@@ -1,86 +1,83 @@
-Task: M0122-0007 residual — `ALTER TABLE ... ALTER COLUMN col RESET (...)`
-(unimplemented_feat.json M0110-0001 entry, also named in M0122-0007's "still
-open" list). COMPLETE and ready to commit this loop.
+Task: M0122 follow-up — `pg_get_serial_sequence()` real OWNED-BY dependency
+lookup (unimplemented_feat.json entry, also flagged by M0122-0002's own
+summary line which had wrongly claimed it "already implemented, verified
+2026-07-04"). COMPLETE and committed this loop (`fdae8b13`).
 
-Files: internal/parser/ast.go (new `AlterTableAlterColumnReset` action kind;
-extended `SetOptions` field doc to note it's shared with SET).
-internal/parser/ddl.go (new RESET (opt, …) branch in the ALTER TABLE ALTER
-COLUMN dispatch, right after the existing SET (...) branch; reuses
-`parseColumnSetOptions` since it already accepts bare option names).
-internal/parser/ddl_test.go (new `TestParseAlterTableAlterColumnReset`).
-internal/executor/operators_ddl.go (new `AlterTableAlterColumnReset` exec
-case — merges named keys OUT of `catalog.Column.Options`, mirrors upstream
-`ATExecResetOptions`'s partial-clear semantics, NOT a wholesale wipe; reuses
-the same pg_attribute heap-resync path the sibling SET case already
-established; also extended the pre-existing "not supported for indexes"
-0A000 guard to cover RESET, not just SET).
-internal/executor/operators_ddl_alter_column_reset_test.go (new
-`TestAlterColumnResetOptionsClearsNamedEntriesOnly`).
-unimplemented_feat.json (surgical 2-field edit only, per house rule: this
-entry's `status` → resolved, `code_audit` updated with the fix write-up —
-did NOT run json.load+json.dump, verified valid JSON via python3 -c
-"json.load(...)" after).
-docs/design/0110-0001-pg-dump-tap-port.md (new "Follow-up: ALTER TABLE ...
-ALTER COLUMN col RESET (...)" section) + docs/design/README.md (row 574
-addendum appended in place, not rewritten).
-.ralph/fix_plan.md (M0122-0007 bullet: added a FIXED follow-up paragraph,
-trimmed "~13 remaining" → "~10 remaining" in the still-open list since
-RESET is done).
+Files: internal/executor/expr.go (the `pg_get_serial_sequence` case — was a
+stub fabricating `public.<table>_<col>_seq`; now strips a schema qualifier
+off the table arg, calls `FindSequenceOwnedBy(bareTable+"."+col)`, returns
+NULL when unowned, else schema-qualifies via the sequence's own
+`seqState.schema` + shared `pgQuoteIdent`).
+internal/executor/operators_pg_get_serial_sequence_test.go (new: serial
+column resolves; non-serial column → NULL; renamed sequence followed;
+identity column resolves).
+unimplemented_feat.json (surgical 2-field edit only, per house rule —
+entry's `status`→resolved, `code_audit` rewritten; verified valid JSON via
+`python3 -c "json.load(...)"` after, did NOT run json.load+json.dump).
+.ralph/deferral_ledger.md (new row: 2 residual gaps recorded — (1)
+`FindSequenceOwnedBy`'s exact-string match can miss an explicit
+`ALTER SEQUENCE ... OWNED BY myschema.tbl.col` since the explicit-DDL path
+stores the parser's raw text unnormalized while the implicit SERIAL/IDENTITY
+path always stores bare `table.column`; (2) this function returns NULL
+instead of raising 42P01/42703 for a nonexistent table/column, deliberately
+matching this file's sibling pg_get_* convention, not upstream PG).
+docs/design/root-0020-sequence-serial-restart-persistence.md (new "Follow-up
+(2026-07-08)" section — this is the general sequence/SERIAL design doc, most
+relevant home for this fix) + docs/design/README.md (root-0020 row addendum).
+.ralph/fix_plan.md (M0122-0002 bullet: appended a "Correction (2026-07-08)"
+paragraph noting/fixing the stale "already implemented" claim).
 
-Key symbols: parser.AlterTableAlterColumnReset (ast.go); the RESET branch in
-ddl.go right after `if p.acceptIdentKeyword("set") || p.acceptKeyword(KwSet)
-{ ... }` in the ALTER COLUMN dispatch (~line 8551 pre-edit); the exec case
-in operators_ddl.go right after `case parser.AlterTableAlterColumnSet:`'s
-block (~line 8062 pre-edit).
+Key symbols: `FindSequenceOwnedBy`/`SetSequenceOwnedBy` (operators_sequence.go,
+pre-existing, now has a second real caller); `pgQuoteIdent` (expr.go, shared
+identifier quoter); the `pg_get_serial_sequence` case in expr.go's big
+`evalExpr` function-name switch.
 
-Findings: confirmed the gap was real (internal/parser/ddl.go's ALTER COLUMN
-dispatch had zero RESET handling — fell to the generic no-op consume loop).
-Confirmed KindInterval (the executor's interval Datum) has NO sub-day
-component at all (months+days only, by design per
-docs/design/0003-0006-date-interval-arithmetic.md) — this RULES OUT
-"timestamp - timestamp → interval" (unimplemented_feat.json entry #4) as a
-comparably-small follow-up candidate for a future loop; implementing it
-faithfully needs a genuinely new microseconds field on the interval Datum
-(ripples through Format/compareDatum/cast), not a single-function fix. Do
-not pick that one without budgeting a full loop for the Datum extension.
-Confirmed non-vacuous via `git stash` on the parser+executor changes: the
-executor test fails pre-fix with `Options = [n_distinct=0.5
-n_distinct_inherited=-0.1]` (both entries survive RESET) exactly as
-predicted.
+Findings: confirmed via `git stash` on expr.go alone that 2 of the 4 new
+tests fail on pre-fix code exactly as predicted (non-serial column wrongly
+returned a guessed name; renamed sequence wrongly returned the stale
+pre-rename name) — non-vacuous. `FindSequenceOwnedBy`/`SetSequenceOwnedBy`
+already existed and were already correctly wired for SERIAL/IDENTITY column
+registration (operators_ddl.go:2870) and explicit `ALTER SEQUENCE ... OWNED
+BY` (operators_ddl.go:13350/13588) — this task only needed to add a second
+consumer in expr.go, not build new tracking infrastructure.
 
-Next step: pick the next M0122 item fresh next loop. Good remaining
-candidates surfaced this loop (NOT yet started): `pg_get_serial_sequence()`
-real catalog-dependency lookup instead of the convention-based
-`table_col_seq` name fabrication (`internal/executor/expr.go:~7325`,
-unimplemented_feat.json entry #57) looked similarly well-scoped but was not
-independently verified this loop — verify-before-implement per M0122's
-own rule before starting it. Also M0119-0006's opclass-dispatch remainder
-(pg_amproc Virtual-UPDATE path + btree opclass/comparator dispatch,
-unimplemented_feat.json's "pg_amcheck server-dependent test tiers" entry) —
-explicitly flagged "not a single-loop slice" twice now; decompose further
-before attempting (e.g. just the pg_amproc Virtual-UPDATE path alone,
-mirroring nextVirtualPgDatabase, might be a viable single slice even though
-it wouldn't close 005_opclass_damage.pl on its own).
+Next step: pick a fresh M0122 item next loop. Un-investigated candidates
+noted by prior loops: M0119-0006's opclass-dispatch remainder (pg_amproc
+Virtual-UPDATE path mirroring `nextVirtualPgDatabase`, PLUS btree opclass/
+comparator dispatch — explicitly flagged "not a single-loop slice" 3 times
+now in the deferral ledger; decompose further, e.g. just the pg_amproc
+Virtual-UPDATE mutator alone, before attempting). Also worth a fresh look:
+M0122-0001's now-complete backlog triage (181/181 tagged) means the
+remaining pool of individually-pickable `open` entries in
+unimplemented_feat.json is now the primary task-selection source — grep for
+`"status": "open"` and pick one with `confidence: "high"` and no cross-
+subsystem architecture dependency (avoid picking another one already flagged
+as multi-loop, like the btree opclass-dispatch one above).
 
-Gates run: go build ./... clean. go vet ./internal/parser/...
-./internal/executor/... clean. go test ./internal/parser/...
-./internal/executor/... ./internal/planner/... ./internal/catalog/... PASS.
-Full go test over all internal/... packages (excluding /testport and
-/testutil/tpch per project convention) PASS, including internal/initdb's
-full suite (399s) and internal/server (8.9s). scripts/tpch-spotcheck.sh PASS
-(Q12=2/Q13=33). RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh
-PASS (0 failed, all 3 workloads: TPC-B, simple-update, select-only).
+Gates run: go build ./... clean. go vet ./internal/executor/... clean.
+go test ./internal/executor/... (full package, 3.9s) PASS. go test
+./internal/parser/... ./internal/planner/... ./internal/catalog/... PASS
+(cached, unaffected packages). scripts/tpch-spotcheck.sh PASS (Q12=2/Q13=33).
+RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh PASS (0 failed,
+all 3 workloads: TPC-B, simple-update, select-only) — run twice, once
+standalone pre-commit-check and once as the actual git pre-commit hook.
 make ralph-state-guard: 1 benign issue auto-repaired (same recurring
 status/progress clean-exit-vs-in_progress reconciliation as every prior
-loop — not a new problem).
+loop — not a new problem, do not chase it further).
 
-In-flight: none. Noticed (informational only, not mine to manage): the
-nightly scheduler fired a fresh batch run (20260708-064334) partway through
-this loop, apparently because the scheduler process restarted around
-01:37 and re-fired the missed 2026-07-08 00:00 slot late at 06:43 — it
-snapshotted the tree mid-edit (dirty=12). This is independent background
-infra (ci/batch clones into its own runtime dir per
-[[goopg_nightly_ci_batch]] memory); no action needed from this loop, but
-the next loop's nightly-triage step should check whether
-ci/logs/action-items.md got regenerated by this run and whether its
-"dirty" snapshot produced any spurious findings worth discounting.
+In-flight: none directly mine. Noticed (informational, not mine to manage):
+the nightly-batch catch-up run `ci/logs/20260708-064334` (started this
+morning per [[goopg_nightly_ci_batch]] memory's independent scheduler infra,
+sha=2e435e91, dirty=12) was still running the race stage as of this loop's
+start and had NOT yet reached pgbench/tpch/summary. Confirmed via
+`git merge-base --is-ancestor` that this run's base sha DOES include the
+flushBatch stale-tag fix (`8ebb71cd`, M-NIGHTLY pgbench/nightly item's real
+root-cause fix, landed loop #17 of that investigation) — so once this run
+completes, its pgbench stage is the real confirmation the M-NIGHTLY
+`pgbench/nightly` bullet in fix_plan.md is waiting on. Next loop's nightly-
+triage step should check `ci/logs/latest/stages/pgbench/` (or wherever that
+stage lands) for a clean result and, if clean, check off/archive that bullet
+per its own "next nightly run is the real confirmation" note (fix_plan.md
+line ~624). If `ci/logs/action-items.md` was regenerated with a NEW mtime by
+the time this run finishes, re-run the standard nightly-triage step (grep for
+`## AI-` items lacking an open fix_plan task) before picking new work.
