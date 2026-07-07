@@ -2118,7 +2118,7 @@ reviewed design doc exists. (The triage task M0122-0001 is doc-only, exempt.)
 Tracking field = a per-entry `status` (`open`/`resolved`) added by M0122-0001,
 mirroring M0119's ledger `status` column.
 
-- [ ] **M0122-0001 — Backlog triage / re-verification pass** (doc-only, exempt).
+- [x] **M0122-0001 — Backlog triage / re-verification pass** (doc-only, exempt).
       Re-audit all 181 entries vs current HEAD; add the `status` field (init
       `open`/`resolved`); resolve the already-done ones — start with the 24
       `unclear`/no-audit + 61 `resolution_check.ledger=open` entries (7 overlap).
@@ -2154,6 +2154,23 @@ mirroring M0119's ledger `status` column.
       feature; `completed_milestones/completed_fix_plan_00{1..9}.md` already
       exist). Next batch: continue through the remaining `resolution_check.
       ledger=open` entries not yet covered.
+      **2026-07-08 (final batch): all 181/181 entries now carry a `status`
+      field** (64 `resolved` / 117 `open`, 0 remaining untagged) — the
+      re-verification pass this task exists for is complete. Last 16-entry
+      cluster (planner/perf: TPC-H Q9/Q15b/Q21 NLI shapes, NOT-IN anti-semi,
+      vectorized FilterOp/SeqScanOp wiring, spill-path activity-lookup
+      cost, plan-snapshot nondeterminism) all confirmed genuinely still
+      `open` via fresh code_audit — none flipped to `resolved` this batch
+      (contrast with earlier batches that were ~40-60% resolved; this
+      cluster skewed toward architectural/perf follow-ups nobody has picked
+      up yet, mostly already tracked at milestone granularity — e.g.
+      M0122-0012 covers the vectorization pair, `.ralph/deferral_ledger.md`
+      already covers the Q21/Q15b NLI shapes — so no new ledger rows were
+      added). M0122-0001 is now COMPLETE: every backlog entry has a final
+      `open`/`resolved` verdict backed by a dated `code_audit`. Remaining
+      work is no longer "triage" — it is picking up individual `open`
+      entries as their own M0122-00NN implementation tasks (each needs its
+      own design doc per the per-task rule above).
 - [x] **M0122-0002 — Catalog system functions & pg_* view stubs** (~9). Quick wins:
       `pg_relation_size`/`pg_total_relation_size` (`f0b2bdb3`), `regexp_matches`
       (2026-07-04 loop #7, scalar/first-match only — SRF `'g'`-flag multi-row

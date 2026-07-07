@@ -884,6 +884,7 @@
    "feature": "Empirical TPC-H verification that index-build column projection achieves DecodeRow cumulative cost ≤ 15% of total query execution time.",
    "task_id": "M0054-0007-followup-resume",
    "resume_point": "next HammerDB SF=1 run",
+   "status": "open",
    "evidence": [
     "Empirical TPC-H verification (DecodeRow cum ≤ 15 % per the M0054-0005c-followup acceptance) is bundled into the next HammerDB SF=1 run"
    ],
@@ -925,6 +926,7 @@
    "feature": "Extend equi-key extractor to handle view-inlined join shapes for Nested-Loop Index Join (TPC-H Q15b not yet supported).",
    "task_id": "M0054-0006-followup-Q15b",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "the equi-key extractor doesn't yet handle Q15b's view-inlined join shape"
    ],
@@ -945,6 +947,7 @@
    "feature": "Implement buffer reuse for rows returned by concatRows() to reduce allocations (currently not reused because callers may retain rows).",
    "task_id": "0005b-followup",
    "resume_point": "After Borrow contract is implemented",
+   "status": "open",
    "evidence": [
     "rows returned by `concatRows(m, lazyRow)` are intentionally NOT buffer-reused: callers may retain them, and the safe alternative needs the Borrow contract (deferred to 0005b-followup)"
    ],
@@ -965,6 +968,7 @@
    "feature": "IN-list IndexScan optimization requiring Append/Union plan node and cost model for query plan optimization",
    "task_id": "M0054",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "M0053-0003 (IN-list IndexScan) scope-reduced — requires Append/Union plan node + cost model, deferred to M0054"
    ],
@@ -1195,6 +1199,7 @@
    "feature": "Q21 Anti-NLI currently uses hash variant because lifting conjuncts to outer Predicate breaks negation semantics (returns 0 rows instead of ~411); the inner-Filter conjunct lift is deferred.",
    "task_id": null,
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "lifting those conjuncts to the outer Predicate broke Anti's negation semantics (returned 0 rows vs canonical ~411 in a probe), so deferred as a follow-up"
    ],
@@ -1215,6 +1220,7 @@
    "feature": "Q21 build-phase cancel requires proper NLI rewrite for derived-table outer inputs; the fix is deferred out of M0062 scope.",
    "task_id": null,
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "The proper fix is in NLI rewrite for derived-table outers — symmetric to but distinct from the M0062-0006 MHJ fix. Filed as a follow-up; out of M0062 scope."
    ],
@@ -1447,6 +1453,7 @@
    "feature": "Anti-semi-join optimization for NOT IN subqueries not implemented; planner rejects negated IN conditions",
    "task_id": "M0069-0005",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "in.Negated=true (NOT IN) is rejected — anti-semi-join semantics out of scope"
    ],
@@ -1467,6 +1474,7 @@
    "feature": "Non-trivial expressions on IN-subquery LHS not optimized to SemiJoin; falls back to runtime cache path",
    "task_id": "M0069-0005",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "in.Operand must be a ColumnRef — non-trivial expressions on the LHS keep the runtime cache path"
    ],
@@ -1487,6 +1495,7 @@
    "feature": "Schema-vs-runtime layout mismatch in walker implementation causes incorrect results; blocks multiple optimization attempts",
    "task_id": "M0068",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "same schema-vs-runtime layout mismatch from M0064/M0065 walker attempts. Reverted; deferred to M0068"
    ],
@@ -1528,6 +1537,7 @@
    "feature": "NLI semi/anti joins with partsupp_pk-style index may not correctly emit outer rows; root cause and fix deferred.",
    "task_id": "M0071-0005",
    "resume_point": "Stage D follow-up",
+   "status": "open",
    "evidence": [
     "to be investigated in M0071-0005 Stage D follow-up"
    ],
@@ -1590,6 +1600,7 @@
    "feature": "Root-cause investigation of planner nondeterminism vs pool-state behavior in plan-snapshot regression harness",
    "task_id": "M0077",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "Root-cause investigation (planner nondeterminism vs pool-state) deferred to M0077"
    ],
@@ -1610,6 +1621,7 @@
    "feature": "Diagnose and isolate individual build optimization flag (PGO / GOAMD64=v3 / ldflags) causing +9.5% wall-time regression",
    "task_id": "M0076-0003",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "The optimisation flags produced a net +9.5 % wall-time regression on this workload"
    ],
@@ -1630,6 +1642,7 @@
    "feature": "FilterOp predicate batch wiring (integration of vectorized expression evaluation into filterOp call-site)",
    "task_id": "M0076-0002",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "only the wiring into filterOp is the deferred piece"
    ],
@@ -1671,6 +1684,7 @@
    "feature": "SeqScanOp predicate batch wiring (vectorized predicate evaluation in sequential scan)",
    "task_id": "M0075",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "seqScanOp predicate batch wiring deferred"
    ],
@@ -1794,6 +1808,7 @@
    "feature": "Spill-path hooks closure-capture optimization (cold-path, left unoptimized)",
    "task_id": "m0091-0001",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "Spill-path hooks (executor/spill.go) are cold-path and left"
    ],
@@ -1835,6 +1850,7 @@
    "feature": "Spill-path per-row lookups optimization (cold path, dropped from scope)",
    "task_id": "m0091",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "Spill-path per-row lookups dropped (cold path)"
    ],
