@@ -666,14 +666,60 @@ every clean, green (build + pre-commit) checkpoint.
       update/select-only smoke) PASS, 0 failed transactions. Design doc
       updated: `docs/design/0107-0007aj-wal-segment-cross-reservation.md`
       "2026-07-07 update" section + `docs/design/README.md` index entry.
-- [ ] testport/TestPort_IsolationEvalPlanQual — FAILed
+- [x] testport/TestPort_IsolationEvalPlanQual — FAILed
       (AI-20260707-000712-002; repro: `go test -v -run
       '^TestPort_IsolationEvalPlanQual$' ./internal/testport/`; evidence:
-      `ci/logs/20260707-000712/testport/go-test.log`).
-- [ ] testport/TestPort_IsolationEvalPlanQualTrigger — FAILed
+      `ci/logs/20260707-000712/testport/go-test.log`). ROOT CAUSE FOUND AND
+      FIXED — same root cause as -003 below (shared plpgsql RAISE NOTICE
+      helper both specs use). Diff showed hundreds of `NOTICE` line
+      mismatches like `upid: 25 checking = 25 checking: t` (goopg) vs
+      `upid: text checking = text checking: t` (PG): `pg_typeof(p_a)` and
+      `pg_typeof(p_b)` render the raw pg_type OID instead of the type
+      display name inside a `RAISE NOTICE '%: % % ...'` format string. Root
+      cause: the M0122-0005 `pg_typeof()::oid` follow-up
+      (`docs/design/0122-0005-char-oid18-disambiguation.md`) made
+      `pg_typeof(x)`/`x::regtype` evaluate to a `KindInt` Datum holding the
+      type's pg_type OID (mirroring `regclass`/`regproc`) — the SQL
+      wire-output layer (`dispatch.go`'s `appendTypedCellText` regtype case)
+      already knew to map that OID back to a display name for a plain
+      `SELECT pg_typeof(...)`, but plpgsql's `RAISE`/format-arg substitution
+      (`internal/executor/plpgsql_runtime.go`'s `evalRaiseMsg`) still called
+      the raw `Datum.Format()` on every arg, printing the bare OID for this
+      one Datum kind. Fixed by adding `isRegtypeExpr(e planner.Expr) bool`
+      (recognizes a `*planner.FuncCall` named `pg_typeof` or a
+      `*planner.CastExpr` with `TargetType=="regtype"` — `planner.exprType`
+      is unexported so the executor package can't query the general static-
+      type resolver, but both call sites already hold the lowered
+      `planner.Expr` per arg) and routing matching `KindInt` args through
+      `RegtypeName(cat, uint32(val.Int), !regObjectSchemaVisible(ctx,
+      "public"))` instead of `val.Format()`. Verified non-vacuous: reverted
+      just the `plpgsql_runtime.go` hunk and confirmed both isolation specs
+      fail again plus a new dedicated regression test
+      (`TestNoticeRaisePgTypeofRendersTypeName`,
+      `internal/server/notice_test.go`, real client/server round-trip via
+      `pq`'s notice handler) fails with the exact bare-OID symptom
+      (`"23: 25 text"` instead of `"integer: text text"`, covering both the
+      `pg_typeof()` call and a literal `::regtype` cast in one format
+      string); restored the fix — all pass. Gates: `go build ./...` clean;
+      `go test ./internal/executor/... ./internal/server/...` PASS (full
+      packages, no regressions); `go test -v -run
+      '^TestPort_IsolationEvalPlanQual$|^TestPort_IsolationEvalPlanQualTrigger$'
+      ./internal/testport/` PASS (both specs back to byte-for-byte PG
+      parity); `RALPH_PRECOMMIT_SCOPE=smoke bash
+      scripts/ralph-precommit-test.sh` PASS (0 failed transactions,
+      standard/simple-update/select-only). Design doc updated:
+      `docs/design/0122-0005-char-oid18-disambiguation.md` new tail section
+      + `docs/design/README.md` 0122-0005 row appended.
+- [x] testport/TestPort_IsolationEvalPlanQualTrigger — FAILed
       (AI-20260707-000712-003; repro: `go test -v -run
       '^TestPort_IsolationEvalPlanQualTrigger$' ./internal/testport/`;
-      evidence: `ci/logs/20260707-000712/testport/go-test.log`).
+      evidence: `ci/logs/20260707-000712/testport/go-test.log`). Same root
+      cause and fix as AI-20260707-000712-002 above (both specs' shared
+      plpgsql helper hits the identical `evalRaiseMsg`/`pg_typeof` gap) —
+      see that bullet for the full writeup. Verified independently:
+      `go test -v -run '^TestPort_IsolationEvalPlanQualTrigger$'
+      ./internal/testport/` PASS (byte-for-byte match across all 38 active
+      permutations, matching the design 0118-0095 promotion's original bar).
 - [ ] tpch/Q21-error — Q21 errored during the sweep (AI-20260707-000712-005;
       repro: `tmp/tpch-nightly-runner -port 65433 -db postgres -user
       <superuser> -queries 21 -per-query-timeout 1200s` against a server on

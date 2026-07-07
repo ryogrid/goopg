@@ -2804,6 +2804,19 @@ func datumToSQLLiteral(d Datum) string {
 // literal. Format argument substitution (replacing `%` with actual values)
 // is not yet implemented — the format-template text is returned as-is.
 // M0096-0012.
+// isRegtypeExpr reports whether e is a pg_typeof(...) call or a ::regtype
+// cast — the two ways a plpgsql expression evaluates to a regtype-typed
+// Datum (a KindInt pg_type OID, per M0122-0005) rather than display text.
+func isRegtypeExpr(e planner.Expr) bool {
+	switch x := e.(type) {
+	case *planner.FuncCall:
+		return strings.EqualFold(x.Name, "pg_typeof")
+	case *planner.CastExpr:
+		return strings.EqualFold(x.TargetType, "regtype")
+	}
+	return false
+}
+
 // evalRaiseMsg evaluates a RAISE statement's message field in the plpgsql context.
 // Handles format args: `'fmt %', arg1, arg2` → evaluates each arg, substitutes
 // left-to-right into format (one % per arg; %% → literal %). M0097-0003.
@@ -2859,6 +2872,18 @@ func evalRaiseMsg(rawMsg string, frame *plpgsqlFrame, ctx *Context) string {
 		}
 		if val.IsNull() {
 			argVals = append(argVals, "<NULL>")
+		} else if val.Kind == KindInt && isRegtypeExpr(lowered) {
+			// pg_typeof(x) / x::regtype evaluate to a KindInt Datum holding the
+			// type's pg_type OID (M0122-0005), not display text — val.Format()
+			// would print the bare OID (e.g. "25") instead of the type name
+			// ("text") the wire-output layer renders for a plain SELECT. Mirror
+			// that resolution here so RAISE NOTICE / format-arg substitution
+			// matches PG's output.
+			var cat catalog.Catalog
+			if ctx != nil {
+				cat = ctx.Catalog
+			}
+			argVals = append(argVals, RegtypeName(cat, uint32(val.Int), !regObjectSchemaVisible(ctx, "public")))
 		} else {
 			argVals = append(argVals, val.Format())
 		}
