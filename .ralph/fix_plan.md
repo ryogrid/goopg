@@ -3196,6 +3196,24 @@ mirroring M0119's ledger `status` column.
       (2026-07-08 section), `docs/design/README.md` row updated.
       `unimplemented_feat.json`'s `M0021-0002`/aggregate-detection entry
       flipped `open`→`resolved` (66/181 resolved, 115 open).
+- [x] **M0122-0018 — `isfinite()` NULL propagation** (~1; found while
+      surveying `unimplemented_feat.json`'s `m0097-0004` cluster, not itself a
+      backlog entry). `evalIsFinite` (`internal/executor/expr.go`) computed
+      `NewBoolDatum(!d.IsNull())` directly, so `isfinite(NULL::date)` etc.
+      returned `FALSE` instead of SQL `NULL` — `isfinite` has no `NotStrict`
+      marker on any of its 4 wired `pg_proc_seed_data.go` OIDs (1373/1389/
+      1390/2048), so like every other strict PostgreSQL function it must
+      propagate NULL rather than evaluate it. Fixed: check `d.IsNull()` first
+      and return `NullDatum`; non-NULL case unchanged (always `TRUE`, goopg v0
+      stores no infinity values). Tests: `TestIsFiniteNullPropagates`
+      (`internal/executor/isfinite_test.go`), confirmed non-vacuous via `git
+      stash` on `expr.go` alone. Gates: `go build ./...` clean; `go test
+      ./internal/executor/...` PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke bash
+      scripts/ralph-precommit-test.sh` PASS (0 failed transactions, all 3
+      workloads). Design: `docs/design/0003-0006-date-interval-arithmetic.md`
+      updated (2026-07-08 follow-up section), `docs/design/README.md` row
+      updated.
 
 > This task list is **seeded, not exhaustive.** The M0122-0001 triage plus every
 > future feature deferral appended to `unimplemented_feat.json` (any new `open`

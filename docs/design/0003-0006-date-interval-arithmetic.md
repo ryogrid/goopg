@@ -335,6 +335,33 @@ Tests: `internal/executor/interval_justify_test.go`
 `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh` PASS (0
 failed transactions, all 3 workloads).
 
+## Follow-up: `isfinite()` NULL propagation (M0122-0018, 2026-07-08)
+
+`evalIsFinite` (`internal/executor/expr.go`) computed its result as
+`NewBoolDatum(!d.IsNull())` — for a NULL argument this evaluates to
+`NewBoolDatum(false)`, i.e. a SQL `FALSE`, not SQL `NULL`. `isfinite` has no
+`NotStrict` marker on any of its `pg_proc_seed_data.go` OIDs (1373 date, 1389
+timestamp, 1390 interval, 2048 timestamptz), so — like every other strict
+PostgreSQL function — a NULL argument must propagate to a NULL result rather
+than being evaluated at all
+(`postgres/src/backend/utils/fmgr/fmgr.c`'s `FunctionCallInvoke` strict-check,
+which upstream's `date_finite`/`timestamp_finite`/`interval_finite` C
+functions rely on instead of checking for NULL themselves). Fixed by checking
+`d.IsNull()` before computing the result and returning `NullDatum` in that
+case; the non-NULL case is unchanged (goopg v0 stores no infinity values for
+any of these types, so it is unconditionally `TRUE`, as established when
+`isfinite` was first stubbed under M0097-0004).
+
+Tests: `internal/executor/isfinite_test.go`
+(`TestIsFiniteNullPropagates` — SQL-level, all 4 wired OIDs' NULL case plus
+one non-NULL case each for date/interval). Confirmed non-vacuous via `git
+stash` on `expr.go` alone (the 4 NULL cases fail — `IsNull() = false, want
+true` — without the fix). Gates: `go build ./...` clean; `go test
+./internal/executor/...` PASS; `scripts/tpch-spotcheck.sh` PASS
+(Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke bash
+scripts/ralph-precommit-test.sh` PASS (0 failed transactions, all 3
+workloads).
+
 ## Cross-references
 
 - TPC-H query bodies: HammerDB upstream

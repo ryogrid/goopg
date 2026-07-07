@@ -5404,10 +5404,10 @@ func evalIsFinite(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		return NullDatum, nil
 	}
 	d, err := evalExpr(x.Args[0], row, ctx)
-	if err != nil {
+	if err != nil || d.IsNull() {
 		return NullDatum, nil
 	}
-	return NewBoolDatum(!d.IsNull()), nil
+	return NewBoolDatum(true), nil
 }
 
 // evalJustifyInterval implements justify_days()/justify_interval(): move

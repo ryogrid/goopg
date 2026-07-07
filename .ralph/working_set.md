@@ -1,56 +1,52 @@
-Task: M0122-0016 — Autovacuum: honor `autovacuum_enabled` reloption
-(`unimplemented_feat.json` task M0086). COMPLETE this loop, committing next.
+Task: M0122-0018 — `isfinite()` NULL propagation bug (found during prior
+loop's M0122-0017 survey, not itself an unimplemented_feat.json backlog
+entry). COMPLETE and committed this loop.
 
-Files: internal/autovacuum/launcher.go (needsVacuum/needsAnalyze gate on
-tbl.AutovacuumEnabledSet/AutovacuumEnabled), internal/autovacuum/
-launcher_test.go (2 new tests), internal/catalog/catalog.go (stale doc
-comment on AutovacuumEnabled fixed — field is no longer catalog-only),
-docs/design/0122-0016-autovacuum-enabled-reloption.md (new),
-docs/design/README.md (index row added), .ralph/fix_plan.md (M0122-0016
-checkbox -> [x]), unimplemented_feat.json (M0086 status open->resolved,
-65/181 resolved now).
+Files: internal/executor/expr.go (evalIsFinite: check d.IsNull() before
+computing result, return NullDatum instead of NewBoolDatum(!d.IsNull())),
+internal/executor/isfinite_test.go (new, TestIsFiniteNullPropagates),
+docs/design/0003-0006-date-interval-arithmetic.md (2026-07-08 follow-up
+section — same doc that already covers the sibling M0097-0004
+justify_hours/justify_days/justify_interval fix, isfinite belongs to the
+same date/interval cluster), docs/design/README.md (0003-0006 row appended
+in place), .ralph/fix_plan.md (M0122-0018 added as [x]).
 
-Key symbols: Launcher.needsVacuum/needsAnalyze (internal/autovacuum/
-launcher.go), catalog.Table.AutovacuumEnabled/AutovacuumEnabledSet
-(pre-existing, just newly consumed).
+Key symbols: evalIsFinite (internal/executor/expr.go, right before the
+evalJustifyInterval comment block — note: the doc comment for evalIsFinite
+sits ~85 lines ABOVE the function itself, orphaned by a prior refactor that
+moved the function down without moving its comment; pre-existing oddity,
+left alone this loop since not in scope).
 
-Findings: this was a small, well-scoped M0122 backlog pickup (selected via
-an Explore-agent survey of the 117 open unimplemented_feat.json entries —
-other candidates surveyed but not picked: m0097-0009 pg_get_serial_sequence
-convention-guessed name, m0097-0004 isfinite() always-true stub,
-M0021-0002 bare-aggregate-in-FOR-UPDATE not rejected, M0087 loadTables
-no-op for non-InMemory catalogs — any of these would be reasonable next
-quick-wins). Upstream reference: postgres/src/backend/postmaster/
-autovacuum.c relation_needs_vacanalyze (~line 3054) — av_enabled check
-gated by !force_vacuum (anti-wraparound overrides the user's disable);
-goopg's pre-existing RelFrozenXID/autovacuumFreezeMaxAge anti-wraparound
-check already ran first in needsVacuum, so only had to add the disable
-gate below it (and mirror it in needsAnalyze, since upstream disables
-both). Confirmed non-vacuous via git stash on launcher.go alone (new test
-fails without the fix). M0119-0004's own next milestone-scale blocker
-(collation "builtin_coll" already exists — no per-database catalog
-namespace at all, confirmed NOT a 1-loop task by the survey) and
-M0119-0006's sole residual (005_opclass_damage.pl, needs a pg_amproc
-Virtual-UPDATE path AND btree opclass/comparator dispatch — also not
-1-loop) were surveyed and explicitly passed over in favor of this smaller
-task; they remain the next M0119 candidates whenever a multi-loop
-architectural task is in scope.
+Findings: isfinite has no NotStrict marker on any of its 4 wired
+pg_proc_seed_data.go OIDs (1373 date/1389 timestamp/1390 interval/2048
+timestamptz) — internal/initdb/pg_proc_seed_data.go — so per the strict-
+function convention (goopg has no generic strictness pre-check in
+evalFuncCall's giant switch; every case handles NULL manually) isfinite must
+propagate NULL, not evaluate. Confirmed non-vacuous via git stash on
+expr.go alone (4 NULL cases fail: "IsNull() = false, want true").
+`unimplemented_feat.json` was NOT touched — this bug was never a backlog
+entry (isfinite's OID coverage itself was already correctly scoped by
+M0097-0004; only the NULL-handling omission was new).
 
-Next step: commit this work (pathspec: the files listed above, NOT
-`postgres` submodule which shows modified/untracked pre-existing at
-session start — untouched by this loop). Then pick the next task: either
-another unimplemented_feat.json open quick-win (see Findings list above),
-or start scoping M0119-0004's collation/per-database-catalog-isolation
-gap or M0119-0006's 005_opclass_damage as a proper multi-loop milestone
-item (needs its own design doc + explicit multi-loop scope acknowledgment
-first, per the M0119 per-task rule).
+Next step: pick the next task. Two concrete quick-win candidates remain
+unsurveyed in depth: (1) m0097-0009 pg_get_serial_sequence() convention-
+guessed name, (2) M0087 loadTables no-op for non-InMemory catalogs.
+Alternatively, per the Current Priority banner, scope M0119-0004's
+per-database catalog-isolation gap or M0119-0006's 005_opclass_damage as a
+proper multi-loop milestone item (needs its own design doc + explicit
+multi-loop scope acknowledgment first, per the M0119 per-task rule) — still
+not attempted. M-NIGHTLY: ci/logs/action-items.md's 8 AI- items (run
+20260707-000712) are all already triaged into fix_plan.md M-NIGHTLY tasks
+(7 checked [x] resolved, 1 — pgbench/nightly btree keyLen mismatch — checked
+[x] but its own text still describes an unresolved multi-day buffer-pool
+investigation; re-read that item's full text before assuming it's actually
+closed if picking it up).
 
-Gates run: go build ./... clean. go test ./internal/autovacuum/... PASS
-(3/3, including 2 new tests). RALPH_PRECOMMIT_SCOPE=smoke bash
-scripts/ralph-precommit-test.sh PASS (0 failed transactions, all 3
-workloads: standard/simple-update/select-only). make ralph-state-guard
-PASS (auto-repaired 1 benign issue, identical pattern to every prior loop).
+Gates run: go build ./... clean. go test ./internal/executor/... PASS
+(full package, 3.5s). scripts/tpch-spotcheck.sh PASS (Q12=2/Q13=33).
+RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh PASS
+(0 failed transactions, all 3 workloads). make ralph-state-guard PASS
+(auto-repaired 1 benign issue, identical pattern to every prior loop).
 
 In-flight: none (no background agents or long-running processes left
-running; the Explore-agent survey used for task selection already
-returned and is fully incorporated above).
+running).
