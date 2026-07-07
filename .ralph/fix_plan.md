@@ -1842,6 +1842,35 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       `.ralph/working_set.md` / ledger). Two general SQL-engine gaps surfaced here
       remain: deferred-constraint *checking at COMMIT* (goopg checks immediately)
       and any residual dump-fidelity items.
+      **2026-07-07 slice (executor-level, not catalog-level — FIXED):** the guard
+      failed with `pg_dump: error: invalid column numbering in table "pnnl_1"` on
+      the LIST-partitioned-table fixture (`pnnl`/`pnnl_1`, per-column NOT NULL
+      override). Root cause was NOT a catalog gap but a genuine LEFT JOIN
+      correctness bug in `internal/executor/operators_join_agg.go`'s lazy hash
+      join (`nextLazy`): `getTableAttrs`'s `pg_attribute a LEFT JOIN pg_constraint
+      co ON (a.attrelid = co.conrelid AND co.contype = 'n' AND co.conkey =
+      array[a.attnum])` silently dropped the outer row for any column whose
+      hash-join key (`attrelid=conrelid`) matched a `pg_constraint` row shared
+      with a sibling column, but whose own residual conjunct (`conkey =
+      array[attnum]`) did not — `nextLazy` only null-padded on a hash-level miss
+      (`len(matches)==0`), never on "hash key matched, but every candidate failed
+      the residual `Predicate`". Fixed by tracking a new `lazyProbeMatched bool`
+      per probe row (set when any candidate passes `Predicate`) and null-padding
+      when the match loop exhausts with it still false. See
+      `docs/design/0036-0001-lazy-hash-join-materialization.md` §7 for full
+      detail; regression test
+      `internal/executor/leftjoin_hash_residual_dropped_row_test.go`
+      (`TestLeftJoinHashResidualFilterPreservesUnmatchedRow`, confirmed
+      non-vacuous via `git stash`). Guard now advances past this gap to the
+      next (already-known, milestone-scale) blocker: `TestPort_PgDumpConnectionSetup`
+      logs `DU-002 round-trip restore FAILS ... collation "builtin_coll" already
+      exists` — the same per-database catalog-isolation limitation this bullet's
+      first paragraph already documents (soft `t.Logf`, not a hard gate). Gates:
+      `go build ./...` clean; `go test ./internal/executor/... ./internal/planner/...`
+      PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `TestPort_IsolationEvalPlanQual`/`TestPort_IsolationEvalPlanQualTrigger` PASS;
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0 failed,
+      all 3 workloads).
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002). `002_save_fullpage`
       (WD-003) + live `pg_waldump --rmgr=Heap2` round-trip DONE. **Still open:** only
       `001_basic.pl`'s server-dependent tier (per-rmgr/relation/block filtering) —
