@@ -535,7 +535,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "PARTIAL: cmd/goopg/main.go:971-1000 parsePrimaryConninfoFull now parses host/port/application_name/user (user landed since the old audit); sslmode and password are still unparsed/unused anywhere in the conninfo path — stale doc comment at line 958 still claims all three are deferred."
+   "code_audit": "PARTIAL (2026-07-08): cmd/goopg/main.go parsePrimaryConninfoFull now parses host/port/application_name/user/sslmode; internal/server/walreceiver.go's new checkSSLMode enforces it at DialWalReceiver (accepts disable/allow/prefer/unset since goopg has no TLS, rejects require/verify-ca/verify-full instead of silently connecting in plaintext). password is still unparsed/unused — WalReceiver.handshake never reads an Authentication* challenge from the primary (v0 is trust-only), so there is nowhere for it to be consumed yet; see .ralph/deferral_ledger.md."
   },
   {
    "feature": "Multi-timeline WAL operations are not implemented",

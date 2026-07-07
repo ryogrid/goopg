@@ -180,3 +180,47 @@ func TestWalReceiverTrimsOverlappingRawWALData(t *testing.T) {
 		t.Fatalf("dst raw WAL differs from source after overlap trimming")
 	}
 }
+
+func TestCheckSSLMode(t *testing.T) {
+	for _, mode := range []string{"", "disable", "allow", "prefer", "DISABLE", "  prefer  "} {
+		if err := checkSSLMode(mode); err != nil {
+			t.Errorf("checkSSLMode(%q) = %v, want nil", mode, err)
+		}
+	}
+	for _, mode := range []string{"require", "verify-ca", "verify-full"} {
+		if err := checkSSLMode(mode); err == nil {
+			t.Errorf("checkSSLMode(%q) = nil, want an error (goopg has no TLS)", mode)
+		}
+	}
+	if err := checkSSLMode("bogus"); err == nil {
+		t.Error(`checkSSLMode("bogus") = nil, want an error (unknown sslmode)`)
+	}
+}
+
+// TestDialWalReceiverRejectsUnsupportedSSLMode verifies that a
+// primary_conninfo requesting sslmode=require is refused before any
+// TCP dial happens, rather than silently connecting in plaintext.
+// goopg has no TLS implementation, so honouring "require" would mean
+// either failing (correct) or lying to the operator about encryption
+// (wrong) — DialWalReceiver must choose the former.
+func TestDialWalReceiverRejectsUnsupportedSSLMode(t *testing.T) {
+	standbyDir := filepath.Join(t.TempDir(), "standby_pg_wal")
+	standbyWAL, err := wal.NewWriter(wal.Config{WALDir: standbyDir, SegmentSize: 4096})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = standbyWAL.Close() }()
+
+	_, err = DialWalReceiver(context.Background(), WalReceiverConfig{
+		// Deliberately an address nothing listens on: if
+		// DialWalReceiver ever attempted the TCP dial despite the
+		// bad sslmode, this test would hang/timeout instead of
+		// failing fast, making the regression obvious.
+		PrimaryAddr: "127.0.0.1:1",
+		WAL:         standbyWAL,
+		SSLMode:     "require",
+	})
+	if err == nil {
+		t.Fatal("DialWalReceiver with sslmode=require: got nil error, want rejection (goopg has no TLS)")
+	}
+}

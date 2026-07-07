@@ -274,6 +274,24 @@ Standby side:
 - `hot_standby` (default `on` in v0; standby accepts read-only
   queries during replay).
 
+### `primary_conninfo` key parsing (2026-07-08)
+
+`cmd/goopg/main.go`'s `parsePrimaryConninfoFull` parses `host`,
+`port`, `application_name`, `user`, and (as of this loop) `sslmode`
+out of the libpq-style DSN. `sslmode` is enforced, not just captured:
+goopg has no TLS implementation, so `internal/server`'s
+`DialWalReceiver` (via `checkSSLMode`) accepts `disable`/`allow`/
+`prefer`/unset (all connect in plaintext — the same outcome `prefer`
+would negotiate down to against any server that doesn't speak SSL)
+and rejects `require`/`verify-ca`/`verify-full` before dialing, rather
+than silently connecting in plaintext when the operator asked for
+encryption. `password` remains unparsed: the replication handshake
+(`WalReceiver.handshake`) never reads an `Authentication*` challenge
+from the primary (v0 is trust-only per `WalReceiverConfig.User`'s doc
+comment), so there is nowhere for a password to be consumed yet —
+tracked as a deferred item pending real replication auth, not silently
+dropped.
+
 ## Test strategy
 
 The M0005 acceptance test (see milestone DoD #4) is an
