@@ -860,7 +860,7 @@ every clean, green (build + pre-commit) checkpoint.
       reproduced the exact nightly failure command byte-for-byte then
       confirmed the fix against it, which is the authoritative repro per the
       M-NIGHTLY rules.
-- [ ] tpch/Q9-timeout — Q9 hit its per-query budget (57014/cancel)
+- [x] tpch/Q9-timeout — Q9 hit its per-query budget (57014/cancel)
       (AI-20260707-000712-007; repro: `tmp/tpch-nightly-runner -port 65433
       -db postgres -user <superuser> -queries 9 -per-query-timeout 1200s`,
       same server setup as above; evidence:
@@ -900,6 +900,52 @@ every clean, green (build + pre-commit) checkpoint.
       `rewriteJoinsToNLI` so MHJ-folded joins are structurally unreachable
       by it. Either way, add a permanent regression test pinning the toy
       3-table repro before landing.
+      2026-07-07 update #2 (FIXED, landed): implemented option (A). New
+      `attachUnusedCrossEdges` (bushy.go), called from `enumerateBushyPlans`
+      right after the winning tree is selected, walks that tree bottom-up
+      and ANDs any still-unused edge (RAW, unremapped `joinEdge.predicate`
+      — global FROM-order ColumnRef indices, no `remapKeyToSubset` call)
+      onto the lowest `*Join` that first co-locates both of its tables, then
+      marks it used so the residual-Filter computation excludes it. This
+      deliberately keeps the SAME global coordinate convention
+      `collectMultiHashTables`'s pre-existing `extraInScans`-guarded extras
+      capture already expects for a join later folded into a
+      `*MultiHashJoin` (its own comment already anticipated this exact Q9
+      shape) — sidestepping the coordinate conflict that sank the reverted
+      prototype entirely, rather than reconciling it after the fact.
+      `collectCrossSideEquiKeys` (nl_index_join.go) gained a name-based
+      side-classification fallback (via `collectScanOutputNames`) for when
+      an AND'd conjunct's ColumnRef indices don't fall inside this Join's
+      local Left/Right width split, so the NestedLoopIndexJoin rewrite can
+      also consume a global-coordinate extra conjunct; `tryBuildNLI`'s
+      final by-name fallback rebind was hardened to also fix an
+      in-range-but-wrong-name `.Index` (previously only rebound when the
+      index was out of range), closing a latent gap the new global-coordinate
+      keys could otherwise hit for a plain (non-MHJ/NLI/Join) outer.
+      Verified end-to-end against `bench/tpch/runtime_goopg/data` (fresh
+      server restart): EXPLAIN confirms `Index Scan using partsupp_pk ...
+      Index Cond: (ps_partkey = l_partkey AND ps_suppkey = l_suppkey)`;
+      `tmp/tpch-runner -queries 9` went from a 1200s+ timeout to `OK
+      elapsed=88.32s rows=175` (175 matches the prototype's real-PostgreSQL-
+      18.3-verified anchor). Full 22-query EXPLAIN sweep clean (no errors).
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2, Q13=33). `go test
+      ./internal/planner/... ./internal/executor/...` PASS; the wider
+      `go test ./internal/...` run surfaced 4 unrelated pre-existing
+      failures (`internal/initdb`, `internal/testport`
+      TestE2E_FailoverPGtoGoopg, `internal/testutil/cluster`
+      TestKillKillRecovery, `internal/testutil/tpch`
+      TestTPCHScaleLoadAndQueryRun) — confirmed identical on HEAD with this
+      loop's planner changes stashed (resource-contention/timeout flakiness
+      under full-suite parallelism, not a regression from this change).
+      Added `internal/executor/bushy_dp_cross_conjunct_test.go`
+      (`TestBushyDPAttachesUnusedCrossEdge`) as a permanent regression guard
+      — see its doc comment for the honest caveat that at this toy scale
+      the pre-existing `pushdown.go` `pushOneConjunct` mechanism also
+      happens to reattach the conjunct on its own (bushy-DP local
+      coordinates coincide with global ones at small N), so this test alone
+      does not prove `attachUnusedCrossEdges` is necessary — only the real
+      Q9-scale verification above does — but it does guard the new code's
+      correctness whenever it fires.
 - [x] tpch/Q20-timeout — Q20 hit its per-query budget (57014/cancel)
       (AI-20260707-000712-008; repro: `tmp/tpch-nightly-runner -port 65433
       -db postgres -user <superuser> -queries 20 -per-query-timeout 1200s`,

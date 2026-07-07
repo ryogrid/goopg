@@ -103,7 +103,7 @@ Root node: `Projection`
 | 1 | Seq Scan | supplier | — |
 | 2 | Seq Scan | orders | — |
 | 3 | Seq Scan | lineitem | — |
-| 4 | Index Scan | partsupp | idx_partsupp_suppkey |
+| 4 | Index Scan | partsupp | partsupp_pk |
 | 5 | Index Scan | nation | nation_pk |
 | 6 | Seq Scan | part | — |
 

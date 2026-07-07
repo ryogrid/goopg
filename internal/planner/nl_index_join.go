@@ -489,7 +489,7 @@ func tryBuildNLI(j *Join, cat catalog.Catalog) (*NestedLoopIndexJoin, bool) {
 		if !ok || cr.Name == "" {
 			continue
 		}
-		if cr.Index >= 0 && cr.Index < len(outerSchema) {
+		if cr.Index >= 0 && cr.Index < len(outerSchema) && outerSchema[cr.Index].Name == cr.Name {
 			continue
 		}
 		if newIdx := findUniqueColumnIndex(outerSchema, cr.Name, 0); newIdx >= 0 {
@@ -554,6 +554,24 @@ func tryBuildNLI(j *Join, cat catalog.Catalog) (*NestedLoopIndexJoin, bool) {
 func collectCrossSideEquiKeys(j *Join, leftWidth int, innerScan *SeqScan) map[string]Expr {
 	result := map[string]Expr{}
 	innerIsRight := Node(innerScan) == j.Right
+	// M0122 TPC-H Q9-timeout: an extra conjunct AND'd onto j.Predicate
+	// by bushy.go's attachUnusedCrossEdges carries RAW (global
+	// FROM-order, unremapped) ColumnRef indices rather than this
+	// Join's own local Left/Right subset indices — the index-based
+	// classification below can't place it. Fall back to classifying
+	// by column NAME (unique per this project's convention) against
+	// the two sides' actual output columns whenever the index-based
+	// verdict is inconclusive (both/neither side).
+	var leftNames, rightNames map[string]bool
+	nameSets := func() (map[string]bool, map[string]bool) {
+		if leftNames == nil {
+			leftNames = map[string]bool{}
+			rightNames = map[string]bool{}
+			collectScanOutputNames(j.Left, leftNames)
+			collectScanOutputNames(j.Right, rightNames)
+		}
+		return leftNames, rightNames
+	}
 	addEq := func(a, b Expr) {
 		ac, aIsCol := a.(*ColumnRef)
 		bc, bIsCol := b.(*ColumnRef)
@@ -564,7 +582,17 @@ func collectCrossSideEquiKeys(j *Join, leftWidth int, innerScan *SeqScan) map[st
 		bLeft := bc.Index >= 0 && bc.Index < leftWidth
 		// Must be cross-side.
 		if aLeft == bLeft {
-			return
+			ln, rn := nameSets()
+			aInLeft, aInRight := ln[ac.Name], rn[ac.Name]
+			bInLeft, bInRight := ln[bc.Name], rn[bc.Name]
+			switch {
+			case aInLeft && !aInRight && bInRight && !bInLeft:
+				aLeft, bLeft = true, false
+			case aInRight && !aInLeft && bInLeft && !bInRight:
+				aLeft, bLeft = false, true
+			default:
+				return
+			}
 		}
 		// Pick the inner-side ref. innerIsRight ⇒ inner-side has
 		// Index in [leftWidth, leftWidth+innerWidth).
