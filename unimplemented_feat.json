@@ -436,7 +436,7 @@
    "feature": "wal_sync_method GUC selector to configure WAL synchronization method.",
    "task_id": "M0007",
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "wal_sync_method GUC selector ... remain deferred"
    ],
@@ -451,7 +451,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/config/defaults.go: wal_sync_method GUC not found"
+   "code_audit": "resolved 2026-07-08: internal/config/defaults.go registers wal_sync_method (TypeEnum, ContextSigHup, fsync/fdatasync/open_sync/open_datasync, default fdatasync); internal/wal/writer.go's state.doSync dispatches fsync/fdatasync for real via cfg.SyncMethod (wired from cmd/goopg/main.go through initdb.OpenOptions.WALSyncMethod). open_sync/open_datasync remain unimplemented (need O_SYNC/O_DSYNC at segment-open time, not flush time) and are rejected by wal.NewWriter with ErrUnsupportedSyncMethod — see .ralph/deferral_ledger.md 2026-07-08 row for the resume point."
   },
   {
    "feature": "WAL segment recycling to reuse old segments instead of unlinking.",

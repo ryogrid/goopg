@@ -415,6 +415,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		walInitZero := boolGUC(registry, "wal_init_zero", true)
 		walSenderMemBuf := int64(intGUC(registry, "wal_sender_memory_buffer", 16<<20))
 		walBuffers := int64(intGUC(registry, "wal_buffers", 16<<20))
+		walSyncMethod := stringGUC(registry, "wal_sync_method", "fdatasync")
 		walWriterDelayMS := intGUC(registry, "wal_writer_delay", 200)
 		bgwriterDelayMS := intGUC(registry, "bgwriter_delay", 200)
 		bgwriterMaxPages := intGUC(registry, "bgwriter_lru_maxpages", 100)
@@ -440,6 +441,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			WALInitZero:           walInitZero,
 			WALSenderMemoryBuffer: walSenderMemBuf,
 			WALBuffers:            walBuffers,
+			WALSyncMethod:         walSyncMethod,
 			WalWriterDelay:        time.Duration(walWriterDelayMS) * time.Millisecond,
 			BgwriterDelay:         time.Duration(bgwriterDelayMS) * time.Millisecond,
 			BgwriterMaxPages:      bgwriterMaxPages,

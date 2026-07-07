@@ -98,6 +98,8 @@
                                         # (change requires restart)
 #wal_init_zero = on                     # zero-fill new WAL segments
                                         # (change requires restart)
+#wal_sync_method = fdatasync            # fsync, fdatasync, open_sync, open_datasync
+                                        # (change requires reload)
 #wal_sender_memory_buffer = 16777216    # 0-1073741824 bytes in-memory WAL ring
                                         # (change requires restart)
 #full_page_writes = on                  # log full pages after first mod since

@@ -15,3 +15,12 @@ import "os"
 func dataSync(f *os.File) error {
 	return f.Sync()
 }
+
+// fullSync backs wal_sync_method=fsync on non-Linux platforms.
+// os.File.Sync() already maps to a full fsync(2)-equivalent here
+// (there's no separate fdatasync primitive to skip), so it's
+// identical to dataSync — matching upstream, which also collapses
+// fsync/fdatasync on platforms without a real fdatasync(2).
+func fullSync(f *os.File) error {
+	return f.Sync()
+}

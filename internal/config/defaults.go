@@ -266,6 +266,31 @@ func BuildDefaultRegistry() *Registry {
 		Scope:   ScopeServer,
 	}))
 
+	// wal_sync_method selects the commit-path durability barrier
+	// flushUpTo's dataSync stage uses. Enum options match what's
+	// available on Linux upstream (postgres/src/backend/access/
+	// transam/xlog.c's wal_sync_method_options — fsync_writethrough
+	// is Windows/macOS-only, excluded here). Default "fdatasync"
+	// matches upstream's PLATFORM_DEFAULT_WAL_SYNC_METHOD on Linux
+	// (postgres/src/include/port/linux.h). Only "fsync"/"fdatasync"
+	// are implemented today; "open_sync"/"open_datasync" are accepted
+	// here (for SHOW/pg_settings parity with upstream) but rejected
+	// by wal.NewWriter with ErrUnsupportedSyncMethod until O_SYNC/
+	// O_DSYNC open-time flags are wired across every WAL segment-open
+	// site — mirrors io_method=io_uring's ErrUnsupportedMethod
+	// precedent below. ContextSigHup matches upstream's PGC_SIGHUP
+	// (guc_tables.c); goopg reads it once at Writer construction, same
+	// as every other ContextPostmaster/ContextSigHup WAL GUC — live
+	// SIGHUP-triggered reconfiguration is out of scope until the
+	// `reload` control-socket command stops being a no-op stub. See
+	// docs/design/0007-0002-fdatasync-commit-path.md.
+	r.MustRegister(NewVariable(Variable{
+		Name: "wal_sync_method", Type: TypeEnum, BootVal: "fdatasync",
+		EnumOptions: []string{"fsync", "fdatasync", "open_sync", "open_datasync"},
+		Context:     ContextSigHup,
+		Scope:       ScopeServer,
+	}))
+
 	// track_io_timing gates per-I/O activity wait-event hooks
 	// (BufferPin / DataFileRead / Write / Extend / Sync / AIO).
 	// Default `off` mirrors upstream PG. ContextUserset: `SET

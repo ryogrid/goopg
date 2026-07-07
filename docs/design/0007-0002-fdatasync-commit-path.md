@@ -117,3 +117,58 @@ both code paths return the same error type.
   - `postgres/src/backend/utils/misc/guc_tables.c::wal_sync_method` —
     GUC selector for the sync method (deferred; v0 picks fdatasync on
     Linux statically).
+
+## Follow-up (2026-07-08): `wal_sync_method` GUC
+
+The "deferred" selector above is now registered and live for the two
+methods that map onto a single syscall call:
+
+- `internal/config/defaults.go` registers `wal_sync_method` as a
+  `TypeEnum` GUC (`ContextSigHup`, matching upstream's `PGC_SIGHUP` in
+  `guc_tables.c`), `EnumOptions: []string{"fsync", "fdatasync",
+  "open_sync", "open_datasync"}` (`fsync_writethrough` excluded —
+  Windows/macOS-only in upstream too, gated behind
+  `HAVE_FSYNC_WRITETHROUGH`), `BootVal: "fdatasync"` (matches
+  upstream's `PLATFORM_DEFAULT_WAL_SYNC_METHOD` on Linux).
+- `wal.Config.SyncMethod` carries the value into the writer;
+  `withDefaults` normalizes empty to `"fdatasync"` so every existing
+  caller that doesn't set it explicitly keeps today's behaviour
+  byte-for-byte.
+- `flushUpTo`'s per-segment sync call is now `state.doSync(f)`, a
+  closed two-way switch: `"fsync"` calls the new `fullSync` helper
+  (`unix.Fsync` on Linux, `f.Sync()` elsewhere — identical to
+  `dataSync` on non-Linux, since there's no separate fdatasync
+  primitive to skip there either); everything else runs the existing
+  `dataSync` (`fdatasync`) path.
+- `cmd/goopg/main.go` reads the GUC (`stringGUC(registry,
+  "wal_sync_method", "fdatasync")`) and threads it through
+  `initdb.OpenOptions.WALSyncMethod` → `wal.Config.SyncMethod`,
+  mirroring the `wal_init_zero`/`wal_buffers` wiring already in place.
+
+**Deliberately not implemented in this loop**: `open_sync` and
+`open_datasync`. Upstream applies these via `O_SYNC`/`O_DSYNC` at
+segment *open* time, not at flush time — every WAL segment-open site
+(`openSegment`, preallocation, and potentially the AIO submission
+path in `internal/aio` if segment I/O routes through it) would need
+to become sync-method-aware, not just `flushUpTo`. `NewWriter` accepts
+these two values at the GUC layer (so `SHOW wal_sync_method` /
+`pg_settings` stay upstream-shaped) but rejects them at Writer
+construction with `wal.ErrUnsupportedSyncMethod`, mirroring
+`internal/aio`'s `io_method=io_uring` → `ErrUnsupportedMethod`
+precedent (`internal/aio/aio.go`). See
+`.ralph/deferral_ledger.md`'s 2026-07-08 row for the resume point.
+
+Also out of scope: live reconfiguration on `SIGHUP`/`reload`. The GUC
+is registered `ContextSigHup` for upstream-accurate metadata, but
+goopg's `reload` control-socket command is still a documented no-op
+stub (separate open item), and the WAL `Writer` reads `SyncMethod`
+once at construction — same limitation every other
+`ContextPostmaster`/`ContextSigHup` WAL GUC already has here.
+
+Verification: `internal/wal/sync_method_test.go` — default resolves
+to `fdatasync`; both `fsync` and `fdatasync` round-trip a real
+Append→FlushUpTo→Close→ReadAll cycle; `open_sync`/`open_datasync`/an
+arbitrary bogus value all fail `NewWriter` with
+`errors.Is(err, ErrUnsupportedSyncMethod)`. Confirmed non-vacuous via
+`git stash` on the implementation files alone (test file fails to
+compile without them, not just fails an assertion).

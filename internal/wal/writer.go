@@ -67,6 +67,14 @@ var (
 	// writer refuses to open. Operators must either match the
 	// config to the existing format or migrate the data dir.
 	ErrWALFormatMismatch = errors.New("wal: configured format does not match existing data dir")
+	// ErrUnsupportedSyncMethod is returned by NewWriter when
+	// Config.SyncMethod names a wal_sync_method value this build
+	// doesn't implement (open_sync / open_datasync / fsync_writethrough
+	// require O_SYNC/O_DSYNC open-time flags or a Windows/macOS-only
+	// primitive — see the wal_sync_method GUC registration comment in
+	// internal/config/defaults.go). Mirrors internal/aio's
+	// ErrUnsupportedMethod precedent for io_method=io_uring.
+	ErrUnsupportedSyncMethod = errors.New("wal: unsupported wal_sync_method")
 )
 
 // Config controls writer and reader behavior.
@@ -153,6 +161,20 @@ type Config struct {
 	// for each WAL flush (M0057-0001). Defaults to slog.Default()
 	// when nil.
 	Logger *slog.Logger
+
+	// SyncMethod selects the commit-path durability barrier
+	// flushUpTo's dataSync stage uses, mirroring upstream's
+	// `wal_sync_method` GUC. "fdatasync" (default, empty string
+	// resolves here) skips inode-metadata flushes now that
+	// preallocated segments have a fixed size between commits;
+	// "fsync" flushes inode metadata too. "open_sync"/"open_datasync"
+	// are recognized (upstream allows them on Linux) but not yet
+	// implemented — they need O_SYNC/O_DSYNC at segment-open time
+	// across every WAL open site, not just this flush barrier — so
+	// NewWriter rejects them with ErrUnsupportedSyncMethod, matching
+	// internal/aio's io_method=io_uring precedent. See
+	// docs/design/0007-0002-fdatasync-commit-path.md.
+	SyncMethod string
 }
 
 // AIOEngine is the wal-side seam onto an AIO engine. Mirrors
@@ -207,6 +229,9 @@ func (c *Config) withDefaults() {
 	}
 	if c.PageHeaders && c.TimelineID == 0 {
 		c.TimelineID = 1
+	}
+	if c.SyncMethod == "" {
+		c.SyncMethod = "fdatasync"
 	}
 }
 
@@ -472,6 +497,12 @@ const (
 // NewWriter creates a segmented WAL writer rooted at cfg.WALDir.
 func NewWriter(cfg Config) (*Writer, error) {
 	cfg.withDefaults()
+	switch cfg.SyncMethod {
+	case "fdatasync", "fsync":
+		// implemented — dispatched in flushUpTo via state.doSync.
+	default:
+		return nil, fmt.Errorf("%w: %q", ErrUnsupportedSyncMethod, cfg.SyncMethod)
+	}
 	if err := os.MkdirAll(cfg.WALDir, 0o700); err != nil {
 		return nil, fmt.Errorf("wal: mkdir %s: %w", cfg.WALDir, err)
 	}
@@ -1720,6 +1751,18 @@ func (s *state) drainBufferUpTo(targetLSN uint64) error {
 	return s.drainBufferBytes(need, drainReasonFlush)
 }
 
+// doSync runs the commit-path durability barrier selected by
+// Config.SyncMethod (wal_sync_method). withDefaults/NewWriter
+// already normalized+validated the value, so this is a closed
+// two-way switch — "fsync" flushes inode metadata too, everything
+// else (the "fdatasync" default) skips it.
+func (s *state) doSync(f *os.File) error {
+	if s.cfg.SyncMethod == "fsync" {
+		return fullSync(f)
+	}
+	return dataSync(f)
+}
+
 func (s *state) flushUpTo(lsn uint64) error {
 	if lsn == 0 {
 		return nil
@@ -1760,12 +1803,12 @@ func (s *state) flushUpTo(lsn uint64) error {
 		if err != nil {
 			return err
 		}
-		// fdatasync on Linux (skips inode metadata that hasn't
-		// changed thanks to preallocation), full fsync fallback
-		// elsewhere. See
-		// docs/design/0007-0002-fdatasync-commit-path.md.
-		if err := dataSync(f); err != nil {
-			return fmt.Errorf("wal: fdatasync %s: %w", f.Name(), err)
+		// wal_sync_method dispatch: fdatasync on Linux (skips inode
+		// metadata that hasn't changed thanks to preallocation) is
+		// the default; fsync additionally flushes inode metadata.
+		// See docs/design/0007-0002-fdatasync-commit-path.md.
+		if err := s.doSync(f); err != nil {
+			return fmt.Errorf("wal: %s %s: %w", s.cfg.SyncMethod, f.Name(), err)
 		}
 		if s.walBufferCounters != nil {
 			s.walBufferCounters.fsyncCount.Add(1)
