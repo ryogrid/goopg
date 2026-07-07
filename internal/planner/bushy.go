@@ -1594,7 +1594,68 @@ func remapByPosMap(e *Expr, posMap func(int) int) {
 		if x.Else != nil {
 			remapByPosMap(&x.Else, posMap)
 		}
+	case *ExistsExpr:
+		// Unlike InExpr, EXISTS/NOT EXISTS subqueries are never
+		// unnested into a join by this point (M0071-0009's Semi/Anti
+		// unnesting only fires for equality-correlated IN/=ANY
+		// shapes) — the inner Plan is evaluated in place at
+		// filter/leaf time with the outer row supplied via
+		// ctx.OuterRows, indexed by the correlated OuterColumnRef's
+		// Index. That Index was resolved against the PRE-rewrite
+		// (OID-sorted) outer schema; after the MultiHashJoin rewrite
+		// reorders columns, it must be translated through the same
+		// posMap or it silently reads the wrong outer column
+		// (AI-20260707-000712-005 / TPC-H Q21: read l_comment where
+		// l_suppkey was meant, producing a numeric-cast error on
+		// text).
+		remapOuterRefsInSubplan(x.Plan, 1, posMap)
+	case *SubqueryExpr:
+		remapOuterRefsInSubplan(x.Plan, 1, posMap)
+	case *ArraySubqueryExpr:
+		remapOuterRefsInSubplan(x.Plan, 1, posMap)
 	}
+}
+
+// remapOuterRefsInSubplan walks a correlated subquery's inner plan
+// (ExistsExpr.Plan / SubqueryExpr.Plan / ArraySubqueryExpr.Plan) and
+// translates any OuterColumnRef whose Level places it at the scope
+// currently being remapped (depth) through posMap. depth starts at 1
+// for the subquery's immediate outer scope (the plan node that owns
+// the Filter/Project/Sort/Aggregate currently being remapped by
+// remapByPosMap) and increases by one for each further level of
+// subquery nesting encountered, matching the ctx.OuterRows stack
+// depth `Level` indexes against at evaluation time (see
+// executor/expr.go's OuterColumnRef case).
+//
+// remapByPosMap only rewrites the ColumnRef/BinaryOp/etc. skeleton of
+// the predicate/target it is given; it does not otherwise descend
+// into a correlated subquery's own plan tree, so without this an
+// EXISTS or scalar subquery referencing the outer row would silently
+// keep stale pre-MultiHashJoin-rewrite indices.
+func remapOuterRefsInSubplan(node Node, depth int, posMap func(int) int) {
+	if node == nil {
+		return
+	}
+	var visit func(Expr)
+	visit = func(e Expr) {
+		switch x := e.(type) {
+		case *OuterColumnRef:
+			if x.Level == depth {
+				x.Index = posMap(x.Index)
+			}
+		case *ExistsExpr:
+			remapOuterRefsInSubplan(x.Plan, depth+1, posMap)
+		case *SubqueryExpr:
+			remapOuterRefsInSubplan(x.Plan, depth+1, posMap)
+		case *ArraySubqueryExpr:
+			remapOuterRefsInSubplan(x.Plan, depth+1, posMap)
+		case *InExpr:
+			if x.Plan != nil {
+				remapOuterRefsInSubplan(x.Plan, depth+1, posMap)
+			}
+		}
+	}
+	walkPlanExprs(node, visit)
 }
 
 // buildMHJPosMap returns a position map from old (FROM‑order

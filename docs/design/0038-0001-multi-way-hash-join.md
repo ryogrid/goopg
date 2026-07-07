@@ -220,3 +220,87 @@ Join(p_partkey = ps_partkey)
 - `internal/executor/operator.go` — `Operator` interface
 - `internal/executor/executor.go:21-169` — `Build()` dispatch
 - `analysis/tpch-spill-hash-join-results.md` — Q2 24.8 GB RSS
+
+## 8. Follow-up: correlated EXISTS/subquery outer-refs not remapped after the MHJ rewrite (2026-07-07, AI-20260707-000712-005)
+
+**Symptom:** TPC-H Q21 (nightly sweep) failed with `pq: invalid input syntax
+for type numeric: "slyly bold packages haggle against the instructions"
+(22P02)` — an `l_comment` (text) value being fed into a numeric comparison.
+Minimal repro needed all three of: (a) ≥3 FROM-clause tables so bushy DP fires
+the `MultiHashJoin` rewrite (§4), (b) a `WHERE`-level `EXISTS`/`NOT EXISTS` or
+scalar subquery correlated back to one of those tables, (c) the correlated
+column NOT be the first column of its source table (so a wrong-index read
+lands on a different, differently-typed column instead of coincidentally
+reading the right one).
+
+**Root cause:** `buildMHJPosMap` (bushy.go) computes a position map from the
+*pre-rewrite* schema (tables concatenated in OID-sorted order — see
+`buildMHJPosMap`'s "Sort by OID to get FROM-order" step) to the
+`MultiHashJoin`'s own table order (`mh.Tables`, driven by
+`ProbeTable`/chain-lookup order, generally *not* OID order). Every
+Filter/Project/Sort/Aggregate expression sitting above the rewritten
+`MultiHashJoin` is walked through this map by `remapByPosMap` so its
+`ColumnRef.Index` values track the new layout.
+
+`remapByPosMap`'s switch had no case for `*ExistsExpr` / `*SubqueryExpr` /
+`*ArraySubqueryExpr`. Both are evaluated as an inline correlated subplan at
+filter/leaf-eval time (`evalExistsExpr`/`evalSubquery`, `internal/executor/expr.go`)
+— the executor pushes the *current* outer row (already in the new,
+post-rewrite column order, since it comes straight from
+`multiHashJoinOp.virtualOut`) onto `ctx.OuterRows`, and the inner plan's
+`OuterColumnRef.Index` indexes directly into that row. Since the index was
+never translated, it silently pointed at the *pre-rewrite* column position
+inside the *post-rewrite* row — for Q21's `l1.l_suppkey` reference this landed
+on `l_comment` a few columns off, and the resulting text value blew up the
+`NOT LIKE`/numeric comparison it was checked against.
+
+Contrast with `InExpr` (already handled, deliberately left as a no-op per the
+existing "already remapped" comment): correlated `IN`/`= ANY` subqueries are
+unnested into a Semi/Anti join by `unnestExistsExpr` *before* bushy DP runs,
+so by the time `remapByPosMap` sees an `InExpr` it is almost always the
+non-correlated/residual shape and genuinely needs no outer-ref fix-up. EXISTS
+and scalar subqueries have no such unnesting pass and reach this point with
+their `OuterColumnRef`s intact.
+
+**Fix:** `internal/planner/bushy.go` — `remapByPosMap` now dispatches
+`*ExistsExpr`/`*SubqueryExpr`/`*ArraySubqueryExpr` to a new
+`remapOuterRefsInSubplan(node, depth, posMap)`, which walks the subquery's
+inner plan via the existing `walkPlanExprs` node-tree walker and remaps any
+`OuterColumnRef` whose `.Level` matches the current nesting `depth` (starting
+at 1 for the immediate outer scope, incrementing across further nested
+Exists/Subquery/In so a doubly-nested correlated reference is translated by
+the correct enclosing scope's posMap, not the wrong one).
+
+**Verification:**
+- New minimal repro (`select ... from supplier, lineitem l1, orders where ...
+  and exists (...)/not exists (...)`) — previously errored, now returns rows.
+- Correlated scalar subquery variant (`(select count(*) from lineitem l2
+  where ...)` in the SELECT list of a 3-way join) — same failure mode,
+  same fix, confirmed via manual repro.
+- `scripts/pg-oracle-diff.sh` byte-for-byte match against vanilla PostgreSQL
+  18.3 on a small synthetic dataset built specifically to include the exact
+  `l_comment` string that broke Q21 (to rule out coincidental correctness).
+- Full TPC-H Q21 via `tmp/tpch-runner -queries 21`: `OK elapsed=91.97s
+  rows=370` (was: hard error at ~21-192s depending on server warmth).
+- `go test ./internal/planner/... ./internal/executor/...`: PASS, no
+  regressions.
+- Reverting just this hunk (`git stash push -- internal/planner/bushy.go`)
+  restores the exact original failure — confirms the fix is load-bearing, not
+  incidental.
+
+**Deferred / discovered, NOT part of this fix (see `.ralph/deferral_ledger.md`
+and `.ralph/fix_plan.md`):** while validating via `scripts/tpch-spotcheck.sh`,
+Q13 was found failing independently (`operator NOT LIKE requires string
+operands (got left.Kind=5 right.Kind=3)` — a `Time`-kind value read where
+`o_comment` (String) was expected, inside a `LEFT OUTER JOIN ... ON ... AND
+o_comment NOT LIKE '...'` plan whose `Filter: (o_comment NOT LIKE ...)` gets
+pushed onto the bare `orders` seq-scan). Confirmed via `git stash` that this
+reproduces identically with this section's fix removed — it is a pre-existing,
+unrelated regression (almost certainly a sibling case of the same class of
+bug: an ON-clause conjunct's `ColumnRef.Index` not being correctly shifted
+when pushed down onto a single table's own scan schema, cf. the M0110-0003
+LEFT JOIN inner-only pushdown fix in
+`internal/planner/pushdown.go`/`shiftColumnRefsBy`). Not fixed here to keep
+this loop's task scope to the assigned Q21 item; filed as a new top-priority
+fix_plan.md entry since it blocks the mandatory Q12/Q13 spot-check gate for
+every subsequent executor/planner change.

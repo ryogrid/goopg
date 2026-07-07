@@ -720,12 +720,91 @@ every clean, green (build + pre-commit) checkpoint.
       `go test -v -run '^TestPort_IsolationEvalPlanQualTrigger$'
       ./internal/testport/` PASS (byte-for-byte match across all 38 active
       permutations, matching the design 0118-0095 promotion's original bar).
-- [ ] tpch/Q21-error — Q21 errored during the sweep (AI-20260707-000712-005;
+- [x] tpch/Q21-error — Q21 errored during the sweep (AI-20260707-000712-005;
       repro: `tmp/tpch-nightly-runner -port 65433 -db postgres -user
       <superuser> -queries 21 -per-query-timeout 1200s` against a server on
       `bench/tpch/runtime_goopg/data`, port 65433 when free, or a copy first
       — `ci/design/05-tpch-stage.md` §A; evidence:
-      `ci/logs/20260707-000712/tpch/run.log`).
+      `ci/logs/20260707-000712/tpch/run.log`). **FIXED 2026-07-07**: root
+      cause was `internal/planner/bushy.go`'s `remapByPosMap` — used to
+      translate `ColumnRef.Index` values above a `MultiHashJoin` (≥3-table
+      chain rewrite, §4 of `docs/design/0038-0001-multi-way-hash-join.md`)
+      from the pre-rewrite (OID-sorted) schema to the MHJ's own table order
+      — had no case for `*ExistsExpr`/`*SubqueryExpr`/`*ArraySubqueryExpr`.
+      Both evaluate their inner plan inline at filter/leaf time against the
+      *current* (post-rewrite) outer row via `ctx.OuterRows` +
+      `OuterColumnRef.Index` (`internal/executor/expr.go`), so an
+      un-translated index silently read the wrong outer column — Q21's
+      correlated `l1.l_suppkey` reference landed on `l_comment` a few
+      columns off, blowing up the numeric comparison it fed into
+      (`pq: invalid input syntax for type numeric: "slyly bold packages
+      haggle against the instructions"`). Added
+      `remapOuterRefsInSubplan(node, depth, posMap)` (walks the subquery's
+      inner plan via the existing `walkPlanExprs` node-tree walker,
+      remapping any `OuterColumnRef` whose `.Level` matches the current
+      nesting depth) and wired it in for all three expr types;
+      deliberately left `InExpr` alone (already correctly a no-op here —
+      correlated IN/=ANY is unnested into a Semi/Anti join by
+      `unnestExistsExpr` *before* bushy DP runs, per the existing comment).
+      Verified: minimal repro (3-way join + correlated EXISTS/NOT EXISTS)
+      and a correlated-scalar-subquery variant both previously errored, now
+      pass; `scripts/pg-oracle-diff.sh` byte-for-byte match against vanilla
+      PostgreSQL 18.3 on a small synthetic dataset built with the exact
+      `l_comment` string that broke Q21 (rules out coincidental
+      correctness); full Q21 via `tmp/tpch-runner -queries 21`: `OK
+      elapsed=91.97s rows=370` (was: hard error); reverting just this hunk
+      (`git stash push -- internal/planner/bushy.go`) reproduces the
+      original failure exactly, confirming the fix is load-bearing. Gates:
+      `go build ./...` clean; `go test ./internal/planner/...
+      ./internal/executor/...` PASS (no regressions); `RALPH_PRECOMMIT_SCOPE=
+      smoke bash scripts/ralph-precommit-test.sh` PASS (0 failed
+      transactions, standard/simple-update/select-only). Design doc:
+      `docs/design/0038-0001-multi-way-hash-join.md` new §8 (already
+      indexed in `docs/design/README.md`). **Newly discovered while
+      validating via `scripts/tpch-spotcheck.sh` (out of this loop's
+      scope, filed as a new item below):** TPC-H Q13 fails independently
+      of this fix (confirmed via `git stash` — reproduces identically with
+      this hunk removed) with `operator NOT LIKE requires string operands
+      (got left.Kind=5 right.Kind=3)` — see the new `tpch/Q13-regression`
+      item below.
+- [ ] tpch/Q13-regression — **NEW, discovered 2026-07-07 while verifying the
+      Q21 fix above, not itself part of AI-20260707-000712-005.** `scripts/
+      tpch-spotcheck.sh` (the mandated pre-commit Q12/Q13 spot-check for any
+      executor/planner change) now FAILS: `Q13: ERROR after 0.00s — pq:
+      operator NOT LIKE requires string operands (got left.Kind=5 right.Kind=3)
+      (42883)` (Kind=5 is `KindTime`, Kind=3 is `KindString` —
+      `internal/executor/datum.go`'s `DatumKind` iota order). Repro (fresh
+      server on `bench/tpch/runtime_goopg/data`, superuser@postgres):
+      `select c_custkey, count(o_orderkey) as c_count from customer left
+      outer join orders on c_custkey = o_custkey and o_comment not like
+      '%special%requests%' group by c_custkey` — `EXPLAIN` shows `Filter:
+      (o_comment NOT LIKE '%special%requests%')` pushed onto the bare `Seq
+      Scan on public.orders` node of a `Nested Loop (LEFT)`; `o_comment` is
+      `orders`'s LAST column (index 8, `character varying`) but the filter
+      appears to read column 0 (`o_orderdate`, `timestamp` → `KindTime`)
+      instead — a `ColumnRef.Index` not being correctly shifted when an
+      ON-clause conjunct is pushed down onto a single table's own scan
+      schema. Confirmed via `git stash` (removing the Q21 fix above,
+      rebuild, rerun) that this reproduces byte-for-byte identically either
+      way — genuinely independent of this loop's change. Likely the same
+      class of bug as the M0110-0003 LEFT JOIN inner-only ON-conjunct
+      pushdown fix (`internal/planner/pushdown.go`'s `classifyConjunctSide`/
+      `walkColumnRefs` vs `internal/planner/planner.go`'s
+      `shiftColumnRefsBy` — that fix added missing node cases to both
+      sibling functions; this may be a similar sibling-divergence or a
+      different pushdown site entirely reached by the same `customer LEFT
+      JOIN orders ON ... AND <col-not-first> NOT LIKE ...` shape).
+      **Priority: HIGH — blocks the mandatory Q12/Q13 spot-check gate for
+      every subsequent executor/planner change** (the machine-enforced git
+      hook only runs the lighter pgbench smoke, so this does not block
+      commits outright, but Hard-won Rule #1 requires the full spot-check
+      for executor/planner work). Not fixed in the loop that discovered it
+      (Q21 was the assigned task; ONE task per loop). Resume point: `git
+      log --oneline -- internal/planner/pushdown.go internal/planner/
+      planner.go` to find which of the many 2026-07-06 commits introduced
+      this (Q13=33 was confirmed passing as recently as loop #50/#53 that
+      day per the entries above), then trace the ON-clause pushdown path for
+      a `LEFT OUTER JOIN customer/orders` plan shape specifically.
 - [ ] tpch/Q15b-MAIN-explain — EXPLAIN Q15b-MAIN errored during the
       plan-capture pass (AI-20260707-000712-006; repro: `tmp/tpch-nightly-
       runner -port 65433 -db postgres -user <superuser> -queries 15 -explain
