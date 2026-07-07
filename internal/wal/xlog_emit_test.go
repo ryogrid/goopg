@@ -477,3 +477,29 @@ func TestPageEmissionLegacyDefaultUnchanged(t *testing.T) {
 		t.Fatalf("legacy default produced different bytes:\n  PageHeaders=unset (zero-value): %x\n  PageHeaders=false explicit:    %x", a, b)
 	}
 }
+
+// TestExtractRecordBytesCapBoundedByWantBytes guards the M-NIGHTLY
+// AC-003 restart-timeout regression (deferral ledger 2026-07-07):
+// extractRecordBytes used to allocate cap(stream) — the entire
+// REMAINING input, often most of a 16MB WAL segment — even when
+// wantBytes (a single record's header or padded body) was a few
+// dozen bytes. readAllPageAware calls this twice per record, and
+// initdb.Open runs several independent full-WAL replay passes, so
+// a handful of small records turned into tens of seconds of
+// allocation+memclr. The returned slice's capacity must scale with
+// wantBytes, not with the size of a large caller-supplied buffer.
+func TestExtractRecordBytesCapBoundedByWantBytes(t *testing.T) {
+	const wantBytes = 24
+	hugeStream := make([]byte, 16<<20) // 16 MiB, mirrors a full WAL segment
+	// Byte 0 is a page-boundary header; make it non-zero so the
+	// EOS/all-zero-header short-circuit doesn't take over and the
+	// loop actually reaches the make() under test.
+	for i := range hugeStream[:SizeOfXLogShortPHD] {
+		hugeStream[i] = 0xAB
+	}
+	recordBytes, _ := extractRecordBytes(hugeStream, 0, 16<<20, wantBytes)
+	if got := cap(recordBytes); got > wantBytes {
+		t.Fatalf("extractRecordBytes over-allocated: cap=%d, want <= wantBytes=%d (stream was %d bytes)",
+			got, wantBytes, len(hugeStream))
+	}
+}

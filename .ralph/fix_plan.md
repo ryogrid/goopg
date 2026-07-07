@@ -2007,6 +2007,48 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       unconfirmed; see the ledger row for the exact resume point (each
       blocked test already has a reusable removal-then-restart repro built
       in, no new harness needed).
+      **2026-07-07 update: restart-timeout blocker CLOSED, AC-003/AC-004
+      cluster fully unblocked.** Root-caused via CPU profiling
+      (`pprof.StartCPUProfile` around a throwaway `initdb.Open` probe on the
+      exact stop→remove-file→restart repro, not the eager-file-open
+      hypothesis above — that was refuted: `go tool pprof -top` showed no
+      `openat`/file-scan cost at all, 70% of samples were in
+      `runtime.memclrNoHeapPointers`). Root cause:
+      `internal/wal/xlog_emit.go`'s `extractRecordBytes(stream, streamStart,
+      segSize, wantBytes)` allocated `make([]byte, 0, len(stream))` — the
+      entire REMAINING input (callers pass `stream[off:]`, so this is close
+      to the full WAL segment size, e.g. 16 MB, for records near the file
+      start) — regardless of `wantBytes` (a single record's 24-byte header or
+      padded body). `readAllPageAware` calls this twice per record, and
+      `initdb.Open` runs several independent full-WAL replay passes
+      (`replayEventTriggerDDLRecords`/`replayOperatorClassDDLRecords`/
+      `replayCLogFromWAL`/`replayRangeTypeDDLRecords`/`replayViewRecords`/
+      more, each via `wal.ReadAll`), so a handful of small DDL/heap records
+      multiplied into 20-40s of allocation+memclr — not specific to the
+      missing-file scenario per se (any startup with enough real WAL pays
+      this), but the AC-003 corruption tests are the first path in the port
+      suite with both non-trivial WAL and a tight (20s) restart budget. Fix:
+      allocate `make([]byte, 0, min(wantBytes, len(stream)))` instead — a
+      strict reduction, safe because the loop's own `len(recordBytes) <
+      wantBytes` guard means it can never append past `wantBytes`. Verified
+      via the exact profiling repro: `initdb.Open` on the broken data dir
+      dropped from 23.57s to 0.18s. New regression test
+      `TestExtractRecordBytesCapBoundedByWantBytes`
+      (`internal/wal/xlog_emit_test.go`), confirmed non-vacuous via `git
+      stash` on `xlog_emit.go` alone (fails with `cap=16777216`). All four
+      previously-blocked tests
+      (`TestPort_PgAmcheck003CombinedCorruption`/`003MissingIndexFork`/
+      `003MissingHeapFile`/`003SchemaScoped`) now PASS — **AC-003/AC-004 have
+      no open blockers remaining.** Gates: `go build ./...` clean; `go test
+      ./internal/wal/... ./internal/initdb/... ./internal/executor/...
+      ./internal/amcheck/... ./internal/catalog/...` PASS; `go test -v -run
+      '^TestPort_PgAmcheck003' ./internal/testport/` PASS (4/4);
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed, all 3 workloads). Design:
+      `docs/design/0110-0003-pg-amcheck-tap-port.md` new "Follow-up
+      (2026-07-07): AC-003 restart-timeout blocker closed" section;
+      `docs/design/README.md` row updated.
 - [ ] **M0119-0007 — pg_basebackup recvlogical** (source: M0095-0003). `030 recvlogical`
       — blocked on logical decoding (tracks the logical-replication milestone / D-004).
 

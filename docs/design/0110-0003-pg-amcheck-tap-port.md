@@ -787,3 +787,54 @@ Gates: `go build ./...` clean; `go test ./internal/executor/...
 ./internal/catalog/... ./internal/amcheck/...` PASS; `scripts/tpch-spotcheck.sh`
 PASS (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
 scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 workloads).
+
+## Follow-up (2026-07-07): AC-003 restart-timeout blocker closed — `extractRecordBytes` was allocating a whole WAL segment per record
+
+Root-caused the "restart cluster after removal: start timeout after 20s"
+blocker the previous follow-up left open, via CPU profiling
+(`pprof.StartCPUProfile` around a throwaway `initdb.Open` probe against the
+exact stop→remove-file→restart repro) rather than more static tracing —
+`go tool pprof -top` showed 70% of all samples in `runtime.memclrNoHeapPointers`
+reached through `wal.extractRecordBytes`'s `make([]byte, 0, len(stream))`
+(`internal/wal/xlog_emit.go:163`, pre-fix).
+
+Bug: `extractRecordBytes(stream, streamStart, segSize, wantBytes)` is called
+twice per WAL record by `readAllPageAware` (once for the 24-byte
+`xlogRecordHeaderSize` header, once for the record's own `paddedTotal` body)
+and by the writer's equivalent scan path. Every call allocated capacity
+`len(stream)` — the entire **remaining** input, since callers pass
+`stream[off:]` — regardless of `wantBytes`. For a record near the start of a
+16 MB WAL segment, extracting a 24-byte header allocated and zero-filled
+~16 MB. `initdb.Open` runs several independent full-WAL replay passes
+(`replayEventTriggerDDLRecords`, `replayOperatorClassDDLRecords`,
+`replayCLogFromWAL`, `replayRangeTypeDDLRecords`, `replayViewRecords`, and
+more via `wal.ReadAll`/`ReplayFromDirWithMgr`), so even a handful of small
+DDL/heap records multiplied into tens of seconds of allocation+memclr —
+comfortably blowing the 20s `cluster.Start()` budget every corruption test in
+this file relies on. Not specific to the missing-file scenario itself: any
+startup with enough real WAL content pays this cost, but the corruption tests
+are the first path in the port suite that both (a) has non-trivial WAL to
+replay and (b) restarts under a tight harness timeout, which is why it
+surfaced here.
+
+Fix: `extractRecordBytes` now allocates `make([]byte, 0, min(wantBytes,
+len(stream)))` — the loop can never append more than `wantBytes` bytes (its
+own `len(recordBytes) < wantBytes` guard), so this is a strict reduction in
+over-allocation, not a behavior change. Verified via the exact profiling
+repro: `initdb.Open` on the broken data dir dropped from 23.57s to 0.18s.
+
+Regression test: `TestExtractRecordBytesCapBoundedByWantBytes`
+(`internal/wal/xlog_emit_test.go`) asserts `cap(recordBytes) <= wantBytes`
+against a 16 MiB synthetic stream with `wantBytes=24`; confirmed non-vacuous
+via `git stash` on `xlog_emit.go` alone (fails with `cap=16777216`).
+
+Result: all four previously-blocked AC-003 corruption tests
+(`TestPort_PgAmcheck003CombinedCorruption`, `003MissingIndexFork`,
+`003MissingHeapFile`, `003SchemaScoped`) now PASS. **AC-003/AC-004 are fully
+unblocked — no open blockers remain in this cluster.**
+
+Gates: `go build ./...` clean; `go test ./internal/wal/... ./internal/initdb/...
+./internal/executor/... ./internal/amcheck/... ./internal/catalog/...` PASS;
+`go test -v -run '^TestPort_PgAmcheck003' ./internal/testport/` PASS (4/4);
+`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 workloads).
