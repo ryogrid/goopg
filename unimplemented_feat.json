@@ -13,6 +13,7 @@
    "feature": "Optimize WAL logical change record storage to reduce write-ahead log volume growth during database initialization.",
    "task_id": null,
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "Logical change records to restore the optimisation are deferred to a post-M0002 milestone"
    ],
@@ -27,7 +28,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: No WAL logical change record optimization found in codebase"
+   "code_audit": "RESOLVED 2026-07-07: Logical change-record WAL optimization is implemented — see `docs/design/0002-0003-redo-records.md` (all sub-loops a-d landed) and `internal/wal/recovery.go:31-63` (RecordKindHeapInsert/BtreeInsert/HeapDelete/HeapVacuum) + `internal/storage/bufpool.go:1502` (Pool.MarkDirtyChangeRecord). pgbench-i WAL volume documented as dropping from ~1.6GB to ~21MB. Note: the design doc's own Status field and docs/design/README.md:67 still literally say \"draft\" despite the code being landed and exercised — a docs-hygiene gap, not a code gap."
   },
   {
    "feature": "Implement signal-based configuration refresh (SIGHUP-style) for the reload command so configuration changes take effect without restarting the server.",
@@ -74,6 +75,7 @@
    "feature": "Implement tablespace support for directing table and index storage to different physical locations.",
    "task_id": null,
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "v0 deliberately defers — tablespaces"
    ],
@@ -297,6 +299,7 @@
    "feature": "DELETE row identification when pgoutput emits empty K body; row identity unavailable for xmax stamping",
    "task_id": null,
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "pgoutput emits an empty K body so the row to stamp xmax on isn't identifiable; tracked as a wire-format extension follow-up"
    ],
@@ -311,7 +314,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/wal/pgoutput.go:17 states v0 DELETE has no pre-image"
+   "code_audit": "RESOLVED 2026-07-07: pre-image capture + 'O' full-old-tuple pgoutput DELETE encoding is implemented end-to-end (internal/wal/recovery.go:6593-6637, internal/executor/operators_storage.go:5469-5493, internal/wal/pgoutput.go:231-251). The only stale artifact is the file-header comment at internal/wal/pgoutput.go:17 (\"D Delete (no pre-image in v0; tuple body is 0 attrs)\"), which no longer reflects the code below it. Residual gap: capture is unconditional (always full old row) rather than gated by each table's configured REPLICA IDENTITY (DEFAULT/NOTHING/USING INDEX), so it over-sends compared to strict PG semantics — not a functional regression, but worth a follow-up note."
   },
   {
    "feature": "MESSAGE message type ('M') in pgoutput",
@@ -339,6 +342,7 @@
    "feature": "Per-slot catalog-xmin retention hook in vacuum and pruning operations",
    "task_id": null,
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "the per-slot catalog-xmin retention hook in vacuum / pruning remain deferred"
    ],
@@ -353,7 +357,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: No per-slot catalog-xmin retention hook in vacuum operations"
+   "code_audit": "confirmed-open: internal/mvcc/manager.go:586-602 (OldestXmin) never consults wal.Slots/Slot.CatalogXmin (internal/wal/slots.go:70-76); internal/vacuum/*.go has no slot-awareness at all. Design doc docs/design/0008-0001-logical-decoding-pipeline.md:131-144 self-documents the gap as unresolved."
   },
   {
    "feature": "EXPLAIN SETTINGS option rendering to display configuration settings; currently parsed but produces no output.",
@@ -381,6 +385,7 @@
    "feature": "Optimize performance by deferring Wait across sequential Appends in the WAL writer loop to enable true pipelining",
    "task_id": "m0009",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "Real perf-pipelining waits on a loop redesign that defers Wait across Appends"
    ],
@@ -401,6 +406,7 @@
    "feature": "Handling schema changes during a logical slot's lifetime (currently surfaces as decoder errors)",
    "task_id": "M0008",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "Schema changes during the slot's life surface as decoder errors when they bite — out of scope for the M0008 first acceptance bar"
    ],
@@ -421,6 +427,7 @@
    "feature": "wal_sync_method GUC selector to configure WAL synchronization method.",
    "task_id": "M0007",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "wal_sync_method GUC selector ... remain deferred"
    ],
@@ -441,6 +448,7 @@
    "feature": "WAL segment recycling to reuse old segments instead of unlinking.",
    "task_id": "M0007",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "`wal_recycle` ... remain deferred"
    ],
@@ -461,6 +469,7 @@
    "feature": "Eager next-segment lookahead for WAL preallocation optimization.",
    "task_id": "M0007",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "eager next-segment lookahead ... remain deferred"
    ],
@@ -475,12 +484,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/config/defaults.go: WAL preallocation optimization not found"
+   "code_audit": "PARTIAL: WAL segment preallocation of the current segment on first open is implemented (internal/wal/writer.go:1896-1961, wal_init_zero GUC), landed via docs/design/0007-0001-wal-segment-preallocation.md. Still missing: eager next-segment lookahead (pre-creating segment N+1 in the background before the write head reaches it) — state.openSegment (writer.go:1896) only preallocates synchronously when a segment is first needed."
   },
   {
    "feature": "Counters for WAL preallocation metrics and monitoring.",
    "task_id": "M0007",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "counters ... remain deferred"
    ],
@@ -501,6 +511,7 @@
    "feature": "parsePrimaryConninfo does not parse user, sslmode, password, and other libpq parameters beyond host and port",
    "task_id": "m0005",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "user / sslmode / etc. follow in later loops"
    ],
@@ -515,12 +526,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: cmd/goopg/main.go:975-984 parsePrimaryConninfoFull omits sslmode password"
+   "code_audit": "PARTIAL: cmd/goopg/main.go:971-1000 parsePrimaryConninfoFull now parses host/port/application_name/user (user landed since the old audit); sslmode and password are still unparsed/unused anywhere in the conninfo path — stale doc comment at line 958 still claims all three are deferred."
   },
   {
    "feature": "Multi-timeline WAL operations are not implemented",
    "task_id": "m0005",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "Out-of-scope: multi-timeline operation"
    ],
@@ -535,12 +547,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: Commit message explicitly lists multi-timeline operation as out-of-scope"
+   "code_audit": "confirmed-open: internal/server/replication.go:407-408,427 rejects non-current TIMELINE on START_REPLICATION (\"START_REPLICATION TIMELINE %d not supported (v0 is single-timeline)\"); docs/design/0005-0001-streaming-replication-architecture.md:305-307 lists \"Multi-timeline operation\" out of scope."
   },
   {
    "feature": "Cascading replication (standby replicating to other standby instances) is not implemented",
    "task_id": "m0005",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "Out-of-scope: cascading replication"
    ],
@@ -555,12 +568,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/server/replication.go:1-11 START_REPLICATION deferred, cascading not found"
+   "code_audit": "confirmed-open: docs/design/0005-0001-streaming-replication-architecture.md:308 \"Cascading replication (standby-of-standby). Single-hop only.\" — no forwarding code found in internal/server/replication.go (note: the old audit's premise that START_REPLICATION itself is deferred is stale; START_REPLICATION is implemented at internal/server/replication.go:400-680, only cascading/forwarding is missing)."
   },
   {
    "feature": "Streaming replication implementation is deferred across approximately 25 follow-up items spanning wire protocol, WAL streaming machinery, replication slots, standby side features, configuration surface, and promotion logic",
    "task_id": "m0005",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "fix_plan.md decomposed into ~25 follow-up items grouped under: architecture, wire protocol, WAL streaming machinery, replication slots, standby side, configuration surface, promotion"
    ],
@@ -575,7 +589,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: docs/design/0005-0001-streaming-replication-architecture.md deferral noted"
+   "code_audit": "PARTIAL: docs/design/README.md:87-93 (0005-0001..0005-0007, all accepted) + :324-333 (M0102-0001..0005, all accepted) show roughly 15 of the original ~25 follow-up items landed (wire protocol, WAL streaming, slots+retention, standby replay, observability, promotion, BASE_BACKUP, sync rep, failover E2E harness); .ralph/fix_plan.md:3121-3123 (M0122-0013, unchecked, ~10 items) tracks the remainder: cascading replication, multi-timeline operation, STANDBY_SNAPSHOT_READY transition (still only a comment at internal/wal/format.go:239), plus misc hardening items."
   },
   {
    "feature": "BETWEEN SYMMETRIC operator variant that allows reversed range endpoints",
@@ -750,6 +764,7 @@
    "feature": "Rename XLogInsert/XLogFlush API methods to align with PostgreSQL conventions",
    "task_id": "M0042-0003",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "XLogInsert/XLogFlush API rename deferred"
    ],
@@ -770,6 +785,7 @@
    "feature": "Implement WALInsertLock array to support parallel WAL inserts",
    "task_id": "M0042-0003",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "WALInsertLock array for parallel inserts deferred"
    ],
@@ -784,7 +800,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/wal/wal_buffer.go no WALInsertLock array implementation"
+   "code_audit": "PARTIAL: foundation infrastructure for an 8-stripe WALInsertLock array is built (internal/wal/padded_mutex.go appendLockSet, internal/wal/insertion_tracker.go, internal/wal/stripe_writer_core.go, internal/wal/stripe_append.go) but explicitly marked dead code awaiting a \"slice B call-site rewrite\"; the production Writer (internal/wal/writer.go:392 appendMu sync.RWMutex) still serializes all WAL appends behind a single lock, so parallel WAL inserts are not yet actually enabled."
   },
   {
    "feature": "Implement pg_index as a persistent heap table; currently stores index metadata only in Go structs",
@@ -1096,6 +1112,7 @@
    "feature": "Replay-safe WAL log handling for two-phase delete operations to ensure crash recovery consistency in B-tree indices.",
    "task_id": "M0055-0005-followup-two-phase-del",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "Two-phase deletion + replay-safe WAL coverage tracked as M0055-0005-followup-two-phase-del"
    ],
@@ -1110,7 +1127,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/access/btree/btree.go:6 WAL records for deletes deferred"
+   "code_audit": "RESOLVED 2026-07-07: M0055-0005-followup-two-phase-del landed — btree two-phase delete (PHASE 1 mark-half-dead via EncodeBtreeVacuum/replayBtreeVacuum, PHASE 2 unlink via EncodeBtreeUnlinkPage/replayBtreeUnlinkPage, both internal/wal/recovery.go) is WAL-logged and crash-replay restores half-dead state (internal/access/btree/btree_vacuum.go:100-224). Only the top-of-file package doc comment (internal/access/btree/btree.go:6) is stale and should be updated to stop saying WAL for inserts/deletes is deferred."
   },
   {
    "feature": "Empirical TPC-H Q20 wall-clock validation using HammerDB SF=1 resume run to confirm performance improvements from multi-parameter correlation unnesting.",
@@ -1680,6 +1697,7 @@
    "feature": "PostgreSQL features pg_multixact, pg_twophase, and pg_commit_ts are not implemented at the executor level and therefore have no WAL persistence",
    "task_id": null,
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "The remaining N/A entries (`pg_multixact`, `pg_twophase`, `pg_commit_ts`) correspond to features goopg has not yet implemented at the executor level"
    ],
@@ -1694,7 +1712,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: pg_multixact, pg_twophase, pg_commit_ts absent from catalog; not implemented at executor level"
+   "code_audit": "PARTIAL: pg_twophase's SQL-level 2PC (PREPARE/COMMIT/ROLLBACK PREPARED) IS implemented in-memory at the executor level (internal/server/twophase.go), so \"not implemented at executor level\" is now false for that piece — but on-disk crash-restart persistence for all three remains absent: pg_twophase state is never written to disk (internal/server/twophase.go:38-40 deferred note), pg_multixact has no runtime SLRU writes (directories are initdb placeholders only, internal/initdb/initdb.go:96-98), and pg_commit_ts has no executor implementation at all behind its registered pg_proc entries (internal/catalog/pg_proc_names_generated.go:2413)."
   },
   {
    "feature": "MarkPageHalfDead WAL record infrastructure is implemented but producer wiring is limited to BtreeVacuum flag-trailer path; other potential producers are not yet wired",
@@ -2114,6 +2132,7 @@
    "feature": "Add pg_stat_io walsummarizer backend_type rows to track WAL summarizer process statistics.",
    "task_id": "m0095-0002",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "pg_stat_io walsummarizer backend_type rows (not implemented)"
    ],
@@ -2128,7 +2147,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: No walsummarizer backend_type rows found in replication_views.go"
+   "code_audit": "RESOLVED 2026-07-07: internal/executor/pgstat_io.go:107-140 (ioBktWalSummarizer enum + \"walsummarizer\" name) wired into fetchIOStatRows/ioTracksObject; internal/executor/pgstat_io_test.go:66-80 pins 2 walsummarizer rows (wal/init, wal/normal) in pg_stat_io. Landed as part of the M0122-0003 pg_stat_io row-shape closure (docs/design/README.md:891)."
   },
   {
    "feature": "Implement CREATE/DROP DATABASE commands with full DDL support.",
@@ -2155,6 +2174,7 @@
    "feature": "No dual-process logical-replication test harness; replcluster currently supports physical replication only",
    "task_id": "M0103",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "No dual-process logical-replication test harness (replcluster is physical-only)"
    ],
@@ -2169,12 +2189,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: replcluster.go states v0 physical replication only, no logical harness"
+   "code_audit": "RESOLVED 2026-07-07: a dual-real-process logical-replication test harness exists at internal/testutil/pubsubcluster/cluster.go (since 4d7bee68) and is exercised by internal/testport/pgoutput_interop_test.go for goopg<->PG logical replication over the wire (CREATE PUBLICATION/SUBSCRIPTION). replcluster.go itself remains physical-only, but that is no longer the only harness in the tree; caveat: no test currently pairs two goopg processes specifically through pubsubcluster (only mixed goopg/PG combos are run)."
   },
   {
    "feature": "SlotDecoder.Classify must handle RecordKindPageImage records instead of dropping them",
    "task_id": "M0103-0008",
    "resume_point": "rung 12",
+   "status": "resolved",
    "evidence": [
     "first-INSERT-into-fresh-page (RecordKindPageImage kind=1) records are still dropped at the SlotDecoder.Classify stage — rung 12"
    ],
@@ -2189,12 +2210,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: classifier.go:141-144 explicitly skips PageImage records, not handled"
+   "code_audit": "RESOLVED 2026-07-07: Classify still doesn't special-case RecordKindPageImage (internal/wal/classifier.go:141-144), but that's now correct — Pool.MarkDirtyLogicalChange (internal/storage/bufpool.go:1549, wired at internal/executor/operators_storage.go:8094,8118) guarantees every heap mutation emits its own logical record independent of any FPI, per docs/design/0103-0018-heap-fpi-and-logical-record-coexistence.md. No further change needed for the heap-DML path; index/metapage paths intentionally still use FPI-only MarkDirtyChangeRecord since they carry no user-row-level logical events."
   },
   {
    "feature": "Protocol version 2 streaming subxacts with Y/A frames and parent-XID linkage (requires apply-worker subxact tracking)",
    "task_id": "M0103-0007",
    "resume_point": "Implement apply-worker subxact tracking in future rung",
+   "status": "open",
    "evidence": [
     "proto_version=2 streaming subxacts (Y/A frames + parent-XID linkage) is out of scope; promoting the default ... stays a future rung"
    ],
@@ -2236,6 +2258,7 @@
    "feature": "DDL replication (schema changes) in various shapes and scenarios",
    "task_id": "M0103-0007",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "DDL replication shapes"
    ],
@@ -2250,12 +2273,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: No DDL replication code found in initdb/relcache_init.go search"
+   "code_audit": "confirmed-open: no DDL-replication code exists anywhere in internal/wal (no DDL message kind in pgoutput.go) or internal/executor; explicitly documented as out-of-scope at docs/milestones/0008-logical-replication-support.md:161-163. (Note: this matches vanilla upstream PostgreSQL's own built-in limitation — DDL isn't natively replicated by pgoutput even in real PG — so closing this gap would be a net-new capability beyond PG parity, not a compat bug fix.)"
   },
   {
    "feature": "Standby recovery doesn't transition standbyState to STANDBY_SNAPSHOT_READY, causing pg_ctl timeout during recovery initialization.",
    "task_id": "M0105-0007",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "standbyState doesn't transition to STANDBY_SNAPSHOT_READY (causes pg_ctl timeout)"
    ],
@@ -2270,12 +2294,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: No standbyState or STANDBY_SNAPSHOT_READY implementation found in codebase"
+   "code_audit": "PARTIAL: goopg-primary to real-PG-standby now functionally reaches a queryable hot-standby state (proven by passing TestE2E_FailoverGoopgToPG, internal/testport/e2e_failover_goopg_to_pg_test.go) via the M0105-0009 shutdown-checkpoint fix (commit c8e0a444) and WAL compat fixes (M0106-0010). However the literal claim survives: real PG's postmaster.pid PMStatus field never transitions to \"ready\"/\"standby\" during recovery off a goopg-produced backup, so pg_ctl -w genuinely still times out — the test harness works around this by launching postgres directly and TCP-polling instead of using pg_ctl (internal/testutil/pgcluster/cluster.go:231-241). Root-caused but not fixed."
   },
   {
    "feature": "Standby process doesn't report PM_STATUS_STANDBY status within 120 seconds, causing pg_ctl to timeout.",
    "task_id": "M0105-0007",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "standby doesn't report PM_STATUS_STANDBY within 120s"
    ],
@@ -2290,7 +2315,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: PM_STATUS_STANDBY status reporting not found in codebase"
+   "code_audit": "PARTIAL: goopg's WAL/checkpoint output now lets a real PG standby reach a functionally-queryable hot-standby state (verified: TestE2E_FailoverGoopgToPG passes live), but PM_STATUS_STANDBY is still never actually reported through postmaster.pid within the pg_ctl-visible window — internal/testutil/pgcluster/cluster.go:231-235 documents this explicitly and bypasses pg_ctl (raw postgres exec + TCP port poll) as the workaround. The narrow \"pg_ctl times out waiting for standby status\" symptom is unresolved by design, not fixed."
   },
   {
    "feature": "WAL sender closes the replication connection before pg_basebackup considers the WAL stream complete.",
@@ -2317,6 +2342,7 @@
    "feature": "PG standby startup fails due to timeline mismatch and invalid WAL records at the redo LSN position.",
    "task_id": "M0102-0007",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "PG standby startup still fails (timeline mismatch / invalid record at redo LSN)"
    ],
@@ -2331,7 +2357,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: Timeline mismatch handling during standby startup not detected"
+   "code_audit": "RESOLVED 2026-07-07: PG-standby startup against a goopg primary no longer fails on timeline mismatch or invalid-record decoding. Fixed via checkPointCopy.PrevTimeLineID correction (commit ca818b71) and RmgrXLog-with-unknown-info routing for goopg-internal WAL payloads (internal/wal/format.go:245-254, comment cites a prior segfault this replaced). Verified live: TestE2E_FailoverGoopgToPG (internal/testport/e2e_failover_goopg_to_pg_test.go) passes both async and sync_remote_apply modes. Note: this is distinct from the still-open PM_STATUS_STANDBY/pg_ctl reporting gap — standby startup itself succeeds even though pg_ctl -w can't observe it."
   },
   {
    "feature": "Expression-based ON CONFLICT targets (e.g., lower(key)) require expression-index evaluation support, which is deferred as a separate scope beyond this testport parser fix.",
@@ -2397,6 +2423,7 @@
    "feature": "pg_waldump TAP test suite portions (2 tests with mixed BUG_FIX and UNIMPLEMENTED sections)",
    "task_id": "M0110-0002",
    "resume_point": "pg_waldump unimplemented test portions",
+   "status": "open",
    "evidence": [
     "BUG_FIX + UNIMPLEMENTED"
    ],
@@ -2411,7 +2438,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/testport/pgwaldump_port_test.go:15-23 — CLI tier ported, server tier deferred due to missing hash/gin/gist/spgist/brin index support"
+   "code_audit": "PARTIAL: hash is no longer a blocker — it is physically B-tree-backed (real WAL-generating storage) since the predicate-hash slice (internal/executor/operators_ddl.go:5877-5885, 5959). gin, gist, spgist and brin remain catalog-metadata-only with zero physical storage (operators_ddl.go:5886-5917: register catalog metadata only, no physical storage, no actual index acceleration), so no AM-specific WAL records exist for pg_waldump's server-tier filtering test to exercise. internal/testport/pgwaldump_port_test.go's server-tier deferral should be narrowed from 5 access methods to 4 (gin/gist/spgist/brin); CSV row WD-002 still correctly deferred."
   },
   {
    "feature": "GIST index support (required for index_including_gist regress test)",
@@ -3173,6 +3200,7 @@
    "feature": "Write-Ahead Logging (WAL) for MultiXact operations, enabling creation, modification, and deletion of MultiXact records to be logged and recovered after crashes.",
    "task_id": "M0118-0003",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "4-way lock-strength members + WAL persistence + spec promotion remain deferred",
     "Updater-bearing multi + WAL persistence + spec promotion deferred"
