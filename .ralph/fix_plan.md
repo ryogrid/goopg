@@ -2244,6 +2244,15 @@ mirroring M0119's ledger `status` column.
       `joinOp.openLateral` and the SRF's arg evaluated against a nil outer
       row (`XX000: column ref arr/1 on nil slot`). No FROM-clause
       SRF-correlation gap is known open now.
+      **Correction (2026-07-08):** this task's own summary line claimed
+      `pg_get_serial_sequence` was "already implemented, verified 2026-07-04"
+      — that verification was wrong. It was a convention-based stub
+      (`table_col_seq` fabrication) that ignored actual sequence ownership,
+      confirmed still-open in `unimplemented_feat.json` and fixed this loop:
+      now resolves the column's real OWNED-BY sequence via
+      `FindSequenceOwnedBy` (NULL for a non-owned column, follows renames).
+      See `docs/design/root-0020-sequence-serial-restart-persistence.md`'s
+      new follow-up section and the matching deferral ledger row.
 - [ ] **M0122-0003 — EXPLAIN output & pg_stat instrumentation** (~7, partial).
       FORMAT XML/YAML **done** (2026-07-04, loop #8) — design:
       `docs/design/0122-0003-explain-format-xml-yaml.md`. Per-CTE ANALYZE

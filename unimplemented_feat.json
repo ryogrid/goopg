@@ -2129,7 +2129,7 @@
    "feature": "pg_get_serial_sequence() is a stub that returns a convention-based sequence name instead of the actual sequence.",
    "task_id": "m0097-0009",
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "pg_get_serial_sequence stub (returns table_col_seq convention)"
    ],
@@ -2144,7 +2144,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: expr.go:7325 pg_get_serial_sequence() is stub returning convention-based name"
+   "code_audit": "RESOLVED 2026-07-08 (M0122 follow-up): expr.go's pg_get_serial_sequence() now uses the real OWNED-BY dependency (FindSequenceOwnedBy/catalog.Column.OwnedBy tracking already maintained by SERIAL/IDENTITY column registration and explicit ALTER SEQUENCE ... OWNED BY) instead of fabricating \"table_col_seq\" by convention. Returns NULL for a column that owns no sequence, and follows a renamed sequence correctly. Tests: TestPgGetSerialSequenceSerialColumn/NonSerialColumnReturnsNull/FollowsRename/IdentityColumn in internal/executor/operators_pg_get_serial_sequence_test.go."
   },
   {
    "feature": "isfinite() function is not implemented (goopg v0 has no infinity values to check).",

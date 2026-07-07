@@ -7837,16 +7837,37 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		return evalLastval(ctx)
 	case "pg_get_serial_sequence":
 		// pg_get_serial_sequence(table_name, column_name) → text
-		// Returns the sequence name used for a serial/identity column.
-		// Stub: construct the conventional name table_column_seq. M0097-0009.
+		// Real PG (ruleutils.c pg_get_serial_sequence) resolves the column's
+		// attnum then scans pg_depend for an auto/internal dependency from a
+		// sequence relation onto that column, returning NULL when the column
+		// owns no sequence. Previously this fabricated "table_column_seq"
+		// unconditionally — wrong for a renamed sequence, an explicit OWNED BY
+		// target, or any plain (non-serial) column. M0122 follow-up.
 		if len(x.Args) == 2 {
 			tbl, err1 := evalExpr(x.Args[0], row, ctx)
 			col, err2 := evalExpr(x.Args[1], row, ctx)
 			if err1 != nil || err2 != nil || tbl.IsNull() || col.IsNull() {
 				return NullDatum, nil
 			}
-			seqName := fmt.Sprintf("public.%s_%s_seq", strings.ToLower(tbl.StringValue()), strings.ToLower(col.StringValue()))
-			return NewStringDatum(seqName), nil
+			tblArg := strings.ToLower(strings.TrimSpace(tbl.StringValue()))
+			colName := strings.ToLower(strings.TrimSpace(col.StringValue()))
+			// Ownership is recorded under the bare table name (see
+			// SetSequenceOwnedBy call sites in operators_ddl.go/
+			// operators_sequence.go), so strip any schema qualifier the
+			// caller passed before matching.
+			bareTbl := tblArg
+			if i := strings.LastIndex(tblArg, "."); i >= 0 {
+				bareTbl = tblArg[i+1:]
+			}
+			seqName := FindSequenceOwnedBy(bareTbl + "." + colName)
+			if seqName == "" {
+				return NullDatum, nil
+			}
+			schema := "public"
+			if s := LookupSequence(seqName); s != nil && s.schema != "" {
+				schema = s.schema
+			}
+			return NewStringDatum(pgQuoteIdent(schema) + "." + pgQuoteIdent(seqName)), nil
 		}
 		return NullDatum, nil
 	case "pg_get_indexdef":
