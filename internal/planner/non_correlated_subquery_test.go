@@ -53,13 +53,15 @@ func TestPlanHasOuterRef_Correlated(t *testing.T) {
 }
 
 // TestPlanHasOuterRef_NestedSubquery verifies that an OuterColumnRef
-// inside a nested SubqueryExpr's plan is reported. The conservative
-// behaviour treats the outer subquery as correlated even when the
-// nested OuterColumnRef refers to a level deeper than the outer plan
-// — a false negative would be a correctness bug; a false positive is
-// only a missed cache optimisation.
+// inside a nested SubqueryExpr's plan is reported when it ESCAPES the
+// outer plan — i.e. its Level (a hop count from where it was created;
+// see resolveColumnRefAt) skips past the outer plan's own scope to
+// whatever encloses it. Level=2 found one subquery level below `plan`
+// means "two hops up from the nested subquery's own scope", which is
+// one hop past `plan` itself — a genuine escaping correlation `plan`
+// cannot resolve on its own.
 func TestPlanHasOuterRef_NestedSubquery(t *testing.T) {
-	outer := &OuterColumnRef{pos: 0, Level: 1, Index: 0, Name: "x", Type: catalog.Type{Name: "int8"}}
+	outer := &OuterColumnRef{pos: 0, Level: 2, Index: 0, Name: "x", Type: catalog.Type{Name: "int8"}}
 	innerPlan := &Filter{
 		pos:   0,
 		Child: &SeqScan{pos: 0, Table: &catalog.Table{Name: "t2"}},
@@ -77,6 +79,44 @@ func TestPlanHasOuterRef_NestedSubquery(t *testing.T) {
 	}
 	if !planHasOuterRef(plan) {
 		t.Error("planHasOuterRef did not descend into nested SubqueryExpr.Plan")
+	}
+}
+
+// TestPlanHasOuterRef_NestedSubqueryResolvesLocally verifies that a
+// nested SubqueryExpr's OuterColumnRef which resolves WITHIN `plan`'s
+// own scope (Level=1, exactly one hop from the nested subquery's own
+// scope — i.e. `plan` itself, since `nested` is embedded directly in
+// `plan`'s predicate) does NOT make `plan` correlated to anything
+// outside itself. This is TPC-H Q20's shape: the partsupp IN-subquery
+// embeds a scalar subquery correlated to partsupp's own ps_partkey/
+// ps_suppkey (Level=1, i.e. partsupp-local) — that correlation is
+// fully resolved by partsupp's own decorrelation pass and must not
+// make the OUTER `s_suppkey IN (partsupp-subquery)` look correlated
+// to `supplier`. Pre-fix, `planHasOuterRef` treated ANY nested
+// OuterColumnRef as escaping regardless of Level, which blocked
+// M0069-0005's non-correlated-IN → SemiJoin fast path here and left
+// the outer IN as a raw per-row correlated Filter — re-executing the
+// entire partsupp+lineitem subtree once per supplier row
+// (M-NIGHTLY tpch/Q20-timeout).
+func TestPlanHasOuterRef_NestedSubqueryResolvesLocally(t *testing.T) {
+	outer := &OuterColumnRef{pos: 0, Level: 1, Index: 0, Name: "x", Type: catalog.Type{Name: "int8"}}
+	innerPlan := &Filter{
+		pos:   0,
+		Child: &SeqScan{pos: 0, Table: &catalog.Table{Name: "t2"}},
+		Predicate: &BinaryOp{
+			pos: 0, Op: parser.OpEq,
+			Left:  &ColumnRef{pos: 0, Index: 0, Name: "y", Type: catalog.Type{Name: "int8"}},
+			Right: outer,
+		},
+	}
+	nested := &SubqueryExpr{pos: 0, Plan: innerPlan}
+	plan := &Filter{
+		pos:       0,
+		Child:     &SeqScan{pos: 0, Table: &catalog.Table{Name: "t1"}},
+		Predicate: nested,
+	}
+	if planHasOuterRef(plan) {
+		t.Error("planHasOuterRef reported an escaping outer ref for a Level=1 nested reference that resolves within plan's own scope")
 	}
 }
 

@@ -900,11 +900,48 @@ every clean, green (build + pre-commit) checkpoint.
       `rewriteJoinsToNLI` so MHJ-folded joins are structurally unreachable
       by it. Either way, add a permanent regression test pinning the toy
       3-table repro before landing.
-- [ ] tpch/Q20-timeout — Q20 hit its per-query budget (57014/cancel)
+- [x] tpch/Q20-timeout — Q20 hit its per-query budget (57014/cancel)
       (AI-20260707-000712-008; repro: `tmp/tpch-nightly-runner -port 65433
       -db postgres -user <superuser> -queries 20 -per-query-timeout 1200s`,
       same server setup as above; evidence:
       `ci/logs/20260707-000712/tpch/run.log`).
+      2026-07-07 RESOLVED (two independent planner bugs, both fixed — full
+      detail in today's deferral ledger row): (1) `planHasOuterRef`
+      (planner.go) treated ANY `OuterColumnRef` inside a nested subquery as
+      escaping the tested plan, ignoring the `Level` hop-count field that
+      `bushy.go`'s `remapOuterRefsInSubplan` already uses correctly — Q20's
+      partsupp-scoped scalar subquery (`ps_availqty > (select 0.5*sum(...)
+      from lineitem where l_partkey=ps_partkey and l_suppkey=ps_suppkey
+      ...)`) has `Level=1` refs that resolve fully inside partsupp's own
+      scope, one nesting level below where the outer `s_suppkey IN (...)`'s
+      `IsNonCorrelated` was being computed; the false "correlated" verdict
+      blocked M0069-0005's SemiJoin fast path, leaving the outer IN as a raw
+      per-row `InExpr` that re-executed the entire partsupp+lineitem
+      subtree once per supplier row (10000 rows at SF1). Fixed via a new
+      depth-tracked `planHasEscapingOuterRef(node, depth)` worker (depth
+      starts at 1, +1 per subquery-nesting recursion, same convention
+      `remapOuterRefsInSubplan` already established) that only counts
+      `Level >= depth` as escaping. (2) `splitEqualityForHash` (used by
+      `planFromClause`'s explicit `JOIN ... ON` path) only recognised a bare
+      single equality; an AND-of-equalities predicate (e.g. `partsupp JOIN
+      (SELECT ... GROUP BY l_partkey, l_suppkey) agg ON ps_partkey=
+      agg.l_partkey AND ps_suppkey=agg.l_suppkey`) fell through to Nested
+      Loop, recomputing the GROUP BY once per outer row against an
+      expensive derived-table side with no usable index. Fixed by iterating
+      `splitAnd(pred)`'s conjuncts and hashing on the first one that
+      decomposes into disjoint sides, leaving the full `Predicate` for the
+      executor's existing residual-recheck-per-hash-match (same mechanism
+      TPC-H Q9 already relies on). Verified end-to-end: `tmp/tpch-runner
+      -queries 20` went from `ERROR after 1200.13s (57014)` to `OK
+      elapsed=2.55s rows=92` on a fresh server restart against
+      `bench/tpch/runtime_goopg/data`; row count cross-checked against a
+      freshly-started real PostgreSQL 18.3 instance on an independently
+      generated SF1 dataset — both return exactly 92 rows.
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2, Q13=33); full `go test ./...`
+      green. Regression tests: `TestPlanHasOuterRef_NestedSubqueryResolvesLocally`
+      (fails without the `planHasOuterRef` fix), `TestSplitEqualityForHashMultiKey`
+      (fails without the `splitEqualityForHash` fix), `TestPlanQ20OuterInFullyUnnested`
+      (asserts no raw `InExpr` survives in Q20's planned tree).
 
 **Next up:** M0122-0003 (EXPLAIN/pg_stat instrumentation) is mostly done
 (2026-07-05) — FORMAT XML/YAML, per-CTE ANALYZE stats, SETTINGS rendering,

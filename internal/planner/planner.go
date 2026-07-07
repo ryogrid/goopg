@@ -4807,21 +4807,37 @@ func resolveOrderBySubstitution(expr parser.Expr, targets []parser.ResTarget) pa
 	return expr
 }
 
-// AND-of-equalities, OR, range predicates, and equalities whose
-// operands span both sides all fall back to (nil, nil, false)
-// — the planner keeps the nested-loop algorithm for those.
+// OR, range predicates, and equalities whose operands span both
+// sides all fall back to (nil, nil, false) — the planner keeps the
+// nested-loop algorithm for those.
+//
+// An AND-of-equalities predicate (explicit multi-column
+// `JOIN ... ON a=b AND c=d`) hashes on the FIRST conjunct that
+// decomposes into disjoint sides; `pred` itself (all conjuncts,
+// untouched) stays on `jn.Predicate` and the executor's
+// joinPredicateMatchSlot re-checks it in full per hash match, so
+// the remaining conjuncts are never silently dropped — the same
+// hash-key-plus-residual-recheck mechanism TPC-H Q9's bushy DP
+// already relies on for a base-relation join with two equalities.
+// Without this, a 2+-key equi-join against an expensive derived-
+// table side (e.g. TPC-H Q20's `partsupp JOIN (SELECT ... GROUP BY
+// l_partkey, l_suppkey)`) forced a Nested Loop that recomputed the
+// GROUP BY aggregate once per outer partsupp row (M-NIGHTLY
+// tpch/Q20-timeout).
 func splitEqualityForHash(pred Expr, leftWidth int) (Expr, Expr, bool) {
-	bin, ok := pred.(*BinaryOp)
-	if !ok || bin.Op != parser.OpEq {
-		return nil, nil, false
-	}
-	lSide := exprSide(bin.Left, leftWidth)
-	rSide := exprSide(bin.Right, leftWidth)
-	switch {
-	case lSide == sideLeft && rSide == sideRight:
-		return bin.Left, bin.Right, true
-	case lSide == sideRight && rSide == sideLeft:
-		return bin.Right, bin.Left, true
+	for _, conjunct := range splitAnd(pred) {
+		bin, ok := conjunct.(*BinaryOp)
+		if !ok || bin.Op != parser.OpEq {
+			continue
+		}
+		lSide := exprSide(bin.Left, leftWidth)
+		rSide := exprSide(bin.Right, leftWidth)
+		switch {
+		case lSide == sideLeft && rSide == sideRight:
+			return bin.Left, bin.Right, true
+		case lSide == sideRight && rSide == sideLeft:
+			return bin.Right, bin.Left, true
+		}
 	}
 	return nil, nil, false
 }
@@ -10085,15 +10101,45 @@ func planExistsExpr(x *parser.ExistsExpr, parent *resolveContext) (Expr, error) 
 }
 
 // planHasOuterRef reports whether any expression anywhere in the
-// plan tree is an OuterColumnRef. It descends into nested
-// SubqueryExpr/InExpr/ExistsExpr so that a level-2 OuterColumnRef
-// inside a nested subquery is not mistaken for non-correlated at
-// the outer level.
+// plan tree is an OuterColumnRef that ESCAPES the plan itself —
+// i.e. resolves to some ancestor scope beyond node's own immediate
+// parent. It descends into nested SubqueryExpr/InExpr/ExistsExpr so
+// that a reference which skips past node (e.g. a level-2
+// OuterColumnRef inside a once-nested subquery, referring to node's
+// own parent rather than node) is not mistaken for non-correlated.
 //
-// Used by M0058-0001: a subquery with no OuterColumnRef yields the
-// same result for every outer row, so the executor SubqueryCache
-// can use a constant key instead of one keyed on the full outer row.
+// OuterColumnRef.Level is a hop count from where the reference was
+// created (1 = its own immediate parent scope, 2 = grandparent, ...;
+// see resolveColumnRefAt). A reference found DIRECTLY in node's own
+// expressions with Level>=1 always escapes node (node has no scopes
+// of its own to absorb it). A reference found one subquery level
+// deeper only escapes node if Level>=2 — Level==1 there resolves
+// within node's OWN scope (e.g. TPC-H Q20's `ps_availqty > (SELECT
+// ... WHERE l_partkey=ps_partkey)` scalar subquery nested inside the
+// partsupp IN-subquery: ps_partkey/ps_suppkey are Level=1 relative to
+// the scalar subquery, i.e. partsupp-local, NOT a reference to
+// whatever encloses the partsupp subquery). The pre-fix version
+// treated ANY OuterColumnRef at ANY nesting depth as escaping,
+// wrongly marking the partsupp IN-subquery "correlated" and blocking
+// M0069-0005's non-correlated-IN → SemiJoin fast path — the
+// outermost `s_suppkey IN (...)` was then left as a raw per-row
+// correlated Filter, re-executing the entire partsupp+lineitem
+// subtree once per supplier row (M-NIGHTLY tpch/Q20-timeout).
+//
+// Used by M0058-0001: a subquery with no escaping OuterColumnRef
+// yields the same result for every outer row, so the executor
+// SubqueryCache can use a constant key instead of one keyed on the
+// full outer row.
 func planHasOuterRef(node Node) bool {
+	return planHasEscapingOuterRef(node, 1)
+}
+
+// planHasEscapingOuterRef is planHasOuterRef's depth-aware worker.
+// depth is the Level value that would refer to node's own immediate
+// parent scope at the current nesting point (1 at the top call,
+// incrementing by one for each subquery level recursed into — the
+// same convention bushy.go's remapOuterRefsInSubplan already uses).
+func planHasEscapingOuterRef(node Node, depth int) bool {
 	found := false
 	walkPlanExprs(node, func(e Expr) {
 		if found {
@@ -10105,25 +10151,27 @@ func planHasOuterRef(node Node) bool {
 			}
 			switch x := inner.(type) {
 			case *OuterColumnRef:
-				found = true
+				if x.Level >= depth {
+					found = true
+				}
 			case *SubqueryExpr:
-				if x.Plan != nil && planHasOuterRef(x.Plan) {
+				if x.Plan != nil && planHasEscapingOuterRef(x.Plan, depth+1) {
 					found = true
 				}
 			case *ArraySubqueryExpr:
-				if x.Plan != nil && planHasOuterRef(x.Plan) {
+				if x.Plan != nil && planHasEscapingOuterRef(x.Plan, depth+1) {
 					found = true
 				}
 			case *MultiAssignSubqRow:
-				if x.Plan != nil && planHasOuterRef(x.Plan) {
+				if x.Plan != nil && planHasEscapingOuterRef(x.Plan, depth+1) {
 					found = true
 				}
 			case *InExpr:
-				if x.Plan != nil && planHasOuterRef(x.Plan) {
+				if x.Plan != nil && planHasEscapingOuterRef(x.Plan, depth+1) {
 					found = true
 				}
 			case *ExistsExpr:
-				if x.Plan != nil && planHasOuterRef(x.Plan) {
+				if x.Plan != nil && planHasEscapingOuterRef(x.Plan, depth+1) {
 					found = true
 				}
 			}
