@@ -159,6 +159,7 @@
    "feature": "Timestamp-timestamp interval arithmetic (subtracting timestamps produces intervals)",
    "task_id": null,
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "Out of scope (deferred): EXTRACT (its own grammar), timestamp-timestamp interval, sub-day units, multi-field intervals"
    ],
@@ -173,12 +174,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/executor/expr.go:1294 comment says timestamp-timestamp subtraction scope-deferred"
+   "code_audit": "confirmed-open 2026-07-07: internal/executor/expr.go:1359-1366 (evalBinary, OpAdd/OpSub case) still routes only KindTime+KindInterval through addTimeInterval; comment explicitly states 'timestamp - timestamp (returns interval upstream; scope-deferred until the type system)' — no KindTime-KindTime path exists anywhere in expr.go (only the unrelated equality helper at line 6495 compares KindTime==KindTime for `=`). timestamp1 - timestamp2 still falls through to the integer-arithmetic path and errors. No test exercises timestamp-timestamp interval subtraction."
   },
   {
    "feature": "Sub-day interval units (hours, minutes, seconds, milliseconds) for interval arithmetic",
    "task_id": null,
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "Out of scope (deferred): EXTRACT (its own grammar), timestamp-timestamp interval, sub-day units, multi-field intervals"
    ],
@@ -193,7 +195,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/parser/expr.go:141 IntervalLit only supports day/month/year units"
+   "code_audit": "confirmed-open 2026-07-07: internal/parser/select.go:3009-3016 (Form 1, trailing-unit interval '<N>' <unit>) and :3089-3092 (splitEmbeddedInterval, Form 2 interval '<N> <unit>') both switch only on day/days, month/months, year/years — no hour/minute/second/millisecond/microsecond cases exist in internal/parser (grep for hour|minute|millisecond|microsecond in parser/*.go hits only a comment at expr.go:119-121 noting 'sub-second fields wait'). internal/executor's KindInterval carrier (datum.go:28-37) also only packs months+days, explicitly 'drops sub-day precision.' Both parser and storage layer remain day-granularity only."
   },
   {
    "feature": "SASLprep string normalization, channel binding support, and scram_iterations GUC configuration for SCRAM-SHA-256.",
@@ -220,6 +222,7 @@
    "feature": "Lehman/Yao crab-walk concurrency control for B-tree index operations",
    "task_id": null,
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "Lehman/Yao crab-walk is deferred"
    ],
@@ -234,7 +237,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/access/btree/btree.go:585 Lehman-Yao right-link only, crab-walk staged"
+   "code_audit": "confirmed-open 2026-07-07: internal/access/btree/btree.go:578-614 still documents only Landing 2 of milestone 0002 — readers use Lehman-Yao right-link recovery (descendToLeaf, btree.go:1301-1332) but writers serialize all split-path inserts through a single tree-wide splitMu sync.Mutex (btree.go:614), not per-level lock-coupling/crab-walk descent. The struct comment explicitly states 'Landing 3's full writer-coupling protocol is still staged' and M0055-0004-followup-stage2-splitmu-removal's attempt to drop splitMu caused buffer-pool 'unpin underflow' races (fixed for PinNew only in M0056-0001), so splitMu itself remains in place. No grep hits for 'crab' or 'coupled' anywhere in the package."
   },
   {
    "feature": "EXPLAIN ANALYZE output rendering of BUFFERS and SETTINGS options with Pool-level instrumentation for page-pin and page-read counter metrics.",
@@ -617,6 +620,7 @@
    "feature": "KindDate carrier type for proper date-specific BETWEEN codec semantics",
    "task_id": "m0003",
    "resume_point": "0003-0013",
+   "status": "open",
    "evidence": [
     "KindDate carrier"
    ],
@@ -631,12 +635,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: docs/design/0003-0013-between-operator.md:106 KindDate carrier explicitly deferred"
+   "code_audit": "confirmed-open 2026-07-07: no KindDate carrier exists — internal/executor/datum.go:21-64 DatumKind enum lists KindNull/KindBool/KindInt/KindString/KindBytes/KindTime/KindInterval/KindNumeric/KindToastPointer/KindEnum only; date and timestamp values both still share KindTime. Repo-wide grep for KindDate hits only docs/design/0003-0013-between-operator.md:104-106 (which still lists it under 'Out of scope (deferred)') and backlog/tooling artifacts — zero hits in any .go source file. Gap is unaddressed."
   },
   {
    "feature": "Implement window frame clause semantics for ROWS, RANGE, GROUPS frame modes and frame exclusion options.",
    "task_id": "M0020",
    "resume_point": "implement frame clause execution logic",
+   "status": "open",
    "evidence": [
     "Frame clauses (ROWS / RANGE / GROUPS / frame-exclusion) parse but error explicitly with 'frame clauses are not supported in v0'"
    ],
@@ -651,7 +656,7 @@
     "later_commits": "confirmed-open-code-audit: select.go:3439 frame clauses rejected by parser"
    },
    "confidence": "high",
-   "code_audit": "partially-resolved 2026-07-05 (M0122-0004): ROWS frame mode now parses and executes end-to-end. New parser.WindowFrame AST (internal/parser/expr.go/select.go's parseFrameClause/parseFrameBound/parseFrameExclusion); analyzer.validateWindowFrame rejects RANGE/GROUPS with 0A000 (deliberate v0 scope limit, not a bug) and validates ROWS bound ordering with 42P20; planner.WindowAgg.Frame carries the resolved frame through buildWindowStage/resolveWindowFrame; executor's evalExplicitFrameAggFuncs/frameBounds (internal/executor/operators_window.go) reproduce postgres/src/backend/executor/nodeWindowAgg.c's update_frameheadpos/update_frametailpos ROWS arithmetic exactly, including EXCLUDE CURRENT ROW/GROUP/TIES (frameRowExcluded) and frame-aware first_value/last_value/nth_value (cume_dist stays frame-independent per spec). Tests: internal/parser/window_test.go, internal/analyzer/analyzer_test.go's TestAnalyzeWindowFrameRowsAccepted/TestAnalyzeWindowFrameRangeGroupsRejected/TestAnalyzeWindowFrameBoundOrderingRejected, internal/executor/window_compat_test.go's TestCompatWindowExplicitRowsFrameSliding/TestCompatWindowExplicitFrameExcludeCurrentRow/TestCompatWindowExplicitFrameExcludeGroupAndTies/TestCompatWindowFrameNegativeOffsetRejected. Design: docs/design/0020-0001-window-parser-and-ast.md Follow-up section. RANGE/GROUPS frame modes remain open (need per-ORDER-BY-column peer comparison / group-counting bounds, not just ROWS' row-index arithmetic) — see .ralph/deferral_ledger.md."
+   "code_audit": "partially-resolved 2026-07-07 (re-verified, no change since M0122-0004): ROWS frame mode remains the only implemented frame unit — internal/analyzer/analyzer.go:1570-1571 still hard-rejects RANGE/GROUPS with 0A000 ('RANGE and GROUPS window frame units are not supported in v0; only ROWS is implemented'). ROWS-frame tests still pass at HEAD: TestCompatWindowExplicitRowsFrameSliding, TestCompatWindowExplicitFrameExcludeCurrentRow, TestCompatWindowExplicitFrameExcludeGroupAndTies, TestCompatWindowFrameNegativeOffsetRejected all PASS (go test ./internal/executor/ -run 'TestCompatWindowExplicit...'). RANGE/GROUPS peer-comparison / group-counting bounds still unimplemented — core gap remains OPEN. Design: docs/design/0020-0001-window-parser-and-ast.md Follow-up section; see .ralph/deferral_ledger.md."
   },
   {
    "feature": "Support window function references by name using OVER window_name syntax and WINDOW clause definitions.",
@@ -828,6 +833,7 @@
    "feature": "Window function frame clauses and named windows are not yet implemented.",
    "task_id": "M0020",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "Frame clauses and named windows remain deferred"
    ],
@@ -842,7 +848,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "partially-resolved: named windows landed 2026-07-05 (M0122-0004, see the other window-function entry's code_audit + docs/design/0020-0001-window-parser-and-ast.md). Frame clauses remain confirmed-open — internal/planner/plan.go's WindowFunc still lacks frame-bounds structures. M0122-0004 also landed frame-consuming aggregate window functions (sum/count/avg/min/max OVER (...)) evaluated over PostgreSQL's *default* frame (no explicit ROWS/RANGE/GROUPS clause needed), which is the first real consumer for future frame-clause execution work — see docs/design/0020-0001-window-parser-and-ast.md's second Follow-up section. first_value/last_value/nth_value window functions also landed on the same default-frame infra (internal/executor/operators_window.go's peerGroupBounds, reused via a new frameEnd-per-row precomputation); nth_value raises 22016 for a non-positive n, matching postgres/src/backend/utils/adt/windowfuncs.c's window_nth_value. 2026-07-05 (this loop): ntile/cume_dist/percent_rank also landed — ntile reproduces window_ntile's exact bucket-sizing algorithm (22014 for n<=0, remainder rows to the first buckets), percent_rank/cume_dist reuse the existing rank local and frameEnd[] peer-group boundary respectively. Every window function implemented across the M0122-0004 series still assumes PostgreSQL's default frame — ROWS/RANGE/GROUPS frame-clause parsing/execution itself is now the only remaining open item in this entry; see docs/design/0020-0001-window-parser-and-ast.md's fourth Follow-up section. 2026-07-05 (later loop): dense_rank() also landed as a window function (previously only its WITHIN GROUP ordered-set-aggregate form existed) — shares the row_number/rank code path (analyzer.analyzeWindowFuncCall, planner.buildWindowFunc), with a new denseRank counter in internal/executor/operators_window.go's evalWindowFuncs that increments once per peer-group boundary (rank's rowNum-based counter skips on ties; denseRank does not). All 11 standard PostgreSQL window functions (row_number, rank, dense_rank, percent_rank, cume_dist, ntile, lag, lead, first_value, last_value, nth_value) are now implemented under the default frame. 2026-07-05 (later loop): ROWS window frame clause landed too (see the other window-frame entry's code_audit for the full parser/analyzer/planner/executor breakdown) — RANGE/GROUPS frame modes are now the sole open item in this entry."
+   "code_audit": "partially-resolved 2026-07-07 (re-verified, no change since 2026-07-05): named windows and ROWS frame clause remain landed and working — TestCompatWindowNamedWindowClause PASSes (parser supports WINDOW w AS (...), internal/parser/select.go), plus the ROWS-frame test set (TestCompatWindowExplicitRowsFrameSliding, TestCompatWindowExplicitFrameExcludeCurrentRow/GroupAndTies) all PASS. RANGE/GROUPS frame modes are still the sole open item: internal/analyzer/analyzer.go:1570-1571 rejects them with 0A000. No RANGE/GROUPS implementation found anywhere in internal/executor or internal/analyzer. Verdict unchanged from the 2026-07-05 audit — still OPEN on RANGE/GROUPS. All 11 standard PostgreSQL window functions are implemented under the default frame (see prior audit history); design: docs/design/0020-0001-window-parser-and-ast.md Follow-up sections."
   },
   {
    "feature": "Implement full Borrow-semantics architectural rewrite for comprehensive allocation optimization (current stage only addresses specific call sites without the architectural change).",
@@ -968,6 +974,7 @@
    "feature": "Posting growth helper functions are implemented but not integrated into the steady-state B-tree insert path, causing in-place insert operations to leak page bytes during memory growth.",
    "task_id": null,
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "NOT wired into the steady-state insert path — the in-place grow leaks page bytes"
    ],
@@ -982,7 +989,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/access/btree/btree.go:1960 posting growth helpers defined but deferred from steady-state insert"
+   "code_audit": "confirmed-open 2026-07-07: internal/access/btree/posting.go:89-109 appendTIDToPosting and promoteSingleToPosting (both dated M0055-0003, doc-commented as 'Used by the steady-state insert path to grow a posting in place') have zero callers anywhere in the package — grep for both names matches only their own definitions in posting.go, not btree.go's insert path nor any test in posting_test.go. Confirmed still dead code; btree.go:2000-2004 explicitly notes the in-place dedup-grow path 'was tried but produces page-fragment garbage' and was reverted in favor of a separate pre-split dedupPageBeforeSplit compaction path, so steady-state inserts still allocate fresh line pointers/leak page bytes rather than growing postings in place."
   },
   {
    "feature": "Re-enable race condition detector (-race) for concurrent write stress tests",
@@ -1093,6 +1100,7 @@
    "feature": "Fix storage pool per-slot pinCount accounting race condition in buffer management",
    "task_id": "M0055-bufpool-pin-race",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "The bug is in the storage pool's per-slot pinCount accounting and is tracked as a separate sub-task `M0055-bufpool-pin-race` for the storage layer to fix"
    ],
@@ -1107,7 +1115,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: docs/milestones/0056: Phase A PinNew race (M0056-0001) in progress, not completed"
+   "code_audit": "RESOLVED 2026-07-07 (M0122-0001, this loop, verify-before-implement): M0056-0001 landed in commit 6a88492e ('fix(storage,btree): M0056-0001 PinNew slot reservation race') — Pool.PinNew (internal/storage/bufpool.go:1049-1124) now reserves the victim slot's pinCount before releasing the pool lock and holds it across the InitPage/Extend I/O window, eliminating the race where a concurrent Pin's evictLocked could steal the same slot. The design has since evolved further (M0098-0003 128-partition locking, then M0099-0002/M0107-0008 to a fully lock-free per-slot atomic state atomic.Uint64 packing pinCount/usageCount/dirty/valid, bufpool.go:55-57) — the cache-hit Pin fast path is now lock-free CAS with no mutex at all, and pinMu only serializes the cache-miss/eviction slow path. The milestone doc docs/milestones/0056-... still says 'Status: in progress' (stale — Phase B/C/D splitMu-removal work is separately tracked/blocked on an unrelated flake per the commit message) but the specific per-slot pinCount accounting race this item describes is fixed and superseded by a stronger lock-free design."
   },
   {
    "feature": "Replay-safe WAL log handling for two-phase delete operations to ensure crash recovery consistency in B-tree indices.",
@@ -1399,6 +1407,7 @@
    "feature": "Connection pool mutex partitioning to reduce lock contention",
    "task_id": "M0070-0006",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "poolMu partitioning DEFERRED → M0070-0006"
    ],
@@ -1413,7 +1422,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: no grep matches for mutex partitioning; connection pool lacks partition"
+   "code_audit": "RESOLVED 2026-07-07 (M0122-0001, this loop, verify-before-implement): 'Connection pool' in the feature text is a mislabeling of the storage buffer-pool's poolMu (source commit e4ee8a28's changelog: 'M0069-0008 poolMu partitioning DEFERRED → M0070-0006', referring to internal/storage/bufpool.go's Pool type, not a network/session connection pool — no connection-pool struct exists anywhere in the repo). poolMu partitioning landed in commit 3f1de667 ('feat(m0098-0003): buffer pool 128-partition locking' — 128 FNV-1a hash-partitioned mutexes replacing the single poolMu) and was subsequently superseded by an even finer-grained lock-free design (M0099-0002 'atomic pinCount + RWMutex evictMu', now fully lock-free per-slot atomic state in bufpool.go:55-57): the Pin cache-hit fast path takes no mutex at all (lock-free CAS), and only cache-miss/eviction uses a single pinMu slow-path lock. The original contention-reduction goal is met and exceeded."
   },
   {
    "feature": "Anti-semi-join optimization for NOT IN subqueries not implemented; planner rejects negated IN conditions",
@@ -2409,6 +2418,7 @@
    "feature": "Splitting state.appendMu's four invariants to enable independent granular locking.",
    "task_id": "M0107-0007",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "splitting state.appendMu's four invariants"
    ],
@@ -2423,7 +2433,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/wal/stripe_writer_core.go:11 mentions as design, no implementation"
+   "code_audit": "confirmed-open 2026-07-07: internal/wal/stripe_writer_core.go:5-40 (stripeWriterCore, 'Foundation 15 for M0107-0007 slice B') explicitly states the call-site rewrite that 'lifts state.appendMu's four invariants into per-stripe local state plus shared stripeWriterCore state ... is multi-loop scope and is NOT in this loop.' At HEAD, internal/wal/writer.go still declares a single appendMu sync.RWMutex (writer.go:392) guarding all append/drain/publish paths, with 30+ Lock/RLock call sites across writer.go (e.g. writer.go:636,1235,1272,1325,1461,1505,1568,1623) — no independent granular locks have replaced it; only the unused/unmounted primitives (appendLockSet, insertPosTracker, insertionTracker, tailPublisher) exist as a staged foundation."
   },
   {
    "feature": "pg_waldump TAP test suite portions (2 tests with mixed BUG_FIX and UNIMPLEMENTED sections)",
