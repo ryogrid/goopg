@@ -3181,8 +3181,53 @@ mirroring M0119's ledger `status` column.
       `pg_tablespace` visibility remains a separate open item in this
       cluster.
 - [ ] **M0122-0007 — DDL / admin commands / ctl / GUC config** (~14). CREATE/DROP
-      DATABASE full DDL, `goopg ctl restart`, REINDEX, SIGHUP config reload,
-      tablespaces, ALTER FUNCTION/COLUMN, planner/jit GUC stubs.
+      DATABASE full DDL, `goopg ctl restart`, REINDEX, tablespaces, ALTER
+      FUNCTION/COLUMN, planner/jit GUC stubs.
+      **SIGHUP config reload — done (2026-07-08):** `startControlPlane`'s
+      `OnReload` (`internal/server/server.go`) was a logged-only "v0
+      no-op" — neither `goopg reload` nor a literal `kill -HUP <pid>`
+      changed anything on a running server. Both now call the same new
+      `Server.reloadConfig`, which re-parses the new `Config.ConfigPath`
+      (the postgresql.conf `cfg.Registry` was loaded from at boot, now
+      threaded from `cmd/goopg`) and applies it via a new
+      `Registry.ApplyReloadEntries` (`internal/config/guc.go`) — unlike
+      boot's `ApplyConfigEntries`, this gates by `Context`:
+      `ContextPostmaster`/`ContextInternal` entries are left untouched
+      with a "cannot be changed without restarting the server" warning
+      (matching upstream `ProcessConfigFile`), everything else applies
+      with `SourceConfigFile` AND fires the registry's `OnChange` bridge
+      (boot's bypass doesn't, since nothing has read the registry yet at
+      that point — but a reload changes a *live* value, so process-global
+      toggles like `enable_nestloop_index` must observe it immediately).
+      A malformed/unknown entry is reported as a warning, never aborts
+      the reload or crashes the server. SIGHUP wiring added a
+      `signal.Notify(syscall.SIGHUP)` goroutine in `startControlPlane`
+      calling the identical `reloadConfig` path. Tests:
+      `TestApplyReloadEntriesAppliesSigHupSkipsPostmaster`,
+      `TestApplyReloadEntriesFiresOnChange` (`internal/config/
+      guc_test.go`), `TestReloadConfigAppliesSigHupSkipsPostmaster`,
+      `TestReloadConfigNoPathIsNoop` (`internal/server/reload_test.go`).
+      Live-verified against the real `cmd/goopg` binary via both
+      `goopg reload -D <datadir>` and `kill -HUP <pid>`: edited
+      `checkpoint_timeout` (PGC_SIGHUP) from 600→900 in postgresql.conf
+      plus added `max_connections = 5` (PGC_POSTMASTER); post-reload
+      `SHOW checkpoint_timeout` moved 10min→15min while `SHOW
+      max_connections` stayed at the unchanged 100, with the expected
+      restart-required warning in the server log for the latter. Design:
+      `docs/design/root-0004-configuration-and-guc.md` "Hot reload
+      (2026-07-08)" section; `docs/design/README.md` row updated. Gates:
+      `go build ./...`/`go vet ./internal/config/... ./internal/server/...
+      ./cmd/goopg/...` clean; `go test ./internal/config/...
+      ./internal/server/... ./internal/control/... ./cmd/...` PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS
+      (0 failed, all 3 workloads). **Still open** (this bucket, ~13
+      remaining items): a true restart-the-listener reload for
+      `ContextPostmaster` GUCs is out of scope (matches upstream — those
+      need a real process restart; goopg's reload only warns about them),
+      plus the rest of M0122-0007's named items (CREATE/DROP DATABASE
+      full DDL, `goopg ctl restart`, REINDEX, tablespaces, ALTER
+      FUNCTION/COLUMN, planner/jit GUC stubs).
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,
       encoding constraints during bootstrap/runtime.

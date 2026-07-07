@@ -406,6 +406,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			return 1
 		}
 		cfg.Registry = registry
+		cfg.ConfigPath = *confPath
 		logger.Info("loaded postgresql.conf", "path", *confPath, "entries", len(entries))
 	}
 	var rt *initdb.Runtime
@@ -1178,7 +1179,7 @@ func runReload(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "goopg reload: unexpected reply %q\n", reply)
 		return 1
 	}
-	fmt.Fprintln(stdout, "goopg reload: configuration reload signalled (v0 no-op)")
+	fmt.Fprintln(stdout, "goopg reload: configuration reload signalled")
 	return 0
 }
 

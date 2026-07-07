@@ -240,6 +240,62 @@ func TestApplyConfigEntriesUnknownReturnsError(t *testing.T) {
 	}
 }
 
+// TestApplyReloadEntriesAppliesSigHupSkipsPostmaster verifies the
+// three-way split ApplyReloadEntries must make on a running server: a
+// PGC_SIGHUP variable (checkpoint_timeout) takes effect immediately, a
+// PGC_POSTMASTER variable (max_connections) is left untouched with a
+// warning (it needs a real restart), and an unknown name is reported
+// as a warning too — none of it aborts the whole reload.
+func TestApplyReloadEntriesAppliesSigHupSkipsPostmaster(t *testing.T) {
+	r := BuildDefaultRegistry()
+	origMaxConn, _ := r.Get("max_connections")
+	beforeMaxConn := origMaxConn.Value
+
+	result := r.ApplyReloadEntries([]ConfigEntry{
+		{Name: "checkpoint_timeout", Value: "600", SourceFile: "postgresql.conf", SourceLine: 1},
+		{Name: "max_connections", Value: "200", SourceFile: "postgresql.conf", SourceLine: 2},
+		{Name: "nope_such_var", Value: "x", SourceFile: "postgresql.conf", SourceLine: 3},
+	})
+
+	if len(result.Changed) != 1 || result.Changed[0] != "checkpoint_timeout" {
+		t.Fatalf("Changed = %v, want [checkpoint_timeout]", result.Changed)
+	}
+	if len(result.Warnings) != 2 {
+		t.Fatalf("Warnings = %v, want 2 entries (max_connections restart-required + unknown param)", result.Warnings)
+	}
+
+	ct, _ := r.Get("checkpoint_timeout")
+	if ct.Value != "600" {
+		t.Errorf("checkpoint_timeout = %q, want %q (PGC_SIGHUP must apply on reload)", ct.Value, "600")
+	}
+	if ct.Source != SourceConfigFile {
+		t.Errorf("checkpoint_timeout.Source = %v, want SourceConfigFile", ct.Source)
+	}
+
+	mc, _ := r.Get("max_connections")
+	if mc.Value != beforeMaxConn {
+		t.Errorf("max_connections = %q, want unchanged %q (PGC_POSTMASTER must not apply on reload)", mc.Value, beforeMaxConn)
+	}
+}
+
+// TestApplyReloadEntriesFiresOnChange verifies a reload-driven value
+// change bridges to the same OnChange callback a SET does, since
+// (unlike boot-time ApplyConfigEntries) the server is already live
+// and process-global toggles need to observe the new value.
+func TestApplyReloadEntriesFiresOnChange(t *testing.T) {
+	r := BuildDefaultRegistry()
+	var got string
+	r.OnChange("enable_nestloop_index", func(value string) { got = value })
+
+	r.ApplyReloadEntries([]ConfigEntry{
+		{Name: "enable_nestloop_index", Value: "off", SourceFile: "postgresql.conf", SourceLine: 1},
+	})
+
+	if got != "off" {
+		t.Fatalf("OnChange callback got %q, want %q", got, "off")
+	}
+}
+
 func TestReportableVariablesSeedPlausibleSet(t *testing.T) {
 	r := BuildDefaultRegistry()
 	sess := NewSessionRegistry(r)
