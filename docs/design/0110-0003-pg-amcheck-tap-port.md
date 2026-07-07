@@ -732,3 +732,58 @@ drop) without a real server.
 Gates: `go build ./...`; `go vet ./internal/server/... ./internal/activity/...`;
 `go test ./internal/server/... ./internal/activity/... ./internal/catalog/...`;
 `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh`.
+
+## Follow-up (2026-07-07): AC-003 cluster unblocked — synthetic TOAST relations report as healthy-empty instead of erroring
+
+All six AC-003/AC-004 tests (`TestPort_PgAmcheck003CombinedCorruption`,
+`003MissingIndexFork`, `003MissingHeapFile`, `003SchemaScoped`,
+`004VerifyHeapam`, `AllTables`, `BtreeIndexCheck`) were unconditionally
+`t.Skip`ing at their "pre-corruption baseline is clean" gate, all with the
+identical evidence:
+
+```
+heap table "postgres.pg_toast.pg_toast_16404": ERROR: could not open relation: relation does not exist
+btree index "postgres.pg_toast.pg_toast_16404_index": ERROR: could not open relation: relation does not exist
+```
+
+Root cause: `catalog.go`'s TOAST-exposure scheme (`toastRelidOffset`,
+`tableHasToastRelation`, doc comment at `tableHasToastRelation` ~line 990)
+deliberately emits a synthetic `pg_class`/`pg_index` row for every toastable
+table's `pg_toast_<oid>` relation and `pg_toast_<oid>_index` — but with **no
+real backing heap or index file**, since goopg never actually routes
+out-of-line values through a physical TOAST relation. Real `pg_amcheck`, by
+default, walks every table's TOAST relation alongside the table itself (it
+resolves `reltoastrelid` and checks it too) — so `verify_heapam(oid)` /
+`bt_index_check(oid)` on a synthetic TOAST OID always 42P01'd, and pg_amcheck
+reported the *whole database* as dirty before any real corruption was ever
+injected, permanently blocking the "confirm a clean baseline first" gate every
+one of these tests requires.
+
+Fix: `verifyHeapamResolveTable`'s call site (`operators_verify_heapam.go`) and
+`btIndexResolve`'s call site (`operators_bt_index_check.go`) both gained a
+fallback when the OID fails to resolve to a real table/index: check
+`catalog.InMemory.ToastParentTable(oid)` (pre-existing helper, previously used
+only by REINDEX CONCURRENTLY lock routing) — if the OID is a synthetic TOAST
+relation/index OID whose parent still owns an auto-exposed TOAST relation,
+report **no findings** (`nil`/`NullDatum, nil`) instead of raising 42P01. This
+is semantically correct, not a workaround: since no value is ever actually
+stored in goopg's synthetic TOAST relation, it is vacuously always empty and
+healthy — exactly the report real `pg_amcheck` gives for a genuinely empty
+TOAST table.
+
+Result: `TestPort_PgAmcheck004VerifyHeapam`, `TestPort_PgAmcheckAllTables`, and
+`TestPort_PgAmcheckBtreeIndexCheck` now genuinely PASS (previously always
+skipped). The four corruption-injection tests
+(`003CombinedCorruption`/`003MissingIndexFork`/`003MissingHeapFile`/
+`003SchemaScoped`) advance past the same gate but now hit a **new, distinct**
+blocker: after the test manually removes a heap/index file to simulate
+corruption, restarting the goopg cluster times out after 20s
+(`start timeout after 20s`, no corruption-check ever runs). This is a fresh
+discovery, not a regression from this fix (the old code never reached the
+restart step) — see the deferral ledger's 2026-07-07 AC-003 row for the exact
+repro and resume point.
+
+Gates: `go build ./...` clean; `go test ./internal/executor/...
+./internal/catalog/... ./internal/amcheck/...` PASS; `scripts/tpch-spotcheck.sh`
+PASS (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 workloads).

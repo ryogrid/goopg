@@ -1965,6 +1965,48 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       remain entirely unimplemented — needs a live active-connection counter
       keyed by database name, a materially larger change than this loop's
       sentinel-only check.
+      **2026-07-07 (AC-003 cluster): 3 of the 7 previously-fully-skipped
+      003/004/005 tests now genuinely PASS.** All 7 were skipping at an
+      identical "pre-corruption baseline is clean" gate, with the exact same
+      evidence every time: `pg_amcheck` erroring `could not open relation:
+      relation does not exist` on `postgres.pg_toast.pg_toast_<oid>` (heap)
+      and `pg_toast_<oid>_index` (btree) — goopg's synthetic TOAST-relation
+      catalog rows (`catalog.go`'s `tableHasToastRelation`) are pg_class/
+      pg_index join targets only, with NO real backing heap/index file by
+      design (goopg never routes out-of-line values through a physical TOAST
+      relation), and real `pg_amcheck`'s default whole-table walk always
+      checks a table's TOAST relation alongside it. Fixed:
+      `verifyHeapamResolveTable`'s call site
+      (`internal/executor/operators_verify_heapam.go`) and
+      `btIndexResolve`'s call site
+      (`internal/executor/operators_bt_index_check.go`) now fall back to the
+      pre-existing `catalog.InMemory.ToastParentTable(oid)` helper (previously
+      only used by REINDEX CONCURRENTLY lock routing) when a `regclass` OID
+      doesn't resolve — a synthetic TOAST OID reports zero findings (healthy,
+      vacuously-empty) instead of raising 42P01. `TestPort_PgAmcheck004VerifyHeapam`,
+      `TestPort_PgAmcheckAllTables`, `TestPort_PgAmcheckBtreeIndexCheck` now
+      PASS. Gates: `go build ./...` clean; `go test ./internal/executor/...
+      ./internal/catalog/... ./internal/amcheck/...` PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed, all 3 workloads). Design:
+      `docs/design/0110-0003-pg-amcheck-tap-port.md` new "Follow-up
+      (2026-07-07): AC-003 cluster unblocked" section;
+      `docs/design/README.md` row updated. **Still open (new discovery, see
+      today's deferral ledger row):** the remaining 4 corruption-injection
+      tests (`TestPort_PgAmcheck003CombinedCorruption`, `003MissingIndexFork`,
+      `003MissingHeapFile`, `003SchemaScoped` — the ones that remove a
+      heap/index main-fork file to simulate corruption, matching real
+      `003_check.pl`) advance past the TOAST gate but hit a NEW blocker:
+      restarting the goopg cluster after the file removal times out after 20s
+      — `pg_amcheck` never runs against the corrupted cluster at all. Uniform
+      across all 4 (same symptom regardless of which file is removed). Root
+      cause not yet localized — leading candidate is an eager per-relation
+      file open/scan somewhere in `internal/initdb/open.go`'s startup
+      sequence (unlike real PG's lazy per-relation open), but this is
+      unconfirmed; see the ledger row for the exact resume point (each
+      blocked test already has a reusable removal-then-restart repro built
+      in, no new harness needed).
 - [ ] **M0119-0007 — pg_basebackup recvlogical** (source: M0095-0003). `030 recvlogical`
       — blocked on logical decoding (tracks the logical-replication milestone / D-004).
 

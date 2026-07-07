@@ -78,6 +78,18 @@ func evalBtIndexCheck(x *planner.FuncCall, row Row, ctx *Context, parentCheck bo
 	}
 	idx, ok := btIndexResolve(argVal, im)
 	if !ok {
+		if argVal.Kind == KindInt {
+			if _, isToast := im.ToastParentTable(uint32(argVal.Int)); isToast {
+				// Synthetic pg_toast_<oid>_index OID (catalog.go's
+				// toastIndexOidOffset scheme): goopg exposes it only as a
+				// pg_class/pg_index join target with no real backing index
+				// (mirrors the verify_heapam TOAST-heap case above) — no
+				// entry is ever actually stored there, so it is vacuously
+				// always a healthy, empty index. Report no findings instead
+				// of erroring.
+				return NullDatum, nil
+			}
+		}
 		return NullDatum, &ExecError{Code: "42P01", Pos: x.Pos(),
 			Message: "could not open relation: relation does not exist"}
 	}
