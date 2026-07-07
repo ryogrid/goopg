@@ -44,13 +44,15 @@ valid; needsVacuum — internal/autovacuum/launcher.go:204-217 confirmed still
 ignores AutovacuumEnabled reloption). Spot-checked 2 of the most surprising
 reversals (subscriber setup, star-expansion) myself via grep/Read before
 applying — both confirmed accurate. Did NOT append new deferral_ledger.md
-rows — pure triage/verification, not new implementation work. NOT YET
-COMMITTED — see Next step.
+rows — pure triage/verification, not new implementation work. Committed as
+ae1d0495 (first pre-commit pgbench-smoke attempt hit a transient TPC-B
+"current transaction is aborted" abort — 1 failed txn out of 6148 unrelated
+to this doc-only change; immediate retry via `bash
+scripts/ralph-precommit-test.sh` passed cleanly with 0 failed across all 3
+workloads, then `git commit` re-ran the hook and passed on the first try).
 
-Next step: `git add unimplemented_feat.json .ralph/working_set.md
-.ralph/progress.json && git commit` (message: chore(M0122-0001): triage 10
-more no-match backlog entries; 4 flip resolved). Then continue M0122-0001 —
-39 - 10 = 29 `no-match`+no-status entries remain. Regenerate the live list
+Next step: continue M0122-0001 — 39 - 10 = 29 `no-match`+no-status entries
+remain. Regenerate the live list
 fresh next loop (indices shift after this edit):
 `python3 -c "import json; d=json.load(open('unimplemented_feat.json'))['unimplemented_features']; nm=[f for f in d if 'status' not in f and f.get('resolution_check',{}).get('ledger')=='no-match']; print(len(nm)); [print(i,f['feature'][:90]) for i,f in enumerate(nm)]"`
 Good next cluster (by likely hit-rate): TPC-H/planner perf items (~30
