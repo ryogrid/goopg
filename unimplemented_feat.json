@@ -34,6 +34,7 @@
    "feature": "Implement signal-based configuration refresh (SIGHUP-style) for the reload command so configuration changes take effect without restarting the server.",
    "task_id": null,
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "v0 server-side handler is a no-op until per-GUC SIGHUP-style refresh wires up"
    ],
@@ -48,7 +49,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: cmd/goopg/main.go:1171 reload command prints configuration reload no-op"
+   "code_audit": "confirmed-open 2026-07-07: cmd/goopg/main.go:1181 runReload prints 'configuration reload signalled (v0 no-op)'; server-side internal/server/server.go:634-637 OnReload callback logs 'reload requested (v0 no-op)' and returns nil. Control-socket RELOAD plumbing (internal/control/control.go:286-293) is fully wired end-to-end, but the callback itself does no GUC re-read/config-file re-parse. Old line citation (main.go:1171) was stale from file drift; substance unchanged."
   },
   {
    "feature": "Implement the restart command for goopg ctl control socket (currently a documented stub).",
@@ -243,6 +244,7 @@
    "feature": "EXPLAIN ANALYZE output rendering of BUFFERS and SETTINGS options with Pool-level instrumentation for page-pin and page-read counter metrics.",
    "task_id": null,
    "resume_point": "Pool-level page-pin/page-read instrumentation",
+   "status": "resolved",
    "evidence": [
     "BUFFERS / SETTINGS counter rendering is queued as a Pool-level page-pin/page-read instrumentation follow-up"
    ],
@@ -257,12 +259,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: docs/design/0018-0004 lines 123-125 defer BUFFERS/SETTINGS to future work"
+   "code_audit": "RESOLVED 2026-07-07: docs/design/0122-0003-explain-format-xml-yaml.md:110-115 status table shows SETTINGS rendering done, BUFFERS rendering partial (TEXT+JSON/XML/YAML, ANALYZE-only, shared hit/read(+dirtied/written) only). Landed via internal/storage/bufpool.go (sharedHitCount/sharedReadCount/sharedDirtiedCount/sharedWrittenCount counters) + internal/executor/operators_explain.go (appendExplainSettingsRow/addExplainSettingsGroup/formatBuffersLine), tests internal/executor/explain_buffers_test.go + explain_settings_test.go. Old citation (docs/design/0018-0004:123-125) still literally says out-of-scope — that text was never edited — but the follow-up landed in the later 0122-0003 doc (2026-07-04) instead. BUFFERS remains partial (no planning-time buffers when ANALYZE off, no local/temp terms) — resolving as the core ask (BUFFERS+SETTINGS rendering with Pool instrumentation) is met, partial-BUFFERS residual noted for any future audit."
   },
   {
    "feature": "Support for EXPLAIN FORMAT XML and FORMAT YAML options to output query plans in XML or YAML format.",
    "task_id": null,
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "FORMAT XML/YAML -> \"unsupported FORMAT\""
    ],
@@ -277,12 +280,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/parser/explain_options_test.go:136 confirms FORMAT XML unsupported"
+   "code_audit": "RESOLVED 2026-07-07: internal/parser/ast.go:473-474 adds ExplainFormatXML/ExplainFormatYAML; internal/parser/parser.go:1479,1481 sets opts.Format for xml/yaml keywords. internal/parser/explain_options_test.go:133-144's test flipped from rejects-XML to TestParseExplainAcceptsXMLFormat (old citation's line 136 still exists but its assertion changed). Rendering in internal/executor/operators_explain_format.go (renderExplainXML/renderExplainYAML), tests internal/executor/explain_format_xml_yaml_test.go. Landed 2026-07-04 per docs/design/0122-0003-explain-format-xml-yaml.md:52-90."
   },
   {
    "feature": "Per-CTE execution statistics tracking in PostgreSQL's pg_stat_* system catalogs for individual CTE performance visibility.",
    "task_id": null,
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "per-CTE pg_stat_* counters"
    ],
@@ -297,7 +301,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: No per-CTE execution statistics found in codebase"
+   "code_audit": "confirmed-open 2026-07-07: no pg_stat_statements/per-CTE grep hits in internal/catalog/catalog.go; existing pg_stat_* virtual tables (pg_stat_slru:6995, pg_stat_wal:7031, pg_stat_io:7061) are all whole-relation/whole-backend granularity, none CTE-keyed. Real PostgreSQL has no such catalog either (CTEs aren't persistent objects with an OID to key stats by) — gap expected to stay open by design. Note: goopg did add unrelated per-CTE EXPLAIN ANALYZE node annotations (docs/design/0122-0003...md:36-45), but that's transient per-query-plan instrumentation, not a pg_stat_* catalog — doesn't satisfy this entry."
   },
   {
    "feature": "DELETE row identification when pgoutput emits empty K body; row identity unavailable for xmax stamping",
@@ -367,6 +371,7 @@
    "feature": "EXPLAIN SETTINGS option rendering to display configuration settings; currently parsed but produces no output.",
    "task_id": "M0018-0004",
    "resume_point": "M0018-0004",
+   "status": "resolved",
    "evidence": [
     "BUFFERS ... parsed-but-no-op until M0018-0004",
     "SETTINGS ... parsed-but-no-op until M0018-0004"
@@ -383,7 +388,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: docs/design/0018-0004:123 defers SETTINGS rendering to future work"
+   "code_audit": "RESOLVED 2026-07-07: docs/design/0122-0003-explain-format-xml-yaml.md:121-183 'SETTINGS rendering (later loop, 2026-07-04)' section — internal/config/guc.go FlagExplain, internal/config/session.go ExplainVariables(), internal/executor/operators_explain.go appendExplainSettingsRow/addExplainSettingsGroup, tests internal/executor/explain_settings_test.go. Duplicate of the entry-1 SETTINGS half — both this entry (M0018-0004) and entry 1 pointed at the stale 0018-0004 doc section, superseded by 0122-0003."
   },
   {
    "feature": "Optimize performance by deferring Wait across sequential Appends in the WAL writer loop to enable true pipelining",
@@ -683,6 +688,7 @@
    "feature": "Implement per-row lock timestamp stamping during streaming execution to track exact lock timing.",
    "task_id": "M0021",
    "resume_point": "refactor for per-row streaming stamping",
+   "status": "open",
    "evidence": [
     "Per-row streaming stamping needs a seqScanOp Pin/RLock-per-row refactor and is deferred",
     "streaming per-row stamping ... all stay deferred",
@@ -704,12 +710,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/executor/operators_window.go lacks lock timestamp stamping logic"
+   "code_audit": "confirmed-open 2026-07-07 (old citation was mislabeled — operators_window.go is the window-function operator, 0 lock-related lines). Real row-locking lives in internal/executor/operators_lockrows.go (lockRowsOp.stampLock/stampLockInner, ~lines 843-1100+), which stamps HeapXmax* lock-mode infomask bits + a real XID onto the tuple header (M0021-0003 Stage A, extended through M0118-0003/0009). No wall-clock 'lock timestamp' is recorded per row anywhere — only XID/infomask state; grep for 'lock timestamp'/'LockTimestamp' across the repo returns nothing. Genuinely unimplemented; unclear this is even a real PG-compat concept (PG has no per-row lock-acquisition timestamp)."
   },
   {
    "feature": "Detection of aggregate functions in SELECT ... FOR UPDATE target lists to enforce proper locking constraints when aggregates appear in the target.",
    "task_id": "M0021-0002",
    "resume_point": "planner slice",
+   "status": "open",
    "evidence": [
     "Aggregate-functions-in-target detection and locking-inside-subqueries deferred"
    ],
@@ -724,12 +731,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/planner/locking_test.go:11-98 no aggregate detection in FOR UPDATE"
+   "code_audit": "confirmed-open 2026-07-07 (old path was mislabeled — the file is internal/analyzer/locking_test.go, not internal/planner/). internal/analyzer/analyzer.go:395-427 analyzeLockingClauses (analyzeLockingClauses) rejects FOR UPDATE/FOR SHARE combined with GROUP BY or HAVING (0A000), confirmed by TestAnalyzeForUpdateRejectsGroupBy/RejectsHaving — that guard IS implemented. But a bare aggregate in the target list without GROUP BY (e.g. SELECT count(*) FROM t FOR UPDATE) is still undetected — PG rejects this via hasAggs in transformLockingClause; goopg has no equivalent check or test. The specific aggregate-in-target-list detection this entry describes remains missing."
   },
   {
    "feature": "Optimize per-row writeHeapRow operations by pinning heap data to improve memory locality during bulk writes.",
    "task_id": null,
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "per-row writeHeapRow pinning + statement-cache deferred"
    ],
@@ -744,12 +752,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/executor/ no pinning/locality optimization found"
+   "code_audit": "confirmed-open 2026-07-07: internal/executor/operators_storage.go:7595-7720 (writeHeapRow/writeHeapRowReturning) and internal/executor/heap_insert_select.go (FSM candidate selection, hotPinThreshold, batchExtendAndRegisterFSM) show real M0107-0007 perf work — but it's about page selection to avoid pin contention, not pinning heap data for memory locality. Each row-write still does a plain Pool.Pin/Unpin per tuple; no locality/prefetch optimization found anywhere in internal/executor or internal/storage."
   },
   {
    "feature": "Implement statement-level caching to reduce preparation overhead across repeated query executions.",
    "task_id": null,
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "per-row writeHeapRow pinning + statement-cache deferred"
    ],
@@ -764,7 +773,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/server/dispatch.go:803 only query-scoped cache not statement-level"
+   "code_audit": "RESOLVED 2026-07-07: cross-session 16-shard plan cache landed commit 5c17297d 'feat(m0098-0005)' (internal/server/plancache.go, 2026-05-12), wired into both the simple-query path (internal/server/dispatch.go:906-925) and extended Parse/Bind/Execute path (internal/server/dispatch_extended.go:79-97), keyed by normalized SQL text so repeated executions across sessions skip re-planning. Old citation (dispatch.go:803) no longer contains cache logic (now cursor-declare code) — stale line, but substance superseded. Caveat: SQL-level PREPARE/EXECUTE sets disablePlanCache=true (dispatch.go:731) and always re-plans, so that sub-path still lacks caching — noted as residual, not blocking resolution of the primary ask."
   },
   {
    "feature": "Rename XLogInsert/XLogFlush API methods to align with PostgreSQL conventions",
@@ -854,6 +863,7 @@
    "feature": "Implement full Borrow-semantics architectural rewrite for comprehensive allocation optimization (current stage only addresses specific call sites without the architectural change).",
    "task_id": null,
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "The full Borrow-semantics rewrite (design doc 0054-0002 §5.2) is split into a follow-up"
    ],
@@ -868,7 +878,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/executor/slot.go:14 only incremental BorrowSemantics removal noted"
+   "code_audit": "RESOLVED 2026-07-07 (via superseding architecture): internal/executor/slot.go:1-17 explicitly states the TupleSlot pipeline (M0069-0001, docs/design/0068-0002-tuple-slot-pipeline.md) removes the row-level BorrowSemantics contract entirely. Repo-wide grep for BorrowSemantics/Borrowable (the literal interface proposed in docs/design/0054-0002-executor-tuple-copy-reduction.md §5.2) returns zero hits — it was never built as specified. Instead the comprehensive allocation-optimization goal was achieved via TupleSlot/MaterializedSlot/VirtualSlot, now present across 57 files in internal/executor (nearly every operator) — the 'comprehensive architectural rewrite' the entry envisioned, just under a different name (cross-referenced in the M0073-M0077 arena/Datum series). Old citation's 'only incremental removal noted' is stale — the removal was completed and replaced wholesale."
   },
   {
    "feature": "Empirical TPC-H verification that index-build column projection achieves DecodeRow cumulative cost ≤ 15% of total query execution time.",
