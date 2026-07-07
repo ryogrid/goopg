@@ -3181,8 +3181,9 @@ mirroring M0119's ledger `status` column.
       `pg_tablespace` visibility remains a separate open item in this
       cluster.
 - [ ] **M0122-0007 — DDL / admin commands / ctl / GUC config** (~14). CREATE/DROP
-      DATABASE full DDL, `goopg ctl restart`, REINDEX, tablespaces, ALTER
-      FUNCTION/COLUMN, planner/jit GUC stubs.
+      DATABASE full DDL, REINDEX, tablespaces, ALTER FUNCTION/COLUMN,
+      planner/jit GUC stubs. (`goopg reload`/SIGHUP and `goopg restart` done,
+      see below.)
       **SIGHUP config reload — done (2026-07-08):** `startControlPlane`'s
       `OnReload` (`internal/server/server.go`) was a logged-only "v0
       no-op" — neither `goopg reload` nor a literal `kill -HUP <pid>`
@@ -3226,8 +3227,48 @@ mirroring M0119's ledger `status` column.
       `ContextPostmaster` GUCs is out of scope (matches upstream — those
       need a real process restart; goopg's reload only warns about them),
       plus the rest of M0122-0007's named items (CREATE/DROP DATABASE
-      full DDL, `goopg ctl restart`, REINDEX, tablespaces, ALTER
-      FUNCTION/COLUMN, planner/jit GUC stubs).
+      full DDL, REINDEX, tablespaces, ALTER FUNCTION/COLUMN, planner/jit GUC
+      stubs).
+      **`goopg restart` — done (2026-07-08):** was a hard stub (`runRestart`
+      always printed "not yet implemented" and returned exit 1, telling the
+      operator to run `stop`/`start` by hand). Since v0's server always runs
+      in the foreground (no postmaster fork/daemonize), a real restart can't
+      spawn a background replacement the way `pg_ctl restart` does — instead
+      `runRestart` (`cmd/goopg/main.go`) stops whatever instance owns `-D`'s
+      `postmaster.pid` (skipped entirely if the pidfile is absent or stale —
+      `control.ProcessAlive` says no live process at that PID, matching
+      `pg_ctl restart`'s not-running behavior), waits for it to exit, then
+      hands off to the exact same start path `goopg start` uses, so the CLI
+      process itself becomes the new server. `-config`/`-hba` keep reusing
+      `goopg start`'s existing `<datadir>/postgresql.conf`/`pg_hba.conf`
+      auto-discovery; `-listen` additionally defaults to the stopped
+      instance's own listen address (from its `postmaster.pid`) when not
+      given explicitly — goopg's listen address is a start-time CLI flag
+      with no config-file home to recover it from otherwise, unlike
+      upstream's `listen_addresses`/`port` GUCs. Split into
+      `runRestartWithStarter(args, stdout, stderr, start)` so tests can
+      inject a fake starter and verify the stop-then-start orchestration
+      (missing `-D`, no pidfile, stale pidfile, live-and-stopped) without
+      blocking on a real foreground listener. Tests: 4 subtests under
+      `TestRunRestartWithStarter` (`cmd/goopg/main_test.go`), the live one
+      spinning up a real `control.Listener` + a real killable child process
+      to exercise the actual stop-wait-then-start sequence end to end (not
+      mocked at the control-socket layer); `TestSubcommandStubsAreReachable`
+      updated (`restart` now requires `-D` like `stop`/`reload`/`status`,
+      exit 2 not the old stub's exit 1). Live-verified against the real
+      `cmd/goopg` binary: started on `127.0.0.1:65498`, ran `goopg restart -D
+      <datadir>` with no `-listen`, confirmed the PID changed (new server
+      process) while `goopg status` still reported the same
+      `127.0.0.1:65498` address, unchanged. Design:
+      `docs/design/root-0001-architecture-overview.md` "`goopg restart`
+      (2026-07-08)" section; `docs/design/README.md` row updated. Gates:
+      `go build ./...` clean; `go vet ./cmd/... ./internal/control/...`
+      clean; `go test ./cmd/... ./internal/control/...` PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed, all 3 workloads). **Still open** (this bucket, ~12 remaining
+      items): CREATE/DROP DATABASE full DDL, REINDEX, tablespaces, ALTER
+      FUNCTION/COLUMN, planner/jit GUC stubs.
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,
       encoding constraints during bootstrap/runtime.

@@ -2,11 +2,15 @@ package main
 
 import (
 	"bytes"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/goopg/goopg/internal/config"
 	"github.com/goopg/goopg/internal/control"
@@ -56,17 +60,19 @@ func TestVersionPrintsAndExitsZero(t *testing.T) {
 // TestSubcommandStubsAreReachable confirms every subcommand
 // dispatches without panicking. The exit codes here are what
 // each subcommand returns when invoked with NO arguments:
-//   - stop/reload/status all require -D; missing flag is exit 2.
-//   - restart is still a stub returning exit 1.
+//   - stop/restart/reload/status all require -D; missing flag is exit 2.
 //   - version always returns 0.
 //
 // `start` is excluded because it runs a real server (see
 // internal/server tests); `init` is excluded because it now writes
 // a real data directory and is covered by TestInitCommandLaysOutDataDir.
+// `restart`'s stop-then-start orchestration is covered separately by
+// TestRunRestartWithStarter (it can't run through the real `start` here
+// without blocking on a foreground server).
 func TestSubcommandStubsAreReachable(t *testing.T) {
 	cases := map[string]int{
 		"stop":    2,
-		"restart": 1,
+		"restart": 2,
 		"reload":  2,
 		"status":  2,
 		"version": 0,
@@ -78,6 +84,130 @@ func TestSubcommandStubsAreReachable(t *testing.T) {
 			t.Errorf("run(%q) = %d, want %d (stderr=%q)", cmd, got, want, stderr.String())
 		}
 	}
+}
+
+// TestRunRestartWithStarter exercises runRestart's stop-then-start
+// orchestration via the injectable starter (runRestart itself always wires
+// the real runStart, which blocks forever serving a foreground listener —
+// not something a unit test can drive directly).
+func TestRunRestartWithStarter(t *testing.T) {
+	t.Run("missing -D exits 2 without starting", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		started := false
+		code := runRestartWithStarter(nil, &stdout, &stderr, func(args []string, _, _ io.Writer) int {
+			started = true
+			return 0
+		})
+		if code != 2 {
+			t.Fatalf("exit=%d, want 2 (stderr=%q)", code, stderr.String())
+		}
+		if started {
+			t.Fatal("starter invoked despite missing -D")
+		}
+	})
+
+	t.Run("no postmaster.pid starts straight away with default listen addr", func(t *testing.T) {
+		dir := t.TempDir()
+		var stdout, stderr bytes.Buffer
+		var gotArgs []string
+		code := runRestartWithStarter([]string{"-D", dir}, &stdout, &stderr, func(args []string, _, _ io.Writer) int {
+			gotArgs = args
+			return 0
+		})
+		if code != 0 {
+			t.Fatalf("exit=%d, want 0 (stderr=%q)", code, stderr.String())
+		}
+		want := []string{"-D", dir, "-listen", "127.0.0.1:5432"}
+		if !slices.Equal(gotArgs, want) {
+			t.Fatalf("starter args = %v, want %v", gotArgs, want)
+		}
+	})
+
+	t.Run("stale pidfile is treated as not running", func(t *testing.T) {
+		dir := t.TempDir()
+		// A pid essentially guaranteed to be dead: fork a real child,
+		// wait for it to exit, then reuse its (now-stale) pid number.
+		cmd := exec.Command("true")
+		if err := cmd.Run(); err != nil {
+			t.Fatalf("spawn throwaway process: %v", err)
+		}
+		deadPID := cmd.Process.Pid
+		if err := control.WritePIDFile(dir, control.PIDFile{
+			PID:        deadPID,
+			DataDir:    dir,
+			StartedAt:  time.Now(),
+			ListenAddr: "127.0.0.1:9999",
+			SocketPath: filepath.Join(dir, control.SocketName),
+		}); err != nil {
+			t.Fatalf("WritePIDFile: %v", err)
+		}
+
+		var stdout, stderr bytes.Buffer
+		var started bool
+		code := runRestartWithStarter([]string{"-D", dir}, &stdout, &stderr, func(args []string, _, _ io.Writer) int {
+			started = true
+			return 0
+		})
+		if code != 0 {
+			t.Fatalf("exit=%d, want 0 (stderr=%q)", code, stderr.String())
+		}
+		if !started {
+			t.Fatal("starter not invoked for a stale pidfile")
+		}
+	})
+
+	t.Run("live server is stopped before starting, reusing its listen addr", func(t *testing.T) {
+		dir := t.TempDir()
+		ln, err := control.NewListener(filepath.Join(dir, control.SocketName))
+		if err != nil {
+			t.Fatalf("NewListener: %v", err)
+		}
+		defer ln.Close()
+
+		// A real, killable process to stand in for the "running server".
+		sleeper := exec.Command("sleep", "60")
+		if err := sleeper.Start(); err != nil {
+			t.Fatalf("start sleeper: %v", err)
+		}
+		defer func() { _ = sleeper.Process.Kill(); _, _ = sleeper.Process.Wait() }()
+
+		ln.OnStop = func() error {
+			// Kill alone leaves a zombie until reaped, and
+			// syscall.Kill(pid, 0) still succeeds against a zombie —
+			// Wait so ProcessAlive's poll loop actually observes death.
+			_ = sleeper.Process.Kill()
+			_, _ = sleeper.Process.Wait()
+			return nil
+		}
+		go ln.Serve()
+
+		if err := control.WritePIDFile(dir, control.PIDFile{
+			PID:        sleeper.Process.Pid,
+			DataDir:    dir,
+			StartedAt:  time.Now(),
+			ListenAddr: "127.0.0.1:7777",
+			SocketPath: ln.Path(),
+		}); err != nil {
+			t.Fatalf("WritePIDFile: %v", err)
+		}
+
+		var stdout, stderr bytes.Buffer
+		var gotArgs []string
+		code := runRestartWithStarter([]string{"-D", dir}, &stdout, &stderr, func(args []string, _, _ io.Writer) int {
+			gotArgs = args
+			return 0
+		})
+		if code != 0 {
+			t.Fatalf("exit=%d, want 0 (stderr=%q)", code, stderr.String())
+		}
+		want := []string{"-D", dir, "-listen", "127.0.0.1:7777"}
+		if !slices.Equal(gotArgs, want) {
+			t.Fatalf("starter args = %v, want %v (should default to the stopped instance's own listen addr)", gotArgs, want)
+		}
+		if control.ProcessAlive(sleeper.Process.Pid) {
+			t.Fatal("sleeper still alive after restart's stop phase")
+		}
+	})
 }
 
 // TestInitCommandLaysOutDataDir drives `goopg init -D <tmp>` and
