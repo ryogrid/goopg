@@ -835,6 +835,20 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 			logger.Info("connection rejected: unknown database", "database", db)
 			return
 		}
+
+		// M0119-0006 (AC-002 residual #1): reject a connection to a database
+		// marked `datconnlimit = -2` (left partway through DROP DATABASE),
+		// mirroring PG's InitPostgres FATAL 55000 "cannot connect to invalid
+		// database" (postinit.c). Only the -2 sentinel is enforced here —
+		// positive datconnlimit throttling needs a live per-database
+		// connection counter and is a separate, untested-here feature (see
+		// the matching deferral ledger row).
+		if reg, ok := s.cfg.Catalog.(databaseConnLimitRegistry); ok && reg.DatabaseConnLimit(db) == catalog.DatconnlimitInvalidDB {
+			s.writeFatal(w, sqlstate.ObjectNotInPrerequisiteState,
+				fmt.Sprintf("cannot connect to invalid database %q", db))
+			logger.Info("connection rejected: invalid database", "database", db)
+			return
+		}
 	}
 
 	logger.Info("connection established")

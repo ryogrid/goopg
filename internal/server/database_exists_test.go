@@ -98,6 +98,63 @@ func TestConnectNonexistentDatabaseRejected(t *testing.T) {
 	}
 }
 
+// TestConnectInvalidDatconnlimitDatabaseRejected pins the M0119-0006 (AC-002
+// residual #1) contract: a connection naming a database whose `datconnlimit`
+// is the `-2` "invalid database" sentinel (left partway through DROP
+// DATABASE, per PG's DATCONNLIMIT_INVALID_DB) is rejected post-authentication
+// with a FATAL ErrorResponse carrying SQLSTATE 55000 and the PG-compatible
+// `cannot connect to invalid database "..."` message, mirroring
+// postinit.c's InitPostgres check.
+func TestConnectInvalidDatconnlimitDatabaseRejected(t *testing.T) {
+	cat := catalog.NewInMemory()
+	if err := cat.CreateDatabase("brokendb"); err != nil {
+		t.Fatal(err)
+	}
+	if !cat.SetDatabaseConnLimit("brokendb", catalog.DatconnlimitInvalidDB) {
+		t.Fatal("SetDatabaseConnLimit: database not found")
+	}
+	addr, stop := startServerWithCatalog(t, cat)
+	defer stop()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+	writeStartupPacket(t, conn, map[string]string{"user": "postgres", "database": "brokendb"})
+
+	r := protocol.NewFrameReader(conn)
+	var f protocol.Frame
+	for {
+		fr, err := r.ReadFrame()
+		if err != nil {
+			t.Fatalf("read FATAL ErrorResponse: %v", err)
+		}
+		if fr.Type == protocol.MsgErrorResponse {
+			f = fr
+			break
+		}
+		if fr.Type != protocol.MsgAuthentication {
+			t.Fatalf("unexpected frame %c before ErrorResponse", fr.Type)
+		}
+	}
+	got := decodeFields(t, f.Payload)
+	if got[protocol.FieldSeverity] != "FATAL" {
+		t.Errorf("severity = %q, want FATAL", got[protocol.FieldSeverity])
+	}
+	if got[protocol.FieldSQLState] != string(sqlstate.ObjectNotInPrerequisiteState) {
+		t.Errorf("SQLSTATE = %q, want %q (55000)",
+			got[protocol.FieldSQLState], sqlstate.ObjectNotInPrerequisiteState)
+	}
+	if want := `cannot connect to invalid database "brokendb"`; got[protocol.FieldMessage] != want {
+		t.Errorf("message = %q, want %q", got[protocol.FieldMessage], want)
+	}
+	if _, err := r.ReadFrame(); err == nil {
+		t.Error("expected EOF after FATAL, got nil")
+	}
+}
+
 // TestConnectBootstrapDatabasesAccepted confirms the three seeded bootstrap
 // databases (postgres, template1, template0) pass the existence check — the
 // handshake proceeds to AuthenticationOk rather than a 3D000 rejection. This is

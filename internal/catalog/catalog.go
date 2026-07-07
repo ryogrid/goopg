@@ -4512,6 +4512,13 @@ func (c *InMemory) DropDatabase(name string) error {
 	return nil
 }
 
+// DatconnlimitInvalidDB mirrors PG's DATCONNLIMIT_INVALID_DB sentinel
+// (pg_database.h): a database left partway through DROP DATABASE is marked
+// with this datconnlimit value so it's excluded from client-side filters
+// (pg_amcheck/vacuumdb) and rejected at connect time (postinit.c's
+// "cannot connect to invalid database" FATAL).
+const DatconnlimitInvalidDB int32 = -2
+
 // DatabaseConnLimit returns the runtime `pg_database.datconnlimit` override
 // recorded for name via SetDatabaseConnLimit, or 0 (PG's "no limit" default)
 // if none was ever set. M-NIGHTLY AI-20260707-000712-004 / AC-002 residual #1.

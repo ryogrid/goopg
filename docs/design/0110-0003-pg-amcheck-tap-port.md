@@ -545,3 +545,61 @@ startup never consults `DatabaseConnLimit`, only database registration/
 `datconnlimit` values (real per-database connection-count throttling) are
 entirely unimplemented — only the `-2` sentinel's SQL-visibility half was
 needed for AC-002.
+
+### Follow-up: connect-time `datconnlimit = -2` rejection (2026-07-07)
+
+Picked up residual #1 above. PG's `InitPostgres` (postinit.c) rechecks
+`pg_database` after authentication and calls `database_is_invalid_form`,
+which is just `datform->datconnlimit == DATCONNLIMIT_INVALID_DB` (pg_database.h
+defines the sentinel as `-2`, "a database is set to invalid partway through
+being dropped"). A match is a FATAL `55000`
+(`ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE`) `cannot connect to invalid
+database "%s"`, raised before the session is otherwise established — distinct
+from the connection-count check a few lines below it (`ERRCODE_TOO_MANY_
+CONNECTIONS`), which only applies to non-negative limits and is out of scope
+here (needs a live per-database connection counter — residual #2, still
+deferred, untouched by this loop).
+
+goopg's connection-startup handshake (`Server.handleStartup`,
+`internal/server/server.go`) already had the sibling "database does not
+exist" gate (`databaseRegistry.HasDatabase`, M0110-0003 AC-002 gap #3) right
+after authentication — the natural place to add the `-2` check too. Added:
+
+- `catalog.DatconnlimitInvalidDB` (`internal/catalog/catalog.go`), an exported
+  `-2` constant mirroring PG's `DATCONNLIMIT_INVALID_DB` name, so the sentinel
+  isn't a magic number at the call site.
+- `databaseConnLimitRegistry` (`internal/server/database_ddl.go`), a new
+  single-method interface (`DatabaseConnLimit(name string) int32`) satisfied
+  by `catalog.InMemory`. Deliberately kept separate from the existing
+  `databaseRegistry` interface (`CreateDatabase`/`DropDatabase`/`HasDatabase`)
+  rather than adding the method there: `databaseRegistry` gates the
+  unrelated unknown-role and unknown-database FATAL checks via the same type
+  assertion, so widening it would silently disable those checks for any
+  catalog fake that implements the first three methods but not this one.
+  This mirrors the existing `databaseConfigRegistry` precedent (added for
+  `ALTER DATABASE ... SET`) in the same file.
+- A new check in `Server.handleStartup`, right after the existing
+  `HasDatabase` gate (so it only runs once the database is confirmed to
+  exist): if `DatabaseConnLimit(db) == catalog.DatconnlimitInvalidDB`, write
+  the FATAL `55000` `cannot connect to invalid database "%s"` ErrorResponse
+  and close the connection, exactly like the sibling check above it.
+
+Deliberately scoped to the `-2` sentinel only, per the ledger row's own
+scoping rationale — positive-limit connection *counting* needs new state
+(an active-connection registry keyed by database) and remains residual #2,
+untouched.
+
+**Test.** `TestConnectInvalidDatconnlimitDatabaseRejected`
+(`internal/server/database_exists_test.go`), mirroring the existing
+`TestConnectNonexistentDatabaseRejected`/`TestConnectBootstrapDatabasesAccepted`
+pair exactly: creates a database, marks it `datconnlimit = -2` via
+`SetDatabaseConnLimit`, dials the real wire protocol, and asserts the FATAL
+frame's SQLSTATE and message text. Confirmed non-vacuous via `git stash` on
+`server.go` alone (fails with `unexpected frame S before ErrorResponse` — the
+handshake proceeds to `AuthenticationOk` instead of rejecting — without the
+fix).
+
+Gates: `go build ./...` clean; `go vet ./internal/server/... ./internal/catalog/...`
+clean; `go test ./internal/server/... ./internal/catalog/... ./internal/executor/...`
+PASS; `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh` PASS
+(0 failed transactions, standard/simple-update/select-only).

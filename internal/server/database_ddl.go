@@ -585,6 +585,18 @@ type databaseConfigRegistry interface {
 	ResetAllDatabaseConfig(dbOid uint32)
 }
 
+// databaseConnLimitRegistry is the subset of catalog.Catalog the
+// connection-startup `datconnlimit = -2` (invalid database) check needs.
+// catalog.InMemory satisfies this interface. A separate interface from
+// databaseRegistry (rather than adding this method there) keeps any
+// catalog fake that implements CreateDatabase/DropDatabase/HasDatabase but
+// not DatabaseConnLimit from silently losing the unrelated role/database-
+// existence checks that also gate on a databaseRegistry type assertion.
+// M0119-0006 (AC-002 residual #1).
+type databaseConnLimitRegistry interface {
+	DatabaseConnLimit(name string) int32
+}
+
 // applyAlterDatabaseConfig applies a parsed ALTER DATABASE ... SET/RESET
 // operation, mirroring tryHandleDatabaseDDL's (handled, notice, err) shape.
 // Naming any database other than the connection's own liveDBName is a

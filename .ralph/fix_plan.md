@@ -1810,8 +1810,12 @@ prev-link fixes.
       (AC-002) ported; CREATE SCHEMA + user-schema table restart-durability enablers
       landed. **Remaining (AC-003, deferred):** `003_check`, `004_verify_heapam`,
       `005_opclass_damage` — need `verify_heapam()` SRF + opclass catalog parity +
-      index AMs. (One 002 sub-section deferred: `datconnlimit=-2` invalid-DB filter —
-      runtime shared-catalog write.) Design `0110-0003-*`.
+      index AMs. (2026-07-07: the `datconnlimit=-2` invalid-DB filter sub-section is
+      now fully closed, both its SQL-visibility half — M0119-0006 AC-002 — and its
+      connect-time-enforcement half — M0119-0006 AC-002 residual #1 follow-up;
+      positive `datconnlimit` connection-count throttling remains a separate, still-
+      open gap, tracked in the deferral ledger, not part of AC-002's scope.) Design
+      `0110-0003-*`.
 
 ## M0119 — Deferral-Ledger Backlog Consumption (filed 2026-06-29)
 
@@ -1925,6 +1929,37 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
       `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
       failed, all 3 workloads).
+      **2026-07-07 follow-up (connect-time enforcement, AC-002 residual #1
+      part 2):** landed the "still deferred" connect-time half named above —
+      a real client can no longer open a session against a `datconnlimit =
+      -2` database. `catalog.DatconnlimitInvalidDB` (new exported `-2`
+      constant) + a new `databaseConnLimitRegistry` interface
+      (`internal/server/database_ddl.go`, kept separate from
+      `databaseRegistry` so a catalog fake missing this one method doesn't
+      silently disable the unrelated role/database-existence FATAL checks
+      that share that type assertion) + a new check in
+      `Server.handleStartup` (`internal/server/server.go`), right after the
+      existing `HasDatabase` gate, rejects with the real PG FATAL `55000`
+      `cannot connect to invalid database "%s"` (mirrors `postinit.c`'s
+      `database_is_invalid_form`/`InitPostgres` check). Test:
+      `TestConnectInvalidDatconnlimitDatabaseRejected`
+      (`internal/server/database_exists_test.go`), mirroring the existing
+      `TestConnectNonexistentDatabaseRejected`; confirmed non-vacuous via
+      `git stash` on `server.go` alone (fails with `unexpected frame S
+      before ErrorResponse` — handshake proceeds to AuthenticationOk instead
+      of rejecting). Design doc updated:
+      `docs/design/0110-0003-pg-amcheck-tap-port.md`'s new "Follow-up:
+      connect-time `datconnlimit = -2` rejection" section +
+      `docs/design/README.md` row updated. Gates: `go build ./...` clean;
+      `go vet ./internal/server/... ./internal/catalog/...` clean; `go test
+      ./internal/server/... ./internal/catalog/... ./internal/executor/...`
+      PASS; `RALPH_PRECOMMIT_SCOPE=smoke bash
+      scripts/ralph-precommit-test.sh` PASS (0 failed transactions, all 3
+      workloads). **Still deferred** (new 2026-07-07 ledger row): positive
+      `datconnlimit` values (real per-database connection-count throttling)
+      remain entirely unimplemented — needs a live active-connection counter
+      keyed by database name, a materially larger change than this loop's
+      sentinel-only check.
 - [ ] **M0119-0007 — pg_basebackup recvlogical** (source: M0095-0003). `030 recvlogical`
       — blocked on logical decoding (tracks the logical-replication milestone / D-004).
 
