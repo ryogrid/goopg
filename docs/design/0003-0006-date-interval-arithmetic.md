@@ -295,6 +295,46 @@ interval strings (`'1 year 2 months 3 days'`, `'01:02:03'`) — both the typed
 literal and the cast path reject them identically now, so there is no
 remaining asymmetry between the two entry points for this v0 interval type.
 
+## Follow-up: `justify_hours`/`justify_days`/`justify_interval` (M0097-0004, 2026-07-07)
+
+`evalJustifyInterval` (`internal/executor/expr.go`) was a stub that returned
+its argument unchanged for all three functions — `unimplemented_feat.json`'s
+`m0097-0004` entry. Implemented for real: `justify_days()`/`justify_interval()`
+now move whole 30-day chunks out of the day field into the month field, then
+equalize the sign of both fields, mirroring upstream's
+`interval_justify_days`/`interval_justify_interval`
+(`postgres/src/backend/utils/adt/timestamp.c`) exactly. Upstream's
+`justify_interval` additionally folds in `interval_justify_hours` (moving
+whole 24-hour chunks of the *time* field into days) as a pre-step, but
+goopg's v0 `KindInterval` Datum has no time field at all — it is always
+exactly zero — so that step is permanently a no-op here and
+`justify_interval` collapses to plain `justify_days`. For the same reason
+`justify_hours()` itself is always the identity for goopg (nothing ever
+moves from a nonexistent time field into days) and is dispatched straight to
+`evalExpr` by the `evalFuncCall` switch instead of through
+`evalJustifyInterval` at all.
+
+The month/day rebalancing arithmetic was factored into a standalone
+`justifyIntervalDays(months, days int32) (int32, int32)` so the sign-
+reconciliation branches (only reachable with a mixed-sign months+days value)
+have a direct unit-test seam — goopg has no `interval + interval` operator
+yet, so a SQL-level test can't construct such a value from typed literals.
+Verified live against real PostgreSQL 18.3: `justify_days('35 days')` = `'1
+mon 5 days'`, `justify_days('-35 days')` = `'-1 mons -5 days'`,
+`justify_interval('5 mons -33 days')` = `'3 mons 27 days'`,
+`justify_interval('-5 mons 33 days')` = `'-3 mons -27 days'`.
+
+Tests: `internal/executor/interval_justify_test.go`
+(`TestJustifyIntervalFunctions` — SQL-level, single-field literals;
+`TestJustifyIntervalDaysSignReconciliation` — direct calls into
+`justifyIntervalDays` for the mixed-sign cases). Confirmed non-vacuous via
+`git stash` on `expr.go` alone (test file fails to compile without
+`justifyIntervalDays`). Gates: `go build ./...` clean; `go test
+./internal/executor/... ./internal/planner/... ./internal/analyzer/...
+./internal/parser/...` PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+`RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh` PASS (0
+failed transactions, all 3 workloads).
+
 ## Cross-references
 
 - TPC-H query bodies: HammerDB upstream

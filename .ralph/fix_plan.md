@@ -2741,6 +2741,39 @@ mirroring M0119's ledger `status` column.
       ./internal/planner/...` PASS; `scripts/tpch-spotcheck.sh` PASS
       (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke bash
       scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 workloads).
+      **`justify_hours`/`justify_days`/`justify_interval` landed (2026-07-07,
+      this loop, m0097-0004):** all three were stubs returning their argument
+      unchanged. `justify_days`/`justify_interval` now normalize whole 30-day
+      chunks of the day field into the month field via a new
+      `justifyIntervalDays(months, days int32) (int32, int32)` helper
+      (`internal/executor/expr.go`), mirroring upstream's
+      `interval_justify_days`/`interval_justify_interval`
+      (`postgres/src/backend/utils/adt/timestamp.c`) exactly — upstream's
+      `justify_interval` also folds in `interval_justify_hours` (moving whole
+      24h chunks of the *time* field into days) as a pre-step, but since v0's
+      `KindInterval` Datum has no time field at all (always exactly zero),
+      that step is permanently a no-op and `justify_interval` collapses to
+      plain `justify_days`. `justify_hours()` itself is therefore always the
+      identity for goopg (matches upstream exactly for this v0 representation,
+      not an approximation) and is dispatched straight to `evalExpr` rather
+      than through `evalJustifyInterval`. Verified live against real
+      PostgreSQL 18.3 (`postgres/local_install`): `justify_days('35 days')` =
+      `'1 mon 5 days'`, `justify_interval('5 mons -33 days')` = `'3 mons 27
+      days'`, `justify_interval('-5 mons 33 days')` = `'-3 mons -27 days'`.
+      Tests: `internal/executor/interval_justify_test.go`
+      (`TestJustifyIntervalFunctions` — SQL-level; `TestJustifyIntervalDaysSignReconciliation`
+      — direct calls into `justifyIntervalDays` for the mixed-sign
+      reconciliation branches, since goopg has no `interval + interval`
+      operator to build such a value from SQL typed literals). Confirmed
+      non-vacuous via `git stash` (test file fails to compile without the new
+      helper). `unimplemented_feat.json`'s `m0097-0004` entry marked
+      `resolved`. Design: `docs/design/0003-0006-date-interval-arithmetic.md`
+      new Follow-up section; `docs/design/README.md` row extended. Gates: `go
+      build ./...` clean; `go test ./internal/executor/... ./internal/planner/...
+      ./internal/analyzer/... ./internal/parser/...` PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh` PASS
+      (0 failed transactions, all 3 workloads).
       **Still open in this bucket:** RANGE/GROUPS window frame modes
       (documented v0 scope limit), sub-day intervals + multi-component
       interval strings (both the typed-literal and cast paths now

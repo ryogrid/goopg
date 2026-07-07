@@ -2071,6 +2071,7 @@
    "feature": "justify_hours(), justify_days(), and justify_interval() functions are stubs that return input unchanged.",
    "task_id": "m0097-0004",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "justify_hours / justify_days / justify_interval: stubs — return input as-is"
    ],
