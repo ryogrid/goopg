@@ -286,6 +286,53 @@ func TestConnectExceedsPositiveDatconnlimitRejected(t *testing.T) {
 	}
 }
 
+// TestConnectNonSuperuserFirstConnectionUnlimitedDatabaseAccepted pins the
+// M0119-0006-DATCONNLIMIT-DEFAULT fix: a database that never had
+// SetDatabaseConnLimit called on it (i.e. every database in a fresh cluster)
+// must report an effectively unlimited datconnlimit, matching PG's `-1`
+// pg_database.h default — not the Go zero-value `0`, which would reject a
+// non-superuser role's very first connection (`limit >= 0 && count(1) >
+// limit(0)`). Uses a real activity.Registry so the positive-datconnlimit
+// check in handleStartup actually runs.
+func TestConnectNonSuperuserFirstConnectionUnlimitedDatabaseAccepted(t *testing.T) {
+	cat := catalog.NewInMemory()
+	if err := cat.CreateDatabase("freshdb"); err != nil {
+		t.Fatal(err)
+	}
+	cat.RegisterRole("alice")
+	act := activity.NewActivityRegistry(mvcc.DefaultProcArraySize)
+	addr, stop := startServerWithCatalogAndActivity(t, cat, act)
+	defer stop()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+	writeStartupPacket(t, conn, map[string]string{"user": "alice", "database": "freshdb"})
+
+	// AuthenticationOk is always sent before the datconnlimit check runs, so
+	// a single first-frame read can't distinguish accept from reject here —
+	// read on until ReadyForQuery (full acceptance) or an ErrorResponse
+	// (the datconnlimit-default bug would produce one) arrives.
+	r := protocol.NewFrameReader(conn)
+	for {
+		f, err := r.ReadFrame()
+		if err != nil {
+			t.Fatalf("read frame: %v", err)
+		}
+		if f.Type == protocol.MsgErrorResponse {
+			got := decodeFields(t, f.Payload)
+			t.Fatalf("connection rejected: SQLSTATE=%q msg=%q",
+				got[protocol.FieldSQLState], got[protocol.FieldMessage])
+		}
+		if f.Type == protocol.MsgReadyForQuery {
+			break
+		}
+	}
+}
+
 // TestConnectPositiveDatconnlimitSuperuserBypasses confirms the bootstrap
 // superuser ("postgres") connects past a positive datconnlimit that would
 // reject any other role, mirroring CheckMyDatabase's `!am_superuser` gate:

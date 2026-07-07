@@ -838,3 +838,50 @@ Gates: `go build ./...` clean; `go test ./internal/wal/... ./internal/initdb/...
 `go test -v -run '^TestPort_PgAmcheck003' ./internal/testport/` PASS (4/4);
 `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
 scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 workloads).
+
+## Follow-up (2026-07-08): `DatabaseConnLimit`'s unset default was `0`, not PG's `-1` — blocked every non-superuser role's first connection cluster-wide
+
+Found live while e2e-verifying an unrelated ALTER FUNCTION parser fix (a
+freshly `CREATE ROLE`'d, unprivileged session's very first `SELECT 1` FATAL'd
+with `too many connections for database "postgres"`), tracked as its own
+`M0119-0006-DATCONNLIMIT-DEFAULT` deferral-ledger row and closed the same day.
+
+Root cause: `DatabaseConnLimit(name)`'s `return c.databaseConnLimit[name]`
+returned the Go zero-value `0` for any database that never had an explicit
+`SetDatabaseConnLimit` override — i.e. every database in a fresh cluster,
+since nothing calls `SetDatabaseConnLimit` at `CreateDatabase` time. Real PG's
+`pg_database.datconnlimit` default is `-1` ("no limit", `pg_database.h`); `0`
+means "reject all new connections." The residual #2 positive-datconnlimit
+check added in the follow-up above (`limit >= 0 && !isSuperuserRoleName(user)`
+then `count > limit`) was written and tested only against databases that had
+an *explicit* limit set, so this default-value bug had zero test coverage —
+every existing datconnlimit test connects as the hardcoded superuser name
+`"postgres"`, which bypasses the check entirely regardless of the limit
+value.
+
+Fix: `DatabaseConnLimit` now uses the map's comma-ok form and returns `-1`
+when the entry is absent, instead of relying on Go's zero-value fallthrough.
+The `pg_database` `VirtualRows` render path needed no code change — it
+already called `c.DatabaseConnLimit(n)` rather than reading the map
+directly — only its comment describing the old (wrong) default was stale and
+is now fixed alongside the struct field's doc comment.
+
+**Test.** `TestConnectNonSuperuserFirstConnectionUnlimitedDatabaseAccepted`
+(`internal/server/database_exists_test.go`): creates a database, registers a
+non-superuser role, and asserts a fresh connection succeeds without ever
+setting a `datconnlimit` override. Note this test cannot use the "read one
+frame and check it's Authentication" shortcut `TestConnectBootstrapDatabasesAccepted`
+uses — `AuthenticationOk` is always sent before the positive-datconnlimit
+check runs, so a rejection and an acceptance both start with the same first
+frame. It instead reads frames until either an `ErrorResponse` (fail) or
+`ReadyForQuery` (pass) arrives, the same pattern the rejection-path tests
+already use. Confirmed non-vacuous by reverting `catalog.go` to its pre-fix
+form and re-running: fails with the exact predicted `53300 too many
+connections for database "freshdb"` FATAL.
+
+Gates: `go build ./...` clean; `go test ./internal/server/... ./internal/catalog/...
+./internal/activity/...` PASS (repeated 3x for flake-check); `scripts/tpch-spotcheck.sh`
+PASS (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh`
+PASS (0 failed, all 3 workloads). **M0119-0006's datconnlimit cluster (both
+the `-2` invalid-database sentinel and positive-limit throttling) now has no
+known open residuals.**
