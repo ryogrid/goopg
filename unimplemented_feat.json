@@ -1857,7 +1857,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: Design doc 0089-0002-buffer-pool-dirty-tracking-on-extend.md does not exist; audit undocumented"
+   "code_audit": "still-open 2026-07-07 (re-verified): docs/design/0089-0002-buffer-pool-dirty-tracking-on-extend.md still does not exist -- note the milestone id was reused/collided: a DIFFERENT M0089-0002 (final checkpoint in Runtime.Close, commit 4c661e88) landed and is unrelated to this dirty-tracking audit. Pool.PinNew (internal/storage/bufpool.go:1049-1124) does correctly publish new slots as dirty (slotDirtyBit set at line 1104), so no obvious bug is visible by inspection. The scale-100 pgbench symptom that originally motivated this audit was later root-caused to two unrelated bugs (stale FSM after TRUNCATE, concurrent-UPDATE xmax races) fixed under M0090-0001/0002 with passing e2e pgbench verification at scale 100. The audit itself was never performed/documented, but no evidence of a real dirty-tracking bug remains either -- low priority to actually do the audit now."
   },
   {
    "feature": "Plan cache implementation is deferred. Design document M0092-0008 explains why a plan cache won't help pgbench with client-side literal substitution patterns.",
@@ -1877,7 +1877,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: Plan cache deferred; design M0092-0008 explains why caching won't help pgbench patterns"
+   "code_audit": "still-open 2026-07-07 (re-verified, not stale despite M0098-0005 landing a real cache): internal/server/plancache.go (16-shard cross-session plan cache) is wired into both the simple-query path (dispatch.go:911) and extended path (dispatch_extended.go:94), but its cache key is normalizeCompatSQL(sql) (dispatch.go:1502) which lowercases/collapses whitespace while explicitly preserving literal values verbatim (normalizeSQLPreservingLiterals, comment at dispatch.go:1508-1509 citing M0097-0003 to avoid literal-value key collisions). pgbench's classic client-side-literal-substituted simple-query traffic (WHERE aid = 42 vs WHERE aid = 9999) therefore still produces a distinct cache key per query -> 0% hit rate, exactly the failure mode 0092-0008 predicted. The cache does help real extended-protocol prepared statements reusing identical SQL text with $1/Bind params (0092-0008's 'future use-case'), but the specific pgbench-literal-substitution skepticism this entry describes is unresolved by M0098-0005."
   },
   {
    "feature": "Structural fix for select-only performance is deferred to M0092. The initial audit is complete but the implementation is left for the next milestone.",
@@ -1965,6 +1965,7 @@
    "feature": "Subscriber setup with streaming and logical replication for replicating changes is not implemented in goopg v0.",
    "task_id": null,
    "resume_point": "BB-020",
+   "status": "resolved",
    "evidence": [
     "Logical streaming deferred: logical replication protocol not in goopg v0",
     "Subscriber setup deferred: streaming + logical replication not in goopg v0",
@@ -1983,7 +1984,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: Logical replication exists but subscriber setup incomplete"
+   "code_audit": "RESOLVED 2026-07-07: CREATE/DROP SUBSCRIPTION implemented in internal/executor/operators_ddl.go:641-665 (execCreateSubscription/execDropSubscription), writing WAL via wal.EncodeCreateSubscription. Full apply pipeline landed: internal/server/tablesync_manager.go (RunTableSyncManager/syncOneRel table-sync), internal/executor/applyworker.go (per-subscription logical-apply loop for INSERT/UPDATE/DELETE pgoutput messages), internal/server/applylauncher.go (auto-launcher, commit cf310c79). Commit f31b4772 closed Scenario B (goopg primary + PG subscriber E2E); commit 57105dad delivered the CREATE SUBSCRIPTION round-trip. D-004's remaining unported TAP tests are deferred detail scenarios, not the core subscriber-setup gap this entry described."
   },
   {
    "feature": "min_parallel_table_scan_size and min_parallel_index_scan_size GUCs are accepted but not acted upon; query planner ignores these settings.",
@@ -2388,6 +2389,7 @@
    "feature": "Expression-based ON CONFLICT targets (e.g., lower(key)) require expression-index evaluation support, which is deferred as a separate scope beyond this testport parser fix.",
    "task_id": null,
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "expression-based ON CONFLICT (lower(key)) targets require expression-index evaluation support (separate scope)"
    ],
@@ -2402,7 +2404,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/parser/dml.go:148 ON CONFLICT targets only support col_name, not expressions"
+   "code_audit": "RESOLVED 2026-07-07: internal/parser/dml.go:267-279 (parseConflictTargetColumnList) now explicitly parses expression columns like lower(fruit) into a parallel Exprs slice on OnConflictTarget. internal/executor/operators_upsert.go encodeExprIndexKey (line 1204/1242) and collectExprColumnNames (line 1293) evaluate expression-index keys for conflict matching (M0100-0006b). Old line-148 citation is stale."
   },
   {
    "feature": "Full SeqScan/Project plan node migration from opTreeSlab is deferred to a future loop; plannode.go establishes only the foundation.",
@@ -2422,7 +2424,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/executor/plannode.go:14 states SeqScan/Project not yet migrated"
+   "code_audit": "PARTIALLY-RESOLVED 2026-07-07, still open: internal/executor/plannode.go:16-22 (Migration status Phase C.3 header) shows PlanSeqScan is now fully concrete (seqScanOp holds schema/tbl/pos/rel directly, no orig planner.Node pointer; landed via commit 1953872c 'SeqScan plan pointer elimination'). PlanProject remains an adapter keeping orig planner.Node for future migration -- that half of the original claim is still genuinely open."
   },
   {
    "feature": "Splitting state.appendMu's four invariants to enable independent granular locking.",
@@ -2491,6 +2493,7 @@
    "feature": "SELECT * star-expansion within set operation branches (UNION/INTERSECT/EXCEPT)",
    "task_id": null,
    "resume_point": "star-expansion in set-op branches",
+   "status": "resolved",
    "evidence": [
     "copyselect still defers on a separate SELECT *-in-set-op-branch star-expansion bug"
    ],
@@ -2505,7 +2508,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: No evidence of star expansion in set op branches; each branch planned separately"
+   "code_audit": "RESOLVED 2026-07-07 (not-a-real-gap): internal/analyzer/analyzer.go analyzeSelectWithParent (lines 234-281) recurses into s.SetOp.Right then the left side (SetOp cleared) so each UNION/INTERSECT/EXCEPT branch runs the full normal SELECT-analysis path independently, including analyzeTargets -> analyzeStar (lines 749-754, 1006) against its own FROM-list. Each branch gets independent * expansion; the original audit missed this recursive per-branch structure."
   },
   {
    "feature": "GROUP BY GROUPING SETS, ROLLUP, and CUBE syntax forms are not supported; they are parsed as sentinels but not executed.",
@@ -2532,6 +2535,7 @@
    "feature": "EXPLAIN output format is not fully implemented for UUID operations",
    "task_id": "M0097-0029",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "Remaining: EXPLAIN format"
    ],
@@ -2546,7 +2550,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: No UUID-specific EXPLAIN output formatting found in codebase"
+   "code_audit": "RESOLVED 2026-07-07 (not-a-real-gap): no UUID-specific code exists or is needed in internal/executor/operators_explain.go / operators_explain_format.go; EXPLAIN renders plan constants via the generic Datum-formatting path, and UUID's codec (commit 3770b2af) already produces PG-accurate text. Commit 0b503761 brought the uuid regress suite to 0 diff lines. No EXPLAIN-specific fix was ever needed for UUID; original entry was a misdiagnosis."
   },
   {
    "feature": "CTEs (Common Table Expressions) without explicit aliases are not recognized by the parser",
