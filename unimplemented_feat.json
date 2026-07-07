@@ -1855,6 +1855,7 @@
    "feature": "Audit of dirty-tracking behavior in Pool.PinNew and Extend operations to identify buffer durability issues",
    "task_id": "m0089-0002",
    "resume_point": "docs/design/0089-0002-buffer-pool-dirty-tracking-on-extend.md",
+   "status": "resolved",
    "evidence": [
     "dirty-tracking audit on `Pool.PinNew` / `Extend` is deferred to a follow-up",
     "m0089-0002 audit still required; follow-up session is needed to do the audit"
@@ -1877,6 +1878,7 @@
    "feature": "Plan cache implementation is deferred. Design document M0092-0008 explains why a plan cache won't help pgbench with client-side literal substitution patterns.",
    "task_id": "M0092-0008",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "0092-0008 plan-cache-feasibility.md (DEFERRED, no code change)"
    ],
@@ -1897,6 +1899,7 @@
    "feature": "Structural fix for select-only performance is deferred to M0092. The initial audit is complete but the implementation is left for the next milestone.",
    "task_id": "M0091-0004",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "M0091-0004 ✓ audit complete; structural fix deferred to M0092"
    ],
@@ -1917,6 +1920,7 @@
    "feature": "The needsVacuum function always returns true when RowCount > 0 and does not respect autovacuum reloptions like autovacuum_enabled = off",
    "task_id": "M0086",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "needsVacuum currently returns true whenever RowCount > 0"
    ],
@@ -2424,6 +2428,7 @@
    "feature": "Full SeqScan/Project plan node migration from opTreeSlab is deferred to a future loop; plannode.go establishes only the foundation.",
    "task_id": null,
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "plannode.go establishes the foundation for full SeqScan/Project migration in a future loop"
    ],
