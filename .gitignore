@@ -102,3 +102,8 @@ bench/tpch/runtime_goopg/tmp/
 # Nightly CI batch run outputs (ci/design/04)
 ci/logs/
 __pycache__/
+
+!ci/logs
+ci/logs/*
+!ci/logs/action-items.md
+

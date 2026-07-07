@@ -1925,6 +1925,21 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int1
 					pos:       j.Pos(),
 					Child:     rightNode,
 					Predicate: combineAnd(shifted),
+					// LeafLocal (M0077-0001 convention): Predicate's
+					// ColumnRef.Index values are now leaf-local to
+					// rightNode's own output schema, NOT FROM-
+					// cumulative. Without this, the post-rewrite
+					// posMap passes (applyJoinTreePosMap /
+					// remapPosMapAfterRewrite, run later via
+					// remapWithBindings / remapExprRefsToMHJ) treat
+					// the index as a stale FROM-cumulative offset and
+					// remap it again, corrupting it a second time
+					// (tpch/Q13-regression: `customer LEFT JOIN
+					// orders ON c_custkey = o_custkey AND o_comment
+					// NOT LIKE '%special%requests%'` — o_comment's
+					// already-correct local index 8 got remapped to
+					// 0, resolving to o_orderdate instead).
+					LeafLocal: true,
 				}
 			}
 			pred = combineAnd(keep)

@@ -810,6 +810,26 @@ func pickInnerSide(j *Join, leftCol, rightCol *ColumnRef, leftWidth int) (*SeqSc
 		return rss, rightSideRef, leftSideRef
 	}
 	if lss, ok := j.Left.(*SeqScan); ok {
+		// Making Left the inner (probed/index-scanned) side means
+		// Right becomes the outer (loop-driving) side. That's a
+		// semantics-changing swap for any join type where one side
+		// must stay preserved/outer-only: LEFT JOIN must keep Left
+		// as the driving side (every Left row must appear at least
+		// once, NULL-extended when unmatched — impossible if Right
+		// drives the loop instead, since an unmatched Left row then
+		// has no iteration that ever visits it); Semi/Anti must keep
+		// Left as the sole emitted side. Only INNER permits the
+		// free swap. tpch/Q13-regression: `customer LEFT JOIN orders
+		// ON c_custkey = o_custkey AND o_comment NOT LIKE '...'`
+		// took this branch once the NOT-LIKE conjunct pushed
+		// `orders` behind a Filter (no longer a bare *SeqScan, so
+		// the `rss` branch above declined) — Right(orders) became
+		// the outer driver, silently dropping every customer with
+		// zero matching orders (~50k of 150k rows in the TPC-H
+		// SF=1 data) from the LEFT JOIN's output.
+		if j.Type != JoinTypeInner {
+			return nil, nil, nil
+		}
 		// Inner is left; outer is right. M0071-0002-followup:
 		// when this branch fires, the NLI's emitted schema is
 		// `outer ++ inner` = `Right ++ Left`, which is the FLIP

@@ -767,44 +767,69 @@ every clean, green (build + pre-commit) checkpoint.
       this hunk removed) with `operator NOT LIKE requires string operands
       (got left.Kind=5 right.Kind=3)` — see the new `tpch/Q13-regression`
       item below.
-- [ ] tpch/Q13-regression — **NEW, discovered 2026-07-07 while verifying the
-      Q21 fix above, not itself part of AI-20260707-000712-005.** `scripts/
-      tpch-spotcheck.sh` (the mandated pre-commit Q12/Q13 spot-check for any
-      executor/planner change) now FAILS: `Q13: ERROR after 0.00s — pq:
-      operator NOT LIKE requires string operands (got left.Kind=5 right.Kind=3)
-      (42883)` (Kind=5 is `KindTime`, Kind=3 is `KindString` —
-      `internal/executor/datum.go`'s `DatumKind` iota order). Repro (fresh
-      server on `bench/tpch/runtime_goopg/data`, superuser@postgres):
-      `select c_custkey, count(o_orderkey) as c_count from customer left
-      outer join orders on c_custkey = o_custkey and o_comment not like
-      '%special%requests%' group by c_custkey` — `EXPLAIN` shows `Filter:
-      (o_comment NOT LIKE '%special%requests%')` pushed onto the bare `Seq
-      Scan on public.orders` node of a `Nested Loop (LEFT)`; `o_comment` is
-      `orders`'s LAST column (index 8, `character varying`) but the filter
-      appears to read column 0 (`o_orderdate`, `timestamp` → `KindTime`)
-      instead — a `ColumnRef.Index` not being correctly shifted when an
-      ON-clause conjunct is pushed down onto a single table's own scan
-      schema. Confirmed via `git stash` (removing the Q21 fix above,
-      rebuild, rerun) that this reproduces byte-for-byte identically either
-      way — genuinely independent of this loop's change. Likely the same
-      class of bug as the M0110-0003 LEFT JOIN inner-only ON-conjunct
-      pushdown fix (`internal/planner/pushdown.go`'s `classifyConjunctSide`/
-      `walkColumnRefs` vs `internal/planner/planner.go`'s
-      `shiftColumnRefsBy` — that fix added missing node cases to both
-      sibling functions; this may be a similar sibling-divergence or a
-      different pushdown site entirely reached by the same `customer LEFT
-      JOIN orders ON ... AND <col-not-first> NOT LIKE ...` shape).
-      **Priority: HIGH — blocks the mandatory Q12/Q13 spot-check gate for
-      every subsequent executor/planner change** (the machine-enforced git
-      hook only runs the lighter pgbench smoke, so this does not block
-      commits outright, but Hard-won Rule #1 requires the full spot-check
-      for executor/planner work). Not fixed in the loop that discovered it
-      (Q21 was the assigned task; ONE task per loop). Resume point: `git
-      log --oneline -- internal/planner/pushdown.go internal/planner/
-      planner.go` to find which of the many 2026-07-06 commits introduced
-      this (Q13=33 was confirmed passing as recently as loop #50/#53 that
-      day per the entries above), then trace the ON-clause pushdown path for
-      a `LEFT OUTER JOIN customer/orders` plan shape specifically.
+- [x] tpch/Q13-regression — **RESOLVED 2026-07-07.** Discovered 2026-07-06
+      while verifying the Q21 fix (AI-20260707-000712-005); fixed this loop
+      as its own follow-up task. Two independent, previously-latent bugs,
+      both exposed by the same `customer LEFT JOIN orders ON c_custkey =
+      o_custkey AND o_comment NOT LIKE '%special%requests%'` shape
+      (`internal/testutil/tpch/tpch.go`'s Q13):
+      **(1) crash** — `planFromItem`'s LEFT JOIN inner-only-conjunct split
+      (`internal/planner/planner.go` ~line 1899, the M0063-0005 design)
+      wraps `o_comment NOT LIKE ...` in a `Filter` over the inner (orders)
+      plan and correctly shifts its `ColumnRef.Index` to inner-local
+      coordinates, but never marked that Filter `LeafLocal: true` (the
+      M0077-0001 convention on the `Filter` struct in `plan.go`). Two
+      post-rewrite passes that run later in the same `Plan()` call
+      (`remapWithBindings`→`applyJoinTreePosMap` and
+      `remapExprRefsToMHJ`→`remapPosMapAfterRewrite`, both `bushy.go`)
+      mistake the already-local index for a stale FROM-cumulative offset
+      and remap it a second time — with this goopg TPC-H dataset's
+      non-canonical orders column order (`o_orderdate` first, `o_comment`
+      last at local index 8), the correct index 8 got remapped to 0,
+      silently resolving `o_comment` to `o_orderdate` (a `Time` value) and
+      producing `operator NOT LIKE requires string operands (got
+      left.Kind=5 right.Kind=3)` (42883). Fix: set `LeafLocal: true` on
+      that Filter at construction. **(2) silent row loss** — found
+      immediately after fixing (1), via the mandatory
+      `scripts/tpch-spotcheck.sh` re-run: Q13 now completed but returned 32
+      rows instead of 33, missing exactly the `c_count=0` bucket (the
+      ~50,000 of 150,000 TPC-H SF=1 customers with zero orders, or zero
+      orders passing the filter — confirmed via
+      `customer where c_custkey not in (select o_custkey from orders)`).
+      Root cause: `internal/planner/nl_index_join.go`'s `tryBuildNLI` /
+      `pickInnerSide` prefers `j.Right` (orders) as the NLI's indexed inner
+      side but falls back to `j.Left` (customer) whenever `j.Right` is not
+      a bare `*SeqScan` — exactly what fix (1)'s Filter wrapper produces.
+      That fallback makes customer the INNER (indexed, null-extended-on-
+      miss) side and orders the OUTER (loop-driving) side without
+      adjusting `j.Type`; for INNER joins this swap is harmless, but for
+      LEFT JOIN (and Semi/Anti) it silently flips which side is preserved
+      — once orders drives the loop, a customer with zero matching orders
+      is never visited and vanishes from the output. Reproduced
+      minimally: `zz_a(id pk) LEFT JOIN zz_b ON id = a_id AND cmt NOT LIKE
+      '%special%'` picked `Nested Loop (LEFT)` with `zz_b` as the SeqScan
+      driver and `Index Scan using zz_a_pkey` as the (wrongly) inner side,
+      returning `zz_b`'s own rows under `a`'s column names. Fix:
+      `pickInnerSide` now declines the `j.Left`-as-inner branch whenever
+      `j.Type != JoinTypeInner`, falling back to Hash/Merge join (which
+      correctly keeps customer as the preserved probe side). Verified: at
+      TPC-H scale the real Q13 query now plans as `Hash Join (LEFT)` (not
+      NLI) exactly per the M0063-0005 design, with `Filter: (o_comment NOT
+      LIKE ...)` correctly attached to the `orders` scan. Regression test:
+      `internal/planner/left_join_inner_only_leaflocal_test.go`
+      (`TestLeftJoinInnerOnlyConjunctFilterIsLeafLocal`, pins fix 1;
+      verified it fails without the fix, both on the `LeafLocal` flag and
+      on the resulting wrong `o_comment`→`o_orderdate` resolution). Gates:
+      `go build ./...` clean; `go test ./internal/planner/...
+      ./internal/executor/...` PASS; full `go test -short ./...` (excluding
+      `internal/testutil/tpch` and `internal/testport`, both explicitly
+      excluded from the default suite per their own doc comments /
+      `.ralph/PROMPT.md`) PASS with no regressions; `scripts/
+      tpch-spotcheck.sh` PASS (Q12=2 rows, Q13=33 rows — full 33-bucket
+      parity restored, including the previously-missing `c_count=0,
+      custdist=50000` row). Design doc: `docs/design/0063-0005-q13-left-
+      join-not-like-rewrite.md` new §8 (status flipped draft→accepted;
+      already indexed in `docs/design/README.md`).
 - [ ] tpch/Q15b-MAIN-explain — EXPLAIN Q15b-MAIN errored during the
       plan-capture pass (AI-20260707-000712-006; repro: `tmp/tpch-nightly-
       runner -port 65433 -db postgres -user <superuser> -queries 15 -explain

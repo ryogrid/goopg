@@ -143,8 +143,8 @@ Root node: `Projection`
 
 | # | Node Type | Table | Index |
 |---|-----------|-------|-------|
-| 1 | Seq Scan | orders | — |
-| 2 | Index Scan | customer | customer_pk |
+| 1 | Seq Scan | customer | — |
+| 2 | Seq Scan | orders | — |
 
 ### Q14
 
@@ -249,7 +249,7 @@ for an M0054-0003 sub-task investigation.
 
 | Table | Seq Scan queries | Index Scan queries |
 |-------|------------------|--------------------|
-| customer | Q10, Q18, Q22, Q7 | Q13, Q3, Q5, Q8 |
+| customer | Q10, Q13, Q18, Q22, Q7 | Q3, Q5, Q8 |
 | lineitem | Q10, Q17, Q18, Q19, Q9 | Q1, Q12, Q14, Q15a, Q15b, Q20, Q3, Q5, Q6, Q7, Q8 |
 | lineitem l1 | Q21 | — |
 | nation | Q10, Q11, Q21 | Q2, Q20, Q5, Q7, Q8, Q9 |
