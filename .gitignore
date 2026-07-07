@@ -108,4 +108,5 @@ ci/logs/*
 !ci/logs/action-items.md
 !ci/logs/launch.log
 !ci/logs/scheduler.log
+!ci/logs/history.jsonl
 

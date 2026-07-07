@@ -112,7 +112,7 @@ trap abort_cleanup EXIT
 trap 'exit 4' INT TERM
 
 # --- persist top-level batch logs to git on completion --------------------------
-# Commit & push ONLY the three top-level report files, via explicit pathspec —
+# Commit & push ONLY the top-level report files, via explicit pathspec —
 # never `-A` / `.` / `commit -a` — so the concurrently-running ralph loop's
 # unrelated working-tree WIP is never swept into this commit. Best-effort: any
 # git failure is logged (to the run dir + a one-line progress note) but never
@@ -122,7 +122,7 @@ trap 'exit 4' INT TERM
 # single local clone.
 commit_and_push_logs() {
     local glog="${RUN_DIR}/git-logs-push.log" branch try paths=() f
-    for f in ci/logs/action-items.md ci/logs/launch.log ci/logs/scheduler.log; do
+    for f in ci/logs/action-items.md ci/logs/launch.log ci/logs/scheduler.log ci/logs/history.jsonl; do
         [[ -e "${REPO_ROOT}/${f}" ]] && paths+=("${f}")
     done
     [[ ${#paths[@]} -gt 0 ]] || return 0
@@ -145,7 +145,7 @@ commit_and_push_logs() {
     fi
     for try in 1 2 3 4 5; do
         git -C "${REPO_ROOT}" commit \
-            -m "chore(ci): nightly batch ${RUN_ID} logs (action-items, launch, scheduler)" \
+            -m "chore(ci): nightly batch ${RUN_ID} logs (action-items, launch, scheduler, history)" \
             -- "${paths[@]}" >>"${glog}" 2>&1 && break
         sleep 3
     done
