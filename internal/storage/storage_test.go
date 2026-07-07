@@ -1181,6 +1181,96 @@ func TestSetAsyncFlushBatchSizeClamps(t *testing.T) {
 	}
 }
 
+// TestFlushBatchSkipsStaleTag guards the M-NIGHTLY loop-17 fix:
+// FlushAllPaced's dirty-page scan captures each slot's tag via an
+// unlocked read, well before flushBatch actually reaches that slot in
+// a later batch. In between, ordinary buffer-pool churn can evict and
+// repurpose the exact same slot for a different relation. flushBatch
+// must detect that the slot's tag no longer matches what the scan
+// captured and skip writing — never write the slot's NEW content to
+// the OLD tag's (rel, block) on disk. This white-box test simulates
+// that repurpose deterministically (bypassing the clock-sweep's
+// non-deterministic victim selection) rather than relying on the slow
+// pgbench+checkpoint repro that originally surfaced the bug.
+func TestFlushBatchSkipsStaleTag(t *testing.T) {
+	dir := t.TempDir()
+	mgr := NewManager(ManagerConfig{DataDir: dir})
+	defer mgr.Close()
+	pool, err := NewPool(mgr, PoolConfig{Slots: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+
+	relOld := RelFileNode{DBOid: 1, RelOid: 20001, Fork: MainFork}
+	relNew := RelFileNode{DBOid: 1, RelOid: 20002, Fork: MainFork}
+	page := make(Page, BlockSize)
+	_ = InitPage(page)
+	if _, err := mgr.Extend(relOld, page); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.Extend(relNew, page); err != nil {
+		t.Fatal(err)
+	}
+
+	oldTag := BufferTag{Rel: relOld, Block: 0}
+	newTag := BufferTag{Rel: relNew, Block: 0}
+
+	// Dirty a slot under relOld — what FlushAllPaced's scan would
+	// capture as (slot, oldTag).
+	s, err := pool.Pin(oldTag)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.page[100] = 0xAA
+	pool.MarkDirty(s)
+	pool.Unpin(s)
+
+	// Repurpose the SAME physical slot for relNew, mirroring what a
+	// real claimVictim/evictVictim/PinNew cycle does to bufmap + the
+	// slot's tag/content/state, but driven directly for a deterministic
+	// repro.
+	slotIdx, _ := pool.bm.Lookup(oldTag)
+	if slotIdx < 0 {
+		t.Fatal("expected oldTag to be resident after Pin/MarkDirty/Unpin")
+	}
+	pool.bm.Delete(oldTag, slotIdx)
+	s.contentMu.Lock()
+	s.page[100] = 0xBB
+	s.tag = newTag
+	s.contentMu.Unlock()
+	if !pool.bm.Insert(newTag, slotIdx, stateGen(s.state.Load())) {
+		t.Fatal("bm.Insert(newTag) unexpectedly failed")
+	}
+
+	// Call flushBatch directly with the stale (slot, oldTag) pairing
+	// FlushAllPaced's earlier scan would have captured.
+	if err := pool.flushBatch([]*Slot{s}, []BufferTag{oldTag}); err != nil {
+		t.Fatalf("flushBatch: %v", err)
+	}
+
+	// relOld's block 0 on disk must be untouched: read it fresh through
+	// a second Manager on the same data dir (bypasses the pool cache
+	// entirely) and confirm it's still InitPage's zero fill, not
+	// relNew's 0xBB.
+	mgr2 := NewManager(ManagerConfig{DataDir: dir})
+	defer mgr2.Close()
+	buf := make(Page, BlockSize)
+	if err := mgr2.ReadBlock(relOld, 0, buf); err != nil {
+		t.Fatal(err)
+	}
+	if got := buf[100]; got != 0 {
+		t.Errorf("relOld block 0 byte 100 = %#x, want 0x00 — stale-tag flush wrote relNew's content to relOld's file", got)
+	}
+
+	// The repurposed slot's dirty bit must still be set: relNew's
+	// content (0xBB) is genuinely unflushed and must not be silently
+	// dropped by a dirty-bit clear keyed on the stale tag.
+	if !stateDirty(s.state.Load()) {
+		t.Errorf("slot dirty bit cleared under stale tag; relNew's dirty content would be lost without ever being flushed")
+	}
+}
+
 // TestPrefetchBlockPopulatesTarget pins that PrefetchBlock
 // stamps the AIOSubmitOp.Target field with the relfile's
 // path so pg_aios.target_desc can render it.

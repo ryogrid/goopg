@@ -1012,6 +1012,7 @@ func (p *Pool) evictVictim(victimIdx int, wasDirty bool, oldTag BufferTag) error
 	if p.OnFlushWait != nil {
 		p.OnFlushWait()
 	}
+	recordIOTrace(oldTag, "preFlush", s.page)
 	flushErr := p.flushSlot(oldTag, s.page)
 	if p.OnFlushDone != nil {
 		p.OnFlushDone()
@@ -1671,8 +1672,29 @@ func (p *Pool) flushBatch(slots []*Slot, tags []BufferTag) error {
 		}
 	}()
 
+	// FlushAllPaced's dirty-page scan reads each slot's tag via an unlocked
+	// state.Load(), well before this batch reaches contentMu.RLock() here.
+	// In that gap the slot can be evicted and repurposed for a different
+	// relation/block entirely (claimVictim doesn't consult contentMu).
+	// contentMu.RLock (held for the rest of this function) blocks any
+	// further repurposing once acquired, so re-checking s.tag now is
+	// race-free and authoritative for the remainder of the call. A
+	// mismatch means tags[i] is stale: skip this slot rather than writing
+	// its NEW content to the OLD tag's (rel, block) on disk — that silent
+	// cross-relation write is the M-NIGHTLY btree keyLen-mismatch
+	// corruption (heap page bytes landing in a btree index file), see
+	// .ralph/deferral_ledger.md. Whoever now owns the slot's real tag is
+	// responsible for flushing it through its own dirty-bit lifecycle.
+	stale := make([]bool, len(slots))
+	for i, s := range slots {
+		stale[i] = s.tag != tags[i]
+	}
+
 	var maxLSN LSN
-	for _, s := range slots {
+	for i, s := range slots {
+		if stale[i] {
+			continue
+		}
 		if lsn := MustHeader(s.page).LSN(); lsn > maxLSN {
 			maxLSN = lsn
 		}
@@ -1689,10 +1711,15 @@ func (p *Pool) flushBatch(slots []*Slot, tags []BufferTag) error {
 	}
 	handles := make([]AIOHandle, len(slots))
 	for i, s := range slots {
+		if stale[i] {
+			continue
+		}
 		h, err := p.mgr.WriteBlockAIO(tags[i].Rel, tags[i].Block, s.page)
 		if err != nil {
 			for j := 0; j < i; j++ {
-				_, _ = handles[j].Wait()
+				if handles[j] != nil {
+					_, _ = handles[j].Wait()
+				}
 			}
 			if p.OnCheckpointerWriteDone != nil {
 				p.OnCheckpointerWriteDone()
@@ -1704,6 +1731,9 @@ func (p *Pool) flushBatch(slots []*Slot, tags []BufferTag) error {
 
 	var firstErr error
 	for _, h := range handles {
+		if h == nil {
+			continue
+		}
 		if _, err := h.Wait(); err != nil && firstErr == nil {
 			firstErr = err
 		}
@@ -1717,6 +1747,9 @@ func (p *Pool) flushBatch(slots []*Slot, tags []BufferTag) error {
 
 	// Clear dirty bits where tag still matches.
 	for i, s := range slots {
+		if stale[i] {
+			continue
+		}
 		if s.tag == tags[i] {
 			for {
 				old := s.state.Load()

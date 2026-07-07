@@ -186,6 +186,29 @@ explicit `Sync(tag)` is requested.
   THEN tag is deleted, THEN queued waiters are released" — see
   `internal/storage/bufpool.go`'s `evictVictim` for the current,
   fixed sequence.
+- **Checkpoint batch-flush stale-tag invariant (found the hard way,
+  M-NIGHTLY loop 17):** `FlushAllPaced` (the checkpointer's full-pool
+  flush) scans every slot ONCE up front via an *unlocked*
+  `state.Load()` + `slot.tag` read, building a `(slot, tag)` worklist
+  that `flushBatch` then processes across many later batches. Ordinary
+  buffer-pool churn can fully evict and repurpose a scanned slot for a
+  *different relation* before its batch turn arrives — `contentMu`
+  alone does not prevent this, because nothing pins the slot between
+  the scan and the flush. `flushBatch` must re-check `slot.tag ==
+  tags[i]` immediately after taking `contentMu.RLock()` (held
+  continuously through the write, so the recheck stays valid for the
+  rest of the call) and skip the write entirely for any slot that no
+  longer matches — otherwise it silently writes the slot's *new*
+  content to the *old* tag's (rel, block) via `WriteBlockAIO`, with a
+  freshly-recomputed checksum stamped over the wrong-but-real bytes
+  (invisible to checksum verification and to the race detector, since
+  every access is properly locked — the bug is a stale association,
+  not a data race). This is what previously surfaced as pgbench
+  TPC-B's `btree: item length mismatch` nightly flake (heap-page bytes
+  landing inside a btree index file). See `internal/storage/
+  bufpool.go`'s `flushBatch` for the current, fixed sequence, and
+  `internal/storage/io_trace.go` (`GOOPG_IO_TRACE=1`) for the
+  content-hash tracer that localized it.
 
 ### Sizing and alignment
 

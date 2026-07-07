@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"sync/atomic"
+	"time"
 
 	"github.com/goopg/goopg/internal/storage"
 )
@@ -38,6 +39,19 @@ func maybeDumpPageOnParseErr(p storage.Page, ctx string) {
 	op := readOpaque(p)
 	fmt.Fprintf(f, "opaque: Prev=%d Next=%d Level=%d Flags=0x%x HighKeyLen=%d\n",
 		op.Prev, op.Next, op.Level, op.Flags, len(op.HighKey))
+
+	h := storage.HashPage(p)
+	fmt.Fprintf(f, "page content hash: %016x\n", h)
+	if os.Getenv("GOOPG_IO_TRACE") == "1" {
+		fmt.Fprintf(f, "io trace lifecycle for this exact page content:\n")
+		for _, line := range storage.DumpIOTraceForHash(h) {
+			fmt.Fprintf(f, "  %s\n", line)
+		}
+		fmt.Fprintf(f, "io trace, all tags, last 2s before this dump (max 3000 lines):\n")
+		for _, line := range storage.DumpRecentIOTrace(2*time.Second, 3000) {
+			fmt.Fprintf(f, "  %s\n", line)
+		}
+	}
 
 	count, cerr := storage.PageLinePointerCount(p)
 	fmt.Fprintf(f, "line pointer count: %d (err=%v)\n", count, cerr)

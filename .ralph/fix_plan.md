@@ -61,7 +61,7 @@ every clean, green (build + pre-commit) checkpoint.
      placeholder is a comment, not a checkbox, so the plan-complete exit
      heuristic stays live.) -->
 
-- [ ] pgbench/nightly — pgbench nightly stage aborted: `btree: item length
+- [x] pgbench/nightly — pgbench nightly stage aborted: `btree: item length
       mismatch keyLen=9 total=37` at c=100 (AI-20260706-201855-001; repro:
       `REPO_ROOT=$PWD RUN_DIR=$(mktemp -d) bash ci/batch/stages/stage-pgbench.sh`
       with s=50 c=100 j=20 T=180). Same error message as the 2026-06-26
@@ -558,6 +558,71 @@ every clean, green (build + pre-commit) checkpoint.
       `MarkDirtyChangeRecord`/`MarkDirtyLogicalChange` plumbing for a
       mis-routed logical-record replay path (flagged unaudited by loop 14).
       Full detail in today's deferral ledger row (16th consecutive loop).
+      2026-07-07 update #8 (17th consecutive loop; see today's deferral
+      ledger row): **ROOT CAUSE FOUND AND FIXED.** Executed update #7's
+      handoff option (1) — instrumented `evictVictim`'s pre-flush point and
+      `relFile.writeBlock`/`readBlock`'s post-I/O points with a content-hash
+      trace (`internal/storage/io_trace.go`, `GOOPG_IO_TRACE=1`-gated, kept
+      committed like the loop-13 dump tool) and correlated it against the
+      forensic dump tool at crash time. First result: the corrupted page's
+      exact byte content had a `postRead` trace match but never a matching
+      `preFlush`/`postWrite` — meaning the write that produced the corrupted
+      on-disk bytes bypassed both instrumented paths. Extended the trace to
+      `relFile.extend`/`extendBatch` (also never matched) and added a
+      recent-activity dump (all tags, last 2s, uncapped by hash) to see the
+      block's full write history regardless of which path touched it. A
+      fresh repro's dump for block 2464 of `pgbench_accounts_pkey` showed:
+      `preFlush` (valid btree content, 247 line pointers) → `postWrite`
+      (same content, checksummed copy) → **270ms gap with zero recorded
+      write/extend events** → `postRead` (corrupted content, 185 line
+      pointers) at crash time. The only write path never instrumented was
+      `Pool.flushBatch`'s `Manager.WriteBlockAIO` call (bufpool.go:1693) —
+      the checkpointer/bgwriter's batched-flush path (`FlushAllPaced`).
+      Read `FlushAllPaced` (bufpool.go:1619) end-to-end: it scans every
+      slot ONCE up front, capturing `(idx, tag)` pairs via an **unlocked**
+      `state.Load()` + `p.slots[i].tag` read, then processes the resulting
+      worklist in later batches via `flushBatch`. Between that scan and a
+      given slot's batch actually running, ordinary buffer-pool churn
+      (`claimVictim`/`evictVictim`/`PinNew`/`pinLoad`) can fully evict and
+      repurpose that exact slot for a **different relation** (e.g. a heap
+      page) — `flushBatch` then takes `contentMu.RLock()` (correctly
+      synchronized, no data race — this is why 1180+ race-detector
+      iterations across loops 9-15 never caught it) and writes whatever the
+      slot NOW holds under the STALE captured tag via `WriteBlockAIO`. The
+      existing `if s.tag == tags[i] { clear dirty bit }` guard after the
+      write already silently acknowledged this staleness window (to avoid
+      corrupting dirty-bit bookkeeping) but did nothing to stop the
+      wrong-content write itself — the exact "logic bug in properly-
+      synchronized code" loop update #3 predicted from race-detector-clean
+      real-workload repros. Fixed `flushBatch` (bufpool.go:1665) to
+      recompute `stale[i] := s.tag != tags[i]` once, immediately after all
+      slots' `contentMu.RLock()`s are held (race-free for the rest of the
+      call since a write-lock repopulation would block on that RLock), and
+      skip `WriteBlockAIO`/WAL-LSN accounting/dirty-bit-clear for any stale
+      slot instead of writing its new content to the old tag's (rel,
+      block). Gates: `go build ./...` clean; `go vet ./...` clean;
+      `go test ./internal/storage/... ./internal/access/btree/...
+      ./internal/wal/...` PASS. Verification (not just unit tests): built a
+      fixed binary, fresh `pgbench -i -s 50` init, then **two consecutive**
+      `pgbench -c 100 -j 20 -T 25 -P 5` runs (the exact authoritative
+      nightly repro, previously ~100% reproducing within seconds every
+      single time across all 17 loops) — **0 failed transactions, 0 errors,
+      both runs**, with checkpoints confirmed firing during the run (server
+      log shows multiple `checkpoint start/complete` events, one spanning
+      4061ms — the exact scan-then-batch window the bug needed). Mandatory
+      `scripts/ralph-precommit-test.sh` (`RALPH_PRECOMMIT_SCOPE=smoke`)
+      also PASS (0 failed across all three CI workloads). Kept
+      `internal/storage/io_trace.go` committed (env-gated, single cached
+      bool check when unset, same precedent as the loop-13 dump tool) since
+      it was decisive here and may be useful for any future buffer-pool
+      investigation. Also added `TestFlushBatchSkipsStaleTag`
+      (`internal/storage/storage_test.go`) as a fast, deterministic
+      regression guard (white-box repurpose of a dirtied slot's tag mid-
+      flight, no pgbench/checkpoint needed) — confirmed non-vacuous via
+      `git stash`-ing just the fix and watching it fail as predicted, then
+      restoring. Leaving this task checked but NOT archived from
+      M-NIGHTLY — the next nightly run is the real confirmation; if
+      tonight's run is clean, drop this bullet per the standing rule.
 
 - [ ] race/internal/wal — race suite failed in package
       `github.com/goopg/goopg/internal/wal` (AI-20260707-000712-001; repro:
