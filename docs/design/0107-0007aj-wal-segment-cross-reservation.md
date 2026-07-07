@@ -142,3 +142,51 @@ Full `go test -race ./internal/wal/` passes.
 Unblocks promotion of the `multiple-row-versions` isolation spec to
 `pass` (the SSI behaviour was already correct per [[0118-0001]] §9; the WAL
 ring race was the only remaining blocker). See [[0118-0001]] §10.
+
+---
+
+## 2026-07-07 update — Path B's re-check diverged from the gate (AI-20260707-000712-001)
+
+The "Concurrency correctness" proof above assumed `appendPGCompat`'s Path B
+body enforces the *same* inequality as the gate that routes into it
+(`reserveSize ≤ free() − reservedBytes`). In the actual code this was false:
+the gate (`needsDrain`, deciding Path A vs Path B) correctly subtracted
+`reservedBytes.Load()`, but Path B's own pre-`AppendXLogPayload` headroom
+check (previously `need := reserveSize - walBuf.free()`) did **not** — it
+only ever looked at `free()`, which ignores bytes a concurrent
+`tryAppend` fast-path caller has already claimed via `tryReserve` but not
+yet published (so `resident()`/`tail` haven't advanced to cover them yet).
+
+Both `tryAppend` (RLock) and the state-loop's `appendPGCompat` Path B run
+lock-free with respect to each other (`appendMu` is only taken by Path A);
+`tryAppend`'s `reservedBytes` claim is exactly the mechanism meant to make
+concurrent reservations visible to any other headroom check — Path B's
+recheck simply didn't consult it. Under enough scheduling contention (the
+nightly race-gate run failed at `GOMAXPROCS`≈host-core-count under CI
+load; a local repro needs `GOMAXPROCS=2` to widen the window reliably,
+~1/15 tries at `-count=1`, every try at `-count=15`) a `tryAppend` claim
+can grow `reservedBytes` between Path B's stale-free() check and its
+`AppendXLogPayload` call, so the combined footprint exceeds `cap` and
+`writeReserved` returns `errWALBufferReservedOutOfRange` — the exact
+symptom `TestConcurrentAppendAcrossSegmentBoundariesNoOverflow` guards,
+reached through a different concurrency path than the one this doc
+originally analyzed (fast-path vs. slow-path racing, not fast-path vs.
+fast-path).
+
+**Fix**: Path B now claims its own `reserveSize` bytes via the same
+`walBuf.tryReserve` / `releaseReservation` CAS pair `tryAppend` uses,
+instead of a plain `free()` comparison — draining (subtracting
+`reservedBytes`, matching the gate's formula) and retrying `tryReserve` in
+a loop until the claim succeeds, then releasing it after
+`PublishUpTo`/on error, exactly mirroring `tryAppend`'s protocol
+(`internal/wal/writer.go`, `state.appendPGCompat`). This makes the two
+concurrent callers of `AppendXLogPayload` (fast-path `tryAppend`, slow-path
+`appendPGCompat`) agree on one atomic accounting mechanism instead of two
+inconsistent formulas, closing the gap the "Concurrency correctness"
+proof above missed.
+
+Verified non-vacuous: reverting the fix reproduces the failure reliably
+within `-count=15` at `GOMAXPROCS=2`/`-cpu=2`; with the fix, 15/15 (and a
+separate 8/8 at `-count=1`) pass under the same conditions. Full
+`go test -race ./internal/wal/` and the `scripts/ralph-precommit-test.sh`
+pgbench smoke also pass.

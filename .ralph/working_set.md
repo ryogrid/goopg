@@ -1,54 +1,59 @@
-Task: M-NIGHTLY (AI-20260706-201855-001) — pgbench/nightly btree
-keyLen-mismatch corruption. 16th consecutive loop, pure investigation (no
-code landed). Also triaged 7 new AI items from tonight's nightly run
-(20260707-000712) into fix_plan.md's M-NIGHTLY section as new bullets
-(race/internal/wal, 2x testport isolation-eval-plan-qual, tpch Q21/Q15b/
-Q9/Q20) — none started yet, this loop finished the already-in-flight
-pgbench/nightly task first per the preemption rule.
+(idle — nothing in flight)
 
-What this loop did: executed loop 15's handoff — read `insertOp.Next` and
-`updateOp.updateViaIndex` (operators_storage.go) end-to-end, the exact
-executor paths pgbench's plain INSERT/UPDATE-by-pkey take. REFUTED the
-heap-vs-index RelFileNode-crossing hypothesis for these two call sites
-(both `rel` and `idxRel` are always freshly/independently derived, no
-caching; RangeScan's callback only collects into a `pendingUpdate` slice,
-defers all writes until after RangeScan fully returns/unpins — honours
-the "none re-enter the btree" contract). Also re-derived (not just
-re-cited) that the buffer pool's claimVictim/tryPinSlot/Unpin/PinNew/
-pinLoad CAS state machine is correct and storage.InitPage fully zeroes
-new pages. NEW proof: `BTree.freeList`/`pinNewOrRecycled`'s recycle path
-is structurally UNREACHABLE for this workload (every `btree.Open()` call
-allocates a fresh `*BTree` with an empty freeList; only VacuumIndexPages's
-single long-lived handle can bridge push+pop, and no VACUUM runs during
-the 25s pgbench window) — upgrades this from "assumed inert" to "proven
-impossible". Also ruled out `upsertOp.leafTrees` (operator-scoped, and
-TPC-B never hits ON CONFLICT anyway). Full detail: deferral_ledger.md's
-16th-consecutive-loop row (2026-07-07) and fix_plan.md's "update #7".
+M-NIGHTLY (AI-20260707-000712-001) race/internal/wal: FIXED and committed
+this loop. Root cause: `state.appendPGCompat`'s Path B (state-loop slow
+path for the PG-compat WAL append, used when `tryAppend`'s fast path falls
+back) computed its pre-`AppendXLogPayload` headroom check as
+`reserveSize - walBuf.free()`, omitting the `walBuf.reservedBytes.Load()`
+subtraction the Path A/B gate (`needsDrain`, a few lines above in the same
+function) already applies. `tryAppend`'s fast path (RLock — runs fully
+concurrently with Path B; only Path A takes `appendMu.Lock()`) claims
+`reserveSize` bytes via CAS-protected `walBuf.tryReserve` before its own
+`AppendXLogPayload` call, and those claimed bytes aren't reflected in
+`resident()`/`free()` until `PublishUpTo` runs — so Path B's stale
+`free()`-only check could conclude "enough room" while a concurrent
+`tryAppend` claim pushed the combined footprint past `cap`, surfacing as
+`errWALBufferReservedOutOfRange` from `writeReserved`
+(`TestConcurrentAppendAcrossSegmentBoundariesNoOverflow`). Repro needed
+`GOMAXPROCS=2 -cpu=2` (plain `-race` alone: 5/5 pass, didn't reproduce);
+at `-cpu=2`: ~1/5 single runs, confirmed at `-count=15`. Fixed
+(internal/wal/writer.go, `state.appendPGCompat`) by having Path B
+claim/release its `reserveSize` via the same `tryReserve`/
+`releaseReservation` CAS pair `tryAppend` uses (loop: drain by
+`reserveSize - (free() - reservedBytes)` then retry `tryReserve` until it
+succeeds) instead of a plain `free()` comparison. Verified non-vacuous
+(revert fails within -count=15 at cpu=2, fix passes 15/15 + separate
+8/8). Gates: build clean; `go test -race ./internal/wal/` PASS (3 fresh
+runs); `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh`
+PASS (0 failed pgbench transactions, standard/simple-update/select-only).
+Design doc updated: docs/design/0107-0007aj-wal-segment-cross-reservation.md
+"2026-07-07 update" section (the original "Concurrency correctness" proof
+missed this exact gap) + docs/design/README.md index entry appended.
+fix_plan.md AI-20260707-000712-001 bullet checked off with full detail.
 
-Next step (two options, priority order — see ledger row for full recipe):
-1. Loop 12's still-outstanding checksum/line-pointer-sample instrumentation:
-   sample storage.PageLinePointerCount / a byte hash of s.page immediately
-   before evictVictim's flushSlot call (bufpool.go), and again immediately
-   after relFile.writeBlock's WriteAt / relFile.readBlock's ReadAt
-   (smgr.go), keyed by blk — this dichotomy (in-memory-already-wrong vs.
-   disk-roundtrip-loses-it) was NEVER actually run (loops 13-15 pivoted
-   onto other threads before reaching it) and is the single most decisive
-   unrun measurement.
-2. Audit emitCanonicalHeapInsert/emitCanonicalHeapDelete and the shared
-   MarkDirtyChangeRecord (btree.go) / MarkDirtyLogicalChange (bufpool.go)
-   logical-record plumbing for a mis-routed WAL-replay/change-record path
-   (flagged unaudited by loop 14, still untouched by any loop since).
-Use the now-committed `GOOPG_BTREE_PARSE_ERR_DUMP=1` dump tool
-(internal/access/btree/parse_err_dump.go) plus the cheap repro (pick a
-free port via `ss -ltn`; `pgbench -i -s 50` once ~4min; then `pgbench -c
-100 -j 20 -T 25 -P 5`, ~10-25s to failure) to correlate either
-investigation's findings against a fresh forensic dump.
+Noted but not touched this loop: `.gitignore` shows an uncommitted diff
+(adds `!ci/logs`/`!ci/logs/action-items.md` exceptions) that predates this
+loop's start (mtime 09:18:58, before my first tool call) and is unrelated
+to the WAL fix — left alone per the "concurrent Ralph commits" pattern
+(some other process, likely the nightly ci/batch tooling, appears to have
+committed `ci/logs/action-items.md` itself mid-session as commit
+0a4988e3 without following up with the .gitignore tweak). Not mine to
+resolve; a future loop can fold it in if it recurs.
 
-Gates run this loop: `go build ./...` clean (no code changes this loop,
-investigation-only). `make ralph-state-guard`: run next, see status block.
+Remaining open M-NIGHTLY items (untouched, still queued, in
+ci/logs/action-items.md / fix_plan.md): testport/TestPort_IsolationEvalPlanQual
+(AI-20260707-000712-002), testport/TestPort_IsolationEvalPlanQualTrigger
+(AI-20260707-000712-003), tpch/Q21-error (-005), tpch/Q15b-MAIN-explain
+(-006), tpch/Q9-timeout (-007), tpch/Q20-timeout (-008). The pgbench/nightly
+btree keyLen-mismatch item (AI-20260706-201855-001, fixed loop 17 via
+8ebb71cd) is still checked-but-unarchived pending tonight's nightly run
+confirming it stays clean.
 
-In-flight: none. No servers/binaries/background processes started or left
-running this loop (pure static code reading via Read/Serena, no build/test
-execution needed since nothing changed). Separate live nightly CI batch
-(`ci/batch/run-nightly.sh`) and the protected `goopg-wp.scope` on port 5544
-were not touched.
+Next step: pick the next M-NIGHTLY item (suggest
+testport/TestPort_IsolationEvalPlanQual, AI-20260707-000712-002 — re-run
+`go test -v -run '^TestPort_IsolationEvalPlanQual$' ./internal/testport/`
+at HEAD first per the standing "may be stale" rule before investigating).
+
+In-flight: none. No servers/binaries/data dirs left running; the
+pgbench smoke gate's temp data dir under tmp/ was cleaned up by the
+script itself.

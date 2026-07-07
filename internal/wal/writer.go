@@ -1387,28 +1387,56 @@ func (s *state) appendPGCompat(payload []byte) (uint64, uint64, error) {
 	// AppendXLogPayload acquires its own stripe lock internally (no outer lock).
 	// PublishUpTo is an atomic tail advance (no lock).
 
-	// Phase 1: drain if needed (lock-free). Drain to the worst-case footprint
-	// (reserveSize) so a segment-boundary crossing inside AppendXLogPayload has
-	// room for both the pad and the re-landed record.
-	need := int64(reserveSize) - s.walBuf.free()
-	if need > 0 {
-		// Publish pending bytes before draining so drain can read them.
-		curr, _ := s.core.Load()
-		s.core.PublishUpTo(int64(curr))
-		if err := s.drainBufferBytes(need, drainReasonOverflow); err != nil {
-			return 0, 0, err
+	// Phase 1+2: atomically claim reserveSize bytes via tryReserve — the same
+	// CAS-protected reservedBytes accounting tryAppend's fast path uses — then
+	// stripe-locked append. A plain `reserveSize > free()` check here (as this
+	// code used to do) races against concurrent tryAppend fast-path callers:
+	// they can hold reservedBytes bytes that have not yet advanced tail/resident,
+	// so a free()-only check on this (state-loop) path can conclude "enough
+	// room" while a fast-path caller's in-flight reservation pushes the actual
+	// combined footprint past cap, and AppendXLogPayload's subsequent
+	// writeReserved fails with errWALBufferReservedOutOfRange (AI-20260707-000712-001:
+	// reproduces reliably under GOMAXPROCS=2 concurrency, where scheduling gaps
+	// widen the window between this check and the reservation). tryReserve's
+	// CAS loop closes that window: only writers whose combined reservations
+	// stay within cap proceed. Loop because a lost CAS or a concurrent
+	// fast-path reservation can require another drain pass before there is
+	// room to claim.
+	for {
+		reserved := s.walBuf.reservedBytes.Load()
+		need := int64(reserveSize) - (s.walBuf.free() - reserved)
+		if need > 0 {
+			// Publish pending bytes before draining so drain can read them.
+			curr, _ := s.core.Load()
+			s.core.PublishUpTo(int64(curr))
+			if err := s.drainBufferBytes(need, drainReasonOverflow); err != nil {
+				return 0, 0, err
+			}
 		}
+		if rerr := s.walBuf.tryReserve(int64(reserveSize)); rerr == nil {
+			break
+		}
+		// Lost the race to a concurrent reservation (fast-path tryAppend or
+		// another retry of this same loop elsewhere is impossible — this is
+		// the single state-loop goroutine — but tryAppend callers can claim
+		// the space we just drained before our tryReserve runs). Yield so a
+		// racing holder's imminent releaseReservation can make progress
+		// instead of busy-spinning when there is nothing left to drain.
+		runtime.Gosched()
 	}
 
-	// Phase 2: stripe-locked append (AppendXLogPayload takes its own stripe lock).
 	procNum := s.stripeNum()
 	start0, _, total, leading, err := s.core.AppendXLogPayload(procNum, payload, s.cfg.SegmentSize, s.sysID, s.tli)
 	if err != nil {
+		s.walBuf.releaseReservation(int64(reserveSize))
 		return 0, 0, err
 	}
 
-	// Phase 3: publish (atomic tail advance; no lock).
+	// Phase 3: publish (atomic tail advance; no lock), then release the
+	// buffer-capacity reservation now that tail covers these bytes (they are
+	// counted in resident() rather than reservedBytes from here on).
 	s.core.PublishUpTo(int64(start0) + int64(total))
+	s.walBuf.releaseReservation(int64(reserveSize))
 
 	// Update state-loop bookkeeping. writePos/writeLSN are state-loop-only
 	// fields (plain assignment is safe — no concurrent writes from the state

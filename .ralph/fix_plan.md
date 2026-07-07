@@ -624,10 +624,48 @@ every clean, green (build + pre-commit) checkpoint.
       M-NIGHTLY — the next nightly run is the real confirmation; if
       tonight's run is clean, drop this bullet per the standing rule.
 
-- [ ] race/internal/wal — race suite failed in package
+- [x] race/internal/wal — race suite failed in package
       `github.com/goopg/goopg/internal/wal` (AI-20260707-000712-001; repro:
       `go test -race -timeout 15m ./internal/wal/`; evidence:
-      `ci/logs/20260707-000712/race/go-test.log`).
+      `ci/logs/20260707-000712/race/go-test.log`). ROOT CAUSE FOUND AND FIXED.
+      The nightly log showed a plain `--- FAIL` (no DATA RACE report) on
+      `TestConcurrentAppendAcrossSegmentBoundariesNoOverflow` — did not
+      reproduce at HEAD under plain `-race` (5/5 pass), but reproduces
+      reliably with `GOMAXPROCS=2 -cpu=2` (more scheduling contention among
+      the test's 8 writer goroutines): failed 1/5 single runs, then
+      confirmed at `-count=15` under the same flags (real bug, not nightly-
+      host flakiness). Root cause: `state.appendPGCompat`'s Path B (the
+      state-loop's stripe-B buffered-append path, used when `tryAppend`'s
+      fast path falls back to the slow path) computed its pre-
+      `AppendXLogPayload` headroom check as `need := reserveSize -
+      walBuf.free()` — omitting the `walBuf.reservedBytes.Load()`
+      subtraction that the Path A/B gate (`needsDrain`, a few lines above)
+      already applies. `tryAppend`'s fast path (RLock, runs fully
+      concurrently with Path B — only Path A takes `appendMu.Lock()`) claims
+      `reserveSize` bytes via `walBuf.tryReserve` (CAS-protected
+      `reservedBytes`) before its own `AppendXLogPayload` call; those claimed
+      bytes are not yet reflected in `resident()`/`free()` until
+      `PublishUpTo` advances `tail`. So Path B's stale `free()`-only check
+      could conclude "enough room" while a concurrent `tryAppend` claim
+      pushed the combined footprint past `cap`, and the subsequent
+      `writeReserved` returned `errWALBufferReservedOutOfRange` — the exact
+      symptom this test guards, reached via slow-path/fast-path racing
+      rather than the fast-path/fast-path racing the original 0107-0007aj
+      fix analyzed. Fixed (`internal/wal/writer.go`, `state.appendPGCompat`)
+      by having Path B claim/release its `reserveSize` via the same
+      `tryReserve`/`releaseReservation` CAS pair `tryAppend` uses (looping
+      drain-then-claim until the reservation succeeds, mirroring the gate's
+      `free() - reservedBytes` formula for the drain amount) instead of a
+      plain `free()` comparison. Verified non-vacuous: reverted the fix and
+      reran `-count=15` at `GOMAXPROCS=2`/`-cpu=2` — fails within the batch
+      (same `errWALBufferReservedOutOfRange`); restored the fix — 15/15 pass,
+      plus a separate clean 8/8 at `-count=1`. Gates: `go build ./...`
+      clean; full `go test -race ./internal/wal/` PASS (3 fresh `-count=1`
+      runs); `RALPH_PRECOMMIT_SCOPE=smoke
+      bash scripts/ralph-precommit-test.sh` (pgbench standard/simple-
+      update/select-only smoke) PASS, 0 failed transactions. Design doc
+      updated: `docs/design/0107-0007aj-wal-segment-cross-reservation.md`
+      "2026-07-07 update" section + `docs/design/README.md` index entry.
 - [ ] testport/TestPort_IsolationEvalPlanQual — FAILed
       (AI-20260707-000712-002; repro: `go test -v -run
       '^TestPort_IsolationEvalPlanQual$' ./internal/testport/`; evidence:
