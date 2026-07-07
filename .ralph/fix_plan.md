@@ -623,6 +623,25 @@ every clean, green (build + pre-commit) checkpoint.
       restoring. Leaving this task checked but NOT archived from
       M-NIGHTLY — the next nightly run is the real confirmation; if
       tonight's run is clean, drop this bullet per the standing rule.
+      2026-07-07 ledger reconciliation (this loop, no code changed):
+      audited every `status = -` deferral-ledger row from this
+      investigation thread (the 17-loop pgbench keyLen-mismatch chase plus
+      its overlapping empty-internal-page/Q13/Q9-timeout tangents) against
+      the now-landed root-cause fixes. Flipped 15 rows from `-` to
+      `resolved` where the row's own `deferred` column described exactly
+      the mechanism `8ebb71cd`'s `flushBatch` stale-tag fix, `510615b4`'s
+      `evictVictim` bufmap-delete-before-flush fix, or the Q13/`o_comment`
+      LEFT JOIN fix (`75394478`) subsequently closed — dead-end hypotheses
+      and superseded investigation notes, not new scope. Left open the 3
+      rows in the same span that flag genuinely distinct, still-unaddressed
+      gaps found along the way: the cascade-delete's cross-recursion-level
+      crash-safety gap (2026-07-07, cascade row), the fast-path's
+      unenforced "no insert on an incomplete-split page" invariant
+      (2026-07-07, 9th-loop row), and the pre-existing M0122-0005 ALTER
+      DOMAIN NOT NULL scope note — none of those were touched by any
+      landed fix. No `.ralph/deferral_ledger.md` row's `landed`/`deferred`/
+      `resume point`/`why` text content was altered, only the leading
+      `status` cell.
 
 - [x] race/internal/wal — race suite failed in package
       `github.com/goopg/goopg/internal/wal` (AI-20260707-000712-001; repro:
