@@ -1,74 +1,80 @@
 (idle — nothing in flight)
 
-M-NIGHTLY (AI-20260707-000712-005, tpch/Q21-error) FIXED and committed this
-loop. Root cause: `internal/planner/bushy.go`'s `remapByPosMap` — used to
-translate `ColumnRef.Index` above a `MultiHashJoin` (≥3-table chain rewrite,
-`docs/design/0038-0001-multi-way-hash-join.md` §4) from the pre-rewrite
-(OID-sorted) schema to the MHJ's own table order — had no case for
-`*ExistsExpr`/`*SubqueryExpr`/`*ArraySubqueryExpr`. Both evaluate their inner
-plan inline at filter/leaf time against the *current* (post-rewrite) outer
-row via `ctx.OuterRows`/`OuterColumnRef.Index` (`internal/executor/expr.go`),
-so an un-translated index silently read the wrong outer column — Q21's
-correlated `l1.l_suppkey` landed on `l_comment`, blowing up a numeric
-comparison ("invalid input syntax for type numeric: 'slyly bold packages...'").
-Fix: new `remapOuterRefsInSubplan(node, depth, posMap)` walks the subquery's
-inner plan via the existing `walkPlanExprs` node-tree walker, remapping any
-`OuterColumnRef` whose `.Level` matches the current nesting depth; wired into
-`remapByPosMap` for all three expr types. `InExpr` deliberately left alone
-(already correct no-op — correlated IN/=ANY is unnested into a Semi/Anti join
-by `unnestExistsExpr` before bushy DP runs).
+M-NIGHTLY (tpch/Q13-regression) FIXED, committed (75394478), and pushed this
+loop. Task was fully resolved — no follow-up required unless a future
+regression reopens it.
 
-Verified non-vacuous: `git stash push -- internal/planner/bushy.go` restores
-the exact original failure. Positive verification: minimal repro (3-way join
-+ correlated EXISTS/NOT EXISTS) and a correlated-scalar-subquery variant both
-now pass; `scripts/pg-oracle-diff.sh` byte-for-byte match vs vanilla
-PostgreSQL 18.3 on a small synthetic dataset containing the exact `l_comment`
-string that broke Q21 (rules out coincidental correctness); full Q21 via
-`tmp/tpch-runner -queries 21`: `OK elapsed=91.97s rows=370` (was: hard error).
-Gates: `go build ./...` clean; `go test ./internal/planner/...
-./internal/executor/...` PASS; `RALPH_PRECOMMIT_SCOPE=smoke bash
-scripts/ralph-precommit-test.sh` PASS (0 failed transactions,
-standard/simple-update/select-only). Design doc: `docs/design/0038-0001-
-multi-way-hash-join.md` new §8 (already indexed in README). fix_plan.md
-AI-20260707-000712-005 checked off with full detail.
+Two independent latent bugs, both surfaced by TPC-H Q13's `customer LEFT
+JOIN orders ON c_custkey = o_custkey AND o_comment NOT LIKE
+'%special%requests%'` shape:
 
-**IMPORTANT — newly discovered, NOT fixed this loop, HIGH priority for next
-loop:** while validating via `scripts/tpch-spotcheck.sh` (the mandated
-Q12/Q13 pre-commit spot-check for executor/planner changes), found Q13 FAILS
-independently: `operator NOT LIKE requires string operands (got left.Kind=5
-right.Kind=3)` — `o_comment` (String, orders' last column) resolves to
-`o_orderdate` (Time, orders' first column) inside a `customer LEFT OUTER JOIN
-orders ON c_custkey = o_custkey AND o_comment NOT LIKE '%special%requests%'`
-plan, whose `EXPLAIN` shows the NOT LIKE filter pushed onto the bare `orders`
-seq-scan. Confirmed via `git stash` (removing this loop's bushy.go fix,
-rebuild, rerun) that this reproduces byte-for-byte identically either way —
-genuinely pre-existing and unrelated to the Q21 fix above. Likely the same
-class of bug as M0110-0003's LEFT JOIN inner-only ON-conjunct pushdown fix
-(`internal/planner/pushdown.go`'s `classifyConjunctSide`/`walkColumnRefs` vs
-`internal/planner/planner.go`'s `shiftColumnRefsBy`). Filed as a new
-`tpch/Q13-regression` item in fix_plan.md + a deferral_ledger row (both
-appended this loop). The machine-enforced git pre-commit hook only runs the
-lighter pgbench smoke (confirmed by reading `.githooks/pre-commit`), so this
-did NOT block committing the Q21 fix — but it blocks the full Hard-won-Rule-#1
-gate for every subsequent executor/planner change until fixed.
+1. **Crash** — `internal/planner/planner.go`'s LEFT JOIN inner-only-conjunct
+   split (~line 1899, the M0063-0005 design) wraps `o_comment NOT LIKE ...`
+   in a `Filter` over the inner (orders) plan and correctly shifts its
+   `ColumnRef.Index` to leaf-local coordinates, but never set
+   `LeafLocal: true` (the M0077-0001 convention on `Filter` in `plan.go`).
+   Two post-rewrite posMap passes (`applyJoinTreePosMap` /
+   `remapPosMapAfterRewrite`, both `bushy.go`) mistook the already-local
+   index for a stale FROM-cumulative offset and remapped it a second time
+   — with this dataset's non-canonical orders column order, index 8
+   (o_comment) got remapped to 0 (o_orderdate), producing a 42883 Kind
+   mismatch. Fixed by setting `LeafLocal: true` on that Filter.
 
-Next step: pick up `tpch/Q13-regression` (fix_plan.md, filed this loop) —
-start with `git log --oneline -- internal/planner/pushdown.go
-internal/planner/planner.go` to find which 2026-07-06 commit introduced the
-regression (Q13=33 was passing as recently as loop #50/#53 that day per
-fix_plan.md's own entries), then trace the ON-clause pushdown path for the
-`customer LEFT OUTER JOIN orders ON ... AND o_comment NOT LIKE ...` shape
-specifically (repro query is in the fix_plan.md entry). After that: the
-remaining queued M-NIGHTLY items (untouched, in ci/logs/action-items.md /
-fix_plan.md): tpch/Q15b-MAIN-explain (AI-20260707-000712-006),
-tpch/Q9-timeout (-007), tpch/Q20-timeout (-008) — all need the same
-port-65433 TPC-H runner server setup per `ci/design/05-tpch-stage.md` §A.
+2. **Silent row loss** (found immediately after fixing #1, via the
+   mandatory `tpch-spotcheck.sh` re-run: Q13 ran but returned 32 rows not
+   33, missing the `c_count=0` bucket for the ~50k customers with zero
+   orders) — `internal/planner/nl_index_join.go`'s `tryBuildNLI` /
+   `pickInnerSide` falls back to using `j.Left` (customer) as the NLI's
+   indexed inner side whenever `j.Right` (orders) isn't a bare `*SeqScan`
+   (exactly what fix #1's Filter wrapper produces), silently making
+   customer the null-extended side and orders the loop-driver — correct
+   for INNER joins, WRONG for LEFT JOIN (flips which side is preserved).
+   Fixed by declining that fallback branch whenever `j.Type !=
+   JoinTypeInner`, falling back to the (already-correct) Hash Join path.
 
-In-flight: none. No servers/binaries/data dirs left running — the canonical
-`bench/tpch/runtime_goopg/data` server used for repro/verification this loop
-was stopped and its cgroup scope (`goopg-q21-repro`) cleaned up; the
-`ralph-precommit-test.sh` smoke gate's own temp data dir under tmp/ was
-cleaned up by the script itself; the throwaway real-PostgreSQL oracle
-instance on `bench/tpch/runtime/pgdata` (port 65432, started manually for the
-pg-oracle-diff verification) was stopped via `pg_ctl stop` and its synthetic
-`t_supplier`/`t_lineitem`/`t_orders` tables dropped on both engines.
+Verification this loop: minimal planner-only repro test (a throwaway
+`zz_probe_q13_test.go`, deleted after use) isolated bug #1 down to the exact
+line via instrumented prints (also deleted); a small `zz_a pk / zz_b`
+psql-level repro isolated bug #2 (NLI picked customer_pk as inner, orders
+as outer SeqScan driver, returning zz_b's own rows under zz_a's column
+names). Both fixes verified via `go build ./...`, `go test
+./internal/planner/... ./internal/executor/...`, a full `go test -short
+./...` sweep (excluding `internal/testutil/tpch` — heavy scale-load tests
+gated behind `-short`/explicit `-run` per their own doc comment — and
+`internal/testport` — ported oracle tests that must be invoked explicitly
+per `.ralph/PROMPT.md`; DO NOT run these two via a blanket `go test ./...`,
+they hang/take hours), and `scripts/tpch-spotcheck.sh` (Q12=2, Q13=33 —
+full parity restored). New regression test:
+`internal/planner/left_join_inner_only_leaflocal_test.go`
+(`TestLeftJoinInnerOnlyConjunctFilterIsLeafLocal`, confirmed it fails
+without the fix). Design doc `docs/design/0063-0005-q13-left-join-not-
+like-rewrite.md` updated (status draft→accepted, new §8 post-mortem),
+already indexed in `docs/design/README.md`. `.ralph/fix_plan.md`'s
+`tpch/Q13-regression` item checked off with full detail.
+
+Next step: pick up the next queued M-NIGHTLY item from `ci/logs/action-
+items.md` / `fix_plan.md` — `tpch/Q15b-MAIN-explain` (AI-20260707-000712-006,
+EXPLAIN errored during plan-capture), then `tpch/Q9-timeout`
+(AI-20260707-000712-007) and `tpch/Q20-timeout` (AI-20260707-000712-008) —
+all three need the same port-65433 TPC-H runner server setup per
+`ci/design/05-tpch-stage.md` §A (see `bench/tpch/env_goopg.sh` for the
+canonical PGDATA/port/superuser env, and `scripts/goopg-test-run.sh` for
+the memory-capped launch wrapper — remember to stop the server / systemd
+scope cleanly when done, never bare `pkill`).
+
+In-flight: none. All manually-started servers this loop (repro/verify
+instances on `bench/tpch/runtime_goopg/data`, port 65433, cgroup scopes
+goopg-q13-repro/-repro2/-repro3) were stopped via `systemctl --user stop`;
+the real-PostgreSQL oracle instance on `bench/tpch/runtime/pgdata` (port
+65432, started manually for an oracle-comparison attempt that turned out
+unnecessary — no TPC-H data was loaded there) was stopped via `pg_ctl
+stop`. The `scripts/tpch-spotcheck.sh` gate's own server + temp data dir
+were stopped/cleaned by the script itself. A stray `go test
+./internal/testutil/tpch/...` and a stray blanket `go test ./...` each hit
+one of the two heavy/excluded packages above and hung to their 10-30 min
+timeout (expected/known behavior per those packages' own doc comments, not
+a regression) — their processes exited on their own with the timeout; no
+process was left running (verified via `ps aux` — only the pre-existing,
+unrelated `goopg-wp.scope` WordPress instance and a pre-existing
+`pgtsconfig_test` postgres instance remain, both sanctioned/unrelated to
+this work).
