@@ -1,0 +1,6 @@
+2026-07-07T00:07:12+09:00 [RUN]	start run_id=20260707-000712 sha=b70c70dd dirty=5 stages=preflight,units,race,testport,pgbench,tpch,summary
+2026-07-07T00:07:13+09:00 [RUN]	S1 lanes start (L: units,race | H: testport,pgbench — filtered by NIGHTLY_STAGES)
+2026-07-07T02:24:00+09:00 [RUN]	S1 barrier reached
+2026-07-07T03:52:53+09:00 [RUN]	end status_rc=2 (0 pass / 2 fail / 3 inconclusive) — see summary.md
+2026-07-08T06:43:34+09:00 [RUN]	start run_id=20260708-064334 sha=2e435e91 dirty=12 stages=preflight,units,race,testport,pgbench,tpch,summary
+2026-07-08T06:43:42+09:00 [RUN]	S1 lanes start (L: units,race | H: testport,pgbench — filtered by NIGHTLY_STAGES)

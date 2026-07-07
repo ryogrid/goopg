@@ -106,4 +106,6 @@ __pycache__/
 !ci/logs
 ci/logs/*
 !ci/logs/action-items.md
+!ci/logs/launch.log
+!ci/logs/scheduler.log
 
