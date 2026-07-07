@@ -1298,6 +1298,7 @@
    "feature": "Implement range-correlation support for EXISTS with non-equijoin predicates (e.g., l_suppkey <> ...)",
    "task_id": null,
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "Q21 non-equijoin EXISTS correlation; out-of-scope for M0061-0001",
     "Q21 still cancels: non-equijoin correlation (l_suppkey <> ...) is documented out-of-scope; needs range-correlation EXISTS."
@@ -1314,12 +1315,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/planner/unnest_test.go:274 non-equijoin should NOT unnest"
+   "code_audit": "RESOLVED 2026-07-08: Q21's mixed-correlation EXISTS pattern (equijoin l_orderkey AND non-equijoin l_suppkey <>) IS unnested into a Semi/Anti join whose non-equijoin residual is lifted into the join's Predicate — mechanism 'M0062-0005', landed commit 0a417306, internal/planner/unnest.go:2044-2095; pinned by internal/planner/q21_live_test.go (TestPlanQ21LiveSQL, TestM0070Q21InnerOnlyConjunctsStay). Prior citation internal/planner/unnest_test.go:245 (TestCannotUnnestNonEquijoinSubquery) was a mislabel: that test covers an unrelated scalar-aggregate subquery shape requiring an equijoin probe key, not EXISTS/Semi-Anti — working as designed, not this gap"
   },
   {
    "feature": "Q21 Anti-NLI optimization attempt corrupted NLI outer-key probe logic; partial state remains unresolved",
    "task_id": "M0065",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "Q21 Anti-NLI lift attempt corrupted the NLI outer-key probe"
    ],
@@ -1334,12 +1336,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/planner/bushy.go:1836 references M0065-Q21-walker with unsolved NLI key issues"
+   "code_audit": "RESOLVED/moot 2026-07-08: internal/planner/bushy.go:1961-1968 still carries the M0065-era comment ('Q21's mismatching Anti-NLI keys are a separate problem tracked under M0065-Q21-walker') but this refers to the walker deliberately not touching NLI keys, a conservative guard, not corruption. The actual Q21 correctness bug (0 rows vs canonical ~411/381) was root-caused and fixed via SchemaColumn.SourceTableIdx-aware re-resolution (internal/planner/unnest.go:2071-2079, findColumnIndexByNameAndSource), landed commit e8c37796 (M0071-0009, 'Q21 0->381 rows'); q21_live_test.go end-to-end tests currently pass. The stale comment predates the real fix and is superseded, not a live corruption"
   },
   {
    "feature": "Q5 query optimization and correctness testing is not yet addressed.",
    "task_id": "M0063-0002",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "M0063-0002 (Q5) and M0063-0003 (Q20) deferred"
    ],
@@ -1354,7 +1357,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: docs/milestones/0062-tpch-residual-long-tail.md:41 Q5 optimization pending"
+   "code_audit": "RESOLVED 2026-07-08: full slice-by-slice fix landed under M0077 (commits 174cb902 Slice A, 71eeba32 Slice B, da260d1c Slice C 'Q5 unlock', 5d8bd431 Slice D 'Q5 26s'), closed in 1998881e ('close M0077 — Phase 9 handover'); Q5 went from 600s+/cancel to 26s with a documented cost-model root cause (missing build-side memory term in estimateJoinCost, see [[m0076_q5_cost_model_root_cause]] and [[m0077_q5_unlocked_4_slice]] memory notes). commit 1eb3a168 ('22/22 OK') confirms Q5 in the full TPC-H sweep; docs/design has a Q5 planner design bundle (commit 5760dc93)"
   },
   {
    "feature": "Q8 still returns 0 rows; the full fix requires complete IndexScan-alias plumbing that is currently in progress.",
@@ -1381,6 +1384,7 @@
    "feature": "Q21 EXISTS unnest residual zero-rows bug fix deferred to slot pipeline",
    "task_id": "M0071-0005",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "Q21 residual zero-rows is therefore documented as slot-pipeline-blocked"
    ],
@@ -1395,12 +1399,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/planner/q21_live_test.go:112 references M0070-0001 but no zero-rows bug fix code"
+   "code_audit": "RESOLVED 2026-07-08 (same bug as [[m0071_0009_q21_path_b_landed]], reconfirmed): internal/planner/q21_live_test.go:112 (TestM0070Q21InnerOnlyConjunctsStay) pins a different, narrower invariant (inner-only conjuncts stay in Filter, not join Predicate) — not itself the zero-rows bug. The zero-rows bug is documented and fixed at internal/planner/unnest.go:2050-2065: without the re-resolve, Q21's residual l1.l_suppkey index pointed at the wrong outer column so AntiJoin's Predicate evaluated against an unrelated value, causing silent over-match (rows=0 vs canonical ~411); fixed via commit e8c37796 (M0071-0009)"
   },
   {
    "feature": "Q9 composite-NLI follow-up (second half of M0070-0001 fix) deferred to TupleSlot pipeline phase",
    "task_id": "M0070-0003",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "folded into Phase 3 (M0070-0003 TupleSlot pipeline)"
    ],
@@ -1415,7 +1420,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/planner/nl_index_join.go:140 Q9 composite-NLI hoist reverted, deferred to M0068"
+   "code_audit": "RESOLVED 2026-07-08: internal/planner/nl_index_join.go:133-140 still has the stale M0067-0003 comment ('Reverted... Defer to M0068') but M0068 never touched this (M0068 was a GC/row-pool refactor). The composite-NLI hoist for Q9 (ps_partkey=l_partkey alongside ps_suppkey=l_suppkey so partsupp_pk composite index fires) was solved 2026-07-07 via attachUnusedCrossEdges in bushy.go (global-coordinate cross-table edge attachment) plus a name-based fallback in collectCrossSideEquiKeys (nl_index_join.go:552-570, 'M0122 TPC-H Q9-timeout'); commit 2a9eade5, documented .ralph/deferral_ledger.md:573 ('FULLY LANDED'). EXPLAIN now shows Index Scan using partsupp_pk with both index conds; Q9 went from 1200s+ timeout to 88s — not a TupleSlot-pipeline deferral, solved directly in the planner"
   },
   {
    "feature": "Connection pool mutex partitioning to reduce lock contention",
@@ -1456,7 +1461,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: unnest.go:1200 negated IN rejected for non-correlated case only"
+   "code_audit": "confirmed-open 2026-07-08: internal/planner/unnest.go:1200 (isUnnestableNonCorrelatedIn) still hard-rejects negated IN — 'if in.Negated { return false }', comment 'NOT IN requires anti-semi-join semantics which are out of scope for M0069-0005'; git log --all --grep=anti-semi/AntiJoin finds no later commit converting NOT IN to an AntiJoin plan. Unchanged since ebb267d6"
   },
   {
    "feature": "Non-trivial expressions on IN-subquery LHS not optimized to SemiJoin; falls back to runtime cache path",
@@ -1476,7 +1481,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: unnest.go:1203 LHS must be ColumnRef; complex exprs rejected"
+   "code_audit": "confirmed-open 2026-07-08: internal/planner/unnest.go:1203 (same isUnnestableNonCorrelatedIn function) unchanged — 'if _, ok := in.Operand.(*ColumnRef); !ok { return false }'; no commit relaxes this to accept arbitrary expressions (BinaryExpr, FuncCall, etc.) as IN-subquery LHS. Still restricted to plain ColumnRef"
   },
   {
    "feature": "Schema-vs-runtime layout mismatch in walker implementation causes incorrect results; blocks multiple optimization attempts",
@@ -1496,12 +1501,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: nl_index_join.go:133 M0067-0003 reverted due to schema/layout mismatch"
+   "code_audit": "confirmed-open 2026-07-08: internal/planner/nl_index_join.go:133-141 still carries the exact original comment ('M0067-0003 attempt: Q9 composite-NLI hoist. Reverted — ... surfaces the schema-annotation-vs-runtime-layout mismatch... Defer to M0068'). M0068 commits (aef72b7c, e9080ac2, d79ebdab, 965c2a07) did Datum compact layout / row-pool / external sort — did NOT touch this walker or fix the mismatch; per M0074/M0071-0009 commit notes, 'Q9 stays at 7 rows; SourceTableIdx alone doesn't cover the chained-NLI schema-runtime layout mismatch... Carry-forward to Phase 3 slot pipeline'. The reverted hoist was worked around for the simpler Q21 case (SourceTableIdx fix) but never itself re-attempted or fixed for Q9's chained-NLI shape"
   },
   {
    "feature": "Q5 CPU performance profiling of the OpCode optimization is deferred to the final sweep stage combined with arena work.",
    "task_id": "M0073-0005",
    "resume_point": "combined capture with arena work in M0073-0001..4",
+   "status": "resolved",
    "evidence": [
     "Q5 CPU pprof verification deferred to M0073-0005's final sweep"
    ],
@@ -1516,7 +1522,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: slot.go:14 slot pipeline Stage A done; profiling deferred"
+   "code_audit": "RESOLVED 2026-07-08: docs/handover/2026-05-10-tpch-status-phase5.md:33-38 contains the actual before/after CPU pprof table for M0073-final (evalExprSlot flat 26.11%->25.83%, cum 68.68%), cited downstream in docs/design/0074-0001-vectorised-binary-and-columnref-inline.md:13-16 as the baseline for the next milestone; commit 1e338014 ('M0073 closes') lands this. Unlike the DecodeRow<=15% metric (a still-partial sibling entry in this backlog), this empirical capture was actually produced and documented — the numeric target (<=60% cum) wasn't hit, but the profiling activity itself (the actual ask) was completed"
   },
   {
    "feature": "NLI semi/anti joins with partsupp_pk-style index may not correctly emit outer rows; root cause and fix deferred.",
@@ -1536,7 +1542,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: no grep evidence; NLI semi/anti join issue still deferred"
+   "code_audit": "unverifiable/vague 2026-07-08: the claim originates from commit b0226c37's message speculating Q21's 0-row bug was 'a separate issue in the NLI Semi (... may not be emitting outer rows correctly), to be investigated in M0071-0005 Stage D follow-up'. Q21 was later fixed 0->381 rows (commit e8c37796, M0071-0009), but the root cause found was a hash-join Semi/Anti schema-merge bug (reresolveJoinByName widening schema + missing residual-predicate eval in nextLazy), not an NLI/partsupp_pk-index-specific bug — Q21 doesn't even use partsupp. Current NLI Semi/Anti outer-row handling (internal/planner/nl_index_join.go:286,518-522, 'M0063-0004: Semi/Anti emit only [outer]') is live with no TODO/known-broken markers. 'M0071-0005 Stage D' as a literal task is never referenced again in any commit/doc (M0071-0005 maps to 'TupleSlot pipeline Stages B-E', an unrelated structural track) — too vague to force a resolved/open verdict; kept open pending a concrete reproduction"
   },
   {
    "feature": "Q9 chained-NLI rebind logic requires slot pipeline implementation; planner-only approach infeasible",
