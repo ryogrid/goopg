@@ -245,8 +245,17 @@ GUC-override storage) — same as `RESET` already was. Verified live: all 5
 previously-broken forms (`SET x TO v`, `SET x = v`, `SET x FROM CURRENT`,
 `SET x TO DEFAULT`, `RESET x`, `RESET ALL`) now return `ALTER FUNCTION`
 instead of a syntax error. Test: `TestParseAlterFunctionGenericSetReset`
-(parser). **Still open, narrower:** a comma-separated value list (`SET
-search_path = app, public`, real PG `var_list` grammar) still errors — the
-no-op branch only ever consumed a single value token, a pre-existing
-limitation unchanged by this fix (not previously verified live; confirmed
-open by this follow-up's live testing) — see the deferral ledger.
+(parser).
+
+**Was still open, now closed (2026-07-08 follow-up 2):** the comma-separated
+`var_list` value form (`SET search_path = app, public`, real PG `gram.y`
+grammar) still errored after the follow-up above — the no-op branch only
+ever consumed a single value token. Fixed by reusing the same
+`p.parseSetValueAtoms()` helper the generic `SET` statement
+(`parser.go`'s `parseSet`) already uses for comma-separated GUC values,
+discarding the parsed list (still a no-op). Verified live: `SET search_path
+= app, public` / `SET search_path TO app, public, pg_catalog` now both
+return `ALTER FUNCTION`. Test: two new cases in
+`TestParseAlterFunctionGenericSetReset` (parser). **The ALTER
+FUNCTION/PROCEDURE/ROUTINE cluster (OWNER TO/RENAME TO/SET SCHEMA/generic
+SET-RESET incl. var_list) has no known open residuals.**

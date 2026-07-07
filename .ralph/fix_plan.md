@@ -2086,6 +2086,25 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       function call sites — the AM never dispatches through a per-index
       `FUNCTION 1` comparator, so a custom opclass is cataloged but inert.
       Both remain genuinely open, index-AM-level, not a single-loop slice.
+- [ ] **M0119-0006-DATCONNLIMIT-DEFAULT — URGENT, pick next** (found 2026-07-08
+      live-verifying an unrelated ALTER FUNCTION parser fix; see today's
+      deferral ledger "CRITICAL" row for the full write-up and exact fix).
+      `catalog.InMemory.DatabaseConnLimit(name)` returns the Go zero-value `0`
+      for any database that never had an explicit `SetDatabaseConnLimit` call
+      (i.e. every database in a fresh cluster) — but real PG's default is `-1`
+      (unlimited), not `0` ("reject all"). Combined with M0119-0006's
+      already-landed positive-datconnlimit enforcement
+      (`internal/server/server.go` ~line 959), this means **every
+      non-superuser role's first-ever connection to any database is
+      rejected** with `too many connections`. Zero test coverage today —
+      every existing datconnlimit test connects as the hardcoded superuser
+      name `"postgres"`, which bypasses the check. Fix: `DatabaseConnLimit`
+      should return `-1` (not the map's zero value) when no override was set
+      (comma-ok map lookup); also fix the stale "0 (PG's no limit default)"
+      comment at catalog.go:2059-2060 and check `pg_database`'s `VirtualRows`
+      builder for the same wrong-default assumption on the SELECT-side
+      render. Add a regression test: a fresh non-superuser role's first
+      connection to a never-limited database must succeed.
 - [ ] **M0119-0007 — pg_basebackup recvlogical** (source: M0095-0003). `030 recvlogical`
       — blocked on logical decoding (tracks the logical-replication milestone / D-004).
 
@@ -3346,6 +3365,33 @@ mirroring M0119's ledger `status` column.
       `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
       `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS
       (0 failed, all 3 workloads).
+      **`SET config_param = value1, value2` var_list form — done (2026-07-08
+      follow-up 2, M0097-0150):** closed the resume point named just above.
+      `internal/parser/ddl.go`'s ALTER FUNCTION `SET` branch now calls the
+      same `p.parseSetValueAtoms()` helper the generic `SET` statement
+      (`parser.go`'s `parseSet`) already uses for comma-separated GUC values,
+      discarding the parsed list (still a no-op — no per-function
+      GUC-override storage). Two new cases in the same
+      `TestParseAlterFunctionGenericSetReset` table (`SET search_path = app,
+      public`, `SET search_path TO app, public, pg_catalog`); confirmed
+      non-vacuous via `git stash` on `ddl.go` alone (both fail pre-fix with a
+      syntax error at the comma). Verified live against `cmd/goopg` (real
+      `postgres` superuser session): both forms now return `ALTER FUNCTION`,
+      function stayed callable throughout. **M0097-0150's ALTER
+      FUNCTION/PROCEDURE/ROUTINE cluster (OWNER TO/RENAME TO/SET SCHEMA/
+      generic SET-RESET incl. var_list) now has no known open residuals.**
+      Gates: `go build ./...` clean; `go test ./internal/parser/...` PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed, all 3 workloads). **Unrelated discovery while live-verifying
+      this fix (NOT part of M0122-0007's scope, filed as its own urgent
+      M0119-0006-DATCONNLIMIT-DEFAULT task above and a new "CRITICAL"
+      deferral ledger row instead of fixed here, per one-task-per-loop):**
+      a non-superuser role's very first connection to any database is
+      currently rejected with "too many connections" — `catalog.InMemory.
+      DatabaseConnLimit`'s unset-default is the Go zero-value `0` (PG's
+      real default is `-1`/unlimited), and M0119-0006's already-landed
+      positive-datconnlimit enforcement treats `0` as an active hard limit.
       **Still open** (this bucket, ~11 remaining items): CREATE/DROP DATABASE
       full DDL (architecturally larger — goopg is currently single-database;
       `DROP DATABASE` always reports does-not-exist by design), REINDEX

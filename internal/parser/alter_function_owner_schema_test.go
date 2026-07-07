@@ -137,6 +137,10 @@ func TestParseAlterFunctionGenericSetReset(t *testing.T) {
 		{sql: "ALTER FUNCTION myfunc(int4) RESET search_path", name: "myfunc"},
 		{sql: "ALTER FUNCTION myfunc(int4) RESET ALL", name: "myfunc"},
 		{sql: "ALTER FUNCTION myfunc(int4) IMMUTABLE SET search_path = app", name: "myfunc"},
+		// var_list form (gram.y): comma-separated values for list-valued
+		// GUCs like search_path/temp_tablespaces.
+		{sql: "ALTER FUNCTION myfunc(int4) SET search_path = app, public", name: "myfunc"},
+		{sql: "ALTER FUNCTION myfunc(int4) SET search_path TO app, public, pg_catalog", name: "myfunc"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.sql, func(t *testing.T) {

@@ -7300,7 +7300,13 @@ func (p *parser) parseAlter() (Stmt, error) {
 					} else if p.acceptIdentKeyword("default") {
 						// value already consumed
 					} else if p.cur().Kind != TokenSymbol || p.cur().Value != ";" {
-						p.advance() // value token
+						// var_list: comma-separated values for list-valued GUCs
+						// like search_path/temp_tablespaces (gram.y's var_list),
+						// e.g. `SET search_path = app, public`. Reuses the same
+						// atom parser the generic SET statement uses; the result
+						// is discarded (still a no-op — goopg has no per-function
+						// GUC-override storage).
+						_, _ = p.parseSetValueAtoms()
 					}
 				}
 				continue
