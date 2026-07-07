@@ -3138,6 +3138,48 @@ mirroring M0119's ledger `status` column.
       path (fixed here) is covered; see the ledger row for the resume
       point. `pg_tablespace` visibility remains a separate open item in
       this cluster.
+      **2026-07-08 follow-up 2 (checkpointed-restart heap decode — 3 of 5
+      fields done):** closed the "still deferred" heap-decode gap above
+      for predicate/INCLUDE columns/NULLS NOT DISTINCT.
+      `buildUserPGIndexRow` (`internal/executor/pg18_user_catalog_rows.go`)
+      now writes real `indnatts`/`indnkeyatts` (previously always equal —
+      INCLUDE columns were silently dropped from `indkey`), appends
+      INCLUDE-column attnums to `indkey`, and writes `indpred` as the
+      predicate's SQL text when `HasPredicate` (`indexprs` stays NULL —
+      goopg has no expression-index support, so nothing can populate it).
+      `catalog.PGIndexRow`/`DecodePGIndexPhysicalRow`
+      (`internal/catalog/codec.go`) gained `IndNKeyAtts`/
+      `IndNullsNotDistinct`/`IndHasPred`/`IndPred`; `indpred`'s
+      NULL-vs-present state is inferred from data length alone (safe
+      because `indexprs`, the column before it, is proven always NULL, and
+      `encodeRowPG` writes zero bytes for NULL columns) via a new
+      `decodePGIndexVarlenaText` helper. `loadUserIndexesFromHeap`
+      (`internal/initdb/open.go`) splits decoded `indkey` at `indnkeyatts`
+      into key columns vs `IncludeColumns` and threads
+      `HasPredicate`/`PredicateString`/`NullsNotDistinct` through to
+      `RegisterIndexDuringRecovery`. Test:
+      `TestCreateIndexPredicateAndIncludeColumnsSurviveCheckpointedRestart`
+      (`internal/initdb/index_ddl_recovery_test.go`, graceful `Close()`,
+      confirmed non-vacuous via `git stash`). Live-verified against the
+      real `cmd/goopg` binary with a graceful `stop`/`start`. Design:
+      `docs/design/0122-0006-index-column-order-restart-persistence.md`
+      "Follow-up 2 (2026-07-08)" section; `docs/design/README.md` row
+      updated. Gates: `go build ./...`/`go vet ./...` clean; `go test
+      ./internal/wal/... ./internal/catalog/... ./internal/executor/...
+      ./internal/initdb/... ./internal/planner/... ./internal/analyzer/...
+      ./internal/parser/... ./internal/server/...` PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed, all 3 workloads). **Still open** (new 2026-07-08 ledger row,
+      "follow-up 2 of 2"): `ColOpClasses`/`ColCollations`
+      (`indclass`/`indcollation` real OID resolution) — a materially
+      larger, separate gap that also affects the *live* (non-restart)
+      `pg_index` rendering (`catalog.go`'s `VirtualRows` builder ignores
+      `ColOpClasses`/`ColCollations` too, using a hard-coded per-type
+      default-opclass switch and always-zero `indcollation`); needs a full
+      opclass/collation name↔OID registry, not just heap-decode plumbing.
+      `pg_tablespace` visibility remains a separate open item in this
+      cluster.
 - [ ] **M0122-0007 — DDL / admin commands / ctl / GUC config** (~14). CREATE/DROP
       DATABASE full DDL, `goopg ctl restart`, REINDEX, SIGHUP config reload,
       tablespaces, ALTER FUNCTION/COLUMN, planner/jit GUC stubs.

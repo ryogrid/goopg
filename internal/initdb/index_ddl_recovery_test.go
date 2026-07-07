@@ -206,6 +206,72 @@ func TestCreateIndexExtendedPropertiesSurviveRestartViaWAL(t *testing.T) {
 	}
 }
 
+// TestCreateIndexPredicateAndIncludeColumnsSurviveCheckpointedRestart pins the
+// M0122-0006 follow-up's second residual (see .ralph/deferral_ledger.md's
+// 2026-07-08 row): a partial-index WHERE predicate, INCLUDE columns, and
+// NULLS NOT DISTINCT must survive a *checkpointed* restart (a graceful
+// rt1.Close(), which flushes the pg_index heap row and drives recovery
+// through loadUserIndexesFromHeap — internal/initdb/open.go — not through
+// CREATE INDEX WAL replay). This is the read side of buildUserPGIndexRow's
+// indpred/indkey(INCLUDE)/indnullsnotdistinct writes
+// (internal/executor/pg18_user_catalog_rows.go) plus
+// catalog.DecodePGIndexPhysicalRow's matching decode
+// (internal/catalog/codec.go). Companion to
+// TestCreateIndexExtendedPropertiesSurviveRestartViaWAL above, which only
+// exercises the uncheckpointed-crash / WAL-replay path.
+//
+// ColOpClasses/ColCollations are deliberately NOT asserted here: real
+// per-column opclass/collation OID resolution in indclass/indcollation is
+// still unimplemented (a separate, larger residual — see the ledger),
+// so they do not survive a checkpointed restart yet.
+func TestCreateIndexPredicateAndIncludeColumnsSurviveCheckpointedRestart(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	if err := Init(Options{DataDir: dir}); err != nil {
+		t.Fatal(err)
+	}
+
+	rt1, err := Open(OpenOptions{DataDir: dir, PoolSlots: 64})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runDDL(t, rt1, "CREATE TABLE ext2 (a int4 NOT NULL, b text, c int4)")
+	runDDL(t, rt1, `CREATE UNIQUE INDEX ext2_idx ON ext2 (a, b) INCLUDE (c) `+
+		`NULLS NOT DISTINCT WHERE (a > 0)`)
+
+	// Graceful shutdown: Runtime.Close performs a synchronous checkpoint
+	// (M0089-0002), flushing the pg_index heap page — recovery on the next
+	// Open is won by loadUserIndexesFromHeap, not WAL replay.
+	if err := rt1.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	rt2, err := Open(OpenOptions{DataDir: dir, PoolSlots: 64})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt2.Close()
+
+	idx, ok := rt2.Catalog.LookupIndex(parser.ObjectName{Name: "ext2_idx"})
+	if !ok {
+		t.Fatal("ext2_idx not found after restart — heap-driven index recovery failed")
+	}
+	if len(idx.Columns) != 2 || idx.Columns[0] != "a" || idx.Columns[1] != "b" {
+		t.Errorf("recovered Columns = %v, want [a b]", idx.Columns)
+	}
+	if !idx.HasPredicate {
+		t.Error("recovered HasPredicate = false, want true")
+	}
+	if idx.PredicateString != "(a > 0)" {
+		t.Errorf("recovered PredicateString = %q, want %q", idx.PredicateString, "(a > 0)")
+	}
+	if len(idx.IncludeColumns) != 1 || idx.IncludeColumns[0] != "c" {
+		t.Errorf("recovered IncludeColumns = %v, want [c]", idx.IncludeColumns)
+	}
+	if !idx.NullsNotDistinct {
+		t.Error("recovered NullsNotDistinct = false, want true")
+	}
+}
+
 // TestDropIndexSurvivesRestartViaWAL pins the symmetric DROP
 // path: a CREATE INDEX followed by DROP INDEX must NOT
 // resurrect the index from WAL on restart. (M0079-0001.)

@@ -298,3 +298,99 @@ from the heap row, and `PGIndexRow`/`DecodePGIndexPhysicalRow` have no
 loses opclass/collation/predicate/INCLUDE/NULLS-NOT-DISTINCT — only a
 genuine uncheckpointed crash is covered by this follow-up's WAL path)
 remains open; see the deferral ledger for the resume point.
+
+## Follow-up 2 (2026-07-08): checkpointed-restart heap decode
+
+Closes 3 of the 5 fields left open by the "still deferred" note above:
+predicate, INCLUDE columns, and NULLS NOT DISTINCT now survive a
+*checkpointed* restart (a plain graceful `Close()`/`stop`, which flushes
+the pg_index heap row and recovers via `loadUserIndexesFromHeap`, not WAL
+replay). ColOpClasses/ColCollations (`indclass`/`indcollation` real OID
+resolution) remain open — see "Still deferred" below.
+
+### Fix
+
+- **`buildUserPGIndexRow`** (`internal/executor/pg18_user_catalog_rows.go`)
+  no longer hard-codes `indnkeyatts == indnatts`: it now computes
+  `nkeyatts = len(idx.Columns)` and `natts = nkeyatts +
+  len(idx.IncludeColumns)`, and appends the INCLUDE columns' attnums to
+  `indkey` after the key columns' (mirroring real PG's `indkey` layout —
+  key columns first, then INCLUDE columns). Previously INCLUDE columns
+  were entirely absent from the physical `indkey` vector, so there was no
+  way to reconstruct them from the heap row at all. `indpred` is now
+  written as `idx.PredicateString` (as PG varlena text) when
+  `idx.HasPredicate`, instead of always `NULL`. `indexprs` stays `NULL`
+  unconditionally — goopg has no expression-index support
+  (`catalog.Index.Columns` holds only plain column names), so no code
+  path can ever populate it; this is not a residual, just an accurate
+  reflection of current capability.
+- **`catalog.PGIndexRow`/`DecodePGIndexPhysicalRow`**
+  (`internal/catalog/codec.go`) gained `IndNKeyAtts` (decoded from the
+  previously-ignored offset-10 `indnkeyatts` field), `IndNullsNotDistinct`
+  (offset 13, between `indisunique`@12 and `indisprimary`@14 — the byte
+  was already being skipped correctly by the existing offset arithmetic,
+  just never read into the struct), and `IndHasPred`/`IndPred`. The
+  `indpred` decode exploits a specific, checked invariant: `indexprs`
+  (the column immediately before it) is proven always `NULL` (see above),
+  and goopg's physical tuple encoder (`encodeRowPG`) writes zero bytes for
+  a `NULL` column — so any bytes remaining in the tuple after `indoption`
+  belong entirely to `indpred`, letting its presence be inferred from data
+  length alone, with no null-bitmap plumbing needed (some callers of
+  `DecodePGIndexPhysicalRow`, e.g. `operators_ddl.go`'s
+  `stampCatalogRows`, only have the raw data bytes on hand, not the
+  tuple's null bitmap). A new `decodePGIndexVarlenaText` helper decodes
+  both the short (1-byte header) and long (4-byte header) PG varlena text
+  forms, mirroring `internal/executor/codec.go`'s `varlenaTextBytes`
+  encoder. **If expression-index support is ever added, this
+  length-based inference breaks** and both `indexprs`/`indpred` will need
+  real null-bitmap-aware decoding.
+- **`loadUserIndexesFromHeap`** (`internal/initdb/open.go`) Pass 2/3 now
+  carry `IndNKeyAtts`/`IndNullsNotDistinct`/`IndHasPred`/`IndPred` through
+  to `RegisterIndexDuringRecovery`, and split the decoded `indkey` at
+  `indnkeyatts`: the first `nkeyatts` attnums resolve to `colNames` (key
+  columns, as before), the rest resolve to `IncludeColumns`.
+
+### Tests
+
+- `internal/initdb/index_ddl_recovery_test.go`,
+  `TestCreateIndexPredicateAndIncludeColumnsSurviveCheckpointedRestart`:
+  uses a *graceful* `rt1.Close()` (checkpointed restart, exercising
+  `loadUserIndexesFromHeap`) for `CREATE UNIQUE INDEX ext2_idx ON ext2
+  (a, b) INCLUDE (c) NULLS NOT DISTINCT WHERE (a > 0)`, asserting
+  `HasPredicate`/`PredicateString`/`IncludeColumns`/`NullsNotDistinct` all
+  survive. Deliberately does NOT assert `ColOpClasses`/`ColCollations`
+  (still open). Confirmed non-vacuous via `git stash` on the 3 impl files:
+  all 4 assertions fail with the exact pre-fix zero-value symptom.
+- Live end-to-end verification against the real `cmd/goopg` binary: a
+  graceful `stop`/`start` (not `kill -9`) for `CREATE UNIQUE INDEX
+  ext3_idx ON ext3 (a, b) INCLUDE (c) NULLS NOT DISTINCT WHERE (a > 0)` —
+  `pg_get_indexdef` and `pg_index.indnatts`/`indnkeyatts`/`indkey`/
+  `indnullsnotdistinct` all correct post-restart.
+
+### Gates run (this follow-up)
+
+- `go build ./...` / `go vet ./...` clean.
+- `go test ./internal/wal/... ./internal/catalog/... ./internal/executor/...
+  ./internal/initdb/... ./internal/planner/... ./internal/analyzer/...
+  ./internal/parser/... ./internal/server/...` PASS.
+- `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33).
+- `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh` PASS
+  (0 failed transactions, all 3 workloads).
+
+### Still deferred
+
+`ColOpClasses`/`ColCollations` (`indclass`/`indcollation` real per-column
+OID resolution) remain unresolved after a checkpointed restart — and, in
+fact, on the *live* (no restart) path too: `pg_index`'s `VirtualRows`
+builder (`internal/catalog/catalog.go`, ~line 7660) only fills `indclass`
+via a hard-coded per-Go-type-name default-opclass switch and always
+zeroes `indcollation`, ignoring `idx.ColOpClasses`/`ColCollations`
+entirely regardless of restart. `pg_get_indexdef`/`\d` are unaffected,
+since they render from the in-memory `Index` struct's name-string fields
+directly, never through `pg_index`'s numeric columns. Fixing this needs a
+real opclass-name→OID and collation-name→OID resolver covering the full
+builtin universe (not just the small `builtinRangeSubtypeOpclasses` set
+used by range-type defaults), plus the reverse OID→name lookup, wired
+into both the live `VirtualRows` builder and
+`buildUserPGIndexRow`/`DecodePGIndexPhysicalRow`. See the deferral
+ledger's 2026-07-08 "follow-up 2 of 2" row for the full resume point.

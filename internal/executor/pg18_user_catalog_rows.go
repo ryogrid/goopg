@@ -1056,29 +1056,49 @@ func pgIndexColumnsPG18() []catalog.Column {
 // for a user-defined index. Column names are mapped to 1-based attnums via
 // the index's parent table column list.
 func buildUserPGIndexRow(idx *catalog.Index) Row {
-	n := len(idx.Columns)
-	natts := int64(n)
+	nKey := len(idx.Columns)
+	nInclude := len(idx.IncludeColumns)
+	natts := int64(nKey + nInclude)
+	nkeyatts := int64(nKey)
 
-	attnums := make([]int16, n)
-	if idx.Table != nil {
-		for i, colName := range idx.Columns {
-			for _, col := range idx.Table.Columns {
-				if col.Name == colName {
-					attnums[i] = int16(col.Ordinal + 1)
-					break
-				}
+	colAttnum := func(colName string) int16 {
+		if idx.Table == nil {
+			return 0
+		}
+		for _, col := range idx.Table.Columns {
+			if col.Name == colName {
+				return int16(col.Ordinal + 1)
 			}
 		}
+		return 0
 	}
-	zeros32 := make([]uint32, n)
+	// indkey: key columns first, then INCLUDE columns (M0122-0006 follow-up
+	// 2 of 2) — mirrors real PG's ExecutorGetIndexAttrBitmap layout. Without
+	// appending the INCLUDE attnums here, a checkpointed restart lost every
+	// INCLUDE column: loadUserIndexesFromHeap could only recover as many
+	// attnums as indnkeyatts reported, and indnkeyatts was (bug) always set
+	// equal to indnatts, leaving no way to tell key columns from INCLUDE
+	// columns apart on the read side.
+	attnums := make([]int16, 0, nKey+nInclude)
+	for _, colName := range idx.Columns {
+		attnums = append(attnums, colAttnum(colName))
+	}
+	for _, colName := range idx.IncludeColumns {
+		attnums = append(attnums, colAttnum(colName))
+	}
+	// indcollation/indclass cover only the key columns in real PG (INCLUDE
+	// columns carry no opclass/collation). Real per-column OID resolution
+	// (idx.ColOpClasses/ColCollations by name) remains deferred — see
+	// .ralph/deferral_ledger.md's 2026-07-08 M0122-0006 row.
+	zeros32 := make([]uint32, nKey)
 
 	// indoption: per-key ASC/DESC + NULLS FIRST/LAST bitmask, mirroring
 	// upstream's INDOPTION_DESC (0x1) / INDOPTION_NULLS_FIRST (0x2). Lost
 	// without this (M0122-0006): pg_get_indexdef/\d/pg_dump would silently
 	// render every index as plain ascending regardless of its declared
 	// column ordering.
-	indoption := make([]int16, n)
-	for i := 0; i < n; i++ {
+	indoption := make([]int16, nKey)
+	for i := 0; i < nKey; i++ {
 		var bits int16
 		if i < len(idx.ColDescending) && idx.ColDescending[i] {
 			bits |= 0x0001
@@ -1089,11 +1109,22 @@ func buildUserPGIndexRow(idx *catalog.Index) Row {
 		indoption[i] = bits
 	}
 
+	// indpred: the WHERE-clause predicate's SQL text (goopg represents
+	// pg_node_tree columns as plain SQL text, not a serialized node tree —
+	// same pattern as column_defaults_recovery.go's expression-as-text
+	// round-trip). NULL when the index isn't partial. Without this
+	// (M0122-0006 follow-up 2 of 2), a partial index's predicate silently
+	// reverted to "none" on a checkpointed restart.
+	indpred := NullDatum
+	if idx.HasPredicate {
+		indpred = NewStringDatum(idx.PredicateString)
+	}
+
 	return Row{
 		NewIntDatum(int64(idx.OID)),               // indexrelid
 		NewIntDatum(int64(tableOIDForIndex(idx))), // indrelid
 		NewIntDatum(natts),                        // indnatts
-		NewIntDatum(natts),                        // indnkeyatts
+		NewIntDatum(nkeyatts),                     // indnkeyatts
 		NewBoolDatum(idx.Unique),                  // indisunique
 		NewBoolDatum(idx.NullsNotDistinct),        // indnullsnotdistinct (DU-002 slice 134)
 		NewBoolDatum(idx.Primary),                 // indisprimary
@@ -1109,8 +1140,8 @@ func buildUserPGIndexRow(idx *catalog.Index) Row {
 		NewBytesDatum(pgOIDVectorBytes(zeros32)),  // indcollation
 		NewBytesDatum(pgOIDVectorBytes(zeros32)),  // indclass
 		NewBytesDatum(pgInt2VectorBytes(indoption)), // indoption
-		NullDatum, // indexprs (NULL)
-		NullDatum, // indpred  (NULL)
+		NullDatum, // indexprs — goopg has no expression-index support (Index.Columns holds only plain column names), so this is always NULL
+		indpred,   // indpred
 	}
 }
 
