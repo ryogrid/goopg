@@ -206,14 +206,31 @@ executor narrow the supported runtime subset later.
 
 Full `go test ./...` green.
 
+**2026-07-08 update (M0021-0002 unimplemented_feat.json entry):**
+aggregate-functions-in-target detection landed. `analyzeLockingClauses`
+gained a target-list scan (`targetHasBareAggregate` / local
+`isAnalyzerAggregateName`, mirroring `parser.exprContainsAggregateCall`
+/ `planner.isAggregateFunc`'s standard-aggregate name set — each
+package keeps its own small local copy rather than sharing one, the
+existing convention here) that rejects `SELECT count(*) FROM t FOR
+UPDATE` with `0A000 "FOR UPDATE is not allowed with aggregate
+functions"`, matching upstream's `CheckSelectLocking`'s `qry->hasAggs`
+branch (`postgres/src/backend/parser/analyze.c`) both in error code and
+message text (confirmed against `expected/portals.out`'s `SELECT
+MIN(f1) FROM uctest FOR UPDATE` case). The walk mirrors
+`parser.exprContainsAggregateCall`'s exact case set (FuncCall/BinaryOp/
+UnaryOp/CastExpr/IsNullExpr/IsBoolExpr/IndirectionStar) so a bare
+aggregate is caught whether it's the whole target expression or nested
+inside one (e.g. `sum(x) + 1`). New tests
+`TestAnalyzeForUpdateRejectsBareAggregate` /
+`TestAnalyzeForUpdateRejectsAggregateInExpr` in `locking_test.go`
+(confirmed non-vacuous via `git stash`). Full `go test ./...` green;
+`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+`RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+failed, all 3 workloads).
+
 ## Out of scope
 
-- Aggregate-functions-in-target detection (a SELECT like
-  `SELECT count(*) FROM t FOR UPDATE` should also error per
-  upstream, but the analyzer doesn't currently expose a "this
-  target list contains aggregates" predicate; deferred to the
-  planner slice when WindowFunc / aggregate node detection
-  lands cleanly).
 - Locking inside subqueries / CTEs — upstream forbids this, the
   analyzer recurses into subquery analysis but doesn't yet plumb
   the "outer locking context" needed to detect inner-query

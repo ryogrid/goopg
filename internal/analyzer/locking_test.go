@@ -57,6 +57,28 @@ func TestAnalyzeForUpdateRejectsHaving(t *testing.T) {
 		"0A000")
 }
 
+// TestAnalyzeForUpdateRejectsBareAggregate — a bare aggregate in the
+// target list with no GROUP BY (e.g. `SELECT count(*) ... FOR UPDATE`)
+// is rejected the same way upstream's CheckSelectLocking rejects it via
+// qry->hasAggs, distinct from the already-covered GROUP BY/HAVING
+// cases above. M0021-0002.
+func TestAnalyzeForUpdateRejectsBareAggregate(t *testing.T) {
+	cat := analyzerCatalog(t)
+	expectAnalyzeCode(t, cat,
+		"SELECT count(*) FROM pgbench_accounts FOR UPDATE",
+		"0A000")
+}
+
+// TestAnalyzeForUpdateRejectsAggregateInExpr — the aggregate can be
+// nested inside a larger target-list expression, not just the bare
+// call itself.
+func TestAnalyzeForUpdateRejectsAggregateInExpr(t *testing.T) {
+	cat := analyzerCatalog(t)
+	expectAnalyzeCode(t, cat,
+		"SELECT sum(abalance) + 1 FROM pgbench_accounts FOR UPDATE",
+		"0A000")
+}
+
 // TestAnalyzeForUpdateUnknownTarget — `OF not_in_from` errors with
 // 42P01 (the upstream "relation not in FROM" diagnostic).
 func TestAnalyzeForUpdateUnknownTarget(t *testing.T) {

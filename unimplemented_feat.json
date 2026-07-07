@@ -716,7 +716,7 @@
    "feature": "Detection of aggregate functions in SELECT ... FOR UPDATE target lists to enforce proper locking constraints when aggregates appear in the target.",
    "task_id": "M0021-0002",
    "resume_point": "planner slice",
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "Aggregate-functions-in-target detection and locking-inside-subqueries deferred"
    ],
@@ -731,7 +731,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open 2026-07-07 (old path was mislabeled — the file is internal/analyzer/locking_test.go, not internal/planner/). internal/analyzer/analyzer.go:395-427 analyzeLockingClauses (analyzeLockingClauses) rejects FOR UPDATE/FOR SHARE combined with GROUP BY or HAVING (0A000), confirmed by TestAnalyzeForUpdateRejectsGroupBy/RejectsHaving — that guard IS implemented. But a bare aggregate in the target list without GROUP BY (e.g. SELECT count(*) FROM t FOR UPDATE) is still undetected — PG rejects this via hasAggs in transformLockingClause; goopg has no equivalent check or test. The specific aggregate-in-target-list detection this entry describes remains missing."
+   "code_audit": "RESOLVED 2026-07-08: internal/analyzer/analyzer.go's analyzeLockingClauses now scans every target-list expression via new targetHasBareAggregate (mirrors parser.exprContainsAggregateCall's FuncCall/BinaryOp/UnaryOp/CastExpr/IsNullExpr/IsBoolExpr/IndirectionStar walk + isAnalyzerAggregateName's standard-aggregate name set) and rejects a bare aggregate with no GROUP BY (e.g. SELECT count(*) FROM t FOR UPDATE) via 0A000 \"FOR UPDATE is not allowed with aggregate functions\", matching upstream's CheckSelectLocking qry->hasAggs branch (postgres/src/backend/parser/analyze.c) in both SQLSTATE and message text (verified against postgres/src/test/regress/expected/portals.out's SELECT MIN(f1) FROM uctest FOR UPDATE case). New tests TestAnalyzeForUpdateRejectsBareAggregate / TestAnalyzeForUpdateRejectsAggregateInExpr in internal/analyzer/locking_test.go (confirmed non-vacuous via git stash). See docs/design/0021-0001-for-update-parser-analysis-and-ast.md 2026-07-08 update."
   },
   {
    "feature": "Optimize per-row writeHeapRow operations by pinning heap data to improve memory locality during bulk writes.",

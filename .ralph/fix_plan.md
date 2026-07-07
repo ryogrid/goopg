@@ -3170,6 +3170,32 @@ mirroring M0119's ledger `status` column.
       `docs/design/0122-0016-autovacuum-enabled-reloption.md`,
       `docs/design/README.md` row added. `unimplemented_feat.json`'s `M0086`
       entry flipped `open`→`resolved` (65/181 resolved, 116 open).
+- [x] **M0122-0017 — Analyzer: reject bare aggregate in FOR UPDATE target
+      list** (~1; `unimplemented_feat.json` task `M0021-0002`). `SELECT
+      count(*) FROM t FOR UPDATE` (no `GROUP BY`) silently passed analysis —
+      `analyzeLockingClauses` only rejected `GROUP BY`/`HAVING` combined with
+      locking, not a bare aggregate in the target list, matching upstream's
+      `CheckSelectLocking`'s `qry->hasAggs` branch
+      (`postgres/src/backend/parser/analyze.c`) which was still unimplemented.
+      Fixed: new `targetHasBareAggregate`/`isAnalyzerAggregateName`
+      (`internal/analyzer/analyzer.go`) walk every target-list expression
+      (mirrors `parser.exprContainsAggregateCall`'s FuncCall/BinaryOp/UnaryOp/
+      CastExpr/IsNullExpr/IsBoolExpr/IndirectionStar case set) and reject with
+      `0A000 "FOR UPDATE is not allowed with aggregate functions"` — verified
+      against `postgres/src/test/regress/expected/portals.out`'s `SELECT
+      MIN(f1) FROM uctest FOR UPDATE` case for both SQLSTATE and message text.
+      Tests: `TestAnalyzeForUpdateRejectsBareAggregate`,
+      `TestAnalyzeForUpdateRejectsAggregateInExpr`
+      (`internal/analyzer/locking_test.go`), confirmed non-vacuous via `git
+      stash` on `analyzer.go` alone. Gates: `go build ./...` clean; `go test
+      ./internal/analyzer/... ./internal/parser/... ./internal/planner/...`
+      PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh` PASS
+      (0 failed transactions, all 3 workloads). Design:
+      `docs/design/0021-0001-for-update-parser-analysis-and-ast.md` updated
+      (2026-07-08 section), `docs/design/README.md` row updated.
+      `unimplemented_feat.json`'s `M0021-0002`/aggregate-detection entry
+      flipped `open`→`resolved` (66/181 resolved, 115 open).
 
 > This task list is **seeded, not exhaustive.** The M0122-0001 triage plus every
 > future feature deferral appended to `unimplemented_feat.json` (any new `open`

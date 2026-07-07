@@ -415,6 +415,12 @@ func analyzeLockingClauses(s *parser.SelectStmt, ctx *scope) error {
 		return analyzeError(first.Pos(), "0A000",
 			"FOR UPDATE/SHARE is not allowed with HAVING clause")
 	}
+	for _, t := range s.Targets {
+		if targetHasBareAggregate(t.Expr) {
+			return analyzeError(first.Pos(), "0A000",
+				"FOR UPDATE is not allowed with aggregate functions")
+		}
+	}
 	for _, lc := range s.Locking {
 		for _, name := range lc.Targets {
 			if !lockingTargetMatches(name, ctx.rels) {
@@ -444,6 +450,62 @@ func lockingTargetMatches(name string, rels []scopeRel) bool {
 		if strings.EqualFold(name, rel.table.Name) {
 			return true
 		}
+	}
+	return false
+}
+
+// targetHasBareAggregate reports whether expr contains a call to a
+// standard PostgreSQL aggregate function that is not itself a window
+// function (OVER-less). Used by analyzeLockingClauses to reject
+// `SELECT count(*) FROM t FOR UPDATE`-style queries the way upstream's
+// CheckSelectLocking does via qry->hasAggs — mirrors
+// parser.exprContainsAggregateCall / planner.isAggregateFunc; kept
+// local since the analyzer does not otherwise know "aggregate" as a
+// category. M0021-0002.
+func targetHasBareAggregate(e parser.Expr) bool {
+	switch x := e.(type) {
+	case *parser.FuncCall:
+		if x.Over == nil && isAnalyzerAggregateName(x.Name.Name) {
+			return true
+		}
+		for _, a := range x.Args {
+			if targetHasBareAggregate(a) {
+				return true
+			}
+		}
+	case *parser.BinaryOp:
+		return targetHasBareAggregate(x.Left) || targetHasBareAggregate(x.Right)
+	case *parser.UnaryOp:
+		return targetHasBareAggregate(x.Operand)
+	case *parser.CastExpr:
+		return targetHasBareAggregate(x.Operand)
+	case *parser.IsNullExpr:
+		return targetHasBareAggregate(x.Operand)
+	case *parser.IsBoolExpr:
+		return targetHasBareAggregate(x.Operand)
+	case *parser.IndirectionStar:
+		return targetHasBareAggregate(x.Source)
+	}
+	return false
+}
+
+// isAnalyzerAggregateName mirrors parser.isParserAggregateName /
+// planner.isAggregateFunc's standard-aggregate name set.
+func isAnalyzerAggregateName(name string) bool {
+	switch strings.ToLower(name) {
+	case "count", "sum", "avg", "min", "max",
+		"var_pop", "var_samp", "variance", "stddev_pop", "stddev_samp", "stddev",
+		"corr", "covar_pop", "covar_samp",
+		"regr_count", "regr_sxx", "regr_syy", "regr_sxy",
+		"regr_avgx", "regr_avgy", "regr_r2", "regr_slope", "regr_intercept",
+		"bool_and", "bool_or", "every",
+		"bit_and", "bit_or", "bit_xor",
+		"string_agg", "array_agg", "json_agg", "jsonb_agg",
+		"json_object_agg", "jsonb_object_agg",
+		"xmlagg", "any_value",
+		"percentile_cont", "percentile_disc", "mode",
+		"rank", "dense_rank", "cume_dist", "percent_rank":
+		return true
 	}
 	return false
 }
