@@ -2051,6 +2051,12 @@ type InMemory struct {
 	// recovered databases succeed after a crash, NOT for
 	// per-database storage isolation (that lands later).
 	databases map[string]bool
+	// databaseConnLimit holds runtime `pg_database.datconnlimit` overrides
+	// written via `UPDATE pg_database SET datconnlimit = ... WHERE datname =
+	// ...` (M-NIGHTLY AI-20260707-000712-004 follow-up / AC-002 residual #1).
+	// Absent entries report 0 (PG's "no limit" default), matching the
+	// hard-coded value pg_database.VirtualRows used before this map existed.
+	databaseConnLimit map[string]int32
 	// dbRoleSettings holds per-database `ALTER DATABASE name SET config =
 	// value` overrides (pg_db_role_setting, setrole=0 scope only — ALTER
 	// ROLE ... SET / ALTER ROLE ... IN DATABASE ... SET are a separate,
@@ -3234,6 +3240,7 @@ func NewInMemory() *InMemory {
 		dbOid:                  DefaultDBOid,
 		routines:               NewRoutines(),
 		databases:              map[string]bool{"postgres": true, "template1": true, "template0": true},
+		databaseConnLimit:      make(map[string]int32),
 		dbRoleSettings:         make(map[uint32][]string),
 		roleSettings:           make(map[roleSettingKey][]string),
 		roleMembers:            make(map[roleMembershipKey]*RoleMembership),
@@ -4501,7 +4508,33 @@ func (c *InMemory) DropDatabase(name string) error {
 		return ErrDatabaseNotFound
 	}
 	delete(c.databases, name)
+	delete(c.databaseConnLimit, name)
 	return nil
+}
+
+// DatabaseConnLimit returns the runtime `pg_database.datconnlimit` override
+// recorded for name via SetDatabaseConnLimit, or 0 (PG's "no limit" default)
+// if none was ever set. M-NIGHTLY AI-20260707-000712-004 / AC-002 residual #1.
+func (c *InMemory) DatabaseConnLimit(name string) int32 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.databaseConnLimit[name]
+}
+
+// SetDatabaseConnLimit records a runtime `datconnlimit` override for an
+// existing database — the target of `UPDATE pg_database SET datconnlimit =
+// ... WHERE datname = ...` (goopg has no physical, generically-writable
+// pg_database heap; this is the same "runtime InMemory truth, no on-disk
+// write" pattern CreateCollation/CreateExtension already use). Returns false
+// if name is not a registered database (caller reports 0 rows affected).
+func (c *InMemory) SetDatabaseConnLimit(name string, limit int32) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.databases[name] {
+		return false
+	}
+	c.databaseConnLimit[name] = limit
+	return true
 }
 
 // RegisterDatabaseDuringRecovery is the idempotent version of
@@ -6265,10 +6298,13 @@ func (c *InMemory) registerSystemTables() {
 			out = append(out, []string{
 				oid, // oid: conventional database OID (M0097-0021)
 				n,
-				"10",          // datdba: OID of owner (10 = postgres superuser)
-				"6",           // encoding: 6 = UTF8
-				datallowconn,  // datallowconn: allow connections
-				"0",           // datconnlimit: 0 = default (vacuumdb filters datconnlimit <> -2)
+				"10",         // datdba: OID of owner (10 = postgres superuser)
+				"6",          // encoding: 6 = UTF8
+				datallowconn, // datallowconn: allow connections
+				// datconnlimit: runtime override via `UPDATE pg_database SET
+				// datconnlimit = ...` (SetDatabaseConnLimit), default 0 = no
+				// limit. vacuumdb/pg_amcheck filter on `datconnlimit <> -2`.
+				strconv.FormatInt(int64(c.DatabaseConnLimit(n)), 10),
 				datistemplate, // datistemplate: true for template0/template1
 				datFrozenStr,  // datfrozenxid: cluster-wide min(relfrozenxid), bootstrap floor 2
 				"1",           // datminmxid: FirstMultiXactId bootstrap floor

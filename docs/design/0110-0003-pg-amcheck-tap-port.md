@@ -470,12 +470,78 @@ anti-join runs to completion. Both `--all --exclude-schema …` cases (`.pl`
 `no relations to check`) and stand as the end-to-end regression guard for the
 planner fix.
 
-### One deferred residual
+### Former deferred residual — now closed (2026-07-07)
 
 **`datconnlimit = -2` invalid-database filter.** The `.pl` marks a database
 invalid via `UPDATE pg_database SET datconnlimit = -2` and asserts pg_amcheck's
-database-resolution query filters it out. goopg has no runtime in-place update
-of on-disk shared catalogs (`pg_database` is initdb-only; the in-memory catalog
-exposes no `datconnlimit` write path), so the UPDATE is a silent no-op and the
-database stays connectable. Blocked on the runtime shared-catalog-write
-capability, not an amcheck concern.
+database-resolution query filters it out. This was blocked on a runtime write
+path for `pg_database.datconnlimit` — goopg has no on-disk, generically
+UPDATE-able heap for `pg_database` (it is `catalog.Table{Virtual: true}`,
+computed entirely by `VirtualRows()`), so the write needed a dedicated
+mechanism rather than falling out of the generic UPDATE executor for free.
+
+**Read side.** `catalog.InMemory` gained `databaseConnLimit map[string]int32`
+plus `SetDatabaseConnLimit(name string, limit int32) bool` /
+`DatabaseConnLimit(name string) int32` (catalog.go) — the same "runtime
+InMemory truth, no on-disk write" pattern `CreateCollation`/`CreateExtension`
+already use for other per-object runtime state. `pg_database`'s `VirtualRows`
+closure now renders `strconv.FormatInt(int64(c.DatabaseConnLimit(n)), 10)`
+instead of the old hard-coded `"0"`.
+
+**Write side.** This is the interesting half. `planUpdate` (`internal/planner/
+planner.go`) already resolves `UPDATE pg_database SET datconnlimit = ... WHERE
+...` without complaint — `pg_database.View == nil`, so it never enters the
+view-rewrite branch, and nothing in the generic single-table UPDATE path
+checks `Table.Virtual`. The WHERE/SET expressions resolve against
+`pg_database`'s ordinary `Columns` list exactly like a real table's. The
+problem was purely on the *execution* side: `updateOp.Next()`
+(`internal/executor/operators_storage.go`) unconditionally calls
+`ctx.Catalog.RelFileNode(tbl)` and scans physical heap pages through that
+relation file — `pg_database` has none, so the scan silently produced zero
+matching rows (`UPDATE 0`, no error) and the SET never ran.
+
+Fixed by adding `updateOp.nextVirtualPgDatabase()`: `Next()` now checks
+`tbl.Virtual && tbl.Schema == "pg_catalog" && tbl.Name == "pg_database"` right
+after setting `o.done = true`, and if true routes here instead of the ~1300
+lines of physical-heap logic below (`MaterializeWriterXID`, `RelFileNode`,
+B-tree/SeqScan matching, WAL emission, MVCC tuple headers — none of it applies
+to a table with no storage). The helper:
+
+1. Reads `tbl.VirtualRows()` — the exact same rows a `SELECT * FROM
+   pg_database` would see.
+2. Decodes each cell into a typed `Row` via `planner.TypedVirtualCell` (the
+   identical helper `rematerialiseVirtualRows` uses for the SELECT-side
+   `Values`/`VirtualSource` path in `operators.go`), so `evalExpr` can run
+   the already-extracted `o.pred` (the WHERE clause `extractScan` pulled out
+   of the plan's `Child` at construction time) against real typed values —
+   the WHERE-matching logic is not duplicated, only its data source changes.
+3. For matched rows, evaluates `o.plan.Set[connLimitOrdinal]` (also already
+   resolved by the generic planner path — no special planner code needed) and
+   calls `SetDatabaseConnLimit`.
+4. Rejects (`0A000`) any `SET` targeting a column other than `datconnlimit` —
+   silently discarding an unsupported column's write would be worse than
+   refusing it outright.
+
+The special-case is scoped to `pg_database` specifically, not every `Virtual`
+table — generalizing the Child-scan/write substitution to arbitrary system
+catalogs was avoided to keep blast radius low; other Virtual tables' `UPDATE`
+statements keep today's existing (silent, 0-rows-affected) behavior unchanged.
+
+**Test.** `TestPort_PgAmcheck002Nonesuch`'s "Invalid / partially dropped
+database" section is now ported (was `NOT PORTED`/deferred) — both
+`command_checks_all` cases (`--database regression_invalid` and `--table
+regression_invalid.public.foo`) run against the real `pg_amcheck` binary and
+assert the exact upstream `no connectable databases to check matching "..."`
+error. Confirmed non-vacuous via `git stash` on the catalog/executor changes
+(fails with the pre-fix `skipping database "regression_invalid": amcheck is
+not installed` symptom). **002_nonesuch.pl (AC-002) is now fully ported with
+no remaining residuals.**
+
+**Still deferred** (recorded in `.ralph/deferral_ledger.md`, M0119-0006 AC-002
+residual #1 row): (1) connect-time enforcement — a client can still actually
+open a session against a `datconnlimit = -2` database; goopg's connection
+startup never consults `DatabaseConnLimit`, only database registration/
+`datallowconn`. Real PG rejects the connection itself. (2) Positive
+`datconnlimit` values (real per-database connection-count throttling) are
+entirely unimplemented — only the `-2` sentinel's SQL-visibility half was
+needed for AC-002.

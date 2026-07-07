@@ -1879,8 +1879,52 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       … `005_opclass_damage`; `CREATE EXTENSION amcheck` + `verify_heapam()` SRF on
       top of `internal/amcheck` + opclass catalog parity. Largest open cluster
       (~29 ledger rows): index AMs, `box`/`int4range`/`int4[]` types, STORAGE
-      EXTERNAL TOAST corruption, the heapallindexed heap-scan producer, and the
-      `datconnlimit = -2` invalid-DB filter (runtime shared-catalog write).
+      EXTERNAL TOAST corruption, and the heapallindexed heap-scan producer.
+      **2026-07-07: 002_nonesuch's last residual (`datconnlimit = -2` invalid-DB
+      filter) FIXED and PORTED** (M-NIGHTLY AI-20260707-000712-004 follow-up):
+      `catalog.InMemory` gained a runtime `datconnlimit` override —
+      `databaseConnLimit map[string]int32` +
+      `SetDatabaseConnLimit`/`DatabaseConnLimit` (catalog.go), read by
+      `pg_database`'s `VirtualRows` builder instead of the old hard-coded `"0"`.
+      The write side needed more than the catalog method: `UPDATE pg_database
+      SET datconnlimit = ...` planned through the ordinary `planUpdate`/`*planner.
+      Update` path with no error (WHERE/SET resolve fine against `pg_database`'s
+      column list even though it's `Virtual`), but `updateOp.Next()`'s physical
+      path always reported 0 rows affected — pg_database has no RelFileNode/heap
+      pages to scan, so the normal SeqScan-based child found nothing. Added
+      `updateOp.nextVirtualPgDatabase()` (`internal/executor/operators_storage.go`):
+      when `Table.Virtual && Schema=="pg_catalog" && Name=="pg_database"`,
+      `Next()` routes here instead of the ~1300-line physical-heap path — reads
+      current rows straight from `tbl.VirtualRows()` (typed via the same
+      `planner.TypedVirtualCell` helper the SELECT-side `Values`/`VirtualSource`
+      path already uses), evaluates the extracted `o.pred`/`o.plan.Set` against
+      them exactly like the physical path would, and persists via
+      `SetDatabaseConnLimit`. Scoped deliberately narrow (pg_database only, not
+      every `Virtual` table) to keep blast radius low; any `SET` column other
+      than `datconnlimit` errors 0A000 rather than silently discarding the
+      write. Ported the previously-deferred 002_nonesuch.pl section
+      (`internal/testport/pgamcheck002_port_test.go`, "Invalid / partially
+      dropped database won't be targeted") — both `command_checks_all` cases
+      (bare `--database regression_invalid` and `--table
+      regression_invalid.public.foo`) now assert the real upstream `no
+      connectable databases to check matching ...` error via the live
+      `pg_amcheck` binary. **002_nonesuch.pl (AC-002) is now FULLY ported, no
+      residuals remain.** Confirmed non-vacuous via `git stash` (fails with the
+      pre-fix `skipping database ... amcheck is not installed` symptom without
+      the two impl files). CSV row AC-002 rationale updated (also fixed a
+      latent CSV-quoting bug this same edit would have introduced —
+      unescaped commas in an unquoted rationale field broke `encoding/csv`
+      field-count parsing; rewrote with em-dashes, matching the row's existing
+      house style) + regenerated `postgres-oracle-port-status.md`. Gates: `go
+      build ./...`/`go vet` clean; `go test ./internal/executor/...
+      ./internal/catalog/... ./internal/planner/... ./internal/initdb/...`
+      PASS; `TestPort_PgAmcheck002Nonesuch`/`TestPort_PgAmcheck001Basic` PASS
+      (other `TestPort_PgAmcheck0*` tests skip on a pre-existing, unrelated
+      TOAST-file gap); `TestPort_PgDumpConnectionSetup`/
+      `TestPort_IsolationEvalPlanQual`/`TestPort_IsolationEvalPlanQualTrigger`
+      PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed, all 3 workloads).
 - [ ] **M0119-0007 — pg_basebackup recvlogical** (source: M0095-0003). `030 recvlogical`
       — blocked on logical decoding (tracks the logical-replication milestone / D-004).
 
