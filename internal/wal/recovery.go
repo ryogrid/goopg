@@ -6127,13 +6127,30 @@ type CreateIndexPayload struct {
 	Columns  []string
 	Unique   bool
 	Primary  bool
+	// ColDescending / ColNullsFirst carry the per-key-column ASC/DESC +
+	// NULLS FIRST/LAST ordering (mirrors upstream's pg_index.indoption
+	// bitmask) so a restart-triggered replay of this record restores the
+	// exact same catalog.Index.ColDescending/ColNullsFirst state the live
+	// CREATE INDEX produced, instead of silently defaulting every column
+	// to ascending/NULLS LAST. Parallel to Columns; index i describes
+	// Columns[i].
+	ColDescending []bool
+	ColNullsFirst []bool
 }
 
 // EncodeCreateIndex encodes a CREATE INDEX event (M0079-0001).
 // Format documented at the RecordKindCreateIndex constant.
+//
+// ColDescending/ColNullsFirst (M0122-0006) are appended as two trailing
+// numCols-byte blocks AFTER the column name list, deliberately NOT
+// interleaved with each column's bytes: this keeps the format
+// append-only, so DecodeCreateIndex can still read a pre-M0122-0006 WAL
+// record (which simply lacks the trailing blocks — e.g. an existing
+// on-disk cluster's history) without misparsing column name bytes as
+// order flags.
 func EncodeCreateIndex(p CreateIndexPayload) []byte {
 	const headerSize = 1 + 4 + 4 + 1 + 1 + 2 + 2 + 2 + 2
-	totalLen := headerSize + len(p.Schema) + len(p.Name) + len(p.Method)
+	totalLen := headerSize + len(p.Schema) + len(p.Name) + len(p.Method) + 2*len(p.Columns)
 	for _, c := range p.Columns {
 		totalLen += 2 + len(c)
 	}
@@ -6159,6 +6176,18 @@ func EncodeCreateIndex(p CreateIndexPayload) []byte {
 		binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(c)))
 		off += 2
 		off += copy(out[off:], c)
+	}
+	for i := range p.Columns {
+		if i < len(p.ColDescending) && p.ColDescending[i] {
+			out[off] = 1
+		}
+		off++
+	}
+	for i := range p.Columns {
+		if i < len(p.ColNullsFirst) && p.ColNullsFirst[i] {
+			out[off] = 1
+		}
+		off++
 	}
 	return out
 }
@@ -6204,6 +6233,30 @@ func DecodeCreateIndex(payload []byte) (CreateIndexPayload, error) {
 		}
 		p.Columns = append(p.Columns, string(payload[off:off+colLen]))
 		off += colLen
+	}
+	// ColDescending/ColNullsFirst (M0122-0006) are two trailing numCols-byte
+	// blocks appended AFTER the column list — append-only so a pre-existing
+	// on-disk WAL record predating this field (which simply ends here, with
+	// no trailing blocks) still decodes: every column defaults to
+	// ascending/NULLS LAST, matching its actual pre-M0122-0006 behavior.
+	p.ColDescending = make([]bool, numCols)
+	p.ColNullsFirst = make([]bool, numCols)
+	switch remaining := len(payload) - off; remaining {
+	case 0:
+		// Pre-M0122-0006 record: no trailing blocks at all. Valid — every
+		// column defaults to ascending/NULLS LAST, matching its actual
+		// pre-M0122-0006 behavior.
+	case 2 * numCols:
+		for i := 0; i < numCols; i++ {
+			p.ColDescending[i] = payload[off] != 0
+			off++
+		}
+		for i := 0; i < numCols; i++ {
+			p.ColNullsFirst[i] = payload[off] != 0
+			off++
+		}
+	default:
+		return CreateIndexPayload{}, fmt.Errorf("wal: create-index payload truncated in trailing order blocks (have %d trailing bytes, want 0 or %d)", remaining, 2*numCols)
 	}
 	return p, nil
 }

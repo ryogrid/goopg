@@ -1129,6 +1129,7 @@ type PGIndexRow struct {
 	IndKey       []int16 // attnum values for each indexed column
 	IndIsUnique  bool    // indisunique
 	IndIsPrimary bool    // indisprimary
+	IndOption    []int16 // per-key ASC/DESC + NULLS FIRST/LAST bitmask (INDOPTION_DESC=0x1, INDOPTION_NULLS_FIRST=0x2)
 }
 
 const (
@@ -1180,7 +1181,59 @@ func DecodePGIndexPhysicalRow(data []byte) (PGIndexRow, error) {
 	for i := range r.IndKey {
 		r.IndKey[i] = int16(binary.LittleEndian.Uint16(blob[vectorHdrSize+2*i : vectorHdrSize+2*i+2]))
 	}
+
+	// indcollation, indclass, and indoption follow indkey as three more
+	// 4-byte-aligned varlena columns (oidvector, oidvector, int2vector —
+	// see pgIndexColumnsPG18). Walk past the first two (their content
+	// isn't needed here) to reach indoption, which carries the per-key
+	// ASC/DESC + NULLS FIRST/LAST ordering (INDOPTION_DESC=0x1,
+	// INDOPTION_NULLS_FIRST=0x2) — without decoding it, an index's
+	// declared column ordering silently reverted to all-ascending on
+	// every restart (M0122-0006). Any decode failure below is treated as
+	// "no indoption available" rather than a hard error, since the fields
+	// already decoded above remain valid on their own.
+	off := pgIndexAlign4(pgIndexOffIndKey + needed)
+	for i := 0; i < 2; i++ { // indcollation, indclass
+		total, ok := pgVarlenaTotalLen(data, off)
+		if !ok {
+			return r, nil
+		}
+		off = pgIndexAlign4(off + total)
+	}
+	if len(data) < off+vectorHdrSize {
+		return r, nil
+	}
+	optBlob := data[off:]
+	m := int(binary.LittleEndian.Uint32(optBlob[16:20]))
+	if m < 0 || m > 1024 || len(optBlob) < vectorHdrSize+2*m {
+		return r, nil
+	}
+	r.IndOption = make([]int16, m)
+	for i := range r.IndOption {
+		r.IndOption[i] = int16(binary.LittleEndian.Uint16(optBlob[vectorHdrSize+2*i : vectorHdrSize+2*i+2]))
+	}
 	return r, nil
+}
+
+// pgIndexAlign4 rounds off up to the next 4-byte boundary, matching
+// PostgreSQL's 'i' (int) alignment applied between successive varlena
+// attributes (oidvector/int2vector) in a physical heap tuple.
+func pgIndexAlign4(off int) int {
+	return (off + 3) &^ 3
+}
+
+// pgVarlenaTotalLen reads a 4-byte-uncompressed varlena header's total
+// byte length (vl_len_>>2) at data[off:], returning ok=false if the
+// header is out of range or the header itself doesn't fit.
+func pgVarlenaTotalLen(data []byte, off int) (int, bool) {
+	if off < 0 || len(data) < off+4 {
+		return 0, false
+	}
+	total := int(binary.LittleEndian.Uint32(data[off:off+4]) >> 2)
+	if total < 4 || off+total > len(data) {
+		return 0, false
+	}
+	return total, true
 }
 
 // PGStatisticRow holds the fields from pg_statistic needed for in-memory

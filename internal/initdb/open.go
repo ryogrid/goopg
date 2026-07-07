@@ -2908,6 +2908,7 @@ func loadUserIndexesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *
 		indexRelid uint32
 		indRelid   uint32
 		indKey     []int16
+		indOption  []int16
 		isUnique   bool
 		isPrimary  bool
 	}
@@ -2941,6 +2942,7 @@ func loadUserIndexesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *
 					indexRelid: row.IndexRelid,
 					indRelid:   row.IndRelid,
 					indKey:     row.IndKey,
+					indOption:  row.IndOption,
 					isUnique:   row.IndIsUnique,
 					isPrimary:  row.IndIsPrimary,
 				}
@@ -2959,13 +2961,23 @@ func loadUserIndexesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *
 		if !ok {
 			continue
 		}
-		// Map attnum → column name.
+		// Map attnum → column name, carrying each column's ASC/DESC + NULLS
+		// FIRST/LAST ordering (indoption, M0122-0006) along in lockstep so a
+		// filtered-out attnum doesn't desynchronize the two slices.
 		colNames := make([]string, 0, len(pgIdx.indKey))
-		for _, attnum := range pgIdx.indKey {
+		colDescending := make([]bool, 0, len(pgIdx.indKey))
+		colNullsFirst := make([]bool, 0, len(pgIdx.indKey))
+		for i, attnum := range pgIdx.indKey {
 			if attnum <= 0 || int(attnum) > len(tbl.Columns) {
 				continue
 			}
 			colNames = append(colNames, tbl.Columns[attnum-1].Name)
+			var opt int16
+			if i < len(pgIdx.indOption) {
+				opt = pgIdx.indOption[i]
+			}
+			colDescending = append(colDescending, opt&0x0001 != 0)
+			colNullsFirst = append(colNullsFirst, opt&0x0002 != 0)
 		}
 		if len(colNames) == 0 {
 			continue
@@ -2981,7 +2993,7 @@ func loadUserIndexesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *
 			// its schema.
 			schema = name
 		}
-		cat.RegisterIndexDuringRecovery(schema, ir.name, pgIdx.indRelid, colNames, pgIdx.isUnique, "btree", pgIdx.isPrimary, ir.oid)
+		cat.RegisterIndexDuringRecovery(schema, ir.name, pgIdx.indRelid, colNames, pgIdx.isUnique, "btree", pgIdx.isPrimary, ir.oid, colDescending, colNullsFirst)
 		// Restore fillfactor/deduplicate_items/fastupdate/gin_pending_list_limit/
 		// pages_per_range/autosummarize from the heap-persisted pg_class row —
 		// without this they silently revert to defaults across every restart

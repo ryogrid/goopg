@@ -3072,7 +3072,32 @@ mirroring M0119's ledger `status` column.
       ledger for a fresh open (`status = -`) row.
 - [ ] **M0122-0006 — On-disk catalog persistence & shared catalogs** (~8).
       Persistent `pg_index` heap, index column order (ASC/DESC/NULLS) across
-      restart, `pg_tablespace` visibility, `pg_database.datconnlimit` write.
+      restart, `pg_tablespace` visibility, `pg_database.datconnlimit` write
+      (the last **done**, M0119-0006 2026-07-07 note above).
+      **Index column order (ASC/DESC/NULLS) across restart — done
+      (2026-07-08, this loop):** fixed a 3-part gap (live `pg_index.
+      indoption` virtual builder, heap-persisted shadow row encode+decode,
+      and — the actual crash-durability bug, only reproducible via a true
+      uncheckpointed `SIGKILL` — the CREATE INDEX WAL record being emitted
+      before the ordering was set on the in-memory index). Design:
+      `docs/design/0122-0006-index-column-order-restart-persistence.md`;
+      `docs/design/README.md` new row. Deferred (ledger row, 2026-07-08):
+      `wal.CreateIndexPayload` still doesn't carry predicate/INCLUDE
+      columns/opclass/collation/fillfactor/dedup, a wider version of the
+      same bug for those fields. Gates: `go build ./...`/`go vet ./...`
+      clean; `go test ./internal/wal/... ./internal/initdb/...
+      ./internal/catalog/... ./internal/executor/... ./internal/planner/...
+      ./internal/analyzer/... ./internal/parser/...` PASS; `go test -short
+      ./...` (excluding tpch/testport) PASS; `scripts/tpch-spotcheck.sh`
+      PASS (Q12=2/Q13=33 — also the regression test for the WAL
+      backward-compat fix, which failed before it against
+      `bench/tpch/runtime_goopg/data`'s pre-existing WAL history);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed, all 3 workloads); live end-to-end verification against the
+      real `cmd/goopg` binary with an actual `kill -9` crash. Still open in
+      this cluster: `pg_index` persistent heap (partially covered by the
+      above but the bullet's original framing — a fuller pg_index heap
+      story — may still have residuals), `pg_tablespace` visibility.
 - [ ] **M0122-0007 — DDL / admin commands / ctl / GUC config** (~14). CREATE/DROP
       DATABASE full DDL, `goopg ctl restart`, REINDEX, SIGHUP config reload,
       tablespaces, ALTER FUNCTION/COLUMN, planner/jit GUC stubs.

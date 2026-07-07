@@ -1071,7 +1071,23 @@ func buildUserPGIndexRow(idx *catalog.Index) Row {
 		}
 	}
 	zeros32 := make([]uint32, n)
-	zeros16 := make([]int16, n)
+
+	// indoption: per-key ASC/DESC + NULLS FIRST/LAST bitmask, mirroring
+	// upstream's INDOPTION_DESC (0x1) / INDOPTION_NULLS_FIRST (0x2). Lost
+	// without this (M0122-0006): pg_get_indexdef/\d/pg_dump would silently
+	// render every index as plain ascending regardless of its declared
+	// column ordering.
+	indoption := make([]int16, n)
+	for i := 0; i < n; i++ {
+		var bits int16
+		if i < len(idx.ColDescending) && idx.ColDescending[i] {
+			bits |= 0x0001
+		}
+		if i < len(idx.ColNullsFirst) && idx.ColNullsFirst[i] {
+			bits |= 0x0002
+		}
+		indoption[i] = bits
+	}
 
 	return Row{
 		NewIntDatum(int64(idx.OID)),               // indexrelid
@@ -1092,7 +1108,7 @@ func buildUserPGIndexRow(idx *catalog.Index) Row {
 		NewBytesDatum(pgInt2VectorBytes(attnums)), // indkey
 		NewBytesDatum(pgOIDVectorBytes(zeros32)),  // indcollation
 		NewBytesDatum(pgOIDVectorBytes(zeros32)),  // indclass
-		NewBytesDatum(pgInt2VectorBytes(zeros16)), // indoption
+		NewBytesDatum(pgInt2VectorBytes(indoption)), // indoption
 		NullDatum, // indexprs (NULL)
 		NullDatum, // indpred  (NULL)
 	}

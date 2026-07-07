@@ -2937,7 +2937,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			if nc.ExclusionOp == "=" && strings.ToLower(nc.Method) == "btree" {
 				// btree equality exclusion == unique constraint: build a real btree
 				// so checkExclusionConstraintsForInsert can probe it at INSERT time.
-				if err := o.createBTreeIndex(s.Pos(), idxName, tbl, nc.Columns, nil, false, false, false); err != nil {
+				if err := o.createBTreeIndex(s.Pos(), idxName, tbl, nc.Columns, nil, false, false, false, nil, nil); err != nil {
 					return err
 				}
 				if idx, ok2 := o.ctx.Catalog.LookupIndex(idxName); ok2 {
@@ -2963,7 +2963,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			continue
 		}
 		primary := nc.IsPrimary
-		if err := o.createBTreeIndex(s.Pos(), idxName, tbl, nc.Columns, nil, true, primary, nc.NullsNotDistinct); err != nil {
+		if err := o.createBTreeIndex(s.Pos(), idxName, tbl, nc.Columns, nil, true, primary, nc.NullsNotDistinct, nil, nil); err != nil {
 			return err
 		}
 		if idx, ok := o.ctx.Catalog.LookupIndex(idxName); ok {
@@ -3030,7 +3030,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	}
 	if len(pkCols) > 0 && !namedPKCreated {
 		idxName := parser.ObjectName{Schema: s.Name.Schema, Name: tbl.Name + "_pkey"}
-		if err := o.createBTreeIndex(s.Pos(), idxName, tbl, pkCols, nil, true, true, false); err != nil {
+		if err := o.createBTreeIndex(s.Pos(), idxName, tbl, pkCols, nil, true, true, false, nil, nil); err != nil {
 			// Propagate B-tree index errors (e.g. unsupported key type).
 			// This makes CREATE TABLE fail cleanly rather than silently creating
 			// a table without its primary key constraint.
@@ -3061,7 +3061,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				idxBaseName = c.UniqueConstraintName
 			}
 			idxName := parser.ObjectName{Schema: s.Name.Schema, Name: idxBaseName}
-			if err := o.createBTreeIndex(s.Pos(), idxName, tbl, []string{c.Name}, nil, true, false, c.UniqueNullsNotDistinct); err != nil {
+			if err := o.createBTreeIndex(s.Pos(), idxName, tbl, []string{c.Name}, nil, true, false, c.UniqueNullsNotDistinct, nil, nil); err != nil {
 				return err
 			}
 			if idx, ok := o.ctx.Catalog.LookupIndex(idxName); ok {
@@ -3085,7 +3085,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		}
 		idxName := parser.ObjectName{Schema: s.Name.Schema, Name: o.autoIndexNameWithIncludes(tbl, cols, inclCols, "key")}
 		tableUniqueNND := i < len(s.TableUniqueNullsNotDistinct) && s.TableUniqueNullsNotDistinct[i]
-		if err := o.createBTreeIndex(s.Pos(), idxName, tbl, cols, nil, true, false, tableUniqueNND); err != nil {
+		if err := o.createBTreeIndex(s.Pos(), idxName, tbl, cols, nil, true, false, tableUniqueNND, nil, nil); err != nil {
 			return err
 		}
 		if idx, ok := o.ctx.Catalog.LookupIndex(idxName); ok {
@@ -3115,7 +3115,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		ec.Name = name
 		idxName := parser.ObjectName{Schema: s.Name.Schema, Name: name}
 		if ec.ExclusionOp == "=" && strings.ToLower(ec.Method) == "btree" {
-			if err := o.createBTreeIndex(s.Pos(), idxName, tbl, ec.Columns, nil, false, false, false); err != nil {
+			if err := o.createBTreeIndex(s.Pos(), idxName, tbl, ec.Columns, nil, false, false, false, nil, nil); err != nil {
 				return err
 			}
 			if idx, ok := o.ctx.Catalog.LookupIndex(idxName); ok {
@@ -3140,7 +3140,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	// Create btree indexes for LIKE INCLUDING INDEXES unique (non-PK) indexes.
 	for _, idx := range likeUniqueIndexes {
 		idxName := parser.ObjectName{Schema: s.Name.Schema, Name: tbl.Name + "_" + strings.Join(idx.Columns, "_") + "_key"}
-		if err := o.createBTreeIndex(s.Pos(), idxName, tbl, idx.Columns, nil, true, false, idx.NullsNotDistinct); err != nil {
+		if err := o.createBTreeIndex(s.Pos(), idxName, tbl, idx.Columns, nil, true, false, idx.NullsNotDistinct, nil, nil); err != nil {
 			return err
 		}
 	}
@@ -3167,7 +3167,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			}
 		}
 		idxName := parser.ObjectName{Schema: s.Name.Schema, Name: o.autoIndexNameWithIncludes(tbl, nameCols, nil, "idx")}
-		if err := o.createBTreeIndex(s.Pos(), idxName, tbl, idx.Columns, colExprs, false, false, false); err != nil {
+		if err := o.createBTreeIndex(s.Pos(), idxName, tbl, idx.Columns, colExprs, false, false, false, nil, nil); err != nil {
 			continue // skip indexes with unsupported expression types
 		}
 	}
@@ -3935,7 +3935,7 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 			}
 			childIdxName = parser.ObjectName{Schema: s.Name.Schema, Name: tbl.Name + suffix}
 		}
-		if err := o.createBTreeIndex(s.Pos(), childIdxName, tbl, parentIdx.Columns, nil, parentIdx.Unique, parentIdx.Primary, parentIdx.NullsNotDistinct); err != nil {
+		if err := o.createBTreeIndex(s.Pos(), childIdxName, tbl, parentIdx.Columns, nil, parentIdx.Unique, parentIdx.Primary, parentIdx.NullsNotDistinct, parentIdx.ColDescending, parentIdx.ColNullsFirst); err != nil {
 			return err
 		}
 	}
@@ -3944,7 +3944,7 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 	// M0097-0028.
 	for _, colName := range poc.UniqueColumns {
 		childIdxName := parser.ObjectName{Schema: s.Name.Schema, Name: tbl.Name + "_" + colName + "_key"}
-		if err := o.createBTreeIndex(s.Pos(), childIdxName, tbl, []string{colName}, nil, true, false, false); err != nil {
+		if err := o.createBTreeIndex(s.Pos(), childIdxName, tbl, []string{colName}, nil, true, false, false, nil, nil); err != nil {
 			return err
 		}
 	}
@@ -3982,7 +3982,7 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 				}
 			}
 		}
-		if err := o.createBTreeIndex(s.Pos(), childIdxName, tbl, parentIdx.Columns, colExprs, false, false, false); err != nil {
+		if err := o.createBTreeIndex(s.Pos(), childIdxName, tbl, parentIdx.Columns, colExprs, false, false, false, nil, nil); err != nil {
 			return err
 		}
 		// Copy predicate (WHERE clause) and ColExprStrings from parent index.
@@ -5956,7 +5956,29 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 			resolvedPred = nil
 		}
 	}
-	if err := o.createBTreeIndex(s.Pos(), idxName, tbl, s.Columns, s.ColExprs, s.Unique, false, s.NullsNotDistinct, resolvedPred); err != nil {
+	// Store INCLUDE columns, partial index flag, predicate expression, and the
+	// per-column ASC/DESC + NULLS ordering. The ordering is recorded only when
+	// at least one column is non-default so a plain index keeps empty slices and
+	// dumps byte-identically. DU-002 slice 56. Computed BEFORE createBTreeIndex
+	// so the CREATE INDEX WAL record it emits captures the real ordering
+	// (M0122-0006) — setting idx.ColDescending/ColNullsFirst only AFTER that
+	// call, as a prior version of this function did, left the WAL payload
+	// permanently defaulted to ascending/NULLS-LAST on a genuine crash restart
+	// (no intervening checkpoint), even though the heap-persisted pg_index row
+	// was correctly resynced afterward by the block below.
+	nonDefaultOrder := indexHasNonDefaultOrder(s.ColOrders)
+	hasOpClass := indexHasOpClass(s.ColOrders)
+	hasCollation := indexHasCollation(s.ColOrders)
+	var colDescending, colNullsFirst []bool
+	if nonDefaultOrder {
+		colDescending = make([]bool, len(s.ColOrders))
+		colNullsFirst = make([]bool, len(s.ColOrders))
+		for i, ord := range s.ColOrders {
+			colDescending[i] = ord.Descending
+			colNullsFirst[i] = ord.NullsFirst
+		}
+	}
+	if err := o.createBTreeIndex(s.Pos(), idxName, tbl, s.Columns, s.ColExprs, s.Unique, false, s.NullsNotDistinct, colDescending, colNullsFirst, resolvedPred); err != nil {
 		return err
 	}
 	if declaredHash {
@@ -5968,13 +5990,6 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 			hidx.DeclaredHash = true
 		}
 	}
-	// Store INCLUDE columns, partial index flag, predicate expression, and the
-	// per-column ASC/DESC + NULLS ordering. The ordering is recorded only when
-	// at least one column is non-default so a plain index keeps empty slices and
-	// dumps byte-identically. DU-002 slice 56.
-	nonDefaultOrder := indexHasNonDefaultOrder(s.ColOrders)
-	hasOpClass := indexHasOpClass(s.ColOrders)
-	hasCollation := indexHasCollation(s.ColOrders)
 	if s.HasPredicate || len(s.IncludeColumns) > 0 || s.Predicate != nil || nonDefaultOrder || hasOpClass || hasCollation || s.NullsNotDistinct || s.Fillfactor != 0 || s.DeduplicateItems != nil {
 		if idx, ok := o.ctx.Catalog.LookupIndex(idxName); ok {
 			idx.HasPredicate = s.HasPredicate
@@ -5991,16 +6006,8 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 			// NULLS NOT DISTINCT (PG 15+) — record so pg_index.indnullsnotdistinct
 			// and pg_get_indexdef reproduce it for pg_dump. DU-002 slice 134.
 			idx.NullsNotDistinct = s.NullsNotDistinct
-			if nonDefaultOrder {
-				desc := make([]bool, len(s.ColOrders))
-				nullsFirst := make([]bool, len(s.ColOrders))
-				for i, ord := range s.ColOrders {
-					desc[i] = ord.Descending
-					nullsFirst[i] = ord.NullsFirst
-				}
-				idx.ColDescending = desc
-				idx.ColNullsFirst = nullsFirst
-			}
+			// ColDescending/ColNullsFirst are already set by createBTreeIndex
+			// above (before its WAL emission) — not repeated here.
 			// Non-default per-column operator class (pg_index.indclass) so
 			// pg_get_indexdef / pg_dump re-emit ` text_pattern_ops` after the
 			// column. DU-002 slice 312.
@@ -6109,7 +6116,7 @@ func (o *ddlOp) createPartitionChildIndexes(s *parser.CreateIndexStmt, parentTbl
 		}
 		// resolvedPred is a nil planner.Expr when there is no partial predicate;
 		// createBTreeIndex treats a nil predExpr[0] as "no predicate".
-		if err := o.createBTreeIndex(s.Pos(), childIdxName, childTbl, s.Columns, s.ColExprs, s.Unique, false, s.NullsNotDistinct, resolvedPred); err != nil {
+		if err := o.createBTreeIndex(s.Pos(), childIdxName, childTbl, s.Columns, s.ColExprs, s.Unique, false, s.NullsNotDistinct, parentIdx.ColDescending, parentIdx.ColNullsFirst, resolvedPred); err != nil {
 			return err
 		}
 		childIdx, ok2 := o.ctx.Catalog.LookupIndex(childIdxName)
@@ -7283,7 +7290,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					}
 					childIdxName = parser.ObjectName{Schema: childTbl.Schema, Name: childTbl.Name + suffix}
 				}
-				_ = o.createBTreeIndex(act.Pos(), childIdxName, childTbl, parentIdx.Columns, nil, parentIdx.Unique, parentIdx.Primary, parentIdx.NullsNotDistinct)
+				_ = o.createBTreeIndex(act.Pos(), childIdxName, childTbl, parentIdx.Columns, nil, parentIdx.Unique, parentIdx.Primary, parentIdx.NullsNotDistinct, parentIdx.ColDescending, parentIdx.ColNullsFirst)
 			}
 		case parser.AlterTableDetachPartition:
 			// ALTER TABLE parent DETACH PARTITION child — remove child from parent's
@@ -8733,7 +8740,7 @@ func (o *ddlOp) execAlterTableAddPrimaryKey(tbl *catalog.Table, act parser.Alter
 		name = tbl.Name + "_pkey"
 	}
 	idxName := parser.ObjectName{Schema: tbl.Schema, Name: name}
-	if err := o.createBTreeIndex(act.Pos(), idxName, tbl, act.Columns, nil, true, true, false); err != nil {
+	if err := o.createBTreeIndex(act.Pos(), idxName, tbl, act.Columns, nil, true, true, false, nil, nil); err != nil {
 		return err
 	}
 	if idx, ok := o.ctx.Catalog.LookupIndex(idxName); ok {
@@ -8965,7 +8972,7 @@ func (o *ddlOp) execAlterTableAddUnique(tbl *catalog.Table, act parser.AlterTabl
 		name = o.autoIndexNameWithIncludes(tbl, act.Columns, act.IncludeColumns, "key")
 	}
 	idxName := parser.ObjectName{Schema: tbl.Schema, Name: name}
-	if err := o.createBTreeIndex(act.Pos(), idxName, tbl, act.Columns, nil, true, false, false); err != nil {
+	if err := o.createBTreeIndex(act.Pos(), idxName, tbl, act.Columns, nil, true, false, false, nil, nil); err != nil {
 		return err
 	}
 	if idx, ok := o.ctx.Catalog.LookupIndex(idxName); ok {
@@ -9431,7 +9438,7 @@ func (o *ddlOp) createExclusionIndexStub(pos int, idxName parser.ObjectName, tbl
 	return nil
 }
 
-func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalog.Table, columns []string, colExprs []parser.Expr, unique bool, primary bool, nullsNotDistinct bool, predExpr ...planner.Expr) error {
+func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalog.Table, columns []string, colExprs []parser.Expr, unique bool, primary bool, nullsNotDistinct bool, colDescending, colNullsFirst []bool, predExpr ...planner.Expr) error {
 	if len(columns) == 0 {
 		return &ExecError{Code: "42601", Pos: pos, Message: "index must have at least one key column"}
 	}
@@ -9466,6 +9473,18 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 		}
 		return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
 	}
+	// Set the per-column ASC/DESC + NULLS ordering BEFORE the CREATE INDEX
+	// WAL record is built below (M0122-0006): the caller's own post-call
+	// resync block (execCreateIndex) used to set these fields on idx AFTER
+	// this function had already emitted its WAL payload, so a genuine
+	// crash restart (no intervening checkpoint) always replayed the index
+	// as plain ascending/NULLS-LAST regardless of its declared ordering,
+	// even though the heap-persisted pg_index row was already correctly
+	// resynced afterward — a WAL-vs-heap durability gap only a real,
+	// uncheckpointed SIGKILL exposed (a plain Runtime.Close() performs a
+	// shutdown checkpoint that masked it).
+	idx.ColDescending = colDescending
+	idx.ColNullsFirst = colNullsFirst
 	// Store parsed expressions for expression-based index columns so the
 	// planner and executor can evaluate them at conflict-detection time.
 	if len(colExprs) > 0 {
@@ -9512,14 +9531,16 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 	// recovery finishes.
 	if o.ctx.Pool != nil {
 		payload := wal.EncodeCreateIndex(wal.CreateIndexPayload{
-			OID:      idx.OID,
-			TableOID: tbl.OID,
-			Schema:   idxName.Schema,
-			Name:     idxName.Name,
-			Method:   "btree",
-			Columns:  append([]string(nil), columns...),
-			Unique:   unique,
-			Primary:  primary,
+			OID:           idx.OID,
+			TableOID:      tbl.OID,
+			Schema:        idxName.Schema,
+			Name:          idxName.Name,
+			Method:        "btree",
+			Columns:       append([]string(nil), columns...),
+			Unique:        unique,
+			Primary:       primary,
+			ColDescending: idx.ColDescending,
+			ColNullsFirst: idx.ColNullsFirst,
 		})
 		if _, err := o.ctx.Pool.LogChangeRecord(payload); err != nil {
 			// Best-effort: roll back the in-memory mutation so

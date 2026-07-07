@@ -70,6 +70,69 @@ func TestCreateIndexSurvivesRestartViaWAL(t *testing.T) {
 	}
 }
 
+// TestCreateIndexColumnOrderingSurvivesRestartViaWAL pins M0122-0006: an
+// index's per-column ASC/DESC + NULLS FIRST/LAST ordering (indoption) must
+// survive a crash restart via the CREATE INDEX WAL record, not silently
+// reset to all-ascending/NULLS-LAST. Companion to
+// TestCreateIndexSurvivesRestartViaWAL above, which only pinned
+// Unique/Method/Columns.
+//
+// Uses the TestCrashRecoveryReplaysWALAfterUncleanShutdown pattern (flush
+// WAL durable, then close WAL + StorageMgr directly WITHOUT Pool.Close) —
+// a plain `rt1.Close()` performs a synchronous shutdown checkpoint
+// (Runtime.Close, M0089-0002) that flushes the pg_index heap page too,
+// which lets `loadUserIndexesFromHeap` win the recovery race and can mask
+// a bug that's specific to the CREATE INDEX WAL payload's own
+// encode/decode, which only decides the outcome on a genuine unclean
+// shutdown (SIGKILL) where no checkpoint ran.
+func TestCreateIndexColumnOrderingSurvivesRestartViaWAL(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	if err := Init(Options{DataDir: dir}); err != nil {
+		t.Fatal(err)
+	}
+
+	rt1, err := Open(OpenOptions{DataDir: dir, PoolSlots: 64})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runDDL(t, rt1, "CREATE TABLE ord (a int4 NOT NULL, b int4 NOT NULL)")
+	// Explicit NULLS clauses on both columns, each overriding its type's
+	// default (DESC defaults to NULLS FIRST, ASC to NULLS LAST) so the
+	// assertions below can't pass by accident from unset zero values.
+	runDDL(t, rt1, "CREATE INDEX ord_idx ON ord (a DESC NULLS LAST, b ASC NULLS FIRST)")
+
+	// Simulate SIGKILL: force WAL durable, then close WAL + StorageMgr
+	// directly, dropping every dirty buffer-pool page (including the
+	// pg_index heap row) without a checkpoint.
+	if err := rt1.WAL.FlushUpTo(rt1.WAL.WrittenLSN()); err != nil {
+		t.Fatalf("FlushUpTo: %v", err)
+	}
+	if err := rt1.WAL.Close(); err != nil {
+		t.Fatalf("WAL.Close: %v", err)
+	}
+	if err := rt1.StorageMgr.Close(); err != nil {
+		t.Fatalf("StorageMgr.Close: %v", err)
+	}
+	rt1 = nil
+
+	rt2, err := Open(OpenOptions{DataDir: dir, PoolSlots: 64})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt2.Close()
+
+	idx, ok := rt2.Catalog.LookupIndex(parser.ObjectName{Name: "ord_idx"})
+	if !ok {
+		t.Fatal("ord_idx not found after restart — WAL-driven index recovery failed")
+	}
+	if len(idx.ColDescending) != 2 || !idx.ColDescending[0] || idx.ColDescending[1] {
+		t.Errorf("recovered ColDescending=%v, want [true false]", idx.ColDescending)
+	}
+	if len(idx.ColNullsFirst) != 2 || idx.ColNullsFirst[0] || !idx.ColNullsFirst[1] {
+		t.Errorf("recovered ColNullsFirst=%v, want [false true]", idx.ColNullsFirst)
+	}
+}
+
 // TestDropIndexSurvivesRestartViaWAL pins the symmetric DROP
 // path: a CREATE INDEX followed by DROP INDEX must NOT
 // resurrect the index from WAL on restart. (M0079-0001.)

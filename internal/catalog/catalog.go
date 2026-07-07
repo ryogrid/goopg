@@ -5250,6 +5250,8 @@ func (c *InMemory) RegisterIndexDuringRecovery(
 	method string,
 	primary bool,
 	oid uint32,
+	colDescending []bool,
+	colNullsFirst []bool,
 ) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -5286,14 +5288,16 @@ func (c *InMemory) RegisterIndexDuringRecovery(
 	}
 	k := key(parser.ObjectName{Schema: schema, Name: name})
 	idx := &Index{
-		Schema:  schema,
-		Name:    name,
-		Table:   tbl,
-		Columns: append([]string(nil), cols...),
-		Unique:  unique,
-		Method:  strings.ToLower(method),
-		Primary: primary,
-		OID:     oid,
+		Schema:        schema,
+		Name:          name,
+		Table:         tbl,
+		Columns:       append([]string(nil), cols...),
+		Unique:        unique,
+		Method:        strings.ToLower(method),
+		Primary:       primary,
+		OID:           oid,
+		ColDescending: append([]bool(nil), colDescending...),
+		ColNullsFirst: append([]bool(nil), colNullsFirst...),
 	}
 	c.indexes[k] = idx
 	if c.byTable[tbl.OID] == nil {
@@ -7679,7 +7683,7 @@ func (c *InMemory) registerSystemTables() {
 			}
 			natts := len(idx.Columns) + len(idx.IncludeColumns)
 			nkeyatts := len(idx.Columns)
-			// Build space-separated zero-vector for indcollation/indoption.
+			// Build space-separated zero-vector for indcollation.
 			buildZeroVec := func(n int) string {
 				if n <= 0 {
 					return ""
@@ -7690,6 +7694,23 @@ func (c *InMemory) registerSystemTables() {
 				}
 				return strings.Join(parts, " ")
 			}
+			// indoption: per-key ASC/DESC + NULLS FIRST/LAST bitmask, mirroring
+			// upstream's INDOPTION_DESC (0x1) / INDOPTION_NULLS_FIRST (0x2).
+			// M0122-0006: this live pg_index query path previously always
+			// rendered an all-zero vector (buildZeroVec) regardless of the
+			// index's declared column ordering.
+			indoptionParts := make([]string, nkeyatts)
+			for i := range indoptionParts {
+				var bits int
+				if i < len(idx.ColDescending) && idx.ColDescending[i] {
+					bits |= 0x0001
+				}
+				if i < len(idx.ColNullsFirst) && idx.ColNullsFirst[i] {
+					bits |= 0x0002
+				}
+				indoptionParts[i] = fmt.Sprintf("%d", bits)
+			}
+			indoption := strings.Join(indoptionParts, " ")
 			out = append(out, []string{
 				fmt.Sprintf("%d", idx.OID),       // indexrelid
 				fmt.Sprintf("%d", idx.Table.OID), // indrelid
@@ -7709,7 +7730,7 @@ func (c *InMemory) registerSystemTables() {
 				indkey,                           // indkey
 				buildZeroVec(nkeyatts),           // indcollation
 				indclass,                         // indclass
-				buildZeroVec(nkeyatts),           // indoption
+				indoption,                        // indoption
 				"",                               // indexprs (NULL)
 				"",                               // indpred (NULL)
 				"",                               // indcoloptions (NULL)
