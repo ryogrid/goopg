@@ -3778,7 +3778,7 @@ func (p *parser) parseWindowDef() (*WindowDef, error) {
 	if p.cur().Kind == TokenIdent || p.cur().Kind == TokenQuotedIdent {
 		name := p.cur().Value
 		p.advance()
-		return &WindowDef{pos: t.Pos, RefName: name}, nil
+		return &WindowDef{pos: t.Pos, RefName: name, IsBareRef: true}, nil
 	}
 	return nil, p.errAtCur("expected '(' or window name after OVER")
 }
@@ -3791,6 +3791,20 @@ func (p *parser) parseWindowDef() (*WindowDef, error) {
 // consumed the opening `(`; pos is the position to stamp on the result.
 func (p *parser) parseWindowSpecBody(pos int) (*WindowDef, error) {
 	wd := &WindowDef{pos: pos}
+	// Optional existing_window_name (SQL:2008 7.11 <window clause> syntax
+	// rule 10 / gram.y's opt_existing_window_name): a bare identifier
+	// immediately after '(' that isn't one of the frame-mode words, which
+	// must stay available to parseFrameClause below (mirrors gram.y's
+	// PARTITION/RANGE/ROWS/GROUPS precedence trick — those unreserved
+	// keywords are never taken as an existing_window_name). Merging against
+	// the referenced window (partition/order/frame override rules) happens
+	// later in the analyzer, once all named windows are visible.
+	if t := p.cur(); t.Kind == TokenQuotedIdent ||
+		(t.Kind == TokenIdent && !strings.EqualFold(t.Value, "rows") &&
+			!strings.EqualFold(t.Value, "range") && !strings.EqualFold(t.Value, "groups")) {
+		wd.RefName = t.Value
+		p.advance()
+	}
 	if p.acceptKeyword(KwPartition) {
 		if _, err := p.expectKeyword(KwBy); err != nil {
 			return nil, err

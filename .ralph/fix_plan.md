@@ -2696,11 +2696,56 @@ mirroring M0119's ledger `status` column.
       build ./...` clean; `go test ./internal/executor/...
       ./internal/planner/... ./internal/parser/... ./internal/analyzer/...`
       PASS (no regressions); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33).
+      **Combining window forms landed (2026-07-07, this loop):**
+      `OVER (win_name ORDER BY ...)` and `WINDOW w2 AS (w1 ...)` now
+      implement SQL:2008 7.11's override rules (own PARTITION BY when
+      referencing a window is an error; own ORDER BY only allowed when
+      the referenced window has none; own frame clause always kept but
+      the referenced window having any frame clause at all is an error)
+      via a new `mergeWindowDef` (`internal/analyzer/analyzer.go`),
+      every case confirmed against a live PostgreSQL 18.3 instance
+      before being encoded as a test. Parser: `parseWindowSpecBody`
+      (`internal/parser/select.go`) now recognises an optional leading
+      `existing_window_name`, excluding the bare `rows`/`range`/`groups`
+      frame-mode words so `OVER (ROWS ...)` still parses as anonymous
+      (mirrors gram.y's IDENT-precedence disambiguation). Caught by the
+      pre-existing `TestCompatWindowExplicitRowsFrameSliding` compat
+      test (not a new one written for this slice): a parenthesis-free
+      `OVER name` is a *different* upstream shape (gram.y's `OVER ColId`)
+      resolved by direct winref alias with **no** override validation at
+      all, even when the referenced window has a frame clause — only
+      the parenthesized `OVER (name ...)` form goes through
+      `mergeWindowDef`. New `parser.WindowDef.IsBareRef bool`
+      distinguishes the two so the analyzer applies the right path.
+      Also fixed a bug the new merge path surfaced: the
+      undefined-window-name diagnostic was `42P20`
+      (`ERRCODE_WINDOWING_ERROR`); upstream uses `42704`
+      (`ERRCODE_UNDEFINED_OBJECT`) for that specific message — confirmed
+      against PostgreSQL 18.3, `TestAnalyzeNamedWindowUndefinedRejected`
+      updated accordingly. Also added a duplicate-WINDOW-name check
+      (`42P20`, previously entirely unchecked). Tests:
+      `internal/parser/window_test.go`'s
+      `TestParseWindowClauseOverCombiningForm`/
+      `TestParseWindowClauseNamedWindowBasedOnNamedWindow`/
+      `TestParseWindowClauseRefNameExcludesFrameModeWords`;
+      `internal/analyzer/analyzer_test.go`'s
+      `TestAnalyzeNamedWindowCombiningFormAccepted`/
+      `TestAnalyzeNamedWindowCombiningFormErrors`/
+      `TestAnalyzeNamedWindowBareRefToFramedWindowAccepted`;
+      `internal/executor/window_compat_test.go`'s
+      `TestCompatWindowCombiningForms`. Design:
+      `docs/design/0020-0001-window-parser-and-ast.md` new "Follow-up:
+      combining window forms" section; `docs/design/README.md` row
+      extended. Gates: `go build ./...`/`go vet` clean; `go test
+      ./internal/parser/... ./internal/analyzer/... ./internal/executor/...
+      ./internal/planner/...` PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke bash
+      scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 workloads).
       **Still open in this bucket:** RANGE/GROUPS window frame modes
-      (documented v0 scope limit), combining window forms, sub-day
-      intervals + multi-component interval strings (both the typed-literal
-      and cast paths now reject them identically, but neither supports
-      them — v0's `KindInterval` Datum has no sub-day field at all).
+      (documented v0 scope limit), sub-day intervals + multi-component
+      interval strings (both the typed-literal and cast paths now
+      reject them identically, but neither supports them — v0's
+      `KindInterval` Datum has no sub-day field at all).
 - [x] **M0122-0005 — Types / opclasses / casts / collation / domains** (~11).
       1-byte `char`(OID 18) disambiguation, `pg_collation_for`, function-based cast
       dumping, ALTER TYPE RENAME/OWNER, domain CHECK renderer, `pg_ts_config` OIDs.

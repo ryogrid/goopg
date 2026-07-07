@@ -165,6 +165,76 @@ func TestParseWindowClauseMultipleNamedWindows(t *testing.T) {
 	}
 }
 
+// TestParseWindowClauseOverCombiningForm — the M0122-0004 combining-forms
+// follow-up: `OVER (existing_window_name ...)` parses the leading bare
+// identifier as RefName (gram.y's opt_existing_window_name) while still
+// letting the referencing clause add its own ORDER BY. Merge validation
+// (e.g. rejecting an own PARTITION BY) is the analyzer's job — this test
+// only pins the parse shape.
+func TestParseWindowClauseOverCombiningForm(t *testing.T) {
+	stmts, err := Parse("SELECT rank() OVER (w ORDER BY aid) FROM t WINDOW w AS (PARTITION BY bid)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fc := stmts[0].(*SelectStmt).Targets[0].Expr.(*FuncCall)
+	if fc.Over == nil || fc.Over.RefName != "w" {
+		t.Fatalf("Over = %+v, want RefName %q", fc.Over, "w")
+	}
+	if len(fc.Over.OrderBy) != 1 {
+		t.Errorf("Over.OrderBy = %+v, want 1 own entry", fc.Over.OrderBy)
+	}
+	if len(fc.Over.PartitionBy) != 0 {
+		t.Errorf("Over.PartitionBy = %+v, want empty pre-resolution (inherited later)", fc.Over.PartitionBy)
+	}
+}
+
+// TestParseWindowClauseNamedWindowBasedOnNamedWindow — a `WINDOW` clause
+// entry may itself reference an earlier entry (`w2 AS (w1 ORDER BY b)`),
+// the other combining-forms shape the M0122-0004 follow-up covers.
+func TestParseWindowClauseNamedWindowBasedOnNamedWindow(t *testing.T) {
+	stmts, err := Parse("SELECT row_number() OVER w2 FROM t WINDOW w1 AS (PARTITION BY a), w2 AS (w1 ORDER BY b)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := stmts[0].(*SelectStmt)
+	if len(s.WindowClause) != 2 {
+		t.Fatalf("WindowClause len = %d, want 2", len(s.WindowClause))
+	}
+	w2 := s.WindowClause[1].Def
+	if w2.RefName != "w1" {
+		t.Errorf("w2.RefName = %q, want %q", w2.RefName, "w1")
+	}
+	if len(w2.OrderBy) != 1 {
+		t.Errorf("w2.OrderBy = %+v, want 1 own entry", w2.OrderBy)
+	}
+}
+
+// TestParseWindowClauseRefNameExcludesFrameModeWords guards the
+// gram.y-mirrored disambiguation in parseWindowSpecBody: ROWS/RANGE/GROUPS
+// immediately after '(' must stay available to parseFrameClause and never
+// get misparsed as an existing_window_name, even though a bona fide window
+// name is parsed exactly the same way (a bare identifier).
+func TestParseWindowClauseRefNameExcludesFrameModeWords(t *testing.T) {
+	cases := []string{
+		"SELECT row_number() OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t",
+		"SELECT sum(x) OVER (RANGE UNBOUNDED PRECEDING) FROM t",
+		"SELECT sum(x) OVER (GROUPS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t",
+	}
+	for _, sql := range cases {
+		stmts, err := Parse(sql)
+		if err != nil {
+			t.Fatalf("Parse(%q) failed: %v", sql, err)
+		}
+		fc := stmts[0].(*SelectStmt).Targets[0].Expr.(*FuncCall)
+		if fc.Over.RefName != "" {
+			t.Errorf("%s: RefName = %q, want empty (frame-mode word must not be misparsed as existing_window_name)", sql, fc.Over.RefName)
+		}
+		if fc.Over.Frame == nil {
+			t.Errorf("%s: Frame = nil, want a parsed frame clause", sql)
+		}
+	}
+}
+
 // TestParseWindowFrameRowsBetweenOffsets — the general BETWEEN form
 // with two numeric offsets on both sides (M0122-0004 frame-clause
 // slice).

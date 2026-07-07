@@ -552,6 +552,17 @@ type WindowDef struct {
 	OrderBy     []SortBy
 	Frame       *WindowFrame
 	RefName     string
+	// IsBareRef is true only for the parenthesis-free `OVER window_name`
+	// form (gram.y's `over_clause: OVER ColId`), which is a transparent
+	// alias to that WINDOW-clause entry — PartitionBy/OrderBy/Frame are
+	// always empty here and the referenced window's fields are copied
+	// wholesale with no override validation. It is false for the
+	// parenthesized `OVER (window_name ...)` combining form (gram.y's
+	// `over_clause: OVER window_specification` with a leading
+	// opt_existing_window_name) and for every `WINDOW name AS (...)`
+	// clause entry, both of which go through mergeWindowDef's SQL:2008
+	// override rules even when they add no clauses of their own.
+	IsBareRef bool
 }
 
 // Pos returns the position of the leading `OVER` keyword.

@@ -103,6 +103,65 @@ func TestCompatWindowNamedWindowClause(t *testing.T) {
 	}
 }
 
+// TestCompatWindowCombiningForms — the M0122-0004 combining-forms
+// follow-up: an inline `OVER (win_name ORDER BY ...)` extending a named
+// window's PARTITION BY, and a named window built on top of another named
+// window, both compared byte-for-byte against the same spec written out
+// fully inline (same fixture/shape as TestCompatWindowNamedWindowClause).
+func TestCompatWindowCombiningForms(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE t (grp int, val int)"); err != nil {
+		t.Fatal(err)
+	}
+	tbl, _ := ctx.Catalog.LookupTable(parser.ObjectName{Name: "t"})
+	rel := ctx.Catalog.RelFileNode(tbl)
+	seed := []Row{
+		{{Kind: KindInt, Int: 1}, {Kind: KindInt, Int: 20}},
+		{{Kind: KindInt, Int: 1}, {Kind: KindInt, Int: 10}},
+		{{Kind: KindInt, Int: 1}, {Kind: KindInt, Int: 10}},
+		{{Kind: KindInt, Int: 2}, {Kind: KindInt, Int: 7}},
+		{{Kind: KindInt, Int: 2}, {Kind: KindInt, Int: 5}},
+	}
+	for _, r := range seed {
+		if err := writeHeapRow(ctx, rel, tbl.Columns, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	compare := func(sqlA, sqlB string) {
+		t.Helper()
+		a := runQuery(t, ctx, sqlA)
+		b := runQuery(t, ctx, sqlB)
+		if len(a) != len(b) {
+			t.Fatalf("%q rows=%d, %q rows=%d", sqlA, len(a), sqlB, len(b))
+		}
+		for i := range a {
+			for col := range a[i] {
+				if a[i][col].Format() != b[i][col].Format() {
+					t.Fatalf("row[%d] col[%d] = %+v, want %+v (from %q)", i, col, a[i][col], b[i][col], sqlB)
+				}
+			}
+		}
+	}
+
+	// Inline OVER combining form: adds its own ORDER BY to a
+	// PARTITION-BY-only named window.
+	compare(
+		"SELECT grp, val, row_number() OVER (w ORDER BY val) AS rn FROM t "+
+			"WINDOW w AS (PARTITION BY grp) ORDER BY grp, val, rn",
+		"SELECT grp, val, row_number() OVER (PARTITION BY grp ORDER BY val) AS rn FROM t "+
+			"ORDER BY grp, val, rn")
+
+	// Named window based on another named window.
+	compare(
+		"SELECT grp, val, rank() OVER w2 AS rk FROM t "+
+			"WINDOW w1 AS (PARTITION BY grp), w2 AS (w1 ORDER BY val) ORDER BY grp, val, rk",
+		"SELECT grp, val, rank() OVER (PARTITION BY grp ORDER BY val) AS rk FROM t "+
+			"ORDER BY grp, val, rk")
+}
+
 func TestCompatWindowRankPeerGroups(t *testing.T) {
 	ctx, _, cleanup := newDDLFixture(t)
 	defer cleanup()
