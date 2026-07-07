@@ -1,81 +1,103 @@
-Task: M0122-0007 — implemented `goopg restart` (was a hard stub returning
-exit 1 "not yet implemented"). COMPLETE and committed this loop (b01eae13).
+Task: M0097-0150 (fix_plan M0122-0007 bucket) — implemented `ALTER
+FUNCTION/PROCEDURE/ROUTINE ... OWNER TO` and `... SET SCHEMA` (both were
+parse-only no-ops; RENAME TO already worked). COMPLETE and committed this
+loop.
 
-Files: cmd/goopg/main.go (runRestart now delegates to new
-runRestartWithStarter(args, stdout, stderr, start) — parses -D/-config/
--listen/-hba/-mode/-t, stops the -D instance only if control.ProcessAlive
-says its postmaster.pid PID is actually live, waits up to -t seconds via
-the same poll-loop pattern as runStop, then calls start(startArgs, ...)
-with -D/-listen always set and -config/-hba only when non-empty — -listen
-defaults to the stopped instance's own ListenAddr from its postmaster.pid
-when not given explicitly, falling back to 127.0.0.1:5432 only when there
-was no live instance to read it from), cmd/goopg/main_test.go (new
-TestRunRestartWithStarter, 4 subtests: missing -D exits 2 without
-invoking the starter; no postmaster.pid starts straight away with the
-127.0.0.1:5432 default; a stale pidfile (dead PID) is treated as
-not-running; a genuinely live instance — real control.Listener +
-control.WritePIDFile + a real `sleep 60` child process as the stand-in
-server — gets stopped (OnStop kills+Waits the child so ProcessAlive
-actually flips false, not just Kill() alone which leaves a zombie) before
-the fake starter runs, and its listen address carries through unchanged;
-TestSubcommandStubsAreReachable's "restart" case updated 1->2 to match
-the new -D-required contract), docs/design/root-0001-architecture-overview.md
-(new "`goopg restart` (2026-07-08)" paragraph under the pg_ctl-mapping
-table), docs/design/README.md (root-0001 row extended), .ralph/fix_plan.md
-(M0122-0007's summary line + a new "done" writeup under it, "Still open"
-trimmed to the remaining ~12 items now that both goopg reload/SIGHUP
-(last loop) and goopg restart (this loop) are done).
+Files: internal/catalog/routines.go (new `Routine.Owner uint32` +
+`OwnerOrDefault()`; new `Routines.SetSchema(r, newSchema)` re-keys
+byKey/byName exactly like RenameRoutine, just on Schema; new
+`SetSchemaByOIDDuringRecovery`/`SetOwnerByOIDDuringRecovery` OID-based
+recovery counterparts), internal/parser/ast.go (AlterFunctionStmt gains
+NewOwner/NewSchema fields), internal/parser/ddl.go (OWNER TO branch now
+captures the resolved owner instead of discarding it; SET SCHEMA branch
+now captures the new schema — AND fixed a real pre-existing bug: the
+attribute loop's SET-clause detection matched TokenIdent value "set", but
+SET lexes as the real keyword KwSet, so it never matched and EVERY `ALTER
+FUNCTION ... SET ...` form was a syntax error before this loop, not the
+documented no-op; also fixed the inner "FROM" check the same way),
+internal/executor/operators_ddl.go (execAlterFunction gains OWNER
+TO/SET SCHEMA early-return branches mirroring RenameTo's shape and
+execAlterAggregateOwner/execAlterCollation's owner-resolution/error-code
+pattern), internal/initdb/pg_proc_view.go (proowner for user routines now
+r.OwnerOrDefault() instead of hardcoded "10"), internal/wal/recovery.go
+(new RecordKindAlterFunctionOwner=121/RecordKindAlterFunctionSetSchema=122
++ Encode/Decode pairs), internal/initdb/function_ddl_recovery.go (replay
+cases for both new record kinds), unimplemented_feat.json (M0097-0150
+entry status open->resolved, surgical edit only — did NOT run
+json.load+dump), docs/design/0015-0002-pg-proc-catalog-and-routine-registry.md
++ docs/design/README.md (new section/row), .ralph/fix_plan.md (M0122-0007
+write-up + "Still open" trimmed to ~11), .ralph/deferral_ledger.md (new
+row: generic ALTER FUNCTION `SET config=value`/`RESET` remains broken —
+two more isolated small parser bugs, see below). New test files:
+internal/parser/alter_function_owner_schema_test.go; new tests appended
+to internal/executor/operators_function_test.go,
+internal/initdb/pg_proc_view_test.go,
+internal/initdb/function_ddl_recovery_test.go,
+internal/wal/function_ddl_test.go.
 
-Key symbols: runRestartWithStarter (cmd/goopg/main.go) — the testable
-core; runRestart (cmd/goopg/main.go) is just runRestartWithStarter wired
-to the real runStart. control.ProcessAlive/control.ParsePIDFile/
-control.Send (internal/control/control.go) — reused verbatim from
-runStop's existing pattern, no changes to that package.
+Key symbols: execAlterFunction (internal/executor/operators_ddl.go) —
+the testable core, now has OWNER TO/SET SCHEMA branches right after the
+existing RENAME TO branch. Routines.SetSchema/RenameRoutine
+(internal/catalog/routines.go) — the two re-keying mutators (schema and
+name are both part of both byKey/byName map keys).
 
-Findings: v0's server never daemonizes (goopg start blocks the calling
-process in the foreground), so a "restart" can't fork a replacement the
-way pg_ctl does — the only sane implementation is stop-then-exec-start-
-in-the-same-process, which is what landed. Testing the live-stop branch
-needed a REAL killable OS process (not just a fake PID) because
-control.ProcessAlive uses kill(pid,0), which succeeds against a zombie
-that hasn't been Wait()'d yet — Kill() alone in the test's OnStop handler
-left the sleeper process stuck as a zombie and the restart's poll loop
-timed out at the full 30s default before I added the Wait() call. Live
-e2e against the real cmd/goopg binary (start on 127.0.0.1:65498, `goopg
-restart -D <datadir>` with no -listen) confirmed the PID actually changed
-(1922289 -> 1922570) while `goopg status` kept reporting the same
-127.0.0.1:65498 address unprompted.
+Findings: (1) `catalog.Routine` had NO Owner field at all — unlike
+UserAggregate/UserCollation/UserOperator/etc which all already have the
+"Owner uint32, 0=unset->bootstrap superuser" pattern — confirming
+unimplemented_feat.json's M0097-0150 entry was a real, correctly-scoped
+gap, not stale. (2) Discovered mid-implementation that the SET-clause
+detection bug made ALL `ALTER FUNCTION ... SET ...` forms syntax errors
+(not just SET SCHEMA) — confirmed via `postgres/src/backend/parser/gram.y`
+that `common_func_opt_item: FunctionSetResetClause` makes generic `SET
+name = value`/`RESET` legitimate, combinable-with-VOLATILE grammar (unlike
+OWNER TO/RENAME TO/SET SCHEMA, which gram.y's AlterOwnerStmt/RenameStmt
+show are separate exclusive top-level forms — matches this codebase's
+existing early-return-per-form precedent, e.g. RenameTo). (3) Fixing the
+outer KwSet gate was NOT enough to make the generic SET-value form work:
+`p.acceptSymbol("=")` only matches TokenSymbol but `=` lexes as
+TokenOperator in this lexer (confirmed internal/parser/lexer.go), and the
+"FROM CURRENT" branch checks for a literal "from" token immediately after
+SET instead of parsing the config-name first (real grammar is `var_name
+FROM CURRENT`, name first) — both pre-existing, both left deferred (see
+ledger row) since fixing them wasn't needed to close M0097-0150's own
+named scope (OWNER TO/RENAME TO/SET SCHEMA) and RESET already worked
+fine on its own. Verified all of this against real PG 18.3 gram.y, not
+guessed.
 
-Next step: pick the next task. M-NIGHTLY is clean (ci/logs/action-items.md
-unchanged since 20260707-000712, all 8 items resolved — re-verify at next
-loop start per the standing rule since this loop didn't need to touch it).
-Candidates carried from prior loops, still open: (a) M0122-0006's
-opclass/collation OID resolution gap (indclass/indcollation real OID
-resolution, live AND heap-restore paths) and its pg_tablespace-visibility
-item (flagged "defer indefinitely" in the ledger on 2026-06-15 — re-read
-that row before committing a loop to it, the fix_plan bullet may be
-stale); (b) M0122-0007's remaining ~12 items: CREATE/DROP DATABASE full
-DDL, REINDEX (check internal/executor/operators_reindex.go's current
-state first — may already be more complete than the fix_plan bullet
-implies), tablespaces, ALTER FUNCTION/COLUMN, planner/jit GUC stubs; (c)
-M0122-0008 (SASLprep/channel binding/scram_iterations still open; RBAC
-mostly done per 2026-07-05/06 notes, view's-own-ACL gap remains,
-materially larger); (d) M0119-0004/0005/0006/0007 per the Current
-Priority banner (M0119-0004 pg_dump DU-002 residual, M0119-0005
-hash/gin/gist/spgist/brin AM gap, M0119-0006 pg_amproc dispatch gap —
-check overlap with candidate (a)'s opclass work before picking both).
+Next step: pick the next task. M-NIGHTLY re-verified clean at this loop's
+start (all 8 AI-20260707-000712-* items already [x] in fix_plan.md,
+unchanged since last loop — re-verify again next loop per the standing
+rule). Candidates carried forward: (a) the just-recorded ALTER FUNCTION
+generic SET/RESET parser fix (small, well-isolated — see deferral ledger
+row appended today for the exact 2-line-ish fix + test additions needed);
+(b) M0122-0006's opclass/collation OID resolution gap (indclass/
+indcollation real OID resolution, live AND heap-restore paths — flagged
+"defer indefinitely" 2026-06-15, re-read that row before committing);
+(c) M0122-0007's remaining ~11 items: CREATE/DROP DATABASE full DDL
+(architecturally large — goopg is single-database today), REINDEX
+physical rebuild (validation/locking already real, just no-op rebuild),
+tablespaces, `ALTER TABLE ... ALTER COLUMN RESET (...)` (confirmed-open,
+unrelated to today's function-OWNER work), planner/jit GUC stubs; (d)
+M0122-0008 (SASLprep/channel binding/scram_iterations; RBAC mostly done,
+view's-own-ACL gap remains); (e) M0119-0004/0005/0006/0007 per the
+Current Priority banner (M0119-0005 hash/gin/gist/spgist/brin AM gap,
+M0119-0006 pg_amproc dispatch gap — check overlap with candidate (b)'s
+opclass work before picking both).
 
-Gates run: go build ./... clean; go vet ./cmd/... ./internal/control/...
-clean; go test ./cmd/... ./internal/control/... ./internal/server/... PASS.
-scripts/tpch-spotcheck.sh PASS (Q12=2/Q13=33).
+Gates run: go build ./... clean; go vet ./... clean; go test
+./internal/parser/... ./internal/catalog/... ./internal/executor/...
+./internal/wal/... ./internal/initdb/... ./internal/planner/... ALL
+PASS. scripts/tpch-spotcheck.sh PASS (Q12=2/Q13=33).
 RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh PASS (0
-failed, all 3 workloads, both the manual pre-verification run and the
-git-hook run at commit time). Live e2e: real cmd/goopg binary, goopg
-init/start/restart/status/stop against a scratch data dir on
-127.0.0.1:65498. make ralph-state-guard: 2 benign issues auto-repaired
-(identical pattern to every prior loop — status/progress
-running-vs-completed reconciliation).
+failed, all 3 workloads). Live e2e: real cmd/goopg binary on
+127.0.0.1:65499 — CREATE ROLE/CREATE FUNCTION/ALTER FUNCTION OWNER TO/SET
+SCHEMA, confirmed pg_proc.proowner/pronamespace changed to the real
+role/schema OIDs, function still callable under its new schema
+(app.add_one(41)=42), 42704/42883 error paths verified, then `goopg
+restart`'d the same data dir and confirmed both survived. make
+ralph-state-guard: 2 benign issues auto-repaired (identical pattern to
+every prior loop).
 
-In-flight: none. Manual verification data dir (/tmp/goopg-restart-verify)
-was fully torn down (server stopped, directory removed) before this loop
-ended.
+In-flight: none. Manual verification data dir (/tmp/goopg-alterfunc-verify)
+and scratch binary (/tmp/goopg-bin) were fully torn down (server stopped,
+files removed) before this loop ended.

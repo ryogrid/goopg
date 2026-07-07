@@ -3266,9 +3266,60 @@ mirroring M0119's ledger `status` column.
       clean; `go test ./cmd/... ./internal/control/...` PASS;
       `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
       `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
-      failed, all 3 workloads). **Still open** (this bucket, ~12 remaining
-      items): CREATE/DROP DATABASE full DDL, REINDEX, tablespaces, ALTER
-      FUNCTION/COLUMN, planner/jit GUC stubs.
+      failed, all 3 workloads).
+      **`ALTER FUNCTION/PROCEDURE/ROUTINE OWNER TO`/`SET SCHEMA` — done
+      (2026-07-08, M0097-0150):** both previously parsed but were silently
+      discarded no-ops (`RENAME TO` already worked). New `catalog.Routine.Owner`/
+      `OwnerOrDefault()` (mirrors every other `OwnerOrDefault`-style object in
+      this codebase) and `Routines.SetSchema` (re-keys `byKey`/`byName`,
+      mirroring `RenameRoutine`'s re-keying on `Schema` instead of `Name`), plus
+      OID-based recovery counterparts (`SetOwnerByOIDDuringRecovery`/
+      `SetSchemaByOIDDuringRecovery`). Surfaced and fixed a real pre-existing
+      parser bug along the way: the ALTER FUNCTION attribute loop's SET-clause
+      detection matched `TokenIdent` value `"set"`, but `SET` lexes as the real
+      keyword `KwSet` — so it never matched and **every** `ALTER FUNCTION ...
+      SET ...` form was a syntax error, not the documented no-op (fixed for the
+      `SET SCHEMA` sub-form; the generic `SET config = value`/`RESET` sub-forms
+      remain broken for two more small, now-isolated reasons — see the deferral
+      ledger row appended today). `execAlterFunction` gains OWNER TO/SET SCHEMA
+      branches mirroring `RenameTo`'s early-return shape (real PG grammar treats
+      these as separate top-level forms, not clauses combinable with
+      VOLATILE/etc, confirmed against `postgres/src/backend/parser/gram.y`'s
+      `AlterOwnerStmt`/`RenameStmt` vs `alterfunc_opt_list`). `pg_proc.proowner`
+      for user routines now reads `r.OwnerOrDefault()` instead of a hardcoded
+      `"10"`; `pronamespace` already read `r.Schema` live so SET SCHEMA
+      round-trips with no view change. New WAL record kinds 121/122
+      (`RecordKindAlterFunctionOwner`/`RecordKindAlterFunctionSetSchema`),
+      replayed by `replayFunctionDDLRecords`. Verified live against the real
+      `cmd/goopg` binary: `ALTER FUNCTION add_one(int) OWNER TO func_owner` +
+      `SET SCHEMA app` changed `pg_proc.proowner`/`pronamespace` to the real
+      role/schema OIDs, `app.add_one(41)` still executed correctly, and both
+      the ownership and the schema move survived a `goopg restart`. Tests:
+      `TestParseAlterFunctionOwner`/`TestParseAlterFunctionSetSchema`/
+      `TestParseAlterFunctionRenameAndVolatileStillWork` (parser, new
+      `alter_function_owner_schema_test.go`); `TestExecAlterFunctionOwner`/
+      `TestExecAlterFunctionSetSchema` (executor, `operators_function_test.go`);
+      `TestPgProcViewRendersRoutineOwner` (initdb); `TestEncodeDecodeAlterFunctionOwnerRoundTrip`/
+      `TestEncodeDecodeAlterFunctionSetSchemaRoundTrip` (wal); `TestFunctionDDLRecoveryReplaysAlterAfterCreate`
+      extended to cover both new record kinds end-to-end through a real WAL
+      flush + reopen. `unimplemented_feat.json`'s M0097-0150 entry flipped to
+      `resolved`. Design: `docs/design/0015-0002-pg-proc-catalog-and-routine-registry.md`
+      new "`ALTER FUNCTION/PROCEDURE/ROUTINE OWNER TO`/`SET SCHEMA` (2026-07-08,
+      M0097-0150)" section; `docs/design/README.md` row updated. Gates:
+      `go build ./...`/`go vet ./...` clean; `go test ./internal/parser/...
+      ./internal/catalog/... ./internal/executor/... ./internal/wal/...
+      ./internal/initdb/... ./internal/planner/...` PASS; `scripts/tpch-spotcheck.sh`
+      PASS (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+      scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 workloads).
+      **Still open** (this bucket, ~11 remaining items): CREATE/DROP DATABASE
+      full DDL (architecturally larger — goopg is currently single-database;
+      `DROP DATABASE` always reports does-not-exist by design), REINDEX
+      (validation + CONCURRENTLY lock/wait semantics already real; physical
+      index rebuild remains a no-op — separately-scoped, larger), tablespaces,
+      `ALTER TABLE ... ALTER COLUMN RESET (...)` (unrelated to today's ALTER
+      FUNCTION work — confirmed-open at ddl.go per `unimplemented_feat.json`),
+      planner/jit GUC stubs, plus the generic ALTER FUNCTION `SET`/`RESET`
+      parser gap this loop's own deferral ledger row just recorded.
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,
       encoding constraints during bootstrap/runtime.

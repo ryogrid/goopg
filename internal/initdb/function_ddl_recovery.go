@@ -105,6 +105,18 @@ func replayFunctionDDLRecords(walDir string, cat *catalog.InMemory) error {
 				return fmt.Errorf("decode alter-function-flags at lsn %d: %w", rec.StartLSN, derr)
 			}
 			rs.SetFlagsByOIDDuringRecovery(oid, volatile, securityDefiner, leakproof, strict)
+		case wal.RecordKindAlterFunctionOwner:
+			oid, ownerOID, derr := wal.DecodeAlterFunctionOwner(rec.Payload)
+			if derr != nil {
+				return fmt.Errorf("decode alter-function-owner at lsn %d: %w", rec.StartLSN, derr)
+			}
+			rs.SetOwnerByOIDDuringRecovery(oid, ownerOID)
+		case wal.RecordKindAlterFunctionSetSchema:
+			oid, newSchema, derr := wal.DecodeAlterFunctionSetSchema(rec.Payload)
+			if derr != nil {
+				return fmt.Errorf("decode alter-function-set-schema at lsn %d: %w", rec.StartLSN, derr)
+			}
+			rs.SetSchemaByOIDDuringRecovery(oid, newSchema)
 		}
 	}
 	return nil

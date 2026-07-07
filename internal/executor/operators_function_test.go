@@ -322,3 +322,90 @@ func TestExecDropProcedureRollbackLeavesEntry(t *testing.T) {
 		t.Fatal("procedure must survive ROLLBACK — the registry was never mutated")
 	}
 }
+
+// TestExecAlterFunctionOwner pins ALTER FUNCTION ... OWNER TO (M0097-0150):
+// previously OWNER TO parsed but was silently discarded (a documented no-op),
+// so pg_proc.proowner never reflected an ALTER. Mirrors
+// TestDDLAlterAggregateOwner's shape (storage_ddl_test.go).
+func TestExecAlterFunctionOwner(t *testing.T) {
+	cat := catalog.NewInMemory()
+	if err := runRoutineDDL(t,
+		`CREATE FUNCTION add_one(x int) RETURNS int LANGUAGE plpgsql AS $$ BEGIN RETURN x + 1; END $$`,
+		cat); err != nil {
+		t.Fatalf("CREATE FUNCTION: %v", err)
+	}
+	fn, ok := cat.Routines().Lookup(parser.ObjectName{Name: "add_one"}, []catalog.Type{{Name: "int"}})
+	if !ok {
+		t.Fatal("function not registered before ALTER")
+	}
+	if got := fn.OwnerOrDefault(); got != 10 {
+		t.Fatalf("default owner = %d, want 10 (bootstrap superuser)", got)
+	}
+
+	cat.RegisterRole("func_owner")
+	wantOID, ok := cat.RoleOID("func_owner")
+	if !ok {
+		t.Fatal("func_owner role not registered")
+	}
+
+	if err := runRoutineDDL(t, "ALTER FUNCTION add_one(int) OWNER TO func_owner", cat); err != nil {
+		t.Fatalf("ALTER FUNCTION OWNER TO: %v", err)
+	}
+	if got := fn.OwnerOrDefault(); got != wantOID {
+		t.Errorf("owner after ALTER = %d, want %d", got, wantOID)
+	}
+
+	// CURRENT_USER resolves to the bootstrap-superuser sentinel, mirroring
+	// ALTER AGGREGATE/COLLATION ... OWNER TO CURRENT_USER.
+	if err := runRoutineDDL(t, "ALTER FUNCTION add_one(int) OWNER TO CURRENT_USER", cat); err != nil {
+		t.Fatalf("ALTER FUNCTION OWNER TO CURRENT_USER: %v", err)
+	}
+	if got := fn.OwnerOrDefault(); got != 10 {
+		t.Errorf("owner after OWNER TO CURRENT_USER = %d, want 10", got)
+	}
+
+	// Unknown role must raise 42704.
+	err := runRoutineDDL(t, "ALTER FUNCTION add_one(int) OWNER TO no_such_role", cat)
+	if ee, ok := err.(*ExecError); !ok || ee.Code != "42704" {
+		t.Errorf("want 42704 for unknown role, got %v", err)
+	}
+
+	// Unknown function must raise 42883.
+	err = runRoutineDDL(t, "ALTER FUNCTION no_such_func(int) OWNER TO func_owner", cat)
+	if ee, ok := err.(*ExecError); !ok || ee.Code != "42883" {
+		t.Errorf("want 42883 for unknown function, got %v", err)
+	}
+}
+
+// TestExecAlterFunctionSetSchema pins ALTER FUNCTION ... SET SCHEMA
+// (M0097-0150): previously SET SCHEMA parsed but was silently discarded, so
+// the routine never actually moved (and, separately, the parser's SET-clause
+// detection was flat-out unreachable — SET lexes as a keyword token, not the
+// TokenIdent the old condition checked for, so every `ALTER FUNCTION ... SET
+// ...` form was a syntax error prior to this fix, not merely a no-op).
+func TestExecAlterFunctionSetSchema(t *testing.T) {
+	cat := catalog.NewInMemory()
+	if err := runRoutineDDL(t,
+		`CREATE FUNCTION add_one(x int) RETURNS int LANGUAGE plpgsql AS $$ BEGIN RETURN x + 1; END $$`,
+		cat); err != nil {
+		t.Fatalf("CREATE FUNCTION: %v", err)
+	}
+	fn, ok := cat.Routines().Lookup(parser.ObjectName{Name: "add_one"}, []catalog.Type{{Name: "int"}})
+	if !ok {
+		t.Fatal("function not registered before ALTER")
+	}
+
+	if err := runRoutineDDL(t, "ALTER FUNCTION add_one(int) SET SCHEMA myschema", cat); err != nil {
+		t.Fatalf("ALTER FUNCTION SET SCHEMA: %v", err)
+	}
+	if fn.Schema != "myschema" {
+		t.Errorf("Schema after SET SCHEMA = %q, want myschema", fn.Schema)
+	}
+	if _, ok := cat.Routines().Lookup(parser.ObjectName{Schema: "public", Name: "add_one"}, []catalog.Type{{Name: "int"}}); ok {
+		t.Error("routine still resolves under the old schema after SET SCHEMA")
+	}
+	got, ok := cat.Routines().Lookup(parser.ObjectName{Schema: "myschema", Name: "add_one"}, []catalog.Type{{Name: "int"}})
+	if !ok || got != fn {
+		t.Error("routine does not resolve under the new schema after SET SCHEMA")
+	}
+}

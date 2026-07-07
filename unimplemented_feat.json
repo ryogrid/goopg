@@ -2779,8 +2779,8 @@
   {
    "feature": "ALTER FUNCTION/PROCEDURE OWNER TO / RENAME TO / SET SCHEMA enforcement (currently no-op)",
    "task_id": "M0097-0150",
-   "resume_point": "OWNER TO / SET SCHEMA still parse-only no-ops (ddl.go); RENAME TO is now fully enforced (execAlterFunction, operators_ddl.go:11336, WAL-persisted)",
-   "status": "open",
+   "resume_point": "RESOLVED 2026-07-08: OWNER TO and SET SCHEMA now enforced (Routine.Owner/OwnerOrDefault, Routines.SetSchema, execAlterFunction, WAL record kinds 121/122); RENAME TO was already enforced. Verified live against cmd/goopg + restart persistence. See docs/design/0015-0002-pg-proc-catalog-and-routine-registry.md.",
+   "status": "resolved",
    "evidence": [
     "ALTER FUNCTION/PROCEDURE OWNER TO / RENAME TO / SET SCHEMA: no-op"
    ],

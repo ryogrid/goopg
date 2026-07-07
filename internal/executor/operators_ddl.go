@@ -11489,6 +11489,45 @@ func (o *ddlOp) execAlterFunction(s *parser.AlterFunctionStmt) error {
 		}
 		return nil
 	}
+	// OWNER TO: update the routine owner. M0097-0150.
+	if s.NewOwner != "" {
+		ownerOID := uint32(10) // bootstrap superuser, mirrors execAlterAggregateOwner/execAlterCollation's default owner
+		if !strings.EqualFold(s.NewOwner, "current_user") {
+			im, ok := o.ctx.Catalog.(*catalog.InMemory)
+			if !ok {
+				return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "ALTER FUNCTION OWNER TO requires InMemory catalog"}
+			}
+			oid, found := im.RoleOID(s.NewOwner)
+			if !found {
+				return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("role %q does not exist", s.NewOwner)}
+			}
+			ownerOID = oid
+		}
+		for _, r := range routines {
+			r.Owner = ownerOID
+			if o.ctx.WAL != nil {
+				if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterFunctionOwner(r.OID, ownerOID)); werr != nil {
+					return fmt.Errorf("wal alter-function-owner: %w", werr)
+				}
+			}
+		}
+		return nil
+	}
+	// SET SCHEMA: move the routine to a new schema. M0097-0150.
+	if s.NewSchema != "" {
+		for _, r := range routines {
+			oid := r.OID
+			if err := rs.SetSchema(r, s.NewSchema); err != nil {
+				return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
+			}
+			if o.ctx.WAL != nil {
+				if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterFunctionSetSchema(oid, s.NewSchema)); werr != nil {
+					return fmt.Errorf("wal alter-function-set-schema: %w", werr)
+				}
+			}
+		}
+		return nil
+	}
 	// Only superusers may set a function as leakproof.
 	if s.Leakproof != nil && *s.Leakproof && o.ctx.NonSuperuserRole != "" {
 		return &ExecError{Code: "42501", Pos: s.Pos(), Message: "only superuser can define a leakproof function"}

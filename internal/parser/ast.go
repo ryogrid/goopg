@@ -3418,6 +3418,8 @@ type AlterFunctionStmt struct {
 	IsProcedure bool
 	IsRoutine   bool   // ALTER ROUTINE: applies to both functions and procedures (M0097-0022)
 	RenameTo    string // RENAME TO new_name (M0097-0022)
+	NewOwner    string // OWNER TO new_owner; "current_user" sentinel for CURRENT_USER/SESSION_USER/CURRENT_ROLE (M0097-0150)
+	NewSchema   string // SET SCHEMA new_schema (M0097-0150)
 	// Updated attributes (nil = not changed)
 	Volatile        *string // "v", "s", "i"
 	SecurityDefiner *bool

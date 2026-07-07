@@ -7239,13 +7239,24 @@ func (p *parser) parseAlter() (Stmt, error) {
 		// Consume one or more function attributes
 		for p.isFunctionAttribute() || (p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "owner")) ||
 			(p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "rename")) ||
-			(p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "set")) ||
+			(p.cur().Kind == TokenKeyword && p.cur().Keyword == KwSet) ||
 			(p.cur().Kind == TokenKeyword && p.cur().Keyword == KwReset) {
-			// OWNER TO role — no-op (no role system in goopg v0)
+			// OWNER TO new_owner — store the resolved owner in stmt. M0097-0150.
 			if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "owner") {
 				p.advance() // OWNER
 				p.acceptKeyword(KwTo)
-				p.advance() // role name (ident or CURRENT_USER etc.)
+				// CURRENT_USER / SESSION_USER / CURRENT_ROLE resolve to the
+				// bootstrap superuser sentinel, mirroring ALTER AGGREGATE/
+				// COLLATION ... OWNER TO.
+				if p.acceptIdentKeyword("current_user") ||
+					p.acceptIdentKeyword("session_user") ||
+					p.acceptIdentKeyword("current_role") {
+					stmt.NewOwner = "current_user"
+				} else if tok, err := p.parseIdent(); err == nil {
+					stmt.NewOwner = identText(tok)
+				} else {
+					stmt.NewOwner = "current_user"
+				}
 				continue
 			}
 			// RENAME TO new_name — store new name in stmt
@@ -7256,13 +7267,21 @@ func (p *parser) parseAlter() (Stmt, error) {
 				stmt.RenameTo = identText(newName)
 				continue
 			}
-			// SET SCHEMA schema | SET guc_name {TO|=} value | SET FROM CURRENT — no-op
-			if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "set") {
+			// SET SCHEMA schema — store the new schema in stmt (M0097-0150).
+			// SET guc_name {TO|=} value | SET FROM CURRENT remain no-ops. SET
+			// itself is a real keyword token (KwSet), not an ident — as is
+			// FROM (KwFrom) below; both were previously matched against
+			// TokenIdent, so this whole branch was unreachable dead code
+			// (any `ALTER FUNCTION ... SET ...` form hit a syntax error
+			// instead of falling into this "no-op" comment's promise).
+			if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwSet {
 				p.advance() // SET
 				if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "schema") {
 					p.advance() // SCHEMA
-					p.advance() // schema name
-				} else if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "from") {
+					if schemaTok, err := p.parseIdent(); err == nil {
+						stmt.NewSchema = identText(schemaTok)
+					}
+				} else if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwFrom {
 					p.advance() // FROM
 					p.acceptIdentKeyword("current")
 				} else {

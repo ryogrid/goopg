@@ -163,3 +163,79 @@ Full `go test ./...` green.
   resolver path) — step 6.
 - Numerical type-OID columns in `pg_proc` — paired with the wider
   type-system work that swaps every text-OID surface to integer.
+
+## `ALTER FUNCTION/PROCEDURE/ROUTINE OWNER TO` / `SET SCHEMA` (2026-07-08, M0097-0150)
+
+Closes the last two named forms of the M0097-0150 unimplemented-feature
+entry — `RENAME TO` already worked (loop #71 ledger follow-up); `OWNER TO`
+and `SET SCHEMA` parsed but were silently discarded no-ops, so `pg_proc`'s
+`proowner`/`pronamespace` never reflected an ALTER.
+
+**Catalog:** `Routine` gains `Owner uint32` (0 = unset → bootstrap superuser,
+mirrors every other `OwnerOrDefault`-style object in this codebase —
+`UserAggregate`, `UserCollation`, `UserOperator`, etc.) and `OwnerOrDefault()`.
+`Routines.SetSchema(r, newSchema)` re-keys both `byKey`/`byName` indices
+(schema is part of both keys) — mirrors `RenameRoutine`'s re-keying, just on
+`Schema` instead of `Name`. `SetSchemaByOIDDuringRecovery`/
+`SetOwnerByOIDDuringRecovery` are the WAL-replay counterparts (owner isn't
+part of either key, so its recovery path is a direct field write, mirroring
+`SetFlagsByOIDDuringRecovery`).
+
+**Parser:** `AlterFunctionStmt` gains `NewOwner`/`NewSchema` fields. A real
+pre-existing bug surfaced here: the attribute-consuming loop's SET-clause
+detection matched `TokenIdent` with value `"set"`, but `SET` lexes as the
+real keyword token `KwSet` — so the condition never matched and **every**
+`ALTER FUNCTION ... SET ...` form (not just `SET SCHEMA`) was a syntax
+error, not merely the documented no-op. Fixed by matching `TokenKeyword{Keyword:
+KwSet}` (and `KwFrom` for the `SET x FROM CURRENT` sub-form) instead of
+`TokenIdent`.
+
+**Executor:** `execAlterFunction` gains two early-return branches (mirroring
+`RenameTo`'s existing early return — real PostgreSQL grammar treats `OWNER
+TO`/`SET SCHEMA`/`RENAME TO` as three separate top-level `AlterFunctionStmt`-
+adjacent forms, not clauses combinable with `VOLATILE`/`STRICT`/etc, per
+`gram.y`'s `AlterOwnerStmt`/`RenameStmt` vs. `alterfunc_opt_list`):
+`OWNER TO` resolves the new owner via `catalog.RoleOID` (42704 if unknown,
+`CURRENT_USER`/`SESSION_USER`/`CURRENT_ROLE` resolve to the bootstrap-
+superuser sentinel exactly like `execAlterAggregateOwner`/`execAlterCollation`)
+and WAL-logs `RecordKindAlterFunctionOwner`; `SET SCHEMA` calls the new
+`Routines.SetSchema` and WAL-logs `RecordKindAlterFunctionSetSchema`.
+
+**`pg_proc` rendering:** the user-routine row builder's `proowner` column
+was a hardcoded `"10"` — now `r.OwnerOrDefault()`. `pronamespace` already
+read `r.Schema` live, so `SET SCHEMA` round-trips with no view change.
+
+**WAL/restart persistence:** new record kinds 121 (`RecordKindAlterFunctionOwner`,
+`kind|ownerOID|oid`) and 122 (`RecordKindAlterFunctionSetSchema`,
+`kind|oid|newSchemaLen|newSchema`), replayed by `replayFunctionDDLRecords`
+(`internal/initdb/function_ddl_recovery.go`).
+
+**Verified against a live `cmd/goopg` binary** (not just unit tests): created
+a role and a function, ran `ALTER FUNCTION add_one(int) OWNER TO func_owner`
++ `ALTER FUNCTION add_one(int) SET SCHEMA app`, confirmed `pg_proc.proowner`/
+`pronamespace` changed to the real role/schema OIDs and `app.add_one(41)`
+still executed correctly — then `goopg restart`'d the same data directory and
+confirmed both the ownership and the schema move survived, with the function
+still callable under its new schema.
+
+Tests: `TestParseAlterFunctionOwner`/`TestParseAlterFunctionSetSchema`/
+`TestParseAlterFunctionRenameAndVolatileStillWork` (parser); `TestExecAlterFunctionOwner`/
+`TestExecAlterFunctionSetSchema` (executor); `TestPgProcViewRendersRoutineOwner`
+(initdb); `TestEncodeDecodeAlterFunctionOwnerRoundTrip`/
+`TestEncodeDecodeAlterFunctionSetSchemaRoundTrip` (wal); `TestFunctionDDLRecoveryReplaysAlterAfterCreate`
+extended to cover both new record kinds end-to-end through a real WAL
+flush + reopen (initdb).
+
+**Still open:** the generic `SET config_param {TO|=} value` / `SET
+config_param FROM CURRENT` / `RESET` clauses on `ALTER FUNCTION` (legitimate
+PostgreSQL grammar per `gram.y`'s `common_func_opt_item: FunctionSetResetClause`,
+combinable with `VOLATILE`/etc in the same statement, unlike `OWNER
+TO`/`RENAME TO`/`SET SCHEMA`) were unreachable dead code before this loop
+(same `KwSet`-vs-`TokenIdent` bug) and remain broken after it — the fix only
+repaired the `SET SCHEMA` sub-branch inside that block. `SET name = value`
+fails because `acceptSymbol("=")` only matches `TokenSymbol`, not the
+`TokenOperator` kind `=` actually lexes as; `SET name FROM CURRENT` fails
+because the code checks for a literal `"from"` immediately after `SET`
+instead of parsing the config-parameter name first. Not a regression (this
+whole form was already a syntax error before this loop), but now a
+correctly-scoped, separately-fixable gap — see the deferral ledger.

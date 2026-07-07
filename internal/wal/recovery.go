@@ -744,6 +744,16 @@ const (
 	//   bit2=Strict) | volatileLen(2) | volatile(volatileLen bytes)
 	RecordKindAlterFunctionFlags byte = 64
 
+	// RecordKindAlterFunctionOwner records an `ALTER FUNCTION/PROCEDURE/
+	// ROUTINE name(args) OWNER TO newowner` event (M0097-0150). Format:
+	//   kind(1) | ownerOID(4) | oid(4)
+	RecordKindAlterFunctionOwner byte = 121
+
+	// RecordKindAlterFunctionSetSchema records an `ALTER FUNCTION/PROCEDURE/
+	// ROUTINE name(args) SET SCHEMA newschema` event (M0097-0150). Format:
+	//   kind(1) | oid(4) | newSchemaLen(2) | newSchema(newSchemaLen bytes)
+	RecordKindAlterFunctionSetSchema byte = 122
+
 	// RecordKindSequenceState records the FULL state of one sequence
 	// (definition + current counter) so sequences — including the implicit
 	// sequences backing SERIAL/IDENTITY columns — survive a restart. goopg's
@@ -6112,6 +6122,62 @@ func DecodeAlterFunctionFlags(payload []byte) (oid uint32, volatile string, secu
 		return 0, "", false, false, false, fmt.Errorf("wal: alter-function-flags payload truncated (need %d bytes)", 8+volLen)
 	}
 	return oid, string(payload[8 : 8+volLen]), securityDefiner, leakproof, strict, nil
+}
+
+// EncodeAlterFunctionOwner encodes an ALTER FUNCTION/PROCEDURE/ROUTINE
+// OWNER TO event (M0097-0150). Format documented at the
+// RecordKindAlterFunctionOwner constant.
+func EncodeAlterFunctionOwner(oid, ownerOID uint32) []byte {
+	out := make([]byte, 9)
+	out[0] = RecordKindAlterFunctionOwner
+	binary.LittleEndian.PutUint32(out[1:5], ownerOID)
+	binary.LittleEndian.PutUint32(out[5:9], oid)
+	return out
+}
+
+// DecodeAlterFunctionOwner decodes a RecordKindAlterFunctionOwner payload.
+func DecodeAlterFunctionOwner(payload []byte) (oid, ownerOID uint32, err error) {
+	if len(payload) < 9 {
+		return 0, 0, fmt.Errorf("wal: alter-function-owner payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindAlterFunctionOwner {
+		return 0, 0, fmt.Errorf("wal: record kind %d is not alter-function-owner", payload[0])
+	}
+	ownerOID = binary.LittleEndian.Uint32(payload[1:5])
+	oid = binary.LittleEndian.Uint32(payload[5:9])
+	return oid, ownerOID, nil
+}
+
+// EncodeAlterFunctionSetSchema encodes an ALTER FUNCTION/PROCEDURE/ROUTINE
+// SET SCHEMA event (M0097-0150). Format documented at the
+// RecordKindAlterFunctionSetSchema constant.
+func EncodeAlterFunctionSetSchema(oid uint32, newSchema string) []byte {
+	if len(newSchema) > 0xFFFF {
+		newSchema = newSchema[:0xFFFF]
+	}
+	out := make([]byte, 7+len(newSchema))
+	out[0] = RecordKindAlterFunctionSetSchema
+	binary.LittleEndian.PutUint32(out[1:5], oid)
+	binary.LittleEndian.PutUint16(out[5:7], uint16(len(newSchema)))
+	copy(out[7:], newSchema)
+	return out
+}
+
+// DecodeAlterFunctionSetSchema decodes a RecordKindAlterFunctionSetSchema
+// payload.
+func DecodeAlterFunctionSetSchema(payload []byte) (oid uint32, newSchema string, err error) {
+	if len(payload) < 7 {
+		return 0, "", fmt.Errorf("wal: alter-function-set-schema payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindAlterFunctionSetSchema {
+		return 0, "", fmt.Errorf("wal: record kind %d is not alter-function-set-schema", payload[0])
+	}
+	oid = binary.LittleEndian.Uint32(payload[1:5])
+	schemaLen := int(binary.LittleEndian.Uint16(payload[5:7]))
+	if len(payload) < 7+schemaLen {
+		return 0, "", fmt.Errorf("wal: alter-function-set-schema payload truncated (need %d bytes)", 7+schemaLen)
+	}
+	return oid, string(payload[7 : 7+schemaLen]), nil
 }
 
 // CreateIndexPayload carries the metadata needed to fully
