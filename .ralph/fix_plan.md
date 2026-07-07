@@ -830,11 +830,36 @@ every clean, green (build + pre-commit) checkpoint.
       custdist=50000` row). Design doc: `docs/design/0063-0005-q13-left-
       join-not-like-rewrite.md` new §8 (status flipped draft→accepted;
       already indexed in `docs/design/README.md`).
-- [ ] tpch/Q15b-MAIN-explain — EXPLAIN Q15b-MAIN errored during the
-      plan-capture pass (AI-20260707-000712-006; repro: `tmp/tpch-nightly-
-      runner -port 65433 -db postgres -user <superuser> -queries 15 -explain
-      -per-query-timeout 60s`, same server setup as above; evidence:
-      `ci/logs/20260707-000712/tpch/explain-run.log`).
+- [x] tpch/Q15b-MAIN-explain — **FIXED 2026-07-07.** EXPLAIN Q15b-MAIN errored
+      during the plan-capture pass (AI-20260707-000712-006; repro:
+      `tmp/tpch-nightly-runner -port 65433 -db postgres -user <superuser>
+      -queries 15 -explain -per-query-timeout 60s`; evidence:
+      `ci/logs/20260707-000712/tpch/explain-run.log` —
+      `pq: relation "revenue0" does not exist (42P01)`). Root cause was a bug
+      in the benchmark tool itself (`cmd/tpch-runner/main.go`), not the goopg
+      engine: `runQ15WithCancel`/`runQ15` (the HammerDB Q15
+      CREATE-VIEW/SELECT/DROP-VIEW three-statement special case) both guarded
+      the `Q15-CREATEVIEW` and final `drop view` steps behind `if
+      !doExplain`, intending only to skip wrapping the DDL itself in `EXPLAIN`
+      (which doesn't apply to DDL) — but this also skipped *running* the
+      CREATE VIEW as a real statement under `-explain`, so `revenue0` never
+      existed when `EXPLAIN <Q15MainSelect>` tried to resolve it. Fixed by
+      making CREATE VIEW / DROP VIEW run unconditionally (never wrapped in
+      EXPLAIN) in both functions, while `Q15a-VIEWBODY`/`Q15b-MAIN` still
+      honor `doExplain` as before. Verified: fresh server on
+      `bench/tpch/runtime_goopg/data` (port 65433, `--hba` flag, memory-capped
+      via `scripts/goopg-test-run.sh`), full 22-query `-explain` sweep now
+      completes with zero errors (previously failed at Q15b-MAIN); `-queries
+      15` without `-explain` still produces the correct real result (`Q15a
+      rows=10000`, `Q15b rows=1`) confirming the non-explain path is
+      unaffected; `scripts/tpch-spotcheck.sh`-equivalent Q12/Q13 check (run
+      manually against the same server) still PASS (Q12=2, Q13=33). `go build
+      ./...` clean. No dedicated automated regression test added — the
+      function drives real `*sql.DB` queries against a live server with no
+      existing seam for a pure unit test, and this loop's manual run
+      reproduced the exact nightly failure command byte-for-byte then
+      confirmed the fix against it, which is the authoritative repro per the
+      M-NIGHTLY rules.
 - [ ] tpch/Q9-timeout — Q9 hit its per-query budget (57014/cancel)
       (AI-20260707-000712-007; repro: `tmp/tpch-nightly-runner -port 65433
       -db postgres -user <superuser> -queries 9 -per-query-timeout 1200s`,

@@ -91,15 +91,18 @@ func runOneWithCancel(db *sql.DB, qn int, queries map[int]string, budget, cancel
 }
 
 // runQ15WithCancel is the Q15 special case with cancel support.
+//
+// CREATE VIEW and DROP VIEW always run as real statements (never
+// wrapped in EXPLAIN, which doesn't apply to DDL) regardless of
+// doExplain — Q15b-MAIN's plan can't resolve the `revenue0` relation
+// otherwise (a prior EXPLAIN-only sweep skipped these and every
+// Q15b-MAIN EXPLAIN failed with 42P01 "relation revenue0 does not
+// exist").
 func runQ15WithCancel(db *sql.DB, budget, cancelAfter time.Duration, signalFile string, doExplain bool) {
-	if !doExplain {
-		timeOneWithCancel(db, "Q15-CREATEVIEW", "create or replace view revenue0 (supplier_no, total_revenue) as "+tpch.Q15ViewBody(), budget, cancelAfter, signalFile, false)
-	}
+	timeOneWithCancel(db, "Q15-CREATEVIEW", "create or replace view revenue0 (supplier_no, total_revenue) as "+tpch.Q15ViewBody(), budget, cancelAfter, signalFile, false)
 	timeOneWithCancel(db, "Q15a-VIEWBODY", tpch.Q15ViewBody(), budget, cancelAfter, signalFile, doExplain)
 	timeOneWithCancel(db, "Q15b-MAIN", tpch.Q15MainSelect(), budget, cancelAfter, signalFile, doExplain)
-	if !doExplain {
-		_, _ = db.Exec("drop view if exists revenue0")
-	}
+	_, _ = db.Exec("drop view if exists revenue0")
 }
 
 // timeOneWithCancel runs a single SQL statement with two independent
@@ -261,17 +264,17 @@ func runOne(db *sql.DB, qn int, queries map[int]string, budget time.Duration, do
 // VIEW; the per-statement timings are reported individually so
 // the SELECT (the EXPLAIN-able shape that matters for plan
 // inspection) is observable in isolation.
+//
+// CREATE VIEW and DROP VIEW always run as real statements (never
+// wrapped in EXPLAIN) regardless of doExplain — see the doc comment
+// on runQ15WithCancel for why skipping them under -explain is wrong.
 func runQ15(db *sql.DB, budget time.Duration, doExplain bool) {
-	if !doExplain {
-		// CREATE VIEW must succeed first so the main SELECT
-		// resolves the view reference.
-		timeOne(db, "Q15-CREATEVIEW", tpch.Q15ViewBody()[:0]+"create or replace view revenue0 (supplier_no, total_revenue) as "+tpch.Q15ViewBody(), budget, false)
-	}
+	// CREATE VIEW must succeed first so the main SELECT
+	// resolves the view reference.
+	timeOne(db, "Q15-CREATEVIEW", tpch.Q15ViewBody()[:0]+"create or replace view revenue0 (supplier_no, total_revenue) as "+tpch.Q15ViewBody(), budget, false)
 	timeOne(db, "Q15a-VIEWBODY", tpch.Q15ViewBody(), budget, doExplain)
 	timeOne(db, "Q15b-MAIN", tpch.Q15MainSelect(), budget, doExplain)
-	if !doExplain {
-		_, _ = db.Exec("drop view if exists revenue0")
-	}
+	_, _ = db.Exec("drop view if exists revenue0")
 }
 
 // timeOne wraps the per-query plumbing: build context with
