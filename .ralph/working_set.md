@@ -6,61 +6,70 @@ file changed besides .ralph/progress.json (benign ralph-state-guard
 auto-repair, timestamp bump only).
 
 Key symbols: none new (pure backlog bookkeeping). Evidence cited this loop
-(Q21/Q5/Q9 cluster, indices 6-15 of the 31-entry no-match remainder, via 2
-parallel general-purpose agents): internal/planner/unnest.go:2044-2095
-(M0062-0005 non-equijoin residual lift, commit 0a417306 — Q21
-range-correlation EXISTS resolved), internal/planner/bushy.go:1961-1968
-(stale M0065-era comment, superseded by commit e8c37796 SourceTableIdx fix),
-docs/handover/2026-05-10-tpch-status-phase5.md:33-38 (Q5 CPU pprof table —
-M0073-0005 profiling ask WAS completed, unlike its DecodeRow sibling),
-.ralph/deferral_ledger.md:573 (Q9 composite-NLI via attachUnusedCrossEdges,
-commit 2a9eade5, "FULLY LANDED" 2026-07-07), internal/planner/unnest.go:1200
-+1203 (isUnnestableNonCorrelatedIn — NOT IN anti-semi-join AND non-ColumnRef
-LHS both still hard-rejected, unchanged since ebb267d6 — 2 confirmed
-still-open), internal/planner/nl_index_join.go:133-141 (M0067-0003
-schema-vs-runtime layout mismatch — M0068 never touched it, still open),
-commit b0226c37 (NLI semi/anti partsupp_pk outer-row claim — marked
-unverifiable/vague, no reproduction found, kept open pending concrete repro).
+(Q9/Q5/M0091-perf cluster, indices 10-19 of the 25-entry no-match remainder,
+via 2 parallel general-purpose agents, plus 1 solo item I split off):
+internal/planner/bushy.go attachUnusedCrossEdges (commit 2a9eade5, Q9
+composite-NLI, already-known FULLY LANDED per .ralph/deferral_ledger.md:573
+— flipped this entry too since it referenced a different task_id/day),
+docs/design/fix-for-q5/ + M0077 4-slice commits 174cb902/71eeba32/da260d1c/
+5d8bd431 (Q5 600s+->16-26s, closed 1998881e), commit 514bdf6e (M0093 pgbench
+317->2,740 TPS, clears M0091's TPS>=1000 bar — docs/design/0093-0002-pgbench-
+remeasurement-target.md:50 ties acceptance explicitly to M0091), commit
+da7224d7 + e8874a08 (M0092-0005/M0122-0003 gated client-driven Pool/Manager/
+AIO I/O hooks behind track_io_timing, resolving that m0091 entry). Confirmed
+still-open with refreshed citations: plan-snapshot nondeterminism-vs-pool-
+state investigation (never performed, docs/design/0076-0006-plan-snapshot-
+harness.md:15-17 defers to M0077 which only shipped a workaround), build-flag
+regression diagnosis (M0076-0003, PARTIAL/moot — M0098-0007 made GOAMD64=v3+
+PGO default without isolating which knob caused +9.5%), FilterOp batch wiring
+(operators.go filterOp.Next():229-258 still row-by-row evalExprSlot),
+SeqScanOp batch wiring (operators_storage.go seqScanOp.Next():1316, same
+gap — no predicate eval near SeqScanOp at all, it's all in filterOp),
+spill-path closure-capture AND spill-path per-row-lookups (both = same
+unresolved gap in internal/executor/spill.go WriteRow/ReadRowInto still
+calling activity.LookupCurrentGoroutine() per row unconditionally, never
+migrated to the fast-path-gated LookupTrackedGoroutine used elsewhere post-
+M0122-0003 — these two backlog entries are literal duplicates of one gap,
+flagged for a future de-dup pass but left as 2 rows per no-full-rewrite
+discipline).
 
-Findings: triaged 10 more of the 31 `no-match`+no-status backlog entries via
-2 parallel general-purpose agents (read-only), covering the Q21/Q5/Q9
-planner cluster (items 6-15: range-correlation EXISTS, Q21 Anti-NLI
-outer-key-probe M0065-era corruption, Q5 optimization/correctness, Q21
-EXISTS unnest zero-rows, Q9 composite-NLI TupleSlot deferral, anti-semi-join
-for NOT IN, non-ColumnRef IN-subquery LHS, schema-vs-runtime layout
-mismatch walker bug, Q5 CPU pprof profiling, NLI semi/anti partsupp_pk
-outer-row emission). Result: 6 flipped resolved (higher than the 4/10 rate
-of the prior loop — this cluster's Q21/Q5/Q9 items were mostly closed by the
-M0071-0009/M0077/2026-07-07-Q9-refix work, confirming the calibration note
-from last loop's carry). 4 confirmed still-open with refreshed code_audit
-citations (anti-semi-join NOT IN — zero grep hits for AntiJoin/anti-semi
-conversion; non-ColumnRef IN-subquery LHS — same function, unchanged;
-schema-vs-runtime layout mismatch — M0068 never actually fixed it, only
-worked around elsewhere for a simpler case; NLI partsupp_pk outer-row claim
-— marked unverifiable/vague since the described bug was never reproduced
-distinct from the Q21 hash-join bug that WAS fixed). Did NOT append new
+Findings: triaged 10 more of the 25 `no-match`+no-status backlog entries via
+2 parallel general-purpose agents (read-only) + 1 solo follow-up (agent split
+missed index 15/SeqScanOp, covered it directly via grep — no vectorized
+predicate code anywhere near seqScanOp, confirmed-open). Result: 4 flipped
+resolved (Q9 chained-NLI/slot-pipeline entry — NOT via a slot pipeline
+[slot.go never built] but via bushy.go's attachUnusedCrossEdges instead; Q5
+optimization fix; M0091 TPS>=1000 goal — via M0093, 2,740 TPS measured;
+Client-driven Pool/Manager/AIO hooks m0091 entry — via M0092-0005/M0122-0003
+track_io_timing gating). 6 confirmed still-open with refreshed code_audit
+(plan-snapshot nondeterminism investigation, build-flag regression diagnosis
+[PARTIAL/moot], FilterOp batch wiring, SeqScanOp batch wiring, spill-path
+closure-capture, spill-path per-row — last two are duplicate framings of one
+gap). Entry count 181 preserved; no-match count 25->21; status-count
+156->160 (62 resolved / 98 open / 21 none). Did NOT append new
 deferral_ledger.md rows — pure triage/verification, not new implementation
-work.
+work; none of the 6 still-open items looked like they needed a fresh ledger
+row (all already well-documented as deliberately out-of-scope/cold-path in
+their originating design docs).
 
-Next step: continue M0122-0001 — 31 - 6 = 25 `no-match`+no-status entries
-remain. Regen command (indices shift after each edit):
+Next step: continue M0122-0001 — 21 no-match+no-status entries remain.
+Regen command (indices shift after each edit):
 `python3 -c "import json; d=json.load(open('unimplemented_feat.json'))['unimplemented_features']; nm=[f for f in d if 'status' not in f and f.get('resolution_check',{}).get('ledger')=='no-match']; print(len(nm)); [print(i,f['feature'][:100]) for i,f in enumerate(nm)]"`
-Good next cluster: indices 0-9 of the regenerated 25-entry list (items 16-25
-of the old 31-entry numbering — vectorized predicate batch wiring
-FilterOp/SeqScanOp, M0091 TPS>=1000 goal, spill-path optimizations, plan
-cache M0092-0008, needsVacuum autovacuum-reloption bug, SeqScan/Project
-plannode.go migration). These look like perf/M0091-M0092 cluster items —
-check git log for "M0091" "M0092" "plan cache" "vectorized" "SeqScanOp"
-commits after each item's deferred_date; also check if `needsVacuum` bug
-(item on autovacuum reloptions) is a live correctness bug worth a
-deferral_ledger row if still open (it reads like a real unfixed defect, not
-just a stale-doc entry — inspect internal/executor or internal/storage for
-needsVacuum and verify against pg autovacuum reloption semantics).
+Good next cluster: indices 16-20 of the 21-entry list (Pool.PinNew/Extend
+dirty-tracking durability audit m0089-0002, plan cache M0092-0008 design-doc
+rationale check, select-only perf structural fix M0092, needsVacuum
+autovacuum-reloption bug — this one reads like a REAL live correctness
+defect worth a deferral_ledger row if still open, inspect internal/executor
+or internal/storage for `needsVacuum` and compare against pg's
+autovacuum_vacuum_scale_factor/autovacuum_vacuum_threshold semantics — and
+SeqScan/Project plannode.go opTreeSlab migration). Indices 0-9 are an older
+Q15b/Q21/IN-list/concatRows cluster already fully audited (2026-07-08 dated,
+confirmed still-open) — do not re-triage those without new evidence.
 
 Gates run: `make ralph-state-guard` PASS (auto-repaired 1 benign issue:
 progress.status completed-marker-from-prior-loop reconciled to in_progress,
-same pattern as most prior loops). JSON validity + entry-count (181
-preserved, status-count 150->156, no-match count 31->25, zero-unicode-escape)
+same pattern as every prior loop). JSON validity + entry-count (181
+preserved, status-count 156->160, no-match count 25->21, zero-unicode-escape)
 confirmed via python3 before this working_set write. Pre-commit pgbench
 smoke NOT YET RUN — will run automatically via `.githooks/pre-commit` when
 the commit below executes.

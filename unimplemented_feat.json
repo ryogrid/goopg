@@ -1548,6 +1548,7 @@
    "feature": "Q9 chained-NLI rebind logic requires slot pipeline implementation; planner-only approach infeasible",
    "task_id": "M0071-0005",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "defer Q9 chained-NLI rebind to slot pipeline; DEFERRED → M0071-0005"
    ],
@@ -1562,12 +1563,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: slot.go:16 slot pipeline partially migrated; full impl incomplete"
+   "code_audit": "RESOLVED 2026-07-08: slot pipeline (planner/slot.go) was never built and is not required — Q9's chained-NLI/rebind defect is fixed via a different mechanism, bushy.go's attachUnusedCrossEdges (2a9eade5, after reverted prototype a3a74cc4), which ANDs a bushy-DP tree's unused cross-table edge onto the join predicate in global FROM-order coords so both nl_index_join.go's NLI picker and bushy.go's MultiHashJoin-Filters remap agree. Per .ralph/deferral_ledger.md:573 (FULLY LANDED): EXPLAIN now shows Index Scan using partsupp_pk with composite Index Cond; tmp/tpch-runner -queries 9 went from 1200s+ cancel to OK elapsed=88.32s rows=175 (matches PG 18.3). Regression test internal/executor/bushy_dp_cross_conjunct_test.go added."
   },
   {
    "feature": "Q5 optimization fix deferred due to empirical regression",
    "task_id": "M0076-0001",
    "resume_point": "M0077",
+   "status": "resolved",
    "evidence": [
     "defer Q5 fix to M0077 — empirical regression"
    ],
@@ -1582,7 +1584,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: no code evidence; Q5 optimization fix deferred per commit"
+   "code_audit": "RESOLVED 2026-07-08: landed under M0077's 4-slice refactor — Slice A 174cb902 (leaf-local filter attachment + NLI rebind robustness), Slice B 71eeba32 (post-filter base-row estimates), Slice C da260d1c (build-side-aware hash-join cost), Slice D 5d8bd431 (anchored equality synthesis); closed 1998881e. Q5 now reaches expected binary hash-join family (filtered region+orders below join tree, no 6-table MultiHashJoin) in 16-26s, was cancel@1100s+ in M0076-final; Q3=11462/Q12=2/Q13=35/Q21=381/Q22=7 held. docs/design/fix-for-q5/ is authoritative bundle."
   },
   {
    "feature": "Root-cause investigation of planner nondeterminism vs pool-state behavior in plan-snapshot regression harness",
@@ -1602,7 +1604,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: no harness/investigation code; diagnostic work deferred"
+   "code_audit": "confirmed-open 2026-07-08: the plan-snapshot harness itself landed (cmd/plan-snapshot/main.go, b27869c7/M0076-0006), but the root-cause investigation this entry names — planner-side nondeterminism vs connection-pool state behind batch-mode plan-diff false positives — was never performed. docs/design/0076-0006-plan-snapshot-harness.md:15-17 defers it to M0077; docs/handover/2026-05-11-tpch-status-phase9.md:186-189 shows M0077 closing with only a workaround ('batch mode remains best-effort', use --queries=N per-query mode) not a diagnosis. No commit/doc/ledger entry since phase9 revisits it."
   },
   {
    "feature": "Diagnose and isolate individual build optimization flag (PGO / GOAMD64=v3 / ldflags) causing +9.5% wall-time regression",
@@ -1622,7 +1624,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: no diagnostics; regression investigation deferred"
+   "code_audit": "PARTIAL/moot 2026-07-08: per-knob A/B isolation was never performed (M0076-0003 absent from .ralph/fix_plan.md entirely; docs/handover/2026-05-10-tpch-status-phase7.md:287-290 stated the intent but no follow-up isolates PGO vs GOAMD64=v3 vs ldflags vs trimpath individually). M0098-0007 (7b919821, docs/design/0098-0007-pgo-goamd64-runtime-knobs.md) later made GOAMD64=v3 + conditional PGO the unconditional default build (Makefile:84-94) WITHOUT ldflags='-s -w'/-trimpath (those stay opt-in in bench-build-optimized, Makefile:235-252) — the +9.5% finding was superseded by a default-flag decision, not diagnosed; no measurement confirms the narrower bundle is regression-free."
   },
   {
    "feature": "FilterOp predicate batch wiring (integration of vectorized expression evaluation into filterOp call-site)",
@@ -1642,7 +1644,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: operators.go:224-253 uses row-by-row evalExprSlot; design 0075-0004 defers vectorized filterOp wiring to M0076"
+   "code_audit": "confirmed-open 2026-07-08: internal/executor/operators.go's filterOp.Next() (lines 229-258) still evaluates the predicate one slot at a time via evalExprSlot(o.pred, slot, o.ctx) in a per-row loop; no vectorized/batch path was ever wired in (grep for vectoriz/batch near filterOp in internal/executor/*.go: no hits). .ralph/fix_plan.md:3118-3120 still lists 'M0122-0012 — Perf infra: vectorization/slot-pipeline/harness (~19, ARCHITECTURAL)... vectorized FilterOp/SeqScanOp' as an open, unchecked backlog item — docs/design/0075-0004-filter-batch-wiring.md's original defer-to-M0076 note is unaddressed."
   },
   {
    "feature": "Datum struct flip (re-deferral from M0075 due to silent regression)",
@@ -1683,7 +1685,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: operators_storage.go has no vectorized batch predicate evaluation in SeqScanOp; row-by-row processing only"
+   "code_audit": "confirmed-open 2026-07-08: internal/executor/operators_storage.go's seqScanOp.Next() (line 1316) still decodes and yields one heap tuple per iteration with no batch/vectorized path; grep for vectoriz/batch near seqScanOp: zero hits. Predicate evaluation itself lives entirely in the separate filterOp (operators.go:229-258, evalExprSlot row-by-row, same unresolved gap as the sibling FilterOp entry) — no pushdown into SeqScanOp exists either. .ralph/fix_plan.md:3118-3120 still lists 'M0122-0012 — Perf infra: vectorization/slot-pipeline/harness ... vectorized FilterOp/SeqScanOp' as an open, unchecked item"
   },
   {
    "feature": "Runtime SET for track_io_timing GUC is not yet wired. Currently only static session-level configuration via postgresql.conf is supported.",
@@ -1723,8 +1725,9 @@
     "fix_plan": "no-match",
     "later_commits": "superseded-by-code-audit"
    },
+   "status": "resolved",
    "confidence": "high",
-   "code_audit": "confirmed-open: Performance goal TPS≥1000 claimed unmet; no optimization closed the gap since commit"
+   "code_audit": "RESOLVED 2026-07-08: M0093 (read-only commit-skip-WAL + lazy XID) closed the M0091 TPS>=1,000 goal — commit 514bdf6e 'bench(m0093-0003 + m0093-0004): pgbench post-M0093 — 317 -> 2,740 TPS (8.6x)' measured 2,740 TPS, ~2.7x the M0091 bar. docs/design/0093-0002-pgbench-remeasurement-target.md line 50 explicitly ties its acceptance criterion to 'M0091's original acceptance (TPS >= 1,000)'. All M0093 sub-milestones marked complete in fix_plan.md (commit 92954445); TPC-H Q1-Q22 regression swept clean (commit 1eb3a168)."
   },
   {
    "feature": "PostgreSQL features pg_multixact, pg_twophase, and pg_commit_ts are not implemented at the executor level and therefore have no WAL persistence",
@@ -1805,12 +1808,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: Spill-path closure-capture optimization described as deferred, left unoptimized cold path"
+   "code_audit": "confirmed-open 2026-07-08: internal/executor/spill.go's spillWriter.WriteRow and spillReader.ReadRowInto still call activity.LookupCurrentGoroutine() unconditionally on every spilled row (1x in WriteRow, 2x in ReadRowInto) — the exact cold-path lookup docs/design/0091-0001-activity-tracking-goroutineid-fastpath.md:117-126 decided to drop ('Decision: drop these calls'). Commit 5653b1d9 (M0107-0005 loop-10) only swapped the call signature (LookupGoroutine()->LookupCurrentGoroutine()) as part of a wholesale ActivityRegistry rewrite; the per-row call itself was never removed, and LookupCurrentGoroutine still runs goroutineID() (runtime.Stack-based, internal/activity/activity.go:186-207) every call. Unlike the sibling Pool/Manager/AIO hooks (below), spill.go was never migrated to the fast-path-gated LookupTrackedGoroutine (internal/activity/registry.go:607) built later for track_io_timing. Unoptimized as of HEAD."
   },
   {
    "feature": "Client-driven Pool/Manager/AIO hooks optimization (larger refactor scope deferred from M0091)",
    "task_id": "m0091",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "Client-driven Pool/Manager/AIO hooks are deferred (smaller share + larger refactor)"
    ],
@@ -1825,7 +1829,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: Client-driven Pool/Manager/AIO hooks optimization deferred from M0091 scope"
+   "code_audit": "RESOLVED 2026-07-08: commit da7224d7 'fix(m0092-0005): gate client-driven I/O hooks behind track_io_timing' implemented the deferred optimization named in docs/design/0092-0005-lookup-goroutine-io-hooks-guc.md: Pool.OnPinWait/OnPinDone, Manager.OnReadWait/OnReadDone, OnWriteWait/OnWriteDone, OnExtendWait/OnExtendDone, AIO.OnWaitStart/OnWaitEnd (internal/initdb/open.go ~lines 627-1852) are now no-ops unless track_io_timing is on, eliminating LookupGoroutine cost on the hot Pin/Read/Write/Extend path. Follow-up M0122-0003 (commit e8874a08 'track_io_timing runtime SET') made the GUC live per-session via a fast-path atomic flag + LookupTrackedGoroutine (internal/activity/registry.go:607-616), superseding the design doc's own 'M0093 candidate for proper per-session wiring' caveat. deferral_ledger.md row dated 2026-07-05 (M0122-0003) confirms closure."
   },
   {
    "feature": "Spill-path per-row lookups optimization (cold path, dropped from scope)",
@@ -1845,7 +1849,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: Spill-path per-row lookups optimization dropped from scope, cold path left unoptimized"
+   "code_audit": "confirmed-open 2026-07-08: same gap as the sibling m0091-0001 spill entry above — internal/executor/spill.go's per-row activity.LookupCurrentGoroutine() calls in WriteRow/ReadRowInto (the 'per-row lookups... dropped from scope' cold path referenced by docs/design/0091-0001-activity-tracking-goroutineid-fastpath.md:117-126) were never removed or gated. git log --follow internal/executor/spill.go shows only a mechanical rename in 5653b1d9 (M0107-0005), no elimination; no design doc or .ralph/fix_plan.md entry documents spill.go being revisited since 3bdc1adc/5c34192379. This entry and the sibling m0091-0001 spill entry describe the identical unresolved gap from two angles (closure-capture vs. per-row-lookup framing) — worth de-duplicating in a future cleanup pass."
   },
   {
    "feature": "Audit of dirty-tracking behavior in Pool.PinNew and Extend operations to identify buffer durability issues",
