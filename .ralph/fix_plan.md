@@ -865,6 +865,41 @@ every clean, green (build + pre-commit) checkpoint.
       -db postgres -user <superuser> -queries 9 -per-query-timeout 1200s`,
       same server setup as above; evidence:
       `ci/logs/20260707-000712/tpch/run.log`).
+      2026-07-07 update (investigation-only, no code landed — see today's
+      deferral ledger row for full detail): root cause found — the NLI join
+      against `partsupp` uses only the single-column FK index
+      `partsupp_supplier_fkidx (ps_suppkey)` even though `partsupp_pk
+      (ps_partkey, ps_suppkey)` exists and the WHERE clause has BOTH
+      `ps_suppkey=l_suppkey` AND `ps_partkey=l_partkey`; `bushy.go`'s DP only
+      wires one such edge into a join's canonical Predicate, leaving the
+      other as a whole-plan residual Filter checked only after every later
+      join — ~80x row amplification per probe. Prototyped a fix
+      (`attachCrossConjunctsToTree`, ANDs the unused edge onto the lowest
+      join that first co-locates both tables) that WORKED for the real Q9
+      shape: composite `partsupp_pk` chosen, `tmp/tpch-runner -queries 9`
+      280s+ timeout → `OK elapsed=87.19s rows=175` (175 verified correct
+      against a fresh real-PostgreSQL-18.3 run). **REVERTED**: the same
+      mechanism corrupts results when the join instead gets folded into a
+      `*planner.MultiHashJoin` chain (DP's alternative to NLI) — proven via a
+      minimal 3-table toy repro returning 0 rows instead of 1, traced to a
+      coordinate-space conflict between `nl_index_join.go`'s NLI index
+      picker (needs local bushy-DP-subset coordinates on the extra
+      predicate) and `bushy.go`'s `collectMultiHashTables`/
+      `applyJoinTreePosMap` MHJ-Filters pipeline (needs global FROM-order
+      coordinates, applies its own remap unconditionally, double-shifting
+      whatever coordinate space is fed in). All three touched files reverted
+      to HEAD via `git checkout --`; `go build ./...` clean;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2, Q13=33) confirming the
+      reverted tree is healthy. Next step (two options, both fully specified
+      in the ledger row): (A) make `collectCrossSideEquiKeys` fall back to
+      name-based side classification for out-of-local-range refs, then
+      attach the RAW unremapped (genuinely global-coordinate) edge predicate
+      instead of a locally-remapped one, so both downstream consumers get
+      the coordinate convention they each already expect; or (B) move the
+      attachment pass to run after `rewriteMultiWayChain` but before
+      `rewriteJoinsToNLI` so MHJ-folded joins are structurally unreachable
+      by it. Either way, add a permanent regression test pinning the toy
+      3-table repro before landing.
 - [ ] tpch/Q20-timeout — Q20 hit its per-query budget (57014/cancel)
       (AI-20260707-000712-008; repro: `tmp/tpch-nightly-runner -port 65433
       -db postgres -user <superuser> -queries 20 -per-query-timeout 1200s`,
