@@ -8,7 +8,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/goopg/goopg/internal/activity"
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/protocol"
 	"github.com/goopg/goopg/internal/sqlstate"
 )
@@ -19,12 +21,23 @@ import (
 // hits here is the database check itself.
 func startServerWithCatalog(t *testing.T, cat catalog.Catalog) (string, func()) {
 	t.Helper()
+	return startServerWithCatalogAndActivity(t, cat, nil)
+}
+
+// startServerWithCatalogAndActivity is startServerWithCatalog plus an
+// optional activity registry, needed by the M0119-0006 (AC-002 residual #2)
+// positive-datconnlimit tests: that check is gated on Config.Activity being
+// non-nil (mirroring every other Activity-registry-driven check in
+// handleStartup), which startServerWithCatalog's callers don't need.
+func startServerWithCatalogAndActivity(t *testing.T, cat catalog.Catalog, act *activity.Registry) (string, func()) {
+	t.Helper()
 	srv := New(Config{
 		Address:          "127.0.0.1:0",
 		Logger:           slog.New(slog.NewTextHandler(io.Discard, nil)),
 		AcceptDeadline:   25 * time.Millisecond,
 		HandshakeTimeout: 2 * time.Second,
 		Catalog:          cat,
+		Activity:         act,
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -189,5 +202,125 @@ func TestConnectBootstrapDatabasesAccepted(t *testing.T) {
 				t.Errorf("first frame = %c, want R (AuthenticationOk)", f.Type)
 			}
 		})
+	}
+}
+
+// TestConnectExceedsPositiveDatconnlimitRejected pins the M0119-0006 (AC-002
+// residual #2) contract: once a database's live connection count exceeds its
+// positive `datconnlimit`, a further non-superuser connection is rejected
+// post-authentication with a FATAL ErrorResponse carrying SQLSTATE 53300 and
+// the PG-compatible `too many connections for database "%s"` message,
+// mirroring postinit.c's CheckMyDatabase check. Requires a real
+// activity.Registry (see startServerWithCatalogAndActivity), since the check
+// is gated on Config.Activity being wired, exactly like every other
+// activity-registry-driven check in handleStartup.
+func TestConnectExceedsPositiveDatconnlimitRejected(t *testing.T) {
+	cat := catalog.NewInMemory()
+	if err := cat.CreateDatabase("limiteddb"); err != nil {
+		t.Fatal(err)
+	}
+	if !cat.SetDatabaseConnLimit("limiteddb", 1) {
+		t.Fatal("SetDatabaseConnLimit: database not found")
+	}
+	cat.RegisterRole("alice")
+	act := activity.NewActivityRegistry(mvcc.DefaultProcArraySize)
+	addr, stop := startServerWithCatalogAndActivity(t, cat, act)
+	defer stop()
+
+	dial := func(t *testing.T) net.Conn {
+		t.Helper()
+		conn, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+		writeStartupPacket(t, conn, map[string]string{"user": "alice", "database": "limiteddb"})
+		return conn
+	}
+
+	// First connection: count becomes 1, limit is 1 — must succeed.
+	first := dial(t)
+	defer first.Close()
+	r1 := protocol.NewFrameReader(first)
+	f1, err := r1.ReadFrame()
+	if err != nil {
+		t.Fatalf("first connection: read first frame: %v", err)
+	}
+	if f1.Type != protocol.MsgAuthentication {
+		got := decodeFields(t, f1.Payload)
+		t.Fatalf("first connection rejected: SQLSTATE=%q msg=%q",
+			got[protocol.FieldSQLState], got[protocol.FieldMessage])
+	}
+
+	// Second connection: count becomes 2 > limit 1 — must be rejected.
+	second := dial(t)
+	defer second.Close()
+	r2 := protocol.NewFrameReader(second)
+	var f2 protocol.Frame
+	for {
+		fr, err := r2.ReadFrame()
+		if err != nil {
+			t.Fatalf("second connection: read FATAL ErrorResponse: %v", err)
+		}
+		if fr.Type == protocol.MsgErrorResponse {
+			f2 = fr
+			break
+		}
+		if fr.Type != protocol.MsgAuthentication {
+			t.Fatalf("unexpected frame %c before ErrorResponse", fr.Type)
+		}
+	}
+	got := decodeFields(t, f2.Payload)
+	if got[protocol.FieldSeverity] != "FATAL" {
+		t.Errorf("severity = %q, want FATAL", got[protocol.FieldSeverity])
+	}
+	if got[protocol.FieldSQLState] != string(sqlstate.TooManyConnections) {
+		t.Errorf("SQLSTATE = %q, want %q (53300)",
+			got[protocol.FieldSQLState], sqlstate.TooManyConnections)
+	}
+	if want := `too many connections for database "limiteddb"`; got[protocol.FieldMessage] != want {
+		t.Errorf("message = %q, want %q", got[protocol.FieldMessage], want)
+	}
+	if _, err := r2.ReadFrame(); err == nil {
+		t.Error("expected EOF after FATAL, got nil")
+	}
+}
+
+// TestConnectPositiveDatconnlimitSuperuserBypasses confirms the bootstrap
+// superuser ("postgres") connects past a positive datconnlimit that would
+// reject any other role, mirroring CheckMyDatabase's `!am_superuser` gate:
+// the superuser's own connections are still counted (CountDBConnections has
+// no role filter) but the reject check itself never applies to them.
+func TestConnectPositiveDatconnlimitSuperuserBypasses(t *testing.T) {
+	cat := catalog.NewInMemory()
+	if err := cat.CreateDatabase("limiteddb2"); err != nil {
+		t.Fatal(err)
+	}
+	if !cat.SetDatabaseConnLimit("limiteddb2", 1) {
+		t.Fatal("SetDatabaseConnLimit: database not found")
+	}
+	act := activity.NewActivityRegistry(mvcc.DefaultProcArraySize)
+	addr, stop := startServerWithCatalogAndActivity(t, cat, act)
+	defer stop()
+
+	for i := range 3 {
+		conn, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+		writeStartupPacket(t, conn, map[string]string{"user": "postgres", "database": "limiteddb2"})
+
+		r := protocol.NewFrameReader(conn)
+		f, err := r.ReadFrame()
+		if err != nil {
+			t.Fatalf("connection %d: read first frame: %v", i, err)
+		}
+		if f.Type != protocol.MsgAuthentication {
+			got := decodeFields(t, f.Payload)
+			t.Fatalf("connection %d rejected: SQLSTATE=%q msg=%q",
+				i, got[protocol.FieldSQLState], got[protocol.FieldMessage])
+		}
 	}
 }

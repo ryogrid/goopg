@@ -896,6 +896,30 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 		}
 	}()
 
+	// M0119-0006 (AC-002 residual #2): reject a non-superuser connection once
+	// the database's live connection count exceeds a positive `datconnlimit`,
+	// mirroring PG's InitPostgres/CheckMyDatabase FATAL 53300 "too many
+	// connections for database" (postinit.c). Placed after reg.Register above
+	// so CountByDatName's scan already includes this connection's own slot,
+	// matching CountDBConnections' self-inclusive count (postinit.c's own
+	// comment: "we create our PGPROC before checking for other PGPROCs").
+	// Superuser connections are still counted (matching CountDBConnections
+	// having no role filter) but skip the reject check itself, exactly like
+	// upstream's `!am_superuser` gate.
+	if db := params["database"]; db != "" && !isReplication && reg != nil {
+		if limReg, ok := s.cfg.Catalog.(databaseConnLimitRegistry); ok {
+			if limit := limReg.DatabaseConnLimit(db); limit >= 0 && !isSuperuserRoleName(user) {
+				if count := reg.CountByDatName(db); count > limit {
+					s.writeFatal(w, sqlstate.TooManyConnections,
+						fmt.Sprintf("too many connections for database %q", db))
+					logger.Info("connection rejected: too many connections",
+						"database", db, "limit", limit, "count", count)
+					return
+				}
+			}
+		}
+	}
+
 	// Wire client-I/O wait-event hooks on the frame reader/writer.
 	// M0107-0005: capture reg + procNum (int32); WaitEventStart/End are
 	// now O(1) atomic stores with no global mutex (vs Registry.mu.Lock

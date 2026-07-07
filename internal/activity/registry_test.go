@@ -118,6 +118,52 @@ func TestActivityRegistryBackgroundWorker(t *testing.T) {
 	}
 }
 
+// TestActivityRegistryCountByDatName pins M0119-0006 (AC-002 residual #2)'s
+// connect-time counting primitive: CountByDatName must count every currently
+// registered slot whose DatName matches, across multiple databases, and
+// reflect Unregister immediately (no stale entries), including the
+// self-inclusive property Server.handleStartup relies on (a backend already
+// Register()'d for db "a" is itself counted by a CountByDatName("a") call
+// made afterward for that same connection).
+func TestActivityRegistryCountByDatName(t *testing.T) {
+	r := NewActivityRegistry(16)
+
+	if n := r.CountByDatName("a"); n != 0 {
+		t.Fatalf("CountByDatName before any Register = %d, want 0", n)
+	}
+
+	r.Register(&Backend{PID: "1", DatName: "a", State: "active"})
+	if n := r.CountByDatName("a"); n != 1 {
+		t.Fatalf("CountByDatName(a) after one Register = %d, want 1", n)
+	}
+	if n := r.CountByDatName("b"); n != 0 {
+		t.Fatalf("CountByDatName(b) = %d, want 0 (no backend in b)", n)
+	}
+
+	r.Register(&Backend{PID: "2", DatName: "a", State: "active"})
+	r.Register(&Backend{PID: "3", DatName: "b", State: "active"})
+	if n := r.CountByDatName("a"); n != 2 {
+		t.Fatalf("CountByDatName(a) after two Registers = %d, want 2", n)
+	}
+	if n := r.CountByDatName("b"); n != 1 {
+		t.Fatalf("CountByDatName(b) after one Register = %d, want 1", n)
+	}
+
+	r.Unregister("1")
+	if n := r.CountByDatName("a"); n != 1 {
+		t.Fatalf("CountByDatName(a) after Unregister = %d, want 1", n)
+	}
+
+	r.Unregister("2")
+	r.Unregister("3")
+	if n := r.CountByDatName("a"); n != 0 {
+		t.Fatalf("CountByDatName(a) after both Unregistered = %d, want 0", n)
+	}
+	if n := r.CountByDatName("b"); n != 0 {
+		t.Fatalf("CountByDatName(b) after Unregister = %d, want 0", n)
+	}
+}
+
 // TestActivityRegistrySetCurrentGoroutine verifies the goroutine-activity map
 // provides (reg, procNum) lookup used by pool/AIO/spill hooks.
 func TestActivityRegistrySetCurrentGoroutine(t *testing.T) {

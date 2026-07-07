@@ -1813,8 +1813,13 @@ prev-link fixes.
       index AMs. (2026-07-07: the `datconnlimit=-2` invalid-DB filter sub-section is
       now fully closed, both its SQL-visibility half — M0119-0006 AC-002 — and its
       connect-time-enforcement half — M0119-0006 AC-002 residual #1 follow-up;
-      positive `datconnlimit` connection-count throttling remains a separate, still-
-      open gap, tracked in the deferral ledger, not part of AC-002's scope.) Design
+      **2026-07-07, same day:** positive `datconnlimit` connection-count throttling
+      (residual #2) is also now closed — `activity.ActivityRegistry.CountByDatName`
+      + a `Server.handleStartup` check reject a non-superuser connection once a
+      database's live connection count exceeds its configured limit, mirroring
+      `postinit.c`'s `CheckMyDatabase`/`CountDBConnections` (FATAL `53300`). AC-002
+      now has zero remaining residuals; per-role `rolconnlimit` throttling (a
+      separate PG mechanism) remains untracked, per the matching ledger row.) Design
       `0110-0003-*`.
 
 ## M0119 — Deferral-Ledger Backlog Consumption (filed 2026-06-29)

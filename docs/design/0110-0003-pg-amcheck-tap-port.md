@@ -603,3 +603,132 @@ Gates: `go build ./...` clean; `go vet ./internal/server/... ./internal/catalog/
 clean; `go test ./internal/server/... ./internal/catalog/... ./internal/executor/...`
 PASS; `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh` PASS
 (0 failed transactions, standard/simple-update/select-only).
+
+### Follow-up: residual #2 — positive `datconnlimit` connection-count throttling (2026-07-07)
+
+The previous follow-up deliberately scoped out the "too many connections"
+check (`CheckMyDatabase`, `postgres/src/backend/utils/init/postinit.c:392-399`):
+
+```c
+if (dbform->datconnlimit >= 0 &&
+    AmRegularBackendProcess() &&
+    !am_superuser &&
+    CountDBConnections(MyDatabaseId) > dbform->datconnlimit)
+    ereport(FATAL,
+            (errcode(ERRCODE_TOO_MANY_CONNECTIONS),
+             errmsg("too many connections for database \"%s\"", name)));
+```
+
+Two properties of the upstream check matter for the port:
+
+1. **The count includes the connecting backend itself.** The comment right
+   above it says so explicitly: "we create our PGPROC before checking for
+   other PGPROCs... the connection limit is approximate." `CountDBConnections`
+   scans `ProcArray` for every backend (any role) whose `databaseId` matches,
+   with no self-exclusion — unlike its cousin `CountOtherDBBackends` (used by
+   `DROP DATABASE`), which explicitly skips `MyProc`. So the comparison is
+   `count > limit`, not `count >= limit`, and the counter must be incremented
+   *before* the comparison runs.
+2. **Superuser connections are still counted, only the check is skipped for
+   them.** `!am_superuser` gates the `ereport`, not the count — a superuser
+   session occupies a slot that counts against everyone else's limit exactly
+   like a regular one does, since `CountDBConnections` has no role filter.
+
+goopg has no `ProcArray`; the closest existing analogue that already tracks
+one entry per live backend, keyed by database name, is
+`activity.ActivityRegistry` (`internal/activity/registry.go`), populated by
+`Server.handleStartup`'s existing `reg.Register(&activity.Backend{DatName:
+params["database"], ...})` call (line ~875) and released by the existing
+teardown `defer` calling `reg.Unregister(pidStr)` (line ~895). Since that
+`Register` call already happens before any point this check could run, no
+new mutable state or lifecycle is needed: a slot-scan count taken *after*
+`Register` already has the self-inclusive property `CountDBConnections`
+relies on, and `Unregister`'s existing cleanup already keeps it accurate on
+every teardown path (including the reject path added here) with zero new
+increment/decrement pairing to get wrong. (An earlier draft of this section
+proposed a dedicated `dbConnMu`/`dbConnCounts` counter incremented/decremented
+around a `connLimitDB` closure variable; per-review, that added a second
+piece of state and a new leak surface across every future early-return in
+`handleStartup` for no benefit — `handleStartup` runs once per TCP connection,
+not the per-frame hot path, so the O(slot-count) scan below costs nothing
+that matters.)
+
+Add one read-only method to `ActivityRegistry`:
+
+```go
+// CountByDatName returns the number of currently registered backend slots
+// (regular + background) whose DatName equals name, INCLUDING a backend
+// that has already Register()'d itself for this same connection — mirrors
+// PG's CountDBConnections (postinit.c / procarray.c), which counts the
+// calling backend's own PGPROC alongside every other backend's, unlike its
+// self-excluding cousin CountOtherDBBackends (used by DROP DATABASE).
+// O(len(slots)); intended for connect-time use (once per TCP connection),
+// not the per-frame WaitEvent hot path.
+func (r *ActivityRegistry) CountByDatName(name string) int32 {
+    var n int32
+    for i := range r.slots {
+        if c := r.slots[i].cold; c != nil && c.DatName == name {
+            n++
+        }
+    }
+    return n
+}
+```
+
+And one new check in `Server.handleStartup`, placed right after the existing
+`reg.Register(...)` / `activity.SetCurrentGoroutine(...)` block (so `db`'s
+own just-registered slot is already counted) — either before or after the
+teardown `defer` is fine now, since there is no new state for the defer to
+release:
+
+```go
+if db := params["database"]; db != "" && !isReplication && reg != nil {
+    if limReg, ok := s.cfg.Catalog.(databaseConnLimitRegistry); ok {
+        if limit := limReg.DatabaseConnLimit(db); limit >= 0 && !isSuperuserRoleName(user) {
+            if count := reg.CountByDatName(db); count > limit {
+                s.writeFatal(w, sqlstate.TooManyConnections,
+                    fmt.Sprintf("too many connections for database %q", db))
+                logger.Info("connection rejected: too many connections",
+                    "database", db, "limit", limit, "count", count)
+                return
+            }
+        }
+    }
+}
+```
+
+Reused as-is, no new plumbing needed: `databaseConnLimitRegistry.
+DatabaseConnLimit` (already returns any configured limit, not just the `-2`
+sentinel), `isSuperuserRoleName` (existing bootstrap-`postgres`-is-the-only-
+superuser convention, already used for `is_superuser` GUC reporting a few
+lines below), and `sqlstate.TooManyConnections` (`53300`, already defined,
+previously unused). The existing teardown `defer` (`reg.Unregister(pidStr)`)
+needs no change: rejecting here still runs it via the normal `return` path,
+removing this backend's slot exactly like any other disconnect.
+
+Deliberately NOT done: replication connections stay excluded from the
+count (matching `AmRegularBackendProcess()`'s exclusion of walsenders — goopg
+routes those to a separate path before reaching this block, via the
+pre-existing `isReplication` guard); background/internal connections that
+never go through `handleStartup` (there are none reaching user databases
+today) are out of scope; per-role connection limits (`pg_authid.rolconnlimit`,
+a separate PG mechanism) are a different, untracked feature.
+
+**Test plan.** Extend `internal/server/database_exists_test.go`:
+`startServerWithCatalog`'s signature grows an `act *activity.Registry`
+parameter (nil-safe passthrough into `Config.Activity`; existing callers pass
+`nil`, preserving today's behaviour where this whole block is skipped).
+`TestConnectExceedsPositiveDatconnlimitRejected` wires a real
+`activity.NewActivityRegistry(N)`, sets `SetDatabaseConnLimit(db, 1)`, opens
+and keeps one connection alive, then dials a second and asserts the FATAL
+`53300` `too many connections for database "%s"` ErrorResponse.
+`TestConnectPositiveDatconnlimitSuperuserBypasses` mirrors it connecting as
+`postgres` past the same limit to confirm the bypass (still counted, not
+rejected). `TestActivityRegistryCountByDatName`
+(`internal/activity/registry_test.go`) unit-tests `CountByDatName` directly
+(multiple databases, zero/one/many matching slots, post-`Unregister` count
+drop) without a real server.
+
+Gates: `go build ./...`; `go vet ./internal/server/... ./internal/activity/...`;
+`go test ./internal/server/... ./internal/activity/... ./internal/catalog/...`;
+`RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh`.
