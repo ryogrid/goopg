@@ -5252,6 +5252,14 @@ func (c *InMemory) RegisterIndexDuringRecovery(
 	oid uint32,
 	colDescending []bool,
 	colNullsFirst []bool,
+	hasPredicate bool,
+	predicateString string,
+	includeColumns []string,
+	colOpClasses []string,
+	colCollations []string,
+	fillfactor int,
+	deduplicateItems *bool,
+	nullsNotDistinct bool,
 ) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -5298,6 +5306,21 @@ func (c *InMemory) RegisterIndexDuringRecovery(
 		OID:           oid,
 		ColDescending: append([]bool(nil), colDescending...),
 		ColNullsFirst: append([]bool(nil), colNullsFirst...),
+		// --- M0122-0006 follow-up: index properties beyond ordering, carried
+		// through the CREATE INDEX WAL record the same way ColDescending/
+		// ColNullsFirst are (see wal.CreateIndexPayload's extension block).
+		// The heap-recovery driver (loadUserIndexesFromHeap) does not yet
+		// decode these from pg_index's heap row, so it always passes the
+		// zero values here — a separate, already-documented residual, not a
+		// regression introduced by this call.
+		HasPredicate:     hasPredicate,
+		PredicateString:  predicateString,
+		IncludeColumns:   append([]string(nil), includeColumns...),
+		ColOpClasses:     append([]string(nil), colOpClasses...),
+		ColCollations:    append([]string(nil), colCollations...),
+		Fillfactor:       fillfactor,
+		DeduplicateItems: deduplicateItems,
+		NullsNotDistinct: nullsNotDistinct,
 	}
 	c.indexes[k] = idx
 	if c.byTable[tbl.OID] == nil {

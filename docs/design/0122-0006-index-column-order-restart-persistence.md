@@ -188,3 +188,113 @@ change to the specific milestone item (index column ordering).
   `bench/tpch/runtime_goopg/data`'s pre-existing WAL history).
 - `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh` PASS
   (0 failed transactions, all 3 workloads).
+
+## Follow-up (2026-07-08): index properties beyond ordering
+
+The original fix's own deferral-ledger row flagged a wider version of gap
+(3): `wal.CreateIndexPayload` carried only `OID/TableOID/Schema/Name/
+Method/Columns/Unique/Primary/ColDescending/ColNullsFirst` — a partial
+index's `WHERE` predicate, `INCLUDE` columns, per-column opclass/
+collation overrides, `WITH (fillfactor=…)`, `WITH (deduplicate_items=…)`,
+and `NULLS NOT DISTINCT` were all still set on `idx` in a caller's
+*post-call* resync block, after `createBTreeIndex`'s WAL record had
+already been built — the exact same "WAL emitted too early" shape gap
+(3) above fixed for `ColDescending`/`ColNullsFirst`, just for a wider set
+of fields.
+
+### Fix
+
+- **`wal.CreateIndexPayload`** (`internal/wal/recovery.go`) gained
+  `HasPredicate`, `PredicateString`, `IncludeColumns`, `ColOpClasses`,
+  `ColCollations`, `Fillfactor`, `DeduplicateItems`, `NullsNotDistinct`.
+  Encoded as a new, **optional** trailing "extension" block
+  (`encodeCreateIndexExtension`/`decodeCreateIndexExtension`), appended
+  after the `ColDescending`/`ColNullsFirst` blocks only when at least one
+  of these fields is non-default (`hasCreateIndexExtension`) — a plain
+  index's WAL record stays byte-identical to before this follow-up, so
+  every pre-existing backward-compat test needed no changes. `Decode`
+  now accepts three payload generations: `remaining == 0` (pre-M0122-0006,
+  no order blocks), `remaining == 2*numCols` (M0122-0006, order blocks
+  only), `remaining > 2*numCols` (this follow-up, order blocks + a
+  self-describing extension block: a flags byte, `int32` fillfactor,
+  then the optional predicate string / INCLUDE list / per-column
+  opclass and collation lists).
+- **`createBTreeIndex`** (`internal/executor/operators_ddl.go`) gained an
+  optional trailing `props *btreeIndexProps` parameter (replacing the old
+  bare `predExpr ...planner.Expr` variadic — the predicate expression is
+  now one field of the new struct). All 8 new properties are set on `idx`
+  immediately after creation, in the same block as `ColDescending`/
+  `ColNullsFirst`, strictly BEFORE the WAL record is built — the identical
+  ordering discipline the original fix established. Only the two call
+  sites that actually declare these properties needed updating:
+  `execCreateIndex`'s direct `CREATE INDEX` path and
+  `createPartitionChildIndexes` (partition-child index echo, which now
+  also propagates the parent's `ColOpClasses`/`ColCollations` — a small
+  pre-existing gap of its own, since nothing computed those before). The
+  other 14 `createBTreeIndex` call sites (constraint-backed PK/UNIQUE/
+  EXCLUDE indexes with no such properties) are unaffected — they simply
+  omit the new optional argument, as they already omitted the old
+  `predExpr` variadic.
+- **`catalog.RegisterIndexDuringRecovery`** and the `indexRegistryRecovery`
+  interface (`internal/initdb/index_ddl_recovery.go`) gained the same 8
+  parameters, set directly on the newly-registered `*catalog.Index`
+  literal. `replayIndexDDLRecords` (pure-WAL driver) passes the decoded
+  payload's values straight through. `loadUserIndexesFromHeap`
+  (heap-based driver) passes their zero values — the heap-decode side of
+  this gap (pg_index's `indclass`/`indcollation`/`indexprs`/`indpred`
+  content is still never decoded; `buildUserPGIndexRow` still writes them
+  as all-zero/NULL) is a separate, already-known residual (see the ledger
+  row below), not something this call regresses.
+- `idx.Predicate` (the parsed `parser.Expr` AST, as opposed to
+  `PredicateString`) is deliberately **not** threaded through WAL/
+  recovery: nothing reads it again after `CREATE INDEX` finishes — the
+  build-time row filter runs once, and `pg_get_indexdef`/pg_dump render
+  from `PredicateString`. It remains set only for the live session (kept
+  in each call site's now-much-smaller post-call block), so it is `nil`
+  after a WAL-only crash-restart recovery — harmless given nothing
+  consults it post-restart.
+
+### Tests
+
+- `internal/wal/index_ddl_test.go`: `TestEncodeCreateIndexExtensionRoundTrip`
+  (new fields round-trip), `TestEncodeCreateIndexOmitsExtensionBlockWhenDefault`
+  (plain index emits no extension bytes), `TestDecodeCreateIndexBackwardCompat
+  OrderBlocksOnlyNoExtension` (gen1 record — order blocks, no extension —
+  still decodes with every new field at zero), `TestDecodeCreateIndexRejects
+  TruncatedExtension` (every cut point inside the extension block errors).
+- `internal/initdb/index_ddl_recovery_test.go`,
+  `TestCreateIndexExtendedPropertiesSurviveRestartViaWAL`: the same
+  true-crash pattern as `TestCreateIndexColumnOrderingSurvivesRestartViaWAL`
+  (flush WAL, close WAL+StorageMgr directly, skip `Pool.Close`), for
+  `CREATE UNIQUE INDEX ext_idx ON ext (a, b COLLATE "C" text_pattern_ops)
+  INCLUDE (c) WITH (fillfactor=70, deduplicate_items=off) NULLS NOT
+  DISTINCT WHERE (a > 0)`. Confirmed non-vacuous: temporarily reverted the
+  WAL payload to omit the new fields (leaving `idx.*` correctly set
+  in-memory) and confirmed all 8 assertions failed as expected, then
+  restored the fix.
+- Live end-to-end verification against the real `cmd/goopg` binary: the
+  exact statement above, `kill -9` with no checkpoint, restart —
+  `pg_get_indexdef` and `pg_index.indoption`/`indnullsnotdistinct`/
+  `indclass`/`indcollation` all correct post-restart.
+
+### Gates run (this follow-up)
+
+- `go build ./...` / `go vet ./...` clean.
+- `go test ./internal/wal/... ./internal/catalog/... ./internal/executor/...
+  ./internal/initdb/... ./internal/planner/... ./internal/analyzer/...
+  ./internal/parser/... ./internal/server/...` PASS.
+- `go test -short ./...` (excluding `internal/testutil/tpch` and
+  `internal/testport`) PASS.
+- `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33).
+- `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh` PASS
+  (0 failed transactions, all 3 workloads).
+
+### Still deferred
+
+The heap-recovery driver's decode-side gap noted above (`pg_index`'s
+`indclass`/`indcollation`/`indexprs`/`indpred` content is never decoded
+from the heap row, and `PGIndexRow`/`DecodePGIndexPhysicalRow` have no
+`indnullsnotdistinct` field either, so a *checkpointed* restart still
+loses opclass/collation/predicate/INCLUDE/NULLS-NOT-DISTINCT — only a
+genuine uncheckpointed crash is covered by this follow-up's WAL path)
+remains open; see the deferral ledger for the resume point.

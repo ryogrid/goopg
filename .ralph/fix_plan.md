@@ -3098,6 +3098,46 @@ mirroring M0119's ledger `status` column.
       this cluster: `pg_index` persistent heap (partially covered by the
       above but the bullet's original framing — a fuller pg_index heap
       story — may still have residuals), `pg_tablespace` visibility.
+      **2026-07-08 follow-up (index properties beyond ordering — done):**
+      fixed the sibling gap the above investigation flagged (ledger row,
+      2026-07-08): `wal.CreateIndexPayload` gained `HasPredicate`/
+      `PredicateString`/`IncludeColumns`/`ColOpClasses`/`ColCollations`/
+      `Fillfactor`/`DeduplicateItems`/`NullsNotDistinct`, encoded as a new
+      optional trailing "extension" block (omitted for a plain index — no
+      byte-format change to existing WAL/tests) after the ColDescending/
+      ColNullsFirst blocks. `createBTreeIndex` gained an optional
+      `btreeIndexProps` struct parameter (replacing the old bare
+      `predExpr ...planner.Expr` variadic) set on `idx` before its WAL
+      emission — the exact same durability-ordering fix as the ordering
+      bullet above, for a wider field set. `RegisterIndexDuringRecovery` +
+      interface gained the same 8 params. Design:
+      `docs/design/0122-0006-index-column-order-restart-persistence.md`
+      "Follow-up (2026-07-08)" section; `docs/design/README.md` row
+      updated. Tests: `TestEncodeCreateIndexExtensionRoundTrip`/
+      `TestEncodeCreateIndexOmitsExtensionBlockWhenDefault`/
+      `TestDecodeCreateIndexBackwardCompatOrderBlocksOnlyNoExtension`/
+      `TestDecodeCreateIndexRejectsTruncatedExtension` (wal),
+      `TestCreateIndexExtendedPropertiesSurviveRestartViaWAL` (initdb,
+      true-crash pattern, confirmed non-vacuous via a temporary revert).
+      Live-verified against the real `cmd/goopg` binary with an actual
+      `kill -9`: `pg_get_indexdef`/`pg_index` correct post-restart for a
+      `WHERE`/`INCLUDE`/opclass/collation/fillfactor/dedup/`NULLS NOT
+      DISTINCT` index. Gates: `go build ./...`/`go vet ./...` clean; `go
+      test ./internal/wal/... ./internal/catalog/... ./internal/executor/...
+      ./internal/initdb/... ./internal/planner/... ./internal/analyzer/...
+      ./internal/parser/... ./internal/server/...` PASS; `go test -short
+      ./...` (excluding tpch/testport) PASS; `scripts/tpch-spotcheck.sh`
+      PASS (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+      scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 workloads).
+      **Still deferred** (new 2026-07-08 ledger row): the heap-recovery
+      driver (`loadUserIndexesFromHeap`) still can't restore any of these 8
+      fields after a *checkpointed* restart — `pg_index`'s `indclass`/
+      `indcollation`/`indexprs`/`indpred` heap content is never decoded
+      (`DecodePGIndexPhysicalRow`/`buildUserPGIndexRow`), and there's no
+      `indnullsnotdistinct` heap field either. Only the uncheckpointed-crash
+      path (fixed here) is covered; see the ledger row for the resume
+      point. `pg_tablespace` visibility remains a separate open item in
+      this cluster.
 - [ ] **M0122-0007 — DDL / admin commands / ctl / GUC config** (~14). CREATE/DROP
       DATABASE full DDL, `goopg ctl restart`, REINDEX, SIGHUP config reload,
       tablespaces, ALTER FUNCTION/COLUMN, planner/jit GUC stubs.

@@ -96,6 +96,138 @@ func TestEncodeCreateIndexRoundTrip(t *testing.T) {
 	}
 }
 
+// TestEncodeCreateIndexExtensionRoundTrip pins the M0122-0006 follow-up
+// encoding contract: HasPredicate/PredicateString, IncludeColumns,
+// ColOpClasses, ColCollations, Fillfactor, DeduplicateItems, and
+// NullsNotDistinct must all round-trip byte-for-byte through Encode/Decode.
+func TestEncodeCreateIndexExtensionRoundTrip(t *testing.T) {
+	dedupOff := false
+	dedupOn := true
+	cases := []struct {
+		name string
+		p    CreateIndexPayload
+	}{
+		{
+			name: "plain index emits no extension block",
+			p: CreateIndexPayload{
+				OID: 1, TableOID: 2, Name: "plain_idx", Method: "btree",
+				Columns: []string{"a"}, Unique: true,
+			},
+		},
+		{
+			name: "partial index with predicate",
+			p: CreateIndexPayload{
+				OID: 3, TableOID: 4, Name: "partial_idx", Method: "btree",
+				Columns:         []string{"a"},
+				HasPredicate:    true,
+				PredicateString: "(a > 0)",
+			},
+		},
+		{
+			name: "include columns + opclass + collation + fillfactor + dedup off + nulls not distinct",
+			p: CreateIndexPayload{
+				OID: 5, TableOID: 6, Name: "full_idx", Method: "btree",
+				Columns:          []string{"a", "b"},
+				Unique:           true,
+				IncludeColumns:   []string{"c", "d"},
+				ColOpClasses:     []string{"text_pattern_ops", ""},
+				ColCollations:    []string{"", "\"C\""},
+				Fillfactor:       70,
+				DeduplicateItems: &dedupOff,
+				NullsNotDistinct: true,
+			},
+		},
+		{
+			name: "dedup on, no other extension fields",
+			p: CreateIndexPayload{
+				OID: 7, TableOID: 8, Name: "dedup_idx", Method: "btree",
+				Columns:          []string{"a"},
+				DeduplicateItems: &dedupOn,
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			enc := EncodeCreateIndex(tc.p)
+			got, err := DecodeCreateIndex(enc)
+			if err != nil {
+				t.Fatalf("DecodeCreateIndex: %v", err)
+			}
+			if got.HasPredicate != tc.p.HasPredicate {
+				t.Errorf("HasPredicate = %v, want %v", got.HasPredicate, tc.p.HasPredicate)
+			}
+			if got.PredicateString != tc.p.PredicateString {
+				t.Errorf("PredicateString = %q, want %q", got.PredicateString, tc.p.PredicateString)
+			}
+			if len(got.IncludeColumns) != len(tc.p.IncludeColumns) {
+				t.Fatalf("IncludeColumns len = %d, want %d", len(got.IncludeColumns), len(tc.p.IncludeColumns))
+			}
+			for i := range tc.p.IncludeColumns {
+				if got.IncludeColumns[i] != tc.p.IncludeColumns[i] {
+					t.Errorf("IncludeColumns[%d] = %q, want %q", i, got.IncludeColumns[i], tc.p.IncludeColumns[i])
+				}
+			}
+			wantOpc := tc.p.ColOpClasses
+			if wantOpc == nil {
+				wantOpc = make([]string, len(tc.p.Columns))
+			}
+			for i := range tc.p.Columns {
+				if stringAt(got.ColOpClasses, i) != wantOpc[i] {
+					t.Errorf("ColOpClasses[%d] = %q, want %q", i, stringAt(got.ColOpClasses, i), wantOpc[i])
+				}
+			}
+			wantColl := tc.p.ColCollations
+			if wantColl == nil {
+				wantColl = make([]string, len(tc.p.Columns))
+			}
+			for i := range tc.p.Columns {
+				if stringAt(got.ColCollations, i) != wantColl[i] {
+					t.Errorf("ColCollations[%d] = %q, want %q", i, stringAt(got.ColCollations, i), wantColl[i])
+				}
+			}
+			if got.Fillfactor != tc.p.Fillfactor {
+				t.Errorf("Fillfactor = %d, want %d", got.Fillfactor, tc.p.Fillfactor)
+			}
+			if (got.DeduplicateItems == nil) != (tc.p.DeduplicateItems == nil) {
+				t.Fatalf("DeduplicateItems nil-ness mismatch: got=%v want=%v", got.DeduplicateItems, tc.p.DeduplicateItems)
+			}
+			if tc.p.DeduplicateItems != nil && *got.DeduplicateItems != *tc.p.DeduplicateItems {
+				t.Errorf("DeduplicateItems = %v, want %v", *got.DeduplicateItems, *tc.p.DeduplicateItems)
+			}
+			if got.NullsNotDistinct != tc.p.NullsNotDistinct {
+				t.Errorf("NullsNotDistinct = %v, want %v", got.NullsNotDistinct, tc.p.NullsNotDistinct)
+			}
+		})
+	}
+}
+
+// TestEncodeCreateIndexOmitsExtensionBlockWhenDefault pins that a plain index
+// (no predicate/INCLUDE/opclass/collation/fillfactor/dedup/nulls-not-distinct)
+// encodes to EXACTLY the same bytes as before this M0122-0006 follow-up
+// existed — the extension block is omitted entirely, not emitted with all
+// zero/empty fields. This is what keeps every pre-existing backward-compat
+// test (TestDecodeCreateIndexBackwardCompatNoOrderBlocks,
+// TestDecodeCreateIndexRejectsTruncated) valid unmodified.
+func TestEncodeCreateIndexOmitsExtensionBlockWhenDefault(t *testing.T) {
+	p := CreateIndexPayload{
+		OID: 1, TableOID: 2, Name: "plain_idx", Method: "btree",
+		Columns: []string{"a", "b"}, Unique: true,
+		ColDescending: []bool{true, false},
+		ColNullsFirst: []bool{false, true},
+	}
+	enc := EncodeCreateIndex(p)
+	wantLen := len(enc) // baseline: header+strings+columns+order-blocks only
+	if hasCreateIndexExtension(p) {
+		t.Fatal("hasCreateIndexExtension(plain payload) = true, want false")
+	}
+	// Setting any single new field must grow the encoded length.
+	withPred := p
+	withPred.HasPredicate = true
+	if l := len(EncodeCreateIndex(withPred)); l <= wantLen {
+		t.Errorf("HasPredicate=true encoded length = %d, want > %d", l, wantLen)
+	}
+}
+
 // TestDecodeCreateIndexBackwardCompatNoOrderBlocks pins M0122-0006's
 // backward-compatibility contract: a pre-existing on-disk WAL record
 // encoded before ColDescending/ColNullsFirst existed (i.e. missing the two
@@ -128,6 +260,36 @@ func TestDecodeCreateIndexBackwardCompatNoOrderBlocks(t *testing.T) {
 	}
 }
 
+// TestDecodeCreateIndexBackwardCompatOrderBlocksOnlyNoExtension pins
+// decoding of a "gen1" record — one written by the M0122-0006 commit that
+// added ColDescending/ColNullsFirst but predates this follow-up's extension
+// block. Such a record ends exactly after the order blocks (remaining ==
+// 2*numCols): every M0122-0006-follow-up field must default to its zero
+// value, not error out as "truncated".
+func TestDecodeCreateIndexBackwardCompatOrderBlocksOnlyNoExtension(t *testing.T) {
+	p := CreateIndexPayload{
+		OID: 9, TableOID: 10, Name: "gen1_idx", Method: "btree",
+		Columns:       []string{"a"},
+		ColDescending: []bool{true},
+		ColNullsFirst: []bool{true},
+	}
+	// p has no extension-triggering fields set, so EncodeCreateIndex already
+	// produces the exact gen1 shape (order blocks, no extension) — assert
+	// that directly rather than hand-truncating.
+	enc := EncodeCreateIndex(p)
+	got, err := DecodeCreateIndex(enc)
+	if err != nil {
+		t.Fatalf("DecodeCreateIndex(gen1 payload): %v", err)
+	}
+	if got.HasPredicate || got.PredicateString != "" || len(got.IncludeColumns) != 0 ||
+		got.Fillfactor != 0 || got.DeduplicateItems != nil || got.NullsNotDistinct {
+		t.Errorf("gen1 payload must decode with every follow-up field at its zero value, got %+v", got)
+	}
+	if !got.ColDescending[0] || !got.ColNullsFirst[0] {
+		t.Errorf("gen1 order flags lost: ColDescending=%v ColNullsFirst=%v", got.ColDescending, got.ColNullsFirst)
+	}
+}
+
 // TestDecodeCreateIndexRejectsTruncated pins the defensive
 // length checks in DecodeCreateIndex. (M0079-0001.)
 //
@@ -150,6 +312,38 @@ func TestDecodeCreateIndexRejectsTruncated(t *testing.T) {
 		}
 		if _, err := DecodeCreateIndex(enc[:cut]); err == nil {
 			t.Errorf("truncated payload at cut=%d must error", cut)
+		}
+	}
+}
+
+// TestDecodeCreateIndexRejectsTruncatedExtension pins the defensive length
+// checks inside decodeCreateIndexExtension (M0122-0006 follow-up): cutting
+// the payload anywhere inside the extension block must error, never silently
+// decode a partial/garbage value.
+func TestDecodeCreateIndexRejectsTruncatedExtension(t *testing.T) {
+	dedup := true
+	p := CreateIndexPayload{
+		OID: 11, TableOID: 12, Name: "trunc_idx", Method: "btree",
+		Columns:          []string{"a", "b"},
+		HasPredicate:     true,
+		PredicateString:  "(a > 0)",
+		IncludeColumns:   []string{"c"},
+		ColOpClasses:     []string{"text_pattern_ops", ""},
+		ColCollations:    []string{"", "\"C\""},
+		Fillfactor:       70,
+		DeduplicateItems: &dedup,
+	}
+	enc := EncodeCreateIndex(p)
+	base := p
+	base.HasPredicate, base.PredicateString = false, ""
+	base.IncludeColumns, base.ColOpClasses, base.ColCollations = nil, nil, nil
+	base.Fillfactor, base.DeduplicateItems = 0, nil
+	extBoundary := len(EncodeCreateIndex(base)) // order-blocks-only prefix length; no extension bytes yet
+	// cut == extBoundary itself (zero extension bytes) is the valid gen1
+	// shape (no extension present at all) — start just past it.
+	for cut := extBoundary + 1; cut < len(enc); cut++ {
+		if _, err := DecodeCreateIndex(enc[:cut]); err == nil {
+			t.Errorf("truncated extension payload at cut=%d must error", cut)
 		}
 	}
 }

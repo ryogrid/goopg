@@ -5978,7 +5978,39 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 			colNullsFirst[i] = ord.NullsFirst
 		}
 	}
-	if err := o.createBTreeIndex(s.Pos(), idxName, tbl, s.Columns, s.ColExprs, s.Unique, false, s.NullsNotDistinct, colDescending, colNullsFirst, resolvedPred); err != nil {
+	// Same rationale as colDescending/colNullsFirst above (M0122-0006
+	// follow-up): compute every other index property BEFORE createBTreeIndex
+	// so its CREATE INDEX WAL record captures the real values, not the
+	// defaults a post-call assignment would leave in place across a genuine
+	// crash restart.
+	var opc, coll []string
+	if hasOpClass {
+		opc = make([]string, len(s.ColOrders))
+		for i, ord := range s.ColOrders {
+			opc[i] = ord.OpClass
+		}
+	}
+	if hasCollation {
+		coll = make([]string, len(s.ColOrders))
+		for i, ord := range s.ColOrders {
+			coll[i] = ord.Collation
+		}
+	}
+	var predicateString string
+	if s.Predicate != nil {
+		predicateString = defaultExprToSQL(s.Predicate)
+	}
+	props := &btreeIndexProps{
+		Predicate:        resolvedPred,
+		HasPredicate:     s.HasPredicate,
+		PredicateString:  predicateString,
+		IncludeColumns:   s.IncludeColumns,
+		ColOpClasses:     opc,
+		ColCollations:    coll,
+		Fillfactor:       s.Fillfactor,
+		DeduplicateItems: s.DeduplicateItems,
+	}
+	if err := o.createBTreeIndex(s.Pos(), idxName, tbl, s.Columns, s.ColExprs, s.Unique, false, s.NullsNotDistinct, colDescending, colNullsFirst, props); err != nil {
 		return err
 	}
 	if declaredHash {
@@ -5992,42 +6024,16 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 	}
 	if s.HasPredicate || len(s.IncludeColumns) > 0 || s.Predicate != nil || nonDefaultOrder || hasOpClass || hasCollation || s.NullsNotDistinct || s.Fillfactor != 0 || s.DeduplicateItems != nil {
 		if idx, ok := o.ctx.Catalog.LookupIndex(idxName); ok {
-			idx.HasPredicate = s.HasPredicate
+			// HasPredicate/PredicateString/IncludeColumns/Fillfactor/
+			// DeduplicateItems/ColOpClasses/ColCollations/NullsNotDistinct are
+			// already set by createBTreeIndex above (before its WAL emission,
+			// via btreeIndexProps) — not repeated here. idx.Predicate keeps
+			// the raw WHERE-clause AST for THIS live session only: it is not
+			// WAL-persisted (only PredicateString is), since nothing reads
+			// idx.Predicate again after a restart — pg_get_indexdef/pg_dump
+			// render from PredicateString, and the build-time row filter only
+			// runs once, at CREATE INDEX time.
 			idx.Predicate = s.Predicate
-			// Persist `WITH (fillfactor=N)` so pg_class.reloptions / pg_dump
-			// round-trip it (already range-validated above). DU-002 slice 218.
-			idx.Fillfactor = s.Fillfactor
-			// Persist `WITH (deduplicate_items=on|off)` likewise. DU-002 slice 219.
-			idx.DeduplicateItems = s.DeduplicateItems
-			if s.Predicate != nil {
-				idx.PredicateString = defaultExprToSQL(s.Predicate)
-			}
-			idx.IncludeColumns = s.IncludeColumns
-			// NULLS NOT DISTINCT (PG 15+) — record so pg_index.indnullsnotdistinct
-			// and pg_get_indexdef reproduce it for pg_dump. DU-002 slice 134.
-			idx.NullsNotDistinct = s.NullsNotDistinct
-			// ColDescending/ColNullsFirst are already set by createBTreeIndex
-			// above (before its WAL emission) — not repeated here.
-			// Non-default per-column operator class (pg_index.indclass) so
-			// pg_get_indexdef / pg_dump re-emit ` text_pattern_ops` after the
-			// column. DU-002 slice 312.
-			if hasOpClass {
-				opc := make([]string, len(s.ColOrders))
-				for i, ord := range s.ColOrders {
-					opc[i] = ord.OpClass
-				}
-				idx.ColOpClasses = opc
-			}
-			// Non-default per-column collation (pg_index.indcollation) so
-			// pg_get_indexdef / pg_dump re-emit ` COLLATE "C"` after the column.
-			// DU-002 slice 313.
-			if hasCollation {
-				coll := make([]string, len(s.ColOrders))
-				for i, ord := range s.ColOrders {
-					coll[i] = ord.Collation
-				}
-				idx.ColCollations = coll
-			}
 			// Flush the just-set fields (reloptions on pg_class, everything else
 			// on pg_index) to the heap-persisted catalog rows — createBTreeIndex's
 			// own sync ran before any of these fields existed on idx, so without
@@ -6109,14 +6115,27 @@ func (o *ddlOp) createPartitionChildIndexes(s *parser.CreateIndexStmt, parentTbl
 			nameCols[i] = col
 		}
 	}
+	// Same M0122-0006-follow-up rationale as execCreateIndex's own call site:
+	// build every index property BEFORE createBTreeIndex so its CREATE INDEX
+	// WAL record captures the real values, not a post-call assignment's
+	// defaults. PredicateString/ColOpClasses/ColCollations are inherited
+	// straight from the parent index (already resolved there).
+	props := &btreeIndexProps{
+		Predicate:        resolvedPred,
+		HasPredicate:     s.HasPredicate,
+		PredicateString:  parentIdx.PredicateString,
+		IncludeColumns:   s.IncludeColumns,
+		ColOpClasses:     parentIdx.ColOpClasses,
+		ColCollations:    parentIdx.ColCollations,
+		Fillfactor:       s.Fillfactor,
+		DeduplicateItems: s.DeduplicateItems,
+	}
 	for _, childTbl := range im.PartitionChildren(parentTbl.OID) {
 		childIdxName := parser.ObjectName{
 			Schema: childTbl.Schema,
 			Name:   o.autoIndexNameWithIncludes(childTbl, nameCols, s.IncludeColumns, "idx"),
 		}
-		// resolvedPred is a nil planner.Expr when there is no partial predicate;
-		// createBTreeIndex treats a nil predExpr[0] as "no predicate".
-		if err := o.createBTreeIndex(s.Pos(), childIdxName, childTbl, s.Columns, s.ColExprs, s.Unique, false, s.NullsNotDistinct, parentIdx.ColDescending, parentIdx.ColNullsFirst, resolvedPred); err != nil {
+		if err := o.createBTreeIndex(s.Pos(), childIdxName, childTbl, s.Columns, s.ColExprs, s.Unique, false, s.NullsNotDistinct, parentIdx.ColDescending, parentIdx.ColNullsFirst, props); err != nil {
 			return err
 		}
 		childIdx, ok2 := o.ctx.Catalog.LookupIndex(childIdxName)
@@ -6129,24 +6148,25 @@ func (o *ddlOp) createPartitionChildIndexes(s *parser.CreateIndexStmt, parentTbl
 		// statement) and DROP/lock walks treat the tree as one object.
 		childIdx.PartitionParentOID = parentIdx.OID
 		im.RegisterIndexPartitionChild(parentIdx.OID, childIdx.OID)
-		// Carry the parent's partial-index / INCLUDE / expression metadata so the
-		// child's pg_get_indexdef renders identically.
+		// HasPredicate/PredicateString/IncludeColumns/ColOpClasses/
+		// ColCollations/Fillfactor/DeduplicateItems are already set by
+		// createBTreeIndex above (before its WAL emission, via
+		// btreeIndexProps) — not repeated here. childIdx.Predicate keeps the
+		// raw WHERE-clause AST for this live session only (see the identical
+		// note at execCreateIndex's own post-call block).
 		if s.HasPredicate {
-			childIdx.HasPredicate = s.HasPredicate
 			childIdx.Predicate = s.Predicate
-			childIdx.PredicateString = parentIdx.PredicateString
 		}
-		childIdx.IncludeColumns = s.IncludeColumns
 		for i, str := range parentIdx.ColExprStrings {
 			if str != "" && i < len(childIdx.ColExprStrings) {
 				childIdx.ColExprStrings[i] = str
 			}
 		}
-		// Carry the WITH-clause storage parameters too, so `CREATE INDEX ...
-		// WITH (fillfactor=N)` on a partitioned parent doesn't silently drop
-		// the option on every child (M0119-0004 index-reloptions follow-up).
-		childIdx.Fillfactor = s.Fillfactor
-		childIdx.DeduplicateItems = s.DeduplicateItems
+		// FastUpdate/GinPendingListLimit/PagesPerRange/AutoSummarize apply
+		// only to GIN/BRIN indexes, which never reach createBTreeIndex (see
+		// the catalog-only method dispatch above in execCreateIndex); kept
+		// here only for parity with the parent's WITH-clause echo, unrelated
+		// to this fix's scope.
 		childIdx.FastUpdate = s.FastUpdate
 		childIdx.GinPendingListLimit = s.GinPendingListLimit
 		childIdx.PagesPerRange = s.PagesPerRange
@@ -9438,9 +9458,33 @@ func (o *ddlOp) createExclusionIndexStub(pos int, idxName parser.ObjectName, tbl
 	return nil
 }
 
-func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalog.Table, columns []string, colExprs []parser.Expr, unique bool, primary bool, nullsNotDistinct bool, colDescending, colNullsFirst []bool, predExpr ...planner.Expr) error {
+// btreeIndexProps carries the WHERE-clause predicate, INCLUDE columns, and
+// per-column opclass/collation/fillfactor/dedup storage parameters a CREATE
+// INDEX statement (or a partition-child echo of one) declares beyond plain
+// Columns/Unique/Primary/ColDescending/ColNullsFirst. createBTreeIndex sets
+// all of these on the freshly-created catalog.Index BEFORE emitting its
+// CREATE INDEX WAL record (M0122-0006 follow-up) — see the comment at that
+// assignment for why post-call assignment isn't durability-safe. Passed as
+// an optional trailing arg (nil/omitted for the many call sites that create
+// a plain constraint-backed index with none of these properties).
+type btreeIndexProps struct {
+	Predicate        planner.Expr // resolved WHERE predicate for build-time row filtering; nil = no predicate
+	HasPredicate     bool
+	PredicateString  string
+	IncludeColumns   []string
+	ColOpClasses     []string
+	ColCollations    []string
+	Fillfactor       int
+	DeduplicateItems *bool
+}
+
+func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalog.Table, columns []string, colExprs []parser.Expr, unique bool, primary bool, nullsNotDistinct bool, colDescending, colNullsFirst []bool, props ...*btreeIndexProps) error {
 	if len(columns) == 0 {
 		return &ExecError{Code: "42601", Pos: pos, Message: "index must have at least one key column"}
+	}
+	var xp *btreeIndexProps
+	if len(props) > 0 {
+		xp = props[0]
 	}
 	cols := make([]*catalog.Column, len(columns))
 	for i, name := range columns {
@@ -9473,18 +9517,30 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 		}
 		return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
 	}
-	// Set the per-column ASC/DESC + NULLS ordering BEFORE the CREATE INDEX
-	// WAL record is built below (M0122-0006): the caller's own post-call
-	// resync block (execCreateIndex) used to set these fields on idx AFTER
-	// this function had already emitted its WAL payload, so a genuine
-	// crash restart (no intervening checkpoint) always replayed the index
-	// as plain ascending/NULLS-LAST regardless of its declared ordering,
-	// even though the heap-persisted pg_index row was already correctly
-	// resynced afterward — a WAL-vs-heap durability gap only a real,
-	// uncheckpointed SIGKILL exposed (a plain Runtime.Close() performs a
-	// shutdown checkpoint that masked it).
+	// Set the per-column ASC/DESC + NULLS ordering, and every other index
+	// property (partial predicate/INCLUDE columns/opclass/collation/
+	// fillfactor/dedup/NULLS NOT DISTINCT), BEFORE the CREATE INDEX WAL
+	// record is built below (M0122-0006 + its follow-up): a caller's own
+	// post-call resync block used to set these fields on idx AFTER this
+	// function had already emitted its WAL payload, so a genuine crash
+	// restart (no intervening checkpoint) always replayed the index with
+	// every one of these properties reverted to its default, regardless of
+	// what was actually declared, even though the heap-persisted pg_index
+	// row was already correctly resynced afterward — a WAL-vs-heap
+	// durability gap only a real, uncheckpointed SIGKILL exposed (a plain
+	// Runtime.Close() performs a shutdown checkpoint that masked it).
 	idx.ColDescending = colDescending
 	idx.ColNullsFirst = colNullsFirst
+	idx.NullsNotDistinct = nullsNotDistinct
+	if xp != nil {
+		idx.HasPredicate = xp.HasPredicate
+		idx.PredicateString = xp.PredicateString
+		idx.IncludeColumns = xp.IncludeColumns
+		idx.ColOpClasses = xp.ColOpClasses
+		idx.ColCollations = xp.ColCollations
+		idx.Fillfactor = xp.Fillfactor
+		idx.DeduplicateItems = xp.DeduplicateItems
+	}
 	// Store parsed expressions for expression-based index columns so the
 	// planner and executor can evaluate them at conflict-detection time.
 	if len(colExprs) > 0 {
@@ -9500,8 +9556,12 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 	}
 	idxRel := o.ctx.Catalog.IndexRelFileNode(idx)
 	var buildErr error
-	if len(predExpr) > 0 && predExpr[0] != nil {
-		buildErr = o.bulkBuildBTreeWithPredicate(idxRel, tbl, cols, unique, nullsNotDistinct, idxName.String(), pos, predExpr[0])
+	var predExpr planner.Expr
+	if xp != nil {
+		predExpr = xp.Predicate
+	}
+	if predExpr != nil {
+		buildErr = o.bulkBuildBTreeWithPredicate(idxRel, tbl, cols, unique, nullsNotDistinct, idxName.String(), pos, predExpr)
 	} else {
 		buildErr = o.bulkBuildBTree(idxRel, tbl, cols, unique, nullsNotDistinct, idxName.String(), pos)
 	}
@@ -9531,16 +9591,24 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 	// recovery finishes.
 	if o.ctx.Pool != nil {
 		payload := wal.EncodeCreateIndex(wal.CreateIndexPayload{
-			OID:           idx.OID,
-			TableOID:      tbl.OID,
-			Schema:        idxName.Schema,
-			Name:          idxName.Name,
-			Method:        "btree",
-			Columns:       append([]string(nil), columns...),
-			Unique:        unique,
-			Primary:       primary,
-			ColDescending: idx.ColDescending,
-			ColNullsFirst: idx.ColNullsFirst,
+			OID:              idx.OID,
+			TableOID:         tbl.OID,
+			Schema:           idxName.Schema,
+			Name:             idxName.Name,
+			Method:           "btree",
+			Columns:          append([]string(nil), columns...),
+			Unique:           unique,
+			Primary:          primary,
+			ColDescending:    idx.ColDescending,
+			ColNullsFirst:    idx.ColNullsFirst,
+			NullsNotDistinct: idx.NullsNotDistinct,
+			HasPredicate:     idx.HasPredicate,
+			PredicateString:  idx.PredicateString,
+			IncludeColumns:   idx.IncludeColumns,
+			ColOpClasses:     idx.ColOpClasses,
+			ColCollations:    idx.ColCollations,
+			Fillfactor:       idx.Fillfactor,
+			DeduplicateItems: idx.DeduplicateItems,
 		})
 		if _, err := o.ctx.Pool.LogChangeRecord(payload); err != nil {
 			// Best-effort: roll back the in-memory mutation so

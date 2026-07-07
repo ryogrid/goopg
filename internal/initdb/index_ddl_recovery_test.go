@@ -133,6 +133,79 @@ func TestCreateIndexColumnOrderingSurvivesRestartViaWAL(t *testing.T) {
 	}
 }
 
+// TestCreateIndexExtendedPropertiesSurviveRestartViaWAL pins the M0122-0006
+// follow-up: a partial-index WHERE predicate, INCLUDE columns, per-column
+// opclass/collation, WITH-clause fillfactor/deduplicate_items, and NULLS NOT
+// DISTINCT must all survive a genuine crash restart via the CREATE INDEX WAL
+// record — not silently reset to their defaults. Companion to
+// TestCreateIndexColumnOrderingSurvivesRestartViaWAL above; same
+// uncheckpointed-SIGKILL rationale (a plain rt1.Close() would flush the
+// pg_index heap row via its shutdown checkpoint and let
+// loadUserIndexesFromHeap mask a WAL-payload-specific bug).
+func TestCreateIndexExtendedPropertiesSurviveRestartViaWAL(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	if err := Init(Options{DataDir: dir}); err != nil {
+		t.Fatal(err)
+	}
+
+	rt1, err := Open(OpenOptions{DataDir: dir, PoolSlots: 64})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runDDL(t, rt1, "CREATE TABLE ext (a int4 NOT NULL, b text, c int4)")
+	runDDL(t, rt1, `CREATE UNIQUE INDEX ext_idx ON ext (a, b COLLATE "C" text_pattern_ops) `+
+		`INCLUDE (c) WITH (fillfactor=70, deduplicate_items=off) NULLS NOT DISTINCT WHERE (a > 0)`)
+
+	// Simulate SIGKILL: force WAL durable, then close WAL + StorageMgr
+	// directly, dropping every dirty buffer-pool page (including the
+	// pg_index heap row) without a checkpoint.
+	if err := rt1.WAL.FlushUpTo(rt1.WAL.WrittenLSN()); err != nil {
+		t.Fatalf("FlushUpTo: %v", err)
+	}
+	if err := rt1.WAL.Close(); err != nil {
+		t.Fatalf("WAL.Close: %v", err)
+	}
+	if err := rt1.StorageMgr.Close(); err != nil {
+		t.Fatalf("StorageMgr.Close: %v", err)
+	}
+	rt1 = nil
+
+	rt2, err := Open(OpenOptions{DataDir: dir, PoolSlots: 64})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt2.Close()
+
+	idx, ok := rt2.Catalog.LookupIndex(parser.ObjectName{Name: "ext_idx"})
+	if !ok {
+		t.Fatal("ext_idx not found after restart — WAL-driven index recovery failed")
+	}
+	if !idx.HasPredicate {
+		t.Error("recovered HasPredicate = false, want true")
+	}
+	if idx.PredicateString != "(a > 0)" {
+		t.Errorf("recovered PredicateString = %q, want %q", idx.PredicateString, "(a > 0)")
+	}
+	if len(idx.IncludeColumns) != 1 || idx.IncludeColumns[0] != "c" {
+		t.Errorf("recovered IncludeColumns = %v, want [c]", idx.IncludeColumns)
+	}
+	if len(idx.ColOpClasses) != 2 || idx.ColOpClasses[1] != "text_pattern_ops" {
+		t.Errorf("recovered ColOpClasses = %v, want [_ text_pattern_ops]", idx.ColOpClasses)
+	}
+	if len(idx.ColCollations) != 2 || idx.ColCollations[1] == "" {
+		t.Errorf("recovered ColCollations = %v, want a non-empty entry at [1]", idx.ColCollations)
+	}
+	if idx.Fillfactor != 70 {
+		t.Errorf("recovered Fillfactor = %d, want 70", idx.Fillfactor)
+	}
+	if idx.DeduplicateItems == nil || *idx.DeduplicateItems {
+		t.Errorf("recovered DeduplicateItems = %v, want &false", idx.DeduplicateItems)
+	}
+	if !idx.NullsNotDistinct {
+		t.Error("recovered NullsNotDistinct = false, want true")
+	}
+}
+
 // TestDropIndexSurvivesRestartViaWAL pins the symmetric DROP
 // path: a CREATE INDEX followed by DROP INDEX must NOT
 // resurrect the index from WAL on restart. (M0079-0001.)

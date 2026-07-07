@@ -2993,7 +2993,15 @@ func loadUserIndexesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *
 			// its schema.
 			schema = name
 		}
-		cat.RegisterIndexDuringRecovery(schema, ir.name, pgIdx.indRelid, colNames, pgIdx.isUnique, "btree", pgIdx.isPrimary, ir.oid, colDescending, colNullsFirst)
+		// HasPredicate/PredicateString/IncludeColumns/ColOpClasses/ColCollations/
+		// NullsNotDistinct are not yet decoded from the pg_index heap row here
+		// (DecodePGIndexPhysicalRow skips indexprs/indpred/indclass/indcollation
+		// content) — a known, separate residual (see .ralph/deferral_ledger.md),
+		// so this heap-recovery driver always passes their zero values.
+		// Fillfactor/DeduplicateItems ARE restored, but via the separate
+		// ApplyIndexReloptions call just below (reads pg_class.reloptions text),
+		// not through this call.
+		cat.RegisterIndexDuringRecovery(schema, ir.name, pgIdx.indRelid, colNames, pgIdx.isUnique, "btree", pgIdx.isPrimary, ir.oid, colDescending, colNullsFirst, false, "", nil, nil, nil, 0, nil, false)
 		// Restore fillfactor/deduplicate_items/fastupdate/gin_pending_list_limit/
 		// pages_per_range/autosummarize from the heap-persisted pg_class row —
 		// without this they silently revert to defaults across every restart
