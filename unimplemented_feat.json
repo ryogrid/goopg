@@ -1936,7 +1936,7 @@
    "feature": "The needsVacuum function always returns true when RowCount > 0 and does not respect autovacuum reloptions like autovacuum_enabled = off",
    "task_id": "M0086",
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "needsVacuum currently returns true whenever RowCount > 0"
    ],
@@ -1951,7 +1951,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/autovacuum/launcher.go:204 ignores autovacuum_enabled reloptions"
+   "code_audit": "RESOLVED 2026-07-08 (M0122-0016): internal/autovacuum/launcher.go's needsVacuum/needsAnalyze now gate on tbl.AutovacuumEnabledSet/AutovacuumEnabled (WITH (autovacuum_enabled=false) suppresses both, anti-wraparound forcing still overrides), mirroring autovacuum.c's relation_needs_vacanalyze. See docs/design/0122-0016-autovacuum-enabled-reloption.md."
   },
   {
    "feature": "The loadTables function uses a type assertion for InMemory catalog and silently no-ops when called with other catalog implementations",

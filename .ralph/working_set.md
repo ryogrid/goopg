@@ -1,45 +1,56 @@
-Task: M0122-0001 backlog triage — COMPLETE this loop. All 181/181 entries in
-unimplemented_feat.json now carry a final `status` field (64 resolved / 117
-open, 0 untagged). Doc-only bookkeeping (exempt from design-doc rule).
+Task: M0122-0016 — Autovacuum: honor `autovacuum_enabled` reloption
+(`unimplemented_feat.json` task M0086). COMPLETE this loop, committing next.
 
-Files: unimplemented_feat.json (16 surgical Edits — inserted `"status": "open"`
-after `resume_point` for the final 16-entry no-match cluster; all 16 confirmed
-still-open via already-present 2026-07-08-dated code_audit notes, none
-flipped to resolved). .ralph/fix_plan.md (M0122-0001 checkbox -> [x], added
-2026-07-08 completion summary). .ralph/progress.json (benign
-ralph-state-guard auto-repair, timestamp bump only, same pattern every loop).
+Files: internal/autovacuum/launcher.go (needsVacuum/needsAnalyze gate on
+tbl.AutovacuumEnabledSet/AutovacuumEnabled), internal/autovacuum/
+launcher_test.go (2 new tests), internal/catalog/catalog.go (stale doc
+comment on AutovacuumEnabled fixed — field is no longer catalog-only),
+docs/design/0122-0016-autovacuum-enabled-reloption.md (new),
+docs/design/README.md (index row added), .ralph/fix_plan.md (M0122-0016
+checkbox -> [x]), unimplemented_feat.json (M0086 status open->resolved,
+65/181 resolved now).
 
-Key symbols: none new (pure backlog bookkeeping, no code changed).
+Key symbols: Launcher.needsVacuum/needsAnalyze (internal/autovacuum/
+launcher.go), catalog.Table.AutovacuumEnabled/AutovacuumEnabledSet
+(pre-existing, just newly consumed).
 
-Findings: the final 16-entry cluster was planner/perf architectural
-follow-ups (TPC-H Q9/Q15b/Q21 NLI shapes, NOT-IN anti-semi-join, vectorized
-FilterOp/SeqScanOp wiring, spill-path per-row activity-lookup cost,
-plan-snapshot nondeterminism root-cause). Every one of the 16 already had a
-2026-07-08-dated code_audit from an earlier pass in this same conversation
-(before a context-compaction boundary) confirming genuinely-still-open status
--- this loop's job was mechanical: convert those completed audits into the
-final `status` field. Did NOT add new deferral_ledger.md rows: the
-vectorization pair (FilterOp/SeqScanOp) is already tracked at
-.ralph/fix_plan.md:3118-3120 (M0122-0012), and the Q21/Q15b NLI-shape gaps
-are documented inline in their own code comments / prior deferral_ledger
-entries -- a new row would duplicate existing tracking.
+Findings: this was a small, well-scoped M0122 backlog pickup (selected via
+an Explore-agent survey of the 117 open unimplemented_feat.json entries —
+other candidates surveyed but not picked: m0097-0009 pg_get_serial_sequence
+convention-guessed name, m0097-0004 isfinite() always-true stub,
+M0021-0002 bare-aggregate-in-FOR-UPDATE not rejected, M0087 loadTables
+no-op for non-InMemory catalogs — any of these would be reasonable next
+quick-wins). Upstream reference: postgres/src/backend/postmaster/
+autovacuum.c relation_needs_vacanalyze (~line 3054) — av_enabled check
+gated by !force_vacuum (anti-wraparound overrides the user's disable);
+goopg's pre-existing RelFrozenXID/autovacuumFreezeMaxAge anti-wraparound
+check already ran first in needsVacuum, so only had to add the disable
+gate below it (and mirror it in needsAnalyze, since upstream disables
+both). Confirmed non-vacuous via git stash on launcher.go alone (new test
+fails without the fix). M0119-0004's own next milestone-scale blocker
+(collation "builtin_coll" already exists — no per-database catalog
+namespace at all, confirmed NOT a 1-loop task by the survey) and
+M0119-0006's sole residual (005_opclass_damage.pl, needs a pg_amproc
+Virtual-UPDATE path AND btree opclass/comparator dispatch — also not
+1-loop) were surveyed and explicitly passed over in favor of this smaller
+task; they remain the next M0119 candidates whenever a multi-loop
+architectural task is in scope.
 
-Next step: M0122-0001 (the triage/re-verification pass itself) is DONE --
-do not resume it. Future loops picking up individual `open` entries from
-unimplemented_feat.json should treat each as its own M0122-00NN
-implementation task, requiring its own reviewed design doc before code
-(per the per-task rule in fix_plan.md around line 2113). To find them:
-`python3 -c "import json; d=json.load(open('unimplemented_feat.json'))['unimplemented_features']; op=[f for f in d if f.get('status')=='open']; print(len(op))"`
-(117 currently). Prioritize by task_id/milestone clustering as prior loops
-did, or pick standalone quick wins first.
+Next step: commit this work (pathspec: the files listed above, NOT
+`postgres` submodule which shows modified/untracked pre-existing at
+session start — untouched by this loop). Then pick the next task: either
+another unimplemented_feat.json open quick-win (see Findings list above),
+or start scoping M0119-0004's collation/per-database-catalog-isolation
+gap or M0119-0006's 005_opclass_damage as a proper multi-loop milestone
+item (needs its own design doc + explicit multi-loop scope acknowledgment
+first, per the M0119 per-task rule).
 
-Gates run: `make ralph-state-guard` PASS (auto-repaired 1 benign issue,
-identical pattern to every prior loop -- progress.status completed-marker
-reconciled to in_progress). JSON validity + full status-field coverage
-(181/181, 64 resolved/117 open, 0 remaining, zero \u-escapes / literal UTF-8
-preserved) verified via python3 before this working_set write. Pre-commit
-pgbench smoke will run automatically via `.githooks/pre-commit` on the
-commit below.
+Gates run: go build ./... clean. go test ./internal/autovacuum/... PASS
+(3/3, including 2 new tests). RALPH_PRECOMMIT_SCOPE=smoke bash
+scripts/ralph-precommit-test.sh PASS (0 failed transactions, all 3
+workloads: standard/simple-update/select-only). make ralph-state-guard
+PASS (auto-repaired 1 benign issue, identical pattern to every prior loop).
 
-In-flight: none (all work this loop was direct file Edits/reads, no
-background agents or long-running processes started).
+In-flight: none (no background agents or long-running processes left
+running; the Explore-agent survey used for task selection already
+returned and is fully incorporated above).

@@ -587,9 +587,11 @@ type Table struct {
 	// carries no default that a zero check could detect, so AutovacuumEnabledSet
 	// guards whether the option was specified. When set, pg_class.reloptions
 	// gains the text[] element `autovacuum_enabled=true|false`, which pg_dump
-	// renders back as `WITH (autovacuum_enabled='true'|'false')`. goopg has no
-	// autovacuum, so the value is catalog/dump-only (advisory; runtime
-	// unaffected). M0110-0001 (DU-002 slice 196).
+	// renders back as `WITH (autovacuum_enabled='true'|'false')`. Also consumed
+	// at runtime by internal/autovacuum.Launcher.needsVacuum/needsAnalyze (M0086),
+	// mirroring autovacuum.c's relation_needs_vacanalyze: an explicit `false`
+	// disables both, except anti-wraparound forcing still overrides it.
+	// M0110-0001 (DU-002 slice 196).
 	AutovacuumEnabled    bool
 	AutovacuumEnabledSet bool
 

@@ -3145,6 +3145,31 @@ mirroring M0119's ledger `status` column.
       `verify_heapam()` SRF + opclass parity, AC-002..005, pg_dump 002-010.
       **Overlaps M0119-0004/0006 — the triage assigns each item to ONE milestone;
       do not double-work.**
+- [x] **M0122-0016 — Autovacuum: honor `autovacuum_enabled` reloption** (~1;
+      `unimplemented_feat.json` task `M0086`). `internal/autovacuum.Launcher.
+      needsVacuum` always returned true whenever `RowCount > 0`, ignoring the
+      `WITH (autovacuum_enabled=false)` storage parameter already tracked on
+      `catalog.Table` (`AutovacuumEnabled`/`AutovacuumEnabledSet`, populated
+      since M0110-0001 but catalog/dump-only until now — its own doc comment
+      said "goopg has no autovacuum ... runtime unaffected", stale since
+      `internal/autovacuum` has existed since M0019). Fixed: both
+      `needsVacuum` and `needsAnalyze` (`internal/autovacuum/launcher.go`) now
+      return `false` when `AutovacuumEnabledSet && !AutovacuumEnabled`,
+      mirroring `postgres/src/backend/postmaster/autovacuum.c`'s
+      `relation_needs_vacanalyze` (`av_enabled`/`force_vacuum` gate) — the
+      pre-existing anti-wraparound (`RelFrozenXID`/`autovacuumFreezeMaxAge`)
+      check still runs first and overrides the disable, matching upstream's
+      "ignore [the disable] if at risk" comment. Tests:
+      `TestNeedsVacuumRespectsAutovacuumEnabledReloption`,
+      `TestNeedsVacuumAntiWraparoundOverridesDisabledReloption`
+      (`internal/autovacuum/launcher_test.go`), confirmed non-vacuous via
+      `git stash` on `launcher.go` alone. Gates: `go build ./...` clean;
+      `go test ./internal/autovacuum/...` PASS (3/3);
+      `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh` PASS
+      (0 failed transactions, standard/simple-update/select-only). Design:
+      `docs/design/0122-0016-autovacuum-enabled-reloption.md`,
+      `docs/design/README.md` row added. `unimplemented_feat.json`'s `M0086`
+      entry flipped `open`→`resolved` (65/181 resolved, 116 open).
 
 > This task list is **seeded, not exhaustive.** The M0122-0001 triage plus every
 > future feature deferral appended to `unimplemented_feat.json` (any new `open`
