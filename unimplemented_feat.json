@@ -898,12 +898,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: docs/milestones/0054: empirical TPC-H verification not completed"
+   "code_audit": "PARTIAL 2026-07-08: the underlying optimization (DecodeRowProjectionIntoArena) landed at M0074-0004 (commit 4906451) and the dependent TPC-H query set now runs clean 22/22 end-to-end (docs/handover/2026-05-11-tpch-status-phase9.md:33-56); but the specific empirical measurement asked for — DecodeRow cumulative cost <=15% of total execution time via pprof — was never captured/recorded post-deferral, so this narrow verification artifact is still missing even though the feature it measures is done"
   },
   {
    "feature": "Complete HammerDB SF=1 power test after Q9 regression fix (test was aborted after Q9, Q20 and remaining queries were not executed).",
    "task_id": "M0054-0007-followup-resume",
    "resume_point": "After M0054-0006-followup-Q9-composite is fixed",
+   "status": "resolved",
    "evidence": [
     "M0054-0007-followup-resume: new sub-task for the NLI-re-enabled retry, blocked by Q9-composite landing first"
    ],
@@ -918,7 +919,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: analysis/: HammerDB SF=1 test execution incomplete/aborted"
+   "code_audit": "RESOLVED 2026-07-08: docs/handover/2026-05-11-tpch-status-phase9.md:33-56 shows a full 22-query SF=1 power sweep, all OK including Q9 (66.26s, 175 rows) and Q20 (16.40s, 99 rows) — the run that previously aborted at Q20 completed cleanly. Q9/Q20 independently regressed and were re-fixed again 2026-07-07 per .ralph/deferral_ledger.md:572-573, both with permanent regression tests; HEAD is clean"
   },
   {
    "feature": "Extend equi-key extractor to handle view-inlined join shapes for Nested-Loop Index Join (TPC-H Q15b not yet supported).",
@@ -938,7 +939,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/planner/nl_index_join_test.go:254 Q15b disabled: row-layout-flip unfixed"
+   "code_audit": "confirmed-open 2026-07-08: internal/planner/nl_index_join_test.go:254-278 (TestNLIRuleSkipsIsolatedScopeOuter) still explicitly asserts NLI must NOT fire when the outer is an isolated-scope/view-wrapped Project (Q15b's shape), comment says 'Re-enable when the row-layout-flip is fixed at the nliRewrite substitution level'. A different Q15b shape (Filter->CrossJoin) was fixed in commit 1e0c21c4, but this isolated-scope-Project-wrapper case remains deliberately gated off, unchanged since M0063-0001 (2e6e9f9e)"
   },
   {
    "feature": "Implement buffer reuse for rows returned by concatRows() to reduce allocations (currently not reused because callers may retain rows).",
@@ -958,7 +959,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/access/btree/btree.go:1960 insertItemSorted dedup-grow abandoned due to page-fragment garbage"
+   "code_audit": "confirmed-open 2026-07-08 (prior code_audit citation was mismatched to btree.go, unrelated to concatRows): internal/executor/operators_join_agg.go:2899 concatRows(a, b Row) Row still does out := make(Row, 0, len(a)+len(b)) on every call, no pooling; internal/executor/row_pool.go acquireRow/releaseRow (M0068-0004) added sync.Pool-backed row reuse used elsewhere (e.g. operators_index.go:149) but concatRows was never wired to it. The 'Borrow contract' from the old resume_point was implemented then removed (internal/executor/operator.go:49-50, M0071-0015 Stage E) in favor of slot-based Materialize() lifetime semantics — a different mechanism superseded it, but concatRows buffer reuse itself was never delivered"
   },
   {
    "feature": "IN-list IndexScan optimization requiring Append/Union plan node and cost model for query plan optimization",
@@ -978,7 +979,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/planner/in_list_test.go:14 OR-of-IndexScan plan node not yet implemented"
+   "code_audit": "confirmed-open 2026-07-08: internal/planner/in_list_test.go:14-45 (TestInListSeqScanCorrectness) still pins IN-list to SeqScan with comment 'no OR-IndexScan rule yet... update the assertion when that lands'; grep for AppendNode/UnionNode/Append/Union plan-node types across internal/planner/*.go returns zero hits — no Append/Union plan node exists anywhere in the planner"
   },
   {
    "feature": "Posting growth helper functions are implemented but not integrated into the steady-state B-tree insert path, causing in-place insert operations to leak page bytes during memory growth.",
@@ -1152,6 +1153,7 @@
    "feature": "Empirical TPC-H Q20 wall-clock validation using HammerDB SF=1 resume run to confirm performance improvements from multi-parameter correlation unnesting.",
    "task_id": "M0054-0007",
    "resume_point": "next HammerDB SF=1 resume run",
+   "status": "resolved",
    "evidence": [
     "Empirical TPC-H Q20 wall-clock validation requires a HammerDB SF=1 resume run, which is out of scope for this loop"
    ],
@@ -1166,12 +1168,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: Deferral marked: resume point needs HammerDB SF=1 run"
+   "code_audit": "RESOLVED 2026-07-08: .ralph/deferral_ledger.md:572 (resolved 2026-07-07, tpch/Q20-timeout) — planHasEscapingOuterRef depth-fix + splitEqualityForHash multi-key fix; tmp/tpch-runner -queries 20 went from a 1200.13s cancel to OK elapsed=2.55s rows=92, cross-checked row-for-row against real PostgreSQL 18.3; regression tests internal/planner/non_correlated_subquery_test.go:TestPlanHasOuterRef_NestedSubqueryResolvesLocally and internal/planner/q20_unnest_test.go:TestPlanQ20OuterInFullyUnnested added"
   },
   {
    "feature": "Full verification of all 22 close criteria for M0054-0007 milestone, deferred as a partial milestone to be resumed after M0054-0008 completion.",
    "task_id": "M0054-0007-followup-resume",
    "resume_point": "after M0054-0008 lands",
+   "status": "resolved",
    "evidence": [
     "M0054-0007-followup-resume is marked PARTIAL/DEFERRED"
    ],
@@ -1186,7 +1189,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: Deferral marked: resume point after M0054-0008 completion"
+   "code_audit": "RESOLVED-by-supersession 2026-07-08: the practical 22/22 close criterion was met under M0077, not a standalone M0054-0008 — docs/handover/2026-05-11-tpch-status-phase9.md:30-58 'Every query executed without error; every gated row count holds.' M0054-0008 itself was never landed as its own milestone (only a forward-pointer in docs/design/0054-0003-magic-set-decorrelation.md:3,69; docs/milestones/README.md:91 still says 'planned' — stale metadata); its scope was absorbed into the M0063/M0075-M0077/M0122 Q5/Q9/Q20 fix series"
   },
   {
    "feature": "Q21 Anti-NLI currently uses hash variant because lifting conjuncts to outer Predicate breaks negation semantics (returns 0 rows instead of ~411); the inner-Filter conjunct lift is deferred.",
@@ -1206,7 +1209,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/planner/nl_index_join.go:290 shows semi-join uses hash algo, NLI prohibited for semantics"
+   "code_audit": "PARTIAL 2026-07-08: the correctness bug is RESOLVED — Q21 returned 0 rows pre-fix, now returns 397 rows in the latest regression sweep (1eb3a168, 'M0071-0009 0->381 rows regression remains fixed'), via SourceTableIdx-aware column resolution (internal/planner/unnest.go:2078-2090), not the originally-planned conjunct-lift. But the Anti-NLI promotion described in this entry is still not used for this shape: internal/planner/q21_live_test.go:163,176 explicitly requires the AntiJoin stay a plain *Join (hash) with the inner-only conjunct (l_receiptdate > l_commitdate) left in the inner Filter rather than lifted to the join Predicate — the 'lift' approach was abandoned as a design decision, not completed. internal/planner/nl_index_join.go:302-316 shows residualPred is only populated for the Q19 OR-of-ANDs path, not the general Semi/Anti inner-conjunct case"
   },
   {
    "feature": "Q21 build-phase cancel requires proper NLI rewrite for derived-table outer inputs; the fix is deferred out of M0062 scope.",
@@ -1226,7 +1229,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/planner/nl_index_join.go:140 defers derived-table NLI rewrite to M0068"
+   "code_audit": "PARTIAL 2026-07-08: the literal 'Q21 build-phase cancel' claim is RESOLVED per commit 977ff220 ('Q21 build-phase cancel lag RESOLVED... explicit ctx.Err() check... in joinOp.openLazyHashJoin') — a simple cancellation fix, not an NLI rewrite. The bundled 'derived-table NLI rewrite' half remains open (same gap as the Q15b entry above) — same commit 977ff220 explicitly deferred that part 'out of M0062 scope', still gated off at HEAD. Prior code_audit's nl_index_join.go:140 citation now points at unrelated text (a reverted Q9 composite-index hoist, also 'Defer to M0068' — coincidental phrase reuse, confirmed by reading current lines 120-160)"
   },
   {
    "feature": "SASLprep pre-processing for SASL authentication username normalization",
@@ -1274,6 +1277,7 @@
    "feature": "Optimize Q14 query performance (regressed from 29s baseline to 600s timeout)",
    "task_id": null,
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "Q14 cancel at 600 s — regression vs prior 29 s baseline"
    ],
@@ -1288,7 +1292,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/planner/nl_index_join.go:373 mentions Q14 but no performance regression fix found"
+   "code_audit": "RESOLVED 2026-07-08: docs/handover/2026-05-11-tpch-status-phase9.md:46 shows 'Q14: OK 19.49s 1 row' — well under both the original 29s baseline and the 600s timeout regression cited in the deferral. internal/planner/nl_index_join.go:373 is a design-rationale comment (NLI gate scoping for SeqScan vs Project outers), not evidence of an unfixed regression; re-read at current lines 340-399, still accurate but unrelated to a perf bug"
   },
   {
    "feature": "Implement range-correlation support for EXISTS with non-equijoin predicates (e.g., l_suppkey <> ...)",
