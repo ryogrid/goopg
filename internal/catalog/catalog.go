@@ -2020,6 +2020,17 @@ type Catalog interface {
 	// the pg_type OID of its multirange's auto-generated `_name` array type,
 	// used by format_type to render a `mymultirange[]` column. M0110-0001.
 	LookupRangeTypeByMultirangeArrayOID(oid uint32) (*RangeType, bool)
+	// ResolveIndexColumnOpclassOID resolves an index key column's pg_opclass
+	// OID for pg_index.indclass rendering. Shared by the live pg_index
+	// VirtualRows renderer and the heap-row renderer (buildUserPGIndexRow,
+	// internal/executor/pg18_user_catalog_rows.go) so both agree. M0122-0007
+	// follow-up.
+	ResolveIndexColumnOpclassOID(explicitName, typeName string, methodOID uint32) uint32
+	// ResolveIndexColumnCollationOID resolves an index key column's
+	// pg_collation OID for pg_index.indcollation rendering, for the same
+	// live/heap-row sharing reason as ResolveIndexColumnOpclassOID.
+	// M0122-0007 follow-up.
+	ResolveIndexColumnCollationOID(explicitName string) uint32
 }
 
 // InMemory is the v0 implementation: a sync.RWMutex-guarded map.
@@ -7661,46 +7672,33 @@ func (c *InMemory) registerSystemTables() {
 				}
 			}
 			indkey := strings.Join(keyParts, " ")
-			// indclass: one opclass OID per key column (0 = unknown; btree int4=1978).
+			// indclass: one opclass OID per key column, via the shared
+			// resolver (also used by buildUserPGIndexRow's heap-row twin —
+			// internal/executor/pg18_user_catalog_rows.go — so the live and
+			// heap-persisted renderings never diverge). M0122-0007
+			// follow-up: this previously ignored ColOpClasses entirely and
+			// used a per-type OID switch with values that did not match
+			// real PostgreSQL (e.g. int2_ops rendered as 1970 instead of
+			// 1979).
+			opclassMethodOID := AccessMethodOIDByName(idx.Method)
+			if opclassMethodOID == 0 {
+				opclassMethodOID = btreeAccessMethodOID
+			}
 			classOIDs := make([]string, len(idx.Columns))
 			for i, col := range idx.Columns {
-				oid := "0"
+				var explicit, typeName string
+				if i < len(idx.ColOpClasses) {
+					explicit = idx.ColOpClasses[i]
+				}
 				if col != "" {
 					for _, tc := range idx.Table.Columns {
 						if tc.Name == col {
-							switch tc.Type.Name {
-							case "int2", "smallint":
-								oid = "1970"
-							case "int4", "int", "integer", "serial":
-								oid = "1978"
-							case "int8", "bigint", "bigserial":
-								oid = "1980"
-							case "float4", "real":
-								oid = "2968"
-							case "float8", "double precision":
-								oid = "2970"
-							case "text", "varchar", "character varying":
-								oid = "1994"
-							case "name":
-								oid = "1996"
-							case "bpchar", "char", "character":
-								oid = "426"
-							case "oid":
-								oid = "2990"
-							case "bool", "boolean":
-								oid = "424"
-							case "date":
-								oid = "434"
-							case "timestamp", "timestamp without time zone":
-								oid = "2040"
-							case "timestamptz", "timestamp with time zone":
-								oid = "2040"
-							}
+							typeName = tc.Type.Name
 							break
 						}
 					}
 				}
-				classOIDs[i] = oid
+				classOIDs[i] = fmt.Sprintf("%d", c.ResolveIndexColumnOpclassOID(explicit, typeName, opclassMethodOID))
 			}
 			indclass := strings.Join(classOIDs, " ")
 			boolStr := func(b bool) string {
@@ -7711,17 +7709,21 @@ func (c *InMemory) registerSystemTables() {
 			}
 			natts := len(idx.Columns) + len(idx.IncludeColumns)
 			nkeyatts := len(idx.Columns)
-			// Build space-separated zero-vector for indcollation.
-			buildZeroVec := func(n int) string {
-				if n <= 0 {
-					return ""
+			// indcollation: per-key-column explicit COLLATE OID via the
+			// shared resolver (0 = not collatable / no explicit collation
+			// given; see ResolveIndexColumnCollationOID's doc comment for
+			// why this is also shared with buildUserPGIndexRow's heap-row
+			// twin). M0122-0007 follow-up: this previously always rendered
+			// an all-zero vector regardless of ColCollations.
+			collationParts := make([]string, nkeyatts)
+			for i := range collationParts {
+				var explicit string
+				if i < len(idx.ColCollations) {
+					explicit = idx.ColCollations[i]
 				}
-				parts := make([]string, n)
-				for i := range parts {
-					parts[i] = "0"
-				}
-				return strings.Join(parts, " ")
+				collationParts[i] = fmt.Sprintf("%d", c.ResolveIndexColumnCollationOID(explicit))
 			}
+			indcollation := strings.Join(collationParts, " ")
 			// indoption: per-key ASC/DESC + NULLS FIRST/LAST bitmask, mirroring
 			// upstream's INDOPTION_DESC (0x1) / INDOPTION_NULLS_FIRST (0x2).
 			// M0122-0006: this live pg_index query path previously always
@@ -7756,7 +7758,7 @@ func (c *InMemory) registerSystemTables() {
 				"t",                              // indislive
 				boolStr(idx.IsReplicaIdentity),   // indisreplident (DU-002 slice 306)
 				indkey,                           // indkey
-				buildZeroVec(nkeyatts),           // indcollation
+				indcollation,                     // indcollation
 				indclass,                         // indclass
 				indoption,                        // indoption
 				"",                               // indexprs (NULL)
@@ -18205,6 +18207,147 @@ func builtinOpclassOIDByName(name string) (builtinOpclassInfo, bool) {
 		}
 	}
 	return builtinOpclassInfo{}, false
+}
+
+// builtinColumnOpclassOIDs maps a builtin (BKI-pinned) btree operator-class
+// name to its pg_opclass.oid, covering the classes reachable from an
+// ordinary (non-range) column's index definition: both a column type's
+// implicit default opclass and any name a user gives explicitly via
+// `CREATE INDEX ... (col opclass_name)`. Verified against a real
+// PostgreSQL 18.3 instance (`SELECT opcname, oid FROM pg_opclass WHERE
+// opcmethod = 'btree'::regclass`) since only a handful of these have a
+// BKI-frozen oid in pg_opclass.dat -- the rest are genbki-autonumbered but
+// stable for a given PG18.3 build. goopg has no native hash access method
+// (Index.DeclaredHash's doc comment: a `USING hash` index is built on the
+// btree substrate, so Method never becomes "hash"), so only the btree
+// table is needed here. M0122-0007 follow-up (ColOpClasses live-query gap).
+var builtinColumnOpclassOIDs = map[string]uint32{
+	"array_ops": 10000, "bit_ops": 10002, "bool_ops": 10003,
+	"bpchar_ops": 10004, "bpchar_pattern_ops": 4219, "bytea_ops": 10006,
+	"char_ops": 10007, "cidr_ops": 10009, "date_ops": 3122,
+	"enum_ops": 10069, "float4_ops": 10012, "float8_ops": 3123,
+	"inet_ops": 10015, "int2_ops": 1979, "int4_ops": 1978, "int8_ops": 3124,
+	"interval_ops": 10022, "jsonb_ops": 10088, "macaddr8_ops": 10026,
+	"macaddr_ops": 10024, "money_ops": 10047, "multirange_ops": 10080,
+	"name_ops": 10028, "numeric_ops": 3125, "oid_ops": 1981,
+	"oidvector_ops": 10032, "pg_lsn_ops": 10067, "range_ops": 10076,
+	"record_image_ops": 10036, "record_ops": 10034, "text_ops": 3126,
+	"text_pattern_ops": 4217, "tid_ops": 10050, "time_ops": 10038,
+	"timestamp_ops": 3128, "timestamptz_ops": 3127, "timetz_ops": 10041,
+	"tsquery_ops": 10074, "tsvector_ops": 10071, "uuid_ops": 10065,
+	"varbit_ops": 10043, "varchar_ops": 10044, "varchar_pattern_ops": 4218,
+	"xid8_ops": 10053,
+}
+
+// defaultColumnOpclassNameForType returns the implicit default btree
+// opclass name PostgreSQL picks for a column type when no explicit opclass
+// is named in CREATE INDEX, for the subset of type-name spellings goopg's
+// index-column type resolution covers. Verified against a real PostgreSQL
+// 18.3 instance (`CREATE INDEX` on a column of each type, then reading
+// pg_index.indclass back) rather than derived from pg_opclass.dat's
+// opcdefault rows alone, since a type's default opclass is keyed by its
+// pg_type OID, not by name (e.g. "varchar"'s default opclass is text_ops,
+// not a dedicated varchar_ops). M0122-0007 follow-up.
+func defaultColumnOpclassNameForType(typeName string) (string, bool) {
+	switch typeName {
+	case "int2", "smallint":
+		return "int2_ops", true
+	case "int4", "int", "integer", "serial":
+		return "int4_ops", true
+	case "int8", "bigint", "bigserial":
+		return "int8_ops", true
+	case "float4", "real":
+		return "float4_ops", true
+	case "float8", "double precision":
+		return "float8_ops", true
+	case "text", "varchar", "character varying":
+		return "text_ops", true
+	case "name":
+		return "name_ops", true
+	case "bpchar", "char", "character":
+		return "bpchar_ops", true
+	case "oid":
+		return "oid_ops", true
+	case "bool", "boolean":
+		return "bool_ops", true
+	case "date":
+		return "date_ops", true
+	case "timestamp", "timestamp without time zone":
+		return "timestamp_ops", true
+	case "timestamptz", "timestamp with time zone":
+		return "timestamptz_ops", true
+	case "numeric", "decimal":
+		return "numeric_ops", true
+	case "uuid":
+		return "uuid_ops", true
+	case "interval":
+		return "interval_ops", true
+	case "inet":
+		return "inet_ops", true
+	case "bytea":
+		return "bytea_ops", true
+	}
+	return "", false
+}
+
+// resolveColumnOpclassOID resolves an explicit per-column operator class
+// name (idx.ColOpClasses[i]) to its pg_opclass OID for indclass rendering,
+// checking user-created classes (CREATE OPERATOR CLASS) for the index's
+// access method before the builtin pinned table (mirroring PG's single
+// pg_opclass scan covering both). Returns 0 when the name isn't found for
+// that method, so the caller falls back to the column's default opclass.
+// M0122-0007 follow-up.
+func (c *InMemory) resolveColumnOpclassOID(name string, methodOID uint32) uint32 {
+	for _, uoc := range c.ListUserOperatorClasses() {
+		if uoc.Method == methodOID && uoc.Name == name {
+			return uoc.OID
+		}
+	}
+	if methodOID == btreeAccessMethodOID {
+		return builtinColumnOpclassOIDs[name]
+	}
+	return 0
+}
+
+// ResolveIndexColumnOpclassOID resolves the pg_opclass OID for one index key
+// column, given an explicit operator class name (empty if CREATE INDEX named
+// none) and the column's own type name. Tries, in order: (1) an explicit
+// name against user-created classes (CREATE OPERATOR CLASS) then the builtin
+// pinned table, (2) the column type's implicit default opclass. Returns 0 if
+// nothing resolves. Exported so both the live pg_index VirtualRows renderer
+// (this file) and the heap-row renderer (buildUserPGIndexRow,
+// internal/executor/pg18_user_catalog_rows.go, used for restart recovery and
+// a real PG standby's direct heap scan) share one resolution path instead of
+// two that could silently diverge. M0122-0007 follow-up.
+func (c *InMemory) ResolveIndexColumnOpclassOID(explicitName, typeName string, methodOID uint32) uint32 {
+	if explicitName != "" {
+		if oid := c.resolveColumnOpclassOID(explicitName, methodOID); oid != 0 {
+			return oid
+		}
+	}
+	if name, ok := defaultColumnOpclassNameForType(typeName); ok {
+		return builtinColumnOpclassOIDs[name]
+	}
+	return 0
+}
+
+// ResolveIndexColumnCollationOID resolves the pg_collation OID for one index
+// key column's explicit COLLATE name (0 for an empty name, matching a
+// non-collatable column's real attcollation=0): a user-created collation
+// (CREATE COLLATION) first, then the 7 BKI-pinned builtin ones. Exported for
+// the same live/heap-row sharing reason as ResolveIndexColumnOpclassOID.
+// M0122-0007 follow-up.
+func (c *InMemory) ResolveIndexColumnCollationOID(explicitName string) uint32 {
+	if explicitName == "" {
+		return 0
+	}
+	if oid := c.UserCollationOIDByName(explicitName); oid != 0 {
+		return oid
+	}
+	if oid, ok := builtinCollationOIDByName(explicitName); ok {
+		return oid
+	}
+	return 0
 }
 
 // defaultUserBtreeOpclassForSubtype mirrors GetDefaultOpClass's (postgres/

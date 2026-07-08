@@ -12818,7 +12818,7 @@ func resyncIndexHeapRow(ctx *Context, idx *catalog.Index) error {
 		RelOid: catalog.IndexRelationId,
 		Fork:   storage.MainFork,
 	}
-	if _, err := writeHeapRowCanonical(ctx, pgIndexRel, pgIndexColumnsPG18(), buildUserPGIndexRow(idx)); err != nil {
+	if _, err := writeHeapRowCanonical(ctx, pgIndexRel, pgIndexColumnsPG18(), buildUserPGIndexRow(ctx.Catalog, idx)); err != nil {
 		return fmt.Errorf("pg_index replica-identity resync: %w", err)
 	}
 	if err := mirrorTouchedCatalogsToPostgresDB(ctx); err != nil {
@@ -12856,7 +12856,7 @@ func syncIndexToCatalogHeap(ctx *Context, idx *catalog.Index) error {
 		RelOid: catalog.IndexRelationId,
 		Fork:   storage.MainFork,
 	}
-	if _, err := writeHeapRowCanonical(ctx, pgIndexRel, pgIndexColumnsPG18(), buildUserPGIndexRow(idx)); err != nil {
+	if _, err := writeHeapRowCanonical(ctx, pgIndexRel, pgIndexColumnsPG18(), buildUserPGIndexRow(ctx.Catalog, idx)); err != nil {
 		return fmt.Errorf("pg_index: %w", err)
 	}
 

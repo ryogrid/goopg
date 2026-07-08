@@ -445,6 +445,51 @@ func TestPgIndexesView(t *testing.T) {
 	}
 }
 
+// TestPgIndexIndclassIndcollation pins the M0122-0007 follow-up fix:
+// pg_index.indclass/indcollation must resolve an index's explicit
+// ColOpClasses/ColCollations (a `CREATE INDEX ... (col opclass COLLATE
+// coll)` column spec) rather than always rendering the column type's
+// default opclass and an all-zero collation vector.
+func TestPgIndexIndclassIndcollation(t *testing.T) {
+	c := NewInMemory()
+	tbl, err := c.CreateTable(parser.ObjectName{Name: "docs"}, []Column{
+		{Name: "id", Type: Type{Name: "int4"}},
+		{Name: "body", Type: Type{Name: "text"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	idx, err := c.CreateIndex(parser.ObjectName{Name: "docs_body_idx"}, tbl, []string{"id", "body"}, false, "btree", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// id gets no explicit opclass/collation (default-type fallback);
+	// body is explicitly `text_pattern_ops COLLATE "C"`.
+	idx.ColOpClasses = []string{"", "text_pattern_ops"}
+	idx.ColCollations = []string{"", "C"}
+
+	view, ok := c.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_index"})
+	if !ok {
+		t.Fatal("LookupTable(pg_catalog.pg_index) failed")
+	}
+	var row []string
+	for _, r := range view.VirtualRows() {
+		if r[0] == strconv.FormatUint(uint64(idx.OID), 10) {
+			row = r
+		}
+	}
+	if row == nil {
+		t.Fatalf("no pg_index row for index oid=%d", idx.OID)
+	}
+	// column order: ... indkey(15) indcollation(16) indclass(17) ...
+	if got, want := row[17], "1978 4217"; got != want {
+		t.Errorf("indclass=%q want %q (int4_ops default, explicit text_pattern_ops)", got, want)
+	}
+	if got, want := row[16], "0 950"; got != want {
+		t.Errorf("indcollation=%q want %q (id not collatable, body COLLATE \"C\")", got, want)
+	}
+}
+
 // TestSystemCatalogOIDConstants verifies the fixed OIDs match upstream's
 // values so ODBC/JDBC metadata probes that look up by numeric OID see the
 // expected numbers.

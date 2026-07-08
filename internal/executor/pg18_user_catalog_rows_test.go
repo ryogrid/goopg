@@ -2391,7 +2391,7 @@ func TestUserPGIndexRowReplicaIdentity(t *testing.T) {
 			Schema: "public", Name: "ri_uidx", Table: tbl, OID: 16601,
 			Columns: []string{"id"}, Unique: true, IsReplicaIdentity: want,
 		}
-		row := buildUserPGIndexRow(idx)
+		row := buildUserPGIndexRow(catalog.NewInMemory(), idx)
 		if got := row[col].BoolValue(); got != want {
 			t.Errorf("IsReplicaIdentity=%v: indisreplident = %v, want %v", want, got, want)
 		}
@@ -2423,7 +2423,7 @@ func TestBuildUserPGIndexRowIndoptionRoundTrip(t *testing.T) {
 		ColNullsFirst: []bool{false, true, false},
 	}
 
-	row := buildUserPGIndexRow(idx)
+	row := buildUserPGIndexRow(catalog.NewInMemory(), idx)
 	cols := pgIndexColumnsPG18()
 	data, err := EncodeRowPG(cols, row)
 	if err != nil {
