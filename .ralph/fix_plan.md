@@ -5509,6 +5509,44 @@ mirroring M0119's ledger `status` column.
       scripts/ralph-precommit-test.sh` PASS (0 failed transactions, all 3
       pgbench workloads). **Still open in this bucket:** `WALInsertLock`
       array (parallel inserts), MultiXact WAL.
+      **2026-07-09 (next loop) — reconciliation, no code change:** verified
+      the `WALInsertLock` array line item is in fact already fully landed
+      (M0107-0007 slice B, `docs/design/0107-0007ah-wal-tryappend-rwmutex.md`
+      / `0107-0007aj-wal-segment-cross-reservation.md` and ~28 sibling design
+      docs `0107-0007a`..`0107-0007aj`) — it was a stale leftover in this
+      bucket's summary line, not real remaining work. Confirmed by code
+      reading, not just docs: `internal/wal/padded_mutex.go`'s
+      `appendLockSet` is an 8-stripe `[8]paddedMutex` array
+      (`appendLockStripes = 8`, matching PG's `NUM_XLOGINSERT_LOCKS` /
+      `WALInsertLocks[]`, `xlog.c`/`xlog.h`), genuinely wired (not dead code)
+      into every hot append path via `stripe_writer_core.go`'s
+      `c.locks`/`stripeAppend`/`stripeAppendBuild`/`stripeAppendBuiltEmitted`,
+      selected per-caller by `stripeForProcNum(procNum)`. `writer.go`'s
+      `tryAppend` fast path takes `state.appendMu.RLock()` (shared) then the
+      one stripe lock via `AppendXLogPayload`, so up to 8 concurrent
+      backends genuinely append into disjoint WAL-buffer regions in
+      parallel; only the replica WAL-apply path (`appendRaw`, sequential by
+      nature — a single WAL receiver, matching upstream) and
+      checkpoint/recovery resets take the exclusive `Lock()`. Re-ran the
+      three tests that pin this concurrency model at HEAD (unmodified):
+      `go test -race -run
+      'TestConcurrentTryAppendProceedsInParallel|TestTryAppendRLockDoesNotBlockSiblings|TestConcurrentAppendAcrossSegmentBoundariesNoOverflow'
+      ./internal/wal/...` — all 3 PASS. No fix_plan/deferral-ledger row
+      needed (nothing was actually missing); this bucket's remaining named
+      item is `MultiXact WAL` only. Surveyed that one too before choosing
+      this reconciliation instead: `internal/multixact/` is an explicitly
+      unwired, in-memory-only primitive (package doc: "the risky hot-path
+      integration ... lands in later loops on top of this verified
+      primitive") — no SLRU-backed offsets/members store, no xmax-stamping
+      wiring, no WAL record kinds at all (`grep -rn Multixact
+      internal/wal/*.go` only hits two placeholder comments). WAL-logging
+      multixact creation presupposes a durable multixact SLRU exists to
+      protect first — that foundation doesn't exist yet, and building it
+      plus wiring it into the tuple-header hot path is multi-loop,
+      feature-sized work on the same class of hot path (xmax) that has
+      already cost this project many multi-loop corruption-hunt threads
+      (see the `M-NIGHTLY (AI-20260709-010336-082)` btree thread above) —
+      correctly left deferred rather than rushed into one loop.
 - [ ] **M0122-0010 — Concurrency: buffer pool & btree locking** (~17, LARGE).
       Lehman/Yao crab-walk, `splitMu` removal, storage-pool pin-count race,
       re-enable the `-race` gate. Gate: race detector mandatory.
