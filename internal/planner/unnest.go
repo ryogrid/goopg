@@ -1121,6 +1121,59 @@ func findInExprInExpr(e Expr) *InExpr {
 	return nil
 }
 
+// correlatedInOperandSafeToUnnest verifies that the single
+// correlation pair unnestInExpr will use as the join key actually
+// encodes the original `in.Operand IN (subquery)` predicate, not
+// merely "a correlated row exists".
+//
+// unnestInExpr always builds the join's (LeftKey, RightKey) from
+// params[0] (the correlation equijoin pair pulled out of the
+// subquery's own WHERE clause) — it never looks at in.Operand or at
+// what the subquery actually SELECTs. That substitution is sound
+// only when:
+//
+//  1. the correlation's outer-scope side (params[0].OuterRef) is the
+//     SAME column as in.Operand. Otherwise the join checks "does a
+//     row exist whose correlation column matches some unrelated outer
+//     column" instead of "is in.Operand among the selected values" —
+//     a different predicate, silently wrong for both IN and NOT IN.
+//  2. the correlation's subquery-scope side (params[0].SubCol) is the
+//     SAME column the subquery projects. clonePlanReplacingOuter
+//     folds the correlation predicate into a tautology inside the
+//     cloned inner plan (relying on the join key to reinstate it); if
+//     the subquery selects a different column, that fold silently
+//     discards the correlation as a real filter.
+//
+// When both hold, every row that survives the correlation predicate
+// necessarily has a projected value equal to in.Operand and never
+// NULL (the equality correlation can't be satisfied by a NULL) — so
+// even a NOT IN Anti join is correct here without per-correlation-
+// group NullAware tracking (unlike the general correlated NOT IN
+// case, which still needs that — M0122-0011 deferral ledger).
+func correlatedInOperandSafeToUnnest(in *InExpr, params []unnestParam) bool {
+	if len(params) != 1 {
+		return false
+	}
+	operand, ok := in.Operand.(*ColumnRef)
+	if !ok {
+		return false
+	}
+	outerRef := params[0].OuterRef
+	if operand.Index != outerRef.Index || operand.SourceTableIdx != outerRef.SourceTableIdx || operand.Name != outerRef.Name {
+		return false
+	}
+	proj, ok := in.Plan.(*Project)
+	if !ok || len(proj.Targets) != 1 {
+		return false
+	}
+	selected, ok := proj.Targets[0].(*ColumnRef)
+	if !ok {
+		return false
+	}
+	subCol := params[0].SubCol
+	return selected.Index == subCol.Index && selected.SourceTableIdx == subCol.SourceTableIdx && selected.Name == subCol.Name
+}
+
 // canUnnestInExpr checks whether an IN (subquery) is a candidate
 // for unnesting into a semi-join.  The inner plan must have a
 // correlation predicate of the shape `inner_col = outer_ref`
@@ -1168,6 +1221,17 @@ func canUnnestInExprDepth(in *InExpr, depth int) bool {
 	// equality joins with inner ColumnRefs.
 	params := collectUnnestParams(plan)
 	if params == nil || len(params) == 0 {
+		return false
+	}
+	// unnestInExpr always keys the resulting join on the correlation
+	// pair (params[0]), never on in.Operand directly — that only
+	// encodes the same predicate as the original `operand IN
+	// (subquery)` when the correlation identifies exactly the value
+	// being tested. See correlatedInOperandSafeToUnnest's doc comment
+	// for the two required conditions and why a mismatch would
+	// silently change the query's meaning, not just miss an
+	// optimization.
+	if !correlatedInOperandSafeToUnnest(in, params) {
 		return false
 	}
 	// M0062-0004: nested IN subqueries are now accepted *if* each

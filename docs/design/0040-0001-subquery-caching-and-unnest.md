@@ -493,3 +493,90 @@ Gates: `go build ./...` clean; `go test ./internal/planner/...
 `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
 `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
 failed transactions, all 3 pgbench workloads).
+
+## Follow-up (2026-07-09, M0122-0011 follow-up #2): correlated-IN unnest ignored the IN operand — real correctness bug, not just the flagged NullAware gap
+
+Resuming the previous follow-up's deliberately-deferred item ("the
+CORRELATED NOT IN path has the same NOT-EXISTS-shaped Anti-join gap")
+found a bigger, pre-existing bug than the NullAware framing assumed:
+`unnestInExpr`'s correlated branch (§4, `internal/planner/unnest.go`)
+never looks at `in.Operand` at all. It builds the join's
+`(LeftKey, RightKey)` purely from `params[0]` — the single correlation
+equijoin pair pulled out of the subquery's own WHERE clause
+(`collectUnnestParams`) — and drops the correlation predicate itself
+from the cloned inner plan (`clonePlanReplacingOuter` substitutes the
+`OuterColumnRef` with `SubCol`, folding e.g. `z = outer.w` into the
+tautology `z = z`). This is only sound when the correlation happens to
+*identify exactly* the value the IN is testing. Whenever the
+correlation column differs from the IN operand and/or from the
+subquery's own SELECT column, the produced join silently tests a
+different predicate than the original SQL:
+
+```sql
+-- x IN (SELECT y FROM t2 WHERE z = t1.w)
+-- pre-fix unnest built: Join(t1, t2, on t1.w = t2.y)
+-- i.e. "does a t2 row have y = w", discarding both `z = w`
+-- (folded to a no-op) and the actual `x = y` comparison.
+```
+
+This affects plain (non-negated) correlated `IN` too, not only `NOT
+IN` — a materially bigger scope than the previous follow-up's framing
+("needs per-correlation-group NULL/emptiness tracking"). A live,
+demonstrable false-positive: `ci_outer(x,w)` = `(1,5),(2,99)`,
+`ci_inner(y,z)` = `(5,777)` — real PostgreSQL semantics say `x IN
+(SELECT y FROM ci_inner WHERE z = ci_outer.w)` returns zero rows for
+every `ci_outer` row (no `ci_inner` row has `z` matching `5` or `99`),
+but the pre-fix planner wrongly returned `x=1` (`w=5` incidentally
+equals `ci_inner.y=5`).
+
+**Fix, and why it also closes the NullAware gap for free.** Added
+`correlatedInOperandSafeToUnnest(in, params)` (`internal/planner/
+unnest.go`), gating `canUnnestInExprDepth`'s correlated branch. It
+requires exactly one correlation pair, and BOTH:
+
+1. `in.Operand` is structurally the same column as the correlation's
+   outer-scope side (`params[0].OuterRef`) — same `Index`/
+   `SourceTableIdx`/`Name` (both are populated from the same
+   scope-resolution numbering, confirmed empirically: an unrelated
+   outer column has a different `Index`/`Name` even when
+   `SourceTableIdx` coincides).
+2. The subquery's sole projected expression (`in.Plan.(*Project)
+   .Targets[0]`) is structurally the same column as the correlation's
+   subquery-scope side (`params[0].SubCol`) — otherwise folding the
+   correlation predicate to a tautology silently discards a real
+   filter.
+
+When both hold, the correlation predicate **is** `SELECT-column =
+in.Operand`, so every row that survives it has a non-NULL projected
+value exactly equal to `in.Operand` (an equality predicate can't be
+satisfied by NULL) — the subquery's per-outer-row result is therefore
+either empty or exactly `{in.Operand}`, never containing a NULL or a
+mismatched value. That is precisely the condition under which a plain
+(non-NullAware) Anti join already implements NOT IN's three-valued
+semantics correctly (empty → keep, matched-non-NULL → exclude), so
+the previously-flagged "correlated NOT IN needs per-group NullAware
+tracking" turns out to be moot for every case this mechanism is
+actually allowed to unnest post-fix — the real bug was the missing
+operand/select-column identity check, not missing NullAware
+plumbing. Any correlated IN/NOT IN that doesn't satisfy both
+conditions now correctly falls back to the pre-existing (always
+correct) runtime per-row evaluation path — a performance-only
+regression for such shapes, never a correctness one.
+
+**Tests:** `internal/planner/correlated_in_unnest_test.go` — two
+positive cases (self-referencing correlation still unnests to
+`JoinTypeSemi`/`JoinTypeAnti`) and two negative cases (operand ≠
+correlation column; correlation column ≠ selected column — both must
+leave the `InExpr` in place, unnested). `internal/executor/
+correlated_in_unnest_test.go` — end-to-end row-count proof using the
+`ci_outer`/`ci_inner` data above (`TestCorrelatedIn_
+OperandMismatchNotCorrelationColumn`) plus the safe self-referencing
+case (`TestCorrelatedIn_SelfReferencingStillUnnests`). Confirmed
+non-vacuous via `git stash` on `unnest.go` alone: both negative
+planner tests fail (`InExpr was unnested despite ...`) and the
+executor test's false-positive row reappears (`got 1 rows, want 0`).
+Gates: `go build ./...` clean; `go test ./internal/planner/...
+./internal/executor/... ./internal/analyzer/...` PASS;
+`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+`RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+failed transactions, all 3 pgbench workloads).

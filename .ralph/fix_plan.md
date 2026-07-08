@@ -5001,6 +5001,48 @@ mirroring M0119's ledger `status` column.
       pgbench workloads). **Still open in this bucket:** correlated NOT
       IN's NullAware gap, Q16's non-triggering unnest (root cause not
       yet isolated), Q8/Q9/Q21 row-count fixes.
+      **Correlated IN/NOT IN operand-identity bug found and fixed
+      (2026-07-09, this loop, resolves the "correlated NOT IN's
+      NullAware gap" item above with a bigger-scope root cause than
+      that framing assumed):** `unnestInExpr`'s correlated branch
+      (`internal/planner/unnest.go`) never read `in.Operand` — it
+      always keyed the join on the subquery's own correlation
+      equijoin pair alone, folding the correlation predicate itself
+      into a tautology inside the cloned inner plan. This silently
+      changed the predicate's *meaning* (not just its NULL handling)
+      for BOTH plain correlated `IN` and `NOT IN` whenever the
+      correlation column differed from the IN operand and/or the
+      subquery's SELECT column — e.g. `x IN (SELECT y FROM t2 WHERE z
+      = outer.w)` matched on `w = y` alone, discarding `z` and the
+      real `x`/`y` comparison. Fixed via new
+      `correlatedInOperandSafeToUnnest` gate in
+      `canUnnestInExprDepth`: requires `in.Operand` to be the same
+      column as the correlation's outer-scope side AND the subquery's
+      sole projected column to be the same column as the
+      correlation's subquery-scope side. Proved this also fully
+      closes the previously-flagged NullAware gap: when both
+      identities hold, every surviving row's projected value is
+      non-NULL and exactly equals `in.Operand`, so a plain Anti join
+      is already correct for NOT IN here — no per-group NullAware
+      tracking needed for anything still unnestable post-fix.
+      Tests: `internal/planner/correlated_in_unnest_test.go` (2
+      positive shape-preserving cases + 2 negative regression cases),
+      `internal/executor/correlated_in_unnest_test.go` (end-to-end
+      row-count proof: pre-fix wrongly returns a row, post-fix
+      correctly returns none). Confirmed non-vacuous via `git stash`
+      on `unnest.go` alone. Design:
+      `docs/design/0040-0001-subquery-caching-and-unnest.md` new
+      Follow-up #2 section; `docs/design/README.md` row extended.
+      Deferral ledger: new row appended documenting the fix; Q16's
+      non-triggering-unnest item (unrelated optimizer-coverage gap)
+      remains open at its original resume point. Gates: `go build
+      ./...` clean; `go test ./internal/planner/...
+      ./internal/executor/... ./internal/analyzer/...` PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh`
+      PASS (0 failed txns, all 3 pgbench workloads). **Still open in
+      this bucket:** Q16's non-triggering unnest (root cause not yet
+      isolated), Q8/Q9/Q21 row-count fixes.
 - [ ] **M0122-0012 — Perf infra: vectorization / slot-pipeline / harness** (~19,
       ARCHITECTURAL). Borrow-semantics allocation rewrite, plannode migration,
       vectorized FilterOp/SeqScanOp, plan cache, HammerDB SF1 validation.
