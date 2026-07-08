@@ -346,8 +346,9 @@ func (o *ddlOp) execDropTablespace(s *parser.DropTablespaceStmt) error {
 	return nil
 }
 
-// resolveCreateTableTablespace resolves an optional `TABLESPACE name` clause
-// (parser.CreateTableStmt.Tablespace) to the pg_class.reltablespace value to
+// resolveTablespaceClause resolves an optional `TABLESPACE name` clause
+// (parser.CreateTableStmt.Tablespace / parser.CreateIndexStmt.Tablespace /
+// AlterTableAction.TablespaceName) to the pg_class.reltablespace value to
 // store: 0 when the clause is absent or names the database's default
 // tablespace (pg_default — goopg has no per-database tablespace override), the
 // resolved OID otherwise. Mirrors DefineRelation's tablespace handling
@@ -355,7 +356,7 @@ func (o *ddlOp) execDropTablespace(s *parser.DropTablespaceStmt) error {
 // get_tablespace_oid), and pg_global is rejected for ordinary relations with
 // 22023 (ERRCODE_INVALID_PARAMETER_VALUE, "only shared relations can be placed
 // in pg_global tablespace"). M0122-0007.
-func resolveCreateTableTablespace(ctx *Context, pos int, name string) (uint32, error) {
+func resolveTablespaceClause(ctx *Context, pos int, name string) (uint32, error) {
 	if name == "" {
 		return 0, nil
 	}
@@ -2679,7 +2680,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				Message: fmt.Sprintf("server %q does not exist", s.ForeignServer)}
 		}
 	}
-	tablespaceOID, err := resolveCreateTableTablespace(o.ctx, s.Pos(), s.Tablespace)
+	tablespaceOID, err := resolveTablespaceClause(o.ctx, s.Pos(), s.Tablespace)
 	if err != nil {
 		return err
 	}
@@ -3667,7 +3668,7 @@ func (o *ddlOp) execCreateTableAs(s *parser.CreateTableStmt) error {
 			Name: colName, Type: catalog.Type{Name: strings.ToLower(typeName)},
 		}
 	}
-	tablespaceOID, err := resolveCreateTableTablespace(o.ctx, s.Pos(), s.Tablespace)
+	tablespaceOID, err := resolveTablespaceClause(o.ctx, s.Pos(), s.Tablespace)
 	if err != nil {
 		return err
 	}
@@ -3793,7 +3794,7 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 			return err
 		}
 	}
-	tablespaceOID, err := resolveCreateTableTablespace(o.ctx, s.Pos(), s.Tablespace)
+	tablespaceOID, err := resolveTablespaceClause(o.ctx, s.Pos(), s.Tablespace)
 	if err != nil {
 		return err
 	}
@@ -5924,6 +5925,13 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 	if method == "hash" {
 		method = "btree"
 	}
+	// Resolve the optional TABLESPACE clause once, before either creation path
+	// below — an unknown name / pg_global must error regardless of access
+	// method. Catalog metadata only; no physical relocation. M0122-0007.
+	idxTablespaceOID, tsErr := resolveTablespaceClause(o.ctx, s.Pos(), s.Tablespace)
+	if tsErr != nil {
+		return tsErr
+	}
 	// gist, spgist, gin and brin: register catalog metadata only (no physical
 	// storage). pg_index / pg_class / pg_get_indexdef queries work correctly; no
 	// actual index acceleration or constraint enforcement. GIN is catalog-only
@@ -5937,6 +5945,7 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 		}
 		idx.HasPredicate = s.HasPredicate
 		idx.IncludeColumns = s.IncludeColumns
+		idx.Tablespace = idxTablespaceOID
 		// Persist `WITH (fillfactor=N)` so pg_class.reloptions / pg_dump round-trip
 		// it (already range-validated above). DU-002 slice 218.
 		idx.Fillfactor = s.Fillfactor
@@ -6061,6 +6070,15 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 		// the SSI scan/insert hooks.
 		if hidx, ok := o.ctx.Catalog.LookupIndex(idxName); ok {
 			hidx.DeclaredHash = true
+		}
+	}
+	if idxTablespaceOID != 0 {
+		// Not carried through btreeIndexProps/the CREATE INDEX WAL record
+		// (deliberately deferred, matching Table.Tablespace — ledger row,
+		// M0122-0007): only affects pg_class.reltablespace for the life of
+		// this session, resets to 0 (default) after a restart.
+		if bidx, ok := o.ctx.Catalog.LookupIndex(idxName); ok {
+			bidx.Tablespace = idxTablespaceOID
 		}
 	}
 	if s.HasPredicate || len(s.IncludeColumns) > 0 || s.Predicate != nil || nonDefaultOrder || hasOpClass || hasCollation || s.NullsNotDistinct || s.Fillfactor != 0 || s.DeduplicateItems != nil {
@@ -6892,6 +6910,17 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 							}
 						}
 					}
+				}
+				if act.Kind == parser.AlterTableSetTablespace {
+					// ALTER INDEX name SET TABLESPACE tablespace_name — same
+					// catalog-metadata-only treatment as the table form above
+					// (see the AlterTableSetTablespace case in the table
+					// action loop); not yet WAL-persisted. M0122-0007.
+					oid, tsErr := resolveTablespaceClause(o.ctx, act.Pos(), act.TablespaceName)
+					if tsErr != nil {
+						return tsErr
+					}
+					idx.Tablespace = oid
 				}
 				if act.Kind == parser.AlterTableRenameTable {
 					// ALTER INDEX name RENAME TO newname on a real (non-TOAST)
@@ -8067,6 +8096,17 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			// RESET (param, …) — clear the named storage parameters back to their
 			// defaults. Acts on the same live catalog.Table fields as SET. M0118-0001.
 			o.execAlterTableResetReloptions(tbl, act)
+		case parser.AlterTableSetTablespace:
+			// SET TABLESPACE name — update pg_class.reltablespace. Catalog
+			// metadata only: no physical relocation of the table's on-disk
+			// file, and not yet WAL-persisted (resets to 0/default after a
+			// restart, same deferral as CREATE TABLE ... TABLESPACE's ledger
+			// row). M0122-0007.
+			oid, tsErr := resolveTablespaceClause(o.ctx, act.Pos(), act.TablespaceName)
+			if tsErr != nil {
+				return tsErr
+			}
+			tbl.Tablespace = oid
 		case parser.AlterTableAlterColumnSet:
 			// SET (opt=value, …) — record the per-column attribute options on the
 			// catalog column AND rewrite the pg_attribute heap row so pg_dump

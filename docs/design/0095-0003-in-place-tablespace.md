@@ -153,8 +153,9 @@ decision above):**
   sees it) — only the in-process catalog rebuild after a restart drops it,
   matching the existing `Unlogged` precedent exactly.
 - **`CREATE INDEX ... TABLESPACE`, `ALTER TABLE/INDEX ... SET TABLESPACE`
-  remain unparsed** (not even accepted syntax today) — separate, additive
-  grammar work, not covered by this slice.
+  remained unparsed** (not even accepted syntax at the time) — separate,
+  additive grammar work, not covered by this slice. **Closed 2026-07-08, see
+  below.**
 
 Tests: `parser.TestParseCreateTableTablespace` (all three parse sites, table
 + empty-column-list + partition child); `executor`'s
@@ -173,6 +174,77 @@ tracked in the deferral ledger); `go test ./internal/initdb/...` PASS;
 `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
 `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0 failed
 txns, all 3 workloads).
+
+## CREATE INDEX / ALTER TABLE/INDEX ... SET TABLESPACE (landed 2026-07-08, M0122-0007 follow-up)
+
+Closed the resume point named just above. Three grammar gaps, all catalog-
+metadata-only (same scope boundary as `CREATE TABLE ... TABLESPACE`: no
+physical relocation, no restart durability):
+
+1. **`CREATE INDEX ... TABLESPACE name`.** Real PG grammar places the clause
+   after `WITH (storage_parameter)` and before `WHERE` (`gram.y`'s `IndexStmt`:
+   `OptTableSpace` precedes `where_clause`) — `parseCreateIndexTail`
+   (`internal/parser/ddl.go`) now accepts it in that position onto the new
+   `CreateIndexStmt.Tablespace` field. `execCreateIndex`
+   (`internal/executor/operators_ddl.go`) resolves it via the same
+   `resolveTablespaceClause` helper the CREATE TABLE path uses (renamed from
+   `resolveCreateTableTablespace` — the resolution logic has nothing
+   table-specific about it) once, before branching into either the
+   gist/spgist/gin/brin catalog-only path or the real btree
+   `createBTreeIndex` path, since an unknown name / `pg_global` must reject the
+   statement regardless of access method. The resolved OID lands on the new
+   `catalog.Index.Tablespace` field.
+2. **`ALTER TABLE name SET TABLESPACE name`.** Unlike `SET SCHEMA`/`SET
+   LOGGED` (whole-statement fields the caller intercepts before the
+   per-action parser runs), real PG's `SET TABLESPACE` is an ordinary
+   `alter_table_cmd` (`AT_SetTableSpace`, `gram.y:2932-2937`) — combinable
+   with other comma-separated actions. `parseAlterTableAction`
+   (`internal/parser/ddl.go`) recognizes it (checked before the pre-existing
+   `SET (reloptions)` branch, which unconditionally expects a `(`) and emits
+   the new `AlterTableSetTablespace` action kind carrying the name in the new
+   `AlterTableAction.TablespaceName` field. `execAlterTable`
+   (`internal/executor/operators_ddl.go`) resolves and stores it on
+   `tbl.Tablespace`.
+3. **`ALTER INDEX name SET TABLESPACE name`.** Same grammar reused for the
+   other relkind. The dedicated ALTER INDEX parse block checks for it ahead
+   of the pre-existing `ALTER INDEX name SET (param = value, …)` reloptions
+   branch (same ordering reason as #2), producing the identical
+   `AlterTableSetTablespace` action wrapped in an `AlterTableStmt` with
+   `TagOverride: "ALTER INDEX"`. `execAlterTable`'s index branch (the
+   `LookupIndex` fallback reached when the name doesn't resolve as a table)
+   resolves and stores it on `idx.Tablespace`.
+
+Both `catalog.Index.Tablespace` and `AlterTableAction.TablespaceName` render
+as `pg_class.reltablespace` via the same index row-builder loop in
+`catalog.go`'s `registerSystemTables` that previously hardcoded `"0"` for
+every index. Deliberately **not** carried through `btreeIndexProps`/the
+CREATE INDEX WAL record — like `Table.Tablespace`, `Index.Tablespace` is
+catalog-metadata-only for the life of the session and resets to `0` (default)
+after a restart (ledger row, M0122-0007).
+
+Tests: `parser.TestParseCreateIndexTablespace` (plain / after WITH options /
+before WHERE / absent), `TestParseAlterTableSetTablespace`,
+`TestParseAlterIndexSetTablespace` (also pins the sibling reloptions `SET (…)`
+branch stays unaffected) — all in `internal/parser/create_tablespace_test.go`.
+`executor`'s `TestCreateIndexTablespaceResolvesAndStores` (real btree path),
+`TestCreateIndexTablespaceCatalogOnlyMethod` (gist path),
+`TestCreateIndexTablespaceUnknownErrors42704`,
+`TestAlterTableSetTablespaceUpdatesTable`,
+`TestAlterIndexSetTablespaceUpdatesIndex`,
+`TestPGClassRendersIndexReltablespace` (live `SELECT reltablespace FROM
+pg_catalog.pg_class`) — `internal/executor/create_index_tablespace_test.go`.
+Confirmed non-vacuous: the new parser fields/action kind and catalog field
+don't exist without the fix (compile failure on `git stash` of the
+parser/catalog/executor diffs). Gates: `go build ./...`/`go vet ./...` clean;
+`go test ./internal/parser/... ./internal/catalog/... ./internal/executor/...`
+PASS; `go test ./internal/planner/... ./internal/initdb/...` PASS;
+`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+`RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0 failed
+txns, all 3 workloads).
+
+**Still open** (M0122-0007, this bucket): CREATE/DROP DATABASE full DDL,
+REINDEX physical rebuild, tablespace physical relocation + restart
+durability (both table and index).
 
 ## Tests
 

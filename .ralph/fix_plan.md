@@ -4486,6 +4486,49 @@ mirroring M0119's ledger `status` column.
       **Still open** (this bucket, ~7 remaining items): CREATE/DROP DATABASE
       full DDL, REINDEX physical rebuild, tablespace physical relocation +
       restart durability, CREATE INDEX/ALTER ... SET TABLESPACE.
+      **`CREATE INDEX ... TABLESPACE` / `ALTER TABLE/INDEX ... SET
+      TABLESPACE` — DONE (2026-07-08, later loop):** closed the "both still
+      fully unparsed" resume point directly above. `CreateIndexStmt.Tablespace`
+      (parser, `parseCreateIndexTail` — real PG grammar order: after `WITH
+      (storage_parameter)`, before `WHERE`) plus a new `AlterTableSetTablespace`
+      action kind (`AlterTableAction.TablespaceName`) for the bare `SET
+      TABLESPACE name` form of both `ALTER TABLE` (an ordinary
+      comma-combinable `alter_table_cmd`, unlike `SET SCHEMA`/`SET LOGGED`
+      which are whole-statement fields intercepted before the per-action
+      parser) and `ALTER INDEX` (checked ahead of the pre-existing `SET
+      (reloptions)` branch in both dispatchers, which otherwise unconditionally
+      expects `(`). Executor resolves all three sites through the renamed
+      `resolveTablespaceClause` (was `resolveCreateTableTablespace` —
+      genuinely relation-generic, no table-specific logic) onto the new
+      `catalog.Index.Tablespace` field, rendered as `pg_class.reltablespace` by
+      the same index-row loop that previously hardcoded `"0"`. Deliberately
+      NOT carried through `btreeIndexProps`/the CREATE INDEX WAL record —
+      catalog-metadata-only for the session lifetime, matching
+      `Table.Tablespace`'s existing restart-durability gap (no new ledger row;
+      already covered by the "tablespace physical relocation + restart
+      durability" bullet below). Tests:
+      `parser.TestParseCreateIndexTablespace`,
+      `TestParseAlterTableSetTablespace`, `TestParseAlterIndexSetTablespace`
+      (`internal/parser/create_tablespace_test.go`);
+      `executor.TestCreateIndexTablespaceResolvesAndStores` (btree),
+      `TestCreateIndexTablespaceCatalogOnlyMethod` (gist),
+      `TestCreateIndexTablespaceUnknownErrors42704`,
+      `TestAlterTableSetTablespaceUpdatesTable`,
+      `TestAlterIndexSetTablespaceUpdatesIndex`,
+      `TestPGClassRendersIndexReltablespace`
+      (`internal/executor/create_index_tablespace_test.go`); all confirmed
+      non-vacuous via `git stash` (new fields/action kind don't exist without
+      the fix). Design: `docs/design/0095-0003-in-place-tablespace.md` new
+      "CREATE INDEX / ALTER TABLE/INDEX ... SET TABLESPACE" section;
+      `docs/design/README.md` row updated. Gates: `go build ./...`/`go vet
+      ./...` clean; `go test ./internal/parser/... ./internal/catalog/...
+      ./internal/executor/...` PASS; `go test ./internal/planner/...
+      ./internal/initdb/...` PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+      scripts/ralph-precommit-test.sh` PASS (0 failed txns, all 3 workloads).
+      **Still open** (this bucket, ~6 remaining items): CREATE/DROP DATABASE
+      full DDL, REINDEX physical rebuild, tablespace physical relocation +
+      restart durability (both table and index).
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,
       encoding constraints during bootstrap/runtime.

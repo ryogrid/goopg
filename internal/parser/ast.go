@@ -1596,6 +1596,10 @@ type CreateIndexStmt struct {
 	// explicitly-declared value so pg_get_indexdef can re-emit
 	// `WITH (autosummarize='on'|'off')`. DU-002 slice 223.
 	AutoSummarize *bool
+	// Tablespace holds the name from an optional `TABLESPACE name` clause
+	// (empty = database default). Mirrors CreateTableStmt.Tablespace.
+	// M0122-0007.
+	Tablespace string
 }
 
 // IndexColOrder captures the ASC/DESC + NULLS ordering of one CREATE INDEX key
@@ -3072,6 +3076,14 @@ const (
 	// ConstraintName holds the target constraint; AlterConstraint* fields
 	// carry the parsed attributes. DU-002 slice 433.
 	AlterTableAlterConstraint
+	// AlterTableSetTablespace — `ALTER TABLE name SET TABLESPACE tablespace_name`
+	// (also reused for `ALTER INDEX name SET TABLESPACE tablespace_name`, real
+	// PG's alter_table_cmd grammar shares the AT_SetTableSpace subtype across
+	// both relkinds — gram.y's `SET TABLESPACE name`). TablespaceName carries
+	// the target tablespace. goopg records the catalog metadata only — no
+	// physical relocation of the relation's files, matching the CREATE TABLE/
+	// INDEX ... TABLESPACE precedent (M0122-0007).
+	AlterTableSetTablespace
 )
 
 // FDWOptionVerb tags one entry of an `ALTER FOREIGN TABLE ... OPTIONS (...)`
@@ -3171,6 +3183,9 @@ type AlterTableAction struct {
 	// ClusterIndexName is the index named in `CLUSTER ON index_name` for
 	// AlterTableClusterOn. DU-002 slice 321.
 	ClusterIndexName string
+	// TablespaceName is the target tablespace for AlterTableSetTablespace
+	// (`SET TABLESPACE name`, table or index). M0122-0007.
+	TablespaceName string
 	// DefaultExpr is the parsed DEFAULT expression for AlterTableSetDefault
 	// (`ALTER COLUMN name SET DEFAULT expr`). Nil for AlterTableDropDefault.
 	// DU-002 slice 269.

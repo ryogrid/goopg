@@ -120,3 +120,87 @@ func TestParseDropTablespace(t *testing.T) {
 		}
 	}
 }
+
+// TestParseCreateIndexTablespace pins the M0122-0007 follow-up: CREATE
+// INDEX's TABLESPACE clause (real PG grammar: after WITH (storage_parameter),
+// before WHERE) must populate CreateIndexStmt.Tablespace instead of being
+// rejected or silently discarded.
+func TestParseCreateIndexTablespace(t *testing.T) {
+	cases := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{"plain", "CREATE INDEX idx1 ON t (a) TABLESPACE ts1", "ts1"},
+		{"no clause", "CREATE INDEX idx1 ON t (a)", ""},
+		{"after WITH options", "CREATE INDEX idx1 ON t (a) WITH (fillfactor=70) TABLESPACE ts1", "ts1"},
+		{"before WHERE predicate", "CREATE INDEX idx1 ON t (a) TABLESPACE ts1 WHERE a > 0", "ts1"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stmts, err := Parse(tc.sql)
+			if err != nil {
+				t.Fatalf("Parse(%q): %v", tc.sql, err)
+			}
+			s, ok := stmts[0].(*CreateIndexStmt)
+			if !ok {
+				t.Fatalf("Parse(%q): want *CreateIndexStmt, got %T", tc.sql, stmts[0])
+			}
+			if s.Tablespace != tc.want {
+				t.Errorf("%q: Tablespace=%q want %q", tc.sql, s.Tablespace, tc.want)
+			}
+		})
+	}
+}
+
+// TestParseAlterTableSetTablespace pins the M0122-0007 follow-up: `ALTER
+// TABLE name SET TABLESPACE name` was previously fully unparsed (the bare-SET
+// dispatch only recognized the parenthesized reloptions form and SET
+// SCHEMA/LOGGED, so this fell through to "expected ADD or DROP"). It must now
+// produce an AlterTableSetTablespace action carrying TablespaceName.
+func TestParseAlterTableSetTablespace(t *testing.T) {
+	stmts, err := Parse("ALTER TABLE t SET TABLESPACE ts1")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	s, ok := stmts[0].(*AlterTableStmt)
+	if !ok {
+		t.Fatalf("want *AlterTableStmt, got %T", stmts[0])
+	}
+	if len(s.Actions) != 1 || s.Actions[0].Kind != AlterTableSetTablespace {
+		t.Fatalf("want 1 AlterTableSetTablespace action, got %+v", s.Actions)
+	}
+	if got := s.Actions[0].TablespaceName; got != "ts1" {
+		t.Errorf("TablespaceName=%q want %q", got, "ts1")
+	}
+}
+
+// TestParseAlterIndexSetTablespace mirrors TestParseAlterTableSetTablespace
+// for `ALTER INDEX name SET TABLESPACE name` — checked ahead of the existing
+// `ALTER INDEX name SET (param = value, …)` reloptions branch, which
+// otherwise unconditionally expects a `(` after SET.
+func TestParseAlterIndexSetTablespace(t *testing.T) {
+	stmts, err := Parse("ALTER INDEX idx1 SET TABLESPACE ts1")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	s, ok := stmts[0].(*AlterTableStmt)
+	if !ok {
+		t.Fatalf("want *AlterTableStmt, got %T", stmts[0])
+	}
+	if len(s.Actions) != 1 || s.Actions[0].Kind != AlterTableSetTablespace {
+		t.Fatalf("want 1 AlterTableSetTablespace action, got %+v", s.Actions)
+	}
+	if got := s.Actions[0].TablespaceName; got != "ts1" {
+		t.Errorf("TablespaceName=%q want %q", got, "ts1")
+	}
+	// The existing reloptions SET must remain unaffected.
+	stmts2, err := Parse("ALTER INDEX idx1 SET (fillfactor = 70)")
+	if err != nil {
+		t.Fatalf("Parse (reloptions): %v", err)
+	}
+	s2 := stmts2[0].(*AlterTableStmt)
+	if len(s2.Actions) != 1 || s2.Actions[0].Kind != AlterIndexSetReloptions {
+		t.Fatalf("reloptions SET regressed: %+v", s2.Actions)
+	}
+}

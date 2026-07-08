@@ -1604,6 +1604,13 @@ type Index struct {
 	Method  string
 	Primary bool
 	OID     uint32
+	// Tablespace is the pg_class.reltablespace value for this index: 0
+	// (InvalidOid) means the database default. Set by `CREATE INDEX ...
+	// TABLESPACE name` or `ALTER INDEX ... SET TABLESPACE name`. Catalog
+	// metadata only (mirrors Table.Tablespace) — not yet WAL-persisted, so it
+	// resets to 0 after a restart (ledger row, M0122-0007). No physical
+	// relocation of the index's on-disk file happens either.
+	Tablespace uint32
 	// DeclaredHash records that the index was created `USING hash`. goopg has no
 	// native hash access method — a hash index is built on the B-tree substrate,
 	// so Method stays "btree" (catalog/pg_am/pg_dump unchanged) — but a
@@ -5990,6 +5997,11 @@ func (c *InMemory) registerSystemTables() {
 			// are joined in declaration-stable order (fillfactor first), mirroring
 			// the array order PG stores. DU-002 slices 218/219.
 			idxReloptions := BuildIndexReloptions(idx)
+			// reltablespace: 0 = default; explicit CREATE/ALTER INDEX ...
+			// TABLESPACE otherwise. Hoisted to a local so the row literal
+			// below keeps its single-token column width (and comment
+			// alignment), same convention as relOfType above. M0122-0007.
+			idxTablespace := strconv.Itoa(int(idx.Tablespace))
 			out = append(out, []string{
 				strconv.Itoa(int(idx.OID)),  // 0:  oid
 				idx.Name,                    // 1:  relname
@@ -5999,7 +6011,7 @@ func (c *InMemory) registerSystemTables() {
 				"10",                        // 5:  relowner
 				idxRelam,                    // 6:  relam
 				strconv.Itoa(int(idx.OID)),  // 7:  relfilenode
-				"0",                         // 8:  reltablespace
+				idxTablespace,               // 8:  reltablespace
 				"0",                         // 9:  relpages
 				"-1",                        // 10: reltuples (-1 = unknown for indexes)
 				"0",                         // 11: relallvisible

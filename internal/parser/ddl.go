@@ -4936,6 +4936,16 @@ func (p *parser) parseCreateIndexTail(pos int, unique bool) (Stmt, error) {
 			_ = p.acceptIdentKeyword("distinct")
 		}
 	}
+	// Optional TABLESPACE clause. Comes after WITH (storage_parameter) and
+	// before WHERE in real PG grammar (gram.y IndexStmt: OptTableSpace before
+	// where_clause). M0122-0007.
+	if p.acceptKeyword(KwTablespace) {
+		tsTok, err := p.parseIdent()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Tablespace = identText(tsTok)
+	}
 	// Optional WHERE predicate (partial index) — parse and record.
 	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwWhere {
 		p.advance()
@@ -7161,6 +7171,25 @@ func (p *parser) parseAlter() (Stmt, error) {
 				}
 			}
 		}
+		// ALTER INDEX name SET TABLESPACE tablespace_name — catalog metadata
+		// only, no physical relocation. Checked before the generic reloptions
+		// SET below since that branch unconditionally expects `(`. M0122-0007.
+		if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwSet &&
+			p.peek(1).Kind == TokenKeyword && p.peek(1).Keyword == KwTablespace {
+			p.advance() // SET
+			p.advance() // TABLESPACE
+			tsTok, err := p.parseIdent()
+			if err != nil {
+				return nil, err
+			}
+			stmt := &AlterTableStmt{pos: t.Pos, Name: idxName, TagOverride: "ALTER INDEX"}
+			stmt.Actions = append(stmt.Actions, AlterTableAction{
+				pos:            tsTok.Pos,
+				Kind:           AlterTableSetTablespace,
+				TablespaceName: identText(tsTok),
+			})
+			return stmt, nil
+		}
 		// ALTER INDEX name SET (param = value, …) — index storage parameters.
 		// Only GIN fastupdate is acted on (drives predicate-gin SSI granularity,
 		// design 0118-0140); other options round-trip as accepted no-ops.
@@ -8934,6 +8963,22 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 			}, nil
 		}
 		return AlterTableAction{}, p.errAtCur("expected column or constraint name after DROP")
+	}
+	// SET TABLESPACE name — an alter_table_cmd in its own right (gram.y's
+	// AT_SetTableSpace), combinable with other comma-separated actions, unlike
+	// SET SCHEMA/SET LOGGED which the caller intercepts as whole-statement
+	// fields before this per-action parser ever runs. Catalog metadata only —
+	// no physical relocation of the relation's files. M0122-0007.
+	if cur := p.cur(); cur.Kind == TokenKeyword && cur.Keyword == KwSet &&
+		p.peek(1).Kind == TokenKeyword && p.peek(1).Keyword == KwTablespace {
+		pos := cur.Pos
+		p.advance() // SET
+		p.advance() // TABLESPACE
+		tsTok, err := p.parseIdent()
+		if err != nil {
+			return AlterTableAction{}, err
+		}
+		return AlterTableAction{pos: pos, Kind: AlterTableSetTablespace, TablespaceName: identText(tsTok)}, nil
 	}
 	// SET (reloptions) / RESET (reloptions) — table-level storage parameters,
 	// e.g. `ALTER TABLE foo SET (parallel_workers = 2)` or
