@@ -246,6 +246,102 @@ txns, all 3 workloads).
 REINDEX physical rebuild, tablespace physical relocation + restart
 durability (both table and index).
 
+## Restart durability (2026-07-08 follow-up)
+
+Closed the "restart durability (both table and index)" resume point named
+above. `pg_class.reltablespace` for both `Table.Tablespace` and
+`Index.Tablespace` was already correctly *written* into the live heap row
+(`buildUserPGClassRow` / `buildUserPGClassRowForIndex`, the latter fixed this
+loop — it had hardcoded `0` even for an index explicitly created `...
+TABLESPACE ts1`) but never *read back* on the heap-driven restart path:
+
+- `catalog.PGClassRow` gained `RelTablespace uint32`, decoded by
+  `DecodePGClassPhysicalRow` (`internal/catalog/codec.go`) at the real PG18
+  `FormData_pg_class` byte offset 92 — verified against `pgClassColDefs`'s own
+  offset comments (`internal/initdb/initdb.go`): sits between
+  `relfilenode`(88) and `relpages`(96).
+- `internal/initdb/open.go`'s `loadUserTablesFromHeap` sets `tbl.Tablespace =
+  tr.RelTablespace` when reconstructing a table from the pg_class heap.
+- `loadUserIndexesFromHeap` decodes the same column for `relkind='i'` rows and
+  threads it through a new `tablespace uint32` parameter on
+  `catalog.Catalog`'s `RegisterIndexDuringRecovery` /
+  `internal/initdb.indexRegistryRecovery` — mirrors the existing
+  `fillfactor`/`deduplicateItems` parameters, which take the same "pass 0/nil
+  here, apply the real value via a separate reloptions-decode step" shape for
+  reloptions but, unlike those, tablespace needs no string parsing so it goes
+  straight through the constructor argument.
+
+For the WAL-only replay fallback (`internal/initdb.replayIndexDDLRecords`,
+exercised when no pg_index heap row exists yet — e.g. an uncheckpointed crash
+between `syncIndexToCatalogHeap` and the next checkpoint), `wal.
+CreateIndexPayload` gained a `Tablespace uint32` field inside its existing
+self-describing "extension" block (new `ciExtHasTablespace` flag bit,
+`internal/wal/recovery.go`), encoded/decoded exactly like `Fillfactor`.
+`btreeIndexProps` (`internal/executor/operators_ddl.go`) gained a matching
+`Tablespace` field, and `createBTreeIndex` now sets `idx.Tablespace =
+xp.Tablespace` in the same block that already applies
+`Fillfactor`/`DeduplicateItems` from `xp` — **before** the CREATE INDEX WAL
+record is built, following the same "before WAL emission, not a post-call
+assignment" discipline every other M0122-0006-follow-up index property
+already established (a post-call assignment survives a graceful shutdown
+checkpoint but reverts to 0 across a genuine uncheckpointed crash restart).
+This let `execCreateIndex`'s old post-call `bidx.Tablespace =
+idxTablespaceOID` block (added when the CREATE INDEX TABLESPACE clause first
+landed, deliberately deferred at the time) be deleted outright — the value
+now flows through `btreeIndexProps` like every sibling property.
+
+`ALTER TABLE/INDEX ... SET TABLESPACE` was previously catalog-metadata-only
+for the life of the session (explicitly documented as such when it first
+landed) — it now resyncs the heap-persisted pg_class row immediately after
+the mutation: the table action reuses the established
+`deleteCatalogRowsForOID`(xmax-stamp)+`syncTableToCatalogHeap` idiom every
+other column-mutating ALTER action in `execAlterTable` already follows; the
+index action calls `resyncIndexClassHeapRow`, which already stamps the old
+row's xmax internally. An uncheckpointed crash immediately after either
+statement no longer loses the change.
+
+Tests: `TestEncodeCreateIndexExtensionRoundTrip`'s new "tablespace only" case
+plus the gen1 backward-compat zero-value assertion
+(`internal/wal/index_ddl_test.go`);
+`TestTableTablespaceSurvivesRestartViaCatalogHeap`,
+`TestIndexTablespaceSurvivesRestartViaCatalogHeap`,
+`TestAlterTableSetTablespaceSurvivesRestartViaCatalogHeap`
+(`internal/initdb/tablespace_restart_test.go`) — full `Init`→`Open`→DDL→
+`Close`→`Open` cycles against a real on-disk data directory (no JSON
+snapshot), all confirmed non-vacuous via `git stash` on the fix files (fail
+with `Tablespace = 0, want <oid>` pre-fix). Also live-verified against the
+real `cmd/goopg` binary: `CREATE TABLESPACE ts1 LOCATION ''`, `CREATE TABLE
+ts_live (id int4) TABLESPACE ts1`, `CREATE INDEX ts_live_idx ON ts_live (id)
+TABLESPACE ts1`, then a real `goopg stop` / `goopg start` — `pg_class.
+reltablespace` for both rows unchanged across the restart; likewise for
+`ALTER TABLE ... SET TABLESPACE`. Gates: `go build ./...`/`go vet ./...`
+clean; `go test ./internal/catalog/... ./internal/wal/...
+./internal/initdb/... ./internal/executor/...` PASS; `scripts/
+tpch-spotcheck.sh` PASS (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+scripts/ralph-precommit-test.sh` PASS (0 failed txns, all 3 workloads).
+
+**New gap found live-verifying this fix, not fixed here (deferral ledger
+row, one task per loop):** the tablespace *registry* itself (`CREATE
+TABLESPACE`, `catalog.InMemory.tablespaces`) has no restart durability at
+all — `CreateTablespace`/`DropTablespace` mutate a purely in-memory map with
+no WAL record and no backing heap relation (`pg_tablespace` is a shared
+catalog with no `RelFileNode` resolver, per the "Catalog-visibility scope
+decision" section above), so a tablespace vanishes from `pg_tablespace`
+entirely after a restart even though its `pg_tblspc/<oid>/` directory stays
+on disk — confirmed live: a fresh server session's `CREATE TABLE ... 
+TABLESPACE ts1` fails with `42704 tablespace "ts1" does not exist` right
+after a restart that had `ts1` live moments before. This orphans any
+table/index whose now-durable `reltablespace` OID points at the vanished
+tablespace. Needs the same class of fix `CREATE DATABASE`/`CREATE SCHEMA`
+already got: a new `RecordKindCreateTablespace`/`RecordKindDropTablespace`
+WAL record pair plus a `replayTablespaceDDLRecords` driver in
+`internal/initdb`, mirroring `replayDatabaseDDLRecords`/
+`replaySchemaDDLRecords`.
+
+**Still open** (M0122-0007, this bucket): CREATE/DROP DATABASE full DDL,
+REINDEX physical rebuild, tablespace physical relocation, tablespace-registry
+restart durability (new, this follow-up).
+
 ## Tests
 
 - `parser.TestParseCreateTablespace` / `TestParseCreateTablespaceMissingLocation`

@@ -2589,6 +2589,13 @@ func loadUserTablesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *m
 		if tr.RelFileNode != 0 && tr.RelFileNode != tr.OID {
 			tbl.RelFileNodeOID = tr.RelFileNode
 		}
+		// Restore pg_class.reltablespace (M0122-0007 tablespace-restart-
+		// durability follow-up) — otherwise a CREATE/ALTER TABLE ... TABLESPACE
+		// silently reverted to the database default across every restart.
+		// RelTablespace is 0 (the correct default) for both a table that never
+		// had a non-default tablespace and a legacy-format row predating this
+		// field.
+		tbl.Tablespace = tr.RelTablespace
 		// Restore storage parameters (fillfactor, autovacuum_*, and for
 		// views security_barrier/security_invoker/check_option) from the
 		// heap-persisted reloptions column — otherwise they silently
@@ -2861,6 +2868,7 @@ func loadUserIndexesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *
 		name       string
 		nsp        uint32
 		relOptions string
+		tablespace uint32
 	}
 	var indexRows []indexClassRow
 
@@ -2905,7 +2913,7 @@ func loadUserIndexesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *
 						relOptions = decoded[reloptionsOrdinal].StringValue()
 					}
 				}
-				indexRows = append(indexRows, indexClassRow{oid: row.OID, name: row.RelName, nsp: row.RelNamespace, relOptions: relOptions})
+				indexRows = append(indexRows, indexClassRow{oid: row.OID, name: row.RelName, nsp: row.RelNamespace, relOptions: relOptions, tablespace: row.RelTablespace})
 			}
 		}
 	}
@@ -3066,7 +3074,7 @@ func loadUserIndexesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *
 		// Fillfactor/DeduplicateItems are restored via the separate
 		// ApplyIndexReloptions call just below (reads pg_class.reloptions
 		// text), not through this call.
-		cat.RegisterIndexDuringRecovery(schema, ir.name, pgIdx.indRelid, colNames, pgIdx.isUnique, "btree", pgIdx.isPrimary, ir.oid, colDescending, colNullsFirst, pgIdx.hasPred, pgIdx.predText, includeColNames, colOpClasses, colCollations, 0, nil, pgIdx.nullsNotDistinct)
+		cat.RegisterIndexDuringRecovery(schema, ir.name, pgIdx.indRelid, colNames, pgIdx.isUnique, "btree", pgIdx.isPrimary, ir.oid, colDescending, colNullsFirst, pgIdx.hasPred, pgIdx.predText, includeColNames, colOpClasses, colCollations, 0, nil, pgIdx.nullsNotDistinct, ir.tablespace)
 		// Restore fillfactor/deduplicate_items/fastupdate/gin_pending_list_limit/
 		// pages_per_range/autosummarize from the heap-persisted pg_class row —
 		// without this they silently revert to defaults across every restart

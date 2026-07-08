@@ -544,7 +544,7 @@ func buildUserPGClassRowForIndex(cat catalog.Catalog, idx *catalog.Index) Row {
 		NewIntDatum(bootstrapSuperuserOID),    // relowner
 		NewIntDatum(pgBTreeAccessMethodOID),   // relam
 		NewIntDatum(int64(idx.OID)),           // relfilenode
-		NewIntDatum(0),                        // reltablespace
+		NewIntDatum(int64(idx.Tablespace)),    // reltablespace (0 = default; explicit CREATE/ALTER INDEX ... TABLESPACE otherwise, M0122-0007)
 		NewIntDatum(0),                        // relpages
 		NewIntDatum(0),                        // reltuples
 		NewIntDatum(0),                        // relallvisible

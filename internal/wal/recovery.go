@@ -6324,6 +6324,11 @@ type CreateIndexPayload struct {
 	Fillfactor       int
 	DeduplicateItems *bool
 	NullsNotDistinct bool
+	// Tablespace carries pg_class.reltablespace (0 = database default) so a
+	// CREATE INDEX ... TABLESPACE / ALTER INDEX ... SET TABLESPACE survives an
+	// uncheckpointed crash restart replayed purely from WAL. M0122-0007
+	// tablespace-restart-durability follow-up.
+	Tablespace uint32
 }
 
 // EncodeCreateIndex encodes a CREATE INDEX event (M0079-0001).
@@ -6394,6 +6399,7 @@ const (
 	ciExtHasOpClasses     = 1 << 3
 	ciExtHasCollations    = 1 << 4
 	ciExtNullsNotDistinct = 1 << 5
+	ciExtHasTablespace    = 1 << 6
 )
 
 // hasCreateIndexExtension reports whether p carries any of the M0122-0006
@@ -6402,7 +6408,7 @@ const (
 // by this follow-up.
 func hasCreateIndexExtension(p CreateIndexPayload) bool {
 	if p.HasPredicate || len(p.IncludeColumns) > 0 || p.Fillfactor != 0 ||
-		p.DeduplicateItems != nil || p.NullsNotDistinct {
+		p.DeduplicateItems != nil || p.NullsNotDistinct || p.Tablespace != 0 {
 		return true
 	}
 	for _, s := range p.ColOpClasses {
@@ -6439,6 +6445,9 @@ func encodeCreateIndexExtension(p CreateIndexPayload) []byte {
 	}
 	if p.NullsNotDistinct {
 		flags |= ciExtNullsNotDistinct
+	}
+	if p.Tablespace != 0 {
+		flags |= ciExtHasTablespace
 	}
 	numCols := len(p.Columns)
 	hasOpClasses := false
@@ -6480,6 +6489,9 @@ func encodeCreateIndexExtension(p CreateIndexPayload) []byte {
 			size += 2 + len(stringAt(p.ColCollations, i))
 		}
 	}
+	if p.Tablespace != 0 {
+		size += 4
+	}
 
 	out := make([]byte, size)
 	off := 0
@@ -6514,6 +6526,10 @@ func encodeCreateIndexExtension(p CreateIndexPayload) []byte {
 			off += 2
 			off += copy(out[off:], c)
 		}
+	}
+	if p.Tablespace != 0 {
+		binary.LittleEndian.PutUint32(out[off:off+4], p.Tablespace)
+		off += 4
 	}
 	return out
 }
@@ -6602,6 +6618,13 @@ func decodeCreateIndexExtension(payload []byte, off *int, numCols int, p *Create
 		p.DeduplicateItems = &v
 	}
 	p.NullsNotDistinct = flags&ciExtNullsNotDistinct != 0
+	if flags&ciExtHasTablespace != 0 {
+		if len(payload) < *off+4 {
+			return fmt.Errorf("wal: create-index payload truncated in tablespace")
+		}
+		p.Tablespace = binary.LittleEndian.Uint32(payload[*off : *off+4])
+		*off += 4
+	}
 	return nil
 }
 

@@ -33,6 +33,7 @@ const (
 	pgClassOffRelName        = 4
 	pgClassOffRelNamespace   = 68
 	pgClassOffRelFileNode    = 88
+	pgClassOffRelTablespace  = 92
 	pgClassOffRelIsShared    = 117
 	pgClassOffRelPersistence = 118
 	pgClassOffRelKind        = 119
@@ -582,6 +583,12 @@ type PGClassRow struct {
 	RelKind        string // relkind: 'r'=table,'i'=index,'v'=view,'S'=seq
 	RelNAtts       int32  // relnatts
 	RelFileNode    uint32 // relfilenode (0 for virtual / view)
+	// RelTablespace holds pg_class.reltablespace (0 = database default).
+	// Only DecodePGClassPhysicalRow populates this (the fixed-offset
+	// PG18-canonical layout); the legacy simple encoding decoded by
+	// DecodePGClassRow predates tablespaces and always leaves it 0.
+	// M0122-0007 tablespace-restart-durability follow-up.
+	RelTablespace  uint32
 	RelPersistence string // relpersistence: 'p'=permanent
 	RelIsShared    bool   // relisshared
 	// RelOptions holds the pg_class.reloptions text[] external literal (e.g.
@@ -861,6 +868,7 @@ func DecodePGClassPhysicalRow(data []byte) (PGClassRow, error) {
 		RelKind:        relKind,
 		RelNAtts:       relNAtts,
 		RelFileNode:    binary.LittleEndian.Uint32(data[pgClassOffRelFileNode : pgClassOffRelFileNode+4]),
+		RelTablespace:  binary.LittleEndian.Uint32(data[pgClassOffRelTablespace : pgClassOffRelTablespace+4]),
 		RelPersistence: relPersistence,
 		RelIsShared:    relIsShared,
 	}

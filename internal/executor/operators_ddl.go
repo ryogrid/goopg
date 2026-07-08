@@ -6059,6 +6059,7 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 		ColCollations:    coll,
 		Fillfactor:       s.Fillfactor,
 		DeduplicateItems: s.DeduplicateItems,
+		Tablespace:       idxTablespaceOID,
 	}
 	if err := o.createBTreeIndex(s.Pos(), idxName, tbl, s.Columns, s.ColExprs, s.Unique, false, s.NullsNotDistinct, colDescending, colNullsFirst, props); err != nil {
 		return err
@@ -6070,15 +6071,6 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 		// the SSI scan/insert hooks.
 		if hidx, ok := o.ctx.Catalog.LookupIndex(idxName); ok {
 			hidx.DeclaredHash = true
-		}
-	}
-	if idxTablespaceOID != 0 {
-		// Not carried through btreeIndexProps/the CREATE INDEX WAL record
-		// (deliberately deferred, matching Table.Tablespace — ledger row,
-		// M0122-0007): only affects pg_class.reltablespace for the life of
-		// this session, resets to 0 (default) after a restart.
-		if bidx, ok := o.ctx.Catalog.LookupIndex(idxName); ok {
-			bidx.Tablespace = idxTablespaceOID
 		}
 	}
 	if s.HasPredicate || len(s.IncludeColumns) > 0 || s.Predicate != nil || nonDefaultOrder || hasOpClass || hasCollation || s.NullsNotDistinct || s.Fillfactor != 0 || s.DeduplicateItems != nil {
@@ -6915,12 +6907,21 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					// ALTER INDEX name SET TABLESPACE tablespace_name — same
 					// catalog-metadata-only treatment as the table form above
 					// (see the AlterTableSetTablespace case in the table
-					// action loop); not yet WAL-persisted. M0122-0007.
+					// action loop). Restart-durable via the heap-persisted
+					// reltablespace column loadUserIndexesFromHeap now
+					// restores (M0122-0007 tablespace-restart-durability
+					// follow-up); resyncIndexClassHeapRow already stamps the
+					// old pg_class row's xmax before writing the fresh one.
 					oid, tsErr := resolveTablespaceClause(o.ctx, act.Pos(), act.TablespaceName)
 					if tsErr != nil {
 						return tsErr
 					}
 					idx.Tablespace = oid
+					if catalogHeapSyncAvailable(o.ctx) {
+						if syncErr := resyncIndexClassHeapRow(o.ctx, idx); syncErr != nil {
+							return syncErr
+						}
+					}
 				}
 				if act.Kind == parser.AlterTableRenameTable {
 					// ALTER INDEX name RENAME TO newname on a real (non-TOAST)
@@ -8099,14 +8100,27 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 		case parser.AlterTableSetTablespace:
 			// SET TABLESPACE name — update pg_class.reltablespace. Catalog
 			// metadata only: no physical relocation of the table's on-disk
-			// file, and not yet WAL-persisted (resets to 0/default after a
-			// restart, same deferral as CREATE TABLE ... TABLESPACE's ledger
-			// row). M0122-0007.
+			// file. Restart-durable via the same heap-persisted reltablespace
+			// column loadUserTablesFromHeap now restores (M0122-0007
+			// tablespace-restart-durability follow-up) — resync immediately so
+			// an uncheckpointed crash right after this statement doesn't lose
+			// the change.
 			oid, tsErr := resolveTablespaceClause(o.ctx, act.Pos(), act.TablespaceName)
 			if tsErr != nil {
 				return tsErr
 			}
 			tbl.Tablespace = oid
+			if catalogHeapSyncAvailable(o.ctx) {
+				if err := o.ctx.MaterializeWriterXID(); err == nil {
+					xmax := o.ctx.Tx.XID
+					for _, dbOid := range catalogDBOids(o.ctx) {
+						deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
+					}
+				}
+				if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
+					return fmt.Errorf("DDL catalog sync: %w", syncErr)
+				}
+			}
 		case parser.AlterTableAlterColumnSet:
 			// SET (opt=value, …) — record the per-column attribute options on the
 			// catalog column AND rewrite the pg_attribute heap row so pg_dump
@@ -9610,6 +9624,13 @@ type btreeIndexProps struct {
 	ColCollations    []string
 	Fillfactor       int
 	DeduplicateItems *bool
+	// Tablespace carries pg_class.reltablespace (0 = database default), set
+	// BEFORE createBTreeIndex's CREATE INDEX WAL record is built for the same
+	// restart-durability reason as every other field on this struct — a
+	// post-call assignment (the pre-M0122-0007-follow-up shape) survived a
+	// graceful shutdown checkpoint but reverted to 0 across a genuine crash
+	// restart replayed purely from WAL.
+	Tablespace uint32
 }
 
 func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalog.Table, columns []string, colExprs []parser.Expr, unique bool, primary bool, nullsNotDistinct bool, colDescending, colNullsFirst []bool, props ...*btreeIndexProps) error {
@@ -9674,6 +9695,7 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 		idx.ColCollations = xp.ColCollations
 		idx.Fillfactor = xp.Fillfactor
 		idx.DeduplicateItems = xp.DeduplicateItems
+		idx.Tablespace = xp.Tablespace
 	}
 	// Store parsed expressions for expression-based index columns so the
 	// planner and executor can evaluate them at conflict-detection time.
@@ -9743,6 +9765,7 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 			ColCollations:    idx.ColCollations,
 			Fillfactor:       idx.Fillfactor,
 			DeduplicateItems: idx.DeduplicateItems,
+			Tablespace:       idx.Tablespace,
 		})
 		if _, err := o.ctx.Pool.LogChangeRecord(payload); err != nil {
 			// Best-effort: roll back the in-memory mutation so

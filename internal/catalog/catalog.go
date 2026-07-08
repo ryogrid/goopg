@@ -5307,6 +5307,7 @@ func (c *InMemory) RegisterIndexDuringRecovery(
 	fillfactor int,
 	deduplicateItems *bool,
 	nullsNotDistinct bool,
+	tablespace uint32,
 ) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -5368,6 +5369,7 @@ func (c *InMemory) RegisterIndexDuringRecovery(
 		Fillfactor:       fillfactor,
 		DeduplicateItems: deduplicateItems,
 		NullsNotDistinct: nullsNotDistinct,
+		Tablespace:       tablespace,
 	}
 	c.indexes[k] = idx
 	if c.byTable[tbl.OID] == nil {

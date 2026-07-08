@@ -4529,6 +4529,63 @@ mirroring M0119's ledger `status` column.
       **Still open** (this bucket, ~6 remaining items): CREATE/DROP DATABASE
       full DDL, REINDEX physical rebuild, tablespace physical relocation +
       restart durability (both table and index).
+      **Tablespace restart durability (table + index) — DONE (2026-07-08,
+      later loop):** closed the "restart durability (both table and index)"
+      resume point. `catalog.PGClassRow` gained `RelTablespace uint32`,
+      decoded by `DecodePGClassPhysicalRow` at the real PG18
+      `FormData_pg_class` byte offset 92 (between `relfilenode`(88) and
+      `relpages`(96)); `loadUserTablesFromHeap` now sets `tbl.Tablespace =
+      tr.RelTablespace` — the value was already being written into the heap
+      row by `buildUserPGClassRow`, just never read back. The index sibling
+      row builder, `buildUserPGClassRowForIndex`, had hardcoded `reltablespace`
+      to `0` even for an index explicitly created `... TABLESPACE ts1` — fixed
+      to render `idx.Tablespace`; `loadUserIndexesFromHeap` decodes it back
+      via a new `tablespace uint32` parameter threaded through
+      `catalog.Catalog`'s `RegisterIndexDuringRecovery`/
+      `indexRegistryRecovery` interface (mirrors the existing
+      `fillfactor`/`deduplicateItems` parameters). For the WAL-only replay
+      fallback (`replayIndexDDLRecords`, used before a pg_index heap row
+      exists), `wal.CreateIndexPayload` gained a `Tablespace uint32` field in
+      its self-describing extension block (new `ciExtHasTablespace` flag
+      bit); `btreeIndexProps`/`createBTreeIndex` now set `idx.Tablespace`
+      from `xp.Tablespace` BEFORE the CREATE INDEX WAL record is built (same
+      discipline every other M0122-0006-follow-up index property already
+      follows), which also let `execCreateIndex`'s old post-call
+      `bidx.Tablespace = idxTablespaceOID` block be deleted outright.
+      `ALTER TABLE/INDEX ... SET TABLESPACE` (previously catalog-metadata-only
+      for the session lifetime) now resyncs the heap-persisted pg_class row
+      immediately after the mutation, so an uncheckpointed crash right after
+      the ALTER no longer loses the change either. Tests:
+      `TestEncodeCreateIndexExtensionRoundTrip`'s new "tablespace only" case
+      (`internal/wal/index_ddl_test.go`);
+      `TestTableTablespaceSurvivesRestartViaCatalogHeap`/
+      `TestIndexTablespaceSurvivesRestartViaCatalogHeap`/
+      `TestAlterTableSetTablespaceSurvivesRestartViaCatalogHeap`
+      (`internal/initdb/tablespace_restart_test.go`, full
+      `Init`→`Open`→DDL→`Close`→`Open` cycles against a real on-disk data
+      dir), all confirmed non-vacuous via `git stash`. Also live-verified
+      against the real `cmd/goopg` binary with a real `goopg stop`/`goopg
+      start` cycle. Design: `docs/design/0095-0003-in-place-tablespace.md`
+      new "Restart durability (2026-07-08 follow-up)" section;
+      `docs/design/README.md` row updated. **New gap found live-verifying
+      this fix, recorded in the deferral ledger, NOT fixed here (one task
+      per loop):** the tablespace REGISTRY itself (`CREATE TABLESPACE`,
+      `catalog.InMemory.tablespaces`) has no restart durability at all — it
+      is a purely in-memory map with no WAL record and no backing heap
+      relation, so a tablespace vanishes from `pg_tablespace` after a
+      restart even though `pg_tblspc/<oid>/` stays on disk, orphaning any
+      table/index whose now-durable `reltablespace` OID points at it. Needs
+      a new `RecordKindCreateTablespace`/`RecordKindDropTablespace` WAL
+      record pair + a `replayTablespaceDDLRecords` driver, mirroring
+      `replayDatabaseDDLRecords`/`replaySchemaDDLRecords`. Gates: `go build
+      ./...`/`go vet ./...` clean; `go test ./internal/catalog/...
+      ./internal/wal/... ./internal/initdb/... ./internal/executor/...`
+      PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed txns, all 3 workloads). **Still open** (this bucket, ~5
+      remaining items): CREATE/DROP DATABASE full DDL, REINDEX physical
+      rebuild, tablespace physical relocation, tablespace-registry restart
+      durability (new, see deferral ledger).
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,
       encoding constraints during bootstrap/runtime.
