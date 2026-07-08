@@ -4634,6 +4634,63 @@ mirroring M0119's ledger `status` column.
       workloads). **Still open** (this bucket, ~4 remaining items):
       CREATE/DROP DATABASE full DDL, REINDEX physical rebuild, tablespace
       physical relocation.
+      **REINDEX physical rebuild (2026-07-09 follow-up):** closed this
+      resume point, for the plain (non-`CONCURRENTLY`) `REINDEX INDEX`/
+      `REINDEX TABLE` forms. Previously `reindexOp.Next`
+      (`internal/executor/operators_reindex.go`) validated the target name
+      and, for `CONCURRENTLY`/`SCHEMA`, reproduced PostgreSQL's observable
+      locking (M0118-0008), but never actually rebuilt anything — a REINDEX
+      issued to repair a stale/corrupted index silently did nothing. New
+      `reindexOp.rebuildIndex(idx, pos)` / `rebuildTableIndexes(tbl, pos)`
+      rebuild every btree index involved by reusing CREATE INDEX's own
+      bulk-build path — a bare `&ddlOp{ctx: o.ctx}` calls `bulkBuildBTree`/
+      `bulkBuildBTreeWithPredicate`, whose `btree.BulkCreateWithOptions`
+      already truncates + repacks the target relation from scratch
+      (previously written for crash-recovery bulk builds, exactly the
+      semantics REINDEX needs). Non-btree access methods (gist/spgist/gin/
+      brin) stay a no-op — CREATE INDEX itself never builds physical
+      storage for them either. New `reindexOp.acquireReindexLocks`
+      genuinely HOLDS (not the file's pre-existing transient
+      wait-then-release pattern) a `ShareLock` on the parent table plus an
+      `AccessExclusiveLock` on the index for the rebuild's duration,
+      mirroring `reindex.sgml`'s real locking ("REINDEX locks out writes
+      but not reads ... also takes an ACCESS EXCLUSIVE lock on the
+      specific index") — without this a concurrent reader/writer could
+      race the truncate-then-rebuild. Tests:
+      `TestReindexIndexPhysicallyRebuilds`/
+      `TestReindexTablePhysicallyRebuildsAllIndexes` (truncate a live
+      index's storage, REINDEX, verify via a direct `btree.RangeScan` —
+      bypassing SQL — that the rebuilt btree is correct) and
+      `TestReindexIndexBlocksBehindConcurrentIndexReader` (a second
+      backend's `AccessShareLock` blocks REINDEX until released), all in
+      `internal/executor/reindex_physical_rebuild_test.go`, confirmed
+      non-vacuous via `git stash` on `operators_reindex.go` alone (all 3
+      fail pre-fix). Also live-verified against the real `cmd/goopg`
+      binary: zero-byte-truncated a live index's on-disk relfilenode file
+      directly, confirmed the query then failed (`short read at block`),
+      ran `REINDEX INDEX`, confirmed the query and its Index Scan plan
+      both recovered; `REINDEX TABLE` afterward left the data intact.
+      Design: `docs/design/0122-0007-reindex-physical-rebuild.md` (new);
+      `docs/design/README.md` row added. Gates: `go build ./...`/`go vet
+      ./internal/executor/...` clean; `go test ./internal/executor/...
+      ./internal/access/btree/... ./internal/catalog/...
+      ./internal/planner/...` PASS; `go test ./internal/testport/... -run
+      'TestPort_IsolationReindex|TestPort_IsolationMultipleCic'` PASS (all
+      4 specs — reindex-concurrently/-toast/-schema/multiple-cic — no
+      regression, none of them exercise the plain `INDEX`/`TABLE` forms
+      this slice changed); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed txns, all 3 workloads). **Deliberately left open (deferral
+      ledger row, scoped out of this loop):** `REINDEX SCHEMA`'s physical
+      rebuild (the per-table `rebuildTableIndexes` call this loop already
+      built, just not wired into the `SCHEMA` branch — deferred to keep
+      this loop's blast radius to the two forms with a passing non-vacuous
+      test) and `REINDEX ... CONCURRENTLY`'s physical rebuild (needs a
+      genuine shadow-index build-then-swap, a materially larger capability
+      goopg does not have). **Still open** (M0122-0007 bucket, ~3
+      remaining items): CREATE/DROP DATABASE full DDL, tablespace physical
+      relocation, REINDEX SCHEMA/CONCURRENTLY physical rebuild.
+
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,
       encoding constraints during bootstrap/runtime.

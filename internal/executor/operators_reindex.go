@@ -3,10 +3,16 @@ package executor
 // operators_reindex.go — REINDEX statement executor (M0097-0023).
 //
 // REINDEX INDEX name validates the index exists; REINDEX TABLE validates
-// the table. Physical reindex is a no-op in goopg v0 (no physical btree
-// rebuild). Raises 42P01 for nonexistent targets matching PostgreSQL.
+// the table. Raises 42P01 for nonexistent targets matching PostgreSQL.
+//
+// Plain (non-CONCURRENTLY) REINDEX INDEX / REINDEX TABLE physically rebuild
+// their btree index(es) from a fresh heap scan, reusing CREATE INDEX's
+// bulk-build path (M0122-0007, design 0122-0007-reindex-physical-rebuild).
+// REINDEX SCHEMA and every CONCURRENTLY form remain a catalog-only no-op —
+// see that design doc's Deferral section.
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strings"
@@ -99,13 +105,24 @@ func (o *reindexOp) Next() (TupleSlot, error) {
 
 	switch o.stmt.ObjectType {
 	case "INDEX":
-		if _, ok := o.ctx.Catalog.LookupIndex(name); !ok {
+		idx, ok := o.ctx.Catalog.LookupIndex(name)
+		if !ok {
 			// Try unqualified.
-			if _, ok2 := o.ctx.Catalog.LookupIndex(parser.ObjectName{Name: name.Name}); !ok2 {
-				return nil, &ExecError{
-					Code:    "42P01",
-					Message: fmt.Sprintf("relation %q does not exist", o.stmt.Name),
-				}
+			idx, ok = o.ctx.Catalog.LookupIndex(parser.ObjectName{Name: name.Name})
+		}
+		if !ok {
+			return nil, &ExecError{
+				Code:    "42P01",
+				Message: fmt.Sprintf("relation %q does not exist", o.stmt.Name),
+			}
+		}
+		// REINDEX INDEX CONCURRENTLY: goopg has no shadow-index build-then-
+		// swap machinery, so the physical rebuild stays a no-op there (as
+		// before this change) — only the plain form rebuilds in place, under
+		// a real ACCESS EXCLUSIVE lock on the index (see rebuildIndex).
+		if !o.stmt.Concurrently {
+			if err := o.rebuildIndex(idx, o.stmt.Pos()); err != nil {
+				return nil, err
 			}
 		}
 	case "TABLE":
@@ -121,14 +138,17 @@ func (o *reindexOp) Next() (TupleSlot, error) {
 		// REINDEX TABLE CONCURRENTLY waits for every transaction that holds a
 		// lock on the table to finish before it can swap in the rebuilt index,
 		// without itself blocking concurrent reads or writes (it holds only
-		// ShareUpdateExclusive). goopg's index rebuild is a no-op, but the wait
-		// is observable concurrency behaviour, so reproduce it via the
+		// ShareUpdateExclusive). goopg's index rebuild stays a no-op for this
+		// form (no shadow-index build-then-swap machinery), but the wait is
+		// observable concurrency behaviour, so reproduce it via the
 		// WaitForLockers analog on the dedicated table lock manager. M0118-0008
 		// (reindex-concurrently isolation spec).
 		if o.stmt.Concurrently {
 			if err := o.ctx.waitForRelationLockers(o.ctx.Catalog.RelFileNode(tbl)); err != nil {
 				return nil, err
 			}
+		} else if err := o.rebuildTableIndexes(tbl, o.stmt.Pos()); err != nil {
+			return nil, err
 		}
 	case "SCHEMA":
 		// REINDEX SCHEMA rebuilds every index on every table in the schema.
@@ -159,6 +179,125 @@ func (o *reindexOp) Next() (TupleSlot, error) {
 	}
 	// Physical reindex is a no-op in v0.
 	return nil, EOF
+}
+
+// rebuildIndex physically rebuilds idx's on-disk btree pages from a fresh
+// scan of its table's heap, keeping the index's OID and catalog metadata
+// unchanged — reusing the exact bulk-build path CREATE INDEX uses
+// (ddlOp.bulkBuildBTree/bulkBuildBTreeWithPredicate, which truncates the
+// relation before repacking it). M0122-0007 (REINDEX physical rebuild).
+//
+// Non-btree access methods (gist/spgist/gin/brin) are catalog-only in
+// goopg — CREATE INDEX never builds physical storage for them either (see
+// execCreateIndex's catalog-only branch) — so there is nothing to rebuild;
+// this is a no-op for those, matching the pre-existing behaviour.
+//
+// Held for the duration: an ACCESS EXCLUSIVE lock on the index (blocking any
+// concurrent index scan/DROP INDEX against it) plus a SHARE lock on the
+// parent table (blocking concurrent writes but not reads), mirroring real
+// PostgreSQL's plain-REINDEX locking (reindex.sgml). Without this, a
+// concurrent writer could mutate the heap — or another session's index scan
+// could be mid-read of the very pages TruncateRelation is about to discard —
+// while the rebuild is in flight.
+func (o *reindexOp) rebuildIndex(idx *catalog.Index, pos int) error {
+	if idx == nil || idx.Method != "btree" || idx.Table == nil {
+		return nil
+	}
+	tbl := idx.Table
+	cols := make([]*catalog.Column, len(idx.Columns))
+	for i, name := range idx.Columns {
+		if name == "" {
+			// Expression column (e.g. lower(col)); collectBTreeEntries skips
+			// rows with an all-expression key, matching CREATE INDEX's own
+			// documented limitation for expression indexes.
+			continue
+		}
+		col, ok := o.ctx.Catalog.LookupColumn(tbl, name)
+		if !ok {
+			return &ExecError{Code: "42703", Pos: pos, Message: fmt.Sprintf("column %q of relation %q does not exist", name, tbl.Name)}
+		}
+		cols[i] = col
+	}
+	var predExpr planner.Expr
+	if idx.HasPredicate && idx.Predicate != nil {
+		predExpr, _ = planner.ResolveIndexPredicate(idx.Predicate, tbl)
+	}
+	idxRel := o.ctx.Catalog.IndexRelFileNode(idx)
+	tblRel := o.ctx.Catalog.RelFileNode(tbl)
+	release, err := o.acquireReindexLocks(idxRel, tblRel)
+	if err != nil {
+		return err
+	}
+	defer release()
+	dop := &ddlOp{ctx: o.ctx}
+	if predExpr != nil {
+		return dop.bulkBuildBTreeWithPredicate(idxRel, tbl, cols, idx.Unique, idx.NullsNotDistinct, idx.Name, pos, predExpr)
+	}
+	return dop.bulkBuildBTree(idxRel, tbl, cols, idx.Unique, idx.NullsNotDistinct, idx.Name, pos)
+}
+
+// rebuildTableIndexes rebuilds every btree index on tbl. Used by plain
+// REINDEX TABLE. M0122-0007.
+func (o *reindexOp) rebuildTableIndexes(tbl *catalog.Table, pos int) error {
+	for _, idx := range o.ctx.Catalog.IndexesOnTable(tbl) {
+		if err := o.rebuildIndex(idx, pos); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// acquireReindexLocks takes and HOLDS — unlike acquireRelLockMaybeTransient's
+// wait-only-then-release pattern used elsewhere in this file — an ACCESS
+// EXCLUSIVE lock on the index plus a SHARE lock on its parent table for the
+// duration of a physical rebuild. The returned func releases both; call it
+// unconditionally (defer) once the rebuild finishes, success or error. A zero
+// backend identity (no live connection, e.g. an embedded/test context) or a
+// system-catalog relation (OID below firstNormalObjectOID) is treated as
+// always available, matching every other lock helper in this file.
+func (o *reindexOp) acquireReindexLocks(idxRel, tblRel storage.RelFileNode) (func(), error) {
+	c := o.ctx
+	if idxRel.RelOid < firstNormalObjectOID || tblRel.RelOid < firstNormalObjectOID {
+		return func() {}, nil
+	}
+	backend := c.BackendID
+	if c.TxnLockBackendID != 0 {
+		backend = c.TxnLockBackendID
+	}
+	if backend == 0 {
+		return func() {}, nil
+	}
+	lockCtx := context.Background()
+	if c.Ctx != nil {
+		lockCtx = c.Ctx
+	}
+	tblTag := lockmgr.LockTag{DB: tblRel.DBOid, Rel: tblRel.RelOid}
+	idxTag := lockmgr.LockTag{DB: idxRel.DBOid, Rel: idxRel.RelOid}
+	if err := tableLockMgr.AcquireWithTimeout(lockCtx, backend, tblTag, lockmgr.ShareLock, c.deadlockTimeout()); err != nil {
+		return nil, reindexLockWaitError(err)
+	}
+	if err := tableLockMgr.AcquireWithTimeout(lockCtx, backend, idxTag, lockmgr.AccessExclusiveLock, c.deadlockTimeout()); err != nil {
+		tableLockMgr.Release(backend, tblTag, lockmgr.ShareLock)
+		return nil, reindexLockWaitError(err)
+	}
+	return func() {
+		tableLockMgr.Release(backend, idxTag, lockmgr.AccessExclusiveLock)
+		tableLockMgr.Release(backend, tblTag, lockmgr.ShareLock)
+	}, nil
+}
+
+// reindexLockWaitError maps a lockmgr wait failure onto the same ExecError
+// shape acquireRelLockMaybeTransient uses (context.go), so REINDEX's lock
+// wait reports deadlocks/cancellations identically to every other blocking
+// DDL lock acquisition in this codebase.
+func reindexLockWaitError(err error) error {
+	if err == lockmgr.ErrDeadlockDetected {
+		return &ExecError{Code: "40P01", Message: "deadlock detected"}
+	}
+	if ee := lockWaitCancelError(err); ee != nil {
+		return ee
+	}
+	return &ExecError{Code: "XX000", Message: err.Error()}
 }
 
 // schemaRelsByOID returns the RelFileNodes of every non-virtual user table in
