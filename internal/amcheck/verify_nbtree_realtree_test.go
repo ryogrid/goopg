@@ -324,7 +324,7 @@ func TestVerifyBtreeEngineSilentOnRealShuffledInt4(t *testing.T) {
 // which is load-bearing for the repro this harness feeds (see
 // TestVerifyBtreeEngineSilentOnRealConcurrentContended below) — a large pool
 // (no eviction pressure) does not reproduce it.
-func buildRealTreeConcurrent(t *testing.T, n, writers, poolSlots int, keyRange int32, seed int64) (*storage.Manager, *storage.Pool, storage.RelFileNode, int, func()) {
+func buildRealTreeConcurrent(t *testing.T, n, writers, poolSlots int, keyRange int32, seed int64) (*storage.Manager, *storage.Pool, storage.RelFileNode, int, []btree.LeafEntry, func()) {
 	t.Helper()
 	dir := t.TempDir()
 	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dir})
@@ -332,6 +332,11 @@ func buildRealTreeConcurrent(t *testing.T, n, writers, poolSlots int, keyRange i
 	if err != nil {
 		t.Fatalf("NewPool: %v", err)
 	}
+	// M-NIGHTLY investigation aid (AI-20260708-064334-001): catch a
+	// "clean" eviction that's about to discard unflushed content
+	// red-handed, with byte-level detail, instead of only detecting the
+	// resulting loss after the fact via the leaf-entry diff below.
+	pool.DebugValidateCleanEvictions = true
 	rel := storage.RelFileNode{DBOid: 1, RelOid: 9200, Fork: storage.MainFork}
 	bt, err := btree.Create(pool, rel)
 	if err != nil {
@@ -344,11 +349,17 @@ func buildRealTreeConcurrent(t *testing.T, n, writers, poolSlots int, keyRange i
 	var failed atomic.Bool
 	var inserted atomic.Int64
 	perWriter := n / writers
+	// TEMPORARY M-NIGHTLY investigation aid (AI-20260708-064334-001):
+	// record every successfully-inserted (key, TID) pair so the caller can
+	// diff it against the final on-disk leaf walk and identify exactly
+	// which entries were lost (not just how many).
+	perWriterEntries := make([][]btree.LeafEntry, writers)
 	for w := 0; w < writers; w++ {
 		wg.Add(1)
 		go func(wid int) {
 			defer wg.Done()
 			rng := rand.New(rand.NewSource(seed + int64(wid)))
+			entries := make([]btree.LeafEntry, 0, perWriter)
 			for i := 0; i < perWriter; i++ {
 				k := btree.EncodeInt4(rng.Int31n(keyRange))
 				ptr := storage.ItemPointer{Block: storage.BlockNumber(wid + 1), Offset: uint16(i%60000 + 1)}
@@ -357,8 +368,10 @@ func buildRealTreeConcurrent(t *testing.T, n, writers, poolSlots int, keyRange i
 					failed.Store(true)
 					return
 				}
+				entries = append(entries, btree.LeafEntry{Key: k, TID: ptr})
 				inserted.Add(1)
 			}
+			perWriterEntries[wid] = entries
 		}(w)
 	}
 	wg.Wait()
@@ -371,7 +384,11 @@ func buildRealTreeConcurrent(t *testing.T, n, writers, poolSlots int, keyRange i
 		cleanup()
 		t.FailNow()
 	}
-	return mgr, pool, rel, int(inserted.Load()), cleanup
+	var all []btree.LeafEntry
+	for _, e := range perWriterEntries {
+		all = append(all, e...)
+	}
+	return mgr, pool, rel, int(inserted.Load()), all, cleanup
 }
 
 // TestVerifyBtreeEngineSilentOnRealConcurrentContended is a KNOWN-FAILING
@@ -395,9 +412,34 @@ func buildRealTreeConcurrent(t *testing.T, n, writers, poolSlots int, keyRange i
 // pointer.
 //
 // Repro reliability at these parameters (Slots: 64, n=200000, writers=64,
-// keyRange=50000): lost 7-16 real leaf entries in every local run so far
+// keyRange=50000): lost 6-42 real leaf entries in every local run so far
 // (never 0) in well under a second — roughly 300x cheaper than the
 // pgbench -s 50 -c 100 -j 20 -T 180 nightly repro.
+//
+// Update (later loop, same day): pool.DebugValidateCleanEvictions (see
+// bufpool.go) proves the mechanism directly — every run logs one or more
+// "BUG: clean-eviction content mismatch" errors, where a "clean"
+// (non-dirty) eviction's in-memory page differs from its on-disk image
+// by dozens to hundreds of bytes starting right after the page header
+// (byte 12). This is DEFINITIVE: the dirty bit read false for a page
+// that had unflushed writes, so evictVictim's fast path (skip the flush
+// because "on-disk already matches") silently discarded them. Ruled out
+// this loop: (1) ABA via the 15-bit slot generation counter wrapping —
+// measured max ~2500 claims per slot in a run, far below the 32768-wrap
+// threshold; (2) stale recycled-block reuse (pinNewOrRecycled) — dead
+// code path here, this test never calls btree_vacuum's recycleBlock;
+// (3) a plain data race — `go test -race` on this exact repro reports
+// zero races while still reproducing the mismatch, so this is a pure
+// synchronized-but-wrong-order protocol bug, not a torn/unsynchronized
+// memory access; (4) every MarkDirty call site in btree.go was audited
+// and correctly precedes Unpin; every dirty-bit-clearing site in
+// bufpool.go was enumerated (flushBatch, InvalidateRel/InvalidateBlock,
+// claimVictim's own claim) and none apply to this insert-only workload.
+// Still open: the exact sequence that makes claimVictim observe
+// dirty=false for a slot that MarkDirty set true. Next step: add a
+// monotonic per-slot event log (timestamp + old/new state) at every
+// MarkDirty and claimVictim call for one specific slot that triggers a
+// mismatch, to catch the transition in the act.
 func TestVerifyBtreeEngineSilentOnRealConcurrentContended(t *testing.T) {
 	t.Skip("known-failing: tracks M-NIGHTLY AI-20260708-064334-001 (buffer-pool eviction lost-item bug); un-skip to confirm a fix")
 	if testing.Short() {
@@ -407,10 +449,41 @@ func TestVerifyBtreeEngineSilentOnRealConcurrentContended(t *testing.T) {
 	const writers = 64
 	const poolSlots = 64
 	const keyRange = 50000
-	mgr, pool, rel, got, cleanup := buildRealTreeConcurrent(t, n, writers, poolSlots, keyRange, 20260708)
+	mgr, pool, rel, got, expected, cleanup := buildRealTreeConcurrent(t, n, writers, poolSlots, keyRange, 20260708)
 	defer cleanup()
+	hit, read, dirtied, written := pool.BufferCounters()
+	t.Logf("buffer counters: hit=%d read=%d dirtied=%d written=%d dirtyVictimRate=%.4f",
+		hit, read, dirtied, written, pool.DirtyVictimRate())
 	if got != n {
 		t.Fatalf("inserted %d, want %d", got, n)
 	}
+
+	// M-NIGHTLY investigation aid (AI-20260708-064334-001): diff the
+	// actual on-disk leaf entries against every successfully-inserted
+	// (key, TID) pair to identify exactly which entries were lost, and
+	// whether the losses cluster by writer (TID.Block == wid+1) or by
+	// iteration (TID.Offset == i+1) — a cluster would point at a specific
+	// eviction/flush window rather than a uniformly-random race.
+	src := realPageSource(t, pool, rel)
+	actual, err := amcheck.CollectBtreeLeafEntries(src)
+	if err != nil {
+		t.Fatalf("CollectBtreeLeafEntries: %v", err)
+	}
+	present := make(map[storage.ItemPointer]bool, len(actual))
+	for _, e := range actual {
+		present[e.TID] = true
+	}
+	if len(actual) != n {
+		for _, e := range expected {
+			if !present[e.TID] {
+				kv, _ := btree.DecodeInt4(e.Key)
+				wid := int(e.TID.Block) - 1
+				i := int(e.TID.Offset) - 1
+				t.Logf("MISSING entry: key=%d TID=%v (writer=%d iter=%d of %d)",
+					kv, e.TID, wid, i, n/writers)
+			}
+		}
+	}
+
 	assertNonSiblingTiersSilent(t, mgr, pool, rel, got)
 }

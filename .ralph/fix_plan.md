@@ -752,6 +752,42 @@ every clean, green (build + pre-commit) checkpoint.
       ./internal/access/btree/...` clean; `go test ./internal/amcheck/...
       ./internal/access/btree/... ./internal/storage/...` PASS (new test
       skipped, not run).
+      2026-07-08 update (3rd loop on the reopen; see today's 3rd deferral
+      ledger row): un-skipped the 2nd-loop repro, confirmed it still
+      reproduces (6-42 lost entries/run), and added `pool.
+      DebugValidateCleanEvictions` (`internal/storage/bufpool.go`, off by
+      default/zero-cost bool field + `debugValidateCleanEviction` helper
+      in `evictVictim`) — when set, every "clean" (non-dirty) eviction
+      re-reads its block from disk and byte-compares against the
+      in-memory page before discarding it. This DEFINITIVELY proves the
+      mechanism: it fires 1-2 times per run with dozens-hundreds of
+      differing bytes right after the page header, i.e. `evictVictim`'s
+      `!wasDirty` fast path is discarding real unflushed writes. Also
+      extended `buildRealTreeConcurrent` to return every inserted
+      (key,TID) so the test logs the EXACT missing entries — losses are
+      scattered single-item across writers/keys, no clustering. RULED OUT
+      with hard measurements: (1) ABA via the 15-bit slot-gen counter
+      (max ~2500 claims/slot measured, needs 32768 to wrap); (2) stale
+      recycled-block reuse via `pinNewOrRecycled` (dead code here, no
+      vacuum in this test — but NOT dead for the real vacuum-enabled
+      pgbench workload, flagged as a separate follow-up); (3) a plain
+      data race (`go test -race` on this repro: zero race warnings, still
+      reproduces — a pure protocol/ordering bug, not a torn memory
+      access). Audited every MarkDirty* call site in btree.go (all
+      correct, write-then-dirty, pin held continuously) and every
+      dirty-CLEARING site in bufpool.go (flushBatch not invoked here,
+      InvalidateRel/Block not called, claimVictim's own CAS correctly
+      captures dirty before replacing) — none explain the observed
+      false-read. Exact mechanism (why claimVictim reads dirty=false for
+      a slot MarkDirty had set true) is STILL open — needs a per-slot
+      event log to catch the transition live (see deferral ledger resume
+      point). Gates: `go build ./...` clean; `go vet ./internal/amcheck/...
+      ./internal/storage/... ./internal/access/btree/...` clean; `go test
+      ./internal/storage/... ./internal/access/btree/...
+      ./internal/amcheck/...` PASS (new test re-skipped, not run in this
+      count). Did not run the full pre-commit/tpch-spotcheck gates — no
+      production behavior changed (flag defaults false, zero-cost); MUST
+      run those once the actual fix lands.
 
 - [x] race/internal/wal — race suite failed in package
       `github.com/goopg/goopg/internal/wal` (AI-20260707-000712-001; repro:

@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -382,6 +383,18 @@ type Pool struct {
 	// DoD ratio and ResetVictimStats.
 	dirtyVictimCount stats.Counter
 	totalVictimCount stats.Counter
+
+	// DebugValidateCleanEvictions is an M-NIGHTLY investigation aid
+	// (AI-20260708-064334-001), off by default (zero cost when false).
+	// When true, every "clean" (non-dirty) eviction re-reads its block
+	// from disk and compares it byte-for-byte against the in-memory
+	// page, logging an Error on any mismatch — a mismatch is definitive
+	// proof that the dirty bit was wrong at eviction time (the eviction
+	// silently discarded unflushed content). See
+	// TestVerifyBtreeEngineSilentOnRealConcurrentContended in
+	// internal/amcheck, which sets this to reproduce the bug in ~1s.
+	// Remove this field once the eviction-race root cause is fixed.
+	DebugValidateCleanEvictions bool
 }
 
 // PoolConfig controls Pool sizing.
@@ -998,6 +1011,15 @@ func (p *Pool) evictVictim(victimIdx int, wasDirty bool, oldTag BufferTag) error
 	}
 	p.sharedEvictionCount.Add(1)
 	if !wasDirty {
+		// M-NIGHTLY investigation aid (AI-20260708-064334-001): the
+		// "clean" fast path below assumes on-disk content already
+		// matches in-memory content. When DebugValidateCleanEvictions is
+		// set, verify that assumption directly; a mismatch is definitive
+		// proof the dirty bit was wrong at eviction time. Off by default
+		// (zero cost). See TestVerifyBtreeEngineSilentOnRealConcurrentContended.
+		if p.DebugValidateCleanEvictions {
+			p.debugValidateCleanEviction(victimIdx, oldTag)
+		}
 		// Nothing to flush: the on-disk content already matches, so it's
 		// safe to retire the tag immediately.
 		p.bm.Delete(oldTag, int32(victimIdx))
@@ -1042,6 +1064,39 @@ func (p *Pool) evictVictim(victimIdx int, wasDirty bool, oldTag BufferTag) error
 	p.sharedWrittenCount.Add(1)
 	p.accountBackendWrite(oldTag.Rel)
 	return nil
+}
+
+
+// debugValidateCleanEviction is an M-NIGHTLY investigation aid
+// (AI-20260708-064334-001) gated by DebugValidateCleanEvictions. It
+// re-reads oldTag's block from disk and compares it byte-for-byte
+// against the slot's in-memory content; a mismatch proves the "clean"
+// (non-dirty) eviction path was about to silently discard unflushed
+// content. Only called when the flag is set, so it costs nothing by
+// default. Remove once the eviction-race root cause is fixed.
+func (p *Pool) debugValidateCleanEviction(victimIdx int, oldTag BufferTag) {
+	diskCopy := make(Page, BlockSize)
+	if err := p.mgr.ReadBlock(oldTag.Rel, oldTag.Block, diskCopy); err != nil {
+		return
+	}
+	mem := p.slots[victimIdx].page
+	if bytes.Equal(diskCopy, mem) {
+		return
+	}
+	firstDiff, lastDiff, ndiff := -1, -1, 0
+	for i := 0; i < len(diskCopy) && i < len(mem); i++ {
+		if diskCopy[i] != mem[i] {
+			if firstDiff < 0 {
+				firstDiff = i
+			}
+			lastDiff = i
+			ndiff++
+		}
+	}
+	p.logger.Error("BUG: clean-eviction content mismatch (M-NIGHTLY AI-20260708-064334-001)",
+		"tag", oldTag, "slotIdx", victimIdx, "firstDiffByte", firstDiff,
+		"lastDiffByte", lastDiff, "ndiffBytes", ndiff,
+		"diskLSN", MustHeader(diskCopy).LSN(), "memLSN", MustHeader(mem).LSN())
 }
 
 // PinNew pins the next-after-end block of rel for writing without
