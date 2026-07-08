@@ -2697,7 +2697,7 @@ survey the deferral ledger for a fresh open (`status = -`) row.
       (representative, run alone, no co-load): `go test -race -timeout 60m
       -run '^TestExecutorDeadlockThreeSession$' ./internal/executor/`.
 
-- [ ] pgbench/nightly-reopen-20260709 — REOPENED a third time (subject
+- [x] pgbench/nightly-reopen-20260709 — REOPENED a third time (subject
       `pgbench/nightly`; both prior tasks above are checked/closed but the
       fix apparently didn't fully hold): `btree: empty internal page
       (blk=1554 rel={DBOid:5 RelOid:16412 Fork:0})` (AI-20260709-010336-082;
@@ -2884,6 +2884,25 @@ survey the deferral ledger for a fresh open (`status = -`) row.
       tolerates that gap at every structural-insert entry point rather than
       closing it; see the design doc §5 and the deferral ledger row appended
       2026-07-09 for the resume point.
+  - [x] `M-NIGHTLY (AI-20260709-010336-082)` 6th loop — closed the parent
+      task: re-ran the EXACT nightly `stage-pgbench.sh` gate (not a scaled-
+      down substitute) — `s=50 c=100 j=20 T=180`x3 workloads, isolated port
+      5560, fresh throwaway data dir — against current HEAD (5th loop's
+      move-right fix + 4th loop's VACUUM sibling-relink fix both present).
+      Result: PASS, 0 failed transactions across all three workloads
+      (tps 1393/2527/106962), ~14 min wall time. This is the same
+      recipe/scale that produced the original `blk=1554 empty internal
+      page` abort (AI-20260709-010336-082) and both intermediate reopens —
+      first time in this investigation thread the gate has passed at full
+      nightly scale rather than only via a shorter/smaller-scale synthetic
+      repro. Parent checkbox flipped to `[x]`. Standing gap NOT closed by
+      this loop (unchanged from the 5th loop's note): `bt.splitMu` is still
+      not a real cross-connection mutex — today's pass tolerates that via
+      per-site re-validation (VACUUM relink + insert move-right), so a
+      future structural-write path added without the same re-validation
+      discipline (e.g. page deletion/recycling, external-sort bulk-build)
+      should be treated as suspect until it's audited the same way. No code
+      changes this loop — verification only.
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 
