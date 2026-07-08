@@ -4348,6 +4348,34 @@ mirroring M0119's ledger `status` column.
       base-table access — needs a preliminary per-statement RTE-style
       permission pass, materially larger than this follow-up.
       SASLprep/channel binding/`scram_iterations`, encoding constraints.
+      **`scram_iterations` wired into password hashing landed (2026-07-08,
+      this loop):** the GUC (`internal/config/defaults.go`, registered
+      since earlier but never read anywhere) is now actually consulted by
+      `CREATE`/`ALTER ROLE ... PASSWORD 'plain'` — `auth.NewSCRAMSecret`'s
+      hardcoded `scramDefaultIterations` (4096) call site is replaced with
+      a new `auth.NewSCRAMSecretWithIterations(pw, iterations)` sibling,
+      and `applyRoleAttrOptions` (`internal/server/role_ddl.go`) now takes
+      the same `currentGUCResolver` its two callers already had in scope
+      (previously only used for `SET ... FROM CURRENT`); a new
+      `resolveScramIterations` helper reads the live `scram_iterations`
+      value. The auth/verification side needed no change — `scram.go:326`'s
+      server-first-message already renders `s.secret.Iterations` parsed
+      back out of the stored verifier, not a constant, so it was already
+      correct; only the write path was pinned to the default. Tests:
+      `internal/server/role_ddl_scram_iterations_test.go`
+      (`TestCreateAlterRolePasswordHonorsScramIterationsGUC`), confirmed
+      non-vacuous via `git stash`. Design: `docs/design/
+      root-0021-role-auth-persistence.md` new "Follow-up: `scram_iterations`
+      GUC wired into password hashing" section; `docs/design/README.md`
+      root-0021 row extended. Gates: `go build ./...`/`go vet ./...` clean;
+      `go test ./internal/server/... ./internal/auth/... ./internal/config/...`
+      PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed transactions, all 3 workloads). SASLprep and TLS channel
+      binding remain fully unimplemented in this cluster (separate,
+      larger slices — SASLprep needs a Unicode-normalization dependency
+      not currently in `go.mod`; channel binding needs TLS
+      tls-server-end-point wiring).
 - [ ] **M0122-0009 — WAL / recovery / crash-consistency infra** (~16). WAL segment
       recycling, `WALInsertLock` array (parallel inserts), MultiXact WAL,
       `pg_subtrans` truncation. Gate: `-race` + recovery E2E (WAL practice card).

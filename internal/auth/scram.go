@@ -68,11 +68,24 @@ func (s *SCRAMSecret) EncodedSalt() string {
 // development and tests; production deployments will store the
 // already-derived form.
 func NewSCRAMSecret(password string) (*SCRAMSecret, error) {
+	return NewSCRAMSecretWithIterations(password, scramDefaultIterations)
+}
+
+// NewSCRAMSecretWithIterations derives a SCRAMSecret using an explicit
+// iteration count, mirroring upstream's CreateRole/encrypt_password path
+// which reads the scram_iterations GUC (postgres/src/backend/commands/
+// user.c, postgres/src/common/scram-common.c scram_build_secret) instead
+// of always using SCRAM_SHA_256_DEFAULT_ITERATIONS. A non-positive count
+// falls back to scramDefaultIterations.
+func NewSCRAMSecretWithIterations(password string, iterations int) (*SCRAMSecret, error) {
+	if iterations <= 0 {
+		iterations = scramDefaultIterations
+	}
 	salt := make([]byte, scramDefaultSaltLen)
 	if _, err := rand.Read(salt); err != nil {
 		return nil, fmt.Errorf("scram salt: %w", err)
 	}
-	return scramBuildSecret(password, salt, scramDefaultIterations), nil
+	return scramBuildSecret(password, salt, iterations), nil
 }
 
 // ParseSCRAMSecret parses an upstream-format rolpassword string. The

@@ -231,3 +231,51 @@ Tests: `internal/initdb/role_ddl_recovery_test.go`'s
 `TestPgAuthidSyncLoadRoundTrip` extended to set and assert a `ValidUntil`
 value survives a real heap-file round trip across `Open` cycles (previously
 explicitly NOT asserted, per the stale comment this loop removed).
+
+## Follow-up: `scram_iterations` GUC wired into password hashing (M0122-0008)
+
+`scram_iterations` (`internal/config/defaults.go`, `ScopeSession`,
+`ContextUserset`) was registered as a GUC but never actually read anywhere
+— `CREATE`/`ALTER ROLE ... PASSWORD 'plain'` always hashed through
+`auth.NewSCRAMSecret`, which hardcoded `scramDefaultIterations` (4096, PG's
+`SCRAM_SHA_256_DEFAULT_ITERATIONS`). Upstream's `encrypt_password`
+(`postgres/src/backend/commands/user.c`) and `scram_build_secret`
+(`postgres/src/common/scram-common.c`) read the live GUC instead, so `SET
+scram_iterations = N; ALTER ROLE ... PASSWORD ...` changes the PBKDF2 cost
+of the newly-derived verifier — a real, user-visible security knob that
+goopg silently ignored.
+
+Fixed: `auth.NewSCRAMSecretWithIterations(password, iterations)`
+(`internal/auth/scram.go`) is a new sibling of `NewSCRAMSecret` taking an
+explicit count (non-positive falls back to the same default, so existing
+callers — `initdb`'s bootstrap superuser, the mock-auth channel-binding
+path, tests — are unaffected by construction, not by convention).
+`applyRoleAttrOptions` (`internal/server/role_ddl.go`) now takes the same
+`currentGUCResolver` its two callers (`tryHandleRoleDDL`'s CREATE/ALTER ROLE
+attribute-clause branches) already had in scope for the unrelated `SET ...
+FROM CURRENT` path, and a new `resolveScramIterations` helper reads
+`scram_iterations` off it (falls back to 0 → `NewSCRAMSecretWithIterations`'s
+own default whenever no session/GUC is available, e.g. `initdb`'s bootstrap
+call which doesn't go through this path at all). No change needed on the
+authentication/verification side: `parse_scram_secret`'s Go port
+(`ParseSCRAMSecret`) already reads the iteration count back out of the
+stored `SCRAM-SHA-256$<iterations>:...` verifier and `scramState`'s
+server-first-message (`scram.go:326`) already renders `s.secret.Iterations`
+from the parsed value, not a constant — the read side was already correct,
+only the write side was pinned to the default.
+
+Not modelled (unchanged from before this fix): `initdb`'s bootstrap
+superuser secret always uses the compiled-in default regardless of any
+`postgresql.conf` `scram_iterations` setting present at `initdb` time —
+matches upstream's own bootstrap behavior (the value used to hash the
+bootstrap password is fixed at initdb time, before GUC processing of a
+user-supplied config file would apply), so no gap.
+
+Tests: `internal/server/role_ddl_scram_iterations_test.go`
+(`TestCreateAlterRolePasswordHonorsScramIterationsGUC`) — CREATE ROLE with a
+nil resolver derives 4096 iterations; CREATE ROLE and ALTER ROLE ...
+PASSWORD with a live resolver reporting `scram_iterations = "1024"`/`"42"`
+derive exactly that count (parsed back out of the stored verifier via
+`auth.ParseSCRAMSecret`). Confirmed non-vacuous via `git stash` on
+`scram.go`/`role_ddl.go` (fails, both roles report 4096 regardless of the
+live GUC).

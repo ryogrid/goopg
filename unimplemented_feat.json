@@ -217,7 +217,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/auth/scram.go:45,75,150 scramDefaultIterations hardcoded (scram_iterations GUC registered in internal/config/defaults.go:184 but never consulted); scram.go:279-289 channel binding explicitly rejected; no SASLprep anywhere — GUC registration is cosmetic only"
+   "code_audit": "partially-resolved 2026-07-08: scram_iterations GUC is now consulted — auth.NewSCRAMSecretWithIterations (internal/auth/scram.go) + role_ddl.go's resolveScramIterations read the live session GUC for CREATE/ALTER ROLE PASSWORD (fix_plan.md M0122-0008, docs/design/root-0021-role-auth-persistence.md). Still confirmed-open: scram.go:279-289 channel binding explicitly rejected; no SASLprep anywhere in the codebase"
   },
   {
    "feature": "Lehman/Yao crab-walk concurrency control for B-tree index operations",
