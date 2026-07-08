@@ -2772,6 +2772,63 @@ survey the deferral ledger for a fresh open (`status = -`) row.
       clean; `go test ./internal/executor/... ./internal/amcheck/...` PASS;
       `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33). Deferral ledger row
       appended for the still-open corruption mechanism.
+  - [x] `M-NIGHTLY (AI-20260709-010336-082)` 4th loop on the reopen: found
+      and fixed the actual root cause of the prior loop's block-678
+      sibling-relink corruption via CODE READING alone (no new live
+      instrumentation needed — the prior loop's hand-trace of
+      `insertIntoBlock` in isolation was correct; the bug lives in a
+      DIFFERENT function that races against it). `bt.splitMu` — a
+      per-`*BTree`-**Go-instance** mutex, confirmed by an earlier loop to
+      NOT serialize across connections since each backend opens its own
+      `*BTree` per statement — is held for the whole duration of
+      `unlinkEmptyLeaf` (`internal/access/btree/btree_vacuum.go`), which
+      computes `leftLive`/`rightLive` via an unlocked `liveSibling`
+      pre-pass and then, much later, blindly writes those STALE values as
+      the post-unlink sibling relink (`op.Prev = req.RightSibNewPrev` /
+      `op.Next = req.LeftSibNewNext`). A concurrent Insert-driven split on
+      a DIFFERENT connection's `*BTree` instance for the SAME relation is
+      NOT blocked by this `splitMu` (different instance) and can splice a
+      new live page into the exact chain segment VACUUM is mid-unlinking;
+      that split's own sibling relink is correct in isolation (fresh
+      `readOpaque` immediately before `writeOpaque`, under the real
+      cross-connection `pinW`/`contentMu` lock), but VACUUM's later write
+      then stomps it back to the pre-split neighbour — reproducing
+      exactly the confirmed on-disk symptom (block 678 `Prev` stuck at
+      677 when the true chain was 677->15798->678). Fixed both
+      `unlinkEmptyLeaf` (WAL path) and `unlinkEmptyLeafFPI` (no-WAL-hook
+      fallback) to re-derive the live neighbour via a FRESH `liveSibling`
+      walk, started from the sibling block's CURRENT on-disk Prev/Next,
+      executed INSIDE the same `pinW` hold that performs the write — a
+      no-op if nothing raced, self-correcting if it did. Verified via a
+      fresh independent repro (isolated port 5533, `pgbench -i -s 10
+      --no-vacuum` then `pgbench -c 60 -j 12 -T 30` racing an explicit
+      `VACUUM pgbench_accounts` loop every 0.3s): 0 failed transactions,
+      and post-run `bt_index_check` no longer reports any Prev/Next
+      sibling-link mismatch. Gates: `go build ./...` clean; `go test
+      ./internal/access/btree/... ./internal/amcheck/...
+      ./internal/executor/...` PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33). **New, different corruption class surfaced by the
+      SAME fresh repro** (not fixed this loop — see deferral ledger row
+      appended 2026-07-09): `bt_index_check` now reports `high key
+      invariant violated ... block 4026`; direct block dump (throwaway
+      probe, not committed) confirmed block 4026 is an INTERNAL
+      (level=1) page whose LAST downlink key exceeds its own HighKey —
+      all 246 preceding keys are correctly bounded. Root cause hypothesis
+      (code-reading, not yet instrumented/proven): `insertIntoBlock`
+      (`internal/access/btree/btree.go:2114`) — used for both the leaf
+      fast path and the recursive parent-downlink insert after a child
+      split — never checks the target block's current HighKey against
+      the item being inserted before `pageHasSpaceFor`/insert (missing
+      PostgreSQL's Lehman-Yao "move right" step); if the target page was
+      concurrently split by another connection between the caller
+      deciding this block was correct and the actual `pinW`+insert, the
+      item can land on a now-too-narrow page. This is a bigger,
+      hotter-path fix than this loop's scope — needs its own dedicated
+      loop with fresh repro + live instrumentation if code-reading alone
+      doesn't confirm it. Resume point and full repro recipe are in the
+      deferral ledger row dated 2026-07-09
+      (`M-NIGHTLY (AI-20260709-010336-082, 3rd pgbench reopen)`, status
+      `resolved`, "deferred" column).
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 

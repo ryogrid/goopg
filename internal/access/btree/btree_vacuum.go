@@ -346,22 +346,62 @@ func (bt *BTree) unlinkEmptyLeaf(leaf emptyLeafInfo) error {
 	// path the FPI fallback would use; we rely on the unlink
 	// record itself to reconstruct each page's state during
 	// replay.
+	//
+	// M-NIGHTLY (AI-20260709-010336-082, 3rd pgbench reopen): do NOT
+	// blindly stamp the leftLive/rightLive values captured by the
+	// liveSibling walk above. bt.splitMu (held for this whole
+	// function) only serialises against OTHER structural mutations on
+	// THIS *BTree Go instance -- it does NOT serialise across
+	// connections, and each backend opens its own *BTree per
+	// statement (see btree.go's splitMu doc comment). A concurrent
+	// Insert-driven split on a DIFFERENT connection's *BTree instance
+	// for the SAME relation can splice a brand-new live page into the
+	// chain between the walk above and the writes below (its own
+	// sibling relink is safe -- it re-reads fresh under its own pinW
+	// immediately before writing). Blindly applying the stale
+	// leftLive/rightLive here would stomp that split's correct relink
+	// right back to the pre-split (now wrong) neighbour -- this is
+	// the exact mechanism that produced block 678's persistent
+	// "left link/right link pair not in agreement" corruption
+	// (confirmed on-disk: true chain 677->15798->678, but 678's
+	// btpo_prev stayed 677). Fix: re-derive the live neighbour from
+	// this block's CURRENT on-disk link, under the same pinW that
+	// performs the write -- a no-op if nothing raced, self-correcting
+	// if it did.
 	if req.HasLeftSib {
+		var walkErr error
 		if err := bt.applyOpaqueMutation(req.LeftSibBlk, lsn, func(p storage.Page) {
 			op := readOpaque(p)
-			op.Next = req.LeftSibNewNext
+			newNext, werr := bt.liveSibling(op.Next, true)
+			if werr != nil {
+				walkErr = werr
+				return
+			}
+			op.Next = newNext
 			writeOpaque(p, op)
 		}); err != nil {
 			return err
 		}
+		if walkErr != nil {
+			return walkErr
+		}
 	}
 	if req.HasRightSib {
+		var walkErr error
 		if err := bt.applyOpaqueMutation(req.RightSibBlk, lsn, func(p storage.Page) {
 			op := readOpaque(p)
-			op.Prev = req.RightSibNewPrev
+			newPrev, werr := bt.liveSibling(op.Prev, false)
+			if werr != nil {
+				walkErr = werr
+				return
+			}
+			op.Prev = newPrev
 			writeOpaque(p, op)
 		}); err != nil {
 			return err
+		}
+		if walkErr != nil {
+			return walkErr
 		}
 	}
 	if req.HasParent {
@@ -632,14 +672,23 @@ func (bt *BTree) unlinkEmptyLeafFPI(leaf emptyLeafInfo) error {
 		return err
 	}
 
-	// Update left sibling's Next.
+	// Update left sibling's Next. M-NIGHTLY (AI-20260709-010336-082):
+	// re-derive the live neighbour from the sibling's CURRENT on-disk
+	// link under this pinW, not the stale leftLive/rightLive captured
+	// above — see the WAL-path twin unlinkEmptyLeaf for the full
+	// cross-connection race rationale.
 	if leftLive != storage.InvalidBlockNumber {
 		s, err := bt.pinW(leftLive)
 		if err != nil {
 			return err
 		}
 		op := readOpaque(s.Page())
-		op.Next = rightLive
+		newNext, werr := bt.liveSibling(op.Next, true)
+		if werr != nil {
+			bt.unpinW(s)
+			return werr
+		}
+		op.Next = newNext
 		writeOpaque(s.Page(), op)
 		err = bt.markDirtyWithPageRecord(s, leftLive)
 		bt.unpinW(s)
@@ -655,7 +704,12 @@ func (bt *BTree) unlinkEmptyLeafFPI(leaf emptyLeafInfo) error {
 			return err
 		}
 		op := readOpaque(s.Page())
-		op.Prev = leftLive
+		newPrev, werr := bt.liveSibling(op.Prev, false)
+		if werr != nil {
+			bt.unpinW(s)
+			return werr
+		}
+		op.Prev = newPrev
 		writeOpaque(s.Page(), op)
 		err = bt.markDirtyWithPageRecord(s, rightLive)
 		bt.unpinW(s)
