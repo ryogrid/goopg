@@ -10,3 +10,4 @@
 2026-07-09T01:03:45+09:00 [RUN]	S1 lanes start (L: units,race | H: testport,pgbench — filtered by NIGHTLY_STAGES)
 2026-07-09T03:48:12+09:00 [RUN]	S1 barrier reached
 2026-07-09T04:24:26+09:00 [RUN]	end status_rc=2 (0 pass / 2 fail / 3 inconclusive) — see summary.md
+2026-07-09T04:26:12+09:00 [RUN]	log-push: committed + pushed batch logs to origin/align-data-structure-with-pg

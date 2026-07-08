@@ -2694,6 +2694,84 @@ survey the deferral ledger for a fresh open (`status = -`) row.
       HEAD before assuming this is a fresh regression of the same root
       cause; not re-run in this triage pass (pgbench repro takes several
       minutes of `-i -s 50` load plus the `-c 100 -j 20 -T 180` run).
+      2026-07-09 update (1st loop on the reopen): re-ran the repro at HEAD
+      using the established cheap recipe (isolated port 5533, `pgbench -i
+      -s 50` once — 4m28s — then `pgbench -c 100 -j 20 -T 25 -P 5` twice).
+      Both runs: 0 failed transactions (does not reproduce the original
+      runtime "empty internal page" abort in this shorter window, same as
+      every prior reopen's first loop). First useful side-finding while
+      setting this up: hit the SAME libpq ABI mismatch as
+      `testport/TestE2E_SASLPrepMatchesRealLibpqClient`
+      (AI-20260709-010336-001) independently — `postgres/local_install/bin/
+      psql`/`pgbench` both `symbol lookup error: undefined symbol:
+      PQsendPipelineSync` when run with a bare `PATH`; confirmed the fix
+      that item's writeup proposed (`LD_LIBRARY_PATH=$PWD/postgres/
+      local_install/lib`) works — every manual pgbench/psql repro recipe in
+      this fix_plan going forward should export that alongside `PATH`, not
+      just the SASL test itself. Then ran the SAME post-run `bt_index_check
+      (..., true)` technique the 2026-07-08 reopen used and got a
+      **different, genuine finding**: `pgbench_accounts_pkey` reports `ERROR:
+      left link/right link pair in index "pgbench_accounts_pkey" not in
+      agreement` — a distinct symptom class from both this month's already-
+      fixed bugs (2026-07-07's `keyLen mismatch`/bufmap-tombstone family,
+      2026-07-08's amcheck duplicate-key false-positive), so this is
+      genuinely new, not a rehash. Found and fixed a real (small) diagnostic
+      gap on the way: `btIndexReportDetail` (`internal/executor/
+      operators_bt_index_check.go`) suppressed the error DETAIL (which
+      carries the offending block number) whenever there was only ONE
+      finding — the common case — even though upstream amcheck's own
+      `ereport(ERROR)` calls always attach an `errdetail_internal` naming the
+      block; fixed to always build the "block N: msg" detail regardless of
+      count (no test asserted the old suppress-when-single behavior). Used
+      the now-visible block number plus a throwaway direct-file-read Go
+      probe (opened the stopped server's `base/5/16412` file, parsed opaque
+      headers via the already-exported `btree.ParseOpaque`, reverted after
+      use — not committed) to confirm this is genuine **on-disk, persistent**
+      corruption (checked with the server stopped, not a live buffer-pool
+      artifact): block 678 (leaf, level=0) has `Prev=677`, but the actual
+      forward sibling chain is `677 --Next--> 15798 --Next--> 678` (15798's
+      `Prev=677`, `Next=678`; 677's `Next=15798`) — i.e. 678's left-link was
+      never updated to point at 15798 when 15798 was spliced in between 677
+      and 678, and still stale-points at the pre-split predecessor 677. This
+      is byte-for-byte the "classic example" upstream's own
+      `bt_recheck_sibling_links` doc comment (verify_nbtree.c:1079-1088)
+      describes as the signature of a **faulty, non-atomic page split**: "the
+      original right sibling page's left link fails to point to the new
+      right sibling page... even though the first phase of a page split is
+      supposed to work as a single atomic action." Read (not yet
+      instrumented) `insertIntoBlock`'s existing old-right-sibling relink
+      code (btree.go ~2148-2303: `oldNext := op.Next` captured once under
+      `blk`'s continuously-held `pinW`, later `sibSlot, _ := bt.pinW(sibBlk)`
+      / `sibOp.Prev = rightBlk` / `writeOpaque(...)`) end-to-end and could
+      NOT find an inspection-only defect — the pinW/contentMu coupling on
+      the shared sibling block should serialize against both "678 splits
+      itself concurrently" and "two different backends relink 678 at once"
+      correctly by hand-trace (documented reasoning, not proof) — matching
+      this investigation's month-long pattern where hand-tracing alone
+      repeatedly failed to find the real defect and only live instrumentation
+      (`DebugTraceBufmap` et al., 2026-07-08 14th loop) succeeded. Did NOT
+      build new instrumentation this loop (out of budget after the repro/
+      localization work). Next step: this is a MUCH more localized starting
+      point than any prior reopen got in its first loop — reuse
+      `internal/access/btree`'s existing debug-trace scaffolding pattern
+      (`DebugTraceInserts`/`DebugTraceBufmap` style: cheap, off-by-default,
+      committed) to add a trace specifically around `insertIntoBlock`'s
+      `sibSlot`/`oldNext` relink (blk being split, sibBlk being relinked,
+      before/after `sibOp.Prev`), then re-run this exact recipe (repro
+      preserved on disk, see below) filtering the trace log for block 678 —
+      or, if the corrupted data dir has already been cleaned up by the time
+      this resumes, regenerate via `pgbench -i -s 50` once + `pgbench -c 100
+      -j 20 -T 25 -P 5` twice against a fresh isolated server (both
+      `PATH`/`LD_LIBRARY_PATH` as above), then `bt_index_check
+      ('pgbench_accounts_pkey'::regclass, true)` post-run. **The exact
+      corrupted data dir from this loop is preserved** at
+      `tmp/perf-optimize/reopen3-data` (server stopped, not deleted — 481M,
+      gitignored) specifically so the next loop can skip the ~5 minute
+      repro and jump straight to instrumenting `insertIntoBlock` against
+      this already-known-bad block 678. Gates this loop: `go build ./...`
+      clean; `go test ./internal/executor/... ./internal/amcheck/...` PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33). Deferral ledger row
+      appended for the still-open corruption mechanism.
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 
