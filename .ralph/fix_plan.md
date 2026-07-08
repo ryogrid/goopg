@@ -2829,6 +2829,47 @@ survey the deferral ledger for a fresh open (`status = -`) row.
       deferral ledger row dated 2026-07-09
       (`M-NIGHTLY (AI-20260709-010336-082, 3rd pgbench reopen)`, status
       `resolved`, "deferred" column).
+  - [x] `M-NIGHTLY (AI-20260709-010336-082)` 5th loop — **fixed the block-4026
+      high-key overrun** surfaced by the prior loop's own verification repro.
+      Root cause confirmed by code reading (no live instrumentation needed):
+      `insertIntoBlock` (`internal/access/btree/btree.go`) pinned its target
+      `blk` and inserted/split unconditionally, with no Lehman-Yao move-right
+      check — none of its three call shapes (leaf fast-path fallback,
+      recursive parent-downlink insert, root-lift downlink insert) re-verified
+      the target's current high key against the item being inserted. Since
+      `bt.splitMu` only serializes structural writes within one `*BTree`
+      Go-instance (each backend opens its own instance per statement — a
+      prior finding from the same investigation thread), a concurrent split
+      on a DIFFERENT connection's instance could move the item's key range to
+      `blk`'s right sibling in the window between the caller deciding `blk`
+      was correct and `insertIntoBlock`'s own `pinW`. Fix: `insertIntoBlock`
+      now loops on pin — after each `pinW(blk)` it checks a new
+      `itemOvershootsHighKey(op, it.key)` helper (leaf: `key<=HighKey`,
+      internal: `key<HighKey`, matching amcheck's `VerifyBtreeItemOrder`
+      stored-item invariant, `internal/amcheck/verify_nbtree.go:220-229`) and
+      steps to `op.Next` on overshoot instead of inserting/splitting in
+      place. Deliberately a DIFFERENT predicate from the existing
+      `keyExceedsHighKey` (search-key descent routing, where equality to
+      `HighKey` means "stay on this page" for both leaf and internal levels)
+      — that leaf/internal asymmetry between search-routing and the
+      stored-item invariant is what the prior loop's code-reading pass had
+      not yet pinned down. Verified via a fresh independent repro (isolated
+      port 5533, `pgbench -i -s 10 --no-vacuum` then TWO rounds of `pgbench
+      -c 60..100 -j 12..20 -T 30` racing an explicit `VACUUM
+      pgbench_accounts` loop every 0.3s): 0 failed transactions both rounds,
+      `bt_index_check('pgbench_accounts_pkey'::regclass, true)` reports no
+      findings after either round (the exact recipe that reproduced the
+      block-4026 finding on the pre-fix binary). Gates: `go build ./...`
+      clean; `go test ./internal/access/btree/... ./internal/amcheck/...
+      ./internal/executor/...` PASS; `go test -race
+      ./internal/access/btree/...` PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33). Design doc `docs/design/0055-0005-btree-insert-move-right.md`
+      added (indexed in `docs/design/README.md`) documenting the mechanism
+      and scope. **Follow-up left open** (not this loop's scope): `bt.splitMu`
+      cross-connection non-serialization itself remains unfixed — this loop
+      tolerates that gap at every structural-insert entry point rather than
+      closing it; see the design doc §5 and the deferral ledger row appended
+      2026-07-09 for the resume point.
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 

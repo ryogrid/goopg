@@ -200,6 +200,28 @@ func keyExceedsHighKey(op BTPageOpaque, key []byte) bool {
 	return CompareKeys(key, op.HighKey) > 0
 }
 
+// itemOvershootsHighKey reports whether a new item keyed `key` belongs
+// strictly to the right of the page described by `op` rather than on it —
+// the Lehman-Yao "move right" test applied to a structural INSERT rather
+// than a search descent. It differs from keyExceedsHighKey in the
+// boundary case: a search key equal to HighKey may legitimately stay on
+// this page (HighKey is inclusive for routing), but a stored ITEM equal
+// to HighKey is only valid on a leaf (leaf: key<=HighKey); on an internal
+// page it must move right (internal: key<HighKey), matching amcheck's
+// stored-item invariant in VerifyBtreeItemOrder (verify_nbtree.go) —
+// HighKey is itself the separator that was pushed up when this page last
+// split, so a downlink equal to it belongs to the right sibling.
+func itemOvershootsHighKey(op BTPageOpaque, key []byte) bool {
+	if !op.HasHighKey() || op.Next == storage.InvalidBlockNumber {
+		return false
+	}
+	cmp := CompareKeys(key, op.HighKey)
+	if op.IsLeaf() {
+		return cmp > 0
+	}
+	return cmp >= 0
+}
+
 // initPage prepares a freshly extended block as a B-tree page with the
 // given opaque content. The page starts empty (no items).
 func initPage(p storage.Page, o BTPageOpaque) {
@@ -2113,9 +2135,34 @@ func (bt *BTree) tryInsertNoSplit(it item) error {
 // dropping its latch — readers that descended to it under shared
 // latch will follow the new right-link to find the moved keys.
 func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNumber, it item) error {
-	slot, err := bt.pinW(blk)
-	if err != nil {
-		return err
+	// Lehman-Yao move-right: `blk` was decided by the caller (a fresh
+	// descendToLeaf under splitMu, or a path[] ancestor recorded before
+	// or during this connection's own split). `bt.splitMu` only
+	// serializes structural changes within THIS *BTree Go instance —
+	// each backend opens its own instance per statement — so a
+	// concurrent split on a DIFFERENT connection's instance for the
+	// SAME relation can move the key range `it` belongs in to blk's
+	// right sibling between that decision and this pin (M-NIGHTLY
+	// AI-20260709-010336-082: reproduced as a "high key invariant
+	// violated" internal-page finding). Detect via the same
+	// leaf/internal high-key boundary amcheck enforces and step right
+	// instead of inserting out of bounds.
+	var slot *storage.Slot
+	var op BTPageOpaque
+	for {
+		var err error
+		slot, err = bt.pinW(blk)
+		if err != nil {
+			return err
+		}
+		op = readOpaque(slot.Page())
+		if itemOvershootsHighKey(op, it.key) {
+			next := op.Next
+			bt.unpinW(slot)
+			blk = next
+			continue
+		}
+		break
 	}
 
 	if pageHasSpaceFor(slot.Page(), it) {
@@ -2143,8 +2190,8 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 
 	// Split. Pin a freshly-extended right page exclusively,
 	// redistribute items, stamp the high key, then drop both
-	// latches before walking up.
-	op := readOpaque(slot.Page())
+	// latches before walking up. `op` already holds this page's
+	// pre-split opaque header from the move-right loop above.
 	// The block that is currently left's right sibling (if any).
 	// After the split the new right page is spliced between them, so
 	// this sibling's btpo_prev must be relinked from blk to rightBlk
