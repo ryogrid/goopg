@@ -175,6 +175,17 @@ type Config struct {
 	// internal/aio's io_method=io_uring precedent. See
 	// docs/design/0007-0002-fdatasync-commit-path.md.
 	SyncMethod string
+
+	// MinWALSize mirrors upstream's `min_wal_size` GUC (bytes). It sets
+	// the floor on how many WAL segments RemoveOldSegments keeps around
+	// as pre-zeroed spares by renaming obsolete segments into fresh
+	// future slots (recycle-by-rename) instead of unlinking them —
+	// avoiding the create+zero-fill+directory-fsync cost a later
+	// openSegment would otherwise pay for a brand-new file. <= 0 (the
+	// default) disables recycling entirely: every obsolete segment is
+	// unlinked, matching pre-M0122-0009 behaviour. See
+	// docs/design/0122-0009-wal-segment-recycling.md.
+	MinWALSize int64
 }
 
 // AIOEngine is the wal-side seam onto an AIO engine. Mirrors
@@ -266,6 +277,7 @@ type result struct {
 	startLSN   uint64
 	endLSN     uint64
 	removed    int
+	recycled   int
 	walBufStat walBufStatSnapshot
 	err        error
 }
@@ -845,31 +857,38 @@ func (w *Writer) FlushUpTo(lsn uint64) error {
 	}
 }
 
-// RemoveOldSegments unlinks any WAL segment file whose contents end
+// RemoveOldSegments retires any WAL segment file whose contents end
 // strictly before the segment that contains keepLSN. The segment
 // containing keepLSN — and every segment after it — is preserved, so
 // the caller can pass `min(checkpointLSN, min(slot.RestartLSN))` and
 // be sure no record needed for crash recovery or for an attached
 // standby is removed.
 //
+// Up to `ceil(Config.MinWALSize/SegmentSize)` of the newest obsolete
+// segments are recycled (zero-filled and renamed into fresh future
+// segment slots) rather than unlinked, so a later openSegment for
+// that slot skips its own create+zero-fill+directory-fsync. The rest
+// are unlinked as before. Config.MinWALSize <= 0 disables recycling
+// (every obsolete segment is unlinked, the pre-M0122-0009 behaviour).
+//
 // keepLSN == 0 is a no-op (no records have been written yet).
 //
 // The op runs on the writer's serialised loop so it cannot race with
-// an in-flight Append or Flush. Open file handles for removed segments
-// are closed before the unlink and dropped from the writer's cache so
-// subsequent writes never re-touch a deleted file.
+// an in-flight Append or Flush. Open file handles for retired segments
+// are closed before the unlink/rename and dropped from the writer's
+// cache so subsequent writes never re-touch the old file.
 //
-// Returns the number of segment files that were removed.
-func (w *Writer) RemoveOldSegments(keepLSN uint64) (int, error) {
+// Returns the number of segment files unlinked and the number recycled.
+func (w *Writer) RemoveOldSegments(keepLSN uint64) (removed, recycled int, err error) {
 	if keepLSN == 0 {
-		return 0, nil
+		return 0, 0, nil
 	}
 	resp := make(chan result, 1)
 	if err := w.send(op{kind: opRecycle, lsn: keepLSN, resp: resp}); err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	r := <-resp
-	return r.removed, r.err
+	return r.removed, r.recycled, r.err
 }
 
 // Close flushes dirty segments, closes files, and stops the worker.
@@ -1201,8 +1220,8 @@ func (s *state) loop(ops <-chan op, done chan<- struct{}) {
 				// New code routes through flushSig via FlushUpTo.
 				req.resp <- result{err: s.flushUpTo(req.lsn)}
 			case opRecycle:
-				n, err := s.removeOldSegments(req.lsn)
-				req.resp <- result{removed: n, err: err}
+				n, rc, err := s.removeOldSegments(req.lsn)
+				req.resp <- result{removed: n, recycled: rc, err: err}
 			case opClose:
 				// Drain any pending group-flush requests before closing.
 				s.handleGroupFlush()
@@ -1858,39 +1877,58 @@ func (s *state) flushUpTo(lsn uint64) error {
 	return nil
 }
 
-// removeOldSegments unlinks every segment whose final byte sits
-// strictly before the segment containing keepLSN. Runs on the loop
-// goroutine so it serialises with append/flush and won't race with
-// openSegment.
+// removeOldSegments retires every segment whose final byte sits
+// strictly before the segment containing keepLSN, either by
+// unlinking it or — for up to `ceil(Config.MinWALSize/SegmentSize)`
+// of the newest obsolete segments — recycling it into a fresh future
+// segment slot. Runs on the loop goroutine so it serialises with
+// append/flush and won't race with openSegment.
 //
 // Behaviour notes:
 //   - The segment that contains keepLSN is preserved (the standby /
 //     recovery still needs to read records inside it).
-//   - Open file handles for removed segments are closed and dropped
+//   - Open file handles for retired segments are closed and dropped
 //     from s.files so a subsequent writeAt that somehow targets a
 //     stale segment number reopens fresh (it shouldn't — keepLSN
-//     guarantees we only delete fully-superseded segments — but the
+//     guarantees we only retire fully-superseded segments — but the
 //     defensive close keeps the invariant explicit).
-//   - dirty flags for removed segments are dropped: the bytes were
+//   - dirty flags for retired segments are dropped: the bytes were
 //     superseded, no fdatasync owes them anymore.
 //   - Missing files are silently skipped so a partially-cleaned
 //     directory (e.g. a manual rm during testing) doesn't wedge the
 //     loop.
-func (s *state) removeOldSegments(keepLSN uint64) (int, error) {
+//   - Recycling targets the lowest-numbered free segment slot at or
+//     after keepSeg (mirrors upstream InstallXLogFileSegment's
+//     find_free scan), so it never clobbers a segment that already
+//     exists. The recycled file is zero-filled after the rename —
+//     unlike upstream, which leaves the old content in place — because
+//     decodeRecord's graceful-EOS heuristic (docs/design/0007-0001-wal-segment-preallocation.md)
+//     distinguishes "end of valid WAL" from "corruption" by checking
+//     whether the bytes past a bad/absent record are all zero. A
+//     recycled segment's leftover content is a real, well-formed
+//     record from its previous life (valid CRC and all), so leaving
+//     it in place would let recovery misread stale history as live
+//     WAL. See docs/design/0122-0009-wal-segment-recycling.md.
+func (s *state) removeOldSegments(keepLSN uint64) (removed, recycled int, err error) {
 	if keepLSN == 0 {
-		return 0, nil
+		return 0, 0, nil
 	}
 	keepSeg := segmentForLSN(keepLSN, s.cfg.SegmentSize)
 	if keepSeg == 0 {
-		return 0, nil
+		return 0, 0, nil
 	}
 
 	entries, err := os.ReadDir(s.cfg.WALDir)
 	if err != nil {
-		return 0, fmt.Errorf("wal: list %s: %w", s.cfg.WALDir, err)
+		return 0, 0, fmt.Errorf("wal: list %s: %w", s.cfg.WALDir, err)
 	}
 
-	removed := 0
+	type staleSeg struct {
+		segNo uint64
+		name  string
+	}
+	existing := make(map[uint64]bool, len(entries))
+	var stale []staleSeg
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
@@ -1899,24 +1937,85 @@ func (s *state) removeOldSegments(keepLSN uint64) (int, error) {
 		if !ok {
 			continue
 		}
-		if segNo >= keepSeg {
+		existing[segNo] = true
+		if segNo < keepSeg {
+			stale = append(stale, staleSeg{segNo, e.Name()})
+		}
+	}
+
+	spares := 0
+	if s.cfg.MinWALSize > 0 && s.cfg.SegmentSize > 0 {
+		spares = int((s.cfg.MinWALSize + s.cfg.SegmentSize - 1) / s.cfg.SegmentSize)
+	}
+
+	// Recycle the newest obsolete segments first (mirrors upstream's
+	// RemoveOldXlogFiles, which walks toward the retention cutoff from
+	// the current end of WAL).
+	sort.Slice(stale, func(i, j int) bool { return stale[i].segNo > stale[j].segNo })
+
+	nextTarget := keepSeg
+	anyRecycled := false
+	for _, o := range stale {
+		if f, open := s.files[o.segNo]; open {
+			_ = f.Close()
+			delete(s.files, o.segNo)
+		}
+		delete(s.dirty, o.segNo)
+		oldPath := filepath.Join(s.cfg.WALDir, o.name)
+
+		if recycled < spares {
+			for existing[nextTarget] {
+				nextTarget++
+			}
+			newPath := filepath.Join(s.cfg.WALDir, formatSegmentName(nextTarget))
+			if rerr := recycleSegmentFile(oldPath, newPath, s.cfg.SegmentSize); rerr != nil {
+				if errors.Is(rerr, os.ErrNotExist) {
+					continue
+				}
+				return removed, recycled, rerr
+			}
+			delete(existing, o.segNo)
+			existing[nextTarget] = true
+			nextTarget++
+			recycled++
+			anyRecycled = true
 			continue
 		}
-		if f, open := s.files[segNo]; open {
-			_ = f.Close()
-			delete(s.files, segNo)
-		}
-		delete(s.dirty, segNo)
-		path := filepath.Join(s.cfg.WALDir, e.Name())
-		if err := os.Remove(path); err != nil {
-			if errors.Is(err, os.ErrNotExist) {
+
+		if rerr := os.Remove(oldPath); rerr != nil {
+			if errors.Is(rerr, os.ErrNotExist) {
 				continue
 			}
-			return removed, fmt.Errorf("wal: remove %s: %w", path, err)
+			return removed, recycled, fmt.Errorf("wal: remove %s: %w", oldPath, rerr)
 		}
 		removed++
 	}
-	return removed, nil
+
+	if anyRecycled {
+		// Directory fsync makes the renamed dirents durable, mirroring
+		// openSegment's post-creation fsync for brand-new segments.
+		if dir, derr := os.Open(s.cfg.WALDir); derr == nil {
+			_ = dir.Sync()
+			_ = dir.Close()
+		}
+	}
+	return removed, recycled, nil
+}
+
+// recycleSegmentFile renames an obsolete WAL segment into a fresh
+// future segment slot and zero-fills it. See removeOldSegments for
+// why the zero-fill (absent from upstream's equivalent
+// InstallXLogFileSegment) is required here.
+func recycleSegmentFile(oldPath, newPath string, size int64) error {
+	if err := os.Rename(oldPath, newPath); err != nil {
+		return fmt.Errorf("wal: recycle rename %s -> %s: %w", oldPath, newPath, err)
+	}
+	f, err := os.OpenFile(newPath, os.O_RDWR, 0o600)
+	if err != nil {
+		return fmt.Errorf("wal: recycle open %s: %w", newPath, err)
+	}
+	defer f.Close()
+	return preallocateSegment(f, size)
 }
 
 func (s *state) writeAt(pos int64, buf []byte) error {

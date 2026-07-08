@@ -85,7 +85,7 @@ func TestRemoveOldSegmentsKeepsContainingSegment(t *testing.T) {
 	// (segNo=2, byte offset 0 inside the segment, 1-based LSN =
 	// 2*32 + 1 = 65). Segments 0 and 1 are obsolete; 2 and 3 stay.
 	keepLSN := uint64(2*32 + 1)
-	removed, err := w.RemoveOldSegments(keepLSN)
+	removed, _, err := w.RemoveOldSegments(keepLSN)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,7 +115,7 @@ func TestRemoveOldSegmentsZeroLSNIsNoop(t *testing.T) {
 	if _, _, err := w.Append(make([]byte, 24)); err != nil {
 		t.Fatal(err)
 	}
-	removed, err := w.RemoveOldSegments(0)
+	removed, _, err := w.RemoveOldSegments(0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,7 +144,7 @@ func TestRemoveOldSegmentsClosesCachedHandle(t *testing.T) {
 		}
 	}
 	// Drop segments 0 and 1 (keep segment 2).
-	if _, err := w.RemoveOldSegments(uint64(2*32 + 1)); err != nil {
+	if _, _, err := w.RemoveOldSegments(uint64(2*32 + 1)); err != nil {
 		t.Fatal(err)
 	}
 	// Append more — the writer should open segment 3 fresh.
@@ -158,6 +158,117 @@ func TestRemoveOldSegmentsClosesCachedHandle(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(walDir, name)); !errors.Is(err, fs.ErrNotExist) {
 			t.Fatalf("segment %s reappeared (err=%v)", name, err)
 		}
+	}
+}
+
+// TestRemoveOldSegmentsRecyclesUpToMinWALSize confirms MinWALSize
+// caps how many of the newest obsolete segments get recycled
+// (zero-filled + renamed into a future slot) instead of unlinked,
+// and that the recycled file's content is genuinely zeroed rather
+// than the old segment's leftover WAL bytes (required for
+// decodeRecord's graceful-EOS heuristic -- see removeOldSegments).
+func TestRemoveOldSegmentsRecyclesUpToMinWALSize(t *testing.T) {
+	walDir := filepath.Join(t.TempDir(), "pg_wal")
+	const segSize = 32
+	w, err := NewWriter(Config{WALDir: walDir, SegmentSize: segSize, MinWALSize: 2 * segSize})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	// Fill segments 0..4 (5 segments, one 24-byte record each).
+	for i := 0; i < 5; i++ {
+		payload := make([]byte, 24)
+		payload[0] = byte('a' + i)
+		if _, _, err := w.Append(payload); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if names := segmentNames(t, walDir); len(names) != 5 {
+		t.Fatalf("pre-recycle segment count = %d (%v), want 5", len(names), names)
+	}
+
+	// Keep segment 3 onward (segments 0,1,2 obsolete). MinWALSize=2
+	// segments caps recycling at the 2 newest obsolete segments (2
+	// and 1); the oldest (0) is unlinked.
+	keepLSN := uint64(3*segSize + 1)
+	removed, recycled, err := w.RemoveOldSegments(keepLSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removed != 1 {
+		t.Fatalf("removed = %d, want 1", removed)
+	}
+	if recycled != 2 {
+		t.Fatalf("recycled = %d, want 2", recycled)
+	}
+
+	// Segment 0 must be gone; segments 3,4 (kept) plus two freshly
+	// recycled slots (5,6 -- the first free slots at/after keepSeg=3)
+	// must be present.
+	got := segmentNames(t, walDir)
+	want := []string{
+		formatSegmentName(3),
+		formatSegmentName(4),
+		formatSegmentName(5),
+		formatSegmentName(6),
+	}
+	if !equalStringSlices(got, want) {
+		t.Fatalf("post-recycle segments = %v, want %v", got, want)
+	}
+
+	// The recycled slots must be genuinely zero-filled, not the
+	// donor segment's old WAL bytes.
+	for _, segNo := range []uint64{5, 6} {
+		data, err := os.ReadFile(filepath.Join(walDir, formatSegmentName(segNo)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(data) != segSize {
+			t.Fatalf("recycled segment %d size = %d, want %d", segNo, len(data), segSize)
+		}
+		for i, b := range data {
+			if b != 0 {
+				t.Fatalf("recycled segment %d byte %d = %#x, want zero (stale WAL content leaked through)", segNo, i, b)
+			}
+		}
+	}
+}
+
+// TestRemoveOldSegmentsRecycleCapExceedsObsoleteCount confirms that
+// when MinWALSize requests more spares than there are obsolete
+// segments, every obsolete segment is recycled and none are
+// unlinked (no divide-by-zero or out-of-range panics on the small
+// side either).
+func TestRemoveOldSegmentsRecycleCapExceedsObsoleteCount(t *testing.T) {
+	walDir := filepath.Join(t.TempDir(), "pg_wal")
+	const segSize = 32
+	w, err := NewWriter(Config{WALDir: walDir, SegmentSize: segSize, MinWALSize: 10 * segSize})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	for i := 0; i < 3; i++ {
+		if _, _, err := w.Append(make([]byte, 24)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	keepLSN := uint64(2*segSize + 1)
+	removed, recycled, err := w.RemoveOldSegments(keepLSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removed != 0 {
+		t.Fatalf("removed = %d, want 0", removed)
+	}
+	if recycled != 2 {
+		t.Fatalf("recycled = %d, want 2", recycled)
+	}
+	got := segmentNames(t, walDir)
+	want := []string{formatSegmentName(2), formatSegmentName(3), formatSegmentName(4)}
+	if !equalStringSlices(got, want) {
+		t.Fatalf("post-recycle segments = %v, want %v", got, want)
 	}
 }
 

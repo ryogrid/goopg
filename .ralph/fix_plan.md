@@ -4947,9 +4947,45 @@ mirroring M0119's ledger `status` column.
       (the `internal/initdb` package test takes ~5 min, ran to completion);
       `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
       `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed transactions, all 3 pgbench workloads).
+      **WAL segment recycling landed (2026-07-09, next loop):**
+      `Writer.RemoveOldSegments` previously unlinked every obsolete segment;
+      upstream recycles some of them (rename into a future segment slot,
+      `RemoveXlogFile`/`InstallXLogFileSegment`) so a later `openSegment`
+      skips its own create+zero-fill+directory-fsync. New `Config.MinWALSize`
+      (wired from the previously-unread `min_wal_size` GUC via
+      `internal/initdb/open.go`'s `OpenOptions.WALMinSize`, read in
+      `cmd/goopg/main.go` the same way `max_wal_size` already is) caps how
+      many of the newest obsolete segments `state.removeOldSegments`
+      (`internal/wal/writer.go`) recycles via the new `recycleSegmentFile`
+      helper (rename + zero-fill + fsync, reusing `preallocateSegment`) vs
+      unlinks; `<= 0` (default) disables recycling, byte-identical to prior
+      behaviour. The recycle target is the lowest free segment slot at or
+      after the keep segment (mirrors upstream's `find_free` scan, never
+      clobbers a live/already-recycled segment). Diverges from upstream by
+      zero-filling the recycled segment (upstream leaves old content as-is,
+      relying on per-record CRC to bound recovery scans) because goopg's
+      `reader.go` graceful-EOS heuristic checks for an all-zero tail instead
+      — an unzeroed recycled segment's leftover well-formed old record would
+      pass CRC validation and be misread as live WAL. `SlotAwareRetainer.Retain`
+      (`internal/wal/retention.go`) threads the new `recycled` count through
+      to its summary log (`segments_recycled` alongside `segments_removed`).
+      Tests: `TestRemoveOldSegmentsRecyclesUpToMinWALSize` (confirms recycled
+      files are genuinely zero, not stale content — the load-bearing
+      correctness check), `TestRemoveOldSegmentsRecycleCapExceedsObsoleteCount`
+      (`internal/wal/retention_test.go`); pre-existing `TestRemoveOldSegments*`
+      tests (implicit `MinWALSize=0`) continue to pin the recycling-disabled
+      default. Design: `docs/design/0122-0009-wal-segment-recycling.md` (new,
+      cites upstream `xlog.c` source); `docs/design/README.md` index updated.
+      Deferral-ledger row filed: only the `min_wal_size` floor half of
+      upstream's `XLOGfileslop` sizing is implemented, not the
+      checkpoint-distance-estimate/`max_wal_size`-ceiling halves. Gates:
+      `go build ./...`/`go vet ./...` clean; `go test`/`go test -race` PASS
+      across `internal/wal`, `internal/mvcc`; `go test ./internal/initdb/...`
+      PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
       failed transactions, all 3 pgbench workloads). **Still open in this
-      bucket:** WAL segment recycling, `WALInsertLock` array (parallel
-      inserts), MultiXact WAL.
+      bucket:** `WALInsertLock` array (parallel inserts), MultiXact WAL.
 - [ ] **M0122-0010 — Concurrency: buffer pool & btree locking** (~17, LARGE).
       Lehman/Yao crab-walk, `splitMu` removal, storage-pool pin-count race,
       re-enable the `-race` gate. Gate: race detector mandatory.

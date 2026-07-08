@@ -18,9 +18,12 @@
 //   4. Unlink every segment whose final byte sits strictly before the
 //      segment containing the resulting keep-LSN.
 //
-// goopg's v0 retention follows the same shape, minus min_wal_size
-// preallocation (we delete instead of recycle-by-rename) and minus
-// archive-mode integration (no pg_wal/archive_status yet).
+// goopg's v0 retention follows the same shape, including min_wal_size
+// recycle-by-rename (Writer.RemoveOldSegments — see
+// docs/design/0122-0009-wal-segment-recycling.md), minus the
+// checkpoint-distance-estimate and max_wal_size halves of upstream's
+// XLOGfileslop sizing formula, and minus archive-mode integration (no
+// pg_wal/archive_status yet).
 //
 // See docs/design/0005-0004-slot-aware-wal-retention.md.
 
@@ -127,19 +130,21 @@ func (r *SlotAwareRetainer) Retain(checkpointLSN uint64) error {
 		}
 	}
 
-	// Step 4: unlink obsolete segments. The writer guarantees the
+	// Step 4: retire obsolete segments (unlink, or recycle-by-rename
+	// up to min_wal_size worth of spares). The writer guarantees the
 	// segment containing keepLSN is preserved.
-	removed, err := r.Writer.RemoveOldSegments(keepLSN)
+	removed, recycled, err := r.Writer.RemoveOldSegments(keepLSN)
 	if err != nil {
 		return fmt.Errorf("wal retention: remove old segments: %w", err)
 	}
 
-	if removed > 0 || len(invalidated) > 0 {
+	if removed > 0 || recycled > 0 || len(invalidated) > 0 {
 		r.logger().Info("wal retention: pruned",
 			"event", EventWALSegmentsRecycled,
 			"checkpoint_lsn", checkpointLSN,
 			"keep_lsn", keepLSN,
 			"segments_removed", removed,
+			"segments_recycled", recycled,
 			"slots_invalidated", invalidated,
 		)
 	}

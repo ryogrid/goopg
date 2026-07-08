@@ -155,6 +155,13 @@ type OpenOptions struct {
 	// docs/design/0007-0002-fdatasync-commit-path.md.
 	WALSyncMethod string
 
+	// WALMinSize forwards to wal.Config.MinWALSize (bytes), the floor
+	// on how many obsolete WAL segments RemoveOldSegments recycles
+	// (zero-fill + rename into a future slot) instead of unlinking.
+	// 0 disables recycling. Mirrors the `min_wal_size` GUC. See
+	// docs/design/0122-0009-wal-segment-recycling.md.
+	WALMinSize int64
+
 	// AIO* control the AIO engine the storage manager (and
 	// future heap-scan / checkpointer / WAL-writer callers)
 	// will use. Maps to the upstream-aligned `io_method`,
@@ -362,6 +369,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		SenderMemoryBuffer: opts.WALSenderMemoryBuffer,
 		WALBuffers:         opts.WALBuffers,
 		SyncMethod:         opts.WALSyncMethod,
+		MinWALSize:         opts.WALMinSize,
 		// M0101-0001: emit PG-compatible XLOG page headers so pg_waldump
 		// can parse the WAL segments. SystemID is embedded in every page
 		// header for cross-segment consistency checking.
