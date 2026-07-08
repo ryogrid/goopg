@@ -654,6 +654,20 @@ type BTree struct {
 	// rewriteLog records insertIntoBlock's page-rewrite checkpoints (see
 	// RewriteLogEvent); guarded by insertLogMu alongside insertLog.
 	rewriteLog []RewriteLogEvent
+	// DebugVerifyFastPathInserts (M-NIGHTLY AI-20260708-064334-001
+	// investigation aid, 7th loop): when true, every single-item fast-path
+	// insertItemSorted call (tryInsertNoSplit, insertIntoBlock's own
+	// no-split branch, tryInsertOnCachedRightmost -- deliberately NOT the
+	// split/dedup-rewrite path's insertItemSorted calls, which resetPageItems
+	// first and are already covered by RewriteLogEvent) snapshots
+	// pageItems() immediately before and after the call and verifies every
+	// pre-existing (key,TID) pair is still present afterward -- a plain
+	// insert only ever adds a line pointer, so any pre-existing entry that
+	// vanishes is captured as a FastPathViolation with the exact call site,
+	// block, and the item that was inserted alongside it. Off by default,
+	// zero cost when unset -- same pattern as DebugTraceInserts.
+	DebugVerifyFastPathInserts bool
+	fastPathViolations         []FastPathViolation
 	// logSeqNext is a single monotonic counter shared by insertLog and
 	// rewriteLog (instead of each using its own len()-based sequence) so a
 	// caller can compare Seq values ACROSS the two logs to establish
@@ -689,6 +703,97 @@ func (bt *BTree) traceInsert(blk storage.BlockNumber, lineIdx int, it item) {
 		Ptr:     it.ptr,
 	})
 	bt.insertLogMu.Unlock()
+}
+
+// FastPathViolation records a fast-path insertItemSorted call (see
+// BTree.DebugVerifyFastPathInserts) after which a (key,TID) pair that was
+// present on the page immediately BEFORE the call is no longer present
+// immediately after it -- despite a fast-path insert only ever adding a
+// line pointer, never removing one. M-NIGHTLY AI-20260708-064334-001, 7th
+// loop: localizes a lost entry to the exact fast-path call that dropped
+// it, complementing RewriteLogEvent's coverage of the split/dedup-rewrite
+// path (already cleared -- see the 6th loop's update in
+// verify_nbtree_realtree_test.go).
+type FastPathViolation struct {
+	Seq       uint64
+	Block     storage.BlockNumber
+	Site      string // "tryInsertNoSplit" | "insertIntoBlock-nosplit" | "tryInsertOnCachedRightmost"
+	Inserted  InsertLogRecord
+	PreCount  int
+	PostCount int
+	Missing   []InsertLogRecord
+}
+
+// fastPathItemIdent identifies an item by its (key,TID) pair for the
+// pre/post survivor-set comparison in insertItemSortedVerified.
+type fastPathItemIdent struct {
+	key string
+	ptr storage.ItemPointer
+}
+
+// insertItemSortedVerified wraps insertItemSorted with the pre/post
+// pageItems()-snapshot check described by FastPathViolation. A no-op
+// wrapper (falls straight through to insertItemSorted) when
+// DebugVerifyFastPathInserts is false.
+func (bt *BTree) insertItemSortedVerified(site string, blk storage.BlockNumber, p storage.Page, it item) int {
+	if !bt.DebugVerifyFastPathInserts {
+		return insertItemSorted(p, it)
+	}
+	pre, err := pageItems(p)
+	if err != nil {
+		panic(err)
+	}
+	preSnap := append([]item(nil), pre...)
+	lineIdx := insertItemSorted(p, it)
+	post, err := pageItems(p)
+	if err != nil {
+		panic(err)
+	}
+	bt.checkFastPathSurvivors(site, blk, it, preSnap, post)
+	return lineIdx
+}
+
+// checkFastPathSurvivors is the pre/post survivor-set comparison behind
+// insertItemSortedVerified, split out so it can be unit-tested and read
+// independently of the pinning/locking around it.
+func (bt *BTree) checkFastPathSurvivors(site string, blk storage.BlockNumber, it item, pre, post []item) {
+	postSet := make(map[fastPathItemIdent]int, len(post))
+	for _, x := range post {
+		postSet[fastPathItemIdent{string(x.key), x.ptr}]++
+	}
+	var missing []InsertLogRecord
+	for _, x := range pre {
+		id := fastPathItemIdent{string(x.key), x.ptr}
+		if postSet[id] > 0 {
+			postSet[id]--
+			continue
+		}
+		missing = append(missing, InsertLogRecord{Block: blk, Key: append([]byte(nil), x.key...), Ptr: x.ptr})
+	}
+	if len(missing) == 0 {
+		return
+	}
+	bt.insertLogMu.Lock()
+	defer bt.insertLogMu.Unlock()
+	seq := bt.logSeqNext
+	bt.logSeqNext++
+	bt.fastPathViolations = append(bt.fastPathViolations, FastPathViolation{
+		Seq:       seq,
+		Block:     blk,
+		Site:      site,
+		Inserted:  InsertLogRecord{Seq: seq, Block: blk, Key: append([]byte(nil), it.key...), Ptr: it.ptr},
+		PreCount:  len(pre),
+		PostCount: len(post),
+		Missing:   missing,
+	})
+}
+
+// FastPathViolations returns every recorded FastPathViolation, in recorded
+// order. Test/investigation helper for DebugVerifyFastPathInserts.
+func (bt *BTree) FastPathViolations() []FastPathViolation {
+	bt.insertLogMu.Lock()
+	defer bt.insertLogMu.Unlock()
+	return append([]FastPathViolation(nil), bt.fastPathViolations...)
 }
 
 // InsertLogRecord is one recorded insertItemSorted call, exported for
@@ -1607,7 +1712,7 @@ func (bt *BTree) tryInsertNoSplit(it item) error {
 		return errNeedsSplit
 	}
 
-	lineIdx := insertItemSorted(slot.Page(), it)
+	lineIdx := bt.insertItemSortedVerified("tryInsertNoSplit", leafBlk, slot.Page(), it)
 	bt.traceInsert(leafBlk, lineIdx, it)
 	if logIns := bt.pool.LogBtreeInsert(); logIns != nil {
 		itemBytes := it.marshal()
@@ -1637,7 +1742,7 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 	}
 
 	if pageHasSpaceFor(slot.Page(), it) {
-		lineIdx := insertItemSorted(slot.Page(), it)
+		lineIdx := bt.insertItemSortedVerified("insertIntoBlock-nosplit", blk, slot.Page(), it)
 		bt.traceInsert(blk, lineIdx, it)
 		// Logical-record path (M0002 redo-records): if the pool
 		// has a btree-insert hook configured, emit a small
@@ -2263,7 +2368,7 @@ func (bt *BTree) tryInsertOnCachedRightmost(blk storage.BlockNumber, it item) (b
 		bt.unpinW(slot)
 		return false, nil
 	}
-	lineIdx := insertItemSorted(slot.Page(), it)
+	lineIdx := bt.insertItemSortedVerified("tryInsertOnCachedRightmost", blk, slot.Page(), it)
 	bt.traceInsert(blk, lineIdx, it)
 	if logIns := bt.pool.LogBtreeInsert(); logIns != nil {
 		itemBytes := it.marshal()

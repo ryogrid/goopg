@@ -350,6 +350,12 @@ func buildRealTreeConcurrent(t *testing.T, n, writers, poolSlots int, keyRange i
 	// lost entry can be cross-referenced against its own write history, not
 	// just its absence from the final leaf walk.
 	bt.DebugTraceInserts = true
+	// M-NIGHTLY investigation aid (AI-20260708-064334-001, 7th loop): the
+	// 6th loop's RewriteLogEvent instrumentation proved the loss is NOT in
+	// the split/dedup-rewrite path -- some missing entries are touched
+	// only by plain fast-path insertItemSorted calls afterward. Verify
+	// every fast-path call's pre/post pageItems() survivor set directly.
+	bt.DebugVerifyFastPathInserts = true
 
 	var wg sync.WaitGroup
 	var failed atomic.Bool
@@ -574,8 +580,48 @@ func buildRealTreeConcurrent(t *testing.T, n, writers, poolSlots int, keyRange i
 // lost an entry, to find the exact consecutive pair of fast-path inserts
 // where a previously-present (key,TID) silently disappears. See
 // .ralph/deferral_ledger.md's 6th 2026-07-08 row for the full writeup.
+//
+// Update (7th loop, same day, AI-20260708-064334-001): executed the 6th
+// loop's exact next step. Built BTree.DebugVerifyFastPathInserts /
+// insertItemSortedVerified (btree.go) — wraps all 3 fast-path single-item
+// insertItemSorted call sites (tryInsertNoSplit, insertIntoBlock's own
+// no-split branch, tryInsertOnCachedRightmost) with a pageItems() snapshot
+// immediately before and immediately after each call, and asserts every
+// pre-existing (key,TID) pair the "before" snapshot held is still present
+// in the "after" snapshot (a plain fast-path insert only ever ADDS a line
+// pointer). **REFUTES this loop's own hypothesis too, with a clean
+// negative result**: across a full 200000-insert/64-writer run that still
+// lost 12 real entries, ZERO FastPathViolations were recorded — every
+// fast-path call, at every site, preserved every pre-existing entry.
+// Combined with the 6th loop's finding (pageItems() at rewrite time
+// already lacks the lost entry, so dedupConsolidate/appendSorted are also
+// clean), this pins the loss window down precisely: for one traced
+// example (key=47087, TID={3,1508}, inserted at blk=16 lineIdx=6
+// seq=216430), the LAST fast-path call on blk=16 to include this entry in
+// its "post" snapshot, and the eventual split's own pageItems() read
+// (which already lacked it), are separated by an UNPIN(blk=16) ...
+// re-PIN(blk=16) gap — the entry vanished while nobody held a pin on the
+// page, i.e. during (or across) a buffer-pool eviction. The existing
+// DebugValidateCleanEvictions/DebugTraceSlotEvents instrumentation
+// (loops 3-4) only checks the "clean" (skip-flush) eviction fast path and
+// found no mismatch on blk=16 in this run (its one hit this run was on an
+// unrelated block, 133) — the DIRTY flush-then-evict path
+// (evictVictim's `wasDirty` branch → flushSlot, bufpool.go ~1123) has
+// never been directly instrumented to compare "bytes about to be written
+// to disk" against "the last known-good in-memory pageItems() snapshot"
+// for the SAME block. Next step: instrument flushSlot (or evictVictim's
+// dirty branch immediately around it) to snapshot pageItems() on the page
+// being flushed right before the WriteAt call, keyed by block, and
+// compare against the most recent fast-path/rewrite "post" snapshot
+// recorded for that block (both logs already exist and share Seq
+// ordering) — a mismatch there would directly catch a stale/torn flush.
+// Also worth a quick audit pass: does claimVictim correctly refuse to
+// select a slot with a nonzero pin count as a victim (a pinned page being
+// evicted at all would itself be the bug, independent of flush
+// correctness)? See .ralph/deferral_ledger.md's 7th 2026-07-08 row for
+// the full writeup.
 func TestVerifyBtreeEngineSilentOnRealConcurrentContended(t *testing.T) {
-	t.Skip("known-failing: tracks M-NIGHTLY AI-20260708-064334-001 (btree lost-index-entry bug, mechanism not yet in the fast-path single-item insert); un-skip to confirm a fix")
+	t.Skip("known-failing: tracks M-NIGHTLY AI-20260708-064334-001 (btree lost-index-entry bug; fast-path insertItemSorted call sites now proven clean via DebugVerifyFastPathInserts -- loss window is an unpin/re-pin gap on the same block, likely the dirty flush-then-evict path in bufpool.go's evictVictim, not yet directly instrumented); un-skip to confirm a fix")
 	if testing.Short() {
 		t.Skip("skipping concurrent real-tree amcheck stress in short mode")
 	}
@@ -590,6 +636,23 @@ func TestVerifyBtreeEngineSilentOnRealConcurrentContended(t *testing.T) {
 		hit, read, dirtied, written, pool.DirtyVictimRate())
 	if got != n {
 		t.Fatalf("inserted %d, want %d", got, n)
+	}
+
+	// M-NIGHTLY investigation aid (AI-20260708-064334-001, 7th loop): any
+	// fast-path insertItemSorted call whose pre/post pageItems() survivor
+	// sets disagree is a direct, localized capture of the loss mechanism
+	// -- dump every one unconditionally before the leaf-entry diff below.
+	if violations := bt.FastPathViolations(); len(violations) > 0 {
+		t.Logf("FAST-PATH VIOLATIONS: %d recorded", len(violations))
+		for _, v := range violations {
+			t.Logf("  violation seq=%d blk=%d site=%s inserted=%s preCount=%d postCount=%d",
+				v.Seq, v.Block, v.Site, v.Inserted, v.PreCount, v.PostCount)
+			for _, m := range v.Missing {
+				t.Logf("    missing: %s", m)
+			}
+		}
+	} else {
+		t.Logf("FAST-PATH VIOLATIONS: none recorded (fast-path insertItemSorted calls all preserved pre-existing entries)")
 	}
 
 	// M-NIGHTLY investigation aid (AI-20260708-064334-001): diff the
@@ -672,6 +735,17 @@ func TestVerifyBtreeEngineSilentOnRealConcurrentContended(t *testing.T) {
 				if !foundRewrite {
 					t.Logf("  no rewrite event recorded for blk=%d at/after seq=%d (block never underwent a split/dedup-recovery rewrite after this insert -- loss did NOT happen via insertIntoBlock's rewrite path)",
 						last.Block, last.Seq)
+				}
+				// M-NIGHTLY investigation aid (AI-20260708-064334-001, 7th
+				// loop): does any recorded FastPathViolation directly name
+				// this TID as a casualty?
+				for _, v := range bt.FastPathViolations() {
+					for _, m := range v.Missing {
+						if m.Ptr == e.TID {
+							t.Logf("  => LOCALIZED: fast-path violation seq=%d site=%s blk=%d (triggered by inserting %s) dropped this exact TID",
+								v.Seq, v.Site, v.Block, v.Inserted)
+						}
+					}
 				}
 				// Ground truth: is the key/TID physically present on the
 				// block's CURRENT on-disk bytes right now, regardless of what

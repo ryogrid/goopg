@@ -905,6 +905,46 @@ every clean, green (build + pre-commit) checkpoint.
       a previously-present (key,TID) silently disappears. Do NOT re-open the
       split/rewrite path (conclusively cleared this loop) or re-run `-race`
       on the disjoint-key repro (already exhaustively clean).
+      2026-07-08 update (7th loop on the reopen; see today's 7th deferral
+      ledger row): executed the above next step. Built `BTree.
+      DebugVerifyFastPathInserts`/`insertItemSortedVerified`/
+      `checkFastPathSurvivors` (btree.go) — wraps all 3 fast-path
+      single-item `insertItemSorted` call sites (`tryInsertNoSplit`,
+      `insertIntoBlock`'s no-split branch, `tryInsertOnCachedRightmost`)
+      with a `pageItems()` snapshot immediately before/after each call,
+      recording a `FastPathViolation` if any pre-existing (key,TID) from
+      the "before" snapshot is missing from "after". Wired into
+      `TestVerifyBtreeEngineSilentOnRealConcurrentContended` (temporarily
+      un-skipped, re-skipped before commit). **REFUTES this loop's own
+      hypothesis too, with a clean negative result**: a full run still
+      lost 12 real entries but recorded ZERO `FastPathViolation`s — every
+      fast-path call at all 3 sites preserved every pre-existing entry.
+      Combined with the 6th loop's rewrite-path refutation, this pins the
+      loss window down precisely for a traced example: the entry survived
+      every fast-path call's own pre/post check up to blk=16's last
+      fast-path touch before its eventual split, then vanished in the gap
+      between that call's `unpinW` and the split-triggering call's
+      `pinW`+`pageItems()` read — i.e. while nobody held a pin on the
+      page, during (or across) a buffer-pool eviction.
+      `pool.DebugValidateCleanEvictions` (loops 3-4) fired once this run
+      but on an unrelated block, consistent with loop 4's "mismatch and
+      missing-entry count are uncorrelated" finding — pointing away from
+      the "clean" (skip-flush) eviction path specifically and toward the
+      DIRTY flush-then-evict path (`evictVictim`'s `wasDirty` branch →
+      `flushSlot`, bufpool.go ~1123-1185), which has never been directly
+      instrumented. Gates: `go build ./...` clean; `go vet
+      ./internal/amcheck/... ./internal/storage/... ./internal/access/
+      btree/...` clean; `go test ./internal/storage/... ./internal/access/
+      btree/... ./internal/amcheck/...` PASS (test re-skipped);
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33). Next step:
+      instrument `evictVictim`'s dirty branch (or `flushSlot` itself) to
+      snapshot `pageItems()` on the page immediately before the flush
+      write, keyed by block, and compare against the most recent fast-path
+      "post" snapshot already recorded for that block (all logs share
+      `logSeqNext` ordering) — a mismatch there directly catches a stale/
+      torn flush. First, quickly audit `claimVictim` (bufpool.go) to
+      confirm it actually excludes slots with `pinCount > 0` from victim
+      selection.
 
 - [x] race/internal/wal — race suite failed in package
       `github.com/goopg/goopg/internal/wal` (AI-20260707-000712-001; repro:
