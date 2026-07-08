@@ -346,6 +346,32 @@ func (o *ddlOp) execDropTablespace(s *parser.DropTablespaceStmt) error {
 	return nil
 }
 
+// resolveCreateTableTablespace resolves an optional `TABLESPACE name` clause
+// (parser.CreateTableStmt.Tablespace) to the pg_class.reltablespace value to
+// store: 0 when the clause is absent or names the database's default
+// tablespace (pg_default — goopg has no per-database tablespace override), the
+// resolved OID otherwise. Mirrors DefineRelation's tablespace handling
+// (tablecmds.c): an unknown name raises 42704 (ERRCODE_UNDEFINED_OBJECT,
+// get_tablespace_oid), and pg_global is rejected for ordinary relations with
+// 22023 (ERRCODE_INVALID_PARAMETER_VALUE, "only shared relations can be placed
+// in pg_global tablespace"). M0122-0007.
+func resolveCreateTableTablespace(ctx *Context, pos int, name string) (uint32, error) {
+	if name == "" {
+		return 0, nil
+	}
+	oid, found := ctx.Catalog.LookupTablespaceOID(name)
+	if !found {
+		return 0, &ExecError{Code: "42704", Pos: pos, Message: fmt.Sprintf("tablespace %q does not exist", name)}
+	}
+	if oid == catalog.GlobalTablespaceOID {
+		return 0, &ExecError{Code: "22023", Pos: pos, Message: "only shared relations can be placed in pg_global tablespace"}
+	}
+	if oid == catalog.DefaultTablespaceOID {
+		return 0, nil
+	}
+	return oid, nil
+}
+
 // execCreateCollation registers a CREATE COLLATION in the runtime
 // pg_collation registry so pg_dump's getCollations / dumpCollation round-trip
 // it. goopg does not use the collation for actual string ordering — only the
@@ -2653,10 +2679,15 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				Message: fmt.Sprintf("server %q does not exist", s.ForeignServer)}
 		}
 	}
+	tablespaceOID, err := resolveCreateTableTablespace(o.ctx, s.Pos(), s.Tablespace)
+	if err != nil {
+		return err
+	}
 	tbl, err := o.ctx.Catalog.CreateTable(s.Name, cols)
 	if err != nil {
 		return &ExecError{Code: "42P07", Pos: s.Pos(), Message: err.Error()}
 	}
+	tbl.Tablespace = tablespaceOID
 	if s.ForeignServer != "" {
 		tbl.ForeignServerName = s.ForeignServer
 		tbl.ForeignOptions = s.ForeignOptions
@@ -3636,10 +3667,15 @@ func (o *ddlOp) execCreateTableAs(s *parser.CreateTableStmt) error {
 			Name: colName, Type: catalog.Type{Name: strings.ToLower(typeName)},
 		}
 	}
+	tablespaceOID, err := resolveCreateTableTablespace(o.ctx, s.Pos(), s.Tablespace)
+	if err != nil {
+		return err
+	}
 	tbl, err := o.ctx.Catalog.CreateTable(s.Name, cols)
 	if err != nil {
 		return &ExecError{Code: "42P07", Pos: s.Pos(), Message: err.Error()}
 	}
+	tbl.Tablespace = tablespaceOID
 	// If the table was created without an explicit schema qualifier, record the
 	// resolved writable schema so TablesInSchema() can find it for DROP CASCADE.
 	// M0097-0022.
@@ -3757,10 +3793,15 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 			return err
 		}
 	}
+	tablespaceOID, err := resolveCreateTableTablespace(o.ctx, s.Pos(), s.Tablespace)
+	if err != nil {
+		return err
+	}
 	tbl, err := o.ctx.Catalog.CreateTable(s.Name, cols)
 	if err != nil {
 		return &ExecError{Code: "42P07", Pos: s.Pos(), Message: err.Error()}
 	}
+	tbl.Tablespace = tablespaceOID
 	// If the table was created without an explicit schema qualifier, record the
 	// resolved writable schema so TablesInSchema() can find it for DROP CASCADE.
 	// M0097-0022.

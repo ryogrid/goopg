@@ -4423,6 +4423,42 @@ mirroring M0119's ledger `status` column.
       clean stash of this loop's diff); `scripts/tpch-spotcheck.sh` PASS
       (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
       scripts/ralph-precommit-test.sh` PASS (0 failed txns, all 3 workloads).
+      **`CREATE TABLE ... TABLESPACE` — DONE (2026-07-08, later loop):** closed
+      the "tablespaces" resume point's first, catalog-metadata slice. The
+      clause was parsed and silently discarded at all 3 accepting sites (main
+      column-list path, empty-column-list/typed-table path, PARTITION OF child
+      path) — `CreateTableStmt.Tablespace` now captures the name at each, and
+      the executor resolves it via new `catalog.InMemory.LookupTablespaceOID`
+      (covers `pg_default`/`pg_global` + the runtime CREATE TABLESPACE
+      registry), storing the OID on new `catalog.Table.Tablespace` and
+      rendering it as `pg_class.reltablespace` (both sibling row builders).
+      Errors mirror `tablecmds.c`: unknown name → 42704, `pg_global` → 22023;
+      resolving to the database default normalizes to 0. Wired into
+      `execCreateTable`/`execCreatePartitionChild`/`execCreateTableAs`. Also
+      corrected a stale design-doc claim: `pg_tablespace` has actually been
+      query-visible (virtual overlay including runtime tablespaces) since
+      M0110-0001 — the "on-disk pg_tablespace heap visibility" deferral note
+      in `docs/design/0095-0003-in-place-tablespace.md` no longer describes
+      the current blocker for this feature. Tests:
+      `parser.TestParseCreateTableTablespace`; 6 new executor tests
+      (`internal/executor/create_table_tablespace_test.go`); both confirmed
+      non-vacuous via `git stash`. Design: `docs/design/0095-0003-in-place-
+      tablespace.md` new section; `docs/design/README.md` row updated.
+      **Deliberately NOT covered** (deferral ledger row appended today):
+      physical relocation of relation files into the tablespace's directory;
+      restart durability of `Table.Tablespace` (mirrors the pre-existing
+      `Table.Unlogged` gap — neither survives a reload from the pg_class
+      heap today); `CREATE INDEX ... TABLESPACE` / `ALTER TABLE/INDEX ... SET
+      TABLESPACE` (both still fully unparsed). Gates: `go build ./...` clean;
+      `go test ./internal/parser/... ./internal/catalog/...` PASS; `go test
+      ./internal/executor/...` PASS (minus the pre-existing, unrelated
+      `TestSeqScanFiresPrefetchesAcrossBlocks` hang); `go test
+      ./internal/initdb/...` PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+      scripts/ralph-precommit-test.sh` PASS (0 failed txns, all 3 workloads).
+      **Still open** (this bucket, ~7 remaining items): CREATE/DROP DATABASE
+      full DDL, REINDEX physical rebuild, tablespace physical relocation +
+      restart durability, CREATE INDEX/ALTER ... SET TABLESPACE.
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,
       encoding constraints during bootstrap/runtime.

@@ -481,7 +481,7 @@ func buildUserPGClassRow(cat catalog.Catalog, tbl *catalog.Table) Row {
 		NewIntDatum(bootstrapSuperuserOID),                         // relowner
 		NewIntDatum(pgHeapAccessMethodOID),                         // relam
 		NewIntDatum(relfilenode),                                   // relfilenode
-		NewIntDatum(0),                                             // reltablespace (default per-db tablespace)
+		NewIntDatum(int64(tbl.Tablespace)),                         // reltablespace (0 = default; explicit CREATE TABLE ... TABLESPACE otherwise, M0122-0007)
 		NewIntDatum(0),                                             // relpages
 		NewIntDatum(0),                                             // reltuples (float4 here; stored 0 == 0.0)
 		NewIntDatum(0),                                             // relallvisible

@@ -3343,15 +3343,15 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 		// PG's CREATE TABLE ... PARTITION OF grammar admits OptTableSpace (after
 		// OptWith / OnCommitOption); the partition-child arm previously omitted it,
 		// so a trailing TABLESPACE left unconsumed tokens and the whole statement
-		// failed with a syntax error. Mirror the non-partition path (line ~2248):
-		// accept and discard the name — goopg's storage manager does not honour
-		// tablespaces, so reltablespace stays 0 and pg_dump emits no TABLESPACE
-		// clause for the default tablespace, round-tripping the child unchanged.
+		// failed with a syntax error. Capture the name (M0122-0007 resolves and
+		// stores it on the executor side, the non-partition path's sibling).
 		// M0110-0001 (DU-002 slice 192).
 		if p.acceptKeyword(KwTablespace) {
-			if _, err := p.parseIdent(); err != nil {
+			tsTok, err := p.parseIdent()
+			if err != nil {
 				return nil, err
 			}
+			stmt.Tablespace = identText(tsTok)
 		}
 		return stmt, nil
 	}
@@ -3872,11 +3872,15 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 		stmt.With = opts
 	}
 	if p.acceptKeyword(KwTablespace) {
-		// Accept and discard for v0; the storage manager doesn't
-		// honour tablespaces yet.
-		if _, err := p.parseIdent(); err != nil {
+		// M0122-0007: capture the name; the executor resolves it against the
+		// tablespace registry and stores/renders reltablespace. goopg's storage
+		// manager still does not relocate the relation's physical files into
+		// the tablespace's directory (catalog-metadata fidelity only).
+		tsTok, err := p.parseIdent()
+		if err != nil {
 			return nil, err
 		}
+		stmt.Tablespace = identText(tsTok)
 	}
 	// ON COMMIT { PRESERVE ROWS | DELETE ROWS | DROP } for temp tables.
 	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwOn {
@@ -3931,7 +3935,9 @@ func (p *parser) consumeCreateTableSuffix(stmt *CreateTableStmt) {
 			_ = p.acceptIdentKeyword("oids")
 		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwTablespace:
 			p.advance()
-			_, _ = p.parseIdent()
+			if tsTok, err := p.parseIdent(); err == nil {
+				stmt.Tablespace = identText(tsTok)
+			}
 		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwOn:
 			// ON COMMIT { PRESERVE ROWS | DELETE ROWS | DROP } — temp table option.
 			p.advance()

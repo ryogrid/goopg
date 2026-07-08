@@ -506,6 +506,17 @@ type Table struct {
 	Unlogged bool
 	Temp     bool
 
+	// Tablespace is the pg_class.reltablespace value: 0 (InvalidOid) means the
+	// table lives in the database's default tablespace (pg_default), matching
+	// upstream's convention of storing 0 rather than the tablespace's own OID
+	// in that case (heap_create, RelationInitTableAccessMethod). A non-zero
+	// value is the OID of an explicit `CREATE TABLE ... TABLESPACE name`
+	// clause. goopg does not relocate the relation's physical storage into the
+	// tablespace's directory — this is catalog metadata only (dump/`\d+`
+	// fidelity), matching the pre-existing CREATE TABLESPACE scope decision.
+	// M0122-0007.
+	Tablespace uint32
+
 	// ReplicaIdentity is the single-char pg_class.relreplident code set by
 	// `ALTER TABLE ... REPLICA IDENTITY {DEFAULT|FULL|NOTHING|USING INDEX idx}`:
 	// 'd' (DEFAULT, the implicit value), 'f' (FULL), 'n' (NOTHING), 'i' (USING
@@ -1826,6 +1837,11 @@ type Catalog interface {
 	// DropTablespace removes a tablespace from the runtime registry, returning its
 	// OID and whether it was present. M0095-0003.
 	DropTablespace(name string) (uint32, bool)
+	// LookupTablespaceOID resolves a tablespace name (case-insensitive) to its
+	// OID, covering pg_default/pg_global plus the runtime registry. Used by
+	// CREATE TABLE ... TABLESPACE to validate and resolve the clause.
+	// M0122-0007.
+	LookupTablespaceOID(name string) (uint32, bool)
 	// RegisterCompatObject records a noop-created object (e.g. CREATE CONVERSION as noop).
 	// objType is "conversion", "operator", "rule", "text search configuration", etc.
 	RegisterCompatObject(objType, name string)
@@ -5784,28 +5800,28 @@ func (c *InMemory) registerSystemTables() {
 				relacl = c.relaclTextLockedSeq(t.OID)
 			}
 			out = append(out, []string{
-				strconv.Itoa(int(t.OID)),     // 0:  oid
-				t.Name,                       // 1:  relname
-				strconv.Itoa(int(nsOID)),     // 2:  relnamespace
-				"0",                          // 3:  reltype
-				relOfType,                    // 4:  reloftype (typed table `OF type`; 0 otherwise, DU-002 slice 374)
-				"10",                         // 5:  relowner (bootstrap superuser)
-				relam,                        // 6:  relam (heap=2; 0 for sequences)
-				strconv.Itoa(int(t.OID)),     // 7:  relfilenode
-				"0",                          // 8:  reltablespace
-				relpages,                     // 9:  relpages
-				reltuples,                    // 10: reltuples
-				"0",                          // 11: relallvisible
-				"0",                          // 12: relallfrozen
-				reltoastrelid,                // 13: reltoastrelid
-				hasIdx,                       // 14: relhasindex
-				"f",                          // 15: relisshared
-				relpers,                      // 16: relpersistence
-				relkind,                      // 17: relkind
-				strconv.Itoa(len(t.Columns)), // 18: relnatts
-				strconv.Itoa(relchecks),      // 19: relchecks
-				"f",                          // 20: relhasrules
-				relHasTriggers,               // 21: relhastriggers
+				strconv.Itoa(int(t.OID)),        // 0:  oid
+				t.Name,                          // 1:  relname
+				strconv.Itoa(int(nsOID)),        // 2:  relnamespace
+				"0",                             // 3:  reltype
+				relOfType,                       // 4:  reloftype (typed table `OF type`; 0 otherwise, DU-002 slice 374)
+				"10",                            // 5:  relowner (bootstrap superuser)
+				relam,                           // 6:  relam (heap=2; 0 for sequences)
+				strconv.Itoa(int(t.OID)),        // 7:  relfilenode
+				strconv.Itoa(int(t.Tablespace)), // 8:  reltablespace (0 = default; explicit CREATE TABLE ... TABLESPACE otherwise, M0122-0007)
+				relpages,                        // 9:  relpages
+				reltuples,                       // 10: reltuples
+				"0",                             // 11: relallvisible
+				"0",                             // 12: relallfrozen
+				reltoastrelid,                   // 13: reltoastrelid
+				hasIdx,                          // 14: relhasindex
+				"f",                             // 15: relisshared
+				relpers,                         // 16: relpersistence
+				relkind,                         // 17: relkind
+				strconv.Itoa(len(t.Columns)),    // 18: relnatts
+				strconv.Itoa(relchecks),         // 19: relchecks
+				"f",                             // 20: relhasrules
+				relHasTriggers,                  // 21: relhastriggers
 				func() string {
 					if len(c.partitionChildren[t.OID]) > 0 {
 						return "t"
@@ -12567,6 +12583,39 @@ func (c *InMemory) DropTablespace(name string) (uint32, bool) {
 		return 0, false
 	}
 	delete(c.tablespaces, lc)
+	return ts.oid, true
+}
+
+// DefaultTablespaceOID / GlobalTablespaceOID are the bootstrap pg_tablespace
+// OIDs (pg_tablespace.dat), matching upstream's DEFAULTTABLESPACE_OID /
+// GLOBALTABLESPACE_OID. Every database's default tablespace is pg_default —
+// goopg has no per-database tablespace override (dattablespace is always
+// hardcoded to 1663, see pg_database_bootstrap.go) — so a table's explicit
+// `TABLESPACE pg_default` always normalizes to reltablespace=0, mirroring
+// heap_create's `reltablespaceOid == MyDatabaseTableSpace ? InvalidOid : ...`.
+const (
+	DefaultTablespaceOID uint32 = 1663
+	GlobalTablespaceOID  uint32 = 1664
+)
+
+// LookupTablespaceOID resolves a tablespace name (case-insensitive) to its
+// OID, covering the two bootstrap tablespaces (pg_default/pg_global) plus any
+// runtime-registered ones (CREATE TABLESPACE). Mirrors get_tablespace_oid
+// (tablespace.c). M0122-0007 (CREATE TABLE ... TABLESPACE).
+func (c *InMemory) LookupTablespaceOID(name string) (uint32, bool) {
+	lc := strings.ToLower(name)
+	switch lc {
+	case "pg_default":
+		return DefaultTablespaceOID, true
+	case "pg_global":
+		return GlobalTablespaceOID, true
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	ts, ok := c.tablespaces[lc]
+	if !ok {
+		return 0, false
+	}
 	return ts.oid, true
 }
 

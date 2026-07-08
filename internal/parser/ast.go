@@ -1435,6 +1435,10 @@ type CreateTableStmt struct {
 	// the on-disk pg_foreign_table.ftoptions text[] representation pg_dump's
 	// getTables reads via pg_options_to_table. DU-002 slice 417.
 	ForeignOptions []string
+	// Tablespace holds the name from an optional `TABLESPACE name` clause.
+	// Empty means unspecified (the table lands in the database's default
+	// tablespace). M0122-0007.
+	Tablespace string
 }
 
 func (s *CreateTableStmt) Pos() int  { return s.pos }

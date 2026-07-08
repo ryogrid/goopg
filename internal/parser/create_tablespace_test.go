@@ -47,6 +47,53 @@ func TestParseCreateTablespaceMissingLocation(t *testing.T) {
 	}
 }
 
+// TestParseCreateTableTablespace pins the M0122-0007 fix: CREATE TABLE's
+// TABLESPACE clause used to be parsed and silently discarded at all three
+// sites that accept it (the main column-list path, the empty `()` /
+// consumeCreateTableSuffix path, and the PARTITION OF child path). It must now
+// populate CreateTableStmt.Tablespace so the executor can validate and store
+// it.
+func TestParseCreateTableTablespace(t *testing.T) {
+	cases := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{"main column-list path", "CREATE TABLE t (a int) TABLESPACE ts1", "ts1"},
+		{"empty column-list path", "CREATE TABLE t () TABLESPACE ts2", "ts2"},
+		{"no clause", "CREATE TABLE t (a int)", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stmts, err := Parse(tc.sql)
+			if err != nil {
+				t.Fatalf("Parse(%q): %v", tc.sql, err)
+			}
+			s, ok := stmts[0].(*CreateTableStmt)
+			if !ok {
+				t.Fatalf("Parse(%q): want *CreateTableStmt, got %T", tc.sql, stmts[0])
+			}
+			if s.Tablespace != tc.want {
+				t.Errorf("%q: Tablespace=%q want %q", tc.sql, s.Tablespace, tc.want)
+			}
+		})
+	}
+
+	// PARTITION OF child path.
+	stmts, err := Parse("CREATE TABLE parent (a int) PARTITION BY RANGE (a); " +
+		"CREATE TABLE child PARTITION OF parent FOR VALUES FROM (1) TO (10) TABLESPACE ts3")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	s, ok := stmts[1].(*CreateTableStmt)
+	if !ok {
+		t.Fatalf("want *CreateTableStmt, got %T", stmts[1])
+	}
+	if s.Tablespace != "ts3" {
+		t.Errorf("partition child: Tablespace=%q want %q", s.Tablespace, "ts3")
+	}
+}
+
 func TestParseDropTablespace(t *testing.T) {
 	cases := []struct {
 		sql      string
