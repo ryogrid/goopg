@@ -1123,17 +1123,19 @@ func decodePGBool(v byte, field string) (bool, error) {
 
 // PGIndexRow holds the fields from pg_index needed for catalog recovery.
 type PGIndexRow struct {
-	IndexRelid          uint32  // indexrelid
-	IndRelid            uint32  // indrelid (owning table OID)
-	IndNAtts            int16   // indnatts (key columns + INCLUDE columns)
-	IndNKeyAtts         int16   // indnkeyatts (key columns only; the rest of IndKey is INCLUDE columns)
-	IndKey              []int16 // attnum values: key columns first, then INCLUDE columns
-	IndIsUnique         bool    // indisunique
-	IndNullsNotDistinct bool    // indnullsnotdistinct
-	IndIsPrimary        bool    // indisprimary
-	IndOption           []int16 // per-key ASC/DESC + NULLS FIRST/LAST bitmask (INDOPTION_DESC=0x1, INDOPTION_NULLS_FIRST=0x2)
-	IndHasPred          bool    // true if indpred is non-NULL (partial index)
-	IndPred             string  // indpred's WHERE-clause SQL text (goopg stores pg_node_tree columns as SQL text; see column_defaults_recovery.go)
+	IndexRelid          uint32   // indexrelid
+	IndRelid            uint32   // indrelid (owning table OID)
+	IndNAtts            int16    // indnatts (key columns + INCLUDE columns)
+	IndNKeyAtts         int16    // indnkeyatts (key columns only; the rest of IndKey is INCLUDE columns)
+	IndKey              []int16  // attnum values: key columns first, then INCLUDE columns
+	IndIsUnique         bool     // indisunique
+	IndNullsNotDistinct bool     // indnullsnotdistinct
+	IndIsPrimary        bool     // indisprimary
+	IndCollation        []uint32 // per-key-column indcollation OIDs (M0122-0006 follow-up 3)
+	IndClass            []uint32 // per-key-column indclass (opclass) OIDs (M0122-0006 follow-up 3)
+	IndOption           []int16  // per-key ASC/DESC + NULLS FIRST/LAST bitmask (INDOPTION_DESC=0x1, INDOPTION_NULLS_FIRST=0x2)
+	IndHasPred          bool     // true if indpred is non-NULL (partial index)
+	IndPred             string   // indpred's WHERE-clause SQL text (goopg stores pg_node_tree columns as SQL text; see column_defaults_recovery.go)
 }
 
 const (
@@ -1192,21 +1194,29 @@ func DecodePGIndexPhysicalRow(data []byte) (PGIndexRow, error) {
 
 	// indcollation, indclass, and indoption follow indkey as three more
 	// 4-byte-aligned varlena columns (oidvector, oidvector, int2vector —
-	// see pgIndexColumnsPG18). Walk past the first two (their content
-	// isn't needed here) to reach indoption, which carries the per-key
-	// ASC/DESC + NULLS FIRST/LAST ordering (INDOPTION_DESC=0x1,
-	// INDOPTION_NULLS_FIRST=0x2) — without decoding it, an index's
-	// declared column ordering silently reverted to all-ascending on
-	// every restart (M0122-0006). Any decode failure below is treated as
-	// "no indoption available" rather than a hard error, since the fields
-	// already decoded above remain valid on their own.
+	// see pgIndexColumnsPG18). indcollation/indclass carry the per-key
+	// collation/opclass OIDs (M0122-0006 follow-up 3 — previously skipped
+	// over here, so a checkpointed restart always lost
+	// idx.ColOpClasses/ColCollations even though the heap row carried the
+	// real OIDs). indoption carries the per-key ASC/DESC + NULLS
+	// FIRST/LAST ordering (INDOPTION_DESC=0x1, INDOPTION_NULLS_FIRST=0x2)
+	// — without decoding it, an index's declared column ordering silently
+	// reverted to all-ascending on every restart (M0122-0006). Any decode
+	// failure below is treated as "field unavailable" rather than a hard
+	// error, since the fields already decoded above remain valid on their
+	// own.
 	off := pgIndexAlign4(pgIndexOffIndKey + needed)
-	for i := 0; i < 2; i++ { // indcollation, indclass
-		total, ok := pgVarlenaTotalLen(data, off)
-		if !ok {
-			return r, nil
-		}
-		off = pgIndexAlign4(off + total)
+	if collOIDs, newOff, ok := decodePGIndexOIDVector(data, off); ok {
+		r.IndCollation = collOIDs
+		off = newOff
+	} else {
+		return r, nil
+	}
+	if classOIDs, newOff, ok := decodePGIndexOIDVector(data, off); ok {
+		r.IndClass = classOIDs
+		off = newOff
+	} else {
+		return r, nil
 	}
 	if len(data) < off+vectorHdrSize {
 		return r, nil
@@ -1286,19 +1296,35 @@ func pgIndexAlign4(off int) int {
 	return (off + 3) &^ 3
 }
 
-// pgVarlenaTotalLen reads a 4-byte-uncompressed varlena header's total
-// byte length (vl_len_>>2) at data[off:], returning ok=false if the
-// header is out of range or the header itself doesn't fit.
-func pgVarlenaTotalLen(data []byte, off int) (int, bool) {
-	if off < 0 || len(data) < off+4 {
-		return 0, false
+// decodePGIndexOIDVector decodes an oidvector varlena (24-byte header —
+// vl_len_/ndim/dataoff/elemtype/dims[0]/lbound[0] — mirrors the int2vector
+// header decoded for indkey/indoption above, but with 4-byte OID elements
+// instead of 2-byte int2 elements; see pgOIDVectorBytes, the encode-side
+// sibling in internal/executor/pg18_user_catalog_rows.go) at data[off:].
+// Returns the decoded OIDs and the 4-byte-aligned offset immediately past
+// this column, or ok=false if the header/data doesn't fit. M0122-0006
+// follow-up 3 (indcollation/indclass decode).
+func decodePGIndexOIDVector(data []byte, off int) ([]uint32, int, bool) {
+	const vectorHdrSize = 24
+	if off < 0 || len(data) < off+vectorHdrSize {
+		return nil, off, false
 	}
-	total := int(binary.LittleEndian.Uint32(data[off:off+4]) >> 2)
-	if total < 4 || off+total > len(data) {
-		return 0, false
+	blob := data[off:]
+	n := int(binary.LittleEndian.Uint32(blob[16:20])) // dims[0]
+	if n < 0 || n > 1024 {
+		return nil, off, false
 	}
-	return total, true
+	needed := vectorHdrSize + 4*n
+	if len(blob) < needed {
+		return nil, off, false
+	}
+	oids := make([]uint32, n)
+	for i := range oids {
+		oids[i] = binary.LittleEndian.Uint32(blob[vectorHdrSize+4*i : vectorHdrSize+4*i+4])
+	}
+	return oids, pgIndexAlign4(off + needed), true
 }
+
 
 // PGStatisticRow holds the fields from pg_statistic needed for in-memory
 // planner statistics reconstruction.

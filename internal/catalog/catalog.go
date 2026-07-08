@@ -2031,6 +2031,15 @@ type Catalog interface {
 	// live/heap-row sharing reason as ResolveIndexColumnOpclassOID.
 	// M0122-0007 follow-up.
 	ResolveIndexColumnCollationOID(explicitName string) uint32
+	// ResolveIndexColumnOpclassName reverse-resolves a decoded indclass OID
+	// back to a ColOpClasses[i] name string, for checkpointed-restart
+	// recovery (loadUserIndexesFromHeap). M0122-0006 follow-up 3.
+	ResolveIndexColumnOpclassName(oid uint32, typeName string, methodOID uint32) string
+	// ResolveIndexColumnCollationName reverse-resolves a decoded
+	// indcollation OID back to a ColCollations[i] name string, the
+	// collation-side sibling of ResolveIndexColumnOpclassName. M0122-0006
+	// follow-up 3.
+	ResolveIndexColumnCollationName(oid uint32) string
 }
 
 // InMemory is the v0 implementation: a sync.RWMutex-guarded map.
@@ -18348,6 +18357,83 @@ func (c *InMemory) ResolveIndexColumnCollationOID(explicitName string) uint32 {
 		return oid
 	}
 	return 0
+}
+
+// builtinCollationNameByOID is the reverse of builtinCollationOIDByName,
+// needed to reconstruct a ColCollations[i] name string from a heap-decoded
+// indcollation OID (loadUserIndexesFromHeap, checkpointed-restart recovery —
+// M0122-0006 follow-up 3). Only a handful of collations are BKI-pinned, so a
+// plain switch mirrors the forward lookup rather than adding a second map.
+func builtinCollationNameByOID(oid uint32) (string, bool) {
+	switch oid {
+	case 100:
+		return "default", true
+	case 950:
+		return "C", true
+	case 951:
+		return "POSIX", true
+	case 962:
+		return "ucs_basic", true
+	case 963:
+		return "unicode", true
+	case 811:
+		return "pg_c_utf8", true
+	case 6411:
+		return "pg_unicode_fast", true
+	}
+	return "", false
+}
+
+// ResolveIndexColumnOpclassName reverse-resolves a pg_opclass OID (as decoded
+// from a heap-persisted indclass by DecodePGIndexPhysicalRow) back to the
+// ColOpClasses[i] name string loadUserIndexesFromHeap needs to restore an
+// index across a *checkpointed* restart — the WAL-replay crash-recovery path
+// never needs this since wal.CreateIndexPayload already carries the name
+// strings directly (see the M0122-0006 follow-up 3 ledger entry). Returns ""
+// when oid equals the column type's own implicit default opclass, mirroring
+// how ResolveIndexColumnOpclassOID/buildUserPGIndexRow never record an
+// explicit name for that case (so an empty string round-trips exactly) and
+// matching real PostgreSQL's own indclass-vs-default comparison in
+// ruleutils.c's pg_get_indexdef_worker. M0122-0006 follow-up 3.
+func (c *InMemory) ResolveIndexColumnOpclassName(oid uint32, typeName string, methodOID uint32) string {
+	if oid == 0 {
+		return ""
+	}
+	if defName, ok := defaultColumnOpclassNameForType(typeName); ok && builtinColumnOpclassOIDs[defName] == oid {
+		return ""
+	}
+	for _, uoc := range c.ListUserOperatorClasses() {
+		if uoc.Method == methodOID && uoc.OID == oid {
+			return uoc.Name
+		}
+	}
+	for name, candidateOID := range builtinColumnOpclassOIDs {
+		if candidateOID == oid {
+			return name
+		}
+	}
+	return ""
+}
+
+// ResolveIndexColumnCollationName reverse-resolves a pg_collation OID (as
+// decoded from a heap-persisted indcollation) back to the ColCollations[i]
+// COLLATE-name string — the collation-side sibling of
+// ResolveIndexColumnOpclassName. Returns "" for oid==0, since
+// ResolveIndexColumnCollationOID only ever writes a nonzero indcollation for
+// an explicit COLLATE clause (see its own doc comment). M0122-0006 follow-up 3.
+func (c *InMemory) ResolveIndexColumnCollationName(oid uint32) string {
+	if oid == 0 {
+		return ""
+	}
+	for _, uc := range c.ListUserCollations() {
+		if uc.OID == oid {
+			return uc.Name
+		}
+	}
+	if name, ok := builtinCollationNameByOID(oid); ok {
+		return name
+	}
+	return ""
 }
 
 // defaultUserBtreeOpclassForSubtype mirrors GetDefaultOpClass's (postgres/

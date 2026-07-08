@@ -2917,6 +2917,8 @@ func loadUserIndexesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *
 		indRelid         uint32
 		indKey           []int16
 		indNKeyAtts      int16
+		indCollation     []uint32
+		indClass         []uint32
 		indOption        []int16
 		isUnique         bool
 		isPrimary        bool
@@ -2955,6 +2957,8 @@ func loadUserIndexesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *
 					indRelid:         row.IndRelid,
 					indKey:           row.IndKey,
 					indNKeyAtts:      row.IndNKeyAtts,
+					indCollation:     row.IndCollation,
+					indClass:         row.IndClass,
 					indOption:        row.IndOption,
 					isUnique:         row.IndIsUnique,
 					isPrimary:        row.IndIsPrimary,
@@ -2990,17 +2994,39 @@ func loadUserIndexesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *
 		colNames := make([]string, 0, nKeyAtts)
 		colDescending := make([]bool, 0, nKeyAtts)
 		colNullsFirst := make([]bool, 0, nKeyAtts)
+		// ColOpClasses/ColCollations: reverse-resolve each key column's
+		// decoded indclass/indcollation OID back to a name string via the
+		// same catalog.Catalog resolvers the live pg_index VirtualRows
+		// renderer and buildUserPGIndexRow's write side share (M0122-0006
+		// follow-up 3 — previously always nil here, so a checkpointed
+		// restart silently reverted every index's opclass/collation to the
+		// column type's plain default). btreeMethodOID is fixed since this
+		// driver only ever recovers "btree" indexes (see the
+		// RegisterIndexDuringRecovery call below).
+		btreeMethodOID := catalog.AccessMethodOIDByName("btree")
+		colOpClasses := make([]string, 0, nKeyAtts)
+		colCollations := make([]string, 0, nKeyAtts)
 		for i, attnum := range pgIdx.indKey[:nKeyAtts] {
 			if attnum <= 0 || int(attnum) > len(tbl.Columns) {
 				continue
 			}
-			colNames = append(colNames, tbl.Columns[attnum-1].Name)
+			col := tbl.Columns[attnum-1]
+			colNames = append(colNames, col.Name)
 			var opt int16
 			if i < len(pgIdx.indOption) {
 				opt = pgIdx.indOption[i]
 			}
 			colDescending = append(colDescending, opt&0x0001 != 0)
 			colNullsFirst = append(colNullsFirst, opt&0x0002 != 0)
+			var classOID, collOID uint32
+			if i < len(pgIdx.indClass) {
+				classOID = pgIdx.indClass[i]
+			}
+			if i < len(pgIdx.indCollation) {
+				collOID = pgIdx.indCollation[i]
+			}
+			colOpClasses = append(colOpClasses, cat.ResolveIndexColumnOpclassName(classOID, col.Type.Name, btreeMethodOID))
+			colCollations = append(colCollations, cat.ResolveIndexColumnCollationName(collOID))
 		}
 		if len(colNames) == 0 {
 			continue
@@ -3023,17 +3049,12 @@ func loadUserIndexesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *
 			// its schema.
 			schema = name
 		}
-		// ColOpClasses/ColCollations are not yet decoded from the pg_index heap
-		// row here (indclass/indcollation only ever carry zero OIDs — real
-		// per-column opclass/collation OID resolution is still unimplemented,
-		// even on the live/non-restart path) — a known, separate residual (see
-		// .ralph/deferral_ledger.md), so this heap-recovery driver always
-		// passes their zero values. HasPredicate/PredicateString/
-		// IncludeColumns/NullsNotDistinct ARE now decoded (M0122-0006
-		// follow-up 2 of 2). Fillfactor/DeduplicateItems are restored via the
-		// separate ApplyIndexReloptions call just below (reads
-		// pg_class.reloptions text), not through this call.
-		cat.RegisterIndexDuringRecovery(schema, ir.name, pgIdx.indRelid, colNames, pgIdx.isUnique, "btree", pgIdx.isPrimary, ir.oid, colDescending, colNullsFirst, pgIdx.hasPred, pgIdx.predText, includeColNames, nil, nil, 0, nil, pgIdx.nullsNotDistinct)
+		// ColOpClasses/ColCollations are now reverse-resolved above from the
+		// heap-decoded indclass/indcollation OIDs (M0122-0006 follow-up 3).
+		// Fillfactor/DeduplicateItems are restored via the separate
+		// ApplyIndexReloptions call just below (reads pg_class.reloptions
+		// text), not through this call.
+		cat.RegisterIndexDuringRecovery(schema, ir.name, pgIdx.indRelid, colNames, pgIdx.isUnique, "btree", pgIdx.isPrimary, ir.oid, colDescending, colNullsFirst, pgIdx.hasPred, pgIdx.predText, includeColNames, colOpClasses, colCollations, 0, nil, pgIdx.nullsNotDistinct)
 		// Restore fillfactor/deduplicate_items/fastupdate/gin_pending_list_limit/
 		// pages_per_range/autosummarize from the heap-persisted pg_class row —
 		// without this they silently revert to defaults across every restart
