@@ -675,6 +675,35 @@ func (r *relFile) WriteAt(p []byte, off int64) (int, error) {
 	return r.f.WriteAt(p, off)
 }
 
+// PrepareWrite implements aio.ChecksumFile (structurally — storage
+// deliberately does not import internal/aio, see the AIOEngine
+// comment above). The io_uring method's raw-fd write path submits
+// straight to the kernel by file descriptor, bypassing WriteAt
+// entirely; without this hook a checksummed cluster would write
+// blocks through io_uring with a stale/garbage pd_checksum that
+// every later checksum-verifying read (including the ordinary
+// synchronous ReadAt path) would then reject as corrupt. Mirrors
+// WriteAt's own off%BlockSize-aligned, full-block-length gate.
+func (r *relFile) PrepareWrite(buf []byte, off int64) []byte {
+	if r.checksums && len(buf) == BlockSize && off%BlockSize == 0 {
+		return r.checksummedForWrite(BlockNumber(off/BlockSize), buf)
+	}
+	return buf
+}
+
+// VerifyRead implements aio.ChecksumFile, the read-side twin of
+// PrepareWrite: the io_uring method's raw-fd read path bypasses
+// ReadAt entirely, so without this hook a checksummed cluster
+// would silently skip verification (and OnChecksumFailure
+// reporting) for every read issued that way. Mirrors ReadAt's own
+// off%BlockSize-aligned, full-block-length gate.
+func (r *relFile) VerifyRead(buf []byte, off int64) error {
+	if r.checksums && len(buf) == BlockSize && off%BlockSize == 0 {
+		return r.verifyOnRead(BlockNumber(off/BlockSize), buf)
+	}
+	return nil
+}
+
 // Fd exposes the underlying *os.File's kernel descriptor so an
 // AIO method that talks to the kernel directly (notably
 // io_uring) can submit ops by fd. The mutex above is the

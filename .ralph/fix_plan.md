@@ -1320,6 +1320,69 @@ every clean, green (build + pre-commit) checkpoint.
       throughput). Verify with a new targeted concurrency test exercising a
       real AIOEngine (internal/aio's MethodWorker or MethodSync) alongside
       concurrent synchronous smgr calls to the same block.
+      2026-07-08 update (14th loop, continuation): investigating this item
+      surfaced a SECOND, more concrete bug in the same raw-fd bypass and
+      that half is now **RESOLVED**. The MethodWorker/MethodSync AIO
+      methods were never actually part of the bypass — `runOp`
+      (internal/aio/aio.go) calls `op.File.ReadAt`/`WriteAt`, and
+      `relFile.ReadAt`/`WriteAt` (internal/storage/smgr.go) already take
+      `relFile.mu` for the full I/O plus apply checksum stamping/
+      verification — so only `methodIOUring`'s raw-fd path (`Submit`
+      type-asserting `op.File` as `fdHaver` and submitting straight by
+      kernel fd, internal/aio/method_iouring_linux.go) was ever a real
+      bypass. Confirmed a live, concrete, checksum-specific consequence of
+      that bypass: on a checksummed cluster (`data_checksum_version` >= 1)
+      with `io_method=io_uring`, every AIO write silently persisted a
+      stale/garbage `pd_checksum` (relFile.WriteAt's stamping never ran)
+      and every AIO read silently skipped verification — worse, a
+      subsequent *synchronous* read of a block written this way would
+      then report a false-positive `*ChecksumError` for a page that was
+      never actually corrupted. Fixed via a new optional `aio.File`
+      extension, `ChecksumFile{PrepareWrite(buf,off) []byte,
+      VerifyRead(buf,off) error}` (internal/aio/aio.go):
+      `methodIOUring.Submit` calls `PrepareWrite` before building the SQE
+      for a write (submitting the stamped copy, pinned alive via
+      `pendingOp.buf` until the kernel completes it) and `completeOne`
+      calls `VerifyRead` after a successful read, mapping a mismatch onto
+      the `Result.Err` `Wait()` returns. `storage.relFile.PrepareWrite`/
+      `VerifyRead` (internal/storage/smgr.go) implement the interface
+      structurally (storage still does not import internal/aio) by
+      delegating to the same `checksummedForWrite`/`verifyOnRead` helpers
+      `WriteAt`/`ReadAt` already use, so the two paths cannot drift.
+      Verified non-vacuous: reverted just the Submit/completeOne wiring
+      and reran the new test — fails (0 PrepareWrite calls, unstamped
+      bytes on disk); with the fix, passes. New tests:
+      `TestEngineIOUringChecksumFileHooks` (internal/aio, linux-only,
+      `t.Skip`s on fallback like the file's other io_uring tests) and
+      `TestChecksumRelFilePrepareWriteVerifyRead` (internal/storage,
+      exercises the real `PageSetChecksumCopy`/`VerifyPage` production
+      functions). Gates: `go build ./...` / `go vet ./...` clean;
+      `go test ./internal/aio/... ./internal/storage/... ./internal/initdb/...`
+      PASS; `go test -race -run TestEngineIOUring ./internal/aio/...` PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed txns, all 3 workloads). Design doc updated:
+      docs/design/0009-0006-aio-io-uring.md (new "Checksum bypass (fixed)
+      and the still-open per-block ordering gap" section) +
+      docs/design/README.md's 0009-0006 row.
+      **What remains open** (this task stays unchecked): the ORIGINAL
+      per-(rel,block) same-tag ordering concern this item was filed for —
+      a concurrent synchronous readBlock/writeBlock/extend (or another
+      io_uring op) on the SAME block of the SAME relFile is still not
+      serialized against an in-flight io_uring raw-fd op. Re-examined
+      reachability via the one production call site (`Pool.flushBatch`'s
+      `WriteBlockAIO`, internal/storage/bufpool.go): per the 2026-07-08
+      M-NIGHTLY deferral-ledger row's hand-trace, `Slot.contentMu`'s
+      RWMutex already forces any evictor/reloader of the same slot to
+      wait for the flush's real `Wait()` before touching `s.page`, so no
+      concrete corruption path is known there today — this downgrades
+      urgency (latent-risk, not confirmed-reachable) but does not close
+      the gap at the smgr/aio layer itself, which is correctness-load-
+      bearing the moment any OTHER caller starts using WriteBlockAIO/
+      PrefetchBlock outside contentMu's protection. Next step unchanged:
+      the per-(rel,block) in-flight-AIO registry design described above,
+      consulted by readBlock/writeBlock/WriteBlockAIO/PrefetchBlock
+      instead of a blanket per-file mutex.
 
 - [x] race/internal/wal — race suite failed in package
       `github.com/goopg/goopg/internal/wal` (AI-20260707-000712-001; repro:

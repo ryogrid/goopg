@@ -212,10 +212,17 @@ type methodIOUring struct {
 // needs to finish it. We keep len(buf) here because the kernel
 // reports a byte count (cqe.Res) but completing an EOF read
 // also needs the original buffer length to detect truncation.
+// buf is the slice actually submitted to the kernel (op.Buffer
+// for reads; op.File's ChecksumFile.PrepareWrite result for
+// writes when the File implements it, else op.Buffer) — kept
+// here so the reaper has a live reference for the duration of
+// the kernel op and so a read completion can be verified against
+// the exact bytes that landed in it.
 type pendingOp struct {
 	h    *Handle
 	dir  Direction
 	want int
+	buf  []byte
 }
 
 // newMethodIOUring runs the io_uring_setup probe and, on
@@ -371,12 +378,27 @@ func (m *methodIOUring) Submit(op *Op) *Handle {
 		return h
 	}
 
+	// The raw-fd path below hands the kernel a pointer straight
+	// into buf, bypassing File.WriteAt entirely — so a File that
+	// stamps checksums inside WriteAt (storage.relFile, when
+	// checksums are enabled) never gets the chance for writes
+	// submitted this way. ChecksumFile is the explicit hook that
+	// lets it stamp the checksum here instead, into a copy the
+	// kernel actually writes; buf is what we submit and pin alive
+	// until the write completes.
+	buf := op.Buffer
+	if op.Direction == DirWrite {
+		if cf, ok := op.File.(ChecksumFile); ok {
+			buf = cf.PrepareWrite(op.Buffer, op.Offset)
+		}
+	}
+
 	userData := m.nextUD.Add(1)
 	m.pendingMu.Lock()
-	m.pending[userData] = pendingOp{h: h, dir: op.Direction, want: len(op.Buffer)}
+	m.pending[userData] = pendingOp{h: h, dir: op.Direction, want: len(op.Buffer), buf: buf}
 	m.pendingMu.Unlock()
 
-	if err := m.submitOne(op, fdh.Fd(), userData); err != nil {
+	if err := m.submitOne(op, buf, fdh.Fd(), userData); err != nil {
 		// Submission failure: roll back pending + slot, finish
 		// synchronously with the error so the caller's Wait
 		// returns rather than blocking.
@@ -391,8 +413,11 @@ func (m *methodIOUring) Submit(op *Op) *Handle {
 
 // submitOne writes one SQE and bumps the SQ tail, then issues
 // io_uring_enter to nudge the kernel. Caller must NOT hold
-// pendingMu (we take submitMu instead).
-func (m *methodIOUring) submitOne(op *Op, fd uintptr, userData uint64) error {
+// pendingMu (we take submitMu instead). buf is what the kernel
+// actually reads from / writes into — op.Buffer for reads, or a
+// ChecksumFile-stamped copy for writes (see Submit) — so the SQE
+// must point at buf, not op.Buffer.
+func (m *methodIOUring) submitOne(op *Op, buf []byte, fd uintptr, userData uint64) error {
 	m.submitMu.Lock()
 	defer m.submitMu.Unlock()
 
@@ -413,10 +438,10 @@ func (m *methodIOUring) submitOne(op *Op, fd uintptr, userData uint64) error {
 	}
 	sqe.Fd = int32(fd)
 	sqe.Off = uint64(op.Offset)
-	if len(op.Buffer) > 0 {
-		sqe.Addr = uint64(uintptr(unsafe.Pointer(&op.Buffer[0])))
+	if len(buf) > 0 {
+		sqe.Addr = uint64(uintptr(unsafe.Pointer(&buf[0])))
 	}
-	sqe.Len = uint32(len(op.Buffer))
+	sqe.Len = uint32(len(buf))
 	sqe.UserData = userData
 
 	// Release-store the new tail so the kernel sees the SQE.
@@ -542,6 +567,13 @@ func (m *methodIOUring) completeOne(cqe ioCqe) {
 				r.Err = io.EOF
 			} else {
 				r.Err = io.EOF
+			}
+		}
+	}
+	if r.Err == nil && po.dir == DirRead {
+		if cf, ok := po.h.op.File.(ChecksumFile); ok {
+			if verr := cf.VerifyRead(po.buf[:r.N], po.h.op.Offset); verr != nil {
+				r.Err = verr
 			}
 		}
 	}

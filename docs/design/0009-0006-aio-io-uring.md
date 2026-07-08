@@ -127,6 +127,73 @@ coordination. Two implications for goopg:
    visibility through their adapters. In-memory test files don't
    satisfy `fdHaver` and are handled by the inline-fallback branch.
 
+## Checksum bypass (fixed) and the still-open per-block ordering gap
+
+The same raw-fd submission that motivates `fdHaver` above has a second
+consequence the original slice missed: submitting directly by kernel fd
+means the SQE points straight at the caller's buffer, bypassing
+`File.ReadAt`/`File.WriteAt` entirely. For the `sync` and `worker`
+methods every op still flows through those two methods (`runOp` calls
+`op.File.ReadAt`/`WriteAt`), so `storage.relFile`'s checksum stamping
+(write) and verification (read) — implemented inside `WriteAt`/`ReadAt`
+— apply automatically. The `io_uring` method's `fdHaver` fast path
+never calls `WriteAt`/`ReadAt` at all, so on a checksummed cluster
+(`data_checksum_version` ≥ 1) running `io_method=io_uring` it used to
+silently: (a) write every AIO-submitted block with whatever stale
+`pd_checksum` bytes happened to already be in the caller's buffer, and
+(b) skip verification on every AIO-submitted read. (a) is the more
+serious half — once a checkpointer flush lands a block through
+`WriteBlockAIO` this way, the block's on-disk `pd_checksum` no longer
+matches its content, so *any later synchronous read* (which does
+verify) reports a false-positive `ChecksumError` for a page that was
+never actually corrupted.
+
+Fixed via an optional extension of `aio.File`, `ChecksumFile`
+(`internal/aio/aio.go`):
+
+```go
+type ChecksumFile interface {
+    PrepareWrite(buf []byte, off int64) []byte // stamp a checksum into a copy
+    VerifyRead(buf []byte, off int64) error    // verify a completed read
+}
+```
+
+`methodIOUring.Submit` type-asserts `op.File` against `ChecksumFile` in
+addition to `fdHaver`: for a write it calls `PrepareWrite` before
+building the SQE and submits the returned (possibly copied) buffer
+instead of `op.Buffer`, pinning a reference in `pendingOp.buf` so it
+survives until the kernel completes the write; for a read,
+`completeOne` calls `VerifyRead` on the landed bytes after a successful
+completion and maps a mismatch onto the `Result.Err` the caller's
+`Wait()` sees. `storage.relFile` implements both methods by delegating
+to the same `checksummedForWrite`/`verifyOnRead` helpers `WriteAt`/
+`ReadAt` already used, so the io_uring path can't drift from the
+synchronous path's checksum semantics. Files that don't implement
+`ChecksumFile` (plain `*os.File`, in-memory test files) are unaffected.
+
+This is a narrower fix than a general "route io_uring through
+`WriteAt`/`ReadAt`" approach, which would force a per-file mutex around
+every op (see `submitOne`'s single `submitMu`, already file-scoped for
+SQE bookkeeping) and defeat the cross-block parallelism io_uring exists
+for. `ChecksumFile` only touches the buffer content, not ordering.
+
+**Still open**: `storage/aio-relfile-mu-bypass` in `.ralph/fix_plan.md`
+tracks a separate, so-far-unconfirmed-as-reachable concern — the raw-fd
+path also doesn't serialize against a concurrent *synchronous*
+`readBlock`/`writeBlock`/`extend` (or another concurrent AIO op) on the
+*same* block of the *same* relFile, since those take `relFile.mu` for
+their whole duration while `Submit`'s raw-fd branch never touches it.
+`.ralph/deferral_ledger.md`'s 2026-07-08 M-NIGHTLY row found this by
+hand-tracing the one production call site (`Pool.flushBatch`'s
+`WriteBlockAIO`) and could not construct a concrete corruption window
+there — `Slot.contentMu`'s RWMutex already forces any evictor/reloader
+of the same slot to wait for the flush's real `Wait()` to return before
+touching `s.page` — but the gap is real at the `smgr`/`aio` layer in
+isolation and deserves the per-(rel,block) in-flight-AIO registry
+design described there before any other caller starts using
+`WriteBlockAIO`/`PrefetchBlock` on a path `contentMu` doesn't already
+cover.
+
 ## Tests
 
 - `TestNewEngineIOUringConstructs` (cross-platform) — selecting
@@ -140,6 +207,19 @@ coordination. Two implications for goopg:
 - `TestEngineIOUringParallel` (linux only) — 64 concurrent writes
   followed by 64 reads against the same file, verify no slot
   collisions in the `userData → Handle` map.
+- `TestEngineIOUringChecksumFileHooks` (linux only) — a fake
+  `ChecksumFile`-backed file proves `Submit` calls `PrepareWrite`
+  before the kernel write (and that the stamped bytes, not the
+  caller's untouched buffer, land on disk) and `completeOne` calls
+  `VerifyRead` after a completed read, surfacing a mismatch as the
+  `Result`'s error. Confirmed to fail without the fix (reverting the
+  `Submit`/`completeOne` wiring reproduces both symptoms: zero
+  `PrepareWrite` calls, unstamped bytes on disk).
+- `TestChecksumRelFilePrepareWriteVerifyRead` (`internal/storage`) —
+  `relFile.PrepareWrite`/`VerifyRead` in isolation: stamps a real page
+  via the production `PageSetChecksumCopy`/`VerifyPage` path, confirms
+  the caller's buffer is untouched, and confirms a corrupted copy is
+  rejected with a `*ChecksumError` carrying the right block number.
 
 Both io_uring-specific tests `t.Skip` when `e.Method() != MethodIOUring`,
 so the suite passes on any Linux host regardless of whether

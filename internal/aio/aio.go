@@ -83,6 +83,34 @@ type File interface {
 	io.WriterAt
 }
 
+// ChecksumFile is an optional extension of File. The `sync` and
+// `worker` methods always perform I/O through ReadAt/WriteAt, so
+// a File that verifies/stamps checksums inside those two methods
+// (as storage.relFile does) gets that behaviour automatically.
+// The `io_uring` method's raw-fd fast path (see fdHaver in
+// method_iouring_linux.go) bypasses ReadAt/WriteAt entirely for
+// files that expose a kernel fd — this hook is how that path
+// still gets the same checksum semantics. Files that don't
+// implement it (e.g. plain *os.File, in-memory test files) get
+// no checksum handling either way, matching their ReadAt/WriteAt
+// behaviour today.
+type ChecksumFile interface {
+	// PrepareWrite returns the bytes to actually submit for a
+	// write of buf at offset off — typically a copy with a
+	// freshly computed checksum stamped in, mirroring what
+	// WriteAt would have done. buf itself must not be mutated.
+	// The returned slice must stay valid until the write
+	// completes; the method keeps a reference alive for that.
+	PrepareWrite(buf []byte, off int64) []byte
+
+	// VerifyRead checks a successfully completed read's bytes
+	// (already landed in buf) at offset off, mirroring what
+	// ReadAt would have checked, and returns a non-nil error on
+	// checksum mismatch. Only called after a full, error-free
+	// read.
+	VerifyRead(buf []byte, off int64) error
+}
+
 // Op describes one I/O the caller wants the engine to perform.
 // Buffer is the destination for reads / source for writes. The
 // caller owns the buffer's memory: it must remain valid until
