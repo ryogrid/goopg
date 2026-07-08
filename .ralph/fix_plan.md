@@ -643,7 +643,7 @@ every clean, green (build + pre-commit) checkpoint.
       `resume point`/`why` text content was altered, only the leading
       `status` cell.
 
-- [ ] pgbench/nightly-reopen-20260708 — REOPENED (subject `pgbench/nightly`
+- [x] pgbench/nightly-reopen-20260708 — CLOSED (14th loop, resolved). REOPENED (subject `pgbench/nightly`
       recurred; the 2026-07-06 task above is checked but the fix apparently
       didn't fully hold): `btree: empty internal page (blk=8782 rel=
       {DBOid:5 RelOid:16412 Fork:0})` (AI-20260708-064334-001; repro:
@@ -1235,6 +1235,67 @@ every clean, green (build + pre-commit) checkpoint.
       collision (two DIFFERENT slots coincidentally sharing the same gen
       value at the same time), not just the already-ruled-out same-slot
       wraparound-after-2500-claims case.
+      2026-07-08 update (14th loop, same day, AI-20260708-064334-001):
+      **RESOLVED.** Executed the 13th loop's option (a) exactly — built
+      `storage.Pool.OnBufmapInsert`/`OnBufmapDelete` (`internal/storage/
+      bufpool.go`, routed through new `bmInsert`/`bmDelete` wrapper methods
+      that are now the SOLE call sites touching `p.bm.Insert`/`p.bm.Delete`)
+      plus `BTree.DebugTraceBufmap`/`RecordBufmapInsert`/`RecordBufmapDelete`/
+      `BufmapEventsForBlock`/`CheckBufmapExclusivity` (`internal/access/
+      btree/btree.go`), logging every bufmap mutation for this BTree's
+      relation SYNCHRONOUSLY inside bufmap's own internal mu — unlike the
+      flush/reload hooks (whose Seq is stamped by a later, separately-locked
+      call and can drift from true completion order, per the 11th loop's
+      finding), this records bufmap's TRUE mutation order for the tag, with
+      no residual jitter possible. Wired into
+      `TestVerifyBtreeEngineSilentOnRealConcurrentContended` (temporarily
+      un-skipped) with a per-missing-entry `CheckBufmapExclusivity` dump.
+      **First run produced a direct hit**: for block 444, `bufmap-event
+      seq=1177594 op=insert slot=38 ok=true` was immediately followed by
+      `bufmap-event seq=1177611 op=insert slot=42 ok=true` — a SECOND
+      successful Insert for the same tag with NO intervening Delete,
+      conclusively proving the double-mapping 13 prior loops could not
+      locate. Root cause, found by reading `internal/storage/bufmap.go`'s
+      `Insert` immediately after: it stopped at the FIRST tombstone-or-empty
+      bucket in its open-addressing probe chain and claimed it immediately,
+      contradicting `Lookup`'s/`Delete`'s own documented and implemented
+      invariant that "tombstones do NOT terminate probing; only true-empty
+      buckets do" — a live entry for a tag can legitimately sit further
+      along the SAME probe chain, past an earlier tombstone left by a
+      different, already-deleted, colliding key. A concurrent
+      `pinLoad`/`PinNew` racing to (re-)publish a tag that was still live
+      elsewhere in the chain would incorrectly succeed, planting a SECOND
+      live slot for the same block; the two slots then raced a disk reload
+      against a legitimate flush of the same block exactly as the 12th
+      loop's IO-trace evidence showed, permanently discarding the flush's
+      content. Fixed `Insert` to scan to a true-empty terminator (matching
+      `Lookup`/`Delete`) before deciding whether to insert, remembering only
+      the FIRST tombstone-or-empty bucket seen as the write target — the
+      standard open-addressing-with-tombstones algorithm (see `Insert`'s
+      updated doc comment for the full mechanism and trace). Added
+      `TestBufmapInsertSkipsPastTombstoneToExistingKey`
+      (`internal/storage/bufmap_test.go`) as a cheap, deterministic,
+      whitebox regression test (constructs a real starting-bucket collision,
+      confirmed to FAIL on the pre-fix code and PASS post-fix). Permanently
+      un-skipped `TestVerifyBtreeEngineSilentOnRealConcurrentContended`
+      (replaced its `t.Skip` with a RESOLVED doc comment) — 6/6 clean runs
+      plus one full `-race` run (176s, zero races, zero lost entries).
+      Updated `docs/design/root-0005-buffer-manager.md`'s Concurrency Model
+      section with this invariant. Gates: `go build ./...` clean; `go vet
+      ./internal/storage/... ./internal/access/btree/... ./internal/amcheck/...`
+      clean; `go test ./internal/storage/... ./internal/access/btree/...
+      ./internal/amcheck/... ./internal/executor/...` PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed txns, all 3 workloads). **Also re-ran the exact authoritative
+      nightly repro named in AI-20260708-064334-001** (`ci/batch/stages/
+      stage-pgbench.sh`, scale=50 clients=100 threads=20 duration=180×3,
+      the precise parameters that originally failed with "btree: empty
+      internal page"): PASS, 0 failed transactions across all 3 workloads
+      (tps 1233/2309/99127). This closes the task — no separate deferral-
+      ledger row needed (a complete fix with a permanent regression guard
+      landed, not a partial/deferred one). The unrelated `storage/
+      aio-relfile-mu-bypass` item below remains open as its own task.
 
 - [ ] storage/aio-relfile-mu-bypass — NEW (found as a side-effect of the
       13th-loop M-NIGHTLY audit above, AI-20260708-064334-001; not itself

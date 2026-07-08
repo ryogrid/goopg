@@ -391,6 +391,26 @@ type Pool struct {
 	// once the M-NIGHTLY root cause is fixed.
 	OnBlockReload func(tag BufferTag, page Page)
 
+	// OnBufmapInsert/OnBufmapDelete are M-NIGHTLY investigation aids
+	// (AI-20260708-064334-001, 14th loop), nil by default (zero cost when
+	// unset). Every one of this Pool's bm.Insert/bm.Delete calls is routed
+	// through bmInsert/bmDelete below, which invoke these hooks while still
+	// holding bufmap's own internal mu — so, unlike OnFlushSnapshot/
+	// OnBlockReload (whose Seq is stamped by a later, separately-locked
+	// call into btree's insertLogMu and can therefore drift from true
+	// completion order under scheduling jitter, per the 11th loop's
+	// finding), a caller's hook here observes bufmap mutations in their
+	// TRUE serialization order relative to every other Insert/Delete on
+	// the same bufmap. Exists to let btree.BTree record a per-tag
+	// ownership timeline and directly prove or refute whether two
+	// different slots ever simultaneously believe they own the same
+	// BufferTag (the one invariant never yet checked with live
+	// instrumentation across 13 prior loops on this task — see
+	// .ralph/fix_plan.md's M-NIGHTLY / pgbench/nightly-reopen-20260708
+	// entry). Remove once the M-NIGHTLY root cause is fixed.
+	OnBufmapInsert func(tag BufferTag, slotIdx int32, gen uint32, ok bool)
+	OnBufmapDelete func(tag BufferTag, slotIdx int32)
+
 	// OnExtendWait is called when PinNew is about to extend rel via the
 	// pool's sole smgr Extend call (extend_time's OnFlushWait analogue).
 	// Deliberately a distinct pair from storage.Manager's own
@@ -1021,7 +1041,7 @@ func (p *Pool) InvalidateRel(rel RelFileNode) {
 		// We only clear if the slot is still valid+unpinned.
 		newSt := st &^ (slotValidBit | slotDirtyBit)
 		if s.state.CompareAndSwap(st, newSt) {
-			p.bm.Delete(s.tag, int32(i))
+			p.bmDelete(s.tag, int32(i))
 			p.tombstones.Add(1)
 		}
 	}
@@ -1040,7 +1060,7 @@ func (p *Pool) InvalidateBlock(tag BufferTag) {
 	}
 	newSt := st &^ (slotValidBit | slotDirtyBit)
 	if s.state.CompareAndSwap(st, newSt) {
-		p.bm.Delete(tag, slotIdx)
+		p.bmDelete(tag, slotIdx)
 		p.tombstones.Add(1)
 	}
 }
@@ -1048,6 +1068,28 @@ func (p *Pool) InvalidateBlock(tag BufferTag) {
 // ErrNoBuffer is returned when every slot is pinned and the clock
 // sweep can't find a victim.
 var ErrNoBuffer = errors.New("no available buffer (all pinned)")
+
+// bmInsert and bmDelete are the sole call sites that touch p.bm.Insert/
+// p.bm.Delete (M-NIGHTLY AI-20260708-064334-001, 14th loop) — routing
+// every bufmap mutation through these two funcs lets OnBufmapInsert/
+// OnBufmapDelete observe every (tag, slotIdx) ownership change in bufmap's
+// own true lock order, with no extra synchronization of their own (the
+// hook runs synchronously inside bufmap's Insert/Delete call, still
+// holding bufmap's internal mu). Zero cost when both hooks are nil.
+func (p *Pool) bmInsert(tag BufferTag, slotIdx int32, gen uint32) bool {
+	ok := p.bm.Insert(tag, slotIdx, gen)
+	if p.OnBufmapInsert != nil {
+		p.OnBufmapInsert(tag, slotIdx, gen, ok)
+	}
+	return ok
+}
+
+func (p *Pool) bmDelete(tag BufferTag, slotIdx int32) {
+	p.bm.Delete(tag, slotIdx)
+	if p.OnBufmapDelete != nil {
+		p.OnBufmapDelete(tag, slotIdx)
+	}
+}
 
 // tryPinSlot attempts to increment the pin count on slotIdx atomically,
 // verifying the slot is valid, not in IO, and has the expected generation.
@@ -1170,7 +1212,7 @@ func (p *Pool) evictVictim(victimIdx int, wasDirty bool, oldTag BufferTag) error
 		// safe to retire the tag immediately.
 		st := p.slots[victimIdx].state.Load()
 		p.traceSlotEvent(int32(victimIdx), evEvictVictimClean, oldTag, st, st)
-		p.bm.Delete(oldTag, int32(victimIdx))
+		p.bmDelete(oldTag, int32(victimIdx))
 		p.tombstones.Add(1)
 		p.maybeCompact()
 		return nil
@@ -1199,7 +1241,7 @@ func (p *Pool) evictVictim(victimIdx int, wasDirty bool, oldTag BufferTag) error
 	// under a different slot (M-NIGHTLY loop 13 root cause). Any
 	// waiters that queued up during the flush are released below, by
 	// which point the delete is already visible to them.
-	p.bm.Delete(oldTag, int32(victimIdx))
+	p.bmDelete(oldTag, int32(victimIdx))
 	p.tombstones.Add(1)
 	p.maybeCompact()
 	if n := p.slotWaiters[victimIdx].Load(); n > 0 {
@@ -1369,7 +1411,7 @@ func (p *Pool) PinNew(rel RelFileNode) (*Slot, BlockNumber, error) {
 	p.traceSlotEvent(int32(victimIdx), evPinNewPublish, tag, prevSt, newSt)
 
 	// Insert into bufmap. Under pinMu, no other goroutine can insert the same tag.
-	if !p.bm.Insert(tag, int32(victimIdx), gen) {
+	if !p.bmInsert(tag, int32(victimIdx), gen) {
 		// Another goroutine published this block while we were in Extend.
 		// Use their slot and release ours.
 		if existingIdx, existingGen := p.bm.Lookup(tag); existingIdx >= 0 {
@@ -1548,7 +1590,7 @@ func (p *Pool) pinLoad(tag BufferTag) (*Slot, error) {
 	// see the slot and wait in the "stateIO" branch above.
 	gen := stateGen(s.state.Load())
 	s.tag = tag
-	if !p.bm.Insert(tag, int32(victimIdx), gen) {
+	if !p.bmInsert(tag, int32(victimIdx), gen) {
 		// Another goroutine (in a concurrent PinNew?) published this tag.
 		p.traceSlotEvent(int32(victimIdx), evReleaseVictimSlot, tag, s.state.Load(), 0)
 		s.tag = BufferTag{}
@@ -1573,7 +1615,7 @@ func (p *Pool) pinLoad(tag BufferTag) (*Slot, error) {
 	p.pinMu.Lock()
 
 	if ioErr != nil {
-		p.bm.Delete(tag, int32(victimIdx))
+		p.bmDelete(tag, int32(victimIdx))
 		p.tombstones.Add(1)
 		s.tag = BufferTag{}
 		p.releaseVictimSlot(victimIdx) // also wakes per-slot sema waiters

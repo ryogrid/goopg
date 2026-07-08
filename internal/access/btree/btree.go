@@ -729,6 +729,27 @@ type BTree struct {
 	// a given block at a time — no two concurrent holds for the same key
 	// can race this map.
 	contentMuBefore map[storage.BlockNumber][]InsertLogRecord
+	// DebugTraceBufmap (M-NIGHTLY AI-20260708-064334-001 investigation aid,
+	// 14th loop): when true, arms RecordBufmapInsert/RecordBufmapDelete as
+	// the target for storage.Pool.OnBufmapInsert/OnBufmapDelete — every
+	// bufmap mutation (Insert success/failure, Delete) for a block
+	// belonging to this BTree's relation is appended to bufmapLog, sharing
+	// insertLog/rewriteLog/flushLog/reloadLog/contentMuLog's Seq counter.
+	// Unlike those other logs, the hook fires synchronously INSIDE
+	// storage.Pool.bmInsert/bmDelete while bufmap's own internal mu is
+	// still held, so bufmapLog's recorded order is bufmap's TRUE
+	// serialization order for the tag — not subject to the Seq-vs-real-
+	// completion-order drift the 11th loop found in the flush/reload hooks
+	// (those stamp Seq from a later, separately-locked call). This is the
+	// only way, after 13 loops of hypothesis-refinement without ever
+	// directly instrumenting bufmap itself, to prove or refute whether two
+	// different slots simultaneously believe they own the same tag — scan
+	// bufmapLog for a tag whose Insert(slotA) has no intervening Delete
+	// before a LATER Insert(slotB) for the same tag succeeds. Off by
+	// default, zero cost when unset — same pattern as DebugTraceFlushes/
+	// DebugTraceReloads/DebugTraceContentMu.
+	DebugTraceBufmap bool
+	bufmapLog        []BufmapEvent
 	// logSeqNext is a single monotonic counter shared by insertLog and
 	// rewriteLog (instead of each using its own len()-based sequence) so a
 	// caller can compare Seq values ACROSS the two logs to establish
@@ -1077,6 +1098,99 @@ func (bt *BTree) ReloadSnapshotRecordsForBlock(blk storage.BlockNumber) []Reload
 		}
 	}
 	return out
+}
+
+// BufmapEvent records one bufmap mutation for a block belonging to this
+// BTree's relation: an Insert attempt (Ok reports whether it succeeded —
+// false means some other slot already owned the tag) or a Delete, keyed to
+// bt's shared Seq counter (see DebugTraceBufmap). Op is "insert" or
+// "delete".
+type BufmapEvent struct {
+	Seq     uint64
+	Block   storage.BlockNumber
+	Op      string
+	SlotIdx int32
+	Gen     uint32
+	Ok      bool
+}
+
+// RecordBufmapInsert is the storage.Pool.OnBufmapInsert hook this BTree
+// wires when DebugTraceBufmap is set (e.g. `pool.OnBufmapInsert =
+// bt.RecordBufmapInsert`). Fires synchronously inside storage.Pool.bmInsert
+// while bufmap's own internal mu is still held, so bufmapLog's recorded
+// order is bufmap's TRUE mutation order for the tag (see DebugTraceBufmap's
+// doc comment for why this differs from the flush/reload hooks). A no-op
+// when DebugTraceBufmap is false or tag belongs to a different relation.
+func (bt *BTree) RecordBufmapInsert(tag storage.BufferTag, slotIdx int32, gen uint32, ok bool) {
+	if !bt.DebugTraceBufmap || tag.Rel != bt.rel {
+		return
+	}
+	bt.insertLogMu.Lock()
+	seq := bt.logSeqNext
+	bt.logSeqNext++
+	bt.bufmapLog = append(bt.bufmapLog, BufmapEvent{Seq: seq, Block: tag.Block, Op: "insert", SlotIdx: slotIdx, Gen: gen, Ok: ok})
+	bt.insertLogMu.Unlock()
+}
+
+// RecordBufmapDelete is the storage.Pool.OnBufmapDelete hook this BTree
+// wires when DebugTraceBufmap is set (e.g. `pool.OnBufmapDelete =
+// bt.RecordBufmapDelete`). See RecordBufmapInsert's doc comment. A no-op
+// when DebugTraceBufmap is false or tag belongs to a different relation.
+func (bt *BTree) RecordBufmapDelete(tag storage.BufferTag, slotIdx int32) {
+	if !bt.DebugTraceBufmap || tag.Rel != bt.rel {
+		return
+	}
+	bt.insertLogMu.Lock()
+	seq := bt.logSeqNext
+	bt.logSeqNext++
+	bt.bufmapLog = append(bt.bufmapLog, BufmapEvent{Seq: seq, Block: tag.Block, Op: "delete", SlotIdx: slotIdx, Ok: true})
+	bt.insertLogMu.Unlock()
+}
+
+// BufmapEventsForBlock returns every recorded BufmapEvent (see
+// DebugTraceBufmap) for blk, in recorded (true bufmap-lock) order.
+// Test/investigation helper.
+func (bt *BTree) BufmapEventsForBlock(blk storage.BlockNumber) []BufmapEvent {
+	bt.insertLogMu.Lock()
+	defer bt.insertLogMu.Unlock()
+	var out []BufmapEvent
+	for _, e := range bt.bufmapLog {
+		if e.Block == blk {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// CheckBufmapExclusivity scans every recorded BufmapEvent (see
+// DebugTraceBufmap) for blk and reports the first point at which two
+// DIFFERENT slot indices both hold a live (successful-Insert,
+// no-matching-Delete-yet) ownership of the same block's tag at once — a
+// direct, ground-truth violation of bufmap's single-owner invariant. Returns
+// ok=true (no violation found) or ok=false plus the two conflicting events.
+// Test/investigation helper.
+func (bt *BTree) CheckBufmapExclusivity(blk storage.BlockNumber) (ok bool, first, second BufmapEvent) {
+	events := bt.BufmapEventsForBlock(blk)
+	live := map[int32]bool{}
+	var liveEvent map[int32]BufmapEvent = map[int32]BufmapEvent{}
+	for _, e := range events {
+		switch e.Op {
+		case "insert":
+			if !e.Ok {
+				continue
+			}
+			for slot, isLive := range live {
+				if isLive && slot != e.SlotIdx {
+					return false, liveEvent[slot], e
+				}
+			}
+			live[e.SlotIdx] = true
+			liveEvent[e.SlotIdx] = e
+		case "delete":
+			live[e.SlotIdx] = false
+		}
+	}
+	return true, BufmapEvent{}, BufmapEvent{}
 }
 
 // ContentMuEvent records one full pinW..unpinW hold on a block: the

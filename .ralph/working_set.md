@@ -1,88 +1,58 @@
-Task: M-NIGHTLY pgbench/nightly-reopen-20260708 (AI-20260708-064334-001) —
-IN PROGRESS, not complete. 13th loop on the reopen. Attempted the 12th
-loop's exact next step (land a synchronization fix in claimVictim/
-evictVictim/pinLoad) but did NOT land any source-code change: a
-from-scratch hand-trace of the whole protocol could not reproduce (on
-paper) the gap the 12th loop asked to be fixed, and landing an unverified
-guess into this heavily-audited hot path was judged riskier than another
-investigation-only loop. Filed a genuinely NEW, separate, confirmed
-finding (AIO/relFile.mu bypass) as its own fix_plan task instead of
-conflating it with this one.
+(idle — nothing in flight)
 
-Files (all committed, docs-only): .ralph/fix_plan.md (13th-loop update
-under the pgbench/nightly-reopen-20260708 task + new unchecked item
-`storage/aio-relfile-mu-bypass`), .ralph/deferral_ledger.md (13th
-2026-07-08 row). No source files modified this loop.
+M-NIGHTLY pgbench/nightly-reopen-20260708 (AI-20260708-064334-001) CLOSED
+this loop (14th loop on the reopen) after 13 prior investigation-only
+loops. Root cause: storage.bufmap.Insert (internal/storage/bufmap.go)
+stopped at the FIRST tombstone-or-empty bucket in its open-addressing
+probe chain, contradicting Lookup's/Delete's own "tombstones do NOT
+terminate probing" invariant — let two different buffer-pool slots
+simultaneously "own" the same BufferTag, which then raced a disk reload
+against a legitimate flush of the same block, permanently discarding a
+write. Found via NEW direct bufmap Insert/Delete instrumentation
+(storage.Pool.OnBufmapInsert/OnBufmapDelete, BTree.DebugTraceBufmap/
+CheckBufmapExclusivity) — the one angle none of the 13 prior loops had
+tried. Fixed Insert to scan to a true-empty terminator before deciding,
+remembering the first tombstone/empty as the write target (standard
+open-addressing-with-tombstones algorithm).
 
-Key symbols audited this loop (all read, none edited): storage.bufmap's
-Insert/Delete/Lookup/compact (bufmap.go) — correctly serialize tag
-ownership under bufmap.mu, ruled out as a double-mapping source by
-inspection (not yet by live tracing — see Next step). storage.Pool's
-claimVictim/evictVictim/pinLoad/pinSlow/Pin (bufpool.go ~1055-1595) —
-hand-traced every interleaving I could construct; the per-slot IO-inflight
-bit + semaphore-wait + bufmap-delete-after-flush protocol appears to
-correctly prevent a reload from observing pre-flush bytes in the
-SYNC-ONLY path (no checkpointer/AIO). bt.pinW/unpinW (btree.go ~1492) —
-confirmed `s.Lock()`/`s.Unlock()` ARE `contentMu.Lock/Unlock`
-(bufpool.go:87-88), so writer mutations are properly excluded from the
-checkpointer's flushBatch (contentMu.RLock) by Go's RWMutex semantics —
-ruled out "torn write during checkpointer flush". Pool.Unpin (bufpool.go
-~1651) panics on underflow — ruled out silent double-unpin corruption
-(would crash instead). storage.Manager.WriteBlockAIO/PrefetchBlock
-(smgr.go ~183-273) — NEW FINDING: bypass relFile.mu entirely when
-`m.aio != nil` (calls `eng.Submit(...)` directly, skipping
-`f.writeBlock`/`f.readBlock`); internal/aio/aio.go's Engine.Submit
-(~459-471) has no per-file/per-offset ordering (registerInFlight is
-stats-only). This IS wired in production (internal/initdb/open.go:303
-`mgr.SetAIO(...)`) but NOT in this unit test's pool (buildRealTreeConcurrent
-never calls SetAIO, never invokes FlushAllPaced during the race window) —
-so it cannot explain THIS test's reproducible loss, and even in
-production, contentMu's RWMutex still forces any evictor/reloader to wait
-for flushBatch's real Wait() before touching page bytes, so no concrete
-corruption path was found from it either, in the time available.
+Verification this loop: TestBufmapInsertSkipsPastTombstoneToExistingKey
+(new, confirmed fails pre-fix/passes post-fix) — go test ./internal/
+storage/... ./internal/access/btree/... ./internal/amcheck/...
+./internal/executor/... PASS — TestVerifyBtreeEngineSilentOnRealConcurrentContended
+permanently un-skipped, 6/6 clean runs + 1 -race run (176s, zero races) —
+scripts/tpch-spotcheck.sh PASS (Q12=2/Q13=33) — RALPH_PRECOMMIT_SCOPE=smoke
+scripts/ralph-precommit-test.sh PASS (0 failed, all 3 workloads) — AND the
+exact authoritative nightly repro (ci/batch/stages/stage-pgbench.sh,
+scale=50 clients=100 threads=20 duration=180x3) PASS, 0 failed
+transactions. docs/design/root-0005-buffer-manager.md's Concurrency Model
+section updated with the new invariant. fix_plan.md task marked [x]
+CLOSED with full writeup. No deferral-ledger row needed (complete fix +
+permanent regression test, not a partial/deferred one).
 
-Hypothesis/Findings: after 13 loops (12 via live instrumentation, this one
-via pure hand-trace of the code), NO concrete code-level defect has been
-identified in the sync-only claimVictim/evictVictim/pinLoad/bufmap/
-relFile/contentMu/pinMu protocol that the skipped test exercises — every
-invariant I could construct holds. This is a genuinely surprising/notable
-result: it means the bug may NOT be a simple lock-ordering gap in the
-mechanisms every prior loop has focused on. Do NOT re-open (all
-conclusively settled across 13 loops now): claimVictim's pin-count
-exclusion, fast-path insert sites, split/dedup-rewrite path, clean-eviction
-path, relFile.readBlock/writeBlock's own r.mu serialization, pinW/unpinW
-vs pinLoad as separate contentMu choke points, Unpin double-decrement,
-torn writes during checkpointer flush. Two NEW, not-yet-tried angles this
-loop identified but did not execute (time-boxed out): (a) bufmap has NEVER
-been directly instrumented with per-call Insert/Delete/Lookup logging in
-13 loops — every loop, including this one, only inferred its correctness
-by reading the code; (b) the 15-bit slot generation counter's wraparound
-was checked historically only for same-slot reuse frequency (~2500 claims
-per slot, far below the 32768 wrap threshold), never for a CROSS-slot gen
-COLLISION (two different slots coincidentally holding the same gen value
-at the same time, which could let a stale tryPinSlot/CAS succeed against
-the wrong slot).
+Files modified (all committed by end of this loop): internal/storage/
+bufmap.go (the fix), internal/storage/bufmap_test.go (new regression
+test), internal/storage/bufpool.go (bmInsert/bmDelete wrapper +
+OnBufmapInsert/OnBufmapDelete hooks), internal/access/btree/btree.go
+(BufmapEvent/RecordBufmapInsert/RecordBufmapDelete/CheckBufmapExclusivity
+debug aids), internal/amcheck/verify_nbtree_realtree_test.go (wired debug
+aids + permanently un-skipped the repro test), docs/design/
+root-0005-buffer-manager.md, .ralph/fix_plan.md.
 
-Next step: pick ONE of the two next-step candidates above and execute it
-directly (do not re-derive the whole investigation from scratch — this
-working_set + the 13th deferral-ledger row already contain the full
-ruled-out list): (a) add direct Insert/Delete/Lookup call logging to
-bufmap.go (new debug hook, same zero-cost-when-off pattern as every prior
-DebugTrace*/DebugValidate* aid in this thread) and re-run the repro to
-verify blk=377's tag truly never has 2 live mappings simultaneously; or
-(b) instrument claimVictim's gen assignment and tryPinSlot's gen check to
-log every (slotIdx, gen) pair assigned/checked and scan for a collision
-across DIFFERENT slot indices sharing the same gen concurrently. Separately
-(independent task, not this loop's priority): the new
-`storage/aio-relfile-mu-bypass` fix_plan item needs its own design pass
-(per-(rel,block) in-flight-AIO registry, not a blanket per-file mutex) —
-pick that up as its own unit of work, not mid-stream inside the M-NIGHTLY
-investigation.
+Next step for a future loop: pick up the separate, still-open
+`storage/aio-relfile-mu-bypass` fix_plan item (storage.Manager.
+WriteBlockAIO/PrefetchBlock bypass relFile.mu when an AIOEngine is
+attached; needs its own per-(rel,block) in-flight-AIO registry design —
+not proven related to the just-fixed bug, do not conflate). Also
+consider whether the new OnBufmapInsert/OnBufmapDelete debug hooks
+should be left in place (zero-cost when nil, matches the existing
+Debug*/On* pattern) or trimmed — current judgment: leave them, they are
+now permanent regression-test infrastructure (CheckBufmapExclusivity),
+same as OnFlushSnapshot/OnBlockReload before them.
 
-Gates run this loop: go build ./... clean (no code changed, docs-only
-commit). No test run needed (no code change to verify); the skipped test
-remains skipped and unmodified in behavior.
+Gates run this loop: go build ./... clean; go vet ./internal/storage/...
+./internal/access/btree/... ./internal/amcheck/... clean; full test
+suite as listed above all PASS; make ralph-state-guard PASS (auto-
+repaired a stale status/progress marker from a prior loop, unrelated to
+this loop's work).
 
-In-flight: none. No background processes left running. All work from
-this loop (fix_plan.md + deferral_ledger.md updates) is about to be
-committed.
+In-flight: none. No background processes left running.

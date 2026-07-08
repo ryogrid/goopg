@@ -209,6 +209,33 @@ explicit `Sync(tag)` is requested.
   bufpool.go`'s `flushBatch` for the current, fixed sequence, and
   `internal/storage/io_trace.go` (`GOOPG_IO_TRACE=1`) for the
   content-hash tracer that localized it.
+- **`bufmap` single-owner invariant across tombstones (found the hard
+  way, M-NIGHTLY AI-20260708-064334-001, 14th loop):** `bufmap` is
+  open-addressed with tombstones, and `Lookup`/`Delete` both correctly
+  treat "tombstones do NOT terminate probing; only true-empty buckets
+  do" — a live entry for a tag can legitimately sit *past* an earlier
+  tombstone left by a different, already-deleted key that happened to
+  collide on the same starting bucket. `Insert` used to violate this:
+  it stopped at the *first* tombstone-or-empty bucket in the probe
+  chain and claimed it immediately, without checking whether the
+  target tag already had a live entry further along the same chain.
+  That let two different slots simultaneously "own" one `BufferTag` in
+  `bufmap` — proved directly with new per-call instrumentation
+  (`BTree.CheckBufmapExclusivity`, `internal/access/btree/btree.go`)
+  after 13 prior investigation loops of flush/reload/contentMu/
+  syscall-level snapshot tracing had narrowed the symptom (a
+  cache-miss reload racing a legitimate flush of the same block,
+  silently discarding the flush's content) without finding why two
+  slots could both be "valid" for the same block at once. Any future
+  change to `bufmap.Insert` must keep scanning to a true-empty
+  terminator (matching `Lookup`/`Delete`) before deciding whether to
+  insert, remembering only the *first* tombstone-or-empty bucket seen
+  as the write target — the standard open-addressing-with-tombstones
+  algorithm. See `internal/storage/bufmap.go`'s `Insert` for the
+  current, fixed sequence, and
+  `TestBufmapInsertSkipsPastTombstoneToExistingKey`
+  (`internal/storage/bufmap_test.go`) for the permanent regression
+  guard.
 
 ### Sizing and alignment
 
