@@ -6,6 +6,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/goopg/goopg/internal/access/btree"
 	"github.com/goopg/goopg/internal/amcheck"
@@ -758,7 +759,7 @@ func buildRealTreeConcurrent(t *testing.T, n, writers, poolSlots int, keyRange i
 // holding an outdated slot). See .ralph/deferral_ledger.md's 9th
 // 2026-07-08 row for the full writeup.
 func TestVerifyBtreeEngineSilentOnRealConcurrentContended(t *testing.T) {
-	t.Skip("known-failing: tracks M-NIGHTLY AI-20260708-064334-001 (btree lost-index-entry bug; 10th loop cross-checked the 9th loop's reload-snapshot smoking gun against an INDEPENDENT smgr/syscall-level content-hash IO tracer (GOOPG_IO_TRACE=1, internal/storage/io_trace.go) and REFUTES hypothesis (b) -- across 60863 real ReadAt/WriteAt-completion events spanning 38 blocks and 49 lost entries in one run, EVERY postRead exactly matched the immediately-preceding postWrite's byte-content hash for that same (relFile, block); zero stale/superseded reads at the true hardware-completion-order layer. Combined with the 8th loop's proof that flush-side WriteBlock always durably wrote whatever was in memory, the entire storage/smgr layer (bufpool eviction+reload+flush, and the OS/file read/write path) is now cleared -- the loss is a genuine IN-MEMORY content bug, not a storage-layer one. Reviewed bufpool.go's pinLoad/tryPinSlot/claimVictim tag-publish-before-load window on inspection (state-bit gating + pinMu serialization) and found no obvious gap. Next step: instrument at the contentMu-critical-section level directly (one layer below the flush/reload snapshots already built) to catch which specific content mutation clobbers the entry; see .ralph/deferral_ledger.md's 10th 2026-07-08 row for full detail). 2026-07-08 update (11th loop, same day, AI-20260708-064334-001): executed the 10th loop's next step -- built BTree.DebugTraceContentMu (btree.go), bracketing every pinW/unpinW hold (before/after pageItems() snapshot around the hold) with the existing insertLog/rewriteLog/flushLog/reloadLog Seq counter. **Found a real gap in the 10th loop's own premise**: pinW/unpinW is NOT actually the sole mutation choke point as its doc comment claimed -- storage.Pool.pinLoad (bufpool.go:1561-1572) independently acquires/releases the SAME s.contentMu directly around its ReadBlock call during a cache-miss reload, bypassing bt.pinW/unpinW entirely (fixed the misleading doc comment this loop). This fully explains why the new instrumentation's per-block hold sequence showed the missing entry present at one traced pinW/unpinW hold's Unlock and already gone at the very next traced hold's Lock, with nothing in between at the pinW/unpinW level: the loss happens inside pinLoad's own reload hold, which the pinW/unpinW instrumentation cannot see but the pre-existing (9th-loop) OnBlockReload hook can. Cross-referencing precisely (by exact (key,TID) presence via RewriteSnapshotHasTID, not just item count) pinned the loss down to the tightest window found in this investigation so far: for the one entry lost in a fresh repro (key at blk=196), the flush-snapshot immediately before the loss (Seq=311541) has 268 items INCLUDING the entry, and the very next reload-snapshot of the same block (Seq=311542 -- one Seq-tick later, i.e. essentially back-to-back with no other traced btree-level event for this block in between) has 267 items, entry gone. This reopens, rather than closes, the question the 10th loop believed it had answered: the 10th loop's IO-trace check only flags a postRead that matches an OLDER postWrite instead of the MOST RECENT one -- it cannot detect a still-plausible variant of hypothesis (b) where a SECOND, chronologically-later postWrite (e.g. from a DIFFERENT physical slot racing to flush the same block tag during heavy eviction churn -- the 9th loop already observed 3 different slot indices serving blk=173's tag in one run) legitimately becomes the new most-recent write with STALE (pre-insert) content, so the following read correctly matches it and is never flagged as a mismatch, yet the insert is still lost. Next step: for blk=196's exact Seq=311541/311542 window, walk the io-trace log by wall-clock time (not recurring lpCnt, which is ambiguous -- the same lpCnt value recurs many times over a run) to check whether TWO postWrite events land for this block in immediate succession there, with the second one's item count/hash regressing from the first -- if so, that is the concrete two-slots-racing-to-flush-the-same-tag mechanism to fix in claimVictim/evictVictim's victim-selection and tag-transition sequence (bufpool.go ~1527-1557); if not, add a dedicated hook directly inside pinLoad's own reload hold (distinct from pinW/unpinW, since this loop proved they are separate mutation sites) to catch a same-slot double-load or a destination-buffer aliasing bug instead. See .ralph/deferral_ledger.md's 11th 2026-07-08 row for the full writeup; un-skip to confirm a fix")
+	t.Skip("known-failing: tracks M-NIGHTLY AI-20260708-064334-001 (btree lost-index-entry bug; 10th loop cross-checked the 9th loop's reload-snapshot smoking gun against an INDEPENDENT smgr/syscall-level content-hash IO tracer (GOOPG_IO_TRACE=1, internal/storage/io_trace.go) and REFUTES hypothesis (b) -- across 60863 real ReadAt/WriteAt-completion events spanning 38 blocks and 49 lost entries in one run, EVERY postRead exactly matched the immediately-preceding postWrite's byte-content hash for that same (relFile, block); zero stale/superseded reads at the true hardware-completion-order layer. Combined with the 8th loop's proof that flush-side WriteBlock always durably wrote whatever was in memory, the entire storage/smgr layer (bufpool eviction+reload+flush, and the OS/file read/write path) is now cleared -- the loss is a genuine IN-MEMORY content bug, not a storage-layer one. Reviewed bufpool.go's pinLoad/tryPinSlot/claimVictim tag-publish-before-load window on inspection (state-bit gating + pinMu serialization) and found no obvious gap. Next step: instrument at the contentMu-critical-section level directly (one layer below the flush/reload snapshots already built) to catch which specific content mutation clobbers the entry; see .ralph/deferral_ledger.md's 10th 2026-07-08 row for full detail). 2026-07-08 update (11th loop, same day, AI-20260708-064334-001): executed the 10th loop's next step -- built BTree.DebugTraceContentMu (btree.go), bracketing every pinW/unpinW hold (before/after pageItems() snapshot around the hold) with the existing insertLog/rewriteLog/flushLog/reloadLog Seq counter. **Found a real gap in the 10th loop's own premise**: pinW/unpinW is NOT actually the sole mutation choke point as its doc comment claimed -- storage.Pool.pinLoad (bufpool.go:1561-1572) independently acquires/releases the SAME s.contentMu directly around its ReadBlock call during a cache-miss reload, bypassing bt.pinW/unpinW entirely (fixed the misleading doc comment this loop). This fully explains why the new instrumentation's per-block hold sequence showed the missing entry present at one traced pinW/unpinW hold's Unlock and already gone at the very next traced hold's Lock, with nothing in between at the pinW/unpinW level: the loss happens inside pinLoad's own reload hold, which the pinW/unpinW instrumentation cannot see but the pre-existing (9th-loop) OnBlockReload hook can. Cross-referencing precisely (by exact (key,TID) presence via RewriteSnapshotHasTID, not just item count) pinned the loss down to the tightest window found in this investigation so far: for the one entry lost in a fresh repro (key at blk=196), the flush-snapshot immediately before the loss (Seq=311541) has 268 items INCLUDING the entry, and the very next reload-snapshot of the same block (Seq=311542 -- one Seq-tick later, i.e. essentially back-to-back with no other traced btree-level event for this block in between) has 267 items, entry gone. This reopens, rather than closes, the question the 10th loop believed it had answered: the 10th loop's IO-trace check only flags a postRead that matches an OLDER postWrite instead of the MOST RECENT one -- it cannot detect a still-plausible variant of hypothesis (b) where a SECOND, chronologically-later postWrite (e.g. from a DIFFERENT physical slot racing to flush the same block tag during heavy eviction churn -- the 9th loop already observed 3 different slot indices serving blk=173's tag in one run) legitimately becomes the new most-recent write with STALE (pre-insert) content, so the following read correctly matches it and is never flagged as a mismatch, yet the insert is still lost. Next step: for blk=196's exact Seq=311541/311542 window, walk the io-trace log by wall-clock time (not recurring lpCnt, which is ambiguous -- the same lpCnt value recurs many times over a run) to check whether TWO postWrite events land for this block in immediate succession there, with the second one's item count/hash regressing from the first -- if so, that is the concrete two-slots-racing-to-flush-the-same-tag mechanism to fix in claimVictim/evictVictim's victim-selection and tag-transition sequence (bufpool.go ~1527-1557); if not, add a dedicated hook directly inside pinLoad's own reload hold (distinct from pinW/unpinW, since this loop proved they are separate mutation sites) to catch a same-slot double-load or a destination-buffer aliasing bug instead. See .ralph/deferral_ledger.md's 11th 2026-07-08 row for the full writeup; 2026-07-08 update (12th loop, same day, AI-20260708-064334-001): executed the 11th loop's exact next step -- for a fresh repro, walked storage.IOTraceEventsForTag(tag) in wall-clock order (internal/amcheck/verify_nbtree_realtree_test.go, new check right after the 10th loop's stale-postRead check) flagging any adjacent postWrite pair whose line-pointer count REGRESSES. A naive first pass flagged 29 hits, but 27/29 were ordinary page splits (goopg splits by byte size not item count, so the surviving fraction is 50.7%-53.8%, not exactly half); refined the check to a magnitude-based split/non-split classifier (>25% drop = presumed split, ignored) which left exactly ONE genuine hit, and it lands EXACTLY on the already-localized loss: for the missing (key=33666, TID={1,2883}) entry at blk=377, the smgr-level IO trace shows postWrite lpCnt=401 (hash=498a1802fb28de87) at t=43.393270170s immediately followed just 1.9ms later by postWrite lpCnt=400 (hash=f812168be1dc1a85) at t=43.395185889s -- and cross-referencing the SAME window at the btree layer confirms this is not two independent flushes: contentMu-hold seq=908007 has the entry present (afterCount=401, matching the first, correct postWrite), a reload-snapshot AT seq=908093 (i.e. BETWEEN the two postWrites) already shows itemCount=399 with the entry absent -- a stale on-disk copy predating the insert -- and the very next contentMu-hold (seq=908216) shows beforeCount=399, meaning that stale 399-item reload overwrote the correct 401-item in-memory copy despite flush-snapshot seq=908124 (itemCount=401, entry present) having just legitimately flushed the correct version in between. The second postWrite (lpCnt=400 = 399 stale items + 1 later insert layered on top of the stale reload) then durably clobbers the correct 401-item version on disk. This is now confirmed, cross-validated at BOTH the contentMu (in-memory) and IO-trace (smgr/syscall) layers, as hypothesis (b) variant 2: a cache-miss reload racing against a legitimate flush of the SAME block loads a STALE on-disk copy into the slot, silently discarding the concurrently-flushed correct in-memory content; a subsequent write on top of the now-stale slot re-flushes the loss permanently. Next step: instrument storage.Pool.claimVictim/evictVictim/pinLoad's victim-selection and tag-transition sequence (bufpool.go ~1527-1572) directly -- specifically check whether a slot's dirty-flush (evictVictim, ~1527-1557) and a DIFFERENT slot's (or the same slot's) subsequent reload (pinLoad, ~1561-1572) for the SAME tag can interleave without a shared exclusion, i.e. whether the reload's ReadBlock can complete and publish before the flush's WriteBlock is acknowledged as durable, or whether two slots can simultaneously hold the same tag during the handoff. See .ralph/deferral_ledger.md's 12th 2026-07-08 row for the full writeup; un-skip to confirm a fix")
 	if testing.Short() {
 		t.Skip("skipping concurrent real-tree amcheck stress in short mode")
 	}
@@ -975,6 +976,7 @@ func TestVerifyBtreeEngineSilentOnRealConcurrentContended(t *testing.T) {
 						var priorWrites []struct {
 							Hash  uint64
 							LPCnt int
+							T     time.Time
 						}
 						for _, ev := range ioEvents {
 							t.Logf("  io-trace: phase=%s blk=%d hash=%016x lpCnt=%d lpErr=%q t=%s",
@@ -984,7 +986,8 @@ func TestVerifyBtreeEngineSilentOnRealConcurrentContended(t *testing.T) {
 								priorWrites = append(priorWrites, struct {
 									Hash  uint64
 									LPCnt int
-								}{ev.Hash, ev.LPCnt})
+									T     time.Time
+								}{ev.Hash, ev.LPCnt, ev.T})
 							case "postRead":
 								if len(priorWrites) == 0 {
 									continue
@@ -1008,6 +1011,56 @@ func TestVerifyBtreeEngineSilentOnRealConcurrentContended(t *testing.T) {
 										ev.Hash, ev.LPCnt, latest.Hash, latest.LPCnt)
 								}
 							}
+						}
+						// M-NIGHTLY investigation aid (AI-20260708-064334-001,
+						// 12th loop): the check just above can only catch a
+						// postRead matching an OLDER postWrite -- it is
+						// structurally blind to a SECOND, chronologically-
+						// later postWrite that legitimately becomes "most
+						// recent" while REGRESSING (stale pre-insert bytes
+						// from a different physical slot racing to flush the
+						// same block tag; the 9th loop already saw 3 distinct
+						// slot indices serve one block's tag in a single
+						// run). Check that variant of hypothesis (b) directly
+						// by walking this tag's postWrite events in
+						// wall-clock order (priorWrites is already exactly
+						// that list) and flagging any adjacent pair whose
+						// line-pointer count REGRESSES. IMPORTANT: an
+						// ordinary page SPLIT also legitimately regresses a
+						// page's item count (roughly halves it, moving the
+						// rest to a new sibling) -- a first pass of this
+						// check on a real repro logged 27/29 hits at almost
+						// exactly half (e.g. 493->248, 492->247); a second pass
+						// found goopg splits by BYTE SIZE not item count
+						// (variable key lengths), so the split ratio isn't
+						// exactly 50% -- observed 50.7%-53.8% of the original
+						// count survives on the original page, which a fixed
+						// "at most half+2" cutoff still misclassified as a
+						// smoking gun. What cleanly separates the two
+						// clusters in the data is magnitude, not ratio: every
+						// observed split drop was >=225 items (>45% of a
+						// ~490-item page), while every non-split regression
+						// was EXACTLY 1 item. Use a fractional cutoff wide
+						// enough to swallow all real splits (>25% of the
+						// prior count) while still catching a small,
+						// non-split loss of a handful of items.
+						for i := 1; i < len(priorWrites); i++ {
+							prev, cur := priorWrites[i-1], priorWrites[i]
+							if cur.LPCnt >= prev.LPCnt {
+								continue
+							}
+							delta := prev.LPCnt - cur.LPCnt
+							splitShaped := delta*4 > prev.LPCnt // drop >25% of prior count
+							if splitShaped {
+								t.Logf("  io-trace postWrite #%d (lpCnt=%d) regresses from #%d (lpCnt=%d) -- split-shaped (dropped %d, >25%% of prior count), presumed an ordinary page split, not flagged",
+									i, cur.LPCnt, i-1, prev.LPCnt, delta)
+								continue
+							}
+							t.Logf("  => SMOKING GUN (racing flush): postWrite #%d at t=%s (lpCnt=%d hash=%016x) REGRESSES from postWrite #%d at t=%s (lpCnt=%d hash=%016x) by only %d items (NOT split-shaped -- a split would leave at most ~half), gap=%s -- a later, chronologically-newer flush landed FEWER items than an already-durable write with no legitimate mutation to explain it, consistent with two physical slots racing to flush the same block tag",
+								i, cur.T.Format("15:04:05.000000000"), cur.LPCnt, cur.Hash,
+								i-1, prev.T.Format("15:04:05.000000000"), prev.LPCnt, prev.Hash,
+								prev.LPCnt-cur.LPCnt,
+								cur.T.Sub(prev.T))
 						}
 					}
 				}

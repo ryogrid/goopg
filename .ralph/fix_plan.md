@@ -1139,6 +1139,46 @@ every clean, green (build + pre-commit) checkpoint.
       mismatches" conclusion covers the two-writers-race variant of
       hypothesis (b) — it does not, by construction of that loop's own
       matching algorithm.
+      2026-07-08 update (12th loop, same day; see today's 12th deferral
+      ledger row): executed the 11th loop's exact next step. Extended the
+      wall-clock IO-trace check to flag any adjacent postWrite pair for a
+      tag whose line-pointer count REGRESSES. A naive version flagged 29
+      hits on a fresh repro, but 27/29 were ordinary page splits (goopg
+      splits by byte size not item count, so the surviving fraction is
+      50.7%-53.8%, not exactly half); refined to a magnitude-based
+      classifier (drop >25% of prior count = presumed split, not flagged),
+      leaving exactly ONE genuine hit — and it lands EXACTLY on the
+      already-localized loss, now CONFIRMED and cross-validated at BOTH the
+      contentMu (in-memory) and IO-trace (smgr/syscall) layers: for the
+      missing (key=33666, TID={1,2883}) entry at blk=377, a reload-snapshot
+      lands itemCount=399 (entry absent, a stale on-disk copy predating the
+      insert) BETWEEN a correct flush-snapshot (itemCount=401, entry
+      present, seq=908124) and the smgr IO trace shows that correct flush
+      landing as postWrite lpCnt=401 at t=43.393270170s, immediately
+      followed just 1.9ms later by a SECOND postWrite lpCnt=400 (=399 stale
+      items + 1 later insert layered on the stale reload) that durably
+      clobbers the correct disk copy — the very next contentMu-hold
+      confirms the in-memory slot itself is now the stale 399-item version.
+      Confirms hypothesis (b) variant 2: a cache-miss reload racing a
+      legitimate flush of the SAME block loads STALE on-disk bytes into the
+      slot, silently discarding the concurrently-flushed correct content; a
+      later write on the now-stale slot re-flushes the loss permanently.
+      Gates: go build ./... clean; go vet ./internal/storage/...
+      ./internal/amcheck/... ./internal/access/btree/... clean; go test
+      ./internal/storage/... ./internal/access/btree/...
+      ./internal/amcheck/... PASS (target test re-skipped);
+      scripts/tpch-spotcheck.sh PASS (Q12=2/Q13=33). Test skip message
+      (verify_nbtree_realtree_test.go ~762) updated with this finding.
+      Next step: fix the confirmed synchronization gap directly in
+      storage.Pool.claimVictim/evictVictim/pinLoad (bufpool.go ~1527-1572)
+      — audit whether the reload path (pinLoad) can publish a ReadBlock
+      result for a tag without checking/blocking on that tag's in-flight or
+      just-completed flush (evictVictim's WriteBlock), and whether two
+      slots can transiently hold the same tag during the flush->reload
+      handoff; land a targeted exclusion (likely: reload must re-validate
+      or wait on any in-flight flush for the same tag before publishing),
+      then un-skip TestVerifyBtreeEngineSilentOnRealConcurrentContended to
+      confirm the fix closes this task.
 
 - [x] race/internal/wal — race suite failed in package
       `github.com/goopg/goopg/internal/wal` (AI-20260707-000712-001; repro:
