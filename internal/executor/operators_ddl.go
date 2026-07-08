@@ -322,6 +322,18 @@ func (o *ddlOp) execCreateTablespace(s *parser.CreateTablespaceStmt) error {
 			return &ExecError{Code: "58P01", Pos: s.Pos(), Message: fmt.Sprintf("could not create directory %q: %v", versionDir, mkErr)}
 		}
 	}
+	// M0122-0007 tablespace-registry restart-durability follow-up: persist
+	// the tablespace so it survives a restart. goopg's tablespace registry
+	// has no backing heap relation, so record a WAL event the recovery
+	// driver (internal/initdb/tablespace_ddl_recovery.go) replays into the
+	// registry on the next startup (mirrors CREATE SCHEMA, M0110-0003). The
+	// OID just assigned by CreateTablespace is carried so recovery restores
+	// the same OID.
+	if o.ctx.WAL != nil {
+		if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateTablespace(s.Name, s.Owner, location, oid)); werr != nil {
+			return fmt.Errorf("wal create-tablespace: %w", werr)
+		}
+	}
 	return nil
 }
 
@@ -336,6 +348,15 @@ func (o *ddlOp) execDropTablespace(s *parser.DropTablespaceStmt) error {
 			return nil
 		}
 		return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("tablespace %q does not exist", s.Name)}
+	}
+	// M0122-0007 tablespace-registry restart-durability follow-up: persist
+	// the drop so it survives a restart (mirrors DROP SCHEMA). Without
+	// this, a tablespace dropped at runtime would be re-registered by
+	// replaying its CREATE TABLESPACE record on the next startup.
+	if o.ctx.WAL != nil {
+		if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropTablespace(s.Name)); werr != nil {
+			return fmt.Errorf("wal drop-tablespace: %w", werr)
+		}
 	}
 	if o.ctx.DataDir != "" {
 		dir := filepath.Join(o.ctx.DataDir, "pg_tblspc", strconv.FormatUint(uint64(oid), 10))

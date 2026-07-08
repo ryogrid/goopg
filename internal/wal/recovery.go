@@ -763,6 +763,23 @@ const (
 	//   kind(1) | oid(4) | newSchemaLen(2) | newSchema(newSchemaLen bytes)
 	RecordKindAlterFunctionSetSchema byte = 122
 
+	// RecordKindCreateTablespace records a `CREATE TABLESPACE name [OWNER
+	// owner] LOCATION 'location'` event (M0122-0007 tablespace-registry
+	// restart-durability follow-up). goopg's tablespace registry
+	// (catalog.InMemory.tablespaces) is a pure in-memory map with no backing
+	// heap relation, so the physical redo path is a no-op; the recovery
+	// driver in internal/initdb/tablespace_ddl_recovery.go re-registers the
+	// tablespace (with its original OID) after physical replay. Mirrors
+	// RecordKindCreateSchema. Format:
+	//   kind(1) | oid(4) | nameLen(2)+name | ownerLen(2)+owner |
+	//   locationLen(2)+location.
+	RecordKindCreateTablespace byte = 124
+
+	// RecordKindDropTablespace records a `DROP TABLESPACE name` event.
+	// Counterpart to RecordKindCreateTablespace; same no-op physical redo
+	// path. Format: kind(1) | nameLen(2) | name(nameLen bytes).
+	RecordKindDropTablespace byte = 125
+
 	// RecordKindSequenceState records the FULL state of one sequence
 	// (definition + current counter) so sequences — including the implicit
 	// sequences backing SERIAL/IDENTITY columns — survive a restart. goopg's
@@ -3339,6 +3356,104 @@ func DecodeDropSchema(payload []byte) (name string, err error) {
 	nameLen := int(binary.LittleEndian.Uint16(payload[1:3]))
 	if len(payload) < 3+nameLen {
 		return "", fmt.Errorf("wal: drop-schema payload truncated (need %d bytes)", 3+nameLen)
+	}
+	return string(payload[3 : 3+nameLen]), nil
+}
+
+// EncodeCreateTablespace encodes a CREATE TABLESPACE event (M0122-0007
+// tablespace-registry restart-durability follow-up). The OID is carried so
+// recovery re-registers the tablespace with the same identifier the live
+// server assigned.
+// Format: kind(1) | oid(4) | nameLen(2)+name | ownerLen(2)+owner |
+//
+//	locationLen(2)+location.
+func EncodeCreateTablespace(name, owner, location string, oid uint32) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	if len(owner) > 0xFFFF {
+		owner = owner[:0xFFFF]
+	}
+	if len(location) > 0xFFFF {
+		location = location[:0xFFFF]
+	}
+	out := make([]byte, 11+len(name)+len(owner)+len(location))
+	out[0] = RecordKindCreateTablespace
+	binary.LittleEndian.PutUint32(out[1:5], oid)
+	off := 5
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(name)))
+	off += 2
+	copy(out[off:off+len(name)], name)
+	off += len(name)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(owner)))
+	off += 2
+	copy(out[off:off+len(owner)], owner)
+	off += len(owner)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(location)))
+	off += 2
+	copy(out[off:off+len(location)], location)
+	return out
+}
+
+// DecodeCreateTablespace decodes a RecordKindCreateTablespace payload.
+func DecodeCreateTablespace(payload []byte) (name, owner, location string, oid uint32, err error) {
+	if len(payload) < 7 {
+		return "", "", "", 0, fmt.Errorf("wal: create-tablespace payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindCreateTablespace {
+		return "", "", "", 0, fmt.Errorf("wal: record kind %d is not create-tablespace", payload[0])
+	}
+	oid = binary.LittleEndian.Uint32(payload[1:5])
+	off := 5
+	readStr := func() (string, error) {
+		if len(payload) < off+2 {
+			return "", fmt.Errorf("wal: create-tablespace payload truncated at length prefix (offset %d)", off)
+		}
+		l := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+		off += 2
+		if len(payload) < off+l {
+			return "", fmt.Errorf("wal: create-tablespace payload truncated (need %d bytes)", off+l)
+		}
+		s := string(payload[off : off+l])
+		off += l
+		return s, nil
+	}
+	if name, err = readStr(); err != nil {
+		return "", "", "", 0, err
+	}
+	if owner, err = readStr(); err != nil {
+		return "", "", "", 0, err
+	}
+	if location, err = readStr(); err != nil {
+		return "", "", "", 0, err
+	}
+	return name, owner, location, oid, nil
+}
+
+// EncodeDropTablespace encodes a DROP TABLESPACE event.
+// Format: kind(1) | nameLen(2) | name(nameLen bytes).
+func EncodeDropTablespace(name string) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	out := make([]byte, 3+len(name))
+	out[0] = RecordKindDropTablespace
+	binary.LittleEndian.PutUint16(out[1:3], uint16(len(name)))
+	copy(out[3:], name)
+	return out
+}
+
+// DecodeDropTablespace decodes a RecordKindDropTablespace payload.
+func DecodeDropTablespace(payload []byte) (name string, err error) {
+	if len(payload) < 3 {
+		return "", fmt.Errorf("wal: drop-tablespace payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindDropTablespace {
+		return "", fmt.Errorf("wal: record kind %d is not drop-tablespace", payload[0])
+	}
+	nameLen := int(binary.LittleEndian.Uint16(payload[1:3]))
+	if len(payload) < 3+nameLen {
+		return "", fmt.Errorf("wal: drop-tablespace payload truncated (need %d bytes)", 3+nameLen)
 	}
 	return string(payload[3 : 3+nameLen]), nil
 }
@@ -8364,6 +8479,15 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 		// internal/initdb/schema_ddl_recovery.go scans the WAL for these
 		// records after physical replay and re-applies them to the
 		// catalog's schema registry.
+		return false, nil
+	case RecordKindCreateTablespace, RecordKindDropTablespace:
+		// CREATE/DROP TABLESPACE records (M0122-0007 tablespace-registry
+		// restart-durability follow-up) carry only pg_tablespace registry
+		// metadata; goopg's tablespace registry has no backing heap
+		// relation, so the physical replay path has nothing to do. The
+		// recovery driver in internal/initdb/tablespace_ddl_recovery.go
+		// scans the WAL for these records after physical replay and
+		// re-applies them to the catalog's tablespace registry.
 		return false, nil
 	case RecordKindCreateTransform, RecordKindDropTransform:
 		// CREATE/DROP TRANSFORM records (M0119-0004 restart persistence)

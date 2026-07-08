@@ -12600,6 +12600,34 @@ func (c *InMemory) DropTablespace(name string) (uint32, bool) {
 	return ts.oid, true
 }
 
+// RegisterTablespaceDuringRecovery re-registers a tablespace with its
+// original OID/owner/location, replayed from a RecordKindCreateTablespace WAL
+// record (M0122-0007 tablespace-registry restart-durability follow-up).
+// Mirrors RegisterSchemaDuringRecovery.
+func (c *InMemory) RegisterTablespaceDuringRecovery(name, owner, location string, oid uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	lc := strings.ToLower(name)
+	c.tablespaces[lc] = &tablespaceRow{
+		oid:      oid,
+		name:     name,
+		owner:    owner,
+		location: location,
+	}
+	if oid >= c.nextOID {
+		c.nextOID = oid + 1
+	}
+}
+
+// UnregisterTablespaceDuringRecovery removes a tablespace from the registry,
+// replayed from a RecordKindDropTablespace WAL record. Counterpart to
+// RegisterTablespaceDuringRecovery; mirrors UnregisterSchemaDuringRecovery.
+func (c *InMemory) UnregisterTablespaceDuringRecovery(name string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.tablespaces, strings.ToLower(name))
+}
+
 // DefaultTablespaceOID / GlobalTablespaceOID are the bootstrap pg_tablespace
 // OIDs (pg_tablespace.dat), matching upstream's DEFAULTTABLESPACE_OID /
 // GLOBALTABLESPACE_OID. Every database's default tablespace is pg_default —

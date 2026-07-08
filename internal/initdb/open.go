@@ -1073,6 +1073,18 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: schema DDL replay: %w", err)
 	}
+	// M0122-0007 tablespace-registry restart-durability follow-up: restore
+	// CREATE/DROP TABLESPACE entries (pg_tablespace) from the WAL the same
+	// way. goopg's tablespace registry has no backing heap relation, so
+	// this must run before loadUserTablesFromHeap / loadUserIndexesFromHeap
+	// reconstruct their (now-durable) reltablespace OIDs, so a table/index
+	// pointing at a user tablespace doesn't transiently look orphaned.
+	if err := replayTablespaceDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: tablespace DDL replay: %w", err)
+	}
 	// DU-002 (M0119-0004) restart persistence: restore CREATE/DROP TRANSFORM
 	// objects (pg_transform) from the WAL the same way. Order relative to
 	// schema replay does not matter — transforms are keyed by (type name,

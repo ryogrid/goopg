@@ -342,6 +342,64 @@ WAL record pair plus a `replayTablespaceDDLRecords` driver in
 REINDEX physical rebuild, tablespace physical relocation, tablespace-registry
 restart durability (new, this follow-up).
 
+## Tablespace-registry restart durability (2026-07-09 follow-up)
+
+Closed the "tablespace-registry restart durability" gap named in the section
+above. `catalog.InMemory.tablespaces` (`CreateTablespace`/`DropTablespace`)
+now gets the same durability mechanism `CREATE DATABASE`/`CREATE SCHEMA`
+already have — a goopg-private WAL record pair plus a post-physical-replay
+recovery driver, since `pg_tablespace` is a shared catalog with no backing
+heap relation to sync into (per the "Catalog-visibility scope decision"
+section above).
+
+- `wal.RecordKindCreateTablespace` (124) / `RecordKindDropTablespace` (125)
+  (`internal/wal/recovery.go`). Create carries `oid | name | owner |
+  location` (mirrors `RecordKindCreateSchema`'s OID-preserving shape); drop
+  carries only `name`. Both are no-op for physical replay (`ApplyRecord`'s
+  `ApplyRecordKindPhysicalOnly`-style switch) — there is no page-level state
+  to reconstruct, exactly like CREATE/DROP SCHEMA.
+- `catalog.InMemory.RegisterTablespaceDuringRecovery(name, owner, location,
+  oid)` / `UnregisterTablespaceDuringRecovery(name)` — re-populate/remove the
+  `tablespaces` map entry with the original OID (bumping `nextOID` past it,
+  mirroring `RegisterSchemaDuringRecovery`).
+- `internal/initdb/tablespace_ddl_recovery.go`'s `replayTablespaceDDLRecords`
+  — a new post-physical-replay pass, byte-for-byte structured like
+  `replaySchemaDDLRecords`: scans `pg_wal` for these two record kinds via a
+  local `tablespaceRegistryRecovery` interface type-asserted against the
+  `catalog.Catalog` argument, applying each in WAL order. Wired into
+  `internal/initdb/open.go`'s `Open` right after `replaySchemaDDLRecords`
+  (order doesn't matter relative to schema replay — tablespaces aren't
+  schema-scoped — but it must run before `loadUserTablesFromHeap`/
+  `loadUserIndexesFromHeap` reconstruct their durable `reltablespace` OIDs,
+  so a table/index pointing at a user tablespace doesn't transiently look
+  orphaned during the same `Open` call).
+- `execCreateTablespace`/`execDropTablespace` (`internal/executor/
+  operators_ddl.go`) now append the corresponding WAL record right after the
+  in-memory mutation succeeds (create: after the `pg_tblspc/<oid>` directory
+  is created; drop: before the directory is removed) — same "mutate, then
+  WAL" ordering CREATE/DROP SCHEMA already use.
+
+Tests: `TestTablespaceDDLRecoveryReplaysCreate` (OID preserved across a real
+`Init`→`Open`→WAL-append→`Close`→`Open` cycle),
+`TestTablespaceDDLRecoveryReplaysDropAfterCreate` (CREATE+DROP cancels out),
+`TestReplayTablespaceDDLRecordsHandlesMissingWalDir` (no-op on a fresh
+initdb) — all in `internal/initdb/tablespace_ddl_recovery_test.go`, confirmed
+non-vacuous via `git stash` on the four impl files (fails to build without
+them: `undefined: wal.EncodeCreateTablespace` etc.). Also live-verified
+against the real `cmd/goopg` binary: `SET allow_in_place_tablespaces = on;
+CREATE TABLESPACE ts1 LOCATION ''; CREATE TABLE t1(a int) TABLESPACE ts1;`,
+then a real `goopg stop`/`goopg start` — `pg_tablespace` still lists `ts1`,
+`t1.reltablespace` unchanged, and a fresh `CREATE TABLE t2(a int) TABLESPACE
+ts1` in the post-restart session succeeds (previously `42704`). Repeated with
+`DROP TABLESPACE ts1` before a restart — confirmed it stays gone. Gates: `go
+build ./...` clean; `go test ./internal/catalog/... ./internal/wal/...
+./internal/initdb/... ./internal/executor/...` PASS; `scripts/
+tpch-spotcheck.sh` PASS (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+scripts/ralph-precommit-test.sh` PASS (0 failed txns, all 3 workloads).
+
+**Still open** (M0122-0007, this bucket): CREATE/DROP DATABASE full DDL,
+REINDEX physical rebuild, tablespace physical relocation.
+
 ## Tests
 
 - `parser.TestParseCreateTablespace` / `TestParseCreateTablespaceMissingLocation`

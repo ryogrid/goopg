@@ -4586,6 +4586,54 @@ mirroring M0119's ledger `status` column.
       remaining items): CREATE/DROP DATABASE full DDL, REINDEX physical
       rebuild, tablespace physical relocation, tablespace-registry restart
       durability (new, see deferral ledger).
+      **Tablespace-registry restart durability — DONE (2026-07-09):** closed
+      the "tablespace-registry restart durability" resume point directly
+      above. `catalog.InMemory.tablespaces` (`CreateTablespace`/
+      `DropTablespace`) had ZERO restart durability — a purely in-memory map
+      with no WAL record and no backing heap relation, so a tablespace
+      vanished from `pg_tablespace` entirely after any restart even though
+      its `pg_tblspc/<oid>/` directory stayed on disk. Fixed the same way
+      `CREATE DATABASE`/`CREATE SCHEMA` already were: new
+      `wal.RecordKindCreateTablespace`/`RecordKindDropTablespace` (124/125,
+      `EncodeCreateTablespace`/`DecodeCreateTablespace`/
+      `EncodeDropTablespace`/`DecodeDropTablespace`, `internal/wal/
+      recovery.go`) are no-ops for physical replay; a new
+      `internal/initdb/tablespace_ddl_recovery.go`'s
+      `replayTablespaceDDLRecords`, byte-for-byte structured like
+      `replaySchemaDDLRecords`, scans `pg_wal` after physical replay and
+      applies each record via a new `catalog.InMemory.
+      RegisterTablespaceDuringRecovery`/`UnregisterTablespaceDuringRecovery`
+      pair (re-populates/removes the `tablespaces` map entry, preserving the
+      original OID and bumping `nextOID` past it). Wired into
+      `internal/initdb/open.go`'s `Open` right after `replaySchemaDDLRecords`
+      (must run before `loadUserTablesFromHeap`/`loadUserIndexesFromHeap`
+      reconstruct their durable `reltablespace` OIDs). `execCreateTablespace`/
+      `execDropTablespace` (`internal/executor/operators_ddl.go`) now append
+      the corresponding WAL record right after the in-memory mutation
+      succeeds, mirroring CREATE/DROP SCHEMA's "mutate, then WAL" ordering.
+      Tests: `TestTablespaceDDLRecoveryReplaysCreate`/
+      `TestTablespaceDDLRecoveryReplaysDropAfterCreate`/
+      `TestReplayTablespaceDDLRecordsHandlesMissingWalDir`
+      (`internal/initdb/tablespace_ddl_recovery_test.go`), confirmed
+      non-vacuous via `git stash` on the four impl files (fails to build:
+      `undefined: wal.EncodeCreateTablespace` etc.). Live-verified against
+      the real `cmd/goopg` binary: `SET allow_in_place_tablespaces = on;
+      CREATE TABLESPACE ts1 LOCATION ''; CREATE TABLE t1(a int) TABLESPACE
+      ts1;`, then a real `goopg stop`/`goopg start` — `pg_tablespace` still
+      lists `ts1`, `t1.reltablespace` unchanged, and a fresh `CREATE TABLE
+      t2(a int) TABLESPACE ts1` in the post-restart session succeeds
+      (previously `42704 tablespace "ts1" does not exist`); repeated with
+      `DROP TABLESPACE ts1` before a restart — confirmed it stays gone.
+      Design: `docs/design/0095-0003-in-place-tablespace.md` new
+      "Tablespace-registry restart durability (2026-07-09 follow-up)"
+      section; `docs/design/README.md` row updated. Gates: `go build ./...`
+      clean; `go test ./internal/catalog/... ./internal/wal/...
+      ./internal/initdb/... ./internal/executor/...` PASS; `scripts/
+      tpch-spotcheck.sh` PASS (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+      scripts/ralph-precommit-test.sh` PASS (0 failed txns, all 3
+      workloads). **Still open** (this bucket, ~4 remaining items):
+      CREATE/DROP DATABASE full DDL, REINDEX physical rebuild, tablespace
+      physical relocation.
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,
       encoding constraints during bootstrap/runtime.
