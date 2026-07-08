@@ -4960,6 +4960,47 @@ mirroring M0119's ledger `status` column.
       IN-subquery unnesting (`unimplemented_feat.json`'s sibling
       M0069-0005 entry, `unnest.go:1203`'s `ColumnRef`-only restriction),
       Q8/Q9/Q21 row-count fixes.
+      **Non-ColumnRef IN-subquery LHS landed (2026-07-09, this loop,
+      closes the sibling M0069-0005 `unimplemented_feat.json` entry
+      named directly above):** `isUnnestableNonCorrelatedIn`
+      (`internal/planner/unnest.go`) no longer requires `in.Operand` to
+      be a `*ColumnRef` — it now only checks `in.Operand != nil`,
+      `in.Plan != nil`, and a single-column inner output.
+      `unnestNonCorrelatedInExpr` previously reconstructed a fresh
+      `*ColumnRef` by copying `Index`/`Name`/`Type`/`SourceTableIdx` off
+      the operand; that reconstruction is gone — `outerKey := in.Operand`
+      is used directly as `Join.LeftKey`, since `LeftKey`/`RightKey` were
+      already typed as general `Expr` and the hash-join executor's
+      `evalHashKey` (`internal/executor/operators_join_agg.go`) already
+      evaluates them with the ordinary `evalExpr`, not a ColumnRef-
+      specific extractor — the restriction was never protecting a real
+      invariant. So `f(x) IN (subquery)` / `a + b IN (subquery)` now
+      unnest to a hash Semi/Anti join exactly like a bare-column LHS,
+      instead of falling back to the slower per-row runtime-cache path.
+      Tests: `internal/planner/not_in_unnest_test.go`'s new
+      `TestUnnestNonCorrelatedIn_NonColumnRefOperand` (`x + 1 IN
+      (subquery)` unnests to `JoinTypeSemi`/`JoinAlgoHash` with a
+      `*BinaryOp` `LeftKey`); `internal/planner/unnest_test.go`'s
+      `TestRecursiveUnnestInsideNonUnnestableIN` updated — it previously
+      relied on a non-ColumnRef operand (`a_id + 1`) to keep its outer IN
+      deliberately non-unnestable while pinning the unrelated M0040-0004
+      recursive-inner-subquery-unnest invariant; since operand shape
+      alone no longer blocks unnesting, it now uses a non-equijoin
+      correlation (`b_val > a_id`) instead, which `collectUnnestParams`
+      still correctly rejects. Confirmed non-vacuous via `git stash` on
+      `unnest.go` alone (new test fails: `InExpr survived unnesting`,
+      no `JoinTypeSemi` found). Design:
+      `docs/design/0040-0001-subquery-caching-and-unnest.md` new
+      Follow-up section; `docs/design/README.md` row extended;
+      `unimplemented_feat.json`'s M0069-0005 non-ColumnRef-LHS entry
+      flipped `open` → `resolved`. Gates: `go build ./...` clean; `go
+      test ./internal/planner/... ./internal/executor/...
+      ./internal/analyzer/...` PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+      scripts/ralph-precommit-test.sh` PASS (0 failed txns, all 3
+      pgbench workloads). **Still open in this bucket:** correlated NOT
+      IN's NullAware gap, Q16's non-triggering unnest (root cause not
+      yet isolated), Q8/Q9/Q21 row-count fixes.
 - [ ] **M0122-0012 — Perf infra: vectorization / slot-pipeline / harness** (~19,
       ARCHITECTURAL). Borrow-semantics allocation rewrite, plannode migration,
       vectorized FilterOp/SeqScanOp, plan cache, HammerDB SF1 validation.

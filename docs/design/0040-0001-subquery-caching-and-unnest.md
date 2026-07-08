@@ -449,3 +449,47 @@ pre-existing, still-correct runtime-cache path. `scripts/
 tpch-spotcheck.sh` (Q12=2/Q13=33) and `RALPH_PRECOMMIT_SCOPE=smoke
 scripts/ralph-precommit-test.sh` (0 failed, all 3 pgbench workloads)
 both PASS.
+
+## Follow-up (2026-07-09, M0122-0011 follow-up): non-ColumnRef LHS operand
+
+`isUnnestableNonCorrelatedIn` (`internal/planner/unnest.go`) also
+hard-required `in.Operand` to be a bare `*ColumnRef` — `f(x) IN
+(subquery)` or `a + b IN (subquery)` always fell back to the slower
+runtime-cache path, even when the inner plan was otherwise trivially
+unnestable (`unimplemented_feat.json`'s M0069-0005 entry,
+reconfirmed open as recently as 2026-07-08).
+
+**Why the restriction wasn't load-bearing.** `Join.LeftKey`/`RightKey`
+are already typed as general `Expr`, not `*ColumnRef` — the hash-join
+executor's `evalHashKey` (`internal/executor/operators_join_agg.go`)
+evaluates them with the ordinary `evalExpr`, the same evaluator used
+for any predicate. `planInExpr` (`internal/planner/planner.go`)
+already fully resolves `in.Operand` via `resolveExpr` in the outer
+scope regardless of its shape — the ColumnRef requirement was never
+protecting a real invariant, just an artifact of
+`unnestNonCorrelatedInExpr` reconstructing a fresh `*ColumnRef` by
+copying `Index`/`Name`/`Type`/`SourceTableIdx` off the operand instead
+of using the operand expression directly.
+
+**Fix:** `isUnnestableNonCorrelatedIn` now only checks `in.Operand !=
+nil`, `in.Plan != nil`, and a single-column inner output.
+`unnestNonCorrelatedInExpr` builds `outerKey := in.Operand` directly
+instead of the field-copy reconstruction — `LeftKey`/`RightKey` accept
+it as-is.
+
+**Tests:** `internal/planner/not_in_unnest_test.go`'s new
+`TestUnnestNonCorrelatedIn_NonColumnRefOperand` (`x + 1 IN (subquery)`
+unnests to `JoinTypeSemi`/`JoinAlgoHash` with a `*BinaryOp` `LeftKey`,
+not a `*ColumnRef`). `internal/planner/unnest_test.go`'s
+`TestRecursiveUnnestInsideNonUnnestableIN` — which relied on a
+non-ColumnRef operand (`a_id + 1`) to keep its outer IN deliberately
+non-unnestable while pinning the unrelated M0040-0004 recursive-unnest
+invariant — was updated to force non-unnestability via a non-equijoin
+correlation (`b_val > a_id`) instead, since operand shape alone no
+longer blocks unnesting. Confirmed non-vacuous via `git stash` on
+`unnest.go` alone (new test fails: `InExpr survived unnesting`).
+Gates: `go build ./...` clean; `go test ./internal/planner/...
+./internal/executor/... ./internal/analyzer/...` PASS;
+`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+`RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+failed transactions, all 3 pgbench workloads).

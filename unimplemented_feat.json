@@ -1474,7 +1474,7 @@
    "feature": "Non-trivial expressions on IN-subquery LHS not optimized to SemiJoin; falls back to runtime cache path",
    "task_id": "M0069-0005",
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "in.Operand must be a ColumnRef — non-trivial expressions on the LHS keep the runtime cache path"
    ],
@@ -1489,7 +1489,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open 2026-07-08: internal/planner/unnest.go:1203 (same isUnnestableNonCorrelatedIn function) unchanged — 'if _, ok := in.Operand.(*ColumnRef); !ok { return false }'; no commit relaxes this to accept arbitrary expressions (BinaryExpr, FuncCall, etc.) as IN-subquery LHS. Still restricted to plain ColumnRef"
+   "code_audit": "RESOLVED 2026-07-09 (M0122-0011 follow-up, this loop): isUnnestableNonCorrelatedIn (internal/planner/unnest.go) no longer requires in.Operand to be a *ColumnRef — the guard now only checks in.Plan is non-nil with a single output column. unnestNonCorrelatedInExpr builds the Semi/Anti join's LeftKey directly from in.Operand (dropped the ColumnRef-field-copy reconstruction) since Join.LeftKey/RightKey are already general Expr and the hash-join executor evaluates them via evalExpr (internal/executor/operators_join_agg.go's evalHashKey), so `f(x) IN (subquery)` / `a+b IN (subquery)` now unnest identically to a bare-column LHS. Tests: internal/planner/not_in_unnest_test.go:TestUnnestNonCorrelatedIn_NonColumnRefOperand (new); internal/planner/unnest_test.go:TestRecursiveUnnestInsideNonUnnestableIN updated to force non-unnestability via a non-equijoin correlation instead of a non-ColumnRef operand, since operand shape alone no longer blocks unnesting. Confirmed non-vacuous via git stash. Design: docs/design/0040-0001-subquery-caching-and-unnest.md new Follow-up section."
   },
   {
    "feature": "Schema-vs-runtime layout mismatch in walker implementation causes incorrect results; blocks multiple optimization attempts",

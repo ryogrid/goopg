@@ -1191,9 +1191,9 @@ func canUnnestInExprDepth(in *InExpr, depth int) bool {
 }
 
 // isUnnestableNonCorrelatedIn checks the structural preconditions
-// for unnesting a non-correlated IN: the LHS is a ColumnRef and
-// the inner plan has exactly one output column. Without these the
-// Semi/Anti-join rewriting would mis-shape the join.
+// for unnesting a non-correlated IN: the inner plan has exactly one
+// output column. Without this the Semi/Anti-join rewriting would
+// mis-shape the join.
 //
 // M0122-0011: NOT IN is now unnestable too (previously rejected —
 // "NOT IN requires anti-semi-join semantics which are out of scope
@@ -1201,8 +1201,16 @@ func canUnnestInExprDepth(in *InExpr, depth int) bool {
 // JoinTypeAnti with NullAware=true, which the executor gives
 // NOT IN's three-valued-NULL semantics instead of the plain
 // NOT-EXISTS-shaped Anti join.
+//
+// M0122-0011 follow-up: the LHS operand no longer has to be a bare
+// ColumnRef. Join.LeftKey/RightKey are general Expr and the hash-join
+// executor evaluates them with evalExpr (operators_join_agg.go's
+// evalHashKey), so `f(x) IN (subquery)` or `a+b IN (subquery)` unnest
+// exactly like `x IN (subquery)` — the operand is already fully
+// resolved in the outer scope by planInExpr's resolveExpr call, same
+// as any other outer-scope expression.
 func isUnnestableNonCorrelatedIn(in *InExpr) bool {
-	if _, ok := in.Operand.(*ColumnRef); !ok {
+	if in.Operand == nil {
 		return false
 	}
 	if in.Plan == nil {
@@ -1347,8 +1355,7 @@ func unnestNonCorrelatedInExpr(in *InExpr, outer Node) (Node, error) {
 	if !isUnnestableNonCorrelatedIn(in) {
 		return nil, nil
 	}
-	outerCol, ok := in.Operand.(*ColumnRef)
-	if !ok {
+	if in.Operand == nil {
 		return nil, nil
 	}
 	innerPlan := in.Plan
@@ -1397,15 +1404,11 @@ func unnestNonCorrelatedInExpr(in *InExpr, outer Node) (Node, error) {
 	// Re-index inner key into the merged (outer ++ inner) coord.
 	innerKey.Index = outerWidth
 
-	// outer key references its column in outerChild's coord —
-	// preserved as-is.
-	outerKey := &ColumnRef{
-		pos:            outerCol.Pos(),
-		Index:          outerCol.Index,
-		Name:           outerCol.Name,
-		Type:           outerCol.Type,
-		SourceTableIdx: outerCol.SourceTableIdx,
-	}
+	// The outer key is the IN's left operand itself, already
+	// resolved against outerChild's coord by planInExpr — no
+	// ColumnRef reconstruction needed since LeftKey/RightKey accept
+	// any Expr (see isUnnestableNonCorrelatedIn's doc comment).
+	outerKey := in.Operand
 
 	// M0069-0005: drop the IN conjunct from the filter — the
 	// join encodes the equality via (LeftKey, RightKey) and the
