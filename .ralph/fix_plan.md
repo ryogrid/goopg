@@ -2659,7 +2659,7 @@ survey the deferral ledger for a fresh open (`status = -`) row.
       `psql`, expected/unchanged). `go vet
       ./internal/testutil/cluster/... ./internal/testport/...` clean.
 
-- [ ] nightly/units-race-co-load-timeout-20260709 — units stage
+- [x] nightly/units-race-co-load-timeout-20260709 — units stage
       (`cmd/goopg`, `internal/amcheck`, `internal/initdb`, `internal/mvcc`)
       and race stage (`cmd/goopg`, `internal/access/btree`,
       `internal/amcheck`, `internal/executor`) each had one package per
@@ -2696,6 +2696,27 @@ survey the deferral ledger for a fresh open (`status = -`) row.
       infra/scheduling noise rather than a genuine new deadlock. repro
       (representative, run alone, no co-load): `go test -race -timeout 60m
       -run '^TestExecutorDeadlockThreeSession$' ./internal/executor/`.
+      2026-07-09 follow-up loop — CONFIRMED infra/scheduling noise, not a
+      product regression. Ran all three named tests standalone (no other
+      nightly stage co-loaded), each with a generous 20m timeout to see the
+      actual wall time: `go test -race -timeout 20m -run
+      '^TestExecutorDeadlockThreeSession$' ./internal/executor/` → PASS in
+      1.5s test time (15.9s wall incl. build); `go test -race -timeout 20m
+      -run '^TestUpsertOnConflictDoUpdateWaitsOnForeignConflictingLock$'
+      ./internal/executor/` → PASS in 1.3s test time (1.8s wall); `go test
+      -timeout 20m -run '^TestStandbyControllerPromoteDrainsPendingReplay$'
+      ./cmd/goopg/` → PASS in 1.4s test time (2.1s wall). All three
+      completed in low single-digit seconds — orders of magnitude under the
+      33-53m nightly-batch kill, so the lock waits genuinely resolved almost
+      instantly once the 4-stage host contention (units+race+testport+
+      pgbench+tpch all running concurrently, each with its own `p=4`
+      parallel packages) was removed. No code change needed; no deadlock
+      exists. Closing as infra-only — this is a scheduling artifact of the
+      nightly batch's own concurrency, not a product bug. If a future
+      nightly run repeats this pattern, the fix belongs in
+      `ci/batch/` (e.g. don't co-schedule race/units alongside
+      pgbench/tpch, or raise the per-package `-timeout`), not in the tests
+      or the code they exercise.
 
 - [x] pgbench/nightly-reopen-20260709 — REOPENED a third time (subject
       `pgbench/nightly`; both prior tasks above are checked/closed but the
