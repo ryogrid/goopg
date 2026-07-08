@@ -765,6 +765,64 @@ func TestCheckpointerPostCheckpointFnErrorIsNonFatal(t *testing.T) {
 	}
 }
 
+// TestCheckpointerCallsTruncateSubtransFn verifies that runCheckpoint invokes
+// TruncateSubtransFn once per successful checkpoint, alongside TruncateCLOGFn
+// (M0122-0009).
+func TestCheckpointerCallsTruncateSubtransFn(t *testing.T) {
+	dir := t.TempDir()
+	walDir := filepath.Join(dir, "pg_wal")
+	w, err := NewWriter(Config{WALDir: walDir, SegmentSize: 4096,
+		PageHeaders: true, TimelineID: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	var callCount int
+	cp := NewCheckpointer(&fakeFlusher{}, w, CheckpointerConfig{
+		TruncateSubtransFn: func() error {
+			callCount++
+			return nil
+		},
+	})
+	if err := cp.runCheckpoint(context.Background(), false, false); err != nil {
+		t.Fatalf("runCheckpoint: %v", err)
+	}
+	if callCount != 1 {
+		t.Errorf("TruncateSubtransFn called %d times, want 1", callCount)
+	}
+
+	if err := cp.runCheckpoint(context.Background(), false, false); err != nil {
+		t.Fatalf("second runCheckpoint: %v", err)
+	}
+	if callCount != 2 {
+		t.Errorf("after second checkpoint: TruncateSubtransFn called %d times total, want 2", callCount)
+	}
+}
+
+// TestCheckpointerTruncateSubtransFnErrorIsNonFatal verifies that a non-nil
+// error from TruncateSubtransFn does not propagate out of runCheckpoint —
+// same best-effort treatment as PostCheckpointFn/TruncateCLOGFn.
+func TestCheckpointerTruncateSubtransFnErrorIsNonFatal(t *testing.T) {
+	dir := t.TempDir()
+	walDir := filepath.Join(dir, "pg_wal")
+	w, err := NewWriter(Config{WALDir: walDir, SegmentSize: 4096,
+		PageHeaders: true, TimelineID: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	cp := NewCheckpointer(&fakeFlusher{}, w, CheckpointerConfig{
+		TruncateSubtransFn: func() error {
+			return fmt.Errorf("simulated subtrans truncate failure")
+		},
+	})
+	if err := cp.runCheckpoint(context.Background(), false, false); err != nil {
+		t.Errorf("runCheckpoint returned error %v, want nil (hook errors must be non-fatal)", err)
+	}
+}
+
 // TestCheckpointerCallsFlushCLOGFn verifies that runCheckpoint invokes
 // FlushCLOGFn once per successful checkpoint, in the flush phase (i.e. it
 // does not need the primary flusher to be dirty). M0117-0007 Part B

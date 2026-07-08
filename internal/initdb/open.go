@@ -1552,6 +1552,26 @@ func Open(opts OpenOptions) (*Runtime, error) {
 			}
 			return clog.TruncateCLOG(horizon)
 		},
+		// M0122-0009: durable-ordered pg_subtrans truncation, same horizon
+		// computation as TruncateCLOGFn (safe: subtrans truncation only needs
+		// to stay at or below the CLOG horizon, never above it — see
+		// SubxactMap.Truncate's doc comment). Bounds the in-memory subxact map
+		// and on-disk pg_subtrans SLRU segment set, both otherwise unbounded
+		// for the lifetime of a long-lived cluster.
+		TruncateSubtransFn: func() error {
+			datFrozen := cat.DatFrozenXID()
+			if datFrozen < mvcc.FirstNormalTransactionID {
+				return nil
+			}
+			horizon := datFrozen
+			if ox := txnMgr.OldestXmin(); ox != 0 && storage.XIDPrecedes(ox, horizon) {
+				horizon = ox
+			}
+			if horizon < mvcc.FirstNormalTransactionID {
+				return nil
+			}
+			return subxactMap.Truncate(horizon)
+		},
 		// M0117-0007 Part B continuation: bound how long an async commit's
 		// deferred CLOG write-back can stay dirty in memory (see
 		// mvcc.CLog.setStatusWithLSN / FlushAll).

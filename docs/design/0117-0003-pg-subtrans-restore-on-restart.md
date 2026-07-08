@@ -119,10 +119,10 @@ restored links are visible to the first snapshot.
 
 ## Known limitations / follow-ups
 
-- **No `pg_subtrans` truncation.** Like the pre-G1 CLOG, the mirror grows without
-  bound (PG calls `TruncateSUBTRANS` at checkpoint). Negligible at goopg scale
-  (4 bytes per *subtransaction* XID, and subxacts are rare); truncation is a
-  follow-up coupled to the CLOG-truncation horizon already added in M0117/G1.
+- **`pg_subtrans` truncation: DONE (M0122-0009, 2026-07-09).** `SubtransSLRU.
+  TruncateBefore`/`SubxactMap.Truncate`, wired from the checkpointer's new
+  `TruncateSubtransFn` using the exact CLOG-truncation horizon this note
+  anticipated. See `docs/design/0122-0009-pg-subtrans-truncation.md`.
 - **`SUB_COMMITTED` lane** (the 0x03 CLOG state for a committed subxact whose parent
   is still in progress) is M0117-0004, not this task.
 

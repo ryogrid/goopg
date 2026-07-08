@@ -135,6 +135,18 @@ type CheckpointerConfig struct {
 	// are logged as warnings and do not fail the checkpoint. G1.
 	TruncateCLOGFn func() error
 
+	// TruncateSubtransFn, when non-nil, is called at the end of each
+	// successful checkpoint AFTER the checkpoint marker is durable, alongside
+	// TruncateCLOGFn, to truncate pg_subtrans (both the in-memory subxact map
+	// and its on-disk SLRU mirror) up to the same conservative horizon
+	// (M0122-0009). Without this, a long-lived cluster's subxact parent-link
+	// tracking grows without bound. The callee is responsible for computing a
+	// conservative horizon (never above any live snapshot's xmin); no WAL
+	// record is emitted (matches upstream — pg_subtrans truncation is not
+	// WAL-logged). Errors are logged as warnings and do not fail the
+	// checkpoint, same treatment as TruncateCLOGFn.
+	TruncateSubtransFn func() error
+
 	// FlushCLOGFn, when non-nil, is called during the dirty-page flush phase
 	// of every checkpoint (timed, volume-triggered, or on-demand) — in the
 	// same phase as, and before, the primary buffer-pool flush's redo LSN is
@@ -596,6 +608,13 @@ func (c *Checkpointer) runCheckpoint(ctx context.Context, spread, shutdown bool)
 	if c.cfg.TruncateCLOGFn != nil {
 		if err := c.cfg.TruncateCLOGFn(); err != nil {
 			c.cfg.Logger.Warn("post-checkpoint clog truncation failed", "err", err)
+		}
+	}
+	// M0122-0009: durable-ordered pg_subtrans truncation, same ordering
+	// rationale as TruncateCLOGFn above.
+	if c.cfg.TruncateSubtransFn != nil {
+		if err := c.cfg.TruncateSubtransFn(); err != nil {
+			c.cfg.Logger.Warn("post-checkpoint subtrans truncation failed", "err", err)
 		}
 	}
 	// M0057-0001: log checkpoint complete so benchmark runs can see

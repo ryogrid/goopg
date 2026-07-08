@@ -97,6 +97,45 @@ func (m *SubxactMap) RestoreFromSLRU() (int, error) {
 	return len(links), nil
 }
 
+// Truncate discards in-memory parent/abort entries for every subxid strictly
+// older than oldestXact and, when persistence is enabled, truncates the
+// on-disk pg_subtrans SLRU segments to match (M0122-0009). Without this, both
+// the in-memory maps and the on-disk SLRU segment set grow without bound for
+// the lifetime of a cluster.
+//
+// oldestXact should be the same conservative horizon TruncateCLOG is called
+// with (e.g. min(datfrozenxid, OldestXmin)) — safe because any subxid below
+// that horizon belongs to a top-level transaction that has long since
+// committed or aborted, so its terminal status is already resolvable
+// directly from CLOG without ever consulting the parent chain again. Mirrors
+// PG subtrans.c:TruncateSUBTRANS, called with
+// GetOldestTransactionIdConsideredRunning() at every checkpoint; using the
+// CLOG horizon here instead is at least as conservative (never truncates
+// more than upstream would).
+//
+// Wraparound-safe: entry ages are compared via storage.XIDPrecedes, not a
+// plain `<`. Idempotent and safe to call repeatedly with the same or an
+// older XID.
+func (m *SubxactMap) Truncate(oldestXact storage.TransactionID) error {
+	m.mu.Lock()
+	for subxid := range m.parents {
+		if storage.XIDPrecedes(subxid, oldestXact) {
+			delete(m.parents, subxid)
+		}
+	}
+	for subxid := range m.aborted {
+		if storage.XIDPrecedes(subxid, oldestXact) {
+			delete(m.aborted, subxid)
+		}
+	}
+	slru := m.slru
+	m.mu.Unlock()
+	if slru == nil {
+		return nil
+	}
+	return slru.TruncateBefore(oldestXact)
+}
+
 // Register records that subxid is a child of parentXid. Must be called
 // when a subtransaction first writes (lazy XID allocation). When persistence
 // is enabled (EnablePersistence), the parent link is also written through to

@@ -4903,6 +4903,53 @@ mirroring M0119's ledger `status` column.
 - [ ] **M0122-0009 — WAL / recovery / crash-consistency infra** (~16). WAL segment
       recycling, `WALInsertLock` array (parallel inserts), MultiXact WAL,
       `pg_subtrans` truncation. Gate: `-race` + recovery E2E (WAL practice card).
+      **`pg_subtrans` truncation landed (2026-07-09, this loop):** the bucket's
+      one previously-untouched item with no prior progress notes.
+      `internal/mvcc/subxact_visibility.go`'s `SubxactMap` (in-memory
+      `parents`/`aborted` maps) and `internal/mvcc/subxact_slru.go`'s
+      `SubtransSLRU` (`pg_subtrans/` SLRU mirror, M0117-0003) had no removal
+      primitive at all — both grew without bound for the lifetime of a
+      cluster, a gap the M0117-0003 design doc's own "Known follow-ups"
+      section had already flagged and left for later. New
+      `SubtransSLRU.TruncateBefore(oldestXact)` unlinks segment files whose
+      highest page strictly precedes `oldestXact`'s SLRU page (new
+      `SubtransPagePrecedes`, `CLOGPagePrecedes`'s twin scaled to
+      `subtransXactsPerPage`), mirroring `clog.go`'s `truncateSLRUSegments`
+      (reuses the same-package `parseSLRUSegName` helper). New
+      `SubxactMap.Truncate(oldestXact)` prunes both in-memory maps
+      (wraparound-safe via `storage.XIDPrecedes`) and calls through to the
+      SLRU when persistence is enabled; nil-safe when it isn't. New
+      `CheckpointerConfig.TruncateSubtransFn` (`internal/wal/checkpointer.go`)
+      invoked from `runCheckpoint` right after `TruncateCLOGFn`, same
+      best-effort/non-fatal error treatment. `internal/initdb/open.go` wires
+      it to the identical `horizon = min(datfrozenxid, OldestXmin)`
+      computation `TruncateCLOGFn` already uses — safe because any subxid
+      below that horizon's top-level xact already has a direct CLOG
+      `Committed`/`Aborted` status (never `SubCommitted`), so its parent link
+      is never consulted again; reusing the existing, already-tested horizon
+      avoids introducing a second, subtly-different computation. No WAL
+      record emitted — matches upstream `TruncateSUBTRANS`, which PG likewise
+      never WAL-logs (`pg_subtrans` is disposable across a crash;
+      `StartupSUBTRANS` just zeroes it on restart — goopg's restore-on-restart
+      choice per M0117-0003 is an orthogonal, deliberate divergence unrelated
+      to this fix). Tests: `TestSubtransSLRUTruncateBefore`/
+      `TestSubxactMapTruncate`/`TestSubxactMapTruncateNoPersistence`
+      (`internal/mvcc/subxact_truncate_test.go`),
+      `TestCheckpointerCallsTruncateSubtransFn`/
+      `TestCheckpointerTruncateSubtransFnErrorIsNonFatal`
+      (`internal/wal/checkpointer_test.go`). Design:
+      `docs/design/0122-0009-pg-subtrans-truncation.md` (new);
+      `docs/design/0117-0003-pg-subtrans-restore-on-restart.md`'s "Known
+      follow-ups" section updated to point at it; `docs/design/README.md`
+      index updated (both the new row and the 0117-0003 row's stale
+      follow-up note). Gates: `go build ./...` clean; `go vet`/`go test`
+      clean+PASS across `internal/mvcc`/`internal/wal`/`internal/initdb`
+      (the `internal/initdb` package test takes ~5 min, ran to completion);
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed transactions, all 3 pgbench workloads). **Still open in this
+      bucket:** WAL segment recycling, `WALInsertLock` array (parallel
+      inserts), MultiXact WAL.
 - [ ] **M0122-0010 — Concurrency: buffer pool & btree locking** (~17, LARGE).
       Lehman/Yao crab-walk, `splitMu` removal, storage-pool pin-count race,
       re-enable the `-race` gate. Gate: race detector mandatory.
