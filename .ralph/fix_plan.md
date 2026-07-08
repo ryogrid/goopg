@@ -4687,9 +4687,46 @@ mirroring M0119's ledger `status` column.
       this loop's blast radius to the two forms with a passing non-vacuous
       test) and `REINDEX ... CONCURRENTLY`'s physical rebuild (needs a
       genuine shadow-index build-then-swap, a materially larger capability
-      goopg does not have). **Still open** (M0122-0007 bucket, ~3
-      remaining items): CREATE/DROP DATABASE full DDL, tablespace physical
-      relocation, REINDEX SCHEMA/CONCURRENTLY physical rebuild.
+      goopg does not have).
+      **REINDEX SCHEMA physical rebuild — done (2026-07-09 follow-up):**
+      closed the resume point named directly above. The `SCHEMA` case's
+      per-relation loop now calls `rebuildTableIndexes(tbl, pos)` for each
+      non-concurrent table (same mechanism `REINDEX TABLE` already used),
+      instead of only acquiring/releasing a transient `ShareLock` and
+      leaving corrupted storage untouched. `schemaRelsByOID` was renamed to
+      `schemaTableNamesByOID` and now returns qualified `parser.ObjectName`s
+      re-resolved via `o.ctx.Catalog.LookupTable` immediately before each
+      use (previously the loop captured `Table`/`RelFileNode` once up
+      front) — necessary because `reindex-schema.spec` exercises a second
+      table being concurrently dropped while REINDEX SCHEMA is still
+      waiting on an earlier table's conflicting lock; a stale captured
+      pointer would try to rebuild a since-removed relation, while
+      re-resolving and silently skipping a lookup miss reproduces
+      upstream's tolerate-concurrent-drop behavior. New test
+      `TestReindexSchemaPhysicallyRebuildsAllTables`
+      (`internal/executor/reindex_physical_rebuild_test.go`): a schema with
+      two tables, each given a truncated btree index; `REINDEX SCHEMA`
+      rebuilds both, confirmed non-vacuous via `git stash` on
+      `operators_reindex.go` alone (fails `short read at block` pre-fix).
+      Re-ran `go test -v -run '^TestPort_IsolationReindexSchema$'
+      ./internal/testport/` after the change — still PASS, confirming the
+      concurrent-drop-tolerance behavior the isolation spec exercises
+      survived the switch from transient-lock-only to actual rebuild.
+      Design: `docs/design/0122-0007-reindex-physical-rebuild.md` updated
+      Fix/Deferral sections; `docs/design/README.md` row updated;
+      deferral-ledger new row (M0122-0007, 2026-07-09) closes item (1),
+      leaves item (2) — `REINDEX ... CONCURRENTLY` across all three object
+      types — open. Gates: `go build ./...`/`go vet ./internal/executor/...`
+      clean; `go test ./internal/executor/... ./internal/access/btree/...
+      ./internal/catalog/... ./internal/planner/...` PASS; `go test
+      ./internal/testport/... -run
+      'TestPort_IsolationReindex|TestPort_IsolationMultipleCic'` PASS (all 4
+      specs, no regression); `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+      scripts/ralph-precommit-test.sh` PASS (0 failed txns, all 3
+      workloads). **Still open** (M0122-0007 bucket, ~3 remaining items):
+      CREATE/DROP DATABASE full DDL, tablespace physical relocation,
+      REINDEX CONCURRENTLY physical rebuild (all object types).
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,

@@ -5,11 +5,11 @@ package executor
 // REINDEX INDEX name validates the index exists; REINDEX TABLE validates
 // the table. Raises 42P01 for nonexistent targets matching PostgreSQL.
 //
-// Plain (non-CONCURRENTLY) REINDEX INDEX / REINDEX TABLE physically rebuild
-// their btree index(es) from a fresh heap scan, reusing CREATE INDEX's
-// bulk-build path (M0122-0007, design 0122-0007-reindex-physical-rebuild).
-// REINDEX SCHEMA and every CONCURRENTLY form remain a catalog-only no-op —
-// see that design doc's Deferral section.
+// Plain (non-CONCURRENTLY) REINDEX INDEX / REINDEX TABLE / REINDEX SCHEMA
+// physically rebuild their btree index(es) from a fresh heap scan, reusing
+// CREATE INDEX's bulk-build path (M0122-0007, design
+// 0122-0007-reindex-physical-rebuild). Every CONCURRENTLY form remains a
+// catalog-only no-op — see that design doc's Deferral section.
 
 import (
 	"context"
@@ -151,29 +151,39 @@ func (o *reindexOp) Next() (TupleSlot, error) {
 			return nil, err
 		}
 	case "SCHEMA":
-		// REINDEX SCHEMA rebuilds every index on every table in the schema.
-		// goopg's physical rebuild is a no-op, but the lock behaviour is
-		// observable: a plain reindex takes a ShareLock per relation (which
-		// conflicts with a concurrent SHARE UPDATE EXCLUSIVE holder, so it
-		// waits), while REINDEX SCHEMA CONCURRENTLY takes no conflicting lock
+		// REINDEX SCHEMA rebuilds every btree index on every table in the
+		// schema, one relation at a time: a plain reindex holds a ShareLock
+		// on each table for the duration of that table's own rebuild (via
+		// rebuildTableIndexes/rebuildIndex, same as REINDEX TABLE), which
+		// conflicts with a concurrent SHARE UPDATE EXCLUSIVE holder and so
+		// waits there; REINDEX SCHEMA CONCURRENTLY takes no conflicting lock
 		// and instead waits for existing lockers to drain (the CONCURRENTLY
-		// contract). Relations are processed in OID (creation) order so the
-		// stall lands on the earliest-created locked table first — which lets a
-		// concurrent DROP of a later, not-yet-reached table proceed while the
-		// reindex waits, exactly like upstream. M0118-0008 (reindex-schema).
+		// contract), with its physical rebuild staying a no-op, same as
+		// REINDEX TABLE/INDEX CONCURRENTLY. Relations are processed in OID
+		// (creation) order so the stall lands on the earliest-created locked
+		// table first — which lets a concurrent DROP of a later,
+		// not-yet-reached table proceed while the reindex waits. Such a
+		// table is re-looked-up by OID immediately before use (rather than
+		// resolved once up front) and silently skipped if it no longer
+		// exists, matching upstream's tolerate-concurrent-drop behaviour
+		// (reindex-schema.spec: drop3 succeeds mid-wait, reindex2/
+		// reindex_conc2 still completes). M0118-0008 (reindex-schema);
+		// M0122-0007 (physical rebuild).
 		schemaName := name.Name
 		if name.Schema != "" {
 			schemaName = name.Schema
 		}
-		for _, rel := range o.schemaRelsByOID(schemaName) {
+		for _, tn := range o.schemaTableNamesByOID(schemaName) {
+			tbl, ok := o.ctx.Catalog.LookupTable(tn)
+			if !ok {
+				continue
+			}
 			if o.stmt.Concurrently {
-				if err := o.ctx.waitForRelationLockers(rel); err != nil {
+				if err := o.ctx.waitForRelationLockers(o.ctx.Catalog.RelFileNode(tbl)); err != nil {
 					return nil, err
 				}
-			} else {
-				if err := o.ctx.acquireRelLockMaybeTransient(rel, lockmgr.ShareLock); err != nil {
-					return nil, err
-				}
+			} else if err := o.rebuildTableIndexes(tbl, o.stmt.Pos()); err != nil {
+				return nil, err
 			}
 		}
 	}
@@ -300,28 +310,33 @@ func reindexLockWaitError(err error) error {
 	return &ExecError{Code: "XX000", Message: err.Error()}
 }
 
-// schemaRelsByOID returns the RelFileNodes of every non-virtual user table in
-// schemaName, ordered by OID (creation order). REINDEX SCHEMA locks/waits on
-// relations in this order so the first stall is on the earliest-created locked
-// table, matching upstream's relation processing order. M0118-0008.
-func (o *reindexOp) schemaRelsByOID(schemaName string) []storage.RelFileNode {
+// schemaTableNamesByOID returns the qualified names of every non-virtual user
+// table in schemaName, ordered by OID (creation order). REINDEX SCHEMA
+// locks/waits/rebuilds relations in this order so the first stall is on the
+// earliest-created locked table, matching upstream's relation processing
+// order. Returning names (rather than resolved Table pointers or
+// RelFileNodes captured once up front) lets the caller re-resolve each
+// relation via LookupTable immediately before use, so a table concurrently
+// dropped while REINDEX SCHEMA waits on an earlier one is detected and
+// skipped instead of operating on stale catalog state. M0118-0008.
+func (o *reindexOp) schemaTableNamesByOID(schemaName string) []parser.ObjectName {
 	tables := o.ctx.Catalog.TablesInSchema(schemaName)
-	type relOID struct {
-		rfn storage.RelFileNode
-		oid uint32
+	type namedOID struct {
+		name parser.ObjectName
+		oid  uint32
 	}
-	rels := make([]relOID, 0, len(tables))
+	named := make([]namedOID, 0, len(tables))
 	for _, tn := range tables {
 		tbl, ok := o.ctx.Catalog.LookupTable(tn)
 		if !ok {
 			continue
 		}
-		rels = append(rels, relOID{rfn: o.ctx.Catalog.RelFileNode(tbl), oid: tbl.OID})
+		named = append(named, namedOID{name: tn, oid: tbl.OID})
 	}
-	sort.Slice(rels, func(i, j int) bool { return rels[i].oid < rels[j].oid })
-	out := make([]storage.RelFileNode, len(rels))
-	for i, r := range rels {
-		out[i] = r.rfn
+	sort.Slice(named, func(i, j int) bool { return named[i].oid < named[j].oid })
+	out := make([]parser.ObjectName, len(named))
+	for i, n := range named {
+		out[i] = n.name
 	}
 	return out
 }

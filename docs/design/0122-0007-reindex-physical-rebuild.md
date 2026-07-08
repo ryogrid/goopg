@@ -1,4 +1,4 @@
-# 0122-0007 — REINDEX physical rebuild (plain `REINDEX INDEX` / `REINDEX TABLE`)
+# 0122-0007 — REINDEX physical rebuild (plain `REINDEX INDEX` / `TABLE` / `SCHEMA`)
 
 - **Milestone:** M0122-0007 (DDL / admin commands / ctl / GUC config)
 - **Status:** accepted (partial — see Deferral)
@@ -18,9 +18,9 @@ real-world purpose) silently did nothing while reporting success.
 
 ## Fix
 
-Plain (non-`CONCURRENTLY`) `REINDEX INDEX name` and `REINDEX TABLE name` now
-physically rebuild every btree index involved, reusing CREATE INDEX's own
-bulk-build path rather than inventing a new one:
+Plain (non-`CONCURRENTLY`) `REINDEX INDEX name`, `REINDEX TABLE name`, and
+`REINDEX SCHEMA name` now physically rebuild every btree index involved,
+reusing CREATE INDEX's own bulk-build path rather than inventing a new one:
 
 - `reindexOp.rebuildIndex(idx, pos)` resolves `idx`'s key columns (mirroring
   `createBTreeIndex`'s column-lookup loop) and its partial-index predicate (via
@@ -41,7 +41,20 @@ bulk-build path rather than inventing a new one:
   `execCreateIndex`'s catalog-only branch) — so `rebuildIndex` is a no-op for
   `idx.Method != "btree"`, matching that pre-existing scope boundary exactly.
 - `reindexOp.rebuildTableIndexes(tbl, pos)` calls `rebuildIndex` for every
-  `catalog.IndexesOnTable(tbl)` entry; used by `REINDEX TABLE`.
+  `catalog.IndexesOnTable(tbl)` entry; used by `REINDEX TABLE` and (2026-07-09
+  follow-up) `REINDEX SCHEMA`'s per-table loop.
+- **`REINDEX SCHEMA` follow-up (2026-07-09):** the `SCHEMA` branch's
+  per-relation loop now calls `rebuildTableIndexes` for each non-concurrent
+  table instead of only acquiring/releasing a transient `ShareLock`
+  (`schemaTableNamesByOID` — renamed from `schemaRelsByOID` — now returns
+  qualified names, re-resolved via `LookupTable` immediately before use
+  instead of once up front). This matters because `reindex-schema.spec`
+  exercises a table being concurrently dropped *while REINDEX SCHEMA is still
+  waiting on an earlier table's lock*: capturing `Table`/`RelFileNode` once up
+  front (as the old `schemaRelsByOID` did) would hand a stale pointer to a
+  since-dropped relation to the rebuild step; re-resolving by name and
+  silently skipping a lookup miss reproduces upstream's tolerate-concurrent-
+  drop behaviour instead.
 
 ### Locking: a real hold, not the file's existing wait-only pattern
 
@@ -90,14 +103,10 @@ cancellation) map onto the same `ExecError` codes
   not blocking access). The existing wait-for-lockers behaviour
   (`waitForRelationLockers`, M0118-0008) is unchanged; only the trailing
   physical rebuild remains a no-op, exactly as before this slice.
-- **`REINDEX SCHEMA` (concurrent or not).** Its per-relation loop
-  (`schemaRelsByOID`) still only acquires/waits on the table-level lock, the
-  same transient pattern as before — it does not call `rebuildTableIndexes`.
-  Wiring it in is straightforward (the same per-table call this slice added to
-  the `TABLE` branch) but was left for a follow-up to keep this slice's blast
-  radius to the two forms with a passing non-vacuous rebuild test, and to avoid
-  touching the already-strict `reindex-schema` isolation spec's exact lock
-  sequencing in the same loop that also changed the physical-rebuild surface.
+- **`REINDEX SCHEMA CONCURRENTLY`.** Its per-relation loop still only calls
+  `waitForRelationLockers` — the same behaviour as before this follow-up; it
+  does not rebuild. Needs the same shadow-index build-then-swap machinery as
+  the other `CONCURRENTLY` forms above.
 - **`REINDEX DATABASE` / `REINDEX SYSTEM`.** Unchanged catalog-only no-op (no
   `case` in the `ObjectType` switch at all); `reindexdb`'s TAP-ported tests
   (`TestPort_Scripts090Reindexdb`/`091ReindexdbAll`) only ever issue
@@ -124,6 +133,10 @@ cancellation) map onto the same `ExecError` codes
     Confirmed non-vacuous: fails (`REINDEX INDEX completed while a concurrent
     ... reader still held the index`) pre-fix, since the pre-fix code never
     acquired any lock for the `INDEX` case at all.
+  - `TestReindexSchemaPhysicallyRebuildsAllTables` (2026-07-09 follow-up) — two
+    tables in one schema, each with a truncated btree index; `REINDEX SCHEMA`
+    must rebuild both. Confirmed non-vacuous via `git stash` on
+    `operators_reindex.go` alone — fails with `short read at block` pre-fix.
 - Live-verified against the real `cmd/goopg` binary: created a table + btree
   index, confirmed `EXPLAIN` chose an Index Scan, stopped the server, zero-byte
   truncated the index's on-disk relfilenode file directly (`base/<db>/<oid>`),
@@ -135,16 +148,17 @@ cancellation) map onto the same `ExecError` codes
   ./internal/executor/... ./internal/access/btree/... ./internal/catalog/...
   ./internal/planner/...` PASS; `go test ./internal/testport/... -run
   'TestPort_IsolationReindex|TestPort_IsolationMultipleCic'` PASS (all 4 specs,
-  no regression — none of them exercise the plain non-CONCURRENTLY
-  `INDEX`/`TABLE` forms this slice changed); `scripts/tpch-spotcheck.sh` PASS
-  (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh`
-  PASS (0 failed txns, all 3 workloads).
+  no regression — `TestPort_IsolationReindexSchema` in particular still passes
+  after the 2026-07-09 follow-up wired physical rebuild into the `SCHEMA`
+  branch, confirming the concurrent-drop-tolerance behaviour survived);
+  `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+  `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0 failed
+  txns, all 3 workloads).
 
 ## Deferral
 
-`REINDEX SCHEMA`'s physical rebuild (per-table `rebuildTableIndexes` call,
-same mechanism this slice already built) and `REINDEX ... CONCURRENTLY`'s
-physical rebuild (needs a genuine shadow-index build-then-swap, a materially
-larger capability) remain open — see `.ralph/deferral_ledger.md`. Also
-carried forward unchanged from the parent M0122-0007 bucket: `CREATE`/`DROP
-DATABASE` full DDL, tablespace physical relocation.
+`REINDEX ... CONCURRENTLY`'s physical rebuild (all three object types —
+`INDEX`/`TABLE`/`SCHEMA`; needs a genuine shadow-index build-then-swap, a
+materially larger capability) remains open — see `.ralph/deferral_ledger.md`.
+Also carried forward unchanged from the parent M0122-0007 bucket: `CREATE`/
+`DROP DATABASE` full DDL, tablespace physical relocation.
