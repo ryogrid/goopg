@@ -1,58 +1,59 @@
-(idle — nothing in flight)
+Task: storage/aio-relfile-mu-bypass (fix_plan.md ~line 1300) — PARTIALLY
+RESOLVED this loop (checksum-bypass half fixed; item stays unchecked
+because the original per-block ordering half is still open).
 
-M-NIGHTLY pgbench/nightly-reopen-20260708 (AI-20260708-064334-001) CLOSED
-this loop (14th loop on the reopen) after 13 prior investigation-only
-loops. Root cause: storage.bufmap.Insert (internal/storage/bufmap.go)
-stopped at the FIRST tombstone-or-empty bucket in its open-addressing
-probe chain, contradicting Lookup's/Delete's own "tombstones do NOT
-terminate probing" invariant — let two different buffer-pool slots
-simultaneously "own" the same BufferTag, which then raced a disk reload
-against a legitimate flush of the same block, permanently discarding a
-write. Found via NEW direct bufmap Insert/Delete instrumentation
-(storage.Pool.OnBufmapInsert/OnBufmapDelete, BTree.DebugTraceBufmap/
-CheckBufmapExclusivity) — the one angle none of the 13 prior loops had
-tried. Fixed Insert to scan to a true-empty terminator before deciding,
-remembering the first tombstone/empty as the write target (standard
-open-addressing-with-tombstones algorithm).
+Files modified (all committed as f1228a65, pushed):
+internal/aio/aio.go (new ChecksumFile interface), internal/aio/
+method_iouring_linux.go (Submit/submitOne/completeOne/pendingOp wired
+to call PrepareWrite before SQE submission for writes and VerifyRead
+after completion for reads), internal/aio/method_iouring_linux_test.go
+(new TestEngineIOUringChecksumFileHooks), internal/storage/smgr.go
+(relFile.PrepareWrite/VerifyRead implementing ChecksumFile
+structurally), internal/storage/checksum_io_test.go (new
+TestChecksumRelFilePrepareWriteVerifyRead), docs/design/
+0009-0006-aio-io-uring.md (new section), docs/design/README.md
+(0009-0006 row appended), .ralph/fix_plan.md (task entry updated,
+left unchecked).
 
-Verification this loop: TestBufmapInsertSkipsPastTombstoneToExistingKey
-(new, confirmed fails pre-fix/passes post-fix) — go test ./internal/
-storage/... ./internal/access/btree/... ./internal/amcheck/...
-./internal/executor/... PASS — TestVerifyBtreeEngineSilentOnRealConcurrentContended
-permanently un-skipped, 6/6 clean runs + 1 -race run (176s, zero races) —
-scripts/tpch-spotcheck.sh PASS (Q12=2/Q13=33) — RALPH_PRECOMMIT_SCOPE=smoke
-scripts/ralph-precommit-test.sh PASS (0 failed, all 3 workloads) — AND the
-exact authoritative nightly repro (ci/batch/stages/stage-pgbench.sh,
-scale=50 clients=100 threads=20 duration=180x3) PASS, 0 failed
-transactions. docs/design/root-0005-buffer-manager.md's Concurrency Model
-section updated with the new invariant. fix_plan.md task marked [x]
-CLOSED with full writeup. No deferral-ledger row needed (complete fix +
-permanent regression test, not a partial/deferred one).
+Findings this loop: investigating the 13th-loop's "relFile.mu bypass"
+finding showed MethodWorker/MethodSync were NEVER actually bypassed
+(runOp calls op.File.ReadAt/WriteAt, and relFile.ReadAt/WriteAt already
+take relFile.mu + apply checksums) — only methodIOUring's raw-fd
+fdHaver path bypasses File.ReadAt/WriteAt. That bypass had a second,
+more concrete consequence nobody had named yet: on a checksummed
+cluster with io_method=io_uring, every AIO write persisted a stale
+pd_checksum (never stamped) and every AIO read skipped verification —
+and a LATER synchronous read of an AIO-written block would then report
+a false-positive ChecksumError for a page that was never corrupted.
+Fixed via aio.ChecksumFile{PrepareWrite,VerifyRead}, wired into
+Submit/completeOne, implemented by relFile via the same helpers
+WriteAt/ReadAt already use. Verified non-vacuous (reverted wiring only,
+confirmed the new aio test fails: 0 PrepareWrite calls, unstamped bytes
+on disk).
 
-Files modified (all committed by end of this loop): internal/storage/
-bufmap.go (the fix), internal/storage/bufmap_test.go (new regression
-test), internal/storage/bufpool.go (bmInsert/bmDelete wrapper +
-OnBufmapInsert/OnBufmapDelete hooks), internal/access/btree/btree.go
-(BufmapEvent/RecordBufmapInsert/RecordBufmapDelete/CheckBufmapExclusivity
-debug aids), internal/amcheck/verify_nbtree_realtree_test.go (wired debug
-aids + permanently un-skipped the repro test), docs/design/
-root-0005-buffer-manager.md, .ralph/fix_plan.md.
+Next step for a future loop: the ORIGINAL per-(rel,block) same-tag
+ordering concern (a concurrent synchronous readBlock/writeBlock/extend,
+or another io_uring op, on the SAME block of the SAME relFile is still
+not serialized against an in-flight io_uring raw-fd op) remains open.
+Per the 2026-07-08 M-NIGHTLY deferral-ledger row's hand-trace,
+Slot.contentMu's RWMutex already prevents this from being reachable via
+the ONE production call site (Pool.flushBatch's WriteBlockAIO) today —
+so this is latent-risk, not confirmed-reachable, but still worth
+closing properly. Design (don't rush) a per-(rel,block) in-flight-AIO
+registry consulted by readBlock/writeBlock/WriteBlockAIO/PrefetchBlock,
+NOT a blanket per-file mutex (would regress checkpointer throughput via
+methodIOUring's already-file-scoped submitMu comparison point). Verify
+with a targeted concurrency test: real io_uring engine + a concurrent
+synchronous smgr call to the exact same (rel,block).
 
-Next step for a future loop: pick up the separate, still-open
-`storage/aio-relfile-mu-bypass` fix_plan item (storage.Manager.
-WriteBlockAIO/PrefetchBlock bypass relFile.mu when an AIOEngine is
-attached; needs its own per-(rel,block) in-flight-AIO registry design —
-not proven related to the just-fixed bug, do not conflate). Also
-consider whether the new OnBufmapInsert/OnBufmapDelete debug hooks
-should be left in place (zero-cost when nil, matches the existing
-Debug*/On* pattern) or trimmed — current judgment: leave them, they are
-now permanent regression-test infrastructure (CheckBufmapExclusivity),
-same as OnFlushSnapshot/OnBlockReload before them.
+Gates run this loop: go build ./... / go vet ./... clean; go test
+./internal/aio/... ./internal/storage/... ./internal/initdb/... PASS;
+go test -race -run TestEngineIOUring ./internal/aio/... PASS;
+scripts/tpch-spotcheck.sh PASS (Q12=2/Q13=33);
+RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh PASS (0
+failed txns, all 3 workloads, both standalone and via the pre-commit
+hook); make ralph-state-guard PASS (auto-repaired a stale
+status/progress marker, unrelated to this loop's work).
 
-Gates run this loop: go build ./... clean; go vet ./internal/storage/...
-./internal/access/btree/... ./internal/amcheck/... clean; full test
-suite as listed above all PASS; make ralph-state-guard PASS (auto-
-repaired a stale status/progress marker from a prior loop, unrelated to
-this loop's work).
-
-In-flight: none. No background processes left running.
+In-flight: none. No background processes left running. Commit
+f1228a65 pushed to origin/align-data-structure-with-pg.
