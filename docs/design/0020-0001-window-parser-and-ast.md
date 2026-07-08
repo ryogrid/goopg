@@ -669,3 +669,72 @@ against upstream PostgreSQL 18.3 row-for-row).
 the substantially larger remaining item, needing per-ORDER-BY-column
 `<`/`=` peer comparison (`RANGE`) or group-counting bounds (`GROUPS`)
 instead of `ROWS`' plain row-index arithmetic.
+
+## Follow-up: GROUPS window frame mode (2026-07-09, M0122-0004)
+
+Implemented `GROUPS` frame mode — closes half of the deferred item
+above. `RANGE` remains rejected (`0A000`): unlike `GROUPS`, its offset
+bounds need a per-ORDER-BY-column `+`/`-`/`<` operator lookup keyed on
+the ordering column's data type (numeric `+`/`-`, `interval` for
+datetime columns), a materially larger, type-system-reaching capability
+this slice doesn't build. `GROUPS`, per spec (`syntax.sgml`,
+`postgres/src/backend/parser/parse_clause.c`), only needs its offset
+treated as a non-negative integer count of ORDER BY *peer groups*
+rather than rows — the same offset-resolution/validation machinery
+`ROWS` already has (`resolveFrameOffset`), just applied to peer-group
+indices instead of row indices — so it did not need the `RANGE`-only
+operator-lookup machinery.
+
+**Analyzer (`internal/analyzer/analyzer.go`):** `validateWindowFrame`
+now takes the window's `ORDER BY` column count and switches on
+`fr.Mode`: `FrameModeRows` is unrestricted (as before), `FrameModeGroups`
+requires at least one `ORDER BY` column (`42P20` "GROUPS mode requires
+an ORDER BY clause", matching `parse_clause.c`'s post-parse check
+byte-for-byte — verified against a real PostgreSQL 18.3 instance), and
+anything else (`FrameModeRange`) is still rejected with `0A000`. Bound-
+ordering validation (`42P20`) is unchanged — it was already mode-
+agnostic.
+
+**Planner (`internal/planner/plan.go`/`planner.go`):** `planner.WindowFrame`
+gains a `Mode parser.FrameMode` field (previously dropped during
+lowering, since a `Frame` reaching the planner was always `ROWS`);
+`resolveWindowFrame` now carries it through unchanged from the parsed
+`parser.WindowFrame`.
+
+**Executor (`internal/executor/operators_window.go`):** `frameBounds`
+gained a `groupBounds []int` parameter (the partition's peer-group
+boundary array, as returned by the existing `peerGroupBounds` — nil
+for `ROWS`-mode callers) and now dispatches to a new
+`frameBoundsGroups` when `Frame.Mode == FrameModeGroups`. `frameBoundsGroups`
+mirrors `frameBounds`' own `ROWS`-mode arithmetic exactly, but performs
+it on peer-*group* indices (via a new `groupIndexOf` helper — the same
+binary search `peerBoundsOf` already used, now factored out and shared)
+instead of row indices, then translates the resulting `[startGroup,
+endGroup)` back to an absolute `[startRow, endRow)` row range through
+`groupBounds`. `evalExplicitFrameAggFuncs` now computes `groupBounds`
+whenever `Frame.Mode == FrameModeGroups` (previously only for an
+`EXCLUDE` clause) and threads it into every `frameBounds` call; the
+`first_value`/`last_value`/`nth_value` cases in the main per-row loop
+do the same via the existing `valueGroupBounds` (its populate-condition
+widened to also cover `GROUPS` mode, not just `EXCLUDE`). No change was
+needed for `row_number`/`rank`/`dense_rank`/`lag`/`lead`/`ntile`/
+`percent_rank`/`cume_dist` — per spec they are frame-independent
+regardless of mode, already established by the `ROWS` slice above.
+
+**Tests:** `internal/analyzer/analyzer_test.go`
+(`TestAnalyzeWindowFrameRangeRejected` — renamed/narrowed from
+`TestAnalyzeWindowFrameRangeGroupsRejected`;
+`TestAnalyzeWindowFrameGroupsAccepted`;
+`TestAnalyzeWindowFrameGroupsRequiresOrderByRejected`),
+`internal/executor/window_compat_test.go`
+(`TestCompatWindowExplicitGroupsFrameSliding` — duplicate-key data so
+`GROUPS` genuinely diverges from an equivalent `ROWS` frame;
+`TestCompatWindowGroupsUnboundedPrecedingCumulative`), both cross-
+checked row-for-row against a real PostgreSQL 18.3 instance. Confirmed
+non-vacuous via `git stash` on the four impl files (fails pre-fix with
+the old `0A000` "only ROWS is implemented" error).
+
+**Still deferred (ledger row, M0122-0004):** `RANGE` frame
+mode — needs the per-ORDER-BY-column operator-lookup machinery
+described above; `GROUPS`' peer-group index arithmetic doesn't
+generalize to it.

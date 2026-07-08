@@ -212,7 +212,9 @@ func (o *windowOp) evalWindowFuncs() error {
 		// computed when one of those functions is actually present.
 		var frameEnd []int
 		var valueGroupBounds []int
-		needsValueGroupBounds := o.plan.Frame != nil && o.plan.Frame.Exclusion != parser.FrameExcludeNone && hasFrameValueWindowFunc(o.plan.Funcs)
+		needsValueGroupBounds := o.plan.Frame != nil &&
+			(o.plan.Frame.Exclusion != parser.FrameExcludeNone || o.plan.Frame.Mode == parser.FrameModeGroups) &&
+			hasFrameValueWindowFunc(o.plan.Funcs)
 		if hasFrameValueWindowFunc(o.plan.Funcs) {
 			groupBounds, err := o.peerGroupBounds(pStart, pEnd)
 			if err != nil {
@@ -309,7 +311,7 @@ func (o *windowOp) evalWindowFuncs() error {
 				case "first_value":
 					start, end := pStart, frameEnd[localIdx]
 					if o.plan.Frame != nil {
-						start, end = o.frameBounds(pStart, pEnd, i)
+						start, end = o.frameBounds(pStart, pEnd, i, valueGroupBounds)
 					}
 					idx := start
 					if o.plan.Frame != nil && o.plan.Frame.Exclusion != parser.FrameExcludeNone {
@@ -328,7 +330,7 @@ func (o *windowOp) evalWindowFuncs() error {
 				case "last_value":
 					start, end := pStart, frameEnd[localIdx]
 					if o.plan.Frame != nil {
-						start, end = o.frameBounds(pStart, pEnd, i)
+						start, end = o.frameBounds(pStart, pEnd, i, valueGroupBounds)
 					}
 					idx := end - 1
 					if o.plan.Frame != nil && o.plan.Frame.Exclusion != parser.FrameExcludeNone {
@@ -358,7 +360,7 @@ func (o *windowOp) evalWindowFuncs() error {
 					}
 					start, end := pStart, frameEnd[localIdx]
 					if o.plan.Frame != nil {
-						start, end = o.frameBounds(pStart, pEnd, i)
+						start, end = o.frameBounds(pStart, pEnd, i, valueGroupBounds)
 					}
 					var target int
 					if o.plan.Frame != nil && o.plan.Frame.Exclusion != parser.FrameExcludeNone {
@@ -540,19 +542,19 @@ func (o *windowOp) evalFrameAggFuncs(aggHelper *aggregateOp, colBase, pStart, pE
 }
 
 // evalExplicitFrameAggFuncs computes sum/count/avg/min/max for an
-// explicit ROWS frame clause. Unlike the default-frame path above (one
-// running total per peer group, since the default frame only ever
-// grows), an explicit frame's bounds can both grow and shrink from one
-// row to the next (e.g. `ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING`
-// slides rather than accumulates), so there is no valid single running
-// total to share across rows — each row's frame is recomputed from
-// scratch via the same aggregate accumulator. This is a new feature
-// with no prior consumer, so correctness-first O(partition size ×
-// average frame size) is the deliberate v0 tradeoff; TPC-H doesn't use
-// frame clauses, so this doesn't touch the spot-check gate.
+// explicit ROWS or GROUPS frame clause. Unlike the default-frame path
+// above (one running total per peer group, since the default frame
+// only ever grows), an explicit frame's bounds can both grow and
+// shrink from one row to the next (e.g. `ROWS BETWEEN 1 PRECEDING AND
+// 1 FOLLOWING` slides rather than accumulates), so there is no valid
+// single running total to share across rows — each row's frame is
+// recomputed from scratch via the same aggregate accumulator. This is
+// a new feature with no prior consumer, so correctness-first O(partition
+// size × average frame size) is the deliberate v0 tradeoff; TPC-H
+// doesn't use frame clauses, so this doesn't touch the spot-check gate.
 func (o *windowOp) evalExplicitFrameAggFuncs(aggHelper *aggregateOp, colBase, pStart, pEnd int) error {
 	var groupBounds []int
-	if o.plan.Frame.Exclusion != parser.FrameExcludeNone {
+	if o.plan.Frame.Exclusion != parser.FrameExcludeNone || o.plan.Frame.Mode == parser.FrameModeGroups {
 		gb, err := o.peerGroupBounds(pStart, pEnd)
 		if err != nil {
 			return err
@@ -567,7 +569,7 @@ func (o *windowOp) evalExplicitFrameAggFuncs(aggHelper *aggregateOp, colBase, pS
 		colIdx := colBase + j
 		call := windowFuncToAggregateCall(fn)
 		for i := pStart; i < pEnd; i++ {
-			start, end := o.frameBounds(pStart, pEnd, i)
+			start, end := o.frameBounds(pStart, pEnd, i, groupBounds)
 			peerStart, peerEnd := 0, 0
 			if o.plan.Frame.Exclusion != parser.FrameExcludeNone {
 				peerStart, peerEnd = peerBoundsOf(groupBounds, i)
@@ -650,14 +652,20 @@ func (o *windowOp) resolveFrameOffset(expr planner.Expr, label string) (int64, e
 }
 
 // frameBounds returns the absolute [start, end) row-index bounds of
-// row i's ROWS window frame within partition [pStart, pEnd),
-// reproducing update_frameheadpos/update_frametailpos's ROWS-mode
-// arithmetic (postgres/src/backend/executor/nodeWindowAgg.c) exactly:
-// both bounds are clamped to the partition, and an out-of-order result
-// (e.g. a FOLLOWING start past a PRECEDING end) collapses to an empty
-// frame rather than erroring, matching upstream.
-func (o *windowOp) frameBounds(pStart, pEnd, i int) (int, int) {
+// row i's window frame within partition [pStart, pEnd). groupBounds is
+// the partition's peer-group boundary array (as returned by
+// peerGroupBounds) and is only consulted for GROUPS mode — ROWS-mode
+// callers may pass nil. Dispatches to frameBoundsGroups for GROUPS
+// mode; otherwise reproduces update_frameheadpos/update_frametailpos's
+// ROWS-mode arithmetic (postgres/src/backend/executor/nodeWindowAgg.c)
+// exactly: both bounds are clamped to the partition, and an
+// out-of-order result (e.g. a FOLLOWING start past a PRECEDING end)
+// collapses to an empty frame rather than erroring, matching upstream.
+func (o *windowOp) frameBounds(pStart, pEnd, i int, groupBounds []int) (int, int) {
 	fr := o.plan.Frame
+	if fr.Mode == parser.FrameModeGroups {
+		return o.frameBoundsGroups(i, groupBounds)
+	}
 	local := i - pStart
 	n := pEnd - pStart
 	clamp := func(v int) int {
@@ -696,12 +704,72 @@ func (o *windowOp) frameBounds(pStart, pEnd, i int) (int, int) {
 	return pStart + start, pStart + end
 }
 
+// frameBoundsGroups returns the absolute [start, end) row-index bounds
+// of row i's GROUPS-mode window frame, given groupBounds — the
+// partition's peer-group boundary array (ascending absolute
+// group-start row indices plus a trailing partition-end sentinel, as
+// returned by peerGroupBounds). GROUPS-mode bounds are counted in
+// peer groups rather than rows (an offset PRECEDING/FOLLOWING moves N
+// whole peer groups, and CURRENT ROW means the current row's own peer
+// group), mirroring update_frameheadpos/update_frametailpos's GROUPS
+// branch exactly — the row-index arithmetic above is otherwise
+// identical, just performed on group indices and then translated back
+// to row indices via groupBounds.
+func (o *windowOp) frameBoundsGroups(i int, groupBounds []int) (int, int) {
+	fr := o.plan.Frame
+	numGroups := len(groupBounds) - 1
+	curGroup := groupIndexOf(groupBounds, i)
+	clamp := func(v int) int {
+		if v < 0 {
+			return 0
+		}
+		if v > numGroups {
+			return numGroups
+		}
+		return v
+	}
+	var startG, endG int
+	switch fr.StartKind {
+	case parser.FrameBoundUnboundedPreceding:
+		startG = 0
+	case parser.FrameBoundCurrentRow:
+		startG = curGroup
+	case parser.FrameBoundOffsetPreceding:
+		startG = clamp(curGroup - int(o.frameStartOff))
+	case parser.FrameBoundOffsetFollowing:
+		startG = clamp(curGroup + int(o.frameStartOff))
+	}
+	switch fr.EndKind {
+	case parser.FrameBoundUnboundedFollowing:
+		endG = numGroups
+	case parser.FrameBoundCurrentRow:
+		endG = curGroup + 1
+	case parser.FrameBoundOffsetPreceding:
+		endG = clamp(curGroup - int(o.frameEndOff) + 1)
+	case parser.FrameBoundOffsetFollowing:
+		endG = clamp(curGroup + int(o.frameEndOff) + 1)
+	}
+	if endG < startG {
+		endG = startG
+	}
+	return groupBounds[startG], groupBounds[endG]
+}
+
+// groupIndexOf returns the index k of the peer group containing
+// absolute row index i, given groupBounds as returned by
+// peerGroupBounds (ascending group-start indices plus a trailing
+// partition-end sentinel) — i.e. the k such that
+// groupBounds[k] <= i < groupBounds[k+1].
+func groupIndexOf(groupBounds []int, i int) int {
+	return sort.Search(len(groupBounds)-1, func(k int) bool { return groupBounds[k+1] > i })
+}
+
 // peerBoundsOf returns the [start, end) peer-group bounds containing
 // absolute row index i, given groupBounds as returned by
 // peerGroupBounds (ascending group-start indices plus a trailing pEnd
 // sentinel).
 func peerBoundsOf(groupBounds []int, i int) (int, int) {
-	k := sort.Search(len(groupBounds)-1, func(k int) bool { return groupBounds[k+1] > i })
+	k := groupIndexOf(groupBounds, i)
 	return groupBounds[k], groupBounds[k+1]
 }
 

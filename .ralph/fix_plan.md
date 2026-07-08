@@ -3851,6 +3851,61 @@ mirroring M0119's ledger `status` column.
       interval strings (both the typed-literal and cast paths now
       reject them identically, but neither supports them — v0's
       `KindInterval` Datum has no sub-day field at all).
+      **GROUPS window frame mode landed (2026-07-09, this loop):** closes
+      half of the "RANGE/GROUPS" item above. `RANGE` remains rejected
+      (0A000) — its offset bounds need a per-ORDER-BY-column type-aware
+      `+`/`-`/`<` operator lookup (numeric vs. `interval` for datetime
+      columns), a materially larger capability this slice doesn't build.
+      `GROUPS`, per spec (`parse_clause.c`), only needs its offset
+      treated as a non-negative integer count of ORDER BY peer groups
+      rather than rows — the same offset machinery `ROWS` already has
+      (`resolveFrameOffset`), just applied to peer-group indices.
+      Analyzer (`internal/analyzer/analyzer.go`): `validateWindowFrame`
+      now takes the window's ORDER BY column count; `FrameModeGroups`
+      requires at least one ORDER BY column (42P20 "GROUPS mode requires
+      an ORDER BY clause", verified byte-for-byte against a real
+      PostgreSQL 18.3 instance), `FrameModeRange` stays rejected (0A000).
+      Planner (`internal/planner/plan.go`/`planner.go`): `WindowFrame`
+      gains a `Mode parser.FrameMode` field (previously dropped during
+      lowering since a Frame reaching the planner was always ROWS);
+      `resolveWindowFrame` carries it through. Executor
+      (`internal/executor/operators_window.go`): `frameBounds` gained a
+      `groupBounds []int` parameter and dispatches to a new
+      `frameBoundsGroups` for GROUPS mode — mirrors the ROWS-mode
+      arithmetic exactly but on peer-group indices (via new
+      `groupIndexOf`, factored out of the pre-existing `peerBoundsOf`)
+      instead of row indices, translated back to a row range via
+      `peerGroupBounds`. `evalExplicitFrameAggFuncs` computes
+      `groupBounds` whenever `Frame.Mode == FrameModeGroups` (previously
+      only for an EXCLUDE clause); `first_value`/`last_value`/`nth_value`
+      thread the same `valueGroupBounds` through (populate-condition
+      widened to also cover GROUPS mode). `row_number`/`rank`/
+      `dense_rank`/`lag`/`lead`/`ntile`/`percent_rank`/`cume_dist` needed
+      no change (frame-independent by spec regardless of mode). Tests:
+      `TestAnalyzeWindowFrameGroupsAccepted`/
+      `TestAnalyzeWindowFrameGroupsRequiresOrderByRejected`/
+      `TestAnalyzeWindowFrameRangeRejected` (renamed/narrowed from
+      `TestAnalyzeWindowFrameRangeGroupsRejected`) in
+      `internal/analyzer/analyzer_test.go`;
+      `TestCompatWindowExplicitGroupsFrameSliding` (duplicate-key data so
+      GROUPS genuinely diverges from an equivalent ROWS frame) and
+      `TestCompatWindowGroupsUnboundedPrecedingCumulative` in
+      `internal/executor/window_compat_test.go`, both cross-checked
+      row-for-row against a real PostgreSQL 18.3 instance (`GROUPS
+      BETWEEN 1 PRECEDING AND 1 FOLLOWING` and `GROUPS UNBOUNDED
+      PRECEDING`). Confirmed non-vacuous via `git stash` on the four impl
+      files (fails pre-fix with the old "only ROWS is implemented"
+      0A000). Design: `docs/design/0020-0001-window-parser-and-ast.md`
+      new "Follow-up: GROUPS window frame mode" section;
+      `docs/design/README.md` row extended. Gates: `go build ./...`
+      clean; `go test ./internal/analyzer/... ./internal/planner/...
+      ./internal/executor/...` PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+      scripts/ralph-precommit-test.sh` PASS (0 failed txns, all 3
+      workloads). **Still open in this bucket:** RANGE window frame mode
+      (documented v0 scope limit — needs the per-ORDER-BY-column
+      operator-lookup machinery described above), sub-day intervals +
+      multi-component interval strings.
 - [x] **M0122-0005 — Types / opclasses / casts / collation / domains** (~11).
       1-byte `char`(OID 18) disambiguation, `pg_collation_for`, function-based cast
       dumping, ALTER TYPE RENAME/OWNER, domain CHECK renderer, `pg_ts_config` OIDs.

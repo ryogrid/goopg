@@ -5232,15 +5232,16 @@ func inferExprType(e Expr) catalog.Type {
 // expressions into planner Exprs, the same way buildWindowStage
 // resolves PARTITION BY/ORDER BY/FILTER expressions for the window's
 // input. Returns nil for a nil frame (default frame — unchanged
-// executor behavior). The analyzer has already rejected RANGE/GROUPS
-// and validated bound ordering, so this only needs to carry the
-// already-validated shape through — mode isn't even threaded since a
-// Frame reaching here is always ROWS.
+// executor behavior). The analyzer has already rejected RANGE and
+// validated bound ordering (and, for GROUPS, that an ORDER BY clause
+// is present), so this only needs to carry the already-validated
+// shape through, including Mode (ROWS or GROUPS) — the executor
+// dispatches its frame-bounds arithmetic on it.
 func resolveWindowFrame(fr *parser.WindowFrame, inputCtx *resolveContext, agg *aggregateSurface) (*WindowFrame, error) {
 	if fr == nil {
 		return nil, nil
 	}
-	out := &WindowFrame{StartKind: fr.StartKind, EndKind: fr.EndKind, Exclusion: fr.Exclusion}
+	out := &WindowFrame{Mode: fr.Mode, StartKind: fr.StartKind, EndKind: fr.EndKind, Exclusion: fr.Exclusion}
 	if fr.StartOffset != nil {
 		r, err := resolveExprForWindowInput(fr.StartOffset, inputCtx, agg)
 		if err != nil {

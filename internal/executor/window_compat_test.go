@@ -966,3 +966,108 @@ func TestCompatWindowFrameNegativeOffsetRejected(t *testing.T) {
 		t.Fatalf("err=%v want ExecError 22013", err)
 	}
 }
+
+// TestCompatWindowExplicitGroupsFrameSliding pins GROUPS-mode frame
+// arithmetic — bounds counted in ORDER BY peer groups rather than rows
+// (M0122-0004 RANGE/GROUPS follow-up) — against duplicate-key data so
+// GROUPS genuinely diverges from an equivalent ROWS frame. grp=1 has
+// three peer groups on val (10,10 / 20 / 30,30); grp=2 has two
+// singleton groups (100 / 200). Cross-checked against a real
+// PostgreSQL 18.3 instance (`GROUPS BETWEEN 1 PRECEDING AND 1
+// FOLLOWING`): sliding={20,20,20,30,30}→{40,40,100,80,80},
+// fv={10,10,10,20,20}, lv={20,20,30,30,30}.
+func TestCompatWindowExplicitGroupsFrameSliding(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE t (grp int, val int)"); err != nil {
+		t.Fatal(err)
+	}
+	tbl, _ := ctx.Catalog.LookupTable(parser.ObjectName{Name: "t"})
+	rel := ctx.Catalog.RelFileNode(tbl)
+	seed := []Row{
+		{{Kind: KindInt, Int: 1}, {Kind: KindInt, Int: 10}},
+		{{Kind: KindInt, Int: 1}, {Kind: KindInt, Int: 10}},
+		{{Kind: KindInt, Int: 1}, {Kind: KindInt, Int: 20}},
+		{{Kind: KindInt, Int: 1}, {Kind: KindInt, Int: 30}},
+		{{Kind: KindInt, Int: 1}, {Kind: KindInt, Int: 30}},
+		{{Kind: KindInt, Int: 2}, {Kind: KindInt, Int: 100}},
+		{{Kind: KindInt, Int: 2}, {Kind: KindInt, Int: 200}},
+	}
+	for _, r := range seed {
+		if err := writeHeapRow(ctx, rel, tbl.Columns, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	rows := runQuery(t, ctx,
+		"SELECT grp, val, "+
+			"sum(val) OVER w AS sliding, "+
+			"first_value(val) OVER w AS fv, "+
+			"last_value(val) OVER w AS lv, "+
+			"count(*) OVER w AS cnt "+
+			"FROM t "+
+			"WINDOW w AS (PARTITION BY grp ORDER BY val GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING) "+
+			"ORDER BY grp, val")
+	want := []struct{ grp, val, sliding, fv, lv, cnt int64 }{
+		{1, 10, 40, 10, 20, 3},
+		{1, 10, 40, 10, 20, 3},
+		{1, 20, 100, 10, 30, 5},
+		{1, 30, 80, 20, 30, 3},
+		{1, 30, 80, 20, 30, 3},
+		{2, 100, 300, 100, 200, 2},
+		{2, 200, 300, 100, 200, 2},
+	}
+	if len(rows) != len(want) {
+		t.Fatalf("rows=%d want %d", len(rows), len(want))
+	}
+	for i, w := range want {
+		got := []int64{rows[i][0].Int, rows[i][1].Int, rows[i][2].Int, rows[i][3].Int, rows[i][4].Int, rows[i][5].Int}
+		wantVals := []int64{w.grp, w.val, w.sliding, w.fv, w.lv, w.cnt}
+		for col, g := range got {
+			if rows[i][col].Kind != KindInt || g != wantVals[col] {
+				t.Fatalf("row[%d]=%+v want %v", i, rows[i], wantVals)
+			}
+		}
+	}
+}
+
+// TestCompatWindowGroupsUnboundedPrecedingCumulative pins the default
+// end-bound (CURRENT ROW, which in GROUPS mode means the current row's
+// last peer) for a cumulative `GROUPS UNBOUNDED PRECEDING` frame —
+// cross-checked against a real PostgreSQL 18.3 instance: val
+// {10,10,20,30,30} → cum {20,20,40,100,100}.
+func TestCompatWindowGroupsUnboundedPrecedingCumulative(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE t (val int)"); err != nil {
+		t.Fatal(err)
+	}
+	tbl, _ := ctx.Catalog.LookupTable(parser.ObjectName{Name: "t"})
+	rel := ctx.Catalog.RelFileNode(tbl)
+	seed := []Row{
+		{{Kind: KindInt, Int: 10}},
+		{{Kind: KindInt, Int: 10}},
+		{{Kind: KindInt, Int: 20}},
+		{{Kind: KindInt, Int: 30}},
+		{{Kind: KindInt, Int: 30}},
+	}
+	for _, r := range seed {
+		if err := writeHeapRow(ctx, rel, tbl.Columns, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	rows := runQuery(t, ctx,
+		"SELECT val, sum(val) OVER (ORDER BY val GROUPS UNBOUNDED PRECEDING) AS cum FROM t ORDER BY val")
+	want := []int64{20, 20, 40, 100, 100}
+	if len(rows) != len(want) {
+		t.Fatalf("rows=%d want %d", len(rows), len(want))
+	}
+	for i, w := range want {
+		if rows[i][1].Kind != KindInt || rows[i][1].Int != w {
+			t.Fatalf("row[%d]=%+v want cum=%d", i, rows[i], w)
+		}
+	}
+}

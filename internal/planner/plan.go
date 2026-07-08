@@ -838,6 +838,7 @@ type WindowAgg struct {
 // than duplicating them, matching the existing convention of BinaryOp/
 // UnaryOp.Op reusing parser.OpCode.
 type WindowFrame struct {
+	Mode        parser.FrameMode // FrameModeRows or FrameModeGroups (RANGE is rejected by the analyzer)
 	StartKind   parser.FrameBoundKind
 	StartOffset Expr // non-nil only for FrameBoundOffsetPreceding/Following
 	EndKind     parser.FrameBoundKind

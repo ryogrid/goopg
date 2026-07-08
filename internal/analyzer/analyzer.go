@@ -1609,7 +1609,7 @@ func analyzeWindowFuncCall(x *parser.FuncCall, ctx *scope) (catalog.Type, error)
 			return catalog.Type{}, err
 		}
 	}
-	if err := validateWindowFrame(x.Over.Frame, x.Over.Pos(), ctx); err != nil {
+	if err := validateWindowFrame(x.Over.Frame, x.Over.Pos(), len(x.Over.OrderBy), ctx); err != nil {
 		return catalog.Type{}, err
 	}
 	return retType, nil
@@ -1618,19 +1618,31 @@ func analyzeWindowFuncCall(x *parser.FuncCall, ctx *scope) (catalog.Type, error)
 // validateWindowFrame validates a parsed window frame clause's mode
 // and bound ordering (SQL:2003 <window frame clause>), mirroring
 // gram.y's frame_extent/frame_bound reduce-time checks — all
-// ERRCODE_WINDOWING_ERROR (42P20) — plus this v0's RANGE/GROUPS scope
-// limitation (0A000). Returns nil for a nil frame (no explicit frame
-// clause was written — the default frame applies). Also type-checks
-// (but does not range-check) any offset expressions; the executor
-// mirrors LIMIT's pattern of range/null-checking a once-evaluated
-// constant expression at runtime (22004/22013), since an offset can't
-// be validated until it's evaluated.
-func validateWindowFrame(fr *parser.WindowFrame, pos int, ctx *scope) error {
+// ERRCODE_WINDOWING_ERROR (42P20) — plus this v0's RANGE scope
+// limitation (0A000; GROUPS is fully implemented, see
+// internal/executor/operators_window.go). Returns nil for a nil frame
+// (no explicit frame clause was written — the default frame applies).
+// Also type-checks (but does not range-check) any offset expressions;
+// the executor mirrors LIMIT's pattern of range/null-checking a
+// once-evaluated constant expression at runtime (22004/22013), since
+// an offset can't be validated until it's evaluated.
+func validateWindowFrame(fr *parser.WindowFrame, pos int, orderByLen int, ctx *scope) error {
 	if fr == nil {
 		return nil
 	}
-	if fr.Mode != parser.FrameModeRows {
-		return analyzeError(pos, "0A000", "RANGE and GROUPS window frame units are not supported in v0; only ROWS is implemented")
+	switch fr.Mode {
+	case parser.FrameModeRows:
+		// No additional mode-specific restriction.
+	case parser.FrameModeGroups:
+		// Per spec (and gram.y's post-parse check in parse_clause.c),
+		// GROUPS mode requires an ORDER BY clause in the window
+		// definition — its frame bounds are counted in ORDER BY peer
+		// groups, which are undefined without one.
+		if orderByLen == 0 {
+			return analyzeError(pos, "42P20", "GROUPS mode requires an ORDER BY clause")
+		}
+	default:
+		return analyzeError(pos, "0A000", "RANGE window frame units are not supported in v0; only ROWS and GROUPS are implemented")
 	}
 	if fr.StartKind == parser.FrameBoundUnboundedFollowing {
 		return analyzeError(pos, "42P20", "frame start cannot be UNBOUNDED FOLLOWING")
