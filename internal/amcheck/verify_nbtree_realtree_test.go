@@ -749,7 +749,7 @@ func buildRealTreeConcurrent(t *testing.T, n, writers, poolSlots int, keyRange i
 // holding an outdated slot). See .ralph/deferral_ledger.md's 9th
 // 2026-07-08 row for the full writeup.
 func TestVerifyBtreeEngineSilentOnRealConcurrentContended(t *testing.T) {
-	t.Skip("known-failing: tracks M-NIGHTLY AI-20260708-064334-001 (btree lost-index-entry bug; 9th loop's reload-snapshot instrumentation proves the loss is a PERMANENT one-time event -- the first disk reload of a block after its last good flush already and durably lacks the lost entry, and every later reload of that block for the rest of the run still lacks it; ruled out a transient read/write race, points at either a non-durable 'good' write or a second stale write clobbering it; next step instruments smgr.go's relFile.writeBlock/readBlock directly with a lock-jitter-free op counter); un-skip to confirm a fix")
+	t.Skip("known-failing: tracks M-NIGHTLY AI-20260708-064334-001 (btree lost-index-entry bug; 10th loop cross-checked the 9th loop's reload-snapshot smoking gun against an INDEPENDENT smgr/syscall-level content-hash IO tracer (GOOPG_IO_TRACE=1, internal/storage/io_trace.go) and REFUTES hypothesis (b) -- across 60863 real ReadAt/WriteAt-completion events spanning 38 blocks and 49 lost entries in one run, EVERY postRead exactly matched the immediately-preceding postWrite's byte-content hash for that same (relFile, block); zero stale/superseded reads at the true hardware-completion-order layer. Combined with the 8th loop's proof that flush-side WriteBlock always durably wrote whatever was in memory, the entire storage/smgr layer (bufpool eviction+reload+flush, and the OS/file read/write path) is now cleared -- the loss is a genuine IN-MEMORY content bug, not a storage-layer one. Reviewed bufpool.go's pinLoad/tryPinSlot/claimVictim tag-publish-before-load window on inspection (state-bit gating + pinMu serialization) and found no obvious gap. Next step: instrument at the contentMu-critical-section level directly (one layer below the flush/reload snapshots already built) to catch which specific content mutation clobbers the entry; see .ralph/deferral_ledger.md's 10th 2026-07-08 row for full detail); un-skip to confirm a fix")
 	if testing.Short() {
 		t.Skip("skipping concurrent real-tree amcheck stress in short mode")
 	}
@@ -930,6 +930,74 @@ func TestVerifyBtreeEngineSilentOnRealConcurrentContended(t *testing.T) {
 								re.Seq, re.Block, len(re.Items), has, lastGoodFlushSeq)
 							if !has {
 								t.Logf("  => SMOKING GUN: disk reload at seq=%d already lacked this (key,TID) despite the last flush of this block (seq=%d) having it -- the reload served stale or wrong bytes", re.Seq, lastGoodFlushSeq)
+							}
+						}
+					}
+				}
+				// M-NIGHTLY investigation aid (AI-20260708-064334-001, 10th
+				// loop): the 9th loop's smoking-gun reload-snapshot check
+				// operates at the btree layer (pageItems() decoded from
+				// bt's own OnBlockReload/OnFlushSnapshot hooks, timestamped
+				// by a shared insertLogMu Seq counter with residual
+				// cross-goroutine jitter). Cross-check the SAME block at
+				// the smgr/syscall layer instead, using the independent
+				// content-hash IO tracer (internal/storage/io_trace.go,
+				// GOOPG_IO_TRACE=1) whose events are timestamped by
+				// time.Now() taken immediately after each real ReadAt
+				// (readBlock) / WriteAt (writeBlock) call returns, under
+				// the SAME relFile.mu that serializes the syscalls
+				// themselves -- true completion order, zero lock-ordering
+				// ambiguity. If a postRead's byte-content hash exactly
+				// matches an EARLIER postWrite's hash rather than the most
+				// recent one, that is direct syscall-level proof of a
+				// stale/superseded read (confirms hypothesis (b): an older
+				// write's bytes really did reach disk after -- or were
+				// read in preference to -- the newer write's bytes). If a
+				// postRead's hash matches NO prior postWrite at all, the
+				// bytes on disk were never legitimately written through
+				// this relFile, pointing at a filesystem/file-identity bug
+				// instead of a buffer-pool write-write race.
+				{
+					tag := storage.BufferTag{Rel: rel, Block: last.Block}
+					ioEvents := storage.IOTraceEventsForTag(tag)
+					if len(ioEvents) == 0 {
+						t.Logf("  no smgr-level IO-trace events for blk=%d (re-run with GOOPG_IO_TRACE=1 to enable this diagnostic)", last.Block)
+					} else {
+						var priorWrites []struct {
+							Hash  uint64
+							LPCnt int
+						}
+						for _, ev := range ioEvents {
+							t.Logf("  io-trace: phase=%s blk=%d hash=%016x lpCnt=%d lpErr=%q t=%s",
+								ev.Phase, tag.Block, ev.Hash, ev.LPCnt, ev.LPErr, ev.T.Format("15:04:05.000000000"))
+							switch ev.Phase {
+							case "postWrite":
+								priorWrites = append(priorWrites, struct {
+									Hash  uint64
+									LPCnt int
+								}{ev.Hash, ev.LPCnt})
+							case "postRead":
+								if len(priorWrites) == 0 {
+									continue
+								}
+								latest := priorWrites[len(priorWrites)-1]
+								if ev.Hash == latest.Hash {
+									continue
+								}
+								matchedStale := -1
+								for i := len(priorWrites) - 2; i >= 0; i-- {
+									if priorWrites[i].Hash == ev.Hash {
+										matchedStale = i
+										break
+									}
+								}
+								if matchedStale >= 0 {
+									t.Logf("  => SMOKING GUN (syscall-level): postRead hash=%016x lpCnt=%d matches an EARLIER postWrite (%d writes back, lpCnt=%d), not the most recent postWrite (lpCnt=%d) -- a stale/superseded write's bytes were read back, confirming hypothesis (b) at the smgr layer",
+										ev.Hash, ev.LPCnt, len(priorWrites)-1-matchedStale, priorWrites[matchedStale].LPCnt, latest.LPCnt)
+								} else {
+									t.Logf("  => ANOMALY (syscall-level): postRead hash=%016x lpCnt=%d matches NO prior postWrite to this tag (most recent postWrite hash=%016x lpCnt=%d) -- bytes on disk were never legitimately written through this relFile",
+										ev.Hash, ev.LPCnt, latest.Hash, latest.LPCnt)
+								}
 							}
 						}
 					}

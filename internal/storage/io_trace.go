@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"os"
+	"sort"
 	"sync"
 	"time"
 )
@@ -95,5 +96,24 @@ func DumpRecentIOTrace(window time.Duration, maxLines int) []string {
 		out = append(out, fmt.Sprintf("tag=%+v phase=%s hash=%016x lpCnt=%d lpErr=%q t=%s",
 			ev.Tag, ev.Phase, ev.Hash, ev.LPCnt, ev.LPErr, ev.T.Format(time.RFC3339Nano)))
 	}
+	return out
+}
+
+// IOTraceEventsForTag returns every recorded IO-trace event for tag, sorted
+// by completion time T. recordIOTrace is called immediately after ReadAt
+// (readBlock) or WriteAt (writeBlock) returns, so T reflects real syscall
+// completion order for this specific (rel, block) rather than any
+// higher-level log's lock-acquisition order. Returns nil if GOOPG_IO_TRACE
+// was not set (no events were ever recorded) or tag was never touched.
+func IOTraceEventsForTag(tag BufferTag) []ioTraceEvent {
+	ioTraceMu.Lock()
+	var out []ioTraceEvent
+	for _, ev := range ioTraceLog {
+		if ev.Tag == tag {
+			out = append(out, ev)
+		}
+	}
+	ioTraceMu.Unlock()
+	sort.Slice(out, func(i, j int) bool { return out[i].T.Before(out[j].T) })
 	return out
 }

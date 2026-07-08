@@ -1028,6 +1028,66 @@ every clean, green (build + pre-commit) checkpoint.
       the dirty-flush write side — all five conclusively cleared; also do
       not re-litigate whether the reload path is implicated, that is now
       hard evidence, not hypothesis.
+      2026-07-08 update (10th loop on the reopen; see today's 10th deferral
+      ledger row): executed the main next step, but using existing
+      infrastructure instead of building a new counter — discovered
+      `internal/storage/io_trace.go` (`GOOPG_IO_TRACE=1`) already records a
+      content-hash + line-pointer-count event, timestamped by `time.Now()`
+      taken immediately after each real `ReadAt`/`WriteAt` returns, under
+      the SAME `relFile.mu` that serializes the syscalls — exactly the
+      jitter-free true-completion-order data the 9th loop's next-step asked
+      for, added the day before (commit `8ebb71cd`) for a related but
+      distinct corruption investigation. Added `storage.
+      IOTraceEventsForTag(tag)` (exported accessor, sorted by `T`) and
+      wired a new per-missing-entry diagnostic block into
+      `TestVerifyBtreeEngineSilentOnRealConcurrentContended` that walks a
+      lost entry's block's full syscall-level event history and checks
+      whether any `postRead` hash fails to match the immediately-preceding
+      `postWrite` hash (the direct signature of hypothesis (b): a
+      stale/superseded write being read back). Re-ran the repro with
+      `GOOPG_IO_TRACE=1`: 49 lost entries this run across 38 distinct
+      blocks, 60863 total IO-trace events — **zero read-mismatches**. Every
+      single disk read, for every implicated block, exactly returned the
+      byte content of the most recently completed write to that same
+      (relFile, block) — hypothesis (b) is REFUTED at the smgr/syscall
+      layer. Combined with the 8th loop's proof that the flush WRITE side
+      always faithfully wrote in-memory content, the ENTIRE storage/smgr
+      layer (bufpool eviction+reload+flush, and the OS read/write path) is
+      now cleared — the 9th loop's Seq-based "reload already lacks the
+      entry" signature was a real, reproducible symptom but its storage-
+      layer implication was a false lead (residual cross-log Seq jitter,
+      exactly the risk the 9th loop's own writeup flagged). The loss is a
+      genuine IN-MEMORY content bug. Reviewed `bufpool.go`'s `pinLoad`/
+      `tryPinSlot`/`claimVictim` tag-publish-before-load window on
+      inspection (the tag is published in `bufmap` before `ReadBlock`
+      populates the slot, gated by `stateValid`/`stateIO` bits so
+      concurrent `tryPinSlot` calls correctly return nil and wait; the
+      whole claim/evict/insert sequence runs under a single `pinMu`) — no
+      obvious gap found, but not proven race-free, just not disproven by
+      inspection alone. Gates: `go build ./...` clean; `go vet
+      ./internal/storage/... ./internal/amcheck/...` clean; `go test
+      ./internal/storage/... ./internal/access/btree/...
+      ./internal/amcheck/...` PASS (target test re-skipped); `scripts/
+      tpch-spotcheck.sh` PASS (Q12=2/Q13=33). Next step: go one layer
+      deeper than flush/reload snapshots (8th/9th loop) and syscall IO
+      (this loop) into the in-memory `contentMu`-guarded mutation sequence
+      itself — instrument the exact critical section(s) that mutate a
+      pinned page's bytes (insert/split/dedup call sites already covered
+      by `DebugTraceInserts`, but nothing currently records a
+      before/after content-hash pair bracketing each `contentMu` hold) to
+      catch which specific in-memory mutation silently drops or replaces
+      an already-inserted item while leaving the page's item COUNT
+      unchanged (already observed: a "good" flush at itemCount=379 with
+      the entry present, followed 6 Seq-ticks later by another flush of
+      the SAME block, STILL itemCount=379, entry now absent — same count,
+      different content, not a split/dedup event). Do NOT re-open
+      claimVictim, the fast-path insert sites' own correctness, the
+      split/dedup-rewrite path, the clean-eviction path, the dirty-flush
+      write side, or smgr.go's readBlock/writeBlock/relFile.mu
+      serialization — all now conclusively cleared (six mechanisms ruled
+      out across 8 loops of targeted instrumentation). Do NOT re-litigate
+      hypothesis (b) (stale write superseding a newer one) — refuted with
+      hard syscall-level evidence, not just unconfirmed.
 
 - [x] race/internal/wal — race suite failed in package
       `github.com/goopg/goopg/internal/wal` (AI-20260707-000712-001; repro:
