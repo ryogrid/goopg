@@ -580,3 +580,34 @@ Gates: `go build ./...` clean; `go test ./internal/planner/...
 `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
 `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
 failed transactions, all 3 pgbench workloads).
+
+## Follow-up (2026-07-09, M0122-0011 follow-up #3): Q16's "non-triggering unnest" could not be reproduced — closed as refuted
+
+The `NOT IN` follow-up above deferred one item: a live EXPLAIN against a
+running server showed TPC-H Q16's `InExpr` surviving as a residual
+filter instead of unnesting to the new `NullAware` Anti join, even
+though a synthetic two-table-join probe with the same shape unnested
+correctly. Re-investigating with the item's own resume point — plan
+Q16 against a schema mirroring the real HammerDB-equivalent one (PK
+btree indexes on `part`/`partsupp`/`supplier` plus SF1-magnitude
+`TableStats.RowCount`, matching `index_utilisation_test.go`'s
+`hammerdbPKs`) — the Anti join unnest fires correctly. Going further:
+it also fires against a bare `tpch.Catalog()` with no indexes or
+stats at all (throwaway probe, reverted), and every commit across the
+whole M0122-0011 chain (`be47cc93` through `ef323e88`) plans Q16 the
+same correct way. No planner revision was found where Q16 fails to
+unnest.
+
+**Conclusion:** the original observation was most likely a
+stale/un-rebuilt `cmd/goopg` binary at observation time, not a
+planner defect — there is no live bug here to fix. Landed
+`internal/planner/q16_unnest_test.go`
+(`TestPlanQ16NotInUnnestsWithRealSchema`) as a permanent regression
+guard pinning the now-confirmed-correct behavior against a realistic
+schema, so a genuine future regression is caught immediately instead
+of requiring another multi-loop investigation. If a future
+nightly/live run again shows Q16's `InExpr` surviving as a residual
+filter, suspect a stale binary first before re-opening planner-side
+investigation. Gates: `go build ./...` clean; `go test
+./internal/planner/...` PASS; `scripts/tpch-spotcheck.sh` PASS
+(Q12=2/Q13=33).

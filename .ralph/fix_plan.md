@@ -5043,6 +5043,30 @@ mirroring M0119's ledger `status` column.
       PASS (0 failed txns, all 3 pgbench workloads). **Still open in
       this bucket:** Q16's non-triggering unnest (root cause not yet
       isolated), Q8/Q9/Q21 row-count fixes.
+      **Q16 non-triggering-unnest item CLOSED (2026-07-09, this loop —
+      could not reproduce, refuted):** re-investigated the "Q16's real
+      join shape does not route through the new unnest path" claim
+      from the row above using a schema that mirrors the real
+      HammerDB-equivalent one (PK btree indexes on
+      part/partsupp/supplier plus SF1-magnitude `TableStats.RowCount`,
+      matching `index_utilisation_test.go`'s `hammerdbPKs`). The Anti
+      join unnest fires correctly — and, going one step further this
+      loop, so does a bare `tpch.Catalog()` plan with NO indexes/stats
+      at all (independently re-verified via a throwaway probe test,
+      reverted). Checked out every commit in the M0122-0011 chain
+      (`be47cc93` through `ef323e88`) and could not find a revision
+      where Q16 fails to unnest. Conclusion: the original observation
+      was almost certainly a stale/un-rebuilt `cmd/goopg` binary at
+      observation time, not a planner defect — there is no live bug to
+      fix. Landed `internal/planner/q16_unnest_test.go`
+      (`TestPlanQ16NotInUnnestsWithRealSchema`) as a permanent
+      regression guard pinning this now-confirmed-correct behavior
+      against a realistic schema. Deferral ledger: row 620's item (2)
+      closed via a new row; row 620 itself flipped to `resolved` (both
+      its items now closed). Gates: `go build ./...` clean; `go test
+      ./internal/planner/...` PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33). **Still open in this bucket:** Q8/Q9/Q21
+      row-count fixes.
 - [ ] **M0122-0012 — Perf infra: vectorization / slot-pipeline / harness** (~19,
       ARCHITECTURAL). Borrow-semantics allocation rewrite, plannode migration,
       vectorized FilterOp/SeqScanOp, plan cache, HammerDB SF1 validation.
