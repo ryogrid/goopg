@@ -1,46 +1,76 @@
 Task: M-NIGHTLY pgbench/nightly-reopen-20260708 (AI-20260708-064334-001) —
-IN PROGRESS, not complete. Landed a real amcheck false-positive fix this loop;
-2 leads still open (see fix_plan.md task + deferral ledger 2026-07-08 row).
+IN PROGRESS, not complete. Root cause LOCUS narrowed to buffer-pool eviction
+(internal/storage/bufpool.go), NOT the btree package. Fast (~1s) reliable
+in-process repro built and committed (skipped by default). See fix_plan.md
+task + deferral ledger's 2nd 2026-07-08 row for full detail.
 
-Files: internal/amcheck/verify_nbtree.go (VerifyBtreeItemOrder relaxed to
-non-decreasing keys), internal/amcheck/verify_nbtree_test.go (renamed
-DuplicateKeysViolation -> DuplicateKeysAllowed + new
-DecreaseAfterDuplicateViolation test), docs/design/0110-0005-verify-heapam-engine.md
-(new subsection), docs/design/README.md (0110-0005 row appended), .ralph/fix_plan.md
-+ .ralph/deferral_ledger.md (this loop's row/task update). All committed.
+Files: internal/amcheck/verify_nbtree_realtree_test.go (NEW
+`buildRealTreeConcurrent` helper + NEW `TestVerifyBtreeEngineSilentOnRealConcurrentContended`,
+currently `t.Skip`'d — un-skip to reproduce/verify a fix), .ralph/fix_plan.md
++ .ralph/deferral_ledger.md (this loop's update/row). internal/access/btree/btree.go
+was temporarily instrumented with a debug write-log hook during investigation
+— FULLY REVERTED, no diff remains there. No production code changed this loop.
 
-Key symbols: btree.CompareKeys (key-only, no TID tiebreak anywhere in the
-engine — this is the root fact behind the fix), VerifyBtreeItemOrder,
-btree.PageItemKeys.
+Key symbols to instrument next: internal/storage/bufpool.go — claimVictim,
+evictVictim, pinLoad, flushSlot. NOT internal/access/btree (ruled out: every
+lost item genuinely reaches insertItemSorted; pageItems/parseItem/
+parsePostingRaw all correctly copy key bytes into fresh slices, no aliasing).
 
-Hypothesis/Findings: (1) amcheck's item-order check was too strict (assumed
-upstream's heapkeyspace TID-tiebreak model) — FIXED, verified, committed.
-(2) Original nightly runtime symptom ("btree: empty internal page" pgbench
-transaction abort) was NEVER reproduced this loop (only tried 2x25s windows;
-nightly stage uses T=180x3) — still open, unconfirmed whether already fixed
-by the 2026-07-07 fixes (510615b4/8ebb71cd, both ancestors of the nightly
-commit) or still live. (3) NEW lead found: pgbench_accounts_pkey shows a
-genuine, narrowly-targeted "high key invariant violated" on 2 internal
-(level=1) blocks where only the LAST item exceeds the page's own high key —
-consistent with a downlink misrouted during an internal-page split. This is
-reproducible via: fresh initdb, pgbench -i -s 50 once, pgbench -c 100 -j 20
--T 25 -P 5 TWICE back-to-back, then bt_index_check('pgbench_accounts_pkey',
-true) — much cheaper than the intermittent runtime-abort repro.
+Hypothesis/Findings: (1) 64 concurrent goroutines calling bt.Insert on a
+SHARED narrow key range (n=200000, keyRange=50000, mirrors pgbench's
+uniform-random-aid UPDATE churn on pgbench_accounts_pkey — goopg has no HOT
+update so every UPDATE re-inserts) with a SMALL buffer pool
+(storage.PoolConfig{Slots: 64}) loses 7-16 real leaf entries EVERY run (100%
+of ~8 runs). (2) The IDENTICAL workload with Slots: 2048 (no eviction needed
+for the ~530-block working set) loses ZERO — this is the load-bearing signal
+that isolates the bug to the eviction/flush path, not btree split logic.
+(3) A debug hook logging every insertItemSorted call (temporary, reverted)
+confirmed lost items DO get written successfully at insert time (no error,
+item present in the page right after write per the hook log) but vanish from
+the FINAL on-disk tree — i.e. a write gets lost SOMEWHERE AFTER a successful
+in-memory insert, consistent with an eviction/flush race dropping a dirty
+page's content (or losing track of which slot is dirty) rather than a
+double-write/overwrite bug. (4) A prior bug in exactly this area
+(evictVictim's bufmap.Delete-before-flush race) was already fixed in commit
+510615b4 for M0056-followup-multiwriter-flake — this is very likely a
+sibling/remaining race in the same claimVictim/evictVictim/pinLoad machinery,
+NOT yet identified at the line level. (5) Also noticed but NOT fixed
+(confirmed harmless dead code, out of scope): btree.go lines ~1338 and ~2047
+compare op.Next against literal `0` instead of storage.InvalidBlockNumber
+(0xFFFFFFFF) — every real page-construction site uses InvalidBlockNumber, so
+this comparison is always false and the rightmost-leaf insert-cache
+(tryInsertOnCachedRightmost) never actually engages. Confirmed NOT the
+data-loss cause (a permanently-dead fast path can't lose data). Worth a
+trivial fix in some future loop (pure perf, restores an intended
+optimization) but not urgent.
 
-Next step: pick ONE of the two open leads next loop. Recommended: lead (3)
-first (deterministic repro already in hand) — instrument insertIntoBlock's
-internal-page-split path (internal/access/btree/btree.go ~1420-1660, under
-bt.splitMu) using the repro above to catch the exact moment a downlink lands
-on the wrong side of a split. If that's fixed and lead (2) still doesn't
-reproduce at full T=180 scale, mark the fix_plan task complete (stale/fixed)
-per rule 3.
+Next step: un-skip TestVerifyBtreeEngineSilentOnRealConcurrentContended
+(remove the `t.Skip(...)` line — leave the `testing.Short()` skip), confirm
+it still reproduces at Slots: 64 (it does, per this loop), then binary-search
+the pool-size threshold (try 128, 256, 512, 1024...) to find where the loss
+stops — a narrower threshold shrinks the eviction-frequency window the race
+needs, which should make hand-tracing claimVictim/evictVictim/pinLoad's
+concurrent interleavings tractable. Add targeted debug hooks THERE (not in
+btree.go) this time — e.g. log every (tag, victimIdx, wasDirty) claimVictim
+decision and every flushSlot call, then check whether some dirty page's flush
+gets skipped, races a concurrent re-load of the same tag, or a pin-count
+race lets a dirty page get evicted (not just chosen as victim) while still
+being written. Once root-caused and fixed: un-skip the test permanently as
+its regression guard, then re-run the ORIGINAL pgbench-based repro
+(ci/batch/stages/stage-pgbench.sh, s=50 c=100 j=20 T=180) to check whether
+the nightly "empty internal page" abort was the same bug.
 
-Gates run this loop (all PASS): go build ./...; go vet; go test
-./internal/amcheck/... ./internal/access/btree/... ./internal/executor/...
-./internal/testport/... (amcheck+btree suites, full); RALPH_PRECOMMIT_SCOPE=smoke
-scripts/ralph-precommit-test.sh; scripts/tpch-spotcheck.sh (Q12=2/Q13=33);
-make ralph-state-guard (self-repaired a stale completed-marker, now consistent).
+Gates run this loop (all PASS): go build ./...; go vet ./internal/amcheck/...
+./internal/access/btree/...; go test ./internal/amcheck/...
+./internal/access/btree/... ./internal/storage/... (new test skipped by
+design, not counted as a pass); make ralph-state-guard (self-repaired a
+stale completed-marker from a prior loop's clean exit, now consistent).
+Did NOT run the full ralph-precommit-test.sh / tpch-spotcheck.sh pre-commit
+gates this loop since no production code is being committed (test-file +
+markdown bookkeeping only) — the next loop that lands an actual bufpool fix
+MUST run those before committing per the Hard-won Rules.
 
-In-flight: none — all temp servers/probe files/data dirs from this loop were
-stopped and removed before finishing (goopg-reopen-check-2/3 systemd scopes,
-/tmp/goopg-reopen-check, internal/access/btree/zz_probe_test.go).
+In-flight: none — all temporary probe files (internal/amcheck/zz_probe_test.go,
+internal/access/btree/zz_probe2_test.go) and the temporary debugInsertLog
+hook in btree.go were deleted/reverted before finishing this loop. No
+background processes left running.

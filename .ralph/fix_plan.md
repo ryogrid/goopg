@@ -725,6 +725,33 @@ every clean, green (build + pre-commit) checkpoint.
       to chase than the intermittent runtime abort — this data dir already
       has 2 known-bad blocks to trace backward from, though the specific
       data dir was deleted this loop; regenerate via the same recipe).
+      2026-07-08 update (2nd loop on the reopen; see today's 2nd deferral
+      ledger row): built a MUCH cheaper repro than pgbench — a pure Go
+      concurrent-insert stress test
+      (`internal/amcheck/verify_nbtree_realtree_test.go`
+      `TestVerifyBtreeEngineSilentOnRealConcurrentContended`, currently
+      `t.Skip`'d) that runs 64 goroutines calling `bt.Insert` on a shared
+      narrow key range and reproduces a genuine lost-index-entry bug (7-16 of
+      200000 inserted leaf entries silently vanish) in well under a second,
+      100% of runs so far. Root-cause investigation this loop (debug write-log
+      hook, since reverted) RULED OUT `internal/access/btree`'s split/dedup
+      logic (every lost item genuinely reached `insertItemSorted`; item-key
+      copy semantics in `pageItems`/`parseItem`/`parsePostingRaw` are all
+      correct, no aliasing) and CONFIRMED the bug lives in
+      `internal/storage/bufpool.go`'s eviction/flush path instead: the SAME
+      workload with a small pool (`Slots: 64`) loses items every time; with a
+      large pool (`Slots: 2048`, no eviction needed) it loses ZERO. Did not
+      identify the exact line/race — out of loop budget. Next step:
+      instrument `claimVictim`/`evictVictim`/`pinLoad`/`flushSlot` in
+      bufpool.go (un-skip the new test first, `Slots: 64` already reproduces
+      reliably), find the exact race, fix it, then un-skip
+      `TestVerifyBtreeEngineSilentOnRealConcurrentContended` as its permanent
+      regression guard. Only after that's fixed, re-attempt the original
+      pgbench-based repro to check whether it's the same bug. Gates this
+      loop: `go build ./...` clean; `go vet ./internal/amcheck/...
+      ./internal/access/btree/...` clean; `go test ./internal/amcheck/...
+      ./internal/access/btree/... ./internal/storage/...` PASS (new test
+      skipped, not run).
 
 - [x] race/internal/wal — race suite failed in package
       `github.com/goopg/goopg/internal/wal` (AI-20260707-000712-001; repro:
