@@ -4909,6 +4909,57 @@ mirroring M0119's ledger `status` column.
 - [ ] **M0122-0011 — Query optimizer & TPC-H/HammerDB correctness** (~17). Anti/
       semi-join unnesting (NOT IN), Q8/Q9/Q21 row-count fixes; several blocked on
       the slot/TupleSlot pipeline (see M0122-0012). Gate: TPC-H spot-check.
+      **Non-correlated NOT IN anti-semi-join unnesting landed (2026-07-09,
+      this loop, closes the "Anti/semi-join unnesting (NOT IN)" item and the
+      matching `unimplemented_feat.json` M0069-0005 entry):**
+      `isUnnestableNonCorrelatedIn`/`unnestNonCorrelatedInExpr`
+      (`internal/planner/unnest.go`) no longer hard-reject `in.Negated`; a
+      non-correlated `x NOT IN (subquery)` now unnests to a new
+      `Join.NullAware` (`internal/planner/plan.go`) `JoinTypeAnti` hash
+      join instead of staying on the slower per-row runtime-cache path.
+      The naive relax (just dropping the `Negated` guard, reusing the
+      pre-existing Anti join) would have been a silent correctness
+      regression: that Anti join is NOT-EXISTS-shaped ("NULL probe key
+      never matches → keep"), which is wrong for NOT IN's three-valued-
+      NULL semantics (a NULL anywhere in the subquery poisons the whole
+      predicate to empty output; an empty subquery returns every outer
+      row including NULL ones; otherwise a NULL outer value is excluded,
+      not kept). `internal/executor/operators_join_agg.go`'s
+      `openLazyHashJoin`/`nextLazy` track two build-side aggregates
+      (`antiBuildRows`/`antiBuildHasNull`) and special-case all three
+      rules when `NullAware` is set. Tests:
+      `internal/planner/not_in_unnest_test.go`,
+      `internal/executor/not_in_unnest_test.go` (4 cases covering the
+      normal/poison/empty/null-probe rules, cross-checked against real
+      PostgreSQL 18.3 NOT IN semantics); confirmed non-vacuous via `git
+      stash` (planner test fails to compile; executor's empty-subquery
+      case fails — which also proved the **pre-existing** runtime-cache
+      fallback itself mishandled that one edge case, a latent bug this
+      fix incidentally closes too). Design:
+      `docs/design/0040-0001-subquery-caching-and-unnest.md` new
+      Follow-up section; `docs/design/README.md` row updated;
+      `unimplemented_feat.json` M0069-0005 NOT-IN entry flipped to
+      `resolved`. Gates: `go build ./...` clean; `go test
+      ./internal/planner/... ./internal/executor/...` PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS
+      (0 failed txns, all 3 workloads); live-verified TPC-H Q16 (a real
+      NOT IN query) still returns the correct current-dataset row count
+      (18192). **Deliberately deferred (ledger row appended):** (1) the
+      CORRELATED NOT IN path (`unnestInExpr`'s existing
+      `if in.Negated { joinType = JoinTypeAnti }`) has the same
+      NOT-EXISTS-shaped gap — pre-existing, not introduced this loop —
+      but fixing it needs per-correlation-group NULL/emptiness tracking,
+      materially larger than this loop's single-global-build case; (2)
+      Q16's own real join shape does not actually route through the new
+      unnest path (an equivalent synthetic probe does) — root cause not
+      isolated, not a correctness bug since it safely keeps using the
+      pre-existing correct fallback, just missed optimization coverage.
+      Still open in this bucket: correlated NOT IN's NullAware gap,
+      Q16's non-triggering unnest, non-trivial LHS expressions on
+      IN-subquery unnesting (`unimplemented_feat.json`'s sibling
+      M0069-0005 entry, `unnest.go:1203`'s `ColumnRef`-only restriction),
+      Q8/Q9/Q21 row-count fixes.
 - [ ] **M0122-0012 — Perf infra: vectorization / slot-pipeline / harness** (~19,
       ARCHITECTURAL). Borrow-semantics allocation rewrite, plannode migration,
       vectorized FilterOp/SeqScanOp, plan cache, HammerDB SF1 validation.

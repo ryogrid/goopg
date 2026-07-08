@@ -1453,7 +1453,7 @@
    "feature": "Anti-semi-join optimization for NOT IN subqueries not implemented; planner rejects negated IN conditions",
    "task_id": "M0069-0005",
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "in.Negated=true (NOT IN) is rejected — anti-semi-join semantics out of scope"
    ],
@@ -1468,7 +1468,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open 2026-07-08: internal/planner/unnest.go:1200 (isUnnestableNonCorrelatedIn) still hard-rejects negated IN — 'if in.Negated { return false }', comment 'NOT IN requires anti-semi-join semantics which are out of scope for M0069-0005'; git log --all --grep=anti-semi/AntiJoin finds no later commit converting NOT IN to an AntiJoin plan. Unchanged since ebb267d6"
+   "code_audit": "RESOLVED 2026-07-09 (M0122-0011, this loop): non-correlated `x NOT IN (subquery)` now unnests to a NullAware JoinTypeAnti hash join (internal/planner/unnest.go's isUnnestableNonCorrelatedIn/unnestNonCorrelatedInExpr, new Join.NullAware field in internal/planner/plan.go). The executor (internal/executor/operators_join_agg.go) gives NullAware Anti joins NOT IN's three-valued-NULL semantics instead of the plain NOT-EXISTS-shaped Anti join a naive relax would have produced: a NULL anywhere in the subquery's build side poisons the whole predicate to empty output, an empty subquery emits every outer row unconditionally (including NULL outer values), and otherwise a NULL outer/probe value is excluded rather than kept. See docs/design/0040-0001-subquery-caching-and-unnest.md's new Follow-up section and the deferral ledger for the still-open correlated-NOT-IN gap this loop deliberately left untouched."
   },
   {
    "feature": "Non-trivial expressions on IN-subquery LHS not optimized to SemiJoin; falls back to runtime cache path",

@@ -720,7 +720,19 @@ type Join struct {
 	// left row as the lateral outer slot (BindLateralOuter contract)
 	// instead of materialising both sides up front.
 	Lateral bool
-	schema  Schema
+	// NullAware marks a JoinTypeAnti built from unnesting a
+	// non-correlated `x NOT IN (subquery)` (M0122-0011). Plain Anti
+	// join semantics (used for NOT EXISTS) keep a probe row whenever
+	// no hash match is found, including when the probe key is NULL —
+	// correct for NOT EXISTS, but not for NOT IN's three-valued
+	// semantics: a NULL anywhere in the subquery's output poisons
+	// the whole predicate to NULL/false for every outer row unless
+	// the subquery is empty, and a NULL outer value never matches
+	// (excluded) unless the subquery is empty. The executor's
+	// nextLazy/openLazyHashJoin special-case this flag instead of
+	// reusing the NOT-EXISTS-shaped default.
+	NullAware bool
+	schema    Schema
 }
 
 func (n *Join) Pos() int       { return n.pos }

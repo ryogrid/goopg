@@ -343,3 +343,109 @@ on an independently-generated SF1 dataset (`bench/tpch/runtime/pgdata`)
   changes which code path handles the outer IN, not yet isolated. It
   is kept as an end-state assertion guarding future regressions of
   this shape, not as the bug's original repro.
+
+## Follow-up (2026-07-09, M0122-0011): `NOT IN` → NullAware anti-join
+
+`isUnnestableNonCorrelatedIn` (`internal/planner/unnest.go`) previously
+hard-rejected `in.Negated` — the doc comment said NOT IN "requires
+anti-semi-join semantics which are out of scope for M0069-0005", so
+`x NOT IN (non-correlated subquery)` always fell back to the slower
+per-row runtime-cache execution path
+(`unimplemented_feat.json` M0069-0005, `code_audit` reconfirmed open
+as recently as 2026-07-08).
+
+**The relax is not just dropping the guard.** The existing `Anti`
+join (already used for correlated `NOT EXISTS`/`NOT IN` unnesting,
+`unnestInExpr`'s `if in.Negated { joinType = JoinTypeAnti }`) is
+built for NOT EXISTS semantics: "keep the probe row iff no hash
+match is found", with a NULL probe key documented as "never matches
+→ keep" (`internal/executor/operators_join_agg.go`'s `nextLazy`,
+the M0061-0001 comment block). That is correct for NOT EXISTS
+(existence doesn't care about NULL comparability) but wrong for NOT
+IN's three-valued-NULL semantics:
+
+- if the subquery produces **any** NULL in the compared column,
+  `x NOT IN (subquery)` is NULL (excluded) for **every** outer row —
+  even ones whose `x` matches no subquery value — because
+  `x = NULL` is always NULL/unknown, and `IN` is `OR`-composed
+  across every comparison;
+- if the subquery is genuinely **empty**, `x NOT IN ()` is TRUE for
+  every outer row, **including** a NULL `x` (the reverse case: an
+  empty `OR` chain is FALSE, so `NOT (...)` is TRUE regardless of
+  `x`'s nullness);
+- otherwise (non-empty, NULL-free subquery), a NULL `x` itself makes
+  `x NOT IN (subquery)` NULL (excluded) — the opposite of the plain
+  Anti join's "NULL probe key never matches → keep" rule.
+
+A naive relax (drop the `Negated` guard, always emit `JoinTypeAnti`)
+would have reused the NOT-EXISTS-shaped rule for all three cases and
+silently returned extra rows whenever the subquery or outer value
+contained a NULL — exactly the "silent row-count regression" failure
+mode `.ralph/PROMPT.md`'s hard-won rules warn about, and worse than
+the pre-existing runtime-cache fallback it would have replaced.
+
+**Fix:** new `Join.NullAware bool` field (`internal/planner/plan.go`),
+set by `unnestNonCorrelatedInExpr` only when `in.Negated`. The
+executor's `openLazyHashJoin` build loop (the right/build side is
+always the subquery for `JoinTypeAnti`; `BuildLeft` is forced false
+for Semi/Anti) tracks two scalars while `NullAware` is set —
+`antiBuildRows` (total build-side rows seen) and `antiBuildHasNull`
+(any build-side row's join key was NULL) — no per-row bookkeeping
+needed since NOT IN's degenerate cases only depend on these two
+aggregates, not on which values matched. `nextLazy` checks them
+before the normal per-probe-row hash lookup:
+
+- `antiBuildHasNull`: return `EOF` immediately (empty result, for
+  every outer row);
+- `antiBuildRows == 0`: pass every probe row through unconditionally
+  via `lazyOuterOnlySlot` (no hash lookup, so a NULL `x` is emitted
+  too);
+- otherwise: normal Anti-join probing, except a NULL probe key
+  (`ok == false` from `evalHashKey`) now `continue`s (excluded)
+  instead of falling through to "keep".
+
+**Deliberately out of scope — the CORRELATED `NOT IN` path
+(`unnestInExpr`'s `if in.Negated { joinType = JoinTypeAnti }`,
+reachable today for shapes like
+`x NOT IN (SELECT y FROM t WHERE t.corr = outer.corr)`) was found to
+have the same class of gap** (it does not set `NullAware`, so it
+still uses the NOT-EXISTS-shaped rule) **but was not touched this
+loop.** Fixing it correctly is materially larger: the "subquery is
+empty" / "subquery has a NULL" facts have to be tracked **per
+correlation-key group**, not once globally, since a correlated
+subquery conceptually re-runs per outer row — the single pair of
+build-side flags this fix uses is only sound for the non-correlated
+case's single global build. See the deferral ledger for the resume
+point.
+
+**Tests:** `internal/planner/not_in_unnest_test.go`
+(`TestUnnestNonCorrelatedNotIn` — NOT IN unnests to
+`JoinTypeAnti`+`NullAware`; `TestUnnestNonCorrelatedIn_NotNullAware`
+— plain IN stays `NullAware=false`); `internal/executor/
+not_in_unnest_test.go` (`TestNotInUnnest_NormalCase`,
+`_SubqueryNullPoisonsAllRows`, `_EmptySubqueryReturnsAllRows`,
+`_NullProbeExcluded` — all four cross-checked against the three-
+valued-NULL rules above). Confirmed non-vacuous via `git stash` on
+the three implementation files: the planner test fails to compile
+(`NullAware` doesn't exist) and the executor's
+`_EmptySubqueryReturnsAllRows` case fails (drops the NULL-`x` row,
+2 rows instead of 3) — incidentally proving the **pre-existing**
+runtime-cache fallback path itself mishandled that one edge case
+(NULL outer value + empty subquery), a latent bug this fix also
+happens to close for the queries it now unnests.
+
+**Verification against real data:** TPC-H Q16 (`ps_suppkey NOT IN
+(SELECT s_suppkey FROM supplier WHERE s_comment LIKE
+'%Customer%Complaints%')`) still returns the current dataset's
+correct row count (18192, matching the load-dependent baseline
+already on file in `ci/logs/action-items.md`'s non-blocking notices)
+— though a live EXPLAIN showed Q16's specific join shape does not
+actually route through the new unnest path (the `InExpr` still
+appears as a residual filter conjunct there; not yet root-caused —
+possibly join-order/NLI-conversion interaction specific to the real
+schema's indexes, unreproduced by an equivalent synthetic two-table
+probe). Not a regression either way: Q16 simply keeps using the
+pre-existing, still-correct runtime-cache path. `scripts/
+tpch-spotcheck.sh` (Q12=2/Q13=33) and `RALPH_PRECOMMIT_SCOPE=smoke
+scripts/ralph-precommit-test.sh` (0 failed, all 3 pgbench workloads)
+both PASS.

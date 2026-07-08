@@ -1191,15 +1191,17 @@ func canUnnestInExprDepth(in *InExpr, depth int) bool {
 }
 
 // isUnnestableNonCorrelatedIn checks the structural preconditions
-// for unnesting a non-correlated IN: the LHS is a ColumnRef, the
-// IN is not negated (NOT IN requires anti-semi-join semantics
-// which are out of scope for M0069-0005), and the inner plan has
-// exactly one output column. Without these the SemiJoin
-// rewriting would mis-shape the join.
+// for unnesting a non-correlated IN: the LHS is a ColumnRef and
+// the inner plan has exactly one output column. Without these the
+// Semi/Anti-join rewriting would mis-shape the join.
+//
+// M0122-0011: NOT IN is now unnestable too (previously rejected —
+// "NOT IN requires anti-semi-join semantics which are out of scope
+// for M0069-0005"). unnestNonCorrelatedInExpr builds a
+// JoinTypeAnti with NullAware=true, which the executor gives
+// NOT IN's three-valued-NULL semantics instead of the plain
+// NOT-EXISTS-shaped Anti join.
 func isUnnestableNonCorrelatedIn(in *InExpr) bool {
-	if in.Negated {
-		return false
-	}
 	if _, ok := in.Operand.(*ColumnRef); !ok {
 		return false
 	}
@@ -1435,17 +1437,29 @@ func unnestNonCorrelatedInExpr(in *InExpr, outer Node) (Node, error) {
 	// the outer width). The executor's JoinTypeSemi already emits
 	// just the probe row; preserving the outer schema here keeps
 	// every upstream column index valid.
+	//
+	// M0122-0011: `x NOT IN (subquery)` uses JoinTypeAnti with
+	// NullAware=true instead — the executor gives it NOT IN's
+	// three-valued-NULL semantics (a NULL anywhere in the subquery
+	// output, or in x itself, generally excludes the row — see the
+	// NullAware doc comment on the Join struct) rather than the
+	// plain NOT-EXISTS-shaped Anti join.
 	semiPred := &BinaryOp{pos: in.Pos(), Op: parser.OpEq, Left: outerKey, Right: innerKey}
 	_ = innerWidth
+	joinType := JoinTypeSemi
+	if in.Negated {
+		joinType = JoinTypeAnti
+	}
 	join := &Join{
 		pos:       in.Pos(),
-		Type:      JoinTypeSemi,
+		Type:      joinType,
 		Algo:      JoinAlgoHash,
 		Left:      outerChild,
 		Right:     innerPlan,
 		Predicate: semiPred,
 		LeftKey:   outerKey,
 		RightKey:  innerKey,
+		NullAware: in.Negated,
 		schema:    append(Schema(nil), outerChild.Output()...),
 	}
 	filter.Child = join
