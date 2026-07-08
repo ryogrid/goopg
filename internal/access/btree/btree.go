@@ -636,6 +636,95 @@ type BTree struct {
 	// pop/push atomic.
 	freeListMu sync.Mutex
 	freeList   []storage.BlockNumber
+
+	// DebugTraceInserts (M-NIGHTLY AI-20260708-064334-001 investigation
+	// aid, 5th loop): when true, every insertItemSorted call anywhere in
+	// this BTree (fast-path, cached-rightmost, split-left-refill,
+	// split-right-fill, dedup-recovery-rebuild) appends a record to
+	// insertLog: which block the item physically landed on, at which
+	// 0-based line-pointer slot, with the item's key/TID. Off by default,
+	// a single bool check when unset — same zero-cost-when-off pattern as
+	// storage.Pool.DebugTraceSlotEvents. Lets a caller cross-reference
+	// "was this (key,TID) ever actually written, and where" against the
+	// final on-disk leaf walk to localize a lost entry to an exact
+	// (block, slot) instead of only knowing it vanished somewhere.
+	DebugTraceInserts bool
+	insertLogMu       sync.Mutex
+	insertLog         []btreeInsertLogEvent
+}
+
+// btreeInsertLogEvent is one recorded insertItemSorted call (see
+// BTree.DebugTraceInserts).
+type btreeInsertLogEvent struct {
+	Seq     uint64
+	Block   storage.BlockNumber
+	LineIdx int // 0-based line-pointer index the item was inserted at
+	Key     []byte
+	Ptr     storage.ItemPointer
+}
+
+// traceInsert records one insertItemSorted call when DebugTraceInserts is
+// enabled; a no-op otherwise.
+func (bt *BTree) traceInsert(blk storage.BlockNumber, lineIdx int, it item) {
+	if !bt.DebugTraceInserts {
+		return
+	}
+	bt.insertLogMu.Lock()
+	bt.insertLog = append(bt.insertLog, btreeInsertLogEvent{
+		Seq:     uint64(len(bt.insertLog)),
+		Block:   blk,
+		LineIdx: lineIdx,
+		Key:     append([]byte(nil), it.key...),
+		Ptr:     it.ptr,
+	})
+	bt.insertLogMu.Unlock()
+}
+
+// InsertLogRecord is one recorded insertItemSorted call, exported for
+// investigation tooling outside this package. See BTree.DebugTraceInserts.
+type InsertLogRecord struct {
+	Seq     uint64
+	Block   storage.BlockNumber
+	LineIdx int
+	Key     []byte
+	Ptr     storage.ItemPointer
+}
+
+func (r InsertLogRecord) String() string {
+	return fmt.Sprintf("seq=%d blk=%d lineIdx=%d key=%x ptr=%v", r.Seq, r.Block, r.LineIdx, r.Key, r.Ptr)
+}
+
+// InsertLogRecordsForTID returns every recorded insertItemSorted call whose
+// item pointer matches tid, in recorded order. Test/investigation helper for
+// DebugTraceInserts.
+func (bt *BTree) InsertLogRecordsForTID(tid storage.ItemPointer) []InsertLogRecord {
+	bt.insertLogMu.Lock()
+	defer bt.insertLogMu.Unlock()
+	var out []InsertLogRecord
+	for _, e := range bt.insertLog {
+		if e.Ptr == tid {
+			out = append(out, InsertLogRecord{e.Seq, e.Block, e.LineIdx, e.Key, e.Ptr})
+		}
+	}
+	return out
+}
+
+// InsertLogRecordsForBlockAfter returns every recorded insertItemSorted call
+// that landed on blk with Seq >= afterSeq, in recorded order. Test/
+// investigation helper for DebugTraceInserts: used to see whether a target
+// block was later rewritten wholesale (a resetPageItems + reinsert-everything
+// burst, the signature of a split/dedup-recovery redistribution) after a
+// specific insert, and whether a specific TID's item survived that rewrite.
+func (bt *BTree) InsertLogRecordsForBlockAfter(blk storage.BlockNumber, afterSeq uint64) []InsertLogRecord {
+	bt.insertLogMu.Lock()
+	defer bt.insertLogMu.Unlock()
+	var out []InsertLogRecord
+	for _, e := range bt.insertLog {
+		if e.Block == blk && e.Seq >= afterSeq {
+			out = append(out, InsertLogRecord{e.Seq, e.Block, e.LineIdx, e.Key, e.Ptr})
+		}
+	}
+	return out
 }
 
 // pinNewOrRecycled (M0055-0005 Phase D) returns a writable slot
@@ -1436,7 +1525,8 @@ func (bt *BTree) tryInsertNoSplit(it item) error {
 		return errNeedsSplit
 	}
 
-	insertItemSorted(slot.Page(), it)
+	lineIdx := insertItemSorted(slot.Page(), it)
+	bt.traceInsert(leafBlk, lineIdx, it)
 	if logIns := bt.pool.LogBtreeInsert(); logIns != nil {
 		itemBytes := it.marshal()
 		return bt.pool.MarkDirtyChangeRecord(slot, func() (storage.LSN, error) {
@@ -1465,7 +1555,8 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 	}
 
 	if pageHasSpaceFor(slot.Page(), it) {
-		insertItemSorted(slot.Page(), it)
+		lineIdx := insertItemSorted(slot.Page(), it)
+		bt.traceInsert(blk, lineIdx, it)
 		// Logical-record path (M0002 redo-records): if the pool
 		// has a btree-insert hook configured, emit a small
 		// change record on subsequent dirties of this page in
@@ -1542,7 +1633,8 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 		// split needed. The right-side allocation is rolled back.
 		resetPageItems(slot.Page())
 		for _, x := range allItems {
-			insertItemSorted(slot.Page(), x)
+			lineIdx := insertItemSorted(slot.Page(), x)
+			bt.traceInsert(blk, lineIdx, x)
 		}
 		// Drop the freshly-allocated right slot — split avoided.
 		rightSlot.Unlock()
@@ -1567,10 +1659,12 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 	// Reset left page to empty, refill.
 	resetPageItems(slot.Page())
 	for _, x := range leftItems {
-		insertItemSorted(slot.Page(), x)
+		lineIdx := insertItemSorted(slot.Page(), x)
+		bt.traceInsert(blk, lineIdx, x)
 	}
 	for _, x := range rightItems {
-		insertItemSorted(rightSlot.Page(), x)
+		lineIdx := insertItemSorted(rightSlot.Page(), x)
+		bt.traceInsert(rightBlk, lineIdx, x)
 	}
 
 	// Stamp the new high key onto the left page: left now covers
@@ -1976,7 +2070,9 @@ func pageHasSpaceFor(p storage.Page, it item) bool {
 // encoded every item. The pre-Phase-A path was the chief CPU
 // hotspot per the M0055 baseline pprof (analysis/btree-baseline-
 // 2026-05-06.md) — this rewrite eliminates the O(n) re-encode.
-func insertItemSorted(p storage.Page, it item) {
+// insertItemSorted writes it into p at its sorted position and returns the
+// 0-based line-pointer index it landed at (used by BTree.traceInsert).
+func insertItemSorted(p storage.Page, it item) int {
 	count, err := storage.PageLinePointerCount(p)
 	if err != nil {
 		panic(err)
@@ -2008,6 +2104,7 @@ func insertItemSorted(p storage.Page, it item) {
 	if _, err := storage.PageInsertItemRawAt(p, uint16(lo+1), raw); err != nil {
 		panic(err)
 	}
+	return lo
 }
 
 // tryInsertOnCachedRightmost (M0055-0002-followup-rightmost-cache)
@@ -2062,7 +2159,8 @@ func (bt *BTree) tryInsertOnCachedRightmost(blk storage.BlockNumber, it item) (b
 		bt.unpinW(slot)
 		return false, nil
 	}
-	insertItemSorted(slot.Page(), it)
+	lineIdx := insertItemSorted(slot.Page(), it)
+	bt.traceInsert(blk, lineIdx, it)
 	if logIns := bt.pool.LogBtreeInsert(); logIns != nil {
 		itemBytes := it.marshal()
 		err := bt.pool.MarkDirtyChangeRecord(slot, func() (storage.LSN, error) {

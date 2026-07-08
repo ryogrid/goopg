@@ -324,7 +324,7 @@ func TestVerifyBtreeEngineSilentOnRealShuffledInt4(t *testing.T) {
 // which is load-bearing for the repro this harness feeds (see
 // TestVerifyBtreeEngineSilentOnRealConcurrentContended below) — a large pool
 // (no eviction pressure) does not reproduce it.
-func buildRealTreeConcurrent(t *testing.T, n, writers, poolSlots int, keyRange int32, seed int64) (*storage.Manager, *storage.Pool, storage.RelFileNode, int, []btree.LeafEntry, func()) {
+func buildRealTreeConcurrent(t *testing.T, n, writers, poolSlots int, keyRange int32, seed int64) (*storage.Manager, *storage.Pool, storage.RelFileNode, int, []btree.LeafEntry, *btree.BTree, func()) {
 	t.Helper()
 	dir := t.TempDir()
 	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dir})
@@ -345,6 +345,11 @@ func buildRealTreeConcurrent(t *testing.T, n, writers, poolSlots int, keyRange i
 		_ = mgr.Close()
 		t.Fatalf("btree.Create: %v", err)
 	}
+	// M-NIGHTLY investigation aid (AI-20260708-064334-001, 5th loop): record
+	// every insertItemSorted call (block+slot a key actually landed at) so a
+	// lost entry can be cross-referenced against its own write history, not
+	// just its absence from the final leaf walk.
+	bt.DebugTraceInserts = true
 
 	var wg sync.WaitGroup
 	var failed atomic.Bool
@@ -389,7 +394,7 @@ func buildRealTreeConcurrent(t *testing.T, n, writers, poolSlots int, keyRange i
 	for _, e := range perWriterEntries {
 		all = append(all, e...)
 	}
-	return mgr, pool, rel, int(inserted.Load()), all, cleanup
+	return mgr, pool, rel, int(inserted.Load()), all, bt, cleanup
 }
 
 // TestVerifyBtreeEngineSilentOnRealConcurrentContended is a KNOWN-FAILING
@@ -481,8 +486,49 @@ func buildRealTreeConcurrent(t *testing.T, n, writers, poolSlots int, keyRange i
 // split/redistribution logic bug in internal/access/btree, not
 // internal/storage/bufpool.go. See .ralph/deferral_ledger.md's 4th
 // 2026-07-08 row for the full writeup.
+//
+// Update (5th loop, same day, AI-20260708-064334-001): built
+// BTree.DebugTraceInserts (btree.go) — an unbounded, global log of every
+// insertItemSorted call (block, line-pointer index, key, TID), plus
+// Pool.DumpEventsForTag (bufpool.go), the exported sibling of
+// dumpCrossSlotEventsForTag for cross-package lookups. Result: **the
+// dominant loss mechanism is now proven, not just hypothesized, to be
+// inside the split/redistribution rewrite path.** For every missing entry
+// in a fresh repro: (1) insertItemSorted WAS called exactly once for that
+// exact (key, TID) — confirmed physically written (PageInsertItemRawAt
+// panics on failure, and no panic occurred); (2) a global scan of the
+// ENTIRE run's insert log for that TID found NO second occurrence anywhere,
+// on ANY block — ruling out "the item was carried to a new block during a
+// later split" (a split's left/right redistribution loop re-invokes
+// insertItemSorted for every surviving item, which would have logged a
+// second record); (3) the original block went on to receive hundreds more
+// insertItemSorted calls (healthy ongoing activity, not abandoned/evicted);
+// (4) reading the block's CURRENT on-disk bytes at test end confirms the
+// exact TID is genuinely absent — sometimes with sibling entries sharing
+// the identical duplicate key still present and intact. Since a plain
+// single-item insertItemSorted call only ADDS a line pointer (shifts
+// others, never deletes existing tuple bytes), the only mechanism able to
+// make a previously, successfully-written entry disappear without a trace
+// is `insertIntoBlock`'s split branch: `resetPageItems` wipes the entire
+// line-pointer array, then `pageItems`+`appendSorted`+`dedupConsolidate`
+// recompute the survivor set from scratch and reinsert it split across
+// left/right. The bug is therefore localized to that exact sequence
+// (btree.go's insertIntoBlock, ~line 1523-1574) — either `pageItems` fails
+// to read back an item that's genuinely on the page at read time, or
+// `dedupConsolidate`/`appendSorted` incorrectly drops a non-duplicate item
+// during the rebuild. Both were re-read function-by-function this loop and
+// no single-threaded logic flaw was spotted by inspection alone (dedup only
+// drops EXACT (key,ptr) duplicates via a safe in-place filter; appendSorted
+// is a straightforward sorted insert) — next step needs the SAME kind of
+// direct instrumentation used here, but INSIDE insertIntoBlock's split
+// branch itself: log `len(allItems)` immediately after `pageItems()` and
+// again after `dedupConsolidate`, cross-referenced against
+// `PageLinePointerCount` read just before the split starts, to catch
+// whether the read-back undercounts or the dedup rebuild overcounts-then-
+// drops. See .ralph/deferral_ledger.md's 5th 2026-07-08 row for the full
+// writeup and exact resume point.
 func TestVerifyBtreeEngineSilentOnRealConcurrentContended(t *testing.T) {
-	t.Skip("known-failing: tracks M-NIGHTLY AI-20260708-064334-001 (buffer-pool eviction lost-item bug); un-skip to confirm a fix")
+	t.Skip("known-failing: tracks M-NIGHTLY AI-20260708-064334-001 (btree split/redistribution lost-item bug); un-skip to confirm a fix")
 	if testing.Short() {
 		t.Skip("skipping concurrent real-tree amcheck stress in short mode")
 	}
@@ -490,7 +536,7 @@ func TestVerifyBtreeEngineSilentOnRealConcurrentContended(t *testing.T) {
 	const writers = 64
 	const poolSlots = 64
 	const keyRange = 50000
-	mgr, pool, rel, got, expected, cleanup := buildRealTreeConcurrent(t, n, writers, poolSlots, keyRange, 20260708)
+	mgr, pool, rel, got, expected, bt, cleanup := buildRealTreeConcurrent(t, n, writers, poolSlots, keyRange, 20260708)
 	defer cleanup()
 	hit, read, dirtied, written := pool.BufferCounters()
 	t.Logf("buffer counters: hit=%d read=%d dirtied=%d written=%d dirtyVictimRate=%.4f",
@@ -522,6 +568,72 @@ func TestVerifyBtreeEngineSilentOnRealConcurrentContended(t *testing.T) {
 				i := int(e.TID.Offset) - 1
 				t.Logf("MISSING entry: key=%d TID=%v (writer=%d iter=%d of %d)",
 					kv, e.TID, wid, i, n/writers)
+				// M-NIGHTLY investigation aid (AI-20260708-064334-001, 5th
+				// loop): was this entry ever actually written, and where?
+				logRecs := bt.InsertLogRecordsForTID(e.TID)
+				if len(logRecs) == 0 {
+					t.Logf("  insertItemSorted NEVER called for this TID — insert path silently returned without writing it")
+					continue
+				}
+				for _, r := range logRecs {
+					t.Logf("  insert-log: %s", r)
+				}
+				// Did the target block get rewritten wholesale afterward (a
+				// split/dedup-recovery redistribution burst), and did our
+				// item's (key,TID) survive that rewrite as a fresh
+				// insertItemSorted call? Look at every recorded write to the
+				// same block from just after our insert onward (count only —
+				// the individual records are too voluminous to log per-entry).
+				last := logRecs[len(logRecs)-1]
+				after := bt.InsertLogRecordsForBlockAfter(last.Block, last.Seq+1)
+				rewritten := false
+				for _, r := range after {
+					if r.Ptr == e.TID {
+						rewritten = true
+					}
+				}
+				t.Logf("  %d later insertItemSorted call(s) touched blk=%d after seq=%d; our TID reappears in that log: %v",
+					len(after), last.Block, last.Seq, rewritten)
+				// Ground truth: is the key/TID physically present on the
+				// block's CURRENT on-disk bytes right now, regardless of what
+				// the insert log says? Distinguishes "line-pointer array
+				// entry lost" (key absent entirely) from "TID silently
+				// changed" (key present, different TID) from "present but
+				// CollectBtreeLeafEntries's sibling-chain walk never reached
+				// this page" (key present here, entry also present in
+				// `actual` under a still-correct TID — would mean the earlier
+				// `present` map lookup itself is the bug, not the tree).
+				if p, perr := src(last.Block); perr == nil {
+					op := btree.ParseOpaque(p)
+					entries, eerr := btree.PageLeafEntries(p)
+					var sameKey []btree.LeafEntry
+					if eerr == nil {
+						for _, le := range entries {
+							if len(le.Key) == len(e.Key) && string(le.Key) == string(e.Key) {
+								sameKey = append(sameKey, le)
+							}
+						}
+					}
+					lineCount, _ := storage.PageLinePointerCount(p)
+					t.Logf("  CURRENT blk=%d: isLeaf=%v deleted=%v lineCount=%d entriesErr=%v sameKeyEntries=%v",
+						last.Block, op.IsLeaf(), op.IsDeleted(), lineCount, eerr, sameKey)
+				} else {
+					t.Logf("  CURRENT blk=%d: read failed: %v", last.Block, perr)
+				}
+				// Also dump the storage layer's per-slot event history for
+				// every block this entry was ever written to (bounded ring,
+				// may only show the tail of a long run).
+				seenBlk := map[storage.BlockNumber]bool{}
+				for _, r := range logRecs {
+					if seenBlk[r.Block] {
+						continue
+					}
+					seenBlk[r.Block] = true
+					tag := storage.BufferTag{Rel: rel, Block: r.Block}
+					for _, se := range pool.DumpEventsForTag(tag) {
+						t.Logf("  storage-event(blk=%d): %s", r.Block, se)
+					}
+				}
 			}
 		}
 	}

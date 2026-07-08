@@ -822,6 +822,50 @@ every clean, green (build + pre-commit) checkpoint.
       find the exact (page, slot-offset) a lost key was written to, then
       dump that page's `slotEvents` history (now available for free) to
       see what clobbered it.
+      2026-07-08 update (5th loop on the reopen; see today's 5th deferral
+      ledger row): built `BTree.DebugTraceInserts` (`internal/access/btree/
+      btree.go`, off by default/zero-cost, unbounded global log of every
+      `insertItemSorted` call — block, line-pointer index, key, TID) plus
+      `Pool.DumpEventsForTag` (exported sibling of `dumpCrossSlotEventsForTag`),
+      wired into a per-missing-entry diagnostic in
+      `TestVerifyBtreeEngineSilentOnRealConcurrentContended` (temporarily
+      un-skipped, re-skipped before commit). **Proved, not just
+      hypothesized, that the loss happens inside the split/redistribution
+      rewrite (`insertIntoBlock`'s split branch), not the storage/eviction
+      layer**: every missing entry's `insertItemSorted` call is logged
+      exactly once (confirmed physically written — `PageInsertItemRawAt`
+      panics on failure, none occurred); a global scan of the entire run's
+      log for that TID finds no second occurrence on ANY block, ruling out
+      "carried to a new block by a later split" (which would log a second
+      record); the origin block goes on to receive hundreds more
+      successful inserts afterward (not abandoned); and the block's
+      CURRENT on-disk bytes at test end genuinely lack the TID, sometimes
+      while a sibling entry sharing the identical duplicate key survives —
+      proving a single-entry drop during a page rewrite, not a whole-page
+      loss. Since a plain insert only adds a line pointer (never deletes
+      existing tuple bytes), only `resetPageItems` + `pageItems`+
+      `appendSorted`+`dedupConsolidate`'s rebuild-and-redistribute sequence
+      (btree.go ~1523-1574) can make a previously-written entry vanish
+      without a trace. Re-read `pageItems`/`dedupConsolidate`/
+      `appendSorted` function-by-function — no single-threaded logic flaw
+      spotted by inspection alone; also confirmed (by code reading, not
+      new instrumentation) that goopg's posting-list mechanism is
+      categorically unreachable from the online Insert path (dedup never
+      builds real postings) and that `bt.splitMu` fully serializes the
+      entire split-path recursion, so a concurrent-root-lift race is
+      unreachable in today's code. Gates: `go build ./...` clean; `go vet
+      ./internal/amcheck/... ./internal/storage/... ./internal/access/
+      btree/...` clean; `go test ./internal/storage/... ./internal/access/
+      btree/... ./internal/amcheck/...` PASS (test re-skipped);
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33). Next step:
+      instrument `insertIntoBlock`'s split branch directly — log
+      `PageLinePointerCount` just before the split, `len(allItems)` right
+      after `pageItems()`, and again after `dedupConsolidate`, for the
+      block a lost entry's insert targeted; cross-reference against
+      `bt.InsertLogRecordsForBlockAfter` to find the first split burst
+      after the lost insert (a tight run of consecutive calls with
+      monotonically-increasing lineIdx from 0) and check whether the lost
+      key is present in that exact `pageItems()` read.
 
 - [x] race/internal/wal — race suite failed in package
       `github.com/goopg/goopg/internal/wal` (AI-20260707-000712-001; repro:

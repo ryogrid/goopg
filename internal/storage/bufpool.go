@@ -1248,6 +1248,34 @@ func (p *Pool) dumpCrossSlotEventsForTag(tag BufferTag) {
 	}
 }
 
+// DumpEventsForTag is the exported, string-returning sibling of
+// dumpCrossSlotEventsForTag (M-NIGHTLY AI-20260708-064334-001, 5th loop): scans
+// every slot's event ring for any event touching tag and returns them as
+// formatted lines, oldest first across all slots, for a caller outside this
+// package (e.g. a btree-layer investigation test) to log/cross-reference
+// against its own write-path trace. Requires DebugTraceSlotEvents to have
+// been true for the events to exist; returns nil otherwise.
+func (p *Pool) DumpEventsForTag(tag BufferTag) []string {
+	var out []string
+	for slotIdx := range p.slotEvents {
+		ring := &p.slotEvents[slotIdx]
+		pos := ring.pos.Load()
+		start := uint64(0)
+		if pos > slotEventRingSize {
+			start = pos - slotEventRingSize
+		}
+		for i := start; i < pos; i++ {
+			e := ring.events[i%slotEventRingSize]
+			if e.tag != tag {
+				continue
+			}
+			out = append(out, fmt.Sprintf("seq=%d slotIdx=%d kind=%s tag=%v oldState=%#016x newState=%#016x",
+				e.seq, slotIdx, e.kind.String(), e.tag, e.oldState, e.newState))
+		}
+	}
+	return out
+}
+
 // PinNew pins the next-after-end block of rel for writing without
 // reading from disk. Returns the block number the slot represents.
 func (p *Pool) PinNew(rel RelFileNode) (*Slot, BlockNumber, error) {
