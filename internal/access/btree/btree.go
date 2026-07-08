@@ -698,6 +698,37 @@ type BTree struct {
 	// pattern as DebugTraceFlushes.
 	DebugTraceReloads bool
 	reloadLog         []ReloadSnapshotEvent
+	// DebugTraceContentMu (M-NIGHTLY AI-20260708-064334-001 investigation
+	// aid, 11th loop): when true, arms pinW/unpinW to snapshot pageItems()
+	// for the block being locked, bracketing the FULL contentMu hold (the
+	// "before" snapshot is taken right after s.Lock(), the "after"
+	// snapshot right before s.Unlock()) rather than any one caller's
+	// fast-path/split/dedup call. pinW/unpinW is every CALLER-SIDE
+	// mutation's choke point, but NOT the only code that takes
+	// storage.Slot.contentMu — storage.Pool.pinLoad (bufpool.go
+	// ~1561-1572) independently Lock()s/Unlock()s the same mutex around
+	// its own ReadBlock call during a cache-miss reload, so a hold
+	// recorded here can show a page's content valid at Unlock and already
+	// different at the very next traced Lock with nothing in between at
+	// THIS layer — that gap is real and lives inside pinLoad's reload
+	// hold, observable via DebugTraceReloads/OnBlockReload instead (see
+	// the 11th loop's writeup in
+	// TestVerifyBtreeEngineSilentOnRealConcurrentContended's skip message
+	// for how this was used to narrow the loss window further). Shares
+	// insertLog/rewriteLog/flushLog/reloadLog's Seq counter. Off by
+	// default, zero cost when unset — same pattern as DebugTraceFlushes/
+	// DebugTraceReloads.
+	DebugTraceContentMu bool
+	contentMuLog        []ContentMuEvent
+	// contentMuBefore holds, per in-flight pinW hold, the pageItems()
+	// snapshot taken right after acquiring the exclusive content latch, so
+	// unpinW can pair it with a post-mutation snapshot into one
+	// ContentMuEvent. Keyed by block number: safe without extra
+	// synchronization beyond insertLogMu because storage.Slot.contentMu is
+	// itself exclusive per block, so only one goroutine can hold a pinW on
+	// a given block at a time — no two concurrent holds for the same key
+	// can race this map.
+	contentMuBefore map[storage.BlockNumber][]InsertLogRecord
 	// logSeqNext is a single monotonic counter shared by insertLog and
 	// rewriteLog (instead of each using its own len()-based sequence) so a
 	// caller can compare Seq values ACROSS the two logs to establish
@@ -1048,6 +1079,96 @@ func (bt *BTree) ReloadSnapshotRecordsForBlock(blk storage.BlockNumber) []Reload
 	return out
 }
 
+// ContentMuEvent records one full pinW..unpinW hold on a block: the
+// pageItems() decoded right after the exclusive content latch was
+// acquired (Before) and right before it was released (After), keyed to
+// bt's shared Seq counter (see DebugTraceContentMu) so a caller can find
+// the exact hold where a previously-present (key,TID) pair is in Before
+// but missing from After.
+type ContentMuEvent struct {
+	Seq    uint64
+	Block  storage.BlockNumber
+	Before []InsertLogRecord
+	After  []InsertLogRecord
+}
+
+// recordContentMuLock is called from pinW immediately after s.Lock(),
+// while DebugTraceContentMu is armed — it snapshots pageItems() for the
+// page about to be mutated and stashes it in contentMuBefore, keyed by
+// block, for recordContentMuUnlock to pair with the post-mutation
+// snapshot. A no-op when DebugTraceContentMu is false.
+func (bt *BTree) recordContentMuLock(blk storage.BlockNumber, page storage.Page) {
+	if !bt.DebugTraceContentMu {
+		return
+	}
+	recs := snapshotPageItemsAsLog(blk, page)
+	if recs == nil {
+		return
+	}
+	bt.insertLogMu.Lock()
+	if bt.contentMuBefore == nil {
+		bt.contentMuBefore = make(map[storage.BlockNumber][]InsertLogRecord)
+	}
+	bt.contentMuBefore[blk] = recs
+	bt.insertLogMu.Unlock()
+}
+
+// recordContentMuUnlock is called from unpinW immediately before
+// s.Unlock(), while DebugTraceContentMu is armed — it snapshots
+// pageItems() again, pairs it with the matching recordContentMuLock
+// snapshot for the same block, and appends a ContentMuEvent. A no-op
+// when DebugTraceContentMu is false or no matching "before" snapshot was
+// recorded (e.g. pageItems() failed to decode at lock time).
+func (bt *BTree) recordContentMuUnlock(blk storage.BlockNumber, page storage.Page) {
+	if !bt.DebugTraceContentMu {
+		return
+	}
+	recs := snapshotPageItemsAsLog(blk, page)
+	bt.insertLogMu.Lock()
+	before, ok := bt.contentMuBefore[blk]
+	if ok {
+		delete(bt.contentMuBefore, blk)
+		seq := bt.logSeqNext
+		bt.logSeqNext++
+		bt.contentMuLog = append(bt.contentMuLog, ContentMuEvent{Seq: seq, Block: blk, Before: before, After: recs})
+	}
+	bt.insertLogMu.Unlock()
+}
+
+// snapshotPageItemsAsLog decodes pageItems() and converts it to the
+// []InsertLogRecord shape shared by insertLog/rewriteLog/flushLog/
+// reloadLog/contentMuLog so RewriteSnapshotHasTID and the other existing
+// diagnostic helpers work unchanged against a ContentMuEvent. Returns nil
+// (not an error) on decode failure, matching RecordFlushSnapshot/
+// RecordReloadSnapshot's best-effort behavior — this is debug
+// instrumentation, not a correctness path.
+func snapshotPageItemsAsLog(blk storage.BlockNumber, page storage.Page) []InsertLogRecord {
+	items, err := pageItems(page)
+	if err != nil {
+		return nil
+	}
+	recs := make([]InsertLogRecord, len(items))
+	for i, it := range items {
+		recs[i] = InsertLogRecord{Block: blk, LineIdx: i, Key: append([]byte(nil), it.key...), Ptr: it.ptr}
+	}
+	return recs
+}
+
+// ContentMuRecordsForBlock returns every recorded ContentMuEvent (see
+// DebugTraceContentMu) for blk, in recorded order. Test/investigation
+// helper.
+func (bt *BTree) ContentMuRecordsForBlock(blk storage.BlockNumber) []ContentMuEvent {
+	bt.insertLogMu.Lock()
+	defer bt.insertLogMu.Unlock()
+	var out []ContentMuEvent
+	for _, e := range bt.contentMuLog {
+		if e.Block == blk {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
 // pinNewOrRecycled (M0055-0005 Phase D) returns a writable slot
 // for a fresh page allocation, preferring a recycled block from
 // the free list before extending the file. The page bytes are
@@ -1361,17 +1482,25 @@ func (bt *BTree) unpinR(s *storage.Slot) {
 
 // pinW pins a buffer and acquires its exclusive content latch.
 // Used at every mutation site so concurrent readers (which take
-// the shared latch) see a coherent page image.
+// the shared latch) see a coherent page image. NOTE: this is every
+// CALLER-side choke point for this latch, but storage.Pool.pinLoad also
+// independently Lock()s/Unlock()s the same per-slot contentMu around its
+// own ReadBlock call during a cache-miss reload (bufpool.go
+// ~1561-1572) -- see DebugTraceContentMu's doc comment for why that
+// distinction mattered to the M-NIGHTLY AI-20260708-064334-001
+// investigation.
 func (bt *BTree) pinW(blk storage.BlockNumber) (*storage.Slot, error) {
 	s, err := bt.pool.Pin(storage.BufferTag{Rel: bt.rel, Block: blk})
 	if err != nil {
 		return nil, err
 	}
 	s.Lock()
+	bt.recordContentMuLock(blk, s.Page())
 	return s, nil
 }
 
 func (bt *BTree) unpinW(s *storage.Slot) {
+	bt.recordContentMuUnlock(s.Tag().Block, s.Page())
 	s.Unlock()
 	bt.pool.Unpin(s)
 }

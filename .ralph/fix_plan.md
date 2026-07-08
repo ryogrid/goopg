@@ -1088,6 +1088,57 @@ every clean, green (build + pre-commit) checkpoint.
       out across 8 loops of targeted instrumentation). Do NOT re-litigate
       hypothesis (b) (stale write superseding a newer one) — refuted with
       hard syscall-level evidence, not just unconfirmed.
+      2026-07-08 update (11th loop on the reopen; see today's 11th deferral
+      ledger row): executed the 10th loop's exact next step — built
+      BTree.DebugTraceContentMu (btree.go), bracketing every pinW/unpinW
+      hold with a before/after pageItems() snapshot, sharing
+      insertLog/rewriteLog/flushLog/reloadLog's Seq counter. **Found a real
+      flaw in the 10th loop's own premise, not the target bug directly**:
+      pinW/unpinW is NOT the sole contentMu choke point as its doc comment
+      (trusted uncritically by all 10 prior loops) claimed —
+      storage.Pool.pinLoad (bufpool.go ~1561-1572) independently
+      Lock()s/Unlock()s the SAME per-slot contentMu directly around its own
+      ReadBlock call during a cache-miss reload, bypassing bt.pinW/unpinW
+      entirely (fixed the misleading doc comments this loop). A fresh
+      repro (only 1 entry lost this run — smaller than the usual 6-49,
+      pure run-to-run variance) showed the resulting "GAP LOSS" pattern:
+      entry present at one traced pinW/unpinW hold's Unlock (seq=311449),
+      already absent at the very next traced hold's Lock (seq=311559),
+      nothing recorded at the pinW/unpinW level in between. Cross-
+      referencing against the pre-existing flush/reload logs closed the
+      gap to the tightest window in this whole investigation: a flush-
+      snapshot at seq=311541 has 268 items INCLUDING the entry (checked by
+      exact TID, not just count); the very next reload-snapshot at
+      seq=311542 — one Seq tick later — has 267 items, entry gone. This
+      REOPENS a specific sub-question the 10th loop's "zero mismatches"
+      result does not actually cover: that check only flags a postRead
+      matching an OLDER postWrite instead of the MOST RECENT one — it
+      cannot detect a SECOND, chronologically-later postWrite (e.g. from a
+      DIFFERENT physical slot racing to flush the same block tag; the 9th
+      loop already saw 3 different slot indices serve one block's tag in a
+      single run) legitimately becoming the new most-recent write with
+      STALE (pre-insert) content, which a following read would correctly
+      match without ever being flagged. Gates: go build ./... clean; go
+      vet ./internal/storage/... ./internal/amcheck/...
+      ./internal/access/btree/... clean; go test ./internal/storage/...
+      ./internal/access/btree/... ./internal/amcheck/... PASS (target test
+      re-skipped). Next step: walk io_trace.go's log for the implicated
+      block by WALL-CLOCK time (ioTraceEvent.T), not recurring lpCnt
+      (ambiguous — directly observed recurring across the run), to check
+      whether TWO postWrite events land for the block in immediate
+      succession with the second one's item count/hash regressing from the
+      first (the two-slots-racing-to-flush mechanism, fixed in
+      claimVictim/evictVictim's victim-selection/tag-transition sequence,
+      bufpool.go ~1527-1557) — or, if not, add a dedicated hook directly
+      inside pinLoad's own reload hold (distinct from pinW/unpinW) to catch
+      a same-slot double-load or destination-buffer aliasing bug instead.
+      Do NOT re-open claimVictim's pin-count exclusion, the fast-path
+      insert sites, the split/dedup-rewrite path, the clean-eviction path,
+      or relFile.readBlock/writeBlock's own r.mu serialization — all still
+      conclusively cleared. DO re-open whether the 10th loop's "zero
+      mismatches" conclusion covers the two-writers-race variant of
+      hypothesis (b) — it does not, by construction of that loop's own
+      matching algorithm.
 
 - [x] race/internal/wal — race suite failed in package
       `github.com/goopg/goopg/internal/wal` (AI-20260707-000712-001; repro:

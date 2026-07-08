@@ -374,6 +374,15 @@ func buildRealTreeConcurrent(t *testing.T, n, writers, poolSlots int, keyRange i
 	// for the same block.
 	bt.DebugTraceReloads = true
 	pool.OnBlockReload = bt.RecordReloadSnapshot
+	// M-NIGHTLY investigation aid (AI-20260708-064334-001, 11th loop): the
+	// 8th/9th loops proved the flush write side and reload read side both
+	// faithfully move whatever bytes exist, and the 10th loop's syscall-
+	// level IO trace cleared the entire storage/smgr layer -- the loss is
+	// a genuine in-memory content bug. Bracket every pinW/unpinW hold (the
+	// SOLE choke point every mutation passes through) with a before/after
+	// pageItems() snapshot to catch which specific hold silently drops an
+	// already-inserted entry.
+	bt.DebugTraceContentMu = true
 
 	var wg sync.WaitGroup
 	var failed atomic.Bool
@@ -749,7 +758,7 @@ func buildRealTreeConcurrent(t *testing.T, n, writers, poolSlots int, keyRange i
 // holding an outdated slot). See .ralph/deferral_ledger.md's 9th
 // 2026-07-08 row for the full writeup.
 func TestVerifyBtreeEngineSilentOnRealConcurrentContended(t *testing.T) {
-	t.Skip("known-failing: tracks M-NIGHTLY AI-20260708-064334-001 (btree lost-index-entry bug; 10th loop cross-checked the 9th loop's reload-snapshot smoking gun against an INDEPENDENT smgr/syscall-level content-hash IO tracer (GOOPG_IO_TRACE=1, internal/storage/io_trace.go) and REFUTES hypothesis (b) -- across 60863 real ReadAt/WriteAt-completion events spanning 38 blocks and 49 lost entries in one run, EVERY postRead exactly matched the immediately-preceding postWrite's byte-content hash for that same (relFile, block); zero stale/superseded reads at the true hardware-completion-order layer. Combined with the 8th loop's proof that flush-side WriteBlock always durably wrote whatever was in memory, the entire storage/smgr layer (bufpool eviction+reload+flush, and the OS/file read/write path) is now cleared -- the loss is a genuine IN-MEMORY content bug, not a storage-layer one. Reviewed bufpool.go's pinLoad/tryPinSlot/claimVictim tag-publish-before-load window on inspection (state-bit gating + pinMu serialization) and found no obvious gap. Next step: instrument at the contentMu-critical-section level directly (one layer below the flush/reload snapshots already built) to catch which specific content mutation clobbers the entry; see .ralph/deferral_ledger.md's 10th 2026-07-08 row for full detail); un-skip to confirm a fix")
+	t.Skip("known-failing: tracks M-NIGHTLY AI-20260708-064334-001 (btree lost-index-entry bug; 10th loop cross-checked the 9th loop's reload-snapshot smoking gun against an INDEPENDENT smgr/syscall-level content-hash IO tracer (GOOPG_IO_TRACE=1, internal/storage/io_trace.go) and REFUTES hypothesis (b) -- across 60863 real ReadAt/WriteAt-completion events spanning 38 blocks and 49 lost entries in one run, EVERY postRead exactly matched the immediately-preceding postWrite's byte-content hash for that same (relFile, block); zero stale/superseded reads at the true hardware-completion-order layer. Combined with the 8th loop's proof that flush-side WriteBlock always durably wrote whatever was in memory, the entire storage/smgr layer (bufpool eviction+reload+flush, and the OS/file read/write path) is now cleared -- the loss is a genuine IN-MEMORY content bug, not a storage-layer one. Reviewed bufpool.go's pinLoad/tryPinSlot/claimVictim tag-publish-before-load window on inspection (state-bit gating + pinMu serialization) and found no obvious gap. Next step: instrument at the contentMu-critical-section level directly (one layer below the flush/reload snapshots already built) to catch which specific content mutation clobbers the entry; see .ralph/deferral_ledger.md's 10th 2026-07-08 row for full detail). 2026-07-08 update (11th loop, same day, AI-20260708-064334-001): executed the 10th loop's next step -- built BTree.DebugTraceContentMu (btree.go), bracketing every pinW/unpinW hold (before/after pageItems() snapshot around the hold) with the existing insertLog/rewriteLog/flushLog/reloadLog Seq counter. **Found a real gap in the 10th loop's own premise**: pinW/unpinW is NOT actually the sole mutation choke point as its doc comment claimed -- storage.Pool.pinLoad (bufpool.go:1561-1572) independently acquires/releases the SAME s.contentMu directly around its ReadBlock call during a cache-miss reload, bypassing bt.pinW/unpinW entirely (fixed the misleading doc comment this loop). This fully explains why the new instrumentation's per-block hold sequence showed the missing entry present at one traced pinW/unpinW hold's Unlock and already gone at the very next traced hold's Lock, with nothing in between at the pinW/unpinW level: the loss happens inside pinLoad's own reload hold, which the pinW/unpinW instrumentation cannot see but the pre-existing (9th-loop) OnBlockReload hook can. Cross-referencing precisely (by exact (key,TID) presence via RewriteSnapshotHasTID, not just item count) pinned the loss down to the tightest window found in this investigation so far: for the one entry lost in a fresh repro (key at blk=196), the flush-snapshot immediately before the loss (Seq=311541) has 268 items INCLUDING the entry, and the very next reload-snapshot of the same block (Seq=311542 -- one Seq-tick later, i.e. essentially back-to-back with no other traced btree-level event for this block in between) has 267 items, entry gone. This reopens, rather than closes, the question the 10th loop believed it had answered: the 10th loop's IO-trace check only flags a postRead that matches an OLDER postWrite instead of the MOST RECENT one -- it cannot detect a still-plausible variant of hypothesis (b) where a SECOND, chronologically-later postWrite (e.g. from a DIFFERENT physical slot racing to flush the same block tag during heavy eviction churn -- the 9th loop already observed 3 different slot indices serving blk=173's tag in one run) legitimately becomes the new most-recent write with STALE (pre-insert) content, so the following read correctly matches it and is never flagged as a mismatch, yet the insert is still lost. Next step: for blk=196's exact Seq=311541/311542 window, walk the io-trace log by wall-clock time (not recurring lpCnt, which is ambiguous -- the same lpCnt value recurs many times over a run) to check whether TWO postWrite events land for this block in immediate succession there, with the second one's item count/hash regressing from the first -- if so, that is the concrete two-slots-racing-to-flush-the-same-tag mechanism to fix in claimVictim/evictVictim's victim-selection and tag-transition sequence (bufpool.go ~1527-1557); if not, add a dedicated hook directly inside pinLoad's own reload hold (distinct from pinW/unpinW, since this loop proved they are separate mutation sites) to catch a same-slot double-load or a destination-buffer aliasing bug instead. See .ralph/deferral_ledger.md's 11th 2026-07-08 row for the full writeup; un-skip to confirm a fix")
 	if testing.Short() {
 		t.Skip("skipping concurrent real-tree amcheck stress in short mode")
 	}
@@ -997,6 +1006,101 @@ func TestVerifyBtreeEngineSilentOnRealConcurrentContended(t *testing.T) {
 								} else {
 									t.Logf("  => ANOMALY (syscall-level): postRead hash=%016x lpCnt=%d matches NO prior postWrite to this tag (most recent postWrite hash=%016x lpCnt=%d) -- bytes on disk were never legitimately written through this relFile",
 										ev.Hash, ev.LPCnt, latest.Hash, latest.LPCnt)
+								}
+							}
+						}
+					}
+				}
+				// M-NIGHTLY investigation aid (AI-20260708-064334-001, 11th
+				// loop): the 8th/9th loops proved the flush/reload sides of
+				// the storage layer faithfully move whatever bytes exist,
+				// and the 10th loop's syscall-level IO trace cleared the
+				// smgr/OS layer entirely -- the loss must happen inside a
+				// specific pinW..unpinW hold (the SOLE choke point every
+				// leaf/internal page mutation passes through). Walk every
+				// contentMu hold recorded for this block at/after the
+				// insert and report the first one where the entry is
+				// present in Before but missing from After -- that IS the
+				// hold where the in-memory bytes lost it.
+				{
+					cmEvents := bt.ContentMuRecordsForBlock(last.Block)
+					if len(cmEvents) == 0 {
+						t.Logf("  no contentMu-hold event recorded for blk=%d (block was never pinW/unpinW-locked during this run, or pageItems() failed to decode at every hold)", last.Block)
+					} else {
+						var lastGoodSeq uint64
+						haveLastGood := false
+						for _, ce := range cmEvents {
+							if ce.Seq < last.Seq {
+								continue
+							}
+							beforeHas := btree.RewriteSnapshotHasTID(ce.Before, e.TID)
+							afterHas := btree.RewriteSnapshotHasTID(ce.After, e.TID)
+							if !beforeHas && !afterHas {
+								continue
+							}
+							t.Logf("  contentMu-hold seq=%d blk=%d beforeCount=%d afterCount=%d presentBefore=%v presentAfter=%v",
+								ce.Seq, ce.Block, len(ce.Before), len(ce.After), beforeHas, afterHas)
+							if beforeHas && !afterHas {
+								t.Logf("  => SMOKING GUN (in-memory): contentMu hold seq=%d had this (key,TID) at lock time and lost it before unlock -- the mutation performed under THIS hold is the loss site", ce.Seq)
+							}
+							if !haveLastGood || ce.Seq > lastGoodSeq {
+								lastGoodSeq = ce.Seq
+								haveLastGood = true
+							}
+						}
+						if !haveLastGood {
+							t.Logf("  no contentMu-hold event for blk=%d at/after seq=%d ever showed this (key,TID) present in Before or After (entry may already have been lost before any traced hold, or the traced hold window missed it)", last.Block, last.Seq)
+						} else {
+							// The per-entry filter above only prints holds
+							// that show the entry present -- silent by
+							// design once it's gone, which is why earlier
+							// loops' snapshot techniques could only prove
+							// "permanently absent from here on", never name
+							// a transition point. Pin the transition down:
+							// find the very next traced hold on this block
+							// after the last one that had the entry
+							// (regardless of what it shows) and report
+							// whether the entry was ALREADY gone at that
+							// hold's Lock time. If so, the loss happened in
+							// the GAP between two traced pinW/unpinW holds,
+							// not inside one -- meaning either pinW/unpinW
+							// is not actually the sole mutation choke point
+							// (something else touches page bytes), or an
+							// eviction+reload cycle served bytes lacking
+							// the entry despite the 8th/9th/10th loops'
+							// flush/reload/IO-trace snapshots never
+							// catching a mismatch for any block. Cross-
+							// reference any reload event landing exactly in
+							// that gap to distinguish the two.
+							var next *btree.ContentMuEvent
+							for i := range cmEvents {
+								if cmEvents[i].Seq <= lastGoodSeq {
+									continue
+								}
+								if next == nil || cmEvents[i].Seq < next.Seq {
+									next = &cmEvents[i]
+								}
+							}
+							if next == nil {
+								t.Logf("  no contentMu-hold recorded on blk=%d after last-good seq=%d (block was never pinW-locked again during this run after the entry was last seen present)", last.Block, lastGoodSeq)
+							} else {
+								beforeHas := btree.RewriteSnapshotHasTID(next.Before, e.TID)
+								t.Logf("  next contentMu-hold after last-good seq=%d is seq=%d blk=%d beforeCount=%d presentBefore=%v",
+									lastGoodSeq, next.Seq, next.Block, len(next.Before), beforeHas)
+								if !beforeHas {
+									t.Logf("  => GAP LOSS: entry was present at hold seq=%d but already absent at the very next traced hold (seq=%d) on the SAME block -- the loss happened BETWEEN two pinW/unpinW holds, not inside one", lastGoodSeq, next.Seq)
+									for _, re := range bt.ReloadSnapshotRecordsForBlock(last.Block) {
+										if re.Seq > lastGoodSeq && re.Seq < next.Seq {
+											has := btree.RewriteSnapshotHasTID(re.Items, e.TID)
+											t.Logf("  reload-snapshot IN GAP seq=%d itemCount=%d present=%v", re.Seq, len(re.Items), has)
+										}
+									}
+									for _, fe := range bt.FlushSnapshotRecordsForBlock(last.Block) {
+										if fe.Seq > lastGoodSeq && fe.Seq < next.Seq {
+											has := btree.RewriteSnapshotHasTID(fe.Items, e.TID)
+											t.Logf("  flush-snapshot IN GAP seq=%d itemCount=%d present=%v", fe.Seq, len(fe.Items), has)
+										}
+									}
 								}
 							}
 						}
