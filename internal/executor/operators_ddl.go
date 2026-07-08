@@ -10860,6 +10860,7 @@ func routineToCreateFunctionPayload(r *catalog.Routine) wal.CreateFunctionPayloa
 		BeginAtomic:     r.BeginAtomic,
 		IsReturnForm:    r.IsReturnForm,
 		KindChar:        r.KindChar,
+		Config:          r.Config,
 	}
 }
 
@@ -11010,6 +11011,7 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 		Rows:            s.Rows,
 		SecurityDefiner: s.SecurityDefiner,
 		Leakproof:       s.Leakproof,
+		Config:          catalog.ApplyFunctionConfigOps(nil, s.ConfigOps),
 	}
 	// Extract dependency information for information_schema views (SQL functions only).
 	if lang == "sql" {
@@ -11598,6 +11600,16 @@ func (o *ddlOp) execAlterFunction(s *parser.AlterFunctionStmt) error {
 		if s.Strict != nil {
 			r.Strict = *s.Strict
 		}
+		// SET name = value / RESET name / RESET ALL — real PG's
+		// FunctionSetResetClause is combinable with VOLATILE/STRICT/etc in
+		// the same statement (common_func_opt_item), so this applies inside
+		// the same per-routine loop rather than an early-return branch like
+		// RENAME/OWNER/SET SCHEMA above (those are genuinely separate
+		// top-level grammar productions, not combinable). DU-002 proconfig
+		// follow-up to M0097-0150.
+		if len(s.ConfigOps) > 0 {
+			r.Config = catalog.ApplyFunctionConfigOps(r.Config, s.ConfigOps)
+		}
 		// DU-002 restart-persistence follow-up (M0119-0004, loop #71 ledger
 		// resume point): log the full post-mutation snapshot of the four
 		// mutable attributes, not just the clause(s) this statement touched —
@@ -11605,6 +11617,11 @@ func (o *ddlOp) execAlterFunction(s *parser.AlterFunctionStmt) error {
 		if o.ctx.WAL != nil {
 			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterFunctionFlags(r.OID, r.Volatile, r.SecurityDefiner, r.Leakproof, r.Strict)); werr != nil {
 				return fmt.Errorf("wal alter-function-flags: %w", werr)
+			}
+			if len(s.ConfigOps) > 0 {
+				if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterFunctionConfig(r.OID, r.Config)); werr != nil {
+					return fmt.Errorf("wal alter-function-config: %w", werr)
+				}
 			}
 		}
 	}

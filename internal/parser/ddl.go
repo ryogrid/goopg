@@ -7268,13 +7268,13 @@ func (p *parser) parseAlter() (Stmt, error) {
 				continue
 			}
 			// SET SCHEMA schema — store the new schema in stmt (M0097-0150).
-			// SET guc_name {TO|=} value | SET guc_name FROM CURRENT remain
-			// no-ops (goopg has no per-function GUC-override storage). SET
-			// itself is a real keyword token (KwSet), not an ident — as is
-			// FROM (KwFrom) below; both were previously matched against
-			// TokenIdent, so this whole branch was unreachable dead code
-			// (any `ALTER FUNCTION ... SET ...` form hit a syntax error
-			// instead of falling into this "no-op" comment's promise).
+			// SET guc_name {TO|=} value | SET guc_name FROM CURRENT are
+			// captured into stmt.ConfigOps for pg_proc.proconfig (DU-002
+			// follow-up). SET itself is a real keyword token (KwSet), not an
+			// ident — as is FROM (KwFrom) below; both were previously matched
+			// against TokenIdent, so this whole branch was unreachable dead
+			// code (any `ALTER FUNCTION ... SET ...` form hit a syntax error
+			// instead of ever reaching here).
 			if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwSet {
 				p.advance() // SET
 				if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "schema") {
@@ -7283,41 +7283,20 @@ func (p *parser) parseAlter() (Stmt, error) {
 						stmt.NewSchema = identText(schemaTok)
 					}
 				} else {
-					// SET guc_name {TO|=} value | SET guc_name FROM CURRENT —
-					// per gram.y's var_name comes first, THEN the
-					// TO/=/FROM-CURRENT form (unlike RESET, "FROM" is never
-					// the guc name here since a bare "SET FROM" isn't valid
-					// PG grammar either way).
-					p.advance() // guc name (or quoted name)
-					if (p.cur().Kind == TokenSymbol || p.cur().Kind == TokenOperator) && p.cur().Value == "=" {
-						p.advance()
-					} else {
-						p.acceptKeyword(KwTo)
+					op, ok, err := p.parseFunctionConfigSetClause()
+					if err != nil {
+						return nil, err
 					}
-					if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwFrom {
-						p.advance() // FROM
-						p.acceptIdentKeyword("current")
-					} else if p.acceptIdentKeyword("default") {
-						// value already consumed
-					} else if p.cur().Kind != TokenSymbol || p.cur().Value != ";" {
-						// var_list: comma-separated values for list-valued GUCs
-						// like search_path/temp_tablespaces (gram.y's var_list),
-						// e.g. `SET search_path = app, public`. Reuses the same
-						// atom parser the generic SET statement uses; the result
-						// is discarded (still a no-op — goopg has no per-function
-						// GUC-override storage).
-						_, _ = p.parseSetValueAtoms()
+					if ok {
+						stmt.ConfigOps = append(stmt.ConfigOps, op)
 					}
 				}
 				continue
 			}
-			// RESET guc_name | RESET ALL — no-op
+			// RESET guc_name | RESET ALL — captured into stmt.ConfigOps.
 			if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwReset {
 				p.advance() // RESET
-				// ALL or a guc name.
-				if !p.acceptIdentKeyword("all") {
-					p.advance() // guc name
-				}
+				stmt.ConfigOps = append(stmt.ConfigOps, p.parseFunctionConfigResetClause())
 				continue
 			}
 			cur := p.cur()

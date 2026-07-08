@@ -3415,6 +3415,27 @@ type CreateFunctionStmt struct {
 	Parallel        string // proparallel: "u"=unsafe (default), "s"=safe, "r"=restricted
 	Cost            string // procost: planner per-row cost override (COST n); "" = language default
 	Rows            string // prorows: SRF result-row estimate override (ROWS n); "" = default
+	// ConfigOps records CREATE FUNCTION's `SET name {TO|=} value` / `RESET
+	// name` / `RESET ALL` clauses (real PG's FunctionSetResetClause, part of
+	// common_func_opt_item — shared with ALTER FUNCTION's identical clause
+	// below) in statement order, for pg_proc.proconfig (DU-002 follow-up).
+	ConfigOps []FunctionConfigOp
+}
+
+// FunctionConfigOp is one `SET name {TO|=} value[, ...]` / `RESET name` /
+// `RESET ALL` clause of a CREATE/ALTER FUNCTION/PROCEDURE/ROUTINE statement,
+// applied in the order recorded (mirrors pg_proc.proconfig's "name=value"
+// array-element shape, same storage convention as InMemory's
+// role/database-level SetRoleConfig/SetDatabaseConfig). `SET name FROM
+// CURRENT` and `SET name TO DEFAULT` never produce an op (see the parser's
+// doc comment) — goopg has no per-session GUC snapshot to capture at
+// CREATE/ALTER time, so both collapse to "leave unset", not a distinguishable
+// value.
+type FunctionConfigOp struct {
+	Reset    bool   // RESET name
+	ResetAll bool   // RESET ALL
+	Name     string // GUC name (empty when ResetAll)
+	Value    string // comma-joined flattened value(s), SET only
 }
 
 // AlterFunctionStmt — `ALTER FUNCTION name([argtypes]) attribute ...`
@@ -3433,6 +3454,11 @@ type AlterFunctionStmt struct {
 	SecurityDefiner *bool
 	Leakproof       *bool
 	Strict          *bool
+	// ConfigOps records the generic `SET name {TO|=} value` / `RESET name` /
+	// `RESET ALL` clauses (distinct from the dedicated `SET SCHEMA` rule
+	// above — real PG grammar treats them as separate productions) in
+	// statement order. DU-002 proconfig follow-up to M0097-0150.
+	ConfigOps []FunctionConfigOp
 }
 
 func (s *AlterFunctionStmt) Pos() int  { return s.pos }

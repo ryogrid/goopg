@@ -409,3 +409,88 @@ func TestExecAlterFunctionSetSchema(t *testing.T) {
 		t.Error("routine does not resolve under the new schema after SET SCHEMA")
 	}
 }
+
+// TestExecCreateFunctionSetClausePopulatesConfig pins the CREATE FUNCTION
+// side of the SET-clause fix (DU-002 proconfig follow-up to M0097-0150):
+// previously `SET name = value` in a CREATE FUNCTION statement was a hard
+// syntax error (SET lexes as the keyword KwSet, never the TokenIdent
+// isFunctionAttribute()'s old "set" case checked for — the exact same root
+// cause ALTER FUNCTION's SET clause had before M0097-0150). Now it populates
+// catalog.Routine.Config.
+func TestExecCreateFunctionSetClausePopulatesConfig(t *testing.T) {
+	cat := catalog.NewInMemory()
+	if err := runRoutineDDL(t,
+		`CREATE FUNCTION f() RETURNS int LANGUAGE sql SET search_path = app, public STRICT AS $$ SELECT 1 $$`,
+		cat); err != nil {
+		t.Fatalf("CREATE FUNCTION with SET clause: %v", err)
+	}
+	fn, ok := cat.Routines().Lookup(parser.ObjectName{Name: "f"}, nil)
+	if !ok {
+		t.Fatal("function not registered")
+	}
+	if !fn.Strict {
+		t.Error("STRICT after SET clause was not applied (combinable common_func_opt_item)")
+	}
+	if len(fn.Config) != 1 || fn.Config[0] != "search_path=app,public" {
+		t.Errorf("Config = %#v, want [search_path=app,public]", fn.Config)
+	}
+}
+
+// TestExecAlterFunctionSetResetConfig pins ALTER FUNCTION/PROCEDURE/ROUTINE
+// ... SET name = value / RESET name / RESET ALL actually mutating
+// catalog.Routine.Config, closing the "goopg has no per-function
+// GUC-override storage" no-op the earlier same-day ALTER FUNCTION SET/RESET
+// parsing fix (M0097-0150) deferred. Also pins that SET is combinable with
+// VOLATILE/etc in one statement (common_func_opt_item), matching real
+// gram.y's alterfunc_opt_list, unlike the mutually-exclusive RENAME/OWNER/
+// SET SCHEMA top-level forms.
+func TestExecAlterFunctionSetResetConfig(t *testing.T) {
+	cat := catalog.NewInMemory()
+	if err := runRoutineDDL(t,
+		`CREATE FUNCTION add_one(x int) RETURNS int LANGUAGE plpgsql AS $$ BEGIN RETURN x + 1; END $$`,
+		cat); err != nil {
+		t.Fatalf("CREATE FUNCTION: %v", err)
+	}
+	fn, ok := cat.Routines().Lookup(parser.ObjectName{Name: "add_one"}, []catalog.Type{{Name: "int"}})
+	if !ok {
+		t.Fatal("function not registered before ALTER")
+	}
+	if fn.Config != nil {
+		t.Fatalf("Config before any SET = %#v, want nil", fn.Config)
+	}
+
+	// SET combined with VOLATILE in the same statement — both must apply.
+	if err := runRoutineDDL(t, "ALTER FUNCTION add_one(int) VOLATILE SET search_path = app, public", cat); err != nil {
+		t.Fatalf("ALTER FUNCTION SET: %v", err)
+	}
+	if fn.Volatile != "v" {
+		t.Errorf("Volatile after combined SET = %q, want v", fn.Volatile)
+	}
+	if len(fn.Config) != 1 || fn.Config[0] != "search_path=app,public" {
+		t.Fatalf("Config after SET = %#v, want [search_path=app,public]", fn.Config)
+	}
+
+	// A second SET on a different name appends.
+	if err := runRoutineDDL(t, "ALTER FUNCTION add_one(int) SET work_mem = '64MB'", cat); err != nil {
+		t.Fatalf("ALTER FUNCTION SET work_mem: %v", err)
+	}
+	if len(fn.Config) != 2 || fn.Config[0] != "search_path=app,public" || fn.Config[1] != "work_mem=64MB" {
+		t.Fatalf("Config after second SET = %#v", fn.Config)
+	}
+
+	// RESET removes just the named entry.
+	if err := runRoutineDDL(t, "ALTER FUNCTION add_one(int) RESET search_path", cat); err != nil {
+		t.Fatalf("ALTER FUNCTION RESET search_path: %v", err)
+	}
+	if len(fn.Config) != 1 || fn.Config[0] != "work_mem=64MB" {
+		t.Fatalf("Config after RESET search_path = %#v, want [work_mem=64MB]", fn.Config)
+	}
+
+	// RESET ALL clears everything.
+	if err := runRoutineDDL(t, "ALTER FUNCTION add_one(int) RESET ALL", cat); err != nil {
+		t.Fatalf("ALTER FUNCTION RESET ALL: %v", err)
+	}
+	if fn.Config != nil {
+		t.Errorf("Config after RESET ALL = %#v, want nil", fn.Config)
+	}
+}

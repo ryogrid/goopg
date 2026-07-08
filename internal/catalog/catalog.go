@@ -14906,6 +14906,20 @@ func optionsArrayLiteral(opts []string) string {
 	return arrayTextLiteral(opts)
 }
 
+// RoutineConfigArrayLiteral renders a routine's pg_proc.proconfig entries
+// ("name=value" strings, see Routine.Config) as the PostgreSQL text[]
+// external literal pg_dump's dumpFunc reads back to emit `SET name = value`
+// lines. Exported (unlike the sibling optionsArrayLiteral) so the initdb
+// package's pg_proc VirtualRows renderer — a different package, plain-string
+// cells rather than a heap-encoded array — can reuse the exact same
+// array_out quoting rules (quoteArrayElement) instead of a second,
+// potentially divergent implementation. An empty/nil list yields "" (SQL
+// NULL, so dumpFunc emits no SET clause at all — matches a routine that
+// never had a SET clause). DU-002 proconfig follow-up to M0097-0150.
+func RoutineConfigArrayLiteral(cfg []string) string {
+	return optionsArrayLiteral(cfg)
+}
+
 type ForeignServer struct {
 	Name    string // srvname
 	OID     uint32 // pg_foreign_server.oid (assigned from the catalog OID counter)

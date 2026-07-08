@@ -218,3 +218,109 @@ func TestRoutinesResolveForDrop(t *testing.T) {
 		t.Fatalf("ResolveBySig(g,bool) err = %v, want ErrRoutineNotFound", err)
 	}
 }
+
+// TestApplyFunctionConfigOps pins the pg_proc.proconfig upsert/reset
+// semantics shared by CREATE FUNCTION's SET clause and ALTER FUNCTION/
+// PROCEDURE/ROUTINE ... SET/RESET (DU-002 proconfig follow-up to
+// M0097-0150): SET upserts case-insensitively by name (replace in place, or
+// append), RESET removes the named entry, RESET ALL clears everything, and
+// later ops win over earlier ones for the same name — applied strictly in
+// statement order.
+func TestApplyFunctionConfigOps(t *testing.T) {
+	cases := []struct {
+		name string
+		cfg  []string
+		ops  []parser.FunctionConfigOp
+		want []string
+	}{
+		{
+			name: "set appends to empty",
+			cfg:  nil,
+			ops:  []parser.FunctionConfigOp{{Name: "search_path", Value: "app,public"}},
+			want: []string{"search_path=app,public"},
+		},
+		{
+			name: "set replaces existing entry case-insensitively",
+			cfg:  []string{"search_path=old"},
+			ops:  []parser.FunctionConfigOp{{Name: "Search_Path", Value: "new"}},
+			want: []string{"Search_Path=new"},
+		},
+		{
+			name: "set appends a second distinct entry",
+			cfg:  []string{"search_path=app"},
+			ops:  []parser.FunctionConfigOp{{Name: "work_mem", Value: "64MB"}},
+			want: []string{"search_path=app", "work_mem=64MB"},
+		},
+		{
+			name: "reset removes the named entry only",
+			cfg:  []string{"search_path=app", "work_mem=64MB"},
+			ops:  []parser.FunctionConfigOp{{Reset: true, Name: "search_path"}},
+			want: []string{"work_mem=64MB"},
+		},
+		{
+			name: "reset of an absent name is a no-op",
+			cfg:  []string{"search_path=app"},
+			ops:  []parser.FunctionConfigOp{{Reset: true, Name: "nope"}},
+			want: []string{"search_path=app"},
+		},
+		{
+			name: "reset all clears everything",
+			cfg:  []string{"search_path=app", "work_mem=64MB"},
+			ops:  []parser.FunctionConfigOp{{ResetAll: true}},
+			want: nil,
+		},
+		{
+			name: "later op wins for the same name",
+			cfg:  nil,
+			ops: []parser.FunctionConfigOp{
+				{Name: "search_path", Value: "first"},
+				{Name: "search_path", Value: "second"},
+			},
+			want: []string{"search_path=second"},
+		},
+		{
+			name: "reset all then set starts fresh",
+			cfg:  []string{"search_path=app"},
+			ops: []parser.FunctionConfigOp{
+				{ResetAll: true},
+				{Name: "work_mem", Value: "64MB"},
+			},
+			want: []string{"work_mem=64MB"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := ApplyFunctionConfigOps(append([]string(nil), tc.cfg...), tc.ops)
+			if len(got) != len(tc.want) {
+				t.Fatalf("ApplyFunctionConfigOps = %#v, want %#v", got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Errorf("ApplyFunctionConfigOps[%d] = %q, want %q", i, got[i], tc.want[i])
+				}
+			}
+		})
+	}
+}
+
+// TestReplaceConfigByOIDDuringRecovery pins the WAL-replay counterpart: a
+// full-array overwrite keyed by OID, silently no-op for a missing OID
+// (matching every other *ByOIDDuringRecovery method in this file).
+func TestReplaceConfigByOIDDuringRecovery(t *testing.T) {
+	rs := NewRoutines()
+	r, err := rs.Create(makeRoutine("public", "f1", nil, Type{Name: "int"}, "BEGIN END"), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rs.ReplaceConfigByOIDDuringRecovery(r.OID, []string{"search_path=app,public"})
+	if len(r.Config) != 1 || r.Config[0] != "search_path=app,public" {
+		t.Fatalf("Config after replay = %#v, want [search_path=app,public]", r.Config)
+	}
+	// A second replay call fully overwrites (not merges) the array.
+	rs.ReplaceConfigByOIDDuringRecovery(r.OID, []string{"work_mem=64MB"})
+	if len(r.Config) != 1 || r.Config[0] != "work_mem=64MB" {
+		t.Fatalf("Config after second replay = %#v, want [work_mem=64MB]", r.Config)
+	}
+	// Missing OID: silent no-op, no panic.
+	rs.ReplaceConfigByOIDDuringRecovery(r.OID+9999, []string{"x=y"})
+}

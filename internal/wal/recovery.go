@@ -749,6 +749,15 @@ const (
 	//   kind(1) | ownerOID(4) | oid(4)
 	RecordKindAlterFunctionOwner byte = 121
 
+	// RecordKindAlterFunctionConfig records the post-mutation snapshot of a
+	// routine's pg_proc.proconfig array after an `ALTER FUNCTION/PROCEDURE/
+	// ROUTINE ... SET name = value / RESET name / RESET ALL` clause (DU-002
+	// proconfig follow-up to M0097-0150). Like RecordKindAlterFunctionFlags,
+	// this logs the whole resulting array rather than the individual clause
+	// so replay is a straight overwrite, not order-dependent op replay.
+	// EncodeAlterFunctionConfig/DecodeAlterFunctionConfig.
+	RecordKindAlterFunctionConfig byte = 123
+
 	// RecordKindAlterFunctionSetSchema records an `ALTER FUNCTION/PROCEDURE/
 	// ROUTINE name(args) SET SCHEMA newschema` event (M0097-0150). Format:
 	//   kind(1) | oid(4) | newSchemaLen(2) | newSchema(newSchemaLen bytes)
@@ -5784,6 +5793,13 @@ type CreateFunctionPayload struct {
 	BeginAtomic     bool
 	IsReturnForm    bool
 	KindChar        string
+	// Config is pg_proc.proconfig ("name=value" entries set via CREATE
+	// FUNCTION's SET clause). Encoded as an optional trailing extension
+	// block, omitted entirely when empty for byte-identical output vs.
+	// pre-existing records with no SET clause (same pattern as
+	// CreateIndexPayload's predicate/INCLUDE-column extension block).
+	// DU-002 proconfig follow-up to M0097-0150.
+	Config []string
 }
 
 // EncodeCreateFunction encodes a CREATE [OR REPLACE] FUNCTION/PROCEDURE
@@ -5888,6 +5904,21 @@ func EncodeCreateFunction(p CreateFunctionPayload) []byte {
 		}
 		buf.WriteByte(mode)
 		writeWALStr16(a.Default)
+	}
+	// Optional Config extension block (DU-002 proconfig follow-up), omitted
+	// entirely when empty — byte-identical to a pre-Config record for the
+	// (overwhelmingly common) case of no SET clause.
+	if len(p.Config) > 0 {
+		cfg := p.Config
+		if len(cfg) > 0xFFFF {
+			cfg = cfg[:0xFFFF]
+		}
+		var cfgCount [2]byte
+		binary.LittleEndian.PutUint16(cfgCount[:], uint16(len(cfg)))
+		buf.Write(cfgCount[:])
+		for _, c := range cfg {
+			writeWALStr16(c)
+		}
 	}
 	return buf.Bytes()
 }
@@ -6018,6 +6049,24 @@ func DecodeCreateFunction(payload []byte) (CreateFunctionPayload, error) {
 			return CreateFunctionPayload{}, err
 		}
 		p.Args = append(p.Args, a)
+	}
+	// Optional Config extension block (DU-002 proconfig follow-up). Absent
+	// entirely for a pre-existing record with no SET clause — backward
+	// compatible, mirrors CreateIndexPayload's extension-block pattern.
+	if off < len(payload) {
+		if len(payload) < off+2 {
+			return CreateFunctionPayload{}, fmt.Errorf("wal: create-function payload truncated (need %d bytes)", off+2)
+		}
+		cfgCount := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+		off += 2
+		p.Config = make([]string, 0, cfgCount)
+		for i := 0; i < cfgCount; i++ {
+			s, err := readStr16()
+			if err != nil {
+				return CreateFunctionPayload{}, err
+			}
+			p.Config = append(p.Config, s)
+		}
 	}
 	return p, nil
 }
@@ -6178,6 +6227,63 @@ func DecodeAlterFunctionSetSchema(payload []byte) (oid uint32, newSchema string,
 		return 0, "", fmt.Errorf("wal: alter-function-set-schema payload truncated (need %d bytes)", 7+schemaLen)
 	}
 	return oid, string(payload[7 : 7+schemaLen]), nil
+}
+
+// EncodeAlterFunctionConfig encodes the post-mutation snapshot of a
+// routine's pg_proc.proconfig array after an ALTER FUNCTION/PROCEDURE/
+// ROUTINE ... SET/RESET clause (DU-002 proconfig follow-up to M0097-0150).
+// Format documented at the RecordKindAlterFunctionConfig constant:
+//
+//	kind(1) | oid(4) | count(2) | [entryLen(2) | entry(entryLen bytes)]*count
+func EncodeAlterFunctionConfig(oid uint32, config []string) []byte {
+	var buf bytes.Buffer
+	buf.WriteByte(RecordKindAlterFunctionConfig)
+	var oidBuf [4]byte
+	binary.LittleEndian.PutUint32(oidBuf[:], oid)
+	buf.Write(oidBuf[:])
+	if len(config) > 0xFFFF {
+		config = config[:0xFFFF]
+	}
+	var countBuf [2]byte
+	binary.LittleEndian.PutUint16(countBuf[:], uint16(len(config)))
+	buf.Write(countBuf[:])
+	for _, entry := range config {
+		if len(entry) > 0xFFFF {
+			entry = entry[:0xFFFF]
+		}
+		var l [2]byte
+		binary.LittleEndian.PutUint16(l[:], uint16(len(entry)))
+		buf.Write(l[:])
+		buf.WriteString(entry)
+	}
+	return buf.Bytes()
+}
+
+// DecodeAlterFunctionConfig decodes a RecordKindAlterFunctionConfig payload.
+func DecodeAlterFunctionConfig(payload []byte) (oid uint32, config []string, err error) {
+	if len(payload) < 7 {
+		return 0, nil, fmt.Errorf("wal: alter-function-config payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindAlterFunctionConfig {
+		return 0, nil, fmt.Errorf("wal: record kind %d is not alter-function-config", payload[0])
+	}
+	oid = binary.LittleEndian.Uint32(payload[1:5])
+	count := int(binary.LittleEndian.Uint16(payload[5:7]))
+	off := 7
+	config = make([]string, 0, count)
+	for i := 0; i < count; i++ {
+		if len(payload) < off+2 {
+			return 0, nil, fmt.Errorf("wal: alter-function-config payload truncated (need %d bytes)", off+2)
+		}
+		l := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+		off += 2
+		if len(payload) < off+l {
+			return 0, nil, fmt.Errorf("wal: alter-function-config payload truncated (need %d bytes)", off+l)
+		}
+		config = append(config, string(payload[off:off+l]))
+		off += l
+	}
+	return oid, config, nil
 }
 
 // CreateIndexPayload carries the metadata needed to fully

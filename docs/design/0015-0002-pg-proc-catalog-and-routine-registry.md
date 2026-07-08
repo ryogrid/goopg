@@ -259,3 +259,128 @@ return `ALTER FUNCTION`. Test: two new cases in
 `TestParseAlterFunctionGenericSetReset` (parser). **The ALTER
 FUNCTION/PROCEDURE/ROUTINE cluster (OWNER TO/RENAME TO/SET SCHEMA/generic
 SET-RESET incl. var_list) has no known open residuals.**
+
+**Follow-up (2026-07-08, M0122-0007): the generic SET/RESET clause actually
+storing/rendering `pg_proc.proconfig` — DU-002's "Per-function SET
+configuration parameters are not tracked" entry.** The two follow-ups above
+made `ALTER FUNCTION ... SET/RESET` parse-and-execute without erroring, but
+left both halves of the actual feature unbuilt: (a) `CREATE FUNCTION`'s own
+`SET` clause (`common_func_opt_item: FunctionSetResetClause`, same production
+`ALTER FUNCTION` uses) was not merely a no-op like the doc above implied — it
+was a hard **syntax error**, the identical `KwSet`-vs-`TokenIdent` bug fixed
+for `ALTER FUNCTION` earlier the same day, just never ported to
+`isFunctionAttribute()`/`parseCreateFunctionTail`. Reproduced live via a
+throwaway parser probe (`CREATE FUNCTION f() ... SET search_path = public AS
+$$...$$` → `"expected AS $$body$$ for CREATE FUNCTION (got set)"`) before
+fixing. (b) Every `SET`/`RESET` clause on either statement was still
+discarded ("goopg has no per-function GUC-override storage") — there was
+nowhere to put it.
+
+Fix, part 1 (parser): a new top-level `case p.cur().Keyword == KwSet` /
+`KwReset` in `parseCreateFunctionTail`'s attribute loop
+(`internal/parser/function.go`) — sitting alongside the existing
+`KwLanguage`/`KwAs`/`KwReturn` cases rather than nested inside
+`isFunctionAttribute()`'s `TokenIdent`-keyed sub-switch, since `SET`/`RESET`/
+`ALL`/`DEFAULT`/`FROM` all lex as real keyword tokens, never `TokenIdent`.
+Two new shared helpers, `parseFunctionConfigSetClause`/
+`parseFunctionConfigResetClause`, replace the discard-only logic `ALTER
+FUNCTION`'s branch (`internal/parser/ddl.go`) had grown across the two
+follow-ups above — both statements now populate a new
+`[]FunctionConfigOp{Reset, ResetAll, Name, Value}` field (`ConfigOps` on both
+`CreateFunctionStmt` and `AlterFunctionStmt`, `internal/parser/ast.go`) in
+statement order. Two more of the same keyword-vs-ident lexing bugs surfaced
+and were fixed along the way: `RESET ALL` matched via
+`acceptIdentKeyword("all")`, which can never succeed since `ALL` is the
+reserved keyword `KwAll`, not `TokenIdent` (silently fell through to "RESET
+of a GUC literally named all" instead — harmless before now since `RESET`
+was a no-op either way, but load-bearing once `ResetAll` needed to be
+distinguished from `Reset{Name:"all"}`); same story for `SET x TO DEFAULT`
+via `acceptIdentKeyword("default")` vs the reserved keyword `KwDefault` (it
+was falling through to `parseSetValueAtoms`, which happily accepts a bare
+keyword token and stored the literal string `"default"` as the value).
+
+Fix, part 2 (catalog + executor): new `catalog.Routine.Config []string`
+(the exact `pg_proc.proconfig` "name=value"-entry shape, mirroring
+`InMemory.roleSettings`' `ALTER ROLE ... SET` storage) plus a package-level
+`catalog.ApplyFunctionConfigOps(cfg []string, ops []parser.FunctionConfigOp)
+[]string` — a pure function (no locking; `Routine` field mutation elsewhere
+in `execAlterFunction`, e.g. `r.Volatile = *s.Volatile`, is unsynchronized
+too) that folds a `SET`/`RESET`/`RESET ALL` op list onto a config array:
+`SET` upserts case-insensitively by name, `RESET` removes the named entry,
+`RESET ALL` clears everything, later ops for the same name win.
+`execCreateFunction` calls it once to build a fresh routine's initial
+`Config` (`internal/executor/operators_ddl.go`); `execAlterFunction` folds it
+into the *same* per-routine loop that already applies
+`VOLATILE`/`SECURITY DEFINER`/`LEAKPROOF`/`STRICT` — **not** a new
+early-return branch like `RENAME TO`/`OWNER TO`/`SET SCHEMA` above, because
+real `gram.y`'s `alterfunc_opt_list` makes the config clause combinable with
+those four attributes in one statement (`ALTER FUNCTION f() STRICT SET
+search_path = app` is valid PG grammar), unlike the three mutually-exclusive
+top-level rename/owner/schema productions.
+
+`pg_proc` rendering: the user-routine row builder's `proconfig` column
+(`internal/initdb/pg_proc_view.go`) was an unconditional `""` (NULL) at every
+emission site — now `catalog.RoutineConfigArrayLiteral(r.Config)` for the
+one row shape that can ever carry a `Config` (user-defined routines); the
+sibling built-in-stub/`catalog.BuiltinProcs()`/user-aggregate row builders
+correctly stay `""` (none of those can ever have gone through a `SET`
+clause). `RoutineConfigArrayLiteral` is a thin exported wrapper around the
+same private `optionsArrayLiteral`/`quoteArrayElement` upstream-`array_out`
+quoting rules `pg_class.reloptions`/FDW `OPTIONS` already use, so a value
+that itself embeds a comma (e.g. `search_path=app,public`, from a `var_list`
+SET) round-trips as a properly quoted single array element instead of being
+split on the array delimiter.
+
+WAL/restart persistence: `CreateFunctionPayload` (`internal/wal/recovery.go`)
+gained an optional trailing `Config []string` extension block — omitted
+entirely when empty, byte-identical to a pre-`Config` record for the
+overwhelmingly common case of no `SET` clause (same pattern
+`CreateIndexPayload`'s predicate/INCLUDE-column extension established). A
+new record kind, `RecordKindAlterFunctionConfig` (123), logs the *whole*
+post-mutation `Config` snapshot after an `ALTER FUNCTION ... SET/RESET`
+(mirrors `RecordKindAlterFunctionFlags`'s whole-state-replay shape rather
+than replaying individual ops) — `EncodeAlterFunctionConfig`/
+`DecodeAlterFunctionConfig`, replayed by `replayFunctionDDLRecords`
+(`internal/initdb/function_ddl_recovery.go`) via a new
+`Routines.ReplaceConfigByOIDDuringRecovery`.
+
+Verified live against the real `cmd/goopg` binary (not just unit tests):
+`CREATE FUNCTION f() ... SET search_path = app, public AS $$...$$` and
+`ALTER FUNCTION f() SET work_mem = '64MB'` both now succeed (previously the
+`CREATE FUNCTION` form was a syntax error); `SELECT proconfig FROM pg_proc
+WHERE proname = 'f'` showed the real array; a `goopg restart` preserved it.
+
+Tests (all confirmed non-vacuous via a scoped `git stash` of every
+implementation file at once — the new types/fields/functions don't exist
+without the fix, so the test files fail to *compile*, the strongest form of
+non-vacuousness): `TestParseCreateFunctionSetClause`,
+`TestParseAlterFunctionGenericSetReset` (extended with `wantOps`
+assertions), `TestParseAlterFunctionSetSchemaDistinctFromConfigSet` (parser,
+`alter_function_owner_schema_test.go`); `TestApplyFunctionConfigOps`,
+`TestReplaceConfigByOIDDuringRecovery` (catalog, `routines_test.go`);
+`TestExecCreateFunctionSetClausePopulatesConfig`,
+`TestExecAlterFunctionSetResetConfig` (executor,
+`operators_function_test.go`); `TestEncodeDecodeAlterFunctionConfigRoundTrip`,
+`TestEncodeCreateFunctionOmitsConfigExtensionWhenEmpty` (wal,
+`function_ddl_test.go`); `TestPgProcViewProconfigRendersUserRoutineConfig`
+(initdb, `pg_proc_view_test.go`); `TestFunctionDDLRecoveryReplaysCreate`/
+`TestFunctionDDLRecoveryReplaysAlterAfterCreate` extended with `Config`
+round-trip assertions (initdb, `function_ddl_recovery_test.go`).
+
+Deferred (ledger row, 2026-07-08): goopg does not actually *apply* a
+routine's `Config` during its own execution (no push/pop of these GUC values
+around a plpgsql/SQL function call) — this closes the DU-002 entry's literal
+"not tracked ... report NULL" claim (storage + dump-fidelity), not full
+upstream runtime semantics; matches this codebase's existing pattern for
+several other proconfig-adjacent features (`n_distinct` planner hints, TOAST
+compression metadata, extended-statistics target) that are dump-fidelity
+only by explicit design. `unimplemented_feat.json`'s matching `DU-002` entry
+flipped to `resolved`.
+
+Gates: `go build ./...`/`go vet ./...` clean; `go test
+./internal/parser/... ./internal/catalog/... ./internal/executor/...
+./internal/wal/... ./internal/initdb/...` PASS (one confirmed pre-existing,
+HEAD-reproducible hang in `TestSeqScanFiresPrefetchesAcrossBlocks`,
+unrelated to this change — see ledger); `scripts/tpch-spotcheck.sh` PASS
+(Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh`
+PASS (0 failed, all 3 workloads).

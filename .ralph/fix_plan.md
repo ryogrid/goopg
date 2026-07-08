@@ -4325,6 +4325,68 @@ mirroring M0119's ledger `status` column.
       items): CREATE/DROP DATABASE full DDL, REINDEX physical rebuild,
       tablespaces, planner/jit GUC stubs, the ALTER FUNCTION `SET`-value
       comma-list gap.
+      **`pg_proc.proconfig` (per-function `SET` config) — done (2026-07-08,
+      later loop, DU-002 proconfig follow-up):** the "ALTER FUNCTION SET-value
+      comma-list gap" note directly above was stale (already closed by
+      "follow-up 2" earlier the same day) — this loop closed the actual
+      remaining `unimplemented_feat.json` `DU-002` entry instead: "Per-function
+      SET configuration parameters are not tracked; all functions report NULL
+      for the proconfig column." Verify-before-implement found the entry's own
+      claim ("parsed-then-discarded") was itself wrong — `CREATE FUNCTION ...
+      SET ...` was a hard **syntax error**, the identical `KwSet`-vs-
+      `TokenIdent` lexing bug M0097-0150 fixed for `ALTER FUNCTION` that same
+      day, just never ported to `CREATE FUNCTION`'s attribute loop (reproduced
+      live via a throwaway parser probe before fixing). Fixed both directions:
+      new top-level `KwSet`/`KwReset` cases in `parseCreateFunctionTail`
+      (`internal/parser/function.go`) plus shared `parseFunctionConfigSetClause`/
+      `parseFunctionConfigResetClause` helpers (also now used by `ALTER
+      FUNCTION`'s identical clause, `internal/parser/ddl.go`) populate a new
+      `[]FunctionConfigOp` field (`ConfigOps`) on both `CreateFunctionStmt` and
+      `AlterFunctionStmt`. Two more of the same keyword-vs-ident bugs surfaced
+      and were fixed along the way: `RESET ALL` (`KwAll`) and `SET x TO
+      DEFAULT` (`KwDefault`) were both silently mis-parsed as literal GUC
+      values named "all"/"default" via `acceptIdentKeyword`, which can never
+      match a reserved keyword token. New `catalog.Routine.Config []string`
+      (pg_proc.proconfig shape) + `catalog.ApplyFunctionConfigOps` (pure
+      SET-upsert/RESET-remove/RESET-ALL-clear fold, later-op-wins) wired into
+      `execCreateFunction` and `execAlterFunction` — the latter folds
+      `ConfigOps` into the *same* per-routine loop that already applies
+      VOLATILE/SECURITY DEFINER/LEAKPROOF/STRICT (combinable in one statement
+      per real `gram.y`'s `alterfunc_opt_list`), not a new early-return branch
+      like RENAME/OWNER/SET SCHEMA. `pg_proc.proconfig` now renders
+      `catalog.RoutineConfigArrayLiteral(r.Config)` for user routines
+      (`internal/initdb/pg_proc_view.go`) instead of a hardcoded `""`; the
+      sibling built-in/aggregate row builders correctly stay NULL. Restart-
+      durable via a new optional `Config` extension block on
+      `wal.CreateFunctionPayload` (omitted when empty, byte-identical to a
+      pre-`Config` record) and a new `RecordKindAlterFunctionConfig=123` WAL
+      record (whole-array snapshot replay, mirroring
+      `RecordKindAlterFunctionFlags`), replayed in
+      `internal/initdb/function_ddl_recovery.go` via a new
+      `Routines.ReplaceConfigByOIDDuringRecovery`. Deliberately still
+      dump-fidelity only — goopg does not push/pop these GUC values around
+      the routine's own execution (ledger row, 2026-07-08), matching the
+      established pattern for `n_distinct`/TOAST-compression/extended-
+      statistics-target. Design: `docs/design/0015-0002-pg-proc-catalog-and-
+      routine-registry.md` new Follow-up section; `docs/design/README.md` row
+      updated; `unimplemented_feat.json`'s `DU-002` entry flipped to
+      `resolved`. Tests (parser/catalog/executor/wal/initdb, ~10 new cases —
+      see the design doc's Tests list) all confirmed non-vacuous via a scoped
+      `git stash` of every implementation file at once (new types/fields don't
+      exist without the fix, so the test files fail to *compile*). **Unrelated
+      discovery while gating this fix (filed as its own ledger row, NOT fixed
+      here per one-task-per-loop):** `TestSeqScanFiresPrefetchesAcrossBlocks`
+      (`internal/executor/storage_test.go`) hangs indefinitely — confirmed
+      pre-existing (reproduces identically on a clean stash of this loop's own
+      diff), plausibly a regression from the recent M-NIGHTLY AIO/relFile.mu
+      fix cluster. Gates: `go build ./...`/`go vet ./...` clean; `go test
+      ./internal/parser/... ./internal/catalog/... ./internal/executor/...`
+      (minus the above pre-existing unrelated hang) `./internal/wal/...
+      ./internal/initdb/...` PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+      scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 workloads).
+      **Still open** (this bucket, ~9 remaining items): CREATE/DROP DATABASE
+      full DDL, REINDEX physical rebuild, tablespaces, planner/jit GUC stubs.
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,
       encoding constraints during bootstrap/runtime.
