@@ -15608,3 +15608,87 @@ Gates: `go build ./...` clean; `go test ./internal/wal/... ./internal/catalog/..
 ./internal/initdb/... ./internal/executor/...` PASS; `scripts/tpch-spotcheck.sh`
 PASS (Q12=2, Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
 scripts/ralph-precommit-test.sh` PASS (0 failed transactions, all 3 workloads).
+
+## Follow-up (2026-07-09, M0122-0007, same day): user-mapping registry restart durability
+
+**Gap** (resume point named in the foreign-server follow-up section above,
+"Still open"): `catalog.InMemory.userMappings` (keyed by
+`"<user>\x00<server>"`) was, like `foreignServers` before the previous
+section's fix, a pure in-memory map with zero WAL persistence. `CREATE USER
+MAPPING FOR <user> SERVER <server>` minted a stable OID via
+`RegisterUserMapping` and the mapping round-tripped through
+`pg_user_mappings` while the process stayed up, but a restart silently
+dropped every registered mapping — even though its referenced server now
+survives a restart (previous section), the mapping itself did not.
+
+**Scope**: `CREATE USER MAPPING` / `DROP USER MAPPING` only. Unlike the
+foreign-server follow-up, no design-review correctness gap was found here:
+`DROP USER MAPPING`'s existence gate (`internal/executor/operators_ddl.go`
+~line 14969, `im.DropUserMapping(user, server)`) already consulted the
+`userMappings` registry directly, never the non-durable `compatObjects`
+bookkeeping, so there was nothing to repoint.
+
+**Fix, mirroring the foreign-server follow-up exactly:**
+- Two new WAL record kinds, `wal.RecordKindCreateUserMapping`/
+  `RecordKindDropUserMapping` (128/129, next free after foreign-server's
+  126/127). Format: `kind(1) | oid(4) | userLen(2)+user |
+  serverLen(2)+server | optionsCount(2) | (optLen(2)+opt)*` for CREATE;
+  `kind(1) | userLen(2)+user | serverLen(2)+server` for DROP.
+  `internal/wal/recovery.go`'s physical-replay dispatch switch gains a
+  `case RecordKindCreateUserMapping, RecordKindDropUserMapping: return
+  false, nil` arm (no physical page state — same as the foreign-server arm
+  immediately above it).
+- `catalog.InMemory.RegisterUserMappingDuringRecovery(user, server string,
+  options []string, oid uint32)` / `UnregisterUserMappingDuringRecovery(user,
+  server string)` (`internal/catalog/catalog.go`), mirroring
+  `RegisterForeignServerDuringRecovery`/`UnregisterForeignServerDuringRecovery`
+  byte-for-byte: re-populate `c.userMappings[userMappingKey(user, server)]`
+  with the *original* OID (not a freshly allocated one) and bump
+  `c.nextOID` past it if needed.
+- New `internal/initdb/usermapping_ddl_recovery.go`,
+  `replayUserMappingDDLRecords(walDir string, cat catalog.Catalog) error` —
+  line-for-line the same shape as `replayForeignServerDDLRecords`. Wired
+  into `internal/initdb/open.go` right after the existing
+  `replayForeignServerDDLRecords(...)` call (after, not before, so a
+  recovered mapping's referenced server already exists by the time the
+  mapping is re-registered — though nothing in the mapping registry itself
+  actually validates the server reference today).
+- `execCompatCreate`'s `case "user mapping":` branch
+  (`internal/executor/operators_ddl.go`, the `im.RegisterUserMapping(...)`
+  call site) appends `o.ctx.WAL.Append(wal.EncodeCreateUserMapping(...))`
+  right after the in-memory registration, guarded by `o.ctx.WAL != nil`. The
+  `DROP USER MAPPING` site appends `wal.EncodeDropUserMapping(user, server)`
+  the same way.
+
+**Tests**: WAL encode/decode round-trip
+(`internal/wal/user_mapping_ddl_test.go`), catalog-level
+`TestRegisterUserMappingDuringRecoveryPreservesOID`/
+`TestUnregisterUserMappingDuringRecoveryRemovesEntry`
+(`internal/catalog/user_mapping_recovery_test.go`), and a
+`replayUserMappingDDLRecords` recovery-driver test mirroring
+`foreignserver_ddl_recovery_test.go`
+(`internal/initdb/usermapping_ddl_recovery_test.go`, full `Init`+`Open`+
+restart+`Open` cycle). No executor-level WAL-emission test was added — unlike
+the foreign-server follow-up, there was no pre-existing correctness bug at
+the executor call sites to pin with a `git stash`-confirmed regression test,
+so the initdb integration test (which exercises the real WAL-append +
+replay path end to end) is the test that would fail pre-fix. Live-verified
+against a real `cmd/goopg` binary: `CREATE FOREIGN DATA WRAPPER` + `CREATE
+SERVER ... OPTIONS (host 'remote')` + `CREATE USER MAPPING FOR postgres
+SERVER test_srv OPTIONS (user 'remoteuser', password 'secret')`, then two
+consecutive `goopg stop`/`start` cycles: after the first restart
+`pg_user_mappings` still lists the mapping with the same `umid`/`srvid`
+OIDs and `umoptions`; `DROP USER MAPPING FOR postgres SERVER test_srv`
+succeeds and `pg_user_mappings` goes back to zero rows; after a *second*
+restart it is still zero rows (the drop itself is durable, not just the
+create).
+
+**Still open**: nothing further identified for `CREATE`/`DROP USER MAPPING`
+restart durability — this closes the resume point left by the previous
+section. `ALTER USER MAPPING` (option changes) does not exist in the parser
+yet and is out of scope here.
+
+Gates: `go build ./...` clean; `go test ./internal/wal/... ./internal/catalog/...
+./internal/initdb/... ./internal/executor/...` PASS; `scripts/tpch-spotcheck.sh`
+PASS (Q12=2, Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+scripts/ralph-precommit-test.sh` PASS (0 failed transactions, all 3 workloads).

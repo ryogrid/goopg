@@ -15130,6 +15130,30 @@ func (c *InMemory) UnregisterForeignServerDuringRecovery(name string) {
 	delete(c.foreignServers, name)
 }
 
+// RegisterUserMappingDuringRecovery restores a user mapping with its
+// original OID during WAL replay (M0122-0007 user-mapping restart-durability
+// follow-up). Mirrors RegisterForeignServerDuringRecovery.
+func (c *InMemory) RegisterUserMappingDuringRecovery(user, server string, options []string, oid uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.userMappings == nil {
+		c.userMappings = make(map[string]*UserMapping)
+	}
+	c.userMappings[userMappingKey(user, server)] = &UserMapping{OID: oid, UmUser: user, SrvName: server, Options: options}
+	if oid >= c.nextOID {
+		c.nextOID = oid + 1
+	}
+}
+
+// UnregisterUserMappingDuringRecovery removes a user mapping during WAL
+// replay of a DROP USER MAPPING record. Mirrors
+// UnregisterForeignServerDuringRecovery.
+func (c *InMemory) UnregisterUserMappingDuringRecovery(user, server string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.userMappings, userMappingKey(user, server))
+}
+
 // Cast is a user-defined cast (CREATE CAST (source AS target) …). goopg does not
 // actually perform user casts; this records just enough metadata to round-trip
 // the definition through pg_dump (pg_cast virtual view → getCasts/dumpCast).

@@ -802,6 +802,26 @@ const (
 	// path. Format: kind(1) | nameLen(2) | name(nameLen bytes).
 	RecordKindDropForeignServer byte = 127
 
+	// RecordKindCreateUserMapping records a `CREATE USER MAPPING FOR user
+	// SERVER server [OPTIONS (...)]` event (M0122-0007 foreign-server
+	// registry restart-durability follow-up — the user-mapping resume point
+	// named in that milestone's ledger row). goopg's user-mapping registry
+	// (catalog.InMemory.userMappings) is a pure in-memory map keyed by
+	// "<user>\x00<server>" with no backing heap relation, so the physical
+	// redo path is a no-op; the recovery driver in
+	// internal/initdb/usermapping_ddl_recovery.go re-registers the mapping
+	// (with its original OID) after physical replay. Mirrors
+	// RecordKindCreateForeignServer. Format:
+	//   kind(1) | oid(4) | userLen(2)+user | serverLen(2)+server |
+	//   optionsCount(2) | (optLen(2)+opt)*.
+	RecordKindCreateUserMapping byte = 128
+
+	// RecordKindDropUserMapping records a `DROP USER MAPPING FOR user SERVER
+	// server` event. Counterpart to RecordKindCreateUserMapping; same no-op
+	// physical redo path. Format: kind(1) | userLen(2)+user |
+	// serverLen(2)+server.
+	RecordKindDropUserMapping byte = 129
+
 	// RecordKindSequenceState records the FULL state of one sequence
 	// (definition + current counter) so sequences — including the implicit
 	// sequences backing SERIAL/IDENTITY columns — survive a restart. goopg's
@@ -3606,6 +3626,141 @@ func DecodeDropForeignServer(payload []byte) (name string, err error) {
 		return "", fmt.Errorf("wal: drop-foreign-server payload truncated (need %d bytes)", 3+nameLen)
 	}
 	return string(payload[3 : 3+nameLen]), nil
+}
+
+// EncodeCreateUserMapping encodes a CREATE USER MAPPING event (M0122-0007
+// user-mapping registry restart-durability follow-up). Format: kind(1) |
+// oid(4) | userLen(2)+user | serverLen(2)+server | optionsCount(2) |
+// (optLen(2)+opt)*.
+func EncodeCreateUserMapping(user, server string, options []string, oid uint32) []byte {
+	clip := func(s string) string {
+		if len(s) > 0xFFFF {
+			return s[:0xFFFF]
+		}
+		return s
+	}
+	user, server = clip(user), clip(server)
+	if len(options) > 0xFFFF {
+		options = options[:0xFFFF]
+	}
+	size := 4 + 2 + len(user) + 2 + len(server) + 2
+	for _, opt := range options {
+		if len(opt) > 0xFFFF {
+			opt = opt[:0xFFFF]
+		}
+		size += 2 + len(opt)
+	}
+	out := make([]byte, 1+size)
+	out[0] = RecordKindCreateUserMapping
+	binary.LittleEndian.PutUint32(out[1:5], oid)
+	off := 5
+	writeStr := func(s string) {
+		binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(s)))
+		off += 2
+		copy(out[off:off+len(s)], s)
+		off += len(s)
+	}
+	writeStr(user)
+	writeStr(server)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(options)))
+	off += 2
+	for _, opt := range options {
+		if len(opt) > 0xFFFF {
+			opt = opt[:0xFFFF]
+		}
+		writeStr(opt)
+	}
+	return out[:off]
+}
+
+// DecodeCreateUserMapping decodes a RecordKindCreateUserMapping payload.
+func DecodeCreateUserMapping(payload []byte) (user, server string, options []string, oid uint32, err error) {
+	if len(payload) < 5 {
+		return "", "", nil, 0, fmt.Errorf("wal: create-user-mapping payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindCreateUserMapping {
+		return "", "", nil, 0, fmt.Errorf("wal: record kind %d is not create-user-mapping", payload[0])
+	}
+	oid = binary.LittleEndian.Uint32(payload[1:5])
+	off := 5
+	readStr := func() (string, error) {
+		if len(payload) < off+2 {
+			return "", fmt.Errorf("wal: create-user-mapping payload truncated at length prefix (offset %d)", off)
+		}
+		l := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+		off += 2
+		if len(payload) < off+l {
+			return "", fmt.Errorf("wal: create-user-mapping payload truncated (need %d bytes)", off+l)
+		}
+		s := string(payload[off : off+l])
+		off += l
+		return s, nil
+	}
+	if user, err = readStr(); err != nil {
+		return "", "", nil, 0, err
+	}
+	if server, err = readStr(); err != nil {
+		return "", "", nil, 0, err
+	}
+	if len(payload) < off+2 {
+		return "", "", nil, 0, fmt.Errorf("wal: create-user-mapping payload truncated at options count (offset %d)", off)
+	}
+	optCount := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	if optCount > 0 {
+		options = make([]string, 0, optCount)
+		for i := 0; i < optCount; i++ {
+			opt, oerr := readStr()
+			if oerr != nil {
+				return "", "", nil, 0, oerr
+			}
+			options = append(options, opt)
+		}
+	}
+	return user, server, options, oid, nil
+}
+
+// EncodeDropUserMapping encodes a DROP USER MAPPING event. Format: kind(1) |
+// userLen(2)+user | serverLen(2)+server.
+func EncodeDropUserMapping(user, server string) []byte {
+	if len(user) > 0xFFFF {
+		user = user[:0xFFFF]
+	}
+	if len(server) > 0xFFFF {
+		server = server[:0xFFFF]
+	}
+	out := make([]byte, 5+len(user)+len(server))
+	out[0] = RecordKindDropUserMapping
+	binary.LittleEndian.PutUint16(out[1:3], uint16(len(user)))
+	copy(out[3:3+len(user)], user)
+	off := 3 + len(user)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(server)))
+	off += 2
+	copy(out[off:], server)
+	return out
+}
+
+// DecodeDropUserMapping decodes a RecordKindDropUserMapping payload.
+func DecodeDropUserMapping(payload []byte) (user, server string, err error) {
+	if len(payload) < 3 {
+		return "", "", fmt.Errorf("wal: drop-user-mapping payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindDropUserMapping {
+		return "", "", fmt.Errorf("wal: record kind %d is not drop-user-mapping", payload[0])
+	}
+	userLen := int(binary.LittleEndian.Uint16(payload[1:3]))
+	if len(payload) < 3+userLen+2 {
+		return "", "", fmt.Errorf("wal: drop-user-mapping payload truncated (need %d bytes)", 3+userLen+2)
+	}
+	user = string(payload[3 : 3+userLen])
+	off := 3 + userLen
+	serverLen := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	if len(payload) < off+serverLen {
+		return "", "", fmt.Errorf("wal: drop-user-mapping payload truncated (need %d bytes)", off+serverLen)
+	}
+	server = string(payload[off : off+serverLen])
+	return user, server, nil
 }
 
 // EncodeCreateTransform encodes a CREATE TRANSFORM event (M0119-0004 restart
@@ -8647,6 +8802,15 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 		// recovery driver in internal/initdb/foreignserver_ddl_recovery.go
 		// scans the WAL for these records after physical replay and
 		// re-applies them to the catalog's foreign-server registry.
+		return false, nil
+	case RecordKindCreateUserMapping, RecordKindDropUserMapping:
+		// CREATE/DROP USER MAPPING records (M0122-0007 user-mapping
+		// restart-durability follow-up) carry only pg_user_mapping registry
+		// metadata; goopg's user-mapping registry has no backing heap
+		// relation, so the physical replay path has nothing to do. The
+		// recovery driver in internal/initdb/usermapping_ddl_recovery.go
+		// scans the WAL for these records after physical replay and
+		// re-applies them to the catalog's user-mapping registry.
 		return false, nil
 	case RecordKindCreateTransform, RecordKindDropTransform:
 		// CREATE/DROP TRANSFORM records (M0119-0004 restart persistence)

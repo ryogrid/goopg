@@ -1104,6 +1104,16 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: foreign-server DDL replay: %w", err)
 	}
+	// M0122-0007 user-mapping registry restart-durability follow-up:
+	// restore CREATE/DROP USER MAPPING entries (pg_user_mapping) from the
+	// WAL the same way, after the foreign-server registry above so a
+	// recovered mapping's referenced server already exists.
+	if err := replayUserMappingDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: user-mapping DDL replay: %w", err)
+	}
 	// DU-002 (M0119-0004) restart persistence: restore CREATE/DROP TRANSFORM
 	// objects (pg_transform) from the WAL the same way. Order relative to
 	// schema replay does not matter — transforms are keyed by (type name,

@@ -5176,6 +5176,61 @@ mirroring M0119's ledger `status` column.
       regression); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
       `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
       failed transactions, all 3 workloads).
+      **User-mapping registry restart durability — done (2026-07-09, same
+      day, closes the resume point left by the foreign-server fix above):**
+      `catalog.InMemory.userMappings` (`CREATE`/`DROP USER MAPPING`) was,
+      like `foreignServers` before it, a pure in-memory map with zero WAL
+      persistence — a restart silently dropped every registered mapping
+      even though its referenced server now survives (previous entry).
+      Fixed by mirroring the foreign-server recipe exactly: new
+      `wal.RecordKindCreateUserMapping`/`RecordKindDropUserMapping`
+      (128/129) + `internal/initdb/usermapping_ddl_recovery.go`'s
+      `replayUserMappingDDLRecords`; `catalog.InMemory.
+      RegisterUserMappingDuringRecovery`/`UnregisterUserMappingDuringRecovery`
+      re-populate the registry with the original OID; `execCompatCreate`'s
+      `case "user mapping":` now WAL-emits on `CREATE USER MAPPING`, and the
+      `DROP USER MAPPING` site emits `EncodeDropUserMapping` the same way.
+      Wired into `internal/initdb/open.go` right after the existing
+      foreign-server replay call. Unlike the foreign-server fix, no
+      design-review correctness gap was found this time — `DROP USER
+      MAPPING`'s existence gate already consulted the durable
+      `userMappings` registry directly, never the non-durable
+      `compatObjects` bookkeeping, so nothing needed repointing. Tests:
+      `TestEncodeDecodeCreateUserMappingRoundTrip`/
+      `TestEncodeDecodeDropUserMappingRoundTrip`/
+      `TestDecodeUserMappingRejectsWrongKindAndTruncatedPayload`
+      (`internal/wal/user_mapping_ddl_test.go`),
+      `TestRegisterUserMappingDuringRecoveryPreservesOID`/
+      `TestUnregisterUserMappingDuringRecoveryRemovesEntry`
+      (`internal/catalog/user_mapping_recovery_test.go`),
+      `TestUserMappingDDLRecoveryReplaysCreate`/
+      `TestUserMappingDDLRecoveryReplaysDropAfterCreate`/
+      `TestReplayUserMappingDDLRecordsHandlesMissingWalDir`
+      (`internal/initdb/usermapping_ddl_recovery_test.go`, full
+      `Init`+`Open`+restart+`Open` cycle). Live-verified against a real
+      `cmd/goopg` binary across two consecutive restarts:
+      `CREATE FOREIGN DATA WRAPPER`/`CREATE SERVER ... OPTIONS (host
+      'remote')`/`CREATE USER MAPPING FOR postgres SERVER test_srv OPTIONS
+      (user 'remoteuser', password 'secret')`, then `goopg stop`/`start` —
+      `pg_user_mappings` still lists the mapping with the same
+      `umid`/`srvid`/`umoptions`; `DROP USER MAPPING` then succeeds and a
+      SECOND `goopg stop`/`start` confirms the drop itself is durable too
+      (0 rows, not just the create side). Design:
+      `docs/design/0110-0001-pg-dump-tap-port.md` new "Follow-up
+      (2026-07-09, M0122-0007, same day): user-mapping registry restart
+      durability" section; `docs/design/README.md` row extended; deferral
+      ledger row (M0122-0007) flipped to `resolved`, new row appended
+      closing the same-named resume point. Gates: `go build ./...`/`go vet
+      ./internal/wal/... ./internal/catalog/... ./internal/initdb/...
+      ./internal/executor/...` clean; `go test` on the same four packages
+      PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed transactions, all 3 workloads). **No further known gap** in
+      this specific (foreign-server + user-mapping) restart-durability
+      bucket. Remaining M0122-0007 items: CREATE/DROP DATABASE full DDL,
+      tablespace physical relocation, REINDEX CONCURRENTLY physical rebuild
+      (all object types), plus the true restart-the-listener reload for
+      `ContextPostmaster` GUCs noted above (matches upstream, not a gap).
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,

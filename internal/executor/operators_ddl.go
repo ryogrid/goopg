@@ -14970,7 +14970,16 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 			// DROP USER MAPPING FOR <user> SERVER <server>: Names = [user, server].
 			// Remove the dump-visible registry entry (DU-002 slice 377).
 			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok && len(s.Names) >= 2 {
-				if im.DropUserMapping(s.Names[0].String(), s.Names[1].String()) {
+				user, server := s.Names[0].String(), s.Names[1].String()
+				if im.DropUserMapping(user, server) {
+					// M0122-0007 user-mapping registry restart-durability
+					// follow-up: persist the drop so it survives a restart,
+					// mirroring DROP SERVER.
+					if o.ctx.WAL != nil {
+						if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropUserMapping(user, server)); werr != nil {
+							return fmt.Errorf("wal drop-user-mapping: %w", werr)
+						}
+					}
 					return nil
 				}
 			}
@@ -15607,7 +15616,19 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		// Options threads the OPTIONS (...) clause so umoptions round-trips
 		// (pg_user_mappings.umoptions → dumpUserMappings). DU-002 slice 377
 		// (options: slice 379).
-		im.RegisterUserMapping(s.ObjName.String(), s.TableName.String(), s.Options)
+		um := im.RegisterUserMapping(s.ObjName.String(), s.TableName.String(), s.Options)
+		// M0122-0007 user-mapping registry restart-durability follow-up:
+		// persist the mapping so it survives a restart. goopg's user-mapping
+		// registry has no backing heap relation, so record a WAL event the
+		// recovery driver (internal/initdb/usermapping_ddl_recovery.go)
+		// replays into the registry on the next startup (mirrors CREATE
+		// SERVER). The OID just assigned/refreshed by RegisterUserMapping is
+		// carried so recovery restores the same identity.
+		if o.ctx.WAL != nil {
+			if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateUserMapping(um.UmUser, um.SrvName, um.Options, um.OID)); werr != nil {
+				return fmt.Errorf("wal create-user-mapping: %w", werr)
+			}
+		}
 	case "operator":
 		// Build the compat key as opName(leftCanon,rightCanon) to match DROP OPERATOR lookup.
 		leftArg, rightArg := "", ""
