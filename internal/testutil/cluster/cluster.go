@@ -366,6 +366,26 @@ func (c *Cluster) PSQL(args ...string) (util.CommandResult, error) {
 	})
 }
 
+// PSQLWithPassword runs psql like PSQL, but with a caller-supplied
+// PGPASSWORD instead of the default empty one — for exercising
+// password-based auth methods (SCRAM/MD5) end-to-end against a real libpq
+// client rather than lib/pq's Go reimplementation.
+func (c *Cluster) PSQLWithPassword(password string, args ...string) (util.CommandResult, error) {
+	host, port, err := splitHostPort(c.listenAddr)
+	if err != nil {
+		return util.CommandResult{}, err
+	}
+	base := []string{"-h", host, "-p", port, "-U", c.user, "-d", c.database}
+	base = append(base, args...)
+	return util.RunCommand(util.CommandSpec{
+		Name:    c.psqlPath,
+		Args:    base,
+		Dir:     c.repoRoot,
+		Env:     []string{"PGPASSWORD=" + password},
+		Timeout: 30 * time.Second,
+	})
+}
+
 // PGbench runs a foreground pgbench command against this cluster.
 func (c *Cluster) PGbench(args ...string) (util.CommandResult, error) {
 	host, port, err := splitHostPort(c.listenAddr)

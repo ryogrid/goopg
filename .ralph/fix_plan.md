@@ -4400,6 +4400,48 @@ mirroring M0119's ledger `status` column.
       larger slices — SASLprep needs a Unicode-normalization dependency
       not currently in `go.mod`; channel binding needs TLS
       tls-server-end-point wiring).
+      **SASLprep landed (2026-07-08, this loop):** ported `pg_saslprep`
+      (`postgres/src/common/saslprep.c`, RFC 4013) to
+      `internal/auth/saslprep.go`, including its exact algorithm quirk
+      (prohibited-output/bidi checks run against the mapped-but-pre-NFKC
+      codepoints, not the final normalized output) and its six Unicode
+      range tables, mechanically extracted from the C source by a one-off
+      script into `internal/auth/saslprep_tables.go` (not hand-transcribed,
+      to guarantee byte-identical data — 396+360+36+... range pairs).
+      NFKC normalization added via a new `golang.org/x/text` dependency
+      (`unicode/norm.NFKC`, NOT `secure/precis.OpaqueString`, which is
+      NFC per RFC 8265 — a different, non-upstream-compatible form).
+      Wired into `auth.NewSCRAMSecretWithIterations` (mirrors
+      `pg_be_scram_build_secret`) and
+      `SCRAMSecret.VerifySCRAMSecretFromPassword` (mirrors
+      `scram_verify_plain_password`), both falling back to the raw
+      password on SASLprep failure like upstream. The live SCRAM
+      handshake itself needed no change — it never re-derives from a
+      plaintext password, only checks the client's proof against the
+      already-prepped stored secret. Tests:
+      `TestPGSASLPrepRFC4013Examples`/`TestPGSASLPrepInvalidUTF8`/
+      `TestSCRAMSecretNormalizesEquivalentUnicodeForms`
+      (`internal/auth`) plus a differential e2e test against a REAL
+      libpq client — `TestE2E_SASLPrepMatchesRealLibpqClient`
+      (`internal/testport`), since lib/pq's own Go SCRAM client does no
+      SASLprep at all (confirmed by reading its `scram` package), so only
+      real `psql` (linked against upstream's own saslprep.c) meaningfully
+      proves cross-implementation byte parity; a role's password
+      containing U+2168 ROMAN NUMERAL NINE, stored via `CREATE ROLE`,
+      authenticates against the plain ASCII canonical form "IX" over a
+      real SCRAM handshake. Added `cluster.PSQLWithPassword` test-infra
+      helper (`internal/testutil/cluster/cluster.go`) since none of the
+      existing psql helpers allowed a non-empty `PGPASSWORD`. Design:
+      `docs/design/0049-0003-scram-sha-256.md` new §3.1 + README row.
+      Deferral-ledger row appended (channel binding — the other named gap
+      — remains open, needs TLS wiring that doesn't exist anywhere in the
+      server yet, a materially larger separate slice). Gates:
+      `go build ./...`/`go vet ./...` clean; `go mod tidy` clean;
+      `go test ./internal/auth/... ./internal/server/...` PASS; targeted
+      `internal/testport` e2e SCRAM/role tests PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS
+      (0 failed transactions, all 3 workloads).
 - [ ] **M0122-0009 — WAL / recovery / crash-consistency infra** (~16). WAL segment
       recycling, `WALInsertLock` array (parallel inserts), MultiXact WAL,
       `pg_subtrans` truncation. Gate: `-race` + recovery E2E (WAL practice card).

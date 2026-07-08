@@ -85,7 +85,7 @@ func NewSCRAMSecretWithIterations(password string, iterations int) (*SCRAMSecret
 	if _, err := rand.Read(salt); err != nil {
 		return nil, fmt.Errorf("scram salt: %w", err)
 	}
-	return scramBuildSecret(password, salt, iterations), nil
+	return scramBuildSecret(saslPrepOrOriginal(password), salt, iterations), nil
 }
 
 // ParseSCRAMSecret parses an upstream-format rolpassword string. The
@@ -177,7 +177,7 @@ func scramBuildSecret(password string, salt []byte, iter int) *SCRAMSecret {
 // Used by the cleartext path against a SCRAM-shadowed credential —
 // matches scram_verify_plain_password in upstream.
 func (s *SCRAMSecret) VerifySCRAMSecretFromPassword(password string) bool {
-	c := scramBuildSecret(password, s.Salt, s.Iterations)
+	c := scramBuildSecret(saslPrepOrOriginal(password), s.Salt, s.Iterations)
 	return subtle.ConstantTimeCompare(c.StoredKey, s.StoredKey) == 1
 }
 
