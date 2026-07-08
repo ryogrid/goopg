@@ -3107,6 +3107,30 @@ mirroring M0119's ledger `status` column.
       `FindSequenceOwnedBy` (NULL for a non-owned column, follows renames).
       See `docs/design/root-0020-sequence-serial-restart-persistence.md`'s
       new follow-up section and the matching deferral ledger row.
+      **Follow-up (2026-07-08, later loop):** closed that fix's own residual —
+      an explicit `CREATE`/`ALTER SEQUENCE ... OWNED BY schema.table.column`
+      is now normalized to the bare `table.column` form (new
+      `bareOwnedByTableColumn`, `internal/executor/operators_ddl.go`) before
+      `SetSequenceOwnedBy` stores it, matching the bare form
+      `FindSequenceOwnedBy`'s callers already probe with — previously such an
+      explicit schema-qualified target silently made `pg_get_serial_sequence`
+      return NULL. Tests:
+      `TestPgGetSerialSequenceExplicitSchemaQualifiedOwnedBy`/
+      `AlterSequenceSchemaQualifiedOwnedBy`
+      (`internal/executor/operators_pg_get_serial_sequence_test.go`),
+      confirmed non-vacuous via `git stash`. Discovered (not fixed, new
+      ledger row): `seqRegistry` is a process-global `sync.Map` with no
+      schema/database scoping — `FindSequenceOwnedBy` can match a same-named
+      leftover entry across independent test fixtures (or, architecturally,
+      across databases in one process); real PG can't hit this since
+      `pg_depend` lookups are per-backend-database scoped. Gates: `go build
+      ./...`/`go vet ./internal/executor/...` clean; targeted sequence/DDL
+      tests PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed, all 3 workloads). Design:
+      `docs/design/root-0020-sequence-serial-restart-persistence.md` new
+      follow-up section; `docs/design/README.md` row updated;
+      `unimplemented_feat.json`'s m0097-0009 entry updated in place.
 - [ ] **M0122-0003 — EXPLAIN output & pg_stat instrumentation** (~7, partial).
       FORMAT XML/YAML **done** (2026-07-04, loop #8) — design:
       `docs/design/0122-0003-explain-format-xml-yaml.md`. Per-CTE ANALYZE

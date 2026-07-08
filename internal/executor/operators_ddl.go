@@ -13347,7 +13347,7 @@ func (o *ddlOp) execCreateSequence(s *parser.CreateSequenceStmt) error {
 	}
 	SetSequenceDataType(name, dt)
 	if s.OwnedBy != "" {
-		SetSequenceOwnedBy(name, s.OwnedBy)
+		SetSequenceOwnedBy(name, bareOwnedByTableColumn(s.OwnedBy))
 	}
 	// Create a virtual catalog table for SELECT * FROM seq_name. This also
 	// surfaces the sequence in pg_class (relkind='S') / pg_depend / pg_sequence
@@ -13406,6 +13406,26 @@ func CreateSequenceCatalogRelation(cat catalog.Catalog, seqObjName parser.Object
 			calledStr,
 		}}
 	}
+}
+
+// bareOwnedByTableColumn strips any schema qualifier from a parsed OWNED BY
+// target ("table.column" or "schema.table.column"), returning the bare
+// "table.column" form. FindSequenceOwnedBy's callers (autoGenerateSerialValues's
+// rename fallback, pg_get_serial_sequence()) always look up with a bare,
+// unqualified table name, so an explicit schema-qualified OWNED BY must be
+// normalized before being persisted via SetSequenceOwnedBy or those lookups
+// silently miss. Mirrors validateSeqOwnedBy's own last-dot/first-dot split.
+func bareOwnedByTableColumn(ownedBy string) string {
+	lastDot := strings.LastIndex(ownedBy, ".")
+	if lastDot < 0 {
+		return ownedBy
+	}
+	tblPart := ownedBy[:lastDot]
+	colPart := ownedBy[lastDot+1:]
+	if schemaDot := strings.Index(tblPart, "."); schemaDot >= 0 {
+		tblPart = tblPart[schemaDot+1:]
+	}
+	return tblPart + "." + colPart
 }
 
 // validateSeqOwnedBy checks OWNED BY table.column before the sequence is
@@ -13585,7 +13605,7 @@ func (o *ddlOp) execAlterSequence(s *parser.AlterSequenceStmt) error {
 		SetSequenceDataType(name, s.DataType)
 	}
 	if s.OwnedBy != "" {
-		SetSequenceOwnedBy(name, s.OwnedBy)
+		SetSequenceOwnedBy(name, bareOwnedByTableColumn(s.OwnedBy))
 	} else if s.ClearOwnedBy {
 		SetSequenceOwnedBy(name, "")
 	}

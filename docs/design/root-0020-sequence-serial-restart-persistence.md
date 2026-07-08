@@ -144,12 +144,42 @@ stored verbatim by the DDL path instead of normalized to the bare
 lookup's bare-form match can miss that one spelling — a narrow, pre-existing
 inconsistency, not introduced by this fix.
 
+## Follow-up (2026-07-08, later loop): explicit-OWNED-BY schema-qualified residual closed
+
+Closed the residual named in the section above. Both `SetSequenceOwnedBy` call
+sites that persist an *explicit* `OWNED BY` target (`CREATE SEQUENCE ... OWNED
+BY`, `internal/executor/operators_ddl.go`'s `execCreateSequence`; `ALTER
+SEQUENCE ... OWNED BY`, the same file's `execAlterSequence`) now pass the
+target through a new `bareOwnedByTableColumn(ownedBy string) string` helper
+before storing it — it strips any schema qualifier via the same last-dot
+(column) / first-dot (schema) split `validateSeqOwnedBy` already uses, so
+`OWNED BY myschema.mytable.mycol` is stored as `mytable.mycol`, matching the
+bare form every `FindSequenceOwnedBy` caller (`autoGenerateSerialValues`'s
+rename fallback, `pg_get_serial_sequence()`) already probes with. The implicit
+SERIAL/IDENTITY registration path was already bare (never schema-qualified in
+the first place), so it needed no change.
+
+New discovery, recorded in `.ralph/deferral_ledger.md` rather than fixed here:
+`seqRegistry` (`operators_sequence.go`) is a single process-global `sync.Map`
+with no per-test-fixture reset, and `FindSequenceOwnedBy` matches purely on the
+literal `"table.column"` string via an unordered `Range` — no schema/database
+scoping at all. Real PG can never hit this ambiguity (`pg_depend` lookups are
+inherently scoped to one backend's one connected database), but two
+independent `newStorageFixture` tests in the same test binary that both use a
+same-named table/column can spuriously read each other's leftover
+`ownedBy` entry depending on Go's map iteration order — reproduced while
+writing this follow-up's own regression tests (they initially collided with
+`TestPgGetSerialSequenceFollowsRename`'s leftover `orders`/`id` entry before
+being renamed to unique fixture names).
+
 ## Tests
 
 - `internal/executor/operators_pg_get_serial_sequence_test.go` — serial
   column resolves to its real sequence; a plain non-serial column returns
   NULL; a renamed sequence is followed correctly; an identity column
-  resolves too.
+  resolves too; `TestPgGetSerialSequenceExplicitSchemaQualifiedOwnedBy`/
+  `TestPgGetSerialSequenceAlterSequenceSchemaQualifiedOwnedBy` cover the
+  schema-qualified explicit `OWNED BY` normalization (2026-07-08 follow-up).
 - `internal/testport/serial_sequence_durability_test.go` —
   `TestPort_SerialSequenceSurvivesRestart`: BIGSERIAL auto-gen continues
   strictly above the pre-restart max (within the 32-value gap) after a clean
