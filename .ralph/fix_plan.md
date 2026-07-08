@@ -1447,6 +1447,27 @@ every clean, green (build + pre-commit) checkpoint.
       docs/design/README.md's 0009-0006 row. No deferral-ledger row
       needed — a complete fix with a permanent regression guard landed,
       closing every part of this task's original scope.
+      2026-07-08 ledger reconciliation (16th loop, no code changed):
+      re-ran `ci/logs/action-items.md`'s nightly triage per rule 3 —
+      the file's only item (`AI-20260708-064334-001`, run
+      `20260708-064334`) is the SAME stale run already fully resolved by
+      the reopen task's 14th/15th loops above (its `sha`/timestamp
+      predate both landed fixes); no new nightly failure to triage, and
+      the next real nightly run will regenerate a clean log. Mirroring
+      the 2026-07-07 reconciliation precedent above: audited all 13
+      `status = -` deferral-ledger rows filed during this reopen's 1st-13th
+      investigation loops (2026-07-08) against the 14th loop's landed
+      root-cause fix (`bufmap.Insert`'s tombstone-skip double-mapping,
+      per the entry above) — every one of the 13 rows documents an
+      intermediate hypothesis from the SAME investigation thread
+      (eviction/flush/reload/rewrite/fast-path mechanisms), all
+      superseded once the true root cause (a second live slot for the
+      same tag racing a legitimate flush/reload) was found and fixed
+      with a permanent regression guard
+      (`TestVerifyBtreeEngineSilentOnRealConcurrentContended`,
+      un-skipped). Flipped all 13 rows' `status` from `-` to `resolved`;
+      no row's `landed`/`deferred`/`resume point`/`why` text was altered,
+      only the leading `status` cell (227 → 214 open ledger rows).
 
 - [x] race/internal/wal — race suite failed in package
       `github.com/goopg/goopg/internal/wal` (AI-20260707-000712-001; repro:
