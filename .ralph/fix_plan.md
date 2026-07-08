@@ -2086,6 +2086,34 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       function call sites — the AM never dispatches through a per-index
       `FUNCTION 1` comparator, so a custom opclass is cataloged but inert.
       Both remain genuinely open, index-AM-level, not a single-loop slice.
+      **2026-07-08: item (1) landed.** `updateOp.nextVirtualPgAmproc()`
+      (`internal/executor/operators_storage.go`) + `catalog.InMemory.
+      SetAmProcMemberProc` (`internal/catalog/catalog.go`) give `pg_amproc`
+      the same dedicated Virtual-UPDATE path `pg_database` already has —
+      `UPDATE pg_catalog.pg_amproc SET amproc = ... WHERE amproc = ...` now
+      actually rewrites the matched row instead of silently affecting 0 rows;
+      only the `amproc` column is writable (0A000 otherwise). Also fixed an
+      adjacent bug surfaced while building the test: `'<builtin proc>'::
+      regproc`/`::regprocedure` casts (e.g. `'int4eq'::regproc`) wrongly
+      raised 42883 because `expr.go`'s cast handler only checked
+      `ctx.Catalog.Routines()`, missing the `catalog.LookupBuiltinProc`
+      fallback tier `resolveOpClassFunction` already uses for the same class
+      of name. Tests: `TestUpdatePgAmprocRewritesAmprocColumn`/
+      `TestUpdatePgAmprocRejectsOtherColumns`
+      (`internal/executor/pg_amproc_update_test.go`), confirmed non-vacuous
+      via `git stash`. Design:
+      `docs/design/0110-0003-pg-amcheck-tap-port.md` new "Follow-up
+      (2026-07-08): `005_opclass_damage.pl` UPDATE-path prerequisite"
+      section; `docs/design/README.md` row updated. Gates: `go build ./...`
+      clean; `go test ./internal/executor/... ./internal/catalog/...
+      ./internal/planner/...` PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+      scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 workloads).
+      **Item (2) — btree per-index comparator dispatch — remains the sole
+      open blocker**: even with (1) fixed, a corrupted `amproc` is still
+      unobservable to `pg_amcheck` (the AM never reads it), so
+      `005_opclass_damage.pl` still cannot pass end-to-end. Genuinely
+      index-AM-level, not a single-loop slice.
 - [x] **M0119-0006-DATCONNLIMIT-DEFAULT** (found 2026-07-08 live-verifying an
       unrelated ALTER FUNCTION parser fix; fixed same-day in its own
       follow-up loop — see deferral ledger's resolved row for the full
@@ -3150,15 +3178,10 @@ mirroring M0119's ledger `status` column.
       ./...` (excluding tpch/testport) PASS; `scripts/tpch-spotcheck.sh`
       PASS (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
       scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 workloads).
-      **Still deferred** (new 2026-07-08 ledger row): the heap-recovery
-      driver (`loadUserIndexesFromHeap`) still can't restore any of these 8
-      fields after a *checkpointed* restart — `pg_index`'s `indclass`/
-      `indcollation`/`indexprs`/`indpred` heap content is never decoded
-      (`DecodePGIndexPhysicalRow`/`buildUserPGIndexRow`), and there's no
-      `indnullsnotdistinct` heap field either. Only the uncheckpointed-crash
-      path (fixed here) is covered; see the ledger row for the resume
-      point. `pg_tablespace` visibility remains a separate open item in
-      this cluster.
+      (Deferred gap this note used to flag here — heap-recovery decode of
+      `indclass`/`indcollation`/predicate/INCLUDE/NULLS NOT DISTINCT — is
+      now fully closed; see the two follow-ups below.) `pg_tablespace`
+      visibility remains a separate open item in this cluster.
       **2026-07-08 follow-up 2 (checkpointed-restart heap decode — 3 of 5
       fields done):** closed the "still deferred" heap-decode gap above
       for predicate/INCLUDE columns/NULLS NOT DISTINCT.
@@ -3191,16 +3214,37 @@ mirroring M0119's ledger `status` column.
       ./internal/parser/... ./internal/server/...` PASS;
       `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
       `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
-      failed, all 3 workloads). **Still open** (new 2026-07-08 ledger row,
-      "follow-up 2 of 2"): `ColOpClasses`/`ColCollations`
-      (`indclass`/`indcollation` real OID resolution) — a materially
-      larger, separate gap that also affects the *live* (non-restart)
-      `pg_index` rendering (`catalog.go`'s `VirtualRows` builder ignores
-      `ColOpClasses`/`ColCollations` too, using a hard-coded per-type
-      default-opclass switch and always-zero `indcollation`); needs a full
-      opclass/collation name↔OID registry, not just heap-decode plumbing.
-      `pg_tablespace` visibility remains a separate open item in this
-      cluster.
+      failed, all 3 workloads).
+      **2026-07-08 follow-up 3 (opclass/collation name-OID registry, live +
+      heap-write — done):** built the missing name→OID registry the note
+      above called for: `catalog.go` gained `builtinColumnOpclassOIDs`
+      (btree-opclass name→OID, verified against a real PostgreSQL 18.3
+      instance's `pg_opclass`) + `defaultColumnOpclass`/matching collation
+      resolvers, wired into both the live `pg_index.VirtualRows` renderer
+      (previously a hard-coded per-type default-opclass switch and
+      always-zero `indcollation`) and `buildUserPGIndexRow`'s heap-row
+      writer, via `ResolveIndexColumnOpclassOID`/
+      `ResolveIndexColumnCollationOID`. Design: this file's design doc
+      "Follow-up (2026-07-08)" section 3.
+      **2026-07-08 follow-up 4 of 4 (checkpointed-restart heap-decode —
+      done, closes the opclass/collation restart-persistence cluster):**
+      `catalog.codec.go`'s `PGIndexRow` gained `IndCollation`/`IndClass
+      []uint32`, `DecodePGIndexPhysicalRow` now decodes both oidvector
+      columns (new `decodePGIndexOIDVector` helper), and
+      `loadUserIndexesFromHeap` reverse-resolves them back to
+      `ColOpClasses`/`ColCollations` name strings via new
+      `ResolveIndexColumnOpclassName`/`ResolveIndexColumnCollationName`
+      catalog methods — a graceful restart no longer reverts an index's
+      declared opclass/collation to the column type's plain default. Gates
+      (both follow-ups): `go build ./...`/`go vet ./...` clean; `go test
+      ./internal/catalog/... ./internal/executor/... ./internal/initdb/...`
+      PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed, all 3 workloads). **This closes the opclass/collation
+      restart-persistence residual — no known open item remains in this
+      sub-thread.** `pg_tablespace` visibility remains a separate open item
+      in this cluster (deferred indefinitely per the M0095-0003 ledger row —
+      no RelFileNode resolver for shared `pg_tablespace`).
 - [ ] **M0122-0007 — DDL / admin commands / ctl / GUC config** (~14). CREATE/DROP
       DATABASE full DDL, REINDEX, tablespaces, ALTER FUNCTION/COLUMN,
       planner/jit GUC stubs. (`goopg reload`/SIGHUP and `goopg restart` done,

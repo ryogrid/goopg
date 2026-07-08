@@ -16076,6 +16076,26 @@ func (c *InMemory) RemoveAmProcMember(familyOID, leftType, rightType, procNum ui
 	return false
 }
 
+// SetAmProcMemberProc rewrites the amproc (support-function OID) of the
+// pg_amproc row keyed by its own oid — the row identity a Virtual-UPDATE
+// path (updateOp.nextVirtualPgAmproc) resolves from the already-matched
+// row rather than re-deriving family/lefttype/righttype/procnum. Mirrors
+// SetDatabaseConnLimit's "runtime InMemory truth, no on-disk write"
+// precedent; used to let pg_amcheck's 005_opclass_damage-style
+// `UPDATE pg_amproc SET amproc = ...` corruption injection actually take
+// effect. M0119-0006 (005_opclass_damage UPDATE-path prerequisite).
+func (c *InMemory) SetAmProcMemberProc(oid, newProcOID uint32) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, m := range c.amProcMembers {
+		if m.OID == oid {
+			m.ProcOID = newProcOID
+			return true
+		}
+	}
+	return false
+}
+
 // amGISTMethodOID / amSPGistMethodOID are pg_am.oid for "gist"/"spgist"
 // (see AccessMethodOIDByName below) — the only two in-tree access methods
 // whose amadjustmembers override (gistvalidate.c gistadjustmembers,

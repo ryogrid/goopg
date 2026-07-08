@@ -501,6 +501,15 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 						return NewIntDatum(int64(candidates[0].OID)), nil
 					}
 				}
+				// Not a user-created CREATE FUNCTION routine — fall back to the
+				// curated builtin pg_proc table (the same two-tier lookup
+				// resolveOpClassFunction uses for CREATE OPERATOR CLASS's own
+				// FUNCTION clause), so `'int4eq'::regproc` resolves like real PG
+				// instead of erroring on any bare builtin name. M0119-0006
+				// (005_opclass_damage UPDATE-path prerequisite).
+				if bp, found := catalog.LookupBuiltinProc(name); found {
+					return NewIntDatum(int64(bp.OID)), nil
+				}
 				return NullDatum, &ExecError{Code: "42883", Pos: x.Pos(), Message: fmt.Sprintf("function %q does not exist", funcName)}
 			}
 			// An OID input (oid→regproc/regprocedure) renders via
