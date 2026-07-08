@@ -945,6 +945,51 @@ every clean, green (build + pre-commit) checkpoint.
       torn flush. First, quickly audit `claimVictim` (bufpool.go) to
       confirm it actually excludes slots with `pinCount > 0` from victim
       selection.
+      2026-07-08 update (8th loop on the reopen; see today's 8th deferral
+      ledger row): audited `claimVictim` first — correctly excludes any
+      slot with `statePin(old) != 0` (bufpool.go ~1079); not the bug. Then
+      executed the main next step: built `storage.Pool.OnFlushSnapshot`
+      (bufpool.go, called from `flushSlot` right before `WriteBlock`, nil
+      by default) plus `BTree.RecordFlushSnapshot`/`DebugTraceFlushes`/
+      `FlushSnapshotEvent`/`FlushSnapshotRecordsForBlock` (btree.go), which
+      decode `pageItems()` from the exact bytes a flush is about to write
+      to disk, sharing `insertLog`/`rewriteLog`'s `Seq` counter. Wired into
+      `TestVerifyBtreeEngineSilentOnRealConcurrentContended` (temporarily
+      un-skipped, re-skipped before commit) and extended the per-missing-
+      entry diagnostic to cross-reference flush-snapshot presence. **The
+      strongest, most reproducible signature found in this 8-loop
+      investigation**: for all 18 missing entries in a fresh repro (every
+      one, not a subset), the entry is present in the first recorded
+      flush-snapshot of its block after being inserted, and already
+      ABSENT in the very next recorded flush-snapshot of that same block —
+      often only tens to a few hundred `Seq` ticks later (e.g. key=48709
+      TID={6,1512}: present at flush seq=254194, gone at flush seq=254306,
+      112 ticks later). This RECONCILES rather than contradicts the 7th
+      loop's zero-`FastPathViolation`s result: that check only compares a
+      page's survivor set immediately before/after each individual
+      `insertItemSorted` call, so once the entry is already missing by the
+      time any fast-path call next touches the reloaded page, every such
+      call correctly reports no violation. With the rewrite path (6th
+      loop) and clean-eviction path (4th loop) already cleared, this
+      leaves exactly one uninstrumented mechanism able to make the entry
+      vanish between "last good flush" and "next flush already missing
+      it": the RELOAD side of an eviction cycle — `Pool`'s cache-miss read
+      path (`pinLoad` / `Manager.ReadBlock`) serving stale or wrong bytes
+      for the block after it was correctly flushed. Gates: `go build
+      ./...` clean; `go vet ./internal/amcheck/... ./internal/storage/...
+      ./internal/access/btree/...` clean; `go test ./internal/storage/...
+      ./internal/access/btree/... ./internal/amcheck/...` PASS (test
+      re-skipped); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33). Next
+      step: instrument the read/reload side directly — snapshot
+      `pageItems()` on any block reload that follows a prior flush of the
+      same block (`Pool.pinLoad`'s cache-miss branch, or
+      `Manager.ReadBlock` itself), and compare against the most recent
+      `FlushSnapshotEvent` recorded for that exact block+Rel via the same
+      Seq-ordered cross-reference already built this loop — a mismatch
+      there would catch a stale/wrong read red-handed and finally close
+      the loop this investigation opened at the 7th loop. Do NOT re-open
+      claimVictim, the fast-path insert sites, the split/dedup-rewrite
+      path, or the clean-eviction path — all four conclusively cleared.
 
 - [x] race/internal/wal — race suite failed in package
       `github.com/goopg/goopg/internal/wal` (AI-20260707-000712-001; repro:

@@ -668,6 +668,20 @@ type BTree struct {
 	// zero cost when unset -- same pattern as DebugTraceInserts.
 	DebugVerifyFastPathInserts bool
 	fastPathViolations         []FastPathViolation
+	// DebugTraceFlushes (M-NIGHTLY AI-20260708-064334-001 investigation
+	// aid, 8th loop): when true, arms RecordFlushSnapshot as the target for
+	// storage.Pool.OnFlushSnapshot — every dirty-page flush of a block
+	// belonging to this BTree's relation (evictVictim's wasDirty branch,
+	// via flushSlot) is decoded with pageItems() and appended to flushLog,
+	// sharing insertLog/rewriteLog's Seq counter. The 7th loop isolated the
+	// loss window to an unpin/re-pin gap on the same block — a flush is the
+	// only thing that touches a page's bytes while nobody holds a pin on
+	// it, so this lets a caller directly compare "what a flush wrote to
+	// disk" against the last known-good insert/rewrite/fast-path snapshot
+	// for the same block. Off by default, zero cost when unset — same
+	// pattern as DebugTraceInserts.
+	DebugTraceFlushes bool
+	flushLog          []FlushSnapshotEvent
 	// logSeqNext is a single monotonic counter shared by insertLog and
 	// rewriteLog (instead of each using its own len()-based sequence) so a
 	// caller can compare Seq values ACROSS the two logs to establish
@@ -912,6 +926,59 @@ func RewriteSnapshotHasTID(recs []InsertLogRecord, tid storage.ItemPointer) bool
 		}
 	}
 	return false
+}
+
+// FlushSnapshotEvent records one dirty-page flush to disk: the leaf
+// entries pageItems() decodes from the exact bytes flushSlot is about to
+// write, keyed to bt's shared Seq counter (see DebugTraceFlushes) so a
+// caller can compare temporal order against insertLog/rewriteLog/
+// fastPathViolations for the same block.
+type FlushSnapshotEvent struct {
+	Seq   uint64
+	Block storage.BlockNumber
+	Items []InsertLogRecord
+}
+
+// RecordFlushSnapshot is the storage.Pool.OnFlushSnapshot hook this BTree
+// wires when DebugTraceFlushes is set (e.g. `pool.OnFlushSnapshot =
+// bt.RecordFlushSnapshot`): given the exact tag and bytes a dirty-page
+// flush is about to write to disk, it decodes pageItems() and appends a
+// FlushSnapshotEvent. A no-op when DebugTraceFlushes is false, tag
+// belongs to a different relation, or pageItems() can't decode the page
+// (e.g. the meta page) — matches the signature
+// storage.Pool.OnFlushSnapshot expects.
+func (bt *BTree) RecordFlushSnapshot(tag storage.BufferTag, page storage.Page) {
+	if !bt.DebugTraceFlushes || tag.Rel != bt.rel {
+		return
+	}
+	items, err := pageItems(page)
+	if err != nil {
+		return
+	}
+	recs := make([]InsertLogRecord, len(items))
+	for i, it := range items {
+		recs[i] = InsertLogRecord{Block: tag.Block, LineIdx: i, Key: append([]byte(nil), it.key...), Ptr: it.ptr}
+	}
+	bt.insertLogMu.Lock()
+	seq := bt.logSeqNext
+	bt.logSeqNext++
+	bt.flushLog = append(bt.flushLog, FlushSnapshotEvent{Seq: seq, Block: tag.Block, Items: recs})
+	bt.insertLogMu.Unlock()
+}
+
+// FlushSnapshotRecordsForBlock returns every recorded FlushSnapshotEvent
+// (see DebugTraceFlushes) for blk, in recorded order. Test/investigation
+// helper.
+func (bt *BTree) FlushSnapshotRecordsForBlock(blk storage.BlockNumber) []FlushSnapshotEvent {
+	bt.insertLogMu.Lock()
+	defer bt.insertLogMu.Unlock()
+	var out []FlushSnapshotEvent
+	for _, e := range bt.flushLog {
+		if e.Block == blk {
+			out = append(out, e)
+		}
+	}
+	return out
 }
 
 // pinNewOrRecycled (M0055-0005 Phase D) returns a writable slot

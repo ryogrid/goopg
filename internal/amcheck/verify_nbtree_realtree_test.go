@@ -356,6 +356,15 @@ func buildRealTreeConcurrent(t *testing.T, n, writers, poolSlots int, keyRange i
 	// only by plain fast-path insertItemSorted calls afterward. Verify
 	// every fast-path call's pre/post pageItems() survivor set directly.
 	bt.DebugVerifyFastPathInserts = true
+	// M-NIGHTLY investigation aid (AI-20260708-064334-001, 8th loop): the
+	// 7th loop isolated the loss window to an unpin/re-pin gap on the same
+	// block -- the only remaining not-yet-instrumented mechanism in that
+	// gap is a dirty-page flush (evictVictim's wasDirty branch ->
+	// flushSlot). Capture the exact bytes each flush writes to disk so
+	// they can be cross-referenced against the last known-good insert/
+	// rewrite/fast-path snapshot for the same block.
+	bt.DebugTraceFlushes = true
+	pool.OnFlushSnapshot = bt.RecordFlushSnapshot
 
 	var wg sync.WaitGroup
 	var failed atomic.Bool
@@ -620,8 +629,53 @@ func buildRealTreeConcurrent(t *testing.T, n, writers, poolSlots int, keyRange i
 // evicted at all would itself be the bug, independent of flush
 // correctness)? See .ralph/deferral_ledger.md's 7th 2026-07-08 row for
 // the full writeup.
+//
+// Update (8th loop, same day, AI-20260708-064334-001): audited claimVictim
+// first, per the 7th loop's suggestion — it correctly excludes any slot
+// with a nonzero pin count (`if statePin(old) != 0 { continue }`,
+// bufpool.go ~1079); not the bug. Then executed the 7th loop's main next
+// step: built storage.Pool.OnFlushSnapshot (bufpool.go, called from
+// flushSlot immediately before the WriteBlock call, zero cost when nil)
+// plus BTree.RecordFlushSnapshot/DebugTraceFlushes/FlushSnapshotEvent
+// (btree.go), which decodes pageItems() from the exact bytes a flush is
+// about to write to disk and logs it sharing insertLog/rewriteLog's Seq
+// counter. **This is the strongest, most reproducible signature found in
+// this entire 8-loop investigation.** For all 18 missing entries in a
+// fresh repro (previously only spot-checked 1-2 per run), the SAME exact
+// pattern held with zero exceptions: the entry is present in the first
+// recorded flush-snapshot of its block after its insert, and already
+// ABSENT in the very next recorded flush-snapshot of that same block —
+// often only tens to a few hundred Seq ticks later (e.g. key=48709
+// TID={6,1512}: present at flush seq=254194 [332 items], gone at flush
+// seq=254306 [333 items], 112 ticks later). Crucially, DebugVerifyFastPathInserts
+// (7th loop) recorded ZERO violations for the entire run, which this
+// finding now explains rather than contradicts: that check only compares
+// a page's survivor set immediately before/after each individual
+// insertItemSorted call, so if the entry is ALREADY missing by the time
+// ANY fast-path call next touches the reloaded page, every such call
+// correctly reports no violation (nothing it touched went missing on its
+// watch). Combined with the already-clean rewrite-path (6th loop) and
+// clean-eviction (4th loop) findings, this leaves exactly one
+// uninstrumented mechanism able to make the entry vanish between "last
+// good flush" and "next flush already missing it": the RELOAD side of an
+// eviction cycle — Pool's cache-miss read path (pinLoad / Manager.ReadBlock)
+// serving stale or wrong bytes for the block after it was correctly
+// flushed. Also notable: the item count between the two flushes is NOT
+// always a clean -1 (e.g. blk=192 above went 332->333, up by one, because
+// other writers' inserts landed in the same window) — consistent with the
+// loss happening once, silently, during a reload that other concurrent
+// fast-path inserts then build on top of without ever detecting the gap.
+// Next step: instrument the read/reload side directly — snapshot
+// pageItems() on any block reload that follows a prior flush of the same
+// block (Pool.pinLoad's cache-miss branch, or Manager.ReadBlock itself),
+// and compare against the most recent FlushSnapshotEvent recorded for
+// that exact block+Rel via the same Seq-ordered cross-reference already
+// built here — a mismatch there would catch a stale/wrong read red-handed
+// and finally close the loop this investigation opened at the 7th loop.
+// See .ralph/deferral_ledger.md's 8th 2026-07-08 row for the full
+// writeup.
 func TestVerifyBtreeEngineSilentOnRealConcurrentContended(t *testing.T) {
-	t.Skip("known-failing: tracks M-NIGHTLY AI-20260708-064334-001 (btree lost-index-entry bug; fast-path insertItemSorted call sites now proven clean via DebugVerifyFastPathInserts -- loss window is an unpin/re-pin gap on the same block, likely the dirty flush-then-evict path in bufpool.go's evictVictim, not yet directly instrumented); un-skip to confirm a fix")
+	t.Skip("known-failing: tracks M-NIGHTLY AI-20260708-064334-001 (btree lost-index-entry bug; 8th loop's flush-snapshot instrumentation localizes the loss to the RELOAD side of an eviction cycle -- every missing entry is present in the last flush before loss and already absent by the very next flush of the same block, with zero fast-path/rewrite violations in between; next step instruments Pool's cache-miss reload path); un-skip to confirm a fix")
 	if testing.Short() {
 		t.Skip("skipping concurrent real-tree amcheck stress in short mode")
 	}
@@ -735,6 +789,34 @@ func TestVerifyBtreeEngineSilentOnRealConcurrentContended(t *testing.T) {
 				if !foundRewrite {
 					t.Logf("  no rewrite event recorded for blk=%d at/after seq=%d (block never underwent a split/dedup-recovery rewrite after this insert -- loss did NOT happen via insertIntoBlock's rewrite path)",
 						last.Block, last.Seq)
+				}
+				// M-NIGHTLY investigation aid (AI-20260708-064334-001, 8th
+				// loop): does any dirty-page flush of this block show the
+				// entry already missing from the EXACT bytes written to
+				// disk? A flush is the only thing that touches a page's
+				// bytes while nobody holds a pin on it (the 7th loop's
+				// isolation of the loss window to an unpin/re-pin gap on
+				// the same block) -- if a flush's own pageItems() snapshot
+				// already lacks the entry, the loss is upstream of
+				// flushSlot/WriteBlock (evictVictim's dirty branch, or the
+				// in-memory page was already corrupt before the flush
+				// began), not the flush call itself.
+				flushEvents := bt.FlushSnapshotRecordsForBlock(last.Block)
+				if len(flushEvents) == 0 {
+					t.Logf("  no flush-snapshot event recorded for blk=%d at/after seq=%d (block never flushed to disk while dirty during this run)",
+						last.Block, last.Seq)
+				} else {
+					for _, fe := range flushEvents {
+						if fe.Seq < last.Seq {
+							continue
+						}
+						has := btree.RewriteSnapshotHasTID(fe.Items, e.TID)
+						t.Logf("  flush-snapshot seq=%d blk=%d itemCount=%d presentAtFlush=%v",
+							fe.Seq, fe.Block, len(fe.Items), has)
+						if !has {
+							t.Logf("  => LOCALIZED: dirty-page flush at seq=%d already lacked this (key,TID) in the exact bytes written to disk -- bug is upstream of flushSlot/WriteBlock, not the flush call itself", fe.Seq)
+						}
+					}
 				}
 				// M-NIGHTLY investigation aid (AI-20260708-064334-001, 7th
 				// loop): does any recorded FastPathViolation directly name

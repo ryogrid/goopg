@@ -361,6 +361,19 @@ type Pool struct {
 	// OnFlushDone is called after that flush finishes.
 	OnFlushDone func()
 
+	// OnFlushSnapshot is an M-NIGHTLY investigation aid
+	// (AI-20260708-064334-001, 8th loop), nil by default (zero cost when
+	// unset). When set, flushSlot calls it immediately before the
+	// WriteBlock call with the exact tag and bytes about to be written to
+	// disk — letting a caller (e.g. btree.BTree.RecordFlushSnapshot)
+	// capture "what a dirty-page flush actually wrote" so it can be
+	// compared against the last known-good in-memory snapshot recorded for
+	// the same block by an independent, higher-layer log. Fires for every
+	// flushSlot call regardless of caller (evictVictim's dirty branch,
+	// WriteDirtyPages, checkpoint flushBatch), not just eviction-triggered
+	// flushes. Remove once the M-NIGHTLY root cause is fixed.
+	OnFlushSnapshot func(tag BufferTag, page Page)
+
 	// OnExtendWait is called when PinNew is about to extend rel via the
 	// pool's sole smgr Extend call (extend_time's OnFlushWait analogue).
 	// Deliberately a distinct pair from storage.Manager's own
@@ -2019,6 +2032,9 @@ func (p *Pool) flushSlot(tag BufferTag, page Page) error {
 				return fmt.Errorf("flush wal up to %d: %w", lsn, err)
 			}
 		}
+	}
+	if p.OnFlushSnapshot != nil {
+		p.OnFlushSnapshot(tag, page)
 	}
 	if err := p.mgr.WriteBlock(tag.Rel, tag.Block, page); err != nil {
 		return err

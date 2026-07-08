@@ -1,79 +1,86 @@
 Task: M-NIGHTLY pgbench/nightly-reopen-20260708 (AI-20260708-064334-001) —
-IN PROGRESS, not complete. This (7th) loop REFUTED the 6th loop's proposed
-fast-path-insertItemSorted mechanism with a clean negative result, and
-pinned the loss window down to an unpin/re-pin gap on the same block —
-i.e. it happens during (or across) a buffer-pool eviction, most likely the
-DIRTY flush-then-evict path (never yet directly instrumented). See
-fix_plan.md's 7th-loop update + deferral ledger's 7th 2026-07-08 row for
-full detail.
+IN PROGRESS, not complete. This (8th) loop built flush-time instrumentation
+and found the CLEANEST signature yet: all 18/18 missing entries in a fresh
+repro are present at the first post-insert flush of their block and already
+gone by the very next flush of that block. See fix_plan.md's 8th-loop update
++ deferral ledger's 8th 2026-07-08 row for full detail.
 
-Files: internal/access/btree/btree.go (NEW `BTree.DebugVerifyFastPathInserts`
-field + `FastPathViolation` struct + `insertItemSortedVerified` +
-`checkFastPathSurvivors` + `FastPathViolations()` getter — wraps all 3
-fast-path single-item insertItemSorted call sites with a pageItems()
-before/after snapshot; zero cost when the flag is off). internal/amcheck/
-verify_nbtree_realtree_test.go (buildRealTreeConcurrent now also sets
-bt.DebugVerifyFastPathInserts=true; per-run unconditional FastPathViolations
-dump + per-missing-entry cross-reference added to
-TestVerifyBtreeEngineSilentOnRealConcurrentContended; doc comment extended
-with this loop's finding; test re-skipped, un-skip locally to re-run).
-.ralph/fix_plan.md + .ralph/deferral_ledger.md updated.
-KEEP DebugVerifyFastPathInserts/insertItemSortedVerified: reusable,
-zero-cost-when-off, same pattern as DebugTraceInserts/RewriteLogEvent/
-DebugTraceSlotEvents/DebugValidateCleanEvictions.
+Files: internal/storage/bufpool.go (NEW `Pool.OnFlushSnapshot func(tag,
+page)` field, nil by default; wired in `flushSlot` immediately before the
+`WriteBlock` call). internal/access/btree/btree.go (NEW `BTree.
+DebugTraceFlushes` field + `FlushSnapshotEvent` struct + `RecordFlushSnapshot`
+method (matches `OnFlushSnapshot`'s signature, filters to `bt.rel`, decodes
+`pageItems()`, shares `logSeqNext`) + `FlushSnapshotRecordsForBlock` getter).
+internal/amcheck/verify_nbtree_realtree_test.go (buildRealTreeConcurrent now
+sets `bt.DebugTraceFlushes=true` + `pool.OnFlushSnapshot = bt.
+RecordFlushSnapshot`; per-missing-entry diagnostic extended with a
+flush-snapshot cross-reference block; doc comment extended with this loop's
+finding; test re-skipped with an updated skip message, un-skip locally to
+re-run). .ralph/fix_plan.md + .ralph/deferral_ledger.md updated.
+KEEP OnFlushSnapshot/RecordFlushSnapshot/DebugTraceFlushes: reusable,
+zero-cost-when-off, same pattern as the other DebugTrace*/DebugValidate*
+aids in this thread (DebugTraceInserts, DebugVerifyFastPathInserts,
+DebugValidateCleanEvictions, DebugTraceSlotEvents).
 
-Key symbols for next step: internal/storage/bufpool.go's `evictVictim`
-(~1123-1185, the `wasDirty` branch that calls `flushSlot`) and `flushSlot`
-itself — NOT yet instrumented to compare "bytes about to be written to
-disk" against "the last known-good in-memory pageItems() snapshot" for the
-same block. Also `claimVictim` (bufpool.go) — NOT yet re-verified this loop
-whether it correctly excludes slots with pinCount>0 from victim selection
-(a quick audit worth doing before building new instrumentation).
+Key symbols for next step: internal/storage/bufpool.go's `pinLoad` (the
+cache-miss reload path invoked from `Pin`/`PinNew` when a tag isn't already
+resident) and `Manager.ReadBlock` (internal/storage/smgr.go) — NEITHER is
+yet instrumented to snapshot what bytes a reload actually reads and compare
+against the last known-good FlushSnapshotEvent for that exact block. This is
+the one remaining candidate mechanism in the loss window (see Hypothesis
+below).
 
-Hypothesis/Findings: DEFINITIVE this loop — wrapped all 3 fast-path
-single-item insertItemSorted call sites (tryInsertNoSplit, insertIntoBlock's
-no-split branch, tryInsertOnCachedRightmost) with a pageItems() snapshot
-immediately before and after each call, asserting every pre-existing
-(key,TID) survives (a plain insert only ever adds a line pointer). A full
-200000-insert/64-writer run that still lost 12 real entries recorded ZERO
-violations — every fast-path call at every site preserved every
-pre-existing entry in its own pre/post pair. This REFUTES the fast-path
-hypothesis (6th loop's proposed next mechanism) just as cleanly as the 6th
-loop refuted the 5th loop's split/rewrite hypothesis. For one traced
-example (key=47087, TID={3,1508}, inserted blk=16 lineIdx=6 seq=216430,
-564 later inserts touch blk=16, one split event at seq=315252 whose own
-pageItems() read already lacked it — per the 6th loop's RewriteLogEvent
-data, re-confirmed this loop): the entry survived every fast-path call's
-own check up to blk=16's LAST fast-path touch before the split, then
-vanished in the gap between that call's unpinW and the split-triggering
-call's pinW+pageItems() read. Since pinW/unpinW correctly serialize access
-to a PINNED page (confirmed clean under -race, 6th loop and earlier), the
-only thing that happens while NOBODY holds a pin on a block is a
-buffer-pool eviction (page leaves the pool, possibly gets flushed to disk,
-and is reloaded fresh on the next pin). pool.DebugValidateCleanEvictions
-(loops 3-4, still active this run) fired once but on an UNRELATED block
-(133, not 16) — consistent with loop 4's "mismatch-firing and
-missing-entry count are uncorrelated" finding. That instrumentation only
-checks the `!wasDirty` (skip-flush) eviction fast path; the DIRTY
-flush-then-evict path (evictVictim's `wasDirty` branch, which calls
-flushSlot) has NEVER been directly instrumented to verify the bytes it
-writes to disk actually match the last known-good in-memory content for
-that block. This is now the leading, still-unproven hypothesis.
+Hypothesis/Findings: DEFINITIVE this loop — wrapped `flushSlot` (called from
+both `evictVictim`'s dirty branch AND the bgwriter's `WriteDirtyPages`) with
+an `OnFlushSnapshot` hook giving the exact tag+bytes about to hit disk;
+`BTree.RecordFlushSnapshot` decodes `pageItems()` from those bytes when the
+tag belongs to this BTree's relation. Re-ran the 200000-insert/64-writer
+repro: it lost 18 real entries this run, and for EVERY SINGLE ONE (not a
+subset — this is the first loop in the whole 8-loop thread to check ALL
+missing entries, not just 1-2 spot checks), the exact same signature held:
+the entry IS present in the earliest flush-snapshot of its block recorded
+after its insert, and is ALREADY ABSENT in the very next flush-snapshot of
+that same block, often only 40-800 `Seq` ticks later (smallest gap seen:
+seq 235964->236047 for TID={57,1107} on blk=110, 83 ticks). Item counts
+between the two flushes are NOT always a clean -1 (sometimes +1, e.g.
+332->333 for blk=192) because other writers' concurrent fast-path inserts
+land in the same window — but our specific entry is always gone by the
+second flush regardless. This RECONCILES the 7th loop's zero-
+`FastPathViolation`s result (previously read as "fast-path is clean, so the
+loss must be in the unpin/re-pin gap somewhere") into something sharper: the
+entry is ALREADY missing by the time ANY fast-path call next touches the
+reloaded page, so of course no fast-path call's own before/after check ever
+sees a violation — the violation already happened, upstream of the fast
+path, during the reload itself. Combined with the already-cleared rewrite
+path (6th loop), clean-eviction path (4th loop), fast-path insert sites (7th
+loop), claimVictim's pin-exclusion (this loop, quick audit), and now the
+dirty-flush WRITE side (this loop — flushes always faithfully write
+whatever bytes are in memory, confirmed 18/18), the ONLY remaining
+uninstrumented step in the eviction cycle is the READ side: does `pinLoad`'s
+cache-miss branch (or `Manager.ReadBlock` underneath it) ever serve stale or
+wrong bytes for a block that was just correctly flushed?
 
-Next step: instrument evictVictim's dirty branch (or flushSlot itself,
-bufpool.go ~1123-1185) to snapshot pageItems() on the page being flushed
-immediately before the WriteAt call, keyed by block+seq, and compare
-against the most recent fast-path/rewrite/violation "post" snapshot
-already recorded for that block — insertLog, rewriteLog, and
-fastPathViolations all share one logSeqNext counter, so a caller can
-determine true temporal order across all of them plus a new flush-time
-log. A mismatch there would directly catch a stale/torn flush. Before
-building that (cheaper first pass): re-verify claimVictim actually
-excludes slots with a nonzero pin count from victim selection — if it
-doesn't, that alone is the bug, independent of flush correctness. Do NOT
-re-open the fast-path single-item insertItemSorted call sites (this
-loop's DebugVerifyFastPathInserts instrumentation conclusively clears
-them) or the split/dedup-rewrite path (6th loop conclusively cleared it).
+Next step: instrument `Pool.pinLoad`'s cache-miss reload branch (bufpool.go)
+— or `Manager.ReadBlock` itself (smgr.go) if it's easier to hook centrally —
+to snapshot `pageItems()` on every block reload for a tag belonging to
+`bt.rel`, gated by a new `BTree.DebugTraceReloads` (or similar) flag
+following the exact same wiring pattern as `RecordFlushSnapshot`
+(`pool.OnBlockReload = bt.RecordReloadSnapshot`, a new `Pool.OnBlockReload
+func(tag BufferTag, page Page)` hook mirroring `OnFlushSnapshot`, fired
+right after the disk read completes and before the slot is published/
+Pin-returned). Then extend the per-missing-entry diagnostic with a third
+cross-reference: find the reload event on the lost entry's block
+immediately after the "present" flush-snapshot and immediately before the
+"absent" flush-snapshot already logged this loop, and check whether pageItems()
+on THAT reload already lacks the entry — if so, this is the smoking gun (a
+stale/wrong read), and the very next step after that would be comparing the
+reloaded bytes against what disk actually holds via a raw re-read (like
+`debugValidateCleanEviction` already does for the clean-eviction path) to
+determine whether the read itself is buggy or the disk write from the prior
+flush never actually landed before the reload raced it. Do NOT re-open
+claimVictim, the fast-path insert sites, the split/dedup-rewrite path, the
+clean-eviction path, or the dirty-flush write side — all five conclusively
+cleared across loops 4, 6, 7, and this loop.
 
 Gates run this loop (all PASS): go build ./...; go vet
 ./internal/amcheck/... ./internal/storage/... ./internal/access/btree/...;
@@ -82,9 +89,10 @@ go test ./internal/storage/... ./internal/access/btree/...
 go test -v -run TestVerifyBtreeEngineSilentOnRealConcurrentContended
 ./internal/amcheck/... (run manually with the test temporarily un-skipped,
 for investigation only — NOT part of the committed gate set, re-skipped
-before commit; confirmed 12 missing entries, 0 FastPathViolations);
-scripts/tpch-spotcheck.sh (Q12=2/Q13=33 PASS); make ralph-state-guard
-pending (run before finishing this loop, see below).
+before commit; confirmed 18 missing entries, 0 FastPathViolations, 18/18
+flush-snapshot LOCALIZED hits); scripts/tpch-spotcheck.sh (Q12=2/Q13=33
+PASS); make ralph-state-guard pending (run before finishing this loop, see
+below).
 
 In-flight: none. No background processes left running. The test file's
 temporary un-skip used during this loop's investigation was reverted
