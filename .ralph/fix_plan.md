@@ -866,6 +866,45 @@ every clean, green (build + pre-commit) checkpoint.
       after the lost insert (a tight run of consecutive calls with
       monotonically-increasing lineIdx from 0) and check whether the lost
       key is present in that exact `pageItems()` read.
+      2026-07-08 update (6th loop on the reopen; see today's 6th deferral
+      ledger row): executed the above next step. Built `BTree.RewriteLogEvent`/
+      `traceRewrite` (btree.go) — a deep-copy snapshot of `allItems` right
+      after `pageItems()`+`appendSorted()` and again right after
+      `dedupConsolidate()`, for every `insertIntoBlock` rewrite, sharing one
+      monotonic `logSeqNext` counter with `insertLog` so events from both
+      logs compare for true temporal order. Wired a per-missing-entry
+      diagnostic into `TestVerifyBtreeEngineSilentOnRealConcurrentContended`
+      (temporarily un-skipped, re-skipped before commit). **REFUTES the 5th
+      loop's split/redistribution localization**: every rewrite event on an
+      affected block shows `presentAfterPageItems=false` with
+      `postPageItemsCount` exactly `preLineCount+1` (matches
+      `PageLinePointerCount`, zero discrepancy) — `pageItems()` correctly
+      decodes every physical line pointer that IS on the page; the page
+      itself already lacks the lost entry's line pointer before the rewrite
+      ever runs, so `dedupConsolidate` has nothing to wrongly drop. Several
+      missing entries show NO rewrite event at all after their insert — only
+      plain fast-path `insertItemSorted` calls (`tryInsertNoSplit`/
+      `insertIntoBlock`'s no-split branch/`tryInsertOnCachedRightmost`) ever
+      touch those blocks afterward, yet the entry still vanishes. Also ran
+      this exact contended-duplicate-key repro under `-race` for the first
+      time (prior 20+ -race-clean runs all used the disjoint-key
+      `TestMultiWriterStress_M0055_Phase_C` repro instead): exactly ONE
+      report, inside `dumpCrossSlotEventsForTag`/`traceSlotEvent`
+      (bufpool.go) — the `DebugTraceSlotEvents` debug tool's own cross-slot
+      scan, an accepted best-effort tradeoff per its doc comment, not the
+      missing-entry mechanism; no other race fired. Gates: `go build ./...`
+      clean; `go vet ./internal/amcheck/... ./internal/storage/...
+      ./internal/access/btree/...` clean; `go test ./internal/storage/...
+      ./internal/access/btree/... ./internal/amcheck/...` PASS (test
+      re-skipped); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33). Next
+      step: apply the SAME before/after `pageItems()`-snapshot technique to
+      the fast-path single-item `insertItemSorted` call sites instead of the
+      rewrite path — for the specific blocks known (post-hoc) to lose an
+      entry, snapshot `pageItems()` immediately before and after each
+      fast-path call on that block to find the exact consecutive pair where
+      a previously-present (key,TID) silently disappears. Do NOT re-open the
+      split/rewrite path (conclusively cleared this loop) or re-run `-race`
+      on the disjoint-key repro (already exhaustively clean).
 
 - [x] race/internal/wal — race suite failed in package
       `github.com/goopg/goopg/internal/wal` (AI-20260707-000712-001; repro:

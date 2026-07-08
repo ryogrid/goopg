@@ -1,104 +1,104 @@
 Task: M-NIGHTLY pgbench/nightly-reopen-20260708 (AI-20260708-064334-001) —
-IN PROGRESS, not complete. This (5th) loop PROVED the dominant loss
-mechanism is inside internal/access/btree's split/redistribution rewrite
-(insertIntoBlock's split branch), not the storage/eviction layer — with
-direct evidence, not inference. See fix_plan.md's 5th-loop update + deferral
-ledger's 5th 2026-07-08 row for full detail.
+IN PROGRESS, not complete. This (6th) loop REFUTED the 5th loop's
+"split/redistribution" localization with direct evidence: the loss happens
+via the FAST-PATH single-item insert path, not insertIntoBlock's split
+branch. See fix_plan.md's 6th-loop update + deferral ledger's 6th
+2026-07-08 row for full detail.
 
-Files: internal/access/btree/btree.go (NEW `BTree.DebugTraceInserts bool`
-+ `insertLog []btreeInsertLogEvent` + `traceInsert`/`InsertLogRecordsForTID`/
-`InsertLogRecordsForBlockAfter` — an unbounded global log of every
-insertItemSorted call (block, 0-based line-pointer idx, key, TID); wired
-into ALL 6 insertItemSorted call sites (tryInsertNoSplit, insertIntoBlock's
-no-split fast path, insertIntoBlock's dedup-recovery rebuild loop,
-insertIntoBlock's split left/right fill loops, tryInsertOnCachedRightmost);
-insertItemSorted itself now RETURNS the 0-based lineIdx it inserted at
-(callers use it for tracing). internal/storage/bufpool.go (NEW
-`Pool.DumpEventsForTag(tag) []string` — exported, string-returning sibling
-of the existing private `dumpCrossSlotEventsForTag`, for cross-package
-lookups). internal/amcheck/verify_nbtree_realtree_test.go
-(buildRealTreeConcurrent now also returns `*btree.BTree` and sets
-`bt.DebugTraceInserts = true`; TestVerifyBtreeEngineSilentOnRealConcurrentContended's
-missing-entry loop extended with a full diagnostic: insert-log lookup,
-later-insert-to-same-block count + reappearance check, CURRENT on-disk
-same-key-entries dump, storage-event dump — all only active when the test
-is un-skipped; test re-skipped, doc-comment extended with this loop's
-findings). .ralph/fix_plan.md + .ralph/deferral_ledger.md updated.
-KEEP all new instrumentation: reusable, zero-cost-when-off, same pattern
-as DebugTraceSlotEvents/DebugValidateCleanEvictions.
+Files: internal/access/btree/btree.go (NEW `BTree.RewriteLogEvent` +
+`traceRewrite` + `RewriteLogRecordsForBlock` + `RewriteSnapshotHasTID` —
+deep-copy snapshots of `allItems` right after pageItems()+appendSorted()
+and right after dedupConsolidate(), for every insertIntoBlock rewrite
+(dedup-recovery no-split path AND real split path); `insertLog` and the
+new `rewriteLog` now share one monotonic `logSeqNext` counter instead of
+each using len()-based Seq, so events from both logs compare for true
+temporal order). internal/amcheck/verify_nbtree_realtree_test.go
+(per-missing-entry diagnostic extended to call `RewriteLogRecordsForBlock`
+and report presence/absence at each snapshot; doc comment on
+TestVerifyBtreeEngineSilentOnRealConcurrentContended extended with this
+loop's finding; test re-skipped, un-skip locally to re-run).
+.ralph/fix_plan.md + .ralph/deferral_ledger.md updated.
+KEEP RewriteLogEvent/traceRewrite: reusable, zero-cost-when-off, same
+pattern as DebugTraceInserts/DebugTraceSlotEvents/DebugValidateCleanEvictions.
 
 Key symbols for next step: internal/access/btree/btree.go's
-`insertIntoBlock` (~line 1461-1703, especially the split branch ~1523-1574:
-`pageItems`, `appendSorted`, `dedupConsolidate`, the left/right
-`insertItemSorted` refill loops) — this is now the CONFIRMED location of
-the bug, not a hypothesis. `bt.InsertLogRecordsForBlockAfter(blk, seq)` /
-`bt.InsertLogRecordsForTID(tid)` (already built, reusable without new
-instrumentation) to correlate a specific lost entry against the block's
-full write history.
+`tryInsertNoSplit` (~1578-1619), `insertIntoBlock`'s own no-split fast path
+(the `if pageHasSpaceFor(...) { lineIdx := insertItemSorted(...) ...}`
+branch near the top of insertIntoBlock, before the split logic),
+`tryInsertOnCachedRightmost` (currently believed dead code per the 8th
+2026-07-07 loop — NOT re-verified this loop). `storage.PageInsertItemRawAt`
+(internal/storage/heap.go:652) — re-read this loop, arithmetic looks
+internally sound for a single isolated call.
 
-Hypothesis/Findings: DEFINITIVE this loop (hard evidence, not inference):
-for every missing entry in a fresh repro — (1) insertItemSorted was called
-EXACTLY ONCE for that (key,TID), confirmed physically written
-(PageInsertItemRawAt panics on failure; none occurred); (2) a global scan
-of the ENTIRE run's insert log for that TID across ALL blocks found no
-second occurrence anywhere — rules out "moved to a new block during a
-later split" (which would log a second insertItemSorted call with the same
-Ptr); (3) the origin block received hundreds more successful inserts
-afterward (healthy, not abandoned/evicted); (4) the block's CURRENT
-on-disk bytes at test end genuinely lack the TID — in several cases with a
-SIBLING entry sharing the identical duplicate key still present, proving a
-single-entry drop during a page rewrite, not a whole-page loss. Since a
-plain insertItemSorted call only ADDS a line pointer (shifts others, never
-deletes existing tuple bytes), the only mechanism that can make a
-previously-written entry vanish without a trace is insertIntoBlock's split
-branch: resetPageItems wipes the line-pointer array, then
-pageItems+appendSorted+dedupConsolidate recompute the survivor set from
-scratch and reinsert it split across left/right. RULED OUT this loop (by
-code reading, not new instrumentation): postings (marshalPosting is never
-invoked from the online Insert path — dedupConsolidate's own comment says
-so, confirmed no call site reachable from Insert); a concurrent-root-lift
-race (bt.splitMu fully serializes the ENTIRE split-path recursion —
-descendToLeaf + insertIntoBlock + createNewRoot all run under one lock, so
-the createNewRoot/finishSplit defensive "meta.Root != leftBlk" branches are
-for a future splitMu-removal stage, unreachable today). Re-read
-pageItems/dedupConsolidate/appendSorted function-by-function — no
-single-threaded logic flaw spotted by inspection alone (dedup only drops
-EXACT (key,ptr) duplicates via the standard safe in-place `items[:0]`
-filter idiom; appendSorted is a plain sorted binary-search insert into a
-copy). All 4 prior loops' eviction-path ruling-out (bufmap/relFile/arena/
-claimVictim/evictVictim/pinLoad/PinNew) remains valid and should NOT be
-re-derived.
+Hypothesis/Findings: DEFINITIVE this loop — every rewrite event (dedup-
+recovery or split) on a block that later loses an entry shows
+presentAfterPageItems=false with postPageItemsCount == preLineCount+1
+(matches PageLinePointerCount exactly, no undercount) — meaning
+pageItems() correctly reads whatever IS physically on the page; the page
+ITSELF already lacks the lost entry's line pointer before any rewrite
+touches it. Several missing entries have NO rewrite event at all after
+their insert (block never split again) yet still lose the entry — so the
+loss must happen via ordinary same-page fast-path insertItemSorted calls,
+not the split/dedup rebuild. This REFUTES the 5th loop's headline
+conclusion (which was itself evidence-based, just wrong once tested
+further — the "no second insertItemSorted call for that TID anywhere"
+finding was real, but its interpretation as "must be the split rewrite"
+was the wrong branch). RULED OUT this loop: a plain data race — ran this
+EXACT contended-duplicate-key repro under `-race` (GORACE=halt_on_error=0
+to run to completion) for the FIRST TIME in this whole investigation
+thread (all 20+ prior -race-clean runs used the DISJOINT-key
+TestMultiWriterStress_M0055_Phase_C repro instead, which never touches
+this narrow-key-contention page-sharing pattern) — exactly ONE race fired,
+inside dumpCrossSlotEventsForTag/traceSlotEvent (bufpool.go), the
+DebugTraceSlotEvents debug tool's own cross-slot ring scan; its doc
+comment already documents same-slot torn reads as an accepted best-effort
+tradeoff, and the cross-slot case is a stricter variant of the same
+accepted tradeoff, not a new bug class — it does not explain or correlate
+with the missing entries. No other race fired. This is the THIRD
+independent confirmation (different repros/tooling each time) that this
+is a pure protocol/ordering logic bug in properly-synchronized code, not
+a torn/unsynchronized memory access. PageInsertItemRawAt itself (re-read
+this loop) is internally consistent for one isolated call: reads
+Header(p) once, derives count/lower from it, unconditionally sets
+Lower() to lower+itemIDSize on success — a bug here would need a second
+concurrent mutator of the SAME page bypassing pinW's exclusive lock,
+which the clean -race run makes unlikely (though not impossible — a
+logic-level double-entry rather than a byte-level race could still evade
+the race detector).
 
-Next step: instrument insertIntoBlock's split branch directly (gated by
-DebugTraceInserts or a sibling bool) — log PageLinePointerCount(slot.Page())
-immediately before the split starts, len(allItems) right after
-pageItems(), and len(allItems) again after dedupConsolidate(allItems), for
-whichever block a lost entry's original insert targeted. Use
-bt.InsertLogRecordsForBlockAfter(blk, seq) to find the FIRST split burst
-after the lost insert (identifiable as a tight run of consecutive
-insertItemSorted calls with monotonically-increasing lineIdx starting from
-0 — the left-refill loop's signature, distinct from steady-state
-single-item inserts scattered across a wide seq range) and check whether
-the lost key is present in that exact pageItems() read. If pageItems()
-already undercounts at that moment, the bug is in the page read/decode
-(check for a torn/stale read despite pinW's exclusive lock — would be a
-NEW, distinct storage-layer finding after 4 loops of clean audit there).
-If dedupConsolidate receives the correct full set but emits fewer, re-audit
-it for a three-or-more-way-duplicate-run edge case despite this loop's
-structural read finding it sound.
+Next step: apply the SAME before/after pageItems()-snapshot technique
+built this loop, but to the fast-path single-item insertItemSorted call
+sites (tryInsertNoSplit, insertIntoBlock's own no-split branch,
+tryInsertOnCachedRightmost) instead of the rewrite path. Concretely: for
+the specific blocks already known (post-hoc, from this loop's diagnostic
+— e.g. blk=285 seq~394620, blk=311 seq~421999, blk=31, blk=139, blk=196,
+etc., new run will differ) to lose an entry, snapshot pageItems() (or at
+minimum a hash/count) immediately before and immediately after each
+fast-path insertItemSorted call touching that block, to find the exact
+consecutive pair where a previously-present (key,TID) silently
+disappears between two calls that never reset the page. This is
+expensive per-call (full page decode) so it's fine to gate it to only
+active AFTER a first pass has identified which blocks matter (two-phase:
+first run un-gated DebugTraceInserts/RewriteLogEvent as-is to find which
+blocks lose entries with NO rewrite event, then re-run with a NEW,
+block-filtered fast-path snapshot flag active only for those specific
+block numbers to keep the trace affordable). Do NOT re-open the
+split/rewrite path (this loop's RewriteLogEvent instrumentation
+conclusively clears it) or re-run -race on the disjoint-key repro
+(already exhaustively clean, ~1180+ iterations across loops 1-5 of the
+prior investigation thread).
 
 Gates run this loop (all PASS): go build ./...; go vet
 ./internal/amcheck/... ./internal/storage/... ./internal/access/btree/...;
 go test ./internal/storage/... ./internal/access/btree/...
 ./internal/amcheck/... (target test re-skipped by design, ran clean);
-scripts/tpch-spotcheck.sh (Q12=2/Q13=33 PASS); make ralph-state-guard
-(self-repaired a stale status/progress marker, then reported OK). Pre-commit
-pgbench smoke gate + final commit still pending as of this write (run them
-before finishing the loop).
+go test -race -run TestVerifyBtreeEngineSilentOnRealConcurrentContended
+./internal/amcheck/... (run manually with the test temporarily un-skipped,
+for investigation only — NOT part of the committed gate set, re-skipped
+before commit); scripts/tpch-spotcheck.sh (Q12=2/Q13=33 PASS); make
+ralph-state-guard pending (run before finishing this loop, see below).
 
 In-flight: none. No background processes left running. The test file's
 temporary un-skip used during this loop's investigation was reverted
-(t.Skip restored with an updated message) before commit;
-DebugTraceInserts=true is left ON in buildRealTreeConcurrent permanently,
-matching the DebugValidateCleanEvictions/DebugTraceSlotEvents precedent —
-intentional, not leftover WIP.
+(t.Skip restored with an updated message) before the gates above were
+re-run and before commit.

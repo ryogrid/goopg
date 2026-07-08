@@ -527,8 +527,55 @@ func buildRealTreeConcurrent(t *testing.T, n, writers, poolSlots int, keyRange i
 // whether the read-back undercounts or the dedup rebuild overcounts-then-
 // drops. See .ralph/deferral_ledger.md's 5th 2026-07-08 row for the full
 // writeup and exact resume point.
+//
+// Update (6th loop, same day, AI-20260708-064334-001): executed the 5th
+// loop's exact next step — built BTree.RewriteLogEvent/traceRewrite
+// (btree.go), a deep-copy snapshot of allItems taken right after
+// pageItems()+appendSorted() and again right after dedupConsolidate(),
+// for every insertIntoBlock rewrite (both the dedup-recovery no-split
+// path and the real split path), sharing one monotonic Seq counter with
+// insertLog so the two logs' events can be temporally ordered against
+// each other. Wired a per-missing-entry diagnostic (below) that finds
+// the first rewrite event on the lost entry's block at/after its insert
+// and reports whether the (key,TID) was present in each snapshot.
+// **This REFUTES the 5th loop's "split/redistribution" localization**:
+// every rewrite event on an affected block already shows
+// presentAfterPageItems=false — i.e., `pageItems()` correctly decodes
+// every physical line pointer on the page (postPageItemsCount is always
+// EXACTLY preLineCount+1, matching PageLinePointerCount with no
+// discrepancy) but the physical page ITSELF already lacks the lost
+// entry's line pointer before this rewrite ever runs. dedupConsolidate
+// is therefore also cleared (nothing to drop that was never there). Some
+// missing entries (e.g. writer 34 iters 2284/2601) show NO rewrite event
+// at all ever touching their block after the insert — for those, only
+// the plain single-item fast-path insertItemSorted calls (tryInsertNoSplit
+// / insertIntoBlock's own no-split branch / tryInsertOnCachedRightmost)
+// ever touched that page afterward, yet the entry still vanished. The
+// loss mechanism is therefore in the FAST-PATH insert sequence itself
+// (PageInsertItemRawAt's line-pointer-array bookkeeping under repeated
+// same-page inserts), not the split/dedup rewrite. Also ran this exact
+// repro under `-race` for the first time (all 20+ prior -race-clean runs
+// used the DISJOINT-key TestMultiWriterStress_M0055_Phase_C repro, never
+// this heavily-DUPLICATE-key one) and got exactly ONE report — inside
+// `dumpCrossSlotEventsForTag`/`traceSlotEvent` (bufpool.go), the
+// DebugTraceSlotEvents ring-buffer debug tool itself, whose doc comment
+// already documents cross-slot torn reads as an accepted best-effort
+// tradeoff; it does not touch or explain the missing-entry mechanism.
+// No other race fired (GORACE=halt_on_error=0, full run to completion).
+// This rules out a plain memory data race for the THIRD independent repro
+// in this investigation thread — reinforcing loop 3's "pure
+// protocol/ordering bug in properly-synchronized code, not a torn/
+// unsynchronized access" conclusion. Next step: apply the SAME
+// before/after pageItems()-snapshot technique built this loop, but to
+// the fast-path single-item insertItemSorted call sites (tryInsertNoSplit,
+// insertIntoBlock's no-split branch, tryInsertOnCachedRightmost) instead
+// of the rewrite path — snapshot pageItems() immediately before and after
+// each fast-path call for the specific blocks known (post-hoc) to have
+// lost an entry, to find the exact consecutive pair of fast-path inserts
+// where a previously-present (key,TID) silently disappears. See
+// .ralph/deferral_ledger.md's 6th 2026-07-08 row for the full writeup.
 func TestVerifyBtreeEngineSilentOnRealConcurrentContended(t *testing.T) {
-	t.Skip("known-failing: tracks M-NIGHTLY AI-20260708-064334-001 (btree split/redistribution lost-item bug); un-skip to confirm a fix")
+	t.Skip("known-failing: tracks M-NIGHTLY AI-20260708-064334-001 (btree lost-index-entry bug, mechanism not yet in the fast-path single-item insert); un-skip to confirm a fix")
 	if testing.Short() {
 		t.Skip("skipping concurrent real-tree amcheck stress in short mode")
 	}
@@ -594,6 +641,38 @@ func TestVerifyBtreeEngineSilentOnRealConcurrentContended(t *testing.T) {
 				}
 				t.Logf("  %d later insertItemSorted call(s) touched blk=%d after seq=%d; our TID reappears in that log: %v",
 					len(after), last.Block, last.Seq, rewritten)
+				// M-NIGHTLY investigation aid (AI-20260708-064334-001, 6th
+				// loop): pinpoint the exact insertIntoBlock rewrite event
+				// (dedup-recovery or split) that should have carried this
+				// entry forward, and check whether it was present at the
+				// pageItems()+appendSorted() checkpoint but missing after
+				// dedupConsolidate() (a dedup bug) versus already missing
+				// at the pageItems() checkpoint itself (a page read/decode
+				// bug -- pageItems undercounting a page that genuinely held
+				// the entry). insertLog and rewriteLog share one monotonic
+				// Seq counter, so Seq comparison across the two logs
+				// reflects true temporal order.
+				rewriteEvents := bt.RewriteLogRecordsForBlock(last.Block)
+				foundRewrite := false
+				for _, re := range rewriteEvents {
+					if re.Seq < last.Seq {
+						continue
+					}
+					foundRewrite = true
+					inPageItems := btree.RewriteSnapshotHasTID(re.PostPageItems, e.TID)
+					inDedup := btree.RewriteSnapshotHasTID(re.PostDedup, e.TID)
+					t.Logf("  rewrite-event seq=%d phase=%s preLineCount=%d postPageItemsCount=%d postDedupCount=%d presentAfterPageItems=%v presentAfterDedup=%v",
+						re.Seq, re.Phase, re.PreLineCount, len(re.PostPageItems), len(re.PostDedup), inPageItems, inDedup)
+					if !inPageItems {
+						t.Logf("  => LOCALIZED: pageItems() already lacked this (key,TID) at rewrite seq=%d -- bug is in the page read/decode, not dedupConsolidate", re.Seq)
+					} else if !inDedup {
+						t.Logf("  => LOCALIZED: pageItems() had this (key,TID) but dedupConsolidate() dropped it at rewrite seq=%d -- bug is in dedupConsolidate", re.Seq)
+					}
+				}
+				if !foundRewrite {
+					t.Logf("  no rewrite event recorded for blk=%d at/after seq=%d (block never underwent a split/dedup-recovery rewrite after this insert -- loss did NOT happen via insertIntoBlock's rewrite path)",
+						last.Block, last.Seq)
+				}
 				// Ground truth: is the key/TID physically present on the
 				// block's CURRENT on-disk bytes right now, regardless of what
 				// the insert log says? Distinguishes "line-pointer array

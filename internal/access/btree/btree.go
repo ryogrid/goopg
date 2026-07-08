@@ -651,6 +651,15 @@ type BTree struct {
 	DebugTraceInserts bool
 	insertLogMu       sync.Mutex
 	insertLog         []btreeInsertLogEvent
+	// rewriteLog records insertIntoBlock's page-rewrite checkpoints (see
+	// RewriteLogEvent); guarded by insertLogMu alongside insertLog.
+	rewriteLog []RewriteLogEvent
+	// logSeqNext is a single monotonic counter shared by insertLog and
+	// rewriteLog (instead of each using its own len()-based sequence) so a
+	// caller can compare Seq values ACROSS the two logs to establish
+	// temporal ordering — e.g. "did any rewrite event on this block happen
+	// after this specific insert". Guarded by insertLogMu.
+	logSeqNext uint64
 }
 
 // btreeInsertLogEvent is one recorded insertItemSorted call (see
@@ -670,8 +679,10 @@ func (bt *BTree) traceInsert(blk storage.BlockNumber, lineIdx int, it item) {
 		return
 	}
 	bt.insertLogMu.Lock()
+	seq := bt.logSeqNext
+	bt.logSeqNext++
 	bt.insertLog = append(bt.insertLog, btreeInsertLogEvent{
-		Seq:     uint64(len(bt.insertLog)),
+		Seq:     seq,
 		Block:   blk,
 		LineIdx: lineIdx,
 		Key:     append([]byte(nil), it.key...),
@@ -725,6 +736,77 @@ func (bt *BTree) InsertLogRecordsForBlockAfter(blk storage.BlockNumber, afterSeq
 		}
 	}
 	return out
+}
+
+// RewriteLogEvent is one recorded insertIntoBlock page-rewrite event (the
+// dedup-recovery no-split rebuild, or a genuine split): the full survivor set
+// captured at the two checkpoints that matter for the M-NIGHTLY
+// AI-20260708-064334-001 investigation — immediately after `pageItems()`
+// (what the rewrite believes is currently on the page, plus the incoming
+// item) and immediately after `dedupConsolidate()` (what it's about to write
+// back). Comparing a specific (key,TID)'s presence across these two
+// snapshots localizes a lost entry to either "pageItems undercounted a page
+// that genuinely held it" or "dedupConsolidate dropped a non-duplicate".
+// Gated by DebugTraceInserts, same zero-cost-when-off contract as insertLog.
+type RewriteLogEvent struct {
+	Seq             uint64
+	Block           storage.BlockNumber
+	Phase           string // "dedup-recovery" or "split"
+	PreLineCount    int    // storage.PageLinePointerCount(slot.Page()) just before pageItems()
+	PostPageItems   []InsertLogRecord
+	PostDedup       []InsertLogRecord
+}
+
+func (bt *BTree) traceRewrite(blk storage.BlockNumber, phase string, preLineCount int, postPageItems, postDedup []item) {
+	if !bt.DebugTraceInserts {
+		return
+	}
+	toRecords := func(items []item) []InsertLogRecord {
+		out := make([]InsertLogRecord, len(items))
+		for i, it := range items {
+			out[i] = InsertLogRecord{Block: blk, LineIdx: i, Key: append([]byte(nil), it.key...), Ptr: it.ptr}
+		}
+		return out
+	}
+	bt.insertLogMu.Lock()
+	defer bt.insertLogMu.Unlock()
+	seq := bt.logSeqNext
+	bt.logSeqNext++
+	bt.rewriteLog = append(bt.rewriteLog, RewriteLogEvent{
+		Seq:           seq,
+		Block:         blk,
+		Phase:         phase,
+		PreLineCount:  preLineCount,
+		PostPageItems: toRecords(postPageItems),
+		PostDedup:     toRecords(postDedup),
+	})
+}
+
+// RewriteLogRecordsForBlock returns every recorded insertIntoBlock rewrite
+// event (see RewriteLogEvent) for blk, in recorded order. Test/investigation
+// helper for DebugTraceInserts.
+func (bt *BTree) RewriteLogRecordsForBlock(blk storage.BlockNumber) []RewriteLogEvent {
+	bt.insertLogMu.Lock()
+	defer bt.insertLogMu.Unlock()
+	var out []RewriteLogEvent
+	for _, e := range bt.rewriteLog {
+		if e.Block == blk {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// PresentIn reports whether tid appears among a RewriteLogEvent snapshot's
+// recorded (key,TID) pairs. Investigation helper — avoids callers
+// hand-rolling the same linear scan at every call site.
+func RewriteSnapshotHasTID(recs []InsertLogRecord, tid storage.ItemPointer) bool {
+	for _, r := range recs {
+		if r.Ptr == tid {
+			return true
+		}
+	}
+	return false
 }
 
 // pinNewOrRecycled (M0055-0005 Phase D) returns a writable slot
@@ -1611,6 +1693,18 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 	}
 	initPage(rightSlot.Page(), rightOpaque)
 
+	// M-NIGHTLY investigation aid (AI-20260708-064334-001, 6th loop):
+	// snapshot the two checkpoints that matter for localizing a lost
+	// entry — right after pageItems()+appendSorted() (what the rewrite
+	// believes is on the page, plus the incoming item) and right after
+	// dedupConsolidate() (what it's about to write back). Both are DEEP
+	// COPIES of the item-struct slice (not the post-dedup slice itself,
+	// which reuses pageItems's backing array via `items[:0]` in-place
+	// compaction — holding a live reference into it would read corrupted
+	// data once dedupConsolidate runs). Zero cost when DebugTraceInserts
+	// is off (traceRewrite no-ops immediately).
+	preLineCount, _ := storage.PageLinePointerCount(slot.Page())
+
 	allItems, err := pageItems(slot.Page())
 	if err != nil {
 		rightSlot.Unlock()
@@ -1619,6 +1713,10 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 		return err
 	}
 	allItems = appendSorted(allItems, it)
+	var postPageItemsSnap []item
+	if bt.DebugTraceInserts {
+		postPageItemsSnap = append([]item(nil), allItems...)
+	}
 
 	// M0055-0003 Phase B (pre-split dedup compaction): consolidate
 	// adjacent same-key items into postings. For duplicate-heavy
@@ -1627,7 +1725,12 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 	// avoiding the split entirely. We bail back to the no-split
 	// path if dedup recovers enough space.
 	allItems = dedupConsolidate(allItems)
+	var postDedupSnap []item
+	if bt.DebugTraceInserts {
+		postDedupSnap = append([]item(nil), allItems...)
+	}
 	if compactRawSize(allItems) < pageFreeBudget(slot.Page())+pageOccupied(slot.Page()) {
+		bt.traceRewrite(blk, "dedup-recovery", preLineCount, postPageItemsSnap, postDedupSnap)
 		// Re-attempt no-split insert with the dedup'd content.
 		// Reset the page and write the dedup'd items back, no
 		// split needed. The right-side allocation is rolled back.
@@ -1645,6 +1748,7 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 		bt.unpinW(slot)
 		return nil
 	}
+	bt.traceRewrite(blk, "split", preLineCount, postPageItemsSnap, postDedupSnap)
 
 	// M0055-0002-followup-byte-split: byte-aware split-loc.
 	// Pick the entry whose cumulative encoded byte size lands
