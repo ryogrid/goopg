@@ -135,3 +135,114 @@ func TestDetectWritePos_SingleNonZeroSegment(t *testing.T) {
 		t.Fatalf("writePos = %d, want %d (base for 0x100)", writePos, wantBase)
 	}
 }
+
+// TestDetectWritePos_IgnoresEagerPhantomFutureSegment is the
+// regression pin for the M0007 eager-next-segment-lookahead follow-up:
+// state.eagerPreallocSegment can leave a full-size, entirely
+// zero-filled segment 1 on disk beyond segment 0 (which itself is
+// only partially written — the writer never got around to rolling
+// over into segment 1 for real before this snapshot / a crash). A
+// reopen must find the true end of WAL inside segment 0, not
+// mistakenly trust it as "fully used" because a same-size segment 1
+// exists above it.
+func TestDetectWritePos_IgnoresEagerPhantomFutureSegment(t *testing.T) {
+	const segSize = int64(1024)
+	walDir := t.TempDir()
+
+	// Build segment 0 for real, via the writer, so it contains
+	// genuine decodable records followed by a real zero-fill tail —
+	// exactly what a genuinely partially-written, preallocated
+	// segment looks like on disk.
+	w, err := NewWriter(Config{WALDir: walDir, SegmentSize: segSize, Preallocate: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var lastEnd uint64
+	for _, p := range []string{"alpha", "beta", "gamma"} {
+		_, end, err := w.Append([]byte(p))
+		if err != nil {
+			t.Fatal(err)
+		}
+		lastEnd = end
+	}
+	if err := w.FlushUpTo(lastEnd); err != nil {
+		t.Fatal(err)
+	}
+	// Wait for the writer's own eager lookahead to finish creating
+	// segment 1, then close — simulating a crash right after eager
+	// preallocation completed but before the writer ever rolled over
+	// into segment 1 for real.
+	w.stateRef.eagerWG.Wait()
+	if _, err := os.Stat(filepath.Join(walDir, formatSegmentName(1))); err != nil {
+		t.Fatalf("expected eager lookahead to have created segment 1: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	writePos, _, err := detectWritePos(walDir, segSize, false)
+	if err != nil {
+		t.Fatalf("detectWritePos: %v", err)
+	}
+	if writePos != int64(lastEnd) {
+		t.Fatalf("writePos = %d, want %d (segment 0's real end — segment 1 is an untouched eager phantom and must be ignored)", writePos, lastEnd)
+	}
+}
+
+// TestClose_WaitsForEagerJobTriggeredByItsOwnFlush is the regression
+// pin for a review finding on the eager-lookahead follow-up: with
+// Config.WALBuffers > 0, Append only touches the in-memory buffer —
+// nothing reaches openSegment until something drains it. If nothing
+// drains the buffer before Close, close()'s own flushUpTo call can be
+// the FIRST caller of openSegment for one or more segments, and
+// openSegment unconditionally kicks off a brand-new eager job for the
+// segment after whichever one it just opened. A Wait() that only ran
+// at the very top of close() (before flushUpTo) would return before
+// any of these jobs even started, letting Close() return while a
+// background goroutine is still writing into the WAL directory.
+// close() must wait AFTER flushUpTo, not just before it.
+func TestClose_WaitsForEagerJobTriggeredByItsOwnFlush(t *testing.T) {
+	const segSize = int64(512)
+	walDir := t.TempDir()
+
+	w, err := NewWriter(Config{
+		WALDir:      walDir,
+		SegmentSize: segSize,
+		Preallocate: true,
+		// Large enough that every appended byte below stays buffered
+		// in memory — nothing physically reaches a segment file until
+		// Close's own flushUpTo drains it.
+		WALBuffers: 64 * 1024,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Enough total bytes to span segment 0 into segment 1, so
+	// flushUpTo's drain opens BOTH segment 0 and segment 1 for the
+	// first time — each triggering its own fresh eager job (for
+	// segment 1 and segment 2 respectively) that has had zero chance
+	// to run before Close() is called.
+	big := make([]byte, segSize)
+	if _, _, err := w.Append(big); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := w.Append([]byte("tail")); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// If close() waited correctly, segment 2 (eagerly triggered by
+	// flushUpTo's own first-time open of segment 1) must already be
+	// fully sized the instant Close() returns — no explicit wait here.
+	info, err := os.Stat(filepath.Join(walDir, formatSegmentName(2)))
+	if err != nil {
+		t.Fatalf("expected segment 2 to exist immediately after Close (eager job triggered by close's own flush): %v", err)
+	}
+	if info.Size() != segSize {
+		t.Fatalf("segment 2 size = %d, want %d (Close returned before its own eager job finished)", info.Size(), segSize)
+	}
+}

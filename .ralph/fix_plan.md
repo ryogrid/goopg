@@ -5434,7 +5434,81 @@ mirroring M0119's ledger `status` column.
       PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
       `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
       failed transactions, all 3 pgbench workloads). **Still open in this
-      bucket:** `WALInsertLock` array (parallel inserts), MultiXact WAL.
+      bucket (at that point):** `WALInsertLock` array (parallel inserts),
+      MultiXact WAL, eager next-segment lookahead.
+      **Eager next-segment lookahead landed (2026-07-09, next loop):**
+      closes the `unimplemented_feat.json` M0007 entry left over from the
+      original 0007-0001 preallocation design (deferred there as "gives
+      lower commit-path tail latency at rollover but adds a background
+      goroutine"). `state.openSegment(segNo)` (`internal/wal/writer.go`) now
+      calls a new `state.eagerPreallocSegment(segNo+1)` right after handling
+      `segNo` itself, spawning a background goroutine that zero-fills a
+      `<segfile>.eager<pid>.tmp` file and durably links it into place
+      (`os.Link`, EEXIST-tolerant no-clobber — mirrors upstream
+      `XLogFileInit`'s temp-then-link pattern) so a genuine rollover usually
+      finds the next segment already preallocated instead of paying for it
+      synchronously; new `state.eagerInFlight`/`eagerMu` dedupe concurrent
+      triggers for the same segment, `state.eagerWG` lets `close()` wait for
+      any still-running job before tearing down `s.files`. Found and fixed a
+      real correctness hazard this exposed on the way: `detectWritePos`
+      (consulted only at writer-reopen time, e.g. after a restart) used to
+      trust every non-last on-disk segment as "fully used" via file size
+      alone, content-scanning only the literal highest-numbered file — a
+      crash between eagerly preallocating `segNo+1` and the writer ever
+      really reaching it leaves a fully zero, never-written `segNo+1` file
+      *above* the genuinely partially-written `segNo`, which the old logic
+      would silently overshoot past (trusting `segNo` as full while
+      content-scanning the empty phantom instead). Fixed by walking backward
+      from the highest segNo, trimming any segment that is both full-size
+      and scans as entirely empty, before running the existing (otherwise
+      unchanged) last-segment scan logic — the full-size guard is what keeps
+      this from misclassifying a genuine short/legacy empty-last segment
+      (already handled correctly, unchanged). Also fixed a pre-existing
+      pg_waldump test (`TestPGWaldumpParsesEmittedWAL`) that the new second
+      on-disk segment file exposed: bare `pg_waldump -p walDir -s .. -e ..`
+      (no explicit filename) auto-detects `WalSegSz` by opening "any
+      WAL-looking file" via unordered `readdir()` (`identify_target_directory`
+      / `search_directory`, `pg_waldump.c`), which can hand it the all-zero
+      segment 1 and misread its zeroed long-page-header as `xlp_seg_size=0`
+      — a pre-existing upstream pg_waldump quirk (real PG WAL directories
+      have the same kind of preallocated future segment during normal
+      operation), fixed by naming the exact start segment as a positional
+      argument, the standard unambiguous invocation form. Tests:
+      `internal/wal/writer_detect_test.go`'s new
+      `TestDetectWritePos_IgnoresEagerPhantomFutureSegment` (confirmed
+      non-vacuous by reverting the trim loop — fails with the exact
+      predicted writePos overshoot); `internal/wal/wal_test.go`'s
+      `TestPreallocationCounters` updated to `w.stateRef.eagerWG.Wait()`
+      before each assertion and re-derive the new one-segment-ahead expected
+      totals (was implicitly relying on the background goroutine losing a
+      race it had no guaranteed way to lose). **Independent review caught a
+      genuine bug in the first cut:** `close()`'s `eagerWG.Wait()` ran
+      *before* `flushUpTo`, but with `Config.WALBuffers > 0` (the default)
+      `flushUpTo` can itself be the first caller of `openSegment` for a
+      segment (buffered bytes never drained until Close), which then kicks
+      off a brand-new eager job with zero chance to have started before that
+      earlier `Wait()` already returned — `Close()` could return while a
+      background goroutine was still writing into the WAL directory. Fixed
+      by moving `Wait()` to after `flushUpTo` (the last remaining
+      `openSegment` caller inside `close()`). New test
+      `TestClose_WaitsForEagerJobTriggeredByItsOwnFlush`
+      (`writer_detect_test.go`, confirmed non-vacuous — fails ~95% of runs
+      with the ordering reverted, a real race not a rare corner case).
+      Design:
+      `docs/design/0007-0001-wal-segment-preallocation.md` new "Follow-up
+      (2026-07-09): eager next-segment lookahead" section;
+      `docs/design/README.md` row updated; `unimplemented_feat.json`'s
+      matching M0007 entry flipped to `resolved` (task_id retagged
+      `M0122-0009`). No deferral-ledger row needed — nothing new was left
+      unimplemented (the pre-existing `posix_fallocate` deferral,
+      unaffected by this loop, was already tracked in the design doc before
+      this change). Gates: `go build ./...` clean; `go test`/`go test -race`
+      PASS across `internal/wal`; `go test ./internal/initdb/...` PASS (no
+      regression in Init+Open+restart recovery, ~5 min); `scripts/tpch-spotcheck.sh`
+      PASS (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+      scripts/ralph-precommit-test.sh` PASS (0 failed transactions, all 3
+      pgbench workloads). **Still open in this bucket:** `WALInsertLock`
+      array (parallel inserts), MultiXact WAL.
 - [ ] **M0122-0010 — Concurrency: buffer pool & btree locking** (~17, LARGE).
       Lehman/Yao crab-walk, `splitMu` removal, storage-pool pin-count race,
       re-enable the `-race` gate. Gate: race detector mandatory.

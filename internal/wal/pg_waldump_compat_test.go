@@ -143,9 +143,25 @@ func TestPGWaldumpParsesEmittedWAL(t *testing.T) {
 	// doesn't read past our written data into the preallocated
 	// zero-filled tail (which would surface as a spurious
 	// "invalid record length 0" error).
+	//
+	// An explicit STARTSEG positional argument (rather than bare `-p`)
+	// is required here, not just stylistic: pg_waldump's own
+	// directory-only mode (`identify_target_directory(waldir, NULL)`,
+	// pg_waldump.c) auto-detects WalSegSz by opening whatever WAL-named
+	// file `readdir` happens to return first — unordered, and never
+	// guaranteed to be the earliest segment. Real WAL directories
+	// (goopg's and upstream's alike) routinely contain an
+	// already-preallocated, all-zero *next* segment even when only the
+	// first has been written (eager next-segment lookahead, M0007
+	// follow-up), so an unlucky directory order can hand pg_waldump
+	// that all-zero file and its zeroed long-page-header reads back
+	// `xlp_seg_size=0`, aborting with "invalid WAL segment size".
+	// Naming the exact start segment sidesteps the ambiguity entirely,
+	// matching how pg_waldump is normally invoked against a known LSN
+	// range.
 	cmd := exec.Command(waldump,
 		"-q",
-		"-p", walDir,
+		filepath.Join(walDir, startSeg),
 		"-t", "1",
 		"-s", lsnToRecPtr(firstStart),
 		"-e", lsnToRecPtr(lastStart),

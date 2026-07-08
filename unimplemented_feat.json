@@ -476,9 +476,9 @@
   },
   {
    "feature": "Eager next-segment lookahead for WAL preallocation optimization.",
-   "task_id": "M0007",
+   "task_id": "M0122-0009",
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "eager next-segment lookahead ... remain deferred"
    ],
@@ -493,7 +493,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "PARTIAL: WAL segment preallocation of the current segment on first open is implemented (internal/wal/writer.go:1896-1961, wal_init_zero GUC), landed via docs/design/0007-0001-wal-segment-preallocation.md. Still missing: eager next-segment lookahead (pre-creating segment N+1 in the background before the write head reaches it) — state.openSegment (writer.go:1896) only preallocates synchronously when a segment is first needed."
+   "code_audit": "RESOLVED 2026-07-09: state.openSegment now calls the new state.eagerPreallocSegment(segNo+1) (internal/wal/writer.go) right after handling segNo, spawning a background goroutine (temp-file + os.Link-no-clobber, mirroring upstream XLogFileInit) that zero-fills and durably links segNo+1 into place before the writer's write head ever reaches it. state.eagerWG lets close() wait for any in-flight job. Also fixed a new correctness hazard this exposed: detectWritePos (writer.go) previously trusted every non-last segment as fully-used by file size alone, which a crash-time all-zero eager phantom segment above the genuinely-active one would silently defeat (overshooting writePos to the wrong segment's end) — now walks backward trimming any full-size, entirely-empty trailing segment before applying the existing last-segment scan. Tests: TestDetectWritePos_IgnoresEagerPhantomFutureSegment (internal/wal/writer_detect_test.go, confirmed non-vacuous by reverting the trim loop), TestPreallocationCounters updated for the new one-segment-ahead counts. See docs/design/0007-0001-wal-segment-preallocation.md 'Follow-up (2026-07-09)'."
   },
   {
    "feature": "Counters for WAL preallocation metrics and monitoring.",

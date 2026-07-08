@@ -470,6 +470,13 @@ type state struct {
 
 	// fg is the group-commit flush queue, shared with Writer. M0098-0002.
 	fg *flushGroup
+
+	// eagerMu guards eagerInFlight; eagerWG lets close() wait for any
+	// background eager-preallocation goroutines to finish before the
+	// writer's files map is torn down. See eagerPreallocSegment.
+	eagerMu       sync.Mutex
+	eagerInFlight map[uint64]struct{}
+	eagerWG       sync.WaitGroup
 }
 
 // walBufferCounters holds the lifetime drain counters that
@@ -1017,6 +1024,46 @@ func detectWritePos(walDir string, segSize int64, pageHeaders bool) (int64, uint
 	// Gap detection (missing segment in the retained range) is still
 	// done correctly by comparing consecutive entries.
 	firstSegNo := segNos[0]
+
+	// M0007 eager-lookahead follow-up: state.eagerPreallocSegment can
+	// leave a fully zero-filled "future" segment on disk beyond the
+	// segment that actually holds the last real record — it
+	// preallocates segNo+1 (to full SegmentSize, entirely zero) as
+	// soon as segNo is opened for real use, so a crash/restart before
+	// the writer ever reaches segNo+1 leaves that file sitting there,
+	// completely untouched. Blindly trusting the single
+	// highest-numbered file as "the last, possibly-partial segment"
+	// (this function's pre-eager-lookahead rule) would then scan that
+	// all-zero file and silently treat the genuinely-active segment
+	// below it as "fully used" via the non-last size-only fast path,
+	// overshooting writePos to the very end of that segment instead
+	// of its true last record.
+	//
+	// Only a segment whose on-disk size equals the full configured
+	// SegmentSize can possibly be such a phantom — a real "not yet
+	// written" segment in legacy (non-preallocated) mode is always
+	// short (0 or partial bytes, handled correctly by the untouched
+	// scan-the-literal-last-segment logic below already). So: drop
+	// the highest segNo from consideration when it is both full-size
+	// AND scans as entirely empty (0 bytes used before the first EOS
+	// sentinel), and repeat on the segment below it, until a segment
+	// fails that test (real content, or short/legacy) or only one
+	// segment remains. At most one such phantom can exist at a time
+	// in practice (eager lookahead only ever preallocates a single
+	// segment ahead of the one currently in real use), but the loop
+	// tolerates more defensively.
+	lastIdx := len(segNos) - 1
+	for lastIdx > 0 && segSizes[segNos[lastIdx]] == segSize {
+		usedBytes, _, scanErr := scanLastSegmentEnd(walDir, segNos[lastIdx], segSizes[segNos[lastIdx]], segSize, pageHeaders)
+		if scanErr != nil {
+			return 0, 0, scanErr
+		}
+		if usedBytes != 0 {
+			break
+		}
+		lastIdx--
+	}
+	segNos = segNos[:lastIdx+1]
 
 	// Start writePos at the absolute LSN of the first retained segment
 	// so the result is an absolute byte offset, not one relative to
@@ -2110,7 +2157,88 @@ func (s *state) openSegment(segNo uint64) (*os.File, error) {
 	}
 
 	s.files[segNo] = f
+	// Eager next-segment lookahead (M0007 follow-up): kick off
+	// background preallocation of segNo+1 now, so that by the time
+	// the write head rolls over, openSegment(segNo+1) finds the file
+	// already zero-filled instead of paying preallocateSegment's cost
+	// synchronously on the commit path. Best-effort and idempotent —
+	// see eagerPreallocSegment.
+	s.eagerPreallocSegment(segNo + 1)
 	return f, nil
+}
+
+// eagerPreallocSegment preallocates segNo's file in the background,
+// if Config.Preallocate is enabled and no copy of the file exists or
+// is already being built. A later synchronous openSegment(segNo)
+// simply finds the file already in place (via os.Stat) and skips its
+// own zero-fill — so this is a pure latency optimization, never a
+// correctness dependency: if the background job is slow, aborts, or
+// loses a race, the synchronous path still preallocates segNo itself
+// exactly as it always has.
+func (s *state) eagerPreallocSegment(segNo uint64) {
+	if !s.cfg.Preallocate {
+		return
+	}
+	finalPath := filepath.Join(s.cfg.WALDir, formatSegmentName(segNo))
+	if _, err := os.Stat(finalPath); err == nil {
+		return
+	}
+
+	s.eagerMu.Lock()
+	if s.eagerInFlight == nil {
+		s.eagerInFlight = make(map[uint64]struct{})
+	}
+	if _, already := s.eagerInFlight[segNo]; already {
+		s.eagerMu.Unlock()
+		return
+	}
+	s.eagerInFlight[segNo] = struct{}{}
+	s.eagerMu.Unlock()
+
+	s.eagerWG.Go(func() {
+		defer func() {
+			s.eagerMu.Lock()
+			delete(s.eagerInFlight, segNo)
+			s.eagerMu.Unlock()
+		}()
+		s.eagerPreallocWorker(finalPath)
+	})
+}
+
+// eagerPreallocWorker zero-fills a fresh temp file and durably links
+// it into finalPath — mirroring upstream XLogFileInit's
+// create-as-temp-then-link-no-clobber pattern (xlog.c) — so a
+// concurrent synchronous openSegment for the same segment number can
+// never observe (or race against) a partially zero-filled file at the
+// real segment path. os.Link failing with "already exists" means the
+// synchronous path (or another eager attempt) won the race; that is
+// the expected, harmless outcome, not an error.
+func (s *state) eagerPreallocWorker(finalPath string) {
+	tmpPath := fmt.Sprintf("%s.eager%d.tmp", finalPath, os.Getpid())
+	tf, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o600)
+	if err != nil {
+		return
+	}
+	defer os.Remove(tmpPath)
+
+	if err := preallocateSegment(tf, s.cfg.SegmentSize); err != nil {
+		_ = tf.Close()
+		return
+	}
+	_ = tf.Close()
+
+	if err := os.Link(tmpPath, finalPath); err != nil {
+		return
+	}
+
+	if s.walBufferCounters != nil {
+		s.walBufferCounters.segmentsPreallocated.Add(1)
+		s.walBufferCounters.preallocatedBytes.Add(s.cfg.SegmentSize)
+	}
+	if dir, derr := os.Open(s.cfg.WALDir); derr == nil {
+		_ = dir.Sync()
+		_ = dir.Close()
+	}
 }
 
 // preallocateSegment zero-fills f to size and fsyncs it. Mirrors
@@ -2166,6 +2294,21 @@ func (s *state) close() error {
 			firstErr = err
 		}
 	}
+
+	// Wait for any eager next-segment preallocation goroutines to
+	// finish before tearing down s.files — they only ever touch their
+	// own temp file + one os.Link into the WAL dir, never s.files
+	// itself, but waiting here keeps the writer's shutdown
+	// deterministic (no goroutine outliving Close, no stray temp file
+	// left behind by an abandoned worker). This MUST run after
+	// flushUpTo, not before: with Config.WALBuffers > 0, buffered
+	// bytes not yet drained to any segment file mean flushUpTo above
+	// can be the very first caller of openSegment for some segment,
+	// which itself triggers a brand-new eager job for the segment
+	// after it — a Wait() only at the top of this function would
+	// finish before that job even starts.
+	s.eagerWG.Wait()
+
 	for _, f := range s.files {
 		if err := f.Close(); err != nil && firstErr == nil {
 			firstErr = err
