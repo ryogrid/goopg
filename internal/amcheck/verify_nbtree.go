@@ -157,8 +157,23 @@ func VerifyBtreePage(p storage.Page, blkno storage.BlockNumber, indexName string
 //     separator" and is unique on its level). Violation message:
 //     `high key invariant violated for index "%s"`.
 //
-//   - Item-order invariant. Items must be stored in strictly ascending key
-//     order: each item's key must be strictly less than the next item's key.
+//   - Item-order invariant. Items must be stored in non-decreasing key order:
+//     each item's key must not be greater than the next item's key. Upstream
+//     requires *strictly* ascending order because its heapkeyspace nbtree
+//     comparator (_bt_compare) always breaks a key tie by heap TID, so two
+//     on-disk items are never truly equal. goopg's comparator
+//     (btree.CompareKeys, the same one the live index uses for descent,
+//     insert positioning, and split points) is key-only — it has no TID
+//     tiebreak anywhere in the engine — so goopg's btree does NOT keep
+//     same-key items in any particular TID order (confirmed empirically: a
+//     hot low-cardinality key under sustained non-HOT-UPDATE churn produces
+//     hundreds of same-key leaf items in observably random TID order). Two
+//     adjacent items with an equal key are therefore always legitimate here
+//     (goopg, like PostgreSQL, carries multiple index entries for the same
+//     key until VACUUM removes the dead ones — every non-HOT UPDATE inserts a
+//     fresh entry sharing the old key); only a strict *decrease* is a
+//     violation. This matches upstream's own fallback for non-heapkeyspace
+//     (pre-v4, no TID tiebreak) indexes — invariant_leq_offset's cmp <= 0.
 //     Violation message: `item order invariant violated for index "%s"`.
 //
 // goopg specifics that make this port faithful:
@@ -213,8 +228,10 @@ func VerifyBtreeItemOrder(p storage.Page, blkno storage.BlockNumber, indexName s
 					"high key invariant violated for index \"%s\"", indexName)}}
 			}
 		}
-		// Item order: current key strictly less than the next item's key.
-		if i+1 < len(keys) && btree.CompareKeys(key, keys[i+1]) >= 0 {
+		// Item order: current key must not be greater than the next item's key
+		// (a strict decrease is the only violation — see the doc comment above
+		// on why goopg tolerates equal adjacent keys).
+		if i+1 < len(keys) && btree.CompareKeys(key, keys[i+1]) > 0 {
 			return []BtreeReport{{Block: blkno, Msg: fmt.Sprintf(
 				"item order invariant violated for index \"%s\"", indexName)}}
 		}

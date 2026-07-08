@@ -370,9 +370,12 @@ cross-level descent:
   key that is an untruncated copy of the last data item; an internal high key is
   "just another separator", unique on its level. Message:
   `high key invariant violated for index "%s"`.
-- **Item-order invariant.** Items must be stored in strictly ascending key order:
-  each key strictly less than the next. Message:
-  `item order invariant violated for index "%s"`.
+- **Item-order invariant.** Items must be stored in **non-decreasing** key order:
+  no key may be greater than the next. Message:
+  `item order invariant violated for index "%s"`. (2026-07-08 update below:
+  originally ported as *strictly* ascending, matching upstream's default
+  heapkeyspace behaviour; corrected to non-decreasing once empirical evidence
+  showed goopg's engine does not provide upstream's TID tiebreak.)
 
 goopg specifics making the port faithful:
 
@@ -404,13 +407,66 @@ items and yield nil.
 `pd_upper` to the B-tree special offset before adding items so item data grows
 above the opaque area, then writes the opaque bytes; self-checks the decoded
 opaque + key sequence through `btree.ParseOpaque`/`btree.PageItemKeys`):
-ascending leaf clean; out-of-order and duplicate-adjacent keys each assert the
-item-order message + block; leaf `key == high key` clean (`<=`) vs leaf
-`key > high key` violation; internal `key == high key` violation (`<`) vs
-internal negative-infinity clean; rightmost page ignores a lingering high key;
-metapage and deleted pages yield nil. 10 tests. `btree/posting_test.go` gains
-`TestPageItemKeys` asserting the posting-collapse behaviour (regular + 3-TID
-posting → 2 keys).
+ascending leaf clean; out-of-order keys assert the item-order message + block;
+duplicate-adjacent keys are clean (see 2026-07-08 update below) but a decrease
+following a duplicate run still asserts the violation; leaf `key == high key`
+clean (`<=`) vs leaf `key > high key` violation; internal `key == high key`
+violation (`<`) vs internal negative-infinity clean; rightmost page ignores a
+lingering high key; metapage and deleted pages yield nil. 10 tests.
+`btree/posting_test.go` gains `TestPageItemKeys` asserting the
+posting-collapse behaviour (regular + 3-TID posting → 2 keys).
+
+### 2026-07-08 update: item-order tier was too strict (false-positive corruption reports)
+
+`VerifyBtreeItemOrder` originally required *strictly* ascending adjacent keys
+(`cmp >= 0` was a violation), directly mirroring upstream's default
+heapkeyspace behaviour where `_bt_compare` always breaks a key tie by heap TID
+(`verify_nbtree.c:invariant_l_offset`), so two on-disk items are never truly
+equal in a healthy upstream index.
+
+This assumption does not hold for goopg. `btree.CompareKeys` — the *only*
+comparator the engine's own descent, insert-position, and split-point code
+uses anywhere in `internal/access/btree` — is key-only; it has no heap-TID
+tiebreak. goopg's btree therefore never guarantees any particular order among
+items that share a key, and duplicate keys are common in practice: every
+non-HOT `UPDATE` (goopg has no HOT-update path — see
+`[[goopg_no_hot_update_index_reeval]]`) inserts a fresh index entry sharing
+the old key, and `dedupConsolidate`'s posting-list promotion (which would
+otherwise collapse same-key entries into one line pointer) only runs from
+`BulkCreate`, not the live insert/update path (2026-07-07 deferral-ledger
+row) — so duplicate keys routinely surface as separate, TID-unordered plain
+line pointers.
+
+Discovered via the M-NIGHTLY `pgbench/nightly` reopen
+(AI-20260708-064334-001, `.ralph/deferral_ledger.md` 2026-07-08 row):
+`bt_index_check(..., true)` on `pgbench_branches_pkey` (50 rows) reported
+"item order invariant violated" on ~40 blocks — physically impossible for
+that table's real size — which redirected the investigation from the btree
+engine to the checker itself. A throwaway probe dumping the flagged leaf
+block found 331 items sharing one key (`bid=1`, hammered by non-HOT `UPDATE`
+churn with no autovacuum in the test window) with heap TIDs in genuinely
+random order, not ascending.
+
+A first fix attempt matched upstream's model exactly — added
+`btree.PageItemKeyTIDs`/`CompareItemPointers` and broke ties by TID range —
+but re-verifying against the *same* on-disk data still reported violations,
+which is what proved the TIDs really are unordered in this engine (not just
+under-tested) and that the TID-tiebreak model was the wrong invariant for
+goopg's design. The correct fix is simpler: relax to non-decreasing keys only
+(`cmp > 0` is the sole violation), which is exactly upstream's own fallback
+for **non**-heapkeyspace / pre-v4 indexes (`invariant_leq_offset`) — goopg's
+comparator has always behaved like a non-heapkeyspace index in this respect,
+it was just never modeled that way in the checker. The TID-tiebreak helpers
+were reverted as dead code once the simpler fix landed.
+
+Post-fix, `pgbench_branches_pkey`/`pgbench_tellers_pkey` verify clean against
+the same captured (previously false-flagged) data. `pgbench_accounts_pkey`
+still reports a genuine, much more targeted "high key invariant violated" on
+2 of ~10000+ blocks — an unrelated, apparently real bug (a downlink
+exceeding its own internal page's high key, consistent with a split
+misrouting a downlink to the wrong sibling) left open in
+`.ralph/fix_plan.md`'s `pgbench/nightly-reopen-20260708` task for a
+dedicated follow-up loop.
 
 ## B-tree item-count ceiling tier (`VerifyBtreePage`, added loop #57)
 

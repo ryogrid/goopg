@@ -643,6 +643,89 @@ every clean, green (build + pre-commit) checkpoint.
       `resume point`/`why` text content was altered, only the leading
       `status` cell.
 
+- [ ] pgbench/nightly-reopen-20260708 — REOPENED (subject `pgbench/nightly`
+      recurred; the 2026-07-06 task above is checked but the fix apparently
+      didn't fully hold): `btree: empty internal page (blk=8782 rel=
+      {DBOid:5 RelOid:16412 Fork:0})` (AI-20260708-064334-001; repro:
+      `REPO_ROOT=$PWD RUN_DIR=$(mktemp -d) bash ci/batch/stages/stage-pgbench.sh`
+      s=50 c=100 j=20 T=180; evidence: `ci/logs/20260708-064334/pgbench/
+      pgbench.log`). Same symptom class as the "empty internal page" thread
+      (updates #7-#11 above, fixed via the `evictVictim` bufmap.Delete-
+      before-flush race, commit `510615b4`) — but that fix landed BEFORE
+      2026-07-07 update #8's `flushBatch` stale-tag fix (`8ebb71cd`), and
+      this is the first nightly run since both landed. Per rule 3, re-run
+      the repro at HEAD before assuming regression.
+      2026-07-08 update (1st loop on the reopen; see today's deferral ledger
+      row): re-ran the cheap repro at HEAD (`pgbench -i -s 50` once, then
+      `pgbench -c 100 -j 20 -T 25 -P 5` twice) — 0 failed transactions both
+      times (does NOT reproduce the original runtime "empty internal page"
+      abort in this shorter window), but a POST-RUN `bt_index_check(...,
+      true)` on all 3 pkey indexes reported "item order invariant violated"
+      on nearly every block, including `pgbench_branches_pkey` (only 50
+      rows) flagging ~40 blocks — a physically impossible corruption
+      footprint for that table's real size, which redirected the
+      investigation to the CHECKER itself rather than the btree. **Found and
+      FIXED a real bug, but in `internal/amcheck`, not `internal/access/
+      btree`**: `VerifyBtreeItemOrder` required strictly-ascending adjacent
+      keys (`cmp >= 0` violation), but goopg's `btree.CompareKeys` (the only
+      comparator the engine's own descent/insert/split code uses) has no
+      heap-TID tiebreak anywhere, so goopg's btree never guarantees any
+      particular order among same-key duplicates — confirmed empirically via
+      a throwaway probe (`zz_probe_test.go`, reverted) dumping block 1 of
+      `pgbench_branches_pkey`: 331 leaf items all sharing key=1 (bid=1,
+      hammered by non-HOT UPDATE churn — no autovacuum in the test window)
+      with their heap TIDs in genuinely random order, not ascending. First
+      attempted a (key,TID)-tiebreak fix matching upstream's heapkeyspace
+      `_bt_compare` model (new `btree.PageItemKeyTIDs`/`CompareItemPointers`)
+      — rebuilt, re-ran `bt_index_check` against the SAME on-disk data, and
+      it STILL flagged violations, which is what proved goopg's TIDs really
+      are unordered (not just under-tested) and the TID-tiebreak model was
+      the wrong invariant for this engine. Replaced it with the correct,
+      simpler fix: relax the check to non-decreasing keys only (`cmp > 0` is
+      the sole violation — equal adjacent keys always allowed), matching
+      upstream's own fallback for non-heapkeyspace/pre-v4 indexes
+      (`invariant_leq_offset`). Reverted the TID-tiebreak helpers (dead code
+      once the simpler fix landed). Updated
+      `TestVerifyBtreeItemOrder_DuplicateKeysViolation` → renamed
+      `..._DuplicateKeysAllowed` (flipped assertion; its old "goopg dedups
+      equal keys into a posting item" premise was itself wrong — dedup only
+      runs from `BulkCreate`, not the live insert/update path, per the
+      2026-07-07 deferral-ledger row) and added
+      `..._DecreaseAfterDuplicateViolation` for the still-real decrease case.
+      Post-fix re-verify against the SAME captured corrupted-per-old-checker
+      data dir: `pgbench_branches_pkey`/`pgbench_tellers_pkey` now CLEAN;
+      `pgbench_accounts_pkey` (RelOid 16412 — the exact relation the
+      original AI-20260708-064334-001 report named) now reports a much more
+      targeted "high key invariant violated" on exactly 2 of ~10000+ blocks
+      (10158, 10162) instead of near-universal — this is very likely a
+      genuine, distinct bug: both are internal (level=1) pages where every
+      item is properly ascending EXCEPT the last, which exceeds the page's
+      own high key (block 10158: last item `803a6aa9` > high key
+      `80397cd3`) — consistent with a downlink misrouted to the wrong
+      sibling during an internal-page split, not the duplicate-key false
+      positive just fixed. Gates: `go build ./...` clean; `go test
+      ./internal/amcheck/... ./internal/access/btree/... ./internal/
+      executor/... ./internal/testport/...
+      -run "TestVerifyBtreeItemOrder|TestPort_.*[Aa]mcheck|TestPort_.*Btree"`
+      PASS; `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh`
+      PASS (0 failed, all 3 workloads); `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33). **Does NOT close this task** — the amcheck false
+      positive is fixed and committed, but the original nightly runtime
+      symptom (pgbench transaction aborting mid-workload on "empty internal
+      page") was never reproduced this loop (25s×2 window too short — the
+      nightly stage uses T=180×3) and the newly-found accounts_pkey
+      high-key violation is unexplained. Next step: (a) reproduce with the
+      full T=180 authoritative window (or the update-#6-style cheap
+      scale=50/c=100/j=20/T=25 loop run several times back-to-back with
+      `bt_index_check` after each) to try to catch the runtime abort
+      directly; (b) instrument `insertIntoBlock`'s internal-page-split path
+      (btree.go:~1420-1660) to catch the exact moment a downlink lands on
+      the wrong side of a split, using the now-confirmed reproducible
+      accounts_pkey high-key-violation symptom as the target (much cheaper
+      to chase than the intermittent runtime abort — this data dir already
+      has 2 known-bad blocks to trace backward from, though the specific
+      data dir was deleted this loop; regenerate via the same recipe).
+
 - [x] race/internal/wal — race suite failed in package
       `github.com/goopg/goopg/internal/wal` (AI-20260707-000712-001; repro:
       `go test -race -timeout 15m ./internal/wal/`; evidence:
