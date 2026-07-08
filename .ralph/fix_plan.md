@@ -2627,23 +2627,37 @@ survey the deferral ledger for a fresh open (`status = -`) row.
       '^(TestPort_IsolationFkPartitioned2|TestPort_IsolationSkipLocked3|TestPort_IsolationDeadlockHard|TestPort_IsolationStats|TestPort_PgDumpConnectionSetup|TestPort_IsolationMultixactNoForget)$'
       ./internal/testport/`.
 
-- [ ] testport/TestE2E_SASLPrepMatchesRealLibpqClient — still fails at HEAD,
-      distinct from the mass build-break above (AI-20260709-010336-001;
-      re-ran individually after `go build ./...` confirmed clean — still
-      reproduces). `postgres/local_install/bin/psql` errors `symbol lookup
-      error: ... undefined symbol: PQsendPipelineSync` (exit=127) instead
-      of running the SASLprep differential check; `ldd
-      postgres/local_install/bin/psql` shows it dynamically linked against
-      the *system* `/lib/x86_64-linux-gnu/libpq.so.5`, not a bundled one —
-      that system libpq predates `PQsendPipelineSync` (libpq pipeline-mode
-      support), an ABI mismatch between the vendored `local_install` psql
-      binary and whichever `libpq.so.5` the dynamic linker resolves first
-      on this host. Needs either an RPATH/static local_install build so
-      `psql` always loads its own matching libpq, or an `LD_LIBRARY_PATH`
-      fix in the test harness that shells out to real `psql`; not
-      attempted here (build/packaging fix, out of scope for this triage
-      pass). repro: `go test -v -run
-      '^TestE2E_SASLPrepMatchesRealLibpqClient$' ./internal/testport/`.
+- [x] testport/TestE2E_SASLPrepMatchesRealLibpqClient — FIXED
+      (AI-20260709-010336-001). Root cause confirmed as diagnosed by the
+      prior triage loop: `postgres/local_install/bin/psql` dynamically
+      resolves `libpq.so.5` via the default linker search path, which finds
+      the *system* `/lib/x86_64-linux-gnu/libpq.so.5` (predates
+      `PQsendPipelineSync`) ahead of the newer bundled one in
+      `postgres/local_install/lib` — a lazily-bound PLT symbol, so it only
+      fails once psql's SCRAM/pipeline codepath actually calls it (why only
+      this one `PSQLWithPassword`-based test hit it while plain-`PSQL`
+      trust-auth tests didn't). Fixed at the harness level rather than
+      rebuilding local_install with an RPATH: added
+      `(*cluster.Cluster).libpqEnv()` (`internal/testutil/cluster/
+      cluster.go`) returning `LD_LIBRARY_PATH=<repoRoot>/postgres/
+      local_install/lib`, wired into all four in-tree-binary call sites —
+      `PSQL`, `PSQLWithPassword`, `PGbench`, `StartPSQL` — via each spec's
+      `Env` (appended after `os.Environ()`, so it's a no-op where a caller
+      already sets `LD_LIBRARY_PATH` itself, e.g. `e2e_pgbench_test.go`'s
+      existing `os.Setenv` workaround: glibc's `getenv` returns the first
+      match, and that one lands earlier in the merged slice). Centralizing
+      here (rather than only patching the SASL test) closes the same latent
+      gap for every other cluster-helper caller instead of requiring each
+      new test to remember the workaround, per the pgbench-reopen triage's
+      own forward-looking note ("every manual pgbench/psql repro recipe...
+      should export that alongside PATH, not just the SASL test itself").
+      Verified: `go build ./...` clean; `go test -v -run
+      '^TestE2E_SASLPrepMatchesRealLibpqClient$' ./internal/testport/`
+      PASS; spot-checked no regression on two other cluster-helper callers
+      (`TestE2E_PgbenchWorkload` PASS, `TestPort_Psql001Basic`/
+      `TestPort_Psql020CancelAdapted` SKIP as before — system has no PATH
+      `psql`, expected/unchanged). `go vet
+      ./internal/testutil/cluster/... ./internal/testport/...` clean.
 
 - [ ] nightly/units-race-co-load-timeout-20260709 — units stage
       (`cmd/goopg`, `internal/amcheck`, `internal/initdb`, `internal/mvcc`)
