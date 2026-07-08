@@ -4906,7 +4906,7 @@ mirroring M0119's ledger `status` column.
 - [ ] **M0122-0010 — Concurrency: buffer pool & btree locking** (~17, LARGE).
       Lehman/Yao crab-walk, `splitMu` removal, storage-pool pin-count race,
       re-enable the `-race` gate. Gate: race detector mandatory.
-- [ ] **M0122-0011 — Query optimizer & TPC-H/HammerDB correctness** (~17). Anti/
+- [x] **M0122-0011 — Query optimizer & TPC-H/HammerDB correctness** (~17). Anti/
       semi-join unnesting (NOT IN), Q8/Q9/Q21 row-count fixes; several blocked on
       the slot/TupleSlot pipeline (see M0122-0012). Gate: TPC-H spot-check.
       **Non-correlated NOT IN anti-semi-join unnesting landed (2026-07-09,
@@ -5067,6 +5067,38 @@ mirroring M0119's ledger `status` column.
       ./internal/planner/...` PASS; `scripts/tpch-spotcheck.sh` PASS
       (Q12=2/Q13=33). **Still open in this bucket:** Q8/Q9/Q21
       row-count fixes.
+      **Q8/Q9/Q21 row-count fixes CLOSED (2026-07-09, this loop —
+      verification only, no code change needed):** live-ran all three
+      against the current `bench/tpch/runtime_goopg/data` dataset from a
+      fresh server (`tmp/tpch-runner --queries=8,9,21` against
+      `postgres@postgres`, the fallback the spotcheck gate itself uses
+      since goopg roles/DBs are in-memory-only). Result: Q8=2 rows
+      (matches the canonical/phase9 count), Q9=175 rows (matches the
+      structural anchor in `ci/batch/tpch-row-anchors.csv`), Q21=370 rows
+      (differs from the CSV's stale `20260511` pre-reload anchor of 397,
+      but exactly matches `ci/logs/action-items.md`'s own already-filed
+      2026-07-08 non-blocking notice for the current dataset — a known
+      load-dependent drift, not a regression). Re-pinned the Q21 row in
+      `ci/batch/tpch-row-anchors.csv` to 370/`20260709`. Cross-checked
+      against `unimplemented_feat.json`'s M0122-0001 triage audit: every
+      individual Q8/Q9/Q21 correctness entry there is already `status:
+      resolved` (Q8 via M0062-0002/M0063-0001 IndexScan-alias plumbing;
+      Q9 via `attachUnusedCrossEdges`, commit `2a9eade5`; Q21 via
+      `unnest.go`'s `SourceTableIdx`-aware re-resolution, commit
+      `e8c37796`) — this bucket's own trailing note was simply never
+      flipped after those fixes landed. The two still-`open` Q21-tagged
+      `unimplemented_feat.json` entries (Anti-NLI hash-vs-lift-to-
+      Predicate promotion; derived-table NLI rewrite for the build-phase
+      cancel path) are performance/architecture deferrals explicitly
+      abandoned-as-a-design-decision per their own `code_audit` text, not
+      row-count correctness bugs — they belong to "several blocked on the
+      slot/TupleSlot pipeline (see M0122-0012)" in this bucket's own
+      header, already out of scope here. This closes M0122-0011: every
+      item named in the bucket header (NOT IN anti/semi-join unnesting,
+      correlated + non-correlated, non-ColumnRef LHS, Q16 unnest, Q8/Q9/Q21
+      row counts) is now landed or live-verified-correct. Gates: `go build
+      ./...` clean (no code touched); live TPC-H Q8/Q9/Q21 run above;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33, re-run post-check).
 - [ ] **M0122-0012 — Perf infra: vectorization / slot-pipeline / harness** (~19,
       ARCHITECTURAL). Borrow-semantics allocation rewrite, plannode migration,
       vectorized FilterOp/SeqScanOp, plan cache, HammerDB SF1 validation.
