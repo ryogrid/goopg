@@ -1179,6 +1179,86 @@ every clean, green (build + pre-commit) checkpoint.
       or wait on any in-flight flush for the same tag before publishing),
       then un-skip TestVerifyBtreeEngineSilentOnRealConcurrentContended to
       confirm the fix closes this task.
+      2026-07-08 update (13th loop, same day; see today's 13th deferral
+      ledger row): attempted the 12th loop's exact next step (land the
+      synchronization fix) but, before writing any code, did a from-scratch
+      hand-trace of the ENTIRE claimVictim/evictVictim/pinLoad/pinSlow/Pin/
+      bufmap/relFile/pinW/MarkDirty/Unpin protocol (not reusing prior
+      loops' instrumentation) specifically hunting for the "two slots hold
+      the same tag" or "reload publishes without waiting on an in-flight
+      flush" gap the 12th loop's next-step named. Could NOT construct such
+      a window: bufmap.Insert always fails if the tag is already present;
+      evictVictim's bm.Delete(oldTag) runs strictly after flushSlot's
+      WriteBlock returns, still under pinMu; any concurrent Pin(oldTag)
+      during the flush correctly detects stateIO=true and waits on the
+      per-slot semaphore, only re-attempting a fresh disk read AFTER the
+      delete is visible (itself strictly after the flush completed, by
+      pinMu ordering) — so a woken waiter's own reload cannot observe
+      pre-flush bytes by this mechanism. Also checked and ruled out:
+      Unpin double-decrement (panics immediately on underflow — would
+      crash the test, not silently corrupt); torn writes during the
+      checkpointer's flushBatch (bt.pinW takes s.Lock()==contentMu.Lock()
+      exclusively for every page mutation, which properly excludes
+      flushBatch's contentMu.RLock()). Found ONE genuinely new, previously
+      unaudited gap: storage.Manager.WriteBlockAIO/PrefetchBlock (smgr.go)
+      bypass relFile.mu ENTIRELY when an AIOEngine is attached (the
+      `eng != nil` branch calls `eng.Submit(...)` directly instead of
+      `f.writeBlock`/`f.readBlock`), and internal/aio/aio.go's
+      Engine.Submit provides no per-file/per-offset ordering of its own —
+      confirmed by reading Submit/registerInFlight. This bypass IS wired in
+      production (internal/initdb/open.go:303 `mgr.SetAIO(...)`) and the
+      real checkpointer does call FlushAllPaced/flushBatch periodically,
+      but is NOT reachable by this unit test (buildRealTreeConcurrent never
+      calls SetAIO and never invokes FlushAllPaced during the insert race
+      window — only via Close(), after all writers finish) and, even in
+      the production case, contentMu's RWMutex (flushBatch holds RLock,
+      any eviction/reload needs Lock) still forces an evictor/reloader to
+      wait for flushBatch's real AIO Wait() to return before touching
+      s.page, so no concrete corruption path was found from this bypass
+      either — recorded as its own new fix_plan item below (AIO
+      relFile.mu bypass) rather than conflated with this task, since a
+      correct fix needs its own design (naive per-file serialization would
+      kill cross-block AIO parallelism) and isn't proven to fix THIS bug.
+      Net result this loop: the sync-only-path mechanism the skipped test
+      reproduces still has NO identified code-level defect after 13 loops
+      of combined live-instrumentation + hand-tracing — every invariant
+      constructible from reading the code holds. Gates: go build ./...
+      clean (no code changes landed this loop, investigation-only). Next
+      step: pivot to a DIFFERENT class of check than any tried so far —
+      (a) directly instrument bufmap.Insert/Delete/Lookup themselves (never
+      once traced with per-call logging across 13 loops; every loop so far
+      only inferred bufmap's correctness by reading the code) to verify,
+      for blk=377's exact tag, that bufmap truly holds a SINGLE (tag→slot)
+      mapping at every instant during the loss window, rather than trusting
+      inspection; or (b) audit the 15-bit slot generation counter
+      (`stateGen`/`newGen := (curGen+1)&0x7FFF`) for a CROSS-slot gen
+      collision (two DIFFERENT slots coincidentally sharing the same gen
+      value at the same time), not just the already-ruled-out same-slot
+      wraparound-after-2500-claims case.
+
+- [ ] storage/aio-relfile-mu-bypass — NEW (found as a side-effect of the
+      13th-loop M-NIGHTLY audit above, AI-20260708-064334-001; not itself
+      confirmed to cause any observed data loss, but a genuine
+      code-hygiene/latent-risk gap worth its own task). storage.Manager.
+      WriteBlockAIO and PrefetchBlock (internal/storage/smgr.go) bypass
+      relFile.mu entirely whenever an AIOEngine is attached (`eng != nil`
+      calls `eng.Submit(...)` directly, skipping `f.writeBlock`/
+      `f.readBlock`), and internal/aio/aio.go's Engine.Submit provides no
+      per-file/per-offset ordering of its own (confirmed by reading
+      Submit/registerInFlight — the inflight map is bookkeeping-only, not a
+      serialization point). relFile.mu is treated as the file's sole
+      serialization point everywhere else (readBlock/writeBlock/extend all
+      take it). SetAIO IS wired in production (internal/initdb/open.go:303)
+      so this bypass is live on the real server, not just a theoretical
+      concern. Next step: design (don't rush) a fix that preserves AIO's
+      cross-block parallelism while still serializing any AIO op against a
+      concurrent synchronous read/write to the SAME block of the SAME
+      relFile — e.g. a per-(rel,block) in-flight-AIO registry that
+      readBlock/writeBlock/WriteBlockAIO/PrefetchBlock all consult, rather
+      than a blanket per-file mutex (which would regress checkpointer
+      throughput). Verify with a new targeted concurrency test exercising a
+      real AIOEngine (internal/aio's MethodWorker or MethodSync) alongside
+      concurrent synchronous smgr calls to the same block.
 
 - [x] race/internal/wal — race suite failed in package
       `github.com/goopg/goopg/internal/wal` (AI-20260707-000712-001; repro:

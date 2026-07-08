@@ -1,94 +1,88 @@
 Task: M-NIGHTLY pgbench/nightly-reopen-20260708 (AI-20260708-064334-001) —
-IN PROGRESS, not complete. 12th loop on the reopen. Executed the 11th
-loop's exact next step (wall-clock IO-trace postWrite-regression check)
-and it CONFIRMED, with cross-layer validation, the racing-flush/stale-
-reload mechanism that was left open. Committed as (see `git log -1`
-after this loop's commit).
+IN PROGRESS, not complete. 13th loop on the reopen. Attempted the 12th
+loop's exact next step (land a synchronization fix in claimVictim/
+evictVictim/pinLoad) but did NOT land any source-code change: a
+from-scratch hand-trace of the whole protocol could not reproduce (on
+paper) the gap the 12th loop asked to be fixed, and landing an unverified
+guess into this heavily-audited hot path was judged riskier than another
+investigation-only loop. Filed a genuinely NEW, separate, confirmed
+finding (AIO/relFile.mu bypass) as its own fix_plan task instead of
+conflating it with this one.
 
-Files (all committed): internal/amcheck/verify_nbtree_realtree_test.go
-(new `time` import; extended the existing GOOPG_IO_TRACE wall-clock
-check with a postWrite-regression scan over `priorWrites`, refined
-twice in-loop from a naive "any regression" check — 29 false-positive
-hits, mostly ordinary page splits — to a magnitude-based split/non-split
-classifier (`delta*4 > prev.LPCnt` = presumed split, ignored); skip
-message appended with the 12th-loop finding). .ralph/deferral_ledger.md
-+ .ralph/fix_plan.md (12th-loop rows).
+Files (all committed, docs-only): .ralph/fix_plan.md (13th-loop update
+under the pgbench/nightly-reopen-20260708 task + new unchecked item
+`storage/aio-relfile-mu-bypass`), .ralph/deferral_ledger.md (13th
+2026-07-08 row). No source files modified this loop.
 
-Key symbols for next step: internal/storage/bufpool.go's claimVictim
-(~1068, pin-count exclusion — cleared), evictVictim (~1527-1557, dirty
-flush + bufmap-delete-before-flush, already fixed once for a DIFFERENT
-symptom in commit 510615b4) and pinLoad (~1561-1572, the reload's own
-direct s.contentMu.Lock()/Unlock() hold around ReadBlock — proven in the
-11th loop to be a SEPARATE mutation site from bt.pinW/unpinW). The
-confirmed gap is a missing exclusion between a slot's flush becoming
-durable and a (possibly different-slot) concurrent reload of the SAME
-tag being allowed to publish stale bytes.
+Key symbols audited this loop (all read, none edited): storage.bufmap's
+Insert/Delete/Lookup/compact (bufmap.go) — correctly serialize tag
+ownership under bufmap.mu, ruled out as a double-mapping source by
+inspection (not yet by live tracing — see Next step). storage.Pool's
+claimVictim/evictVictim/pinLoad/pinSlow/Pin (bufpool.go ~1055-1595) —
+hand-traced every interleaving I could construct; the per-slot IO-inflight
+bit + semaphore-wait + bufmap-delete-after-flush protocol appears to
+correctly prevent a reload from observing pre-flush bytes in the
+SYNC-ONLY path (no checkpointer/AIO). bt.pinW/unpinW (btree.go ~1492) —
+confirmed `s.Lock()`/`s.Unlock()` ARE `contentMu.Lock/Unlock`
+(bufpool.go:87-88), so writer mutations are properly excluded from the
+checkpointer's flushBatch (contentMu.RLock) by Go's RWMutex semantics —
+ruled out "torn write during checkpointer flush". Pool.Unpin (bufpool.go
+~1651) panics on underflow — ruled out silent double-unpin corruption
+(would crash instead). storage.Manager.WriteBlockAIO/PrefetchBlock
+(smgr.go ~183-273) — NEW FINDING: bypass relFile.mu entirely when
+`m.aio != nil` (calls `eng.Submit(...)` directly, skipping
+`f.writeBlock`/`f.readBlock`); internal/aio/aio.go's Engine.Submit
+(~459-471) has no per-file/per-offset ordering (registerInFlight is
+stats-only). This IS wired in production (internal/initdb/open.go:303
+`mgr.SetAIO(...)`) but NOT in this unit test's pool (buildRealTreeConcurrent
+never calls SetAIO, never invokes FlushAllPaced during the race window) —
+so it cannot explain THIS test's reproducible loss, and even in
+production, contentMu's RWMutex still forces any evictor/reloader to wait
+for flushBatch's real Wait() before touching page bytes, so no concrete
+corruption path was found from it either, in the time available.
 
-Hypothesis/Findings: CONFIRMED, cross-validated at both the contentMu
-(in-memory, 11th loop) and IO-trace (smgr/syscall, this loop) layers:
-hypothesis (b) variant 2 — a cache-miss reload racing a legitimate flush
-of the SAME block loads a STALE on-disk copy into the slot, silently
-discarding the concurrently-flushed correct in-memory content; a
-subsequent write on top of the now-stale slot then durably re-flushes
-the loss. Concrete evidence this loop (fresh repro, missing entry
-key=33666 TID={1,2883} at blk=377): reload-snapshot itemCount=399
-(entry absent, stale) lands BETWEEN a correct flush-snapshot
-(itemCount=401, entry present, seq=908124) and the next contentMu-hold;
-the smgr IO tracer shows that correct flush as postWrite lpCnt=401 at
-t=43.393270170s, followed just 1.9ms later by postWrite lpCnt=400
-(=399 stale + 1 later insert on top of the stale reload) that clobbers
-the correct disk copy. IMPORTANT tooling note for future loops: a naive
-"any postWrite regression" check on this workload is mostly NOISE —
-27/29 raw hits this loop were ordinary page splits (goopg splits by
-BYTE SIZE not item count, so the surviving fraction is ~50.7%-53.8%, not
-exactly half — a "half+2" cutoff still misclassifies them). Use a
-magnitude cutoff (>25% drop = split) to isolate the real signal. Do NOT
-re-open: claimVictim's pin-count exclusion, fast-path insert sites,
-split/dedup-rewrite path, clean-eviction path, relFile.readBlock/
-writeBlock's own r.mu serialization, or whether pinW/unpinW is the sole
-contentMu choke point (it is NOT, per the 11th loop) — all conclusively
-settled across 12 loops.
+Hypothesis/Findings: after 13 loops (12 via live instrumentation, this one
+via pure hand-trace of the code), NO concrete code-level defect has been
+identified in the sync-only claimVictim/evictVictim/pinLoad/bufmap/
+relFile/contentMu/pinMu protocol that the skipped test exercises — every
+invariant I could construct holds. This is a genuinely surprising/notable
+result: it means the bug may NOT be a simple lock-ordering gap in the
+mechanisms every prior loop has focused on. Do NOT re-open (all
+conclusively settled across 13 loops now): claimVictim's pin-count
+exclusion, fast-path insert sites, split/dedup-rewrite path, clean-eviction
+path, relFile.readBlock/writeBlock's own r.mu serialization, pinW/unpinW
+vs pinLoad as separate contentMu choke points, Unpin double-decrement,
+torn writes during checkpointer flush. Two NEW, not-yet-tried angles this
+loop identified but did not execute (time-boxed out): (a) bufmap has NEVER
+been directly instrumented with per-call Insert/Delete/Lookup logging in
+13 loops — every loop, including this one, only inferred its correctness
+by reading the code; (b) the 15-bit slot generation counter's wraparound
+was checked historically only for same-slot reuse frequency (~2500 claims
+per slot, far below the 32768 wrap threshold), never for a CROSS-slot gen
+COLLISION (two different slots coincidentally holding the same gen value
+at the same time, which could let a stale tryPinSlot/CAS succeed against
+the wrong slot).
 
-Next step: this is now a CONFIRM-COMPLETE, FIX-PENDING investigation —
-stop instrumenting and land the actual synchronization fix in
-storage.Pool's claimVictim/evictVictim/pinLoad (bufpool.go ~1527-1572).
-Audit specifically: (1) can pinLoad's ReadBlock be in flight (or already
-have returned, pending publish into the slot) for a tag WHILE a
-different call is evictVictim-flushing a dirty slot for that SAME tag,
-without any lock ordering that would serialize them? (2) can two
-distinct slots transiently both claim the same tag during a flush-then-
-reload handoff (the 9th loop already observed 3 different physical slot
-indices serve one block's tag in a single run — re-examine that finding
-now that the exact race is understood)? The likely fix shape: pinLoad
-must re-validate (or block on) any in-flight/just-completed flush for
-its target tag before publishing its ReadBlock result into the slot —
-e.g. a per-tag flush-in-progress marker checked/waited-on inside
-pinLoad's critical section, or extending the existing per-slot
-contentMu hold to cover a tag-level check. After landing a candidate
-fix, un-skip TestVerifyBtreeEngineSilentOnRealConcurrentContended (line
-~762, `t.Skip(...)` in internal/amcheck/verify_nbtree_realtree_test.go)
-and re-run it (foreground, several times for flake margin given this bug
-is intermittent/timing-dependent) to confirm zero missing entries before
-re-adding the skip and closing this task's checkbox in fix_plan.md.
+Next step: pick ONE of the two next-step candidates above and execute it
+directly (do not re-derive the whole investigation from scratch — this
+working_set + the 13th deferral-ledger row already contain the full
+ruled-out list): (a) add direct Insert/Delete/Lookup call logging to
+bufmap.go (new debug hook, same zero-cost-when-off pattern as every prior
+DebugTrace*/DebugValidate* aid in this thread) and re-run the repro to
+verify blk=377's tag truly never has 2 live mappings simultaneously; or
+(b) instrument claimVictim's gen assignment and tryPinSlot's gen check to
+log every (slotIdx, gen) pair assigned/checked and scan for a collision
+across DIFFERENT slot indices sharing the same gen concurrently. Separately
+(independent task, not this loop's priority): the new
+`storage/aio-relfile-mu-bypass` fix_plan item needs its own design pass
+(per-(rel,block) in-flight-AIO registry, not a blanket per-file mutex) —
+pick that up as its own unit of work, not mid-stream inside the M-NIGHTLY
+investigation.
 
-Gates run this loop (all PASS): go build ./... clean; go vet
-./internal/amcheck/... ./internal/storage/... ./internal/access/btree/...
-clean; go test ./internal/storage/... ./internal/access/btree/...
-./internal/amcheck/... PASS (target test re-skipped, confirmed both
-skip-restore and its own short-circuit correctness); un-skipped manual
-runs (temporary in-session edit, reverted before commit) reproduced and
-confirmed the finding above 3 times across 4 GOOPG_IO_TRACE=1 runs;
-scripts/tpch-spotcheck.sh PASS (Q12=2/Q13=33); pre-commit hook's
-CI-parity pgbench smoke PASS (ran automatically on `git commit`); make
-ralph-state-guard OK.
+Gates run this loop: go build ./... clean (no code changed, docs-only
+commit). No test run needed (no code change to verify); the skipped test
+remains skipped and unmodified in behavior.
 
 In-flight: none. No background processes left running. All work from
-this loop is committed. IMPORTANT process note: this loop discovered
-that the test's `t.Skip(...)` at line ~762 is UNCONDITIONAL (not gated
-by `testing.Short()`) — the actual repro body only runs when that line
-is temporarily neutralized (wrap in `if false { ... }`, run, then
-restore verbatim — do NOT `git checkout --` the file to revert, since
-that discards ALL uncommitted edits in the file, not just the skip
-toggle; this loop lost and had to redo its diagnostic-code edit that
-way once). Any future loop touching this test must reproduce the same
-temporary-unskip / restore-before-commit dance.
+this loop (fix_plan.md + deferral_ledger.md updates) is about to be
+committed.
