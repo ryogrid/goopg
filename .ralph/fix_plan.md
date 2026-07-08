@@ -2590,6 +2590,111 @@ is. Next candidate: the view's-own-ACL gap from M0122-0008 (materially
 larger), resume the M0110-0001 multi-database isolation survey above, or
 survey the deferral ledger for a fresh open (`status = -`) row.
 
+- [x] testport/mass-build-break-20260709 — stale, re-ran at HEAD, passes
+      (AI-20260709-010336-002 through -081, i.e. every nightly-run
+      20260709-010336 `testport/TestPort_Isolation*`, `TestPort_PgAmcheck*`,
+      `TestPort_PgBasebackup*`, `TestPort_PgDump*`, `TestPort_PgDumpall*`,
+      `TestPort_PgReceivewal020`, `TestPort_PgoutputInterop*` regression
+      except -001 and -082, 80 items). All 80 were collateral from a single
+      transient build break, not real product bugs. 79 of the 80 failed
+      with the identical `isolation_port_test.go:NNNN: init failed: #
+      github.com/goopg/goopg/internal/executor` /
+      `operators_window.go:314/333/363/572: too many arguments in call to
+      o.frameBounds` compile error (these tests fork-build a real `goopg`
+      server binary at test-init time); the 80th
+      (`TestPort_IsolationMultixactNoForget`, AI-...-023) failed with a
+      plain `start timeout after 20s` — same collateral window, one test
+      earlier in the run queue. Root cause: the nightly batch (sha
+      `b9a1e1fb5366`) built/ran `go test ./internal/testport/...` directly
+      against the live working tree during 01:03-03:37, which overlapped
+      the M0122-0004 GROUPS-window-frame-mode work landing that same
+      morning (`4ac7ba47`, an ancestor of current HEAD `26677eb3`) —
+      `operators_window.go`'s `frameBounds` call sites were transiently
+      inconsistent (some call sites already passing the new `[]int` param,
+      some not yet) while that stage's build ran. `go build ./...` is clean
+      at current HEAD; live-re-ran 6 of the 80 individually
+      (`TestPort_IsolationFkPartitioned2`, `TestPort_IsolationSkipLocked3`,
+      `TestPort_IsolationDeadlockHard`, `TestPort_IsolationStats`,
+      `TestPort_PgDumpConnectionSetup`, `TestPort_IsolationMultixactNoForget`)
+      — all 6 PASS at HEAD, confirming staleness; no product fix needed.
+      Standing hazard worth a future loop: the nightly batch tests the live
+      working tree rather than a pinned snapshot/worktree, so a same-day
+      concurrent Ralph commit mid-multi-file-edit can transiently break a
+      whole stage and manufacture dozens of spurious "regressions" — see
+      also the units/race co-load timeout item below for a second, distinct
+      way shared-host nightly runs produce noisy mass failures. repro (any
+      subset): `go build ./... && go test -v -run
+      '^(TestPort_IsolationFkPartitioned2|TestPort_IsolationSkipLocked3|TestPort_IsolationDeadlockHard|TestPort_IsolationStats|TestPort_PgDumpConnectionSetup|TestPort_IsolationMultixactNoForget)$'
+      ./internal/testport/`.
+
+- [ ] testport/TestE2E_SASLPrepMatchesRealLibpqClient — still fails at HEAD,
+      distinct from the mass build-break above (AI-20260709-010336-001;
+      re-ran individually after `go build ./...` confirmed clean — still
+      reproduces). `postgres/local_install/bin/psql` errors `symbol lookup
+      error: ... undefined symbol: PQsendPipelineSync` (exit=127) instead
+      of running the SASLprep differential check; `ldd
+      postgres/local_install/bin/psql` shows it dynamically linked against
+      the *system* `/lib/x86_64-linux-gnu/libpq.so.5`, not a bundled one —
+      that system libpq predates `PQsendPipelineSync` (libpq pipeline-mode
+      support), an ABI mismatch between the vendored `local_install` psql
+      binary and whichever `libpq.so.5` the dynamic linker resolves first
+      on this host. Needs either an RPATH/static local_install build so
+      `psql` always loads its own matching libpq, or an `LD_LIBRARY_PATH`
+      fix in the test harness that shells out to real `psql`; not
+      attempted here (build/packaging fix, out of scope for this triage
+      pass). repro: `go test -v -run
+      '^TestE2E_SASLPrepMatchesRealLibpqClient$' ./internal/testport/`.
+
+- [ ] nightly/units-race-co-load-timeout-20260709 — units stage
+      (`cmd/goopg`, `internal/amcheck`, `internal/initdb`, `internal/mvcc`)
+      and race stage (`cmd/goopg`, `internal/access/btree`,
+      `internal/amcheck`, `internal/executor`) each had one package per
+      stage SIGQUIT-killed by go test's own `-timeout` after 33-53 real
+      minutes (`*** Test killed with quit: ran too long`); no AI-id (the
+      82-item action-items.md regression list only covers testport/pgbench,
+      units/race stage failures are surfaced separately under the run's
+      "Resource kills" section of `ci/logs/20260709-010336/summary.md`).
+      Ruled out: cgroup OOM kill (`~/.ralph/logs/mem_guard.log` has zero
+      lines in the 2026-07-09T01:00-04:30 window — no PRESSURE/SIGKILL
+      entry at all that night) and a build break (the hung packages
+      compiled fine; other tests inside the same package/binary passed,
+      e.g. units' `internal/executor` package itself reported `ok
+      ... 157.359s`). `cmd/goopg`'s units-stage hang left off at
+      `TestStandbyControllerPromoteDrainsPendingReplay`'s init log line
+      with no further output for 33m; the race-stage `internal/executor`
+      hang's goroutine dump shows `TestExecutorDeadlockThreeSession` /
+      `TestUpsertOnConflictDoUpdateWaitsOnForeignConflictingLock` genuinely
+      parked in `lockmgr.(*LockManager).acquire` /
+      `mvcc.(*Manager).WaitForXID` for 53m (real waits, not a spin/panic).
+      This is a repeat of the previously-noted "initdb 10m-timeout under
+      co-load" pattern (nightly-batch memory topic), now up to ~53m and
+      spread across 4 packages per stage — plausibly because
+      units+race+testport+pgbench+tpch all run concurrently on one host
+      (each stage itself also running `p=4` parallel packages), so
+      CPU/fsync contention under that combined load can push a normally-
+      fast lock wait or `initdb` cycle past the per-package timeout. Not
+      reproduced in isolation in this triage pass (each repro is 30-50m
+      real time and the point is to test WITHOUT co-load, i.e. standalone,
+      which the automated batch doesn't do) — needs a future loop to
+      re-run e.g. `TestExecutorDeadlockThreeSession` and
+      `TestStandbyControllerPromoteDrainsPendingReplay` standalone (no
+      other nightly stage running concurrently) to confirm this is
+      infra/scheduling noise rather than a genuine new deadlock. repro
+      (representative, run alone, no co-load): `go test -race -timeout 60m
+      -run '^TestExecutorDeadlockThreeSession$' ./internal/executor/`.
+
+- [ ] pgbench/nightly-reopen-20260709 — REOPENED a third time (subject
+      `pgbench/nightly`; both prior tasks above are checked/closed but the
+      fix apparently didn't fully hold): `btree: empty internal page
+      (blk=1554 rel={DBOid:5 RelOid:16412 Fork:0})` (AI-20260709-010336-082;
+      repro: `REPO_ROOT=$PWD RUN_DIR=$(mktemp -d) bash
+      ci/batch/stages/stage-pgbench.sh` s=50 c=100 j=20 T=180; evidence:
+      `ci/logs/20260709-010336/pgbench/pgbench.log`). Same symptom class as
+      the 2026-07-08 reopen (`blk=8782`) — per rule 3, re-run the repro at
+      HEAD before assuming this is a fresh regression of the same root
+      cause; not re-run in this triage pass (pgbench repro takes several
+      minutes of `-i -s 50` load plus the `-c 100 -j 20 -T 180` run).
+
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 
 M0117 (CLOG ↔ PostgreSQL subsystem alignment), M0118 (Upstream Isolation Spec
