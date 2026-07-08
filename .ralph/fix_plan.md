@@ -1297,7 +1297,7 @@ every clean, green (build + pre-commit) checkpoint.
       landed, not a partial/deferred one). The unrelated `storage/
       aio-relfile-mu-bypass` item below remains open as its own task.
 
-- [ ] storage/aio-relfile-mu-bypass — NEW (found as a side-effect of the
+- [x] storage/aio-relfile-mu-bypass — NEW (found as a side-effect of the
       13th-loop M-NIGHTLY audit above, AI-20260708-064334-001; not itself
       confirmed to cause any observed data loss, but a genuine
       code-hygiene/latent-risk gap worth its own task). storage.Manager.
@@ -1365,7 +1365,7 @@ every clean, green (build + pre-commit) checkpoint.
       docs/design/0009-0006-aio-io-uring.md (new "Checksum bypass (fixed)
       and the still-open per-block ordering gap" section) +
       docs/design/README.md's 0009-0006 row.
-      **What remains open** (this task stays unchecked): the ORIGINAL
+      **What remained open** at the end of that loop: the ORIGINAL
       per-(rel,block) same-tag ordering concern this item was filed for —
       a concurrent synchronous readBlock/writeBlock/extend (or another
       io_uring op) on the SAME block of the SAME relFile is still not
@@ -1383,6 +1383,70 @@ every clean, green (build + pre-commit) checkpoint.
       the per-(rel,block) in-flight-AIO registry design described above,
       consulted by readBlock/writeBlock/WriteBlockAIO/PrefetchBlock
       instead of a blanket per-file mutex.
+      2026-07-08 update (15th loop, continuation — CLOSES this task):
+      implemented the per-(rel,block) in-flight-AIO registry.
+      `relFile.lockBlock` (internal/storage/smgr.go) is a
+      `map[BlockNumber]chan struct{}` guarded by a dedicated `blockMu`
+      (kept separate from `relFile.mu` so registering/releasing a block
+      never collapses cross-block AIO parallelism into a whole-file
+      lock): `lockBlock(blk)` blocks until no entry exists for `blk`,
+      registers one, and returns a release func. `readBlock`/`writeBlock`
+      hold it for their whole body; `extend`/`extendBatch` need no
+      change — they only ever touch brand-new blocks past the current
+      `nblocks`, and `WriteBlockAIO` already rejects `blk >= nblocks`, so
+      no AIO op can ever be in flight against a block that doesn't exist
+      yet. `Manager.PrefetchBlock`/`WriteBlockAIO` acquire the latch
+      before `eng.Submit` (only on the AIO-attached branch — the
+      eng==nil fallback calls `readBlock`/`writeBlock` directly, which
+      already latch internally, so no double-acquisition) and release it
+      via a new `AIOSubmitOp.OnComplete func()` field, wired through
+      `aioEngineAdapter.Submit` (internal/initdb/open.go) to
+      `aio.Op.Callback`. Callback is the right hook because
+      `Engine.finishHandle` calls it identically from all three methods
+      (sync/worker/io_uring) at the moment the I/O *actually* completes —
+      independent of whether/when the caller invokes the returned
+      handle's `Wait` — confirmed by reading `finishHandle`
+      (internal/aio/aio.go) and `completeOne` (method_iouring_linux.go).
+      Releasing at real completion rather than at `Wait` time is what
+      makes the latch correct rather than merely advisory: a caller that
+      submits and defers `Wait` would otherwise let a synchronous
+      same-block access race the still-in-flight I/O. Updated the
+      existing `recordingAIOEngine` test fake
+      (internal/storage/storage_test.go) to call `OnComplete` (it
+      completes inline; without this, PrefetchBlock/WriteBlockAIO's new
+      latch would never release, deadlocking any existing test touching
+      the same block twice) — audited all 6 of its call sites, no test
+      relied on the old no-callback behavior. New test:
+      `TestBlockLatchSerializesAIOAgainstSync`
+      (internal/storage/storage_test.go) uses a `gatedAIOEngine` test
+      double that performs the AIO write's real I/O immediately but
+      defers its `OnComplete` call until the test closes a channel, so
+      the assertions are deterministic (no reliance on a race actually
+      manifesting): a concurrent synchronous `WriteBlock` to the SAME
+      block blocks until `OnComplete` fires, while a `WriteBlock` to a
+      DIFFERENT block completes immediately throughout (proving the latch
+      is per-block, not a regression to a blanket per-file lock).
+      Verified non-vacuous: temporarily stubbed `lockBlock` to a no-op —
+      test failed with the expected "returned before the in-flight AIO op
+      completed" message; restored, re-ran clean including
+      `go test -race`. Considered but rejected a real-io_uring-based
+      timing test instead: Linux's buffered-I/O page-cache locking
+      (i_rwsem) likely already prevents byte-level tearing between two
+      concurrent pwrite/pread syscalls on the same regular file
+      regardless of this fix, which would make a content-tearing-based
+      test pass even with the fix reverted (non-discriminating); the
+      gated-fake approach directly exercises the actual serialization
+      contract instead. Gates: `go build ./...` / `go vet ./...` clean;
+      `go test ./internal/storage/... ./internal/aio/... ./internal/initdb/...`
+      PASS; `go test -race ./internal/storage/... ./internal/aio/...`
+      PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS
+      (0 failed txns, all 3 workloads). Design doc updated:
+      docs/design/0009-0006-aio-io-uring.md (section retitled, "Still
+      open" replaced with the fix description + test) and
+      docs/design/README.md's 0009-0006 row. No deferral-ledger row
+      needed — a complete fix with a permanent regression guard landed,
+      closing every part of this task's original scope.
 
 - [x] race/internal/wal — race suite failed in package
       `github.com/goopg/goopg/internal/wal` (AI-20260707-000712-001; repro:

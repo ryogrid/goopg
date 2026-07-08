@@ -45,6 +45,17 @@ type AIOSubmitOp struct {
 	// path) the engine surfaces through pg_aios.target_desc.
 	// Empty leaves the column blank.
 	Target string
+	// OnComplete, if set, is called exactly once when this op's
+	// I/O actually finishes — on the engine's completion path,
+	// independent of whether/when the caller invokes the
+	// returned AIOHandle's Wait. Manager.PrefetchBlock and
+	// Manager.WriteBlockAIO set this to release the per-(rel,
+	// block) latch relFile.lockBlock acquired before Submit, so
+	// a concurrent synchronous readBlock/writeBlock (or another
+	// AIO op) on the SAME block waits for the real completion,
+	// not just until the caller gets around to Wait. See
+	// docs/design/0009-0006-aio-io-uring.md.
+	OnComplete func()
 }
 
 // AIODirection mirrors aio.Direction without taking the import.
@@ -201,7 +212,8 @@ func (m *Manager) PrefetchBlock(rel RelFileNode, blk BlockNumber, buf []byte) (A
 		// Synchronous fallback: run the read inline and hand
 		// back a pre-completed handle. Keeps callers'
 		// Submit/Wait code path identical regardless of
-		// whether the engine is attached.
+		// whether the engine is attached. readBlock takes its
+		// own per-block latch, so no explicit lockBlock here.
 		err := f.readBlock(blk, buf)
 		var n int
 		if err == nil {
@@ -209,11 +221,19 @@ func (m *Manager) PrefetchBlock(rel RelFileNode, blk BlockNumber, buf []byte) (A
 		}
 		return preCompletedHandle{n: n, err: err}, nil
 	}
+	// The AIO engine's raw-fd path (methodIOUring) bypasses
+	// f.mu entirely, so lockBlock is this op's ONLY
+	// serialization against a concurrent synchronous
+	// readBlock/writeBlock or another AIO op on the same block.
+	// Released by OnComplete when the read actually finishes —
+	// not merely when the caller gets around to Wait.
+	unlock := f.lockBlock(blk)
 	return eng.Submit(AIOSubmitOp{
-		File:   f,
-		Buffer: buf,
-		Offset: off,
-		Target: f.path,
+		File:       f,
+		Buffer:     buf,
+		Offset:     off,
+		Target:     f.path,
+		OnComplete: unlock,
 	}), nil
 }
 
@@ -257,6 +277,8 @@ func (m *Manager) WriteBlockAIO(rel RelFileNode, blk BlockNumber, buf []byte) (A
 	eng := m.aio
 	m.mu.Unlock()
 	if eng == nil {
+		// writeBlock takes its own per-block latch, so no
+		// explicit lockBlock here.
 		err := f.writeBlock(blk, buf)
 		var n int
 		if err == nil {
@@ -264,12 +286,18 @@ func (m *Manager) WriteBlockAIO(rel RelFileNode, blk BlockNumber, buf []byte) (A
 		}
 		return preCompletedHandle{n: n, err: err}, nil
 	}
+	// See PrefetchBlock's comment: lockBlock is this op's ONLY
+	// serialization against a concurrent synchronous access or
+	// another AIO op on the same block, since the engine's
+	// raw-fd path bypasses f.mu entirely.
+	unlock := f.lockBlock(blk)
 	return eng.Submit(AIOSubmitOp{
-		File:      f,
-		Buffer:    buf,
-		Offset:    off,
-		Direction: AIODirWrite,
-		Target:    f.path,
+		File:       f,
+		Buffer:     buf,
+		Offset:     off,
+		Direction:  AIODirWrite,
+		Target:     f.path,
+		OnComplete: unlock,
 	}), nil
 }
 
@@ -635,6 +663,51 @@ type relFile struct {
 	checksums      bool
 	ignoreChecksum bool
 	onChecksumFail func(rel RelFileNode, blk BlockNumber)
+
+	// blockMu guards blockBusy, the per-(rel,block) in-flight
+	// registry that serializes an AIO op (which bypasses mu
+	// entirely on methodIOUring's raw-fd path — see
+	// docs/design/0009-0006-aio-io-uring.md) against a
+	// concurrent synchronous readBlock/writeBlock, or another
+	// AIO op, on the SAME block. Deliberately separate from mu
+	// (which still serializes the whole file's synchronous ops
+	// among themselves) so cross-block AIO parallelism is never
+	// reduced to file-wide serialization.
+	blockMu   sync.Mutex
+	blockBusy map[BlockNumber]chan struct{}
+}
+
+// lockBlock blocks until no other operation (synchronous or AIO)
+// is registered against blk on this relFile, then registers blk
+// as busy and returns a release func the caller MUST call exactly
+// once to unblock any waiters. readBlock/writeBlock hold it for
+// their whole body; Manager.PrefetchBlock/WriteBlockAIO hold it
+// from Submit until the AIOSubmitOp's OnComplete fires (the AIO
+// op's real completion, not merely the caller's Wait).
+func (r *relFile) lockBlock(blk BlockNumber) func() {
+	for {
+		r.blockMu.Lock()
+		ch, busy := r.blockBusy[blk]
+		if !busy {
+			done := make(chan struct{})
+			if r.blockBusy == nil {
+				r.blockBusy = make(map[BlockNumber]chan struct{})
+			}
+			r.blockBusy[blk] = done
+			r.blockMu.Unlock()
+			var once sync.Once
+			return func() {
+				once.Do(func() {
+					r.blockMu.Lock()
+					delete(r.blockBusy, blk)
+					r.blockMu.Unlock()
+					close(done)
+				})
+			}
+		}
+		r.blockMu.Unlock()
+		<-ch
+	}
 }
 
 // ReadAt is the engine-facing offset-shaped read. The relFile
@@ -713,6 +786,8 @@ func (r *relFile) VerifyRead(buf []byte, off int64) error {
 func (r *relFile) Fd() uintptr { return r.f.Fd() }
 
 func (r *relFile) readBlock(blk BlockNumber, buf []byte) error {
+	unlock := r.lockBlock(blk)
+	defer unlock()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if blk >= r.nblocks {
@@ -731,6 +806,8 @@ func (r *relFile) readBlock(blk BlockNumber, buf []byte) error {
 }
 
 func (r *relFile) writeBlock(blk BlockNumber, buf []byte) error {
+	unlock := r.lockBlock(blk)
+	defer unlock()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if blk >= r.nblocks {

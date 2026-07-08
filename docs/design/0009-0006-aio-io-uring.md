@@ -127,7 +127,7 @@ coordination. Two implications for goopg:
    visibility through their adapters. In-memory test files don't
    satisfy `fdHaver` and are handled by the inline-fallback branch.
 
-## Checksum bypass (fixed) and the still-open per-block ordering gap
+## Checksum bypass and per-block ordering (both fixed)
 
 The same raw-fd submission that motivates `fdHaver` above has a second
 consequence the original slice missed: submitting directly by kernel fd
@@ -177,22 +177,52 @@ every op (see `submitOne`'s single `submitMu`, already file-scoped for
 SQE bookkeeping) and defeat the cross-block parallelism io_uring exists
 for. `ChecksumFile` only touches the buffer content, not ordering.
 
-**Still open**: `storage/aio-relfile-mu-bypass` in `.ralph/fix_plan.md`
-tracks a separate, so-far-unconfirmed-as-reachable concern — the raw-fd
-path also doesn't serialize against a concurrent *synchronous*
-`readBlock`/`writeBlock`/`extend` (or another concurrent AIO op) on the
-*same* block of the *same* relFile, since those take `relFile.mu` for
-their whole duration while `Submit`'s raw-fd branch never touches it.
-`.ralph/deferral_ledger.md`'s 2026-07-08 M-NIGHTLY row found this by
-hand-tracing the one production call site (`Pool.flushBatch`'s
-`WriteBlockAIO`) and could not construct a concrete corruption window
-there — `Slot.contentMu`'s RWMutex already forces any evictor/reloader
-of the same slot to wait for the flush's real `Wait()` to return before
-touching `s.page` — but the gap is real at the `smgr`/`aio` layer in
-isolation and deserves the per-(rel,block) in-flight-AIO registry
-design described there before any other caller starts using
-`WriteBlockAIO`/`PrefetchBlock` on a path `contentMu` doesn't already
-cover.
+**Per-block ordering (fixed)**: `storage/aio-relfile-mu-bypass` in
+`.ralph/fix_plan.md` also tracked a second, so-far-unconfirmed-as-
+reachable concern — the raw-fd path doesn't serialize against a
+concurrent *synchronous* `readBlock`/`writeBlock` (or another concurrent
+AIO op) on the *same* block of the *same* relFile, since those take
+`relFile.mu` for their whole duration while `Submit`'s raw-fd branch
+never touches it. `.ralph/deferral_ledger.md`'s 2026-07-08 M-NIGHTLY row
+found this by hand-tracing the one production call site
+(`Pool.flushBatch`'s `WriteBlockAIO`) and could not construct a concrete
+corruption window there — `Slot.contentMu`'s RWMutex already forces any
+evictor/reloader of the same slot to wait for the flush's real `Wait()`
+to return before touching `s.page` — but the gap was real at the
+`smgr`/`aio` layer in isolation and would have become correctness-load-
+bearing the moment any other caller used `WriteBlockAIO`/`PrefetchBlock`
+on a path `contentMu` doesn't already cover.
+
+Fixed with a per-(rel,block) in-flight registry, `relFile.lockBlock`
+(`internal/storage/smgr.go`): a map of `BlockNumber` → a channel closed
+on release, guarded by a dedicated `blockMu` separate from `relFile.mu`
+so the registry never collapses cross-block AIO parallelism into a
+whole-file lock. `readBlock`/`writeBlock` hold the latch for their
+whole body (extend/extendBatch don't need it — they only ever touch
+brand-new blocks past the current `nblocks`, which by construction
+can't have an AIO op in flight against them yet, since `WriteBlockAIO`
+rejects `blk >= nblocks`). `Manager.PrefetchBlock`/`WriteBlockAIO`
+acquire the latch before `Submit` and release it via a new
+`AIOSubmitOp.OnComplete` hook, wired through `aioEngineAdapter` in
+`internal/initdb/open.go` to `aio.Op.Callback` — the one completion
+path shared by all three methods (`sync`/`worker`/`io_uring`) that
+fires when the I/O actually finishes, independent of when (or whether
+promptly) the caller invokes the returned handle's `Wait`. Releasing
+at real completion rather than at `Wait` time is what makes the latch
+correct rather than merely advisory: a caller that submits and defers
+`Wait` would otherwise let a synchronous same-block access race the
+still-in-flight I/O.
+
+Verified by `TestBlockLatchSerializesAIOAgainstSync`
+(`internal/storage/storage_test.go`): a `gatedAIOEngine` test double
+performs the AIO write's real I/O immediately but defers its
+`OnComplete` call until the test releases a channel, so the test can
+assert — deterministically, without relying on a race actually
+manifesting — that a concurrent synchronous `WriteBlock` to the *same*
+block blocks until `OnComplete` fires, while a `WriteBlock` to a
+*different* block completes immediately throughout. Confirmed
+non-vacuous by temporarily stubbing `lockBlock` to a no-op and watching
+the test fail with the expected message, then restoring the fix.
 
 ## Tests
 

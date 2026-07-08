@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 type recordingWAL struct {
@@ -745,6 +746,15 @@ func (r *recordingAIOEngine) Submit(op AIOSubmitOp) AIOHandle {
 		n, err = op.File.WriteAt(op.Buffer, op.Offset)
 	default:
 		n, err = op.File.ReadAt(op.Buffer, op.Offset)
+	}
+	// Real engines call OnComplete on the completion path
+	// regardless of Wait timing (see AIOSubmitOp.OnComplete);
+	// this fake completes inline, so it must honor the same
+	// contract or PrefetchBlock/WriteBlockAIO's per-block latch
+	// would never release, deadlocking any test that touches the
+	// same block again.
+	if op.OnComplete != nil {
+		op.OnComplete()
 	}
 	return recordingAIOHandle{n: n, err: err}
 }
@@ -1719,4 +1729,123 @@ func TestSlotPinCountIsolatesByTag(t *testing.T) {
 	pool.Unpin(s0b)
 	pool.Unpin(s0c)
 	pool.Unpin(s1a)
+}
+
+
+// gatedAIOEngine is a fake AIOEngine whose Submit performs the
+// real I/O immediately (so the bytes land on disk right away,
+// matching real engines) but defers calling OnComplete until the
+// test closes hold — simulating an AIO op that is still
+// "in-flight" from the storage layer's perspective even though
+// the underlying I/O already finished. This lets a test assert,
+// deterministically (no timing races), that
+// Manager.WriteBlockAIO/PrefetchBlock hold relFile's per-block
+// latch until OnComplete fires, not merely until Submit returns.
+type gatedAIOEngine struct {
+	hold chan struct{}
+}
+
+func (g *gatedAIOEngine) Submit(op AIOSubmitOp) AIOHandle {
+	var n int
+	var err error
+	switch op.Direction {
+	case AIODirWrite:
+		n, err = op.File.WriteAt(op.Buffer, op.Offset)
+	default:
+		n, err = op.File.ReadAt(op.Buffer, op.Offset)
+	}
+	go func() {
+		<-g.hold
+		if op.OnComplete != nil {
+			op.OnComplete()
+		}
+	}()
+	return recordingAIOHandle{n: n, err: err}
+}
+
+// TestBlockLatchSerializesAIOAgainstSync is the regression guard
+// for the storage/aio-relfile-mu-bypass task
+// (.ralph/fix_plan.md): relFile.lockBlock must be the ONE
+// serialization point between an AIO op (which bypasses relFile.mu
+// entirely on methodIOUring's raw-fd path) and a concurrent
+// synchronous read/write to the SAME block, while leaving
+// different blocks fully independent. Uses gatedAIOEngine to
+// control exactly when the AIO op's completion (and therefore the
+// latch release) happens, so the assertions below are
+// deterministic rather than relying on a race actually manifesting.
+func TestBlockLatchSerializesAIOAgainstSync(t *testing.T) {
+	dir := t.TempDir()
+	mgr := NewManager(ManagerConfig{DataDir: dir})
+	defer mgr.Close()
+	rel := RelFileNode{DBOid: 1, RelOid: 17300, Fork: MainFork}
+
+	page := make(Page, BlockSize)
+	if err := InitPage(page); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.Extend(rel, page); err != nil { // block 0
+		t.Fatal(err)
+	}
+	if _, err := mgr.Extend(rel, page); err != nil { // block 1
+		t.Fatal(err)
+	}
+
+	eng := &gatedAIOEngine{hold: make(chan struct{})}
+	mgr.SetAIO(eng)
+
+	// Start an AIO write to block 0. Submit returns immediately
+	// (gatedAIOEngine performs the write inline) but OnComplete —
+	// and therefore the release of relFile's block-0 latch — is
+	// blocked on eng.hold.
+	aioBuf := make(Page, BlockSize)
+	copy(aioBuf, page)
+	h, err := mgr.WriteBlockAIO(rel, 0, aioBuf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.Wait(); err != nil {
+		t.Fatalf("AIO write Wait: %v", err)
+	}
+
+	// A concurrent synchronous write to the SAME block (0) must
+	// block until the AIO op's OnComplete fires.
+	syncDone := make(chan error, 1)
+	go func() {
+		syncDone <- mgr.WriteBlock(rel, 0, page)
+	}()
+
+	select {
+	case err := <-syncDone:
+		t.Fatalf("WriteBlock(blk=0) returned (err=%v) before the in-flight AIO op completed — same-block serialization is broken", err)
+	case <-time.After(100 * time.Millisecond):
+		// Expected: still blocked on relFile's block-0 latch.
+	}
+
+	// A synchronous write to a DIFFERENT block (1) must NOT be
+	// blocked by block 0's outstanding AIO op — cross-block
+	// parallelism must survive this fix.
+	otherDone := make(chan error, 1)
+	go func() {
+		otherDone <- mgr.WriteBlock(rel, 1, page)
+	}()
+	select {
+	case err := <-otherDone:
+		if err != nil {
+			t.Fatalf("WriteBlock(blk=1) err=%v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("WriteBlock(blk=1) blocked — per-block latch regressed into a whole-file lock")
+	}
+
+	// Release the AIO op's completion. The synchronous block-0
+	// write must now unblock promptly.
+	close(eng.hold)
+	select {
+	case err := <-syncDone:
+		if err != nil {
+			t.Fatalf("WriteBlock(blk=0) err=%v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("WriteBlock(blk=0) never unblocked after the AIO op's OnComplete fired")
+	}
 }

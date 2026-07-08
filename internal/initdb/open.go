@@ -2061,6 +2061,17 @@ func (a aioEngineAdapter) Submit(op storage.AIOSubmitOp) storage.AIOHandle {
 	if op.Direction == storage.AIODirWrite {
 		dir = aio.DirWrite
 	}
+	// op.OnComplete releases relFile's per-(rel,block) latch
+	// (see storage.AIOSubmitOp.OnComplete). aio.Op.Callback
+	// fires on the engine's completion path regardless of
+	// method (sync/worker/io_uring) and regardless of when the
+	// caller invokes Wait, which is exactly the timing the latch
+	// needs — forwarding the Result is unnecessary since the
+	// latch release doesn't care whether the I/O succeeded.
+	var cb func(aio.Result)
+	if op.OnComplete != nil {
+		cb = func(aio.Result) { op.OnComplete() }
+	}
 	return aioHandleAdapter{
 		h: a.eng.Submit(aio.Op{
 			File:      aioFileAdapter{f: op.File},
@@ -2068,6 +2079,7 @@ func (a aioEngineAdapter) Submit(op storage.AIOSubmitOp) storage.AIOHandle {
 			Offset:    op.Offset,
 			Direction: dir,
 			Target:    op.Target,
+			Callback:  cb,
 		}),
 	}
 }
