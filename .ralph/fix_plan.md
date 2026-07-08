@@ -4385,6 +4385,33 @@ mirroring M0119's ledger `status` column.
       ./internal/initdb/...` PASS; `scripts/tpch-spotcheck.sh` PASS
       (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
       scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 workloads).
+      **`TestSeqScanFiresPrefetchesAcrossBlocks` hang — RESOLVED (2026-07-08,
+      later loop):** the deferral above suspected a production regression
+      from the M-NIGHTLY AIO/relFile.mu fix cluster; verify-before-implement
+      found the real cause was test-scaffolding-only.
+      `recordingExecAIOEngine.Submit` (`internal/executor/storage_test.go`,
+      duplicated from `internal/storage/storage_test.go`'s recording engine
+      per its own doc comment) never called `op.OnComplete`, so
+      `Manager.PrefetchBlock`'s AIO path (`unlock := f.lockBlock(blk)` ...
+      `OnComplete: unlock`, `internal/storage/smgr.go:230`) left
+      `relFile.blockBusy[blk]` permanently registered — any later
+      `lockBlock` call on the same block blocks forever
+      (`smgr.go:709`). Production is unaffected: `internal/initdb/open.go`'s
+      `aioEngineAdapter.Submit` correctly forwards `op.OnComplete` into
+      `aio.Op.Callback`, fired by all three real engine methods regardless
+      of `Wait` timing. Fixed by adding the same `if op.OnComplete != nil {
+      op.OnComplete() }` call the sibling recording engine already has.
+      Confirmed non-vacuous via `git stash` on the test file alone (hangs
+      pre-fix, `timeout 15` → `Terminated`; passes in 0.007s post-fix).
+      Gates: `go build ./...`/`go vet ./internal/executor/...` clean;
+      `go test ./internal/executor/...` PASS (3.7s); `go test
+      ./internal/storage/...` PASS (4.5s); `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+      scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 workloads — one
+      failed txn seen on an initial run confirmed to be a pre-existing
+      unrelated flake by re-running clean-stash HEAD, which failed
+      identically before this test-only diff existed). See deferral ledger
+      row appended today (status flipped to `resolved`).
       **Still open** (this bucket, ~9 remaining items): CREATE/DROP DATABASE
       full DDL, REINDEX physical rebuild, tablespaces, planner/jit GUC stubs.
       **planner/jit GUC stubs — DONE (2026-07-08, later loop):** closed the
