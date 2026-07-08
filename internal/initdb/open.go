@@ -1093,6 +1093,17 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: tablespace DDL replay: %w", err)
 	}
+	// M0122-0007 foreign-server registry restart-durability follow-up:
+	// restore CREATE/DROP SERVER entries (pg_foreign_server) from the WAL
+	// the same way. goopg's foreign-server registry has no backing heap
+	// relation, so a fresh cluster otherwise reported zero foreign servers
+	// after every restart.
+	if err := replayForeignServerDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: foreign-server DDL replay: %w", err)
+	}
 	// DU-002 (M0119-0004) restart persistence: restore CREATE/DROP TRANSFORM
 	// objects (pg_transform) from the WAL the same way. Order relative to
 	// schema replay does not matter — transforms are keyed by (type name,

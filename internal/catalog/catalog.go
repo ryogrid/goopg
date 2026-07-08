@@ -15103,6 +15103,33 @@ func (c *InMemory) ForeignServerOID(name string) uint32 {
 	return 0
 }
 
+// RegisterForeignServerDuringRecovery re-registers a foreign server with its
+// original OID, replayed from a RecordKindCreateForeignServer WAL record
+// (M0122-0007 foreign-server registry restart-durability follow-up). Mirrors
+// RegisterTablespaceDuringRecovery. Owner is not carried (see
+// RecordKindCreateForeignServer's doc comment).
+func (c *InMemory) RegisterForeignServerDuringRecovery(name, fdwName, srvType, srvVersion string, options []string, oid uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.foreignServers == nil {
+		c.foreignServers = make(map[string]*ForeignServer)
+	}
+	c.foreignServers[name] = &ForeignServer{Name: name, OID: oid, FdwName: fdwName, Type: srvType, Version: srvVersion, Options: options}
+	if oid >= c.nextOID {
+		c.nextOID = oid + 1
+	}
+}
+
+// UnregisterForeignServerDuringRecovery removes a foreign server from the
+// registry, replayed from a RecordKindDropForeignServer WAL record.
+// Counterpart to RegisterForeignServerDuringRecovery; mirrors
+// UnregisterTablespaceDuringRecovery.
+func (c *InMemory) UnregisterForeignServerDuringRecovery(name string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.foreignServers, name)
+}
+
 // Cast is a user-defined cast (CREATE CAST (source AS target) …). goopg does not
 // actually perform user casts; this records just enough metadata to round-trip
 // the definition through pg_dump (pg_cast virtual view → getCasts/dumpCast).

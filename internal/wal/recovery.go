@@ -780,6 +780,28 @@ const (
 	// path. Format: kind(1) | nameLen(2) | name(nameLen bytes).
 	RecordKindDropTablespace byte = 125
 
+	// RecordKindCreateForeignServer records a `CREATE SERVER name [TYPE
+	// 'type'] [VERSION 'version'] FOREIGN DATA WRAPPER fdwname [OPTIONS
+	// (...)]` event (M0122-0007 foreign-server registry restart-durability
+	// follow-up). goopg's foreign-server registry
+	// (catalog.InMemory.foreignServers) is a pure in-memory map with no
+	// backing heap relation, so the physical redo path is a no-op; the
+	// recovery driver in internal/initdb/foreignserver_ddl_recovery.go
+	// re-registers the server (with its original OID) after physical
+	// replay. Mirrors RecordKindCreateTablespace. Owner is deliberately not
+	// carried: nothing in the codebase sets ForeignServer.Owner away from
+	// its zero value yet (no `ALTER SERVER ... OWNER TO`), so there is
+	// nothing to persist. Format:
+	//   kind(1) | oid(4) | nameLen(2)+name | fdwNameLen(2)+fdwName |
+	//   srvTypeLen(2)+srvType | srvVersionLen(2)+srvVersion |
+	//   optionsCount(2) | (optLen(2)+opt)*.
+	RecordKindCreateForeignServer byte = 126
+
+	// RecordKindDropForeignServer records a `DROP SERVER name` event.
+	// Counterpart to RecordKindCreateForeignServer; same no-op physical redo
+	// path. Format: kind(1) | nameLen(2) | name(nameLen bytes).
+	RecordKindDropForeignServer byte = 127
+
 	// RecordKindSequenceState records the FULL state of one sequence
 	// (definition + current counter) so sequences — including the implicit
 	// sequences backing SERIAL/IDENTITY columns — survive a restart. goopg's
@@ -3454,6 +3476,134 @@ func DecodeDropTablespace(payload []byte) (name string, err error) {
 	nameLen := int(binary.LittleEndian.Uint16(payload[1:3]))
 	if len(payload) < 3+nameLen {
 		return "", fmt.Errorf("wal: drop-tablespace payload truncated (need %d bytes)", 3+nameLen)
+	}
+	return string(payload[3 : 3+nameLen]), nil
+}
+
+// EncodeCreateForeignServer encodes a CREATE SERVER event (M0122-0007
+// foreign-server registry restart-durability follow-up). Format: kind(1) |
+// oid(4) | nameLen(2)+name | fdwNameLen(2)+fdwName | srvTypeLen(2)+srvType |
+// srvVersionLen(2)+srvVersion | optionsCount(2) | (optLen(2)+opt)*.
+func EncodeCreateForeignServer(name, fdwName, srvType, srvVersion string, options []string, oid uint32) []byte {
+	clip := func(s string) string {
+		if len(s) > 0xFFFF {
+			return s[:0xFFFF]
+		}
+		return s
+	}
+	name, fdwName, srvType, srvVersion = clip(name), clip(fdwName), clip(srvType), clip(srvVersion)
+	if len(options) > 0xFFFF {
+		options = options[:0xFFFF]
+	}
+	size := 4 + 2 + len(name) + 2 + len(fdwName) + 2 + len(srvType) + 2 + len(srvVersion) + 2
+	for _, opt := range options {
+		if len(opt) > 0xFFFF {
+			opt = opt[:0xFFFF]
+		}
+		size += 2 + len(opt)
+	}
+	out := make([]byte, 1+size)
+	out[0] = RecordKindCreateForeignServer
+	binary.LittleEndian.PutUint32(out[1:5], oid)
+	off := 5
+	writeStr := func(s string) {
+		binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(s)))
+		off += 2
+		copy(out[off:off+len(s)], s)
+		off += len(s)
+	}
+	writeStr(name)
+	writeStr(fdwName)
+	writeStr(srvType)
+	writeStr(srvVersion)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(options)))
+	off += 2
+	for _, opt := range options {
+		if len(opt) > 0xFFFF {
+			opt = opt[:0xFFFF]
+		}
+		writeStr(opt)
+	}
+	return out[:off]
+}
+
+// DecodeCreateForeignServer decodes a RecordKindCreateForeignServer payload.
+func DecodeCreateForeignServer(payload []byte) (name, fdwName, srvType, srvVersion string, options []string, oid uint32, err error) {
+	if len(payload) < 5 {
+		return "", "", "", "", nil, 0, fmt.Errorf("wal: create-foreign-server payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindCreateForeignServer {
+		return "", "", "", "", nil, 0, fmt.Errorf("wal: record kind %d is not create-foreign-server", payload[0])
+	}
+	oid = binary.LittleEndian.Uint32(payload[1:5])
+	off := 5
+	readStr := func() (string, error) {
+		if len(payload) < off+2 {
+			return "", fmt.Errorf("wal: create-foreign-server payload truncated at length prefix (offset %d)", off)
+		}
+		l := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+		off += 2
+		if len(payload) < off+l {
+			return "", fmt.Errorf("wal: create-foreign-server payload truncated (need %d bytes)", off+l)
+		}
+		s := string(payload[off : off+l])
+		off += l
+		return s, nil
+	}
+	if name, err = readStr(); err != nil {
+		return "", "", "", "", nil, 0, err
+	}
+	if fdwName, err = readStr(); err != nil {
+		return "", "", "", "", nil, 0, err
+	}
+	if srvType, err = readStr(); err != nil {
+		return "", "", "", "", nil, 0, err
+	}
+	if srvVersion, err = readStr(); err != nil {
+		return "", "", "", "", nil, 0, err
+	}
+	if len(payload) < off+2 {
+		return "", "", "", "", nil, 0, fmt.Errorf("wal: create-foreign-server payload truncated at options count (offset %d)", off)
+	}
+	optCount := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	if optCount > 0 {
+		options = make([]string, 0, optCount)
+		for i := 0; i < optCount; i++ {
+			opt, oerr := readStr()
+			if oerr != nil {
+				return "", "", "", "", nil, 0, oerr
+			}
+			options = append(options, opt)
+		}
+	}
+	return name, fdwName, srvType, srvVersion, options, oid, nil
+}
+
+// EncodeDropForeignServer encodes a DROP SERVER event.
+// Format: kind(1) | nameLen(2) | name(nameLen bytes).
+func EncodeDropForeignServer(name string) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	out := make([]byte, 3+len(name))
+	out[0] = RecordKindDropForeignServer
+	binary.LittleEndian.PutUint16(out[1:3], uint16(len(name)))
+	copy(out[3:], name)
+	return out
+}
+
+// DecodeDropForeignServer decodes a RecordKindDropForeignServer payload.
+func DecodeDropForeignServer(payload []byte) (name string, err error) {
+	if len(payload) < 3 {
+		return "", fmt.Errorf("wal: drop-foreign-server payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindDropForeignServer {
+		return "", fmt.Errorf("wal: record kind %d is not drop-foreign-server", payload[0])
+	}
+	nameLen := int(binary.LittleEndian.Uint16(payload[1:3]))
+	if len(payload) < 3+nameLen {
+		return "", fmt.Errorf("wal: drop-foreign-server payload truncated (need %d bytes)", 3+nameLen)
 	}
 	return string(payload[3 : 3+nameLen]), nil
 }
@@ -8488,6 +8638,15 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 		// recovery driver in internal/initdb/tablespace_ddl_recovery.go
 		// scans the WAL for these records after physical replay and
 		// re-applies them to the catalog's tablespace registry.
+		return false, nil
+	case RecordKindCreateForeignServer, RecordKindDropForeignServer:
+		// CREATE/DROP SERVER records (M0122-0007 foreign-server registry
+		// restart-durability follow-up) carry only pg_foreign_server
+		// registry metadata; goopg's foreign-server registry has no backing
+		// heap relation, so the physical replay path has nothing to do. The
+		// recovery driver in internal/initdb/foreignserver_ddl_recovery.go
+		// scans the WAL for these records after physical replay and
+		// re-applies them to the catalog's foreign-server registry.
 		return false, nil
 	case RecordKindCreateTransform, RecordKindDropTransform:
 		// CREATE/DROP TRANSFORM records (M0119-0004 restart persistence)

@@ -14910,9 +14910,23 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 			}
 		case "server":
 			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
-				// Drop the dump-visible registry entry too (DU-002 slice 376).
-				im.DropForeignServer(s.Names[0].String())
-				if im.DropCompatObject("server", s.Names[0].String()) {
+				name := s.Names[0].String()
+				// M0122-0007 foreign-server registry restart-durability
+				// follow-up: the durable foreignServers registry (DU-002
+				// slice 376), not the legacy compatObjects bookkeeping, is
+				// now the existence gate — compatObjects never survived a
+				// restart, so gating here left DROP SERVER erroring
+				// "does not exist" on a server that reappeared in
+				// pg_foreign_server after a crash. DropCompatObject is still
+				// called best-effort to clear any stale entry.
+				found := im.DropForeignServer(name)
+				im.DropCompatObject("server", name)
+				if found {
+					if o.ctx.WAL != nil {
+						if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropForeignServer(name)); werr != nil {
+							return fmt.Errorf("wal drop-foreign-server: %w", werr)
+						}
+					}
 					return nil
 				}
 			}
@@ -14966,19 +14980,29 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 				if im.DropForeignDataWrapper(fdwName) {
 					// CASCADE: drop all servers associated with this FDW.
 					if s.Behavior == parser.DropCascade {
-						// Find servers registered under this FDW via "fdw-server:fdwname:servername".
-						prefix := fdwName + ":"
+						// M0122-0007 foreign-server registry restart-durability
+						// follow-up: discover cascade candidates from the
+						// durable foreignServers registry (filtering by
+						// FdwName) instead of the legacy, non-durable
+						// "fdw-server:fdwname:servername" compatObjects
+						// association, which never survived a restart and
+						// would silently skip cascading to a pre-restart
+						// server.
 						var cascadeServers []string
-						for _, entry := range im.ListCompatObjects("fdw-server") {
-							if strings.HasPrefix(entry, prefix) {
-								serverName := strings.TrimPrefix(entry, prefix)
-								cascadeServers = append(cascadeServers, serverName)
+						for _, srv := range im.ListForeignServers() {
+							if srv.FdwName == fdwName {
+								cascadeServers = append(cascadeServers, srv.Name)
 							}
 						}
 						for _, serverName := range cascadeServers {
 							im.DropCompatObject("fdw-server", fdwName+":"+serverName)
 							im.DropCompatObject("server", serverName)
 							im.DropForeignServer(serverName) // dump-visible registry (DU-002 slice 376)
+							if o.ctx.WAL != nil {
+								if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropForeignServer(serverName)); werr != nil {
+									return fmt.Errorf("wal drop-foreign-server: %w", werr)
+								}
+							}
 							o.ctx.AddNotice(fmt.Sprintf("drop cascades to server %s", serverName))
 						}
 					}
@@ -15532,7 +15556,19 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		// round-trips through pg_dump (pg_foreign_server virtual view →
 		// dumpForeignServer). The registry mints a stable OID and resolves the
 		// referenced FDW name to its srvfdw OID at render time. DU-002 slice 376.
-		im.RegisterForeignServer(s.ObjName.String(), s.TableName.String(), s.ServerType, s.ServerVersion, s.Options)
+		srv := im.RegisterForeignServer(s.ObjName.String(), s.TableName.String(), s.ServerType, s.ServerVersion, s.Options)
+		// M0122-0007 foreign-server registry restart-durability follow-up:
+		// persist the server so it survives a restart. goopg's foreign-server
+		// registry has no backing heap relation, so record a WAL event the
+		// recovery driver (internal/initdb/foreignserver_ddl_recovery.go)
+		// replays into the registry on the next startup (mirrors CREATE
+		// TABLESPACE). The OID just assigned/refreshed by RegisterForeignServer
+		// is carried so recovery restores the same identity.
+		if o.ctx.WAL != nil {
+			if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateForeignServer(srv.Name, srv.FdwName, srv.Type, srv.Version, srv.Options, srv.OID)); werr != nil {
+				return fmt.Errorf("wal create-foreign-server: %w", werr)
+			}
+		}
 	case "foreign-data wrapper":
 		// Register FDW so DROP FOREIGN DATA WRAPPER can succeed AND so it
 		// round-trips through pg_dump (pg_foreign_data_wrapper virtual view →

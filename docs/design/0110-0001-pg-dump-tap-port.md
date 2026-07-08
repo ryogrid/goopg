@@ -15494,3 +15494,117 @@ Gates: `go build ./...` clean; `go test -count=1 ./internal/parser/...
 PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2, Q13=33);
 `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh` PASS
 (0 failed transactions, all 3 workloads).
+
+## Follow-up (2026-07-09, M0122-0007): foreign-server registry restart durability
+
+**Gap** (`unimplemented_feat.json` DU-002-376/DU-002-378, `status: open`,
+`code_audit: confirmed-open: internal/catalog/catalog.go:11697 foreign
+servers stored in-memory only`): `catalog.InMemory.foreignServers` (slice
+376 above) is a pure in-memory map with zero WAL persistence. `CREATE SERVER`
+mints a stable OID via `RegisterForeignServer` and the server round-trips
+through `pg_dump`/`pg_foreign_server` while the process stays up, but a
+restart silently drops every registered server — `pg_foreign_server` reports
+zero rows, `DROP SERVER`/`CREATE USER MAPPING ... SERVER x` on the
+now-vanished name fails "does not exist", and any dependent user mapping
+(`c.userMappings`, keyed by `"<user>\x00<server>"`) becomes an orphan whose
+`srvid` no longer resolves. This mirrors the exact gap the tablespace
+registry had until the 2026-07-09 follow-up in
+`docs/design/0095-0003-in-place-tablespace.md` (`RecordKindCreateTablespace`/
+`RecordKindDropTablespace`, 124/125) — same fix shape, different registry.
+
+**Scope**: `CREATE SERVER` / `DROP SERVER` (with or without `CASCADE` from
+`DROP FOREIGN DATA WRAPPER ... CASCADE`) only. `CREATE USER MAPPING`
+persistence is a separate, not-yet-filed gap (the mapping registry has no
+WAL wiring either) — deliberately left out of this slice's blast radius;
+noting it in the ledger as a distinct follow-up rather than folding it in
+here, since a mapping's restart durability is only useful once its
+referenced server also survives a restart, but not vice versa.
+
+**Correctness fix required (found in design review, before this section's
+original draft):** `DROP SERVER`'s existence gate and the `DROP FOREIGN DATA
+WRAPPER ... CASCADE` per-server discovery loop do **not** consult
+`foreignServers` today — they gate on the separate, non-durable
+`compatObjects["server"]`/`compatObjects["fdw-server"]` bookkeeping
+(`internal/executor/operators_ddl.go` ~line 14911-14988). Persisting only
+`foreignServers` (as the rest of this section describes) without also
+repointing these two call sites would leave a real post-restart bug: a
+pre-restart `CREATE SERVER` correctly reappears in `pg_foreign_server`, but
+`DROP SERVER` on it then fails "does not exist" (the compat-object entry
+didn't survive the restart even though the durable registry did), and `DROP
+FOREIGN DATA WRAPPER ... CASCADE` silently fails to cascade-drop it while
+still reporting success. Fix: repoint both call sites at `foreignServers`
+directly instead of adding a second, parallel persistence path for
+`compatObjects` — `COMMENT ON SERVER` (line ~16941-16946) already uses
+`ForeignServerOID` as its own existence check, so this makes the "server"
+object type consistent across all three of its call sites instead of
+introducing a fourth pattern:
+- `DROP SERVER` (line 14911-14918): gate success on `im.DropForeignServer(name)`'s
+  bool return instead of `im.DropCompatObject("server", name)`'s (still call
+  `DropCompatObject` too, best-effort, so no stale entry lingers if one
+  exists from before this fix).
+- CASCADE loop (line 14969-14983): discover candidate servers by scanning
+  `im.ListForeignServers()` and filtering `srv.FdwName == fdwName`, instead
+  of prefix-matching `ListCompatObjects("fdw-server")` entries.
+
+**Fix, mirroring `replayTablespaceDDLRecords` exactly:**
+- Two new WAL record kinds, `wal.RecordKindCreateForeignServer`/
+  `RecordKindDropForeignServer` (126/127, next free after tablespace's
+  124/125). Format: `kind(1) | oid(4) | nameLen(2)+name |
+  fdwNameLen(2)+fdwName | srvTypeLen(2)+srvType | srvVersionLen(2)+srvVersion
+  | optionsCount(2) | (optLen(2)+opt)*` for CREATE. `Owner` is deliberately
+  NOT in the wire format: nothing in the codebase ever sets
+  `ForeignServer.Owner` away from its zero value today (no `OWNER TO`
+  support for servers), so there is nothing meaningful to persist yet — a
+  future loop adding server ownership must extend this record, not assume
+  it round-trips already. Every other field is carried, options serialized
+  as repeated length-prefixed strings (mirroring how `EncodeCreateTSDict`
+  already serializes a string slice elsewhere in this file); `kind(1) |
+  nameLen(2)+name` for DROP.
+  `internal/wal/recovery.go`'s physical-replay dispatch switch gains a
+  `case RecordKindCreateForeignServer, RecordKindDropForeignServer: return
+  false, nil` arm (no physical page state — same as the tablespace/schema
+  arms immediately above it).
+- `catalog.InMemory.RegisterForeignServerDuringRecovery(name, fdwName,
+  srvType, srvVersion string, options []string, oid uint32)` /
+  `UnregisterForeignServerDuringRecovery(name string)`
+  (`internal/catalog/catalog.go`), mirroring
+  `RegisterTablespaceDuringRecovery`/`UnregisterTablespaceDuringRecovery`
+  byte-for-byte: re-populate `c.foreignServers[name]` with the *original*
+  OID (not a freshly allocated one) and bump `c.nextOID` past it if needed.
+- New `internal/initdb/foreignserver_ddl_recovery.go`,
+  `replayForeignServerDDLRecords(walDir string, cat catalog.Catalog) error`
+  — line-for-line the same shape as `replayTablespaceDDLRecords` (missing
+  walDir → nil; catalog not exposing the recovery interface → nil;
+  `wal.ReadAll` + `wal.IsGoopgNativeRecord` guard + switch on
+  `rec.Payload[0]`). Wired into `internal/initdb/open.go` right after the
+  existing `replayTablespaceDDLRecords(...)` call.
+- `execCompatCreate`'s `case "server":` branch
+  (`internal/executor/operators_ddl.go`, the `im.RegisterForeignServer(...)`
+  call site) appends `o.ctx.WAL.Append(wal.EncodeCreateForeignServer(...))`
+  right after the in-memory registration, guarded by `o.ctx.WAL != nil`
+  (matches every other DDL WAL-emit site in this file). The plain `DROP
+  SERVER` site (`im.DropForeignServer(s.Names[0].String())`) and the `DROP
+  FOREIGN DATA WRAPPER ... CASCADE` per-server drop loop
+  (`im.DropForeignServer(serverName)`) both append
+  `wal.EncodeDropForeignServer(name)` the same way `DROP ACCESS METHOD`/`DROP
+  EVENT TRIGGER` already do.
+
+**Tests**: WAL encode/decode round-trip
+(`internal/wal/recovery_test.go`), a catalog-level
+`TestRegisterForeignServerDuringRecoveryPreservesOID`/
+`TestUnregisterForeignServerDuringRecoveryRemovesEntry`
+(`internal/catalog/catalog_test.go`), a `replayForeignServerDDLRecords`
+recovery-driver test mirroring `tablespace_ddl_recovery_test.go`
+(`internal/initdb/foreignserver_ddl_recovery_test.go`), and an
+executor-level `TestCreateDropServerEmitsWAL`-style test asserting the WAL
+append happens (`internal/executor`). Confirm non-vacuous via `git stash`
+on the catalog/initdb files alone.
+
+**Still open**: `CREATE USER MAPPING` restart durability (separate gap,
+noted above); positive `datconnlimit`-style live-connection accounting is
+unrelated and already tracked elsewhere.
+
+Gates: `go build ./...` clean; `go test ./internal/wal/... ./internal/catalog/...
+./internal/initdb/... ./internal/executor/...` PASS; `scripts/tpch-spotcheck.sh`
+PASS (Q12=2, Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+scripts/ralph-precommit-test.sh` PASS (0 failed transactions, all 3 workloads).

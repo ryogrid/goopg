@@ -5117,6 +5117,65 @@ mirroring M0119's ledger `status` column.
       workloads). **Still open** (M0122-0007 bucket, ~3 remaining items):
       CREATE/DROP DATABASE full DDL, tablespace physical relocation,
       REINDEX CONCURRENTLY physical rebuild (all object types).
+      **Foreign-server registry restart durability — done (2026-07-09,
+      `unimplemented_feat.json` DU-002-376/DU-002-378 closed):**
+      `catalog.InMemory.foreignServers` (CREATE/DROP SERVER) was a pure
+      in-memory map with zero WAL persistence — a restart silently dropped
+      every registered server, breaking `pg_foreign_server`/dependent user
+      mappings. Fixed exactly mirroring the tablespace-registry follow-up
+      above: new `wal.RecordKindCreateForeignServer`/
+      `RecordKindDropForeignServer` (126/127) +
+      `internal/initdb/foreignserver_ddl_recovery.go`'s
+      `replayForeignServerDDLRecords`; `catalog.InMemory.
+      RegisterForeignServerDuringRecovery`/`UnregisterForeignServerDuringRecovery`
+      re-populate the registry with the original OID; `execCompatCreate`'s
+      `case "server":` now WAL-emits on `CREATE SERVER`. A design-review
+      pass (before implementation, per this milestone's per-task rule) found
+      a real blocking gap the naive port would have introduced: `DROP
+      SERVER`'s existence gate and `DROP FOREIGN DATA WRAPPER ... CASCADE`'s
+      per-server discovery both keyed off the separate, non-durable
+      `compatObjects["server"]`/`compatObjects["fdw-server"]` bookkeeping,
+      not `foreignServers` — so a WAL-recovered server could never be
+      dropped again ("does not exist"), and CASCADE would silently fail to
+      cascade-drop it. Fixed by repointing both call sites at
+      `foreignServers` directly (`DropForeignServer`'s bool return / a
+      `ListForeignServers()` scan filtered by `FdwName`) instead of adding a
+      second parallel persistence path — this also makes "server" consistent
+      with `COMMENT ON SERVER`, which already used `ForeignServerOID` as its
+      existence check. `Owner` is deliberately not carried in the new WAL
+      record: nothing sets `ForeignServer.Owner` away from its zero value
+      today (no `ALTER SERVER ... OWNER TO`). Scope: `CREATE`/`DROP SERVER`
+      only — `CREATE USER MAPPING` restart durability is a separate,
+      still-open gap (ledger row appended). Tests:
+      `TestEncodeDecodeCreateForeignServerRoundTrip`/
+      `TestEncodeDecodeDropForeignServerRoundTrip`/
+      `TestDecodeForeignServerRejectsWrongKindAndTruncatedPayload`
+      (`internal/wal`), `TestRegisterForeignServerDuringRecoveryPreservesOID`/
+      `TestUnregisterForeignServerDuringRecoveryRemovesEntry`
+      (`internal/catalog`), `TestForeignServerDDLRecoveryReplaysCreate`/
+      `TestForeignServerDDLRecoveryReplaysDropAfterCreate`/
+      `TestReplayForeignServerDDLRecordsHandlesMissingWalDir`
+      (`internal/initdb`, full `Init`+`Open`+restart+`Open` cycle),
+      `TestDropServerGatesOnForeignServerRegistryNotCompatObjects`/
+      `TestDropForeignDataWrapperCascadeUsesForeignServerRegistry`/
+      `TestCreateServerRegistersForeignServerWithCapturedOID`
+      (`internal/executor`) — the two correctness-fix tests confirmed
+      non-vacuous via `git stash` on `operators_ddl.go` alone (both fail
+      pre-fix: "does not exist" / cascade leaves the server behind).
+      Live-verified against a real `cmd/goopg` binary: `CREATE SERVER`
+      + `goopg stop`/`start` + `pg_foreign_server` still lists it +
+      `DROP SERVER` on it now succeeds (previously would 42704). Design:
+      `docs/design/0110-0001-pg-dump-tap-port.md` new "Follow-up
+      (2026-07-09, M0122-0007)" section (includes the design-review
+      correction); `docs/design/README.md` row updated. Gates: `go build
+      ./...`/`go vet ./internal/wal/... ./internal/catalog/...
+      ./internal/initdb/... ./internal/executor/...` clean; `go test
+      ./internal/wal/... ./internal/catalog/... ./internal/initdb/...
+      ./internal/executor/...` PASS; `go test -v -run
+      '^TestPort_PgDumpConnectionSetup$' ./internal/testport/` PASS (no
+      regression); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed transactions, all 3 workloads).
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,

@@ -3355,7 +3355,7 @@
    "feature": "Persistent storage of server definitions (currently in-memory only)",
    "task_id": "DU-002-378",
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "servers in-memory only"
    ],
@@ -3365,18 +3365,18 @@
     "d792e1ab67bef7ad5b5b3d00ac3f5433f3334295"
    ],
    "resolution_check": {
-    "ledger": "open",
-    "fix_plan": "no-match",
+    "ledger": "resolved",
+    "fix_plan": "M0122-0007",
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/catalog/catalog.go:11697 foreign servers stored in-memory only"
+   "code_audit": "RESOLVED (2026-07-09, M0122-0007 foreign-server registry restart-durability follow-up): catalog.InMemory.foreignServers now survives a restart via wal.RecordKindCreateForeignServer/RecordKindDropForeignServer (126/127) + internal/initdb/foreignserver_ddl_recovery.go's replayForeignServerDDLRecords, mirroring the tablespace registry's identical fix. Live-verified via a real goopg stop/start: CREATE SERVER's row survives restart and DROP SERVER on it then succeeds."
   },
   {
    "feature": "Persistent storage of server definitions (currently in-memory only)",
    "task_id": "DU-002-376",
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "servers in-memory only"
    ],
@@ -3386,12 +3386,12 @@
     "46e70c8517917257e9032ba12fbf0403c2bcdd23"
    ],
    "resolution_check": {
-    "ledger": "open",
-    "fix_plan": "no-match",
+    "ledger": "resolved",
+    "fix_plan": "M0122-0007",
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/catalog/catalog.go:11697 foreign servers stored in-memory only"
+   "code_audit": "RESOLVED (2026-07-09, M0122-0007 foreign-server registry restart-durability follow-up): catalog.InMemory.foreignServers now survives a restart via wal.RecordKindCreateForeignServer/RecordKindDropForeignServer (126/127) + internal/initdb/foreignserver_ddl_recovery.go's replayForeignServerDDLRecords, mirroring the tablespace registry's identical fix. Live-verified via a real goopg stop/start: CREATE SERVER's row survives restart and DROP SERVER on it then succeeds."
   },
   {
    "feature": "Per-column optional type specification in CREATE TABLE OF syntax (col WITH OPTIONS form)",

@@ -215,6 +215,57 @@ func TestForeignServerRegistry(t *testing.T) {
 	}
 }
 
+// TestRegisterForeignServerDuringRecoveryPreservesOID pins the M0122-0007
+// foreign-server registry restart-durability follow-up: replaying a CREATE
+// SERVER WAL record must re-populate the registry with the EXACT OID the
+// pre-restart server assigned, not a freshly minted one — otherwise a
+// dependent user mapping's srvid (resolved once at CREATE USER MAPPING time)
+// would silently point at the wrong row after a restart.
+func TestRegisterForeignServerDuringRecoveryPreservesOID(t *testing.T) {
+	c := NewInMemory()
+	const wantOID = uint32(40777)
+
+	c.RegisterForeignServerDuringRecovery("recovered_srv", "postgres_fdw", "prod", "9.1",
+		[]string{"host=localhost"}, wantOID)
+
+	if got := c.ForeignServerOID("recovered_srv"); got != wantOID {
+		t.Fatalf("ForeignServerOID(recovered_srv) = %d, want %d (OID not preserved)", got, wantOID)
+	}
+	list := c.ListForeignServers()
+	if len(list) != 1 {
+		t.Fatalf("ListForeignServers = %+v, want exactly 1 entry", list)
+	}
+	if list[0].FdwName != "postgres_fdw" || list[0].Type != "prod" || list[0].Version != "9.1" ||
+		len(list[0].Options) != 1 || list[0].Options[0] != "host=localhost" {
+		t.Fatalf("recovered server fields = %+v, want fdw=postgres_fdw type=prod version=9.1 options=[host=localhost]", list[0])
+	}
+
+	// A subsequent fresh (non-recovery) registration must not collide with
+	// the replayed OID — nextOID must have been bumped past it.
+	fresh := c.RegisterForeignServer("fresh_srv", "postgres_fdw", "", "", nil)
+	if fresh.OID <= wantOID {
+		t.Fatalf("fresh RegisterForeignServer minted OID %d, want > recovered OID %d (nextOID not bumped)", fresh.OID, wantOID)
+	}
+}
+
+// TestUnregisterForeignServerDuringRecoveryRemovesEntry is the DROP
+// counterpart.
+func TestUnregisterForeignServerDuringRecoveryRemovesEntry(t *testing.T) {
+	c := NewInMemory()
+	c.RegisterForeignServerDuringRecovery("gone_srv", "postgres_fdw", "", "", nil, 40778)
+	if got := c.ForeignServerOID("gone_srv"); got == 0 {
+		t.Fatalf("setup: ForeignServerOID(gone_srv) = 0, want registered")
+	}
+
+	c.UnregisterForeignServerDuringRecovery("gone_srv")
+
+	if got := c.ForeignServerOID("gone_srv"); got != 0 {
+		t.Fatalf("after UnregisterForeignServerDuringRecovery, ForeignServerOID(gone_srv) = %d, want 0", got)
+	}
+	// Idempotent: unregistering an already-gone name must not panic or error.
+	c.UnregisterForeignServerDuringRecovery("gone_srv")
+}
+
 // TestUserMappingRegistry verifies the user-mapping registry and the
 // pg_user_mappings virtual view that pg_dump's dumpUserMappings reads. The view
 // MUST exist (returning 0 rows by default) so that creating any foreign server
