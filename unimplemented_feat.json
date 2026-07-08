@@ -2717,7 +2717,7 @@
    "feature": "GUC stubs for jit, compute_query_id, and plan_cache_mode registered but not fully configured or functional.",
    "task_id": "M0097-0073",
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "GUC stubs added"
    ],
@@ -2728,11 +2728,11 @@
    ],
    "resolution_check": {
     "ledger": "no-match",
-    "fix_plan": "no-match",
+    "fix_plan": "checked",
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: jit/compute_query_id/plan_cache_mode are compat stubs only (internal/config/defaults.go:288-310, comment 'Compatibility stubs for GUCs checked by pg_regress tests'), no functional consumers found repo-wide"
+   "code_audit": "RESOLVED 2026-07-08 (M0122-0007 planner/jit GUC stubs): all 9 upstream jit_* GUCs now registered (internal/config/defaults.go), matching guc_tables.c contexts/bounds/boot values; compute_query_id/plan_cache_mode were already complete. 'Not fully configured' (missing jit_optimize_above_cost/jit_inline_above_cost/jit_debugging_support/jit_dump_bitcode/jit_expressions/jit_profiling_support/jit_tuple_deforming/jit_provider) is fixed. 'Not functional' (no actual JIT compilation) is intentionally out of scope and matches real PostgreSQL built without --with-llvm, which accepts the same SET/SHOW but never JIT-compiles either — not a genuine compatibility gap."
   },
   {
    "feature": "LANGUAGE C functions are accepted with only stub implementations that do not actually compile or execute C code",

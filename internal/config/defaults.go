@@ -332,6 +332,45 @@ func BuildDefaultRegistry() *Registry {
 		Context:     ContextUserset,
 		Scope:       ScopeServer,
 	}))
+	// The rest of upstream's jit_* GUC family (guc_tables.c) — goopg has
+	// no JIT compiler at all (not even a stub code path consulted at
+	// runtime, unlike enable_nestloop-style planner toggles), so these
+	// exist purely so SET/SHOW and pg_settings enumeration don't fail
+	// with "unrecognized configuration parameter" on scripts written
+	// against a real PostgreSQL. Contexts/defaults/bounds mirror
+	// guc_tables.c exactly (jit_debugging_support/jit_profiling_support
+	// are PGC_SU_BACKEND; jit_dump_bitcode is PGC_SUSET; jit_provider is
+	// PGC_POSTMASTER; the rest are PGC_USERSET).
+	r.MustRegister(NewVariable(Variable{
+		Name: "jit_debugging_support", Type: TypeBool, BootVal: "off",
+		Context: ContextSuBackend,
+		Scope:   ScopeServer,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "jit_dump_bitcode", Type: TypeBool, BootVal: "off",
+		Context: ContextSuset,
+		Scope:   ScopeServer,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "jit_expressions", Type: TypeBool, BootVal: "on",
+		Context: ContextUserset,
+		Scope:   ScopeServer,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "jit_profiling_support", Type: TypeBool, BootVal: "off",
+		Context: ContextSuBackend,
+		Scope:   ScopeServer,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "jit_tuple_deforming", Type: TypeBool, BootVal: "on",
+		Context: ContextUserset,
+		Scope:   ScopeServer,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "jit_provider", Type: TypeString, BootVal: "llvmjit",
+		Context: ContextPostmaster,
+		Scope:   ScopeServer,
+	}))
 
 	// wal_sender_memory_buffer sizes (in bytes) the in-memory
 	// ring of recent WAL bytes used by walsender's
@@ -595,6 +634,20 @@ func BuildDefaultRegistry() *Registry {
 	// Values mirror postgres/src/backend/utils/misc/guc_tables.c.
 	r.MustRegister(NewVariable(Variable{
 		Name: "jit_above_cost", Type: TypeReal, BootVal: "100000",
+		MinVal: -1, MaxVal: 1e15,
+		Context: ContextUserset,
+		Scope:   ScopeSession | ScopeTransaction,
+		Flags:   FlagExplain,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "jit_optimize_above_cost", Type: TypeReal, BootVal: "500000",
+		MinVal: -1, MaxVal: 1e15,
+		Context: ContextUserset,
+		Scope:   ScopeSession | ScopeTransaction,
+		Flags:   FlagExplain,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "jit_inline_above_cost", Type: TypeReal, BootVal: "500000",
 		MinVal: -1, MaxVal: 1e15,
 		Context: ContextUserset,
 		Scope:   ScopeSession | ScopeTransaction,

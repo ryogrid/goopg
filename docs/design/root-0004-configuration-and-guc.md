@@ -340,3 +340,49 @@ showed the `max_connections` restart-required warning and
 `ContextPostmaster` GUCs (e.g. re-binding on a changed `port`) is not
 attempted — matching upstream, those still require a full process
 restart; goopg's reload only reports them.
+
+## Completing the `jit_*` GUC stub family (2026-07-08, M0122-0007)
+
+M0097-0073 registered three JIT-adjacent compatibility stubs (`jit`,
+`jit_above_cost`, `compute_query_id`, `plan_cache_mode`) so scripts
+written against real PostgreSQL don't fail with "unrecognized
+configuration parameter", but upstream's `guc_tables.c` defines nine
+`jit_*` GUCs total — six were still missing:
+`jit_optimize_above_cost`/`jit_inline_above_cost` (real, alongside the
+existing `jit_above_cost`) and `jit_debugging_support`/
+`jit_dump_bitcode`/`jit_expressions`/`jit_profiling_support`/
+`jit_tuple_deforming`/`jit_provider`. All eight now registered in
+`internal/config/defaults.go`, with boot values, `Type`, and
+`Context` copied directly from `guc_tables.c` (`jit_debugging_support`/
+`jit_profiling_support` are `PGC_SU_BACKEND` → `ContextSuBackend`;
+`jit_dump_bitcode` is `PGC_SUSET` → `ContextSuset`; `jit_provider` is
+`PGC_POSTMASTER` → `ContextPostmaster`; the rest are `PGC_USERSET` →
+`ContextUserset`). goopg has no JIT compiler at all — not even a
+consulted-but-inert code path — so, like their three siblings, these
+remain pure enumeration/SET-acceptance stubs with no runtime effect.
+Choosing `ContextSuBackend` for the two `SU_BACKEND` GUCs is
+functionally meaningful despite the "just a stub" framing:
+`SessionRegistry.Set` already rejects any `Context < ContextSuset`
+with `"parameter ... cannot be changed now"`, so `SET
+jit_debugging_support = on` correctly fails the same way it does
+against real PostgreSQL (`SU_BACKEND` GUCs are only settable at
+backend start, never via `SET`), without any new enforcement code.
+`postgresql.conf.sample` gained matching commented-out entries (this
+codebase's `TestSampleConfigCoversRegistry` requires every non-
+`FlagDisallowInFile` registry GUC to appear there, unlike upstream's
+own sample file which omits `GUC_NOT_IN_SAMPLE` entries — a
+deliberate goopg-local stricter convention, not a bug in the test).
+Tests: `TestJitGUCFamilyStubs` (table-driven over all 8, asserting
+boot value/type/context and `SET`-acceptance matching real PG's
+context rules), `TestJitCostGUCsAcceptNegativeOneSentinel` (the two
+new cost GUCs accept upstream's `-1`-disables sentinel and reject
+values below it), both `internal/config/jit_guc_stubs_test.go`
+(confirmed non-vacuous via `git stash` on `defaults.go` +
+`postgresql.conf.sample`). Gates: `go build ./...`/`go vet ./...`
+clean; `go test ./internal/config/...` PASS;
+`go test ./internal/executor/... ./internal/initdb/...` PASS (minus
+the pre-existing, unrelated `TestSeqScanFiresPrefetchesAcrossBlocks`
+hang tracked in the deferral ledger); `scripts/tpch-spotcheck.sh` PASS
+(Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+scripts/ralph-precommit-test.sh` PASS (0 failed txns, all 3
+workloads).

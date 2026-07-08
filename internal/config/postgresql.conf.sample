@@ -201,6 +201,8 @@
 #cpu_operator_cost = 0.0025            # 0-1e9
 #effective_cache_size = 4GB             # 1-1099511627776 kB
 #jit_above_cost = 100000                # perform JIT compilation when query cost is above this; -1 disables
+#jit_optimize_above_cost = 500000       # optimize JIT-compiled functions when query cost is above this; -1 disables
+#jit_inline_above_cost = 500000         # perform JIT inlining when query cost is above this; -1 disables
 #parallel_setup_cost = 1000             # cost of starting up worker processes for parallel query
 #parallel_tuple_cost = 0.1             # cost of passing each tuple from worker to master backend
 #from_collapse_limit = 8               # 1-2147483647
@@ -229,6 +231,12 @@
 #track_io_timing = off                  # collect per-I/O wait timing
 #stats_fetch_consistency = cache        # none | cache | snapshot
 #jit = off                              # allow JIT compilation
+#jit_debugging_support = off            # register JIT-compiled functions with debugger
+#jit_dump_bitcode = off                 # write out LLVM bitcode to facilitate JIT debugging
+#jit_expressions = on                   # allow JIT compilation of expressions
+#jit_profiling_support = off            # register JIT-compiled functions with perf profiler
+#jit_tuple_deforming = on               # allow JIT compilation of tuple deforming
+#jit_provider = 'llvmjit'               # JIT provider to use
 #compute_query_id = off                 # compute query identifiers
 #plan_cache_mode = auto                 # plan cache mode
 #check_function_bodies = on             # validate function bodies during creation

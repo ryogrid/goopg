@@ -4387,6 +4387,42 @@ mirroring M0119's ledger `status` column.
       scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 workloads).
       **Still open** (this bucket, ~9 remaining items): CREATE/DROP DATABASE
       full DDL, REINDEX physical rebuild, tablespaces, planner/jit GUC stubs.
+      **planner/jit GUC stubs — DONE (2026-07-08, later loop):** closed the
+      "planner/jit GUC stubs" resume point. Upstream's `guc_tables.c` defines
+      nine `jit_*` GUCs; M0097-0073 had only registered `jit`/`jit_above_cost`
+      (plus siblings `compute_query_id`/`plan_cache_mode`). Added the six
+      missing ones to `internal/config/defaults.go` —
+      `jit_optimize_above_cost`/`jit_inline_above_cost` (real, `-1`-disables
+      sentinel, same shape as the existing `jit_above_cost`) and
+      `jit_debugging_support`/`jit_dump_bitcode`/`jit_expressions`/
+      `jit_profiling_support`/`jit_tuple_deforming`/`jit_provider` (bool/string,
+      boot values and `Context` copied 1:1 from `guc_tables.c` —
+      `jit_debugging_support`/`jit_profiling_support` are `PGC_SU_BACKEND`,
+      `jit_dump_bitcode` is `PGC_SUSET`, `jit_provider` is `PGC_POSTMASTER`, the
+      rest `PGC_USERSET`). goopg has no JIT compiler so these remain pure
+      enumeration/SET-acceptance stubs, matching the pre-existing three; the
+      `SU_BACKEND` choice is still functionally meaningful — `SessionRegistry.
+      Set` already rejects `Context < ContextSuset`, so `SET
+      jit_debugging_support = on` correctly fails like real PG's "can't SET a
+      backend-start-only parameter" rather than silently no-opping. Added
+      matching commented-out `postgresql.conf.sample` entries (required by
+      `TestSampleConfigCoversRegistry`). New
+      `internal/config/jit_guc_stubs_test.go`: `TestJitGUCFamilyStubs`
+      (table-driven over all 8, boot value/type/context + SET-acceptance) and
+      `TestJitCostGUCsAcceptNegativeOneSentinel`; confirmed non-vacuous via
+      `git stash` on `defaults.go` + `postgresql.conf.sample`. Design:
+      `docs/design/root-0004-configuration-and-guc.md` new "Completing the
+      `jit_*` GUC stub family" section; `docs/design/README.md` row updated.
+      **M0122-0007's planner/jit GUC stubs item now has no known open
+      residuals; CREATE/DROP DATABASE full DDL, REINDEX physical rebuild, and
+      tablespaces remain** (~8 items). Gates: `go build ./...`/`go vet ./...`
+      clean; `go test ./internal/config/...` PASS; `go test
+      ./internal/executor/... ./internal/initdb/...` PASS (minus the
+      pre-existing, unrelated `TestSeqScanFiresPrefetchesAcrossBlocks` hang
+      already tracked in the deferral ledger — reproduces identically on a
+      clean stash of this loop's diff); `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+      scripts/ralph-precommit-test.sh` PASS (0 failed txns, all 3 workloads).
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,
       encoding constraints during bootstrap/runtime.
