@@ -682,6 +682,22 @@ type BTree struct {
 	// pattern as DebugTraceInserts.
 	DebugTraceFlushes bool
 	flushLog          []FlushSnapshotEvent
+	// DebugTraceReloads (M-NIGHTLY AI-20260708-064334-001 investigation
+	// aid, 9th loop): when true, arms RecordReloadSnapshot as the target
+	// for storage.Pool.OnBlockReload — every disk reload of a block
+	// belonging to this BTree's relation (pinLoad's cache-miss branch,
+	// right after Manager.ReadBlock, before the slot is published for Pin)
+	// is decoded with pageItems() and appended to reloadLog, sharing
+	// insertLog/rewriteLog/flushLog's Seq counter. The 8th loop proved the
+	// dirty-flush WRITE side always faithfully writes whatever bytes are
+	// in memory (18/18), narrowing the loss window to the READ side: does
+	// a reload ever serve stale or wrong bytes for a block that was just
+	// correctly flushed? This lets a caller compare "what a reload
+	// actually read" against the immediately preceding FlushSnapshotEvent
+	// for the same block. Off by default, zero cost when unset — same
+	// pattern as DebugTraceFlushes.
+	DebugTraceReloads bool
+	reloadLog         []ReloadSnapshotEvent
 	// logSeqNext is a single monotonic counter shared by insertLog and
 	// rewriteLog (instead of each using its own len()-based sequence) so a
 	// caller can compare Seq values ACROSS the two logs to establish
@@ -974,6 +990,57 @@ func (bt *BTree) FlushSnapshotRecordsForBlock(blk storage.BlockNumber) []FlushSn
 	defer bt.insertLogMu.Unlock()
 	var out []FlushSnapshotEvent
 	for _, e := range bt.flushLog {
+		if e.Block == blk {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// ReloadSnapshotEvent records one disk reload of a block: the leaf
+// entries pageItems() decodes from the exact bytes Manager.ReadBlock just
+// served, keyed to bt's shared Seq counter (see DebugTraceReloads) so a
+// caller can compare temporal order against flushLog for the same block.
+type ReloadSnapshotEvent struct {
+	Seq   uint64
+	Block storage.BlockNumber
+	Items []InsertLogRecord
+}
+
+// RecordReloadSnapshot is the storage.Pool.OnBlockReload hook this BTree
+// wires when DebugTraceReloads is set (e.g. `pool.OnBlockReload =
+// bt.RecordReloadSnapshot`): given the exact tag and bytes a disk reload
+// just read, it decodes pageItems() and appends a ReloadSnapshotEvent. A
+// no-op when DebugTraceReloads is false, tag belongs to a different
+// relation, or pageItems() can't decode the page (e.g. the meta page) —
+// matches the signature storage.Pool.OnBlockReload expects.
+func (bt *BTree) RecordReloadSnapshot(tag storage.BufferTag, page storage.Page) {
+	if !bt.DebugTraceReloads || tag.Rel != bt.rel {
+		return
+	}
+	items, err := pageItems(page)
+	if err != nil {
+		return
+	}
+	recs := make([]InsertLogRecord, len(items))
+	for i, it := range items {
+		recs[i] = InsertLogRecord{Block: tag.Block, LineIdx: i, Key: append([]byte(nil), it.key...), Ptr: it.ptr}
+	}
+	bt.insertLogMu.Lock()
+	seq := bt.logSeqNext
+	bt.logSeqNext++
+	bt.reloadLog = append(bt.reloadLog, ReloadSnapshotEvent{Seq: seq, Block: tag.Block, Items: recs})
+	bt.insertLogMu.Unlock()
+}
+
+// ReloadSnapshotRecordsForBlock returns every recorded ReloadSnapshotEvent
+// (see DebugTraceReloads) for blk, in recorded order. Test/investigation
+// helper.
+func (bt *BTree) ReloadSnapshotRecordsForBlock(blk storage.BlockNumber) []ReloadSnapshotEvent {
+	bt.insertLogMu.Lock()
+	defer bt.insertLogMu.Unlock()
+	var out []ReloadSnapshotEvent
+	for _, e := range bt.reloadLog {
 		if e.Block == blk {
 			out = append(out, e)
 		}

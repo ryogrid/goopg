@@ -362,17 +362,34 @@ type Pool struct {
 	OnFlushDone func()
 
 	// OnFlushSnapshot is an M-NIGHTLY investigation aid
-	// (AI-20260708-064334-001, 8th loop), nil by default (zero cost when
-	// unset). When set, flushSlot calls it immediately before the
-	// WriteBlock call with the exact tag and bytes about to be written to
-	// disk — letting a caller (e.g. btree.BTree.RecordFlushSnapshot)
-	// capture "what a dirty-page flush actually wrote" so it can be
-	// compared against the last known-good in-memory snapshot recorded for
-	// the same block by an independent, higher-layer log. Fires for every
-	// flushSlot call regardless of caller (evictVictim's dirty branch,
-	// WriteDirtyPages, checkpoint flushBatch), not just eviction-triggered
-	// flushes. Remove once the M-NIGHTLY root cause is fixed.
+	// (AI-20260708-064334-001, 8th loop; re-anchored post-write in the 9th
+	// loop), nil by default (zero cost when unset). When set, flushSlot
+	// calls it immediately AFTER the WriteBlock call succeeds, with the
+	// exact tag and bytes just durably written to disk — letting a caller
+	// (e.g. btree.BTree.RecordFlushSnapshot) capture "what a dirty-page
+	// flush actually wrote" so it can be compared against the last
+	// known-good in-memory snapshot recorded for the same block by an
+	// independent, higher-layer log. Post-write placement (not pre-write,
+	// as the 8th loop originally had it) matters for Seq-ordered
+	// cross-referencing against OnBlockReload, which fires post-read: both
+	// hooks now log "operation durably completed" time, so Seq comparisons
+	// between the two logs reflect real IO ordering instead of "intent to
+	// write" vs "read completed". Fires for every flushSlot call
+	// regardless of caller (evictVictim's dirty branch, WriteDirtyPages,
+	// checkpoint flushBatch), not just eviction-triggered flushes. Remove
+	// once the M-NIGHTLY root cause is fixed.
 	OnFlushSnapshot func(tag BufferTag, page Page)
+
+	// OnBlockReload is an M-NIGHTLY investigation aid
+	// (AI-20260708-064334-001, 9th loop), nil by default (zero cost when
+	// unset). When set, pinLoad's cache-miss branch calls it immediately
+	// after Manager.ReadBlock completes successfully, while s.contentMu is
+	// still held and before the slot is published for Pin — letting a
+	// caller (e.g. btree.BTree.RecordReloadSnapshot) capture "what bytes a
+	// disk reload actually served" so it can be compared against the last
+	// flush-snapshot recorded for the same block by OnFlushSnapshot. Remove
+	// once the M-NIGHTLY root cause is fixed.
+	OnBlockReload func(tag BufferTag, page Page)
 
 	// OnExtendWait is called when PinNew is about to extend rel via the
 	// pool's sole smgr Extend call (extend_time's OnFlushWait analogue).
@@ -1546,6 +1563,9 @@ func (p *Pool) pinLoad(tag BufferTag) (*Slot, error) {
 		p.OnPinWait()
 	}
 	ioErr := p.mgr.ReadBlock(tag.Rel, tag.Block, s.page)
+	if ioErr == nil && p.OnBlockReload != nil {
+		p.OnBlockReload(tag, s.page)
+	}
 	if p.OnPinDone != nil {
 		p.OnPinDone()
 	}
@@ -2033,11 +2053,18 @@ func (p *Pool) flushSlot(tag BufferTag, page Page) error {
 			}
 		}
 	}
-	if p.OnFlushSnapshot != nil {
-		p.OnFlushSnapshot(tag, page)
-	}
 	if err := p.mgr.WriteBlock(tag.Rel, tag.Block, page); err != nil {
 		return err
+	}
+	// OnFlushSnapshot fires AFTER WriteBlock succeeds (M-NIGHTLY
+	// AI-20260708-064334-001, 9th loop) so its Seq reflects "durably
+	// written" time, matching OnBlockReload's post-ReadBlock placement --
+	// firing before the write (as this did through the 8th loop) let a
+	// concurrent reload's real ReadAt land before this write's real
+	// WriteAt while still being assigned a LOWER Seq, making Seq-ordered
+	// flush-vs-reload comparisons unreliable.
+	if p.OnFlushSnapshot != nil {
+		p.OnFlushSnapshot(tag, page)
 	}
 	return nil
 }

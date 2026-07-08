@@ -990,6 +990,44 @@ every clean, green (build + pre-commit) checkpoint.
       the loop this investigation opened at the 7th loop. Do NOT re-open
       claimVictim, the fast-path insert sites, the split/dedup-rewrite
       path, or the clean-eviction path — all four conclusively cleared.
+      2026-07-08 update (9th loop on the reopen; see today's 9th deferral
+      ledger row): executed the main next step — built
+      `storage.Pool.OnBlockReload` (bufpool.go, called from `pinLoad`'s
+      cache-miss branch right after `Manager.ReadBlock` succeeds, nil by
+      default) plus `BTree.RecordReloadSnapshot`/`DebugTraceReloads`/
+      `ReloadSnapshotEvent`/`ReloadSnapshotRecordsForBlock` (btree.go),
+      sharing the same `Seq` counter. While wiring the cross-reference,
+      found and fixed a real bug in the 8th loop's own instrumentation:
+      `OnFlushSnapshot` fired BEFORE `flushSlot`'s `WriteBlock` call
+      (pre-write time) while the new `OnBlockReload` fires AFTER
+      `ReadBlock` returns (post-read time) — comparing `Seq` across the
+      two logs as originally built was apples-to-oranges. Moved
+      `OnFlushSnapshot` to fire after `WriteBlock` succeeds so both hooks
+      log "durably completed" time. Re-ran the repro AFTER this fix and
+      the signature strengthened: for all 14 lost entries in a fresh run,
+      the FIRST reload of the affected block after the last flush that had
+      the entry ALREADY lacks it, AND every subsequent reload of that same
+      block for the rest of the run (3179 reload-events checked) still
+      lacks it — a permanent, non-recovering loss, ruling out a transient
+      read/write race and pointing at either (a) the "good" flush's write
+      not durably landing, or (b) a second, stale write clobbering it
+      afterward (a lost-update pattern). Gates: `go build ./...` clean;
+      `go vet ./internal/amcheck/... ./internal/storage/...
+      ./internal/access/btree/...` clean; `go test ./internal/storage/...
+      ./internal/access/btree/... ./internal/amcheck/...` PASS (test
+      re-skipped); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33). Next
+      step: instrument `relFile.writeBlock`/`relFile.readBlock`
+      (`internal/storage/smgr.go`, both under `r.mu`) with a monotonic
+      op-sequence counter LOCAL to the `relFile` (not `bt`'s
+      `insertLogMu`-guarded `Seq`, to eliminate residual cross-goroutine
+      lock-ordering jitter) to determine the TRUE syscall order for a
+      given block, and check whether two `writeBlock` calls for the same
+      block ever interleave with an older copy landing after a newer one
+      (hypothesis b). Do NOT re-open claimVictim, the fast-path insert
+      sites, the split/dedup-rewrite path, the clean-eviction path, or
+      the dirty-flush write side — all five conclusively cleared; also do
+      not re-litigate whether the reload path is implicated, that is now
+      hard evidence, not hypothesis.
 
 - [x] race/internal/wal — race suite failed in package
       `github.com/goopg/goopg/internal/wal` (AI-20260707-000712-001; repro:

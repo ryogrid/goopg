@@ -365,6 +365,15 @@ func buildRealTreeConcurrent(t *testing.T, n, writers, poolSlots int, keyRange i
 	// rewrite/fast-path snapshot for the same block.
 	bt.DebugTraceFlushes = true
 	pool.OnFlushSnapshot = bt.RecordFlushSnapshot
+	// M-NIGHTLY investigation aid (AI-20260708-064334-001, 9th loop): the
+	// 8th loop proved the dirty-flush WRITE side always faithfully writes
+	// whatever bytes are in memory (18/18) -- the only remaining
+	// uninstrumented step in the eviction cycle is the READ side. Capture
+	// the exact bytes every disk reload serves so they can be
+	// cross-referenced against the immediately preceding flush snapshot
+	// for the same block.
+	bt.DebugTraceReloads = true
+	pool.OnBlockReload = bt.RecordReloadSnapshot
 
 	var wg sync.WaitGroup
 	var failed atomic.Bool
@@ -674,8 +683,73 @@ func buildRealTreeConcurrent(t *testing.T, n, writers, poolSlots int, keyRange i
 // and finally close the loop this investigation opened at the 7th loop.
 // See .ralph/deferral_ledger.md's 8th 2026-07-08 row for the full
 // writeup.
+//
+// Update (9th loop, same day, AI-20260708-064334-001): executed the 8th
+// loop's next step. Built storage.Pool.OnBlockReload (bufpool.go, called
+// from pinLoad's cache-miss branch immediately after Manager.ReadBlock
+// succeeds, before the slot is published for Pin) plus
+// BTree.RecordReloadSnapshot/DebugTraceReloads/ReloadSnapshotEvent
+// (btree.go), sharing the same Seq counter. While wiring the cross-
+// reference, found and fixed a real bug in the 8th loop's OWN
+// instrumentation first: OnFlushSnapshot fired BEFORE flushSlot's
+// WriteBlock call (pre-write "intent" time) while the new OnBlockReload
+// fires AFTER ReadBlock returns (post-read "completed" time) — comparing
+// Seq across the two logs as-is would have been apples-to-oranges, since
+// a reload's real disk read could complete before a flush's real disk
+// write yet still log a HIGHER Seq purely from insertLogMu lock-
+// acquisition jitter. Moved OnFlushSnapshot to fire after WriteBlock
+// succeeds so both hooks consistently log "operation durably completed"
+// time (bufpool.go's flushSlot). Re-ran the repro AFTER this fix and the
+// signature not only survived, it strengthened: for every one of 14 lost
+// entries in this run, the FIRST reload of the affected block recorded
+// after the last flush that had the entry ALREADY lacks it (e.g. blk=142:
+// flush seq=609678 itemCount=360 present=true; the very next reload,
+// seq=609829, itemCount=359 present=false) — one item short of what was
+// just durably written. Critically, this is not a one-off race that
+// later reads recover from: EVERY subsequent reload of the same block for
+// the rest of the run (3179 reload-events checked across all 14 missing
+// entries, from Seq deltas of a few hundred up to well over 100000 ticks
+// later) still lacks the entry, while the item count keeps climbing as
+// other writers insert on top. A transient read/write race would show
+// SOME later reloads recovering the entry once the real disk state
+// settles; a permanent, unrecovering loss instead means either (a) the
+// "good" flush's WriteBlock call did not durably land the entry despite
+// its in-memory snapshot having it, or (b) a second, older/stale write to
+// the same block landed on disk AFTER the good flush and clobbered it — a
+// classic lost-update pattern. storage.Pool.slotEvent traces for one
+// affected block (173) show three DIFFERENT slot indices (17, 25, 31)
+// holding the same tag across a span of ~3000 Seq ticks — slot 17's dirty
+// eviction (flush) immediately followed by slot 25's fresh pinLoad
+// (reload) then an immediate CLEAN eviction (no insert landed on it
+// while resident) then slot 31's own pinLoad (another reload) — i.e. the
+// block is churning through eviction/reload cycles on a ~64-slot pool
+// under 64-writer contention fast enough that back-to-back cycles for the
+// SAME block, on DIFFERENT physical slots, are common. Manual code
+// review of evictVictim's dirty branch (bufpool.go) and smgr.go's
+// relFile.readBlock/writeBlock (both properly serialized per-relFile
+// under r.mu, and evictVictim only calls bm.Delete(oldTag) strictly AFTER
+// flushSlot's WriteBlock returns) did not surface an obvious lock gap for
+// hypothesis (a); hypothesis (b) — a second, stale write clobbering the
+// good one — remains unrefuted and is the most likely remaining
+// mechanism, but requires either wall-clock (not Seq) instrumentation at
+// the smgr.relFile.writeBlock/readBlock layer directly, or a raw
+// independent re-read of the block right after the "good" flush (mirroring
+// what debugValidateCleanEviction already does for the clean-eviction
+// path) to catch a losing racer red-handed. Next step: instrument
+// relFile.writeBlock and relFile.readBlock directly (smgr.go, both
+// already under r.mu) with a monotonic op-sequence counter local to the
+// relFile (not bt's insertLogMu-guarded Seq, to eliminate ANY
+// cross-goroutine lock-ordering jitter) so a caller can determine, for a
+// specific block, the exact TRUE order of every WriteAt/ReadAt syscall —
+// then re-run this repro and check whether two writeBlock calls for the
+// SAME block are ever interleaved such that an OLDER in-memory copy's
+// write lands after the newer one's, which would confirm hypothesis (b)
+// directly and point at whichever caller is flushing stale content (likely
+// a second concurrent evictVictim/WriteDirtyPages/flushBatch caller
+// holding an outdated slot). See .ralph/deferral_ledger.md's 9th
+// 2026-07-08 row for the full writeup.
 func TestVerifyBtreeEngineSilentOnRealConcurrentContended(t *testing.T) {
-	t.Skip("known-failing: tracks M-NIGHTLY AI-20260708-064334-001 (btree lost-index-entry bug; 8th loop's flush-snapshot instrumentation localizes the loss to the RELOAD side of an eviction cycle -- every missing entry is present in the last flush before loss and already absent by the very next flush of the same block, with zero fast-path/rewrite violations in between; next step instruments Pool's cache-miss reload path); un-skip to confirm a fix")
+	t.Skip("known-failing: tracks M-NIGHTLY AI-20260708-064334-001 (btree lost-index-entry bug; 9th loop's reload-snapshot instrumentation proves the loss is a PERMANENT one-time event -- the first disk reload of a block after its last good flush already and durably lacks the lost entry, and every later reload of that block for the rest of the run still lacks it; ruled out a transient read/write race, points at either a non-durable 'good' write or a second stale write clobbering it; next step instruments smgr.go's relFile.writeBlock/readBlock directly with a lock-jitter-free op counter); un-skip to confirm a fix")
 	if testing.Short() {
 		t.Skip("skipping concurrent real-tree amcheck stress in short mode")
 	}
@@ -815,6 +889,48 @@ func TestVerifyBtreeEngineSilentOnRealConcurrentContended(t *testing.T) {
 							fe.Seq, fe.Block, len(fe.Items), has)
 						if !has {
 							t.Logf("  => LOCALIZED: dirty-page flush at seq=%d already lacked this (key,TID) in the exact bytes written to disk -- bug is upstream of flushSlot/WriteBlock, not the flush call itself", fe.Seq)
+						}
+					}
+				}
+				// M-NIGHTLY investigation aid (AI-20260708-064334-001, 9th
+				// loop): the 8th loop proved the flush WRITE side always
+				// faithfully wrote whatever was in memory. Now check the
+				// READ side directly: find the last flush of this block
+				// that still had the entry present (the "good" flush) and
+				// every reload of this block recorded after it -- does
+				// pageItems() on the reload already lack the entry? If so,
+				// that IS the smoking gun (a stale/wrong disk read); if
+				// every reload after the last good flush still HAS the
+				// entry, the loss must be happening after the reload
+				// (post-Pin, in-memory) instead, ruling the reload path
+				// out entirely.
+				{
+					var lastGoodFlushSeq uint64
+					haveLastGood := false
+					for _, fe := range flushEvents {
+						if btree.RewriteSnapshotHasTID(fe.Items, e.TID) {
+							if !haveLastGood || fe.Seq > lastGoodFlushSeq {
+								lastGoodFlushSeq = fe.Seq
+								haveLastGood = true
+							}
+						}
+					}
+					reloadEvents := bt.ReloadSnapshotRecordsForBlock(last.Block)
+					if len(reloadEvents) == 0 {
+						t.Logf("  no reload-snapshot event recorded for blk=%d (block never went through a disk reload during this run)", last.Block)
+					} else if !haveLastGood {
+						t.Logf("  %d reload-snapshot event(s) recorded for blk=%d, but no flush ever had this entry present -- cannot anchor a last-known-good flush", len(reloadEvents), last.Block)
+					} else {
+						for _, re := range reloadEvents {
+							if re.Seq < lastGoodFlushSeq {
+								continue
+							}
+							has := btree.RewriteSnapshotHasTID(re.Items, e.TID)
+							t.Logf("  reload-snapshot seq=%d blk=%d itemCount=%d presentAtReload=%v (last good flush seq=%d)",
+								re.Seq, re.Block, len(re.Items), has, lastGoodFlushSeq)
+							if !has {
+								t.Logf("  => SMOKING GUN: disk reload at seq=%d already lacked this (key,TID) despite the last flush of this block (seq=%d) having it -- the reload served stale or wrong bytes", re.Seq, lastGoodFlushSeq)
+							}
 						}
 					}
 				}
