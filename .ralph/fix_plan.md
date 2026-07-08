@@ -788,6 +788,40 @@ every clean, green (build + pre-commit) checkpoint.
       count). Did not run the full pre-commit/tpch-spotcheck gates — no
       production behavior changed (flag defaults false, zero-cost); MUST
       run those once the actual fix lands.
+      2026-07-08 update (4th loop on the reopen; see today's 4th deferral
+      ledger row): built `pool.DebugTraceSlotEvents` (`internal/storage/
+      bufpool.go`, off by default/zero-cost like `DebugValidateCleanEvictions`)
+      — a per-slot ring log of every MarkDirty*/claimVictim/evictVictim/
+      pinLoad-publish/PinNew-publish/releaseVictimSlot state transition,
+      auto-dumped (including a cross-slot scan for the same tag) whenever
+      a clean-eviction mismatch fires. Caught one mismatch in the act: a
+      slot loaded a page fresh from disk, was Unpinned with ZERO
+      intervening MarkDirty calls, then was re-claimed as a victim
+      moments later — legitimately clean by every tracked transition —
+      yet the disk re-read still disagreed. Cross-slot scan found no
+      other slot ever touched that tag (bufmap ownership is correctly
+      exclusive). Audited and ruled out (all clean): `bufmap.go` Insert/
+      Delete/Lookup/compact (mutex-serialized), `relFile.readBlock/
+      writeBlock/extend` (share one per-relation mutex, use ReadAt/
+      WriteAt not Seek+Read), `Manager.relFile`'s single-instance-per-rel
+      cache, `arena.slot`'s non-overlapping slicing. **Pivot finding**:
+      3 more back-to-back runs recorded (mismatches, missing-entries) =
+      (1,12)/(0,20)/(0,13) — the run with the MOST missing entries had
+      ZERO mismatches. Mismatch-firing and data loss are uncorrelated, so
+      the "clean eviction discards a real write" mechanism (3rd loop) is
+      at most a minor/coincidental contributor, not the dominant cause.
+      Leading hypothesis is now a genuine lost `btree.Insert` via a
+      structural split/redistribution race in `internal/access/btree`,
+      not an eviction/flush race in `internal/storage`. Gates: `go build
+      ./...` clean; `go vet ./internal/amcheck/... ./internal/storage/...
+      ./internal/access/btree/...` clean; `go test ./internal/storage/...
+      ./internal/access/btree/... ./internal/amcheck/...` PASS (test
+      re-skipped); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33). Next
+      step: reuse loop 2's reverted `insertItemSorted` write-log hook
+      live end-to-end, cross-reference against the final leaf walk to
+      find the exact (page, slot-offset) a lost key was written to, then
+      dump that page's `slotEvents` history (now available for free) to
+      see what clobbered it.
 
 - [x] race/internal/wal — race suite failed in package
       `github.com/goopg/goopg/internal/wal` (AI-20260707-000712-001; repro:

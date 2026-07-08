@@ -337,6 +337,7 @@ func buildRealTreeConcurrent(t *testing.T, n, writers, poolSlots int, keyRange i
 	// red-handed, with byte-level detail, instead of only detecting the
 	// resulting loss after the fact via the leaf-entry diff below.
 	pool.DebugValidateCleanEvictions = true
+	pool.DebugTraceSlotEvents = true
 	rel := storage.RelFileNode{DBOid: 1, RelOid: 9200, Fork: storage.MainFork}
 	bt, err := btree.Create(pool, rel)
 	if err != nil {
@@ -440,6 +441,46 @@ func buildRealTreeConcurrent(t *testing.T, n, writers, poolSlots int, keyRange i
 // monotonic per-slot event log (timestamp + old/new state) at every
 // MarkDirty and claimVictim call for one specific slot that triggers a
 // mismatch, to catch the transition in the act.
+//
+// Update (4th loop, same day, AI-20260708-064334-001): built
+// pool.DebugTraceSlotEvents (see bufpool.go) — a per-slot ring log of
+// every MarkDirty/claimVictim/evictVictim/pinLoad-publish/PinNew-publish/
+// releaseVictimSlot state transition, dumped automatically on a
+// DebugValidateCleanEvictions mismatch (both slot-local and a cross-slot
+// scan for the same tag, to check for impossible double-ownership).
+// Result: **the "clean eviction discards a real write" mechanism is NOT
+// the (sole) cause of the missing entries.** Captured one real mismatch
+// in the act: a slot loaded a page fresh from disk via pinLoad (cache
+// miss), was Unpinned with ZERO intervening MarkDirty call, then was
+// re-claimed as a victim moments later — genuinely clean by every
+// tracked state transition — yet DebugValidateCleanEviction's disk
+// re-read still disagreed with what was just read into memory. The
+// cross-slot scan found no other slot ever recorded touching the same
+// tag, ruling out double-ownership via the bufmap (Insert's mutex
+// correctly serializes tag ownership; audited bufmap.go's Insert/
+// Delete/Lookup/compact, relFile's readBlock/writeBlock/extend (all
+// share one per-relation r.mu, using ReadAt/WriteAt not Seek+Read so no
+// torn-offset race), Manager.relFile's single-instance-per-rel cache,
+// and arena.slot's non-overlapping three-index slicing — all clean).
+// Decisive tiebreaker: 3 back-to-back runs recorded 1/0/0
+// DebugValidateCleanEviction mismatches but 12/20/13 missing entries —
+// the run with the MOST missing entries (20) had ZERO mismatches. Missing-
+// entry count and mismatch-firing are uncorrelated, so clean-eviction
+// mismatches are at most a minor/coincidental contributor, and the
+// dominant loss mechanism has to be something that never touches the
+// dirty-bit machinery at all — most likely a genuine lost btree.Insert
+// (an insert that reaches insertItemSorted, as loop 2 already proved via
+// the write-log hook, but whose effect never survives to the final leaf
+// walk) via a structural race (concurrent split/redistribution corrupting
+// or dropping an item) rather than an eviction/flush race. Next step:
+// reuse loop 2's reverted insertItemSorted write-log hook, but this time
+// keep it live end-to-end and cross-reference it against the final leaf
+// walk to find the exact (page, slot-offset) a lost key was written to,
+// then trace that page's slotEvents history (now available without
+// building new instrumentation) to see what clobbered it — likely a
+// split/redistribution logic bug in internal/access/btree, not
+// internal/storage/bufpool.go. See .ralph/deferral_ledger.md's 4th
+// 2026-07-08 row for the full writeup.
 func TestVerifyBtreeEngineSilentOnRealConcurrentContended(t *testing.T) {
 	t.Skip("known-failing: tracks M-NIGHTLY AI-20260708-064334-001 (buffer-pool eviction lost-item bug); un-skip to confirm a fix")
 	if testing.Short() {

@@ -49,6 +49,11 @@ func stateIO(st uint64) bool       { return st&slotIOBit != 0 }
 type Slot struct {
 	page Page // alias into the arena
 
+	// idx is this slot's fixed index into Pool.slots, set once in
+	// NewPool. Lets MarkDirty* (which only receive a *Slot) address
+	// Pool.slotEvents without pointer arithmetic. See DebugTraceSlotEvents.
+	idx int32
+
 	// Tag identifies the (rel, fork, block) the slot currently holds.
 	// Written only while ioInflight is set in state; readable once valid.
 	tag BufferTag
@@ -395,6 +400,111 @@ type Pool struct {
 	// internal/amcheck, which sets this to reproduce the bug in ~1s.
 	// Remove this field once the eviction-race root cause is fixed.
 	DebugValidateCleanEvictions bool
+
+	// DebugTraceSlotEvents is an M-NIGHTLY investigation aid
+	// (AI-20260708-064334-001), off by default (zero cost when false: the
+	// only always-paid cost is the per-slot ring buffer allocation in
+	// NewPool). When true, every dirty-mark call and every claim/evict/
+	// publish/release state transition is appended to a bounded per-slot
+	// ring (slotEvents), so a debugValidateCleanEviction mismatch can dump
+	// the exact sequence of events that led to a slot's dirty bit reading
+	// false when unflushed content says it should have read true. Remove
+	// alongside DebugValidateCleanEvictions once the root cause is fixed.
+	DebugTraceSlotEvents bool
+	slotEvents           []slotEventRing
+	slotEventSeq         atomic.Uint64
+}
+
+// slotEventKind identifies which state-transition site produced a
+// slotEvent. See DebugTraceSlotEvents.
+type slotEventKind uint8
+
+const (
+	evMarkDirty slotEventKind = iota
+	evMarkDirtyWithLSNLocked
+	evMarkDirtyChangeRecord
+	evClaimVictim
+	evEvictVictimClean
+	evEvictVictimDirty
+	evPinLoadPublish
+	evPinNewPublish
+	evReleaseVictimSlot
+)
+
+func (k slotEventKind) String() string {
+	switch k {
+	case evMarkDirty:
+		return "MarkDirty"
+	case evMarkDirtyWithLSNLocked:
+		return "MarkDirtyWithLSNLocked"
+	case evMarkDirtyChangeRecord:
+		return "MarkDirtyChangeRecord"
+	case evClaimVictim:
+		return "claimVictim"
+	case evEvictVictimClean:
+		return "evictVictim(clean)"
+	case evEvictVictimDirty:
+		return "evictVictim(dirty)"
+	case evPinLoadPublish:
+		return "pinLoad-publish"
+	case evPinNewPublish:
+		return "PinNew-publish"
+	case evReleaseVictimSlot:
+		return "releaseVictimSlot"
+	default:
+		return "unknown"
+	}
+}
+
+// slotEvent is one recorded state transition. See DebugTraceSlotEvents.
+type slotEvent struct {
+	seq      uint64
+	kind     slotEventKind
+	tag      BufferTag
+	oldState uint64
+	newState uint64
+}
+
+// slotEventRingSize bounds memory and dump size; large enough to cover
+// several full occupancy cycles of a slot under heavy churn.
+const slotEventRingSize = 64
+
+// slotEventRing is a lock-free (single monotonic-counter) ring buffer of
+// the most recent slotEventRingSize events for one slot. Writers use
+// pos.Add(1)-1 as their slot index; a torn read racing a wraparound write
+// is acceptable for a best-effort debug dump.
+type slotEventRing struct {
+	events [slotEventRingSize]slotEvent
+	pos    atomic.Uint64
+}
+
+// traceSlotEvent records one state transition for slotIdx when
+// DebugTraceSlotEvents is enabled; a no-op otherwise.
+func (p *Pool) traceSlotEvent(slotIdx int32, kind slotEventKind, tag BufferTag, oldSt, newSt uint64) {
+	if !p.DebugTraceSlotEvents {
+		return
+	}
+	seq := p.slotEventSeq.Add(1)
+	ring := &p.slotEvents[slotIdx]
+	i := ring.pos.Add(1) - 1
+	ring.events[i%slotEventRingSize] = slotEvent{seq: seq, kind: kind, tag: tag, oldState: oldSt, newState: newSt}
+}
+
+// dumpSlotEvents logs the recorded event history for slotIdx, oldest
+// first. Used by debugValidateCleanEviction to explain a mismatch.
+func (p *Pool) dumpSlotEvents(slotIdx int32) {
+	ring := &p.slotEvents[slotIdx]
+	pos := ring.pos.Load()
+	start := uint64(0)
+	if pos > slotEventRingSize {
+		start = pos - slotEventRingSize
+	}
+	for i := start; i < pos; i++ {
+		e := ring.events[i%slotEventRingSize]
+		p.logger.Error("slot-event (M-NIGHTLY AI-20260708-064334-001)",
+			"seq", e.seq, "slotIdx", slotIdx, "kind", e.kind.String(), "tag", e.tag,
+			"oldState", fmt.Sprintf("%#016x", e.oldState), "newState", fmt.Sprintf("%#016x", e.newState))
+	}
 }
 
 // PoolConfig controls Pool sizing.
@@ -536,6 +646,7 @@ func NewPool(mgr *Manager, cfg PoolConfig) (*Pool, error) {
 		bm:                       newBufmap(cfg.Slots),
 		slotSema:                 make([]uint32, cfg.Slots),
 		slotWaiters:              make([]atomic.Int32, cfg.Slots),
+		slotEvents:               make([]slotEventRing, cfg.Slots),
 	}
 	p.fullPageWrites.Store(cfg.FullPageWrites)
 	// Upstream defaults (pg_config_manual.h): DEFAULT_CHECKPOINT_FLUSH_AFTER=32,
@@ -547,6 +658,7 @@ func NewPool(mgr *Manager, cfg PoolConfig) (*Pool, error) {
 	// Initialise per-slot page pointers.
 	for i := range p.slots {
 		p.slots[i].page = a.slot(i)
+		p.slots[i].idx = int32(i)
 	}
 	return p, nil
 }
@@ -941,7 +1053,10 @@ func (p *Pool) tryPinSlot(slotIdx int32, gen uint32) *Slot {
 // Wakes any goroutines waiting on this slot's IO via per-slot semaphore.
 func (p *Pool) releaseVictimSlot(victimIdx int) {
 	n := p.slotWaiters[victimIdx].Load()
-	p.slots[victimIdx].state.Store(0)
+	s := &p.slots[victimIdx]
+	prevSt := s.state.Load()
+	s.state.Store(0)
+	p.traceSlotEvent(int32(victimIdx), evReleaseVictimSlot, s.tag, prevSt, 0)
 	for i := int32(0); i < n; i++ {
 		runtimeshim.SemaRelease(&p.slotSema[victimIdx])
 	}
@@ -996,6 +1111,7 @@ func (p *Pool) claimVictim() (victimIdx int, wasDirty bool, oldTag BufferTag, er
 			if !wasValid {
 				tag = BufferTag{}
 			}
+			p.traceSlotEvent(int32(i), evClaimVictim, tag, old, newSt)
 			return i, wasValid && dirty, tag, nil
 		}
 		// Another goroutine modified this slot concurrently; try next.
@@ -1022,12 +1138,15 @@ func (p *Pool) evictVictim(victimIdx int, wasDirty bool, oldTag BufferTag) error
 		}
 		// Nothing to flush: the on-disk content already matches, so it's
 		// safe to retire the tag immediately.
+		st := p.slots[victimIdx].state.Load()
+		p.traceSlotEvent(int32(victimIdx), evEvictVictimClean, oldTag, st, st)
 		p.bm.Delete(oldTag, int32(victimIdx))
 		p.tombstones.Add(1)
 		p.maybeCompact()
 		return nil
 	}
 	s := &p.slots[victimIdx]
+	p.traceSlotEvent(int32(victimIdx), evEvictVictimDirty, oldTag, s.state.Load(), s.state.Load())
 	// Release pinMu while doing IO so other goroutines can proceed.
 	p.pinMu.Unlock()
 	s.contentMu.Lock()
@@ -1097,6 +1216,36 @@ func (p *Pool) debugValidateCleanEviction(victimIdx int, oldTag BufferTag) {
 		"tag", oldTag, "slotIdx", victimIdx, "firstDiffByte", firstDiff,
 		"lastDiffByte", lastDiff, "ndiffBytes", ndiff,
 		"diskLSN", MustHeader(diskCopy).LSN(), "memLSN", MustHeader(mem).LSN())
+	if p.DebugTraceSlotEvents {
+		p.dumpSlotEvents(int32(victimIdx))
+		p.dumpCrossSlotEventsForTag(oldTag)
+	}
+}
+
+// dumpCrossSlotEventsForTag is a one-shot M-NIGHTLY investigation aid
+// (AI-20260708-064334-001): scans every slot's event ring for any event
+// touching tag, to check whether two different physical slots ever both
+// recorded activity for the same tag concurrently (which bufmap's Insert
+// mutex is supposed to make impossible). Only called from the already
+// DebugTraceSlotEvents-gated debugValidateCleanEviction path.
+func (p *Pool) dumpCrossSlotEventsForTag(tag BufferTag) {
+	for slotIdx := range p.slotEvents {
+		ring := &p.slotEvents[slotIdx]
+		pos := ring.pos.Load()
+		start := uint64(0)
+		if pos > slotEventRingSize {
+			start = pos - slotEventRingSize
+		}
+		for i := start; i < pos; i++ {
+			e := ring.events[i%slotEventRingSize]
+			if e.tag != tag {
+				continue
+			}
+			p.logger.Error("cross-slot-event (M-NIGHTLY AI-20260708-064334-001)",
+				"seq", e.seq, "slotIdx", slotIdx, "kind", e.kind.String(), "tag", e.tag,
+				"oldState", fmt.Sprintf("%#016x", e.oldState), "newState", fmt.Sprintf("%#016x", e.newState))
+		}
+	}
 }
 
 // PinNew pins the next-after-end block of rel for writing without
@@ -1155,9 +1304,11 @@ func (p *Pool) PinNew(rel RelFileNode) (*Slot, BlockNumber, error) {
 
 	// Publish this slot as valid+dirty+pinned.
 	gen := stateGen(s.state.Load())
+	prevSt := s.state.Load()
 	s.tag = tag
 	newSt := slotValidBit | slotDirtyBit | uint64(1) | (uint64(1) << slotUsageShift) | (uint64(gen) << slotGenShift)
 	s.state.Store(newSt)
+	p.traceSlotEvent(int32(victimIdx), evPinNewPublish, tag, prevSt, newSt)
 
 	// Insert into bufmap. Under pinMu, no other goroutine can insert the same tag.
 	if !p.bm.Insert(tag, int32(victimIdx), gen) {
@@ -1165,6 +1316,7 @@ func (p *Pool) PinNew(rel RelFileNode) (*Slot, BlockNumber, error) {
 		// Use their slot and release ours.
 		if existingIdx, existingGen := p.bm.Lookup(tag); existingIdx >= 0 {
 			if existing := p.tryPinSlot(existingIdx, existingGen); existing != nil {
+				p.traceSlotEvent(int32(victimIdx), evReleaseVictimSlot, tag, s.state.Load(), 0)
 				s.tag = BufferTag{}
 				s.state.Store(0)
 				p.pinMu.Unlock()
@@ -1340,6 +1492,7 @@ func (p *Pool) pinLoad(tag BufferTag) (*Slot, error) {
 	s.tag = tag
 	if !p.bm.Insert(tag, int32(victimIdx), gen) {
 		// Another goroutine (in a concurrent PinNew?) published this tag.
+		p.traceSlotEvent(int32(victimIdx), evReleaseVictimSlot, tag, s.state.Load(), 0)
 		s.tag = BufferTag{}
 		p.releaseVictimSlot(victimIdx)
 		return nil, nil // caller retries
@@ -1369,8 +1522,10 @@ func (p *Pool) pinLoad(tag BufferTag) (*Slot, error) {
 	// Transition to valid+pinned. Read waiter count under pinMu before
 	// clearing ioInflight so no new waiters can arrive between read and wake.
 	n := p.slotWaiters[victimIdx].Load()
+	prevSt := s.state.Load()
 	newSt := slotValidBit | uint64(1) | (uint64(1) << slotUsageShift) | (uint64(gen) << slotGenShift)
 	s.state.Store(newSt)
+	p.traceSlotEvent(int32(victimIdx), evPinLoadPublish, tag, prevSt, newSt)
 	for i := int32(0); i < n; i++ {
 		runtimeshim.SemaRelease(&p.slotSema[victimIdx])
 	}
@@ -1455,8 +1610,10 @@ func (p *Pool) MarkDirty(s *Slot) {
 		if old&slotDirtyBit != 0 {
 			return // already dirty
 		}
-		if s.state.CompareAndSwap(old, old|slotDirtyBit) {
+		newSt := old | slotDirtyBit
+		if s.state.CompareAndSwap(old, newSt) {
 			p.sharedDirtiedCount.Add(1)
+			p.traceSlotEvent(s.idx, evMarkDirty, s.tag, old, newSt)
 			return
 		}
 	}
@@ -1501,8 +1658,10 @@ func (p *Pool) markDirtyWithLSNCommon(s *Slot) {
 			// Already dirty; still need to update fpiSinceCheckpoint.
 			break
 		}
-		if s.state.CompareAndSwap(old, old|slotDirtyBit) {
+		newSt := old | slotDirtyBit
+		if s.state.CompareAndSwap(old, newSt) {
 			p.sharedDirtiedCount.Add(1)
+			p.traceSlotEvent(s.idx, evMarkDirtyWithLSNLocked, s.tag, old, newSt)
 			break
 		}
 	}
@@ -1591,8 +1750,10 @@ func (p *Pool) MarkDirtyChangeRecord(s *Slot, emitter func() (LSN, error)) error
 		if old&slotDirtyBit != 0 {
 			break
 		}
-		if s.state.CompareAndSwap(old, old|slotDirtyBit) {
+		newSt := old | slotDirtyBit
+		if s.state.CompareAndSwap(old, newSt) {
 			p.sharedDirtiedCount.Add(1)
+			p.traceSlotEvent(s.idx, evMarkDirtyChangeRecord, s.tag, old, newSt)
 			break
 		}
 	}
