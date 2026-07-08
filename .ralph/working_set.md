@@ -1,88 +1,89 @@
 Task: M-NIGHTLY pgbench/nightly-reopen-20260708 (AI-20260708-064334-001) —
-IN PROGRESS, not complete. Root cause narrowed from "somewhere in
-claimVictim/evictVictim/pinLoad" to a DEFINITIVE proof: the `!wasDirty`
-("clean eviction") fast path in evictVictim discards real, unflushed
-writes. Exact mechanism (why the dirty bit reads false) still open. See
-fix_plan.md task + deferral ledger's 3rd 2026-07-08 row for full detail.
+IN PROGRESS, not complete. PIVOTED this loop: the "clean eviction discards
+unflushed writes" mechanism (3rd loop's headline finding) is now PROVEN NOT
+to be the dominant cause of the lost B-tree entries. Next loop should chase
+a genuine lost btree.Insert via a structural split/redistribution race in
+internal/access/btree, NOT the storage/eviction layer. See fix_plan.md's
+4th-loop update + deferral ledger's 4th 2026-07-08 row for full detail.
 
-Files: internal/storage/bufpool.go (NEW `Pool.DebugValidateCleanEvictions`
-bool field, default false/zero-cost + NEW `debugValidateCleanEviction`
-helper called from evictVictim's `!wasDirty` branch — KEEP, this is the
-regression/repro tool, not throwaway), internal/amcheck/verify_nbtree_realtree_test.go
-(`buildRealTreeConcurrent` now also returns every inserted (key,TID) pair;
-`TestVerifyBtreeEngineSilentOnRealConcurrentContended` sets
-`pool.DebugValidateCleanEvictions = true` and logs exact MISSING entries
-via a diff against the real leaf walk — still `t.Skip`'d, un-skip to
-reproduce). .ralph/fix_plan.md + .ralph/deferral_ledger.md updated.
+Files: internal/storage/bufpool.go (NEW `Pool.DebugTraceSlotEvents` bool,
+default false/zero-cost + `slotEventRing`/`slotEvent`/`traceSlotEvent`/
+`dumpSlotEvents`/`dumpCrossSlotEventsForTag` — wired into MarkDirty,
+MarkDirtyWithLSNLocked (via markDirtyWithLSNCommon), MarkDirtyChangeRecord,
+claimVictim, evictVictim (clean+dirty), pinLoad-publish, PinNew-publish
+(+ its "another goroutine published" discard branch), releaseVictimSlot
+(+ pinLoad's "Insert failed" discard branch). Added `Slot.idx int32` (set
+once in NewPool) so MarkDirty* — which only receive a *Slot — can address
+the per-slot ring without pointer arithmetic. KEEP all of this: reusable,
+zero-cost-when-off investigation tool, same pattern as
+DebugValidateCleanEvictions), internal/amcheck/verify_nbtree_realtree_test.go
+(buildRealTreeConcurrent now also sets pool.DebugTraceSlotEvents=true
+unconditionally, mirroring the existing DebugValidateCleanEvictions=true;
+big doc-comment above TestVerifyBtreeEngineSilentOnRealConcurrentContended
+extended with this loop's findings; test itself re-skipped, unchanged
+otherwise). .ralph/fix_plan.md + .ralph/deferral_ledger.md updated.
+Committed as f9df1f51.
 
-Key symbols for next step: internal/storage/bufpool.go — MarkDirty,
-MarkDirtyChangeRecord, markDirtyWithLSNCommon, claimVictim (the CAS that
-reads+replaces s.state). Need a NEW per-slot event log (not yet built)
-recording every dirty-SET and every claimVictim CAS with old/new state +
-a monotonic sequence number.
+Key symbols for next step: internal/access/btree/btree.go — insertItemSorted
+(loop 2 built-and-reverted a write-log hook here proving every lost item
+DOES reach insertItemSorted), the split/redistribution code around
+insertIntoBlock (~1420-1660, under bt.splitMu), tryInsertNoSplit,
+finishSplit, clearIncompleteSplit. internal/storage/bufpool.go's new
+DebugTraceSlotEvents/dumpSlotEvents (reusable now — no new instrumentation
+needed to trace a specific page's storage-layer history once you know
+which page a lost key landed on).
 
-Hypothesis/Findings: (1) DEFINITIVE (byte-level proof via
-DebugValidateCleanEvictions): a "clean" eviction's in-memory page
-differs from its on-disk image by dozens-hundreds of bytes starting at
-byte 12 (right after the page header) — i.e. real accumulated inserts
-that were never flushed, discarded because the dirty bit read false.
-Fires 1-2 times per ~1s run, explaining the 6-42 missing entries/run
-(each bad clean-eviction loses several items at once, matching the
-diff's "single page, several items" pattern already seen in leaf-entry
-diffs). (2) RULED OUT this loop, with hard measurements: (a) ABA via the
-15-bit slot-generation counter wrapping (measured max ~2500 claims/slot
-in a full run, needs 32768 to wrap — not close); (b) stale
-recycled-block reuse via pinNewOrRecycled/popRecycledBlock (dead code
-for this insert-only test — recycleBlock is only called from
-btree_vacuum.go, never invoked here; DOES apply to the real
-vacuum-enabled pgbench nightly workload though — separate follow-up);
-(c) a plain unsynchronized data race (`go test -race` on this exact
-repro: ZERO race warnings, still reproduces both symptoms — this is a
-pure protocol/ordering bug, not a torn memory access). (3) Every
-MarkDirty/MarkDirtyChangeRecord/MarkDirtyWithLSNLocked call site in
-internal/access/btree/btree.go audited (tryInsertNoSplit,
-insertIntoBlock's 3 branches, createNewRoot, finishSplit,
-clearIncompleteSplit, clearRootFlag) — all correctly write-then-dirty
-with the pin held continuously across both; MarkDirty is not being
-skipped by btree.go. (4) Every dirty-CLEARING site in bufpool.go
-enumerated (flushBatch's clear loop — not invoked, test never calls
-FlushAll/checkpointer; InvalidateRel/InvalidateBlock — not called;
-claimVictim's own full-state-overwrite CAS, which correctly captures
-dirty from `old` before replacing) — none explain a real MarkDirty's
-effect vanishing without an intervening eviction. (5) Confirmed
-(storage.InvalidBlockNumber = 0xFFFFFFFF) the prior loop's
-tryInsertOnCachedRightmost dead-code finding (Next compared against
-literal 0) is correct and NOT the cause.
+Hypothesis/Findings: (1) DEFINITIVE (this loop): a real clean-eviction
+content mismatch was caught with FULL per-slot event history — the slot
+had ZERO writes (no MarkDirty at all) during its occupancy of the mismatched
+tag, ruling out "lost MarkDirty for THIS occupancy" as that specific
+mismatch's cause. (2) RULED OUT this loop (all audited, all clean): bufmap.go
+Insert/Delete/Lookup/compact (mutex-serialized, no duplicate-tag window
+possible); relFile.readBlock/writeBlock/extend (smgr.go) — share ONE
+per-relation r.mu, use ReadAt/WriteAt (not Seek+Read, so no torn-offset
+race); Manager.relFile's single-relFile-instance-per-rel cache (mutex-
+guarded map); arena.slot's non-overlapping three-index byte slicing.
+(3) DECISIVE (this loop): ran the repro 3 more times, recording
+(DebugValidateCleanEviction mismatches, missing-entry count) pairs:
+(1,12)/(0,20)/(0,13). The run with the MOST missing entries (20) had
+ZERO mismatches. Mismatch-firing and data-loss magnitude are UNCORRELATED
+— the clean-eviction mechanism is at most a minor/coincidental contributor,
+not the primary bug. (4) Everything from loops 1-3 about claimVictim/
+evictVictim/pinLoad/PinNew/bufmap/MarkDirty* call sites remains valid (no
+bug found there after 4 full loops of dedicated audit) — the eviction path
+should now be considered thoroughly investigated and NOT the next place to
+look.
 
-Next step: build a per-slot monotonic event log (new bool flag,
-zero-cost when off, mirroring DebugValidateCleanEvictions) recording
-every MarkDirty*/claimVictim state transition (slot idx, tag, old/new
-state, seq). Re-run with both flags on; when debugValidateCleanEviction
-fires for tag T, dump T's event history to find which MarkDirty call's
-effect vanished and what happened to s.state right after — specifically
-check whether tag T got evicted+reloaded into a DIFFERENT physical slot
-mid-lifetime, i.e. whether "the same tag" across its lifetime actually
-spans two slots at a handoff point that loses the dirty signal. Once
-fixed: un-skip TestVerifyBtreeEngineSilentOnRealConcurrentContended
-permanently as its regression guard, then re-run the ORIGINAL
-pgbench-based repro (ci/batch/stages/stage-pgbench.sh, s=50 c=100 j=20
-T=180) to check whether the nightly "empty internal page" abort was the
-same bug. Also re-check pinNewOrRecycled's recycled-block path
-specifically for the vacuum-enabled real workload once this bug closes.
+Next step: pivot to internal/access/btree's structural write path. Reuse
+loop 2's reverted insertItemSorted write-log hook (temporary instrumentation
+that logs every item actually written, with page tag + slot offset), but
+this time DON'T revert it — keep it live for the length of one debugging
+session, cross-reference its full write log against
+TestVerifyBtreeEngineSilentOnRealConcurrentContended's final leaf walk to
+identify the EXACT (page tag, slot-offset) a lost key was written to. Then
+call the now-available `pool.DebugTraceSlotEvents` +
+`pool.dumpSlotEvents`-equivalent (may need a small helper to dump-by-tag
+rather than by-victim-slot, since the tag's CURRENT slot isn't known ahead
+of time — consider adding a `Pool.DumpEventsForTag(tag)` convenience that
+scans all rings, similar to the existing dumpCrossSlotEventsForTag) on that
+specific page's full history to see whether a LATER split/redistribution
+call overwrote or dropped the item. If the storage-layer trace shows nothing
+wrong for that specific page either, the bug is purely logical inside
+internal/access/btree's split/redistribution arithmetic (pageItems/
+parseItem/parsePostingRaw or the split-point/copy logic), not a race at
+all — focus single-threaded logic review there next.
 
-Gates run this loop (all PASS): go build ./...; go vet
-./internal/amcheck/... ./internal/storage/... ./internal/access/btree/...;
-go test ./internal/storage/... ./internal/access/btree/...
-./internal/amcheck/... (new test skipped by design, not counted as a
-pass). Did NOT run the full ralph-precommit-test.sh / tpch-spotcheck.sh
-pre-commit gates this loop since no production behavior changed for any
-live code path (DebugValidateCleanEvictions defaults false and is
-zero-cost; only test files + an opt-in debug field changed) — the next
-loop that lands the actual bufpool fix MUST run those before committing
-per the Hard-won Rules.
+Gates run this loop (all PASS): go build ./...; go vet ./internal/amcheck/...
+./internal/storage/... ./internal/access/btree/...; go test
+./internal/storage/... ./internal/access/btree/... ./internal/amcheck/...
+(new/updated test re-skipped by design); scripts/tpch-spotcheck.sh
+(Q12=2/Q13=33 PASS); pre-commit pgbench smoke (via git commit hook, PASS,
+0 failed across all 3 workloads); make ralph-state-guard (self-repaired a
+stale status/progress marker from the previous loop, then reported OK).
 
-In-flight: none — the earlier heavier instrumentation (unconditional
-disk-read validation, per-slot ABA claim counters) was refactored down
-to the single zero-cost-when-off `DebugValidateCleanEvictions` flag and
-verified still reproduces before finishing. No background processes
-left running.
+In-flight: none. No background processes left running. The test file's
+temporary un-skip + DebugTraceSlotEvents-enabling used during this loop's
+investigation was reverted/finalized before commit (t.Skip restored,
+DebugTraceSlotEvents=true left ON in buildRealTreeConcurrent permanently,
+matching the existing DebugValidateCleanEvictions=true precedent — this is
+intentional, not leftover WIP).
