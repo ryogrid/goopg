@@ -6270,6 +6270,65 @@ mirroring M0119's ledger `status` column.
       (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
       scripts/ralph-precommit-test.sh` PASS (0 failed transactions, all 3
       pgbench workloads).
+  - [x] `M0122-0007` follow-up 17 (2026-07-10, this loop) — **closed
+      4d-ii-part-2b item 2, wiring `RelFileNode.DBOid` at creation time.**
+      `catalog.Table`/`catalog.Index` (`internal/catalog/catalog.go`) each
+      gained a `DBOid uint32` field, populated by `CreateTable`/`CreateIndex`
+      from `resolveDBOid(dbOid)` — the same `dbOid ...uint32` variadic
+      parameter every executor DDL call site already threads as
+      `catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)` (follow-ups 14/15/16),
+      so **no call site of `CreateTable`/`CreateIndex` needed to change** —
+      the field rides the existing parameter. `InMemory.RelFileNode`/
+      `IndexRelFileNode` now prefer `table.DBOid`/`index.DBOid` over the
+      single process-wide `c.dbOid`, but **only when it names a genuinely
+      distinct database** (nonzero and not `DefaultDBOid`) — the
+      `postgres`/`template1` dual-mirror guard the design doc's original
+      scope note called out: every `NamespaceDBOid`-translated "postgres"
+      table's own `DBOid` is `DefaultDBOid` (1) for `c.ns()` keying (same
+      translation `LookupTable`/`CreateTable` already apply), but its
+      correct *physical* dbOid is whatever `c.dbOid` currently resolves to
+      (`PostgresDBOid`=5 after `SetDBOID` runs at startup, per
+      `detectCatalogDBOID` — preserving the `base/1/` + `base/5/` mirror).
+      Using `table.DBOid` unconditionally was tried first and immediately
+      broke `TestAlterTableSetTablespacePhysicalRelocationSurvivesRestart`
+      (relocated files landed under `base/1/pg_tblspc/…` instead of the
+      expected `base/5/pg_tblspc/…` after restart) — confirms the guard is
+      load-bearing, not defensive boilerplate; fixed by only trusting
+      `table.DBOid`/`index.DBOid` when it differs from both 0 and
+      `DefaultDBOid`. New test
+      `TestRelFileNodeUsesTableOwnDBOidNotProcessWideDefault`
+      (`internal/executor/ddl_write_dbid_routing_test.go`) proves two
+      same-named tables (and their PK indexes) created on distinct
+      connection dbOids now resolve to genuinely distinct
+      `storage.RelFileNode` values — previously they aliased onto the same
+      on-disk relfilenode path despite `storage.RelFileNode.DBOid` being a
+      real field since slice 1, because `RelFileNode`/`IndexRelFileNode`
+      always read the single process-wide `c.dbOid` regardless of which
+      table/index was asked about. **Not covered by this item (documented,
+      not silently dropped):** `TryRegisterUserTable`/`RegisterRealTable`
+      (the pg_class-heap-scan and `pg_goopg_catalog_cache.json`-snapshot
+      startup recovery paths) don't set the new `Table.DBOid` field on the
+      `*Table` they register — both callers (`internal/initdb/open.go`,
+      `internal/initdb/catalog_cache.go`) only ever pass the implicit
+      `DefaultDBOid` today, since startup recovery is still single-database
+      (multi-db startup replay is 4e/`CREATE DATABASE … TEMPLATE`
+      territory), so this is currently unreachable rather than a live bug —
+      flagged for whichever future loop makes startup recovery
+      multi-db-aware. Design doc
+      (`docs/design/0122-0018-per-database-catalog-namespace.md`) 4d-ii-
+      part-2b item 2 updated to "fully landed"; status line and
+      "Recommended order" section updated; `docs/design/README.md` row
+      extended. **Remaining M0122-0007 items:** item 1's applyworker.go
+      corner, then 4e. Gates: `go build ./...`/`go vet ./...` clean; `go
+      test -race ./internal/catalog/... ./internal/executor/...` PASS; `go
+      test ./internal/planner/... ./internal/storage/...
+      ./internal/initdb/...` PASS (initdb includes the previously-failing
+      `TestAlterTableSetTablespacePhysicalRelocationSurvivesRestart`,
+      confirmed PASS after the dual-mirror guard fix); `go test -short
+      $(go list ./... | grep -v /internal/testport)` (full repo, short
+      mode) PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed transactions, all 3 pgbench workloads).
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,

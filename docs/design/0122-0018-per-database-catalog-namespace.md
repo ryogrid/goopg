@@ -1,6 +1,6 @@
 # Per-database catalog namespace (M0122-0007 slice 4)
 
-Status: accepted (sub-slices 4a, 4b-i, 4b-ii, 4c, 4d-i, 4d-ii-part-1, and 4d-ii-part-2a landed; 4d-ii-part-2b items 1 and 3 fully landed — item 1's applyworker.go corner and item 2 (`RelFileNode.DBOid`) + 4e remain planned)
+Status: accepted (sub-slices 4a, 4b-i, 4b-ii, 4c, 4d-i, 4d-ii-part-1, and 4d-ii-part-2a landed; 4d-ii-part-2b items 2 and 3 fully landed, item 1 landed except its applyworker.go corner — item 1's applyworker.go corner + 4e remain planned)
 Date: 2026-07-09
 Supersedes: none — extends the "Still open" note in
 `0122-0017-database-ddl-drop-guards.md` and the deferral-ledger rows dated
@@ -605,7 +605,7 @@ entirely by calling `addGroupByPKDeps` directly still failed because
 `IndexesOnTable` couldn't find the PK index created under the distinct
 dbOid. See the deferral-ledger row appended this loop for the resume point.
 
-### 4d-ii-part-2b — Remaining cross-file lookups + `RelFileNode.DBOid` (planned)
+### 4d-ii-part-2b — Remaining cross-file lookups + `RelFileNode.DBOid`
 
 Two remaining pieces (renumbered from the original "4d-ii-part-2"; part 2a's
 `operators_ddl.go`-local scope above is now closed):
@@ -623,15 +623,48 @@ Two remaining pieces (renumbered from the original "4d-ii-part-2"; part 2a's
    occurrences across `internal/executor`, measured via grep during
    4d-ii-part-1), which would need updating in lockstep, so it may not
    actually be less work than the mechanical per-call-site fix.
-2. Wire `RelFileNode.DBOid` to the connection's real dbOid at creation time
-   (currently hardcoded to `DefaultDBOid` regardless of connection) so
-   physical storage genuinely separates per database, closing the loop with
-   slices 2/3's `base/<dbOid>` directories. **Must account for the
-   `postgres`/`template1` dual-mirror** noted under "Blast radius" —
-   `postgres`'s storage identity is not simply
-   `ResolveDatabaseOid("postgres")` in every context; audit `NewInMemory`'s
-   `dbOid: DefaultDBOid` seed and the `base/1/` + `base/5/` mirror before
-   changing what oid live relations are created under.
+2. **LANDED (2026-07-10):** Wire `RelFileNode.DBOid` to the connection's real
+   dbOid at creation time. `catalog.Table`/`catalog.Index` each gained a
+   `DBOid uint32` field, populated by `CreateTable`/`CreateIndex` from
+   `resolveDBOid(dbOid)` — the same `dbOid ...uint32` variadic parameter every
+   executor DDL call site already threads as
+   `catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)` (items 1/3). No call site
+   of `CreateTable`/`CreateIndex` changed — the field rides the existing
+   parameter. `InMemory.RelFileNode`/`IndexRelFileNode` now prefer
+   `table.DBOid`/`index.DBOid` over the single process-wide `c.dbOid`, but
+   **only when it names a genuinely distinct database** (nonzero and not
+   `DefaultDBOid`) — this is the `postgres`/`template1` dual-mirror guard the
+   original scope note above called out: every `NamespaceDBOid`-translated
+   "postgres" table's own `DBOid` is `DefaultDBOid` (1) for `c.ns()` keying
+   (same translation `LookupTable`/`CreateTable` already apply), but its
+   correct *physical* dbOid is whatever `c.dbOid` currently resolves to —
+   `PostgresDBOid` (5) after `SetDBOID` runs at startup
+   (`detectCatalogDBOID`), preserving the `base/1/` + `base/5/` mirror.
+   Using `table.DBOid` unconditionally was tried first and immediately broke
+   `TestAlterTableSetTablespacePhysicalRelocationSurvivesRestart` (relocated
+   files landed under `base/1/pg_tblspc/…` instead of the expected
+   `base/5/pg_tblspc/…` after restart) — confirms the guard is load-bearing,
+   not defensive boilerplate. A table/index created under a real
+   `CREATE DATABASE`-allocated oid (the only case `table.DBOid` is neither 0
+   nor `DefaultDBOid`) now gets its own physically-separate `base/<dbOid>/`
+   relfilenode path instead of aliasing onto whatever `c.dbOid` happens to be
+   process-wide. Verified via new test
+   `TestRelFileNodeUsesTableOwnDBOidNotProcessWideDefault`
+   (`internal/executor/ddl_write_dbid_routing_test.go`): two same-named
+   tables created on distinct connection dbOids now resolve to distinct
+   `storage.RelFileNode` values (previously they aliased onto the same
+   on-disk path — physical storage was never actually multi-tenant despite
+   `storage.RelFileNode.DBOid` being a real field since slice 1). **Not
+   covered by this item:** `TryRegisterUserTable`/`RegisterRealTable`
+   (`internal/catalog/catalog.go`, the pg_class-heap-scan and
+   `pg_goopg_catalog_cache.json`-snapshot startup recovery paths) still don't
+   set the new `Table.DBOid` field on the `*Table` they register — both
+   callers (`internal/initdb/open.go`, `internal/initdb/catalog_cache.go`)
+   only ever pass the implicit `DefaultDBOid`, since startup recovery is
+   still single-database (multi-db startup replay is 4e/`CREATE DATABASE …
+   TEMPLATE` territory, out of scope here), so this is currently
+   unreachable dead weight rather than a live bug — flagged for whichever
+   future loop makes startup recovery multi-db-aware.
 3. **New scope surfaced by 4d-ii-part-2a's finding above — now fully LANDED:**
    `catalog.InMemory.CreateView`/`DropView`/`AllUserViews`/`AllUserMatViews`/
    `IndexesOnTable` each gained a `dbOid ...uint32` parameter (mirroring the
@@ -765,11 +798,13 @@ in order — each depends on the previous sub-slice's data shape.
 "New finding" above) and item 1 (the cross-file `IndexesOnTable` sweep,
 including the `catalog.SearchPathCatalog.IndexesOnTable` override that
 transparently covers every `internal/planner` call site) are now both
-fully landed. What remains of 4d-ii-part-2b: item 1's one deliberately
-deferred corner (`internal/executor/applyworker.go`'s logical-replication
-apply-worker path — needs a per-subscription dbOid concept that doesn't
-exist yet before it can be threaded consistently), then item 2, wiring
-`RelFileNode.DBOid` at creation time. Before resuming 4d-ii-part-2b, read
+fully landed. Item 2, wiring `RelFileNode.DBOid` at creation time, is now
+also fully landed (2026-07-10) — see its section above for the
+`postgres`/`DefaultDBOid` dual-mirror guard that turned out load-bearing.
+What remains of 4d-ii-part-2b: item 1's one deliberately deferred corner
+(`internal/executor/applyworker.go`'s logical-replication apply-worker path
+— needs a per-subscription dbOid concept that doesn't exist yet before it
+can be threaded consistently). Before resuming it, read
 4d-i's, 4d-ii-part-1's,
 and 4d-ii-part-2a's landed sections above in full — they document exactly
 which write entry points and which `operators_ddl.go` lookups already

@@ -314,6 +314,19 @@ type Table struct {
 	// storage paths; when zero, goopg falls back to OID (its native layout).
 	RelFileNodeOID uint32
 
+	// DBOid is the real physical database oid this table's namespace was
+	// created under (the value CreateTable's variadic dbOid resolved via
+	// resolveDBOid — already NamespaceDBOid-translated by every executor
+	// call site, so "postgres" tables carry DefaultDBOid here, matching
+	// c.ns(DefaultDBOid)). RelFileNode/IndexRelFileNode read it to stamp
+	// storage.RelFileNode.DBOid per-table instead of the single process-wide
+	// InMemory.dbOid, so physical storage finally separates per database
+	// (M0122-0007 4d-ii-part-2b item 2). Zero for tables never routed through
+	// CreateTable (every virtual pg_catalog/information_schema table — none
+	// of which have physical storage, so RelFileNode falls back to
+	// InMemory.dbOid for them, preserving pre-existing behavior).
+	DBOid uint32
+
 	// Virtual marks tables that don't live on the heap. The planner
 	// short-circuits SeqScan into a materialised Values node by
 	// calling VirtualRows() at plan time. v0 uses this for the
@@ -1611,6 +1624,11 @@ type Index struct {
 	// resets to 0 after a restart (ledger row, M0122-0007). No physical
 	// relocation of the index's on-disk file happens either.
 	Tablespace uint32
+	// DBOid mirrors Table.DBOid: the real physical database oid this index's
+	// namespace was created under, read by IndexRelFileNode instead of the
+	// single process-wide InMemory.dbOid (M0122-0007 4d-ii-part-2b item 2).
+	// Zero falls back to InMemory.dbOid, same convention as Table.DBOid.
+	DBOid uint32
 	// DeclaredHash records that the index was created `USING hash`. goopg has no
 	// native hash access method — a hash index is built on the B-tree substrate,
 	// so Method stays "btree" (catalog/pg_am/pg_dump unchanged) — but a
@@ -10820,6 +10838,7 @@ func (c *InMemory) CreateTable(name parser.ObjectName, cols []Column, dbOid ...u
 		Name:    name.Name,
 		Columns: append([]Column(nil), cols...),
 		OID:     c.nextOID,
+		DBOid:   resolveDBOid(dbOid),
 	}
 	c.nextOID++
 	ns.tables[k] = t
@@ -10848,6 +10867,7 @@ func (c *InMemory) CreateIndex(name parser.ObjectName, table *Table, cols []stri
 		Method:  strings.ToLower(method),
 		Primary: primary,
 		OID:     c.nextOID,
+		DBOid:   resolveDBOid(dbOid),
 	}
 	c.nextOID++
 	ns.indexes[k] = idx
@@ -17603,7 +17623,18 @@ func (c *InMemory) HasPrimaryKey(table *Table) bool {
 // layout — see resolveTablespaceClause in internal/executor/operators_ddl.go)
 // so a table created or ALTERed onto a non-default tablespace resolves its
 // file under pg_tblspc/<TblOid>/... . M0122-0007 tablespace physical
-// relocation.
+// relocation. DBOid prefers table.DBOid (the table's own creation-time
+// namespace, M0122-0007 4d-ii-part-2b item 2) but only when it names a
+// genuinely distinct database (a real CreateDatabase-allocated oid); a zero
+// or DefaultDBOid table.DBOid falls back to the single process-wide c.dbOid,
+// which is what preserves the pre-existing "postgres"/template1 dual-mirror
+// override (SetDBOID stamps c.dbOid = PostgresDBOid (5) — the real on-disk
+// oid detectCatalogDBOID reads back at startup — while every "postgres"-
+// routed table's own DBOid is NamespaceDBOid-translated to DefaultDBOid (1)
+// for c.ns() keying, same as LookupTable/CreateTable's existing convention;
+// using table.DBOid unconditionally here would have physically relocated
+// every "postgres" relation from base/5/… to base/1/… and broken the
+// mirror, confirmed by TestAlterTableSetTablespacePhysicalRelocationSurvivesRestart).
 func (c *InMemory) RelFileNode(table *Table) storage.RelFileNode {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -17611,15 +17642,24 @@ func (c *InMemory) RelFileNode(table *Table) storage.RelFileNode {
 	if table.RelFileNodeOID != 0 {
 		relOID = table.RelFileNodeOID
 	}
-	return storage.RelFileNode{TblOid: table.Tablespace, DBOid: c.dbOid, RelOid: relOID, Fork: storage.MainFork}
+	dbOid := c.dbOid
+	if table.DBOid != 0 && table.DBOid != DefaultDBOid {
+		dbOid = table.DBOid
+	}
+	return storage.RelFileNode{TblOid: table.Tablespace, DBOid: dbOid, RelOid: relOID, Fork: storage.MainFork}
 }
 
 // IndexRelFileNode returns the storage manager identity for an index.
-// TblOid comes from index.Tablespace, mirroring RelFileNode above.
+// TblOid comes from index.Tablespace, mirroring RelFileNode above. DBOid
+// prefers index.DBOid, same fallback convention as RelFileNode.
 func (c *InMemory) IndexRelFileNode(index *Index) storage.RelFileNode {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return storage.RelFileNode{TblOid: index.Tablespace, DBOid: c.dbOid, RelOid: index.OID, Fork: storage.MainFork}
+	dbOid := c.dbOid
+	if index.DBOid != 0 && index.DBOid != DefaultDBOid {
+		dbOid = index.DBOid
+	}
+	return storage.RelFileNode{TblOid: index.Tablespace, DBOid: dbOid, RelOid: index.OID, Fork: storage.MainFork}
 }
 
 // AllTables returns deep copies of every non-virtual user table

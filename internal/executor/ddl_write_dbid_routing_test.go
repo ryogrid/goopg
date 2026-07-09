@@ -428,3 +428,72 @@ func TestExecCreateViewGroupByPKDepRegistersUnderDistinctDBOid(t *testing.T) {
 		t.Fatalf("ViewsDependingOnConstraint(base.OID, base_pkey)=%v, want [v]", deps)
 	}
 }
+
+// TestRelFileNodeUsesTableOwnDBOidNotProcessWideDefault closes M0122-0007
+// 4d-ii-part-2b item 2: catalog.InMemory.RelFileNode/IndexRelFileNode used to
+// stamp storage.RelFileNode.DBOid from the single process-wide
+// InMemory.dbOid (SetDBOID/DBOID) regardless of which database a table's own
+// namespace lives under, so two tables of the same name created on distinct
+// connection dbOids would alias onto the SAME on-disk relfilenode path —
+// physical storage was never actually per-database. Fixed by giving
+// Table/Index their own DBOid field, set at CreateTable/CreateIndex time
+// from the same catalog.NamespaceDBOid(ctx.CurrentDatabaseOid) value already
+// threaded through every executor DDL call site (item 1/item 3), and having
+// RelFileNode/IndexRelFileNode prefer it over the process-wide fallback.
+func TestRelFileNodeUsesTableOwnDBOidNotProcessWideDefault(t *testing.T) {
+	const otherDBOid = 6262
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE widgets (id int4 PRIMARY KEY)"); err != nil {
+		t.Fatalf("CREATE TABLE (default dbOid): %v", err)
+	}
+	ctx.CurrentDatabaseOid = otherDBOid
+	if err := runDDL(t, ctx, "CREATE TABLE widgets (id int4 PRIMARY KEY)"); err != nil {
+		t.Fatalf("CREATE TABLE (dbOid=%d): %v", otherDBOid, err)
+	}
+
+	im, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		t.Fatal("ctx.Catalog is not *catalog.InMemory")
+	}
+	name := parser.ObjectName{Schema: "public", Name: "widgets"}
+
+	defaultTbl, ok := im.LookupTable(name, catalog.DefaultDBOid)
+	if !ok {
+		t.Fatal("LookupTable(DefaultDBOid) did not find the first widgets table")
+	}
+	otherTbl, ok := im.LookupTable(name, otherDBOid)
+	if !ok {
+		t.Fatalf("LookupTable(dbOid=%d) did not find the second widgets table", otherDBOid)
+	}
+
+	defaultRel := im.RelFileNode(defaultTbl)
+	otherRel := im.RelFileNode(otherTbl)
+	if defaultRel.DBOid != catalog.DefaultDBOid {
+		t.Fatalf("RelFileNode(default-dbOid widgets).DBOid = %d, want %d", defaultRel.DBOid, catalog.DefaultDBOid)
+	}
+	if otherRel.DBOid != otherDBOid {
+		t.Fatalf("RelFileNode(dbOid=%d widgets).DBOid = %d, want %d", otherDBOid, otherRel.DBOid, otherDBOid)
+	}
+	if defaultRel.RelOid == otherRel.RelOid && defaultRel.DBOid == otherRel.DBOid {
+		t.Fatalf("the two distinct-dbOid widgets tables collided onto the same RelFileNode %+v", defaultRel)
+	}
+
+	defaultIdx, ok := im.LookupIndex(parser.ObjectName{Schema: "public", Name: "widgets_pkey"}, catalog.DefaultDBOid)
+	if !ok {
+		t.Fatal("LookupIndex(DefaultDBOid) did not find widgets_pkey")
+	}
+	otherIdx, ok := im.LookupIndex(parser.ObjectName{Schema: "public", Name: "widgets_pkey"}, otherDBOid)
+	if !ok {
+		t.Fatalf("LookupIndex(dbOid=%d) did not find widgets_pkey", otherDBOid)
+	}
+	defaultIdxRel := im.IndexRelFileNode(defaultIdx)
+	otherIdxRel := im.IndexRelFileNode(otherIdx)
+	if defaultIdxRel.DBOid != catalog.DefaultDBOid {
+		t.Fatalf("IndexRelFileNode(default-dbOid widgets_pkey).DBOid = %d, want %d", defaultIdxRel.DBOid, catalog.DefaultDBOid)
+	}
+	if otherIdxRel.DBOid != otherDBOid {
+		t.Fatalf("IndexRelFileNode(dbOid=%d widgets_pkey).DBOid = %d, want %d", otherDBOid, otherIdxRel.DBOid, otherDBOid)
+	}
+}
