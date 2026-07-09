@@ -5847,6 +5847,90 @@ mirroring M0119's ledger `status` column.
       WRITE paths + `RelFileNode.DBOid`), then 4e (cross-cutting fixups +
       the `CREATE DATABASE ... TEMPLATE` copy mechanism this epic exists to
       unblock).
+  - [x] `M0122-0007` follow-up 10 (2026-07-09, this loop) — **slice 4 sub-slice
+      4c (route READ paths through the connection's real dbOid), landed.**
+      `catalog.SearchPathCatalog` gains a `DBOid uint32` field; its existing
+      `LookupTable` override and a new `LookupIndex` override now key off it
+      via a new `effectiveDBOid` helper (explicit caller-supplied dbOid still
+      wins unconditionally) and the new exported
+      `catalog.NamespaceDBOid(uint32) uint32`. Wired at all four
+      `SearchPathCatalog`-construction seams in `internal/server/dispatch.go`
+      (`ctxPlanCatalog` ×2 read `ctx.CurrentDatabaseOid` directly;
+      `sessionPlanCatalog` gained a `dbOid uint32` parameter, all 5 call
+      sites updated — one (dispatch.go's `ectx.PlanCatalog` seed) resolves it
+      directly from `connTx.DBName` via a new `resolveConnDBOid` helper since
+      `wireExtensionRows` hasn't stamped `ectx.CurrentDatabaseOid` yet at
+      that point in the request). **Critical correctness finding, not in the
+      original 4c plan text:** wiring the connection's raw
+      `ResolveDatabaseOid` answer straight into the namespace lookup would
+      have been a severe regression — `ResolveDatabaseOid("postgres")`
+      answers `PostgresDBOid` (5), but every catalog write path still
+      unconditionally persists under `DefaultDBOid` (1) until 4d migrates
+      them, so literally every table would have vanished for every
+      "postgres" connection (the overwhelming majority of real traffic —
+      TPC-H/pgbench/regress all connect to "postgres"). `NamespaceDBOid`
+      maps both `0` (no live connection) and `PostgresDBOid` back to
+      `DefaultDBOid`; confirmed via `scripts/tpch-spotcheck.sh` staying
+      Q12=2/Q13=33 (would have gone to 0 rows without the shim). **Second
+      correctness finding:** `ns()` used to lazily create-and-register a
+      missing dbOid's namespace even when called under `c.mu.RLock()`
+      (`LookupTable`/`LookupIndex`/5 other read entry points) — a concurrent
+      map write racing every other RLock holder, unreachable in production
+      before 4c (every real call resolved to the pre-seeded `DefaultDBOid`)
+      but a live hazard now that a never-seeded dbOid (any real second
+      database, before 4d ever writes to it) is a normal read. Fixed: `ns()`
+      is now non-mutating (returns a shared, never-written
+      `emptyTableNamespace` sentinel for a missing dbOid); new
+      `getOrCreateNS` — used only by the four entry points that can register
+      a namespace's first object (`CreateTable`/`CreateIndex`/
+      `RegisterRealTable`/`TryRegisterUserTable`, all under `c.mu.Lock()`) —
+      keeps create-on-demand semantics where they're actually safe.
+      Reproduced the exact pre-fix `fatal error: concurrent map read and map
+      write` crash via a scratch revert-and-`-race`-rerun (not committed) to
+      confirm the fix is non-vacuous. **Third correctness finding:** the
+      cross-session plan cache (`internal/server/plancache.go`, M0098-0005)
+      caches a `planner.Node` in a single server-wide map keyed only by
+      normalized SQL text — a plan embeds resolved `*catalog.Table`/
+      `*catalog.Index` pointers from whichever namespace was live when it was
+      planned, so without a namespace-aware key a plan built for one
+      database's namespace could be replayed for a connection reading a
+      different one. New `planCacheKey(sql, dbOid)` prefixes the existing key
+      with `catalog.NamespaceDBOid(dbOid)`; both cache sites
+      (`dispatchSimpleQueryViaExecutor`'s single-statement cache,
+      `executeExtendedQueryViaExecutor`'s cross-session cache) updated
+      together. This was caught by hand-tracing the cache's key computation,
+      not by a failing test — every connection resolves to the same
+      `DefaultDBOid` today (nothing yet connects to two distinct real
+      databases through the live server), so it would have passed every
+      existing test while silently wrong once 4d makes namespaces diverge.
+      New tests (`internal/catalog/dbid_namespace_test.go`):
+      `TestSearchPathCatalogDBOidRoutesReads` (5 subcases covering all of
+      zero/`PostgresDBOid`/`DefaultDBOid`-explicit/a-genuinely-distinct-dbOid/
+      explicit-argument-wins-over-wrapper-field) and
+      `TestNsReadOnlyUnderConcurrentUnseededDBOids` (64 goroutines racing
+      `LookupTable`/`LookupIndex` against distinct never-seeded dbOids under
+      `-race`). Design: `docs/design/0122-0018-per-database-catalog-namespace.md`
+      4c section flipped to landed with full writeup (status header updated,
+      "Recommended order" section points at 4d next + flags an unrelated
+      pre-existing `internal/activity/registry.go` `-race` failure noticed
+      during verification — confirmed via `git stash` to reproduce
+      identically on unmodified HEAD, out of scope for this loop);
+      `docs/design/README.md` row updated. Gates: `go build ./...`/`go vet
+      ./...` clean; `go test -race ./internal/catalog/... ./internal/executor/...`
+      PASS; `go test ./internal/catalog/... ./internal/executor/...
+      ./internal/server/...` PASS (the `internal/server` `-race` run hits the
+      pre-existing unrelated `TestConnectExceedsPositiveDatconnlimitRejected`
+      race noted above; non-`-race` `internal/server` run is clean); `go test
+      -short $(go list ./... | grep -v /internal/testport)` (full repo, short
+      mode) PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33 — the
+      critical end-to-end proof the `postgres` dual-mirror shim works);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed transactions, all 3 pgbench workloads — exercises both
+      plan-cache paths under real concurrent load). **Remaining M0122-0007
+      items:** 4d (route WRITE paths + `RelFileNode.DBOid`; must revisit the
+      `postgres`/`DefaultDBOid` dual-mirror shim once writes route by real
+      dbOid), then 4e (cross-cutting fixups + the `CREATE DATABASE ...
+      TEMPLATE` copy mechanism this epic exists to unblock).
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,

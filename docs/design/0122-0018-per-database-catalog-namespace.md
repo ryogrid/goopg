@@ -1,6 +1,6 @@
 # Per-database catalog namespace (M0122-0007 slice 4)
 
-Status: accepted (sub-slices 4a, 4b-i, and 4b-ii landed; 4c, 4d, 4e planned)
+Status: accepted (sub-slices 4a, 4b-i, 4b-ii, and 4c landed; 4d, 4e planned)
 Date: 2026-07-09
 Supersedes: none — extends the "Still open" note in
 `0122-0017-database-ddl-drop-guards.md` and the deferral-ledger rows dated
@@ -255,16 +255,93 @@ PASS; `go test -short $(go list ./... | grep -v /internal/testport)`
 (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh`
 PASS (0 failed transactions, all 3 pgbench workloads).
 
-### 4c — Route READ paths through the connection's real dbOid (planned)
+### 4c — Route READ paths through the connection's real dbOid (LANDED this loop, 2026-07-09)
 
-Once 4b-ii lands, thread `ctx.CurrentDatabaseOid` (already available since 4a)
-through the read-side call sites — name resolution in the analyzer/planner
-(`LookupTable`, `LookupIndex`, schema-qualified name resolution) — instead
-of `DefaultDBOid`. This is the first sub-slice with an actual observable
-behavior change: a second database can have a distinct read-visible table
-set from the default one. Requires auditing embedded/test callers that
-have no live connection (empty `CurrentDatabase`/zero `CurrentDatabaseOid`)
-to fall back to `DefaultDBOid` explicitly, matching today's behavior.
+`ctx.CurrentDatabaseOid` (available since 4a) is now threaded into
+`LookupTable`/`LookupIndex` — every analyzer/planner name-resolution call site
+that goes through a `catalog.SearchPathCatalog` wrapper (`ctxPlanCatalog`/
+`sessionPlanCatalog`/`o.planCatalog()`, the existing per-connection catalog
+seam that already carries `TempOwnerToken`/`SnapshotPartitionDetachEpoch`/
+`DisableSeqScan`) now resolves against the connection's own database instead
+of always `DefaultDBOid`. Landed as three pieces:
+
+1. **`catalog.SearchPathCatalog` gains a `DBOid uint32` field** plus an
+   `effectiveDBOid(explicit []uint32) []uint32` helper: an explicit
+   caller-supplied dbOid still wins unconditionally (unchanged pre-4c
+   contract), else `c.DBOid` is translated via the new exported
+   `catalog.NamespaceDBOid(uint32) uint32`. `LookupTable`'s existing override
+   and a new `LookupIndex` override both call it.
+2. **The `postgres`/`DefaultDBOid` dual-mirror shim** (`NamespaceDBOid`): a
+   connection's real database oid is NOT used verbatim as the namespace key.
+   `ResolveDatabaseOid("postgres")` answers `PostgresDBOid` (5, the real
+   on-disk oid `detectCatalogDBOID` reads back at startup — see "Blast
+   radius" above) but every catalog write path still unconditionally
+   persists under `DefaultDBOid` (1) until 4d migrates them. Wiring the raw
+   oid straight through would have made every existing table invisible to
+   every "postgres" connection — i.e. essentially all real traffic
+   (TPC-H/pgbench/regress all connect to "postgres"). `NamespaceDBOid` maps
+   both `0` (no live connection — embedded/test contexts) and `PostgresDBOid`
+   back to `DefaultDBOid`; only a genuinely distinct oid (a real
+   `CREATE DATABASE`, or `template0`) gets routed to its own — today still
+   empty, since 4d hasn't landed — namespace. This is the deliberate,
+   narrowly-scoped instance of the "must account for the dual-mirror" warning
+   4d's own section below already flagged; 4d must revisit it once write
+   paths route by dbOid too.
+3. **`ns()`'s read-path race hazard was fixed as a load-bearing prerequisite,
+   not a nice-to-have.** `ns()` used to lazily create-and-register a missing
+   dbOid's namespace on ANY call, including ones made under `c.mu.RLock()`
+   (`LookupTable`/`LookupIndex`/5 other read entry points) — a concurrent
+   map write racing every other RLock holder. Before 4c this was unreachable
+   in production (every real call always resolved to the pre-seeded
+   `DefaultDBOid`); 4c makes a never-seeded dbOid a normal read (any real
+   second database, before 4d ever writes to it), so the hazard became live.
+   Fix: `ns()` is now non-mutating (returns a shared, never-written
+   `emptyTableNamespace` sentinel for a missing dbOid); a new `getOrCreateNS`
+   — used only by the four entry points that can register a namespace's
+   first object (`CreateTable`/`CreateIndex`/`RegisterRealTable`/
+   `TryRegisterUserTable`), all called under `c.mu.Lock()` — keeps the
+   create-on-demand behavior where it's actually safe. Rename/Drop paths
+   look-up-then-bail on a missing entry and never needed create semantics.
+   `TestNsReadOnlyUnderConcurrentUnseededDBOids`
+   (`internal/catalog/dbid_namespace_test.go`) reproduces the exact
+   `fatal error: concurrent map read and map write` crash under `-race`
+   against the pre-fix `ns()` (confirmed via a scratch revert-and-rerun, not
+   committed) and passes clean against the fix.
+
+Also landed: the cross-session plan cache (`internal/server/plancache.go`,
+M0098-0005) now segregates its key by `catalog.NamespaceDBOid` (new
+`planCacheKey` helper) — a plan embeds resolved `*catalog.Table`/
+`*catalog.Index` pointers from a specific namespace, so the single
+server-wide cache map must never satisfy one connection's lookup with a plan
+built for a different namespace. Both cache sites
+(`dispatchSimpleQueryViaExecutor`'s single-statement cache and
+`executeExtendedQueryViaExecutor`'s cross-session cache) were updated
+together — this was caught by hand-tracing the plan-cache's actual key
+computation, not by a failing test, since every connection resolves to the
+same `DefaultDBOid` today (no test yet connects to two distinct real
+databases through the live server) and would have passed silently wrong once
+4d makes namespaces actually diverge.
+
+New tests: `TestSearchPathCatalogDBOidRoutesReads` (5 subcases: zero,
+`PostgresDBOid`, `DefaultDBOid` explicit, a genuinely distinct dbOid, and
+explicit-argument-wins-over-wrapper-field) and
+`TestNsReadOnlyUnderConcurrentUnseededDBOids` (both
+`internal/catalog/dbid_namespace_test.go`).
+
+Gates run (all PASS): `go build ./...` clean; `go vet ./...` clean; `go test
+-race ./internal/catalog/... ./internal/executor/...` PASS;
+`go test ./internal/catalog/... ./internal/executor/... ./internal/server/...`
+PASS (the one `-race` failure in `internal/server` —
+`TestConnectExceedsPositiveDatconnlimitRejected`, a pre-existing
+`internal/activity/registry.go` `acquire`/`CountByDatName` race — reproduces
+identically on unmodified HEAD via `git stash`, confirmed unrelated to this
+loop and out of scope); `go test -short $(go list ./... | grep -v
+/internal/testport)` (full repo, short mode) PASS; `scripts/tpch-spotcheck.sh`
+PASS (Q12=2/Q13=33 — the critical end-to-end proof that the `postgres`
+dual-mirror shim works: every query against "postgres" still sees
+`DefaultDBOid`'s tables); `RALPH_PRECOMMIT_SCOPE=smoke
+scripts/ralph-precommit-test.sh` PASS (0 failed transactions, all 3 pgbench
+workloads — exercises both plan-cache paths under real concurrent load).
 
 ### 4d — Route WRITE paths (planned)
 
@@ -294,18 +371,33 @@ today, ready to become a hard assertion once this lands).
 
 ## Recommended order and stopping points
 
-4a (landed) → 4b-i (landed) → 4b-ii (landed) → 4c → 4d → 4e, strictly in
-order — each depends on the previous sub-slice's data shape. 4c is next:
-thread `ctx.CurrentDatabaseOid` (available since 4a) through the read-side
-call sites now that every entry point can accept it (4b-ii). Do not thread
-a real dbOid through call sites while the underlying map was still a
-single shared namespace (pre-4b-i state) — it would have compiled and
-silently done nothing, exactly the kind of "worse than a no-op" outcome
-flagged in the slice-2 deferral row; that risk is now moot since 4b-ii's
-variadic parameter landed with zero call sites passing a non-default
-value. If a sub-slice is cut off mid-implementation, prefer reverting it
-whole (the tree must build and tests must pass at every commit) over
-leaving a partially-migrated state.
+4a (landed) → 4b-i (landed) → 4b-ii (landed) → 4c (landed) → 4d → 4e, strictly
+in order — each depends on the previous sub-slice's data shape. 4d is next:
+route WRITE paths (`CreateTable`/`CreateIndex`/`DropTable`/`DropIndex`/
+`RegisterRealTable`/rename/ALTER) through the connection's real dbOid instead
+of the hardcoded `DefaultDBOid`, and wire `RelFileNode.DBOid` at creation
+time. Before starting 4d, read 4c's landed section above in full — it
+documents the `postgres`/`DefaultDBOid` dual-mirror shim
+(`catalog.NamespaceDBOid`) that 4d must revisit (once writes route by real
+dbOid, "postgres" connections can no longer be silently folded into
+`DefaultDBOid` the way 4c's read-only shim does), the plan-cache
+segregation that must stay in sync with however 4d changes namespace
+resolution, and the `ns()`/`getOrCreateNS` split (4d's create-needing write
+paths already use `getOrCreateNS`; don't revert them to the old
+always-creating `ns()`). If a sub-slice is cut off mid-implementation, prefer
+reverting it whole (the tree must build and tests must pass at every commit)
+over leaving a partially-migrated state.
+
+**Unrelated pre-existing hazard noticed while verifying 4c** (not part of
+this epic, not fixed here): `go test -race ./internal/server/...` fails
+`TestConnectExceedsPositiveDatconnlimitRejected` with a real data race in
+`internal/activity/registry.go` (`ActivityRegistry.acquire` write racing
+`CountByDatName`'s read of the same backend slot) — reproduces identically on
+unmodified HEAD via `git stash` (confirmed 2026-07-09), so it predates this
+epic entirely. Flagged here only because it surfaced during this loop's `-race`
+verification pass; a future loop should file it against
+`internal/activity/registry.go` directly (M0119-0006, which added
+`CountByDatName`) rather than this design doc.
 
 ## Deferred / explicitly out of scope
 

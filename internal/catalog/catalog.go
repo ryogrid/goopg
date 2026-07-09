@@ -3321,17 +3321,41 @@ const DefaultDBOid uint32 = 1
 // CREATE TABLE sees the user-table row through its postgres-DB lens.
 const PostgresDBOid uint32 = 5
 
-// ns returns the per-database table/index namespace for dbOid (M0122-0007
-// slice 4b). Every namespace that will ever be read is pre-seeded while
-// the caller already holds c.mu for writing (today: only DefaultDBOid, in
-// NewInMemory; slice 4d adds a CreateDatabase-time seed) — so the
-// lazy-create fallback below is unreached in production and exists only
-// so a missing seed fails soft (an empty namespace) rather than a
-// nil-map panic. It deliberately does NOT acquire c.mu itself:
-// sync.RWMutex is not reentrant, and every caller already holds the
-// right lock (RLock or Lock) before touching the table/index maps,
-// exactly matching pre-4b behavior.
+// emptyTableNamespace is the shared, never-mutated fallback ns() returns for
+// a dbOid with no namespace yet. A package-level singleton is safe here only
+// because ns() is read-only (see its own comment) — nothing ever writes
+// through a value ns() returned, so concurrent readers sharing this one
+// instance can never race. M0122-0007 slice 4c.
+var emptyTableNamespace = newTableNamespace()
+
+// ns returns the per-database table/index namespace for dbOid, or a shared
+// empty namespace if dbOid has none yet (M0122-0007 slice 4c). It deliberately
+// does NOT acquire c.mu itself: sync.RWMutex is not reentrant, and every
+// caller already holds the right lock (RLock or Lock) before touching the
+// table/index maps. Because of that, ns() must NEVER mutate c.namespaces —
+// slice 4c wires real per-connection dbOids into LookupTable/LookupIndex
+// (RLock paths), and a dbOid with no namespace yet (any real database before
+// slice 4d starts routing writes) is now a normal, expected read, not just a
+// theoretical one exercised by a test holding c.mu for writing. Lazily
+// creating here would be a concurrent map write racing every other RLock
+// holder — see getOrCreateNS for the write-side counterpart that legitimately
+// needs to create one, called only under c.mu.Lock().
 func (c *InMemory) ns(dbOid uint32) *tableNamespace {
+	if n, ok := c.namespaces[dbOid]; ok {
+		return n
+	}
+	return emptyTableNamespace
+}
+
+// getOrCreateNS is ns()'s write-side counterpart: it creates and registers an
+// empty namespace for dbOid the first time an object is ever registered under
+// it. Callers MUST already hold c.mu.Lock() (not RLock) — this mutates
+// c.namespaces. Used only by the four entry points that can introduce a
+// dbOid's first object (CreateTable, CreateIndex, RegisterRealTable,
+// TryRegisterUserTable); every other write path (rename/drop) only mutates an
+// existing entry and correctly errors "does not exist" via plain ns() when
+// the namespace was never created. M0122-0007 slice 4c.
+func (c *InMemory) getOrCreateNS(dbOid uint32) *tableNamespace {
 	if n, ok := c.namespaces[dbOid]; ok {
 		return n
 	}
@@ -10583,7 +10607,7 @@ func (c *InMemory) TryRegisterUserTable(tbl *Table, dbOid ...uint32) error {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	ns := c.ns(resolveDBOid(dbOid))
+	ns := c.getOrCreateNS(resolveDBOid(dbOid))
 	k := key(parser.ObjectName{Schema: tbl.Schema, Name: tbl.Name})
 	if _, exists := ns.tables[k]; exists {
 		return nil // already registered — idempotent
@@ -10624,7 +10648,7 @@ func (c *InMemory) RegisterRealTable(t *Table, dbOid ...uint32) error {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	ns := c.ns(resolveDBOid(dbOid))
+	ns := c.getOrCreateNS(resolveDBOid(dbOid))
 	k := key(parser.ObjectName{Schema: t.Schema, Name: t.Name})
 	if existing, ok := ns.tables[k]; ok {
 		if existing.OID == t.OID {
@@ -10783,7 +10807,7 @@ func (c *InMemory) lookupIndexLocked(name parser.ObjectName, dbOid uint32) (*Ind
 func (c *InMemory) CreateTable(name parser.ObjectName, cols []Column, dbOid ...uint32) (*Table, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	ns := c.ns(resolveDBOid(dbOid))
+	ns := c.getOrCreateNS(resolveDBOid(dbOid))
 	k := key(name)
 	if _, exists := ns.tables[k]; exists {
 		return nil, fmt.Errorf("relation %q already exists", k)
@@ -10810,7 +10834,7 @@ func (c *InMemory) CreateIndex(name parser.ObjectName, table *Table, cols []stri
 	if table == nil {
 		return nil, fmt.Errorf("table is nil")
 	}
-	ns := c.ns(resolveDBOid(dbOid))
+	ns := c.getOrCreateNS(resolveDBOid(dbOid))
 	k := key(name)
 	if _, exists := ns.indexes[k]; exists {
 		return nil, fmt.Errorf("relation %q already exists", k)
@@ -19962,6 +19986,16 @@ type SearchPathCatalog struct {
 	// false in the default (toggle-untouched) case so legacy plans are unchanged.
 	// Design 0118-0103 (M0118-0009 horizons enabler).
 	DisableSeqScan bool
+	// DBOid is the querying connection's real, physical database oid
+	// (executor.Context.CurrentDatabaseOid, resolved via ResolveDatabaseOid).
+	// Zero for connection-less contexts (embedded/test callers, or a
+	// connection whose database didn't resolve) — effectiveDBOid falls back
+	// to DefaultDBOid in that case, matching pre-4c behavior. LookupTable and
+	// LookupIndex read it via effectiveDBOid to key the per-database
+	// table/index namespace (catalog.InMemory.ns) at the connection's own
+	// database instead of always DefaultDBOid. Design 0122-0018 (M0122-0007
+	// slice 4c).
+	DBOid uint32
 }
 
 // WithSearchPath returns a SearchPathCatalog that falls back to the schemas
@@ -19992,9 +20026,52 @@ func (c *SearchPathCatalog) CurrentPartitionDetachEpoch() uint64 {
 	return c.SnapshotPartitionDetachEpoch
 }
 
+// NamespaceDBOid translates a connection's real database oid (e.g.
+// executor.Context.CurrentDatabaseOid) into the table/index namespace dbOid
+// read-side lookups should key off. Exported so callers outside this package
+// that need to agree with SearchPathCatalog.effectiveDBOid on "which
+// namespace does this connection read" — e.g. a plan-cache key, which must
+// not conflate two connections that read different namespaces — share the
+// exact same mapping instead of re-deriving it. Two special cases, both
+// documented in docs/design/0122-0018-per-database-catalog-namespace.md's
+// "Blast radius":
+//   - zero (no live connection — embedded/test contexts, or an unresolved
+//     database) falls back to DefaultDBOid, matching pre-4c behavior exactly.
+//   - PostgresDBOid (5, ResolveDatabaseOid("postgres")'s answer) also falls
+//     back to DefaultDBOid. This is NOT a bug: every catalog write path still
+//     unconditionally persists under DefaultDBOid (1) until slice 4d migrates
+//     them, so a "postgres" connection (the overwhelming majority of real
+//     traffic — every TPC-H/pgbench/regress gate connects to it) must keep
+//     reading DefaultDBOid's namespace, the one writes actually land in, or
+//     every existing table would appear to vanish. Only a genuinely distinct
+//     database oid (a real CREATE DATABASE, or template0) gets routed to its
+//     own — today still empty, since 4d hasn't landed — namespace. Slice 4d
+//     must revisit this mapping together with the on-disk base/1+base/5
+//     dual-mirror it's paired with. M0122-0007 slice 4c.
+func NamespaceDBOid(connDBOid uint32) uint32 {
+	if connDBOid == 0 || connDBOid == PostgresDBOid {
+		return DefaultDBOid
+	}
+	return connDBOid
+}
+
+// effectiveDBOid resolves the dbOid a LookupTable/LookupIndex call should key
+// off: an explicit caller-supplied dbOid wins (unchanged pre-4c behavior for
+// any future caller that already knows exactly which database it means), else
+// c.DBOid translated via NamespaceDBOid.
+func (c *SearchPathCatalog) effectiveDBOid(explicit []uint32) []uint32 {
+	if len(explicit) > 0 {
+		return explicit
+	}
+	return []uint32{NamespaceDBOid(c.DBOid)}
+}
+
 // LookupTable overrides the embedded Catalog.LookupTable to apply the
-// current search_path when the name has no explicit schema qualifier.
+// current search_path when the name has no explicit schema qualifier, and to
+// key the lookup off the querying connection's real database (effectiveDBOid,
+// M0122-0007 slice 4c).
 func (c *SearchPathCatalog) LookupTable(name parser.ObjectName, dbOid ...uint32) (*Table, bool) {
+	dbOid = c.effectiveDBOid(dbOid)
 	tbl, ok := c.Catalog.LookupTable(name, dbOid...)
 	if !ok && name.Schema == "" && c.GetSchemas != nil {
 		for _, sc := range c.GetSchemas() {
@@ -20005,6 +20082,15 @@ func (c *SearchPathCatalog) LookupTable(name parser.ObjectName, dbOid ...uint32)
 		}
 	}
 	return tbl, ok
+}
+
+// LookupIndex overrides the embedded Catalog.LookupIndex to key the lookup
+// off the querying connection's real database (effectiveDBOid, M0122-0007
+// slice 4c) — mirrors LookupTable above, minus the search_path fallback
+// (index names aren't schema-search-path resolved the way unqualified table
+// names are; callers that need that already qualify the constraint name).
+func (c *SearchPathCatalog) LookupIndex(name parser.ObjectName, dbOid ...uint32) (*Index, bool) {
+	return c.Catalog.LookupIndex(name, c.effectiveDBOid(dbOid)...)
 }
 
 // Unwrap returns the underlying Catalog, allowing callers to peel the

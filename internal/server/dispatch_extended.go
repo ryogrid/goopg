@@ -80,13 +80,16 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 	// The same parameterized query is shared across all 100 pgbench
 	// connections — one planning call serves them all.
 	var node planner.Node
+	// Resolved directly from dbName (not an executor.Context field) since
+	// ectx doesn't exist yet at this point in the request. M0122-0007 slice 4c.
+	connDBOid := resolveConnDBOid(s.cfg.Catalog, dbName)
 	if s.pc != nil && !sessionTempInheritanceActive(s.cfg.Catalog) && !partitionDetachPending(s.cfg.Catalog) && !inheritanceChangePending(s.cfg.Catalog) {
-		key := normalizeCompatSQL(query)
+		key := planCacheKey(query, connDBOid)
 		if cached, ok := s.pc.Get(key); ok {
 			node = cached
 		} else {
 			var perr error
-			node, perr = planner.Plan(stmt, sessionPlanCatalog(sess, s.cfg.Catalog))
+			node, perr = planner.Plan(stmt, sessionPlanCatalog(sess, s.cfg.Catalog, connDBOid))
 			if perr != nil {
 				code, msg := planErrorFields(perr)
 				return nil, &extendedQueryError{Code: code, Message: msg}
@@ -97,7 +100,7 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 		}
 	} else {
 		var perr error
-		node, perr = planner.Plan(stmt, sessionPlanCatalog(sess, s.cfg.Catalog))
+		node, perr = planner.Plan(stmt, sessionPlanCatalog(sess, s.cfg.Catalog, connDBOid))
 		if perr != nil {
 			code, msg := planErrorFields(perr)
 			return nil, &extendedQueryError{Code: code, Message: msg}

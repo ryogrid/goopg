@@ -413,7 +413,14 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		}
 		// Set PlanCatalog to a search-path-aware wrapper so DDL executor can
 		// use it when calling planner.Plan for internal validation. M0097-0022.
-		ectx.PlanCatalog = sessionPlanCatalog(sess, s.cfg.Catalog)
+		// Resolved directly from connTx.DBName (not ectx.CurrentDatabaseOid)
+		// since wireExtensionRows hasn't stamped it yet at this point in the
+		// request. M0122-0007 slice 4c.
+		var connDBName string
+		if connTx != nil {
+			connDBName = connTx.DBName
+		}
+		ectx.PlanCatalog = sessionPlanCatalog(sess, s.cfg.Catalog, resolveConnDBOid(s.cfg.Catalog, connDBName))
 	}
 	// Match advisorySessionIDFromContext's preference order: the per-connection
 	// AdvisorySessionIdentity (SessionRegistry) is the stable advisory owner, so
@@ -668,7 +675,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 				}
 				// Infer result column types and undeclared parameter types by planning/walking.
 				if ectx.Catalog != nil {
-					if plan, planErr := planner.Plan(ps.Query, sessionPlanCatalog(sess, ectx.Catalog)); planErr == nil {
+					if plan, planErr := planner.Plan(ps.Query, sessionPlanCatalog(sess, ectx.Catalog, ectx.CurrentDatabaseOid)); planErr == nil {
 						schema := plan.Output()
 						if len(schema) > 0 {
 							resultTypes := make([]string, len(schema))
@@ -909,12 +916,12 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		var precached planner.Node
 		var cacheKey string
 		if s.pc != nil && len(stmts) == 1 && !disablePlanCache && !isNotifyStmt(stmt) && !isTwoPhaseStmt(stmt) && !sessionTempInheritanceActive(s.cfg.Catalog) && !partitionDetachPending(s.cfg.Catalog) && !inheritanceChangePending(s.cfg.Catalog) {
-			cacheKey = normalizeCompatSQL(sql)
+			cacheKey = planCacheKey(sql, ectx.CurrentDatabaseOid)
 			if cached, ok := s.pc.Get(cacheKey); ok {
 				precached = cached
 			} else {
 				// Cache miss: plan now so we can store it.
-				freshNode, perr := planner.Plan(stmt, sessionPlanCatalog(sess, s.cfg.Catalog))
+				freshNode, perr := planner.Plan(stmt, sessionPlanCatalog(sess, s.cfg.Catalog, ectx.CurrentDatabaseOid))
 				if perr != nil {
 					code, msg := planErrorFields(perr)
 					return s.writeQueryError(w, code, msg, planErrorHintFields(perr)...)
@@ -1252,14 +1259,20 @@ func inheritanceChangePending(base catalog.Catalog) bool {
 // sessionPlanCatalog returns a search-path-aware catalog wrapper for use when
 // calling planner.Plan. The wrapper re-reads search_path dynamically so that
 // SET search_path changes take effect on the next statement. When sess is nil
-// the base catalog is returned unchanged. M0097-0022.
-func sessionPlanCatalog(sess *config.SessionRegistry, base catalog.Catalog) catalog.Catalog {
+// the base catalog is returned unchanged. dbOid is the querying connection's
+// real database oid (resolveConnDBOid/ectx.CurrentDatabaseOid); it seeds
+// SearchPathCatalog.DBOid so LookupTable/LookupIndex key off the connection's
+// own namespace (M0122-0007 slice 4c, design 0122-0018). Pass 0 for
+// connection-less/embedded callers — effectiveDBOid falls back to
+// DefaultDBOid. M0097-0022.
+func sessionPlanCatalog(sess *config.SessionRegistry, base catalog.Catalog, dbOid uint32) catalog.Catalog {
 	if sess == nil {
 		return base
 	}
 	wrapped := catalog.WithSearchPath(base, func() []string {
 		return searchPathSchemas(sess)
 	})
+	wrapped.DBOid = dbOid
 	// Carry the session's temp-relation ownership token so the planner drops
 	// other-session temp inheritance children during expansion. Must match
 	// executor.sessionTempOwner: "s"+UniqueID(). Design 0118-0036 (inherit-temp).
@@ -1274,6 +1287,27 @@ func sessionPlanCatalog(sess *config.SessionRegistry, base catalog.Catalog) cata
 		wrapped.DisableSeqScan = true
 	}
 	return wrapped
+}
+
+// resolveConnDBOid resolves dbName to its real, physical pg_database.oid via
+// cat's databaseOidResolver, returning 0 (SearchPathCatalog.effectiveDBOid's
+// "use DefaultDBOid" sentinel) when dbName is empty or unresolvable — the
+// same fallback wireExtensionRows leaves ectx.CurrentDatabaseOid at. Exists
+// because the single-statement and cross-session plan-cache paths
+// (dispatch.go's cache-miss branch, executeExtendedQueryViaExecutor) build
+// their PlanCatalog before wireExtensionRows stamps ectx.CurrentDatabaseOid —
+// this resolves the same oid directly from the connection's dbName instead.
+// M0122-0007 slice 4c.
+func resolveConnDBOid(cat catalog.Catalog, dbName string) uint32 {
+	if dbName == "" {
+		return 0
+	}
+	if dr, ok := cat.(databaseOidResolver); ok {
+		if oid, ok := dr.ResolveDatabaseOid(dbName); ok {
+			return oid
+		}
+	}
+	return 0
 }
 
 // ctxPlanCatalog is like sessionPlanCatalog but reads search_path from an
@@ -1291,6 +1325,10 @@ func ctxPlanCatalog(ctx *executor.Context, base catalog.Catalog) catalog.Catalog
 		}
 		return parseSearchPathSchemas(sp)
 	})
+	// Seed the connection's real database oid so LookupTable/LookupIndex key
+	// off its own namespace (M0122-0007 slice 4c). Zero (no live connection)
+	// falls back to DefaultDBOid via effectiveDBOid.
+	wrapped.DBOid = ctx.CurrentDatabaseOid
 	// Carry the session temp-owner token (matches executor.sessionTempOwner) so
 	// the planner applies the RELATION_IS_OTHER_TEMP exclusion. Design 0118-0036.
 	if s, ok := ctx.AdvisorySessionIdentity.(interface{ UniqueID() uint64 }); ok && s != nil {
@@ -1508,6 +1546,18 @@ func normalizeCompatSQL(sql string) string {
 	// Lowercasing string literals would cause 'A' and 'a' to map to the
 	// same plan-cache key, returning the wrong cached plan. M0097-0003.
 	return normalizeSQLPreservingLiterals(s)
+}
+
+// planCacheKey builds the cross-session plan cache key: normalizeCompatSQL's
+// text form prefixed with the querying connection's effective table/index
+// namespace oid (catalog.NamespaceDBOid(connDBOid)). Without the oid prefix,
+// a plan cached while resolving names against one database's namespace could
+// be replayed for a connection reading a different one — the cache is a
+// single server-wide map shared by every connection (M0122-0007 slice 4c;
+// see plancache.go's doc comment). Two connections whose NamespaceDBOid
+// agrees (e.g. both "postgres") intentionally still share one entry.
+func planCacheKey(sql string, connDBOid uint32) string {
+	return strconv.FormatUint(uint64(catalog.NamespaceDBOid(connDBOid)), 10) + "\x00" + normalizeCompatSQL(sql)
 }
 
 // normalizeSQLPreservingLiterals lowercases SQL outside string literals
