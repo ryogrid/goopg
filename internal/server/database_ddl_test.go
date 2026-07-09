@@ -280,7 +280,7 @@ func TestTryHandleDatabaseDDLAlterDatabaseConfigFromCurrent(t *testing.T) {
 func TestDatabaseDDLErrorSQLState(t *testing.T) {
 	s := newTestRoleServer()
 	im := s.cfg.Catalog.(*catalog.InMemory)
-	if err := im.CreateDatabase("tpch", catalog.BootstrapSuperuserOID); err != nil {
+	if _, err := im.CreateDatabase("tpch", catalog.BootstrapSuperuserOID); err != nil {
 		t.Fatalf("seed CreateDatabase(tpch): %v", err)
 	}
 
@@ -403,7 +403,7 @@ func TestTryHandleDatabaseDDLDropRequiresOwnership(t *testing.T) {
 func TestTryHandleDatabaseDDLDropGuards(t *testing.T) {
 	s := newTestRoleServer()
 	im := s.cfg.Catalog.(*catalog.InMemory)
-	if err := im.CreateDatabase("tpch", catalog.BootstrapSuperuserOID); err != nil {
+	if _, err := im.CreateDatabase("tpch", catalog.BootstrapSuperuserOID); err != nil {
 		t.Fatalf("seed CreateDatabase(tpch): %v", err)
 	}
 
@@ -481,7 +481,7 @@ func TestTryHandleDatabaseDDLDropGuards(t *testing.T) {
 func TestTryHandleDatabaseDDLDropForceTerminatesOtherBackends(t *testing.T) {
 	s := newTestRoleServer()
 	im := s.cfg.Catalog.(*catalog.InMemory)
-	if err := im.CreateDatabase("tpch", catalog.BootstrapSuperuserOID); err != nil {
+	if _, err := im.CreateDatabase("tpch", catalog.BootstrapSuperuserOID); err != nil {
 		t.Fatalf("seed CreateDatabase(tpch): %v", err)
 	}
 

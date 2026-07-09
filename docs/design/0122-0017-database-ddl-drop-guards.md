@@ -194,11 +194,92 @@ no longer listed `forcetest` afterward. Tests:
 scripts/ralph-precommit-test.sh` PASS (0 failed transactions, all 3
 workloads).
 
+## Physical-storage-isolation slice 1: real, distinct `pg_database.oid` (2026-07-09 follow-up 3, this loop)
+
+Every prior loop in this bucket correctly deferred "full per-database physical
+storage isolation" whole, as an architectural item too large for one loop: it
+needs (a) a real distinct OID per database, (b) a `base/<dbOid>` directory
+populated by copying the template database's files on CREATE, (c) removing
+that directory tree on DROP, and (d) routing every relation lookup through the
+connection's actual database instead of the single hardcoded
+`catalog.DefaultDBOid`. (d) in particular is a cluster-wide catalog
+refactor (goopg's `catalog.InMemory` is one shared table/index namespace for
+the whole process, not scoped per database) that cannot land in a single loop.
+
+This loop lands (a) only — the prerequisite every later slice depends on —
+without touching (b)/(c)/(d). Before this slice, `CreateDatabase` never
+allocated an OID at all: `pg_database.VirtualRows` rendered the SAME hardcoded
+`"16384"` placeholder for every non-template database, so two databases
+created via `CREATE DATABASE foo`/`CREATE DATABASE bar` were indistinguishable
+by `pg_database.oid` — a real correctness bug independent of physical storage
+(`pg_database.oid` is a primary key in upstream PG), and a hard blocker for
+slice 2 (no directory name to allocate without a real, unique OID).
+
+**What changed:**
+
+- `catalog.InMemory.CreateDatabase(name, owner)` now allocates a real OID from
+  the same cluster-wide `nextOID` counter every other catalog object uses
+  (mirrors real PG's single shared OID space) and returns it —
+  `(uint32, error)` instead of just `error`. Stored in a new `databaseOid
+  map[string]uint32` field.
+- New `DatabaseOid(name) uint32` getter returns the stored oid, or 0 ("no
+  override" sentinel) for a name never registered through `CreateDatabase` —
+  i.e. the three bootstrap rows (`postgres`/`template0`/`template1`), which
+  predate any `CreateDatabase` call.
+- `pgDatabase.VirtualRows`'s oid-selection switch gained a `default` arm: any
+  `datname` that isn't `template1`/`template0` now renders
+  `DatabaseOid(n)` when non-zero, instead of unconditionally falling back to
+  the old `"16384"` placeholder.
+- **Deliberately unchanged: the live `"postgres"` row's displayed oid.**
+  `"postgres"` is seeded at bootstrap, never through `CreateDatabase`, so
+  `DatabaseOid("postgres")` is 0 and the placeholder stands — confirmed
+  necessary by the pre-existing comment right above this switch: `CREATE
+  SUBSCRIPTION`'s `subdbid` and the `datacl` heap resync both key off the
+  `"16384"` placeholder for the one live/connected database, and a past loop
+  already found that changing it broke the pg_dump subscription round-trip.
+  Since v0 can only ever actually connect to `"postgres"` (no per-database
+  routing yet — that's slice 4/(d) above), only a name nobody can connect to
+  is affected by this slice, which is why it's safe to land in isolation.
+- `wal.EncodeCreateDatabase`/`DecodeCreateDatabase` gained a fourth trailing
+  4-byte `oid` field (same backward-compat pattern the M0122-0007 `owner`
+  suffix already used): a pre-slice-1 WAL payload with no oid suffix decodes
+  oid=0, matching "no override" exactly.
+- `RegisterDatabaseDuringRecovery(name, owner, oid)` (the WAL-replay driver's
+  entry point, `internal/initdb/database_ddl_recovery.go`) now also advances
+  `nextOID` past a recovered non-zero oid — mirrors `advanceNextOIDLocked`'s
+  pattern for every other recovered OID, so a later `CREATE TABLE`/`CREATE
+  DATABASE` in the same process can never reallocate an oid a crash-recovered
+  database already owns.
+- The one existing rollback path that re-creates a database entry after a WAL
+  append failure (`databaseDDLDrop`'s "re-create on DROP's own WAL-append
+  failure" branch) keeps calling `CreateDatabase` (allocating a fresh oid)
+  rather than restoring the exact dropped oid — an accepted simplification
+  for this exceedingly rare double-failure edge case, since no `DropDatabase`
+  WAL record was ever durably written in that path either.
+
+Tests: `TestCreateDatabaseAllocatesDistinctDisplayedOid`,
+`TestRegisterDatabaseDuringRecoveryAdvancesNextOID`
+(`internal/catalog/database_test.go`);
+`TestDecodeCreateDatabaseDefaultsOidForPreSlice1Payload`
+(`internal/wal/database_ddl_test.go`, alongside the updated pre-existing
+owner-defaulting test). Gates: `go build ./...`/`go vet ./...` clean; `go test
+-count=1 ./internal/catalog/... ./internal/wal/... ./internal/server/...
+./internal/initdb/...` PASS (full packages, no regressions);
+`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+scripts/ralph-precommit-test.sh` PASS (0 failed transactions, all 3
+workloads). Also spot-checked the exact regression the "postgres" comment
+warns about by re-running `TestPort_PgDumpDatabaseConfigSet`,
+`TestPort_PgDumpRoleConfigSet`, `TestPort_PgDumpallGlobalsOnly` (all PASS) and
+`TestPort_Subscription001RepChanges` (FAILs — confirmed via `git stash` to
+fail identically at HEAD before this change, an unrelated pre-existing
+failure, not a regression introduced here).
+
 ## Still open (M0122-0007 bucket)
 
-- Full per-database physical storage isolation (template copy on CREATE, real
-  directory removal on DROP) — the architectural item every prior loop in this
-  bucket has correctly deferred whole; see the deferral ledger row appended
-  alongside this doc.
+- Physical-storage-isolation slices 2-4: `base/<dbOid>` directory allocation +
+  template-copy on CREATE, real directory removal on DROP, and routing every
+  relation lookup through the connection's actual database (the full
+  cluster-wide catalog-scoping refactor) — see the deferral ledger row
+  appended alongside this doc for the concrete resume point.
 - `REINDEX ... CONCURRENTLY` physical rebuild (separate, pre-existing item,
   unaffected by this change).

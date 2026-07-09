@@ -546,7 +546,8 @@ func (s *Server) tryHandleDatabaseDDL(sql string, liveDBName string, actingRole 
 	switch kind {
 	case databaseDDLCreate:
 		owner := s.resolveActingRoleOID(actingRole)
-		if err := cat.CreateDatabase(name, owner); err != nil {
+		oid, err := cat.CreateDatabase(name, owner)
+		if err != nil {
 			if errors.Is(err, catalog.ErrDatabaseExists) {
 				// PG: dbcommands.c createdb(), ERRCODE_DUPLICATE_DATABASE.
 				return true, "", &databaseDDLError{
@@ -557,7 +558,7 @@ func (s *Server) tryHandleDatabaseDDL(sql string, liveDBName string, actingRole 
 			return true, "", err
 		}
 		if s.cfg.WAL != nil {
-			if _, _, werr := s.cfg.WAL.Append(wal.EncodeCreateDatabase(name, owner)); werr != nil {
+			if _, _, werr := s.cfg.WAL.Append(wal.EncodeCreateDatabase(name, owner, oid)); werr != nil {
 				// Roll back the catalog change so memory and disk agree.
 				_ = cat.DropDatabase(name)
 				return true, "", werr
@@ -655,8 +656,12 @@ func (s *Server) tryHandleDatabaseDDL(sql string, liveDBName string, actingRole 
 		if s.cfg.WAL != nil {
 			if _, _, werr := s.cfg.WAL.Append(wal.EncodeDropDatabase(name)); werr != nil {
 				// Re-create the catalog entry (with its original owner) so
-				// the abort is consistent.
-				_ = cat.CreateDatabase(name, droppedOwner)
+				// the abort is consistent. A fresh oid gets allocated here
+				// rather than restoring the dropped one — acceptable for
+				// this exceedingly rare double-failure edge case (the
+				// DROP's own WAL append failing) since no DropDatabase
+				// record was ever durably written either.
+				_, _ = cat.CreateDatabase(name, droppedOwner)
 				return true, "", werr
 			}
 		}
@@ -750,7 +755,7 @@ func (s *Server) handleDatabaseDDLBypass(sql, liveDBName, actingRole string, res
 // handler needs. catalog.InMemory satisfies this interface; alternate
 // implementations (e.g. tests) opt in by exposing the same methods.
 type databaseRegistry interface {
-	CreateDatabase(name string, owner uint32) error
+	CreateDatabase(name string, owner uint32) (uint32, error)
 	DropDatabase(name string) error
 	HasDatabase(name string) bool
 	DatabaseOwner(name string) uint32

@@ -18,12 +18,12 @@ func TestEncodeDecodeCreateDatabaseRoundTrip(t *testing.T) {
 		"日本語DB", // multi-byte UTF-8
 	}
 	for _, name := range cases {
-		raw := EncodeCreateDatabase(name, 16401)
+		raw := EncodeCreateDatabase(name, 16401, 16500)
 		if raw[0] != RecordKindCreateDatabase {
 			t.Errorf("name %q: kind byte = %d, want %d", name, raw[0], RecordKindCreateDatabase)
 			continue
 		}
-		got, owner, err := DecodeCreateDatabase(raw)
+		got, owner, oid, err := DecodeCreateDatabase(raw)
 		if err != nil {
 			t.Errorf("name %q: decode err: %v", name, err)
 			continue
@@ -33,6 +33,9 @@ func TestEncodeDecodeCreateDatabaseRoundTrip(t *testing.T) {
 		}
 		if owner != 16401 {
 			t.Errorf("name %q: decoded owner = %d, want 16401", name, owner)
+		}
+		if oid != 16500 {
+			t.Errorf("name %q: decoded oid = %d, want 16500", name, oid)
 		}
 	}
 }
@@ -62,7 +65,7 @@ func TestEncodeDecodeDropDatabaseRoundTrip(t *testing.T) {
 // misinterpreting bytes.
 func TestDecodeCreateDatabaseRejectsWrongKind(t *testing.T) {
 	bogus := []byte{RecordKindSmgrCreate, 0, 0}
-	if _, _, err := DecodeCreateDatabase(bogus); err == nil {
+	if _, _, _, err := DecodeCreateDatabase(bogus); err == nil {
 		t.Error("expected error decoding non-create-database payload")
 	}
 }
@@ -72,7 +75,7 @@ func TestDecodeCreateDatabaseRejectsWrongKind(t *testing.T) {
 func TestDecodeCreateDatabaseRejectsTruncatedPayload(t *testing.T) {
 	// kind + nameLen=10 but only 4 name bytes follow.
 	truncated := []byte{RecordKindCreateDatabase, 10, 0, 't', 'p', 'c', 'h'}
-	if _, _, err := DecodeCreateDatabase(truncated); err == nil {
+	if _, _, _, err := DecodeCreateDatabase(truncated); err == nil {
 		t.Error("expected error decoding truncated create-database payload")
 	}
 }
@@ -84,7 +87,7 @@ func TestDecodeCreateDatabaseRejectsTruncatedPayload(t *testing.T) {
 // already-on-disk WAL stream from before this change doesn't error.
 func TestDecodeCreateDatabaseDefaultsOwnerForPreM01220007Payload(t *testing.T) {
 	legacy := []byte{RecordKindCreateDatabase, 4, 0, 't', 'p', 'c', 'h'}
-	name, owner, err := DecodeCreateDatabase(legacy)
+	name, owner, oid, err := DecodeCreateDatabase(legacy)
 	if err != nil {
 		t.Fatalf("decode legacy payload: %v", err)
 	}
@@ -93,5 +96,30 @@ func TestDecodeCreateDatabaseDefaultsOwnerForPreM01220007Payload(t *testing.T) {
 	}
 	if owner != catalog.BootstrapSuperuserOID {
 		t.Errorf("owner = %d, want BootstrapSuperuserOID (%d)", owner, catalog.BootstrapSuperuserOID)
+	}
+	if oid != 0 {
+		t.Errorf("oid = %d, want 0 (no override — pre-slice-1 payload)", oid)
+	}
+}
+
+// TestDecodeCreateDatabaseDefaultsOidForPreSlice1Payload confirms a WAL
+// record written after the M0122-0007 owner suffix landed but before the
+// physical-storage-isolation slice-1 oid suffix (kind|nameLen|name|owner,
+// no trailing 4 oid bytes) still decodes, with oid defaulting to 0 (the
+// catalog's DatabaseOid "no override" sentinel).
+func TestDecodeCreateDatabaseDefaultsOidForPreSlice1Payload(t *testing.T) {
+	midway := []byte{RecordKindCreateDatabase, 4, 0, 't', 'p', 'c', 'h', 0, 0, 0, 0}
+	name, owner, oid, err := DecodeCreateDatabase(midway)
+	if err != nil {
+		t.Fatalf("decode pre-slice-1 payload: %v", err)
+	}
+	if name != "tpch" {
+		t.Errorf("name = %q, want tpch", name)
+	}
+	if owner != 0 {
+		t.Errorf("owner = %d, want 0 (the payload's actual owner suffix)", owner)
+	}
+	if oid != 0 {
+		t.Errorf("oid = %d, want 0 (no override — pre-slice-1 payload)", oid)
 	}
 }

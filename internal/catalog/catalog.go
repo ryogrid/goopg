@@ -2109,6 +2109,21 @@ type InMemory struct {
 	// BootstrapSuperuserOID via DatabaseOwner's comma-less lookup, matching
 	// pg_database's pre-existing hardcoded "10" rendering.
 	databaseOwner map[string]uint32
+	// databaseOid holds the real, distinct `pg_database.oid` allocated for a
+	// database registered via CreateDatabase/RegisterDatabaseDuringRecovery
+	// (M0122-0007 physical-storage-isolation slice 1: a prerequisite for a
+	// future `base/<dbOid>` directory — every relation still routes through
+	// DefaultDBOid, this registry only fixes the DISPLAYED oid). Allocated
+	// from the same cluster-wide `nextOID` counter every other object uses
+	// (mirrors real PG's single shared OID space). Absent entries (the
+	// bootstrap postgres/template0/template1 rows) report 0 via DatabaseOid's
+	// comma-less lookup — pgDatabase.VirtualRows treats 0 as "no override,
+	// keep the legacy hardcoded placeholder", which is deliberate: the LIVE
+	// "postgres" database's displayed oid must stay the 16384 placeholder
+	// (see VirtualRows' own comment — CREATE SUBSCRIPTION's subdbid and the
+	// datacl heap resync both depend on it), and only a genuinely new
+	// CREATE DATABASE name is affected.
+	databaseOid map[string]uint32
 	// dbRoleSettings holds per-database `ALTER DATABASE name SET config =
 	// value` overrides (pg_db_role_setting, setrole=0 scope only — ALTER
 	// ROLE ... SET / ALTER ROLE ... IN DATABASE ... SET are a separate,
@@ -3294,6 +3309,7 @@ func NewInMemory() *InMemory {
 		databases:              map[string]bool{"postgres": true, "template1": true, "template0": true},
 		databaseConnLimit:      make(map[string]int32),
 		databaseOwner:          make(map[string]uint32),
+		databaseOid:            make(map[string]uint32),
 		dbRoleSettings:         make(map[uint32][]string),
 		roleSettings:           make(map[roleSettingKey][]string),
 		roleMembers:            make(map[roleMembershipKey]*RoleMembership),
@@ -4539,21 +4555,26 @@ func (c *InMemory) HasDatabase(name string) bool {
 // CreateDatabase registers a new database name (M0054-0001). owner is the
 // `pg_database.datdba` OID to record (the creating role — mirrors upstream
 // createdb()'s "owner defaults to session user" rule; callers pass
-// BootstrapSuperuserOID for the bootstrap superuser). Returns
-// `ErrDatabaseExists` when the name is already known. Callers are
-// expected to write a `wal.RecordKindCreateDatabase` record on the
+// BootstrapSuperuserOID for the bootstrap superuser). Returns the newly
+// allocated `pg_database.oid` (M0122-0007 physical-storage-isolation slice
+// 1 — see DatabaseOid) plus `ErrDatabaseExists` when the name is already
+// known (oid is 0 in the error case). Callers are expected to write a
+// `wal.RecordKindCreateDatabase` record (with the returned oid) on the
 // success path so the registration survives a crash. Bootstrap and
 // recovery paths use `RegisterDatabaseDuringRecovery` instead, which
 // is idempotent.
-func (c *InMemory) CreateDatabase(name string, owner uint32) error {
+func (c *InMemory) CreateDatabase(name string, owner uint32) (uint32, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.databases[name] {
-		return ErrDatabaseExists
+		return 0, ErrDatabaseExists
 	}
+	oid := c.nextOID
+	c.nextOID++
 	c.databases[name] = true
 	c.databaseOwner[name] = owner
-	return nil
+	c.databaseOid[name] = oid
+	return oid, nil
 }
 
 // DropDatabase removes a database from the catalog (M0054-0001).
@@ -4567,6 +4588,7 @@ func (c *InMemory) DropDatabase(name string) error {
 	delete(c.databases, name)
 	delete(c.databaseConnLimit, name)
 	delete(c.databaseOwner, name)
+	delete(c.databaseOid, name)
 	return nil
 }
 
@@ -4583,6 +4605,17 @@ func (c *InMemory) DatabaseOwner(name string) uint32 {
 		return owner
 	}
 	return BootstrapSuperuserOID
+}
+
+// DatabaseOid returns the real `pg_database.oid` allocated for name via
+// CreateDatabase/RegisterDatabaseDuringRecovery, or 0 if name was never
+// registered through either (the bootstrap postgres/template0/template1
+// rows, which predate any CreateDatabase call). M0122-0007
+// physical-storage-isolation slice 1 — see the databaseOid field doc.
+func (c *InMemory) DatabaseOid(name string) uint32 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.databaseOid[name]
 }
 
 // DatconnlimitInvalidDB mirrors PG's DATCONNLIMIT_INVALID_DB sentinel
@@ -4625,12 +4658,22 @@ func (c *InMemory) SetDatabaseConnLimit(name string, limit int32) bool {
 // CreateDatabase used by the WAL-replay driver. Re-applying a record
 // that has already taken effect (e.g. because a SaveCatalog snapshot
 // captured it) is a no-op rather than an error. owner is the datdba OID
-// carried by the WAL record (M0122-0007).
-func (c *InMemory) RegisterDatabaseDuringRecovery(name string, owner uint32) {
+// carried by the WAL record (M0122-0007). oid is the real `pg_database.oid`
+// carried by the WAL record (M0122-0007 physical-storage-isolation slice
+// 1); 0 for a pre-slice-1 payload (DecodeCreateDatabase's own backward-compat
+// default), in which case DatabaseOid falls back to "no override" exactly
+// as before this change. nextOID is advanced past a non-zero oid so a later
+// CREATE TABLE/DATABASE never reallocates it (mirrors advanceNextOIDLocked's
+// pattern for every other recovered OID).
+func (c *InMemory) RegisterDatabaseDuringRecovery(name string, owner, oid uint32) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.databases[name] = true
 	c.databaseOwner[name] = owner
+	c.databaseOid[name] = oid
+	if oid >= c.nextOID {
+		c.nextOID = oid + 1
+	}
 }
 
 // UnregisterDatabaseDuringRecovery is the idempotent counterpart to
@@ -4641,6 +4684,7 @@ func (c *InMemory) UnregisterDatabaseDuringRecovery(name string) {
 	defer c.mu.Unlock()
 	delete(c.databases, name)
 	delete(c.databaseOwner, name)
+	delete(c.databaseOid, name)
 }
 
 // dbRoleSettingConfigName returns the GUC name half of a "name=value"
@@ -6396,6 +6440,20 @@ func (c *InMemory) registerSystemTables() {
 				oid, datallowconn, datistemplate = "1", "true", "true"
 			case "template0":
 				oid, datallowconn, datistemplate = "4", "false", "true"
+			default:
+				// A database registered via CreateDatabase (i.e. not one of
+				// the three bootstrap rows above) now carries a real,
+				// distinct oid (M0122-0007 physical-storage-isolation slice
+				// 1) instead of reusing the shared "16384" placeholder every
+				// non-template row rendered before. Deliberately does NOT
+				// touch the live "postgres" row: it never goes through
+				// CreateDatabase, so DatabaseOid("postgres") is 0 and the
+				// placeholder above stands — CREATE SUBSCRIPTION's subdbid
+				// and the datacl heap resync both key off that placeholder
+				// (see the datacl comment below).
+				if realOid := c.DatabaseOid(n); realOid != 0 {
+					oid = strconv.FormatUint(uint64(realOid), 10)
+				}
 			}
 			// datacl is keyed by c.DBOID() — the REAL on-disk OID read from the
 			// physical global/1262 heap by detectCatalogDBOID at startup (PG18's

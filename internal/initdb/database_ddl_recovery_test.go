@@ -25,7 +25,7 @@ func TestDatabaseDDLRecoveryReplaysCreate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first Open: %v", err)
 	}
-	if _, _, werr := rt1.WAL.Append(wal.EncodeCreateDatabase("tpch", catalog.BootstrapSuperuserOID)); werr != nil {
+	if _, _, werr := rt1.WAL.Append(wal.EncodeCreateDatabase("tpch", catalog.BootstrapSuperuserOID, 16401)); werr != nil {
 		_ = rt1.Close()
 		t.Fatalf("WAL.Append create-database: %v", werr)
 	}
@@ -70,7 +70,7 @@ func TestDatabaseDDLRecoveryReplaysDropAfterCreate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first Open: %v", err)
 	}
-	if _, _, werr := rt1.WAL.Append(wal.EncodeCreateDatabase("scratch", catalog.BootstrapSuperuserOID)); werr != nil {
+	if _, _, werr := rt1.WAL.Append(wal.EncodeCreateDatabase("scratch", catalog.BootstrapSuperuserOID, 16402)); werr != nil {
 		_ = rt1.Close()
 		t.Fatalf("WAL.Append create: %v", werr)
 	}

@@ -5496,6 +5496,50 @@ mirroring M0119's ledger `status` column.
       workloads). **Remaining M0122-0007 items (now 2):** CREATE/DROP
       DATABASE physical storage isolation (the architectural item), REINDEX
       CONCURRENTLY physical rebuild.
+  - [x] `M0122-0007` follow-up 3 (2026-07-09, this loop) — **physical-storage-
+      isolation slice 1: real, distinct `pg_database.oid` per CREATE
+      DATABASE.** Closes the prerequisite named at the top of every prior
+      loop's "still open" note in this bucket: `CreateDatabase` previously
+      never allocated an OID at all, so `pg_database.VirtualRows` rendered
+      the SAME hardcoded `"16384"` placeholder for every non-template
+      database — two `CREATE DATABASE` calls were indistinguishable by
+      `pg_database.oid` (a primary key upstream), and there was no OID to
+      name a future `base/<dbOid>` directory with. `catalog.InMemory.
+      CreateDatabase(name, owner)` now allocates a real OID from the same
+      cluster-wide `nextOID` counter every other object shares and returns it
+      (`(uint32, error)`); new `databaseOid` registry + `DatabaseOid(name)
+      uint32` getter (0 = "no override", the 3 bootstrap rows). The live
+      "postgres" row's displayed oid is deliberately UNCHANGED (never goes
+      through CreateDatabase — a prior loop found that changing it broke
+      CREATE SUBSCRIPTION's subdbid/datacl heap-resync matching). WAL
+      `EncodeCreateDatabase`/`DecodeCreateDatabase` gained a 4th trailing oid
+      field (same backward-compat pattern as the owner suffix);
+      `RegisterDatabaseDuringRecovery(name, owner, oid)` advances `nextOID`
+      past a recovered oid. Design: `docs/design/0122-0017-database-ddl-
+      drop-guards.md` new "Physical-storage-isolation slice 1" section;
+      `docs/design/README.md` row updated; deferral-ledger new row
+      (M0122-0007, 2026-07-09) maps the remaining slices 2-4 (base/<dbOid>
+      directory + template copy on CREATE, directory removal on DROP, and
+      — the deepest gap — giving `catalog.InMemory` a per-database table
+      namespace instead of one shared map for the whole process). Tests:
+      `TestCreateDatabaseAllocatesDistinctDisplayedOid`,
+      `TestRegisterDatabaseDuringRecoveryAdvancesNextOID`
+      (`internal/catalog/database_test.go`),
+      `TestDecodeCreateDatabaseDefaultsOidForPreSlice1Payload`
+      (`internal/wal/database_ddl_test.go`). Gates: `go build ./...`/`go vet
+      ./...` clean; `go test -count=1 ./internal/catalog/... ./internal/wal/...
+      ./internal/server/... ./internal/initdb/...` PASS (full, no
+      regressions); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed transactions, all 3 workloads). Also re-ran
+      `TestPort_PgDumpDatabaseConfigSet`, `TestPort_PgDumpRoleConfigSet`,
+      `TestPort_PgDumpallGlobalsOnly` (all PASS — confirms the "postgres"
+      placeholder-preservation reasoning above) and
+      `TestPort_Subscription001RepChanges` (FAILs, but confirmed via `git
+      stash` to fail identically at HEAD before this change — a pre-existing,
+      unrelated failure, not a regression). **Remaining M0122-0007 items:**
+      physical-storage-isolation slices 2-4 (see deferral ledger row for the
+      concrete resume points), REINDEX CONCURRENTLY physical rebuild.
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,

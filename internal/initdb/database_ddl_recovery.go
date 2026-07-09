@@ -25,7 +25,7 @@ import (
 // databaseRegistryRecovery is the catalog-side surface this recovery
 // pass needs. `*catalog.InMemory` satisfies it.
 type databaseRegistryRecovery interface {
-	RegisterDatabaseDuringRecovery(name string, owner uint32)
+	RegisterDatabaseDuringRecovery(name string, owner, oid uint32)
 	UnregisterDatabaseDuringRecovery(name string)
 }
 
@@ -62,11 +62,11 @@ func replayDatabaseDDLRecords(walDir string, cat catalog.Catalog) error {
 		}
 		switch rec.Payload[0] {
 		case wal.RecordKindCreateDatabase:
-			name, owner, derr := wal.DecodeCreateDatabase(rec.Payload)
+			name, owner, oid, derr := wal.DecodeCreateDatabase(rec.Payload)
 			if derr != nil {
 				return fmt.Errorf("decode create-database at lsn %d: %w", rec.StartLSN, derr)
 			}
-			reg.RegisterDatabaseDuringRecovery(name, owner)
+			reg.RegisterDatabaseDuringRecovery(name, owner, oid)
 		case wal.RecordKindDropDatabase:
 			name, derr := wal.DecodeDropDatabase(rec.Payload)
 			if derr != nil {

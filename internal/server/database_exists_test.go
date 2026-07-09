@@ -120,7 +120,7 @@ func TestConnectNonexistentDatabaseRejected(t *testing.T) {
 // postinit.c's InitPostgres check.
 func TestConnectInvalidDatconnlimitDatabaseRejected(t *testing.T) {
 	cat := catalog.NewInMemory()
-	if err := cat.CreateDatabase("brokendb", catalog.BootstrapSuperuserOID); err != nil {
+	if _, err := cat.CreateDatabase("brokendb", catalog.BootstrapSuperuserOID); err != nil {
 		t.Fatal(err)
 	}
 	if !cat.SetDatabaseConnLimit("brokendb", catalog.DatconnlimitInvalidDB) {
@@ -216,7 +216,7 @@ func TestConnectBootstrapDatabasesAccepted(t *testing.T) {
 // activity-registry-driven check in handleStartup.
 func TestConnectExceedsPositiveDatconnlimitRejected(t *testing.T) {
 	cat := catalog.NewInMemory()
-	if err := cat.CreateDatabase("limiteddb", catalog.BootstrapSuperuserOID); err != nil {
+	if _, err := cat.CreateDatabase("limiteddb", catalog.BootstrapSuperuserOID); err != nil {
 		t.Fatal(err)
 	}
 	if !cat.SetDatabaseConnLimit("limiteddb", 1) {
@@ -296,7 +296,7 @@ func TestConnectExceedsPositiveDatconnlimitRejected(t *testing.T) {
 // check in handleStartup actually runs.
 func TestConnectNonSuperuserFirstConnectionUnlimitedDatabaseAccepted(t *testing.T) {
 	cat := catalog.NewInMemory()
-	if err := cat.CreateDatabase("freshdb", catalog.BootstrapSuperuserOID); err != nil {
+	if _, err := cat.CreateDatabase("freshdb", catalog.BootstrapSuperuserOID); err != nil {
 		t.Fatal(err)
 	}
 	cat.RegisterRole("alice")
@@ -340,7 +340,7 @@ func TestConnectNonSuperuserFirstConnectionUnlimitedDatabaseAccepted(t *testing.
 // no role filter) but the reject check itself never applies to them.
 func TestConnectPositiveDatconnlimitSuperuserBypasses(t *testing.T) {
 	cat := catalog.NewInMemory()
-	if err := cat.CreateDatabase("limiteddb2", catalog.BootstrapSuperuserOID); err != nil {
+	if _, err := cat.CreateDatabase("limiteddb2", catalog.BootstrapSuperuserOID); err != nil {
 		t.Fatal(err)
 	}
 	if !cat.SetDatabaseConnLimit("limiteddb2", 1) {
