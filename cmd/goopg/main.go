@@ -416,8 +416,10 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		walSenderMemBuf := int64(intGUC(registry, "wal_sender_memory_buffer", 16<<20))
 		walBuffers := int64(intGUC(registry, "wal_buffers", 16<<20))
 		walSyncMethod := stringGUC(registry, "wal_sync_method", "fdatasync")
-		// min_wal_size is stored in MB (matching upstream); wal.Config.MinWALSize wants bytes.
+		// min_wal_size/max_wal_size are stored in MB (matching upstream);
+		// wal.Config.MinWALSize/MaxWALSize want bytes.
 		walMinSizeBytes := int64(intGUC(registry, "min_wal_size", 80)) * 1024 * 1024
+		walMaxSizeBytes := int64(intGUC(registry, "max_wal_size", 1024)) * 1024 * 1024
 		walWriterDelayMS := intGUC(registry, "wal_writer_delay", 200)
 		bgwriterDelayMS := intGUC(registry, "bgwriter_delay", 200)
 		bgwriterMaxPages := intGUC(registry, "bgwriter_lru_maxpages", 100)
@@ -445,6 +447,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			WALBuffers:            walBuffers,
 			WALSyncMethod:         walSyncMethod,
 			WALMinSize:            walMinSizeBytes,
+			WALMaxSize:            walMaxSizeBytes,
 			WalWriterDelay:        time.Duration(walWriterDelayMS) * time.Millisecond,
 			BgwriterDelay:         time.Duration(bgwriterDelayMS) * time.Millisecond,
 			BgwriterMaxPages:      bgwriterMaxPages,
@@ -710,6 +713,17 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 				Writer: rt.WAL,
 				Slots:  rt.Slots,
 				Logger: logger,
+				// M0122-0009 follow-up: let RemoveOldSegmentsWithEstimate's
+				// XLOGfileslop-style sizing grow past the min_wal_size
+				// floor under sustained write volume (capped at
+				// max_wal_size, wired into rt.WAL's Config above via
+				// WALMaxSize).
+				CheckPointDistanceEstimateFn: rt.Checkpointer.CheckPointDistanceEstimate,
+			}
+			if v, ok := registry.Get("checkpoint_completion_target"); ok {
+				if f, err := strconv.ParseFloat(v.Display(), 64); err == nil {
+					retainer.CompletionTarget = f
+				}
 			}
 			if v, ok := registry.Get("max_slot_wal_keep_size"); ok {
 				// Stored in MB (matching upstream guc_tables.c). -1

@@ -162,6 +162,12 @@ type OpenOptions struct {
 	// docs/design/0122-0009-wal-segment-recycling.md.
 	WALMinSize int64
 
+	// WALMaxSize forwards to wal.Config.MaxWALSize (bytes), the ceiling
+	// RemoveOldSegmentsWithEstimate's XLOGfileslop-style formula caps
+	// recycling at. Mirrors the `max_wal_size` GUC. <= 0 disables the
+	// ceiling. See docs/design/0122-0009-wal-segment-recycling.md.
+	WALMaxSize int64
+
 	// AIO* control the AIO engine the storage manager (and
 	// future heap-scan / checkpointer / WAL-writer callers)
 	// will use. Maps to the upstream-aligned `io_method`,
@@ -370,6 +376,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		WALBuffers:         opts.WALBuffers,
 		SyncMethod:         opts.WALSyncMethod,
 		MinWALSize:         opts.WALMinSize,
+		MaxWALSize:         opts.WALMaxSize,
 		// M0101-0001: emit PG-compatible XLOG page headers so pg_waldump
 		// can parse the WAL segments. SystemID is embedded in every page
 		// header for cross-segment consistency checking.

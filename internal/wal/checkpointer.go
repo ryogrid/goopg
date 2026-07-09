@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -216,6 +217,13 @@ type Checkpointer struct {
 	lastCheckpointLSN     atomic.Uint64
 	lastCheckpointRedoLSN atomic.Uint64
 
+	// distMu guards priorRedoLSN/checkPointDistanceEstimate. Checkpoints
+	// are infrequent (seconds-to-minutes apart) so a plain mutex — rather
+	// than lock-free float CAS — is fine here.
+	distMu                     sync.Mutex
+	priorRedoLSN               uint64
+	checkPointDistanceEstimate float64
+
 	// Aggregate counters surfaced through pg_stat_checkpointer.
 	// Mirror the upstream PG 18 view's counter shape:
 	// num_timed     — timer-driven cycles
@@ -274,6 +282,42 @@ func (c *Checkpointer) LastCheckpointLSN() uint64 {
 // pg_control update path (M0102-0007).
 func (c *Checkpointer) LastCheckpointRedoLSN() uint64 {
 	return c.lastCheckpointRedoLSN.Load()
+}
+
+// updateCheckPointDistanceEstimate mirrors upstream's
+// UpdateCheckPointDistanceEstimate (xlog.c): a moving average of the WAL
+// bytes generated between successive checkpoints' redo LSNs, consulted by
+// SlotAwareRetainer to size WAL-segment recycling (XLOGfileslop, M0122-0009
+// follow-up). The average declines slowly when a cycle used less WAL than
+// estimated, but jumps immediately when a cycle used more — biased toward
+// the peak load rather than a plain average, so a bursty workload isn't
+// underestimated right after a quiet period. The very first checkpoint
+// (priorRedoLSN still 0) has nothing to compare against and leaves the
+// estimate at its zero value.
+func (c *Checkpointer) updateCheckPointDistanceEstimate(redoLSN uint64) {
+	c.distMu.Lock()
+	defer c.distMu.Unlock()
+	prior := c.priorRedoLSN
+	c.priorRedoLSN = redoLSN
+	if prior == 0 || redoLSN <= prior {
+		return
+	}
+	nbytes := float64(redoLSN - prior)
+	if c.checkPointDistanceEstimate < nbytes {
+		c.checkPointDistanceEstimate = nbytes
+	} else {
+		c.checkPointDistanceEstimate = 0.90*c.checkPointDistanceEstimate + 0.10*nbytes
+	}
+}
+
+// CheckPointDistanceEstimate returns the current moving-average estimate
+// (bytes) of inter-checkpoint WAL volume. Exported so SlotAwareRetainer can
+// size WAL-segment recycling; 0 before the second checkpoint of a run
+// completes (no distance to measure yet).
+func (c *Checkpointer) CheckPointDistanceEstimate() float64 {
+	c.distMu.Lock()
+	defer c.distMu.Unlock()
+	return c.checkPointDistanceEstimate
 }
 
 // CheckpointRedoLSN is the executor.Checkpointer interface method.
@@ -477,6 +521,12 @@ func (c *Checkpointer) runCheckpoint(ctx context.Context, spread, shutdown bool)
 		}
 	}
 	redoLSN0 := uint64(pos + int64(leading))
+	// M0122-0009 follow-up: feed this cycle's redo distance into the
+	// moving-average estimate SlotAwareRetainer consults for
+	// XLOGfileslop-style WAL-segment recycling. Must run before the
+	// retainer call below (via c.retainer.Retain) so the estimate it reads
+	// already reflects this cycle.
+	c.updateCheckPointDistanceEstimate(redoLSN0)
 	// M0106-0010 batched-47: sample nextXid from the mvcc manager
 	// BEFORE appending the checkpoint record so the on-wire CheckPoint
 	// payload carries the live value. The standby reads nextXid out of

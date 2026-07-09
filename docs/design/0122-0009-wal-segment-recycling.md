@@ -110,28 +110,111 @@ larger, higher-risk change out of scope here).
 
 ## Non-goals / deferred
 
-Only the `min_wal_size` floor half of upstream's `XLOGfileslop` sizing is
-implemented. Not implemented (ledger row filed in
-`.ralph/deferral_ledger.md`):
+Timeline-aware recycling / `RemoveNonParentXlogFiles` (no timeline-switch
+support yet in goopg) and a `wal_recycle`-style opt-out GUC (goopg's
+off-switch is `min_wal_size <= 0`, which also matches upstream's own
+`min_wal_size=0` meaning "always remove, never recycle" per
+`XLOGfileslop`'s `minSegNo` floor collapsing to `endLogSegNo - 1`) remain
+unimplemented. The `min_wal_size`/`max_wal_size`/distance-estimate sizing
+itself is now fully implemented — see the follow-up below.
 
-- The checkpoint-distance-estimate term (`CheckPointDistanceEstimate` /
-  `CheckPointCompletionTarget`) that lets upstream recycle *more* than the
-  `min_wal_size` floor when write volume is high.
-- The `max_wal_size` ceiling on the recycle target (upstream never recycles
-  past `maxSegNo`; goopg's `spares` count is driven by `MinWALSize` alone, so
-  a very large `min_wal_size` setting could recycle further ahead than
-  upstream would allow under a small `max_wal_size`). In practice this only
-  changes how many segments are held as *recycled spares* vs *unlinked* — it
-  does not affect correctness, since either an obsolete segment is retired
-  and its future segno is created by `openSegment` when first needed, or it
-  is pre-touched via recycling; the total on-disk footprint difference is
-  bounded by `min_wal_size`.
-- Timeline-aware recycling / `RemoveNonParentXlogFiles` (no timeline-switch
-  support yet in goopg).
-- `wal_recycle`-style opt-out GUC (goopg's off-switch is
-  `min_wal_size <= 0`, which also matches upstream's own `min_wal_size=0`
-  meaning "always remove, never recycle" per `XLOGfileslop`'s `minSegNo`
-  floor collapsing to `endLogSegNo - 1`).
+## Follow-up (2026-07-09): `max_wal_size` ceiling + `CheckPointDistanceEstimate`
+
+Closes the two sizing gaps this doc originally deferred (ledger row
+`M0122-0009`, 2026-07-09; also tracked as the last open item under
+M0122-0009 in `.ralph/fix_plan.md`).
+
+**What was missing.** `removeOldSegments`'s `spares` count was driven by
+`MinWALSize` alone — the floor half of upstream's `XLOGfileslop` (xlog.c).
+Two halves were absent: the `max_wal_size` ceiling (`maxSegNo` clamp) and
+the checkpoint-distance-estimate term that lets upstream recycle further
+ahead than the floor under sustained write volume (`CheckPointDistanceEstimate`,
+`CheckPointCompletionTarget`).
+
+**Design choice: segment-count-relative math, not absolute LSN/segNo
+math.** Upstream computes `minSegNo`/`maxSegNo`/`recycleSegNo` as absolute
+`XLogSegNo` values derived from `lastredoptr`. goopg's new
+`computeSpareSegments(minWALSize, maxWALSize, segmentSize,
+distanceEstimateBytes, completionTarget) int` (`internal/wal/writer.go`)
+instead works entirely in segment counts *relative to the retention
+keep-segment* — `spares = max(ceil(minWALSize/segSize),
+ceil((1+completionTarget)*distanceEstimateBytes*1.10/segSize))`, clamped to
+`ceil(maxWALSize/segSize)` when `maxWALSize > 0`. This is behaviourally
+equivalent (both bound "how many segments past the keep point to hold as
+spares") without needing goopg's 1-based LSN encoding to line up
+bit-for-bit with upstream's 0-based `XLogSegNo` arithmetic. Passing
+`distanceEstimateBytes=0, completionTarget=0` reproduces the original
+`ceil(minWALSize/segSize)` floor exactly — pinned by
+`TestComputeSpareSegmentsMatchesMinWALSizeFloorWhenNoEstimate` and every
+pre-existing `RemoveOldSegments` test (all still calling the unchanged
+public API, which now forwards to the same function with both new inputs
+zeroed).
+
+**CheckPointDistanceEstimate tracking.** New
+`Checkpointer.updateCheckPointDistanceEstimate(redoLSN)` (`internal/wal/checkpointer.go`)
+ports upstream's `UpdateCheckPointDistanceEstimate` (xlog.c) verbatim: an
+exponential moving average over each checkpoint cycle's redo-LSN delta that
+jumps immediately to a higher observed distance but only decays 90/10
+toward a lower one (biased toward peak load so a bursty workload isn't
+underestimated right after a quiet period). Called from `runCheckpoint`
+right after `redoLSN0` is computed, mutex-guarded (checkpoints are seconds
+apart, not a hot path). Exposed via `Checkpointer.CheckPointDistanceEstimate()
+float64`.
+
+**Wiring.** `SlotAwareRetainer` (`internal/wal/retention.go`) gained
+`CheckPointDistanceEstimateFn func() float64` and `CompletionTarget
+float64`. When `CheckPointDistanceEstimateFn` is set, `Retain` calls the new
+`Writer.RemoveOldSegmentsWithEstimate(keepLSN, distanceEstimateBytes,
+completionTarget)` instead of the plain `RemoveOldSegments(keepLSN)`; nil
+(the pre-existing test default) preserves the exact old behaviour.
+`cmd/goopg/main.go` wires `retainer.CheckPointDistanceEstimateFn =
+rt.Checkpointer.CheckPointDistanceEstimate` and reads
+`checkpoint_completion_target` into `retainer.CompletionTarget` (the same
+GUC `Checkpointer.SetCompletionTarget` already consumes for dirty-page
+pacing). New `wal.Config.MaxWALSize` (bytes) forwards from a new
+`initdb.OpenOptions.WALMaxSize`, wired from the `max_wal_size` GUC (default
+1024 MB, matching upstream) in `cmd/goopg/main.go` the same way
+`WALMinSize`/`min_wal_size` already are — a startup-time snapshot, not
+live-reloadable, matching `MinWALSize`'s existing precedent.
+
+**Op-channel plumbing.** `RemoveOldSegmentsWithEstimate` threads
+`distanceEstimate`/`completionTarget` through the writer's existing
+serialised `op` channel (new fields on the `op` struct) rather than storing
+them as mutable `Config`/`state` fields, so the per-checkpoint dynamic
+estimate never risks racing the writer's own goroutine.
+
+### Tests
+
+- `TestComputeSpareSegmentsMatchesMinWALSizeFloorWhenNoEstimate`,
+  `TestComputeSpareSegmentsGrowsWithDistanceEstimate`,
+  `TestComputeSpareSegmentsCapsAtMaxWALSize` (`internal/wal/retention_test.go`):
+  pure unit coverage of the new formula, including the zero-inputs
+  equivalence to the pre-existing floor.
+- `TestRemoveOldSegmentsWithEstimateHonoursDistanceAndMax`: integration
+  test with `MinWALSize` unset — only a wired distance estimate causes any
+  recycling, and `MaxWALSize` still caps it below what the raw estimate
+  alone would request.
+- `TestCheckpointerUpdatesCheckPointDistanceEstimate`
+  (`internal/wal/checkpointer_test.go`): pins the jump-up-immediately /
+  decay-slowly EMA shape across four real `CheckpointNow()` cycles
+  (byte-count-agnostic — asserts direction and magnitude bounds, not exact
+  values, since checkpoint marker framing overhead is an implementation
+  detail).
+- `TestSlotAwareRetainerUsesCheckPointDistanceEstimateFn`
+  (`internal/wal/retention_test.go`): confirms `Retain` reaches
+  `RemoveOldSegmentsWithEstimate` (not the plain MinWALSize-only path) when
+  `CheckPointDistanceEstimateFn` is wired, with `MinWALSize`/`MaxWALSize`
+  both unset so any observed recycling can only have come from the
+  distance-estimate path.
+
+### Gates (this follow-up)
+
+`go build ./...`/`go vet ./...` clean; `go test`/`go test -race
+./internal/wal/...` PASS; `go test ./internal/initdb/...` PASS (full
+`Init`+`Open`+restart cycle, ~4 min, no regression);
+`go test ./cmd/goopg/...` PASS; `scripts/tpch-spotcheck.sh` PASS
+(Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh`
+PASS (0 failed transactions, all 3 pgbench workloads).
 
 ## Tests
 

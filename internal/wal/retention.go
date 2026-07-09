@@ -18,12 +18,12 @@
 //   4. Unlink every segment whose final byte sits strictly before the
 //      segment containing the resulting keep-LSN.
 //
-// goopg's v0 retention follows the same shape, including min_wal_size
-// recycle-by-rename (Writer.RemoveOldSegments — see
-// docs/design/0122-0009-wal-segment-recycling.md), minus the
-// checkpoint-distance-estimate and max_wal_size halves of upstream's
-// XLOGfileslop sizing formula, and minus archive-mode integration (no
-// pg_wal/archive_status yet).
+// goopg's v0 retention follows the same shape, including min_wal_size/
+// max_wal_size/checkpoint-distance-estimate-sized recycle-by-rename
+// (Writer.RemoveOldSegmentsWithEstimate, wired via
+// CheckPointDistanceEstimateFn below — see
+// docs/design/0122-0009-wal-segment-recycling.md), minus archive-mode
+// integration (no pg_wal/archive_status yet).
 //
 // See docs/design/0005-0004-slot-aware-wal-retention.md.
 
@@ -71,6 +71,23 @@ type SlotAwareRetainer struct {
 	// (segments removed, slots invalidated). Defaults to slog
 	// default.
 	Logger *slog.Logger
+
+	// CheckPointDistanceEstimateFn, when non-nil, returns the current
+	// moving-average estimate (bytes) of inter-checkpoint WAL volume —
+	// wired to (*Checkpointer).CheckPointDistanceEstimate in production.
+	// Combined with CompletionTarget and Writer's Config.MinWALSize/
+	// MaxWALSize, it drives RemoveOldSegmentsWithEstimate's
+	// XLOGfileslop-style sizing so segment recycling can grow past the
+	// MinWALSize floor under sustained write volume (capped at
+	// MaxWALSize). nil falls back to RemoveOldSegments' pre-existing
+	// MinWALSize-only floor. M0122-0009 follow-up; see
+	// docs/design/0122-0009-wal-segment-recycling.md.
+	CheckPointDistanceEstimateFn func() float64
+
+	// CompletionTarget mirrors checkpoint_completion_target, one of the
+	// XLOGfileslop distance-formula inputs. Only consulted when
+	// CheckPointDistanceEstimateFn is non-nil.
+	CompletionTarget float64
 }
 
 // Retain implements Retainer. Steps mirror the order documented in
@@ -130,10 +147,18 @@ func (r *SlotAwareRetainer) Retain(checkpointLSN uint64) error {
 		}
 	}
 
-	// Step 4: retire obsolete segments (unlink, or recycle-by-rename
-	// up to min_wal_size worth of spares). The writer guarantees the
-	// segment containing keepLSN is preserved.
-	removed, recycled, err := r.Writer.RemoveOldSegments(keepLSN)
+	// Step 4: retire obsolete segments (unlink, or recycle-by-rename up to
+	// a spares count sized by min_wal_size/max_wal_size and — when a
+	// distance estimate is wired — the same XLOGfileslop-style formula
+	// upstream uses). The writer guarantees the segment containing
+	// keepLSN is preserved.
+	var removed, recycled int
+	var err error
+	if r.CheckPointDistanceEstimateFn != nil {
+		removed, recycled, err = r.Writer.RemoveOldSegmentsWithEstimate(keepLSN, r.CheckPointDistanceEstimateFn(), r.CompletionTarget)
+	} else {
+		removed, recycled, err = r.Writer.RemoveOldSegments(keepLSN)
+	}
 	if err != nil {
 		return fmt.Errorf("wal retention: remove old segments: %w", err)
 	}

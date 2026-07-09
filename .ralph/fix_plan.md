@@ -5547,6 +5547,51 @@ mirroring M0119's ledger `status` column.
       already cost this project many multi-loop corruption-hunt threads
       (see the `M-NIGHTLY (AI-20260709-010336-082)` btree thread above) —
       correctly left deferred rather than rushed into one loop.
+      **`max_wal_size` ceiling + `CheckPointDistanceEstimate` — done
+      (2026-07-09, next loop, closes the deferral-ledger row from the
+      original WAL segment recycling loop):** the bucket's other named
+      sizing gap. New `computeSpareSegments` (`internal/wal/writer.go`)
+      ports upstream's `XLOGfileslop` (xlog.c) formula as segment counts
+      relative to the retention keep-segment rather than absolute
+      LSN/segNo math (behaviourally equivalent, avoids needing goopg's
+      1-based LSN encoding to line up bit-for-bit with upstream's 0-based
+      `XLogSegNo` arithmetic); new `Checkpointer.CheckPointDistanceEstimate()`
+      ports `UpdateCheckPointDistanceEstimate`'s jump-up-immediately/
+      decay-slowly (90/10) EMA verbatim, fed from each `runCheckpoint`
+      cycle's redo-LSN delta. New `Writer.RemoveOldSegmentsWithEstimate` +
+      `SlotAwareRetainer.CheckPointDistanceEstimateFn`/`CompletionTarget`
+      wire it through Retain; `cmd/goopg/main.go` reads `max_wal_size`
+      (new `wal.Config.MaxWALSize` via `initdb.OpenOptions.WALMaxSize`,
+      default 1024 MB matching upstream) and `checkpoint_completion_target`
+      the same way `min_wal_size`/`checkpoint_completion_target` already
+      feed the checkpointer's other knobs. The pre-existing
+      `RemoveOldSegments` public API is unchanged behaviourally — it now
+      forwards to the same formula with both new inputs zeroed, proven to
+      reduce to the original `ceil(MinWALSize/SegmentSize)` floor exactly
+      (every pre-existing test using it, e.g.
+      `TestRemoveOldSegmentsRecyclesUpToMinWALSize`, still passes
+      unmodified). Tests:
+      `TestComputeSpareSegmentsMatchesMinWALSizeFloorWhenNoEstimate`/
+      `TestComputeSpareSegmentsGrowsWithDistanceEstimate`/
+      `TestComputeSpareSegmentsCapsAtMaxWALSize`/
+      `TestRemoveOldSegmentsWithEstimateHonoursDistanceAndMax`/
+      `TestSlotAwareRetainerUsesCheckPointDistanceEstimateFn`
+      (`internal/wal/retention_test.go`),
+      `TestCheckpointerUpdatesCheckPointDistanceEstimate`
+      (`internal/wal/checkpointer_test.go`, pins the jump-up/decay-down
+      shape across real `CheckpointNow()` cycles without asserting exact
+      byte counts). Design: `docs/design/0122-0009-wal-segment-recycling.md`
+      new "Follow-up (2026-07-09)" section; `docs/design/README.md` row
+      updated; deferral-ledger row flipped to `resolved`, new row appended
+      closing it. Gates: `go build ./...`/`go vet ./...` clean; `go test`/
+      `go test -race ./internal/wal/...` PASS; `go test
+      ./internal/initdb/... ./cmd/goopg/...` PASS; `scripts/tpch-spotcheck.sh`
+      PASS (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+      scripts/ralph-precommit-test.sh` PASS (0 failed transactions, all 3
+      pgbench workloads). **M0122-0009's WAL-segment-recycling sizing
+      sub-bucket now has no known open gap; MultiXact WAL remains the
+      bucket's sole open item** (multi-loop, feature-sized — see the
+      survey directly above).
 - [ ] **M0122-0010 — Concurrency: buffer pool & btree locking** (~17, LARGE).
       Lehman/Yao crab-walk, `splitMu` removal, storage-pool pin-count race,
       re-enable the `-race` gate. Gate: race detector mandatory.

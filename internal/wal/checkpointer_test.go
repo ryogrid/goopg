@@ -368,6 +368,87 @@ func TestCheckpointerCheckpointNowSynchronous(t *testing.T) {
 	}
 }
 
+// TestCheckpointerUpdatesCheckPointDistanceEstimate pins the two upstream
+// UpdateCheckPointDistanceEstimate behaviours (xlog.c): the moving average
+// jumps immediately to a higher observed inter-checkpoint distance, but
+// only decays slowly (90/10 weighted) toward a lower one. Exact byte counts
+// aren't asserted (checkpoint marker framing overhead is an implementation
+// detail) — only the directional jump-up/decay-down shape.
+func TestCheckpointerUpdatesCheckPointDistanceEstimate(t *testing.T) {
+	walDir := filepath.Join(t.TempDir(), "pg_wal")
+	w, err := NewWriter(Config{WALDir: walDir, SegmentSize: 65536})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	flusher := &fakeFlusher{flushSignalChan: make(chan struct{}, 8)}
+	cp := NewCheckpointer(flusher, w, CheckpointerConfig{
+		Interval: time.Hour, // never ticks during the test
+		Logger:   slog.New(slog.NewTextHandler(nilDiscardWriter{}, nil)),
+	})
+
+	if got := cp.CheckPointDistanceEstimate(); got != 0 {
+		t.Fatalf("estimate before any checkpoint = %v, want 0", got)
+	}
+
+	// First checkpoint: no prior redo LSN to compare against, so the
+	// estimate stays at its zero value.
+	if err := cp.CheckpointNow(); err != nil {
+		t.Fatal(err)
+	}
+	if got := cp.CheckPointDistanceEstimate(); got != 0 {
+		t.Fatalf("estimate after first checkpoint (no prior redo) = %v, want 0", got)
+	}
+
+	// Second checkpoint after a small append: nbytes > 0 == prior estimate,
+	// so it jumps straight to nbytes (the "< nbytes" branch).
+	if _, _, err := w.Append(make([]byte, 100)); err != nil {
+		t.Fatal(err)
+	}
+	if err := cp.CheckpointNow(); err != nil {
+		t.Fatal(err)
+	}
+	afterSmall := cp.CheckPointDistanceEstimate()
+	if afterSmall <= 0 {
+		t.Fatalf("estimate after second checkpoint = %v, want > 0", afterSmall)
+	}
+
+	// Third checkpoint after a much larger append: nbytes exceeds the
+	// current estimate, so it jumps immediately to (approximately) the new
+	// larger value rather than being smoothed.
+	if _, _, err := w.Append(make([]byte, 5000)); err != nil {
+		t.Fatal(err)
+	}
+	if err := cp.CheckpointNow(); err != nil {
+		t.Fatal(err)
+	}
+	afterBig := cp.CheckPointDistanceEstimate()
+	if afterBig <= afterSmall {
+		t.Fatalf("estimate after big cycle = %v, want > %v (should jump up)", afterBig, afterSmall)
+	}
+	if afterBig < 5000 {
+		t.Fatalf("estimate after big cycle = %v, want >= 5000 (jumps to the raw distance on increase)", afterBig)
+	}
+
+	// Fourth checkpoint after a small append again: nbytes is now well
+	// below the current estimate, so it should decay via 0.90*est +
+	// 0.10*nbytes rather than dropping straight to the new small value.
+	if _, _, err := w.Append(make([]byte, 50)); err != nil {
+		t.Fatal(err)
+	}
+	if err := cp.CheckpointNow(); err != nil {
+		t.Fatal(err)
+	}
+	afterDecay := cp.CheckPointDistanceEstimate()
+	if afterDecay >= afterBig {
+		t.Fatalf("estimate after small cycle = %v, want < %v (should decay downward)", afterDecay, afterBig)
+	}
+	if afterDecay < 0.85*afterBig {
+		t.Fatalf("estimate decayed too fast: %v, want >= %v (0.90 weight on the prior estimate should dominate one cycle)", afterDecay, 0.85*afterBig)
+	}
+}
+
 func TestCheckpointerWritesCheckpointMarkers(t *testing.T) {
 	walDir := filepath.Join(t.TempDir(), "pg_wal")
 	w, err := NewWriter(Config{WALDir: walDir, SegmentSize: 512})

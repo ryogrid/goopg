@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -186,6 +187,17 @@ type Config struct {
 	// unlinked, matching pre-M0122-0009 behaviour. See
 	// docs/design/0122-0009-wal-segment-recycling.md.
 	MinWALSize int64
+
+	// MaxWALSize mirrors upstream's `max_wal_size` GUC (bytes): the
+	// ceiling upstream's XLOGfileslop formula caps recycling at, so a
+	// bursty CheckPointDistanceEstimate can never grow the recycled-spare
+	// count past this bound. Only consulted by
+	// RemoveOldSegmentsWithEstimate (RemoveOldSegments itself never
+	// exceeds MinWALSize, so the ceiling has nothing to clamp there).
+	// <= 0 (the default) disables the ceiling. See
+	// docs/design/0122-0009-wal-segment-recycling.md's "max_wal_size
+	// ceiling + CheckPointDistanceEstimate" follow-up.
+	MaxWALSize int64
 }
 
 // AIOEngine is the wal-side seam onto an AIO engine. Mirrors
@@ -266,6 +278,15 @@ type op struct {
 	payload []byte
 	lsn     uint64
 	resp    chan result
+
+	// distanceEstimate and completionTarget are only meaningful for
+	// opRecycle: RemoveOldSegmentsWithEstimate's CheckPointDistanceEstimate
+	// (bytes) and checkpoint_completion_target inputs to the
+	// XLOGfileslop-style spares formula. Both zero (RemoveOldSegments'
+	// plain path) reproduces the pre-M0122-0009 MinWALSize-only floor
+	// exactly.
+	distanceEstimate float64
+	completionTarget float64
 }
 
 type walBufStatSnapshot struct {
@@ -887,11 +908,29 @@ func (w *Writer) FlushUpTo(lsn uint64) error {
 //
 // Returns the number of segment files unlinked and the number recycled.
 func (w *Writer) RemoveOldSegments(keepLSN uint64) (removed, recycled int, err error) {
+	return w.sendRemoveOldSegments(keepLSN, 0, 0)
+}
+
+// RemoveOldSegmentsWithEstimate is RemoveOldSegments extended with the two
+// remaining inputs to upstream's XLOGfileslop formula (xlog.c):
+// distanceEstimateBytes (CheckPointDistanceEstimate — the moving average of
+// inter-checkpoint WAL volume) and completionTarget
+// (checkpoint_completion_target). Together with Config.MinWALSize/MaxWALSize
+// they size how many of the newest obsolete segments are recycled, growing
+// past the MinWALSize floor under sustained write volume but never past the
+// MaxWALSize ceiling. Passing 0 for both reproduces RemoveOldSegments'
+// MinWALSize-only floor exactly. See
+// docs/design/0122-0009-wal-segment-recycling.md.
+func (w *Writer) RemoveOldSegmentsWithEstimate(keepLSN uint64, distanceEstimateBytes, completionTarget float64) (removed, recycled int, err error) {
+	return w.sendRemoveOldSegments(keepLSN, distanceEstimateBytes, completionTarget)
+}
+
+func (w *Writer) sendRemoveOldSegments(keepLSN uint64, distanceEstimateBytes, completionTarget float64) (removed, recycled int, err error) {
 	if keepLSN == 0 {
 		return 0, 0, nil
 	}
 	resp := make(chan result, 1)
-	if err := w.send(op{kind: opRecycle, lsn: keepLSN, resp: resp}); err != nil {
+	if err := w.send(op{kind: opRecycle, lsn: keepLSN, resp: resp, distanceEstimate: distanceEstimateBytes, completionTarget: completionTarget}); err != nil {
 		return 0, 0, err
 	}
 	r := <-resp
@@ -1267,7 +1306,7 @@ func (s *state) loop(ops <-chan op, done chan<- struct{}) {
 				// New code routes through flushSig via FlushUpTo.
 				req.resp <- result{err: s.flushUpTo(req.lsn)}
 			case opRecycle:
-				n, rc, err := s.removeOldSegments(req.lsn)
+				n, rc, err := s.removeOldSegments(req.lsn, req.distanceEstimate, req.completionTarget)
 				req.resp <- result{removed: n, recycled: rc, err: err}
 			case opClose:
 				// Drain any pending group-flush requests before closing.
@@ -1926,10 +1965,16 @@ func (s *state) flushUpTo(lsn uint64) error {
 
 // removeOldSegments retires every segment whose final byte sits
 // strictly before the segment containing keepLSN, either by
-// unlinking it or — for up to `ceil(Config.MinWALSize/SegmentSize)`
-// of the newest obsolete segments — recycling it into a fresh future
+// unlinking it or — for up to `computeSpareSegments(...)` of the
+// newest obsolete segments — recycling it into a fresh future
 // segment slot. Runs on the loop goroutine so it serialises with
 // append/flush and won't race with openSegment.
+//
+// distanceEstimateBytes/completionTarget are the two extra
+// XLOGfileslop inputs RemoveOldSegmentsWithEstimate threads through;
+// RemoveOldSegments passes 0 for both, which computeSpareSegments
+// reduces to the original `ceil(Config.MinWALSize/SegmentSize)` floor
+// exactly (see computeSpareSegments).
 //
 // Behaviour notes:
 //   - The segment that contains keepLSN is preserved (the standby /
@@ -1956,7 +2001,7 @@ func (s *state) flushUpTo(lsn uint64) error {
 //     record from its previous life (valid CRC and all), so leaving
 //     it in place would let recovery misread stale history as live
 //     WAL. See docs/design/0122-0009-wal-segment-recycling.md.
-func (s *state) removeOldSegments(keepLSN uint64) (removed, recycled int, err error) {
+func (s *state) removeOldSegments(keepLSN uint64, distanceEstimateBytes, completionTarget float64) (removed, recycled int, err error) {
 	if keepLSN == 0 {
 		return 0, 0, nil
 	}
@@ -1990,10 +2035,7 @@ func (s *state) removeOldSegments(keepLSN uint64) (removed, recycled int, err er
 		}
 	}
 
-	spares := 0
-	if s.cfg.MinWALSize > 0 && s.cfg.SegmentSize > 0 {
-		spares = int((s.cfg.MinWALSize + s.cfg.SegmentSize - 1) / s.cfg.SegmentSize)
-	}
+	spares := computeSpareSegments(s.cfg.MinWALSize, s.cfg.MaxWALSize, s.cfg.SegmentSize, distanceEstimateBytes, completionTarget)
 
 	// Recycle the newest obsolete segments first (mirrors upstream's
 	// RemoveOldXlogFiles, which walks toward the retention cutoff from
@@ -2047,6 +2089,61 @@ func (s *state) removeOldSegments(keepLSN uint64) (removed, recycled int, err er
 		}
 	}
 	return removed, recycled, nil
+}
+
+// computeSpareSegments decides how many of the newest obsolete WAL
+// segments removeOldSegments should recycle (vs. unlink), mirroring
+// upstream's XLOGfileslop (postgres/src/backend/access/transam/xlog.c).
+// Unlike upstream — which computes absolute minSegNo/maxSegNo/recycleSegNo
+// bounds from an absolute LSN — this works entirely in segment counts
+// relative to the retention keep-segment, which is behaviourally
+// equivalent (both ultimately bound "how many segments past the keep
+// point to keep as spares") without needing goopg's 1-based LSN encoding
+// to line up bit-for-bit with upstream's 0-based XLogSegNo arithmetic.
+//
+//   - minWALSize/maxWALSize mirror min_wal_size/max_wal_size (bytes).
+//     maxWALSize <= 0 disables the ceiling (matches the pre-existing,
+//     MinWALSize-only behaviour when distanceEstimateBytes is also 0).
+//   - distanceEstimateBytes mirrors CheckPointDistanceEstimate: the
+//     exponential moving average of inter-checkpoint WAL volume
+//     (Checkpointer.CheckPointDistanceEstimate). 0 (no estimate yet,
+//     e.g. before the first checkpoint cycle completes) contributes
+//     nothing beyond the MinWALSize floor.
+//   - completionTarget mirrors checkpoint_completion_target, applied via
+//     the same "(1 + target) * distance, then +10% for good measure"
+//     fudge factor XLOGfileslop uses.
+//
+// Passing distanceEstimateBytes=0, completionTarget=0 reproduces the
+// original `ceil(minWALSize/segmentSize)` floor exactly — the sole
+// behaviour RemoveOldSegments (and every test written against it) pins.
+func computeSpareSegments(minWALSize, maxWALSize, segmentSize int64, distanceEstimateBytes, completionTarget float64) int {
+	if segmentSize <= 0 {
+		return 0
+	}
+	spares := ceilSegs(minWALSize, segmentSize)
+
+	distance := (1.0 + completionTarget) * distanceEstimateBytes
+	distance *= 1.10 // upstream: "add 10% for good measure"
+	if distSegs := ceilSegs(int64(math.Ceil(distance)), segmentSize); distSegs > spares {
+		spares = distSegs
+	}
+
+	if maxWALSize > 0 {
+		if maxSegs := ceilSegs(maxWALSize, segmentSize); spares > maxSegs {
+			spares = maxSegs
+		}
+	}
+	return spares
+}
+
+// ceilSegs returns ceil(n/segmentSize) as an int, or 0 when n or
+// segmentSize is non-positive (mirrors the "<= 0 disables this" convention
+// MinWALSize/MaxWALSize already use elsewhere in this file).
+func ceilSegs(n, segmentSize int64) int {
+	if n <= 0 || segmentSize <= 0 {
+		return 0
+	}
+	return int((n + segmentSize - 1) / segmentSize)
 }
 
 // recycleSegmentFile renames an obsolete WAL segment into a fresh
