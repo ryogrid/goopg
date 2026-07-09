@@ -5808,65 +5808,29 @@ func verboseIntervalOffset(totalSecs int) string {
 	return b.String()
 }
 
-func (c *InMemory) registerSystemTables() {
-	pgClass := &Table{
-		Schema: "pg_catalog",
-		Name:   "pg_class",
-		// Columns match the PG18-canonical 34-column pg_class tupdesc written by
-		// syncTableToCatalogHeap / pgClassColumnsPG18(). This alignment is required
-		// so that scanMatching can decode physical pg_class heap tuples for UPDATE
-		// (e.g. "UPDATE pg_class SET reltuples = ... WHERE oid = ...").
-		// M0100-0010: sysupd2/sysmerge2 concurrent-update blocking fix.
-		Columns: []Column{
-			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
-			{Name: "relname", Type: Type{Name: "name"}, Ordinal: 1},
-			{Name: "relnamespace", Type: Type{Name: "oid"}, Ordinal: 2},
-			{Name: "reltype", Type: Type{Name: "oid"}, Ordinal: 3},
-			{Name: "reloftype", Type: Type{Name: "oid"}, Ordinal: 4},
-			{Name: "relowner", Type: Type{Name: "oid"}, Ordinal: 5},
-			{Name: "relam", Type: Type{Name: "oid"}, Ordinal: 6},
-			{Name: "relfilenode", Type: Type{Name: "oid"}, Ordinal: 7},
-			{Name: "reltablespace", Type: Type{Name: "oid"}, Ordinal: 8},
-			{Name: "relpages", Type: Type{Name: "int4"}, Ordinal: 9},
-			{Name: "reltuples", Type: Type{Name: "float4"}, Ordinal: 10},
-			{Name: "relallvisible", Type: Type{Name: "int4"}, Ordinal: 11},
-			{Name: "relallfrozen", Type: Type{Name: "int4"}, Ordinal: 12},
-			{Name: "reltoastrelid", Type: Type{Name: "oid"}, Ordinal: 13},
-			{Name: "relhasindex", Type: Type{Name: "bool"}, Ordinal: 14},
-			{Name: "relisshared", Type: Type{Name: "bool"}, Ordinal: 15},
-			{Name: "relpersistence", Type: Type{Name: "char"}, Ordinal: 16},
-			{Name: "relkind", Type: Type{Name: "char"}, Ordinal: 17},
-			{Name: "relnatts", Type: Type{Name: "int2"}, Ordinal: 18},
-			{Name: "relchecks", Type: Type{Name: "int2"}, Ordinal: 19},
-			{Name: "relhasrules", Type: Type{Name: "bool"}, Ordinal: 20},
-			{Name: "relhastriggers", Type: Type{Name: "bool"}, Ordinal: 21},
-			{Name: "relhassubclass", Type: Type{Name: "bool"}, Ordinal: 22},
-			{Name: "relrowsecurity", Type: Type{Name: "bool"}, Ordinal: 23},
-			{Name: "relforcerowsecurity", Type: Type{Name: "bool"}, Ordinal: 24},
-			{Name: "relispopulated", Type: Type{Name: "bool"}, Ordinal: 25},
-			{Name: "relreplident", Type: Type{Name: "char"}, Ordinal: 26},
-			{Name: "relispartition", Type: Type{Name: "bool"}, Ordinal: 27},
-			{Name: "relrewrite", Type: Type{Name: "oid"}, Ordinal: 28},
-			{Name: "relfrozenxid", Type: Type{Name: "xid"}, Ordinal: 29},
-			{Name: "relminmxid", Type: Type{Name: "xid"}, Ordinal: 30},
-			{Name: "relacl", Type: Type{Name: "aclitem[]"}, Ordinal: 31},
-			{Name: "reloptions", Type: Type{Name: "text[]"}, Ordinal: 32},
-			{Name: "relpartbound", Type: Type{Name: "pg_node_tree"}, Ordinal: 33},
-		},
-		OID:     1259, // upstream's RelationRelationId
-		Virtual: true,
+
+// PGClassRowsForDBOid builds the pg_class row-set for dbOid's own tables/
+// indexes (M0122-0007 4e: per-connection pg_class scoping). Composite-type
+// and pg_class-self rows stay global — composite types aren't
+// namespace-scoped at all (see
+// docs/design/0122-0018-per-database-catalog-namespace.md's "Deferred /
+// explicitly out of scope"). registerSystemTables's VirtualRows closure
+// calls this with DefaultDBOid so every existing caller (server dispatch
+// without a per-connection PgClassRows wire-up, every test) sees
+// byte-identical behavior; a per-connection dbOid is wired in via
+// executor.Context.PgClassRows (internal/server/dispatch.go's
+// wireExtensionRows).
+func (c *InMemory) PGClassRowsForDBOid(dbOid uint32) [][]string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	keys := make([]string, 0, len(c.ns(dbOid).tables))
+	for k := range c.ns(dbOid).tables {
+		keys = append(keys, k)
 	}
-	pgClass.VirtualRows = func() [][]string {
-		c.mu.RLock()
-		defer c.mu.RUnlock()
-		keys := make([]string, 0, len(c.ns(DefaultDBOid).tables))
-		for k := range c.ns(DefaultDBOid).tables {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		out := make([][]string, 0, len(c.ns(DefaultDBOid).tables)+len(c.ns(DefaultDBOid).indexes))
-		for _, k := range keys {
-			t := c.ns(DefaultDBOid).tables[k]
+	sort.Strings(keys)
+	out := make([][]string, 0, len(c.ns(dbOid).tables)+len(c.ns(dbOid).indexes))
+	for _, k := range keys {
+		t := c.ns(dbOid).tables[k]
 			if t.Virtual && t.View == nil && !t.IsMatView && !t.IsSequence {
 				// Skip system-catalog virtual tables (pg_class, pg_locks, etc.)
 				// but include user views (t.View != nil), materialized views, and
@@ -5924,7 +5888,7 @@ func (c *InMemory) registerSystemTables() {
 				}
 			}
 			hasIdx := "f"
-			if len(c.ns(DefaultDBOid).byTable[t.OID]) > 0 {
+			if len(c.ns(dbOid).byTable[t.OID]) > 0 {
 				hasIdx = "t"
 			}
 			isPartition := "f"
@@ -6162,13 +6126,13 @@ func (c *InMemory) registerSystemTables() {
 			}
 		}
 		// Emit index rows (relkind='i'/'I') so pg_class can be used to count indexes.
-		idxKeys := make([]string, 0, len(c.ns(DefaultDBOid).indexes))
-		for k := range c.ns(DefaultDBOid).indexes {
+		idxKeys := make([]string, 0, len(c.ns(dbOid).indexes))
+		for k := range c.ns(dbOid).indexes {
 			idxKeys = append(idxKeys, k)
 		}
 		sort.Strings(idxKeys)
 		for _, k := range idxKeys {
-			idx := c.ns(DefaultDBOid).indexes[k]
+			idx := c.ns(dbOid).indexes[k]
 			// Resolve namespace from the index's table.
 			idxNsOID := uint32(2200)
 			if idx.Table != nil {
@@ -6347,6 +6311,58 @@ func (c *InMemory) registerSystemTables() {
 			"",         // 33: relpartbound
 		})
 		return out
+}
+
+func (c *InMemory) registerSystemTables() {
+	pgClass := &Table{
+		Schema: "pg_catalog",
+		Name:   "pg_class",
+		// Columns match the PG18-canonical 34-column pg_class tupdesc written by
+		// syncTableToCatalogHeap / pgClassColumnsPG18(). This alignment is required
+		// so that scanMatching can decode physical pg_class heap tuples for UPDATE
+		// (e.g. "UPDATE pg_class SET reltuples = ... WHERE oid = ...").
+		// M0100-0010: sysupd2/sysmerge2 concurrent-update blocking fix.
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "relname", Type: Type{Name: "name"}, Ordinal: 1},
+			{Name: "relnamespace", Type: Type{Name: "oid"}, Ordinal: 2},
+			{Name: "reltype", Type: Type{Name: "oid"}, Ordinal: 3},
+			{Name: "reloftype", Type: Type{Name: "oid"}, Ordinal: 4},
+			{Name: "relowner", Type: Type{Name: "oid"}, Ordinal: 5},
+			{Name: "relam", Type: Type{Name: "oid"}, Ordinal: 6},
+			{Name: "relfilenode", Type: Type{Name: "oid"}, Ordinal: 7},
+			{Name: "reltablespace", Type: Type{Name: "oid"}, Ordinal: 8},
+			{Name: "relpages", Type: Type{Name: "int4"}, Ordinal: 9},
+			{Name: "reltuples", Type: Type{Name: "float4"}, Ordinal: 10},
+			{Name: "relallvisible", Type: Type{Name: "int4"}, Ordinal: 11},
+			{Name: "relallfrozen", Type: Type{Name: "int4"}, Ordinal: 12},
+			{Name: "reltoastrelid", Type: Type{Name: "oid"}, Ordinal: 13},
+			{Name: "relhasindex", Type: Type{Name: "bool"}, Ordinal: 14},
+			{Name: "relisshared", Type: Type{Name: "bool"}, Ordinal: 15},
+			{Name: "relpersistence", Type: Type{Name: "char"}, Ordinal: 16},
+			{Name: "relkind", Type: Type{Name: "char"}, Ordinal: 17},
+			{Name: "relnatts", Type: Type{Name: "int2"}, Ordinal: 18},
+			{Name: "relchecks", Type: Type{Name: "int2"}, Ordinal: 19},
+			{Name: "relhasrules", Type: Type{Name: "bool"}, Ordinal: 20},
+			{Name: "relhastriggers", Type: Type{Name: "bool"}, Ordinal: 21},
+			{Name: "relhassubclass", Type: Type{Name: "bool"}, Ordinal: 22},
+			{Name: "relrowsecurity", Type: Type{Name: "bool"}, Ordinal: 23},
+			{Name: "relforcerowsecurity", Type: Type{Name: "bool"}, Ordinal: 24},
+			{Name: "relispopulated", Type: Type{Name: "bool"}, Ordinal: 25},
+			{Name: "relreplident", Type: Type{Name: "char"}, Ordinal: 26},
+			{Name: "relispartition", Type: Type{Name: "bool"}, Ordinal: 27},
+			{Name: "relrewrite", Type: Type{Name: "oid"}, Ordinal: 28},
+			{Name: "relfrozenxid", Type: Type{Name: "xid"}, Ordinal: 29},
+			{Name: "relminmxid", Type: Type{Name: "xid"}, Ordinal: 30},
+			{Name: "relacl", Type: Type{Name: "aclitem[]"}, Ordinal: 31},
+			{Name: "reloptions", Type: Type{Name: "text[]"}, Ordinal: 32},
+			{Name: "relpartbound", Type: Type{Name: "pg_node_tree"}, Ordinal: 33},
+		},
+		OID:     1259, // upstream's RelationRelationId
+		Virtual: true,
+	}
+	pgClass.VirtualRows = func() [][]string {
+		return c.PGClassRowsForDBOid(DefaultDBOid)
 	}
 	c.ns(DefaultDBOid).tables["pg_catalog.pg_class"] = pgClass
 
@@ -10736,7 +10752,8 @@ func key(name parser.ObjectName) string {
 func (c *InMemory) LookupTable(name parser.ObjectName, dbOid ...uint32) (*Table, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	ns := c.ns(resolveDBOid(dbOid))
+	resolved := resolveDBOid(dbOid)
+	ns := c.ns(resolved)
 	if t, ok := ns.tables[key(name)]; ok {
 		return t, true
 	}
@@ -10761,6 +10778,45 @@ func (c *InMemory) LookupTable(name parser.ObjectName, dbOid ...uint32) (*Table,
 				return t, true
 			}
 		}
+	}
+	// System catalogs (pg_catalog/information_schema) are registered exactly
+	// once, under DefaultDBOid, by registerSystemTables — CREATE DATABASE
+	// never seeds a fresh namespace with its own copies of them (they carry
+	// no per-database data of their own beyond what PGClassRowsForDBOid etc.
+	// materialize from the namespace at read time). Without this fallback, a
+	// connection to any genuinely distinct dbOid (anything but DefaultDBOid/
+	// PostgresDBOid, both of which alias to it via NamespaceDBOid) cannot
+	// resolve "pg_class" et al. at all — "relation \"pg_class\" does not
+	// exist" (42P01) — even though the virtual table objects clearly exist.
+	// Scoped to pg_catalog/information_schema only, so a distinct dbOid's
+	// connection can never see DefaultDBOid's real *user* tables (which stay
+	// correctly isolated via the ns.tables lookups above). M0122-0007 4e.
+	if resolved != DefaultDBOid {
+		if t, ok := c.lookupSystemCatalogTableLocked(name); ok {
+			return t, true
+		}
+	}
+	return nil, false
+}
+
+// lookupSystemCatalogTableLocked resolves name against DefaultDBOid's
+// namespace, but only when name is (or could be, if unqualified) a
+// pg_catalog/information_schema object — see LookupTable's fallback above.
+// Callers must already hold c.mu (RLock or Lock).
+func (c *InMemory) lookupSystemCatalogTableLocked(name parser.ObjectName) (*Table, bool) {
+	ns := c.ns(DefaultDBOid)
+	if name.Schema != "" {
+		if !strings.EqualFold(name.Schema, "pg_catalog") && !strings.EqualFold(name.Schema, "information_schema") {
+			return nil, false
+		}
+		t, ok := ns.tables[key(name)]
+		return t, ok
+	}
+	if t, ok := ns.tables[key(parser.ObjectName{Schema: "pg_catalog", Name: name.Name})]; ok {
+		return t, true
+	}
+	if t, ok := ns.tables[key(parser.ObjectName{Schema: "information_schema", Name: name.Name})]; ok {
+		return t, true
 	}
 	return nil, false
 }

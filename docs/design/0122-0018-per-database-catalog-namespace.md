@@ -1,6 +1,6 @@
 # Per-database catalog namespace (M0122-0007 slice 4)
 
-Status: accepted (sub-slices 4a, 4b-i, 4b-ii, 4c, 4d-i, 4d-ii-part-1, and 4d-ii-part-2a landed; 4d-ii-part-2b items 1, 2, and 3 all fully landed; 4e's FK-target-resolution, sequence-ownership, and view-constraint-dependency items all landed; `CREATE DATABASE ... TEMPLATE` bounded validation landed 2026-07-10 — the real relation-copy mechanism itself remains planned, see "Remaining 4e work" below)
+Status: accepted (sub-slices 4a, 4b-i, 4b-ii, 4c, 4d-i, 4d-ii-part-1, and 4d-ii-part-2a landed; 4d-ii-part-2b items 1, 2, and 3 all fully landed; 4e's FK-target-resolution, sequence-ownership, and view-constraint-dependency items all landed; `CREATE DATABASE ... TEMPLATE` bounded validation landed 2026-07-10; the pg_class-under-fresh-database gap (name resolution generically, row enumeration for pg_class specifically) landed 2026-07-10 — the real relation-copy mechanism itself remains planned, see "Remaining 4e work" below)
 Date: 2026-07-10
 Supersedes: none — extends the "Still open" note in
 `0122-0017-database-ddl-drop-guards.md` and the deferral-ledger rows dated
@@ -1028,19 +1028,38 @@ created in a freshly `CREATE DATABASE`'d database is correctly invisible from
 `postgres`'s own `pg_class` query (real per-database isolation, not just a
 name registered in `pg_database`).
 
-**Residual gap noticed live during this loop's manual verification, NOT part
-of this task** (recorded here for a future loop, not yet in the deferral
-ledger's own table since it doesn't have a task-id of its own yet): a
-connection to any newly `CREATE DATABASE`'d database (unrelated to
-TEMPLATE — reproduces identically on a plain empty target) cannot query
-`pg_class`/run `psql`'s `\dt` at all (`ERROR: relation "pg_class" does not
-exist`), even though DML/DDL against real tables in that database works and
-is correctly isolated from other databases. This is the system-catalog
-virtual-table builders (`pg_class` et al.) not yet being wired to a
-per-connection dbOid the way `internal/catalog/catalog.go`'s
-`tableNamespace` machinery now is (see `per_connection_virtual_catalog_scoping`
-project memory for the mechanism other virtual tables already use) — a
-separate, pre-existing gap this loop did not introduce and did not fix.
+**Residual gap noticed live during a prior loop's manual verification — FIXED
+2026-07-10.** A connection to any newly `CREATE DATABASE`'d database
+(unrelated to TEMPLATE — reproduced identically on a plain empty target)
+could not query `pg_class`/run `psql`'s `\dt` at all (`ERROR: relation
+"pg_class" does not exist`), even though DML/DDL against real tables in that
+database worked and was correctly isolated from other databases. Root cause,
+confirmed by a background Explore pass: `registerSystemTables` registers
+every `pg_catalog`/`information_schema` virtual table exactly once, under
+`DefaultDBOid`'s namespace only, and `CREATE DATABASE` never seeds a fresh
+namespace with references to them — so `catalog.InMemory.LookupTable`
+(via `SearchPathCatalog.effectiveDBOid`) simply could not find the name
+`pg_class` in a genuinely distinct dbOid's (empty) namespace. Two-part fix:
+(1) generic name-resolution fallback — `LookupTable` now falls back to
+`DefaultDBOid`'s namespace, via new `lookupSystemCatalogTableLocked`, whenever
+a name is schema-qualified `pg_catalog`/`information_schema` (or unqualified
+and found there under one of those schemas) — this alone unblocks name
+resolution for all ~70 system-catalog virtual tables plus the two heap-backed
+ones (`pg_attribute`/`pg_type`), scoped tightly enough that a distinct dbOid's
+connection still can never see `DefaultDBOid`'s real *user* tables; (2)
+`pg_class`-specific row-content fix — its `VirtualRows` closure body was
+extracted into an exported `catalog.InMemory.PGClassRowsForDBOid(dbOid
+uint32) [][]string`, wired to a new per-connection
+`executor.Context.PgClassRows` field (mirroring the existing `ExtensionRows`
+pattern, set in `internal/server/dispatch.go`'s `wireExtensionRows`) so
+`pg_class` now lists the CONNECTING database's own tables/indexes rather than
+always `DefaultDBOid`'s. Live-verified end-to-end against a real `cmd/goopg` +
+`psql`: `CREATE DATABASE freshdb` → connect → `pg_class` query succeeds → `\dt`
+shows only that database's own table. See the 2026-07-10 deferral-ledger row
+("pg_class-under-fresh-database") for the ~13 sibling virtual-table builders
+(`pg_indexes`, `pg_tables`, `pg_constraint`, etc.) that are name-resolution-
+fixed by part (1) above but still need part (2)'s row-content treatment
+individually — each is its own bounded future loop.
 
 **Remaining 4e work: the `CREATE DATABASE ... TEMPLATE` copy mechanism
 itself** — deep-copying the source dbOid's `catalog.tableNamespace`

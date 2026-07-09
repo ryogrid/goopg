@@ -103,6 +103,11 @@ func (o *valuesOp) Open(ctx *Context) error {
 			// IO signal goopg instruments), which the static catalog VirtualRows
 			// fallback cannot do. M0122-0003.
 			o.rows = rematerialiseVirtualRowsFromStrings(tbl, fetchIOStatRows(ctx))
+		} else if tbl.Name == "pg_class" && ctx != nil && ctx.PgClassRows != nil {
+			// pg_class must list the connecting database's own tables/indexes,
+			// not always DefaultDBOid's — use the per-connection, dbOid-scoped
+			// lister. M0122-0007 4e.
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, ctx.PgClassRows())
 		} else if tbl.VirtualRows != nil {
 			o.rows = rematerialiseVirtualRows(o.plan)
 		}

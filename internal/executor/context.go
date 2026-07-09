@@ -476,6 +476,13 @@ type Context struct {
 	// the global registry per connecting database. M0110-0003 (AC-002 gap #7c).
 	ExtensionRows func() [][]string
 
+	// PgClassRows, when non-nil, is called by the valuesOp that backs pg_class
+	// to return the rows visible to this connection: CurrentDatabaseOid's own
+	// tables/indexes rather than always DefaultDBOid's (catalog.InMemory's
+	// PGClassRowsForDBOid, mirroring ExtensionRows above). Wired by the server
+	// to close over CurrentDatabaseOid. M0122-0007 4e.
+	PgClassRows func() [][]string
+
 	// NonSuperuserRole, when non-empty, means the session is currently running
 	// under a non-superuser role (set via SET SESSION AUTHORIZATION). Privilege
 	// checks that require superuser (e.g. LEAKPROOF function attribute) must

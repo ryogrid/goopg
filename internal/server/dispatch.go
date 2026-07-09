@@ -1971,6 +1971,24 @@ func (s *Server) wireExtensionRows(ectx *executor.Context, dbName string) {
 			ectx.CurrentDatabaseOid = oid
 		}
 	}
+	// pg_class must reflect the connecting database's own tables/indexes, not
+	// always DefaultDBOid's (M0122-0007 4e). Captures ectx.CurrentDatabaseOid
+	// by reference so this stays correct even though it's stamped above in
+	// this same call (ResolveDatabaseOid failing leaves it at its prior/zero
+	// value, which NamespaceDBOid maps back to DefaultDBOid — unchanged
+	// legacy behavior for embedded/test contexts with no real connection).
+	if pc, ok := s.cfg.Catalog.(pgClassRowLister); ok {
+		ectx.PgClassRows = func() [][]string {
+			return pc.PGClassRowsForDBOid(catalog.NamespaceDBOid(ectx.CurrentDatabaseOid))
+		}
+	}
+}
+
+// pgClassRowLister is implemented by catalog.InMemory to expose a
+// per-database pg_class row-set (M0122-0007 4e), mirroring extensionLister
+// above.
+type pgClassRowLister interface {
+	PGClassRowsForDBOid(dbOid uint32) [][]string
 }
 
 func undoEnumDDLForRollback(connTx *connTxState, cat catalog.Catalog) {

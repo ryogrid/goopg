@@ -6664,6 +6664,71 @@ mirroring M0119's ledger `status` column.
       (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
       scripts/ralph-precommit-test.sh` PASS (0 failed transactions, all 3
       pgbench workloads).
+  - [x] `M0122-0007` follow-up 23 (2026-07-10, this loop) — **fixed the
+      pg_class-under-fresh-database gap follow-up 22 flagged.** Root cause
+      (confirmed via a background Explore pass): `registerSystemTables`
+      (`internal/catalog/catalog.go`) registers every `pg_catalog`/
+      `information_schema` virtual table exactly once, under `DefaultDBOid`'s
+      namespace only; `CREATE DATABASE` never seeds a fresh namespace with
+      references to them, so a connection to any genuinely distinct dbOid
+      could not even resolve the name "pg_class" (42P01). Two-part fix: (1)
+      generic name resolution — `InMemory.LookupTable` now falls back to
+      `DefaultDBOid`'s namespace, via new `lookupSystemCatalogTableLocked`,
+      whenever a name is schema-qualified `pg_catalog`/`information_schema`
+      (or unqualified and found there under one of those schemas) — scoped
+      tightly enough that a distinct dbOid's connection still never sees
+      `DefaultDBOid`'s real user tables. This alone unblocks name resolution
+      for all ~70 system-catalog virtual tables plus the two heap-backed ones
+      (`pg_attribute`/`pg_type`). (2) `pg_class`'s row CONTENT — extracted its
+      `VirtualRows` closure body into a new exported
+      `catalog.InMemory.PGClassRowsForDBOid(dbOid uint32) [][]string`
+      (parameterized its 4 internal `c.ns(DefaultDBOid)` references on
+      `dbOid`; the closure itself now just calls it with `DefaultDBOid`,
+      byte-identical default behavior), wired a new per-connection
+      `executor.Context.PgClassRows func() [][]string` field (mirrors the
+      existing `ExtensionRows` pattern) set by `internal/server/dispatch.go`'s
+      `wireExtensionRows` (new `pgClassRowLister` interface) for both the
+      simple- and extended-query dispatch paths, and consumed it via a new
+      `tbl.Name == "pg_class"` branch in `internal/executor/operators.go`'s
+      `valuesOp.Open`. `pg_class` now lists the CONNECTING database's own
+      tables/indexes, not always `DefaultDBOid`'s. New tests
+      `TestPgClassResolvesUnderFreshDistinctDBOid` (a dbOid with zero objects
+      ever created under it — the exact fresh-`CREATE DATABASE` shape — still
+      resolves `pg_class` by name; a genuinely nonexistent user table still
+      correctly errors) and `TestPgClassRowsScopedToConnectionDBOid` (two
+      tables created under `DefaultDBOid` vs. a distinct dbOid never
+      cross-leak in `PGClassRowsForDBOid`'s output), both in
+      `internal/executor/fk_dbid_routing_test.go`. Live end-to-end verified
+      against a real `cmd/goopg` binary + real `psql`: `CREATE DATABASE
+      freshdb` → connect → `SELECT relname FROM pg_class WHERE
+      relname='pg_class'` succeeds (previously 42P01) → `CREATE TABLE
+      only_in_freshdb` → `\dt` shows only that one table, not `postgres`'s.
+      **Remaining scope (deferred, own future loops):** ~13 sibling virtual-
+      table builders (`pg_indexes`, `pg_tables`, `pg_attrdef`,
+      `pg_constraint`, `pg_inherits`, `pg_index`, `pg_statistic_ext`,
+      `pg_policy`, `pg_depend`, `pg_trigger`, `pg_rewrite`,
+      `information_schema.routines`/`parameters`/`routine_*_usage`,
+      `pg_foreign_table`) share the same `c.ns(DefaultDBOid)`-hardcoded
+      `VirtualRows` pattern — now name-resolution-fixed by part (1) above but
+      still row-content-`DefaultDBOid`-only until each gets part (2)'s
+      closure-extraction treatment individually; `pg_sequence`/
+      `pg_sequences`/`information_schema.sequences` were already separately
+      flagged by an earlier follow-up's deferral row. The two heap-backed
+      catalogs (`pg_attribute`/`pg_type`) have a structurally different,
+      deeper gap: their physical heap rows are hardcoded to `DBOid:
+      catalog.DefaultDBOid` in `internal/executor/operators_ddl.go`'s
+      `syncTableToCatalogHeap`, a heap-write/heap-scan fix, not a
+      `VirtualRows`-closure one. Design doc
+      (`docs/design/0122-0018-per-database-catalog-namespace.md`) residual-gap
+      section updated to FIXED + status line; `docs/design/README.md` row
+      extended; deferral ledger row appended
+      ("pg_class-under-fresh-database"). Gates: `go build ./...`/`go vet
+      ./...` clean; `go test ./internal/catalog/... ./internal/executor/...
+      ./internal/server/... ./internal/planner/...` PASS; `go test -short
+      $(go list ./... | grep -v /internal/testport)` (full repo, short mode)
+      PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed transactions, all 3 pgbench workloads).
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,

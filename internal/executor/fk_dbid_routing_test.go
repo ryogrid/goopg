@@ -153,3 +153,91 @@ func TestExecTruncateCascadeFindsOwnDistinctDBOidReferencingTable(t *testing.T) 
 		t.Fatalf("child has %d rows after TRUNCATE parent CASCADE, want 0 (CASCADE did not reach the connection's own distinct-dbOid referencing table)", len(rows))
 	}
 }
+
+// TestPgClassResolvesUnderFreshDistinctDBOid covers M0122-0007 4e's remaining
+// gap: a connection to any genuinely distinct dbOid — even one that has never
+// had a single object created under it, exactly like a connection to a
+// freshly CREATE DATABASE'd database — used to fail to even resolve the name
+// "pg_class" ("relation \"pg_class\" does not exist", 42P01), because
+// registerSystemTables registers every pg_catalog/information_schema virtual
+// table exactly once, under DefaultDBOid's namespace only, and CREATE
+// DATABASE never seeds a fresh namespace with references to them.
+// InMemory.LookupTable now falls back to DefaultDBOid's namespace for
+// pg_catalog/information_schema names specifically (never for plain user
+// tables, which must stay isolated per database).
+func TestPgClassResolvesUnderFreshDistinctDBOid(t *testing.T) {
+	const freshDBOid = 7003
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+	ctx.CurrentDatabaseOid = freshDBOid // no CreateTable/CreateIndex call under this dbOid — namespace never seeded
+
+	// Must not error with 42P01 "relation \"pg_class\" does not exist".
+	_ = runQueryUnderDBOid(t, ctx, "SELECT relname FROM pg_class WHERE relname = 'pg_class'")
+
+	// A genuinely nonexistent user table under the same fresh dbOid must
+	// still correctly error — the fallback must not leak DefaultDBOid's real
+	// user tables into an unrelated database's connection.
+	stmts, err := parser.Parse("SELECT * FROM this_table_does_not_exist_anywhere")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	planCat := catalog.WithSearchPath(ctx.Catalog, nil)
+	planCat.DBOid = ctx.CurrentDatabaseOid
+	if _, err := planner.Plan(stmts[0], planCat); err == nil {
+		t.Fatal("expected \"relation does not exist\" for a genuinely nonexistent table, got no error")
+	}
+}
+
+// TestPgClassRowsScopedToConnectionDBOid covers M0122-0007 4e's pg_class
+// VirtualRows enumeration: catalog.InMemory.PGClassRowsForDBOid must list the
+// GIVEN dbOid's own tables, not always DefaultDBOid's — this is the method
+// internal/server/dispatch.go's wireExtensionRows wires into
+// executor.Context.PgClassRows for the real server; this test exercises it
+// directly since this package has no server-side dispatch wiring of its own.
+func TestPgClassRowsScopedToConnectionDBOid(t *testing.T) {
+	const otherDBOid = 7004
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+
+	// CREATE TABLE routes to whichever dbOid ctx.CurrentDatabaseOid names at
+	// the time it runs — toggle it so the two tables land in different
+	// namespaces of the SAME catalog instance.
+	ctx.CurrentDatabaseOid = catalog.DefaultDBOid
+	if err := runDDL(t, ctx, "CREATE TABLE only_in_default (id int4)"); err != nil {
+		t.Fatalf("CREATE TABLE only_in_default: %v", err)
+	}
+	ctx.CurrentDatabaseOid = otherDBOid
+	if err := runDDL(t, ctx, "CREATE TABLE only_in_other (id int4)"); err != nil {
+		t.Fatalf("CREATE TABLE only_in_other: %v", err)
+	}
+
+	im, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		t.Fatalf("ctx.Catalog is %T, want *catalog.InMemory", ctx.Catalog)
+	}
+
+	defaultRows := im.PGClassRowsForDBOid(catalog.DefaultDBOid)
+	if pgClassRowsContainName(defaultRows, "only_in_other") {
+		t.Fatal("DefaultDBOid's pg_class rows include only_in_other, a table created under a distinct dbOid")
+	}
+	if !pgClassRowsContainName(defaultRows, "only_in_default") {
+		t.Fatal("DefaultDBOid's pg_class rows are missing only_in_default")
+	}
+
+	otherRows := im.PGClassRowsForDBOid(otherDBOid)
+	if !pgClassRowsContainName(otherRows, "only_in_other") {
+		t.Fatal("otherDBOid's pg_class rows are missing only_in_other")
+	}
+	if pgClassRowsContainName(otherRows, "only_in_default") {
+		t.Fatal("otherDBOid's pg_class rows include only_in_default, a table created under DefaultDBOid")
+	}
+}
+
+func pgClassRowsContainName(rows [][]string, relname string) bool {
+	for _, r := range rows {
+		if len(r) > 1 && r[1] == relname {
+			return true
+		}
+	}
+	return false
+}
