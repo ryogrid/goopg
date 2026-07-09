@@ -2102,6 +2102,13 @@ type InMemory struct {
 	// Absent entries report -1 (PG's "no limit" default, pg_database.h) via
 	// DatabaseConnLimit's comma-ok lookup.
 	databaseConnLimit map[string]int32
+	// databaseOwner holds `pg_database.datdba` for databases registered via
+	// CreateDatabase/RegisterDatabaseDuringRecovery (M0122-0007 DROP DATABASE
+	// ownership check). Absent entries (the bootstrap postgres/template0/
+	// template1 rows, which never go through CreateDatabase) report
+	// BootstrapSuperuserOID via DatabaseOwner's comma-less lookup, matching
+	// pg_database's pre-existing hardcoded "10" rendering.
+	databaseOwner map[string]uint32
 	// dbRoleSettings holds per-database `ALTER DATABASE name SET config =
 	// value` overrides (pg_db_role_setting, setrole=0 scope only — ALTER
 	// ROLE ... SET / ALTER ROLE ... IN DATABASE ... SET are a separate,
@@ -3286,6 +3293,7 @@ func NewInMemory() *InMemory {
 		routines:               NewRoutines(),
 		databases:              map[string]bool{"postgres": true, "template1": true, "template0": true},
 		databaseConnLimit:      make(map[string]int32),
+		databaseOwner:          make(map[string]uint32),
 		dbRoleSettings:         make(map[uint32][]string),
 		roleSettings:           make(map[roleSettingKey][]string),
 		roleMembers:            make(map[roleMembershipKey]*RoleMembership),
@@ -4528,19 +4536,23 @@ func (c *InMemory) HasDatabase(name string) bool {
 	return c.databases[name]
 }
 
-// CreateDatabase registers a new database name (M0054-0001). Returns
+// CreateDatabase registers a new database name (M0054-0001). owner is the
+// `pg_database.datdba` OID to record (the creating role — mirrors upstream
+// createdb()'s "owner defaults to session user" rule; callers pass
+// BootstrapSuperuserOID for the bootstrap superuser). Returns
 // `ErrDatabaseExists` when the name is already known. Callers are
 // expected to write a `wal.RecordKindCreateDatabase` record on the
 // success path so the registration survives a crash. Bootstrap and
 // recovery paths use `RegisterDatabaseDuringRecovery` instead, which
 // is idempotent.
-func (c *InMemory) CreateDatabase(name string) error {
+func (c *InMemory) CreateDatabase(name string, owner uint32) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.databases[name] {
 		return ErrDatabaseExists
 	}
 	c.databases[name] = true
+	c.databaseOwner[name] = owner
 	return nil
 }
 
@@ -4554,7 +4566,23 @@ func (c *InMemory) DropDatabase(name string) error {
 	}
 	delete(c.databases, name)
 	delete(c.databaseConnLimit, name)
+	delete(c.databaseOwner, name)
 	return nil
+}
+
+// DatabaseOwner returns the `pg_database.datdba` OID recorded for name via
+// CreateDatabase/RegisterDatabaseDuringRecovery, or BootstrapSuperuserOID if
+// none was ever recorded (the bootstrap postgres/template0/template1 rows,
+// which predate any CreateDatabase call — mirrors their pre-existing
+// hardcoded "10" rendering in pg_database.VirtualRows). M0122-0007 (DROP
+// DATABASE ownership check).
+func (c *InMemory) DatabaseOwner(name string) uint32 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if owner, ok := c.databaseOwner[name]; ok {
+		return owner
+	}
+	return BootstrapSuperuserOID
 }
 
 // DatconnlimitInvalidDB mirrors PG's DATCONNLIMIT_INVALID_DB sentinel
@@ -4596,11 +4624,13 @@ func (c *InMemory) SetDatabaseConnLimit(name string, limit int32) bool {
 // RegisterDatabaseDuringRecovery is the idempotent version of
 // CreateDatabase used by the WAL-replay driver. Re-applying a record
 // that has already taken effect (e.g. because a SaveCatalog snapshot
-// captured it) is a no-op rather than an error.
-func (c *InMemory) RegisterDatabaseDuringRecovery(name string) {
+// captured it) is a no-op rather than an error. owner is the datdba OID
+// carried by the WAL record (M0122-0007).
+func (c *InMemory) RegisterDatabaseDuringRecovery(name string, owner uint32) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.databases[name] = true
+	c.databaseOwner[name] = owner
 }
 
 // UnregisterDatabaseDuringRecovery is the idempotent counterpart to
@@ -4610,6 +4640,7 @@ func (c *InMemory) UnregisterDatabaseDuringRecovery(name string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	delete(c.databases, name)
+	delete(c.databaseOwner, name)
 }
 
 // dbRoleSettingConfigName returns the GUC name half of a "name=value"
@@ -6388,8 +6419,8 @@ func (c *InMemory) registerSystemTables() {
 			out = append(out, []string{
 				oid, // oid: conventional database OID (M0097-0021)
 				n,
-				"10",         // datdba: OID of owner (10 = postgres superuser)
-				"6",          // encoding: 6 = UTF8
+				strconv.FormatUint(uint64(c.DatabaseOwner(n)), 10), // datdba: real owner OID (M0122-0007), default BootstrapSuperuserOID (10)
+				"6", // encoding: 6 = UTF8
 				datallowconn, // datallowconn: allow connections
 				// datconnlimit: runtime override via `UPDATE pg_database SET
 				// datconnlimit = ...` (SetDatabaseConnLimit), default -1 = no

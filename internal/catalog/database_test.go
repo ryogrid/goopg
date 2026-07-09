@@ -29,7 +29,7 @@ func TestNewInMemorySeedsPostgresDatabase(t *testing.T) {
 // flow used by HammerDB's setup path.
 func TestCreateDropDatabaseRoundTrip(t *testing.T) {
 	c := NewInMemory()
-	if err := c.CreateDatabase("tpch"); err != nil {
+	if err := c.CreateDatabase("tpch", BootstrapSuperuserOID); err != nil {
 		t.Fatalf("CreateDatabase: %v", err)
 	}
 	if !c.HasDatabase("tpch") {
@@ -47,10 +47,10 @@ func TestCreateDropDatabaseRoundTrip(t *testing.T) {
 // PostgreSQL's behaviour (SQLSTATE 42P04).
 func TestCreateDatabaseDuplicateReturnsErrDatabaseExists(t *testing.T) {
 	c := NewInMemory()
-	if err := c.CreateDatabase("tpch"); err != nil {
+	if err := c.CreateDatabase("tpch", BootstrapSuperuserOID); err != nil {
 		t.Fatalf("first CreateDatabase: %v", err)
 	}
-	err := c.CreateDatabase("tpch")
+	err := c.CreateDatabase("tpch", BootstrapSuperuserOID)
 	if !errors.Is(err, ErrDatabaseExists) {
 		t.Errorf("second CreateDatabase err = %v, want ErrDatabaseExists", err)
 	}
@@ -73,8 +73,8 @@ func TestDropDatabaseUnknownReturnsErrDatabaseNotFound(t *testing.T) {
 // "database already exists" in that case.
 func TestRegisterDatabaseDuringRecoveryIsIdempotent(t *testing.T) {
 	c := NewInMemory()
-	c.RegisterDatabaseDuringRecovery("tpch")
-	c.RegisterDatabaseDuringRecovery("tpch") // must not panic / error
+	c.RegisterDatabaseDuringRecovery("tpch", BootstrapSuperuserOID)
+	c.RegisterDatabaseDuringRecovery("tpch", BootstrapSuperuserOID) // must not panic / error
 	if !c.HasDatabase("tpch") {
 		t.Error("after recovery register, tpch should be present")
 	}
@@ -85,7 +85,7 @@ func TestRegisterDatabaseDuringRecoveryIsIdempotent(t *testing.T) {
 // not the pre-M0054-0001 hard-coded `postgres` row.
 func TestPgDatabaseVirtualRowsEnumeratesRegistry(t *testing.T) {
 	c := NewInMemory()
-	if err := c.CreateDatabase("tpch"); err != nil {
+	if err := c.CreateDatabase("tpch", BootstrapSuperuserOID); err != nil {
 		t.Fatalf("CreateDatabase: %v", err)
 	}
 	// Reach directly into the tables map; LookupTable takes a

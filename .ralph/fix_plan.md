@@ -5392,10 +5392,66 @@ mirroring M0119's ledger `status` column.
       `WITH (FORCE)`/connection-termination (no cancel-backend mechanism
       exists) and ownership/permission checks (no database-owner tracking
       exists) — both noted in the deferral ledger row appended this loop.
-      **Remaining M0122-0007 items (unchanged):** CREATE/DROP DATABASE
-      physical storage isolation (template copy on CREATE, real directory
-      removal on DROP — the architectural item), REINDEX CONCURRENTLY
-      physical rebuild.
+      **DROP DATABASE ownership check — done (2026-07-09, this loop, closes
+      the "ownership/permission checks" residual named just above):**
+      `catalog.InMemory` gained real `pg_database.datdba` tracking — a new
+      `databaseOwner map[string]uint32` (parallel to `databaseConnLimit`).
+      `CreateDatabase`/`RegisterDatabaseDuringRecovery` now take an `owner
+      uint32` and record it; `DatabaseOwner(name) uint32` getter defaults to
+      `BootstrapSuperuserOID` for names with no recorded owner (the bootstrap
+      postgres/template0/template1 rows, which predate any CreateDatabase
+      call — `pg_database.datdba` used to hardcode `"10"` unconditionally,
+      now genuinely computed). `wal.EncodeCreateDatabase`/
+      `DecodeCreateDatabase` gained a trailing 4-byte owner OID (decode
+      defaults to `BootstrapSuperuserOID` when absent, so a pre-existing WAL
+      stream still replays). `tryHandleDatabaseDDL` gained an `actingRole
+      string` parameter — the same `connTx.NonSuperuserRole`-or-`""`
+      convention `tryRecordTableGrant` already uses (`grant_ddl.go`) — via
+      two new `*Server` helpers `resolveActingRoleOID`/
+      `actingRoleIsSuperuser` (type-assert to `*catalog.InMemory` for
+      `RoleOID`/`IsSuperuser`, mirroring the role_ddl.go pattern). CREATE
+      DATABASE now records the resolved OID as owner; DROP DATABASE rejects
+      a non-owner/non-superuser `actingRole` with 42501
+      `InsufficientPrivilege`, `"must be owner of database %s"` (matches
+      `aclchk.c`'s exact message for `OBJECT_DATABASE`/`ACLCHECK_NOT_OWNER`),
+      inserted as the FIRST guard right after the existence check — matches
+      `dbcommands.c dropdb()`'s real ordering (`object_ownercheck` runs
+      before the template/self-drop/busy checks this bucket added earlier).
+      Both wire-protocol call sites (`dispatch.go` simple-query,
+      `dispatch_extended.go` extended-query) now thread
+      `connTx.NonSuperuserRole` through as `actingRole`. Live-verified
+      against a real `cmd/goopg` binary: `SET SESSION AUTHORIZATION alice;
+      CREATE DATABASE aliceonly2` recorded `datdba=16403` (alice's real OID,
+      confirmed via `pg_roles`); `SET SESSION AUTHORIZATION bob; DROP
+      DATABASE aliceonly2` correctly errored `must be owner of database
+      aliceonly2`; `SET SESSION AUTHORIZATION alice; DROP DATABASE
+      aliceonly2` succeeded; a fresh `aliceonly3` created as alice survived a
+      real `goopg stop`/`start` restart with `datdba` still `16403` post-WAL-
+      replay. **Known limitation carried over, not introduced here:** a
+      plain non-superuser LOGIN connection that never issues `SET ROLE`/`SET
+      SESSION AUTHORIZATION` still resolves to the bootstrap superuser for
+      `actingRole` (verified live: `PGUSER=alice psql -c "CREATE DATABASE
+      ..."` recorded `datdba=10`, not alice's OID) — `connTx.NonSuperuserRole`
+      only diverges from `""` after one of those statements, identical to
+      every other `actingRole`-gated check in this codebase
+      (`tryRecordTableGrant` included); would need session-startup role
+      tracking to fix, out of scope for this guard. Tests:
+      `TestTryHandleDatabaseDDLDropRequiresOwnership`
+      (`internal/server/database_ddl_test.go`);
+      `TestDecodeCreateDatabaseDefaultsOwnerForPreM01220007Payload`
+      (`internal/wal/database_ddl_test.go`). Design:
+      `docs/design/0122-0017-database-ddl-drop-guards.md` new "Ownership
+      check" section; `docs/design/README.md` row updated. Gates: `go build
+      ./...`/`go vet ./internal/catalog/... ./internal/wal/...
+      ./internal/server/... ./internal/initdb/...` clean; `go test` on those
+      4 packages PASS (full, no regressions); `scripts/tpch-spotcheck.sh`
+      PASS (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+      scripts/ralph-precommit-test.sh` PASS (0 failed transactions, all 3
+      workloads).
+      **Remaining M0122-0007 items:** CREATE/DROP DATABASE physical storage
+      isolation (template copy on CREATE, real directory removal on DROP —
+      the architectural item), `WITH (FORCE)` connection-termination (no
+      cancel-backend mechanism), REINDEX CONCURRENTLY physical rebuild.
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,

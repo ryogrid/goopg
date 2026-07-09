@@ -75,6 +75,65 @@ drops with no error pre-fix).
 - `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0 failed
   transactions, all 3 workloads).
 
+## Ownership check (2026-07-09 follow-up, this loop)
+
+Closes the "ownership/permission check before DROP" residual named above.
+Real `dropdb()` runs `object_ownercheck(DatabaseRelationId, db_id,
+GetUserId())` **immediately after the existence lookup and before every
+other guard** (`dbcommands.c` ~line 1720) — failing it raises 42501
+`ERRCODE_INSUFFICIENT_PRIVILEGE`, `aclchk.c`'s `"must be owner of database
+%s"` (`ACLCHECK_NOT_OWNER`/`OBJECT_DATABASE` case). goopg's database
+registry (`catalog.InMemory.databases`, a bare `map[string]bool`) tracked no
+owner at all, so this check was structurally impossible before now.
+
+- `catalog.InMemory` gained `databaseOwner map[string]uint32` (parallel to
+  the pre-existing `databaseConnLimit` map). `CreateDatabase`/
+  `RegisterDatabaseDuringRecovery` both now take an `owner uint32` and record
+  it; `DropDatabase`/`UnregisterDatabaseDuringRecovery` clear it. A new
+  `DatabaseOwner(name) uint32` getter defaults to `BootstrapSuperuserOID` (10)
+  for names with no recorded owner — the bootstrap `postgres`/`template0`/
+  `template1` rows, which predate any `CreateDatabase` call and previously
+  rendered a hardcoded `"10"` in `pg_database.datdba` anyway (now genuinely
+  computed via this getter, same `catalog.go` `pgDatabase.VirtualRows`
+  builder).
+- `wal.EncodeCreateDatabase`/`DecodeCreateDatabase` gained the owner OID as a
+  trailing 4-byte field (format: `kind(1) | nameLen(2) | name | owner(4)`).
+  `DecodeCreateDatabase` defaults to `BootstrapSuperuserOID` when the
+  trailing 4 bytes are absent, so a WAL stream written before this change
+  still replays correctly.
+- `tryHandleDatabaseDDL` gained an `actingRole string` parameter — the same
+  `connTx.NonSuperuserRole`-or-`""`-for-bootstrap-superuser convention
+  `tryRecordTableGrant` already uses (`grant_ddl.go`). Two new `*Server`
+  helpers, `resolveActingRoleOID`/`actingRoleIsSuperuser`, resolve it to an
+  OID (via `catalog.InMemory.RoleOID`) and check `IsSuperuser`. CREATE
+  DATABASE now records the resolved OID as the new database's owner; DROP
+  DATABASE rejects with 42501 when `actingRole` neither owns the target nor
+  is a superuser — inserted as the very first guard after the existence
+  check, ahead of the template/self-drop/busy checks added earlier, matching
+  `dropdb()`'s real ordering.
+- Both call sites (`dispatch.go`'s simple-query path, `dispatch_extended.go`'s
+  extended-query path) now thread `connTx.NonSuperuserRole` through as
+  `actingRole`.
+
+**Known limitation carried over, not introduced by this change:** goopg's
+RBAC model has no notion of "the login role that never issued `SET ROLE`/`SET
+SESSION AUTHORIZATION`" — `connTx.NonSuperuserRole` only diverges from `""`
+after one of those statements, so a plain non-superuser login connection is
+still treated as the bootstrap superuser for this check, identical to every
+other `actingRole`-gated check in this codebase (`tryRecordTableGrant`
+included). Not a new gap; not fixed here (would need session-startup role
+tracking, out of scope for a DROP DATABASE guard).
+
+Tests: `TestTryHandleDatabaseDDLDropRequiresOwnership`
+(`internal/server/database_ddl_test.go`) — non-owner rejection (42501 +
+exact message), superuser bypass despite not owning, and owner-drops-own-db
+success; `TestDecodeCreateDatabaseDefaultsOwnerForPreM01220007Payload`
+(`internal/wal/database_ddl_test.go`) pins the backward-compat decode path.
+Gates: `go build ./...`/`go vet ./internal/catalog/... ./internal/wal/...
+./internal/server/... ./internal/initdb/...` clean; `go test
+./internal/catalog/... ./internal/wal/... ./internal/server/...
+./internal/initdb/...` PASS (full packages, no regressions).
+
 ## Still open (M0122-0007 bucket)
 
 - Full per-database physical storage isolation (template copy on CREATE, real
@@ -83,7 +142,5 @@ drops with no error pre-fix).
   alongside this doc.
 - `WITH (FORCE)` connection termination (needs a signal/cancel-backend
   mechanism goopg doesn't have yet).
-- Ownership/permission check before DROP (`object_ownercheck` — goopg's
-  database registry tracks no owner today).
 - `REINDEX ... CONCURRENTLY` physical rebuild (separate, pre-existing item,
   unaffected by this change).

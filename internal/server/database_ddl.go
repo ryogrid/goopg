@@ -444,6 +444,38 @@ func databaseDDLCommandTag(sql string) string {
 	}
 }
 
+// resolveActingRoleOID resolves actingRole (the connTx.NonSuperuserRole
+// convention: "" means the bootstrap superuser) to a role OID, for recording
+// as pg_database.datdba / checking DROP DATABASE ownership. Falls back to
+// catalog.BootstrapSuperuserOID when the catalog doesn't expose RoleOID or
+// the name isn't registered — defensive; a live session's own effective role
+// is always registered in practice.
+func (s *Server) resolveActingRoleOID(actingRole string) uint32 {
+	if actingRole == "" {
+		return catalog.BootstrapSuperuserOID
+	}
+	im, ok := s.cfg.Catalog.(*catalog.InMemory)
+	if !ok {
+		return catalog.BootstrapSuperuserOID
+	}
+	if oid, found := im.RoleOID(actingRole); found {
+		return oid
+	}
+	return catalog.BootstrapSuperuserOID
+}
+
+// actingRoleIsSuperuser reports whether actingRole (see resolveActingRoleOID)
+// currently holds the SUPERUSER attribute — the escape hatch dropdb()'s
+// object_ownercheck grants a superuser regardless of database ownership.
+func (s *Server) actingRoleIsSuperuser(actingRole string) bool {
+	oid := s.resolveActingRoleOID(actingRole)
+	im, ok := s.cfg.Catalog.(*catalog.InMemory)
+	if !ok {
+		return oid == catalog.BootstrapSuperuserOID
+	}
+	return im.IsSuperuser(oid)
+}
+
 // tryHandleDatabaseDDL returns (handled, notice, err). When handled is true
 // the dispatch path should NOT fall through to compatNoopCommandTag.
 //
@@ -461,7 +493,13 @@ func databaseDDLCommandTag(sql string) string {
 // effect when the named database is the connection's own live database;
 // naming any OTHER database is a silent no-op, matching goopg v0's
 // single-live-database-storage scope (see the package doc comment above).
-func (s *Server) tryHandleDatabaseDDL(sql string, liveDBName string, resolveCurrent currentGUCResolver) (bool, string, error) {
+//
+// actingRole is the session's current effective role (connTx.NonSuperuserRole,
+// or "" for the bootstrap superuser — the same convention tryRecordTableGrant
+// uses, see grant_ddl.go): CREATE DATABASE records it as the new database's
+// datdba, and DROP DATABASE requires it to either own the target database or
+// be a superuser (mirrors dbcommands.c dropdb()'s object_ownercheck call).
+func (s *Server) tryHandleDatabaseDDL(sql string, liveDBName string, actingRole string, resolveCurrent currentGUCResolver) (bool, string, error) {
 	if op, ok := parseAlterDatabaseConfig(sql); ok {
 		return s.applyAlterDatabaseConfig(op, liveDBName, resolveCurrent)
 	}
@@ -485,7 +523,8 @@ func (s *Server) tryHandleDatabaseDDL(sql string, liveDBName string, resolveCurr
 	}
 	switch kind {
 	case databaseDDLCreate:
-		if err := cat.CreateDatabase(name); err != nil {
+		owner := s.resolveActingRoleOID(actingRole)
+		if err := cat.CreateDatabase(name, owner); err != nil {
 			if errors.Is(err, catalog.ErrDatabaseExists) {
 				// PG: dbcommands.c createdb(), ERRCODE_DUPLICATE_DATABASE.
 				return true, "", &databaseDDLError{
@@ -496,7 +535,7 @@ func (s *Server) tryHandleDatabaseDDL(sql string, liveDBName string, resolveCurr
 			return true, "", err
 		}
 		if s.cfg.WAL != nil {
-			if _, _, werr := s.cfg.WAL.Append(wal.EncodeCreateDatabase(name)); werr != nil {
+			if _, _, werr := s.cfg.WAL.Append(wal.EncodeCreateDatabase(name, owner)); werr != nil {
 				// Roll back the catalog change so memory and disk agree.
 				_ = cat.DropDatabase(name)
 				return true, "", werr
@@ -504,9 +543,9 @@ func (s *Server) tryHandleDatabaseDDL(sql string, liveDBName string, resolveCurr
 		}
 		return true, "", nil
 	case databaseDDLDrop:
-		// PG's dropdb() (dbcommands.c) runs its guard checks — template,
-		// currently-open, other-backends — AFTER the existence lookup but
-		// BEFORE actually removing the pg_database row. goopg's
+		// PG's dropdb() (dbcommands.c) runs its guard checks — ownership,
+		// template, currently-open, other-backends — AFTER the existence
+		// lookup but BEFORE actually removing the pg_database row. goopg's
 		// HasDatabase pre-check mirrors that ordering; cat.DropDatabase
 		// itself only ever mutates once every guard below has passed.
 		if !cat.HasDatabase(name) {
@@ -522,6 +561,16 @@ func (s *Server) tryHandleDatabaseDDL(sql string, liveDBName string, resolveCurr
 			return true, "", &databaseDDLError{
 				code: sqlstate.UndefinedDatabase,
 				msg:  fmt.Sprintf("database %q does not exist", name),
+			}
+		}
+		// PG: dropdb(), object_ownercheck (ERRCODE_INSUFFICIENT_PRIVILEGE,
+		// aclchk.c's "must be owner of database %s"). Checked immediately
+		// after the existence lookup, before every other guard below —
+		// matches dbcommands.c's real ordering.
+		if owner := cat.DatabaseOwner(name); owner != s.resolveActingRoleOID(actingRole) && !s.actingRoleIsSuperuser(actingRole) {
+			return true, "", &databaseDDLError{
+				code: sqlstate.InsufficientPrivilege,
+				msg:  fmt.Sprintf("must be owner of database %s", name),
 			}
 		}
 		// PG: dropdb(), "Disallow dropping a DB that is marked istemplate"
@@ -557,6 +606,7 @@ func (s *Server) tryHandleDatabaseDDL(sql string, liveDBName string, resolveCurr
 				}
 			}
 		}
+		droppedOwner := cat.DatabaseOwner(name)
 		if err := cat.DropDatabase(name); err != nil {
 			if errors.Is(err, catalog.ErrDatabaseNotFound) {
 				// Unreachable in practice (HasDatabase above already
@@ -573,8 +623,9 @@ func (s *Server) tryHandleDatabaseDDL(sql string, liveDBName string, resolveCurr
 		}
 		if s.cfg.WAL != nil {
 			if _, _, werr := s.cfg.WAL.Append(wal.EncodeDropDatabase(name)); werr != nil {
-				// Re-create the catalog entry so the abort is consistent.
-				_ = cat.CreateDatabase(name)
+				// Re-create the catalog entry (with its original owner) so
+				// the abort is consistent.
+				_ = cat.CreateDatabase(name, droppedOwner)
 				return true, "", werr
 			}
 		}
@@ -591,8 +642,8 @@ func (s *Server) tryHandleDatabaseDDL(sql string, liveDBName string, resolveCurr
 // DATABASE parse-failure fallback). Returns handled=false when sql isn't a
 // database-DDL bypass form (or the bypass degrades to legacy no-op, e.g. no
 // catalog plumbed), so the caller continues its normal dispatch path.
-func (s *Server) handleDatabaseDDLBypass(sql, liveDBName string, resolveCurrent currentGUCResolver, w *protocol.FrameWriter) (handled bool, err error) {
-	handled, notice, herr := s.tryHandleDatabaseDDL(sql, liveDBName, resolveCurrent)
+func (s *Server) handleDatabaseDDLBypass(sql, liveDBName, actingRole string, resolveCurrent currentGUCResolver, w *protocol.FrameWriter) (handled bool, err error) {
+	handled, notice, herr := s.tryHandleDatabaseDDL(sql, liveDBName, actingRole, resolveCurrent)
 	if !handled {
 		return false, nil
 	}
@@ -620,9 +671,10 @@ func (s *Server) handleDatabaseDDLBypass(sql, liveDBName string, resolveCurrent 
 // handler needs. catalog.InMemory satisfies this interface; alternate
 // implementations (e.g. tests) opt in by exposing the same methods.
 type databaseRegistry interface {
-	CreateDatabase(name string) error
+	CreateDatabase(name string, owner uint32) error
 	DropDatabase(name string) error
 	HasDatabase(name string) bool
+	DatabaseOwner(name string) uint32
 }
 
 // databaseConfigRegistry is the subset of catalog.Catalog the ALTER

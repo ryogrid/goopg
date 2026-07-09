@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/goopg/goopg/internal/access/btree"
+	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/control"
 	"github.com/goopg/goopg/internal/storage"
 )
@@ -1435,34 +1436,44 @@ const (
 )
 
 // EncodeCreateDatabase encodes a CREATE DATABASE event (M0054-0001).
-// Format: kind(1) | nameLen(2) | name(nameLen bytes).
-func EncodeCreateDatabase(name string) []byte {
+// Format: kind(1) | nameLen(2) | name(nameLen bytes) | owner(4, datdba OID,
+// M0122-0007).
+func EncodeCreateDatabase(name string, owner uint32) []byte {
 	if len(name) > 0xFFFF {
 		// goopg's identifier length cap is far below 64 KiB; truncating
 		// here is defensive — this branch is unreachable under normal
 		// CREATE DATABASE syntax.
 		name = name[:0xFFFF]
 	}
-	out := make([]byte, 3+len(name))
+	out := make([]byte, 3+len(name)+4)
 	out[0] = RecordKindCreateDatabase
 	binary.LittleEndian.PutUint16(out[1:3], uint16(len(name)))
 	copy(out[3:], name)
+	binary.LittleEndian.PutUint32(out[3+len(name):], owner)
 	return out
 }
 
-// DecodeCreateDatabase decodes a RecordKindCreateDatabase payload.
-func DecodeCreateDatabase(payload []byte) (name string, err error) {
+// DecodeCreateDatabase decodes a RecordKindCreateDatabase payload. owner
+// defaults to catalog.BootstrapSuperuserOID when the payload predates the
+// M0122-0007 owner suffix (no trailing 4 bytes) — keeps replay of a WAL
+// stream written before this change working.
+func DecodeCreateDatabase(payload []byte) (name string, owner uint32, err error) {
 	if len(payload) < 3 {
-		return "", fmt.Errorf("wal: create-database payload too short (%d bytes)", len(payload))
+		return "", 0, fmt.Errorf("wal: create-database payload too short (%d bytes)", len(payload))
 	}
 	if payload[0] != RecordKindCreateDatabase {
-		return "", fmt.Errorf("wal: record kind %d is not create-database", payload[0])
+		return "", 0, fmt.Errorf("wal: record kind %d is not create-database", payload[0])
 	}
 	nameLen := int(binary.LittleEndian.Uint16(payload[1:3]))
 	if len(payload) < 3+nameLen {
-		return "", fmt.Errorf("wal: create-database payload truncated (need %d bytes)", 3+nameLen)
+		return "", 0, fmt.Errorf("wal: create-database payload truncated (need %d bytes)", 3+nameLen)
 	}
-	return string(payload[3 : 3+nameLen]), nil
+	name = string(payload[3 : 3+nameLen])
+	owner = catalog.BootstrapSuperuserOID
+	if len(payload) >= 3+nameLen+4 {
+		owner = binary.LittleEndian.Uint32(payload[3+nameLen : 3+nameLen+4])
+	}
+	return name, owner, nil
 }
 
 // EncodeDropDatabase encodes a DROP DATABASE event (M0054-0001).

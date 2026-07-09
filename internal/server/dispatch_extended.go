@@ -33,7 +33,7 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 	// catalog-backed DROP entirely — see dispatchSimpleQueryViaExecutor's
 	// identical pre-parse check (dispatch.go) for the full explanation.
 	if kind, _ := classifyDatabaseDDL(query); kind == databaseDDLDrop {
-		if res, qerr, handled := s.tryHandleDatabaseOrRoleDDLExtended(query, dbName, sess); handled {
+		if res, qerr, handled := s.tryHandleDatabaseOrRoleDDLExtended(query, dbName, connTx.NonSuperuserRole, sess); handled {
 			return res, qerr
 		}
 	}
@@ -43,7 +43,7 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 		// parser grammar (same string-prefix wire-dispatch bypass the
 		// simple-query path uses in dispatchSimpleQueryViaExecutor) — try
 		// that bypass here too before surfacing a syntax error. M0119-0004.
-		if res, qerr, handled := s.tryHandleDatabaseOrRoleDDLExtended(query, dbName, sess); handled {
+		if res, qerr, handled := s.tryHandleDatabaseOrRoleDDLExtended(query, dbName, connTx.NonSuperuserRole, sess); handled {
 			return res, qerr
 		}
 		if res, qerr, handled := s.tryCompatNoopExtended(query); handled {
@@ -352,7 +352,7 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 //
 // Returns handled=false when query is not a DDL form this bypass
 // recognises, so the caller falls through to its normal syntax-error path.
-func (s *Server) tryHandleDatabaseOrRoleDDLExtended(query, dbName string, sess *config.SessionRegistry) (*extendedQueryResult, *extendedQueryError, bool) {
+func (s *Server) tryHandleDatabaseOrRoleDDLExtended(query, dbName, actingRole string, sess *config.SessionRegistry) (*extendedQueryResult, *extendedQueryError, bool) {
 	resolveCurrentGUC := currentGUCResolver(func(name string) (string, bool) {
 		if sess == nil {
 			return "", false
@@ -360,7 +360,7 @@ func (s *Server) tryHandleDatabaseOrRoleDDLExtended(query, dbName string, sess *
 		_, eff, ok := sess.GetDisplay(name)
 		return eff, ok
 	})
-	if handled, notice, herr := s.tryHandleDatabaseDDL(query, dbName, resolveCurrentGUC); handled {
+	if handled, notice, herr := s.tryHandleDatabaseDDL(query, dbName, actingRole, resolveCurrentGUC); handled {
 		if herr != nil {
 			return nil, &extendedQueryError{Code: databaseDDLErrorSQLState(herr), Message: herr.Error()}, true
 		}

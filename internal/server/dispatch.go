@@ -113,7 +113,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 	// DATABASE need no such pre-check because the parser has no grammar for
 	// them at all (parser.Parse always fails, hitting the bypass below).
 	if kind, _ := classifyDatabaseDDL(sql); kind == databaseDDLDrop {
-		if handled, err := s.handleDatabaseDDLBypass(sql, connTx.DBName, resolveCurrentGUC, w); handled {
+		if handled, err := s.handleDatabaseDDLBypass(sql, connTx.DBName, connTx.NonSuperuserRole, resolveCurrentGUC, w); handled {
 			return err
 		}
 	}
@@ -130,7 +130,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		// it, and (b) emit a WAL record so the registration survives a
 		// crash. Other commands fall through to the wire-protocol no-op
 		// tag handler.
-		if handled, err := s.handleDatabaseDDLBypass(sql, connTx.DBName, resolveCurrentGUC, w); handled {
+		if handled, err := s.handleDatabaseDDLBypass(sql, connTx.DBName, connTx.NonSuperuserRole, resolveCurrentGUC, w); handled {
 			return err
 		}
 		// A multi-statement batch whose FIRST statement is CREATE/DROP ROLE

@@ -239,7 +239,7 @@ func TestTryHandleDatabaseDDLAlterDatabaseConfigFromCurrent(t *testing.T) {
 		return v, ok
 	})
 
-	handled, _, err := s.tryHandleDatabaseDDL("ALTER DATABASE postgres SET work_mem FROM CURRENT", "postgres", resolver)
+	handled, _, err := s.tryHandleDatabaseDDL("ALTER DATABASE postgres SET work_mem FROM CURRENT", "postgres", "", resolver)
 	if !handled || err != nil {
 		t.Fatalf("ALTER DATABASE postgres SET work_mem FROM CURRENT: handled=%v err=%v", handled, err)
 	}
@@ -248,7 +248,7 @@ func TestTryHandleDatabaseDDLAlterDatabaseConfigFromCurrent(t *testing.T) {
 	}
 
 	// An unrecognised GUC name (resolver reports ok=false) errors.
-	handled, _, err = s.tryHandleDatabaseDDL("ALTER DATABASE postgres SET no_such_guc FROM CURRENT", "postgres", resolver)
+	handled, _, err = s.tryHandleDatabaseDDL("ALTER DATABASE postgres SET no_such_guc FROM CURRENT", "postgres", "", resolver)
 	if !handled {
 		t.Fatal("ALTER DATABASE postgres SET no_such_guc FROM CURRENT: expected handled=true")
 	}
@@ -257,7 +257,7 @@ func TestTryHandleDatabaseDDLAlterDatabaseConfigFromCurrent(t *testing.T) {
 	}
 
 	// A nil resolver (no live session) behaves the same as ok=false.
-	handled, _, err = s.tryHandleDatabaseDDL("ALTER DATABASE postgres SET work_mem FROM CURRENT", "postgres", nil)
+	handled, _, err = s.tryHandleDatabaseDDL("ALTER DATABASE postgres SET work_mem FROM CURRENT", "postgres", "", nil)
 	if !handled || err == nil {
 		t.Fatalf("ALTER DATABASE postgres SET work_mem FROM CURRENT (nil resolver): handled=%v err=%v", handled, err)
 	}
@@ -266,7 +266,7 @@ func TestTryHandleDatabaseDDLAlterDatabaseConfigFromCurrent(t *testing.T) {
 	// no-op — the resolver must never be consulted (a nil resolver here must
 	// NOT error), mirroring applyAlterDatabaseConfig's identical restriction
 	// for the literal-value forms.
-	handled, _, err = s.tryHandleDatabaseDDL("ALTER DATABASE otherdb SET work_mem FROM CURRENT", "postgres", nil)
+	handled, _, err = s.tryHandleDatabaseDDL("ALTER DATABASE otherdb SET work_mem FROM CURRENT", "postgres", "", nil)
 	if !handled || err != nil {
 		t.Fatalf("ALTER DATABASE otherdb SET work_mem FROM CURRENT: handled=%v err=%v", handled, err)
 	}
@@ -280,12 +280,12 @@ func TestTryHandleDatabaseDDLAlterDatabaseConfigFromCurrent(t *testing.T) {
 func TestDatabaseDDLErrorSQLState(t *testing.T) {
 	s := newTestRoleServer()
 	im := s.cfg.Catalog.(*catalog.InMemory)
-	if err := im.CreateDatabase("tpch"); err != nil {
+	if err := im.CreateDatabase("tpch", catalog.BootstrapSuperuserOID); err != nil {
 		t.Fatalf("seed CreateDatabase(tpch): %v", err)
 	}
 
 	// CREATE DATABASE on an existing name: PG ERRCODE_DUPLICATE_DATABASE (42P04).
-	handled, _, err := s.tryHandleDatabaseDDL("CREATE DATABASE tpch", "postgres", nil)
+	handled, _, err := s.tryHandleDatabaseDDL("CREATE DATABASE tpch", "postgres", "", nil)
 	if !handled || err == nil {
 		t.Fatalf("CREATE DATABASE tpch (duplicate): handled=%v err=%v", handled, err)
 	}
@@ -298,7 +298,7 @@ func TestDatabaseDDLErrorSQLState(t *testing.T) {
 
 	// DROP DATABASE on a nonexistent name (no IF EXISTS): PG
 	// ERRCODE_UNDEFINED_DATABASE (3D000).
-	handled, _, err = s.tryHandleDatabaseDDL("DROP DATABASE nosuchdb", "postgres", nil)
+	handled, _, err = s.tryHandleDatabaseDDL("DROP DATABASE nosuchdb", "postgres", "", nil)
 	if !handled || err == nil {
 		t.Fatalf("DROP DATABASE nosuchdb: handled=%v err=%v", handled, err)
 	}
@@ -311,7 +311,7 @@ func TestDatabaseDDLErrorSQLState(t *testing.T) {
 
 	// ALTER DATABASE ... SET ... FROM CURRENT on an unresolved GUC name: PG
 	// ERRCODE_UNDEFINED_OBJECT (42704), same code SHOW/SET already use.
-	handled, _, err = s.tryHandleDatabaseDDL("ALTER DATABASE postgres SET no_such_guc FROM CURRENT", "postgres",
+	handled, _, err = s.tryHandleDatabaseDDL("ALTER DATABASE postgres SET no_such_guc FROM CURRENT", "postgres", "",
 		currentGUCResolver(func(string) (string, bool) { return "", false }))
 	if !handled || err == nil {
 		t.Fatalf("ALTER DATABASE postgres SET no_such_guc FROM CURRENT: handled=%v err=%v", handled, err)
@@ -329,6 +329,72 @@ func TestDatabaseDDLErrorSQLState(t *testing.T) {
 
 var errUnwrappedForTest = errors.New("boom")
 
+// TestTryHandleDatabaseDDLDropRequiresOwnership pins the M0122-0007 DROP
+// DATABASE ownership check mirrored from dbcommands.c dropdb()'s
+// object_ownercheck call: CREATE DATABASE records the creating role as
+// datdba, and only that role (or a superuser) may DROP it — everyone else
+// gets 42501 "must be owner of database %s", matching real PG's message and
+// SQLSTATE exactly.
+func TestTryHandleDatabaseDDLDropRequiresOwnership(t *testing.T) {
+	s := newTestRoleServer()
+	im := s.cfg.Catalog.(*catalog.InMemory)
+
+	for _, role := range []string{"alice", "bob"} {
+		if handled, err := s.tryHandleRoleDDL("CREATE ROLE "+role+" LOGIN", "postgres", nil); !handled || err != nil {
+			t.Fatalf("CREATE ROLE %s: handled=%v err=%v", role, handled, err)
+		}
+	}
+	aliceOID, ok := im.RoleOID("alice")
+	if !ok {
+		t.Fatal("role alice not registered in catalog")
+	}
+
+	handled, _, err := s.tryHandleDatabaseDDL("CREATE DATABASE aliceonly", "postgres", "alice", nil)
+	if !handled || err != nil {
+		t.Fatalf("CREATE DATABASE aliceonly (as alice): handled=%v err=%v", handled, err)
+	}
+	if got := im.DatabaseOwner("aliceonly"); got != aliceOID {
+		t.Errorf("DatabaseOwner(aliceonly) = %d, want alice's OID %d", got, aliceOID)
+	}
+
+	// A non-owner, non-superuser role is rejected.
+	handled, _, err = s.tryHandleDatabaseDDL("DROP DATABASE aliceonly", "postgres", "bob", nil)
+	if !handled || err == nil {
+		t.Fatalf("DROP DATABASE aliceonly (as bob): handled=%v err=%v, want an error", handled, err)
+	}
+	if got := databaseDDLErrorSQLState(err); got != sqlstate.InsufficientPrivilege {
+		t.Errorf("DROP DATABASE aliceonly (as bob): sqlstate = %q, want %q", got, sqlstate.InsufficientPrivilege)
+	}
+	if want := "must be owner of database aliceonly"; err.Error() != want {
+		t.Errorf("DROP DATABASE aliceonly (as bob): message = %q, want %q", err.Error(), want)
+	}
+	if !im.HasDatabase("aliceonly") {
+		t.Error("DROP DATABASE aliceonly (as bob): database was removed despite the rejection")
+	}
+
+	// The bootstrap superuser (actingRole "") may drop it despite not owning it.
+	handled, _, err = s.tryHandleDatabaseDDL("DROP DATABASE aliceonly", "postgres", "", nil)
+	if !handled || err != nil {
+		t.Fatalf("DROP DATABASE aliceonly (as superuser): handled=%v err=%v, want success", handled, err)
+	}
+	if im.HasDatabase("aliceonly") {
+		t.Error("DROP DATABASE aliceonly (as superuser): database still registered after a successful drop")
+	}
+
+	// The owning role itself may always drop its own database.
+	handled, _, err = s.tryHandleDatabaseDDL("CREATE DATABASE aliceonly2", "postgres", "alice", nil)
+	if !handled || err != nil {
+		t.Fatalf("CREATE DATABASE aliceonly2 (as alice): handled=%v err=%v", handled, err)
+	}
+	handled, _, err = s.tryHandleDatabaseDDL("DROP DATABASE aliceonly2", "postgres", "alice", nil)
+	if !handled || err != nil {
+		t.Fatalf("DROP DATABASE aliceonly2 (as owner alice): handled=%v err=%v, want success", handled, err)
+	}
+	if im.HasDatabase("aliceonly2") {
+		t.Error("DROP DATABASE aliceonly2 (as owner alice): database still registered after a successful drop")
+	}
+}
+
 // TestTryHandleDatabaseDDLDropGuards pins the three DROP DATABASE guard
 // checks mirrored from PG's dropdb() (dbcommands.c): template protection,
 // "can't drop my own database", and the other-backends busy check — all
@@ -337,13 +403,13 @@ var errUnwrappedForTest = errors.New("boom")
 func TestTryHandleDatabaseDDLDropGuards(t *testing.T) {
 	s := newTestRoleServer()
 	im := s.cfg.Catalog.(*catalog.InMemory)
-	if err := im.CreateDatabase("tpch"); err != nil {
+	if err := im.CreateDatabase("tpch", catalog.BootstrapSuperuserOID); err != nil {
 		t.Fatalf("seed CreateDatabase(tpch): %v", err)
 	}
 
 	// PG: dropdb(), "cannot drop a template database" (42809).
 	for _, name := range []string{"template0", "template1"} {
-		handled, _, err := s.tryHandleDatabaseDDL("DROP DATABASE "+name, "postgres", nil)
+		handled, _, err := s.tryHandleDatabaseDDL("DROP DATABASE "+name, "postgres", "", nil)
 		if !handled || err == nil {
 			t.Fatalf("DROP DATABASE %s: handled=%v err=%v, want an error", name, handled, err)
 		}
@@ -360,7 +426,7 @@ func TestTryHandleDatabaseDDLDropGuards(t *testing.T) {
 
 	// PG: dropdb(), "cannot drop the currently open database" (55006) —
 	// the connection's own liveDBName is the target.
-	handled, _, err := s.tryHandleDatabaseDDL("DROP DATABASE postgres", "postgres", nil)
+	handled, _, err := s.tryHandleDatabaseDDL("DROP DATABASE postgres", "postgres", "", nil)
 	if !handled || err == nil {
 		t.Fatalf("DROP DATABASE postgres (self): handled=%v err=%v, want an error", handled, err)
 	}
@@ -381,7 +447,7 @@ func TestTryHandleDatabaseDDLDropGuards(t *testing.T) {
 	reg.Register(&activity.Backend{PID: "999", DatName: "tpch", BackendType: "client_backend"})
 	defer reg.Unregister("999")
 
-	handled, _, err = s.tryHandleDatabaseDDL("DROP DATABASE tpch", "postgres", nil)
+	handled, _, err = s.tryHandleDatabaseDDL("DROP DATABASE tpch", "postgres", "", nil)
 	if !handled || err == nil {
 		t.Fatalf("DROP DATABASE tpch (busy): handled=%v err=%v, want an error", handled, err)
 	}
@@ -397,7 +463,7 @@ func TestTryHandleDatabaseDDLDropGuards(t *testing.T) {
 
 	// Once the other backend disconnects, the drop succeeds.
 	reg.Unregister("999")
-	handled, _, err = s.tryHandleDatabaseDDL("DROP DATABASE tpch", "postgres", nil)
+	handled, _, err = s.tryHandleDatabaseDDL("DROP DATABASE tpch", "postgres", "", nil)
 	if !handled || err != nil {
 		t.Fatalf("DROP DATABASE tpch (idle): handled=%v err=%v, want success", handled, err)
 	}
