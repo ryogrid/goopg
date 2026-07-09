@@ -1,72 +1,67 @@
-Task: M0122-0007 4e — `CREATE DATABASE ... TEMPLATE` real relation-copy
-mechanism (follow-up 22 landed a bounded validation-only slice; commit
-875f9f37). This IS the epic's final remaining item.
+Task: M0122-0007 4e (`CREATE DATABASE ... TEMPLATE` epic). This loop fixed and
+committed the pg_class-under-fresh-database gap (follow-up 23, commit
+1edd6ede). Epic's only remaining item is the real relation-copy mechanism.
 
-Files (this loop, already committed): internal/server/database_ddl.go,
-internal/server/database_ddl_test.go,
-docs/design/0122-0018-per-database-catalog-namespace.md,
-docs/design/README.md, .ralph/fix_plan.md, .ralph/deferral_ledger.md.
+Files (this loop, committed): internal/catalog/catalog.go (LookupTable
+fallback + PGClassRowsForDBOid), internal/executor/context.go (PgClassRows
+field), internal/executor/operators.go (valuesOp.Open pg_class branch),
+internal/server/dispatch.go (wireExtensionRows wiring + pgClassRowLister),
+internal/executor/fk_dbid_routing_test.go (2 new tests), design doc +
+README + fix_plan.md + deferral_ledger.md.
 
-Key symbols: `resolveCreateDatabaseTemplate` (database_ddl.go) — currently
-errors 0A000 on a non-empty template unless it aliases
-`catalog.DefaultDBOid`. Replace its FeatureNotSupported branch with the real
-copy; keep the existence check + the DefaultDBOid-skip (load-bearing, see
-below). `createDatabasePhysicalDirectory` — currently only creates an empty
-`base/<oid>/PG_VERSION` scaffold, never copies files.
+Key symbols: `catalog.InMemory.LookupTable` (10751ish) — new
+`lookupSystemCatalogTableLocked` fallback, generic for ALL pg_catalog/
+information_schema names. `catalog.InMemory.PGClassRowsForDBOid` (~5823) —
+extracted pg_class's former inline VirtualRows closure, now parameterized on
+dbOid; `registerSystemTables`'s VirtualRows still calls it with DefaultDBOid
+(byte-identical default). `executor.Context.PgClassRows`, wired in
+`server.wireExtensionRows` via new `pgClassRowLister` interface.
 
-Findings (confirmed this loop, don't re-derive):
-- Physical storage IS real per-database: `internal/storage/smgr.go`
-  `relDir`/`sharedOrPerDBRelDir` route every RelFileNode through
-  `base/<dbOid>/<relOid>` (+ `_fsm`/`_vm`/`_init` forks).
-- Catalog IS real per-database: `catalog.InMemory.namespaces
-  map[uint32]*tableNamespace` (tables/indexes/byTable), accessed via
-  `ns(dbOid)`/`getOrCreateNS(dbOid)`. Views AND sequences are just Table
-  entries (IsSequence bool) in the SAME map — no separate registry to copy.
-- `"template1"` and `"postgres"` BOTH alias `catalog.DefaultDBOid` (1) — a
-  pre-existing legacy dual-mirror every fixture/pre-4c path writes real
-  tables into. A copy mechanism must NOT treat DefaultDBOid as a normal
-  template source (whose "content" is ambiguous between template1's own data
-  and postgres's own data) — this is why the validation slice special-cases
-  it. `template0` is oid 4, genuinely distinct, always empty.
-- OIDs are cluster-wide (one `nextOID` counter) — copied objects need FRESH
-  OIDs, not the source's OIDs (would collide). FK targets, index byTable
-  keys etc. all need remapping to the new OIDs.
-- pg_attribute/pg_type are heap-backed (see `pg_attribute_alter_needs_heap_resync`
-  memory) — a copied table's columns need a heap re-sync write too, not just
-  an in-memory Table struct copy.
-- Residual gap found live (NOT this task, not fixed): a connection to ANY
-  freshly CREATE DATABASE'd database can't query pg_class at all (`ERROR:
-  relation "pg_class" does not exist") — system-catalog virtual builders
-  aren't wired to a per-connection dbOid yet. Recorded in deferral ledger.
-  Worth fixing before/alongside the copy mechanism since a copied database
-  would be equally useless if you can't \d it afterward.
+Findings (confirmed, don't re-derive):
+- Two distinct bugs existed: (A) NAME resolution — pg_catalog/
+  information_schema tables are registered ONLY under DefaultDBOid's
+  namespace, so ANY distinct dbOid's connection got 42P01 on system-catalog
+  names. Fixed generically for all ~70 such tables. (B) ROW CONTENT — even
+  once resolvable, pg_class's VirtualRows always enumerated DefaultDBOid's
+  tables regardless of connection. Fixed for pg_class only this loop.
+- ~13 sibling virtual builders (pg_indexes, pg_tables, pg_attrdef,
+  pg_constraint, pg_inherits, pg_index, pg_statistic_ext, pg_policy,
+  pg_depend, pg_trigger, pg_rewrite, information_schema.routines/parameters/
+  routine_*_usage, pg_foreign_table) share the same c.ns(DefaultDBOid)-
+  hardcoded VirtualRows pattern — now Bug-A-fixed (no more 42P01) but still
+  Bug-B-open (list DefaultDBOid's objects regardless of connection).
+  pg_sequence/pg_sequences already separately flagged by an earlier ledger
+  row. Recorded in deferral ledger row "pg_class-under-fresh-database"
+  (2026-07-10) with the exact per-table resume pattern (mirror pg_class's
+  closure-extraction: PGXxxRowsForDBOid + Context field + wireExtensionRows
+  site + valuesOp.Open branch), one table per future loop.
+- pg_attribute/pg_type (heap-backed, not VirtualRows) are a DIFFERENT,
+  deeper gap: their physical heap rows are hardcoded DBOid=DefaultDBOid in
+  operators_ddl.go's syncTableToCatalogHeap — a heap-write/heap-scan fix,
+  not a VirtualRows one. Not touched this loop.
+- Live end-to-end verified via a real cmd/goopg binary + psql (LD_LIBRARY_PATH
+  must include postgres/local_install/lib or psql fails with a symbol lookup
+  error — undocumented gotcha, worth a memory if it recurs): CREATE DATABASE
+  freshdb -> connect -> pg_class query succeeds -> CREATE TABLE -> \dt shows
+  only that table, postgres db's own \dt unaffected.
 
-- A background Explore agent (see "In-flight" below) independently confirmed
-  the above and added one new detail: enum types, domains, composite types,
-  and routines are NOT namespace-scoped at all in `catalog.InMemory` (they
-  live in separate global/DefaultDBOid-only sibling maps, e.g. `enumTypes`,
-  `domains` — distinct from `tableNamespace`). The design doc already scopes
-  these out of the whole epic (docs/design/0122-0018-...md L1043-ish), so the
-  copy mechanism should realistically cover only tables/indexes/views/
-  sequences (the namespace-scoped kinds) as its first cut — copying a table
-  with a domain-typed column would still reference the (correctly shared,
-  un-namespaced) domain definition, which needs no copying.
+Next step: pick ONE of the ~13 deferred virtual builders (pg_tables and
+pg_indexes are the next highest-value targets, since psql's \d/\dt-family
+commands and many compat-tool catalog joins touch them) and apply the same
+closure-extraction pattern PGClassRowsForDBOid used. OR start the actual
+CREATE DATABASE ... TEMPLATE relation-copy mechanism (design doc's
+"Remaining 4e work" section has the sketch) now that pg_class works
+end-to-end for verifying it. Either is a reasonable next pick.
 
-Next step: design doc's "Remaining 4e work" section
-(docs/design/0122-0018-per-database-catalog-namespace.md) has the sketch.
-Start by deciding whether to fix the pg_class-under-fresh-db gap FIRST (small,
-independently valuable, makes the copy mechanism actually usable end-to-end)
-or in the same loop as the copy mechanism.
+Gates run: go build/vet ./... clean; go test ./internal/catalog/...
+./internal/executor/... ./internal/server/... ./internal/planner/... PASS;
+go test -short (full repo, non-testport) PASS; tpch-spotcheck PASS
+(Q12=2/Q13=33); pgbench smoke PASS (0 failed, all 3 workloads, twice —
+standalone + pre-commit hook). make ralph-state-guard OK (no repair needed).
+Nightly triage: ci/logs/action-items.md's single AI-20260710-011513-001
+(build regression) was already fixed + closed in fix_plan.md by a prior
+loop (follow-up 14, commit abbf7de1) before this loop started — no new
+M-NIGHTLY task needed; `make build` verified clean at loop start.
 
-Gates run: go build/vet clean; go test ./internal/server/... ./internal/catalog/...
-./internal/executor/... ./internal/wal/... PASS; full repo -short PASS;
-tpch-spotcheck PASS (Q12=2/Q13=33); pgbench smoke PASS (0 failed, all 3
-workloads, ran twice — once standalone, once as the commit's pre-commit
-hook). make ralph-state-guard OK (self-repaired a benign status/progress
-timestamp mismatch from the previous loop's clean exit).
-
-In-flight: none. The background Explore agent (id a36d34e0c12dc6687) launched
-early this loop reported back (after this loop's work was already committed)
-— folded its one new finding (enum/domain/composite/routine scope-out) into
-the notes above; nothing it found contradicted or required changes to the
-committed work.
+In-flight: none. tmp/manual-pgclass-test/ (scratch server used for the live
+verification) was removed after use.
