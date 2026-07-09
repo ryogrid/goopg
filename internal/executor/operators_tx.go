@@ -298,10 +298,11 @@ func rollbackDDLCreate(ctx *Context, entry DDLUndoEntry) {
 		RelOid: entry.RelOID,
 		Fork:   storage.MainFork,
 	}
+	dbOid := catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)
 	if entry.IsIndex {
-		_ = ctx.Catalog.DropIndex(entry.Name)
+		_ = ctx.Catalog.DropIndex(entry.Name, dbOid)
 	} else {
-		_ = ctx.Catalog.DropTable(entry.Name)
+		_ = ctx.Catalog.DropTable(entry.Name, dbOid)
 	}
 	if ctx.Pool != nil {
 		ctx.Pool.InvalidateRel(rel)
@@ -343,10 +344,11 @@ func ProcessRollbackUndos(ctx *Context, sess *BasicSession) {
 	// On full ROLLBACK these are all being undone (the top-level transaction aborts).
 	// M0097-0023.
 	if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+		dbOid := catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)
 		for _, drop := range sess.TakePendingDDLDrops() {
-			im.RegisterTable(drop.Table)
+			im.RegisterTable(drop.Table, dbOid)
 			for _, idx := range drop.Indexes {
-				im.RestoreIndex(idx)
+				im.RestoreIndex(idx, dbOid)
 			}
 		}
 	}
@@ -521,10 +523,11 @@ func (o *transactionOp) execRollbackTo() error {
 	// M0097-0023.
 	newDepth := sess.SavepointDepth()
 	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+		dbOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
 		for _, drop := range sess.RollbackDDLDropsToDepth(newDepth) {
-			im.RegisterTable(drop.Table)
+			im.RegisterTable(drop.Table, dbOid)
 			for _, idx := range drop.Indexes {
-				im.RestoreIndex(idx)
+				im.RestoreIndex(idx, dbOid)
 			}
 		}
 	}

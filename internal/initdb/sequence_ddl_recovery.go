@@ -86,7 +86,7 @@ func replaySequenceDDLRecords(walDir string, cat catalog.Catalog) error {
 		if i := strings.LastIndex(p.Name, "."); i >= 0 {
 			seqObjName = parser.ObjectName{Schema: p.Name[:i], Name: p.Name[i+1:]}
 		}
-		executor.CreateSequenceCatalogRelation(cat, seqObjName, p.Name)
+		executor.CreateSequenceCatalogRelation(cat, seqObjName, p.Name, catalog.DefaultDBOid)
 
 		if p.OwnedBy == "" || (p.ColSpelling == "" && p.IdentityKind == 0) {
 			continue

@@ -1,6 +1,6 @@
 # Per-database catalog namespace (M0122-0007 slice 4)
 
-Status: accepted (sub-slices 4a, 4b-i, 4b-ii, and 4c landed; 4d, 4e planned)
+Status: accepted (sub-slices 4a, 4b-i, 4b-ii, 4c, and 4d-i landed; 4d-ii, 4e planned)
 Date: 2026-07-09
 Supersedes: none — extends the "Still open" note in
 `0122-0017-database-ddl-drop-guards.md` and the deferral-ledger rows dated
@@ -343,20 +343,146 @@ dual-mirror shim works: every query against "postgres" still sees
 scripts/ralph-precommit-test.sh` PASS (0 failed transactions, all 3 pgbench
 workloads — exercises both plan-cache paths under real concurrent load).
 
-### 4d — Route WRITE paths (planned)
+### 4d-i — Thread the connection's real dbOid through write entry points (LANDED this loop, 2026-07-09)
 
-`CreateTable`/`CreateIndex`/`DropTable`/`DropIndex`/`RegisterRealTable`/
-`AddColumn`/rename/ALTER paths, so objects actually land in — and get
-removed from — the connection's own namespace instead of the shared
-default. Also wire `RelFileNode.DBOid` to the connection's real dbOid at
-creation time (currently hardcoded to `DefaultDBOid` regardless of
-connection) so physical storage genuinely separates per database, closing
-the loop with slices 2/3's `base/<dbOid>` directories. **Must account for
-the `postgres`/`template1` dual-mirror** noted under "Blast radius" —
-`postgres`'s storage identity is not simply `ResolveDatabaseOid("postgres")`
-in every context; audit `NewInMemory`'s `dbOid: DefaultDBOid` seed and the
-`base/1/` + `base/5/` mirror before changing what oid live relations are
-created under.
+Every executor call site that mutates the catalog — `CreateTable`
+(`execCreateTable`, `execCreateTableAs`'s no-storage and normal branches,
+partition-child creation, `CreateSequenceCatalogRelation`), `CreateIndex`
+(`execCreateIndex`'s gist/spgist/gin/brin branch, the btree bulk-build path,
+`createExclusionIndexStub`), `DropTable` (`execDropTable`'s leaf-drop and
+DROP-SCHEMA-CASCADE table loop, sequence virtual-relation removal, the TEMP
+table shadow-drop in `execCreateTable`), `DropIndex` (`execDropIndex`,
+`ApplyPendingIndexDrops`, the two build-failure/WAL-failure rollback paths in
+`execCreateIndex`'s btree branch, the ALTER-TABLE-DROP-COLUMN dependent-index
+cleanup), `RenameTable`/`RenameIndex` (the two ALTER TABLE/INDEX RENAME
+branches), `AddColumn` (`addColumnRecursive`), and the savepoint-rollback
+restore path (`RegisterTable`/`RestoreIndex` in `ProcessRollbackUndos`,
+`execRollbackTo`, and the TEMP-table-drop shadow-restore in `execDropTable`)
+— previously called the corresponding `catalog.InMemory` method with **no**
+dbOid argument, which every one of them defaults to `DefaultDBOid`
+(`resolveDBOid`'s zero-length fallback) regardless of which database the
+connection was actually bound to. All ~24 call sites (in
+`internal/executor/operators_ddl.go` and `operators_tx.go`) now pass
+`catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)` explicitly — the exact same
+shim 4c uses for reads, so a `"postgres"` connection's writes still land
+under `DefaultDBOid` (unchanged behavior; see the dual-mirror note below) while
+a connection to a genuinely distinct, non-`"postgres"` real database (one
+`CREATE DATABASE` allocated its own `pg_database.oid` for, per the
+5c467579-and-friends commits) now creates/drops/renames objects in **that**
+database's own namespace instead of the shared default. Two entry points
+(`AddColumn`, `RegisterTable`, `RestoreIndex`) did not even have a `dbOid
+...uint32` parameter yet (4b-ii missed them because nothing called them with
+one) — added here, mirroring the existing variadic-parameter convention.
+`CreateSequenceCatalogRelation` (shared between the live executor and
+`internal/initdb/sequence_ddl_recovery.go`'s WAL replay) gained a *required*
+`dbOid uint32` parameter instead of variadic, since its two callers'
+correct values are so different (the live path resolves the connection's
+real dbOid; startup replay has no per-connection concept yet and must keep
+passing `catalog.DefaultDBOid` explicitly, preserving today's single-database
+replay behavior). `ApplyPendingIndexDrops` needed no signature change — both
+its callers already had a `*Context` in scope, so it resolves
+`catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)` internally.
+
+**Dual-mirror preserved, not yet revisited:** `catalog.NamespaceDBOid` still
+folds `PostgresDBOid` (5) back to `DefaultDBOid` (1) exactly as 4c left it —
+this sub-slice deliberately did not touch that shim, so every `"postgres"`
+connection's writes are bit-for-bit unchanged (confirmed via
+`scripts/tpch-spotcheck.sh` staying Q12=2/Q13=33 and the pgbench smoke gate,
+both of which connect as `"postgres"`). The "audit the dual-mirror before
+changing what oid live relations are created under" caution from the
+original 4d planning note therefore does not yet apply — no live relation's
+storage identity changed for any existing connection kind.
+
+**Critical scope finding, discovered while landing this — the real gap
+4d-ii must close:** this sub-slice only fixes *half* of what a working
+per-database namespace needs. `ectx.Catalog` (the raw `catalog.Catalog` every
+executor operator holds, assigned once in
+`internal/server/dispatch.go:295` as `s.cfg.Catalog`, a bare
+`*catalog.InMemory`) is **never** wrapped in a `SearchPathCatalog` the way
+`ectx.PlanCatalog` is (4c only wired the *planner's* catalog reference). That
+means every executor-operator-level `LookupTable(name)` / `LookupIndex(name)`
+call with no explicit dbOid argument — there are **60 in
+`internal/executor/operators_ddl.go` alone**, plus more across
+`operators_fk.go`, `operators_cluster.go`, `operators_reindex.go`,
+`operators_sequence.go`, `operators_storage.go`,
+`operators_pg_get_publication_tables.go`, and every DML operator (`expr.go`
+and friends) — still resolves against `DefaultDBOid` only, completely
+independent of `ctx.CurrentDatabaseOid`. Concretely: `execDropTable`,
+`execCreateIndex`, `execAlterTable*`, and effectively every DML operator all
+start by calling `o.ctx.Catalog.LookupTable(name)` (or `LookupIndex`) to find
+the object they're about to operate on — for a table created under a
+genuinely distinct dbOid by this loop's now-correct `CreateTable` routing,
+that lookup will report "does not exist", because it never receives the
+dbOid this loop threads on the *write* side. **This was proven empirically
+while writing this loop's tests** (`internal/executor/ddl_write_dbid_routing_test.go`):
+a `CREATE TABLE ... AS SELECT` against a table in a distinct namespace
+required rewriting the test to avoid a `FROM` clause, since
+`o.planCatalog()` (which falls back to the raw, unwrapped `ctx.Catalog` when
+`ctx.PlanCatalog` is nil — true in every unit-test harness, and read-routed
+only via `SearchPathCatalog` in the live server path) could not resolve the
+source table either. In production, planner-level resolution (`PlanCatalog`)
+*is* dbOid-aware since 4c, so a `SELECT` naming the table plans correctly —
+but the *executor operator's own* subsequent lookup of the same table (e.g.
+to fetch `*catalog.Table` for a DML op, or to locate it for DROP/ALTER) is
+not, so plan-time and execute-time catalog resolution disagree for any
+connection to a genuinely second real database. This is safe today only
+because nothing in production or in any existing test connects to a second
+real database end-to-end yet (confirmed by 4c's own writeup) — every real
+connection today resolves through `catalog.NamespaceDBOid` to `DefaultDBOid`,
+so this loop's changes are a pure no-op for all existing behavior (proved by
+the full non-testport suite, `-race` catalog/executor run,
+tpch-spotcheck, and pgbench smoke gates all staying green with zero row-count
+or transaction-count drift). But **the write-routing landed here is
+necessary, forward-compatible plumbing, not a complete story**: 4d-ii must
+thread the same `catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)` argument
+through every executor-operator-level `LookupTable`/`LookupIndex` call before
+a second real database's objects are actually usable end-to-end.
+
+New tests: `internal/executor/ddl_write_dbid_routing_test.go` —
+`TestExecCreateTableRoutesToConnectionRealDBOid`,
+`TestExecCreateTableAsRoutesToConnectionRealDBOid`, and
+`TestExecCreateTablePostgresConnectionStaysOnDefaultDBOid` (the dual-mirror
+pin, mirroring 4c's own read-side pin but for the write path). These test
+`CreateTable` specifically because it is the one entry point that does not
+need a prior `LookupTable` to already be dbOid-aware — every other entry
+point this loop touched (`DropTable`, `CreateIndex`, `RenameTable`, etc.) is
+correctly wired but not independently end-to-end-testable yet, precisely
+because of the 4d-ii gap above (their callers obtain the `*catalog.Table` /
+`*catalog.Index` they operate on via a `LookupTable`/`LookupIndex` call that
+is not yet dbOid-routed).
+
+Gates: `go build ./...` / `go vet ./...` clean; `go test -race
+./internal/catalog/... ./internal/executor/...` PASS; `go test -short
+$(go list ./... | grep -v /internal/testport)` (full repo, short mode) PASS;
+`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+scripts/ralph-precommit-test.sh` PASS (0 failed transactions, all 3 pgbench
+workloads).
+
+### 4d-ii — Thread dbOid through executor-operator-level lookups + `RelFileNode.DBOid` (planned)
+
+Two remaining pieces, likely worth their own further split given the size:
+
+1. Thread `catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)` through every
+   executor-operator-level `LookupTable`/`LookupIndex` call that currently
+   passes none (60+ in `operators_ddl.go` alone; more across the DML
+   operators) — see the "critical scope finding" in 4d-i above for exactly
+   why this is required before a second real database's tables are usable
+   through anything but `CREATE TABLE` itself. Given the scale, consider
+   whether wrapping `ectx.Catalog` itself in a `SearchPathCatalog` (mirroring
+   `ectx.PlanCatalog`) is viable instead of touching every call site
+   individually — but note this breaks every `im, ok :=
+   o.ctx.Catalog.(*catalog.InMemory)` type assertion (dozens of them), which
+   would need updating in lockstep, so it may not actually be less work than
+   the mechanical per-call-site fix.
+2. Wire `RelFileNode.DBOid` to the connection's real dbOid at creation time
+   (currently hardcoded to `DefaultDBOid` regardless of connection) so
+   physical storage genuinely separates per database, closing the loop with
+   slices 2/3's `base/<dbOid>` directories. **Must account for the
+   `postgres`/`template1` dual-mirror** noted under "Blast radius" —
+   `postgres`'s storage identity is not simply
+   `ResolveDatabaseOid("postgres")` in every context; audit `NewInMemory`'s
+   `dbOid: DefaultDBOid` seed and the `base/1/` + `base/5/` mirror before
+   changing what oid live relations are created under.
 
 ### 4e — Cross-cutting fixups + the original motivation (planned)
 
@@ -371,22 +497,23 @@ today, ready to become a hard assertion once this lands).
 
 ## Recommended order and stopping points
 
-4a (landed) → 4b-i (landed) → 4b-ii (landed) → 4c (landed) → 4d → 4e, strictly
-in order — each depends on the previous sub-slice's data shape. 4d is next:
-route WRITE paths (`CreateTable`/`CreateIndex`/`DropTable`/`DropIndex`/
-`RegisterRealTable`/rename/ALTER) through the connection's real dbOid instead
-of the hardcoded `DefaultDBOid`, and wire `RelFileNode.DBOid` at creation
-time. Before starting 4d, read 4c's landed section above in full — it
-documents the `postgres`/`DefaultDBOid` dual-mirror shim
-(`catalog.NamespaceDBOid`) that 4d must revisit (once writes route by real
-dbOid, "postgres" connections can no longer be silently folded into
-`DefaultDBOid` the way 4c's read-only shim does), the plan-cache
-segregation that must stay in sync with however 4d changes namespace
-resolution, and the `ns()`/`getOrCreateNS` split (4d's create-needing write
-paths already use `getOrCreateNS`; don't revert them to the old
-always-creating `ns()`). If a sub-slice is cut off mid-implementation, prefer
-reverting it whole (the tree must build and tests must pass at every commit)
-over leaving a partially-migrated state.
+4a (landed) → 4b-i (landed) → 4b-ii (landed) → 4c (landed) → 4d-i (landed) →
+4d-ii → 4e, strictly in order — each depends on the previous sub-slice's data
+shape. 4d-ii is next: thread `catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)`
+through every executor-operator-level `LookupTable`/`LookupIndex` call site
+that doesn't have it yet (see 4d-i's "critical scope finding" above for the
+full list of affected files and the reasoning for why this, not
+`RelFileNode.DBOid`, is the higher-priority half), then wire
+`RelFileNode.DBOid` at creation time. Before starting 4d-ii, read 4d-i's
+landed section above in full — it documents exactly which write entry points
+already thread the connection's real dbOid (so 4d-ii's lookups must resolve
+the SAME `catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)` value to actually
+find what 4d-i creates), the `postgres`/`DefaultDBOid` dual-mirror shim that
+still applies unchanged, and the `ns()`/`getOrCreateNS` split (create-needing
+paths use `getOrCreateNS`; don't revert them to the old always-creating
+`ns()`). If a sub-slice is cut off mid-implementation, prefer reverting it
+whole (the tree must build and tests must pass at every commit) over leaving
+a partially-migrated state.
 
 **Unrelated pre-existing hazard noticed while verifying 4c** (not part of
 this epic, not fixed here): `go test -race ./internal/server/...` fails

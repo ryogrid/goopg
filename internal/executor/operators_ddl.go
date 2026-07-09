@@ -1453,7 +1453,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			key := strings.ToLower(s.Name.Name)
 			o.ctx.TempTableShadows[key] = permTbl
 			// Drop the existing catalog entry (heap data preserved at old OID).
-			if err := o.ctx.Catalog.DropTable(s.Name); err != nil {
+			if err := o.ctx.Catalog.DropTable(s.Name, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); err != nil {
 				return &ExecError{Code: "42P01", Pos: s.Pos(), Message: err.Error()}
 			}
 		} else {
@@ -2911,7 +2911,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	if err != nil {
 		return err
 	}
-	tbl, err := o.ctx.Catalog.CreateTable(s.Name, cols)
+	tbl, err := o.ctx.Catalog.CreateTable(s.Name, cols, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 	if err != nil {
 		return &ExecError{Code: "42P07", Pos: s.Pos(), Message: err.Error()}
 	}
@@ -3861,7 +3861,7 @@ func (o *ddlOp) execCreateTableAs(s *parser.CreateTableStmt) error {
 	}
 	if o.ctx.Pool == nil || o.ctx.Catalog == nil || o.ctx.TxnMgr == nil {
 		// No storage: create an empty table with no columns.
-		_, err := o.ctx.Catalog.CreateTable(s.Name, nil)
+		_, err := o.ctx.Catalog.CreateTable(s.Name, nil, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		if err != nil {
 			return &ExecError{Code: "42P07", Pos: s.Pos(), Message: err.Error()}
 		}
@@ -3899,7 +3899,7 @@ func (o *ddlOp) execCreateTableAs(s *parser.CreateTableStmt) error {
 	if err != nil {
 		return err
 	}
-	tbl, err := o.ctx.Catalog.CreateTable(s.Name, cols)
+	tbl, err := o.ctx.Catalog.CreateTable(s.Name, cols, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 	if err != nil {
 		return &ExecError{Code: "42P07", Pos: s.Pos(), Message: err.Error()}
 	}
@@ -4025,7 +4025,7 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 	if err != nil {
 		return err
 	}
-	tbl, err := o.ctx.Catalog.CreateTable(s.Name, cols)
+	tbl, err := o.ctx.Catalog.CreateTable(s.Name, cols, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 	if err != nil {
 		return &ExecError{Code: "42P07", Pos: s.Pos(), Message: err.Error()}
 	}
@@ -5938,7 +5938,7 @@ func (o *ddlOp) dropTableByRefImmediate(name parser.ObjectName, tbl *catalog.Tab
 			SavepointDepth: bsess.SavepointDepth(),
 		})
 	}
-	if err := o.ctx.Catalog.DropTable(dropName); err != nil {
+	if err := o.ctx.Catalog.DropTable(dropName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); err != nil {
 		return &ExecError{Code: "XX000", Message: err.Error()}
 	}
 	// Drop sequences that are owned by columns of this table (created via
@@ -5955,7 +5955,7 @@ func (o *ddlOp) dropTableByRefImmediate(name parser.ObjectName, tbl *catalog.Tab
 		key := strings.ToLower(name.Name)
 		if permTbl, hasShadow := o.ctx.TempTableShadows[key]; hasShadow && permTbl != nil {
 			if im, ok2 := o.ctx.Catalog.(*catalog.InMemory); ok2 {
-				im.RegisterTable(permTbl)
+				im.RegisterTable(permTbl, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 			}
 			delete(o.ctx.TempTableShadows, key)
 		}
@@ -6166,7 +6166,7 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 	// BRIN is catalog-only so its `pages_per_range` reloption likewise round-trips
 	// (DU-002 slice 222).
 	if method == "gist" || method == "spgist" || method == "gin" || method == "brin" {
-		idx, createErr := o.ctx.Catalog.CreateIndex(idxName, tbl, s.Columns, s.Unique, method, false)
+		idx, createErr := o.ctx.Catalog.CreateIndex(idxName, tbl, s.Columns, s.Unique, method, false, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		if createErr != nil {
 			return &ExecError{Code: "XX000", Pos: s.Pos(), Message: createErr.Error()}
 		}
@@ -6589,7 +6589,7 @@ func (o *ddlOp) execDropIndex(s *parser.DropIndexStmt) error {
 			})
 			continue
 		}
-		if err := o.ctx.Catalog.DropIndex(name); err != nil {
+		if err := o.ctx.Catalog.DropIndex(name, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); err != nil {
 			return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
 		}
 		flagInval = true
@@ -6658,10 +6658,11 @@ func ApplyPendingIndexDrops(ctx *Context, sess *BasicSession) {
 	if len(drops) == 0 {
 		return
 	}
+	dbOid := catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)
 	flagInval := false
 	droppedOIDs := make([]uint32, 0, len(drops))
 	for _, d := range drops {
-		if err := ctx.Catalog.DropIndex(d.Name); err != nil {
+		if err := ctx.Catalog.DropIndex(d.Name, dbOid); err != nil {
 			// Best-effort: the index may already be gone (e.g. a concurrent
 			// drop). Skip rather than abort an in-progress commit.
 			continue
@@ -7177,7 +7178,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					if !isIM {
 						return &ExecError{Code: "XX000", Pos: act.Pos(), Message: "catalog does not support index rename"}
 					}
-					if err := im.RenameIndex(oldObjName, newObjName); err != nil {
+					if err := im.RenameIndex(oldObjName, newObjName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); err != nil {
 						return &ExecError{Code: "42P07", Pos: act.Pos(), Message: err.Error()}
 					}
 					// Use ctx.Pool.LogChangeRecord, the same WAL-emission path
@@ -7850,7 +7851,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			oldBare := tbl.Name // capture before RenameTable updates tbl.Name
 			oldObjName := parser.ObjectName{Schema: tbl.Schema, Name: tbl.Name}
 			newObjName := parser.ObjectName{Schema: tbl.Schema, Name: newName}
-			if err := o.ctx.Catalog.RenameTable(oldObjName, newObjName); err != nil {
+			if err := o.ctx.Catalog.RenameTable(oldObjName, newObjName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); err != nil {
 				return &ExecError{Code: "42P07", Pos: act.Pos(), Message: err.Error()}
 			}
 			if tbl.IsSequence {
@@ -8951,7 +8952,7 @@ func (o *ddlOp) execAlterTableAddColumn(stmt *parser.AlterTableStmt, tbl *catalo
 // goopg v0 just treats "already exists" as a no-op so subsequent SELECTs
 // project the inherited column rather than erroring. M0097-0077.
 func (o *ddlOp) addColumnRecursive(tbl *catalog.Table, col catalog.Column, act parser.AlterTableAction, stmt *parser.AlterTableStmt, isRoot bool) error {
-	if _, err := o.ctx.Catalog.AddColumn(tbl, col); err != nil {
+	if _, err := o.ctx.Catalog.AddColumn(tbl, col, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); err != nil {
 		if !strings.Contains(strings.ToLower(err.Error()), "already exists") {
 			return &ExecError{Code: "XX000", Pos: stmt.Pos(), Message: err.Error()}
 		}
@@ -9831,7 +9832,7 @@ func (o *ddlOp) createExclusionIndexStub(pos int, idxName parser.ObjectName, tbl
 	if !ok {
 		return nil // unsupported catalog — silently skip
 	}
-	idx, err := im.CreateIndex(idxName, tbl, ec.Columns, false, "btree", false)
+	idx, err := im.CreateIndex(idxName, tbl, ec.Columns, false, "btree", false, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "already exists") {
 			return &ExecError{Code: "42P07", Pos: pos, Message: err.Error()}
@@ -9918,7 +9919,7 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 		}
 		cols[i] = col
 	}
-	idx, err := o.ctx.Catalog.CreateIndex(idxName, tbl, columns, unique, "btree", primary)
+	idx, err := o.ctx.Catalog.CreateIndex(idxName, tbl, columns, unique, "btree", primary, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "already exists") {
 			return &ExecError{Code: "42P07", Pos: pos, Message: err.Error()}
@@ -9975,7 +9976,7 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 		buildErr = o.bulkBuildBTree(idxRel, tbl, cols, unique, nullsNotDistinct, idxName.String(), pos)
 	}
 	if buildErr != nil {
-		_ = o.ctx.Catalog.DropIndex(idxName)
+		_ = o.ctx.Catalog.DropIndex(idxName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		o.ctx.Pool.InvalidateRel(idxRel)
 		_ = o.ctx.Pool.Manager().DropRelation(idxRel)
 		return buildErr
@@ -10028,7 +10029,7 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 			// disk btree pages remain — they are harmless without
 			// a catalog entry — but the next graceful SaveCatalog
 			// won't capture this index either.
-			_ = o.ctx.Catalog.DropIndex(idxName)
+			_ = o.ctx.Catalog.DropIndex(idxName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 			o.ctx.Pool.InvalidateRel(idxRel)
 			_ = o.ctx.Pool.Manager().DropRelation(idxRel)
 			return &ExecError{Code: "XX000", Pos: pos, Message: fmt.Sprintf("create-index WAL append: %v", err)}
@@ -13742,14 +13743,14 @@ func (o *ddlOp) execCreateSequence(s *parser.CreateSequenceStmt) error {
 // CREATE SEQUENCE path and the implicit IDENTITY-column registration so an
 // identity sequence is discoverable by pg_dump. M0110-0001 (DU-002 slice 120).
 func (o *ddlOp) createSeqCatalogTable(seqObjName parser.ObjectName, name string) {
-	CreateSequenceCatalogRelation(o.ctx.Catalog, seqObjName, name)
+	CreateSequenceCatalogRelation(o.ctx.Catalog, seqObjName, name, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 }
 
 // CreateSequenceCatalogRelation is the ddlOp-independent core of
 // createSeqCatalogTable, shared with startup replay
 // (internal/initdb/sequence_ddl_recovery.go) so a WAL-restored sequence is
 // discoverable via SELECT * FROM seq / pg_class after a restart too.
-func CreateSequenceCatalogRelation(cat catalog.Catalog, seqObjName parser.ObjectName, name string) {
+func CreateSequenceCatalogRelation(cat catalog.Catalog, seqObjName parser.ObjectName, name string, dbOid uint32) {
 	if _, ok := cat.(*catalog.InMemory); !ok {
 		return
 	}
@@ -13758,7 +13759,7 @@ func CreateSequenceCatalogRelation(cat catalog.Catalog, seqObjName parser.Object
 		{Name: "log_cnt", Type: catalog.Type{Name: "int8"}, Ordinal: 1},
 		{Name: "is_called", Type: catalog.Type{Name: "bool"}, Ordinal: 2},
 	}
-	seqTbl, err2 := cat.CreateTable(seqObjName, seqCols)
+	seqTbl, err2 := cat.CreateTable(seqObjName, seqCols, dbOid)
 	if err2 != nil {
 		return
 	}
@@ -14087,7 +14088,7 @@ func (o *ddlOp) execCreateMatView(s *parser.CreateMatViewStmt) error {
 		}
 		cols[i] = catalog.Column{Name: name, Type: sc.Type, Ordinal: i}
 	}
-	tbl, err := o.ctx.Catalog.CreateTable(s.Name, cols)
+	tbl, err := o.ctx.Catalog.CreateTable(s.Name, cols, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 	if err != nil {
 		return &ExecError{Code: "42P07", Pos: s.Pos(), Message: err.Error()}
 	}
@@ -14452,7 +14453,7 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 				}
 				// Drop each table in the schema.
 				for _, tbl := range tables {
-					if err := o.ctx.Catalog.DropTable(tbl); err != nil {
+					if err := o.ctx.Catalog.DropTable(tbl, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); err != nil {
 						return &ExecError{Code: "42P01", Pos: s.Pos(), Message: err.Error()}
 					}
 				}
@@ -14853,7 +14854,7 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 				_, _, _ = o.ctx.WAL.Append(wal.EncodeDropSequence(strings.ToLower(strings.TrimSpace(name.String()))))
 			}
 			// Remove the virtual catalog entry created for SELECT * FROM seq_name. M0097-0024.
-			_ = o.ctx.Catalog.DropTable(name)
+			_ = o.ctx.Catalog.DropTable(name, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		}
 		return nil
 	}
@@ -19631,7 +19632,7 @@ func (o *ddlOp) execAlterDropColumn(tbl *catalog.Table, act parser.AlterTableAct
 			o.ctx.Pool.InvalidateRel(idxRel)
 			_ = o.ctx.Pool.Manager().TruncateRelation(idxRel)
 			idxName := parser.ObjectName{Schema: idx.Schema, Name: idx.Name}
-			_ = o.ctx.Catalog.DropIndex(idxName)
+			_ = o.ctx.Catalog.DropIndex(idxName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		}
 	}
 	o.ctx.Pool.InvalidateRel(rel)

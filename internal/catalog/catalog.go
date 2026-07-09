@@ -1812,7 +1812,7 @@ type Catalog interface {
 	DropView(name parser.ObjectName, ifExists bool) error
 	SetTableStats(table *Table, stats *TableStats)
 	UpdateRelStats(table *Table, pages int, tuples int64)
-	AddColumn(table *Table, col Column) (*Column, error)
+	AddColumn(table *Table, col Column, dbOid ...uint32) (*Column, error)
 	DropTable(name parser.ObjectName, dbOid ...uint32) error
 	DropIndex(name parser.ObjectName, dbOid ...uint32) error
 	// TablesInSchema returns the names of all non-virtual user tables in the given
@@ -10859,14 +10859,14 @@ func (c *InMemory) CreateIndex(name parser.ObjectName, table *Table, cols []stri
 }
 
 // AddColumn appends one column to an existing table definition.
-func (c *InMemory) AddColumn(table *Table, col Column) (*Column, error) {
+func (c *InMemory) AddColumn(table *Table, col Column, dbOid ...uint32) (*Column, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if table == nil {
 		return nil, fmt.Errorf("table is nil")
 	}
 	k := key(parser.ObjectName{Schema: table.Schema, Name: table.Name})
-	t, ok := c.ns(DefaultDBOid).tables[k]
+	t, ok := c.ns(resolveDBOid(dbOid)).tables[k]
 	if !ok {
 		return nil, fmt.Errorf("relation %q does not exist", table.QualifiedName())
 	}
@@ -10906,28 +10906,29 @@ func (c *InMemory) RenameTable(old, new parser.ObjectName, dbOid ...uint32) erro
 // RegisterTable re-inserts a previously-dropped table back into the catalog.
 // Used when a TEMP TABLE shadows a permanent table and is then dropped —
 // the permanent table is restored by re-registering its saved *Table. M0097-0003.
-func (c *InMemory) RegisterTable(tbl *Table) {
+func (c *InMemory) RegisterTable(tbl *Table, dbOid ...uint32) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	k := strings.ToLower(tbl.Name)
 	if tbl.Schema != "" {
 		k = strings.ToLower(tbl.Schema) + "." + k
 	}
-	c.ns(DefaultDBOid).tables[k] = tbl
+	c.getOrCreateNS(resolveDBOid(dbOid)).tables[k] = tbl
 }
 
 // RestoreIndex re-inserts a previously-dropped index back into the catalog.
 // Used when ROLLBACK TO SAVEPOINT undoes a DROP TABLE that happened inside
 // a savepoint. M0097-0023.
-func (c *InMemory) RestoreIndex(idx *Index) {
+func (c *InMemory) RestoreIndex(idx *Index, dbOid ...uint32) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	k := key(parser.ObjectName{Schema: idx.Schema, Name: idx.Name})
-	c.ns(DefaultDBOid).indexes[k] = idx
-	if c.ns(DefaultDBOid).byTable[idx.Table.OID] == nil {
-		c.ns(DefaultDBOid).byTable[idx.Table.OID] = map[string]*Index{}
+	ns := c.getOrCreateNS(resolveDBOid(dbOid))
+	ns.indexes[k] = idx
+	if ns.byTable[idx.Table.OID] == nil {
+		ns.byTable[idx.Table.OID] = map[string]*Index{}
 	}
-	c.ns(DefaultDBOid).byTable[idx.Table.OID][k] = idx
+	ns.byTable[idx.Table.OID][k] = idx
 }
 
 // RenameIndex renames a catalog index entry from old to new, re-keying both

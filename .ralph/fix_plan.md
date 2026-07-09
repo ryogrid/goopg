@@ -5927,10 +5927,96 @@ mirroring M0119's ledger `status` column.
       `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
       failed transactions, all 3 pgbench workloads — exercises both
       plan-cache paths under real concurrent load). **Remaining M0122-0007
-      items:** 4d (route WRITE paths + `RelFileNode.DBOid`; must revisit the
-      `postgres`/`DefaultDBOid` dual-mirror shim once writes route by real
-      dbOid), then 4e (cross-cutting fixups + the `CREATE DATABASE ...
-      TEMPLATE` copy mechanism this epic exists to unblock).
+      items (before this loop):** 4d (route WRITE paths + `RelFileNode.DBOid`;
+      must revisit the `postgres`/`DefaultDBOid` dual-mirror shim once writes
+      route by real dbOid), then 4e (cross-cutting fixups + the `CREATE
+      DATABASE ... TEMPLATE` copy mechanism this epic exists to unblock).
+
+  - [x] `M0122-0007` follow-up 11 (2026-07-09, this loop) — **slice 4
+      sub-slice 4d-i (thread the connection's real dbOid through catalog
+      WRITE entry points), landed.** All ~24 executor-level catalog-write
+      call sites — `CreateTable` (`execCreateTable`, both `execCreateTableAs`
+      branches, `CreateSequenceCatalogRelation`), `CreateIndex`
+      (`execCreateIndex`'s gist/spgist/gin/brin branch, the btree bulk-build
+      path, `createExclusionIndexStub`), `DropTable`/`DropIndex`
+      (`execDropTable`, `execDropIndex`, `ApplyPendingIndexDrops`, the
+      btree-build/WAL-failure rollback paths, DROP SCHEMA CASCADE's table
+      loop, the sequence virtual-relation removal, the TEMP-table
+      shadow-drop), `RenameTable`/`RenameIndex` (both ALTER RENAME branches),
+      `AddColumn` (`addColumnRecursive`), and the savepoint-rollback restore
+      path (`RegisterTable`/`RestoreIndex` in `ProcessRollbackUndos` +
+      `execRollbackTo` + the TEMP-drop shadow-restore) — in
+      `internal/executor/operators_ddl.go` + `operators_tx.go` — now pass
+      `catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)` instead of omitting
+      the dbOid argument entirely (which every one of them defaults to
+      `DefaultDBOid` via `resolveDBOid`'s zero-length fallback). `AddColumn`,
+      `RegisterTable`, `RestoreIndex` gained their first `dbOid ...uint32`
+      parameter (4b-ii missed these three — nothing called them with one at
+      the time). `CreateSequenceCatalogRelation` (shared between the live
+      executor and `internal/initdb/sequence_ddl_recovery.go`'s WAL replay)
+      gained a *required* `dbOid uint32` parameter instead of variadic, since
+      its two callers need genuinely different values: the live path
+      resolves the connection's real dbOid, replay keeps passing
+      `catalog.DefaultDBOid` explicitly (startup replay has no per-connection
+      concept, unchanged behavior). `ApplyPendingIndexDrops` needed no
+      signature change — both its callers already had a `*Context` in scope,
+      so it resolves the dbOid internally. **Net effect:** a connection to a
+      genuinely distinct real database (one with its own `pg_database.oid`
+      from a prior `CREATE DATABASE`) now creates/drops/renames catalog
+      objects in its own namespace instead of the shared default; a
+      `"postgres"` connection's writes are bit-for-bit unchanged (the
+      `catalog.NamespaceDBOid` dual-mirror shim from 4c was deliberately left
+      untouched, confirmed via tpch-spotcheck + pgbench smoke both connecting
+      as `"postgres"` staying green with canonical row/transaction counts).
+      **Critical scope finding, discovered while writing this loop's own
+      tests, that defines 4d-ii's actual scope:** `ectx.Catalog` (every
+      executor operator's own catalog reference, assigned once in
+      `internal/server/dispatch.go:295` as the raw, unwrapped
+      `*catalog.InMemory`) is never wrapped in a `SearchPathCatalog` the way
+      `ectx.PlanCatalog` is — 4c only wired the *planner's* catalog
+      reference. So the 60+ bare `LookupTable`/`LookupIndex` calls in
+      `operators_ddl.go` alone (plus more across `operators_fk.go`,
+      `operators_cluster.go`, `operators_reindex.go`, `operators_sequence.go`,
+      `operators_storage.go`, `operators_pg_get_publication_tables.go`, and
+      every DML operator) still resolve only `DefaultDBOid`, completely
+      independent of `ctx.CurrentDatabaseOid` — meaning a table this loop's
+      fix correctly creates under a distinct dbOid is still invisible to
+      `execDropTable`/`execCreateIndex`/ALTER-TABLE/most DML, because their
+      own pre-mutation `LookupTable`/`LookupIndex` call never receives that
+      dbOid. Reproduced directly while writing
+      `internal/executor/ddl_write_dbid_routing_test.go`: a `CREATE TABLE ...
+      AS SELECT ... FROM <table-in-a-distinct-namespace>` failed to plan
+      (`relation does not exist`) until the test was rewritten to use a
+      `FROM`-less literal SELECT, because `o.planCatalog()` falls back to the
+      raw unwrapped `ctx.Catalog` whenever `ctx.PlanCatalog` is nil (true in
+      every unit-test harness; the live server path only gets `PlanCatalog`
+      wrapping from 4c's dispatch.go wiring). This is why only `CreateTable`
+      (which needs no prior dbOid-aware lookup to succeed) is
+      independently end-to-end-tested this loop — the other entry points'
+      dbOid threading is correct, tested-safe (zero behavior change for any
+      existing connection kind), but not yet independently exercisable with
+      a non-default dbOid until 4d-ii closes the lookup-side gap. New tests:
+      `TestExecCreateTableRoutesToConnectionRealDBOid`,
+      `TestExecCreateTableAsRoutesToConnectionRealDBOid`,
+      `TestExecCreateTablePostgresConnectionStaysOnDefaultDBOid`
+      (`internal/executor/ddl_write_dbid_routing_test.go`). Design:
+      `docs/design/0122-0018-per-database-catalog-namespace.md` 4d section
+      split into landed "4d-i" (this loop, full writeup) + planned "4d-ii"
+      (lookup-side threading + `RelFileNode.DBOid`, both itemized);
+      `docs/design/README.md` row updated. Deferral ledger: new row (2026-07-09,
+      M0122-0007 4d-i) recording the 4d-ii gap in full. Gates: `go build
+      ./...`/`go vet ./...` clean; `go test -race ./internal/catalog/...
+      ./internal/executor/...` PASS; `go test -short $(go list ./... | grep
+      -v /internal/testport)` (full repo, short mode) PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+      scripts/ralph-precommit-test.sh` PASS (0 failed transactions, all 3
+      pgbench workloads). **Remaining M0122-0007 items:** 4d-ii (thread
+      `catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)` through the
+      executor-operator-level `LookupTable`/`LookupIndex` call sites 4d-i's
+      write-routing needs to actually find its own objects, then wire
+      `RelFileNode.DBOid` at creation time), then 4e (cross-cutting fixups +
+      the `CREATE DATABASE ... TEMPLATE` copy mechanism this epic exists to
+      unblock).
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,
