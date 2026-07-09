@@ -1808,8 +1808,8 @@ type Catalog interface {
 	LookupIndex(name parser.ObjectName, dbOid ...uint32) (*Index, bool)
 	CreateTable(name parser.ObjectName, cols []Column, dbOid ...uint32) (*Table, error)
 	CreateIndex(name parser.ObjectName, table *Table, cols []string, unique bool, method string, primary bool, dbOid ...uint32) (*Index, error)
-	CreateView(name parser.ObjectName, cols []Column, aliases []string, query *parser.SelectStmt, orReplace bool) (*Table, error)
-	DropView(name parser.ObjectName, ifExists bool) error
+	CreateView(name parser.ObjectName, cols []Column, aliases []string, query *parser.SelectStmt, orReplace bool, dbOid ...uint32) (*Table, error)
+	DropView(name parser.ObjectName, ifExists bool, dbOid ...uint32) error
 	SetTableStats(table *Table, stats *TableStats)
 	UpdateRelStats(table *Table, pages int, tuples int64)
 	AddColumn(table *Table, col Column, dbOid ...uint32) (*Column, error)
@@ -1946,7 +1946,7 @@ type Catalog interface {
 	// DropTableACL forgets all privileges recorded for relOID (called when the
 	// relation is dropped so a recycled OID does not inherit stale grants).
 	DropTableACL(relOID uint32)
-	IndexesOnTable(table *Table) []*Index
+	IndexesOnTable(table *Table, dbOid ...uint32) []*Index
 	// AllIndexes returns every index in the catalog, sorted by OID. M0097-0023.
 	AllIndexes(dbOid ...uint32) []*Index
 	HasPrimaryKey(table *Table) bool
@@ -10998,18 +10998,19 @@ func (c *InMemory) RenameIndexDuringRecovery(schema, oldName, newName string) {
 // responsibility — passes already-typed []Column). orReplace
 // drops an existing same-name view first; CREATE VIEW (without
 // REPLACE) over an existing object is an error per upstream.
-func (c *InMemory) CreateView(name parser.ObjectName, cols []Column, aliases []string, query *parser.SelectStmt, orReplace bool) (*Table, error) {
+func (c *InMemory) CreateView(name parser.ObjectName, cols []Column, aliases []string, query *parser.SelectStmt, orReplace bool, dbOid ...uint32) (*Table, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	ns := c.getOrCreateNS(resolveDBOid(dbOid))
 	k := key(name)
-	if existing, ok := c.ns(DefaultDBOid).tables[k]; ok {
+	if existing, ok := ns.tables[k]; ok {
 		if !orReplace {
 			return nil, fmt.Errorf("relation %q already exists", k)
 		}
 		if existing.View == nil {
 			return nil, fmt.Errorf("%q is not a view", k)
 		}
-		delete(c.ns(DefaultDBOid).tables, k)
+		delete(ns.tables, k)
 	}
 	for i := range cols {
 		cols[i].Ordinal = i
@@ -11024,7 +11025,7 @@ func (c *InMemory) CreateView(name parser.ObjectName, cols []Column, aliases []s
 		ViewColumnAliases: append([]string(nil), aliases...),
 	}
 	c.nextOID++
-	c.ns(DefaultDBOid).tables[k] = t
+	ns.tables[k] = t
 	return t, nil
 }
 
@@ -11070,11 +11071,12 @@ func (c *InMemory) UpdateRelStats(table *Table, pages int, tuples int64) {
 
 // DropView removes a view from the catalog. Errors when the
 // name resolves to a non-view relation; respects ifExists.
-func (c *InMemory) DropView(name parser.ObjectName, ifExists bool) error {
+func (c *InMemory) DropView(name parser.ObjectName, ifExists bool, dbOid ...uint32) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	ns := c.ns(resolveDBOid(dbOid))
 	k := key(name)
-	t, ok := c.ns(DefaultDBOid).tables[k]
+	t, ok := ns.tables[k]
 	if !ok {
 		if ifExists {
 			return nil
@@ -11084,7 +11086,7 @@ func (c *InMemory) DropView(name parser.ObjectName, ifExists bool) error {
 	if t.View == nil {
 		return fmt.Errorf("%q is not a view", k)
 	}
-	delete(c.ns(DefaultDBOid).tables, k)
+	delete(ns.tables, k)
 	return nil
 }
 
@@ -17212,13 +17214,13 @@ func (c *InMemory) DropIndex(name parser.ObjectName, dbOid ...uint32) error {
 }
 
 // IndexesOnTable returns indexes whose base relation is table.
-func (c *InMemory) IndexesOnTable(table *Table) []*Index {
+func (c *InMemory) IndexesOnTable(table *Table, dbOid ...uint32) []*Index {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	if table == nil {
 		return nil
 	}
-	idxs := c.ns(DefaultDBOid).byTable[table.OID]
+	idxs := c.ns(resolveDBOid(dbOid)).byTable[table.OID]
 	out := make([]*Index, 0, len(idxs))
 	for _, idx := range idxs {
 		out = append(out, idx)
@@ -17837,11 +17839,11 @@ func (c *InMemory) ClearPgClassRowMarksForXID(xid uint32) {
 
 // AllUserViews returns deep copies of every user-created non-materialized view.
 // Used by DROP VIEW CASCADE dependency scanning. M0097-0021.
-func (c *InMemory) AllUserViews() []*Table {
+func (c *InMemory) AllUserViews(dbOid ...uint32) []*Table {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	out := make([]*Table, 0)
-	for _, t := range c.ns(DefaultDBOid).tables {
+	for _, t := range c.ns(resolveDBOid(dbOid)).tables {
 		if !t.Virtual || t.View == nil || t.IsMatView {
 			continue
 		}
@@ -17855,11 +17857,11 @@ func (c *InMemory) AllUserViews() []*Table {
 
 // AllUserMatViews returns deep copies of every user-created materialized view.
 // Used by DROP TABLE/VIEW/MATERIALIZED VIEW CASCADE dependency scanning.
-func (c *InMemory) AllUserMatViews() []*Table {
+func (c *InMemory) AllUserMatViews(dbOid ...uint32) []*Table {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	out := make([]*Table, 0)
-	for _, t := range c.ns(DefaultDBOid).tables {
+	for _, t := range c.ns(resolveDBOid(dbOid)).tables {
 		if !t.IsMatView {
 			continue
 		}

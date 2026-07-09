@@ -1,6 +1,6 @@
 # Per-database catalog namespace (M0122-0007 slice 4)
 
-Status: accepted (sub-slices 4a, 4b-i, 4b-ii, 4c, 4d-i, 4d-ii-part-1, and 4d-ii-part-2a landed; 4d-ii-part-2b, 4e planned)
+Status: accepted (sub-slices 4a, 4b-i, 4b-ii, 4c, 4d-i, 4d-ii-part-1, and 4d-ii-part-2a landed; 4d-ii-part-2b item 3's own-signature half landed, its `planCatalog()` half + items 1-2 + 4e planned)
 Date: 2026-07-09
 Supersedes: none — extends the "Still open" note in
 `0122-0017-database-ddl-drop-guards.md` and the deferral-ledger rows dated
@@ -632,14 +632,28 @@ Two remaining pieces (renumbered from the original "4d-ii-part-2"; part 2a's
    `ResolveDatabaseOid("postgres")` in every context; audit `NewInMemory`'s
    `dbOid: DefaultDBOid` seed and the `base/1/` + `base/5/` mirror before
    changing what oid live relations are created under.
-3. **New scope surfaced by 4d-ii-part-2a's finding above:** make
-   `catalog.InMemory.CreateView`, `AllUserViews`, `AllUserMatViews`, and
-   `IndexesOnTable` dbOid-aware (each currently hardcodes
-   `c.ns(DefaultDBOid)` with no dbOid parameter), and separately make
-   `o.planCatalog()`'s FROM-table resolution dbOid-aware — otherwise CREATE
-   VIEW/CREATE INDEX-visibility/dependency-walk correctness on a
-   distinct-dbOid connection stays broken regardless of how many
-   `LookupTable`/`LookupIndex` call sites get an explicit dbOid argument.
+3. **New scope surfaced by 4d-ii-part-2a's finding above — own-signature half
+   LANDED this loop, `planCatalog()` half still planned:**
+   `catalog.InMemory.CreateView`/`DropView`/`AllUserViews`/`AllUserMatViews`/
+   `IndexesOnTable` each gained a `dbOid ...uint32` parameter (mirroring the
+   4b-ii variadic pattern), and every call site in `operators_ddl.go` that
+   references them now threads `catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)`
+   — this includes `execCreateView`, `execDropOneView`, `execDropOneMatView`,
+   `execDropTable`'s RESTRICT/CASCADE dependency scans, and DROP SCHEMA
+   CASCADE's view collection. Verified via two new regression tests
+   (`TestExecCreateViewRoutesToConnectionRealDBOid`,
+   `TestIndexesOnTableFindsOwnDistinctDBOidTable` in
+   `internal/executor/ddl_write_dbid_routing_test.go`), each using a no-FROM
+   view body to avoid the still-open gap below. **Still open:**
+   `o.planCatalog()`'s FROM-table resolution is not dbOid-aware —
+   `planner.Plan` receives a bare `catalog.Catalog` and calls `LookupTable`
+   with no dbOid argument internally, so `CREATE VIEW ... FROM <table>` on a
+   distinct-dbOid connection still resolves the FROM table against
+   DefaultDBOid. This requires giving the planner package access to a
+   per-connection dbOid, a larger and structurally different change (the
+   planner currently receives only a bare `catalog.Catalog`, no `Context`).
+   See the deferral ledger's `AI-20260710-011513-001` / 4d-ii-part-2b-item-1
+   row for the exact resume point.
 
 ### 4e — Cross-cutting fixups + the original motivation (planned)
 

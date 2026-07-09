@@ -6120,6 +6120,47 @@ mirroring M0119's ledger `status` column.
       `RelFileNode.DBOid`), then 4e (cross-cutting fixups + the
       `CREATE DATABASE ... TEMPLATE` copy mechanism this epic exists to
       unblock).
+  - [x] `M-NIGHTLY (AI-20260710-011513-001)` / `M0122-0007` follow-up 14
+      (2026-07-10, this loop) — **fixed the nightly-CI build regression**
+      (`make build` failing in preflight, `ci/logs/action-items.md`). Root
+      cause: the tree at loop start already carried uncommitted, mid-flight
+      WIP from an interrupted prior loop iteration that had started
+      4d-ii-part-2b item 3's own-signature half — it added
+      `dbOid ...uint32` params to `catalog.InMemory.CreateView`/`DropView`/
+      `AllUserViews`/`AllUserMatViews`/`IndexesOnTable` and updated
+      `viewsDependingOnView`/`viewsDependingOnTable`/
+      `matViewsDependingOnRelation` to accept+forward a `dbOid` param, but
+      left 6 of their own call sites in `operators_ddl.go`
+      (`execDropOneView`/`execDropOneMatView`/`execDropTable`'s
+      RESTRICT/CASCADE dependency-scan blocks) still calling the old arity
+      — `go build` failed with "not enough arguments in call to
+      matViewsDependingOnRelation/viewsDependingOnTable". Completed the
+      threading at all 6 sites via
+      `catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)`, then by
+      inspection found + fixed 2 more sites that compiled fine (the new
+      param is variadic-optional) but were still silently hardcoded to
+      DefaultDBOid: `execDropOneMatView`'s own `DropView` call and DROP
+      SCHEMA CASCADE's `AllUserViews()` call. Added 2 new regression tests
+      (`TestExecCreateViewRoutesToConnectionRealDBOid`,
+      `TestIndexesOnTableFindsOwnDistinctDBOidTable` in
+      `internal/executor/ddl_write_dbid_routing_test.go`), each using a
+      no-FROM view body to exercise the fix without hitting the still-open
+      `o.planCatalog()` FROM-table-resolution gap. Design doc
+      (`docs/design/0122-0018-per-database-catalog-namespace.md`) 4d-ii-
+      part-2b item 3 updated to reflect the own-signature half as landed;
+      `docs/design/README.md` row extended; deferral ledger row appended
+      (`AI-20260710-011513-001` / 4d-ii-part-2b item 1) documenting the
+      still-open `planCatalog()` gap and the ~50-site cross-file
+      `IndexesOnTable`/`AllUserViews` sweep (item 2) as the next resume
+      points. Gates: `go build ./...`/`go vet ./...` clean; `go test -race
+      ./internal/catalog/... ./internal/executor/...` PASS; `go test
+      ./internal/planner/...` PASS; `go test -short $(go list ./... | grep
+      -v /internal/testport)` (full repo, short mode) PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33, ran twice — before
+      and after the 2 additional non-build-breaking call-site fixes);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed transactions, all 3 pgbench workloads, ran twice for the same
+      reason).
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,

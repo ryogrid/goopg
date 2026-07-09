@@ -261,3 +261,78 @@ func TestExecAttrACLChangeFindsOwnDistinctDBOidTable(t *testing.T) {
 		t.Fatal("AttrACLText is empty after GRANT SELECT (id) ON base TO alice — the column privilege was not recorded")
 	}
 }
+
+// TestExecCreateViewRoutesToConnectionRealDBOid covers M0122-0007 slice
+// 4d-ii-part-2b item (1): catalog.InMemory.CreateView/DropView previously had
+// no dbOid parameter at all and always wrote/read c.ns(DefaultDBOid), which
+// was a bigger gap than the LookupTable/LookupIndex sweep — a CREATE VIEW
+// issued on a connection bound to a genuinely distinct dbOid always landed
+// under DefaultDBOid regardless of ctx.CurrentDatabaseOid (a namespace
+// collision, not merely a lookup miss). The view body is a literal SELECT
+// (no FROM) to isolate this fix from the separate, still-open gap that
+// o.planCatalog() itself is not dbOid-aware for FROM-table resolution
+// (tracked in the deferral ledger).
+func TestExecCreateViewRoutesToConnectionRealDBOid(t *testing.T) {
+	const otherDBOid = 4747
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+	ctx.CurrentDatabaseOid = otherDBOid
+
+	if err := runDDL(t, ctx, "CREATE VIEW v AS SELECT 1 AS id"); err != nil {
+		t.Fatalf("CREATE VIEW: %v", err)
+	}
+
+	name := parser.ObjectName{Schema: "public", Name: "v"}
+	if _, ok := ctx.Catalog.LookupTable(name); ok {
+		t.Fatal("LookupTable(DefaultDBOid) unexpectedly found a view created under a distinct connection dbOid")
+	}
+	tbl, ok := ctx.Catalog.LookupTable(name, otherDBOid)
+	if !ok {
+		t.Fatalf("LookupTable(dbOid=%d) did not find the view created by this connection", otherDBOid)
+	}
+	if tbl.View == nil {
+		t.Fatal("found relation is not a view")
+	}
+
+	if err := runDDL(t, ctx, "DROP VIEW v"); err != nil {
+		t.Fatalf("DROP VIEW: %v", err)
+	}
+	if _, ok := ctx.Catalog.LookupTable(name, otherDBOid); ok {
+		t.Fatal("LookupTable(otherDBOid) still finds the view after DROP VIEW on the same connection")
+	}
+}
+
+// TestIndexesOnTableFindsOwnDistinctDBOidTable covers the same 4d-ii-part-2b
+// item (1) gap for catalog.InMemory.IndexesOnTable: before this fix it always
+// scanned c.ns(DefaultDBOid).byTable, so an index on a table created under a
+// genuinely distinct dbOid was unreachable via IndexesOnTable — the exact
+// blocker noted in the design doc as breaking the collectViewPKDeps/
+// addGroupByPKDeps cluster's white-box test.
+func TestIndexesOnTableFindsOwnDistinctDBOidTable(t *testing.T) {
+	const otherDBOid = 4848
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+	ctx.CurrentDatabaseOid = otherDBOid
+
+	if err := runDDL(t, ctx, "CREATE TABLE widgets (id int4)"); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	if err := runDDL(t, ctx, "CREATE INDEX widgets_id_idx ON widgets (id)"); err != nil {
+		t.Fatalf("CREATE INDEX: %v", err)
+	}
+
+	tbl, ok := ctx.Catalog.LookupTable(parser.ObjectName{Schema: "public", Name: "widgets"}, otherDBOid)
+	if !ok {
+		t.Fatal("LookupTable(otherDBOid) did not find the table")
+	}
+	if idxs := ctx.Catalog.IndexesOnTable(tbl); len(idxs) != 0 {
+		t.Fatalf("IndexesOnTable(tbl) [defaults to DefaultDBOid] unexpectedly found %d indexes for a table created under a distinct connection dbOid", len(idxs))
+	}
+	idxs := ctx.Catalog.IndexesOnTable(tbl, otherDBOid)
+	if len(idxs) != 1 {
+		t.Fatalf("IndexesOnTable(tbl, otherDBOid)=%d indexes, want 1", len(idxs))
+	}
+	if idxs[0].Name != "widgets_id_idx" {
+		t.Fatalf("IndexesOnTable(tbl, otherDBOid)[0].Name=%q, want widgets_id_idx", idxs[0].Name)
+	}
+}

@@ -4935,7 +4935,7 @@ func (o *ddlOp) execCreateView(s *parser.CreateViewStmt) error {
 				oldViewOID = existing.OID
 				oldViewOwner = existing.Owner
 			}
-			_ = im.DropView(s.Name, true) // remove old def so plan can't cycle back to it
+			_ = im.DropView(s.Name, true, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) // remove old def so plan can't cycle back to it
 		}
 	}
 	if viewPlan, planErr := planner.Plan(s.Query, o.planCatalog()); planErr == nil {
@@ -4995,7 +4995,7 @@ func (o *ddlOp) execCreateView(s *parser.CreateViewStmt) error {
 			}
 		}
 	}
-	vt, err := o.ctx.Catalog.CreateView(s.Name, cols, s.Columns, s.Query, s.OrReplace)
+	vt, err := o.ctx.Catalog.CreateView(s.Name, cols, s.Columns, s.Query, s.OrReplace, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 	if err != nil {
 		return &ExecError{Code: "42P07", Pos: s.Pos(), Message: err.Error()}
 	}
@@ -5119,7 +5119,7 @@ func collectAllViewTransitiveDeps(im *catalog.InMemory, startName parser.ObjectN
 		}
 
 		// Views depending on curr.
-		for _, vn := range viewsDependingOnView(im, curr) {
+		for _, vn := range viewsDependingOnView(im, curr, dbOid) {
 			k := vn.String()
 			if !seen[k] {
 				seen[k] = true
@@ -5129,7 +5129,7 @@ func collectAllViewTransitiveDeps(im *catalog.InMemory, startName parser.ObjectN
 		}
 
 		// MatViews depending on curr.
-		for _, mvn := range matViewsDependingOnRelation(im, curr) {
+		for _, mvn := range matViewsDependingOnRelation(im, curr, dbOid) {
 			k := mvn.String()
 			if !seen[k] {
 				seen[k] = true
@@ -5199,7 +5199,7 @@ func (o *ddlOp) execDropOneView(name parser.ObjectName, ifExists bool, behavior 
 	// Notices are emitted by the top-level caller (execDropView), not here.
 	if behavior == parser.DropCascade {
 		if im, ok2 := o.ctx.Catalog.(*catalog.InMemory); ok2 {
-			deps := viewsDependingOnView(im, name)
+			deps := viewsDependingOnView(im, name, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 			for _, depName := range deps {
 				if !dropped[depName.String()] {
 					if err := o.execDropOneView(depName, true, behavior, pos, dropped); err != nil {
@@ -5207,7 +5207,7 @@ func (o *ddlOp) execDropOneView(name parser.ObjectName, ifExists bool, behavior 
 					}
 				}
 			}
-			matDeps := matViewsDependingOnRelation(im, name)
+			matDeps := matViewsDependingOnRelation(im, name, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 			for _, depName := range matDeps {
 				if !dropped[depName.String()] {
 					if err := o.execDropOneMatView(depName, true, behavior, pos, dropped, false); err != nil {
@@ -5218,7 +5218,7 @@ func (o *ddlOp) execDropOneView(name parser.ObjectName, ifExists bool, behavior 
 		}
 	}
 
-	if err := o.ctx.Catalog.DropView(name, ifExists); err != nil {
+	if err := o.ctx.Catalog.DropView(name, ifExists, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); err != nil {
 		if ifExists {
 			o.ctx.AddNotice(fmt.Sprintf("view %q does not exist, skipping", name.String()))
 			return nil
@@ -5274,7 +5274,7 @@ func (o *ddlOp) execDropOneMatView(name parser.ObjectName, ifExists bool, behavi
 	// Only emit notices when emitNotice=true (top-level DROP MATERIALIZED VIEW only).
 	if behavior == parser.DropCascade {
 		if im, ok2 := o.ctx.Catalog.(*catalog.InMemory); ok2 {
-			matDeps := matViewsDependingOnRelation(im, name)
+			matDeps := matViewsDependingOnRelation(im, name, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 			if emitNotice {
 				// Emit cascade notice before dropping.
 				newDeps := make([]parser.ObjectName, 0, len(matDeps))
@@ -5306,7 +5306,7 @@ func (o *ddlOp) execDropOneMatView(name parser.ObjectName, ifExists bool, behavi
 		}
 	}
 
-	if err := o.ctx.Catalog.DropView(name, ifExists); err != nil {
+	if err := o.ctx.Catalog.DropView(name, ifExists, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); err != nil {
 		if ifExists {
 			o.ctx.AddNotice(fmt.Sprintf("materialized view %q does not exist, skipping", name.String()))
 			return nil
@@ -5352,10 +5352,10 @@ func (o *ddlOp) execDropOneMatView(name parser.ObjectName, ifExists bool, behavi
 
 // viewsDependingOnView returns all views whose body directly references the given view name.
 // Used by DROP VIEW CASCADE to find dependent views. M0097-0021.
-func viewsDependingOnView(im *catalog.InMemory, target parser.ObjectName) []parser.ObjectName {
+func viewsDependingOnView(im *catalog.InMemory, target parser.ObjectName, dbOid uint32) []parser.ObjectName {
 	targetName := target.Name
 	var deps []parser.ObjectName
-	for _, t := range im.AllUserViews() {
+	for _, t := range im.AllUserViews(dbOid) {
 		if t.View == nil || t.IsMatView {
 			continue
 		}
@@ -5371,10 +5371,10 @@ func viewsDependingOnView(im *catalog.InMemory, target parser.ObjectName) []pars
 
 // matViewsDependingOnRelation returns the names of materialized views that directly reference
 // the given table/view/matview name in their SELECT body. Used by CASCADE drops.
-func matViewsDependingOnRelation(im *catalog.InMemory, target parser.ObjectName) []parser.ObjectName {
+func matViewsDependingOnRelation(im *catalog.InMemory, target parser.ObjectName, dbOid uint32) []parser.ObjectName {
 	targetName := strings.ToLower(target.Name)
 	var deps []parser.ObjectName
-	for _, t := range im.AllUserMatViews() {
+	for _, t := range im.AllUserMatViews(dbOid) {
 		if t.View == nil {
 			continue
 		}
@@ -5556,8 +5556,8 @@ func (o *ddlOp) execDropTable(s *parser.DropTableStmt) error {
 		if s.Behavior != parser.DropCascade {
 			if im, ok2 := o.ctx.Catalog.(*catalog.InMemory); ok2 {
 				var depDescs []string
-				directViews := viewsDependingOnTable(im, name)
-				directMVs := matViewsDependingOnRelation(im, name)
+				directViews := viewsDependingOnTable(im, name, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+				directMVs := matViewsDependingOnRelation(im, name, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 				for _, vn := range directViews {
 					depDescs = append(depDescs, fmt.Sprintf("view %s depends on table %s", vn.String(), name.String()))
 				}
@@ -5609,7 +5609,7 @@ func (o *ddlOp) execDropTable(s *parser.DropTableStmt) error {
 				seen := map[string]bool{}
 
 				// Direct view dependents + all their transitive view/matview deps via BFS.
-				viewNames := viewsDependingOnTable(im, name)
+				viewNames := viewsDependingOnTable(im, name, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 				for _, vn := range viewNames {
 					k := vn.String()
 					if !seen[k] {
@@ -5626,7 +5626,7 @@ func (o *ddlOp) execDropTable(s *parser.DropTableStmt) error {
 					}
 				}
 				// Direct materialized view dependents + all their transitive deps via BFS.
-				matViewNames := matViewsDependingOnRelation(im, name)
+				matViewNames := matViewsDependingOnRelation(im, name, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 				for _, mvn := range matViewNames {
 					k := mvn.String()
 					if !seen[k] {
@@ -5702,11 +5702,11 @@ func (o *ddlOp) execDropTable(s *parser.DropTableStmt) error {
 // viewsDependingOnTable returns the names of views that directly reference tableName
 // in their FROM clause. Used by DROP TABLE CASCADE to cascade drops.
 // Only checks views in the same schema as the dropped table for performance.
-func viewsDependingOnTable(im *catalog.InMemory, tableName parser.ObjectName) []parser.ObjectName {
+func viewsDependingOnTable(im *catalog.InMemory, tableName parser.ObjectName, dbOid uint32) []parser.ObjectName {
 	var deps []parser.ObjectName
 	tblLower := strings.ToLower(tableName.Name)
 	tblSchema := strings.ToLower(tableName.Schema)
-	for _, tbl := range im.AllUserViews() {
+	for _, tbl := range im.AllUserViews(dbOid) {
 		if tbl.View == nil {
 			continue
 		}
@@ -14413,7 +14413,7 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 				var droppedViews []string
 				var droppedOpClasses []string
 				if im2, ok3 := o.ctx.Catalog.(*catalog.InMemory); ok3 {
-					for _, v := range im2.AllUserViews() {
+					for _, v := range im2.AllUserViews(catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 						if strings.EqualFold(v.Schema, schemaName) {
 							droppedViews = append(droppedViews, v.Name)
 						}
