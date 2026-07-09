@@ -5682,6 +5682,54 @@ mirroring M0119's ledger `status` column.
       "resume point" column for the exact fix shape); the larger
       `splitMu` removal / Lehman-Yao crab-walk items in this bucket
       remain untouched by this loop.
+      **2026-07-09 loop (same day, continuation) — fixed the
+      `applyParentDownlinkRemoval` index-drift race named above.**
+      Changed the function's signature from
+      `(parentBlk storage.BlockNumber, removeSlot uint16, lsn
+      storage.LSN)` to `(parentBlk, childBlk storage.BlockNumber, lsn
+      storage.LSN)`: instead of trusting a slot index resolved well
+      before the removal actually runs (WAL emission + sibling-relink
+      writes happen in between), it now re-scans the parent's CURRENT
+      item list for `it.ptr.Block == childBlk` under the same `pinW`
+      that performs the removal — mirrors the §2.5 sibling-relink fix
+      pattern and `findParentDownlinkByBlock`'s existing by-block
+      matching, self-correcting if a cross-connection split raced in,
+      idempotent no-op if the downlink was already removed by a racing
+      unlink. Both call sites (`unlinkEmptyLeaf`'s and
+      `unlinkEmptyInternalPage`'s WAL-emitting paths, lines ~408/~981)
+      now pass the child block (`leaf.blk`/`blk`) instead of
+      `req.ParentRemoveSlot`; the WAL record's own `ParentRemoveSlot`
+      field is untouched (crash replay is single-threaded, so the
+      stale-index concern is live-apply-only). New regression test
+      `TestApplyParentDownlinkRemovalIgnoresStaleIndex`
+      (`internal/access/btree/btree_vacuum_parent_downlink_race_test.go`)
+      deterministically reproduces the drift (no goroutines needed):
+      resolves a target leaf's parent slot on a real 2-level tree
+      (`BulkCreate`, n=3000), splices a synthetic live downlink into
+      the front of the parent's item list (shifting the target's true
+      position by one, so the pre-splice stale slot now points at a
+      different, live "victim" child), then invokes the fixed removal
+      keyed on the target's block and asserts: the target's downlink is
+      gone, the victim's downlink survives (proving no
+      wrong-item-by-stale-index deletion), and the spliced item
+      survives untouched. Confirmed non-vacuous via `git stash` on
+      `btree_vacuum.go` alone — the test fails to even COMPILE pre-fix
+      (`cannot use targetBlk (BlockNumber) as uint16 value`), a stronger
+      signal than a runtime assertion failure. Design doc
+      `docs/design/0055-0003-btree-page-deletion-and-recycling-protocol.md`
+      new §2.6; `docs/design/README.md` row updated. Deferral ledger row
+      dated 2026-07-09 (`M0122-0010`, "applyParentDownlinkRemoval...")
+      flipped to `resolved`. Gates: `go build ./...` clean; `go test
+      ./internal/access/btree/... ./internal/amcheck/...
+      ./internal/executor/...` PASS; `go test -race
+      ./internal/access/btree/...` PASS; `scripts/tpch-spotcheck.sh`
+      PASS (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+      scripts/ralph-precommit-test.sh` PASS (0 failed txns, all 3
+      workloads). **Standing gap unchanged (not this loop's scope):**
+      `bt.splitMu` is still not a real cross-connection mutex — this
+      fix (like §2.5's) tolerates that by re-validating at the
+      individual write site; the larger `splitMu` removal / Lehman-Yao
+      crab-walk items in this bucket remain untouched.
 - [x] **M0122-0011 — Query optimizer & TPC-H/HammerDB correctness** (~17). Anti/
       semi-join unnesting (NOT IN), Q8/Q9/Q21 row-count fixes; several blocked on
       the slot/TupleSlot pipeline (see M0122-0012). Gate: TPC-H spot-check.

@@ -223,24 +223,19 @@ func (bt *BTree) findLeftmostLeaf() (storage.BlockNumber, error) {
 // harnesses without a WAL writer).
 func (bt *BTree) unlinkEmptyLeaf(leaf emptyLeafInfo) error {
 	// M-NIGHTLY (AI-20260706-201855-001): resolveParentDownlink
-	// below captures the parent's downlink SLOT INDEX, and
-	// applyParentDownlinkRemoval later removes-by-index against
-	// that same slot. Between the two, a concurrent Insert-driven
+	// below captures the parent's downlink slot index for the WAL
+	// record, well before applyParentDownlinkRemoval actually
+	// mutates the page. Between the two, a concurrent Insert-driven
 	// split (Insert/finishSplit, both under splitMu) can insert a
 	// new downlink into the SAME parent page ahead of the captured
-	// slot, shifting every later index right — so the later
-	// removal deletes whatever now sits at that index (some OTHER
-	// live child's downlink), not leaf.blk's. The orphaned live
-	// child stays reachable (nothing pointed it out of the tree),
-	// but leaf.blk's own downlink is never removed, so it survives
-	// in the parent even after recycleBlock() below returns
-	// leaf.blk to the free list for reuse by an unrelated split —
-	// a later reader following the parent's stale downlink lands
-	// on whatever new content that split wrote, surfacing as
-	// "btree: item length mismatch". Splits already serialise
-	// every OTHER structural mutation through splitMu; taking it
-	// here too closes the gap so the parent's slot layout cannot
-	// shift between resolve and remove.
+	// slot, shifting every later index right. Splits already
+	// serialise every OTHER structural mutation through splitMu;
+	// taking it here too closes the gap for splits originating from
+	// THIS *BTree Go instance. (M0122-0010: a split from a DIFFERENT
+	// connection's instance is NOT covered by splitMu — see
+	// applyParentDownlinkRemoval's own doc comment for how that
+	// cross-connection case is closed independently, by re-locating
+	// the downlink by block identity instead of trusting the index.)
 	bt.splitMu.Lock()
 	defer bt.splitMu.Unlock()
 
@@ -405,7 +400,7 @@ func (bt *BTree) unlinkEmptyLeaf(leaf emptyLeafInfo) error {
 		}
 	}
 	if req.HasParent {
-		if err := bt.applyParentDownlinkRemoval(req.ParentBlk, req.ParentRemoveSlot, lsn); err != nil {
+		if err := bt.applyParentDownlinkRemoval(req.ParentBlk, leaf.blk, lsn); err != nil {
 			return err
 		}
 	}
@@ -617,10 +612,27 @@ func (bt *BTree) applyOpaqueMutation(blk storage.BlockNumber, lsn storage.LSN, m
 	return nil
 }
 
-// applyParentDownlinkRemoval rewrites the parent's items list
-// excluding the removeSlot entry, mirroring
+// applyParentDownlinkRemoval rewrites the parent's items list,
+// removing the downlink to childBlk, mirroring
 // `removeDownlinkFromParent`'s leftmost-key adoption. (M0079-0003.)
-func (bt *BTree) applyParentDownlinkRemoval(parentBlk storage.BlockNumber, removeSlot uint16, lsn storage.LSN) error {
+//
+// M0122-0010 (AI-20260709-010336-082 follow-up): the caller resolves
+// a slot INDEX well before this runs (WAL record emission plus the
+// sibling-relink writes above it in unlinkEmptyLeaf/
+// unlinkEmptyInternalPage both happen in between). bt.splitMu only
+// serialises structural writes within THIS *BTree Go instance, not
+// across connections (each backend opens its own instance per
+// statement — see btree.go's splitMu doc comment), so a concurrent
+// Insert-driven split on a DIFFERENT connection's instance can splice
+// a new downlink into parentBlk ahead of the captured slot, shifting
+// every later index right. Removing by trusted index would then
+// delete an unrelated LIVE child's downlink instead of childBlk's.
+// Re-locate the target by block identity under this same pinW —
+// mirrors findParentDownlinkByBlock's matching, self-correcting if a
+// split raced, a no-op if the downlink was already removed by a
+// racing unlink (findParentDownlinkByBlock's twin, WAL-replay
+// idempotency case).
+func (bt *BTree) applyParentDownlinkRemoval(parentBlk, childBlk storage.BlockNumber, lsn storage.LSN) error {
 	s, err := bt.pinW(parentBlk)
 	if err != nil {
 		return err
@@ -630,13 +642,19 @@ func (bt *BTree) applyParentDownlinkRemoval(parentBlk storage.BlockNumber, remov
 		bt.unpinW(s)
 		return err
 	}
-	if removeSlot == 0 || int(removeSlot) > len(items) {
+	idx := -1
+	for i, it := range items {
+		if it.ptr.Block == childBlk {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
 		// Already removed; idempotent no-op.
 		bt.pool.MarkDirtyWithLSNLocked(s, lsn)
 		bt.unpinW(s)
 		return nil
 	}
-	idx := int(removeSlot) - 1
 	newItems := make([]item, 0, len(items)-1)
 	newItems = append(newItems, items[:idx]...)
 	newItems = append(newItems, items[idx+1:]...)
@@ -955,7 +973,7 @@ func (bt *BTree) unlinkEmptyInternalPage(blk, prev, next, parentBlk storage.Bloc
 			return walkErr
 		}
 	}
-	if err := bt.applyParentDownlinkRemoval(req.ParentBlk, req.ParentRemoveSlot, lsn); err != nil {
+	if err := bt.applyParentDownlinkRemoval(req.ParentBlk, blk, lsn); err != nil {
 		return err
 	}
 	if err := bt.applyOpaqueMutation(req.LeafBlk, lsn, func(p storage.Page) {
