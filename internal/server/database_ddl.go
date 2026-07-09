@@ -22,13 +22,21 @@ package server
 //     `internal/initdb/open.go` re-applies these records during
 //     startup.
 //
-// Multi-database storage isolation (a real per-database file
-// namespace) is intentionally NOT in scope here — every relation
-// still routes through `catalog.DefaultDBOid`. The HammerDB TPC-H
-// workflow needs (a) `pg_database` to list `tpch` so the
-// existence-probe `SELECT 1 FROM pg_database WHERE datname='tpch'`
-// returns a row after a crash, and (b) connections to `tpch` to
-// succeed. Both are satisfied without per-database storage isolation.
+// Multi-database storage isolation was NOT in scope when this file was
+// first written — every relation routed through `catalog.DefaultDBOid`
+// regardless of which database a connection attached to. That has since
+// changed (M0122-0007, design docs/design/0122-0018-per-database-catalog-
+// namespace.md): each CREATE DATABASE now allocates its own real dbOid
+// (DatabaseOid), a connection's DML/DDL keys off its OWN database's
+// catalog.tableNamespace and its own base/<dbOid> physical directory
+// (internal/storage/smgr.go), and CREATE DATABASE ... TEMPLATE is validated
+// against the template's real per-database relation set
+// (resolveCreateDatabaseTemplate below) rather than silently ignored. What
+// remains unimplemented is the actual TEMPLATE relation-copy mechanism
+// itself (see resolveCreateDatabaseTemplate's and
+// createDatabasePhysicalDirectory's doc comments) — everything else in this
+// file's original scope note (pg_database surviving a crash, connections to
+// a recovered database succeeding) still holds.
 
 import (
 	"errors"
@@ -384,9 +392,11 @@ func unquoteSQLStringLiteral(s string) (string, bool) {
 //   create database <name> [...]
 //   drop   database [if exists] <name> [...]
 //
-// Any trailing options (TEMPLATE, ENCODING, OWNER, …) are ignored —
-// goopg has no per-database storage to apply them to and HammerDB
-// does not pass any.
+// Any trailing options other than TEMPLATE (ENCODING, OWNER, …) are still
+// ignored — goopg has no per-database storage to apply them to and HammerDB
+// does not pass any. TEMPLATE is extracted separately by
+// createDatabaseTemplateName and validated by resolveCreateDatabaseTemplate
+// (M0122-0007 4e).
 func classifyDatabaseDDL(sql string) (databaseDDLKind, string) {
 	s := strings.TrimSpace(sql)
 	for strings.HasSuffix(s, ";") {
@@ -423,30 +433,79 @@ func dropDatabaseHasForce(sql string) bool {
 	return dropDatabaseForceRe.MatchString(strings.ToLower(s))
 }
 
+// createDatabaseTemplateRe matches the `TEMPLATE [=] <name>` option
+// (gram.y's createdb_opt_item T_TEMPLATE case) within a CREATE DATABASE
+// statement's trailing option list. Applied only to the substring AFTER the
+// new database's own name (see createDatabaseTemplateName) — never to the
+// whole statement — so a name that happens to start with "template" (e.g.
+// `CREATE DATABASE template_scratch`) is never mistaken for the option
+// itself.
+var createDatabaseTemplateRe = regexp.MustCompile(`(?i)\btemplate\s*=?\s*(?:"([^"]*)"|([A-Za-z_][A-Za-z0-9_$]*))`)
+
+// createDatabaseTemplateName returns the TEMPLATE option's target database
+// name for a CREATE DATABASE statement, defaulting to "template1" when the
+// option is absent — mirrors dbcommands.c createdb()'s "if (!dbtemplate)
+// dbtemplate = template1" default (postgres/src/backend/commands/
+// dbcommands.c). sql must already be known (via classifyDatabaseDDL) to be a
+// CREATE DATABASE statement.
+func createDatabaseTemplateName(sql string) string {
+	s := strings.TrimSpace(sql)
+	for strings.HasSuffix(s, ";") {
+		s = strings.TrimSpace(strings.TrimSuffix(s, ";"))
+	}
+	lower := strings.ToLower(s)
+	if !strings.HasPrefix(lower, "create database ") {
+		return "template1"
+	}
+	rest := s[len("create database "):]
+	_, end := extractFirstIdentifierSpan(rest)
+	m := createDatabaseTemplateRe.FindStringSubmatch(rest[end:])
+	if m == nil {
+		return "template1"
+	}
+	if m[1] != "" {
+		return m[1]
+	}
+	return m[2]
+}
+
 // extractFirstIdentifier reads the first SQL identifier from s,
 // honouring double-quoted form. Returns "" when s is empty or
 // the leading token is not an identifier.
 func extractFirstIdentifier(s string) string {
-	s = strings.TrimLeft(s, " \t\r\n")
-	if s == "" {
-		return ""
+	name, _ := extractFirstIdentifierSpan(s)
+	return name
+}
+
+// extractFirstIdentifierSpan is extractFirstIdentifier's span-returning
+// twin: it additionally reports how many bytes of the ORIGINAL (untrimmed) s
+// the identifier — plus any leading whitespace and surrounding quotes —
+// consumed, so a caller can slice the remainder of s (e.g. CREATE DATABASE's
+// trailing option list, see createDatabaseTemplateName) without re-parsing
+// the name itself. extractFirstIdentifier is a thin wrapper that discards
+// end.
+func extractFirstIdentifierSpan(s string) (name string, end int) {
+	trimmed := strings.TrimLeft(s, " \t\r\n")
+	skipped := len(s) - len(trimmed)
+	if trimmed == "" {
+		return "", len(s)
 	}
-	if s[0] == '"' {
-		end := strings.IndexByte(s[1:], '"')
-		if end < 0 {
-			return ""
+	if trimmed[0] == '"' {
+		close := strings.IndexByte(trimmed[1:], '"')
+		if close < 0 {
+			return "", len(s)
 		}
-		return s[1 : 1+end]
+		return trimmed[1 : 1+close], skipped + 1 + close + 1
 	}
-	end := 0
-	for end < len(s) {
-		c := s[end]
+	e := 0
+	for e < len(trimmed) {
+		c := trimmed[e]
 		if c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == ';' || c == ',' || c == '(' || c == ')' {
 			break
 		}
-		end++
+		e++
 	}
-	return s[:end]
+	return trimmed[:e], skipped + e
 }
 
 // databaseDDLCommandTag returns the wire-protocol CommandComplete tag
@@ -487,24 +546,94 @@ func (s *Server) resolveActingRoleOID(actingRole string) uint32 {
 	return catalog.BootstrapSuperuserOID
 }
 
+// resolveCreateDatabaseTemplate resolves templateName to the real dbOid
+// CREATE DATABASE ... TEMPLATE should copy from, applying the two checks
+// goopg's still-bounded template support enforces today: the template
+// database must exist (mirrors dbcommands.c createdb()'s get_db_info
+// ERRCODE_UNDEFINED_DATABASE check), and — since goopg does not yet
+// implement the real relation-copy mechanism (M0122-0007 4e's last item; see
+// the deferral ledger) — it must currently have zero USER relations (tables,
+// views, materialized views and sequences all live in the same per-database
+// catalog.Table registry, see AllTables; system/catalog tables — anything
+// below catalog.FirstUserOID, e.g. the heap-backed pg_attribute/pg_type rows
+// every database's namespace carries from bootstrap — are excluded, since
+// their presence doesn't mean the database has any actual user content to
+// lose by not copying), the only case goopg can honor correctly today.
+//
+// The emptiness check is skipped entirely when templateName resolves to
+// catalog.DefaultDBOid: "template1" and "postgres" both alias that one
+// shared oid in goopg's current architecture (the pre-existing postgres/
+// DefaultDBOid dual-mirror, design 0122-0018-per-database-catalog-
+// namespace.md) — a legacy namespace that predates per-database storage
+// isolation and that every fixture and pre-4c code path still writes real
+// user tables into. There is no way to tell "template1's own content" apart
+// from "postgres's own content" at that shared oid, so the emptiness check
+// would misfire on every server that has ever created a table (the
+// overwhelmingly common case) — skip it and keep the exact pre-existing
+// behavior (silently produce an empty new database) there, same as before
+// this loop. Only a template that resolves to its OWN distinct,
+// CreateDatabase-allocated dbOid (any other registered database, or
+// template0's fixed, never-aliased oid 4) gets the new strict check, since
+// only there is "empty" a reliable, meaningful question — and that is
+// exactly the case that used to silently create an empty database instead
+// of copying anything, a real data-loss-shaped mismatch with PostgreSQL this
+// turns into an explicit error. A catalog that doesn't expose
+// databaseTemplateRegistry (some test/embedded paths) skips both checks,
+// matching every other soft-typed-interface fallback in this file.
+func (s *Server) resolveCreateDatabaseTemplate(templateName string) error {
+	tmpl, ok := s.cfg.Catalog.(databaseTemplateRegistry)
+	if !ok {
+		return nil
+	}
+	oid, ok := tmpl.ResolveDatabaseOid(templateName)
+	if !ok {
+		return &databaseDDLError{
+			code: sqlstate.UndefinedDatabase,
+			msg:  fmt.Sprintf("template database %q does not exist", templateName),
+		}
+	}
+	if oid == catalog.DefaultDBOid {
+		return nil
+	}
+	hasUserRelations := false
+	for _, t := range tmpl.AllTables(oid) {
+		if !catalog.IsSystemRelation(t.OID) {
+			hasUserRelations = true
+			break
+		}
+	}
+	if hasUserRelations {
+		return &databaseDDLError{
+			code: sqlstate.FeatureNotSupported,
+			msg: fmt.Sprintf("CREATE DATABASE ... TEMPLATE %q: copying a "+
+				"non-empty template database is not yet supported", templateName),
+		}
+	}
+	return nil
+}
+
 // createDatabasePhysicalDirectory creates base/<oid>/PG_VERSION for a
 // just-allocated CREATE DATABASE oid (M0122-0007 physical-storage-isolation
-// slice 2 — see the package doc comment's "Multi-database storage
-// isolation" note, still not fully in scope: no relation ever routes I/O
-// through this directory yet, see catalog.DefaultDBOid). A nil Pool (some
-// test/embedded contexts, mirroring executor's ddlOp.relocateRelationPhysicalFile)
-// or an empty DataDir is a silent no-op — the registry entry still stands
-// alone, matching how other DDL operators skip cluster-filesystem effects
-// in those contexts.
+// slice 2). Every relation created under this connection's own dbOid now
+// physically routes its files through base/<oid> (internal/storage/smgr.go's
+// relDir/sharedOrPerDBRelDir, wired by the per-database catalog-namespace
+// epic, design 0122-0018) — so this scaffold is real, live storage, not a
+// vestigial directory. A nil Pool (some test/embedded contexts, mirroring
+// executor's ddlOp.relocateRelationPhysicalFile) or an empty DataDir is a
+// silent no-op — the registry entry still stands alone, matching how other
+// DDL operators skip cluster-filesystem effects in those contexts.
 //
-// TEMPLATE is deliberately NOT honored here: goopg still has one shared
-// table/index namespace for the whole process (every relation keys off
-// catalog.DefaultDBOid regardless of which database a connection attached
-// to), so there is no valid set of "the template database's relations" to
-// copy yet — copying would either copy nothing (vacuous) or copy the one
-// shared namespace's relations into an oid nothing will ever read from.
-// This is physical-storage-isolation slice 4's prerequisite; see the
-// deferral ledger.
+// TEMPLATE's target-existence and target-is-empty checks now happen earlier,
+// in resolveCreateDatabaseTemplate (called from tryHandleDatabaseDDL before
+// this function runs) — but this function itself still only creates an
+// EMPTY scaffold: it never copies the template's relation files into the new
+// oid's directory. That is fine for every TEMPLATE this bounded slice
+// accepts (template0/template1/any other currently-empty database all have
+// zero relations to copy), but it means the real
+// `CreateDatabaseUsingFileCopy`-equivalent copy step — physically copying
+// each of the template's relation files here, plus deep-copying the source
+// dbOid's catalog.tableNamespace (tables/indexes/sequences/views) under
+// freshly allocated OIDs — remains unimplemented. See the deferral ledger.
 func (s *Server) createDatabasePhysicalDirectory(oid uint32) error {
 	if s.cfg.Pool == nil {
 		return nil
@@ -598,6 +727,9 @@ func (s *Server) tryHandleDatabaseDDL(sql string, liveDBName string, actingRole 
 	}
 	switch kind {
 	case databaseDDLCreate:
+		if err := s.resolveCreateDatabaseTemplate(createDatabaseTemplateName(sql)); err != nil {
+			return true, "", err
+		}
 		owner := s.resolveActingRoleOID(actingRole)
 		oid, err := cat.CreateDatabase(name, owner)
 		if err != nil {
@@ -859,6 +991,17 @@ type databaseConfigRegistry interface {
 // M0119-0006 (AC-002 residual #1).
 type databaseConnLimitRegistry interface {
 	DatabaseConnLimit(name string) int32
+}
+
+// databaseTemplateRegistry is the subset of catalog.Catalog CREATE
+// DATABASE's TEMPLATE handling needs to resolve and inspect the source
+// database. A separate interface from databaseRegistry for the same reason
+// databaseConnLimitRegistry is separate (see its own doc comment): a catalog
+// fake implementing CreateDatabase/DropDatabase/HasDatabase but not these
+// two methods must not silently lose the TEMPLATE checks.
+type databaseTemplateRegistry interface {
+	ResolveDatabaseOid(name string) (uint32, bool)
+	AllTables(dbOid ...uint32) []*catalog.Table
 }
 
 // applyAlterDatabaseConfig applies a parsed ALTER DATABASE ... SET/RESET

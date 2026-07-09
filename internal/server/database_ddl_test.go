@@ -9,6 +9,7 @@ import (
 
 	"github.com/goopg/goopg/internal/activity"
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/sqlstate"
 	"github.com/goopg/goopg/internal/storage"
 )
@@ -624,5 +625,126 @@ func TestDropDatabaseHasForce(t *testing.T) {
 		if got := dropDatabaseHasForce(c.sql); got != c.want {
 			t.Errorf("dropDatabaseHasForce(%q) = %v, want %v", c.sql, got, c.want)
 		}
+	}
+}
+
+// TestCreateDatabaseTemplateName pins createDatabaseTemplateName's parsing,
+// including the "template1" default (mirrors dbcommands.c createdb()'s own
+// default) and the false-positive guard: a new database name that happens to
+// start with "template" must never be mistaken for the TEMPLATE option
+// itself (the option regex is applied only to the substring AFTER the parsed
+// database name, see the function's own doc comment).
+func TestCreateDatabaseTemplateName(t *testing.T) {
+	cases := []struct {
+		sql  string
+		want string
+	}{
+		{"CREATE DATABASE foo", "template1"},
+		{"CREATE DATABASE foo TEMPLATE bar", "bar"},
+		{"CREATE DATABASE foo TEMPLATE=bar", "bar"},
+		{"CREATE DATABASE foo TEMPLATE = bar", "bar"},
+		{"create database foo template bar", "bar"},
+		{`CREATE DATABASE foo TEMPLATE "Bar"`, "Bar"},
+		{"CREATE DATABASE foo OWNER me TEMPLATE bar ENCODING 'UTF8'", "bar"},
+		{"CREATE DATABASE foo;", "template1"},
+		// A database name that merely starts with "template" is not the
+		// TEMPLATE option and must not be misparsed as one.
+		{"CREATE DATABASE template_scratch", "template1"},
+		{"CREATE DATABASE template_scratch TEMPLATE bar", "bar"},
+		{"DROP DATABASE foo", "template1"}, // not a CREATE — falls back to the default
+	}
+	for _, c := range cases {
+		if got := createDatabaseTemplateName(c.sql); got != c.want {
+			t.Errorf("createDatabaseTemplateName(%q) = %q, want %q", c.sql, got, c.want)
+		}
+	}
+}
+
+// TestTryHandleDatabaseDDLCreateTemplateDoesNotExistErrors pins
+// resolveCreateDatabaseTemplate's existence check (mirrors dbcommands.c
+// createdb()'s get_db_info ERRCODE_UNDEFINED_DATABASE case): naming a
+// nonexistent database as TEMPLATE must surface a typed error, not silently
+// create an empty database as classifyDatabaseDDL's pre-existing
+// "trailing options are ignored" looseness used to.
+func TestTryHandleDatabaseDDLCreateTemplateDoesNotExistErrors(t *testing.T) {
+	s := newTestRoleServer()
+	im := s.cfg.Catalog.(*catalog.InMemory)
+
+	handled, _, err := s.tryHandleDatabaseDDL("CREATE DATABASE foo TEMPLATE bogus", "postgres", "", nil)
+	if !handled || err == nil {
+		t.Fatalf("CREATE DATABASE foo TEMPLATE bogus: handled=%v err=%v, want a typed error", handled, err)
+	}
+	if got := databaseDDLErrorSQLState(err); got != sqlstate.UndefinedDatabase {
+		t.Errorf("SQLSTATE = %q, want %q", got, sqlstate.UndefinedDatabase)
+	}
+	if im.HasDatabase("foo") {
+		t.Error("CREATE DATABASE foo TEMPLATE bogus: database was registered despite the error")
+	}
+}
+
+// TestTryHandleDatabaseDDLCreateEmptyTemplateSucceeds pins the one template
+// shape goopg's still-bounded TEMPLATE support fully honors today: a
+// template database with zero user relations (tables, views, sequences —
+// AllTables) succeeds exactly like a plain CREATE DATABASE, whether the
+// template is implicit (no TEMPLATE clause, defaulting to template1),
+// explicitly "template1", or a freshly created empty user database.
+func TestTryHandleDatabaseDDLCreateEmptyTemplateSucceeds(t *testing.T) {
+	s := newTestRoleServer()
+	im := s.cfg.Catalog.(*catalog.InMemory)
+
+	if handled, _, err := s.tryHandleDatabaseDDL("CREATE DATABASE emptysrc", "postgres", "", nil); !handled || err != nil {
+		t.Fatalf("CREATE DATABASE emptysrc: handled=%v err=%v", handled, err)
+	}
+
+	cases := []string{
+		"CREATE DATABASE foo1",
+		"CREATE DATABASE foo2 TEMPLATE template1",
+		"CREATE DATABASE foo3 TEMPLATE emptysrc",
+	}
+	for _, sql := range cases {
+		handled, _, err := s.tryHandleDatabaseDDL(sql, "postgres", "", nil)
+		if !handled || err != nil {
+			t.Errorf("%s: handled=%v err=%v", sql, handled, err)
+		}
+	}
+	for _, name := range []string{"foo1", "foo2", "foo3"} {
+		if !im.HasDatabase(name) {
+			t.Errorf("database %q was not registered", name)
+		}
+	}
+}
+
+// TestTryHandleDatabaseDDLCreateNonEmptyTemplateErrors pins the correctness
+// fix this loop landed: before it, CREATE DATABASE ... TEMPLATE against a
+// database with real user tables silently created an EMPTY database instead
+// (classifyDatabaseDDL's "trailing options are ignored" looseness), which is
+// a silent semantic mismatch with real PostgreSQL (which actually copies the
+// template's contents) — a shape of bug this project treats as a priority
+// fix even before the full copy mechanism lands (see the "silent wrong
+// behavior" precedent in the M0122-0007 4e FK-enforcement fix). goopg does
+// not yet implement the real relation-copy mechanism, so this must now fail
+// LOUDLY with a typed FeatureNotSupported error instead.
+func TestTryHandleDatabaseDDLCreateNonEmptyTemplateErrors(t *testing.T) {
+	s := newTestRoleServer()
+	im := s.cfg.Catalog.(*catalog.InMemory)
+
+	if handled, _, err := s.tryHandleDatabaseDDL("CREATE DATABASE nonemptysrc", "postgres", "", nil); !handled || err != nil {
+		t.Fatalf("CREATE DATABASE nonemptysrc: handled=%v err=%v", handled, err)
+	}
+	srcOid := im.DatabaseOid("nonemptysrc")
+	cols := []catalog.Column{{Name: "id", Type: catalog.Type{Name: "int4"}, Ordinal: 0}}
+	if _, err := im.CreateTable(parser.ObjectName{Name: "t"}, cols, srcOid); err != nil {
+		t.Fatalf("CreateTable under nonemptysrc: %v", err)
+	}
+
+	handled, _, err := s.tryHandleDatabaseDDL("CREATE DATABASE foo TEMPLATE nonemptysrc", "postgres", "", nil)
+	if !handled || err == nil {
+		t.Fatalf("CREATE DATABASE foo TEMPLATE nonemptysrc: handled=%v err=%v, want a typed error", handled, err)
+	}
+	if got := databaseDDLErrorSQLState(err); got != sqlstate.FeatureNotSupported {
+		t.Errorf("SQLSTATE = %q, want %q", got, sqlstate.FeatureNotSupported)
+	}
+	if im.HasDatabase("foo") {
+		t.Error("CREATE DATABASE foo TEMPLATE nonemptysrc: database was registered despite the error")
 	}
 }

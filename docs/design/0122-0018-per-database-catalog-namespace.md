@@ -1,7 +1,7 @@
 # Per-database catalog namespace (M0122-0007 slice 4)
 
-Status: accepted (sub-slices 4a, 4b-i, 4b-ii, 4c, 4d-i, 4d-ii-part-1, and 4d-ii-part-2a landed; 4d-ii-part-2b items 1, 2, and 3 all fully landed; 4e's FK-target-resolution, sequence-ownership, and view-constraint-dependency items all landed — only the `CREATE DATABASE ... TEMPLATE` copy mechanism remains planned)
-Date: 2026-07-09
+Status: accepted (sub-slices 4a, 4b-i, 4b-ii, 4c, 4d-i, 4d-ii-part-1, and 4d-ii-part-2a landed; 4d-ii-part-2b items 1, 2, and 3 all fully landed; 4e's FK-target-resolution, sequence-ownership, and view-constraint-dependency items all landed; `CREATE DATABASE ... TEMPLATE` bounded validation landed 2026-07-10 — the real relation-copy mechanism itself remains planned, see "Remaining 4e work" below)
+Date: 2026-07-10
 Supersedes: none — extends the "Still open" note in
 `0122-0017-database-ddl-drop-guards.md` and the deferral-ledger rows dated
 2026-07-06/2026-07-09 (task-id `M0122-0007`, "physical-storage-isolation
@@ -980,9 +980,86 @@ view-dependency-related
 `matViewsDependingOnRelation`/`collectViewPKDeps`/`addGroupByPKDeps`) was
 already dbOid-threaded — confirmed by inspection, not re-flagged.
 
+**`CREATE DATABASE ... TEMPLATE` bounded validation landed (2026-07-10).**
+`internal/server/database_ddl.go` gained `createDatabaseTemplateName` (parses
+the `TEMPLATE [=] <name>` option, applied only to the substring after the new
+database's own name via the new `extractFirstIdentifierSpan`, so a name that
+happens to start with "template" — e.g. `CREATE DATABASE template_scratch` —
+is never mistaken for the option) and `resolveCreateDatabaseTemplate`, called
+from `tryHandleDatabaseDDL`'s `databaseDDLCreate` case before the target
+database is allocated. It enforces the two checks goopg can honor without the
+real copy mechanism: the template must exist (`ResolveDatabaseOid`,
+mirroring dbcommands.c createdb()'s `ERRCODE_UNDEFINED_DATABASE`), and it
+must have zero USER relations (`AllTables`, filtered to
+`!catalog.IsSystemRelation`) — the only case a database that isn't actually
+copied can still be semantically correct. Before this, a non-empty TEMPLATE
+fell through classifyDatabaseDDL's "trailing options are ignored" looseness
+and silently created an empty database instead of copying anything, a real
+data-loss-shaped mismatch with PostgreSQL; that is now a typed
+`FeatureNotSupported` (0A000) error instead.
+
+The emptiness check is skipped entirely when the template resolves to
+`catalog.DefaultDBOid` (1) — discovered live via
+`TestSimpleQueryDropDatabaseActuallyDrops`'s failure during this loop's
+verification pass: `"template1"` and `"postgres"` both alias that one shared
+oid (the pre-existing dual-mirror this doc's 4c/4d sections document), which
+every fixture and pre-4c code path still writes real user tables into, so
+the check would misfire on any server that has ever created a table — the
+overwhelmingly common case, including the default no-TEMPLATE-clause path.
+Skipping there exactly preserves the pre-existing "silently produce an empty
+database" behavior for `template1`/`postgres`/no-clause (unchanged from
+before this loop); the new strict check only applies to a template that
+resolves to its own distinct, `CreateDatabase`-allocated dbOid (any other
+registered database) or `template0`'s fixed, never-aliased oid 4 — the only
+oids where "is this template empty" is actually a reliable question. Tests:
+`TestCreateDatabaseTemplateName`,
+`TestTryHandleDatabaseDDLCreateTemplateDoesNotExistErrors`,
+`TestTryHandleDatabaseDDLCreateEmptyTemplateSucceeds`,
+`TestTryHandleDatabaseDDLCreateNonEmptyTemplateErrors`
+(`internal/server/database_ddl_test.go`), each of the latter two negative
+cases confirmed to fail against a revert of just the
+`resolveCreateDatabaseTemplate` call site. Live-verified against the real
+`cmd/goopg` binary via `psql`: `CREATE DATABASE foo` and
+`CREATE DATABASE foo TEMPLATE template1` still succeed on a server that
+already has tables in `postgres`; `CREATE DATABASE foo TEMPLATE <empty db>`
+succeeds; `CREATE DATABASE foo TEMPLATE <db with a table>` fails with the new
+0A000; `CREATE DATABASE foo TEMPLATE nosuchdb` fails with 3D000; a table
+created in a freshly `CREATE DATABASE`'d database is correctly invisible from
+`postgres`'s own `pg_class` query (real per-database isolation, not just a
+name registered in `pg_database`).
+
+**Residual gap noticed live during this loop's manual verification, NOT part
+of this task** (recorded here for a future loop, not yet in the deferral
+ledger's own table since it doesn't have a task-id of its own yet): a
+connection to any newly `CREATE DATABASE`'d database (unrelated to
+TEMPLATE — reproduces identically on a plain empty target) cannot query
+`pg_class`/run `psql`'s `\dt` at all (`ERROR: relation "pg_class" does not
+exist`), even though DML/DDL against real tables in that database works and
+is correctly isolated from other databases. This is the system-catalog
+virtual-table builders (`pg_class` et al.) not yet being wired to a
+per-connection dbOid the way `internal/catalog/catalog.go`'s
+`tableNamespace` machinery now is (see `per_connection_virtual_catalog_scoping`
+project memory for the mechanism other virtual tables already use) — a
+separate, pre-existing gap this loop did not introduce and did not fix.
+
 **Remaining 4e work: the `CREATE DATABASE ... TEMPLATE` copy mechanism
-itself** — now unblocked, since both prerequisite items (sequence ownership,
-view constraint-dependency tracking) have landed.
+itself** — deep-copying the source dbOid's `catalog.tableNamespace`
+(tables/indexes/sequences/views, each under freshly allocated OIDs, with FK
+target OIDs remapped) plus physically copying each relation's on-disk file(s)
+(`internal/storage/smgr.go`'s `base/<dbOid>/<relOid>` layout, confirmed real
+and per-database by this loop's investigation) into the new database's
+directory — `CreateDatabaseUsingFileCopy`/`copydir`'s functional analog
+(`postgres/src/backend/commands/dbcommands.c`), adapted to goopg's shared
+in-memory-catalog-with-per-dbOid-namespaces architecture rather than PG's
+literal per-database on-disk catalog. Unblocked since both upstream
+prerequisites (sequence ownership, view constraint-dependency tracking) have
+landed; the two checks landed this loop (template existence, template
+emptiness) become largely redundant once the copy mechanism lands (a
+non-empty template stops being an error and becomes the actual, common
+case), so a future loop should replace `resolveCreateDatabaseTemplate`'s
+`FeatureNotSupported` branch with the real copy rather than deleting the
+function outright — the existence check and the `DefaultDBOid`-skip logic
+both still apply.
 
 ## Recommended order and stopping points
 
@@ -1002,9 +1079,12 @@ dual-mirror guard that turned out load-bearing) are now all fully landed
 4e** (dependent-object-walk fixups + the `CREATE DATABASE ... TEMPLATE`
 copy mechanism). 4e's FK-target-resolution, sequence-ownership, and view
 constraint-dependency items are now all landed (2026-07-10, see their
-sections above); **4e's only remaining item is the
-`CREATE DATABASE ... TEMPLATE` copy mechanism itself**, now unblocked since
-both of its prerequisites landed. Before starting it, read 4d-i's,
+sections above); `CREATE DATABASE ... TEMPLATE`'s bounded
+existence/emptiness validation also landed (2026-07-10, see its own section
+above) — **4e's only remaining item is the real
+`CREATE DATABASE ... TEMPLATE` relation-copy mechanism itself**, now
+unblocked since both of its prerequisites landed. Before starting it, read
+4d-i's,
 4d-ii-part-1's, and 4d-ii-part-2a's/4d-ii-part-2b's/4e's landed sections
 above in full — they document exactly which write entry points and lookups
 already thread the connection's real dbOid (so the template-copy mechanism

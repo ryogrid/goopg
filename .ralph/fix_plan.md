@@ -6591,6 +6591,79 @@ mirroring M0119's ledger `status` column.
       (`CreateDatabaseUsingFileCopy`/`copydir`,
       `postgres/src/backend/commands/dbcommands.c`) — the epic's original
       motivation and final resume point.
+  - [x] `M0122-0007` follow-up 22 (2026-07-10, this loop) — **started
+      `CREATE DATABASE ... TEMPLATE`, landed a bounded, correct validation
+      slice.** `internal/server/database_ddl.go` gained
+      `createDatabaseTemplateName` (parses the `TEMPLATE [=] <name>` option
+      — applied only to the substring AFTER the new database's own parsed
+      name, via new `extractFirstIdentifierSpan`, so a name that happens to
+      start with "template" is never misparsed as the option) and
+      `resolveCreateDatabaseTemplate`, wired into `tryHandleDatabaseDDL`'s
+      create branch before the target database is allocated. It enforces
+      the template exists (`ResolveDatabaseOid`, else `3D000` mirroring
+      dbcommands.c createdb()'s `ERRCODE_UNDEFINED_DATABASE`) and has zero
+      USER relations (`AllTables` filtered to `!catalog.IsSystemRelation` —
+      system/catalog rows below `FirstUserOID` don't count), else the new
+      `0A000 FeatureNotSupported`. Before this, a non-empty TEMPLATE fell
+      through `classifyDatabaseDDL`'s "trailing options are ignored"
+      looseness and silently created an EMPTY database instead of copying
+      anything — a real data-loss-shaped mismatch with PostgreSQL, now a
+      loud typed error instead. **Load-bearing correction found live during
+      this loop's own gate-verification pass:** the naive version of this
+      check (apply to every template unconditionally) broke
+      `TestSimpleQueryDropDatabaseActuallyDrops` — `"template1"` and
+      `"postgres"` both alias `catalog.DefaultDBOid` in goopg's current
+      architecture (the pre-existing dual-mirror, design
+      0122-0018-per-database-catalog-namespace.md), a shared legacy
+      namespace every fixture and pre-4c code path still writes real user
+      tables into, so the check misfired on any server that has ever
+      created a table — the overwhelmingly common case, including the
+      default no-TEMPLATE-clause path. Fixed by skipping the emptiness
+      check entirely when the template resolves to `DefaultDBOid`,
+      preserving the exact pre-existing silent-empty-database behavior
+      there (unchanged from before this loop); the strict check only fires
+      for a template with its own distinct, `CreateDatabase`-allocated
+      dbOid (or `template0`'s fixed, never-aliased oid 4) — exactly the
+      case that used to silently misbehave. New tests
+      `TestCreateDatabaseTemplateName`,
+      `TestTryHandleDatabaseDDLCreateTemplateDoesNotExistErrors`,
+      `TestTryHandleDatabaseDDLCreateEmptyTemplateSucceeds`,
+      `TestTryHandleDatabaseDDLCreateNonEmptyTemplateErrors`
+      (`internal/server/database_ddl_test.go`), the two negative cases each
+      confirmed to fail against a revert of the `resolveCreateDatabaseTemplate`
+      call site. Live-verified against the real `cmd/goopg` binary via
+      `psql`: default/`TEMPLATE template1` CREATE DATABASE unaffected on a
+      server with real tables in `postgres`; an empty user database as
+      TEMPLATE succeeds; a TEMPLATE with a real table 0A000s; an unknown
+      TEMPLATE 3D000s; a table created in a freshly `CREATE DATABASE`'d
+      database is correctly invisible from another database's `pg_class`
+      query (real per-database isolation, not just a `pg_database` name
+      registration). **New residual gap noticed live, NOT fixed here:** a
+      connection to ANY freshly `CREATE DATABASE`'d database cannot query
+      `pg_class`/run `psql`'s `\dt` at all (system-catalog virtual-table
+      builders aren't yet wired to a per-connection dbOid) — reproduces on
+      a plain empty database too, unrelated to TEMPLATE; recorded in the
+      deferral ledger and design doc for a future loop. Design doc
+      (`docs/design/0122-0018-per-database-catalog-namespace.md`) gained a
+      full section plus "Recommended order"/status-line updates;
+      `docs/design/README.md` row extended; deferral ledger row appended.
+      **Remaining M0122-0007 work: the real `CREATE DATABASE ... TEMPLATE`
+      relation-copy mechanism** — deep-copying the source dbOid's
+      `catalog.tableNamespace` (tables/indexes/sequences/views) under
+      freshly allocated OIDs, remapping FK target OIDs, and physically
+      copying each relation's on-disk file(s)
+      (`internal/storage/smgr.go`'s `base/<dbOid>/<relOid>` layout,
+      confirmed real and per-database by this loop's investigation) —
+      `CreateDatabaseUsingFileCopy`/`copydir`'s functional analog
+      (`postgres/src/backend/commands/dbcommands.c`), adapted to goopg's
+      shared-catalog-with-per-dbOid-namespaces architecture. Gates:
+      `go build ./...`/`go vet ./...` clean; `go test ./internal/server/...
+      ./internal/catalog/... ./internal/executor/... ./internal/wal/...`
+      PASS; `go test -short $(go list ./... | grep -v /internal/testport)`
+      (full repo, short mode) PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+      scripts/ralph-precommit-test.sh` PASS (0 failed transactions, all 3
+      pgbench workloads).
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,
