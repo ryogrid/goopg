@@ -1,6 +1,6 @@
 # Per-database catalog namespace (M0122-0007 slice 4)
 
-Status: accepted (sub-slices 4a, 4b-i, 4b-ii, 4c, 4d-i, 4d-ii-part-1, and 4d-ii-part-2a landed; 4d-ii-part-2b items 1, 2, and 3 all fully landed — 4e remains planned)
+Status: accepted (sub-slices 4a, 4b-i, 4b-ii, 4c, 4d-i, 4d-ii-part-1, and 4d-ii-part-2a landed; 4d-ii-part-2b items 1, 2, and 3 all fully landed; 4e's FK-target-resolution item landed — 4e's view-constraint-dep and sequence-ownership items, plus the `CREATE DATABASE ... TEMPLATE` copy mechanism, remain planned)
 Date: 2026-07-09
 Supersedes: none — extends the "Still open" note in
 `0122-0017-database-ddl-drop-guards.md` and the deferral-ledger rows dated
@@ -806,7 +806,7 @@ Two remaining pieces (renumbered from the original "4d-ii-part-2"; part 2a's
    and the helper's own contract respectively. The former deferral-ledger
    row for this corner is resolved (see the ledger's `resolved` flip).
 
-### 4e — Cross-cutting fixups + the original motivation (planned)
+### 4e — Cross-cutting fixups + the original motivation (in progress)
 
 Once 4b-ii-4d land: dependent-object walks that assume a single global
 namespace (FK target resolution, view dependency tracking, sequence
@@ -816,6 +816,102 @@ mechanism (`CreateDatabaseUsingFileCopy`/`copydir`,
 unblock, and the AC-002/DU-002 dump+restore round-trip probe already
 staged in `internal/testport/pgdump_connsetup_test.go` (a soft `t.Logf`
 today, ready to become a hard assertion once this lands).
+
+**FK target resolution — LANDED (2026-07-10).** Five call sites in
+`internal/executor/operators_fk.go`/`operators_ddl.go` resolved the FK's
+referenced/child table via `LookupTable`/`AllTables` with no `dbOid`
+argument, always keying against `DefaultDBOid` regardless of the connection's
+real database (all five already had the `dbOid ...uint32` parameter
+available on the callee — this was purely a threading gap, not a signature
+change, mirroring 4d-ii-part-2b item 1's pattern):
+
+- `assertParentExists` (`operators_fk.go`) — the INSERT/UPDATE-time
+  FK-parent-exists check. Before the fix, a missing lookup meant the
+  "referenced table not found (CREATE TABLE out of order) — skip" branch
+  fired for every insert on a distinct-dbOid connection, silently disabling
+  FK enforcement entirely rather than rejecting rows with no matching
+  parent. Highest blast radius — this is the hot path.
+- `assertNoChildRows` (`operators_fk.go`) — only affected the parent
+  primary-key column names in the FK-RESTRICT error's DETAIL line, not
+  enforcement itself.
+- `runAllDeferredFKChecks` (`operators_fk.go`) — resolved the child table for
+  an `INITIALLY DEFERRED` check run at COMMIT; a miss took the `continue`
+  branch, silently skipping the deferred violation check.
+- `checkFKColumnTypeCompatibility` (`operators_fk.go`) — resolved the
+  referenced table for enum-type FK compatibility checking at CREATE
+  TABLE/ADD CONSTRAINT time; the very next line already threaded
+  `catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)` into `IndexesOnTable`,
+  which is what made this half-migrated site easy to spot.
+- `execTruncate`'s CASCADE expansion (`operators_ddl.go`) — built its
+  whole-catalog FK-referencer set via `im.AllTables()` with no dbOid,
+  scanning `DefaultDBOid`'s (typically empty, for a distinct-dbOid
+  connection) namespace instead of the connection's own — so `TRUNCATE ...
+  CASCADE` silently failed to cascade to a real same-database referencing
+  table, leaving its rows behind as dangling references to the
+  just-truncated parent. Whole-database-scan blast radius.
+
+New tests `TestAssertParentExistsFindsOwnDistinctDBOidParent` and
+`TestExecTruncateCascadeFindsOwnDistinctDBOidReferencingTable`
+(`internal/executor/fk_dbid_routing_test.go`) cover the two highest-severity
+sites end-to-end (INSERT rejection and TRUNCATE CASCADE reach), each
+confirmed to fail against a revert of just the FK-fix diff. Writing these
+required a new test-only planning helper (`runDMLUnderDBOid`/
+`runQueryUnderDBOid` in the same file): the package's existing `runDDL`/
+`runQuery` helpers call `planner.Plan(stmts[0], ctx.Catalog)` with the raw,
+un-wrapped catalog, which resolves table names for statements needing
+planning-time name resolution (INSERT's target table, SELECT's FROM
+table) against `DefaultDBOid` only — unlike the real server, which always
+plans through `sessionPlanCatalog`/`ctxPlanCatalog`'s dbOid-seeded
+`SearchPathCatalog` wrapper. This is a test-harness gap, not a production
+bug (confirmed by reading `internal/server/dispatch.go`'s planning call
+sites), but it means any *future* dbOid-routing test in this package that
+needs a table resolved by name during planning (as opposed to CREATE
+TABLE/CREATE VIEW's outer-statement plan, which needs no such resolution)
+must use the new helper, not plain `runDDL`/`runQuery`.
+
+**Not yet threaded (next resume points, ranked by blast radius):**
+
+- **Sequence ownership** (`internal/executor/operators_sequence.go`) — more
+  severe than a missing-parameter bug. `var seqRegistry sync.Map` is a
+  **process-global** store (explicitly doc-commented as living outside
+  `catalog.InMemory`) keyed only by bare (optionally schema-qualified)
+  sequence name, with zero dbOid concept anywhere in the file.
+  `DropSequencesOwnedByTable` (called from `dropTableByRefImmediate`),
+  `SetSequenceOwnedBy` (implicit-serial registration in `execCreateTable`,
+  explicit `OWNED BY` in `execCreateSequence`/`execAlterSequence`), and
+  `FindSequenceOwnedBy` (consumed by `autoGenerateSerialValues`'s
+  `nextval()` resolution on every INSERT, and `pg_get_serial_sequence`-style
+  lookups in `expr.go`'s `evalFuncCall`) all operate on this flat map.
+  Concretely: `DROP TABLE t` in database A can delete/cascade sequences
+  owned by a same-named table `t` in database B; two same-named
+  table+column pairs in different databases silently share (and race on)
+  one sequence counter. Fixing individual call sites is insufficient —
+  `seqRegistry`'s key scheme itself needs a dbOid (or equivalent) namespace
+  component first. This is 4e's largest remaining structural gap and blocks
+  the `CREATE DATABASE ... TEMPLATE` copy mechanism (a template-copied
+  sequence would otherwise collide with the source database's live
+  sequence in the same global map).
+- **View constraint-dependency tracking** (`internal/catalog/catalog.go`) —
+  `c.constraintViewDeps map[string][]string` (declared near line 2280) is a
+  single flat field on `InMemory`, keyed `"tableOID:constraintName"` (OID
+  half is safe — table OIDs are globally unique) → `[]viewName` (the
+  *value* is a bare, unqualified name with no dbOid). Its own
+  `UnregisterViewConstraintDeps`, called from `execDropOneView` on every
+  `DROP VIEW`, matches and removes entries **by bare name across every key
+  in the whole map** — so `DROP VIEW v` in database A also strips a
+  same-named, unrelated view `v` in database B out of the map, silently
+  disabling that other database's `DROP CONSTRAINT RESTRICT` protection.
+  Concrete cross-database data-corruption path. `execCreateView`'s
+  registration call site (`im.RegisterViewConstraintDep(viewKey, ...)`,
+  `viewKey := s.Name.String()`) feeds the same unqualified-name issue.
+  Everything else view-dependency-related
+  (`CreateView`/`AllUserViews`/`AllUserMatViews`/`IndexesOnTable`/
+  `planCatalog()`/`viewsDependingOnView`/`viewsDependingOnTable`/
+  `matViewsDependingOnRelation`/`collectViewPKDeps`/`addGroupByPKDeps`) is
+  already dbOid-threaded — confirmed by inspection, not re-flagged.
+- The `CREATE DATABASE ... TEMPLATE` copy mechanism itself — blocked on both
+  items above landing first (a template copy must not alias the source
+  database's sequences or view-constraint-dep entries).
 
 ## Recommended order and stopping points
 
@@ -833,16 +929,27 @@ creation time — see its section above for the `postgres`/`DefaultDBOid`
 dual-mirror guard that turned out load-bearing) are now all fully landed
 (2026-07-10). **4d-ii-part-2b is complete; the only remaining sub-slice is
 4e** (dependent-object-walk fixups + the `CREATE DATABASE ... TEMPLATE`
-copy mechanism). Before starting it, read 4d-i's, 4d-ii-part-1's, and
-4d-ii-part-2a's/4d-ii-part-2b's landed sections above in full — they
-document exactly which write entry points and lookups already thread the
-connection's real dbOid (so 4e's dependent-object walks must resolve the
-SAME `catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)` value to actually
-find what earlier sub-slices create), the `postgres`/`DefaultDBOid`
-dual-mirror shim that still applies unchanged, and the
-`ns()`/`getOrCreateNS` split (create-needing paths use `getOrCreateNS`;
-don't revert them to the old always-creating `ns()`). If a sub-slice is cut
-off mid-implementation, prefer reverting it
+copy mechanism). 4e's own FK-target-resolution item is now landed
+(2026-07-10, see its section above); **4e's remaining items are sequence
+ownership (`seqRegistry`'s process-global, dbOid-less key scheme — the
+larger structural gap, do this one first) and view constraint-dependency
+tracking (`constraintViewDeps`'s unqualified-name values), then finally the
+`CREATE DATABASE ... TEMPLATE` copy mechanism itself**, which is blocked on
+both landing first. Before starting any of them, read 4d-i's,
+4d-ii-part-1's, and 4d-ii-part-2a's/4d-ii-part-2b's/4e's landed sections
+above in full — they document exactly which write entry points and lookups
+already thread the connection's real dbOid (so 4e's remaining dependent-
+object walks must resolve the SAME
+`catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)` value to actually find
+what earlier sub-slices create), the `postgres`/`DefaultDBOid` dual-mirror
+shim that still applies unchanged, and the `ns()`/`getOrCreateNS` split
+(create-needing paths use `getOrCreateNS`; don't revert them to the old
+always-creating `ns()`). This package's `runDDL`/`runQuery` test helpers
+plan through the raw, un-wrapped catalog and so cannot resolve table names
+under a distinct dbOid — use the new `runDMLUnderDBOid`/
+`runQueryUnderDBOid` helpers (`internal/executor/fk_dbid_routing_test.go`)
+for any test that needs planning-time name resolution under a distinct
+dbOid. If a sub-slice is cut off mid-implementation, prefer reverting it
 whole (the tree must build and tests must pass at every commit) over leaving
 a partially-migrated state.
 

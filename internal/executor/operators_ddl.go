@@ -10836,7 +10836,7 @@ func (o *ddlOp) execTruncate(s *parser.TruncateStmt) error {
 	// pointing to it. If behavior is CASCADE, expand the set and emit NOTICEs.
 	// Otherwise fail with "cannot truncate a table referenced in a foreign key constraint".
 	if hasIM {
-		allTables := im.AllTables()
+		allTables := im.AllTables(catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		// Process in a BFS loop because CASCADE expansion may introduce new referencing tables.
 		for {
 			expanded := false

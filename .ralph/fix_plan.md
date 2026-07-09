@@ -6407,6 +6407,68 @@ mirroring M0119's ledger `status` column.
       run) PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
       `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS
       (0 failed transactions, all 3 pgbench workloads).
+  - [x] `M0122-0007` follow-up 19 (2026-07-10, this loop) — **started 4e,
+      closed its FK target resolution item.** An Explore agent mapped 4e's
+      three named categories (FK target resolution, view dependency
+      tracking, sequence ownership) to concrete call sites first. Threaded
+      `catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)` through 5 previously
+      un-dbOid'd FK-related lookups in `internal/executor/operators_fk.go`/
+      `operators_ddl.go`: `assertParentExists` (the INSERT/UPDATE-time
+      FK-parent-exists check — highest blast radius, since a lookup miss
+      took the "referenced table not found — skip" branch and silently
+      disabled FK enforcement entirely for a distinct-dbOid connection,
+      rather than just failing to find a genuinely missing parent),
+      `assertNoChildRows` (DETAIL-line parent PK columns only, not
+      enforcement), `runAllDeferredFKChecks` (deferred/`INITIALLY DEFERRED`
+      child-table resolution at COMMIT — a miss silently `continue`d past
+      the violation check), `checkFKColumnTypeCompatibility` (enum FK-type
+      check at CREATE TABLE/ADD CONSTRAINT time — the very next line
+      already threaded dbOid into a sibling `IndexesOnTable` call, exposing
+      the half-migrated pattern), and `execTruncate`'s CASCADE expansion
+      (`im.AllTables()` scanned `DefaultDBOid`'s namespace instead of the
+      connection's own, so `TRUNCATE ... CASCADE` silently failed to reach
+      a real same-database referencing table). All 5 callees already
+      accepted the `dbOid ...uint32` variadic parameter — pure threading,
+      mirroring 4d-ii-part-2b item 1's pattern, no signature change. New
+      tests `TestAssertParentExistsFindsOwnDistinctDBOidParent`,
+      `TestExecTruncateCascadeFindsOwnDistinctDBOidReferencingTable`
+      (`internal/executor/fk_dbid_routing_test.go`), each confirmed to fail
+      against a revert of just the fix diff. Writing them required new
+      test-only planning helpers `runDMLUnderDBOid`/`runQueryUnderDBOid`
+      (same file): the package's existing `runDDL`/`runQuery` helpers plan
+      through the raw un-wrapped `ctx.Catalog`, which cannot resolve a
+      table name under a distinct dbOid at planning time for statements
+      needing it (INSERT's target table, SELECT's FROM table) — unlike the
+      real server, which always plans through
+      `sessionPlanCatalog`/`ctxPlanCatalog`'s dbOid-seeded
+      `SearchPathCatalog` wrapper (confirmed by reading
+      `internal/server/dispatch.go`'s planning call sites — this is a
+      test-harness gap, not a production bug). Design doc
+      (`docs/design/0122-0018-per-database-catalog-namespace.md`) 4e
+      section updated with the landed item plus full detail on the two
+      remaining ones; `docs/design/README.md` row extended; deferral ledger
+      row appended. **Remaining 4e items (ranked by blast radius):**
+      sequence ownership (`internal/executor/operators_sequence.go`'s
+      `seqRegistry` is a process-global `sync.Map` with zero dbOid concept
+      at all — needs a namespaced key scheme before any call site is
+      meaningfully fixable, the largest remaining structural gap, and
+      blocks the `CREATE DATABASE ... TEMPLATE` copy mechanism) and view
+      constraint-dependency tracking
+      (`catalog.InMemory.constraintViewDeps`'s stored values are bare
+      unqualified view names shared across the whole map — `DROP VIEW v`
+      in one database can silently strip a same-named unrelated view's
+      `DROP CONSTRAINT RESTRICT` protection in another, a real
+      cross-database corruption path), then the `CREATE DATABASE ...
+      TEMPLATE` copy mechanism itself. Gates: `go build ./...`/`go vet
+      ./...` clean; `go test -race ./internal/catalog/...
+      ./internal/executor/...` PASS; `go test -short $(go list ./... |
+      grep -v /internal/testport)` (full repo, short mode) PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed transactions, all 3 pgbench workloads — first run hit 1
+      pre-existing flaky failed transaction unrelated to this change,
+      confirmed by a clean second run with 0 failures across all 3
+      workloads).
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,
