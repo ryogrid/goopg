@@ -1,6 +1,6 @@
 # Per-database catalog namespace (M0122-0007 slice 4)
 
-Status: accepted (sub-slices 4a, 4b-i, 4b-ii, 4c, 4d-i, and 4d-ii-part-1 landed; 4d-ii-part-2, 4e planned)
+Status: accepted (sub-slices 4a, 4b-i, 4b-ii, 4c, 4d-i, 4d-ii-part-1, and 4d-ii-part-2a landed; 4d-ii-part-2b, 4e planned)
 Date: 2026-07-09
 Supersedes: none — extends the "Still open" note in
 `0122-0017-database-ddl-drop-guards.md` and the deferral-ledger rows dated
@@ -526,13 +526,97 @@ workloads).
 3. `RelFileNode.DBOid` at creation time (4d-ii's second named piece, below)
    — still hardcoded to `DefaultDBOid` regardless of connection.
 
-### 4d-ii-part-2 — Remaining executor-operator-level lookups + `RelFileNode.DBOid` (planned)
+### 4d-ii-part-2a — Signature-cascading `im`/`cat`-local lookups in `operators_ddl.go` (LANDED this loop, 2026-07-09)
 
-Two remaining pieces:
+Closed item 1 from 4d-ii-part-1's "explicitly out of scope" list: all 14
+`im.LookupTable`/`im.LookupIndex`/`cat.LookupTable` call sites in
+`operators_ddl.go` that were bound to a locally type-asserted `im, ok :=
+o.ctx.Catalog.(*catalog.InMemory)` or a bare `cat`/`im` function parameter
+with no dbOid argument. Re-auditing each site's enclosing function found the
+split was **not** as originally estimated — most sites turned out to be
+mechanical (the enclosing function is itself a `(o *ddlOp)` method, or
+already receives `ctx *Context`, so `o.ctx`/`ctx` was in scope the whole
+time and only a trailing `catalog.NamespaceDBOid(...)` argument was needed,
+exactly like 4d-ii-part-1's 60 sites):
 
-1. The signature-cascading `im`/`cat`-local lookups in `operators_ddl.go`
-   (item 1 above) plus the full cross-file sweep (item 2 above). Given the
-   scale, consider whether wrapping `ectx.Catalog` itself in a
+- `execCreateView`'s OR REPLACE branch (line ~4934, `im.LookupTable(s.Name)`).
+- `execAttrACLChange`'s column-GRANT table loop (line ~17026).
+- `execCommentOn`'s six `ObjKind` cases — table/index/column/constraint/
+  trigger/policy/rule (lines ~17179-17398): `im.LookupTable(s.ObjName)`
+  (×6) and `im.LookupIndex(s.ObjName)` (×1).
+- `execCreateStatistics`'s FROM-table resolution (line ~17472).
+- `lockRelationTransitively`'s view-body dependency walk (lines ~19887,
+  19889) — this one already receives `ctx *Context` as a parameter (it is
+  not a `ddlOp` method, but `ctx` was already threaded through), so it only
+  needed `catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)` appended.
+
+Only two clusters were genuine signature-cascades (the enclosing function
+truly has no `ctx`/dbOid in scope, confirmed via `find_referencing_symbols`
+before editing):
+
+- `collectAllViewTransitiveDeps(im, startName)` → added a `dbOid uint32`
+  parameter, threaded through its internal `im.LookupTable(curr)` call and
+  all 4 call sites (`execDropView`, `execDropTable` ×3), all of which are
+  `ddlOp` methods and pass `catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)`.
+- The `collectViewPKDeps`/`walkSelectPKDeps`/`walkExprPKDeps`/
+  `addGroupByPKDeps` cluster (mutually recursive AST walkers used by CREATE
+  VIEW to register PK-constraint dependencies, M0097-0036) → all four gained
+  a `dbOid uint32` parameter, threaded through `addGroupByPKDeps`'s internal
+  `cat.LookupTable(...)` call; the single external call site
+  (`execCreateView`) passes `catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)`.
+
+New tests (`internal/executor/ddl_write_dbid_routing_test.go`):
+`TestExecCommentOnFindsOwnDistinctDBOidTable` (table/column/index comment
+targets), `TestExecCreateStatisticsFindsOwnDistinctDBOidTable`,
+`TestExecAttrACLChangeFindsOwnDistinctDBOidTable` — each confirmed to FAIL
+when the corresponding call site's dbOid argument is temporarily reverted
+(non-vacuousness spot-check, not committed).
+
+**The two signature-cascaded functions (`collectAllViewTransitiveDeps` and
+the PK-deps cluster) are NOT covered by a regression test** — see the new
+finding below; they are currently unreachable on a genuinely distinct dbOid
+via any SQL path, so no test could observe a behavior difference yet. The
+code change itself was verified by inspection (matches the identical
+`catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)` pattern proven correct at
+70+ other sites across 4c/4d-i/4d-ii-part-1) and does not regress the
+DefaultDBOid/`postgres` path (full repo test suite + tpch-spotcheck +
+pgbench smoke all pass unchanged).
+
+**New finding (blocks testing/using the two signature-cascaded functions on
+a genuinely distinct dbOid today):** `catalog.InMemory.CreateView` (write
+side) and `AllUserViews`/`AllUserMatViews`/`IndexesOnTable` (read side used
+by `viewsDependingOnView`/`viewsDependingOnTable`/
+`matViewsDependingOnRelation`/`addGroupByPKDeps`'s own `IndexesOnTable`
+call) are **all** hardcoded to `c.ns(DefaultDBOid)` with no dbOid parameter
+at all — a materially larger gap than the "60+ LookupTable/LookupIndex call
+sites" 4d-i/4d-ii-part-1/4d-ii-part-2a closed. Concretely: (a) `CREATE VIEW`
+issued on a distinct-dbOid connection always lands the view under
+`DefaultDBOid` regardless of `ctx.CurrentDatabaseOid` (so two different
+databases' views of the same name collide in one shared namespace today);
+(b) even a table's own indexes are unreachable via `IndexesOnTable` once the
+table lives under a distinct dbOid, because `IndexesOnTable` never consults
+its `dbOid` — only `c.ns(DefaultDBOid).byTable`. Discovered while trying to
+write an end-to-end/white-box regression test for this loop's
+`collectAllViewTransitiveDeps` and PK-deps-cluster fixes: `CREATE VIEW ...
+FROM base` on a distinct-dbOid connection fails validation at
+`planner.Plan` (a separate, also-undocumented `o.planCatalog()` dbOid gap)
+before even reaching `CreateView`, and a white-box attempt to bypass SQL
+entirely by calling `addGroupByPKDeps` directly still failed because
+`IndexesOnTable` couldn't find the PK index created under the distinct
+dbOid. See the deferral-ledger row appended this loop for the resume point.
+
+### 4d-ii-part-2b — Remaining cross-file lookups + `RelFileNode.DBOid` (planned)
+
+Two remaining pieces (renumbered from the original "4d-ii-part-2"; part 2a's
+`operators_ddl.go`-local scope above is now closed):
+
+1. The full cross-file sweep item 2 from 4d-ii-part-1's "explicitly out of
+   scope" list: `operators_fk.go`, `operators_cluster.go`,
+   `operators_reindex.go`, `operators_sequence.go`, `operators_storage.go`,
+   `operators_pg_get_publication_tables.go`, and every DML operator
+   (`expr.go` and friends) — never grep-measured; re-measure via `grep -n
+   '\.LookupTable(\|\.LookupIndex('` across those files before starting.
+   Given the scale, consider whether wrapping `ectx.Catalog` itself in a
    `SearchPathCatalog` (mirroring `ectx.PlanCatalog`) is viable instead of
    touching every remaining call site individually — but note this breaks
    every `im, ok := o.ctx.Catalog.(*catalog.InMemory)` type assertion (262
@@ -548,6 +632,14 @@ Two remaining pieces:
    `ResolveDatabaseOid("postgres")` in every context; audit `NewInMemory`'s
    `dbOid: DefaultDBOid` seed and the `base/1/` + `base/5/` mirror before
    changing what oid live relations are created under.
+3. **New scope surfaced by 4d-ii-part-2a's finding above:** make
+   `catalog.InMemory.CreateView`, `AllUserViews`, `AllUserMatViews`, and
+   `IndexesOnTable` dbOid-aware (each currently hardcodes
+   `c.ns(DefaultDBOid)` with no dbOid parameter), and separately make
+   `o.planCatalog()`'s FROM-table resolution dbOid-aware — otherwise CREATE
+   VIEW/CREATE INDEX-visibility/dependency-walk correctness on a
+   distinct-dbOid connection stays broken regardless of how many
+   `LookupTable`/`LookupIndex` call sites get an explicit dbOid argument.
 
 ### 4e — Cross-cutting fixups + the original motivation (planned)
 
@@ -563,19 +655,22 @@ today, ready to become a hard assertion once this lands).
 ## Recommended order and stopping points
 
 4a (landed) → 4b-i (landed) → 4b-ii (landed) → 4c (landed) → 4d-i (landed) →
-4d-ii-part-1 (landed) → 4d-ii-part-2 → 4e, strictly in order — each depends
-on the previous sub-slice's data shape. 4d-ii-part-2 is next: the
-signature-cascading `im`/`cat`-local lookups still in `operators_ddl.go`,
-plus the cross-file sweep across `operators_fk.go`/`operators_cluster.go`/
-`operators_reindex.go`/`operators_sequence.go`/`operators_storage.go`/
-`operators_pg_get_publication_tables.go`/the DML operators (see 4d-ii-part-1's
-"explicitly out of scope" list above for the full breakdown), then wire
-`RelFileNode.DBOid` at creation time. Before starting 4d-ii-part-2, read
-4d-i's and 4d-ii-part-1's landed sections above in full — they document
-exactly which write entry points and which `operators_ddl.go` lookups
-already thread the connection's real dbOid (so 4d-ii-part-2's remaining
-lookups must resolve the SAME `catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)`
-value to actually find what 4d-i/4d-ii-part-1 create), the
+4d-ii-part-1 (landed) → 4d-ii-part-2a (landed) → 4d-ii-part-2b → 4e, strictly
+in order — each depends on the previous sub-slice's data shape.
+4d-ii-part-2b is next: the cross-file sweep across
+`operators_fk.go`/`operators_cluster.go`/`operators_reindex.go`/
+`operators_sequence.go`/`operators_storage.go`/
+`operators_pg_get_publication_tables.go`/the DML operators (see
+4d-ii-part-1's "explicitly out of scope" list above for the full
+breakdown), the newly-surfaced `CreateView`/`AllUserViews`/
+`AllUserMatViews`/`IndexesOnTable`/`planCatalog()` dbOid-awareness gap (see
+4d-ii-part-2a's "New finding" above), then wire `RelFileNode.DBOid` at
+creation time. Before starting 4d-ii-part-2b, read 4d-i's, 4d-ii-part-1's,
+and 4d-ii-part-2a's landed sections above in full — they document exactly
+which write entry points and which `operators_ddl.go` lookups already
+thread the connection's real dbOid (so 4d-ii-part-2b's remaining lookups
+must resolve the SAME `catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)`
+value to actually find what 4d-i/4d-ii-part-1/4d-ii-part-2a create), the
 `postgres`/`DefaultDBOid` dual-mirror shim that still applies unchanged, and
 the `ns()`/`getOrCreateNS` split (create-needing paths use `getOrCreateNS`;
 don't revert them to the old always-creating `ns()`). If a sub-slice is cut

@@ -6071,6 +6071,56 @@ mirroring M0119's ledger `status` column.
       (cross-cutting fixups + the `CREATE DATABASE ... TEMPLATE` copy
       mechanism this epic exists to unblock).
 
+  - [x] `M0122-0007` follow-up 13 (2026-07-09, this loop) — **slice 4
+      sub-slice 4d-ii-part-2a landed**: closed all 14 `im.LookupTable`/
+      `im.LookupIndex`/`cat.LookupTable` call sites 4d-ii-part-1 deferred
+      (`internal/executor/operators_ddl.go`). Re-auditing each site's
+      enclosing function found only 2 of the 14 were genuine
+      signature-cascades — the other 12 (`execCreateView`'s OR REPLACE
+      branch, `execAttrACLChange`, `execCommentOn`'s 6 `ObjKind` cases,
+      `execCreateStatistics`, `lockRelationTransitively`) were already
+      `(o *ddlOp)` methods or already received `ctx *Context`, so a
+      trailing `catalog.NamespaceDBOid(...)` argument sufficed, same
+      mechanical shape as part 1's 60 sites. The 2 real cascades —
+      `collectAllViewTransitiveDeps(im, startName)` and the
+      mutually-recursive `collectViewPKDeps`/`walkSelectPKDeps`/
+      `walkExprPKDeps`/`addGroupByPKDeps` cluster (M0097-0036's view
+      PK-dependency AST walk) — each gained a `dbOid uint32` parameter,
+      threaded through their own internal `LookupTable` call and every
+      external call site (4 callers for the first, 1 for the second).
+      New tests `TestExecCommentOnFindsOwnDistinctDBOidTable`,
+      `TestExecCreateStatisticsFindsOwnDistinctDBOidTable`,
+      `TestExecAttrACLChangeFindsOwnDistinctDBOidTable`
+      (`internal/executor/ddl_write_dbid_routing_test.go`), each confirmed
+      non-vacuous by temporarily reverting its site's dbOid argument.
+      **New finding, recorded in the design doc + a new deferral-ledger
+      row:** `catalog.InMemory.CreateView`/`AllUserViews`/
+      `AllUserMatViews`/`IndexesOnTable` are all hardcoded to
+      `c.ns(DefaultDBOid)` with no dbOid parameter at all — discovered
+      while trying (and failing) to write an end-to-end/white-box
+      regression test for the 2 signature-cascaded functions above; this
+      is a materially bigger, previously-undocumented gap than the
+      `LookupTable`/`LookupIndex` call-site sweep ever covered, filed as
+      new item 3 of 4d-ii-part-2b (design doc:
+      `docs/design/0122-0018-per-database-catalog-namespace.md`, split
+      into landed "4d-ii-part-2a" + renumbered planned "4d-ii-part-2b";
+      `docs/design/README.md` row updated). Gates: `go build ./...`/
+      `go vet ./...` clean; `go test -race ./internal/catalog/...
+      ./internal/executor/...` PASS; `go test -short $(go list ./... |
+      grep -v /internal/testport)` (full repo, short mode) PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS
+      (0 failed transactions, all 3 pgbench workloads). **Remaining
+      M0122-0007 items:** 4d-ii-part-2b (cross-file sweep across
+      `operators_fk.go`/`operators_cluster.go`/`operators_reindex.go`/
+      `operators_sequence.go`/`operators_storage.go`/
+      `operators_pg_get_publication_tables.go`/DML operators, the
+      newly-found `CreateView`/`AllUserViews`/`AllUserMatViews`/
+      `IndexesOnTable`/`planCatalog()` dbOid-awareness gap, and
+      `RelFileNode.DBOid`), then 4e (cross-cutting fixups + the
+      `CREATE DATABASE ... TEMPLATE` copy mechanism this epic exists to
+      unblock).
+
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,
       encoding constraints during bootstrap/runtime.

@@ -137,3 +137,127 @@ func TestExecCreateIndexFindsOwnDistinctDBOidTable(t *testing.T) {
 		t.Fatal("LookupIndex(otherDBOid) did not find the index created by this connection")
 	}
 }
+
+
+// TestExecCommentOnFindsOwnDistinctDBOidTable covers M0122-0007 slice
+// 4d-ii-part-2 item (1): execCommentOn's per-ObjKind im.LookupTable(s.ObjName)/
+// im.LookupIndex(s.ObjName) calls previously carried no dbOid argument, which
+// always resolved DefaultDBOid. On a connection bound to a genuinely distinct
+// dbOid, COMMENT ON TABLE/COLUMN/INDEX for an object created by that same
+// connection would report "does not exist" (or, worse, silently no-op on a
+// same-named DefaultDBOid object belonging to a different database).
+func TestExecCommentOnFindsOwnDistinctDBOidTable(t *testing.T) {
+	const oidPgClass = 1259
+	const otherDBOid = 4646
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+	ctx.CurrentDatabaseOid = otherDBOid
+
+	if err := runDDL(t, ctx, "CREATE TABLE base (id int4)"); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	if err := runDDL(t, ctx, "CREATE INDEX base_id_idx ON base (id)"); err != nil {
+		t.Fatalf("CREATE INDEX: %v", err)
+	}
+	if err := runDDL(t, ctx, "COMMENT ON TABLE base IS 'a table comment'"); err != nil {
+		t.Fatalf("COMMENT ON TABLE: %v", err)
+	}
+	if err := runDDL(t, ctx, "COMMENT ON COLUMN base.id IS 'a column comment'"); err != nil {
+		t.Fatalf("COMMENT ON COLUMN: %v", err)
+	}
+	if err := runDDL(t, ctx, "COMMENT ON INDEX base_id_idx IS 'an index comment'"); err != nil {
+		t.Fatalf("COMMENT ON INDEX: %v", err)
+	}
+
+	im, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		t.Fatal("ctx.Catalog is not *catalog.InMemory")
+	}
+	tblName := parser.ObjectName{Schema: "public", Name: "base"}
+	tbl, ok := im.LookupTable(tblName, otherDBOid)
+	if !ok {
+		t.Fatal("LookupTable(otherDBOid) did not find the table")
+	}
+	if desc, ok := im.GetComment(oidPgClass, tbl.OID, 0); !ok || desc != "a table comment" {
+		t.Fatalf("COMMENT ON TABLE: GetComment(pg_class, %d, 0)=(%q,%v), want (%q,true)", tbl.OID, desc, ok, "a table comment")
+	}
+	if desc, ok := im.GetComment(oidPgClass, tbl.OID, 1); !ok || desc != "a column comment" {
+		t.Fatalf("COMMENT ON COLUMN: GetComment(pg_class, %d, 1)=(%q,%v), want (%q,true)", tbl.OID, desc, ok, "a column comment")
+	}
+	idxName := parser.ObjectName{Schema: "public", Name: "base_id_idx"}
+	idx, ok := im.LookupIndex(idxName, otherDBOid)
+	if !ok {
+		t.Fatal("LookupIndex(otherDBOid) did not find the index")
+	}
+	if desc, ok := im.GetComment(oidPgClass, idx.OID, 0); !ok || desc != "an index comment" {
+		t.Fatalf("COMMENT ON INDEX: GetComment(pg_class, %d, 0)=(%q,%v), want (%q,true)", idx.OID, desc, ok, "an index comment")
+	}
+}
+
+// TestExecCreateStatisticsFindsOwnDistinctDBOidTable covers M0122-0007 slice
+// 4d-ii-part-2 item (1): execCreateStatistics's im.LookupTable(s.FromTable)
+// call previously carried no dbOid argument, so on a connection bound to a
+// genuinely distinct dbOid the FROM table was never found and the new
+// statistics object was silently registered with TableOID=0 (an orphan,
+// unattached to any real table) instead of the connection's own table.
+func TestExecCreateStatisticsFindsOwnDistinctDBOidTable(t *testing.T) {
+	const otherDBOid = 4646
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+	ctx.CurrentDatabaseOid = otherDBOid
+
+	if err := runDDL(t, ctx, "CREATE TABLE base (a int4, b int4)"); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	if err := runDDL(t, ctx, "CREATE STATISTICS stx1 (dependencies) ON a, b FROM base"); err != nil {
+		t.Fatalf("CREATE STATISTICS: %v", err)
+	}
+
+	im, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		t.Fatal("ctx.Catalog is not *catalog.InMemory")
+	}
+	tbl, ok := im.LookupTable(parser.ObjectName{Schema: "public", Name: "base"}, otherDBOid)
+	if !ok {
+		t.Fatal("LookupTable(otherDBOid) did not find the table")
+	}
+	obj, ok := im.LookupStatistics("stx1")
+	if !ok {
+		t.Fatal("LookupStatistics(stx1) not found")
+	}
+	if obj.TableOID != tbl.OID {
+		t.Fatalf("CREATE STATISTICS: TableOID=%d, want %d (the connection's own base table) — FROM-table lookup did not resolve the connection's real dbOid", obj.TableOID, tbl.OID)
+	}
+}
+
+// TestExecAttrACLChangeFindsOwnDistinctDBOidTable covers M0122-0007 slice
+// 4d-ii-part-2 item (1): execAttrACLChange's im.LookupTable(tn) call
+// previously carried no dbOid argument, so a column-level GRANT issued on a
+// connection bound to a genuinely distinct dbOid silently found nothing
+// (continue, no error) and recorded no privilege at all.
+func TestExecAttrACLChangeFindsOwnDistinctDBOidTable(t *testing.T) {
+	const otherDBOid = 4646
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+	ctx.CurrentDatabaseOid = otherDBOid
+
+	if err := runDDL(t, ctx, "CREATE TABLE base (id int4)"); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	if err := runDDL(t, ctx, "GRANT SELECT (id) ON base TO alice"); err != nil {
+		t.Fatalf("GRANT: %v", err)
+	}
+
+	im, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		t.Fatal("ctx.Catalog is not *catalog.InMemory")
+	}
+	tbl, ok := im.LookupTable(parser.ObjectName{Schema: "public", Name: "base"}, otherDBOid)
+	if !ok {
+		t.Fatal("LookupTable(otherDBOid) did not find the table")
+	}
+	acl := im.AttrACLText(tbl.OID, 1)
+	if acl == "" {
+		t.Fatal("AttrACLText is empty after GRANT SELECT (id) ON base TO alice — the column privilege was not recorded")
+	}
+}

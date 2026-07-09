@@ -4931,7 +4931,7 @@ func (o *ddlOp) execCreateView(s *parser.CreateViewStmt) error {
 	var oldViewOwner string
 	if s.OrReplace {
 		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
-			if existing, ok2 := im.LookupTable(s.Name); ok2 && existing.View != nil {
+			if existing, ok2 := im.LookupTable(s.Name, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); ok2 && existing.View != nil {
 				oldViewOID = existing.OID
 				oldViewOwner = existing.Owner
 			}
@@ -5064,7 +5064,7 @@ func (o *ddlOp) execCreateView(s *parser.CreateViewStmt) error {
 	// can detect that this view relies on the constraint. M0097-0036.
 	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
 		viewKey := s.Name.String()
-		for _, dep := range collectViewPKDeps(s.Query, o.ctx.Catalog) {
+		for _, dep := range collectViewPKDeps(s.Query, o.ctx.Catalog, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 			im.RegisterViewConstraintDep(viewKey, dep.tableOID, dep.constraintName)
 		}
 	}
@@ -5099,7 +5099,7 @@ type transitiveDep struct {
 // views and materialized views that transitively depend on it. startName
 // itself is NOT included in the result. The parentKind/parentName fields of
 // each entry record which immediate ancestor pulled the object in.
-func collectAllViewTransitiveDeps(im *catalog.InMemory, startName parser.ObjectName) []transitiveDep {
+func collectAllViewTransitiveDeps(im *catalog.InMemory, startName parser.ObjectName, dbOid uint32) []transitiveDep {
 	seen := map[string]bool{}
 	queue := []parser.ObjectName{startName}
 	var result []transitiveDep
@@ -5110,7 +5110,7 @@ func collectAllViewTransitiveDeps(im *catalog.InMemory, startName parser.ObjectN
 
 		// Determine the kind of curr.
 		currKind := "table"
-		if tbl, ok := im.LookupTable(curr); ok {
+		if tbl, ok := im.LookupTable(curr, dbOid); ok {
 			if tbl.IsMatView {
 				currKind = "materialized view"
 			} else if tbl.View != nil {
@@ -5149,7 +5149,7 @@ func (o *ddlOp) execDropView(s *parser.DropViewStmt) error {
 		// Before dropping, collect all transitive deps and emit ONE aggregate notice.
 		if s.Behavior == parser.DropCascade {
 			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
-				deps := collectAllViewTransitiveDeps(im, name)
+				deps := collectAllViewTransitiveDeps(im, name, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 				if len(deps) == 1 {
 					d := deps[0]
 					o.ctx.AddNotice(fmt.Sprintf("drop cascades to %s %s", d.kind, d.name.String()))
@@ -5574,7 +5574,7 @@ func (o *ddlOp) execDropTable(s *parser.DropTableStmt) error {
 				}
 				allDirect := append(append([]parser.ObjectName{}, directViews...), directMVs...)
 				for _, directDep := range allDirect {
-					transitiveDeps := collectAllViewTransitiveDeps(im, directDep)
+					transitiveDeps := collectAllViewTransitiveDeps(im, directDep, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 					for _, td := range transitiveDeps {
 						k := td.name.String()
 						if !seenTransitive[k] {
@@ -5617,7 +5617,7 @@ func (o *ddlOp) execDropTable(s *parser.DropTableStmt) error {
 						deps = append(deps, cascadeDep{kind: "view", display: "view " + vn.String(), viewName: vn})
 					}
 					// Transitively reachable views/matviews from this view.
-					for _, td := range collectAllViewTransitiveDeps(im, vn) {
+					for _, td := range collectAllViewTransitiveDeps(im, vn, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 						k2 := td.name.String()
 						if !seen[k2] {
 							seen[k2] = true
@@ -5634,7 +5634,7 @@ func (o *ddlOp) execDropTable(s *parser.DropTableStmt) error {
 						deps = append(deps, cascadeDep{kind: "materialized view", display: "materialized view " + mvn.String(), viewName: mvn})
 					}
 					// Transitively reachable matviews from this matview.
-					for _, td := range collectAllViewTransitiveDeps(im, mvn) {
+					for _, td := range collectAllViewTransitiveDeps(im, mvn, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 						k2 := td.name.String()
 						if !seen[k2] {
 							seen[k2] = true
@@ -9710,48 +9710,48 @@ type pkConstraintRef struct {
 // collectViewPKDeps scans a view's SELECT body AST and returns all PK constraints
 // that the view relies on via GROUP BY functional dependency. Used by CREATE VIEW
 // to register dependencies for DROP CONSTRAINT RESTRICT enforcement. M0097-0036.
-func collectViewPKDeps(sel *parser.SelectStmt, cat catalog.Catalog) []pkConstraintRef {
+func collectViewPKDeps(sel *parser.SelectStmt, cat catalog.Catalog, dbOid uint32) []pkConstraintRef {
 	seen := make(map[string]bool)
 	var out []pkConstraintRef
-	walkSelectPKDeps(sel, cat, &out, seen)
+	walkSelectPKDeps(sel, cat, &out, seen, dbOid)
 	return out
 }
 
-func walkSelectPKDeps(sel *parser.SelectStmt, cat catalog.Catalog, out *[]pkConstraintRef, seen map[string]bool) {
+func walkSelectPKDeps(sel *parser.SelectStmt, cat catalog.Catalog, out *[]pkConstraintRef, seen map[string]bool, dbOid uint32) {
 	if sel == nil {
 		return
 	}
 	// UNION/INTERSECT/EXCEPT: this SelectStmt is the left branch; recurse into right.
 	if sel.SetOp != nil {
-		walkSelectPKDeps(sel.SetOp.Right, cat, out, seen)
+		walkSelectPKDeps(sel.SetOp.Right, cat, out, seen, dbOid)
 	}
 	// Main SELECT body with GROUP BY.
 	if len(sel.GroupBy) > 0 {
-		addGroupByPKDeps(sel, cat, out, seen)
+		addGroupByPKDeps(sel, cat, out, seen, dbOid)
 	}
 	// Recurse into WHERE subqueries.
 	if sel.Where != nil {
-		walkExprPKDeps(sel.Where, cat, out, seen)
+		walkExprPKDeps(sel.Where, cat, out, seen, dbOid)
 	}
 }
 
-func walkExprPKDeps(e parser.Expr, cat catalog.Catalog, out *[]pkConstraintRef, seen map[string]bool) {
+func walkExprPKDeps(e parser.Expr, cat catalog.Catalog, out *[]pkConstraintRef, seen map[string]bool, dbOid uint32) {
 	if e == nil {
 		return
 	}
 	switch v := e.(type) {
 	case *parser.InExpr:
 		if v.Subquery != nil {
-			walkSelectPKDeps(v.Subquery, cat, out, seen)
+			walkSelectPKDeps(v.Subquery, cat, out, seen, dbOid)
 		}
 	case *parser.SubqueryExpr:
-		walkSelectPKDeps(v.Inner, cat, out, seen)
+		walkSelectPKDeps(v.Inner, cat, out, seen, dbOid)
 	case *parser.ExistsExpr:
-		walkSelectPKDeps(v.Subquery, cat, out, seen)
+		walkSelectPKDeps(v.Subquery, cat, out, seen, dbOid)
 	}
 }
 
-func addGroupByPKDeps(sel *parser.SelectStmt, cat catalog.Catalog, out *[]pkConstraintRef, seen map[string]bool) {
+func addGroupByPKDeps(sel *parser.SelectStmt, cat catalog.Catalog, out *[]pkConstraintRef, seen map[string]bool, dbOid uint32) {
 	// Build the set of column names present in GROUP BY (lower-cased).
 	groupBySet := make(map[string]bool)
 	for _, gb := range sel.GroupBy {
@@ -9766,13 +9766,13 @@ func addGroupByPKDeps(sel *parser.SelectStmt, cat catalog.Catalog, out *[]pkCons
 	// For each table-valued FROM entry, check if its full PK is covered.
 	for _, rv := range sel.From {
 		if rv.Subquery != nil {
-			walkSelectPKDeps(rv.Subquery, cat, out, seen)
+			walkSelectPKDeps(rv.Subquery, cat, out, seen, dbOid)
 			continue
 		}
 		if rv.Name == "" {
 			continue
 		}
-		tbl, ok := cat.LookupTable(parser.ObjectName{Schema: rv.Schema, Name: rv.Name})
+		tbl, ok := cat.LookupTable(parser.ObjectName{Schema: rv.Schema, Name: rv.Name}, dbOid)
 		if !ok {
 			continue
 		}
@@ -17023,7 +17023,7 @@ func (o *ddlOp) execAttrACLChange(ac *parser.AttrACLChange) error {
 		return nil
 	}
 	for _, tn := range ac.TableNames {
-		tbl, ok := im.LookupTable(tn)
+		tbl, ok := im.LookupTable(tn, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		if !ok || tbl == nil {
 			continue
 		}
@@ -17176,7 +17176,7 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 		// path. pg_dump chooses the COMMENT ON keyword from relkind (relkind='m'
 		// → MATERIALIZED VIEW, relkind='f' → FOREIGN TABLE); the stored
 		// pg_description row is keyword-agnostic. DU-002 slices 145, 146, 435.
-		tbl, ok := im.LookupTable(s.ObjName)
+		tbl, ok := im.LookupTable(s.ObjName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		if !ok {
 			return undefinedRelation()
 		}
@@ -17298,13 +17298,13 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 		}
 		im.SetComment(oidPgCast, cst.OID, 0, s.Description)
 	case "index":
-		idx, ok := im.LookupIndex(s.ObjName)
+		idx, ok := im.LookupIndex(s.ObjName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		if !ok {
 			return undefinedRelation()
 		}
 		im.SetComment(oidPgClass, idx.OID, 0, s.Description)
 	case "column":
-		tbl, ok := im.LookupTable(s.ObjName)
+		tbl, ok := im.LookupTable(s.ObjName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		if !ok {
 			return undefinedRelation()
 		}
@@ -17317,7 +17317,7 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 		return &ExecError{Code: "42703", Pos: s.Pos(),
 			Message: fmt.Sprintf("column %q of relation %q does not exist", s.SubName, s.ObjName.String())}
 	case "constraint":
-		tbl, ok := im.LookupTable(s.ObjName)
+		tbl, ok := im.LookupTable(s.ObjName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		if !ok {
 			return undefinedRelation()
 		}
@@ -17358,7 +17358,7 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 		// 2620) and objsubid 0, then re-emits `COMMENT ON TRIGGER <name> ON
 		// <table> IS '...'`. Resolve the trigger by name on the named table.
 		// DU-002 slice 370.
-		tbl, ok := im.LookupTable(s.ObjName)
+		tbl, ok := im.LookupTable(s.ObjName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		if !ok {
 			return undefinedRelation()
 		}
@@ -17376,7 +17376,7 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 		// and objsubid 0, then re-emits `COMMENT ON POLICY <name> ON <table>
 		// IS '...'`. Resolve the policy by name on the named table. DU-002
 		// slice 371.
-		tbl, ok := im.LookupTable(s.ObjName)
+		tbl, ok := im.LookupTable(s.ObjName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		if !ok {
 			return undefinedRelation()
 		}
@@ -17395,7 +17395,7 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 		// goopg models each CREATE RULE as a catalog.RuleInfo (with its own OID)
 		// on the owning table (DU-002 slice 324); resolve the rule by name there.
 		// DU-002 slice 372.
-		tbl, ok := im.LookupTable(s.ObjName)
+		tbl, ok := im.LookupTable(s.ObjName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		if !ok {
 			return undefinedRelation()
 		}
@@ -17469,7 +17469,7 @@ func (o *ddlOp) execCreateStatistics(s *parser.CreateStatisticsStmt) error {
 	// Resolve the table that this statistics object refers to.
 	var tableOID uint32
 	if s.FromTable.Name != "" {
-		tbl, ok := im.LookupTable(s.FromTable)
+		tbl, ok := im.LookupTable(s.FromTable, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		if ok {
 			tableOID = tbl.OID
 		}
@@ -19884,9 +19884,9 @@ func lockRelationTransitively(ctx *Context, sess Session, dbOID uint32, mode str
 		// Walk the view body to find referenced tables/views.
 		refs := collectSelectTableRefs(tbl.View)
 		for _, ref := range refs {
-			dep, ok := cat.LookupTable(parser.ObjectName{Schema: ref.Schema, Name: ref.Name})
+			dep, ok := cat.LookupTable(parser.ObjectName{Schema: ref.Schema, Name: ref.Name}, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid))
 			if !ok && ref.Schema == "" {
-				dep, ok = cat.LookupTable(parser.ObjectName{Schema: "public", Name: ref.Name})
+				dep, ok = cat.LookupTable(parser.ObjectName{Schema: "public", Name: ref.Name}, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid))
 			}
 			if !ok {
 				continue
