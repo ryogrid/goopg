@@ -665,7 +665,7 @@ func checkFKColumnTypeCompatibility(ctx *Context, childTbl *catalog.Table, fk ca
 	if len(fk.RefColumns) > 0 {
 		refColName = fk.RefColumns[0]
 	} else {
-		for _, idx := range ctx.Catalog.IndexesOnTable(refTbl) {
+		for _, idx := range ctx.Catalog.IndexesOnTable(refTbl, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)) {
 			if idx.Primary && len(idx.Columns) > 0 {
 				refColName = idx.Columns[0]
 				break

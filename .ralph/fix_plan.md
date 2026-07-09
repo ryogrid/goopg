@@ -6210,6 +6210,66 @@ mirroring M0119's ledger `status` column.
       short mode) PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
       `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
       failed transactions, all 3 pgbench workloads).
+  - [x] `M0122-0007` follow-up 16 (2026-07-10, this loop) — **closed
+      4d-ii-part-2b item 1, the cross-file `IndexesOnTable` sweep**, except
+      one deliberately deferred corner. Threaded
+      `catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)` through every
+      remaining un-scoped `IndexesOnTable` call site: `operators_fk.go` (1),
+      `operators_cluster.go` (3), `operators_reindex.go` (2),
+      `deferred_unique.go` (1), `context.go` (1), `operators_vacuum.go` (1),
+      `operators_upsert.go` (4), `ssi.go` (5), `operators_storage.go` (5),
+      and the ~24 remaining sites in `operators_ddl.go` left over from item
+      3's narrower scope. Re-measured `operators_sequence.go` and
+      `operators_pg_get_publication_tables.go` per the design doc's
+      instruction — both have zero `IndexesOnTable`/`AllUserViews`/
+      `AllUserMatViews` call sites, no change needed. `expr.go`'s
+      `buildForeignKeyDefString` (pg_get_constraintdef's FK branch) gained a
+      variadic `dbOid ...uint32` param threaded from `ctx.CurrentDatabaseOid`
+      at its one production call site.
+      **`internal/planner`'s own `IndexesOnTable` call sites needed no
+      direct edits at all:** added `catalog.SearchPathCatalog.IndexesOnTable`
+      (`internal/catalog/catalog.go`), mirroring its existing
+      `LookupTable`/`LookupIndex` overrides — `SearchPathCatalog` previously
+      had no override for `IndexesOnTable` at all, so any caller holding
+      only a `catalog.Catalog` interface value silently promoted straight to
+      the embedded `InMemory.IndexesOnTable` with no dbOid argument. Every
+      `internal/planner` caller reaches the catalog exclusively through
+      `ctx.PlanCatalog`/`ctxPlanCatalog` (always a dbOid-seeded
+      `SearchPathCatalog` per follow-up 15's fix), so this ONE addition
+      transparently fixed all 6 planner-package call sites
+      (`nl_index_join.go:655`, `planner.go:7379,8108,8225,11196,11400`)
+      without touching planner.go — e.g. `resolveDefaultDoNothingArbiter`,
+      which resolves the implicit arbiter index for a bare
+      `ON CONFLICT DO NOTHING`. Verified as a real, previously-latent bug
+      (not just a doc claim) via new test
+      `TestPlanUpsertDoNothingNoTargetFindsArbiterUnderDistinctDBOid`
+      (`internal/executor/operators_upsert_test.go`), confirmed to fail
+      (`ArbiterIndex` stays nil) against a revert of just the
+      `SearchPathCatalog.IndexesOnTable` addition — without an arbiter
+      index, `ON CONFLICT DO NOTHING`'s conflict probe never runs
+      (`maintainArbiter` no-ops when `o.arbiterTree` is nil), so a genuine
+      primary-key conflict would surface as an unhandled `23505` instead of
+      being silently skipped.
+      **Deliberately left unthreaded:** `internal/executor/applyworker.go`'s
+      `primaryKeyOnlyRow` still calls `cat.IndexesOnTable(tbl)` with no
+      dbOid — the entire logical-replication apply-worker path is uniformly
+      un-migrated for dbOid-awareness (its sibling `w.cat.LookupTable` call
+      also carries no dbOid; `NewApplyWorker` never receives a
+      per-subscription-dbOid-seeded catalog), so threading only this one
+      call would be a partial, inconsistent fix — needs its own dedicated
+      pass once the apply worker gains a per-subscription dbOid concept.
+      Design doc (`docs/design/0122-0018-per-database-catalog-namespace.md`)
+      4d-ii-part-2b item 1 updated to "fully landed except applyworker.go";
+      `docs/design/README.md` row extended; deferral ledger row appended.
+      **Remaining M0122-0007 items:** item 1's applyworker.go corner, item 2
+      (`RelFileNode.DBOid` wiring at creation time), then 4e. Gates:
+      `go build ./...`/`go vet ./...` clean; `go test -race
+      ./internal/catalog/... ./internal/executor/... ./internal/planner/...`
+      PASS; `go test -short $(go list ./... | grep -v /internal/testport)`
+      (full repo, short mode) PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+      scripts/ralph-precommit-test.sh` PASS (0 failed transactions, all 3
+      pgbench workloads).
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,

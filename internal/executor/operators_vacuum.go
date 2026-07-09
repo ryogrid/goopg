@@ -343,7 +343,7 @@ func relationStillExists(ctx *Context, tbl *catalog.Table) bool {
 // tuples collected during the heap vacuum pass. Empty index leaf pages are
 // deleted and the tree is compacted if fully empty (M0047-0002).
 func vacuumIndexes(ctx *Context, tbl *catalog.Table, deadTIDs []storage.ItemPointer) {
-	indexes := ctx.Catalog.IndexesOnTable(tbl)
+	indexes := ctx.Catalog.IndexesOnTable(tbl, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid))
 	for _, idx := range indexes {
 		if idx.Method != "btree" {
 			continue

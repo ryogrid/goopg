@@ -2786,7 +2786,7 @@ func idxRowHasConcurrentXmax(ctx *Context, rel storage.RelFileNode, blk storage.
 }
 
 func hotUpdateEligible(plan *planner.Update, ctx *Context) bool {
-	indexes := ctx.Catalog.IndexesOnTable(plan.Table)
+	indexes := ctx.Catalog.IndexesOnTable(plan.Table, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid))
 	for _, idx := range indexes {
 		for _, idxCol := range idx.Columns {
 			for i, set := range plan.Set {
@@ -6675,7 +6675,7 @@ func maintainUniqueIndexesForInsert(ctx *Context, tbl *catalog.Table, cols []cat
 	if ctx.Catalog == nil || ctx.Pool == nil {
 		return
 	}
-	for _, idx := range ctx.Catalog.IndexesOnTable(tbl) {
+	for _, idx := range ctx.Catalog.IndexesOnTable(tbl, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)) {
 		idxRel := ctx.Catalog.IndexRelFileNode(idx)
 		tree, err := btree.Open(ctx.Pool, idxRel)
 		if err != nil {
@@ -7045,7 +7045,7 @@ func checkUniqueIndexesForInsert(ctx *Context, tbl *catalog.Table, cols []catalo
 		return nil
 	}
 	rel := ctx.Catalog.RelFileNode(tbl)
-	for _, idx := range ctx.Catalog.IndexesOnTable(tbl) {
+	for _, idx := range ctx.Catalog.IndexesOnTable(tbl, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)) {
 		if !idx.Unique && !idx.Primary {
 			continue
 		}
@@ -7155,7 +7155,7 @@ func checkUniqueIndexesForUpdate(ctx *Context, tbl *catalog.Table, cols []catalo
 		return nil
 	}
 	rel := ctx.Catalog.RelFileNode(tbl)
-	for _, idx := range ctx.Catalog.IndexesOnTable(tbl) {
+	for _, idx := range ctx.Catalog.IndexesOnTable(tbl, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)) {
 		if !idx.Unique && !idx.Primary {
 			continue
 		}
@@ -7218,7 +7218,7 @@ func checkExclusionConstraintsForInsert(ctx *Context, tbl *catalog.Table, cols [
 		return nil
 	}
 	rel := ctx.Catalog.RelFileNode(tbl)
-	for _, idx := range ctx.Catalog.IndexesOnTable(tbl) {
+	for _, idx := range ctx.Catalog.IndexesOnTable(tbl, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)) {
 		if !idx.IsExclusion {
 			continue
 		}

@@ -109,7 +109,7 @@ func (o *clusterOp) Next() (TupleSlot, error) {
 // CLUSTER ON <idx>` action (slice 321). Returns 42704 if no such index exists.
 func markTableClusterIndex(ctx *Context, tbl *catalog.Table, idxName string, pos int) error {
 	var chosen *catalog.Index
-	for _, idx := range ctx.Catalog.IndexesOnTable(tbl) {
+	for _, idx := range ctx.Catalog.IndexesOnTable(tbl, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)) {
 		if strings.EqualFold(idx.Name, idxName) {
 			chosen = idx
 			break
@@ -122,7 +122,7 @@ func markTableClusterIndex(ctx *Context, tbl *catalog.Table, idxName string, pos
 			Message: fmt.Sprintf("index %q for table %q does not exist", idxName, tbl.Name),
 		}
 	}
-	for _, idx := range ctx.Catalog.IndexesOnTable(tbl) {
+	for _, idx := range ctx.Catalog.IndexesOnTable(tbl, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)) {
 		want := idx == chosen
 		if idx.IsClustered != want {
 			idx.IsClustered = want
@@ -139,7 +139,7 @@ func markTableClusterIndex(ctx *Context, tbl *catalog.Table, idxName string, pos
 // CLUSTER` (tablecmds.c ATExecSetWithoutCluster → mark_index_clustered(rel,
 // InvalidOid)). DU-002 slice 321.
 func clearTableClusterIndex(ctx *Context, tbl *catalog.Table) error {
-	for _, idx := range ctx.Catalog.IndexesOnTable(tbl) {
+	for _, idx := range ctx.Catalog.IndexesOnTable(tbl, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)) {
 		if idx.IsClustered {
 			idx.IsClustered = false
 			if err := resyncIndexHeapRow(ctx, idx); err != nil {

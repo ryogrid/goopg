@@ -141,7 +141,7 @@ func ssiRecordHashIndexInsert(ctx *Context, tbl *catalog.Table, cols []catalog.C
 	if !ssiActive(ctx) || tbl == nil {
 		return nil
 	}
-	for _, idx := range ctx.Catalog.IndexesOnTable(tbl) {
+	for _, idx := range ctx.Catalog.IndexesOnTable(tbl, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)) {
 		if !idx.DeclaredHash {
 			continue
 		}
@@ -200,7 +200,7 @@ func ssiGistIndexForTable(ctx *Context, tbl *catalog.Table, cols []catalog.Colum
 	if ctx == nil || ctx.Catalog == nil || tbl == nil {
 		return 0, 0, false
 	}
-	for _, idx := range ctx.Catalog.IndexesOnTable(tbl) {
+	for _, idx := range ctx.Catalog.IndexesOnTable(tbl, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)) {
 		if idx == nil || idx.Method != "gist" || len(idx.Columns) == 0 || idx.Columns[0] == "" {
 			continue
 		}
@@ -239,7 +239,7 @@ func ssiRecordGistIndexInsert(ctx *Context, tbl *catalog.Table, cols []catalog.C
 	if !ssiActive(ctx) || tbl == nil {
 		return nil
 	}
-	for _, idx := range ctx.Catalog.IndexesOnTable(tbl) {
+	for _, idx := range ctx.Catalog.IndexesOnTable(tbl, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)) {
 		if idx == nil || idx.Method != "gist" || len(idx.Columns) == 0 || idx.Columns[0] == "" {
 			continue
 		}
@@ -307,7 +307,7 @@ func ssiGinIndexForTable(ctx *Context, tbl *catalog.Table, cols []catalog.Column
 	if ctx == nil || ctx.Catalog == nil || tbl == nil {
 		return 0, 0, false, false
 	}
-	for _, idx := range ctx.Catalog.IndexesOnTable(tbl) {
+	for _, idx := range ctx.Catalog.IndexesOnTable(tbl, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)) {
 		if idx == nil || idx.Method != "gin" || len(idx.Columns) == 0 || idx.Columns[0] == "" {
 			continue
 		}
@@ -360,7 +360,7 @@ func ssiRecordGinIndexInsert(ctx *Context, tbl *catalog.Table, cols []catalog.Co
 	if !ssiActive(ctx) || tbl == nil {
 		return nil
 	}
-	for _, idx := range ctx.Catalog.IndexesOnTable(tbl) {
+	for _, idx := range ctx.Catalog.IndexesOnTable(tbl, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)) {
 		if idx == nil || idx.Method != "gin" || len(idx.Columns) == 0 || idx.Columns[0] == "" {
 			continue
 		}

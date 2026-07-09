@@ -1812,7 +1812,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 								}
 							}
 							// Copy PK columns from source.
-							for _, idx := range im2.IndexesOnTable(src) {
+							for _, idx := range im2.IndexesOnTable(src, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 								if idx.Primary {
 									s.PrimaryKey = append(s.PrimaryKey, idx.Columns...)
 									break
@@ -1820,7 +1820,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 							}
 						}
 						// Copy unique (non-PK) non-partial indexes and non-unique plain indexes.
-						for _, idx := range im2.IndexesOnTable(src) {
+						for _, idx := range im2.IndexesOnTable(src, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 							if idx.Primary || idx.HasPredicate || idx.IsExclusion {
 								continue
 							}
@@ -3628,10 +3628,10 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				oidPgClass      = uint32(1259)
 				oidPgConstraint = uint32(2606)
 			)
-			dstIndexes := im.IndexesOnTable(tbl)
+			dstIndexes := im.IndexesOnTable(tbl, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 			for _, lcs := range likeCommentSources {
 				// Index comments — match by column set.
-				for _, srcIdx := range im.IndexesOnTable(lcs.src) {
+				for _, srcIdx := range im.IndexesOnTable(lcs.src, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 					desc, hasComment := im.GetComment(oidPgClass, srcIdx.OID, 0)
 					if !hasComment || desc == "" {
 						continue
@@ -4205,7 +4205,7 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 	// child partition.  Naming uses the standard auto-generated form
 	// (`<child>_pkey` for PRIMARY, `<child>_<col>_key` for UNIQUE) so
 	// adjacency between catalog/btree state and pg_class is predictable.
-	for _, parentIdx := range o.ctx.Catalog.IndexesOnTable(parent) {
+	for _, parentIdx := range o.ctx.Catalog.IndexesOnTable(parent, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 		if parentIdx.Method != "btree" || (!parentIdx.Primary && !parentIdx.Unique) {
 			continue
 		}
@@ -4239,7 +4239,7 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 	// parent index and auto-generate a name using the partition name + column
 	// names + "_idx". Expression columns get "expr" as their name part so that
 	// two expression indexes on the same child get "_expr_idx" / "_expr_idx1".
-	for _, parentIdx := range o.ctx.Catalog.IndexesOnTable(parent) {
+	for _, parentIdx := range o.ctx.Catalog.IndexesOnTable(parent, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 		if parentIdx.Method != "btree" || parentIdx.Primary || parentIdx.Unique {
 			continue
 		}
@@ -5905,7 +5905,7 @@ func (o *ddlOp) dropHasTempShadow(name parser.ObjectName) bool {
 // recursion, or a non-deferrable explicit-txn drop) and by ApplyPendingTableDrops
 // at COMMIT for drops that were deferred. M0118-0008.
 func (o *ddlOp) dropTableByRefImmediate(name parser.ObjectName, tbl *catalog.Table) error {
-	idxs := o.ctx.Catalog.IndexesOnTable(tbl)
+	idxs := o.ctx.Catalog.IndexesOnTable(tbl, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 	idxRels := make([]storage.RelFileNode, 0, len(idxs))
 	idxOIDs := make([]uint32, 0, len(idxs))
 	for _, idx := range idxs {
@@ -7609,12 +7609,12 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			// upsertOp's arbiter probe and insertOp's unique-constraint check both
 			// miss live duplicates. Only create when the child doesn't already
 			// have a matching index. M0097-0028.
-			for _, parentIdx := range o.ctx.Catalog.IndexesOnTable(tbl) {
+			for _, parentIdx := range o.ctx.Catalog.IndexesOnTable(tbl, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 				if parentIdx.Method != "btree" || (!parentIdx.Primary && !parentIdx.Unique) {
 					continue
 				}
 				alreadyHas := false
-				for _, childIdx := range o.ctx.Catalog.IndexesOnTable(childTbl) {
+				for _, childIdx := range o.ctx.Catalog.IndexesOnTable(childTbl, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 					if len(childIdx.Columns) != len(parentIdx.Columns) {
 						continue
 					}
@@ -7952,7 +7952,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			}
 			// Update any index column references that use the old name.
 			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
-				for _, idx := range im.IndexesOnTable(tbl) {
+				for _, idx := range im.IndexesOnTable(tbl, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 					for i, col := range idx.Columns {
 						if strings.EqualFold(col, oldColName) {
 							idx.Columns[i] = newColName
@@ -8237,7 +8237,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			// clear on all others — and re-sync the pg_index heap row of any index
 			// whose flag actually changed (mirrors relation_mark_replica_identity's
 			// dirty-only update).
-			for _, idx := range o.ctx.Catalog.IndexesOnTable(tbl) {
+			for _, idx := range o.ctx.Catalog.IndexesOnTable(tbl, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 				want := idx == chosenIdx
 				if idx.IsReplicaIdentity != want {
 					idx.IsReplicaIdentity = want
@@ -9478,7 +9478,7 @@ func (o *ddlOp) execAlterTableDropConstraint(tbl *catalog.Table, act parser.Alte
 	// idx.Primary false. Same DU-002 slice 433 follow-up as the FK branch
 	// above.
 	var uqIdx *catalog.Index
-	for _, idx := range o.ctx.Catalog.IndexesOnTable(tbl) {
+	for _, idx := range o.ctx.Catalog.IndexesOnTable(tbl, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 		if !idx.Primary && idx.Unique && idx.IsConstraint && strings.EqualFold(idx.Name, act.ConstraintName) {
 			uqIdx = idx
 			break
@@ -9497,7 +9497,7 @@ func (o *ddlOp) execAlterTableDropConstraint(tbl *catalog.Table, act parser.Alte
 	// constraint existed (live-confirmed, not fixed alongside the FK/UNIQUE
 	// branches above). DU-002 slice 433 follow-up (2nd pass).
 	var exclIdx *catalog.Index
-	for _, idx := range o.ctx.Catalog.IndexesOnTable(tbl) {
+	for _, idx := range o.ctx.Catalog.IndexesOnTable(tbl, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 		if idx.IsExclusion && strings.EqualFold(idx.Name, act.ConstraintName) {
 			exclIdx = idx
 			break
@@ -9512,7 +9512,7 @@ func (o *ddlOp) execAlterTableDropConstraint(tbl *catalog.Table, act parser.Alte
 
 	// 4. PRIMARY KEY constraints.
 	var pkIdx *catalog.Index
-	for _, idx := range o.ctx.Catalog.IndexesOnTable(tbl) {
+	for _, idx := range o.ctx.Catalog.IndexesOnTable(tbl, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 		if idx.Primary && strings.EqualFold(idx.Name, act.ConstraintName) {
 			pkIdx = idx
 			break
@@ -9638,7 +9638,7 @@ func (o *ddlOp) nonFKConstraintExists(tbl *catalog.Table, name string) bool {
 			return true
 		}
 	}
-	for _, idx := range o.ctx.Catalog.IndexesOnTable(tbl) {
+	for _, idx := range o.ctx.Catalog.IndexesOnTable(tbl, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 		if (idx.Primary || idx.Unique) && strings.EqualFold(idx.Name, name) {
 			return true
 		}
@@ -11139,7 +11139,7 @@ func (o *ddlOp) truncateTableAndPartitions(tbl *catalog.Table, pos int, only boo
 			}
 		}
 	}
-	idxs := o.ctx.Catalog.IndexesOnTable(tbl)
+	idxs := o.ctx.Catalog.IndexesOnTable(tbl, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 	rel := o.ctx.Catalog.RelFileNode(tbl)
 
 	// Snapshot pages before truncation for transactional rollback support.
@@ -13082,7 +13082,7 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 // list. DU-002 slice 306.
 func resolveReplicaIdentityIndex(ctx *Context, tbl *catalog.Table, indexName string, pos int) (*catalog.Index, *ExecError) {
 	var idx *catalog.Index
-	for _, candidate := range ctx.Catalog.IndexesOnTable(tbl) {
+	for _, candidate := range ctx.Catalog.IndexesOnTable(tbl, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)) {
 		if strings.EqualFold(candidate.Name, indexName) {
 			idx = candidate
 			break
@@ -14172,7 +14172,7 @@ func (o *ddlOp) materializeView(tbl *catalog.Table, selectPlan planner.Node) err
 	// Rebuild all btree indexes on the matview after population.
 	// This also detects unique constraint violations (duplicate rows). M0097-0025.
 	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
-		for _, idx := range im.IndexesOnTable(tbl) {
+		for _, idx := range im.IndexesOnTable(tbl, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 			idxRel := o.ctx.Catalog.IndexRelFileNode(idx)
 			// Truncate (clear) the index storage before rebuilding.
 			o.ctx.Pool.InvalidateRel(idxRel)
@@ -14235,7 +14235,7 @@ func (o *ddlOp) execRefreshMatView(s *parser.RefreshMatViewStmt) error {
 	if s.Concurrently {
 		if im, ok2 := o.ctx.Catalog.(*catalog.InMemory); ok2 {
 			hasUnique := false
-			for _, idx := range im.IndexesOnTable(tbl) {
+			for _, idx := range im.IndexesOnTable(tbl, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 				if !idx.Unique || idx.HasPredicate {
 					continue // partial or non-unique — not suitable for CONCURRENTLY
 				}
@@ -14294,7 +14294,7 @@ func (o *ddlOp) execRefreshMatView(s *parser.RefreshMatViewStmt) error {
 			// Non-concurrent REFRESH → "could not create unique index 'name'".
 			idxName := ""
 			if im, ok2 := o.ctx.Catalog.(*catalog.InMemory); ok2 {
-				for _, idx := range im.IndexesOnTable(tbl) {
+				for _, idx := range im.IndexesOnTable(tbl, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 					if idx.Unique {
 						idxName = idx.Name
 						break
@@ -14312,7 +14312,7 @@ func (o *ddlOp) execRefreshMatView(s *parser.RefreshMatViewStmt) error {
 	if s.Concurrently {
 		if im, ok2 := o.ctx.Catalog.(*catalog.InMemory); ok2 {
 			hasUnique := false
-			for _, idx := range im.IndexesOnTable(tbl) {
+			for _, idx := range im.IndexesOnTable(tbl, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 				if !idx.Unique || idx.HasPredicate {
 					continue
 				}
@@ -17352,7 +17352,7 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 		// UNIQUE / PRIMARY KEY / EXCLUDE constraints are backed by indexes whose
 		// Name equals the constraint name; the index OID is the pg_constraint OID
 		// emitted by pg_constraint's VirtualRows. DU-002 slice 144.
-		for _, idx := range im.IndexesOnTable(tbl) {
+		for _, idx := range im.IndexesOnTable(tbl, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 			if (idx.IsConstraint || idx.IsExclusion) && idx.OID != 0 && strings.EqualFold(idx.Name, s.SubName) {
 				im.SetComment(oidPgConstraint, idx.OID, 0, s.Description)
 				return nil
@@ -19626,7 +19626,7 @@ func (o *ddlOp) execAlterDropColumn(tbl *catalog.Table, act parser.AlterTableAct
 	// Phase 3: drop indexes that reference the dropped column (key or INCLUDE),
 	// then truncate the heap and remaining indexes.
 	droppedColName := strings.ToLower(act.ColumnName)
-	for _, idx := range o.ctx.Catalog.IndexesOnTable(tbl) {
+	for _, idx := range o.ctx.Catalog.IndexesOnTable(tbl, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 		refsDropped := false
 		for _, c := range idx.Columns {
 			if strings.EqualFold(c, droppedColName) {
@@ -19660,7 +19660,7 @@ func (o *ddlOp) execAlterDropColumn(tbl *catalog.Table, act parser.AlterTableAct
 	if o.ctx.VM != nil {
 		o.ctx.VM.DropRelation(rel)
 	}
-	for _, idx := range o.ctx.Catalog.IndexesOnTable(tbl) {
+	for _, idx := range o.ctx.Catalog.IndexesOnTable(tbl, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 		idxRel := o.ctx.Catalog.IndexRelFileNode(idx)
 		o.ctx.Pool.InvalidateRel(idxRel)
 		_ = o.ctx.Pool.Manager().TruncateRelation(idxRel)
@@ -19797,7 +19797,7 @@ func (o *ddlOp) execAlterColumnType(tbl *catalog.Table, act parser.AlterTableAct
 	if o.ctx.VM != nil {
 		o.ctx.VM.DropRelation(rel)
 	}
-	for _, idx := range o.ctx.Catalog.IndexesOnTable(tbl) {
+	for _, idx := range o.ctx.Catalog.IndexesOnTable(tbl, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 		idxRel := o.ctx.Catalog.IndexRelFileNode(idx)
 		o.ctx.Pool.InvalidateRel(idxRel)
 		_ = o.ctx.Pool.Manager().TruncateRelation(idxRel)

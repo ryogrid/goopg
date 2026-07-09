@@ -253,7 +253,7 @@ func (o *reindexOp) rebuildIndex(idx *catalog.Index, pos int) error {
 // rebuildTableIndexes rebuilds every btree index on tbl. Used by plain
 // REINDEX TABLE. M0122-0007.
 func (o *reindexOp) rebuildTableIndexes(tbl *catalog.Table, pos int) error {
-	for _, idx := range o.ctx.Catalog.IndexesOnTable(tbl) {
+	for _, idx := range o.ctx.Catalog.IndexesOnTable(tbl, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 		if err := o.rebuildIndex(idx, pos); err != nil {
 			return err
 		}
@@ -324,7 +324,7 @@ func (o *reindexOp) rebuildIndexConcurrently(idx *catalog.Index, pos int) error 
 // failure on any index cleans up every shadow already built for earlier
 // indexes on this table before returning the error. M0122-0007.
 func (o *reindexOp) rebuildTableIndexesConcurrently(tbl *catalog.Table, pos int) error {
-	idxs := o.ctx.Catalog.IndexesOnTable(tbl)
+	idxs := o.ctx.Catalog.IndexesOnTable(tbl, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 	shadows := make(map[uint32]storage.RelFileNode, len(idxs))
 	for _, idx := range idxs {
 		shadowRel, built, err := o.buildIndexShadow(idx, pos)

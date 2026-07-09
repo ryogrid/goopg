@@ -1,6 +1,6 @@
 # Per-database catalog namespace (M0122-0007 slice 4)
 
-Status: accepted (sub-slices 4a, 4b-i, 4b-ii, 4c, 4d-i, 4d-ii-part-1, and 4d-ii-part-2a landed; 4d-ii-part-2b item 3 fully landed — own-signature half plus the `planCatalog()` half plus the `addGroupByPKDeps` follow-on bug it surfaced; items 1-2 + 4e planned)
+Status: accepted (sub-slices 4a, 4b-i, 4b-ii, 4c, 4d-i, 4d-ii-part-1, and 4d-ii-part-2a landed; 4d-ii-part-2b items 1 and 3 fully landed — item 1's applyworker.go corner and item 2 (`RelFileNode.DBOid`) + 4e remain planned)
 Date: 2026-07-09
 Supersedes: none — extends the "Still open" note in
 `0122-0017-database-ddl-drop-guards.md` and the deferral-ledger rows dated
@@ -693,6 +693,57 @@ Two remaining pieces (renumbered from the original "4d-ii-part-2"; part 2a's
    The former deferral-ledger row `AI-20260710-011513-001` /
    4d-ii-part-2b-item-1 is now resolved (see the ledger's `resolved` flip).
 
+4. **Item 1, the cross-file sweep, is now fully landed except one deliberately
+   deferred corner (`applyworker.go`).** Every remaining un-threaded
+   `IndexesOnTable` call site got `catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)`
+   threaded through: `operators_fk.go` (1), `operators_cluster.go` (3),
+   `operators_reindex.go` (2), `deferred_unique.go` (1), `context.go` (1),
+   `operators_vacuum.go` (1), `operators_upsert.go` (4), `ssi.go` (5),
+   `operators_storage.go` (5), and the ~24 remaining sites in
+   `operators_ddl.go` left over from item 3's narrower scope.
+   `operators_sequence.go` and `operators_pg_get_publication_tables.go` were
+   re-measured and turned out to have zero `IndexesOnTable`/`AllUserViews`/
+   `AllUserMatViews` call sites — no change needed there. `expr.go`'s
+   `buildForeignKeyDefString` (pg_get_constraintdef's FK-constraint branch)
+   gained a variadic `dbOid ...uint32` parameter, threaded from
+   `ctx.CurrentDatabaseOid` at its one production call site.
+
+   The `internal/planner` package's own `IndexesOnTable` call sites
+   (`nl_index_join.go:655`, `planner.go:7379,8108,8225,11196,11400`) needed
+   **no direct edits at all**. Instead, `catalog.SearchPathCatalog` gained a
+   new `IndexesOnTable` override (mirroring its existing `LookupTable`/
+   `LookupIndex` overrides) — before this addition, `SearchPathCatalog` had
+   no override for `IndexesOnTable` at all, so any caller holding only a
+   `catalog.Catalog` interface value (which every planner-package caller
+   does — they all reach the catalog exclusively through `ctx.PlanCatalog`/
+   `ctxPlanCatalog`, which item 3's fix above guarantees is always a
+   dbOid-seeded `SearchPathCatalog`) silently promoted straight to the
+   embedded `InMemory.IndexesOnTable` with no dbOid argument, always
+   resolving DefaultDBOid regardless of `SearchPathCatalog.DBOid`. Adding
+   the one override fixed all 6 planner-package call sites transparently —
+   e.g. `resolveDefaultDoNothingArbiter`, which resolves the implicit
+   arbiter index for a bare `ON CONFLICT DO NOTHING` (no explicit target).
+   Verified as a real, previously-latent bug via new test
+   `TestPlanUpsertDoNothingNoTargetFindsArbiterUnderDistinctDBOid`
+   (`internal/executor/operators_upsert_test.go`), confirmed to fail
+   (`ArbiterIndex` stays nil) against a revert of just the
+   `SearchPathCatalog.IndexesOnTable` addition — without an arbiter index,
+   `ON CONFLICT DO NOTHING`'s conflict probe never runs (`maintainArbiter`
+   no-ops when `o.arbiterTree` is nil), so a genuine primary-key conflict
+   would surface as an unhandled `23505` instead of being silently skipped.
+
+   **Deliberately left unthreaded:** `internal/executor/applyworker.go`'s
+   `primaryKeyOnlyRow` (~line 662) still calls `cat.IndexesOnTable(tbl)`
+   with no dbOid. The entire logical-replication apply-worker path is
+   uniformly un-migrated for dbOid-awareness — its sibling
+   `w.cat.LookupTable` call (line 217) also carries no dbOid argument, and
+   `NewApplyWorker` receives a bare `cat catalog.Catalog`, never a
+   per-subscription-dbOid-seeded `SearchPathCatalog` — so threading only
+   this one call would be a partial, inconsistent fix. Needs its own
+   dedicated pass: give `ApplyWorker` a per-subscription dbOid concept
+   first, then thread it through every `w.cat.*` call together. See the
+   deferral ledger's 2026-07-10 item-1 row.
+
 ### 4e — Cross-cutting fixups + the original motivation (planned)
 
 Once 4b-ii-4d land: dependent-object walks that assume a single global
@@ -711,17 +762,15 @@ today, ready to become a hard assertion once this lands).
 in order — each depends on the previous sub-slice's data shape.
 4d-ii-part-2b's item 3 (the `CreateView`/`AllUserViews`/`AllUserMatViews`/
 `IndexesOnTable`/`planCatalog()` dbOid-awareness gap, see 4d-ii-part-2a's
-"New finding" above) is now fully landed. What remains of 4d-ii-part-2b:
-item 1, the cross-file sweep across
-`operators_fk.go`/`operators_cluster.go`/`operators_reindex.go`/
-`operators_sequence.go`/`operators_storage.go`/
-`operators_pg_get_publication_tables.go`/the DML operators (see
-4d-ii-part-1's "explicitly out of scope" list above for the full
-breakdown, and this section's item 1 above — ~50 more un-threaded
-`IndexesOnTable`/`AllUserViews`/`AllUserMatViews` call sites, measured via
-`grep -rn '\.IndexesOnTable(\|\.AllUserViews(\|\.AllUserMatViews(' internal/`
-during this loop), then item 2, wiring `RelFileNode.DBOid` at creation
-time. Before resuming 4d-ii-part-2b, read 4d-i's, 4d-ii-part-1's,
+"New finding" above) and item 1 (the cross-file `IndexesOnTable` sweep,
+including the `catalog.SearchPathCatalog.IndexesOnTable` override that
+transparently covers every `internal/planner` call site) are now both
+fully landed. What remains of 4d-ii-part-2b: item 1's one deliberately
+deferred corner (`internal/executor/applyworker.go`'s logical-replication
+apply-worker path — needs a per-subscription dbOid concept that doesn't
+exist yet before it can be threaded consistently), then item 2, wiring
+`RelFileNode.DBOid` at creation time. Before resuming 4d-ii-part-2b, read
+4d-i's, 4d-ii-part-1's,
 and 4d-ii-part-2a's landed sections above in full — they document exactly
 which write entry points and which `operators_ddl.go` lookups already
 thread the connection's real dbOid (so 4d-ii-part-2b's remaining lookups

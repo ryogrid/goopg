@@ -897,7 +897,7 @@ func (c *Context) acquireScanIndexReadLocksTxn(tbl *catalog.Table) error {
 	if tbl == nil || c.Catalog == nil {
 		return nil
 	}
-	for _, idx := range c.Catalog.IndexesOnTable(tbl) {
+	for _, idx := range c.Catalog.IndexesOnTable(tbl, catalog.NamespaceDBOid(c.CurrentDatabaseOid)) {
 		if idx == nil {
 			continue
 		}

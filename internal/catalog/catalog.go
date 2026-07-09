@@ -20096,6 +20096,18 @@ func (c *SearchPathCatalog) LookupIndex(name parser.ObjectName, dbOid ...uint32)
 	return c.Catalog.LookupIndex(name, c.effectiveDBOid(dbOid)...)
 }
 
+// IndexesOnTable overrides the embedded Catalog.IndexesOnTable to key the
+// lookup off the querying connection's real database (effectiveDBOid,
+// M0122-0007 slice 4c) — mirrors LookupTable/LookupIndex above. Without this
+// override, every planner-package caller that holds only a catalog.Catalog
+// interface value (e.g. cat.IndexesOnTable(tbl) in internal/planner) silently
+// promoted straight to the embedded InMemory.IndexesOnTable with no dbOid
+// argument, always resolving DefaultDBOid's indexes regardless of c.DBOid —
+// 4d-ii-part-2b item 1.
+func (c *SearchPathCatalog) IndexesOnTable(table *Table, dbOid ...uint32) []*Index {
+	return c.Catalog.IndexesOnTable(table, c.effectiveDBOid(dbOid)...)
+}
+
 // Unwrap returns the underlying Catalog, allowing callers to peel the
 // search-path layer for type assertions (e.g., to *InMemory). M0097-0022.
 func (c *SearchPathCatalog) Unwrap() Catalog { return c.Catalog }

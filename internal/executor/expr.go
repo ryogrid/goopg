@@ -4972,7 +4972,7 @@ func buildConstraintDefString(idx *catalog.Index) string {
 // DEFERRABLE clause are appended; MATCH SIMPLE (the default) is omitted, as PG
 // does. A trailing ` NOT VALID` is appended for an unvalidated FK
 // (convalidated='f'). DU-002 slices 51, 307.
-func buildForeignKeyDefString(im *catalog.InMemory, fk catalog.ForeignKey) string {
+func buildForeignKeyDefString(im *catalog.InMemory, fk catalog.ForeignKey, dbOid ...uint32) string {
 	var refTbl *catalog.Table
 	for _, t := range im.AllTables() {
 		if t.Virtual || t.OID == 0 {
@@ -4993,7 +4993,7 @@ func buildForeignKeyDefString(im *catalog.InMemory, fk catalog.ForeignKey) strin
 		refName = refTbl.Name
 		if len(refCols) == 0 {
 			// Default to the referenced table's primary-key columns.
-			for _, idx := range im.IndexesOnTable(refTbl) {
+			for _, idx := range im.IndexesOnTable(refTbl, dbOid...) {
 				if idx.Primary {
 					refCols = idx.Columns
 					break
@@ -8067,7 +8067,7 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 					if fk.OID == 0 || fk.OID != targetOID {
 						continue
 					}
-					return NewStringDatum(buildForeignKeyDefString(im, fk)), nil
+					return NewStringDatum(buildForeignKeyDefString(im, fk, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid))), nil
 				}
 			}
 			// Domain CHECK constraints (contype='c', keyed on contypid). pg_dump's
