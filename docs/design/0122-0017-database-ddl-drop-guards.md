@@ -134,13 +134,71 @@ Gates: `go build ./...`/`go vet ./internal/catalog/... ./internal/wal/...
 ./internal/catalog/... ./internal/wal/... ./internal/server/...
 ./internal/initdb/...` PASS (full packages, no regressions).
 
+## `WITH (FORCE)` connection termination (2026-07-09 follow-up 2, this loop)
+
+The previous follow-up's "still open" list was wrong about the blocker: goopg
+already has a connection-termination mechanism — `backendCancelRegistry`
+(`cancel.go`), the process-wide registry behind a peer
+`pg_terminate_backend(pid)` call (`ctx.TerminateBackend`, wired in
+`dispatch.go`/`dispatch_extended.go`). `DROP DATABASE ... WITH (FORCE)` just
+needed to drive that same registry itself instead of only being reachable
+from the `pg_terminate_backend` SQL function.
+
+Mirrors `dbcommands.c dropdb()`'s real shape: `if (force)
+TerminateOtherDBBackends(db_id)` runs immediately before the
+`CountOtherDBBackends` busy check (`procarray.c`). New `dropDatabaseHasForce`
+(regex on the trailing `[ [ WITH ] ( FORCE ) ]` clause — `classifyDatabaseDDL`
+already strips/ignores every other trailing option, so this only needs to
+special-case FORCE) gates two new `*Server` methods called from
+`tryHandleDatabaseDDL`'s `databaseDDLDrop` branch, both in
+`internal/server/database_ddl.go`:
+
+- `terminateOtherDBBackends(name)` — walks `activity.Registry.Snapshot()`
+  for every backend whose `DatName == name` and fires
+  `cancelReg.terminateByPID` on each PID, exactly the path
+  `pg_terminate_backend(pid)` uses for a peer backend.
+- `waitForDatabaseBackendsToDrain(name)` — polls `CountByDatName(name)` for up
+  to 5s (50 × 100ms), mirroring `CountOtherDBBackends`'s own retry loop: a
+  terminated backend's connection goroutine needs a moment to actually tear
+  down and unregister from the activity registry before the immediately
+  following busy check runs.
+
+Both are called ONLY when `WITH (FORCE)` is present — a plain `DROP DATABASE`
+keeps its pre-existing single immediate `CountByDatName` check unchanged (no
+wait), since upstream's *unconditional* 5s retry-wait inside
+`CountOtherDBBackends` (which applies even without FORCE, e.g. to give an
+already-disconnecting backend time to leave) is a separate, not-yet-ported
+behaviour change, deferred below.
+
+**Simplification carried over from `pg_terminate_backend`:** no per-backend
+permission check (upstream's `TerminateOtherDBBackends` requires
+`has_privs_of_role`/superuser-vs-superuser checks per target PID) — goopg's
+existing `pg_terminate_backend` SQL function already skips this
+(`expr.go`), and the DROP DATABASE ownership/superuser guard already gates
+the whole statement, so this mirrors the codebase's existing scope level
+rather than introducing a new gap.
+
+Live-verified against a real `cmd/goopg` binary (throwaway data dir, port
+5601): `CREATE DATABASE forcetest`, a background `psql -d forcetest -c
+"SELECT pg_sleep(60)"` held it busy. `DROP DATABASE forcetest` (no FORCE)
+correctly errored `"is being accessed by other users"`. `DROP DATABASE
+forcetest WITH (FORCE)` succeeded in ~100ms; the busy session's client saw
+`FATAL: terminating connection due to administrator command` (the same
+message a real `pg_terminate_backend` termination produces); `pg_database`
+no longer listed `forcetest` afterward. Tests:
+`TestTryHandleDatabaseDDLDropForceTerminatesOtherBackends`,
+`TestDropDatabaseHasForce` (`internal/server/database_ddl_test.go`). Gates:
+`go build ./...` clean; `go vet ./internal/server/...` clean; `go test
+./internal/server/...` PASS (full package, no regressions);
+`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+scripts/ralph-precommit-test.sh` PASS (0 failed transactions, all 3
+workloads).
+
 ## Still open (M0122-0007 bucket)
 
 - Full per-database physical storage isolation (template copy on CREATE, real
   directory removal on DROP) — the architectural item every prior loop in this
   bucket has correctly deferred whole; see the deferral ledger row appended
   alongside this doc.
-- `WITH (FORCE)` connection termination (needs a signal/cancel-backend
-  mechanism goopg doesn't have yet).
 - `REINDEX ... CONCURRENTLY` physical rebuild (separate, pre-existing item,
   unaffected by this change).

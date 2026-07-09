@@ -471,3 +471,77 @@ func TestTryHandleDatabaseDDLDropGuards(t *testing.T) {
 		t.Error("DROP DATABASE tpch (idle): database still registered after a successful drop")
 	}
 }
+
+// TestTryHandleDatabaseDDLDropForceTerminatesOtherBackends pins the WITH
+// (FORCE) path (M0122-0007): a busy database that would otherwise fail the
+// "is being accessed by other users" guard succeeds instead, because FORCE
+// signals the other backend's connection-termination function (the same
+// process-wide cancelReg.terminateByPID path pg_terminate_backend(pid)
+// already uses) before the busy check runs.
+func TestTryHandleDatabaseDDLDropForceTerminatesOtherBackends(t *testing.T) {
+	s := newTestRoleServer()
+	im := s.cfg.Catalog.(*catalog.InMemory)
+	if err := im.CreateDatabase("tpch", catalog.BootstrapSuperuserOID); err != nil {
+		t.Fatalf("seed CreateDatabase(tpch): %v", err)
+	}
+
+	reg := activity.NewRegistry()
+	s.cfg.Activity = reg
+	reg.Register(&activity.Backend{PID: "999", DatName: "tpch", BackendType: "client_backend"})
+	defer reg.Unregister("999")
+
+	// Simulate a live backend: registering a cancelEntry with a terminate
+	// function that (mirroring what a real connection's serve-loop teardown
+	// does) unregisters the backend from the activity registry once fired.
+	terminated := false
+	entry := s.cancelReg.register(999, 1)
+	entry.setTerminate(func() {
+		terminated = true
+		reg.Unregister("999")
+	})
+	defer s.cancelReg.unregister(999)
+
+	// Without FORCE, the plain busy check still rejects — unchanged.
+	handled, _, err := s.tryHandleDatabaseDDL("DROP DATABASE tpch", "postgres", "", nil)
+	if !handled || err == nil {
+		t.Fatalf("DROP DATABASE tpch (busy, no force): handled=%v err=%v, want an error", handled, err)
+	}
+	if terminated {
+		t.Error("DROP DATABASE tpch (no force): terminate function fired without WITH (FORCE)")
+	}
+	if !im.HasDatabase("tpch") {
+		t.Error("DROP DATABASE tpch (busy, no force): database was removed despite the rejection")
+	}
+
+	// WITH (FORCE) terminates the other backend and succeeds.
+	handled, _, err = s.tryHandleDatabaseDDL("DROP DATABASE tpch WITH (FORCE)", "postgres", "", nil)
+	if !handled || err != nil {
+		t.Fatalf("DROP DATABASE tpch WITH (FORCE): handled=%v err=%v, want success", handled, err)
+	}
+	if !terminated {
+		t.Error("DROP DATABASE tpch WITH (FORCE): terminate function never fired")
+	}
+	if im.HasDatabase("tpch") {
+		t.Error("DROP DATABASE tpch WITH (FORCE): database still registered after a successful drop")
+	}
+}
+
+func TestDropDatabaseHasForce(t *testing.T) {
+	cases := []struct {
+		sql  string
+		want bool
+	}{
+		{"DROP DATABASE foo", false},
+		{"DROP DATABASE foo WITH (FORCE)", true},
+		{"DROP DATABASE foo WITH ( FORCE )", true},
+		{"drop database foo (force)", true},
+		{"DROP DATABASE IF EXISTS foo WITH (FORCE);", true},
+		{"DROP DATABASE foo WITH (FORCE) ", true},
+		{"DROP DATABASE foo TEMPLATE=false", false},
+	}
+	for _, c := range cases {
+		if got := dropDatabaseHasForce(c.sql); got != c.want {
+			t.Errorf("dropDatabaseHasForce(%q) = %v, want %v", c.sql, got, c.want)
+		}
+	}
+}

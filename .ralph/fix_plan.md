@@ -5452,6 +5452,50 @@ mirroring M0119's ledger `status` column.
       isolation (template copy on CREATE, real directory removal on DROP —
       the architectural item), `WITH (FORCE)` connection-termination (no
       cancel-backend mechanism), REINDEX CONCURRENTLY physical rebuild.
+  - [x] `M0122-0007` follow-up 2 (2026-07-09, this loop) — **`DROP DATABASE
+      ... WITH (FORCE)` connection termination, done.** The prior loop's
+      "no cancel-backend mechanism" note was wrong: goopg already has one —
+      `backendCancelRegistry` (`internal/server/cancel.go`), the process-wide
+      registry behind a peer `pg_terminate_backend(pid)` call. New
+      `dropDatabaseHasForce` (`internal/server/database_ddl.go`) detects the
+      trailing `WITH (FORCE)`/`(FORCE)` clause (the only option this bypass
+      recognises, matching real PG's `DropdbStmt.options`); when present,
+      `tryHandleDatabaseDDL`'s `databaseDDLDrop` branch calls two new
+      `*Server` methods mirroring `dbcommands.c dropdb()`'s
+      `if (force) TerminateOtherDBBackends(db_id)` ordering (right before the
+      busy check): `terminateOtherDBBackends(name)` walks
+      `activity.Registry.Snapshot()` for every backend on the target database
+      and fires `cancelReg.terminateByPID` (same path `pg_terminate_backend`
+      uses for a peer); `waitForDatabaseBackendsToDrain(name)` polls
+      `CountByDatName` for up to 5s (50×100ms), mirroring
+      `CountOtherDBBackends`'s own retry loop — the window a just-terminated
+      backend needs to actually unregister before the busy check
+      (immediately following) runs. A plain (non-FORCE) DROP DATABASE keeps
+      its pre-existing single immediate check unchanged — no wait added
+      there (out of scope; upstream's unconditional 5s retry-wait even
+      without FORCE is a separate, not-yet-ported behaviour). No new
+      permission check beyond the existing DROP DATABASE owner/superuser
+      guard — mirrors the simplification goopg's `pg_terminate_backend` SQL
+      function already makes. Tests:
+      `TestTryHandleDatabaseDDLDropForceTerminatesOtherBackends`,
+      `TestDropDatabaseHasForce` (`internal/server/database_ddl_test.go`).
+      Design: `docs/design/0122-0017-database-ddl-drop-guards.md` new
+      "`WITH (FORCE)` connection termination" section; `docs/design/
+      README.md` row updated. Live-verified against a real `cmd/goopg`
+      binary (throwaway data dir, port 5601): a background `psql -d
+      forcetest -c "SELECT pg_sleep(60)"` held the database busy; plain
+      `DROP DATABASE forcetest` correctly errored "is being accessed by
+      other users"; `DROP DATABASE forcetest WITH (FORCE)` succeeded in
+      ~100ms, the busy session's client saw `FATAL: terminating connection
+      due to administrator command`, and `pg_database` no longer listed
+      `forcetest` afterward. Gates: `go build ./...` clean; `go vet
+      ./internal/server/...` clean; `go test ./internal/server/...` PASS
+      (full package, no regressions); `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+      scripts/ralph-precommit-test.sh` PASS (0 failed transactions, all 3
+      workloads). **Remaining M0122-0007 items (now 2):** CREATE/DROP
+      DATABASE physical storage isolation (the architectural item), REINDEX
+      CONCURRENTLY physical rebuild.
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,

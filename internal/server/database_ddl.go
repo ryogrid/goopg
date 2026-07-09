@@ -33,7 +33,10 @@ package server
 import (
 	"errors"
 	"fmt"
+	"regexp"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/protocol"
@@ -400,6 +403,25 @@ func classifyDatabaseDDL(sql string) (databaseDDLKind, string) {
 	return databaseDDLNone, ""
 }
 
+// dropDatabaseForceRe matches the trailing `[ [ WITH ] ( FORCE ) ]` clause of
+// a DROP DATABASE statement (gram.y's createdb_opt_list analog, reused for
+// DROP DATABASE) — the only option this bypass recognises. Any other
+// trailing option keeps falling through classifyDatabaseDDL's existing
+// "trailing options are ignored" looseness (package doc comment above).
+var dropDatabaseForceRe = regexp.MustCompile(`(?:with\s*)?\(\s*force\s*\)\s*$`)
+
+// dropDatabaseHasForce reports whether sql is a DROP DATABASE statement
+// carrying a WITH (FORCE) (or bare (FORCE)) option — PG's dbcommands.c
+// dropdb() `force` argument, sourced from DropdbStmt.options in
+// standard_ProcessUtility.
+func dropDatabaseHasForce(sql string) bool {
+	s := strings.TrimSpace(sql)
+	for strings.HasSuffix(s, ";") {
+		s = strings.TrimSpace(strings.TrimSuffix(s, ";"))
+	}
+	return dropDatabaseForceRe.MatchString(strings.ToLower(s))
+}
+
 // extractFirstIdentifier reads the first SQL identifier from s,
 // honouring double-quoted form. Returns "" when s is empty or
 // the leading token is not an identifier.
@@ -596,8 +618,17 @@ func (s *Server) tryHandleDatabaseDDL(sql string, liveDBName string, actingRole 
 				msg:  "cannot drop the currently open database",
 			}
 		}
+		// PG: dropdb(), "Attempt to terminate all existing connections to
+		// the target database if the user has requested to do so"
+		// (dbcommands.c, `if (force) TerminateOtherDBBackends(db_id)`). Only
+		// WITH (FORCE) exercises this path; a plain DROP DATABASE keeps the
+		// pre-existing single immediate busy check below unchanged — out of
+		// scope here (see waitForDatabaseBackendsToDrain's doc comment).
+		if dropDatabaseHasForce(sql) {
+			s.terminateOtherDBBackends(name)
+			s.waitForDatabaseBackendsToDrain(name)
+		}
 		// PG: dropdb(), CountOtherDBBackends() (ERRCODE_OBJECT_IN_USE).
-		// goopg has no FORCE/TerminateOtherDBBackends equivalent yet.
 		if s.cfg.Activity != nil {
 			if n := s.cfg.Activity.CountByDatName(name); n > 0 {
 				return true, "", &databaseDDLError{
@@ -632,6 +663,54 @@ func (s *Server) tryHandleDatabaseDDL(sql string, liveDBName string, actingRole 
 		return true, "", nil
 	}
 	return false, "", nil
+}
+
+// terminateOtherDBBackends signals every backend currently connected to
+// database name to terminate — PG's TerminateOtherDBBackends (procarray.c),
+// the mechanism behind DROP DATABASE ... WITH (FORCE). Reuses the exact
+// process-wide cancelReg.terminateByPID path a peer pg_terminate_backend(pid)
+// call goes through (cancel.go), which fires the target connection's root
+// context cancel so its serve loop tears the connection down. A backend
+// whose PID no longer resolves in cancelReg (already exited) is silently
+// skipped, matching upstream's tolerance for a connection racing its own
+// disconnect. Unlike upstream, this applies no extra permission check beyond
+// the DROP DATABASE ownership/superuser guard already gating the caller —
+// the same simplification goopg's pg_terminate_backend already makes
+// (expr.go), so a non-superuser DB owner can force-terminate another role's
+// backend here exactly as pg_terminate_backend already lets them.
+func (s *Server) terminateOtherDBBackends(name string) {
+	if s.cfg.Activity == nil || s.cancelReg == nil {
+		return
+	}
+	for _, b := range s.cfg.Activity.Snapshot() {
+		if b.DatName != name {
+			continue
+		}
+		pid, err := strconv.ParseUint(b.PID, 10, 32)
+		if err != nil {
+			continue
+		}
+		s.cancelReg.terminateByPID(uint32(pid))
+	}
+}
+
+// waitForDatabaseBackendsToDrain polls CountByDatName(name) for up to 5
+// seconds (50 tries * 100ms), mirroring CountOtherDBBackends' own retry loop
+// (procarray.c) — the window a just-terminated backend needs to actually
+// unregister itself before tryHandleDatabaseDDL's busy check (immediately
+// following the caller of this function) runs. Unlike upstream, this is
+// only invoked from the WITH (FORCE) path: a plain DROP DATABASE keeps its
+// pre-existing single immediate check (no wait), since CountOtherDBBackends'
+// unconditional 5s retry-wait is a separate, not-yet-ported behaviour change
+// that isn't needed to make FORCE itself work — see M0122-0007 remaining
+// items in fix_plan.md.
+func (s *Server) waitForDatabaseBackendsToDrain(name string) {
+	for tries := 0; tries < 50; tries++ {
+		if s.cfg.Activity.CountByDatName(name) == 0 {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 // handleDatabaseDDLBypass runs tryHandleDatabaseDDL against sql and, when it
