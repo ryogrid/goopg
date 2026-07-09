@@ -312,7 +312,8 @@ see "What this does NOT do" for why.
   a crash could in principle lose the `mkdir` while the WAL record survives
   (analogous to why upstream's `CreateDirAndVersionFile` tolerates `EEXIST`
   during redo). Idempotent recreation on every replay closes that gap for
-  free. DROP DATABASE replay does **not** remove the directory (see below).
+  free. DROP DATABASE replay did **not** remove the directory at the time
+  this section was written — closed by slice 3, below.
 
 **What this does NOT do (re-scoping slice 2's original template-copy plan):**
 
@@ -356,11 +357,68 @@ any client reconnected. Gates: `go build ./...` clean; `go vet
 scripts/ralph-precommit-test.sh` PASS (0 failed transactions, all 3
 workloads).
 
+## Physical-storage-isolation slice 3: `base/<dbOid>` directory removal on DROP DATABASE (2026-07-09 follow-up 5)
+
+Closes the gap slice 2 left open: `base/<dbOid>` was created on `CREATE
+DATABASE` but never removed on `DROP DATABASE`, so every dropped database
+left a permanently orphaned empty directory.
+
+**What changed:**
+
+- `internal/initdb.RemovePerDatabaseScaffolding(dataDir, dbOID)` (new,
+  `internal/initdb/initdb.go`) — the symmetric counterpart to
+  `CreatePerDatabaseScaffolding`: `os.RemoveAll(base/<oid>)`. Idempotent
+  (`RemoveAll` on an already-missing directory is a no-op), so it is safe to
+  call from both the live drop path and WAL replay, including replaying the
+  same record twice.
+- `Server.removeDatabasePhysicalDirectory` (`internal/server/database_ddl.go`)
+  — previously only used to roll back a `CREATE DATABASE` whose WAL append
+  failed — now also calls the new `initdb` function (was inlining its own
+  `os.RemoveAll(filepath.Join(...))`, now delegates instead of duplicating the
+  path construction) and gained a second caller: the end of
+  `tryHandleDatabaseDDL`'s `databaseDDLDrop` branch, once the drop itself is
+  durable (after the `WAL.Append` succeeds, or immediately if no WAL is
+  configured). The database's oid is captured via the existing
+  `catalog.InMemory.DatabaseOid(name)` (added to the `databaseRegistry`
+  interface) **before** `cat.DropDatabase(name)` runs, since `DropDatabase`
+  deletes the name→oid mapping along with the rest of the catalog entry.
+  Ordering mirrors slice 2's create-side crash-safety discipline in reverse:
+  slice 2 creates the directory *before* the operation that commits to it
+  (WAL append); slice 3 removes the directory only *after* the operation
+  that commits to the drop, so a WAL-append failure (which re-creates the
+  catalog entry with a fresh oid) never removes a directory a still-live
+  database might resolve to.
+- **Restart durability**: `replayDatabaseDDLRecords`
+  (`internal/initdb/database_ddl_recovery.go`) now removes `base/<oid>` for
+  every replayed `RecordKindDropDatabase`, mirroring the create-side
+  recreation added in slice 2. The `DropDatabase` WAL record only carries the
+  database name (no oid), so the oid is read from the registry via the new
+  `databaseRegistryRecovery.DatabaseOid` method immediately before
+  `UnregisterDatabaseDuringRecovery` erases it — correct even when a CREATE
+  and its matching DROP replay within the same pass (the oid is still live
+  in the registry at the point the DROP record is processed).
+
+Tests: `TestTryHandleDatabaseDDLDropRemovesPhysicalDirectory`
+(`internal/server/database_ddl_test.go`, confirmed non-vacuous via `git
+stash` on `database_ddl.go` alone — fails "still present after DROP DATABASE"
+pre-fix); `TestDatabaseDDLRecoveryReplaysDropAfterCreate` extended with a
+`base/16402` absence assertion (`internal/initdb/database_ddl_recovery_test.go`,
+confirmed non-vacuous via `git stash` on `database_ddl_recovery.go`/
+`initdb.go` together). Live-verified against a real `cmd/goopg` binary (port
+65499): `CREATE DATABASE slice3test` produced `base/16403/`;
+`DROP DATABASE slice3test` removed it immediately; a second
+create/drop/restart cycle confirmed the directory stays gone across a real
+server restart (WAL replay does not resurrect a dropped database's
+directory). Gates: `go build ./...` clean; `go vet ./internal/initdb/...
+./internal/server/... ./internal/catalog/...` clean; `go test
+./internal/initdb/... ./internal/server/... ./internal/catalog/...
+./internal/wal/...` PASS (full packages, no regressions);
+`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+scripts/ralph-precommit-test.sh` PASS (0 failed transactions, all 3
+workloads).
+
 ## Still open (M0122-0007 bucket)
 
-- Physical-storage-isolation slice 3: real directory removal on DROP
-  DATABASE (`base/<dbOid>` is currently orphaned, not deleted — harmless
-  since nothing routes I/O through it, but never swept).
 - Physical-storage-isolation slice 4: routing every relation lookup through
   the connection's actual database (the full cluster-wide catalog-scoping
   refactor, `catalog.InMemory` gaining a per-database table/index namespace)

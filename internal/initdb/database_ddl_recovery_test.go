@@ -149,6 +149,13 @@ func TestDatabaseDDLRecoveryReplaysDropAfterCreate(t *testing.T) {
 	if !cat.HasDatabase("postgres") {
 		t.Error("seed postgres database should still be present")
 	}
+	// M0122-0007 physical-storage-isolation slice 3: replaying the CREATE
+	// then the DROP in the same pass must leave no base/16402 behind —
+	// the directory the CREATE record's replay produced must be removed
+	// again by the DROP record's replay, not orphaned.
+	if _, err := os.Stat(filepath.Join(dir, "base", "16402")); !os.IsNotExist(err) {
+		t.Errorf("base/16402 present after CREATE+DROP replay: err=%v", err)
+	}
 }
 
 // TestReplayDatabaseDDLRecordsHandlesMissingWalDir verifies the

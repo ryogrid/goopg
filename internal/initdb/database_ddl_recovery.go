@@ -27,6 +27,7 @@ import (
 type databaseRegistryRecovery interface {
 	RegisterDatabaseDuringRecovery(name string, owner, oid uint32)
 	UnregisterDatabaseDuringRecovery(name string)
+	DatabaseOid(name string) uint32
 }
 
 // replayDatabaseDDLRecords reads every WAL record under walDir and
@@ -39,10 +40,14 @@ type databaseRegistryRecovery interface {
 // replayed CREATE DATABASE record (M0122-0007 physical-storage-isolation
 // slice 2) — CreatePerDatabaseScaffolding is idempotent, so this is safe
 // whether or not the directory already survived the crash. DROP DATABASE
-// replay does not remove the directory (physical directory removal on
-// DROP is a separate, not-yet-implemented slice — see the deferral
-// ledger); an empty orphaned base/<oid> from a dropped database is
-// harmless since nothing routes relation I/O through it yet.
+// replay likewise removes base/<oid> (slice 3) — the oid is looked up from
+// the registry immediately before UnregisterDatabaseDuringRecovery, since
+// the DropDatabase WAL record itself only carries the database name (the
+// same way the live databaseDDLDrop handler must read the oid before
+// calling catalog.DropDatabase, which forgets the name->oid mapping).
+// RemovePerDatabaseScaffolding is idempotent (os.RemoveAll on an
+// already-missing directory is a no-op), so replaying the same DROP twice
+// or after the live server already removed the directory is always safe.
 func replayDatabaseDDLRecords(walDir string, cat catalog.Catalog, dataDir string) error {
 	if cat == nil {
 		return nil
@@ -86,7 +91,13 @@ func replayDatabaseDDLRecords(walDir string, cat catalog.Catalog, dataDir string
 			if derr != nil {
 				return fmt.Errorf("decode drop-database at lsn %d: %w", rec.StartLSN, derr)
 			}
+			oid := reg.DatabaseOid(name)
 			reg.UnregisterDatabaseDuringRecovery(name)
+			if dataDir != "" && oid != 0 {
+				if err := RemovePerDatabaseScaffolding(dataDir, oid); err != nil {
+					return fmt.Errorf("remove base/%d for %q at lsn %d: %w", oid, name, rec.StartLSN, err)
+				}
+			}
 		}
 	}
 	return nil

@@ -5591,11 +5591,58 @@ mirroring M0119's ledger `status` column.
       (full packages, no regressions); `scripts/tpch-spotcheck.sh` PASS
       (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
       scripts/ralph-precommit-test.sh` PASS (0 failed transactions, all 3
-      workloads). **Remaining M0122-0007 items:** physical-storage-isolation
-      slice 3 (real directory removal on DROP DATABASE — `base/<dbOid>` is
-      currently orphaned, harmless since nothing routes I/O through it),
-      slice 4 (per-database catalog namespace, the prerequisite for the
-      template-copy mechanism), REINDEX CONCURRENTLY physical rebuild.
+      workloads). **Remaining M0122-0007 items (before this loop):** physical-
+      storage-isolation slice 3 (real directory removal on DROP DATABASE —
+      `base/<dbOid>` is currently orphaned, harmless since nothing routes I/O
+      through it), slice 4 (per-database catalog namespace, the prerequisite
+      for the template-copy mechanism), REINDEX CONCURRENTLY physical rebuild.
+  - [x] `M0122-0007` follow-up 5 (2026-07-09, this loop) — **physical-storage-
+      isolation slice 3: real `base/<dbOid>` directory removal on DROP
+      DATABASE, done.** New `initdb.RemovePerDatabaseScaffolding(dataDir,
+      dbOID)` (symmetric counterpart to `CreatePerDatabaseScaffolding`,
+      idempotent `os.RemoveAll`). `Server.removeDatabasePhysicalDirectory`
+      (previously only used for CREATE-DATABASE-WAL-append-failure rollback)
+      now delegates to it (was inlining its own `os.RemoveAll(filepath.Join(...))`
+      — now shares the one path-construction site) and gained a second
+      caller: the end of `tryHandleDatabaseDDL`'s `databaseDDLDrop` branch,
+      once the drop is durable (after `WAL.Append` succeeds, or immediately
+      if no WAL configured) — mirrors slice 2's create-side crash-safety
+      ordering in reverse (remove only after the operation that commits to
+      the drop, never before, so a WAL-append failure that re-creates the
+      catalog entry with a fresh oid never removes a directory a still-live
+      database might resolve to). The dropped database's oid is captured via
+      `cat.DatabaseOid(name)` (added to the `databaseRegistry` interface)
+      BEFORE `cat.DropDatabase(name)`, which deletes the name→oid mapping
+      along with the rest of the catalog entry. Restart durability:
+      `replayDatabaseDDLRecords` (`internal/initdb/database_ddl_recovery.go`)
+      now removes `base/<oid>` for every replayed `RecordKindDropDatabase` —
+      the WAL record only carries the database name, so the oid is read from
+      the still-live registry (new `databaseRegistryRecovery.DatabaseOid`)
+      immediately before `UnregisterDatabaseDuringRecovery` erases it,
+      correct even when a CREATE and its matching DROP replay within the
+      same pass. Tests: `TestTryHandleDatabaseDDLDropRemovesPhysicalDirectory`
+      (`internal/server/database_ddl_test.go`, confirmed non-vacuous via `git
+      stash` on `database_ddl.go` alone — fails "still present after DROP
+      DATABASE" pre-fix); `TestDatabaseDDLRecoveryReplaysDropAfterCreate`
+      extended with a `base/16402` absence assertion
+      (`internal/initdb/database_ddl_recovery_test.go`, confirmed non-vacuous
+      via `git stash` on `database_ddl_recovery.go`/`initdb.go` together).
+      Live-verified against a real `cmd/goopg` binary (port 65499):
+      `CREATE DATABASE slice3test` produced `base/16403/`; `DROP DATABASE
+      slice3test` removed it immediately; a second create/drop/restart cycle
+      confirmed the directory stays gone across a real server restart (WAL
+      replay does not resurrect a dropped database's directory). Gates: `go
+      build ./...` clean; `go vet ./internal/initdb/... ./internal/server/...
+      ./internal/catalog/...` clean; `go test ./internal/initdb/...
+      ./internal/server/... ./internal/catalog/... ./internal/wal/...` PASS
+      (full packages, no regressions); `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+      scripts/ralph-precommit-test.sh` PASS (0 failed transactions, all 3
+      workloads). Design: `docs/design/0122-0017-database-ddl-drop-guards.md`
+      new "Physical-storage-isolation slice 3" section; `docs/design/README.md`
+      row updated. **Remaining M0122-0007 items:** slice 4 (per-database
+      catalog namespace, the prerequisite for the template-copy mechanism),
+      REINDEX CONCURRENTLY physical rebuild.
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,

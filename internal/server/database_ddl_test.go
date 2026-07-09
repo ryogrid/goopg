@@ -429,6 +429,41 @@ func TestTryHandleDatabaseDDLCreateCreatesPhysicalDirectory(t *testing.T) {
 	}
 }
 
+// TestTryHandleDatabaseDDLDropRemovesPhysicalDirectory pins M0122-0007
+// physical-storage-isolation slice 3: DROP DATABASE must remove the
+// base/<oid> directory the matching CREATE DATABASE allocated, not leave
+// it orphaned forever.
+func TestTryHandleDatabaseDDLDropRemovesPhysicalDirectory(t *testing.T) {
+	dataDir := t.TempDir()
+	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dataDir})
+	pool, err := storage.NewPool(mgr, storage.PoolConfig{Slots: 4})
+	if err != nil {
+		t.Fatalf("NewPool: %v", err)
+	}
+	defer pool.Close()
+
+	s := New(Config{Catalog: catalog.NewInMemory(), Pool: pool})
+	im := s.cfg.Catalog.(*catalog.InMemory)
+
+	handled, _, err := s.tryHandleDatabaseDDL("CREATE DATABASE dropdirtest", "postgres", "", nil)
+	if !handled || err != nil {
+		t.Fatalf("CREATE DATABASE dropdirtest: handled=%v err=%v", handled, err)
+	}
+	oid := im.DatabaseOid("dropdirtest")
+	dbDir := filepath.Join(dataDir, "base", strconv.FormatUint(uint64(oid), 10))
+	if _, err := os.Stat(dbDir); err != nil {
+		t.Fatalf("base/%d missing right after CREATE DATABASE: %v", oid, err)
+	}
+
+	handled, _, err = s.tryHandleDatabaseDDL("DROP DATABASE dropdirtest", "postgres", "", nil)
+	if !handled || err != nil {
+		t.Fatalf("DROP DATABASE dropdirtest: handled=%v err=%v", handled, err)
+	}
+	if _, err := os.Stat(dbDir); !os.IsNotExist(err) {
+		t.Errorf("base/%d still present after DROP DATABASE: err=%v", oid, err)
+	}
+}
+
 // TestTryHandleDatabaseDDLCreateNoPoolIsNoop confirms a nil Pool (the
 // catalog-only test fixtures every other database_ddl_test.go case uses)
 // does not turn createDatabasePhysicalDirectory into an error — matches

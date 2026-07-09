@@ -33,8 +33,6 @@ package server
 import (
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -518,13 +516,18 @@ func (s *Server) createDatabasePhysicalDirectory(oid uint32) error {
 	return initdb.CreatePerDatabaseScaffolding(dataDir, oid)
 }
 
-// removeDatabasePhysicalDirectory best-effort removes base/<oid> after a
-// CREATE DATABASE that allocated it fails a later step (currently only the
-// WAL append in the databaseDDLCreate branch above) — keeps the rollback
-// symmetric with createDatabasePhysicalDirectory's creation. A failure here
-// is non-fatal: it only leaves a harmless orphaned empty directory, the
-// same "safe orphan" tolerance relocateRelationPhysicalFileCleanupOld
-// documents for the tablespace-relocation case.
+// removeDatabasePhysicalDirectory best-effort removes base/<oid>. Two
+// callers: (1) CREATE DATABASE rollback when a later step (currently only
+// the WAL append in the databaseDDLCreate branch above) fails — keeps the
+// rollback symmetric with createDatabasePhysicalDirectory's creation; (2)
+// DROP DATABASE's own success path (databaseDDLDrop branch, M0122-0007
+// physical-storage-isolation slice 3), once the drop itself is durable. A
+// failure here is non-fatal in both cases: it only leaves a harmless
+// orphaned (CREATE rollback) or leaked (DROP) directory, the same "safe
+// orphan" tolerance relocateRelationPhysicalFileCleanupOld documents for
+// the tablespace-relocation case — DROP DATABASE has already succeeded
+// from the client's point of view by the time this runs, so a filesystem
+// error here must not turn into a user-visible DROP DATABASE failure.
 func (s *Server) removeDatabasePhysicalDirectory(oid uint32) {
 	if s.cfg.Pool == nil {
 		return
@@ -533,7 +536,7 @@ func (s *Server) removeDatabasePhysicalDirectory(oid uint32) {
 	if dataDir == "" {
 		return
 	}
-	_ = os.RemoveAll(filepath.Join(dataDir, "base", strconv.FormatUint(uint64(oid), 10)))
+	_ = initdb.RemovePerDatabaseScaffolding(dataDir, oid)
 }
 
 // actingRoleIsSuperuser reports whether actingRole (see resolveActingRoleOID)
@@ -700,6 +703,9 @@ func (s *Server) tryHandleDatabaseDDL(sql string, liveDBName string, actingRole 
 			}
 		}
 		droppedOwner := cat.DatabaseOwner(name)
+		// Captured before DropDatabase below, which deletes the catalog's
+		// name->oid mapping along with the rest of the entry.
+		droppedOid := cat.DatabaseOid(name)
 		if err := cat.DropDatabase(name); err != nil {
 			if errors.Is(err, catalog.ErrDatabaseNotFound) {
 				// Unreachable in practice (HasDatabase above already
@@ -721,11 +727,22 @@ func (s *Server) tryHandleDatabaseDDL(sql string, liveDBName string, actingRole 
 				// rather than restoring the dropped one — acceptable for
 				// this exceedingly rare double-failure edge case (the
 				// DROP's own WAL append failing) since no DropDatabase
-				// record was ever durably written either.
+				// record was ever durably written either. The re-created
+				// entry gets a fresh oid (droppedOid's directory is left
+				// as a harmless orphan, matching createDatabasePhysicalDirectory's
+				// own rollback tolerance) — removeDatabasePhysicalDirectory
+				// is only reached below, past this early return.
 				_, _ = cat.CreateDatabase(name, droppedOwner)
 				return true, "", werr
 			}
 		}
+		// M0122-0007 physical-storage-isolation slice 3: remove base/<oid>
+		// now that the drop is durable (WAL-committed above, or no WAL
+		// configured at all) — mirrors createDatabasePhysicalDirectory's
+		// crash-safety ordering (the physical artifact is only cleaned up
+		// once nothing can roll the operation back anymore). A nil Pool/
+		// empty DataDir is a silent no-op, same as the CREATE-side helper.
+		s.removeDatabasePhysicalDirectory(droppedOid)
 		return true, "", nil
 	}
 	return false, "", nil
@@ -820,6 +837,7 @@ type databaseRegistry interface {
 	DropDatabase(name string) error
 	HasDatabase(name string) bool
 	DatabaseOwner(name string) uint32
+	DatabaseOid(name string) uint32
 }
 
 // databaseConfigRegistry is the subset of catalog.Catalog the ALTER

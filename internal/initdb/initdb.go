@@ -335,6 +335,21 @@ func CreatePerDatabaseScaffolding(dataDir string, dbOID uint32) error {
 	return nil
 }
 
+// RemovePerDatabaseScaffolding removes base/<dbOID>/ (the symmetric
+// counterpart to CreatePerDatabaseScaffolding), called by DROP DATABASE
+// (internal/server) and its WAL-replay recovery path once the drop is
+// durable (M0122-0007 physical-storage-isolation slice 3). A missing
+// directory is not an error — os.RemoveAll is a no-op in that case, which
+// matters for replay: a crash between the removal and the DROP DATABASE
+// WAL record becoming durable must not turn a replay into a hard failure.
+func RemovePerDatabaseScaffolding(dataDir string, dbOID uint32) error {
+	dbDir := filepath.Join(dataDir, "base", strconv.FormatUint(uint64(dbOID), 10))
+	if err := os.RemoveAll(dbDir); err != nil {
+		return fmt.Errorf("remove base/%d: %w", dbOID, err)
+	}
+	return nil
+}
+
 // setupWALDir relocates pg_wal outside the data directory, mirroring
 // upstream initdb's -X/--waldir (initdb.c create_xlog_or_symlink). walDir
 // must already be validated as an absolute path. Mirroring upstream's
