@@ -1,6 +1,6 @@
 # Per-database catalog namespace (M0122-0007 slice 4)
 
-Status: accepted (plumbing sub-slice 4a landed; 4b-4e planned)
+Status: accepted (sub-slices 4a and 4b-i landed; 4b-ii, 4c, 4d, 4e planned)
 Date: 2026-07-09
 Supersedes: none — extends the "Still open" note in
 `0122-0017-database-ddl-drop-guards.md` and the deferral-ledger rows dated
@@ -127,9 +127,9 @@ PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
 `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
 failed transactions, all 3 workloads).
 
-### 4b — Namespace the table/index maps (planned, NOT started)
+### 4b-i — Namespace the table/index maps, internal only (LANDED, 2026-07-09)
 
-Wrap `tables`/`indexes`/`byTable` in a per-dbOid namespace, e.g.:
+Wrapped `tables`/`indexes`/`byTable` in a per-dbOid namespace:
 
 ```go
 type tableNamespace struct {
@@ -137,28 +137,83 @@ type tableNamespace struct {
     indexes map[string]*Index
     byTable map[uint32]map[string]*Index
 }
-namespaces map[uint32]*tableNamespace // keyed by dbOid
+namespaces map[uint32]*tableNamespace // keyed by dbOid, on InMemory
 ```
 
-with a `(c *InMemory) ns(dbOid uint32) *tableNamespace` accessor (lazily
-creates, under `c.mu`) replacing all 226 direct `c.tables`/`c.indexes`/
-`c.byTable` references. Every public entry point listed under "Blast
-radius" gains an explicit `dbOid uint32` parameter. To keep this sub-slice
-itself behavior-preserving and independently gate-able, **every existing
-caller passes `catalog.DefaultDBOid`** (a mechanical, find-and-replace-style
-change at each call site) — this sub-slice changes the data structure and
-every signature but not yet any actual routing decision. Recommended
-approach for whichever loop takes this on: do it as a single self-contained
-pass (not spread across loops) since a half-migrated signature set (some
-callers passing a real dbOid, most still hardcoding `DefaultDBOid`) would
-be strictly worse than the current single-namespace state — silently
-wrong instead of honestly incomplete. Budget for this to be a full loop
-(or a dedicated worktree-isolated pass) on its own; do not attempt to also
-start 4c in the same loop.
+with a `(c *InMemory) ns(dbOid uint32) *tableNamespace` accessor replacing
+all 226 direct `c.tables`/`c.indexes`/`c.byTable` references inside
+`internal/catalog/catalog.go`, plus the further 27 direct-field references
+found in same-package white-box tests (`*_test.go` files in
+`internal/catalog/`, e.g. `temp_namespace_test.go` seeding rows straight
+into `c.tables`). All 253 sites now read `c.ns(DefaultDBOid).tables` (or
+`.indexes`/`.byTable`) — a purely mechanical substitution since every one
+of them already used receiver `c` (confirmed by grepping for any other
+receiver — none existed).
+
+**Locking contract (the one non-mechanical design decision in this
+sub-slice):** `ns()` deliberately does **not** acquire `c.mu` itself —
+`sync.RWMutex` is not reentrant, and every existing call site already
+holds the right lock (`RLock` or `Lock`) before touching the table/index
+maps, exactly as before 4b-i. This only stays sound because
+`namespaces[DefaultDBOid]` is pre-seeded once inside `NewInMemory` (single
+-threaded, before any goroutine fan-out), so `ns()`'s lazy-create branch
+(`c.namespaces[dbOid] = newTableNamespace()`) is dead code for the
+lifetime of 4b-i/4c — it exists only so a future missing seed fails soft
+(empty namespace) instead of a nil-map panic, and it must stay dead until
+whichever sub-slice starts creating namespaces for real dbOids does so
+under `c.mu` held for writing (4d, when `CreateDatabase` needs its own
+namespace).
+
+**Deliberately deferred out of 4b-i** (this is the reason it's "4b-i" and
+not simply "4b"): the design originally scoped 4b as ALSO giving every
+public entry point (`LookupTable`, `CreateTable`, `DropTable`,
+`LookupIndex`, ... — see "Blast radius") an explicit `dbOid uint32`
+parameter, with every external caller (hundreds of sites across
+`internal/executor`/`internal/planner`) updated to pass
+`catalog.DefaultDBOid`. That signature-and-caller migration is
+independently large (a second multi-hundred-site mechanical pass, this
+time crossing package boundaries) and is NOT required for 4b-i's own
+behavior-preservation guarantee — the internal data-structure swap is
+already a complete, self-consistent, zero-observable-change unit on its
+own with `ns(DefaultDBOid)` hardcoded at every one of catalog.go's call
+sites. Splitting it into 4b-i (landed) / 4b-ii (below) avoids the
+"half-migrated signature set is worse than not started" trap the
+original doc warned about — 4b-ii starts from an honest 0%, not a
+partially-mechanical mid-file state.
+
+Gates run (all PASS): `go build ./...` clean; `go vet ./...` clean;
+`go test -short $(go list ./... | grep -v /internal/testport)` (every
+package, full repo, short mode); `go test ./internal/catalog/...
+./internal/executor/... ./internal/server/...` (non-short, targeted);
+`scripts/tpch-spotcheck.sh` (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+scripts/ralph-precommit-test.sh` (0 failed, all 3 pgbench workloads).
+
+### 4b-ii — Give catalog entry points an explicit dbOid parameter (planned, NOT started)
+
+Every public entry point listed under "Blast radius" — `LookupTable`,
+`CreateTable`, `DropTable`, `LookupIndex`, `CreateIndex`, `DropIndex`,
+`RenameTable`, `RenameIndex`, `AllTables`, `AllIndexes`,
+`TablesInSchema`, `RegisterRealTable`, `TryRegisterUserTable`,
+`LookupTableByOID`, `LookupIndexByOID`, `InheritanceChildren`,
+`PartitionChildren`, ... — gains an explicit `dbOid uint32` parameter
+(threading through to the now-available `c.ns(dbOid)` from 4b-i). Every
+existing caller (hundreds of sites in `internal/executor` and
+`internal/planner`) passes `catalog.DefaultDBOid` — a mechanical,
+find-and-replace-style change at each call site, but crossing package
+boundaries this time, so it cannot be done with a single in-file
+substitution the way 4b-i was; expect to touch dozens of files. This
+sub-slice still changes no actual routing decision (every namespace
+resolved is still `DefaultDBOid`) — 4c is the first sub-slice that reads
+a real per-connection value. Recommended approach: a single
+self-contained pass (or a dedicated worktree-isolated pass) — a
+half-migrated signature set (some callers passing a real dbOid, most
+still hardcoding `DefaultDBOid`) would be strictly worse than 4b-i's
+current state, silently wrong instead of honestly incomplete. Do not
+attempt to also start 4c in the same loop.
 
 ### 4c — Route READ paths through the connection's real dbOid (planned)
 
-Once 4b lands, thread `ctx.CurrentDatabaseOid` (already available since 4a)
+Once 4b-ii lands, thread `ctx.CurrentDatabaseOid` (already available since 4a)
 through the read-side call sites — name resolution in the analyzer/planner
 (`LookupTable`, `LookupIndex`, schema-qualified name resolution) — instead
 of `DefaultDBOid`. This is the first sub-slice with an actual observable
@@ -184,7 +239,7 @@ created under.
 
 ### 4e — Cross-cutting fixups + the original motivation (planned)
 
-Once 4b-4d land: dependent-object walks that assume a single global
+Once 4b-ii-4d land: dependent-object walks that assume a single global
 namespace (FK target resolution, view dependency tracking, sequence
 ownership), then finally the actual `CREATE DATABASE ... TEMPLATE` copy
 mechanism (`CreateDatabaseUsingFileCopy`/`copydir`,
@@ -195,14 +250,14 @@ today, ready to become a hard assertion once this lands).
 
 ## Recommended order and stopping points
 
-4a (landed) → 4b → 4c → 4d → 4e, strictly in order — each depends on the
-previous sub-slice's data shape. Do not attempt to skip 4b by threading a
+4a (landed) → 4b-i (landed) → 4b-ii → 4c → 4d → 4e, strictly in order — each
+depends on the previous sub-slice's data shape. Do not attempt to skip 4b-ii by threading a
 real dbOid through call sites while the underlying map is still a single
 shared namespace (it would compile and silently do nothing, exactly the
 kind of "worse than a no-op" outcome flagged in the slice-2 deferral row).
 If a sub-slice is cut off mid-implementation, prefer reverting it whole
 (the tree must build and tests must pass at every commit) over leaving a
-partially-migrated signature set — see 4b's note above.
+partially-migrated signature set — see 4b-ii's note above.
 
 ## Deferred / explicitly out of scope
 

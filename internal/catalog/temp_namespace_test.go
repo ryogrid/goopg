@@ -70,7 +70,7 @@ func TestDropSessionTempObjects(t *testing.T) {
 
 	mkTemp := func(name, owner string, oid uint32) {
 		c.mu.Lock()
-		c.tables[name] = &Table{OID: oid, Name: name, Temp: true, TempOwner: owner}
+		c.ns(DefaultDBOid).tables[name] = &Table{OID: oid, Name: name, Temp: true, TempOwner: owner}
 		c.mu.Unlock()
 	}
 	mkTemp("t_s1_a", "s1", 20001)
@@ -78,7 +78,7 @@ func TestDropSessionTempObjects(t *testing.T) {
 	mkTemp("t_s2_a", "s2", 20003)
 	// A permanent table must never be touched.
 	c.mu.Lock()
-	c.tables["perm"] = &Table{OID: 20004, Name: "perm"}
+	c.ns(DefaultDBOid).tables["perm"] = &Table{OID: 20004, Name: "perm"}
 	c.mu.Unlock()
 
 	if n := c.DropSessionTempObjects("s1"); n != 2 {
@@ -112,9 +112,9 @@ func TestSessionTempTableNamesAndTypeCascade(t *testing.T) {
 	c := NewInMemory()
 	c.EnsureTempNamespace("s1")
 	c.mu.Lock()
-	c.tables["just_give_me_a_type"] = &Table{OID: 30001, Name: "just_give_me_a_type", Temp: true, TempOwner: "s1"}
-	c.tables["other_temp"] = &Table{OID: 30002, Name: "other_temp", Temp: true, TempOwner: "s1"}
-	c.tables["s2_temp"] = &Table{OID: 30003, Name: "s2_temp", Temp: true, TempOwner: "s2"}
+	c.ns(DefaultDBOid).tables["just_give_me_a_type"] = &Table{OID: 30001, Name: "just_give_me_a_type", Temp: true, TempOwner: "s1"}
+	c.ns(DefaultDBOid).tables["other_temp"] = &Table{OID: 30002, Name: "other_temp", Temp: true, TempOwner: "s1"}
+	c.ns(DefaultDBOid).tables["s2_temp"] = &Table{OID: 30003, Name: "s2_temp", Temp: true, TempOwner: "s2"}
 	c.mu.Unlock()
 
 	names := c.SessionTempTableNames("s1")

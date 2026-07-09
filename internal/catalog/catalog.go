@@ -1046,7 +1046,7 @@ func tableHasToastRelation(t *Table) bool {
 // toastRelidOffset) to its schema-qualified name `pg_toast.pg_toast_<parentOID>`,
 // matching PG's regclassout for a relation in the pg_toast namespace (which is
 // never in search_path, hence always schema-qualified). The synthetic TOAST
-// pg_class row lives only in the virtual builder's output, not in c.tables, so
+// pg_class row lives only in the virtual builder's output, not in c.ns(DefaultDBOid).tables, so
 // `reltoastrelid::regclass` cannot find it via tableByOID and must reconstruct
 // the name here. Returns false when the OID is below the TOAST range or its
 // parent table owns no auto-exposed TOAST relation. M0118-0008 TOAST-exposure
@@ -1215,14 +1215,14 @@ func (c *InMemory) ToastRelFileNode(parentRel storage.RelFileNode) (storage.RelF
 func (c *InMemory) toastBearingTables() []*Table {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	keys := make([]string, 0, len(c.tables))
-	for k := range c.tables {
+	keys := make([]string, 0, len(c.ns(DefaultDBOid).tables))
+	for k := range c.ns(DefaultDBOid).tables {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
 	out := make([]*Table, 0)
 	for _, k := range keys {
-		t := c.tables[k]
+		t := c.ns(DefaultDBOid).tables[k]
 		// Mirror the pg_class main-loop skip: drop system-catalog virtual
 		// tables but keep user views, matviews and sequences (which
 		// tableHasToastRelation subsequently rejects unless they are 'r'/'m').
@@ -2072,13 +2072,38 @@ type Catalog interface {
 // startup may override it when importing a physical PostgreSQL backup
 // whose active database lives under a different base/<oid> directory.
 // Full multi-database storage routing still arrives with milestone 7.
-type InMemory struct {
-	mu      sync.RWMutex
+// tableNamespace holds the table/index catalog for a single database,
+// keyed out of InMemory.namespaces by real physical dbOid (M0122-0007
+// slice 4b, design 0122-0018). Sub-slice 4b only wraps the data
+// structure — every access still goes through ns(DefaultDBOid), so this
+// is not yet a behavior change; 4c/4d wire a real per-connection dbOid
+// through.
+type tableNamespace struct {
 	tables  map[string]*Table
 	indexes map[string]*Index
 	byTable map[uint32]map[string]*Index
-	nextOID uint32
-	dbOid   uint32
+}
+
+func newTableNamespace() *tableNamespace {
+	return &tableNamespace{
+		tables:  make(map[string]*Table),
+		indexes: make(map[string]*Index),
+		byTable: make(map[uint32]map[string]*Index),
+	}
+}
+
+type InMemory struct {
+	mu sync.RWMutex
+	// namespaces holds the per-database table/index catalog (see
+	// tableNamespace), keyed by real physical dbOid. Access it via
+	// ns(dbOid), never directly — see ns()'s own comment for the locking
+	// contract. M0122-0007 slice 4b (design 0122-0018): pre-seeded with
+	// only the DefaultDBOid entry today; every caller still resolves
+	// through ns(DefaultDBOid), so this sub-slice changes no observable
+	// behavior. 4c/4d thread a real per-connection dbOid through.
+	namespaces map[uint32]*tableNamespace
+	nextOID    uint32
+	dbOid      uint32
 	// routines holds user-defined routines (M0015 Stage A step 2).
 	// Separate registry — not part of the table/index map space —
 	// so existing CRUD on those types stays untouched. Accessed
@@ -2180,7 +2205,7 @@ type InMemory struct {
 	// toastRelidOffset for the relation, + toastIndexOidOffset for its index) to
 	// a new unqualified name set by ALTER TABLE/INDEX … RENAME under
 	// allow_system_table_mods. The synthetic TOAST pg_class/pg_index rows live
-	// only in the virtual builders (not c.tables), so a rename cannot mutate a
+	// only in the virtual builders (not c.ns(DefaultDBOid).tables), so a rename cannot mutate a
 	// real row; this override is consulted by the pg_class builder (relname),
 	// ToastRelName (regclass rendering) and LookupToastRel (name→OID). The
 	// reind_con_toast spec renames pg_toast_<oid> → reind_con_toast and its
@@ -3296,13 +3321,31 @@ const DefaultDBOid uint32 = 1
 // CREATE TABLE sees the user-table row through its postgres-DB lens.
 const PostgresDBOid uint32 = 5
 
+// ns returns the per-database table/index namespace for dbOid (M0122-0007
+// slice 4b). Every namespace that will ever be read is pre-seeded while
+// the caller already holds c.mu for writing (today: only DefaultDBOid, in
+// NewInMemory; slice 4d adds a CreateDatabase-time seed) — so the
+// lazy-create fallback below is unreached in production and exists only
+// so a missing seed fails soft (an empty namespace) rather than a
+// nil-map panic. It deliberately does NOT acquire c.mu itself:
+// sync.RWMutex is not reentrant, and every caller already holds the
+// right lock (RLock or Lock) before touching the table/index maps,
+// exactly matching pre-4b behavior.
+func (c *InMemory) ns(dbOid uint32) *tableNamespace {
+	if n, ok := c.namespaces[dbOid]; ok {
+		return n
+	}
+	n := newTableNamespace()
+	c.namespaces[dbOid] = n
+	return n
+}
+
 // NewInMemory returns a catalog seeded with the v0 pg_catalog
 // virtual views.
+
 func NewInMemory() *InMemory {
 	c := &InMemory{
-		tables:                 make(map[string]*Table),
-		indexes:                make(map[string]*Index),
-		byTable:                make(map[uint32]map[string]*Index),
+		namespaces:             map[uint32]*tableNamespace{DefaultDBOid: newTableNamespace()},
 		nextOID:                FirstUserOID,
 		dbOid:                  DefaultDBOid,
 		routines:               NewRoutines(),
@@ -3914,7 +3957,7 @@ func (c *InMemory) HasTempInheritanceChildren() bool {
 			childOIDs[oid] = true
 		}
 	}
-	for _, t := range c.tables {
+	for _, t := range c.ns(DefaultDBOid).tables {
 		if t.Temp && t.TempOwner != "" && childOIDs[t.OID] {
 			return true
 		}
@@ -4012,7 +4055,7 @@ func (c *InMemory) InheritanceChildren(parentOID uint32) []*Table {
 	}
 	out := make([]*Table, 0, len(children))
 	for _, oid := range children {
-		for _, t := range c.tables {
+		for _, t := range c.ns(DefaultDBOid).tables {
 			if t.OID == oid {
 				out = append(out, t)
 				break
@@ -4033,7 +4076,7 @@ func (c *InMemory) PartitionChildren(parentOID uint32) []*Table {
 	}
 	out := make([]*Table, 0, len(children))
 	for _, oid := range children {
-		for _, t := range c.tables {
+		for _, t := range c.ns(DefaultDBOid).tables {
 			if t.OID == oid {
 				out = append(out, t)
 				break
@@ -4146,7 +4189,7 @@ func (c *InMemory) UnregisterPartitionChild(parentOID, childOID uint32) {
 func (c *InMemory) MarkPartitionDetachPending(childOID uint32, epoch uint64) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	for _, t := range c.tables {
+	for _, t := range c.ns(DefaultDBOid).tables {
 		if t.OID == childOID {
 			if t.DetachPendingEpoch == 0 {
 				c.pendingPartitionDetachCount++
@@ -4165,7 +4208,7 @@ func (c *InMemory) MarkPartitionDetachPending(childOID uint32, epoch uint64) boo
 func (c *InMemory) ClearPartitionDetachPending(childOID uint32) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	for _, t := range c.tables {
+	for _, t := range c.ns(DefaultDBOid).tables {
 		if t.OID == childOID {
 			if t.DetachPendingEpoch != 0 {
 				t.DetachPendingEpoch = 0
@@ -4287,7 +4330,7 @@ func (c *InMemory) IndexPartitionChildren(parentOID uint32) []*Index {
 func (c *InMemory) LookupIndexByOID(oid uint32) (*Index, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	for _, idx := range c.indexes {
+	for _, idx := range c.ns(DefaultDBOid).indexes {
 		if idx.OID == oid {
 			return idx, true
 		}
@@ -4303,7 +4346,7 @@ func (c *InMemory) FindPartitionForValue(parentOID uint32, keyValue string) *Tab
 	defer c.mu.RUnlock()
 	var defaultPart *Table
 	for _, childOID := range c.partitionChildren[parentOID] {
-		for _, t := range c.tables {
+		for _, t := range c.ns(DefaultDBOid).tables {
 			if t.OID != childOID {
 				continue
 			}
@@ -4330,7 +4373,7 @@ func (c *InMemory) FindRangePartitionForValue(parentOID uint32, keyValue int64) 
 	defer c.mu.RUnlock()
 	var defaultPart *Table
 	for _, childOID := range c.partitionChildren[parentOID] {
-		for _, t := range c.tables {
+		for _, t := range c.ns(DefaultDBOid).tables {
 			if t.OID != childOID {
 				continue
 			}
@@ -4368,7 +4411,7 @@ func (c *InMemory) FindRangePartitionForDatums(parentOID uint32, keyStrs []strin
 	defer c.mu.RUnlock()
 	var defaultPart *Table
 	for _, childOID := range c.partitionChildren[parentOID] {
-		for _, t := range c.tables {
+		for _, t := range c.ns(DefaultDBOid).tables {
 			if t.OID != childOID {
 				continue
 			}
@@ -4495,7 +4538,7 @@ func (c *InMemory) FindHashPartitionForValue(parentOID uint32, keyValue string) 
 	}
 	var defaultPart *Table
 	for _, childOID := range c.partitionChildren[parentOID] {
-		for _, t := range c.tables {
+		for _, t := range c.ns(DefaultDBOid).tables {
 			if t.OID != childOID {
 				continue
 			}
@@ -4523,7 +4566,7 @@ func (c *InMemory) FindHashPartitionByHash(parentOID uint32, h uint64) *Table {
 	defer c.mu.RUnlock()
 	var defaultPart *Table
 	for _, childOID := range c.partitionChildren[parentOID] {
-		for _, t := range c.tables {
+		for _, t := range c.ns(DefaultDBOid).tables {
 			if t.OID != childOID {
 				continue
 			}
@@ -5475,11 +5518,11 @@ func (c *InMemory) RegisterIndexDuringRecovery(
 		NullsNotDistinct: nullsNotDistinct,
 		Tablespace:       tablespace,
 	}
-	c.indexes[k] = idx
-	if c.byTable[tbl.OID] == nil {
-		c.byTable[tbl.OID] = map[string]*Index{}
+	c.ns(DefaultDBOid).indexes[k] = idx
+	if c.ns(DefaultDBOid).byTable[tbl.OID] == nil {
+		c.ns(DefaultDBOid).byTable[tbl.OID] = map[string]*Index{}
 	}
-	c.byTable[tbl.OID][k] = idx
+	c.ns(DefaultDBOid).byTable[tbl.OID][k] = idx
 	c.advanceNextOIDLocked(oid)
 }
 
@@ -5498,12 +5541,12 @@ func (c *InMemory) UnregisterIndexDuringRecovery(schema, name string) {
 	if !ok {
 		return
 	}
-	delete(c.indexes, k)
+	delete(c.ns(DefaultDBOid).indexes, k)
 	if idx.Table != nil {
-		if perTable := c.byTable[idx.Table.OID]; perTable != nil {
+		if perTable := c.ns(DefaultDBOid).byTable[idx.Table.OID]; perTable != nil {
 			delete(perTable, k)
 			if len(perTable) == 0 {
-				delete(c.byTable, idx.Table.OID)
+				delete(c.ns(DefaultDBOid).byTable, idx.Table.OID)
 			}
 		}
 	}
@@ -5512,9 +5555,9 @@ func (c *InMemory) UnregisterIndexDuringRecovery(schema, name string) {
 // tableByOID returns the *Table whose OID matches; caller must
 // hold c.mu (read or write). Used by the recovery hooks to map
 // a WAL-encoded table OID back to the in-memory entry without
-// re-walking c.tables on every call site.
+// re-walking c.ns(DefaultDBOid).tables on every call site.
 func (c *InMemory) tableByOID(oid uint32) (*Table, bool) {
-	for _, t := range c.tables {
+	for _, t := range c.ns(DefaultDBOid).tables {
 		if t.OID == oid {
 			return t, true
 		}
@@ -5752,14 +5795,14 @@ func (c *InMemory) registerSystemTables() {
 	pgClass.VirtualRows = func() [][]string {
 		c.mu.RLock()
 		defer c.mu.RUnlock()
-		keys := make([]string, 0, len(c.tables))
-		for k := range c.tables {
+		keys := make([]string, 0, len(c.ns(DefaultDBOid).tables))
+		for k := range c.ns(DefaultDBOid).tables {
 			keys = append(keys, k)
 		}
 		sort.Strings(keys)
-		out := make([][]string, 0, len(c.tables)+len(c.indexes))
+		out := make([][]string, 0, len(c.ns(DefaultDBOid).tables)+len(c.ns(DefaultDBOid).indexes))
 		for _, k := range keys {
-			t := c.tables[k]
+			t := c.ns(DefaultDBOid).tables[k]
 			if t.Virtual && t.View == nil && !t.IsMatView && !t.IsSequence {
 				// Skip system-catalog virtual tables (pg_class, pg_locks, etc.)
 				// but include user views (t.View != nil), materialized views, and
@@ -5817,7 +5860,7 @@ func (c *InMemory) registerSystemTables() {
 				}
 			}
 			hasIdx := "f"
-			if len(c.byTable[t.OID]) > 0 {
+			if len(c.ns(DefaultDBOid).byTable[t.OID]) > 0 {
 				hasIdx = "t"
 			}
 			isPartition := "f"
@@ -6055,13 +6098,13 @@ func (c *InMemory) registerSystemTables() {
 			}
 		}
 		// Emit index rows (relkind='i'/'I') so pg_class can be used to count indexes.
-		idxKeys := make([]string, 0, len(c.indexes))
-		for k := range c.indexes {
+		idxKeys := make([]string, 0, len(c.ns(DefaultDBOid).indexes))
+		for k := range c.ns(DefaultDBOid).indexes {
 			idxKeys = append(idxKeys, k)
 		}
 		sort.Strings(idxKeys)
 		for _, k := range idxKeys {
-			idx := c.indexes[k]
+			idx := c.ns(DefaultDBOid).indexes[k]
 			// Resolve namespace from the index's table.
 			idxNsOID := uint32(2200)
 			if idx.Table != nil {
@@ -6241,7 +6284,7 @@ func (c *InMemory) registerSystemTables() {
 		})
 		return out
 	}
-	c.tables["pg_catalog.pg_class"] = pgClass
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_class"] = pgClass
 
 	// pg_namespace — required by vacuumdb's table-discovery catalog query
 	// (M0095-0004). vacuumdb sends:
@@ -6281,7 +6324,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return out
 	}
-	c.tables["pg_catalog.pg_namespace"] = pgNamespace
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_namespace"] = pgNamespace
 
 	// pg_extension — backs pg_amcheck's "is amcheck installed?" probe
 	// (M0110-0003):
@@ -6317,7 +6360,7 @@ func (c *InMemory) registerSystemTables() {
 		defer c.mu.RUnlock()
 		return c.extensionRowsLocked("")
 	}
-	c.tables["pg_catalog.pg_extension"] = pgExtension
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_extension"] = pgExtension
 
 	// pg_indexes view. HammerDB's checkschema step queries
 	// `select tablename, indexname from pg_indexes where
@@ -6345,8 +6388,8 @@ func (c *InMemory) registerSystemTables() {
 		c.mu.RLock()
 		defer c.mu.RUnlock()
 		// Sort for deterministic output across calls.
-		tableKeys := make([]string, 0, len(c.tables))
-		for k, t := range c.tables {
+		tableKeys := make([]string, 0, len(c.ns(DefaultDBOid).tables))
+		for k, t := range c.ns(DefaultDBOid).tables {
 			if t.Virtual {
 				continue
 			}
@@ -6355,8 +6398,8 @@ func (c *InMemory) registerSystemTables() {
 		sort.Strings(tableKeys)
 		var out [][]string
 		for _, tk := range tableKeys {
-			t := c.tables[tk]
-			idxs := c.byTable[t.OID]
+			t := c.ns(DefaultDBOid).tables[tk]
+			idxs := c.ns(DefaultDBOid).byTable[t.OID]
 			idxKeys := make([]string, 0, len(idxs))
 			for ik := range idxs {
 				idxKeys = append(idxKeys, ik)
@@ -6379,7 +6422,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return out
 	}
-	c.tables["pg_catalog.pg_indexes"] = pgIndexes
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_indexes"] = pgIndexes
 
 	// pg_database — HammerDB probes
 	// `SELECT 1 FROM pg_database WHERE datname = '<db>'` to
@@ -6529,7 +6572,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return out
 	}
-	c.tables["pg_catalog.pg_database"] = pgDatabase
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_database"] = pgDatabase
 
 	// pg_roles — HammerDB probes
 	// `SELECT 1 FROM pg_roles WHERE rolname = '<user>'` before
@@ -6601,7 +6644,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return out
 	}
-	c.tables["pg_catalog.pg_roles"] = pgRoles
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_roles"] = pgRoles
 
 	// pg_authid — the real, superuser-only role catalog pg_roles is a view
 	// over. pg_dumpall's dumpRoles/dumpUserConfig query it directly (not
@@ -6706,7 +6749,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return out
 	}
-	c.tables["pg_catalog.pg_authid"] = pgAuthid
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_authid"] = pgAuthid
 
 	// pg_auth_members — role membership (`GRANT <role> TO <role>`), sourced
 	// from the roleMembers registry GRANT/REVOKE ROLE maintains
@@ -6754,7 +6797,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return out
 	}
-	c.tables["pg_catalog.pg_auth_members"] = pgAuthMembers
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_auth_members"] = pgAuthMembers
 
 	// pg_parameter_acl — GUC-level ACLs (`GRANT SET|ALTER SYSTEM ON PARAMETER
 	// ...`). Registered so pg_dumpall's getParameterACLs query resolves
@@ -6794,7 +6837,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return out
 	}
-	c.tables["pg_catalog.pg_parameter_acl"] = pgParameterACL
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_parameter_acl"] = pgParameterACL
 
 	// pg_tables — HammerDB probes
 	// `SELECT 1 FROM pg_tables WHERE schemaname = 'public'` to
@@ -6816,14 +6859,14 @@ func (c *InMemory) registerSystemTables() {
 	pgTables.VirtualRows = func() [][]string {
 		c.mu.RLock()
 		defer c.mu.RUnlock()
-		keys := make([]string, 0, len(c.tables))
-		for k := range c.tables {
+		keys := make([]string, 0, len(c.ns(DefaultDBOid).tables))
+		for k := range c.ns(DefaultDBOid).tables {
 			keys = append(keys, k)
 		}
 		sort.Strings(keys)
 		var out [][]string
 		for _, k := range keys {
-			t := c.tables[k]
+			t := c.ns(DefaultDBOid).tables[k]
 			if t.Virtual {
 				continue
 			}
@@ -6835,7 +6878,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return out
 	}
-	c.tables["pg_catalog.pg_tables"] = pgTables
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_tables"] = pgTables
 
 	// pg_settings — isolation specs use
 	// `SELECT setting FROM pg_settings WHERE name = 'default_transaction_isolation'`
@@ -6878,7 +6921,7 @@ func (c *InMemory) registerSystemTables() {
 				"user", "bool", "default", "", "", "", "on", "on", "", "", "f"},
 		}
 	}
-	c.tables["pg_catalog.pg_settings"] = pgSettings
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_settings"] = pgSettings
 
 	// pg_locks — advisory_lock.sql queries this to verify lock state.
 	// v0 returns empty rows (no lock tracking infrastructure). M0097-0010.
@@ -6906,7 +6949,7 @@ func (c *InMemory) registerSystemTables() {
 		},
 	}
 	pgLocks.VirtualRows = func() [][]string { return nil } // always empty in v0
-	c.tables["pg_catalog.pg_locks"] = pgLocks
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_locks"] = pgLocks
 
 	// pg_enum — one row per enum label. M0097-0017.
 	pgEnum := &Table{
@@ -6945,7 +6988,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return rows
 	}
-	c.tables["pg_catalog.pg_enum"] = pgEnum
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_enum"] = pgEnum
 
 	// NOTE: pg_type (OID 1247) is a heap-backed system catalog registered by
 	// initdb, NOT a virtual table. Do NOT add it here. M0097-0017 originally
@@ -6987,7 +7030,7 @@ func (c *InMemory) registerSystemTables() {
 		OID: 3391,
 	}
 	pgAvailExt.VirtualRows = func() [][]string { return nil }
-	c.tables["pg_catalog.pg_available_extensions"] = pgAvailExt
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_available_extensions"] = pgAvailExt
 
 	// pg_available_extension_versions — 0 rows is fine.
 	pgAvailExtVer := &Table{
@@ -7006,7 +7049,7 @@ func (c *InMemory) registerSystemTables() {
 		OID: 3392,
 	}
 	pgAvailExtVer.VirtualRows = func() [][]string { return nil }
-	c.tables["pg_catalog.pg_available_extension_versions"] = pgAvailExtVer
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_available_extension_versions"] = pgAvailExtVer
 
 	// pg_backend_memory_contexts — needs a row with level=1.
 	pgBackendMemCtx := &Table{
@@ -7036,7 +7079,7 @@ func (c *InMemory) registerSystemTables() {
 			{"Caller tuples", "", "TopMemoryContext", "2", "65536", "2", "32768", "0", "32768", "Bump", "{1,4}"},
 		}
 	}
-	c.tables["pg_catalog.pg_backend_memory_contexts"] = pgBackendMemCtx
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_backend_memory_contexts"] = pgBackendMemCtx
 
 	// pg_config — needs count > 20.
 	pgConfig := &Table{
@@ -7074,7 +7117,7 @@ func (c *InMemory) registerSystemTables() {
 			{"VERSION", "PostgreSQL 18.0"},
 		}
 	}
-	c.tables["pg_catalog.pg_config"] = pgConfig
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_config"] = pgConfig
 
 	// pg_cursors — count = 0 expected.
 	pgCursors := &Table{
@@ -7090,7 +7133,7 @@ func (c *InMemory) registerSystemTables() {
 		OID: 3395,
 	}
 	pgCursors.VirtualRows = func() [][]string { return nil }
-	c.tables["pg_catalog.pg_cursors"] = pgCursors
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_cursors"] = pgCursors
 
 	// pg_file_settings — 0 rows is fine.
 	pgFileSettings := &Table{
@@ -7107,7 +7150,7 @@ func (c *InMemory) registerSystemTables() {
 		OID: 3396,
 	}
 	pgFileSettings.VirtualRows = func() [][]string { return nil }
-	c.tables["pg_catalog.pg_file_settings"] = pgFileSettings
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_file_settings"] = pgFileSettings
 
 	// pg_hba_file_rules — sysviews.sql checks `count(*) > 0` and
 	// `count(*) FILTER (WHERE error IS NOT NULL) = 0`, so we must emit at
@@ -7140,7 +7183,7 @@ func (c *InMemory) registerSystemTables() {
 			{"1", "pg_hba.conf", "1", "local", "{all}", "{all}", "", "", "trust", "{}"},
 		}
 	}
-	c.tables["pg_catalog.pg_hba_file_rules"] = pgHbaRules
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_hba_file_rules"] = pgHbaRules
 
 	// pg_ident_file_mappings — 0 rows is fine, no errors needed.
 	pgIdentMappings := &Table{
@@ -7157,7 +7200,7 @@ func (c *InMemory) registerSystemTables() {
 		OID: 3398,
 	}
 	pgIdentMappings.VirtualRows = func() [][]string { return nil }
-	c.tables["pg_catalog.pg_ident_file_mappings"] = pgIdentMappings
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_ident_file_mappings"] = pgIdentMappings
 
 	// pg_prepared_statements — count = 0 expected.
 	pgPrepStmts := &Table{
@@ -7175,7 +7218,7 @@ func (c *InMemory) registerSystemTables() {
 		OID: 3399,
 	}
 	pgPrepStmts.VirtualRows = func() [][]string { return nil }
-	c.tables["pg_catalog.pg_prepared_statements"] = pgPrepStmts
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_prepared_statements"] = pgPrepStmts
 
 	// pg_prepared_xacts — 0 rows is fine.
 	pgPrepXacts := &Table{
@@ -7190,7 +7233,7 @@ func (c *InMemory) registerSystemTables() {
 		OID: 3400,
 	}
 	pgPrepXacts.VirtualRows = func() [][]string { return nil }
-	c.tables["pg_catalog.pg_prepared_xacts"] = pgPrepXacts
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_prepared_xacts"] = pgPrepXacts
 
 	// pg_stat_slru — needs count > 0.
 	pgStatSlru := &Table{
@@ -7226,7 +7269,7 @@ func (c *InMemory) registerSystemTables() {
 			{"other", "0", "0", "0", "0", "0", "0", "0", reset},
 		}
 	}
-	c.tables["pg_catalog.pg_stat_slru"] = pgStatSlru
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_stat_slru"] = pgStatSlru
 
 	// pg_stat_wal — exactly 1 row expected.
 	pgStatWal := &Table{
@@ -7249,7 +7292,7 @@ func (c *InMemory) registerSystemTables() {
 			{"0", "0", "0", "0", "0", "0", "0", "0", "2026-01-01 00:00:00+00"},
 		}
 	}
-	c.tables["pg_catalog.pg_stat_wal"] = pgStatWal
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_stat_wal"] = pgStatWal
 
 	// pg_stat_io — per-backend-type I/O statistics (PG 16+, OID 8061).
 	// The static VirtualRows fallback below returns no rows; the real,
@@ -7286,7 +7329,7 @@ func (c *InMemory) registerSystemTables() {
 		OID: 8061,
 	}
 	pgStatIO.VirtualRows = func() [][]string { return nil }
-	c.tables["pg_catalog.pg_stat_io"] = pgStatIO
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_stat_io"] = pgStatIO
 
 	// pg_description — stores COMMENT ON object descriptions (OID 2609).
 	// COMMENT ON is parsed as a no-op in goopg v0; this stub allows queries
@@ -7315,7 +7358,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return out
 	}
-	c.tables["pg_catalog.pg_description"] = pgDescription
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_description"] = pgDescription
 
 	// pg_attrdef — stores column default expressions (OID 2604).
 	// COMMENT ON and DEFAULT tracking are stubs in goopg v0; this virtual table
@@ -7351,7 +7394,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return rows
 	}
-	c.tables["pg_catalog.pg_attrdef"] = pgAttrdef
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_attrdef"] = pgAttrdef
 
 	// pg_constraint — stores table and domain constraint definitions (OID 2606).
 	// Constraint tracking is a stub in goopg v0; this virtual table lets queries
@@ -7396,7 +7439,7 @@ func (c *InMemory) registerSystemTables() {
 		c.mu.RLock()
 		defer c.mu.RUnlock()
 		var out [][]string
-		for _, tbl := range c.tables {
+		for _, tbl := range c.ns(DefaultDBOid).tables {
 			if tbl.Virtual || tbl.OID == 0 {
 				continue
 			}
@@ -7487,7 +7530,7 @@ func (c *InMemory) registerSystemTables() {
 			}
 		}
 		// Emit UNIQUE, PRIMARY KEY, and EXCLUDE constraints from constraint-backed indexes.
-		for _, idx := range c.indexes {
+		for _, idx := range c.ns(DefaultDBOid).indexes {
 			if (!idx.IsConstraint && !idx.IsExclusion) || idx.Table == nil {
 				continue
 			}
@@ -7541,7 +7584,7 @@ func (c *InMemory) registerSystemTables() {
 			out = append(out, row)
 		}
 		// Emit NOT NULL constraints (contype='n', PG18). M0097-0023.
-		for _, tbl := range c.tables {
+		for _, tbl := range c.ns(DefaultDBOid).tables {
 			if tbl.Virtual || tbl.OID == 0 {
 				continue
 			}
@@ -7594,7 +7637,7 @@ func (c *InMemory) registerSystemTables() {
 		// Emit FOREIGN KEY constraints (contype='f', PG). pg_dump's getConstraints
 		// joins `pg_constraint c ON src.tbloid = c.conrelid WHERE contype='f'` and
 		// renders each via pg_get_constraintdef(c.oid). DU-002 slice 51.
-		for _, tbl := range c.tables {
+		for _, tbl := range c.ns(DefaultDBOid).tables {
 			if tbl.Virtual || tbl.OID == 0 {
 				continue
 			}
@@ -7608,7 +7651,7 @@ func (c *InMemory) registerSystemTables() {
 				}
 				// Resolve the referenced table OID + referenced column ordinals.
 				var refTbl *Table
-				for _, cand := range c.tables {
+				for _, cand := range c.ns(DefaultDBOid).tables {
 					if cand.Virtual || cand.OID == 0 {
 						continue
 					}
@@ -7697,7 +7740,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return out
 	}
-	c.tables["pg_catalog.pg_constraint"] = pgConstraint
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_constraint"] = pgConstraint
 
 	// pg_inherits — stores inheritance/partition parent-child relationships (OID 2611).
 	// Used by psql \d to identify partition children. M0097-0023.
@@ -7716,7 +7759,7 @@ func (c *InMemory) registerSystemTables() {
 		defer c.mu.RUnlock()
 		var out [][]string
 		parentSeq := make(map[uint32]int)
-		for _, tbl := range c.tables {
+		for _, tbl := range c.ns(DefaultDBOid).tables {
 			if tbl.Virtual {
 				continue
 			}
@@ -7749,7 +7792,7 @@ func (c *InMemory) registerSystemTables() {
 		//   pg_index LEFT JOIN pg_inherits ON (indexrelid = inhrelid)
 		// used by indexing.sql to discover partitioned-index parent/child chains.
 		idxParentSeq := make(map[uint32]int)
-		for _, idx := range c.indexes {
+		for _, idx := range c.ns(DefaultDBOid).indexes {
 			if idx.PartitionParentOID == 0 {
 				continue
 			}
@@ -7764,7 +7807,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return out
 	}
-	c.tables["pg_catalog.pg_inherits"] = pgInherits
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_inherits"] = pgInherits
 
 	// pg_index — stores index definitions (OID 2610).
 	// This virtual stub lets queries that join against pg_index (e.g. psql \d+
@@ -7961,7 +8004,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return out
 	}
-	c.tables["pg_catalog.pg_index"] = pgIndexCatalog
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_index"] = pgIndexCatalog
 
 	// pg_statistic_ext — stores extended statistics objects (OID 3381).
 	// This virtual stub lets queries against pg_statistic_ext succeed instead
@@ -8023,7 +8066,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return out
 	}
-	c.tables["pg_catalog.pg_statistic_ext"] = pgStatisticExt
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_statistic_ext"] = pgStatisticExt
 
 	// pg_collation — stores collation definitions (OID 3456).
 	// This virtual stub lets psql \d+ meta-queries succeed instead of erroring
@@ -8110,7 +8153,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return rows
 	}
-	c.tables["pg_catalog.pg_collation"] = pgCollation
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_collation"] = pgCollation
 
 	// pg_policy — stores row-level security policies (OID 3256). goopg does NOT
 	// enforce RLS, but a policy created via CREATE POLICY is recorded on its
@@ -8138,7 +8181,7 @@ func (c *InMemory) registerSystemTables() {
 		c.mu.RLock()
 		defer c.mu.RUnlock()
 		var out [][]string
-		for _, tbl := range c.tables {
+		for _, tbl := range c.ns(DefaultDBOid).tables {
 			if tbl == nil || tbl.Virtual || tbl.OID == 0 || len(tbl.Policies) == 0 {
 				continue
 			}
@@ -8192,7 +8235,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return out
 	}
-	c.tables["pg_catalog.pg_policy"] = pgPolicy
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_policy"] = pgPolicy
 
 	// pg_wait_events — needs at least one row per type.
 	pgWaitEvents := &Table{
@@ -8282,7 +8325,7 @@ func (c *InMemory) registerSystemTables() {
 			{"IPC", "BgWorkerStartup", "Waiting for background worker to start up."},
 		}
 	}
-	c.tables["pg_catalog.pg_wait_events"] = pgWaitEvents
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_wait_events"] = pgWaitEvents
 
 	// pg_timezone_names — needs count(distinct utc_offset) >= 24.
 	pgTimezoneNames := &Table{
@@ -8320,7 +8363,7 @@ func (c *InMemory) registerSystemTables() {
 		rows = append(rows, []string{"America/Los_Angeles", "LMT", verboseIntervalOffset(-(7*3600 + 52*60 + 58)), "f"})
 		return rows
 	}
-	c.tables["pg_catalog.pg_timezone_names"] = pgTimezoneNames
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_timezone_names"] = pgTimezoneNames
 
 	// pg_timezone_abbrevs — needs count(distinct utc_offset) >= 24 and a row for abbrev = 'LMT'.
 	pgTimezoneAbbrevs := &Table{
@@ -8356,7 +8399,7 @@ func (c *InMemory) registerSystemTables() {
 		rows = append(rows, []string{"LMT", verboseIntervalOffset(-(7*3600 + 52*60 + 58)), "f"})
 		return rows
 	}
-	c.tables["pg_catalog.pg_timezone_abbrevs"] = pgTimezoneAbbrevs
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_timezone_abbrevs"] = pgTimezoneAbbrevs
 
 	// pg_am — access method catalog (OID 2601).
 	// Returns the standard set of PostgreSQL access methods so queries
@@ -8395,7 +8438,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return rows
 	}
-	c.tables["pg_catalog.pg_am"] = pgAm
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_am"] = pgAm
 
 	// pg_depend — dependency catalog (OID 2608).
 	// goopg does not maintain a general dependency graph (extension membership,
@@ -8423,7 +8466,7 @@ func (c *InMemory) registerSystemTables() {
 		OID: 2608,
 	}
 	pgDepend.VirtualRows = c.dependVirtualRows
-	c.tables["pg_catalog.pg_depend"] = pgDepend
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_depend"] = pgDepend
 
 	// pg_tablespace — tablespace catalog (OID 1213). The on-disk shared heap
 	// (initialized by initdb with pg_default/pg_global) is not wired into the SQL
@@ -8444,7 +8487,7 @@ func (c *InMemory) registerSystemTables() {
 		OID: 1213,
 	}
 	pgTablespace.VirtualRows = c.tablespaceVirtualRows
-	c.tables["pg_catalog.pg_tablespace"] = pgTablespace
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_tablespace"] = pgTablespace
 
 	// pg_foreign_table — foreign-table catalog (OID 3118). pg_dump's getTables
 	// runs a `SELECT ftserver FROM pg_foreign_table WHERE ftrelid = c.oid`
@@ -8469,14 +8512,14 @@ func (c *InMemory) registerSystemTables() {
 	pgForeignTable.VirtualRows = func() [][]string {
 		c.mu.RLock()
 		defer c.mu.RUnlock()
-		keys := make([]string, 0, len(c.tables))
-		for k := range c.tables {
+		keys := make([]string, 0, len(c.ns(DefaultDBOid).tables))
+		for k := range c.ns(DefaultDBOid).tables {
 			keys = append(keys, k)
 		}
 		sort.Strings(keys)
 		var out [][]string
 		for _, k := range keys {
-			t := c.tables[k]
+			t := c.ns(DefaultDBOid).tables[k]
 			if t.ForeignServerName == "" {
 				continue
 			}
@@ -8492,7 +8535,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return out
 	}
-	c.tables["pg_catalog.pg_foreign_table"] = pgForeignTable
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_foreign_table"] = pgForeignTable
 
 	// pg_init_privs — initial-privileges catalog (OID 3394). PG records here the
 	// privileges an object had immediately after initdb (privtype 'i') or after
@@ -8519,7 +8562,7 @@ func (c *InMemory) registerSystemTables() {
 		OID: 3394,
 	}
 	pgInitPrivs.VirtualRows = func() [][]string { return nil }
-	c.tables["pg_catalog.pg_init_privs"] = pgInitPrivs
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_init_privs"] = pgInitPrivs
 
 	// pg_cast — cast catalog (OID 2605). goopg registers no user-defined casts, so
 	// this view is empty. pg_dump's getFuncs runs `EXISTS (SELECT 1 FROM pg_cast
@@ -8568,7 +8611,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return out
 	}
-	c.tables["pg_catalog.pg_cast"] = pgCast
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_cast"] = pgCast
 
 	// pg_transform — transform catalog (OID 3576). Schema matches PG's
 	// pg_transform (oid, trftype, trflang, trffromsql, trftosql); trffromsql/
@@ -8605,7 +8648,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return out
 	}
-	c.tables["pg_catalog.pg_transform"] = pgTransform
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_transform"] = pgTransform
 
 	// pg_language — procedural-language catalog (OID 2612). pg_dump's getProcLangs
 	// runs `SELECT tableoid, oid, lanname, lanpltrusted, lanplcallfoid, laninline,
@@ -8660,7 +8703,7 @@ func (c *InMemory) registerSystemTables() {
 			{"13627", "plpgsql", "10", "f", "t", "0", "0", "0", ""},
 		}
 	}
-	c.tables["pg_catalog.pg_language"] = pgLanguage
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_language"] = pgLanguage
 
 	// pg_operator — operator catalog (OID 2617). pg_dump's getOperators runs
 	// `SELECT tableoid, oid, oprname, oprnamespace, oprowner, oprkind, oprleft,
@@ -8745,7 +8788,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return out
 	}
-	c.tables["pg_catalog.pg_operator"] = pgOperator
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_operator"] = pgOperator
 
 	// pg_opclass — operator-class catalog (OID 2616). pg_dump's getOpclasses runs
 	// `SELECT tableoid, oid, opcmethod, opcname, opcnamespace, opcowner FROM
@@ -8813,7 +8856,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return out
 	}
-	c.tables["pg_catalog.pg_opclass"] = pgOpclass
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_opclass"] = pgOpclass
 
 	// pg_opfamily — operator-family catalog (OID 2753). pg_dump's getOpfamilies
 	// runs `SELECT tableoid, oid, opfmethod, opfname, opfnamespace, opfowner FROM
@@ -8853,7 +8896,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return out
 	}
-	c.tables["pg_catalog.pg_opfamily"] = pgOpfamily
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_opfamily"] = pgOpfamily
 
 	// pg_ts_parser — text-search parser catalog (OID 3601). pg_dump's
 	// getTSParsers runs `SELECT tableoid, oid, prsname, prsnamespace,
@@ -8910,7 +8953,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return rows
 	}
-	c.tables["pg_catalog.pg_ts_parser"] = pgTSParser
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_ts_parser"] = pgTSParser
 
 	// pg_ts_template — text-search template catalog (OID 3764). pg_dump's
 	// getTSTemplates runs `SELECT tableoid, oid, tmplname, tmplnamespace,
@@ -8963,7 +9006,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return rows
 	}
-	c.tables["pg_catalog.pg_ts_template"] = pgTSTemplate
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_ts_template"] = pgTSTemplate
 
 	// pg_ts_dict — text-search dictionary catalog (OID 3600). pg_dump's
 	// getTSDictionaries runs `SELECT tableoid, oid, dictname, dictnamespace,
@@ -9023,7 +9066,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return rows
 	}
-	c.tables["pg_catalog.pg_ts_dict"] = pgTSDict
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_ts_dict"] = pgTSDict
 
 	// pg_ts_config — text-search configuration catalog (OID 3602). pg_dump's
 	// getTSConfigurations runs `SELECT tableoid, oid, cfgname, cfgnamespace,
@@ -9062,7 +9105,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return rows
 	}
-	c.tables["pg_catalog.pg_ts_config"] = pgTSConfig
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_ts_config"] = pgTSConfig
 
 	// pg_ts_config_map — per-token-type dictionary mapping for a text search
 	// configuration (OID 3603). dumpTSConfig's own query (`SELECT ... FROM
@@ -9111,7 +9154,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return rows
 	}
-	c.tables["pg_catalog.pg_ts_config_map"] = pgTSConfigMap
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_ts_config_map"] = pgTSConfigMap
 
 	// pg_foreign_data_wrapper — foreign-data wrapper catalog (OID 2328).
 	// pg_dump's getForeignDataWrappers runs `SELECT tableoid, oid, fdwname,
@@ -9173,7 +9216,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return out
 	}
-	c.tables["pg_catalog.pg_foreign_data_wrapper"] = pgForeignDataWrapper
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_foreign_data_wrapper"] = pgForeignDataWrapper
 
 	// pg_foreign_server — foreign-server catalog (OID 1417). pg_dump's
 	// getForeignServers runs `SELECT tableoid, oid, srvname, srvowner,
@@ -9237,7 +9280,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return out
 	}
-	c.tables["pg_catalog.pg_foreign_server"] = pgForeignServer
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_foreign_server"] = pgForeignServer
 
 	// pg_user_mappings — the publicly-readable view over pg_user_mapping JOIN
 	// pg_foreign_server (system_views.sql). For every foreign server, pg_dump's
@@ -9296,7 +9339,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return out
 	}
-	c.tables["pg_catalog.pg_user_mappings"] = pgUserMappings
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_user_mappings"] = pgUserMappings
 
 	// pg_default_acl — default-ACL catalog (OID 826). After getForeignServers,
 	// pg_dump's getUserMappings short-circuits (no foreign servers → no catalog
@@ -9348,7 +9391,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return out
 	}
-	c.tables["pg_catalog.pg_default_acl"] = pgDefaultACL
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_default_acl"] = pgDefaultACL
 
 	// pg_conversion — encoding-conversion catalog (OID 2607). After
 	// getDefaultACLs, pg_dump's getConversions runs:
@@ -9427,7 +9470,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return out
 	}
-	c.tables["pg_catalog.pg_conversion"] = pgConversion
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_conversion"] = pgConversion
 
 	// pg_range — range-type catalog (OID 3541). After getConversions, pg_dump's
 	// getCasts runs:
@@ -9485,7 +9528,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return out
 	}
-	c.tables["pg_catalog.pg_range"] = pgRange
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_range"] = pgRange
 
 	// pg_event_trigger — event-trigger catalog (OID 3466). After getCasts,
 	// pg_dump's getEventTriggers runs:
@@ -9542,7 +9585,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return out
 	}
-	c.tables["pg_catalog.pg_event_trigger"] = pgEventTrigger
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_event_trigger"] = pgEventTrigger
 
 	// pg_partitioned_table — partition-key catalog (OID 3350). After
 	// getEventTriggers, pg_dump's getTableAttrs / collectComments path probes
@@ -9576,7 +9619,7 @@ func (c *InMemory) registerSystemTables() {
 		OID: 3350,
 	}
 	pgPartitionedTable.VirtualRows = func() [][]string { return nil }
-	c.tables["pg_catalog.pg_partitioned_table"] = pgPartitionedTable
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_partitioned_table"] = pgPartitionedTable
 
 	// pg_trigger — trigger catalog (OID 2620). After getTableAttrs, pg_dump's
 	// getTriggers probes per-table triggers. The query that first hits this
@@ -9633,7 +9676,7 @@ func (c *InMemory) registerSystemTables() {
 		c.mu.RLock()
 		defer c.mu.RUnlock()
 		var out [][]string
-		for _, tbl := range c.tables {
+		for _, tbl := range c.ns(DefaultDBOid).tables {
 			if tbl == nil || tbl.Virtual || tbl.OID == 0 || len(tbl.Triggers) == 0 {
 				continue
 			}
@@ -9728,7 +9771,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return out
 	}
-	c.tables["pg_catalog.pg_trigger"] = pgTrigger
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_trigger"] = pgTrigger
 
 	// pg_rewrite — rewrite-rule catalog (OID 2618). After getTriggers, pg_dump's
 	// getRules dumps any ON SELECT/INSERT/UPDATE/DELETE rules. The query that
@@ -9771,7 +9814,7 @@ func (c *InMemory) registerSystemTables() {
 		c.mu.RLock()
 		defer c.mu.RUnlock()
 		var out [][]string
-		for _, tbl := range c.tables {
+		for _, tbl := range c.ns(DefaultDBOid).tables {
 			if tbl == nil || tbl.Virtual || tbl.OID == 0 || len(tbl.Rules) == 0 {
 				continue
 			}
@@ -9801,7 +9844,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return out
 	}
-	c.tables["pg_catalog.pg_rewrite"] = pgRewrite
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_rewrite"] = pgRewrite
 
 	// pg_largeobject_metadata — large-object ownership/ACL catalog (OID 2995).
 	// After getRules, pg_dump's getBlobs probes large objects with:
@@ -9822,7 +9865,7 @@ func (c *InMemory) registerSystemTables() {
 		OID: 2995,
 	}
 	pgLargeobjectMetadata.VirtualRows = func() [][]string { return nil }
-	c.tables["pg_catalog.pg_largeobject_metadata"] = pgLargeobjectMetadata
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_largeobject_metadata"] = pgLargeobjectMetadata
 
 	// pg_amop — access-method operator catalog (OID 2602). After getBlobs,
 	// pg_dump's getDependencies issues a pg_depend UNION that joins both pg_amop
@@ -9881,7 +9924,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return out
 	}
-	c.tables["pg_catalog.pg_amop"] = pgAmop
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_amop"] = pgAmop
 
 	// pg_amproc — access-method support-procedure catalog (OID 2603). Joined
 	// alongside pg_amop in the same getDependencies pg_depend UNION (see pg_amop
@@ -9922,7 +9965,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return out
 	}
-	c.tables["pg_catalog.pg_amproc"] = pgAmproc
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_amproc"] = pgAmproc
 
 	// pg_seclabels — system view exposing security labels (a join over the
 	// pg_seclabel + pg_shseclabel catalogs). After getDependencies, pg_dump's
@@ -9950,7 +9993,7 @@ func (c *InMemory) registerSystemTables() {
 		OID: 3597,
 	}
 	pgSeclabels.VirtualRows = func() [][]string { return nil }
-	c.tables["pg_catalog.pg_seclabels"] = pgSeclabels
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_seclabels"] = pgSeclabels
 
 	// pg_shseclabel — the raw shared (cluster-wide) security-label catalog
 	// (pg_shseclabel.h, SharedSecLabelRelationId 3592). dumpDatabase's
@@ -9972,7 +10015,7 @@ func (c *InMemory) registerSystemTables() {
 		OID: 3592,
 	}
 	pgShseclabel.VirtualRows = func() [][]string { return nil }
-	c.tables["pg_catalog.pg_shseclabel"] = pgShseclabel
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_shseclabel"] = pgShseclabel
 
 	// pg_db_role_setting — per-database/per-role GUC override catalog
 	// (pg_db_role_setting.h, DbRoleSettingRelationId 2964). dumpDatabaseConfig
@@ -10023,7 +10066,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return out
 	}
-	c.tables["pg_catalog.pg_db_role_setting"] = pgDbRoleSetting
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_db_role_setting"] = pgDbRoleSetting
 
 	// pg_sequence — per-sequence parameter catalog (OID 2224, one row per
 	// sequence relation). After getTables, pg_dump's getSequences issues:
@@ -10068,8 +10111,8 @@ func (c *InMemory) registerSystemTables() {
 		}
 		c.mu.RLock()
 		defer c.mu.RUnlock()
-		keys := make([]string, 0, len(c.tables))
-		for k, t := range c.tables {
+		keys := make([]string, 0, len(c.ns(DefaultDBOid).tables))
+		for k, t := range c.ns(DefaultDBOid).tables {
 			if t.IsSequence {
 				keys = append(keys, k)
 			}
@@ -10077,7 +10120,7 @@ func (c *InMemory) registerSystemTables() {
 		sort.Strings(keys)
 		rows := make([][]string, 0, len(keys))
 		for _, k := range keys {
-			t := c.tables[k]
+			t := c.ns(DefaultDBOid).tables[k]
 			schema := t.Schema
 			if schema == "" {
 				schema = "public"
@@ -10103,7 +10146,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return rows
 	}
-	c.tables["pg_catalog.pg_sequence"] = pgSequence
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_sequence"] = pgSequence
 
 	// Update pg_settings to include more enable_* settings so sysviews.sql
 	// `select name, setting from pg_settings where name like 'enable%'` is non-empty.
@@ -10252,7 +10295,7 @@ func (c *InMemory) registerInformationSchemaTables() {
 		}
 		return rows
 	}
-	c.tables["information_schema.routines"] = isRoutines
+	c.ns(DefaultDBOid).tables["information_schema.routines"] = isRoutines
 
 	// information_schema.parameters — one row per parameter per routine.
 	isParams := &Table{
@@ -10322,7 +10365,7 @@ func (c *InMemory) registerInformationSchemaTables() {
 		}
 		return rows
 	}
-	c.tables["information_schema.parameters"] = isParams
+	c.ns(DefaultDBOid).tables["information_schema.parameters"] = isParams
 
 	// Stub usage views — columns match PG's information_schema; return no rows
 	// (body-dependency analysis not yet implemented).
@@ -10393,7 +10436,7 @@ func (c *InMemory) registerInformationSchemaTables() {
 		}
 		return rows
 	}
-	c.tables["information_schema.routine_routine_usage"] = rruTbl
+	c.ns(DefaultDBOid).tables["information_schema.routine_routine_usage"] = rruTbl
 
 	// routine_sequence_usage: one row per sequence dependency.
 	rsuCols := isRoutineUsageViews["routine_sequence_usage"]
@@ -10426,7 +10469,7 @@ func (c *InMemory) registerInformationSchemaTables() {
 		}
 		return rows
 	}
-	c.tables["information_schema.routine_sequence_usage"] = rsuTbl
+	c.ns(DefaultDBOid).tables["information_schema.routine_sequence_usage"] = rsuTbl
 
 	// routine_column_usage: one row per column dependency.
 	rcuCols := isRoutineUsageViews["routine_column_usage"]
@@ -10465,7 +10508,7 @@ func (c *InMemory) registerInformationSchemaTables() {
 		}
 		return rows
 	}
-	c.tables["information_schema.routine_column_usage"] = rcuTbl
+	c.ns(DefaultDBOid).tables["information_schema.routine_column_usage"] = rcuTbl
 
 	// routine_table_usage: one row per table dependency.
 	rtuCols := isRoutineUsageViews["routine_table_usage"]
@@ -10504,7 +10547,7 @@ func (c *InMemory) registerInformationSchemaTables() {
 		}
 		return rows
 	}
-	c.tables["information_schema.routine_table_usage"] = rtuTbl
+	c.ns(DefaultDBOid).tables["information_schema.routine_table_usage"] = rtuTbl
 }
 
 // TryRegisterUserTable installs a user table recovered from the pg_class/
@@ -10521,13 +10564,13 @@ func (c *InMemory) TryRegisterUserTable(tbl *Table) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	k := key(parser.ObjectName{Schema: tbl.Schema, Name: tbl.Name})
-	if _, exists := c.tables[k]; exists {
+	if _, exists := c.ns(DefaultDBOid).tables[k]; exists {
 		return nil // already registered — idempotent
 	}
 	for i := range tbl.Columns {
 		tbl.Columns[i].Ordinal = i
 	}
-	c.tables[k] = tbl
+	c.ns(DefaultDBOid).tables[k] = tbl
 	if tbl.OID >= c.nextOID {
 		c.nextOID = tbl.OID + 1
 	}
@@ -10561,7 +10604,7 @@ func (c *InMemory) RegisterRealTable(t *Table) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	k := key(parser.ObjectName{Schema: t.Schema, Name: t.Name})
-	if existing, ok := c.tables[k]; ok {
+	if existing, ok := c.ns(DefaultDBOid).tables[k]; ok {
 		if existing.OID == t.OID {
 			return nil // already registered — idempotent
 		}
@@ -10570,7 +10613,7 @@ func (c *InMemory) RegisterRealTable(t *Table) error {
 	for i := range t.Columns {
 		t.Columns[i].Ordinal = i
 	}
-	c.tables[k] = t
+	c.ns(DefaultDBOid).tables[k] = t
 	return nil
 }
 
@@ -10593,7 +10636,7 @@ func (c *InMemory) RegisterVirtualTable(t *Table) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	k := key(parser.ObjectName{Schema: t.Schema, Name: t.Name})
-	if _, exists := c.tables[k]; exists {
+	if _, exists := c.ns(DefaultDBOid).tables[k]; exists {
 		return fmt.Errorf("relation %q already exists", k)
 	}
 	if t.OID == 0 {
@@ -10603,7 +10646,7 @@ func (c *InMemory) RegisterVirtualTable(t *Table) error {
 	for i := range t.Columns {
 		t.Columns[i].Ordinal = i
 	}
-	c.tables[k] = t
+	c.ns(DefaultDBOid).tables[k] = t
 	return nil
 }
 
@@ -10627,14 +10670,14 @@ func key(name parser.ObjectName) string {
 func (c *InMemory) LookupTable(name parser.ObjectName) (*Table, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	if t, ok := c.tables[key(name)]; ok {
+	if t, ok := c.ns(DefaultDBOid).tables[key(name)]; ok {
 		return t, true
 	}
 	if name.Schema == "" {
-		if t, ok := c.tables[key(parser.ObjectName{Schema: "public", Name: name.Name})]; ok {
+		if t, ok := c.ns(DefaultDBOid).tables[key(parser.ObjectName{Schema: "public", Name: name.Name})]; ok {
 			return t, true
 		}
-		if t, ok := c.tables[key(parser.ObjectName{Schema: "pg_catalog", Name: name.Name})]; ok {
+		if t, ok := c.ns(DefaultDBOid).tables[key(parser.ObjectName{Schema: "pg_catalog", Name: name.Name})]; ok {
 			return t, true
 		}
 	} else {
@@ -10642,7 +10685,7 @@ func (c *InMemory) LookupTable(name parser.ObjectName) (*Table, bool) {
 		// that were moved to a different schema via SET SCHEMA (catalog key is unchanged).
 		// A table stored without an explicit schema (t.Schema="") is treated as being
 		// in "public", so a "public.foo" lookup finds a bare-keyed "foo" entry. M0097-0023.
-		if t, ok := c.tables[name.Name]; ok {
+		if t, ok := c.ns(DefaultDBOid).tables[name.Name]; ok {
 			tSchema := t.Schema
 			if tSchema == "" {
 				tSchema = "public"
@@ -10692,19 +10735,19 @@ func (c *InMemory) LookupIndex(name parser.ObjectName) (*Index, bool) {
 // rename/lookup issued before vs. after a restart can therefore target the
 // same logical index under two different literal keys.
 func (c *InMemory) lookupIndexLocked(name parser.ObjectName) (*Index, string, bool) {
-	if idx, ok := c.indexes[key(name)]; ok {
+	if idx, ok := c.ns(DefaultDBOid).indexes[key(name)]; ok {
 		return idx, key(name), ok
 	}
 	if name.Schema == "" {
 		// Unqualified name: try "public.<name>" first (indexes created via DDL
 		// always carry the table's schema, which defaults to "public").
-		if idx, ok := c.indexes["public."+name.Name]; ok {
+		if idx, ok := c.ns(DefaultDBOid).indexes["public."+name.Name]; ok {
 			return idx, "public." + name.Name, ok
 		}
 	} else {
 		// Schema-qualified lookup failed: fall back to bare name for indexes
 		// created without an explicit schema in the catalog key.
-		if idx, ok := c.indexes[name.Name]; ok {
+		if idx, ok := c.ns(DefaultDBOid).indexes[name.Name]; ok {
 			return idx, name.Name, ok
 		}
 	}
@@ -10717,7 +10760,7 @@ func (c *InMemory) CreateTable(name parser.ObjectName, cols []Column) (*Table, e
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	k := key(name)
-	if _, exists := c.tables[k]; exists {
+	if _, exists := c.ns(DefaultDBOid).tables[k]; exists {
 		return nil, fmt.Errorf("relation %q already exists", k)
 	}
 	for i := range cols {
@@ -10730,7 +10773,7 @@ func (c *InMemory) CreateTable(name parser.ObjectName, cols []Column) (*Table, e
 		OID:     c.nextOID,
 	}
 	c.nextOID++
-	c.tables[k] = t
+	c.ns(DefaultDBOid).tables[k] = t
 	return t, nil
 }
 
@@ -10743,7 +10786,7 @@ func (c *InMemory) CreateIndex(name parser.ObjectName, table *Table, cols []stri
 		return nil, fmt.Errorf("table is nil")
 	}
 	k := key(name)
-	if _, exists := c.indexes[k]; exists {
+	if _, exists := c.ns(DefaultDBOid).indexes[k]; exists {
 		return nil, fmt.Errorf("relation %q already exists", k)
 	}
 	idx := &Index{
@@ -10757,11 +10800,11 @@ func (c *InMemory) CreateIndex(name parser.ObjectName, table *Table, cols []stri
 		OID:     c.nextOID,
 	}
 	c.nextOID++
-	c.indexes[k] = idx
-	if c.byTable[table.OID] == nil {
-		c.byTable[table.OID] = map[string]*Index{}
+	c.ns(DefaultDBOid).indexes[k] = idx
+	if c.ns(DefaultDBOid).byTable[table.OID] == nil {
+		c.ns(DefaultDBOid).byTable[table.OID] = map[string]*Index{}
 	}
-	c.byTable[table.OID][k] = idx
+	c.ns(DefaultDBOid).byTable[table.OID][k] = idx
 	return idx, nil
 }
 
@@ -10773,7 +10816,7 @@ func (c *InMemory) AddColumn(table *Table, col Column) (*Column, error) {
 		return nil, fmt.Errorf("table is nil")
 	}
 	k := key(parser.ObjectName{Schema: table.Schema, Name: table.Name})
-	t, ok := c.tables[k]
+	t, ok := c.ns(DefaultDBOid).tables[k]
 	if !ok {
 		return nil, fmt.Errorf("relation %q does not exist", table.QualifiedName())
 	}
@@ -10794,18 +10837,18 @@ func (c *InMemory) RenameTable(old, new parser.ObjectName) error {
 	defer c.mu.Unlock()
 	oldK := key(old)
 	newK := key(new)
-	tbl, exists := c.tables[oldK]
+	tbl, exists := c.ns(DefaultDBOid).tables[oldK]
 	if !exists {
 		return fmt.Errorf("relation %q does not exist", oldK)
 	}
-	if _, exists2 := c.tables[newK]; exists2 {
+	if _, exists2 := c.ns(DefaultDBOid).tables[newK]; exists2 {
 		return fmt.Errorf("relation %q already exists", newK)
 	}
 	// Re-key the table entry under the new name, preserving the pointer.
 	tbl.Schema = new.Schema
 	tbl.Name = new.Name
-	c.tables[newK] = tbl
-	delete(c.tables, oldK)
+	c.ns(DefaultDBOid).tables[newK] = tbl
+	delete(c.ns(DefaultDBOid).tables, oldK)
 	return nil
 }
 
@@ -10819,7 +10862,7 @@ func (c *InMemory) RegisterTable(tbl *Table) {
 	if tbl.Schema != "" {
 		k = strings.ToLower(tbl.Schema) + "." + k
 	}
-	c.tables[k] = tbl
+	c.ns(DefaultDBOid).tables[k] = tbl
 }
 
 // RestoreIndex re-inserts a previously-dropped index back into the catalog.
@@ -10829,15 +10872,15 @@ func (c *InMemory) RestoreIndex(idx *Index) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	k := key(parser.ObjectName{Schema: idx.Schema, Name: idx.Name})
-	c.indexes[k] = idx
-	if c.byTable[idx.Table.OID] == nil {
-		c.byTable[idx.Table.OID] = map[string]*Index{}
+	c.ns(DefaultDBOid).indexes[k] = idx
+	if c.ns(DefaultDBOid).byTable[idx.Table.OID] == nil {
+		c.ns(DefaultDBOid).byTable[idx.Table.OID] = map[string]*Index{}
 	}
-	c.byTable[idx.Table.OID][k] = idx
+	c.ns(DefaultDBOid).byTable[idx.Table.OID][k] = idx
 }
 
 // RenameIndex renames a catalog index entry from old to new, re-keying both
-// `c.indexes` and the owning table's `c.byTable` slot (mirrors RenameTable's
+// `c.ns(DefaultDBOid).indexes` and the owning table's `c.ns(DefaultDBOid).byTable` slot (mirrors RenameTable's
 // shape, DU-002 slice 443). Returns an error when old does not exist or new
 // already exists — real PostgreSQL raises 42P07 for the latter
 // (RenameRelation -> RangeVarCallbackForAlterRelation's namespace check).
@@ -10853,10 +10896,10 @@ func (c *InMemory) RenameIndex(old, new parser.ObjectName) error {
 		return fmt.Errorf("relation %q already exists", newK)
 	}
 	idx.Name = new.Name
-	c.indexes[newK] = idx
-	delete(c.indexes, oldK)
+	c.ns(DefaultDBOid).indexes[newK] = idx
+	delete(c.ns(DefaultDBOid).indexes, oldK)
 	if idx.Table != nil {
-		if perTable := c.byTable[idx.Table.OID]; perTable != nil {
+		if perTable := c.ns(DefaultDBOid).byTable[idx.Table.OID]; perTable != nil {
 			delete(perTable, oldK)
 			perTable[newK] = idx
 		}
@@ -10881,10 +10924,10 @@ func (c *InMemory) RenameIndexDuringRecovery(schema, oldName, newName string) {
 	}
 	newK := key(parser.ObjectName{Schema: idx.Schema, Name: newName})
 	idx.Name = newName
-	c.indexes[newK] = idx
-	delete(c.indexes, oldK)
+	c.ns(DefaultDBOid).indexes[newK] = idx
+	delete(c.ns(DefaultDBOid).indexes, oldK)
 	if idx.Table != nil {
-		if perTable := c.byTable[idx.Table.OID]; perTable != nil {
+		if perTable := c.ns(DefaultDBOid).byTable[idx.Table.OID]; perTable != nil {
 			delete(perTable, oldK)
 			perTable[newK] = idx
 		}
@@ -10905,14 +10948,14 @@ func (c *InMemory) CreateView(name parser.ObjectName, cols []Column, aliases []s
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	k := key(name)
-	if existing, ok := c.tables[k]; ok {
+	if existing, ok := c.ns(DefaultDBOid).tables[k]; ok {
 		if !orReplace {
 			return nil, fmt.Errorf("relation %q already exists", k)
 		}
 		if existing.View == nil {
 			return nil, fmt.Errorf("%q is not a view", k)
 		}
-		delete(c.tables, k)
+		delete(c.ns(DefaultDBOid).tables, k)
 	}
 	for i := range cols {
 		cols[i].Ordinal = i
@@ -10927,7 +10970,7 @@ func (c *InMemory) CreateView(name parser.ObjectName, cols []Column, aliases []s
 		ViewColumnAliases: append([]string(nil), aliases...),
 	}
 	c.nextOID++
-	c.tables[k] = t
+	c.ns(DefaultDBOid).tables[k] = t
 	return t, nil
 }
 
@@ -10977,7 +11020,7 @@ func (c *InMemory) DropView(name parser.ObjectName, ifExists bool) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	k := key(name)
-	t, ok := c.tables[k]
+	t, ok := c.ns(DefaultDBOid).tables[k]
 	if !ok {
 		if ifExists {
 			return nil
@@ -10987,7 +11030,7 @@ func (c *InMemory) DropView(name parser.ObjectName, ifExists bool) error {
 	if t.View == nil {
 		return fmt.Errorf("%q is not a view", k)
 	}
-	delete(c.tables, k)
+	delete(c.ns(DefaultDBOid).tables, k)
 	return nil
 }
 
@@ -11120,29 +11163,29 @@ func (c *InMemory) RenameSchema(old, new string) ([]*Table, error) {
 		c.schemaOwners[lcNew] = owner
 	}
 	var movedSequences []*Table
-	for k, tbl := range c.tables {
+	for k, tbl := range c.ns(DefaultDBOid).tables {
 		if !strings.EqualFold(tbl.Schema, old) {
 			continue
 		}
 		tbl.Schema = new
 		newK := key(parser.ObjectName{Schema: new, Name: tbl.Name})
 		if newK != k {
-			delete(c.tables, k)
-			c.tables[newK] = tbl
+			delete(c.ns(DefaultDBOid).tables, k)
+			c.ns(DefaultDBOid).tables[newK] = tbl
 		}
 		if tbl.IsSequence {
 			movedSequences = append(movedSequences, tbl)
 		}
 	}
-	for k, idx := range c.indexes {
+	for k, idx := range c.ns(DefaultDBOid).indexes {
 		if !strings.EqualFold(idx.Schema, old) {
 			continue
 		}
 		idx.Schema = new
 		newK := key(parser.ObjectName{Schema: new, Name: idx.Name})
 		if newK != k {
-			delete(c.indexes, k)
-			c.indexes[newK] = idx
+			delete(c.ns(DefaultDBOid).indexes, k)
+			c.ns(DefaultDBOid).indexes[newK] = idx
 		}
 	}
 	for name, schema := range c.opClassSchemas {
@@ -12460,9 +12503,9 @@ func (c *InMemory) dependVirtualRows() [][]string {
 		oid     uint32
 		columns []Column
 	}
-	byName := make(map[string]tblRef, len(c.tables))
+	byName := make(map[string]tblRef, len(c.ns(DefaultDBOid).tables))
 	seqKeys := make([]string, 0)
-	for k, t := range c.tables {
+	for k, t := range c.ns(DefaultDBOid).tables {
 		if t.IsSequence {
 			seqKeys = append(seqKeys, k)
 			continue
@@ -12480,7 +12523,7 @@ func (c *InMemory) dependVirtualRows() [][]string {
 
 	rows := make([][]string, 0, len(seqKeys))
 	for _, k := range seqKeys {
-		t := c.tables[k]
+		t := c.ns(DefaultDBOid).tables[k]
 		seqSchema := strings.ToLower(t.Schema)
 		if seqSchema == "" {
 			seqSchema = "public"
@@ -16987,7 +17030,7 @@ func (c *InMemory) TablesInSchema(schemaName string) []parser.ObjectName {
 	defer c.mu.RUnlock()
 	schemaLC := strings.ToLower(schemaName)
 	var out []parser.ObjectName
-	for k, t := range c.tables {
+	for k, t := range c.ns(DefaultDBOid).tables {
 		if t.Virtual {
 			continue // skip system/virtual tables
 		}
@@ -17020,17 +17063,17 @@ func (c *InMemory) DropTable(name parser.ObjectName) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	k := key(name)
-	tbl, exists := c.tables[k]
+	tbl, exists := c.ns(DefaultDBOid).tables[k]
 	if !exists {
 		return fmt.Errorf("relation %q does not exist", k)
 	}
-	if idxs, ok := c.byTable[tbl.OID]; ok {
+	if idxs, ok := c.ns(DefaultDBOid).byTable[tbl.OID]; ok {
 		for idxKey := range idxs {
-			delete(c.indexes, idxKey)
+			delete(c.ns(DefaultDBOid).indexes, idxKey)
 		}
-		delete(c.byTable, tbl.OID)
+		delete(c.ns(DefaultDBOid).byTable, tbl.OID)
 	}
-	delete(c.tables, k)
+	delete(c.ns(DefaultDBOid).tables, k)
 	delete(c.tableACLs, tbl.OID) // forget any granted privileges (M0118-0008)
 	delete(c.tableACLOrder, tbl.OID)
 	return nil
@@ -17050,20 +17093,20 @@ func (c *InMemory) DropSessionTempObjects(owner string) int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	var victims []string
-	for k, t := range c.tables {
+	for k, t := range c.ns(DefaultDBOid).tables {
 		if t != nil && t.Temp && t.TempOwner == owner {
 			victims = append(victims, k)
 		}
 	}
 	for _, k := range victims {
-		tbl := c.tables[k]
-		if idxs, ok := c.byTable[tbl.OID]; ok {
+		tbl := c.ns(DefaultDBOid).tables[k]
+		if idxs, ok := c.ns(DefaultDBOid).byTable[tbl.OID]; ok {
 			for idxKey := range idxs {
-				delete(c.indexes, idxKey)
+				delete(c.ns(DefaultDBOid).indexes, idxKey)
 			}
-			delete(c.byTable, tbl.OID)
+			delete(c.ns(DefaultDBOid).byTable, tbl.OID)
 		}
-		delete(c.tables, k)
+		delete(c.ns(DefaultDBOid).tables, k)
 		delete(c.tableACLs, tbl.OID)
 		delete(c.tableACLOrder, tbl.OID)
 	}
@@ -17085,7 +17128,7 @@ func (c *InMemory) SessionTempTableNames(owner string) []string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	var names []string
-	for _, t := range c.tables {
+	for _, t := range c.ns(DefaultDBOid).tables {
 		if t != nil && t.Temp && t.TempOwner == owner {
 			names = append(names, t.Name)
 		}
@@ -17098,15 +17141,15 @@ func (c *InMemory) DropIndex(name parser.ObjectName) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	k := key(name)
-	idx, ok := c.indexes[k]
+	idx, ok := c.ns(DefaultDBOid).indexes[k]
 	if !ok {
 		return fmt.Errorf("index %q does not exist", k)
 	}
-	delete(c.indexes, k)
-	if idxs, ok := c.byTable[idx.Table.OID]; ok {
+	delete(c.ns(DefaultDBOid).indexes, k)
+	if idxs, ok := c.ns(DefaultDBOid).byTable[idx.Table.OID]; ok {
 		delete(idxs, k)
 		if len(idxs) == 0 {
-			delete(c.byTable, idx.Table.OID)
+			delete(c.ns(DefaultDBOid).byTable, idx.Table.OID)
 		}
 	}
 	return nil
@@ -17119,7 +17162,7 @@ func (c *InMemory) IndexesOnTable(table *Table) []*Index {
 	if table == nil {
 		return nil
 	}
-	idxs := c.byTable[table.OID]
+	idxs := c.ns(DefaultDBOid).byTable[table.OID]
 	out := make([]*Index, 0, len(idxs))
 	for _, idx := range idxs {
 		out = append(out, idx)
@@ -17345,8 +17388,8 @@ func BuildIndexDef(idx *Index) string {
 func (c *InMemory) AllIndexes() []*Index {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	out := make([]*Index, 0, len(c.indexes))
-	for _, idx := range c.indexes {
+	out := make([]*Index, 0, len(c.ns(DefaultDBOid).indexes))
+	for _, idx := range c.ns(DefaultDBOid).indexes {
 		out = append(out, idx)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].OID < out[j].OID })
@@ -17440,7 +17483,7 @@ func (c *InMemory) DropExclusionConstraint(tableOID uint32, constraintName strin
 // UNIQUE constraint) from both the per-table and flat index registries.
 // Caller must hold c.mu for writing.
 func (c *InMemory) dropIndexByName(tableOID uint32, constraintName string) bool {
-	inner, ok := c.byTable[tableOID]
+	inner, ok := c.ns(DefaultDBOid).byTable[tableOID]
 	if !ok {
 		return false
 	}
@@ -17449,9 +17492,9 @@ func (c *InMemory) dropIndexByName(tableOID uint32, constraintName string) bool 
 	}
 	delete(inner, constraintName)
 	// Also remove from the flat indexes map.
-	for k, idx := range c.indexes {
+	for k, idx := range c.ns(DefaultDBOid).indexes {
 		if idx.Table != nil && idx.Table.OID == tableOID && idx.Name == constraintName {
-			delete(c.indexes, k)
+			delete(c.ns(DefaultDBOid).indexes, k)
 			break
 		}
 	}
@@ -17487,7 +17530,7 @@ func (c *InMemory) HasPrimaryKey(table *Table) bool {
 	if table == nil {
 		return false
 	}
-	idxs := c.byTable[table.OID]
+	idxs := c.ns(DefaultDBOid).byTable[table.OID]
 	for _, idx := range idxs {
 		if idx.Primary {
 			return true
@@ -17529,8 +17572,8 @@ func (c *InMemory) IndexRelFileNode(index *Index) storage.RelFileNode {
 func (c *InMemory) AllTables() []*Table {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	out := make([]*Table, 0, len(c.tables))
-	for _, t := range c.tables {
+	out := make([]*Table, 0, len(c.ns(DefaultDBOid).tables))
+	for _, t := range c.ns(DefaultDBOid).tables {
 		if t.Virtual {
 			continue
 		}
@@ -17554,7 +17597,7 @@ func (c *InMemory) DatFrozenXID() storage.TransactionID {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	var oldest storage.TransactionID
-	for _, t := range c.tables {
+	for _, t := range c.ns(DefaultDBOid).tables {
 		if t.Virtual || IsSystemRelation(t.OID) {
 			continue
 		}
@@ -17740,7 +17783,7 @@ func (c *InMemory) AllUserViews() []*Table {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	out := make([]*Table, 0)
-	for _, t := range c.tables {
+	for _, t := range c.ns(DefaultDBOid).tables {
 		if !t.Virtual || t.View == nil || t.IsMatView {
 			continue
 		}
@@ -17758,7 +17801,7 @@ func (c *InMemory) AllUserMatViews() []*Table {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	out := make([]*Table, 0)
-	for _, t := range c.tables {
+	for _, t := range c.ns(DefaultDBOid).tables {
 		if !t.IsMatView {
 			continue
 		}
@@ -17776,7 +17819,7 @@ func (c *InMemory) AllUserMatViews() []*Table {
 func (c *InMemory) RenameColumnInViews(tableName, oldCol, newCol string) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	for _, t := range c.tables {
+	for _, t := range c.ns(DefaultDBOid).tables {
 		if t.View == nil {
 			continue
 		}
@@ -17868,7 +17911,7 @@ func (c *InMemory) FindFKsReferencingTable(tableName string) []FKRef {
 	defer c.mu.RUnlock()
 	name := strings.ToLower(tableName)
 	var out []FKRef
-	for _, t := range c.tables {
+	for _, t := range c.ns(DefaultDBOid).tables {
 		if t.Virtual {
 			continue
 		}
@@ -19392,7 +19435,7 @@ func (c *InMemory) TablesWithColumnOfType(typeName string) []*Table {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	var out []*Table
-	for _, tbl := range c.tables {
+	for _, tbl := range c.ns(DefaultDBOid).tables {
 		if tbl.Virtual {
 			continue
 		}
@@ -19441,13 +19484,13 @@ func (c *InMemory) attrDefRowsLocked() []attrDefRow {
 	// Index sequence relations by their bare (lowercased) name so a SERIAL
 	// column's default can resolve the owned sequence's pg_class OID.
 	seqOIDByName := make(map[string]uint32)
-	for _, t := range c.tables {
+	for _, t := range c.ns(DefaultDBOid).tables {
 		if t.IsSequence {
 			seqOIDByName[strings.ToLower(t.Name)] = t.OID
 		}
 	}
-	keys := make([]string, 0, len(c.tables))
-	for k, t := range c.tables {
+	keys := make([]string, 0, len(c.ns(DefaultDBOid).tables))
+	for k, t := range c.ns(DefaultDBOid).tables {
 		if t.Virtual {
 			continue
 		}
@@ -19457,7 +19500,7 @@ func (c *InMemory) attrDefRowsLocked() []attrDefRow {
 	var rows []attrDefRow
 	var oid uint32 = 1
 	for _, k := range keys {
-		tbl := c.tables[k]
+		tbl := c.ns(DefaultDBOid).tables[k]
 		for _, col := range tbl.Columns {
 			var adbin string
 			var seqOID uint32
@@ -19790,7 +19833,7 @@ func (c *InMemory) DropDomain(name string, ifExists bool, cascade bool) ([]strin
 	}
 	// Find tables that use this domain as a column type.
 	var dependentTables []string
-	for _, tbl := range c.tables {
+	for _, tbl := range c.ns(DefaultDBOid).tables {
 		if tbl.Virtual {
 			continue
 		}
@@ -19809,15 +19852,15 @@ func (c *InMemory) DropDomain(name string, ifExists bool, cascade bool) ([]strin
 	var dropped []string
 	if cascade {
 		for _, tblName := range dependentTables {
-			for tableKey, tbl := range c.tables {
+			for tableKey, tbl := range c.ns(DefaultDBOid).tables {
 				if strings.EqualFold(tbl.Name, tblName) {
 					dropped = append(dropped, tblName)
 					tblOID := tbl.OID
-					delete(c.tables, tableKey)
+					delete(c.ns(DefaultDBOid).tables, tableKey)
 					// Remove indexes on this table.
-					for idxOID, idx := range c.indexes {
+					for idxOID, idx := range c.ns(DefaultDBOid).indexes {
 						if idx.Table != nil && idx.Table.OID == tblOID {
-							delete(c.indexes, idxOID)
+							delete(c.ns(DefaultDBOid).indexes, idxOID)
 						}
 					}
 					break

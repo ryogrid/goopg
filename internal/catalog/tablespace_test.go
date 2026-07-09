@@ -11,7 +11,7 @@ import (
 func TestPgTablespaceVirtualView(t *testing.T) {
 	c := NewInMemory()
 
-	tbl, ok := c.tables["pg_catalog.pg_tablespace"]
+	tbl, ok := c.ns(DefaultDBOid).tables["pg_catalog.pg_tablespace"]
 	if !ok {
 		t.Fatal("pg_catalog.pg_tablespace not registered")
 	}
@@ -72,7 +72,7 @@ func TestPgDependAndForeignTableViews(t *testing.T) {
 		{"pg_catalog.pg_foreign_table", []string{"ftrelid", "ftserver", "ftoptions"}},
 	}
 	for _, tc := range cases {
-		tbl, ok := c.tables[tc.name]
+		tbl, ok := c.ns(DefaultDBOid).tables[tc.name]
 		if !ok {
 			t.Fatalf("%s not registered", tc.name)
 		}

@@ -91,7 +91,7 @@ func TestPgDatabaseVirtualRowsEnumeratesRegistry(t *testing.T) {
 	// Reach directly into the tables map; LookupTable takes a
 	// parser.ObjectName which would pull the parser package into this
 	// test for no real benefit.
-	tbl, ok := c.tables["pg_catalog.pg_database"]
+	tbl, ok := c.ns(DefaultDBOid).tables["pg_catalog.pg_database"]
 	if !ok || tbl.VirtualRows == nil {
 		t.Fatalf("pg_database virtual table not registered")
 	}
@@ -140,7 +140,7 @@ func TestCreateDatabaseAllocatesDistinctDisplayedOid(t *testing.T) {
 		t.Errorf("DatabaseOid(postgres) = %d, want 0 (no override)", got)
 	}
 
-	tbl, ok := c.tables["pg_catalog.pg_database"]
+	tbl, ok := c.ns(DefaultDBOid).tables["pg_catalog.pg_database"]
 	if !ok || tbl.VirtualRows == nil {
 		t.Fatalf("pg_database virtual table not registered")
 	}
@@ -223,7 +223,7 @@ func TestRegisterDatabaseDuringRecoveryAdvancesNextOID(t *testing.T) {
 // bootstrap FrozenTransactionID(2); datminmxid is the FirstMultiXactId(1) floor.
 func TestPgDatabaseExposesFrozenXidColumns(t *testing.T) {
 	c := NewInMemory()
-	tbl, ok := c.tables["pg_catalog.pg_database"]
+	tbl, ok := c.ns(DefaultDBOid).tables["pg_catalog.pg_database"]
 	if !ok {
 		t.Fatalf("pg_database virtual table not registered")
 	}
@@ -320,7 +320,7 @@ func TestResetDatabaseConfigLastEntryDeletesMapKey(t *testing.T) {
 	if _, ok := c.dbRoleSettings[FirstUserOID]; ok {
 		t.Errorf("dbRoleSettings still has a key for %d after its last entry was reset", FirstUserOID)
 	}
-	tbl, ok := c.tables["pg_catalog.pg_db_role_setting"]
+	tbl, ok := c.ns(DefaultDBOid).tables["pg_catalog.pg_db_role_setting"]
 	if !ok || tbl.VirtualRows == nil {
 		t.Fatalf("pg_db_role_setting virtual table not registered")
 	}
@@ -347,7 +347,7 @@ func TestResetAllDatabaseConfigClearsEverything(t *testing.T) {
 // setconfig rendered as a PG-native text[] literal.
 func TestPgDbRoleSettingVirtualRowsProjectsOverrides(t *testing.T) {
 	c := NewInMemory()
-	tbl, ok := c.tables["pg_catalog.pg_db_role_setting"]
+	tbl, ok := c.ns(DefaultDBOid).tables["pg_catalog.pg_db_role_setting"]
 	if !ok || tbl.VirtualRows == nil {
 		t.Fatalf("pg_db_role_setting virtual table not registered")
 	}
@@ -506,7 +506,7 @@ func TestUnregisterRoleDropsRoleConfigRows(t *testing.T) {
 // setrole=0 database row, sorted deterministically by (RoleOID, DBOid).
 func TestPgDbRoleSettingVirtualRowsProjectsRoleOverrides(t *testing.T) {
 	c := NewInMemory()
-	tbl, ok := c.tables["pg_catalog.pg_db_role_setting"]
+	tbl, ok := c.ns(DefaultDBOid).tables["pg_catalog.pg_db_role_setting"]
 	if !ok || tbl.VirtualRows == nil {
 		t.Fatalf("pg_db_role_setting virtual table not registered")
 	}

@@ -60,7 +60,7 @@ func TestExtensionVirtualRowsGlobal(t *testing.T) {
 	if err := c.CreateExtension("amcheck", "public", "1.4", "postgres", false); err != nil {
 		t.Fatalf("CreateExtension: %v", err)
 	}
-	tbl, ok := c.tables["pg_catalog.pg_extension"]
+	tbl, ok := c.ns(DefaultDBOid).tables["pg_catalog.pg_extension"]
 	if !ok || tbl.VirtualRows == nil {
 		t.Fatalf("pg_extension table or VirtualRows missing")
 	}

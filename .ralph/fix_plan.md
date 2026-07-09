@@ -5754,6 +5754,44 @@ mirroring M0119's ledger `status` column.
       explicit `dbOid` parameter through every public entry point (all
       callers passing `DefaultDBOid` to stay behavior-preserving); budget it
       as one self-contained pass, not spread across loops.
+  - [x] `M0122-0007` follow-up 8 (2026-07-09, this loop) — **slice 4 sub-slice
+      4b-i (namespace the table/index maps, internal only), landed.** Wrapped
+      `catalog.InMemory`'s `tables map[string]*Table`/`indexes
+      map[string]*Index`/`byTable map[uint32]map[string]*Index` fields in a
+      new `tableNamespace` struct keyed by `namespaces map[uint32]
+      *tableNamespace` (`internal/catalog/catalog.go`), with a `(c
+      *InMemory) ns(dbOid uint32) *tableNamespace` accessor. Replaced all 226
+      direct `c.tables`/`c.indexes`/`c.byTable` references inside
+      `catalog.go` with `c.ns(DefaultDBOid).tables`/etc (confirmed
+      mechanical: every one of the 226 already used receiver `c`, no other
+      receiver existed), plus 27 further direct-field references in
+      same-package white-box tests (`internal/catalog/*_test.go`, e.g.
+      `temp_namespace_test.go` seeding rows straight into `c.tables`).
+      Locking contract: `ns()` does NOT lock `c.mu` itself (not reentrant) —
+      it relies on `namespaces[DefaultDBOid]` being pre-seeded once inside
+      `NewInMemory` (single-threaded, before any goroutine fan-out) so its
+      lazy-create branch is dead code for now; every existing call site
+      still holds the same lock it always did. **Deliberately split out of
+      the original "4b" scope** (see design doc's 4b-i/4b-ii split): giving
+      every public entry point (`LookupTable`, `CreateTable`, ... ~dozens of
+      functions, hundreds of external callers in `internal/executor`/
+      `internal/planner`) an explicit `dbOid` parameter is now 4b-ii — a
+      separately-large, cross-package mechanical pass that this loop did
+      NOT attempt, so as to avoid landing a half-migrated signature set.
+      Zero observable behavior change (every namespace resolved is still
+      `DefaultDBOid`). Gates: `go build ./...` clean; `go vet ./...` clean;
+      `go test -short $(go list ./... | grep -v /internal/testport)` (full
+      repo, short mode) PASS; `go test ./internal/catalog/...
+      ./internal/executor/... ./internal/server/...` (targeted, non-short)
+      PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed transactions, all 3 pgbench workloads). Design:
+      `docs/design/0122-0018-per-database-catalog-namespace.md` updated (4b
+      split into 4b-i landed / 4b-ii planned) — no README.md index change
+      needed (same doc, already indexed). **Remaining M0122-0007 items:**
+      4b-ii (public entry-point `dbOid` parameter + all external callers),
+      then 4c/4d/4e per the design doc; 4b-ii is the next resume point and
+      should also be budgeted as its own self-contained pass.
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,

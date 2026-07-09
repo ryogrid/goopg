@@ -79,7 +79,7 @@ func TestTransformRegistry(t *testing.T) {
 // DU-002 (M0119-0004).
 func TestPgTransformVirtualRows(t *testing.T) {
 	c := NewInMemory()
-	tbl := c.tables["pg_catalog.pg_transform"]
+	tbl := c.ns(DefaultDBOid).tables["pg_catalog.pg_transform"]
 	if tbl == nil || tbl.VirtualRows == nil {
 		t.Fatal("pg_transform virtual table missing")
 	}
@@ -115,7 +115,7 @@ func TestPgTransformVirtualRows(t *testing.T) {
 	// NULL — matching pg_cast.castfunc's convention for the same situation.
 	c2 := NewInMemory()
 	c2.RegisterTransform("hstore", "plpythonu", 0, 0)
-	rows2 := c2.tables["pg_catalog.pg_transform"].VirtualRows()
+	rows2 := c2.ns(DefaultDBOid).tables["pg_catalog.pg_transform"].VirtualRows()
 	if rows2[0][3] != "0" || rows2[0][4] != "0" {
 		t.Errorf("unresolved func OIDs = %q/%q, want 0/0", rows2[0][3], rows2[0][4])
 	}
