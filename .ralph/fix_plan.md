@@ -2924,6 +2924,40 @@ survey the deferral ledger for a fresh open (`status = -`) row.
       discipline (e.g. page deletion/recycling, external-sort bulk-build)
       should be treated as suspect until it's audited the same way. No code
       changes this loop — verification only.
+  - [x] `M-NIGHTLY (AI-20260709-010336-001..081)` testport package-wide
+      failure — 81 `TestPort_*`/`TestE2E_*` tests in
+      `ci/logs/20260709-010336/testport/go-test.log` all failed with
+      `init failed: # github.com/goopg/goopg/internal/executor
+      internal/executor/operators_window.go:216:71: o.plan.Frame.Mode
+      undefined (type *planner.WindowFrame has no field or method Mode)`
+      (first failure at `TestPort_IsolationTemporalRangeIntegrity`,
+      log line 7475, then every subsequent test in the same `go test`
+      process — a single package-wide compile break, not 81 independent
+      regressions). Per fix_plan rule 3, re-ran the repro at HEAD before
+      investigating: the nightly's snapshot sha (`b9a1e1fb5366`) predates
+      commit `4ac7ba47` ("feat(executor): implement GROUPS window frame
+      mode (M0122-0004)"), which is the commit that added
+      `WindowFrame.Mode`/fixed this exact compile site — i.e. the break
+      was already resolved on `main`/this branch before tonight's items
+      were triaged. Confirmed via `go build ./...` (clean) and `go vet
+      ./internal/executor/...` (clean), then spot-checked one test per
+      distinct subsystem across the 81 (SASLprep E2E, 2 isolation specs,
+      2 pg_amcheck, pg_basebackup, pg_dump, pg_receivewal, pgoutput
+      interop) — all 9 PASS at HEAD (`go test -v -run
+      '^(TestE2E_SASLPrepMatchesRealLibpqClient|TestPort_IsolationFkContention|
+      TestPort_IsolationDeadlockHard|TestPort_PgAmcheck002Nonesuch|
+      TestPort_PgAmcheckBtreeIndexCheck|TestPort_PgBasebackup010BackupExecution|
+      TestPort_PgReceivewal020|TestPort_PgDumpConnectionSetup|
+      TestPort_PgoutputInteropGoopgToPG)$' ./internal/testport/`). No code
+      changes needed — stale nightly snapshot, already fixed on a later
+      commit than the one it ran against. The next nightly run (against
+      current HEAD) is the real confirmation for the full 81-test set;
+      not re-running the whole ~2h `internal/testport/` suite in this loop
+      (the log's own tail shows the full run needs >2h12m and gets killed
+      mid-`create_index` regress subtest — an infra timeout unrelated to
+      this compile-break triage, out of scope here). No deferral-ledger
+      row: nothing new was left unimplemented, this was pure stale-log
+      triage.
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 
