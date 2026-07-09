@@ -5595,6 +5595,59 @@ mirroring M0119's ledger `status` column.
 - [ ] **M0122-0010 — Concurrency: buffer pool & btree locking** (~17, LARGE).
       Lehman/Yao crab-walk, `splitMu` removal, storage-pool pin-count race,
       re-enable the `-race` gate. Gate: race detector mandatory.
+      **2026-07-09 loop — fixed the internal-page sibling-relink
+      cross-connection race** (continuation of the M-NIGHTLY
+      AI-20260709-010336-082 pgbench-reopen thread's closing note: "a
+      future structural-write path added without the same re-validation
+      discipline... should be treated as suspect until it's audited the
+      same way"). Audited `internal/access/btree/btree_vacuum.go`'s
+      remaining structural-mutation call sites for the exact bug class
+      just fixed there (leaf sibling-relink using a stale unlocked
+      `liveSibling` capture instead of a fresh re-derivation under the
+      write-side `pinW`) and found the IDENTICAL gap one level up:
+      `unlinkEmptyInternalPage` (WAL path) and
+      `unlinkEmptyInternalPageFPI` (FPI fallback) — used by
+      `maybeCascadeEmptyInternal` to unlink a vacuumed-empty internal
+      page — both computed `leftLive`/`rightLive` via the same unlocked
+      pre-pass and wrote them verbatim, exposed to the same cross-
+      connection splice-then-stomp corruption `bt.splitMu` cannot
+      prevent (per-`*BTree`-Go-instance only, not cross-connection).
+      Fixed both to re-derive the live neighbour via a fresh
+      `liveSibling` walk inside the same `pinW` hold that performs the
+      write, mirroring the leaf-level fix exactly. New regression test
+      `TestUnlinkEmptyInternalPagePreservesConcurrentSplice`
+      (`internal/access/btree/btree_vacuum_internal_race_test.go`)
+      deterministically reproduces the race with no goroutines needed:
+      builds a real 3-level (root/internal/leaf) tree via `BulkCreate`
+      (n=900000, same recipe as the existing
+      `TestVacuumIndexPagesCascadesEmptyInternalPage`), captures a
+      target internal page's real live prev/next exactly like
+      `maybeCascadeEmptyInternal` does, splices a synthetic live page in
+      between (simulating a same-window concurrent split on a different
+      connection), then invokes the low-level unlink with the STALE
+      pre-splice prev/next and asserts the splice survives instead of
+      being stomped. Confirmed non-vacuous via `git stash` on
+      `btree_vacuum.go` alone (fails pre-fix with the exact "stale stomp
+      regression" symptom the test asserts against). Design doc
+      `docs/design/0055-0003-btree-page-deletion-and-recycling-protocol.md`
+      new §2.5; `docs/design/README.md` row extended. Gates: `go build
+      ./...` clean; `go test ./internal/access/btree/...
+      ./internal/amcheck/... ./internal/executor/...` PASS; `go test
+      -race ./internal/access/btree/...` PASS; `scripts/tpch-spotcheck.sh`
+      PASS (Q12=2/Q13=33). **New gap found while fixing the above,
+      deferred (ledger row appended 2026-07-09):**
+      `applyParentDownlinkRemoval` (shared by both the leaf and
+      internal-page unlink WAL paths) removes the parent's downlink
+      purely by a previously-captured slot INDEX, with no re-validation
+      at write time that the item still at that index is the intended
+      child's downlink — the exact index-drift race
+      AI-20260706-201855-001 fixed for the intra-instance case (there
+      `splitMu` closed it), but NOT for a concurrent split racing from a
+      DIFFERENT connection's instance on the same parent page. This is
+      the epic's next concrete resume point (see the ledger row's
+      "resume point" column for the exact fix shape); the larger
+      `splitMu` removal / Lehman-Yao crab-walk items in this bucket
+      remain untouched by this loop.
 - [x] **M0122-0011 — Query optimizer & TPC-H/HammerDB correctness** (~17). Anti/
       semi-join unnesting (NOT IN), Q8/Q9/Q21 row-count fixes; several blocked on
       the slot/TupleSlot pipeline (see M0122-0012). Gate: TPC-H spot-check.

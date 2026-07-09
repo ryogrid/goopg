@@ -906,22 +906,53 @@ func (bt *BTree) unlinkEmptyInternalPage(blk, prev, next, parentBlk storage.Bloc
 	if err != nil {
 		return fmt.Errorf("btree: emit internal-page unlink record: %w", err)
 	}
+	// M-NIGHTLY (AI-20260709-010336-082 follow-up): do NOT blindly
+	// stamp the leftLive/rightLive values captured by the liveSibling
+	// walk above — mirrors unlinkEmptyLeaf's fix for the identical
+	// stale-sibling-relink race, just at the internal-page level.
+	// bt.splitMu only serialises structural mutations within THIS
+	// *BTree Go instance; each backend opens its own instance per
+	// statement, so a concurrent Insert-driven split on a DIFFERENT
+	// connection's instance for the SAME relation can splice a new
+	// live page into this exact chain segment between the walk above
+	// and the writes below. Re-derive the live neighbour from the
+	// sibling's CURRENT on-disk link, under the same pinW that
+	// performs the write — a no-op if nothing raced, self-correcting
+	// if it did.
 	if req.HasLeftSib {
+		var walkErr error
 		if err := bt.applyOpaqueMutation(req.LeftSibBlk, lsn, func(p storage.Page) {
 			op := readOpaque(p)
-			op.Next = req.LeftSibNewNext
+			newNext, werr := bt.liveSibling(op.Next, true)
+			if werr != nil {
+				walkErr = werr
+				return
+			}
+			op.Next = newNext
 			writeOpaque(p, op)
 		}); err != nil {
 			return err
 		}
+		if walkErr != nil {
+			return walkErr
+		}
 	}
 	if req.HasRightSib {
+		var walkErr error
 		if err := bt.applyOpaqueMutation(req.RightSibBlk, lsn, func(p storage.Page) {
 			op := readOpaque(p)
-			op.Prev = req.RightSibNewPrev
+			newPrev, werr := bt.liveSibling(op.Prev, false)
+			if werr != nil {
+				walkErr = werr
+				return
+			}
+			op.Prev = newPrev
 			writeOpaque(p, op)
 		}); err != nil {
 			return err
+		}
+		if walkErr != nil {
+			return walkErr
 		}
 	}
 	if err := bt.applyParentDownlinkRemoval(req.ParentBlk, req.ParentRemoveSlot, lsn); err != nil {
@@ -943,13 +974,23 @@ func (bt *BTree) unlinkEmptyInternalPage(blk, prev, next, parentBlk storage.Bloc
 // (test harnesses without a WAL writer) — mirrors
 // unlinkEmptyLeafFPI's shape.
 func (bt *BTree) unlinkEmptyInternalPageFPI(blk, parentBlk, leftLive, rightLive storage.BlockNumber) error {
+	// M-NIGHTLY (AI-20260709-010336-082 follow-up): re-derive the live
+	// neighbour from the sibling's CURRENT on-disk link under this
+	// pinW, not the stale leftLive/rightLive captured by the caller —
+	// see unlinkEmptyInternalPage's WAL-path twin and
+	// unlinkEmptyLeafFPI for the full cross-connection race rationale.
 	if leftLive != storage.InvalidBlockNumber {
 		s, err := bt.pinW(leftLive)
 		if err != nil {
 			return err
 		}
 		op := readOpaque(s.Page())
-		op.Next = rightLive
+		newNext, werr := bt.liveSibling(op.Next, true)
+		if werr != nil {
+			bt.unpinW(s)
+			return werr
+		}
+		op.Next = newNext
 		writeOpaque(s.Page(), op)
 		err = bt.markDirtyWithPageRecord(s, leftLive)
 		bt.unpinW(s)
@@ -963,7 +1004,12 @@ func (bt *BTree) unlinkEmptyInternalPageFPI(blk, parentBlk, leftLive, rightLive 
 			return err
 		}
 		op := readOpaque(s.Page())
-		op.Prev = leftLive
+		newPrev, werr := bt.liveSibling(op.Prev, false)
+		if werr != nil {
+			bt.unpinW(s)
+			return werr
+		}
+		op.Prev = newPrev
 		writeOpaque(s.Page(), op)
 		err = bt.markDirtyWithPageRecord(s, rightLive)
 		bt.unpinW(s)

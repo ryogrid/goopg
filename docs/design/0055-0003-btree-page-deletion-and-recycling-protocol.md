@@ -63,6 +63,51 @@ Current empty-leaf handling is intentionally simplified and does not yet provide
   scan for this case. Root invariants and fast-root metadata are
   unaffected by this gap (cascading never touches the root itself).
 
+### 2.5 Internal-page sibling-relink cross-connection race
+
+- **Fixed 2026-07-09** (M-NIGHTLY AI-20260709-010336-082 follow-up,
+  `internal/access/btree/btree_vacuum.go`): `unlinkEmptyInternalPage`
+  (WAL path) and `unlinkEmptyInternalPageFPI` (FPI fallback) had the
+  identical stale-sibling-relink bug already fixed for LEAF pages in
+  `unlinkEmptyLeaf`/`unlinkEmptyLeafFPI` (§2.4's sibling counterpart,
+  same root cause as the pgbench-reopen thread's block-678 finding)
+  — both computed `leftLive`/`rightLive` via an unlocked `liveSibling`
+  pre-pass in `maybeCascadeEmptyInternal`/`unlinkEmptyInternalPage`,
+  then wrote those captured values verbatim into the sibling pages.
+  `bt.splitMu` (held across the whole cascade via the caller,
+  `unlinkEmptyLeaf`) only serialises within one `*BTree` Go-instance —
+  each backend opens its own instance per statement — so a concurrent
+  Insert-driven split on a DIFFERENT connection's instance for the
+  SAME relation could splice a new live internal page into the exact
+  chain segment between the walk and the write, and this cascade's
+  later blind write would stomp that splice back to the stale
+  neighbour. Fixed by re-deriving the live neighbour via a fresh
+  `liveSibling` walk from the sibling's CURRENT on-disk link, executed
+  INSIDE the same `pinW` hold that performs the write — mirrors §2.4's
+  leaf-level fix exactly. Regression test:
+  `TestUnlinkEmptyInternalPagePreservesConcurrentSplice`
+  (`internal/access/btree/btree_vacuum_internal_race_test.go`) —
+  deterministically simulates the race (no goroutines needed) by
+  capturing a real internal page's live prev/next, splicing a
+  synthetic live page in between, then invoking the unlink with the
+  stale pre-splice prev/next; confirmed non-vacuous via `git stash`
+  (fails pre-fix with the exact stomp symptom).
+- **New gap found while fixing the above, NOT yet fixed (deferred, see
+  `.ralph/deferral_ledger.md` 2026-07-09):** `applyParentDownlinkRemoval`
+  (shared by both the leaf and internal-page unlink paths) removes the
+  parent's downlink purely by a previously-captured slot INDEX
+  (`resolveParentDownlink`'s / `findDownlinkSlotInParent`'s return
+  value), with no re-validation at write time that the item still at
+  that index is actually the intended child's downlink. This is the
+  SAME index-drift race AI-20260706-201855-001 fixed for the
+  intra-instance case (there, `splitMu` closed the gap because both
+  racing operations shared one `*BTree` instance) — but for a
+  DIFFERENT connection's instance racing via a concurrent split on
+  the SAME parent page, `splitMu` provides no protection at all (same
+  limitation as §2.5 above), so the index can still drift cross-
+  connection and `applyParentDownlinkRemoval` will delete an unrelated
+  live child's downlink instead of the intended one.
+
 ## 3. Tests
 
 - Delete-heavy and vacuum-heavy workloads with repeated cycles.
