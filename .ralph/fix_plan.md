@@ -5540,6 +5540,62 @@ mirroring M0119's ledger `status` column.
       unrelated failure, not a regression). **Remaining M0122-0007 items:**
       physical-storage-isolation slices 2-4 (see deferral ledger row for the
       concrete resume points), REINDEX CONCURRENTLY physical rebuild.
+  - [x] `M0122-0007` follow-up 4 (2026-07-09, this loop) — **physical-storage-
+      isolation slice 2: `base/<dbOid>` directory on CREATE DATABASE, done
+      (template-copy half re-scoped, see below).** `internal/initdb.
+      createPerDatabaseScaffolding` (Init-time-only, unexported) is now
+      `CreatePerDatabaseScaffolding` (exported: `os.MkdirAll(base/<oid>)` +
+      write `base/<oid>/PG_VERSION`, both naturally idempotent). New
+      `Server.createDatabasePhysicalDirectory`/`removeDatabasePhysicalDirectory`
+      (`internal/server/database_ddl.go`) call it via `s.cfg.Pool.Manager().
+      DataDir()` (nil `Pool`/empty `DataDir` = silent no-op, matching
+      `execCreateTablespace`'s embedded/test-context skip). Wired into
+      `databaseDDLCreate` BEFORE the WAL append — mirrors
+      `relocateRelationPhysicalFile`'s crash-safety ordering (physical
+      artifact exists before the operation that commits to it); a directory-
+      creation failure rolls back the catalog oid allocation exactly like a
+      WAL-append failure, and a WAL-append failure now also removes the
+      just-created directory (best-effort, safe-orphan-on-failure). Restart
+      durability: `replayDatabaseDDLRecords`
+      (`internal/initdb/database_ddl_recovery.go`) gained a `dataDir string`
+      param and re-creates `base/<oid>` for every replayed `CREATE DATABASE`
+      record (idempotent — closes the gap where the directory itself has no
+      independent WAL/fsync protection separate from the catalog record).
+      **Re-scoped the original slice-2 plan's template-copy half:** copying
+      a non-`template0` `TEMPLATE`'s relations is impossible today because
+      goopg still has ONE shared table/index namespace for the whole process
+      (`catalog.InMemory.tables`/`indexes` have no per-database key) — there
+      is no way to enumerate "template1's relations" as distinct from any
+      other database's. That mechanism (upstream's
+      `CreateDatabaseUsingFileCopy`/`copydir`) needs slice 4's per-database
+      catalog namespace to land FIRST, contrary to the original plan's
+      ordering assumption; `TEMPLATE` options remain silently ignored,
+      unchanged. Design: `docs/design/0122-0017-database-ddl-drop-guards.md`
+      new "Physical-storage-isolation slice 2" section (includes the
+      re-scoping rationale); `docs/design/README.md` row updated. Tests:
+      `TestTryHandleDatabaseDDLCreateCreatesPhysicalDirectory` (confirmed
+      non-vacuous via `git stash` across all 4 touched files — fails
+      "PG_VERSION missing" pre-fix), `TestTryHandleDatabaseDDLCreateNoPoolIsNoop`
+      (`internal/server/database_ddl_test.go`);
+      `TestDatabaseDDLRecoveryRecreatesMissingDatabaseDirectory` (new — deletes
+      the directory between two `Open` calls, confirms replay recreates it)
+      plus an assertion added to `TestDatabaseDDLRecoveryReplaysCreate`
+      (`internal/initdb/database_ddl_recovery_test.go`). Live-verified
+      against a real `cmd/goopg` binary (port 65498): `CREATE DATABASE
+      slicetest` produced `base/16403/PG_VERSION` matching the connection's
+      `pg_database.oid`; deleting that directory and restarting the server
+      recreated it via WAL replay before any client reconnected. Gates: `go
+      build ./...` clean; `go vet ./internal/initdb/... ./internal/server/...
+      ./internal/catalog/...` clean; `go test ./internal/initdb/...
+      ./internal/server/... ./internal/catalog/... ./internal/wal/...` PASS
+      (full packages, no regressions); `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+      scripts/ralph-precommit-test.sh` PASS (0 failed transactions, all 3
+      workloads). **Remaining M0122-0007 items:** physical-storage-isolation
+      slice 3 (real directory removal on DROP DATABASE — `base/<dbOid>` is
+      currently orphaned, harmless since nothing routes I/O through it),
+      slice 4 (per-database catalog namespace, the prerequisite for the
+      template-copy mechanism), REINDEX CONCURRENTLY physical rebuild.
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,

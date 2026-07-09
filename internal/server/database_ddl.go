@@ -33,12 +33,15 @@ package server
 import (
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/initdb"
 	"github.com/goopg/goopg/internal/protocol"
 	"github.com/goopg/goopg/internal/sqlstate"
 	"github.com/goopg/goopg/internal/wal"
@@ -486,6 +489,53 @@ func (s *Server) resolveActingRoleOID(actingRole string) uint32 {
 	return catalog.BootstrapSuperuserOID
 }
 
+// createDatabasePhysicalDirectory creates base/<oid>/PG_VERSION for a
+// just-allocated CREATE DATABASE oid (M0122-0007 physical-storage-isolation
+// slice 2 — see the package doc comment's "Multi-database storage
+// isolation" note, still not fully in scope: no relation ever routes I/O
+// through this directory yet, see catalog.DefaultDBOid). A nil Pool (some
+// test/embedded contexts, mirroring executor's ddlOp.relocateRelationPhysicalFile)
+// or an empty DataDir is a silent no-op — the registry entry still stands
+// alone, matching how other DDL operators skip cluster-filesystem effects
+// in those contexts.
+//
+// TEMPLATE is deliberately NOT honored here: goopg still has one shared
+// table/index namespace for the whole process (every relation keys off
+// catalog.DefaultDBOid regardless of which database a connection attached
+// to), so there is no valid set of "the template database's relations" to
+// copy yet — copying would either copy nothing (vacuous) or copy the one
+// shared namespace's relations into an oid nothing will ever read from.
+// This is physical-storage-isolation slice 4's prerequisite; see the
+// deferral ledger.
+func (s *Server) createDatabasePhysicalDirectory(oid uint32) error {
+	if s.cfg.Pool == nil {
+		return nil
+	}
+	dataDir := s.cfg.Pool.Manager().DataDir()
+	if dataDir == "" {
+		return nil
+	}
+	return initdb.CreatePerDatabaseScaffolding(dataDir, oid)
+}
+
+// removeDatabasePhysicalDirectory best-effort removes base/<oid> after a
+// CREATE DATABASE that allocated it fails a later step (currently only the
+// WAL append in the databaseDDLCreate branch above) — keeps the rollback
+// symmetric with createDatabasePhysicalDirectory's creation. A failure here
+// is non-fatal: it only leaves a harmless orphaned empty directory, the
+// same "safe orphan" tolerance relocateRelationPhysicalFileCleanupOld
+// documents for the tablespace-relocation case.
+func (s *Server) removeDatabasePhysicalDirectory(oid uint32) {
+	if s.cfg.Pool == nil {
+		return
+	}
+	dataDir := s.cfg.Pool.Manager().DataDir()
+	if dataDir == "" {
+		return
+	}
+	_ = os.RemoveAll(filepath.Join(dataDir, "base", strconv.FormatUint(uint64(oid), 10)))
+}
+
 // actingRoleIsSuperuser reports whether actingRole (see resolveActingRoleOID)
 // currently holds the SUPERUSER attribute — the escape hatch dropdb()'s
 // object_ownercheck grants a superuser regardless of database ownership.
@@ -557,10 +607,21 @@ func (s *Server) tryHandleDatabaseDDL(sql string, liveDBName string, actingRole 
 			}
 			return true, "", err
 		}
+		// M0122-0007 physical-storage-isolation slice 2: create base/<oid>
+		// (+ PG_VERSION) BEFORE the WAL append that makes the CREATE durable —
+		// mirrors relocateRelationPhysicalFile's crash-safety ordering (the
+		// physical artifact must exist before the operation that commits to
+		// it). A failure here rolls back the catalog allocation exactly like
+		// a WAL-append failure does below.
+		if err := s.createDatabasePhysicalDirectory(oid); err != nil {
+			_ = cat.DropDatabase(name)
+			return true, "", err
+		}
 		if s.cfg.WAL != nil {
 			if _, _, werr := s.cfg.WAL.Append(wal.EncodeCreateDatabase(name, owner, oid)); werr != nil {
 				// Roll back the catalog change so memory and disk agree.
 				_ = cat.DropDatabase(name)
+				s.removeDatabasePhysicalDirectory(oid)
 				return true, "", werr
 			}
 		}

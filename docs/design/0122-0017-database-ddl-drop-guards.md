@@ -274,12 +274,98 @@ warns about by re-running `TestPort_PgDumpDatabaseConfigSet`,
 fail identically at HEAD before this change, an unrelated pre-existing
 failure, not a regression introduced here).
 
+## Physical-storage-isolation slice 2: `base/<dbOid>` directory on CREATE DATABASE (2026-07-09 follow-up 4)
+
+Lands the directory-allocation half of slice 2 named above. **The
+template-copy half is explicitly NOT implemented and is re-scoped below** —
+see "What this does NOT do" for why.
+
+**What changed:**
+
+- `internal/initdb.createPerDatabaseScaffolding` (Init-time-only, unexported)
+  is now `CreatePerDatabaseScaffolding` (exported): `os.MkdirAll(base/<oid>)`
+  + write `base/<oid>/PG_VERSION`. Both operations are naturally idempotent
+  (`MkdirAll` on an existing dir, `WriteFile` truncate-and-rewrite), so the
+  function is safe to call repeatedly for the same oid.
+- `Server.createDatabasePhysicalDirectory(oid)` (new,
+  `internal/server/database_ddl.go`) calls it using `s.cfg.Pool.Manager().
+  DataDir()` — a nil `Pool` or empty `DataDir` (embedded/test contexts) is a
+  silent no-op, matching how `execCreateTablespace`/
+  `relocateRelationPhysicalFile` skip cluster-filesystem effects in the same
+  contexts.
+- `tryHandleDatabaseDDL`'s `databaseDDLCreate` branch calls it **BEFORE** the
+  WAL append (not after) — mirrors `relocateRelationPhysicalFile`'s
+  crash-safety ordering: the physical artifact must exist before the
+  operation that makes it durable/authoritative runs, not after. A directory-
+  creation failure rolls back the catalog's oid allocation exactly like a
+  WAL-append failure already did (`cat.DropDatabase(name)`); a WAL-append
+  failure now ALSO removes the just-created directory via the new
+  `Server.removeDatabasePhysicalDirectory(oid)` (best-effort — like
+  `relocateRelationPhysicalFileCleanupOld`, a failure here only leaves a
+  harmless orphaned empty directory).
+- **Restart durability**: `replayDatabaseDDLRecords`
+  (`internal/initdb/database_ddl_recovery.go`) gained a `dataDir string`
+  parameter; for every replayed `RecordKindCreateDatabase` it also calls
+  `CreatePerDatabaseScaffolding(dataDir, oid)`. This matters even though the
+  live create-path already created the directory before its WAL record went
+  durable, because the directory itself has no independent WAL protection —
+  a crash could in principle lose the `mkdir` while the WAL record survives
+  (analogous to why upstream's `CreateDirAndVersionFile` tolerates `EEXIST`
+  during redo). Idempotent recreation on every replay closes that gap for
+  free. DROP DATABASE replay does **not** remove the directory (see below).
+
+**What this does NOT do (re-scoping slice 2's original template-copy plan):**
+
+The original slice-2 plan (see the "Still open" note this section replaces)
+assumed a non-`template0` `CREATE DATABASE ... TEMPLATE x` could "walk the
+template database's relations copying each main-fork file". That assumption
+doesn't hold: goopg still has **one shared table/index namespace for the
+whole process** (`catalog.InMemory.tables`/`indexes` have no per-database
+key), so there is no way to enumerate "template1's relations" as distinct
+from "postgres's relations" — every relation ever created lives in the same
+map, keyed only by name, regardless of which database a connection was
+attached to when it ran `CREATE TABLE`. Attempting a template copy today
+would either copy nothing (vacuous, since `template1` is never populated
+through any real path) or copy the ONE shared namespace's relations into an
+oid nothing will ever route I/O through (since `catalog.DefaultDBOid` is
+still hardcoded everywhere) — neither is a meaningful step forward. The
+template-copy mechanism (upstream's `CreateDatabaseUsingFileCopy`/`copydir`,
+per `postgres/src/backend/commands/dbcommands.c`) genuinely needs slice 4's
+per-database catalog namespace to land first; it is not an independent
+sibling slice the way the ledger's original framing assumed. `TEMPLATE`
+options on `CREATE DATABASE` remain silently ignored, unchanged from before
+this loop.
+
+Tests: `TestTryHandleDatabaseDDLCreateCreatesPhysicalDirectory` (confirmed
+non-vacuous via `git stash` on `database_ddl.go`/`initdb.go`/
+`database_ddl_recovery.go`/`open.go` together — fails "PG_VERSION missing"
+pre-fix), `TestTryHandleDatabaseDDLCreateNoPoolIsNoop`
+(`internal/server/database_ddl_test.go`);
+`TestDatabaseDDLRecoveryRecreatesMissingDatabaseDirectory` (new — deletes the
+directory between two `Open` calls and confirms replay recreates it), plus an
+assertion added to the pre-existing `TestDatabaseDDLRecoveryReplaysCreate`
+(`internal/initdb/database_ddl_recovery_test.go`). Live-verified against a
+real `cmd/goopg` binary (port 65498): `CREATE DATABASE slicetest` produced
+`base/16403/PG_VERSION` matching the connection's `pg_database.oid`; deleting
+that directory and restarting the server recreated it via WAL replay before
+any client reconnected. Gates: `go build ./...` clean; `go vet
+./internal/initdb/... ./internal/server/... ./internal/catalog/...` clean;
+`go test ./internal/initdb/... ./internal/server/... ./internal/catalog/...
+./internal/wal/...` PASS (full packages, no regressions);
+`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+scripts/ralph-precommit-test.sh` PASS (0 failed transactions, all 3
+workloads).
+
 ## Still open (M0122-0007 bucket)
 
-- Physical-storage-isolation slices 2-4: `base/<dbOid>` directory allocation +
-  template-copy on CREATE, real directory removal on DROP, and routing every
-  relation lookup through the connection's actual database (the full
-  cluster-wide catalog-scoping refactor) — see the deferral ledger row
-  appended alongside this doc for the concrete resume point.
+- Physical-storage-isolation slice 3: real directory removal on DROP
+  DATABASE (`base/<dbOid>` is currently orphaned, not deleted — harmless
+  since nothing routes I/O through it, but never swept).
+- Physical-storage-isolation slice 4: routing every relation lookup through
+  the connection's actual database (the full cluster-wide catalog-scoping
+  refactor, `catalog.InMemory` gaining a per-database table/index namespace)
+  — the prerequisite the template-copy mechanism above actually needs. See
+  the deferral ledger row appended alongside this doc for the concrete
+  resume point.
 - `REINDEX ... CONCURRENTLY` physical rebuild (separate, pre-existing item,
   unaffected by this change).

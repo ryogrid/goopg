@@ -1270,7 +1270,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// catalog is fully constructed, so the next connection sees an
 	// accurate `pg_database`. Order matters: a drop following a
 	// create cancels out, so we walk records in stream order.
-	if err := replayDatabaseDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+	if err := replayDatabaseDDLRecords(filepath.Join(abs, "pg_wal"), cat, abs); err != nil {
 		_ = pool.Close()
 		_ = walWriter.Close()
 		_ = mgr.Close()

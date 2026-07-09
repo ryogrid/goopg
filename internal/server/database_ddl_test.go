@@ -2,11 +2,15 @@ package server
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
+	"strconv"
 	"testing"
 
 	"github.com/goopg/goopg/internal/activity"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/sqlstate"
+	"github.com/goopg/goopg/internal/storage"
 )
 
 // TestClassifyDatabaseDDL pins the M0054-0001 string-prefix matcher
@@ -392,6 +396,48 @@ func TestTryHandleDatabaseDDLDropRequiresOwnership(t *testing.T) {
 	}
 	if im.HasDatabase("aliceonly2") {
 		t.Error("DROP DATABASE aliceonly2 (as owner alice): database still registered after a successful drop")
+	}
+}
+
+// TestTryHandleDatabaseDDLCreateCreatesPhysicalDirectory pins M0122-0007
+// physical-storage-isolation slice 2: CREATE DATABASE must create
+// base/<oid>/PG_VERSION under the server's real data directory (a Pool
+// wired to a Manager, unlike newTestRoleServer's catalog-only fixture).
+func TestTryHandleDatabaseDDLCreateCreatesPhysicalDirectory(t *testing.T) {
+	dataDir := t.TempDir()
+	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dataDir})
+	pool, err := storage.NewPool(mgr, storage.PoolConfig{Slots: 4})
+	if err != nil {
+		t.Fatalf("NewPool: %v", err)
+	}
+	defer pool.Close()
+
+	s := New(Config{Catalog: catalog.NewInMemory(), Pool: pool})
+	im := s.cfg.Catalog.(*catalog.InMemory)
+
+	handled, _, err := s.tryHandleDatabaseDDL("CREATE DATABASE physdirtest", "postgres", "", nil)
+	if !handled || err != nil {
+		t.Fatalf("CREATE DATABASE physdirtest: handled=%v err=%v", handled, err)
+	}
+	oid := im.DatabaseOid("physdirtest")
+	if oid == 0 {
+		t.Fatal("DatabaseOid(physdirtest) = 0, want a real allocated oid")
+	}
+	versionFile := filepath.Join(dataDir, "base", strconv.FormatUint(uint64(oid), 10), "PG_VERSION")
+	if _, err := os.Stat(versionFile); err != nil {
+		t.Errorf("base/%d/PG_VERSION missing after CREATE DATABASE: %v", oid, err)
+	}
+}
+
+// TestTryHandleDatabaseDDLCreateNoPoolIsNoop confirms a nil Pool (the
+// catalog-only test fixtures every other database_ddl_test.go case uses)
+// does not turn createDatabasePhysicalDirectory into an error — matches
+// how other DDL operators skip cluster-filesystem effects in that context.
+func TestTryHandleDatabaseDDLCreateNoPoolIsNoop(t *testing.T) {
+	s := newTestRoleServer()
+	handled, _, err := s.tryHandleDatabaseDDL("CREATE DATABASE nopooltest", "postgres", "", nil)
+	if !handled || err != nil {
+		t.Fatalf("CREATE DATABASE nopooltest (nil Pool): handled=%v err=%v", handled, err)
 	}
 }
 

@@ -315,11 +315,16 @@ type Options struct {
 	Registry *config.Registry
 }
 
-// Init lays out the data directory according to opts.
-// createPerDatabaseScaffolding creates base/<dbOID>/ and writes
+// CreatePerDatabaseScaffolding creates base/<dbOID>/ and writes
 // base/<dbOID>/PG_VERSION so upstream PG ValidatePgVersion passes.
-// Must be called for every database OID seeded in pg_database.
-func createPerDatabaseScaffolding(dataDir string, dbOID uint32) error {
+// Called for every database OID seeded in pg_database at Init time, and
+// again by CREATE DATABASE (internal/server) and its WAL-replay recovery
+// path (M0122-0007 physical-storage-isolation slice 2) for a newly
+// allocated dboid. Idempotent — os.MkdirAll/os.WriteFile both tolerate an
+// already-existing directory/file, so replaying the same CREATE DATABASE
+// record twice (or re-running after a crash between mkdir and the WAL
+// append that makes it durable) is always safe.
+func CreatePerDatabaseScaffolding(dataDir string, dbOID uint32) error {
 	dbDir := filepath.Join(dataDir, "base", strconv.FormatUint(uint64(dbOID), 10))
 	if err := os.MkdirAll(dbDir, 0o700); err != nil {
 		return fmt.Errorf("create base/%d: %w", dbOID, err)
@@ -718,7 +723,7 @@ func Init(opts Options) error {
 	// Each needs base/<dboid>/ and base/<dboid>/PG_VERSION so PG's
 	// ValidatePgVersion passes at standby startup.
 	for _, dbOID := range []uint32{1, 4, 5} {
-		if err := createPerDatabaseScaffolding(abs, dbOID); err != nil {
+		if err := CreatePerDatabaseScaffolding(abs, dbOID); err != nil {
 			return fmt.Errorf("goopg init: %w", err)
 		}
 	}

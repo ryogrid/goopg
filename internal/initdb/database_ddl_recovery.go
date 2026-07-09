@@ -34,7 +34,16 @@ type databaseRegistryRecovery interface {
 // walDir means "freshly initdb'd cluster" and is treated as a no-op.
 // The catalog argument may be nil (some embedded test setups), in
 // which case the function returns nil without doing any I/O.
-func replayDatabaseDDLRecords(walDir string, cat catalog.Catalog) error {
+//
+// dataDir, when non-empty, re-creates base/<oid>/ (+ PG_VERSION) for every
+// replayed CREATE DATABASE record (M0122-0007 physical-storage-isolation
+// slice 2) — CreatePerDatabaseScaffolding is idempotent, so this is safe
+// whether or not the directory already survived the crash. DROP DATABASE
+// replay does not remove the directory (physical directory removal on
+// DROP is a separate, not-yet-implemented slice — see the deferral
+// ledger); an empty orphaned base/<oid> from a dropped database is
+// harmless since nothing routes relation I/O through it yet.
+func replayDatabaseDDLRecords(walDir string, cat catalog.Catalog, dataDir string) error {
 	if cat == nil {
 		return nil
 	}
@@ -67,6 +76,11 @@ func replayDatabaseDDLRecords(walDir string, cat catalog.Catalog) error {
 				return fmt.Errorf("decode create-database at lsn %d: %w", rec.StartLSN, derr)
 			}
 			reg.RegisterDatabaseDuringRecovery(name, owner, oid)
+			if dataDir != "" && oid != 0 {
+				if err := CreatePerDatabaseScaffolding(dataDir, oid); err != nil {
+					return fmt.Errorf("recreate base/%d for %q at lsn %d: %w", oid, name, rec.StartLSN, err)
+				}
+			}
 		case wal.RecordKindDropDatabase:
 			name, derr := wal.DecodeDropDatabase(rec.Payload)
 			if derr != nil {
