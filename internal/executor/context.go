@@ -456,6 +456,19 @@ type Context struct {
 	// pg_extension. Empty in embedded/test contexts. M0110-0003 (AC-002 gap #7c).
 	CurrentDatabase string
 
+	// CurrentDatabaseOid is the REAL, physical pg_database.oid resolved for
+	// CurrentDatabase via catalog.(*InMemory).ResolveDatabaseOid — the same
+	// oid that keys on-disk storage/ACLs, NOT pg_database's displayed oid
+	// column (which shows "postgres" as a legacy 16384 placeholder for
+	// compat, see ResolveDatabaseOid's doc comment). Zero if CurrentDatabase
+	// is empty or unresolvable (embedded/test contexts, or a database name
+	// the catalog doesn't recognize). This is plumbing only today — no
+	// lookup site yet keys off it, since catalog.InMemory's table/index
+	// namespace is still one shared, process-wide map regardless of which
+	// database a connection is bound to (M0122-0007 physical-storage-
+	// isolation slice 4; see docs/design/0122-0018-per-database-catalog-namespace.md).
+	CurrentDatabaseOid uint32
+
 	// ExtensionRows, when non-nil, is called by the valuesOp that backs
 	// pg_extension to return the rows visible in CurrentDatabase. pg_extension is
 	// per-database in PostgreSQL but goopg shares one in-memory catalog, so the

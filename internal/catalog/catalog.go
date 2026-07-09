@@ -4618,6 +4618,35 @@ func (c *InMemory) DatabaseOid(name string) uint32 {
 	return c.databaseOid[name]
 }
 
+// ResolveDatabaseOid returns the REAL, physical pg_database.oid for name —
+// the same oid that keys on-disk storage/ACLs (c.DBOID() for "postgres",
+// the fixed bootstrap oids for template1/template0, or the CreateDatabase-
+// allocated oid via DatabaseOid for any other registered database) — as
+// opposed to pg_database's VirtualRows column, which deliberately DISPLAYS
+// "postgres" as the legacy 16384 placeholder for CREATE SUBSCRIPTION/datacl
+// compat (see that closure's "oid, datallowconn, datistemplate" comment).
+// Returns ok=false if name is not a database this catalog knows about.
+// M0122-0007 physical-storage-isolation slice 4a — see
+// docs/design/0122-0018-per-database-catalog-namespace.md. Keep this switch
+// in sync with the VirtualRows closure's oid selection if either changes.
+func (c *InMemory) ResolveDatabaseOid(name string) (oid uint32, ok bool) {
+	switch name {
+	case "postgres":
+		return c.DBOID(), true
+	case "template1":
+		return 1, true
+	case "template0":
+		return 4, true
+	}
+	c.mu.RLock()
+	_, known := c.databases[name]
+	c.mu.RUnlock()
+	if !known {
+		return 0, false
+	}
+	return c.DatabaseOid(name), true
+}
+
 // DatconnlimitInvalidDB mirrors PG's DATCONNLIMIT_INVALID_DB sentinel
 // (pg_database.h): a database left partway through DROP DATABASE is marked
 // with this datconnlimit value so it's excluded from client-side filters

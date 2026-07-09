@@ -167,6 +167,38 @@ func TestCreateDatabaseAllocatesDistinctDisplayedOid(t *testing.T) {
 	}
 }
 
+// TestResolveDatabaseOid confirms ResolveDatabaseOid reports the REAL
+// physical oid used to key on-disk storage/ACLs for each database kind, NOT
+// pg_database's displayed-oid placeholder (which TestCreateDatabaseAllocates
+// DistinctDisplayedOid above pins as unchanged for "postgres"). M0122-0007
+// physical-storage-isolation slice 4a.
+func TestResolveDatabaseOid(t *testing.T) {
+	c := NewInMemory()
+	c.SetDBOID(5) // mirrors detectCatalogDBOID's real-world PG18 "postgres" oid
+
+	if oid, ok := c.ResolveDatabaseOid("postgres"); !ok || oid != 5 {
+		t.Errorf("ResolveDatabaseOid(postgres) = (%d, %v), want (5, true)", oid, ok)
+	}
+	if oid, ok := c.ResolveDatabaseOid("template1"); !ok || oid != 1 {
+		t.Errorf("ResolveDatabaseOid(template1) = (%d, %v), want (1, true)", oid, ok)
+	}
+	if oid, ok := c.ResolveDatabaseOid("template0"); !ok || oid != 4 {
+		t.Errorf("ResolveDatabaseOid(template0) = (%d, %v), want (4, true)", oid, ok)
+	}
+
+	created, err := c.CreateDatabase("dba", BootstrapSuperuserOID)
+	if err != nil {
+		t.Fatalf("CreateDatabase(dba): %v", err)
+	}
+	if oid, ok := c.ResolveDatabaseOid("dba"); !ok || oid != created {
+		t.Errorf("ResolveDatabaseOid(dba) = (%d, %v), want (%d, true)", oid, ok, created)
+	}
+
+	if oid, ok := c.ResolveDatabaseOid("no-such-database"); ok || oid != 0 {
+		t.Errorf("ResolveDatabaseOid(no-such-database) = (%d, %v), want (0, false)", oid, ok)
+	}
+}
+
 // TestRegisterDatabaseDuringRecoveryAdvancesNextOID confirms replaying a
 // CREATE DATABASE WAL record (which carries the original real oid, M0122-0007
 // physical-storage-isolation slice 1) advances the catalog's nextOID counter

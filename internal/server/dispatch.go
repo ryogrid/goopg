@@ -1898,14 +1898,28 @@ type extensionLister interface {
 	ExtensionRowsForDB(db string) [][]string
 }
 
+// databaseOidResolver is implemented by catalogs that can resolve a database
+// name to its real, physical pg_database.oid (catalog.InMemory). M0122-0007
+// physical-storage-isolation slice 4a.
+type databaseOidResolver interface {
+	ResolveDatabaseOid(name string) (uint32, bool)
+}
+
 // wireExtensionRows installs the per-database pg_extension view on ectx so an
 // extension installed in one database is invisible in another (PostgreSQL's
-// pg_extension is per-database; goopg shares one in-memory catalog). Used by
-// both the simple- and extended-query executor paths. M0110-0003 (gap #7c).
+// pg_extension is per-database; goopg shares one in-memory catalog). Also
+// resolves and stamps ectx.CurrentDatabaseOid (M0122-0007 slice 4a plumbing —
+// not yet consumed by any lookup site). Used by both the simple- and
+// extended-query executor paths. M0110-0003 (gap #7c).
 func (s *Server) wireExtensionRows(ectx *executor.Context, dbName string) {
 	ectx.CurrentDatabase = dbName
 	if el, ok := s.cfg.Catalog.(extensionLister); ok {
 		ectx.ExtensionRows = func() [][]string { return el.ExtensionRowsForDB(dbName) }
+	}
+	if dr, ok := s.cfg.Catalog.(databaseOidResolver); ok {
+		if oid, ok := dr.ResolveDatabaseOid(dbName); ok {
+			ectx.CurrentDatabaseOid = oid
+		}
 	}
 }
 

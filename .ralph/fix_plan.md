@@ -5707,6 +5707,53 @@ mirroring M0119's ledger `status` column.
       ledger row appended for this residual gap. **Remaining M0122-0007
       items:** slice 4 (per-database catalog namespace, the prerequisite for
       the template-copy mechanism) is now the only item left in this bucket.
+  - [x] `M0122-0007` follow-up 7 (2026-07-09, this loop) — **slice 4 design
+      pass + sub-slice 4a (context plumbing), landed.** Every prior loop in
+      this bucket flagged slice 4 (per-database catalog namespace) as "needs
+      its own design pass" / "a multi-loop epic" but none had written that
+      pass down. New design doc `docs/design/0122-0018-per-database-catalog-namespace.md`
+      inventories the actual blast radius (226 direct `c.tables`/`c.indexes`/
+      `c.byTable` call sites in `catalog.go` alone, measured via grep, plus
+      dozens of public entry points called from hundreds of executor/planner
+      sites) and lays out an ordered sub-slice breakdown: 4a (context
+      plumbing, landed) → 4b (namespace the maps behind a `dbOid`-keyed
+      accessor, behavior-preserving) → 4c (route reads through the
+      connection's real dbOid) → 4d (route writes + `RelFileNode.DBOid`) →
+      4e (cross-cutting fixups + the `CREATE DATABASE ... TEMPLATE` copy
+      mechanism this epic exists to unblock). Landed 4a: `catalog.
+      (*InMemory).ResolveDatabaseOid(name) (uint32, bool)`
+      (`internal/catalog/catalog.go`) is the canonical resolver for a
+      database's REAL physical oid (`c.DBOID()` for "postgres", fixed
+      bootstrap oids 1/4 for template1/template0, `DatabaseOid` for anything
+      else) — distinct from `pg_database`'s displayed-oid placeholder for
+      "postgres". New `executor.Context.CurrentDatabaseOid uint32` field is
+      stamped by the existing shared `Server.wireExtensionRows`
+      (`internal/server/dispatch.go`) — the SAME site both the simple and
+      extended query dispatch paths already call to wire `CurrentDatabase`/
+      `ExtensionRows` (M0110-0003 gap #7c) — so both sibling paths get the
+      new oid in one wiring point instead of risking a "wire only one path"
+      bug. Deliberately pure plumbing: no lookup site consumes
+      `CurrentDatabaseOid` yet, so this sub-slice changes zero observable
+      behavior. Tests: `TestResolveDatabaseOid`
+      (`internal/catalog/database_test.go`),
+      `TestWireExtensionRowsStampsCurrentDatabaseOid`
+      (new `internal/server/database_oid_wiring_test.go`), both confirmed
+      non-vacuous via `git stash` on the production file alone (compile
+      failure pre-fix). Gates: `go build ./...` clean; `go vet
+      ./internal/catalog/... ./internal/executor/... ./internal/server/...`
+      clean; `go test ./internal/catalog/... ./internal/executor/...
+      ./internal/server/...` PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+      scripts/ralph-precommit-test.sh` PASS (0 failed transactions, all 3
+      workloads). Design: `docs/design/0122-0018-per-database-catalog-namespace.md`
+      (new) + `docs/design/README.md` row. Deferral ledger row appended
+      (task-id "M0122-0007 (physical-storage-isolation slice 4a...)").
+      **Remaining M0122-0007 items:** sub-slices 4b-4e (see the new design
+      doc for the full plan) — 4b is the next resume point: wrap
+      `tables`/`indexes`/`byTable` in a per-dbOid namespace and thread an
+      explicit `dbOid` parameter through every public entry point (all
+      callers passing `DefaultDBOid` to stay behavior-preserving); budget it
+      as one self-contained pass, not spread across loops.
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,
