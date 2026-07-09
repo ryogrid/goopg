@@ -5265,6 +5265,100 @@ mirroring M0119's ledger `status` column.
       tablespace physical relocation, REINDEX CONCURRENTLY physical rebuild
       (all object types), plus the true restart-the-listener reload for
       `ContextPostmaster` GUCs noted above (matches upstream, not a gap).
+      **Tablespace physical relocation — done (2026-07-09, this loop, closes
+      the "tablespace physical relocation" resume point every prior
+      tablespace-cluster entry above has named since 2026-07-08):** every
+      earlier tablespace slice was catalog-metadata only —
+      `pg_class.reltablespace` reported the right OID but a relation's real
+      data file always stayed under `base/<dbOid>/<relOid>` regardless of
+      its declared tablespace. `storage.RelFileNode` gained `TblOid uint32`
+      (0 = default tablespace, unchanged `base/<dbOid>` path — purely
+      additive, every existing struct literal keeps compiling and behaving
+      identically); `Manager.relPath`/`RelPath` (`internal/storage/smgr.go`)
+      route through a new `relDir` helper that resolves a non-zero `TblOid`
+      to `pg_tblspc/<TblOid>/<config.TablespaceVersionDirectory>/<dbOid>/`,
+      the same layout `execCreateTablespace` already creates.
+      `catalog.InMemory.RelFileNode(table)`/`IndexRelFileNode(index)` — the
+      ONLY two call sites in the whole codebase that convert a
+      `catalog.Table`/`catalog.Index` into a `storage.RelFileNode` for real
+      I/O (confirmed via grep: all 227 raw `storage.RelFileNode{...}`
+      literals elsewhere are tests/TOAST/shared-catalog-sentinel
+      constructions, not a second conversion path) — now set `TblOid` from
+      `table.Tablespace`/`index.Tablespace` (both fields already existed and
+      were already restart-durable per the 2026-07-08/09 entries above; they
+      simply never reached `RelFileNode`). `ALTER TABLE/INDEX ... SET
+      TABLESPACE` (`internal/executor/operators_ddl.go`) now calls a new
+      `relocateRelationPhysicalFile(oldRel, newRel)` BEFORE mutating
+      `tbl.Tablespace`/`idx.Tablespace`: flush the relation's dirty buffered
+      pages to the OLD file (new `Pool.FlushRel`, which — unlike the
+      pre-existing `InvalidateRel` DROP-TABLE uses — writes instead of
+      discarding dirty content), copy-and-fsync to the NEW tablespace path,
+      forget the OLD cached handle (new `Manager.CloseRelation`, closes
+      without deleting — distinct from `DropRelation`). Only MainFork is
+      handled (goopg has no real backing file for FSM/VM/Init forks outside
+      `internal/executor/expr.go`'s `pg_relation_size` helpers); a non-btree
+      index (gist/spgist/gin/brin) has no physical file at all, so the move
+      is a no-op and only the catalog metadata changes, matching CREATE
+      INDEX's own behavior for those AMs. **Crash-safety is copy-then-switch**
+      (mirrors upstream's `copy_relation_data` + pending-delete, NOT
+      rename-then-switch): the new file is fully written+fsynced BEFORE the
+      caller commits the catalog/heap/WAL mutation that makes the new
+      tablespace authoritative; the old file is removed only AFTER that
+      commit succeeds (new `relocateRelationPhysicalFileCleanupOld`) — a
+      crash at either boundary leaves at most a harmless orphaned file, never
+      lost or duplicated data. **Safety-completeness fix in the same loop:**
+      `execDropTablespace` previously `os.RemoveAll`'d the `pg_tblspc/<oid>`
+      directory unconditionally — harmless when tablespaces were
+      catalog-metadata-only, but a real data-loss risk now that the
+      directory can hold genuine relation files. It now checks every table
+      and index for `Tablespace == oid` first and rejects with `55000`
+      (`ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE`), mirroring upstream's
+      `DropTableSpace` "tablespace %q is not empty" (`tablespace.c`). Tests:
+      `storage.TestRelPathTablespace`/`TestManagerOpensTablespaceUnderPgTblspcDir`/
+      `TestManagerCloseRelationClosesHandleWithoutDeletingFile`/
+      `TestPoolFlushRelWritesOnlyTargetRelationAndKeepsSlotsCached`;
+      `executor.TestAlterTableSetTablespacePhysicallyRelocatesFile`/
+      `TestAlterIndexSetTablespacePhysicallyRelocatesFile` (confirmed
+      non-vacuous via `git stash` — fail to COMPILE pre-fix, since they use
+      the new `TblOid` field);
+      `executor.TestDropTablespaceRejectsWhenTableStillReferencesIt`/
+      `TestDropTablespaceRejectsWhenIndexStillReferencesIt`;
+      `initdb.TestAlterTableSetTablespacePhysicalRelocationSurvivesRestart`
+      (real `Init`→`Open`→DDL→`Close`→`Open` cycle asserting the file lives
+      under the NEW `pg_tblspc/...` path and NOT the old `base/...` path
+      post-restart — also confirmed non-vacuous via `git stash`; a plain
+      reltablespace-only assertion would have passed even pre-fix, since
+      without TblOid-aware routing the file simply never moves and stays
+      trivially findable at its one unchanged location). Live-verified
+      against a real `cmd/goopg` binary: `CREATE TABLESPACE` +
+      `CREATE TABLE ... TABLESPACE` + 100 rows + `ALTER TABLE ... SET
+      TABLESPACE` + `CREATE INDEX ... TABLESPACE` — `find pg_tblspc base`
+      confirmed both files live only under
+      `pg_tblspc/<oid>/<version dir>/<dbOid>/`; a real `goopg stop`/`goopg
+      start` cycle preserved all 100 rows and a working index-scan lookup;
+      `DROP TABLESPACE` on the still-referenced tablespace correctly errored
+      `tablespace "ts_live" is not empty`. Design:
+      `docs/design/0095-0003-in-place-tablespace.md` new "Physical
+      relocation" section; `docs/design/README.md` row extended. Gates: `go
+      build ./...`/`go vet ./...` clean; `go test ./internal/storage/...
+      ./internal/catalog/... ./internal/access/btree/... ./internal/amcheck/...`
+      PASS; `go test ./internal/executor/...` PASS (also caught and fixed a
+      real bug this loop's own gate run surfaced: the first relocation-path
+      draft used `ctx.DataDir` to build absolute file paths, which broke the
+      pre-existing `TestAlterIndexSetTablespaceUpdatesIndex` — that test's
+      fixture deliberately points `ctx.DataDir` at a DIFFERENT directory
+      than the real storage `Manager`'s own configured root; fixed by using
+      the Manager's own `DataDir()` accessor instead, which is authoritative
+      for where files actually live); `go test ./internal/initdb/...` PASS
+      (243s, full suite); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed transactions across pgbench TPC-B/simple-update/select-only).
+      **Deferred (ledger row, 2026-07-09):** orphaned files from a crash
+      strictly mid-relocation are never garbage-collected (harmless dead
+      bytes, not a correctness bug — see the ledger row for the resume
+      point on an eventual sweep mechanism). **Remaining M0122-0007 items:**
+      CREATE/DROP DATABASE full DDL, REINDEX CONCURRENTLY physical rebuild
+      (both pre-existing, untouched this loop).
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,

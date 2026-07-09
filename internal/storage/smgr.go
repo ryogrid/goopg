@@ -6,7 +6,10 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
+
+	"github.com/goopg/goopg/internal/config"
 )
 
 // Manager is the storage manager. It owns one open file per loaded
@@ -446,7 +449,7 @@ func (m *Manager) Exists(rel RelFileNode) bool {
 // can build the upstream-verbatim `could not open file "%s"` message when a
 // fork is found missing (the pg_amcheck heap file-removal corruption scenario).
 func (m *Manager) RelPath(rel RelFileNode) string {
-	base := sharedOrPerDBRelDir(rel.DBOid)
+	base := relDir(rel)
 	switch rel.Fork {
 	case MainFork:
 		return base + "/" + fmt.Sprint(rel.RelOid)
@@ -525,6 +528,25 @@ func (m *Manager) DropRelation(rel RelFileNode) error {
 	return nil
 }
 
+// CloseRelation closes rel's cached open file handle (if any) WITHOUT
+// removing the underlying file — unlike DropRelation, which does both. Used
+// by ALTER TABLE/INDEX ... SET TABLESPACE's physical relocation (M0122-0007):
+// once a relation's file has been copied to its new tablespace-scoped path
+// and the catalog durably points there, the OLD RelFileNode's cached handle
+// must be forgotten so a subsequent access under the (already-evicted, per
+// Pool.FlushRel+InvalidateRel) old tag can't accidentally reopen/reuse it;
+// the actual old file removal is a separate best-effort cleanup step the
+// caller performs itself (os.Remove), since a failure to clean up an orphan
+// is harmless but closing the wrong handle is not.
+func (m *Manager) CloseRelation(rel RelFileNode) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if f, ok := m.files[rel]; ok {
+		_ = f.f.Close()
+		delete(m.files, rel)
+	}
+}
+
 // TruncateRelation truncates rel's backing file to zero blocks. The
 // caller is responsible for invalidating buffer-pool slots that hold
 // pages of rel before calling this.
@@ -586,8 +608,24 @@ func sharedOrPerDBRelDir(dbOid uint32) string {
 	return "base/" + fmt.Sprint(dbOid)
 }
 
+// relDir returns the directory (forward-slash-joined, relative to the data
+// dir) a RelFileNode's files live under. TblOid==0 (pg_default/pg_global —
+// see catalog.Table.Tablespace's "0 means default" convention) keeps the
+// pre-existing base/<dbOid> (or global/) layout. A non-zero TblOid routes
+// through pg_tblspc/<TblOid>/<version dir>/<dbOid>, mirroring upstream's
+// relpath() tablespace branch and the directory execCreateTablespace already
+// creates (internal/executor/operators_ddl.go). M0122-0007 tablespace
+// physical relocation.
+func relDir(rel RelFileNode) string {
+	if rel.TblOid == 0 {
+		return sharedOrPerDBRelDir(rel.DBOid)
+	}
+	return "pg_tblspc/" + strconv.FormatUint(uint64(rel.TblOid), 10) + "/" +
+		config.TablespaceVersionDirectory + "/" + fmt.Sprint(rel.DBOid)
+}
+
 func (m *Manager) relPath(rel RelFileNode) string {
-	base := filepath.Join(m.cfg.DataDir, sharedOrPerDBRelDir(rel.DBOid))
+	base := filepath.Join(m.cfg.DataDir, relDir(rel))
 	switch rel.Fork {
 	case MainFork:
 		return filepath.Join(base, fmt.Sprint(rel.RelOid))

@@ -1934,6 +1934,50 @@ func (p *Pool) FlushAll() error {
 	return p.FlushAllPaced(nil)
 }
 
+// FlushRel writes every dirty slot belonging to rel to its CURRENT on-disk
+// location and clears their dirty bits, leaving the slots cached (unlike
+// InvalidateRel, which discards dirty content instead of writing it — correct
+// for DROP TABLE where the data is being deleted anyway, but wrong here).
+// Used by ALTER TABLE/INDEX ... SET TABLESPACE's physical relocation
+// (M0122-0007): the relation's file must reflect every buffered write before
+// it is copied to the new tablespace path, otherwise the copy would silently
+// drop whatever this session (or another) wrote but hasn't been evicted yet.
+// Callers still need InvalidateRel afterward to drop the now-clean cached
+// slots so the next access re-resolves rel's (possibly changed) tag.
+func (p *Pool) FlushRel(rel RelFileNode) error {
+	type pending struct {
+		idx int
+		tag BufferTag
+	}
+	var todo []pending
+	for i := range p.slots {
+		st := p.slots[i].state.Load()
+		if stateValid(st) && stateDirty(st) && p.slots[i].tag.Rel == rel {
+			todo = append(todo, pending{i, p.slots[i].tag})
+		}
+	}
+	if len(todo) == 0 {
+		return nil
+	}
+	batchSize := p.flushBatchSize()
+	for start := 0; start < len(todo); start += batchSize {
+		end := start + batchSize
+		if end > len(todo) {
+			end = len(todo)
+		}
+		batchSlots := make([]*Slot, 0, end-start)
+		batchTags := make([]BufferTag, 0, end-start)
+		for _, t := range todo[start:end] {
+			batchSlots = append(batchSlots, &p.slots[t.idx])
+			batchTags = append(batchTags, t.tag)
+		}
+		if err := p.flushBatch(batchSlots, batchTags); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // FlushAllPaced writes every dirty slot and invokes pacer after each batch.
 func (p *Pool) FlushAllPaced(pacer func(progress float64) error) error {
 	if p.OnFlushAll != nil {

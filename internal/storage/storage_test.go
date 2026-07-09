@@ -355,6 +355,78 @@ func TestPoolFlushAllClearsDirty(t *testing.T) {
 	}
 }
 
+// TestPoolFlushRelWritesOnlyTargetRelationAndKeepsSlotsCached verifies
+// FlushRel (M0122-0007's prerequisite for tablespace physical relocation)
+// writes only the named relation's dirty pages, leaves an unrelated
+// relation's dirty page untouched, and — unlike InvalidateRel — keeps the
+// flushed slot cached and valid (just no longer dirty) rather than evicting
+// it.
+func TestPoolFlushRelWritesOnlyTargetRelationAndKeepsSlotsCached(t *testing.T) {
+	dir := t.TempDir()
+	mgr := NewManager(ManagerConfig{DataDir: dir})
+	defer mgr.Close()
+	pool, err := NewPool(mgr, PoolConfig{Slots: 8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+
+	relA := RelFileNode{DBOid: 1, RelOid: 400, Fork: MainFork}
+	relB := RelFileNode{DBOid: 1, RelOid: 401, Fork: MainFork}
+
+	sA, _, err := pool.PinNew(relA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sA.Page()[200] = 0xAA
+	pool.MarkDirty(sA)
+	pool.Unpin(sA)
+
+	sB, _, err := pool.PinNew(relB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sB.Page()[200] = 0xBB
+	pool.MarkDirty(sB)
+	pool.Unpin(sB)
+
+	if err := pool.FlushRel(relA); err != nil {
+		t.Fatal(err)
+	}
+
+	// relA's dirty bit is clear, but its slot is still cached (valid).
+	tagA := BufferTag{Rel: relA, Block: 0}
+	if idx, _ := pool.bm.Lookup(tagA); idx < 0 {
+		t.Fatal("relA's slot was evicted by FlushRel — should stay cached")
+	} else if pool.slots[idx].isDirty() {
+		t.Error("relA's slot still dirty after FlushRel")
+	}
+
+	// relA's byte reached disk.
+	gotA := make(Page, BlockSize)
+	if err := mgr.ReadBlock(relA, 0, gotA); err != nil {
+		t.Fatal(err)
+	}
+	if gotA[200] != 0xAA {
+		t.Errorf("relA smgr read byte[200] = %#x, want 0xAA", gotA[200])
+	}
+
+	// relB was never flushed: still dirty in the buffer pool, and its byte
+	// never reached disk (mgr.Exists is false, or a fresh read shows a zero
+	// page — either way, NOT 0xBB).
+	if idxB, _ := pool.bm.Lookup(BufferTag{Rel: relB, Block: 0}); idxB < 0 {
+		t.Fatal("relB's slot unexpectedly evicted")
+	} else if !pool.slots[idxB].isDirty() {
+		t.Error("relB's slot unexpectedly clean — FlushRel(relA) must not touch relB")
+	}
+	if mgr.Exists(relB) {
+		gotB := make(Page, BlockSize)
+		if err := mgr.ReadBlock(relB, 0, gotB); err == nil && gotB[200] == 0xBB {
+			t.Error("relB's dirty byte reached disk — FlushRel(relA) must not flush relB")
+		}
+	}
+}
+
 func TestPoolEvictionFlushesWALBeforeData(t *testing.T) {
 	dir := t.TempDir()
 	mgr := NewManager(ManagerConfig{DataDir: dir})

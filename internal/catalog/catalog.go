@@ -17378,7 +17378,12 @@ func (c *InMemory) HasPrimaryKey(table *Table) bool {
 	return false
 }
 
-// RelFileNode returns the storage manager identity for a table.
+// RelFileNode returns the storage manager identity for a table. TblOid comes
+// from table.Tablespace (0 = pg_default, i.e. the pre-existing base/<dbOid>
+// layout — see resolveTablespaceClause in internal/executor/operators_ddl.go)
+// so a table created or ALTERed onto a non-default tablespace resolves its
+// file under pg_tblspc/<TblOid>/... . M0122-0007 tablespace physical
+// relocation.
 func (c *InMemory) RelFileNode(table *Table) storage.RelFileNode {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -17386,14 +17391,15 @@ func (c *InMemory) RelFileNode(table *Table) storage.RelFileNode {
 	if table.RelFileNodeOID != 0 {
 		relOID = table.RelFileNodeOID
 	}
-	return storage.RelFileNode{DBOid: c.dbOid, RelOid: relOID, Fork: storage.MainFork}
+	return storage.RelFileNode{TblOid: table.Tablespace, DBOid: c.dbOid, RelOid: relOID, Fork: storage.MainFork}
 }
 
 // IndexRelFileNode returns the storage manager identity for an index.
+// TblOid comes from index.Tablespace, mirroring RelFileNode above.
 func (c *InMemory) IndexRelFileNode(index *Index) storage.RelFileNode {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return storage.RelFileNode{DBOid: c.dbOid, RelOid: index.OID, Fork: storage.MainFork}
+	return storage.RelFileNode{TblOid: index.Tablespace, DBOid: c.dbOid, RelOid: index.OID, Fork: storage.MainFork}
 }
 
 // AllTables returns deep copies of every non-virtual user table

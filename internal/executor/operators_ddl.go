@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"math/big"
 	"os"
@@ -342,6 +343,28 @@ func (o *ddlOp) execCreateTablespace(s *parser.CreateTablespaceStmt) error {
 // tablespace without IF EXISTS raises the upstream-verbatim
 // "tablespace ... does not exist" (ERRCODE_UNDEFINED_OBJECT). M0095-0003.
 func (o *ddlOp) execDropTablespace(s *parser.DropTablespaceStmt) error {
+	// M0122-0007 physical relocation: since CREATE TABLE/INDEX ... TABLESPACE
+	// and ALTER ... SET TABLESPACE now place a relation's real data file under
+	// pg_tblspc/<oid>/..., removing that directory out from under a still-
+	// referencing table/index would destroy live data — mirror upstream's
+	// DropTableSpace (tablespace.c) "tablespace %q is not empty" guard
+	// (ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE) by checking dependents BEFORE
+	// touching the registry or filesystem. Resolve the OID without mutating
+	// first so a rejected DROP leaves the tablespace fully intact.
+	if oid, found := o.ctx.Catalog.LookupTablespaceOID(s.Name); found {
+		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+			for _, tbl := range im.AllTables() {
+				if tbl.Tablespace == oid {
+					return &ExecError{Code: "55000", Pos: s.Pos(), Message: fmt.Sprintf("tablespace %q is not empty", s.Name)}
+				}
+			}
+			for _, idx := range im.AllIndexes() {
+				if idx.Tablespace == oid {
+					return &ExecError{Code: "55000", Pos: s.Pos(), Message: fmt.Sprintf("tablespace %q is not empty", s.Name)}
+				}
+			}
+		}
+	}
 	oid, found := o.ctx.Catalog.DropTablespace(s.Name)
 	if !found {
 		if s.IfExists {
@@ -392,6 +415,131 @@ func resolveTablespaceClause(ctx *Context, pos int, name string) (uint32, error)
 		return 0, nil
 	}
 	return oid, nil
+}
+
+// relocateRelationPhysicalFile physically moves a table's or index's
+// MainFork data file from oldRel's tablespace-scoped location to newRel's,
+// for ALTER TABLE/INDEX ... SET TABLESPACE (M0122-0007). Before this, SET
+// TABLESPACE only updated pg_class.reltablespace — the file itself always
+// stayed under the original base/<dbOid> (or pg_tblspc/<old>/...) path.
+// Only MainFork is handled: goopg has no real backing file for FSM/VM/Init
+// forks (nothing outside internal/executor/expr.go's pg_relation_size
+// helpers references those fork constants), and non-btree index AMs
+// (gist/spgist/gin/brin) have no physical storage at all — REINDEX's
+// physical-rebuild path makes the same assumption.
+//
+// Crash-safety is copy-then-switch, mirroring upstream's
+// copy_relation_data + pending-delete (NOT rename-then-switch): the new
+// file is fully copied and fsynced here, BEFORE the caller commits the
+// catalog/heap/WAL mutation that makes the new tablespace authoritative.
+// Only after that commit succeeds does the caller remove the old file
+// (relocateRelationPhysicalFileCleanupOld). A crash between this call and
+// the commit leaves a harmless orphaned copy at the new location (the
+// catalog still names the old one, authoritative and untouched); a crash
+// after the commit but before cleanup leaves the correct, complete new
+// file authoritative and an orphaned old file (never referenced again).
+// Neither case loses data.
+//
+// The caller must hold an AccessExclusiveLock on the relation (already
+// true of both ALTER TABLE and ALTER INDEX's existing lock acquisition)
+// and must call this BEFORE mutating tbl.Tablespace/idx.Tablespace, since
+// oldRel/newRel are derived from the catalog identity before/after that
+// change.
+func (o *ddlOp) relocateRelationPhysicalFile(oldRel, newRel storage.RelFileNode) error {
+	if oldRel == newRel {
+		return nil
+	}
+	if o.ctx.Pool == nil {
+		// Embedded/test contexts with no cluster filesystem: nothing to move.
+		return nil
+	}
+	mgr := o.ctx.Pool.Manager()
+	// mgr.DataDir(), NOT o.ctx.DataDir, is the authoritative root for actual
+	// relation files: some test fixtures deliberately point ctx.DataDir at a
+	// different directory than the Manager's own (they only exercise
+	// pg_tblspc/<oid> admin-directory bookkeeping, never real relation
+	// files) — using ctx.DataDir here would build a path the Manager never
+	// resolves anything under, even though mgr.Exists(oldRel) (which DOES
+	// use the Manager's own root) correctly reports the file present.
+	dataDir := mgr.DataDir()
+	if dataDir == "" {
+		return nil
+	}
+	if !mgr.Exists(oldRel) {
+		// No physical file yet (relation never written) — nothing to copy;
+		// the new location is created lazily on first write, same as today.
+		return nil
+	}
+	// Flush every buffered write for this relation to the OLD file before
+	// reading it — InvalidateRel alone would DISCARD dirty pages instead of
+	// writing them (correct for DROP TABLE, wrong here: it would silently
+	// drop not-yet-evicted writes from the copy).
+	if err := o.ctx.Pool.FlushRel(oldRel); err != nil {
+		return fmt.Errorf("flush before tablespace move: %w", err)
+	}
+	o.ctx.Pool.InvalidateRel(oldRel)
+
+	oldPath := filepath.Join(dataDir, mgr.RelPath(oldRel))
+	newPath := filepath.Join(dataDir, mgr.RelPath(newRel))
+	if err := os.MkdirAll(filepath.Dir(newPath), 0o700); err != nil {
+		return fmt.Errorf("mkdir %s: %w", filepath.Dir(newPath), err)
+	}
+	if err := copyFileFsync(oldPath, newPath); err != nil {
+		return fmt.Errorf("copy %s to %s: %w", oldPath, newPath, err)
+	}
+	// Forget the OLD cached handle now that its content has been copied —
+	// any later access under the old tag (there shouldn't be one once the
+	// caller's catalog mutation lands, but a stale cached *os.File must not
+	// linger) re-resolves through relFile() from scratch.
+	mgr.CloseRelation(oldRel)
+	return nil
+}
+
+// relocateRelationPhysicalFileCleanupOld best-effort removes the relation's
+// now-superseded OLD file after the caller has durably committed the
+// tablespace change (relocateRelationPhysicalFile already copied and
+// fsynced the new one). A failure here (e.g. the file was already gone) is
+// deliberately non-fatal: it only leaves harmless orphaned bytes on disk,
+// never lost or duplicated data — the caller has already committed to the
+// new location being authoritative.
+func (o *ddlOp) relocateRelationPhysicalFileCleanupOld(oldRel storage.RelFileNode) {
+	if o.ctx.Pool == nil {
+		return
+	}
+	mgr := o.ctx.Pool.Manager()
+	dataDir := mgr.DataDir()
+	if dataDir == "" {
+		return
+	}
+	oldPath := filepath.Join(dataDir, mgr.RelPath(oldRel))
+	_ = os.Remove(oldPath)
+}
+
+// copyFileFsync copies src to dst byte-for-byte and fsyncs dst before
+// returning, so the new tablespace's file is durable on disk before the
+// caller commits the catalog change that makes it authoritative (see
+// relocateRelationPhysicalFile's crash-safety doc comment). dst is created
+// with O_EXCL-free O_TRUNC semantics — a leftover dst from a prior crashed
+// attempt is safe to overwrite since it was never made authoritative.
+func copyFileFsync(src, dst string) (err error) {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if cerr := out.Close(); err == nil {
+			err = cerr
+		}
+	}()
+	if _, err = io.Copy(out, in); err != nil {
+		return err
+	}
+	return out.Sync()
 }
 
 // execCreateCollation registers a CREATE COLLATION in the runtime
@@ -6925,23 +7073,38 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					}
 				}
 				if act.Kind == parser.AlterTableSetTablespace {
-					// ALTER INDEX name SET TABLESPACE tablespace_name — same
-					// catalog-metadata-only treatment as the table form above
-					// (see the AlterTableSetTablespace case in the table
-					// action loop). Restart-durable via the heap-persisted
-					// reltablespace column loadUserIndexesFromHeap now
-					// restores (M0122-0007 tablespace-restart-durability
-					// follow-up); resyncIndexClassHeapRow already stamps the
-					// old pg_class row's xmax before writing the fresh one.
+					// ALTER INDEX name SET TABLESPACE tablespace_name — updates
+					// pg_class.reltablespace AND physically relocates the
+					// index's on-disk main-fork file (M0122-0007 physical
+					// relocation; same treatment as the table form above). A
+					// non-btree index (gist/spgist/gin/brin) has no physical
+					// file to begin with (mgr.Exists is false), so
+					// relocateRelationPhysicalFile is a no-op for those — only
+					// the catalog metadata moves, matching how CREATE INDEX
+					// never built physical storage for them either. Restart-
+					// durable via the heap-persisted reltablespace column
+					// loadUserIndexesFromHeap now restores (M0122-0007
+					// tablespace-restart-durability follow-up);
+					// resyncIndexClassHeapRow already stamps the old pg_class
+					// row's xmax before writing the fresh one.
 					oid, tsErr := resolveTablespaceClause(o.ctx, act.Pos(), act.TablespaceName)
 					if tsErr != nil {
 						return tsErr
+					}
+					oldRel := o.ctx.Catalog.IndexRelFileNode(idx)
+					newRel := oldRel
+					newRel.TblOid = oid
+					if err := o.relocateRelationPhysicalFile(oldRel, newRel); err != nil {
+						return fmt.Errorf("could not move index %q to tablespace: %w", idx.Name, err)
 					}
 					idx.Tablespace = oid
 					if catalogHeapSyncAvailable(o.ctx) {
 						if syncErr := resyncIndexClassHeapRow(o.ctx, idx); syncErr != nil {
 							return syncErr
 						}
+					}
+					if oldRel != newRel {
+						o.relocateRelationPhysicalFileCleanupOld(oldRel)
 					}
 				}
 				if act.Kind == parser.AlterTableRenameTable {
@@ -8119,16 +8282,24 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			// defaults. Acts on the same live catalog.Table fields as SET. M0118-0001.
 			o.execAlterTableResetReloptions(tbl, act)
 		case parser.AlterTableSetTablespace:
-			// SET TABLESPACE name — update pg_class.reltablespace. Catalog
-			// metadata only: no physical relocation of the table's on-disk
-			// file. Restart-durable via the same heap-persisted reltablespace
-			// column loadUserTablesFromHeap now restores (M0122-0007
+			// SET TABLESPACE name — update pg_class.reltablespace AND
+			// physically relocate the table's on-disk main-fork file
+			// (M0122-0007 physical relocation; previously catalog-metadata
+			// only, see the deferral ledger's 2026-07-08 row). Restart-durable
+			// via the same heap-persisted reltablespace column
+			// loadUserTablesFromHeap now restores (M0122-0007
 			// tablespace-restart-durability follow-up) — resync immediately so
 			// an uncheckpointed crash right after this statement doesn't lose
 			// the change.
 			oid, tsErr := resolveTablespaceClause(o.ctx, act.Pos(), act.TablespaceName)
 			if tsErr != nil {
 				return tsErr
+			}
+			oldRel := o.ctx.Catalog.RelFileNode(tbl)
+			newRel := oldRel
+			newRel.TblOid = oid
+			if err := o.relocateRelationPhysicalFile(oldRel, newRel); err != nil {
+				return fmt.Errorf("could not move table %q to tablespace: %w", tbl.Name, err)
 			}
 			tbl.Tablespace = oid
 			if catalogHeapSyncAvailable(o.ctx) {
@@ -8141,6 +8312,9 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
 					return fmt.Errorf("DDL catalog sync: %w", syncErr)
 				}
+			}
+			if oldRel != newRel {
+				o.relocateRelationPhysicalFileCleanupOld(oldRel)
 			}
 		case parser.AlterTableAlterColumnSet:
 			// SET (opt=value, …) — record the per-column attribute options on the

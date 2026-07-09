@@ -91,7 +91,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/executor/operators_ddl.go:280 rejects external tablespaces as unsupported"
+   "code_audit": "PARTIAL (2026-07-09, M0122-0007 physical-relocation follow-up): in-place tablespaces (CREATE TABLESPACE ... LOCATION '' with allow_in_place_tablespaces on) now genuinely direct table/index storage — storage.RelFileNode gained TblOid, Manager.relPath/RelPath route through pg_tblspc/<TblOid>/..., and ALTER TABLE/INDEX ... SET TABLESPACE physically copies the relation's file there (see .ralph/fix_plan.md M0122-0007 and docs/design/0095-0003-in-place-tablespace.md's \"Physical relocation\" section). internal/executor/operators_ddl.go's external (absolute-path) tablespace rejection is UNCHANGED and remains intentional, not a gap: goopg has no cross-filesystem relocation mechanism and upstream's own in-place-tablespace feature (this same LOCATION='' form) exists specifically for the dev/test use case goopg targets."
   },
   {
    "feature": "Implement multi-database support so a single server instance can manage multiple independent databases.",

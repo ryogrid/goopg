@@ -400,6 +400,104 @@ scripts/ralph-precommit-test.sh` PASS (0 failed txns, all 3 workloads).
 **Still open** (M0122-0007, this bucket): CREATE/DROP DATABASE full DDL,
 REINDEX physical rebuild, tablespace physical relocation.
 
+## Physical relocation (landed 2026-07-09, M0122-0007 follow-up)
+
+Every earlier tablespace slice (CREATE TABLE/INDEX ... TABLESPACE,
+ALTER ... SET TABLESPACE, restart durability) was **catalog-metadata only**:
+`pg_class.reltablespace` reported the right OID, but the relation's actual
+data file always stayed under `base/<dbOid>/<relOid>` regardless of its
+declared tablespace. This closes that gap: a relation's file now genuinely
+lives under `pg_tblspc/<TblOid>/<version dir>/<dbOid>/<relOid>` when
+`TblOid != 0`, matching upstream's `relpath()` tablespace branch and the
+`pg_tblspc/<oid>/<version dir>` layout `execCreateTablespace` (and the
+`BASE_BACKUP` tier above) already create.
+
+**Storage layer** (`internal/storage`):
+- `RelFileNode` gained a `TblOid uint32` field (mirrors upstream's
+  `RelFileLocator.spcOid`). Zero means the default tablespace — the
+  pre-existing `base/<dbOid>` (or `global/`) layout is byte-identical for
+  every relation that doesn't use a non-default tablespace, so this is a
+  purely additive, backward-compatible change (a struct literal that omits
+  the field still compiles and behaves exactly as before).
+- `Manager.relPath`/`RelPath` route through a new `relDir` helper: `TblOid
+  == 0` keeps `sharedOrPerDBRelDir`'s existing behavior; a non-zero `TblOid`
+  resolves to `pg_tblspc/<TblOid>/<config.TablespaceVersionDirectory>/<dbOid>`.
+- `Manager.CloseRelation(rel)` closes a cached open-file handle WITHOUT
+  deleting the file (unlike `DropRelation`, which does both) — needed so a
+  relocation's OLD `RelFileNode` doesn't keep a stale handle alive after its
+  content has been copied elsewhere.
+- `Pool.FlushRel(rel)` writes every dirty buffered page belonging to one
+  relation to its CURRENT on-disk location and clears their dirty bits,
+  leaving the slots cached. `InvalidateRel` (pre-existing, used by DROP
+  TABLE) instead *discards* dirty content — correct when the data is being
+  deleted anyway, wrong for a move, where an in-flight write would silently
+  vanish from the copy.
+
+**Catalog layer** (`internal/catalog`): `InMemory.RelFileNode(table)` /
+`IndexRelFileNode(index)` — the only two call sites that convert a
+`catalog.Table`/`catalog.Index` into a `storage.RelFileNode` for real I/O
+(confirmed by grep: every one of storage's 227 raw `RelFileNode{...}`
+literals repo-wide is a test, TOAST, or shared-catalog sentinel construction,
+not a second table/index conversion path) — now set `TblOid` from
+`table.Tablespace`/`index.Tablespace` (both fields already existed and were
+already restart-durable; they just never reached `RelFileNode`).
+
+**Executor layer** (`internal/executor/operators_ddl.go`): both
+`AlterTableSetTablespace` sites (`ALTER TABLE ... SET TABLESPACE` and
+`ALTER INDEX ... SET TABLESPACE`) now call a new
+`relocateRelationPhysicalFile(oldRel, newRel)` before mutating
+`tbl.Tablespace`/`idx.Tablespace`:
+
+1. `Pool.FlushRel(oldRel)` + `InvalidateRel(oldRel)` — every buffered write
+   lands on the OLD file before it's read.
+2. `copyFileFsync` copies the OLD file's bytes to the NEW tablespace-scoped
+   path and `fsync`s the destination.
+3. `Manager.CloseRelation(oldRel)` forgets the OLD cached handle.
+4. The caller then mutates the catalog and resyncs the heap-persisted
+   `pg_class.reltablespace` row (pre-existing code, unchanged) — this is the
+   durable "point of no return."
+5. Only after that commit succeeds does `relocateRelationPhysicalFileCleanupOld`
+   best-effort `os.Remove` the OLD file.
+
+Only `MainFork` is handled: goopg has no real backing file for FSM/VM/Init
+forks outside `internal/executor/expr.go`'s `pg_relation_size` helpers, and
+non-btree index AMs (gist/spgist/gin/brin) have no physical storage at all —
+`mgr.Exists(oldRel)` is false for those, so `relocateRelationPhysicalFile` is
+a no-op and only the catalog metadata moves (matching how CREATE INDEX never
+built physical storage for them either).
+
+**Crash safety is copy-then-switch**, mirroring upstream's
+`copy_relation_data` + pending-delete — deliberately NOT rename-then-switch.
+The new file is fully written and fsynced *before* the catalog/heap/WAL
+mutation that makes the new tablespace authoritative; the old file is
+removed only *after* that mutation commits.
+- A crash between the copy and the commit leaves a harmless orphaned copy at
+  the new location — the catalog still names the old (untouched,
+  authoritative) file.
+- A crash after the commit but before cleanup leaves the correct, complete
+  new file authoritative and an orphaned old file that is never referenced
+  again.
+
+Neither case loses data; the only residual is an occasional harmless orphan
+file, not tracked or garbage-collected (see Deferral below).
+
+**`DROP TABLESPACE` non-empty guard (safety-completeness fix in the same
+loop):** before this loop, `DROP TABLESPACE` unconditionally `os.RemoveAll`'d
+the `pg_tblspc/<oid>` directory — harmless when tablespaces were
+catalog-metadata-only (nothing real lived there), but a real data-loss risk
+once physical relocation exists. `execDropTablespace` now checks every table
+and index for `Tablespace == oid` first and rejects with `55000`
+(`ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE`), mirroring upstream's
+`DropTableSpace` "tablespace %q is not empty" (`tablespace.c`).
+
+Verified live against a real `cmd/goopg` binary: `CREATE TABLESPACE`,
+`CREATE TABLE ... TABLESPACE`, `INSERT` 100 rows, `ALTER TABLE ... SET
+TABLESPACE`, `CREATE INDEX ... TABLESPACE` — `find pg_tblspc base` confirmed
+both files under `pg_tblspc/<oid>/<version dir>/<dbOid>/`, absent from
+`base/<dbOid>/`; a real `goopg stop`/`goopg start` cycle preserved all 100
+rows and a working index scan; `DROP TABLESPACE` on the still-referenced
+tablespace correctly errored `tablespace "ts_live" is not empty`.
+
 ## Tests
 
 - `parser.TestParseCreateTablespace` / `TestParseCreateTablespaceMissingLocation`
@@ -415,6 +513,22 @@ REINDEX physical rebuild, tablespace physical relocation.
 - `TestPort_PgBasebackup011InPlaceTablespace` (the upstream scenario end-to-end:
   create an in-place tablespace, `pg_basebackup --format=tar --wal-method=none`,
   assert `base.tar` + exactly one `<oid>.tar`).
+- Physical relocation (2026-07-09): `storage.TestRelPathTablespace` /
+  `TestManagerOpensTablespaceUnderPgTblspcDir` /
+  `TestManagerCloseRelationClosesHandleWithoutDeletingFile` /
+  `TestPoolFlushRelWritesOnlyTargetRelationAndKeepsSlotsCached`;
+  `executor.TestAlterTableSetTablespacePhysicallyRelocatesFile` /
+  `TestAlterIndexSetTablespacePhysicallyRelocatesFile` (both confirmed
+  non-vacuous via `git stash` — fail to compile pre-fix, since they use the
+  new `TblOid` field);
+  `executor.TestDropTablespaceRejectsWhenTableStillReferencesIt` /
+  `TestDropTablespaceRejectsWhenIndexStillReferencesIt`;
+  `initdb.TestAlterTableSetTablespacePhysicalRelocationSurvivesRestart` (a
+  real `Init`→`Open`→DDL→`Close`→`Open` cycle asserting the file exists
+  under the NEW `pg_tblspc/...` path and NOT under the old `base/...` path
+  post-restart — a plain reltablespace-only check would pass even on
+  pre-fix code, since without any TblOid-aware path routing the file simply
+  never moves and stays trivially "findable").
 
 ## BASE_BACKUP per-tablespace tier (landed loop #13, 2026-06-15)
 
@@ -460,3 +574,20 @@ On-disk `pg_tablespace` heap visibility remains a further, independent
 capability (shared-catalog runtime write — no `RelFileNode` resolver for the
 shared `pg_tablespace` catalog) tracked separately; it is **not** needed by
 `011`, which exercises only the filesystem + BASE_BACKUP behavior.
+
+**Physical relocation (2026-07-09) — deliberately out of scope:**
+- Orphaned copies/old files from a crash mid-relocation (see the
+  crash-safety analysis above) are never garbage-collected — they sit as
+  harmless dead bytes under whichever tablespace directory until an
+  operator notices. Upstream doesn't have this exact problem (it assigns a
+  fresh relfilenode and relies on the ordinary pending-delete-at-commit
+  mechanism); goopg's simpler same-relfilenode copy-then-switch has no
+  equivalent sweep. A future loop could add one (e.g. an amcheck-style scan
+  comparing `pg_tblspc/*` contents against every live `reltablespace`), but
+  no correctness bug is left unaddressed by skipping it — see `docs/
+  deferral_ledger.md`'s 2026-07-09 M0122-0007 row.
+- `REINDEX ... CONCURRENTLY`'s physical rebuild (unrelated pre-existing
+  M0122-0007 residual, not touched this loop) still needs a genuine
+  shadow-index build-then-swap.
+- `CREATE/DROP DATABASE` full DDL (also pre-existing, not touched this
+  loop) remains the last named M0122-0007 bucket item.
