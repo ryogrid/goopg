@@ -425,5 +425,8 @@ workloads).
   — the prerequisite the template-copy mechanism above actually needs. See
   the deferral ledger row appended alongside this doc for the concrete
   resume point.
-- `REINDEX ... CONCURRENTLY` physical rebuild (separate, pre-existing item,
-  unaffected by this change).
+- ~~`REINDEX ... CONCURRENTLY` physical rebuild~~ — landed 2026-07-09 (see
+  `0122-0007-reindex-physical-rebuild.md`'s "shadow-file build-then-swap"
+  follow-up), separate from this doc's own work. Its own residual gap (no
+  second validation scan, so a write racing the shadow build's heap scan may
+  not appear in the rebuilt index) is tracked there, not here.

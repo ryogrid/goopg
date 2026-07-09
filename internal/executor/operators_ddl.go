@@ -515,6 +515,64 @@ func (o *ddlOp) relocateRelationPhysicalFileCleanupOld(oldRel storage.RelFileNod
 	_ = os.Remove(oldPath)
 }
 
+// swapRelationPhysicalFile atomically replaces oldRel's on-disk main-fork
+// file with shadowRel's (already-built-and-flushed) file via os.Rename, then
+// drops the pool's cache for both identities. Unlike relocateRelationPhysicalFile
+// above (which copies bytes to a NEW relOid the catalog will start pointing
+// at, for a tablespace move), this keeps oldRel's identity/OID unchanged —
+// only its physical bytes change — so no catalog mutation or WAL record is
+// needed for durability: os.Rename is atomic on the same filesystem, so a
+// crash either side of it leaves either the pre- or the fully-rebuilt file,
+// never a torn one. Used by REINDEX ... CONCURRENTLY's build-then-swap
+// sequence (operators_reindex.go); the caller must already hold a lock that
+// excludes new readers/writers of oldRel for this call's (very brief)
+// duration — the same acquireReindexLocks plain REINDEX already uses, here
+// held only around the swap instead of the whole rebuild.
+func (o *ddlOp) swapRelationPhysicalFile(oldRel, shadowRel storage.RelFileNode) error {
+	if o.ctx.Pool == nil {
+		return nil
+	}
+	mgr := o.ctx.Pool.Manager()
+	dataDir := mgr.DataDir()
+	if dataDir == "" {
+		return nil
+	}
+	// Discard the OLD file's cached/dirty pages (they describe the
+	// pre-rebuild structure being replaced, never wanted again) rather than
+	// flushing them — the shadow file already holds the complete, correct,
+	// durably-flushed replacement content.
+	o.ctx.Pool.InvalidateRel(oldRel)
+	mgr.CloseRelation(oldRel)
+	o.ctx.Pool.InvalidateRel(shadowRel)
+	mgr.CloseRelation(shadowRel)
+	oldPath := filepath.Join(dataDir, mgr.RelPath(oldRel))
+	shadowPath := filepath.Join(dataDir, mgr.RelPath(shadowRel))
+	if err := os.Rename(shadowPath, oldPath); err != nil {
+		return fmt.Errorf("reindex concurrently: swap index file: %w", err)
+	}
+	return nil
+}
+
+// removeShadowRelationFile best-effort removes a shadow file created by
+// REINDEX ... CONCURRENTLY's build-then-swap sequence
+// (operators_reindex.go) that turned out not to be needed — a sibling
+// index's build failed, or the post-build CONCURRENTLY wait itself errored
+// — mirroring relocateRelationPhysicalFileCleanupOld's non-fatal "harmless
+// orphaned bytes, never lost data" contract.
+func (o *ddlOp) removeShadowRelationFile(shadowRel storage.RelFileNode) {
+	if o.ctx.Pool == nil {
+		return
+	}
+	mgr := o.ctx.Pool.Manager()
+	dataDir := mgr.DataDir()
+	if dataDir == "" {
+		return
+	}
+	o.ctx.Pool.InvalidateRel(shadowRel)
+	mgr.CloseRelation(shadowRel)
+	_ = os.Remove(filepath.Join(dataDir, mgr.RelPath(shadowRel)))
+}
+
 // copyFileFsync copies src to dst byte-for-byte and fsyncs dst before
 // returning, so the new tablespace's file is durable on disk before the
 // caller commits the catalog change that makes it authoritative (see

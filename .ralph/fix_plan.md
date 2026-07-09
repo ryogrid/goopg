@@ -5643,6 +5643,70 @@ mirroring M0119's ledger `status` column.
       row updated. **Remaining M0122-0007 items:** slice 4 (per-database
       catalog namespace, the prerequisite for the template-copy mechanism),
       REINDEX CONCURRENTLY physical rebuild.
+  - [x] `M0122-0007` follow-up 6 (2026-07-09, this loop) — **`REINDEX ...
+      CONCURRENTLY` physical rebuild, done** (all three object types —
+      INDEX/TABLE/SCHEMA — that already reproduced the CONCURRENTLY wait
+      timing; `REINDEX DATABASE`/`SYSTEM` and the synthetic `pg_toast.*`
+      form remain unaffected catalog-only no-ops). New shadow-file
+      build-then-swap: `buildIndexShadow` (`operators_reindex.go`) mints a
+      fresh, catalog-invisible `RelFileNode` via `Catalog.AllocOID()` (never
+      registered — the same synthetic-OID pattern named CHECK constraints
+      already use) and runs the exact `bulkBuildBTree`/
+      `bulkBuildBTreeWithPredicate` path plain REINDEX uses, targeting that
+      RelFileNode instead of the live index's own — so the live index keeps
+      serving every concurrent reader/writer throughout the build, no lock
+      needed. The pre-existing `waitForRelationLockers` call is UNCHANGED in
+      position/target/semantics (TABLE/SCHEMA still make exactly one call
+      per table, after building every index's shadow, not one per index) —
+      deliberately preserved so `reindex-concurrently.spec`'s session-
+      interleaving assertions (which key off this wait's exact timing) stay
+      intact. `swapRelationPhysicalFile` (`operators_ddl.go`) then
+      atomically `os.Rename`s the already-built-and-flushed shadow file over
+      the live index's file — same filesystem ⇒ atomic, so a crash on
+      either side of the rename leaves the pre- or fully-rebuilt file, never
+      torn — under a brief `acquireReindexLocks` hold (the SAME lock plain
+      REINDEX INDEX already takes for its *entire* rebuild, here held only
+      around the swap). The index's OID/RelFileNode is never changed, only
+      its bytes are, so — unlike ALTER ... SET TABLESPACE's relocation —
+      this needs **no catalog mutation and no WAL record**: the renamed file
+      already is the durable state once the rename returns.
+      `removeShadowRelationFile` best-effort cleans up an already-built
+      shadow that turns out not to be needed (sibling build failure, or the
+      wait itself erroring), mirroring `relocateRelationPhysicalFileCleanupOld`'s
+      non-fatal contract. Tests:
+      `TestReindexIndexConcurrentlyPhysicallyRebuilds`,
+      `TestReindexTableConcurrentlyPhysicallyRebuildsAllIndexes`,
+      `TestReindexIndexConcurrentlyDoesNotBlockConcurrentIndexReader`
+      (`internal/executor/reindex_physical_rebuild_test.go`), all confirmed
+      non-vacuous (assert the actual btree.RangeScan contents and completion
+      timing, not just "no error"). Live-verified against a real `cmd/goopg`
+      binary (port 65499): zero-byte-truncated a live PK index's on-disk
+      relfilenode file, confirmed the query then failed (`short read at
+      block`), ran `REINDEX INDEX CONCURRENTLY`, confirmed the SAME
+      relfilenode (16405, unchanged), a working index-scan query, and
+      survival across a real server restart with no orphaned shadow file
+      left in `base/<db>/`. Gates: `go build ./...` clean; `go test
+      ./internal/executor/... ./internal/access/btree/...
+      ./internal/catalog/... ./internal/planner/...` PASS; `go test
+      ./internal/testport/ -run
+      'TestPort_IsolationReindex|TestPort_IsolationMultipleCic'` PASS (all 4
+      specs, no regression — confirms the wait-call timing this loop was
+      careful to preserve actually held); `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+      scripts/ralph-precommit-test.sh` PASS (0 failed transactions, all 3
+      workloads). Design: `docs/design/0122-0007-reindex-physical-rebuild.md`
+      new "shadow-file build-then-swap" section (+ updated Deferral);
+      `docs/design/0122-0017-database-ddl-drop-guards.md` "Still open"
+      updated; `docs/design/README.md` row updated. **Deliberately NOT
+      implemented** (same simplification CREATE INDEX CONCURRENTLY already
+      makes — single build + single start-time wait, no second validation
+      scan): a write landing on the table WHILE the shadow build's heap scan
+      is in flight is not guaranteed to appear in the rebuilt index; real
+      PostgreSQL closes this with `validate_index`'s incremental catch-up
+      scan, which goopg implements for neither CONCURRENTLY form. Deferral
+      ledger row appended for this residual gap. **Remaining M0122-0007
+      items:** slice 4 (per-database catalog namespace, the prerequisite for
+      the template-copy mechanism) is now the only item left in this bucket.
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,

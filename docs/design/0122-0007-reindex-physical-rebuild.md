@@ -155,10 +155,95 @@ cancellation) map onto the same `ExecError` codes
   `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0 failed
   txns, all 3 workloads).
 
+## `REINDEX ... CONCURRENTLY` physical rebuild: shadow-file build-then-swap (2026-07-09 follow-up)
+
+`REINDEX INDEX/TABLE/SCHEMA CONCURRENTLY` now also physically rebuilds —
+previously only the plain form did (see "What stays a no-op" above, now
+superseded for these three object types; `REINDEX DATABASE`/`SYSTEM` and the
+synthetic `pg_toast.*` relation form remain catalog-only no-ops, unchanged).
+
+Real PostgreSQL rebuilds a `CONCURRENTLY` index via a genuinely different
+mechanism than the plain form: it creates a second, shadow index catalog
+entry, builds it via `CREATE INDEX CONCURRENTLY`'s own multi-phase
+build+validate+build protocol, swaps the two indexes' relfilenodes
+(`index_concurrently_swap`, `indexcmds.c`), then drops the now-superseded old
+one. goopg's simpler equivalent, reusing pieces already on hand:
+
+- **Build.** `buildIndexShadow` (`operators_reindex.go`) mints a fresh,
+  catalog-invisible `RelFileNode` — same tablespace/database identity as the
+  live index, but a brand-new `RelOid` via `Catalog.AllocOID()` (the same
+  "synthetic OID, no catalog entry" pattern named CHECK constraints already
+  use) — and runs the *exact* `bulkBuildBTree`/`bulkBuildBTreeWithPredicate`
+  path plain `REINDEX` uses, targeting that RelFileNode instead of the live
+  index's own. Because it is a different file, the live index keeps serving
+  every concurrent reader/writer throughout the build — nothing needs to
+  block for this to be correct. `Pool.FlushRel` durably flushes the shadow
+  file before it is considered swap-eligible.
+- **Wait.** Exactly the pre-existing `waitForRelationLockers` call this file
+  already made for `CONCURRENTLY` before this follow-up — unchanged in
+  position, target relation, or semantics, so `reindex-concurrently.spec`'s
+  session-interleaving assertions (which key off this wait's exact timing)
+  are unaffected. `TABLE`/`SCHEMA` still make exactly ONE such call per
+  table (`rebuildTableIndexesConcurrently` builds every index's shadow
+  first, waits once, then swaps each), not one per index.
+- **Swap.** `swapRelationPhysicalFile` (`operators_ddl.go`) atomically
+  replaces the live index's on-disk file with the shadow file via
+  `os.Rename` (same filesystem ⇒ atomic — a crash on either side of the
+  rename leaves either the pre- or the fully-rebuilt file, never a torn
+  one), after `InvalidateRel`+`CloseRelation` on both identities so no stale
+  buffer-pool cache entry survives the swap. The index's OID/RelFileNode
+  identity is **never changed** — only its bytes are — so, unlike ALTER
+  ...  SET TABLESPACE's relocation (which moves a relation to a genuinely
+  new path the catalog must learn), this needs **no catalog mutation and no
+  WAL record**: the renamed file already **is** the durable state once the
+  rename returns. The swap is guarded by the exact same `acquireReindexLocks`
+  hold (ShareLock on the table + AccessExclusiveLock on the index) plain
+  `REINDEX INDEX` already takes for its *entire* rebuild — here taken only
+  around the brief swap itself, which is the entire point of `CONCURRENTLY`
+  not blocking for the (potentially long) build.
+- **Cleanup.** `removeShadowRelationFile` best-effort removes an
+  already-built shadow file that turns out not to be needed (a sibling
+  index's build failed, or the post-build wait itself errored) —
+  non-fatal, mirroring `relocateRelationPhysicalFileCleanupOld`'s "harmless
+  orphaned bytes, never lost data" contract.
+
+**Deliberately not implemented — same simplification `CREATE INDEX
+CONCURRENTLY` already makes** (that code's own single build + single
+start-time-snapshot wait, no second validation scan): a write that lands on
+the table *while the shadow build's heap scan is in flight* is not
+guaranteed to appear in the rebuilt index. Real PostgreSQL closes this gap
+with a second, incremental validation scan after the first `WaitForLockers`
+(`validate_index`); goopg does not implement that for either `CONCURRENTLY`
+form. In practice this only matters for a write racing the exact
+milliseconds of the (usually short) heap scan — the far more common case,
+repairing a corrupted or stale index with no concurrent writers, rebuilds
+correctly and was live-verified end to end (corrupt `base/<db>/<oid>` file →
+`short read at block` → `REINDEX INDEX CONCURRENTLY` → same relfilenode,
+query works, survives a restart with no orphaned shadow file left behind).
+
+Tests: `TestReindexIndexConcurrentlyPhysicallyRebuilds`,
+`TestReindexTableConcurrentlyPhysicallyRebuildsAllIndexes`,
+`TestReindexIndexConcurrentlyDoesNotBlockConcurrentIndexReader`
+(`internal/executor/reindex_physical_rebuild_test.go`). Gates: `go build
+./...` clean; `go test ./internal/executor/... ./internal/access/btree/...
+./internal/catalog/... ./internal/planner/...` PASS; `go test
+./internal/testport/ -run
+'TestPort_IsolationReindex|TestPort_IsolationMultipleCic'` PASS (all 4
+specs, no regression — confirms the wait-call timing this follow-up was
+careful to preserve actually held); `scripts/tpch-spotcheck.sh` PASS
+(Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh`
+PASS (0 failed txns, all 3 pgbench workloads).
+
 ## Deferral
 
-`REINDEX ... CONCURRENTLY`'s physical rebuild (all three object types —
-`INDEX`/`TABLE`/`SCHEMA`; needs a genuine shadow-index build-then-swap, a
-materially larger capability) remains open — see `.ralph/deferral_ledger.md`.
-Also carried forward unchanged from the parent M0122-0007 bucket: `CREATE`/
-`DROP DATABASE` full DDL, tablespace physical relocation.
+`REINDEX SCHEMA CONCURRENTLY`'s per-table wait/swap loop does not re-validate
+that the CURRENT table (the one whose shadows were just built) still exists
+between the wait and the swap — only the pre-existing "next table in the
+loop" concurrent-drop tolerance is covered (a table dropped while an
+*earlier* table's wait is in flight). A `DROP TABLE` racing the exact
+in-flight table's own build/wait/swap window is untested and unhandled,
+mirroring a gap that already existed for the wait phase alone before this
+follow-up. `REINDEX ... CONCURRENTLY`'s single-scan-without-revalidation
+limitation (previous paragraph) is the other open item from this slice. Also
+carried forward unchanged from the parent M0122-0007 bucket: `CREATE`/`DROP
+DATABASE` full DDL, tablespace physical relocation.

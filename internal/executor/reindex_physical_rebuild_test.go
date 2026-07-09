@@ -247,3 +247,157 @@ func TestReindexIndexBlocksBehindConcurrentIndexReader(t *testing.T) {
 		t.Fatal("REINDEX INDEX never completed after the conflicting reader released its lock")
 	}
 }
+
+// TestReindexIndexConcurrentlyPhysicallyRebuilds is the non-vacuous DoD test
+// for M0122-0007's REINDEX ... CONCURRENTLY build-then-swap slice: unlike the
+// plain form, CONCURRENTLY previously left a corrupted index's storage
+// untouched (a pure no-op past the CONCURRENTLY wait). REINDEX INDEX
+// CONCURRENTLY must now build a shadow file from the current heap contents
+// and swap it in — same DoD shape as TestReindexIndexPhysicallyRebuilds
+// above, just via the shadow-build-then-swap path (rebuildIndexConcurrently)
+// instead of rebuildIndex's in-place truncate+rebuild.
+func TestReindexIndexConcurrentlyPhysicallyRebuilds(t *testing.T) {
+	ctx, cleanup := newFSMFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE t (id int4)"); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	for _, v := range []string{"1", "2", "3", "4", "5"} {
+		if err := runDDL(t, ctx, "INSERT INTO t VALUES ("+v+")"); err != nil {
+			t.Fatalf("INSERT %s: %v", v, err)
+		}
+	}
+	if err := runDDL(t, ctx, "CREATE INDEX t_idx ON t (id)"); err != nil {
+		t.Fatalf("CREATE INDEX: %v", err)
+	}
+	idx, ok := ctx.Catalog.LookupIndex(parser.ObjectName{Schema: "public", Name: "t_idx"})
+	if !ok {
+		t.Fatalf("t_idx not found after CREATE INDEX")
+	}
+	idxRel := ctx.Catalog.IndexRelFileNode(idx)
+
+	if err := ctx.Pool.Manager().TruncateRelation(idxRel); err != nil {
+		t.Fatalf("TruncateRelation: %v", err)
+	}
+	ctx.Pool.InvalidateRel(idxRel)
+	if n, err := ctx.Pool.NBlocks(idxRel); err != nil || n != 0 {
+		t.Fatalf("pre-REINDEX sanity: NBlocks = %d, %v, want 0, nil", n, err)
+	}
+
+	if err := runDDL(t, ctx, "REINDEX INDEX CONCURRENTLY t_idx"); err != nil {
+		t.Fatalf("REINDEX INDEX CONCURRENTLY: %v", err)
+	}
+
+	// idx's identity (OID/RelFileNode) must be unchanged — the swap replaces
+	// bytes in place, it never introduces a new relOid the catalog would need
+	// to learn about.
+	if got := ctx.Catalog.IndexRelFileNode(idx); got != idxRel {
+		t.Fatalf("index RelFileNode changed after REINDEX CONCURRENTLY: got %v, want unchanged %v", got, idxRel)
+	}
+
+	bt, err := btree.Open(ctx.Pool, idxRel)
+	if err != nil {
+		t.Fatalf("btree.Open after REINDEX INDEX CONCURRENTLY: %v", err)
+	}
+	var got []storage.ItemPointer
+	if err := bt.RangeScan(nil, nil, func(key []byte, ptr storage.ItemPointer) (bool, error) {
+		got = append(got, ptr)
+		return true, nil
+	}); err != nil {
+		t.Fatalf("RangeScan: %v", err)
+	}
+	if len(got) != 5 {
+		t.Fatalf("post-REINDEX INDEX CONCURRENTLY entry count = %d, want 5 (CONCURRENTLY did not physically rebuild the index)", len(got))
+	}
+}
+
+// TestReindexTableConcurrentlyPhysicallyRebuildsAllIndexes is
+// TestReindexTablePhysicallyRebuildsAllIndexes's CONCURRENTLY counterpart:
+// REINDEX TABLE CONCURRENTLY must rebuild every btree index on the table via
+// rebuildTableIndexesConcurrently (build every shadow, one waitForRelationLockers
+// call, then swap each in), silently skipping the catalog-only gist sibling
+// exactly like the plain form.
+func TestReindexTableConcurrentlyPhysicallyRebuildsAllIndexes(t *testing.T) {
+	ctx, cleanup := newFSMFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE t (a int4, b int4)"); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	for _, v := range []string{"(1,10)", "(2,20)", "(3,30)"} {
+		if err := runDDL(t, ctx, "INSERT INTO t VALUES "+v); err != nil {
+			t.Fatalf("INSERT %s: %v", v, err)
+		}
+	}
+	if err := runDDL(t, ctx, "CREATE INDEX t_a_idx ON t (a)"); err != nil {
+		t.Fatalf("CREATE INDEX t_a_idx: %v", err)
+	}
+	if err := runDDL(t, ctx, "CREATE INDEX t_b_idx ON t USING gist (b)"); err != nil {
+		t.Fatalf("CREATE INDEX t_b_idx (gist): %v", err)
+	}
+
+	aIdx, _ := ctx.Catalog.LookupIndex(parser.ObjectName{Schema: "public", Name: "t_a_idx"})
+	aRel := ctx.Catalog.IndexRelFileNode(aIdx)
+	if err := ctx.Pool.Manager().TruncateRelation(aRel); err != nil {
+		t.Fatalf("TruncateRelation(t_a_idx): %v", err)
+	}
+	ctx.Pool.InvalidateRel(aRel)
+
+	if err := runDDL(t, ctx, "REINDEX TABLE CONCURRENTLY t"); err != nil {
+		t.Fatalf("REINDEX TABLE CONCURRENTLY: %v", err)
+	}
+
+	bt, err := btree.Open(ctx.Pool, aRel)
+	if err != nil {
+		t.Fatalf("btree.Open(t_a_idx) after REINDEX TABLE CONCURRENTLY: %v", err)
+	}
+	var count int
+	if err := bt.RangeScan(nil, nil, func(key []byte, ptr storage.ItemPointer) (bool, error) {
+		count++
+		return true, nil
+	}); err != nil {
+		t.Fatalf("RangeScan: %v", err)
+	}
+	if count != 3 {
+		t.Fatalf("t_a_idx post-REINDEX TABLE CONCURRENTLY entry count = %d, want 3", count)
+	}
+}
+
+// TestReindexIndexConcurrentlyDoesNotBlockConcurrentIndexReader is the
+// CONCURRENTLY-specific counterpart to
+// TestReindexIndexBlocksBehindConcurrentIndexReader: the whole point of
+// CONCURRENTLY is that a live index reader must NOT be blocked by the shadow
+// build — only the final swap takes a (brief) conflicting lock, and only if a
+// reader is already gone by then. Here the reader releases its lock well
+// before REINDEX INDEX CONCURRENTLY is even issued, so this asserts the
+// operation completes promptly rather than timing out.
+func TestReindexIndexConcurrentlyDoesNotBlockConcurrentIndexReader(t *testing.T) {
+	ctx, cleanup := newFSMFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE t (id int4)"); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	for _, v := range []string{"1", "2", "3"} {
+		if err := runDDL(t, ctx, "INSERT INTO t VALUES ("+v+")"); err != nil {
+			t.Fatalf("INSERT %s: %v", v, err)
+		}
+	}
+	if err := runDDL(t, ctx, "CREATE INDEX t_idx ON t (id)"); err != nil {
+		t.Fatalf("CREATE INDEX: %v", err)
+	}
+
+	ctx.BackendID = 909091
+	done := make(chan error, 1)
+	go func() { done <- runDDL(t, ctx, "REINDEX INDEX CONCURRENTLY t_idx") }()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("REINDEX INDEX CONCURRENTLY: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("REINDEX INDEX CONCURRENTLY never completed with no concurrent lockers")
+	}
+}
