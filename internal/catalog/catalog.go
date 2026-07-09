@@ -1058,7 +1058,7 @@ func (c *InMemory) ToastRelName(oid uint32) (string, bool) {
 		parentOID := oid - toastIndexOidOffset
 		c.mu.RLock()
 		defer c.mu.RUnlock()
-		t, ok := c.tableByOID(parentOID)
+		t, ok := c.tableByOID(parentOID, DefaultDBOid)
 		if !ok || !tableHasToastRelation(t) {
 			return "", false
 		}
@@ -1070,7 +1070,7 @@ func (c *InMemory) ToastRelName(oid uint32) (string, bool) {
 	parentOID := oid - toastRelidOffset
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	t, ok := c.tableByOID(parentOID)
+	t, ok := c.tableByOID(parentOID, DefaultDBOid)
 	if !ok || !tableHasToastRelation(t) {
 		return "", false
 	}
@@ -1123,7 +1123,7 @@ func (c *InMemory) LookupToastRel(schema, name string) (oid uint32, isIndex bool
 		} else {
 			parentOID = ov - toastRelidOffset
 		}
-		if t, found := c.tableByOID(parentOID); found && tableHasToastRelation(t) {
+		if t, found := c.tableByOID(parentOID, DefaultDBOid); found && tableHasToastRelation(t) {
 			return ov, idx, true
 		}
 	}
@@ -1143,7 +1143,7 @@ func (c *InMemory) LookupToastRel(schema, name string) (oid uint32, isIndex bool
 		return 0, false, false
 	}
 	parentOID := uint32(pOID)
-	t, found := c.tableByOID(parentOID)
+	t, found := c.tableByOID(parentOID, DefaultDBOid)
 	if !found || !tableHasToastRelation(t) {
 		return 0, false, false
 	}
@@ -1173,7 +1173,7 @@ func (c *InMemory) ToastParentTable(toastOID uint32) (*Table, bool) {
 	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	t, ok := c.tableByOID(parentOID)
+	t, ok := c.tableByOID(parentOID, DefaultDBOid)
 	if !ok || !tableHasToastRelation(t) {
 		return nil, false
 	}
@@ -1193,7 +1193,7 @@ func (c *InMemory) ToastParentTable(toastOID uint32) (*Table, bool) {
 func (c *InMemory) ToastRelFileNode(parentRel storage.RelFileNode) (storage.RelFileNode, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	t, ok := c.tableByOID(parentRel.RelOid)
+	t, ok := c.tableByOID(parentRel.RelOid, DefaultDBOid)
 	if !ok || !tableHasToastRelation(t) {
 		return storage.RelFileNode{}, false
 	}
@@ -1803,21 +1803,21 @@ func (i *Index) QualifiedName() string {
 
 // Catalog is the lookup interface the planner uses.
 type Catalog interface {
-	LookupTable(name parser.ObjectName) (*Table, bool)
+	LookupTable(name parser.ObjectName, dbOid ...uint32) (*Table, bool)
 	LookupColumn(table *Table, name string) (*Column, bool)
-	LookupIndex(name parser.ObjectName) (*Index, bool)
-	CreateTable(name parser.ObjectName, cols []Column) (*Table, error)
-	CreateIndex(name parser.ObjectName, table *Table, cols []string, unique bool, method string, primary bool) (*Index, error)
+	LookupIndex(name parser.ObjectName, dbOid ...uint32) (*Index, bool)
+	CreateTable(name parser.ObjectName, cols []Column, dbOid ...uint32) (*Table, error)
+	CreateIndex(name parser.ObjectName, table *Table, cols []string, unique bool, method string, primary bool, dbOid ...uint32) (*Index, error)
 	CreateView(name parser.ObjectName, cols []Column, aliases []string, query *parser.SelectStmt, orReplace bool) (*Table, error)
 	DropView(name parser.ObjectName, ifExists bool) error
 	SetTableStats(table *Table, stats *TableStats)
 	UpdateRelStats(table *Table, pages int, tuples int64)
 	AddColumn(table *Table, col Column) (*Column, error)
-	DropTable(name parser.ObjectName) error
-	DropIndex(name parser.ObjectName) error
+	DropTable(name parser.ObjectName, dbOid ...uint32) error
+	DropIndex(name parser.ObjectName, dbOid ...uint32) error
 	// TablesInSchema returns the names of all non-virtual user tables in the given
 	// schema.  Used by DROP SCHEMA CASCADE. M0097-0020.
-	TablesInSchema(schemaName string) []parser.ObjectName
+	TablesInSchema(schemaName string, dbOid ...uint32) []parser.ObjectName
 	// SchemaExists reports whether a schema has been registered.
 	SchemaExists(name string) bool
 	// SchemaOID returns the OID of a registered schema (0 if not found). Used by
@@ -1948,7 +1948,7 @@ type Catalog interface {
 	DropTableACL(relOID uint32)
 	IndexesOnTable(table *Table) []*Index
 	// AllIndexes returns every index in the catalog, sorted by OID. M0097-0023.
-	AllIndexes() []*Index
+	AllIndexes(dbOid ...uint32) []*Index
 	HasPrimaryKey(table *Table) bool
 	RelFileNode(table *Table) storage.RelFileNode
 	IndexRelFileNode(index *Index) storage.RelFileNode
@@ -1980,7 +1980,7 @@ type Catalog interface {
 	AllocOID() uint32
 	// RenameTable renames a table/sequence/view by swapping its catalog key.
 	// Returns an error if old does not exist or new already exists. M0097-0024.
-	RenameTable(old, new parser.ObjectName) error
+	RenameTable(old, new parser.ObjectName, dbOid ...uint32) error
 	// LookupEnum finds a user-defined enum type by name (case-insensitive).
 	// Exposed on the interface so the catalog-row builders can resolve an enum
 	// column's type name to its pg_type OID. DU-002 slice 88.
@@ -3340,6 +3340,26 @@ func (c *InMemory) ns(dbOid uint32) *tableNamespace {
 	return n
 }
 
+// resolveDBOid returns the target dbOid for a catalog table/index entry
+// point: the first element of dbOid if the caller supplied one, else
+// DefaultDBOid. Every entry point in the "Blast radius" list of
+// docs/design/0122-0018-per-database-catalog-namespace.md accepts its
+// dbOid as a trailing `dbOid ...uint32` parameter rather than a required
+// one (M0122-0007 slice 4b-ii) — this keeps every existing call site
+// (hundreds, across internal/executor and internal/planner) byte-for-byte
+// unchanged and behavior-preserving, since omitting the argument resolves
+// to exactly the same DefaultDBOid these call sites hardcoded before
+// 4b-ii. A future caller that has a real per-connection dbOid (4c/4d)
+// simply passes it: `c.LookupTable(name, ctx.CurrentDatabaseOid)`. Only
+// DefaultDBOid is ever resolved today — see ns()'s locking contract for
+// why a non-pre-seeded dbOid must not reach here from a read-locked path.
+func resolveDBOid(dbOid []uint32) uint32 {
+	if len(dbOid) > 0 {
+		return dbOid[0]
+	}
+	return DefaultDBOid
+}
+
 // NewInMemory returns a catalog seeded with the v0 pg_catalog
 // virtual views.
 
@@ -4046,7 +4066,7 @@ func AccessibleInheritanceChildren(children []*Table, sessionTempOwner string) [
 
 // InheritanceChildren returns the direct inheritance children of parentOID.
 // Returns nil if the table has no inheritance children. M0096-0009.
-func (c *InMemory) InheritanceChildren(parentOID uint32) []*Table {
+func (c *InMemory) InheritanceChildren(parentOID uint32, dbOid ...uint32) []*Table {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	children := c.inheritanceChildren[parentOID]
@@ -4055,7 +4075,7 @@ func (c *InMemory) InheritanceChildren(parentOID uint32) []*Table {
 	}
 	out := make([]*Table, 0, len(children))
 	for _, oid := range children {
-		for _, t := range c.ns(DefaultDBOid).tables {
+		for _, t := range c.ns(resolveDBOid(dbOid)).tables {
 			if t.OID == oid {
 				out = append(out, t)
 				break
@@ -4067,7 +4087,7 @@ func (c *InMemory) InheritanceChildren(parentOID uint32) []*Table {
 
 // PartitionChildren returns the OIDs of partition children for a partitioned table.
 // Returns nil if the table has no partitions registered.  M0096-0007.
-func (c *InMemory) PartitionChildren(parentOID uint32) []*Table {
+func (c *InMemory) PartitionChildren(parentOID uint32, dbOid ...uint32) []*Table {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	children := c.partitionChildren[parentOID]
@@ -4076,7 +4096,7 @@ func (c *InMemory) PartitionChildren(parentOID uint32) []*Table {
 	}
 	out := make([]*Table, 0, len(children))
 	for _, oid := range children {
-		for _, t := range c.ns(DefaultDBOid).tables {
+		for _, t := range c.ns(resolveDBOid(dbOid)).tables {
 			if t.OID == oid {
 				out = append(out, t)
 				break
@@ -4327,10 +4347,10 @@ func (c *InMemory) IndexPartitionChildren(parentOID uint32) []*Index {
 
 // LookupIndexByOID returns the index with the given OID, or false if not found.
 // M0097-0023.
-func (c *InMemory) LookupIndexByOID(oid uint32) (*Index, bool) {
+func (c *InMemory) LookupIndexByOID(oid uint32, dbOid ...uint32) (*Index, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	for _, idx := range c.ns(DefaultDBOid).indexes {
+	for _, idx := range c.ns(resolveDBOid(dbOid)).indexes {
 		if idx.OID == oid {
 			return idx, true
 		}
@@ -5458,7 +5478,7 @@ func (c *InMemory) RegisterIndexDuringRecovery(
 ) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	tbl, ok := c.tableByOID(tableOID)
+	tbl, ok := c.tableByOID(tableOID, DefaultDBOid)
 	if !ok {
 		// Owning table not yet recovered — caller must run
 		// `loadUserTablesFromHeap` (or equivalent) before
@@ -5481,7 +5501,7 @@ func (c *InMemory) RegisterIndexDuringRecovery(
 	// follow-up). lookupIndexLocked already implements the same "" vs
 	// "public." collision fallback reads rely on, so reusing it here keeps
 	// recovery's notion of "same index" consistent with LookupIndex's.
-	if existing, existingKey, dup := c.lookupIndexLocked(parser.ObjectName{Schema: schema, Name: name}); dup {
+	if existing, existingKey, dup := c.lookupIndexLocked(parser.ObjectName{Schema: schema, Name: name}, DefaultDBOid); dup {
 		// JSON snapshot or earlier recovery pass already registered
 		// this index. Idempotent no-op.
 		_ = existing
@@ -5537,7 +5557,7 @@ func (c *InMemory) UnregisterIndexDuringRecovery(schema, name string) {
 	// DROP INDEX WAL record's raw (often unqualified) schema must resolve to
 	// whatever key the index actually lives under, or the drop silently
 	// no-ops and the index is "resurrected" after restart.
-	idx, k, ok := c.lookupIndexLocked(parser.ObjectName{Schema: schema, Name: name})
+	idx, k, ok := c.lookupIndexLocked(parser.ObjectName{Schema: schema, Name: name}, DefaultDBOid)
 	if !ok {
 		return
 	}
@@ -5556,8 +5576,8 @@ func (c *InMemory) UnregisterIndexDuringRecovery(schema, name string) {
 // hold c.mu (read or write). Used by the recovery hooks to map
 // a WAL-encoded table OID back to the in-memory entry without
 // re-walking c.ns(DefaultDBOid).tables on every call site.
-func (c *InMemory) tableByOID(oid uint32) (*Table, bool) {
-	for _, t := range c.ns(DefaultDBOid).tables {
+func (c *InMemory) tableByOID(oid uint32, dbOid uint32) (*Table, bool) {
+	for _, t := range c.ns(dbOid).tables {
 		if t.OID == oid {
 			return t, true
 		}
@@ -5568,10 +5588,10 @@ func (c *InMemory) tableByOID(oid uint32) (*Table, bool) {
 // LookupTableByOID is the read-locked public accessor for tableByOID.
 // Used by the executor to render `oid::regclass` for the `tableoid`
 // system column (M0100-0005y) and similar OID-back-to-name lookups.
-func (c *InMemory) LookupTableByOID(oid uint32) (*Table, bool) {
+func (c *InMemory) LookupTableByOID(oid uint32, dbOid ...uint32) (*Table, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.tableByOID(oid)
+	return c.tableByOID(oid, resolveDBOid(dbOid))
 }
 
 // RegisterOpClassHashFunc records that opClassName uses routineName as its
@@ -10557,20 +10577,21 @@ func (c *InMemory) registerInformationSchemaTables() {
 // the JSON snapshot), the call is a no-op and returns nil. nextOID is
 // advanced past tbl.OID to prevent future allocations from colliding with
 // existing heap-stored relations.
-func (c *InMemory) TryRegisterUserTable(tbl *Table) error {
+func (c *InMemory) TryRegisterUserTable(tbl *Table, dbOid ...uint32) error {
 	if tbl == nil {
 		return fmt.Errorf("TryRegisterUserTable: nil table")
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	ns := c.ns(resolveDBOid(dbOid))
 	k := key(parser.ObjectName{Schema: tbl.Schema, Name: tbl.Name})
-	if _, exists := c.ns(DefaultDBOid).tables[k]; exists {
+	if _, exists := ns.tables[k]; exists {
 		return nil // already registered — idempotent
 	}
 	for i := range tbl.Columns {
 		tbl.Columns[i].Ordinal = i
 	}
-	c.ns(DefaultDBOid).tables[k] = tbl
+	ns.tables[k] = tbl
 	if tbl.OID >= c.nextOID {
 		c.nextOID = tbl.OID + 1
 	}
@@ -10591,7 +10612,7 @@ func (c *InMemory) TryRegisterUserTable(tbl *Table) error {
 // System catalog tables are excluded from Snapshot() so they are
 // never persisted to JSON — they are always re-registered at
 // startup from their heap relfiles.
-func (c *InMemory) RegisterRealTable(t *Table) error {
+func (c *InMemory) RegisterRealTable(t *Table, dbOid ...uint32) error {
 	if t == nil {
 		return fmt.Errorf("RegisterRealTable: nil table")
 	}
@@ -10603,8 +10624,9 @@ func (c *InMemory) RegisterRealTable(t *Table) error {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	ns := c.ns(resolveDBOid(dbOid))
 	k := key(parser.ObjectName{Schema: t.Schema, Name: t.Name})
-	if existing, ok := c.ns(DefaultDBOid).tables[k]; ok {
+	if existing, ok := ns.tables[k]; ok {
 		if existing.OID == t.OID {
 			return nil // already registered — idempotent
 		}
@@ -10613,7 +10635,7 @@ func (c *InMemory) RegisterRealTable(t *Table) error {
 	for i := range t.Columns {
 		t.Columns[i].Ordinal = i
 	}
-	c.ns(DefaultDBOid).tables[k] = t
+	ns.tables[k] = t
 	return nil
 }
 
@@ -10667,17 +10689,18 @@ func key(name parser.ObjectName) string {
 // and `SELECT FROM pg_class ...` shapes resolve without an
 // explicit schema qualifier — mirrors upstream's implicit
 // `pg_catalog` entry on the search_path.
-func (c *InMemory) LookupTable(name parser.ObjectName) (*Table, bool) {
+func (c *InMemory) LookupTable(name parser.ObjectName, dbOid ...uint32) (*Table, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	if t, ok := c.ns(DefaultDBOid).tables[key(name)]; ok {
+	ns := c.ns(resolveDBOid(dbOid))
+	if t, ok := ns.tables[key(name)]; ok {
 		return t, true
 	}
 	if name.Schema == "" {
-		if t, ok := c.ns(DefaultDBOid).tables[key(parser.ObjectName{Schema: "public", Name: name.Name})]; ok {
+		if t, ok := ns.tables[key(parser.ObjectName{Schema: "public", Name: name.Name})]; ok {
 			return t, true
 		}
-		if t, ok := c.ns(DefaultDBOid).tables[key(parser.ObjectName{Schema: "pg_catalog", Name: name.Name})]; ok {
+		if t, ok := ns.tables[key(parser.ObjectName{Schema: "pg_catalog", Name: name.Name})]; ok {
 			return t, true
 		}
 	} else {
@@ -10685,7 +10708,7 @@ func (c *InMemory) LookupTable(name parser.ObjectName) (*Table, bool) {
 		// that were moved to a different schema via SET SCHEMA (catalog key is unchanged).
 		// A table stored without an explicit schema (t.Schema="") is treated as being
 		// in "public", so a "public.foo" lookup finds a bare-keyed "foo" entry. M0097-0023.
-		if t, ok := c.ns(DefaultDBOid).tables[name.Name]; ok {
+		if t, ok := ns.tables[name.Name]; ok {
 			tSchema := t.Schema
 			if tSchema == "" {
 				tSchema = "public"
@@ -10713,10 +10736,10 @@ func (c *InMemory) LookupColumn(table *Table, name string) (*Column, bool) {
 // LookupIndex returns the index with the given name, or false when
 // unresolved. Unqualified lookups fall back to an unqualified search
 // so schema-qualified references find indexes stored without a schema.
-func (c *InMemory) LookupIndex(name parser.ObjectName) (*Index, bool) {
+func (c *InMemory) LookupIndex(name parser.ObjectName, dbOid ...uint32) (*Index, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	idx, _, ok := c.lookupIndexLocked(name)
+	idx, _, ok := c.lookupIndexLocked(name, resolveDBOid(dbOid))
 	return idx, ok
 }
 
@@ -10734,20 +10757,21 @@ func (c *InMemory) LookupIndex(name parser.ObjectName) (*Index, bool) {
 // resolves the namespace OID to the explicit string "public" instead. A
 // rename/lookup issued before vs. after a restart can therefore target the
 // same logical index under two different literal keys.
-func (c *InMemory) lookupIndexLocked(name parser.ObjectName) (*Index, string, bool) {
-	if idx, ok := c.ns(DefaultDBOid).indexes[key(name)]; ok {
+func (c *InMemory) lookupIndexLocked(name parser.ObjectName, dbOid uint32) (*Index, string, bool) {
+	ns := c.ns(dbOid)
+	if idx, ok := ns.indexes[key(name)]; ok {
 		return idx, key(name), ok
 	}
 	if name.Schema == "" {
 		// Unqualified name: try "public.<name>" first (indexes created via DDL
 		// always carry the table's schema, which defaults to "public").
-		if idx, ok := c.ns(DefaultDBOid).indexes["public."+name.Name]; ok {
+		if idx, ok := ns.indexes["public."+name.Name]; ok {
 			return idx, "public." + name.Name, ok
 		}
 	} else {
 		// Schema-qualified lookup failed: fall back to bare name for indexes
 		// created without an explicit schema in the catalog key.
-		if idx, ok := c.ns(DefaultDBOid).indexes[name.Name]; ok {
+		if idx, ok := ns.indexes[name.Name]; ok {
 			return idx, name.Name, ok
 		}
 	}
@@ -10756,11 +10780,12 @@ func (c *InMemory) lookupIndexLocked(name parser.ObjectName) (*Index, string, bo
 
 // CreateTable installs a new table in the catalog. Returns an error
 // when a table with the same name already exists.
-func (c *InMemory) CreateTable(name parser.ObjectName, cols []Column) (*Table, error) {
+func (c *InMemory) CreateTable(name parser.ObjectName, cols []Column, dbOid ...uint32) (*Table, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	ns := c.ns(resolveDBOid(dbOid))
 	k := key(name)
-	if _, exists := c.ns(DefaultDBOid).tables[k]; exists {
+	if _, exists := ns.tables[k]; exists {
 		return nil, fmt.Errorf("relation %q already exists", k)
 	}
 	for i := range cols {
@@ -10773,20 +10798,21 @@ func (c *InMemory) CreateTable(name parser.ObjectName, cols []Column) (*Table, e
 		OID:     c.nextOID,
 	}
 	c.nextOID++
-	c.ns(DefaultDBOid).tables[k] = t
+	ns.tables[k] = t
 	return t, nil
 }
 
 // CreateIndex installs a new index in the catalog. Returns an error
 // when an index with the same name already exists.
-func (c *InMemory) CreateIndex(name parser.ObjectName, table *Table, cols []string, unique bool, method string, primary bool) (*Index, error) {
+func (c *InMemory) CreateIndex(name parser.ObjectName, table *Table, cols []string, unique bool, method string, primary bool, dbOid ...uint32) (*Index, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if table == nil {
 		return nil, fmt.Errorf("table is nil")
 	}
+	ns := c.ns(resolveDBOid(dbOid))
 	k := key(name)
-	if _, exists := c.ns(DefaultDBOid).indexes[k]; exists {
+	if _, exists := ns.indexes[k]; exists {
 		return nil, fmt.Errorf("relation %q already exists", k)
 	}
 	idx := &Index{
@@ -10800,11 +10826,11 @@ func (c *InMemory) CreateIndex(name parser.ObjectName, table *Table, cols []stri
 		OID:     c.nextOID,
 	}
 	c.nextOID++
-	c.ns(DefaultDBOid).indexes[k] = idx
-	if c.ns(DefaultDBOid).byTable[table.OID] == nil {
-		c.ns(DefaultDBOid).byTable[table.OID] = map[string]*Index{}
+	ns.indexes[k] = idx
+	if ns.byTable[table.OID] == nil {
+		ns.byTable[table.OID] = map[string]*Index{}
 	}
-	c.ns(DefaultDBOid).byTable[table.OID][k] = idx
+	ns.byTable[table.OID][k] = idx
 	return idx, nil
 }
 
@@ -10832,23 +10858,24 @@ func (c *InMemory) AddColumn(table *Table, col Column) (*Column, error) {
 
 // RenameTable renames a catalog table/view/sequence entry from old to new.
 // Returns an error when old does not exist or new already exists. M0097-0024.
-func (c *InMemory) RenameTable(old, new parser.ObjectName) error {
+func (c *InMemory) RenameTable(old, new parser.ObjectName, dbOid ...uint32) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	ns := c.ns(resolveDBOid(dbOid))
 	oldK := key(old)
 	newK := key(new)
-	tbl, exists := c.ns(DefaultDBOid).tables[oldK]
+	tbl, exists := ns.tables[oldK]
 	if !exists {
 		return fmt.Errorf("relation %q does not exist", oldK)
 	}
-	if _, exists2 := c.ns(DefaultDBOid).tables[newK]; exists2 {
+	if _, exists2 := ns.tables[newK]; exists2 {
 		return fmt.Errorf("relation %q already exists", newK)
 	}
 	// Re-key the table entry under the new name, preserving the pointer.
 	tbl.Schema = new.Schema
 	tbl.Name = new.Name
-	c.ns(DefaultDBOid).tables[newK] = tbl
-	delete(c.ns(DefaultDBOid).tables, oldK)
+	ns.tables[newK] = tbl
+	delete(ns.tables, oldK)
 	return nil
 }
 
@@ -10884,22 +10911,24 @@ func (c *InMemory) RestoreIndex(idx *Index) {
 // shape, DU-002 slice 443). Returns an error when old does not exist or new
 // already exists — real PostgreSQL raises 42P07 for the latter
 // (RenameRelation -> RangeVarCallbackForAlterRelation's namespace check).
-func (c *InMemory) RenameIndex(old, new parser.ObjectName) error {
+func (c *InMemory) RenameIndex(old, new parser.ObjectName, dbOid ...uint32) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	idx, oldK, exists := c.lookupIndexLocked(old)
+	resolved := resolveDBOid(dbOid)
+	ns := c.ns(resolved)
+	idx, oldK, exists := c.lookupIndexLocked(old, resolved)
 	if !exists {
 		return fmt.Errorf("relation %q does not exist", key(old))
 	}
 	newK := key(parser.ObjectName{Schema: idx.Schema, Name: new.Name})
-	if _, _, collides := c.lookupIndexLocked(parser.ObjectName{Schema: idx.Schema, Name: new.Name}); collides {
+	if _, _, collides := c.lookupIndexLocked(parser.ObjectName{Schema: idx.Schema, Name: new.Name}, resolved); collides {
 		return fmt.Errorf("relation %q already exists", newK)
 	}
 	idx.Name = new.Name
-	c.ns(DefaultDBOid).indexes[newK] = idx
-	delete(c.ns(DefaultDBOid).indexes, oldK)
+	ns.indexes[newK] = idx
+	delete(ns.indexes, oldK)
 	if idx.Table != nil {
-		if perTable := c.ns(DefaultDBOid).byTable[idx.Table.OID]; perTable != nil {
+		if perTable := ns.byTable[idx.Table.OID]; perTable != nil {
 			delete(perTable, oldK)
 			perTable[newK] = idx
 		}
@@ -10918,7 +10947,7 @@ func (c *InMemory) RenameIndex(old, new parser.ObjectName) error {
 func (c *InMemory) RenameIndexDuringRecovery(schema, oldName, newName string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	idx, oldK, exists := c.lookupIndexLocked(parser.ObjectName{Schema: schema, Name: oldName})
+	idx, oldK, exists := c.lookupIndexLocked(parser.ObjectName{Schema: schema, Name: oldName}, DefaultDBOid)
 	if !exists {
 		return
 	}
@@ -17025,12 +17054,12 @@ func (c *InMemory) TableRuleKind(tableName string) string {
 	return c.tableRuleKinds[strings.ToLower(tableName)]
 }
 
-func (c *InMemory) TablesInSchema(schemaName string) []parser.ObjectName {
+func (c *InMemory) TablesInSchema(schemaName string, dbOid ...uint32) []parser.ObjectName {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	schemaLC := strings.ToLower(schemaName)
 	var out []parser.ObjectName
-	for k, t := range c.ns(DefaultDBOid).tables {
+	for k, t := range c.ns(resolveDBOid(dbOid)).tables {
 		if t.Virtual {
 			continue // skip system/virtual tables
 		}
@@ -17059,21 +17088,22 @@ func (c *InMemory) TablesInSchema(schemaName string) []parser.ObjectName {
 	return out
 }
 
-func (c *InMemory) DropTable(name parser.ObjectName) error {
+func (c *InMemory) DropTable(name parser.ObjectName, dbOid ...uint32) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	ns := c.ns(resolveDBOid(dbOid))
 	k := key(name)
-	tbl, exists := c.ns(DefaultDBOid).tables[k]
+	tbl, exists := ns.tables[k]
 	if !exists {
 		return fmt.Errorf("relation %q does not exist", k)
 	}
-	if idxs, ok := c.ns(DefaultDBOid).byTable[tbl.OID]; ok {
+	if idxs, ok := ns.byTable[tbl.OID]; ok {
 		for idxKey := range idxs {
-			delete(c.ns(DefaultDBOid).indexes, idxKey)
+			delete(ns.indexes, idxKey)
 		}
-		delete(c.ns(DefaultDBOid).byTable, tbl.OID)
+		delete(ns.byTable, tbl.OID)
 	}
-	delete(c.ns(DefaultDBOid).tables, k)
+	delete(ns.tables, k)
 	delete(c.tableACLs, tbl.OID) // forget any granted privileges (M0118-0008)
 	delete(c.tableACLOrder, tbl.OID)
 	return nil
@@ -17137,19 +17167,20 @@ func (c *InMemory) SessionTempTableNames(owner string) []string {
 }
 
 // DropIndex removes an index from the catalog.
-func (c *InMemory) DropIndex(name parser.ObjectName) error {
+func (c *InMemory) DropIndex(name parser.ObjectName, dbOid ...uint32) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	ns := c.ns(resolveDBOid(dbOid))
 	k := key(name)
-	idx, ok := c.ns(DefaultDBOid).indexes[k]
+	idx, ok := ns.indexes[k]
 	if !ok {
 		return fmt.Errorf("index %q does not exist", k)
 	}
-	delete(c.ns(DefaultDBOid).indexes, k)
-	if idxs, ok := c.ns(DefaultDBOid).byTable[idx.Table.OID]; ok {
+	delete(ns.indexes, k)
+	if idxs, ok := ns.byTable[idx.Table.OID]; ok {
 		delete(idxs, k)
 		if len(idxs) == 0 {
-			delete(c.ns(DefaultDBOid).byTable, idx.Table.OID)
+			delete(ns.byTable, idx.Table.OID)
 		}
 	}
 	return nil
@@ -17385,11 +17416,12 @@ func BuildIndexDef(idx *Index) string {
 }
 
 // AllIndexes returns every index in the catalog, sorted by OID.
-func (c *InMemory) AllIndexes() []*Index {
+func (c *InMemory) AllIndexes(dbOid ...uint32) []*Index {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	out := make([]*Index, 0, len(c.ns(DefaultDBOid).indexes))
-	for _, idx := range c.ns(DefaultDBOid).indexes {
+	ns := c.ns(resolveDBOid(dbOid))
+	out := make([]*Index, 0, len(ns.indexes))
+	for _, idx := range ns.indexes {
 		out = append(out, idx)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].OID < out[j].OID })
@@ -17510,7 +17542,7 @@ func (c *InMemory) dropIndexByName(tableOID uint32, constraintName string) bool 
 func (c *InMemory) DropForeignKeyConstraint(tableOID uint32, constraintName string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	tbl, ok := c.tableByOID(tableOID)
+	tbl, ok := c.tableByOID(tableOID, DefaultDBOid)
 	if !ok {
 		return false
 	}
@@ -17569,11 +17601,12 @@ func (c *InMemory) IndexRelFileNode(index *Index) storage.RelFileNode {
 // creation time so plugins can interpret tuple bytes against a
 // stable shape. See
 // docs/design/0008-0001-logical-decoding-pipeline.md.
-func (c *InMemory) AllTables() []*Table {
+func (c *InMemory) AllTables(dbOid ...uint32) []*Table {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	out := make([]*Table, 0, len(c.ns(DefaultDBOid).tables))
-	for _, t := range c.ns(DefaultDBOid).tables {
+	ns := c.ns(resolveDBOid(dbOid))
+	out := make([]*Table, 0, len(ns.tables))
+	for _, t := range ns.tables {
 		if t.Virtual {
 			continue
 		}
@@ -19961,11 +19994,11 @@ func (c *SearchPathCatalog) CurrentPartitionDetachEpoch() uint64 {
 
 // LookupTable overrides the embedded Catalog.LookupTable to apply the
 // current search_path when the name has no explicit schema qualifier.
-func (c *SearchPathCatalog) LookupTable(name parser.ObjectName) (*Table, bool) {
-	tbl, ok := c.Catalog.LookupTable(name)
+func (c *SearchPathCatalog) LookupTable(name parser.ObjectName, dbOid ...uint32) (*Table, bool) {
+	tbl, ok := c.Catalog.LookupTable(name, dbOid...)
 	if !ok && name.Schema == "" && c.GetSchemas != nil {
 		for _, sc := range c.GetSchemas() {
-			tbl, ok = c.Catalog.LookupTable(parser.ObjectName{Schema: sc, Name: name.Name})
+			tbl, ok = c.Catalog.LookupTable(parser.ObjectName{Schema: sc, Name: name.Name}, dbOid...)
 			if ok {
 				return tbl, ok
 			}

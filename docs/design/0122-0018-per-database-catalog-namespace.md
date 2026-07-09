@@ -1,6 +1,6 @@
 # Per-database catalog namespace (M0122-0007 slice 4)
 
-Status: accepted (sub-slices 4a and 4b-i landed; 4b-ii, 4c, 4d, 4e planned)
+Status: accepted (sub-slices 4a, 4b-i, and 4b-ii landed; 4c, 4d, 4e planned)
 Date: 2026-07-09
 Supersedes: none — extends the "Still open" note in
 `0122-0017-database-ddl-drop-guards.md` and the deferral-ledger rows dated
@@ -188,28 +188,72 @@ package, full repo, short mode); `go test ./internal/catalog/...
 `scripts/tpch-spotcheck.sh` (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
 scripts/ralph-precommit-test.sh` (0 failed, all 3 pgbench workloads).
 
-### 4b-ii — Give catalog entry points an explicit dbOid parameter (planned, NOT started)
+### 4b-ii — Give catalog entry points an explicit dbOid parameter (LANDED, 2026-07-09)
 
 Every public entry point listed under "Blast radius" — `LookupTable`,
 `CreateTable`, `DropTable`, `LookupIndex`, `CreateIndex`, `DropIndex`,
 `RenameTable`, `RenameIndex`, `AllTables`, `AllIndexes`,
 `TablesInSchema`, `RegisterRealTable`, `TryRegisterUserTable`,
 `LookupTableByOID`, `LookupIndexByOID`, `InheritanceChildren`,
-`PartitionChildren`, ... — gains an explicit `dbOid uint32` parameter
-(threading through to the now-available `c.ns(dbOid)` from 4b-i). Every
-existing caller (hundreds of sites in `internal/executor` and
-`internal/planner`) passes `catalog.DefaultDBOid` — a mechanical,
-find-and-replace-style change at each call site, but crossing package
-boundaries this time, so it cannot be done with a single in-file
-substitution the way 4b-i was; expect to touch dozens of files. This
-sub-slice still changes no actual routing decision (every namespace
-resolved is still `DefaultDBOid`) — 4c is the first sub-slice that reads
-a real per-connection value. Recommended approach: a single
-self-contained pass (or a dedicated worktree-isolated pass) — a
-half-migrated signature set (some callers passing a real dbOid, most
-still hardcoding `DefaultDBOid`) would be strictly worse than 4b-i's
-current state, silently wrong instead of honestly incomplete. Do not
-attempt to also start 4c in the same loop.
+`PartitionChildren` — gained an explicit `dbOid` parameter, threaded
+through to `c.ns(dbOid)` from 4b-i.
+
+**Deviation from the plan above (the actual shape that landed):** the
+original text on this line called for a *required* `dbOid uint32`
+parameter, with every one of the hundreds of external call sites in
+`internal/executor`/`internal/planner` mechanically edited to pass
+`catalog.DefaultDBOid` explicitly. That would have been a genuinely
+large, cross-package, error-prone diff — a measured `grep` pass at
+implementation time found 300+ non-test call sites for `LookupTable`
+alone (and 800+ across all 17 entry points), any one of which, if
+missed, would silently fail to compile (caught) or, worse, could be
+mis-edited to reference the wrong variable. Instead, every one of the 17
+entry points gained a **trailing variadic `dbOid ...uint32` parameter**
+(a new package-level `resolveDBOid(dbOid []uint32) uint32` helper next to
+`ns()` resolves it: `dbOid[0]` if supplied, else `DefaultDBOid`). This is
+strictly forward-compatible with the plan's own stated goal — 4c/4d's
+future call sites read exactly the same either way
+(`c.LookupTable(name, ctx.CurrentDatabaseOid)`), since Go allows passing
+0 or 1 arguments to a variadic parameter identically to a required one —
+while making the "existing caller passes `DefaultDBOid`" step happen for
+free, for all ~800 sites, with zero risk of a missed or mis-edited call
+site. The `Catalog` interface (`internal/catalog/catalog.go`) gained the
+same variadic parameter on its 9 overlapping methods
+(`LookupTable`/`LookupIndex`/`CreateTable`/`CreateIndex`/`DropTable`/
+`DropIndex`/`TablesInSchema`/`AllIndexes`/`RenameTable`); its only two
+implementers are `*InMemory` (this sub-slice) and `*SearchPathCatalog`
+(the `LookupTable` search-path override, updated to forward `dbOid...`
+unchanged) — confirmed by grep, no mock/test-double implementers of the
+interface exist. The internal `lookupIndexLocked` helper (shared by
+`LookupIndex`/`RenameIndex`/`RenameIndexDuringRecovery`/
+`RegisterIndexDuringRecovery`/`UnregisterIndexDuringRecovery`) and
+`tableByOID` (shared by `LookupTableByOID` and 8 TOAST-relation helpers)
+took a **required** `dbOid uint32` parameter instead, since they're
+private and every call site is in the same file — the recovery-path and
+TOAST-helper callers (out of scope for the 17-entry-point list) all pass
+`DefaultDBOid` explicitly, unchanged behavior.
+
+Zero observable behavior change: no caller anywhere in the tree passes a
+non-default `dbOid` yet, so every one of the ~800 pre-existing call
+sites resolves to exactly `DefaultDBOid` exactly as before — this
+sub-slice still changes no actual routing decision (4c is the first
+sub-slice that reads a real per-connection value). New regression test
+`TestDBOidParameterRoutesToDistinctNamespace`
+(`internal/catalog/dbid_namespace_test.go`) exercises all 17 entry
+points with an explicit non-default `dbOid`, proving two namespaces are
+genuinely isolated (a table/index created under one is invisible to
+lookups against the other) rather than the parameter being accepted and
+silently ignored — this is also the first test to exercise `ns()`'s
+lazy-create branch with a real (non-pre-seeded) dbOid, safe here because
+every write happens through a `CreateTable`/`CreateIndex` call that
+already holds `c.mu` for writing (see 4b-i's locking contract).
+
+Gates run (all PASS): `go build ./...` clean; `go vet ./...` clean; `go
+test ./internal/catalog/... ./internal/executor/... ./internal/server/...`
+PASS; `go test -short $(go list ./... | grep -v /internal/testport)`
+(full repo, short mode) PASS; `scripts/tpch-spotcheck.sh` PASS
+(Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh`
+PASS (0 failed transactions, all 3 pgbench workloads).
 
 ### 4c — Route READ paths through the connection's real dbOid (planned)
 
@@ -250,14 +294,18 @@ today, ready to become a hard assertion once this lands).
 
 ## Recommended order and stopping points
 
-4a (landed) → 4b-i (landed) → 4b-ii → 4c → 4d → 4e, strictly in order — each
-depends on the previous sub-slice's data shape. Do not attempt to skip 4b-ii by threading a
-real dbOid through call sites while the underlying map is still a single
-shared namespace (it would compile and silently do nothing, exactly the
-kind of "worse than a no-op" outcome flagged in the slice-2 deferral row).
-If a sub-slice is cut off mid-implementation, prefer reverting it whole
-(the tree must build and tests must pass at every commit) over leaving a
-partially-migrated signature set — see 4b-ii's note above.
+4a (landed) → 4b-i (landed) → 4b-ii (landed) → 4c → 4d → 4e, strictly in
+order — each depends on the previous sub-slice's data shape. 4c is next:
+thread `ctx.CurrentDatabaseOid` (available since 4a) through the read-side
+call sites now that every entry point can accept it (4b-ii). Do not thread
+a real dbOid through call sites while the underlying map was still a
+single shared namespace (pre-4b-i state) — it would have compiled and
+silently done nothing, exactly the kind of "worse than a no-op" outcome
+flagged in the slice-2 deferral row; that risk is now moot since 4b-ii's
+variadic parameter landed with zero call sites passing a non-default
+value. If a sub-slice is cut off mid-implementation, prefer reverting it
+whole (the tree must build and tests must pass at every commit) over
+leaving a partially-migrated state.
 
 ## Deferred / explicitly out of scope
 

@@ -5792,6 +5792,61 @@ mirroring M0119's ledger `status` column.
       4b-ii (public entry-point `dbOid` parameter + all external callers),
       then 4c/4d/4e per the design doc; 4b-ii is the next resume point and
       should also be budgeted as its own self-contained pass.
+  - [x] `M0122-0007` follow-up 9 (2026-07-09, this loop) — **slice 4 sub-slice
+      4b-ii (give every public catalog entry point a dbOid parameter), landed.**
+      All 17 blast-radius entry points (`LookupTable`/`CreateTable`/`DropTable`/
+      `LookupIndex`/`CreateIndex`/`DropIndex`/`RenameTable`/`RenameIndex`/
+      `AllTables`/`AllIndexes`/`TablesInSchema`/`RegisterRealTable`/
+      `TryRegisterUserTable`/`LookupTableByOID`/`LookupIndexByOID`/
+      `InheritanceChildren`/`PartitionChildren`) gained a trailing **variadic**
+      `dbOid ...uint32` parameter (new `resolveDBOid(dbOid []uint32) uint32`
+      helper next to `ns()`: `dbOid[0]` if supplied, else `DefaultDBOid`) —
+      a deliberate deviation from the design doc's original "required
+      parameter + edit every external caller" plan. A measured `grep` pass
+      found 800+ non-test external call sites across the 17 entry points
+      (300+ for `LookupTable` alone); the variadic form makes every one of
+      them resolve to `DefaultDBOid` for free with zero risk of a missed or
+      mis-edited site, while staying call-site-identical for 4c/4d's future
+      real-dbOid callers (`c.LookupTable(name, ctx.CurrentDatabaseOid)` reads
+      the same either way). The `Catalog` interface's 9 overlapping methods
+      gained the same variadic parameter; its two implementers (`*InMemory`,
+      `*SearchPathCatalog`'s `LookupTable` override) both updated — confirmed
+      via grep to be the only two, no mock/test-double implementers exist.
+      The private `lookupIndexLocked`/`tableByOID` helpers (shared by
+      `LookupIndex`/`RenameIndex`/recovery-path callers, and by
+      `LookupTableByOID`/8 TOAST-relation helpers) took a **required**
+      `dbOid uint32` instead, since every call site is in the same file;
+      the out-of-scope recovery/TOAST callers all pass `DefaultDBOid`
+      explicitly, unchanged behavior. Zero observable behavior change: no
+      caller anywhere passes a non-default dbOid yet. New test
+      `TestDBOidParameterRoutesToDistinctNamespace`
+      (`internal/catalog/dbid_namespace_test.go`) exercises all 17 entry
+      points with dbOid=999 vs. the default, proving two namespaces are
+      genuinely isolated (not silently ignored) — also the first thing to
+      exercise `ns()`'s lazy-create branch with a non-pre-seeded dbOid,
+      safe here because every write goes through `CreateTable`/`CreateIndex`
+      already holding `c.mu` for writing (4b-i's locking contract).
+      Confirmed non-vacuous via `git stash` on `catalog.go` alone (the new
+      test fails to compile pre-fix — every call passes one argument too
+      many against the pre-4b-ii required-arity signatures). Design:
+      `docs/design/0122-0018-per-database-catalog-namespace.md` new "4b-ii"
+      section (status flipped to landed, deviation documented) +
+      "Recommended order" section updated; `docs/design/README.md` row
+      updated. Deferral-ledger: the 4b-ii row from follow-up 8 flipped to
+      `resolved`, new row appended documenting what changed and deferring
+      4c/4d (real per-connection routing — still 100% unimplemented; every
+      call site still implicitly resolves `DefaultDBOid`). Gates: `go build
+      ./...`/`go vet ./...` clean; `go test ./internal/catalog/...
+      ./internal/executor/... ./internal/server/...` PASS; `go test -short
+      $(go list ./... | grep -v /internal/testport)` (full repo, short
+      mode) PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed transactions, all 3 pgbench workloads). **Remaining
+      M0122-0007 items:** 4c (route READ paths through
+      `ctx.CurrentDatabaseOid`) is the next resume point, then 4d (route
+      WRITE paths + `RelFileNode.DBOid`), then 4e (cross-cutting fixups +
+      the `CREATE DATABASE ... TEMPLATE` copy mechanism this epic exists to
+      unblock).
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,
