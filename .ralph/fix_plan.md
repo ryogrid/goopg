@@ -6768,6 +6768,50 @@ mirroring M0119's ledger `status` column.
       `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
       `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
       failed transactions, all 3 pgbench workloads).
+  - [x] `M0122-0007` follow-up 25 (2026-07-10, this loop) — **fixed the next
+      highest-value sibling virtual-table builder follow-up 24 flagged:
+      `pg_constraint`.** Same closure-extraction pattern: extracted the
+      `VirtualRows` closure body (CHECK / UNIQUE·PK·EXCLUDE / NOT NULL /
+      FOREIGN KEY constraint emission — the largest of these builders, ~300
+      lines) into an exported `catalog.InMemory.PGConstraintRowsForDBOid(dbOid
+      uint32) [][]string`, parameterizing its `c.ns(DefaultDBOid)` references
+      (tables + indexes, 5 occurrences) on `dbOid`; `c.domains` (domain CHECK
+      constraints) intentionally stays global, matching the same
+      not-yet-namespace-scoped precedent `PGClassRowsForDBOid` already
+      documents for composite types. The registered closure now just calls
+      `PGConstraintRowsForDBOid(DefaultDBOid)`, byte-identical default
+      behavior. Wired a new per-connection `executor.Context.PgConstraintRows
+      func() [][]string` field (mirrors `PgIndexesRows`/`PgTablesRows`), set in
+      `internal/server/dispatch.go`'s `wireExtensionRows` (new
+      `pgConstraintRowLister` interface), consumed by a new `tbl.Name ==
+      "pg_constraint"` branch in `internal/executor/operators.go`'s
+      `valuesOp.Open`. New test `TestPgConstraintRowsScopedToConnectionDBOid`
+      (`internal/executor/fk_dbid_routing_test.go`), mirroring
+      `TestPgIndexesRowsScopedToConnectionDBOid`: two tables each with a
+      `PRIMARY KEY`, one under `DefaultDBOid` and one under a distinct dbOid,
+      never cross-leak their `_pkey` constraint rows. Live end-to-end verified
+      against a real `cmd/goopg` binary + real `psql`: `CREATE DATABASE
+      freshdb3` → connect → `CREATE TABLE only_in_freshdb3 (id int PRIMARY
+      KEY, val int CHECK (val > 0))` → `SELECT conname, contype, conrelid FROM
+      pg_constraint` in `freshdb3` shows only that table's 3 constraints
+      (pkey/check/not-null) at its own `dbOid`-local OID; the same query
+      against `postgres` db shows only `postgres`'s own
+      `only_in_postgres_*` constraints (no cross-database leak either
+      direction). **Remaining scope (deferred, own future loops):** 10 sibling
+      builders still row-content-`DefaultDBOid`-only — `pg_attrdef`,
+      `pg_inherits`, `pg_index`, `pg_statistic_ext`, `pg_policy`, `pg_depend`,
+      `pg_trigger`, `pg_rewrite`,
+      `information_schema.routines`/`parameters`/`routine_*_usage`,
+      `pg_foreign_table`; `pg_sequence`/`pg_sequences`/
+      `information_schema.sequences` and `pg_attribute`/`pg_type` remain
+      separately flagged as before. Design doc updated (new "pg_constraint"
+      residual-gap subsection); `docs/design/README.md` row extended;
+      deferral ledger row appended ("pg_constraint per-dbOid content"). Gates:
+      `go build ./...`/`go vet ./...` clean; `go test ./internal/catalog/...
+      ./internal/executor/... ./internal/server/... ./internal/planner/...`
+      PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed transactions, all 3 pgbench workloads).
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,

@@ -1995,6 +1995,14 @@ func (s *Server) wireExtensionRows(ectx *executor.Context, dbName string) {
 			return pt.PGTablesRowsForDBOid(catalog.NamespaceDBOid(ectx.CurrentDatabaseOid))
 		}
 	}
+	// pg_constraint must likewise reflect the connecting database's own
+	// tables'/indexes' constraints, not always DefaultDBOid's. Mirrors the
+	// pg_class wiring above. M0122-0007 4e follow-up 25.
+	if pc, ok := s.cfg.Catalog.(pgConstraintRowLister); ok {
+		ectx.PgConstraintRows = func() [][]string {
+			return pc.PGConstraintRowsForDBOid(catalog.NamespaceDBOid(ectx.CurrentDatabaseOid))
+		}
+	}
 }
 
 // pgClassRowLister is implemented by catalog.InMemory to expose a
@@ -2013,6 +2021,13 @@ type pgIndexesRowLister interface {
 
 type pgTablesRowLister interface {
 	PGTablesRowsForDBOid(dbOid uint32) [][]string
+}
+
+// pgConstraintRowLister is implemented by catalog.InMemory to expose a
+// per-database pg_constraint row-set, mirroring pgClassRowLister above.
+// M0122-0007 4e follow-up 25.
+type pgConstraintRowLister interface {
+	PGConstraintRowsForDBOid(dbOid uint32) [][]string
 }
 
 func undoEnumDDLForRollback(connTx *connTxState, cat catalog.Catalog) {

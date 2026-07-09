@@ -5896,6 +5896,322 @@ func (c *InMemory) PGTablesRowsForDBOid(dbOid uint32) [][]string {
 	return out
 }
 
+// PGConstraintRowsForDBOid builds the pg_constraint row-set for dbOid's own
+// tables/indexes/domains (mirrors PGClassRowsForDBOid's per-connection dbOid
+// scoping above). registerSystemTables's VirtualRows closure calls this with
+// DefaultDBOid so every existing caller (server dispatch without a
+// per-connection PgConstraintRows wire-up, every test) sees byte-identical
+// behavior; a per-connection dbOid is wired in via
+// executor.Context.PgConstraintRows (internal/server/dispatch.go's
+// wireExtensionRows). Domain CHECK constraints (c.domains) stay global —
+// domains aren't namespace-scoped at all yet, same as composite types in
+// PGClassRowsForDBOid above. M0122-0007 4e follow-up 25.
+func (c *InMemory) PGConstraintRowsForDBOid(dbOid uint32) [][]string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	var out [][]string
+	for _, tbl := range c.ns(dbOid).tables {
+		if tbl.Virtual || tbl.OID == 0 {
+			continue
+		}
+		// Emit named CHECK constraints.
+		for _, nc := range tbl.NamedChecks {
+			if nc.Name == "" || nc.OID == 0 {
+				continue
+			}
+			row := make([]string, 26)
+			row[0] = fmt.Sprintf("%d", nc.OID)  // oid
+			row[1] = nc.Name                    // conname
+			row[2] = "2200"                     // connamespace (public)
+			row[3] = "c"                        // contype = check
+			row[4] = "f"                        // condeferrable
+			row[5] = "f"                        // condeferred
+			if nc.NotValid || nc.NotEnforced {
+				// convalidated='f' — either explicitly added NOT VALID, or
+				// NOT ENFORCED (real PG's ATAddCheckNNConstraint sets
+				// skip_validation=!is_enforced, so an unenforced constraint
+				// is implicitly unvalidated too). DU-002 slice 430.
+				row[6] = "f" // convalidated
+			} else {
+				row[6] = "t" // convalidated
+			}
+			row[7] = fmt.Sprintf("%d", tbl.OID) // conrelid
+			row[8] = "0"                        // contypid
+			row[9] = "0"                        // conindid
+			row[10] = "0"                       // conparentid
+			row[11] = "0"                       // confrelid
+			row[12] = " "                       // confupdtype
+			row[13] = " "                       // confdeltype
+			row[14] = " "                       // confmatchtype
+			if nc.IsLocal {
+				row[15] = "t"
+			} else {
+				row[15] = "f"
+			}
+			row[16] = fmt.Sprintf("%d", nc.InhCount) // coninhcount
+			if nc.NoInherit {
+				row[17] = "t" // connoinherit (CHECK ... NO INHERIT). DU-002 slice 128.
+			} else {
+				row[17] = "f"
+			}
+			row[18] = "f"     // conperiod
+			row[24] = nc.Expr // conbin
+			if nc.NotEnforced {
+				row[25] = "f" // conenforced — CHECK ... NOT ENFORCED. DU-002 slice 430.
+			} else {
+				row[25] = "t" // conenforced
+			}
+			out = append(out, row)
+		}
+	}
+	// Emit domain CHECK constraints (contype='c', keyed on contypid = the
+	// domain's pg_type OID rather than conrelid). pg_dump's
+	// getDomainConstraints reads `WHERE contypid = $1 AND contype IN ('c','n')`
+	// and renders each via pg_get_constraintdef ORDER BY conname — the ORDER BY
+	// is applied by the executor over these rows, so a domain's multiple CHECKs
+	// each get a row here. DU-002 slice 96 (single) / slice 385 (multi).
+	for _, d := range c.domains {
+		for _, ck := range d.Checks {
+			if ck.Expr == "" || ck.OID == 0 {
+				continue
+			}
+			row := make([]string, 26)
+			row[0] = fmt.Sprintf("%d", ck.OID) // oid
+			row[1] = ck.Name                   // conname
+			row[2] = "2200"                    // connamespace (public)
+			row[3] = "c"                       // contype = check
+			row[4] = "f"                       // condeferrable
+			row[5] = "f"                       // condeferred
+			row[6] = "t"                       // convalidated
+			row[7] = "0"                       // conrelid (none — domain check)
+			row[8] = fmt.Sprintf("%d", d.OID)  // contypid = domain OID
+			row[9] = "0"                       // conindid
+			row[10] = "0"                      // conparentid
+			row[11] = "0"                      // confrelid
+			row[12] = " "                      // confupdtype
+			row[13] = " "                      // confdeltype
+			row[14] = " "                      // confmatchtype
+			row[15] = "t"                      // conislocal
+			row[16] = "0"                      // coninhcount
+			row[17] = "f"                      // connoinherit
+			row[18] = "f"                      // conperiod
+			row[24] = ck.Expr                  // conbin
+			row[25] = "t"                      // conenforced: always true in v0
+			out = append(out, row)
+		}
+	}
+	// Emit UNIQUE, PRIMARY KEY, and EXCLUDE constraints from constraint-backed indexes.
+	for _, idx := range c.ns(dbOid).indexes {
+		if (!idx.IsConstraint && !idx.IsExclusion) || idx.Table == nil {
+			continue
+		}
+		colOrdMap := make(map[string]int, len(idx.Table.Columns))
+		for _, col := range idx.Table.Columns {
+			colOrdMap[col.Name] = col.Ordinal + 1
+		}
+		var keyNums []string
+		for _, colName := range idx.Columns {
+			if ord, ok := colOrdMap[colName]; ok {
+				keyNums = append(keyNums, fmt.Sprintf("%d", ord))
+			}
+		}
+		contype := "u"
+		if idx.Primary {
+			contype = "p"
+		} else if idx.IsExclusion {
+			contype = "x"
+		}
+		row := make([]string, 26)
+		row[0] = fmt.Sprintf("%d", idx.OID)
+		row[1] = idx.Name
+		row[2] = "2200"
+		row[3] = contype
+		// condeferrable / condeferred: a DEFERRABLE [INITIALLY DEFERRED]
+		// UNIQUE/PK constraint round-trips the flags so pg_dump re-emits the
+		// clause. DU-002 slice 139.
+		row[4] = "f"
+		if idx.Deferrable {
+			row[4] = "t"
+		}
+		row[5] = "f"
+		if idx.InitiallyDeferred {
+			row[5] = "t"
+		}
+		row[6] = "t"
+		row[7] = fmt.Sprintf("%d", idx.Table.OID)
+		row[8] = "0"
+		row[9] = fmt.Sprintf("%d", idx.OID)
+		row[10] = "0"
+		row[11] = "0"
+		row[12] = " "
+		row[13] = " "
+		row[14] = " "
+		row[15] = "t"
+		row[16] = "0"
+		row[17] = "f"
+		row[18] = "f"
+		row[19] = "{" + strings.Join(keyNums, ",") + "}"
+		row[25] = "t" // conenforced: always true in v0
+		out = append(out, row)
+	}
+	// Emit NOT NULL constraints (contype='n', PG18). M0097-0023.
+	for _, tbl := range c.ns(dbOid).tables {
+		if tbl.Virtual || tbl.OID == 0 {
+			continue
+		}
+		for _, nc := range tbl.NotNullConstraints {
+			if nc.Name == "" || nc.OID == 0 {
+				continue
+			}
+			colOrd := 0
+			for i, col := range tbl.Columns {
+				if strings.EqualFold(col.Name, nc.ColName) {
+					colOrd = i + 1
+					break
+				}
+			}
+			row := make([]string, 26)
+			row[0] = fmt.Sprintf("%d", nc.OID)
+			row[1] = nc.Name
+			row[2] = "2200"
+			row[3] = "n" // contype = not null
+			row[4] = "f"
+			row[5] = "f"
+			row[6] = "t"
+			row[7] = fmt.Sprintf("%d", tbl.OID)
+			row[8] = "0"
+			row[9] = "0"
+			row[10] = "0"
+			row[11] = "0"
+			row[12] = " "
+			row[13] = " "
+			row[14] = " "
+			if nc.IsLocal {
+				row[15] = "t"
+			} else {
+				row[15] = "f"
+			}
+			row[16] = fmt.Sprintf("%d", nc.InhCount)
+			if nc.NoInherit {
+				row[17] = "t"
+			} else {
+				row[17] = "f"
+			}
+			row[18] = "f"
+			if colOrd > 0 {
+				row[19] = fmt.Sprintf("{%d}", colOrd)
+			}
+			row[25] = "t" // conenforced: always true in v0
+			out = append(out, row)
+		}
+	}
+	// Emit FOREIGN KEY constraints (contype='f', PG). pg_dump's getConstraints
+	// joins `pg_constraint c ON src.tbloid = c.conrelid WHERE contype='f'` and
+	// renders each via pg_get_constraintdef(c.oid). DU-002 slice 51.
+	for _, tbl := range c.ns(dbOid).tables {
+		if tbl.Virtual || tbl.OID == 0 {
+			continue
+		}
+		colOrd := make(map[string]int, len(tbl.Columns))
+		for i, col := range tbl.Columns {
+			colOrd[strings.ToLower(col.Name)] = i + 1
+		}
+		for _, fk := range tbl.ForeignKeys {
+			if fk.Name == "" || fk.OID == 0 {
+				continue
+			}
+			// Resolve the referenced table OID + referenced column ordinals.
+			var refTbl *Table
+			for _, cand := range c.ns(dbOid).tables {
+				if cand.Virtual || cand.OID == 0 {
+					continue
+				}
+				if strings.EqualFold(cand.Name, fk.RefTable) {
+					refTbl = cand
+					break
+				}
+			}
+			var confrelid uint32
+			refColOrd := map[string]int{}
+			if refTbl != nil {
+				confrelid = refTbl.OID
+				for i, col := range refTbl.Columns {
+					refColOrd[strings.ToLower(col.Name)] = i + 1
+				}
+			}
+			var conkey, confkey []string
+			for _, cn := range fk.Columns {
+				if ord, ok := colOrd[strings.ToLower(cn)]; ok {
+					conkey = append(conkey, fmt.Sprintf("%d", ord))
+				}
+			}
+			for _, cn := range fk.RefColumns {
+				if ord, ok := refColOrd[strings.ToLower(cn)]; ok {
+					confkey = append(confkey, fmt.Sprintf("%d", ord))
+				}
+			}
+			// confdelsetcols (PG15): attnums of the columns an ON DELETE SET
+			// NULL|DEFAULT is restricted to. NULL when the action covers the
+			// whole key, matching PG (decompile_column_index_array emits the
+			// ` (col, …)` suffix only when this is non-null). DU-002 slice 311.
+			var confdelsetcols []string
+			for _, cn := range fk.OnDeleteSetCols {
+				if ord, ok := colOrd[strings.ToLower(cn)]; ok {
+					confdelsetcols = append(confdelsetcols, fmt.Sprintf("%d", ord))
+				}
+			}
+			row := make([]string, 26)
+			row[0] = fmt.Sprintf("%d", fk.OID) // oid
+			row[1] = fk.Name                   // conname
+			row[2] = "2200"                    // connamespace (public)
+			row[3] = "f"                       // contype = foreign key
+			if fk.Deferrable {
+				row[4] = "t"
+			} else {
+				row[4] = "f" // condeferrable
+			}
+			if fk.InitiallyDeferred {
+				row[5] = "t"
+			} else {
+				row[5] = "f" // condeferred
+			}
+			if fk.NotValid || fk.NotEnforced {
+				row[6] = "f" // convalidated — NOT VALID (or implied by NOT ENFORCED)
+			} else {
+				row[6] = "t" // convalidated
+			}
+			row[7] = fmt.Sprintf("%d", tbl.OID) // conrelid
+			row[8] = "0"                        // contypid
+			row[9] = "0"                        // conindid (unique idx on ref tbl; unused by deparse)
+			row[10] = "0"                       // conparentid (0 → pg_dump WHERE conparentid=0 keeps it)
+			row[11] = fmt.Sprintf("%d", confrelid)
+			row[12] = string(fkActionChar(fk.OnUpdate)) // confupdtype
+			row[13] = string(fkActionChar(fk.OnDelete)) // confdeltype
+			if fk.MatchFull {
+				row[14] = "f" // confmatchtype = MATCH FULL
+			} else {
+				row[14] = "s" // confmatchtype = MATCH SIMPLE (default)
+			}
+			row[15] = "t"                               // conislocal
+			row[16] = "0"                               // coninhcount
+			row[17] = "f"                               // connoinherit
+			row[18] = "f"                               // conperiod
+			row[19] = "{" + strings.Join(conkey, ",") + "}"
+			row[20] = "{" + strings.Join(confkey, ",") + "}"
+			if len(confdelsetcols) > 0 {
+				row[23] = "{" + strings.Join(confdelsetcols, ",") + "}" // confdelsetcols
+			}
+			if fk.NotEnforced {
+				row[25] = "f" // conenforced — FOREIGN KEY ... NOT ENFORCED. DU-002 slice 431.
+			} else {
+				row[25] = "t" // conenforced
+			}
+			out = append(out, row)
+		}
+	}
+	return out
+}
+
 func (c *InMemory) PGClassRowsForDBOid(dbOid uint32) [][]string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -7538,309 +7854,7 @@ func (c *InMemory) registerSystemTables() {
 		OID: 2606,
 	}
 	pgConstraint.VirtualRows = func() [][]string {
-		c.mu.RLock()
-		defer c.mu.RUnlock()
-		var out [][]string
-		for _, tbl := range c.ns(DefaultDBOid).tables {
-			if tbl.Virtual || tbl.OID == 0 {
-				continue
-			}
-			// Emit named CHECK constraints.
-			for _, nc := range tbl.NamedChecks {
-				if nc.Name == "" || nc.OID == 0 {
-					continue
-				}
-				row := make([]string, 26)
-				row[0] = fmt.Sprintf("%d", nc.OID)  // oid
-				row[1] = nc.Name                    // conname
-				row[2] = "2200"                     // connamespace (public)
-				row[3] = "c"                        // contype = check
-				row[4] = "f"                        // condeferrable
-				row[5] = "f"                        // condeferred
-				if nc.NotValid || nc.NotEnforced {
-					// convalidated='f' — either explicitly added NOT VALID, or
-					// NOT ENFORCED (real PG's ATAddCheckNNConstraint sets
-					// skip_validation=!is_enforced, so an unenforced constraint
-					// is implicitly unvalidated too). DU-002 slice 430.
-					row[6] = "f" // convalidated
-				} else {
-					row[6] = "t" // convalidated
-				}
-				row[7] = fmt.Sprintf("%d", tbl.OID) // conrelid
-				row[8] = "0"                        // contypid
-				row[9] = "0"                        // conindid
-				row[10] = "0"                       // conparentid
-				row[11] = "0"                       // confrelid
-				row[12] = " "                       // confupdtype
-				row[13] = " "                       // confdeltype
-				row[14] = " "                       // confmatchtype
-				if nc.IsLocal {
-					row[15] = "t"
-				} else {
-					row[15] = "f"
-				}
-				row[16] = fmt.Sprintf("%d", nc.InhCount) // coninhcount
-				if nc.NoInherit {
-					row[17] = "t" // connoinherit (CHECK ... NO INHERIT). DU-002 slice 128.
-				} else {
-					row[17] = "f"
-				}
-				row[18] = "f"     // conperiod
-				row[24] = nc.Expr // conbin
-				if nc.NotEnforced {
-					row[25] = "f" // conenforced — CHECK ... NOT ENFORCED. DU-002 slice 430.
-				} else {
-					row[25] = "t" // conenforced
-				}
-				out = append(out, row)
-			}
-		}
-		// Emit domain CHECK constraints (contype='c', keyed on contypid = the
-		// domain's pg_type OID rather than conrelid). pg_dump's
-		// getDomainConstraints reads `WHERE contypid = $1 AND contype IN ('c','n')`
-		// and renders each via pg_get_constraintdef ORDER BY conname — the ORDER BY
-		// is applied by the executor over these rows, so a domain's multiple CHECKs
-		// each get a row here. DU-002 slice 96 (single) / slice 385 (multi).
-		for _, d := range c.domains {
-			for _, ck := range d.Checks {
-				if ck.Expr == "" || ck.OID == 0 {
-					continue
-				}
-				row := make([]string, 26)
-				row[0] = fmt.Sprintf("%d", ck.OID) // oid
-				row[1] = ck.Name                   // conname
-				row[2] = "2200"                    // connamespace (public)
-				row[3] = "c"                       // contype = check
-				row[4] = "f"                       // condeferrable
-				row[5] = "f"                       // condeferred
-				row[6] = "t"                       // convalidated
-				row[7] = "0"                       // conrelid (none — domain check)
-				row[8] = fmt.Sprintf("%d", d.OID)  // contypid = domain OID
-				row[9] = "0"                       // conindid
-				row[10] = "0"                      // conparentid
-				row[11] = "0"                      // confrelid
-				row[12] = " "                      // confupdtype
-				row[13] = " "                      // confdeltype
-				row[14] = " "                      // confmatchtype
-				row[15] = "t"                      // conislocal
-				row[16] = "0"                      // coninhcount
-				row[17] = "f"                      // connoinherit
-				row[18] = "f"                      // conperiod
-				row[24] = ck.Expr                  // conbin
-				row[25] = "t"                      // conenforced: always true in v0
-				out = append(out, row)
-			}
-		}
-		// Emit UNIQUE, PRIMARY KEY, and EXCLUDE constraints from constraint-backed indexes.
-		for _, idx := range c.ns(DefaultDBOid).indexes {
-			if (!idx.IsConstraint && !idx.IsExclusion) || idx.Table == nil {
-				continue
-			}
-			colOrdMap := make(map[string]int, len(idx.Table.Columns))
-			for _, col := range idx.Table.Columns {
-				colOrdMap[col.Name] = col.Ordinal + 1
-			}
-			var keyNums []string
-			for _, colName := range idx.Columns {
-				if ord, ok := colOrdMap[colName]; ok {
-					keyNums = append(keyNums, fmt.Sprintf("%d", ord))
-				}
-			}
-			contype := "u"
-			if idx.Primary {
-				contype = "p"
-			} else if idx.IsExclusion {
-				contype = "x"
-			}
-			row := make([]string, 26)
-			row[0] = fmt.Sprintf("%d", idx.OID)
-			row[1] = idx.Name
-			row[2] = "2200"
-			row[3] = contype
-			// condeferrable / condeferred: a DEFERRABLE [INITIALLY DEFERRED]
-			// UNIQUE/PK constraint round-trips the flags so pg_dump re-emits the
-			// clause. DU-002 slice 139.
-			row[4] = "f"
-			if idx.Deferrable {
-				row[4] = "t"
-			}
-			row[5] = "f"
-			if idx.InitiallyDeferred {
-				row[5] = "t"
-			}
-			row[6] = "t"
-			row[7] = fmt.Sprintf("%d", idx.Table.OID)
-			row[8] = "0"
-			row[9] = fmt.Sprintf("%d", idx.OID)
-			row[10] = "0"
-			row[11] = "0"
-			row[12] = " "
-			row[13] = " "
-			row[14] = " "
-			row[15] = "t"
-			row[16] = "0"
-			row[17] = "f"
-			row[18] = "f"
-			row[19] = "{" + strings.Join(keyNums, ",") + "}"
-			row[25] = "t" // conenforced: always true in v0
-			out = append(out, row)
-		}
-		// Emit NOT NULL constraints (contype='n', PG18). M0097-0023.
-		for _, tbl := range c.ns(DefaultDBOid).tables {
-			if tbl.Virtual || tbl.OID == 0 {
-				continue
-			}
-			for _, nc := range tbl.NotNullConstraints {
-				if nc.Name == "" || nc.OID == 0 {
-					continue
-				}
-				colOrd := 0
-				for i, col := range tbl.Columns {
-					if strings.EqualFold(col.Name, nc.ColName) {
-						colOrd = i + 1
-						break
-					}
-				}
-				row := make([]string, 26)
-				row[0] = fmt.Sprintf("%d", nc.OID)
-				row[1] = nc.Name
-				row[2] = "2200"
-				row[3] = "n" // contype = not null
-				row[4] = "f"
-				row[5] = "f"
-				row[6] = "t"
-				row[7] = fmt.Sprintf("%d", tbl.OID)
-				row[8] = "0"
-				row[9] = "0"
-				row[10] = "0"
-				row[11] = "0"
-				row[12] = " "
-				row[13] = " "
-				row[14] = " "
-				if nc.IsLocal {
-					row[15] = "t"
-				} else {
-					row[15] = "f"
-				}
-				row[16] = fmt.Sprintf("%d", nc.InhCount)
-				if nc.NoInherit {
-					row[17] = "t"
-				} else {
-					row[17] = "f"
-				}
-				row[18] = "f"
-				if colOrd > 0 {
-					row[19] = fmt.Sprintf("{%d}", colOrd)
-				}
-				row[25] = "t" // conenforced: always true in v0
-				out = append(out, row)
-			}
-		}
-		// Emit FOREIGN KEY constraints (contype='f', PG). pg_dump's getConstraints
-		// joins `pg_constraint c ON src.tbloid = c.conrelid WHERE contype='f'` and
-		// renders each via pg_get_constraintdef(c.oid). DU-002 slice 51.
-		for _, tbl := range c.ns(DefaultDBOid).tables {
-			if tbl.Virtual || tbl.OID == 0 {
-				continue
-			}
-			colOrd := make(map[string]int, len(tbl.Columns))
-			for i, col := range tbl.Columns {
-				colOrd[strings.ToLower(col.Name)] = i + 1
-			}
-			for _, fk := range tbl.ForeignKeys {
-				if fk.Name == "" || fk.OID == 0 {
-					continue
-				}
-				// Resolve the referenced table OID + referenced column ordinals.
-				var refTbl *Table
-				for _, cand := range c.ns(DefaultDBOid).tables {
-					if cand.Virtual || cand.OID == 0 {
-						continue
-					}
-					if strings.EqualFold(cand.Name, fk.RefTable) {
-						refTbl = cand
-						break
-					}
-				}
-				var confrelid uint32
-				refColOrd := map[string]int{}
-				if refTbl != nil {
-					confrelid = refTbl.OID
-					for i, col := range refTbl.Columns {
-						refColOrd[strings.ToLower(col.Name)] = i + 1
-					}
-				}
-				var conkey, confkey []string
-				for _, cn := range fk.Columns {
-					if ord, ok := colOrd[strings.ToLower(cn)]; ok {
-						conkey = append(conkey, fmt.Sprintf("%d", ord))
-					}
-				}
-				for _, cn := range fk.RefColumns {
-					if ord, ok := refColOrd[strings.ToLower(cn)]; ok {
-						confkey = append(confkey, fmt.Sprintf("%d", ord))
-					}
-				}
-				// confdelsetcols (PG15): attnums of the columns an ON DELETE SET
-				// NULL|DEFAULT is restricted to. NULL when the action covers the
-				// whole key, matching PG (decompile_column_index_array emits the
-				// ` (col, …)` suffix only when this is non-null). DU-002 slice 311.
-				var confdelsetcols []string
-				for _, cn := range fk.OnDeleteSetCols {
-					if ord, ok := colOrd[strings.ToLower(cn)]; ok {
-						confdelsetcols = append(confdelsetcols, fmt.Sprintf("%d", ord))
-					}
-				}
-				row := make([]string, 26)
-				row[0] = fmt.Sprintf("%d", fk.OID) // oid
-				row[1] = fk.Name                   // conname
-				row[2] = "2200"                    // connamespace (public)
-				row[3] = "f"                       // contype = foreign key
-				if fk.Deferrable {
-					row[4] = "t"
-				} else {
-					row[4] = "f" // condeferrable
-				}
-				if fk.InitiallyDeferred {
-					row[5] = "t"
-				} else {
-					row[5] = "f" // condeferred
-				}
-				if fk.NotValid || fk.NotEnforced {
-					row[6] = "f" // convalidated — NOT VALID (or implied by NOT ENFORCED)
-				} else {
-					row[6] = "t" // convalidated
-				}
-				row[7] = fmt.Sprintf("%d", tbl.OID) // conrelid
-				row[8] = "0"                        // contypid
-				row[9] = "0"                        // conindid (unique idx on ref tbl; unused by deparse)
-				row[10] = "0"                       // conparentid (0 → pg_dump WHERE conparentid=0 keeps it)
-				row[11] = fmt.Sprintf("%d", confrelid)
-				row[12] = string(fkActionChar(fk.OnUpdate)) // confupdtype
-				row[13] = string(fkActionChar(fk.OnDelete)) // confdeltype
-				if fk.MatchFull {
-					row[14] = "f" // confmatchtype = MATCH FULL
-				} else {
-					row[14] = "s" // confmatchtype = MATCH SIMPLE (default)
-				}
-				row[15] = "t"                               // conislocal
-				row[16] = "0"                               // coninhcount
-				row[17] = "f"                               // connoinherit
-				row[18] = "f"                               // conperiod
-				row[19] = "{" + strings.Join(conkey, ",") + "}"
-				row[20] = "{" + strings.Join(confkey, ",") + "}"
-				if len(confdelsetcols) > 0 {
-					row[23] = "{" + strings.Join(confdelsetcols, ",") + "}" // confdelsetcols
-				}
-				if fk.NotEnforced {
-					row[25] = "f" // conenforced — FOREIGN KEY ... NOT ENFORCED. DU-002 slice 431.
-				} else {
-					row[25] = "t" // conenforced
-				}
-				out = append(out, row)
-			}
-		}
-		return out
+		return c.PGConstraintRowsForDBOid(DefaultDBOid)
 	}
 	c.ns(DefaultDBOid).tables["pg_catalog.pg_constraint"] = pgConstraint
 

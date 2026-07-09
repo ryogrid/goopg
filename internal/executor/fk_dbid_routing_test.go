@@ -339,3 +339,53 @@ func pgIndexesRowsContainTable(rows [][]string, tablename string) bool {
 	}
 	return false
 }
+
+// TestPgConstraintRowsScopedToConnectionDBOid covers M0122-0007 4e follow-up
+// 25's pg_constraint VirtualRows enumeration:
+// catalog.InMemory.PGConstraintRowsForDBOid must list the GIVEN dbOid's own
+// tables'/indexes' constraints, not always DefaultDBOid's — mirrors
+// TestPgIndexesRowsScopedToConnectionDBOid above for the pg_constraint table.
+func TestPgConstraintRowsScopedToConnectionDBOid(t *testing.T) {
+	const otherDBOid = 7007
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+
+	ctx.CurrentDatabaseOid = catalog.DefaultDBOid
+	if err := runDDL(t, ctx, "CREATE TABLE only_in_default (id int4 PRIMARY KEY)"); err != nil {
+		t.Fatalf("CREATE TABLE only_in_default: %v", err)
+	}
+	ctx.CurrentDatabaseOid = otherDBOid
+	if err := runDDL(t, ctx, "CREATE TABLE only_in_other (id int4 PRIMARY KEY)"); err != nil {
+		t.Fatalf("CREATE TABLE only_in_other: %v", err)
+	}
+
+	im, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		t.Fatalf("ctx.Catalog is %T, want *catalog.InMemory", ctx.Catalog)
+	}
+
+	defaultRows := im.PGConstraintRowsForDBOid(catalog.DefaultDBOid)
+	if pgConstraintRowsContainName(defaultRows, "only_in_other_pkey") {
+		t.Fatal("DefaultDBOid's pg_constraint rows include only_in_other_pkey, a constraint created under a distinct dbOid")
+	}
+	if !pgConstraintRowsContainName(defaultRows, "only_in_default_pkey") {
+		t.Fatal("DefaultDBOid's pg_constraint rows are missing only_in_default_pkey")
+	}
+
+	otherRows := im.PGConstraintRowsForDBOid(otherDBOid)
+	if !pgConstraintRowsContainName(otherRows, "only_in_other_pkey") {
+		t.Fatal("otherDBOid's pg_constraint rows are missing only_in_other_pkey")
+	}
+	if pgConstraintRowsContainName(otherRows, "only_in_default_pkey") {
+		t.Fatal("otherDBOid's pg_constraint rows include only_in_default_pkey, a constraint created under DefaultDBOid")
+	}
+}
+
+func pgConstraintRowsContainName(rows [][]string, conname string) bool {
+	for _, r := range rows {
+		if len(r) > 1 && r[1] == conname {
+			return true
+		}
+	}
+	return false
+}
