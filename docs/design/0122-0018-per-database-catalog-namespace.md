@@ -1,6 +1,6 @@
 # Per-database catalog namespace (M0122-0007 slice 4)
 
-Status: accepted (sub-slices 4a, 4b-i, 4b-ii, 4c, 4d-i, 4d-ii-part-1, and 4d-ii-part-2a landed; 4d-ii-part-2b items 1, 2, and 3 all fully landed; 4e's FK-target-resolution item landed — 4e's view-constraint-dep and sequence-ownership items, plus the `CREATE DATABASE ... TEMPLATE` copy mechanism, remain planned)
+Status: accepted (sub-slices 4a, 4b-i, 4b-ii, 4c, 4d-i, 4d-ii-part-1, and 4d-ii-part-2a landed; 4d-ii-part-2b items 1, 2, and 3 all fully landed; 4e's FK-target-resolution and sequence-ownership items landed — 4e's view-constraint-dep item, plus the `CREATE DATABASE ... TEMPLATE` copy mechanism, remain planned)
 Date: 2026-07-09
 Supersedes: none — extends the "Still open" note in
 `0122-0017-database-ddl-drop-guards.md` and the deferral-ledger rows dated
@@ -869,28 +869,77 @@ needs a table resolved by name during planning (as opposed to CREATE
 TABLE/CREATE VIEW's outer-statement plan, which needs no such resolution)
 must use the new helper, not plain `runDDL`/`runQuery`.
 
-**Not yet threaded (next resume points, ranked by blast radius):**
-
-- **Sequence ownership** (`internal/executor/operators_sequence.go`) — more
-  severe than a missing-parameter bug. `var seqRegistry sync.Map` is a
-  **process-global** store (explicitly doc-commented as living outside
-  `catalog.InMemory`) keyed only by bare (optionally schema-qualified)
-  sequence name, with zero dbOid concept anywhere in the file.
-  `DropSequencesOwnedByTable` (called from `dropTableByRefImmediate`),
-  `SetSequenceOwnedBy` (implicit-serial registration in `execCreateTable`,
-  explicit `OWNED BY` in `execCreateSequence`/`execAlterSequence`), and
-  `FindSequenceOwnedBy` (consumed by `autoGenerateSerialValues`'s
-  `nextval()` resolution on every INSERT, and `pg_get_serial_sequence`-style
-  lookups in `expr.go`'s `evalFuncCall`) all operate on this flat map.
-  Concretely: `DROP TABLE t` in database A can delete/cascade sequences
-  owned by a same-named table `t` in database B; two same-named
-  table+column pairs in different databases silently share (and race on)
-  one sequence counter. Fixing individual call sites is insufficient —
-  `seqRegistry`'s key scheme itself needs a dbOid (or equivalent) namespace
-  component first. This is 4e's largest remaining structural gap and blocks
-  the `CREATE DATABASE ... TEMPLATE` copy mechanism (a template-copied
-  sequence would otherwise collide with the source database's live
-  sequence in the same global map).
+**Sequence ownership — LANDED (2026-07-10).** `seqRegistry`'s key scheme
+(`internal/executor/operators_sequence.go`) now embeds the owning dbOid:
+`seqKey` composes `"<dbOid>:<normalised name>"` instead of the bare name, and
+`seqState` gained an immutable `dbOid uint32` field so the two Range-based
+scans (`FindSequenceOwnedBy`, `DropSequencesOwnedByTable`, `AllSequenceInfos`)
+filter by dbOid instead of matching every entry in the process-global map.
+Every one of the ~18 public entry points (`RegisterSequence`,
+`SetSequenceDataType/Cache/Temporary/OwnedBy/ColumnMarker`, `LookupSequence`,
+`DropSequence`, `RenameSequence`, `SequenceRowData/OwnedBy`,
+`FindSequenceOwnedBy`, `DropSequencesOwnedByTable`, `ResetSequence`,
+`GetSequenceCurrentValue`, `SetSequenceCurrentValue`, `UpdateSequenceParams`,
+`AllSequenceInfos`) gained the same trailing `dbOid ...uint32` convention as
+the catalog's own `resolveDBOid` (mirrored as a package-local
+`resolveSeqDBOid`), so every pre-existing zero-arg call site keeps resolving
+to exactly DefaultDBOid. All ~45 call sites across `operators_ddl.go`
+(CREATE/ALTER/DROP/RENAME SEQUENCE, implicit SERIAL-column registration,
+DROP TABLE's owned-sequence cascade, TRUNCATE ... RESTART IDENTITY, ALTER
+TABLE/SCHEMA rename cascades), `operators_tx.go` (RESTART IDENTITY rollback —
+`SeqRestoreEntry` gained a `DBOid` field so `ProcessRollbackUndos` restores
+into the right database), `expr.go` (`pg_get_serial_sequence`, `currtid2`),
+and `operators_sequence.go`'s own `evalNextval/evalCurrval/evalSetval/
+evalLastval/autoGenerateSerialValues` were threaded with
+`catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)` (a new `ctxSeqDBOid` helper
+for the `eval*` family). `evalGenExpr`/`evalGenFuncCall`/
+`applyDefaultsForMissing` (`operators_generated.go`, the `DEFAULT
+nextval(...)` expression-evaluator path, distinct from
+`autoGenerateSerialValues`'s SERIAL/IDENTITY path) gained the same trailing
+variadic and are threaded from their 3 real call sites with a live
+`ctx`/dbOid (`applyworker.go`'s `applyInsert` via a new `ApplyWorker.dbOid()`
+helper that reads `w.cat`'s `SearchPathCatalog.DBOid`, `operators_storage.go`,
+`operators_upsert.go`); `computeGeneratedColumns`'s ~14 call sites were left
+zero-arg deliberately — a `GENERATED ALWAYS AS (...) STORED` expression must
+be `IMMUTABLE` in PostgreSQL, so it can never legally contain `nextval()`,
+making dbOid-threading there unreachable-code churn with no behavioral
+payoff. `wal.SequenceStatePayload` gained a trailing-appended `DBOid` field
+(`EncodeSequenceState`/`DecodeSequenceState`) and `EncodeDropSequence`/
+`DecodeDropSequence` gained a trailing 4-byte dbOid, both following the
+`EncodeCreateSubscription` backward-compatible-trailer pattern (a pre-4e WAL
+record with no trailer decodes as dbOid 0 → DefaultDBOid via
+`NamespaceDBOid`, identical to the pre-4e default).
+`internal/initdb/sequence_ddl_recovery.go`'s replay `live` map (used to dedupe
+last-record-wins per sequence before the catalog-marker fixup pass) was
+re-keyed from bare name to `"<dbOid>:<name>"` for the same reason — two
+distinct databases' same-named sequences would otherwise dedupe onto one
+replay entry. New tests
+`TestSerialSequenceDoesNotAliasAcrossDistinctDBOid` and
+`TestDropTableDoesNotCascadeSequenceAcrossDistinctDBOid`
+(`internal/executor/sequence_dbid_routing_test.go`) prove two same-named
+SERIAL-backed tables under distinct connection dbOids get independent
+counters (a same-key collision under the old scheme silently reset the other
+database's already-live counter, since `RegisterSequence` unconditionally
+overwrites) and that a same-named table's owned sequence in one database
+survives a `DROP TABLE` cascade in a different database; both confirmed to
+fail against a revert of just `seqKey`'s dbOid component (a same-signature
+neutered `seqKey` that folds the dbOid argument to a no-op, so the revert
+isolates the key-scheme fix from the ~45 call-site threading, which is
+mechanically inert without it).
+**Deliberately still DefaultDBOid-only (separate, pre-existing gap, not
+part of this item):** the `pg_sequence`/`pg_sequences` virtual-row builders
+(`internal/catalog/catalog.go`'s `pgSequence.VirtualRows`,
+`internal/initdb/pg_sequences_view.go`,
+`internal/initdb/information_schema_sequences_view.go`) call
+`SequenceParamsFunc`/`AllSequenceInfos` with no dbOid because their own
+`VirtualRows func() [][]string` closures have no per-connection context to
+draw one from — the same "per-connection virtual catalog scoping" mechanism
+already solved for other virtual tables (thread DBName → Context, a
+per-connection lister in `valuesOp.Open`) has not yet been applied to these
+two. `sequenceParamsForCatalog` and the two `AllSequenceInfos()` call sites
+still default to DefaultDBOid, matching their pre-4e behavior exactly (no
+regression, but `SELECT * FROM pg_sequences` on a distinct-dbOid connection
+still only sees DefaultDBOid's sequences).
 - **View constraint-dependency tracking** (`internal/catalog/catalog.go`) —
   `c.constraintViewDeps map[string][]string` (declared near line 2280) is a
   single flat field on `InMemory`, keyed `"tableOID:constraintName"` (OID
@@ -929,13 +978,12 @@ creation time — see its section above for the `postgres`/`DefaultDBOid`
 dual-mirror guard that turned out load-bearing) are now all fully landed
 (2026-07-10). **4d-ii-part-2b is complete; the only remaining sub-slice is
 4e** (dependent-object-walk fixups + the `CREATE DATABASE ... TEMPLATE`
-copy mechanism). 4e's own FK-target-resolution item is now landed
-(2026-07-10, see its section above); **4e's remaining items are sequence
-ownership (`seqRegistry`'s process-global, dbOid-less key scheme — the
-larger structural gap, do this one first) and view constraint-dependency
-tracking (`constraintViewDeps`'s unqualified-name values), then finally the
+copy mechanism). 4e's FK-target-resolution and sequence-ownership items are
+now both landed (2026-07-10, see their sections above); **4e's only
+remaining item is view constraint-dependency tracking
+(`constraintViewDeps`'s unqualified-name values), then finally the
 `CREATE DATABASE ... TEMPLATE` copy mechanism itself**, which is blocked on
-both landing first. Before starting any of them, read 4d-i's,
+it landing first. Before starting either, read 4d-i's,
 4d-ii-part-1's, and 4d-ii-part-2a's/4d-ii-part-2b's/4e's landed sections
 above in full — they document exactly which write entry points and lookups
 already thread the connection's real dbOid (so 4e's remaining dependent-

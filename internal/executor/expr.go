@@ -7868,12 +7868,12 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			if i := strings.LastIndex(tblArg, "."); i >= 0 {
 				bareTbl = tblArg[i+1:]
 			}
-			seqName := FindSequenceOwnedBy(bareTbl + "." + colName)
+			seqName := FindSequenceOwnedBy(bareTbl+"."+colName, ctxSeqDBOid(ctx))
 			if seqName == "" {
 				return NullDatum, nil
 			}
 			schema := "public"
-			if s := LookupSequence(seqName); s != nil && s.schema != "" {
+			if s := LookupSequence(seqName, ctxSeqDBOid(ctx)); s != nil && s.schema != "" {
 				schema = s.schema
 			}
 			return NewStringDatum(pgQuoteIdent(schema) + "." + pgQuoteIdent(seqName)), nil
@@ -10679,7 +10679,7 @@ func evalCurrtid2(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	}
 
 	// Sequence: in-memory only; treat TID as always valid. M0097-0038.
-	if LookupSequence(relname) != nil {
+	if LookupSequence(relname, ctxSeqDBOid(ctx)) != nil {
 		return NewStringDatum(fmt.Sprintf("(%d,%d)", block, offset)), nil
 	}
 

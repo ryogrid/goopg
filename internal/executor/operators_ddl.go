@@ -1628,7 +1628,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			src, ok := o.ctx.Catalog.LookupTable(likeName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 			if ok {
 				likeByKey["@@LIKE:"+likeName.String()] = src
-			} else if LookupSequence(likeName.String()) != nil {
+			} else if LookupSequence(likeName.String(), catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) != nil {
 				return &ExecError{
 					Code:    "42809",
 					Pos:     s.Pos(),
@@ -3120,9 +3120,9 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		if c.IdentityMax != nil {
 			seqMax = *c.IdentityMax
 		}
-		RegisterSequence(seqName, seqStart, seqIncrement, seqMin, seqMax, c.IdentityCycle)
+		RegisterSequence(seqName, seqStart, seqIncrement, seqMin, seqMax, c.IdentityCycle, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		if c.IdentityCache != nil {
-			SetSequenceCache(seqName, *c.IdentityCache)
+			SetSequenceCache(seqName, *c.IdentityCache, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		}
 		// Set the data type so information_schema.sequences shows the correct type
 		// AND pg_dump computes the right default min/max. The base-integer aliases
@@ -3140,9 +3140,9 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		default:
 			seqDataType = "integer"
 		}
-		SetSequenceDataType(seqName, seqDataType)
+		SetSequenceDataType(seqName, seqDataType, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		// Record implicit ownership so DROP TABLE cascades to this sequence.
-		SetSequenceOwnedBy(seqName, strings.ToLower(s.Name.Name)+"."+strings.ToLower(c.Name))
+		SetSequenceOwnedBy(seqName, strings.ToLower(s.Name.Name)+"."+strings.ToLower(c.Name), catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		// A SERIAL or IDENTITY column's backing sequence must be discoverable by
 		// pg_dump (relkind='S' in pg_class + its pg_depend row), so give it a catalog
 		// IsSequence relation just like an explicit CREATE SEQUENCE. A serial
@@ -3169,7 +3169,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		if isSerial {
 			spelling = colTypeLow
 		}
-		SetSequenceColumnMarker(seqName, spelling, identKind)
+		SetSequenceColumnMarker(seqName, spelling, identKind, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		WALLogSequenceState(o.ctx, seqName)
 	}
 
@@ -5961,9 +5961,9 @@ func (o *ddlOp) dropTableByRefImmediate(name parser.ObjectName, tbl *catalog.Tab
 	// ALTER SEQUENCE ... OWNED BY table.col, or SERIAL column defaults).
 	// Restart persistence: log a removal record for every implicit sequence
 	// the table owned, so replay does not resurrect them after the DROP TABLE.
-	for _, seqName := range DropSequencesOwnedByTable(tbl.Name) {
+	for _, seqName := range DropSequencesOwnedByTable(tbl.Name, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 		if o.ctx.WAL != nil {
-			_, _, _ = o.ctx.WAL.Append(wal.EncodeDropSequence(seqName))
+			_, _, _ = o.ctx.WAL.Append(wal.EncodeDropSequence(seqName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)))
 		}
 	}
 	// If this table was shadowing a permanent one, restore it. M0097-0003.
@@ -7006,15 +7006,16 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			}
 			oldFull := qualName(oldSchema, oldBare)
 			newFull := qualName(s.SetSchema, oldBare)
-			if RenameSequence(oldFull, newFull) || RenameSequence(oldBare, newFull) {
+			dbOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
+			if RenameSequence(oldFull, newFull, dbOid) || RenameSequence(oldBare, newFull, dbOid) {
 				if o.ctx.WAL != nil {
-					_, _, _ = o.ctx.WAL.Append(wal.EncodeDropSequence(strings.ToLower(strings.TrimSpace(oldFull))))
-					_, _, _ = o.ctx.WAL.Append(wal.EncodeDropSequence(strings.ToLower(strings.TrimSpace(oldBare))))
+					_, _, _ = o.ctx.WAL.Append(wal.EncodeDropSequence(strings.ToLower(strings.TrimSpace(oldFull)), dbOid))
+					_, _, _ = o.ctx.WAL.Append(wal.EncodeDropSequence(strings.ToLower(strings.TrimSpace(oldBare)), dbOid))
 				}
 				WALLogSequenceState(o.ctx, newFull)
 				capturedNewFull := newFull
 				tbl.VirtualRows = func() [][]string {
-					lv, lc, called, ok2 := SequenceRowData(capturedNewFull)
+					lv, lc, called, ok2 := SequenceRowData(capturedNewFull, dbOid)
 					if !ok2 {
 						return nil
 					}
@@ -7222,11 +7223,12 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			if act.Kind == parser.AlterTableRenameTable {
 				oldName := s.Name.Name
 				newName := act.NewName
-				if RenameSequence(oldName, newName) || RenameSequence("public."+oldName, newName) {
+				dbOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
+				if RenameSequence(oldName, newName, dbOid) || RenameSequence("public."+oldName, newName, dbOid) {
 					// Restart persistence: retire the old name and log the
 					// renamed sequence's state under the new one.
 					if o.ctx.WAL != nil {
-						_, _, _ = o.ctx.WAL.Append(wal.EncodeDropSequence(strings.ToLower(strings.TrimSpace(oldName))))
+						_, _, _ = o.ctx.WAL.Append(wal.EncodeDropSequence(strings.ToLower(strings.TrimSpace(oldName)), dbOid))
 					}
 					WALLogSequenceState(o.ctx, newName)
 					return nil
@@ -7880,21 +7882,22 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				}
 				oldFull := qualName(tbl.Schema, oldBare)
 				newFull := qualName(tbl.Schema, newName)
-				if !RenameSequence(oldFull, newFull) {
-					RenameSequence(oldBare, newFull)
+				seqDBOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
+				if !RenameSequence(oldFull, newFull, seqDBOid) {
+					RenameSequence(oldBare, newFull, seqDBOid)
 				}
 				// Restart persistence: retire the old name and log the renamed
 				// sequence's state under the new one (both name forms — the
 				// registry may hold either the bare or qualified key).
 				if o.ctx.WAL != nil {
-					_, _, _ = o.ctx.WAL.Append(wal.EncodeDropSequence(strings.ToLower(strings.TrimSpace(oldFull))))
-					_, _, _ = o.ctx.WAL.Append(wal.EncodeDropSequence(strings.ToLower(strings.TrimSpace(oldBare))))
+					_, _, _ = o.ctx.WAL.Append(wal.EncodeDropSequence(strings.ToLower(strings.TrimSpace(oldFull)), seqDBOid))
+					_, _, _ = o.ctx.WAL.Append(wal.EncodeDropSequence(strings.ToLower(strings.TrimSpace(oldBare)), seqDBOid))
 				}
 				WALLogSequenceState(o.ctx, newFull)
 				// Regenerate the VirtualRows closure to reference the new registry key.
 				capturedNewFull := newFull
 				tbl.VirtualRows = func() [][]string {
-					lv, lc, called, ok2 := SequenceRowData(capturedNewFull)
+					lv, lc, called, ok2 := SequenceRowData(capturedNewFull, seqDBOid)
 					if !ok2 {
 						return nil
 					}
@@ -10972,6 +10975,7 @@ func (o *ddlOp) execTruncate(s *parser.TruncateStmt) error {
 	if s.RestartIdentity {
 		sess, isBas := o.ctx.Session.(*BasicSession)
 		inExplicitTx := isBas && sess.InExplicitTransaction()
+		seqDBOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
 		for _, entry := range tableSet {
 			tbl := entry.tbl
 			for _, col := range tbl.Columns {
@@ -10990,11 +10994,11 @@ func (o *ddlOp) execTruncate(s *parser.TruncateStmt) error {
 				if seqName != "" {
 					if inExplicitTx {
 						// Save old counter so ROLLBACK can restore it.
-						if oldCurr, ok := GetSequenceCurrentValue(seqName); ok {
-							sess.RecordSeqRestore(SeqRestoreEntry{Name: seqName, OldCurr: oldCurr})
+						if oldCurr, ok := GetSequenceCurrentValue(seqName, seqDBOid); ok {
+							sess.RecordSeqRestore(SeqRestoreEntry{Name: seqName, OldCurr: oldCurr, DBOid: seqDBOid})
 						}
 					}
-					if ResetSequence(seqName) {
+					if ResetSequence(seqName, seqDBOid) {
 						// Restart persistence: the reset counter must survive a
 						// restart too. See RecordKindSequenceState.
 						WALLogSequenceState(o.ctx, seqName)
@@ -13642,7 +13646,8 @@ func isKnownSeqType(dt string) bool {
 // M0097-0009.
 func (o *ddlOp) execCreateSequence(s *parser.CreateSequenceStmt) error {
 	name := s.Name.String()
-	if LookupSequence(name) != nil && s.IfNotExists {
+	seqDBOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
+	if LookupSequence(name, seqDBOid) != nil && s.IfNotExists {
 		return nil
 	}
 	// Validate data type.
@@ -13725,20 +13730,20 @@ func (o *ddlOp) execCreateSequence(s *parser.CreateSequenceStmt) error {
 		}
 	}
 	cycle := s.Cycle
-	RegisterSequence(name, start, increment, minV, maxV, cycle)
+	RegisterSequence(name, start, increment, minV, maxV, cycle, seqDBOid)
 	if s.Cache != nil {
-		SetSequenceCache(name, *s.Cache)
+		SetSequenceCache(name, *s.Cache, seqDBOid)
 	}
 	if s.Temporary {
-		SetSequenceTemporary(name, true)
+		SetSequenceTemporary(name, true, seqDBOid)
 	}
 	dt := s.DataType
 	if dt == "" {
 		dt = "bigint"
 	}
-	SetSequenceDataType(name, dt)
+	SetSequenceDataType(name, dt, seqDBOid)
 	if s.OwnedBy != "" {
-		SetSequenceOwnedBy(name, bareOwnedByTableColumn(s.OwnedBy))
+		SetSequenceOwnedBy(name, bareOwnedByTableColumn(s.OwnedBy), seqDBOid)
 	}
 	// Create a virtual catalog table for SELECT * FROM seq_name. This also
 	// surfaces the sequence in pg_class (relkind='S') / pg_depend / pg_sequence
@@ -13783,7 +13788,7 @@ func CreateSequenceCatalogRelation(cat catalog.Catalog, seqObjName parser.Object
 	seqTbl.IsSequence = true
 	seqName := name // capture for closure
 	seqTbl.VirtualRows = func() [][]string {
-		lv, lc, called, ok2 := SequenceRowData(seqName)
+		lv, lc, called, ok2 := SequenceRowData(seqName, dbOid)
 		if !ok2 {
 			return nil
 		}
@@ -13885,7 +13890,8 @@ func (o *ddlOp) validateSeqOwnedBy(pos int, seqName, ownedBy string) error {
 // execAlterSequence handles ALTER SEQUENCE statements. M0097-0068.
 func (o *ddlOp) execAlterSequence(s *parser.AlterSequenceStmt) error {
 	name := s.Name.String()
-	seq := LookupSequence(name)
+	seqDBOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
+	seq := LookupSequence(name, seqDBOid)
 	if seq == nil {
 		if s.IfExists {
 			return nil
@@ -13989,16 +13995,16 @@ func (o *ddlOp) execAlterSequence(s *parser.AlterSequenceStmt) error {
 	}
 
 	if err := UpdateSequenceParams(name, s.Increment, minV, maxV, s.StartWith, s.RestartWith,
-		s.Cache, s.Restart, s.Cycle, s.NoCycle); err != nil {
+		s.Cache, s.Restart, s.Cycle, s.NoCycle, seqDBOid); err != nil {
 		return &ExecError{Code: "42P01", Pos: s.Pos(), Message: err.Error()}
 	}
 	if s.DataType != "" {
-		SetSequenceDataType(name, s.DataType)
+		SetSequenceDataType(name, s.DataType, seqDBOid)
 	}
 	if s.OwnedBy != "" {
-		SetSequenceOwnedBy(name, bareOwnedByTableColumn(s.OwnedBy))
+		SetSequenceOwnedBy(name, bareOwnedByTableColumn(s.OwnedBy), seqDBOid)
 	} else if s.ClearOwnedBy {
-		SetSequenceOwnedBy(name, "")
+		SetSequenceOwnedBy(name, "", seqDBOid)
 	}
 	// Restart persistence: WAL-log the post-ALTER definition + counter so the
 	// altered state survives restart. See RecordKindSequenceState.
@@ -14853,7 +14859,8 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 					)
 				}
 			}
-			if !DropSequence(name.String()) {
+			seqDBOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
+			if !DropSequence(name.String(), seqDBOid) {
 				if s.IfExists {
 					o.ctx.AddNotice(fmt.Sprintf("sequence %q does not exist, skipping", name.String()))
 					continue
@@ -14867,7 +14874,7 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 			// Restart persistence: record the removal so startup replay does
 			// not resurrect the sequence. See RecordKindDropSequence.
 			if o.ctx.WAL != nil {
-				_, _, _ = o.ctx.WAL.Append(wal.EncodeDropSequence(strings.ToLower(strings.TrimSpace(name.String()))))
+				_, _, _ = o.ctx.WAL.Append(wal.EncodeDropSequence(strings.ToLower(strings.TrimSpace(name.String())), seqDBOid))
 			}
 			// Remove the virtual catalog entry created for SELECT * FROM seq_name. M0097-0024.
 			_ = o.ctx.Catalog.DropTable(name, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
@@ -17635,15 +17642,16 @@ func (o *ddlOp) execAlterSchema(s *parser.AlterSchemaStmt) error {
 			}
 			oldFull := s.Name + "." + tbl.Name
 			newFull := s.NewName + "." + tbl.Name
-			if RenameSequence(oldFull, newFull) || RenameSequence(tbl.Name, newFull) {
+			seqDBOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
+			if RenameSequence(oldFull, newFull, seqDBOid) || RenameSequence(tbl.Name, newFull, seqDBOid) {
 				if o.ctx.WAL != nil {
-					_, _, _ = o.ctx.WAL.Append(wal.EncodeDropSequence(strings.ToLower(strings.TrimSpace(oldFull))))
-					_, _, _ = o.ctx.WAL.Append(wal.EncodeDropSequence(strings.ToLower(strings.TrimSpace(tbl.Name))))
+					_, _, _ = o.ctx.WAL.Append(wal.EncodeDropSequence(strings.ToLower(strings.TrimSpace(oldFull)), seqDBOid))
+					_, _, _ = o.ctx.WAL.Append(wal.EncodeDropSequence(strings.ToLower(strings.TrimSpace(tbl.Name)), seqDBOid))
 				}
 				WALLogSequenceState(o.ctx, newFull)
 				capturedNewFull := newFull
 				tbl.VirtualRows = func() [][]string {
-					lv, lc, called, ok2 := SequenceRowData(capturedNewFull)
+					lv, lc, called, ok2 := SequenceRowData(capturedNewFull, seqDBOid)
 					if !ok2 {
 						return nil
 					}

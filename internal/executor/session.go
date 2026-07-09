@@ -171,7 +171,8 @@ type TruncateUndoEntry struct {
 // SeqRestoreEntry records the pre-restart sequence counter for rollback.
 type SeqRestoreEntry struct {
 	Name    string
-	OldCurr int64 // seqState.current value before RESTART
+	OldCurr int64  // seqState.current value before RESTART
+	DBOid   uint32 // owning database oid (M0122-0007 4e)
 }
 
 // BasicSession is a minimal Session implementation for the v0

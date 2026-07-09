@@ -60,7 +60,7 @@ func computeGeneratedColumns(cols []catalog.Column, row Row) error {
 // covers the DEFAULT shapes pgoutput-replicated test fixtures actually use;
 // expressions evalGenExpr can't handle leave the slot unchanged so a
 // NOT NULL violation surfaces loudly rather than silently NULL-ing a row.
-func applyDefaultsForMissing(cols []catalog.Column, row Row, missing []bool) {
+func applyDefaultsForMissing(cols []catalog.Column, row Row, missing []bool, dbOid ...uint32) {
 	for i, m := range missing {
 		if !m {
 			continue
@@ -68,7 +68,7 @@ func applyDefaultsForMissing(cols []catalog.Column, row Row, missing []bool) {
 		if i >= len(cols) || cols[i].DefaultExpr == nil {
 			continue
 		}
-		val, err := evalGenExpr(cols[i].DefaultExpr, cols, row)
+		val, err := evalGenExpr(cols[i].DefaultExpr, cols, row, dbOid...)
 		if err != nil {
 			continue
 		}
@@ -98,7 +98,7 @@ func evalGeneratedExpr(exprStr string, cols []catalog.Column, row Row) (Datum, e
 // evalGenExpr is a recursive evaluator for simple expressions used in
 // generated columns.  It handles integer/string literals, column references,
 // binary arithmetic, unary negation, and casts.
-func evalGenExpr(e parser.Expr, cols []catalog.Column, row Row) (Datum, error) {
+func evalGenExpr(e parser.Expr, cols []catalog.Column, row Row, dbOid ...uint32) (Datum, error) {
 	switch x := e.(type) {
 
 	case *parser.IntegerConst:
@@ -132,21 +132,21 @@ func evalGenExpr(e parser.Expr, cols []catalog.Column, row Row) (Datum, error) {
 
 	case *parser.CastExpr:
 		// Evaluate the operand; ignore the cast type for now.
-		return evalGenExpr(x.Operand, cols, row)
+		return evalGenExpr(x.Operand, cols, row, dbOid...)
 
 	case *parser.BinaryOp:
-		left, err := evalGenExpr(x.Left, cols, row)
+		left, err := evalGenExpr(x.Left, cols, row, dbOid...)
 		if err != nil {
 			return NullDatum, err
 		}
-		right, err := evalGenExpr(x.Right, cols, row)
+		right, err := evalGenExpr(x.Right, cols, row, dbOid...)
 		if err != nil {
 			return NullDatum, err
 		}
 		return evalGenBinary(x.Op, left, right)
 
 	case *parser.UnaryOp:
-		operand, err := evalGenExpr(x.Operand, cols, row)
+		operand, err := evalGenExpr(x.Operand, cols, row, dbOid...)
 		if err != nil {
 			return NullDatum, err
 		}
@@ -158,7 +158,7 @@ func evalGenExpr(e parser.Expr, cols []catalog.Column, row Row) (Datum, error) {
 		return operand, nil
 
 	case *parser.FuncCall:
-		return evalGenFuncCall(x, cols, row)
+		return evalGenFuncCall(x, cols, row, dbOid...)
 
 	}
 
@@ -191,7 +191,7 @@ func evalGenExpr(e parser.Expr, cols []catalog.Column, row Row) (Datum, error) {
 // session-scoped and intentionally NOT touched here — DEFAULT-eval is
 // not a place where SQL-level currval/lastval should observe a side
 // effect. See docs/design/0103-0042 for the divergence rationale.
-func evalGenFuncCall(x *parser.FuncCall, cols []catalog.Column, row Row) (Datum, error) {
+func evalGenFuncCall(x *parser.FuncCall, cols []catalog.Column, row Row, dbOid ...uint32) (Datum, error) {
 	if x.Star {
 		return NullDatum, nil
 	}
@@ -212,7 +212,7 @@ func evalGenFuncCall(x *parser.FuncCall, cols []catalog.Column, row Row) (Datum,
 		return NullDatum, nil
 	}
 	if fn == "nextval" && len(x.Args) == 1 {
-		argVal, err := evalGenExpr(x.Args[0], cols, row)
+		argVal, err := evalGenExpr(x.Args[0], cols, row, dbOid...)
 		if err != nil || argVal.Kind != KindString {
 			return NullDatum, nil
 		}
@@ -220,7 +220,7 @@ func evalGenFuncCall(x *parser.FuncCall, cols []catalog.Column, row Row) (Datum,
 		if name == "" {
 			return NullDatum, nil
 		}
-		s := LookupSequence(name)
+		s := LookupSequence(name, resolveSeqDBOid(dbOid))
 		if s == nil {
 			// Mirror evalNextval's auto-create-with-defaults behaviour
 			// so apply-worker-replicated rows whose SERIAL sequence was
@@ -228,8 +228,8 @@ func evalGenFuncCall(x *parser.FuncCall, cols []catalog.Column, row Row) (Datum,
 			// subscriber) still advance deterministically. Defaults are
 			// the PG-compatible (start=1, increment=1, min=1, max=int64
 			// max, cycle=false).
-			RegisterSequence(name, 1, 1, 1, 9223372036854775807, false)
-			s = LookupSequence(name)
+			RegisterSequence(name, 1, 1, 1, 9223372036854775807, false, resolveSeqDBOid(dbOid))
+			s = LookupSequence(name, resolveSeqDBOid(dbOid))
 		}
 		v, err := s.nextVal()
 		if err != nil {

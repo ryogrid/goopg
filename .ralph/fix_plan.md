@@ -6469,6 +6469,73 @@ mirroring M0119's ledger `status` column.
       pre-existing flaky failed transaction unrelated to this change,
       confirmed by a clean second run with 0 failures across all 3
       workloads).
+  - [x] `M0122-0007` follow-up 20 (2026-07-10, this loop) — **closed 4e's
+      sequence-ownership item, its largest remaining structural gap.**
+      `internal/executor/operators_sequence.go`'s `seqRegistry` was a
+      process-global `sync.Map` keyed only by bare sequence name with zero
+      dbOid concept, so two same-named tables' implicit SERIAL sequences in
+      distinct databases silently shared (and raced on) one counter, and
+      `DROP TABLE` in one database could cascade-drop a same-named table's
+      sequence in another. Fixed by namespacing `seqKey` itself
+      (`"<dbOid>:<name>"`, `seqState` gained an immutable `dbOid` field) and
+      threading a trailing `dbOid ...uint32` (new `resolveSeqDBOid` helper,
+      mirroring `catalog.resolveDBOid`) through all ~18 public entry points
+      and their ~45 call sites across `operators_ddl.go` (CREATE/ALTER/
+      DROP/RENAME SEQUENCE, implicit SERIAL registration, DROP TABLE's
+      owned-sequence cascade, TRUNCATE RESTART IDENTITY, ALTER TABLE/SCHEMA
+      rename cascades), `operators_tx.go` (`SeqRestoreEntry` gained a
+      `DBOid` field for RESTART IDENTITY rollback), `expr.go`
+      (`pg_get_serial_sequence`, `currtid2`), and `operators_sequence.go`'s
+      own `evalNextval`/`evalCurrval`/`evalSetval`/`evalLastval`/
+      `autoGenerateSerialValues` (new `ctxSeqDBOid(ctx)` helper). Also
+      threaded the `DEFAULT nextval(...)` expression-evaluator path
+      (`operators_generated.go`'s `evalGenExpr`/`evalGenFuncCall`/
+      `applyDefaultsForMissing` — distinct from `autoGenerateSerialValues`'s
+      SERIAL/IDENTITY path) from its 3 real call sites
+      (`applyworker.go`'s `applyInsert` via a new `ApplyWorker.dbOid()`
+      helper reading `w.cat`'s `SearchPathCatalog.DBOid`,
+      `operators_storage.go`, `operators_upsert.go`);
+      `computeGeneratedColumns`'s ~14 call sites were deliberately left
+      zero-arg since a `GENERATED ALWAYS AS (...) STORED` expression must
+      be IMMUTABLE in PostgreSQL and can never legally contain `nextval()`.
+      `wal.SequenceStatePayload` gained a trailing-appended `DBOid` field
+      and `EncodeDropSequence`/`DecodeDropSequence` gained a trailing
+      4-byte dbOid, both following the `EncodeCreateSubscription`
+      backward-compatible-trailer pattern (a pre-4e WAL record with no
+      trailer decodes as dbOid 0 → DefaultDBOid via `NamespaceDBOid`).
+      `internal/initdb/sequence_ddl_recovery.go`'s replay dedup map was
+      re-keyed from bare name to `"<dbOid>:<name>"` for the same collision
+      reason. New tests `TestSerialSequenceDoesNotAliasAcrossDistinctDBOid`,
+      `TestDropTableDoesNotCascadeSequenceAcrossDistinctDBOid`
+      (`internal/executor/sequence_dbid_routing_test.go`), each confirmed
+      to fail against a revert of just `seqKey`'s dbOid component (a
+      same-signature neutered `seqKey` that folds the dbOid argument to a
+      no-op — isolates the key-scheme fix from the ~45 mechanically-inert
+      call-site threading). **Deliberately still DefaultDBOid-only
+      (separate, pre-existing gap, deferral ledger row appended):** the
+      `pg_sequence`/`pg_sequences` virtual-row builders have no
+      per-connection context to draw a dbOid from at all (their
+      `VirtualRows func() [][]string` closures take zero args) — the same
+      unsolved "per-connection virtual catalog scoping" mechanism other
+      virtual tables already have. Design doc
+      (`docs/design/0122-0018-per-database-catalog-namespace.md`) 4e
+      section and status line updated; `docs/design/README.md` row
+      extended; deferral ledger rows appended (one `resolved`, one `-` for
+      the virtual-row follow-on). **Remaining M0122-0007 work:** 4e's only
+      remaining item is view constraint-dependency tracking
+      (`catalog.InMemory.constraintViewDeps`'s bare unqualified-name
+      values), then the `CREATE DATABASE ... TEMPLATE` copy mechanism
+      itself. Gates: `go build ./...`/`go vet ./...` clean; `go test -race
+      ./internal/executor/... ./internal/wal/...` PASS; `go test -short
+      $(go list ./... | grep -v /internal/testport)` (full repo, short
+      mode) PASS; `go test ./internal/initdb/...` PASS (259s, non-race —
+      `-race` alone on this package hit the pre-documented ~10min co-load
+      timeout, unrelated to this change, see
+      `goopg_nightly_ci_batch`/`ci/design/07-ralph-feedback.md`); `go test
+      -v -run TestPort_SerialSequenceSurvivesRestart ./internal/testport/`
+      PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed transactions, all 3 pgbench workloads).
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,

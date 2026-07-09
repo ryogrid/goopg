@@ -210,7 +210,7 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 		for _, tgtIdx := range o.plan.ColumnIndex {
 			upsertMissing[tgtIdx] = false
 		}
-		applyDefaultsForMissing(parentCols, inserted, upsertMissing)
+		applyDefaultsForMissing(parentCols, inserted, upsertMissing, ctxSeqDBOid(o.ctx))
 		autoGenerateSerialValues(o.ctx, o.plan.Table.Name, parentCols, inserted, upsertMissing)
 		// Clear the speculative-insert index-key cache so a later source row
 		// that conflicts directly (no speculative insert) cannot wrongly reuse

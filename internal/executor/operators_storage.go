@@ -1889,7 +1889,7 @@ func (o *insertOp) Next() (TupleSlot, error) {
 		// runs, mirroring upstream ExecInitStoredGenerated/ExecComputeStoredGenerated
 		// ordering. The same helper rung 13 uses on the apply path applies
 		// here: missing[i]=true for every column NOT in plan.ColumnIndex.
-		applyDefaultsForMissing(cols, row, insertMissing)
+		applyDefaultsForMissing(cols, row, insertMissing, ctxSeqDBOid(o.ctx))
 
 		// Auto-generate values for SERIAL / BIGSERIAL / SMALLSERIAL columns
 		// and GENERATED [ALWAYS|BY DEFAULT] AS IDENTITY columns.

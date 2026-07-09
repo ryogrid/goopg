@@ -52,9 +52,14 @@ func replaySequenceDDLRecords(walDir string, cat catalog.Catalog) error {
 		return fmt.Errorf("read wal: %w", err)
 	}
 
-	// live tracks the latest surviving state per sequence key so the
-	// catalog-marker fixups below run once per sequence, not per record.
+	// live tracks the latest surviving state per (dbOid, sequence key) so the
+	// catalog-marker fixups below run once per sequence, not per record, and
+	// two distinct databases' same-named sequences don't alias onto one entry
+	// (M0122-0007 4e).
 	live := map[string]wal.SequenceStatePayload{}
+	liveKey := func(dbOid uint32, name string) string {
+		return fmt.Sprintf("%d:%s", catalog.NamespaceDBOid(dbOid), strings.ToLower(name))
+	}
 
 	for _, rec := range records {
 		if len(rec.Payload) == 0 {
@@ -67,14 +72,14 @@ func replaySequenceDDLRecords(walDir string, cat catalog.Catalog) error {
 				return fmt.Errorf("decode sequence-state at lsn %d: %w", rec.StartLSN, derr)
 			}
 			executor.RestoreSequenceFromWAL(p)
-			live[strings.ToLower(p.Name)] = p
+			live[liveKey(p.DBOid, p.Name)] = p
 		case wal.RecordKindDropSequence:
-			name, derr := wal.DecodeDropSequence(rec.Payload)
+			name, dropDBOid, derr := wal.DecodeDropSequence(rec.Payload)
 			if derr != nil {
 				return fmt.Errorf("decode drop-sequence at lsn %d: %w", rec.StartLSN, derr)
 			}
-			executor.DropSequence(name)
-			delete(live, strings.ToLower(name))
+			executor.DropSequence(name, catalog.NamespaceDBOid(dropDBOid))
+			delete(live, liveKey(dropDBOid, name))
 		}
 	}
 
@@ -82,11 +87,12 @@ func replaySequenceDDLRecords(walDir string, cat catalog.Catalog) error {
 	// serial spelling / identity markers and re-create the virtual sequence
 	// relation (SELECT * FROM seq / pg_class relkind='S' discoverability).
 	for _, p := range live {
+		dbOid := catalog.NamespaceDBOid(p.DBOid)
 		seqObjName := parser.ObjectName{Name: p.Name}
 		if i := strings.LastIndex(p.Name, "."); i >= 0 {
 			seqObjName = parser.ObjectName{Schema: p.Name[:i], Name: p.Name[i+1:]}
 		}
-		executor.CreateSequenceCatalogRelation(cat, seqObjName, p.Name, catalog.DefaultDBOid)
+		executor.CreateSequenceCatalogRelation(cat, seqObjName, p.Name, dbOid)
 
 		if p.OwnedBy == "" || (p.ColSpelling == "" && p.IdentityKind == 0) {
 			continue
@@ -101,7 +107,7 @@ func replaySequenceDDLRecords(walDir string, cat catalog.Catalog) error {
 		if i := strings.LastIndex(tblName, "."); i >= 0 {
 			tblObjName = parser.ObjectName{Schema: tblName[:i], Name: tblName[i+1:]}
 		}
-		tbl, ok := cat.LookupTable(tblObjName)
+		tbl, ok := cat.LookupTable(tblObjName, dbOid)
 		if !ok || tbl == nil {
 			continue // table dropped (its drop-sequence record normally covers this)
 		}

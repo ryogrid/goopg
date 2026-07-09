@@ -38,6 +38,7 @@ type seqState struct {
 	seqName   string      // bare sequence name (no schema prefix)
 	dataType  string      // "smallint", "integer", or "bigint" (default)
 	temporary bool        // true for TEMPORARY sequences (allowed in READ ONLY txns)
+	dbOid     uint32      // owning database oid (M0122-0007 4e); immutable after creation
 	mu        sync.Mutex  // serialises nextval
 
 	// Restart persistence (RecordKindSequenceState — see wal/recovery.go).
@@ -87,17 +88,33 @@ func (s *seqState) nextVal() (int64, error) {
 	return next, nil
 }
 
-// seqRegistry is the process-global sequence store.
+// seqRegistry is the process-global sequence store, namespaced by dbOid
+// (M0122-0007 4e) — the key is "<dbOid>:<normalised name>" so that two
+// distinct databases can each have their own same-named sequence without
+// aliasing onto one shared counter.
 var seqRegistry sync.Map // map[string]*seqState
 
-// seqKey normalises a sequence name to a registry key.
-func seqKey(name string) string {
-	return strings.ToLower(strings.TrimSpace(name))
+// seqKey normalises a sequence name and dbOid to a registry key.
+func seqKey(name string, dbOid uint32) string {
+	return fmt.Sprintf("%d:%s", dbOid, strings.ToLower(strings.TrimSpace(name)))
+}
+
+// resolveSeqDBOid returns the target dbOid for a seqRegistry entry point: the
+// first element of dbOid if the caller supplied one, else DefaultDBOid —
+// mirrors catalog.resolveDBOid's trailing-variadic convention (M0122-0007
+// slice 4b-ii) so every pre-4e call site (which passes none) keeps resolving
+// to exactly the DefaultDBOid it implicitly used before this namespacing.
+func resolveSeqDBOid(dbOid []uint32) uint32 {
+	if len(dbOid) > 0 {
+		return dbOid[0]
+	}
+	return catalog.DefaultDBOid
 }
 
 // RegisterSequence creates or replaces a sequence in the registry.
 // Called by CREATE SEQUENCE and by SERIAL column initialisation.
-func RegisterSequence(name string, start, increment, min, max int64, cycle bool) {
+func RegisterSequence(name string, start, increment, min, max int64, cycle bool, dbOid ...uint32) {
+	oid := resolveSeqDBOid(dbOid)
 	schema, bare := splitSeqName(strings.ToLower(strings.TrimSpace(name)))
 	s := &seqState{
 		start:     start,
@@ -109,16 +126,17 @@ func RegisterSequence(name string, start, increment, min, max int64, cycle bool)
 		schema:    schema,
 		seqName:   bare,
 		dataType:  "bigint",
+		dbOid:     oid,
 	}
 	// current starts at start-increment so that the first nextval returns start.
 	s.current.Store(start - increment)
-	seqRegistry.Store(seqKey(name), s)
+	seqRegistry.Store(seqKey(name, oid), s)
 }
 
 // SetSequenceDataType records the declared data type of a sequence (e.g. from
 // CREATE SEQUENCE ... AS smallint). M0097-0068.
-func SetSequenceDataType(name, dataType string) {
-	v, ok := seqRegistry.Load(seqKey(name))
+func SetSequenceDataType(name, dataType string, dbOid ...uint32) {
+	v, ok := seqRegistry.Load(seqKey(name, resolveSeqDBOid(dbOid)))
 	if !ok {
 		return
 	}
@@ -131,8 +149,8 @@ func SetSequenceDataType(name, dataType string) {
 // SetSequenceCache records the declared CACHE size of a sequence (e.g. from
 // CREATE/ALTER SEQUENCE ... CACHE n). Values < 1 are clamped to 1, matching PG's
 // minimum. DU-002 slice 130.
-func SetSequenceCache(name string, cache int64) {
-	v, ok := seqRegistry.Load(seqKey(name))
+func SetSequenceCache(name string, cache int64, dbOid ...uint32) {
+	v, ok := seqRegistry.Load(seqKey(name, resolveSeqDBOid(dbOid)))
 	if !ok {
 		return
 	}
@@ -147,8 +165,8 @@ func SetSequenceCache(name string, cache int64) {
 
 // SetSequenceTemporary marks a sequence as temporary (allowed in READ ONLY txns).
 // M0097-0024.
-func SetSequenceTemporary(name string, tmp bool) {
-	v, ok := seqRegistry.Load(seqKey(name))
+func SetSequenceTemporary(name string, tmp bool, dbOid ...uint32) {
+	v, ok := seqRegistry.Load(seqKey(name, resolveSeqDBOid(dbOid)))
 	if !ok {
 		return
 	}
@@ -159,8 +177,8 @@ func SetSequenceTemporary(name string, tmp bool) {
 }
 
 // IsSequenceTemporary returns true if the named sequence is temporary.
-func IsSequenceTemporary(name string) bool {
-	v, ok := seqRegistry.Load(seqKey(name))
+func IsSequenceTemporary(name string, dbOid ...uint32) bool {
+	v, ok := seqRegistry.Load(seqKey(name, resolveSeqDBOid(dbOid)))
 	if !ok {
 		return false
 	}
@@ -183,22 +201,23 @@ func splitSeqName(name string) (schema, bare string) {
 // LookupSequence returns the seqState for name, or nil if not found.
 // Tries both the bare name and the "public.<name>" qualified form to handle
 // sequences registered with or without schema prefix.
-func LookupSequence(name string) *seqState {
-	k := seqKey(name)
-	if v, ok := seqRegistry.Load(k); ok {
+func LookupSequence(name string, dbOid ...uint32) *seqState {
+	oid := resolveSeqDBOid(dbOid)
+	nameKey := strings.ToLower(strings.TrimSpace(name))
+	if v, ok := seqRegistry.Load(seqKey(nameKey, oid)); ok {
 		return v.(*seqState)
 	}
 	// Try "public.<bare>" if input has no schema, or bare if input has "public." prefix.
-	if strings.Contains(k, ".") {
+	if strings.Contains(nameKey, ".") {
 		// Strip schema prefix and retry with bare name.
-		if _, bare, ok2 := strings.Cut(k, "."); ok2 {
-			if v, ok := seqRegistry.Load(bare); ok {
+		if _, bare, ok2 := strings.Cut(nameKey, "."); ok2 {
+			if v, ok := seqRegistry.Load(seqKey(bare, oid)); ok {
 				return v.(*seqState)
 			}
 		}
 	} else {
 		// Try with "public." prefix.
-		if v, ok := seqRegistry.Load("public." + k); ok {
+		if v, ok := seqRegistry.Load(seqKey("public."+nameKey, oid)); ok {
 			return v.(*seqState)
 		}
 	}
@@ -206,16 +225,17 @@ func LookupSequence(name string) *seqState {
 }
 
 // DropSequence removes a sequence from the registry. M0097-0038.
-func DropSequence(name string) bool {
-	_, loaded := seqRegistry.LoadAndDelete(seqKey(name))
+func DropSequence(name string, dbOid ...uint32) bool {
+	_, loaded := seqRegistry.LoadAndDelete(seqKey(name, resolveSeqDBOid(dbOid)))
 	return loaded
 }
 
 // RenameSequence moves a sequence from oldName to newName in the registry.
 // Updates the internal schema/seqName fields. Returns false if oldName is not found.
 // M0097-0024.
-func RenameSequence(oldName, newName string) bool {
-	v, loaded := seqRegistry.LoadAndDelete(seqKey(oldName))
+func RenameSequence(oldName, newName string, dbOid ...uint32) bool {
+	oid := resolveSeqDBOid(dbOid)
+	v, loaded := seqRegistry.LoadAndDelete(seqKey(oldName, oid))
 	if !loaded {
 		return false
 	}
@@ -225,7 +245,7 @@ func RenameSequence(oldName, newName string) bool {
 	s.schema = schema
 	s.seqName = bare
 	s.mu.Unlock()
-	seqRegistry.Store(seqKey(newName), s)
+	seqRegistry.Store(seqKey(newName, oid), s)
 	return true
 }
 
@@ -236,8 +256,8 @@ func RenameSequence(oldName, newName string) bool {
 // reads from the sequence relation.
 // logCnt is 32 when called (mirrors PG's write-ahead log cache size), 0 otherwise.
 // Returns ok=false if the sequence does not exist. M0097-0024.
-func SequenceRowData(name string) (lastValue int64, logCnt int64, isCalled bool, ok bool) {
-	v, exists := seqRegistry.Load(seqKey(name))
+func SequenceRowData(name string, dbOid ...uint32) (lastValue int64, logCnt int64, isCalled bool, ok bool) {
+	v, exists := seqRegistry.Load(seqKey(name, resolveSeqDBOid(dbOid)))
 	if !exists {
 		return 0, 0, false, false
 	}
@@ -265,8 +285,8 @@ func SequenceRowData(name string) (lastValue int64, logCnt int64, isCalled bool,
 }
 
 // SequenceOwnedBy returns the "table.column" owner string for a sequence (empty if unowned).
-func SequenceOwnedBy(name string) string {
-	v, ok := seqRegistry.Load(seqKey(name))
+func SequenceOwnedBy(name string, dbOid ...uint32) string {
+	v, ok := seqRegistry.Load(seqKey(name, resolveSeqDBOid(dbOid)))
 	if !ok {
 		return ""
 	}
@@ -276,13 +296,18 @@ func SequenceOwnedBy(name string) string {
 	return s.ownedBy
 }
 
-// FindSequenceOwnedBy searches seqRegistry for a sequence whose ownedBy field
-// matches owner ("table.column"). Returns the sequence name, or "" if not found.
-func FindSequenceOwnedBy(owner string) string {
+// FindSequenceOwnedBy searches seqRegistry for a sequence in dbOid's database
+// whose ownedBy field matches owner ("table.column"). Returns the sequence
+// name, or "" if not found.
+func FindSequenceOwnedBy(owner string, dbOid ...uint32) string {
+	oid := resolveSeqDBOid(dbOid)
 	owner = strings.ToLower(owner)
 	var found string
 	seqRegistry.Range(func(k, v any) bool {
 		s := v.(*seqState)
+		if s.dbOid != oid {
+			return true
+		}
 		s.mu.Lock()
 		ob := s.ownedBy
 		nm := s.seqName
@@ -298,8 +323,8 @@ func FindSequenceOwnedBy(owner string) string {
 
 // SetSequenceOwnedBy records that the sequence with the given name is owned by
 // "table.column" (as produced by ALTER SEQUENCE ... OWNED BY). Pass "" to clear.
-func SetSequenceOwnedBy(name, owner string) {
-	v, ok := seqRegistry.Load(seqKey(name))
+func SetSequenceOwnedBy(name, owner string, dbOid ...uint32) {
+	v, ok := seqRegistry.Load(seqKey(name, resolveSeqDBOid(dbOid)))
 	if !ok {
 		return
 	}
@@ -309,19 +334,25 @@ func SetSequenceOwnedBy(name, owner string) {
 	s.mu.Unlock()
 }
 
-// DropSequencesOwnedByTable drops all sequences whose ownedBy field starts with
-// "tableName." (case-insensitive). Called by DROP TABLE to cascade-drop owned sequences.
-func DropSequencesOwnedByTable(tableName string) []string {
+// DropSequencesOwnedByTable drops all sequences in dbOid's database whose
+// ownedBy field starts with "tableName." (case-insensitive). Called by DROP
+// TABLE to cascade-drop owned sequences.
+func DropSequencesOwnedByTable(tableName string, dbOid ...uint32) []string {
+	oid := resolveSeqDBOid(dbOid)
 	prefix := strings.ToLower(tableName) + "."
+	oidPrefix := fmt.Sprintf("%d:", oid)
 	var dropped []string
 	seqRegistry.Range(func(k, v any) bool {
 		s := v.(*seqState)
+		if s.dbOid != oid {
+			return true
+		}
 		s.mu.Lock()
 		owned := s.ownedBy
 		s.mu.Unlock()
 		if strings.HasPrefix(owned, prefix) {
 			seqRegistry.Delete(k)
-			dropped = append(dropped, k.(string))
+			dropped = append(dropped, strings.TrimPrefix(k.(string), oidPrefix))
 		}
 		return true
 	})
@@ -330,8 +361,8 @@ func DropSequencesOwnedByTable(tableName string) []string {
 
 // ResetSequence resets a sequence to its start value (equivalent to TRUNCATE ... RESTART IDENTITY).
 // Returns false if the sequence does not exist.
-func ResetSequence(name string) bool {
-	v, ok := seqRegistry.Load(seqKey(name))
+func ResetSequence(name string, dbOid ...uint32) bool {
+	v, ok := seqRegistry.Load(seqKey(name, resolveSeqDBOid(dbOid)))
 	if !ok {
 		return false
 	}
@@ -344,8 +375,8 @@ func ResetSequence(name string) bool {
 
 // GetSequenceCurrentValue returns the raw internal current counter of the sequence.
 // The next nextval() call will return current+increment. Returns (0, false) if not found.
-func GetSequenceCurrentValue(name string) (int64, bool) {
-	v, ok := seqRegistry.Load(seqKey(name))
+func GetSequenceCurrentValue(name string, dbOid ...uint32) (int64, bool) {
+	v, ok := seqRegistry.Load(seqKey(name, resolveSeqDBOid(dbOid)))
 	if !ok {
 		return 0, false
 	}
@@ -367,8 +398,8 @@ func GetSequenceCurrentValue(name string) (int64, bool) {
 // The marker rides the sequence's WAL state record so startup replay can
 // restore the owning column's catalog markers, which the INSERT
 // auto-increment path keys on.
-func SetSequenceColumnMarker(name, spelling string, identityKind byte) {
-	v, ok := seqRegistry.Load(seqKey(name))
+func SetSequenceColumnMarker(name, spelling string, identityKind byte, dbOid ...uint32) {
+	v, ok := seqRegistry.Load(seqKey(name, resolveSeqDBOid(dbOid)))
 	if !ok {
 		return
 	}
@@ -400,6 +431,7 @@ func (s *seqState) payloadLocked(current int64, called bool) wal.SequenceStatePa
 		OwnedBy:      s.ownedBy,
 		ColSpelling:  s.colSpelling,
 		IdentityKind: s.identityKind,
+		DBOid:        s.dbOid,
 	}
 }
 
@@ -412,7 +444,7 @@ func WALLogSequenceState(ctx *Context, name string) {
 	if ctx == nil || ctx.WAL == nil {
 		return
 	}
-	s := LookupSequence(name)
+	s := LookupSequence(name, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid))
 	if s == nil {
 		return
 	}
@@ -489,8 +521,8 @@ func autoGenerateSerialValues(ctx *Context, tableName string, cols []catalog.Col
 		case "serial", "serial4", "bigserial", "serial8", "smallserial", "serial2":
 			seqName = strings.ToLower(tableName) + "_" + strings.ToLower(col.Name) + "_seq"
 			// If the standard tablename_colname_seq was renamed, look up by ownership.
-			if LookupSequence(seqName) == nil {
-				if owned := FindSequenceOwnedBy(strings.ToLower(tableName) + "." + strings.ToLower(col.Name)); owned != "" {
+			if LookupSequence(seqName, ctxSeqDBOid(ctx)) == nil {
+				if owned := FindSequenceOwnedBy(strings.ToLower(tableName)+"."+strings.ToLower(col.Name), ctxSeqDBOid(ctx)); owned != "" {
 					seqName = owned
 				}
 			}
@@ -514,18 +546,19 @@ func autoGenerateSerialValues(ctx *Context, tableName string, cols []catalog.Col
 // restored exactly as logged: Current is the pre-logged horizon for records
 // emitted by nextval, or the exact value for create/alter/setval snapshots.
 func RestoreSequenceFromWAL(p wal.SequenceStatePayload) {
-	RegisterSequence(p.Name, p.Start, p.Increment, p.Min, p.Max, p.Cycle)
+	dbOid := catalog.NamespaceDBOid(p.DBOid)
+	RegisterSequence(p.Name, p.Start, p.Increment, p.Min, p.Max, p.Cycle, dbOid)
 	if p.Cache > 1 {
-		SetSequenceCache(p.Name, p.Cache)
+		SetSequenceCache(p.Name, p.Cache, dbOid)
 	}
 	if p.DataType != "" {
-		SetSequenceDataType(p.Name, p.DataType)
+		SetSequenceDataType(p.Name, p.DataType, dbOid)
 	}
 	if p.OwnedBy != "" {
-		SetSequenceOwnedBy(p.Name, p.OwnedBy)
+		SetSequenceOwnedBy(p.Name, p.OwnedBy, dbOid)
 	}
-	SetSequenceColumnMarker(p.Name, p.ColSpelling, p.IdentityKind)
-	s := LookupSequence(p.Name)
+	SetSequenceColumnMarker(p.Name, p.ColSpelling, p.IdentityKind, dbOid)
+	s := LookupSequence(p.Name, dbOid)
 	if s == nil {
 		return
 	}
@@ -538,8 +571,8 @@ func RestoreSequenceFromWAL(p wal.SequenceStatePayload) {
 }
 
 // SetSequenceCurrentValue directly sets the internal counter (used for ROLLBACK of RESTART IDENTITY).
-func SetSequenceCurrentValue(name string, val int64) bool {
-	v, ok := seqRegistry.Load(seqKey(name))
+func SetSequenceCurrentValue(name string, val int64, dbOid ...uint32) bool {
+	v, ok := seqRegistry.Load(seqKey(name, resolveSeqDBOid(dbOid)))
 	if !ok {
 		return false
 	}
@@ -565,6 +598,16 @@ func seqNameFromDatum(d Datum, ctx *Context) string {
 	return d.StringValue()
 }
 
+// ctxSeqDBOid resolves the seqRegistry dbOid for a Context, defaulting to
+// DefaultDBOid when ctx is nil (e.g. a test calling an eval* function
+// directly with no session).
+func ctxSeqDBOid(ctx *Context) uint32 {
+	if ctx == nil {
+		return catalog.DefaultDBOid
+	}
+	return catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)
+}
+
 func evalNextval(args []Datum, ctx *Context) (Datum, error) {
 	if len(args) == 0 {
 		return NullDatum, nil
@@ -573,11 +616,12 @@ func evalNextval(args []Datum, ctx *Context) (Datum, error) {
 		return NullDatum, nil
 	}
 	name := seqNameFromDatum(args[0], ctx)
+	dbOid := ctxSeqDBOid(ctx)
 	// Read-only transaction guard: non-temp sequences cannot be advanced.
-	if ctx != nil && ctx.Session != nil && ctx.Session.IsReadOnlyTxn() && !IsSequenceTemporary(name) {
+	if ctx != nil && ctx.Session != nil && ctx.Session.IsReadOnlyTxn() && !IsSequenceTemporary(name, dbOid) {
 		return Datum{}, &ExecError{Code: "25006", Message: "cannot execute nextval() in a read-only transaction"}
 	}
-	s := LookupSequence(name)
+	s := LookupSequence(name, dbOid)
 	if s == nil {
 		return Datum{}, &ExecError{Code: "42P01", Message: fmt.Sprintf("relation %q does not exist", name)}
 	}
@@ -590,7 +634,7 @@ func evalNextval(args []Datum, ctx *Context) (Datum, error) {
 		if i := strings.LastIndex(name, "."); i >= 0 {
 			on = parser.ObjectName{Schema: name[:i], Name: name[i+1:]}
 		}
-		if tbl, ok := ctx.Catalog.LookupTable(on); ok {
+		if tbl, ok := ctx.Catalog.LookupTable(on, dbOid); ok {
 			if err := ctx.acquireSequenceLockTxn(ctx.Catalog.RelFileNode(tbl)); err != nil {
 				return Datum{}, err
 			}
@@ -608,7 +652,7 @@ func evalNextval(args []Datum, ctx *Context) (Datum, error) {
 		if ctx.CurrSeqVals == nil {
 			ctx.CurrSeqVals = make(map[string]int64)
 		}
-		ctx.CurrSeqVals[seqKey(name)] = v
+		ctx.CurrSeqVals[seqKey(name, dbOid)] = v
 		ctx.LastSeqVal = v
 		ctx.LastSeqSet = true
 		ctx.LastSeqName = name
@@ -630,7 +674,7 @@ func evalCurrval(args []Datum, ctx *Context) (Datum, error) {
 	if ctx == nil || ctx.CurrSeqVals == nil {
 		return Datum{}, &ExecError{Code: "55000", Message: fmt.Sprintf("currval of sequence %q is not yet defined in this session", name)}
 	}
-	v, ok := ctx.CurrSeqVals[seqKey(name)]
+	v, ok := ctx.CurrSeqVals[seqKey(name, ctxSeqDBOid(ctx))]
 	if !ok {
 		return Datum{}, &ExecError{Code: "55000", Message: fmt.Sprintf("currval of sequence %q is not yet defined in this session", name)}
 	}
@@ -648,8 +692,9 @@ func evalSetval(args []Datum, ctx *Context) (Datum, error) {
 		return NullDatum, nil
 	}
 	name := seqNameFromDatum(args[0], ctx)
+	dbOid := ctxSeqDBOid(ctx)
 	// Read-only transaction guard: non-temp sequences cannot be set.
-	if ctx != nil && ctx.Session != nil && ctx.Session.IsReadOnlyTxn() && !IsSequenceTemporary(name) {
+	if ctx != nil && ctx.Session != nil && ctx.Session.IsReadOnlyTxn() && !IsSequenceTemporary(name, dbOid) {
 		return Datum{}, &ExecError{Code: "25006", Message: "cannot execute setval() in a read-only transaction"}
 	}
 	value := args[1].Int
@@ -658,10 +703,10 @@ func evalSetval(args []Datum, ctx *Context) (Datum, error) {
 		isCalled = args[2].BoolValue()
 	}
 
-	s := LookupSequence(name)
+	s := LookupSequence(name, dbOid)
 	if s == nil {
-		RegisterSequence(name, 1, 1, 1, 9223372036854775807, false)
-		s = LookupSequence(name)
+		RegisterSequence(name, 1, 1, 1, 9223372036854775807, false, dbOid)
+		s = LookupSequence(name, dbOid)
 	}
 	// Validate value is within sequence bounds.
 	s.mu.Lock()
@@ -688,7 +733,7 @@ func evalSetval(args []Datum, ctx *Context) (Datum, error) {
 		if ctx.CurrSeqVals == nil {
 			ctx.CurrSeqVals = make(map[string]int64)
 		}
-		ctx.CurrSeqVals[seqKey(name)] = value
+		ctx.CurrSeqVals[seqKey(name, dbOid)] = value
 		ctx.LastSeqVal = value
 		ctx.LastSeqSet = true
 		ctx.LastSeqName = name
@@ -703,7 +748,7 @@ func evalLastval(ctx *Context) (Datum, error) {
 		return Datum{}, &ExecError{Code: "55000", Message: "lastval is not yet defined in this session"}
 	}
 	// If the last-used sequence was dropped, lastval() must error.
-	if ctx.LastSeqName != "" && LookupSequence(ctx.LastSeqName) == nil {
+	if ctx.LastSeqName != "" && LookupSequence(ctx.LastSeqName, ctxSeqDBOid(ctx)) == nil {
 		ctx.LastSeqSet = false
 		return Datum{}, &ExecError{Code: "55000", Message: "lastval is not yet defined in this session"}
 	}
@@ -715,8 +760,8 @@ func evalLastval(ctx *Context) (Datum, error) {
 // to start-increment (honoring newStart if also supplied). restartWith, if not
 // nil, overrides the restart target. M0097-0068.
 func UpdateSequenceParams(name string, increment, minVal, maxVal, startWith, restartWith, cache *int64,
-	restart, cycle, noCycle bool) error {
-	s := LookupSequence(name)
+	restart, cycle, noCycle bool, dbOid ...uint32) error {
+	s := LookupSequence(name, resolveSeqDBOid(dbOid))
 	if s == nil {
 		return fmt.Errorf("sequence %q does not exist", name)
 	}
@@ -774,10 +819,14 @@ type SeqInfo struct {
 
 // AllSequenceInfos returns a snapshot of all registered sequences.
 // Called by the pg_sequences virtual table VirtualRows callback.
-func AllSequenceInfos() []SeqInfo {
+func AllSequenceInfos(dbOid ...uint32) []SeqInfo {
+	oid := resolveSeqDBOid(dbOid)
 	var out []SeqInfo
 	seqRegistry.Range(func(_, v any) bool {
 		s := v.(*seqState)
+		if s.dbOid != oid {
+			return true
+		}
 		s.mu.Lock()
 		dt := s.dataType
 		if dt == "" {
