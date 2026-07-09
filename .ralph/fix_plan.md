@@ -6536,6 +6536,61 @@ mirroring M0119's ledger `status` column.
       PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
       `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
       failed transactions, all 3 pgbench workloads).
+  - [x] `M0122-0007` follow-up 21 (2026-07-10, this loop) — **closed 4e's
+      last remaining dependent-object-walk item: view constraint-dependency
+      tracking.** `internal/catalog/catalog.go`'s `constraintViewDeps
+      map[string][]string` was keyed `"tableOID:constraintName"` (already
+      dbOid-safe — `nextOID` is a single cluster-wide counter, and a view
+      can only reference tables in its own database) but stored **bare,
+      unqualified view names** as values. Its own
+      `UnregisterViewConstraintDeps` (called by `execDropOneView` on every
+      `DROP VIEW`) matched and removed entries by bare name **across every
+      key in the whole map** — so `DROP VIEW v` in database A silently
+      erased a same-named, unrelated view `v`'s dependency entry in
+      database B, defeating that other database's `DROP CONSTRAINT
+      RESTRICT` protection. A concrete cross-database data-corruption path,
+      not merely a lookup miss — this was live-documented in the design doc
+      as 4e's last open item, not newly discovered this loop. Fixed by
+      qualifying the stored value itself: `RegisterViewConstraintDep`/
+      `UnregisterViewConstraintDeps` gained the standard trailing `dbOid
+      ...uint32` parameter (`resolveDBOid`), storing/matching
+      `"<dbOid>:<viewName>"` instead of the bare name.
+      `ViewsDependingOnConstraint` (the RESTRICT-check read path) needed no
+      signature change but now strips the `dbOid:` prefix before returning,
+      since RESTRICT-error callers only need the bare name. The two
+      `internal/executor/operators_ddl.go` call sites (`execCreateView`'s
+      registration, `execDropOneView`'s cleanup) now pass
+      `catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)`. New test
+      `TestDropViewDoesNotEraseConstraintDepAcrossDistinctDBOid`
+      (`internal/executor/ddl_write_dbid_routing_test.go`) creates a
+      same-named view `v` under two distinct connection dbOids, drops one,
+      and asserts the other's entry survives — confirmed to fail (deps
+      erased to `[]`) against a scratch-copy revert of just the
+      value-qualification (a neutered qualifier folding dbOid to a
+      constant), isolating the key-scheme fix from the two
+      mechanically-inert call-site threads. Existing
+      `TestViewConstraintDepTracking` (`internal/catalog/catalog_test.go`)
+      and `TestExecCreateViewGroupByPKDepRegistersUnderDistinctDBOid`
+      (which call the zero-arg/single-dbOid form) still pass unchanged —
+      the trailing variadic keeps every pre-existing call site resolving to
+      `DefaultDBOid`. **This closes 4e in full except the `CREATE DATABASE
+      ... TEMPLATE` copy mechanism itself**, now unblocked since both of
+      its prerequisites (sequence ownership, this item) have landed.
+      Deferral ledger row appended (`resolved`, matching the
+      sequence-ownership row's convention); design doc
+      (`docs/design/0122-0018-per-database-catalog-namespace.md`) 4e
+      section, status line, and "Recommended order" section all updated;
+      `docs/design/README.md` row extended. Gates: `go build ./...`/`go vet
+      ./...` clean; `go test -race ./internal/catalog/...
+      ./internal/executor/...` PASS; `go test -short $(go list ./... | grep
+      -v /internal/testport)` (full repo, short mode) PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed transactions, all 3 pgbench workloads). **Remaining M0122-0007
+      work: the `CREATE DATABASE ... TEMPLATE` copy mechanism only**
+      (`CreateDatabaseUsingFileCopy`/`copydir`,
+      `postgres/src/backend/commands/dbcommands.c`) — the epic's original
+      motivation and final resume point.
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,

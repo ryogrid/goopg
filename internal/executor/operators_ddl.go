@@ -5081,7 +5081,7 @@ func (o *ddlOp) execCreateView(s *parser.CreateViewStmt) error {
 	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
 		viewKey := s.Name.String()
 		for _, dep := range collectViewPKDeps(s.Query, o.ctx.Catalog, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
-			im.RegisterViewConstraintDep(viewKey, dep.tableOID, dep.constraintName)
+			im.RegisterViewConstraintDep(viewKey, dep.tableOID, dep.constraintName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		}
 	}
 	return nil
@@ -5243,7 +5243,7 @@ func (o *ddlOp) execDropOneView(name parser.ObjectName, ifExists bool, behavior 
 	}
 	// Clean up constraint dependencies registered by CREATE VIEW. M0097-0036.
 	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
-		im.UnregisterViewConstraintDeps(name.String())
+		im.UnregisterViewConstraintDeps(name.String(), catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 	}
 	// Restart persistence (M0119-0004 follow-up): stamp xmax on the on-disk
 	// pg_class/pg_attribute rows this view's own CREATE VIEW wrote via

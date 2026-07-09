@@ -429,6 +429,57 @@ func TestExecCreateViewGroupByPKDepRegistersUnderDistinctDBOid(t *testing.T) {
 	}
 }
 
+// TestDropViewDoesNotEraseConstraintDepAcrossDistinctDBOid closes M0122-0007
+// 4e's view constraint-dependency gap: UnregisterViewConstraintDeps (called
+// by DROP VIEW) matched entries by bare viewName across the WHOLE
+// constraintViewDeps map, so dropping a view in one database could erase a
+// same-named view's DROP-CONSTRAINT-RESTRICT dependency tracking in a
+// completely different database, even though that other view still exists
+// and the constraint it depends on was never touched. Fixed by qualifying
+// the stored viewName with dbOid in RegisterViewConstraintDep/
+// UnregisterViewConstraintDeps.
+func TestDropViewDoesNotEraseConstraintDepAcrossDistinctDBOid(t *testing.T) {
+	const otherDBOid = 5152
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+
+	// Default database: create a view "v" depending on base_pkey via GROUP BY.
+	if err := runDDL(t, ctx, "CREATE TABLE base (id int4 PRIMARY KEY, val text)"); err != nil {
+		t.Fatalf("CREATE TABLE base (default dbOid): %v", err)
+	}
+	if err := runDDL(t, ctx, "CREATE VIEW v AS SELECT id, count(*) FROM base GROUP BY id"); err != nil {
+		t.Fatalf("CREATE VIEW v (default dbOid): %v", err)
+	}
+	defaultTbl, ok := ctx.Catalog.LookupTable(parser.ObjectName{Schema: "public", Name: "base"})
+	if !ok {
+		t.Fatal("LookupTable(default dbOid) did not find base")
+	}
+
+	// Distinct database: same table/view names, its own independent dependency.
+	ctx.CurrentDatabaseOid = otherDBOid
+	if err := runDDL(t, ctx, "CREATE TABLE base (id int4 PRIMARY KEY, val text)"); err != nil {
+		t.Fatalf("CREATE TABLE base (distinct dbOid): %v", err)
+	}
+	if err := runDDL(t, ctx, "CREATE VIEW v AS SELECT id, count(*) FROM base GROUP BY id"); err != nil {
+		t.Fatalf("CREATE VIEW v (distinct dbOid): %v", err)
+	}
+
+	// Drop the distinct database's "v" — must not touch the default
+	// database's same-named "v" dependency entry.
+	if err := runDDL(t, ctx, "DROP VIEW v"); err != nil {
+		t.Fatalf("DROP VIEW v (distinct dbOid): %v", err)
+	}
+
+	im, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		t.Fatal("ctx.Catalog is not *catalog.InMemory")
+	}
+	deps := im.ViewsDependingOnConstraint(defaultTbl.OID, "base_pkey")
+	if len(deps) != 1 || deps[0] != "v" {
+		t.Fatalf("default dbOid's ViewsDependingOnConstraint(base.OID, base_pkey)=%v, want [v] (cross-database DROP VIEW erased it)", deps)
+	}
+}
+
 // TestRelFileNodeUsesTableOwnDBOidNotProcessWideDefault closes M0122-0007
 // 4d-ii-part-2b item 2: catalog.InMemory.RelFileNode/IndexRelFileNode used to
 // stamp storage.RelFileNode.DBOid from the single process-wide

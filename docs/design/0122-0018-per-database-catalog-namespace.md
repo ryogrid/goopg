@@ -1,6 +1,6 @@
 # Per-database catalog namespace (M0122-0007 slice 4)
 
-Status: accepted (sub-slices 4a, 4b-i, 4b-ii, 4c, 4d-i, 4d-ii-part-1, and 4d-ii-part-2a landed; 4d-ii-part-2b items 1, 2, and 3 all fully landed; 4e's FK-target-resolution and sequence-ownership items landed — 4e's view-constraint-dep item, plus the `CREATE DATABASE ... TEMPLATE` copy mechanism, remain planned)
+Status: accepted (sub-slices 4a, 4b-i, 4b-ii, 4c, 4d-i, 4d-ii-part-1, and 4d-ii-part-2a landed; 4d-ii-part-2b items 1, 2, and 3 all fully landed; 4e's FK-target-resolution, sequence-ownership, and view-constraint-dependency items all landed — only the `CREATE DATABASE ... TEMPLATE` copy mechanism remains planned)
 Date: 2026-07-09
 Supersedes: none — extends the "Still open" note in
 `0122-0017-database-ddl-drop-guards.md` and the deferral-ledger rows dated
@@ -940,27 +940,49 @@ two. `sequenceParamsForCatalog` and the two `AllSequenceInfos()` call sites
 still default to DefaultDBOid, matching their pre-4e behavior exactly (no
 regression, but `SELECT * FROM pg_sequences` on a distinct-dbOid connection
 still only sees DefaultDBOid's sequences).
-- **View constraint-dependency tracking** (`internal/catalog/catalog.go`) —
-  `c.constraintViewDeps map[string][]string` (declared near line 2280) is a
-  single flat field on `InMemory`, keyed `"tableOID:constraintName"` (OID
-  half is safe — table OIDs are globally unique) → `[]viewName` (the
-  *value* is a bare, unqualified name with no dbOid). Its own
-  `UnregisterViewConstraintDeps`, called from `execDropOneView` on every
-  `DROP VIEW`, matches and removes entries **by bare name across every key
-  in the whole map** — so `DROP VIEW v` in database A also strips a
-  same-named, unrelated view `v` in database B out of the map, silently
-  disabling that other database's `DROP CONSTRAINT RESTRICT` protection.
-  Concrete cross-database data-corruption path. `execCreateView`'s
-  registration call site (`im.RegisterViewConstraintDep(viewKey, ...)`,
-  `viewKey := s.Name.String()`) feeds the same unqualified-name issue.
-  Everything else view-dependency-related
-  (`CreateView`/`AllUserViews`/`AllUserMatViews`/`IndexesOnTable`/
-  `planCatalog()`/`viewsDependingOnView`/`viewsDependingOnTable`/
-  `matViewsDependingOnRelation`/`collectViewPKDeps`/`addGroupByPKDeps`) is
-  already dbOid-threaded — confirmed by inspection, not re-flagged.
-- The `CREATE DATABASE ... TEMPLATE` copy mechanism itself — blocked on both
-  items above landing first (a template copy must not alias the source
-  database's sequences or view-constraint-dep entries).
+**View constraint-dependency tracking — LANDED (2026-07-10).**
+`c.constraintViewDeps map[string][]string` (`internal/catalog/catalog.go`,
+field declared near line 2280) is a single flat field on `InMemory`, keyed
+`"tableOID:constraintName"` (OID half was already safe — table OIDs are
+globally unique, a single cluster-wide `nextOID` counter) → `[]viewName`;
+the *value* was a bare, unqualified name with no dbOid. Its own
+`UnregisterViewConstraintDeps`, called from `execDropOneView` on every
+`DROP VIEW`, matched and removed entries **by bare name across every key in
+the whole map** — so `DROP VIEW v` in database A also stripped a
+same-named, unrelated view `v` in database B out of the map, silently
+disabling that other database's `DROP CONSTRAINT RESTRICT` protection. A
+concrete cross-database data-corruption path, not just a lookup miss.
+`execCreateView`'s registration call site
+(`im.RegisterViewConstraintDep(viewKey, ...)`, `viewKey := s.Name.String()`)
+fed the same unqualified-name issue on the write side. Fixed by qualifying
+the stored value itself: both `RegisterViewConstraintDep` and
+`UnregisterViewConstraintDeps` gained the same trailing `dbOid ...uint32`
+convention as every other 4e entry point (`resolveDBOid`), and the value
+stored/matched is now `"<dbOid>:<viewName>"` rather than the bare name.
+`ViewsDependingOnConstraint` (the RESTRICT-check read path) needed no
+signature change — a dependent view can only live in its table's own
+database, so `tableOID` alone already pins the result to one database — but
+its output now strips the `dbOid:` prefix before returning, since callers
+only use the bare name for the RESTRICT error message. The two call sites in
+`internal/executor/operators_ddl.go` (`execCreateView`'s registration,
+`execDropOneView`'s cleanup) now pass
+`catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)`. New test
+`TestDropViewDoesNotEraseConstraintDepAcrossDistinctDBOid`
+(`internal/executor/ddl_write_dbid_routing_test.go`) creates a same-named
+view `v` in two distinct-dbOid databases, drops one, and asserts the other's
+dependency entry survives; confirmed to fail against a revert of just the
+value-qualification (a same-signature neutered qualifier that folds dbOid to
+a constant, isolating the key-scheme fix from the two call-site threads,
+which are mechanically inert without it). Everything else
+view-dependency-related
+(`CreateView`/`AllUserViews`/`AllUserMatViews`/`IndexesOnTable`/
+`planCatalog()`/`viewsDependingOnView`/`viewsDependingOnTable`/
+`matViewsDependingOnRelation`/`collectViewPKDeps`/`addGroupByPKDeps`) was
+already dbOid-threaded — confirmed by inspection, not re-flagged.
+
+**Remaining 4e work: the `CREATE DATABASE ... TEMPLATE` copy mechanism
+itself** — now unblocked, since both prerequisite items (sequence ownership,
+view constraint-dependency tracking) have landed.
 
 ## Recommended order and stopping points
 
@@ -978,16 +1000,15 @@ creation time — see its section above for the `postgres`/`DefaultDBOid`
 dual-mirror guard that turned out load-bearing) are now all fully landed
 (2026-07-10). **4d-ii-part-2b is complete; the only remaining sub-slice is
 4e** (dependent-object-walk fixups + the `CREATE DATABASE ... TEMPLATE`
-copy mechanism). 4e's FK-target-resolution and sequence-ownership items are
-now both landed (2026-07-10, see their sections above); **4e's only
-remaining item is view constraint-dependency tracking
-(`constraintViewDeps`'s unqualified-name values), then finally the
-`CREATE DATABASE ... TEMPLATE` copy mechanism itself**, which is blocked on
-it landing first. Before starting either, read 4d-i's,
+copy mechanism). 4e's FK-target-resolution, sequence-ownership, and view
+constraint-dependency items are now all landed (2026-07-10, see their
+sections above); **4e's only remaining item is the
+`CREATE DATABASE ... TEMPLATE` copy mechanism itself**, now unblocked since
+both of its prerequisites landed. Before starting it, read 4d-i's,
 4d-ii-part-1's, and 4d-ii-part-2a's/4d-ii-part-2b's/4e's landed sections
 above in full — they document exactly which write entry points and lookups
-already thread the connection's real dbOid (so 4e's remaining dependent-
-object walks must resolve the SAME
+already thread the connection's real dbOid (so the template-copy mechanism
+must resolve the SAME
 `catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)` value to actually find
 what earlier sub-slices create), the `postgres`/`DefaultDBOid` dual-mirror
 shim that still applies unchanged, and the `ns()`/`getOrCreateNS` split

@@ -2277,9 +2277,11 @@ type InMemory struct {
 	// synthesized for pg_dump / catalog parity. DU-002 (M0110-0001).
 	rangeTypes map[string]*RangeType
 
-	// constraintViewDeps maps "tableOID:constraintName" → []viewName for
-	// views that rely on the constraint for GROUP BY functional dependency.
-	// Used to enforce DROP CONSTRAINT RESTRICT. M0097-0036 / functional_deps.
+	// constraintViewDeps maps "tableOID:constraintName" → []"dbOid:viewName"
+	// for views that rely on the constraint for GROUP BY functional
+	// dependency. Used to enforce DROP CONSTRAINT RESTRICT. M0097-0036 /
+	// functional_deps. Values are dbOid-qualified since M0122-0007 4e — see
+	// RegisterViewConstraintDep/UnregisterViewConstraintDeps.
 	constraintViewDeps map[string][]string
 
 	// opClassHashFuncs maps operator class name → hash extended routine name.
@@ -17476,28 +17478,40 @@ func (c *InMemory) AllIndexes(dbOid ...uint32) []*Index {
 }
 
 // RegisterViewConstraintDep records that a view relies on a PK constraint for
-// GROUP BY functional dependency. Called by CREATE VIEW. M0097-0036.
-func (c *InMemory) RegisterViewConstraintDep(viewName string, tableOID uint32, constraintName string) {
+// GROUP BY functional dependency. Called by CREATE VIEW. M0097-0036. dbOid
+// qualifies the stored viewName (M0122-0007 4e) so a same-named view in a
+// different database is never conflated by UnregisterViewConstraintDeps;
+// tableOID/constraintName need no such qualifier since nextOID is a single
+// cluster-wide counter and a view can only reference tables in its own
+// database.
+func (c *InMemory) RegisterViewConstraintDep(viewName string, tableOID uint32, constraintName string, dbOid ...uint32) {
 	key := fmt.Sprintf("%d:%s", tableOID, constraintName)
+	qualified := fmt.Sprintf("%d:%s", resolveDBOid(dbOid), viewName)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for _, existing := range c.constraintViewDeps[key] {
-		if existing == viewName {
+		if existing == qualified {
 			return
 		}
 	}
-	c.constraintViewDeps[key] = append(c.constraintViewDeps[key], viewName)
+	c.constraintViewDeps[key] = append(c.constraintViewDeps[key], qualified)
 }
 
 // UnregisterViewConstraintDeps removes all constraint dependencies recorded for
-// the given view name. Called by DROP VIEW. M0097-0036.
-func (c *InMemory) UnregisterViewConstraintDeps(viewName string) {
+// the given view name. Called by DROP VIEW. M0097-0036. dbOid scopes the
+// removal (M0122-0007 4e) to the view being dropped's own database, matching
+// the qualifier RegisterViewConstraintDep stored — without it, DROP VIEW in
+// one database could erase a same-named view's dependency tracking in
+// another, silently defeating that other view's DROP CONSTRAINT RESTRICT
+// check.
+func (c *InMemory) UnregisterViewConstraintDeps(viewName string, dbOid ...uint32) {
+	qualified := fmt.Sprintf("%d:%s", resolveDBOid(dbOid), viewName)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for key, names := range c.constraintViewDeps {
 		var kept []string
 		for _, n := range names {
-			if n != viewName {
+			if n != qualified {
 				kept = append(kept, n)
 			}
 		}
@@ -17510,7 +17524,10 @@ func (c *InMemory) UnregisterViewConstraintDeps(viewName string) {
 }
 
 // ViewsDependingOnConstraint returns the names of views that depend on the
-// given PK constraint via GROUP BY functional dependency. M0097-0036.
+// given PK constraint via GROUP BY functional dependency. M0097-0036. Stored
+// values are dbOid-qualified (M0122-0007 4e); the qualifier is stripped here
+// since callers only use the bare name for RESTRICT error messages, and
+// tableOID already pins the result to one database.
 func (c *InMemory) ViewsDependingOnConstraint(tableOID uint32, constraintName string) []string {
 	key := fmt.Sprintf("%d:%s", tableOID, constraintName)
 	c.mu.RLock()
@@ -17520,7 +17537,13 @@ func (c *InMemory) ViewsDependingOnConstraint(tableOID uint32, constraintName st
 		return nil
 	}
 	out := make([]string, len(src))
-	copy(out, src)
+	for i, qualified := range src {
+		if idx := strings.IndexByte(qualified, ':'); idx >= 0 {
+			out[i] = qualified[idx+1:]
+		} else {
+			out[i] = qualified
+		}
+	}
 	return out
 }
 
