@@ -336,3 +336,95 @@ func TestIndexesOnTableFindsOwnDistinctDBOidTable(t *testing.T) {
 		t.Fatalf("IndexesOnTable(tbl, otherDBOid)[0].Name=%q, want widgets_id_idx", idxs[0].Name)
 	}
 }
+
+
+// TestExecCreateViewFromClauseRoutesToConnectionRealDBOid closes the
+// o.planCatalog() FROM-table-resolution gap noted above and in the deferral
+// ledger (AI-20260710-011513-001 / 4d-ii-part-2b item 3): before
+// executor.ctxPlanCatalog wrapped ctx.Catalog in a dbOid-seeded
+// catalog.SearchPathCatalog when ctx.PlanCatalog was unset (as it is via
+// this package's own test fixtures, which never run server/dispatch.go's
+// ectx wiring), planner.Plan's internal LookupTable call for the view's FROM
+// table always fell back to DefaultDBOid, so `CREATE VIEW ... FROM base` on
+// a distinct-dbOid connection failed to resolve `base` even though `base`
+// exists under that connection's own dbOid.
+func TestExecCreateViewFromClauseRoutesToConnectionRealDBOid(t *testing.T) {
+	const otherDBOid = 4949
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+	ctx.CurrentDatabaseOid = otherDBOid
+
+	if err := runDDL(t, ctx, "CREATE TABLE base (id int4, val text)"); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	if err := runDDL(t, ctx, "CREATE VIEW v AS SELECT id, val FROM base"); err != nil {
+		t.Fatalf("CREATE VIEW ... FROM base: %v", err)
+	}
+
+	tbl, ok := ctx.Catalog.LookupTable(parser.ObjectName{Schema: "public", Name: "v"}, otherDBOid)
+	if !ok {
+		t.Fatalf("LookupTable(dbOid=%d) did not find the view created by this connection", otherDBOid)
+	}
+	if tbl.View == nil {
+		t.Fatal("found relation is not a view")
+	}
+	// The view's column list is planner-derived (execCreateView's planSchema
+	// path); it only has 2 real columns (id, val) when the FROM table
+	// actually resolved during planning. Before the fix, planner.Plan failed
+	// to find `base` under otherDBOid, so execCreateView fell back to the
+	// target-list path and still recorded 2 columns from the unresolved
+	// target names — so the real signal is that the CREATE VIEW above did
+	// not error and the columns carry the expected names/types below (an
+	// unresolved `id`/`val` reference would have failed planning with
+	// 42P01/42703, which execCreateView surfaces via the non-0A000 error
+	// branch).
+	if len(tbl.Columns) != 2 {
+		t.Fatalf("view has %d columns, want 2", len(tbl.Columns))
+	}
+	if tbl.Columns[0].Name != "id" || tbl.Columns[0].Type.Name != "int4" {
+		t.Fatalf("view column 0 = %+v, want id/int4", tbl.Columns[0])
+	}
+	if tbl.Columns[1].Name != "val" || tbl.Columns[1].Type.Name != "text" {
+		t.Fatalf("view column 1 = %+v, want val/text", tbl.Columns[1])
+	}
+}
+
+
+// TestExecCreateViewGroupByPKDepRegistersUnderDistinctDBOid closes a second,
+// closely related gap surfaced while writing the FROM-clause test above:
+// addGroupByPKDeps (the GROUP-BY-functional-dependency half of
+// collectViewPKDeps, called from execCreateView) called
+// cat.IndexesOnTable(tbl) with no dbOid argument even though it already
+// receives one and threads it into the sibling cat.LookupTable call two
+// lines above — so on a distinct-dbOid connection it could never find the
+// base table's PK index, and CREATE VIEW never registered the
+// view→PK-constraint dependency (catalog.InMemory.RegisterViewConstraintDep)
+// that DROP CONSTRAINT RESTRICT relies on to detect a dependent view. Fixed
+// by passing dbOid through to IndexesOnTable, mirroring the LookupTable call
+// immediately above it. M0122-0007 slice 4d-ii-part-2b item 3.
+func TestExecCreateViewGroupByPKDepRegistersUnderDistinctDBOid(t *testing.T) {
+	const otherDBOid = 5151
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+	ctx.CurrentDatabaseOid = otherDBOid
+
+	if err := runDDL(t, ctx, "CREATE TABLE base (id int4 PRIMARY KEY, val text)"); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	if err := runDDL(t, ctx, "CREATE VIEW v AS SELECT id, count(*) FROM base GROUP BY id"); err != nil {
+		t.Fatalf("CREATE VIEW ... GROUP BY id: %v", err)
+	}
+
+	tbl, ok := ctx.Catalog.LookupTable(parser.ObjectName{Schema: "public", Name: "base"}, otherDBOid)
+	if !ok {
+		t.Fatalf("LookupTable(dbOid=%d) did not find base", otherDBOid)
+	}
+	im, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		t.Fatal("ctx.Catalog is not *catalog.InMemory")
+	}
+	deps := im.ViewsDependingOnConstraint(tbl.OID, "base_pkey")
+	if len(deps) != 1 || deps[0] != "v" {
+		t.Fatalf("ViewsDependingOnConstraint(base.OID, base_pkey)=%v, want [v]", deps)
+	}
+}

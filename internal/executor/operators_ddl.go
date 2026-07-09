@@ -57,6 +57,21 @@ func ctxPlanCatalog(ctx *Context) catalog.Catalog {
 	if ctx.PlanCatalog != nil {
 		return ctx.PlanCatalog
 	}
+	// No session-provided wrapper (unit-test fixtures, and any executor-
+	// internal caller that never went through server/dispatch.go's ectx
+	// wiring): still key FROM-table/index resolution off the connection's
+	// real database oid when one is known, mirroring
+	// server.sessionPlanCatalog/server.ctxPlanCatalog. Without this,
+	// planner.Plan's internal LookupTable/LookupIndex calls (no explicit
+	// dbOid argument) fell back to DefaultDBOid even on a distinct-dbOid
+	// connection, so e.g. `CREATE VIEW v AS SELECT * FROM base` failed to
+	// resolve `base` once it lived under a non-default dbOid. M0122-0007
+	// slice 4d-ii-part-2b item 3 (design 0122-0018).
+	if ctx.CurrentDatabaseOid != 0 {
+		wrapped := catalog.WithSearchPath(ctx.Catalog, nil)
+		wrapped.DBOid = ctx.CurrentDatabaseOid
+		return wrapped
+	}
 	return ctx.Catalog
 }
 
@@ -9781,7 +9796,7 @@ func addGroupByPKDeps(sel *parser.SelectStmt, cat catalog.Catalog, out *[]pkCons
 			alias = strings.ToLower(rv.Name)
 		}
 		tblNameLower := strings.ToLower(rv.Name)
-		for _, idx := range cat.IndexesOnTable(tbl) {
+		for _, idx := range cat.IndexesOnTable(tbl, dbOid) {
 			if !idx.Primary {
 				continue
 			}

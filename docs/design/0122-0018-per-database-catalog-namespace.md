@@ -1,6 +1,6 @@
 # Per-database catalog namespace (M0122-0007 slice 4)
 
-Status: accepted (sub-slices 4a, 4b-i, 4b-ii, 4c, 4d-i, 4d-ii-part-1, and 4d-ii-part-2a landed; 4d-ii-part-2b item 3's own-signature half landed, its `planCatalog()` half + items 1-2 + 4e planned)
+Status: accepted (sub-slices 4a, 4b-i, 4b-ii, 4c, 4d-i, 4d-ii-part-1, and 4d-ii-part-2a landed; 4d-ii-part-2b item 3 fully landed — own-signature half plus the `planCatalog()` half plus the `addGroupByPKDeps` follow-on bug it surfaced; items 1-2 + 4e planned)
 Date: 2026-07-09
 Supersedes: none — extends the "Still open" note in
 `0122-0017-database-ddl-drop-guards.md` and the deferral-ledger rows dated
@@ -632,28 +632,66 @@ Two remaining pieces (renumbered from the original "4d-ii-part-2"; part 2a's
    `ResolveDatabaseOid("postgres")` in every context; audit `NewInMemory`'s
    `dbOid: DefaultDBOid` seed and the `base/1/` + `base/5/` mirror before
    changing what oid live relations are created under.
-3. **New scope surfaced by 4d-ii-part-2a's finding above — own-signature half
-   LANDED this loop, `planCatalog()` half still planned:**
+3. **New scope surfaced by 4d-ii-part-2a's finding above — now fully LANDED:**
    `catalog.InMemory.CreateView`/`DropView`/`AllUserViews`/`AllUserMatViews`/
    `IndexesOnTable` each gained a `dbOid ...uint32` parameter (mirroring the
    4b-ii variadic pattern), and every call site in `operators_ddl.go` that
    references them now threads `catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)`
    — this includes `execCreateView`, `execDropOneView`, `execDropOneMatView`,
    `execDropTable`'s RESTRICT/CASCADE dependency scans, and DROP SCHEMA
-   CASCADE's view collection. Verified via two new regression tests
-   (`TestExecCreateViewRoutesToConnectionRealDBOid`,
+   CASCADE's view collection. Verified via
+   `TestExecCreateViewRoutesToConnectionRealDBOid` and
    `TestIndexesOnTableFindsOwnDistinctDBOidTable` in
-   `internal/executor/ddl_write_dbid_routing_test.go`), each using a no-FROM
-   view body to avoid the still-open gap below. **Still open:**
-   `o.planCatalog()`'s FROM-table resolution is not dbOid-aware —
-   `planner.Plan` receives a bare `catalog.Catalog` and calls `LookupTable`
-   with no dbOid argument internally, so `CREATE VIEW ... FROM <table>` on a
-   distinct-dbOid connection still resolves the FROM table against
-   DefaultDBOid. This requires giving the planner package access to a
-   per-connection dbOid, a larger and structurally different change (the
-   planner currently receives only a bare `catalog.Catalog`, no `Context`).
-   See the deferral ledger's `AI-20260710-011513-001` / 4d-ii-part-2b-item-1
-   row for the exact resume point.
+   `internal/executor/ddl_write_dbid_routing_test.go`.
+
+   The `planCatalog()` half (the gap those two tests deliberately avoided by
+   using a no-FROM view body) is now also fixed:
+   `executor.ctxPlanCatalog` (`internal/executor/operators_ddl.go`) previously
+   returned the bare, unwrapped `ctx.Catalog` whenever `ctx.PlanCatalog` was
+   unset, so `planner.Plan`'s internal `LookupTable`/`LookupIndex` calls (no
+   explicit dbOid argument) always resolved against `DefaultDBOid` — even
+   though `server.sessionPlanCatalog`/`server.ctxPlanCatalog` already wire a
+   dbOid-seeded `catalog.SearchPathCatalog` as `ctx.PlanCatalog` on every real
+   connection (see `internal/server/dispatch.go`'s `sess != nil` block).
+   The gap only reproduced through this package's own unit-test fixtures
+   (`newVMFixture`/`runDDL`), which build a bare `*executor.Context` and
+   never run that dispatch-layer wiring — but any other executor-internal
+   caller that reaches `planner.Plan` via `ctxPlanCatalog` without a
+   dispatch-supplied `PlanCatalog` had the same exposure. Fixed by having
+   `ctxPlanCatalog`'s fallback branch wrap `ctx.Catalog` in a
+   `catalog.WithSearchPath(...)` seeded with `ctx.CurrentDatabaseOid` (a
+   `nil` schemas function; search-path fallback resolution is orthogonal to
+   this fix) instead of returning it unwrapped, mirroring
+   `sessionPlanCatalog`. Verified negatively — reverting only this one
+   function change reproduces `42P01: relation "base" does not exist` on
+   `CREATE VIEW v AS SELECT id, val FROM base` under a distinct dbOid — and
+   positively via the new
+   `TestExecCreateViewFromClauseRoutesToConnectionRealDBOid` regression test.
+
+   Fixing `planCatalog()` surfaced a **second, closely related bug**:
+   `addGroupByPKDeps` (`internal/executor/operators_ddl.go`, part of the
+   `collectViewPKDeps` chain `execCreateView` calls to register
+   view→PK-constraint GROUP-BY-functional-dependency deps) called
+   `cat.IndexesOnTable(tbl)` with no `dbOid` argument, even though the
+   function already receives one and threads it into the sibling
+   `cat.LookupTable` call two lines above. On a distinct-dbOid connection
+   this meant the base table's PK index could never be found, so
+   `catalog.InMemory.RegisterViewConstraintDep` never fired — a view like
+   `CREATE VIEW v AS SELECT id, count(*) FROM base GROUP BY id` silently
+   lost its dependency tracking, meaning a subsequent `DROP CONSTRAINT ...
+   RESTRICT` on `base`'s PK would incorrectly succeed instead of being
+   blocked. This is the exact `collectViewPKDeps`/PK-deps-cluster fix that
+   4d-ii-part-2a's white-box test was blocked on and had previously verified
+   only by code inspection. Fixed by passing `dbOid` through to
+   `IndexesOnTable`; verified via the new
+   `TestExecCreateViewGroupByPKDepRegistersUnderDistinctDBOid` regression
+   test, which asserts `catalog.InMemory.ViewsDependingOnConstraint` returns
+   the view after `CREATE VIEW ... GROUP BY <pk-covering-cols>` under a
+   distinct dbOid.
+
+   All four tests live in `internal/executor/ddl_write_dbid_routing_test.go`.
+   The former deferral-ledger row `AI-20260710-011513-001` /
+   4d-ii-part-2b-item-1 is now resolved (see the ledger's `resolved` flip).
 
 ### 4e — Cross-cutting fixups + the original motivation (planned)
 
@@ -671,15 +709,19 @@ today, ready to become a hard assertion once this lands).
 4a (landed) → 4b-i (landed) → 4b-ii (landed) → 4c (landed) → 4d-i (landed) →
 4d-ii-part-1 (landed) → 4d-ii-part-2a (landed) → 4d-ii-part-2b → 4e, strictly
 in order — each depends on the previous sub-slice's data shape.
-4d-ii-part-2b is next: the cross-file sweep across
+4d-ii-part-2b's item 3 (the `CreateView`/`AllUserViews`/`AllUserMatViews`/
+`IndexesOnTable`/`planCatalog()` dbOid-awareness gap, see 4d-ii-part-2a's
+"New finding" above) is now fully landed. What remains of 4d-ii-part-2b:
+item 1, the cross-file sweep across
 `operators_fk.go`/`operators_cluster.go`/`operators_reindex.go`/
 `operators_sequence.go`/`operators_storage.go`/
 `operators_pg_get_publication_tables.go`/the DML operators (see
 4d-ii-part-1's "explicitly out of scope" list above for the full
-breakdown), the newly-surfaced `CreateView`/`AllUserViews`/
-`AllUserMatViews`/`IndexesOnTable`/`planCatalog()` dbOid-awareness gap (see
-4d-ii-part-2a's "New finding" above), then wire `RelFileNode.DBOid` at
-creation time. Before starting 4d-ii-part-2b, read 4d-i's, 4d-ii-part-1's,
+breakdown, and this section's item 1 above — ~50 more un-threaded
+`IndexesOnTable`/`AllUserViews`/`AllUserMatViews` call sites, measured via
+`grep -rn '\.IndexesOnTable(\|\.AllUserViews(\|\.AllUserMatViews(' internal/`
+during this loop), then item 2, wiring `RelFileNode.DBOid` at creation
+time. Before resuming 4d-ii-part-2b, read 4d-i's, 4d-ii-part-1's,
 and 4d-ii-part-2a's landed sections above in full — they document exactly
 which write entry points and which `operators_ddl.go` lookups already
 thread the connection's real dbOid (so 4d-ii-part-2b's remaining lookups

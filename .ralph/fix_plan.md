@@ -6161,6 +6161,55 @@ mirroring M0119's ledger `status` column.
       `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
       failed transactions, all 3 pgbench workloads, ran twice for the same
       reason).
+  - [x] `M0122-0007` follow-up 15 (2026-07-10, this loop) — **closed
+      4d-ii-part-2b item 3's remaining `planCatalog()` half, plus a
+      follow-on bug it surfaced.** `executor.ctxPlanCatalog`
+      (`internal/executor/operators_ddl.go`) fell back to the bare,
+      unwrapped `ctx.Catalog` whenever `ctx.PlanCatalog` was unset, so
+      `planner.Plan`'s internal `LookupTable` calls (no explicit dbOid arg)
+      always resolved `CREATE VIEW ... FROM <table>` against `DefaultDBOid`
+      even on a distinct-dbOid connection — confirmed as a real bug (not
+      just a doc claim) by reverting only this function and reproducing
+      `42P01: relation "base" does not exist`. Real server dispatch
+      (`server.sessionPlanCatalog`, `internal/server/dispatch.go`) already
+      wires `ctx.PlanCatalog` correctly on every connection with a session;
+      the gap was this package's own unit-test fixtures
+      (`newVMFixture`/`runDDL`) plus any other executor-internal
+      `ctxPlanCatalog` caller lacking a dispatch-supplied wrapper. Fix:
+      wrap `ctx.Catalog` in `catalog.WithSearchPath(ctx.Catalog, nil)` with
+      `.DBOid = ctx.CurrentDatabaseOid` when no `PlanCatalog` is set,
+      mirroring `sessionPlanCatalog` — no planner-package signature change
+      needed (the design doc's note that this "requires giving the planner
+      package access to a per-connection dbOid" was itself the thing that
+      turned out unnecessary: `SearchPathCatalog.DBOid` already carries it
+      through the existing `catalog.Catalog` interface).
+      Investigating this surfaced a **second bug** in the
+      `collectViewPKDeps` chain: `addGroupByPKDeps` called
+      `cat.IndexesOnTable(tbl)` with no `dbOid` argument, unlike the
+      sibling `cat.LookupTable` call two lines above it in the same
+      function — so a view's GROUP-BY PK-constraint dependency
+      (`RegisterViewConstraintDep`) never registered under a distinct
+      dbOid, meaning `DROP CONSTRAINT ... RESTRICT` would wrongly succeed
+      instead of being blocked. This is the exact
+      `collectViewPKDeps`/PK-deps-cluster gap 4d-ii-part-2a's white-box
+      test was blocked on and had only verified by code inspection.
+      Fixed by threading `dbOid` through to `IndexesOnTable`. New tests
+      `TestExecCreateViewFromClauseRoutesToConnectionRealDBOid`,
+      `TestExecCreateViewGroupByPKDepRegistersUnderDistinctDBOid`
+      (`internal/executor/ddl_write_dbid_routing_test.go`), both confirmed
+      to fail (42P01 / empty `ViewsDependingOnConstraint`) against a
+      revert of their respective one-line fix. Design doc
+      (`docs/design/0122-0018-per-database-catalog-namespace.md`) 4d-ii-
+      part-2b item 3 updated to "fully landed"; `docs/design/README.md` row
+      extended; deferral ledger row `AI-20260710-011513-001` resolved by a
+      new appended row (items 1-2's ~50-site cross-file sweep +
+      `RelFileNode.DBOid` remain the next resume points). Gates:
+      `go build ./...`/`go vet ./...` clean; `go test -race
+      ./internal/catalog/... ./internal/executor/...` PASS; `go test
+      -short $(go list ./... | grep -v /internal/testport)` (full repo,
+      short mode) PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed transactions, all 3 pgbench workloads).
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,
