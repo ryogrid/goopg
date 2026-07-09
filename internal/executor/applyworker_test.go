@@ -117,6 +117,112 @@ func TestApplyWorkerInsertsRowFromPgoutputStream(t *testing.T) {
 	}
 }
 
+// TestApplyWorkerAppliesInsertUnderDistinctSubscriptionDBOid exercises
+// M0122-0007 4d-ii-part-2b item 1's applyworker.go corner: an ApplyWorker
+// constructed over a catalog.SearchPathCatalog seeded with a distinct
+// subscription dbOid (mirroring server.applyWorkerCatalog's wiring in
+// DefaultLaunchApplyWorker) resolves the *subscribing database's own*
+// "items" table — not the DefaultDBOid one the raw catalog.InMemory would
+// always fall back to — for its un-dbOid-threaded LookupTable call at
+// applyworker.go's applyRelation (~line 217). Before applyWorkerCatalog
+// existed, NewApplyWorker always received the bare process-wide catalog, so
+// a subscription living in a genuinely distinct database (a real CREATE
+// DATABASE oid) could never find its own tables: applyRelation's LookupTable
+// would either miss entirely or silently alias onto the wrong database's
+// same-named table.
+func TestApplyWorkerAppliesInsertUnderDistinctSubscriptionDBOid(t *testing.T) {
+	_, pubCat, pubCleanup := newStorageFixture(t)
+	defer pubCleanup()
+	pubTbl, _ := pubCat.LookupTable(parser.ObjectName{Name: "items"})
+
+	snap := wal.BuildCatalogSnapshot(pubCat.(*catalog.InMemory))
+	var buf bytes.Buffer
+	po := wal.NewPgOutput(snap, &buf)
+	if err := po.Begin(42, 0xCAFE); err != nil {
+		t.Fatal(err)
+	}
+	body := encodeBodyV0([]any{7, "alpha"}, []string{"int4", "text"})
+	tuple := wrapAsHeapTuple(t, body, 2)
+	if err := po.Change(wal.Change{
+		Kind:     wal.ChangeInsert,
+		Rel:      pubCat.RelFileNode(pubTbl),
+		NewTuple: tuple,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := po.Commit(42, 0xCAFE); err != nil {
+		t.Fatal(err)
+	}
+
+	// Subscriber: newStorageFixture pre-creates "items" under
+	// DefaultDBOid; additionally register a same-named "items" under a
+	// genuinely distinct dbOid — the subscription's own database, which
+	// the apply worker must resolve against instead.
+	const otherDBOid = 9191
+	subCtx, subCat, subCleanup := newStorageFixture(t)
+	defer subCleanup()
+	if _, err := subCat.CreateTable(parser.ObjectName{Name: "items"}, []catalog.Column{
+		{Name: "id", Type: catalog.Type{Name: "int4"}, NotNull: true},
+		{Name: "label", Type: catalog.Type{Name: "text"}},
+	}, otherDBOid); err != nil {
+		t.Fatalf("CreateTable(otherDBOid): %v", err)
+	}
+	defaultTbl, _ := subCat.LookupTable(parser.ObjectName{Name: "items"})
+	otherTbl, ok := subCat.LookupTable(parser.ObjectName{Name: "items"}, otherDBOid)
+	if !ok {
+		t.Fatalf("LookupTable(dbOid=%d) did not find the just-created table", otherDBOid)
+	}
+
+	w := NewApplyWorker(&catalog.SearchPathCatalog{Catalog: subCat, DBOid: otherDBOid}, subCtx.Pool, subCtx.TxnMgr)
+	defer w.SafeRollback()
+
+	stream := buf.Bytes()
+	consumed := 0
+	for consumed < len(stream) {
+		end, err := pgoutputMessageLength(stream[consumed:])
+		if err != nil {
+			t.Fatal(err)
+		}
+		m, err := wal.DecodeMessage(stream[consumed : consumed+end])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.ApplyMessage(m); err != nil {
+			t.Fatalf("ApplyMessage(kind=%q): %v", m.Kind, err)
+		}
+		consumed += end
+	}
+
+	countRows := func(tbl *catalog.Table) int {
+		tx, _ := subCtx.TxnMgr.Begin(0)
+		defer subCtx.TxnMgr.Rollback(tx)
+		snap2, _ := subCtx.TxnMgr.SnapshotFor(tx)
+		scanCtx := NewContext()
+		scanCtx.Pool = subCtx.Pool
+		scanCtx.Catalog = subCat
+		scanCtx.TxnMgr = subCtx.TxnMgr
+		scanCtx.Tx = tx
+		scanCtx.Snap = snap2
+		scan := newSeqScanOp(&planner.SeqScan{Table: tbl})
+		if err := scan.Open(scanCtx); err != nil {
+			t.Fatal(err)
+		}
+		defer scan.Close()
+		rows, err := drainScan(scan)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return len(rows)
+	}
+
+	if n := countRows(otherTbl); n != 1 {
+		t.Errorf("otherDBOid table row count = %d, want 1 (the apply worker should have resolved this table)", n)
+	}
+	if n := countRows(defaultTbl); n != 0 {
+		t.Errorf("DefaultDBOid table row count = %d, want 0 (the apply worker must not alias onto the wrong database's same-named table)", n)
+	}
+}
+
 // TestPrimaryKeyOnlyRow pins the partial-key helper that applyUpdate
 // falls back on when pgoutput omits OldTuple (REPLICA IDENTITY DEFAULT
 // + key columns unchanged): the synthesised key row carries PK column

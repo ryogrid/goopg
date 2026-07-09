@@ -325,6 +325,38 @@ func TestResolveApplyWorkerApplicationName(t *testing.T) {
 	}
 }
 
+// TestApplyWorkerCatalogSeedsSubscriptionDBOid pins
+// applyWorkerCatalog's contract: DefaultLaunchApplyWorker uses it to wrap
+// cfg.Catalog before constructing the ApplyWorker (M0122-0007
+// 4d-ii-part-2b item 1) so the worker's un-dbOid-threaded LookupTable /
+// LookupIndex / IndexesOnTable calls resolve the subscribing database's
+// own tables (catalog.SearchPathCatalog.effectiveDBOid) instead of always
+// falling back to DefaultDBOid.
+func TestApplyWorkerCatalogSeedsSubscriptionDBOid(t *testing.T) {
+	base := catalog.NewInMemory()
+
+	wrapped := applyWorkerCatalog(base, 4242)
+	spc, ok := wrapped.(*catalog.SearchPathCatalog)
+	if !ok {
+		t.Fatalf("applyWorkerCatalog returned %T, want *catalog.SearchPathCatalog", wrapped)
+	}
+	if spc.DBOid != 4242 {
+		t.Errorf("DBOid = %d, want 4242", spc.DBOid)
+	}
+	if spc.Unwrap() != catalog.Catalog(base) {
+		t.Error("applyWorkerCatalog did not preserve the underlying catalog")
+	}
+
+	// A zero dbOid (a subscription created before this item shipped, or
+	// one that never resolved a distinct database) must behave exactly
+	// like the unwrapped catalog's own zero-dbOid default — legacy
+	// single-database subscriptions are unaffected.
+	legacy := applyWorkerCatalog(base, 0).(*catalog.SearchPathCatalog)
+	if legacy.DBOid != 0 {
+		t.Errorf("DBOid = %d, want 0 for a legacy subscription", legacy.DBOid)
+	}
+}
+
 // TestLogicalReceiverConfigCarriesApplicationName guards the
 // LogicalReceiverConfig.ApplicationName field that
 // DefaultLaunchApplyWorker now populates. Without this field, the apply

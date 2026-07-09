@@ -56,6 +56,17 @@ type Subscription struct {
 	Publications []string
 	Enabled      bool
 	SlotName     string
+	// DBOid is the database this subscription's apply worker resolves
+	// local relations against — the connection's real dbOid at CREATE
+	// SUBSCRIPTION time (catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)),
+	// same convention as catalog.Table.DBOid/catalog.Index.DBOid
+	// (M0122-0007 4d-ii-part-2b item 2). Zero (the pre-item-1 default)
+	// resolves to DefaultDBOid via NamespaceDBOid, matching legacy
+	// single-database behavior. The apply launcher reads it to seed a
+	// catalog.SearchPathCatalog for ApplyWorker.cat so its un-dbOid-
+	// threaded LookupTable/IndexesOnTable calls resolve the subscribing
+	// database's own tables instead of always DefaultDBOid's.
+	DBOid uint32
 }
 
 // SubscriptionRel is one tablesync row: a (subscription, relation)
@@ -307,7 +318,10 @@ func (p *PubSub) CreateSubscription(name, conninfo string, publications []string
 // CreateSubscriptionAsOwner is CreateSubscription with an explicit owner
 // OID — the role that issued CREATE SUBSCRIPTION, mirroring
 // Publication.Owner's same real-ownership convention. DU-002 slice 424.
-func (p *PubSub) CreateSubscriptionAsOwner(name, conninfo string, publications []string, slotName string, enabled bool, owner uint32) (*Subscription, error) {
+// dbOid is variadic (mirrors CreateTable/CreateIndex's convention) and
+// sets Subscription.DBOid; omitted defaults to DefaultDBOid via
+// resolveDBOid, matching pre-4d-ii-part-2b-item-1 behavior.
+func (p *PubSub) CreateSubscriptionAsOwner(name, conninfo string, publications []string, slotName string, enabled bool, owner uint32, dbOid ...uint32) (*Subscription, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if _, ok := p.subscriptions[name]; ok {
@@ -324,6 +338,7 @@ func (p *PubSub) CreateSubscriptionAsOwner(name, conninfo string, publications [
 		Publications: append([]string(nil), publications...),
 		Enabled:      enabled,
 		SlotName:     slotName,
+		DBOid:        resolveDBOid(dbOid),
 	}
 	p.nextOID++
 	p.subscriptions[name] = sub

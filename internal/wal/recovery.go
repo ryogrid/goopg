@@ -5795,8 +5795,12 @@ func DecodeAlterPublicationOwner(payload []byte) (name string, ownerOID uint32, 
 // restart-persistence follow-up to M0119-0004, loop #67 ledger resume
 // point). The OID is carried so recovery re-registers the subscription
 // identically to the live server. Format documented at the
-// RecordKindCreateSubscription constant.
-func EncodeCreateSubscription(name, conninfo, slotName string, publications []string, oid, ownerOID uint32, enabled bool) []byte {
+// RecordKindCreateSubscription constant. dbOid is appended as a trailing
+// 4-byte field (M0122-0007 4d-ii-part-2b item 1) so a pre-existing WAL
+// file with no trailer still decodes — DecodeCreateSubscription treats a
+// short read of just that trailer as dbOid 0 (DefaultDBOid via
+// NamespaceDBOid), matching the pre-item-1 single-database default.
+func EncodeCreateSubscription(name, conninfo, slotName string, publications []string, oid, ownerOID uint32, enabled bool, dbOid uint32) []byte {
 	strs := []string{name, conninfo, slotName}
 	for i, s := range strs {
 		if len(s) > 0xFFFF {
@@ -5811,6 +5815,7 @@ func EncodeCreateSubscription(name, conninfo, slotName string, publications []st
 		}
 		total += 2 + len(p)
 	}
+	total += 4
 	out := make([]byte, total)
 	out[0] = RecordKindCreateSubscription
 	binary.LittleEndian.PutUint32(out[1:5], oid)
@@ -5836,16 +5841,20 @@ func EncodeCreateSubscription(name, conninfo, slotName string, publications []st
 		}
 		writeStr(p)
 	}
+	binary.LittleEndian.PutUint32(out[off:off+4], dbOid)
+	off += 4
 	return out
 }
 
 // DecodeCreateSubscription decodes a RecordKindCreateSubscription payload.
-func DecodeCreateSubscription(payload []byte) (name, conninfo, slotName string, publications []string, oid, ownerOID uint32, enabled bool, err error) {
+// dbOid is 0 (DefaultDBOid via NamespaceDBOid) for a pre-item-1 payload
+// that predates the trailing dbOid field.
+func DecodeCreateSubscription(payload []byte) (name, conninfo, slotName string, publications []string, oid, ownerOID uint32, enabled bool, dbOid uint32, err error) {
 	if len(payload) < 10 {
-		return "", "", "", nil, 0, 0, false, fmt.Errorf("wal: create-subscription payload too short (%d bytes)", len(payload))
+		return "", "", "", nil, 0, 0, false, 0, fmt.Errorf("wal: create-subscription payload too short (%d bytes)", len(payload))
 	}
 	if payload[0] != RecordKindCreateSubscription {
-		return "", "", "", nil, 0, 0, false, fmt.Errorf("wal: record kind %d is not create-subscription", payload[0])
+		return "", "", "", nil, 0, 0, false, 0, fmt.Errorf("wal: record kind %d is not create-subscription", payload[0])
 	}
 	oid = binary.LittleEndian.Uint32(payload[1:5])
 	ownerOID = binary.LittleEndian.Uint32(payload[5:9])
@@ -5865,16 +5874,16 @@ func DecodeCreateSubscription(payload []byte) (name, conninfo, slotName string, 
 		return s, nil
 	}
 	if name, err = readStr(); err != nil {
-		return "", "", "", nil, 0, 0, false, err
+		return "", "", "", nil, 0, 0, false, 0, err
 	}
 	if conninfo, err = readStr(); err != nil {
-		return "", "", "", nil, 0, 0, false, err
+		return "", "", "", nil, 0, 0, false, 0, err
 	}
 	if slotName, err = readStr(); err != nil {
-		return "", "", "", nil, 0, 0, false, err
+		return "", "", "", nil, 0, 0, false, 0, err
 	}
 	if len(payload) < off+2 {
-		return "", "", "", nil, 0, 0, false, fmt.Errorf("wal: create-subscription payload truncated (need %d bytes)", off+2)
+		return "", "", "", nil, 0, 0, false, 0, fmt.Errorf("wal: create-subscription payload truncated (need %d bytes)", off+2)
 	}
 	pubCount := int(binary.LittleEndian.Uint16(payload[off : off+2]))
 	off += 2
@@ -5882,11 +5891,15 @@ func DecodeCreateSubscription(payload []byte) (name, conninfo, slotName string, 
 	for i := 0; i < pubCount; i++ {
 		s, serr := readStr()
 		if serr != nil {
-			return "", "", "", nil, 0, 0, false, serr
+			return "", "", "", nil, 0, 0, false, 0, serr
 		}
 		publications = append(publications, s)
 	}
-	return name, conninfo, slotName, publications, oid, ownerOID, enabled, nil
+	if len(payload) >= off+4 {
+		dbOid = binary.LittleEndian.Uint32(payload[off : off+4])
+		off += 4
+	}
+	return name, conninfo, slotName, publications, oid, ownerOID, enabled, dbOid, nil
 }
 
 // EncodeDropSubscription encodes a DROP SUBSCRIPTION event (DU-002

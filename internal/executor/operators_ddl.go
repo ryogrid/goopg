@@ -916,12 +916,13 @@ func (o *ddlOp) execCreateSubscription(s *parser.CreateSubscriptionStmt) error {
 		enabled = v == "true" || v == "on" || v == "yes" || v == "1"
 	}
 	slotName := s.With["slot_name"]
-	sub, err := o.ctx.PubSub.CreateSubscriptionAsOwner(s.Name, s.Conninfo, s.Publications, slotName, enabled, o.currentDDLOwnerOID())
+	subDBOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
+	sub, err := o.ctx.PubSub.CreateSubscriptionAsOwner(s.Name, s.Conninfo, s.Publications, slotName, enabled, o.currentDDLOwnerOID(), subDBOid)
 	if err != nil {
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 	}
 	if o.ctx.WAL != nil {
-		if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateSubscription(sub.Name, sub.Conninfo, sub.SlotName, sub.Publications, sub.OID, sub.Owner, sub.Enabled)); werr != nil {
+		if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateSubscription(sub.Name, sub.Conninfo, sub.SlotName, sub.Publications, sub.OID, sub.Owner, sub.Enabled, sub.DBOid)); werr != nil {
 			return fmt.Errorf("wal create-subscription: %w", werr)
 		}
 	}

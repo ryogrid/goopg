@@ -6329,6 +6329,84 @@ mirroring M0119's ledger `status` column.
       mode) PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
       `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
       failed transactions, all 3 pgbench workloads).
+  - [x] `M0122-0007` follow-up 18 (2026-07-10, this loop) — **closed
+      4d-ii-part-2b item 1's `applyworker.go` corner — 4d-ii-part-2b is now
+      fully landed.** Rather than threading a `dbOid` argument through
+      every `w.cat.*` call site in `internal/executor/applyworker.go`
+      individually (the prior loop's own note explaining why it deferred
+      this), gave `ApplyWorker` a per-subscription dbOid concept and
+      wrapped its catalog instead of touching its call sites at all.
+      `catalog.Subscription` (`internal/catalog/pubsub.go`) gained a
+      `DBOid uint32` field; `PubSub.CreateSubscriptionAsOwner` gained a
+      trailing variadic `dbOid ...uint32` param (mirrors
+      `CreateTable`/`CreateIndex`'s convention, sets `sub.DBOid` via the
+      existing `resolveDBOid` helper). `executor.execCreateSubscription`
+      (`operators_ddl.go`) passes
+      `catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)` at its one call
+      site. `wal.EncodeCreateSubscription`/`DecodeCreateSubscription`
+      (`internal/wal/recovery.go`) gained a trailing 4-byte `dbOid` field
+      appended to the payload — backward-compatible: a pre-existing
+      on-disk WAL record with no trailer decodes as `dbOid=0`
+      (`DefaultDBOid` via `NamespaceDBOid`), identical to the pre-fix
+      default — so `internal/initdb/pubsub_ddl_recovery.go`'s replay path
+      restores it into the recovered `*catalog.Subscription`. New helper
+      `server.applyWorkerCatalog` (`internal/server/applylauncher.go`)
+      wraps a catalog with `&catalog.SearchPathCatalog{Catalog: cat, DBOid:
+      subDBOid}`; `DefaultLaunchApplyWorker` calls it on `cfg.Catalog`
+      before `executor.NewApplyWorker` — the *only* construction site
+      (`sub catalog.Subscription` was already threaded all the way from
+      `ApplyLauncher`'s `PubSub.Subscriptions()` scan into
+      `LaunchApplyWorkerFunc`, confirmed by inspection, so no further
+      plumbing was needed). Every un-dbOid-threaded `LookupTable`/
+      `LookupIndex`/`IndexesOnTable` call inside applyworker.go
+      (`applyRelation`'s local-table resolution at line 217,
+      `primaryKeyOnlyRow`'s PK lookup at ~line 662) now transparently
+      resolves the subscribing database's own tables via the
+      `SearchPathCatalog` overrides item 1's planner-package fix already
+      added (follow-up 16) — **zero lines changed inside
+      applyworker.go itself.** New test
+      `TestApplyWorkerAppliesInsertUnderDistinctSubscriptionDBOid`
+      (`internal/executor/applyworker_test.go`) drives a real pgoutput
+      B→R→I→C byte stream against a subscriber "items" table registered
+      under a distinct dbOid (alongside the fixture's pre-existing
+      DefaultDBOid "items" table as a negative control); confirmed
+      non-vacuous by temporarily reverting just the `SearchPathCatalog`
+      wrap and observing the applied row silently land in the *wrong*
+      same-named `DefaultDBOid` table instead — exactly the
+      cross-database aliasing hazard this corner was deferred over.
+      `TestCreateSubscriptionRoutesToConnectionRealDBOid` /
+      `TestCreateSubscriptionPostgresConnectionStaysOnDefaultDBOid`
+      (`internal/executor/operators_ddl_pubsub_test.go`) cover the
+      write-side routing, including the `postgres`/`DefaultDBOid`
+      dual-mirror shim; `TestApplyWorkerCatalogSeedsSubscriptionDBOid`
+      (`internal/server/applylauncher_test.go`) pins the new helper's own
+      contract (including the zero-dbOid legacy-subscription case).
+      Deferral ledger: the prior loop's row for this corner
+      (`M0122-0007 4d-ii-part-2b item 1 (cross-file IndexesOnTable
+      sweep)`) flipped to `resolved`; a new `resolved` row records this
+      loop's full landing. Design doc
+      (`docs/design/0122-0018-per-database-catalog-namespace.md`) status
+      line, item 1's section, and "Recommended order" section all updated
+      to reflect 4d-ii-part-2b's full completion; `docs/design/README.md`
+      row extended. **Remaining M0122-0007 work: 4e only** (dependent-
+      object-walk fixups — FK target resolution, view dependency
+      tracking, sequence ownership — assuming a single global namespace,
+      then the `CREATE DATABASE ... TEMPLATE` copy mechanism this epic
+      exists to unblock). Gates: `go build ./...`/`go vet ./...` clean;
+      `go test -race ./internal/catalog/... ./internal/executor/...
+      ./internal/wal/... ./internal/server/...` PASS (two unrelated
+      pre-existing collateral hazards reconfirmed, not caused by this
+      loop: `TestConnectExceedsPositiveDatconnlimitRejected`'s data race
+      in `internal/activity/registry.go`, already documented by the 4c
+      loop, reproduces identically on unmodified HEAD via `git stash`;
+      `TestStripeAppendConcurrentDrainConsistency` in `internal/wal` is a
+      pre-existing timing-flaky test, passes cleanly in isolation); `go
+      test -count=1 ./internal/catalog/... ./internal/executor/...
+      ./internal/wal/... ./internal/server/... ./internal/initdb/...
+      ./internal/planner/... ./internal/storage/...` (non-race, full
+      run) PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS
+      (0 failed transactions, all 3 pgbench workloads).
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,

@@ -91,7 +91,7 @@ func replayPubSubDDLRecords(walDir string, pubsub *catalog.PubSub) error {
 			}
 			pubsub.SetPublicationOwnerDuringRecovery(name, ownerOID)
 		case wal.RecordKindCreateSubscription:
-			name, conninfo, slotName, publications, oid, ownerOID, enabled, derr := wal.DecodeCreateSubscription(rec.Payload)
+			name, conninfo, slotName, publications, oid, ownerOID, enabled, dbOid, derr := wal.DecodeCreateSubscription(rec.Payload)
 			if derr != nil {
 				return fmt.Errorf("decode create-subscription at lsn %d: %w", rec.StartLSN, derr)
 			}
@@ -103,6 +103,7 @@ func replayPubSubDDLRecords(walDir string, pubsub *catalog.PubSub) error {
 				Publications: publications,
 				Enabled:      enabled,
 				SlotName:     slotName,
+				DBOid:        dbOid,
 			})
 		case wal.RecordKindDropSubscription:
 			name, derr := wal.DecodeDropSubscription(rec.Payload)

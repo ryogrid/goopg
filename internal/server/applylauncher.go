@@ -263,7 +263,7 @@ func DefaultLaunchApplyWorker(ctx context.Context, cfg ApplyLauncherConfig, sub 
 	}
 	appName = resolveApplyWorkerApplicationName(appName, sub.Name)
 
-	apply := executor.NewApplyWorker(cfg.Catalog, cfg.Pool, cfg.TxnMgr)
+	apply := executor.NewApplyWorker(applyWorkerCatalog(cfg.Catalog, sub.DBOid), cfg.Pool, cfg.TxnMgr)
 	apply.SetSubscriptionContext(cfg.PubSub, sub.Name)
 	apply.SetLogger(cfg.Logger)
 
@@ -293,6 +293,22 @@ func DefaultLaunchApplyWorker(ctx context.Context, cfg ApplyLauncherConfig, sub 
 	})
 	defer apply.SafeRollback()
 	return rec.Run(ctx)
+}
+
+// applyWorkerCatalog seeds a catalog.SearchPathCatalog bound to subDBOid
+// (a subscription's Subscription.DBOid) so an ApplyWorker's un-dbOid-
+// threaded LookupTable/LookupIndex/IndexesOnTable calls
+// (internal/executor/applyworker.go) resolve the subscribing database's
+// own tables instead of always DefaultDBOid's — mirrors
+// server.sessionPlanCatalog's real-connection wiring. Safe to wrap
+// unconditionally: SearchPathCatalog.effectiveDBOid translates a zero
+// DBOid (pre-item-1 subscriptions, or any subscription created before
+// M0122-0007 4d-ii-part-2b item 1 shipped) through catalog.NamespaceDBOid
+// to DefaultDBOid, identical to the unwrapped catalog's own zero-dbOid
+// default — so a legacy single-database subscription's behavior is
+// unchanged. M0122-0007 4d-ii-part-2b item 1's applyworker.go corner.
+func applyWorkerCatalog(cat catalog.Catalog, subDBOid uint32) catalog.Catalog {
+	return &catalog.SearchPathCatalog{Catalog: cat, DBOid: subDBOid}
 }
 
 // resolveApplyWorkerApplicationName picks the application_name the

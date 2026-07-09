@@ -1,6 +1,6 @@
 # Per-database catalog namespace (M0122-0007 slice 4)
 
-Status: accepted (sub-slices 4a, 4b-i, 4b-ii, 4c, 4d-i, 4d-ii-part-1, and 4d-ii-part-2a landed; 4d-ii-part-2b items 2 and 3 fully landed, item 1 landed except its applyworker.go corner — item 1's applyworker.go corner + 4e remain planned)
+Status: accepted (sub-slices 4a, 4b-i, 4b-ii, 4c, 4d-i, 4d-ii-part-1, and 4d-ii-part-2a landed; 4d-ii-part-2b items 1, 2, and 3 all fully landed — 4e remains planned)
 Date: 2026-07-09
 Supersedes: none — extends the "Still open" note in
 `0122-0017-database-ddl-drop-guards.md` and the deferral-ledger rows dated
@@ -726,8 +726,8 @@ Two remaining pieces (renumbered from the original "4d-ii-part-2"; part 2a's
    The former deferral-ledger row `AI-20260710-011513-001` /
    4d-ii-part-2b-item-1 is now resolved (see the ledger's `resolved` flip).
 
-4. **Item 1, the cross-file sweep, is now fully landed except one deliberately
-   deferred corner (`applyworker.go`).** Every remaining un-threaded
+4. **Item 1, the cross-file sweep, is now fully landed, including the
+   `applyworker.go` corner (2026-07-10).** Every remaining un-threaded
    `IndexesOnTable` call site got `catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)`
    threaded through: `operators_fk.go` (1), `operators_cluster.go` (3),
    `operators_reindex.go` (2), `deferred_unique.go` (1), `context.go` (1),
@@ -765,17 +765,46 @@ Two remaining pieces (renumbered from the original "4d-ii-part-2"; part 2a's
    no-ops when `o.arbiterTree` is nil), so a genuine primary-key conflict
    would surface as an unhandled `23505` instead of being silently skipped.
 
-   **Deliberately left unthreaded:** `internal/executor/applyworker.go`'s
-   `primaryKeyOnlyRow` (~line 662) still calls `cat.IndexesOnTable(tbl)`
-   with no dbOid. The entire logical-replication apply-worker path is
-   uniformly un-migrated for dbOid-awareness — its sibling
-   `w.cat.LookupTable` call (line 217) also carries no dbOid argument, and
-   `NewApplyWorker` receives a bare `cat catalog.Catalog`, never a
-   per-subscription-dbOid-seeded `SearchPathCatalog` — so threading only
-   this one call would be a partial, inconsistent fix. Needs its own
-   dedicated pass: give `ApplyWorker` a per-subscription dbOid concept
-   first, then thread it through every `w.cat.*` call together. See the
-   deferral ledger's 2026-07-10 item-1 row.
+   **`applyworker.go` corner LANDED (2026-07-10):** rather than threading a
+   `dbOid` argument through each of `applyRelation`'s `w.cat.LookupTable`
+   (line 217) and `primaryKeyOnlyRow`'s `cat.IndexesOnTable(tbl)`
+   (~line 662) individually — which the prior loop noted would be a
+   partial, inconsistent fix given how many `w.cat.*` call sites exist —
+   `ApplyWorker.cat` itself is now constructed pre-wrapped in a
+   dbOid-seeded `catalog.SearchPathCatalog`, so every un-dbOid-threaded
+   call transparently resolves the subscription's own database via the
+   `SearchPathCatalog.LookupTable`/`IndexesOnTable` overrides item 1's
+   planner-package fix (above) already added. Three pieces:
+   `catalog.Subscription` gained a `DBOid uint32` field, set by
+   `PubSub.CreateSubscriptionAsOwner`'s new variadic `dbOid ...uint32`
+   parameter (mirroring `CreateTable`/`CreateIndex`'s convention);
+   `executor.execCreateSubscription` (`operators_ddl.go`) passes
+   `catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)` at its one call site,
+   and the `wal.EncodeCreateSubscription`/`DecodeCreateSubscription`
+   record format gained a trailing 4-byte `dbOid` field (backward-compatible
+   — a pre-existing on-disk WAL record with no trailer decodes as `dbOid=0`,
+   i.e. `DefaultDBOid` via `NamespaceDBOid`, identical to the pre-fix
+   default) so `internal/initdb/pubsub_ddl_recovery.go`'s replay path
+   restores it too. `server.applyWorkerCatalog` (new helper,
+   `internal/server/applylauncher.go`) wraps `cfg.Catalog` with
+   `&catalog.SearchPathCatalog{Catalog: cat, DBOid: subDBOid}` and
+   `DefaultLaunchApplyWorker` calls it before `executor.NewApplyWorker` —
+   the one and only construction site (`sub catalog.Subscription` was
+   already threaded all the way from `ApplyLauncher`'s
+   `PubSub.Subscriptions()` scan into `LaunchApplyWorkerFunc`, so no
+   further plumbing was needed there). Verified via new test
+   `TestApplyWorkerAppliesInsertUnderDistinctSubscriptionDBOid`
+   (`internal/executor/applyworker_test.go`), confirmed to fail — the
+   applied row silently lands in the *wrong* (`DefaultDBOid`) same-named
+   table instead of the subscription's own — against a revert of just the
+   `SearchPathCatalog` wrap, exactly the cross-database aliasing hazard
+   this corner was deferred over. `TestCreateSubscriptionRoutesToConnectionRealDBOid`
+   / `TestCreateSubscriptionPostgresConnectionStaysOnDefaultDBOid`
+   (`internal/executor/operators_ddl_pubsub_test.go`) and
+   `TestApplyWorkerCatalogSeedsSubscriptionDBOid`
+   (`internal/server/applylauncher_test.go`) cover the write-side routing
+   and the helper's own contract respectively. The former deferral-ledger
+   row for this corner is resolved (see the ledger's `resolved` flip).
 
 ### 4e — Cross-cutting fixups + the original motivation (planned)
 
@@ -791,28 +820,27 @@ today, ready to become a hard assertion once this lands).
 ## Recommended order and stopping points
 
 4a (landed) → 4b-i (landed) → 4b-ii (landed) → 4c (landed) → 4d-i (landed) →
-4d-ii-part-1 (landed) → 4d-ii-part-2a (landed) → 4d-ii-part-2b → 4e, strictly
-in order — each depends on the previous sub-slice's data shape.
+4d-ii-part-1 (landed) → 4d-ii-part-2a (landed) → 4d-ii-part-2b (landed) → 4e,
+strictly in order — each depends on the previous sub-slice's data shape.
 4d-ii-part-2b's item 3 (the `CreateView`/`AllUserViews`/`AllUserMatViews`/
 `IndexesOnTable`/`planCatalog()` dbOid-awareness gap, see 4d-ii-part-2a's
-"New finding" above) and item 1 (the cross-file `IndexesOnTable` sweep,
+"New finding" above), item 1 (the cross-file `IndexesOnTable` sweep,
 including the `catalog.SearchPathCatalog.IndexesOnTable` override that
-transparently covers every `internal/planner` call site) are now both
-fully landed. Item 2, wiring `RelFileNode.DBOid` at creation time, is now
-also fully landed (2026-07-10) — see its section above for the
-`postgres`/`DefaultDBOid` dual-mirror guard that turned out load-bearing.
-What remains of 4d-ii-part-2b: item 1's one deliberately deferred corner
-(`internal/executor/applyworker.go`'s logical-replication apply-worker path
-— needs a per-subscription dbOid concept that doesn't exist yet before it
-can be threaded consistently). Before resuming it, read
-4d-i's, 4d-ii-part-1's,
-and 4d-ii-part-2a's landed sections above in full — they document exactly
-which write entry points and which `operators_ddl.go` lookups already
-thread the connection's real dbOid (so 4d-ii-part-2b's remaining lookups
-must resolve the SAME `catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)`
-value to actually find what 4d-i/4d-ii-part-1/4d-ii-part-2a create), the
-`postgres`/`DefaultDBOid` dual-mirror shim that still applies unchanged, and
-the `ns()`/`getOrCreateNS` split (create-needing paths use `getOrCreateNS`;
+transparently covers every `internal/planner` call site, and its
+`applyworker.go` corner — see item 1's section above for
+`server.applyWorkerCatalog`), and item 2 (wiring `RelFileNode.DBOid` at
+creation time — see its section above for the `postgres`/`DefaultDBOid`
+dual-mirror guard that turned out load-bearing) are now all fully landed
+(2026-07-10). **4d-ii-part-2b is complete; the only remaining sub-slice is
+4e** (dependent-object-walk fixups + the `CREATE DATABASE ... TEMPLATE`
+copy mechanism). Before starting it, read 4d-i's, 4d-ii-part-1's, and
+4d-ii-part-2a's/4d-ii-part-2b's landed sections above in full — they
+document exactly which write entry points and lookups already thread the
+connection's real dbOid (so 4e's dependent-object walks must resolve the
+SAME `catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)` value to actually
+find what earlier sub-slices create), the `postgres`/`DefaultDBOid`
+dual-mirror shim that still applies unchanged, and the
+`ns()`/`getOrCreateNS` split (create-needing paths use `getOrCreateNS`;
 don't revert them to the old always-creating `ns()`). If a sub-slice is cut
 off mid-implementation, prefer reverting it
 whole (the tree must build and tests must pass at every commit) over leaving

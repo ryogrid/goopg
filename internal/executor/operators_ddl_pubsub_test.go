@@ -181,6 +181,59 @@ func TestCreateSubscriptionOwnerTracksEffectiveRole(t *testing.T) {
 	}
 }
 
+// TestCreateSubscriptionRoutesToConnectionRealDBOid exercises M0122-0007
+// 4d-ii-part-2b item 1's catalog+executor half: a connection's real dbOid
+// (ctx.CurrentDatabaseOid) must land on the created Subscription's DBOid
+// field, translated through catalog.NamespaceDBOid the same way every
+// other DDL write entry point already does (items 1-3). The apply
+// launcher's DefaultLaunchApplyWorker reads this field
+// (applyWorkerCatalog) to seed the worker's catalog.SearchPathCatalog —
+// see TestApplyWorkerAppliesInsertUnderDistinctSubscriptionDBOid
+// (internal/executor/applyworker_test.go) for the consumer side.
+func TestCreateSubscriptionRoutesToConnectionRealDBOid(t *testing.T) {
+	const otherDBOid = 7373
+	ctx, _, cleanup := newStorageFixture(t)
+	defer cleanup()
+	ctx.PubSub = catalog.NewPubSub()
+	ctx.CurrentDatabaseOid = otherDBOid
+
+	sql := "CREATE SUBSCRIPTION s CONNECTION 'host=remote dbname=app' PUBLICATION p1 WITH (enabled = false)"
+	if err := runDDL(t, ctx, sql); err != nil {
+		t.Fatalf("runDDL: %v", err)
+	}
+	sub, ok := ctx.PubSub.LookupSubscription("s")
+	if !ok {
+		t.Fatal("subscription s not registered")
+	}
+	if sub.DBOid != otherDBOid {
+		t.Errorf("sub.DBOid = %d, want %d", sub.DBOid, otherDBOid)
+	}
+}
+
+// TestCreateSubscriptionPostgresConnectionStaysOnDefaultDBOid pins the
+// postgres/DefaultDBOid dual-mirror shim (catalog.NamespaceDBOid) on
+// CREATE SUBSCRIPTION's write side, mirroring
+// TestExecCreateTablePostgresConnectionStaysOnDefaultDBOid
+// (ddl_write_dbid_routing_test.go) for tables.
+func TestCreateSubscriptionPostgresConnectionStaysOnDefaultDBOid(t *testing.T) {
+	ctx, _, cleanup := newStorageFixture(t)
+	defer cleanup()
+	ctx.PubSub = catalog.NewPubSub()
+	ctx.CurrentDatabaseOid = catalog.PostgresDBOid
+
+	sql := "CREATE SUBSCRIPTION s CONNECTION 'host=remote dbname=app' PUBLICATION p1 WITH (enabled = false)"
+	if err := runDDL(t, ctx, sql); err != nil {
+		t.Fatalf("runDDL: %v", err)
+	}
+	sub, ok := ctx.PubSub.LookupSubscription("s")
+	if !ok {
+		t.Fatal("subscription s not registered")
+	}
+	if sub.DBOid != catalog.DefaultDBOid {
+		t.Errorf("sub.DBOid = %d, want DefaultDBOid (%d)", sub.DBOid, catalog.DefaultDBOid)
+	}
+}
+
 // TestAlterPublicationOwnerTo covers the loop #65 ledger row's "ALTER
 // PUBLICATION ... OWNER TO" resume point: a publication's owner can be
 // reassigned after CREATE, matching PostgreSQL's AlterPublicationOwner
