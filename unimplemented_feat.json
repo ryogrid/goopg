@@ -3185,7 +3185,7 @@
    "feature": "SET STATISTICS column option is only supported in ALTER TABLE but not in CREATE TABLE; statistics targets cannot be specified when creating a table",
    "task_id": "M0110-0001",
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "No CREATE TABLE threading (SET STATISTICS is ALTER-only)"
    ],
@@ -3200,7 +3200,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/parser/ddl.go:3815 SET STATISTICS not in parseColumnDef"
+   "code_audit": "RESOLVED 2026-07-09 (M0122-0007, verify-before-implement): not a real gap — real PostgreSQL's own grammar (postgres/src/backend/parser/gram.y ColConstraintElem, columnDef) has no inline per-column SET STATISTICS form at all; column statistics targets are settable only via ALTER TABLE ... ALTER COLUMN ... SET STATISTICS (gram.y:2482-2496) or ALTER STATISTICS ... SET STATISTICS for extended statistics objects (gram.y:4770-4786). goopg's existing ALTER TABLE support already matches upstream's only valid syntax; there is nothing to add to CREATE TABLE."
   },
   {
    "feature": "TOAST compression functionality is not implemented. Compression metadata round-trips through pg_dump for schema fidelity, but actual data compression is not performed.",

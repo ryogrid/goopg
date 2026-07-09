@@ -6192,6 +6192,28 @@ mirroring M0119's ledger `status` column.
       workloads). Design: `docs/design/0003-0006-date-interval-arithmetic.md`
       updated (2026-07-08 follow-up section), `docs/design/README.md` row
       updated.
+- [x] **M0122-0019 — CREATE TABLE inline `SET STATISTICS` — verified not a
+      gap** (~1; `unimplemented_feat.json` task `M0110-0001`). The entry
+      claimed CREATE TABLE column definitions were missing an inline `SET
+      STATISTICS N` clause (only `ALTER TABLE ... ALTER COLUMN ... SET
+      STATISTICS` was wired). Checked upstream's own grammar
+      (`postgres/src/backend/parser/gram.y`): `columnDef`/`ColConstraintElem`
+      (lines 3814-4180ish) has no `STATISTICS` alternative at all — a
+      per-column statistics target is settable ONLY via `ALTER TABLE ...
+      ALTER COLUMN ... SET STATISTICS` (gram.y:2482-2496) or, for extended
+      statistics objects, `ALTER STATISTICS ... SET STATISTICS`
+      (gram.y:4770-4786); real `psql`/`pg_dump` never emit an inline form in
+      `CREATE TABLE` either (`ALTER ... SET STATISTICS` always follows the
+      `CREATE TABLE`). goopg's existing ALTER TABLE support already covers
+      upstream's only valid syntax, so there is nothing to add — the prior
+      code-audit's "confirmed-open: SET STATISTICS not in parseColumnDef"
+      was checking for syntax that does not exist in real PostgreSQL.
+      `unimplemented_feat.json`'s matching entry flipped `open`→`resolved`
+      with the grammar citation recorded in `code_audit` (no code change,
+      no test needed — nothing to regress). No design doc: this is a
+      verify-before-implement finding, not an implementation, mirroring the
+      M0122-0005 bucket's several prior "stale entry, no code change needed"
+      closures.
 
 > This task list is **seeded, not exhaustive.** The M0122-0001 triage plus every
 > future feature deferral appended to `unimplemented_feat.json` (any new `open`
