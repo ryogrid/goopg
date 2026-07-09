@@ -5359,6 +5359,43 @@ mirroring M0119's ledger `status` column.
       point on an eventual sweep mechanism). **Remaining M0122-0007 items:**
       CREATE/DROP DATABASE full DDL, REINDEX CONCURRENTLY physical rebuild
       (both pre-existing, untouched this loop).
+      **DROP DATABASE guard checks — done (2026-07-09, this loop):** closed
+      the "no active-connection check" sub-item a dedicated research pass
+      confirmed was the concretely-scoped, non-architectural residual inside
+      "CREATE/DROP DATABASE full DDL" (full per-database physical storage
+      isolation is a separate, materially larger architectural item this
+      bucket has correctly deferred whole for ~10 loops — untouched here).
+      `tryHandleDatabaseDDL`'s `databaseDDLDrop` branch
+      (`internal/server/database_ddl.go`) was a bare catalog map-delete with
+      zero guard checks; now runs, mirroring `dbcommands.c dropdb()`'s own
+      order: template rejection (`template0`/`template1` → 42809
+      `WrongObjectType`, "cannot drop a template database"), self-drop
+      rejection (target == the calling connection's own live database → 55006
+      `ObjectInUse`, "cannot drop the currently open database"), then a
+      busy-check via the pre-existing `activity.ActivityRegistry.CountByDatName`
+      (already built for M0119-0006's `datconnlimit` connect-time check) → 55006
+      `ObjectInUse`, "database %q is being accessed by other users". The
+      self-drop check is ordered before the busy check specifically so no new
+      self-exclusion bookkeeping is needed: once it passes, `name !=
+      liveDBName` is guaranteed, so any backend `CountByDatName(name)` finds
+      next is necessarily a connection other than this one (`CountByDatName`
+      itself is self-inclusive by design, built for a different, connect-time
+      use case). Tests: `TestTryHandleDatabaseDDLDropGuards`
+      (`internal/server/database_ddl_test.go`), confirmed non-vacuous via
+      `git stash`. Design: new `docs/design/0122-0017-database-ddl-drop-guards.md`;
+      `docs/design/README.md` row added. Gates: `go build ./...`/`go vet
+      ./internal/server/... ./internal/activity/...` clean; `go test
+      ./internal/server/... ./internal/activity/...` PASS (full packages, no
+      regression); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed transactions, all 3 workloads). **Still open in this sub-item:**
+      `WITH (FORCE)`/connection-termination (no cancel-backend mechanism
+      exists) and ownership/permission checks (no database-owner tracking
+      exists) — both noted in the deferral ledger row appended this loop.
+      **Remaining M0122-0007 items (unchanged):** CREATE/DROP DATABASE
+      physical storage isolation (template copy on CREATE, real directory
+      removal on DROP — the architectural item), REINDEX CONCURRENTLY
+      physical rebuild.
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,

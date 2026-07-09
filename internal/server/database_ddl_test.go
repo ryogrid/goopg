@@ -4,6 +4,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/goopg/goopg/internal/activity"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/sqlstate"
 )
@@ -327,3 +328,80 @@ func TestDatabaseDDLErrorSQLState(t *testing.T) {
 }
 
 var errUnwrappedForTest = errors.New("boom")
+
+// TestTryHandleDatabaseDDLDropGuards pins the three DROP DATABASE guard
+// checks mirrored from PG's dropdb() (dbcommands.c): template protection,
+// "can't drop my own database", and the other-backends busy check — all
+// three were entirely absent before this change (DropDatabase was a bare
+// map delete with no guards at all).
+func TestTryHandleDatabaseDDLDropGuards(t *testing.T) {
+	s := newTestRoleServer()
+	im := s.cfg.Catalog.(*catalog.InMemory)
+	if err := im.CreateDatabase("tpch"); err != nil {
+		t.Fatalf("seed CreateDatabase(tpch): %v", err)
+	}
+
+	// PG: dropdb(), "cannot drop a template database" (42809).
+	for _, name := range []string{"template0", "template1"} {
+		handled, _, err := s.tryHandleDatabaseDDL("DROP DATABASE "+name, "postgres", nil)
+		if !handled || err == nil {
+			t.Fatalf("DROP DATABASE %s: handled=%v err=%v, want an error", name, handled, err)
+		}
+		if got := databaseDDLErrorSQLState(err); got != sqlstate.WrongObjectType {
+			t.Errorf("DROP DATABASE %s: sqlstate = %q, want %q", name, got, sqlstate.WrongObjectType)
+		}
+		if want := "cannot drop a template database"; err.Error() != want {
+			t.Errorf("DROP DATABASE %s: message = %q, want %q", name, err.Error(), want)
+		}
+		if !im.HasDatabase(name) {
+			t.Errorf("DROP DATABASE %s: database was removed despite the rejection", name)
+		}
+	}
+
+	// PG: dropdb(), "cannot drop the currently open database" (55006) —
+	// the connection's own liveDBName is the target.
+	handled, _, err := s.tryHandleDatabaseDDL("DROP DATABASE postgres", "postgres", nil)
+	if !handled || err == nil {
+		t.Fatalf("DROP DATABASE postgres (self): handled=%v err=%v, want an error", handled, err)
+	}
+	if got := databaseDDLErrorSQLState(err); got != sqlstate.ObjectInUse {
+		t.Errorf("DROP DATABASE postgres (self): sqlstate = %q, want %q", got, sqlstate.ObjectInUse)
+	}
+	if want := "cannot drop the currently open database"; err.Error() != want {
+		t.Errorf("DROP DATABASE postgres (self): message = %q, want %q", err.Error(), want)
+	}
+	if !im.HasDatabase("postgres") {
+		t.Error("DROP DATABASE postgres (self): database was removed despite the rejection")
+	}
+
+	// PG: dropdb(), CountOtherDBBackends() -> "is being accessed by other
+	// users" (55006). Register a fake backend connected to tpch.
+	reg := activity.NewRegistry()
+	s.cfg.Activity = reg
+	reg.Register(&activity.Backend{PID: "999", DatName: "tpch", BackendType: "client_backend"})
+	defer reg.Unregister("999")
+
+	handled, _, err = s.tryHandleDatabaseDDL("DROP DATABASE tpch", "postgres", nil)
+	if !handled || err == nil {
+		t.Fatalf("DROP DATABASE tpch (busy): handled=%v err=%v, want an error", handled, err)
+	}
+	if got := databaseDDLErrorSQLState(err); got != sqlstate.ObjectInUse {
+		t.Errorf("DROP DATABASE tpch (busy): sqlstate = %q, want %q", got, sqlstate.ObjectInUse)
+	}
+	if want := `database "tpch" is being accessed by other users`; err.Error() != want {
+		t.Errorf("DROP DATABASE tpch (busy): message = %q, want %q", err.Error(), want)
+	}
+	if !im.HasDatabase("tpch") {
+		t.Error("DROP DATABASE tpch (busy): database was removed despite the rejection")
+	}
+
+	// Once the other backend disconnects, the drop succeeds.
+	reg.Unregister("999")
+	handled, _, err = s.tryHandleDatabaseDDL("DROP DATABASE tpch", "postgres", nil)
+	if !handled || err != nil {
+		t.Fatalf("DROP DATABASE tpch (idle): handled=%v err=%v, want success", handled, err)
+	}
+	if im.HasDatabase("tpch") {
+		t.Error("DROP DATABASE tpch (idle): database still registered after a successful drop")
+	}
+}

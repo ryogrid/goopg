@@ -504,17 +504,66 @@ func (s *Server) tryHandleDatabaseDDL(sql string, liveDBName string, resolveCurr
 		}
 		return true, "", nil
 	case databaseDDLDrop:
+		// PG's dropdb() (dbcommands.c) runs its guard checks — template,
+		// currently-open, other-backends — AFTER the existence lookup but
+		// BEFORE actually removing the pg_database row. goopg's
+		// HasDatabase pre-check mirrors that ordering; cat.DropDatabase
+		// itself only ever mutates once every guard below has passed.
+		if !cat.HasDatabase(name) {
+			// IF EXISTS branch was already accepted by the prefix
+			// match; the executor must not surface "not found"
+			// when the user said IF EXISTS. Inspect the SQL again.
+			lower := strings.ToLower(strings.TrimSpace(sql))
+			if strings.HasPrefix(lower, "drop database if exists ") {
+				notice := fmt.Sprintf("database %q does not exist, skipping", name)
+				return true, notice, nil
+			}
+			// Non-IF-EXISTS: PG: dbcommands.c dropdb(), ERRCODE_UNDEFINED_DATABASE.
+			return true, "", &databaseDDLError{
+				code: sqlstate.UndefinedDatabase,
+				msg:  fmt.Sprintf("database %q does not exist", name),
+			}
+		}
+		// PG: dropdb(), "Disallow dropping a DB that is marked istemplate"
+		// (ERRCODE_WRONG_OBJECT_TYPE). goopg has no ALTER DATABASE ...
+		// IS_TEMPLATE, so template0/template1 are permanently templates
+		// (mirrors pg_database's own hardcoded datistemplate rendering,
+		// catalog.go's pgDatabase.VirtualRows).
+		if name == "template0" || name == "template1" {
+			return true, "", &databaseDDLError{
+				code: sqlstate.WrongObjectType,
+				msg:  "cannot drop a template database",
+			}
+		}
+		// PG: dropdb(), "Obviously can't drop my own database"
+		// (ERRCODE_OBJECT_IN_USE). Checked before the other-backends
+		// count below: once this passes, name != liveDBName is
+		// guaranteed, so any backend CountByDatName(name) finds below is
+		// necessarily a connection other than this one — no separate
+		// self-exclusion bookkeeping needed.
+		if name == liveDBName {
+			return true, "", &databaseDDLError{
+				code: sqlstate.ObjectInUse,
+				msg:  "cannot drop the currently open database",
+			}
+		}
+		// PG: dropdb(), CountOtherDBBackends() (ERRCODE_OBJECT_IN_USE).
+		// goopg has no FORCE/TerminateOtherDBBackends equivalent yet.
+		if s.cfg.Activity != nil {
+			if n := s.cfg.Activity.CountByDatName(name); n > 0 {
+				return true, "", &databaseDDLError{
+					code: sqlstate.ObjectInUse,
+					msg:  fmt.Sprintf("database %q is being accessed by other users", name),
+				}
+			}
+		}
 		if err := cat.DropDatabase(name); err != nil {
 			if errors.Is(err, catalog.ErrDatabaseNotFound) {
-				// IF EXISTS branch was already accepted by the prefix
-				// match; the executor must not surface "not found"
-				// when the user said IF EXISTS. Inspect the SQL again.
-				lower := strings.ToLower(strings.TrimSpace(sql))
-				if strings.HasPrefix(lower, "drop database if exists ") {
-					notice := fmt.Sprintf("database %q does not exist, skipping", name)
-					return true, notice, nil
-				}
-				// Non-IF-EXISTS: PG: dbcommands.c dropdb(), ERRCODE_UNDEFINED_DATABASE.
+				// Unreachable in practice (HasDatabase above already
+				// confirmed existence under the same catalog mutex
+				// discipline every other DDL site here uses), kept only
+				// as a defensive fallback consistent with the pre-existing
+				// error shape.
 				return true, "", &databaseDDLError{
 					code: sqlstate.UndefinedDatabase,
 					msg:  fmt.Sprintf("database %q does not exist", name),
