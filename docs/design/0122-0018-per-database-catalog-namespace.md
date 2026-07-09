@@ -1,6 +1,6 @@
 # Per-database catalog namespace (M0122-0007 slice 4)
 
-Status: accepted (sub-slices 4a, 4b-i, 4b-ii, 4c, and 4d-i landed; 4d-ii, 4e planned)
+Status: accepted (sub-slices 4a, 4b-i, 4b-ii, 4c, 4d-i, and 4d-ii-part-1 landed; 4d-ii-part-2, 4e planned)
 Date: 2026-07-09
 Supersedes: none — extends the "Still open" note in
 `0122-0017-database-ddl-drop-guards.md` and the deferral-ledger rows dated
@@ -458,22 +458,87 @@ $(go list ./... | grep -v /internal/testport)` (full repo, short mode) PASS;
 scripts/ralph-precommit-test.sh` PASS (0 failed transactions, all 3 pgbench
 workloads).
 
-### 4d-ii — Thread dbOid through executor-operator-level lookups + `RelFileNode.DBOid` (planned)
+### 4d-ii-part-1 — Thread dbOid through operators_ddl.go's direct-ctx lookups (LANDED this loop, 2026-07-09)
 
-Two remaining pieces, likely worth their own further split given the size:
+Closed the mechanical, zero-signature-change subset of 4d-ii's first named
+piece: all 60 call sites in `internal/executor/operators_ddl.go` that call
+`o.ctx.Catalog.LookupTable(...)` / `o.ctx.Catalog.LookupIndex(...)` (or, for
+the one bare-`ctx *Context`-parameter helper, `ctx.Catalog.LookupTable(...)`)
+with no dbOid argument now append `catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)`
+(respectively `ctx.CurrentDatabaseOid`) — the same shim 4c wired for reads
+and 4d-i wired for writes. This closes exactly the gap 4d-i's own writeup
+proved empirically: `execDropTable`, `execCreateIndex` (table + all its
+internal re-lookups of the index it just built), `execCreateView`,
+`execDropOneView`/`execDropOneMatView`, the ALTER TABLE family, partition
+attach/detach/inherit, sequence `OWNED BY` resolution, and
+`catalogHeapSyncAvailable` can now all find an object 4d-i's write-side
+routing created under a genuinely distinct connection dbOid, instead of only
+ever resolving `DefaultDBOid`.
 
-1. Thread `catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)` through every
-   executor-operator-level `LookupTable`/`LookupIndex` call that currently
-   passes none (60+ in `operators_ddl.go` alone; more across the DML
-   operators) — see the "critical scope finding" in 4d-i above for exactly
-   why this is required before a second real database's tables are usable
-   through anything but `CREATE TABLE` itself. Given the scale, consider
-   whether wrapping `ectx.Catalog` itself in a `SearchPathCatalog` (mirroring
-   `ectx.PlanCatalog`) is viable instead of touching every call site
-   individually — but note this breaks every `im, ok :=
-   o.ctx.Catalog.(*catalog.InMemory)` type assertion (dozens of them), which
-   would need updating in lockstep, so it may not actually be less work than
-   the mechanical per-call-site fix.
+Applied via a small throwaway Python script (not committed) that locates each
+`.LookupTable(`/`.LookupIndex(` call preceded by `o.ctx.Catalog.` or
+`ctx.Catalog.`, walks forward counting paren depth to find the matching close
+paren (correctly handling the several multi-line call sites, e.g.
+`catalogHeapSyncAvailable`'s and `validateSeqOwnedBy`'s), and inserts the
+dbOid argument there — then the full diff was hand-reviewed before running
+any gates.
+
+New tests: `TestExecDropTableFindsOwnDistinctDBOidTable`,
+`TestExecCreateIndexFindsOwnDistinctDBOidTable`
+(`internal/executor/ddl_write_dbid_routing_test.go`) — CREATE TABLE followed
+by DROP TABLE / CREATE INDEX on the *same* distinct-dbOid connection, which
+failed with "does not exist" / "relation does not exist" before this loop
+(the exact failure mode 4d-i's writeup described but could not yet fix).
+
+Gates: `go build ./...` / `go vet ./...` clean; `go test -race
+./internal/catalog/... ./internal/executor/...` PASS; `go test -short $(go
+list ./... | grep -v /internal/testport)` (full repo, short mode) PASS;
+`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+scripts/ralph-precommit-test.sh` PASS (0 failed transactions, all 3 pgbench
+workloads).
+
+**Explicitly out of scope this loop (4d-ii-part-2, planned):**
+
+1. 15 `im.LookupTable`/`im.LookupIndex`/`cat.LookupTable` call sites still
+   inside `operators_ddl.go` itself, bound from a locally type-asserted `im,
+   ok := o.ctx.Catalog.(*catalog.InMemory)` or a bare `cat Catalog` /
+   `im *catalog.InMemory` function parameter (e.g.
+   `collectAllViewTransitiveDeps(im *catalog.InMemory, startName
+   parser.ObjectName)`, `walkSelectPKDeps(sel, cat, out, seen)`, the
+   ACL-grant table-name loop around line 17026, the DROP-CASCADE helpers
+   around lines 17179-17472). These are **not** a trailing-arg mechanical
+   fix — the enclosing helper functions have no `ctx`/dbOid in scope, so
+   fixing them requires threading a `dbOid uint32` parameter through each
+   helper's own signature and updating every one of *its* callers too. A
+   materially different, signature-cascading shape of change from this
+   loop's direct-ctx sites.
+2. Every other file the original 4d-i "critical scope finding" named:
+   `operators_fk.go`, `operators_cluster.go`, `operators_reindex.go`,
+   `operators_sequence.go`, `operators_storage.go`,
+   `operators_pg_get_publication_tables.go`, and every DML operator
+   (`expr.go` and friends) — entirely untouched. A bare
+   `LookupTable`/`LookupIndex` call in any of those files still resolves
+   only `DefaultDBOid`. Re-measure via `grep -n '\.LookupTable(\|\.LookupIndex('`
+   across those files before starting part 2 — the design doc's original
+   "60+ in operators_ddl.go alone, plus more" estimate is now precisely
+   accounted for on the `operators_ddl.go` side (60 closed, 15 deferred to
+   part 2 above) but the cross-file count was never grep-measured.
+3. `RelFileNode.DBOid` at creation time (4d-ii's second named piece, below)
+   — still hardcoded to `DefaultDBOid` regardless of connection.
+
+### 4d-ii-part-2 — Remaining executor-operator-level lookups + `RelFileNode.DBOid` (planned)
+
+Two remaining pieces:
+
+1. The signature-cascading `im`/`cat`-local lookups in `operators_ddl.go`
+   (item 1 above) plus the full cross-file sweep (item 2 above). Given the
+   scale, consider whether wrapping `ectx.Catalog` itself in a
+   `SearchPathCatalog` (mirroring `ectx.PlanCatalog`) is viable instead of
+   touching every remaining call site individually — but note this breaks
+   every `im, ok := o.ctx.Catalog.(*catalog.InMemory)` type assertion (262
+   occurrences across `internal/executor`, measured via grep during
+   4d-ii-part-1), which would need updating in lockstep, so it may not
+   actually be less work than the mechanical per-call-site fix.
 2. Wire `RelFileNode.DBOid` to the connection's real dbOid at creation time
    (currently hardcoded to `DefaultDBOid` regardless of connection) so
    physical storage genuinely separates per database, closing the loop with
@@ -498,20 +563,23 @@ today, ready to become a hard assertion once this lands).
 ## Recommended order and stopping points
 
 4a (landed) → 4b-i (landed) → 4b-ii (landed) → 4c (landed) → 4d-i (landed) →
-4d-ii → 4e, strictly in order — each depends on the previous sub-slice's data
-shape. 4d-ii is next: thread `catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)`
-through every executor-operator-level `LookupTable`/`LookupIndex` call site
-that doesn't have it yet (see 4d-i's "critical scope finding" above for the
-full list of affected files and the reasoning for why this, not
-`RelFileNode.DBOid`, is the higher-priority half), then wire
-`RelFileNode.DBOid` at creation time. Before starting 4d-ii, read 4d-i's
-landed section above in full — it documents exactly which write entry points
-already thread the connection's real dbOid (so 4d-ii's lookups must resolve
-the SAME `catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)` value to actually
-find what 4d-i creates), the `postgres`/`DefaultDBOid` dual-mirror shim that
-still applies unchanged, and the `ns()`/`getOrCreateNS` split (create-needing
-paths use `getOrCreateNS`; don't revert them to the old always-creating
-`ns()`). If a sub-slice is cut off mid-implementation, prefer reverting it
+4d-ii-part-1 (landed) → 4d-ii-part-2 → 4e, strictly in order — each depends
+on the previous sub-slice's data shape. 4d-ii-part-2 is next: the
+signature-cascading `im`/`cat`-local lookups still in `operators_ddl.go`,
+plus the cross-file sweep across `operators_fk.go`/`operators_cluster.go`/
+`operators_reindex.go`/`operators_sequence.go`/`operators_storage.go`/
+`operators_pg_get_publication_tables.go`/the DML operators (see 4d-ii-part-1's
+"explicitly out of scope" list above for the full breakdown), then wire
+`RelFileNode.DBOid` at creation time. Before starting 4d-ii-part-2, read
+4d-i's and 4d-ii-part-1's landed sections above in full — they document
+exactly which write entry points and which `operators_ddl.go` lookups
+already thread the connection's real dbOid (so 4d-ii-part-2's remaining
+lookups must resolve the SAME `catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)`
+value to actually find what 4d-i/4d-ii-part-1 create), the
+`postgres`/`DefaultDBOid` dual-mirror shim that still applies unchanged, and
+the `ns()`/`getOrCreateNS` split (create-needing paths use `getOrCreateNS`;
+don't revert them to the old always-creating `ns()`). If a sub-slice is cut
+off mid-implementation, prefer reverting it
 whole (the tree must build and tests must pass at every commit) over leaving
 a partially-migrated state.
 

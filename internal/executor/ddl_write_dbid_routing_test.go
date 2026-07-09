@@ -84,3 +84,56 @@ func TestExecCreateTablePostgresConnectionStaysOnDefaultDBOid(t *testing.T) {
 		t.Fatal("LookupTable(DefaultDBOid) did not find a table created over a \"postgres\" connection — dual-mirror shim broken on the write side")
 	}
 }
+
+// TestExecDropTableFindsOwnDistinctDBOidTable covers M0122-0007 slice 4d-ii:
+// before this slice, execDropTable located its target via a bare
+// o.ctx.Catalog.LookupTable(name) call that always resolved DefaultDBOid, so
+// a same-connection DROP TABLE of an object 4d-i's CreateTable routing had
+// just created under a genuinely distinct dbOid would report "does not
+// exist" (documented as the open gap in
+// docs/design/0122-0018-per-database-catalog-namespace.md's 4d-i "critical
+// scope finding"). execDropTable now threads
+// catalog.NamespaceDBOid(ctx.CurrentDatabaseOid) through its own lookup, so
+// CREATE then DROP on the same distinct-dbOid connection round-trips.
+func TestExecDropTableFindsOwnDistinctDBOidTable(t *testing.T) {
+	const otherDBOid = 4444
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+	ctx.CurrentDatabaseOid = otherDBOid
+
+	if err := runDDL(t, ctx, "CREATE TABLE widgets (id int4)"); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	if err := runDDL(t, ctx, "DROP TABLE widgets"); err != nil {
+		t.Fatalf("DROP TABLE: %v", err)
+	}
+
+	name := parser.ObjectName{Schema: "public", Name: "widgets"}
+	if _, ok := ctx.Catalog.LookupTable(name, otherDBOid); ok {
+		t.Fatal("LookupTable(otherDBOid) still finds the table after DROP TABLE on the same connection")
+	}
+}
+
+// TestExecCreateIndexFindsOwnDistinctDBOidTable covers the CREATE INDEX half
+// of the same 4d-ii gap: execCreateIndex's own o.ctx.Catalog.LookupTable(s.Table)
+// call must resolve the connection's real dbOid, or a same-connection CREATE
+// INDEX on a table 4d-i's CreateTable routing had just created under a
+// distinct dbOid would report "relation does not exist".
+func TestExecCreateIndexFindsOwnDistinctDBOidTable(t *testing.T) {
+	const otherDBOid = 4545
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+	ctx.CurrentDatabaseOid = otherDBOid
+
+	if err := runDDL(t, ctx, "CREATE TABLE widgets (id int4)"); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	if err := runDDL(t, ctx, "CREATE INDEX widgets_id_idx ON widgets (id)"); err != nil {
+		t.Fatalf("CREATE INDEX: %v", err)
+	}
+
+	idxName := parser.ObjectName{Schema: "public", Name: "widgets_id_idx"}
+	if _, ok := ctx.Catalog.LookupIndex(idxName, otherDBOid); !ok {
+		t.Fatal("LookupIndex(otherDBOid) did not find the index created by this connection")
+	}
+}

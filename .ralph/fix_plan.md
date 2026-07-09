@@ -6017,6 +6017,59 @@ mirroring M0119's ledger `status` column.
       `RelFileNode.DBOid` at creation time), then 4e (cross-cutting fixups +
       the `CREATE DATABASE ... TEMPLATE` copy mechanism this epic exists to
       unblock).
+  - [x] `M0122-0007` follow-up 12 (2026-07-09, this loop) — **slice 4
+      sub-slice 4d-ii-part-1 landed**: threaded
+      `catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)` through all 60
+      direct `o.ctx.Catalog.LookupTable(...)`/`o.ctx.Catalog.LookupIndex(...)`
+      (and the one bare-`ctx`-param `ctx.Catalog.LookupTable(...)`) call
+      sites in `internal/executor/operators_ddl.go` that previously passed
+      no dbOid argument — `execDropTable`, `execCreateIndex` (and its
+      several internal re-lookups of the index it just built),
+      `execCreateView`/`execDropOneView`/`execDropOneMatView`, the ALTER
+      TABLE family, partition attach/detach/inherit, sequence `OWNED BY`
+      resolution, `catalogHeapSyncAvailable`, etc. Applied via a throwaway
+      Python script (not committed) that walks each `.LookupTable(`/
+      `.LookupIndex(` call to its balanced closing paren (handles the
+      several multi-line call sites correctly) and inserts the dbOid
+      argument; the resulting diff was hand-reviewed via `git diff` before
+      running any gates. This closes exactly the gap 4d-i's own writeup
+      proved empirically: a same-connection DROP TABLE/CREATE INDEX on a
+      table just created under a distinct dbOid by 4d-i's write routing
+      could not find it (`o.ctx.Catalog.LookupTable`/`LookupIndex` always
+      resolved `DefaultDBOid` regardless of `ctx.CurrentDatabaseOid`). New
+      tests `TestExecDropTableFindsOwnDistinctDBOidTable`,
+      `TestExecCreateIndexFindsOwnDistinctDBOidTable`
+      (`internal/executor/ddl_write_dbid_routing_test.go`) — CREATE TABLE
+      then DROP TABLE / CREATE INDEX on the same distinct-dbOid connection,
+      confirmed failing with "does not exist" before this loop's fix.
+      **Deliberately out of scope, deferred to 4d-ii-part-2** (both
+      itemized in the design doc and a new deferral-ledger row): (1) 15
+      `im.LookupTable`/`im.LookupIndex`/`cat.LookupTable` call sites still
+      in `operators_ddl.go` itself, bound from locals/params with no
+      `ctx`/dbOid in scope (`collectAllViewTransitiveDeps`,
+      `walkSelectPKDeps`, the ACL-grant loop, the DROP-CASCADE helpers) —
+      these need a signature-cascading fix (thread `dbOid` through the
+      helper's own signature + every caller), not a trailing-arg one; (2)
+      the entire cross-file sweep the original 4d-i finding named
+      (`operators_fk.go`/`operators_cluster.go`/`operators_reindex.go`/
+      `operators_sequence.go`/`operators_storage.go`/
+      `operators_pg_get_publication_tables.go`/DML operators) — untouched;
+      (3) `RelFileNode.DBOid` at creation time — still hardcoded to
+      `DefaultDBOid`. Design: `docs/design/0122-0018-per-database-catalog-namespace.md`
+      4d-ii split into landed "4d-ii-part-1" (this loop) + planned
+      "4d-ii-part-2" (both itemized in full); `docs/design/README.md` row
+      updated; "Recommended order" section updated. Deferral ledger: new
+      row (2026-07-09, M0122-0007 4d-ii part 1) recording the part-2 gap in
+      full. Gates: `go build ./...`/`go vet ./...` clean; `go test -race
+      ./internal/catalog/... ./internal/executor/...` PASS; `go test -short
+      $(go list ./... | grep -v /internal/testport)` (full repo, short
+      mode) PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed transactions, all 3 pgbench workloads). **Remaining
+      M0122-0007 items:** 4d-ii-part-2 (the signature-cascading `im`/`cat`
+      lookups + cross-file sweep + `RelFileNode.DBOid`), then 4e
+      (cross-cutting fixups + the `CREATE DATABASE ... TEMPLATE` copy
+      mechanism this epic exists to unblock).
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,
