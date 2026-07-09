@@ -1982,6 +1982,19 @@ func (s *Server) wireExtensionRows(ectx *executor.Context, dbName string) {
 			return pc.PGClassRowsForDBOid(catalog.NamespaceDBOid(ectx.CurrentDatabaseOid))
 		}
 	}
+	// pg_indexes / pg_tables must likewise reflect the connecting database's
+	// own indexes/tables, not always DefaultDBOid's. Mirrors the pg_class
+	// wiring above. M0122-0007 4e follow-up 24.
+	if pi, ok := s.cfg.Catalog.(pgIndexesRowLister); ok {
+		ectx.PgIndexesRows = func() [][]string {
+			return pi.PGIndexesRowsForDBOid(catalog.NamespaceDBOid(ectx.CurrentDatabaseOid))
+		}
+	}
+	if pt, ok := s.cfg.Catalog.(pgTablesRowLister); ok {
+		ectx.PgTablesRows = func() [][]string {
+			return pt.PGTablesRowsForDBOid(catalog.NamespaceDBOid(ectx.CurrentDatabaseOid))
+		}
+	}
 }
 
 // pgClassRowLister is implemented by catalog.InMemory to expose a
@@ -1989,6 +2002,17 @@ func (s *Server) wireExtensionRows(ectx *executor.Context, dbName string) {
 // above.
 type pgClassRowLister interface {
 	PGClassRowsForDBOid(dbOid uint32) [][]string
+}
+
+// pgIndexesRowLister / pgTablesRowLister are implemented by catalog.InMemory
+// to expose per-database pg_indexes / pg_tables row-sets, mirroring
+// pgClassRowLister above. M0122-0007 4e follow-up 24.
+type pgIndexesRowLister interface {
+	PGIndexesRowsForDBOid(dbOid uint32) [][]string
+}
+
+type pgTablesRowLister interface {
+	PGTablesRowsForDBOid(dbOid uint32) [][]string
 }
 
 func undoEnumDDLForRollback(connTx *connTxState, cat catalog.Catalog) {

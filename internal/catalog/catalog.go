@@ -5820,6 +5820,82 @@ func verboseIntervalOffset(totalSecs int) string {
 // byte-identical behavior; a per-connection dbOid is wired in via
 // executor.Context.PgClassRows (internal/server/dispatch.go's
 // wireExtensionRows).
+// PGIndexesRowsForDBOid builds the pg_indexes view row-set for dbOid's own
+// tables/indexes (mirrors PGClassRowsForDBOid's per-connection dbOid scoping
+// below). registerSystemTables's VirtualRows closure calls this with
+// DefaultDBOid so every existing caller (server dispatch without a
+// per-connection PgIndexesRows wire-up, every test) sees byte-identical
+// behavior; a per-connection dbOid is wired in via
+// executor.Context.PgIndexesRows (internal/server/dispatch.go's
+// wireExtensionRows). M0122-0007 4e follow-up 24.
+func (c *InMemory) PGIndexesRowsForDBOid(dbOid uint32) [][]string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	// Sort for deterministic output across calls.
+	tableKeys := make([]string, 0, len(c.ns(dbOid).tables))
+	for k, t := range c.ns(dbOid).tables {
+		if t.Virtual {
+			continue
+		}
+		tableKeys = append(tableKeys, k)
+	}
+	sort.Strings(tableKeys)
+	var out [][]string
+	for _, tk := range tableKeys {
+		t := c.ns(dbOid).tables[tk]
+		idxs := c.ns(dbOid).byTable[t.OID]
+		idxKeys := make([]string, 0, len(idxs))
+		for ik := range idxs {
+			idxKeys = append(idxKeys, ik)
+		}
+		sort.Strings(idxKeys)
+		for _, ik := range idxKeys {
+			idx := idxs[ik]
+			schema := idx.Schema
+			if schema == "" {
+				schema = "public"
+			}
+			out = append(out, []string{
+				schema,
+				t.Name,
+				idx.Name,
+				"", // tablespace
+				BuildIndexDef(idx),
+			})
+		}
+	}
+	return out
+}
+
+// PGTablesRowsForDBOid builds the pg_tables view row-set for dbOid's own
+// tables (mirrors PGClassRowsForDBOid's per-connection dbOid scoping below).
+// registerSystemTables's VirtualRows closure calls this with DefaultDBOid so
+// every existing caller sees byte-identical behavior; a per-connection dbOid
+// is wired in via executor.Context.PgTablesRows (internal/server/dispatch.go's
+// wireExtensionRows). M0122-0007 4e follow-up 24.
+func (c *InMemory) PGTablesRowsForDBOid(dbOid uint32) [][]string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	keys := make([]string, 0, len(c.ns(dbOid).tables))
+	for k := range c.ns(dbOid).tables {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var out [][]string
+	for _, k := range keys {
+		t := c.ns(dbOid).tables[k]
+		if t.Virtual {
+			continue
+		}
+		schema := t.Schema
+		if schema == "" {
+			schema = "public"
+		}
+		out = append(out, []string{schema, t.Name, "postgres"})
+	}
+	return out
+}
+
 func (c *InMemory) PGClassRowsForDBOid(dbOid uint32) [][]string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -6465,42 +6541,7 @@ func (c *InMemory) registerSystemTables() {
 		Virtual: true,
 	}
 	pgIndexes.VirtualRows = func() [][]string {
-		c.mu.RLock()
-		defer c.mu.RUnlock()
-		// Sort for deterministic output across calls.
-		tableKeys := make([]string, 0, len(c.ns(DefaultDBOid).tables))
-		for k, t := range c.ns(DefaultDBOid).tables {
-			if t.Virtual {
-				continue
-			}
-			tableKeys = append(tableKeys, k)
-		}
-		sort.Strings(tableKeys)
-		var out [][]string
-		for _, tk := range tableKeys {
-			t := c.ns(DefaultDBOid).tables[tk]
-			idxs := c.ns(DefaultDBOid).byTable[t.OID]
-			idxKeys := make([]string, 0, len(idxs))
-			for ik := range idxs {
-				idxKeys = append(idxKeys, ik)
-			}
-			sort.Strings(idxKeys)
-			for _, ik := range idxKeys {
-				idx := idxs[ik]
-				schema := idx.Schema
-				if schema == "" {
-					schema = "public"
-				}
-				out = append(out, []string{
-					schema,
-					t.Name,
-					idx.Name,
-					"", // tablespace
-					BuildIndexDef(idx),
-				})
-			}
-		}
-		return out
+		return c.PGIndexesRowsForDBOid(DefaultDBOid)
 	}
 	c.ns(DefaultDBOid).tables["pg_catalog.pg_indexes"] = pgIndexes
 
@@ -6937,26 +6978,7 @@ func (c *InMemory) registerSystemTables() {
 		Virtual: true,
 	}
 	pgTables.VirtualRows = func() [][]string {
-		c.mu.RLock()
-		defer c.mu.RUnlock()
-		keys := make([]string, 0, len(c.ns(DefaultDBOid).tables))
-		for k := range c.ns(DefaultDBOid).tables {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		var out [][]string
-		for _, k := range keys {
-			t := c.ns(DefaultDBOid).tables[k]
-			if t.Virtual {
-				continue
-			}
-			schema := t.Schema
-			if schema == "" {
-				schema = "public"
-			}
-			out = append(out, []string{schema, t.Name, "postgres"})
-		}
-		return out
+		return c.PGTablesRowsForDBOid(DefaultDBOid)
 	}
 	c.ns(DefaultDBOid).tables["pg_catalog.pg_tables"] = pgTables
 

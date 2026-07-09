@@ -108,6 +108,16 @@ func (o *valuesOp) Open(ctx *Context) error {
 			// not always DefaultDBOid's — use the per-connection, dbOid-scoped
 			// lister. M0122-0007 4e.
 			o.rows = rematerialiseVirtualRowsFromStrings(tbl, ctx.PgClassRows())
+		} else if tbl.Name == "pg_indexes" && ctx != nil && ctx.PgIndexesRows != nil {
+			// pg_indexes must list the connecting database's own indexes, not
+			// always DefaultDBOid's — mirrors the pg_class branch above.
+			// M0122-0007 4e follow-up 24.
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, ctx.PgIndexesRows())
+		} else if tbl.Name == "pg_tables" && ctx != nil && ctx.PgTablesRows != nil {
+			// pg_tables must list the connecting database's own tables, not
+			// always DefaultDBOid's — mirrors the pg_class branch above.
+			// M0122-0007 4e follow-up 24.
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, ctx.PgTablesRows())
 		} else if tbl.VirtualRows != nil {
 			o.rows = rematerialiseVirtualRows(o.plan)
 		}

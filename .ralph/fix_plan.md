@@ -6729,6 +6729,45 @@ mirroring M0119's ledger `status` column.
       PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
       `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
       failed transactions, all 3 pgbench workloads).
+  - [x] `M0122-0007` follow-up 24 (2026-07-10, this loop) — **fixed 2 of the
+      ~13 sibling virtual-table builders follow-up 23 flagged as
+      row-content-`DefaultDBOid`-only: `pg_indexes` and `pg_tables`.** Same
+      closure-extraction pattern as `PGClassRowsForDBOid`: extracted each
+      `VirtualRows` closure body into an exported
+      `catalog.InMemory.PGIndexesRowsForDBOid(dbOid uint32)` /
+      `PGTablesRowsForDBOid(dbOid uint32)` method, parameterized their
+      `c.ns(DefaultDBOid)` references on `dbOid` (the registered closures now
+      just call `...RowsForDBOid(DefaultDBOid)`, byte-identical default).
+      Wired new per-connection `executor.Context.PgIndexesRows`/
+      `PgTablesRows func() [][]string` fields (mirroring `PgClassRows`), set
+      in `internal/server/dispatch.go`'s `wireExtensionRows` (new
+      `pgIndexesRowLister`/`pgTablesRowLister` interfaces), consumed by new
+      `tbl.Name == "pg_indexes"`/`"pg_tables"` branches in
+      `internal/executor/operators.go`'s `valuesOp.Open`. New tests
+      `TestPgIndexesRowsScopedToConnectionDBOid`/
+      `TestPgTablesRowsScopedToConnectionDBOid`
+      (`internal/executor/fk_dbid_routing_test.go`), mirroring
+      `TestPgClassRowsScopedToConnectionDBOid`. Live end-to-end verified
+      against a real `cmd/goopg` binary + real `psql`: `CREATE DATABASE
+      freshdb2` → connect → `CREATE TABLE only_in_freshdb2 (id int PRIMARY
+      KEY, ...)` → `pg_tables`/`pg_indexes` in `freshdb2` show only that
+      table/its PK index; the same queries against `postgres` db show 0 rows.
+      **Remaining scope (deferred, own future loops):** 11 sibling builders
+      still row-content-`DefaultDBOid`-only — `pg_attrdef`, `pg_constraint`,
+      `pg_inherits`, `pg_index`, `pg_statistic_ext`, `pg_policy`, `pg_depend`,
+      `pg_trigger`, `pg_rewrite`,
+      `information_schema.routines`/`parameters`/`routine_*_usage`,
+      `pg_foreign_table`; `pg_sequence`/`pg_sequences`/
+      `information_schema.sequences` and `pg_attribute`/`pg_type` remain
+      separately flagged as before. Design doc updated (new "pg_indexes /
+      pg_tables" residual-gap subsection); `docs/design/README.md` row
+      extended; deferral ledger row appended ("pg_indexes/pg_tables per-dbOid
+      content"). Gates: `go build ./...`/`go vet ./internal/...` clean;
+      `go test ./internal/catalog/... ./internal/executor/...
+      ./internal/server/... ./internal/planner/...` PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed transactions, all 3 pgbench workloads).
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,

@@ -1,6 +1,6 @@
 # Per-database catalog namespace (M0122-0007 slice 4)
 
-Status: accepted (sub-slices 4a, 4b-i, 4b-ii, 4c, 4d-i, 4d-ii-part-1, and 4d-ii-part-2a landed; 4d-ii-part-2b items 1, 2, and 3 all fully landed; 4e's FK-target-resolution, sequence-ownership, and view-constraint-dependency items all landed; `CREATE DATABASE ... TEMPLATE` bounded validation landed 2026-07-10; the pg_class-under-fresh-database gap (name resolution generically, row enumeration for pg_class specifically) landed 2026-07-10 — the real relation-copy mechanism itself remains planned, see "Remaining 4e work" below)
+Status: accepted (sub-slices 4a, 4b-i, 4b-ii, 4c, 4d-i, 4d-ii-part-1, and 4d-ii-part-2a landed; 4d-ii-part-2b items 1, 2, and 3 all fully landed; 4e's FK-target-resolution, sequence-ownership, and view-constraint-dependency items all landed; `CREATE DATABASE ... TEMPLATE` bounded validation landed 2026-07-10; the pg_class-under-fresh-database gap (name resolution generically, row enumeration for pg_class specifically) landed 2026-07-10, and the pg_indexes/pg_tables row-content follow-up landed the same day — 11 sibling virtual-table builders plus the real relation-copy mechanism remain planned, see "Remaining 4e work" below)
 Date: 2026-07-10
 Supersedes: none — extends the "Still open" note in
 `0122-0017-database-ddl-drop-guards.md` and the deferral-ledger rows dated
@@ -1060,6 +1060,27 @@ shows only that database's own table. See the 2026-07-10 deferral-ledger row
 (`pg_indexes`, `pg_tables`, `pg_constraint`, etc.) that are name-resolution-
 fixed by part (1) above but still need part (2)'s row-content treatment
 individually — each is its own bounded future loop.
+
+**`pg_indexes` / `pg_tables` row-content — FIXED 2026-07-10 (same day, next
+loop).** The two next-highest-value sibling builders from the list above (both
+directly probed by HammerDB's checkschema step and psql's `\d`/`\dt` family)
+got the same part-(2) closure-extraction treatment: `catalog.InMemory`
+gained `PGIndexesRowsForDBOid(dbOid uint32)` / `PGTablesRowsForDBOid(dbOid
+uint32)`, wired to new per-connection `executor.Context.PgIndexesRows`/
+`PgTablesRows` fields (mirroring `PgClassRows`, set in
+`internal/server/dispatch.go`'s `wireExtensionRows`), consumed by new
+`tbl.Name == "pg_indexes"`/`"pg_tables"` branches in
+`internal/executor/operators.go`'s `valuesOp.Open`. Live-verified end-to-end:
+`CREATE DATABASE freshdb2` → connect → `CREATE TABLE only_in_freshdb2 (id int
+PRIMARY KEY, ...)` → `pg_tables`/`pg_indexes` show only that table/its PK
+index in `freshdb2`, and 0 rows for it when queried from `postgres`. See the
+2026-07-10 deferral-ledger row ("pg_indexes/pg_tables per-dbOid content") for
+the 11 remaining sibling builders (`pg_attrdef`, `pg_constraint`,
+`pg_inherits`, `pg_index`, `pg_statistic_ext`, `pg_policy`, `pg_depend`,
+`pg_trigger`, `pg_rewrite`, `information_schema.routines`/`parameters`/
+`routine_*_usage`, `pg_foreign_table`) still needing this treatment — each is
+its own bounded future loop; `pg_constraint`/`pg_depend`/`pg_index` are next
+highest-value (pg_dump/psql `\d` catalog joins).
 
 **Remaining 4e work: the `CREATE DATABASE ... TEMPLATE` copy mechanism
 itself** — deep-copying the source dbOid's `catalog.tableNamespace`

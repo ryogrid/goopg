@@ -241,3 +241,101 @@ func pgClassRowsContainName(rows [][]string, relname string) bool {
 	}
 	return false
 }
+
+// TestPgTablesRowsScopedToConnectionDBOid covers M0122-0007 4e follow-up 24's
+// pg_tables VirtualRows enumeration: catalog.InMemory.PGTablesRowsForDBOid
+// must list the GIVEN dbOid's own tables, not always DefaultDBOid's — mirrors
+// TestPgClassRowsScopedToConnectionDBOid above for the pg_tables view.
+func TestPgTablesRowsScopedToConnectionDBOid(t *testing.T) {
+	const otherDBOid = 7005
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+
+	ctx.CurrentDatabaseOid = catalog.DefaultDBOid
+	if err := runDDL(t, ctx, "CREATE TABLE only_in_default (id int4)"); err != nil {
+		t.Fatalf("CREATE TABLE only_in_default: %v", err)
+	}
+	ctx.CurrentDatabaseOid = otherDBOid
+	if err := runDDL(t, ctx, "CREATE TABLE only_in_other (id int4)"); err != nil {
+		t.Fatalf("CREATE TABLE only_in_other: %v", err)
+	}
+
+	im, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		t.Fatalf("ctx.Catalog is %T, want *catalog.InMemory", ctx.Catalog)
+	}
+
+	defaultRows := im.PGTablesRowsForDBOid(catalog.DefaultDBOid)
+	if pgTablesRowsContainName(defaultRows, "only_in_other") {
+		t.Fatal("DefaultDBOid's pg_tables rows include only_in_other, a table created under a distinct dbOid")
+	}
+	if !pgTablesRowsContainName(defaultRows, "only_in_default") {
+		t.Fatal("DefaultDBOid's pg_tables rows are missing only_in_default")
+	}
+
+	otherRows := im.PGTablesRowsForDBOid(otherDBOid)
+	if !pgTablesRowsContainName(otherRows, "only_in_other") {
+		t.Fatal("otherDBOid's pg_tables rows are missing only_in_other")
+	}
+	if pgTablesRowsContainName(otherRows, "only_in_default") {
+		t.Fatal("otherDBOid's pg_tables rows include only_in_default, a table created under DefaultDBOid")
+	}
+}
+
+func pgTablesRowsContainName(rows [][]string, tablename string) bool {
+	for _, r := range rows {
+		if len(r) > 1 && r[1] == tablename {
+			return true
+		}
+	}
+	return false
+}
+
+// TestPgIndexesRowsScopedToConnectionDBOid covers M0122-0007 4e follow-up 24's
+// pg_indexes VirtualRows enumeration: catalog.InMemory.PGIndexesRowsForDBOid
+// must list the GIVEN dbOid's own indexes, not always DefaultDBOid's —
+// mirrors TestPgClassRowsScopedToConnectionDBOid above for the pg_indexes view.
+func TestPgIndexesRowsScopedToConnectionDBOid(t *testing.T) {
+	const otherDBOid = 7006
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+
+	ctx.CurrentDatabaseOid = catalog.DefaultDBOid
+	if err := runDDL(t, ctx, "CREATE TABLE only_in_default (id int4 PRIMARY KEY)"); err != nil {
+		t.Fatalf("CREATE TABLE only_in_default: %v", err)
+	}
+	ctx.CurrentDatabaseOid = otherDBOid
+	if err := runDDL(t, ctx, "CREATE TABLE only_in_other (id int4 PRIMARY KEY)"); err != nil {
+		t.Fatalf("CREATE TABLE only_in_other: %v", err)
+	}
+
+	im, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		t.Fatalf("ctx.Catalog is %T, want *catalog.InMemory", ctx.Catalog)
+	}
+
+	defaultRows := im.PGIndexesRowsForDBOid(catalog.DefaultDBOid)
+	if pgIndexesRowsContainTable(defaultRows, "only_in_other") {
+		t.Fatal("DefaultDBOid's pg_indexes rows include only_in_other's index, a table created under a distinct dbOid")
+	}
+	if !pgIndexesRowsContainTable(defaultRows, "only_in_default") {
+		t.Fatal("DefaultDBOid's pg_indexes rows are missing only_in_default's index")
+	}
+
+	otherRows := im.PGIndexesRowsForDBOid(otherDBOid)
+	if !pgIndexesRowsContainTable(otherRows, "only_in_other") {
+		t.Fatal("otherDBOid's pg_indexes rows are missing only_in_other's index")
+	}
+	if pgIndexesRowsContainTable(otherRows, "only_in_default") {
+		t.Fatal("otherDBOid's pg_indexes rows include only_in_default's index, a table created under DefaultDBOid")
+	}
+}
+
+func pgIndexesRowsContainTable(rows [][]string, tablename string) bool {
+	for _, r := range rows {
+		if len(r) > 1 && r[1] == tablename {
+			return true
+		}
+	}
+	return false
+}

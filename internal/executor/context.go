@@ -483,6 +483,14 @@ type Context struct {
 	// to close over CurrentDatabaseOid. M0122-0007 4e.
 	PgClassRows func() [][]string
 
+	// PgIndexesRows / PgTablesRows mirror PgClassRows above for the pg_indexes
+	// and pg_tables views: each lists CurrentDatabaseOid's own tables/indexes
+	// rather than always DefaultDBOid's (catalog.InMemory's
+	// PGIndexesRowsForDBOid / PGTablesRowsForDBOid). Wired by the server to
+	// close over CurrentDatabaseOid. M0122-0007 4e follow-up 24.
+	PgIndexesRows func() [][]string
+	PgTablesRows  func() [][]string
+
 	// NonSuperuserRole, when non-empty, means the session is currently running
 	// under a non-superuser role (set via SET SESSION AUTHORIZATION). Privilege
 	// checks that require superuser (e.g. LEAKPROOF function attribute) must
