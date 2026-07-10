@@ -448,6 +448,64 @@ Gates: `go build ./...` clean; `go test ./internal/executor/... ./internal/analy
 ./internal/planner/...` and `./internal/parser/...` PASS;
 `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke via pre-commit hook.
 
+## Follow-up: fractional interval magnitudes + Form-1 typmod truncation (2026-07-11)
+
+The prior follow-up left deferred item (a): fractional magnitudes
+(`interval '1.5 hours'`). This loop closed it and, in doing so, surfaced a
+second, distinct PostgreSQL semantic that the integer-only path had masked —
+the **trailing-unit form is an SQL interval typmod that truncates**.
+
+- **Fractional parsing (`parseIntervalMagnitude`).** The literal body is split
+  into an integer part (`val int64`) and a fractional part (`fval float64`,
+  |fval|<1, sharing val's sign) — mirroring how PG's `DecodeInterval` feeds a
+  numeric field to its `Adjust*` helpers
+  (`postgres/src/backend/utils/adt/datetime.c`). `"1.5"→(1,0.5)`,
+  `"-1.5"→(-1,-0.5)`, `".5"→(0,0.5)`.
+- **Fractional spill (`intervalUnitToParts`).** A single shared helper — now the
+  sole source of truth for both `evalIntervalLit` (typed literal) and
+  `parseIntervalCastString` (`::`/CAST), unifying the two sibling paths — spills
+  the fraction into smaller units exactly as PG does: fractional **years →
+  months** (`rint(fval*12)`, sub-month discarded, round-half-to-even via
+  `math.RoundToEven`), fractional **months → days** (`int(fval*30)`) + remainder
+  micros, fractional **days → micros** (`fval*USECS_PER_DAY`), and
+  **h/m/s/ms → micros** (`(val+fval)*scale`). `intervalFractMicros` reproduces
+  `AdjustFractMicroseconds`'s truncate-then-round-remainder (`>0.5`/`<-0.5`
+  strict; an exact half stays truncated).
+- **Form-1 typmod truncation (`truncIntervalToUnit`).** `interval '1.5' hour`
+  yields `01:00:00`, *not* `01:30:00`: the trailing unit is an SQL typmod field
+  that truncates the value to that field's granularity (PG's
+  `AdjustIntervalForTypmod`, `timestamp.c`), toward zero for negatives. This is
+  distinguished from the typmod-free embedded-string form `interval '1.5 hours'`
+  (→ `01:30:00`) by a new `Qualified` flag on both `parser.IntervalLit` and
+  `planner.IntervalLit`, set only in the parser's Form-1 branch and threaded
+  through the two `planner.go` conversions + `plpgsql_runtime.go`. Integer
+  literals are unaffected (nothing below the field to drop), so no regression to
+  the loop-#17 integer cases.
+
+Every expected value was captured byte-for-byte from a real PostgreSQL 18.3
+instance and re-verified end-to-end against a live `cmd/goopg` server + `psql`
+(`interval '1.5 hours'`→`01:30:00`, `interval '1.5 months'`→`1 mon 15 days`,
+`interval '1.5 years'`→`1 year 6 mons`, `interval '1.15 months'`→
+`1 mon 4 days 12:00:00`, `interval '1.5' hour`→`01:00:00`, `interval '1.9' hour`→
+`01:00:00`, `interval '1.5' year`→`1 year`, `interval '-90.9' minute`→
+`-01:30:00`, `'2.5 days'::interval`→`2 days 12:00:00`).
+
+**Still deferred** (see `deferral_ledger.md`): (b) multi-field literals
+(`'1 day 05:00:00'`, `'1 year 2 mons'`, bare `HH:MM:SS` bodies) — a real
+`DecodeInterval` tokenizer; (c) week/decade/century/microsecond unit names;
+(d) the full interval-typmod feature beyond a single trailing field — range
+qualifiers (`HOUR TO MINUTE`), `SECOND(p)` precision, and PG's treatment of a
+non-standard trailing word (`interval '1.5' millisecond`) as a *column alias*
+over a bare `interval '1.5'` (which defaults to **seconds** → `00:00:01.5`),
+whereas goopg's Form-1 switch still recognizes `millisecond`/`milliseconds` as a
+unit (a pre-existing loop-#17 divergence, unchanged here).
+
+Tests: `internal/executor/interval_subday_test.go`
+`TestFractionalIntervalLiterals` (Form-2 spill, cast spill, Form-1 truncation,
+negative truncation toward zero). Gates: `go build ./...` clean; `go test`
+executor/parser/planner/analyzer suites PASS; `scripts/tpch-spotcheck.sh` PASS
+(Q12=2/Q13=33); pgbench smoke via pre-commit hook.
+
 ## Cross-references
 
 - TPC-H query bodies: HammerDB upstream

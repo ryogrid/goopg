@@ -133,3 +133,68 @@ func TestSubDayIntervalLiterals(t *testing.T) {
 		}
 	}
 }
+
+// TestFractionalIntervalLiterals covers fractional interval magnitudes
+// (`interval '1.5 hours'`). Every `want` was captured byte-for-byte from a
+// real PostgreSQL 18.3 instance. Two distinct semantics are exercised:
+//
+//   - the typmod-free forms (Form 2 embedded string + `::interval`/CAST)
+//     spill the fraction into smaller units per PG's DecodeInterval
+//     (1.5 hours → 01:30:00, 1.5 months → 1 mon 15 days);
+//   - the trailing-qualifier form (Form 1, `interval '1.5' hour`) applies
+//     an SQL interval typmod that TRUNCATES below the field's granularity
+//     (1.5 hours → 01:00:00), toward zero for negatives.
+func TestFractionalIntervalLiterals(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+	if err := runDDL(t, ctx, "CREATE TABLE t (id int)"); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	if err := runDDL(t, ctx, "INSERT INTO t VALUES (1)"); err != nil {
+		t.Fatalf("INSERT: %v", err)
+	}
+	cases := []struct{ sql, want string }{
+		// Form 2 (embedded string, no typmod): fraction spills down.
+		{"SELECT interval '1.5 hours'", "01:30:00"},
+		{"SELECT interval '0.5 hours'", "00:30:00"},
+		{"SELECT interval '1.5 minutes'", "00:01:30"},
+		{"SELECT interval '1.5 seconds'", "00:00:01.5"},
+		{"SELECT interval '0.5 seconds'", "00:00:00.5"},
+		{"SELECT interval '1.5 days'", "1 day 12:00:00"},
+		{"SELECT interval '2.5 days'", "2 days 12:00:00"},
+		{"SELECT interval '1.5 months'", "1 mon 15 days"},
+		{"SELECT interval '2.5 months'", "2 mons 15 days"},
+		{"SELECT interval '1.15 months'", "1 mon 4 days 12:00:00"},
+		{"SELECT interval '1.5 years'", "1 year 6 mons"},
+		{"SELECT interval '0.5 years'", "6 mons"},
+		{"SELECT interval '1.5 milliseconds'", "00:00:00.0015"},
+		{"SELECT interval '-1.5 hours'", "-01:30:00"},
+		{"SELECT interval '-0.5 hours'", "-00:30:00"},
+		// Cast / :: forms (no typmod either): same spill semantics.
+		{"SELECT '1.5 hours'::interval", "01:30:00"},
+		{"SELECT CAST('2.5 days' AS interval)", "2 days 12:00:00"},
+		// Form 1 (trailing qualifier): typmod truncates below the field.
+		{"SELECT interval '1.5' hour", "01:00:00"},
+		{"SELECT interval '1.9' hour", "01:00:00"},
+		{"SELECT interval '25.5' hour", "25:00:00"},
+		{"SELECT interval '1.5' minute", "00:01:00"},
+		{"SELECT interval '90.5' minute", "01:30:00"},
+		{"SELECT interval '1.5' second", "00:00:01.5"},
+		{"SELECT interval '1.5' day", "1 day"},
+		{"SELECT interval '1.5' month", "1 mon"},
+		{"SELECT interval '1.5' year", "1 year"},
+		// Form 1 truncation is toward zero for negatives.
+		{"SELECT interval '-1.9' hour", "-01:00:00"},
+		{"SELECT interval '-90.9' minute", "-01:30:00"},
+		{"SELECT interval '-1.9' year", "-1 years"},
+	}
+	for _, c := range cases {
+		rows := runQuery(t, ctx, c.sql+" FROM t")
+		if len(rows) != 1 || len(rows[0]) != 1 {
+			t.Fatalf("%s: expected 1x1 result, got %v", c.sql, rows)
+		}
+		if got := rows[0][0].Format(); got != c.want {
+			t.Errorf("%s = %q, want %q", c.sql, got, c.want)
+		}
+	}
+}

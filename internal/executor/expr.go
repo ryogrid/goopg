@@ -5594,25 +5594,116 @@ func parseIntervalCastString(s string) (months, days int32, micros int64, ok boo
 	if len(parts) != 2 {
 		return 0, 0, 0, false
 	}
-	n, err := strconv.ParseInt(parts[0], 10, 32)
-	if err != nil {
+	val, fval, mok := parseIntervalMagnitude(parts[0])
+	if !mok {
 		return 0, 0, 0, false
 	}
-	switch strings.ToLower(strings.TrimSuffix(parts[1], "s")) {
+	unit := strings.ToLower(strings.TrimSuffix(parts[1], "s"))
+	return intervalUnitToParts(val, fval, unit)
+}
+
+// parseIntervalMagnitude splits an interval magnitude token into its
+// integer part (val) and fractional part (fval, |fval|<1, sharing val's
+// sign), mirroring how PostgreSQL's DecodeInterval feeds a numeric field
+// to the Adjust* helpers (postgres/src/backend/utils/adt/datetime.c): the
+// integer portion scales exactly while the fraction spills into the
+// next-smaller unit. "1.5" → (1, 0.5); "-1.5" → (-1, -0.5);
+// ".5" → (0, 0.5); "1" → (1, 0). Returns ok=false for a non-numeric body.
+func parseIntervalMagnitude(s string) (val int64, fval float64, ok bool) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, 0, false
+	}
+	dot := strings.IndexByte(s, '.')
+	if dot < 0 {
+		n, err := strconv.ParseInt(s, 10, 64)
+		if err != nil {
+			return 0, 0, false
+		}
+		return n, 0, true
+	}
+	intPart, fracPart := s[:dot], s[dot+1:]
+	neg := false
+	switch {
+	case strings.HasPrefix(intPart, "-"):
+		neg, intPart = true, intPart[1:]
+	case strings.HasPrefix(intPart, "+"):
+		intPart = intPart[1:]
+	}
+	if intPart == "" {
+		intPart = "0"
+	}
+	iv, err := strconv.ParseInt(intPart, 10, 64)
+	if err != nil {
+		return 0, 0, false
+	}
+	var fv float64
+	if fracPart != "" {
+		f, ferr := strconv.ParseFloat("0."+fracPart, 64)
+		if ferr != nil {
+			return 0, 0, false
+		}
+		fv = f
+	}
+	if neg {
+		iv, fv = -iv, -fv
+	}
+	return iv, fv, true
+}
+
+// intervalFractMicros scales a sub-unit fraction to microseconds,
+// mirroring PostgreSQL's AdjustFractMicroseconds
+// (postgres/src/backend/utils/adt/datetime.c): truncate toward zero,
+// then round the leftover with a strict >0.5 / <-0.5 comparison (an
+// exact half stays truncated). frac is assumed to have |frac|<1.
+func intervalFractMicros(frac float64, scale int64) int64 {
+	if frac == 0 {
+		return 0
+	}
+	f := frac * float64(scale)
+	usec := int64(f)
+	f -= float64(usec)
+	if f > 0.5 {
+		usec++
+	} else if f < -0.5 {
+		usec--
+	}
+	return usec
+}
+
+// intervalUnitToParts converts an integer magnitude (val) plus fractional
+// remainder (fval) in the given singular, lower-cased unit into interval
+// months/days/micros components, mirroring PostgreSQL's DecodeInterval
+// fractional-spill rules (postgres/src/backend/utils/adt/datetime.c):
+//   - fractional years  → months (rint(fval*12), sub-month discarded)
+//   - fractional months → days (int(fval*30)) + remainder micros
+//   - fractional days   → micros (fval*USECS_PER_DAY)
+//   - fractional h/m/s/ms→ micros ((val+fval)*scale)
+//
+// Returns ok=false for an unrecognised unit (the same v0-supported set as
+// the parser's two interval-literal forms).
+func intervalUnitToParts(val int64, fval float64, unit string) (months, days int32, micros int64, ok bool) {
+	switch unit {
 	case "day":
-		return 0, int32(n), 0, true
+		return 0, int32(val), intervalFractMicros(fval, usecsPerDay), true
 	case "month":
-		return int32(n), 0, 0, true
+		// AdjustFractDays(fval, DAYS_PER_MONTH): whole days then remainder → micros.
+		f := fval * 30
+		extraDays := int64(f)
+		f -= float64(extraDays)
+		return int32(val), int32(extraDays), intervalFractMicros(f, usecsPerDay), true
 	case "year":
-		return int32(n) * 12, 0, 0, true
+		// AdjustFractYears discards any sub-month remainder (round-half-to-even).
+		extraMonths := int64(math.RoundToEven(fval * 12))
+		return int32(val*12 + extraMonths), 0, 0, true
 	case "hour":
-		return 0, 0, n * usecsPerHour, true
+		return 0, 0, val*usecsPerHour + intervalFractMicros(fval, usecsPerHour), true
 	case "minute":
-		return 0, 0, n * usecsPerMinute, true
+		return 0, 0, val*usecsPerMinute + intervalFractMicros(fval, usecsPerMinute), true
 	case "second":
-		return 0, 0, n * usecsPerSecond, true
+		return 0, 0, val*usecsPerSecond + intervalFractMicros(fval, usecsPerSecond), true
 	case "millisecond":
-		return 0, 0, n * usecsPerMilli, true
+		return 0, 0, val*usecsPerMilli + intervalFractMicros(fval, usecsPerMilli), true
 	default:
 		return 0, 0, 0, false
 	}
@@ -5626,35 +5717,51 @@ func parseIntervalCastString(s string) (months, days int32, micros int64, ok boo
 // repeated evaluations in a hot loop skip the
 // `strconv.ParseInt` cost.
 func evalIntervalLit(x *planner.IntervalLit) (Datum, error) {
-	var n int32
 	if x.CacheValid {
-		n = x.CachedN
-	} else {
-		parsed, err := strconv.ParseInt(x.Value, 10, 32)
-		if err != nil {
-			return Datum{}, &ExecError{Code: "22007", Pos: x.Pos(), Message: fmt.Sprintf("invalid interval count %q", x.Value)}
-		}
-		n = int32(parsed)
-		x.CachedN = n
-		x.CacheValid = true
+		return NewIntervalDatumFull(x.CachedMonths, x.CachedDays, x.CachedMicros), nil
 	}
-	switch x.Unit {
-	case "day":
-		return NewIntervalDatum(0, n), nil
-	case "month":
-		return NewIntervalDatum(n, 0), nil
-	case "year":
-		return NewIntervalDatum(n*12, 0), nil
-	case "hour":
-		return NewIntervalDatumFull(0, 0, int64(n)*usecsPerHour), nil
-	case "minute":
-		return NewIntervalDatumFull(0, 0, int64(n)*usecsPerMinute), nil
-	case "second":
-		return NewIntervalDatumFull(0, 0, int64(n)*usecsPerSecond), nil
-	case "millisecond":
-		return NewIntervalDatumFull(0, 0, int64(n)*usecsPerMilli), nil
-	default:
+	val, fval, ok := parseIntervalMagnitude(x.Value)
+	if !ok {
+		return Datum{}, &ExecError{Code: "22007", Pos: x.Pos(), Message: fmt.Sprintf("invalid interval count %q", x.Value)}
+	}
+	months, days, micros, ok := intervalUnitToParts(val, fval, x.Unit)
+	if !ok {
 		return Datum{}, &ExecError{Code: "0A000", Pos: x.Pos(), Message: fmt.Sprintf("interval unit %q is not supported in v0", x.Unit)}
+	}
+	// Form 1 `interval 'N' <unit>`: the trailing unit is an SQL typmod
+	// field that truncates the value to that field's granularity.
+	if x.Qualified {
+		months, days, micros = truncIntervalToUnit(months, days, micros, x.Unit)
+	}
+	x.CachedMonths, x.CachedDays, x.CachedMicros = months, days, micros
+	x.CacheValid = true
+	return NewIntervalDatumFull(months, days, micros), nil
+}
+
+// truncIntervalToUnit applies SQL interval typmod truncation for the
+// trailing-qualifier form `interval 'N' <unit>`: the qualifier restricts
+// the interval to that field's granularity, discarding (toward zero) every
+// component below it — mirroring PostgreSQL's AdjustIntervalForTypmod
+// (postgres/src/backend/utils/adt/timestamp.c). e.g. `interval '1.5' hour`
+// = 01:00:00 (the 30 minutes below HOUR are dropped), whereas the
+// typmod-free `interval '1.5 hours'` keeps them (01:30:00). Integer-valued
+// literals are unaffected (nothing below the field to drop). Go's truncated
+// integer division gives the toward-zero behavior PG uses for negatives.
+func truncIntervalToUnit(months, days int32, micros int64, unit string) (int32, int32, int64) {
+	switch unit {
+	case "year":
+		return (months / 12) * 12, 0, 0
+	case "month":
+		return months, 0, 0
+	case "day":
+		return months, days, 0
+	case "hour":
+		return months, days, (micros / usecsPerHour) * usecsPerHour
+	case "minute":
+		return months, days, (micros / usecsPerMinute) * usecsPerMinute
+	default:
+		// "second" (and any non-standard unit): no sub-field to drop.
+		return months, days, micros
 	}
 }
 

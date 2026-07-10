@@ -158,7 +158,16 @@ func (*GroupingCall) exprNode()  {}
 type IntervalLit struct {
 	pos   int
 	Value string // verbatim numeric body of the literal (e.g. "90")
-	Unit  string // lower-cased unit: "day"/"month"/"year"
+	Unit  string // lower-cased singular unit: "day"/"month"/"year"/"hour"/...
+
+	// Qualified marks the trailing-qualifier form `interval 'N' <unit>`
+	// (Form 1), where the unit is an SQL interval typmod field that
+	// truncates the value to that field's granularity — e.g.
+	// `interval '1.5' hour` = 01:00:00. The embedded-string form
+	// `interval '1.5 hours'` (Form 2) carries no typmod (Qualified=false)
+	// and keeps the fractional remainder (01:30:00). See the executor's
+	// evalIntervalLit / truncIntervalToUnit.
+	Qualified bool
 }
 
 func (e *IntervalLit) Pos() int { return e.pos }

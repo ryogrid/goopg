@@ -5866,7 +5866,7 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 	case *parser.TypedStringLit:
 		return &TypedStringLit{pos: x.Pos(), Type: x.Type, Value: x.Value}, nil
 	case *parser.IntervalLit:
-		return &IntervalLit{pos: x.Pos(), Value: x.Value, Unit: x.Unit}, nil
+		return &IntervalLit{pos: x.Pos(), Value: x.Value, Unit: x.Unit, Qualified: x.Qualified}, nil
 	case *parser.SubqueryExpr:
 		return planSubqueryExpr(x, buildHavingParentCtx(agg))
 	case *parser.ArraySubqueryExpr:
@@ -10334,7 +10334,7 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 	case *parser.TypedStringLit:
 		return &TypedStringLit{pos: x.Pos(), Type: x.Type, Value: x.Value}, nil
 	case *parser.IntervalLit:
-		return &IntervalLit{pos: x.Pos(), Value: x.Value, Unit: x.Unit}, nil
+		return &IntervalLit{pos: x.Pos(), Value: x.Value, Unit: x.Unit, Qualified: x.Qualified}, nil
 	case *parser.SubqueryExpr:
 		return planSubqueryExpr(x, ctx)
 	case *parser.ArraySubqueryExpr:

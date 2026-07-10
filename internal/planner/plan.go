@@ -167,9 +167,21 @@ type IntervalLit struct {
 	Value string
 	Unit  string
 
-	// Cached parsed N from `Value`. CacheValid signals populated.
-	CacheValid bool
-	CachedN    int32
+	// Qualified marks the trailing-qualifier form `interval 'N' <unit>`
+	// (an SQL interval typmod field that truncates below its granularity);
+	// see internal/executor/expr.go evalIntervalLit / truncIntervalToUnit.
+	Qualified bool
+
+	// Cached parsed interval components from `Value`+`Unit`.
+	// CacheValid signals populated. Widened from a single int32 count
+	// (M0066-0002) to the full months/days/micros triple so fractional
+	// magnitudes (`interval '1.5 hours'`) — whose spill into smaller
+	// units cannot be represented by one integer count — are also
+	// cached (see internal/executor/expr.go evalIntervalLit).
+	CacheValid   bool
+	CachedMonths int32
+	CachedDays   int32
+	CachedMicros int64
 }
 
 func (e *IntervalLit) Pos() int { return e.pos }

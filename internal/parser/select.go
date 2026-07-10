@@ -3014,7 +3014,11 @@ func (p *parser) tryTypedLiteral() (Expr, bool) {
 				p.advance() // INTERVAL
 				strTok := p.advance()
 				p.advance() // unit
-				return &IntervalLit{pos: t.Pos, Value: strTok.Value, Unit: canonical}, true
+				// The trailing unit is an SQL interval typmod field: it
+				// truncates the value to that field's granularity
+				// (`interval '1.5' hour` = 01:00:00). Marked Qualified so
+				// the executor applies the truncation.
+				return &IntervalLit{pos: t.Pos, Value: strTok.Value, Unit: canonical, Qualified: true}, true
 			}
 		}
 		// Form 2: `interval '<N> <unit>'` — two tokens with the
