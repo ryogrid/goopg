@@ -293,12 +293,20 @@ func (o *transactionOp) clearPgClassRowMarks(tx mvcc.Transaction) {
 // substrate is available — stamping xmax on the pg_class/pg_attribute rows so
 // the startup loader's xmax==0 filter skips them after a crash+restart.
 func rollbackDDLCreate(ctx *Context, entry DDLUndoEntry) {
+	dbOid := catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)
+	relDBOid := catalog.DefaultDBOid
+	if !entry.IsIndex && dbOid != catalog.DefaultDBOid {
+		// A distinct-dbOid connection's table files live under its own
+		// base/<dbOid> directory (catalog.InMemory.RelFileNode routes by
+		// Table.DBOid) — drop the file where it was actually created.
+		// M0122-0007 4e follow-up 39.
+		relDBOid = dbOid
+	}
 	rel := storage.RelFileNode{
-		DBOid:  catalog.DefaultDBOid,
+		DBOid:  relDBOid,
 		RelOid: entry.RelOID,
 		Fork:   storage.MainFork,
 	}
-	dbOid := catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)
 	if entry.IsIndex {
 		_ = ctx.Catalog.DropIndex(entry.Name, dbOid)
 	} else {
@@ -311,10 +319,15 @@ func rollbackDDLCreate(ctx *Context, entry DDLUndoEntry) {
 	// Stamp xmax on the pg_class / pg_attribute rows so that after a
 	// crash+restart the heap loader's xmax==0 filter skips them. Without this,
 	// WAL replay restores the HeapInsert records and the table reappears.
-	// Stamp in all catalog DBOids (DefaultDBOid + mirror DBOID) so
-	// loadUserTablesFromHeap (which reads from cat.DBOID()) also sees xmax.
+	// A table's rows follow tableCatalogDBOids (a distinct database's rows
+	// live only in its own catalog heap, follow-up 39); index rows stay on
+	// the DefaultDBOid+mirror pair (index writes are still pinned there).
 	if catalogHeapSyncAvailable(ctx) && ctx.Tx.XID != storage.InvalidTransactionID {
-		for _, dbOid := range catalogDBOids(ctx) {
+		stampOids := tableCatalogDBOids(ctx)
+		if entry.IsIndex {
+			stampOids = catalogDBOids(ctx)
+		}
+		for _, dbOid := range stampOids {
 			deleteCatalogRowsForOID(ctx, dbOid, entry.RelOID, ctx.Tx.XID)
 		}
 	}

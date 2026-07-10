@@ -5103,7 +5103,7 @@ func (o *ddlOp) execCreateView(s *parser.CreateViewStmt) error {
 		if oldViewOID != 0 && oldViewOID != vt.OID {
 			if xidErr := o.ctx.MaterializeWriterXID(); xidErr == nil {
 				xmax := o.ctx.Tx.XID
-				for _, dbOid := range catalogDBOids(o.ctx) {
+				for _, dbOid := range tableCatalogDBOids(o.ctx) {
 					deleteCatalogRowsForOID(o.ctx, dbOid, oldViewOID, xmax)
 				}
 			}
@@ -5287,7 +5287,7 @@ func (o *ddlOp) execDropOneView(name parser.ObjectName, ifExists bool, behavior 
 	if catalogHeapSyncAvailable(o.ctx) {
 		if xidErr := o.ctx.MaterializeWriterXID(); xidErr == nil {
 			xmax := o.ctx.Tx.XID
-			for _, dbOid := range catalogDBOids(o.ctx) {
+			for _, dbOid := range tableCatalogDBOids(o.ctx) {
 				deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
 			}
 		}
@@ -5373,7 +5373,7 @@ func (o *ddlOp) execDropOneMatView(name parser.ObjectName, ifExists bool, behavi
 	if catalogHeapSyncAvailable(o.ctx) {
 		if xidErr := o.ctx.MaterializeWriterXID(); xidErr == nil {
 			xmax := o.ctx.Tx.XID
-			for _, dbOid := range catalogDBOids(o.ctx) {
+			for _, dbOid := range tableCatalogDBOids(o.ctx) {
 				deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
 			}
 		}
@@ -6048,7 +6048,7 @@ func (o *ddlOp) dropTableByRefImmediate(name parser.ObjectName, tbl *catalog.Tab
 	if catalogHeapSyncAvailable(o.ctx) {
 		if err := o.ctx.MaterializeWriterXID(); err == nil {
 			xmax := o.ctx.Tx.XID
-			for _, dbOid := range catalogDBOids(o.ctx) {
+			for _, dbOid := range tableCatalogDBOids(o.ctx) {
 				deleteCatalogRowsForOID(o.ctx, dbOid, relOID, xmax)
 				for _, idxOID := range idxOIDs {
 					deleteCatalogRowsForOID(o.ctx, dbOid, idxOID, xmax)
@@ -8025,7 +8025,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			if catalogHeapSyncAvailable(o.ctx) {
 				if err := o.ctx.MaterializeWriterXID(); err == nil {
 					xmax := o.ctx.Tx.XID
-					for _, dbOid := range catalogDBOids(o.ctx) {
+					for _, dbOid := range tableCatalogDBOids(o.ctx) {
 						deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
 					}
 				}
@@ -8154,7 +8154,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				if changed && catalogHeapSyncAvailable(o.ctx) {
 					if err := o.ctx.MaterializeWriterXID(); err == nil {
 						xmax := o.ctx.Tx.XID
-						for _, dbOid := range catalogDBOids(o.ctx) {
+						for _, dbOid := range tableCatalogDBOids(o.ctx) {
 							deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
 						}
 					}
@@ -8187,7 +8187,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				if changed && catalogHeapSyncAvailable(o.ctx) {
 					if err := o.ctx.MaterializeWriterXID(); err == nil {
 						xmax := o.ctx.Tx.XID
-						for _, dbOid := range catalogDBOids(o.ctx) {
+						for _, dbOid := range tableCatalogDBOids(o.ctx) {
 							deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
 						}
 					}
@@ -8232,7 +8232,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				if changed && catalogHeapSyncAvailable(o.ctx) {
 					if err := o.ctx.MaterializeWriterXID(); err == nil {
 						xmax := o.ctx.Tx.XID
-						for _, dbOid := range catalogDBOids(o.ctx) {
+						for _, dbOid := range tableCatalogDBOids(o.ctx) {
 							deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
 						}
 					}
@@ -8288,7 +8288,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				if catalogHeapSyncAvailable(o.ctx) {
 					if err := o.ctx.MaterializeWriterXID(); err == nil {
 						xmax := o.ctx.Tx.XID
-						for _, dbOid := range catalogDBOids(o.ctx) {
+						for _, dbOid := range tableCatalogDBOids(o.ctx) {
 							deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
 						}
 					}
@@ -8345,7 +8345,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				if catalogHeapSyncAvailable(o.ctx) {
 					if err := o.ctx.MaterializeWriterXID(); err == nil {
 						xmax := o.ctx.Tx.XID
-						for _, dbOid := range catalogDBOids(o.ctx) {
+						for _, dbOid := range tableCatalogDBOids(o.ctx) {
 							deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
 						}
 					}
@@ -8416,7 +8416,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			if catalogHeapSyncAvailable(o.ctx) {
 				if err := o.ctx.MaterializeWriterXID(); err == nil {
 					xmax := o.ctx.Tx.XID
-					for _, dbOid := range catalogDBOids(o.ctx) {
+					for _, dbOid := range tableCatalogDBOids(o.ctx) {
 						deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
 					}
 				}
@@ -8452,7 +8452,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				if changed && catalogHeapSyncAvailable(o.ctx) {
 					if err := o.ctx.MaterializeWriterXID(); err == nil {
 						xmax := o.ctx.Tx.XID
-						for _, dbOid := range catalogDBOids(o.ctx) {
+						for _, dbOid := range tableCatalogDBOids(o.ctx) {
 							deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
 						}
 					}
@@ -8501,7 +8501,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				if changed && catalogHeapSyncAvailable(o.ctx) {
 					if err := o.ctx.MaterializeWriterXID(); err == nil {
 						xmax := o.ctx.Tx.XID
-						for _, dbOid := range catalogDBOids(o.ctx) {
+						for _, dbOid := range tableCatalogDBOids(o.ctx) {
 							deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
 						}
 					}
@@ -8545,7 +8545,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			if catalogHeapSyncAvailable(o.ctx) {
 				if err := o.ctx.MaterializeWriterXID(); err == nil {
 					xmax := o.ctx.Tx.XID
-					for _, dbOid := range catalogDBOids(o.ctx) {
+					for _, dbOid := range tableCatalogDBOids(o.ctx) {
 						deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
 					}
 				}
@@ -8603,7 +8603,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			if catalogHeapSyncAvailable(o.ctx) {
 				if err := o.ctx.MaterializeWriterXID(); err == nil {
 					xmax := o.ctx.Tx.XID
-					for _, dbOid := range catalogDBOids(o.ctx) {
+					for _, dbOid := range tableCatalogDBOids(o.ctx) {
 						deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
 					}
 				}
@@ -8630,7 +8630,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			if catalogHeapSyncAvailable(o.ctx) {
 				if err := o.ctx.MaterializeWriterXID(); err == nil {
 					xmax := o.ctx.Tx.XID
-					for _, dbOid := range catalogDBOids(o.ctx) {
+					for _, dbOid := range tableCatalogDBOids(o.ctx) {
 						deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
 					}
 				}
@@ -8681,7 +8681,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			if catalogHeapSyncAvailable(o.ctx) {
 				if err := o.ctx.MaterializeWriterXID(); err == nil {
 					xmax := o.ctx.Tx.XID
-					for _, dbOid := range catalogDBOids(o.ctx) {
+					for _, dbOid := range tableCatalogDBOids(o.ctx) {
 						deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
 					}
 				}
@@ -8716,7 +8716,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			if catalogHeapSyncAvailable(o.ctx) {
 				if err := o.ctx.MaterializeWriterXID(); err == nil {
 					xmax := o.ctx.Tx.XID
-					for _, dbOid := range catalogDBOids(o.ctx) {
+					for _, dbOid := range tableCatalogDBOids(o.ctx) {
 						deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
 					}
 				}
@@ -8766,7 +8766,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			if catalogHeapSyncAvailable(o.ctx) {
 				if err := o.ctx.MaterializeWriterXID(); err == nil {
 					xmax := o.ctx.Tx.XID
-					for _, dbOid := range catalogDBOids(o.ctx) {
+					for _, dbOid := range tableCatalogDBOids(o.ctx) {
 						deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
 					}
 				}
@@ -12912,6 +12912,31 @@ func catalogDBOids(ctx *Context) []uint32 {
 	return oids
 }
 
+// tableCatalogHeapDBOid returns the database OID whose pg_class/pg_attribute
+// heap holds (or should hold) the calling connection's user-TABLE rows —
+// PostgreSQL keeps a separate pg_class per database (base/<dbOid>/1259), and
+// M0122-0007 4e follow-up 39 adopts that layout for user tables created under
+// a distinct-dbOid database. A connection on postgres/template1 (the shared
+// DefaultDBOid namespace) keeps the historical DefaultDBOid target, so every
+// pre-existing single-database path is byte-identical to before.
+func tableCatalogHeapDBOid(ctx *Context) uint32 {
+	return catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)
+}
+
+// tableCatalogDBOids returns the database OIDs whose pg_class/pg_attribute
+// heaps must be stamped (xmax) when deleting/re-syncing a user TABLE's rows.
+// The sibling of tableCatalogHeapDBOid's write routing: rows written to a
+// distinct database's own catalog heap live ONLY there, so stamping the
+// DefaultDBOid+mirror pair (catalogDBOids) would miss them — and vice versa.
+// Index/type rows keep using catalogDBOids: their writes are still pinned to
+// DefaultDBOid (see the deferral ledger's follow-up-39 row).
+func tableCatalogDBOids(ctx *Context) []uint32 {
+	if d := tableCatalogHeapDBOid(ctx); d != catalog.DefaultDBOid {
+		return []uint32{d}
+	}
+	return catalogDBOids(ctx)
+}
+
 // namespaceOIDForSchema maps a schema name to its namespace OID. The system
 // schemas resolve to their fixed OIDs; a user schema created via CREATE SCHEMA
 // resolves to the OID the catalog assigned it (so a user table's pg_class row
@@ -12994,8 +13019,16 @@ func applyFDWOptionChanges(existing []string, changes []parser.FDWOptionChange) 
 // blocked PG-standby parse-analyze at `relation public.bench_log does not
 // exist` (M0106-0010 batched-36 loop 7 → loop 8).
 func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
+	// M0122-0007 4e follow-up 39: a connection on a distinct-dbOid database
+	// writes its user-table rows into that database's OWN pg_class /
+	// pg_attribute heap (base/<dbOid>/1259|1249, PG's per-database catalog
+	// layout) so the startup loader can re-register them into the right
+	// namespace. Before this, every row went to DefaultDBOid's heap and a
+	// restart leaked the table into the postgres namespace (with its data
+	// unreachable, since the reloaded Table lost its DBOid routing).
+	heapDBOid := tableCatalogHeapDBOid(ctx)
 	classRel := storage.RelFileNode{
-		DBOid:  catalog.DefaultDBOid,
+		DBOid:  heapDBOid,
 		RelOid: catalog.RelationRelationId,
 		Fork:   storage.MainFork,
 	}
@@ -13004,15 +13037,24 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 		return fmt.Errorf("pg_class: %w", err)
 	}
 	relnamespace := namespaceOIDForSchema(ctx.Catalog, tbl.Schema)
-	if err := insertPgClassOidIndexEntry(ctx, tbl.OID, classTID); err != nil {
-		return fmt.Errorf("pg_class_oid_index: %w", err)
-	}
-	if err := insertPgClassRelnameNspIndexEntry(ctx, tbl.Name, relnamespace, classTID); err != nil {
-		return fmt.Errorf("pg_class_relname_nsp_index: %w", err)
+	// The sys-btree catalog index entries stay DefaultDBOid-only: a distinct
+	// database has no bootstrapped catalog btree files, and inserting its TIDs
+	// into DefaultDBOid's btrees would plant entries pointing at tuples that
+	// live in a DIFFERENT heap file. The startup loader scans heap blocks
+	// directly and never consults these indexes (they serve pg_dump's
+	// server-side index scans + an attaching PG standby, both of which read
+	// the DefaultDBOid/postgres catalogs). See the follow-up-39 ledger row.
+	if heapDBOid == catalog.DefaultDBOid {
+		if err := insertPgClassOidIndexEntry(ctx, tbl.OID, classTID); err != nil {
+			return fmt.Errorf("pg_class_oid_index: %w", err)
+		}
+		if err := insertPgClassRelnameNspIndexEntry(ctx, tbl.Name, relnamespace, classTID); err != nil {
+			return fmt.Errorf("pg_class_relname_nsp_index: %w", err)
+		}
 	}
 
 	attrRel := storage.RelFileNode{
-		DBOid:  catalog.DefaultDBOid,
+		DBOid:  heapDBOid,
 		RelOid: catalog.AttributeRelationId,
 		Fork:   storage.MainFork,
 	}
@@ -13020,6 +13062,9 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 		attrTID, err := writeHeapRowCanonical(ctx, attrRel, pgAttributeColumnsPG18(), buildUserPGAttributeRow(ctx.Catalog, tbl, col))
 		if err != nil {
 			return fmt.Errorf("pg_attribute col %q: %w", col.Name, err)
+		}
+		if heapDBOid != catalog.DefaultDBOid {
+			continue // see the sys-btree comment above
 		}
 		// attnum is the 1-based ordinal of the column in PG18.
 		if err := insertPgAttributeRelidAttnumIndexEntry(ctx, tbl.OID, int16(col.Ordinal+1), attrTID); err != nil {
@@ -13102,9 +13147,13 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 	// `dbname=postgres` reads the runtime-written pg_class /
 	// pg_attribute rows. batched-41's multi-level descend + rebuild path
 	// keeps the source layout consistent, so the mirror's page-by-page
-	// copy now lands a well-formed btree in base/5/.
-	if err := mirrorTouchedCatalogsToPostgresDB(ctx); err != nil {
-		return fmt.Errorf("mirror catalogs to postgres db: %w", err)
+	// copy now lands a well-formed btree in base/5/. A distinct-dbOid write
+	// touched only its own database's catalog files, so the DefaultDBOid→
+	// postgres mirror has nothing new to copy — skip it (follow-up 39).
+	if heapDBOid == catalog.DefaultDBOid {
+		if err := mirrorTouchedCatalogsToPostgresDB(ctx); err != nil {
+			return fmt.Errorf("mirror catalogs to postgres db: %w", err)
+		}
 	}
 
 	return nil
@@ -19742,7 +19791,7 @@ func (o *ddlOp) execAlterDropColumn(tbl *catalog.Table, act parser.AlterTableAct
 	if catalogHeapSyncAvailable(o.ctx) {
 		if err := o.ctx.MaterializeWriterXID(); err == nil {
 			xmax := o.ctx.Tx.XID
-			for _, dbOid := range catalogDBOids(o.ctx) {
+			for _, dbOid := range tableCatalogDBOids(o.ctx) {
 				deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
 			}
 		}

@@ -5650,6 +5650,31 @@ func (c *InMemory) LookupTableByOID(oid uint32, dbOid ...uint32) (*Table, bool) 
 	return c.tableByOID(oid, resolveDBOid(dbOid))
 }
 
+// LookupTableByOIDAllDBs is LookupTableByOID without a namespace pin: it
+// searches every registered database namespace for oid and additionally
+// reports the dbOid whose namespace held the match. Table OIDs are allocated
+// from the single cluster-wide nextOID counter, so an OID identifies at most
+// one table across all namespaces. Used by the startup replay passes
+// (view/matview/column-default records key on TableOID only, with no dbOid
+// field) so state restores onto a table that reloaded into a distinct-dbOid
+// namespace, not just DefaultDBOid's. M0122-0007 4e follow-up 39.
+func (c *InMemory) LookupTableByOIDAllDBs(oid uint32) (*Table, uint32, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if t, ok := c.tableByOID(oid, DefaultDBOid); ok {
+		return t, DefaultDBOid, true
+	}
+	for nsOid := range c.namespaces {
+		if nsOid == DefaultDBOid {
+			continue
+		}
+		if t, ok := c.tableByOID(oid, nsOid); ok {
+			return t, nsOid, true
+		}
+	}
+	return nil, 0, false
+}
+
 // RegisterOpClassHashFunc records that opClassName uses routineName as its
 // FUNCTION 2 (hash extended support function). M0097-0027.
 func (c *InMemory) RegisterOpClassHashFunc(opClassName, routineName string) {
@@ -10830,6 +10855,10 @@ func (c *InMemory) CreateView(name parser.ObjectName, cols []Column, aliases []s
 		Virtual:           true,
 		View:              query,
 		ViewColumnAliases: append([]string(nil), aliases...),
+		// DBOid mirrors CreateTable's stamping (M0122-0007 4e follow-up 39):
+		// syncTableToCatalogHeap routes a view's pg_class row by the owning
+		// database, so a view created under a distinct dbOid must carry it.
+		DBOid: resolveDBOid(dbOid),
 	}
 	c.nextOID++
 	ns.tables[k] = t

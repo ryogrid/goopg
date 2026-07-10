@@ -1,6 +1,6 @@
 # Per-database catalog namespace (M0122-0007 slice 4)
 
-Status: accepted (sub-slices 4a, 4b-i, 4b-ii, 4c, 4d-i, 4d-ii-part-1, and 4d-ii-part-2a landed; 4d-ii-part-2b items 1, 2, and 3 all fully landed; 4e's FK-target-resolution, sequence-ownership, and view-constraint-dependency items all landed; `CREATE DATABASE ... TEMPLATE` bounded validation landed 2026-07-10; the pg_class-under-fresh-database gap (name resolution generically, row enumeration for pg_class specifically) landed 2026-07-10, and the pg_indexes/pg_tables, pg_constraint, pg_index, pg_attrdef/pg_depend, pg_inherits, pg_policy, pg_trigger, pg_rewrite, pg_foreign_table, and pg_sequence row-content follow-ups landed the same day, plus the `oid::regclass`/`'name'::regclass` cast-direction dbOid-scoping gap (follow-up 33) — 2 sibling virtual-table builders (pg_statistic_ext, information_schema.routines/parameters/routine_*_usage) plus pg_sequences/information_schema.sequences (follow-up 34's narrowed remainder) plus the c.foreignServers registry-dbOid-key gap (follow-up 36, landed) and its same-shape c.userMappings sibling (follow-up 37, landed 2026-07-10); follow-up 37's own CURRENT_USER/SESSION_USER/CURRENT_ROLE/USER role-spec resolution discovery closed same-day (follow-up 38) — the real relation-copy mechanism remains planned, see "Remaining 4e work" below)
+Status: accepted (sub-slices 4a, 4b-i, 4b-ii, 4c, 4d-i, 4d-ii-part-1, and 4d-ii-part-2a landed; 4d-ii-part-2b items 1, 2, and 3 all fully landed; 4e's FK-target-resolution, sequence-ownership, and view-constraint-dependency items all landed; `CREATE DATABASE ... TEMPLATE` bounded validation landed 2026-07-10; the pg_class-under-fresh-database gap (name resolution generically, row enumeration for pg_class specifically) landed 2026-07-10, and the pg_indexes/pg_tables, pg_constraint, pg_index, pg_attrdef/pg_depend, pg_inherits, pg_policy, pg_trigger, pg_rewrite, pg_foreign_table, and pg_sequence row-content follow-ups landed the same day, plus the `oid::regclass`/`'name'::regclass` cast-direction dbOid-scoping gap (follow-up 33) — 2 sibling virtual-table builders (pg_statistic_ext, information_schema.routines/parameters/routine_*_usage) plus pg_sequences/information_schema.sequences (follow-up 34's narrowed remainder) plus the c.foreignServers registry-dbOid-key gap (follow-up 36, landed) and its same-shape c.userMappings sibling (follow-up 37, landed 2026-07-10); follow-up 37's own CURRENT_USER/SESSION_USER/CURRENT_ROLE/USER role-spec resolution discovery closed same-day (follow-up 38); restart durability for user tables created under a distinct-dbOid database — per-database pg_class/pg_attribute heap routing + startup reload into the owning namespace — landed same-day (follow-up 39) — the real relation-copy mechanism remains planned, see "Remaining 4e work" below)
 Date: 2026-07-10
 Supersedes: none — extends the "Still open" note in
 `0122-0017-database-ddl-drop-guards.md` and the deferral-ledger rows dated
@@ -1586,6 +1586,68 @@ resolved name (not `current_user`) in `pg_user_mappings`. **Remaining 4e
 scope (deferred, own future loops):** `pg_statistic_ext`/
 `information_schema.routines` (bigger registry redesign); the real `CREATE
 DATABASE ... TEMPLATE` relation-copy mechanism itself.
+
+**Restart durability for user tables created under a distinct-dbOid database —
+LANDED (2026-07-10, follow-up 39).** The first 4e item that touches the
+on-disk catalog layout rather than an in-memory registry. Before this,
+`syncTableToCatalogHeap` (`internal/executor/operators_ddl.go`) pinned every
+user table's pg_class/pg_attribute rows to `DefaultDBOid`'s catalog heap
+(`base/1/1259|1249`) and the startup loader (`loadUserTablesFromHeap`,
+`internal/initdb/open.go`) read only `cat.DBOID()`'s heap, registering
+everything into the `DefaultDBOid` namespace — so a table created under
+`CREATE DATABASE db1` survived a restart only as a ghost in the `postgres`
+namespace (its data unreachable, since the reloaded `catalog.Table` lost the
+`DBOid` that routes reads to `base/<dbOid>/<relOid>`) and vanished from `db1`
+entirely: a data-loss-shaped divergence from PostgreSQL's per-database catalog
+layout (PG keeps a separate pg_class per database; relcache scans
+`MyDatabaseId`'s own files). The fix adopts PG's layout for user-TABLE rows:
+
+- **Write side (executor):** new `tableCatalogHeapDBOid(ctx)` (the
+  connection's `catalog.NamespaceDBOid`) and its stamp-target sibling
+  `tableCatalogDBOids(ctx)` (a distinct database's rows live ONLY in its own
+  heap, so stamping the `DefaultDBOid`+mirror pair would miss them — and vice
+  versa). `syncTableToCatalogHeap` routes its pg_class/pg_attribute heap
+  writes by `tableCatalogHeapDBOid`; for a distinct dbOid it skips the
+  sys-btree catalog index entries (the database has no bootstrapped catalog
+  btree files, and planting TIDs into `DefaultDBOid`'s btrees would point at
+  tuples in a different heap file — the startup loader scans heap blocks
+  directly and never consults these indexes) and skips
+  `mirrorTouchedCatalogsToPostgresDB` (nothing in the `DefaultDBOid` files
+  changed). All table-row xmax-stamp sites (`execCreateView`/
+  `execDropOneView`/`execDropOneMatView`/`dropTableByRefImmediate`/
+  `execAlterTable`/`execAlterDropColumn`) switched `catalogDBOids` →
+  `tableCatalogDBOids`; index-row stamps keep `catalogDBOids` (index writes
+  are still `DefaultDBOid`-pinned, see deferred below). `rollbackDDLCreate`
+  (`internal/executor/operators_tx.go`) now drops the relation file at the
+  dbOid it was actually created under and stamps the matching heap.
+- **Catalog:** `CreateView` now stamps `Table.DBOid` (mirrors `CreateTable`,
+  so a view's pg_class row routes to the owning database); new
+  `LookupTableByOIDAllDBs(oid) (*Table, uint32, bool)` searches every
+  namespace (sound because table OIDs come from the single cluster-wide
+  `nextOID` counter, so an OID matches at most one table).
+- **Read side (initdb):** `loadUserTablesFromHeap` re-parameterized as
+  `loadUserTablesFromHeapForDB(mgr, cat, clog, heapDBOid, nsDBOid)`; `Open`
+  now loops over `cat.ListDatabases()` after `replayDatabaseDDLRecords` and
+  loads each distinct-dbOid database's own catalog heap into that database's
+  namespace with `Table.DBOid` stamped (data-file routing intact), before the
+  view/matview/column-default replay passes — which now resolve their
+  `TableOID`-only WAL records via `LookupTableByOIDAllDBs` so restored state
+  lands on tables in any namespace.
+
+E2E regression test `TestDistinctDatabaseTableSurvivesRestartInOwnNamespace`
+(`internal/server/table_dbid_restart_test.go`, new file): real wire protocol +
+real data-dir round trip; asserts the table reloads into its own database with
+rows intact, a dropped sibling stays dropped (proves the xmax stamp routed to
+the same per-database heap the insert went to), and nothing leaks into the
+`postgres` namespace's pg_class. **Deferred (see the follow-up-39 ledger
+row):** index/type/sequence catalog rows are still written to the
+`DefaultDBOid`(+mirror) heaps only; distinct-dbOid databases get no sys-btree
+catalog index entries (pg_dump's server-side index scans and an attaching PG
+standby therefore only cover the `DefaultDBOid`/`postgres` catalogs — they
+cannot yet dump/attach-to a distinct-dbOid database's tables); the
+view/matview/column-default WAL records still carry no dbOid field
+(`LookupTableByOIDAllDBs` compensates; a dbOid trailer would be the
+PG-faithful shape).
 
 ## Recommended order and stopping points
 

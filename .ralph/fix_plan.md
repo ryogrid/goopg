@@ -7485,6 +7485,55 @@ mirroring M0119's ledger `status` column.
       M0122-0007 scope (deferred, own future loops):** `pg_statistic_ext`/
       `information_schema.routines` (bigger registry redesign); the real
       `CREATE DATABASE ... TEMPLATE` relation-copy mechanism itself.
+  - [x] `M0122-0007` 4e follow-up 39 (2026-07-10, this loop) — **restart
+      durability for user tables created under a distinct-dbOid database**
+      (adopted, verified, and completed from an interrupted prior loop's
+      uncommitted WIP; the loop-start tree carried the full code change +
+      new test but none of the bookkeeping). Before: `syncTableToCatalogHeap`
+      pinned every user table's pg_class/pg_attribute rows to
+      `DefaultDBOid`'s catalog heap and the startup loader registered
+      everything back into the `DefaultDBOid` namespace — a table created
+      under `CREATE DATABASE db1` survived a restart only as a ghost in the
+      postgres namespace with its data unreachable (reloaded `catalog.Table`
+      lost the `DBOid` routing reads to `base/<dbOid>/<relOid>`), and
+      vanished from db1: a data-loss-shaped divergence from PG's
+      per-database catalog layout. Now: `syncTableToCatalogHeap` routes heap
+      writes by new `tableCatalogHeapDBOid` (the connection's
+      `catalog.NamespaceDBOid`) into the database's OWN
+      `base/<dbOid>/1259|1249`, skipping sys-btree entries + the postgres
+      mirror for distinct dbOids; table-row xmax stamps switched
+      `catalogDBOids` → new `tableCatalogDBOids` at all
+      `execCreateView`/`execDropOneView`/`execDropOneMatView`/
+      `dropTableByRefImmediate`/`execAlterTable`/`execAlterDropColumn`
+      sites (index-row stamps keep `catalogDBOids`); `rollbackDDLCreate`
+      (`operators_tx.go`) drops/stamps at the real dbOid.
+      `catalog.CreateView` stamps `Table.DBOid`; new
+      `catalog.LookupTableByOIDAllDBs`. `initdb.Open` loops
+      `cat.ListDatabases()` loading each distinct-dbOid database's own
+      catalog heap into its own namespace via new
+      `loadUserTablesFromHeapForDB(heapDBOid, nsDBOid)`;
+      view/matview/column-default replay resolves TableOID-only WAL records
+      via `LookupTableByOIDAllDBs`. New E2E test
+      `TestDistinctDatabaseTableSurvivesRestartInOwnNamespace`
+      (`internal/server/table_dbid_restart_test.go`): wire protocol + real
+      data-dir round trip; dropped sibling stays dropped; no leak into
+      postgres pg_class. Design doc
+      `docs/design/0122-0018-per-database-catalog-namespace.md` gained a
+      follow-up-39 subsection + status-line update; `docs/design/README.md`
+      row extended; deferral ledger row appended (index/type rows still
+      DefaultDBOid-pinned, no per-database sys-btree catalog indexes → 
+      pg_dump/PG-standby still cover DefaultDBOid/postgres only, WAL
+      view/matview/column-default records carry no dbOid). Gates: `go build
+      ./...`/`go vet ./...` clean; `go test -race ./internal/catalog/...
+      ./internal/executor/... ./internal/initdb/...` PASS (initdb ~16 min
+      under race + live-loop co-load, known finding, not a regression);
+      `go test -short` full repo (excl. testport) PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke via
+      pre-commit hook. **Remaining M0122-0007 scope (deferred, own future
+      loops):** per-database index/type catalog rows + sys-btree bootstrap
+      (belongs with the `CREATE DATABASE ... TEMPLATE` relation-copy
+      mechanism, the last open 4e item); `pg_statistic_ext`/
+      `information_schema.routines` registry redesign.
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,

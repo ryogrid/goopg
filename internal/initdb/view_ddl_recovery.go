@@ -52,7 +52,7 @@ func replayViewRecords(walDir string, cat catalog.Catalog) error {
 		if derr != nil {
 			return fmt.Errorf("decode view at lsn %d: %w", rec.StartLSN, derr)
 		}
-		tbl, found := im.LookupTableByOID(p.TableOID)
+		tbl, _, found := im.LookupTableByOIDAllDBs(p.TableOID)
 		if !found || tbl == nil {
 			continue // view dropped (or replaced under a new OID) since the snapshot
 		}

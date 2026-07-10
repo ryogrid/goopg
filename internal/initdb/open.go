@@ -1277,6 +1277,31 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, fmt.Errorf("goopg: database DDL replay: %w", err)
 	}
 
+	// M0122-0007 4e follow-up 39: load each distinct-dbOid database's user
+	// tables from its OWN per-database pg_class/pg_attribute heap
+	// (base/<dbOid>/1259|1249, written by syncTableToCatalogHeap's
+	// tableCatalogHeapDBOid routing) into that database's catalog namespace.
+	// Must run after replayDatabaseDDLRecords (the database registry is the
+	// source of the dbOid list) and before the view/matview/column-default
+	// replay passes below (they restore state onto these tables by OID).
+	// Bootstrap rows (postgres/template0/template1) report DatabaseOid 0 and
+	// are skipped, as is the shared DefaultDBOid namespace and the detected
+	// mirror DBOID (both already loaded above). Runs regardless of the M0114
+	// catalog-cache fast path — the cache only snapshots cat.DBOID()'s tables.
+	for _, dbName := range cat.ListDatabases() {
+		dbOid := cat.DatabaseOid(dbName)
+		if dbOid == 0 || dbOid == catalog.DefaultDBOid ||
+			dbOid == catalog.PostgresDBOid || dbOid == cat.DBOID() {
+			continue
+		}
+		if err := loadUserTablesFromHeapForDB(mgr, cat, clog, dbOid, dbOid); err != nil {
+			_ = pool.Close()
+			_ = walWriter.Close()
+			_ = mgr.Close()
+			return nil, fmt.Errorf("goopg: user table heap load (db %q oid %d): %w", dbName, dbOid, err)
+		}
+	}
+
 	// M0119-0004-ACLHEAP (ALTER DATABASE ... SET follow-up): replay
 	// ALTER DATABASE ... SET/RESET WAL records into pg_db_role_setting.
 	// Order relative to replayDatabaseDDLRecords does not matter — each
@@ -2458,8 +2483,20 @@ func highestCatalogXID(mgr *storage.Manager, cat *catalog.InMemory) (storage.Tra
 }
 
 func loadUserTablesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+	return loadUserTablesFromHeapForDB(mgr, cat, clog, cat.DBOID(), 0)
+}
+
+// loadUserTablesFromHeapForDB is loadUserTablesFromHeap parameterized by
+// database (M0122-0007 4e follow-up 39): heapDBOid selects which database
+// directory's pg_class/pg_attribute heap files are scanned, and nsDBOid
+// selects the catalog namespace the recovered tables register into (0 keeps
+// the historical DefaultDBOid registration and leaves Table.DBOid unset).
+// A distinct-dbOid database passes its own oid for both, so a table created
+// under CREATE DATABASE reloads into that database's namespace with its
+// data-file routing (Table.DBOid → base/<dbOid>/<relOid>) intact.
+func loadUserTablesFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog, heapDBOid, nsDBOid uint32) error {
 	classRel := storage.RelFileNode{
-		DBOid:  cat.DBOID(),
+		DBOid:  heapDBOid,
 		RelOid: catalog.RelationRelationId,
 		Fork:   storage.MainFork,
 	}
@@ -2548,7 +2585,7 @@ func loadUserTablesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *m
 
 	// Pass 2: collect pg_attribute rows for user tables.
 	attrRel := storage.RelFileNode{
-		DBOid:  cat.DBOID(),
+		DBOid:  heapDBOid,
 		RelOid: catalog.AttributeRelationId,
 		Fork:   storage.MainFork,
 	}
@@ -2670,6 +2707,17 @@ func loadUserTablesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *m
 		// reverted to defaults across every restart. M0119-0004.
 		if tr.RelOptions != "" {
 			catalog.ApplyTableReloptions(tbl, tr.RelOptions)
+		}
+		if nsDBOid != 0 {
+			// Distinct-dbOid database (follow-up 39): register into the
+			// database's own namespace and stamp DBOid so the table's data
+			// files keep routing to base/<dbOid>/<relOid> after the reload
+			// (catalog.InMemory.RelFileNode routes by Table.DBOid).
+			tbl.DBOid = nsDBOid
+			if err := cat.TryRegisterUserTable(tbl, nsDBOid); err != nil {
+				return fmt.Errorf("loadUserTablesFromHeap: register %q (db %d): %w", tr.RelName, nsDBOid, err)
+			}
+			continue
 		}
 		if err := cat.TryRegisterUserTable(tbl); err != nil {
 			return fmt.Errorf("loadUserTablesFromHeap: register %q: %w", tr.RelName, err)
