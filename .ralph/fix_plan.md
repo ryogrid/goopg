@@ -61,6 +61,37 @@ every clean, green (build + pre-commit) checkpoint.
      placeholder is a comment, not a checkbox, so the plan-complete exit
      heuristic stays live.) -->
 
+- [x] testport/TestPort_PgWaldumpVacuumPruneRoundtrip — pg_waldump structural
+      error `invalid WAL segment size ... (0 bytes)` on the trailing segment
+      (AI-20260711-011536-003; repro: `go test -v -run
+      '^TestPort_PgWaldumpVacuumPruneRoundtrip$' ./internal/testport/`).
+      ROOT CAUSE: the M0122-0009 eager next-segment preallocation (writer.go
+      `eagerPreallocSegment`, landed ff27f01d 2026-07-09) now zero-fills the
+      NEXT segment (`000000010000000000000002`, full 16 MiB of zeros) the
+      moment segment 1 opens, and it persists across a clean shutdown — exactly
+      as real PG's XLogFileInit does. pg_waldump reads the segment size from the
+      long-page-header `xlp_seg_size`, which is 0 in an all-zero segment, so
+      pointed at that phantom it fatally reports "invalid WAL segment size
+      (0 bytes)" — real pg_waldump errors identically; NOT a WAL-format bug.
+      FIX (test-fidelity, no production code): skip all-zero preallocated
+      segments via a new `segmentIsAllZero` helper. Fixed the identical latent
+      bug in the SIBLING `TestPort_WALPgWaldumpCompat` (W-001,
+      wal_pg_waldump_test.go) in the same loop. `savefullpage` only fails on
+      "incorrect prev-link" so it was already tolerant. Verified: all
+      `TestPort_PgWaldump*` + W-001 PASS.
+- [x] testport/TestPort_IsolationTimeouts — FAILed in nightly co-load only
+      (AI-20260711-011536-001; repro: `go test -v -run
+      '^TestPort_IsolationTimeouts$' ./internal/testport/`). Not a regression:
+      PASSES 3/3 standalone at HEAD. The isolation runner decides blocking
+      purely by a 300 ms timeout (no pg_locks probe — see
+      `iso_runner_blocking_is_timing_only`), so under the nightly's concurrent
+      CPU pressure a non-blocking step can spuriously time out. Timing flake,
+      not a correctness regression; next nightly with lighter load should drop it.
+- [x] testport/TestPort_IsolationTuplelockUpgradeNoDeadlock — same co-load
+      timing flake as TestPort_IsolationTimeouts (AI-20260711-011536-002;
+      repro: `go test -v -run '^TestPort_IsolationTuplelockUpgradeNoDeadlock$'
+      ./internal/testport/`). PASSES 3/3 standalone at HEAD; 300 ms-timeout
+      blocking heuristic under nightly CPU contention. Not a regression.
 - [x] pgbench/nightly — pgbench nightly stage aborted: `btree: item length
       mismatch keyLen=9 total=37` at c=100 (AI-20260706-201855-001; repro:
       `REPO_ROOT=$PWD RUN_DIR=$(mktemp -d) bash ci/batch/stages/stage-pgbench.sh`
