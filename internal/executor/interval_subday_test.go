@@ -1,6 +1,10 @@
 package executor
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/goopg/goopg/internal/parser"
+)
 
 // TestFormatIntervalSubDay pins formatInterval's rendering of the
 // sub-day (time) component against real PostgreSQL 18.3's EncodeInterval
@@ -195,6 +199,102 @@ func TestFractionalIntervalLiterals(t *testing.T) {
 		}
 		if got := rows[0][0].Format(); got != c.want {
 			t.Errorf("%s = %q, want %q", c.sql, got, c.want)
+		}
+	}
+}
+
+// TestMultiFieldIntervalLiterals covers multi-field interval bodies
+// (`interval '1 day 05:00:00'`, `interval '1 year 2 mons 3 days'`) and bare
+// `HH:MM[:SS[.ffffff]]` time bodies — the shapes goopg's own intervalout
+// emits, so these are exactly the values a round-trip of goopg output must
+// re-parse. Every `want` was captured byte-for-byte from a real PostgreSQL
+// 18.3 instance. The parser's Form-2 typed-literal path and the executor's
+// `::interval`/CAST path share one tokenizer (parser.ParseIntervalBody), so
+// both entry points are exercised. unimplemented_feat #5(b).
+func TestMultiFieldIntervalLiterals(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+	if err := runDDL(t, ctx, "CREATE TABLE t (id int)"); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	if err := runDDL(t, ctx, "INSERT INTO t VALUES (1)"); err != nil {
+		t.Fatalf("INSERT: %v", err)
+	}
+	cases := []struct{ sql, want string }{
+		// Date fields + a trailing HH:MM:SS time.
+		{"SELECT interval '1 day 05:00:00'", "1 day 05:00:00"},
+		{"SELECT interval '1 year 2 mons 3 days 04:05:06'", "1 year 2 mons 3 days 04:05:06"},
+		{"SELECT interval '1 year 2 mons 3 days 04:05:06.789'", "1 year 2 mons 3 days 04:05:06.789"},
+		{"SELECT interval '3 days 04:05:06'", "3 days 04:05:06"},
+		{"SELECT interval '1 day 12:30:00.5'", "1 day 12:30:00.5"},
+		// Multiple date fields, no time.
+		{"SELECT interval '1 year 2 mons 3 days'", "1 year 2 mons 3 days"},
+		{"SELECT interval '1 year 2 months'", "1 year 2 mons"},
+		{"SELECT interval '2 mons'", "2 mons"},
+		// Multiple sub-day fields as words.
+		{"SELECT interval '1 day 2 hours 3 minutes 4 seconds'", "1 day 02:03:04"},
+		{"SELECT interval '1 hr 30 mins'", "01:30:00"},
+		{"SELECT interval '2 hrs 15 secs'", "02:00:15"},
+		// Bare HH:MM[:SS[.f]] time bodies.
+		{"SELECT interval '05:00:00'", "05:00:00"},
+		{"SELECT interval '2:30:00'", "02:30:00"},
+		{"SELECT interval '04:05'", "04:05:00"},
+		{"SELECT interval '100:00:00'", "100:00:00"},
+		{"SELECT interval '00:00:01.5'", "00:00:01.5"},
+		{"SELECT interval '0 days'", "00:00:00"},
+		// Fractional magnitude in a multi-field body spills down.
+		{"SELECT interval '1.5 days 2 hours'", "1 day 14:00:00"},
+		// Per-field signs: the leading '-' binds only its own field; the
+		// time component carries its own sign independently.
+		{"SELECT interval '-1 day 05:00:00'", "-1 days +05:00:00"},
+		{"SELECT interval '1 day -05:00:00'", "1 day -05:00:00"},
+		{"SELECT interval '-2 days 03:00:00'", "-2 days +03:00:00"},
+		// Cast / :: forms use the same tokenizer.
+		{"SELECT '1 day 05:00:00'::interval", "1 day 05:00:00"},
+		{"SELECT CAST('1 year 2 mons 3 days' AS interval)", "1 year 2 mons 3 days"},
+		// Arithmetic: micros are not normalised into days (matches PG).
+		{"SELECT interval '10 days 20:00:00' + interval '1 day 05:00:00'", "11 days 25:00:00"},
+		// Equality across an equivalent decomposition.
+		{"SELECT (interval '3 days 04:05:06' = interval '3 days' + interval '4 hours 5 mins 6 secs')::text", "true"},
+	}
+	for _, c := range cases {
+		rows := runQuery(t, ctx, c.sql+" FROM t")
+		if len(rows) != 1 || len(rows[0]) != 1 {
+			t.Fatalf("%s: expected 1x1 result, got %v", c.sql, rows)
+		}
+		if got := rows[0][0].Format(); got != c.want {
+			t.Errorf("%s = %q, want %q", c.sql, got, c.want)
+		}
+	}
+}
+
+// TestParseIntervalBodySingleFieldMatchesUnitToParts guards the sibling-path
+// invariant that the multi-field tokenizer (parser.ParseIntervalBody) and the
+// per-field spill helper (parser.IntervalUnitToParts, used by the single-field
+// typed-literal path) agree on every single `<magnitude> <unit>` input — so a
+// future edit to one cannot silently drift the interval decoding of the other.
+func TestParseIntervalBodySingleFieldMatchesUnitToParts(t *testing.T) {
+	fields := []struct{ mag, unit string }{
+		{"90", "day"}, {"-3", "hour"}, {"1.5", "hour"}, {"1.5", "month"},
+		{"1.5", "year"}, {"0.5", "second"}, {"2", "minute"}, {"500", "millisecond"},
+		{"1.15", "month"}, {"-1.9", "year"},
+	}
+	for _, f := range fields {
+		val, fval, ok := parser.ParseIntervalMagnitude(f.mag)
+		if !ok {
+			t.Fatalf("ParseIntervalMagnitude(%q) failed", f.mag)
+		}
+		wantMo, wantD, wantMu, wok := parser.IntervalUnitToParts(val, fval, f.unit)
+		if !wok {
+			t.Fatalf("IntervalUnitToParts(%q %q) failed", f.mag, f.unit)
+		}
+		gotMo, gotD, gotMu, gok := parser.ParseIntervalBody(f.mag + " " + f.unit)
+		if !gok {
+			t.Fatalf("ParseIntervalBody(%q %q) failed", f.mag, f.unit)
+		}
+		if gotMo != wantMo || gotD != wantD || gotMu != wantMu {
+			t.Errorf("%q %q: ParseIntervalBody=(%d,%d,%d) IntervalUnitToParts=(%d,%d,%d)",
+				f.mag, f.unit, gotMo, gotD, gotMu, wantMo, wantD, wantMu)
 		}
 	}
 }

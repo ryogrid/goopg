@@ -2078,7 +2078,7 @@ func lowerPLpgSQLExpr(e parser.Expr, frame *plpgsqlFrame) (planner.Expr, error) 
 	case *parser.TypedStringLit:
 		return &planner.TypedStringLit{Type: x.Type, Value: x.Value}, nil
 	case *parser.IntervalLit:
-		return &planner.IntervalLit{Value: x.Value, Unit: x.Unit, Qualified: x.Qualified}, nil
+		return &planner.IntervalLit{Value: x.Value, Unit: x.Unit, Qualified: x.Qualified, PreComputed: x.PreComputed, PreMonths: x.PreMonths, PreDays: x.PreDays, PreMicros: x.PreMicros}, nil
 	case *parser.ExtractExpr:
 		src, err := lowerPLpgSQLExpr(x.Source, frame)
 		if err != nil {

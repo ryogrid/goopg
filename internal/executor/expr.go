@@ -5583,130 +5583,15 @@ func evalDateBin(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 // parseIntervalCastString parses a runtime interval-cast string (the
 // `::interval` / `CAST(... AS interval)` path, as opposed to the
 // parse-time `INTERVAL '...'` typed-literal syntax handled by
-// splitEmbeddedInterval/evalIntervalLit). Accepts the same "<n> <unit>"
-// shape (unit day(s)/month(s)/year(s) or the sub-day
-// hour(s)/minute(s)/second(s)/millisecond(s), case-insensitive) that the
-// typed-literal grammar accepts; anything else fails so the caller can
-// raise 22007 rather than silently pass the string through.
-// M0122-0004; sub-day units added unimplemented_feat #5.
+// splitEmbeddedInterval/evalIntervalLit). It delegates to the parser
+// package's ParseIntervalBody so the cast path and the typed-literal path —
+// sibling paths that must not diverge — share exactly one interval-body
+// tokenizer (single-field "<n> <unit>", multi-field, and HH:MM:SS times).
+// Anything ParseIntervalBody rejects fails here too so the caller can raise
+// 22007 rather than silently pass the string through.
+// M0122-0004; sub-day units unimplemented_feat #5; multi-field #5(b).
 func parseIntervalCastString(s string) (months, days int32, micros int64, ok bool) {
-	parts := strings.Fields(strings.TrimSpace(s))
-	if len(parts) != 2 {
-		return 0, 0, 0, false
-	}
-	val, fval, mok := parseIntervalMagnitude(parts[0])
-	if !mok {
-		return 0, 0, 0, false
-	}
-	unit := strings.ToLower(strings.TrimSuffix(parts[1], "s"))
-	return intervalUnitToParts(val, fval, unit)
-}
-
-// parseIntervalMagnitude splits an interval magnitude token into its
-// integer part (val) and fractional part (fval, |fval|<1, sharing val's
-// sign), mirroring how PostgreSQL's DecodeInterval feeds a numeric field
-// to the Adjust* helpers (postgres/src/backend/utils/adt/datetime.c): the
-// integer portion scales exactly while the fraction spills into the
-// next-smaller unit. "1.5" → (1, 0.5); "-1.5" → (-1, -0.5);
-// ".5" → (0, 0.5); "1" → (1, 0). Returns ok=false for a non-numeric body.
-func parseIntervalMagnitude(s string) (val int64, fval float64, ok bool) {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return 0, 0, false
-	}
-	dot := strings.IndexByte(s, '.')
-	if dot < 0 {
-		n, err := strconv.ParseInt(s, 10, 64)
-		if err != nil {
-			return 0, 0, false
-		}
-		return n, 0, true
-	}
-	intPart, fracPart := s[:dot], s[dot+1:]
-	neg := false
-	switch {
-	case strings.HasPrefix(intPart, "-"):
-		neg, intPart = true, intPart[1:]
-	case strings.HasPrefix(intPart, "+"):
-		intPart = intPart[1:]
-	}
-	if intPart == "" {
-		intPart = "0"
-	}
-	iv, err := strconv.ParseInt(intPart, 10, 64)
-	if err != nil {
-		return 0, 0, false
-	}
-	var fv float64
-	if fracPart != "" {
-		f, ferr := strconv.ParseFloat("0."+fracPart, 64)
-		if ferr != nil {
-			return 0, 0, false
-		}
-		fv = f
-	}
-	if neg {
-		iv, fv = -iv, -fv
-	}
-	return iv, fv, true
-}
-
-// intervalFractMicros scales a sub-unit fraction to microseconds,
-// mirroring PostgreSQL's AdjustFractMicroseconds
-// (postgres/src/backend/utils/adt/datetime.c): truncate toward zero,
-// then round the leftover with a strict >0.5 / <-0.5 comparison (an
-// exact half stays truncated). frac is assumed to have |frac|<1.
-func intervalFractMicros(frac float64, scale int64) int64 {
-	if frac == 0 {
-		return 0
-	}
-	f := frac * float64(scale)
-	usec := int64(f)
-	f -= float64(usec)
-	if f > 0.5 {
-		usec++
-	} else if f < -0.5 {
-		usec--
-	}
-	return usec
-}
-
-// intervalUnitToParts converts an integer magnitude (val) plus fractional
-// remainder (fval) in the given singular, lower-cased unit into interval
-// months/days/micros components, mirroring PostgreSQL's DecodeInterval
-// fractional-spill rules (postgres/src/backend/utils/adt/datetime.c):
-//   - fractional years  → months (rint(fval*12), sub-month discarded)
-//   - fractional months → days (int(fval*30)) + remainder micros
-//   - fractional days   → micros (fval*USECS_PER_DAY)
-//   - fractional h/m/s/ms→ micros ((val+fval)*scale)
-//
-// Returns ok=false for an unrecognised unit (the same v0-supported set as
-// the parser's two interval-literal forms).
-func intervalUnitToParts(val int64, fval float64, unit string) (months, days int32, micros int64, ok bool) {
-	switch unit {
-	case "day":
-		return 0, int32(val), intervalFractMicros(fval, usecsPerDay), true
-	case "month":
-		// AdjustFractDays(fval, DAYS_PER_MONTH): whole days then remainder → micros.
-		f := fval * 30
-		extraDays := int64(f)
-		f -= float64(extraDays)
-		return int32(val), int32(extraDays), intervalFractMicros(f, usecsPerDay), true
-	case "year":
-		// AdjustFractYears discards any sub-month remainder (round-half-to-even).
-		extraMonths := int64(math.RoundToEven(fval * 12))
-		return int32(val*12 + extraMonths), 0, 0, true
-	case "hour":
-		return 0, 0, val*usecsPerHour + intervalFractMicros(fval, usecsPerHour), true
-	case "minute":
-		return 0, 0, val*usecsPerMinute + intervalFractMicros(fval, usecsPerMinute), true
-	case "second":
-		return 0, 0, val*usecsPerSecond + intervalFractMicros(fval, usecsPerSecond), true
-	case "millisecond":
-		return 0, 0, val*usecsPerMilli + intervalFractMicros(fval, usecsPerMilli), true
-	default:
-		return 0, 0, 0, false
-	}
+	return parser.ParseIntervalBody(s)
 }
 
 // evalIntervalLit parses the integer body of an `interval 'N' unit`
@@ -5720,11 +5605,20 @@ func evalIntervalLit(x *planner.IntervalLit) (Datum, error) {
 	if x.CacheValid {
 		return NewIntervalDatumFull(x.CachedMonths, x.CachedDays, x.CachedMicros), nil
 	}
-	val, fval, ok := parseIntervalMagnitude(x.Value)
+	// Multi-field / HH:MM:SS bodies (`interval '1 day 05:00:00'`) are decoded
+	// once by the parser (unimplemented_feat #5(b)) and carried pre-computed;
+	// the trailing-unit typmod truncation never applies to these embedded
+	// forms, so use the components directly.
+	if x.PreComputed {
+		x.CachedMonths, x.CachedDays, x.CachedMicros = x.PreMonths, x.PreDays, x.PreMicros
+		x.CacheValid = true
+		return NewIntervalDatumFull(x.PreMonths, x.PreDays, x.PreMicros), nil
+	}
+	val, fval, ok := parser.ParseIntervalMagnitude(x.Value)
 	if !ok {
 		return Datum{}, &ExecError{Code: "22007", Pos: x.Pos(), Message: fmt.Sprintf("invalid interval count %q", x.Value)}
 	}
-	months, days, micros, ok := intervalUnitToParts(val, fval, x.Unit)
+	months, days, micros, ok := parser.IntervalUnitToParts(val, fval, x.Unit)
 	if !ok {
 		return Datum{}, &ExecError{Code: "0A000", Pos: x.Pos(), Message: fmt.Sprintf("interval unit %q is not supported in v0", x.Unit)}
 	}

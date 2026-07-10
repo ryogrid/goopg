@@ -3032,6 +3032,15 @@ func (p *parser) tryTypedLiteral() (Expr, bool) {
 			p.advance() // string literal
 			return &IntervalLit{pos: t.Pos, Value: v, Unit: u}, true
 		}
+		// Multi-field / HH:MM:SS bodies (`interval '1 day 05:00:00'`,
+		// `interval '1 year 2 mons 3 days'`, bare `interval '05:00:00'`):
+		// decode the whole body up front and carry the pre-computed
+		// months/days/micros. unimplemented_feat #5(b).
+		if mo, d, mu, ok := ParseIntervalBody(next.Value); ok {
+			p.advance() // INTERVAL
+			p.advance() // string literal
+			return &IntervalLit{pos: t.Pos, PreComputed: true, PreMonths: mo, PreDays: d, PreMicros: mu}, true
+		}
 	}
 	return nil, false
 }

@@ -7829,6 +7829,34 @@ mirroring M0119's ledger `status` column.
       ./internal/executor/...` PASS; `scripts/tpch-spotcheck.sh` PASS
       (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke` PASS (0 failed, 3 workloads).
 
+  - [x] `unimplemented_feat #5(b) (multi-field / HH:MM:SS interval literals)`
+      (2026-07-11, this loop) — **closed the prior interval-literal row's
+      deferred item (b): multi-field and time-body interval literals now parse
+      end-to-end** (`interval '1 day 05:00:00'`, `interval '1 year 2 mons 3
+      days 04:05:06.789'`, bare `interval '05:00:00'`/`'04:05'`/`'100:00:00'`,
+      `interval '1 day 2 hours 3 minutes 4 seconds'`) — exactly the shapes
+      goopg's own `formatInterval`/`intervalout` emits, so goopg can re-parse
+      its own interval output. Hoisted the pure interval-body math into a new
+      `internal/parser/interval.go` (`ParseIntervalMagnitude`,
+      `IntervalUnitToParts`, new `ParseIntervalBody` tokenizer — mirrors PG
+      `DecodeInterval`: `<magnitude> <unit>` pairs in any order interleaved
+      with `[+-]HH:MM[:SS[.ffffff]]` time words, each field carrying its own
+      sign; accepts intervalout abbreviations `mon(s)`/`min(s)`/`sec(s)`/
+      `hr(s)`) as the **single source of truth** for both sibling paths:
+      `evalIntervalLit` (typed literal) and `parseIntervalCastString`
+      (`::interval`/CAST, now a one-line `parser.ParseIntervalBody` delegate).
+      Multi-field bodies decode once into `IntervalLit.PreMonths/PreDays/
+      PreMicros` (`PreComputed`, threaded through 2 `planner.go` conversions +
+      `plpgsql_runtime.go`). Byte-for-byte vs PG 18.3. Deferred (ledger
+      2026-07-11): bare-number default-unit (`interval '5'`→seconds),
+      week/decade/century, single-letter units, full interval-typmod grammar.
+      Tests: `interval_subday_test.go` `TestMultiFieldIntervalLiterals` +
+      sibling-path guard `TestParseIntervalBodySingleFieldMatchesUnitToParts`;
+      `TestIntervalCastFromStringInvalidSyntax` updated. Design doc
+      `docs/design/0003-0006-*` new Follow-up + README row. Gates: build/vet
+      clean; executor/parser/planner/analyzer suites PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke (hook).
+
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,
       encoding constraints during bootstrap/runtime.

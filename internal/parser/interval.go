@@ -1,0 +1,259 @@
+package parser
+
+import (
+	"math"
+	"strconv"
+	"strings"
+)
+
+// Microsecond scales for interval sub-day fields. Defined here (the parser
+// package owns interval-body decoding) and mirrored by the executor's own
+// copies for its Datum/format math; the two sets are trivially identical
+// constants — the *logic* that consumes them lives only here.
+const (
+	usecsPerDay    = 24 * 60 * 60 * 1_000_000
+	usecsPerHour   = 3600 * 1_000_000
+	usecsPerMinute = 60 * 1_000_000
+	usecsPerSecond = 1_000_000
+	usecsPerMilli  = 1_000
+)
+
+// ParseIntervalMagnitude splits an interval magnitude token into its integer
+// part (val) and fractional part (fval, |fval|<1, sharing val's sign),
+// mirroring how PostgreSQL's DecodeInterval feeds a numeric field to the
+// Adjust* helpers (postgres/src/backend/utils/adt/datetime.c): the integer
+// portion scales exactly while the fraction spills into the next-smaller unit.
+// "1.5" → (1, 0.5); "-1.5" → (-1, -0.5); ".5" → (0, 0.5); "1" → (1, 0).
+// Returns ok=false for a non-numeric body.
+//
+// Moved here from the executor (M0122 interval work) so the parser's Form-2
+// tokenizer and the executor's typed-literal / cast paths share one
+// implementation — avoiding the sibling-path drift that separate copies invite.
+func ParseIntervalMagnitude(s string) (val int64, fval float64, ok bool) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, 0, false
+	}
+	dot := strings.IndexByte(s, '.')
+	if dot < 0 {
+		n, err := strconv.ParseInt(s, 10, 64)
+		if err != nil {
+			return 0, 0, false
+		}
+		return n, 0, true
+	}
+	intPart, fracPart := s[:dot], s[dot+1:]
+	neg := false
+	switch {
+	case strings.HasPrefix(intPart, "-"):
+		neg, intPart = true, intPart[1:]
+	case strings.HasPrefix(intPart, "+"):
+		intPart = intPart[1:]
+	}
+	if intPart == "" {
+		intPart = "0"
+	}
+	iv, err := strconv.ParseInt(intPart, 10, 64)
+	if err != nil {
+		return 0, 0, false
+	}
+	var fv float64
+	if fracPart != "" {
+		f, ferr := strconv.ParseFloat("0."+fracPart, 64)
+		if ferr != nil {
+			return 0, 0, false
+		}
+		fv = f
+	}
+	if neg {
+		iv, fv = -iv, -fv
+	}
+	return iv, fv, true
+}
+
+// intervalFractMicros scales a sub-unit fraction to microseconds, mirroring
+// PostgreSQL's AdjustFractMicroseconds (postgres/src/backend/utils/adt/
+// datetime.c): truncate toward zero, then round the leftover with a strict
+// >0.5 / <-0.5 comparison (an exact half stays truncated). frac is assumed to
+// have |frac|<1.
+func intervalFractMicros(frac float64, scale int64) int64 {
+	if frac == 0 {
+		return 0
+	}
+	f := frac * float64(scale)
+	usec := int64(f)
+	f -= float64(usec)
+	if f > 0.5 {
+		usec++
+	} else if f < -0.5 {
+		usec--
+	}
+	return usec
+}
+
+// IntervalUnitToParts converts an integer magnitude (val) plus fractional
+// remainder (fval) in the given singular, lower-cased unit into interval
+// months/days/micros components, mirroring PostgreSQL's DecodeInterval
+// fractional-spill rules (postgres/src/backend/utils/adt/datetime.c):
+//   - fractional years  → months (rint(fval*12), sub-month discarded)
+//   - fractional months → days (int(fval*30)) + remainder micros
+//   - fractional days   → micros (fval*USECS_PER_DAY)
+//   - fractional h/m/s/ms→ micros ((val+fval)*scale)
+//
+// The unit must already be canonicalised to the singular base form (see
+// canonicalIntervalUnit). Returns ok=false for an unrecognised unit.
+func IntervalUnitToParts(val int64, fval float64, unit string) (months, days int32, micros int64, ok bool) {
+	switch unit {
+	case "day":
+		return 0, int32(val), intervalFractMicros(fval, usecsPerDay), true
+	case "month":
+		// AdjustFractDays(fval, DAYS_PER_MONTH): whole days then remainder → micros.
+		f := fval * 30
+		extraDays := int64(f)
+		f -= float64(extraDays)
+		return int32(val), int32(extraDays), intervalFractMicros(f, usecsPerDay), true
+	case "year":
+		// AdjustFractYears discards any sub-month remainder (round-half-to-even).
+		extraMonths := int64(math.RoundToEven(fval * 12))
+		return int32(val*12 + extraMonths), 0, 0, true
+	case "hour":
+		return 0, 0, val*usecsPerHour + intervalFractMicros(fval, usecsPerHour), true
+	case "minute":
+		return 0, 0, val*usecsPerMinute + intervalFractMicros(fval, usecsPerMinute), true
+	case "second":
+		return 0, 0, val*usecsPerSecond + intervalFractMicros(fval, usecsPerSecond), true
+	case "millisecond":
+		return 0, 0, val*usecsPerMilli + intervalFractMicros(fval, usecsPerMilli), true
+	default:
+		return 0, 0, 0, false
+	}
+}
+
+// canonicalIntervalUnit maps a unit word (any accepted spelling, any case) to
+// the singular base form IntervalUnitToParts switches on. It accepts the full
+// unit words the single-field literal grammar already supports plus the
+// abbreviations PostgreSQL's intervalout emits (`mon`/`mons`, `min`/`mins`,
+// `sec`/`secs`, `hr`/`hrs`) so goopg can re-parse its own interval output.
+// week/decade/century and single-letter forms remain out of scope (deferred).
+func canonicalIntervalUnit(w string) (string, bool) {
+	switch strings.ToLower(w) {
+	case "year", "years", "yr", "yrs":
+		return "year", true
+	case "month", "months", "mon", "mons":
+		return "month", true
+	case "day", "days":
+		return "day", true
+	case "hour", "hours", "hr", "hrs":
+		return "hour", true
+	case "minute", "minutes", "min", "mins":
+		return "minute", true
+	case "second", "seconds", "sec", "secs":
+		return "second", true
+	case "millisecond", "milliseconds", "ms", "msec", "msecs":
+		return "millisecond", true
+	default:
+		return "", false
+	}
+}
+
+// parseIntervalTimeToken parses a `[+-]HH:MM[:SS[.ffffff]]` time word from a
+// multi-field interval body into a signed microsecond count. The sign, if
+// present, applies to the whole time component (PostgreSQL DecodeTime +
+// leading sign handling). Returns ok=false for anything that isn't a valid
+// colon-delimited time.
+func parseIntervalTimeToken(tok string) (micros int64, ok bool) {
+	neg := false
+	switch {
+	case strings.HasPrefix(tok, "-"):
+		neg, tok = true, tok[1:]
+	case strings.HasPrefix(tok, "+"):
+		tok = tok[1:]
+	}
+	parts := strings.Split(tok, ":")
+	if len(parts) < 2 || len(parts) > 3 {
+		return 0, false
+	}
+	hh, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil || hh < 0 {
+		return 0, false
+	}
+	mm, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil || mm < 0 {
+		return 0, false
+	}
+	micros = hh*usecsPerHour + mm*usecsPerMinute
+	if len(parts) == 3 {
+		// Seconds field may carry a fractional part (`06.789`). Reuse the
+		// magnitude splitter + AdjustFractMicroseconds rounding so the
+		// sub-second handling matches every other interval entry point.
+		sv, sf, sok := ParseIntervalMagnitude(parts[2])
+		if !sok || sv < 0 {
+			return 0, false
+		}
+		micros += sv*usecsPerSecond + intervalFractMicros(sf, usecsPerSecond)
+	}
+	if neg {
+		micros = -micros
+	}
+	return micros, true
+}
+
+// ParseIntervalBody decodes a full free-form interval literal body into
+// months/days/micros components, mirroring PostgreSQL's DecodeInterval
+// (postgres/src/backend/utils/adt/datetime.c) for the field shapes goopg
+// supports: any number of `<magnitude> <unit>` pairs interleaved in any order
+// with `[+-]HH:MM[:SS[.ffffff]]` time words. Each field carries its own sign,
+// e.g. `-1 day 05:00:00` = (days -1, +5h) and `1 day -05:00:00` = (days 1, -5h).
+//
+// This is the single tokenizer shared by the parser's Form-2 typed-literal
+// path and the executor's `::interval` / CAST path (the sibling paths the
+// practice card warns must not diverge). A bare trailing number with no unit
+// (`interval '5'`) is intentionally NOT accepted here — that is the SQL
+// interval-typmod default-unit case (deferred), so such bodies fall through
+// unchanged. Returns ok=false for any body that doesn't decompose cleanly.
+func ParseIntervalBody(body string) (months, days int32, micros int64, ok bool) {
+	fields := strings.Fields(strings.TrimSpace(body))
+	if len(fields) == 0 {
+		return 0, 0, 0, false
+	}
+	consumedAny := false
+	for i := 0; i < len(fields); i++ {
+		f := fields[i]
+		if strings.ContainsRune(f, ':') {
+			// Time component (HH:MM[:SS]).
+			mu, tok := parseIntervalTimeToken(f)
+			if !tok {
+				return 0, 0, 0, false
+			}
+			micros += mu
+			consumedAny = true
+			continue
+		}
+		// Otherwise a numeric magnitude that must be followed by a unit word.
+		val, fval, mok := ParseIntervalMagnitude(f)
+		if !mok {
+			return 0, 0, 0, false
+		}
+		if i+1 >= len(fields) {
+			// Trailing bare number (default-unit / typmod case) — out of scope.
+			return 0, 0, 0, false
+		}
+		unit, uok := canonicalIntervalUnit(fields[i+1])
+		if !uok {
+			return 0, 0, 0, false
+		}
+		i++ // consume the unit word
+		m, d, mu, pok := IntervalUnitToParts(val, fval, unit)
+		if !pok {
+			return 0, 0, 0, false
+		}
+		months += m
+		days += d
+		micros += mu
+		consumedAny = true
+	}
+	if !consumedAny {
+		return 0, 0, 0, false
+	}
+	return months, days, micros, true
+}

@@ -82,10 +82,11 @@ func TestIntervalCastFromString(t *testing.T) {
 }
 
 // TestIntervalCastFromStringInvalidSyntax pins the 22007 error PostgreSQL's
-// interval_in raises for a string that isn't a valid interval body — v0
-// deliberately only accepts the single "<n> <unit>" shape, so anything else
-// (unsupported unit, multi-component strings, garbage) must error instead of
-// silently passing the raw string through unparsed.
+// interval_in raises for a string that isn't a valid interval body. The cast
+// path now accepts multi-field bodies and HH:MM:SS times (unimplemented_feat
+// #5(b)), so only genuinely malformed bodies (unsupported unit, garbage,
+// number-without-unit) must still error instead of silently passing the raw
+// string through unparsed.
 func TestIntervalCastFromStringInvalidSyntax(t *testing.T) {
 	ctx, _, cleanup := newDDLFixture(t)
 	defer cleanup()
@@ -100,8 +101,8 @@ func TestIntervalCastFromStringInvalidSyntax(t *testing.T) {
 	cases := []string{
 		"SELECT 'garbage'::interval FROM t",
 		"SELECT '1 fortnight'::interval FROM t",
-		"SELECT '1 year 2 months'::interval FROM t",
-		"SELECT '01:02:03'::interval FROM t",
+		"SELECT '1 year 2 fortnights'::interval FROM t",
+		"SELECT 'day month'::interval FROM t",
 	}
 	for _, sql := range cases {
 		t.Run(sql, func(t *testing.T) {

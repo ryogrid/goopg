@@ -168,6 +168,16 @@ type IntervalLit struct {
 	// and keeps the fractional remainder (01:30:00). See the executor's
 	// evalIntervalLit / truncIntervalToUnit.
 	Qualified bool
+
+	// PreComputed marks a multi-field / HH:MM:SS embedded body
+	// (`interval '1 day 05:00:00'`, `interval '1 year 2 mons 3 days'`) that
+	// tryTypedLiteral decoded via ParseIntervalBody (unimplemented_feat
+	// #5(b)). When set, PreMonths/PreDays/PreMicros hold the final interval
+	// components and Value/Unit/Qualified are unused.
+	PreComputed bool
+	PreMonths   int32
+	PreDays     int32
+	PreMicros   int64
 }
 
 func (e *IntervalLit) Pos() int { return e.pos }

@@ -506,6 +506,58 @@ negative truncation toward zero). Gates: `go build ./...` clean; `go test`
 executor/parser/planner/analyzer suites PASS; `scripts/tpch-spotcheck.sh` PASS
 (Q12=2/Q13=33); pgbench smoke via pre-commit hook.
 
+## Follow-up: multi-field interval literals (unimplemented_feat #5(b), 2026-07-11)
+
+Closes the prior row's deferred item (b): **multi-field / `HH:MM:SS` interval
+bodies now parse end-to-end** — `interval '1 day 05:00:00'`,
+`interval '1 year 2 mons 3 days 04:05:06.789'`, bare `interval '05:00:00'`,
+`interval '04:05'`. This is the shape goopg's own `intervalout`
+(`formatInterval`) emits, so goopg can now re-parse its own interval output.
+
+**Single-tokenizer design (the important part).** Rather than grow a second
+interval parser, the pure interval-body math was hoisted into the parser
+package as the single source of truth: `ParseIntervalMagnitude`,
+`IntervalUnitToParts`, and the new `ParseIntervalBody` tokenizer now live in
+`internal/parser/interval.go`. The executor's `evalIntervalLit` (typed-literal
+path) and `parseIntervalCastString` (`::interval`/`CAST` path) — the two
+*sibling paths* the practice card warns must never diverge — both delegate to
+these. `parseIntervalCastString` is now a one-line call to
+`parser.ParseIntervalBody`, so single-field, multi-field, and time bodies parse
+identically whether they arrive as a typed literal or a runtime cast.
+
+`ParseIntervalBody` mirrors PostgreSQL's `DecodeInterval`
+(`postgres/src/backend/utils/adt/datetime.c`) for the supported field shapes:
+any number of `<magnitude> <unit>` pairs interleaved in any order with
+`[+-]HH:MM[:SS[.ffffff]]` time words, **each field carrying its own sign**
+(`interval '-1 day 05:00:00'` = `-1 days +05:00:00`; `interval '1 day
+-05:00:00'` = `1 day -05:00:00`). It accepts the intervalout abbreviations
+`mon(s)`/`min(s)`/`sec(s)`/`hr(s)` in addition to the full unit words so the
+round-trip works. Fractional per-field magnitudes reuse the existing spill
+helpers (`interval '1.5 days 2 hours'` = `1 day 14:00:00`).
+
+Parse-time decode: multi-field bodies are decoded once by the parser and
+carried on `IntervalLit` as pre-computed `PreMonths/PreDays/PreMicros`
+(`PreComputed` flag), threaded through the two `planner.go` node conversions
+and `plpgsql_runtime.go` (same pattern as `Qualified`). `evalIntervalLit`
+returns them directly; the trailing-unit typmod truncation never applies to
+embedded forms.
+
+**Still deferred** (see `deferral_ledger.md`): a bare trailing number with no
+unit (`interval '5'` → PG `00:00:05`, the SQL interval-typmod default-unit
+case) is intentionally still rejected here — that is item (d) territory;
+week/decade/century unit names (item c); and single-letter unit forms
+(`h`/`m`/`s`/`d`/`y`, ambiguous `m`) remain unhandled.
+
+Every `want` captured byte-for-byte from a real PostgreSQL 18.3 instance.
+Tests: `internal/executor/interval_subday_test.go`
+`TestMultiFieldIntervalLiterals` (date+time bodies, bare times, per-field
+signs, fractional spill, cast forms, arithmetic) and
+`TestParseIntervalBodySingleFieldMatchesUnitToParts` (a sibling-path guard
+asserting the multi-field tokenizer and the single-field spill helper agree on
+every `<magnitude> <unit>`). Gates: `go build`/`go vet` clean;
+executor/parser/planner/analyzer suites PASS; `scripts/tpch-spotcheck.sh` PASS
+(Q12=2/Q13=33); pgbench smoke via pre-commit hook.
+
 ## Cross-references
 
 - TPC-H query bodies: HammerDB upstream

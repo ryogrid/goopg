@@ -172,6 +172,16 @@ type IntervalLit struct {
 	// see internal/executor/expr.go evalIntervalLit / truncIntervalToUnit.
 	Qualified bool
 
+	// PreComputed marks a multi-field / HH:MM:SS embedded body
+	// (`interval '1 day 05:00:00'`, `interval '1 year 2 mons 3 days'`) that
+	// the parser already decoded via parser.ParseIntervalBody
+	// (unimplemented_feat #5(b)). When set, PreMonths/PreDays/PreMicros hold
+	// the final components and Value/Unit/Qualified are unused.
+	PreComputed bool
+	PreMonths   int32
+	PreDays     int32
+	PreMicros   int64
+
 	// Cached parsed interval components from `Value`+`Unit`.
 	// CacheValid signals populated. Widened from a single int32 count
 	// (M0066-0002) to the full months/days/micros triple so fractional
