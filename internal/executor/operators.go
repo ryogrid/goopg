@@ -149,6 +149,11 @@ func (o *valuesOp) Open(ctx *Context) error {
 			// policies, not always DefaultDBOid's — mirrors the pg_inherits
 			// branch above. M0122-0007 4e follow-up 29.
 			o.rows = rematerialiseVirtualRowsFromStrings(tbl, ctx.PgPolicyRows())
+		} else if tbl.Name == "pg_trigger" && ctx != nil && ctx.PgTriggerRows != nil {
+			// pg_trigger must list the connecting database's own tables'
+			// triggers, not always DefaultDBOid's — mirrors the pg_policy
+			// branch above. M0122-0007 4e follow-up 30.
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, ctx.PgTriggerRows())
 		} else if tbl.VirtualRows != nil {
 			o.rows = rematerialiseVirtualRows(o.plan)
 		}

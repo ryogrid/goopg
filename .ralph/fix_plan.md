@@ -7005,6 +7005,48 @@ mirroring M0119's ledger `status` column.
       `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
       failed transactions, all 3 pgbench workloads) — run via the pre-commit
       hook at commit time.
+  - [x] `M0122-0007` follow-up 30 (2026-07-10, this loop) — **fixed the next
+      highest-value single sibling builder follow-up 29 flagged: `pg_trigger`
+      row-content.** Extracted `pg_trigger.VirtualRows`'s inline closure into
+      new exported `catalog.InMemory.PGTriggerRowsForDBOid(dbOid uint32)
+      [][]string`, parameterizing its one `c.ns(DefaultDBOid)` reference (the
+      loop over every table's `Triggers`) to `c.ns(dbOid)`. The registered
+      closure now just calls `PGTriggerRowsForDBOid(DefaultDBOid)`,
+      byte-identical default behavior. Wired new per-connection
+      `executor.Context.PgTriggerRows func() [][]string` field (mirroring
+      `PgPolicyRows`), set in `internal/server/dispatch.go`'s
+      `wireExtensionRows` (new `pgTriggerRowLister` interface), consumed by a
+      new `tbl.Name == "pg_trigger"` branch in
+      `internal/executor/operators.go`'s `valuesOp.Open`. New test
+      `TestPgTriggerRowsScopedToConnectionDBOid`
+      (`internal/executor/fk_dbid_routing_test.go`), mirroring
+      `TestPgPolicyRowsScopedToConnectionDBOid`: `CREATE FUNCTION ... RETURNS
+      trigger` + `CREATE TRIGGER ... BEFORE INSERT` under each of two
+      distinct dbOids, asserted never to cross-leak their `pg_trigger` rows
+      (by `tgname`). Live end-to-end verified against a real `cmd/goopg`
+      binary + real `psql`: `CREATE DATABASE trgA` / `CREATE DATABASE trgB` →
+      `trgA`: `CREATE TABLE ta (a int); CREATE FUNCTION fn_a() RETURNS
+      trigger ...; CREATE TRIGGER trig_a BEFORE INSERT ON ta ... EXECUTE
+      FUNCTION fn_a()` → `trgB`: same pattern with `tb`/`fn_b`/`trig_b` →
+      `SELECT tgname FROM pg_trigger` in `trgA` returns exactly `trig_a`, the
+      same query in `trgB` returns exactly `trig_b` — no cross-database leak
+      either direction. **Remaining scope (deferred, own future loops):** 5
+      sibling builders still row-content-`DefaultDBOid`-only —
+      `pg_statistic_ext`, `pg_rewrite`, `information_schema.routines`/
+      `parameters`/`routine_*_usage`, `pg_foreign_table`; `pg_sequence`/
+      `pg_sequences`/`information_schema.sequences`, `pg_attribute`/
+      `pg_type`, and the `oid::regclass` cast gap remain separately flagged.
+      `pg_rewrite` is the cleanest next single-builder pick (identical
+      table-level-slice shape to this loop's `pg_trigger` fix). Design doc
+      updated (new "pg_trigger row-content" residual-gap subsection);
+      `docs/design/README.md` row extended; deferral ledger row appended
+      ("pg_trigger per-dbOid content"). Gates: `go build ./...`/`go vet
+      ./...` clean; `go test ./internal/catalog/... ./internal/executor/...
+      ./internal/server/... ./internal/planner/...` PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed transactions, all 3 pgbench workloads) — run via the pre-commit
+      hook at commit time.
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,

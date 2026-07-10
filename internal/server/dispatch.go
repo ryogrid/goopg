@@ -2044,6 +2044,14 @@ func (s *Server) wireExtensionRows(ectx *executor.Context, dbName string) {
 			return pp.PGPolicyRowsForDBOid(catalog.NamespaceDBOid(ectx.CurrentDatabaseOid))
 		}
 	}
+	// pg_trigger must likewise reflect the connecting database's own tables'
+	// triggers, not always DefaultDBOid's. Mirrors the pg_policy wiring
+	// above. M0122-0007 4e follow-up 30.
+	if pt, ok := s.cfg.Catalog.(pgTriggerRowLister); ok {
+		ectx.PgTriggerRows = func() [][]string {
+			return pt.PGTriggerRowsForDBOid(catalog.NamespaceDBOid(ectx.CurrentDatabaseOid))
+		}
+	}
 }
 
 // pgClassRowLister is implemented by catalog.InMemory to expose a
@@ -2101,6 +2109,13 @@ type pgInheritsRowLister interface {
 // M0122-0007 4e follow-up 29.
 type pgPolicyRowLister interface {
 	PGPolicyRowsForDBOid(dbOid uint32) [][]string
+}
+
+// pgTriggerRowLister is implemented by catalog.InMemory to expose a
+// per-database pg_trigger row-set, mirroring pgPolicyRowLister above.
+// M0122-0007 4e follow-up 30.
+type pgTriggerRowLister interface {
+	PGTriggerRowsForDBOid(dbOid uint32) [][]string
 }
 
 func undoEnumDDLForRollback(connTx *connTxState, cat catalog.Catalog) {

@@ -528,6 +528,13 @@ type Context struct {
 	// CurrentDatabaseOid. M0122-0007 4e follow-up 29.
 	PgPolicyRows func() [][]string
 
+	// PgTriggerRows mirrors PgPolicyRows above for the pg_trigger catalog
+	// table: it lists CurrentDatabaseOid's own tables' triggers rather than
+	// always DefaultDBOid's (catalog.InMemory's PGTriggerRowsForDBOid). Wired
+	// by the server to close over CurrentDatabaseOid. M0122-0007 4e
+	// follow-up 30.
+	PgTriggerRows func() [][]string
+
 	// NonSuperuserRole, when non-empty, means the session is currently running
 	// under a non-superuser role (set via SET SESSION AUTHORIZATION). Privilege
 	// checks that require superuser (e.g. LEAKPROOF function attribute) must

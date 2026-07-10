@@ -9703,103 +9703,7 @@ func (c *InMemory) registerSystemTables() {
 		OID: 2620,
 	}
 	pgTrigger.VirtualRows = func() [][]string {
-		c.mu.RLock()
-		defer c.mu.RUnlock()
-		var out [][]string
-		for _, tbl := range c.ns(DefaultDBOid).tables {
-			if tbl == nil || tbl.Virtual || tbl.OID == 0 || len(tbl.Triggers) == 0 {
-				continue
-			}
-			for _, trig := range tbl.Triggers {
-				if trig.OID == 0 {
-					continue // predates OID tracking → invisible to pg_dump
-				}
-				// tgtype bitmask (pg_trigger.h): ROW=1, BEFORE=2, INSERT=4,
-				// DELETE=8, UPDATE=16, TRUNCATE=32, INSTEAD=64. AFTER is the
-				// absence of the BEFORE and INSTEAD bits.
-				var tgtype int
-				if trig.ForEachRow {
-					tgtype |= 1 << 0
-				}
-				switch trig.Timing {
-				case TriggerBefore:
-					tgtype |= 1 << 1
-				case TriggerInsteadOf:
-					tgtype |= 1 << 6
-				}
-				for _, ev := range trig.Events {
-					switch strings.ToLower(ev) {
-					case "insert":
-						tgtype |= 1 << 2
-					case "delete":
-						tgtype |= 1 << 3
-					case "update":
-						tgtype |= 1 << 4
-					case "truncate":
-						tgtype |= 1 << 5
-					}
-				}
-				// tgfoid: resolve the trigger function's OID from the routine
-				// registry. pg_dump's getTriggers does not read tgfoid (it calls
-				// pg_get_triggerdef), so 0 (unresolved) is harmless, but project
-				// the real OID for catalog faithfulness.
-				var tgfoid uint32
-				fnSchema := trig.FuncSchema
-				if fnSchema == "" {
-					fnSchema = "public"
-				}
-				if c.routines != nil {
-					for _, r := range c.routines.LookupByName(parser.ObjectName{Schema: trig.FuncSchema, Name: trig.FuncName}) {
-						tgfoid = r.OID
-						break
-					}
-				}
-				row := make([]string, 19)
-				row[0] = fmt.Sprintf("%d", trig.OID)     // oid
-				row[1] = fmt.Sprintf("%d", trig.TableOID) // tgrelid
-				row[2] = "0"                              // tgparentid
-				row[3] = trig.Name                        // tgname
-				row[4] = fmt.Sprintf("%d", tgfoid)        // tgfoid
-				row[5] = fmt.Sprintf("%d", tgtype)        // tgtype
-				row[6] = "O"                              // tgenabled (origin/enabled)
-				row[7] = "f"                              // tgisinternal
-				row[8] = "0"                              // tgconstrrelid
-				row[9] = "0"                              // tgconstrindid
-				// tgconstraint / tgdeferrable / tginitdeferred — a CREATE CONSTRAINT
-				// TRIGGER carries a non-zero tgconstraint (the implicit pg_constraint
-				// OID) so pg_get_triggerdef emits `CREATE CONSTRAINT TRIGGER` plus the
-				// deferrability clause. DU-002 slice 327.
-				tgconstraint := "0"
-				tgdeferrable := "f"
-				tginitdeferred := "f"
-				if trig.IsConstraint {
-					tgconstraint = fmt.Sprintf("%d", trig.ConstraintOID)
-					if trig.Deferrable {
-						tgdeferrable = "t"
-					}
-					if trig.InitDeferred {
-						tginitdeferred = "t"
-					}
-				}
-				row[10] = tgconstraint   // tgconstraint
-				row[11] = tgdeferrable   // tgdeferrable
-				row[12] = tginitdeferred // tginitdeferred
-				row[13] = fmt.Sprintf("%d", len(trig.Args)) // tgnargs
-				// tgattr (int2vector→int2[], space-separated like pg_index.indkey):
-				// the 1-based attnums of an `UPDATE OF col1, col2` column list, or
-				// empty for every non-column-specific trigger. DU-002 slice 326.
-				row[14] = triggerUpdateColAttrs(tbl, trig.UpdateColumns)
-				row[15] = ""                              // tgargs (bytea; def built from catalog.Trigger.Args)
-				row[16] = ""                              // tgqual (pg_node_tree; WHEN unsupported)
-				// tgoldtable / tgnewtable — the REFERENCING transition-table names
-				// (`OLD TABLE AS …` / `NEW TABLE AS …`), empty when absent. DU-002
-				// slice 328.
-				row[17] = trig.OldTransitionTable        // tgoldtable (name)
-				row[18] = trig.NewTransitionTable        // tgnewtable (name)
-				out = append(out, row)
-			}
-		}
-		return out
+		return c.PGTriggerRowsForDBOid(DefaultDBOid)
 	}
 	c.ns(DefaultDBOid).tables["pg_catalog.pg_trigger"] = pgTrigger
 
@@ -12953,6 +12857,113 @@ func (c *InMemory) PGPolicyRowsForDBOid(dbOid uint32) [][]string {
 				polqual,                    // polqual
 				polwithcheck,               // polwithcheck
 			})
+		}
+	}
+	return out
+}
+
+// PGTriggerRowsForDBOid builds the pg_trigger catalog row-set for dbOid's own
+// tables' triggers (mirrors PGPolicyRowsForDBOid's per-connection dbOid
+// scoping above). registerSystemTables's VirtualRows closure calls this with
+// DefaultDBOid so every existing caller (server dispatch without a
+// per-connection PgTriggerRows wire-up, every test) sees byte-identical
+// behavior; a per-connection dbOid is wired in via executor.Context.PgTriggerRows
+// (internal/server/dispatch.go's wireExtensionRows). M0122-0007 4e follow-up 30.
+func (c *InMemory) PGTriggerRowsForDBOid(dbOid uint32) [][]string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	var out [][]string
+	for _, tbl := range c.ns(dbOid).tables {
+		if tbl == nil || tbl.Virtual || tbl.OID == 0 || len(tbl.Triggers) == 0 {
+			continue
+		}
+		for _, trig := range tbl.Triggers {
+			if trig.OID == 0 {
+				continue // predates OID tracking → invisible to pg_dump
+			}
+			// tgtype bitmask (pg_trigger.h): ROW=1, BEFORE=2, INSERT=4,
+			// DELETE=8, UPDATE=16, TRUNCATE=32, INSTEAD=64. AFTER is the
+			// absence of the BEFORE and INSTEAD bits.
+			var tgtype int
+			if trig.ForEachRow {
+				tgtype |= 1 << 0
+			}
+			switch trig.Timing {
+			case TriggerBefore:
+				tgtype |= 1 << 1
+			case TriggerInsteadOf:
+				tgtype |= 1 << 6
+			}
+			for _, ev := range trig.Events {
+				switch strings.ToLower(ev) {
+				case "insert":
+					tgtype |= 1 << 2
+				case "delete":
+					tgtype |= 1 << 3
+				case "update":
+					tgtype |= 1 << 4
+				case "truncate":
+					tgtype |= 1 << 5
+				}
+			}
+			// tgfoid: resolve the trigger function's OID from the routine
+			// registry. pg_dump's getTriggers does not read tgfoid (it calls
+			// pg_get_triggerdef), so 0 (unresolved) is harmless, but project
+			// the real OID for catalog faithfulness.
+			var tgfoid uint32
+			fnSchema := trig.FuncSchema
+			if fnSchema == "" {
+				fnSchema = "public"
+			}
+			if c.routines != nil {
+				for _, r := range c.routines.LookupByName(parser.ObjectName{Schema: trig.FuncSchema, Name: trig.FuncName}) {
+					tgfoid = r.OID
+					break
+				}
+			}
+			row := make([]string, 19)
+			row[0] = fmt.Sprintf("%d", trig.OID)      // oid
+			row[1] = fmt.Sprintf("%d", trig.TableOID) // tgrelid
+			row[2] = "0"                              // tgparentid
+			row[3] = trig.Name                        // tgname
+			row[4] = fmt.Sprintf("%d", tgfoid)        // tgfoid
+			row[5] = fmt.Sprintf("%d", tgtype)        // tgtype
+			row[6] = "O"                              // tgenabled (origin/enabled)
+			row[7] = "f"                              // tgisinternal
+			row[8] = "0"                              // tgconstrrelid
+			row[9] = "0"                              // tgconstrindid
+			// tgconstraint / tgdeferrable / tginitdeferred — a CREATE CONSTRAINT
+			// TRIGGER carries a non-zero tgconstraint (the implicit pg_constraint
+			// OID) so pg_get_triggerdef emits `CREATE CONSTRAINT TRIGGER` plus the
+			// deferrability clause. DU-002 slice 327.
+			tgconstraint := "0"
+			tgdeferrable := "f"
+			tginitdeferred := "f"
+			if trig.IsConstraint {
+				tgconstraint = fmt.Sprintf("%d", trig.ConstraintOID)
+				if trig.Deferrable {
+					tgdeferrable = "t"
+				}
+				if trig.InitDeferred {
+					tginitdeferred = "t"
+				}
+			}
+			row[10] = tgconstraint                      // tgconstraint
+			row[11] = tgdeferrable                       // tgdeferrable
+			row[12] = tginitdeferred                     // tginitdeferred
+			row[13] = fmt.Sprintf("%d", len(trig.Args))  // tgnargs
+			// tgattr (int2vector→int2[], space-separated like pg_index.indkey):
+			// the 1-based attnums of an `UPDATE OF col1, col2` column list, or
+			// empty for every non-column-specific trigger. DU-002 slice 326.
+			row[14] = triggerUpdateColAttrs(tbl, trig.UpdateColumns)
+			row[15] = "" // tgargs (bytea; def built from catalog.Trigger.Args)
+			row[16] = "" // tgqual (pg_node_tree; WHEN unsupported)
+			// tgoldtable / tgnewtable — the REFERENCING transition-table names
+			// (`OLD TABLE AS …` / `NEW TABLE AS …`), empty when absent. DU-002
+			// slice 328.
+			row[17] = trig.OldTransitionTable // tgoldtable (name)
+			row[18] = trig.NewTransitionTable // tgnewtable (name)
+			out = append(out, row)
 		}
 	}
 	return out

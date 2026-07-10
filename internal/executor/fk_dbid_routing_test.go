@@ -690,3 +690,64 @@ func pgPolicyRowsContainPolname(rows [][]string, polname string) bool {
 	}
 	return false
 }
+
+// TestPgTriggerRowsScopedToConnectionDBOid mirrors
+// TestPgPolicyRowsScopedToConnectionDBOid above for the pg_trigger catalog
+// table (M0122-0007 4e follow-up 30): a trigger created under one dbOid must
+// not leak into another dbOid's pg_trigger rows.
+func TestPgTriggerRowsScopedToConnectionDBOid(t *testing.T) {
+	const otherDBOid = 7013
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+
+	ctx.CurrentDatabaseOid = catalog.DefaultDBOid
+	if err := runDDL(t, ctx, "CREATE TABLE t_default (a int)"); err != nil {
+		t.Fatalf("CREATE TABLE t_default: %v", err)
+	}
+	if err := runDDL(t, ctx, "CREATE FUNCTION trg_default_fn() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$"); err != nil {
+		t.Fatalf("CREATE FUNCTION trg_default_fn: %v", err)
+	}
+	if err := runDDL(t, ctx, "CREATE TRIGGER trg_default BEFORE INSERT ON t_default FOR EACH ROW EXECUTE FUNCTION trg_default_fn()"); err != nil {
+		t.Fatalf("CREATE TRIGGER trg_default: %v", err)
+	}
+	ctx.CurrentDatabaseOid = otherDBOid
+	if err := runDDL(t, ctx, "CREATE TABLE t_other (a int)"); err != nil {
+		t.Fatalf("CREATE TABLE t_other: %v", err)
+	}
+	if err := runDDL(t, ctx, "CREATE FUNCTION trg_other_fn() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$"); err != nil {
+		t.Fatalf("CREATE FUNCTION trg_other_fn: %v", err)
+	}
+	if err := runDDL(t, ctx, "CREATE TRIGGER trg_other BEFORE INSERT ON t_other FOR EACH ROW EXECUTE FUNCTION trg_other_fn()"); err != nil {
+		t.Fatalf("CREATE TRIGGER trg_other: %v", err)
+	}
+
+	im, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		t.Fatalf("ctx.Catalog is %T, want *catalog.InMemory", ctx.Catalog)
+	}
+
+	defaultRows := im.PGTriggerRowsForDBOid(catalog.DefaultDBOid)
+	if !pgTriggerRowsContainTgname(defaultRows, "trg_default") {
+		t.Fatal("DefaultDBOid's pg_trigger rows are missing trg_default")
+	}
+	if pgTriggerRowsContainTgname(defaultRows, "trg_other") {
+		t.Fatal("DefaultDBOid's pg_trigger rows include trg_other, a trigger created under a distinct dbOid")
+	}
+
+	otherRows := im.PGTriggerRowsForDBOid(otherDBOid)
+	if !pgTriggerRowsContainTgname(otherRows, "trg_other") {
+		t.Fatal("otherDBOid's pg_trigger rows are missing trg_other")
+	}
+	if pgTriggerRowsContainTgname(otherRows, "trg_default") {
+		t.Fatal("otherDBOid's pg_trigger rows include trg_default, a trigger created under DefaultDBOid")
+	}
+}
+
+func pgTriggerRowsContainTgname(rows [][]string, tgname string) bool {
+	for _, r := range rows {
+		if len(r) > 3 && r[3] == tgname {
+			return true
+		}
+	}
+	return false
+}
