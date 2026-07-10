@@ -158,29 +158,40 @@ func IntervalUnitToParts(val int64, fval float64, unit string) (months, days int
 // `sec`/`secs`, `hr`/`hrs`) so goopg can re-parse its own interval output.
 // It also accepts the week/decade/century/millennium/microsecond units and
 // their `dec`/`cent`/`mil`/`us`/`usec` abbreviations (unimplemented_feat
-// #5(c); microsecond fractions below 1µs are discarded); single-letter
-// forms (`w`/`c`) remain out of scope (deferred, d-ii positional ambiguity).
+// #5(c); microsecond fractions below 1µs are discarded), plus every
+// single-letter unit PostgreSQL's interval-decoding table (deltatktbl in
+// postgres/src/backend/utils/adt/datetime.c) recognises: `y`=year, `c`=century,
+// `w`=week, `d`=day, `h`=hour, `s`=second, and critically `m`=MINUTE — in an
+// interval literal `m` is unambiguously minute (deltatktbl), never month
+// (`interval '1 m'` → 00:01:00, `interval '1 y 2 m'` → 1 year 00:02:00). There
+// is NO positional ambiguity: DecodeInterval reads the unit token via
+// DecodeUnits→deltatktbl regardless of neighbouring fields (unimplemented_feat
+// #5(d-ii)). Units that appear in deltatktbl but have no case in
+// DecodeInterval's per-unit switch (`quarter`/`qtr`, the `timezone*`/`tz`
+// tokens) are intentionally NOT accepted — PostgreSQL rejects them with
+// DTERR_BAD_FORMAT (`interval '1 qtr'`/`interval '1 tz'` → 22007), so they must
+// fall through to the caller's error path here too.
 func canonicalIntervalUnit(w string) (string, bool) {
 	switch strings.ToLower(w) {
-	case "year", "years", "yr", "yrs":
+	case "year", "years", "yr", "yrs", "y":
 		return "year", true
 	case "month", "months", "mon", "mons":
 		return "month", true
-	case "week", "weeks":
+	case "week", "weeks", "w":
 		return "week", true
 	case "decade", "decades", "dec", "decs":
 		return "decade", true
-	case "century", "centuries", "cent":
+	case "century", "centuries", "cent", "c":
 		return "century", true
 	case "millennium", "millennia", "mil", "mils":
 		return "millennium", true
-	case "day", "days":
+	case "day", "days", "d":
 		return "day", true
-	case "hour", "hours", "hr", "hrs":
+	case "hour", "hours", "hr", "hrs", "h":
 		return "hour", true
-	case "minute", "minutes", "min", "mins":
+	case "minute", "minutes", "min", "mins", "m":
 		return "minute", true
-	case "second", "seconds", "sec", "secs":
+	case "second", "seconds", "sec", "secs", "s":
 		return "second", true
 	case "millisecond", "milliseconds", "ms", "msec", "msecs":
 		return "millisecond", true

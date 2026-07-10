@@ -302,6 +302,25 @@ func TestWeekDecadeCenturyIntervals(t *testing.T) {
 		{"SELECT interval '3 dec'", "30 years"},
 		{"SELECT interval '2 cent'", "200 years"},
 		{"SELECT interval '5 mil'", "5000 years"},
+		// Single-letter unit forms (PG deltatktbl): y/c/w/d/h/m/s. Critically
+		// `m` is MINUTE in an interval literal, never month (unimplemented_feat
+		// #5(d-ii)); values captured from PostgreSQL 18.3.
+		{"SELECT interval '1 y'", "1 year"},
+		{"SELECT interval '1 c'", "100 years"},
+		{"SELECT interval '1 w'", "7 days"},
+		{"SELECT interval '1 d'", "1 day"},
+		{"SELECT interval '1 h'", "01:00:00"},
+		{"SELECT interval '1 m'", "00:01:00"},
+		{"SELECT interval '1 s'", "00:00:01"},
+		{"SELECT interval '2 h 30 m'", "02:30:00"},
+		{"SELECT interval '1 d 2 h 3 m 4 s'", "1 day 02:03:04"},
+		{"SELECT interval '1.5 h'", "01:30:00"},
+		// `m` stays minute even beside a YEAR field: `1 y 2 m` is 1 year + 2
+		// minutes, not 1 year 2 months.
+		{"SELECT interval '1 y 2 m'", "1 year 00:02:00"},
+		// Single-letter forms via the cast / :: sibling path too.
+		{"SELECT '3 w'::interval", "21 days"},
+		{"SELECT CAST('90 m' AS interval)", "01:30:00"},
 		// Microsecond unit + abbreviations (fractions below 1µs discarded).
 		{"SELECT interval '500000 microseconds'", "00:00:00.5"},
 		{"SELECT interval '1500000 us'", "00:00:01.5"},

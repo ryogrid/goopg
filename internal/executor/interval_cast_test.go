@@ -118,6 +118,14 @@ func TestIntervalCastFromStringInvalidSyntax(t *testing.T) {
 		"SELECT '1--2'::interval FROM t",  // negative month part
 		"SELECT '1-2-3'::interval FROM t", // trailing "-3" after the month part
 		"SELECT '1-2x'::interval FROM t",  // trailing non-digit after the month part
+		// quarter/qtr and the timezone tokens appear in PG's deltatktbl but have
+		// no case in DecodeInterval's per-unit switch, so they raise
+		// DTERR_BAD_FORMAT (22007) rather than decoding (unimplemented_feat
+		// #5(d-ii)); goopg's canonicalIntervalUnit must reject them too.
+		"SELECT '1 qtr'::interval FROM t",
+		"SELECT '1 quarter'::interval FROM t",
+		"SELECT '1 tz'::interval FROM t",
+		"SELECT '1 timezone'::interval FROM t",
 	}
 	for _, sql := range cases {
 		t.Run(sql, func(t *testing.T) {

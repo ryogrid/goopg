@@ -731,6 +731,62 @@ cases in `internal/executor/interval_cast_test.go`
 executor/analyzer/planner/parser suites PASS; `scripts/tpch-spotcheck.sh` PASS
 (Q12=2/Q13=33); pgbench smoke via pre-commit hook.
 
+## Follow-up: single-letter interval unit forms (unimplemented_feat #5(d-ii), 2026-07-11)
+
+Closes the prior rows' deferred item (d-ii): the **single-letter interval unit
+abbreviations** now parse — `interval '1 y'` → `1 year`, `interval '1 c'` →
+`100 years`, `interval '1 w'` → `7 days`, `interval '1 d'` → `1 day`,
+`interval '1 h'` → `01:00:00`, `interval '1 m'` → `00:01:00`,
+`interval '1 s'` → `00:00:01`. These are exactly the seven single-character keys
+PostgreSQL's interval-decoding table carries (`deltatktbl` in
+`postgres/src/backend/utils/adt/datetime.c`): `y c w d h m s`.
+
+**The "positional ambiguity" flagged in earlier deferral rows was a
+misconception, refuted by reading `DecodeInterval`.** In an interval literal `m`
+is *unambiguously* MINUTE, never month: `DecodeInterval` (reading right-to-left)
+resolves every unit token through `DecodeUnits`, which binary-searches
+`deltatktbl` — and `deltatktbl` maps `{"m", UNITS, DTK_MINUTE}` independent of
+any neighbouring field. (The `m`→MONTH mapping lives only in the *absolute-date*
+table `datetktbl`, which interval decoding never consults.) So `interval '1 m'`
+is one minute and `interval '1 y 2 m'` is `1 year 00:02:00` (1 year + 2
+*minutes*), both confirmed byte-for-byte against PostgreSQL 18.3.
+
+A companion fidelity point: `quarter`/`qtr` and the timezone tokens
+(`tz`/`timezone`/`timezone_h`/`timezone_m`) *are* present in `deltatktbl`
+(decoding to `DTK_QUARTER`/`DTK_TZ*`), but `DecodeInterval`'s per-unit `switch
+(type)` has **no case** for them, so PG falls through to `default:
+DTERR_BAD_FORMAT` and raises `22007`. goopg reproduces this by *not* adding them
+to `canonicalIntervalUnit`, so they fall through to the same error path
+(`interval '1 qtr'`/`interval '1 timezone'` → 22007).
+
+Scope is a one-function change: seven keys appended to the existing
+`canonicalIntervalUnit` switch in `internal/parser/interval.go`. Because that
+helper is the shared choke point for `ParseIntervalBody`, both sibling entry
+points (parser Form-2 typed literal and executor `::interval`/CAST) gain the
+forms with no `select.go`/executor edit. Glued forms (`1m` with no space) remain
+a separate tokenizer gap — `ParseIntervalBody` splits on whitespace, matching
+neither PG's `ParseDateTime` letter/digit split nor these single-letter keys to
+an unseparated magnitude; that quirk stays deferred with the other tokenizer
+items below.
+
+**Still deferred** (see `deferral_ledger.md`): (d-iii) full interval typmod
+grammar (`HOUR TO MINUTE` ranges, `SECOND(p)` precision, Form-1 trailing-word
+column-alias fall-through); the field-mask collision cases goopg does not model
+(repeated MONTH bit `1-2 3 mons`/`1 mon 2 mons`); and the tokenizer quirks
+(`1-2.5`, `1-`, glued `1m`, trailing lone-unit-word type hint `1-2 days`) — all
+require a full `fmask`/`tmask` collision port plus a letter/digit tokenizer,
+distinct from this additive key change.
+
+Tests: three new blocks in `internal/executor/interval_subday_test.go`
+`TestWeekDecadeCenturyIntervals` (all seven single-letter accepts, the `m`=minute
+composition beside a YEAR field, and both cast/`::` sibling paths) and four new
+`quarter`/`qtr`/`tz`/`timezone` reject rows in
+`internal/executor/interval_cast_test.go`
+`TestIntervalCastFromStringInvalidSyntax`. Every `want`/error captured
+byte-for-byte from a live PostgreSQL 18.3 instance. Gates: `go build`/`go vet`
+clean; executor + parser suites PASS; `scripts/tpch-spotcheck.sh` PASS
+(Q12=2/Q13=33); pgbench smoke via pre-commit hook.
+
 ## Cross-references
 
 - TPC-H query bodies: HammerDB upstream
