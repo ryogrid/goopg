@@ -873,6 +873,53 @@ func pgForeignTableRowsContainFtrelid(rows [][]string, oid uint32) bool {
 	return false
 }
 
+// TestPgForeignServerRowsScopedToConnectionDBOid mirrors
+// TestPgForeignTableRowsScopedToConnectionDBOid above for the
+// pg_foreign_server catalog table (M0122-0007 4e follow-up 36): a same-named
+// CREATE SERVER under one dbOid must not leak into, or collide with, another
+// dbOid's pg_foreign_server rows.
+func TestPgForeignServerRowsScopedToConnectionDBOid(t *testing.T) {
+	const otherDBOid = 7016
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+
+	ctx.CurrentDatabaseOid = catalog.DefaultDBOid
+	if err := runDDL(t, ctx, "CREATE SERVER srv FOREIGN DATA WRAPPER goopg_fdw"); err != nil {
+		t.Fatalf("CREATE SERVER srv (DefaultDBOid): %v", err)
+	}
+	ctx.CurrentDatabaseOid = otherDBOid
+	if err := runDDL(t, ctx, "CREATE SERVER srv FOREIGN DATA WRAPPER goopg_fdw"); err != nil {
+		t.Fatalf("CREATE SERVER srv (otherDBOid): %v", err)
+	}
+
+	im, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		t.Fatalf("ctx.Catalog is %T, want *catalog.InMemory", ctx.Catalog)
+	}
+
+	defaultOID := im.ForeignServerOID("srv", catalog.DefaultDBOid)
+	otherOID := im.ForeignServerOID("srv", otherDBOid)
+	if defaultOID == 0 || otherOID == 0 || defaultOID == otherOID {
+		t.Fatalf("ForeignServerOID: default=%d other=%d, want distinct non-zero OIDs", defaultOID, otherOID)
+	}
+
+	defaultRows := im.PGForeignServerRowsForDBOid(catalog.DefaultDBOid)
+	if !pgForeignTableRowsContainFtrelid(defaultRows, defaultOID) {
+		t.Fatal("DefaultDBOid's pg_foreign_server rows are missing its own srv")
+	}
+	if pgForeignTableRowsContainFtrelid(defaultRows, otherOID) {
+		t.Fatal("DefaultDBOid's pg_foreign_server rows include otherDBOid's srv")
+	}
+
+	otherRows := im.PGForeignServerRowsForDBOid(otherDBOid)
+	if !pgForeignTableRowsContainFtrelid(otherRows, otherOID) {
+		t.Fatal("otherDBOid's pg_foreign_server rows are missing its own srv")
+	}
+	if pgForeignTableRowsContainFtrelid(otherRows, defaultOID) {
+		t.Fatal("otherDBOid's pg_foreign_server rows include DefaultDBOid's srv")
+	}
+}
+
 // TestRegclassCastScopedToConnectionDBOid covers the oid::regclass /
 // 'name'::regclass cast (both in internal/executor/expr.go's CastExpr arm),
 // which previously resolved every lookup against DefaultDBOid regardless of

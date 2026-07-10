@@ -3544,8 +3544,12 @@ func DecodeDropTablespace(payload []byte) (name string, err error) {
 // EncodeCreateForeignServer encodes a CREATE SERVER event (M0122-0007
 // foreign-server registry restart-durability follow-up). Format: kind(1) |
 // oid(4) | nameLen(2)+name | fdwNameLen(2)+fdwName | srvTypeLen(2)+srvType |
-// srvVersionLen(2)+srvVersion | optionsCount(2) | (optLen(2)+opt)*.
-func EncodeCreateForeignServer(name, fdwName, srvType, srvVersion string, options []string, oid uint32) []byte {
+// srvVersionLen(2)+srvVersion | optionsCount(2) | (optLen(2)+opt)* | dbOid(4).
+// dbOid is a trailing-appended field (M0122-0007 4e follow-up 36, mirroring
+// EncodeDropSequence's dbOid trailer) so a pre-follow-up-36 payload still
+// decodes: DecodeCreateForeignServer returns dbOid 0 (DefaultDBOid via
+// NamespaceDBOid) when the trailer is absent.
+func EncodeCreateForeignServer(name, fdwName, srvType, srvVersion string, options []string, oid uint32, dbOid uint32) []byte {
 	clip := func(s string) string {
 		if len(s) > 0xFFFF {
 			return s[:0xFFFF]
@@ -3563,6 +3567,7 @@ func EncodeCreateForeignServer(name, fdwName, srvType, srvVersion string, option
 		}
 		size += 2 + len(opt)
 	}
+	size += 4 // trailing dbOid
 	out := make([]byte, 1+size)
 	out[0] = RecordKindCreateForeignServer
 	binary.LittleEndian.PutUint32(out[1:5], oid)
@@ -3585,16 +3590,20 @@ func EncodeCreateForeignServer(name, fdwName, srvType, srvVersion string, option
 		}
 		writeStr(opt)
 	}
+	binary.LittleEndian.PutUint32(out[off:off+4], dbOid)
+	off += 4
 	return out[:off]
 }
 
 // DecodeCreateForeignServer decodes a RecordKindCreateForeignServer payload.
-func DecodeCreateForeignServer(payload []byte) (name, fdwName, srvType, srvVersion string, options []string, oid uint32, err error) {
+// dbOid is 0 (DefaultDBOid via NamespaceDBOid) for a pre-follow-up-36
+// payload that predates the trailing dbOid field.
+func DecodeCreateForeignServer(payload []byte) (name, fdwName, srvType, srvVersion string, options []string, oid uint32, dbOid uint32, err error) {
 	if len(payload) < 5 {
-		return "", "", "", "", nil, 0, fmt.Errorf("wal: create-foreign-server payload too short (%d bytes)", len(payload))
+		return "", "", "", "", nil, 0, 0, fmt.Errorf("wal: create-foreign-server payload too short (%d bytes)", len(payload))
 	}
 	if payload[0] != RecordKindCreateForeignServer {
-		return "", "", "", "", nil, 0, fmt.Errorf("wal: record kind %d is not create-foreign-server", payload[0])
+		return "", "", "", "", nil, 0, 0, fmt.Errorf("wal: record kind %d is not create-foreign-server", payload[0])
 	}
 	oid = binary.LittleEndian.Uint32(payload[1:5])
 	off := 5
@@ -3612,19 +3621,19 @@ func DecodeCreateForeignServer(payload []byte) (name, fdwName, srvType, srvVersi
 		return s, nil
 	}
 	if name, err = readStr(); err != nil {
-		return "", "", "", "", nil, 0, err
+		return "", "", "", "", nil, 0, 0, err
 	}
 	if fdwName, err = readStr(); err != nil {
-		return "", "", "", "", nil, 0, err
+		return "", "", "", "", nil, 0, 0, err
 	}
 	if srvType, err = readStr(); err != nil {
-		return "", "", "", "", nil, 0, err
+		return "", "", "", "", nil, 0, 0, err
 	}
 	if srvVersion, err = readStr(); err != nil {
-		return "", "", "", "", nil, 0, err
+		return "", "", "", "", nil, 0, 0, err
 	}
 	if len(payload) < off+2 {
-		return "", "", "", "", nil, 0, fmt.Errorf("wal: create-foreign-server payload truncated at options count (offset %d)", off)
+		return "", "", "", "", nil, 0, 0, fmt.Errorf("wal: create-foreign-server payload truncated at options count (offset %d)", off)
 	}
 	optCount := int(binary.LittleEndian.Uint16(payload[off : off+2]))
 	off += 2
@@ -3633,40 +3642,52 @@ func DecodeCreateForeignServer(payload []byte) (name, fdwName, srvType, srvVersi
 		for i := 0; i < optCount; i++ {
 			opt, oerr := readStr()
 			if oerr != nil {
-				return "", "", "", "", nil, 0, oerr
+				return "", "", "", "", nil, 0, 0, oerr
 			}
 			options = append(options, opt)
 		}
 	}
-	return name, fdwName, srvType, srvVersion, options, oid, nil
+	if len(payload) >= off+4 {
+		dbOid = binary.LittleEndian.Uint32(payload[off : off+4])
+	}
+	return name, fdwName, srvType, srvVersion, options, oid, dbOid, nil
 }
 
 // EncodeDropForeignServer encodes a DROP SERVER event.
-// Format: kind(1) | nameLen(2) | name(nameLen bytes).
-func EncodeDropForeignServer(name string) []byte {
+// Format: kind(1) | nameLen(2) | name(nameLen bytes) | dbOid(4). dbOid is a
+// trailing-appended field (M0122-0007 4e follow-up 36, mirroring
+// EncodeDropSequence's dbOid trailer).
+func EncodeDropForeignServer(name string, dbOid uint32) []byte {
 	if len(name) > 0xFFFF {
 		name = name[:0xFFFF]
 	}
-	out := make([]byte, 3+len(name))
+	out := make([]byte, 3+len(name)+4)
 	out[0] = RecordKindDropForeignServer
 	binary.LittleEndian.PutUint16(out[1:3], uint16(len(name)))
 	copy(out[3:], name)
+	binary.LittleEndian.PutUint32(out[3+len(name):], dbOid)
 	return out
 }
 
 // DecodeDropForeignServer decodes a RecordKindDropForeignServer payload.
-func DecodeDropForeignServer(payload []byte) (name string, err error) {
+// dbOid is 0 (DefaultDBOid via NamespaceDBOid) for a pre-follow-up-36
+// payload that predates the trailing dbOid field.
+func DecodeDropForeignServer(payload []byte) (name string, dbOid uint32, err error) {
 	if len(payload) < 3 {
-		return "", fmt.Errorf("wal: drop-foreign-server payload too short (%d bytes)", len(payload))
+		return "", 0, fmt.Errorf("wal: drop-foreign-server payload too short (%d bytes)", len(payload))
 	}
 	if payload[0] != RecordKindDropForeignServer {
-		return "", fmt.Errorf("wal: record kind %d is not drop-foreign-server", payload[0])
+		return "", 0, fmt.Errorf("wal: record kind %d is not drop-foreign-server", payload[0])
 	}
 	nameLen := int(binary.LittleEndian.Uint16(payload[1:3]))
 	if len(payload) < 3+nameLen {
-		return "", fmt.Errorf("wal: drop-foreign-server payload truncated (need %d bytes)", 3+nameLen)
+		return "", 0, fmt.Errorf("wal: drop-foreign-server payload truncated (need %d bytes)", 3+nameLen)
 	}
-	return string(payload[3 : 3+nameLen]), nil
+	name = string(payload[3 : 3+nameLen])
+	if off := 3 + nameLen; len(payload) >= off+4 {
+		dbOid = binary.LittleEndian.Uint32(payload[off : off+4])
+	}
+	return name, dbOid, nil
 }
 
 // EncodeCreateUserMapping encodes a CREATE USER MAPPING event (M0122-0007

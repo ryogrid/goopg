@@ -1444,6 +1444,47 @@ case), so a future loop should replace `resolveCreateDatabaseTemplate`'s
 function outright — the existence check and the `DefaultDBOid`-skip logic
 both still apply.
 
+**Foreign-server registry dbOid scoping — LANDED (2026-07-10, follow-up
+36).** Strictly this belongs to the "~20 sibling per-name maps" this doc's
+own "Deferred / explicitly out of scope" section named as out of scope for
+the namespace epic proper — but the same shape had already been folded into
+4e's "cross-cutting fixups" by follow-ups 30-35 (`seqRegistry`,
+`constraintViewDeps`), so this row keeps that established numbering rather
+than opening a separate doc. `catalog.ForeignServer`
+(`internal/catalog/catalog.go`) gained a `DBOid uint32` field; the
+`c.foreignServers` registry re-keyed from bare name to
+`foreignServerKey(dbOid, name)` (`"<dbOid>:<name>"`, mirroring `seqKey`) so a
+same-named `CREATE SERVER` in two distinct databases no longer collides
+(the pre-fix bare-name key silently collapsed them onto one entry,
+last-writer-wins). `RegisterForeignServer`/`DropForeignServer`/
+`ListForeignServers`/`ForeignServerOID` (the last also updated in the
+`catalog.Catalog` interface) and their `*DuringRecovery` counterparts gained
+a trailing `dbOid ...uint32` parameter; `EncodeCreateForeignServer`/
+`DecodeCreateForeignServer` and `EncodeDropForeignServer`/
+`DecodeDropForeignServer` (`internal/wal/recovery.go`) each gained a
+trailing-appended `dbOid` field, following `EncodeDropSequence`'s
+backward-compatible-trailer pattern exactly (a pre-follow-up-36 WAL payload
+decodes with `dbOid=0`, translated through `catalog.NamespaceDBOid` at the
+replay call site). New `catalog.InMemory.PGForeignServerRowsForDBOid`
+extracted from `pg_foreign_server.VirtualRows` (mirrors
+`PGForeignTableRowsForDBOid`); a new `executor.Context.PgForeignServerRows`
+field is wired the same way as every other 4e per-connection row-lister.
+Auditing every `ForeignServerOID` call site this signature change touched
+also caught 2 pre-existing un-dbOid'd sites that this loop's own regression
+test suite (`TestPgForeignTableRowsScopedToConnectionDBOid`) surfaced as
+newly broken: `CREATE FOREIGN TABLE ... SERVER`'s existence check and
+`COMMENT ON SERVER`, both now threaded with
+`catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)`. Live end-to-end verified
+against a real `cmd/goopg` + `psql`: two `CREATE DATABASE`s each
+`CREATE SERVER shared ...` with a distinct `TYPE`; each database's
+`pg_foreign_server` shows exactly its own row; `DROP SERVER` in one leaves
+the other's same-named server intact; both facts survive a restart.
+**Deliberately still un-dbOid'd, named in the deferral ledger's follow-up-36
+row:** `pg_user_mappings`/`UserMapping` (same-shape sibling, its own future
+loop), `internal/server/grant_ddl.go`'s `GRANT/REVOKE ... ON FOREIGN SERVER`
+(still resolves against `DefaultDBOid` only — not a regression, matches
+pre-follow-up-36 behavior), and the FDW registry itself.
+
 ## Recommended order and stopping points
 
 4a (landed) → 4b-i (landed) → 4b-ii (landed) → 4c (landed) → 4d-i (landed) →

@@ -556,6 +556,13 @@ type Context struct {
 	// follow-up 34.
 	PgSequenceRows func() [][]string
 
+	// PgForeignServerRows mirrors PgForeignTableRows above for the
+	// pg_foreign_server catalog table: it lists CurrentDatabaseOid's own
+	// CREATE SERVER'd servers rather than always DefaultDBOid's
+	// (catalog.InMemory's PGForeignServerRowsForDBOid). Wired by the server
+	// to close over CurrentDatabaseOid. M0122-0007 4e follow-up 36.
+	PgForeignServerRows func() [][]string
+
 	// NonSuperuserRole, when non-empty, means the session is currently running
 	// under a non-superuser role (set via SET SESSION AUTHORIZATION). Privilege
 	// checks that require superuser (e.g. LEAKPROOF function attribute) must

@@ -27,8 +27,8 @@ import (
 // foreignServerRegistryRecovery is the catalog-side surface this recovery
 // pass needs. `*catalog.InMemory` satisfies it.
 type foreignServerRegistryRecovery interface {
-	RegisterForeignServerDuringRecovery(name, fdwName, srvType, srvVersion string, options []string, oid uint32)
-	UnregisterForeignServerDuringRecovery(name string)
+	RegisterForeignServerDuringRecovery(name, fdwName, srvType, srvVersion string, options []string, oid uint32, dbOid ...uint32)
+	UnregisterForeignServerDuringRecovery(name string, dbOid ...uint32)
 }
 
 // replayForeignServerDDLRecords reads every WAL record under walDir and
@@ -67,17 +67,17 @@ func replayForeignServerDDLRecords(walDir string, cat catalog.Catalog) error {
 		}
 		switch rec.Payload[0] {
 		case wal.RecordKindCreateForeignServer:
-			name, fdwName, srvType, srvVersion, options, oid, derr := wal.DecodeCreateForeignServer(rec.Payload)
+			name, fdwName, srvType, srvVersion, options, oid, dbOid, derr := wal.DecodeCreateForeignServer(rec.Payload)
 			if derr != nil {
 				return fmt.Errorf("decode create-foreign-server at lsn %d: %w", rec.StartLSN, derr)
 			}
-			reg.RegisterForeignServerDuringRecovery(name, fdwName, srvType, srvVersion, options, oid)
+			reg.RegisterForeignServerDuringRecovery(name, fdwName, srvType, srvVersion, options, oid, catalog.NamespaceDBOid(dbOid))
 		case wal.RecordKindDropForeignServer:
-			name, derr := wal.DecodeDropForeignServer(rec.Payload)
+			name, dbOid, derr := wal.DecodeDropForeignServer(rec.Payload)
 			if derr != nil {
 				return fmt.Errorf("decode drop-foreign-server at lsn %d: %w", rec.StartLSN, derr)
 			}
-			reg.UnregisterForeignServerDuringRecovery(name)
+			reg.UnregisterForeignServerDuringRecovery(name, catalog.NamespaceDBOid(dbOid))
 		}
 	}
 	return nil

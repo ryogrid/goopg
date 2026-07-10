@@ -90,3 +90,62 @@ func TestCreateServerRegistersForeignServerWithCapturedOID(t *testing.T) {
 		t.Fatalf("registered server OID = 0, want a minted OID")
 	}
 }
+
+// TestCreateServerSameNameAcrossDistinctDBOidDoesNotCollide pins the
+// M0122-0007 4e follow-up 36 fix: RegisterForeignServer used to key the
+// foreignServers registry by bare name only, so two distinct databases'
+// CREATE SERVER of the same name silently collapsed onto one entry
+// (last-writer-wins) instead of erroring or coexisting as PostgreSQL's own
+// per-database pg_foreign_server does. Confirmed to fail against a revert of
+// just foreignServerKey's dbOid component (a same-signature neutered key
+// that folds dbOid to a no-op).
+func TestCreateServerSameNameAcrossDistinctDBOidDoesNotCollide(t *testing.T) {
+	const otherDBOid = 8801
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+
+	ctx.CurrentDatabaseOid = catalog.DefaultDBOid
+	if err := runDDL(t, ctx, `CREATE SERVER shared TYPE 'a' FOREIGN DATA WRAPPER goopg_fdw`); err != nil {
+		t.Fatalf("CREATE SERVER shared (DefaultDBOid): %v", err)
+	}
+	ctx.CurrentDatabaseOid = otherDBOid
+	if err := runDDL(t, ctx, `CREATE SERVER shared TYPE 'b' FOREIGN DATA WRAPPER goopg_fdw`); err != nil {
+		t.Fatalf("CREATE SERVER shared (otherDBOid): %v", err)
+	}
+
+	im, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		t.Fatalf("ctx.Catalog is %T, want *catalog.InMemory", ctx.Catalog)
+	}
+
+	defaultOID := im.ForeignServerOID("shared", catalog.DefaultDBOid)
+	otherOID := im.ForeignServerOID("shared", otherDBOid)
+	if defaultOID == 0 || otherOID == 0 {
+		t.Fatalf("ForeignServerOID: default=%d other=%d, want both non-zero", defaultOID, otherOID)
+	}
+	if defaultOID == otherOID {
+		t.Fatalf("DefaultDBOid and otherDBOid's same-named \"shared\" server share OID %d — they collided into one entry", defaultOID)
+	}
+
+	defaultList := im.ListForeignServers(catalog.DefaultDBOid)
+	if len(defaultList) != 1 || defaultList[0].Type != "a" {
+		t.Fatalf("DefaultDBOid's ListForeignServers = %+v, want exactly 1 entry with Type=a", defaultList)
+	}
+	otherList := im.ListForeignServers(otherDBOid)
+	if len(otherList) != 1 || otherList[0].Type != "b" {
+		t.Fatalf("otherDBOid's ListForeignServers = %+v, want exactly 1 entry with Type=b", otherList)
+	}
+
+	// DROP SERVER in one database must not remove the other's same-named
+	// server (mirrors the drop half of the fix).
+	ctx.CurrentDatabaseOid = catalog.DefaultDBOid
+	if err := runDDL(t, ctx, `DROP SERVER shared`); err != nil {
+		t.Fatalf("DROP SERVER shared (DefaultDBOid): %v", err)
+	}
+	if oid := im.ForeignServerOID("shared", catalog.DefaultDBOid); oid != 0 {
+		t.Fatalf("after DROP SERVER, DefaultDBOid's ForeignServerOID(shared) = %d, want 0", oid)
+	}
+	if oid := im.ForeignServerOID("shared", otherDBOid); oid != otherOID {
+		t.Fatalf("after DefaultDBOid's DROP SERVER, otherDBOid's ForeignServerOID(shared) = %d, want unchanged %d", oid, otherOID)
+	}
+}

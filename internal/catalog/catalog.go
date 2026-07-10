@@ -1946,11 +1946,12 @@ type Catalog interface {
 	// this renderer supplies the canonical aclitem[] text. M0119-0004-ACLHEAP.
 	TypeACLText(typeOID uint32) string
 	// ForeignServerOID returns the stable OID of the named foreign server
-	// (CREATE SERVER), or 0 if not found. Used by the FOREIGN SERVER GRANT
-	// recorder (internal/server/grant_ddl.go) to resolve the object named in
+	// (CREATE SERVER) under dbOid (variadic, defaults to DefaultDBOid), or 0
+	// if not found. Used by the FOREIGN SERVER GRANT recorder
+	// (internal/server/grant_ddl.go) to resolve the object named in
 	// `GRANT … ON FOREIGN SERVER <name> TO …` to the OID-keyed ACL store key.
-	// DU-002 slice 427.
-	ForeignServerOID(name string) uint32
+	// DU-002 slice 427; dbOid scoping: M0122-0007 4e follow-up 36.
+	ForeignServerOID(name string, dbOid ...uint32) uint32
 	// ForeignDataWrapperOID returns the stable OID of the named FDW (CREATE
 	// FOREIGN DATA WRAPPER), or 0 if not found. Used by the FOREIGN DATA WRAPPER
 	// GRANT recorder (internal/server/grant_ddl.go) to resolve the object named
@@ -9273,28 +9274,7 @@ func (c *InMemory) registerSystemTables() {
 	// producing no spurious dumpACL output for the common no-grant case. DU-002
 	// slice 427.
 	pgForeignServer.VirtualRows = func() [][]string {
-		servers := c.ListForeignServers()
-		if len(servers) == 0 {
-			return nil
-		}
-		out := make([][]string, 0, len(servers))
-		for _, s := range servers {
-			owner := s.Owner
-			if owner == 0 {
-				owner = 10 // bootstrap superuser (postgres); getRoleName(10) → "postgres"
-			}
-			out = append(out, []string{
-				strconv.FormatUint(uint64(s.OID), 10), // oid
-				s.Name,                                // srvname
-				strconv.FormatUint(uint64(owner), 10), // srvowner
-				strconv.FormatUint(uint64(c.ForeignDataWrapperOID(s.FdwName)), 10), // srvfdw
-				s.Type,                         // srvtype ("" → NULL, TYPE clause omitted)
-				s.Version,                      // srvversion ("" → NULL, VERSION clause omitted)
-				c.ForeignServerACLText(s.OID),  // srvacl (NULL until a GRANT, DU-002 slice 427)
-				optionsArrayLiteral(s.Options), // srvoptions text[] ("{name=value,…}" or "" for NULL)
-			})
-		}
-		return out
+		return c.PGForeignServerRowsForDBOid(DefaultDBOid)
 	}
 	c.ns(DefaultDBOid).tables["pg_catalog.pg_foreign_server"] = pgForeignServer
 
@@ -13003,7 +12983,7 @@ func (c *InMemory) PGForeignTableRowsForDBOid(dbOid uint32) [][]string {
 			continue
 		}
 		var srvOID uint32
-		if s, ok := c.foreignServers[t.ForeignServerName]; ok {
+		if s, ok := c.foreignServers[foreignServerKey(dbOid, t.ForeignServerName)]; ok {
 			srvOID = s.OID
 		}
 		out = append(out, []string{
@@ -15479,6 +15459,21 @@ type ForeignServer struct {
 	// dumpForeignServer re-emits an `OPTIONS (name 'value', …)` clause. Nil/empty
 	// → no OPTIONS clause. DU-002 slice 378.
 	Options []string
+	// DBOid is the real physical database oid this server was CREATE SERVER'd
+	// under (mirrors catalog.Table.DBOid / seqState.dbOid). Registry entries
+	// are keyed by foreignServerKey(DBOid, Name), so two distinct databases
+	// may each CREATE SERVER a same-named server without colliding.
+	// M0122-0007 4e follow-up 36.
+	DBOid uint32
+}
+
+// foreignServerKey builds the foreignServers registry key from a (dbOid,
+// name) pair, mirroring seqKey's "<dbOid>:<name>" scheme
+// (internal/executor/operators_sequence.go) so a same-named server in two
+// distinct databases no longer collides (last-writer-wins) the way the
+// pre-4e-follow-up-36 bare-name key did. M0122-0007 4e follow-up 36.
+func foreignServerKey(dbOid uint32, name string) string {
+	return strconv.FormatUint(uint64(dbOid), 10) + ":" + name
 }
 
 // RegisterForeignServer records a foreign server, allocating a stable OID on
@@ -15486,13 +15481,23 @@ type ForeignServer struct {
 // entry without changing its OID (the FDW association, TYPE/VERSION, and OPTIONS
 // are refreshed when non-empty). DU-002 slice 376 (options: slice 378;
 // type/version: slice 381).
-func (c *InMemory) RegisterForeignServer(name, fdwName, srvType, srvVersion string, options []string) *ForeignServer {
+// RegisterForeignServer records a foreign server under dbOid (variadic,
+// defaults to DefaultDBOid — every pre-4e-follow-up-36 call site keeps
+// resolving there unchanged, mirroring resolveDBOid's convention),
+// allocating a stable OID on first sight. Idempotent: re-registering an
+// existing (dbOid, name) pair returns the existing entry without changing
+// its OID (the FDW association, TYPE/VERSION, and OPTIONS are refreshed
+// when non-empty). DU-002 slice 376 (options: slice 378; type/version:
+// slice 381; dbOid scoping: M0122-0007 4e follow-up 36).
+func (c *InMemory) RegisterForeignServer(name, fdwName, srvType, srvVersion string, options []string, dbOid ...uint32) *ForeignServer {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.foreignServers == nil {
 		c.foreignServers = make(map[string]*ForeignServer)
 	}
-	if s, ok := c.foreignServers[name]; ok {
+	oid := resolveDBOid(dbOid)
+	key := foreignServerKey(oid, name)
+	if s, ok := c.foreignServers[key]; ok {
 		if fdwName != "" {
 			s.FdwName = fdwName
 		}
@@ -15507,79 +15512,125 @@ func (c *InMemory) RegisterForeignServer(name, fdwName, srvType, srvVersion stri
 		}
 		return s
 	}
-	s := &ForeignServer{Name: name, OID: c.allocOIDLocked(), FdwName: fdwName, Type: srvType, Version: srvVersion, Options: options}
-	c.foreignServers[name] = s
+	s := &ForeignServer{Name: name, OID: c.allocOIDLocked(), FdwName: fdwName, Type: srvType, Version: srvVersion, Options: options, DBOid: oid}
+	c.foreignServers[key] = s
 	return s
 }
 
-// DropForeignServer removes a foreign server from the registry. Returns true if
-// found. DU-002 slice 376.
-func (c *InMemory) DropForeignServer(name string) bool {
+// DropForeignServer removes a foreign server from dbOid's registry
+// (variadic, defaults to DefaultDBOid). Returns true if found. DU-002 slice
+// 376; dbOid scoping: M0122-0007 4e follow-up 36.
+func (c *InMemory) DropForeignServer(name string, dbOid ...uint32) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.foreignServers == nil {
 		return false
 	}
-	if _, ok := c.foreignServers[name]; ok {
-		delete(c.foreignServers, name)
+	key := foreignServerKey(resolveDBOid(dbOid), name)
+	if _, ok := c.foreignServers[key]; ok {
+		delete(c.foreignServers, key)
 		return true
 	}
 	return false
 }
 
-// ListForeignServers returns all registered foreign servers sorted by name.
-// DU-002 slice 376.
-func (c *InMemory) ListForeignServers() []*ForeignServer {
+// ListForeignServers returns dbOid's own registered foreign servers
+// (variadic, defaults to DefaultDBOid), sorted by name. DU-002 slice 376;
+// dbOid scoping: M0122-0007 4e follow-up 36.
+func (c *InMemory) ListForeignServers(dbOid ...uint32) []*ForeignServer {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	if len(c.foreignServers) == 0 {
 		return nil
 	}
+	oid := resolveDBOid(dbOid)
 	out := make([]*ForeignServer, 0, len(c.foreignServers))
 	for _, s := range c.foreignServers {
-		out = append(out, s)
+		if s.DBOid == oid {
+			out = append(out, s)
+		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
 }
 
-// ForeignServerOID returns the stable OID of the named foreign server, or 0 if
-// no such server is registered. Used by pg_user_mappings.VirtualRows to populate
-// srvid (the column pg_dump's dumpUserMappings filters on). DU-002 slice 377.
-func (c *InMemory) ForeignServerOID(name string) uint32 {
+// ForeignServerOID returns the stable OID of the named foreign server under
+// dbOid (variadic, defaults to DefaultDBOid), or 0 if no such server is
+// registered. Used by pg_user_mappings.VirtualRows to populate srvid (the
+// column pg_dump's dumpUserMappings filters on). DU-002 slice 377; dbOid
+// scoping: M0122-0007 4e follow-up 36.
+func (c *InMemory) ForeignServerOID(name string, dbOid ...uint32) uint32 {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	if s, ok := c.foreignServers[name]; ok {
+	if s, ok := c.foreignServers[foreignServerKey(resolveDBOid(dbOid), name)]; ok {
 		return s.OID
 	}
 	return 0
 }
 
 // RegisterForeignServerDuringRecovery re-registers a foreign server with its
-// original OID, replayed from a RecordKindCreateForeignServer WAL record
-// (M0122-0007 foreign-server registry restart-durability follow-up). Mirrors
+// original OID under dbOid (variadic, defaults to DefaultDBOid), replayed
+// from a RecordKindCreateForeignServer WAL record (M0122-0007 foreign-server
+// registry restart-durability follow-up). Mirrors
 // RegisterTablespaceDuringRecovery. Owner is not carried (see
-// RecordKindCreateForeignServer's doc comment).
-func (c *InMemory) RegisterForeignServerDuringRecovery(name, fdwName, srvType, srvVersion string, options []string, oid uint32) {
+// RecordKindCreateForeignServer's doc comment). dbOid scoping: M0122-0007 4e
+// follow-up 36.
+func (c *InMemory) RegisterForeignServerDuringRecovery(name, fdwName, srvType, srvVersion string, options []string, oid uint32, dbOid ...uint32) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.foreignServers == nil {
 		c.foreignServers = make(map[string]*ForeignServer)
 	}
-	c.foreignServers[name] = &ForeignServer{Name: name, OID: oid, FdwName: fdwName, Type: srvType, Version: srvVersion, Options: options}
+	dboid := resolveDBOid(dbOid)
+	c.foreignServers[foreignServerKey(dboid, name)] = &ForeignServer{Name: name, OID: oid, FdwName: fdwName, Type: srvType, Version: srvVersion, Options: options, DBOid: dboid}
 	if oid >= c.nextOID {
 		c.nextOID = oid + 1
 	}
 }
 
-// UnregisterForeignServerDuringRecovery removes a foreign server from the
-// registry, replayed from a RecordKindDropForeignServer WAL record.
-// Counterpart to RegisterForeignServerDuringRecovery; mirrors
-// UnregisterTablespaceDuringRecovery.
-func (c *InMemory) UnregisterForeignServerDuringRecovery(name string) {
+// UnregisterForeignServerDuringRecovery removes a foreign server from
+// dbOid's registry (variadic, defaults to DefaultDBOid), replayed from a
+// RecordKindDropForeignServer WAL record. Counterpart to
+// RegisterForeignServerDuringRecovery; mirrors
+// UnregisterTablespaceDuringRecovery. dbOid scoping: M0122-0007 4e follow-up
+// 36.
+func (c *InMemory) UnregisterForeignServerDuringRecovery(name string, dbOid ...uint32) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	delete(c.foreignServers, name)
+	delete(c.foreignServers, foreignServerKey(resolveDBOid(dbOid), name))
+}
+
+// PGForeignServerRowsForDBOid builds the pg_foreign_server catalog row-set
+// for dbOid's own registered servers (mirrors PGForeignTableRowsForDBOid's
+// per-connection dbOid scoping). registerSystemTables's VirtualRows closure
+// calls this with DefaultDBOid so every existing caller (server dispatch
+// without a per-connection PgForeignServerRows wire-up, every test) sees
+// byte-identical behavior; a per-connection dbOid is wired in via
+// executor.Context.PgForeignServerRows (internal/server/dispatch.go's
+// wireExtensionRows). M0122-0007 4e follow-up 36.
+func (c *InMemory) PGForeignServerRowsForDBOid(dbOid uint32) [][]string {
+	servers := c.ListForeignServers(dbOid)
+	if len(servers) == 0 {
+		return nil
+	}
+	out := make([][]string, 0, len(servers))
+	for _, s := range servers {
+		owner := s.Owner
+		if owner == 0 {
+			owner = 10 // bootstrap superuser (postgres); getRoleName(10) → "postgres"
+		}
+		out = append(out, []string{
+			strconv.FormatUint(uint64(s.OID), 10), // oid
+			s.Name,                                // srvname
+			strconv.FormatUint(uint64(owner), 10), // srvowner
+			strconv.FormatUint(uint64(c.ForeignDataWrapperOID(s.FdwName)), 10), // srvfdw
+			s.Type,                         // srvtype ("" → NULL, TYPE clause omitted)
+			s.Version,                      // srvversion ("" → NULL, VERSION clause omitted)
+			c.ForeignServerACLText(s.OID),  // srvacl (NULL until a GRANT, DU-002 slice 427)
+			optionsArrayLiteral(s.Options), // srvoptions text[] ("{name=value,…}" or "" for NULL)
+		})
+	}
+	return out
 }
 
 // RegisterUserMappingDuringRecovery restores a user mapping with its

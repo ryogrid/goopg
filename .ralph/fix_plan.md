@@ -7278,6 +7278,76 @@ mirroring M0119's ledger `status` column.
       `information_schema.routines` (bigger registry redesign);
       `c.foreignServers` (also touches WAL format); the real `CREATE
       DATABASE ... TEMPLATE` relation-copy mechanism itself.
+  - [x] `M0122-0007` follow-up 36 (2026-07-10, this loop) — **closed the
+      `c.foreignServers` registry-dbOid-key gap follow-up 35 left as
+      remaining scope: `catalog.ForeignServer` was a process-global
+      `map[string]*ForeignServer` keyed by bare name only, so a same-named
+      `CREATE SERVER` in two distinct databases silently collided
+      (last-writer-wins) instead of coexisting like real PG's per-database
+      `pg_foreign_server`.** Gave `ForeignServer` a `DBOid uint32` field and
+      re-keyed the registry via new `foreignServerKey(dbOid, name)`
+      (`"<dbOid>:<name>"`, mirroring `seqKey`). Threaded a trailing
+      `dbOid ...uint32` parameter through `RegisterForeignServer`/
+      `DropForeignServer`/`ListForeignServers`/`ForeignServerOID` (the last
+      also updated in the `catalog.Catalog` interface, since it's the one
+      method of the four exposed there) and their `*DuringRecovery`
+      counterparts. `EncodeCreateForeignServer`/`DecodeCreateForeignServer`
+      and `EncodeDropForeignServer`/`DecodeDropForeignServer`
+      (`internal/wal/recovery.go`) each gained a trailing-appended `dbOid`
+      field, following `EncodeDropSequence`'s backward-compatible-trailer
+      pattern exactly (a pre-follow-up-36 WAL payload decodes with
+      `dbOid=0`, translated through `catalog.NamespaceDBOid` at the replay
+      call site in `internal/initdb/foreignserver_ddl_recovery.go`). New
+      `catalog.InMemory.PGForeignServerRowsForDBOid(dbOid uint32) [][]string`
+      extracted from `pg_foreign_server.VirtualRows` (mirrors
+      `PGForeignTableRowsForDBOid`); new `executor.Context.PgForeignServerRows`
+      field wired in `internal/server/dispatch.go`'s `wireExtensionRows`
+      (new `pgForeignServerRowLister` interface), consumed by a new
+      `tbl.Name == "pg_foreign_server"` branch in `valuesOp.Open`. Updated
+      every CREATE/DROP SERVER and CASCADE-drop call site in
+      `internal/executor/operators_ddl.go` to pass
+      `catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)`; auditing every
+      `ForeignServerOID` call site this signature change touched also caught
+      2 pre-existing un-dbOid'd sites — `CREATE FOREIGN TABLE ... SERVER`'s
+      existence check and `COMMENT ON SERVER` — the first was caught live by
+      a pre-existing regression test (`TestPgForeignTableRowsScopedToConnectionDBOid`)
+      failing with `42704: server does not exist` before this fix.
+      `PGForeignTableRowsForDBOid`'s `c.foreignServers[t.ForeignServerName]`
+      lookup updated to the new keyed form. New tests
+      `TestCreateServerSameNameAcrossDistinctDBOidDoesNotCollide`
+      (`internal/executor/operators_ddl_foreign_server_durability_test.go`),
+      `TestPgForeignServerRowsScopedToConnectionDBOid`
+      (`internal/executor/fk_dbid_routing_test.go`),
+      `TestForeignServerDDLRecoveryPreservesDistinctDBOidAfterRestart`
+      (`internal/initdb/foreignserver_ddl_recovery_test.go`), plus WAL
+      round-trip/backward-compat tests in
+      `internal/wal/foreign_server_ddl_test.go`. Live end-to-end verified
+      against a real `cmd/goopg` binary + real `psql`: two `CREATE
+      DATABASE`s each `CREATE SERVER shared ...` with a distinct `TYPE`;
+      each database's `pg_foreign_server` shows exactly its own `shared`
+      row; `DROP SERVER shared` in one database leaves the other's intact;
+      both facts survive a server restart (WAL replay). **Deliberately
+      still un-dbOid'd (own future loops, recorded in the deferral
+      ledger):** `pg_user_mappings`/`UserMapping` (same-shape sibling);
+      `internal/server/grant_ddl.go`'s `GRANT/REVOKE ... ON FOREIGN SERVER`
+      (still `DefaultDBOid`-only — not a regression, matches pre-fix
+      behavior); the FDW registry itself. Design:
+      `docs/design/0122-0018-per-database-catalog-namespace.md` gained a new
+      subsection; `docs/design/README.md` row updated. Gates: `go build
+      ./...`/`go vet ./...` clean; `go test -race ./internal/catalog/...
+      ./internal/executor/... ./internal/wal/... ./internal/initdb/...
+      ./internal/server/...` PASS (the sole `internal/server` failure,
+      `TestConnectExceedsPositiveDatconnlimitRejected`, is the pre-existing,
+      pre-this-epic `internal/activity/registry.go` data race already
+      documented in the design doc's "Unrelated pre-existing hazard" note —
+      reproduces on unmodified HEAD, unrelated to this change);
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh`
+      PASS (0 failed transactions, all 3 pgbench workloads). **Remaining
+      M0122-0007 scope (deferred, own future loops):** `pg_statistic_ext`/
+      `information_schema.routines` (bigger registry redesign);
+      `pg_user_mappings`/`UserMapping` dbOid scoping; the real `CREATE
+      DATABASE ... TEMPLATE` relation-copy mechanism itself.
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,

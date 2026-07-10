@@ -182,6 +182,11 @@ func (o *valuesOp) Open(ctx *Context) error {
 			// information_schema.sequences mirrors the pg_sequences branch
 			// above. M0122-0007 4e follow-up 35.
 			o.rows = rematerialiseVirtualRowsFromStrings(tbl, InformationSchemaSequencesRows(catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)))
+		} else if tbl.Name == "pg_foreign_server" && ctx != nil && ctx.PgForeignServerRows != nil {
+			// pg_foreign_server must list the connecting database's own
+			// CREATE SERVER'd servers, not always DefaultDBOid's — mirrors
+			// the pg_foreign_table branch above. M0122-0007 4e follow-up 36.
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, ctx.PgForeignServerRows())
 		} else if tbl.VirtualRows != nil {
 			o.rows = rematerialiseVirtualRows(o.plan)
 		}

@@ -2918,7 +2918,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		if !ok {
 			return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "foreign tables are not supported on this catalog"}
 		}
-		if im.ForeignServerOID(s.ForeignServer) == 0 {
+		if im.ForeignServerOID(s.ForeignServer, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) == 0 {
 			return &ExecError{Code: "42704", Pos: s.Pos(),
 				Message: fmt.Sprintf("server %q does not exist", s.ForeignServer)}
 		}
@@ -15175,11 +15175,12 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 				// "does not exist" on a server that reappeared in
 				// pg_foreign_server after a crash. DropCompatObject is still
 				// called best-effort to clear any stale entry.
-				found := im.DropForeignServer(name)
+				dbOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
+				found := im.DropForeignServer(name, dbOid)
 				im.DropCompatObject("server", name)
 				if found {
 					if o.ctx.WAL != nil {
-						if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropForeignServer(name)); werr != nil {
+						if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropForeignServer(name, dbOid)); werr != nil {
 							return fmt.Errorf("wal drop-foreign-server: %w", werr)
 						}
 					}
@@ -15253,8 +15254,9 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 						// association, which never survived a restart and
 						// would silently skip cascading to a pre-restart
 						// server.
+						dbOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
 						var cascadeServers []string
-						for _, srv := range im.ListForeignServers() {
+						for _, srv := range im.ListForeignServers(dbOid) {
 							if srv.FdwName == fdwName {
 								cascadeServers = append(cascadeServers, srv.Name)
 							}
@@ -15262,9 +15264,9 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 						for _, serverName := range cascadeServers {
 							im.DropCompatObject("fdw-server", fdwName+":"+serverName)
 							im.DropCompatObject("server", serverName)
-							im.DropForeignServer(serverName) // dump-visible registry (DU-002 slice 376)
+							im.DropForeignServer(serverName, dbOid) // dump-visible registry (DU-002 slice 376)
 							if o.ctx.WAL != nil {
-								if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropForeignServer(serverName)); werr != nil {
+								if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropForeignServer(serverName, dbOid)); werr != nil {
 									return fmt.Errorf("wal drop-foreign-server: %w", werr)
 								}
 							}
@@ -15820,8 +15822,12 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		// Also record it in the dedicated foreign-server registry so it
 		// round-trips through pg_dump (pg_foreign_server virtual view →
 		// dumpForeignServer). The registry mints a stable OID and resolves the
-		// referenced FDW name to its srvfdw OID at render time. DU-002 slice 376.
-		srv := im.RegisterForeignServer(s.ObjName.String(), s.TableName.String(), s.ServerType, s.ServerVersion, s.Options)
+		// referenced FDW name to its srvfdw OID at render time. Keyed by the
+		// connection's own dbOid (M0122-0007 4e follow-up 36) so a same-named
+		// CREATE SERVER in a distinct database no longer collides.
+		// DU-002 slice 376.
+		dbOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
+		srv := im.RegisterForeignServer(s.ObjName.String(), s.TableName.String(), s.ServerType, s.ServerVersion, s.Options, dbOid)
 		// M0122-0007 foreign-server registry restart-durability follow-up:
 		// persist the server so it survives a restart. goopg's foreign-server
 		// registry has no backing heap relation, so record a WAL event the
@@ -15830,7 +15836,7 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		// TABLESPACE). The OID just assigned/refreshed by RegisterForeignServer
 		// is carried so recovery restores the same identity.
 		if o.ctx.WAL != nil {
-			if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateForeignServer(srv.Name, srv.FdwName, srv.Type, srv.Version, srv.Options, srv.OID)); werr != nil {
+			if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateForeignServer(srv.Name, srv.FdwName, srv.Type, srv.Version, srv.Options, srv.OID, srv.DBOid)); werr != nil {
 				return fmt.Errorf("wal create-foreign-server: %w", werr)
 			}
 		}
@@ -17256,7 +17262,7 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 		// dumpForeignServer keys the comment lookup on the server's catalogId
 		// (tableoid=pg_foreign_server=1417) and objsubid 0, then re-emits
 		// `COMMENT ON SERVER <name> IS '...'`. DU-002 slice 386.
-		oid := im.ForeignServerOID(s.ObjName.Name)
+		oid := im.ForeignServerOID(s.ObjName.Name, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		if oid == 0 {
 			return &ExecError{Code: "42704", Pos: s.Pos(),
 				Message: fmt.Sprintf("server %q does not exist", s.ObjName.Name)}
