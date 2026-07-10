@@ -7802,6 +7802,32 @@ mirroring M0119's ledger `status` column.
       `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
       `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh` PASS
       (0 failed, all 3 workloads).
+  - [x] `unimplemented_feat #135 (pg_get_expr, indexprs slice)` (2026-07-10,
+      follow-up loop) — **closed the live-path expression-index `indexprs` gap
+      the prior row deferred.** Added shared
+      `catalog.IndexExprsText(idx) (string, bool)`
+      (`internal/catalog/catalog.go`): joins `idx.ColExprStrings[i]` for each
+      expression key column (`Columns[i]==""`, ordinal-0 in `indkey`) verbatim,
+      comma-separated, returning `("", false)` when none so the caller emits
+      `VirtualNull`. Wired into `PGIndexRowsForDBOid`, so
+      `pg_get_expr(indexprs, indrelid)` on an expression index now returns the
+      deparsed text (byte-matched to PG 18.3: `lower(b)`, `(a + c), upper(b)`,
+      `(a * c)`, NULL for a plain index). The natural deparse in
+      `ColExprStrings` already carries the right parens — an earlier draft that
+      reused `buildIndexDefString`'s `indexKeyIsBareFuncCall` rule
+      double-wrapped binexprs into `((a + c))` and was corrected to a verbatim
+      join. **Heap twin deliberately NOT changed:** `buildUserPGIndexRow` still
+      writes `indexprs=NULL` because `DecodePGIndexPhysicalRow` infers `indpred`
+      from the bytes after `indoption` assuming `indexprs` is NULL (two
+      consecutive nullable varlenas, no tuple null bitmap available to the
+      decoder) — writing it would corrupt an expression index's `indpred` on
+      restart. Deferred (ledger row 2026-07-10) to a null-bitmap-aware decoder.
+      Tests: `internal/executor/pg_index_indexprs_test.go`
+      (`TestPgIndexIndexprsExpressionIndex` E2E + `TestIndexExprsTextParenAndNullRules`
+      unit); design doc `docs/design/0122-0019-*` Follow-up section + README.
+      Gates: `go build`/`go vet` clean; `go test ./internal/catalog/...
+      ./internal/executor/...` PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke` PASS (0 failed, 3 workloads).
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,

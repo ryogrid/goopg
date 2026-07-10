@@ -1168,7 +1168,16 @@ func buildUserPGIndexRow(cat catalog.Catalog, idx *catalog.Index) Row {
 		NewBytesDatum(pgOIDVectorBytes(indcollationOIDs)), // indcollation
 		NewBytesDatum(pgOIDVectorBytes(indclassOIDs)),     // indclass
 		NewBytesDatum(pgInt2VectorBytes(indoption)),       // indoption
-		NullDatum, // indexprs — goopg has no expression-index support (Index.Columns holds only plain column names), so this is always NULL
+		// indexprs is intentionally always NULL in the heap-persisted row (unlike
+		// the live virtual twin PGIndexRowsForDBOid, which now renders expression
+		// text via catalog.IndexExprsText). The heap decoder
+		// DecodePGIndexPhysicalRow infers indpred's presence from the bytes
+		// remaining after indoption, which is only unambiguous while indexprs is
+		// NULL (two consecutive nullable varlenas are indistinguishable without
+		// the tuple null bitmap, which the decoder doesn't receive). Populating
+		// indexprs here would corrupt an expression index's indpred on restart.
+		// See the deferral-ledger row (2026-07-10, unimplemented_feat #135).
+		NullDatum, // indexprs — always NULL in the heap row (see comment above)
 		indpred,   // indpred
 	}
 }

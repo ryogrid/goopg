@@ -76,14 +76,69 @@ column carries either the real predicate text or SQL NULL.
 - `TestPgIndexRowsIndprIndexprsNullSentinel` — direct row-cell guard so a
   refactor cannot revert the `VirtualNull` sentinel back to a bare `""`.
 
-## Remaining gap (deferred)
+## Follow-up (2026-07-10): live-path `indexprs` for expression indexes
 
-Expression-index `indexprs` is still never populated: `catalog.Index.ColExprs`
-(the parsed key-expression targets of `CREATE INDEX … ((expr)))`) is not
+The prior "remaining gap" (below) is now closed for the **live** query path.
+`pg_get_expr(indexprs, indrelid)` on an expression index returns the deparsed
+expression text instead of NULL.
+
+New shared helper `catalog.IndexExprsText(idx *Index) (string, bool)`
+(`internal/catalog/catalog.go`) is the single source of truth. It walks
+`idx.Columns`, and for each **expression** key column (`Columns[i]==""`, the
+ordinal-0 entries in `indkey`) appends `idx.ColExprStrings[i]` — the natural
+deparse produced by `defaultExprToSQL`, the same serialization
+`buildIndexDefString` consumes. The elements are joined **verbatim** with
+`", "`; it returns `("", false)` when the index has no expression columns, so
+`PGIndexRowsForDBOid` emits `VirtualNull` (SQL NULL) — matching real PG, where
+`indexprs IS NULL` for a non-expression index.
+
+Output was byte-matched against PostgreSQL 18.3:
+
+| index | `pg_get_expr(indexprs)` |
+|-------|-------------------------|
+| `(lower(b))` | `lower(b)` |
+| `((a+c), upper(b))` | `(a + c), upper(b)` |
+| `(a, (a*c))` | `(a * c)` |
+| `(a)` | NULL |
+
+The parens come from the per-expression natural deparse already stored in
+`ColExprStrings` (a binary/arithmetic expression keeps its wrapping parens, a
+bare function call has none). An earlier draft that reused
+`buildIndexDefString`'s `indexKeyIsBareFuncCall` rule to add parens on top
+double-wrapped binexprs into `((a + c))`; the helper joins verbatim instead.
+
+### Heap-persisted twin stays NULL — deliberate
+
+`buildUserPGIndexRow` (`internal/executor/pg18_user_catalog_rows.go`) still
+writes `indexprs=NULL` in the heap row, so the live and heap renderings diverge
+here **on purpose**. `DecodePGIndexPhysicalRow` (`internal/catalog/codec.go`)
+infers `indpred`'s presence from the bytes remaining after `indoption`, which is
+only unambiguous while `indexprs` (the immediately-preceding nullable varlena,
+ordinal 19) is NULL — two consecutive nullable varlenas are indistinguishable
+from the data bytes alone, and the decoder receives only the tuple data portion,
+not its null bitmap. Writing a non-NULL `indexprs` to the heap would corrupt an
+expression index's `indpred` on a checkpointed restart. Closing this needs a
+null-bitmap-aware decoder; the resume point is recorded in
+`.ralph/deferral_ledger.md` (2026-07-10, unimplemented_feat #135, indexprs
+slice).
+
+### Tests
+
+`internal/executor/pg_index_indexprs_test.go`:
+
+- `TestPgIndexIndexprsExpressionIndex` — end-to-end through `pg_get_expr` with
+  the PG-18.3-captured expectations above.
+- `TestIndexExprsTextParenAndNullRules` — direct unit test on
+  `catalog.IndexExprsText` guarding the no-double-paren and NULL-vs-present
+  contract.
+
+## Remaining gap (deferred) — historical, live path now closed above
+
+Expression-index `indexprs` was never populated: `catalog.Index.ColExprs`
+(the parsed key-expression targets of `CREATE INDEX … ((expr)))`) was not
 surfaced into `pg_index.indexprs`, so `pg_get_expr(indexprs, indrelid)` on an
-expression index returns NULL rather than the deparsed expression. psql `\d`
+expression index returned NULL rather than the deparsed expression. psql `\d`
 and `pg_dump` are unaffected — both reconstruct index DDL via
 `pg_get_indexdef` / `buildIndexDefString` directly from index metadata, never
-from `indexprs`. Resume point recorded in `.ralph/deferral_ledger.md`
-(2026-07-10, unimplemented_feat #135): deparse `idx.ColExprs` into the
-`indexprs` cell in **both** `PGIndexRowsForDBOid` and `buildUserPGIndexRow`.
+from `indexprs`. The live path is now fixed (see Follow-up above); the
+heap-persisted path remains deferred (decode-ambiguity landmine).

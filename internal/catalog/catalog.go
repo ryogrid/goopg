@@ -6383,12 +6383,20 @@ func (c *InMemory) PGIndexRowsForDBOid(dbOid uint32) [][]string {
 		// when the index is not partial: a plain "" here read as a non-NULL
 		// empty string, so `SELECT indpred FROM pg_index` and
 		// `pg_get_expr(indpred, indrelid)` returned '' instead of NULL, and
-		// `indpred IS NOT NULL` matched every index. indexprs/indcoloptions are
-		// always NULL in this path (no expression-index support — Index.Columns
-		// holds only plain column names).
+		// `indpred IS NOT NULL` matched every index. indcoloptions is always NULL
+		// in this path; indexprs is populated below for expression indexes.
 		indpred := VirtualNull
 		if idx.HasPredicate {
 			indpred = idx.PredicateString
+		}
+		// indexprs: deparsed expression text for expression key columns
+		// (Columns[i]=="", the ordinal-0 indkey entries above), rendered exactly
+		// as pg_get_expr(indexprs, indrelid) does. VirtualNull (SQL NULL) when the
+		// index has no expression columns. Shared with the heap-row twin
+		// buildUserPGIndexRow via IndexExprsText.
+		indexprs := VirtualNull
+		if exprsText, ok := IndexExprsText(idx); ok {
+			indexprs = exprsText
 		}
 		out = append(out, []string{
 			fmt.Sprintf("%d", idx.OID),       // indexrelid
@@ -6410,7 +6418,7 @@ func (c *InMemory) PGIndexRowsForDBOid(dbOid uint32) [][]string {
 			indcollation,                     // indcollation
 			indclass,                         // indclass
 			indoption,                        // indoption
-			VirtualNull,                      // indexprs (NULL — no expression indexes)
+			indexprs,                         // indexprs (expr text for expression indexes, else NULL)
 			indpred,                          // indpred (WHERE text for partial, else NULL)
 			VirtualNull,                      // indcoloptions (NULL)
 		})
@@ -17656,6 +17664,51 @@ func indexKeyIsBareFuncCall(e *parser.Expr) bool {
 		return false
 	}
 	return true
+}
+
+// IndexExprsText renders pg_index.indexprs for an expression index the way
+// pg_get_expr(indexprs, indrelid) does in upstream PostgreSQL: the deparsed
+// expression text of ONLY the expression key columns (Columns[i]=="", the
+// ordinal-0 entries in indkey), comma-joined in column order. Plain-column key
+// columns and INCLUDE columns are omitted, exactly as PG's indexprs list holds
+// only the expression trees.
+//
+// Each expression's text comes straight from idx.ColExprStrings[i], which is
+// the natural deparse produced by defaultExprToSQL (the same serialization
+// buildIndexDefString consumes). That deparse already carries whatever parens
+// the expression needs — a binary/arithmetic expression such as (a + c) keeps
+// its wrapping parens, a bare function call such as lower(b) has none — which
+// is exactly how PG's expression printer renders each list element. So the
+// elements are joined verbatim with ", "; adding parens here would double-wrap
+// non-function expressions (e.g. ((a + c))) and diverge from PG.
+//
+// Returns ("", false) when the index has no expression columns, so callers
+// emit VirtualNull (SQL NULL) rather than a non-NULL empty string — matching
+// real PG, where indexprs IS NULL for a non-expression index.
+//
+// This is the single source of truth for the expression text so the live
+// virtual pg_index renderer (PGIndexRowsForDBOid) and any future heap-persisted
+// consumer never diverge.
+func IndexExprsText(idx *Index) (string, bool) {
+	if idx == nil {
+		return "", false
+	}
+	parts := make([]string, 0, len(idx.Columns))
+	for i, col := range idx.Columns {
+		if col != "" {
+			continue // plain column key, not an expression
+		}
+		if i >= len(idx.ColExprStrings) {
+			continue
+		}
+		if exprStr := idx.ColExprStrings[i]; exprStr != "" {
+			parts = append(parts, exprStr)
+		}
+	}
+	if len(parts) == 0 {
+		return "", false
+	}
+	return strings.Join(parts, ", "), true
 }
 
 func BuildIndexDef(idx *Index) string {
