@@ -1,6 +1,6 @@
 # Per-database catalog namespace (M0122-0007 slice 4)
 
-Status: accepted (sub-slices 4a, 4b-i, 4b-ii, 4c, 4d-i, 4d-ii-part-1, and 4d-ii-part-2a landed; 4d-ii-part-2b items 1, 2, and 3 all fully landed; 4e's FK-target-resolution, sequence-ownership, and view-constraint-dependency items all landed; `CREATE DATABASE ... TEMPLATE` bounded validation landed 2026-07-10; the pg_class-under-fresh-database gap (name resolution generically, row enumeration for pg_class specifically) landed 2026-07-10, and the pg_indexes/pg_tables, pg_constraint, and pg_index row-content follow-ups landed the same day — 9 sibling virtual-table builders plus the real relation-copy mechanism remain planned, see "Remaining 4e work" below)
+Status: accepted (sub-slices 4a, 4b-i, 4b-ii, 4c, 4d-i, 4d-ii-part-1, and 4d-ii-part-2a landed; 4d-ii-part-2b items 1, 2, and 3 all fully landed; 4e's FK-target-resolution, sequence-ownership, and view-constraint-dependency items all landed; `CREATE DATABASE ... TEMPLATE` bounded validation landed 2026-07-10; the pg_class-under-fresh-database gap (name resolution generically, row enumeration for pg_class specifically) landed 2026-07-10, and the pg_indexes/pg_tables, pg_constraint, pg_index, and pg_attrdef/pg_depend row-content follow-ups landed the same day — 8 sibling virtual-table builders plus the real relation-copy mechanism remain planned, see "Remaining 4e work" below)
 Date: 2026-07-10
 Supersedes: none — extends the "Still open" note in
 `0122-0017-database-ddl-drop-guards.md` and the deferral-ledger rows dated
@@ -1133,6 +1133,57 @@ separate cast/output-function mechanism from the `VirtualRows`-closure gap
 this design doc's sub-slice tracks. See the 2026-07-10 deferral-ledger row
 ("pg_index per-dbOid content") for the 9 remaining sibling builders
 (`pg_attrdef`, `pg_inherits`, `pg_statistic_ext`, `pg_policy`, `pg_depend`,
+`pg_trigger`, `pg_rewrite`, `information_schema.routines`/`parameters`/
+`routine_*_usage`, `pg_foreign_table`) still needing this treatment — each is
+its own bounded future loop.
+
+**`pg_attrdef` + `pg_depend` row-content — FIXED 2026-07-10 (same day, next
+loop, follow-up 27).** These two builders are done together rather than
+separately, unlike every prior sibling in this list: `dependVirtualRows`'s own
+doc comment already stated "`attrDefRowsLocked` builds the deterministic row
+set so this view and `dependVirtualRows` agree on the oids" — a SERIAL
+column's implicit default registers a NORMAL ('n') `pg_depend` row
+(`classid=2604`, `objid`=the `pg_attrdef` row's own oid, `refobjid`=the owned
+sequence's OID) that must reference the exact same oid numbering
+`pg_attrdef` itself emits, so fixing one without the other would desync them
+under a non-default dbOid. `attrDefRowsLocked` (no dbOid parameter, hardcoded
+to `c.ns(DefaultDBOid)`) became `attrDefRowsLockedForDBOid(dbOid uint32)`;
+both call sites — the extracted `catalog.InMemory.PGAttrdefRowsForDBOid(dbOid
+uint32) [][]string` and the extracted `catalog.InMemory.
+PGDependRowsForDBOid(dbOid uint32) [][]string` — now call it with the SAME
+dbOid. `PGDependRowsForDBOid` leaves two dbOid-agnostic pieces unfixed by
+design, matching this list's `pg_constraint`-leaves-`c.domains`-global
+precedent: the sequence-ownership ('a' deptype) lookup goes through the
+package-level `catalog.SequenceParamsFunc(qualifiedName string) (SeqParams,
+bool)` — no dbOid parameter exists on that function at all, so it cannot be
+threaded through from here without its own signature change — and the AM
+operator-class member rows (`c.amOpMembers`/`c.amProcMembers`, not yet
+namespace-scoped anywhere). Wired to new per-connection `executor.Context.
+PgAttrdefRows`/`PgDependRows` fields (mirroring `PgIndexRows`, set in
+`internal/server/dispatch.go`'s `wireExtensionRows`), consumed by new
+`tbl.Name == "pg_attrdef"`/`"pg_depend"` branches in
+`internal/executor/operators.go`'s `valuesOp.Open`. Tests:
+`TestPgAttrdefRowsScopedToConnectionDBOid`,
+`TestPgDependRowsScopedToConnectionDBOid`
+(`internal/executor/fk_dbid_routing_test.go`) — the latter asserts on the 'n'
+attrdef→sequence row rather than the 'a' OWNED-BY row, since the 'a' row is
+exactly the SequenceParamsFunc-gated class just described. Live-verified
+end-to-end: `CREATE DATABASE freshdep1` → connect → `CREATE TABLE
+only_in_freshdep1 (id serial PRIMARY KEY)` → raw `pg_attrdef`/`pg_depend
+WHERE classid=2604` in `freshdep1` show exactly that table's own default/oid
+(`adrelid`/`refobjid` = `freshdep1`'s own table/sequence OIDs), and only
+`postgres`'s own rows when queried from `postgres` — no cross-database leak
+either direction. Confirmed collaterally (not a regression — the `pg_depend`
+view was DefaultDBOid-only before this loop too, so this class of row was
+already never correct for a non-default database, just differently wrong):
+querying `pg_depend WHERE classid=1259` (the 'a' OWNED-BY class) from
+`freshdep1` now correctly returns **zero** rows (no cross-db leak) rather
+than leaking `postgres`'s row, but it should have one row of its own — this
+residual gap folds into the existing "sequence ownership follow-on" ledger
+entry (same `SequenceParamsFunc`-lacks-a-dbOid-parameter root cause as
+`pg_sequences`/`pg_sequence`), not a new row. See the 2026-07-10
+deferral-ledger row ("pg_attrdef/pg_depend per-dbOid content") for the 8
+remaining sibling builders (`pg_inherits`, `pg_statistic_ext`, `pg_policy`,
 `pg_trigger`, `pg_rewrite`, `information_schema.routines`/`parameters`/
 `routine_*_usage`, `pg_foreign_table`) still needing this treatment — each is
 its own bounded future loop.

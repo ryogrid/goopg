@@ -450,3 +450,123 @@ func pgIndexRowsContainIndrelid(rows [][]string, tableOID uint32) bool {
 	}
 	return false
 }
+
+// TestPgAttrdefRowsScopedToConnectionDBOid covers M0122-0007 4e follow-up 27's
+// pg_attrdef VirtualRows enumeration: catalog.InMemory.PGAttrdefRowsForDBOid
+// must list the GIVEN dbOid's own tables' column defaults, not always
+// DefaultDBOid's — mirrors TestPgIndexRowsScopedToConnectionDBOid above for
+// the pg_attrdef catalog table.
+func TestPgAttrdefRowsScopedToConnectionDBOid(t *testing.T) {
+	const otherDBOid = 7009
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+
+	ctx.CurrentDatabaseOid = catalog.DefaultDBOid
+	if err := runDDL(t, ctx, "CREATE TABLE only_in_default (id int4 PRIMARY KEY, val int4 DEFAULT 1)"); err != nil {
+		t.Fatalf("CREATE TABLE only_in_default: %v", err)
+	}
+	ctx.CurrentDatabaseOid = otherDBOid
+	if err := runDDL(t, ctx, "CREATE TABLE only_in_other (id int4 PRIMARY KEY, val int4 DEFAULT 2)"); err != nil {
+		t.Fatalf("CREATE TABLE only_in_other: %v", err)
+	}
+
+	im, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		t.Fatalf("ctx.Catalog is %T, want *catalog.InMemory", ctx.Catalog)
+	}
+
+	defaultTbl, ok := im.LookupTable(parser.ObjectName{Name: "only_in_default"}, catalog.DefaultDBOid)
+	if !ok {
+		t.Fatal("LookupTable(only_in_default, DefaultDBOid) not found")
+	}
+	otherTbl, ok := im.LookupTable(parser.ObjectName{Name: "only_in_other"}, otherDBOid)
+	if !ok {
+		t.Fatal("LookupTable(only_in_other, otherDBOid) not found")
+	}
+
+	defaultRows := im.PGAttrdefRowsForDBOid(catalog.DefaultDBOid)
+	if pgIndexRowsContainIndrelid(defaultRows, otherTbl.OID) {
+		t.Fatal("DefaultDBOid's pg_attrdef rows include only_in_other's default, a table created under a distinct dbOid")
+	}
+	if !pgIndexRowsContainIndrelid(defaultRows, defaultTbl.OID) {
+		t.Fatal("DefaultDBOid's pg_attrdef rows are missing only_in_default's default")
+	}
+
+	otherRows := im.PGAttrdefRowsForDBOid(otherDBOid)
+	if !pgIndexRowsContainIndrelid(otherRows, otherTbl.OID) {
+		t.Fatal("otherDBOid's pg_attrdef rows are missing only_in_other's default")
+	}
+	if pgIndexRowsContainIndrelid(otherRows, defaultTbl.OID) {
+		t.Fatal("otherDBOid's pg_attrdef rows include only_in_default's default, a table created under DefaultDBOid")
+	}
+}
+
+// TestPgDependRowsScopedToConnectionDBOid covers M0122-0007 4e follow-up 27's
+// pg_depend VirtualRows enumeration: catalog.InMemory.PGDependRowsForDBOid
+// must list the GIVEN dbOid's own attrdef->sequence dependency rows, not
+// always DefaultDBOid's. A SERIAL column registers a NORMAL ('n') pg_depend
+// row from its pg_attrdef entry (classid=2604) to the owned sequence's own
+// OID (refobjid) via attrDefRowsLockedForDBOid(dbOid) — this is the row class
+// this loop's dbOid-scoping actually reaches (unlike the deptype='a'
+// OWNED-BY row, which still resolves through the global,
+// not-yet-dbOid-threaded SequenceParamsFunc registry — a separate,
+// already-flagged "sequence ownership follow-on" gap, not fixed here; see
+// the deferral ledger). Mirrors TestPgAttrdefRowsScopedToConnectionDBOid
+// above for the pg_depend catalog table.
+func TestPgDependRowsScopedToConnectionDBOid(t *testing.T) {
+	const otherDBOid = 7010
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+
+	ctx.CurrentDatabaseOid = catalog.DefaultDBOid
+	if err := runDDL(t, ctx, "CREATE TABLE only_in_default (id serial PRIMARY KEY)"); err != nil {
+		t.Fatalf("CREATE TABLE only_in_default: %v", err)
+	}
+	ctx.CurrentDatabaseOid = otherDBOid
+	if err := runDDL(t, ctx, "CREATE TABLE only_in_other (id serial PRIMARY KEY)"); err != nil {
+		t.Fatalf("CREATE TABLE only_in_other: %v", err)
+	}
+
+	im, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		t.Fatalf("ctx.Catalog is %T, want *catalog.InMemory", ctx.Catalog)
+	}
+
+	defaultSeq, ok := im.LookupTable(parser.ObjectName{Name: "only_in_default_id_seq"}, catalog.DefaultDBOid)
+	if !ok {
+		t.Fatal("LookupTable(only_in_default_id_seq, DefaultDBOid) not found")
+	}
+	otherSeq, ok := im.LookupTable(parser.ObjectName{Name: "only_in_other_id_seq"}, otherDBOid)
+	if !ok {
+		t.Fatal("LookupTable(only_in_other_id_seq, otherDBOid) not found")
+	}
+
+	defaultRows := im.PGDependRowsForDBOid(catalog.DefaultDBOid)
+	if !pgDependRowsContainAttrdefToSeq(defaultRows, defaultSeq.OID) {
+		t.Fatal("DefaultDBOid's pg_depend rows are missing only_in_default's attrdef->sequence row")
+	}
+	if pgDependRowsContainAttrdefToSeq(defaultRows, otherSeq.OID) {
+		t.Fatal("DefaultDBOid's pg_depend rows include only_in_other's attrdef->sequence row, a table created under a distinct dbOid")
+	}
+
+	otherRows := im.PGDependRowsForDBOid(otherDBOid)
+	if !pgDependRowsContainAttrdefToSeq(otherRows, otherSeq.OID) {
+		t.Fatal("otherDBOid's pg_depend rows are missing only_in_other's attrdef->sequence row")
+	}
+	if pgDependRowsContainAttrdefToSeq(otherRows, defaultSeq.OID) {
+		t.Fatal("otherDBOid's pg_depend rows include only_in_default's attrdef->sequence row, a table created under DefaultDBOid")
+	}
+}
+
+// pgDependRowsContainAttrdefToSeq reports whether rows contains a
+// classid=2604 (pg_attrdef) / deptype='n' row whose refobjid (index 4) is
+// seqOID — the attrdef->sequence link a SERIAL column's default registers.
+func pgDependRowsContainAttrdefToSeq(rows [][]string, seqOID uint32) bool {
+	want := fmt.Sprintf("%d", seqOID)
+	for _, r := range rows {
+		if len(r) > 6 && r[0] == "2604" && r[6] == "n" && r[4] == want {
+			return true
+		}
+	}
+	return false
+}

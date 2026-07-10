@@ -6860,6 +6860,66 @@ mirroring M0119's ledger `status` column.
       PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
       `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
       failed transactions, all 3 pgbench workloads).
+  - [x] `M0122-0007` follow-up 27 (2026-07-10, this loop) — **fixed the next
+      highest-value sibling pair follow-up 26 flagged: `pg_attrdef` +
+      `pg_depend`, done TOGETHER (unlike every prior single-builder
+      follow-up).** `dependVirtualRows`'s own doc comment already said the
+      two views must "agree on the oids" via the shared `attrDefRowsLocked`
+      numbering (a SERIAL column's NORMAL `'n'` attrdef→sequence `pg_depend`
+      row references the same oid `pg_attrdef` assigns it), so fixing one
+      without the other would desync them under a non-default dbOid.
+      `attrDefRowsLocked()` (hardcoded `c.ns(DefaultDBOid)`, 2 occurrences)
+      became `attrDefRowsLockedForDBOid(dbOid uint32)`; new exported
+      `catalog.InMemory.PGAttrdefRowsForDBOid(dbOid uint32)` and
+      `PGDependRowsForDBOid(dbOid uint32)` (renamed from `dependVirtualRows`)
+      both call it with the SAME dbOid, and `PGDependRowsForDBOid` also
+      parameterizes its own 2 `c.ns(DefaultDBOid)` references (the
+      sequence-ownership table/sequence enumeration). Both registered
+      closures now just call `...RowsForDBOid(DefaultDBOid)`,
+      byte-identical default behavior. Wired new per-connection
+      `executor.Context.PgAttrdefRows`/`PgDependRows func() [][]string`
+      fields (mirroring `PgIndexRows`), set in
+      `internal/server/dispatch.go`'s `wireExtensionRows` (new
+      `pgAttrdefRowLister`/`pgDependRowLister` interfaces), consumed by new
+      `tbl.Name == "pg_attrdef"`/`"pg_depend"` branches in
+      `internal/executor/operators.go`'s `valuesOp.Open`. New tests
+      `TestPgAttrdefRowsScopedToConnectionDBOid`/
+      `TestPgDependRowsScopedToConnectionDBOid`
+      (`internal/executor/fk_dbid_routing_test.go`): a SERIAL-PK table under
+      each of two distinct dbOids, resolved via `LookupTable`, asserted
+      never to cross-leak their `pg_attrdef` rows (by `adrelid`) or their
+      `'n'`-deptype `pg_depend` attrdef→sequence rows (by `refobjid`) — the
+      latter deliberately does NOT assert on the `'a'`-deptype OWNED-BY row,
+      since that row class still resolves through the global,
+      not-yet-dbOid-threaded `catalog.SequenceParamsFunc` (see below). Live
+      end-to-end verified against a real `cmd/goopg` binary + real `psql`:
+      `CREATE DATABASE freshdep1` → connect → `CREATE TABLE
+      only_in_freshdep1 (id serial PRIMARY KEY)` → raw `pg_attrdef` and
+      `pg_depend WHERE classid=2604` in `freshdep1` each show exactly that
+      table's own default/sequence OIDs; the same queries against
+      `postgres` db show only `postgres`'s own rows (no cross-database leak
+      either direction). Confirmed collaterally (not a regression — `
+      pg_depend` was DefaultDBOid-only for every dbOid before this loop
+      too): `pg_depend WHERE classid=1259` (the `'a'`-deptype OWNED-BY row)
+      from `freshdep1` now correctly returns 0 rows (no leak) instead of
+      leaking `postgres`'s row, but is still missing its own row — folds
+      into the existing "sequence ownership follow-on" ledger entry
+      (`catalog.SequenceParamsFunc` has no dbOid parameter at all), not a
+      new row. **Remaining scope (deferred, own future loops):** 8 sibling
+      builders still row-content-`DefaultDBOid`-only — `pg_inherits`,
+      `pg_statistic_ext`, `pg_policy`, `pg_trigger`, `pg_rewrite`,
+      `information_schema.routines`/`parameters`/`routine_*_usage`,
+      `pg_foreign_table`; `pg_sequence`/`pg_sequences`/
+      `information_schema.sequences`, `pg_attribute`/`pg_type`, and the
+      `oid::regclass` cast gap remain separately flagged. Design doc updated
+      (new "pg_attrdef + pg_depend" residual-gap subsection);
+      `docs/design/README.md` row extended; deferral ledger row appended
+      ("pg_attrdef/pg_depend per-dbOid content"). Gates: `go build ./...`/`go
+      vet ./...` clean; `go test ./internal/catalog/...
+      ./internal/executor/... ./internal/server/... ./internal/planner/...`
+      PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed transactions, all 3 pgbench workloads).
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,

@@ -6214,6 +6214,33 @@ func (c *InMemory) PGConstraintRowsForDBOid(dbOid uint32) [][]string {
 	return out
 }
 
+// PGAttrdefRowsForDBOid builds the pg_attrdef catalog row-set for dbOid's own
+// tables' column defaults (mirrors PGConstraintRowsForDBOid's per-connection
+// dbOid scoping above). registerSystemTables's VirtualRows closure calls this
+// with DefaultDBOid so every existing caller (server dispatch without a
+// per-connection PgAttrdefRows wire-up, every test) sees byte-identical
+// behavior; a per-connection dbOid is wired in via
+// executor.Context.PgAttrdefRows (internal/server/dispatch.go's
+// wireExtensionRows). attrDefRowsLockedForDBOid's oid numbering must stay in
+// lockstep with PGDependRowsForDBOid below (both call it with the same dbOid)
+// — pg_dump's pg_depend→pg_attrdef join relies on the two views agreeing on
+// which oid names which default. M0122-0007 4e follow-up 27.
+func (c *InMemory) PGAttrdefRowsForDBOid(dbOid uint32) [][]string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	ar := c.attrDefRowsLockedForDBOid(dbOid)
+	rows := make([][]string, 0, len(ar))
+	for _, r := range ar {
+		rows = append(rows, []string{
+			strconv.FormatUint(uint64(r.oid), 10),
+			strconv.FormatUint(uint64(r.tableOID), 10),
+			strconv.Itoa(r.attnum),
+			r.adbin,
+		})
+	}
+	return rows
+}
+
 // PGIndexRowsForDBOid builds the pg_index catalog row-set for dbOid's own
 // indexes (mirrors PGConstraintRowsForDBOid's per-connection dbOid scoping
 // above). registerSystemTables's VirtualRows closure calls this with
@@ -7960,23 +7987,10 @@ func (c *InMemory) registerSystemTables() {
 	// pg_attrdef holds ordinary column DEFAULTs, the generation expression of
 	// GENERATED ALWAYS AS (expr) STORED columns (pg_dump re-emits it inline,
 	// keyed on attgenerated='s' — DU-002 slice 59), and the implicit nextval()
-	// default of a SERIAL column (slice 121). attrDefRowsLocked builds the
-	// deterministic row set so this view and dependVirtualRows agree on the oids.
-	pgAttrdef.VirtualRows = func() [][]string {
-		c.mu.RLock()
-		defer c.mu.RUnlock()
-		ar := c.attrDefRowsLocked()
-		rows := make([][]string, 0, len(ar))
-		for _, r := range ar {
-			rows = append(rows, []string{
-				strconv.FormatUint(uint64(r.oid), 10),
-				strconv.FormatUint(uint64(r.tableOID), 10),
-				strconv.Itoa(r.attnum),
-				r.adbin,
-			})
-		}
-		return rows
-	}
+	// default of a SERIAL column (slice 121). attrDefRowsLockedForDBOid builds
+	// the deterministic row set so this view and PGDependRowsForDBOid agree on
+	// the oids (same dbOid, same numbering — M0122-0007 4e follow-up 27).
+	pgAttrdef.VirtualRows = func() [][]string { return c.PGAttrdefRowsForDBOid(DefaultDBOid) }
 	c.ns(DefaultDBOid).tables["pg_catalog.pg_attrdef"] = pgAttrdef
 
 	// pg_constraint — stores table and domain constraint definitions (OID 2606).
@@ -8586,7 +8600,7 @@ func (c *InMemory) registerSystemTables() {
 		},
 		OID: 2608,
 	}
-	pgDepend.VirtualRows = c.dependVirtualRows
+	pgDepend.VirtualRows = func() [][]string { return c.PGDependRowsForDBOid(DefaultDBOid) }
 	c.ns(DefaultDBOid).tables["pg_catalog.pg_depend"] = pgDepend
 
 	// pg_tablespace — tablespace catalog (OID 1213). The on-disk shared heap
@@ -12651,9 +12665,30 @@ func (c *InMemory) tablespaceVirtualRows() [][]string {
 	return rows
 }
 
-// dependVirtualRows builds pg_depend's only non-empty dependency class: the
-// AUTO ('a') link from an OWNED-BY sequence to the column it is tied to. Each
-// row matches what PG records for `ALTER/CREATE SEQUENCE ... OWNED BY t.c`:
+// PGDependRowsForDBOid builds pg_depend's row-set for dbOid's own relations
+// (mirrors PGConstraintRowsForDBOid's per-connection dbOid scoping above).
+// registerSystemTables's VirtualRows closure calls this with DefaultDBOid so
+// every existing caller (server dispatch without a per-connection
+// PgDependRows wire-up, every test) sees byte-identical behavior; a
+// per-connection dbOid is wired in via executor.Context.PgDependRows
+// (internal/server/dispatch.go's wireExtensionRows). The
+// attrDefRowsLockedForDBOid(dbOid) call below must use the SAME dbOid as the
+// caller's PGAttrdefRowsForDBOid(dbOid) so the two views' oid numbering stays
+// in lockstep (see PGAttrdefRowsForDBOid's doc comment). Two class of rows
+// stay dbOid-agnostic pending their own dedicated fix, matching the
+// PGConstraintRowsForDBOid precedent of leaving c.domains global: the
+// sequence-ownership lookup (SequenceParamsFunc, keyed only by qualified
+// name — the same registry pg_sequences already reads, tracked by the
+// separate "sequence ownership follow-on" deferral) and the AM operator-class
+// member rows (c.amOpMembers/c.amProcMembers — operator classes/families are
+// not yet namespace-scoped at all, an M0122-0007 4e non-goal). M0122-0007 4e
+// follow-up 27.
+//
+// The rows built here cover pg_depend's non-empty dependency classes: the
+// AUTO ('a') link from an OWNED-BY sequence to the column it is tied to, plus
+// the NORMAL ('n')/INTERNAL ('i') attrdef→sequence and AM opclass/opfamily
+// member links below. Each sequence-ownership row matches what PG records for
+// `ALTER/CREATE SEQUENCE ... OWNED BY t.c`:
 //
 //	classid     = pg_class (1259)   objid       = sequence's pg_class OID
 //	objsubid    = 0                 refclassid  = pg_class (1259)
@@ -12664,7 +12699,7 @@ func (c *InMemory) tablespaceVirtualRows() [][]string {
 // into owning_tab/owning_col so dumpSequence emits the ALTER SEQUENCE OWNED BY.
 // Standalone sequences have no OwnedBy and contribute no row. M0110-0001
 // (DU-002 slice 118).
-func (c *InMemory) dependVirtualRows() [][]string {
+func (c *InMemory) PGDependRowsForDBOid(dbOid uint32) [][]string {
 	if SequenceParamsFunc == nil {
 		return nil
 	}
@@ -12678,9 +12713,9 @@ func (c *InMemory) dependVirtualRows() [][]string {
 		oid     uint32
 		columns []Column
 	}
-	byName := make(map[string]tblRef, len(c.ns(DefaultDBOid).tables))
+	byName := make(map[string]tblRef, len(c.ns(dbOid).tables))
 	seqKeys := make([]string, 0)
-	for k, t := range c.ns(DefaultDBOid).tables {
+	for k, t := range c.ns(dbOid).tables {
 		if t.IsSequence {
 			seqKeys = append(seqKeys, k)
 			continue
@@ -12698,7 +12733,7 @@ func (c *InMemory) dependVirtualRows() [][]string {
 
 	rows := make([][]string, 0, len(seqKeys))
 	for _, k := range seqKeys {
-		t := c.ns(DefaultDBOid).tables[k]
+		t := c.ns(dbOid).tables[k]
 		seqSchema := strings.ToLower(t.Schema)
 		if seqSchema == "" {
 			seqSchema = "public"
@@ -12764,8 +12799,8 @@ func (c *InMemory) dependVirtualRows() [][]string {
 	// by emitting the default as a separate `ALTER TABLE ... SET DEFAULT
 	// nextval(...)` (repairTableAttrDefMultiLoop) — exactly upstream's behavior.
 	// The pg_attrdef.oid pg_dump scanned must equal this objid, so both come from
-	// the shared attrDefRowsLocked numbering. DU-002 slice 121.
-	for _, ad := range c.attrDefRowsLocked() {
+	// the shared attrDefRowsLockedForDBOid(dbOid) numbering. DU-002 slice 121.
+	for _, ad := range c.attrDefRowsLockedForDBOid(dbOid) {
 		if ad.seqOID == 0 {
 			continue
 		}
@@ -19700,17 +19735,17 @@ type attrDefRow struct {
 // Tables are walked in sorted-key order so the synthetic oids are stable across
 // calls — pg_dump matches the pg_attrdef.oid it scanned against the pg_depend
 // objid, so the two producers cannot disagree. DU-002 slice 121.
-func (c *InMemory) attrDefRowsLocked() []attrDefRow {
+func (c *InMemory) attrDefRowsLockedForDBOid(dbOid uint32) []attrDefRow {
 	// Index sequence relations by their bare (lowercased) name so a SERIAL
 	// column's default can resolve the owned sequence's pg_class OID.
 	seqOIDByName := make(map[string]uint32)
-	for _, t := range c.ns(DefaultDBOid).tables {
+	for _, t := range c.ns(dbOid).tables {
 		if t.IsSequence {
 			seqOIDByName[strings.ToLower(t.Name)] = t.OID
 		}
 	}
-	keys := make([]string, 0, len(c.ns(DefaultDBOid).tables))
-	for k, t := range c.ns(DefaultDBOid).tables {
+	keys := make([]string, 0, len(c.ns(dbOid).tables))
+	for k, t := range c.ns(dbOid).tables {
 		if t.Virtual {
 			continue
 		}
@@ -19720,7 +19755,7 @@ func (c *InMemory) attrDefRowsLocked() []attrDefRow {
 	var rows []attrDefRow
 	var oid uint32 = 1
 	for _, k := range keys {
-		tbl := c.ns(DefaultDBOid).tables[k]
+		tbl := c.ns(dbOid).tables[k]
 		for _, col := range tbl.Columns {
 			var adbin string
 			var seqOID uint32

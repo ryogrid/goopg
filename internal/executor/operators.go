@@ -128,6 +128,16 @@ func (o *valuesOp) Open(ctx *Context) error {
 			// always DefaultDBOid's — mirrors the pg_constraint branch
 			// above. M0122-0007 4e follow-up 26.
 			o.rows = rematerialiseVirtualRowsFromStrings(tbl, ctx.PgIndexRows())
+		} else if tbl.Name == "pg_attrdef" && ctx != nil && ctx.PgAttrdefRows != nil {
+			// pg_attrdef must list the connecting database's own tables'
+			// column defaults, not always DefaultDBOid's — mirrors the
+			// pg_index branch above. M0122-0007 4e follow-up 27.
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, ctx.PgAttrdefRows())
+		} else if tbl.Name == "pg_depend" && ctx != nil && ctx.PgDependRows != nil {
+			// pg_depend must list the connecting database's own dependency
+			// rows, not always DefaultDBOid's — mirrors the pg_attrdef
+			// branch above. M0122-0007 4e follow-up 27.
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, ctx.PgDependRows())
 		} else if tbl.VirtualRows != nil {
 			o.rows = rematerialiseVirtualRows(o.plan)
 		}

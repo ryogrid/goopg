@@ -2011,6 +2011,23 @@ func (s *Server) wireExtensionRows(ectx *executor.Context, dbName string) {
 			return pix.PGIndexRowsForDBOid(catalog.NamespaceDBOid(ectx.CurrentDatabaseOid))
 		}
 	}
+	// pg_attrdef / pg_depend must likewise reflect the connecting database's
+	// own column defaults / dependency rows, not always DefaultDBOid's.
+	// Mirrors the pg_index wiring above. Both close over the SAME
+	// NamespaceDBOid(ectx.CurrentDatabaseOid) call so pg_depend's
+	// attrdef→sequence rows stay in oid-numbering lockstep with pg_attrdef's
+	// own rows (PGAttrdefRowsForDBOid's doc comment). M0122-0007 4e
+	// follow-up 27.
+	if pad, ok := s.cfg.Catalog.(pgAttrdefRowLister); ok {
+		ectx.PgAttrdefRows = func() [][]string {
+			return pad.PGAttrdefRowsForDBOid(catalog.NamespaceDBOid(ectx.CurrentDatabaseOid))
+		}
+	}
+	if pd, ok := s.cfg.Catalog.(pgDependRowLister); ok {
+		ectx.PgDependRows = func() [][]string {
+			return pd.PGDependRowsForDBOid(catalog.NamespaceDBOid(ectx.CurrentDatabaseOid))
+		}
+	}
 }
 
 // pgClassRowLister is implemented by catalog.InMemory to expose a
@@ -2043,6 +2060,17 @@ type pgConstraintRowLister interface {
 // M0122-0007 4e follow-up 26.
 type pgIndexRowLister interface {
 	PGIndexRowsForDBOid(dbOid uint32) [][]string
+}
+
+// pgAttrdefRowLister / pgDependRowLister are implemented by catalog.InMemory
+// to expose per-database pg_attrdef / pg_depend row-sets, mirroring
+// pgIndexRowLister above. M0122-0007 4e follow-up 27.
+type pgAttrdefRowLister interface {
+	PGAttrdefRowsForDBOid(dbOid uint32) [][]string
+}
+
+type pgDependRowLister interface {
+	PGDependRowsForDBOid(dbOid uint32) [][]string
 }
 
 func undoEnumDDLForRollback(connTx *connTxState, cat catalog.Catalog) {

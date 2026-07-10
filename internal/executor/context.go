@@ -504,6 +504,16 @@ type Context struct {
 	// server to close over CurrentDatabaseOid. M0122-0007 4e follow-up 26.
 	PgIndexRows func() [][]string
 
+	// PgAttrdefRows / PgDependRows mirror PgIndexRows above for the pg_attrdef
+	// and pg_depend catalog tables: each lists CurrentDatabaseOid's own column
+	// defaults / dependency rows rather than always DefaultDBOid's
+	// (catalog.InMemory's PGAttrdefRowsForDBOid / PGDependRowsForDBOid). Both
+	// must be wired with the SAME dbOid so their oid numbering stays in
+	// lockstep (see PGAttrdefRowsForDBOid's doc comment). Wired by the server
+	// to close over CurrentDatabaseOid. M0122-0007 4e follow-up 27.
+	PgAttrdefRows func() [][]string
+	PgDependRows  func() [][]string
+
 	// NonSuperuserRole, when non-empty, means the session is currently running
 	// under a non-superuser role (set via SET SESSION AUTHORIZATION). Privilege
 	// checks that require superuser (e.g. LEAKPROOF function attribute) must
