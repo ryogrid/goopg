@@ -845,6 +845,52 @@ collision/gobble rejections). Gates: `go build`/`go vet` clean; parser +
 executor interval suites PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
 pgbench smoke via pre-commit hook.
 
+## Follow-up: ISO 8601 duration interval bodies (unimplemented_feat #5(d-iii-rest), 2026-07-11)
+
+Interval literals may be written as ISO 8601 durations — `interval 'P1Y2M3DT4H5M6S'`,
+`interval 'PT1H30M'`, `interval 'P1.5D'` — in both the "format with designators"
+and the "alternative format" (basic `P00020607T013000` and extended
+`P0002-06-07T01:30:00`). PostgreSQL's `interval_in`
+(`postgres/src/backend/utils/adt/timestamp.c`) tries the free-form
+`DecodeInterval` first and, only when it returns `DTERR_BAD_FORMAT`, falls back to
+`DecodeISO8601Interval` (`.../datetime.c`). goopg now mirrors that exactly.
+
+**Ordering as a fallback.** The old `ParseIntervalBody` body was renamed to
+`decodeIntervalFields` (the free-form decoder); `ParseIntervalBody` now calls it
+first and, on failure, calls the new `decodeISO8601Interval`. A body the free-form
+decoder accepts is therefore never overridden by the ISO reading — matching PG's
+"if those functions think it's a bad format, try ISO8601 style" ordering. The ISO
+decoder is fed the **untrimmed** body so PG's `str[0] != 'P'` guard (which rejects a
+leading space) stays byte-accurate.
+
+**Faithful port.** `decodeISO8601Interval` is a line-by-line port of
+`DecodeISO8601Interval`: a `datepart`/`havefield` state machine over
+`P<date>T<time>`, with `Y`/`M`/`W`/`D` designators before the `T` and `H`/`M`/`S`
+after it (so `M` is months before `T` but minutes after — `interval 'P1M'` = 1 mon,
+`interval 'PT1M'` = 00:01:00). Crucially, every designator field and every
+extended-alternative field routes through the **shared `IntervalUnitToParts`** — the
+same fractional-spill math (`AdjustFractYears`/`AdjustFractDays`/
+`AdjustFractMicroseconds`) the free-form decoder already uses — so the two decoders
+cannot drift. Only the two "basic" packed formats (an 8-digit `YYYYMMDD` date field,
+a 6-digit `HHMMSS` time field, detected via `iso8601IntegerWidth` == 8/6) need inline
+component math. New helpers `scanISONumberPrefix`/`parseISO8601Number` reproduce
+`ParseISO8601Number` (strtod-style prefix scan, truncate-toward-zero integer split,
+±1e15 overflow guard); `clampISOInterval` reproduces `itmin2interval`'s int32
+month/day overflow check.
+
+**Still deferred** (see `deferral_ledger.md`): full interval typmod grammar
+(`HOUR TO MINUTE` ranges, `SECOND(p)` precision, Form-1 trailing-word column-alias
+fall-through); interval `±infinity`; and the year-month tokenizer quirks
+`interval '1-'` / `interval '1-2.5'` in the free-form decoder. Every `want`/error in
+the new test was captured byte-for-byte from a live PostgreSQL 18.3 instance
+(port 5599).
+
+Tests: `internal/executor/interval_subday_test.go`'s new
+`TestISO8601IntervalLiterals` (30 designator/alternative-format accepts across both
+sibling paths + 6 malformed-body rejections). Gates: `go build`/`go vet` clean;
+parser + executor interval suites PASS; `scripts/tpch-spotcheck.sh` PASS
+(Q12=2/Q13=33); pgbench smoke via pre-commit hook.
+
 ## Cross-references
 
 - TPC-H query bodies: HammerDB upstream

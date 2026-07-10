@@ -497,15 +497,295 @@ func isASCIILetter(c byte) bool { return (c >= 'a' && c <= 'z') || (c >= 'A' && 
 func isASCIIDigit(c byte) bool  { return c >= '0' && c <= '9' }
 
 // ParseIntervalBody decodes a full free-form interval literal body into
+// months/days/micros components, mirroring PostgreSQL's interval_in
+// (postgres/src/backend/utils/adt/timestamp.c): it first tries the free-form
+// `<magnitude> <unit>` / `HH:MM:SS` decoder (DecodeInterval, here
+// decodeIntervalFields), and only when that fails does it fall back to ISO 8601
+// duration parsing (DecodeISO8601Interval, here decodeISO8601Interval) — exactly
+// PostgreSQL's "if those functions think it's a bad format, try ISO8601 style"
+// ordering. A body the free-form decoder accepts is therefore never overridden
+// by the ISO reading.
+//
+// This is the single tokenizer shared by the parser's Form-2 typed-literal
+// path and the executor's `::interval` / CAST path (the sibling paths the
+// practice card warns must not diverge).
+//
+// Returns ok=false for any body that neither decoder accepts.
+func ParseIntervalBody(body string) (months, days int32, micros int64, ok bool) {
+	if mo, d, mu, fok := decodeIntervalFields(body); fok {
+		return mo, d, mu, true
+	}
+	// PostgreSQL feeds the ORIGINAL (untrimmed) string to DecodeISO8601Interval,
+	// whose `str[0] != 'P'` guard makes a leading space fail — so pass body
+	// verbatim rather than trimming, keeping the space-sensitivity byte-accurate.
+	return decodeISO8601Interval(body)
+}
+
+// scanISONumberPrefix returns the leading run of s that strtod would consume as
+// a decimal number (optional sign, integer digits, optional `.frac`, optional
+// `[eE][+-]?digits` exponent) plus the remainder, mirroring how PostgreSQL's
+// ParseISO8601Number hands strtod the field start. It does not skip leading
+// whitespace (ISO 8601 durations never contain internal spaces), so a
+// space-prefixed field yields an empty number and the caller rejects it.
+func scanISONumberPrefix(s string) (num, rest string) {
+	i, n := 0, len(s)
+	if i < n && (s[i] == '+' || s[i] == '-') {
+		i++
+	}
+	for i < n && s[i] >= '0' && s[i] <= '9' {
+		i++
+	}
+	if i < n && s[i] == '.' {
+		i++
+		for i < n && s[i] >= '0' && s[i] <= '9' {
+			i++
+		}
+	}
+	if i < n && (s[i] == 'e' || s[i] == 'E') {
+		j := i + 1
+		if j < n && (s[j] == '+' || s[j] == '-') {
+			j++
+		}
+		k := j
+		for k < n && s[k] >= '0' && s[k] <= '9' {
+			k++
+		}
+		if k > j { // a bare `e` with no exponent digits is not part of the number
+			i = k
+		}
+	}
+	return s[:i], s[i:]
+}
+
+// parseISO8601Number consumes a leading numeric field from an ISO 8601 duration,
+// returning its integer part (truncated toward zero), fractional remainder
+// (|fval|<1, sharing the sign) and the unconsumed tail, mirroring PostgreSQL's
+// ParseISO8601Number (postgres/src/backend/utils/adt/datetime.c): a field with
+// no numeric content, or a magnitude outside ±1e15 (PG's isnan / overflow
+// guard), is rejected (ok=false).
+func parseISO8601Number(s string) (val int64, fval float64, rest string, ok bool) {
+	num, r := scanISONumberPrefix(s)
+	hasDigit := false
+	for i := 0; i < len(num); i++ {
+		if num[i] >= '0' && num[i] <= '9' {
+			hasDigit = true
+			break
+		}
+	}
+	if !hasDigit {
+		return 0, 0, s, false
+	}
+	f, err := strconv.ParseFloat(num, 64)
+	if err != nil || math.IsNaN(f) || f < -1.0e15 || f > 1.0e15 {
+		return 0, 0, s, false
+	}
+	ip := math.Trunc(f) // truncate toward zero, matching PG's floor/-floor split
+	return int64(ip), f - ip, r, true
+}
+
+// iso8601IntegerWidth counts the integral digits of an ISO 8601 numeric field
+// (ignoring a leading '-' and any fractional part), mirroring PostgreSQL's
+// ISO8601IntegerWidth. PostgreSQL uses this to recognise the "basic" alternative
+// format, where an 8-digit date field (`P00020607`) or a 6-digit time field
+// (`T013000`) packs multiple components into one number.
+func iso8601IntegerWidth(field string) int {
+	if len(field) > 0 && field[0] == '-' {
+		field = field[1:]
+	}
+	w := 0
+	for w < len(field) && field[w] >= '0' && field[w] <= '9' {
+		w++
+	}
+	return w
+}
+
+// clampISOInterval bounds an accumulated ISO 8601 interval to the on-disk
+// Interval field widths (month/day are int32, time is int64), mirroring
+// PostgreSQL's itmin2interval overflow check (total months against INT_MAX).
+// Returns ok=false on overflow.
+func clampISOInterval(months, days, micros int64) (int32, int32, int64, bool) {
+	if months > math.MaxInt32 || months < math.MinInt32 ||
+		days > math.MaxInt32 || days < math.MinInt32 {
+		return 0, 0, 0, false
+	}
+	return int32(months), int32(days), micros, true
+}
+
+// decodeISO8601Interval decodes an ISO 8601 duration into interval
+// months/days/micros, mirroring PostgreSQL's DecodeISO8601Interval
+// (postgres/src/backend/utils/adt/datetime.c). It accepts both the "format with
+// designators" (`P1Y2M3DT4H5M6S`, `PT1H30M`, `P1.5D`; a `W` week field may coexist
+// with others and decimals are allowed in any field) and the "alternative format"
+// — basic (`P00020607T013000`) and extended (`P0002-06-07T01:30:00`). Before the
+// `T`, the unit suffixes are Y/M/W/D; after it, H/M/S. Every designator field and
+// every extended-alternative field routes through the shared IntervalUnitToParts
+// (the same fractional-spill math the free-form decoder uses), so the two paths
+// cannot drift; only the two "basic" packed formats need inline component math.
+//
+// PostgreSQL only reaches this decoder when the free-form DecodeInterval returns
+// DTERR_BAD_FORMAT (interval_in, timestamp.c), so ParseIntervalBody calls it only
+// as a fallback. Returns ok=false for anything that is not a well-formed ISO 8601
+// duration.
+func decodeISO8601Interval(str string) (months, days int32, micros int64, ok bool) {
+	if len(str) < 2 || str[0] != 'P' {
+		return 0, 0, 0, false
+	}
+	str = str[1:]
+	datepart := true
+	havefield := false
+	var mo, dy, us int64
+	add := func(unit string, val int64, fval float64) {
+		m, d, mu, _ := IntervalUnitToParts(val, fval, unit)
+		mo += int64(m)
+		dy += int64(d)
+		us += mu
+	}
+	for len(str) > 0 {
+		if str[0] == 'T' { // begin the time part
+			datepart = false
+			havefield = false
+			str = str[1:]
+			continue
+		}
+		fieldstart := str
+		val, fval, next, nok := parseISO8601Number(str)
+		if !nok {
+			return 0, 0, 0, false
+		}
+		str = next
+		var unit byte // '\0' when the number ran to end-of-string
+		if len(str) > 0 {
+			unit = str[0]
+			str = str[1:]
+		}
+		if datepart {
+			switch unit { // before T: Y M W D (+ alternative formats)
+			case 'Y':
+				add("year", val, fval)
+			case 'M':
+				add("month", val, fval)
+			case 'W':
+				add("week", val, fval)
+			case 'D':
+				add("day", val, fval)
+			case 'T', 0, '-':
+				// ISO 8601 4.4.3.3 alternative format. Basic: an 8-digit date
+				// field packs YYYYMMDD into one number (only as the first field).
+				if (unit == 'T' || unit == 0) && iso8601IntegerWidth(fieldstart) == 8 && !havefield {
+					mo += (val/10000)*12 + (val/100)%100
+					dy += val % 100
+					us += intervalFractMicros(fval, usecsPerDay)
+					if unit == 0 {
+						return clampISOInterval(mo, dy, us)
+					}
+					datepart = false // unit == 'T'
+					havefield = false
+					continue
+				}
+				// Extended alternative format (`0002-06-07`), also the T/'\0'
+				// fall-through when the date field was not 8 digits wide.
+				if havefield {
+					return 0, 0, 0, false
+				}
+				add("year", val, fval)
+				if unit == 0 {
+					return clampISOInterval(mo, dy, us)
+				}
+				if unit == 'T' {
+					datepart = false
+					havefield = false
+					continue
+				}
+				// unit == '-': the month, then (after another '-') the day.
+				if val, fval, str, nok = parseISO8601Number(str); !nok {
+					return 0, 0, 0, false
+				}
+				add("month", val, fval)
+				if len(str) == 0 {
+					return clampISOInterval(mo, dy, us)
+				}
+				if str[0] == 'T' {
+					datepart = false
+					havefield = false
+					continue
+				}
+				if str[0] != '-' {
+					return 0, 0, 0, false
+				}
+				str = str[1:]
+				if val, fval, str, nok = parseISO8601Number(str); !nok {
+					return 0, 0, 0, false
+				}
+				add("day", val, fval)
+				if len(str) == 0 {
+					return clampISOInterval(mo, dy, us)
+				}
+				if str[0] == 'T' {
+					datepart = false
+					havefield = false
+					continue
+				}
+				return 0, 0, 0, false
+			default:
+				return 0, 0, 0, false
+			}
+		} else {
+			switch unit { // after T: H M S (+ alternative formats)
+			case 'H':
+				add("hour", val, fval)
+			case 'M':
+				add("minute", val, fval)
+			case 'S':
+				add("second", val, fval)
+			case 0, ':':
+				// Basic alternative format: a 6-digit time field packs HHMMSS.
+				if unit == 0 && iso8601IntegerWidth(fieldstart) == 6 && !havefield {
+					us += (val/10000)*usecsPerHour + ((val/100)%100)*usecsPerMinute +
+						(val%100)*usecsPerSecond + intervalFractMicros(fval, 1)
+					return clampISOInterval(mo, dy, us)
+				}
+				// Extended alternative format (`01:30:00`).
+				if havefield {
+					return 0, 0, 0, false
+				}
+				us += val*usecsPerHour + intervalFractMicros(fval, usecsPerHour)
+				if unit == 0 {
+					return clampISOInterval(mo, dy, us)
+				}
+				if val, fval, str, nok = parseISO8601Number(str); !nok {
+					return 0, 0, 0, false
+				}
+				us += val*usecsPerMinute + intervalFractMicros(fval, usecsPerMinute)
+				if len(str) == 0 {
+					return clampISOInterval(mo, dy, us)
+				}
+				if str[0] != ':' {
+					return 0, 0, 0, false
+				}
+				str = str[1:]
+				if val, fval, str, nok = parseISO8601Number(str); !nok {
+					return 0, 0, 0, false
+				}
+				us += val*usecsPerSecond + intervalFractMicros(fval, usecsPerSecond)
+				if len(str) == 0 {
+					return clampISOInterval(mo, dy, us)
+				}
+				return 0, 0, 0, false
+			default:
+				return 0, 0, 0, false
+			}
+		}
+		havefield = true
+	}
+	return clampISOInterval(mo, dy, us)
+}
+
+// decodeIntervalFields decodes a free-form interval literal body into
 // months/days/micros components, mirroring PostgreSQL's DecodeInterval
 // (postgres/src/backend/utils/adt/datetime.c) for the field shapes goopg
 // supports: any number of `<magnitude> <unit>` pairs interleaved in any order
 // with `[+-]HH:MM[:SS[.ffffff]]` time words. Each field carries its own sign,
 // e.g. `-1 day 05:00:00` = (days -1, +5h) and `1 day -05:00:00` = (days 1, -5h).
-//
-// This is the single tokenizer shared by the parser's Form-2 typed-literal
-// path and the executor's `::interval` / CAST path (the sibling paths the
-// practice card warns must not diverge).
 //
 // A unitless number defaults to SECONDS (`interval '5'` → 00:00:05,
 // `interval '1 day 5'` → 1 day 00:00:05), mirroring PostgreSQL's
@@ -523,7 +803,7 @@ func isASCIIDigit(c byte) bool  { return c >= '0' && c <= '9' }
 // collision (`interval '1 day 05:00:00 5'` errors, matching PG).
 //
 // Returns ok=false for any body that doesn't decompose cleanly.
-func ParseIntervalBody(body string) (months, days int32, micros int64, ok bool) {
+func decodeIntervalFields(body string) (months, days int32, micros int64, ok bool) {
 	// Expand glued `<magnitude><unit>` fields (`2h30m`, `1.5h`, `1y2mon`) into
 	// separate tokens first, so the field loop below sees the same token stream
 	// whether the literal was written glued or spaced. expandIntervalFields

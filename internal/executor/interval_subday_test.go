@@ -344,6 +344,89 @@ func TestGluedIntervalLiterals(t *testing.T) {
 	}
 }
 
+// TestISO8601IntervalLiterals covers ISO 8601 duration interval bodies
+// (unimplemented_feat #5(d-iii-rest)), which PostgreSQL decodes via
+// DecodeISO8601Interval as a fallback when the free-form decoder fails
+// (interval_in, postgres/src/backend/utils/adt/timestamp.c). Both the "format
+// with designators" (`P1Y2M3DT4H5M6S`, `PT1H30M`, fractional fields, a `W` week
+// field coexisting with others) and the "alternative format" — basic
+// (`P00020607T013000`) and extended (`P0002-06-07T01:30:00`) — are exercised, at
+// both the typed-literal and `::interval`/CAST entry points (they share
+// parser.ParseIntervalBody). Every `want` / rejection was captured byte-for-byte
+// from a live PostgreSQL 18.3 instance (port 5599).
+func TestISO8601IntervalLiterals(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+	if err := runDDL(t, ctx, "CREATE TABLE t (id int)"); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	if err := runDDL(t, ctx, "INSERT INTO t VALUES (1)"); err != nil {
+		t.Fatalf("INSERT: %v", err)
+	}
+	accept := []struct{ sql, want string }{
+		// Format with designators.
+		{"SELECT interval 'P1Y2M3DT4H5M6S'", "1 year 2 mons 3 days 04:05:06"},
+		{"SELECT interval 'P1Y2M3DT4H5M6.789S'", "1 year 2 mons 3 days 04:05:06.789"},
+		{"SELECT interval 'PT1H30M'", "01:30:00"},
+		{"SELECT interval 'P1D'", "1 day"},
+		{"SELECT interval 'P1W'", "7 days"},
+		{"SELECT interval 'P1M'", "1 mon"},
+		{"SELECT interval 'PT1M'", "00:01:00"}, // M after T is minutes, not months
+		{"SELECT interval 'P2Y6M7DT1H30M'", "2 years 6 mons 7 days 01:30:00"},
+		{"SELECT interval 'P0Y'", "00:00:00"},
+		// Fractional fields spill into the next-smaller unit exactly as PG's
+		// Adjust* helpers do.
+		{"SELECT interval 'P1.5Y'", "1 year 6 mons"},
+		{"SELECT interval 'P1.5M'", "1 mon 15 days"},
+		{"SELECT interval 'P1.5D'", "1 day 12:00:00"},
+		{"SELECT interval 'PT1.5H'", "01:30:00"},
+		{"SELECT interval 'PT0.5M'", "00:00:30"},
+		{"SELECT interval 'PT1.5S'", "00:00:01.5"},
+		{"SELECT interval 'P1.5Y2M'", "1 year 8 mons"},
+		// Per-field signs.
+		{"SELECT interval 'P-1Y'", "-1 years"},
+		{"SELECT interval 'PT-5H'", "-05:00:00"},
+		// Alternative format — extended (hyphen/colon separated).
+		{"SELECT interval 'P0002-06-07T01:30:00'", "2 years 6 mons 7 days 01:30:00"},
+		{"SELECT interval 'P0001-02-03'", "1 year 2 mons 3 days"},
+		{"SELECT interval 'P0002-06'", "2 years 6 mons"},
+		{"SELECT interval 'PT01:30:00'", "01:30:00"},
+		{"SELECT interval 'PT01:30'", "01:30:00"},
+		// Alternative format — basic (packed digit runs).
+		{"SELECT interval 'P00020607T013000'", "2 years 6 mons 7 days 01:30:00"},
+		// Empty/short bodies and the fall-through year default.
+		{"SELECT interval 'PT'", "00:00:00"},
+		{"SELECT interval 'P1'", "1 year"}, // bare number = years (alt-format year)
+		{"SELECT interval 'P1DT'", "1 day"},
+		// Cast / :: forms share the tokenizer.
+		{"SELECT 'P1Y2M3DT4H5M6S'::interval", "1 year 2 mons 3 days 04:05:06"},
+		{"SELECT CAST('PT1H30M' AS interval)", "01:30:00"},
+	}
+	for _, c := range accept {
+		rows := runQuery(t, ctx, c.sql+" FROM t")
+		if len(rows) != 1 || len(rows[0]) != 1 {
+			t.Fatalf("%s: expected 1x1 result, got %v", c.sql, rows)
+		}
+		if got := rows[0][0].Format(); got != c.want {
+			t.Errorf("%s = %q, want %q", c.sql, got, c.want)
+		}
+	}
+
+	reject := []string{
+		"SELECT interval 'P' FROM t",     // too short (< 2 chars)
+		"SELECT interval 'PX' FROM t",    // no numeric field
+		"SELECT interval 'P1Q' FROM t",   // Q is not a valid date unit
+		"SELECT interval 'PT1X' FROM t",  // X is not a valid time unit
+		"SELECT interval 'P1Y2' FROM t",  // trailing bare number after a field (havefield)
+		"SELECT interval 'P1YY' FROM t",  // second field has no number
+	}
+	for _, sql := range reject {
+		if _, err := runQueryErr(t, ctx, sql); err == nil {
+			t.Errorf("%s: expected error, got none", sql)
+		}
+	}
+}
+
 // TestWeekDecadeCenturyIntervals covers the coarse interval units week /
 // decade / century / millennium and their dec/cent/mil abbreviations
 // (unimplemented_feat #5(c)). PG parses these only inside the interval body
