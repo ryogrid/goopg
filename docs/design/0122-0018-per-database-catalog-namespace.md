@@ -1,6 +1,6 @@
 # Per-database catalog namespace (M0122-0007 slice 4)
 
-Status: accepted (sub-slices 4a, 4b-i, 4b-ii, 4c, 4d-i, 4d-ii-part-1, and 4d-ii-part-2a landed; 4d-ii-part-2b items 1, 2, and 3 all fully landed; 4e's FK-target-resolution, sequence-ownership, and view-constraint-dependency items all landed; `CREATE DATABASE ... TEMPLATE` bounded validation landed 2026-07-10; the pg_class-under-fresh-database gap (name resolution generically, row enumeration for pg_class specifically) landed 2026-07-10, and the pg_indexes/pg_tables and pg_constraint row-content follow-ups landed the same day — 10 sibling virtual-table builders plus the real relation-copy mechanism remain planned, see "Remaining 4e work" below)
+Status: accepted (sub-slices 4a, 4b-i, 4b-ii, 4c, 4d-i, 4d-ii-part-1, and 4d-ii-part-2a landed; 4d-ii-part-2b items 1, 2, and 3 all fully landed; 4e's FK-target-resolution, sequence-ownership, and view-constraint-dependency items all landed; `CREATE DATABASE ... TEMPLATE` bounded validation landed 2026-07-10; the pg_class-under-fresh-database gap (name resolution generically, row enumeration for pg_class specifically) landed 2026-07-10, and the pg_indexes/pg_tables, pg_constraint, and pg_index row-content follow-ups landed the same day — 9 sibling virtual-table builders plus the real relation-copy mechanism remain planned, see "Remaining 4e work" below)
 Date: 2026-07-10
 Supersedes: none — extends the "Still open" note in
 `0122-0017-database-ddl-drop-guards.md` and the deferral-ledger rows dated
@@ -1107,6 +1107,35 @@ the 2026-07-10 deferral-ledger row ("pg_constraint per-dbOid content") for the
 `information_schema.routines`/`parameters`/`routine_*_usage`,
 `pg_foreign_table`) still needing this treatment — each is its own bounded
 future loop.
+
+**`pg_index` row-content — FIXED 2026-07-10 (same day, next loop).** The next
+highest-value sibling builder from the list above (pg_dump's index-metadata
+queries and psql's `\d`/`indexrelid::regclass` catalog joins) got the same
+part-(2) closure-extraction treatment: its `VirtualRows` closure was extracted
+into `catalog.InMemory.PGIndexRowsForDBOid(dbOid uint32) [][]string`,
+threading `dbOid` through `c.AllIndexes(dbOid)` (already dbOid-parameterized,
+just unused by this closure until now) and through `c.toastBearingTables`,
+whose signature gained a required `dbOid uint32` param (its only caller was
+this closure, so no variadic-compat shim was needed). Wired to a new
+per-connection `executor.Context.PgIndexRows` field (mirroring
+`PgConstraintRows`, set in `internal/server/dispatch.go`'s
+`wireExtensionRows`), consumed by a new `tbl.Name == "pg_index"` branch in
+`internal/executor/operators.go`'s `valuesOp.Open`. Live-verified end-to-end:
+`CREATE DATABASE freshidx1` → connect → `CREATE TABLE only_in_freshidx1 (id
+int PRIMARY KEY, val int)` + `CREATE INDEX ... ON only_in_freshidx1(val)` →
+raw `pg_index` in `freshidx1` shows exactly those 2 index rows at their own
+dbOid-local OIDs, and only `postgres`'s own index row when queried from
+`postgres`. Collateral discovery during this verification (NOT fixed, its own
+deferral-ledger row): `oid::regclass` (the OID→name cast direction) still
+resolves against `DefaultDBOid`'s `pg_class` only, so it silently prints the
+bare numeric OID instead of a name for objects in any other database — a
+separate cast/output-function mechanism from the `VirtualRows`-closure gap
+this design doc's sub-slice tracks. See the 2026-07-10 deferral-ledger row
+("pg_index per-dbOid content") for the 9 remaining sibling builders
+(`pg_attrdef`, `pg_inherits`, `pg_statistic_ext`, `pg_policy`, `pg_depend`,
+`pg_trigger`, `pg_rewrite`, `information_schema.routines`/`parameters`/
+`routine_*_usage`, `pg_foreign_table`) still needing this treatment — each is
+its own bounded future loop.
 
 **Remaining 4e work: the `CREATE DATABASE ... TEMPLATE` copy mechanism
 itself** — deep-copying the source dbOid's `catalog.tableNamespace`

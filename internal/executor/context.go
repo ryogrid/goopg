@@ -498,6 +498,12 @@ type Context struct {
 	// CurrentDatabaseOid. M0122-0007 4e follow-up 25.
 	PgConstraintRows func() [][]string
 
+	// PgIndexRows mirrors PgConstraintRows above for the pg_index catalog
+	// table: it lists CurrentDatabaseOid's own indexes rather than always
+	// DefaultDBOid's (catalog.InMemory's PGIndexRowsForDBOid). Wired by the
+	// server to close over CurrentDatabaseOid. M0122-0007 4e follow-up 26.
+	PgIndexRows func() [][]string
+
 	// NonSuperuserRole, when non-empty, means the session is currently running
 	// under a non-superuser role (set via SET SESSION AUTHORIZATION). Privilege
 	// checks that require superuser (e.g. LEAKPROOF function attribute) must

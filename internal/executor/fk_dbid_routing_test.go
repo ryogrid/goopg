@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -384,6 +385,66 @@ func TestPgConstraintRowsScopedToConnectionDBOid(t *testing.T) {
 func pgConstraintRowsContainName(rows [][]string, conname string) bool {
 	for _, r := range rows {
 		if len(r) > 1 && r[1] == conname {
+			return true
+		}
+	}
+	return false
+}
+
+// TestPgIndexRowsScopedToConnectionDBOid covers M0122-0007 4e follow-up 26's
+// pg_index VirtualRows enumeration: catalog.InMemory.PGIndexRowsForDBOid must
+// list the GIVEN dbOid's own indexes, not always DefaultDBOid's — mirrors
+// TestPgConstraintRowsScopedToConnectionDBOid above for the pg_index catalog
+// table.
+func TestPgIndexRowsScopedToConnectionDBOid(t *testing.T) {
+	const otherDBOid = 7008
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+
+	ctx.CurrentDatabaseOid = catalog.DefaultDBOid
+	if err := runDDL(t, ctx, "CREATE TABLE only_in_default (id int4 PRIMARY KEY)"); err != nil {
+		t.Fatalf("CREATE TABLE only_in_default: %v", err)
+	}
+	ctx.CurrentDatabaseOid = otherDBOid
+	if err := runDDL(t, ctx, "CREATE TABLE only_in_other (id int4 PRIMARY KEY)"); err != nil {
+		t.Fatalf("CREATE TABLE only_in_other: %v", err)
+	}
+
+	im, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		t.Fatalf("ctx.Catalog is %T, want *catalog.InMemory", ctx.Catalog)
+	}
+
+	defaultTbl, ok := im.LookupTable(parser.ObjectName{Name: "only_in_default"}, catalog.DefaultDBOid)
+	if !ok {
+		t.Fatal("LookupTable(only_in_default, DefaultDBOid) not found")
+	}
+	otherTbl, ok := im.LookupTable(parser.ObjectName{Name: "only_in_other"}, otherDBOid)
+	if !ok {
+		t.Fatal("LookupTable(only_in_other, otherDBOid) not found")
+	}
+
+	defaultRows := im.PGIndexRowsForDBOid(catalog.DefaultDBOid)
+	if pgIndexRowsContainIndrelid(defaultRows, otherTbl.OID) {
+		t.Fatal("DefaultDBOid's pg_index rows include only_in_other's index, a table created under a distinct dbOid")
+	}
+	if !pgIndexRowsContainIndrelid(defaultRows, defaultTbl.OID) {
+		t.Fatal("DefaultDBOid's pg_index rows are missing only_in_default's index")
+	}
+
+	otherRows := im.PGIndexRowsForDBOid(otherDBOid)
+	if !pgIndexRowsContainIndrelid(otherRows, otherTbl.OID) {
+		t.Fatal("otherDBOid's pg_index rows are missing only_in_other's index")
+	}
+	if pgIndexRowsContainIndrelid(otherRows, defaultTbl.OID) {
+		t.Fatal("otherDBOid's pg_index rows include only_in_default's index, a table created under DefaultDBOid")
+	}
+}
+
+func pgIndexRowsContainIndrelid(rows [][]string, tableOID uint32) bool {
+	want := fmt.Sprintf("%d", tableOID)
+	for _, r := range rows {
+		if len(r) > 1 && r[1] == want {
 			return true
 		}
 	}

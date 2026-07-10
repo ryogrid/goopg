@@ -6812,6 +6812,54 @@ mirroring M0119's ledger `status` column.
       PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
       `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
       failed transactions, all 3 pgbench workloads).
+  - [x] `M0122-0007` follow-up 26 (2026-07-10, this loop) — **fixed the next
+      highest-value sibling virtual-table builder follow-up 25 flagged:
+      `pg_index`.** Same closure-extraction pattern: extracted the
+      `VirtualRows` closure body into an exported
+      `catalog.InMemory.PGIndexRowsForDBOid(dbOid uint32) [][]string`,
+      threading `dbOid` through `c.AllIndexes(dbOid)` (which already accepted
+      a variadic `dbOid` param — unused by this closure until now) and through
+      `c.toastBearingTables`, which gained a required `dbOid uint32` param
+      (its only caller was this closure). The registered closure now just
+      calls `PGIndexRowsForDBOid(DefaultDBOid)`, byte-identical default
+      behavior. Wired a new per-connection `executor.Context.PgIndexRows
+      func() [][]string` field (mirrors `PgConstraintRows`), set in
+      `internal/server/dispatch.go`'s `wireExtensionRows` (new
+      `pgIndexRowLister` interface), consumed by a new `tbl.Name ==
+      "pg_index"` branch in `internal/executor/operators.go`'s
+      `valuesOp.Open`. New test `TestPgIndexRowsScopedToConnectionDBOid`
+      (`internal/executor/fk_dbid_routing_test.go`), mirroring
+      `TestPgConstraintRowsScopedToConnectionDBOid`: two tables each with a
+      `PRIMARY KEY`, one under `DefaultDBOid` and one under a distinct dbOid,
+      resolved via `LookupTable` and asserted never to cross-leak their
+      pg_index `indrelid` rows. Live end-to-end verified against a real
+      `cmd/goopg` binary + real `psql`: `CREATE DATABASE freshidx1` → connect
+      → `CREATE TABLE only_in_freshidx1 (id int PRIMARY KEY, val int)` +
+      `CREATE INDEX ... ON only_in_freshidx1(val)` → raw `SELECT * FROM
+      pg_index` in `freshidx1` shows exactly those 2 index rows (indrelid
+      matching the table's own pg_class OID); the same query against
+      `postgres` db shows only `postgres`'s own `only_in_postgres_pkey` row
+      (no cross-database leak either direction). Collateral discovery (NOT
+      fixed this loop, recorded in the deferral ledger): `oid::regclass`
+      (OID→name direction) returns the bare numeric OID instead of resolving
+      a name for objects in a non-`DefaultDBOid` database, even though the
+      underlying pg_index/pg_class row content is byte-correct — a separate
+      cast/output-function mechanism, not a `VirtualRows`-closure gap.
+      **Remaining scope (deferred, own future loops):** 9 sibling builders
+      still row-content-`DefaultDBOid`-only — `pg_attrdef`, `pg_inherits`,
+      `pg_statistic_ext`, `pg_policy`, `pg_depend`, `pg_trigger`,
+      `pg_rewrite`, `information_schema.routines`/`parameters`/
+      `routine_*_usage`, `pg_foreign_table`; `pg_sequence`/`pg_sequences`/
+      `information_schema.sequences`, `pg_attribute`/`pg_type`, and the new
+      `oid::regclass` cast gap remain separately flagged. Design doc updated
+      (new "pg_index" residual-gap subsection); `docs/design/README.md` row
+      extended; deferral ledger rows appended ("pg_index per-dbOid content"
+      + "pg_index live verification — collateral discovery"). Gates: `go
+      build ./...`/`go vet ./...` clean; `go test ./internal/catalog/...
+      ./internal/executor/... ./internal/server/... ./internal/planner/...`
+      PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed transactions, all 3 pgbench workloads).
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,

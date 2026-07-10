@@ -1215,27 +1215,29 @@ func (c *InMemory) ToastRelFileNode(parentRel storage.RelFileNode) (storage.RelF
 	return toast, true
 }
 
-// toastBearingTables returns every relation that owns an auto-exposed TOAST
-// relation, under the SAME visibility filter the pg_class virtual builder
-// applies to its main table loop (non-virtual ordinary tables plus
-// materialized views and user sequences/views are admitted to the loop;
+// toastBearingTables returns every relation in dbOid's namespace that owns an
+// auto-exposed TOAST relation, under the SAME visibility filter the pg_class
+// virtual builder applies to its main table loop (non-virtual ordinary tables
+// plus materialized views and user sequences/views are admitted to the loop;
 // tableHasToastRelation then keeps only relkind 'r'/'m'). The pg_class builder
 // emits the synthetic relkind='t' TOAST row and relkind='i' TOAST-index row for
 // exactly this set, so the pg_index builder must enumerate the same set or the
 // two catalogs diverge (an indexrelid with no matching pg_class row). Returned
 // tables share the registry's backing storage; callers must only read.
-// M0118-0008 TOAST-exposure slice 3.
-func (c *InMemory) toastBearingTables() []*Table {
+// M0118-0008 TOAST-exposure slice 3; dbOid-parameterized by M0122-0007 4e
+// follow-up 26 (PGIndexRowsForDBOid) — its lone caller now threads a
+// per-connection dbOid instead of always DefaultDBOid.
+func (c *InMemory) toastBearingTables(dbOid uint32) []*Table {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	keys := make([]string, 0, len(c.ns(DefaultDBOid).tables))
-	for k := range c.ns(DefaultDBOid).tables {
+	keys := make([]string, 0, len(c.ns(dbOid).tables))
+	for k := range c.ns(dbOid).tables {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
 	out := make([]*Table, 0)
 	for _, k := range keys {
-		t := c.ns(DefaultDBOid).tables[k]
+		t := c.ns(dbOid).tables[k]
 		// Mirror the pg_class main-loop skip: drop system-catalog virtual
 		// tables but keep user views, matviews and sequences (which
 		// tableHasToastRelation subsequently rejects unless they are 'r'/'m').
@@ -6212,6 +6214,169 @@ func (c *InMemory) PGConstraintRowsForDBOid(dbOid uint32) [][]string {
 	return out
 }
 
+// PGIndexRowsForDBOid builds the pg_index catalog row-set for dbOid's own
+// indexes (mirrors PGConstraintRowsForDBOid's per-connection dbOid scoping
+// above). registerSystemTables's VirtualRows closure calls this with
+// DefaultDBOid so every existing caller (server dispatch without a
+// per-connection PgIndexRows wire-up, every test) sees byte-identical
+// behavior; a per-connection dbOid is wired in via
+// executor.Context.PgIndexRows (internal/server/dispatch.go's
+// wireExtensionRows). M0122-0007 4e follow-up 26.
+func (c *InMemory) PGIndexRowsForDBOid(dbOid uint32) [][]string {
+	idxs := c.AllIndexes(dbOid)
+	out := make([][]string, 0, len(idxs))
+	for _, idx := range idxs {
+		if idx.Table == nil {
+			continue
+		}
+		// Build column-ordinal lookups (1-based) for the parent table.
+		colOrd := make(map[string]int, len(idx.Table.Columns))
+		for _, col := range idx.Table.Columns {
+			colOrd[col.Name] = col.Ordinal + 1
+		}
+		// indkey: key columns then include columns; expression columns get ordinal 0.
+		keyParts := make([]string, 0, len(idx.Columns)+len(idx.IncludeColumns))
+		for _, col := range idx.Columns {
+			if col == "" {
+				keyParts = append(keyParts, "0")
+			} else if ord, ok := colOrd[col]; ok {
+				keyParts = append(keyParts, fmt.Sprintf("%d", ord))
+			} else {
+				keyParts = append(keyParts, "0")
+			}
+		}
+		for _, col := range idx.IncludeColumns {
+			if ord, ok := colOrd[col]; ok {
+				keyParts = append(keyParts, fmt.Sprintf("%d", ord))
+			} else {
+				keyParts = append(keyParts, "0")
+			}
+		}
+		indkey := strings.Join(keyParts, " ")
+		// indclass: one opclass OID per key column, via the shared
+		// resolver (also used by buildUserPGIndexRow's heap-row twin —
+		// internal/executor/pg18_user_catalog_rows.go — so the live and
+		// heap-persisted renderings never diverge).
+		opclassMethodOID := AccessMethodOIDByName(idx.Method)
+		if opclassMethodOID == 0 {
+			opclassMethodOID = btreeAccessMethodOID
+		}
+		classOIDs := make([]string, len(idx.Columns))
+		for i, col := range idx.Columns {
+			var explicit, typeName string
+			if i < len(idx.ColOpClasses) {
+				explicit = idx.ColOpClasses[i]
+			}
+			if col != "" {
+				for _, tc := range idx.Table.Columns {
+					if tc.Name == col {
+						typeName = tc.Type.Name
+						break
+					}
+				}
+			}
+			classOIDs[i] = fmt.Sprintf("%d", c.ResolveIndexColumnOpclassOID(explicit, typeName, opclassMethodOID))
+		}
+		indclass := strings.Join(classOIDs, " ")
+		boolStr := func(b bool) string {
+			if b {
+				return "t"
+			}
+			return "f"
+		}
+		natts := len(idx.Columns) + len(idx.IncludeColumns)
+		nkeyatts := len(idx.Columns)
+		// indcollation: per-key-column explicit COLLATE OID via the shared
+		// resolver (0 = not collatable / no explicit collation given; see
+		// ResolveIndexColumnCollationOID's doc comment for why this is also
+		// shared with buildUserPGIndexRow's heap-row twin).
+		collationParts := make([]string, nkeyatts)
+		for i := range collationParts {
+			var explicit string
+			if i < len(idx.ColCollations) {
+				explicit = idx.ColCollations[i]
+			}
+			collationParts[i] = fmt.Sprintf("%d", c.ResolveIndexColumnCollationOID(explicit))
+		}
+		indcollation := strings.Join(collationParts, " ")
+		// indoption: per-key ASC/DESC + NULLS FIRST/LAST bitmask, mirroring
+		// upstream's INDOPTION_DESC (0x1) / INDOPTION_NULLS_FIRST (0x2).
+		indoptionParts := make([]string, nkeyatts)
+		for i := range indoptionParts {
+			var bits int
+			if i < len(idx.ColDescending) && idx.ColDescending[i] {
+				bits |= 0x0001
+			}
+			if i < len(idx.ColNullsFirst) && idx.ColNullsFirst[i] {
+				bits |= 0x0002
+			}
+			indoptionParts[i] = fmt.Sprintf("%d", bits)
+		}
+		indoption := strings.Join(indoptionParts, " ")
+		out = append(out, []string{
+			fmt.Sprintf("%d", idx.OID),       // indexrelid
+			fmt.Sprintf("%d", idx.Table.OID), // indrelid
+			fmt.Sprintf("%d", natts),         // indnatts
+			fmt.Sprintf("%d", nkeyatts),      // indnkeyatts
+			boolStr(idx.Unique),              // indisunique
+			boolStr(idx.NullsNotDistinct),    // indnullsnotdistinct
+			boolStr(idx.Primary),             // indisprimary
+			boolStr(idx.IsExclusion),         // indisexclusion
+			"t",                              // indimmediate
+			boolStr(idx.IsClustered),         // indisclustered (DU-002 slice 320)
+			"t",                              // indisvalid
+			"f",                              // indcheckxmin
+			"t",                              // indisready
+			"t",                              // indislive
+			boolStr(idx.IsReplicaIdentity),   // indisreplident (DU-002 slice 306)
+			indkey,                           // indkey
+			indcollation,                     // indcollation
+			indclass,                         // indclass
+			indoption,                        // indoption
+			"",                               // indexprs (NULL)
+			"",                               // indpred (NULL)
+			"",                               // indcoloptions (NULL)
+		})
+	}
+	// Synthesize the unique btree index PG auto-creates on every TOAST
+	// relation (on chunk_id, chunk_seq). The pg_class virtual builder emits
+	// the matching relkind='i' row named pg_toast_<oid>_index; this row lets
+	//   SELECT indexrelid::regclass FROM pg_index
+	//     WHERE indrelid = (SELECT oid FROM pg_class WHERE relname=<toast rel>)
+	// resolve (reindex-concurrently-toast setup). toastBearingTables uses the
+	// SAME gate as the pg_class TOAST-row emission so the two never diverge.
+	// M0118-0008 TOAST-exposure slice 3.
+	for _, t := range c.toastBearingTables(dbOid) {
+		toastRelOID := int(t.OID) + toastRelidOffset
+		toastIdxOID := int(t.OID) + toastIndexOidOffset
+		out = append(out, []string{
+			fmt.Sprintf("%d", toastIdxOID), // indexrelid
+			fmt.Sprintf("%d", toastRelOID), // indrelid
+			"2",                            // indnatts (chunk_id, chunk_seq)
+			"2",                            // indnkeyatts
+			"t",                            // indisunique
+			"f",                            // indnullsnotdistinct
+			"f",                            // indisprimary
+			"f",                            // indisexclusion
+			"t",                            // indimmediate
+			"f",                            // indisclustered
+			"t",                            // indisvalid
+			"f",                            // indcheckxmin
+			"t",                            // indisready
+			"t",                            // indislive
+			"f",                            // indisreplident
+			"1 2",                          // indkey (chunk_id=1, chunk_seq=2)
+			"0 0",                          // indcollation (int4 columns: no collation)
+			"1978 1978",                    // indclass (int4_ops btree)
+			"0 0",                          // indoption
+			"",                             // indexprs (NULL)
+			"",                             // indpred (NULL)
+			"",                             // indcoloptions (NULL)
+		})
+	}
+	return out
+}
+
 func (c *InMemory) PGClassRowsForDBOid(dbOid uint32) [][]string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -7958,167 +8123,7 @@ func (c *InMemory) registerSystemTables() {
 		OID: 2610,
 	}
 	pgIndexCatalog.VirtualRows = func() [][]string {
-		idxs := c.AllIndexes()
-		out := make([][]string, 0, len(idxs))
-		for _, idx := range idxs {
-			if idx.Table == nil {
-				continue
-			}
-			// Build column-ordinal lookups (1-based) for the parent table.
-			colOrd := make(map[string]int, len(idx.Table.Columns))
-			for _, col := range idx.Table.Columns {
-				colOrd[col.Name] = col.Ordinal + 1
-			}
-			// indkey: key columns then include columns; expression columns get ordinal 0.
-			keyParts := make([]string, 0, len(idx.Columns)+len(idx.IncludeColumns))
-			for _, col := range idx.Columns {
-				if col == "" {
-					keyParts = append(keyParts, "0")
-				} else if ord, ok := colOrd[col]; ok {
-					keyParts = append(keyParts, fmt.Sprintf("%d", ord))
-				} else {
-					keyParts = append(keyParts, "0")
-				}
-			}
-			for _, col := range idx.IncludeColumns {
-				if ord, ok := colOrd[col]; ok {
-					keyParts = append(keyParts, fmt.Sprintf("%d", ord))
-				} else {
-					keyParts = append(keyParts, "0")
-				}
-			}
-			indkey := strings.Join(keyParts, " ")
-			// indclass: one opclass OID per key column, via the shared
-			// resolver (also used by buildUserPGIndexRow's heap-row twin —
-			// internal/executor/pg18_user_catalog_rows.go — so the live and
-			// heap-persisted renderings never diverge). M0122-0007
-			// follow-up: this previously ignored ColOpClasses entirely and
-			// used a per-type OID switch with values that did not match
-			// real PostgreSQL (e.g. int2_ops rendered as 1970 instead of
-			// 1979).
-			opclassMethodOID := AccessMethodOIDByName(idx.Method)
-			if opclassMethodOID == 0 {
-				opclassMethodOID = btreeAccessMethodOID
-			}
-			classOIDs := make([]string, len(idx.Columns))
-			for i, col := range idx.Columns {
-				var explicit, typeName string
-				if i < len(idx.ColOpClasses) {
-					explicit = idx.ColOpClasses[i]
-				}
-				if col != "" {
-					for _, tc := range idx.Table.Columns {
-						if tc.Name == col {
-							typeName = tc.Type.Name
-							break
-						}
-					}
-				}
-				classOIDs[i] = fmt.Sprintf("%d", c.ResolveIndexColumnOpclassOID(explicit, typeName, opclassMethodOID))
-			}
-			indclass := strings.Join(classOIDs, " ")
-			boolStr := func(b bool) string {
-				if b {
-					return "t"
-				}
-				return "f"
-			}
-			natts := len(idx.Columns) + len(idx.IncludeColumns)
-			nkeyatts := len(idx.Columns)
-			// indcollation: per-key-column explicit COLLATE OID via the
-			// shared resolver (0 = not collatable / no explicit collation
-			// given; see ResolveIndexColumnCollationOID's doc comment for
-			// why this is also shared with buildUserPGIndexRow's heap-row
-			// twin). M0122-0007 follow-up: this previously always rendered
-			// an all-zero vector regardless of ColCollations.
-			collationParts := make([]string, nkeyatts)
-			for i := range collationParts {
-				var explicit string
-				if i < len(idx.ColCollations) {
-					explicit = idx.ColCollations[i]
-				}
-				collationParts[i] = fmt.Sprintf("%d", c.ResolveIndexColumnCollationOID(explicit))
-			}
-			indcollation := strings.Join(collationParts, " ")
-			// indoption: per-key ASC/DESC + NULLS FIRST/LAST bitmask, mirroring
-			// upstream's INDOPTION_DESC (0x1) / INDOPTION_NULLS_FIRST (0x2).
-			// M0122-0006: this live pg_index query path previously always
-			// rendered an all-zero vector (buildZeroVec) regardless of the
-			// index's declared column ordering.
-			indoptionParts := make([]string, nkeyatts)
-			for i := range indoptionParts {
-				var bits int
-				if i < len(idx.ColDescending) && idx.ColDescending[i] {
-					bits |= 0x0001
-				}
-				if i < len(idx.ColNullsFirst) && idx.ColNullsFirst[i] {
-					bits |= 0x0002
-				}
-				indoptionParts[i] = fmt.Sprintf("%d", bits)
-			}
-			indoption := strings.Join(indoptionParts, " ")
-			out = append(out, []string{
-				fmt.Sprintf("%d", idx.OID),       // indexrelid
-				fmt.Sprintf("%d", idx.Table.OID), // indrelid
-				fmt.Sprintf("%d", natts),         // indnatts
-				fmt.Sprintf("%d", nkeyatts),      // indnkeyatts
-				boolStr(idx.Unique),              // indisunique
-				boolStr(idx.NullsNotDistinct),    // indnullsnotdistinct
-				boolStr(idx.Primary),             // indisprimary
-				boolStr(idx.IsExclusion),         // indisexclusion
-				"t",                              // indimmediate
-				boolStr(idx.IsClustered),         // indisclustered (DU-002 slice 320)
-				"t",                              // indisvalid
-				"f",                              // indcheckxmin
-				"t",                              // indisready
-				"t",                              // indislive
-				boolStr(idx.IsReplicaIdentity),   // indisreplident (DU-002 slice 306)
-				indkey,                           // indkey
-				indcollation,                     // indcollation
-				indclass,                         // indclass
-				indoption,                        // indoption
-				"",                               // indexprs (NULL)
-				"",                               // indpred (NULL)
-				"",                               // indcoloptions (NULL)
-			})
-		}
-		// Synthesize the unique btree index PG auto-creates on every TOAST
-		// relation (on chunk_id, chunk_seq). The pg_class virtual builder emits
-		// the matching relkind='i' row named pg_toast_<oid>_index; this row lets
-		//   SELECT indexrelid::regclass FROM pg_index
-		//     WHERE indrelid = (SELECT oid FROM pg_class WHERE relname=<toast rel>)
-		// resolve (reindex-concurrently-toast setup). toastBearingTables uses the
-		// SAME gate as the pg_class TOAST-row emission so the two never diverge.
-		// M0118-0008 TOAST-exposure slice 3.
-		for _, t := range c.toastBearingTables() {
-			toastRelOID := int(t.OID) + toastRelidOffset
-			toastIdxOID := int(t.OID) + toastIndexOidOffset
-			out = append(out, []string{
-				fmt.Sprintf("%d", toastIdxOID), // indexrelid
-				fmt.Sprintf("%d", toastRelOID), // indrelid
-				"2",                            // indnatts (chunk_id, chunk_seq)
-				"2",                            // indnkeyatts
-				"t",                            // indisunique
-				"f",                            // indnullsnotdistinct
-				"f",                            // indisprimary
-				"f",                            // indisexclusion
-				"t",                            // indimmediate
-				"f",                            // indisclustered
-				"t",                            // indisvalid
-				"f",                            // indcheckxmin
-				"t",                            // indisready
-				"t",                            // indislive
-				"f",                            // indisreplident
-				"1 2",                          // indkey (chunk_id=1, chunk_seq=2)
-				"0 0",                          // indcollation (int4 columns: no collation)
-				"1978 1978",                    // indclass (int4_ops btree)
-				"0 0",                          // indoption
-				"",                             // indexprs (NULL)
-				"",                             // indpred (NULL)
-				"",                             // indcoloptions (NULL)
-			})
-		}
-		return out
+		return c.PGIndexRowsForDBOid(DefaultDBOid)
 	}
 	c.ns(DefaultDBOid).tables["pg_catalog.pg_index"] = pgIndexCatalog
 

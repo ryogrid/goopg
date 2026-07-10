@@ -123,6 +123,11 @@ func (o *valuesOp) Open(ctx *Context) error {
 			// tables'/indexes' constraints, not always DefaultDBOid's —
 			// mirrors the pg_class branch above. M0122-0007 4e follow-up 25.
 			o.rows = rematerialiseVirtualRowsFromStrings(tbl, ctx.PgConstraintRows())
+		} else if tbl.Name == "pg_index" && ctx != nil && ctx.PgIndexRows != nil {
+			// pg_index must list the connecting database's own indexes, not
+			// always DefaultDBOid's — mirrors the pg_constraint branch
+			// above. M0122-0007 4e follow-up 26.
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, ctx.PgIndexRows())
 		} else if tbl.VirtualRows != nil {
 			o.rows = rematerialiseVirtualRows(o.plan)
 		}
