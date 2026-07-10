@@ -570,3 +570,68 @@ func pgDependRowsContainAttrdefToSeq(rows [][]string, seqOID uint32) bool {
 	}
 	return false
 }
+
+// TestPgInheritsRowsScopedToConnectionDBOid mirrors
+// TestPgDependRowsScopedToConnectionDBOid above for the pg_inherits catalog
+// table (M0122-0007 4e follow-up 28): a partition parent/child pair created
+// under one dbOid must not leak into another dbOid's pg_inherits rows.
+func TestPgInheritsRowsScopedToConnectionDBOid(t *testing.T) {
+	const otherDBOid = 7011
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+
+	ctx.CurrentDatabaseOid = catalog.DefaultDBOid
+	if err := runDDL(t, ctx, "CREATE TABLE only_in_default (id int) PARTITION BY RANGE(id)"); err != nil {
+		t.Fatalf("CREATE TABLE only_in_default: %v", err)
+	}
+	if err := runDDL(t, ctx, "CREATE TABLE only_in_default_p1 PARTITION OF only_in_default FOR VALUES FROM (1) TO (100)"); err != nil {
+		t.Fatalf("CREATE TABLE only_in_default_p1: %v", err)
+	}
+	ctx.CurrentDatabaseOid = otherDBOid
+	if err := runDDL(t, ctx, "CREATE TABLE only_in_other (id int) PARTITION BY RANGE(id)"); err != nil {
+		t.Fatalf("CREATE TABLE only_in_other: %v", err)
+	}
+	if err := runDDL(t, ctx, "CREATE TABLE only_in_other_p1 PARTITION OF only_in_other FOR VALUES FROM (1) TO (100)"); err != nil {
+		t.Fatalf("CREATE TABLE only_in_other_p1: %v", err)
+	}
+
+	im, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		t.Fatalf("ctx.Catalog is %T, want *catalog.InMemory", ctx.Catalog)
+	}
+
+	defaultChild, ok := im.LookupTable(parser.ObjectName{Name: "only_in_default_p1"}, catalog.DefaultDBOid)
+	if !ok {
+		t.Fatal("LookupTable(only_in_default_p1, DefaultDBOid) not found")
+	}
+	otherChild, ok := im.LookupTable(parser.ObjectName{Name: "only_in_other_p1"}, otherDBOid)
+	if !ok {
+		t.Fatal("LookupTable(only_in_other_p1, otherDBOid) not found")
+	}
+
+	defaultRows := im.PGInheritsRowsForDBOid(catalog.DefaultDBOid)
+	if !pgInheritsRowsContainInhrelid(defaultRows, defaultChild.OID) {
+		t.Fatal("DefaultDBOid's pg_inherits rows are missing only_in_default_p1's parent-child row")
+	}
+	if pgInheritsRowsContainInhrelid(defaultRows, otherChild.OID) {
+		t.Fatal("DefaultDBOid's pg_inherits rows include only_in_other_p1's parent-child row, a table created under a distinct dbOid")
+	}
+
+	otherRows := im.PGInheritsRowsForDBOid(otherDBOid)
+	if !pgInheritsRowsContainInhrelid(otherRows, otherChild.OID) {
+		t.Fatal("otherDBOid's pg_inherits rows are missing only_in_other_p1's parent-child row")
+	}
+	if pgInheritsRowsContainInhrelid(otherRows, defaultChild.OID) {
+		t.Fatal("otherDBOid's pg_inherits rows include only_in_default_p1's parent-child row, a table created under DefaultDBOid")
+	}
+}
+
+func pgInheritsRowsContainInhrelid(rows [][]string, childOID uint32) bool {
+	want := fmt.Sprintf("%d", childOID)
+	for _, r := range rows {
+		if len(r) > 0 && r[0] == want {
+			return true
+		}
+	}
+	return false
+}

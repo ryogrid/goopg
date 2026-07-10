@@ -6920,6 +6920,52 @@ mirroring M0119's ledger `status` column.
       PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
       `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
       failed transactions, all 3 pgbench workloads).
+  - [x] `M0122-0007` follow-up 28 (2026-07-10, this loop) — **fixed the next
+      highest-value single sibling builder follow-up 27 flagged:
+      `pg_inherits` row-content.** Extracted `pg_inherits.VirtualRows`'s
+      inline closure into new exported
+      `catalog.InMemory.PGInheritsRowsForDBOid(dbOid uint32) [][]string`,
+      parameterizing both of its `c.ns(DefaultDBOid)` references (the
+      partition/legacy-inheritance table parent-child loop and the
+      partitioned-index parent-child loop) to `c.ns(dbOid)`. The registered
+      closure now just calls `PGInheritsRowsForDBOid(DefaultDBOid)`,
+      byte-identical default behavior. Wired new per-connection
+      `executor.Context.PgInheritsRows func() [][]string` field (mirroring
+      `PgDependRows`), set in `internal/server/dispatch.go`'s
+      `wireExtensionRows` (new `pgInheritsRowLister` interface), consumed by
+      a new `tbl.Name == "pg_inherits"` branch in
+      `internal/executor/operators.go`'s `valuesOp.Open`. New test
+      `TestPgInheritsRowsScopedToConnectionDBOid`
+      (`internal/executor/fk_dbid_routing_test.go`), mirroring
+      `TestPgDependRowsScopedToConnectionDBOid`: a `PARTITION BY
+      RANGE`/`PARTITION OF` parent-child pair under each of two distinct
+      dbOids, resolved via `LookupTable`, asserted never to cross-leak their
+      `pg_inherits` rows (by `inhrelid`). Live end-to-end verified against a
+      real `cmd/goopg` binary + real `psql`: `CREATE DATABASE freshinh1` →
+      connect → `CREATE TABLE part_a (id int) PARTITION BY RANGE(id); CREATE
+      TABLE part_a_p1 PARTITION OF part_a FOR VALUES FROM (1) TO (100)` →
+      `freshinh1`'s `pg_inherits` shows exactly its own 1 row while
+      `postgres`'s shows 0; then a second, distinct partition pair
+      (`part_b`/`part_b_p1`) created in `postgres` shows exactly its own 1
+      row while `freshinh1`'s row stays unchanged — no cross-database leak
+      either direction. Collaterally reconfirmed (not fixed, own
+      already-open deferral entry): `inhrelid::regclass` on the live server
+      still prints the raw numeric OID rather than the table name — the
+      `oid::regclass` cast gap. **Remaining scope (deferred, own future
+      loops):** 7 sibling builders still row-content-`DefaultDBOid`-only —
+      `pg_statistic_ext`, `pg_policy`, `pg_trigger`, `pg_rewrite`,
+      `information_schema.routines`/`parameters`/`routine_*_usage`,
+      `pg_foreign_table`; `pg_sequence`/`pg_sequences`/
+      `information_schema.sequences`, `pg_attribute`/`pg_type`, and the
+      `oid::regclass` cast gap remain separately flagged. Design doc updated
+      (new "pg_inherits row-content" residual-gap subsection);
+      `docs/design/README.md` row extended; deferral ledger row appended
+      ("pg_inherits per-dbOid content"). Gates: `go build ./...`/`go vet
+      ./...` clean; `go test ./internal/catalog/... ./internal/executor/...
+      ./internal/server/... ./internal/planner/...` PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed transactions, all 3 pgbench workloads).
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,

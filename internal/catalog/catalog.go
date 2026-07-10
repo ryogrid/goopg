@@ -8050,57 +8050,7 @@ func (c *InMemory) registerSystemTables() {
 		OID: 2611,
 	}
 	pgInherits.VirtualRows = func() [][]string {
-		c.mu.RLock()
-		defer c.mu.RUnlock()
-		var out [][]string
-		parentSeq := make(map[uint32]int)
-		for _, tbl := range c.ns(DefaultDBOid).tables {
-			if tbl.Virtual {
-				continue
-			}
-			// Partition children: one row per child → its partition parent.
-			if tbl.PartitionParentOID != 0 {
-				parentSeq[tbl.PartitionParentOID]++
-				seq := parentSeq[tbl.PartitionParentOID]
-				out = append(out, []string{
-					fmt.Sprintf("%d", tbl.OID),
-					fmt.Sprintf("%d", tbl.PartitionParentOID),
-					fmt.Sprintf("%d", seq),
-					"f",
-				})
-				continue
-			}
-			// Legacy inheritance children: one row per (child, parent) pair in
-			// declaration order, so inhseqno matches the INHERITS (...) list and
-			// pg_dump re-emits the clause. DU-002 slice 170.
-			for i, parentOID := range tbl.InheritsParentOIDs {
-				out = append(out, []string{
-					fmt.Sprintf("%d", tbl.OID),
-					fmt.Sprintf("%d", parentOID),
-					fmt.Sprintf("%d", i+1),
-					"f",
-				})
-			}
-		}
-		// Emit index partition rows: each index with PartitionParentOID set is a
-		// partition child of its parent index. These rows enable the join pattern:
-		//   pg_index LEFT JOIN pg_inherits ON (indexrelid = inhrelid)
-		// used by indexing.sql to discover partitioned-index parent/child chains.
-		idxParentSeq := make(map[uint32]int)
-		for _, idx := range c.ns(DefaultDBOid).indexes {
-			if idx.PartitionParentOID == 0 {
-				continue
-			}
-			idxParentSeq[idx.PartitionParentOID]++
-			seq := idxParentSeq[idx.PartitionParentOID]
-			out = append(out, []string{
-				fmt.Sprintf("%d", idx.OID),
-				fmt.Sprintf("%d", idx.PartitionParentOID),
-				fmt.Sprintf("%d", seq),
-				"f",
-			})
-		}
-		return out
+		return c.PGInheritsRowsForDBOid(DefaultDBOid)
 	}
 	c.ns(DefaultDBOid).tables["pg_catalog.pg_inherits"] = pgInherits
 
@@ -12932,6 +12882,68 @@ func (c *InMemory) PGDependRowsForDBOid(dbOid uint32) [][]string {
 		})
 	}
 	return rows
+}
+
+// PGInheritsRowsForDBOid builds the pg_inherits catalog row-set for dbOid's
+// own inheritance/partition parent-child relationships (mirrors
+// PGIndexRowsForDBOid's per-connection dbOid scoping above).
+// registerSystemTables's VirtualRows closure calls this with DefaultDBOid so
+// every existing caller (server dispatch without a per-connection
+// PgInheritsRows wire-up, every test) sees byte-identical behavior; a
+// per-connection dbOid is wired in via executor.Context.PgInheritsRows
+// (internal/server/dispatch.go's wireExtensionRows). M0122-0007 4e follow-up 28.
+func (c *InMemory) PGInheritsRowsForDBOid(dbOid uint32) [][]string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	var out [][]string
+	parentSeq := make(map[uint32]int)
+	for _, tbl := range c.ns(dbOid).tables {
+		if tbl.Virtual {
+			continue
+		}
+		// Partition children: one row per child → its partition parent.
+		if tbl.PartitionParentOID != 0 {
+			parentSeq[tbl.PartitionParentOID]++
+			seq := parentSeq[tbl.PartitionParentOID]
+			out = append(out, []string{
+				fmt.Sprintf("%d", tbl.OID),
+				fmt.Sprintf("%d", tbl.PartitionParentOID),
+				fmt.Sprintf("%d", seq),
+				"f",
+			})
+			continue
+		}
+		// Legacy inheritance children: one row per (child, parent) pair in
+		// declaration order, so inhseqno matches the INHERITS (...) list and
+		// pg_dump re-emits the clause. DU-002 slice 170.
+		for i, parentOID := range tbl.InheritsParentOIDs {
+			out = append(out, []string{
+				fmt.Sprintf("%d", tbl.OID),
+				fmt.Sprintf("%d", parentOID),
+				fmt.Sprintf("%d", i+1),
+				"f",
+			})
+		}
+	}
+	// Emit index partition rows: each index with PartitionParentOID set is a
+	// partition child of its parent index. These rows enable the join pattern:
+	//   pg_index LEFT JOIN pg_inherits ON (indexrelid = inhrelid)
+	// used by indexing.sql to discover partitioned-index parent/child chains.
+	idxParentSeq := make(map[uint32]int)
+	for _, idx := range c.ns(dbOid).indexes {
+		if idx.PartitionParentOID == 0 {
+			continue
+		}
+		idxParentSeq[idx.PartitionParentOID]++
+		seq := idxParentSeq[idx.PartitionParentOID]
+		out = append(out, []string{
+			fmt.Sprintf("%d", idx.OID),
+			fmt.Sprintf("%d", idx.PartitionParentOID),
+			fmt.Sprintf("%d", seq),
+			"f",
+		})
+	}
+	return out
 }
 
 // CreateTablespace records an in-place tablespace in the runtime registry and

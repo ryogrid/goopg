@@ -138,6 +138,12 @@ func (o *valuesOp) Open(ctx *Context) error {
 			// rows, not always DefaultDBOid's — mirrors the pg_attrdef
 			// branch above. M0122-0007 4e follow-up 27.
 			o.rows = rematerialiseVirtualRowsFromStrings(tbl, ctx.PgDependRows())
+		} else if tbl.Name == "pg_inherits" && ctx != nil && ctx.PgInheritsRows != nil {
+			// pg_inherits must list the connecting database's own
+			// inheritance/partition parent-child rows, not always
+			// DefaultDBOid's — mirrors the pg_depend branch above.
+			// M0122-0007 4e follow-up 28.
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, ctx.PgInheritsRows())
 		} else if tbl.VirtualRows != nil {
 			o.rows = rematerialiseVirtualRows(o.plan)
 		}

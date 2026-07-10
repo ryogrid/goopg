@@ -2028,6 +2028,14 @@ func (s *Server) wireExtensionRows(ectx *executor.Context, dbName string) {
 			return pd.PGDependRowsForDBOid(catalog.NamespaceDBOid(ectx.CurrentDatabaseOid))
 		}
 	}
+	// pg_inherits must likewise reflect the connecting database's own
+	// inheritance/partition parent-child rows, not always DefaultDBOid's.
+	// Mirrors the pg_depend wiring above. M0122-0007 4e follow-up 28.
+	if pih, ok := s.cfg.Catalog.(pgInheritsRowLister); ok {
+		ectx.PgInheritsRows = func() [][]string {
+			return pih.PGInheritsRowsForDBOid(catalog.NamespaceDBOid(ectx.CurrentDatabaseOid))
+		}
+	}
 }
 
 // pgClassRowLister is implemented by catalog.InMemory to expose a
@@ -2071,6 +2079,13 @@ type pgAttrdefRowLister interface {
 
 type pgDependRowLister interface {
 	PGDependRowsForDBOid(dbOid uint32) [][]string
+}
+
+// pgInheritsRowLister is implemented by catalog.InMemory to expose a
+// per-database pg_inherits row-set, mirroring pgDependRowLister above.
+// M0122-0007 4e follow-up 28.
+type pgInheritsRowLister interface {
+	PGInheritsRowsForDBOid(dbOid uint32) [][]string
 }
 
 func undoEnumDDLForRollback(connTx *connTxState, cat catalog.Catalog) {

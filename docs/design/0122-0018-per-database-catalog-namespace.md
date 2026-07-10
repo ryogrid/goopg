@@ -1,6 +1,6 @@
 # Per-database catalog namespace (M0122-0007 slice 4)
 
-Status: accepted (sub-slices 4a, 4b-i, 4b-ii, 4c, 4d-i, 4d-ii-part-1, and 4d-ii-part-2a landed; 4d-ii-part-2b items 1, 2, and 3 all fully landed; 4e's FK-target-resolution, sequence-ownership, and view-constraint-dependency items all landed; `CREATE DATABASE ... TEMPLATE` bounded validation landed 2026-07-10; the pg_class-under-fresh-database gap (name resolution generically, row enumeration for pg_class specifically) landed 2026-07-10, and the pg_indexes/pg_tables, pg_constraint, pg_index, and pg_attrdef/pg_depend row-content follow-ups landed the same day — 8 sibling virtual-table builders plus the real relation-copy mechanism remain planned, see "Remaining 4e work" below)
+Status: accepted (sub-slices 4a, 4b-i, 4b-ii, 4c, 4d-i, 4d-ii-part-1, and 4d-ii-part-2a landed; 4d-ii-part-2b items 1, 2, and 3 all fully landed; 4e's FK-target-resolution, sequence-ownership, and view-constraint-dependency items all landed; `CREATE DATABASE ... TEMPLATE` bounded validation landed 2026-07-10; the pg_class-under-fresh-database gap (name resolution generically, row enumeration for pg_class specifically) landed 2026-07-10, and the pg_indexes/pg_tables, pg_constraint, pg_index, pg_attrdef/pg_depend, and pg_inherits row-content follow-ups landed the same day — 7 sibling virtual-table builders plus the real relation-copy mechanism remain planned, see "Remaining 4e work" below)
 Date: 2026-07-10
 Supersedes: none — extends the "Still open" note in
 `0122-0017-database-ddl-drop-guards.md` and the deferral-ledger rows dated
@@ -1187,6 +1187,39 @@ remaining sibling builders (`pg_inherits`, `pg_statistic_ext`, `pg_policy`,
 `pg_trigger`, `pg_rewrite`, `information_schema.routines`/`parameters`/
 `routine_*_usage`, `pg_foreign_table`) still needing this treatment — each is
 its own bounded future loop.
+
+**`pg_inherits` row-content — FIXED 2026-07-10 (same day, next loop, follow-up
+28).** Single-builder fix, no cross-builder oid-numbering coupling like the
+`pg_attrdef`/`pg_depend` pair had. `pg_inherits.VirtualRows`'s inline closure
+(two `c.ns(DefaultDBOid)` loops: partition/legacy-inheritance table
+parent-child rows, then partitioned-index parent-child rows) was extracted
+into new exported `catalog.InMemory.PGInheritsRowsForDBOid(dbOid uint32)
+[][]string`, parameterizing both `c.ns(DefaultDBOid)` references to
+`c.ns(dbOid)`. The registered closure now just calls
+`PGInheritsRowsForDBOid(DefaultDBOid)`, byte-identical default behavior.
+Wired new per-connection `executor.Context.PgInheritsRows func() [][]string`
+field (mirroring `PgDependRows`), set in `internal/server/dispatch.go`'s
+`wireExtensionRows` (new `pgInheritsRowLister` interface), consumed by a new
+`tbl.Name == "pg_inherits"` branch in `internal/executor/operators.go`'s
+`valuesOp.Open`. Test `TestPgInheritsRowsScopedToConnectionDBOid`
+(`internal/executor/fk_dbid_routing_test.go`), mirroring
+`TestPgDependRowsScopedToConnectionDBOid`: a `PARTITION BY RANGE`/`PARTITION
+OF` parent-child pair under each of two distinct dbOids, never cross-leak
+their `pg_inherits` rows (by `inhrelid`). Live end-to-end verified against a
+real `cmd/goopg` binary + real `psql`: `CREATE DATABASE freshinh1` → connect
+→ `CREATE TABLE part_a (id int) PARTITION BY RANGE(id); CREATE TABLE
+part_a_p1 PARTITION OF part_a FOR VALUES FROM (1) TO (100)` → `freshinh1`'s
+`pg_inherits` shows exactly its own 1 row while `postgres`'s shows 0; then a
+second, distinct partition pair created in `postgres` shows exactly its own 1
+row while `freshinh1`'s stays unchanged — no cross-database leak either
+direction. Collaterally confirmed the `oid::regclass` cast gap is still open
+and unrelated to this fix (`inhrelid::regclass` printed the raw OID, not the
+table name, on the live server). See the 2026-07-10 deferral-ledger row
+("pg_inherits per-dbOid content") for the 7 remaining sibling builders
+(`pg_statistic_ext`, `pg_policy`, `pg_trigger`, `pg_rewrite`,
+`information_schema.routines`/`parameters`/`routine_*_usage`,
+`pg_foreign_table`) still needing this treatment — each is its own bounded
+future loop.
 
 **Remaining 4e work: the `CREATE DATABASE ... TEMPLATE` copy mechanism
 itself** — deep-copying the source dbOid's `catalog.tableNamespace`
