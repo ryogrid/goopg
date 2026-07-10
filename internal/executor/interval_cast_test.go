@@ -83,9 +83,10 @@ func TestIntervalCastFromString(t *testing.T) {
 
 // TestIntervalCastFromStringInvalidSyntax pins the 22007 error PostgreSQL's
 // interval_in raises for a string that isn't a valid interval body. The cast
-// path now accepts multi-field bodies and HH:MM:SS times (unimplemented_feat
-// #5(b)), so only genuinely malformed bodies (unsupported unit, garbage,
-// number-without-unit) must still error instead of silently passing the raw
+// path now accepts multi-field bodies, HH:MM:SS times (unimplemented_feat
+// #5(b)), and a trailing unitless number defaulting to seconds (#5(d-i)), so
+// only genuinely malformed bodies (unsupported unit, garbage, a non-final
+// number with no unit) must still error instead of silently passing the raw
 // string through unparsed.
 func TestIntervalCastFromStringInvalidSyntax(t *testing.T) {
 	ctx, _, cleanup := newDDLFixture(t)
@@ -103,6 +104,13 @@ func TestIntervalCastFromStringInvalidSyntax(t *testing.T) {
 		"SELECT '1 fortnight'::interval FROM t",
 		"SELECT '1 year 2 fortnights'::interval FROM t",
 		"SELECT 'day month'::interval FROM t",
+		// A trailing unitless number defaults to seconds (#5(d-i)), but a
+		// non-final bare number is the ambiguous type-carry case PG rejects,
+		// and a bare number after a time word / seconds unit collides on the
+		// SECOND field mask. All three error in PostgreSQL 18.3.
+		"SELECT '1 2 days'::interval FROM t",
+		"SELECT '1 day 05:00:00 5'::interval FROM t",
+		"SELECT '5 5'::interval FROM t",
 	}
 	for _, sql := range cases {
 		t.Run(sql, func(t *testing.T) {

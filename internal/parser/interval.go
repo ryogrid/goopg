@@ -242,49 +242,89 @@ func parseIntervalTimeToken(tok string) (micros int64, ok bool) {
 //
 // This is the single tokenizer shared by the parser's Form-2 typed-literal
 // path and the executor's `::interval` / CAST path (the sibling paths the
-// practice card warns must not diverge). A bare trailing number with no unit
-// (`interval '5'`) is intentionally NOT accepted here — that is the SQL
-// interval-typmod default-unit case (deferred), so such bodies fall through
-// unchanged. Returns ok=false for any body that doesn't decompose cleanly.
+// practice card warns must not diverge).
+//
+// A unitless number defaults to SECONDS (`interval '5'` → 00:00:05,
+// `interval '1 day 5'` → 1 day 00:00:05), mirroring PostgreSQL's
+// DecodeInterval, whose DTK_NUMBER branch resolves an unspecified field via
+// the typmod `range` switch, falling through to DTK_SECOND for the default
+// full-range typmod (unimplemented_feat #5(d-i)). PostgreSQL scans fields
+// right-to-left carrying the rightmost unit leftward, so the only unitless
+// field that decodes without a field-mask collision is a SINGLE trailing
+// value: two bare numbers, or a bare number before a `<num> <unit>` pair,
+// both re-use the same carried/default field and error (`interval '1 2 days'`,
+// `interval '5 garbage'`). goopg reproduces that by accepting a unitless
+// number only as the FINAL field, and only when the SECOND slot is still free
+// — a preceding time word (`HH:MM[:SS]`, always DTK_TIME_M ⊇ SECOND) or an
+// explicit seconds unit occupies it, making the default-seconds field a
+// collision (`interval '1 day 05:00:00 5'` errors, matching PG).
+//
+// Returns ok=false for any body that doesn't decompose cleanly.
 func ParseIntervalBody(body string) (months, days int32, micros int64, ok bool) {
 	fields := strings.Fields(strings.TrimSpace(body))
 	if len(fields) == 0 {
 		return 0, 0, 0, false
 	}
 	consumedAny := false
+	secondsOccupied := false // SECOND field-mask bit already set by a prior field
 	for i := 0; i < len(fields); i++ {
 		f := fields[i]
 		if strings.ContainsRune(f, ':') {
-			// Time component (HH:MM[:SS]).
+			// Time component (HH:MM[:SS]). PostgreSQL's DecodeTimeForInterval
+			// stamps DTK_TIME_M (HOUR|MINUTE|SECOND) whether or not a seconds
+			// subfield is present, so a time word always occupies the SECOND
+			// slot for the default-unit collision check below.
 			mu, tok := parseIntervalTimeToken(f)
 			if !tok {
 				return 0, 0, 0, false
 			}
 			micros += mu
+			secondsOccupied = true
 			consumedAny = true
 			continue
 		}
-		// Otherwise a numeric magnitude that must be followed by a unit word.
 		val, fval, mok := ParseIntervalMagnitude(f)
 		if !mok {
 			return 0, 0, 0, false
 		}
-		if i+1 >= len(fields) {
-			// Trailing bare number (default-unit / typmod case) — out of scope.
+		// A magnitude followed by a unit word forms a `<num> <unit>` pair.
+		if i+1 < len(fields) {
+			unit, uok := canonicalIntervalUnit(fields[i+1])
+			if !uok {
+				// A non-final magnitude with no following unit word is the
+				// ambiguous type-carry case PostgreSQL rejects (a second bare
+				// number, or one preceding a `<num> <unit>` pair / time word).
+				return 0, 0, 0, false
+			}
+			i++ // consume the unit word
+			m, d, mu, pok := IntervalUnitToParts(val, fval, unit)
+			if !pok {
+				return 0, 0, 0, false
+			}
+			months += m
+			days += d
+			micros += mu
+			if unit == "second" {
+				secondsOccupied = true
+			}
+			consumedAny = true
+			continue
+		}
+		// Trailing unitless magnitude: default to SECONDS per PostgreSQL's
+		// full-range typmod. A collision with an already-occupied SECOND slot
+		// is a bad-format error, exactly as DecodeInterval's `tmask & fmask`
+		// check rejects it.
+		if secondsOccupied {
 			return 0, 0, 0, false
 		}
-		unit, uok := canonicalIntervalUnit(fields[i+1])
-		if !uok {
-			return 0, 0, 0, false
-		}
-		i++ // consume the unit word
-		m, d, mu, pok := IntervalUnitToParts(val, fval, unit)
+		m, d, mu, pok := IntervalUnitToParts(val, fval, "second")
 		if !pok {
 			return 0, 0, 0, false
 		}
 		months += m
 		days += d
 		micros += mu
+		secondsOccupied = true
 		consumedAny = true
 	}
 	if !consumedAny {

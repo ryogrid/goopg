@@ -323,6 +323,57 @@ func TestWeekDecadeCenturyIntervals(t *testing.T) {
 	}
 }
 
+// TestTrailingBareNumberDefaultsToSeconds covers a unitless interval field
+// defaulting to SECONDS (unimplemented_feat #5(d-i)) — PostgreSQL's
+// DecodeInterval resolves an unspecified field via the default full-range
+// typmod, which falls through to DTK_SECOND. The value is accepted only as a
+// single trailing field with the SECOND slot still free; a non-final bare
+// number, or one after a time word / explicit seconds unit, is a field-mask
+// collision that errors (see TestIntervalCastFromStringInvalidSyntax). Every
+// `want` was captured byte-for-byte from a real PostgreSQL 18.3 instance;
+// both the typed-literal and `::interval`/CAST sibling paths are exercised.
+func TestTrailingBareNumberDefaultsToSeconds(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+	if err := runDDL(t, ctx, "CREATE TABLE t (id int)"); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	if err := runDDL(t, ctx, "INSERT INTO t VALUES (1)"); err != nil {
+		t.Fatalf("INSERT: %v", err)
+	}
+	cases := []struct{ sql, want string }{
+		// Lone bare number → seconds, normalised into HH:MM:SS.
+		{"SELECT interval '5'", "00:00:05"},
+		{"SELECT interval '90'", "00:01:30"},
+		{"SELECT interval '3600'", "01:00:00"},
+		{"SELECT interval '-5'", "-00:00:05"},
+		// Fractional bare number spills the fraction into micros.
+		{"SELECT interval '1.5'", "00:00:01.5"},
+		{"SELECT interval '0.5'", "00:00:00.5"},
+		// Trailing bare number after date/word fields (no seconds slot taken).
+		{"SELECT interval '1 day 5'", "1 day 00:00:05"},
+		{"SELECT interval '1 mon 5'", "1 mon 00:00:05"},
+		{"SELECT interval '1 year 5'", "1 year 00:00:05"},
+		{"SELECT interval '1 day 2 hours 5'", "1 day 02:00:05"},
+		{"SELECT interval '5 minute 5'", "00:05:05"},
+		// A millisecond unit occupies a distinct field mask, so a trailing bare
+		// second is still allowed (matches PG's per-field bit tracking).
+		{"SELECT interval '1 ms 5'", "00:00:05.001"},
+		// Cast / :: forms share the same tokenizer.
+		{"SELECT '5'::interval", "00:00:05"},
+		{"SELECT CAST('90' AS interval)", "00:01:30"},
+	}
+	for _, c := range cases {
+		rows := runQuery(t, ctx, c.sql+" FROM t")
+		if len(rows) != 1 || len(rows[0]) != 1 {
+			t.Fatalf("%s: expected 1x1 result, got %v", c.sql, rows)
+		}
+		if got := rows[0][0].Format(); got != c.want {
+			t.Errorf("%s = %q, want %q", c.sql, got, c.want)
+		}
+	}
+}
+
 // TestParseIntervalBodySingleFieldMatchesUnitToParts guards the sibling-path
 // invariant that the multi-field tokenizer (parser.ParseIntervalBody) and the
 // per-field spill helper (parser.IntervalUnitToParts, used by the single-field
