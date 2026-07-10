@@ -7171,6 +7171,63 @@ mirroring M0119's ledger `status` column.
       ./internal/planner/...` PASS; `scripts/tpch-spotcheck.sh` PASS
       (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh`
       PASS (0 failed transactions, all 3 pgbench workloads).
+  - [x] `M0122-0007` follow-up 34 (2026-07-10, this loop) — **scoped
+      `pg_sequence` to the connection's dbOid.** Unlike the `c.foreignServers`/
+      `information_schema.routines` gaps this epic previously ruled out as
+      needing a bigger registry redesign, `seqRegistry`
+      (`internal/executor/operators_sequence.go`) turned out to already be
+      fully dbOid-keyed (`RegisterSequence`/`LookupSequence`/... all take a
+      trailing `dbOid ...uint32`, resolved via `resolveSeqDBOid`) — the only
+      gap was `catalog.SequenceParamsFunc`'s own signature
+      (`func(qualifiedName string) (SeqParams, bool)`, no dbOid parameter),
+      which made every lookup implicitly hit `resolveSeqDBOid(nil)` ==
+      `DefaultDBOid`'s registry entry regardless of which dbOid's sequence
+      was being enumerated. Gave `SequenceParamsFunc` (and its executor-side
+      implementation `sequenceParamsForCatalog`) a `dbOid uint32` parameter;
+      `LookupSequence(qualifiedName, dbOid)` now receives the right dbOid at
+      both of its 2 catalog.go call sites. Extracted
+      `pgSequence.VirtualRows` into new `catalog.InMemory.PGSequenceRowsForDBOid(dbOid uint32)`
+      (mirroring the pg_foreign_table/pg_trigger/pg_rewrite precedent exactly:
+      registered closure now just calls `...RowsForDBOid(DefaultDBOid)`,
+      byte-identical default behavior) and fixed `PGDependRowsForDBOid`'s own
+      pre-existing `SequenceParamsFunc(...)` call (follow-up 27 already
+      dbOid-parameterized this function's table enumeration via `c.ns(dbOid)`,
+      but its `SequenceParamsFunc` lookup silently still hit DefaultDBOid's
+      registry — a latent same-loop-family bug this fix also closes, so a
+      non-default dbOid's OWNED-BY `pg_depend` row can now actually resolve).
+      Wired new per-connection `executor.Context.PgSequenceRows func() [][]string`
+      field, set in `internal/server/dispatch.go`'s `wireExtensionRows` (new
+      `pgSequenceRowLister` interface), consumed by a new
+      `tbl.Name == "pg_sequence"` branch in `internal/executor/operators.go`'s
+      `valuesOp.Open`. New `TestPgSequenceRowsScopedToConnectionDBOid`
+      (`internal/executor/fk_dbid_routing_test.go`): two sequences under two
+      distinct dbOids, asserts each dbOid's `PGSequenceRowsForDBOid` shows only
+      its own sequence with the right `seqstart`, never leaking the other's.
+      Live end-to-end verified against a real `cmd/goopg` binary + real
+      `psql`: two `CREATE DATABASE`s, one `CREATE SEQUENCE` each with distinct
+      START/INCREMENT values — each database's `pg_sequence` (`count(*)=1`)
+      shows only its own sequence with its own params, no cross-leak either
+      direction. **Remaining M0122-0007 scope (deferred, own future loops):**
+      `pg_sequences`/`information_schema.sequences`
+      (`internal/initdb/pg_sequences_view.go`/
+      `information_schema_sequences_view.go`, both reading
+      `executor.AllSequenceInfos()` with no dbOid — same zero-arg `func()
+      [][]string` VirtualRows shape as pg_sequence had, not yet fixed);
+      `pg_statistic_ext`/`information_schema.routines` (bigger registry
+      redesign); `c.foreignServers` (also touches WAL format); the real
+      `CREATE DATABASE ... TEMPLATE` relation-copy mechanism itself. Deferral
+      ledger: flipped the "sequence ownership follow-on" row to `resolved`
+      (SequenceParamsFunc dbOid gap is what it tracked) and appended a new row
+      for the pg_sequences/information_schema.sequences remainder. Design doc
+      gained a new subsection; `docs/design/README.md` row extended. Gates:
+      `go build ./...`/`go vet ./...` clean; `go test ./internal/catalog/...
+      ./internal/executor/... ./internal/server/... ./internal/planner/...`
+      PASS (internal/server's first run hit an unrelated flaky logical-
+      replication timing FAIL — "dial refused" — reproduced clean on 3
+      subsequent `-count=1` reruns, not caused by this loop's change);
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed transactions, all 3 pgbench workloads).
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,

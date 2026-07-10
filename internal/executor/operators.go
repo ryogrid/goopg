@@ -164,6 +164,11 @@ func (o *valuesOp) Open(ctx *Context) error {
 			// foreign tables, not always DefaultDBOid's — mirrors the
 			// pg_rewrite branch above. M0122-0007 4e follow-up 32.
 			o.rows = rematerialiseVirtualRowsFromStrings(tbl, ctx.PgForeignTableRows())
+		} else if tbl.Name == "pg_sequence" && ctx != nil && ctx.PgSequenceRows != nil {
+			// pg_sequence must list the connecting database's own
+			// sequences, not always DefaultDBOid's — mirrors the
+			// pg_foreign_table branch above. M0122-0007 4e follow-up 34.
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, ctx.PgSequenceRows())
 		} else if tbl.VirtualRows != nil {
 			o.rows = rematerialiseVirtualRows(o.plan)
 		}

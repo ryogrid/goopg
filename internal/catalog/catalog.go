@@ -69,10 +69,15 @@ type SeqParams struct {
 }
 
 // SequenceParamsFunc is set by the executor at init. Given a sequence's
-// schema-qualified name (e.g. "public.s") it returns that sequence's
-// pg_sequence parameters. nil until the executor registers it (catalog-only
-// unit tests then see an empty pg_sequence). M0110-0001 (DU-002 slice 115).
-var SequenceParamsFunc func(qualifiedName string) (SeqParams, bool)
+// schema-qualified name (e.g. "public.s") and the owning connection's dbOid,
+// it returns that sequence's pg_sequence parameters. nil until the executor
+// registers it (catalog-only unit tests then see an empty pg_sequence). The
+// dbOid parameter was added by M0122-0007 4e follow-up 34 so pg_sequence and
+// pg_depend's sequence-ownership rows can resolve a CREATE DATABASE'd
+// connection's own sequences instead of always DefaultDBOid's; every
+// existing call site before that follow-up passed no dbOid and implicitly
+// meant DefaultDBOid. M0110-0001 (DU-002 slice 115).
+var SequenceParamsFunc func(qualifiedName string, dbOid uint32) (SeqParams, bool)
 
 // Type is the textual type tag plus an optional typmod argument list.
 // v0 keeps types as strings so the planner doesn't need a real type
@@ -9990,45 +9995,7 @@ func (c *InMemory) registerSystemTables() {
 	// registry via SequenceParamsFunc. pg_dump's getSequences comma-joins this
 	// with pg_get_sequence_data(seqrelid). M0110-0001 (DU-002 slice 115).
 	pgSequence.VirtualRows = func() [][]string {
-		if SequenceParamsFunc == nil {
-			return nil
-		}
-		c.mu.RLock()
-		defer c.mu.RUnlock()
-		keys := make([]string, 0, len(c.ns(DefaultDBOid).tables))
-		for k, t := range c.ns(DefaultDBOid).tables {
-			if t.IsSequence {
-				keys = append(keys, k)
-			}
-		}
-		sort.Strings(keys)
-		rows := make([][]string, 0, len(keys))
-		for _, k := range keys {
-			t := c.ns(DefaultDBOid).tables[k]
-			schema := t.Schema
-			if schema == "" {
-				schema = "public"
-			}
-			p, ok := SequenceParamsFunc(schema + "." + t.Name)
-			if !ok {
-				continue
-			}
-			cyc := "f"
-			if p.Cycle {
-				cyc = "t"
-			}
-			rows = append(rows, []string{
-				strconv.Itoa(int(t.OID)),           // 0: seqrelid
-				strconv.Itoa(int(p.TypeOID)),       // 1: seqtypid
-				strconv.FormatInt(p.Start, 10),     // 2: seqstart
-				strconv.FormatInt(p.Increment, 10), // 3: seqincrement
-				strconv.FormatInt(p.Max, 10),       // 4: seqmax
-				strconv.FormatInt(p.Min, 10),       // 5: seqmin
-				strconv.FormatInt(p.Cache, 10),     // 6: seqcache
-				cyc,                                // 7: seqcycle
-			})
-		}
-		return rows
+		return c.PGSequenceRowsForDBOid(DefaultDBOid)
 	}
 	c.ns(DefaultDBOid).tables["pg_catalog.pg_sequence"] = pgSequence
 
@@ -12425,13 +12392,14 @@ func (c *InMemory) tablespaceVirtualRows() [][]string {
 // caller's PGAttrdefRowsForDBOid(dbOid) so the two views' oid numbering stays
 // in lockstep (see PGAttrdefRowsForDBOid's doc comment). Two class of rows
 // stay dbOid-agnostic pending their own dedicated fix, matching the
-// PGConstraintRowsForDBOid precedent of leaving c.domains global: the
-// sequence-ownership lookup (SequenceParamsFunc, keyed only by qualified
-// name — the same registry pg_sequences already reads, tracked by the
-// separate "sequence ownership follow-on" deferral) and the AM operator-class
-// member rows (c.amOpMembers/c.amProcMembers — operator classes/families are
-// not yet namespace-scoped at all, an M0122-0007 4e non-goal). M0122-0007 4e
-// follow-up 27.
+// PGConstraintRowsForDBOid precedent of leaving c.domains global: the AM
+// operator-class member rows (c.amOpMembers/c.amProcMembers — operator
+// classes/families are not yet namespace-scoped at all, an M0122-0007 4e
+// non-goal). M0122-0007 4e follow-up 27. The sequence-ownership lookup
+// (SequenceParamsFunc) below now DOES pass this function's own dbOid — fixed
+// by follow-up 34, which also gave PGSequenceRowsForDBOid the same dbOid
+// param; pg_sequences/information_schema.sequences (internal/initdb, reading
+// executor.AllSequenceInfos() with no dbOid) remain separately deferred.
 //
 // The rows built here cover pg_depend's non-empty dependency classes: the
 // AUTO ('a') link from an OWNED-BY sequence to the column it is tied to, plus
@@ -12487,7 +12455,7 @@ func (c *InMemory) PGDependRowsForDBOid(dbOid uint32) [][]string {
 		if seqSchema == "" {
 			seqSchema = "public"
 		}
-		p, ok := SequenceParamsFunc(seqSchema + "." + t.Name)
+		p, ok := SequenceParamsFunc(seqSchema+"."+t.Name, dbOid)
 		if !ok || p.OwnedBy == "" {
 			continue
 		}
@@ -12917,6 +12885,56 @@ func (c *InMemory) PGTriggerRowsForDBOid(dbOid uint32) [][]string {
 		}
 	}
 	return out
+}
+
+// PGSequenceRowsForDBOid builds the pg_sequence catalog row-set for dbOid's
+// own sequences (mirrors PGTriggerRowsForDBOid's per-connection dbOid scoping
+// above). registerSystemTables's VirtualRows closure calls this with
+// DefaultDBOid so every existing caller (server dispatch without a
+// per-connection PgSequenceRows wire-up, every test) sees byte-identical
+// behavior; a per-connection dbOid is wired in via
+// executor.Context.PgSequenceRows (internal/server/dispatch.go's
+// wireExtensionRows). M0122-0007 4e follow-up 34.
+func (c *InMemory) PGSequenceRowsForDBOid(dbOid uint32) [][]string {
+	if SequenceParamsFunc == nil {
+		return nil
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	keys := make([]string, 0, len(c.ns(dbOid).tables))
+	for k, t := range c.ns(dbOid).tables {
+		if t.IsSequence {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	rows := make([][]string, 0, len(keys))
+	for _, k := range keys {
+		t := c.ns(dbOid).tables[k]
+		schema := t.Schema
+		if schema == "" {
+			schema = "public"
+		}
+		p, ok := SequenceParamsFunc(schema+"."+t.Name, dbOid)
+		if !ok {
+			continue
+		}
+		cyc := "f"
+		if p.Cycle {
+			cyc = "t"
+		}
+		rows = append(rows, []string{
+			strconv.Itoa(int(t.OID)),           // 0: seqrelid
+			strconv.Itoa(int(p.TypeOID)),       // 1: seqtypid
+			strconv.FormatInt(p.Start, 10),     // 2: seqstart
+			strconv.FormatInt(p.Increment, 10), // 3: seqincrement
+			strconv.FormatInt(p.Max, 10),       // 4: seqmax
+			strconv.FormatInt(p.Min, 10),       // 5: seqmin
+			strconv.FormatInt(p.Cache, 10),     // 6: seqcache
+			cyc,                                // 7: seqcycle
+		})
+	}
+	return rows
 }
 
 // PGRewriteRowsForDBOid builds the pg_rewrite catalog row-set for dbOid's own

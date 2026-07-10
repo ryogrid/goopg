@@ -973,3 +973,71 @@ func TestRegclassCastScopedToConnectionDBOid(t *testing.T) {
 		t.Errorf("DefaultDBOid: 'shared_name'::regclass::oid = %d, want its own %d (got otherDBOid's %d instead?)", got, sharedDefault.OID, sharedOther.OID)
 	}
 }
+
+// TestPgSequenceRowsScopedToConnectionDBOid mirrors
+// TestPgForeignTableRowsScopedToConnectionDBOid above for the pg_sequence
+// catalog table (M0122-0007 4e follow-up 34): a sequence created under one
+// dbOid must not leak into another dbOid's pg_sequence rows, and each
+// database's SequenceParamsFunc lookup (start/increment/etc.) must resolve
+// against its OWN seqRegistry entry rather than always DefaultDBOid's.
+func TestPgSequenceRowsScopedToConnectionDBOid(t *testing.T) {
+	const otherDBOid = 7018
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+
+	ctx.CurrentDatabaseOid = catalog.DefaultDBOid
+	if err := runDDL(t, ctx, "CREATE SEQUENCE seq_default START 10 INCREMENT 2"); err != nil {
+		t.Fatalf("CREATE SEQUENCE seq_default: %v", err)
+	}
+	ctx.CurrentDatabaseOid = otherDBOid
+	if err := runDDL(t, ctx, "CREATE SEQUENCE seq_other START 100 INCREMENT 5"); err != nil {
+		t.Fatalf("CREATE SEQUENCE seq_other: %v", err)
+	}
+
+	im, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		t.Fatalf("ctx.Catalog is %T, want *catalog.InMemory", ctx.Catalog)
+	}
+	seqDefault, ok := im.LookupTable(parser.ObjectName{Name: "seq_default"}, catalog.DefaultDBOid)
+	if !ok {
+		t.Fatal("seq_default not found under DefaultDBOid")
+	}
+	seqOther, ok := im.LookupTable(parser.ObjectName{Name: "seq_other"}, otherDBOid)
+	if !ok {
+		t.Fatal("seq_other not found under otherDBOid")
+	}
+
+	defaultRows := im.PGSequenceRowsForDBOid(catalog.DefaultDBOid)
+	defaultRow, ok := pgSequenceRowByRelid(defaultRows, seqDefault.OID)
+	if !ok {
+		t.Fatal("DefaultDBOid's pg_sequence rows are missing seq_default")
+	}
+	if defaultRow[2] != "10" {
+		t.Errorf("DefaultDBOid's seq_default seqstart = %q, want %q", defaultRow[2], "10")
+	}
+	if _, ok := pgSequenceRowByRelid(defaultRows, seqOther.OID); ok {
+		t.Fatal("DefaultDBOid's pg_sequence rows include seq_other, a sequence created under a distinct dbOid")
+	}
+
+	otherRows := im.PGSequenceRowsForDBOid(otherDBOid)
+	otherRow, ok := pgSequenceRowByRelid(otherRows, seqOther.OID)
+	if !ok {
+		t.Fatal("otherDBOid's pg_sequence rows are missing seq_other")
+	}
+	if otherRow[2] != "100" {
+		t.Errorf("otherDBOid's seq_other seqstart = %q, want %q", otherRow[2], "100")
+	}
+	if _, ok := pgSequenceRowByRelid(otherRows, seqDefault.OID); ok {
+		t.Fatal("otherDBOid's pg_sequence rows include seq_default, a sequence created under DefaultDBOid")
+	}
+}
+
+func pgSequenceRowByRelid(rows [][]string, oid uint32) ([]string, bool) {
+	want := strconv.FormatUint(uint64(oid), 10)
+	for _, r := range rows {
+		if len(r) > 0 && r[0] == want {
+			return r, true
+		}
+	}
+	return nil, false
+}

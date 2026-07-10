@@ -1,6 +1,6 @@
 # Per-database catalog namespace (M0122-0007 slice 4)
 
-Status: accepted (sub-slices 4a, 4b-i, 4b-ii, 4c, 4d-i, 4d-ii-part-1, and 4d-ii-part-2a landed; 4d-ii-part-2b items 1, 2, and 3 all fully landed; 4e's FK-target-resolution, sequence-ownership, and view-constraint-dependency items all landed; `CREATE DATABASE ... TEMPLATE` bounded validation landed 2026-07-10; the pg_class-under-fresh-database gap (name resolution generically, row enumeration for pg_class specifically) landed 2026-07-10, and the pg_indexes/pg_tables, pg_constraint, pg_index, pg_attrdef/pg_depend, pg_inherits, pg_policy, pg_trigger, pg_rewrite, and pg_foreign_table row-content follow-ups landed the same day, plus the `oid::regclass`/`'name'::regclass` cast-direction dbOid-scoping gap (follow-up 33) — 2 sibling virtual-table builders (pg_statistic_ext, information_schema.routines/parameters/routine_*_usage) plus the c.foreignServers/SequenceParamsFunc registry-dbOid-key gaps plus the real relation-copy mechanism remain planned, see "Remaining 4e work" below)
+Status: accepted (sub-slices 4a, 4b-i, 4b-ii, 4c, 4d-i, 4d-ii-part-1, and 4d-ii-part-2a landed; 4d-ii-part-2b items 1, 2, and 3 all fully landed; 4e's FK-target-resolution, sequence-ownership, and view-constraint-dependency items all landed; `CREATE DATABASE ... TEMPLATE` bounded validation landed 2026-07-10; the pg_class-under-fresh-database gap (name resolution generically, row enumeration for pg_class specifically) landed 2026-07-10, and the pg_indexes/pg_tables, pg_constraint, pg_index, pg_attrdef/pg_depend, pg_inherits, pg_policy, pg_trigger, pg_rewrite, pg_foreign_table, and pg_sequence row-content follow-ups landed the same day, plus the `oid::regclass`/`'name'::regclass` cast-direction dbOid-scoping gap (follow-up 33) — 2 sibling virtual-table builders (pg_statistic_ext, information_schema.routines/parameters/routine_*_usage) plus pg_sequences/information_schema.sequences (follow-up 34's narrowed remainder) plus the c.foreignServers registry-dbOid-key gap plus the real relation-copy mechanism remain planned, see "Remaining 4e work" below)
 Date: 2026-07-10
 Supersedes: none — extends the "Still open" note in
 `0122-0017-database-ddl-drop-guards.md` and the deferral-ledger rows dated
@@ -1360,6 +1360,36 @@ an unresolved literal rather than another database's OID); the `<oid>::regclass`
 direction is covered both ways with distinctly-named tables. `NamespaceDBOid(0)`
 returns `DefaultDBOid` (existing helper, unchanged), so every pre-existing
 `ctx.CurrentDatabaseOid == 0` test context is byte-identical to before this fix.
+
+**`pg_sequence` row-content fixed (2026-07-10, follow-up 34):** unlike
+`pg_statistic_ext`/`c.foreignServers`/`information_schema.routines` (all ruled
+out above as needing a bigger registry redesign), `seqRegistry`
+(`internal/executor/operators_sequence.go`) turned out to already be fully
+dbOid-keyed by the earlier "sequence ownership" landing — the only remaining
+gap was `catalog.SequenceParamsFunc`'s own signature (no `dbOid` parameter),
+which made its `LookupSequence` call implicitly resolve against
+`DefaultDBOid` regardless of which dbOid's sequence was actually being
+enumerated. Gave `SequenceParamsFunc`/`sequenceParamsForCatalog` a `dbOid
+uint32` parameter; extracted `pg_sequence.VirtualRows` into new
+`catalog.InMemory.PGSequenceRowsForDBOid(dbOid uint32)` (identical
+closure-extraction shape to `pg_foreign_table`/`pg_trigger`/`pg_rewrite`
+above); fixed `PGDependRowsForDBOid`'s own `SequenceParamsFunc(...)` call,
+which follow-up 27 had already dbOid-parameterized for its table enumeration
+but not for this lookup — a latent bug from that earlier follow-up, closed
+here. Wired new per-connection `executor.Context.PgSequenceRows func()
+[][]string` field, set in `internal/server/dispatch.go`'s
+`wireExtensionRows` (new `pgSequenceRowLister` interface), consumed by a new
+`tbl.Name == "pg_sequence"` branch in `internal/executor/operators.go`'s
+`valuesOp.Open`. New test `TestPgSequenceRowsScopedToConnectionDBOid`
+(`internal/executor/fk_dbid_routing_test.go`). Live end-to-end verified
+against a real `cmd/goopg` + `psql`: two `CREATE DATABASE`s, one `CREATE
+SEQUENCE` each with distinct START/INCREMENT — each database's `pg_sequence`
+shows exactly its own sequence with its own params, no cross-leak either
+direction. `pg_sequences` (`internal/initdb/pg_sequences_view.go`) and
+`information_schema.sequences`
+(`internal/initdb/information_schema_sequences_view.go`) both still call
+`executor.AllSequenceInfos()` with no dbOid and remain unfixed — see the
+2026-07-10 deferral-ledger row (follow-up 34) for this narrowed remainder.
 
 **Remaining 4e work: the `CREATE DATABASE ... TEMPLATE` copy mechanism
 itself** — deep-copying the source dbOid's `catalog.tableNamespace`

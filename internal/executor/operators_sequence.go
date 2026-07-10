@@ -859,10 +859,13 @@ func init() {
 }
 
 // sequenceParamsForCatalog returns the pg_sequence parameter row for the named
-// sequence, or ok=false if no such sequence is registered. Called by the
-// catalog's pg_sequence VirtualRows for each IsSequence relation.
-func sequenceParamsForCatalog(qualifiedName string) (catalog.SeqParams, bool) {
-	s := LookupSequence(qualifiedName)
+// sequence in dbOid's registry, or ok=false if no such sequence is
+// registered there. Called by the catalog's PGSequenceRowsForDBOid/
+// PGDependRowsForDBOid for each IsSequence relation. M0122-0007 4e follow-up
+// 34 added the dbOid parameter (previously implicitly DefaultDBOid via
+// LookupSequence's zero-value variadic).
+func sequenceParamsForCatalog(qualifiedName string, dbOid uint32) (catalog.SeqParams, bool) {
+	s := LookupSequence(qualifiedName, dbOid)
 	if s == nil {
 		return catalog.SeqParams{}, false
 	}
