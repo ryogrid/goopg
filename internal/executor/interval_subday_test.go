@@ -600,6 +600,35 @@ func TestYearMonthHyphenIntervals(t *testing.T) {
 		{"SELECT CAST('100-11' AS interval)", "100 years 11 mons"},
 		// Equality across an equivalent decomposition.
 		{"SELECT (interval '1-2' = interval '1 year 2 months')::text", "true"},
+		// Trailing fractional-seconds run split off the year-month field: PG's
+		// ParseDateTime lexer reads `1-2` as a DTK_DATE field and starts a fresh
+		// DTK_NUMBER field at the '.', so the fraction decodes as seconds
+		// (unimplemented_feat #5(d-iii-rest), year-month tokenizer quirk).
+		{"SELECT interval '1-2.5'", "1 year 2 mons 00:00:00.5"},
+		{"SELECT interval '0-2.5'", "2 mons 00:00:00.5"},
+		{"SELECT interval '1-11.5'", "1 year 11 mons 00:00:00.5"},
+		{"SELECT interval '2-11.999999'", "2 years 11 mons 00:00:00.999999"},
+		{"SELECT interval '05-2.5'", "5 years 2 mons 00:00:00.5"},
+		{"SELECT interval '1-2.'", "1 year 2 mons"},
+		{"SELECT interval '1-2.0'", "1 year 2 mons"},
+		{"SELECT interval '0-0.5'", "00:00:00.5"},
+		// Empty month tail after the '.' split (`1-.5` → `1-` + `.5`).
+		{"SELECT interval '1-.5'", "1 year 00:00:00.5"},
+		{"SELECT interval '10-.5'", "10 years 00:00:00.5"},
+		{"SELECT interval '9-.999999'", "9 years 00:00:00.999999"},
+		{"SELECT interval '1-.0'", "1 year"},
+		// The fraction remainder itself splits again into a magnitude + unit
+		// word, so `.5day` = 12 hours (0.5 * 24h).
+		{"SELECT interval '1-2.5day'", "1 year 2 mons 12:00:00"},
+		// Bare year: an empty month tail with no fraction is a whole year-month
+		// field contributing years only (PG's strtoint on the empty tail = 0).
+		{"SELECT interval '1-'", "1 year"},
+		{"SELECT interval '5-'", "5 years"},
+		{"SELECT interval '100-'", "100 years"},
+		{"SELECT interval '0-'", "00:00:00"},
+		{"SELECT interval '-1-'", "-1 years"},
+		{"SELECT '1-.5'::interval", "1 year 00:00:00.5"},
+		{"SELECT CAST('1-2.5' AS interval)", "1 year 2 mons 00:00:00.5"},
 	}
 	for _, c := range cases {
 		rows := runQuery(t, ctx, c.sql+" FROM t")
@@ -608,6 +637,26 @@ func TestYearMonthHyphenIntervals(t *testing.T) {
 		}
 		if got := rows[0][0].Format(); got != c.want {
 			t.Errorf("%s = %q, want %q", c.sql, got, c.want)
+		}
+	}
+
+	// A SIGNED year-month field with a fractional tail is lexed whole by PG (a
+	// single DTK_TZ token) and rejected by its years-months branch; the extra
+	// forms below likewise mismatch PG's tokenizer and error. Every rejection
+	// was confirmed against a live PostgreSQL 18.3 instance.
+	reject := []string{
+		"SELECT interval '-1-2.5' FROM t",   // signed → whole DTK_TZ → bad format
+		"SELECT interval '-0-1.5' FROM t",   // signed, even 0 years
+		"SELECT interval '+1-2.5' FROM t",   // leading '+' is a sign too
+		"SELECT interval '1-2.5.5' FROM t",  // two fractional runs
+		"SELECT interval '1-2.5 3' FROM t",  // fraction pairs with trailing number
+		"SELECT interval '1-2.5 mons' FROM t", // fraction+MONTH collides with year-month
+		"SELECT interval '3 1-2.5' FROM t",  // bare number preceding the year-month
+		"SELECT interval '1-2.5 3days' FROM t",
+	}
+	for _, sql := range reject {
+		if _, err := runQueryErr(t, ctx, sql); err == nil {
+			t.Errorf("%s: expected error, got none", sql)
 		}
 	}
 }

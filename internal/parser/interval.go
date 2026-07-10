@@ -283,7 +283,8 @@ func canonicalIntervalUnit(w string) (string, bool) {
 // (`1-2` → 1 year 2 months), mirroring PostgreSQL's DecodeInterval DTK_NUMBER
 // hyphen branch (postgres/src/backend/utils/adt/datetime.c): a signed integer
 // year value, a hyphen, then a month count that must satisfy 0 ≤ months < 12,
-// with nothing trailing. The result is a whole-month value years*12 ± months
+// with nothing trailing (an empty month tail, `1-`/`-1-`, is a bare year).
+// The result is a whole-month value years*12 ± months
 // (PG sets type DTK_MONTH unconditionally, so the field contributes months
 // only — never days or micros). A leading `-` on the whole field flips the
 // sign of BOTH the year and the month component (PG: `if (*field[i] == '-')
@@ -315,10 +316,18 @@ func parseYearMonthField(f string) (months int32, ok bool) {
 	// with nothing trailing (Go's ParseInt requires the whole string to be a
 	// valid integer, reproducing PG's `*cp != '\0'` bad-format check for
 	// `1-2-3`, `1-2x`, `1-2.5`; the range check reproduces `val2 < 0 ||
-	// val2 >= MONTHS_PER_YEAR` for `1--2`, `1-12`, `1-13`).
-	mon, err := strconv.ParseInt(f[sep+1:], 10, 64)
-	if err != nil || mon < 0 || mon >= 12 {
-		return 0, false
+	// val2 >= MONTHS_PER_YEAR` for `1--2`, `1-12`, `1-13`). An EMPTY month part
+	// (`1-` → 1 year, `-1-` → -1 years) is a bare year: PostgreSQL's
+	// `strtoint(cp + 1, ...)` on the empty tail returns 0 with no error, so the
+	// field contributes years only.
+	monStr := f[sep+1:]
+	var mon int64
+	if monStr != "" {
+		var err error
+		mon, err = strconv.ParseInt(monStr, 10, 64)
+		if err != nil || mon < 0 || mon >= 12 {
+			return 0, false
+		}
 	}
 	if f[0] == '-' {
 		mon = -mon
@@ -433,8 +442,27 @@ func expandIntervalFields(raw []string) (out []string, ok bool) {
 			sign, body = body[:1], body[1:]
 		}
 		// An internal '-' marks a SQL year-month field (`1-2`, `-1-2`) or an
-		// exotic hyphenated token; leave it whole for parseYearMonthField.
+		// exotic hyphenated token; leave it whole for parseYearMonthField —
+		// UNLESS it is an unsigned field with a trailing fractional-seconds run
+		// that PostgreSQL's ParseDateTime lexer would split off. PG lexes
+		// `1-2.5` as a DTK_DATE field (`1-2`) plus a fresh DTK_NUMBER field
+		// (`.5`), so the fraction decodes as seconds (`1-2.5` → 1 year 2 mons +
+		// 0.5 s); `1-.5` likewise splits into `1-` + `.5`. A SIGNED field
+		// (`-1-2.5`, `+1-2.5`) is kept whole: PG lexes it as a single DTK_TZ
+		// token whose years-months branch then rejects the `.5` tail
+		// (DTERR_BAD_FORMAT), so goopg must error on it too.
 		if strings.ContainsRune(body, '-') {
+			if sign == "" {
+				if pre, rest, ok := splitYearMonthFraction(body); ok {
+					restToks, rok := splitAlphaNumRuns(rest)
+					if !rok {
+						return nil, false
+					}
+					out = append(out, pre)
+					out = append(out, restToks...)
+					continue
+				}
+			}
 			out = append(out, f)
 			continue
 		}
@@ -495,6 +523,42 @@ func splitAlphaNumRuns(body string) (toks []string, ok bool) {
 
 func isASCIILetter(c byte) bool { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') }
 func isASCIIDigit(c byte) bool  { return c >= '0' && c <= '9' }
+
+// splitYearMonthFraction reproduces the one PostgreSQL ParseDateTime lexer split
+// that the coarser whitespace tokenizer misses: an unsigned digit-led SQL
+// year-month field carrying a trailing fractional run (`1-2.5`, `1-.5`,
+// `0-2.5`, `1-2.5day`). PostgreSQL reads the `<digits>-<digits>` run as a
+// DTK_DATE field and then starts a fresh field at the '.', so the remainder
+// decodes on its own (`1-2.5` → 1 year 2 mons + 0.5 s; `1-2.5day` → the `.5day`
+// remainder splits again into `.5`+`day` → +12:00:00). Returns ok=true with
+// pre = the `<digits>-<digits?>` field and rest = the remainder beginning at
+// '.', only when the body has that exact shape. Any other body — no fractional
+// tail (`1-2`, `1-`, `1-2h`), a second '-' (`1-2-3`, `1--2`), or a non-digit
+// head — returns ok=false so the caller decodes it whole (matching PG, which
+// either accepts the bare year-month or rejects the malformed field).
+func splitYearMonthFraction(body string) (pre, rest string, ok bool) {
+	if len(body) == 0 || !isASCIIDigit(body[0]) {
+		return "", "", false
+	}
+	i := 0
+	for i < len(body) && isASCIIDigit(body[i]) { // year digits
+		i++
+	}
+	if i >= len(body) || body[i] != '-' {
+		return "", "", false
+	}
+	i++ // consume the '-' separator
+	for i < len(body) && isASCIIDigit(body[i]) { // month digits (may be zero)
+		i++
+	}
+	// Only a '.' (fractional-seconds run) triggers the split; anything else —
+	// end of field, a letter, or a second '-' — is left for the whole-field
+	// year-month decoder.
+	if i >= len(body) || body[i] != '.' {
+		return "", "", false
+	}
+	return body[:i], body[i:], true
+}
 
 // ParseIntervalBody decodes a full free-form interval literal body into
 // months/days/micros components, mirroring PostgreSQL's interval_in

@@ -891,6 +891,50 @@ sibling paths + 6 malformed-body rejections). Gates: `go build`/`go vet` clean;
 parser + executor interval suites PASS; `scripts/tpch-spotcheck.sh` PASS
 (Q12=2/Q13=33); pgbench smoke via pre-commit hook.
 
+## Follow-up: year-month tokenizer quirks `1-` / `1-2.5` (unimplemented_feat #5(d-iii-rest), 2026-07-11)
+
+Two SQL year-month forms the free-form decoder previously rejected now parse:
+`interval '1-'` → **1 year** (a bare year, empty month tail) and `interval '1-2.5'`
+→ **1 year 2 mons 00:00:00.5** (a fractional-seconds run trailing the year-month
+field). Both fall out of reproducing one detail of PostgreSQL's `ParseDateTime`
+character-level lexer (`postgres/src/backend/utils/adt/datetime.c`) that goopg's
+coarser whitespace tokenizer had skipped.
+
+**The lexer split.** PG lexes a digit-led field `1-2.5` as a `DTK_DATE` field
+`1-2` (it stops the date run at the `.`, which does not match the `-` delimiter)
+and then starts a **fresh** `DTK_NUMBER` field at the `.` → `.5`. That `.5` decodes
+as seconds by the rightmost-field default. goopg now mirrors this in
+`expandIntervalFields` via a new `splitYearMonthFraction`: for an **unsigned**
+digit-led `-` field, it peels off the `<digits>-<digits?>` prefix and feeds the
+remaining `.`-led run back through the existing `splitAlphaNumRuns`, so `1-2.5day`
+even splits a second time into `.5`+`day` (→ +12:00:00) exactly as PG does.
+
+**Sign asymmetry — load-bearing.** A *signed* field (`-1-2.5`, `+1-2.5`) is lexed
+by PG as a single `DTK_TZ` token whose years-months branch then rejects the `.5`
+tail (`DTERR_BAD_FORMAT`). goopg therefore leaves any sign-prefixed field **whole**
+(no split), so `parseYearMonthField` rejects the non-integer month `2.5` and the
+literal errors — matching PG byte-for-byte. `interval '-1-2'` (no fraction) still
+decomposes to -14 months as before.
+
+**Empty month tail.** PG's `strtoint(cp + 1, …)` on the empty string after the
+hyphen returns 0 with no error, so `1-`/`-1-` are bare years. `parseYearMonthField`
+now treats an empty month part as 0 months (still range-checking a non-empty part
+`0 ≤ m < 12`), which serves both the whole `1-` literal and the split `1-.5` → `1-`
++ `.5` case.
+
+**Still deferred:** a bare *unit word* glued to a year-month (`interval '1-2h'` →
+PG 1 year 2 mons, the `h` absorbed as a no-op) still errors in goopg — that needs
+the DecodeInterval "unit designator overridden by the year-month `DTK_MONTH` force"
+behavior, out of scope here. `interval '1-2.5day'` works only because its remainder
+starts with `.`.
+
+Tests: `internal/executor/interval_subday_test.go`'s `TestYearMonthHyphenIntervals`
+gained 22 accepts (fractional-tail, empty-tail, bare-year, cast/`::` siblings) + an
+8-case reject block (signed fractions, double fractions, field collisions). Every
+`want`/error captured byte-for-byte from a live PostgreSQL 18.3 instance. Gates:
+`go build`/`go vet` clean; parser + executor interval suites PASS;
+`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke via pre-commit hook.
+
 ## Cross-references
 
 - TPC-H query bodies: HammerDB upstream
