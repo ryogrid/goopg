@@ -8683,6 +8683,54 @@ mirroring M0119's ledger `status` column.
       PASS (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke bash
       scripts/ralph-precommit-test.sh` PASS (0 failed transactions, all 3
       workloads).
+  - [x] **M0122-0024 — `CREATE TABLE ... OF type_name (col WITH OPTIONS ...)`
+      typed-table column-option list — implemented** (`unimplemented_feat.json`
+      entries deferred 2026-06-30 and 2026-05-12; both describe the same
+      underlying gap). Before this fix ANY parenthesised list after
+      `OF type_name` was rejected outright with "typed-table column option
+      list is not supported" — even the canonical PG form from the CREATE
+      TABLE docs (`employees OF employee_type (salary WITH OPTIONS
+      DEFAULT 1000)`). Parser: extracted the per-column constraint suffix
+      of `parseColumnDef` (NOT NULL/DEFAULT/CHECK/UNIQUE/PRIMARY KEY/
+      REFERENCES/COLLATE/...) into a new shared `parseColumnConstraintList`
+      (`internal/parser/ddl.go`), then implemented real parsing of the
+      `OF type_name (...)` list: each `column_name WITH OPTIONS
+      column_constraint [...]` entry is parsed via the shared helper into
+      a new `CreateTableStmt.OfTypeColumnOptions []ColumnDef` field
+      (`internal/parser/ast.go`). A `table_constraint` entry in the same
+      list (PRIMARY KEY/UNIQUE/CHECK/FOREIGN KEY/CONSTRAINT at table
+      level — also grammar-legal per PG's gram.y `TypedTableElement:
+      columnOptions | TableConstraint`) is explicitly rejected with a
+      clear parse error rather than silently mis-parsed or dropped;
+      narrower remaining scope, deferred (see below). Executor:
+      `execCreateTable` (`internal/executor/operators_ddl.go`) merges each
+      override onto the matching composite-derived `ColumnDef` by name
+      before the normal column-build path runs, so NOT NULL/DEFAULT/CHECK
+      ride the same enforcement machinery as a normal column — no new
+      plumbing needed downstream. An override naming a column absent from
+      the composite type is rejected with `42703` ("column %q does not
+      exist"), matching PostgreSQL's real `MergeAttributes` rejection
+      (verified against `postgres/src/backend/commands/tablecmds.c:2589-2605`
+      via research subagent — PG's check is NOT in `transformOfType`,
+      it's deferred to `MergeAttributes` since typed-table columns come
+      first in the merged list). Added
+      `TestCreateTableOfTypeColumnWithOptions`,
+      `TestCreateTableOfTypeEmptyColumnList`,
+      `TestCreateTableOfTypeTableConstraintRejected`,
+      `TestCreateTableOfTypeUnknownColumnRequiresWithOptions`
+      (`internal/parser/create_table_of_type_test.go`) and
+      `TestCreateTableOfTypeWithOptionsAppliesConstraints` (23502 NOT NULL
+      enforcement + DEFAULT application),
+      `TestCreateTableOfTypeWithOptionsUnknownColumn` (42703)
+      (`internal/executor/create_table_of_type_options_test.go`).
+      `unimplemented_feat.json`'s two matching entries flipped
+      `open`→`resolved` via surgical `Edit`s. Deferral-ledger row added for
+      the remaining table_constraint-in-OF-type-list scope. Gates: `go
+      build ./...`/`go vet ./...` clean; `go test ./internal/parser/...`
+      PASS (full package); `go test ./internal/executor/...` PASS (full
+      package, 4s); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh`
+      PASS (0 failed transactions, all 3 workloads).
 
 > This task list is **seeded, not exhaustive.** The M0122-0001 triage plus every
 > future feature deferral appended to `unimplemented_feat.json` (any new `open`

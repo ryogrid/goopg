@@ -3002,9 +3002,13 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 	}
 
 	// CREATE TABLE name OF type_name [ ( column_options ) ] — a typed table
-	// whose columns are derived from a composite type. The optional
-	// per-column option/constraint list (`(col WITH OPTIONS …)`) is not yet
-	// supported and is rejected so it is not silently dropped. DU-002 slice 374.
+	// whose columns are derived from a composite type. The optional list
+	// following OF type_name may contain `column_name WITH OPTIONS
+	// column_constraint [...]` entries (parsed into stmt.OfTypeColumnOptions
+	// and applied to the composite-derived columns by the executor) and/or
+	// table_constraint entries (PRIMARY KEY/UNIQUE/CHECK/FOREIGN KEY/
+	// CONSTRAINT at table level); the latter are rejected rather than
+	// silently dropped — DU-002 slice 374 follow-up.
 	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwOf {
 		p.advance() // consume OF
 		typeName, err := p.parseObjectName()
@@ -3013,7 +3017,38 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 		}
 		stmt.OfType = &typeName
 		if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
-			return nil, p.errAtCur("typed-table column option list is not supported")
+			p.advance() // consume '('
+			if !p.acceptSymbol(")") {
+				for {
+					if p.cur().Kind == TokenKeyword &&
+						(p.cur().Keyword == KwConstraint || p.cur().Keyword == KwPrimary ||
+							p.cur().Keyword == KwUnique || p.cur().Keyword == KwCheck ||
+							p.cur().Keyword == KwForeign) {
+						return nil, p.errAtCur("table constraints in a typed-table (OF type_name) column list are not supported")
+					}
+					nameTok, err := p.parseIdent()
+					if err != nil {
+						return nil, err
+					}
+					if !p.acceptKeyword(KwWith) && !p.acceptIdentKeyword("with") {
+						return nil, p.errAtCur("expected WITH OPTIONS after column name in typed-table column list")
+					}
+					if !p.acceptIdentKeyword("options") {
+						return nil, p.errAtCur("expected OPTIONS after WITH")
+					}
+					override := ColumnDef{Name: identText(nameTok)}
+					if err := p.parseColumnConstraintList(&override); err != nil {
+						return nil, err
+					}
+					stmt.OfTypeColumnOptions = append(stmt.OfTypeColumnOptions, override)
+					if p.acceptSymbol(")") {
+						break
+					}
+					if !p.acceptSymbol(",") {
+						return nil, p.errAtCur("expected ',' or ')' in typed-table column list")
+					}
+				}
+			}
 		}
 		// Optional trailing clauses (PARTITION BY, WITH, TABLESPACE) follow the
 		// same grammar as a normal CREATE TABLE.
@@ -4139,12 +4174,26 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 		return ColumnDef{}, err
 	}
 	col := ColumnDef{pos: pos, Name: identText(nameTok), Type: colType}
+	if err := p.parseColumnConstraintList(&col); err != nil {
+		return ColumnDef{}, err
+	}
+	return col, nil
+}
+
+// parseColumnConstraintList parses the constraint-clause suffix shared by a
+// normal typed column definition and the untyped `column_name WITH OPTIONS
+// column_constraint` form used by CREATE TABLE ... OF type_name ( ... ), where
+// the column has no type of its own (it is derived from the composite type)
+// but may still carry NOT NULL/DEFAULT/CHECK/etc. overrides. Stops at the
+// first token it does not recognise as a constraint (comma, closing paren,
+// ...), leaving it unconsumed for the caller. DU-002 slice 374 follow-up.
+func (p *parser) parseColumnConstraintList(col *ColumnDef) error {
 	for {
 		switch {
 		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwNot:
 			p.advance()
 			if _, err := p.expectKeyword(KwNull); err != nil {
-				return ColumnDef{}, err
+				return err
 			}
 			col.NotNull = true
 			// Optional NO INHERIT — PG18 NOT NULL constraints may carry NO INHERIT.
@@ -4155,7 +4204,7 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwPrimary:
 			p.advance()
 			if _, err := p.expectKeyword(KwKey); err != nil {
-				return ColumnDef{}, err
+				return err
 			}
 			col.Primary = true
 			col.NotNull = true
@@ -4197,10 +4246,10 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 			isAlways := p.acceptIdentKeyword("always")
 			isByDefault := !isAlways && (p.acceptKeyword(KwBy) && p.acceptKeyword(KwDefault))
 			if !isAlways && !isByDefault {
-				return ColumnDef{}, p.errAtCur("expected ALWAYS or BY DEFAULT after GENERATED")
+				return p.errAtCur("expected ALWAYS or BY DEFAULT after GENERATED")
 			}
 			if _, err := p.expectKeyword(KwAs); err != nil {
-				return ColumnDef{}, err
+				return err
 			}
 			// GENERATED ALWAYS AS IDENTITY [(sequence_options)] — identity column.
 			if p.acceptIdentKeyword("identity") {
@@ -4219,32 +4268,32 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 							_ = p.acceptKeyword(KwWith) || p.acceptIdentKeyword("with")
 							v, err := p.parseInt64()
 							if err != nil {
-								return ColumnDef{}, err
+								return err
 							}
 							col.IdentityStart = v
 						case p.acceptIdentKeyword("increment"):
 							_ = p.acceptKeyword(KwBy)
 							v, err := p.parseInt64()
 							if err != nil {
-								return ColumnDef{}, err
+								return err
 							}
 							col.IdentityIncrement = &v
 						case p.acceptIdentKeyword("minvalue"):
 							v, err := p.parseInt64()
 							if err != nil {
-								return ColumnDef{}, err
+								return err
 							}
 							col.IdentityMin = &v
 						case p.acceptIdentKeyword("maxvalue"):
 							v, err := p.parseInt64()
 							if err != nil {
-								return ColumnDef{}, err
+								return err
 							}
 							col.IdentityMax = &v
 						case p.acceptIdentKeyword("cache"):
 							v, err := p.parseInt64()
 							if err != nil {
-								return ColumnDef{}, err
+								return err
 							}
 							col.IdentityCache = &v
 						case p.acceptIdentKeyword("cycle"):
@@ -4254,16 +4303,16 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 							// field nil/false so the type default applies.
 							_ = p.acceptIdentKeyword("minvalue") || p.acceptIdentKeyword("maxvalue") || p.acceptIdentKeyword("cycle")
 						case p.cur().Kind == TokenEOF:
-							return ColumnDef{}, p.errAtCur("unterminated identity sequence options")
+							return p.errAtCur("unterminated identity sequence options")
 						default:
-							return ColumnDef{}, p.errAtCur("unrecognised identity sequence option")
+							return p.errAtCur("unrecognised identity sequence option")
 						}
 					}
 				}
 				continue
 			}
 			if !p.acceptSymbol("(") {
-				return ColumnDef{}, p.errAtCur("expected '(' after GENERATED ALWAYS AS")
+				return p.errAtCur("expected '(' after GENERATED ALWAYS AS")
 			}
 			// Collect the raw expression tokens (kind + value) so the canonical
 			// join below can reproduce pg_get_expr's spacing — tight function
@@ -4287,7 +4336,7 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 				_ = start
 			}
 			if !p.acceptSymbol(")") {
-				return ColumnDef{}, p.errAtCur("expected ')' to close generated expression")
+				return p.errAtCur("expected ')' to close generated expression")
 			}
 			// Storage strategy: `STORED` or `VIRTUAL`. PG18's default (when neither
 			// keyword is given) is VIRTUAL. goopg materializes every generated
@@ -4316,7 +4365,7 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 			p.advance()
 			expr, err := p.parseExpr()
 			if err != nil {
-				return ColumnDef{}, err
+				return err
 			}
 			col.DefaultExpr = expr
 		// REFERENCES — parse FK constraint and populate col FK fields. M0096-0011.
@@ -4324,17 +4373,17 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 			p.advance()
 			refTable, err := p.parseObjectName()
 			if err != nil {
-				return ColumnDef{}, err
+				return err
 			}
 			col.RefTable = refTable
 			if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
 				p.advance()
 				refCols, err := p.parseColumnNameList()
 				if err != nil {
-					return ColumnDef{}, err
+					return err
 				}
 				if !p.acceptSymbol(")") {
-					return ColumnDef{}, p.errAtCur("expected ')'")
+					return p.errAtCur("expected ')'")
 				}
 				col.RefColumns = refCols
 			}
@@ -4349,7 +4398,7 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 				}
 				action, setCols, aerr := parseFKAction(p)
 				if aerr != nil {
-					return ColumnDef{}, aerr
+					return aerr
 				}
 				if isDelete {
 					col.OnDelete = action
@@ -4387,7 +4436,7 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 			p.advance()
 			expr, err := p.parseCheckExpr()
 			if err != nil {
-				return ColumnDef{}, err
+				return err
 			}
 			col.CheckExpr = expr
 			// Accept optional NOT ENFORCED / ENFORCED, recording NOT ENFORCED
@@ -4414,7 +4463,7 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 				p.advance()
 				expr, err := p.parseCheckExpr()
 				if err != nil {
-					return ColumnDef{}, err
+					return err
 				}
 				col.CheckExpr = expr
 				if p.acceptKeyword(KwNot) {
@@ -4433,7 +4482,7 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 				// CONSTRAINT name PRIMARY KEY
 				p.advance()
 				if _, err := p.expectKeyword(KwKey); err != nil {
-					return ColumnDef{}, err
+					return err
 				}
 				col.Primary = true
 				col.NotNull = true
@@ -4468,7 +4517,7 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 				// DU-002 slice 273.
 				p.advance() // NOT
 				if _, err := p.expectKeyword(KwNull); err != nil {
-					return ColumnDef{}, err
+					return err
 				}
 				col.NotNull = true
 				col.NotNullConstraintName = identText(cnameTok)
@@ -4492,7 +4541,7 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 				}
 			}
 		default:
-			return col, nil
+			return nil
 		}
 	}
 }

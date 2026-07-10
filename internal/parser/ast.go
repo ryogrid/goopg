@@ -1341,6 +1341,15 @@ type CreateTableStmt struct {
 	// pg_class.reloftype is set to the type's OID, so pg_dump re-emits the
 	// `OF type_name` form (suppressing the column list). DU-002 slice 374.
 	OfType *ObjectName
+	// OfTypeColumnOptions holds per-column constraint overrides from the
+	// optional `( column_name WITH OPTIONS column_constraint [ ... ] [, ...] )`
+	// list that may follow `OF type_name`. Each entry's Name matches a field
+	// of the composite type named by OfType; Type is left zero since the
+	// column's type is derived from the composite field, not redeclared here.
+	// Table-level constraints in that same list (PRIMARY KEY/UNIQUE/CHECK/
+	// FOREIGN KEY/CONSTRAINT) are rejected at parse time — not yet supported.
+	// DU-002 slice 374 follow-up.
+	OfTypeColumnOptions []ColumnDef
 	// ColumnAliases holds the optional column-name list from
 	// `CREATE TABLE name (col1, col2, …) AS SELECT …`. When non-nil its
 	// length must not exceed the number of columns the SELECT returns; alias

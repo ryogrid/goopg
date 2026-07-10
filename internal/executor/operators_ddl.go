@@ -1551,6 +1551,34 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				Collation: f.Collation,
 			})
 		}
+		// Apply `column_name WITH OPTIONS column_constraint [...]` overrides
+		// from the OF-type-name column list onto the matching composite-derived
+		// column: everything the shared constraint parser can set (NOT NULL,
+		// DEFAULT, CHECK, UNIQUE, PRIMARY KEY, REFERENCES, ...) rides through
+		// the same fields the normal column-build path below already consumes,
+		// so no further plumbing is needed. The column's Type/Collation stay
+		// derived from the composite field — WITH OPTIONS cannot redeclare a
+		// type. DU-002 slice 374 follow-up.
+		for _, ov := range s.OfTypeColumnOptions {
+			idx := -1
+			for i := range derived {
+				if strings.EqualFold(derived[i].Name, ov.Name) {
+					idx = i
+					break
+				}
+			}
+			if idx == -1 {
+				return &ExecError{Code: "42703", Pos: s.Pos(),
+					Message: fmt.Sprintf("column %q does not exist", ov.Name)}
+			}
+			merged := ov
+			merged.Name = derived[idx].Name
+			merged.Type = derived[idx].Type
+			if merged.Collation == "" {
+				merged.Collation = derived[idx].Collation
+			}
+			derived[idx] = merged
+		}
 		s.Columns = derived
 	}
 

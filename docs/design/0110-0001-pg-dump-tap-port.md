@@ -9146,6 +9146,30 @@ round-tripped data row `7\tseven`). Verified byte-identical vs real pg_dump 18.3
 rejected, not supported. A typed table `OF` a composite in a non-`public` schema isn't covered (composite registry is bare-name).
 `pg_class.reltype` (the table's own rowtype) stays 0, as for every other goopg table.
 
+**Addendum (M0122-0024, 2026-07-10): the per-column `WITH OPTIONS` half is now implemented.** The "explicitly rejected, deferred" note
+above covered the *entire* `( … )` list after `OF type_name`; that list actually splits into two independent PG grammar productions
+(`gram.y`'s `TypedTableElement: columnOptions | TableConstraint`), and only the column-level half is landed here:
+
+- **Parser**: the per-column constraint suffix of `parseColumnDef` (NOT NULL/DEFAULT/CHECK/UNIQUE/PRIMARY KEY/REFERENCES/COLLATE/...)
+  was extracted into a new shared `parseColumnConstraintList(col *ColumnDef) error`, reused by both a normal typed column definition and
+  the new `OF type_name (...)` list parsing. Each `column_name WITH OPTIONS column_constraint [...]` entry parses via the shared helper
+  into a new `CreateTableStmt.OfTypeColumnOptions []ColumnDef` field (`Name` set, `Type` left zero since WITH OPTIONS cannot redeclare a
+  type). A bare `table_constraint` entry in the same list (`PRIMARY KEY`/`UNIQUE`/`CHECK`/`FOREIGN KEY`/`CONSTRAINT` at table level — the
+  other half of the same grammar rule, and legal to interleave with `column_name WITH OPTIONS` entries in real PostgreSQL) is still
+  explicitly rejected with a clear parse error, not silently dropped — this narrower remainder is tracked in the deferral ledger
+  (M0122-0024 row) rather than the whole feature.
+- **Executor**: `execCreateTable` merges each `OfTypeColumnOptions` entry onto the matching composite-derived `ColumnDef` by name
+  (case-insensitive) before `s.Columns = derived` runs, so NOT NULL/DEFAULT/CHECK ride through the exact same column-build/constraint
+  machinery an explicit column already uses — no separate enforcement path was needed. An override naming a column absent from the
+  composite type raises `42703` ("column %q does not exist"), matching PostgreSQL's real rejection in `MergeAttributes`
+  (`postgres/src/backend/commands/tablecmds.c:2589-2605` — the check is deferred there, not in `transformOfType`, because typed-table
+  columns are placed first in the merged attribute list).
+
+Covered by `TestCreateTableOfTypeColumnWithOptions`/`TestCreateTableOfTypeEmptyColumnList`/`TestCreateTableOfTypeTableConstraintRejected`/
+`TestCreateTableOfTypeUnknownColumnRequiresWithOptions` (`internal/parser/create_table_of_type_test.go`) and
+`TestCreateTableOfTypeWithOptionsAppliesConstraints`/`TestCreateTableOfTypeWithOptionsUnknownColumn`
+(`internal/executor/create_table_of_type_options_test.go`).
+
 ### Slice 375 — **`CREATE FOREIGN DATA WRAPPER <name>`** round-trip (PRODUCTION fix)
 
 goopg accepted `CREATE FOREIGN DATA WRAPPER` (parsed as a `CompatNoopStmt` so `DROP` could later succeed) but tracked it only in the

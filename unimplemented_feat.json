@@ -3397,7 +3397,7 @@
    "feature": "Per-column optional type specification in CREATE TABLE OF syntax (col WITH OPTIONS form)",
    "task_id": "DU-002-374",
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "per-column `OF type (col WITH OPTIONS ...)` form rejected"
    ],
@@ -3407,12 +3407,12 @@
     "cc080cb37153f936fcf0b6430fc4182749f01fd5"
    ],
    "resolution_check": {
-    "ledger": "open",
-    "fix_plan": "no-match",
+    "ledger": "resolved",
+    "fix_plan": "M0122-0024",
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/parser/ddl.go:2713 comment explicitly states not yet supported"
+   "code_audit": "RESOLVED (2026-07-10, M0122-0024): `CREATE TABLE name OF type_name (col WITH OPTIONS column_constraint [...])` now parses each entry into CreateTableStmt.OfTypeColumnOptions (internal/parser/ddl.go, reusing the newly-extracted parseColumnConstraintList shared with a normal typed column def) and the executor merges them onto the composite-derived ColumnDef before the normal column-build path runs (internal/executor/operators_ddl.go execCreateTable), so NOT NULL/DEFAULT/CHECK/etc. are genuinely enforced, not silently dropped. A table_constraint entry in the same paren list (PRIMARY KEY/UNIQUE/CHECK/FOREIGN KEY at table level, also grammar-legal per gram.y TypedTableElement) is still rejected with a clear parse error rather than supported — tracked as a narrower remaining gap in the deferral ledger, not silently reopened."
   },
   {
    "feature": "Typed table support for composite types in non-public schemas",
@@ -3504,7 +3504,7 @@
    "feature": "WITH OPTIONS clause in column definitions implemented as no-op; column-level options are not processed or applied",
    "task_id": null,
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "WITH OPTIONS no-op"
    ],
@@ -3514,12 +3514,12 @@
     "bb65e7d5a78330870b6dadca427d9b6a8bb28b71"
    ],
    "resolution_check": {
-    "ledger": "no-match",
-    "fix_plan": "no-match",
+    "ledger": "resolved",
+    "fix_plan": "M0122-0024",
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "medium",
-   "code_audit": "unclear: WITH OPTIONS in ColumnDef definition unclear if consumed"
+   "code_audit": "RESOLVED (2026-07-10, M0122-0024): the WITH OPTIONS form this entry describes is specifically the `CREATE TABLE ... OF type_name (col WITH OPTIONS constraint)` typed-table column list (same underlying gap as the sibling entry above); it now parses into CreateTableStmt.OfTypeColumnOptions and the executor applies each override (NOT NULL/DEFAULT/CHECK/...) to the composite-derived column before catalog build, verified with TestCreateTableOfTypeWithOptionsAppliesConstraints (23502 NOT NULL enforcement + DEFAULT application) in internal/executor/create_table_of_type_options_test.go."
   },
   {
    "feature": "goopg does not emit a blank data row for 0-column SELECT results; PostgreSQL outputs one that goopg omits.",
