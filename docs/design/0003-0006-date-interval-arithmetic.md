@@ -335,6 +335,45 @@ Tests: `internal/executor/interval_justify_test.go`
 `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh` PASS (0
 failed transactions, all 3 workloads).
 
+### Update: sub-day folding once the carrier gained a time field (2026-07-11)
+
+The paragraph above rests on the premise *"goopg's v0 `KindInterval` Datum has
+no time field at all"*. That premise expired on 2026-07-11 when the
+timestamp − timestamp work packed sub-day microseconds into the carrier's
+reserved `Hi` word (`Datum.IntervalMicrosValue` / `NewIntervalDatumFull`) and
+sub-day interval literals (`interval '27 hours'`) began populating it. The
+justify functions were a stale sibling of that carrier change: `justify_hours`
+and `justify_interval` were still no-ops for the time field, silently dropping
+or failing to normalize any sub-day component.
+
+Corrected: `evalJustifyInterval` was renamed to `evalJustify(name, …)` and now
+dispatches all three functions over the full month/day/**micros** triple:
+
+- `justify_hours` → `justifyIntervalHours`: `TMODULO` the micros field by
+  `USECS_PER_DAY`, add the whole-day quotient to `day`, then equalize the sign
+  of `day` vs `time`. Mirrors `interval_justify_hours`.
+- `justify_days` → unchanged `justifyIntervalDays` (month/day only; the time
+  field is deliberately left untouched, exactly as upstream `interval_justify_days`).
+- `justify_interval` → `justifyIntervalFull`: pre-justify days when `day` and
+  `time` share a sign (upstream's overflow-avoidance step), fold 24h chunks of
+  time into days, fold 30-day chunks of days into months, then equalize the
+  sign of month-vs-day and day-vs-time. Mirrors `interval_justify_interval`.
+
+int32 `day`/`month` overflow raises SQLSTATE `22008` *"interval out of range"*
+(`errIntervalRange` via `addDayS32`), matching PG's `pg_add_s32_overflow` guard
+— a large time field can produce a whole-day count outside int32 range.
+
+Verified live against real PostgreSQL 18.3 (`postgres/local_install`, port
+5599): `justify_hours('27 hours')` = `'1 day 03:00:00'`,
+`justify_hours('2 days -1 hours')` = `'1 day 23:00:00'`,
+`justify_interval('1 mon 33 days 27 hours')` = `'2 mons 4 days 03:00:00'`,
+`justify_interval('1 mon -1 hours')` = `'29 days 23:00:00'`,
+`justify_interval('29 days 25 hours')` = `'1 mon 01:00:00'`,
+`justify_interval('-35 days -25 hours')` = `'-1 mons -6 days -01:00:00'`.
+Tests: 12 new sub-day rows in `TestJustifyIntervalFunctions`. Gates: `go build`/
+`go vet` clean; full executor suite PASS; `scripts/tpch-spotcheck.sh` PASS
+(Q12=2/Q13=33); pgbench smoke via pre-commit hook.
+
 ## Follow-up: `isfinite()` NULL propagation (M0122-0018, 2026-07-08)
 
 `evalIsFinite` (`internal/executor/expr.go`) computed its result as
@@ -598,6 +637,51 @@ Every `want` captured byte-for-byte from a real PostgreSQL 18.3 instance. Tests:
 (embedded, multi-field, abbreviations, cast forms) plus new coarse-unit rows in
 the sibling-path guard `TestParseIntervalBodySingleFieldMatchesUnitToParts`.
 Gates: `go build`/`go vet` clean; executor/parser suites PASS;
+`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke via pre-commit
+hook.
+
+## Follow-up: bare-number default-unit → seconds (unimplemented_feat #5(d-i), 2026-07-11)
+
+Closes the prior row's deferred item (d-i): a **unitless number in an interval
+body now defaults to SECONDS** — `interval '5'` → `00:00:05`, `interval '90'` →
+`00:01:30`, `interval '1 day 5'` → `1 day 00:00:05`, `interval '-5'` →
+`-00:00:05`, and the fractional `interval '1.5'` → `00:00:01.5`. This mirrors
+PostgreSQL's `DecodeInterval` (`postgres/src/backend/utils/adt/datetime.c`): a
+`DTK_NUMBER` field with no unit resolves through the typmod `range` switch,
+falling through to `DTK_SECOND` for the default full-range typmod.
+
+Confined to the single shared tokenizer `parser.ParseIntervalBody` — no new
+parser path, no executor edit — so both sibling entry points (the parser's
+Form-2 typed-literal path and the executor's `::interval` / CAST path) gain the
+behaviour at once.
+
+**The subtlety — PG's right-to-left field scan.** `DecodeInterval` reads fields
+*backwards* to "pick up units before values", carrying the rightmost unit
+leftward, and rejects any field whose `tmask` collides with the accumulated
+`fmask`. The consequence: the *only* unitless field that decodes without a
+collision is a **single trailing value**. Two bare numbers, or a bare number
+before a `<num> <unit>` pair, both re-use the same carried/default field and
+error (`interval '1 2 days'`, `interval '5 5'` → error); and because a time word
+`HH:MM[:SS]` always stamps `DTK_TIME_M ⊇ SECOND`, a trailing bare number after a
+time component is a SECOND-slot collision (`interval '1 day 05:00:00 5'` →
+error). goopg's left-to-right tokenizer reproduces this exactly by (1) accepting
+a unitless number only as the **final** field and (2) tracking a `secondsOccupied`
+flag set by any time word or explicit seconds unit — a distinct-bit unit such as
+`millisecond` does *not* set it, so `interval '1 ms 5'` → `00:00:05.001` is
+still accepted, matching PG's per-field-mask bookkeeping.
+
+**Still deferred** (see `deferral_ledger.md`): the SQL year-month hyphen field
+(`interval '1-2'` → 1 year 2 months, a distinct `DecodeInterval` branch);
+(d-ii) single-letter unit forms (`w`/`c`/`h`/`m`/`s`/`d`/`y`, positionally
+ambiguous `m`); (d-iii) full interval typmod grammar (`HOUR TO MINUTE` ranges,
+`SECOND(p)` precision) including the Form-1 trailing-word column-alias
+fall-through.
+
+Every `want` captured byte-for-byte from a real PostgreSQL 18.3 instance. Tests:
+`internal/executor/interval_subday_test.go` `TestTrailingBareNumberDefaultsToSeconds`
+(accept cases, both sibling paths) plus the three new collision-error cases in
+`internal/executor/interval_cast_test.go` `TestIntervalCastFromStringInvalidSyntax`.
+Gates: `go build`/`go vet` clean; executor/analyzer/planner/parser suites PASS;
 `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke via pre-commit
 hook.
 

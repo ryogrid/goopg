@@ -5501,18 +5501,20 @@ func evalIsFinite(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	return NewBoolDatum(true), nil
 }
 
-// evalJustifyInterval implements justify_days()/justify_interval(): move
-// whole 30-day chunks out of the day field into the month field, mirroring
-// interval_justify_days/interval_justify_interval
-// (postgres/src/backend/utils/adt/timestamp.c). PG's justify_interval also
-// folds in interval_justify_hours (moving whole 24h chunks of the *time*
-// field into days) first, but goopg's v0 KindInterval Datum has no sub-day
-// field at all — it is always exactly zero — so that step is a no-op here
-// and justify_interval collapses to plain justify_days. justify_hours()
-// itself is therefore always the identity for goopg and is dispatched
-// straight to evalExpr by its caller instead of through this helper.
-// M0097-0004.
-func evalJustifyInterval(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
+// errIntervalRange is the SQLSTATE 22008 error PG raises
+// (ERRCODE_DATETIME_VALUE_OUT_OF_RANGE, "interval out of range") when a justify
+// step's day/month field overflows int32.
+var errIntervalRange = &ExecError{Code: "22008", Message: "interval out of range"}
+
+// evalJustify implements justify_hours()/justify_days()/justify_interval(),
+// mirroring interval_justify_hours/interval_justify_days/
+// interval_justify_interval (postgres/src/backend/utils/adt/timestamp.c). All
+// three normalize a KindInterval's month/day/time (sub-day micros) fields into
+// customary bounds. Since the interval carrier gained a real sub-day micros
+// field (Datum.IntervalMicrosValue, populated by timestamp − timestamp and by
+// sub-day literals), justify_hours is no longer the identity: it folds whole
+// 24h chunks of the time field into days. M0097-0004 (extended 2026-07-11).
+func evalJustify(name string, x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	if len(x.Args) != 1 {
 		return NullDatum, nil
 	}
@@ -5520,17 +5522,111 @@ func evalJustifyInterval(x *planner.FuncCall, row Row, ctx *Context) (Datum, err
 	if err != nil || d.IsNull() || d.Kind != KindInterval {
 		return d, err
 	}
-	months, days := justifyIntervalDays(d.IntervalMonthsValue(), d.IntervalDaysValue())
-	return NewIntervalDatum(months, days), nil
+	months, days, micros := d.IntervalMonthsValue(), d.IntervalDaysValue(), d.IntervalMicrosValue()
+	switch name {
+	case "justify_hours":
+		months, days, micros, err = justifyIntervalHours(months, days, micros)
+	case "justify_days":
+		// justify_days leaves the time field untouched; only rebalance
+		// whole 30-day chunks of days into months.
+		months, days = justifyIntervalDays(months, days)
+	default: // justify_interval
+		months, days, micros, err = justifyIntervalFull(months, days, micros)
+	}
+	if err != nil {
+		return Datum{}, err
+	}
+	return NewIntervalDatumFull(months, days, micros), nil
 }
 
-// justifyIntervalDays is the pure month/day rebalancing core shared by
-// justify_days()/justify_interval() (evalJustifyInterval above): move whole
-// 30-day chunks out of days into months, then equalize the sign of both
-// fields — mirrors interval_justify_days/interval_justify_interval
-// (postgres/src/backend/utils/adt/timestamp.c) exactly since goopg's v0
-// interval has no time field for interval_justify_interval's extra step to
-// act on.
+// addDayS32 adds an int64 whole-day count (derived from the micros field) to
+// the int32 day field, mirroring PG's pg_add_s32_overflow guard: a large time
+// field can yield a whole-day count outside int32 range.
+func addDayS32(day int32, whole int64) (int32, bool) {
+	s := int64(day) + whole
+	if s < math.MinInt32 || s > math.MaxInt32 {
+		return 0, false
+	}
+	return int32(s), true
+}
+
+// justifyIntervalHours mirrors interval_justify_hours: move whole 24h chunks of
+// the time (micros) field into the day field, then equalize the sign of day and
+// time. months is passed through unchanged.
+func justifyIntervalHours(months, days int32, micros int64) (int32, int32, int64, error) {
+	wholeday := micros / usecsPerDay // TMODULO: truncates toward zero
+	micros -= wholeday * usecsPerDay
+	nd, ok := addDayS32(days, wholeday)
+	if !ok {
+		return 0, 0, 0, errIntervalRange
+	}
+	days = nd
+	if days > 0 && micros < 0 {
+		micros += usecsPerDay
+		days--
+	} else if days < 0 && micros > 0 {
+		micros -= usecsPerDay
+		days++
+	}
+	return months, days, micros, nil
+}
+
+// justifyIntervalFull mirrors interval_justify_interval: bring the time field
+// within [0,24h) and the day field within [0,30d), then make the sign of all
+// three fields equal. Pre-justifies days when day and time share a sign to
+// avoid a spurious overflow, matching upstream exactly.
+func justifyIntervalFull(months, days int32, micros int64) (int32, int32, int64, error) {
+	// Pre-justify days if it might prevent overflow (day and time same sign).
+	if (days > 0 && micros > 0) || (days < 0 && micros < 0) {
+		wholemonth := days / 30
+		days -= wholemonth * 30
+		nm, ok := addDayS32(months, int64(wholemonth))
+		if !ok {
+			return 0, 0, 0, errIntervalRange
+		}
+		months = nm
+	}
+	// Fold whole 24h chunks of time into days.
+	wholeday := micros / usecsPerDay
+	micros -= wholeday * usecsPerDay
+	nd, ok := addDayS32(days, wholeday)
+	if !ok {
+		return 0, 0, 0, errIntervalRange
+	}
+	days = nd
+	// Fold whole 30-day chunks of days into months.
+	wholemonth := days / 30
+	days -= wholemonth * 30
+	nm, ok := addDayS32(months, int64(wholemonth))
+	if !ok {
+		return 0, 0, 0, errIntervalRange
+	}
+	months = nm
+	// Equalize the sign of month against day/time.
+	if months > 0 && (days < 0 || (days == 0 && micros < 0)) {
+		days += 30
+		months--
+	} else if months < 0 && (days > 0 || (days == 0 && micros > 0)) {
+		days -= 30
+		months++
+	}
+	// Equalize the sign of day against time.
+	if days > 0 && micros < 0 {
+		micros += usecsPerDay
+		days--
+	} else if days < 0 && micros > 0 {
+		micros -= usecsPerDay
+		days++
+	}
+	return months, days, micros, nil
+}
+
+// justifyIntervalDays is the pure month/day rebalancing core of justify_days()
+// (evalJustify above): move whole 30-day chunks out of days into months, then
+// equalize the sign of both fields — mirrors interval_justify_days
+// (postgres/src/backend/utils/adt/timestamp.c). justify_days leaves the time
+// (sub-day micros) field untouched; the full three-field normalization lives in
+// justifyIntervalFull.
 func justifyIntervalDays(months, days int32) (int32, int32) {
 	wholeMonths := days / 30
 	days -= wholeMonths * 30
@@ -6867,15 +6963,8 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		return evalMakeTime(x, row, ctx)
 	case "isfinite":
 		return evalIsFinite(x, row, ctx)
-	case "justify_hours":
-		// goopg's KindInterval Datum has no sub-day field, so there is
-		// never anything to move from time into day — always identity.
-		if len(x.Args) != 1 {
-			return NullDatum, nil
-		}
-		return evalExpr(x.Args[0], row, ctx)
-	case "justify_days", "justify_interval":
-		return evalJustifyInterval(x, row, ctx)
+	case "justify_hours", "justify_days", "justify_interval":
+		return evalJustify(name, x, row, ctx)
 	case "date_bin":
 		return evalDateBin(x, row, ctx)
 	case "set_config":
