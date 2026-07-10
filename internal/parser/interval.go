@@ -18,6 +18,83 @@ const (
 	usecsPerMilli  = 1_000
 )
 
+// intervalFieldMask is a bitmask of the interval field types already consumed by
+// a partially-decoded interval body, mirroring PostgreSQL's DecodeInterval
+// `fmask`/`tmask` accounting (postgres/src/backend/utils/adt/datetime.c): after
+// each field is decoded, its type-mask (tmask) is checked against the running
+// fmask and a non-zero intersection is a bad-format error — this is how PG
+// rejects a repeated field like `interval '1 h 2 h'` / `interval '1 mon 2 mons'`
+// or a unit that collides with a preceding `HH:MM:SS` time word
+// (`interval '1 h 05:00:00'`). The individual bits mirror the DTK_M(field) bit
+// positions closely enough for collision detection (the absolute values are
+// irrelevant; only distinctness and the SECOND/ALL_SECS grouping matter).
+type intervalFieldMask uint32
+
+const (
+	imYear intervalFieldMask = 1 << iota
+	imMonth
+	imDay
+	imHour
+	imMinute
+	imSecond
+	imMillisecond
+	imMicrosecond
+	imWeek
+	imDecade
+	imCentury
+	imMillennium
+)
+
+// imAllSecs mirrors PostgreSQL DTK_ALL_SECS_M: a SECOND field carrying a
+// fractional part also occupies the millisecond/microsecond slots, so
+// `interval '1.5 sec 200 ms'` is a collision while `interval '1 sec 200 ms'`
+// is not. imTime mirrors DTK_TIME_M: a `HH:MM[:SS]` time word occupies HOUR,
+// MINUTE and all the SECOND slots at once.
+const (
+	imAllSecs = imSecond | imMillisecond | imMicrosecond
+	imTime    = imHour | imMinute | imAllSecs
+)
+
+// intervalUnitMask returns the field-mask bit(s) a `<magnitude> <unit>` pair
+// contributes, mirroring the per-unit tmask DecodeInterval assigns. A SECOND
+// unit carrying a fractional magnitude widens to imAllSecs (DTK_ALL_SECS_M),
+// matching PostgreSQL's `if (fval == 0) tmask = DTK_M(SECOND); else tmask =
+// DTK_ALL_SECS_M`. The unit must already be canonicalised (see
+// canonicalIntervalUnit). Returns 0 for an unrecognised unit.
+func intervalUnitMask(unit string, fractional bool) intervalFieldMask {
+	switch unit {
+	case "year":
+		return imYear
+	case "month":
+		return imMonth
+	case "week":
+		return imWeek
+	case "decade":
+		return imDecade
+	case "century":
+		return imCentury
+	case "millennium":
+		return imMillennium
+	case "day":
+		return imDay
+	case "hour":
+		return imHour
+	case "minute":
+		return imMinute
+	case "second":
+		if fractional {
+			return imAllSecs
+		}
+		return imSecond
+	case "millisecond":
+		return imMillisecond
+	case "microsecond":
+		return imMicrosecond
+	default:
+		return 0
+	}
+}
+
 // ParseIntervalMagnitude splits an interval magnitude token into its integer
 // part (val) and fractional part (fval, |fval|<1, sharing val's sign),
 // mirroring how PostgreSQL's DecodeInterval feeds a numeric field to the
@@ -295,6 +372,130 @@ func parseIntervalTimeToken(tok string) (micros int64, ok bool) {
 	return micros, true
 }
 
+// inDatetktbl reports whether an all-letter token is a key in PostgreSQL's
+// absolute date/time keyword table (datetktbl in
+// postgres/src/backend/utils/adt/datetime.c). ParseDateTime consults this table
+// to decide whether a letter-run glued directly before a digit starts a fresh
+// field or is swallowed into an invalid DTK_DATE run (see expandIntervalFields).
+// Only the pure-letter keys are listed — the sign-prefixed ones (`+infinity`,
+// `-infinity`) can never appear as a bare letter-run. The interval-unit letters
+// that PostgreSQL happens to also keep here (`d`,`h`,`m`,`s`,`y`,`mon`,`dec`)
+// are exactly the ones for which a glued form like `1d2h` / `1mon2d` / `1dec2d`
+// parses, while `day`/`week`/`min`/`sec`/`w`/`c` are absent, so `1day2h` /
+// `1w2d` error — matching PostgreSQL byte-for-byte.
+func inDatetktbl(w string) bool {
+	switch strings.ToLower(w) {
+	case "ad", "allballs", "am", "apr", "april", "at", "aug", "august",
+		"bc", "d", "dec", "december", "dow", "doy", "dst", "epoch",
+		"feb", "february", "fri", "friday", "h", "infinity", "isodow",
+		"isoyear", "j", "jan", "january", "jd", "jul", "julian", "july",
+		"jun", "june", "m", "mar", "march", "may", "mm", "mon", "monday",
+		"nov", "november", "now", "oct", "october", "on", "pm", "s",
+		"sat", "saturday", "sep", "sept", "september", "sun", "sunday",
+		"t", "thu", "thur", "thurs", "thursday", "today", "tomorrow",
+		"tue", "tues", "tuesday", "wed", "wednesday", "weds", "y",
+		"yesterday":
+		return true
+	default:
+		return false
+	}
+}
+
+// expandIntervalFields splits each whitespace-delimited interval field into the
+// number / unit-word tokens PostgreSQL's ParseDateTime lexer
+// (postgres/src/backend/utils/adt/datetime.c) would produce, so glued forms like
+// `2h30m`, `1.5h`, `-5h` and `1y2mon` decode identically to their spaced
+// equivalents (`2 h 30 m`, `1.5 h`, `-5 h`, `1 y 2 mon`).
+//
+// PostgreSQL's lexer starts a fresh field at every digit↔letter boundary, with
+// one twist: when an all-letter run is immediately followed by a digit it first
+// checks whether that run is a token in the absolute-datetime table (datetktbl);
+// if it is NOT, the run and the following alphanumerics are swallowed into a
+// single invalid DTK_DATE field, which DecodeInterval then rejects. That is why
+// `1d2h`/`1mon2d` (`d`,`mon` ∈ datetktbl) parse but `1day2h`/`1week2d`
+// (`day`,`week` ∉ datetktbl) error. Fields carrying a ':' (time words) or an
+// internal '-' (SQL year-month, `1-2`) are left intact — the caller decodes them
+// whole, exactly as PG's DTK_TIME / DTK_DATE branches do.
+//
+// Returns ok=false when a field would form such a swallowed invalid DTK_DATE, so
+// the caller can reject the whole literal.
+func expandIntervalFields(raw []string) (out []string, ok bool) {
+	out = make([]string, 0, len(raw))
+	for _, f := range raw {
+		// Time words (HH:MM[:SS]) are decoded whole by the caller; never split.
+		if strings.ContainsRune(f, ':') {
+			out = append(out, f)
+			continue
+		}
+		// A leading '+'/'-' is the field's sign, not a separator.
+		sign, body := "", f
+		if len(body) > 0 && (body[0] == '+' || body[0] == '-') {
+			sign, body = body[:1], body[1:]
+		}
+		// An internal '-' marks a SQL year-month field (`1-2`, `-1-2`) or an
+		// exotic hyphenated token; leave it whole for parseYearMonthField.
+		if strings.ContainsRune(body, '-') {
+			out = append(out, f)
+			continue
+		}
+		toks, tok := splitAlphaNumRuns(body)
+		if !tok {
+			return nil, false
+		}
+		// Reattach the leading sign to the first (numeric) token.
+		if sign != "" {
+			toks[0] = sign + toks[0]
+		}
+		out = append(out, toks...)
+	}
+	return out, true
+}
+
+// splitAlphaNumRuns splits a sign-stripped, colon-free, dash-free interval field
+// body into maximal letter runs and numeric runs (digits with optional embedded
+// '.'), reproducing the digit↔letter field boundaries of PostgreSQL's
+// ParseDateTime lexer. A letter run glued immediately before a digit that is NOT
+// an absolute-datetime token is the swallowed-DTK_DATE case PostgreSQL rejects
+// (see expandIntervalFields), so this returns ok=false for it. Any other
+// character (the body is expected to be alphanumeric plus '.') also yields
+// ok=false.
+func splitAlphaNumRuns(body string) (toks []string, ok bool) {
+	if body == "" {
+		return nil, false
+	}
+	for i := 0; i < len(body); {
+		c := body[i]
+		switch {
+		case isASCIILetter(c):
+			j := i
+			for j < len(body) && isASCIILetter(body[j]) {
+				j++
+			}
+			word := body[i:j]
+			// A letter run glued before a digit that datetktbl does not
+			// recognise is swallowed into an invalid DTK_DATE by PostgreSQL.
+			if j < len(body) && isASCIIDigit(body[j]) && !inDatetktbl(word) {
+				return nil, false
+			}
+			toks = append(toks, word)
+			i = j
+		case isASCIIDigit(c) || c == '.':
+			j := i
+			for j < len(body) && (isASCIIDigit(body[j]) || body[j] == '.') {
+				j++
+			}
+			toks = append(toks, body[i:j])
+			i = j
+		default:
+			return nil, false
+		}
+	}
+	return toks, true
+}
+
+func isASCIILetter(c byte) bool { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') }
+func isASCIIDigit(c byte) bool  { return c >= '0' && c <= '9' }
+
 // ParseIntervalBody decodes a full free-form interval literal body into
 // months/days/micros components, mirroring PostgreSQL's DecodeInterval
 // (postgres/src/backend/utils/adt/datetime.c) for the field shapes goopg
@@ -323,33 +524,54 @@ func parseIntervalTimeToken(tok string) (micros int64, ok bool) {
 //
 // Returns ok=false for any body that doesn't decompose cleanly.
 func ParseIntervalBody(body string) (months, days int32, micros int64, ok bool) {
-	fields := strings.Fields(strings.TrimSpace(body))
+	// Expand glued `<magnitude><unit>` fields (`2h30m`, `1.5h`, `1y2mon`) into
+	// separate tokens first, so the field loop below sees the same token stream
+	// whether the literal was written glued or spaced. expandIntervalFields
+	// rejects the swallowed-DTK_DATE forms PostgreSQL rejects (`1day2h`,
+	// `1w2d`), keeping glued and spaced parsing in lock-step with PG.
+	fields, ok := expandIntervalFields(strings.Fields(strings.TrimSpace(body)))
+	if !ok {
+		return 0, 0, 0, false
+	}
 	if len(fields) == 0 {
 		return 0, 0, 0, false
 	}
 	consumedAny := false
-	secondsOccupied := false // SECOND field-mask bit already set by a prior field
+	// fmask accumulates the field-mask bits already set, exactly like
+	// DecodeInterval's fmask: a field whose tmask intersects fmask is a
+	// bad-format collision (`interval '1 h 2 h'`, `interval '1 mon 2 mons'`,
+	// `interval '1 h 05:00:00'`, `interval '05:00:00 5'`).
+	var fmask intervalFieldMask
+	add := func(tmask intervalFieldMask) bool {
+		if fmask&tmask != 0 {
+			return false
+		}
+		fmask |= tmask
+		return true
+	}
 	for i := 0; i < len(fields); i++ {
 		f := fields[i]
 		if strings.ContainsRune(f, ':') {
 			// Time component (HH:MM[:SS]). PostgreSQL's DecodeTimeForInterval
-			// stamps DTK_TIME_M (HOUR|MINUTE|SECOND) whether or not a seconds
-			// subfield is present, so a time word always occupies the SECOND
-			// slot for the default-unit collision check below.
+			// stamps DTK_TIME_M (HOUR|MINUTE|all SECOND slots) whether or not a
+			// seconds subfield is present, so a time word collides with any
+			// preceding HOUR/MINUTE/SECOND field.
 			mu, tok := parseIntervalTimeToken(f)
-			if !tok {
+			if !tok || !add(imTime) {
 				return 0, 0, 0, false
 			}
 			micros += mu
-			secondsOccupied = true
 			consumedAny = true
 			continue
 		}
 		// SQL-standard year-month field (`1-2` → 1 year 2 months). A
 		// self-contained field that contributes months only (PostgreSQL's
-		// DTK_NUMBER hyphen branch, type DTK_MONTH); it consumes no following
-		// unit word and never occupies the SECOND slot.
+		// DTK_NUMBER hyphen branch, type DTK_MONTH); it occupies the MONTH slot,
+		// so `interval '1-2 3 mons'` collides.
 		if ym, isYM := parseYearMonthField(f); isYM {
+			if !add(imMonth) {
+				return 0, 0, 0, false
+			}
 			months += ym
 			consumedAny = true
 			continue
@@ -369,33 +591,30 @@ func ParseIntervalBody(body string) (months, days int32, micros int64, ok bool) 
 			}
 			i++ // consume the unit word
 			m, d, mu, pok := IntervalUnitToParts(val, fval, unit)
-			if !pok {
+			if !pok || !add(intervalUnitMask(unit, fval != 0)) {
 				return 0, 0, 0, false
 			}
 			months += m
 			days += d
 			micros += mu
-			if unit == "second" {
-				secondsOccupied = true
-			}
 			consumedAny = true
 			continue
 		}
 		// Trailing unitless magnitude: default to SECONDS per PostgreSQL's
 		// full-range typmod. A collision with an already-occupied SECOND slot
 		// is a bad-format error, exactly as DecodeInterval's `tmask & fmask`
-		// check rejects it.
-		if secondsOccupied {
-			return 0, 0, 0, false
-		}
+		// check rejects it (a fractional value widens to imAllSecs).
 		m, d, mu, pok := IntervalUnitToParts(val, fval, "second")
-		if !pok {
+		secondMask := imSecond
+		if fval != 0 {
+			secondMask = imAllSecs
+		}
+		if !pok || !add(secondMask) {
 			return 0, 0, 0, false
 		}
 		months += m
 		days += d
 		micros += mu
-		secondsOccupied = true
 		consumedAny = true
 	}
 	if !consumedAny {

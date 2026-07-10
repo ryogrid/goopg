@@ -268,6 +268,82 @@ func TestMultiFieldIntervalLiterals(t *testing.T) {
 	}
 }
 
+// TestGluedIntervalLiterals covers the glued `<magnitude><unit>` interval body
+// forms (`2h30m`, `1.5h`, `1y2mon3d`, `-5h`) plus the field-mask collision
+// rejections, both introduced by unimplemented_feat #5(d-iii). PostgreSQL's
+// ParseDateTime lexer starts a fresh field at each digit↔letter boundary, so a
+// glued literal decodes identically to its spaced equivalent — EXCEPT that a
+// multi-letter unit glued before a digit is only accepted when the unit letters
+// form a datetktbl token (`d`/`h`/`m`/`s`/`y`/`mon`/`dec`), so `1d2h`/`1mon2d`
+// parse while `1day2h`/`1w2d` error. DecodeInterval's `tmask & fmask` check
+// rejects a repeated field (`1h2h`, `1 mon 2 mons`) or a unit that collides with
+// a `HH:MM:SS` time word (`1h 05:00:00`). Every `want` / rejection was captured
+// from PostgreSQL 18.3.
+func TestGluedIntervalLiterals(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+	if err := runDDL(t, ctx, "CREATE TABLE t (id int)"); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	if err := runDDL(t, ctx, "INSERT INTO t VALUES (1)"); err != nil {
+		t.Fatalf("INSERT: %v", err)
+	}
+	accept := []struct{ sql, want string }{
+		{"SELECT interval '1h'", "01:00:00"},
+		{"SELECT interval '2h30m'", "02:30:00"},
+		{"SELECT interval '1d'", "1 day"},
+		{"SELECT interval '1m'", "00:01:00"},
+		{"SELECT interval '90m'", "01:30:00"},
+		{"SELECT interval '1.5h'", "01:30:00"},
+		{"SELECT interval '1y2mon'", "1 year 2 mons"},
+		{"SELECT interval '1y2mon3d'", "1 year 2 mons 3 days"},
+		{"SELECT interval '1h30m'", "01:30:00"},
+		{"SELECT interval '1h30m 5'", "01:30:05"},
+		{"SELECT interval '1day'", "1 day"},
+		{"SELECT interval '-5h'", "-05:00:00"},
+		{"SELECT interval '2h30'", "02:00:30"},
+		{"SELECT interval '1s2h'", "02:00:01"},
+		{"SELECT interval '1d2h'", "1 day 02:00:00"},
+		{"SELECT interval '1mon2day'", "1 mon 2 days"},
+		{"SELECT interval '1dec2d'", "10 years 2 days"},
+		{"SELECT interval '2h30m40s'", "02:30:40"},
+		// Glued and spaced tokenise the same; the cast path shares the tokenizer.
+		{"SELECT '2h30m'::interval", "02:30:00"},
+		{"SELECT CAST('1y2mon3d' AS interval)", "1 year 2 mons 3 days"},
+		// A trailing unitless number still defaults to seconds after glued units.
+		{"SELECT interval '1h30m 40'", "01:30:40"},
+	}
+	for _, c := range accept {
+		rows := runQuery(t, ctx, c.sql+" FROM t")
+		if len(rows) != 1 || len(rows[0]) != 1 {
+			t.Fatalf("%s: expected 1x1 result, got %v", c.sql, rows)
+		}
+		if got := rows[0][0].Format(); got != c.want {
+			t.Errorf("%s = %q, want %q", c.sql, got, c.want)
+		}
+	}
+
+	reject := []string{
+		"SELECT interval '1days2hours' FROM t", // 'days' ∉ datetktbl → swallowed DTK_DATE
+		"SELECT interval '1day2hour' FROM t",
+		"SELECT interval '1days2h' FROM t",
+		"SELECT interval '1mons2days' FROM t",
+		"SELECT interval '1min2sec' FROM t",
+		"SELECT interval '1w2d' FROM t", // 'w' ∉ datetktbl
+		"SELECT interval '1c2d' FROM t", // 'c' ∉ datetktbl
+		"SELECT interval '1h2h' FROM t", // HOUR field-mask collision
+		"SELECT interval '1 mon 2 mons' FROM t",
+		"SELECT interval '1-2 3 mons' FROM t", // year-month sets MONTH, then 3 mons collides
+		"SELECT interval '1h 05:00:00' FROM t", // 1h HOUR vs time-word HOUR
+		"SELECT interval '1.5 sec 200 ms' FROM t", // fractional SECOND (all-secs) vs ms
+	}
+	for _, sql := range reject {
+		if _, err := runQueryErr(t, ctx, sql); err == nil {
+			t.Errorf("%s: expected error, got none", sql)
+		}
+	}
+}
+
 // TestWeekDecadeCenturyIntervals covers the coarse interval units week /
 // decade / century / millennium and their dec/cent/mil abbreviations
 // (unimplemented_feat #5(c)). PG parses these only inside the interval body

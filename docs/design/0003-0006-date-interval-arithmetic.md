@@ -787,6 +787,64 @@ byte-for-byte from a live PostgreSQL 18.3 instance. Gates: `go build`/`go vet`
 clean; executor + parser suites PASS; `scripts/tpch-spotcheck.sh` PASS
 (Q12=2/Q13=33); pgbench smoke via pre-commit hook.
 
+## Follow-up: glued `<magnitude><unit>` forms + field-mask collisions (#5(d-iii), 2026-07-11)
+
+`interval '2h30m'`, `interval '1.5h'`, `interval '1y2mon3d'`, `interval '-5h'`
+and `interval '1day'` now parse end-to-end, and the field-mask collisions
+PostgreSQL rejects (`interval '1h2h'`, `interval '1 mon 2 mons'`,
+`interval '1-2 3 mons'`, `interval '1h 05:00:00'`, `interval '1.5 sec 200 ms'`)
+now error. This closes the "glued `1m`" tokenizer quirk and the repeated-field
+collision cases the #5(d-ii) doc above left deferred.
+
+**Tokenizer (glued split).** `ParseIntervalBody` previously split only on
+whitespace, so any glued form failed magnitude parsing. It now pre-expands each
+whitespace field through `expandIntervalFields`/`splitAlphaNumRuns`, reproducing
+PostgreSQL `ParseDateTime`'s (postgres/src/backend/utils/adt/datetime.c) rule of
+starting a fresh field at every digit↔letter boundary. The one non-obvious twist
+is faithfully modelled: when an all-letter run is glued immediately before a
+digit, PG consults the **absolute** `datetktbl` (not the interval `deltatktbl`)
+via `datebsearch`; if the run is *not* a key there, PG swallows the run plus the
+following alphanumerics into a single invalid `DTK_DATE` field and errors. The
+interval-unit letters PG keeps in `datetktbl` are exactly `d`, `h`, `m`, `s`,
+`y`, `mon`, `dec`, which is why `1d2h`/`1mon2d`/`1dec2d` parse but
+`1day2h`/`1w2d`/`1min2sec` error. `inDatetktbl` encodes the pure-letter
+`datetktbl` keys; a letter-run glued before a digit that it does not recognise
+returns `ok=false` from `splitAlphaNumRuns`. Fields carrying `:` (time words) or
+an internal `-` (SQL year-month, `1-2`) are left intact and decoded whole, as
+PG's `DTK_TIME` / `DTK_DATE` branches do.
+
+**Field-mask collisions (`fmask`/`tmask`).** The old `secondsOccupied bool`
+tracked only the SECOND slot. It is replaced by an `intervalFieldMask` bitmask
+mirroring DecodeInterval's `fmask`: each decoded field contributes a `tmask`
+(`intervalUnitMask`, or `imMonth` for a year-month field, or `imTime` =
+HOUR|MINUTE|all-SECOND slots for a time word), and a non-zero intersection with
+the running `fmask` is a bad-format error — exactly PG's `if (tmask & fmask)
+return DTERR_BAD_FORMAT`. A SECOND unit with a fractional magnitude widens to
+`imAllSecs` (DTK_ALL_SECS_M), so `interval '1.5 sec 200 ms'` collides while
+`interval '1 sec 200 ms'` does not. Collision detection is order-independent, so
+the left-to-right scan matches PG's right-to-left scan for every shape goopg
+supports.
+
+`IntervalUnitToParts` and `canonicalIntervalUnit` keep their signatures; the mask
+is computed alongside via the new `intervalUnitMask` helper, so the executor's
+single-field typed-literal path (`expr.go`, which calls `IntervalUnitToParts`
+directly) is unaffected and only the shared `ParseIntervalBody` gained the new
+behaviour — keeping the Form-2 and `::interval`/CAST sibling paths in lock-step.
+
+**Still deferred** (see `deferral_ledger.md`): the year-month tokenizer quirks
+`interval '1-'` (→ 1 year) and `interval '1-2.5'` (→ 1 year 2 mons + 0.5 s),
+where PG's `DTK_DATE`/number lexer splits inside a hyphenated field; full
+interval typmod grammar (`HOUR TO MINUTE` ranges, `SECOND(p)` precision, Form-1
+trailing-word column-alias fall-through); ISO-8601 duration bodies
+(`interval 'P1Y2M'`); and interval `±infinity`. Every `want`/error in the new
+tests was captured byte-for-byte from a live PostgreSQL 18.3 instance.
+
+Tests: `internal/executor/interval_subday_test.go`'s new
+`TestGluedIntervalLiterals` (glued accepts across both sibling paths + the
+collision/gobble rejections). Gates: `go build`/`go vet` clean; parser +
+executor interval suites PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+pgbench smoke via pre-commit hook.
+
 ## Cross-references
 
 - TPC-H query bodies: HammerDB upstream
