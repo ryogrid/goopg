@@ -7534,6 +7534,55 @@ mirroring M0119's ledger `status` column.
       (belongs with the `CREATE DATABASE ... TEMPLATE` relation-copy
       mechanism, the last open 4e item); `pg_statistic_ext`/
       `information_schema.routines` registry redesign.
+  - [x] `M0122-0007` 4e follow-up 40 (2026-07-10, this loop) — **the real
+      `CREATE DATABASE ... TEMPLATE` relation-copy mechanism, bounded
+      plain-table case** (the last open 4e item, at least for the common
+      shape). Before: ANY non-empty template errored `FeatureNotSupported`
+      regardless of what it contained. Now: `resolveCreateDatabaseTemplate`
+      (`internal/server/database_ddl.go`) distinguishes "nothing to copy"
+      (unchanged), "every user relation is a plain, unindexed heap table"
+      (proceed to copy), and "contains an index/sequence/view/matview/typed
+      table anywhere" (still `FeatureNotSupported`, now a more specific
+      message). `databaseDDLCreate` gained a source-busy guard (mirrors PG's
+      `CountOtherDBBackends`, `ERRCODE_OBJECT_IN_USE`) and calls new
+      `copyTemplateTables`, which clones each table via `CreateTable` under
+      the new dbOid, physically copies its MainFork relation file
+      (`copyTemplateRelationFile`/`copyRelationFileFsync`, mirrors
+      `relocateRelationPhysicalFile`'s copy+fsync discipline but never
+      touches the source), and persists pg_class/pg_attribute catalog-heap
+      rows via a newly exported `executor.SyncTableToCatalogHeap` (a minimal
+      `*executor.Context` + a short-lived internal mvcc transaction, since
+      CREATE DATABASE runs outside any client transaction) — this reuses
+      M0122-0007 4e follow-up 39's per-database catalog-heap restart-durability
+      mechanism as-is, no new WAL record kind needed. Mid-loop failures unwind
+      via new `rollbackTemplateCopy`. Tests:
+      `TestTryHandleDatabaseDDLCreatePlainTableTemplateCopies` (replaces the
+      old `...NonEmptyTemplateErrors` expectation), new
+      `...WithIndexErrors`/`...WithSequenceErrors`
+      (`internal/server/database_ddl_test.go`); new E2E
+      `TestCreateDatabaseTemplatePlainTableCopiesDataAndSurvivesRestart`
+      (`internal/server/database_template_copy_restart_test.go`): real wire
+      protocol, `INSERT`ed rows, copy visible immediately and after a full
+      server restart, source database unaffected. Design doc
+      `docs/design/0122-0018-per-database-catalog-namespace.md` gained a
+      follow-up-40 subsection; `docs/design/README.md` row updated; deferral
+      ledger row appended (index/sequence/view/matview/typed-table TEMPLATE
+      copying still deferred — its own future loop). Gates: `go build
+      ./...`/`go vet ./...` clean; `go test ./internal/server/...
+      ./internal/catalog/... ./internal/executor/... ./internal/initdb/...`
+      PASS; `go test -race ./internal/server/...` PASS except
+      `TestConnectExceedsPositiveDatconnlimitRejected`, confirmed
+      (re-verified this loop, `-count=3` both with and without this change)
+      to be the pre-existing `internal/activity/registry.go` data race
+      predating this epic, not a regression; `go test -short` full repo
+      (excl. testport) PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      pgbench smoke via pre-commit hook. **Remaining M0122-0007 scope
+      (deferred, own future loops):** index/sequence/view/matview/typed-table
+      TEMPLATE copying (needs index-file cloning + per-database sys-btree
+      catalog bootstrap, sequence-state cloning, view/matview AST cloning,
+      composite-type OID resolution); per-database index/type catalog rows +
+      sys-btree bootstrap (independent of TEMPLATE copy);
+      `pg_statistic_ext`/`information_schema.routines` registry redesign.
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,

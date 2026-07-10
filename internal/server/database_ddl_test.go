@@ -714,17 +714,20 @@ func TestTryHandleDatabaseDDLCreateEmptyTemplateSucceeds(t *testing.T) {
 	}
 }
 
-// TestTryHandleDatabaseDDLCreateNonEmptyTemplateErrors pins the correctness
-// fix this loop landed: before it, CREATE DATABASE ... TEMPLATE against a
-// database with real user tables silently created an EMPTY database instead
-// (classifyDatabaseDDL's "trailing options are ignored" looseness), which is
-// a silent semantic mismatch with real PostgreSQL (which actually copies the
-// template's contents) — a shape of bug this project treats as a priority
-// fix even before the full copy mechanism lands (see the "silent wrong
-// behavior" precedent in the M0122-0007 4e FK-enforcement fix). goopg does
-// not yet implement the real relation-copy mechanism, so this must now fail
-// LOUDLY with a typed FeatureNotSupported error instead.
-func TestTryHandleDatabaseDDLCreateNonEmptyTemplateErrors(t *testing.T) {
+// TestTryHandleDatabaseDDLCreatePlainTableTemplateCopies pins the
+// M0122-0007 4e relation-copy mechanism: a template database whose only user
+// relation is a plain, unindexed heap table is now actually COPIED (not
+// silently ignored, and not rejected) — a real, semantics-preserving TEMPLATE
+// per real PostgreSQL's createdb(), rather than either of the two prior wrong
+// behaviors (silently producing an empty database, or the interim
+// FeatureNotSupported rejection this loop replaces for the plain-table case).
+// This fixture's server has no Pool/TxnMgr wired (newTestRoleServer), so the
+// physical file copy and catalog-heap sync are both no-ops — only the
+// in-memory catalog.Table clone under the new dbOid is exercised here; the
+// full physical-copy + restart-durability path is covered by
+// TestCreateDatabaseTemplatePlainTableCopiesDataAndSurvivesRestart
+// (table_dbid_restart_test.go).
+func TestTryHandleDatabaseDDLCreatePlainTableTemplateCopies(t *testing.T) {
 	s := newTestRoleServer()
 	im := s.cfg.Catalog.(*catalog.InMemory)
 
@@ -738,13 +741,86 @@ func TestTryHandleDatabaseDDLCreateNonEmptyTemplateErrors(t *testing.T) {
 	}
 
 	handled, _, err := s.tryHandleDatabaseDDL("CREATE DATABASE foo TEMPLATE nonemptysrc", "postgres", "", nil)
+	if !handled || err != nil {
+		t.Fatalf("CREATE DATABASE foo TEMPLATE nonemptysrc: handled=%v err=%v, want success", handled, err)
+	}
+	if !im.HasDatabase("foo") {
+		t.Fatal("CREATE DATABASE foo TEMPLATE nonemptysrc: database was not registered")
+	}
+	newOid := im.DatabaseOid("foo")
+	tables := im.AllTables(newOid)
+	if len(tables) != 1 || tables[0].Name != "t" {
+		t.Fatalf("AllTables(foo) = %+v, want exactly one table named \"t\"", tables)
+	}
+	if tables[0].OID == srcOid {
+		t.Error("copied table kept the template's own OID instead of getting a fresh one")
+	}
+}
+
+// TestTryHandleDatabaseDDLCreateTemplateWithIndexErrors pins the still-
+// rejected shape: a template containing an INDEX cannot be copied by this
+// bounded slice (no index-file cloning implemented yet) even though its
+// table alone would otherwise qualify — must fail LOUDLY with a typed
+// FeatureNotSupported error, not silently produce an empty or a
+// partially-copied database.
+func TestTryHandleDatabaseDDLCreateTemplateWithIndexErrors(t *testing.T) {
+	s := newTestRoleServer()
+	im := s.cfg.Catalog.(*catalog.InMemory)
+
+	if handled, _, err := s.tryHandleDatabaseDDL("CREATE DATABASE idxsrc", "postgres", "", nil); !handled || err != nil {
+		t.Fatalf("CREATE DATABASE idxsrc: handled=%v err=%v", handled, err)
+	}
+	srcOid := im.DatabaseOid("idxsrc")
+	cols := []catalog.Column{{Name: "id", Type: catalog.Type{Name: "int4"}, Ordinal: 0}}
+	tbl, err := im.CreateTable(parser.ObjectName{Name: "t"}, cols, srcOid)
+	if err != nil {
+		t.Fatalf("CreateTable under idxsrc: %v", err)
+	}
+	if _, err := im.CreateIndex(parser.ObjectName{Name: "t_id_idx"}, tbl, []string{"id"}, false, "btree", false, srcOid); err != nil {
+		t.Fatalf("CreateIndex under idxsrc: %v", err)
+	}
+
+	handled, _, err := s.tryHandleDatabaseDDL("CREATE DATABASE foo TEMPLATE idxsrc", "postgres", "", nil)
 	if !handled || err == nil {
-		t.Fatalf("CREATE DATABASE foo TEMPLATE nonemptysrc: handled=%v err=%v, want a typed error", handled, err)
+		t.Fatalf("CREATE DATABASE foo TEMPLATE idxsrc: handled=%v err=%v, want a typed error", handled, err)
 	}
 	if got := databaseDDLErrorSQLState(err); got != sqlstate.FeatureNotSupported {
 		t.Errorf("SQLSTATE = %q, want %q", got, sqlstate.FeatureNotSupported)
 	}
 	if im.HasDatabase("foo") {
-		t.Error("CREATE DATABASE foo TEMPLATE nonemptysrc: database was registered despite the error")
+		t.Error("CREATE DATABASE foo TEMPLATE idxsrc: database was registered despite the error")
+	}
+}
+
+// TestTryHandleDatabaseDDLCreateTemplateWithSequenceErrors pins the same
+// still-rejected shape for a sequence relation.
+func TestTryHandleDatabaseDDLCreateTemplateWithSequenceErrors(t *testing.T) {
+	s := newTestRoleServer()
+	im := s.cfg.Catalog.(*catalog.InMemory)
+
+	if handled, _, err := s.tryHandleDatabaseDDL("CREATE DATABASE seqsrc", "postgres", "", nil); !handled || err != nil {
+		t.Fatalf("CREATE DATABASE seqsrc: handled=%v err=%v", handled, err)
+	}
+	srcOid := im.DatabaseOid("seqsrc")
+	seqCols := []catalog.Column{
+		{Name: "last_value", Type: catalog.Type{Name: "int8"}, Ordinal: 0},
+		{Name: "log_cnt", Type: catalog.Type{Name: "int8"}, Ordinal: 1},
+		{Name: "is_called", Type: catalog.Type{Name: "bool"}, Ordinal: 2},
+	}
+	seq, err := im.CreateTable(parser.ObjectName{Name: "s"}, seqCols, srcOid)
+	if err != nil {
+		t.Fatalf("CreateTable(sequence) under seqsrc: %v", err)
+	}
+	seq.IsSequence = true
+
+	handled, _, err := s.tryHandleDatabaseDDL("CREATE DATABASE foo TEMPLATE seqsrc", "postgres", "", nil)
+	if !handled || err == nil {
+		t.Fatalf("CREATE DATABASE foo TEMPLATE seqsrc: handled=%v err=%v, want a typed error", handled, err)
+	}
+	if got := databaseDDLErrorSQLState(err); got != sqlstate.FeatureNotSupported {
+		t.Errorf("SQLSTATE = %q, want %q", got, sqlstate.FeatureNotSupported)
+	}
+	if im.HasDatabase("foo") {
+		t.Error("CREATE DATABASE foo TEMPLATE seqsrc: database was registered despite the error")
 	}
 }

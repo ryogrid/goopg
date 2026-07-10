@@ -13009,6 +13009,22 @@ func applyFDWOptionChanges(existing []string, changes []parser.FDWOptionChange) 
 	return result, nil
 }
 
+// SyncTableToCatalogHeap exports syncTableToCatalogHeap for callers outside
+// this package — specifically internal/server's CREATE DATABASE ... TEMPLATE
+// relation-copy path (database_ddl.go's copyTemplateTables), which persists a
+// freshly cloned table's pg_class/pg_attribute catalog-heap rows under the
+// new database's own namespace exactly as execCreateTable does for an
+// ordinary CREATE TABLE. M0122-0007 4e (TEMPLATE relation-copy).
+func SyncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
+	return syncTableToCatalogHeap(ctx, tbl)
+}
+
+// CatalogHeapSyncAvailable exports catalogHeapSyncAvailable for the same
+// caller as SyncTableToCatalogHeap above.
+func CatalogHeapSyncAvailable(ctx *Context) bool {
+	return catalogHeapSyncAvailable(ctx)
+}
+
 // syncTableToCatalogHeap writes one pg_class row and one pg_attribute row per
 // column for tbl. Called by execCreateTable after in-memory catalog is updated.
 //

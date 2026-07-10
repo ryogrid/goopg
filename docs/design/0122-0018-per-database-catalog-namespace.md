@@ -1,6 +1,6 @@
 # Per-database catalog namespace (M0122-0007 slice 4)
 
-Status: accepted (sub-slices 4a, 4b-i, 4b-ii, 4c, 4d-i, 4d-ii-part-1, and 4d-ii-part-2a landed; 4d-ii-part-2b items 1, 2, and 3 all fully landed; 4e's FK-target-resolution, sequence-ownership, and view-constraint-dependency items all landed; `CREATE DATABASE ... TEMPLATE` bounded validation landed 2026-07-10; the pg_class-under-fresh-database gap (name resolution generically, row enumeration for pg_class specifically) landed 2026-07-10, and the pg_indexes/pg_tables, pg_constraint, pg_index, pg_attrdef/pg_depend, pg_inherits, pg_policy, pg_trigger, pg_rewrite, pg_foreign_table, and pg_sequence row-content follow-ups landed the same day, plus the `oid::regclass`/`'name'::regclass` cast-direction dbOid-scoping gap (follow-up 33) — 2 sibling virtual-table builders (pg_statistic_ext, information_schema.routines/parameters/routine_*_usage) plus pg_sequences/information_schema.sequences (follow-up 34's narrowed remainder) plus the c.foreignServers registry-dbOid-key gap (follow-up 36, landed) and its same-shape c.userMappings sibling (follow-up 37, landed 2026-07-10); follow-up 37's own CURRENT_USER/SESSION_USER/CURRENT_ROLE/USER role-spec resolution discovery closed same-day (follow-up 38); restart durability for user tables created under a distinct-dbOid database — per-database pg_class/pg_attribute heap routing + startup reload into the owning namespace — landed same-day (follow-up 39) — the real relation-copy mechanism remains planned, see "Remaining 4e work" below)
+Status: accepted (sub-slices 4a, 4b-i, 4b-ii, 4c, 4d-i, 4d-ii-part-1, and 4d-ii-part-2a landed; 4d-ii-part-2b items 1, 2, and 3 all fully landed; 4e's FK-target-resolution, sequence-ownership, and view-constraint-dependency items all landed; `CREATE DATABASE ... TEMPLATE` bounded validation landed 2026-07-10; the pg_class-under-fresh-database gap (name resolution generically, row enumeration for pg_class specifically) landed 2026-07-10, and the pg_indexes/pg_tables, pg_constraint, pg_index, pg_attrdef/pg_depend, pg_inherits, pg_policy, pg_trigger, pg_rewrite, pg_foreign_table, and pg_sequence row-content follow-ups landed the same day, plus the `oid::regclass`/`'name'::regclass` cast-direction dbOid-scoping gap (follow-up 33) — 2 sibling virtual-table builders (pg_statistic_ext, information_schema.routines/parameters/routine_*_usage) plus pg_sequences/information_schema.sequences (follow-up 34's narrowed remainder) plus the c.foreignServers registry-dbOid-key gap (follow-up 36, landed) and its same-shape c.userMappings sibling (follow-up 37, landed 2026-07-10); follow-up 37's own CURRENT_USER/SESSION_USER/CURRENT_ROLE/USER role-spec resolution discovery closed same-day (follow-up 38); restart durability for user tables created under a distinct-dbOid database — per-database pg_class/pg_attribute heap routing + startup reload into the owning namespace — landed same-day (follow-up 39); the real `CREATE DATABASE ... TEMPLATE` relation-copy mechanism itself landed 2026-07-10 for its bounded plain-table case (follow-up 40) — index/sequence/view/matview TEMPLATE copying remains deferred, see "Remaining 4e work" below)
 Date: 2026-07-10
 Supersedes: none — extends the "Still open" note in
 `0122-0017-database-ddl-drop-guards.md` and the deferral-ledger rows dated
@@ -1649,6 +1649,110 @@ view/matview/column-default WAL records still carry no dbOid field
 (`LookupTableByOIDAllDBs` compensates; a dbOid trailer would be the
 PG-faithful shape).
 
+**`CREATE DATABASE ... TEMPLATE` relation-copy mechanism, bounded plain-table
+case — LANDED (2026-07-10, follow-up 40).** The last open 4e item. Before
+this, `resolveCreateDatabaseTemplate` rejected ANY template with a non-empty
+user relation set outright (`FeatureNotSupported`) — TEMPLATE never actually
+copied anything, unlike real PostgreSQL's `createdb()`, which physically
+copies each of the template's relation files
+(`copy_relation_data`, `postgres/src/backend/commands/dbcommands.c`). This
+lands that copy for the common bounded case: a template whose user relations
+are ALL plain, unindexed heap tables (`!Virtual && View == nil &&
+!IsMatView && !IsSequence && OfTypeOID == 0`, and the template's dbOid has
+ZERO registered indexes at all — an index anywhere in the database rules out
+the whole copy, since goopg still has no per-database sys-btree catalog
+bootstrap, see follow-up 39's own deferral). Index/sequence/view/matview/
+typed-table TEMPLATE copying remains deferred (own future loops — see the
+deferral ledger's follow-up-40 row).
+
+- **`internal/server/database_ddl.go`:** `resolveCreateDatabaseTemplate` now
+  returns `(srcOid uint32, tables []*catalog.Table, err error)` instead of a
+  bare `error`: `tables == nil, err == nil` means "nothing to copy" (the
+  pre-existing `DefaultDBOid`-alias shortcut and the true-empty case both
+  keep this shape unchanged — relied on by
+  `TestTryHandleDatabaseDDLCreateEmptyTemplateSucceeds`); a non-empty
+  `tables` with `err == nil` means the bounded plain-table case applies;
+  `err != nil` (still `FeatureNotSupported`) means the template contains an
+  index/sequence/view/matview/typed table anywhere. New
+  `databaseTemplateRegistry.AllIndexes` method (already existed on
+  `catalog.InMemory`) backs the index-anywhere-in-the-database rejection.
+  `databaseDDLCreate`'s `CREATE DATABASE` branch, when `tables` is non-empty:
+  (1) enforces a source-database busy guard mirroring PG's
+  `CountOtherDBBackends(src_dboid)` (`s.cfg.Activity.CountByDatName`,
+  `ERRCODE_OBJECT_IN_USE`) — only when there is real content to copy, so the
+  empty-template path needs no such guard; (2) after
+  `createDatabasePhysicalDirectory` succeeds, calls new
+  `s.copyTemplateTables(srcOid, newOid, tables)`; (3) on any failure (copy or
+  the subsequent WAL append), rolls back via new `s.rollbackTemplateCopy`
+  (drops every table already registered under `newOid`) in addition to the
+  existing `cat.DropDatabase` + `removeDatabasePhysicalDirectory` undo.
+- **`copyTemplateTables`** clones each template table into the new dbOid:
+  (a) a fresh `catalog.Table` via `catalog.InMemory.CreateTable(name, cols,
+  newOid)` (a deep-copied `[]Column` slice, so the clone never shares
+  backing-array storage with the template's own columns — `CreateTable`
+  itself copies again internally); (b) a physical copy of the relation's
+  `MainFork` data file via new `copyTemplateRelationFile`, which mirrors
+  `internal/executor/operators_ddl.go`'s `relocateRelationPhysicalFile`
+  copy+fsync discipline (flush the source, copy the bytes, fsync the
+  destination) but — unlike that tablespace-move helper — never touches the
+  source file afterward, since the template database keeps living; a source
+  file that doesn't exist yet (relation created but never physically
+  written) is a tolerated no-op, matching `relocateRelationPhysicalFile`'s
+  own tolerance; (c) a `pg_class`/`pg_attribute` catalog-heap sync (plus the
+  column-DEFAULT WAL snapshot, both automatic side effects) via the newly
+  exported `executor.SyncTableToCatalogHeap`/`executor.CatalogHeapSyncAvailable`
+  (thin wrappers around the pre-existing unexported
+  `syncTableToCatalogHeap`/`catalogHeapSyncAvailable`), called from new
+  `syncCopiedTableCatalogHeap`. Because `CREATE DATABASE` runs outside any
+  user session's transaction, `syncCopiedTableCatalogHeap` builds its own
+  minimal `*executor.Context` (`Pool`/`Catalog`/`TxnMgr`/`Tx`/`Snap`/`WAL`/
+  `LogCanonical`/`CurrentDatabaseOid`) and opens+commits a short-lived
+  internal `mvcc.Manager` transaction around the sync — the same "build a
+  minimal Context, no session/planner state" shape
+  `internal/executor/applyworker.go` already uses for its own out-of-band
+  heap writes (logical replication apply, which also has no client
+  transaction to ride).
+- Column fidelity: no changes were needed to `catalog.Column` or
+  `CreateTable` — the copied `[]Column` slice already carries
+  `DefaultExpr`/`NotNull`/identity fields verbatim, and
+  `syncTableToCatalogHeap`'s existing tail (unconditional on which caller
+  invokes it) already snapshots every defaulted column's expression as SQL
+  text via a `wal.EncodeColumnDefaults` record — a copied table's DEFAULT
+  survives a restart exactly like an ordinary `CREATE TABLE ... DEFAULT`'s
+  does, with no separate wiring.
+- Tests: `TestTryHandleDatabaseDDLCreatePlainTableTemplateCopies`
+  (`internal/server/database_ddl_test.go`, replaces the old
+  `...NonEmptyTemplateErrors` test now that a plain-table template is
+  copyable) asserts the in-memory clone under a catalog-only fixture (no
+  Pool/TxnMgr, so the physical-copy/heap-sync steps are no-ops — only
+  `CreateTable`'s clone is exercised); new
+  `TestTryHandleDatabaseDDLCreateTemplateWithIndexErrors`/
+  `...WithSequenceErrors` pin the still-rejected kinds. New E2E test
+  `TestCreateDatabaseTemplatePlainTableCopiesDataAndSurvivesRestart`
+  (`internal/server/database_template_copy_restart_test.go`, new file,
+  mirrors follow-up 39's own `table_dbid_restart_test.go` shape): real wire
+  protocol creates a source database + a plain table with real `INSERT`ed
+  rows, `CREATE DATABASE ... TEMPLATE`s it, and asserts the copy's table AND
+  its rows are visible both immediately and after a full server restart from
+  the same data directory — proof the copy is durable (real physical file +
+  real catalog-heap rows), not an in-memory-only illusion — while the
+  template source stays completely unaffected throughout. Gates: `go build
+  ./...`/`go vet ./...` clean; `go test ./internal/server/... ./internal/catalog/...
+  ./internal/executor/... ./internal/initdb/...` PASS; `go test -race
+  ./internal/server/...` PASS except the pre-existing, unrelated
+  `TestConnectExceedsPositiveDatconnlimitRejected` race documented above (not
+  introduced by this change — reproduces identically on unmodified code);
+  `go test -short` full repo (excl. testport) PASS; `scripts/tpch-spotcheck.sh`
+  PASS (Q12=2/Q13=33).
+- **Deferred (see the deferral ledger's follow-up-40 row):** copying an
+  index, sequence, view, materialized view, or typed table anywhere in the
+  template still errors with `FeatureNotSupported` — each needs its own
+  clone logic (index-file cloning + sys-btree catalog bootstrap for
+  sequences' backing relation and indexes; AST/definition cloning for
+  views/matviews; composite-type OID resolution for typed tables) that this
+  bounded loop deliberately left for future work rather than risk landing
+  all of it, untested, in one pass.
+
 ## Recommended order and stopping points
 
 4a (landed) → 4b-i (landed) → 4b-ii (landed) → 4c (landed) → 4d-i (landed) →
@@ -1669,14 +1773,16 @@ copy mechanism). 4e's FK-target-resolution, sequence-ownership, and view
 constraint-dependency items are now all landed (2026-07-10, see their
 sections above); `CREATE DATABASE ... TEMPLATE`'s bounded
 existence/emptiness validation also landed (2026-07-10, see its own section
-above) — **4e's only remaining item is the real
-`CREATE DATABASE ... TEMPLATE` relation-copy mechanism itself**, now
-unblocked since both of its prerequisites landed. Before starting it, read
-4d-i's,
+above); the real relation-copy mechanism itself has now ALSO landed
+(2026-07-10, follow-up 40, see its own section above) for its bounded
+plain-table case — **4e's only remaining scope is extending that copy
+mechanism to index/sequence/view/matview/typed-table templates** (see the
+deferral ledger's follow-up-40 row for the resume point). Before starting
+that extension, read 4d-i's,
 4d-ii-part-1's, and 4d-ii-part-2a's/4d-ii-part-2b's/4e's landed sections
 above in full — they document exactly which write entry points and lookups
-already thread the connection's real dbOid (so the template-copy mechanism
-must resolve the SAME
+already thread the connection's real dbOid (so any extension must resolve
+the SAME
 `catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)` value to actually find
 what earlier sub-slices create), the `postgres`/`DefaultDBOid` dual-mirror
 shim that still applies unchanged, and the `ns()`/`getOrCreateNS` split

@@ -31,25 +31,37 @@ package server
 // catalog.tableNamespace and its own base/<dbOid> physical directory
 // (internal/storage/smgr.go), and CREATE DATABASE ... TEMPLATE is validated
 // against the template's real per-database relation set
-// (resolveCreateDatabaseTemplate below) rather than silently ignored. What
-// remains unimplemented is the actual TEMPLATE relation-copy mechanism
-// itself (see resolveCreateDatabaseTemplate's and
-// createDatabasePhysicalDirectory's doc comments) — everything else in this
-// file's original scope note (pg_database surviving a crash, connections to
-// a recovered database succeeding) still holds.
+// (resolveCreateDatabaseTemplate below) rather than silently ignored.
+// TEMPLATE now also actually COPIES the bounded case real PostgreSQL's
+// createdb() handles most commonly: a template whose user relations are all
+// plain, unindexed heap tables (copyTemplateTables below) — physically
+// copying each relation's MainFork file plus registering fresh catalog.Table
+// entries and pg_class/pg_attribute catalog-heap rows under the new dbOid.
+// Templates containing an index, sequence, view, materialized view, or typed
+// table still error with FeatureNotSupported (see
+// resolveCreateDatabaseTemplate's doc comment and the deferral ledger) —
+// everything else in this file's original scope note (pg_database surviving
+// a crash, connections to a recovered database succeeding) still holds.
 
 import (
 	"errors"
 	"fmt"
+	"io"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/executor"
 	"github.com/goopg/goopg/internal/initdb"
+	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/protocol"
 	"github.com/goopg/goopg/internal/sqlstate"
+	"github.com/goopg/goopg/internal/storage"
 	"github.com/goopg/goopg/internal/wal"
 )
 
@@ -547,69 +559,98 @@ func (s *Server) resolveActingRoleOID(actingRole string) uint32 {
 }
 
 // resolveCreateDatabaseTemplate resolves templateName to the real dbOid
-// CREATE DATABASE ... TEMPLATE should copy from, applying the two checks
-// goopg's still-bounded template support enforces today: the template
-// database must exist (mirrors dbcommands.c createdb()'s get_db_info
-// ERRCODE_UNDEFINED_DATABASE check), and — since goopg does not yet
-// implement the real relation-copy mechanism (M0122-0007 4e's last item; see
-// the deferral ledger) — it must currently have zero USER relations (tables,
-// views, materialized views and sequences all live in the same per-database
-// catalog.Table registry, see AllTables; system/catalog tables — anything
-// below catalog.FirstUserOID, e.g. the heap-backed pg_attribute/pg_type rows
-// every database's namespace carries from bootstrap — are excluded, since
-// their presence doesn't mean the database has any actual user content to
-// lose by not copying), the only case goopg can honor correctly today.
+// CREATE DATABASE ... TEMPLATE should copy from, plus the set of the
+// template's own tables that this bounded slice knows how to copy. The
+// template database must exist (mirrors dbcommands.c createdb()'s
+// get_db_info ERRCODE_UNDEFINED_DATABASE check). Beyond that, three shapes
+// are distinguished:
 //
-// The emptiness check is skipped entirely when templateName resolves to
-// catalog.DefaultDBOid: "template1" and "postgres" both alias that one
+//   - templateName resolves to catalog.DefaultDBOid ("template1"/"postgres",
+//     see the dual-mirror note below), or genuinely has zero user relations:
+//     returns (0, nil, nil) — "nothing to copy", the caller proceeds exactly
+//     like a plain CREATE DATABASE (unchanged pre-existing behavior, relied
+//     on by TestTryHandleDatabaseDDLCreateEmptyTemplateSucceeds).
+//   - every one of the template's user relations is a plain, unindexed heap
+//     table (!Virtual && View == nil && !IsMatView && !IsSequence &&
+//     OfTypeOID == 0, and the template's dbOid has zero registered indexes at
+//     all): returns (srcOid, tables, nil) — the caller copies each table via
+//     copyTemplateTables.
+//   - the template contains anything else this slice does not implement
+//     copying for (an index anywhere in the database, a sequence, a view, a
+//     materialized view, or a typed table): returns a FeatureNotSupported
+//     error. Index/sequence/view/matview/typed-table TEMPLATE copying is
+//     deferred to a future loop (see the deferral ledger) — copying just the
+//     bounded common case (a plain single-table-set database) first keeps
+//     this loop's blast radius bounded to catalog.Table cloning + a raw
+//     relation-file copy, without also having to invent index-file cloning,
+//     sequence-state cloning, or view/matview AST cloning in the same pass.
+//
+// The emptiness/kind checks are skipped entirely when templateName resolves
+// to catalog.DefaultDBOid: "template1" and "postgres" both alias that one
 // shared oid in goopg's current architecture (the pre-existing postgres/
 // DefaultDBOid dual-mirror, design 0122-0018-per-database-catalog-
 // namespace.md) — a legacy namespace that predates per-database storage
 // isolation and that every fixture and pre-4c code path still writes real
 // user tables into. There is no way to tell "template1's own content" apart
-// from "postgres's own content" at that shared oid, so the emptiness check
-// would misfire on every server that has ever created a table (the
-// overwhelmingly common case) — skip it and keep the exact pre-existing
-// behavior (silently produce an empty new database) there, same as before
-// this loop. Only a template that resolves to its OWN distinct,
-// CreateDatabase-allocated dbOid (any other registered database, or
-// template0's fixed, never-aliased oid 4) gets the new strict check, since
-// only there is "empty" a reliable, meaningful question — and that is
-// exactly the case that used to silently create an empty database instead
-// of copying anything, a real data-loss-shaped mismatch with PostgreSQL this
-// turns into an explicit error. A catalog that doesn't expose
-// databaseTemplateRegistry (some test/embedded paths) skips both checks,
-// matching every other soft-typed-interface fallback in this file.
-func (s *Server) resolveCreateDatabaseTemplate(templateName string) error {
+// from "postgres's own content" at that shared oid, so any check there would
+// misfire on every server that has ever created a table (the overwhelmingly
+// common case) — skip it and keep the exact pre-existing behavior (silently
+// produce an empty new database) there, same as before this loop. Only a
+// template that resolves to its OWN distinct, CreateDatabase-allocated dbOid
+// (any other registered database, or template0's fixed, never-aliased oid 4)
+// gets the new checks, since only there are they reliable/meaningful
+// questions. A catalog that doesn't expose databaseTemplateRegistry (some
+// test/embedded paths) skips every check, matching every other soft-typed-
+// interface fallback in this file.
+func (s *Server) resolveCreateDatabaseTemplate(templateName string) (srcOid uint32, tables []*catalog.Table, err error) {
 	tmpl, ok := s.cfg.Catalog.(databaseTemplateRegistry)
 	if !ok {
-		return nil
+		return 0, nil, nil
 	}
 	oid, ok := tmpl.ResolveDatabaseOid(templateName)
 	if !ok {
-		return &databaseDDLError{
+		return 0, nil, &databaseDDLError{
 			code: sqlstate.UndefinedDatabase,
 			msg:  fmt.Sprintf("template database %q does not exist", templateName),
 		}
 	}
 	if oid == catalog.DefaultDBOid {
-		return nil
+		return 0, nil, nil
 	}
-	hasUserRelations := false
+	// Any index anywhere in the template rules out the whole database for
+	// this bounded slice — goopg has no per-database sys-btree catalog
+	// bootstrap yet (M0122-0007 4e follow-up 39's own deferral) and this loop
+	// does not implement index-file cloning, so even a template whose TABLES
+	// are otherwise all plain heap tables cannot be copied if any of them
+	// carries an index.
+	unsupported := len(tmpl.AllIndexes(oid)) > 0
+	var userTables []*catalog.Table
 	for _, t := range tmpl.AllTables(oid) {
-		if !catalog.IsSystemRelation(t.OID) {
-			hasUserRelations = true
-			break
+		if catalog.IsSystemRelation(t.OID) {
+			// System/catalog relations (anything below catalog.FirstUserOID,
+			// e.g. the heap-backed pg_attribute/pg_type rows every database's
+			// namespace carries from bootstrap) don't represent user content
+			// to copy and are never rejected for being present.
+			continue
 		}
+		if t.View != nil || t.IsMatView || t.IsSequence || t.OfTypeOID != 0 {
+			unsupported = true
+			continue
+		}
+		userTables = append(userTables, t)
 	}
-	if hasUserRelations {
-		return &databaseDDLError{
+	if unsupported {
+		return 0, nil, &databaseDDLError{
 			code: sqlstate.FeatureNotSupported,
-			msg: fmt.Sprintf("CREATE DATABASE ... TEMPLATE %q: copying a "+
-				"non-empty template database is not yet supported", templateName),
+			msg: fmt.Sprintf("CREATE DATABASE ... TEMPLATE %q: copying a template database "+
+				"containing indexes, sequences, views, materialized views, or typed tables "+
+				"is not yet supported", templateName),
 		}
 	}
-	return nil
+	if len(userTables) == 0 {
+		return 0, nil, nil
+	}
+	return oid, userTables, nil
 }
 
 // createDatabasePhysicalDirectory creates base/<oid>/PG_VERSION for a
@@ -623,17 +664,18 @@ func (s *Server) resolveCreateDatabaseTemplate(templateName string) error {
 // silent no-op — the registry entry still stands alone, matching how other
 // DDL operators skip cluster-filesystem effects in those contexts.
 //
-// TEMPLATE's target-existence and target-is-empty checks now happen earlier,
-// in resolveCreateDatabaseTemplate (called from tryHandleDatabaseDDL before
-// this function runs) — but this function itself still only creates an
-// EMPTY scaffold: it never copies the template's relation files into the new
-// oid's directory. That is fine for every TEMPLATE this bounded slice
-// accepts (template0/template1/any other currently-empty database all have
-// zero relations to copy), but it means the real
-// `CreateDatabaseUsingFileCopy`-equivalent copy step — physically copying
-// each of the template's relation files here, plus deep-copying the source
-// dbOid's catalog.tableNamespace (tables/indexes/sequences/views) under
-// freshly allocated OIDs — remains unimplemented. See the deferral ledger.
+// TEMPLATE's target-existence and target-kind checks happen earlier, in
+// resolveCreateDatabaseTemplate (called from tryHandleDatabaseDDL before this
+// function runs) — but this function itself still only ever creates an EMPTY
+// scaffold: it never copies the template's relation files into the new oid's
+// directory. When resolveCreateDatabaseTemplate did find real tables to copy,
+// tryHandleDatabaseDDL calls copyTemplateTables (below) separately, AFTER
+// this function, to physically copy each relation file and register the
+// cloned catalog.Table entries — the two-step split keeps this function's own
+// contract (an empty base/<oid> scaffold) unchanged for every caller that
+// still has nothing to copy (template0/template1/any other currently-empty
+// database). Index/sequence/view/matview TEMPLATE copying remains
+// unimplemented — see the deferral ledger.
 func (s *Server) createDatabasePhysicalDirectory(oid uint32) error {
 	if s.cfg.Pool == nil {
 		return nil
@@ -666,6 +708,205 @@ func (s *Server) removeDatabasePhysicalDirectory(oid uint32) {
 		return
 	}
 	_ = initdb.RemovePerDatabaseScaffolding(dataDir, oid)
+}
+
+// copyTemplateTables clones each of tables (already validated by
+// resolveCreateDatabaseTemplate as plain, unindexed heap tables owned by
+// srcOid) into newOid: a fresh catalog.Table registration under newOid, a
+// physical copy of the relation's MainFork data file, and pg_class/
+// pg_attribute catalog-heap rows so a restart rediscovers the copy through
+// the same per-database catalog-heap loader M0122-0007 4e follow-up 39 wired
+// for an ordinary CREATE TABLE (internal/initdb/open.go's
+// loadUserTablesFromHeapForDB). Mirrors real PostgreSQL's createdb(), which
+// physically copies each relation's heap file page-by-page
+// (copy_relation_data, postgres/src/backend/commands/dbcommands.c) rather
+// than re-inserting rows one at a time — the row bytes are opaque tuples,
+// self-describing only via the catalog's own TupleDesc (registered here
+// separately via CreateTable), so copying the raw file brings the DATA along
+// for free.
+//
+// On any failure partway through the loop, every table already registered
+// under newOid by this call is unwound via rollbackTemplateCopy before the
+// error is returned. The caller (databaseDDLCreate) additionally drops the
+// whole new database registration/directory, but rollbackTemplateCopy keeps
+// the in-memory catalog's per-oid namespace map from carrying a half-copied
+// table set even for that brief window.
+func (s *Server) copyTemplateTables(srcOid, newOid uint32, tables []*catalog.Table) error {
+	im, ok := s.cfg.Catalog.(*catalog.InMemory)
+	if !ok {
+		// No concrete InMemory catalog to clone into (some test/embedded
+		// paths) — resolveCreateDatabaseTemplate already required this same
+		// concrete type (via databaseTemplateRegistry) to produce a non-nil
+		// tables slice, so this is unreachable in practice; defensive no-op
+		// matches every other soft-typed-interface fallback in this file.
+		return nil
+	}
+	for _, srcTbl := range tables {
+		// Deep-copy the column slice: CreateTable copies it again internally,
+		// but this local copy ensures the clone never shares backing-array
+		// storage with the template's own Table.Columns, even transiently.
+		cols := append([]catalog.Column(nil), srcTbl.Columns...)
+		name := parser.ObjectName{Schema: srcTbl.Schema, Name: srcTbl.Name}
+		newTbl, err := im.CreateTable(name, cols, newOid)
+		if err != nil {
+			s.rollbackTemplateCopy(newOid)
+			return fmt.Errorf("cloning table %q: %w", srcTbl.Name, err)
+		}
+		oldRel := storage.RelFileNode{DBOid: srcOid, RelOid: srcTbl.OID, Fork: storage.MainFork}
+		newRel := storage.RelFileNode{DBOid: newOid, RelOid: newTbl.OID, Fork: storage.MainFork}
+		if err := s.copyTemplateRelationFile(oldRel, newRel); err != nil {
+			s.rollbackTemplateCopy(newOid)
+			return fmt.Errorf("copying relation file for table %q: %w", srcTbl.Name, err)
+		}
+		if err := s.syncCopiedTableCatalogHeap(newOid, newTbl); err != nil {
+			s.rollbackTemplateCopy(newOid)
+			return fmt.Errorf("syncing catalog heap for table %q: %w", srcTbl.Name, err)
+		}
+	}
+	return nil
+}
+
+// rollbackTemplateCopy removes every table copyTemplateTables has registered
+// under newOid so far, undoing a partial copy after a mid-loop failure.
+// Best-effort: DropTable's own "does not exist" error can't fire here since
+// every name being dropped came straight from AllTables(newOid).
+func (s *Server) rollbackTemplateCopy(newOid uint32) {
+	im, ok := s.cfg.Catalog.(*catalog.InMemory)
+	if !ok {
+		return
+	}
+	for _, t := range im.AllTables(newOid) {
+		_ = im.DropTable(parser.ObjectName{Schema: t.Schema, Name: t.Name}, newOid)
+	}
+}
+
+// copyTemplateRelationFile physically copies oldRel's MainFork data file to
+// newRel's location, for CREATE DATABASE ... TEMPLATE's plain-table copy
+// (copyTemplateTables). Mirrors internal/executor/operators_ddl.go's
+// relocateRelationPhysicalFile copy+fsync discipline, but — unlike that
+// tablespace-move helper, which retires oldRel once the move commits — never
+// touches oldRel afterward: the source table must stay completely
+// unaffected, since the template database keeps living (this is a COPY, not
+// a move).
+func (s *Server) copyTemplateRelationFile(oldRel, newRel storage.RelFileNode) error {
+	if s.cfg.Pool == nil {
+		// Embedded/test contexts with no cluster filesystem: nothing to copy.
+		return nil
+	}
+	mgr := s.cfg.Pool.Manager()
+	dataDir := mgr.DataDir()
+	if dataDir == "" {
+		return nil
+	}
+	if !mgr.Exists(oldRel) {
+		// The template's table was never written to physically (e.g.
+		// registered directly against the catalog by a test fixture that
+		// bypasses the executor, or genuinely empty) — nothing to copy; the
+		// new table starts with no physical file, exactly like any other
+		// freshly created empty table.
+		return nil
+	}
+	// Flush every buffered write for oldRel to disk before reading it —
+	// InvalidateRel would DISCARD dirty pages instead of writing them, wrong
+	// here since the copy must see the template's latest committed content.
+	if err := s.cfg.Pool.FlushRel(oldRel); err != nil {
+		return fmt.Errorf("flush template relation before copy: %w", err)
+	}
+	oldPath := filepath.Join(dataDir, mgr.RelPath(oldRel))
+	newPath := filepath.Join(dataDir, mgr.RelPath(newRel))
+	if err := os.MkdirAll(filepath.Dir(newPath), 0o700); err != nil {
+		return fmt.Errorf("mkdir %s: %w", filepath.Dir(newPath), err)
+	}
+	if err := copyRelationFileFsync(oldPath, newPath); err != nil {
+		return fmt.Errorf("copy %s to %s: %w", oldPath, newPath, err)
+	}
+	return nil
+}
+
+// copyRelationFileFsync copies src to dst byte-for-byte and fsyncs dst before
+// returning, so the copied file is durable on disk before the CREATE
+// DATABASE WAL append that makes it authoritative (mirrors
+// copyTemplateRelationFile's caller-side ordering). This is database_ddl.go's
+// own copy of internal/executor/operators_ddl.go's copyFileFsync (unexported
+// in a different package, duplicated here rather than exported solely for
+// this one caller).
+func copyRelationFileFsync(src, dst string) (err error) {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if cerr := out.Close(); err == nil {
+			err = cerr
+		}
+	}()
+	if _, err = io.Copy(out, in); err != nil {
+		return err
+	}
+	return out.Sync()
+}
+
+// syncCopiedTableCatalogHeap persists newTbl's pg_class/pg_attribute rows
+// (plus its columns' DEFAULT-expression WAL snapshot, both via
+// executor.SyncTableToCatalogHeap) into newOid's own catalog heap, exactly as
+// an ordinary CREATE TABLE issued over a connection to that database would —
+// see M0122-0007 4e follow-up 39. copyTemplateTables has no live
+// per-connection *executor.Context to reuse here (CREATE DATABASE runs
+// outside any user session's transaction), so this builds a minimal one and
+// opens/commits its own short-lived internal mvcc transaction — mirroring
+// internal/executor/applyworker.go's identical "build a minimal Context, no
+// session/planner state" pattern for heap-writing background work that also
+// has no client transaction to ride.
+func (s *Server) syncCopiedTableCatalogHeap(newOid uint32, tbl *catalog.Table) error {
+	if s.cfg.Pool == nil || s.cfg.TxnMgr == nil {
+		// No cluster filesystem / transaction manager (some test/embedded
+		// paths) — nothing to persist, matching createDatabasePhysicalDirectory's
+		// own nil-Pool fallback.
+		return nil
+	}
+	ectx := executor.NewContext()
+	ectx.Pool = s.cfg.Pool
+	ectx.Catalog = s.cfg.Catalog
+	ectx.CurrentDatabaseOid = newOid
+	if !executor.CatalogHeapSyncAvailable(ectx) {
+		// pg_attribute isn't registered as a real heap-backed table in this
+		// catalog (some test/embedded paths, mirrors catalogHeapSyncAvailable's
+		// other callers) — nothing to persist; the in-memory catalog
+		// registration from copyTemplateTables' CreateTable call already stands.
+		return nil
+	}
+	tx, err := s.cfg.TxnMgr.Begin(mvcc.IsolationReadCommitted)
+	if err != nil {
+		return fmt.Errorf("begin catalog-heap sync transaction: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = s.cfg.TxnMgr.Rollback(tx)
+		}
+	}()
+	snap, err := s.cfg.TxnMgr.SnapshotFor(tx)
+	if err != nil {
+		return fmt.Errorf("snapshot for catalog-heap sync transaction: %w", err)
+	}
+	ectx.TxnMgr = s.cfg.TxnMgr
+	ectx.Tx = tx
+	ectx.Snap = snap
+	ectx.WAL = s.cfg.WAL
+	ectx.LogCanonical = s.cfg.LogCanonical
+	if err := executor.SyncTableToCatalogHeap(ectx, tbl); err != nil {
+		return err
+	}
+	if err := s.cfg.TxnMgr.Commit(tx); err != nil {
+		return fmt.Errorf("commit catalog-heap sync transaction: %w", err)
+	}
+	committed = true
+	return nil
 }
 
 // actingRoleIsSuperuser reports whether actingRole (see resolveActingRoleOID)
@@ -727,8 +968,29 @@ func (s *Server) tryHandleDatabaseDDL(sql string, liveDBName string, actingRole 
 	}
 	switch kind {
 	case databaseDDLCreate:
-		if err := s.resolveCreateDatabaseTemplate(createDatabaseTemplateName(sql)); err != nil {
+		templateName := createDatabaseTemplateName(sql)
+		srcOid, tmplTables, err := s.resolveCreateDatabaseTemplate(templateName)
+		if err != nil {
 			return true, "", err
+		}
+		if len(tmplTables) > 0 {
+			// PG: dbcommands.c createdb(), CountOtherDBBackends(src_dboid)
+			// (ERRCODE_OBJECT_IN_USE) — real PostgreSQL refuses to copy a
+			// template while another backend is connected to it (mirrors the
+			// DROP DATABASE busy guard further below). Only meaningful once
+			// there is real template content to copy: the pre-existing
+			// empty-template path (tmplTables == nil, whether the template
+			// genuinely has none or aliases DefaultDBOid) needs no such
+			// guard, preserving
+			// TestTryHandleDatabaseDDLCreateEmptyTemplateSucceeds's behavior.
+			if s.cfg.Activity != nil {
+				if n := s.cfg.Activity.CountByDatName(templateName); n > 0 {
+					return true, "", &databaseDDLError{
+						code: sqlstate.ObjectInUse,
+						msg:  fmt.Sprintf("source database %q is being accessed by other users", templateName),
+					}
+				}
+			}
 		}
 		owner := s.resolveActingRoleOID(actingRole)
 		oid, err := cat.CreateDatabase(name, owner)
@@ -752,9 +1014,23 @@ func (s *Server) tryHandleDatabaseDDL(sql string, liveDBName string, actingRole 
 			_ = cat.DropDatabase(name)
 			return true, "", err
 		}
+		if len(tmplTables) > 0 {
+			// M0122-0007 4e (last item): copy the template's relation files +
+			// register fresh catalog.Table entries under the new dbOid BEFORE
+			// the WAL append below makes the CREATE durable — same physical-
+			// artifact-before-commit ordering as createDatabasePhysicalDirectory.
+			if cerr := s.copyTemplateTables(srcOid, oid, tmplTables); cerr != nil {
+				s.rollbackTemplateCopy(oid)
+				_ = cat.DropDatabase(name)
+				s.removeDatabasePhysicalDirectory(oid)
+				return true, "", cerr
+			}
+		}
 		if s.cfg.WAL != nil {
 			if _, _, werr := s.cfg.WAL.Append(wal.EncodeCreateDatabase(name, owner, oid)); werr != nil {
-				// Roll back the catalog change so memory and disk agree.
+				// Roll back the catalog change (and any copied template
+				// tables) so memory and disk agree.
+				s.rollbackTemplateCopy(oid)
 				_ = cat.DropDatabase(name)
 				s.removeDatabasePhysicalDirectory(oid)
 				return true, "", werr
@@ -1002,6 +1278,10 @@ type databaseConnLimitRegistry interface {
 type databaseTemplateRegistry interface {
 	ResolveDatabaseOid(name string) (uint32, bool)
 	AllTables(dbOid ...uint32) []*catalog.Table
+	// AllIndexes reports every index registered under dbOid, so
+	// resolveCreateDatabaseTemplate can reject a template containing ANY
+	// index outright (this bounded slice implements no index-file cloning).
+	AllIndexes(dbOid ...uint32) []*catalog.Index
 }
 
 // applyAlterDatabaseConfig applies a parsed ALTER DATABASE ... SET/RESET
