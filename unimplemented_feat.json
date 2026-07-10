@@ -3313,7 +3313,7 @@
    "feature": "VIEW WITH CHECK OPTION is not enforced on INSERT/UPDATE operations; WITH (check_option=...) reloption form is parsed but ignored; restart persistence is in-memory only, not persisted.",
    "task_id": "DU-002",
    "resume_point": "slice 365",
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "Deferred (ledger): CHECK OPTION enforcement on INSERT/UPDATE through the view; the `WITH (check_option=...)` reloption form before AS + security_barrier/security_invoker stay parsed-and-ignored; restart persistence (in-memory only)."
    ],
@@ -3328,7 +3328,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "PARTIALLY RESOLVED 2026-07-04 (M0119-0004/M0122-0004): enforcement now lands `44000` on INSERT/UPDATE violation (`internal/executor/operators_fk.go:checkViewCheckOption`, design `docs/design/root-0025-updatable-views.md`); `WITH (security_barrier=...)`/`WITH (security_invoker=...)` reloption forms parse (`internal/parser/ddl.go` slices 366/367); `WITH (check_option=...)` reloption form now also parses (this loop, same file). Only remaining sub-item: restart persistence is still in-memory-only as of this entry's last audit — re-check `internal/initdb/open.go`'s `loadUserTablesFromHeap`/`ApplyTableReloptions` before re-flagging, a concurrent M0119-0004 loop was mid-flight on exactly that gap when this entry was last audited."
+   "code_audit": "RESOLVED 2026-07-10 (M0122-0021, this loop): the remaining sub-item flagged in the prior audit (restart persistence for check_option) is already fixed and covered end-to-end — buildUserPGClassRow (internal/executor/pg18_user_catalog_rows.go:462-474) encodes a view's security_barrier/security_invoker/check_option reloptions into the heap-persisted pg_class row via catalog.TableReloptionsElements, and loadUserTablesFromHeapForDB (internal/initdb/open.go:2709) decodes them back via catalog.ApplyTableReloptions (case \"check_option\" at internal/catalog/catalog.go:15314) on every restart. Confirmed via the pre-existing dedicated test TestTableAndViewReloptionsSurviveRestart (internal/initdb/view_ddl_recovery_test.go, landed 2026-07-05 commit 8107a8de as part of the index-reloptions follow-up chain, PASS at current HEAD) which creates a view WITH LOCAL CHECK OPTION, restarts the runtime, and asserts view.CheckOption == \"local\" survives. Combined with the enforcement (checkViewCheckOption, 44000 on violation) and parsing already confirmed by the prior PARTIALLY RESOLVED audit, every sub-item of this entry is now closed; no further gap remains."
   },
   {
    "feature": "HANDLER and VALIDATOR function references in CREATE FOREIGN DATA WRAPPER",

@@ -8573,6 +8573,40 @@ mirroring M0119's ledger `status` column.
       (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke bash
       scripts/ralph-precommit-test.sh` PASS (0 failed transactions, all 3
       workloads).
+- [x] **M0122-0021 — VIEW WITH CHECK OPTION restart-persistence sub-item —
+      verified stale, closed** (~1; `unimplemented_feat.json` task `DU-002`
+      slice 365). The entry's last audit (2026-07-04) marked enforcement and
+      parsing RESOLVED but flagged one remaining sub-item as open: "restart
+      persistence is still in-memory-only ... a concurrent M0119-0004 loop
+      was mid-flight on exactly that gap when this entry was last audited."
+      That concurrent loop landed the next day (commit `8107a8de`,
+      2026-07-05) and this loop's audit found it fully wired: encode side —
+      `buildUserPGClassRow` (`internal/executor/pg18_user_catalog_rows.go:
+      462-474`) serializes a view's `security_barrier`/`security_invoker`/
+      `check_option` reloptions into the heap-persisted `pg_class` row via
+      `catalog.TableReloptionsElements`; decode side —
+      `loadUserTablesFromHeapForDB` (`internal/initdb/open.go:2709`) reads
+      them back via `catalog.ApplyTableReloptions` (`case "check_option"`,
+      `internal/catalog/catalog.go:15314`) on every restart. Confirmed via
+      the pre-existing dedicated end-to-end test
+      `TestTableAndViewReloptionsSurviveRestart`
+      (`internal/initdb/view_ddl_recovery_test.go`) — creates a view `WITH
+      LOCAL CHECK OPTION`, closes and reopens the runtime against the same
+      data dir, asserts `view.CheckOption == "local"` survives — PASS at
+      current HEAD. Combined with the enforcement (`checkViewCheckOption`,
+      `44000` on violation) and parsing already confirmed by the prior
+      audit, every sub-item of this entry is now closed.
+      `unimplemented_feat.json`'s matching entry flipped `open`→`resolved`
+      (82/181 resolved, 99 open). No code change, no design doc change (the
+      design doc `docs/design/root-0025-updatable-views.md` already
+      describes the landed behavior) — verify-before-implement finding only,
+      same pattern as M0122-0019/M0122-0020. Gates: `go build ./...`/`go vet
+      ./...` clean; `go test ./internal/initdb/... -run
+      TestTableAndViewReloptionsSurviveRestart` PASS; `go test
+      ./internal/initdb/...` (full package) PASS; `scripts/tpch-spotcheck.sh`
+      PASS (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke bash
+      scripts/ralph-precommit-test.sh` PASS (0 failed transactions, all 3
+      workloads).
 
 > This task list is **seeded, not exhaustive.** The M0122-0001 triage plus every
 > future feature deferral appended to `unimplemented_feat.json` (any new `open`
