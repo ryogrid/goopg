@@ -129,3 +129,127 @@ func TestCreateDatabaseTemplatePlainTableCopiesDataAndSurvivesRestart(t *testing
 		t.Fatalf("t_copy leaked into postgres pg_class (count=%d, want 0)", leaked)
 	}
 }
+
+
+// TestCreateDatabaseTemplateSequenceCopiesStateAndSurvivesRestart:
+// CREATE DATABASE ... TEMPLATE against a source database containing a
+// sequence (with real nextval() activity through the real executor) copies
+// the sequence's live counter state — not just its definition — into the new
+// database, as an independent counter (advancing one must not move the
+// other), both immediately and after a full data-dir round trip. Mirrors
+// TestCreateDatabaseTemplatePlainTableCopiesDataAndSurvivesRestart's shape
+// for M0122-0007 4e follow-up 41 (sequence cloning has no relation file, so
+// this is a separate code path — database_ddl.go's copyTemplateSequences —
+// from the plain-table one, exercised here end to end for the first time).
+func TestCreateDatabaseTemplateSequenceCopiesStateAndSurvivesRestart(t *testing.T) {
+	dir := t.TempDir()
+	if err := initdb.Init(initdb.Options{DataDir: dir}); err != nil {
+		t.Fatalf("initdb.Init: %v", err)
+	}
+
+	ctx := context.Background()
+	s1 := startDBIDRestartServer(t, dir)
+
+	pg := s1.open(t, "postgres")
+	if _, err := pg.ExecContext(ctx, "CREATE DATABASE seq_tmpl_src"); err != nil {
+		pg.Close()
+		s1.close(t)
+		t.Fatalf("CREATE DATABASE seq_tmpl_src: %v", err)
+	}
+
+	src := s1.open(t, "seq_tmpl_src")
+	if _, err := src.ExecContext(ctx, "CREATE SEQUENCE s_copy START 1"); err != nil {
+		src.Close()
+		pg.Close()
+		s1.close(t)
+		t.Fatalf("CREATE SEQUENCE s_copy: %v", err)
+	}
+	var srcVal int64
+	if err := src.QueryRowContext(ctx, "SELECT nextval('s_copy')").Scan(&srcVal); err != nil {
+		src.Close()
+		pg.Close()
+		s1.close(t)
+		t.Fatalf("nextval(s_copy) on source: %v", err)
+	}
+	if srcVal != 1 {
+		src.Close()
+		pg.Close()
+		s1.close(t)
+		t.Fatalf("nextval(s_copy) on source = %d, want 1", srcVal)
+	}
+
+	if _, err := pg.ExecContext(ctx, "CREATE DATABASE seq_tmpl_copy TEMPLATE seq_tmpl_src"); err != nil {
+		src.Close()
+		pg.Close()
+		s1.close(t)
+		t.Fatalf("CREATE DATABASE seq_tmpl_copy TEMPLATE seq_tmpl_src: %v", err)
+	}
+
+	// Immediate visibility (no restart): the clone continues exactly from
+	// the source's counter (1) at copy time.
+	cpy := s1.open(t, "seq_tmpl_copy")
+	var cpyVal int64
+	if err := cpy.QueryRowContext(ctx, "SELECT nextval('s_copy')").Scan(&cpyVal); err != nil {
+		cpy.Close()
+		src.Close()
+		pg.Close()
+		s1.close(t)
+		t.Fatalf("nextval(s_copy) on copy (pre-restart): %v", err)
+	}
+	if cpyVal != 2 {
+		cpy.Close()
+		src.Close()
+		pg.Close()
+		s1.close(t)
+		t.Fatalf("nextval(s_copy) on copy (pre-restart) = %d, want 2", cpyVal)
+	}
+
+	// Advancing the copy must not affect the source's own counter.
+	if err := src.QueryRowContext(ctx, "SELECT nextval('s_copy')").Scan(&srcVal); err != nil {
+		cpy.Close()
+		src.Close()
+		pg.Close()
+		s1.close(t)
+		t.Fatalf("nextval(s_copy) on source (post-copy): %v", err)
+	}
+	if srcVal != 2 {
+		cpy.Close()
+		src.Close()
+		pg.Close()
+		s1.close(t)
+		t.Fatalf("nextval(s_copy) on source (post-copy) = %d, want 2 (independent counter, not aliased to the copy)", srcVal)
+	}
+
+	cpy.Close()
+	src.Close()
+	pg.Close()
+	s1.close(t)
+
+	// Full restart from the same data dir. Post-restart values only need to
+	// continue strictly above their own pre-restart value — nextval
+	// pre-logs 32 values ahead (upstream SEQ_LOG_VALS), so an exact +1 is
+	// not guaranteed across a restart (same gap semantics
+	// TestPort_SerialSequenceSurvivesRestart already documents).
+	s2 := startDBIDRestartServer(t, dir)
+	defer s2.close(t)
+
+	cpy2 := s2.open(t, "seq_tmpl_copy")
+	defer cpy2.Close()
+	var cpyValAfterRestart int64
+	if err := cpy2.QueryRowContext(ctx, "SELECT nextval('s_copy')").Scan(&cpyValAfterRestart); err != nil {
+		t.Fatalf("nextval(s_copy) on copy (post-restart): %v", err)
+	}
+	if cpyValAfterRestart <= 2 {
+		t.Fatalf("nextval(s_copy) on copy (post-restart) = %d, want > 2 (durable continuation)", cpyValAfterRestart)
+	}
+
+	src2 := s2.open(t, "seq_tmpl_src")
+	defer src2.Close()
+	var srcValAfterRestart int64
+	if err := src2.QueryRowContext(ctx, "SELECT nextval('s_copy')").Scan(&srcValAfterRestart); err != nil {
+		t.Fatalf("nextval(s_copy) on source (post-restart): %v", err)
+	}
+	if srcValAfterRestart <= 2 {
+		t.Fatalf("nextval(s_copy) on source (post-restart) = %d, want > 2 (source's own durable counter, unaffected by the copy)", srcValAfterRestart)
+	}
+}

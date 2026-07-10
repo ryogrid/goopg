@@ -468,6 +468,32 @@ func WALLogSequenceState(ctx *Context, name string) {
 	}
 }
 
+
+// SnapshotSequenceState returns the sequence's exact live definitional state
+// (start/increment/bounds/cache/cycle/current counter/called flag/ownership
+// markers), or ok=false if no such non-temporary sequence exists under dbOid.
+// Used by CREATE DATABASE ... TEMPLATE's sequence-clone path
+// (internal/server/database_ddl.go) to capture a template sequence's state
+// without exposing the unexported seqState type across the package boundary.
+// A temporary sequence (session-scoped) is never a valid clone source —
+// resolveCreateDatabaseTemplate rejects any template containing one before
+// this is ever called, so ok=false here would only mean a concurrent DROP
+// SEQUENCE raced the clone (the source-database busy guard makes this rare
+// in practice, but the caller must still handle it explicitly).
+func SnapshotSequenceState(name string, dbOid uint32) (wal.SequenceStatePayload, bool) {
+	v, ok := seqRegistry.Load(seqKey(name, dbOid))
+	if !ok {
+		return wal.SequenceStatePayload{}, false
+	}
+	s := v.(*seqState)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.temporary {
+		return wal.SequenceStatePayload{}, false
+	}
+	return s.payloadLocked(s.current.Load(), s.called.Load()), true
+}
+
 // maybePreLogNextval WAL-logs the sequence state with the counter advanced
 // SEQ_LOG_VALS (32) values ahead of the just-fetched v, when v has crossed the
 // previously logged horizon. Mirrors upstream sequence.c: replaying the

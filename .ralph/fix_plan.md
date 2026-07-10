@@ -7583,6 +7583,68 @@ mirroring M0119's ledger `status` column.
       composite-type OID resolution); per-database index/type catalog rows +
       sys-btree bootstrap (independent of TEMPLATE copy);
       `pg_statistic_ext`/`information_schema.routines` registry redesign.
+  - [x] `M0122-0007` 4e follow-up 41 (2026-07-10, this loop) — **extended
+      `CREATE DATABASE ... TEMPLATE`'s relation-copy mechanism (follow-up 40)
+      to also cover sequences.** Unlike the still-deferred index/view/
+      matview/typed-table cases, a sequence needs no relation file and no
+      per-database sys-btree catalog bootstrap — its durable state is a
+      process-global registry entry (`internal/executor`'s `seqRegistry`),
+      not a heap page, so the clone mechanism already existed almost
+      verbatim as `RestoreSequenceFromWAL` (the same function WAL replay
+      uses at startup). New exported `executor.SnapshotSequenceState`
+      captures a sequence's live state via `WALLogSequenceState`'s own
+      `payloadLocked` snapshot. **Real correctness finding, surfaced only by
+      the E2E test:** sequences cannot be detected via the same
+      `tmpl.AllTables(oid)` walk plain tables use — every sequence's
+      virtual `pg_class` relation is `Virtual` (`CreateSequenceCatalogRelation`),
+      and `AllTables` unconditionally skips `Virtual` rows. A first pass
+      keyed detection off `AllTables` + a hand-set `IsSequence` flag; its
+      own unit tests passed (fixtures didn't set `Virtual`) but the real
+      wire-protocol E2E test failed with `relation "s_copy" does not exist`
+      since the real `CREATE SEQUENCE` path's `Virtual=true` row was
+      invisible to the walk. Fixed via `executor.AllSequenceInfos(oid)`
+      instead (reads `seqRegistry` directly), gated by
+      `executor.IsSequenceTemporary` (a TEMPORARY sequence still keeps the
+      whole template unsupported, same rule as indexes/views). New
+      `resolveCreateDatabaseTemplate` third return value
+      `sequences []executor.SeqInfo`; new `s.copyTemplateSequences`
+      (snapshot → `RestoreSequenceFromWAL` under the new dbOid →
+      `CreateSequenceCatalogRelation` → `WALLogSequenceState` against a
+      minimal `*executor.Context`); `rollbackTemplateCopy` gained a second
+      sweep over `executor.AllSequenceInfos(newOid)` (mirrors real DROP
+      SEQUENCE's `DropSequence`+`DropTable` pairing) since a Virtual
+      sequence row is invisible to the pre-existing `AllTables`-only sweep
+      too. Tests: `TestTryHandleDatabaseDDLCreateTemplateWithSequenceCopies`
+      (replaces `...WithSequenceErrors`), new
+      `...WithTemporarySequenceErrors` (`internal/server/database_ddl_test.go`,
+      fixtures corrected to the real `RegisterSequence`+
+      `CreateSequenceCatalogRelation` pair); new E2E
+      `TestCreateDatabaseTemplateSequenceCopiesStateAndSurvivesRestart`
+      (`internal/server/database_template_copy_restart_test.go`): real wire
+      protocol + real `nextval()`, clone continues from the source's exact
+      counter, advancing either copy never moves the other, both keep
+      advancing independently after a full restart (values only asserted
+      strictly-above pre-restart, matching
+      `TestPort_SerialSequenceSurvivesRestart`'s documented pre-logging-gap
+      semantics). Design: `docs/design/0122-0018-per-database-catalog-namespace.md`
+      gained a follow-up-41 subsection; `docs/design/README.md` row
+      updated; deferral ledger row appended. Gates: `go build ./...`/`go vet
+      ./...` clean; `go test ./internal/server/... ./internal/executor/...
+      ./internal/catalog/...` PASS; `go test -race ./internal/server/...
+      ./internal/executor/...` PASS except the pre-existing, unrelated
+      `TestConnectExceedsPositiveDatconnlimitRejected` race (re-confirmed
+      this loop via `git stash` + `-count=3` against unmodified HEAD —
+      reproduces identically, not introduced by this change); `go test
+      -short` full repo (excl. testport) PASS; `scripts/tpch-spotcheck.sh`
+      PASS (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke bash
+      scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 workloads).
+      **Remaining M0122-0007 scope (deferred, own future loops):**
+      index/view/matview/typed-table TEMPLATE copying (index-file cloning +
+      per-database sys-btree catalog bootstrap; view/matview AST/`ViewDef`
+      cloning; composite-type OID resolution for typed tables);
+      per-database index/type catalog rows + sys-btree bootstrap
+      (independent of TEMPLATE copy); `pg_statistic_ext`/
+      `information_schema.routines` registry redesign.
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,

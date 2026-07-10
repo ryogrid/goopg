@@ -602,20 +602,20 @@ func (s *Server) resolveActingRoleOID(actingRole string) uint32 {
 // questions. A catalog that doesn't expose databaseTemplateRegistry (some
 // test/embedded paths) skips every check, matching every other soft-typed-
 // interface fallback in this file.
-func (s *Server) resolveCreateDatabaseTemplate(templateName string) (srcOid uint32, tables []*catalog.Table, err error) {
+func (s *Server) resolveCreateDatabaseTemplate(templateName string) (srcOid uint32, tables []*catalog.Table, sequences []executor.SeqInfo, err error) {
 	tmpl, ok := s.cfg.Catalog.(databaseTemplateRegistry)
 	if !ok {
-		return 0, nil, nil
+		return 0, nil, nil, nil
 	}
 	oid, ok := tmpl.ResolveDatabaseOid(templateName)
 	if !ok {
-		return 0, nil, &databaseDDLError{
+		return 0, nil, nil, &databaseDDLError{
 			code: sqlstate.UndefinedDatabase,
 			msg:  fmt.Sprintf("template database %q does not exist", templateName),
 		}
 	}
 	if oid == catalog.DefaultDBOid {
-		return 0, nil, nil
+		return 0, nil, nil, nil
 	}
 	// Any index anywhere in the template rules out the whole database for
 	// this bounded slice — goopg has no per-database sys-btree catalog
@@ -633,24 +633,43 @@ func (s *Server) resolveCreateDatabaseTemplate(templateName string) (srcOid uint
 			// to copy and are never rejected for being present.
 			continue
 		}
-		if t.View != nil || t.IsMatView || t.IsSequence || t.OfTypeOID != 0 {
+		// Sequences never appear here: AllTables skips every Virtual entry,
+		// and CreateSequenceCatalogRelation always marks a sequence's pg_class
+		// row Virtual — they're detected via executor.AllSequenceInfos below
+		// instead, straight from the process-global sequence registry.
+		if t.View != nil || t.IsMatView || t.OfTypeOID != 0 {
 			unsupported = true
 			continue
 		}
 		userTables = append(userTables, t)
 	}
+	var seqInfos []executor.SeqInfo
+	for _, si := range executor.AllSequenceInfos(oid) {
+		// A TEMPORARY sequence is session-scoped and has no durable state
+		// worth cloning; keep the whole template unsupported in that (rare)
+		// case rather than silently dropping it.
+		name := si.Name
+		if si.Schema != "" && si.Schema != "public" {
+			name = si.Schema + "." + si.Name
+		}
+		if executor.IsSequenceTemporary(name, oid) {
+			unsupported = true
+			continue
+		}
+		seqInfos = append(seqInfos, si)
+	}
 	if unsupported {
-		return 0, nil, &databaseDDLError{
+		return 0, nil, nil, &databaseDDLError{
 			code: sqlstate.FeatureNotSupported,
 			msg: fmt.Sprintf("CREATE DATABASE ... TEMPLATE %q: copying a template database "+
-				"containing indexes, sequences, views, materialized views, or typed tables "+
-				"is not yet supported", templateName),
+				"containing indexes, views, materialized views, typed tables, or temporary "+
+				"sequences is not yet supported", templateName),
 		}
 	}
-	if len(userTables) == 0 {
-		return 0, nil, nil
+	if len(userTables) == 0 && len(seqInfos) == 0 {
+		return 0, nil, nil, nil
 	}
-	return oid, userTables, nil
+	return oid, userTables, seqInfos, nil
 }
 
 // createDatabasePhysicalDirectory creates base/<oid>/PG_VERSION for a
@@ -766,6 +785,53 @@ func (s *Server) copyTemplateTables(srcOid, newOid uint32, tables []*catalog.Tab
 	return nil
 }
 
+
+// copyTemplateSequences clones each of the template's sequences into newOid.
+// Unlike copyTemplateTables, a sequence has no relation file and no
+// catalog-heap row to copy — its durable state is a process-global registry
+// entry (internal/executor's seqRegistry) snapshotted/restored via
+// executor.SnapshotSequenceState/RestoreSequenceFromWAL, plus the virtual
+// pg_class(relkind='S') catalog table CreateSequenceCatalogRelation already
+// uses for every other sequence-creation path (CREATE SEQUENCE, WAL replay).
+func (s *Server) copyTemplateSequences(srcOid, newOid uint32, sequences []executor.SeqInfo) error {
+	im, ok := s.cfg.Catalog.(*catalog.InMemory)
+	if !ok {
+		// No concrete InMemory catalog to clone into (some test/embedded
+		// paths) — resolveCreateDatabaseTemplate already required this same
+		// concrete type (via databaseTemplateRegistry) to produce a non-nil
+		// sequences slice, so this is unreachable in practice; defensive
+		// no-op matches copyTemplateTables' identical fallback.
+		return nil
+	}
+	for _, si := range sequences {
+		seqObjName := parser.ObjectName{Schema: si.Schema, Name: si.Name}
+		name := si.Name
+		if si.Schema != "" && si.Schema != "public" {
+			name = si.Schema + "." + si.Name
+		}
+		payload, ok := executor.SnapshotSequenceState(name, srcOid)
+		if !ok {
+			// The source-database busy guard in tryHandleDatabaseDDL makes
+			// this rare (no other backend can be connected to the template
+			// mid-copy), but be defensive rather than clone a stale/missing
+			// sequence: a concurrent superuser DROP SEQUENCE could still
+			// race the AllSequenceInfos scan in resolveCreateDatabaseTemplate.
+			s.rollbackTemplateCopy(newOid)
+			return fmt.Errorf("cloning sequence %q: source sequence no longer exists", name)
+		}
+		payload.DBOid = newOid
+		executor.RestoreSequenceFromWAL(payload)
+		executor.CreateSequenceCatalogRelation(im, seqObjName, name, newOid)
+		if s.cfg.WAL != nil {
+			ectx := executor.NewContext()
+			ectx.CurrentDatabaseOid = newOid
+			ectx.WAL = s.cfg.WAL
+			executor.WALLogSequenceState(ectx, name)
+		}
+	}
+	return nil
+}
+
 // rollbackTemplateCopy removes every table copyTemplateTables has registered
 // under newOid so far, undoing a partial copy after a mid-loop failure.
 // Best-effort: DropTable's own "does not exist" error can't fire here since
@@ -777,6 +843,18 @@ func (s *Server) rollbackTemplateCopy(newOid uint32) {
 	}
 	for _, t := range im.AllTables(newOid) {
 		_ = im.DropTable(parser.ObjectName{Schema: t.Schema, Name: t.Name}, newOid)
+	}
+	// Sequences are Virtual catalog tables (never returned by AllTables,
+	// see resolveCreateDatabaseTemplate's doc comment) plus a separate
+	// process-global registry entry (executor.seqRegistry) — mirror DROP
+	// SEQUENCE's own pairing (operators_ddl.go) to clean up both.
+	for _, si := range executor.AllSequenceInfos(newOid) {
+		name := si.Name
+		if si.Schema != "" && si.Schema != "public" {
+			name = si.Schema + "." + si.Name
+		}
+		executor.DropSequence(name, newOid)
+		_ = im.DropTable(parser.ObjectName{Schema: si.Schema, Name: si.Name}, newOid)
 	}
 }
 
@@ -969,19 +1047,19 @@ func (s *Server) tryHandleDatabaseDDL(sql string, liveDBName string, actingRole 
 	switch kind {
 	case databaseDDLCreate:
 		templateName := createDatabaseTemplateName(sql)
-		srcOid, tmplTables, err := s.resolveCreateDatabaseTemplate(templateName)
+		srcOid, tmplTables, tmplSequences, err := s.resolveCreateDatabaseTemplate(templateName)
 		if err != nil {
 			return true, "", err
 		}
-		if len(tmplTables) > 0 {
+		if len(tmplTables) > 0 || len(tmplSequences) > 0 {
 			// PG: dbcommands.c createdb(), CountOtherDBBackends(src_dboid)
 			// (ERRCODE_OBJECT_IN_USE) — real PostgreSQL refuses to copy a
 			// template while another backend is connected to it (mirrors the
 			// DROP DATABASE busy guard further below). Only meaningful once
 			// there is real template content to copy: the pre-existing
-			// empty-template path (tmplTables == nil, whether the template
-			// genuinely has none or aliases DefaultDBOid) needs no such
-			// guard, preserving
+			// empty-template path (tmplTables/tmplSequences == nil, whether
+			// the template genuinely has none or aliases DefaultDBOid) needs
+			// no such guard, preserving
 			// TestTryHandleDatabaseDDLCreateEmptyTemplateSucceeds's behavior.
 			if s.cfg.Activity != nil {
 				if n := s.cfg.Activity.CountByDatName(templateName); n > 0 {
@@ -1020,6 +1098,17 @@ func (s *Server) tryHandleDatabaseDDL(sql string, liveDBName string, actingRole 
 			// the WAL append below makes the CREATE durable — same physical-
 			// artifact-before-commit ordering as createDatabasePhysicalDirectory.
 			if cerr := s.copyTemplateTables(srcOid, oid, tmplTables); cerr != nil {
+				s.rollbackTemplateCopy(oid)
+				_ = cat.DropDatabase(name)
+				s.removeDatabasePhysicalDirectory(oid)
+				return true, "", cerr
+			}
+		}
+		if len(tmplSequences) > 0 {
+			// M0122-0007 4e follow-up 41: sequences have no relation file, so
+			// this runs independently of the table-copy branch above (a
+			// template can contain either, both, or neither).
+			if cerr := s.copyTemplateSequences(srcOid, oid, tmplSequences); cerr != nil {
 				s.rollbackTemplateCopy(oid)
 				_ = cat.DropDatabase(name)
 				s.removeDatabasePhysicalDirectory(oid)

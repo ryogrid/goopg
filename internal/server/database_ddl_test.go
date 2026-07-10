@@ -9,6 +9,7 @@ import (
 
 	"github.com/goopg/goopg/internal/activity"
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/executor"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/sqlstate"
 	"github.com/goopg/goopg/internal/storage"
@@ -794,7 +795,7 @@ func TestTryHandleDatabaseDDLCreateTemplateWithIndexErrors(t *testing.T) {
 
 // TestTryHandleDatabaseDDLCreateTemplateWithSequenceErrors pins the same
 // still-rejected shape for a sequence relation.
-func TestTryHandleDatabaseDDLCreateTemplateWithSequenceErrors(t *testing.T) {
+func TestTryHandleDatabaseDDLCreateTemplateWithSequenceCopies(t *testing.T) {
 	s := newTestRoleServer()
 	im := s.cfg.Catalog.(*catalog.InMemory)
 
@@ -802,25 +803,68 @@ func TestTryHandleDatabaseDDLCreateTemplateWithSequenceErrors(t *testing.T) {
 		t.Fatalf("CREATE DATABASE seqsrc: handled=%v err=%v", handled, err)
 	}
 	srcOid := im.DatabaseOid("seqsrc")
-	seqCols := []catalog.Column{
-		{Name: "last_value", Type: catalog.Type{Name: "int8"}, Ordinal: 0},
-		{Name: "log_cnt", Type: catalog.Type{Name: "int8"}, Ordinal: 1},
-		{Name: "is_called", Type: catalog.Type{Name: "bool"}, Ordinal: 2},
+	// Mirrors execCreateSequence's own registration pair (operators_ddl.go):
+	// RegisterSequence (the process-global counter) plus
+	// CreateSequenceCatalogRelation (the Virtual pg_class row) — a hand-built
+	// catalog.Table with IsSequence set but Virtual unset would NOT reproduce
+	// AllTables' real filtering behavior (AllTables always skips Virtual
+	// rows, and every real sequence's relation IS Virtual).
+	executor.RegisterSequence("s", 1, 1, 1, 9223372036854775807, false, srcOid)
+	executor.CreateSequenceCatalogRelation(im, parser.ObjectName{Name: "s"}, "s", srcOid)
+	if !executor.SetSequenceCurrentValue("s", 5, srcOid) {
+		t.Fatal("SetSequenceCurrentValue(s, 5) under seqsrc failed")
 	}
-	seq, err := im.CreateTable(parser.ObjectName{Name: "s"}, seqCols, srcOid)
-	if err != nil {
-		t.Fatalf("CreateTable(sequence) under seqsrc: %v", err)
-	}
-	seq.IsSequence = true
 
 	handled, _, err := s.tryHandleDatabaseDDL("CREATE DATABASE foo TEMPLATE seqsrc", "postgres", "", nil)
+	if !handled || err != nil {
+		t.Fatalf("CREATE DATABASE foo TEMPLATE seqsrc: handled=%v err=%v, want success", handled, err)
+	}
+	if !im.HasDatabase("foo") {
+		t.Fatal("CREATE DATABASE foo TEMPLATE seqsrc: database was not registered")
+	}
+	newOid := im.DatabaseOid("foo")
+	clonedPayload, ok := executor.SnapshotSequenceState("s", newOid)
+	if !ok {
+		t.Fatal("sequence \"s\" was not cloned into the new database's registry")
+	}
+	if clonedPayload.Current != 5 {
+		t.Fatalf("cloned sequence \"s\" current = %d, want 5 (the source's counter at copy time)", clonedPayload.Current)
+	}
+	// Advancing the clone must not alias the source's own counter.
+	if !executor.SetSequenceCurrentValue("s", 42, newOid) {
+		t.Fatal("SetSequenceCurrentValue(s, 42) under foo failed")
+	}
+	srcPayload, ok := executor.SnapshotSequenceState("s", srcOid)
+	if !ok || srcPayload.Current != 5 {
+		t.Fatalf("source sequence \"s\" current = (%d, ok=%v), want (5, true) — clone must not alias the source", srcPayload.Current, ok)
+	}
+}
+
+// TestTryHandleDatabaseDDLCreateTemplateWithTemporarySequenceErrors pins that
+// a TEMPORARY sequence — session-scoped, no durable state worth cloning —
+// still rules out the whole template, unlike a plain (non-temporary)
+// sequence which TestTryHandleDatabaseDDLCreateTemplateWithSequenceCopies
+// confirms is now copyable.
+func TestTryHandleDatabaseDDLCreateTemplateWithTemporarySequenceErrors(t *testing.T) {
+	s := newTestRoleServer()
+	im := s.cfg.Catalog.(*catalog.InMemory)
+
+	if handled, _, err := s.tryHandleDatabaseDDL("CREATE DATABASE tmpseqsrc", "postgres", "", nil); !handled || err != nil {
+		t.Fatalf("CREATE DATABASE tmpseqsrc: handled=%v err=%v", handled, err)
+	}
+	srcOid := im.DatabaseOid("tmpseqsrc")
+	executor.RegisterSequence("s", 1, 1, 1, 9223372036854775807, false, srcOid)
+	executor.CreateSequenceCatalogRelation(im, parser.ObjectName{Name: "s"}, "s", srcOid)
+	executor.SetSequenceTemporary("s", true, srcOid)
+
+	handled, _, err := s.tryHandleDatabaseDDL("CREATE DATABASE foo TEMPLATE tmpseqsrc", "postgres", "", nil)
 	if !handled || err == nil {
-		t.Fatalf("CREATE DATABASE foo TEMPLATE seqsrc: handled=%v err=%v, want a typed error", handled, err)
+		t.Fatalf("CREATE DATABASE foo TEMPLATE tmpseqsrc: handled=%v err=%v, want a typed error", handled, err)
 	}
 	if got := databaseDDLErrorSQLState(err); got != sqlstate.FeatureNotSupported {
 		t.Errorf("SQLSTATE = %q, want %q", got, sqlstate.FeatureNotSupported)
 	}
 	if im.HasDatabase("foo") {
-		t.Error("CREATE DATABASE foo TEMPLATE seqsrc: database was registered despite the error")
+		t.Error("CREATE DATABASE foo TEMPLATE tmpseqsrc: database was registered despite the error")
 	}
 }

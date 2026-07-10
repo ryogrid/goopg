@@ -1,6 +1,6 @@
 # Per-database catalog namespace (M0122-0007 slice 4)
 
-Status: accepted (sub-slices 4a, 4b-i, 4b-ii, 4c, 4d-i, 4d-ii-part-1, and 4d-ii-part-2a landed; 4d-ii-part-2b items 1, 2, and 3 all fully landed; 4e's FK-target-resolution, sequence-ownership, and view-constraint-dependency items all landed; `CREATE DATABASE ... TEMPLATE` bounded validation landed 2026-07-10; the pg_class-under-fresh-database gap (name resolution generically, row enumeration for pg_class specifically) landed 2026-07-10, and the pg_indexes/pg_tables, pg_constraint, pg_index, pg_attrdef/pg_depend, pg_inherits, pg_policy, pg_trigger, pg_rewrite, pg_foreign_table, and pg_sequence row-content follow-ups landed the same day, plus the `oid::regclass`/`'name'::regclass` cast-direction dbOid-scoping gap (follow-up 33) — 2 sibling virtual-table builders (pg_statistic_ext, information_schema.routines/parameters/routine_*_usage) plus pg_sequences/information_schema.sequences (follow-up 34's narrowed remainder) plus the c.foreignServers registry-dbOid-key gap (follow-up 36, landed) and its same-shape c.userMappings sibling (follow-up 37, landed 2026-07-10); follow-up 37's own CURRENT_USER/SESSION_USER/CURRENT_ROLE/USER role-spec resolution discovery closed same-day (follow-up 38); restart durability for user tables created under a distinct-dbOid database — per-database pg_class/pg_attribute heap routing + startup reload into the owning namespace — landed same-day (follow-up 39); the real `CREATE DATABASE ... TEMPLATE` relation-copy mechanism itself landed 2026-07-10 for its bounded plain-table case (follow-up 40) — index/sequence/view/matview TEMPLATE copying remains deferred, see "Remaining 4e work" below)
+Status: accepted (sub-slices 4a, 4b-i, 4b-ii, 4c, 4d-i, 4d-ii-part-1, and 4d-ii-part-2a landed; 4d-ii-part-2b items 1, 2, and 3 all fully landed; 4e's FK-target-resolution, sequence-ownership, and view-constraint-dependency items all landed; `CREATE DATABASE ... TEMPLATE` bounded validation landed 2026-07-10; the pg_class-under-fresh-database gap (name resolution generically, row enumeration for pg_class specifically) landed 2026-07-10, and the pg_indexes/pg_tables, pg_constraint, pg_index, pg_attrdef/pg_depend, pg_inherits, pg_policy, pg_trigger, pg_rewrite, pg_foreign_table, and pg_sequence row-content follow-ups landed the same day, plus the `oid::regclass`/`'name'::regclass` cast-direction dbOid-scoping gap (follow-up 33) — 2 sibling virtual-table builders (pg_statistic_ext, information_schema.routines/parameters/routine_*_usage) plus pg_sequences/information_schema.sequences (follow-up 34's narrowed remainder) plus the c.foreignServers registry-dbOid-key gap (follow-up 36, landed) and its same-shape c.userMappings sibling (follow-up 37, landed 2026-07-10); follow-up 37's own CURRENT_USER/SESSION_USER/CURRENT_ROLE/USER role-spec resolution discovery closed same-day (follow-up 38); restart durability for user tables created under a distinct-dbOid database — per-database pg_class/pg_attribute heap routing + startup reload into the owning namespace — landed same-day (follow-up 39); the real `CREATE DATABASE ... TEMPLATE` relation-copy mechanism itself landed 2026-07-10 for its bounded plain-table case (follow-up 40), extended the same day to also cover sequences (follow-up 41) — index/view/matview/typed-table TEMPLATE copying remains deferred, see "Remaining 4e work" below)
 Date: 2026-07-10
 Supersedes: none — extends the "Still open" note in
 `0122-0017-database-ddl-drop-guards.md` and the deferral-ledger rows dated
@@ -1753,6 +1753,106 @@ deferral ledger's follow-up-40 row).
   bounded loop deliberately left for future work rather than risk landing
   all of it, untested, in one pass.
 
+**`CREATE DATABASE ... TEMPLATE` sequence cloning — LANDED (2026-07-10,
+follow-up 41).** Extends follow-up 40's plain-table-only copy to also cover
+sequences — narrower in scope than "index/sequence/view/matview/typed-table"
+sounds together: unlike the still-open index/view/matview/typed-table cases,
+a sequence needs no relation file and no per-database sys-btree catalog
+bootstrap (follow-up 39's own deferral), since goopg's sequence durable state
+is a process-global registry entry (`internal/executor`'s `seqRegistry`), not
+a heap page — the clone mechanism it needed already existed almost verbatim
+as `RestoreSequenceFromWAL` (the same function WAL replay uses at startup).
+
+- **`internal/executor/operators_sequence.go`:** new exported
+  `SnapshotSequenceState(name string, dbOid uint32) (wal.SequenceStatePayload, bool)`
+  captures a sequence's exact live state (start/increment/bounds/cache/cycle/
+  current counter/called flag/ownership markers) via the same
+  `payloadLocked` snapshot `WALLogSequenceState` already uses internally,
+  without exposing the unexported `seqState` type across the package
+  boundary. `ok=false` for a temporary sequence (mirrors `WALLogSequenceState`'s
+  own temp skip) or a name with no registry entry.
+- **`internal/server/database_ddl.go`:** `resolveCreateDatabaseTemplate`
+  gained a third return value, `sequences []executor.SeqInfo` (alongside
+  `tables`). **Important correctness finding:** sequences can NOT be
+  detected via the same `tmpl.AllTables(oid)` walk `tables` uses — every
+  sequence's virtual `pg_class` relation is marked `Virtual` by
+  `executor.CreateSequenceCatalogRelation`, and `catalog.InMemory.AllTables`
+  unconditionally skips every `Virtual` row (it's the general-purpose
+  "real user relations" enumerator, e.g. also backing `DatFrozenXID`'s own
+  identical skip). A first implementation attempt keyed sequence detection
+  off `AllTables` + a hand-set `IsSequence` flag and passed its own unit
+  tests (which built fixtures directly with `Virtual` left `false`) but
+  failed the real end-to-end wire-protocol test with `pq: relation "s_copy"
+  does not exist` — the clone's `nextval()` couldn't find a registry entry
+  because the clone step never ran (`tmplSequences` came back empty from a
+  real `CREATE SEQUENCE`). Fixed by enumerating sequences from
+  `executor.AllSequenceInfos(oid)` instead (reads `seqRegistry` directly,
+  independent of `Virtual`), then checking `executor.IsSequenceTemporary`
+  per name — same "keep the whole template unsupported" rule follow-up 39/40
+  established for indexes, now extended to a `TEMPORARY` sequence (session-
+  scoped, no durable state worth cloning). The unit tests were corrected
+  to build fixtures via the real registration pair
+  (`executor.RegisterSequence` + `executor.CreateSequenceCatalogRelation`,
+  mirroring `execCreateSequence` itself) instead of a hand-set `IsSequence`
+  flag, so they now actually exercise the same `Virtual`-skipping behavior
+  production code hits.
+- **`copyTemplateSequences`** (new, parallels `copyTemplateTables`): for
+  each `executor.SeqInfo`, snapshots the source via `SnapshotSequenceState`,
+  overwrites the payload's `DBOid` to the new database's oid, re-registers it
+  via the pre-existing `executor.RestoreSequenceFromWAL` (identical to a WAL
+  replay call — no new registration primitive needed), re-creates the Virtual
+  `pg_class` row via `executor.CreateSequenceCatalogRelation` (so `SELECT *
+  FROM s_copy` / `pg_class`/`pg_sequences` see it under the new database),
+  and — since `CREATE DATABASE` runs outside any client transaction, same
+  reasoning as `syncCopiedTableCatalogHeap` — WAL-logs the clone's own
+  durable snapshot via `executor.WALLogSequenceState` against a minimal
+  `*executor.Context` (`CurrentDatabaseOid`/`WAL` only; no `Tx`/`Snap` needed,
+  since sequence durability doesn't ride the heap/mvcc machinery table
+  cloning does).
+- **`rollbackTemplateCopy`** gained a second sweep: alongside its existing
+  `im.AllTables(newOid)` walk (tables), it now also walks
+  `executor.AllSequenceInfos(newOid)` and, for each, calls
+  `executor.DropSequence` (the registry entry) followed by `im.DropTable`
+  (the Virtual `pg_class` row) — mirroring real `DROP SEQUENCE`'s own
+  pairing of the same two calls (`operators_ddl.go`). Without this second
+  sweep, a mid-copy failure after the sequence step but before the table
+  step (or vice versa) would leak a half-cloned sequence into the aborted
+  database's oid, invisible to the table-only rollback walk.
+- `tryHandleDatabaseDDL`'s `CREATE DATABASE` branch runs
+  `copyTemplateSequences` as an independent step alongside
+  `copyTemplateTables` (a template can contain either, both, or neither);
+  both share the same source-database busy guard
+  (`len(tmplTables) > 0 || len(tmplSequences) > 0`).
+- Tests: `TestTryHandleDatabaseDDLCreateTemplateWithSequenceCopies` replaces
+  the old `...WithSequenceErrors` test (sequences are no longer universally
+  rejected); new `TestTryHandleDatabaseDDLCreateTemplateWithTemporarySequenceErrors`
+  pins that a `TEMPORARY` sequence still rules out the whole template
+  (`internal/server/database_ddl_test.go`). New E2E
+  `TestCreateDatabaseTemplateSequenceCopiesStateAndSurvivesRestart`
+  (`internal/server/database_template_copy_restart_test.go`): real wire
+  protocol creates a sequence, advances it via real `nextval()`, TEMPLATE-
+  copies it, and asserts the clone continues from the source's exact counter
+  immediately, that advancing either copy never moves the other (no
+  aliasing), and that both counters keep advancing independently — with
+  values strictly above their pre-restart value, not necessarily +1, matching
+  the pre-logging-gap semantics `TestPort_SerialSequenceSurvivesRestart`
+  already documents — after a full server restart. Gates: `go build
+  ./...`/`go vet ./...` clean; `go test ./internal/server/...
+  ./internal/executor/... ./internal/catalog/...` PASS; `go test -race
+  ./internal/server/... ./internal/executor/...` PASS except the
+  pre-existing, unrelated `TestConnectExceedsPositiveDatconnlimitRejected`
+  race documented above (re-confirmed this loop via `git stash` +
+  `-count=3` against unmodified HEAD — reproduces identically, not
+  introduced by this change); `go test -short` full repo (excl. testport)
+  PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke via
+  `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+  failed, all 3 workloads).
+- **Remaining 4e scope (deferred, own future loops):** index/view/matview/
+  typed-table TEMPLATE copying (index-file cloning + per-database sys-btree
+  catalog bootstrap; view/matview AST + `ViewDef` text cloning; composite-type
+  OID resolution); `pg_statistic_ext`/`information_schema.routines` registry
+  redesign (pre-existing, unrelated to TEMPLATE).
+
 ## Recommended order and stopping points
 
 4a (landed) → 4b-i (landed) → 4b-ii (landed) → 4c (landed) → 4d-i (landed) →
@@ -1775,9 +1875,10 @@ sections above); `CREATE DATABASE ... TEMPLATE`'s bounded
 existence/emptiness validation also landed (2026-07-10, see its own section
 above); the real relation-copy mechanism itself has now ALSO landed
 (2026-07-10, follow-up 40, see its own section above) for its bounded
-plain-table case — **4e's only remaining scope is extending that copy
-mechanism to index/sequence/view/matview/typed-table templates** (see the
-deferral ledger's follow-up-40 row for the resume point). Before starting
+plain-table case, extended the same day to sequences (follow-up 41, see its
+own section above) — **4e's only remaining scope is extending that copy
+mechanism to index/view/matview/typed-table templates** (see the
+deferral ledger's follow-up-40/41 rows for the resume point). Before starting
 that extension, read 4d-i's,
 4d-ii-part-1's, and 4d-ii-part-2a's/4d-ii-part-2b's/4e's landed sections
 above in full — they document exactly which write entry points and lookups
