@@ -1,36 +1,40 @@
 (idle — nothing in flight)
 
-## Loop summary (2026-07-11, loop #28)
+## Loop summary (2026-07-11, loop #30)
 
-**Outcome: landed year-month tokenizer quirks `1-` / `1-2.5`
-(unimplemented_feat #5(d-iii-rest), the last named year-month deferral).**
+**Nightly triage:** batch 20260711-011536 already fully dispositioned by loop #29
+(all 3 AI items checked off, no new batch). Proceeded to feature work.
 
-- Nightly triage FIRST: `ci/logs/action-items.md` still holds only
-  AI-20260710-011513-001 (`make build` fail). Re-confirmed STALE — `make build`
-  PASSES at HEAD (exit 0). No new nightly work.
-- Feature: `interval '1-'`→1 year (empty month tail = bare year) and
-  `interval '1-2.5'`→1 year 2 mons 00:00:00.5 (fractional-seconds run trailing
-  the year-month field) now parse; `1-2.5day`→+12:00:00; SIGNED `-1-2.5`/`+1-2.5`
-  still error. One file: `internal/parser/interval.go`.
-- Design: PG `ParseDateTime` lexes `1-2.5` as DTK_DATE `1-2` + fresh DTK_NUMBER
-  `.5`; a SIGNED field is one DTK_TZ token its years-months branch rejects.
-  Mirrored: new `splitYearMonthFraction` peels a `.`-led run off an UNSIGNED
-  `<digits>-<digits?>` field in `expandIntervalFields`, feeding the remainder
-  back through `splitAlphaNumRuns`; `parseYearMonthField` now accepts an empty
-  month tail as 0 months (PG strtoint on ""=0). Verified byte-for-byte vs live
-  PG 18.3 (scratch initdb on /tmp/pgverify-interval, port 5601, now stopped).
-- Tests: `internal/executor/interval_subday_test.go` `TestYearMonthHyphenIntervals`
-  +22 accepts / +8 rejects.
-- Docs: unimplemented_feat.json #5 STILL DEFERRED clause narrowed (year-month
-  quirks removed, replaced with the `1-2h` lone-unit-word deferral); design
-  0003-0006 new Follow-up section; README row #73 extended (also backfilled the
-  previously-unindexed d-iii/d-iii-rest follow-ups); deferral ledger row appended.
-- Gates (all PASS): build/vet clean; parser + full executor suites; tpch-spotcheck
-  Q12=2/Q13=33; pgbench smoke via pre-commit hook (on commit).
+**Task — `unimplemented_feat #5(d-iii-rest)` year-month/time glued unit-word
+absorption — DONE (committed, pushed).** Closed the prior ledger row's deferred
+"bare unit word glued to a year-month field" item + spaced/time siblings.
+`interval '1-2h'`/`'1-2 h'`/`'1-2 days'`/`'1-2mon3d'`/`'1-2h30m'` → 1 year 2 mons(+…);
+`interval '12:00 h'`/`'12:00h'`/`'05:00 mon'` → the bare time. Absorbed unit is a
+no-op (PG right-to-left DecodeInterval: year-month/time field to the LEFT resets
+the pending unit type without consuming a magnitude).
 
-**Still deferred (interval)** per ledger: bare unit-word glued to a year-month
-(`interval '1-2h'`→PG 1 year 2 mons, `h` a no-op — needs DecodeInterval's
-right-to-left unit-then-DTK_MONTH-override); full typmod grammar (HOUR TO MINUTE
-ranges, SECOND(p), Form-1 trailing-word column-alias); interval ±infinity.
+Files:
+- internal/parser/interval.go — `decodeIntervalFields` gains `prevAbsorbs`;
+  `splitYearMonthFraction`→`splitYearMonthTrailer` (peel trailing letter run,
+  only with ≥1 month digit); `expandIntervalFields` `:` branch peels a trailing
+  letter run off time fields.
+- internal/parser/select.go — `splitEmbeddedInterval` guarded to require a plain
+  ParseIntervalMagnitude first field (sibling-path fix: `1-2 days` was raising
+  "invalid interval count" before reaching ParseIntervalBody).
+- internal/executor/interval_subday_test.go — new `TestYearMonthTimeGluedUnitAbsorb`
+  (32 accepts + 13 rejects, byte-for-byte vs live PG 18.3 on port 5599).
+- docs/design/0003-0006-date-interval-arithmetic.md — Follow-up section.
+- .ralph/deferral_ledger.md — signed `-1-2h` deferred (needs DTK_TZ-shaped splitter).
+- .ralph/fix_plan.md — item checked off.
+
+Next feature step (deferral ledger 2026-07-11): SIGNED year-month glued form
+`interval '-1-2h'` → PG -1 years -2 mons. PG lexes a sign-prefixed field as one
+DTK_TZ token (collects digits/`:`/`.`/`-`, STOPS at a letter), so `-1-2h` splits
+but `-1-2.5` stays whole & errors. Needs a separate DTK_TZ-shaped splitter in
+expandIntervalFields for the signed branch; do NOT reuse the unsigned DTK_DATE
+splitter (its `.`-vs-letter boundary differs). Then typmod grammar + ±infinity.
+
+Gates: go vet parser+executor clean; parser/analyzer/planner/executor suites PASS;
+tpch-spotcheck PASS (Q12=2/Q13=33); pgbench smoke via pre-commit hook; ralph-state-guard OK.
 
 In-flight: none

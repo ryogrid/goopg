@@ -3103,6 +3103,15 @@ func splitEmbeddedInterval(body string) (string, string, bool) {
 		return "", "", false
 	}
 	num, unit := parts[0], strings.ToLower(parts[1])
+	// The magnitude must be a plain number. A first field that is not a bare
+	// magnitude — most importantly a SQL year-month field (`1-2 days`, where the
+	// `days` is a unit word absorbed as a no-op) — must NOT be mis-split here; it
+	// falls through to ParseIntervalBody, which decodes the whole body faithfully
+	// (`1-2 days` → 1 year 2 mons). Without this guard `1-2` would reach
+	// evalIntervalLit as the magnitude and raise "invalid interval count".
+	if _, _, ok := ParseIntervalMagnitude(num); !ok {
+		return "", "", false
+	}
 	switch unit {
 	case "day", "days", "month", "months", "year", "years",
 		"hour", "hours", "minute", "minutes",

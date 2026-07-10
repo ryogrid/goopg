@@ -661,6 +661,100 @@ func TestYearMonthHyphenIntervals(t *testing.T) {
 	}
 }
 
+// TestYearMonthTimeGluedUnitAbsorb covers a bare unit word swallowed as a no-op
+// by a preceding year-month or time field (unimplemented_feat #5(d-iii-rest)).
+// PostgreSQL's DecodeInterval reads fields right-to-left: a unit word sets the
+// pending `type`/`parsing_unit_val`, and a year-month DTK_DATE field (which
+// forces type=DTK_MONTH) or a DTK_TIME field (type=DTK_DAY) to its left resets
+// both without consuming a magnitude, so the unit contributes nothing:
+// `1-2h`/`1-2 h` → 1 year 2 mons, `12:00 h` → 12:00:00. A lone unit word
+// anywhere else (leading, after a number pair, or after another absorbed unit)
+// is DTERR_BAD_FORMAT. Glued forms tokenise the same as spaced ones: PG's
+// DTK_DATE / DTK_TIME lexer stops at the first non-delimiter letter (only when
+// the year-month part carries at least one month DIGIT — an empty month glues
+// the letter into one malformed token, so `1-h`/`1-day` error). Every accept /
+// reject was captured byte-for-byte from a live PostgreSQL 18.3 instance.
+func TestYearMonthTimeGluedUnitAbsorb(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+	if err := runDDL(t, ctx, "CREATE TABLE t (id int)"); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	if err := runDDL(t, ctx, "INSERT INTO t VALUES (1)"); err != nil {
+		t.Fatalf("INSERT: %v", err)
+	}
+	accept := []struct{ sql, want string }{
+		// Unit word absorbed after a year-month field, glued and spaced — any
+		// unit designator works because it is discarded entirely.
+		{"SELECT interval '1-2h'", "1 year 2 mons"},
+		{"SELECT interval '1-2d'", "1 year 2 mons"},
+		{"SELECT interval '1-2 h'", "1 year 2 mons"},
+		{"SELECT interval '1-2mon'", "1 year 2 mons"},
+		{"SELECT interval '1-2 days'", "1 year 2 mons"},
+		{"SELECT interval '1-2day'", "1 year 2 mons"},
+		{"SELECT interval '1-2 s'", "1 year 2 mons"},
+		{"SELECT interval '1-2sec'", "1 year 2 mons"},
+		{"SELECT interval '1-2minute'", "1 year 2 mons"},
+		{"SELECT interval '1-2 hour'", "1 year 2 mons"},
+		{"SELECT interval '1-2year'", "1 year 2 mons"},
+		{"SELECT interval '1-2 mons'", "1 year 2 mons"},
+		{"SELECT interval '10-3d'", "10 years 3 mons"},
+		{"SELECT interval '1-0h'", "1 year"},
+		// Absorbed unit followed by more real fields.
+		{"SELECT interval '1-2 h 3 d'", "1 year 2 mons 3 days"},
+		{"SELECT interval '1-2 3d'", "1 year 2 mons 3 days"},
+		{"SELECT interval '1-2 days 3'", "1 year 2 mons 00:00:03"},
+		{"SELECT interval '1-2 day 3 hour'", "1 year 2 mons 03:00:00"},
+		{"SELECT interval '1-2 h -3 d'", "1 year 2 mons -3 days"},
+		{"SELECT interval '1-2 h 12:00'", "1 year 2 mons 12:00:00"},
+		// Glued forms that split at the letter and re-tokenise the remainder.
+		{"SELECT interval '1-2h30m'", "1 year 2 mons 00:30:00"},
+		{"SELECT interval '1-2mon3d'", "1 year 2 mons 3 days"},
+		{"SELECT interval '1-2.5h'", "1 year 2 mons 00:30:00"},
+		// Unit word absorbed after a time field (`12:00 h`, glued `12:00h`).
+		{"SELECT interval '12:00 h'", "12:00:00"},
+		{"SELECT interval '12:00h'", "12:00:00"},
+		{"SELECT interval '12:00mon'", "12:00:00"},
+		{"SELECT interval '12:00:00h'", "12:00:00"},
+		{"SELECT interval '05:00 mon'", "05:00:00"},
+		{"SELECT interval '12:00 h 3 d'", "3 days 12:00:00"},
+		// Cast / :: siblings share the tokenizer.
+		{"SELECT '1-2h'::interval", "1 year 2 mons"},
+		{"SELECT CAST('1-2 days' AS interval)", "1 year 2 mons"},
+		{"SELECT '12:00h'::interval", "12:00:00"},
+	}
+	for _, c := range accept {
+		rows := runQuery(t, ctx, c.sql+" FROM t")
+		if len(rows) != 1 || len(rows[0]) != 1 {
+			t.Fatalf("%s: expected 1x1 result, got %v", c.sql, rows)
+		}
+		if got := rows[0][0].Format(); got != c.want {
+			t.Errorf("%s = %q, want %q", c.sql, got, c.want)
+		}
+	}
+
+	reject := []string{
+		"SELECT interval '1-h' FROM t",            // empty month + glued letter → whole malformed token
+		"SELECT interval '1-day' FROM t",          // ditto
+		"SELECT interval '1-2 foo' FROM t",        // 'foo' is not a unit word
+		"SELECT interval '1-2foo' FROM t",         // ditto glued
+		"SELECT interval '1-2 x' FROM t",          // 'x' is not a unit word
+		"SELECT interval '1-2 h h' FROM t",        // consecutive unhandled units
+		"SELECT interval '1-2 hour minute' FROM t", // ditto
+		"SELECT interval '5 h mon' FROM t",        // lone unit after a number pair
+		"SELECT interval '1 day mon' FROM t",      // ditto
+		"SELECT interval '12:00 mon 3' FROM t",    // trailing 3 → seconds collides with time SECOND slot
+		"SELECT interval '12:00h30m' FROM t",      // 30m MINUTE collides with the time-word MINUTE slot
+		"SELECT interval '12:00hh' FROM t",        // 'hh' is not a unit word
+		"SELECT interval '-1-2h' FROM t",          // SIGNED year-month glued unit deferred (see ledger)
+	}
+	for _, sql := range reject {
+		if _, err := runQueryErr(t, ctx, sql); err == nil {
+			t.Errorf("%s: expected error, got none", sql)
+		}
+	}
+}
+
 // TestParseIntervalBodySingleFieldMatchesUnitToParts guards the sibling-path
 // invariant that the multi-field tokenizer (parser.ParseIntervalBody) and the
 // per-field spill helper (parser.IntervalUnitToParts, used by the single-field

@@ -935,6 +935,64 @@ gained 22 accepts (fractional-tail, empty-tail, bare-year, cast/`::` siblings) +
 `go build`/`go vet` clean; parser + executor interval suites PASS;
 `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke via pre-commit hook.
 
+## Follow-up (2026-07-11): year-month / time unit-word absorption (#5(d-iii-rest))
+
+Closed the prior section's "Still deferred" item: a bare **unit word swallowed as
+a no-op** by a preceding year-month or time field (`interval '1-2h'` /
+`interval '1-2 h'` → `1 year 2 mons`, `interval '12:00 h'` / `'12:00h'` →
+`12:00:00`). Two coordinated changes plus a sibling-path guard.
+
+**PG mechanism (right-to-left `DecodeInterval`).** PostgreSQL reads interval fields
+back-to-front: a unit word (`DTK_STRING`) sets a pending `type` and
+`parsing_unit_val=true` but contributes no field-mask bit. The field to its *left*
+then resolves that pending state — and a year-month `DTK_DATE` field (which forces
+`type=DTK_MONTH`) or a `DTK_TIME` field (`type=DTK_DAY`) resets both **without
+consuming a magnitude**, so the unit word is discarded. A unit word that is *not*
+reset this way — leading, after a `<num> <unit>` pair, or after another unit word
+(`parsing_unit_val` still set) — is `DTERR_BAD_FORMAT`. Hence `5 h mon`,
+`1-2 h h`, `1 day mon`, `1-2 hour minute` all error.
+
+**goopg model (left-to-right).** `decodeIntervalFields`
+(`internal/parser/interval.go`) gains a `prevAbsorbs` flag, set true after a
+year-month or time field and false after any magnitude. When a field is not a
+magnitude, it is now accepted iff `prevAbsorbs` **and** it is a valid unit word
+(`canonicalIntervalUnit`); it is skipped, adds no field-mask bit (so a later real
+field still collides correctly — `12:00 mon 3` errors because the trailing `3`
+defaults to SECONDS and collides with the time word's SECOND slot), and clears
+`prevAbsorbs` so a second consecutive unit errors.
+
+**Glued tokenizer.** `splitYearMonthFraction` → `splitYearMonthTrailer`: after the
+`<year>-<month?>` prefix it now splits a trailing **letter** run too — but only
+when the month part has ≥1 digit, because PG's `DTK_DATE` else-branch collects
+letters (`isalnum`) into one malformed token when the month is empty (`1-h`,
+`1-day` error) while stopping at the letter when a month digit is present
+(`1-2h` → `1-2` + `h`). A `.` tail still splits regardless of month digits. The
+symmetric `DTK_TIME` case is handled in `expandIntervalFields`: a `:`-bearing field
+now peels a trailing letter run (`12:00h` → `12:00` + `h`); `12:00h30m` still errors
+because the split `30 m` MINUTE bit collides with the time word's MINUTE slot.
+
+**Sibling-path guard (the load-bearing catch).** The parser's Form-2
+`splitEmbeddedInterval` greedily matched any two-field body whose second word is a
+unit (`1-2 days` → magnitude `1-2`, typmod `day`), short-circuiting
+`ParseIntervalBody` and raising "invalid interval count". It now requires the first
+field to be a plain `ParseIntervalMagnitude`, so year-month bodies fall through to
+the shared decoder. This keeps the typed-literal path (`interval '…'`,
+`evalIntervalLit`) and the cast path (`::interval`/`CAST`, `parseIntervalCastString`)
+in lock-step — both reach `ParseIntervalBody`.
+
+**Still deferred (ledger 2026-07-11):** the **signed** year-month glued form
+(`interval '-1-2h'` → PG `-1 years -2 mons`). PG lexes a sign-prefixed field as a
+single `DTK_TZ` token with different collection rules (it swallows `.`, stops at a
+letter), so the split cannot reuse the unsigned `splitYearMonthTrailer`; goopg keeps
+signed `-`-fields whole and errors, as it already does for `-1-2.5`. Also still open:
+full interval typmod grammar and interval `±infinity`.
+
+Tests: `internal/executor/interval_subday_test.go`'s new
+`TestYearMonthTimeGluedUnitAbsorb` (32 accepts + 13 rejects, every case captured
+byte-for-byte from live PostgreSQL 18.3). Gates: `go build`/`go vet` clean; parser +
+analyzer + planner + executor suites PASS; `scripts/tpch-spotcheck.sh` PASS
+(Q12=2/Q13=33); pgbench smoke via pre-commit hook.
+
 ## Cross-references
 
 - TPC-H query bodies: HammerDB upstream

@@ -7887,6 +7887,31 @@ mirroring M0119's ledger `status` column.
       `docs/design/0003-0006-*` new Follow-up + README row. Gates: build/vet
       clean; executor/parser/planner/analyzer suites PASS;
       `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke (hook).
+  - [x] `unimplemented_feat #5(d-iii-rest) (year-month/time glued unit-word
+      absorption)` (2026-07-11, this loop) — closed the prior row's deferred
+      "bare unit word glued to a year-month field" item plus its spaced and
+      time-field siblings: `interval '1-2h'`/`'1-2 h'`/`'1-2 days'`/`'1-2mon3d'`/
+      `'1-2h30m'` → 1 year 2 mons(+…), `interval '12:00 h'`/`'12:00h'`/
+      `'05:00 mon'` → the bare time. Faithful to PG's right-to-left
+      `DecodeInterval`: a unit word (DTK_STRING) sets a pending type but no
+      field-mask bit, and a year-month DTK_DATE (forces DTK_MONTH) or DTK_TIME
+      field to its left resets it WITHOUT consuming a magnitude, so the unit is
+      discarded; a unit not reset this way (leading / after a number-pair /
+      consecutive) errors (`5 h mon`, `1-2 h h`, `1 day mon` → 22007). goopg
+      models this left-to-right with a `prevAbsorbs` flag in
+      `decodeIntervalFields`; `splitYearMonthFraction`→`splitYearMonthTrailer`
+      and `expandIntervalFields` gain the glued-letter split (only with ≥1 month
+      digit, and off `:` time fields); the parser Form-2 `splitEmbeddedInterval`
+      (`select.go`) is guarded to require a plain magnitude first field so
+      `1-2 days` falls through to the shared `ParseIntervalBody` (was raising
+      "invalid interval count") — keeps `evalIntervalLit` and
+      `parseIntervalCastString` in lock-step. Deferred (ledger 2026-07-11): the
+      SIGNED glued form (`-1-2h`, needs a DTK_TZ-shaped splitter), typmod
+      grammar, ±infinity. Tests: `interval_subday_test.go`
+      `TestYearMonthTimeGluedUnitAbsorb` (32 accepts + 13 rejects, byte-for-byte
+      vs live PG 18.3). Design doc `docs/design/0003-0006-*` Follow-up section.
+      Gates: build/vet clean; parser/analyzer/planner/executor suites PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke (hook).
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,

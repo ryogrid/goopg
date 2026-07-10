@@ -431,9 +431,31 @@ func inDatetktbl(w string) bool {
 func expandIntervalFields(raw []string) (out []string, ok bool) {
 	out = make([]string, 0, len(raw))
 	for _, f := range raw {
-		// Time words (HH:MM[:SS]) are decoded whole by the caller; never split.
+		// Time words (HH:MM[:SS]) are decoded whole by the caller — BUT
+		// PostgreSQL's DTK_TIME lexer collects only digits, ':' and '.', so a
+		// glued trailing unit word starts a fresh DTK_STRING field (`12:00h` →
+		// `12:00` + `h`, the `h` then absorbed as a no-op). Peel any trailing
+		// ASCII-letter run and re-tokenize it; the time prefix is left intact.
+		// (`12:00h30m` still errors: it splits to `12:00`+`h`+`30`+`m`, and the
+		// `30 m` MINUTE bit collides with the time word's MINUTE slot.)
 		if strings.ContainsRune(f, ':') {
-			out = append(out, f)
+			letterAt := -1
+			for k := 0; k < len(f); k++ {
+				if isASCIILetter(f[k]) {
+					letterAt = k
+					break
+				}
+			}
+			if letterAt < 0 || !strings.ContainsRune(f[:letterAt], ':') {
+				out = append(out, f)
+				continue
+			}
+			restToks, rok := splitAlphaNumRuns(f[letterAt:])
+			if !rok {
+				return nil, false
+			}
+			out = append(out, f[:letterAt])
+			out = append(out, restToks...)
 			continue
 		}
 		// A leading '+'/'-' is the field's sign, not a separator.
@@ -444,16 +466,18 @@ func expandIntervalFields(raw []string) (out []string, ok bool) {
 		// An internal '-' marks a SQL year-month field (`1-2`, `-1-2`) or an
 		// exotic hyphenated token; leave it whole for parseYearMonthField —
 		// UNLESS it is an unsigned field with a trailing fractional-seconds run
-		// that PostgreSQL's ParseDateTime lexer would split off. PG lexes
-		// `1-2.5` as a DTK_DATE field (`1-2`) plus a fresh DTK_NUMBER field
-		// (`.5`), so the fraction decodes as seconds (`1-2.5` → 1 year 2 mons +
-		// 0.5 s); `1-.5` likewise splits into `1-` + `.5`. A SIGNED field
-		// (`-1-2.5`, `+1-2.5`) is kept whole: PG lexes it as a single DTK_TZ
-		// token whose years-months branch then rejects the `.5` tail
-		// (DTERR_BAD_FORMAT), so goopg must error on it too.
+		// or a glued unit word that PostgreSQL's ParseDateTime lexer would split
+		// off. PG lexes `1-2.5` as a DTK_DATE field (`1-2`) plus a fresh
+		// DTK_NUMBER field (`.5`), so the fraction decodes as seconds (`1-2.5` →
+		// 1 year 2 mons + 0.5 s); `1-.5` likewise splits into `1-` + `.5`; and
+		// `1-2h` splits into `1-2` + a DTK_STRING `h` unit word that is then
+		// absorbed (`1-2h` → 1 year 2 mons). See splitYearMonthTrailer. A SIGNED
+		// field (`-1-2.5`, `+1-2h`) is kept whole: PG lexes it as a single DTK_TZ
+		// token, whose collection rules differ (it swallows '.', stops at a
+		// letter), so the split is deferred for the signed case.
 		if strings.ContainsRune(body, '-') {
 			if sign == "" {
-				if pre, rest, ok := splitYearMonthFraction(body); ok {
+				if pre, rest, ok := splitYearMonthTrailer(body); ok {
 					restToks, rok := splitAlphaNumRuns(rest)
 					if !rok {
 						return nil, false
@@ -524,19 +548,32 @@ func splitAlphaNumRuns(body string) (toks []string, ok bool) {
 func isASCIILetter(c byte) bool { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') }
 func isASCIIDigit(c byte) bool  { return c >= '0' && c <= '9' }
 
-// splitYearMonthFraction reproduces the one PostgreSQL ParseDateTime lexer split
-// that the coarser whitespace tokenizer misses: an unsigned digit-led SQL
-// year-month field carrying a trailing fractional run (`1-2.5`, `1-.5`,
-// `0-2.5`, `1-2.5day`). PostgreSQL reads the `<digits>-<digits>` run as a
-// DTK_DATE field and then starts a fresh field at the '.', so the remainder
-// decodes on its own (`1-2.5` → 1 year 2 mons + 0.5 s; `1-2.5day` → the `.5day`
-// remainder splits again into `.5`+`day` → +12:00:00). Returns ok=true with
-// pre = the `<digits>-<digits?>` field and rest = the remainder beginning at
-// '.', only when the body has that exact shape. Any other body — no fractional
-// tail (`1-2`, `1-`, `1-2h`), a second '-' (`1-2-3`, `1--2`), or a non-digit
-// head — returns ok=false so the caller decodes it whole (matching PG, which
-// either accepts the bare year-month or rejects the malformed field).
-func splitYearMonthFraction(body string) (pre, rest string, ok bool) {
+// splitYearMonthTrailer reproduces the two PostgreSQL ParseDateTime lexer splits
+// that the coarser whitespace tokenizer misses on an unsigned digit-led SQL
+// year-month field carrying a trailing run.
+//
+//  1. Fractional-seconds tail (`1-2.5`, `1-.5`, `0-2.5`, `1-2.5day`): PostgreSQL
+//     reads the `<digits>-<digits>` run as a DTK_DATE field and then, because '.'
+//     is neither alphanumeric nor the '-' delimiter, stops and starts a fresh
+//     field at the '.', so the remainder decodes on its own (`1-2.5` → 1 year 2
+//     mons + 0.5 s; `1-2.5day` → the `.5day` remainder splits again into
+//     `.5`+`day` → +12:00:00). A '.' tail splits even when the month part is
+//     empty (`1-.5`, `0-.5`).
+//  2. Unit-word tail glued to a NON-EMPTY month (`1-2h`, `1-2mon3d`, `1-2h30m`):
+//     the DTK_DATE collection stops at the first non-delimiter letter, which
+//     starts a fresh DTK_STRING field, so the trailing unit word decodes on its
+//     own and is later absorbed as a no-op (`1-2h` → 1 year 2 mons). This tail
+//     only splits when the month part has at least one digit: with an EMPTY
+//     month, PostgreSQL's else-branch collects the letters INTO the DTK_DATE
+//     token (`isalnum`), yielding one malformed year-month token that errors
+//     (`1-h`, `1-day`) — goopg reproduces that by leaving such a body whole.
+//
+// Returns ok=true with pre = the `<digits>-<digits?>` field and rest = the
+// remainder beginning at the '.'/letter. Any other body — no tail (`1-2`, `1-`),
+// a second '-' (`1-2-3`, `1--2`), an empty-month letter tail (`1-h`), or a
+// non-digit head — returns ok=false so the caller decodes it whole (matching PG,
+// which either accepts the bare year-month or rejects the malformed field).
+func splitYearMonthTrailer(body string) (pre, rest string, ok bool) {
 	if len(body) == 0 || !isASCIIDigit(body[0]) {
 		return "", "", false
 	}
@@ -548,16 +585,25 @@ func splitYearMonthFraction(body string) (pre, rest string, ok bool) {
 		return "", "", false
 	}
 	i++ // consume the '-' separator
+	monStart := i
 	for i < len(body) && isASCIIDigit(body[i]) { // month digits (may be zero)
 		i++
 	}
-	// Only a '.' (fractional-seconds run) triggers the split; anything else —
-	// end of field, a letter, or a second '-' — is left for the whole-field
-	// year-month decoder.
-	if i >= len(body) || body[i] != '.' {
+	if i >= len(body) {
+		return "", "", false // bare `<year>-<month?>`, no trailer to split
+	}
+	switch {
+	case body[i] == '.':
+		// Fractional-seconds tail; splits regardless of month digits.
+		return body[:i], body[i:], true
+	case isASCIILetter(body[i]) && i > monStart:
+		// Unit-word tail, only after a non-empty month (`1-2h`, not `1-h`).
+		return body[:i], body[i:], true
+	default:
+		// End of field, a second '-' (`1-2-3`), or an empty-month letter tail
+		// (`1-h`) — left for the whole-field year-month decoder / error path.
 		return "", "", false
 	}
-	return body[:i], body[i:], true
 }
 
 // ParseIntervalBody decodes a full free-form interval literal body into
@@ -893,6 +939,17 @@ func decodeIntervalFields(body string) (months, days int32, micros int64, ok boo
 		fmask |= tmask
 		return true
 	}
+	// prevAbsorbs tracks whether the field just consumed was a year-month or a
+	// time field — the two field kinds that, in PostgreSQL's right-to-left
+	// DecodeInterval, reset `type`/`parsing_unit_val` WITHOUT consuming a
+	// magnitude. A bare unit word immediately following such a field is
+	// therefore swallowed as a no-op: `1-2h`/`1-2 h` → 1 year 2 mons, `12:00 h`
+	// → 12:00:00 (the year-month DTK_MONTH override / DTK_TIME both discard the
+	// pending unit `type`). A lone unit word anywhere else — leading, or after a
+	// number-pair or another absorbed unit — is DTERR_BAD_FORMAT (`5 h mon`,
+	// `1-2 h h`, `1 day mon` all error), mirroring DecodeInterval's dangling /
+	// "consecutive unhandled units" rejection.
+	prevAbsorbs := false
 	for i := 0; i < len(fields); i++ {
 		f := fields[i]
 		if strings.ContainsRune(f, ':') {
@@ -906,6 +963,7 @@ func decodeIntervalFields(body string) (months, days int32, micros int64, ok boo
 			}
 			micros += mu
 			consumedAny = true
+			prevAbsorbs = true
 			continue
 		}
 		// SQL-standard year-month field (`1-2` → 1 year 2 months). A
@@ -918,12 +976,27 @@ func decodeIntervalFields(body string) (months, days int32, micros int64, ok boo
 			}
 			months += ym
 			consumedAny = true
+			prevAbsorbs = true
 			continue
 		}
 		val, fval, mok := ParseIntervalMagnitude(f)
 		if !mok {
+			// Not a magnitude: the only field shape still acceptable here is a
+			// bare unit word swallowed by a preceding year-month/time field
+			// (see prevAbsorbs). It contributes nothing and adds no fmask bit,
+			// so a later collision is decided by the real fields around it.
+			if prevAbsorbs {
+				if _, uok := canonicalIntervalUnit(f); uok {
+					prevAbsorbs = false
+					continue
+				}
+			}
 			return 0, 0, 0, false
 		}
+		// A real magnitude field consumes any pending unit type (it is not a
+		// candidate to be swallowed), so a following lone unit word is a
+		// collision, not an absorb.
+		prevAbsorbs = false
 		// A magnitude followed by a unit word forms a `<num> <unit>` pair.
 		if i+1 < len(fields) {
 			unit, uok := canonicalIntervalUnit(fields[i+1])
