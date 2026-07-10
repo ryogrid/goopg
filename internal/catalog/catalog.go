@@ -18036,6 +18036,34 @@ func (c *InMemory) AllTables(dbOid ...uint32) []*Table {
 	return out
 }
 
+// AllViews reports every plain (non-materialized) view registered under
+// dbOid — a sibling of AllTables for CREATE DATABASE ... TEMPLATE's view-copy
+// slice (M0122-0007 4e follow-up 42). A plain view's pg_class row is always
+// Virtual (CreateView sets Virtual: true), so AllTables — which unconditionally
+// skips every Virtual row — can never see it; this method walks the same raw
+// namespace map PGClassRowsForDBOid does to surface view rows specifically,
+// mirroring AllSequenceInfos' analogous role for sequences (also Virtual).
+// Materialized views are excluded (IsMatView): they have real heap storage
+// (Virtual: false, see execCreateMatView's CreateTable call) and already
+// surface via AllTables.
+func (c *InMemory) AllViews(dbOid ...uint32) []*Table {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	ns := c.ns(resolveDBOid(dbOid))
+	out := make([]*Table, 0)
+	for _, t := range ns.tables {
+		if t.View == nil || t.IsMatView {
+			continue
+		}
+		cp := *t
+		cp.Columns = append([]Column(nil), t.Columns...)
+		cp.ViewColumnAliases = append([]string(nil), t.ViewColumnAliases...)
+		out = append(out, &cp)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].OID < out[j].OID })
+	return out
+}
+
 // DatFrozenXID returns the minimum RelFrozenXID across all user (non-virtual,
 // non-system) tables that have a valid relfrozenxid, or 0 when none do. This
 // is the cluster-wide datfrozenxid candidate: every XID strictly below it is

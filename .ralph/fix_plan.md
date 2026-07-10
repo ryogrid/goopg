@@ -7638,10 +7638,80 @@ mirroring M0119's ledger `status` column.
       -short` full repo (excl. testport) PASS; `scripts/tpch-spotcheck.sh`
       PASS (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke bash
       scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 workloads).
-      **Remaining M0122-0007 scope (deferred, own future loops):**
-      index/view/matview/typed-table TEMPLATE copying (index-file cloning +
-      per-database sys-btree catalog bootstrap; view/matview AST/`ViewDef`
-      cloning; composite-type OID resolution for typed tables);
+      **Remaining M0122-0007 scope after this follow-up (deferred, own future
+      loops):** index/view/matview/typed-table TEMPLATE copying (index-file
+      cloning + per-database sys-btree catalog bootstrap; view/matview
+      AST/`ViewDef` cloning; composite-type OID resolution for typed
+      tables); per-database index/type catalog rows + sys-btree bootstrap
+      (independent of TEMPLATE copy); `pg_statistic_ext`/
+      `information_schema.routines` registry redesign.
+
+  - [x] `M0122-0007` 4e follow-up 42 (2026-07-10, this loop) — **extended
+      `CREATE DATABASE ... TEMPLATE`'s relation-copy mechanism (follow-ups
+      40/41) to also cover plain (non-materialized) views.** Like sequences,
+      a view has no relation file and no per-database sys-btree bootstrap
+      need — its durable state is just a parsed SELECT AST
+      (`catalog.Table.View`) plus raw defining SQL text (`ViewDef`). **Real
+      correctness finding, caught by inspection rather than a failing E2E
+      test:** `resolveCreateDatabaseTemplate`'s `AllTables(oid)` loop had a
+      `t.View != nil { unsupported = true }` branch that could NEVER fire —
+      `CreateView` always sets `Virtual: true` on a view's pg_class row, and
+      `AllTables` unconditionally skips every `Virtual` row before the loop
+      body ever runs (same shape as follow-up 41's sequence-detection
+      gotcha). A template containing only a plain view was NOT actually
+      rejected with `FeatureNotSupported` as the code's own comment claimed
+      — it silently produced an empty new database with the view just
+      missing, no error at all. Fixed via new `catalog.InMemory.AllViews(dbOid
+      ...uint32) []*Table` (walks the same raw `ns.tables` map
+      `PGClassRowsForDBOid` already does, selecting `View != nil &&
+      !IsMatView`), threaded through `databaseTemplateRegistry`.
+      `resolveCreateDatabaseTemplate` gained a 4th return value `views
+      []*catalog.Table`; removed the dead `t.View != nil` branch + its
+      stale doc comment. New `s.copyTemplateViews` (no `srcOid` param —
+      unlike its siblings, a view's full state already lives in the `views`
+      slice) reuses `catalog.InMemory.CreateView` directly (sharing the
+      source's `View` AST pointer by reference — safe, a view's `Query` is
+      only ever replaced wholesale by a later `CREATE OR REPLACE VIEW`,
+      never mutated in place), copies across the post-creation fields
+      `CreateView` itself doesn't set (`ViewDef`/`CheckOption`/
+      `SecurityBarrier(Set)`/`SecurityInvoker(Set)`), then calls the
+      pre-existing `syncCopiedTableCatalogHeap` — no view-specific plumbing
+      needed there, `syncTableToCatalogHeap`'s WAL branch and
+      `view_ddl_recovery.go`'s replay were both already generic.
+      `rollbackTemplateCopy` gained a third sweep (`AllViews`+`DropView`).
+      **Also found and fixed:** a pre-existing test-isolation hazard —
+      `executor.seqRegistry` is process-global but every test's
+      `catalog.InMemory` restarts OID numbering from `catalog.FirstUserOID`,
+      so the temporary-sequence test's leftover registration leaked into
+      the new view test's numerically-coincident dbOid and made it
+      spuriously fail; fixed via `t.Cleanup` in both pre-existing sequence
+      tests. Tests: `TestTryHandleDatabaseDDLCreateTemplateWithViewCopies`,
+      new `...WithMatViewErrors` (`internal/server/database_ddl_test.go`);
+      new E2E `TestCreateDatabaseTemplateViewCopiesQueryAndSurvivesRestart`
+      (`internal/server/database_template_copy_restart_test.go`): real wire
+      protocol, a table + a view over it, TEMPLATE copy, the copy's view
+      resolves against the copy's own table, dropping the copy's view
+      leaves the source's view intact, and the source's view still
+      resolves correctly after a full server restart. Design:
+      `docs/design/0122-0018-per-database-catalog-namespace.md` gained a
+      follow-up-42 subsection; `docs/design/README.md` row updated;
+      deferral ledger row appended. Gates: `go build ./...`/`go vet ./...`
+      clean; `go test ./internal/server/... ./internal/catalog/...
+      ./internal/executor/... ./internal/initdb/...` PASS; `go test -race
+      ./internal/server/... ./internal/catalog/... ./internal/executor/...`
+      PASS except the pre-existing, unrelated
+      `TestConnectExceedsPositiveDatconnlimitRejected` race plus 2 unrelated
+      flaky tests (`TestConnTxSessionNilWhenNotExplicit`,
+      `TestSimpleQueryBatchAbortUndoesEarlierCreateType`), all re-confirmed
+      via `git stash` against unmodified HEAD (reproduce identically, not
+      introduced by this change); `go test -short` full repo (excl.
+      testport) PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh`
+      PASS (0 failed, all 3 workloads). **Remaining M0122-0007 scope
+      (deferred, own future loops):** index/matview/typed-table TEMPLATE
+      copying (index-file cloning + per-database sys-btree catalog
+      bootstrap; matview heap-data clone reusing this follow-up's own
+      AST-copy half; composite-type OID resolution for typed tables);
       per-database index/type catalog rows + sys-btree bootstrap
       (independent of TEMPLATE copy); `pg_statistic_ext`/
       `information_schema.routines` registry redesign.

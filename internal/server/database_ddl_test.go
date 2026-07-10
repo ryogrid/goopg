@@ -803,6 +803,18 @@ func TestTryHandleDatabaseDDLCreateTemplateWithSequenceCopies(t *testing.T) {
 		t.Fatalf("CREATE DATABASE seqsrc: handled=%v err=%v", handled, err)
 	}
 	srcOid := im.DatabaseOid("seqsrc")
+	// executor.seqRegistry is a process-global registry keyed by (name,
+	// dbOid) — every test's catalog.InMemory restarts its OID counter from
+	// catalog.FirstUserOID, so two independent tests' dbOids routinely
+	// collide numerically. Without this cleanup, sequence "s" registered
+	// under srcOid/newOid here silently leaks into whichever later test
+	// happens to allocate the same numeric dbOid (caught the hard way: this
+	// leaked into TestTryHandleDatabaseDDLCreateTemplateWithViewCopies until
+	// both sequence tests in this file gained this same cleanup).
+	t.Cleanup(func() {
+		executor.DropSequence("s", srcOid)
+		executor.DropSequence("s", im.DatabaseOid("foo"))
+	})
 	// Mirrors execCreateSequence's own registration pair (operators_ddl.go):
 	// RegisterSequence (the process-global counter) plus
 	// CreateSequenceCatalogRelation (the Virtual pg_class row) — a hand-built
@@ -853,6 +865,11 @@ func TestTryHandleDatabaseDDLCreateTemplateWithTemporarySequenceErrors(t *testin
 		t.Fatalf("CREATE DATABASE tmpseqsrc: handled=%v err=%v", handled, err)
 	}
 	srcOid := im.DatabaseOid("tmpseqsrc")
+	// See TestTryHandleDatabaseDDLCreateTemplateWithSequenceCopies' identical
+	// cleanup for why: executor.seqRegistry is process-global and this test's
+	// fresh catalog.InMemory can allocate the exact same numeric srcOid a
+	// later test's catalog also allocates.
+	t.Cleanup(func() { executor.DropSequence("s", srcOid) })
 	executor.RegisterSequence("s", 1, 1, 1, 9223372036854775807, false, srcOid)
 	executor.CreateSequenceCatalogRelation(im, parser.ObjectName{Name: "s"}, "s", srcOid)
 	executor.SetSequenceTemporary("s", true, srcOid)
@@ -866,5 +883,105 @@ func TestTryHandleDatabaseDDLCreateTemplateWithTemporarySequenceErrors(t *testin
 	}
 	if im.HasDatabase("foo") {
 		t.Error("CREATE DATABASE foo TEMPLATE tmpseqsrc: database was registered despite the error")
+	}
+}
+
+// TestTryHandleDatabaseDDLCreateTemplateWithViewCopies pins the M0122-0007 4e
+// follow-up 42 relation-copy mechanism: a template database whose only user
+// relation is a plain (non-materialized) view is now actually COPIED — a
+// hand-built catalog.Table with View set but Virtual unset would NOT
+// reproduce AllTables' real filtering behavior (AllTables always skips
+// Virtual rows, and every real view's relation IS Virtual, per CreateView),
+// so this registers the view via the real im.CreateView path, mirroring
+// TestTryHandleDatabaseDDLCreateTemplateWithSequenceCopies' equivalent care
+// for sequences.
+func TestTryHandleDatabaseDDLCreateTemplateWithViewCopies(t *testing.T) {
+	s := newTestRoleServer()
+	im := s.cfg.Catalog.(*catalog.InMemory)
+
+	if handled, _, err := s.tryHandleDatabaseDDL("CREATE DATABASE viewsrc", "postgres", "", nil); !handled || err != nil {
+		t.Fatalf("CREATE DATABASE viewsrc: handled=%v err=%v", handled, err)
+	}
+	srcOid := im.DatabaseOid("viewsrc")
+	cols := []catalog.Column{{Name: "id", Type: catalog.Type{Name: "int4"}, Ordinal: 0}}
+	if _, err := im.CreateTable(parser.ObjectName{Name: "t"}, cols, srcOid); err != nil {
+		t.Fatalf("CreateTable under viewsrc: %v", err)
+	}
+	stmts, err := parser.Parse("SELECT id FROM t")
+	if err != nil || len(stmts) != 1 {
+		t.Fatalf("parser.Parse(SELECT id FROM t) = %v, %v", stmts, err)
+	}
+	sel, ok := stmts[0].(*parser.SelectStmt)
+	if !ok {
+		t.Fatalf("parsed statement is %T, want *parser.SelectStmt", stmts[0])
+	}
+	viewCols := []catalog.Column{{Name: "id", Type: catalog.Type{Name: "int4"}, Ordinal: 0}}
+	srcView, err := im.CreateView(parser.ObjectName{Name: "v"}, viewCols, nil, sel, false, srcOid)
+	if err != nil {
+		t.Fatalf("CreateView under viewsrc: %v", err)
+	}
+	srcView.ViewDef = "SELECT id FROM t"
+
+	handled, _, err := s.tryHandleDatabaseDDL("CREATE DATABASE foo TEMPLATE viewsrc", "postgres", "", nil)
+	if !handled || err != nil {
+		t.Fatalf("CREATE DATABASE foo TEMPLATE viewsrc: handled=%v err=%v, want success", handled, err)
+	}
+	if !im.HasDatabase("foo") {
+		t.Fatal("CREATE DATABASE foo TEMPLATE viewsrc: database was not registered")
+	}
+	newOid := im.DatabaseOid("foo")
+	views := im.AllViews(newOid)
+	if len(views) != 1 || views[0].Name != "v" {
+		t.Fatalf("AllViews(foo) = %+v, want exactly one view named \"v\"", views)
+	}
+	clone := views[0]
+	if clone.OID == srcView.OID {
+		t.Error("copied view kept the template's own OID instead of getting a fresh one")
+	}
+	if clone.View == nil {
+		t.Fatal("copied view has no parsed query AST")
+	}
+	if clone.ViewDef != "SELECT id FROM t" {
+		t.Errorf("copied view ViewDef = %q, want %q", clone.ViewDef, "SELECT id FROM t")
+	}
+	// The copied table "t" must also exist under the new database — the view
+	// references it, and copyTemplateTables runs independently in the same
+	// CREATE DATABASE (both branches fire off the same tmplTables/tmplViews
+	// pair resolveCreateDatabaseTemplate returns).
+	if _, ok := im.LookupTable(parser.ObjectName{Name: "t"}, newOid); !ok {
+		t.Error("copied database is missing table \"t\" that the copied view references")
+	}
+}
+
+// TestTryHandleDatabaseDDLCreateTemplateWithMatViewErrors pins that a
+// materialized view still rules out the whole template (unlike a plain view,
+// which TestTryHandleDatabaseDDLCreateTemplateWithViewCopies confirms is now
+// copyable) — matview copying needs its own heap-data clone, deferred
+// separately.
+func TestTryHandleDatabaseDDLCreateTemplateWithMatViewErrors(t *testing.T) {
+	s := newTestRoleServer()
+	im := s.cfg.Catalog.(*catalog.InMemory)
+
+	if handled, _, err := s.tryHandleDatabaseDDL("CREATE DATABASE mvsrc", "postgres", "", nil); !handled || err != nil {
+		t.Fatalf("CREATE DATABASE mvsrc: handled=%v err=%v", handled, err)
+	}
+	srcOid := im.DatabaseOid("mvsrc")
+	cols := []catalog.Column{{Name: "id", Type: catalog.Type{Name: "int4"}, Ordinal: 0}}
+	mv, err := im.CreateTable(parser.ObjectName{Name: "mv"}, cols, srcOid)
+	if err != nil {
+		t.Fatalf("CreateTable under mvsrc: %v", err)
+	}
+	mv.IsMatView = true
+	mv.IsPopulated = true
+
+	handled, _, err := s.tryHandleDatabaseDDL("CREATE DATABASE foo TEMPLATE mvsrc", "postgres", "", nil)
+	if !handled || err == nil {
+		t.Fatalf("CREATE DATABASE foo TEMPLATE mvsrc: handled=%v err=%v, want a typed error", handled, err)
+	}
+	if got := databaseDDLErrorSQLState(err); got != sqlstate.FeatureNotSupported {
+		t.Errorf("SQLSTATE = %q, want %q", got, sqlstate.FeatureNotSupported)
+	}
+	if im.HasDatabase("foo") {
+		t.Error("CREATE DATABASE foo TEMPLATE mvsrc: database was registered despite the error")
 	}
 }

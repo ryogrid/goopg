@@ -253,3 +253,122 @@ func TestCreateDatabaseTemplateSequenceCopiesStateAndSurvivesRestart(t *testing.
 		t.Fatalf("nextval(s_copy) on source (post-restart) = %d, want > 2 (source's own durable counter, unaffected by the copy)", srcValAfterRestart)
 	}
 }
+
+
+// TestCreateDatabaseTemplateViewCopiesQueryAndSurvivesRestart: CREATE
+// DATABASE ... TEMPLATE against a source database containing a plain
+// (non-materialized) view — created through the real executor, referencing a
+// plain table also present in the template — copies both the table and the
+// view into the new database as independent objects, both immediately and
+// after a full data-dir round trip. Mirrors
+// TestCreateDatabaseTemplateSequenceCopiesStateAndSurvivesRestart's shape for
+// M0122-0007 4e follow-up 42 (view cloning has no relation file of its own,
+// so this is a separate code path — database_ddl.go's copyTemplateViews —
+// exercised here end to end for the first time). Also confirms the two
+// databases' views are independent objects: DROP VIEW in one leaves the
+// other's view (and its underlying data) intact.
+func TestCreateDatabaseTemplateViewCopiesQueryAndSurvivesRestart(t *testing.T) {
+	dir := t.TempDir()
+	if err := initdb.Init(initdb.Options{DataDir: dir}); err != nil {
+		t.Fatalf("initdb.Init: %v", err)
+	}
+
+	ctx := context.Background()
+	s1 := startDBIDRestartServer(t, dir)
+
+	pg := s1.open(t, "postgres")
+	if _, err := pg.ExecContext(ctx, "CREATE DATABASE view_tmpl_src"); err != nil {
+		pg.Close()
+		s1.close(t)
+		t.Fatalf("CREATE DATABASE view_tmpl_src: %v", err)
+	}
+
+	src := s1.open(t, "view_tmpl_src")
+	for _, stmt := range []string{
+		"CREATE TABLE t_view(a int, b text)",
+		"INSERT INTO t_view VALUES (1,'x'),(2,'y'),(3,'z')",
+		"CREATE VIEW v_copy AS SELECT a, b FROM t_view WHERE a > 1",
+	} {
+		if _, err := src.ExecContext(ctx, stmt); err != nil {
+			src.Close()
+			pg.Close()
+			s1.close(t)
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+
+	if _, err := pg.ExecContext(ctx, "CREATE DATABASE view_tmpl_copy TEMPLATE view_tmpl_src"); err != nil {
+		src.Close()
+		pg.Close()
+		s1.close(t)
+		t.Fatalf("CREATE DATABASE view_tmpl_copy TEMPLATE view_tmpl_src: %v", err)
+	}
+
+	assertVCopyRows := func(db *sql.DB, label string) {
+		t.Helper()
+		rows, err := db.QueryContext(ctx, "SELECT a, b FROM v_copy ORDER BY a")
+		if err != nil {
+			t.Fatalf("%s: SELECT v_copy: %v", label, err)
+		}
+		defer rows.Close()
+		var got []struct {
+			a int
+			b string
+		}
+		for rows.Next() {
+			var r struct {
+				a int
+				b string
+			}
+			if err := rows.Scan(&r.a, &r.b); err != nil {
+				t.Fatalf("%s: scan: %v", label, err)
+			}
+			got = append(got, r)
+		}
+		if len(got) != 2 || got[0].a != 2 || got[0].b != "y" || got[1].a != 3 || got[1].b != "z" {
+			t.Fatalf("%s: rows = %+v, want [(2,y) (3,z)]", label, got)
+		}
+	}
+
+	// Immediate visibility (no restart): the view's query works against the
+	// copied table in the new database, and the source is untouched.
+	cpy := s1.open(t, "view_tmpl_copy")
+	assertVCopyRows(cpy, "view_tmpl_copy (pre-restart)")
+	assertVCopyRows(src, "view_tmpl_src (pre-restart, source unaffected)")
+
+	// The two databases' views are independent objects: dropping the copy's
+	// view must not touch the source's.
+	if _, err := cpy.ExecContext(ctx, "DROP VIEW v_copy"); err != nil {
+		cpy.Close()
+		src.Close()
+		pg.Close()
+		s1.close(t)
+		t.Fatalf("DROP VIEW v_copy on copy: %v", err)
+	}
+	assertVCopyRows(src, "view_tmpl_src (after dropping the copy's view, source unaffected)")
+	cpy.Close()
+	src.Close()
+	pg.Close()
+	s1.close(t)
+
+	// Full restart from the same data dir: the source's view (never
+	// dropped) must still resolve and return the same rows.
+	s2 := startDBIDRestartServer(t, dir)
+	defer s2.close(t)
+
+	src2 := s2.open(t, "view_tmpl_src")
+	defer src2.Close()
+	assertVCopyRows(src2, "view_tmpl_src (post-restart)")
+
+	// Nothing leaked into the postgres namespace.
+	pg2 := s2.open(t, "postgres")
+	defer pg2.Close()
+	var leaked int
+	if err := pg2.QueryRowContext(ctx,
+		"SELECT count(*) FROM pg_class WHERE relname = 'v_copy'").Scan(&leaked); err != nil {
+		t.Fatalf("pg_class leak probe: %v", err)
+	}
+	if leaked != 0 {
+		t.Fatalf("v_copy leaked into postgres pg_class (count=%d, want 0)", leaked)
+	}
+}
