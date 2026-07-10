@@ -7912,6 +7912,31 @@ mirroring M0119's ledger `status` column.
       vs live PG 18.3). Design doc `docs/design/0003-0006-*` Follow-up section.
       Gates: build/vet clean; parser/analyzer/planner/executor suites PASS;
       `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke (hook).
+  - [x] `unimplemented_feat #5(d-iii-rest) (SIGNED year-month glued unit-word)`
+      (2026-07-11, this loop) — closed the prior row's deferred signed glued form:
+      `interval '-1-2h'` → -1 years -2 mons, `'+1-2h'` → 1 year 2 mons,
+      `'-1-2mon3d'` → -1 years -2 mons +3 days, `'-1-2h30m'` →
+      -1 years -2 mons +00:30:00, and the empty-month asymmetry `'-1-h'` →
+      -1 years (vs unsigned `'1-h'` which errors). PG lexes a sign-prefixed field
+      as ONE DTK_TZ token (`ParseDateTime`: after the sign a leading digit
+      collects `digit|:|.|-`, stops at a letter) that falls through
+      DecodeInterval's DTK_TZ→DTK_NUMBER years-months branch where
+      `if(*field[i]=='-')val2=-val2` flows the sign into BOTH year and month
+      (`-1-2`→-14 months); the trailing letter is a DTK_STRING unit word absorbed
+      as a no-op. New `splitSignedTZTrailer` (`internal/parser/interval.go`)
+      reproduces the DTK_TZ collection set — peels a trailing letter run while
+      leaving a `.` inside (so `-1-2.5`/`-1-2.5h` stay whole and error, matching
+      PG's `*cp!='\0'` reject) and collects the year-month `-` even on an empty
+      month; `expandIntervalFields` now dispatches to it for signed fields and to
+      `splitYearMonthTrailer` for unsigned, keeping `evalIntervalLit` and
+      `parseIntervalCastString` in lock-step. Deferred (ledger 2026-07-11): the
+      `+`-separated continuation (`-1-2+3`, needs a re-entrant remainder
+      tokenizer), typmod grammar, ±infinity. Tests: `interval_subday_test.go`
+      `TestYearMonthTimeGluedUnitAbsorb` (now 52 accepts + 17 rejects,
+      byte-for-byte vs live PG 18.3). Design doc `docs/design/0003-0006-*`
+      Follow-up section. Gates: build/vet clean;
+      parser/analyzer/planner/executor suites PASS; `scripts/tpch-spotcheck.sh`
+      PASS (Q12=2/Q13=33); pgbench smoke (hook).
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,

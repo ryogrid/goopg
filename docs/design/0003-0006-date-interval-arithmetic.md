@@ -993,6 +993,62 @@ byte-for-byte from live PostgreSQL 18.3). Gates: `go build`/`go vet` clean; pars
 analyzer + planner + executor suites PASS; `scripts/tpch-spotcheck.sh` PASS
 (Q12=2/Q13=33); pgbench smoke via pre-commit hook.
 
+## Follow-up (2026-07-11): SIGNED year-month glued unit-word (#5(d-iii-rest))
+
+Closed the prior section's "Still deferred" item: the **signed** year-month glued
+form now parses — `interval '-1-2h'` → `-1 years -2 mons`, `interval '+1-2h'` →
+`1 year 2 mons`, `interval '-1-2mon3d'` → `-1 years -2 mons +3 days`,
+`interval '-1-2h30m'` → `-1 years -2 mons +00:30:00`.
+
+**PG mechanism (a distinct lexer path).** In `ParseDateTime`, a field beginning
+with a sign is lexed differently from a bare-digit field. After the sign, a
+leading digit starts a **`DTK_TZ`** token that collects `digit | ':' | '.' | '-'`
+and stops at the first other character (a letter). That token then falls through
+`DecodeInterval`'s `DTK_TZ` → `DTK_NUMBER` path, whose SQL years-months branch
+decodes the signed `<year>-<month>` head with `if (*field[i] == '-') val2 =
+-val2`, so the sign flows into **both** the year and month components (`-1-2` →
+`-14` months). The trailing letter run is a separate `DTK_STRING` unit word,
+absorbed as a no-op by the year-month field to its left (same right-to-left carry
+as the unsigned case).
+
+Two `DTK_TZ`-specific quirks, both modelled faithfully and *different* from the
+unsigned `DTK_DATE` lexer:
+
+1. **`DTK_TZ` swallows `.`** — a fractional tail stays inside the token, so
+   `-1-2.5` / `-1-2.5h` keep the `.5` and the years-months branch rejects them
+   (`*cp != '\0'`). goopg therefore keeps such a body whole and errors, exactly as
+   it already did for `-1-2.5`.
+2. **`DTK_TZ` collects the year-month `-` even with an empty month** — so a glued
+   letter after a bare signed year splits (`-1-h` → `-1-` + `h`) and the `-1-`
+   decodes as `-1 years`. This is **asymmetric** with the unsigned `1-h`, which the
+   `DTK_DATE` else-branch swallows into one malformed token that errors.
+
+**goopg model.** A new `splitSignedTZTrailer` (`internal/parser/interval.go`)
+reproduces the `DTK_TZ` collection set: it peels a trailing ASCII-letter run off a
+`<digits>[-digits]` token (leaving `.` inside), returning the year-month head +
+letter remainder; `expandIntervalFields`'s `-`-branch now calls it for the signed
+case (reattaching the sign) and falls back to `splitYearMonthTrailer` for the
+unsigned case. The remainder is re-tokenised by the shared `splitAlphaNumRuns`, so
+`-1-2mon3d` decomposes to `-1-2` + `mon` + `3` + `d` and the downstream
+`prevAbsorbs` logic swallows the `mon` while `3 d` adds `+3 days`. Because both
+sibling paths (`evalIntervalLit` and `parseIntervalCastString`) reach
+`ParseIntervalBody` → `decodeIntervalFields` → `expandIntervalFields`, the cast
+forms (`'-1-2h'::interval`, `CAST('-1-2 days' AS interval)`) parse identically.
+
+**Still deferred (ledger 2026-07-11):** a **`+`-separated numeric continuation**
+after a signed year-month field (`interval '-1-2+3'` → PG `-1 years -2 mons
++00:00:03`). PG's `DTK_TZ` stops at the `+`, which then begins a *fresh* `DTK_TZ`
+field decoded on its own; goopg's `splitSignedTZTrailer` only peels a trailing
+*letter* run, so it keeps `-1-2+3` whole and errors. Modelling this needs a full
+re-entrant tokenizer for the remainder, out of this loop's bounded scope. Also
+still open: full interval typmod grammar (`HOUR TO MINUTE`, `SECOND(p)`) and
+interval `±infinity`.
+
+Tests: `TestYearMonthTimeGluedUnitAbsorb` grows to 52 accepts + 17 rejects (the
+20 new signed cases captured byte-for-byte from live PostgreSQL 18.3). Gates:
+`go build`/`go vet` clean; parser + analyzer + planner + executor suites PASS;
+`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke via pre-commit hook.
+
 ## Cross-references
 
 - TPC-H query bodies: HammerDB upstream

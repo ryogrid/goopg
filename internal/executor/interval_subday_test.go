@@ -718,10 +718,41 @@ func TestYearMonthTimeGluedUnitAbsorb(t *testing.T) {
 		{"SELECT interval '12:00:00h'", "12:00:00"},
 		{"SELECT interval '05:00 mon'", "05:00:00"},
 		{"SELECT interval '12:00 h 3 d'", "3 days 12:00:00"},
+		// SIGNED year-month glued unit word. PG lexes a sign-prefixed field as one
+		// DTK_TZ token (collects digits/':'/'.'/'-', stops at a letter), so the
+		// glued unit splits off and is absorbed exactly as in the unsigned case,
+		// but the sign flows into BOTH the year and month components
+		// (postgres DecodeInterval `if (*field[i] == '-') val2 = -val2`).
+		{"SELECT interval '-1-2h'", "-1 years -2 mons"},
+		{"SELECT interval '+1-2h'", "1 year 2 mons"},
+		{"SELECT interval '-1-2 days'", "-1 years -2 mons"},
+		{"SELECT interval '-1-2day'", "-1 years -2 mons"},
+		{"SELECT interval '-1-2sec'", "-1 years -2 mons"},
+		{"SELECT interval '-1-2minute'", "-1 years -2 mons"},
+		{"SELECT interval '-1-0h'", "-1 years"},
+		{"SELECT interval '-10-3d'", "-10 years -3 mons"},
+		// The DTK_TZ token collects the '-' even with an empty month, so a glued
+		// letter after a bare signed year splits (`-1-h` → `-1-` + `h`) and the
+		// year decodes alone — unlike the unsigned `1-h`, which errors.
+		{"SELECT interval '-1-h'", "-1 years"},
+		{"SELECT interval '-1-day'", "-1 years"},
+		// Absorbed signed unit followed by more real fields (each keeps its own
+		// sign; the year-month sign does NOT propagate to later fields).
+		{"SELECT interval '-1-2 h 3 d'", "-1 years -2 mons +3 days"},
+		{"SELECT interval '-1-2 3d'", "-1 years -2 mons +3 days"},
+		{"SELECT interval '-1-2 days 3'", "-1 years -2 mons +00:00:03"},
+		{"SELECT interval '-1-2 h -3 d'", "-1 years -2 mons -3 days"},
+		{"SELECT interval '-1-2 h -3'", "-1 years -2 mons -00:00:03"},
+		{"SELECT interval '-1-2 h 12:00'", "-1 years -2 mons +12:00:00"},
+		{"SELECT interval '-1-2mon3d'", "-1 years -2 mons +3 days"},
+		{"SELECT interval '-1-2h30m'", "-1 years -2 mons +00:30:00"},
+		{"SELECT interval '+10-3mon2d'", "10 years 3 mons 2 days"},
 		// Cast / :: siblings share the tokenizer.
 		{"SELECT '1-2h'::interval", "1 year 2 mons"},
 		{"SELECT CAST('1-2 days' AS interval)", "1 year 2 mons"},
 		{"SELECT '12:00h'::interval", "12:00:00"},
+		{"SELECT '-1-2h'::interval", "-1 years -2 mons"},
+		{"SELECT CAST('-1-2 days' AS interval)", "-1 years -2 mons"},
 	}
 	for _, c := range accept {
 		rows := runQuery(t, ctx, c.sql+" FROM t")
@@ -746,7 +777,14 @@ func TestYearMonthTimeGluedUnitAbsorb(t *testing.T) {
 		"SELECT interval '12:00 mon 3' FROM t",    // trailing 3 → seconds collides with time SECOND slot
 		"SELECT interval '12:00h30m' FROM t",      // 30m MINUTE collides with the time-word MINUTE slot
 		"SELECT interval '12:00hh' FROM t",        // 'hh' is not a unit word
-		"SELECT interval '-1-2h' FROM t",          // SIGNED year-month glued unit deferred (see ledger)
+		// Signed year-month rejects. PG's DTK_TZ token swallows a '.', so a
+		// fractional tail stays inside the token and the years-months branch
+		// rejects it (`*cp != '\0'`); a non-unit trailing word still errors.
+		"SELECT interval '-1-2.5h' FROM t",        // '.' swallowed by DTK_TZ → malformed year-month
+		"SELECT interval '-1-2.5' FROM t",         // ditto, no trailer
+		"SELECT interval '-1-2 foo' FROM t",       // 'foo' is not a unit word
+		"SELECT interval '-1-2foo' FROM t",        // ditto glued
+		"SELECT interval '-1-2 h h' FROM t",       // consecutive unhandled units
 	}
 	for _, sql := range reject {
 		if _, err := runQueryErr(t, ctx, sql); err == nil {
