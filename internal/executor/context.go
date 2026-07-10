@@ -542,6 +542,13 @@ type Context struct {
 	// CurrentDatabaseOid. M0122-0007 4e follow-up 31.
 	PgRewriteRows func() [][]string
 
+	// PgForeignTableRows mirrors PgRewriteRows above for the pg_foreign_table
+	// catalog table: it lists CurrentDatabaseOid's own foreign tables rather
+	// than always DefaultDBOid's (catalog.InMemory's
+	// PGForeignTableRowsForDBOid). Wired by the server to close over
+	// CurrentDatabaseOid. M0122-0007 4e follow-up 32.
+	PgForeignTableRows func() [][]string
+
 	// NonSuperuserRole, when non-empty, means the session is currently running
 	// under a non-superuser role (set via SET SESSION AUTHORIZATION). Privilege
 	// checks that require superuser (e.g. LEAKPROOF function attribute) must

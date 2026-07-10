@@ -2,6 +2,7 @@ package executor
 
 import (
 	"fmt"
+	"strconv"
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -801,6 +802,71 @@ func TestPgRewriteRowsScopedToConnectionDBOid(t *testing.T) {
 func pgRewriteRowsContainRulename(rows [][]string, rulename string) bool {
 	for _, r := range rows {
 		if len(r) > 1 && r[1] == rulename {
+			return true
+		}
+	}
+	return false
+}
+
+// TestPgForeignTableRowsScopedToConnectionDBOid mirrors
+// TestPgRewriteRowsScopedToConnectionDBOid above for the pg_foreign_table
+// catalog table (M0122-0007 4e follow-up 32): a foreign table created under
+// one dbOid must not leak into another dbOid's pg_foreign_table rows.
+func TestPgForeignTableRowsScopedToConnectionDBOid(t *testing.T) {
+	const otherDBOid = 7015
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+
+	ctx.CurrentDatabaseOid = catalog.DefaultDBOid
+	if err := runDDL(t, ctx, "CREATE SERVER srv_default FOREIGN DATA WRAPPER goopg_fdw"); err != nil {
+		t.Fatalf("CREATE SERVER srv_default: %v", err)
+	}
+	if err := runDDL(t, ctx, "CREATE FOREIGN TABLE ft_default (a int) SERVER srv_default"); err != nil {
+		t.Fatalf("CREATE FOREIGN TABLE ft_default: %v", err)
+	}
+	ctx.CurrentDatabaseOid = otherDBOid
+	if err := runDDL(t, ctx, "CREATE SERVER srv_other FOREIGN DATA WRAPPER goopg_fdw"); err != nil {
+		t.Fatalf("CREATE SERVER srv_other: %v", err)
+	}
+	if err := runDDL(t, ctx, "CREATE FOREIGN TABLE ft_other (a int) SERVER srv_other"); err != nil {
+		t.Fatalf("CREATE FOREIGN TABLE ft_other: %v", err)
+	}
+
+	im, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		t.Fatalf("ctx.Catalog is %T, want *catalog.InMemory", ctx.Catalog)
+	}
+
+	ftDefault, ok := im.LookupTable(parser.ObjectName{Name: "ft_default"}, catalog.DefaultDBOid)
+	if !ok {
+		t.Fatal("ft_default not found under DefaultDBOid")
+	}
+	ftOther, ok := im.LookupTable(parser.ObjectName{Name: "ft_other"}, otherDBOid)
+	if !ok {
+		t.Fatal("ft_other not found under otherDBOid")
+	}
+
+	defaultRows := im.PGForeignTableRowsForDBOid(catalog.DefaultDBOid)
+	if !pgForeignTableRowsContainFtrelid(defaultRows, ftDefault.OID) {
+		t.Fatal("DefaultDBOid's pg_foreign_table rows are missing ft_default")
+	}
+	if pgForeignTableRowsContainFtrelid(defaultRows, ftOther.OID) {
+		t.Fatal("DefaultDBOid's pg_foreign_table rows include ft_other, a foreign table created under a distinct dbOid")
+	}
+
+	otherRows := im.PGForeignTableRowsForDBOid(otherDBOid)
+	if !pgForeignTableRowsContainFtrelid(otherRows, ftOther.OID) {
+		t.Fatal("otherDBOid's pg_foreign_table rows are missing ft_other")
+	}
+	if pgForeignTableRowsContainFtrelid(otherRows, ftDefault.OID) {
+		t.Fatal("otherDBOid's pg_foreign_table rows include ft_default, a foreign table created under DefaultDBOid")
+	}
+}
+
+func pgForeignTableRowsContainFtrelid(rows [][]string, oid uint32) bool {
+	want := strconv.FormatUint(uint64(oid), 10)
+	for _, r := range rows {
+		if len(r) > 0 && r[0] == want {
 			return true
 		}
 	}

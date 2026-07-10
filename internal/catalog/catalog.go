@@ -8540,30 +8540,7 @@ func (c *InMemory) registerSystemTables() {
 	// is NULL (empty string) when no table-level OPTIONS were given, so
 	// dumpTableSchema omits the OPTIONS clause. DU-002 slice 417.
 	pgForeignTable.VirtualRows = func() [][]string {
-		c.mu.RLock()
-		defer c.mu.RUnlock()
-		keys := make([]string, 0, len(c.ns(DefaultDBOid).tables))
-		for k := range c.ns(DefaultDBOid).tables {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		var out [][]string
-		for _, k := range keys {
-			t := c.ns(DefaultDBOid).tables[k]
-			if t.ForeignServerName == "" {
-				continue
-			}
-			var srvOID uint32
-			if s, ok := c.foreignServers[t.ForeignServerName]; ok {
-				srvOID = s.OID
-			}
-			out = append(out, []string{
-				strconv.FormatUint(uint64(t.OID), 10),  // ftrelid
-				strconv.FormatUint(uint64(srvOID), 10), // ftserver
-				optionsArrayLiteral(t.ForeignOptions),  // ftoptions
-			})
-		}
-		return out
+		return c.PGForeignTableRowsForDBOid(DefaultDBOid)
 	}
 	c.ns(DefaultDBOid).tables["pg_catalog.pg_foreign_table"] = pgForeignTable
 
@@ -12977,6 +12954,41 @@ func (c *InMemory) PGRewriteRowsForDBOid(dbOid uint32) [][]string {
 				"",                         // ev_action (NULL — DO NOTHING)
 			})
 		}
+	}
+	return out
+}
+
+// PGForeignTableRowsForDBOid builds the pg_foreign_table catalog row-set for
+// dbOid's own foreign tables (mirrors PGRewriteRowsForDBOid's per-connection
+// dbOid scoping above). registerSystemTables's VirtualRows closure calls this
+// with DefaultDBOid so every existing caller (server dispatch without a
+// per-connection PgForeignTableRows wire-up, every test) sees byte-identical
+// behavior; a per-connection dbOid is wired in via
+// executor.Context.PgForeignTableRows (internal/server/dispatch.go's
+// wireExtensionRows). M0122-0007 4e follow-up 32.
+func (c *InMemory) PGForeignTableRowsForDBOid(dbOid uint32) [][]string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	keys := make([]string, 0, len(c.ns(dbOid).tables))
+	for k := range c.ns(dbOid).tables {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var out [][]string
+	for _, k := range keys {
+		t := c.ns(dbOid).tables[k]
+		if t.ForeignServerName == "" {
+			continue
+		}
+		var srvOID uint32
+		if s, ok := c.foreignServers[t.ForeignServerName]; ok {
+			srvOID = s.OID
+		}
+		out = append(out, []string{
+			strconv.FormatUint(uint64(t.OID), 10),  // ftrelid
+			strconv.FormatUint(uint64(srvOID), 10), // ftserver
+			optionsArrayLiteral(t.ForeignOptions),  // ftoptions
+		})
 	}
 	return out
 }

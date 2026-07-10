@@ -2060,6 +2060,14 @@ func (s *Server) wireExtensionRows(ectx *executor.Context, dbName string) {
 			return pr.PGRewriteRowsForDBOid(catalog.NamespaceDBOid(ectx.CurrentDatabaseOid))
 		}
 	}
+	// pg_foreign_table must likewise reflect the connecting database's own
+	// foreign tables, not always DefaultDBOid's. Mirrors the pg_rewrite
+	// wiring above. M0122-0007 4e follow-up 32.
+	if pf, ok := s.cfg.Catalog.(pgForeignTableRowLister); ok {
+		ectx.PgForeignTableRows = func() [][]string {
+			return pf.PGForeignTableRowsForDBOid(catalog.NamespaceDBOid(ectx.CurrentDatabaseOid))
+		}
+	}
 }
 
 // pgClassRowLister is implemented by catalog.InMemory to expose a
@@ -2131,6 +2139,13 @@ type pgTriggerRowLister interface {
 // M0122-0007 4e follow-up 31.
 type pgRewriteRowLister interface {
 	PGRewriteRowsForDBOid(dbOid uint32) [][]string
+}
+
+// pgForeignTableRowLister is implemented by catalog.InMemory to expose a
+// per-database pg_foreign_table row-set, mirroring pgRewriteRowLister above.
+// M0122-0007 4e follow-up 32.
+type pgForeignTableRowLister interface {
+	PGForeignTableRowsForDBOid(dbOid uint32) [][]string
 }
 
 func undoEnumDDLForRollback(connTx *connTxState, cat catalog.Catalog) {

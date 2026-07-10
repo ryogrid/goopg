@@ -7090,6 +7090,44 @@ mirroring M0119's ledger `status` column.
       `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
       failed transactions, all 3 pgbench workloads) — run via the pre-commit
       hook at commit time.
+  - [x] `M0122-0007` follow-up 32 (2026-07-10, this loop) — **fixed the next
+      highest-value single sibling builder follow-up 31 flagged:
+      `pg_foreign_table` row-content.** Extracted
+      `pg_foreign_table.VirtualRows`'s inline closure into new exported
+      `catalog.InMemory.PGForeignTableRowsForDBOid(dbOid uint32) [][]string`,
+      parameterizing its two `c.ns(DefaultDBOid)` references (the sorted-keys
+      scan over `tables` and the per-table lookup) to `c.ns(dbOid)`. The
+      registered closure now just calls
+      `PGForeignTableRowsForDBOid(DefaultDBOid)`, byte-identical default
+      behavior. Wired new per-connection `executor.Context.PgForeignTableRows
+      func() [][]string` field (mirroring `PgRewriteRows`), set in
+      `internal/server/dispatch.go`'s `wireExtensionRows` (new
+      `pgForeignTableRowLister` interface), consumed by a new `tbl.Name ==
+      "pg_foreign_table"` branch in `internal/executor/operators.go`'s
+      `valuesOp.Open`. New test `TestPgForeignTableRowsScopedToConnectionDBOid`
+      (`internal/executor/fk_dbid_routing_test.go`), mirroring
+      `TestPgRewriteRowsScopedToConnectionDBOid`: `CREATE SERVER` + `CREATE
+      FOREIGN TABLE ... SERVER ...` under each of two distinct dbOids,
+      asserted never to cross-leak their `pg_foreign_table` rows (matched by
+      `ftrelid`, since the row itself carries no table-name column — resolved
+      each expected table's OID via `catalog.InMemory.LookupTable(name,
+      dbOid)` instead). **Remaining scope (deferred, own future loops):** 2
+      sibling builders still row-content-`DefaultDBOid`-only —
+      `pg_statistic_ext`, `information_schema.routines`/`parameters`/
+      `routine_*_usage`; `pg_sequence`/`pg_sequences`/
+      `information_schema.sequences`, `pg_attribute`/`pg_type`, and the
+      `oid::regclass` cast gap remain separately flagged. Also newly
+      discovered (not fixed) this loop: `pg_foreign_table`'s `ftserver` OID
+      lookup (`c.foreignServers[t.ForeignServerName]`) still resolves against
+      a single process-global `map[string]*ForeignServer` with no dbOid key —
+      a `CREATE SERVER` of the same name in two databases would collide (same
+      shape as the still-open `c.statisticsObjs`/`SequenceParamsFunc` gaps).
+      Design doc updated (new "pg_foreign_table row-content" residual-gap
+      subsection); `docs/design/README.md` row extended; deferral ledger row
+      appended ("pg_foreign_table per-dbOid content"). Gates: `go build
+      ./...`/`go vet ./...` clean; `go test ./internal/catalog/...
+      ./internal/executor/... ./internal/server/... ./internal/planner/...`
+      PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33, re-run this loop).
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,

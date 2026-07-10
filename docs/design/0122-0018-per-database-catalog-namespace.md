@@ -1,6 +1,6 @@
 # Per-database catalog namespace (M0122-0007 slice 4)
 
-Status: accepted (sub-slices 4a, 4b-i, 4b-ii, 4c, 4d-i, 4d-ii-part-1, and 4d-ii-part-2a landed; 4d-ii-part-2b items 1, 2, and 3 all fully landed; 4e's FK-target-resolution, sequence-ownership, and view-constraint-dependency items all landed; `CREATE DATABASE ... TEMPLATE` bounded validation landed 2026-07-10; the pg_class-under-fresh-database gap (name resolution generically, row enumeration for pg_class specifically) landed 2026-07-10, and the pg_indexes/pg_tables, pg_constraint, pg_index, pg_attrdef/pg_depend, pg_inherits, pg_policy, pg_trigger, and pg_rewrite row-content follow-ups landed the same day — 3 sibling virtual-table builders plus the real relation-copy mechanism remain planned, see "Remaining 4e work" below)
+Status: accepted (sub-slices 4a, 4b-i, 4b-ii, 4c, 4d-i, 4d-ii-part-1, and 4d-ii-part-2a landed; 4d-ii-part-2b items 1, 2, and 3 all fully landed; 4e's FK-target-resolution, sequence-ownership, and view-constraint-dependency items all landed; `CREATE DATABASE ... TEMPLATE` bounded validation landed 2026-07-10; the pg_class-under-fresh-database gap (name resolution generically, row enumeration for pg_class specifically) landed 2026-07-10, and the pg_indexes/pg_tables, pg_constraint, pg_index, pg_attrdef/pg_depend, pg_inherits, pg_policy, pg_trigger, pg_rewrite, and pg_foreign_table row-content follow-ups landed the same day — 2 sibling virtual-table builders plus the real relation-copy mechanism remain planned, see "Remaining 4e work" below)
 Date: 2026-07-10
 Supersedes: none — extends the "Still open" note in
 `0122-0017-database-ddl-drop-guards.md` and the deferral-ledger rows dated
@@ -1306,6 +1306,32 @@ content") for the 3 remaining sibling builders (`pg_statistic_ext`,
 `information_schema.routines`/`parameters`/`routine_*_usage`,
 `pg_foreign_table`) still needing this treatment — each is its own bounded
 future loop.
+
+**`pg_foreign_table` row-content fixed (2026-07-10, follow-up 32):** the
+simplest of the 3 remaining sibling builders — `pg_foreign_table.VirtualRows`
+already had the exact same shape as `pg_rewrite`'s (a sorted scan over
+`c.ns(DefaultDBOid).tables` filtering on `t.ForeignServerName != ""`), so it
+got the identical closure-extraction treatment: new
+`catalog.InMemory.PGForeignTableRowsForDBOid(dbOid uint32)`, new
+per-connection `executor.Context.PgForeignTableRows func() [][]string` field,
+wired in `internal/server/dispatch.go`'s `wireExtensionRows` (new
+`pgForeignTableRowLister` interface), consumed by a new `tbl.Name ==
+"pg_foreign_table"` branch in `internal/executor/operators.go`'s
+`valuesOp.Open`. Test `TestPgForeignTableRowsScopedToConnectionDBOid`
+(`internal/executor/fk_dbid_routing_test.go`), mirroring
+`TestPgRewriteRowsScopedToConnectionDBOid`: `CREATE SERVER` + `CREATE FOREIGN
+TABLE ... SERVER ...` under each of two distinct dbOids, never cross-leak
+their `pg_foreign_table` rows (matched by `ftrelid`, since the row itself
+carries no table name column). One caveat carried forward unfixed: the
+`ftserver` OID lookup (`c.foreignServers[t.ForeignServerName]`) still resolves
+against a single process-global `map[string]*ForeignServer` with no dbOid key
+— a `CREATE SERVER` of the same name in two different databases is a latent
+name collision, and only the row-content per-dbOid scoping is fixed here (same
+shape as `pg_statistic_ext`'s `c.statisticsObjs` gap noted above). See the
+2026-07-10 deferral-ledger row ("pg_foreign_table per-dbOid content") for this
+follow-on and the 2 remaining sibling builders (`pg_statistic_ext`,
+`information_schema.routines`/`parameters`/`routine_*_usage`) still needing
+the bigger registry-dbOid-key treatment.
 
 **Remaining 4e work: the `CREATE DATABASE ... TEMPLATE` copy mechanism
 itself** — deep-copying the source dbOid's `catalog.tableNamespace`
