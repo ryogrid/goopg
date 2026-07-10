@@ -410,6 +410,44 @@ Gates: `go build ./...` / `go vet` clean; `go test ./internal/executor/...`
 (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh`
 PASS (0 failed transactions).
 
+## Follow-up: sub-day interval *literal* parsing (unimplemented_feat #5, 2026-07-11)
+
+The prior follow-up landed the sub-day *storage* half but left the deferred item
+(1) above — the *literal* grammar. This loop closed it: sub-day interval literals
+now parse end-to-end through all four unit-parsing paths, so
+`interval '2 hours'`, `interval '90 minutes'`, `interval '2' hour`,
+`'3 hours'::interval`, and `CAST('15 minutes' AS interval)` all yield a
+`KindInterval` carrying the microsecond component, and arithmetic composes them
+with day/hour parts (`interval '1 day' + interval '2 hours'` → `1 day 02:00:00`).
+
+- **Four switches, one conversion.** `hour/minute/second/millisecond` (+plural)
+  cases were added to `internal/parser/select.go` Form 1 (trailing-unit
+  `interval '<N>' <unit>`) and `splitEmbeddedInterval` Form 2
+  (`interval '<N> <unit>'`), and to `internal/executor/expr.go` `evalIntervalLit`
+  (typed literal) and `parseIntervalCastString` (`::interval` / `CAST` cast). Each
+  converts the integer magnitude to microseconds via `NewIntervalDatumFull(0,0,µs)`
+  using new `usecsPerHour/Minute/Second/Milli` consts (siblings of the existing
+  `usecsPerDay`). `parseIntervalCastString`'s signature grew a `micros int64`
+  return; its sole caller now builds the Datum with `NewIntervalDatumFull`.
+- **Rendering is reused, not re-derived.** Output rides the already-PG-verified
+  `formatInterval` time component — no new formatting code — so the assertions in
+  the new test inherit the loop-#16 byte-for-byte PG 18.3 verification.
+- **Analyzer untouched.** It already types every `IntervalLit` as `interval`.
+
+**Still deferred** (see `deferral_ledger.md`): (a) fractional magnitudes
+(`interval '1.5 seconds'`) — the literal body is parsed with `strconv.ParseInt`,
+so a decimal raises `22007`; PG spills the fraction into the next-smaller unit;
+(b) multi-field literals (`'1 day 05:00:00'`, `'1 year 2 mons'`, `HH:MM:SS`
+bodies) — `splitEmbeddedInterval` requires exactly two whitespace fields; a real
+`DecodeInterval`-style tokenizer is needed; (c) week/decade/century/microsecond
+units. Item (2) `date − date → integer` from the prior follow-up is unchanged.
+
+Tests: `internal/executor/interval_subday_test.go` `TestSubDayIntervalLiterals`
+(Form 1, Form 2, cast, sub-day arithmetic, `timestamp + interval` literal).
+Gates: `go build ./...` clean; `go test ./internal/executor/... ./internal/analyzer/...
+./internal/planner/...` and `./internal/parser/...` PASS;
+`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke via pre-commit hook.
+
 ## Cross-references
 
 - TPC-H query bodies: HammerDB upstream

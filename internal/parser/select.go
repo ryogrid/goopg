@@ -3007,7 +3007,9 @@ func (p *parser) tryTypedLiteral() (Expr, bool) {
 		if unitTok.Kind == TokenIdent {
 			unit := strings.ToLower(identText(unitTok))
 			switch unit {
-			case "day", "days", "month", "months", "year", "years":
+			case "day", "days", "month", "months", "year", "years",
+				"hour", "hours", "minute", "minutes",
+				"second", "seconds", "millisecond", "milliseconds":
 				canonical := strings.TrimSuffix(unit, "s")
 				p.advance() // INTERVAL
 				strTok := p.advance()
@@ -3071,6 +3073,8 @@ func (p *parser) parseExistsExpr(negated bool) (Expr, error) {
 //	"1 year"    → ("1", "year", true)
 //	"3 months"  → ("3", "month", true)
 //	"-1 day"    → ("-1", "day", true)
+//	"2 hours"   → ("2", "hour", true)
+//	"30 minutes"→ ("30", "minute", true)
 //
 // HammerDB's TPC-H query templates use this form (Q1's
 // `interval ':1 day'` after parameter substitution becomes
@@ -3087,7 +3091,9 @@ func splitEmbeddedInterval(body string) (string, string, bool) {
 	}
 	num, unit := parts[0], strings.ToLower(parts[1])
 	switch unit {
-	case "day", "days", "month", "months", "year", "years":
+	case "day", "days", "month", "months", "year", "years",
+		"hour", "hours", "minute", "minutes",
+		"second", "seconds", "millisecond", "milliseconds":
 		return num, strings.TrimSuffix(unit, "s"), true
 	}
 	return "", "", false

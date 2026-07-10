@@ -83,3 +83,53 @@ func TestTimestampSubtractionInterval(t *testing.T) {
 		}
 	}
 }
+
+// TestSubDayIntervalLiterals drives sub-day interval literals
+// (hour/minute/second/millisecond, singular + plural) through all four
+// unit-parsing paths end-to-end: the trailing-unit typed literal
+// (Form 1 `interval '2' hour`), the embedded-unit typed literal
+// (Form 2 `interval '2 hours'`), the `::interval` cast, and interval
+// arithmetic that combines a sub-day component with day/hour parts.
+// Outputs are pinned to PostgreSQL 18.3 (default IntervalStyle=postgres).
+// unimplemented_feat #5 — parser half of sub-day interval units.
+func TestSubDayIntervalLiterals(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+	if err := runDDL(t, ctx, "CREATE TABLE t (id int)"); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	if err := runDDL(t, ctx, "INSERT INTO t VALUES (1)"); err != nil {
+		t.Fatalf("INSERT: %v", err)
+	}
+	cases := []struct{ sql, want string }{
+		// Form 2: embedded unit in the string literal.
+		{"SELECT interval '2 hours'", "02:00:00"},
+		{"SELECT interval '2 hour'", "02:00:00"},
+		{"SELECT interval '90 minutes'", "01:30:00"},
+		{"SELECT interval '45 seconds'", "00:00:45"},
+		{"SELECT interval '500 milliseconds'", "00:00:00.5"},
+		{"SELECT interval '-3 hours'", "-03:00:00"},
+		// Form 1: trailing-unit identifier.
+		{"SELECT interval '2' hour", "02:00:00"},
+		{"SELECT interval '30' minute", "00:30:00"},
+		{"SELECT interval '5' second", "00:00:05"},
+		// Cast forms.
+		{"SELECT '3 hours'::interval", "03:00:00"},
+		{"SELECT CAST('15 minutes' AS interval)", "00:15:00"},
+		// Arithmetic combining sub-day with larger units.
+		{"SELECT interval '2 hours' + interval '30 minutes'", "02:30:00"},
+		{"SELECT interval '1 day' + interval '2 hours'", "1 day 02:00:00"},
+		{"SELECT interval '1 hour' - interval '90 minutes'", "-00:30:00"},
+		// timestamp + sub-day interval literal.
+		{"SELECT timestamp '2020-01-01 00:00:00' + interval '2 hours'", "2020-01-01 02:00:00.000000"},
+	}
+	for _, c := range cases {
+		rows := runQuery(t, ctx, c.sql+" FROM t")
+		if len(rows) != 1 || len(rows[0]) != 1 {
+			t.Fatalf("%s: expected 1x1 result, got %v", c.sql, rows)
+		}
+		if got := rows[0][0].Format(); got != c.want {
+			t.Errorf("%s = %q, want %q", c.sql, got, c.want)
+		}
+	}
+}

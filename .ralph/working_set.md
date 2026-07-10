@@ -1,45 +1,38 @@
 (idle — nothing in flight)
 
-## Loop summary (2026-07-10, loop #15)
+## Loop summary (2026-07-11, loop #17)
 
-**Outcome: closed the LIVE-path expression-index `indexprs` gap deferred by
-loop #14. `pg_get_expr(indexprs, indrelid)` on an expression index now returns
-the deparsed expression text instead of NULL. Real feature fix, gated,
-committed.**
+**Outcome: landed the PARSER half of sub-day interval units
+(unimplemented_feat #5 RESOLVED). Sub-day interval *literals* now parse
+end-to-end. Real feature, gated, committed + pushed.**
 
-- Task: `unimplemented_feat #135 (pg_get_expr, indexprs slice)` — the deferred
-  slice from loop #14's ledger row.
-- Added shared `catalog.IndexExprsText(idx) (string, bool)`
-  (`internal/catalog/catalog.go`): joins `idx.ColExprStrings[i]` for each
-  expression key column (`Columns[i]==""`, ordinal-0 in `indkey`) verbatim,
-  comma-separated; `("", false)` when none → caller emits `VirtualNull`.
-  Wired into `PGIndexRowsForDBOid`.
-- Byte-matched to PG 18.3: `(lower(b))`→`lower(b)`, `((a+c),upper(b))`→
-  `(a + c), upper(b)`, `(a,(a*c))`→`(a * c)`, plain→NULL. The natural deparse in
-  `ColExprStrings` already carries the parens — an earlier draft reusing
-  `indexKeyIsBareFuncCall` double-wrapped binexprs into `((a + c))`, corrected
-  to a verbatim join.
-- **Heap twin deliberately unchanged (decode landmine):**
-  `buildUserPGIndexRow` still writes `indexprs=NULL`. `DecodePGIndexPhysicalRow`
-  (`internal/catalog/codec.go`) infers `indpred` from the bytes after
-  `indoption` assuming `indexprs` is NULL — two consecutive nullable varlenas,
-  and the decoder gets no tuple null bitmap. Writing a non-NULL indexprs would
-  corrupt an expression index's `indpred` on restart. Deferred to a
-  null-bitmap-aware decoder (ledger row appended).
-- Tests: `internal/executor/pg_index_indexprs_test.go`
-  (`TestPgIndexIndexprsExpressionIndex` E2E through pg_get_expr +
-  `TestIndexExprsTextParenAndNullRules` helper unit).
-- Bookkeeping: `unimplemented_feat.json` #135 code_audit narrowed (surgical
-  Edit, JSON valid); deferral-ledger row appended; fix_plan.md `[x]`; design doc
-  `0122-0019-*` Follow-up section + README index row updated.
-- Gates (foreground, all PASS): `go build ./...`, `go vet` (catalog+executor);
-  `go test ./internal/catalog/... ./internal/executor/...`;
-  `scripts/tpch-spotcheck.sh` (Q12=2/Q13=33);
-  `RALPH_PRECOMMIT_SCOPE=smoke ralph-precommit-test.sh` (0 failed, 3 workloads).
+- Nightly triage: `ci/logs/action-items.md` AI-20260710-011513-001 already
+  resolved (`[x]` fix_plan L6123/6204); HEAD builds clean. No new work.
+- Task: unimplemented_feat #5 (sub-day interval units — parser half).
+- Change: added `hour/minute/second/millisecond` (+plural) cases to all four
+  unit switches:
+  - `internal/parser/select.go` Form 1 trailing-unit (`interval '2' hour`)
+    + `splitEmbeddedInterval` Form 2 (`interval '2 hours'`).
+  - `internal/executor/expr.go` `evalIntervalLit` (typed literal) +
+    `parseIntervalCastString` (`::interval`/`CAST` cast).
+  - Convert magnitude → micros via `NewIntervalDatumFull(0,0,µs)` using new
+    `usecsPerHour/Minute/Second/Milli` consts (siblings of `usecsPerDay`).
+  - `parseIntervalCastString` signature grew `micros int64`; sole caller now
+    builds via `NewIntervalDatumFull`.
+- Rendering reuses the loop-#16 PG-verified `formatInterval`; analyzer untouched
+  (already types every `IntervalLit` as `interval`).
+- Tests: `internal/executor/interval_subday_test.go` `TestSubDayIntervalLiterals`
+  (Form 1/Form 2/cast/arithmetic/timestamp+interval).
+- Bookkeeping: unimplemented_feat.json #5 → resolved (JSON valid, surgical);
+  deferral ledger row appended; design 0003-0006 new Follow-up section (README
+  already indexes 0003-0006). Did NOT edit fix_plan.md (driver churn).
+- Gates (all PASS): build/vet clean; executor/analyzer/planner + parser suites;
+  tpch-spotcheck (Q12=2/Q13=33); pgbench smoke (pre-commit hook).
 
-**Next natural work:** the heap-persist `indexprs` slice (needs a
-null-bitmap-aware `DecodePGIndexPhysicalRow` + all its callers; also
-`Index.ColExprStrings` isn't WAL/heap-persisted for restart yet). OR continue
-the `unimplemented_feat.json` survey. OR M0122-0008 (auth/roles/multi-DB).
+**Still deferred** (ledger): fractional magnitudes (`interval '1.5 seconds'`,
+ParseInt rejects decimals), multi-field literals (`'1 day 05:00:00'`, needs a
+DecodeInterval tokenizer), week/decade/microsecond units, and `date−date→integer`
+(flagDate blast radius). Next natural: fractional-second literals OR continue
+unimplemented_feat.json survey (~180 open).
 
 In-flight: none

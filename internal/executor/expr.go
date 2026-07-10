@@ -1914,6 +1914,17 @@ func addTimeInterval(t, iv Datum, subtract bool) Datum {
 // interval time-component helpers below (matches USECS_PER_DAY upstream).
 const usecsPerDay = 24 * 60 * 60 * 1_000_000
 
+// Sub-day interval unit magnitudes in microseconds, used when lowering
+// sub-day interval literals (`interval '2 hours'` etc.) to the KindInterval
+// micros carrier. Mirror USECS_PER_HOUR/MINUTE/SEC upstream
+// (postgres/src/include/datatype/timestamp.h).
+const (
+	usecsPerHour   = 3600 * 1_000_000
+	usecsPerMinute = 60 * 1_000_000
+	usecsPerSecond = 1_000_000
+	usecsPerMilli  = 1_000
+)
+
 // subTimeTime implements `timestamp − timestamp` → interval, mirroring
 // upstream timestamp_mi: the microsecond delta is justified into whole 24h
 // days via interval_justify_hours. goopg represents DATE internally as a
@@ -3222,22 +3233,25 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 		return d, nil
 	case "interval":
 		// Cast to interval: parse the v0-supported "<n> <unit>" string shape
-		// (unit ∈ day(s)/month(s)/year(s)), mirroring the `INTERVAL '<n>
-		// <unit>'` typed-literal grammar (evalIntervalLit/splitEmbeddedInterval)
-		// so `'<n> <unit>'::interval` and `CAST('<n> <unit>' AS interval)`
-		// accept exactly the same strings instead of silently passing the
-		// string through unparsed. Multi-component/sub-day interval strings
-		// remain a documented v0 scope limit. M0122-0004.
+		// (unit ∈ day(s)/month(s)/year(s) or the sub-day
+		// hour(s)/minute(s)/second(s)/millisecond(s)), mirroring the
+		// `INTERVAL '<n> <unit>'` typed-literal grammar
+		// (evalIntervalLit/splitEmbeddedInterval) so `'<n> <unit>'::interval`
+		// and `CAST('<n> <unit>' AS interval)` accept exactly the same
+		// strings instead of silently passing the string through unparsed.
+		// Multi-component interval strings (`1 day 05:00:00`) and fractional
+		// magnitudes remain a documented v0 scope limit. M0122-0004;
+		// sub-day units unimplemented_feat #5.
 		if d.Kind == KindInterval {
 			return d, nil
 		}
 		if d.Kind == KindString {
-			months, days, ok := parseIntervalCastString(d.StringValue())
+			months, days, micros, ok := parseIntervalCastString(d.StringValue())
 			if !ok {
 				return Datum{}, &ExecError{Code: "22007", Pos: pos,
 					Message: fmt.Sprintf("invalid input syntax for type interval: %q", d.StringValue())}
 			}
-			return NewIntervalDatum(months, days), nil
+			return NewIntervalDatumFull(months, days, micros), nil
 		}
 		return Datum{}, &ExecError{Code: "22P02", Pos: pos, Message: "cannot cast to interval"}
 	case "tid":
@@ -5570,28 +5584,37 @@ func evalDateBin(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 // `::interval` / `CAST(... AS interval)` path, as opposed to the
 // parse-time `INTERVAL '...'` typed-literal syntax handled by
 // splitEmbeddedInterval/evalIntervalLit). Accepts the same "<n> <unit>"
-// shape (unit day(s)/month(s)/year(s), case-insensitive) since that is
-// the only interval grammar v0 supports; anything else fails so the
-// caller can raise 22007 rather than silently pass the string through.
-// M0122-0004.
-func parseIntervalCastString(s string) (months, days int32, ok bool) {
+// shape (unit day(s)/month(s)/year(s) or the sub-day
+// hour(s)/minute(s)/second(s)/millisecond(s), case-insensitive) that the
+// typed-literal grammar accepts; anything else fails so the caller can
+// raise 22007 rather than silently pass the string through.
+// M0122-0004; sub-day units added unimplemented_feat #5.
+func parseIntervalCastString(s string) (months, days int32, micros int64, ok bool) {
 	parts := strings.Fields(strings.TrimSpace(s))
 	if len(parts) != 2 {
-		return 0, 0, false
+		return 0, 0, 0, false
 	}
 	n, err := strconv.ParseInt(parts[0], 10, 32)
 	if err != nil {
-		return 0, 0, false
+		return 0, 0, 0, false
 	}
 	switch strings.ToLower(strings.TrimSuffix(parts[1], "s")) {
 	case "day":
-		return 0, int32(n), true
+		return 0, int32(n), 0, true
 	case "month":
-		return int32(n), 0, true
+		return int32(n), 0, 0, true
 	case "year":
-		return int32(n) * 12, 0, true
+		return int32(n) * 12, 0, 0, true
+	case "hour":
+		return 0, 0, n * usecsPerHour, true
+	case "minute":
+		return 0, 0, n * usecsPerMinute, true
+	case "second":
+		return 0, 0, n * usecsPerSecond, true
+	case "millisecond":
+		return 0, 0, n * usecsPerMilli, true
 	default:
-		return 0, 0, false
+		return 0, 0, 0, false
 	}
 }
 
@@ -5622,6 +5645,14 @@ func evalIntervalLit(x *planner.IntervalLit) (Datum, error) {
 		return NewIntervalDatum(n, 0), nil
 	case "year":
 		return NewIntervalDatum(n*12, 0), nil
+	case "hour":
+		return NewIntervalDatumFull(0, 0, int64(n)*usecsPerHour), nil
+	case "minute":
+		return NewIntervalDatumFull(0, 0, int64(n)*usecsPerMinute), nil
+	case "second":
+		return NewIntervalDatumFull(0, 0, int64(n)*usecsPerSecond), nil
+	case "millisecond":
+		return NewIntervalDatumFull(0, 0, int64(n)*usecsPerMilli), nil
 	default:
 		return Datum{}, &ExecError{Code: "0A000", Pos: x.Pos(), Message: fmt.Sprintf("interval unit %q is not supported in v0", x.Unit)}
 	}

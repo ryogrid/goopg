@@ -181,7 +181,7 @@
    "feature": "Sub-day interval units (hours, minutes, seconds, milliseconds) for interval arithmetic",
    "task_id": null,
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "Out of scope (deferred): EXTRACT (its own grammar), timestamp-timestamp interval, sub-day units, multi-field intervals"
    ],
@@ -196,7 +196,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "narrowed 2026-07-11: the STORAGE half is now DONE — the KindInterval carrier packs sub-day microseconds in the reserved Hi word (Datum.IntervalMicrosValue / NewIntervalDatumFull, internal/executor/datum.go) and formatInterval renders the HH:MM:SS[.ffffff] time component byte-for-byte vs PG 18.3 (populated today by timestamp - timestamp subtraction). Remaining OPEN = the PARSER half only: internal/parser/select.go (Form 1 trailing-unit interval '<N>' <unit> and splitEmbeddedInterval Form 2 interval '<N> <unit>') plus executor evalIntervalLit / parseIntervalCastString (internal/executor/expr.go) still switch only on day/days, month/months, year/years, so a sub-day interval *literal* like interval '2 hours' is not yet accepted. Multi-field intervals ('1 day 05:00:00') also remain deferred. Resume point: add hour/minute/second (+plural) cases to those four unit switches, converting to micros via NewIntervalDatumFull."
+   "code_audit": "RESOLVED 2026-07-11 (parser half): sub-day interval *literals* are now accepted end-to-end. The four unit switches (internal/parser/select.go Form 1 trailing-unit and splitEmbeddedInterval Form 2; internal/executor/expr.go evalIntervalLit and parseIntervalCastString) gained hour/minute/second/millisecond (+plural) cases converting the magnitude to microseconds via NewIntervalDatumFull, using new usecsPerHour/Minute/Second/Milli consts. So interval '2 hours', interval '90 minutes', interval '2' hour, '3 hours'::interval, and CAST('15 minutes' AS interval) all parse; arithmetic composes them with day/hour parts (interval '1 day' + interval '2 hours' -> '1 day 02:00:00'). Rendering rides the already-PG-verified formatInterval time component. Tests: internal/executor/interval_subday_test.go TestSubDayIntervalLiterals. STILL DEFERRED (see deferral_ledger.md): fractional magnitudes (interval '1.5 seconds' -> evalIntervalLit/parseIntervalCastString parse the body with ParseInt, so a decimal fails 22007), multi-field literals ('1 day 05:00:00' / '1 year 2 months'), and larger/smaller units (week, microsecond, decade)."
   },
   {
    "feature": "SASLprep string normalization, channel binding support, and scram_iterations GUC configuration for SCRAM-SHA-256.",
