@@ -1,6 +1,6 @@
 # Per-database catalog namespace (M0122-0007 slice 4)
 
-Status: accepted (sub-slices 4a, 4b-i, 4b-ii, 4c, 4d-i, 4d-ii-part-1, and 4d-ii-part-2a landed; 4d-ii-part-2b items 1, 2, and 3 all fully landed; 4e's FK-target-resolution, sequence-ownership, and view-constraint-dependency items all landed; `CREATE DATABASE ... TEMPLATE` bounded validation landed 2026-07-10; the pg_class-under-fresh-database gap (name resolution generically, row enumeration for pg_class specifically) landed 2026-07-10, and the pg_indexes/pg_tables, pg_constraint, pg_index, pg_attrdef/pg_depend, pg_inherits, pg_policy, pg_trigger, pg_rewrite, pg_foreign_table, and pg_sequence row-content follow-ups landed the same day, plus the `oid::regclass`/`'name'::regclass` cast-direction dbOid-scoping gap (follow-up 33) — 2 sibling virtual-table builders (pg_statistic_ext, information_schema.routines/parameters/routine_*_usage) plus pg_sequences/information_schema.sequences (follow-up 34's narrowed remainder) plus the c.foreignServers registry-dbOid-key gap (follow-up 36, landed) and its same-shape c.userMappings sibling (follow-up 37, landed 2026-07-10) plus the real relation-copy mechanism remain planned, see "Remaining 4e work" below)
+Status: accepted (sub-slices 4a, 4b-i, 4b-ii, 4c, 4d-i, 4d-ii-part-1, and 4d-ii-part-2a landed; 4d-ii-part-2b items 1, 2, and 3 all fully landed; 4e's FK-target-resolution, sequence-ownership, and view-constraint-dependency items all landed; `CREATE DATABASE ... TEMPLATE` bounded validation landed 2026-07-10; the pg_class-under-fresh-database gap (name resolution generically, row enumeration for pg_class specifically) landed 2026-07-10, and the pg_indexes/pg_tables, pg_constraint, pg_index, pg_attrdef/pg_depend, pg_inherits, pg_policy, pg_trigger, pg_rewrite, pg_foreign_table, and pg_sequence row-content follow-ups landed the same day, plus the `oid::regclass`/`'name'::regclass` cast-direction dbOid-scoping gap (follow-up 33) — 2 sibling virtual-table builders (pg_statistic_ext, information_schema.routines/parameters/routine_*_usage) plus pg_sequences/information_schema.sequences (follow-up 34's narrowed remainder) plus the c.foreignServers registry-dbOid-key gap (follow-up 36, landed) and its same-shape c.userMappings sibling (follow-up 37, landed 2026-07-10); follow-up 37's own CURRENT_USER/SESSION_USER/CURRENT_ROLE/USER role-spec resolution discovery closed same-day (follow-up 38) — the real relation-copy mechanism remains planned, see "Remaining 4e work" below)
 Date: 2026-07-10
 Supersedes: none — extends the "Still open" note in
 `0122-0017-database-ddl-drop-guards.md` and the deferral-ledger rows dated
@@ -1537,6 +1537,55 @@ simplification, confirmed still present by this loop's live E2E check:
 `CREATE USER MAPPING FOR CURRENT_USER SERVER ...` renders `usename =
 'current_user'` in `pg_user_mappings`, not the resolved role name) — unrelated
 to dbOid scoping, orthogonal follow-up.
+
+**`CURRENT_USER`/`SESSION_USER`/`CURRENT_ROLE`/`USER` role-spec resolution —
+LANDED (2026-07-10, follow-up 38).** Closes follow-up 37's own orthogonal
+discovery above. Real PostgreSQL's `CreateUserMapping`/`RemoveUserMapping`
+(`foreigncmds.c`) both resolve the `FOR <user>` `RoleSpec` via
+`get_rolespec_oid` (`acl.c`) — `CURRENT_USER`/`CURRENT_ROLE`/bare `USER`
+resolve to `GetUserId()` (the session's *current* effective role, i.e. after
+`SET ROLE`/`SET SESSION AUTHORIZATION`) and `SESSION_USER` resolves to
+`GetSessionUserId()` (the originally authenticated role) — at CREATE/DROP
+time, not stored symbolically. `internal/parser/ddl.go`'s
+`scanUserMappingForServer` has no connection-state access, so (matching its
+own doc comment) it still passes the raw keyword text through unchanged; the
+resolution instead happens at the executor call sites in
+`internal/executor/operators_ddl.go`, which already have `o.ctx`. New
+`ddlOp.currentDDLOwnerName()` (name-string sibling of the existing
+`currentDDLOwnerOID()`, same `NonSuperuserRole`-or-bootstrap-superuser
+resolution) and `ddlOp.resolveUserMappingRoleName(user string) string` (case-
+insensitively matches `current_user`/`session_user`/`current_role`/`user` and
+substitutes `currentDDLOwnerName()`'s result; anything else, including
+`public`/`""`, passes through unchanged). Both the CREATE USER MAPPING and
+DROP USER MAPPING `"user mapping"` cases now route the parsed user token
+through `resolveUserMappingRoleName` before touching the registry, so a
+mapping created `FOR CURRENT_USER` can also be dropped `FOR CURRENT_USER`
+(mirrors `RemoveUserMapping` resolving the same way `CreateUserMapping`
+does). Like follow-up 37, goopg does not distinguish `SET ROLE` from `SET
+SESSION AUTHORIZATION` anywhere else in this file (every other OWNER TO site
+already collapses `CURRENT_USER`/`SESSION_USER`/`CURRENT_ROLE` into one
+`"current_user"` sentinel resolved via `NonSuperuserRole`), so this follow-up
+matches that established, intentional simplification rather than modeling
+the two independently. Because the resolved name (not the literal keyword) is
+now what gets WAL-logged (`wal.EncodeCreateUserMapping` receives
+`um.UmUser`, already resolved), restart durability comes for free — no WAL
+format change needed. Tests:
+`TestCreateUserMappingCurrentUserResolvesToConnectingRoleName` (table-driven
+over all 4 spellings), `TestCreateUserMappingCurrentUserFallsBackToBootstrapSuperuser`,
+`TestDropUserMappingCurrentUserResolvesSameAsCreate`,
+`TestCreateUserMappingPlainRoleNamePassesThrough` (guards the sentinel match
+isn't over-broad: a role literally named e.g. `myuser`, and the `PUBLIC`
+pseudo-role, must still pass through unchanged) — all in
+`internal/executor/operators_ddl_user_mapping_current_user_test.go`. Live
+end-to-end verified against a real `cmd/goopg` + `psql`: `CREATE USER MAPPING
+FOR CURRENT_USER`/`FOR SESSION_USER` both resolve to `postgres` with no
+active `SET ROLE`; after `SET ROLE alice`, `FOR CURRENT_USER` resolves to
+`alice`, and the resulting mapping is droppable by its resolved name; a
+mapping created `FOR CURRENT_USER` survives a restart still showing the
+resolved name (not `current_user`) in `pg_user_mappings`. **Remaining 4e
+scope (deferred, own future loops):** `pg_statistic_ext`/
+`information_schema.routines` (bigger registry redesign); the real `CREATE
+DATABASE ... TEMPLATE` relation-copy mechanism itself.
 
 ## Recommended order and stopping points
 

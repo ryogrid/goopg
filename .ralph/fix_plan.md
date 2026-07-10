@@ -7422,6 +7422,69 @@ mirroring M0119's ledger `status` column.
       `information_schema.routines` (bigger registry redesign); the
       CURRENT_USER-resolution parser gap noted above; the real `CREATE
       DATABASE ... TEMPLATE` relation-copy mechanism itself.
+  - [x] `M0122-0007` follow-up 38 (2026-07-10, this loop) — **resolved
+      `CREATE`/`DROP USER MAPPING FOR <role-spec>`'s CURRENT_USER/
+      SESSION_USER/CURRENT_ROLE/USER sentinels to the connecting role's
+      actual name**, closing follow-up 37's own orthogonal discovery: the
+      previous nightly build regression (stale by this loop; already fixed
+      by follow-up 14) meant no other AI-triage item was open, so this loop
+      picked up the next M0122-0007 resume point instead. Real PostgreSQL's
+      `CreateUserMapping`/`RemoveUserMapping` (`foreigncmds.c`) resolve the
+      `RoleSpec` via `get_rolespec_oid` (`acl.c`) at CREATE/DROP time
+      (`GetUserId()` for CURRENT_USER/CURRENT_ROLE/USER, `GetSessionUserId()`
+      for SESSION_USER); goopg's `scanUserMappingForServer`
+      (`internal/parser/ddl.go`) has no connection-state access and passes
+      the raw keyword text through unchanged (unfixed, matches its own doc
+      comment), so resolution now happens at the executor call sites
+      (`internal/executor/operators_ddl.go`) instead, which already have
+      `o.ctx`. New `ddlOp.currentDDLOwnerName()` (name-string sibling of the
+      pre-existing `currentDDLOwnerOID()`) and
+      `ddlOp.resolveUserMappingRoleName(user string) string`
+      (case-insensitively matches the 4 sentinel spellings, substitutes
+      `currentDDLOwnerName()`'s result, passes everything else — including
+      `public`/`""` — through unchanged). Both the CREATE and DROP USER
+      MAPPING `"user mapping"` cases route the parsed user token through it
+      before touching the registry, so a mapping created FOR CURRENT_USER
+      can also be dropped FOR CURRENT_USER. Matches the pre-existing
+      "current_user" sentinel convention already used by every OWNER TO site
+      in this file (goopg does not model SET ROLE vs. SET SESSION
+      AUTHORIZATION separately for this purpose). Because the *resolved*
+      name (not the literal keyword) is what gets WAL-logged
+      (`wal.EncodeCreateUserMapping` receives the already-resolved
+      `um.UmUser`), restart durability came for free — no WAL format change
+      needed. New tests (all in
+      `internal/executor/operators_ddl_user_mapping_current_user_test.go`):
+      `TestCreateUserMappingCurrentUserResolvesToConnectingRoleName`
+      (table-driven over CURRENT_USER/SESSION_USER/CURRENT_ROLE/USER, with
+      `NonSuperuserRole` set), `TestCreateUserMappingCurrentUserFallsBackToBootstrapSuperuser`
+      (no active SET ROLE → resolves to "postgres"),
+      `TestDropUserMappingCurrentUserResolvesSameAsCreate`,
+      `TestCreateUserMappingPlainRoleNamePassesThrough` (regression guard: a
+      role literally named e.g. "myuser", and the PUBLIC pseudo-role, must
+      still pass through unchanged — the sentinel match isn't over-broad).
+      Live end-to-end verified against a real `cmd/goopg` binary + real
+      `psql`: `FOR CURRENT_USER`/`FOR SESSION_USER` both resolve to
+      "postgres" with no active SET ROLE; after `SET ROLE alice`, `FOR
+      CURRENT_USER` resolves to "alice" and the mapping is then droppable by
+      its resolved name; a mapping created FOR CURRENT_USER survives a
+      restart still showing the resolved name (not the literal
+      "current_user") in `pg_user_mappings`. Design:
+      `docs/design/0122-0018-per-database-catalog-namespace.md` gained a new
+      "follow-up 38" subsection + status-line update;
+      `docs/design/README.md` row extended. Gates: `go build ./...`/`go vet
+      ./...` clean; `go test -race ./internal/catalog/...
+      ./internal/executor/... ./internal/wal/... ./internal/initdb/...`
+      PASS (`internal/initdb` needed `-timeout 40m` under this host's
+      concurrent live Ralph-loop co-load, matching the
+      `goopg_nightly_ci_batch` "initdb 10m-timeout under co-load" finding —
+      not a regression); `go test ./internal/parser/... ./internal/planner/...
+      ./internal/server/...` PASS; `go test -short` full repo (excl.
+      testport) PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh`
+      PASS (0 failed transactions, all 3 pgbench workloads). **Remaining
+      M0122-0007 scope (deferred, own future loops):** `pg_statistic_ext`/
+      `information_schema.routines` (bigger registry redesign); the real
+      `CREATE DATABASE ... TEMPLATE` relation-copy mechanism itself.
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,

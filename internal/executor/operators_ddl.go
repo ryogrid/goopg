@@ -821,6 +821,39 @@ func (o *ddlOp) currentDDLOwnerOID() uint32 {
 	return 10
 }
 
+// currentDDLOwnerName is currentDDLOwnerOID's name-string sibling, for call
+// sites that store a role NAME rather than an OID (e.g. catalog.UserMapping's
+// UmUser). Resolves to the role currently in effect via SET ROLE / SET
+// SESSION AUTHORIZATION (o.ctx.NonSuperuserRole), or the bootstrap superuser
+// name when no such role is active.
+func (o *ddlOp) currentDDLOwnerName() string {
+	if o.ctx.NonSuperuserRole != "" {
+		return o.ctx.NonSuperuserRole
+	}
+	return "postgres"
+}
+
+// resolveUserMappingRoleName resolves a CREATE/DROP USER MAPPING FOR <user>
+// role-spec to the name that should be stored/looked-up in the
+// catalog.UserMapping registry. CURRENT_USER / SESSION_USER / CURRENT_ROLE /
+// bare USER all resolve to the connecting role's actual name at statement
+// time — mirrors real PostgreSQL's get_rolespec_oid (acl.c), which resolves
+// these RoleSpec kinds via GetUserId()/GetSessionUserId() rather than storing
+// them symbolically. The parser (scanUserMappingForServer) does not perform
+// this resolution itself — it has no connection-state access — so it passes
+// the raw keyword text through unchanged; goopg does not distinguish SET ROLE
+// from SET SESSION AUTHORIZATION for this purpose, matching the single
+// "current_user" sentinel convention every OWNER TO site in this file already
+// uses, so all four spellings resolve identically. Any other value (a plain
+// role name, or "public"/"") passes through unchanged.
+func (o *ddlOp) resolveUserMappingRoleName(user string) string {
+	switch strings.ToLower(user) {
+	case "current_user", "session_user", "current_role", "user":
+		return o.currentDDLOwnerName()
+	}
+	return user
+}
+
 // execCreatePublication / execDropPublication / execCreateSubscription
 // / execDropSubscription drive the *catalog.PubSub registry attached
 // via Context.PubSub. The five virtual catalog views
@@ -15226,8 +15259,12 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 		case "user mapping":
 			// DROP USER MAPPING FOR <user> SERVER <server>: Names = [user, server].
 			// Remove the dump-visible registry entry (DU-002 slice 377).
+			// CURRENT_USER/SESSION_USER/CURRENT_ROLE/USER resolve to the
+			// connecting role's actual name (M0122-0007 4e follow-up 38),
+			// matching the resolution CREATE USER MAPPING now performs so a
+			// mapping created FOR CURRENT_USER can also be dropped that way.
 			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok && len(s.Names) >= 2 {
-				user, server := s.Names[0].String(), s.Names[1].String()
+				user, server := o.resolveUserMappingRoleName(s.Names[0].String()), s.Names[1].String()
 				dbOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
 				if im.DropUserMapping(user, server, dbOid) {
 					// M0122-0007 user-mapping registry restart-durability
@@ -15881,9 +15918,13 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		// (pg_user_mappings.umoptions → dumpUserMappings). DU-002 slice 377
 		// (options: slice 379). Keyed by the connection's own dbOid
 		// (M0122-0007 4e follow-up 37) so a same-named (user, server) pair in
-		// a distinct database no longer collides.
+		// a distinct database no longer collides. CURRENT_USER/SESSION_USER/
+		// CURRENT_ROLE/USER resolve to the connecting role's actual name
+		// (M0122-0007 4e follow-up 38) instead of round-tripping the literal
+		// keyword text.
 		umDBOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
-		um := im.RegisterUserMapping(s.ObjName.String(), s.TableName.String(), s.Options, umDBOid)
+		umUser := o.resolveUserMappingRoleName(s.ObjName.String())
+		um := im.RegisterUserMapping(umUser, s.TableName.String(), s.Options, umDBOid)
 		// M0122-0007 user-mapping registry restart-durability follow-up:
 		// persist the mapping so it survives a restart. goopg's user-mapping
 		// registry has no backing heap relation, so record a WAL event the
