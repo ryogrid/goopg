@@ -8,8 +8,12 @@ package executor
 // Plain (non-CONCURRENTLY) REINDEX INDEX / REINDEX TABLE / REINDEX SCHEMA
 // physically rebuild their btree index(es) from a fresh heap scan, reusing
 // CREATE INDEX's bulk-build path (M0122-0007, design
-// 0122-0007-reindex-physical-rebuild). Every CONCURRENTLY form remains a
-// catalog-only no-op — see that design doc's Deferral section.
+// 0122-0007-reindex-physical-rebuild). Every CONCURRENTLY form also
+// physically rebuilds, via a catalog-invisible shadow-file build-then-swap
+// (rebuildIndexConcurrently/rebuildTableIndexesConcurrently) instead of
+// holding the table locked for the whole rebuild — only non-btree access
+// methods stay a catalog-only no-op (see that design doc's Deferral
+// section for the remaining single-scan-without-revalidation gap).
 
 import (
 	"context"

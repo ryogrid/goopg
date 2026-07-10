@@ -2842,7 +2842,7 @@
    "feature": "REINDEX INDEX/TABLE command is unimplemented; operates as a no-op stub.",
    "task_id": null,
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "no-op rebuild (v0 stub)"
    ],
@@ -2857,7 +2857,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/executor/operators_reindex.go:6 - Physical reindex is no-op; validation works"
+   "code_audit": "RESOLVED 2026-07-10: stale, superseded by commit b9a1e1fb (M0122-0007) — plain REINDEX INDEX/TABLE/SCHEMA physically rebuild via CREATE INDEX's bulk-build path, and REINDEX ... CONCURRENTLY physically rebuilds via shadow-file build-then-swap (internal/executor/operators_reindex.go: rebuildIndex/rebuildIndexConcurrently/rebuildTableIndexesConcurrently). Only non-btree access methods stay catalog-only. Verified via TestReindexIndexPhysicallyRebuilds/TestReindexTablePhysicallyRebuildsAllIndexes/TestReindexSchemaPhysicallyRebuildsAllTables/TestReindexIndexConcurrentlyPhysicallyRebuilds/TestReindexTableConcurrentlyPhysicallyRebuildsAllIndexes (internal/executor/reindex_physical_rebuild_test.go), all PASS. Design doc docs/design/0122-0007-reindex-physical-rebuild.md documents this landed; its own file-header doc comment was itself stale (said CONCURRENTLY \"remains a catalog-only no-op\") and has been corrected in the same loop. Remaining gap is the documented Deferral-section single-scan-without-revalidation limitation, not a stub. internal/executor/operators_reindex.go:6 - Physical reindex is no-op; validation works"
   },
   {
    "feature": "pg_get_expr() function is stubbed to return empty string; does not reconstruct constraint or index expressions.",

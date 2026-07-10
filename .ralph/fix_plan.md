@@ -8533,6 +8533,46 @@ mirroring M0119's ledger `status` column.
       verify-before-implement finding, not an implementation, mirroring the
       M0122-0005 bucket's several prior "stale entry, no code change needed"
       closures.
+- [x] **M0122-0020 — REINDEX physical-rebuild — verified stale `open` entry,
+      closed** (~1; `unimplemented_feat.json`, "REINDEX INDEX/TABLE command
+      is unimplemented; operates as a no-op stub.", `deferred_date:
+      2026-06-08`). The entry pre-dated commit `b9a1e1fb` (`M0122-0007`,
+      "make plain REINDEX INDEX/TABLE physically rebuild btree indexes") and
+      the later CONCURRENTLY shadow-file build-then-swap follow-ups —
+      `internal/executor/operators_reindex.go` now physically rebuilds for
+      every plain form (`REINDEX INDEX`/`TABLE`/`SCHEMA`, reusing `CREATE
+      INDEX`'s bulk-build path) AND every `CONCURRENTLY` form
+      (`rebuildIndexConcurrently`/`rebuildTableIndexesConcurrently`, via a
+      catalog-invisible shadow file swapped in under a brief lock); only
+      non-btree access methods stay a catalog-only no-op. Confirmed via the
+      existing dedicated test file
+      `internal/executor/reindex_physical_rebuild_test.go`
+      (`TestReindexIndexPhysicallyRebuilds`,
+      `TestReindexTablePhysicallyRebuildsAllIndexes`,
+      `TestReindexSchemaPhysicallyRebuildsAllTables`,
+      `TestReindexIndexConcurrentlyPhysicallyRebuilds`,
+      `TestReindexTableConcurrentlyPhysicallyRebuildsAllIndexes`, all PASS)
+      and design doc `docs/design/0122-0007-reindex-physical-rebuild.md`
+      (status "accepted", own Deferral section names only the real
+      remaining gap: no second validation scan for a write racing the
+      shadow build's heap scan). **Secondary finding, fixed in the same
+      loop:** `operators_reindex.go`'s own file-header doc comment was
+      itself stale in the same direction — it asserted "Every CONCURRENTLY
+      form remains a catalog-only no-op", contradicting the file's own
+      `rebuildIndexConcurrently`/`rebuildTableIndexesConcurrently` doc
+      comments two-hundred-odd lines below it; corrected to describe the
+      shadow-file build-then-swap mechanism and point at the design doc's
+      actual (narrower) Deferral gap.
+      `unimplemented_feat.json`'s matching entry flipped `open`→`resolved`
+      (81/181 resolved, 100 open). No design doc changes needed beyond the
+      comment fix above (the design doc's own content was already
+      accurate — only this code comment and the tracking JSON were stale).
+      Gates: `go build ./...`/`go vet ./...` clean (comment-only code
+      change); `go test ./internal/executor/... -run TestReindex` PASS
+      (7/7, all pre-existing); `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke bash
+      scripts/ralph-precommit-test.sh` PASS (0 failed transactions, all 3
+      workloads).
 
 > This task list is **seeded, not exhaustive.** The M0122-0001 triage plus every
 > future feature deferral appended to `unimplemented_feat.json` (any new `open`
