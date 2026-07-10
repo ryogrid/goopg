@@ -1063,15 +1063,19 @@ func tableHasToastRelation(t *Table) bool {
 // `reltoastrelid::regclass` cannot find it via tableByOID and must reconstruct
 // the name here. Returns false when the OID is below the TOAST range or its
 // parent table owns no auto-exposed TOAST relation. M0118-0008 TOAST-exposure
-// slice 2 (design 0118-0084).
-func (c *InMemory) ToastRelName(oid uint32) (string, bool) {
+// slice 2 (design 0118-0084). dbOid (default DefaultDBOid, mirroring every
+// other per-dbOid lookup in this file) scopes the parent-table resolution to
+// the connection's own database namespace — M0122-0007 4e follow-up 33
+// (oid::regclass cast direction, previously hardcoded to DefaultDBOid).
+func (c *InMemory) ToastRelName(oid uint32, dbOid ...uint32) (string, bool) {
+	resolved := resolveDBOid(dbOid)
 	// The TOAST index range [200M, 300M) sits above the TOAST relation range
 	// [100M, 200M); check it first. The index name is pg_toast_<parentOID>_index.
 	if oid >= toastIndexOidOffset {
 		parentOID := oid - toastIndexOidOffset
 		c.mu.RLock()
 		defer c.mu.RUnlock()
-		t, ok := c.tableByOID(parentOID, DefaultDBOid)
+		t, ok := c.tableByOID(parentOID, resolved)
 		if !ok || !tableHasToastRelation(t) {
 			return "", false
 		}
@@ -1083,7 +1087,7 @@ func (c *InMemory) ToastRelName(oid uint32) (string, bool) {
 	parentOID := oid - toastRelidOffset
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	t, ok := c.tableByOID(parentOID, DefaultDBOid)
+	t, ok := c.tableByOID(parentOID, resolved)
 	if !ok || !tableHasToastRelation(t) {
 		return "", false
 	}

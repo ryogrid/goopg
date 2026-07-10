@@ -7128,6 +7128,49 @@ mirroring M0119's ledger `status` column.
       ./...`/`go vet ./...` clean; `go test ./internal/catalog/...
       ./internal/executor/... ./internal/server/... ./internal/planner/...`
       PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33, re-run this loop).
+  - [x] `M0122-0007` follow-up 33 (2026-07-10, this loop) — **fixed the
+      `oid::regclass`/`'name'::regclass` cast-direction dbOid-scoping gap
+      follow-up 26 flagged as a collateral discovery.** Unlike the 10 prior
+      VirtualRows-closure follow-ups, this is a cast/output-function gap in
+      `internal/executor/expr.go`: the `CastExpr` regclass arm (both
+      `<oid>::regclass` and `'name'::regclass`) plus the `regclass` function-
+      call arm resolved every lookup against `DefaultDBOid` unconditionally —
+      `im.LookupTableByOID(uint32(v.Int))`, `im.ToastRelName(uint32(v.Int))`,
+      `ctx.Catalog.AllIndexes()`, and `ctx.Catalog.LookupTable(objName)` were
+      all called with no dbOid argument, so a connection to a distinct
+      `CREATE DATABASE`'d dbOid rendered the bare numeric OID instead of its
+      own table's name, and couldn't resolve its own table's name to an OID
+      at all. Fixed by threading `catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)`
+      through all five call sites (the same pattern `operators_fk.go`/
+      `operators_sequence.go`/`operators_tx.go`/`operators_cluster.go`/
+      `ssi.go`/`deferred_unique.go` already use). `catalog.InMemory.ToastRelName`
+      gained a variadic `dbOid uint32` parameter (previously hardcoded to
+      `DefaultDBOid`; its only call site is the `CastExpr` arm just fixed).
+      New test `TestRegclassCastScopedToConnectionDBOid`
+      (`internal/executor/fk_dbid_routing_test.go`), confirmed to fail via
+      `git stash` against a revert of this loop's `catalog.go`/`expr.go`
+      changes (3 assertions failed: OID→name rendered the bare OID instead of
+      the name, OID→name leaked a `DefaultDBOid` table's name to `otherDBOid`,
+      and `'shared_name'::regclass::oid` resolved to `DefaultDBOid`'s OID from
+      an `otherDBOid` connection). Uses two identically-named tables
+      (`shared_name`) in two distinct dbOids for the string→OID direction —
+      the realistic collision scenario, since a differently-named lookup miss
+      falls back to an unresolved literal rather than another database's OID
+      and so can't demonstrate a leak by itself. Design doc gained a new
+      subsection; `docs/design/README.md` row extended; deferral ledger row
+      appended ("oid::regclass cast — collateral discovery" flipped to
+      `resolved`). **Remaining M0122-0007 scope (deferred, own future
+      loops):** 2 sibling VirtualRows builders (`pg_statistic_ext`,
+      `information_schema.routines`/`parameters`/`routine_*_usage`) needing
+      the bigger registry-dbOid-key treatment; the `c.foreignServers`
+      (CREATE SERVER) and `catalog.SequenceParamsFunc` registries still keyed
+      without a dbOid (same shape, also touches WAL record format for
+      foreignServers); the real `CREATE DATABASE ... TEMPLATE` relation-copy
+      mechanism itself. Gates: `go build ./...`/`go vet ./...` clean; `go
+      test ./internal/catalog/... ./internal/executor/... ./internal/server/...
+      ./internal/planner/...` PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh`
+      PASS (0 failed transactions, all 3 pgbench workloads).
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,

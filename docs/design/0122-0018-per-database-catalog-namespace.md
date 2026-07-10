@@ -1,6 +1,6 @@
 # Per-database catalog namespace (M0122-0007 slice 4)
 
-Status: accepted (sub-slices 4a, 4b-i, 4b-ii, 4c, 4d-i, 4d-ii-part-1, and 4d-ii-part-2a landed; 4d-ii-part-2b items 1, 2, and 3 all fully landed; 4e's FK-target-resolution, sequence-ownership, and view-constraint-dependency items all landed; `CREATE DATABASE ... TEMPLATE` bounded validation landed 2026-07-10; the pg_class-under-fresh-database gap (name resolution generically, row enumeration for pg_class specifically) landed 2026-07-10, and the pg_indexes/pg_tables, pg_constraint, pg_index, pg_attrdef/pg_depend, pg_inherits, pg_policy, pg_trigger, pg_rewrite, and pg_foreign_table row-content follow-ups landed the same day — 2 sibling virtual-table builders plus the real relation-copy mechanism remain planned, see "Remaining 4e work" below)
+Status: accepted (sub-slices 4a, 4b-i, 4b-ii, 4c, 4d-i, 4d-ii-part-1, and 4d-ii-part-2a landed; 4d-ii-part-2b items 1, 2, and 3 all fully landed; 4e's FK-target-resolution, sequence-ownership, and view-constraint-dependency items all landed; `CREATE DATABASE ... TEMPLATE` bounded validation landed 2026-07-10; the pg_class-under-fresh-database gap (name resolution generically, row enumeration for pg_class specifically) landed 2026-07-10, and the pg_indexes/pg_tables, pg_constraint, pg_index, pg_attrdef/pg_depend, pg_inherits, pg_policy, pg_trigger, pg_rewrite, and pg_foreign_table row-content follow-ups landed the same day, plus the `oid::regclass`/`'name'::regclass` cast-direction dbOid-scoping gap (follow-up 33) — 2 sibling virtual-table builders (pg_statistic_ext, information_schema.routines/parameters/routine_*_usage) plus the c.foreignServers/SequenceParamsFunc registry-dbOid-key gaps plus the real relation-copy mechanism remain planned, see "Remaining 4e work" below)
 Date: 2026-07-10
 Supersedes: none — extends the "Still open" note in
 `0122-0017-database-ddl-drop-guards.md` and the deferral-ledger rows dated
@@ -1332,6 +1332,34 @@ shape as `pg_statistic_ext`'s `c.statisticsObjs` gap noted above). See the
 follow-on and the 2 remaining sibling builders (`pg_statistic_ext`,
 `information_schema.routines`/`parameters`/`routine_*_usage`) still needing
 the bigger registry-dbOid-key treatment.
+
+**`oid::regclass`/`'name'::regclass` cast direction fixed (2026-07-10, follow-up
+33):** the collateral discovery from follow-up 26 ("`oid::regclass` … returns
+the bare numeric OID instead of resolving a name for objects in a non-
+`DefaultDBOid` database") — a cast/output-function gap, not a `VirtualRows`
+closure. Unlike the 10 VirtualRows-closure follow-ups, both directions of the
+`regclass` cast (`internal/executor/expr.go`'s `CastExpr` arm, plus the
+`regclass`/`regprocedure`/… function-call arm) resolved every lookup against
+`DefaultDBOid` unconditionally: `<oid>::regclass` for a table in a distinct
+`CREATE DATABASE`'d dbOid rendered the bare numeric OID instead of the
+relation name (falls through `im.LookupTableByOID`/`im.ToastRelName`/
+`ctx.Catalog.AllIndexes()`, all unscoped), and `'name'::regclass` couldn't
+resolve that table's OID at all (`ctx.Catalog.LookupTable(objName)`, also
+unscoped). Fixed by threading `catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)`
+through all five lookup call sites (mirroring every other per-dbOid site in
+`operators_fk.go`/`operators_sequence.go`/`operators_tx.go`), plus giving
+`catalog.InMemory.ToastRelName` a variadic `dbOid` parameter (it had none
+before — hardcoded to `DefaultDBOid`; its sole call site is the `CastExpr` arm
+just fixed). New test `TestRegclassCastScopedToConnectionDBOid`
+(`internal/executor/fk_dbid_routing_test.go`), confirmed to fail against a
+revert of this loop's `catalog.go`/`expr.go` changes: two identically-named
+tables (`shared_name`) in two distinct dbOids resolve `'shared_name'::regclass`
+to their OWN database's OID (the realistic collision scenario — a
+differently-named lookup miss can't demonstrate a leak, since it falls back to
+an unresolved literal rather than another database's OID); the `<oid>::regclass`
+direction is covered both ways with distinctly-named tables. `NamespaceDBOid(0)`
+returns `DefaultDBOid` (existing helper, unchanged), so every pre-existing
+`ctx.CurrentDatabaseOid == 0` test context is byte-identical to before this fix.
 
 **Remaining 4e work: the `CREATE DATABASE ... TEMPLATE` copy mechanism
 itself** — deep-copying the source dbOid's `catalog.tableNamespace`

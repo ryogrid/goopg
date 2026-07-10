@@ -718,6 +718,16 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 			}
 		}
 		if strings.EqualFold(x.TargetType, "regclass") && ctx != nil && ctx.Catalog != nil {
+			// Scope every lookup below to the connection's own database
+			// namespace — mirrors every other per-dbOid site (e.g.
+			// operators_fk.go, operators_sequence.go). Without this, both cast
+			// directions silently resolved against DefaultDBOid only,
+			// regardless of which database the connection was actually on: an
+			// `<oid>::regclass` for a table in a distinct CREATE DATABASE'd
+			// dbOid rendered the bare numeric OID instead of the relation
+			// name, and `'name'::regclass` couldn't find that table's OID at
+			// all. M0122-0007 4e follow-up 33.
+			connDBOid := catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)
 			switch v.Kind {
 			case KindInt:
 				// InvalidOid (0) renders as "-", matching PG's regclassout
@@ -730,19 +740,19 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 					return NewStringDatum("-"), nil
 				}
 				if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
-					if tbl, found := im.LookupTableByOID(uint32(v.Int)); found && tbl != nil {
+					if tbl, found := im.LookupTableByOID(uint32(v.Int), connDBOid); found && tbl != nil {
 						return NewStringDatum(tbl.Name), nil
 					}
 					// Synthetic TOAST relation OIDs (parent OID + 100M) live only in
 					// the virtual pg_class builder, not c.tables, so reconstruct the
 					// schema-qualified pg_toast.pg_toast_<oid> name PG's regclassout
 					// would emit. M0118-0008 TOAST-exposure slice 2 (0118-0084).
-					if name, found := im.ToastRelName(uint32(v.Int)); found {
+					if name, found := im.ToastRelName(uint32(v.Int), connDBOid); found {
 						return NewStringDatum(name), nil
 					}
 				}
 				// Also resolve index OIDs to index names. M0097-0023.
-				for _, idx := range ctx.Catalog.AllIndexes() {
+				for _, idx := range ctx.Catalog.AllIndexes(connDBOid) {
 					if idx.OID == uint32(v.Int) {
 						return NewStringDatum(idx.Name), nil
 					}
@@ -750,12 +760,12 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 			case KindString:
 				schema, rel := splitQualifiedTable(v.StringValue())
 				objName := parser.ObjectName{Schema: schema, Name: rel}
-				if tbl, found := ctx.Catalog.LookupTable(objName); found && tbl != nil {
+				if tbl, found := ctx.Catalog.LookupTable(objName, connDBOid); found && tbl != nil {
 					return NewIntDatum(int64(tbl.OID)), nil
 				}
 				// Also resolve index names: 'idx_name'::regclass returns the index OID.
 				if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
-					if idx, found := im.LookupIndex(objName); found && idx != nil {
+					if idx, found := im.LookupIndex(objName, connDBOid); found && idx != nil {
 						return NewIntDatum(int64(idx.OID)), nil
 					}
 				}
@@ -8730,7 +8740,9 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		if name == "regclass" && v.Kind == KindString && ctx != nil && ctx.Catalog != nil {
 			s := v.StringValue()
 			schema, rel := splitQualifiedTable(s)
-			tbl, ok := ctx.Catalog.LookupTable(parser.ObjectName{Schema: schema, Name: rel})
+			// Scoped to the connection's own dbOid — see the CastExpr
+			// regclass arm's identical fix (M0122-0007 4e follow-up 33).
+			tbl, ok := ctx.Catalog.LookupTable(parser.ObjectName{Schema: schema, Name: rel}, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid))
 			if ok && tbl != nil {
 				return NewIntDatum(int64(tbl.OID)), nil
 			}

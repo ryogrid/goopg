@@ -872,3 +872,104 @@ func pgForeignTableRowsContainFtrelid(rows [][]string, oid uint32) bool {
 	}
 	return false
 }
+
+// TestRegclassCastScopedToConnectionDBOid covers the oid::regclass /
+// 'name'::regclass cast (both in internal/executor/expr.go's CastExpr arm),
+// which previously resolved every lookup against DefaultDBOid regardless of
+// the connection's actual dbOid (M0122-0007 4e follow-up 33): a connection to
+// a distinct CREATE DATABASE'd dbOid could not resolve its own tables'
+// <oid>::regclass to a name (rendered the bare numeric OID instead), and
+// 'name'::regclass couldn't find that table's OID at all. This mirrors the 10
+// prior VirtualRows-closure follow-ups (pg_class, pg_index, pg_trigger, …)
+// but fixes a cast/output-function code path instead of a virtual table.
+func TestRegclassCastScopedToConnectionDBOid(t *testing.T) {
+	const otherDBOid = 7017
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+
+	ctx.CurrentDatabaseOid = catalog.DefaultDBOid
+	if err := runDDL(t, ctx, "CREATE TABLE t_default (a int)"); err != nil {
+		t.Fatalf("CREATE TABLE t_default: %v", err)
+	}
+	ctx.CurrentDatabaseOid = otherDBOid
+	if err := runDDL(t, ctx, "CREATE TABLE t_other (a int)"); err != nil {
+		t.Fatalf("CREATE TABLE t_other: %v", err)
+	}
+
+	im, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		t.Fatalf("ctx.Catalog is %T, want *catalog.InMemory", ctx.Catalog)
+	}
+	tDefault, ok := im.LookupTable(parser.ObjectName{Name: "t_default"}, catalog.DefaultDBOid)
+	if !ok {
+		t.Fatal("t_default not found under DefaultDBOid")
+	}
+	tOther, ok := im.LookupTable(parser.ObjectName{Name: "t_other"}, otherDBOid)
+	if !ok {
+		t.Fatal("t_other not found under otherDBOid")
+	}
+
+	// oid::regclass, from otherDBOid's own connection: its own table's OID
+	// resolves to its own name...
+	ctx.CurrentDatabaseOid = otherDBOid
+	rows := runQueryUnderDBOid(t, ctx, fmt.Sprintf("SELECT %d::regclass::text", tOther.OID))
+	if got := rows[0][0].StringValue(); got != "t_other" {
+		t.Errorf("otherDBOid: %d::regclass::text = %q, want %q", tOther.OID, got, "t_other")
+	}
+	// ...but t_default's OID (owned by DefaultDBOid) must NOT resolve to
+	// "t_default" from this connection — that would be a cross-dbOid leak.
+	rows = runQueryUnderDBOid(t, ctx, fmt.Sprintf("SELECT %d::regclass::text", tDefault.OID))
+	if got := rows[0][0].StringValue(); got == "t_default" {
+		t.Errorf("otherDBOid: %d::regclass::text resolved to %q, a table owned by a different database (cross-dbOid leak)", tDefault.OID, got)
+	}
+
+	// oid::regclass, from DefaultDBOid's own connection: the reverse must
+	// also hold (this is the pre-existing, always-worked direction — pins it
+	// against a regression from this loop's dbOid-scoping change).
+	ctx.CurrentDatabaseOid = catalog.DefaultDBOid
+	rows = runQueryUnderDBOid(t, ctx, fmt.Sprintf("SELECT %d::regclass::text", tDefault.OID))
+	if got := rows[0][0].StringValue(); got != "t_default" {
+		t.Errorf("DefaultDBOid: %d::regclass::text = %q, want %q", tDefault.OID, got, "t_default")
+	}
+	rows = runQueryUnderDBOid(t, ctx, fmt.Sprintf("SELECT %d::regclass::text", tOther.OID))
+	if got := rows[0][0].StringValue(); got == "t_other" {
+		t.Errorf("DefaultDBOid: %d::regclass::text resolved to %q, a table owned by a different database (cross-dbOid leak)", tOther.OID, got)
+	}
+
+	// 'name'::regclass (string→OID direction): two IDENTICALLY-named tables in
+	// the two databases (the realistic collision scenario — a bare table-name
+	// mismatch can't leak by construction, since a lookup miss falls back to
+	// an unresolved literal rather than another database's OID) each resolve
+	// to their OWN database's OID, not the other's.
+	ctx.CurrentDatabaseOid = catalog.DefaultDBOid
+	if err := runDDL(t, ctx, "CREATE TABLE shared_name (a int)"); err != nil {
+		t.Fatalf("CREATE TABLE shared_name (default): %v", err)
+	}
+	ctx.CurrentDatabaseOid = otherDBOid
+	if err := runDDL(t, ctx, "CREATE TABLE shared_name (a int)"); err != nil {
+		t.Fatalf("CREATE TABLE shared_name (other): %v", err)
+	}
+	sharedDefault, ok := im.LookupTable(parser.ObjectName{Name: "shared_name"}, catalog.DefaultDBOid)
+	if !ok {
+		t.Fatal("shared_name not found under DefaultDBOid")
+	}
+	sharedOther, ok := im.LookupTable(parser.ObjectName{Name: "shared_name"}, otherDBOid)
+	if !ok {
+		t.Fatal("shared_name not found under otherDBOid")
+	}
+	if sharedDefault.OID == sharedOther.OID {
+		t.Fatalf("test setup: shared_name got the same OID (%d) in both databases", sharedDefault.OID)
+	}
+
+	ctx.CurrentDatabaseOid = otherDBOid
+	rows = runQueryUnderDBOid(t, ctx, "SELECT 'shared_name'::regclass::oid")
+	if got := uint32(rows[0][0].Int); got != sharedOther.OID {
+		t.Errorf("otherDBOid: 'shared_name'::regclass::oid = %d, want its own %d (got DefaultDBOid's %d instead?)", got, sharedOther.OID, sharedDefault.OID)
+	}
+
+	ctx.CurrentDatabaseOid = catalog.DefaultDBOid
+	rows = runQueryUnderDBOid(t, ctx, "SELECT 'shared_name'::regclass::oid")
+	if got := uint32(rows[0][0].Int); got != sharedDefault.OID {
+		t.Errorf("DefaultDBOid: 'shared_name'::regclass::oid = %d, want its own %d (got otherDBOid's %d instead?)", got, sharedDefault.OID, sharedOther.OID)
+	}
+}
