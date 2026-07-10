@@ -1295,13 +1295,25 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 				isConcreteTimestampLike(leftTyp) && isConcreteTimestampLike(rightTyp) {
 				lname := pgTimeName(leftTyp.Name)
 				rname := pgTimeName(rightTyp.Name)
-				// timetz has no + or - operator at all; other time types are "not unique".
+				// timetz has no + or - operator at all (upstream defines neither),
+				// so both directions raise "operator does not exist" (42883).
 				if strings.EqualFold(leftTyp.Name, "timetz") || strings.EqualFold(rightTyp.Name, "timetz") {
 					ae := analyzeError(x.Pos(), "42883",
 						fmt.Sprintf("operator does not exist: %s %s %s", lname, x.Op, rname))
 					ae.Hint = "No operator matches the given name and argument types. You might need to add explicit type casts."
 					return catalog.Type{}, ae
 				}
+				// Subtraction of two temporal values → interval (timestamp_mi /
+				// time_mi). goopg represents DATE internally as a timestamp, so
+				// date − date also yields an interval here rather than upstream's
+				// integer day count (date_mi) — a deliberate, documented
+				// divergence deferred to the type system (see deferral_ledger.md).
+				// Executor: subTimeTime in internal/executor/expr.go.
+				if x.Op == parser.OpSub {
+					return catalog.Type{Name: "interval"}, nil
+				}
+				// Addition of two temporal values is not defined in PG:
+				// "operator is not unique" (42725) — multiple candidates.
 				ae := analyzeError(x.Pos(), "42725",
 					fmt.Sprintf("operator is not unique: %s %s %s", lname, x.Op, rname))
 				ae.Hint = "Could not choose a best candidate operator. You might need to add explicit type casts."
@@ -1322,6 +1334,12 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 			if isPgLSN(rightTyp) && (isNumericLike(leftTyp) || isUnknownType(leftTyp)) &&
 				x.Op == parser.OpAdd {
 				return catalog.Type{Name: "pg_lsn"}, nil
+			}
+			// interval ± interval → interval (interval_pl / interval_mi).
+			// Executor: addIntervalInterval in internal/executor/expr.go.
+			if strings.EqualFold(leftTyp.Name, "interval") && strings.EqualFold(rightTyp.Name, "interval") &&
+				(x.Op == parser.OpAdd || x.Op == parser.OpSub) {
+				return catalog.Type{Name: "interval"}, nil
 			}
 			if !isNumericLike(leftTyp) || !isNumericLike(rightTyp) {
 				return catalog.Type{}, analyzeError(x.Pos(), "42804", fmt.Sprintf("operator %s requires numeric operands", x.Op))

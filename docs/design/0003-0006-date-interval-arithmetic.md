@@ -362,6 +362,54 @@ true` — without the fix). Gates: `go build ./...` clean; `go test
 scripts/ralph-precommit-test.sh` PASS (0 failed transactions, all 3
 workloads).
 
+## Follow-up: `timestamp − timestamp → interval` + sub-day carrier (2026-07-11)
+
+The original scope deferred `timestamp − timestamp` (upstream returns an
+interval) "until the type system", along with sub-day interval units. This
+follow-up landed the **subtraction + sub-day storage** half without the
+sub-day *literal* parser work:
+
+- **Carrier.** `KindInterval` now packs the sub-day microsecond field in the
+  previously-reserved `Datum.Hi` word (`IntervalMicrosValue()` /
+  `NewIntervalDatumFull(months, days, micros)`), mirroring upstream's
+  months/days/microseconds `Interval` struct. Month/day-only literals leave
+  `Hi = 0`, so every pre-existing caller is unaffected (purely additive).
+- **Output.** `formatInterval` was rewritten to mirror `EncodeInterval`
+  under the default `INTSTYLE_POSTGRES`
+  (`postgres/src/backend/utils/adt/datetime.c`), including the
+  `[-|+]HH:MM:SS[.ffffff]` time component (hours may exceed 24; fractional
+  seconds trimmed of trailing zeros; PG's per-field `is_before` sign quirk).
+  **Verified byte-for-byte against real PostgreSQL 18.3** — e.g. `2 days`,
+  `1 day 12:00:00`, `-1 days -12:00:00`, `-1 mons +02:00:00`, `25:00:00`,
+  `00:00:00.5`.
+- **Arithmetic.** `evalBinary` (`internal/executor/expr.go`) gained a
+  `KindTime − KindTime` branch → `subTimeTime` (microsecond delta justified
+  into whole 24h days, à la `timestamp_mi` + `interval_justify_hours`) and an
+  `interval ± interval` branch → `addIntervalInterval` (`interval_pl` /
+  `interval_mi`). `addTimeInterval` now also applies the micros component.
+- **Analyzer.** `timestamp/time/date` subtraction now types as `interval`
+  (was rejected `42725 "operator is not unique"`); `interval ± interval` types
+  as `interval` (was rejected `42804`). Addition of two temporal values is
+  still `42725`, matching PG.
+- **Ancillary micros plumbing.** interval comparison (`interval_cmp_value`
+  decomposition), sort/hash spill encode/decode, and the group-by key builder
+  were all extended to carry the microsecond field so a sub-day interval never
+  silently collapses when it flows through ORDER BY / GROUP BY / spill.
+
+**Still deferred** (see `deferral_ledger.md`): (1) sub-day interval *literal*
+syntax (`interval '2 hours'`) — a parser change across the Form 1 / Form 2
+unit switches plus `evalIntervalLit` / `parseIntervalCastString`; (2)
+`date − date → integer` — goopg models DATE internally as a timestamp and does
+not flag date literals, so `date − date` yields an `interval` ("9 days")
+rather than upstream `date_mi`'s `int4` day count.
+
+Tests: `internal/executor/interval_subday_test.go`
+(`TestFormatIntervalSubDay` unit + `TestTimestampSubtractionInterval` E2E).
+Gates: `go build ./...` / `go vet` clean; `go test ./internal/executor/...`
+`./internal/analyzer/...` PASS; `scripts/tpch-spotcheck.sh` PASS
+(Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh`
+PASS (0 failed transactions).
+
 ## Cross-references
 
 - TPC-H query bodies: HammerDB upstream

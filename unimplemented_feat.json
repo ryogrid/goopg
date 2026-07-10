@@ -160,7 +160,7 @@
    "feature": "Timestamp-timestamp interval arithmetic (subtracting timestamps produces intervals)",
    "task_id": null,
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "Out of scope (deferred): EXTRACT (its own grammar), timestamp-timestamp interval, sub-day units, multi-field intervals"
    ],
@@ -175,7 +175,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open 2026-07-07: internal/executor/expr.go:1359-1366 (evalBinary, OpAdd/OpSub case) still routes only KindTime+KindInterval through addTimeInterval; comment explicitly states 'timestamp - timestamp (returns interval upstream; scope-deferred until the type system)' — no KindTime-KindTime path exists anywhere in expr.go (only the unrelated equality helper at line 6495 compares KindTime==KindTime for `=`). timestamp1 - timestamp2 still falls through to the integer-arithmetic path and errors. No test exercises timestamp-timestamp interval subtraction."
+   "code_audit": "RESOLVED 2026-07-11: timestamp - timestamp now yields an interval. evalBinary (internal/executor/expr.go) gained a KindTime-KindTime OpSub branch -> subTimeTime, which computes the microsecond delta and justifies it into whole 24h days (mirrors timestamp_mi + interval_justify_hours); interval +/- interval -> addIntervalInterval was added alongside. The KindInterval carrier now packs sub-day microseconds in the reserved Hi word (Datum.IntervalMicrosValue / NewIntervalDatumFull, internal/executor/datum.go); formatInterval was rewritten to mirror EncodeInterval INTSTYLE_POSTGRES including the [-|+]HH:MM:SS[.ffffff] time component (verified byte-for-byte against real PostgreSQL 18.3). Analyzer (internal/analyzer/analyzer.go) now types timestamp/time/date subtraction as interval (was 42725 'operator is not unique') and interval +/- interval as interval. Spill/group-key/interval-compare paths extended to carry micros. Tests: internal/executor/interval_subday_test.go. Deferred (see deferral_ledger.md): sub-day interval *literal* syntax (item 'Sub-day interval units', a parser change) and date-date -> integer (goopg models DATE as timestamp, so date-date yields interval not upstream's int4 day count)."
   },
   {
    "feature": "Sub-day interval units (hours, minutes, seconds, milliseconds) for interval arithmetic",
@@ -196,7 +196,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open 2026-07-07: internal/parser/select.go:3009-3016 (Form 1, trailing-unit interval '<N>' <unit>) and :3089-3092 (splitEmbeddedInterval, Form 2 interval '<N> <unit>') both switch only on day/days, month/months, year/years — no hour/minute/second/millisecond/microsecond cases exist in internal/parser (grep for hour|minute|millisecond|microsecond in parser/*.go hits only a comment at expr.go:119-121 noting 'sub-second fields wait'). internal/executor's KindInterval carrier (datum.go:28-37) also only packs months+days, explicitly 'drops sub-day precision.' Both parser and storage layer remain day-granularity only."
+   "code_audit": "narrowed 2026-07-11: the STORAGE half is now DONE — the KindInterval carrier packs sub-day microseconds in the reserved Hi word (Datum.IntervalMicrosValue / NewIntervalDatumFull, internal/executor/datum.go) and formatInterval renders the HH:MM:SS[.ffffff] time component byte-for-byte vs PG 18.3 (populated today by timestamp - timestamp subtraction). Remaining OPEN = the PARSER half only: internal/parser/select.go (Form 1 trailing-unit interval '<N>' <unit> and splitEmbeddedInterval Form 2 interval '<N> <unit>') plus executor evalIntervalLit / parseIntervalCastString (internal/executor/expr.go) still switch only on day/days, month/months, year/years, so a sub-day interval *literal* like interval '2 hours' is not yet accepted. Multi-field intervals ('1 day 05:00:00') also remain deferred. Resume point: add hour/minute/second (+plural) cases to those four unit switches, converting to micros via NewIntervalDatumFull."
   },
   {
    "feature": "SASLprep string normalization, channel binding support, and scram_iterations GUC configuration for SCRAM-SHA-256.",

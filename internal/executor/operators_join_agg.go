@@ -3023,11 +3023,13 @@ func datumKey(d Datum) string {
 		b = strconv.AppendInt(b, d.TimeValue().UnixNano(), 10)
 		return string(b)
 	case KindInterval:
-		var buf [32]byte
+		var buf [48]byte
 		b := append(buf[:0], 'v', ':')
 		b = strconv.AppendInt(b, int64(d.IntervalMonthsValue()), 10)
 		b = append(b, ':')
 		b = strconv.AppendInt(b, int64(d.IntervalDaysValue()), 10)
+		b = append(b, ':')
+		b = strconv.AppendInt(b, d.IntervalMicrosValue(), 10)
 		return string(b)
 	}
 	return fmt.Sprintf("k:%d", d.Kind)

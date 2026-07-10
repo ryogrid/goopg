@@ -1389,6 +1389,19 @@ func evalBinary(op parser.OpCode, left, right Datum, pos int) (Datum, error) {
 		if op == parser.OpAdd && left.Kind == KindInterval && right.Kind == KindTime {
 			return addTimeInterval(right, left, false), nil
 		}
+		// timestamp − timestamp → interval; date − date → integer days.
+		// Mirrors upstream timestamp_mi / date_mi (timestamp.c / date.c):
+		// the microsecond difference is justified into whole 24h days
+		// (interval_justify_hours), while a pure date pair yields an int4
+		// day count instead of an interval.
+		if op == parser.OpSub && left.Kind == KindTime && right.Kind == KindTime {
+			return subTimeTime(left, right), nil
+		}
+		// interval ± interval → interval (component-wise), matching
+		// interval_pl / interval_mi.
+		if left.Kind == KindInterval && right.Kind == KindInterval {
+			return addIntervalInterval(left, right, op == parser.OpSub), nil
+		}
 		// NUMERIC ± NUMERIC, NUMERIC ± INT, INT ± NUMERIC: promote
 		// the int side to KindNumeric{scale=0} and reuse the same
 		// scale-aligning helpers.  Also try to parse string
@@ -1884,11 +1897,48 @@ func evalPOSIXRegex(s, pattern string, caseInsensitive bool) (bool, error) {
 func addTimeInterval(t, iv Datum, subtract bool) Datum {
 	months := int(iv.IntervalMonthsValue())
 	days := int(iv.IntervalDaysValue())
+	micros := iv.IntervalMicrosValue()
 	if subtract {
 		months = -months
 		days = -days
+		micros = -micros
 	}
-	return NewTimeDatum(t.TimeValue().AddDate(0, months, days))
+	res := t.TimeValue().AddDate(0, months, days)
+	if micros != 0 {
+		res = res.Add(time.Duration(micros) * time.Microsecond)
+	}
+	return NewTimeDatum(res)
+}
+
+// usecsPerDay is the microsecond count in a 24-hour day, used by the
+// interval time-component helpers below (matches USECS_PER_DAY upstream).
+const usecsPerDay = 24 * 60 * 60 * 1_000_000
+
+// subTimeTime implements `timestamp − timestamp` → interval, mirroring
+// upstream timestamp_mi: the microsecond delta is justified into whole 24h
+// days via interval_justify_hours. goopg represents DATE internally as a
+// timestamp, so date − date also flows through here and yields an interval
+// (e.g. "9 days") rather than upstream date_mi's integer day count — a
+// documented divergence deferred to the type system (deferral_ledger.md).
+func subTimeTime(left, right Datum) Datum {
+	diff := left.TimeValue().Sub(right.TimeValue()) // time.Duration (ns)
+	micros := int64(diff / time.Microsecond)
+	days := micros / usecsPerDay
+	micros -= days * usecsPerDay
+	return NewIntervalDatumFull(0, int32(days), micros)
+}
+
+// addIntervalInterval implements `interval ± interval`, combining the
+// month/day/microsecond fields independently (interval_pl / interval_mi).
+func addIntervalInterval(left, right Datum, subtract bool) Datum {
+	sign := int64(1)
+	if subtract {
+		sign = -1
+	}
+	months := int64(left.IntervalMonthsValue()) + sign*int64(right.IntervalMonthsValue())
+	days := int64(left.IntervalDaysValue()) + sign*int64(right.IntervalDaysValue())
+	micros := left.IntervalMicrosValue() + sign*right.IntervalMicrosValue()
+	return NewIntervalDatumFull(int32(months), int32(days), micros)
 }
 
 func arithmetic(op parser.OpCode, a, b int64, pos int) (Datum, error) {
@@ -2329,16 +2379,24 @@ func compareDatum(a, b Datum, pos int) (int, error) {
 		return 0, nil
 	case KindInterval:
 		// Mirrors PostgreSQL's interval_cmp_value (timestamp.c): months are
-		// widened to days at a fixed 30-day rate, then combined with the day
-		// field into a single linear day count. v0's interval has no
-		// sub-day/time component (always 0), so the microsecond widening
-		// upstream does on top of this is a no-op here. M0122-0004.
-		at := int64(a.IntervalMonthsValue())*30 + int64(a.IntervalDaysValue())
-		bt := int64(b.IntervalMonthsValue())*30 + int64(b.IntervalDaysValue())
+		// widened to days at a fixed 30-day rate and combined with the day
+		// field plus the whole-day part of the microsecond component into a
+		// single day count; the sub-day microsecond remainder breaks ties.
+		// Decomposing this way (rather than multiplying days back up to
+		// microseconds) keeps the comparison inside int64 for the ranges
+		// goopg produces. M0122-0004 / timestamp − timestamp subtraction.
+		aDays := int64(a.IntervalMonthsValue())*30 + int64(a.IntervalDaysValue()) + a.IntervalMicrosValue()/usecsPerDay
+		bDays := int64(b.IntervalMonthsValue())*30 + int64(b.IntervalDaysValue()) + b.IntervalMicrosValue()/usecsPerDay
+		aFrac := a.IntervalMicrosValue() % usecsPerDay
+		bFrac := b.IntervalMicrosValue() % usecsPerDay
 		switch {
-		case at < bt:
+		case aDays < bDays:
 			return -1, nil
-		case at > bt:
+		case aDays > bDays:
+			return 1, nil
+		case aFrac < bFrac:
+			return -1, nil
+		case aFrac > bFrac:
 			return 1, nil
 		}
 		return 0, nil

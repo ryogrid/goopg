@@ -190,6 +190,7 @@ func encodeDatum(d Datum, buf []byte) []byte {
 	case KindInterval:
 		buf = binary.LittleEndian.AppendUint32(buf, uint32(d.IntervalMonthsValue()))
 		buf = binary.LittleEndian.AppendUint32(buf, uint32(d.IntervalDaysValue()))
+		buf = binary.LittleEndian.AppendUint64(buf, uint64(d.IntervalMicrosValue()))
 	case KindNumeric:
 		// 2-byte int16 scale + length-prefixed signed-magnitude
 		// big.Int bytes (1 sign byte + magnitude). Per-query
@@ -260,12 +261,13 @@ func decodeDatum(data []byte) (Datum, int, error) {
 		n := int64(binary.LittleEndian.Uint64(data[pos:]))
 		return NewTimeDatum(time.Unix(0, n).UTC()), pos + 8, nil
 	case KindInterval:
-		if pos+8 > len(data) {
+		if pos+16 > len(data) {
 			return Datum{}, 0, fmt.Errorf("truncated interval at %d", pos)
 		}
 		months := int32(binary.LittleEndian.Uint32(data[pos:]))
 		days := int32(binary.LittleEndian.Uint32(data[pos+4:]))
-		return NewIntervalDatum(months, days), pos + 8, nil
+		micros := int64(binary.LittleEndian.Uint64(data[pos+8:]))
+		return NewIntervalDatumFull(months, days, micros), pos + 16, nil
 	case KindNumeric:
 		if pos+6 > len(data) {
 			return Datum{}, 0, fmt.Errorf("truncated numeric at %d", pos)
