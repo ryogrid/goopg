@@ -191,6 +191,57 @@ func canonicalIntervalUnit(w string) (string, bool) {
 	}
 }
 
+// parseYearMonthField decodes a SQL-standard "years-months" interval field
+// (`1-2` → 1 year 2 months), mirroring PostgreSQL's DecodeInterval DTK_NUMBER
+// hyphen branch (postgres/src/backend/utils/adt/datetime.c): a signed integer
+// year value, a hyphen, then a month count that must satisfy 0 ≤ months < 12,
+// with nothing trailing. The result is a whole-month value years*12 ± months
+// (PG sets type DTK_MONTH unconditionally, so the field contributes months
+// only — never days or micros). A leading `-` on the whole field flips the
+// sign of BOTH the year and the month component (PG: `if (*field[i] == '-')
+// val2 = -val2` on top of strtoi64's already-negative year), so
+// `-1-2` → -14 months. Returns ok=false when the token is not exactly
+// `<int>-<int>` with the month part in range — the caller then falls through
+// to plain magnitude parsing, matching PG's DTERR_BAD_FORMAT /
+// DTERR_FIELD_OVERFLOW rejection for `1-2-3` / `1-2x` / `1-12` / `1--2`.
+func parseYearMonthField(f string) (months int32, ok bool) {
+	if f == "" {
+		return 0, false
+	}
+	// A leading '+'/'-' is the year's sign, not the field separator; the
+	// separating hyphen is the first '-' AFTER that optional sign.
+	start := 0
+	if f[0] == '+' || f[0] == '-' {
+		start = 1
+	}
+	rel := strings.IndexByte(f[start:], '-')
+	if rel < 0 {
+		return 0, false // no separator → not a year-month field
+	}
+	sep := start + rel
+	year, err := strconv.ParseInt(f[:sep], 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	// The month part must be a bare non-negative integer < MONTHS_PER_YEAR
+	// with nothing trailing (Go's ParseInt requires the whole string to be a
+	// valid integer, reproducing PG's `*cp != '\0'` bad-format check for
+	// `1-2-3`, `1-2x`, `1-2.5`; the range check reproduces `val2 < 0 ||
+	// val2 >= MONTHS_PER_YEAR` for `1--2`, `1-12`, `1-13`).
+	mon, err := strconv.ParseInt(f[sep+1:], 10, 64)
+	if err != nil || mon < 0 || mon >= 12 {
+		return 0, false
+	}
+	if f[0] == '-' {
+		mon = -mon
+	}
+	total := year*12 + mon
+	if total > math.MaxInt32 || total < math.MinInt32 {
+		return 0, false
+	}
+	return int32(total), true
+}
+
 // parseIntervalTimeToken parses a `[+-]HH:MM[:SS[.ffffff]]` time word from a
 // multi-field interval body into a signed microsecond count. The sign, if
 // present, applies to the whole time component (PostgreSQL DecodeTime +
@@ -280,6 +331,15 @@ func ParseIntervalBody(body string) (months, days int32, micros int64, ok bool) 
 			}
 			micros += mu
 			secondsOccupied = true
+			consumedAny = true
+			continue
+		}
+		// SQL-standard year-month field (`1-2` → 1 year 2 months). A
+		// self-contained field that contributes months only (PostgreSQL's
+		// DTK_NUMBER hyphen branch, type DTK_MONTH); it consumes no following
+		// unit word and never occupies the SECOND slot.
+		if ym, isYM := parseYearMonthField(f); isYM {
+			months += ym
 			consumedAny = true
 			continue
 		}

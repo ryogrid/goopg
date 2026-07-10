@@ -374,6 +374,66 @@ func TestTrailingBareNumberDefaultsToSeconds(t *testing.T) {
 	}
 }
 
+// TestYearMonthHyphenIntervals covers the SQL-standard "years-months" hyphen
+// field (unimplemented_feat #5, year-month hyphen): a `<int>-<int>` token
+// decodes to years*12 ± months (PostgreSQL's DecodeInterval DTK_NUMBER hyphen
+// branch, type DTK_MONTH). A leading '-' flips both the year and month sign
+// (`-1-2` → -14 months). The field is self-contained — it contributes months
+// only and composes with other fields (`1-2 04:05:06`, `1-2 3` → trailing bare
+// seconds, `1 year 1-2` → YEAR+MONTH bits are distinct). Every `want` was
+// captured byte-for-byte from a real PostgreSQL 18.3 instance; both the
+// typed-literal and `::interval`/CAST sibling paths are exercised.
+func TestYearMonthHyphenIntervals(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+	if err := runDDL(t, ctx, "CREATE TABLE t (id int)"); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	if err := runDDL(t, ctx, "INSERT INTO t VALUES (1)"); err != nil {
+		t.Fatalf("INSERT: %v", err)
+	}
+	cases := []struct{ sql, want string }{
+		// Core year-month decompositions.
+		{"SELECT interval '1-2'", "1 year 2 mons"},
+		{"SELECT interval '0-5'", "5 mons"},
+		{"SELECT interval '2-0'", "2 years"},
+		{"SELECT interval '100-11'", "100 years 11 mons"},
+		{"SELECT interval '10-6'", "10 years 6 mons"},
+		{"SELECT interval '1-11'", "1 year 11 mons"},
+		{"SELECT interval '0-0'", "00:00:00"},
+		// Signs: a leading '-' flips BOTH the year and the month component;
+		// '+' is accepted and ignored (PG prints -N as plural "years").
+		{"SELECT interval '-1-2'", "-1 years -2 mons"},
+		{"SELECT interval '-1-0'", "-1 years"},
+		{"SELECT interval '-0-5'", "-5 mons"},
+		{"SELECT interval '+1-2'", "1 year 2 mons"},
+		// Composed with other fields. A year-month field contributes months
+		// only, so it never occupies the SECOND slot: a trailing bare number
+		// still defaults to seconds.
+		{"SELECT interval '1-2 3 days'", "1 year 2 mons 3 days"},
+		{"SELECT interval '3 days 1-2'", "1 year 2 mons 3 days"},
+		{"SELECT interval '1-2 3'", "1 year 2 mons 00:00:03"},
+		{"SELECT interval '1-2 04:05:06'", "1 year 2 mons 04:05:06"},
+		// A YEAR field sets a distinct field-mask bit from the year-month
+		// field's MONTH bit, so both compose (`1 year` + 14 months).
+		{"SELECT interval '1 year 1-2'", "2 years 2 mons"},
+		// Cast / :: forms share the same tokenizer.
+		{"SELECT '1-2'::interval", "1 year 2 mons"},
+		{"SELECT CAST('100-11' AS interval)", "100 years 11 mons"},
+		// Equality across an equivalent decomposition.
+		{"SELECT (interval '1-2' = interval '1 year 2 months')::text", "true"},
+	}
+	for _, c := range cases {
+		rows := runQuery(t, ctx, c.sql+" FROM t")
+		if len(rows) != 1 || len(rows[0]) != 1 {
+			t.Fatalf("%s: expected 1x1 result, got %v", c.sql, rows)
+		}
+		if got := rows[0][0].Format(); got != c.want {
+			t.Errorf("%s = %q, want %q", c.sql, got, c.want)
+		}
+	}
+}
+
 // TestParseIntervalBodySingleFieldMatchesUnitToParts guards the sibling-path
 // invariant that the multi-field tokenizer (parser.ParseIntervalBody) and the
 // per-field spill helper (parser.IntervalUnitToParts, used by the single-field

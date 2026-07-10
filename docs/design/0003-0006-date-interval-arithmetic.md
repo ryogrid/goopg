@@ -685,6 +685,52 @@ Gates: `go build`/`go vet` clean; executor/analyzer/planner/parser suites PASS;
 `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke via pre-commit
 hook.
 
+## Follow-up: SQL year-month hyphen field (unimplemented_feat #5, 2026-07-11)
+
+Closes the prior row's deferred year-month item: the **SQL-standard
+"years-months" hyphen field** now parses — `interval '1-2'` → `1 year 2 mons`,
+`interval '100-11'` → `100 years 11 mons`, `interval '0-5'` → `5 mons`. A
+`<int>-<int>` token decodes to `years*12 ± months`, mirroring PostgreSQL's
+`DecodeInterval` `DTK_NUMBER` hyphen branch
+(`postgres/src/backend/utils/adt/datetime.c`): `val = strtoi64(field)`, then on
+seeing a `-`, `val2 = strtoint(cp+1)` with `type = DTK_MONTH` unconditionally, so
+the field contributes **months only** (never days/micros) regardless of the
+typmod default. A leading `-` on the whole field flips the sign of *both*
+components (`-1-2` → `-14` months = `-1 years -2 mons`), reproducing PG's
+`if (*field[i] == '-') val2 = -val2` layered on strtoi64's already-negative year.
+
+Confined to the shared tokenizer: a new pure helper `parser.parseYearMonthField`
+is consulted inside `ParseIntervalBody`'s field loop *before* plain-magnitude
+parsing, so both sibling entry points (the parser's Form-2 typed-literal path and
+the executor's `::interval` / CAST path) gain it at once — no `select.go` or
+executor edit. The month part is bounded `0 ≤ m < 12` with nothing trailing
+(Go's `ParseInt` requiring a whole-string integer reproduces PG's `*cp != '\0'`
+bad-format check and `val2 < 0 || val2 >= MONTHS_PER_YEAR` range check): `1-12`,
+`1-13`, `1--2`, `1-2-3`, `1-2x` all error (22007). Because a year-month field
+sets only the MONTH contribution and never the SECOND slot, it composes cleanly
+with everything else, including a *trailing* bare number that still defaults to
+seconds (`interval '1-2 3'` → `1 year 2 mons 00:00:03`) and a distinct-bit YEAR
+field (`interval '1 year 1-2'` → `2 years 2 mons`).
+
+**Still deferred** (see `deferral_ledger.md`): (d-ii) single-letter unit forms
+(`w`/`c`/`h`/`m`/`s`/`d`/`y`, positionally ambiguous `m`); (d-iii) full interval
+typmod grammar (`HOUR TO MINUTE` ranges, `SECOND(p)` precision) including the
+Form-1 trailing-word column-alias fall-through; and the **field-mask collision
+cases goopg does not model** — PG rejects a repeated MONTH bit (`1-2 3 mons`,
+`1 mon 2 mons`) which goopg silently sums, and PG accepts three tokenizer
+quirks goopg rejects (`1-2.5` → `1 year 2 mons 0.5s`, `1-` → `1 year`, and a
+trailing lone unit word as a leftward type hint `1-2 days` → `1 year 2 mons`).
+Modelling these needs a full `fmask`/`tmask` field-collision port, a distinct
+feature from this bounded additive field.
+
+Every `want` captured byte-for-byte from a real PostgreSQL 18.3 instance. Tests:
+`internal/executor/interval_subday_test.go` `TestYearMonthHyphenIntervals`
+(accept + compose cases, both sibling paths) plus five new bound/format error
+cases in `internal/executor/interval_cast_test.go`
+`TestIntervalCastFromStringInvalidSyntax`. Gates: `go build`/`go vet` clean;
+executor/analyzer/planner/parser suites PASS; `scripts/tpch-spotcheck.sh` PASS
+(Q12=2/Q13=33); pgbench smoke via pre-commit hook.
+
 ## Cross-references
 
 - TPC-H query bodies: HammerDB upstream

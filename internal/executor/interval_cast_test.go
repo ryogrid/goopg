@@ -111,6 +111,13 @@ func TestIntervalCastFromStringInvalidSyntax(t *testing.T) {
 		"SELECT '1 2 days'::interval FROM t",
 		"SELECT '1 day 05:00:00 5'::interval FROM t",
 		"SELECT '5 5'::interval FROM t",
+		// Year-month hyphen field bounds (PG DecodeInterval DTK_NUMBER hyphen
+		// branch): the month part must be 0 ≤ m < 12 with nothing trailing.
+		"SELECT '1-12'::interval FROM t",  // month == MONTHS_PER_YEAR (out of range)
+		"SELECT '1-13'::interval FROM t",  // month > MONTHS_PER_YEAR
+		"SELECT '1--2'::interval FROM t",  // negative month part
+		"SELECT '1-2-3'::interval FROM t", // trailing "-3" after the month part
+		"SELECT '1-2x'::interval FROM t",  // trailing non-digit after the month part
 	}
 	for _, sql := range cases {
 		t.Run(sql, func(t *testing.T) {
