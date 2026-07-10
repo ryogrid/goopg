@@ -8607,6 +8607,41 @@ mirroring M0119's ledger `status` column.
       PASS (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke bash
       scripts/ralph-precommit-test.sh` PASS (0 failed transactions, all 3
       workloads).
+- [x] **M0122-0022 — COLLATE/USING in `ALTER TYPE … ALTER ATTRIBUTE` —
+      verified stale, closed** (`unimplemented_feat.json` task `M0110-0001`,
+      deferred 2026-06-20). The entry claimed "COLLATE and USING clauses …
+      are accepted by the parser but their effects are ignored during
+      execution." Both halves turned out to be already correct or moot: (1)
+      COLLATE is fully wired — the parser captures it into
+      `AlterAttrCollation` (`internal/parser/ddl.go:9733`), and BOTH executor
+      paths (single-subcommand `execAlterType`,
+      `internal/executor/operators_ddl.go:18776`; multi-subcommand
+      `execAlterTypeAttrCmds`, `operators_ddl.go:18990` — sibling paths, both
+      checked per `pattern_sibling_paths_must_agree`) copy it onto the
+      composite type's field, from where
+      `buildUserPGAttributeRowForCompositeField`
+      (`internal/executor/pg18_user_catalog_rows.go`) writes it into
+      `pg_attribute.attcollation` so `pg_dump`'s `dumpCompositeType`
+      re-emits the `COLLATE` clause. (2) USING is not even part of this
+      statement's real PG grammar — confirmed against
+      `postgres/src/backend/parser/gram.y`'s production `ALTER ATTRIBUTE
+      ColId opt_set_data TYPE_P Typename opt_collate_clause
+      opt_drop_behavior` (only `COLLATE` and `CASCADE|RESTRICT`; `USING` is
+      exclusive to `ALTER TABLE … ALTER COLUMN TYPE`), so the entry's USING
+      claim was inapplicable to begin with. Added new regression coverage
+      (previously untested despite being wired): `TestAlterTypeAlterAttributeCollateApplied`
+      (`internal/executor/alter_type_attribute_collate_test.go`) — covers
+      the single-subcommand form, the multi-subcommand form, and the
+      COLLATE-reset-on-retype-without-COLLATE case. `unimplemented_feat.json`'s
+      matching entry flipped `open`→`resolved` via surgical 2-line `Edit`
+      (83/181 resolved, 98 open). No design-doc change needed (parser/DDL
+      behavior already covered by existing composite-type design docs).
+      Gates: `go build ./...`/`go vet ./...` clean; `go test
+      ./internal/executor/... -run TestAlterTypeAlterAttributeCollateApplied`
+      PASS; `go test ./internal/executor/... -run
+      'TestAlterType|TestComposite'` PASS; `scripts/tpch-spotcheck.sh` PASS;
+      `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh`
+      PASS.
 
 > This task list is **seeded, not exhaustive.** The M0122-0001 triage plus every
 > future feature deferral appended to `unimplemented_feat.json` (any new `open`

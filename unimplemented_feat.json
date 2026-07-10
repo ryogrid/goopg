@@ -3248,7 +3248,7 @@
    "feature": "COLLATE and USING clauses in ALTER TYPE … ALTER ATTRIBUTE are accepted by the parser but their effects are ignored during execution",
    "task_id": "M0110-0001",
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "COLLATE/USING accepted but ignored"
    ],
@@ -3263,7 +3263,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/parser/ddl.go:8432 USING stub-consumed in ALTER TYPE"
+   "code_audit": "resolved 2026-07-10 (M0122-0022): COLLATE is applied, not ignored — parser captures it into AlterAttrCollation (internal/parser/ddl.go:9733), and both executor paths copy it onto the composite field (single-subcommand execAlterType, internal/executor/operators_ddl.go:18776; multi-subcommand execAlterTypeAttrCmds, operators_ddl.go:18990), from where buildUserPGAttributeRowForCompositeField (pg18_user_catalog_rows.go) writes attcollation for pg_dump round-trip. USING is not part of this statement's real PG grammar at all (postgres/src/backend/parser/gram.y: `ALTER ATTRIBUTE ColId opt_set_data TYPE_P Typename opt_collate_clause opt_drop_behavior` — only COLLATE and CASCADE|RESTRICT), so there is nothing to \"ignore\" for it; the original entry's USING claim was inapplicable. Verified end-to-end (both single- and multi-subcommand forms, plus the COLLATE-reset-on-retype case) by new test TestAlterTypeAlterAttributeCollateApplied (internal/executor/alter_type_attribute_collate_test.go)."
   },
   {
    "feature": "Write-Ahead Logging (WAL) for MultiXact operations, enabling creation, modification, and deletion of MultiXact records to be logged and recovered after crashes.",
