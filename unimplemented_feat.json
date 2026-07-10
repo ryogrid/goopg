@@ -2878,7 +2878,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/executor/expr.go:7663 pg_get_expr passes through pre-formatted strings only"
+   "code_audit": "narrowed 2026-07-10: pg_get_expr pass-through is architecturally correct for goopg (all populated pg_node_tree columns adbin/conbin/relpartbound store pre-formatted deparsed SQL text, not serialized node trees). Fixed the live pg_index renderer catalog.InMemory.PGIndexRowsForDBOid, which hardcoded indexprs/indpred to \"\" (a non-NULL empty string for a text column) instead of VirtualNull/PredicateString, diverging from the heap-row twin buildUserPGIndexRow and breaking indpred IS NOT NULL + pg_get_expr(indpred,indrelid) on partial indexes. Remaining open: expression-index indexprs is never populated (Index.ColExprs not surfaced into pg_index.indexprs), so pg_get_expr(indexprs,indrelid) on an expression index still yields NULL — see deferral_ledger.md"
   },
   {
    "feature": "MVCC/attribute tier of verify_heapam (multi-version visibility and per-column consistency checks) remains deferred beyond Tier 1 page-structure checks.",

@@ -7771,6 +7771,37 @@ mirroring M0119's ledger `status` column.
       index/type catalog rows + sys-btree bootstrap (independent of
       TEMPLATE copy); `pg_statistic_ext`/`information_schema.routines`
       registry redesign.
+  - [x] `unimplemented_feat #135 (pg_get_expr)` (2026-07-10, this loop) —
+      **fixed the live `pg_index.indpred`/`indexprs` NULL-sentinel bug and
+      narrowed the entry.** `catalog.InMemory.PGIndexRowsForDBOid`
+      (`internal/catalog/catalog.go`) hardcoded `indexprs`/`indpred`/
+      `indcoloptions` to `""` — for a `text` column that reads back as a
+      non-NULL empty string, not SQL NULL. This diverged from the executor
+      heap-row twin `buildUserPGIndexRow`
+      (`internal/executor/pg18_user_catalog_rows.go`, already correct) and
+      broke two live-SQL behaviors: `indpred IS NOT NULL` (the canonical
+      partial-index probe tools use) matched EVERY index, and
+      `pg_get_expr(indpred, indrelid)` returned `''` instead of the WHERE
+      predicate on a partial index (and `''` instead of NULL on a plain one).
+      Now emits `VirtualNull` for non-partial `indpred`, `idx.PredicateString`
+      for partial, and `VirtualNull` for `indexprs`/`indcoloptions`, mirroring
+      the heap twin exactly (sibling-path sync). Also established that
+      pg_get_expr's pass-through is architecturally correct for goopg — every
+      populated pg_node_tree column (adbin/conbin/relpartbound) stores
+      pre-formatted deparsed SQL text, not a serialized node tree, so no
+      reconstruction is needed. New E2E regression tests
+      `TestPgIndexIndpredPartialVsPlain` (through `pg_get_expr`) +
+      `TestPgIndexRowsIndprIndexprsNullSentinel` (direct row-cell guard)
+      in `internal/executor/pg_index_indpred_test.go`; `code_audit` narrowed
+      in `unimplemented_feat.json`; deferral-ledger row appended for the one
+      remaining open slice (expression-index `indexprs` never populated from
+      `Index.ColExprs` — no client path other than a direct
+      `pg_get_expr(indexprs)` reads it; psql \d / pg_dump use
+      `pg_get_indexdef`). Gates: `go build ./...`/`go vet` clean; `go test
+      ./internal/catalog/... ./internal/executor/...` PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh` PASS
+      (0 failed, all 3 workloads).
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,

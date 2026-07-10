@@ -6375,6 +6375,21 @@ func (c *InMemory) PGIndexRowsForDBOid(dbOid uint32) [][]string {
 			indoptionParts[i] = fmt.Sprintf("%d", bits)
 		}
 		indoption := strings.Join(indoptionParts, " ")
+		// indpred: a partial index's WHERE predicate rendered as SQL text
+		// (goopg stores pg_node_tree columns as plain SQL, mirroring the
+		// executor heap-row twin buildUserPGIndexRow in
+		// internal/executor/pg18_user_catalog_rows.go). It reads back via
+		// pg_get_expr, which is a pass-through. Must be VirtualNull (→ SQL NULL)
+		// when the index is not partial: a plain "" here read as a non-NULL
+		// empty string, so `SELECT indpred FROM pg_index` and
+		// `pg_get_expr(indpred, indrelid)` returned '' instead of NULL, and
+		// `indpred IS NOT NULL` matched every index. indexprs/indcoloptions are
+		// always NULL in this path (no expression-index support — Index.Columns
+		// holds only plain column names).
+		indpred := VirtualNull
+		if idx.HasPredicate {
+			indpred = idx.PredicateString
+		}
 		out = append(out, []string{
 			fmt.Sprintf("%d", idx.OID),       // indexrelid
 			fmt.Sprintf("%d", idx.Table.OID), // indrelid
@@ -6395,9 +6410,9 @@ func (c *InMemory) PGIndexRowsForDBOid(dbOid uint32) [][]string {
 			indcollation,                     // indcollation
 			indclass,                         // indclass
 			indoption,                        // indoption
-			"",                               // indexprs (NULL)
-			"",                               // indpred (NULL)
-			"",                               // indcoloptions (NULL)
+			VirtualNull,                      // indexprs (NULL — no expression indexes)
+			indpred,                          // indpred (WHERE text for partial, else NULL)
+			VirtualNull,                      // indcoloptions (NULL)
 		})
 	}
 	// Synthesize the unique btree index PG auto-creates on every TOAST
@@ -6431,9 +6446,9 @@ func (c *InMemory) PGIndexRowsForDBOid(dbOid uint32) [][]string {
 			"0 0",                          // indcollation (int4 columns: no collation)
 			"1978 1978",                    // indclass (int4_ops btree)
 			"0 0",                          // indoption
-			"",                             // indexprs (NULL)
-			"",                             // indpred (NULL)
-			"",                             // indcoloptions (NULL)
+			VirtualNull,                    // indexprs (NULL — TOAST index is never expression/partial)
+			VirtualNull,                    // indpred (NULL)
+			VirtualNull,                    // indcoloptions (NULL)
 		})
 	}
 	return out
