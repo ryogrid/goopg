@@ -106,6 +106,13 @@ func IntervalUnitToParts(val int64, fval float64, unit string) (months, days int
 	switch unit {
 	case "day":
 		return 0, int32(val), intervalFractMicros(fval, usecsPerDay), true
+	case "week":
+		// AdjustDays(val,7) + AdjustFractDays(fval,7): whole days then the
+		// leftover fraction spills to micros (postgres DecodeInterval DTK_WEEK).
+		f := fval * 7
+		extraDays := int64(f)
+		f -= float64(extraDays)
+		return 0, int32(val*7 + extraDays), intervalFractMicros(f, usecsPerDay), true
 	case "month":
 		// AdjustFractDays(fval, DAYS_PER_MONTH): whole days then remainder → micros.
 		f := fval * 30
@@ -116,6 +123,18 @@ func IntervalUnitToParts(val int64, fval float64, unit string) (months, days int
 		// AdjustFractYears discards any sub-month remainder (round-half-to-even).
 		extraMonths := int64(math.RoundToEven(fval * 12))
 		return int32(val*12 + extraMonths), 0, 0, true
+	case "decade":
+		// AdjustYears(val,10)+AdjustFractYears(fval,10): 1 decade = 120 months.
+		extraMonths := int64(math.RoundToEven(fval * 10 * 12))
+		return int32(val*120 + extraMonths), 0, 0, true
+	case "century":
+		// AdjustYears(val,100)+AdjustFractYears(fval,100): 1 century = 1200 months.
+		extraMonths := int64(math.RoundToEven(fval * 100 * 12))
+		return int32(val*1200 + extraMonths), 0, 0, true
+	case "millennium":
+		// AdjustYears(val,1000)+AdjustFractYears(fval,1000): 1 mil = 12000 months.
+		extraMonths := int64(math.RoundToEven(fval * 1000 * 12))
+		return int32(val*12000 + extraMonths), 0, 0, true
 	case "hour":
 		return 0, 0, val*usecsPerHour + intervalFractMicros(fval, usecsPerHour), true
 	case "minute":
@@ -124,6 +143,9 @@ func IntervalUnitToParts(val int64, fval float64, unit string) (months, days int
 		return 0, 0, val*usecsPerSecond + intervalFractMicros(fval, usecsPerSecond), true
 	case "millisecond":
 		return 0, 0, val*usecsPerMilli + intervalFractMicros(fval, usecsPerMilli), true
+	case "microsecond":
+		// AdjustMicroseconds(val,fval,1): sub-microsecond fraction is discarded.
+		return 0, 0, val + intervalFractMicros(fval, 1), true
 	default:
 		return 0, 0, 0, false
 	}
@@ -134,13 +156,24 @@ func IntervalUnitToParts(val int64, fval float64, unit string) (months, days int
 // unit words the single-field literal grammar already supports plus the
 // abbreviations PostgreSQL's intervalout emits (`mon`/`mons`, `min`/`mins`,
 // `sec`/`secs`, `hr`/`hrs`) so goopg can re-parse its own interval output.
-// week/decade/century and single-letter forms remain out of scope (deferred).
+// It also accepts the week/decade/century/millennium/microsecond units and
+// their `dec`/`cent`/`mil`/`us`/`usec` abbreviations (unimplemented_feat
+// #5(c); microsecond fractions below 1µs are discarded); single-letter
+// forms (`w`/`c`) remain out of scope (deferred, d-ii positional ambiguity).
 func canonicalIntervalUnit(w string) (string, bool) {
 	switch strings.ToLower(w) {
 	case "year", "years", "yr", "yrs":
 		return "year", true
 	case "month", "months", "mon", "mons":
 		return "month", true
+	case "week", "weeks":
+		return "week", true
+	case "decade", "decades", "dec", "decs":
+		return "decade", true
+	case "century", "centuries", "cent":
+		return "century", true
+	case "millennium", "millennia", "mil", "mils":
+		return "millennium", true
 	case "day", "days":
 		return "day", true
 	case "hour", "hours", "hr", "hrs":
@@ -151,6 +184,8 @@ func canonicalIntervalUnit(w string) (string, bool) {
 		return "second", true
 	case "millisecond", "milliseconds", "ms", "msec", "msecs":
 		return "millisecond", true
+	case "microsecond", "microseconds", "us", "usec", "usecs", "usecond", "useconds":
+		return "microsecond", true
 	default:
 		return "", false
 	}

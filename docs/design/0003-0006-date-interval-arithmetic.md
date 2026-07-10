@@ -558,6 +558,49 @@ every `<magnitude> <unit>`). Gates: `go build`/`go vet` clean;
 executor/parser/planner/analyzer suites PASS; `scripts/tpch-spotcheck.sh` PASS
 (Q12=2/Q13=33); pgbench smoke via pre-commit hook.
 
+## Follow-up: coarse interval units week/decade/century/millennium/microsecond (unimplemented_feat #5(c), 2026-07-11)
+
+Closes the prior row's deferred item (c): the coarse interval units **week,
+decade, century, millennium, and microsecond** (plus the `dec`/`cent`/`mil`/
+`us`/`usec` abbreviations) now parse end-to-end in interval bodies —
+`interval '3 weeks'` → `21 days`, `interval '1 century'` → `100 years`,
+`interval '500000 microseconds'` → `00:00:00.5`, and multi-field mixes like
+`interval '1 century 2 weeks 04:05:06'` → `100 years 14 days 04:05:06`.
+
+The change is confined to the two pure helpers in `internal/parser/interval.go`
+that already own interval-body decoding — no new parser path and no
+`select.go`/executor edit:
+
+- `canonicalIntervalUnit` gains the new spellings.
+- `IntervalUnitToParts` gains the scale/spill cases, mirroring PG's
+  `DecodeInterval` (`postgres/src/backend/utils/adt/datetime.c`):
+  week = `AdjustDays(val,7)` + `AdjustFractDays(fval,7)` (whole days then the
+  leftover fraction spills to micros); decade/century/millennium =
+  `AdjustYears(val,10|100|1000)` + `AdjustFractYears` (→ 120/1200/12000 months,
+  fractional years rounded half-to-even into months); microsecond =
+  `AdjustMicroseconds(val,fval,1)` (sub-µs fraction discarded).
+
+Because these units are **not** SQL interval typmod qualifiers, PG parses a
+trailing `WEEK`/`DECADE`/… token as a *column alias* over a bare `interval '3'`
+(= 3 seconds), not a typmod field — so `select.go`'s Form-1 trailing-unit switch
+is deliberately left untouched (it would otherwise mis-handle the alias case,
+which is blocked on the bare-number default-unit item d-i anyway). The units
+reach `IntervalUnitToParts` only via the embedded / `::interval` cast bodies
+routed through `ParseIntervalBody`.
+
+**Still deferred** (see `deferral_ledger.md`): (d-i) bare-number default-unit
+(`interval '5'` → seconds); (d-ii) single-letter unit forms (`w`/`c`/`h`/`m`/
+`s`/`d`/`y`, positionally-ambiguous `m`); (d-iii) full interval typmod grammar
+(`HOUR TO MINUTE` ranges, `SECOND(p)` precision).
+
+Every `want` captured byte-for-byte from a real PostgreSQL 18.3 instance. Tests:
+`internal/executor/interval_subday_test.go` `TestWeekDecadeCenturyIntervals`
+(embedded, multi-field, abbreviations, cast forms) plus new coarse-unit rows in
+the sibling-path guard `TestParseIntervalBodySingleFieldMatchesUnitToParts`.
+Gates: `go build`/`go vet` clean; executor/parser suites PASS;
+`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke via pre-commit
+hook.
+
 ## Cross-references
 
 - TPC-H query bodies: HammerDB upstream

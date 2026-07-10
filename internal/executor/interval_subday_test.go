@@ -268,6 +268,61 @@ func TestMultiFieldIntervalLiterals(t *testing.T) {
 	}
 }
 
+// TestWeekDecadeCenturyIntervals covers the coarse interval units week /
+// decade / century / millennium and their dec/cent/mil abbreviations
+// (unimplemented_feat #5(c)). PG parses these only inside the interval body
+// (`interval '3 weeks'`) — as a trailing token they are a column alias, not a
+// typmod qualifier — so only the embedded / cast forms are exercised. Every
+// `want` was captured from PostgreSQL 18.3 (intervalout): weeks scale to days,
+// decade/century/millennium scale to months (1/10/100/1000 years).
+func TestWeekDecadeCenturyIntervals(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+	if err := runDDL(t, ctx, "CREATE TABLE t (id int)"); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	if err := runDDL(t, ctx, "INSERT INTO t VALUES (1)"); err != nil {
+		t.Fatalf("INSERT: %v", err)
+	}
+	cases := []struct{ sql, want string }{
+		{"SELECT interval '3 weeks'", "21 days"},
+		{"SELECT interval '2 decades'", "20 years"},
+		{"SELECT interval '1 century'", "100 years"},
+		{"SELECT interval '1 millennium'", "1000 years"},
+		// Fractional coarse units spill exactly as AdjustFractDays/Years do.
+		{"SELECT interval '1.5 weeks'", "10 days 12:00:00"},
+		{"SELECT interval '1.5 decades'", "15 years"},
+		{"SELECT interval '0.5 century'", "50 years"},
+		// Multi-field bodies mix coarse units with each other and with a time.
+		{"SELECT interval '2 centuries 5 decades'", "250 years"},
+		{"SELECT interval '1 millennium 1 century'", "1100 years"},
+		{"SELECT interval '1 year 2 weeks 3 days'", "1 year 17 days"},
+		{"SELECT interval '1 century 2 weeks 04:05:06'", "100 years 14 days 04:05:06"},
+		// Abbreviations dec / cent / mil.
+		{"SELECT interval '3 dec'", "30 years"},
+		{"SELECT interval '2 cent'", "200 years"},
+		{"SELECT interval '5 mil'", "5000 years"},
+		// Microsecond unit + abbreviations (fractions below 1µs discarded).
+		{"SELECT interval '500000 microseconds'", "00:00:00.5"},
+		{"SELECT interval '1500000 us'", "00:00:01.5"},
+		{"SELECT interval '250 usec'", "00:00:00.00025"},
+		{"SELECT interval '3 weeks 2 days 06:00:00'", "23 days 06:00:00"},
+		// Cast / :: form shares the same tokenizer.
+		{"SELECT '2 weeks'::interval", "14 days"},
+		{"SELECT CAST('3 decades' AS interval)", "30 years"},
+		{"SELECT '1000 microseconds'::interval", "00:00:00.001"},
+	}
+	for _, c := range cases {
+		rows := runQuery(t, ctx, c.sql+" FROM t")
+		if len(rows) != 1 || len(rows[0]) != 1 {
+			t.Fatalf("%s: expected 1x1 result, got %v", c.sql, rows)
+		}
+		if got := rows[0][0].Format(); got != c.want {
+			t.Errorf("%s = %q, want %q", c.sql, got, c.want)
+		}
+	}
+}
+
 // TestParseIntervalBodySingleFieldMatchesUnitToParts guards the sibling-path
 // invariant that the multi-field tokenizer (parser.ParseIntervalBody) and the
 // per-field spill helper (parser.IntervalUnitToParts, used by the single-field
@@ -278,6 +333,8 @@ func TestParseIntervalBodySingleFieldMatchesUnitToParts(t *testing.T) {
 		{"90", "day"}, {"-3", "hour"}, {"1.5", "hour"}, {"1.5", "month"},
 		{"1.5", "year"}, {"0.5", "second"}, {"2", "minute"}, {"500", "millisecond"},
 		{"1.15", "month"}, {"-1.9", "year"},
+		{"3", "week"}, {"1.5", "week"}, {"2", "decade"}, {"0.5", "century"},
+		{"1", "millennium"}, {"-1.5", "decade"},
 	}
 	for _, f := range fields {
 		val, fval, ok := parser.ParseIntervalMagnitude(f.mag)
