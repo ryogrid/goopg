@@ -77,3 +77,62 @@ func TestExclusionConstraintPartialWhereRoundTrip(t *testing.T) {
 		t.Errorf("buildConstraintDefString = %q, want %q", got, want)
 	}
 }
+
+// TestExclusionConstraintGistOverlapFires verifies that an EXCLUDE USING gist
+// (col WITH &&) constraint on a box column raises 23P01 when an overlapping
+// box is inserted. checkGistOverlapExclusion (operators_storage.go) is the
+// runtime enforcement path this exercises.
+func TestExclusionConstraintGistOverlapFires(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE boxes (b box, EXCLUDE USING gist (b WITH &&))`); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	if err := runDDL(t, ctx, `INSERT INTO boxes VALUES ('(2,2),(0,0)')`); err != nil {
+		t.Fatalf("first INSERT: %v", err)
+	}
+	// Non-overlapping box: must succeed.
+	if err := runDDL(t, ctx, `INSERT INTO boxes VALUES ('(10,10),(8,8)')`); err != nil {
+		t.Fatalf("non-overlapping INSERT should succeed: %v", err)
+	}
+	// Overlapping box: must raise 23P01.
+	err := runDDL(t, ctx, `INSERT INTO boxes VALUES ('(3,3),(1,1)')`)
+	if err == nil {
+		t.Fatal("overlapping box INSERT should have failed with exclusion violation; got nil")
+	}
+	ee, ok := err.(*ExecError)
+	if !ok {
+		t.Fatalf("want *ExecError, got %T: %v", err, err)
+	}
+	if ee.Code != "23P01" {
+		t.Errorf("Code=%q want 23P01", ee.Code)
+	}
+}
+
+// TestExclusionConstraintGistOverlapRejectsUnsupportedType verifies that an
+// EXCLUDE USING gist (col WITH &&) constraint on a non-box column is rejected
+// at DDL time (42704, mirroring PostgreSQL's "data type ... has no default
+// operator class for access method" error) rather than being silently
+// accepted and then never enforced — checkGistOverlapExclusion only
+// understands box values, so accepting any other type here would create a
+// constraint whose overlap check silently fails closed on every INSERT.
+func TestExclusionConstraintGistOverlapRejectsUnsupportedType(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	err := runDDL(t, ctx, `CREATE TABLE ints (i int, EXCLUDE USING gist (i WITH &&))`)
+	if err == nil {
+		t.Fatal("EXCLUDE USING gist (i WITH &&) on an int column should have been rejected; got nil")
+	}
+	ee, ok := err.(*ExecError)
+	if !ok {
+		t.Fatalf("want *ExecError, got %T: %v", err, err)
+	}
+	if ee.Code != "42704" {
+		t.Errorf("Code=%q want 42704", ee.Code)
+	}
+	if !strings.Contains(ee.Message, "no default operator class") {
+		t.Errorf("Message=%q should mention 'no default operator class'", ee.Message)
+	}
+}

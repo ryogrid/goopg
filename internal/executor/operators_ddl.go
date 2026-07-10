@@ -9876,13 +9876,38 @@ func applyExclusionPredicate(idx *catalog.Index, pred parser.Expr) {
 }
 
 // createExclusionIndexStub registers an EXCLUDE USING constraint in the catalog
-// without type-validation or B-tree building. Exclusion semantics are not
+// without B-tree building (exclusion semantics beyond "=" and "&&" are not
 // enforced in v0; the stub exists so pg_constraint and pg_index queries return
-// correct rows. M0097-0023.
+// correct rows). It DOES type-validate "&&" exclusions: checkGistOverlapExclusion
+// (operators_storage.go) is the only runtime enforcement path for a non-"="
+// operator, and it understands "box" values exclusively. Accepting "&&" on any
+// other type here would create a constraint that is silently NEVER enforced at
+// INSERT time (checkGistOverlapExclusion's box parse just fails closed) — a
+// worse trap than rejecting it up front. Mirrors PostgreSQL's real DDL-time
+// rejection (ERRCODE_UNDEFINED_OBJECT, indexcmds.c ResolveOpClass) when a type
+// has no operator class for the requested access method. M0097-0023, M0122-0023.
 func (o *ddlOp) createExclusionIndexStub(pos int, idxName parser.ObjectName, tbl *catalog.Table, ec parser.TableConstraintDef) error {
 	im, ok := o.ctx.Catalog.(*catalog.InMemory)
 	if !ok {
 		return nil // unsupported catalog — silently skip
+	}
+	if ec.ExclusionOp == "&&" {
+		for _, colName := range ec.Columns {
+			col, ok2 := o.ctx.Catalog.LookupColumn(tbl, colName)
+			if !ok2 || col.Type.Name == "box" {
+				continue
+			}
+			method := ec.Method
+			if method == "" {
+				method = "btree"
+			}
+			return &ExecError{
+				Code: "42704",
+				Pos:  pos,
+				Message: fmt.Sprintf("data type %s has no default operator class for access method %q",
+					col.Type.Name, method),
+			}
+		}
 	}
 	idx, err := im.CreateIndex(idxName, tbl, ec.Columns, false, "btree", false, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 	if err != nil {

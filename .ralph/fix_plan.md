@@ -8642,6 +8642,47 @@ mirroring M0119's ledger `status` column.
       'TestAlterType|TestComposite'` PASS; `scripts/tpch-spotcheck.sh` PASS;
       `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh`
       PASS.
+- [x] **M0122-0023 — `EXCLUDE USING` GiST-overlap type-validation bypass —
+      re-scoped and closed** (`unimplemented_feat.json`, deferred
+      2026-06-08). The entry claimed `createExclusionIndexStub` bypasses
+      btree type-validation for box/point columns. Investigation found the
+      `EXCLUDE USING btree (col WITH =)` case was ALREADY fully
+      type-validated (it routes through `createBTreeIndex`, which enforces
+      `isSupportedBTreeKeyType`) — that half was stale. The real, still-open
+      gap was narrower: `EXCLUDE USING gist (col WITH &&)` accepted ANY
+      column type with zero validation, but `checkGistOverlapExclusion`
+      (`internal/executor/operators_storage.go:7257`) — the only runtime
+      enforcement path for `&&` — exclusively understands `box` values;
+      confirmed via a throwaway probe test that a non-box `&&` exclusion
+      constraint is accepted at DDL time and then NEVER fires at INSERT time
+      (silently fails closed, not even an error). Also confirmed via the
+      same probe (after fixing a wrong box-literal test format — PG's real
+      box I/O format is `(x1,y1),(x2,y2)`, no outer parens) that the box/box
+      overlap enforcement path itself works correctly and was previously
+      completely untested. Fix: `createExclusionIndexStub`
+      (`internal/executor/operators_ddl.go:9882`) now rejects `&&` on a
+      non-box column at DDL time with `42704` ("data type %s has no default
+      operator class for access method %q"), mirroring PostgreSQL's real
+      `indexcmds.c` `ResolveOpClass` rejection — verified against
+      `postgres/src/backend/commands/indexcmds.c:2272-2277`. Added
+      `TestExclusionConstraintGistOverlapFires` (box/box overlap positive
+      case, non-overlapping negative case) and
+      `TestExclusionConstraintGistOverlapRejectsUnsupportedType`
+      (`internal/executor/exclusion_constraint_test.go`).
+      `unimplemented_feat.json`'s matching entry flipped `open`→`resolved`
+      via surgical `Edit` (84/181 resolved, 97 open). Remaining scope (real
+      GiST access method, point/circle/polygon overlap types, general
+      opclass resolution for other operators) is out of bounds for a single
+      loop and stays tracked under `unimplemented_feat.json` #118 (GIST
+      index support). No design-doc change needed — the exclusion-constraint
+      behavior is already covered by `docs/design/0119-0004-partial-exclude-where-roundtrip.md`;
+      this is an enforcement-path bugfix, not a new mechanism. Gates: `go
+      build ./...`/`go vet ./...` clean; `go test ./internal/executor/...
+      -run TestExclusionConstraint` PASS (4/4); `go test
+      ./internal/executor/...` (full package) PASS; `scripts/tpch-spotcheck.sh`
+      PASS (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke bash
+      scripts/ralph-precommit-test.sh` PASS (0 failed transactions, all 3
+      workloads).
 
 > This task list is **seeded, not exhaustive.** The M0122-0001 triage plus every
 > future feature deferral appended to `unimplemented_feat.json` (any new `open`

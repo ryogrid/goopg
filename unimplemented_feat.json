@@ -3651,7 +3651,7 @@
    "feature": "EXCLUDE USING constraints bypass btree type validation for non-compatible types (box, point); stored as catalog-only without enforcing physical index.",
    "task_id": null,
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "createExclusionIndexStub bypasses btree type-validation (box/point columns not btree-compatible); catalog-entry-only"
    ],
@@ -3666,7 +3666,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "medium",
-   "code_audit": "unclear: EXCLUDE USING btree validation bypass logic not found in constraint enforcement"
+   "code_audit": "RESOLVED (M0122-0023, 2026-07-10): re-scoped and closed the real gap. The btree \"=\" case was already fully type-validated (createExclusionIndexStub routes it through createBTreeIndex, which enforces isSupportedBTreeKeyType) before this loop. The genuine bypass was the \"&&\" (GiST overlap) case: checkExclusionConstraintsForInsert/checkGistOverlapExclusion (operators_storage.go:7212-7328) only understands box literals, but createExclusionIndexStub accepted \"&&\" on ANY column type with zero validation, so a non-box column silently got a constraint that could never actually fire (parseBoxText fails closed, no error, no enforcement, ever). createExclusionIndexStub now rejects \"&&\" on a non-box column at DDL time with 42704 \"data type %s has no default operator class for access method %q\", mirroring PostgreSQL's real indexcmds.c ResolveOpClass rejection. Regression coverage added in internal/executor/exclusion_constraint_test.go (TestExclusionConstraintGistOverlapFires, TestExclusionConstraintGistOverlapRejectsUnsupportedType) — the box/box overlap enforcement path itself was previously completely untested despite existing since 2026-06-08. Remaining scope (real GiST access method, point/circle/polygon overlap types, opclass resolution beyond box) is out of bounds for this loop and tracked separately (unimplemented_feat.json #118 GIST index support)."
   },
   {
    "feature": "Duplicate-source error handling in merge cross-partition routing is not fully implemented.",
