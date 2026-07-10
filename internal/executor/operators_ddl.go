@@ -15228,12 +15228,14 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 			// Remove the dump-visible registry entry (DU-002 slice 377).
 			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok && len(s.Names) >= 2 {
 				user, server := s.Names[0].String(), s.Names[1].String()
-				if im.DropUserMapping(user, server) {
+				dbOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
+				if im.DropUserMapping(user, server, dbOid) {
 					// M0122-0007 user-mapping registry restart-durability
 					// follow-up: persist the drop so it survives a restart,
-					// mirroring DROP SERVER.
+					// mirroring DROP SERVER. dbOid scoping: M0122-0007 4e
+					// follow-up 37.
 					if o.ctx.WAL != nil {
-						if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropUserMapping(user, server)); werr != nil {
+						if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropUserMapping(user, server, dbOid)); werr != nil {
 							return fmt.Errorf("wal drop-user-mapping: %w", werr)
 						}
 					}
@@ -15877,8 +15879,11 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		// pg_dump query the (previously missing) pg_user_mappings view and abort.
 		// Options threads the OPTIONS (...) clause so umoptions round-trips
 		// (pg_user_mappings.umoptions → dumpUserMappings). DU-002 slice 377
-		// (options: slice 379).
-		um := im.RegisterUserMapping(s.ObjName.String(), s.TableName.String(), s.Options)
+		// (options: slice 379). Keyed by the connection's own dbOid
+		// (M0122-0007 4e follow-up 37) so a same-named (user, server) pair in
+		// a distinct database no longer collides.
+		umDBOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
+		um := im.RegisterUserMapping(s.ObjName.String(), s.TableName.String(), s.Options, umDBOid)
 		// M0122-0007 user-mapping registry restart-durability follow-up:
 		// persist the mapping so it survives a restart. goopg's user-mapping
 		// registry has no backing heap relation, so record a WAL event the
@@ -15887,7 +15892,7 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		// SERVER). The OID just assigned/refreshed by RegisterUserMapping is
 		// carried so recovery restores the same identity.
 		if o.ctx.WAL != nil {
-			if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateUserMapping(um.UmUser, um.SrvName, um.Options, um.OID)); werr != nil {
+			if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateUserMapping(um.UmUser, um.SrvName, um.Options, um.OID, um.DBOid)); werr != nil {
 				return fmt.Errorf("wal create-user-mapping: %w", werr)
 			}
 		}

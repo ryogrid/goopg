@@ -3693,8 +3693,11 @@ func DecodeDropForeignServer(payload []byte) (name string, dbOid uint32, err err
 // EncodeCreateUserMapping encodes a CREATE USER MAPPING event (M0122-0007
 // user-mapping registry restart-durability follow-up). Format: kind(1) |
 // oid(4) | userLen(2)+user | serverLen(2)+server | optionsCount(2) |
-// (optLen(2)+opt)*.
-func EncodeCreateUserMapping(user, server string, options []string, oid uint32) []byte {
+// (optLen(2)+opt)* | dbOid(4). dbOid is a trailing-appended field (M0122-0007
+// 4e follow-up 37, mirroring EncodeCreateForeignServer's dbOid trailer) so a
+// pre-follow-up-37 payload still decodes: DecodeCreateUserMapping returns
+// dbOid 0 (DefaultDBOid via NamespaceDBOid) when the trailer is absent.
+func EncodeCreateUserMapping(user, server string, options []string, oid uint32, dbOid uint32) []byte {
 	clip := func(s string) string {
 		if len(s) > 0xFFFF {
 			return s[:0xFFFF]
@@ -3712,6 +3715,7 @@ func EncodeCreateUserMapping(user, server string, options []string, oid uint32) 
 		}
 		size += 2 + len(opt)
 	}
+	size += 4 // trailing dbOid
 	out := make([]byte, 1+size)
 	out[0] = RecordKindCreateUserMapping
 	binary.LittleEndian.PutUint32(out[1:5], oid)
@@ -3732,16 +3736,20 @@ func EncodeCreateUserMapping(user, server string, options []string, oid uint32) 
 		}
 		writeStr(opt)
 	}
+	binary.LittleEndian.PutUint32(out[off:off+4], dbOid)
+	off += 4
 	return out[:off]
 }
 
 // DecodeCreateUserMapping decodes a RecordKindCreateUserMapping payload.
-func DecodeCreateUserMapping(payload []byte) (user, server string, options []string, oid uint32, err error) {
+// dbOid is 0 (DefaultDBOid via NamespaceDBOid) for a pre-follow-up-37
+// payload that predates the trailing dbOid field.
+func DecodeCreateUserMapping(payload []byte) (user, server string, options []string, oid uint32, dbOid uint32, err error) {
 	if len(payload) < 5 {
-		return "", "", nil, 0, fmt.Errorf("wal: create-user-mapping payload too short (%d bytes)", len(payload))
+		return "", "", nil, 0, 0, fmt.Errorf("wal: create-user-mapping payload too short (%d bytes)", len(payload))
 	}
 	if payload[0] != RecordKindCreateUserMapping {
-		return "", "", nil, 0, fmt.Errorf("wal: record kind %d is not create-user-mapping", payload[0])
+		return "", "", nil, 0, 0, fmt.Errorf("wal: record kind %d is not create-user-mapping", payload[0])
 	}
 	oid = binary.LittleEndian.Uint32(payload[1:5])
 	off := 5
@@ -3759,13 +3767,13 @@ func DecodeCreateUserMapping(payload []byte) (user, server string, options []str
 		return s, nil
 	}
 	if user, err = readStr(); err != nil {
-		return "", "", nil, 0, err
+		return "", "", nil, 0, 0, err
 	}
 	if server, err = readStr(); err != nil {
-		return "", "", nil, 0, err
+		return "", "", nil, 0, 0, err
 	}
 	if len(payload) < off+2 {
-		return "", "", nil, 0, fmt.Errorf("wal: create-user-mapping payload truncated at options count (offset %d)", off)
+		return "", "", nil, 0, 0, fmt.Errorf("wal: create-user-mapping payload truncated at options count (offset %d)", off)
 	}
 	optCount := int(binary.LittleEndian.Uint16(payload[off : off+2]))
 	off += 2
@@ -3774,55 +3782,69 @@ func DecodeCreateUserMapping(payload []byte) (user, server string, options []str
 		for i := 0; i < optCount; i++ {
 			opt, oerr := readStr()
 			if oerr != nil {
-				return "", "", nil, 0, oerr
+				return "", "", nil, 0, 0, oerr
 			}
 			options = append(options, opt)
 		}
 	}
-	return user, server, options, oid, nil
+	if len(payload) >= off+4 {
+		dbOid = binary.LittleEndian.Uint32(payload[off : off+4])
+	}
+	return user, server, options, oid, dbOid, nil
 }
 
 // EncodeDropUserMapping encodes a DROP USER MAPPING event. Format: kind(1) |
-// userLen(2)+user | serverLen(2)+server.
-func EncodeDropUserMapping(user, server string) []byte {
+// userLen(2)+user | serverLen(2)+server | dbOid(4). dbOid is a
+// trailing-appended field (M0122-0007 4e follow-up 37, mirroring
+// EncodeDropForeignServer's dbOid trailer).
+func EncodeDropUserMapping(user, server string, dbOid uint32) []byte {
 	if len(user) > 0xFFFF {
 		user = user[:0xFFFF]
 	}
 	if len(server) > 0xFFFF {
 		server = server[:0xFFFF]
 	}
-	out := make([]byte, 5+len(user)+len(server))
+	out := make([]byte, 5+len(user)+len(server)+4)
 	out[0] = RecordKindDropUserMapping
 	binary.LittleEndian.PutUint16(out[1:3], uint16(len(user)))
 	copy(out[3:3+len(user)], user)
 	off := 3 + len(user)
 	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(server)))
 	off += 2
-	copy(out[off:], server)
-	return out
+	copy(out[off:off+len(server)], server)
+	off += len(server)
+	binary.LittleEndian.PutUint32(out[off:off+4], dbOid)
+	off += 4
+	return out[:off]
 }
 
-// DecodeDropUserMapping decodes a RecordKindDropUserMapping payload.
-func DecodeDropUserMapping(payload []byte) (user, server string, err error) {
+// DecodeDropUserMapping decodes a RecordKindDropUserMapping payload. dbOid
+// is 0 (DefaultDBOid via NamespaceDBOid) for a pre-follow-up-37 payload that
+// predates the trailing dbOid field.
+func DecodeDropUserMapping(payload []byte) (user, server string, dbOid uint32, err error) {
 	if len(payload) < 3 {
-		return "", "", fmt.Errorf("wal: drop-user-mapping payload too short (%d bytes)", len(payload))
+		return "", "", 0, fmt.Errorf("wal: drop-user-mapping payload too short (%d bytes)", len(payload))
 	}
 	if payload[0] != RecordKindDropUserMapping {
-		return "", "", fmt.Errorf("wal: record kind %d is not drop-user-mapping", payload[0])
+		return "", "", 0, fmt.Errorf("wal: record kind %d is not drop-user-mapping", payload[0])
 	}
 	userLen := int(binary.LittleEndian.Uint16(payload[1:3]))
 	if len(payload) < 3+userLen+2 {
-		return "", "", fmt.Errorf("wal: drop-user-mapping payload truncated (need %d bytes)", 3+userLen+2)
+		return "", "", 0, fmt.Errorf("wal: drop-user-mapping payload truncated (need %d bytes)", 3+userLen+2)
 	}
 	user = string(payload[3 : 3+userLen])
 	off := 3 + userLen
 	serverLen := int(binary.LittleEndian.Uint16(payload[off : off+2]))
 	off += 2
 	if len(payload) < off+serverLen {
-		return "", "", fmt.Errorf("wal: drop-user-mapping payload truncated (need %d bytes)", off+serverLen)
+		return "", "", 0, fmt.Errorf("wal: drop-user-mapping payload truncated (need %d bytes)", off+serverLen)
 	}
 	server = string(payload[off : off+serverLen])
-	return user, server, nil
+	off += serverLen
+	if len(payload) >= off+4 {
+		dbOid = binary.LittleEndian.Uint32(payload[off : off+4])
+	}
+	return user, server, dbOid, nil
 }
 
 // EncodeCreateTransform encodes a CREATE TRANSFORM event (M0119-0004 restart

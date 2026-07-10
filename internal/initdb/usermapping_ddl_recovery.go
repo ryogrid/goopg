@@ -27,8 +27,8 @@ import (
 // userMappingRegistryRecovery is the catalog-side surface this recovery pass
 // needs. `*catalog.InMemory` satisfies it.
 type userMappingRegistryRecovery interface {
-	RegisterUserMappingDuringRecovery(user, server string, options []string, oid uint32)
-	UnregisterUserMappingDuringRecovery(user, server string)
+	RegisterUserMappingDuringRecovery(user, server string, options []string, oid uint32, dbOid ...uint32)
+	UnregisterUserMappingDuringRecovery(user, server string, dbOid ...uint32)
 }
 
 // replayUserMappingDDLRecords reads every WAL record under walDir and
@@ -67,17 +67,17 @@ func replayUserMappingDDLRecords(walDir string, cat catalog.Catalog) error {
 		}
 		switch rec.Payload[0] {
 		case wal.RecordKindCreateUserMapping:
-			user, server, options, oid, derr := wal.DecodeCreateUserMapping(rec.Payload)
+			user, server, options, oid, dbOid, derr := wal.DecodeCreateUserMapping(rec.Payload)
 			if derr != nil {
 				return fmt.Errorf("decode create-user-mapping at lsn %d: %w", rec.StartLSN, derr)
 			}
-			reg.RegisterUserMappingDuringRecovery(user, server, options, oid)
+			reg.RegisterUserMappingDuringRecovery(user, server, options, oid, catalog.NamespaceDBOid(dbOid))
 		case wal.RecordKindDropUserMapping:
-			user, server, derr := wal.DecodeDropUserMapping(rec.Payload)
+			user, server, dbOid, derr := wal.DecodeDropUserMapping(rec.Payload)
 			if derr != nil {
 				return fmt.Errorf("decode drop-user-mapping at lsn %d: %w", rec.StartLSN, derr)
 			}
-			reg.UnregisterUserMappingDuringRecovery(user, server)
+			reg.UnregisterUserMappingDuringRecovery(user, server, catalog.NamespaceDBOid(dbOid))
 		}
 	}
 	return nil

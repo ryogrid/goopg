@@ -920,6 +920,63 @@ func TestPgForeignServerRowsScopedToConnectionDBOid(t *testing.T) {
 	}
 }
 
+// TestPgUserMappingsRowsScopedToConnectionDBOid mirrors
+// TestPgForeignServerRowsScopedToConnectionDBOid above for the
+// pg_user_mappings catalog table (M0122-0007 4e follow-up 37): a same-named
+// (user, server) CREATE USER MAPPING under one dbOid must not leak into, or
+// collide with, another dbOid's pg_user_mappings rows.
+func TestPgUserMappingsRowsScopedToConnectionDBOid(t *testing.T) {
+	const otherDBOid = 7018
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+
+	ctx.CurrentDatabaseOid = catalog.DefaultDBOid
+	if err := runDDL(t, ctx, "CREATE SERVER um_srv FOREIGN DATA WRAPPER goopg_fdw"); err != nil {
+		t.Fatalf("CREATE SERVER um_srv (DefaultDBOid): %v", err)
+	}
+	if err := runDDL(t, ctx, "CREATE USER MAPPING FOR um_user SERVER um_srv"); err != nil {
+		t.Fatalf("CREATE USER MAPPING (DefaultDBOid): %v", err)
+	}
+	ctx.CurrentDatabaseOid = otherDBOid
+	if err := runDDL(t, ctx, "CREATE SERVER um_srv FOREIGN DATA WRAPPER goopg_fdw"); err != nil {
+		t.Fatalf("CREATE SERVER um_srv (otherDBOid): %v", err)
+	}
+	if err := runDDL(t, ctx, "CREATE USER MAPPING FOR um_user SERVER um_srv"); err != nil {
+		t.Fatalf("CREATE USER MAPPING (otherDBOid): %v", err)
+	}
+
+	im, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		t.Fatalf("ctx.Catalog is %T, want *catalog.InMemory", ctx.Catalog)
+	}
+
+	defaultList := im.ListUserMappings(catalog.DefaultDBOid)
+	otherList := im.ListUserMappings(otherDBOid)
+	if len(defaultList) != 1 || len(otherList) != 1 {
+		t.Fatalf("ListUserMappings: default=%+v other=%+v, want exactly 1 entry each", defaultList, otherList)
+	}
+	defaultOID, otherOID := defaultList[0].OID, otherList[0].OID
+	if defaultOID == 0 || otherOID == 0 || defaultOID == otherOID {
+		t.Fatalf("user mapping OIDs: default=%d other=%d, want distinct non-zero OIDs", defaultOID, otherOID)
+	}
+
+	defaultRows := im.PGUserMappingsRowsForDBOid(catalog.DefaultDBOid)
+	if !pgForeignTableRowsContainFtrelid(defaultRows, defaultOID) {
+		t.Fatal("DefaultDBOid's pg_user_mappings rows are missing its own mapping")
+	}
+	if pgForeignTableRowsContainFtrelid(defaultRows, otherOID) {
+		t.Fatal("DefaultDBOid's pg_user_mappings rows include otherDBOid's mapping")
+	}
+
+	otherRows := im.PGUserMappingsRowsForDBOid(otherDBOid)
+	if !pgForeignTableRowsContainFtrelid(otherRows, otherOID) {
+		t.Fatal("otherDBOid's pg_user_mappings rows are missing its own mapping")
+	}
+	if pgForeignTableRowsContainFtrelid(otherRows, defaultOID) {
+		t.Fatal("otherDBOid's pg_user_mappings rows include DefaultDBOid's mapping")
+	}
+}
+
 // TestRegclassCastScopedToConnectionDBOid covers the oid::regclass /
 // 'name'::regclass cast (both in internal/executor/expr.go's CastExpr arm),
 // which previously resolved every lookup against DefaultDBOid regardless of

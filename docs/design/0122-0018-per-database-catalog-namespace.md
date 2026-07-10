@@ -1,6 +1,6 @@
 # Per-database catalog namespace (M0122-0007 slice 4)
 
-Status: accepted (sub-slices 4a, 4b-i, 4b-ii, 4c, 4d-i, 4d-ii-part-1, and 4d-ii-part-2a landed; 4d-ii-part-2b items 1, 2, and 3 all fully landed; 4e's FK-target-resolution, sequence-ownership, and view-constraint-dependency items all landed; `CREATE DATABASE ... TEMPLATE` bounded validation landed 2026-07-10; the pg_class-under-fresh-database gap (name resolution generically, row enumeration for pg_class specifically) landed 2026-07-10, and the pg_indexes/pg_tables, pg_constraint, pg_index, pg_attrdef/pg_depend, pg_inherits, pg_policy, pg_trigger, pg_rewrite, pg_foreign_table, and pg_sequence row-content follow-ups landed the same day, plus the `oid::regclass`/`'name'::regclass` cast-direction dbOid-scoping gap (follow-up 33) — 2 sibling virtual-table builders (pg_statistic_ext, information_schema.routines/parameters/routine_*_usage) plus pg_sequences/information_schema.sequences (follow-up 34's narrowed remainder) plus the c.foreignServers registry-dbOid-key gap plus the real relation-copy mechanism remain planned, see "Remaining 4e work" below)
+Status: accepted (sub-slices 4a, 4b-i, 4b-ii, 4c, 4d-i, 4d-ii-part-1, and 4d-ii-part-2a landed; 4d-ii-part-2b items 1, 2, and 3 all fully landed; 4e's FK-target-resolution, sequence-ownership, and view-constraint-dependency items all landed; `CREATE DATABASE ... TEMPLATE` bounded validation landed 2026-07-10; the pg_class-under-fresh-database gap (name resolution generically, row enumeration for pg_class specifically) landed 2026-07-10, and the pg_indexes/pg_tables, pg_constraint, pg_index, pg_attrdef/pg_depend, pg_inherits, pg_policy, pg_trigger, pg_rewrite, pg_foreign_table, and pg_sequence row-content follow-ups landed the same day, plus the `oid::regclass`/`'name'::regclass` cast-direction dbOid-scoping gap (follow-up 33) — 2 sibling virtual-table builders (pg_statistic_ext, information_schema.routines/parameters/routine_*_usage) plus pg_sequences/information_schema.sequences (follow-up 34's narrowed remainder) plus the c.foreignServers registry-dbOid-key gap (follow-up 36, landed) and its same-shape c.userMappings sibling (follow-up 37, landed 2026-07-10) plus the real relation-copy mechanism remain planned, see "Remaining 4e work" below)
 Date: 2026-07-10
 Supersedes: none — extends the "Still open" note in
 `0122-0017-database-ddl-drop-guards.md` and the deferral-ledger rows dated
@@ -1484,6 +1484,59 @@ row:** `pg_user_mappings`/`UserMapping` (same-shape sibling, its own future
 loop), `internal/server/grant_ddl.go`'s `GRANT/REVOKE ... ON FOREIGN SERVER`
 (still resolves against `DefaultDBOid` only — not a regression, matches
 pre-follow-up-36 behavior), and the FDW registry itself.
+
+**User-mapping registry dbOid scoping — LANDED (2026-07-10, follow-up 37).**
+The same-shape sibling follow-up 36 named as its own future loop.
+`catalog.UserMapping` (`internal/catalog/catalog.go`) gained a `DBOid uint32`
+field; the `c.userMappings` registry re-keyed from
+`strings.ToLower(user)+"\x00"+strings.ToLower(server)` to
+`"<dbOid>:"+strings.ToLower(user)+"\x00"+strings.ToLower(server)`
+(`userMappingKey`, mirroring `foreignServerKey`'s `"<dbOid>:<name>"` prefix
+while keeping the pre-existing case-insensitive, NUL-separated (user,
+server) part unchanged) so a same-named `CREATE USER MAPPING` (user, server)
+pair in two distinct databases no longer collides (the pre-fix bare-key
+silently collapsed them onto one entry, last-writer-wins).
+`RegisterUserMapping`/`DropUserMapping`/`ListUserMappings` and their
+`*DuringRecovery` counterparts gained a trailing `dbOid ...uint32`
+parameter, exactly mirroring follow-up 36's `RegisterForeignServer` shape.
+`EncodeCreateUserMapping`/`DecodeCreateUserMapping` and
+`EncodeDropUserMapping`/`DecodeDropUserMapping` (`internal/wal/recovery.go`)
+each gained a trailing-appended `dbOid` field, following
+`EncodeCreateForeignServer`'s backward-compatible-trailer pattern exactly (a
+pre-follow-up-37 WAL payload decodes with `dbOid=0`, translated through
+`catalog.NamespaceDBOid` at the `internal/initdb/usermapping_ddl_recovery.go`
+replay call site). New `catalog.InMemory.PGUserMappingsRowsForDBOid`
+extracted from `pg_user_mappings.VirtualRows` (mirrors
+`PGForeignServerRowsForDBOid`); inside it, the `srvid` column now resolves
+via `c.ForeignServerOID(m.SrvName, dbOid)` instead of the bare-name call, so
+a mapping in database B resolves its `srvid` against database B's own
+`pg_foreign_server` registry, not database A's. A new
+`executor.Context.PgUserMappingsRows` field is wired the same way as every
+other 4e per-connection row-lister (`internal/server/dispatch.go`'s
+`pgUserMappingsRowLister` interface + wiring next to
+`pgForeignServerRowLister`), and a `pg_user_mappings` branch was added to
+`internal/executor/operators.go` next to the `pg_foreign_server` one. CREATE
+USER MAPPING's and DROP USER MAPPING's call sites in
+`internal/executor/operators_ddl.go` now thread
+`catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)` through to the registry
+calls and the WAL-encode calls. Live end-to-end verified against a real
+`cmd/goopg` + `psql`: two `CREATE DATABASE`s each `CREATE SERVER srv ...`
+plus `CREATE USER MAPPING FOR postgres SERVER srv` with a distinct
+`OPTIONS (label ...)`; each database's `pg_user_mappings` shows exactly its
+own row (and no other database's); `DROP USER MAPPING` in one leaves the
+other's same-named mapping intact; both facts (plus the surrounding
+databases themselves) survive a restart. **Deliberately still un-dbOid'd
+(deferred, see the 2026-07-10 follow-up-37 deferral ledger row):**
+`internal/server/grant_ddl.go` has no `GRANT/REVOKE ... ON USER MAPPING`
+support at all (PostgreSQL itself has no such grantable privilege on user
+mappings, so this is not a gap); the parser's `scanUserMappingForServer`
+(`internal/parser/ddl.go`) stores `CURRENT_USER`/`CURRENT_ROLE`/
+`SESSION_USER`/`USER` verbatim as the literal string rather than resolving
+to the connecting role's actual name (a pre-existing, explicitly-documented
+simplification, confirmed still present by this loop's live E2E check:
+`CREATE USER MAPPING FOR CURRENT_USER SERVER ...` renders `usename =
+'current_user'` in `pg_user_mappings`, not the resolved role name) — unrelated
+to dbOid scoping, orthogonal follow-up.
 
 ## Recommended order and stopping points
 

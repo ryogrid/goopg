@@ -9311,29 +9311,7 @@ func (c *InMemory) registerSystemTables() {
 	// with no options it emits the bare `CREATE USER MAPPING FOR <usename> SERVER
 	// <srv>;`. DU-002 slice 377 (options: slice 379).
 	pgUserMappings.VirtualRows = func() [][]string {
-		mappings := c.ListUserMappings()
-		if len(mappings) == 0 {
-			return nil
-		}
-		out := make([][]string, 0, len(mappings))
-		for _, m := range mappings {
-			usename := m.UmUser
-			umuser := uint32(0) // ACL_ID_PUBLIC
-			if usename == "" || strings.EqualFold(usename, "public") {
-				usename = "public"
-			} else if oid, ok := c.RoleOID(m.UmUser); ok {
-				umuser = oid
-			}
-			out = append(out, []string{
-				strconv.FormatUint(uint64(m.OID), 10),                         // umid
-				strconv.FormatUint(uint64(c.ForeignServerOID(m.SrvName)), 10), // srvid
-				m.SrvName,                              // srvname
-				strconv.FormatUint(uint64(umuser), 10), // umuser
-				usename,                                // usename
-				optionsArrayLiteral(m.Options),         // umoptions text[] ("{name=value,…}" or "" for NULL)
-			})
-		}
-		return out
+		return c.PGUserMappingsRowsForDBOid(DefaultDBOid)
 	}
 	c.ns(DefaultDBOid).tables["pg_catalog.pg_user_mappings"] = pgUserMappings
 
@@ -15634,27 +15612,65 @@ func (c *InMemory) PGForeignServerRowsForDBOid(dbOid uint32) [][]string {
 }
 
 // RegisterUserMappingDuringRecovery restores a user mapping with its
-// original OID during WAL replay (M0122-0007 user-mapping restart-durability
-// follow-up). Mirrors RegisterForeignServerDuringRecovery.
-func (c *InMemory) RegisterUserMappingDuringRecovery(user, server string, options []string, oid uint32) {
+// original OID under dbOid (variadic, defaults to DefaultDBOid) during WAL
+// replay (M0122-0007 user-mapping restart-durability follow-up). Mirrors
+// RegisterForeignServerDuringRecovery. dbOid scoping: M0122-0007 4e
+// follow-up 37.
+func (c *InMemory) RegisterUserMappingDuringRecovery(user, server string, options []string, oid uint32, dbOid ...uint32) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.userMappings == nil {
 		c.userMappings = make(map[string]*UserMapping)
 	}
-	c.userMappings[userMappingKey(user, server)] = &UserMapping{OID: oid, UmUser: user, SrvName: server, Options: options}
+	dboid := resolveDBOid(dbOid)
+	c.userMappings[userMappingKey(dboid, user, server)] = &UserMapping{OID: oid, UmUser: user, SrvName: server, Options: options, DBOid: dboid}
 	if oid >= c.nextOID {
 		c.nextOID = oid + 1
 	}
 }
 
-// UnregisterUserMappingDuringRecovery removes a user mapping during WAL
-// replay of a DROP USER MAPPING record. Mirrors
-// UnregisterForeignServerDuringRecovery.
-func (c *InMemory) UnregisterUserMappingDuringRecovery(user, server string) {
+// UnregisterUserMappingDuringRecovery removes a user mapping from dbOid's
+// registry (variadic, defaults to DefaultDBOid) during WAL replay of a DROP
+// USER MAPPING record. Mirrors UnregisterForeignServerDuringRecovery. dbOid
+// scoping: M0122-0007 4e follow-up 37.
+func (c *InMemory) UnregisterUserMappingDuringRecovery(user, server string, dbOid ...uint32) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	delete(c.userMappings, userMappingKey(user, server))
+	delete(c.userMappings, userMappingKey(resolveDBOid(dbOid), user, server))
+}
+
+// PGUserMappingsRowsForDBOid builds the pg_user_mappings catalog row-set for
+// dbOid's own registered user mappings (mirrors PGForeignServerRowsForDBOid's
+// per-connection dbOid scoping). registerSystemTables's VirtualRows closure
+// calls this with DefaultDBOid so every existing caller (server dispatch
+// without a per-connection PgUserMappingsRows wire-up, every test) sees
+// byte-identical behavior; a per-connection dbOid is wired in via
+// executor.Context.PgUserMappingsRows (internal/server/dispatch.go's
+// wireExtensionRows). M0122-0007 4e follow-up 37.
+func (c *InMemory) PGUserMappingsRowsForDBOid(dbOid uint32) [][]string {
+	mappings := c.ListUserMappings(dbOid)
+	if len(mappings) == 0 {
+		return nil
+	}
+	out := make([][]string, 0, len(mappings))
+	for _, m := range mappings {
+		usename := m.UmUser
+		umuser := uint32(0) // ACL_ID_PUBLIC
+		if usename == "" || strings.EqualFold(usename, "public") {
+			usename = "public"
+		} else if oid, ok := c.RoleOID(m.UmUser); ok {
+			umuser = oid
+		}
+		out = append(out, []string{
+			strconv.FormatUint(uint64(m.OID), 10),                                  // umid
+			strconv.FormatUint(uint64(c.ForeignServerOID(m.SrvName, dbOid)), 10), // srvid
+			m.SrvName,                              // srvname
+			strconv.FormatUint(uint64(umuser), 10), // umuser
+			usename,                                // usename
+			optionsArrayLiteral(m.Options),         // umoptions text[] ("{name=value,…}" or "" for NULL)
+		})
+	}
+	return out
 }
 
 // Cast is a user-defined cast (CREATE CAST (source AS target) …). goopg does not
@@ -17270,45 +17286,59 @@ type UserMapping struct {
 	// pg_options_to_table(umoptions); an empty list → NULL → no OPTIONS clause.
 	// DU-002 slice 379.
 	Options []string
+	// DBOid is the real physical database oid this mapping was CREATE USER
+	// MAPPING'd under (mirrors catalog.ForeignServer.DBOid). Registry entries
+	// are keyed by userMappingKey(DBOid, user, server), so two distinct
+	// databases may each CREATE USER MAPPING a same-named (user, server) pair
+	// without colliding. M0122-0007 4e follow-up 37.
+	DBOid uint32
 }
 
-// userMappingKey builds the registry key for a (user, server) pair. The user and
-// server names are matched case-insensitively (goopg lowercases unquoted idents).
-func userMappingKey(user, server string) string {
-	return strings.ToLower(user) + "\x00" + strings.ToLower(server)
+// userMappingKey builds the registry key for a (dbOid, user, server) triple.
+// The user and server names are matched case-insensitively (goopg lowercases
+// unquoted idents); the dbOid prefix mirrors foreignServerKey's "<dbOid>:"
+// scheme so a same-named (user, server) pair in two distinct databases no
+// longer collides. M0122-0007 4e follow-up 37.
+func userMappingKey(dbOid uint32, user, server string) string {
+	return strconv.FormatUint(uint64(dbOid), 10) + ":" + strings.ToLower(user) + "\x00" + strings.ToLower(server)
 }
 
-// RegisterUserMapping records a user mapping, allocating a stable OID on first
-// sight. Idempotent: re-registering an existing (user, server) pair returns the
-// existing entry without changing its OID (OPTIONS are refreshed when non-empty).
-// DU-002 slice 377 (options: slice 379).
-func (c *InMemory) RegisterUserMapping(user, server string, options []string) *UserMapping {
+// RegisterUserMapping records a user mapping under dbOid (variadic, defaults
+// to DefaultDBOid — every pre-4e-follow-up-37 call site keeps resolving
+// there unchanged, mirroring resolveDBOid's convention), allocating a stable
+// OID on first sight. Idempotent: re-registering an existing (dbOid, user,
+// server) triple returns the existing entry without changing its OID
+// (OPTIONS are refreshed when non-empty). DU-002 slice 377 (options: slice
+// 379; dbOid scoping: M0122-0007 4e follow-up 37).
+func (c *InMemory) RegisterUserMapping(user, server string, options []string, dbOid ...uint32) *UserMapping {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.userMappings == nil {
 		c.userMappings = make(map[string]*UserMapping)
 	}
-	key := userMappingKey(user, server)
+	oid := resolveDBOid(dbOid)
+	key := userMappingKey(oid, user, server)
 	if m, ok := c.userMappings[key]; ok {
 		if len(options) > 0 {
 			m.Options = options
 		}
 		return m
 	}
-	m := &UserMapping{OID: c.allocOIDLocked(), UmUser: user, SrvName: server, Options: options}
+	m := &UserMapping{OID: c.allocOIDLocked(), UmUser: user, SrvName: server, Options: options, DBOid: oid}
 	c.userMappings[key] = m
 	return m
 }
 
-// DropUserMapping removes a user mapping from the registry. Returns true if found.
-// DU-002 slice 377.
-func (c *InMemory) DropUserMapping(user, server string) bool {
+// DropUserMapping removes a user mapping from dbOid's registry (variadic,
+// defaults to DefaultDBOid). Returns true if found. DU-002 slice 377; dbOid
+// scoping: M0122-0007 4e follow-up 37.
+func (c *InMemory) DropUserMapping(user, server string, dbOid ...uint32) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.userMappings == nil {
 		return false
 	}
-	key := userMappingKey(user, server)
+	key := userMappingKey(resolveDBOid(dbOid), user, server)
 	if _, ok := c.userMappings[key]; ok {
 		delete(c.userMappings, key)
 		return true
@@ -17316,17 +17346,22 @@ func (c *InMemory) DropUserMapping(user, server string) bool {
 	return false
 }
 
-// ListUserMappings returns all registered user mappings sorted by server name
-// then user name (deterministic dump order). DU-002 slice 377.
-func (c *InMemory) ListUserMappings() []*UserMapping {
+// ListUserMappings returns dbOid's own registered user mappings (variadic,
+// defaults to DefaultDBOid), sorted by server name then user name
+// (deterministic dump order). DU-002 slice 377; dbOid scoping: M0122-0007
+// 4e follow-up 37.
+func (c *InMemory) ListUserMappings(dbOid ...uint32) []*UserMapping {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	if len(c.userMappings) == 0 {
 		return nil
 	}
+	oid := resolveDBOid(dbOid)
 	out := make([]*UserMapping, 0, len(c.userMappings))
 	for _, m := range c.userMappings {
-		out = append(out, m)
+		if m.DBOid == oid {
+			out = append(out, m)
+		}
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].SrvName != out[j].SrvName {

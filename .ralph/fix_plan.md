@@ -7348,6 +7348,80 @@ mirroring M0119's ledger `status` column.
       `information_schema.routines` (bigger registry redesign);
       `pg_user_mappings`/`UserMapping` dbOid scoping; the real `CREATE
       DATABASE ... TEMPLATE` relation-copy mechanism itself.
+  - [x] `M0122-0007` follow-up 37 (2026-07-10, this loop) — **dbOid-scoped
+      the `catalog.UserMapping` registry, the same-shape sibling follow-up
+      36 named as its own future loop: `UserMapping` was a process-global
+      `map[string]*UserMapping` keyed by bare (user, server) only, so a
+      same-named `CREATE USER MAPPING` in two distinct databases silently
+      collided (last-writer-wins) instead of coexisting like real PG's
+      per-database `pg_user_mappings`.** Gave `UserMapping` a `DBOid uint32`
+      field and re-keyed the registry via `userMappingKey` gaining a
+      `"<dbOid>:"` prefix (keeping the pre-existing case-insensitive,
+      NUL-separated `(user, server)` part unchanged). Threaded a trailing
+      `dbOid ...uint32` parameter through `RegisterUserMapping`/
+      `DropUserMapping`/`ListUserMappings` and their `*DuringRecovery`
+      counterparts. `EncodeCreateUserMapping`/`DecodeCreateUserMapping` and
+      `EncodeDropUserMapping`/`DecodeDropUserMapping`
+      (`internal/wal/recovery.go`) each gained a trailing-appended `dbOid`
+      field, following `EncodeCreateForeignServer`'s
+      backward-compatible-trailer pattern exactly (a pre-follow-up-37 WAL
+      payload decodes with `dbOid=0`, translated through
+      `catalog.NamespaceDBOid` at the replay call site in
+      `internal/initdb/usermapping_ddl_recovery.go`). New
+      `catalog.InMemory.PGUserMappingsRowsForDBOid(dbOid uint32) [][]string`
+      extracted from `pg_user_mappings.VirtualRows` (mirrors
+      `PGForeignServerRowsForDBOid`; its `srvid` column now resolves via
+      `c.ForeignServerOID(m.SrvName, dbOid)` instead of the bare-name call,
+      so a mapping in database B resolves against database B's own
+      `pg_foreign_server` registry); new `executor.Context.PgUserMappingsRows`
+      field wired in `internal/server/dispatch.go`'s `wireExtensionRows`
+      (new `pgUserMappingsRowLister` interface), consumed by a new
+      `tbl.Name == "pg_user_mappings"` branch in `valuesOp.Open`. Updated
+      CREATE/DROP USER MAPPING call sites in
+      `internal/executor/operators_ddl.go` to pass
+      `catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)`. New tests
+      `TestCreateUserMappingSameNameAcrossDistinctDBOidDoesNotCollide`
+      (`internal/executor/operators_ddl_user_mapping_durability_test.go`,
+      new file), `TestPgUserMappingsRowsScopedToConnectionDBOid`
+      (`internal/executor/fk_dbid_routing_test.go`),
+      `TestUserMappingDDLRecoveryPreservesDistinctDBOidAfterRestart`
+      (`internal/initdb/usermapping_ddl_recovery_test.go`), plus WAL
+      round-trip/backward-compat tests in
+      `internal/wal/user_mapping_ddl_test.go`. Live end-to-end verified
+      against a real `cmd/goopg` binary + real `psql`: two `CREATE
+      DATABASE`s each `CREATE SERVER srv ...` plus `CREATE USER MAPPING FOR
+      postgres SERVER srv` with distinct `OPTIONS`; each database's
+      `pg_user_mappings` shows exactly its own row; `DROP USER MAPPING` in
+      one database leaves the other's intact; both facts (plus the
+      databases themselves) survive a server restart (WAL replay). The
+      check also surfaced (not fixed — recorded in the deferral ledger) that
+      `CREATE USER MAPPING FOR CURRENT_USER ...` stores the literal string
+      `"current_user"` rather than resolving to the connecting role's name,
+      a pre-existing parser simplification
+      (`internal/parser/ddl.go`'s `scanUserMappingForServer`). **Deliberately
+      still un-dbOid'd (own future loops, recorded in the deferral
+      ledger):** `internal/server/grant_ddl.go`'s
+      `recordForeignServerGrant`/`recordForeignServerRevoke` (still
+      `DefaultDBOid`-only, inherited from follow-up 36 — not a regression);
+      the FDW registry itself. Design:
+      `docs/design/0122-0018-per-database-catalog-namespace.md` gained a new
+      subsection; `docs/design/README.md` row updated. Gates: `go build
+      ./...`/`go vet ./...` clean; `go test -race ./internal/catalog/...
+      ./internal/executor/... ./internal/wal/... ./internal/initdb/...
+      ./internal/server/...` PASS (the sole `internal/server` failure,
+      `TestConnectExceedsPositiveDatconnlimitRejected`, is the same
+      documented pre-existing unrelated race as follow-up 36; running
+      `internal/initdb` under `-race` needed `-timeout 40m` because of this
+      host's concurrent live Ralph-loop co-load, matching the
+      `goopg_nightly_ci_batch` memory's "initdb 10m-timeout under co-load"
+      finding — not a regression); `go test -short` full repo PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh`
+      PASS (0 failed transactions, all 3 pgbench workloads). **Remaining
+      M0122-0007 scope (deferred, own future loops):** `pg_statistic_ext`/
+      `information_schema.routines` (bigger registry redesign); the
+      CURRENT_USER-resolution parser gap noted above; the real `CREATE
+      DATABASE ... TEMPLATE` relation-copy mechanism itself.
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,

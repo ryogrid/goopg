@@ -187,6 +187,12 @@ func (o *valuesOp) Open(ctx *Context) error {
 			// CREATE SERVER'd servers, not always DefaultDBOid's — mirrors
 			// the pg_foreign_table branch above. M0122-0007 4e follow-up 36.
 			o.rows = rematerialiseVirtualRowsFromStrings(tbl, ctx.PgForeignServerRows())
+		} else if tbl.Name == "pg_user_mappings" && ctx != nil && ctx.PgUserMappingsRows != nil {
+			// pg_user_mappings must list the connecting database's own
+			// CREATE USER MAPPING'd mappings, not always DefaultDBOid's —
+			// mirrors the pg_foreign_server branch above. M0122-0007 4e
+			// follow-up 37.
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, ctx.PgUserMappingsRows())
 		} else if tbl.VirtualRows != nil {
 			o.rows = rematerialiseVirtualRows(o.plan)
 		}

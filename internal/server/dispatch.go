@@ -2084,6 +2084,14 @@ func (s *Server) wireExtensionRows(ectx *executor.Context, dbName string) {
 			return pfs.PGForeignServerRowsForDBOid(catalog.NamespaceDBOid(ectx.CurrentDatabaseOid))
 		}
 	}
+	// pg_user_mappings must likewise reflect the connecting database's own
+	// CREATE USER MAPPING'd mappings, not always DefaultDBOid's. Mirrors the
+	// pg_foreign_server wiring above. M0122-0007 4e follow-up 37.
+	if pum, ok := s.cfg.Catalog.(pgUserMappingsRowLister); ok {
+		ectx.PgUserMappingsRows = func() [][]string {
+			return pum.PGUserMappingsRowsForDBOid(catalog.NamespaceDBOid(ectx.CurrentDatabaseOid))
+		}
+	}
 }
 
 // pgClassRowLister is implemented by catalog.InMemory to expose a
@@ -2176,6 +2184,13 @@ type pgSequenceRowLister interface {
 // above. M0122-0007 4e follow-up 36.
 type pgForeignServerRowLister interface {
 	PGForeignServerRowsForDBOid(dbOid uint32) [][]string
+}
+
+// pgUserMappingsRowLister is implemented by catalog.InMemory to expose a
+// per-database pg_user_mappings row-set, mirroring pgForeignServerRowLister
+// above. M0122-0007 4e follow-up 37.
+type pgUserMappingsRowLister interface {
+	PGUserMappingsRowsForDBOid(dbOid uint32) [][]string
 }
 
 func undoEnumDDLForRollback(connTx *connTxState, cat catalog.Catalog) {
