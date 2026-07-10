@@ -3006,9 +3006,12 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 	// following OF type_name may contain `column_name WITH OPTIONS
 	// column_constraint [...]` entries (parsed into stmt.OfTypeColumnOptions
 	// and applied to the composite-derived columns by the executor) and/or
-	// table_constraint entries (PRIMARY KEY/UNIQUE/CHECK/FOREIGN KEY/
-	// CONSTRAINT at table level); the latter are rejected rather than
-	// silently dropped — DU-002 slice 374 follow-up.
+	// table_constraint entries (PRIMARY KEY/UNIQUE/CHECK/EXCLUDE/FOREIGN KEY/
+	// CONSTRAINT at table level), interleavable in either order per PG's
+	// grammar `TypedTableElement: columnOptions | TableConstraint`
+	// (gram.y:3809-3812) — parsed via the same parseTableConstraintElement
+	// helper the ordinary CREATE TABLE column list uses. DU-002 slice 374
+	// follow-up.
 	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwOf {
 		p.advance() // consume OF
 		typeName, err := p.parseObjectName()
@@ -3020,27 +3023,25 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 			p.advance() // consume '('
 			if !p.acceptSymbol(")") {
 				for {
-					if p.cur().Kind == TokenKeyword &&
-						(p.cur().Keyword == KwConstraint || p.cur().Keyword == KwPrimary ||
-							p.cur().Keyword == KwUnique || p.cur().Keyword == KwCheck ||
-							p.cur().Keyword == KwForeign) {
-						return nil, p.errAtCur("table constraints in a typed-table (OF type_name) column list are not supported")
-					}
-					nameTok, err := p.parseIdent()
-					if err != nil {
+					if matched, err := p.parseTableConstraintElement(stmt); err != nil {
 						return nil, err
+					} else if !matched {
+						nameTok, err := p.parseIdent()
+						if err != nil {
+							return nil, err
+						}
+						if !p.acceptKeyword(KwWith) && !p.acceptIdentKeyword("with") {
+							return nil, p.errAtCur("expected WITH OPTIONS after column name in typed-table column list")
+						}
+						if !p.acceptIdentKeyword("options") {
+							return nil, p.errAtCur("expected OPTIONS after WITH")
+						}
+						override := ColumnDef{Name: identText(nameTok)}
+						if err := p.parseColumnConstraintList(&override); err != nil {
+							return nil, err
+						}
+						stmt.OfTypeColumnOptions = append(stmt.OfTypeColumnOptions, override)
 					}
-					if !p.acceptKeyword(KwWith) && !p.acceptIdentKeyword("with") {
-						return nil, p.errAtCur("expected WITH OPTIONS after column name in typed-table column list")
-					}
-					if !p.acceptIdentKeyword("options") {
-						return nil, p.errAtCur("expected OPTIONS after WITH")
-					}
-					override := ColumnDef{Name: identText(nameTok)}
-					if err := p.parseColumnConstraintList(&override); err != nil {
-						return nil, err
-					}
-					stmt.OfTypeColumnOptions = append(stmt.OfTypeColumnOptions, override)
 					if p.acceptSymbol(")") {
 						break
 					}
@@ -3437,336 +3438,13 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 		return stmt, nil
 	}
 	for {
-		// Table-level constraint: PRIMARY KEY ( cols ) [INCLUDE ( cols )].
-		if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwPrimary {
-			p.advance()
-			if _, err := p.expectKeyword(KwKey); err != nil {
-				return nil, err
-			}
-			if !p.acceptSymbol("(") {
-				return nil, p.errAtCur("expected '(' after PRIMARY KEY")
-			}
-			cols, err := p.parseColumnNameList()
-			if err != nil {
-				return nil, err
-			}
-			if !p.acceptSymbol(")") {
-				return nil, p.errAtCur("expected ')'")
-			}
-			stmt.PrimaryKey = cols
-			// Optional INCLUDE (col, …) — parse and store covering columns. M0097-0023.
-			if p.acceptIdentKeyword("include") {
-				if p.acceptSymbol("(") {
-					for !p.acceptSymbol(")") && p.cur().Kind != TokenEOF {
-						if p.cur().Kind == TokenIdent || p.cur().Kind == TokenKeyword {
-							stmt.PrimaryKeyInclude = append(stmt.PrimaryKeyInclude, p.cur().Value)
-						}
-						p.advance()
-					}
-				}
-			}
-			// Optional [NOT] DEFERRABLE [INITIALLY DEFERRED | INITIALLY IMMEDIATE].
-			// Captured (not discarded) so pg_get_constraintdef re-emits the clause
-			// and pg_constraint emits condeferrable/condeferred on dump. The flags
-			// ride the backing tbl_pkey index built in the executor. DU-002 slice 142.
-			p.parseConstraintDeferrable(&stmt.PrimaryKeyDeferrable, &stmt.PrimaryKeyInitiallyDeferred)
-		} else if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwUnique {
-			// Table-level UNIQUE [NULLS NOT DISTINCT] (cols) [INCLUDE (incl)] —
-			// create btree index. M0097-0028 / DU-002 slice 135.
-			p.advance()
-			// Optional NULLS [NOT] DISTINCT (PostgreSQL 15+) precedes the column
-			// list for a constraint (ruleutils.c emits `UNIQUE NULLS NOT DISTINCT
-			// (cols)`), unlike CREATE INDEX where the clause trails the columns.
-			nullsNotDistinct := false
-			if p.acceptIdentKeyword("nulls") {
-				nullsNotDistinct = p.acceptKeyword(KwNot)
-				if !p.acceptKeyword(KwDistinct) {
-					_ = p.acceptIdentKeyword("distinct")
-				}
-			}
-			if p.acceptSymbol("(") {
-				var cols []string
-				for !p.acceptSymbol(")") && p.cur().Kind != TokenEOF {
-					if p.cur().Kind == TokenIdent || p.cur().Kind == TokenKeyword {
-						cols = append(cols, p.cur().Value)
-					}
-					p.advance()
-				}
-				if len(cols) > 0 {
-					stmt.TableUniques = append(stmt.TableUniques, cols)
-					stmt.TableUniqueNullsNotDistinct = append(stmt.TableUniqueNullsNotDistinct, nullsNotDistinct)
-					// Optional INCLUDE (col, …). M0097-0023.
-					var incl []string
-					if p.acceptIdentKeyword("include") {
-						if p.acceptSymbol("(") {
-							for !p.acceptSymbol(")") && p.cur().Kind != TokenEOF {
-								if p.cur().Kind == TokenIdent || p.cur().Kind == TokenKeyword {
-									incl = append(incl, p.cur().Value)
-								}
-								p.advance()
-							}
-						}
-					}
-					stmt.TableUniqueIncludes = append(stmt.TableUniqueIncludes, incl)
-					// Optional [NOT] DEFERRABLE [INITIALLY DEFERRED | INITIALLY
-					// IMMEDIATE]. Captured (not discarded) so pg_get_constraintdef
-					// re-emits the clause on dump. DU-002 slice 139.
-					deferrable := false
-					initiallyDeferred := false
-					if p.acceptKeyword(KwNot) {
-						_ = p.acceptKeyword(KwDeferrable)
-					} else if p.acceptKeyword(KwDeferrable) {
-						deferrable = true
-					}
-					if p.acceptIdentKeyword("initially") {
-						if p.acceptIdentKeyword("deferred") {
-							// INITIALLY DEFERRED implies DEFERRABLE.
-							deferrable = true
-							initiallyDeferred = true
-						} else {
-							_ = p.acceptIdentKeyword("immediate")
-						}
-					}
-					stmt.TableUniqueDeferrable = append(stmt.TableUniqueDeferrable, deferrable)
-					stmt.TableUniqueInitiallyDeferred = append(stmt.TableUniqueInitiallyDeferred, initiallyDeferred)
-				}
-			}
-		} else if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwCheck {
-			// Table-level CHECK (expr) [NOT ENFORCED | ENFORCED] [NO INHERIT]. M0097-0014.
-			p.advance()
-			expr, err := p.parseCheckExpr()
-			if err != nil {
-				return nil, err
-			}
-			stmt.TableChecks = append(stmt.TableChecks, expr)
-			// Accept optional NOT ENFORCED / ENFORCED modifier, recording
-			// NOT ENFORCED per-check (parallel to TableChecks) so pg_dump
-			// re-emits the trailing ` NOT ENFORCED` and pg_constraint reports
-			// conenforced=false. DU-002 slice 430.
-			notEnforced := false
-			if p.acceptKeyword(KwNot) {
-				if p.acceptIdentKeyword("enforced") {
-					notEnforced = true
-				}
-			} else {
-				_ = p.acceptIdentKeyword("enforced")
-			}
-			// Accept optional NO INHERIT, recording it per-check so the suffix
-			// round-trips through the dump. DU-002 slice 128.
-			noInherit := false
-			if p.acceptIdentKeyword("no") {
-				_ = p.acceptIdentKeyword("inherit")
-				stmt.TableHasNoInheritCheck = true
-				noInherit = true
-			}
-			stmt.TableCheckNoInherit = append(stmt.TableCheckNoInherit, noInherit)
-			stmt.TableCheckNotEnforced = append(stmt.TableCheckNotEnforced, notEnforced)
-		} else if p.acceptIdentKeyword("exclude") {
-			// Anonymous EXCLUDE USING method (col WITH op) [INCLUDE (cols)]. M0097-0023.
-			cdef := p.parseExcludeConstraint()
-			// Optional [NOT] DEFERRABLE [INITIALLY DEFERRED | INITIALLY IMMEDIATE].
-			// Captured onto the constraint def so the executor threads it onto the
-			// backing exclusion index and pg_get_constraintdef / pg_constraint
-			// re-emit the clause on dump. DU-002 slice 143.
-			p.parseConstraintDeferrable(&cdef.Deferrable, &cdef.InitiallyDeferred)
-			stmt.TableExclusions = append(stmt.TableExclusions, cdef)
-		} else if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwForeign {
-			// Anonymous table-level FOREIGN KEY (cols) REFERENCES t (cols) … —
-			// the multi-column sibling of the inline column REFERENCES clause.
-			// PG auto-names it <table>_<firstcol>_fkey at execution. DU-002 slice 53.
-			fk, err := p.parseTableForeignKey("")
-			if err != nil {
-				return nil, err
-			}
-			stmt.TableForeignKeys = append(stmt.TableForeignKeys, fk)
-		} else if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwConstraint {
-			// Table-level CONSTRAINT name (PRIMARY KEY | UNIQUE | CHECK | FOREIGN KEY).
-			p.advance() // CONSTRAINT
-			cNameTok, _ := p.parseIdent()
-			constraintName := cNameTok.Value
-			switch {
-			case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwPrimary:
-				p.advance()
-				if _, err := p.expectKeyword(KwKey); err != nil {
-					return nil, err
-				}
-				if !p.acceptSymbol("(") {
-					return nil, p.errAtCur("expected '(' after PRIMARY KEY")
-				}
-				cols, err := p.parseColumnNameList()
-				if err != nil {
-					return nil, err
-				}
-				if !p.acceptSymbol(")") {
-					return nil, p.errAtCur("expected ')'")
-				}
-				stmt.PrimaryKey = cols
-				cdef := TableConstraintDef{Name: constraintName, Columns: cols, IsPrimary: true}
-				// Optional INCLUDE (col, …) — parse and store covering columns.
-				if p.acceptIdentKeyword("include") {
-					if p.acceptSymbol("(") {
-						for !p.acceptSymbol(")") && p.cur().Kind != TokenEOF {
-							if p.cur().Kind == TokenIdent || p.cur().Kind == TokenKeyword {
-								cdef.IncludeColumns = append(cdef.IncludeColumns, p.cur().Value)
-							}
-							p.advance()
-						}
-					}
-				}
-				// Optional [NOT] DEFERRABLE [INITIALLY DEFERRED | INITIALLY IMMEDIATE].
-				// Captured (not discarded) onto the constraint def so the executor
-				// threads it onto the backing index (shared NamedConstraints loop) and
-				// pg_get_constraintdef / pg_constraint re-emit the clause on dump.
-				// Parsed before the append so cdef carries the flags. DU-002 slice 142.
-				p.parseConstraintDeferrable(&cdef.Deferrable, &cdef.InitiallyDeferred)
-				if constraintName != "" {
-					stmt.NamedConstraints = append(stmt.NamedConstraints, cdef)
-				}
-			case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwUnique:
-				// CONSTRAINT name UNIQUE [NULLS [NOT] DISTINCT] (cols) [INCLUDE (cols)]
-				// M0097-0028 / DU-002 slice 138.
-				p.advance()
-				// Optional NULLS [NOT] DISTINCT (PostgreSQL 15+) precedes the column
-				// list, mirroring the anonymous table-level UNIQUE form above. Without
-				// this the `(` lookahead failed and the whole named constraint was
-				// silently dropped from the table (and thus the dump).
-				namedNullsNotDistinct := false
-				if p.acceptIdentKeyword("nulls") {
-					namedNullsNotDistinct = p.acceptKeyword(KwNot)
-					if !p.acceptKeyword(KwDistinct) {
-						_ = p.acceptIdentKeyword("distinct")
-					}
-				}
-				if p.acceptSymbol("(") {
-					var cols []string
-					for !p.acceptSymbol(")") && p.cur().Kind != TokenEOF {
-						if p.cur().Kind == TokenIdent || p.cur().Kind == TokenKeyword {
-							cols = append(cols, p.cur().Value)
-						}
-						p.advance()
-					}
-					if len(cols) > 0 {
-						cdef := TableConstraintDef{Name: constraintName, Columns: cols, NullsNotDistinct: namedNullsNotDistinct}
-						// Optional INCLUDE (col, …).
-						if p.acceptIdentKeyword("include") {
-							if p.acceptSymbol("(") {
-								for !p.acceptSymbol(")") && p.cur().Kind != TokenEOF {
-									if p.cur().Kind == TokenIdent || p.cur().Kind == TokenKeyword {
-										cdef.IncludeColumns = append(cdef.IncludeColumns, p.cur().Value)
-									}
-									p.advance()
-								}
-							}
-						}
-						// Optional [NOT] DEFERRABLE [INITIALLY DEFERRED | INITIALLY
-						// IMMEDIATE] trailer. Mirrors the anonymous table-level UNIQUE
-						// form (slice 139); without this branch a named
-						// `UNIQUE (a) DEFERRABLE …` was a HARD PARSE ERROR (trailing
-						// tokens after the column list). DU-002 slice 140.
-						if p.acceptKeyword(KwNot) {
-							_ = p.acceptKeyword(KwDeferrable)
-							// NOT DEFERRABLE → both flags stay false (default).
-						} else if p.acceptKeyword(KwDeferrable) {
-							cdef.Deferrable = true
-							if p.acceptIdentKeyword("initially") {
-								if p.acceptIdentKeyword("deferred") {
-									cdef.InitiallyDeferred = true
-								} else {
-									_ = p.acceptIdentKeyword("immediate")
-								}
-							}
-						} else if p.acceptIdentKeyword("initially") {
-							// Bare INITIALLY DEFERRED implies DEFERRABLE.
-							if p.acceptIdentKeyword("deferred") {
-								cdef.Deferrable = true
-								cdef.InitiallyDeferred = true
-							} else {
-								_ = p.acceptIdentKeyword("immediate")
-							}
-						}
-						if constraintName != "" {
-							stmt.NamedConstraints = append(stmt.NamedConstraints, cdef)
-						} else {
-							stmt.TableUniques = append(stmt.TableUniques, cols)
-						}
-					}
-				}
-			case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwCheck:
-				p.advance()
-				expr, err := p.parseCheckExpr()
-				if err != nil {
-					return nil, err
-				}
-				anonCheck := constraintName == ""
-				if !anonCheck {
-					// Named CHECK constraint: store with its name for pg_constraint.
-					stmt.TableNamedChecks = append(stmt.TableNamedChecks, PartitionCheckConstraint{
-						Name: constraintName, Expr: expr,
-					})
-				} else {
-					stmt.TableChecks = append(stmt.TableChecks, expr)
-				}
-				notEnforced := false
-				if p.acceptKeyword(KwNot) {
-					if p.acceptIdentKeyword("enforced") {
-						notEnforced = true
-					}
-				} else {
-					_ = p.acceptIdentKeyword("enforced")
-				}
-				// Accept optional NO INHERIT (CONSTRAINT name CHECK NO INHERIT).
-				noInherit := false
-				if p.acceptIdentKeyword("no") {
-					_ = p.acceptIdentKeyword("inherit")
-					stmt.TableHasNoInheritCheck = true
-					noInherit = true
-				}
-				// Keep TableCheckNoInherit/TableCheckNotEnforced parallel to
-				// TableChecks: only the anonymous branch appended an expr.
-				// DU-002 slices 128, 430.
-				if anonCheck {
-					stmt.TableCheckNoInherit = append(stmt.TableCheckNoInherit, noInherit)
-					stmt.TableCheckNotEnforced = append(stmt.TableCheckNotEnforced, notEnforced)
-				} else if len(stmt.TableNamedChecks) > 0 {
-					// Named branch appended before NO INHERIT/NOT ENFORCED were
-					// parsed; carry the per-constraint flags so the named check
-					// re-emits the suffixes on dump. DU-002 slices 129, 430.
-					if noInherit {
-						stmt.TableNamedChecks[len(stmt.TableNamedChecks)-1].NoInherit = true
-					}
-					if notEnforced {
-						stmt.TableNamedChecks[len(stmt.TableNamedChecks)-1].NotEnforced = true
-					}
-				}
-			case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwForeign:
-				// CONSTRAINT name FOREIGN KEY (cols) REFERENCES t (cols) … —
-				// table-level (possibly composite) FK. DU-002 slice 53.
-				fk, err := p.parseTableForeignKey(constraintName)
-				if err != nil {
-					return nil, err
-				}
-				stmt.TableForeignKeys = append(stmt.TableForeignKeys, fk)
-			case p.acceptIdentKeyword("exclude"):
-				// CONSTRAINT name EXCLUDE USING method (col WITH op) [INCLUDE (cols)]. M0097-0023.
-				cdef := p.parseExcludeConstraint()
-				cdef.Name = constraintName
-				// Optional [NOT] DEFERRABLE [INITIALLY DEFERRED | INITIALLY
-				// IMMEDIATE] — captured (not discarded) so the executor threads it
-				// onto the backing exclusion index via the shared NamedConstraints
-				// loop and the dump re-emits the clause. DU-002 slice 143.
-				p.parseConstraintDeferrable(&cdef.Deferrable, &cdef.InitiallyDeferred)
-				stmt.NamedConstraints = append(stmt.NamedConstraints, cdef)
-			default:
-				// Unknown constraint type: skip to next comma/close-paren.
-				for p.cur().Kind != TokenEOF {
-					t := p.cur()
-					if (t.Kind == TokenSymbol && t.Value == ")") ||
-						(t.Kind == TokenSymbol && t.Value == ",") {
-						break
-					}
-					p.advance()
-				}
-			}
+		// Table-level constraint: PRIMARY KEY/UNIQUE/CHECK/EXCLUDE/FOREIGN KEY/
+		// CONSTRAINT name ... — parsed via the shared parseTableConstraintElement
+		// helper (also used by the OF type_name typed-table list). DU-002 slice 374.
+		if matched, err := p.parseTableConstraintElement(stmt); err != nil {
+			return nil, err
+		} else if matched {
+			// handled by parseTableConstraintElement
 		} else if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwLike {
 			// LIKE source_table [INCLUDING/EXCLUDING option …] — copy columns. M0097-0069.
 			p.advance() // consume LIKE
@@ -3926,6 +3604,350 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 		}
 	}
 	return stmt, nil
+}
+
+// parseTableConstraintElement attempts to parse a single table-level
+// constraint clause (PRIMARY KEY/UNIQUE/CHECK/EXCLUDE/FOREIGN KEY/CONSTRAINT
+// name ...) at the parser's current position, appending it to stmt's
+// constraint fields. Returns matched=false (without consuming input) if the
+// current token does not start a table constraint, so callers can fall
+// through to column-definition or other list-element parsing. Shared between
+// the ordinary CREATE TABLE column list and the OF type_name typed-table
+// column/constraint list (DU-002 slice 374 follow-up).
+func (p *parser) parseTableConstraintElement(stmt *CreateTableStmt) (bool, error) {
+	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwPrimary {
+		p.advance()
+		if _, err := p.expectKeyword(KwKey); err != nil {
+			return false, err
+		}
+		if !p.acceptSymbol("(") {
+			return false, p.errAtCur("expected '(' after PRIMARY KEY")
+		}
+		cols, err := p.parseColumnNameList()
+		if err != nil {
+			return false, err
+		}
+		if !p.acceptSymbol(")") {
+			return false, p.errAtCur("expected ')'")
+		}
+		stmt.PrimaryKey = cols
+		// Optional INCLUDE (col, …) — parse and store covering columns. M0097-0023.
+		if p.acceptIdentKeyword("include") {
+			if p.acceptSymbol("(") {
+				for !p.acceptSymbol(")") && p.cur().Kind != TokenEOF {
+					if p.cur().Kind == TokenIdent || p.cur().Kind == TokenKeyword {
+						stmt.PrimaryKeyInclude = append(stmt.PrimaryKeyInclude, p.cur().Value)
+					}
+					p.advance()
+				}
+			}
+		}
+		// Optional [NOT] DEFERRABLE [INITIALLY DEFERRED | INITIALLY IMMEDIATE].
+		// Captured (not discarded) so pg_get_constraintdef re-emits the clause
+		// and pg_constraint emits condeferrable/condeferred on dump. The flags
+		// ride the backing tbl_pkey index built in the executor. DU-002 slice 142.
+		p.parseConstraintDeferrable(&stmt.PrimaryKeyDeferrable, &stmt.PrimaryKeyInitiallyDeferred)
+	} else if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwUnique {
+		// Table-level UNIQUE [NULLS NOT DISTINCT] (cols) [INCLUDE (incl)] —
+		// create btree index. M0097-0028 / DU-002 slice 135.
+		p.advance()
+		// Optional NULLS [NOT] DISTINCT (PostgreSQL 15+) precedes the column
+		// list for a constraint (ruleutils.c emits `UNIQUE NULLS NOT DISTINCT
+		// (cols)`), unlike CREATE INDEX where the clause trails the columns.
+		nullsNotDistinct := false
+		if p.acceptIdentKeyword("nulls") {
+			nullsNotDistinct = p.acceptKeyword(KwNot)
+			if !p.acceptKeyword(KwDistinct) {
+				_ = p.acceptIdentKeyword("distinct")
+			}
+		}
+		if p.acceptSymbol("(") {
+			var cols []string
+			for !p.acceptSymbol(")") && p.cur().Kind != TokenEOF {
+				if p.cur().Kind == TokenIdent || p.cur().Kind == TokenKeyword {
+					cols = append(cols, p.cur().Value)
+				}
+				p.advance()
+			}
+			if len(cols) > 0 {
+				stmt.TableUniques = append(stmt.TableUniques, cols)
+				stmt.TableUniqueNullsNotDistinct = append(stmt.TableUniqueNullsNotDistinct, nullsNotDistinct)
+				// Optional INCLUDE (col, …). M0097-0023.
+				var incl []string
+				if p.acceptIdentKeyword("include") {
+					if p.acceptSymbol("(") {
+						for !p.acceptSymbol(")") && p.cur().Kind != TokenEOF {
+							if p.cur().Kind == TokenIdent || p.cur().Kind == TokenKeyword {
+								incl = append(incl, p.cur().Value)
+							}
+							p.advance()
+						}
+					}
+				}
+				stmt.TableUniqueIncludes = append(stmt.TableUniqueIncludes, incl)
+				// Optional [NOT] DEFERRABLE [INITIALLY DEFERRED | INITIALLY
+				// IMMEDIATE]. Captured (not discarded) so pg_get_constraintdef
+				// re-emits the clause on dump. DU-002 slice 139.
+				deferrable := false
+				initiallyDeferred := false
+				if p.acceptKeyword(KwNot) {
+					_ = p.acceptKeyword(KwDeferrable)
+				} else if p.acceptKeyword(KwDeferrable) {
+					deferrable = true
+				}
+				if p.acceptIdentKeyword("initially") {
+					if p.acceptIdentKeyword("deferred") {
+						// INITIALLY DEFERRED implies DEFERRABLE.
+						deferrable = true
+						initiallyDeferred = true
+					} else {
+						_ = p.acceptIdentKeyword("immediate")
+					}
+				}
+				stmt.TableUniqueDeferrable = append(stmt.TableUniqueDeferrable, deferrable)
+				stmt.TableUniqueInitiallyDeferred = append(stmt.TableUniqueInitiallyDeferred, initiallyDeferred)
+			}
+		}
+	} else if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwCheck {
+		// Table-level CHECK (expr) [NOT ENFORCED | ENFORCED] [NO INHERIT]. M0097-0014.
+		p.advance()
+		expr, err := p.parseCheckExpr()
+		if err != nil {
+			return false, err
+		}
+		stmt.TableChecks = append(stmt.TableChecks, expr)
+		// Accept optional NOT ENFORCED / ENFORCED modifier, recording
+		// NOT ENFORCED per-check (parallel to TableChecks) so pg_dump
+		// re-emits the trailing ` NOT ENFORCED` and pg_constraint reports
+		// conenforced=false. DU-002 slice 430.
+		notEnforced := false
+		if p.acceptKeyword(KwNot) {
+			if p.acceptIdentKeyword("enforced") {
+				notEnforced = true
+			}
+		} else {
+			_ = p.acceptIdentKeyword("enforced")
+		}
+		// Accept optional NO INHERIT, recording it per-check so the suffix
+		// round-trips through the dump. DU-002 slice 128.
+		noInherit := false
+		if p.acceptIdentKeyword("no") {
+			_ = p.acceptIdentKeyword("inherit")
+			stmt.TableHasNoInheritCheck = true
+			noInherit = true
+		}
+		stmt.TableCheckNoInherit = append(stmt.TableCheckNoInherit, noInherit)
+		stmt.TableCheckNotEnforced = append(stmt.TableCheckNotEnforced, notEnforced)
+	} else if p.acceptIdentKeyword("exclude") {
+		// Anonymous EXCLUDE USING method (col WITH op) [INCLUDE (cols)]. M0097-0023.
+		cdef := p.parseExcludeConstraint()
+		// Optional [NOT] DEFERRABLE [INITIALLY DEFERRED | INITIALLY IMMEDIATE].
+		// Captured onto the constraint def so the executor threads it onto the
+		// backing exclusion index and pg_get_constraintdef / pg_constraint
+		// re-emit the clause on dump. DU-002 slice 143.
+		p.parseConstraintDeferrable(&cdef.Deferrable, &cdef.InitiallyDeferred)
+		stmt.TableExclusions = append(stmt.TableExclusions, cdef)
+	} else if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwForeign {
+		// Anonymous table-level FOREIGN KEY (cols) REFERENCES t (cols) … —
+		// the multi-column sibling of the inline column REFERENCES clause.
+		// PG auto-names it <table>_<firstcol>_fkey at execution. DU-002 slice 53.
+		fk, err := p.parseTableForeignKey("")
+		if err != nil {
+			return false, err
+		}
+		stmt.TableForeignKeys = append(stmt.TableForeignKeys, fk)
+	} else if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwConstraint {
+		// Table-level CONSTRAINT name (PRIMARY KEY | UNIQUE | CHECK | FOREIGN KEY).
+		p.advance() // CONSTRAINT
+		cNameTok, _ := p.parseIdent()
+		constraintName := cNameTok.Value
+		switch {
+		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwPrimary:
+			p.advance()
+			if _, err := p.expectKeyword(KwKey); err != nil {
+				return false, err
+			}
+			if !p.acceptSymbol("(") {
+				return false, p.errAtCur("expected '(' after PRIMARY KEY")
+			}
+			cols, err := p.parseColumnNameList()
+			if err != nil {
+				return false, err
+			}
+			if !p.acceptSymbol(")") {
+				return false, p.errAtCur("expected ')'")
+			}
+			stmt.PrimaryKey = cols
+			cdef := TableConstraintDef{Name: constraintName, Columns: cols, IsPrimary: true}
+			// Optional INCLUDE (col, …) — parse and store covering columns.
+			if p.acceptIdentKeyword("include") {
+				if p.acceptSymbol("(") {
+					for !p.acceptSymbol(")") && p.cur().Kind != TokenEOF {
+						if p.cur().Kind == TokenIdent || p.cur().Kind == TokenKeyword {
+							cdef.IncludeColumns = append(cdef.IncludeColumns, p.cur().Value)
+						}
+						p.advance()
+					}
+				}
+			}
+			// Optional [NOT] DEFERRABLE [INITIALLY DEFERRED | INITIALLY IMMEDIATE].
+			// Captured (not discarded) onto the constraint def so the executor
+			// threads it onto the backing index (shared NamedConstraints loop) and
+			// pg_get_constraintdef / pg_constraint re-emit the clause on dump.
+			// Parsed before the append so cdef carries the flags. DU-002 slice 142.
+			p.parseConstraintDeferrable(&cdef.Deferrable, &cdef.InitiallyDeferred)
+			if constraintName != "" {
+				stmt.NamedConstraints = append(stmt.NamedConstraints, cdef)
+			}
+		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwUnique:
+			// CONSTRAINT name UNIQUE [NULLS [NOT] DISTINCT] (cols) [INCLUDE (cols)]
+			// M0097-0028 / DU-002 slice 138.
+			p.advance()
+			// Optional NULLS [NOT] DISTINCT (PostgreSQL 15+) precedes the column
+			// list, mirroring the anonymous table-level UNIQUE form above. Without
+			// this the `(` lookahead failed and the whole named constraint was
+			// silently dropped from the table (and thus the dump).
+			namedNullsNotDistinct := false
+			if p.acceptIdentKeyword("nulls") {
+				namedNullsNotDistinct = p.acceptKeyword(KwNot)
+				if !p.acceptKeyword(KwDistinct) {
+					_ = p.acceptIdentKeyword("distinct")
+				}
+			}
+			if p.acceptSymbol("(") {
+				var cols []string
+				for !p.acceptSymbol(")") && p.cur().Kind != TokenEOF {
+					if p.cur().Kind == TokenIdent || p.cur().Kind == TokenKeyword {
+						cols = append(cols, p.cur().Value)
+					}
+					p.advance()
+				}
+				if len(cols) > 0 {
+					cdef := TableConstraintDef{Name: constraintName, Columns: cols, NullsNotDistinct: namedNullsNotDistinct}
+					// Optional INCLUDE (col, …).
+					if p.acceptIdentKeyword("include") {
+						if p.acceptSymbol("(") {
+							for !p.acceptSymbol(")") && p.cur().Kind != TokenEOF {
+								if p.cur().Kind == TokenIdent || p.cur().Kind == TokenKeyword {
+									cdef.IncludeColumns = append(cdef.IncludeColumns, p.cur().Value)
+								}
+								p.advance()
+							}
+						}
+					}
+					// Optional [NOT] DEFERRABLE [INITIALLY DEFERRED | INITIALLY
+					// IMMEDIATE] trailer. Mirrors the anonymous table-level UNIQUE
+					// form (slice 139); without this branch a named
+					// `UNIQUE (a) DEFERRABLE …` was a HARD PARSE ERROR (trailing
+					// tokens after the column list). DU-002 slice 140.
+					if p.acceptKeyword(KwNot) {
+						_ = p.acceptKeyword(KwDeferrable)
+						// NOT DEFERRABLE → both flags stay false (default).
+					} else if p.acceptKeyword(KwDeferrable) {
+						cdef.Deferrable = true
+						if p.acceptIdentKeyword("initially") {
+							if p.acceptIdentKeyword("deferred") {
+								cdef.InitiallyDeferred = true
+							} else {
+								_ = p.acceptIdentKeyword("immediate")
+							}
+						}
+					} else if p.acceptIdentKeyword("initially") {
+						// Bare INITIALLY DEFERRED implies DEFERRABLE.
+						if p.acceptIdentKeyword("deferred") {
+							cdef.Deferrable = true
+							cdef.InitiallyDeferred = true
+						} else {
+							_ = p.acceptIdentKeyword("immediate")
+						}
+					}
+					if constraintName != "" {
+						stmt.NamedConstraints = append(stmt.NamedConstraints, cdef)
+					} else {
+						stmt.TableUniques = append(stmt.TableUniques, cols)
+					}
+				}
+			}
+		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwCheck:
+			p.advance()
+			expr, err := p.parseCheckExpr()
+			if err != nil {
+				return false, err
+			}
+			anonCheck := constraintName == ""
+			if !anonCheck {
+				// Named CHECK constraint: store with its name for pg_constraint.
+				stmt.TableNamedChecks = append(stmt.TableNamedChecks, PartitionCheckConstraint{
+					Name: constraintName, Expr: expr,
+				})
+			} else {
+				stmt.TableChecks = append(stmt.TableChecks, expr)
+			}
+			notEnforced := false
+			if p.acceptKeyword(KwNot) {
+				if p.acceptIdentKeyword("enforced") {
+					notEnforced = true
+				}
+			} else {
+				_ = p.acceptIdentKeyword("enforced")
+			}
+			// Accept optional NO INHERIT (CONSTRAINT name CHECK NO INHERIT).
+			noInherit := false
+			if p.acceptIdentKeyword("no") {
+				_ = p.acceptIdentKeyword("inherit")
+				stmt.TableHasNoInheritCheck = true
+				noInherit = true
+			}
+			// Keep TableCheckNoInherit/TableCheckNotEnforced parallel to
+			// TableChecks: only the anonymous branch appended an expr.
+			// DU-002 slices 128, 430.
+			if anonCheck {
+				stmt.TableCheckNoInherit = append(stmt.TableCheckNoInherit, noInherit)
+				stmt.TableCheckNotEnforced = append(stmt.TableCheckNotEnforced, notEnforced)
+			} else if len(stmt.TableNamedChecks) > 0 {
+				// Named branch appended before NO INHERIT/NOT ENFORCED were
+				// parsed; carry the per-constraint flags so the named check
+				// re-emits the suffixes on dump. DU-002 slices 129, 430.
+				if noInherit {
+					stmt.TableNamedChecks[len(stmt.TableNamedChecks)-1].NoInherit = true
+				}
+				if notEnforced {
+					stmt.TableNamedChecks[len(stmt.TableNamedChecks)-1].NotEnforced = true
+				}
+			}
+		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwForeign:
+			// CONSTRAINT name FOREIGN KEY (cols) REFERENCES t (cols) … —
+			// table-level (possibly composite) FK. DU-002 slice 53.
+			fk, err := p.parseTableForeignKey(constraintName)
+			if err != nil {
+				return false, err
+			}
+			stmt.TableForeignKeys = append(stmt.TableForeignKeys, fk)
+		case p.acceptIdentKeyword("exclude"):
+			// CONSTRAINT name EXCLUDE USING method (col WITH op) [INCLUDE (cols)]. M0097-0023.
+			cdef := p.parseExcludeConstraint()
+			cdef.Name = constraintName
+			// Optional [NOT] DEFERRABLE [INITIALLY DEFERRED | INITIALLY
+			// IMMEDIATE] — captured (not discarded) so the executor threads it
+			// onto the backing exclusion index via the shared NamedConstraints
+			// loop and the dump re-emits the clause. DU-002 slice 143.
+			p.parseConstraintDeferrable(&cdef.Deferrable, &cdef.InitiallyDeferred)
+			stmt.NamedConstraints = append(stmt.NamedConstraints, cdef)
+		default:
+			// Unknown constraint type: skip to next comma/close-paren.
+			for p.cur().Kind != TokenEOF {
+				t := p.cur()
+				if (t.Kind == TokenSymbol && t.Value == ")") ||
+					(t.Kind == TokenSymbol && t.Value == ",") {
+					break
+				}
+				p.advance()
+			}
+		}
+	} else {
+		return false, nil
+	}
+	return true, nil
 }
 
 // consumeCreateTableSuffix skips INHERITS, PARTITION BY, WITH, and TABLESPACE

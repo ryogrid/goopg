@@ -8731,6 +8731,34 @@ mirroring M0119's ledger `status` column.
       package, 4s); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
       `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh`
       PASS (0 failed transactions, all 3 workloads).
+  - [x] **M0122-0024 follow-up — `table_constraint` half of the same OF
+      type_name list — implemented, deferral row closed.** Extracted the
+      ordinary CREATE TABLE column list's table-constraint dispatch
+      (PRIMARY KEY/UNIQUE/CHECK/EXCLUDE/FOREIGN KEY/CONSTRAINT, ~330 lines
+      of `parseCreateTableTail`) into a shared `parseTableConstraintElement`
+      helper (`internal/parser/ddl.go`), reused by both the ordinary
+      CREATE TABLE loop and the `OF type_name (...)` list loop — the two
+      grammar halves (`TypedTableElement: columnOptions | TableConstraint`)
+      now interleave freely, matching PG's own doc example
+      (`employees OF employee_type (PRIMARY KEY (name), salary WITH
+      OPTIONS DEFAULT 1000)`). No executor change needed (constraint
+      fields feed the same enforcement path regardless of `OfType`).
+      Superseded `TestCreateTableOfTypeTableConstraintRejected` with
+      `TestCreateTableOfTypeTableConstraintAccepted` +
+      `TestCreateTableOfTypeMixedColumnAndTableConstraint`
+      (`internal/parser/create_table_of_type_test.go`); new
+      `TestCreateTableOfTypeTableConstraintMixedWithColumnOptions`
+      (`internal/executor/create_table_of_type_options_test.go`, real
+      23505 unique-violation E2E check). Deferral-ledger row flipped to
+      `resolved` + new row recorded. `unimplemented_feat.json`'s
+      `code_audit` for the DU-002-374 entry appended with the follow-up
+      resolution. Design doc `docs/design/0110-0001-pg-dump-tap-port.md`
+      (Addendum 2) + `docs/design/README.md` index row updated. Gates:
+      `go build ./...`/`go vet ./...` clean; `go test -count=1
+      ./internal/parser/...`/`./internal/executor/...` full packages
+      PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh`
+      PASS (0 failed, all 3 pgbench workloads).
 
 > This task list is **seeded, not exhaustive.** The M0122-0001 triage plus every
 > future feature deferral appended to `unimplemented_feat.json` (any new `open`

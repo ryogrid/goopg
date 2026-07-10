@@ -49,6 +49,51 @@ func TestCreateTableOfTypeWithOptionsAppliesConstraints(t *testing.T) {
 	}
 }
 
+// TestCreateTableOfTypeTableConstraintMixedWithColumnOptions verifies
+// PostgreSQL's own canonical CREATE TABLE OF doc example — a table-level
+// PRIMARY KEY constraint interleaved with a `column WITH OPTIONS` entry in the
+// same OF-type-name list — actually enforces both: the PRIMARY KEY builds a
+// unique index (duplicate insert rejected with 23505) and the DEFAULT still
+// applies to the omitted column. This is the table_constraint half of DU-002
+// slice 374 (M0122-0024 deferral-ledger resume): previously ANY table
+// constraint in this list was a hard parse error.
+func TestCreateTableOfTypeTableConstraintMixedWithColumnOptions(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TYPE employee_type AS (name text, salary numeric)`); err != nil {
+		t.Fatalf("CREATE TYPE: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE TABLE employees OF employee_type (PRIMARY KEY (name), salary WITH OPTIONS DEFAULT 1000)`); err != nil {
+		t.Fatalf("CREATE TABLE OF: %v", err)
+	}
+
+	if err := runDDL(t, ctx, `INSERT INTO employees (name) VALUES ('alice')`); err != nil {
+		t.Fatalf("INSERT with default: %v", err)
+	}
+	rows := runQuery(t, ctx, `SELECT name, salary FROM employees WHERE name = 'alice'`)
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 row for alice, got %d", len(rows))
+	}
+	salary := rows[0][1]
+	if salary.Kind != KindNumeric && salary.Kind != KindInt {
+		t.Fatalf("unexpected salary Datum kind %v", salary.Kind)
+	}
+
+	// PRIMARY KEY (name) must enforce uniqueness.
+	err := runDDL(t, ctx, `INSERT INTO employees (name) VALUES ('alice')`)
+	if err == nil {
+		t.Fatal("expected primary key violation, got nil")
+	}
+	ee, ok := err.(*ExecError)
+	if !ok {
+		t.Fatalf("want *ExecError, got %T: %v", err, err)
+	}
+	if ee.Code != "23505" {
+		t.Errorf("Code=%q want 23505 (unique_violation)", ee.Code)
+	}
+}
+
 // TestCreateTableOfTypeWithOptionsUnknownColumn verifies a WITH OPTIONS entry
 // naming a column absent from the composite type is rejected with PostgreSQL's
 // real error (42703 "column ... does not exist", from MergeAttributes in

@@ -9170,6 +9170,38 @@ Covered by `TestCreateTableOfTypeColumnWithOptions`/`TestCreateTableOfTypeEmptyC
 `TestCreateTableOfTypeWithOptionsAppliesConstraints`/`TestCreateTableOfTypeWithOptionsUnknownColumn`
 (`internal/executor/create_table_of_type_options_test.go`).
 
+**Addendum 2 (M0122-0024 follow-up, 2026-07-10): the `table_constraint` half is now implemented too — the whole grammar
+rule is landed.** The prior addendum's "narrower remainder" (PRIMARY KEY/UNIQUE/CHECK/EXCLUDE/FOREIGN KEY/CONSTRAINT at
+table level, interleavable with `column WITH OPTIONS` entries) is no longer rejected.
+
+- **Parser**: the ordinary CREATE TABLE column list's ~330-line inline table-constraint dispatch (the `if p.cur() ==
+  KwPrimary { … } else if KwUnique { … } else if KwCheck { … } else if "exclude" { … } else if KwForeign { … } else if
+  KwConstraint { … }` chain inside `parseCreateTableTail`'s per-element loop) was extracted verbatim into a new shared
+  `parseTableConstraintElement(stmt *CreateTableStmt) (matched bool, err error)` — a mechanical transform (dedent one
+  level, `return nil, err` → `return false, err`, chain wrapped with a trailing `else { return false, nil }` /
+  `return true, nil`), verified behavior-preserving by running the full `internal/parser` suite unchanged before wiring
+  in the second call site. The ordinary CREATE TABLE loop now calls it first and falls through to LIKE/column-definition
+  parsing only when `matched == false`. The `OF type_name (...)` list loop (previously: reject outright on seeing
+  PRIMARY/UNIQUE/CHECK/FOREIGN/CONSTRAINT) now calls the same helper first, falling through to the `column_name WITH
+  OPTIONS ...` parse only when it returns `matched == false` — so both grammar halves are interleavable in any order,
+  matching real PostgreSQL (`gram.y:3809-3812`'s `TypedTableElement: columnOptions | TableConstraint`, no ordering
+  constraint) and its own canonical doc example (`employees OF employee_type (PRIMARY KEY (name), salary WITH OPTIONS
+  DEFAULT 1000)`).
+- **Executor**: no new code needed — confirmed by inspection that `execCreateTable`'s downstream table-constraint-building
+  logic (PRIMARY KEY → unique index, `TableChecks`/`TableUniques`/`TableForeignKeys`/`NamedConstraints` loops) reads
+  `stmt.PrimaryKey`/etc. unconditionally, never gated on `s.OfType == nil`, so a constraint parsed into those same fields
+  from the OF-type-name list rides the identical enforcement path an ordinary CREATE TABLE constraint already uses.
+- Superseded the now-inaccurate `TestCreateTableOfTypeTableConstraintRejected` with
+  `TestCreateTableOfTypeTableConstraintAccepted` (PRIMARY KEY/CHECK/UNIQUE/named-CONSTRAINT each parse into the right
+  stmt field) and `TestCreateTableOfTypeMixedColumnAndTableConstraint` (PG's own mixed doc example) in
+  `internal/parser/create_table_of_type_test.go`; new
+  `TestCreateTableOfTypeTableConstraintMixedWithColumnOptions` (`internal/executor/create_table_of_type_options_test.go`)
+  is a real E2E check that the mixed-form PRIMARY KEY actually enforces uniqueness (23505 on a duplicate insert) while
+  the interleaved DEFAULT still applies.
+- Gates: `go build ./...`/`go vet ./...` clean; `go test -count=1 ./internal/parser/...`/`./internal/executor/...` full
+  packages PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+  bash scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 pgbench workloads).
+
 ### Slice 375 — **`CREATE FOREIGN DATA WRAPPER <name>`** round-trip (PRODUCTION fix)
 
 goopg accepted `CREATE FOREIGN DATA WRAPPER` (parsed as a `CompatNoopStmt` so `DROP` could later succeed) but tracked it only in the

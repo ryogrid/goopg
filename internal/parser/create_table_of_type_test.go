@@ -51,23 +51,73 @@ func TestCreateTableOfTypeEmptyColumnList(t *testing.T) {
 	}
 }
 
-// TestCreateTableOfTypeTableConstraintRejected verifies that a table_constraint
+// TestCreateTableOfTypeTableConstraintAccepted verifies that a table_constraint
 // entry (PRIMARY KEY/UNIQUE/CHECK/FOREIGN KEY/CONSTRAINT at table level) inside
-// the OF-type-name column list is rejected with a clear parse error rather
-// than silently dropped or misparsed as a column. This half of the PG grammar
-// (`{ column_name WITH OPTIONS column_constraint | table_constraint }`) is
-// still out of scope — see the deferral ledger.
-func TestCreateTableOfTypeTableConstraintRejected(t *testing.T) {
-	cases := []string{
-		`CREATE TABLE employees OF employee_type (PRIMARY KEY (name))`,
-		`CREATE TABLE employees OF employee_type (CHECK (salary >= 0))`,
-		`CREATE TABLE employees OF employee_type (UNIQUE (name))`,
-		`CREATE TABLE employees OF employee_type (CONSTRAINT pk_name PRIMARY KEY (name))`,
+// the OF-type-name column list now parses into the same CreateTableStmt fields
+// the ordinary CREATE TABLE column list uses (PrimaryKey/TableChecks/
+// TableUniques/TableForeignKeys/NamedConstraints), via the shared
+// parseTableConstraintElement helper — the second half of PG's grammar
+// `TypedTableElement: columnOptions | TableConstraint` (gram.y:3809-3812).
+// DU-002 slice 374 follow-up (M0122-0024 deferral-ledger resume).
+func TestCreateTableOfTypeTableConstraintAccepted(t *testing.T) {
+	sql := `CREATE TABLE employees OF employee_type (PRIMARY KEY (name))`
+	stmts, err := Parse(sql)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
 	}
-	for _, sql := range cases {
-		if _, err := Parse(sql); err == nil {
-			t.Errorf("Parse(%q): expected rejection error, got nil", sql)
-		}
+	ct := stmts[0].(*CreateTableStmt)
+	if len(ct.PrimaryKey) != 1 || ct.PrimaryKey[0] != "name" {
+		t.Errorf("PrimaryKey = %v, want [name]", ct.PrimaryKey)
+	}
+
+	sql = `CREATE TABLE employees OF employee_type (CHECK (salary >= 0))`
+	stmts, err = Parse(sql)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	ct = stmts[0].(*CreateTableStmt)
+	if len(ct.TableChecks) != 1 {
+		t.Errorf("TableChecks = %v, want 1 entry", ct.TableChecks)
+	}
+
+	sql = `CREATE TABLE employees OF employee_type (UNIQUE (name))`
+	stmts, err = Parse(sql)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	ct = stmts[0].(*CreateTableStmt)
+	if len(ct.TableUniques) != 1 || len(ct.TableUniques[0]) != 1 || ct.TableUniques[0][0] != "name" {
+		t.Errorf("TableUniques = %v, want [[name]]", ct.TableUniques)
+	}
+
+	sql = `CREATE TABLE employees OF employee_type (CONSTRAINT pk_name PRIMARY KEY (name))`
+	stmts, err = Parse(sql)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	ct = stmts[0].(*CreateTableStmt)
+	if len(ct.NamedConstraints) != 1 || ct.NamedConstraints[0].Name != "pk_name" || !ct.NamedConstraints[0].IsPrimary {
+		t.Errorf("NamedConstraints = %+v, want [{Name:pk_name IsPrimary:true ...}]", ct.NamedConstraints)
+	}
+}
+
+// TestCreateTableOfTypeMixedColumnAndTableConstraint verifies PostgreSQL's own
+// canonical CREATE TABLE OF doc example — a table_constraint and a
+// `column WITH OPTIONS` entry interleaved in the same list — parses both
+// halves correctly (previously the table_constraint half rejected the whole
+// statement outright).
+func TestCreateTableOfTypeMixedColumnAndTableConstraint(t *testing.T) {
+	sql := `CREATE TABLE employees OF employee_type (PRIMARY KEY (name), salary WITH OPTIONS DEFAULT 1000)`
+	stmts, err := Parse(sql)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	ct := stmts[0].(*CreateTableStmt)
+	if len(ct.PrimaryKey) != 1 || ct.PrimaryKey[0] != "name" {
+		t.Errorf("PrimaryKey = %v, want [name]", ct.PrimaryKey)
+	}
+	if len(ct.OfTypeColumnOptions) != 1 || ct.OfTypeColumnOptions[0].Name != "salary" || ct.OfTypeColumnOptions[0].DefaultExpr == nil {
+		t.Errorf("OfTypeColumnOptions = %+v, want [{Name:salary DefaultExpr:non-nil}]", ct.OfTypeColumnOptions)
 	}
 }
 
