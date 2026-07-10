@@ -751,3 +751,58 @@ func pgTriggerRowsContainTgname(rows [][]string, tgname string) bool {
 	}
 	return false
 }
+
+// TestPgRewriteRowsScopedToConnectionDBOid mirrors
+// TestPgTriggerRowsScopedToConnectionDBOid above for the pg_rewrite catalog
+// table (M0122-0007 4e follow-up 31): a CREATE RULE DO-NOTHING rule created
+// under one dbOid must not leak into another dbOid's pg_rewrite rows.
+func TestPgRewriteRowsScopedToConnectionDBOid(t *testing.T) {
+	const otherDBOid = 7014
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+
+	ctx.CurrentDatabaseOid = catalog.DefaultDBOid
+	if err := runDDL(t, ctx, "CREATE TABLE t_default (a int)"); err != nil {
+		t.Fatalf("CREATE TABLE t_default: %v", err)
+	}
+	if err := runDDL(t, ctx, "CREATE RULE rule_default AS ON INSERT TO t_default DO INSTEAD NOTHING"); err != nil {
+		t.Fatalf("CREATE RULE rule_default: %v", err)
+	}
+	ctx.CurrentDatabaseOid = otherDBOid
+	if err := runDDL(t, ctx, "CREATE TABLE t_other (a int)"); err != nil {
+		t.Fatalf("CREATE TABLE t_other: %v", err)
+	}
+	if err := runDDL(t, ctx, "CREATE RULE rule_other AS ON INSERT TO t_other DO INSTEAD NOTHING"); err != nil {
+		t.Fatalf("CREATE RULE rule_other: %v", err)
+	}
+
+	im, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		t.Fatalf("ctx.Catalog is %T, want *catalog.InMemory", ctx.Catalog)
+	}
+
+	defaultRows := im.PGRewriteRowsForDBOid(catalog.DefaultDBOid)
+	if !pgRewriteRowsContainRulename(defaultRows, "rule_default") {
+		t.Fatal("DefaultDBOid's pg_rewrite rows are missing rule_default")
+	}
+	if pgRewriteRowsContainRulename(defaultRows, "rule_other") {
+		t.Fatal("DefaultDBOid's pg_rewrite rows include rule_other, a rule created under a distinct dbOid")
+	}
+
+	otherRows := im.PGRewriteRowsForDBOid(otherDBOid)
+	if !pgRewriteRowsContainRulename(otherRows, "rule_other") {
+		t.Fatal("otherDBOid's pg_rewrite rows are missing rule_other")
+	}
+	if pgRewriteRowsContainRulename(otherRows, "rule_default") {
+		t.Fatal("otherDBOid's pg_rewrite rows include rule_default, a rule created under DefaultDBOid")
+	}
+}
+
+func pgRewriteRowsContainRulename(rows [][]string, rulename string) bool {
+	for _, r := range rows {
+		if len(r) > 1 && r[1] == rulename {
+			return true
+		}
+	}
+	return false
+}

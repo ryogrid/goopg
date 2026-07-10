@@ -9745,38 +9745,7 @@ func (c *InMemory) registerSystemTables() {
 	// absent — goopg has no stored user views feeding this dump path. DU-002
 	// slice 324.
 	pgRewrite.VirtualRows = func() [][]string {
-		c.mu.RLock()
-		defer c.mu.RUnlock()
-		var out [][]string
-		for _, tbl := range c.ns(DefaultDBOid).tables {
-			if tbl == nil || tbl.Virtual || tbl.OID == 0 || len(tbl.Rules) == 0 {
-				continue
-			}
-			for _, r := range tbl.Rules {
-				if r.OID == 0 {
-					continue // predates OID tracking → invisible to pg_dump
-				}
-				evType := r.EvType()
-				if evType == "" {
-					continue
-				}
-				isInstead := "f"
-				if r.Instead {
-					isInstead = "t"
-				}
-				out = append(out, []string{
-					fmt.Sprintf("%d", r.OID),   // oid
-					r.Name,                     // rulename
-					fmt.Sprintf("%d", tbl.OID), // ev_class
-					evType,                     // ev_type
-					string(r.EvEnabled()),      // ev_enabled ('O' default; ALTER TABLE … RULE sets D/R/A)
-					isInstead,                  // is_instead
-					"",                         // ev_qual  (NULL — unconditional rule)
-					"",                         // ev_action (NULL — DO NOTHING)
-				})
-			}
-		}
-		return out
+		return c.PGRewriteRowsForDBOid(DefaultDBOid)
 	}
 	c.ns(DefaultDBOid).tables["pg_catalog.pg_rewrite"] = pgRewrite
 
@@ -12964,6 +12933,49 @@ func (c *InMemory) PGTriggerRowsForDBOid(dbOid uint32) [][]string {
 			row[17] = trig.OldTransitionTable // tgoldtable (name)
 			row[18] = trig.NewTransitionTable // tgnewtable (name)
 			out = append(out, row)
+		}
+	}
+	return out
+}
+
+// PGRewriteRowsForDBOid builds the pg_rewrite catalog row-set for dbOid's own
+// tables' CREATE RULE DO-NOTHING rules (mirrors PGTriggerRowsForDBOid's
+// per-connection dbOid scoping above). registerSystemTables's VirtualRows
+// closure calls this with DefaultDBOid so every existing caller (server
+// dispatch without a per-connection PgRewriteRows wire-up, every test) sees
+// byte-identical behavior; a per-connection dbOid is wired in via
+// executor.Context.PgRewriteRows (internal/server/dispatch.go's
+// wireExtensionRows). M0122-0007 4e follow-up 31.
+func (c *InMemory) PGRewriteRowsForDBOid(dbOid uint32) [][]string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	var out [][]string
+	for _, tbl := range c.ns(dbOid).tables {
+		if tbl == nil || tbl.Virtual || tbl.OID == 0 || len(tbl.Rules) == 0 {
+			continue
+		}
+		for _, r := range tbl.Rules {
+			if r.OID == 0 {
+				continue // predates OID tracking → invisible to pg_dump
+			}
+			evType := r.EvType()
+			if evType == "" {
+				continue
+			}
+			isInstead := "f"
+			if r.Instead {
+				isInstead = "t"
+			}
+			out = append(out, []string{
+				fmt.Sprintf("%d", r.OID),   // oid
+				r.Name,                     // rulename
+				fmt.Sprintf("%d", tbl.OID), // ev_class
+				evType,                     // ev_type
+				string(r.EvEnabled()),      // ev_enabled ('O' default; ALTER TABLE … RULE sets D/R/A)
+				isInstead,                  // is_instead
+				"",                         // ev_qual  (NULL — unconditional rule)
+				"",                         // ev_action (NULL — DO NOTHING)
+			})
 		}
 	}
 	return out

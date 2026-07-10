@@ -7047,6 +7047,49 @@ mirroring M0119's ledger `status` column.
       `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
       failed transactions, all 3 pgbench workloads) — run via the pre-commit
       hook at commit time.
+  - [x] `M0122-0007` follow-up 31 (2026-07-10, this loop) — **fixed the next
+      highest-value single sibling builder follow-up 30 flagged: `pg_rewrite`
+      row-content.** Extracted `pg_rewrite.VirtualRows`'s inline closure into
+      new exported `catalog.InMemory.PGRewriteRowsForDBOid(dbOid uint32)
+      [][]string`, parameterizing its one `c.ns(DefaultDBOid)` reference (the
+      loop over every table's `Rules`) to `c.ns(dbOid)`. The registered
+      closure now just calls `PGRewriteRowsForDBOid(DefaultDBOid)`,
+      byte-identical default behavior. Wired new per-connection
+      `executor.Context.PgRewriteRows func() [][]string` field (mirroring
+      `PgTriggerRows`), set in `internal/server/dispatch.go`'s
+      `wireExtensionRows` (new `pgRewriteRowLister` interface), consumed by a
+      new `tbl.Name == "pg_rewrite"` branch in
+      `internal/executor/operators.go`'s `valuesOp.Open`. New test
+      `TestPgRewriteRowsScopedToConnectionDBOid`
+      (`internal/executor/fk_dbid_routing_test.go`), mirroring
+      `TestPgTriggerRowsScopedToConnectionDBOid`: `CREATE RULE ... AS ON
+      INSERT TO ... DO INSTEAD NOTHING` under each of two distinct dbOids,
+      asserted never to cross-leak their `pg_rewrite` rows (by `rulename`).
+      Live end-to-end verified against a real `cmd/goopg` binary + real
+      `psql`: `CREATE DATABASE rwA` / `CREATE DATABASE rwB` → `rwA`: `CREATE
+      TABLE ta (a int); CREATE RULE rule_a AS ON INSERT TO ta DO INSTEAD
+      NOTHING` → `rwB`: same pattern with `tb`/`rule_b` → `SELECT rulename
+      FROM pg_rewrite` in `rwA` returns exactly `rule_a`, the same query in
+      `rwB` returns exactly `rule_b` — no cross-database leak either
+      direction. **Remaining scope (deferred, own future loops):** 3 sibling
+      builders still row-content-`DefaultDBOid`-only — `pg_statistic_ext`,
+      `information_schema.routines`/`parameters`/`routine_*_usage`,
+      `pg_foreign_table`; `pg_sequence`/`pg_sequences`/
+      `information_schema.sequences`, `pg_attribute`/`pg_type`, and the
+      `oid::regclass` cast gap remain separately flagged.
+      `information_schema.routines`/`parameters`/`routine_*_usage` and
+      `pg_foreign_table` have not yet been inspected for which shape they
+      are; `pg_statistic_ext` needs the bigger "give `c.statisticsObjs` a
+      dbOid key" treatment (process-global map, not a table-level slice).
+      Design doc updated (new "pg_rewrite row-content" residual-gap
+      subsection); `docs/design/README.md` row extended; deferral ledger row
+      appended ("pg_rewrite per-dbOid content"). Gates: `go build ./...`/`go
+      vet ./...` clean; `go test ./internal/catalog/... ./internal/executor/...
+      ./internal/server/... ./internal/planner/...` PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed transactions, all 3 pgbench workloads) — run via the pre-commit
+      hook at commit time.
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,

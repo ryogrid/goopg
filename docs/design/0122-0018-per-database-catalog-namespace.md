@@ -1,6 +1,6 @@
 # Per-database catalog namespace (M0122-0007 slice 4)
 
-Status: accepted (sub-slices 4a, 4b-i, 4b-ii, 4c, 4d-i, 4d-ii-part-1, and 4d-ii-part-2a landed; 4d-ii-part-2b items 1, 2, and 3 all fully landed; 4e's FK-target-resolution, sequence-ownership, and view-constraint-dependency items all landed; `CREATE DATABASE ... TEMPLATE` bounded validation landed 2026-07-10; the pg_class-under-fresh-database gap (name resolution generically, row enumeration for pg_class specifically) landed 2026-07-10, and the pg_indexes/pg_tables, pg_constraint, pg_index, pg_attrdef/pg_depend, pg_inherits, pg_policy, and pg_trigger row-content follow-ups landed the same day — 5 sibling virtual-table builders plus the real relation-copy mechanism remain planned, see "Remaining 4e work" below)
+Status: accepted (sub-slices 4a, 4b-i, 4b-ii, 4c, 4d-i, 4d-ii-part-1, and 4d-ii-part-2a landed; 4d-ii-part-2b items 1, 2, and 3 all fully landed; 4e's FK-target-resolution, sequence-ownership, and view-constraint-dependency items all landed; `CREATE DATABASE ... TEMPLATE` bounded validation landed 2026-07-10; the pg_class-under-fresh-database gap (name resolution generically, row enumeration for pg_class specifically) landed 2026-07-10, and the pg_indexes/pg_tables, pg_constraint, pg_index, pg_attrdef/pg_depend, pg_inherits, pg_policy, pg_trigger, and pg_rewrite row-content follow-ups landed the same day — 3 sibling virtual-table builders plus the real relation-copy mechanism remain planned, see "Remaining 4e work" below)
 Date: 2026-07-10
 Supersedes: none — extends the "Still open" note in
 `0122-0017-database-ddl-drop-guards.md` and the deferral-ledger rows dated
@@ -1278,6 +1278,34 @@ cross-database leak either direction. See the 2026-07-10 deferral-ledger row
 `routine_*_usage`, `pg_foreign_table`) still needing this treatment —
 `pg_rewrite` is the cleanest next single-builder pick (identical shape); each
 is its own bounded future loop.
+
+**`pg_rewrite` row-content — FIXED 2026-07-10 (same day, next loop, follow-up
+31).** Single-builder fix, identical shape to `pg_trigger`'s above (no
+cross-builder oid-numbering coupling). `pg_rewrite.VirtualRows`'s inline
+closure (one `c.ns(DefaultDBOid)` loop over every table's `Rules`) was
+extracted into new exported `catalog.InMemory.PGRewriteRowsForDBOid(dbOid
+uint32) [][]string`, parameterizing the `c.ns(DefaultDBOid)` reference to
+`c.ns(dbOid)`. The registered closure now just calls
+`PGRewriteRowsForDBOid(DefaultDBOid)`, byte-identical default behavior. Wired
+new per-connection `executor.Context.PgRewriteRows func() [][]string` field
+(mirroring `PgTriggerRows`), set in `internal/server/dispatch.go`'s
+`wireExtensionRows` (new `pgRewriteRowLister` interface), consumed by a new
+`tbl.Name == "pg_rewrite"` branch in `internal/executor/operators.go`'s
+`valuesOp.Open`. Test `TestPgRewriteRowsScopedToConnectionDBOid`
+(`internal/executor/fk_dbid_routing_test.go`), mirroring
+`TestPgTriggerRowsScopedToConnectionDBOid`: `CREATE RULE ... AS ON INSERT TO
+... DO INSTEAD NOTHING` under each of two distinct dbOids, never cross-leak
+their `pg_rewrite` rows (by `rulename`). Live end-to-end verified against a
+real `cmd/goopg` binary + real `psql`: `CREATE DATABASE rwA` / `CREATE
+DATABASE rwB` → `rwA`: `CREATE TABLE ta (a int); CREATE RULE rule_a AS ON
+INSERT TO ta DO INSTEAD NOTHING` → `rwB`: same pattern with `tb`/`rule_b` →
+`SELECT rulename FROM pg_rewrite` in `rwA` returns exactly `rule_a`, the same
+query in `rwB` returns exactly `rule_b` — no cross-database leak either
+direction. See the 2026-07-10 deferral-ledger row ("pg_rewrite per-dbOid
+content") for the 3 remaining sibling builders (`pg_statistic_ext`,
+`information_schema.routines`/`parameters`/`routine_*_usage`,
+`pg_foreign_table`) still needing this treatment — each is its own bounded
+future loop.
 
 **Remaining 4e work: the `CREATE DATABASE ... TEMPLATE` copy mechanism
 itself** — deep-copying the source dbOid's `catalog.tableNamespace`

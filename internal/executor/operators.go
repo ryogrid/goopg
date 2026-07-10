@@ -154,6 +154,11 @@ func (o *valuesOp) Open(ctx *Context) error {
 			// triggers, not always DefaultDBOid's — mirrors the pg_policy
 			// branch above. M0122-0007 4e follow-up 30.
 			o.rows = rematerialiseVirtualRowsFromStrings(tbl, ctx.PgTriggerRows())
+		} else if tbl.Name == "pg_rewrite" && ctx != nil && ctx.PgRewriteRows != nil {
+			// pg_rewrite must list the connecting database's own tables'
+			// CREATE RULE DO-NOTHING rules, not always DefaultDBOid's —
+			// mirrors the pg_trigger branch above. M0122-0007 4e follow-up 31.
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, ctx.PgRewriteRows())
 		} else if tbl.VirtualRows != nil {
 			o.rows = rematerialiseVirtualRows(o.plan)
 		}

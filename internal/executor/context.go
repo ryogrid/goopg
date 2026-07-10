@@ -535,6 +535,13 @@ type Context struct {
 	// follow-up 30.
 	PgTriggerRows func() [][]string
 
+	// PgRewriteRows mirrors PgTriggerRows above for the pg_rewrite catalog
+	// table: it lists CurrentDatabaseOid's own tables' CREATE RULE DO-NOTHING
+	// rules rather than always DefaultDBOid's (catalog.InMemory's
+	// PGRewriteRowsForDBOid). Wired by the server to close over
+	// CurrentDatabaseOid. M0122-0007 4e follow-up 31.
+	PgRewriteRows func() [][]string
+
 	// NonSuperuserRole, when non-empty, means the session is currently running
 	// under a non-superuser role (set via SET SESSION AUTHORIZATION). Privilege
 	// checks that require superuser (e.g. LEAKPROOF function attribute) must
