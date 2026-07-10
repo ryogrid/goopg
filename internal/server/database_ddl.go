@@ -560,32 +560,35 @@ func (s *Server) resolveActingRoleOID(actingRole string) uint32 {
 
 // resolveCreateDatabaseTemplate resolves templateName to the real dbOid
 // CREATE DATABASE ... TEMPLATE should copy from, plus the sets of the
-// template's own tables, sequences, and plain views that this bounded slice
-// knows how to copy. The template database must exist (mirrors
-// dbcommands.c createdb()'s get_db_info ERRCODE_UNDEFINED_DATABASE check).
-// Beyond that, three shapes are distinguished:
+// template's own tables, sequences, plain views, and materialized views that
+// this bounded slice knows how to copy. The template database must exist
+// (mirrors dbcommands.c createdb()'s get_db_info ERRCODE_UNDEFINED_DATABASE
+// check). Beyond that, three shapes are distinguished:
 //
 //   - templateName resolves to catalog.DefaultDBOid ("template1"/"postgres",
 //     see the dual-mirror note below), or genuinely has zero user content:
-//     returns (0, nil, nil, nil) — "nothing to copy", the caller proceeds
-//     exactly like a plain CREATE DATABASE (unchanged pre-existing behavior,
-//     relied on by TestTryHandleDatabaseDDLCreateEmptyTemplateSucceeds).
+//     returns (0, nil, nil, nil, nil) — "nothing to copy", the caller
+//     proceeds exactly like a plain CREATE DATABASE (unchanged pre-existing
+//     behavior, relied on by TestTryHandleDatabaseDDLCreateEmptyTemplateSucceeds).
 //   - every one of the template's user relations is a plain, unindexed heap
-//     table (!Virtual && !IsMatView && !IsSequence && View == nil &&
-//     OfTypeOID == 0, and the template's dbOid has zero registered indexes at
-//     all), plus any number of non-TEMPORARY sequences and plain views:
-//     returns (srcOid, tables, sequences, views, nil) — the caller copies
-//     each via copyTemplateTables / copyTemplateSequences / copyTemplateViews
-//     respectively (independent of one another; a template can contain any
-//     combination of the three, or none).
+//     table or an unindexed materialized view (!Virtual && !IsSequence &&
+//     View == nil && OfTypeOID == 0 for plain tables; IsMatView && no index
+//     for matviews, and the template's dbOid has zero registered indexes at
+//     all — an index anywhere, including on a matview, still rules out the
+//     whole database), plus any number of non-TEMPORARY sequences and plain
+//     views: returns (srcOid, tables, sequences, views, matViews, nil) — the
+//     caller copies each via copyTemplateTables / copyTemplateSequences /
+//     copyTemplateViews / copyTemplateMatViews respectively (independent of
+//     one another; a template can contain any combination of the four, or
+//     none).
 //   - the template contains anything else this slice does not implement
-//     copying for (an index anywhere in the database, a materialized view, a
-//     typed table, or a temporary sequence): returns a FeatureNotSupported
-//     error. Index/matview/typed-table TEMPLATE copying is deferred to a
-//     future loop (see the deferral ledger) — copying just the bounded
-//     common case (plain tables + sequences + views) first keeps each loop's
-//     blast radius bounded, without also having to invent index-file
-//     cloning or matview/typed-table cloning in the same pass.
+//     copying for (an index anywhere in the database, a typed table, or a
+//     temporary sequence): returns a FeatureNotSupported error.
+//     Index/typed-table TEMPLATE copying is deferred to a future loop (see
+//     the deferral ledger) — copying just the bounded common case (plain
+//     tables + sequences + views + matviews) first keeps each loop's blast
+//     radius bounded, without also having to invent index-file cloning or
+//     typed-table cloning in the same pass.
 //
 // The emptiness/kind checks are skipped entirely when templateName resolves
 // to catalog.DefaultDBOid: "template1" and "postgres" both alias that one
@@ -604,20 +607,20 @@ func (s *Server) resolveActingRoleOID(actingRole string) uint32 {
 // questions. A catalog that doesn't expose databaseTemplateRegistry (some
 // test/embedded paths) skips every check, matching every other soft-typed-
 // interface fallback in this file.
-func (s *Server) resolveCreateDatabaseTemplate(templateName string) (srcOid uint32, tables []*catalog.Table, sequences []executor.SeqInfo, views []*catalog.Table, err error) {
+func (s *Server) resolveCreateDatabaseTemplate(templateName string) (srcOid uint32, tables []*catalog.Table, sequences []executor.SeqInfo, views []*catalog.Table, matViews []*catalog.Table, err error) {
 	tmpl, ok := s.cfg.Catalog.(databaseTemplateRegistry)
 	if !ok {
-		return 0, nil, nil, nil, nil
+		return 0, nil, nil, nil, nil, nil
 	}
 	oid, ok := tmpl.ResolveDatabaseOid(templateName)
 	if !ok {
-		return 0, nil, nil, nil, &databaseDDLError{
+		return 0, nil, nil, nil, nil, &databaseDDLError{
 			code: sqlstate.UndefinedDatabase,
 			msg:  fmt.Sprintf("template database %q does not exist", templateName),
 		}
 	}
 	if oid == catalog.DefaultDBOid {
-		return 0, nil, nil, nil, nil
+		return 0, nil, nil, nil, nil, nil
 	}
 	// Any index anywhere in the template rules out the whole database for
 	// this bounded slice — goopg has no per-database sys-btree catalog
@@ -627,6 +630,7 @@ func (s *Server) resolveCreateDatabaseTemplate(templateName string) (srcOid uint
 	// carries an index.
 	unsupported := len(tmpl.AllIndexes(oid)) > 0
 	var userTables []*catalog.Table
+	var matViewTables []*catalog.Table
 	for _, t := range tmpl.AllTables(oid) {
 		if catalog.IsSystemRelation(t.OID) {
 			// System/catalog relations (anything below catalog.FirstUserOID,
@@ -640,8 +644,19 @@ func (s *Server) resolveCreateDatabaseTemplate(templateName string) (srcOid uint
 		// CreateView always mark their pg_class row Virtual — they're
 		// detected via executor.AllSequenceInfos / tmpl.AllViews below
 		// instead, straight from their own respective registries.
-		if t.IsMatView || t.OfTypeOID != 0 {
+		if t.OfTypeOID != 0 {
 			unsupported = true
+			continue
+		}
+		// Materialized views (M0122-0007 4e follow-up 43): unlike a plain
+		// view, a matview's pg_class row is NOT Virtual (it owns real heap
+		// storage, see execCreateMatView's CreateTable call) — it already
+		// surfaces through this same AllTables loop, so it needs no separate
+		// registry surface the way AllViews does for plain views. Still
+		// subject to the whole-database index veto above (an unindexed
+		// matview is the only shape this slice copies).
+		if t.IsMatView {
+			matViewTables = append(matViewTables, t)
 			continue
 		}
 		userTables = append(userTables, t)
@@ -661,23 +676,23 @@ func (s *Server) resolveCreateDatabaseTemplate(templateName string) (srcOid uint
 		}
 		seqInfos = append(seqInfos, si)
 	}
-	// Plain views (M0122-0007 4e follow-up 42): unlike matviews/typed-tables
-	// above, a view is always copyable in this slice — it is only an AST +
-	// raw SQL text, no relation file and no per-database sys-btree bootstrap
-	// needed (same reasoning as sequences). No unsupported check here.
+	// Plain views (M0122-0007 4e follow-up 42): unlike typed-tables above, a
+	// view is always copyable in this slice — it is only an AST + raw SQL
+	// text, no relation file and no per-database sys-btree bootstrap needed
+	// (same reasoning as sequences). No unsupported check here.
 	viewTables := tmpl.AllViews(oid)
 	if unsupported {
-		return 0, nil, nil, nil, &databaseDDLError{
+		return 0, nil, nil, nil, nil, &databaseDDLError{
 			code: sqlstate.FeatureNotSupported,
 			msg: fmt.Sprintf("CREATE DATABASE ... TEMPLATE %q: copying a template database "+
-				"containing indexes, materialized views, typed tables, or temporary "+
-				"sequences is not yet supported", templateName),
+				"containing indexes, typed tables, or temporary sequences is not yet "+
+				"supported", templateName),
 		}
 	}
-	if len(userTables) == 0 && len(seqInfos) == 0 && len(viewTables) == 0 {
-		return 0, nil, nil, nil, nil
+	if len(userTables) == 0 && len(seqInfos) == 0 && len(viewTables) == 0 && len(matViewTables) == 0 {
+		return 0, nil, nil, nil, nil, nil
 	}
-	return oid, userTables, seqInfos, viewTables, nil
+	return oid, userTables, seqInfos, viewTables, matViewTables, nil
 }
 
 // createDatabasePhysicalDirectory creates base/<oid>/PG_VERSION for a
@@ -891,6 +906,64 @@ func (s *Server) copyTemplateViews(newOid uint32, views []*catalog.Table) error 
 	}
 	return nil
 }
+// copyTemplateMatViews clones each of the template's materialized views into
+// newOid. A materialized view combines both siblings above: like
+// copyTemplateTables, it owns real heap storage (execCreateMatView's
+// CreateTable call leaves Virtual: false) that must be physically copied via
+// copyTemplateRelationFile; like copyTemplateViews, its defining query is a
+// parsed SELECT AST (catalog.Table.View) plus raw SQL text (ViewDef) that
+// CreateTable itself doesn't set and must be copied across explicitly.
+// syncCopiedTableCatalogHeap's generic WAL handling already covers the
+// RecordKindCreateMatView snapshot (syncTableToCatalogHeap, keyed on
+// tbl.IsMatView/tbl.ViewDef, same funnel copyTemplateViews relies on for
+// plain views) — no matview-specific plumbing needed there, and
+// internal/initdb/matview_ddl_recovery.go's replay locates the reloaded
+// table via LookupTableByOIDAllDBs, which is dbOid-agnostic and needs no
+// changes for a copy living under a different dbOid than its source.
+func (s *Server) copyTemplateMatViews(srcOid, newOid uint32, matViews []*catalog.Table) error {
+	im, ok := s.cfg.Catalog.(*catalog.InMemory)
+	if !ok {
+		// No concrete InMemory catalog to clone into (some test/embedded
+		// paths) — resolveCreateDatabaseTemplate already required this same
+		// concrete type (via databaseTemplateRegistry) to produce a non-nil
+		// matViews slice, so this is unreachable in practice; defensive
+		// no-op matches copyTemplateTables' identical fallback.
+		return nil
+	}
+	for _, srcMV := range matViews {
+		cols := append([]catalog.Column(nil), srcMV.Columns...)
+		name := parser.ObjectName{Schema: srcMV.Schema, Name: srcMV.Name}
+		newTbl, err := im.CreateTable(name, cols, newOid)
+		if err != nil {
+			s.rollbackTemplateCopy(newOid)
+			return fmt.Errorf("cloning materialized view %q: %w", srcMV.Name, err)
+		}
+		// CreateTable only registers an ordinary heap table — the
+		// matview-specific state execCreateMatView stamps post-creation
+		// (mirrors its own ordering, operators_ddl.go's execCreateMatView)
+		// must be copied across explicitly, same as copyTemplateViews does
+		// for a plain view's fields. The AST is safe to share by reference:
+		// a matview's Query is only ever replaced wholesale by a later
+		// CREATE OR REPLACE, never mutated in place (same reasoning as
+		// copyTemplateViews).
+		newTbl.IsMatView = true
+		newTbl.IsPopulated = srcMV.IsPopulated
+		newTbl.View = srcMV.View
+		newTbl.ViewDef = srcMV.ViewDef
+		oldRel := storage.RelFileNode{DBOid: srcOid, RelOid: srcMV.OID, Fork: storage.MainFork}
+		newRel := storage.RelFileNode{DBOid: newOid, RelOid: newTbl.OID, Fork: storage.MainFork}
+		if err := s.copyTemplateRelationFile(oldRel, newRel); err != nil {
+			s.rollbackTemplateCopy(newOid)
+			return fmt.Errorf("copying relation file for materialized view %q: %w", srcMV.Name, err)
+		}
+		if err := s.syncCopiedTableCatalogHeap(newOid, newTbl); err != nil {
+			s.rollbackTemplateCopy(newOid)
+			return fmt.Errorf("syncing catalog heap for materialized view %q: %w", srcMV.Name, err)
+		}
+	}
+	return nil
+}
+
 
 // rollbackTemplateCopy removes every table copyTemplateTables has registered
 // under newOid so far, undoing a partial copy after a mid-loop failure.
@@ -1114,11 +1187,11 @@ func (s *Server) tryHandleDatabaseDDL(sql string, liveDBName string, actingRole 
 	switch kind {
 	case databaseDDLCreate:
 		templateName := createDatabaseTemplateName(sql)
-		srcOid, tmplTables, tmplSequences, tmplViews, err := s.resolveCreateDatabaseTemplate(templateName)
+		srcOid, tmplTables, tmplSequences, tmplViews, tmplMatViews, err := s.resolveCreateDatabaseTemplate(templateName)
 		if err != nil {
 			return true, "", err
 		}
-		if len(tmplTables) > 0 || len(tmplSequences) > 0 || len(tmplViews) > 0 {
+		if len(tmplTables) > 0 || len(tmplSequences) > 0 || len(tmplViews) > 0 || len(tmplMatViews) > 0 {
 			// PG: dbcommands.c createdb(), CountOtherDBBackends(src_dboid)
 			// (ERRCODE_OBJECT_IN_USE) — real PostgreSQL refuses to copy a
 			// template while another backend is connected to it (mirrors the
@@ -1187,6 +1260,18 @@ func (s *Server) tryHandleDatabaseDDL(sql string, liveDBName string, actingRole 
 			// either, so this runs independently of the table/sequence-copy
 			// branches above (a template can contain any combination).
 			if cerr := s.copyTemplateViews(oid, tmplViews); cerr != nil {
+				s.rollbackTemplateCopy(oid)
+				_ = cat.DropDatabase(name)
+				s.removeDatabasePhysicalDirectory(oid)
+				return true, "", cerr
+			}
+		}
+		if len(tmplMatViews) > 0 {
+			// M0122-0007 4e follow-up 43: a materialized view needs its
+			// relation file physically copied like a plain table, so this
+			// runs independently of (but after) the table-copy branch above
+			// — same physical-artifact-before-commit ordering.
+			if cerr := s.copyTemplateMatViews(srcOid, oid, tmplMatViews); cerr != nil {
 				s.rollbackTemplateCopy(oid)
 				_ = cat.DropDatabase(name)
 				s.removeDatabasePhysicalDirectory(oid)

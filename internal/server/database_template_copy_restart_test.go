@@ -372,3 +372,134 @@ func TestCreateDatabaseTemplateViewCopiesQueryAndSurvivesRestart(t *testing.T) {
 		t.Fatalf("v_copy leaked into postgres pg_class (count=%d, want 0)", leaked)
 	}
 }
+
+// TestCreateDatabaseTemplateMatViewCopiesDataAndSurvivesRestart: CREATE
+// DATABASE ... TEMPLATE against a source database containing a materialized
+// view — created and populated through the real executor — copies both its
+// defining query AND its already-materialized heap data into the new
+// database, both immediately and after a full data-dir round trip. Mirrors
+// TestCreateDatabaseTemplateViewCopiesQueryAndSurvivesRestart's shape for
+// M0122-0007 4e follow-up 43 (a materialized view combines the plain-table
+// case's physical relation-file copy with the plain-view case's AST/
+// ViewDef/IsPopulated field copy — database_ddl.go's copyTemplateMatViews —
+// exercised here end to end for the first time). Also confirms the two
+// databases' matviews are physically independent: REFRESH in the copy after
+// changing its own underlying table must not alter the source's
+// still-materialized rows.
+func TestCreateDatabaseTemplateMatViewCopiesDataAndSurvivesRestart(t *testing.T) {
+	dir := t.TempDir()
+	if err := initdb.Init(initdb.Options{DataDir: dir}); err != nil {
+		t.Fatalf("initdb.Init: %v", err)
+	}
+
+	ctx := context.Background()
+	s1 := startDBIDRestartServer(t, dir)
+
+	pg := s1.open(t, "postgres")
+	if _, err := pg.ExecContext(ctx, "CREATE DATABASE mv_tmpl_src"); err != nil {
+		pg.Close()
+		s1.close(t)
+		t.Fatalf("CREATE DATABASE mv_tmpl_src: %v", err)
+	}
+
+	src := s1.open(t, "mv_tmpl_src")
+	for _, stmt := range []string{
+		"CREATE TABLE t_mv(a int, b text)",
+		"INSERT INTO t_mv VALUES (1,'x'),(2,'y'),(3,'z')",
+		"CREATE MATERIALIZED VIEW mv_copy AS SELECT a, b FROM t_mv WHERE a > 1",
+	} {
+		if _, err := src.ExecContext(ctx, stmt); err != nil {
+			src.Close()
+			pg.Close()
+			s1.close(t)
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+
+	if _, err := pg.ExecContext(ctx, "CREATE DATABASE mv_tmpl_copy TEMPLATE mv_tmpl_src"); err != nil {
+		src.Close()
+		pg.Close()
+		s1.close(t)
+		t.Fatalf("CREATE DATABASE mv_tmpl_copy TEMPLATE mv_tmpl_src: %v", err)
+	}
+
+	assertMVCopyRows := func(db *sql.DB, label string, want [][2]any) {
+		t.Helper()
+		rows, err := db.QueryContext(ctx, "SELECT a, b FROM mv_copy ORDER BY a")
+		if err != nil {
+			t.Fatalf("%s: SELECT mv_copy: %v", label, err)
+		}
+		defer rows.Close()
+		var got [][2]any
+		for rows.Next() {
+			var a int
+			var b string
+			if err := rows.Scan(&a, &b); err != nil {
+				t.Fatalf("%s: scan: %v", label, err)
+			}
+			got = append(got, [2]any{a, b})
+		}
+		if len(got) != len(want) {
+			t.Fatalf("%s: rows = %+v, want %+v", label, got, want)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Fatalf("%s: rows = %+v, want %+v", label, got, want)
+			}
+		}
+	}
+
+	want := [][2]any{{2, "y"}, {3, "z"}}
+
+	// Immediate visibility (no restart): the copy's matview already carries
+	// the source's materialized data (not just the defining query), and the
+	// source is untouched.
+	cpy := s1.open(t, "mv_tmpl_copy")
+	assertMVCopyRows(cpy, "mv_tmpl_copy (pre-restart)", want)
+	assertMVCopyRows(src, "mv_tmpl_src (pre-restart, source unaffected)", want)
+
+	// Physical independence: changing the copy's own underlying table and
+	// refreshing its matview must not alter the source's still-materialized
+	// rows.
+	if _, err := cpy.ExecContext(ctx, "INSERT INTO t_mv VALUES (4,'w')"); err != nil {
+		cpy.Close()
+		src.Close()
+		pg.Close()
+		s1.close(t)
+		t.Fatalf("INSERT INTO t_mv on copy: %v", err)
+	}
+	if _, err := cpy.ExecContext(ctx, "REFRESH MATERIALIZED VIEW mv_copy"); err != nil {
+		cpy.Close()
+		src.Close()
+		pg.Close()
+		s1.close(t)
+		t.Fatalf("REFRESH MATERIALIZED VIEW mv_copy on copy: %v", err)
+	}
+	assertMVCopyRows(cpy, "mv_tmpl_copy (after its own insert+refresh)", [][2]any{{2, "y"}, {3, "z"}, {4, "w"}})
+	assertMVCopyRows(src, "mv_tmpl_src (after the copy's insert+refresh, source unaffected)", want)
+	cpy.Close()
+	src.Close()
+	pg.Close()
+	s1.close(t)
+
+	// Full restart from the same data dir: the source's matview (never
+	// refreshed) must still resolve and return the same materialized rows.
+	s2 := startDBIDRestartServer(t, dir)
+	defer s2.close(t)
+
+	src2 := s2.open(t, "mv_tmpl_src")
+	defer src2.Close()
+	assertMVCopyRows(src2, "mv_tmpl_src (post-restart)", want)
+
+	// Nothing leaked into the postgres namespace.
+	pg2 := s2.open(t, "postgres")
+	defer pg2.Close()
+	var leaked int
+	if err := pg2.QueryRowContext(ctx,
+		"SELECT count(*) FROM pg_class WHERE relname = 'mv_copy'").Scan(&leaked); err != nil {
+		t.Fatalf("pg_class leak probe: %v", err)
+	}
+	if leaked != 0 {
+		t.Fatalf("mv_copy leaked into postgres pg_class (count=%d, want 0)", leaked)
+	}
+}

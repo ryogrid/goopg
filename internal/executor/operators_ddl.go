@@ -14175,8 +14175,15 @@ func (o *ddlOp) execCreateMatView(s *parser.CreateMatViewStmt) error {
 		}
 		return &ExecError{Code: "42P07", Pos: s.Pos(), Message: fmt.Sprintf("relation %q already exists", s.Name.String())}
 	}
-	// Plan the SELECT query to determine output columns.
-	if err := analyzer.Analyze(s.Query, o.ctx.Catalog); err != nil {
+	// Plan the SELECT query to determine output columns. Uses the same
+	// search-path/dbOid-aware o.planCatalog() every planner.Plan call in this
+	// file uses (not the raw o.ctx.Catalog) — a distinct-dbOid connection's
+	// unscoped LookupTable falls back to DefaultDBOid, so this pre-check
+	// falsely rejected `CREATE MATERIALIZED VIEW ... FROM <table>` on any
+	// non-default database with a bogus 42P01 even though the table
+	// genuinely existed (same shape as the ctxPlanCatalog gap M0122-0007
+	// slice 4d-ii-part-2b item 3 fixed for CREATE VIEW's FROM clause).
+	if err := analyzer.Analyze(s.Query, o.planCatalog()); err != nil {
 		return &ExecError{Code: "42P01", Pos: s.Pos(), Message: err.Error()}
 	}
 	var selectPlan planner.Node
@@ -14365,8 +14372,12 @@ func (o *ddlOp) execRefreshMatView(s *parser.RefreshMatViewStmt) error {
 			}
 		}
 	}
-	// Re-plan the SELECT from the stored query.
-	if err := analyzer.Analyze(tbl.View, o.ctx.Catalog); err != nil {
+	// Re-plan the SELECT from the stored query. Same dbOid-aware
+	// o.planCatalog() the execCreateMatView pre-check now uses (see its own
+	// comment) — the raw o.ctx.Catalog previously used here made REFRESH
+	// MATERIALIZED VIEW fail with a bogus error on any non-default database
+	// whose matview's FROM-table lives under that same non-default dbOid.
+	if err := analyzer.Analyze(tbl.View, o.planCatalog()); err != nil {
 		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: fmt.Sprintf("refresh plan error: %v", err)}
 	}
 	selectPlan, err := planner.Plan(tbl.View, o.planCatalog())

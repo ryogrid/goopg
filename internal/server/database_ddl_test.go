@@ -953,12 +953,18 @@ func TestTryHandleDatabaseDDLCreateTemplateWithViewCopies(t *testing.T) {
 	}
 }
 
-// TestTryHandleDatabaseDDLCreateTemplateWithMatViewErrors pins that a
-// materialized view still rules out the whole template (unlike a plain view,
-// which TestTryHandleDatabaseDDLCreateTemplateWithViewCopies confirms is now
-// copyable) — matview copying needs its own heap-data clone, deferred
-// separately.
-func TestTryHandleDatabaseDDLCreateTemplateWithMatViewErrors(t *testing.T) {
+// TestTryHandleDatabaseDDLCreateTemplateWithMatViewCopies pins the
+// M0122-0007 4e follow-up 43 relation-copy mechanism: a template database
+// whose only user relation is a materialized view is now actually COPIED —
+// both the heap-data clone (copyTemplateTables' own physical-file-copy
+// discipline) and the AST/populated-flag clone (copyTemplateViews' own
+// field-copy discipline for a plain view) combine in copyTemplateMatViews.
+// A hand-built catalog.Table with IsMatView set but Virtual left unset
+// mirrors AllTables' real filtering behavior (a matview's pg_class row is
+// NOT Virtual, per execCreateMatView's CreateTable call — unlike a plain
+// view), so this test can register the matview directly via im.CreateTable
+// rather than needing a dedicated CreateMatView helper.
+func TestTryHandleDatabaseDDLCreateTemplateWithMatViewCopies(t *testing.T) {
 	s := newTestRoleServer()
 	im := s.cfg.Catalog.(*catalog.InMemory)
 
@@ -971,17 +977,44 @@ func TestTryHandleDatabaseDDLCreateTemplateWithMatViewErrors(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateTable under mvsrc: %v", err)
 	}
+	stmts, err := parser.Parse("SELECT id FROM t")
+	if err != nil || len(stmts) != 1 {
+		t.Fatalf("parser.Parse(SELECT id FROM t) = %v, %v", stmts, err)
+	}
+	sel, ok := stmts[0].(*parser.SelectStmt)
+	if !ok {
+		t.Fatalf("parsed statement is %T, want *parser.SelectStmt", stmts[0])
+	}
 	mv.IsMatView = true
 	mv.IsPopulated = true
+	mv.View = sel
+	mv.ViewDef = "SELECT id FROM t"
 
 	handled, _, err := s.tryHandleDatabaseDDL("CREATE DATABASE foo TEMPLATE mvsrc", "postgres", "", nil)
-	if !handled || err == nil {
-		t.Fatalf("CREATE DATABASE foo TEMPLATE mvsrc: handled=%v err=%v, want a typed error", handled, err)
+	if !handled || err != nil {
+		t.Fatalf("CREATE DATABASE foo TEMPLATE mvsrc: handled=%v err=%v, want success", handled, err)
 	}
-	if got := databaseDDLErrorSQLState(err); got != sqlstate.FeatureNotSupported {
-		t.Errorf("SQLSTATE = %q, want %q", got, sqlstate.FeatureNotSupported)
+	if !im.HasDatabase("foo") {
+		t.Fatal("CREATE DATABASE foo TEMPLATE mvsrc: database was not registered")
 	}
-	if im.HasDatabase("foo") {
-		t.Error("CREATE DATABASE foo TEMPLATE mvsrc: database was registered despite the error")
+	newOid := im.DatabaseOid("foo")
+	clone, ok := im.LookupTable(parser.ObjectName{Name: "mv"}, newOid)
+	if !ok {
+		t.Fatal("copied database is missing materialized view \"mv\"")
+	}
+	if clone.OID == mv.OID {
+		t.Error("copied materialized view kept the template's own OID instead of getting a fresh one")
+	}
+	if !clone.IsMatView {
+		t.Error("copied relation lost IsMatView")
+	}
+	if !clone.IsPopulated {
+		t.Error("copied materialized view lost IsPopulated")
+	}
+	if clone.View == nil {
+		t.Fatal("copied materialized view has no parsed query AST")
+	}
+	if clone.ViewDef != "SELECT id FROM t" {
+		t.Errorf("copied materialized view ViewDef = %q, want %q", clone.ViewDef, "SELECT id FROM t")
 	}
 }

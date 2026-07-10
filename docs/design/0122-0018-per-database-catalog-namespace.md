@@ -1,6 +1,6 @@
 # Per-database catalog namespace (M0122-0007 slice 4)
 
-Status: accepted (sub-slices 4a, 4b-i, 4b-ii, 4c, 4d-i, 4d-ii-part-1, and 4d-ii-part-2a landed; 4d-ii-part-2b items 1, 2, and 3 all fully landed; 4e's FK-target-resolution, sequence-ownership, and view-constraint-dependency items all landed; `CREATE DATABASE ... TEMPLATE` bounded validation landed 2026-07-10; the pg_class-under-fresh-database gap (name resolution generically, row enumeration for pg_class specifically) landed 2026-07-10, and the pg_indexes/pg_tables, pg_constraint, pg_index, pg_attrdef/pg_depend, pg_inherits, pg_policy, pg_trigger, pg_rewrite, pg_foreign_table, and pg_sequence row-content follow-ups landed the same day, plus the `oid::regclass`/`'name'::regclass` cast-direction dbOid-scoping gap (follow-up 33) — 2 sibling virtual-table builders (pg_statistic_ext, information_schema.routines/parameters/routine_*_usage) plus pg_sequences/information_schema.sequences (follow-up 34's narrowed remainder) plus the c.foreignServers registry-dbOid-key gap (follow-up 36, landed) and its same-shape c.userMappings sibling (follow-up 37, landed 2026-07-10); follow-up 37's own CURRENT_USER/SESSION_USER/CURRENT_ROLE/USER role-spec resolution discovery closed same-day (follow-up 38); restart durability for user tables created under a distinct-dbOid database — per-database pg_class/pg_attribute heap routing + startup reload into the owning namespace — landed same-day (follow-up 39); the real `CREATE DATABASE ... TEMPLATE` relation-copy mechanism itself landed 2026-07-10 for its bounded plain-table case (follow-up 40), extended the same day to also cover sequences (follow-up 41) and plain views (follow-up 42) — index/matview/typed-table TEMPLATE copying remains deferred, see "Remaining 4e work" below)
+Status: accepted (sub-slices 4a, 4b-i, 4b-ii, 4c, 4d-i, 4d-ii-part-1, and 4d-ii-part-2a landed; 4d-ii-part-2b items 1, 2, and 3 all fully landed; 4e's FK-target-resolution, sequence-ownership, and view-constraint-dependency items all landed; `CREATE DATABASE ... TEMPLATE` bounded validation landed 2026-07-10; the pg_class-under-fresh-database gap (name resolution generically, row enumeration for pg_class specifically) landed 2026-07-10, and the pg_indexes/pg_tables, pg_constraint, pg_index, pg_attrdef/pg_depend, pg_inherits, pg_policy, pg_trigger, pg_rewrite, pg_foreign_table, and pg_sequence row-content follow-ups landed the same day, plus the `oid::regclass`/`'name'::regclass` cast-direction dbOid-scoping gap (follow-up 33) — 2 sibling virtual-table builders (pg_statistic_ext, information_schema.routines/parameters/routine_*_usage) plus pg_sequences/information_schema.sequences (follow-up 34's narrowed remainder) plus the c.foreignServers registry-dbOid-key gap (follow-up 36, landed) and its same-shape c.userMappings sibling (follow-up 37, landed 2026-07-10); follow-up 37's own CURRENT_USER/SESSION_USER/CURRENT_ROLE/USER role-spec resolution discovery closed same-day (follow-up 38); restart durability for user tables created under a distinct-dbOid database — per-database pg_class/pg_attribute heap routing + startup reload into the owning namespace — landed same-day (follow-up 39); the real `CREATE DATABASE ... TEMPLATE` relation-copy mechanism itself landed 2026-07-10 for its bounded plain-table case (follow-up 40), extended the same day to also cover sequences (follow-up 41), plain views (follow-up 42), and materialized views (follow-up 43, including a real `execCreateMatView`/`execRefreshMatView` dbOid-scoping bugfix found along the way) — index/typed-table TEMPLATE copying remains deferred, see "Remaining 4e work" below)
 Date: 2026-07-10
 Supersedes: none — extends the "Still open" note in
 `0122-0017-database-ddl-drop-guards.md` and the deferral-ledger rows dated
@@ -1936,7 +1936,9 @@ correctly caught by the `t.IsMatView` check.
   own doc comment: a hand-built `catalog.Table{View: ...}` with `Virtual`
   left `false` would not reproduce `AllTables`' real filtering), new
   `TestTryHandleDatabaseDDLCreateTemplateWithMatViewErrors` (pins that a
-  materialized view still rules out the whole template, unlike a plain view)
+  materialized view still rules out the whole template, unlike a plain view;
+  **superseded by follow-up 43 below, which repurposed this test into
+  `...WithMatViewCopies` once matview copying itself landed**)
   (`internal/server/database_ddl_test.go`). New E2E
   `TestCreateDatabaseTemplateViewCopiesQueryAndSurvivesRestart`
   (`internal/server/database_template_copy_restart_test.go`): real wire
@@ -1958,10 +1960,116 @@ correctly caught by the `t.IsMatView` check.
   `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
   failed, all 3 workloads).
 - **Remaining 4e scope after follow-up 42 (deferred, own future loops):**
-  index/matview/typed-table TEMPLATE copying (index-file cloning + per-
-  database sys-btree catalog bootstrap; matview data clone; composite-type
-  OID resolution); `pg_statistic_ext`/`information_schema.routines` registry
-  redesign (pre-existing, unrelated to TEMPLATE).
+  index/typed-table TEMPLATE copying (index-file cloning + per-database
+  sys-btree catalog bootstrap; composite-type OID resolution — matview data
+  cloning itself landed the same day, follow-up 43 below);
+  `pg_statistic_ext`/`information_schema.routines` registry redesign
+  (pre-existing, unrelated to TEMPLATE).
+
+**`CREATE DATABASE ... TEMPLATE` materialized-view cloning — LANDED
+(2026-07-10, follow-up 43).** Extends follow-up 40/41/42's copy mechanism to
+materialized views — the shape follow-up 42's own "Remaining 4e scope" bullet
+flagged as needing both halves combined: a matview owns real heap storage
+(`execCreateMatView`'s `CreateTable` call leaves `Virtual: false`, unlike a
+plain view), so it already surfaces through the same `tmpl.AllTables(oid)`
+loop `resolveCreateDatabaseTemplate` uses for plain tables — no new
+`AllMatViews` registry method was needed, unlike `AllViews` for plain views.
+It still needs the plain-table case's physical relation-file copy (its
+materialized DATA) plus the plain-view case's AST/`ViewDef`/`IsPopulated`
+field copy (its defining query) — `copyTemplateMatViews` combines both
+disciplines directly rather than introducing a third one.
+
+- **`internal/server/database_ddl.go`:** `resolveCreateDatabaseTemplate`
+  gained a fifth return value, `matViews []*catalog.Table` (signature now
+  `(srcOid uint32, tables []*catalog.Table, sequences []executor.SeqInfo,
+  views []*catalog.Table, matViews []*catalog.Table, err error)`). The
+  `AllTables(oid)` loop's `if t.IsMatView || t.OfTypeOID != 0 { unsupported =
+  true }` branch was split: `OfTypeOID != 0` (typed tables) still marks the
+  whole database unsupported, but `t.IsMatView` now appends to `matViews`
+  instead — subject to the same whole-database `AllIndexes(oid) > 0` veto as
+  everything else (an indexed matview, like an indexed plain table, still
+  rules out the whole template; this bounded slice still implements no
+  index-file cloning of any kind).
+- **`copyTemplateMatViews`** (new, sibling of `copyTemplateTables` and
+  `copyTemplateViews`, needs `srcOid` unlike `copyTemplateViews` since — like
+  `copyTemplateTables` — it must locate the source's physical relation file):
+  for each source matview, calls `catalog.InMemory.CreateTable` to register
+  an ordinary heap-table clone (mirrors `copyTemplateTables`), then stamps
+  the matview-specific fields `CreateTable` itself doesn't set
+  (`IsMatView`, `IsPopulated`, `View`, `ViewDef` — mirrors
+  `copyTemplateViews`' post-`CreateView` field-copy order, and
+  `execCreateMatView`'s own stamping order; the `View` AST pointer is shared
+  by reference across source and clone, safe for the same reason
+  `copyTemplateViews` documents), then calls `copyTemplateRelationFile` to
+  physically copy the MainFork data file (mirrors `copyTemplateTables`
+  exactly), then calls the pre-existing `syncCopiedTableCatalogHeap` — no
+  matview-specific plumbing needed there either:
+  `syncTableToCatalogHeap`'s `ctx.Pool != nil && tbl.IsMatView &&
+  tbl.ViewDef != ""` branch (the `RecordKindCreateMatView` WAL snapshot) and
+  `internal/initdb/matview_ddl_recovery.go`'s replay (`LookupTableByOIDAllDBs`,
+  dbOid-agnostic per follow-up 39) were both already written generically for
+  the ordinary `CREATE MATERIALIZED VIEW` path.
+- `rollbackTemplateCopy` needed **no changes** for matviews: unlike a plain
+  view or sequence (both `Virtual`, invisible to `AllTables`), a matview's
+  `Virtual: false` row already gets swept by the pre-existing
+  `im.AllTables(newOid)` + `DropTable` loop that plain tables use — the same
+  reason `resolveCreateDatabaseTemplate` needed no new `AllMatViews` registry
+  method.
+- `tryHandleDatabaseDDL`'s `CREATE DATABASE` branch runs `copyTemplateMatViews`
+  as a fourth independent step (after the table-copy branch, since it shares
+  the same physical-artifact-before-commit ordering); the source-database
+  busy guard condition extended to also check `len(tmplMatViews) > 0`.
+- **Real, previously-undiscovered correctness bug found and fixed in the same
+  loop, independent of `CREATE DATABASE ... TEMPLATE` itself:**
+  `execCreateMatView`'s own pre-validation called
+  `analyzer.Analyze(s.Query, o.ctx.Catalog)` — the raw, dbOid-unaware
+  catalog — while its own very next planning call,
+  `planner.Plan(s.Query, o.planCatalog())` (or `PlanSchemaOnly` for `WITH NO
+  DATA`), correctly used the search-path/dbOid-aware wrapper. This is the
+  exact `ctxPlanCatalog` gap 4d-ii-part-2b item 3 fixed for `CREATE VIEW`'s
+  FROM clause (see 4d-ii-part-2a's "New finding" above) — but that fix never
+  touched `execCreateMatView`, which validates its query through a
+  completely separate `analyzer.Analyze` call `execCreateView` doesn't even
+  have. Net effect: `CREATE MATERIALIZED VIEW ... AS SELECT ... FROM <table>`
+  failed with a bogus `42P01 relation "<table>" does not exist` on ANY
+  non-default database whenever `<table>` itself lived under that same
+  non-default dbOid — i.e. materialized views were silently broken on every
+  distinct-dbOid database, caught only because this loop's own E2E test was
+  the first to exercise `CREATE MATERIALIZED VIEW` under a non-default
+  database at all. The identical gap existed a second time in
+  `execRefreshMatView` (`analyzer.Analyze(tbl.View, o.ctx.Catalog)` before
+  `planner.Plan(tbl.View, o.planCatalog())`), caught by this loop's own E2E
+  test's `REFRESH MATERIALIZED VIEW` step failing the same way. Fixed both
+  call sites to use `o.planCatalog()` instead of `o.ctx.Catalog`
+  (`internal/executor/operators_ddl.go`).
+- **Tests:** `TestTryHandleDatabaseDDLCreateTemplateWithMatViewCopies`
+  (repurposed from the now-obsolete `...WithMatViewErrors`, same care as
+  `...WithViewCopies` about reproducing `AllTables`' real filtering)
+  (`internal/server/database_ddl_test.go`). New E2E
+  `TestCreateDatabaseTemplateMatViewCopiesDataAndSurvivesRestart`
+  (`internal/server/database_template_copy_restart_test.go`): real wire
+  protocol creates a table + a populated materialized view over it,
+  TEMPLATE-copies the database, asserts the copy's matview already carries
+  the source's materialized DATA (not just its defining query) immediately,
+  that inserting into the copy's own underlying table and refreshing the
+  copy's matview leaves the source's matview rows unchanged (physical
+  independence, not aliased relation files), and that the source's matview
+  still resolves correctly after a full server restart. Gates: `go build
+  ./...`/`go vet ./...` clean; `go test ./internal/server/...
+  ./internal/catalog/... ./internal/executor/... ./internal/initdb/...`
+  PASS; `go test -race ./internal/server/... ./internal/catalog/...
+  ./internal/executor/...` PASS except the pre-existing, unrelated
+  `TestConnectExceedsPositiveDatconnlimitRejected` race (re-confirmed via
+  `git stash` against unmodified HEAD, reproduces identically, not
+  introduced by this change); `go test -short` full repo (excl. testport)
+  PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke via
+  `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+  failed, all 3 workloads).
+- **Remaining 4e scope after follow-up 43 (deferred, own future loops):**
+  index/typed-table TEMPLATE copying (index-file cloning + per-database
+  sys-btree catalog bootstrap; composite-type OID resolution);
+  `pg_statistic_ext`/`information_schema.routines` registry redesign
+  (pre-existing, unrelated to TEMPLATE).
 
 ## Recommended order and stopping points
 
@@ -1985,11 +2093,12 @@ sections above); `CREATE DATABASE ... TEMPLATE`'s bounded
 existence/emptiness validation also landed (2026-07-10, see its own section
 above); the real relation-copy mechanism itself has now ALSO landed
 (2026-07-10, follow-up 40, see its own section above) for its bounded
-plain-table case, extended the same day to sequences (follow-up 41) and
-plain views (follow-up 42, see their own sections above) — **4e's only
-remaining scope is extending that copy mechanism to index/matview/typed-
-table templates** (see the deferral ledger's follow-up-40/41/42 rows for the
-resume point). Before starting that extension, read 4d-i's,
+plain-table case, extended the same day to sequences (follow-up 41), plain
+views (follow-up 42), and materialized views (follow-up 43, see their own
+sections above) — **4e's only remaining scope is extending that copy
+mechanism to index/typed-table templates** (see the deferral ledger's
+follow-up-40/41/42/43 rows for the resume point). Before starting that
+extension, read 4d-i's,
 4d-ii-part-1's, and 4d-ii-part-2a's/4d-ii-part-2b's/4e's landed sections
 above in full — they document exactly which write entry points and lookups
 already thread the connection's real dbOid (so any extension must resolve

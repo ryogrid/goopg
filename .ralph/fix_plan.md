@@ -7708,13 +7708,69 @@ mirroring M0119's ledger `status` column.
       testport) PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
       `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh`
       PASS (0 failed, all 3 workloads). **Remaining M0122-0007 scope
-      (deferred, own future loops):** index/matview/typed-table TEMPLATE
-      copying (index-file cloning + per-database sys-btree catalog
-      bootstrap; matview heap-data clone reusing this follow-up's own
-      AST-copy half; composite-type OID resolution for typed tables);
-      per-database index/type catalog rows + sys-btree bootstrap
-      (independent of TEMPLATE copy); `pg_statistic_ext`/
-      `information_schema.routines` registry redesign.
+      (deferred, own future loops):** index/typed-table TEMPLATE copying
+      (index-file cloning + per-database sys-btree catalog bootstrap;
+      composite-type OID resolution for typed tables — matview data cloning
+      itself landed the same day, follow-up 43 below); per-database
+      index/type catalog rows + sys-btree bootstrap (independent of
+      TEMPLATE copy); `pg_statistic_ext`/`information_schema.routines`
+      registry redesign.
+  - [x] `M0122-0007` 4e follow-up 43 (2026-07-10, this loop) — **extended
+      `CREATE DATABASE ... TEMPLATE`'s relation-copy mechanism (follow-ups
+      40/41/42) to also cover materialized views.** Unlike a plain view, a
+      matview's pg_class row is NOT `Virtual` (`execCreateMatView`'s
+      `CreateTable` call leaves `Virtual: false`) — it already surfaces via
+      the same `tmpl.AllTables(oid)` loop `resolveCreateDatabaseTemplate`
+      uses for plain tables, so no new `AllMatViews` registry method was
+      needed. `resolveCreateDatabaseTemplate` gained a 5th return value
+      `matViews []*catalog.Table`; new `copyTemplateMatViews`
+      (`internal/server/database_ddl.go`) combines `copyTemplateTables`'
+      physical relation-file copy (the matview's materialized DATA) with
+      `copyTemplateViews`' AST/`ViewDef`/`IsPopulated` field copy (its
+      defining query); `syncCopiedTableCatalogHeap`/`rollbackTemplateCopy`
+      needed zero changes (both already handle matviews generically or via
+      the pre-existing `AllTables` sweep). **Real, independently-discovered
+      correctness bug found and fixed in the same loop:**
+      `execCreateMatView`/`execRefreshMatView` validated their query via the
+      raw, dbOid-unaware `o.ctx.Catalog` instead of the search-path-aware
+      `o.planCatalog()` every sibling `planner.Plan` call in the same
+      functions already used — `CREATE`/`REFRESH MATERIALIZED VIEW`
+      referencing a table on the SAME non-default database falsely raised
+      `42P01`, exactly the `ctxPlanCatalog` gap 4d-ii-part-2b item 3 fixed
+      for `CREATE VIEW`'s FROM clause, except that fix never touched these
+      two matview functions' own separate `analyzer.Analyze` calls. Fixed
+      both call sites to use `o.planCatalog()` (`internal/executor/
+      operators_ddl.go`) — caught only because this loop's own new E2E test
+      was the first to exercise `CREATE`/`REFRESH MATERIALIZED VIEW` under a
+      non-default database at all. Tests:
+      `TestTryHandleDatabaseDDLCreateTemplateWithMatViewCopies` (repurposed
+      from the now-obsolete `...WithMatViewErrors`)
+      (`internal/server/database_ddl_test.go`); new E2E
+      `TestCreateDatabaseTemplateMatViewCopiesDataAndSurvivesRestart`
+      (`internal/server/database_template_copy_restart_test.go`): real wire
+      protocol, a table plus a populated matview over it, TEMPLATE copy, the
+      copy's matview already carries the source's materialized data
+      immediately, physical independence (insert+refresh on the copy leaves
+      the source unchanged), and the source's matview survives a full
+      restart. Design: `docs/design/0122-0018-per-database-catalog-
+      namespace.md` gained a follow-up-43 subsection; `docs/design/
+      README.md` row updated; deferral ledger row appended. Gates: `go
+      build ./...`/`go vet ./...` clean; `go test ./internal/server/...
+      ./internal/catalog/... ./internal/executor/... ./internal/initdb/...`
+      PASS; `go test -race ./internal/server/... ./internal/catalog/...
+      ./internal/executor/...` PASS except the pre-existing, unrelated
+      `TestConnectExceedsPositiveDatconnlimitRejected` race (re-confirmed
+      via `git stash` against unmodified HEAD, reproduces identically); `go
+      test -short` full repo (excl. testport) PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh`
+      PASS (0 failed, all 3 workloads). **Remaining M0122-0007 scope
+      (deferred, own future loops):** index/typed-table TEMPLATE copying
+      (index-file cloning + per-database sys-btree catalog bootstrap;
+      composite-type OID resolution for typed tables); per-database
+      index/type catalog rows + sys-btree bootstrap (independent of
+      TEMPLATE copy); `pg_statistic_ext`/`information_schema.routines`
+      registry redesign.
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,
