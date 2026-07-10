@@ -144,6 +144,11 @@ func (o *valuesOp) Open(ctx *Context) error {
 			// DefaultDBOid's — mirrors the pg_depend branch above.
 			// M0122-0007 4e follow-up 28.
 			o.rows = rematerialiseVirtualRowsFromStrings(tbl, ctx.PgInheritsRows())
+		} else if tbl.Name == "pg_policy" && ctx != nil && ctx.PgPolicyRows != nil {
+			// pg_policy must list the connecting database's own tables' RLS
+			// policies, not always DefaultDBOid's — mirrors the pg_inherits
+			// branch above. M0122-0007 4e follow-up 29.
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, ctx.PgPolicyRows())
 		} else if tbl.VirtualRows != nil {
 			o.rows = rematerialiseVirtualRows(o.plan)
 		}

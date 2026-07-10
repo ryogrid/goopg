@@ -1,6 +1,6 @@
 # Per-database catalog namespace (M0122-0007 slice 4)
 
-Status: accepted (sub-slices 4a, 4b-i, 4b-ii, 4c, 4d-i, 4d-ii-part-1, and 4d-ii-part-2a landed; 4d-ii-part-2b items 1, 2, and 3 all fully landed; 4e's FK-target-resolution, sequence-ownership, and view-constraint-dependency items all landed; `CREATE DATABASE ... TEMPLATE` bounded validation landed 2026-07-10; the pg_class-under-fresh-database gap (name resolution generically, row enumeration for pg_class specifically) landed 2026-07-10, and the pg_indexes/pg_tables, pg_constraint, pg_index, pg_attrdef/pg_depend, and pg_inherits row-content follow-ups landed the same day — 7 sibling virtual-table builders plus the real relation-copy mechanism remain planned, see "Remaining 4e work" below)
+Status: accepted (sub-slices 4a, 4b-i, 4b-ii, 4c, 4d-i, 4d-ii-part-1, and 4d-ii-part-2a landed; 4d-ii-part-2b items 1, 2, and 3 all fully landed; 4e's FK-target-resolution, sequence-ownership, and view-constraint-dependency items all landed; `CREATE DATABASE ... TEMPLATE` bounded validation landed 2026-07-10; the pg_class-under-fresh-database gap (name resolution generically, row enumeration for pg_class specifically) landed 2026-07-10, and the pg_indexes/pg_tables, pg_constraint, pg_index, pg_attrdef/pg_depend, pg_inherits, and pg_policy row-content follow-ups landed the same day — 6 sibling virtual-table builders plus the real relation-copy mechanism remain planned, see "Remaining 4e work" below)
 Date: 2026-07-10
 Supersedes: none — extends the "Still open" note in
 `0122-0017-database-ddl-drop-guards.md` and the deferral-ledger rows dated
@@ -1220,6 +1220,34 @@ table name, on the live server). See the 2026-07-10 deferral-ledger row
 `information_schema.routines`/`parameters`/`routine_*_usage`,
 `pg_foreign_table`) still needing this treatment — each is its own bounded
 future loop.
+
+**`pg_policy` row-content — FIXED 2026-07-10 (same day, next loop, follow-up
+29).** Single-builder fix, no cross-builder oid-numbering coupling like the
+`pg_attrdef`/`pg_depend` pair had. `pg_policy.VirtualRows`'s inline closure
+(one `c.ns(DefaultDBOid)` loop over every table's `Policies`) was extracted
+into new exported `catalog.InMemory.PGPolicyRowsForDBOid(dbOid uint32)
+[][]string`, parameterizing the `c.ns(DefaultDBOid)` reference to
+`c.ns(dbOid)`. The registered closure now just calls
+`PGPolicyRowsForDBOid(DefaultDBOid)`, byte-identical default behavior. Wired
+new per-connection `executor.Context.PgPolicyRows func() [][]string` field
+(mirroring `PgInheritsRows`), set in `internal/server/dispatch.go`'s
+`wireExtensionRows` (new `pgPolicyRowLister` interface), consumed by a new
+`tbl.Name == "pg_policy"` branch in `internal/executor/operators.go`'s
+`valuesOp.Open`. Test `TestPgPolicyRowsScopedToConnectionDBOid`
+(`internal/executor/fk_dbid_routing_test.go`), mirroring
+`TestPgInheritsRowsScopedToConnectionDBOid`: a `CREATE POLICY ... USING`
+under each of two distinct dbOids, never cross-leak their `pg_policy` rows
+(by `polname`). Live end-to-end verified against a real `cmd/goopg` binary +
+real `psql`: `CREATE DATABASE polA` / `CREATE DATABASE polB` → `polA`:
+`CREATE TABLE ta (a int); CREATE POLICY pol_a ON ta USING (a > 0)` → `polB`:
+`CREATE TABLE tb (a int); CREATE POLICY pol_b ON tb USING (a > 0)` →
+`SELECT polname FROM pg_policy` in `polA` returns exactly `pol_a`, the same
+query in `polB` returns exactly `pol_b` — no cross-database leak either
+direction. See the 2026-07-10 deferral-ledger row ("pg_policy per-dbOid
+content") for the 6 remaining sibling builders (`pg_statistic_ext`,
+`pg_trigger`, `pg_rewrite`, `information_schema.routines`/`parameters`/
+`routine_*_usage`, `pg_foreign_table`) still needing this treatment — each is
+its own bounded future loop.
 
 **Remaining 4e work: the `CREATE DATABASE ... TEMPLATE` copy mechanism
 itself** — deep-copying the source dbOid's `catalog.tableNamespace`

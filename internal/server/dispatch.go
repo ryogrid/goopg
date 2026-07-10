@@ -2036,6 +2036,14 @@ func (s *Server) wireExtensionRows(ectx *executor.Context, dbName string) {
 			return pih.PGInheritsRowsForDBOid(catalog.NamespaceDBOid(ectx.CurrentDatabaseOid))
 		}
 	}
+	// pg_policy must likewise reflect the connecting database's own tables'
+	// row-level-security policies, not always DefaultDBOid's. Mirrors the
+	// pg_inherits wiring above. M0122-0007 4e follow-up 29.
+	if pp, ok := s.cfg.Catalog.(pgPolicyRowLister); ok {
+		ectx.PgPolicyRows = func() [][]string {
+			return pp.PGPolicyRowsForDBOid(catalog.NamespaceDBOid(ectx.CurrentDatabaseOid))
+		}
+	}
 }
 
 // pgClassRowLister is implemented by catalog.InMemory to expose a
@@ -2086,6 +2094,13 @@ type pgDependRowLister interface {
 // M0122-0007 4e follow-up 28.
 type pgInheritsRowLister interface {
 	PGInheritsRowsForDBOid(dbOid uint32) [][]string
+}
+
+// pgPolicyRowLister is implemented by catalog.InMemory to expose a
+// per-database pg_policy row-set, mirroring pgInheritsRowLister above.
+// M0122-0007 4e follow-up 29.
+type pgPolicyRowLister interface {
+	PGPolicyRowsForDBOid(dbOid uint32) [][]string
 }
 
 func undoEnumDDLForRollback(connTx *connTxState, cat catalog.Catalog) {

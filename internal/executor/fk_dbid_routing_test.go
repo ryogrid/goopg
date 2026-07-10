@@ -635,3 +635,58 @@ func pgInheritsRowsContainInhrelid(rows [][]string, childOID uint32) bool {
 	}
 	return false
 }
+
+// TestPgPolicyRowsScopedToConnectionDBOid mirrors
+// TestPgInheritsRowsScopedToConnectionDBOid above for the pg_policy catalog
+// table (M0122-0007 4e follow-up 29): a row-security policy created under one
+// dbOid must not leak into another dbOid's pg_policy rows.
+func TestPgPolicyRowsScopedToConnectionDBOid(t *testing.T) {
+	const otherDBOid = 7012
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+
+	ctx.CurrentDatabaseOid = catalog.DefaultDBOid
+	if err := runDDL(t, ctx, "CREATE TABLE t_default (a int)"); err != nil {
+		t.Fatalf("CREATE TABLE t_default: %v", err)
+	}
+	if err := runDDL(t, ctx, "CREATE POLICY pol_default ON t_default USING (a > 0)"); err != nil {
+		t.Fatalf("CREATE POLICY pol_default: %v", err)
+	}
+	ctx.CurrentDatabaseOid = otherDBOid
+	if err := runDDL(t, ctx, "CREATE TABLE t_other (a int)"); err != nil {
+		t.Fatalf("CREATE TABLE t_other: %v", err)
+	}
+	if err := runDDL(t, ctx, "CREATE POLICY pol_other ON t_other USING (a > 0)"); err != nil {
+		t.Fatalf("CREATE POLICY pol_other: %v", err)
+	}
+
+	im, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		t.Fatalf("ctx.Catalog is %T, want *catalog.InMemory", ctx.Catalog)
+	}
+
+	defaultRows := im.PGPolicyRowsForDBOid(catalog.DefaultDBOid)
+	if !pgPolicyRowsContainPolname(defaultRows, "pol_default") {
+		t.Fatal("DefaultDBOid's pg_policy rows are missing pol_default")
+	}
+	if pgPolicyRowsContainPolname(defaultRows, "pol_other") {
+		t.Fatal("DefaultDBOid's pg_policy rows include pol_other, a policy created under a distinct dbOid")
+	}
+
+	otherRows := im.PGPolicyRowsForDBOid(otherDBOid)
+	if !pgPolicyRowsContainPolname(otherRows, "pol_other") {
+		t.Fatal("otherDBOid's pg_policy rows are missing pol_other")
+	}
+	if pgPolicyRowsContainPolname(otherRows, "pol_default") {
+		t.Fatal("otherDBOid's pg_policy rows include pol_default, a policy created under DefaultDBOid")
+	}
+}
+
+func pgPolicyRowsContainPolname(rows [][]string, polname string) bool {
+	for _, r := range rows {
+		if len(r) > 1 && r[1] == polname {
+			return true
+		}
+	}
+	return false
+}

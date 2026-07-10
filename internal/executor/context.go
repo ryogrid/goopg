@@ -521,6 +521,13 @@ type Context struct {
 	// CurrentDatabaseOid. M0122-0007 4e follow-up 28.
 	PgInheritsRows func() [][]string
 
+	// PgPolicyRows mirrors PgInheritsRows above for the pg_policy catalog
+	// table: it lists CurrentDatabaseOid's own tables' row-level-security
+	// policies rather than always DefaultDBOid's (catalog.InMemory's
+	// PGPolicyRowsForDBOid). Wired by the server to close over
+	// CurrentDatabaseOid. M0122-0007 4e follow-up 29.
+	PgPolicyRows func() [][]string
+
 	// NonSuperuserRole, when non-empty, means the session is currently running
 	// under a non-superuser role (set via SET SESSION AUTHORIZATION). Privilege
 	// checks that require superuser (e.g. LEAKPROOF function attribute) must

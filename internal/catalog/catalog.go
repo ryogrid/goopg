@@ -8263,62 +8263,7 @@ func (c *InMemory) registerSystemTables() {
 		OID: 3256,
 	}
 	pgPolicy.VirtualRows = func() [][]string {
-		c.mu.RLock()
-		defer c.mu.RUnlock()
-		var out [][]string
-		for _, tbl := range c.ns(DefaultDBOid).tables {
-			if tbl == nil || tbl.Virtual || tbl.OID == 0 || len(tbl.Policies) == 0 {
-				continue
-			}
-			for _, pol := range tbl.Policies {
-				if pol.OID == 0 {
-					continue // predates OID tracking → invisible to pg_dump
-				}
-				// polroles: format the OID array as a PostgreSQL array literal.
-				// {0} is the PUBLIC sentinel; getPolicies maps it to a NULL TO
-				// clause via `CASE WHEN polroles = '{0}' THEN NULL …`.
-				roles := pol.Roles
-				if len(roles) == 0 {
-					roles = []uint32{0}
-				}
-				parts := make([]string, len(roles))
-				for i, r := range roles {
-					parts[i] = fmt.Sprintf("%d", r)
-				}
-				polroles := "{" + strings.Join(parts, ",") + "}"
-				// polqual / polwithcheck: render the parsed expression with the
-				// catalog-side pg_get_expr deparser, which fully parenthesizes
-				// every node so pg_dump emits `USING ((expr))` / `WITH CHECK
-				// ((expr))`. An absent expression stays "" (→ SQL NULL → pg_dump
-				// omits the clause).
-				var polqual, polwithcheck string
-				if pol.Using != nil {
-					polqual = formatExprForAttrdef(pol.Using)
-				}
-				if pol.WithCheck != nil {
-					polwithcheck = formatExprForAttrdef(pol.WithCheck)
-				}
-				cmd := pol.Command
-				if cmd == 0 {
-					cmd = '*'
-				}
-				permissive := "t"
-				if !pol.Permissive {
-					permissive = "f"
-				}
-				out = append(out, []string{
-					fmt.Sprintf("%d", pol.OID), // oid
-					pol.Name,                   // polname
-					fmt.Sprintf("%d", tbl.OID), // polrelid
-					string(cmd),                // polcmd
-					permissive,                 // polpermissive
-					polroles,                   // polroles
-					polqual,                    // polqual
-					polwithcheck,               // polwithcheck
-				})
-			}
-		}
-		return out
+		return c.PGPolicyRowsForDBOid(DefaultDBOid)
 	}
 	c.ns(DefaultDBOid).tables["pg_catalog.pg_policy"] = pgPolicy
 
@@ -12942,6 +12887,73 @@ func (c *InMemory) PGInheritsRowsForDBOid(dbOid uint32) [][]string {
 			fmt.Sprintf("%d", seq),
 			"f",
 		})
+	}
+	return out
+}
+
+// PGPolicyRowsForDBOid builds the pg_policy catalog row-set for dbOid's own
+// tables' row-level-security policies (mirrors PGInheritsRowsForDBOid's
+// per-connection dbOid scoping above). registerSystemTables's VirtualRows
+// closure calls this with DefaultDBOid so every existing caller (server
+// dispatch without a per-connection PgPolicyRows wire-up, every test) sees
+// byte-identical behavior; a per-connection dbOid is wired in via
+// executor.Context.PgPolicyRows (internal/server/dispatch.go's
+// wireExtensionRows). M0122-0007 4e follow-up 29.
+func (c *InMemory) PGPolicyRowsForDBOid(dbOid uint32) [][]string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	var out [][]string
+	for _, tbl := range c.ns(dbOid).tables {
+		if tbl == nil || tbl.Virtual || tbl.OID == 0 || len(tbl.Policies) == 0 {
+			continue
+		}
+		for _, pol := range tbl.Policies {
+			if pol.OID == 0 {
+				continue // predates OID tracking → invisible to pg_dump
+			}
+			// polroles: format the OID array as a PostgreSQL array literal.
+			// {0} is the PUBLIC sentinel; getPolicies maps it to a NULL TO
+			// clause via `CASE WHEN polroles = '{0}' THEN NULL …`.
+			roles := pol.Roles
+			if len(roles) == 0 {
+				roles = []uint32{0}
+			}
+			parts := make([]string, len(roles))
+			for i, r := range roles {
+				parts[i] = fmt.Sprintf("%d", r)
+			}
+			polroles := "{" + strings.Join(parts, ",") + "}"
+			// polqual / polwithcheck: render the parsed expression with the
+			// catalog-side pg_get_expr deparser, which fully parenthesizes
+			// every node so pg_dump emits `USING ((expr))` / `WITH CHECK
+			// ((expr))`. An absent expression stays "" (→ SQL NULL → pg_dump
+			// omits the clause).
+			var polqual, polwithcheck string
+			if pol.Using != nil {
+				polqual = formatExprForAttrdef(pol.Using)
+			}
+			if pol.WithCheck != nil {
+				polwithcheck = formatExprForAttrdef(pol.WithCheck)
+			}
+			cmd := pol.Command
+			if cmd == 0 {
+				cmd = '*'
+			}
+			permissive := "t"
+			if !pol.Permissive {
+				permissive = "f"
+			}
+			out = append(out, []string{
+				fmt.Sprintf("%d", pol.OID), // oid
+				pol.Name,                   // polname
+				fmt.Sprintf("%d", tbl.OID), // polrelid
+				string(cmd),                // polcmd
+				permissive,                 // polpermissive
+				polroles,                   // polroles
+				polqual,                    // polqual
+				polwithcheck,               // polwithcheck
+			})
+		}
 	}
 	return out
 }

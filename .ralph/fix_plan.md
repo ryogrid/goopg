@@ -6966,6 +6966,45 @@ mirroring M0119's ledger `status` column.
       `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
       `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
       failed transactions, all 3 pgbench workloads).
+  - [x] `M0122-0007` follow-up 29 (2026-07-10, this loop) — **fixed the next
+      highest-value single sibling builder follow-up 28 flagged: `pg_policy`
+      row-content.** Extracted `pg_policy.VirtualRows`'s inline closure into
+      new exported `catalog.InMemory.PGPolicyRowsForDBOid(dbOid uint32)
+      [][]string`, parameterizing its one `c.ns(DefaultDBOid)` reference (the
+      loop over every table's `Policies`) to `c.ns(dbOid)`. The registered
+      closure now just calls `PGPolicyRowsForDBOid(DefaultDBOid)`,
+      byte-identical default behavior. Wired new per-connection
+      `executor.Context.PgPolicyRows func() [][]string` field (mirroring
+      `PgInheritsRows`), set in `internal/server/dispatch.go`'s
+      `wireExtensionRows` (new `pgPolicyRowLister` interface), consumed by a
+      new `tbl.Name == "pg_policy"` branch in
+      `internal/executor/operators.go`'s `valuesOp.Open`. New test
+      `TestPgPolicyRowsScopedToConnectionDBOid`
+      (`internal/executor/fk_dbid_routing_test.go`), mirroring
+      `TestPgInheritsRowsScopedToConnectionDBOid`: a `CREATE POLICY ... USING`
+      under each of two distinct dbOids, asserted never to cross-leak their
+      `pg_policy` rows (by `polname`). Live end-to-end verified against a real
+      `cmd/goopg` binary + real `psql`: `CREATE DATABASE polA` / `CREATE
+      DATABASE polB` → `polA`: `CREATE TABLE ta (a int); CREATE POLICY pol_a
+      ON ta USING (a > 0)` → `polB`: `CREATE TABLE tb (a int); CREATE POLICY
+      pol_b ON tb USING (a > 0)` → `SELECT polname FROM pg_policy` in `polA`
+      returns exactly `pol_a`, the same query in `polB` returns exactly
+      `pol_b` — no cross-database leak either direction. **Remaining scope
+      (deferred, own future loops):** 6 sibling builders still
+      row-content-`DefaultDBOid`-only — `pg_statistic_ext`, `pg_trigger`,
+      `pg_rewrite`, `information_schema.routines`/`parameters`/
+      `routine_*_usage`, `pg_foreign_table`; `pg_sequence`/`pg_sequences`/
+      `information_schema.sequences`, `pg_attribute`/`pg_type`, and the
+      `oid::regclass` cast gap remain separately flagged. Design doc updated
+      (new "pg_policy row-content" residual-gap subsection);
+      `docs/design/README.md` row extended; deferral ledger row appended
+      ("pg_policy per-dbOid content"). Gates: `go build ./...`/`go vet ./...`
+      clean; `go test ./internal/catalog/... ./internal/executor/...
+      ./internal/server/... ./internal/planner/...` PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed transactions, all 3 pgbench workloads) — run via the pre-commit
+      hook at commit time.
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,
