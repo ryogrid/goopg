@@ -1041,3 +1041,63 @@ func pgSequenceRowByRelid(rows [][]string, oid uint32) ([]string, bool) {
 	}
 	return nil, false
 }
+
+// TestPGSequencesAndInfoSchemaSequencesRowsScopedToConnectionDBOid mirrors
+// TestPgSequenceRowsScopedToConnectionDBOid above for the two sibling views
+// follow-up 34 flagged as deferred: pg_catalog.pg_sequences and
+// information_schema.sequences (both read straight from AllSequenceInfos, no
+// catalog.InMemory indirection). A sequence created under one dbOid must not
+// leak into another dbOid's rows for either view. M0122-0007 4e follow-up 35.
+func TestPGSequencesAndInfoSchemaSequencesRowsScopedToConnectionDBOid(t *testing.T) {
+	const otherDBOid = 7019
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+
+	ctx.CurrentDatabaseOid = catalog.DefaultDBOid
+	if err := runDDL(t, ctx, "CREATE SEQUENCE seqs_default START 10 INCREMENT 2"); err != nil {
+		t.Fatalf("CREATE SEQUENCE seqs_default: %v", err)
+	}
+	ctx.CurrentDatabaseOid = otherDBOid
+	if err := runDDL(t, ctx, "CREATE SEQUENCE seqs_other START 100 INCREMENT 5"); err != nil {
+		t.Fatalf("CREATE SEQUENCE seqs_other: %v", err)
+	}
+
+	defaultPGRows := PGSequencesRows(catalog.DefaultDBOid)
+	if !sequenceRowsContainName(defaultPGRows, 1, "seqs_default") {
+		t.Fatal("DefaultDBOid's pg_sequences rows are missing seqs_default")
+	}
+	if sequenceRowsContainName(defaultPGRows, 1, "seqs_other") {
+		t.Fatal("DefaultDBOid's pg_sequences rows include seqs_other, a sequence created under a distinct dbOid")
+	}
+	otherPGRows := PGSequencesRows(otherDBOid)
+	if !sequenceRowsContainName(otherPGRows, 1, "seqs_other") {
+		t.Fatal("otherDBOid's pg_sequences rows are missing seqs_other")
+	}
+	if sequenceRowsContainName(otherPGRows, 1, "seqs_default") {
+		t.Fatal("otherDBOid's pg_sequences rows include seqs_default, a sequence created under DefaultDBOid")
+	}
+
+	defaultInfoRows := InformationSchemaSequencesRows(catalog.DefaultDBOid)
+	if !sequenceRowsContainName(defaultInfoRows, 2, "seqs_default") {
+		t.Fatal("DefaultDBOid's information_schema.sequences rows are missing seqs_default")
+	}
+	if sequenceRowsContainName(defaultInfoRows, 2, "seqs_other") {
+		t.Fatal("DefaultDBOid's information_schema.sequences rows include seqs_other, a sequence created under a distinct dbOid")
+	}
+	otherInfoRows := InformationSchemaSequencesRows(otherDBOid)
+	if !sequenceRowsContainName(otherInfoRows, 2, "seqs_other") {
+		t.Fatal("otherDBOid's information_schema.sequences rows are missing seqs_other")
+	}
+	if sequenceRowsContainName(otherInfoRows, 2, "seqs_default") {
+		t.Fatal("otherDBOid's information_schema.sequences rows include seqs_default, a sequence created under DefaultDBOid")
+	}
+}
+
+func sequenceRowsContainName(rows [][]string, nameCol int, name string) bool {
+	for _, r := range rows {
+		if len(r) > nameCol && r[nameCol] == name {
+			return true
+		}
+	}
+	return false
+}

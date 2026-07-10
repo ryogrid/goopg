@@ -7228,6 +7228,56 @@ mirroring M0119's ledger `status` column.
       `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
       `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
       failed transactions, all 3 pgbench workloads).
+  - [x] `M0122-0007` follow-up 35 (2026-07-10, this loop) — **closed the
+      exact remainder follow-up 34 flagged as deferred: `pg_sequences`
+      (`internal/initdb/pg_sequences_view.go`) and
+      `information_schema.sequences`
+      (`internal/initdb/information_schema_sequences_view.go`), both of
+      which called `executor.AllSequenceInfos()` with no dbOid, hardcoded
+      to `DefaultDBOid`'s sequences regardless of connection.** Unlike
+      `pg_sequence` (singular, a `catalog.InMemory`-backed table needing
+      the `PGSequenceRowsForDBOid` cross-package interface plumbed through
+      `executor.Context`/`wireExtensionRows`), both views read straight
+      from this package's own `seqRegistry` via the already dbOid-aware
+      `AllSequenceInfos(dbOid ...uint32)` — no `catalog.InMemory`
+      indirection is needed at all. Moved the row-shaping logic that used
+      to live inline in each view's `VirtualRows` closure into two new
+      exported `internal/executor/operators_sequence.go` functions,
+      `PGSequencesRows(dbOid uint32)` / `InformationSchemaSequencesRows(dbOid
+      uint32)` (plus a shared `sortedSequenceInfos` helper and the
+      relocated `seqDataTypePrecision`/a local `boolTextSeq`, since
+      `executor` cannot import `internal/initdb` — import cycle).
+      `internal/executor/operators.go`'s `valuesOp.Open` gained two new
+      branches, `tbl.Name == "pg_sequences"` and `tbl.Name == "sequences"
+      && tbl.Schema == "information_schema"`, each calling the new
+      function directly with `catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)`
+      — mirrors the existing `pg_stat_slru`/`pg_stat_io` direct-call
+      branches (same-package state, no `Context`-field indirection needed)
+      rather than the `pg_class`/`pg_sequence`-style cross-package
+      interface pattern. Each initdb view's own `VirtualRows` closure is
+      now a thin fallback calling the new function with
+      `catalog.DefaultDBOid`, used only when `ctx` is nil. New test
+      `TestPGSequencesAndInfoSchemaSequencesRowsScopedToConnectionDBOid`
+      (`internal/executor/fk_dbid_routing_test.go`). Live end-to-end
+      verified against a real `cmd/goopg` binary + real `psql`: two
+      `CREATE DATABASE`s, one `CREATE SEQUENCE` each with distinct
+      START/INCREMENT — each database's `pg_sequences` and
+      `information_schema.sequences` show exactly its own sequence with
+      its own params, no cross-leak either direction. This closes the
+      "sequence ownership follow-on" deferral-ledger row in full (flipped
+      to `resolved`) and appended a new fully-resolved row for this loop's
+      own fix (nothing further deferred for this sub-cluster). Design:
+      `docs/design/0122-0018-per-database-catalog-namespace.md` gained a
+      new subsection; `docs/design/README.md` row updated. Gates: `go
+      build ./...`/`go vet ./...` clean; `go test ./internal/executor/...
+      ./internal/initdb/... ./internal/catalog/... ./internal/server/...`
+      PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh`
+      PASS (0 failed transactions, all 3 pgbench workloads). **Remaining
+      M0122-0007 scope (deferred, own future loops):** `pg_statistic_ext`/
+      `information_schema.routines` (bigger registry redesign);
+      `c.foreignServers` (also touches WAL format); the real `CREATE
+      DATABASE ... TEMPLATE` relation-copy mechanism itself.
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,

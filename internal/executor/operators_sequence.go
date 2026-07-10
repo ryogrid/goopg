@@ -14,6 +14,7 @@ package executor
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -849,6 +850,109 @@ func AllSequenceInfos(dbOid ...uint32) []SeqInfo {
 		return true
 	})
 	return out
+}
+
+func sortedSequenceInfos(dbOid uint32) []SeqInfo {
+	infos := AllSequenceInfos(dbOid)
+	sort.Slice(infos, func(i, j int) bool {
+		if infos[i].Schema != infos[j].Schema {
+			return infos[i].Schema < infos[j].Schema
+		}
+		return infos[i].Name < infos[j].Name
+	})
+	return infos
+}
+
+// PGSequencesRows builds dbOid's own row-set for the pg_catalog.pg_sequences
+// virtual view (registered by internal/initdb's registerPgSequencesView,
+// which calls this with catalog.DefaultDBOid for the unwired/test-fixture
+// default path — a per-connection dbOid is wired in via
+// internal/server/dispatch.go's wireExtensionRows, consumed by
+// internal/executor/operators.go's valuesOp.Open). Unlike pg_sequence
+// (singular, a real catalog.InMemory-backed table needing the
+// PGSequenceRowsForDBOid cross-package interface), pg_sequences reads
+// straight from this package's own seqRegistry via AllSequenceInfos, so no
+// catalog indirection is needed. M0122-0007 4e follow-up 35 (deferred by
+// follow-up 34).
+func PGSequencesRows(dbOid uint32) [][]string {
+	infos := sortedSequenceInfos(dbOid)
+	rows := make([][]string, len(infos))
+	for i, seq := range infos {
+		base := []string{
+			seq.Schema,
+			seq.Name,
+			"", // sequenceowner — not tracked
+			seq.DataType,
+			fmt.Sprintf("%d", seq.Start),
+			fmt.Sprintf("%d", seq.Min),
+			fmt.Sprintf("%d", seq.Max),
+			fmt.Sprintf("%d", seq.Increment),
+			boolTextSeq(seq.Cycle),
+			"1", // cache_size — not tracked, default 1
+		}
+		if seq.Called {
+			// Append last_value; omitting it leaves last_value as NULL.
+			base = append(base, fmt.Sprintf("%d", seq.LastValue))
+		}
+		rows[i] = base
+	}
+	return rows
+}
+
+// InformationSchemaSequencesRows builds dbOid's own row-set for the
+// information_schema.sequences virtual view (registered by
+// internal/initdb's registerInformationSchemaSequencesView). Mirrors
+// PGSequencesRows above. M0122-0007 4e follow-up 35.
+func InformationSchemaSequencesRows(dbOid uint32) [][]string {
+	infos := sortedSequenceInfos(dbOid)
+	rows := make([][]string, len(infos))
+	for i, seq := range infos {
+		dt, prec := seqDataTypePrecision(seq.DataType)
+		cycleOpt := "NO"
+		if seq.Cycle {
+			cycleOpt = "YES"
+		}
+		rows[i] = []string{
+			"postgres", // sequence_catalog = current database
+			seq.Schema,
+			seq.Name,
+			dt,
+			fmt.Sprintf("%d", prec),
+			"2", // numeric_precision_radix — always binary
+			"0", // numeric_scale — always 0 for integer types
+			fmt.Sprintf("%d", seq.Start),
+			fmt.Sprintf("%d", seq.Min),
+			fmt.Sprintf("%d", seq.Max),
+			fmt.Sprintf("%d", seq.Increment),
+			cycleOpt,
+		}
+	}
+	return rows
+}
+
+// seqDataTypePrecision maps a sequence data type name to the canonical
+// PostgreSQL type name and its numeric_precision value. Moved from
+// internal/initdb's information_schema_sequences_view.go when its row
+// building moved here (M0122-0007 4e follow-up 35).
+func seqDataTypePrecision(dt string) (typeName string, precision int) {
+	switch dt {
+	case "smallint", "int2":
+		return "smallint", 16
+	case "integer", "int4", "int":
+		return "integer", 32
+	default: // bigint / int8 (default)
+		return "bigint", 64
+	}
+}
+
+// boolTextSeq formats a bool as PostgreSQL's text-mode boolean output ("t"/"f").
+// Local to avoid depending on internal/initdb's boolText helper (executor
+// cannot import initdb — would create an import cycle).
+func boolTextSeq(b bool) string {
+	if b {
+		return "t"
+	}
+	return "f"
 }
 
 // init wires the catalog's pg_sequence (singular) row builder to the executor's

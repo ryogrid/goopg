@@ -1391,6 +1391,40 @@ direction. `pg_sequences` (`internal/initdb/pg_sequences_view.go`) and
 `executor.AllSequenceInfos()` with no dbOid and remain unfixed — see the
 2026-07-10 deferral-ledger row (follow-up 34) for this narrowed remainder.
 
+**`pg_sequences`/`information_schema.sequences` row-content fixed
+(2026-07-10, follow-up 35):** closed the exact remainder follow-up 34 left
+open above. Unlike `pg_sequence` (singular — a real `catalog.InMemory`-backed
+table needing the `PGSequenceRowsForDBOid` cross-package interface plumbed
+through `executor.Context`/`wireExtensionRows`), both `pg_sequences` (plural)
+and `information_schema.sequences` read straight from this package's own
+`seqRegistry` via the already dbOid-aware `AllSequenceInfos(dbOid ...uint32)`
+— no `catalog.InMemory` indirection is needed at all, so no `Context` field or
+`wireExtensionRows` wiring was added. Moved the row-shaping logic that used to
+live inline in each view's `VirtualRows` closure
+(`internal/initdb/pg_sequences_view.go`/`information_schema_sequences_view.go`)
+into two new exported functions in `internal/executor/operators_sequence.go`:
+`PGSequencesRows(dbOid uint32)` and `InformationSchemaSequencesRows(dbOid
+uint32)` (plus a shared `sortedSequenceInfos` helper and the relocated
+`seqDataTypePrecision`/a local `boolTextSeq`, since `executor` cannot import
+`internal/initdb` — would be an import cycle). `internal/executor/
+operators.go`'s `valuesOp.Open` gained two new branches, `tbl.Name ==
+"pg_sequences"` and `tbl.Name == "sequences" && tbl.Schema ==
+"information_schema"`, each calling the new function directly with
+`catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)` — mirroring the existing
+`pg_stat_slru`/`pg_stat_io` direct-call branches (which also resolve
+same-package state without a `Context`-field indirection) rather than the
+`pg_class`/`pg_sequence`-style cross-package interface pattern. Each initdb
+view's own `VirtualRows` closure is now a thin fallback calling the new
+function with `catalog.DefaultDBOid`, used only when `ctx` is nil (e.g. a test
+constructing the catalog directly without a connection). New test
+`TestPGSequencesAndInfoSchemaSequencesRowsScopedToConnectionDBOid`
+(`internal/executor/fk_dbid_routing_test.go`). Live end-to-end verified
+against a real `cmd/goopg` + `psql`: two `CREATE DATABASE`s, one `CREATE
+SEQUENCE` each with distinct START/INCREMENT — each database's
+`pg_sequences` and `information_schema.sequences` show exactly their own
+sequence with their own params, no cross-leak either direction. This closes
+the last item follow-up 34 flagged as deferred for this sub-cluster.
+
 **Remaining 4e work: the `CREATE DATABASE ... TEMPLATE` copy mechanism
 itself** — deep-copying the source dbOid's `catalog.tableNamespace`
 (tables/indexes/sequences/views, each under freshly allocated OIDs, with FK

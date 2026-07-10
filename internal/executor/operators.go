@@ -169,6 +169,19 @@ func (o *valuesOp) Open(ctx *Context) error {
 			// sequences, not always DefaultDBOid's — mirrors the
 			// pg_foreign_table branch above. M0122-0007 4e follow-up 34.
 			o.rows = rematerialiseVirtualRowsFromStrings(tbl, ctx.PgSequenceRows())
+		} else if tbl.Name == "pg_sequences" && ctx != nil {
+			// pg_sequences must list the connecting database's own sequences,
+			// not always DefaultDBOid's. Unlike pg_sequence (singular) above,
+			// this reads straight from the executor's own seqRegistry (no
+			// catalog.InMemory indirection needed), so it is resolved here
+			// directly rather than through a Context-field wire-up — mirrors
+			// the pg_stat_slru/pg_stat_io direct-call branches above.
+			// M0122-0007 4e follow-up 35.
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, PGSequencesRows(catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)))
+		} else if tbl.Name == "sequences" && ctx != nil && tbl.Schema == "information_schema" {
+			// information_schema.sequences mirrors the pg_sequences branch
+			// above. M0122-0007 4e follow-up 35.
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, InformationSchemaSequencesRows(catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)))
 		} else if tbl.VirtualRows != nil {
 			o.rows = rematerialiseVirtualRows(o.plan)
 		}
