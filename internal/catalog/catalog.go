@@ -7330,6 +7330,23 @@ func (c *InMemory) PGStatioSequencesRowsForDBOid(dbOid uint32, scope StatTableSc
 	return out
 }
 
+// PGStatUserFunctionsRows builds the pg_stat_user_functions /
+// pg_stat_xact_user_functions row set. Both upstream views (system_views.sql)
+// filter on `pg_stat_get_function_calls(oid) IS NOT NULL` (respectively the
+// _xact_ variant), which returns NULL for every function that has no collected
+// call statistics. With the default track_functions = none — and goopg has no
+// per-function call/time tracking at all — that predicate is never satisfied,
+// so both views are always empty on a faithfully-modelled default cluster,
+// exactly as they are on a stock PostgreSQL 18.3 instance out of the box.
+// Registering them lets `SELECT * FROM pg_stat_user_functions` return 0 rows
+// instead of an unknown-relation error, matching upstream. The 6-column shape
+// (funcid/schemaname/funcname/calls/total_time/self_time) is preserved for
+// clients that introspect the view's tupledesc. See
+// docs/design/0122-0003-pg-stat-user-tables.md. M0122-0003.
+func (c *InMemory) PGStatUserFunctionsRows() [][]string {
+	return nil
+}
+
 func (c *InMemory) registerSystemTables() {
 	pgClass := &Table{
 		Schema: "pg_catalog",
@@ -8584,6 +8601,40 @@ func (c *InMemory) registerSystemTables() {
 			OID:     v.oid,
 		}
 		tbl.VirtualRows = func() [][]string { return c.PGStatioSequencesRowsForDBOid(DefaultDBOid, scope) }
+		c.ns(DefaultDBOid).tables["pg_catalog."+v.name] = tbl
+	}
+
+	// pg_stat_user_functions / pg_stat_xact_user_functions — per-function
+	// call/time statistics (PG's system_views.sql). Both upstream views filter
+	// on pg_stat_get_function_calls(oid) IS NOT NULL, which is never true under
+	// the default track_functions = none; goopg has no per-function call/time
+	// tracking, so both views are always empty — byte-identical to a stock
+	// PostgreSQL 18.3 cluster out of the box. Registering them turns a previous
+	// unknown-relation error into the correct 0-row result. See
+	// catalog.PGStatUserFunctionsRows and docs/design/0122-0003-pg-stat-user-tables.md.
+	statFunctionsColumns := func() []Column {
+		return []Column{
+			{Name: "funcid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "schemaname", Type: Type{Name: "name"}, Ordinal: 1},
+			{Name: "funcname", Type: Type{Name: "name"}, Ordinal: 2},
+			{Name: "calls", Type: Type{Name: "int8"}, Ordinal: 3},
+			{Name: "total_time", Type: Type{Name: "float8"}, Ordinal: 4},
+			{Name: "self_time", Type: Type{Name: "float8"}, Ordinal: 5},
+		}
+	}
+	for _, v := range []struct {
+		name string
+		oid  uint32
+	}{
+		{"pg_stat_user_functions", 9096},
+		{"pg_stat_xact_user_functions", 9097},
+	} {
+		tbl := &Table{
+			Schema: "pg_catalog", Name: v.name, Virtual: true,
+			Columns: statFunctionsColumns(),
+			OID:     v.oid,
+		}
+		tbl.VirtualRows = func() [][]string { return c.PGStatUserFunctionsRows() }
 		c.ns(DefaultDBOid).tables["pg_catalog."+v.name] = tbl
 	}
 

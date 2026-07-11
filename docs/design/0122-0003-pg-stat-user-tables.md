@@ -200,6 +200,45 @@ The block counters stay `0` until goopg grows per-relation buffer-pool
 attribution (a `BufferUsage`-per-relation analog), shared with the table/index
 gap above.
 
+## Function sibling: `pg_stat_user_functions` / `pg_stat_xact_user_functions`
+
+The two function-statistics views are the last per-object stat views in the
+family. Upstream (`system_views.sql`) exposes six columns:
+
+```sql
+-- pg_stat_user_functions / pg_stat_xact_user_functions (6 cols)
+funcid, schemaname, funcname, calls, total_time, self_time
+```
+
+They differ from the table/index/sequence views in one decisive way: their
+`WHERE` clause is `pg_stat_get_function_calls(oid) IS NOT NULL` (respectively the
+`pg_stat_get_xact_function_calls` variant). That builtin returns `NULL` for any
+function with no collected call statistics, and with the default
+`track_functions = none` **no** function is ever tracked — so on a stock
+PostgreSQL 18.3 cluster out of the box both views are **empty**. goopg has no
+per-function call/time tracking at all, so the faithful behaviour is identical:
+`catalog.PGStatUserFunctionsRows()` returns no rows unconditionally, and the two
+virtual views (OIDs 9096–9097) are registered with the exact 6-column tupledesc
+so a client can introspect them and query them for `0` rows instead of hitting an
+unknown-relation error.
+
+Because the views are always empty there is no per-database scoping to do — the
+static `VirtualRows` builder is sufficient and no `valuesOp.Open` per-connection
+twin is needed (unlike the table/index/sequence views, whose rows must be scoped
+to the connecting database).
+
+Tests: `internal/catalog/pgstat_functions_test.go`
+(`TestPGStatUserFunctionsRowsAlwaysEmpty`,
+`TestPGStatUserFunctionsViewsRegistered` — both views registered, 6-col
+tupledesc, empty `VirtualRows`) and
+`internal/executor/pgstat_functions_e2e_test.go`
+(`TestPgStatUserFunctionsEndToEnd` — both views resolve through the
+planner/executor and return `0` rows).
+
+Both views stay empty until goopg grows a cumulative per-function statistics
+subsystem (a `PgStat_StatFuncEntry` analog) *and* wires it to a
+`track_functions`-equivalent GUC — a genuinely new subsystem, not a wiring slice.
+
 ## Deferred
 
 The scan/tuple/vacuum/analyze counters and `last_*` timestamps remain honest

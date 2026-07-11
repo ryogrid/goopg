@@ -3852,6 +3852,30 @@ mirroring M0119's ledger `status` column.
       attribution + the not-yet-registered `pg_statio_*_sequences` trio. Gates:
       catalog+executor full packages PASS; go build ./... clean;
       `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33).
+      **`pg_statio_all/user/sys_sequences` done (2026-07-12, later loop):** the
+      per-sequence I/O trio (5 cols `relid/schemaname/relname/blks_read/blks_hit`)
+      completes the `pg_statio_*` family — `catalog.PGStatioSequencesRowsForDBOid`
+      is the only `pg_statio_*` builder selecting sequences (`t.IsSequence`,
+      relkind 'S'); `executor.fetchStatioSequencesRows` twin, OIDs 9093–9095.
+      **`pg_stat_user_functions` + `pg_stat_xact_user_functions` done
+      (2026-07-12, later loop):** the two per-function statistics views — the
+      LAST per-object stat views in the family — now resolve (previously
+      unknown-relation errors). Both upstream views (`system_views.sql`) filter
+      on `pg_stat_get_function_calls(oid) IS NOT NULL`, never true under the
+      default `track_functions = none`, so both are empty on a stock PG 18.3
+      cluster out of the box; goopg has no per-function call/time tracking, so
+      `catalog.PGStatUserFunctionsRows()` returns no rows unconditionally
+      (always-empty = faithful default behaviour, not a shortcut). Registered
+      with the exact 6-col tupledesc `funcid/schemaname/funcname/calls/
+      total_time/self_time` (OIDs 9096–9097) so clients get 0 rows not an error;
+      always-empty ⇒ no per-connection twin needed (unlike the table/index/
+      sequence views). Tests: `internal/catalog/pgstat_functions_test.go` +
+      `internal/executor/pgstat_functions_e2e_test.go`. Design:
+      `docs/design/0122-0003-pg-stat-user-tables.md` new "Function sibling"
+      section + README row. Ledger row (2026-07-12) records the missing
+      `PgStat_StatFuncEntry` counter subsystem + `track_functions` GUC. Gates:
+      catalog+executor full packages PASS; go build ./... clean;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33).
 - [x] **M0122-0004 — SQL language / executor features** (~21). Window frame
       ROWS/RANGE/GROUPS, GROUPING SETS/ROLLUP/CUBE, DEFAULT-clause
       parsing, intervals. **WITH CHECK
