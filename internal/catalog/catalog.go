@@ -8656,6 +8656,43 @@ func (c *InMemory) registerSystemTables() {
 	pgStatDatabaseConflicts.VirtualRows = c.PGStatDatabaseConflictsRows
 	c.ns(DefaultDBOid).tables["pg_catalog.pg_stat_database_conflicts"] = pgStatDatabaseConflicts
 
+	// pg_stats — the human-readable per-column planner-statistics view. Unlike
+	// every pg_stat_* runtime-counter view above, this projects the pg_statistic
+	// catalog (populated by ANALYZE) rather than a live counter subsystem: one row
+	// per analyzed, non-dropped column. It is per-database (lists the connecting
+	// database's own relations), so — like pg_stat_all_tables — the executor swaps
+	// in a per-connection ctx.CurrentDatabaseOid-scoped twin (fetchStatsRows); this
+	// static VirtualRows fallback scopes to DefaultDBOid. Array columns
+	// (most_common_vals / most_common_freqs / histogram_bounds) are emitted as PG
+	// array text literals, which TypedVirtualCell routes verbatim for the anyarray
+	// / float4[] cells. See catalog.PGStatsRowsForDBOid and
+	// docs/design/0122-0003-pg-stat-user-tables.md.
+	pgStats := &Table{
+		Schema: "pg_catalog", Name: "pg_stats", Virtual: true,
+		Columns: []Column{
+			{Name: "schemaname", Type: Type{Name: "name"}, Ordinal: 0},
+			{Name: "tablename", Type: Type{Name: "name"}, Ordinal: 1},
+			{Name: "attname", Type: Type{Name: "name"}, Ordinal: 2},
+			{Name: "inherited", Type: Type{Name: "bool"}, Ordinal: 3},
+			{Name: "null_frac", Type: Type{Name: "float4"}, Ordinal: 4},
+			{Name: "avg_width", Type: Type{Name: "int4"}, Ordinal: 5},
+			{Name: "n_distinct", Type: Type{Name: "float4"}, Ordinal: 6},
+			{Name: "most_common_vals", Type: Type{Name: "anyarray"}, Ordinal: 7},
+			{Name: "most_common_freqs", Type: Type{Name: "float4[]"}, Ordinal: 8},
+			{Name: "histogram_bounds", Type: Type{Name: "anyarray"}, Ordinal: 9},
+			{Name: "correlation", Type: Type{Name: "float4"}, Ordinal: 10},
+			{Name: "most_common_elems", Type: Type{Name: "anyarray"}, Ordinal: 11},
+			{Name: "most_common_elem_freqs", Type: Type{Name: "float4[]"}, Ordinal: 12},
+			{Name: "elem_count_histogram", Type: Type{Name: "float4[]"}, Ordinal: 13},
+			{Name: "range_length_histogram", Type: Type{Name: "anyarray"}, Ordinal: 14},
+			{Name: "range_empty_frac", Type: Type{Name: "float4"}, Ordinal: 15},
+			{Name: "range_bounds_histogram", Type: Type{Name: "anyarray"}, Ordinal: 16},
+		},
+		OID: 9160,
+	}
+	pgStats.VirtualRows = func() [][]string { return c.PGStatsRowsForDBOid(DefaultDBOid) }
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_stats"] = pgStats
+
 	// pg_stat_progress_* — the command-progress reporting family (VACUUM,
 	// ANALYZE, CLUSTER, CREATE INDEX, BASEBACKUP, COPY). Upstream each view is a
 	// projection over pg_stat_get_progress_info('<CMD>'), which returns exactly

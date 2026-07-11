@@ -4031,6 +4031,28 @@ mirroring M0119's ledger `status` column.
       (`internal/initdb/replication_views_test.go`). README 0122-0003 row + ledger
       updated. Live subscription-stats accumulator deferred (ledger). No pg_stat view
       remains unregistered.
+      **`pg_stats` done (2026-07-12, later loop):** the human-readable per-column
+      planner-statistics view (17-col PG 18.3 shape, OID 9160) now resolves
+      (previously unknown-relation). Unlike every `pg_stat_*` runtime-counter view
+      above, `pg_stats` is upstream a SQL view projecting the `pg_statistic`
+      catalog (populated by ANALYZE); goopg has no SQL evaluation over that heap in
+      the virtual path, so `catalog.PGStatsRowsForDBOid` (`internal/catalog/
+      pgstats.go`) reproduces the projection directly from the same in-memory
+      `Table.Stats.Columns` (`ColumnStats`) that `buildUserPGStatisticRow` writes to
+      the `pg_statistic` heap — SIBLING consumers that must agree (same MCV/histogram
+      order, same `SET STATISTICS 0` skip). Per-database like `pg_stat_all_tables`:
+      `executor.fetchStatsRows` twin scopes to `ctx.CurrentDatabaseOid` at
+      `valuesOp.Open`; static `VirtualRows` scopes to `DefaultDBOid`. Array columns
+      (`most_common_vals`/`histogram_bounds` `anyarray`, `most_common_freqs`
+      `float4[]`) emitted as PG array text literals via `ArrayTextLiteral`, routed
+      verbatim by `TypedVirtualCell`. goopg's ANALYZE collects only MCV (kind 1) +
+      histogram (kind 2), so `correlation`/element/range columns (kinds 3–6) are
+      always NULL — faithful to a real cluster whose ANALYZE computed no such slots.
+      Tests: `internal/catalog/pgstats_test.go` +
+      `internal/executor/pgstats_e2e_test.go`. Design +README +ledger updated (row
+      2026-07-12: text-rendered `stavalues`, placeholder `avg_width`, uncollected
+      stakind 3–6 slots deferred). Gates: catalog+executor full packages PASS; go
+      build ./... clean; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33).
 - [x] **M0122-0004 — SQL language / executor features** (~21). Window frame
       ROWS/RANGE/GROUPS, GROUPING SETS/ROLLUP/CUBE, DEFAULT-clause
       parsing, intervals. **WITH CHECK

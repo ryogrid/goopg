@@ -156,6 +156,11 @@ func (o *valuesOp) Open(ctx *Context) error {
 			o.rows = rematerialiseVirtualRowsFromStrings(tbl, fetchStatioSequencesRows(ctx, catalog.StatScopeSys))
 		} else if tbl.Name == "pg_statio_user_sequences" && ctx != nil {
 			o.rows = rematerialiseVirtualRowsFromStrings(tbl, fetchStatioSequencesRows(ctx, catalog.StatScopeUser))
+		} else if tbl.Name == "pg_stats" && ctx != nil {
+			// pg_stats projects the connecting database's own per-column ANALYZE
+			// statistics (pg_statistic), which the static DefaultDBOid VirtualRows
+			// fallback cannot scope. M0122-0003.
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, fetchStatsRows(ctx))
 		} else if tbl.Name == "pg_class" && ctx != nil && ctx.PgClassRows != nil {
 			// pg_class must list the connecting database's own tables/indexes,
 			// not always DefaultDBOid's — use the per-connection, dbOid-scoped

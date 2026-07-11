@@ -528,6 +528,52 @@ correct 12-column shape/order, 0 rows with no subscription defined).
 
 With this view registered, **no `pg_stat_*` view remains unregistered** in goopg.
 
+## `pg_stats` — human-readable per-column planner statistics
+
+Unlike every `pg_stat_*` view above, `pg_stats` is not a runtime-counter view: it
+is upstream a SQL view (`system_views.sql`) that projects the `pg_statistic`
+catalog — populated by `ANALYZE` — joined to `pg_class`/`pg_attribute`/
+`pg_namespace` into one human-readable row per analyzed, non-dropped column
+(schema/table/column identity, `null_frac`, `avg_width`, `n_distinct`, and the
+stakind-dispatched `most_common_vals`/`most_common_freqs`/`histogram_bounds`/
+`correlation`/element/range slots).
+
+goopg has no SQL evaluation over the `pg_statistic` heap in the virtual-catalog
+path, so `catalog.PGStatsRowsForDBOid(dbOid)` (`internal/catalog/pgstats.go`)
+reproduces the same projection directly from the same in-memory
+`Table.Stats.Columns` (`ColumnStats`) that `buildUserPGStatisticRow`
+(`internal/executor/pg18_user_catalog_rows.go`) writes to the `pg_statistic`
+heap. The two are **sibling consumers of `ColumnStats` and must agree** — both
+read `stats.MCV`/`stats.Histogram` in the same order and skip columns with `SET
+STATISTICS 0`. Like `pg_stat_all_tables`, `pg_stats` is per-database: the
+executor swaps in a per-connection `ctx.CurrentDatabaseOid`-scoped twin
+(`fetchStatsRows`, wired at `valuesOp.Open`); the static `VirtualRows` fallback
+(OID 9160) scopes to `DefaultDBOid`. The array columns
+(`most_common_vals`/`histogram_bounds` `anyarray`, `most_common_freqs`
+`float4[]`) are emitted as PG array text literals via `ArrayTextLiteral`, which
+`planner.TypedVirtualCell` routes verbatim for the `anyarray`/`float4[]` cells.
+
+goopg's `ANALYZE` collects only the MCV list (upstream `STATISTIC_KIND_MCV`, slot
+1) and the equi-depth histogram (`STATISTIC_KIND_HISTOGRAM`, slot 2), so
+`correlation` (kind 3), `most_common_elems`/`most_common_elem_freqs` (kind 4),
+`elem_count_histogram` (kind 5) and the three range-type columns (kind 6) are
+always NULL — byte-identical to a real PG 18.3 cluster whose `ANALYZE` computed
+no such slots. Only columns with a materialized `Table.Stats` entry appear
+(matches "a column `ANALYZE` never touched has no `pg_statistic` row").
+
+Simplifications (deferral-ledger row, 2026-07-12): `most_common_vals`/
+`histogram_bounds` are rendered from the canonical `Datum.Format()` text of each
+value (goopg stores stats values as text, not the column's own element type —
+the same deviation as the `pg_statistic` heap's `text[]` `stavalues`);
+`avg_width` mirrors the `pg_statistic` builder's fixed placeholder; and no
+`has_column_privilege`/system-relation filtering is applied (goopg connections
+are superuser, which sees every column — the default case).
+
+Tests: `TestPGStatsViewRegistered`/`TestPGStatsRowsProjectsColumnStats`/
+`TestPGStatsSkipsUnanalyzedAndDisabled` (`internal/catalog/pgstats_test.go`),
+`TestPgStatsEndToEnd`/`TestPgStatsOmitsUnanalyzedTable`
+(`internal/executor/pgstats_e2e_test.go`).
+
 ## Deferred
 
 The scan/tuple/vacuum/analyze counters and `last_*` timestamps remain honest

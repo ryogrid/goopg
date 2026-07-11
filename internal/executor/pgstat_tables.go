@@ -33,6 +33,30 @@ func fetchStatTablesRows(ctx *Context, scope catalog.StatTableScope) [][]string 
 	}
 }
 
+// fetchStatsRows builds the live, per-connection database-scoped row set for the
+// pg_stats view (human-readable per-column planner statistics). Same
+// ctx.Catalog-unwrap + ctx.CurrentDatabaseOid scoping as fetchStatTablesRows, so
+// a table's column stats in one database are invisible from another. Falls back
+// to the static DefaultDBOid VirtualRows shape (returns nil here) when no
+// InMemory catalog is reachable. See catalog.PGStatsRowsForDBOid.
+func fetchStatsRows(ctx *Context) [][]string {
+	if ctx == nil || ctx.Catalog == nil {
+		return nil
+	}
+	type unwrapper interface{ Unwrap() catalog.Catalog }
+	base := ctx.Catalog
+	for {
+		if im, ok := base.(*catalog.InMemory); ok {
+			return im.PGStatsRowsForDBOid(catalog.NamespaceDBOid(ctx.CurrentDatabaseOid))
+		}
+		if u, ok := base.(unwrapper); ok {
+			base = u.Unwrap()
+			continue
+		}
+		return nil
+	}
+}
+
 // fetchStatXactTablesRows is the per-transaction sibling of fetchStatTablesRows: it
 // builds the live, per-connection database-scoped row set for the
 // pg_stat_xact_all_tables / pg_stat_xact_user_tables / pg_stat_xact_sys_tables virtual
