@@ -1,42 +1,39 @@
 (idle — nothing in flight)
 
-## Loop summary (2026-07-12, loop #89)
+## Loop summary (2026-07-12, loop #90)
 
-**M-NIGHTLY triage — nightly run 20260712-020530 (39 AI items).** Two distinct
-causes, both handled:
+**M-NIGHTLY AI-20260712-020530-002 — root-cause CORRECTION (no functional code
+change).** The nightly triage for run 20260712-020530 was already complete
+(loop #89: 38/39 = stale build break fixed at HEAD; AI-002 = flaky
+TuplelockUpgradeNoDeadlock, demoted + deferred). This loop re-diagnosed AI-002
+empirically and CORRECTED loop #89's wrong root cause.
 
-1. **38/39 = transient build break, ALREADY FIXED at HEAD.** Every one of AI
-   -001,-003..-039 failed with `init failed: operators_ddl.go:13357: not enough
-   arguments in call to catalog.DecodePGIndexPhysicalRow have ([]byte) want
-   ([]byte,[]byte)`. CI built at sha 401e6212 (1-arg caller) mid-way through the
-   `DecodePGIndexPhysicalRow` 2-arg signature landing; commit 88d4eaab fixed the
-   caller. `go build ./...` clean at HEAD; verified PgAmcheck002Nonesuch +
-   PgDumpConnectionSetup PASS. Already checked off in fix_plan (build-break
-   cascade item). No product change.
+**Finding (instrumented, proof):** on the failing perm — `s1_share
+s2_for_update s3_for_update s1_rollback s2_rollback s3_rollback` (a FOR UPDATE
+case, not the s2_update/s3_update perm loop #89 named) — EVERY tuple-lock
+acquire reports `LockMgr==nil`, so `acquireTupleLock`/`tryAcquireTupleLock` are
+TOTAL NO-OPS in the server, INCLUDING lockRowsOp's FOR UPDATE ExclusiveLock
+(operators_lockrows.go:900). This is by deliberate design
+(context.go:863-871): `Context.LockMgr` is nil in production to keep heavyweight
+locking off the hot path, so all row-lock serialisation rides
+xmax/`WaitForXID`, whose single `commitCond.Broadcast()` wakes every waiter →
+non-FIFO race (s3 sometimes beats s2, s2 times out). Loop #89's "FOR UPDATE is
+stable / DML epqWait path lacks the tuple lock" was FALSE; its proposed fix
+(add acquireTupleLock to epqWait) would ALSO be a no-op.
 
-2. **1/39 (AI-...-002) = TestPort_IsolationTuplelockUpgradeNoDeadlock, REAL
-   flaky FIFO-fairness bug — MY TASK THIS LOOP.** Genuinely flaky ~17% STANDALONE
-   at HEAD (1 FAIL/5 PASS), NOT the co-load flake the earlier AI-20260711
-   -011536-002 claimed. Root cause: goopg's DML UPDATE/DELETE conflict path
-   (`epqWait`→`mvcc.WaitForXID`, operators_storage.go:166,180) takes NO
-   serialising per-tuple lock and `WaitForXID` wakes all waiters with one
-   `commitCond.Broadcast()` (manager.go:790) → waiters race to re-stamp xmax →
-   non-FIFO. PG grants FIFO via LOCKTAG_TUPLE in heap_lock_tuple/heap_update.
-   Perms 66 (s2_update/s3_update) & 67 (s2_delete/s3_delete) diverge; FOR UPDATE
-   perms 57/65 stable (lockRowsOp already acquireTupleLocks).
+**Landed:** design doc `docs/design/0021-0012-tuple-lock-fifo-wiring.md` (+README
+row); corrected the test doc comment; deferral_ledger.md correction row. Test
+stays demoted (`runIsoSpec`). No production code changed. Did NOT edit fix_plan
+(driver-churn hazard) — correction lives in ledger+design-doc+test-comment.
 
-**Landed (de-flake, not the engine fix):** demoted the test
-`runIsoSpecStrict`→`runIsoSpec` (skip-on-mismatch → no more nightly red flap)
-with an explanatory comment; target-inventory.csv line 612 `pass`→`defer` +
-regenerated .md (isolation pass 120→119, defer 0→1); deferral_ledger.md row;
-fix_plan M-NIGHTLY reopened-subject task. Gates: go build ./... clean; go vet
-testport clean; demoted test 6/6 ok (never FAIL); ralph-state-guard OK.
+Gates: go build ./... clean; go vet testport clean; demoted test 6/6 ok (never
+FAIL); ralph-state-guard OK (auto-repaired progress marker).
 
-Files: internal/testport/isolation_port_test.go, docs/test-port/postgres-oracle
--target-inventory.{csv,md}, .ralph/{deferral_ledger,fix_plan}.md.
-
-Next: the ENGINE fix is a deferred slice (HIGH blast radius — whole isolation
-surface): acquire `ctx.acquireTupleLock(rel,ptr,ExclusiveLock)` before
-`WaitForXID` in the epqWait DML conflict path, then re-promote the test to
-runIsoSpecStrict + CSV back to pass. Needs full isolation-suite validation.
+**Next (deferred slice, HIGH blast radius):** implement 0021-0012 — route
+acquireTupleLock/tryAcquireTupleLock to the always-on `tableLockMgr` under a
+statement-scoped backend id + per-statement release; keep acquireRelLock on nil
+c.LockMgr; then re-promote test to runIsoSpecStrict + CSV `pass`. Validate with
+FULL isolation suite (`go test -run TestPort_Isolation ./internal/testport/`) +
+pgbench smoke — NOT a spot check (second deadlock domain, NOWAIT/SKIP-LOCKED,
+coarse key-share modes).
 In-flight: none

@@ -1979,26 +1979,36 @@ func TestPort_IsolationMultixactNoDeadlock(t *testing.T) {
 // membership), not the heavyweight lockmgr. M0118-0004.
 //
 // DEMOTED from runIsoSpecStrict → runIsoSpec (2026-07-12, loop #89, nightly
-// AI-20260712-020530-002). The 8043b9ff promotion to pass-required was based on
-// a lucky run: two of the nine permutations — perm 66
-// `s1_share s2_update s3_update ...` and perm 67 `s1_share s2_delete s3_delete
-// ...` — expose an UNIMPLEMENTED PG semantics gap and are flaky at ~17%
-// standalone (verified 1 FAIL / 5 PASS at HEAD; the earlier
-// AI-20260711-011536-002 "co-load timing flake, 3/3 standalone" diagnosis got
-// lucky and did not hold). Root cause: PG serialises tuple-lock waiters through
-// a heavyweight LOCKTAG_TUPLE acquired in heap_update/heap_lock_tuple *before*
-// XactLockTableWait, so its per-tuple wait queue grants the row in FIFO arrival
-// order — s2 (arrived first) always completes before s3. goopg's DML
-// UPDATE/DELETE conflict path (epqWait, internal/executor/operators_storage.go)
-// calls mvcc.Manager.WaitForXID directly with NO serialising tuple lock, and
-// WaitForXID wakes every waiter with a single commitCond.Broadcast(); the
-// waiters then race to re-stamp the row's xmax and the winner is decided by Go
-// scheduling — sometimes s3 beats s2, which then times out ("driver: bad
-// connection"), diverging from PG. (The FOR UPDATE perms 57/65 are stable
-// because lockRowsOp DOES acquireTupleLock.) Re-promote to runIsoSpecStrict once
-// the DML conflict path acquires a serialising per-tuple lock (LOCKTAG_TUPLE
-// analog via Context.acquireTupleLock) before WaitForXID. Tracked:
-// deferral_ledger.md + fix_plan M-NIGHTLY (AI-20260712-020530-002).
+// AI-20260712-020530-002). Flaky at ~10-17% standalone; the failing permutation
+// is `s1_share s2_for_update s3_for_update s1_rollback s2_rollback s3_rollback`
+// (a FOR UPDATE case) — s3 (arrived 2nd) completes before s2 (arrived 1st) and
+// s2 then times out ("driver: bad connection").
+//
+// ROOT CAUSE (loop #90, corrected — supersedes loop #89's "the DML UPDATE/DELETE
+// epqWait path lacks a tuple lock; FOR UPDATE is stable"): that diagnosis was
+// WRONG. Empirically (instrumented Context.acquireTupleLock), *every* tuple-lock
+// acquisition in the server path reports LockMgr==nil, so acquireTupleLock /
+// tryAcquireTupleLock are TOTAL NO-OPS — including lockRowsOp's FOR UPDATE
+// ExclusiveLock. This is by deliberate design: Context.LockMgr is nil in the
+// production server (see internal/executor/context.go:863-871), which keeps
+// heavyweight locking off the pgbench/TPC-H hot path and makes cross-statement
+// row blocking ride xmax/WaitForXID instead. Consequence: two FOR UPDATE waiters
+// s2/s3 do NOT queue FIFO on a LOCKTAG_TUPLE — they both fall through to
+// mvcc.Manager.WaitForXID(s1), whose single commitCond.Broadcast() wakes both;
+// they race to re-stamp the row and Go scheduling picks the winner, so s3
+// sometimes beats s2. PG instead serialises them through a heavyweight
+// LOCKTAG_TUPLE acquired in heap_lock_tuple/heap_update *before*
+// XactLockTableWait, granting the row in arrival order.
+//
+// FIX (deferred, its own slice — HIGH blast radius; see docs/design/
+// 0021-0012-tuple-lock-fifo-wiring.md + deferral_ledger.md): route
+// acquireTupleLock / tryAcquireTupleLock to the always-on package-global
+// tableLockMgr (as LOCK TABLE already does) under a statement-scoped backend
+// identity, add a per-statement release, then re-promote to runIsoSpecStrict +
+// restore target-inventory.csv `pass`. Needs a full isolation-suite + pgbench
+// smoke pass because it activates real tuple locking (second deadlock domain,
+// NOWAIT/SKIP-LOCKED double-handling) that the design intentionally kept dormant.
+// Tracked: fix_plan M-NIGHTLY (AI-20260712-020530-002).
 func TestPort_IsolationTuplelockUpgradeNoDeadlock(t *testing.T) {
 	root := repoRoot(t)
 	c := newCluster(t, "iso_tuplelock_upgrade_no_deadlock")
