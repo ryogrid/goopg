@@ -1279,6 +1279,71 @@ func TestIntervalInfinityArithmetic(t *testing.T) {
 	}
 }
 
+// TestTimestampIntervalInfinity drives `timestamp ± interval 'infinity'`
+// end-to-end, a line-port of PG's timestamp_pl_interval / timestamp_mi_interval
+// infinity handling (postgres/src/backend/utils/adt/timestamp.c:3107): a
+// ±infinity interval forces the result to the same-signed infinite timestamp
+// (subtraction negates the span first), a finite interval added to an
+// already-infinite timestamp passes it through, and "infinity − infinity"
+// errors since the timestamp type has no NaN. Every `want` was captured
+// byte-for-byte from live PostgreSQL 18.3 (socket /tmp:5599, postgres role).
+// This is the last #5(d-iv) sub-item (infinite-timestamp carrier).
+func TestTimestampIntervalInfinity(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+	if err := runDDL(t, ctx, "CREATE TABLE t (id int)"); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	if err := runDDL(t, ctx, "INSERT INTO t VALUES (1)"); err != nil {
+		t.Fatalf("INSERT: %v", err)
+	}
+	const base = "timestamp '2020-01-01 00:00:00'"
+	accept := []struct{ sql, want string }{
+		// A ±infinity interval forces the same-signed infinite timestamp.
+		{"SELECT " + base + " + interval 'infinity'", "infinity"},
+		{"SELECT " + base + " - interval 'infinity'", "-infinity"},
+		{"SELECT " + base + " + interval '-infinity'", "-infinity"},
+		{"SELECT " + base + " - interval '-infinity'", "infinity"},
+		// interval + timestamp (commutative add).
+		{"SELECT interval 'infinity' + " + base, "infinity"},
+		{"SELECT interval '-infinity' + " + base, "-infinity"},
+		// A finite interval added to an already-infinite timestamp passes the
+		// timestamp through unchanged (TIMESTAMP_NOT_FINITE branch).
+		{"SELECT (" + base + " + interval 'infinity') + interval '1 day'", "infinity"},
+		{"SELECT (" + base + " + interval 'infinity') - interval '1 day'", "infinity"},
+		{"SELECT (" + base + " - interval 'infinity') + interval '5 years'", "-infinity"},
+		{"SELECT (" + base + " - interval 'infinity') - interval '5 years'", "-infinity"},
+		// Like-signed infinity + infinity is allowed (matches the NOEND/NOBEGIN
+		// same-sign passthrough in timestamp_pl_interval).
+		{"SELECT (" + base + " + interval 'infinity') + interval 'infinity'", "infinity"},
+		{"SELECT (" + base + " - interval 'infinity') - interval 'infinity'", "-infinity"},
+		// Ordering: the sentinels sort beyond every finite timestamp and each
+		// other (-infinity < finite < +infinity).
+		{"SELECT (" + base + " + interval 'infinity') > timestamp '9999-01-01'", "t"},
+		{"SELECT (" + base + " - interval 'infinity') < timestamp '0001-01-01'", "t"},
+	}
+	for _, c := range accept {
+		rows := runQuery(t, ctx, c.sql+" FROM t")
+		if len(rows) != 1 || len(rows[0]) != 1 {
+			t.Fatalf("%s: expected 1x1 result, got %v", c.sql, rows)
+		}
+		if got := rows[0][0].Format(); got != c.want {
+			t.Errorf("%s = %q, want %q", c.sql, got, c.want)
+		}
+	}
+
+	// "infinity − infinity" has no NaN equivalent → "timestamp out of range".
+	reject := []string{
+		"SELECT (" + base + " + interval 'infinity') - interval 'infinity' FROM t",
+		"SELECT (" + base + " - interval 'infinity') + interval 'infinity' FROM t",
+	}
+	for _, sql := range reject {
+		if _, err := runQueryErr(t, ctx, sql); err == nil {
+			t.Errorf("%s: expected error, got none", sql)
+		}
+	}
+}
+
 // TestExtractFromInterval covers EXTRACT(field FROM interval), a line-port of
 // interval_part_common. Every `want` below was captured from PostgreSQL 18.3
 // (modulo goopg's trailing-zero stripping on numeric output — PG prints

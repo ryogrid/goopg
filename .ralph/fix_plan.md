@@ -8201,6 +8201,33 @@ mirroring M0119's ledger `status` column.
       parser + executor interval suites PASS; pgbench (hook). Still deferred (the
       LAST open #5(d-iv) sub-item): `timestamp ± interval 'infinity'`
       (infinite-timestamp carrier).
+  - [x] `unimplemented_feat #5(d-iv) (timestamp ± interval 'infinity')`
+      (2026-07-11, this loop) — closed the LAST open #5(d-iv) sub-item. A
+      `±infinity` interval added to / subtracted from a timestamp now yields a
+      ±infinity timestamp, line-porting PG's `timestamp_pl_interval` /
+      `timestamp_mi_interval` (`postgres/src/backend/utils/adt/timestamp.c:3107`).
+      **Carrier:** INT64 sentinels on the existing `KindTime` Unix-nanoseconds
+      `Int` — `math.MaxInt64`=+infinity, `math.MinInt64`=-infinity (mirrors PG's
+      `TIMESTAMP_END`/`TIMESTAMP_BEGIN`; a real timestamp saturates ~year 2262 so
+      no collision). New `Datum.IsTimestampPosInf/IsTimestampNegInf/`
+      `IsTimestampNotFinite` + `NewTimestampInfinity` in `internal/executor/
+      datum.go`. **Arithmetic:** `addTimeInterval` (`internal/executor/expr.go`)
+      now returns `(Datum, error)`; a ±infinity span forces the same-signed
+      infinite timestamp (subtraction swaps the sentinel first, matching
+      `interval_um_internal`), a finite span on an already-infinite timestamp
+      passes it through (`TIMESTAMP_NOT_FINITE` branch), and "infinity − infinity"
+      raises `timestamp out of range` (22008) since the type has no NaN.
+      **Output:** `Datum.Format` + hot-path `AppendValueText` render `infinity`/
+      `-infinity`. **Ordering:** no change — `compareDatum` KindTime orders by
+      `Int` (Scale==0), so the sentinels sort correctly. All `want` byte-for-byte
+      vs live PG 18.3 (socket /tmp:5599). Test: `interval_subday_test.go`
+      `TestTimestampIntervalInfinity` (15 accepts + 2 rejects). Design doc
+      `docs/design/0003-0006-date-interval-arithmetic.md` new Follow-up. Gates:
+      build/vet clean; full executor suite PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); pgbench smoke via pre-commit hook. Still deferred (broader,
+      pre-existing): `timestamp 'infinity'` literal-input parsing + wire codec,
+      `isfinite(timestamp)` stub, `timestamp − timestamp` with an infinite operand.
+      With this, the whole #5(d-iv) interval group is complete.
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,

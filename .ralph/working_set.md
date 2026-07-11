@@ -1,38 +1,35 @@
 (idle — nothing in flight)
 
-## Loop summary (2026-07-11, loop #45)
+## Loop summary (2026-07-11, loop #48)
 
 **Nightly triage:** action-items batch `20260711-011536` — all 3 AI items
 (IsolationTimeouts, TuplelockUpgradeNoDeadlock, PgWaldumpVacuumPruneRoundtrip)
 already `[x]` in fix_plan.md (co-load timing flakes). No new work.
 
-**Task — `unimplemented_feat #5(d-iv)` cast-form interval typmod — DONE,
-committed this loop.** Closed deferred item (2) of the EXTRACT(EPOCH) row.
-`CAST(x AS interval hour to minute)`, `x::interval second(2)`, precision-only
-`x::interval(2)` now apply a typmod (was a parse error inside CAST / ignored on
-::). Key insight: PG's `interval_in` uses the typmod LOW field as the bare-
-magnitude DEFAULT UNIT *before* truncation (`'90'::interval minute`=01:30:00, not
-90s), so it can't be post-hoc truncation.
-Parser: shared `parseIntervalCastQualifier` wired into `parseCastTail` +
-`parseCastFuncExpr`; packs PG `INTERVAL_TYPMOD` (`packIntervalCastTypmod`) into
-`CastExpr.Typmods[0]`; `DecodeIntervalCastTypmod` unpacks (internal/parser/
-select.go). Executor: `applyIntervalCastTypmod` intercepted in CastExpr branch
-(gated `TargetType=="interval" && Typmod!=0`), reuses `truncIntervalToUnit`/
-`roundIntervalMicrosToPrec` (internal/executor/expr.go).
-Files: internal/parser/select.go, internal/executor/expr.go,
-internal/executor/interval_subday_test.go (new TestIntervalCastTypmod, 18 cases),
-docs/design/0003-0006-date-interval-arithmetic.md (Follow-up),
-.ralph/deferral_ledger.md (row), .ralph/fix_plan.md (item).
+**Task — CLOSED the LAST open `unimplemented_feat #5(d-iv)` sub-item:
+`timestamp/timestamptz ± interval 'infinity'` (infinite-timestamp carrier).**
+Line-ported PG's `timestamp_pl_interval`/`timestamp_mi_interval`
+(timestamp.c:3107). Carrier = INT64 sentinels on the existing KindTime
+Unix-nanos `Int` (MaxInt64=+inf, MinInt64=-inf; mirrors TIMESTAMP_END/BEGIN;
+no new Datum field, no collision below ~year 2262). New datum.go helpers
+`IsTimestampPosInf/NegInf/NotFinite` + `NewTimestampInfinity`. `addTimeInterval`
+(expr.go) now returns `(Datum,error)`: ±inf span forces same-signed inf
+timestamp (subtract swaps the sentinel first), finite span on an inf timestamp
+passes through, "infinity − infinity" → 22008 `timestamp out of range`.
+Output via `Format`+`AppendValueText`→`infinity`/`-infinity`; ordering needs no
+change (compareDatum orders KindTime by Int). Callers: evalBinary (2) + uuidv7.
+Test `TestTimestampIntervalInfinity` (15 accepts + 2 rejects), all `want` from
+live PG 18.3 (socket /tmp:5599). Ledger row 710; fix_plan item `[x]`; design
+doc 0003-0006 Follow-up.
 
-**Next feature step (deferral ledger 2026-07-11, remaining #5(d-iv)):**
-(1) `timestamp/timestamptz ± interval 'infinity'` — needs a NEW infinite-
-timestamp Datum carrier (TIMESTAMP_NOT_FINITE) + `timestamp_pl_interval`/`_mi`
-short-circuit in `addTimeInterval` (expr.go). (2) `interval(p) '<lit>'`
-leading-precision typed literal — in parsePrimaryExpr's interval case
-(select.go ~L2999) detect `interval ( p ) '<str>'` (paren BEFORE the string),
-reuse `tryConsumeIntervalPrecParen`, carry onto IntervalLit.HasPrec/Prec.
+Gates: build/vet clean; full executor suite PASS; `scripts/tpch-spotcheck.sh`
+PASS (Q12=2/Q13=33); pgbench smoke via pre-commit hook; ralph-state-guard OK.
 
-Gates: build/vet clean; parser + full executor/planner suites PASS;
-tpch-spotcheck PASS (Q12=2/Q13=33); pgbench smoke via pre-commit hook.
+**With this, the whole #5(d-iv) interval group is COMPLETE** (typmod grammar,
+EXTRACT/date_part, ±infinity arithmetic/ordering across interval AND timestamp,
+unary negation). Broader pre-existing gaps deferred (ledger row 710): (1)
+`timestamp 'infinity'` literal-INPUT parsing + wire codec; (2) `isfinite(ts)`
+stub still TRUE for the sentinel; (3) `timestamp − timestamp` with an infinite
+operand (PG → infinite interval). Next loop: pick from these or a new milestone.
 
 In-flight: none

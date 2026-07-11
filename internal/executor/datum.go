@@ -228,6 +228,35 @@ func NewIntervalInfinity(positive bool) Datum {
 	return NewIntervalDatumFull(math.MinInt32, math.MinInt32, math.MinInt64)
 }
 
+// IsTimestampPosInf / IsTimestampNegInf report whether a KindTime Datum
+// carries PostgreSQL's +infinity / -infinity timestamp sentinel. Upstream
+// (postgres/src/include/datatype/timestamp.h) uses TIMESTAMP_END/BEGIN =
+// PG_INT64_MAX/MIN in its micros-since-2000 domain; goopg stores KindTime as
+// Unix nanoseconds, so the same INT64 extremes are used as sentinels — a real
+// timestamp saturates ~year 2262, far below MaxInt64 ns, so they never collide.
+// IsTimestampNotFinite is the union. (unimplemented_feat #5(d-iv))
+func (d Datum) IsTimestampPosInf() bool {
+	return d.Kind == KindTime && d.Int == math.MaxInt64
+}
+
+func (d Datum) IsTimestampNegInf() bool {
+	return d.Kind == KindTime && d.Int == math.MinInt64
+}
+
+func (d Datum) IsTimestampNotFinite() bool {
+	return d.IsTimestampPosInf() || d.IsTimestampNegInf()
+}
+
+// NewTimestampInfinity constructs the +infinity (positive) or -infinity
+// KindTime sentinel Datum. Rendered as 'infinity' / '-infinity' by Format /
+// AppendValueText, which intercept the sentinel before the normal time shape.
+func NewTimestampInfinity(positive bool) Datum {
+	if positive {
+		return Datum{Kind: KindTime, Int: math.MaxInt64}
+	}
+	return Datum{Kind: KindTime, Int: math.MinInt64}
+}
+
 // NumericMantissaValue is the int64 fast-path mantissa of KindNumeric
 // (valid only when Big == nil).
 func (d Datum) NumericMantissaValue() int64 { return d.Int }
@@ -513,6 +542,12 @@ func (d Datum) AppendValueText(dst []byte) []byte {
 		}
 		return append(dst, d.Buf...)
 	case KindTime:
+		if d.Int == math.MaxInt64 {
+			return append(dst, "infinity"...)
+		}
+		if d.Int == math.MinInt64 {
+			return append(dst, "-infinity"...)
+		}
 		return d.TimeValue().AppendFormat(dst, "2006-01-02 15:04:05.000000")
 	}
 	// Fallback for KindInterval / KindNumeric / unknown kinds.
@@ -585,6 +620,14 @@ func (d Datum) Format() string {
 		// Display the label (Buf), not the sort order (Int).
 		return string(d.Buf)
 	case KindTime:
+		// ±infinity timestamp/date sentinel renders identically to upstream
+		// EncodeSpecialTimestamp / EncodeSpecialDate regardless of flagDate.
+		if d.Int == math.MaxInt64 {
+			return "infinity"
+		}
+		if d.Int == math.MinInt64 {
+			return "-infinity"
+		}
 		if d.Flags&flagDate != 0 {
 			// DATE type: render as Postgres MDY style "MM-DD-YYYY". M0097-0063.
 			return d.TimeValue().Format("01-02-2006")

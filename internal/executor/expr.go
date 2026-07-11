@@ -1395,10 +1395,10 @@ func evalBinary(op parser.OpCode, left, right Datum, pos int) (Datum, error) {
 		// timestamp - timestamp (returns interval upstream;
 		// scope-deferred until the type system).
 		if left.Kind == KindTime && right.Kind == KindInterval {
-			return addTimeInterval(left, right, op == parser.OpSub), nil
+			return addTimeInterval(left, right, op == parser.OpSub, pos)
 		}
 		if op == parser.OpAdd && left.Kind == KindInterval && right.Kind == KindTime {
-			return addTimeInterval(right, left, false), nil
+			return addTimeInterval(right, left, false, pos)
 		}
 		// timestamp − timestamp → interval; date − date → integer days.
 		// Mirrors upstream timestamp_mi / date_mi (timestamp.c / date.c):
@@ -1905,7 +1905,40 @@ func evalPOSIXRegex(s, pattern string, caseInsensitive bool) (bool, error) {
 // applied via time.AddDate (which carries year/month overflow
 // the way upstream PG does for `timestamp + interval '1 month'`);
 // days are added via the same call.
-func addTimeInterval(t, iv Datum, subtract bool) Datum {
+// addTimeInterval implements `timestamp + interval` (and, with subtract, the
+// `timestamp - interval` form that upstream routes through timestamp_mi_interval
+// → interval_um_internal → timestamp_pl_interval). It line-ports
+// timestamp_pl_interval's ±infinity handling (postgres/src/backend/utils/adt/
+// timestamp.c:3107): a ±infinity interval forces the result to the same-signed
+// infinite timestamp, EXCEPT "infinity − infinity", which has no NaN analogue
+// for the timestamp type and errors; a finite interval added to an already
+// infinite timestamp passes the timestamp through unchanged.
+// (unimplemented_feat #5(d-iv))
+func addTimeInterval(t, iv Datum, subtract bool, pos int) (Datum, error) {
+	// timestamp_mi_interval negates the span first (interval_um_internal swaps
+	// the ±infinity sentinels), so fold subtract into the sentinel test.
+	spanNoBegin := iv.IsIntervalNoBegin() // interval == -infinity
+	spanNoEnd := iv.IsIntervalNoEnd()     // interval == +infinity
+	if subtract {
+		spanNoBegin, spanNoEnd = spanNoEnd, spanNoBegin
+	}
+	if spanNoBegin { // span is -infinity
+		if t.IsTimestampPosInf() {
+			return NullDatum, timestampOutOfRange(pos)
+		}
+		return NewTimestampInfinity(false), nil
+	}
+	if spanNoEnd { // span is +infinity
+		if t.IsTimestampNegInf() {
+			return NullDatum, timestampOutOfRange(pos)
+		}
+		return NewTimestampInfinity(true), nil
+	}
+	// Span is finite: an already-infinite timestamp passes through unchanged
+	// (TIMESTAMP_NOT_FINITE(timestamp) branch).
+	if t.IsTimestampNotFinite() {
+		return t, nil
+	}
 	months := int(iv.IntervalMonthsValue())
 	days := int(iv.IntervalDaysValue())
 	micros := iv.IntervalMicrosValue()
@@ -1918,7 +1951,15 @@ func addTimeInterval(t, iv Datum, subtract bool) Datum {
 	if micros != 0 {
 		res = res.Add(time.Duration(micros) * time.Microsecond)
 	}
-	return NewTimeDatum(res)
+	return NewTimeDatum(res), nil
+}
+
+// timestampOutOfRange is PG's error for a non-representable timestamp result
+// (here: "infinity − infinity", which the timestamp type cannot express since
+// it has no NaN). Mirrors ereport(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE,
+// "timestamp out of range").
+func timestampOutOfRange(pos int) error {
+	return &ExecError{Code: "22008", Pos: pos, Message: "timestamp out of range"}
 }
 
 // usecsPerDay is the microsecond count in a 24-hour day, used by the
@@ -8254,7 +8295,11 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 				return NullDatum, ivErr
 			}
 			if iv.Kind == KindInterval {
-				ts := addTimeInterval(NewTimeDatum(ctx.Now), iv, false).TimeValue()
+				shifted, aerr := addTimeInterval(NewTimeDatum(ctx.Now), iv, false, x.Pos())
+				if aerr != nil {
+					return NullDatum, aerr
+				}
+				ts := shifted.TimeValue()
 				uuidV7Ns = ts.UnixNano()
 			} else {
 				uuidV7Ns = uuidV7RealTimeNs()

@@ -1561,6 +1561,60 @@ carrier) is now the **last** open #5(d-iv) sub-item — every interval-typmod /
 EXTRACT / infinity-literal / unary form is landed. Gates: `go build`/`go vet`
 clean; parser + executor interval suites PASS; pgbench smoke via pre-commit hook.
 
+## Follow-up: `timestamp ± interval 'infinity'` — infinite-timestamp carrier (unimplemented_feat #5(d-iv), 2026-07-11)
+
+The **last** open #5(d-iv) sub-item. `timestamp + interval 'infinity'` yields a
+`±infinity` timestamp in PG; goopg previously had no way to represent an infinite
+timestamp (`isfinite` was a stub returning TRUE, see `expr.go`).
+
+**Carrier — INT64 sentinels, no new field.** Upstream
+(`postgres/src/include/datatype/timestamp.h`) represents `±infinity` timestamps as
+`TIMESTAMP_END`/`TIMESTAMP_BEGIN` = `PG_INT64_MAX`/`PG_INT64_MIN` in its
+micros-since-2000 domain. goopg stores `KindTime` as **Unix nanoseconds** in
+`Int`, so the same INT64 extremes serve as sentinels: `math.MaxInt64` = +infinity,
+`math.MinInt64` = -infinity. A real timestamp saturates around year 2262 (well
+below `MaxInt64` ns), so the sentinels never collide with a finite value. New
+helpers `Datum.IsTimestampPosInf` / `IsTimestampNegInf` / `IsTimestampNotFinite`
+and constructor `NewTimestampInfinity(bool)` live in `datum.go` beside the
+existing interval-infinity carrier.
+
+**Arithmetic — line-port of `timestamp_pl_interval` (timestamp.c:3107).**
+`addTimeInterval` (`internal/executor/expr.go`) now returns `(Datum, error)` and
+handles infinities before the finite path. Subtraction (`timestamp_mi_interval`)
+negates the span first via `interval_um_internal`, which swaps the interval
+`NOBEGIN`/`NOEND` sentinels — modelled by swapping the `spanNoBegin`/`spanNoEnd`
+flags when `subtract` is set. A `-infinity` span forces `-infinity` (unless the
+timestamp is already `+infinity` → "timestamp out of range", 22008, since the type
+has no NaN); a `+infinity` span forces `+infinity` (unless the timestamp is already
+`-infinity` → error); a finite span added to an already-infinite timestamp passes
+the timestamp through (`TIMESTAMP_NOT_FINITE(timestamp)` branch).
+
+**Output & ordering.** `Datum.Format` and the hot-path `AppendValueText`
+(`datum.go`) intercept the sentinels and render `infinity` / `-infinity`
+(matching `EncodeSpecialTimestamp`/`EncodeSpecialDate`, so a `date` sentinel
+renders identically). Comparison needs **no** change: `compareDatum`'s `KindTime`
+arm orders by `Int` for `Scale==0`, so `MinInt64` (-inf) sorts before every finite
+value and `MaxInt64` (+inf) after — the exact `-infinity < finite < +infinity`
+ordering.
+
+Verified byte-for-byte vs live PG 18.3 (socket /tmp:5599, postgres role): the
+four sign/subtract combinations, commutative `interval + timestamp`, the
+finite-span passthrough on an infinite timestamp, like-signed `infinity+infinity`,
+ordering, and the two `infinity − infinity` error cases. Tests:
+`TestTimestampIntervalInfinity` (`interval_subday_test.go`, 15 accepts + 2
+rejects). Gates: `go build`/`go vet` clean; full executor suite PASS;
+`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke via pre-commit hook.
+
+**Still deferred (broader, pre-existing).** `timestamp 'infinity'` **literal
+input** parsing (goopg produces an infinite timestamp only via the arithmetic
+short-circuit, not from a typed literal or `::timestamp` cast) and the wire-codec
+binary encode/decode of the sentinel; `isfinite(timestamp/date)` still returns
+TRUE for the new sentinel (the `evalIsFinite` stub is unchanged); `timestamp −
+timestamp` where one side is infinite (PG returns an infinite *interval* —
+`subTimeTime` would call `TimeValue()` on the sentinel). With this landed, the
+whole #5(d-iv) interval group (typmod grammar, EXTRACT/date_part, ±infinity
+arithmetic/ordering across interval and now timestamp, unary negation) is complete.
+
 ## Cross-references
 
 - TPC-H query bodies: HammerDB upstream
