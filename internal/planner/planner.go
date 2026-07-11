@@ -9282,11 +9282,25 @@ func pgTypeofDisplayName(t catalog.Type) string {
 // is dropped during planning, never reaching ColumnRef).
 // Returns (result-expr, nil) on success, or (nil, *PlanError) for the
 // ERRCODE_DATATYPE_MISMATCH (42804) case PG raises for non-collatable types.
-func foldPgCollationFor(arg Expr, cat catalog.Catalog, pos int) (Expr, *PlanError) {
+func foldPgCollationFor(arg Expr, cat catalog.Catalog, ctx *resolveContext, pos int) (Expr, *PlanError) {
 	// `expr COLLATE name` states its own collation unambiguously — no need to
 	// approximate.
 	if ce, ok := arg.(*CollateExpr); ok {
 		return &StringConst{Value: catalog.QuoteCollationIdent(ce.CollationName)}, nil
+	}
+	// A bare column reference whose base-table column carries an explicit
+	// column-level COLLATE clause (`c text COLLATE "en_US"`) reports that
+	// collation, not the type's default (postgres/src/backend/utils/adt/misc.c
+	// pg_collation_for reads the collation exprCollation() assigned to the Var,
+	// which parse_collate.c derives from the column's attcollation). goopg has
+	// no per-expression assign_expr_collations pass, so this resolves the
+	// collation directly from the in-scope base-table column. Computed
+	// expressions over such a column still fall through to the type default
+	// below (deferred — see the M0122-0005 deferral-ledger row).
+	if cr, ok := arg.(*ColumnRef); ok && ctx != nil {
+		if coll := ctx.explicitColumnCollationName(cr); coll != "" {
+			return &StringConst{Value: catalog.QuoteCollationIdent(coll)}, nil
+		}
 	}
 	// A bare untyped string literal (no cast, no COLLATE) carries PostgreSQL's
 	// UNKNOWNOID pseudo-type, which has no collation. PG returns NULL here
@@ -9327,6 +9341,35 @@ func foldPgCollationFor(arg Expr, cat catalog.Catalog, pos int) (Expr, *PlanErro
 	}
 	return nil, &PlanError{Pos: pos, Code: "42804", Message: fmt.Sprintf(
 		"collations are not supported by type %s", pgTypeofDisplayName(catalog.Type{Name: baseName}))}
+}
+
+// explicitColumnCollationName resolves the DDL-declared column-level COLLATE
+// name (catalog.Column.Collation) for a resolved column reference, or "" when
+// the column has no explicit collation or the reference can't be mapped to a
+// base-table column in the current FROM scope. Used only by foldPgCollationFor
+// — a best-effort stand-in for parse_collate.c's collation derivation that
+// covers the plain-column case without a general per-expression collation pass.
+func (ctx *resolveContext) explicitColumnCollationName(cr *ColumnRef) string {
+	for i := range ctx.bindings {
+		b := &ctx.bindings[i]
+		if b.table == nil {
+			continue
+		}
+		// Match by the self-join-safe (sourceIdx) identity when one was
+		// assigned; otherwise fall back to the output-column-index range so
+		// single-table queries (sourceIdx == 0) still resolve.
+		identMatch := b.sourceIdx != 0 && b.sourceIdx == cr.SourceTableIdx
+		rangeMatch := cr.Index >= b.offset && cr.Index < b.offset+len(b.table.Columns)
+		if !identMatch && !rangeMatch {
+			continue
+		}
+		for j := range b.table.Columns {
+			if strings.EqualFold(b.table.Columns[j].Name, cr.Name) {
+				return b.table.Columns[j].Collation
+			}
+		}
+	}
+	return ""
 }
 
 // compatibleTypeRank returns a numeric rank for anycompatible type resolution.
@@ -10488,7 +10531,7 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 			if err != nil {
 				return nil, err
 			}
-			result, perr := foldPgCollationFor(arg, ctx.cat, x.Pos())
+			result, perr := foldPgCollationFor(arg, ctx.cat, ctx, x.Pos())
 			if perr != nil {
 				return nil, perr
 			}

@@ -2759,7 +2759,7 @@
    "feature": "pg_collation_for() function returns hardcoded 'default' string; collation tracking throughout catalog and query execution is not implemented",
    "task_id": "M0097-0035",
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "pg_collation_for() stub: returns \"default\" (no collation tracking in v0)"
    ],
@@ -2774,7 +2774,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/executor/expr.go:6249-6253 - hardcoded POSIX; no collation-aware execution"
+   "code_audit": "resolved 2026-07-11 (M0122-0005 + this loop): the audit's cited line numbers are stale (6249-6253 is now interval-cast code). pg_collation_for is a full plan-time fold, not a hardcoded stub — planner.foldPgCollationFor (internal/planner/planner.go) mirrors postgres/src/backend/utils/adt/misc.c pg_collation_for: NULL for a bare untyped literal (UNKNOWNOID), the stated collation for an explicit `expr COLLATE name`, per-type typcollation defaults ('default' for text/varchar/bpchar, 'C' for name, element-following for arrays, domain-base-following), and 42804 for non-collatable types (executor.evalFuncCall pg_collation_for path is the runtime fallback). This loop closed the one residual the code comment flagged: a bare column reference whose base-table column carries an explicit column-level COLLATE clause now reports that collation via resolveContext.explicitColumnCollationName (reads catalog.Column.Collation through the in-scope rangeBinding) instead of the type default. Tests: internal/planner/pg_collation_for_test.go (9 fold cases incl. 4 column-COLLATE), internal/executor/pg_collation_for_test.go. Still deferred (M0122-0005 ledger): a general assign_expr_collations pass so a COMPUTED expression over a collated column (not the plain column ref) derives the right collation."
   },
   {
    "feature": "ALTER FUNCTION/PROCEDURE OWNER TO / RENAME TO / SET SCHEMA enforcement (currently no-op)",

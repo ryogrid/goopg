@@ -1,42 +1,42 @@
 (idle — nothing in flight)
 
-## Loop summary (2026-07-11, loop #58)
+## Loop summary (2026-07-11, loop #59)
 
-**Nightly triage:** action-items batch `20260711-011536` — all 3 AI items
-(IsolationTimeouts, IsolationTuplelockUpgradeNoDeadlock,
-PgWaldumpVacuumPruneRoundtrip) already `[x]` in fix_plan.md M-NIGHTLY (co-load
-timing flakes / already-fixed). No new nightly work.
+**Nightly triage:** action-items batch `20260711-011536` (same as loop #58) —
+all 3 AI items (IsolationTimeouts, IsolationTuplelockUpgradeNoDeadlock,
+PgWaldumpVacuumPruneRoundtrip) already `[x]` in fix_plan.md M-NIGHTLY. No new
+nightly work.
 
-**Task — M0122-0004 / unimplemented_feat.json M0100-0007: MERGE
-duplicate-source cardinality rule.** Verify-before-implement: entry was
-medium-confidence with an `unclear` code audit ("cross-partition routing not
-found"). Re-verified via 4 end-to-end probes (newDDLFixture harness) — the rule
-is ALREADY fully implemented and correct across partition routing, including the
-specifically-flagged cross-partition UPDATE-move case. goopg raises SQLSTATE
-21000 "MERGE command cannot affect row a second time" after applying the first
-mod (operators_merge.go hasDuplicate). Only real gap: PG's errhint was omitted.
+**Task — M0122 backlog / unimplemented_feat.json M0097-0035: pg_collation_for.**
+Verify-before-implement: entry claimed "returns hardcoded 'default'" with a
+STALE code_audit (cited internal/executor/expr.go:6249-6253, now interval-cast
+code). Reality: pg_collation_for is a full plan-time fold (planner.foldPgCollationFor,
+M0122-0005) mirroring PG's misc.c — NULL/UNKNOWNOID, explicit COLLATE, per-type
+defaults, arrays, domains, 42804. Closed the one residual the code comment
+flagged.
 
 Landed:
-- internal/executor/operators_merge.go: added PG's errhint "Ensure that not
-  more than one source row matches any one target row." at the hasDuplicate
-  raise site (byte-faithful to nodeModifyTable.c ExecMergeMatched).
-- internal/executor/merge_dup_source_test.go (NEW): first-ever coverage —
-  TestMergeDupSource{UpdateNonPartitioned,DeleteNonPartitioned,
-  UpdateWithinOnePartition,CrossPartitionMove}; asserts code/message/hint +
-  first-mod-applied + cross-partition row relocation.
-- unimplemented_feat.json: M0100-0007 status open→resolved (surgical Edit; cited
-  proof in code_audit). json re-validated.
-- docs/design/0096-0010-merge-into.md: new Follow-up section; README row updated.
-- .ralph/deferral_ledger.md: resolved row appended.
+- internal/planner/planner.go: foldPgCollationFor now takes ctx; new
+  resolveContext.explicitColumnCollationName resolves a bare *ColumnRef's
+  DDL-declared COLLATE from catalog.Column.Collation via the in-scope
+  rangeBinding (sourceIdx identity, range fallback). Pure plan-time constant
+  fold — no plan-shape/row-count impact.
+- internal/planner/pg_collation_for_test.go: +4 cases (collated_tbl c_ub→
+  ucs_basic, c_c→"C", c_plain→default, qualified ref).
+- unimplemented_feat.json: M0097-0035 open→resolved (surgical Edit, cited proof).
+- docs/design/0122-0005-pg-collation-for-array-types.md: Follow-up section.
+- .ralph/deferral_ledger.md: `-` row (computed-expr collation still deferred:
+  assign_expr_collations pass).
 
-Gates: go build ./... clean; go vet ./internal/executor clean; merge/upsert/
-explain executor tests PASS; tpch-spotcheck PASS (Q12=2/Q13=33);
+Gates: go build ./... clean; go vet ./internal/planner clean; planner suite PASS;
+collation tests (planner+executor) PASS; tpch-spotcheck PASS (Q12=2/Q13=33);
 make ralph-state-guard OK (auto-repaired prev-loop completed marker).
 
-Next loop: unimplemented_feat.json still has ~84 open entries (was 85). Bounded
-candidates: parsePrimaryConninfo password (blocked on trust-only handshake),
-Planner GUC stubs actual behavior, pg_index expression-index restart
-persistence (hard — null-bitmap-aware decode). Avoid the interval/date hot area
-(ledger rows 692-714 heavily worked 2026-07-11).
+Next loop: unimplemented_feat.json now 98 resolved / 83 open. Still-deferred
+computed-expression collation (assign_expr_collations) is a larger pass — see
+today's ledger row. Bounded candidates unchanged from #58: Planner GUC stubs
+actual behavior, parsePrimaryConninfo (blocked on trust-only handshake). Avoid
+pg_index expression-index restart persistence (hard — null-bitmap decode) and
+the interval/date hot area.
 
 In-flight: none
