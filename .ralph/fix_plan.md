@@ -7960,6 +7960,35 @@ mirroring M0119's ledger `status` column.
       Design doc `docs/design/0003-0006-*` new Follow-up section + README row.
       Gates: build/vet clean; parser/analyzer/planner/executor suites PASS;
       `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke (hook).
+  - [x] `unimplemented_feat #5(d-iv) (interval typmod range/precision grammar)`
+      (2026-07-11, this loop) — closed the prior `+`-continuation row's deferred
+      typmod-grammar item for Form-1 interval literals (plain-magnitude body):
+      `<hi> TO <lo>` ranges (`interval '5' hour to minute`=00:05:00, `'5' day to
+      hour`=05:00:00, `'5' year to month`=5 mons, `'90' minute to
+      second`=00:01:30, `'1.5' hour to minute`=00:01:00) and `SECOND(p)`
+      precision (`interval '1.23456789' second(2)`=00:00:01.23, `'1.999999'
+      second(2)`=00:00:02 round-half-away-from-zero, `'5' minute to
+      second(3)`=00:00:05). PG's `DecodeInterval switch(range)` (datetime.c) and
+      `AdjustIntervalForTypmod` (timestamp.c) both collapse a range to its LOW
+      (rightmost) field — it alone drives interpretation AND truncation
+      granularity (higher-order fields kept) — so a range reuses the existing
+      single-field `Qualified` path with unit=lowField. New parser
+      `tryIntervalTypmodQualifier`/`intervalRangeLowField`/`intervalTypmodField`
+      (`internal/parser/select.go`, lookahead-only) + executor
+      `roundIntervalMicrosToPrec`/`intervalPrecScales` (line-port of the
+      precision arm; p>6 clamped to 6). **Fidelity bug fixed in passing:** the
+      old switch accepted PLURAL/`millisecond` trailing words as typmod fields,
+      but those are not grammar keywords — PG parses `interval '5' days` as bare
+      `interval '5'` (00:00:05) + column alias `days`; the singular-only rewrite
+      makes plurals/abbrevs fall through to aliases (TPC-H uses only singular +
+      embedded Form-2, unaffected; `TestParseIntervalLiteral` updated). Deferred
+      (ledger 2026-07-11): complex body under a range (needs `range` threaded
+      into shared `ParseIntervalBody`), `±infinity`, cast-form typmod. Tests:
+      `interval_subday_test.go` `TestIntervalTypmodRangeAndPrecision` (25 accepts
+      + 5 range-syntax rejects, byte-for-byte vs live PG 18.3 port 5599). Design
+      doc `docs/design/0003-0006-*` new Follow-up section + README row. Gates:
+      build/vet clean; parser/analyzer/planner/executor suites PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke (hook).
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,

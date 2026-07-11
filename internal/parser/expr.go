@@ -169,6 +169,15 @@ type IntervalLit struct {
 	// evalIntervalLit / truncIntervalToUnit.
 	Qualified bool
 
+	// HasPrec/Prec carry an explicit fractional-seconds precision from a
+	// SECOND(p) typmod field (`interval '1.23456789' second(2)` → 00:00:01.23,
+	// `interval '5' minute to second(3)`). Set only when the trailing qualifier
+	// ends in SECOND with a parenthesised precision; the executor rounds the
+	// micros to 10^(6-p) via AdjustIntervalForTypmod (postgres timestamp.c).
+	// unimplemented_feat #5(d-iv, interval typmod range/precision grammar).
+	HasPrec bool
+	Prec    int
+
 	// PreComputed marks a multi-field / HH:MM:SS embedded body
 	// (`interval '1 day 05:00:00'`, `interval '1 year 2 mons 3 days'`) that
 	// tryTypedLiteral decoded via ParseIntervalBody (unimplemented_feat

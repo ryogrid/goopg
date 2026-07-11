@@ -1097,6 +1097,57 @@ captured byte-for-byte from live PostgreSQL 18.3. Gates: `go build`/`go vet`
 clean; parser + analyzer + planner + executor suites PASS;
 `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke via pre-commit hook.
 
+## Follow-up (2026-07-11): interval typmod range & precision grammar (#5(d-iv))
+
+Closes the prior loops' deferred **typmod grammar** item for the Form-1
+interval literal: `interval '<mag>' <hi> TO <lo>` ranges and `SECOND(p)`
+precision now parse and evaluate, verified byte-for-byte vs live PG 18.3:
+
+- Ranges: `interval '5' hour to minute` → `00:05:00`, `interval '5' day to hour`
+  → `05:00:00`, `interval '5' year to month` → `5 mons`, `interval '90' minute
+  to second` → `00:01:30`, `interval '1.5' hour to minute` → `00:01:00`.
+- Precision: `interval '1.23456789' second(2)` → `00:00:01.23`,
+  `interval '1.999999' second(2)` → `00:00:02` (round-half-away-from-zero),
+  `interval '5' minute to second(3)` → `00:00:05`.
+
+**Key simplification.** PostgreSQL's `DecodeInterval` `switch (range)`
+(datetime.c) and `AdjustIntervalForTypmod` (timestamp.c) both reduce a range to
+its **low (rightmost) field**: the low field alone decides how a bare magnitude
+is interpreted *and* the granularity it is truncated to (higher-order fields are
+kept, never zeroed). So a range collapses to a single field — the existing
+single-field `Qualified` path (`evalIntervalLit` → `truncIntervalToUnit`)
+generalises to ranges by using the low field as the unit. A new
+`intervalRangeLowField` (parser `select.go`) validates the seven legal SQL pairs
+(YEAR TO MONTH; DAY TO {HOUR,MINUTE,SECOND}; HOUR TO {MINUTE,SECOND}; MINUTE TO
+SECOND) and returns the low field; an invalid pair (`year to second`) is a
+syntax error, matching PG. `SECOND(p)` adds fractional-second rounding via
+`roundIntervalMicrosToPrec` (executor `expr.go`), a line-port of
+`AdjustIntervalForTypmod`'s precision arm (`IntervalScales`/`IntervalOffsets`);
+`p>6` is clamped to 6 (PG warns; we clamp silently).
+
+**Fidelity bug fixed in passing.** The old Form-1 switch accepted PLURAL field
+words (`days`,`hours`) and `millisecond` as typmod fields. But those are not
+grammar keywords in PG: `interval '5' days` parses as the bare interval
+`interval '5'` (= `00:00:05`, bare→seconds) with `days` a **column alias**, not
+`5 days`. The rewrite (`tryIntervalTypmodQualifier` +
+`intervalTypmodField`, singular-only) makes plurals/abbreviations fall through
+to become aliases exactly as PG does. TPC-H uses only singular trailing units
+(and the embedded Form-2 `interval '90 days'`, unaffected), so no query shape
+changed. `TestParseIntervalLiteral` was updated to pin the corrected semantics.
+
+Parse path only handles a **plain-magnitude** body (the set current Form-1
+already accepted); a complex body under a range (`interval '1 2:03:04' day to
+second`) stays deferred — it needs the `range` threaded into the shared
+`ParseIntervalBody` so a *trailing bare number inside a complex body* resolves
+its default field by range (the entangled part). Also still deferred: interval
+`±infinity`, and the leading-typmod cast form `CAST(... AS interval hour to
+minute)`. Tests: `interval_subday_test.go`
+`TestIntervalTypmodRangeAndPrecision` (25 accepts + 5 range-syntax rejects,
+byte-for-byte vs live PG 18.3 on port 5599); parser
+`date_interval_test.go` `TestParseIntervalLiteral`. Gates: `go build`/`go vet`
+clean; parser + analyzer + planner + executor suites PASS;
+`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke via pre-commit hook.
+
 ## Cross-references
 
 - TPC-H query bodies: HammerDB upstream

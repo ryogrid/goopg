@@ -172,6 +172,12 @@ type IntervalLit struct {
 	// see internal/executor/expr.go evalIntervalLit / truncIntervalToUnit.
 	Qualified bool
 
+	// HasPrec/Prec carry an explicit fractional-seconds precision from a
+	// SECOND(p) typmod field; the executor rounds the micros to 10^(6-p) after
+	// the range truncation (see evalIntervalLit). unimplemented_feat #5(d-iv).
+	HasPrec bool
+	Prec    int
+
 	// PreComputed marks a multi-field / HH:MM:SS embedded body
 	// (`interval '1 day 05:00:00'`, `interval '1 year 2 mons 3 days'`) that
 	// the parser already decoded via parser.ParseIntervalBody

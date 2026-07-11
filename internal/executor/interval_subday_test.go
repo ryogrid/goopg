@@ -865,6 +865,83 @@ func TestYearMonthTimeGluedUnitAbsorb(t *testing.T) {
 	}
 }
 
+// TestIntervalTypmodRangeAndPrecision pins the Form-1 interval typmod
+// range/precision grammar (unimplemented_feat #5(d-iv)): a `<hi> TO <lo>` range
+// interprets a bare magnitude as, and truncates it to, its LOW field
+// (postgres datetime.c DecodeInterval `switch (range)` + timestamp.c
+// AdjustIntervalForTypmod, which collapse to the low field), and a `SECOND(p)`
+// precision rounds the fractional seconds. Every `want` was captured
+// byte-for-byte from live PostgreSQL 18.3. The plural cases confirm the
+// fidelity fix: a plural / abbreviation is a column ALIAS on the bare interval
+// (`interval '5' days` = 00:00:05), never a typmod field.
+func TestIntervalTypmodRangeAndPrecision(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+	if err := runDDL(t, ctx, "CREATE TABLE t (id int)"); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	if err := runDDL(t, ctx, "INSERT INTO t VALUES (1)"); err != nil {
+		t.Fatalf("INSERT: %v", err)
+	}
+	accept := []struct{ sql, want string }{
+		// Range: bare magnitude interpreted as (and truncated to) the low field.
+		{"SELECT interval '5' hour to minute", "00:05:00"},
+		{"SELECT interval '1.5' hour to minute", "00:01:00"},
+		{"SELECT interval '90' minute to second", "00:01:30"},
+		{"SELECT interval '5' day to second", "00:00:05"},
+		{"SELECT interval '5' year to month", "5 mons"},
+		{"SELECT interval '5' day to hour", "05:00:00"},
+		{"SELECT interval '5' day to minute", "00:05:00"},
+		{"SELECT interval '1.5' day to minute", "00:01:00"},
+		{"SELECT interval '100' minute to second", "00:01:40"},
+		{"SELECT interval '1.5' minute to second", "00:00:01.5"},
+		{"SELECT interval '-1.5' hour to minute", "-00:01:00"},
+		// Single field (existing behaviour, now via the same helper).
+		{"SELECT interval '5' second", "00:00:05"},
+		{"SELECT interval '5' minute", "00:05:00"},
+		{"SELECT interval '5' hour", "05:00:00"},
+		{"SELECT interval '1.5' hour", "01:00:00"},
+		{"SELECT interval '1.23456789' second", "00:00:01.234568"},
+		// SECOND(p) fractional-seconds precision (round-half-away-from-zero).
+		{"SELECT interval '1.23456789' second(2)", "00:00:01.23"},
+		{"SELECT interval '-1.23456789' second(2)", "-00:00:01.23"},
+		{"SELECT interval '1.999999' second(2)", "00:00:02"},
+		{"SELECT interval '5' second(2)", "00:00:05"},
+		{"SELECT interval '5' minute to second(3)", "00:00:05"},
+		{"SELECT interval '1.2345' minute to second(1)", "00:00:01.2"},
+		// Plural / abbreviation trailing token = column alias on the bare
+		// interval (bare number defaults to SECONDS), NOT a typmod field.
+		{"SELECT interval '5' days", "00:00:05"},
+		{"SELECT interval '5' hours", "00:00:05"},
+		{"SELECT interval '5' millisecond", "00:00:05"},
+		{"SELECT interval '5' min", "00:00:05"},
+	}
+	for _, c := range accept {
+		rows := runQuery(t, ctx, c.sql+" FROM t")
+		if len(rows) != 1 || len(rows[0]) != 1 {
+			t.Fatalf("%s: expected 1x1 result, got %v", c.sql, rows)
+		}
+		if got := rows[0][0].Format(); got != c.want {
+			t.Errorf("%s = %q, want %q", c.sql, got, c.want)
+		}
+	}
+
+	// Invalid range pairs are a syntax error (postgres opt_interval rejects
+	// them); goopg errors too (the unconsumed TO/field trips the parser).
+	reject := []string{
+		"SELECT interval '5' year to second FROM t",
+		"SELECT interval '5' minute to hour FROM t",
+		"SELECT interval '5' second to minute FROM t",
+		"SELECT interval '5' minute to minute FROM t",
+		"SELECT interval '5' hour to hour FROM t",
+	}
+	for _, sql := range reject {
+		if _, err := runQueryErr(t, ctx, sql); err == nil {
+			t.Errorf("%s: expected error, got none", sql)
+		}
+	}
+}
+
 // TestParseIntervalBodySingleFieldMatchesUnitToParts guards the sibling-path
 // invariant that the multi-field tokenizer (parser.ParseIntervalBody) and the
 // per-field spill helper (parser.IntervalUnitToParts, used by the single-field

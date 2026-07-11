@@ -3001,25 +3001,22 @@ func (p *parser) tryTypedLiteral() (Expr, bool) {
 		if next.Kind != TokenStringLit {
 			return nil, false
 		}
-		// Form 1: `interval '<N>' <unit>` — three tokens with the
-		// unit as a trailing identifier. v0's original shape.
-		unitTok := p.peek(2)
-		if unitTok.Kind == TokenIdent {
-			unit := strings.ToLower(identText(unitTok))
-			switch unit {
-			case "day", "days", "month", "months", "year", "years",
-				"hour", "hours", "minute", "minutes",
-				"second", "seconds", "millisecond", "milliseconds":
-				canonical := strings.TrimSuffix(unit, "s")
-				p.advance() // INTERVAL
-				strTok := p.advance()
-				p.advance() // unit
-				// The trailing unit is an SQL interval typmod field: it
-				// truncates the value to that field's granularity
-				// (`interval '1.5' hour` = 01:00:00). Marked Qualified so
-				// the executor applies the truncation.
-				return &IntervalLit{pos: t.Pos, Value: strTok.Value, Unit: canonical, Qualified: true}, true
+		// Form 1: `interval '<N>' <typmod-qualifier>` — the trailing SQL
+		// interval typmod field (`interval '1.5' hour` = 01:00:00), an
+		// optional `<hi> TO <lo>` range (`interval '5' hour to minute`) and
+		// an optional `SECOND(p)` precision (`interval '5' second(2)`).
+		// Only the SINGULAR field keywords year/month/day/hour/minute/second
+		// are grammar keywords; a plural (`days`) or abbreviation (`min`) is
+		// NOT — PostgreSQL then parses `interval '5' days` as the bare interval
+		// `interval '5'` (= 00:00:05) with `days` a column alias, so those must
+		// fall through to Form 2 here. unimplemented_feat #5(d-iv).
+		if lit, consumed, ok := p.tryIntervalTypmodQualifier(t.Pos, next.Value); ok {
+			p.advance() // INTERVAL
+			p.advance() // string literal
+			for i := 0; i < consumed; i++ {
+				p.advance()
 			}
+			return lit, true
 		}
 		// Form 2: `interval '<N> <unit>'` — two tokens with the
 		// unit embedded in the string literal. HammerDB's TPC-H
@@ -3119,6 +3116,120 @@ func splitEmbeddedInterval(body string) (string, string, bool) {
 		return num, strings.TrimSuffix(unit, "s"), true
 	}
 	return "", "", false
+}
+
+// intervalTypmodField is the set of SINGULAR interval field keywords that
+// PostgreSQL's opt_interval grammar accepts as a trailing typmod qualifier on
+// `interval '<body>' <field>`. Plurals (`days`) and abbreviations (`min`) are
+// intentionally excluded: they are not grammar keywords, so a token like `days`
+// after the literal is a column alias on the bare interval, never a typmod
+// (`interval '5' days` = 00:00:05 AS days). See postgres gram.y opt_interval.
+var intervalTypmodField = map[string]bool{
+	"year": true, "month": true, "day": true,
+	"hour": true, "minute": true, "second": true,
+}
+
+// intervalRangeLowField returns the rightmost (low) field of a valid SQL
+// interval range `<hi> TO <lo>`, or ("", false) if the pair is not one of the
+// combinations PostgreSQL's opt_interval grammar permits (YEAR TO MONTH; DAY TO
+// {HOUR,MINUTE,SECOND}; HOUR TO {MINUTE,SECOND}; MINUTE TO SECOND). The low
+// field alone determines both how a bare-magnitude body is interpreted
+// (datetime.c DecodeInterval `switch (range)`) and the granularity
+// AdjustIntervalForTypmod truncates to (timestamp.c), so callers keep only it.
+func intervalRangeLowField(hi, lo string) (string, bool) {
+	switch hi {
+	case "year":
+		if lo == "month" {
+			return "month", true
+		}
+	case "day":
+		switch lo {
+		case "hour", "minute", "second":
+			return lo, true
+		}
+	case "hour":
+		switch lo {
+		case "minute", "second":
+			return lo, true
+		}
+	case "minute":
+		if lo == "second" {
+			return "second", true
+		}
+	}
+	return "", false
+}
+
+// tryIntervalTypmodQualifier decodes the trailing typmod qualifier of a Form-1
+// interval literal `interval '<body>' <qualifier>` by lookahead only, without
+// consuming any tokens. On success it returns the IntervalLit and the number of
+// qualifier tokens (after the string literal) the caller must advance; on a
+// non-match it returns ok=false so the caller falls through to the embedded
+// forms (which is how a plural like `days` becomes a column alias).
+//
+// Grammar (postgres gram.y opt_interval):
+//
+//	<field>
+//	<hi> TO <lo>
+//	SECOND '(' p ')'
+//	<hi> TO SECOND '(' p ')'
+//
+// The range collapses to its low field for both interpretation and truncation
+// (see intervalRangeLowField); precision is only valid when the low field is
+// SECOND. Peek offsets are relative to the INTERVAL token at peek(0): peek(1) is
+// the string body and peek(2) the first qualifier token.
+func (p *parser) tryIntervalTypmodQualifier(pos int, body string) (*IntervalLit, int, bool) {
+	f1 := p.peek(2)
+	if f1.Kind != TokenIdent {
+		return nil, 0, false
+	}
+	hi := strings.ToLower(identText(f1))
+	if !intervalTypmodField[hi] {
+		return nil, 0, false
+	}
+	lowField := hi
+	consumed := 1 // the field ident
+	off := 3      // next token to inspect
+
+	// Optional `TO <lo>` range.
+	if tk := p.peek(off); tk.Kind == TokenKeyword && tk.Keyword == KwTo {
+		f2 := p.peek(off + 1)
+		if f2.Kind != TokenIdent {
+			return nil, 0, false
+		}
+		low, ok := intervalRangeLowField(hi, strings.ToLower(identText(f2)))
+		if !ok {
+			return nil, 0, false
+		}
+		lowField = low
+		consumed += 2
+		off += 2
+	}
+
+	// Optional `( p )` precision — only when the low field is SECOND
+	// (postgres interval_second grammar). A parenthesis after any other field
+	// is left for the caller to reject, so a valid `interval '5' hour` is not
+	// lost to a stray token.
+	hasPrec, prec := false, 0
+	if lowField == "second" {
+		if tk := p.peek(off); tk.Kind == TokenSymbol && tk.Value == "(" {
+			numTok := p.peek(off + 1)
+			closeTok := p.peek(off + 2)
+			if numTok.Kind == TokenIntLit && closeTok.Kind == TokenSymbol && closeTok.Value == ")" {
+				if n, err := strconv.Atoi(numTok.Value); err == nil && n >= 0 {
+					// PostgreSQL clamps precision above MAX_INTERVAL_PRECISION
+					// (6) to 6 with a warning (intervaltypmodin); clamp silently.
+					if n > 6 {
+						n = 6
+					}
+					hasPrec, prec = true, n
+					consumed += 3
+				}
+			}
+		}
+	}
+
+	return &IntervalLit{pos: pos, Value: body, Unit: lowField, Qualified: true, HasPrec: hasPrec, Prec: prec}, consumed, true
 }
 
 // parseInTail consumes the right side of `expr [NOT] IN (...)`

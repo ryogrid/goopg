@@ -5719,9 +5719,15 @@ func evalIntervalLit(x *planner.IntervalLit) (Datum, error) {
 		return Datum{}, &ExecError{Code: "0A000", Pos: x.Pos(), Message: fmt.Sprintf("interval unit %q is not supported in v0", x.Unit)}
 	}
 	// Form 1 `interval 'N' <unit>`: the trailing unit is an SQL typmod
-	// field that truncates the value to that field's granularity.
+	// field that truncates the value to that field's granularity. For a range
+	// (`hour to minute`) x.Unit is already the low field (the parser collapses
+	// the range to it), and a SECOND(p) qualifier additionally rounds the
+	// fractional seconds — both mirror AdjustIntervalForTypmod.
 	if x.Qualified {
 		months, days, micros = truncIntervalToUnit(months, days, micros, x.Unit)
+		if x.HasPrec {
+			micros = roundIntervalMicrosToPrec(micros, x.Prec)
+		}
 	}
 	x.CachedMonths, x.CachedDays, x.CachedMicros = months, days, micros
 	x.CacheValid = true
@@ -5753,6 +5759,31 @@ func truncIntervalToUnit(months, days int32, micros int64, unit string) (int32, 
 		// "second" (and any non-standard unit): no sub-field to drop.
 		return months, days, micros
 	}
+}
+
+// intervalPrecScales[p] = 10^(6-p) microseconds: the quantum a SECOND(p) typmod
+// rounds the interval time field to. Mirrors IntervalScales in PostgreSQL's
+// AdjustIntervalForTypmod (postgres/src/backend/utils/adt/timestamp.c).
+var intervalPrecScales = [7]int64{1000000, 100000, 10000, 1000, 100, 10, 1}
+
+// roundIntervalMicrosToPrec rounds the time (micros) field of an interval to a
+// fractional-seconds precision p (0..6 digits), mirroring the precision arm of
+// PostgreSQL's AdjustIntervalForTypmod: round-half-away-from-zero to 10^(6-p)
+// microseconds (`interval '1.23456789' second(2)` → 00:00:01.23,
+// `interval '1.999999' second(2)` → 00:00:02). p==6 (full precision) is a
+// no-op. Go's truncated `%` matches C for the negative-time branch.
+func roundIntervalMicrosToPrec(micros int64, p int) int64 {
+	if p < 0 || p >= 6 {
+		return micros
+	}
+	scale := intervalPrecScales[p]
+	offset := scale / 2 // == IntervalOffsets[p]
+	if micros >= 0 {
+		micros += offset
+	} else {
+		micros -= offset
+	}
+	return micros - micros%scale
 }
 
 // evalInExpr evaluates `expr [NOT] IN (subquery | val_list)`.
