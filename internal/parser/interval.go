@@ -111,6 +111,18 @@ func ParseIntervalMagnitude(s string) (val int64, fval float64, ok bool) {
 	if s == "" {
 		return 0, 0, false
 	}
+	// PostgreSQL's ParseDateTime sign branch soaks up whitespace between a
+	// leading sign and its digits (`- 3` ≡ `-3`) and only forms a signed
+	// numeric token when a DIGIT then follows — `-.5` / `+.5` / `- .5` are
+	// DTERR_BAD_FORMAT (the branch requires isdigit after the sign; '.' is
+	// not), while the unsigned `.5` is a valid DTK_NUMBER.
+	if s[0] == '+' || s[0] == '-' {
+		rest := strings.TrimLeft(s[1:], " \t\n\r")
+		if rest == "" || !isASCIIDigit(rest[0]) {
+			return 0, 0, false
+		}
+		s = s[:1] + rest
+	}
 	dot := strings.IndexByte(s, '.')
 	if dot < 0 {
 		n, err := strconv.ParseInt(s, 10, 64)
@@ -430,86 +442,138 @@ func inDatetktbl(w string) bool {
 // the caller can reject the whole literal.
 func expandIntervalFields(raw []string) (out []string, ok bool) {
 	out = make([]string, 0, len(raw))
-	for _, f := range raw {
-		// Time words (HH:MM[:SS]) are decoded whole by the caller — BUT
-		// PostgreSQL's DTK_TIME lexer collects only digits, ':' and '.', so a
-		// glued trailing unit word starts a fresh DTK_STRING field (`12:00h` →
-		// `12:00` + `h`, the `h` then absorbed as a no-op). Peel any trailing
-		// ASCII-letter run and re-tokenize it; the time prefix is left intact.
-		// (`12:00h30m` still errors: it splits to `12:00`+`h`+`30`+`m`, and the
-		// `30 m` MINUTE bit collides with the time word's MINUTE slot.)
-		if strings.ContainsRune(f, ':') {
-			letterAt := -1
-			for k := 0; k < len(f); k++ {
-				if isASCIILetter(f[k]) {
-					letterAt = k
-					break
-				}
-			}
-			if letterAt < 0 || !strings.ContainsRune(f[:letterAt], ':') {
-				out = append(out, f)
-				continue
-			}
-			restToks, rok := splitAlphaNumRuns(f[letterAt:])
-			if !rok {
+	for k := 0; k < len(raw); k++ {
+		f := raw[k]
+		// PostgreSQL's sign lexer soaks up whitespace between a leading sign and
+		// its digits (`- 3` ≡ `-3`, `+ 3h30m` ≡ `+3h30m`): ParseDateTime appends
+		// the sign, skips isspace, then requires a digit to form a DTK_TZ token.
+		// A lone sign followed by anything else is DTERR_BAD_FORMAT (`-`, `- .5`)
+		// or an unsupported signed DTK_SPECIAL (`- h`), both 22007.
+		if f == "+" || f == "-" {
+			if k+1 >= len(raw) || !isASCIIDigit(raw[k+1][0]) {
 				return nil, false
 			}
-			out = append(out, f[:letterAt])
-			out = append(out, restToks...)
-			continue
+			k++
+			f += raw[k]
 		}
-		// A leading '+'/'-' is the field's sign, not a separator.
-		sign, body := "", f
-		if len(body) > 0 && (body[0] == '+' || body[0] == '-') {
-			sign, body = body[:1], body[1:]
-		}
-		// An internal '-' marks a SQL year-month field (`1-2`, `-1-2`) or an
-		// exotic hyphenated token; leave it whole for parseYearMonthField —
-		// UNLESS it is an unsigned field with a trailing fractional-seconds run
-		// or a glued unit word that PostgreSQL's ParseDateTime lexer would split
-		// off. PG lexes `1-2.5` as a DTK_DATE field (`1-2`) plus a fresh
-		// DTK_NUMBER field (`.5`), so the fraction decodes as seconds (`1-2.5` →
-		// 1 year 2 mons + 0.5 s); `1-.5` likewise splits into `1-` + `.5`; and
-		// `1-2h` splits into `1-2` + a DTK_STRING `h` unit word that is then
-		// absorbed (`1-2h` → 1 year 2 mons). See splitYearMonthTrailer. A SIGNED
-		// field (`-1-2h`, `+1-2mon3d`) is split by splitSignedTZTrailer instead:
-		// PG lexes it as a single DTK_TZ token whose collection rules differ (it
-		// swallows '.', collects the year-month '-', stops at a letter), so
-		// `-1-2h` → DTK_TZ `-1-2` + `h`(absorbed) → -1 years -2 mons, while
-		// `-1-2.5` (the '.' stays in the token) is kept whole and errors.
-		if strings.ContainsRune(body, '-') {
-			var pre, rest string
-			split := false
-			if sign == "" {
-				pre, rest, split = splitYearMonthTrailer(body)
-			} else if p, r, sok := splitSignedTZTrailer(body); sok {
-				// Reattach the sign to the year-month head; PG's DTK_TZ token
-				// carries it (`-1-2h` → DTK_TZ `-1-2` + DTK_STRING `h`).
-				pre, rest, split = sign+p, r, true
-			}
-			if split {
-				restToks, rok := splitAlphaNumRuns(rest)
-				if !rok {
-					return nil, false
-				}
-				out = append(out, pre)
-				out = append(out, restToks...)
-				continue
-			}
-			out = append(out, f)
-			continue
-		}
-		toks, tok := splitAlphaNumRuns(body)
+		toks, tok := expandIntervalField(f)
 		if !tok {
 			return nil, false
-		}
-		// Reattach the leading sign to the first (numeric) token.
-		if sign != "" {
-			toks[0] = sign + toks[0]
 		}
 		out = append(out, toks...)
 	}
 	return out, true
+}
+
+// expandIntervalField tokenizes ONE whitespace-delimited interval field
+// (see expandIntervalFields for the lexer rules). It is re-entrant: a '+'
+// mid-field ends the current token and begins a fresh sign-led field exactly
+// as PostgreSQL's ParseDateTime does (a sign always starts a new DTK_TZ
+// token), so `-1-2+3` expands to `-1-2` + `+3` and `3h+2` to `3` + `h` + `+2`
+// (unimplemented_feat #5(d-iii-rest), '+'-separated continuation).
+func expandIntervalField(f string) (out []string, ok bool) {
+	// Time words (HH:MM[:SS]) are decoded whole by the caller — BUT
+	// PostgreSQL's DTK_TIME lexer collects only digits, ':' and '.', so a
+	// glued trailing unit word starts a fresh DTK_STRING field (`12:00h` →
+	// `12:00` + `h`, the `h` then absorbed as a no-op). Peel any trailing
+	// ASCII-letter run and re-tokenize it; the time prefix is left intact.
+	// (`12:00h30m` still errors: it splits to `12:00`+`h`+`30`+`m`, and the
+	// `30 m` MINUTE bit collides with the time word's MINUTE slot. A '+' tail
+	// glued straight onto the time digits, `12:00+3`, is kept whole here and
+	// errors — PG splits it but the continuation's SECOND bit then collides
+	// with the time word's DTK_TIME_M, an identical 22007.)
+	//
+	// The field is a time word only when the ':' sits in the HEAD token — a
+	// colon appearing after a mid-field '+' belongs to the continuation field
+	// (`-1-2+3:30` is year-month `-1-2` + signed time `+3:30`, not a time), so
+	// such fields fall through to the year-month / run splitters, whose '+'
+	// handling re-enters here with the bare continuation.
+	colon := strings.IndexByte(f, ':')
+	if colon >= 0 {
+		plus := strings.IndexByte(f[1:], '+') // f[0] may be the field's own sign
+		if plus >= 0 && plus+1 < colon {
+			colon = -1
+		}
+	}
+	if colon >= 0 {
+		letterAt := -1
+		for k := 0; k < len(f); k++ {
+			if isASCIILetter(f[k]) {
+				letterAt = k
+				break
+			}
+		}
+		if letterAt < 0 || !strings.ContainsRune(f[:letterAt], ':') {
+			return []string{f}, true
+		}
+		restToks, rok := splitAlphaNumRuns(f[letterAt:])
+		if !rok {
+			return nil, false
+		}
+		return append([]string{f[:letterAt]}, restToks...), true
+	}
+	// A leading '+'/'-' is the field's sign, not a separator. PostgreSQL only
+	// forms a signed numeric (DTK_TZ) token when a DIGIT follows the sign; a
+	// sign before anything else is DTERR_BAD_FORMAT (`+.5`, `-.5`, `-1-2+.5`)
+	// or a signed DTK_SPECIAL (`+h`) that DecodeInterval rejects — the sole
+	// signed specials it accepts, ±infinity, are not modelled yet (deferred).
+	sign, body := "", f
+	if len(body) > 0 && (body[0] == '+' || body[0] == '-') {
+		sign, body = body[:1], body[1:]
+		if body == "" || !isASCIIDigit(body[0]) {
+			return nil, false
+		}
+	}
+	// An internal '-' marks a SQL year-month field (`1-2`, `-1-2`) or an
+	// exotic hyphenated token; leave it whole for parseYearMonthField —
+	// UNLESS it is an unsigned field with a trailing fractional-seconds run
+	// or a glued unit word that PostgreSQL's ParseDateTime lexer would split
+	// off. PG lexes `1-2.5` as a DTK_DATE field (`1-2`) plus a fresh
+	// DTK_NUMBER field (`.5`), so the fraction decodes as seconds (`1-2.5` →
+	// 1 year 2 mons + 0.5 s); `1-.5` likewise splits into `1-` + `.5`; and
+	// `1-2h` splits into `1-2` + a DTK_STRING `h` unit word that is then
+	// absorbed (`1-2h` → 1 year 2 mons). See splitYearMonthTrailer. A SIGNED
+	// field (`-1-2h`, `+1-2mon3d`) is split by splitSignedTZTrailer instead:
+	// PG lexes it as a single DTK_TZ token whose collection rules differ (it
+	// swallows '.', collects the year-month '-', stops at a letter), so
+	// `-1-2h` → DTK_TZ `-1-2` + `h`(absorbed) → -1 years -2 mons, while
+	// `-1-2.5` (the '.' stays in the token) is kept whole and errors. Both
+	// splitters also stop at '+', which begins a fresh sign-led field
+	// (`-1-2+3` → `-1-2` + `+3` → -1 years -2 mons +00:00:03).
+	if strings.ContainsRune(body, '-') {
+		var pre, rest string
+		split := false
+		if sign == "" {
+			pre, rest, split = splitYearMonthTrailer(body)
+		} else if p, r, sok := splitSignedTZTrailer(body); sok {
+			// Reattach the sign to the year-month head; PG's DTK_TZ token
+			// carries it (`-1-2h` → DTK_TZ `-1-2` + DTK_STRING `h`).
+			pre, rest, split = sign+p, r, true
+		}
+		if split {
+			var restToks []string
+			var rok bool
+			if rest[0] == '+' {
+				restToks, rok = expandIntervalField(rest)
+			} else {
+				restToks, rok = splitAlphaNumRuns(rest)
+			}
+			if !rok {
+				return nil, false
+			}
+			return append([]string{pre}, restToks...), true
+		}
+		return []string{f}, true
+	}
+	toks, tok := splitAlphaNumRuns(body)
+	if !tok {
+		return nil, false
+	}
+	// Reattach the leading sign to the first (numeric) token.
+	if sign != "" {
+		toks[0] = sign + toks[0]
+	}
+	return toks, true
 }
 
 // splitAlphaNumRuns splits a sign-stripped, colon-free, dash-free interval field
@@ -517,7 +581,12 @@ func expandIntervalFields(raw []string) (out []string, ok bool) {
 // '.'), reproducing the digit↔letter field boundaries of PostgreSQL's
 // ParseDateTime lexer. A letter run glued immediately before a digit that is NOT
 // an absolute-datetime token is the swallowed-DTK_DATE case PostgreSQL rejects
-// (see expandIntervalFields), so this returns ok=false for it. Any other
+// (see expandIntervalFields), so this returns ok=false for it. A '+' after at
+// least one run ends the current field and begins a fresh sign-led one (PG's
+// lexer always starts a new token at a sign), so the remainder re-enters
+// expandIntervalField (`3h+2` → `3`+`h`+`+2`); a '+' at position 0 is only
+// reachable as a DOUBLED sign — the caller already stripped the field's own
+// sign (`-1-2++3` recurses here with body `+3`) — which PG rejects. Any other
 // character (the body is expected to be alphanumeric plus '.') also yields
 // ok=false.
 func splitAlphaNumRuns(body string) (toks []string, ok bool) {
@@ -547,6 +616,12 @@ func splitAlphaNumRuns(body string) (toks []string, ok bool) {
 			}
 			toks = append(toks, body[i:j])
 			i = j
+		case c == '+' && i > 0:
+			restToks, rok := expandIntervalField(body[i:])
+			if !rok {
+				return nil, false
+			}
+			return append(toks, restToks...), true
 		default:
 			return nil, false
 		}
@@ -576,12 +651,17 @@ func isASCIIDigit(c byte) bool  { return c >= '0' && c <= '9' }
 //     month, PostgreSQL's else-branch collects the letters INTO the DTK_DATE
 //     token (`isalnum`), yielding one malformed year-month token that errors
 //     (`1-h`, `1-day`) — goopg reproduces that by leaving such a body whole.
+//  3. '+'-continuation tail (`1-2+3`, `1-+3`): '+' is neither alphanumeric nor
+//     the '-' delimiter, so — exactly like '.' — the DTK_DATE collection stops
+//     there regardless of month digits and the remainder begins a fresh
+//     sign-led field (`1-2+3` → 1 year 2 mons 00:00:03, `1-+3` → 1 year
+//     00:00:03).
 //
 // Returns ok=true with pre = the `<digits>-<digits?>` field and rest = the
-// remainder beginning at the '.'/letter. Any other body — no tail (`1-2`, `1-`),
-// a second '-' (`1-2-3`, `1--2`), an empty-month letter tail (`1-h`), or a
-// non-digit head — returns ok=false so the caller decodes it whole (matching PG,
-// which either accepts the bare year-month or rejects the malformed field).
+// remainder beginning at the '.'/letter/'+'. Any other body — no tail (`1-2`,
+// `1-`), a second '-' (`1-2-3`, `1--2`), an empty-month letter tail (`1-h`), or
+// a non-digit head — returns ok=false so the caller decodes it whole (matching
+// PG, which either accepts the bare year-month or rejects the malformed field).
 func splitYearMonthTrailer(body string) (pre, rest string, ok bool) {
 	if len(body) == 0 || !isASCIIDigit(body[0]) {
 		return "", "", false
@@ -602,8 +682,9 @@ func splitYearMonthTrailer(body string) (pre, rest string, ok bool) {
 		return "", "", false // bare `<year>-<month?>`, no trailer to split
 	}
 	switch {
-	case body[i] == '.':
-		// Fractional-seconds tail; splits regardless of month digits.
+	case body[i] == '.' || body[i] == '+':
+		// Fractional-seconds or '+'-continuation tail; splits regardless of
+		// month digits.
 		return body[:i], body[i:], true
 	case isASCIILetter(body[i]) && i > monStart:
 		// Unit-word tail, only after a non-empty month (`1-2h`, not `1-h`).
@@ -638,11 +719,11 @@ func splitYearMonthTrailer(body string) (pre, rest string, ok bool) {
 //     DTK_DATE else-branch swallows into one malformed token that errors. This
 //     asymmetry matches PostgreSQL byte-for-byte.
 //
-// Only a trailing ASCII-letter run (a glued DTK_STRING unit word, absorbed as a
-// no-op) is peeled: returns pre = the DTK_TZ token body (sign-stripped) and
-// rest = the letter-led remainder. Any other stop character — end of field
-// (`-1-2`, no trailer), or a fresh '+'/numeric continuation (`-1-2+3`, which PG
-// accepts as a further DTK_TZ field but goopg does not yet model) — returns
+// A trailing ASCII-letter run (a glued DTK_STRING unit word, absorbed as a
+// no-op) or a '+' (a fresh sign-led DTK_TZ continuation field, `-1-2+3` →
+// -1 years -2 mons +00:00:03) is split off: returns pre = the DTK_TZ token
+// body (sign-stripped) and rest = the letter-/'+'-led remainder. Any other
+// stop character — end of field (`-1-2`, no trailer) or junk — returns
 // ok=false so the caller keeps the whole field for the year-month decoder /
 // error path.
 func splitSignedTZTrailer(body string) (pre, rest string, ok bool) {
@@ -658,10 +739,10 @@ func splitSignedTZTrailer(body string) (pre, rest string, ok bool) {
 	if i >= len(body) {
 		return "", "", false // whole field is one DTK_TZ token — no trailer to split
 	}
-	// The TZ token stopped at body[i]. Only a glued unit-word (letter run) is
-	// peeled; a '.' would already have been consumed above, and any other stop
-	// char ('+', …) begins a continuation field goopg does not model here.
-	if !isASCIILetter(body[i]) {
+	// The TZ token stopped at body[i]. A glued unit-word (letter run) or a '+'
+	// continuation splits; a '.' would already have been consumed above, and
+	// any other stop char is junk left for the whole-field error path.
+	if !isASCIILetter(body[i]) && body[i] != '+' {
 		return "", "", false
 	}
 	return body[:i], body[i:], true

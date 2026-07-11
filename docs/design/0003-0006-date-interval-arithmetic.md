@@ -1049,6 +1049,54 @@ Tests: `TestYearMonthTimeGluedUnitAbsorb` grows to 52 accepts + 17 rejects (the
 `go build`/`go vet` clean; parser + analyzer + planner + executor suites PASS;
 `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke via pre-commit hook.
 
+## Follow-up (2026-07-11): `+`-separated continuation + sign-lexer fidelity (#5(d-iii-rest))
+
+Closes the prior section's deferred `+`-continuation, plus two sign-lexer rules
+discovered while verifying it against live PG 18.3 (port 5599).
+
+**1. `+`-continuation (`interval '-1-2+3'` → `-1 years -2 mons +00:00:03`).**
+PG's `ParseDateTime` always starts a **fresh field at a sign**: the `DTK_TZ` /
+`DTK_DATE` / digit-run / letter-run collections all stop at `+`, and the
+remainder lexes as its own sign-led field (`-1-2+3` → `DTK_TZ -1-2` +
+`DTK_TZ +3`; the trailing bare `+3` then defaults to SECONDS). goopg models this
+by making the field expander **re-entrant**: `expandIntervalFields` now
+delegates each whitespace field to a recursive `expandIntervalField`;
+`splitYearMonthTrailer` and `splitSignedTZTrailer` split at `+` (the unsigned
+form regardless of month digits, like `.`), and `splitAlphaNumRuns` recurses
+into `expandIntervalField` at a mid-body `+` (`3h+2` → `3`+`h`+`+2` →
+`03:00:02`). A continuation composes with everything downstream: glued unit
+words (`-1-2+3h30m`), signed times (`-1-2+3:30`, via a colon-guard fix — a `:`
+*after* the first mid-field `+` belongs to the continuation, not a time head),
+and further fields (`1-2+3 days` → 3 days via the RTL unit carry). Collisions
+reject exactly as PG: a second year-month (`-1-2+3-4`), a second continuation
+(`-1-2+3+4`), and a continuation off a plain-number/decimal/time head
+(`5+3`, `1.5+3`, `12:00+3` — the head already owns the SECOND slot).
+
+**2. Sign must precede a digit.** PG only forms a signed numeric token when a
+digit immediately follows the sign; `+.5` / `-.5` are `DTERR_BAD_FORMAT`
+(goopg previously accepted them as ±0.5 s). Enforced centrally in
+`ParseIntervalMagnitude` and in `expandIntervalField`'s sign branch, which
+also rejects `-1-2+.5` continuations and signed unit words (`+h`, a signed
+`DTK_SPECIAL` PG rejects for everything but the still-deferred ±infinity).
+
+**3. Whitespace soak after a sign.** PG's sign branch skips whitespace between
+the sign and its digits: `- 3` ≡ `-3` (`-00:00:03`), `- 3-4` → `-3 years -4
+mons`, and Form-1 `interval '- 3' day` → `-3 days`. Modelled in
+`expandIntervalFields` (a lone `+`/`-` field glues onto a following digit-led
+field) and in `ParseIntervalMagnitude` (covers the single-field Form-1/Form-2
+paths); a lone sign before anything else errors (`-`, `- h`, `- .5`).
+
+**Still deferred (ledger 2026-07-11):** full interval typmod grammar — including
+the typmod *range default* that makes `interval '-1-2+3' day` resolve the bare
+`+3` to DAYS in PG (`… +3 days`) where goopg's Form-1 only accepts a plain
+magnitude body — and interval `±infinity` (incl. the signed `DTK_SPECIAL`
+`+infinity` lex form).
+
+Tests: `TestYearMonthTimeGluedUnitAbsorb` grows to 79 accepts + 41 rejects, all
+captured byte-for-byte from live PostgreSQL 18.3. Gates: `go build`/`go vet`
+clean; parser + analyzer + planner + executor suites PASS;
+`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke via pre-commit hook.
+
 ## Cross-references
 
 - TPC-H query bodies: HammerDB upstream

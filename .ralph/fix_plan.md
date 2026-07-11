@@ -7937,6 +7937,29 @@ mirroring M0119's ledger `status` column.
       Follow-up section. Gates: build/vet clean;
       parser/analyzer/planner/executor suites PASS; `scripts/tpch-spotcheck.sh`
       PASS (Q12=2/Q13=33); pgbench smoke (hook).
+  - [x] `unimplemented_feat #5(d-iii-rest) ('+'-separated continuation +
+      sign-lexer fidelity)` (2026-07-11, this loop) — closed the prior row's
+      deferred `+`-continuation: `interval '-1-2+3'` → -1 years -2 mons
+      +00:00:03, `'1-2+3'` → 1 year 2 mons 00:00:03, `'1-+3'` → 1 year
+      00:00:03, `'-1-2+3h30m'`/`'-1-2+3:30'` → +03:30:00, `'1-2+3d'` → +3 days,
+      `'3h+2'` → 03:00:02. PG's ParseDateTime starts a FRESH field at every
+      sign, so the field expander is now re-entrant: new recursive
+      `expandIntervalField` (`internal/parser/interval.go`);
+      `splitYearMonthTrailer`/`splitSignedTZTrailer` split at `+`;
+      `splitAlphaNumRuns` recurses at a mid-body `+`; a `:` after the first
+      mid-field `+` belongs to the continuation (colon-guard). Plus two
+      sign-lexer fidelity fixes: a sign must be immediately followed by a digit
+      (`+.5`/`-.5` now ERROR as in PG — were wrongly accepted as ±0.5s;
+      enforced in `ParseIntervalMagnitude` so Form-1/Form-2 siblings agree) and
+      whitespace soaks between a lone sign and its digits (`interval '- 3'` →
+      -00:00:03, Form-1 `interval '- 3' day` → -3 days). Deferred (ledger
+      2026-07-11): typmod grammar incl. its range defaults (`interval
+      '-1-2+3' day` → PG resolves the bare `+3` to DAYS), ±infinity. Tests:
+      `interval_subday_test.go` `TestYearMonthTimeGluedUnitAbsorb` (now 79
+      accepts + 41 rejects, all byte-for-byte vs live PG 18.3 port 5599).
+      Design doc `docs/design/0003-0006-*` new Follow-up section + README row.
+      Gates: build/vet clean; parser/analyzer/planner/executor suites PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke (hook).
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,

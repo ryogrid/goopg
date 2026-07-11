@@ -747,12 +747,52 @@ func TestYearMonthTimeGluedUnitAbsorb(t *testing.T) {
 		{"SELECT interval '-1-2mon3d'", "-1 years -2 mons +3 days"},
 		{"SELECT interval '-1-2h30m'", "-1 years -2 mons +00:30:00"},
 		{"SELECT interval '+10-3mon2d'", "10 years 3 mons 2 days"},
+		// '+'-separated numeric continuation: PG's lexer always starts a fresh
+		// field at a sign, so a '+' ends the year-month DTK_DATE/DTK_TZ token
+		// and the remainder decodes as its own sign-led field (default unit
+		// SECONDS for a trailing bare number). Works off signed and unsigned
+		// year-month heads, empty months, and composes with glued unit words,
+		// times and further fields.
+		{"SELECT interval '-1-2+3'", "-1 years -2 mons +00:00:03"},
+		{"SELECT interval '+1-2+3'", "1 year 2 mons 00:00:03"},
+		{"SELECT interval '1-2+3'", "1 year 2 mons 00:00:03"},
+		{"SELECT interval '1-+3'", "1 year 00:00:03"},
+		{"SELECT interval '-1-+3'", "-1 years +00:00:03"},
+		{"SELECT interval '-1-2+3.5'", "-1 years -2 mons +00:00:03.5"},
+		{"SELECT interval '-1-2+3s'", "-1 years -2 mons +00:00:03"},
+		{"SELECT interval '-1-2+3h'", "-1 years -2 mons +03:00:00"},
+		{"SELECT interval '-1-2+3 h'", "-1 years -2 mons +03:00:00"},
+		{"SELECT interval '-1-2+3.5h'", "-1 years -2 mons +03:30:00"},
+		{"SELECT interval '-1-2+3h30m'", "-1 years -2 mons +03:30:00"},
+		{"SELECT interval '-1-2+3:30'", "-1 years -2 mons +03:30:00"},
+		{"SELECT interval '-1-+3h'", "-1 years +03:00:00"},
+		{"SELECT interval '1-2+3d'", "1 year 2 mons 3 days"},
+		{"SELECT interval '1-2+3 days'", "1 year 2 mons 3 days"},
+		{"SELECT interval '-1-2+3 days'", "-1 years -2 mons +3 days"},
+		// The '+' continuation also splits off a glued unit-word run (`1-2h+3`)
+		// and a plain hour pair (`3h+2` → `3`+`h`+`+2`).
+		{"SELECT interval '1-2h+3'", "1 year 2 mons 00:00:03"},
+		{"SELECT interval '3h+2'", "03:00:02"},
+		// A '+'-continuation carrying its own colon is a signed TIME field, and
+		// can itself trail an absorbed unit word.
+		{"SELECT interval '1-2+3:30h'", "1 year 2 mons 03:30:00"},
+		// PG's sign lexer soaks up whitespace between a lone sign and its
+		// digits, so `- 3` ≡ `-3` and the sign rides the whole glued field.
+		{"SELECT interval '- 3'", "-00:00:03"},
+		{"SELECT interval '- 3-4'", "-3 years -4 mons"},
+		{"SELECT interval '+ 3h30m'", "03:30:00"},
+		// The soak also applies inside the single-field Form-1 body (the typmod
+		// qualifier then truncates below the unit: `- 1.5` day keeps -1 days).
+		{"SELECT interval '- 3' day", "-3 days"},
+		{"SELECT interval '- 1.5' day", "-1 days"},
 		// Cast / :: siblings share the tokenizer.
 		{"SELECT '1-2h'::interval", "1 year 2 mons"},
 		{"SELECT CAST('1-2 days' AS interval)", "1 year 2 mons"},
 		{"SELECT '12:00h'::interval", "12:00:00"},
 		{"SELECT '-1-2h'::interval", "-1 years -2 mons"},
 		{"SELECT CAST('-1-2 days' AS interval)", "-1 years -2 mons"},
+		{"SELECT '-1-2+3'::interval", "-1 years -2 mons +00:00:03"},
+		{"SELECT CAST('1-2+3d' AS interval)", "1 year 2 mons 3 days"},
 	}
 	for _, c := range accept {
 		rows := runQuery(t, ctx, c.sql+" FROM t")
@@ -785,6 +825,38 @@ func TestYearMonthTimeGluedUnitAbsorb(t *testing.T) {
 		"SELECT interval '-1-2 foo' FROM t",       // 'foo' is not a unit word
 		"SELECT interval '-1-2foo' FROM t",        // ditto glued
 		"SELECT interval '-1-2 h h' FROM t",       // consecutive unhandled units
+		// '+'-continuation rejects (all confirmed against live PG 18.3): a
+		// second year-month field collides on MONTH, a second bare number
+		// re-uses the carried/default field, and a '+' continuation off a
+		// non-year-month head (plain number, decimal, time word) collides with
+		// the default-SECONDS slot its own head already occupies.
+		"SELECT interval '-1-2+3-4' FROM t",       // MONTH collision
+		"SELECT interval '-1-2+3+4' FROM t",       // second continuation → seconds re-use
+		"SELECT interval '-1-2+3 4' FROM t",       // bare number after the continuation
+		"SELECT interval '-1-2+' FROM t",          // sign with nothing after it
+		"SELECT interval '-1-2++3' FROM t",        // doubled sign
+		"SELECT interval '-1-2+h' FROM t",         // sign must precede a digit
+		"SELECT interval '5+3' FROM t",            // seconds collision off a plain number
+		"SELECT interval '1.5+3' FROM t",          // ditto, decimal head
+		"SELECT interval '1-2.5+3' FROM t",        // fraction pairs with the continuation
+		"SELECT interval '12:00+3' FROM t",        // time word occupies the SECOND slot
+		"SELECT interval '12:00h+3' FROM t",       // ditto with an absorbed unit between
+		"SELECT interval '-1:30+2' FROM t",        // signed time word, same collision
+		// Sign lexer fidelity: PG only forms a signed token when a DIGIT
+		// follows the sign ('+.5'/'-.5' are DTERR_BAD_FORMAT, and a lone sign
+		// must glue onto a following digit-led field).
+		"SELECT interval '+.5' FROM t",
+		"SELECT interval '-.5' FROM t",
+		"SELECT interval '+.5 sec' FROM t",
+		"SELECT interval '-.5 day' FROM t",
+		"SELECT interval '-.5' day FROM t", // Form-1 single-field sibling
+		"SELECT interval '+.5' second FROM t",
+		"SELECT interval '1 day +.5' FROM t",
+		"SELECT interval '-1-2+.5' FROM t",        // continuation is sign-led too
+		"SELECT interval '+h' FROM t",             // sign + letter is DTK_SPECIAL → rejected
+		"SELECT interval '-' FROM t",              // lone sign, nothing follows
+		"SELECT interval '- h' FROM t",            // lone sign before a non-digit field
+		"SELECT interval '- 3 4' FROM t",          // glued `- 3` then a colliding bare number
 	}
 	for _, sql := range reject {
 		if _, err := runQueryErr(t, ctx, sql); err == nil {
