@@ -1,38 +1,30 @@
 (idle — nothing in flight)
 
-## Loop summary (2026-07-11, loop #54)
+## Loop summary (2026-07-11, loop #56)
 
 **Nightly triage:** action-items batch `20260711-011536` — all 3 AI items
-already `[x]` in fix_plan.md (co-load timing flakes). No new work.
+(IsolationTimeouts, IsolationTuplelockUpgradeNoDeadlock, PgWaldumpVacuumPruneRoundtrip)
+already `[x]` in fix_plan.md (co-load timing flakes). No new nightly work.
 
-**Task — M0122-0004: landed RANGE window frame mode (non-offset bounds).**
-RANGE was the last unimplemented frame mode; the analyzer rejected ALL RANGE
-frames with 0A000, so even the default frame couldn't be spelled explicitly.
-Key insight: in RANGE mode CURRENT ROW means "the current row and ALL its
-ORDER BY peers" — identical to GROUPS-mode's non-offset behavior and the
-default frame — so non-offset RANGE needs NO new arithmetic, only a dispatch
-reuse of the existing peer-group machinery.
-- Analyzer `validateWindowFrame` (`internal/analyzer/analyzer.go`): new
-  `case FrameModeRange` accepts non-offset bounds; rejects RANGE+value-offset
-  with 0A000 (deferred). Unlike GROUPS, non-offset RANGE needs no ORDER BY.
-- Executor (`internal/executor/operators_window.go`): `frameBounds` dispatches
-  `FrameModeRange` → `frameBoundsGroups`; `needsValueGroupBounds` +
-  `evalExplicitFrameAggFuncs` gates extended to precompute peerGroupBounds
-  for RANGE.
-- Planner comments only (Mode already threaded through).
-Verified byte-for-byte vs live PG 18.3 (throwaway initdb). Tests:
-`TestAnalyzeWindowFrameRange{OffsetRejected,NonOffsetAccepted}` (analyzer),
-`TestCompatWindowExplicitRangePeers` + `TestCompatWindowRangeUnboundedPrecedingCumulative`
-(executor). Design: `docs/design/0122-0004-range-window-frame.md` + README row.
-Ledger row for the deferred RANGE-value-offset (`in_range` operators).
+**Task — unimplemented_feat #M0087: autovacuum loadTables silent no-op on
+wrapped catalogs (genuinely-open, confirmed by prior loop's code_audit).**
+`internal/autovacuum/launcher.go` loadTables used a bare `l.Cat.(*catalog.InMemory)`
+assertion; when the launcher holds a wrapper (e.g. `*catalog.SearchPathCatalog`,
+which implements `Unwrap() catalog.Catalog`), the assertion fails and autovacuum
+silently no-ops. Fix = peel the `Unwrap()` chain until the concrete InMemory is
+reached — the same idiom already used in internal/server/dispatch.go
+(`sessionTempInheritanceActive`, `partitionDetachPending`) and planner.go.
 
-Gates: build clean; `go vet` clean; analyzer/planner/parser/executor suites
-PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke via
-pre-commit hook; ralph-state-guard OK (auto-repaired).
+Files: internal/autovacuum/launcher.go (loadTables peels Unwrap chain);
+internal/autovacuum/launcher_test.go (+TestLoadTablesPeelsWrappedCatalog,
++parser import); unimplemented_feat.json (#M0087 open→resolved, surgical Edit).
 
-Next loop: RANGE with a value offset (`RANGE BETWEEN n PRECEDING`) is now the
-ONLY open window-frame item — needs per-ORDER-BY-column type-aware `in_range`
-operators + single-ORDER-BY-column validation (see ledger). Or another open
-M0122 unimplemented_feat item (sub-day intervals; ~20 open buckets remain).
+Gates: `go test ./internal/autovacuum/` PASS; `go build ./...` clean; JSON
+re-parses; `make ralph-state-guard` OK (auto-repaired prev clean-exit marker);
+pgbench smoke via pre-commit hook.
+
+Next loop: unimplemented_feat.json still has ~87 open entries; the ctl/catalog
+verify-and-reconcile cluster plus genuinely-open bounded items (e.g. the
+FilterOp/SeqScanOp predicate-batch wiring, or #92-style robustness fixes) remain.
 
 In-flight: none

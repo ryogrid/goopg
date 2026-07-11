@@ -1957,7 +1957,7 @@
    "feature": "The loadTables function uses a type assertion for InMemory catalog and silently no-ops when called with other catalog implementations",
    "task_id": "M0087",
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "loadTables uses a *catalog.InMemory type assertion and silently no-ops on any other catalog implementation"
    ],
@@ -1972,7 +1972,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: launcher.go:181-186 silently returns nil for non-InMemory catalogs"
+   "code_audit": "RESOLVED 2026-07-11: autovacuum/launcher.go loadTables now peels the Unwrap() chain (the same idiom as internal/server/dispatch.go / internal/planner/planner.go) instead of a bare *catalog.InMemory assertion, so a wrapper catalog such as *catalog.SearchPathCatalog reaches the underlying InMemory and its AllTables() instead of silently no-opping autovacuum. Regression test TestLoadTablesPeelsWrappedCatalog in internal/autovacuum/launcher_test.go."
   },
   {
    "feature": "DEFAULT clause in column definitions is skipped during parsing; default values are not stored or applied to new rows",

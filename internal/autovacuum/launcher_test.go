@@ -7,6 +7,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // TestLauncherStartStop verifies the launcher runs and stops cleanly.
@@ -80,5 +81,33 @@ func TestNeedsVacuumAntiWraparoundOverridesDisabledReloption(t *testing.T) {
 
 	if !l.needsVacuum(tbl) {
 		t.Fatalf("needsVacuum: expected true (anti-wraparound) even with autovacuum_enabled=false")
+	}
+}
+
+// TestLoadTablesPeelsWrappedCatalog verifies that loadTables reaches the
+// underlying *catalog.InMemory even when the launcher holds a wrapper catalog
+// (e.g. *catalog.SearchPathCatalog). A bare `l.Cat.(*catalog.InMemory)`
+// assertion silently fails on such a wrapper and no-ops autovacuum entirely;
+// loadTables now peels the Unwrap() chain, so a table created in the base
+// catalog is still discovered through the wrapper.
+func TestLoadTablesPeelsWrappedCatalog(t *testing.T) {
+	base := catalog.NewInMemory()
+	name := parser.ObjectName{Schema: "public", Name: "widgets"}
+	cols := []catalog.Column{{Name: "id", Type: catalog.Type{Name: "int4"}}}
+	if _, err := base.CreateTable(name, cols); err != nil {
+		t.Fatalf("CreateTable: %v", err)
+	}
+
+	// Sanity: a launcher over the bare InMemory sees the table.
+	if got := NewLauncher(nil, nil, base).loadTables(); len(got) != 1 {
+		t.Fatalf("loadTables(InMemory) = %d tables, want 1", len(got))
+	}
+
+	// The real regression: a launcher over a SearchPathCatalog wrapper must
+	// peel to the InMemory and still see the table (previously returned nil).
+	wrapped := catalog.WithSearchPath(base, func() []string { return []string{"public"} })
+	got := NewLauncher(nil, nil, wrapped).loadTables()
+	if len(got) != 1 || got[0].Name != "widgets" {
+		t.Fatalf("loadTables(SearchPathCatalog) = %v, want the one wrapped table", got)
 	}
 }
