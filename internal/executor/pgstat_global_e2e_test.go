@@ -81,3 +81,33 @@ func TestPgStatDatabaseEndToEnd(t *testing.T) {
 		}
 	}
 }
+
+// TestPgStatDatabaseConflictsEndToEnd drives pg_stat_database_conflicts through
+// the full SQL executor: one row per database, NO shared (datid=0) row, and
+// every confl_* counter an honest 0 (goopg is a primary with no recovery-
+// conflict accumulator). M0122-0003.
+func TestPgStatDatabaseConflictsEndToEnd(t *testing.T) {
+	ctx, _, cleanup := newStorageFixture(t)
+	defer cleanup()
+
+	rows := runQueryRows(t, ctx,
+		"SELECT datid, datname, confl_tablespace, confl_lock, confl_snapshot, confl_bufferpin, confl_deadlock, confl_active_logicalslot FROM pg_stat_database_conflicts ORDER BY datid")
+	if len(rows) < 1 {
+		t.Fatalf("row count = %d, want >= 1", len(rows))
+	}
+	for i, row := range rows {
+		// No shared-objects row: datid is never 0 and datname is never NULL.
+		if row[0].IsNull() || row[0].Format() == "0" {
+			t.Errorf("row %d datid = %v, want a real database oid (no shared row)", i, row[0].Format())
+		}
+		if row[1].IsNull() {
+			t.Errorf("row %d datname = NULL, want a real database name (no shared row)", i)
+		}
+		// confl_* counters (cols 2..7) are honest 0 on a primary.
+		for c := 2; c <= 7; c++ {
+			if row[c].IsNull() || row[c].Format() != "0" {
+				t.Errorf("row %d confl col %d = %v, want 0", i, c, row[c].Format())
+			}
+		}
+	}
+}

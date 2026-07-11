@@ -4808,6 +4808,41 @@ func (c *InMemory) PGStatDatabaseRows() [][]string {
 	return out
 }
 
+// PGStatDatabaseConflictsRows builds the pg_stat_database_conflicts row set:
+// one row per database the catalog knows about, mirroring upstream
+// system_views.sql's "FROM pg_database D". Unlike pg_stat_database there is NO
+// leading shared-objects (datid=0) row — the upstream view has no "SELECT 0,
+// NULL UNION ALL" prefix.
+//
+// Every confl_* counter is a faithful 0. These counters only ever increment on
+// a *standby* when a query is cancelled by a hot-standby recovery conflict
+// (see PgStat_StatDBEntry.conflict_* in pgstat_database.c, bumped only from
+// pgstat_report_recovery_conflict). goopg is a primary with no recovery-
+// conflict accumulator, so — exactly like a real PG 18.3 primary — all five
+// (six with the PG16+ logical-slot column) counters read 0. datid uses the
+// same catalog.databaseDisplayOID helper as pg_stat_database so the two views
+// join to pg_database.oid byte-for-byte. See
+// docs/design/0122-0003-pg-stat-user-tables.md.
+func (c *InMemory) PGStatDatabaseConflictsRows() [][]string {
+	// 8-col shape (PG 18.3): datid, datname, confl_tablespace, confl_lock,
+	// confl_snapshot, confl_bufferpin, confl_deadlock, confl_active_logicalslot.
+	const nCols = 8
+	row := func(datid, datname string) []string {
+		r := make([]string, nCols)
+		for i := range r {
+			r[i] = "0" // confl_* counters default to a faithful 0
+		}
+		r[0] = datid   // datid oid
+		r[1] = datname // datname name
+		return r
+	}
+	out := make([][]string, 0, 4)
+	for _, n := range c.ListDatabases() {
+		out = append(out, row(c.databaseDisplayOID(n), n))
+	}
+	return out
+}
+
 // ResolveDatabaseOid returns the REAL, physical pg_database.oid for name —
 // the same oid that keys on-disk storage/ACLs (c.DBOID() for "postgres",
 // the fixed bootstrap oids for template1/template0, or the CreateDatabase-
@@ -8594,6 +8629,32 @@ func (c *InMemory) registerSystemTables() {
 	}
 	pgStatDatabase.VirtualRows = c.PGStatDatabaseRows
 	c.ns(DefaultDBOid).tables["pg_catalog.pg_stat_database"] = pgStatDatabase
+
+	// pg_stat_database_conflicts — one row per database (NO leading shared-objects
+	// row; upstream's view is a bare "FROM pg_database D"). Like pg_stat_database
+	// this is a GLOBAL row set independent of the connected DB, so it needs no
+	// per-connection twin: the VirtualRows closure enumerates the live registry
+	// (c.ListDatabases via PGStatDatabaseConflictsRows) at query time. Every
+	// confl_* counter is a faithful 0 — these only increment on a standby during
+	// hot-standby recovery conflicts and goopg is a primary with no recovery-
+	// conflict accumulator (matches a real PG 18.3 primary byte-for-byte). See
+	// docs/design/0122-0003-pg-stat-user-tables.md and PGStatDatabaseConflictsRows.
+	pgStatDatabaseConflicts := &Table{
+		Schema: "pg_catalog", Name: "pg_stat_database_conflicts", Virtual: true,
+		Columns: []Column{
+			{Name: "datid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "datname", Type: Type{Name: "name"}, Ordinal: 1},
+			{Name: "confl_tablespace", Type: Type{Name: "int8"}, Ordinal: 2},
+			{Name: "confl_lock", Type: Type{Name: "int8"}, Ordinal: 3},
+			{Name: "confl_snapshot", Type: Type{Name: "int8"}, Ordinal: 4},
+			{Name: "confl_bufferpin", Type: Type{Name: "int8"}, Ordinal: 5},
+			{Name: "confl_deadlock", Type: Type{Name: "int8"}, Ordinal: 6},
+			{Name: "confl_active_logicalslot", Type: Type{Name: "int8"}, Ordinal: 7},
+		},
+		OID: 9102,
+	}
+	pgStatDatabaseConflicts.VirtualRows = c.PGStatDatabaseConflictsRows
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_stat_database_conflicts"] = pgStatDatabaseConflicts
 
 	// pg_stat_io — per-backend-type I/O statistics (PG 16+, OID 8061).
 	// The static VirtualRows fallback below returns no rows; the real,

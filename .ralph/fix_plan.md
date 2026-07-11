@@ -3962,10 +3962,24 @@ mirroring M0119's ledger `status` column.
       `ResolveDatabaseOid`). Tests: `TestPGStatDatabaseViewRegistered`
       (`internal/catalog/pgstat_global_test.go`) + `TestPgStatDatabaseEndToEnd`
       (`internal/executor/pgstat_global_e2e_test.go`). Design +README +ledger
-      updated. `PgStat_StatDBEntry` accumulator deferred. Still unregistered
-      pg_stat views for a later slice: `pg_stat_database_conflicts`,
-      `pg_stat_ssl`, `pg_stat_gssapi`, `pg_stat_subscription_stats`,
-      `pg_stat_progress_*`, `pg_stat_replication`, `pg_stat_wal_receiver`.
+      updated. `PgStat_StatDBEntry` accumulator deferred.
+      **`pg_stat_database_conflicts` done (2026-07-12, later loop):** the
+      per-database recovery-conflict view (8-col PG 18.3 shape, OID 9102). Like
+      `pg_stat_database` it is *global* (`catalog.PGStatDatabaseConflictsRows`
+      enumerates `c.ListDatabases` at query time, no per-connection twin) but
+      UNLIKE it has NO leading shared (`datid=0`) row — upstream is a bare
+      `FROM pg_database D`. Every `confl_*` counter is a faithful 0 (they only
+      bump on a standby via `pgstat_report_recovery_conflict`; goopg is a
+      primary with no recovery-conflict accumulator) — VERIFIED byte-identical
+      to a throwaway real PG 18.3 cluster this loop (8 cols oid/name/6×bigint,
+      one row per db, no datid=0 row, all confl_* 0). `datid` reuses the shared
+      `catalog.databaseDisplayOID` helper. Tests:
+      `TestPGStatDatabaseConflictsViewRegistered` +
+      `TestPgStatDatabaseConflictsEndToEnd`. Design +README +ledger updated.
+      Recovery-conflict accumulator deferred. Still unregistered pg_stat views
+      for a later slice: `pg_stat_ssl`, `pg_stat_gssapi`,
+      `pg_stat_subscription_stats`, `pg_stat_progress_*`, `pg_stat_replication`,
+      `pg_stat_wal_receiver`.
 - [x] **M0122-0004 — SQL language / executor features** (~21). Window frame
       ROWS/RANGE/GROUPS, GROUPING SETS/ROLLUP/CUBE, DEFAULT-clause
       parsing, intervals. **WITH CHECK

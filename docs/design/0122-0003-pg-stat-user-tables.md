@@ -381,6 +381,38 @@ full SELECT resolves the view, shared row first under `ORDER BY datid`, NULL
 `stats_reset`). A live `PgStat_StatDBEntry`-style accumulator is deferred
 (ledger).
 
+## `pg_stat_database_conflicts` (per-database recovery-conflict view, 2026-07-12)
+
+`pg_stat_database_conflicts` reports, per database, how many queries have been
+cancelled by hot-standby recovery conflicts. Upstream (`system_views.sql`) is a
+bare `SELECT ... FROM pg_database D` — **eight columns**: `datid` (oid),
+`datname` (name), and six `int8` counters `confl_tablespace`, `confl_lock`,
+`confl_snapshot`, `confl_bufferpin`, `confl_deadlock`, `confl_active_logicalslot`
+(the last added in PG 16). Unlike `pg_stat_database` there is **no leading
+shared-objects (`datid=0`) row** — the view has no `SELECT 0, NULL UNION ALL`
+prefix.
+
+Like `pg_stat_database` it is a **global** row set independent of the connected
+database, so it needs **no per-connection twin**: the `VirtualRows` closure is
+`catalog.PGStatDatabaseConflictsRows`, enumerating the live registry
+(`c.ListDatabases`) at query time so `CREATE`/`DROP DATABASE` is reflected
+immediately. Every `confl_*` counter is a faithful **0**: these only ever bump
+on a *standby* via `pgstat_report_recovery_conflict` (upstream
+`pgstat_database.c`, `PgStat_StatDBEntry.conflict_*`); goopg is a primary with
+no recovery-conflict accumulator, so — exactly like a real PG 18.3 primary — all
+counters read 0 (verified byte-identical against a throwaway PG 18.3 cluster this
+loop). `datid` derives from the same shared `catalog.databaseDisplayOID(name)`
+helper as `pg_stat_database`, so the two views join to `pg_database.oid`
+byte-for-byte.
+
+Registered in `registerSystemTables` right after `pg_stat_database` (OID 9102).
+Tests: `TestPGStatDatabaseConflictsViewRegistered`
+(`internal/catalog/pgstat_global_test.go` — 8-col shape, no shared row, honest-0
+counters, bootstrap-database display oids, `CREATE DATABASE` reflected) and
+`TestPgStatDatabaseConflictsEndToEnd`
+(`internal/executor/pgstat_global_e2e_test.go` — full SELECT, no `datid=0` row,
+every `confl_*` 0). The live recovery-conflict accumulator is deferred (ledger).
+
 ## Deferred
 
 The scan/tuple/vacuum/analyze counters and `last_*` timestamps remain honest

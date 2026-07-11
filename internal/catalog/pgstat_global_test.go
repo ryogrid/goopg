@@ -180,3 +180,86 @@ func TestPGStatDatabaseViewRegistered(t *testing.T) {
 		t.Error("pg_stat_database: new database statdb not listed after CREATE DATABASE")
 	}
 }
+
+// TestPGStatDatabaseConflictsViewRegistered confirms pg_stat_database_conflicts
+// resolves as a virtual pg_catalog relation with the upstream PG 18.3 8-column
+// tupledesc and returns one honest-0 row per database — with NO leading
+// shared-objects row (upstream's view is a bare "FROM pg_database D"). The
+// confl_* counters only ever bump on a standby recovery conflict, so a primary
+// (goopg) reports 0 for every database. M0122-0003.
+func TestPGStatDatabaseConflictsViewRegistered(t *testing.T) {
+	c := NewInMemory()
+	wantCols := []string{
+		"datid", "datname", "confl_tablespace", "confl_lock", "confl_snapshot",
+		"confl_bufferpin", "confl_deadlock", "confl_active_logicalslot",
+	}
+	tbl := c.ns(DefaultDBOid).tables["pg_catalog.pg_stat_database_conflicts"]
+	if tbl == nil {
+		t.Fatal("pg_stat_database_conflicts not registered as a virtual pg_catalog table")
+	}
+	if !tbl.Virtual {
+		t.Error("pg_stat_database_conflicts: Virtual = false, want true")
+	}
+	if len(tbl.Columns) != len(wantCols) {
+		t.Fatalf("pg_stat_database_conflicts: %d columns, want %d", len(tbl.Columns), len(wantCols))
+	}
+	for i, want := range wantCols {
+		if tbl.Columns[i].Name != want {
+			t.Errorf("pg_stat_database_conflicts: column %d = %q, want %q", i, tbl.Columns[i].Name, want)
+		}
+	}
+	if tbl.VirtualRows == nil {
+		t.Fatal("pg_stat_database_conflicts: VirtualRows is nil")
+	}
+	rows := tbl.VirtualRows()
+	// One row per bootstrap database (template0/template1/postgres) — NO leading
+	// shared row, so the datid=0 sentinel must NOT appear.
+	if len(rows) < 3 {
+		t.Fatalf("pg_stat_database_conflicts: VirtualRows() = %d rows, want >= 3", len(rows))
+	}
+	for r, row := range rows {
+		if len(row) != len(wantCols) {
+			t.Fatalf("pg_stat_database_conflicts: row %d has %d cols, want %d", r, len(row), len(wantCols))
+		}
+		if row[0] == "0" || row[1] == VirtualNull {
+			t.Errorf("pg_stat_database_conflicts: row %d is a shared-objects row (datid=%q datname=%q); upstream has none", r, row[0], row[1])
+		}
+		// confl_* counters (cols 2..7) are honest 0 on a primary.
+		for i := 2; i < len(row); i++ {
+			if row[i] != "0" {
+				t.Errorf("pg_stat_database_conflicts: row %d col %d (%s) = %q, want 0", r, i, wantCols[i], row[i])
+			}
+		}
+	}
+	// datid must join to pg_database.oid exactly as pg_stat_database does (shared
+	// databaseDisplayOID helper). Bootstrap databases carry canonical display oids.
+	byName := map[string]string{}
+	for _, row := range rows {
+		byName[row[1]] = row[0]
+	}
+	for name, wantOid := range map[string]string{"template1": "1", "template0": "4", "postgres": "16384"} {
+		if got := byName[name]; got != wantOid {
+			t.Errorf("pg_stat_database_conflicts: datid for %q = %q, want %q", name, got, wantOid)
+		}
+	}
+	// CREATE DATABASE reflected immediately.
+	if _, err := c.CreateDatabase("confldb", BootstrapSuperuserOID); err != nil {
+		t.Fatalf("CreateDatabase: %v", err)
+	}
+	rows2 := tbl.VirtualRows()
+	if len(rows2) != len(rows)+1 {
+		t.Fatalf("pg_stat_database_conflicts: after CREATE DATABASE %d rows, want %d", len(rows2), len(rows)+1)
+	}
+	var found bool
+	for _, row := range rows2 {
+		if row[1] == "confldb" {
+			found = true
+			if row[0] != c.databaseDisplayOID("confldb") {
+				t.Errorf("pg_stat_database_conflicts: confldb datid = %q, want %q", row[0], c.databaseDisplayOID("confldb"))
+			}
+		}
+	}
+	if !found {
+		t.Error("pg_stat_database_conflicts: new database confldb not listed after CREATE DATABASE")
+	}
+}
