@@ -81,6 +81,29 @@ every clean, green (build + pre-commit) checkpoint.
       ./internal/testport/`). No product fix needed; next nightly on a quiescent
       tree drops the whole cascade. (Loop #82 triage; supersedes loop #81's
       "co-load cascade" mislabel — the mechanism was a transient build break.)
+- [x] testport/TestPort_IsolationTuplelockUpgradeNoDeadlock — REOPENED
+      (AI-20260712-020530-002; earlier AI-20260711-011536-002's "co-load timing
+      flake, 3/3 standalone" diagnosis did NOT hold). Repro:
+      `for i in $(seq 6); do go test -count=1 -run
+      '^TestPort_IsolationTuplelockUpgradeNoDeadlock$' ./internal/testport/; done`.
+      ROOT CAUSE (loop #89): genuinely flaky ~17% STANDALONE (1 FAIL / 5 PASS at
+      HEAD), a row-lock wait-queue FIFO-fairness gap, NOT co-load. Perms 66
+      (`s1_share s2_update s3_update ...`) / 67 (`s2_delete s3_delete`) diverge
+      because goopg's DML UPDATE/DELETE conflict path (`epqWait` →
+      `mvcc.WaitForXID`, operators_storage.go) wakes all waiters with one
+      `commitCond.Broadcast()` and lets them race to re-stamp xmax — no
+      LOCKTAG_TUPLE serialisation — so s3 sometimes beats the earlier-arriving
+      s2 (which then times out). PG grants FIFO via the heavyweight LOCKTAG_TUPLE
+      in `heap_lock_tuple`/`heap_update` (the SELECT FOR UPDATE perms 57/65 are
+      stable because `lockRowsOp` already `acquireTupleLock`s). FIXED THIS LOOP
+      (de-flake + correct the premature 8043b9ff strict promotion, NOT the engine
+      fix): demoted `runIsoSpecStrict`→`runIsoSpec` (skip-on-mismatch → nightly
+      no longer flaps red), flipped target-inventory.csv `pass`→`defer` +
+      regenerated the .md, deferral_ledger.md row with the LOCKTAG_TUPLE resume
+      point. RE-PROMOTE task (deferred, its own slice, HIGH blast radius across
+      the whole isolation surface): make the DML conflict path
+      `ctx.acquireTupleLock(rel, ptr, ExclusiveLock)` before `WaitForXID`, then
+      restore `runIsoSpecStrict` + CSV `pass`.
 - [x] testport/TestPort_PgWaldumpVacuumPruneRoundtrip — pg_waldump structural
       error `invalid WAL segment size ... (0 bytes)` on the trailing segment
       (AI-20260711-011536-003; repro: `go test -v -run
