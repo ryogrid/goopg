@@ -61,6 +61,26 @@ every clean, green (build + pre-commit) checkpoint.
      placeholder is a comment, not a checkbox, so the plan-complete exit
      heuristic stays live.) -->
 
+- [x] testport/* build-break cascade (run 20260712-020530, ~39 AI items:
+      AI-20260712-020530-001..039 — TestPort_IsolationStats,
+      IsolationTuplelockUpgradeNoDeadlock, PgAmcheck002Nonesuch/003*/004*/
+      AllTables/BtreeIndexCheck, PgBasebackup010*, etc.) — **STALE, already
+      fixed at HEAD.** Every item's evidence log shows the identical cause:
+      `init failed: internal/executor/operators_ddl.go:...: not enough arguments
+      in call to catalog.DecodePGIndexPhysicalRow  have ([]byte)  want
+      ([]byte, []byte)` — a COMPILE break, not a co-load timing flake. The
+      nightly built at sha 401e6212 while a concurrent Ralph loop was mid-landing
+      the 2-arg `DecodePGIndexPhysicalRow` signature (catalog.go changed, the
+      executor caller update not yet visible in the working tree — the
+      concurrent-Ralph-tree hazard). At HEAD (cff2627b) the caller passes
+      `catalog.DecodePGIndexPhysicalRow(data, nil)` (operators_ddl.go:13361),
+      `go test -run '^$' ./internal/testport/` compiles clean, and
+      `TestPort_IsolationStats` + `TestPort_PgAmcheck002Nonesuch` PASS 2/2
+      standalone (repro: `go test -count=1 -run
+      '^(TestPort_IsolationStats|TestPort_PgAmcheck002Nonesuch)$'
+      ./internal/testport/`). No product fix needed; next nightly on a quiescent
+      tree drops the whole cascade. (Loop #82 triage; supersedes loop #81's
+      "co-load cascade" mislabel — the mechanism was a transient build break.)
 - [x] testport/TestPort_PgWaldumpVacuumPruneRoundtrip — pg_waldump structural
       error `invalid WAL segment size ... (0 bytes)` on the trailing segment
       (AI-20260711-011536-003; repro: `go test -v -run
