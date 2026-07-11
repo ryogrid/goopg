@@ -239,6 +239,49 @@ Both views stay empty until goopg grows a cumulative per-function statistics
 subsystem (a `PgStat_StatFuncEntry` analog) *and* wires it to a
 `track_functions`-equivalent GUC — a genuinely new subsystem, not a wiring slice.
 
+## Transaction sibling: `pg_stat_xact_all_tables` / `pg_stat_xact_{user,sys}_tables`
+
+The three `pg_stat_xact_*_tables` views are the per-*transaction* counterpart of
+the cumulative `pg_stat_*_tables` views. Upstream (`system_views.sql`) they select
+the same relation set (`pg_class` LEFT JOIN `pg_index`, `relkind IN
+('r','t','m','p')`) but every counter comes from the `pg_stat_get_xact_*` builtins
+— the deltas accumulated by the *current backend's in-progress transaction* rather
+than the cluster-lifetime cumulative totals. Consequently the shape is narrower:
+
+```sql
+-- pg_stat_xact_all_tables (12 cols) — no n_live_tup / last_* / vacuum cells
+relid, schemaname, relname,
+seq_scan, seq_tup_read, idx_scan, idx_tup_fetch,
+n_tup_ins, n_tup_upd, n_tup_del, n_tup_hot_upd, n_tup_newpage_upd
+```
+
+There are **no** `n_live_tup`, `last_*` timestamp or `vacuum_count` columns — the
+xact views carry pure transaction-local deltas, not snapshot estimates or
+maintenance history. goopg has no per-transaction pgstat accumulator (no
+`PgStat_TableXactStatus` analog), so all nine delta counters are a faithful `0` —
+exactly what a stock cluster reports for a relation the current transaction has not
+yet touched. The three real cells are `relid` / `schemaname` / `relname`.
+
+`catalog.PGStatXactTablesRowsForDBOid(dbOid, scope)` reuses the **identical**
+relation filter + `StatTableScope` user/sys split as
+`PGStatTablesRowsForDBOid`, so the cumulative and xact table views always agree on
+which relations they surface. `executor.fetchStatXactTablesRows` is the
+per-connection twin (same `ctx.Catalog`-unwrap + `ctx.CurrentDatabaseOid` scoping),
+wired at `valuesOp.Open`'s three new `pg_stat_xact_*_tables` branches; the static
+`VirtualRows` fallback (OIDs 9098–9100) scopes to `DefaultDBOid`.
+
+Tests: `internal/catalog/pgstat_xact_tables_test.go`
+(`TestPGStatXactTablesRowsBasicShape` — 12-col shape, real identity cells, 0 delta
+counters; `TestPGStatXactTablesScopeFilter`; `TestPGStatXactTablesExcludesNonTableRelkinds`;
+`TestPGStatXactTablesViewsRegistered`) and
+`internal/executor/pgstat_xact_tables_e2e_test.go`
+(`TestPgStatXactUserTablesEndToEnd`, `TestPgStatXactSysTablesExcludesUserTable`).
+
+The delta counters stay `0` until goopg grows a per-transaction table-statistics
+accumulator (`PgStat_TableXactStatus` analog) that folds into commit-time cumulative
+stats — the same not-yet-built subsystem the cumulative views' non-identity columns
+wait on.
+
 ## Deferred
 
 The scan/tuple/vacuum/analyze counters and `last_*` timestamps remain honest

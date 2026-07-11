@@ -7068,6 +7068,79 @@ func (c *InMemory) PGStatTablesRowsForDBOid(dbOid uint32, scope StatTableScope) 
 	return out
 }
 
+// PGStatXactTablesRowsForDBOid builds the pg_stat_xact_all_tables /
+// pg_stat_xact_user_tables / pg_stat_xact_sys_tables row set for one database,
+// scoped by `scope`. These are the per-*transaction* siblings of the cumulative
+// pg_stat_*_tables views: upstream (system_views.sql) they report only the counters
+// accumulated by the current backend's in-progress transaction via
+// pg_stat_get_xact_* (seq_scan, seq_tup_read, idx_scan, idx_tup_fetch, n_tup_ins,
+// n_tup_upd, n_tup_del, n_tup_hot_upd, n_tup_newpage_upd). There are NO n_live_tup /
+// last_* / vacuum cells — the xact views carry pure transaction-local deltas, no
+// snapshot estimates or timestamps.
+//
+// goopg has no per-transaction pgstat accumulator (no PgStat_TableXactStatus), so
+// every one of the 9 delta counters is a faithful 0 — exactly what a stock cluster
+// reports for a relation the current transaction has not yet touched. The three real
+// cells are relid / schemaname / relname. The relation set + user/sys split reuse the
+// SAME filter as PGStatTablesRowsForDBOid so the cumulative and xact table views agree
+// on which relations they surface. See docs/design/0122-0003-pg-stat-user-tables.md.
+func (c *InMemory) PGStatXactTablesRowsForDBOid(dbOid uint32, scope StatTableScope) [][]string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	keys := make([]string, 0, len(c.ns(dbOid).tables))
+	for k := range c.ns(dbOid).tables {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([][]string, 0, len(keys))
+	for _, k := range keys {
+		t := c.ns(dbOid).tables[k]
+		// Identical relation filter to PGStatTablesRowsForDBOid (relkind r/m/p):
+		// skip system-catalog virtual tables, sequences, plain views, foreign tables.
+		if t.Virtual && t.View == nil && !t.IsMatView && !t.IsSequence {
+			continue
+		}
+		if t.IsSequence {
+			continue
+		}
+		if t.View != nil && !t.IsMatView {
+			continue
+		}
+		if t.ForeignServerName != "" {
+			continue
+		}
+		schema := t.Schema
+		if schema == "" {
+			schema = "public"
+		}
+		switch scope {
+		case StatScopeUser:
+			if isSystemStatSchema(schema) {
+				continue
+			}
+		case StatScopeSys:
+			if !isSystemStatSchema(schema) {
+				continue
+			}
+		}
+		out = append(out, []string{
+			strconv.Itoa(int(t.OID)), // 0:  relid
+			schema,                   // 1:  schemaname
+			t.Name,                   // 2:  relname
+			"0",                      // 3:  seq_scan
+			"0",                      // 4:  seq_tup_read
+			"0",                      // 5:  idx_scan
+			"0",                      // 6:  idx_tup_fetch
+			"0",                      // 7:  n_tup_ins
+			"0",                      // 8:  n_tup_upd
+			"0",                      // 9:  n_tup_del
+			"0",                      // 10: n_tup_hot_upd
+			"0",                      // 11: n_tup_newpage_upd
+		})
+	}
+	return out
+}
+
 // PGStatIndexesRowsForDBOid builds the pg_stat_all_indexes / pg_stat_user_indexes
 // / pg_stat_sys_indexes row set for one database, scoped by `scope` (reusing the
 // same StatTableScope user/sys split as the per-table views). It mirrors
@@ -8635,6 +8708,51 @@ func (c *InMemory) registerSystemTables() {
 			OID:     v.oid,
 		}
 		tbl.VirtualRows = func() [][]string { return c.PGStatUserFunctionsRows() }
+		c.ns(DefaultDBOid).tables["pg_catalog."+v.name] = tbl
+	}
+
+	// pg_stat_xact_all_tables / pg_stat_xact_user_tables / pg_stat_xact_sys_tables —
+	// per-*transaction* table access statistics (PG's system_views.sql), the
+	// transaction-scoped sibling of the cumulative pg_stat_*_tables views. Same
+	// live-scoping wiring: the static VirtualRows fallback scopes to DefaultDBOid,
+	// executor.fetchStatXactTablesRows resolves the connecting database and is swapped
+	// in at valuesOp.Open. Unlike the cumulative views these carry only the 9 xact
+	// delta counters (no n_live_tup / last_* / vacuum cells); goopg has no
+	// per-transaction pgstat accumulator, so every counter is a faithful 0 and
+	// relid/schemaname/relname are real. See catalog.PGStatXactTablesRowsForDBOid and
+	// docs/design/0122-0003-pg-stat-user-tables.md.
+	statXactTablesColumns := func() []Column {
+		return []Column{
+			{Name: "relid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "schemaname", Type: Type{Name: "name"}, Ordinal: 1},
+			{Name: "relname", Type: Type{Name: "name"}, Ordinal: 2},
+			{Name: "seq_scan", Type: Type{Name: "int8"}, Ordinal: 3},
+			{Name: "seq_tup_read", Type: Type{Name: "int8"}, Ordinal: 4},
+			{Name: "idx_scan", Type: Type{Name: "int8"}, Ordinal: 5},
+			{Name: "idx_tup_fetch", Type: Type{Name: "int8"}, Ordinal: 6},
+			{Name: "n_tup_ins", Type: Type{Name: "int8"}, Ordinal: 7},
+			{Name: "n_tup_upd", Type: Type{Name: "int8"}, Ordinal: 8},
+			{Name: "n_tup_del", Type: Type{Name: "int8"}, Ordinal: 9},
+			{Name: "n_tup_hot_upd", Type: Type{Name: "int8"}, Ordinal: 10},
+			{Name: "n_tup_newpage_upd", Type: Type{Name: "int8"}, Ordinal: 11},
+		}
+	}
+	for _, v := range []struct {
+		name  string
+		oid   uint32
+		scope StatTableScope
+	}{
+		{"pg_stat_xact_all_tables", 9098, StatScopeAll},
+		{"pg_stat_xact_sys_tables", 9099, StatScopeSys},
+		{"pg_stat_xact_user_tables", 9100, StatScopeUser},
+	} {
+		scope := v.scope
+		tbl := &Table{
+			Schema: "pg_catalog", Name: v.name, Virtual: true,
+			Columns: statXactTablesColumns(),
+			OID:     v.oid,
+		}
+		tbl.VirtualRows = func() [][]string { return c.PGStatXactTablesRowsForDBOid(DefaultDBOid, scope) }
 		c.ns(DefaultDBOid).tables["pg_catalog."+v.name] = tbl
 	}
 

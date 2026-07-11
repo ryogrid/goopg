@@ -33,6 +33,31 @@ func fetchStatTablesRows(ctx *Context, scope catalog.StatTableScope) [][]string 
 	}
 }
 
+// fetchStatXactTablesRows is the per-transaction sibling of fetchStatTablesRows: it
+// builds the live, per-connection database-scoped row set for the
+// pg_stat_xact_all_tables / pg_stat_xact_user_tables / pg_stat_xact_sys_tables virtual
+// views (scope selects which), using the identical ctx.Catalog-unwrap +
+// ctx.CurrentDatabaseOid scoping. goopg has no per-transaction pgstat accumulator, so
+// every delta counter is a faithful 0. See catalog.PGStatXactTablesRowsForDBOid and
+// docs/design/0122-0003-pg-stat-user-tables.md.
+func fetchStatXactTablesRows(ctx *Context, scope catalog.StatTableScope) [][]string {
+	if ctx == nil || ctx.Catalog == nil {
+		return nil
+	}
+	type unwrapper interface{ Unwrap() catalog.Catalog }
+	base := ctx.Catalog
+	for {
+		if im, ok := base.(*catalog.InMemory); ok {
+			return im.PGStatXactTablesRowsForDBOid(catalog.NamespaceDBOid(ctx.CurrentDatabaseOid), scope)
+		}
+		if u, ok := base.(unwrapper); ok {
+			base = u.Unwrap()
+			continue
+		}
+		return nil
+	}
+}
+
 // fetchStatIndexesRows is the per-index sibling of fetchStatTablesRows: it builds
 // the live, per-connection database-scoped row set for the pg_stat_all_indexes /
 // pg_stat_user_indexes / pg_stat_sys_indexes virtual views (scope selects which),

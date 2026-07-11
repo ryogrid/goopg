@@ -1,40 +1,40 @@
 (idle — nothing in flight)
 
-## Loop summary (2026-07-12, loop #79)
+## Loop summary (2026-07-12, loop #80)
 
-**Task (M0122-0003 sub-slice):** added the `pg_stat_user_functions` +
-`pg_stat_xact_user_functions` views — the LAST per-object stat views in the
-`pg_stat*` family (tables/indexes/sequences landed loops #75–#78).
+**Task (M0122-0003 sub-slice):** added the `pg_stat_xact_all_tables` /
+`pg_stat_xact_user_tables` / `pg_stat_xact_sys_tables` trio — the
+per-transaction table access-stat views, the last unregistered
+`pg_stat_*_tables` family. Transaction-scoped counterpart of the cumulative
+`pg_stat_*_tables` views (loops #75–#78).
 
-- Both upstream views (`system_views.sql`) filter on
-  `pg_stat_get_function_calls(oid) IS NOT NULL`, never true under the default
-  `track_functions = none`, so both are empty on a stock PG 18.3 cluster out of
-  the box. goopg has no per-function call/time tracking, so
-  `catalog.PGStatUserFunctionsRows()` (internal/catalog/catalog.go) returns nil
-  unconditionally — always-empty is the faithful default behaviour, not a
-  shortcut.
-- Registered 2 virtual views (OIDs 9096–9097) with the exact 6-col tupledesc
-  `funcid/schemaname/funcname/calls/total_time/self_time` in
-  `registerSystemTables`. Always-empty ⇒ NO per-connection twin and NO
-  `valuesOp.Open` branch needed (unlike table/index/sequence views).
-- Tests: internal/catalog/pgstat_functions_test.go
-  (TestPGStatUserFunctionsRowsAlwaysEmpty / ViewsRegistered) +
-  internal/executor/pgstat_functions_e2e_test.go
-  (TestPgStatUserFunctionsEndToEnd) — PASS.
-- Design: docs/design/0122-0003-pg-stat-user-tables.md new "Function sibling"
-  section + README row. Ledger row appended. fix_plan banner note added.
+- `catalog.PGStatXactTablesRowsForDBOid(dbOid, scope)` reuses the IDENTICAL
+  relation filter + `StatTableScope` user/sys split as
+  `PGStatTablesRowsForDBOid`; narrower 12-col shape (relid/schemaname/relname +
+  9 `pg_stat_get_xact_*` delta counters, NO n_live_tup/last_*/vacuum cells).
+  goopg has no `PgStat_TableXactStatus` accumulator ⇒ every delta counter = 0
+  (faithful for an untouched relation). Identity cells real.
+- `executor.fetchStatXactTablesRows` per-connection twin (internal/executor/
+  pgstat_tables.go); wired at `valuesOp.Open`'s three new
+  `pg_stat_xact_*_tables` branches (operators.go). Static VirtualRows OIDs
+  9098–9100 registered in `registerSystemTables`.
+- Tests: internal/catalog/pgstat_xact_tables_test.go (4) +
+  internal/executor/pgstat_xact_tables_e2e_test.go (2) — PASS.
+- Design: docs/design/0122-0003-pg-stat-user-tables.md new "Transaction
+  sibling" section + README row. Ledger row + fix_plan note added.
 
 **Gates:** catalog+executor full packages PASS; go build ./... clean;
 tpch-spotcheck PASS (Q12=2/Q13=33); pgbench smoke via pre-commit hook.
-Committed + pushed (pending this loop).
+Committed + pushed.
 
-**Nightly:** action-items.md run 20260712-020530 already fully triaged (39
-testport items = 121-connection-refused co-load cascade, non-regression). No
-new M-NIGHTLY task.
+**Nightly:** action-items.md run 20260712-020530 all 39 items = one co-load
+cascade (121 connection-refused to dead isolation server :39219 + package
+2h12m timeout `signal: killed`). Already triaged loop #79. No new M-NIGHTLY.
 
-**Next natural slice:** the `pg_stat_xact_all/user/sys_tables` trio (per-txn
-delta table stats) is the last unregistered pg_stat per-object family; OR the
-deferred per-relation buffer-pool block attribution + per-function/per-table
-counter subsystems (larger cross-cutting storage/executor slices — see ledger).
+**Next natural slice:** the `pg_stat*` per-object view family is now COMPLETE
+(tables/indexes/sequences/functions cumulative + xact-tables). Remaining
+M0122-0003 gaps are the larger cross-cutting counter subsystems (per-table/
+per-index/per-relation-buffer/per-function/per-xact accumulators — see ledger),
+or pick a different milestone slice.
 
 In-flight: none

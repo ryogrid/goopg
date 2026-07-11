@@ -113,6 +113,15 @@ func (o *valuesOp) Open(ctx *Context) error {
 			o.rows = rematerialiseVirtualRowsFromStrings(tbl, fetchStatTablesRows(ctx, catalog.StatScopeSys))
 		} else if tbl.Name == "pg_stat_user_tables" && ctx != nil {
 			o.rows = rematerialiseVirtualRowsFromStrings(tbl, fetchStatTablesRows(ctx, catalog.StatScopeUser))
+		} else if tbl.Name == "pg_stat_xact_all_tables" && ctx != nil {
+			// pg_stat_xact_*_tables list the connecting database's own tables'
+			// per-transaction delta counters (honest-0, no per-xact tracking), the
+			// transaction-scoped sibling of pg_stat_*_tables. M0122-0003.
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, fetchStatXactTablesRows(ctx, catalog.StatScopeAll))
+		} else if tbl.Name == "pg_stat_xact_sys_tables" && ctx != nil {
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, fetchStatXactTablesRows(ctx, catalog.StatScopeSys))
+		} else if tbl.Name == "pg_stat_xact_user_tables" && ctx != nil {
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, fetchStatXactTablesRows(ctx, catalog.StatScopeUser))
 		} else if tbl.Name == "pg_stat_all_indexes" && ctx != nil {
 			// pg_stat_*_indexes list the connecting database's own indexes (the
 			// per-index sibling of pg_stat_*_tables), which the static catalog

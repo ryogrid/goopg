@@ -3876,6 +3876,29 @@ mirroring M0119's ledger `status` column.
       `PgStat_StatFuncEntry` counter subsystem + `track_functions` GUC. Gates:
       catalog+executor full packages PASS; go build ./... clean;
       `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33).
+      **`pg_stat_xact_all/user/sys_tables` done (2026-07-12, later loop):** the
+      per-transaction table access-statistics trio — the transaction-scoped
+      counterpart of the cumulative `pg_stat_*_tables` views and the last
+      unregistered `pg_stat_*_tables` family — now resolves (previously
+      unknown-relation errors). `catalog.PGStatXactTablesRowsForDBOid(dbOid,
+      scope)` reuses the IDENTICAL relation filter + `StatTableScope` user/sys
+      split as `PGStatTablesRowsForDBOid` (so cumulative + xact table views
+      agree on relations) but emits a narrower 12-col shape `relid/schemaname/
+      relname/seq_scan/seq_tup_read/idx_scan/idx_tup_fetch/n_tup_{ins,upd,del,
+      hot_upd,newpage_upd}` — NO `n_live_tup`/`last_*`/`vacuum_count` (xact views
+      are pure per-transaction deltas via `pg_stat_get_xact_*`). goopg has no
+      per-transaction pgstat accumulator (`PgStat_TableXactStatus` analog), so
+      every delta counter is a faithful 0; identity cells real.
+      `executor.fetchStatXactTablesRows` is the per-connection twin, wired at
+      `valuesOp.Open`'s three new `pg_stat_xact_*_tables` branches; static
+      `VirtualRows` fallbacks (OIDs 9098–9100) scope to `DefaultDBOid`. Tests:
+      `internal/catalog/pgstat_xact_tables_test.go` +
+      `internal/executor/pgstat_xact_tables_e2e_test.go`. Design:
+      `docs/design/0122-0003-pg-stat-user-tables.md` new "Transaction sibling"
+      section + README row. Ledger row (2026-07-12) records the missing
+      `PgStat_TableXactStatus` per-transaction accumulator. Gates:
+      catalog+executor full packages PASS; go build ./... clean;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33).
 - [x] **M0122-0004 — SQL language / executor features** (~21). Window frame
       ROWS/RANGE/GROUPS, GROUPING SETS/ROLLUP/CUBE, DEFAULT-clause
       parsing, intervals. **WITH CHECK
