@@ -1512,6 +1512,12 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: replication slots: %w", err)
 	}
+	// Hold the pruning/truncation horizon back to any active logical slot's
+	// catalog_xmin. Wired here (before the CLOG/SLRU truncation horizon below
+	// also reads OldestXmin) so heap pruning, VACUUM and CLOG truncation all
+	// honour a logical decoder's catalog-tuple retention. See
+	// docs/design/0008-0001-logical-decoding-pipeline.md.
+	txnMgr.SetCatalogXminSource(slotsReg.MinCatalogXmin)
 
 	// Replication monitoring registries. Senders are registered by
 	// each walsender goroutine on entry; the (single) Receivers

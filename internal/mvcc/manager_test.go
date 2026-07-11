@@ -756,3 +756,49 @@ func TestDetachToDedicatedSlotRejectsSerializable(t *testing.T) {
 	}
 	_ = m.Rollback(tx)
 }
+
+// TestOldestXminFoldsCatalogXminSource pins the retention consumer: once a
+// catalog_xmin source is installed (server wires it to
+// wal.Slots.MinCatalogXmin), OldestXmin holds the global pruning/truncation
+// horizon back to the oldest catalog_xmin pinned by a logical slot, but never
+// advances it forward past the natural horizon. This is what stops heap
+// pruning / VACUUM / CLOG truncation from reclaiming catalog tuple versions an
+// in-flight logical decoder still needs.
+func TestOldestXminFoldsCatalogXminSource(t *testing.T) {
+	m := NewManager()
+	// Advance nextXID so the natural (no-txn) horizon is well above the first
+	// normal XID, giving room for a lower catalog_xmin to floor it.
+	for i := 0; i < 100; i++ {
+		m.xidgen.Allocate()
+	}
+	base := m.OldestXmin()
+	if base == 0 {
+		t.Fatalf("baseline OldestXmin = 0, expected the running nextXID")
+	}
+
+	// A source pinning an OLDER xid floors the horizon.
+	older := uint64(base) - 40
+	m.SetCatalogXminSource(func() uint64 { return older })
+	if got := m.OldestXmin(); uint64(got) != older {
+		t.Fatalf("OldestXmin with older catalog_xmin = %d, want %d", got, older)
+	}
+
+	// A source pinning a NEWER xid must not advance the horizon forward
+	// (retention only ever holds back, never reclaims more).
+	m.SetCatalogXminSource(func() uint64 { return uint64(base) + 40 })
+	if got := m.OldestXmin(); got != base {
+		t.Fatalf("OldestXmin with newer catalog_xmin = %d, want unchanged %d", got, base)
+	}
+
+	// A source returning 0 (no slot pinning) is a no-op.
+	m.SetCatalogXminSource(func() uint64 { return 0 })
+	if got := m.OldestXmin(); got != base {
+		t.Fatalf("OldestXmin with zero catalog_xmin = %d, want %d", got, base)
+	}
+
+	// Clearing the source restores the pure in-memory behaviour.
+	m.SetCatalogXminSource(nil)
+	if got := m.OldestXmin(); got != base {
+		t.Fatalf("OldestXmin after clearing source = %d, want %d", got, base)
+	}
+}

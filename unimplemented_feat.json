@@ -350,8 +350,8 @@
   {
    "feature": "Per-slot catalog-xmin retention hook in vacuum and pruning operations",
    "task_id": null,
-   "resume_point": null,
-   "status": "open",
+   "resume_point": "RESOLVED 2026-07-12: OldestXmin folds in wal.Slots.MinCatalogXmin via mvcc.Manager.SetCatalogXminSource (wired in initdb.Open); producer API Slots.AdvanceCatalogXmin added. Deferred: decoder->AdvanceCatalogXmin wiring + data-vs-catalog horizon split (see deferral_ledger.md 2026-07-12).",
+   "status": "resolved",
    "evidence": [
     "the per-slot catalog-xmin retention hook in vacuum / pruning remain deferred"
    ],

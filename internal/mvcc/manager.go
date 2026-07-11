@@ -109,6 +109,16 @@ type Manager struct {
 	// both pg_internal.init files at commit time.
 	relcacheInvalPending atomic.Bool
 
+	// catalogXminSource, when installed, returns the smallest catalog_xmin
+	// pinned by any active logical replication slot (0 = nothing pinned).
+	// OldestXmin folds it into the global pruning/truncation horizon so the
+	// heap-prune, VACUUM and CLOG-truncation paths never reclaim catalog (or,
+	// conservatively in v0, any permanent-relation) tuple versions a logical
+	// decoder may still need. Installed once during startup wiring
+	// (initdb.Open) via SetCatalogXminSource; nil keeps the pure in-memory v0
+	// behaviour. Read lock-free via atomic.Pointer on the hot prune path.
+	catalogXminSource atomic.Pointer[func() uint64]
+
 	// WaitForXID uses waitMu + commitCond only.
 	waitMu     sync.Mutex
 	commitCond *sync.Cond
@@ -196,6 +206,21 @@ func (m *Manager) SetCLog(c *CLog) {
 	m.abortedMu.Lock()
 	m.clog = c
 	m.abortedMu.Unlock()
+}
+
+// SetCatalogXminSource installs (or, with nil, clears) the hook OldestXmin
+// consults to hold the global pruning/truncation horizon back to the oldest
+// catalog_xmin pinned by any active logical replication slot. The server wires
+// this to wal.Slots.MinCatalogXmin during startup so heap pruning, VACUUM and
+// CLOG truncation never reclaim catalog tuple versions a logical decoder can
+// still need. fn must be non-blocking (it runs on the prune hot path); a nil fn
+// or a fn returning 0 leaves the horizon unchanged.
+func (m *Manager) SetCatalogXminSource(fn func() uint64) {
+	if fn == nil {
+		m.catalogXminSource.Store(nil)
+		return
+	}
+	m.catalogXminSource.Store(&fn)
 }
 
 // xidWarnAge is how many XIDs before uint32 overflow to emit a warning.
@@ -596,6 +621,20 @@ func (m *Manager) OldestXmin() storage.TransactionID {
 		}
 		if xmin := s.xmin.Load(); xmin != ^uint64(0) && storage.TransactionID(xmin) < result {
 			result = storage.TransactionID(xmin)
+		}
+	}
+	// Hold the horizon back to the oldest catalog_xmin pinned by any active
+	// logical replication slot (0 = nothing pinned). A logical decoder rebuilds
+	// historic catalog snapshots from tuple versions at/after this xid; letting
+	// the prune/VACUUM/CLOG-truncation horizon advance past it would reclaim
+	// catalog rows out from under an in-flight decode. Upstream tracks a separate
+	// data vs catalog horizon (only catalog + user_catalog relations are held by
+	// catalog_xmin); v0 conservatively floors the single global horizon, which
+	// over-retains dead tuples on ordinary permanent tables while a slot lags but
+	// is never unsafe. See docs/design/0008-0001-logical-decoding-pipeline.md.
+	if src := m.catalogXminSource.Load(); src != nil {
+		if cx := (*src)(); cx != 0 && storage.TransactionID(cx) < result {
+			result = storage.TransactionID(cx)
 		}
 	}
 	return result

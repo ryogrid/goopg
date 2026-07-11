@@ -246,3 +246,98 @@ func TestSlotBinaryMagicVersionCRC(t *testing.T) {
 }
 
 
+
+// TestSlotsMinCatalogXmin pins the retention-consumer contract: MinCatalogXmin
+// aggregates the smallest non-zero catalog_xmin across non-invalidated slots
+// and skips physical slots (catalog_xmin==0), freshly created logical slots
+// (catalog_xmin==0), and invalidated slots. This is the value the vacuum/prune
+// horizon is held back to via mvcc.Manager.SetCatalogXminSource.
+func TestSlotsMinCatalogXmin(t *testing.T) {
+	s, _ := OpenSlots(t.TempDir())
+
+	// No slots: nothing pinned.
+	if got := s.MinCatalogXmin(); got != 0 {
+		t.Fatalf("MinCatalogXmin (empty) = %d, want 0", got)
+	}
+
+	// Physical slot never pins a catalog horizon.
+	if _, err := s.Create("phys", SlotPhysical, 0x100); err != nil {
+		t.Fatal(err)
+	}
+	// Fresh logical slot has catalog_xmin==0 until the decoder reserves one.
+	if _, err := s.CreateLogical("lfresh", "pgoutput", "appdb", 0x200); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.MinCatalogXmin(); got != 0 {
+		t.Fatalf("MinCatalogXmin (phys + fresh logical) = %d, want 0", got)
+	}
+
+	// Two logical slots with distinct catalog_xmin — the minimum wins.
+	if _, err := s.CreateLogical("l1", "pgoutput", "appdb", 0x300); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateLogical("l2", "pgoutput", "appdb", 0x400); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AdvanceCatalogXmin("l1", 750); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AdvanceCatalogXmin("l2", 600); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.MinCatalogXmin(); got != 600 {
+		t.Fatalf("MinCatalogXmin = %d, want 600 (l2's value)", got)
+	}
+
+	// Advancing l2 forward past l1 shifts the minimum to l1.
+	if err := s.AdvanceCatalogXmin("l2", 800); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.MinCatalogXmin(); got != 750 {
+		t.Fatalf("MinCatalogXmin after advance = %d, want 750 (l1's value)", got)
+	}
+}
+
+// TestSlotsAdvanceCatalogXminMonotonicAndDurable pins two properties of the
+// producer setter: catalog_xmin only moves forward (a smaller/equal xid is a
+// no-op), and the advanced value is persisted so it survives a restart —
+// otherwise catalog tuples a not-yet-reconnected decoder still needs could be
+// pruned in the reconnection gap.
+func TestSlotsAdvanceCatalogXminMonotonicAndDurable(t *testing.T) {
+	dir := t.TempDir()
+	s1, _ := OpenSlots(dir)
+	if _, err := s1.CreateLogical("ls", "pgoutput", "appdb", 0x500); err != nil {
+		t.Fatal(err)
+	}
+	if err := s1.AdvanceCatalogXmin("ls", 1000); err != nil {
+		t.Fatal(err)
+	}
+	// Backward / equal are no-ops.
+	if err := s1.AdvanceCatalogXmin("ls", 900); err != nil {
+		t.Fatal(err)
+	}
+	if err := s1.AdvanceCatalogXmin("ls", 1000); err != nil {
+		t.Fatal(err)
+	}
+	if err := s1.AdvanceCatalogXmin("ls", 0); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := s1.Get("ls"); got.CatalogXmin != 1000 {
+		t.Fatalf("CatalogXmin = %d, want 1000 (backward/zero ignored)", got.CatalogXmin)
+	}
+	// Unknown slot errors.
+	if err := s1.AdvanceCatalogXmin("nope", 1); !errors.Is(err, ErrSlotNotFound) {
+		t.Fatalf("AdvanceCatalogXmin(unknown) err = %v, want ErrSlotNotFound", err)
+	}
+	// Durability: reopen and confirm the value survived.
+	s2, err := OpenSlots(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := s2.Get("ls"); got.CatalogXmin != 1000 {
+		t.Fatalf("CatalogXmin after reopen = %d, want 1000", got.CatalogXmin)
+	}
+	if min := s2.MinCatalogXmin(); min != 1000 {
+		t.Fatalf("MinCatalogXmin after reopen = %d, want 1000", min)
+	}
+}

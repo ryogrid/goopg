@@ -323,6 +323,59 @@ func (s *Slots) MinRestartLSN() uint64 {
 	return min
 }
 
+// MinCatalogXmin returns the smallest non-zero catalog_xmin pinned by
+// any non-invalidated slot, or 0 when no slot currently pins a catalog
+// horizon. A logical slot's catalog_xmin is the oldest transaction whose
+// catalog row versions its decoder may still need to reconstruct a
+// historic snapshot; the vacuum / opportunistic-prune horizon must not
+// advance past it or catalog tuples could be reclaimed out from under an
+// in-flight decode. Physical slots and freshly created logical slots have
+// CatalogXmin==0 and are skipped, so they never pin the catalog horizon.
+// Mirrors the catalog_xmin aggregation in upstream
+// ReplicationSlotsComputeRequiredXmin (postgres/src/backend/replication/slot.c).
+func (s *Slots) MinCatalogXmin() uint64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var min uint64
+	for _, slot := range s.m {
+		if slot.Invalidated || slot.CatalogXmin == 0 {
+			continue
+		}
+		if min == 0 || slot.CatalogXmin < min {
+			min = slot.CatalogXmin
+		}
+	}
+	return min
+}
+
+// AdvanceCatalogXmin pins (or advances) the named slot's catalog_xmin to
+// xid and durably persists it. The value only moves forward — a smaller or
+// equal xid is ignored — mirroring upstream's monotonic
+// LogicalIncreaseXminForSlot (catalog_xmin is reserved at slot creation and
+// then advanced as decoding confirms it no longer needs older catalog tuple
+// versions; it never moves backward). xid==0 is a no-op. Returns
+// ErrSlotNotFound for an unknown slot. Persisting the value means the horizon
+// survives a restart, so catalog tuples a not-yet-reconnected logical decoder
+// still needs are not pruned in the gap. Used by the logical-decoding pipeline
+// to feed MinCatalogXmin, which the vacuum/prune horizon consults via
+// mvcc.Manager.SetCatalogXminSource.
+func (s *Slots) AdvanceCatalogXmin(name string, xid uint64) error {
+	if xid == 0 {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	slot, ok := s.m[name]
+	if !ok {
+		return ErrSlotNotFound
+	}
+	if xid <= slot.CatalogXmin {
+		return nil
+	}
+	slot.CatalogXmin = xid
+	return s.writeSlotLocked(slot)
+}
+
 // InvalidateLagging marks every non-invalidated slot whose lag
 // (currentLSN - RestartLSN) exceeds maxKeepBytes as invalidated, and
 // returns the names of the slots that were just invalidated. Callers

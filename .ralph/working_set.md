@@ -1,41 +1,37 @@
 (idle — nothing in flight)
 
-## Loop summary (2026-07-12, loop #70)
+## Loop summary (2026-07-12, loop #72)
 
 **Nightly triage:** action-items batch `20260711-011536` — all 3 AI items
-(TestPort_IsolationTimeouts / TuplelockUpgradeNoDeadlock /
-PgWaldumpVacuumPruneRoundtrip) already `[x]` in M-NIGHTLY (co-load timing
-flakes, not regressions). No new nightly work.
+(IsolationTimeouts / TuplelockUpgradeNoDeadlock / PgWaldumpVacuumPruneRoundtrip)
+already `[x]` in M-NIGHTLY (co-load timing flakes). No new nightly work.
 
-**Task — PGLZ varlena compression (encode + decode, PG-faithful). COMPLETE.**
-Discovered while scoping unimplemented_feat #151 (TOAST compression): goopg's
-bootstrap PGLZ compressor (`internal/initdb/pglz.go`) was NOT PG-compatible on
-three axes, and there was NO decompressor — both varlena decode twins
-hard-errored "compressed varlena not supported". A real PG standby could not
-read goopg's `pg_rewrite.ev_action`.
+**Task — per-slot catalog-xmin retention hook in vacuum/pruning
+(unimplemented_feat, logical-decoding pipeline). COMPLETE + committed.**
+Closed the named CONSUMER gap: `OldestXmin` never consulted slot `catalog_xmin`.
 
 Landed:
-- NEW leaf pkg `internal/pglz` (stdlib-only): Compress/Decompress/
-  BuildCompressedVarlena/DecodeInlineCompressed — faithful port of
-  pg_lzcompress.c + varatt.h. Fixed: inverted control-bit polarity (bit1=match),
-  swapped match-tag nibble layout + extension byte for len 18..273, and
-  `va_tcinfo` = low-30-bits rawsize | top-2-bits method (was `rawSize<<2`).
-- Wired `pglz.DecodeInlineCompressed` into BOTH decode siblings:
-  executor/codec.go `decodePhysicalPGVarlena` + wal/pgoutput.go
-  `pgoDecodePhysicalVarlena`.
-- initdb/pglz.go delegates to pglz.Compress + BuildCompressedVarlena.
-- Tests: internal/pglz/pglz_test.go (round-trip + HAND-AUTHORED PG-spec token
-  stream independent of our encoder + corrupt + framing/bit-layout + LZ4-reject);
-  executor/codec_compressed_test.go; wal/pgoutput_compressed_test.go; fixed
-  tcinfo assertions in initdb pg_rewrite_bootstrap_test.go + btree_search_test.go.
-- Design: docs/design/0046-0007-pglz-varlena-compression.md; README row;
-  deferral_ledger.md new row.
+- `internal/wal/slots.go`: `MinCatalogXmin()` (min non-zero across
+  non-invalidated slots; physical/fresh-logical=0 skipped) + monotonic durable
+  producer `AdvanceCatalogXmin(name,xid)` (mirrors LogicalIncreaseXminForSlot).
+- `internal/mvcc/manager.go`: lock-free installed hook
+  `catalogXminSource atomic.Pointer[func() uint64]` + `SetCatalogXminSource`;
+  `OldestXmin()` floors the global horizon to the pinned catalog_xmin (never
+  advances forward). This horizon feeds both heap-prune paths, index-only prune,
+  and CLOG/SLRU truncation.
+- `internal/initdb/open.go`: wires `SetCatalogXminSource(slotsReg.MinCatalogXmin)`
+  before the CLOG-truncation horizon read.
+- Tests: `TestSlotsMinCatalogXmin`, `TestSlotsAdvanceCatalogXminMonotonicAndDurable`,
+  `TestOldestXminFoldsCatalogXminSource`.
+- Design: `docs/design/0008-0001-logical-decoding-pipeline.md` "Catalog xmin
+  retention — hook landed" + README row. unimplemented_feat.json → resolved.
 
-Deferred (ledger): user-data compress-on-write (item #151 still open), LZ4
-method, external-TOAST-pointer logical decode.
+Deferred (ledger 2026-07-12): decoder→`AdvanceCatalogXmin` wiring (reserve at
+slot create, advance on confirm); upstream data-vs-catalog horizon split (v0
+floors ONE global horizon → over-retains user tables, safe); logical
+`CREATE_REPLICATION_SLOT` still uses generic `Slots.Create`.
 
-Gates: go build ./... clean; go vet pglz/initdb/wal clean; full pglz/initdb/
-wal/executor suites PASS; tpch-spotcheck PASS (Q12=2/Q13=33); ralph-state-guard
-repaired+consistent; pgbench smoke via pre-commit hook (see commit).
+Gates: build/vet clean; wal/mvcc/initdb suites PASS; tpch-spotcheck PASS
+(Q12=2/Q13=33); pgbench smoke via pre-commit hook; ralph-state-guard consistent.
 
 In-flight: none
