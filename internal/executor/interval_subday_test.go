@@ -1188,3 +1188,85 @@ func TestIntervalInfinityArithmetic(t *testing.T) {
 		}
 	}
 }
+
+// TestExtractFromInterval covers EXTRACT(field FROM interval), a line-port of
+// interval_part_common. Every `want` below was captured from PostgreSQL 18.3
+// (modulo goopg's trailing-zero stripping on numeric output — PG prints
+// `6.500000`, goopg `6.5`, a pre-existing EXTRACT numeric-scale gap shared with
+// the timestamp path).
+func TestExtractFromInterval(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+	if err := runDDL(t, ctx, "CREATE TABLE t (id int)"); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	if err := runDDL(t, ctx, "INSERT INTO t VALUES (1)"); err != nil {
+		t.Fatalf("INSERT: %v", err)
+	}
+	const full = "interval '2 years 3 months 10 days 4 hours 5 minutes 6.5 seconds'"
+	accept := []struct{ sql, want string }{
+		{"SELECT extract(year from " + full + ")", "2"},
+		{"SELECT extract(month from " + full + ")", "3"},
+		{"SELECT extract(day from " + full + ")", "10"},
+		{"SELECT extract(hour from " + full + ")", "4"},
+		{"SELECT extract(minute from " + full + ")", "5"},
+		{"SELECT extract(second from " + full + ")", "6.5"},
+		{"SELECT extract(millisecond from interval '6.5 seconds')", "6500"},
+		{"SELECT extract(microsecond from interval '6.5 seconds')", "6500000"},
+		{"SELECT extract(week from interval '10 days')", "1"},
+		{"SELECT extract(quarter from interval '2 years 3 months 10 days')", "2"},
+		{"SELECT extract(decade from interval '2 years')", "0"},
+		{"SELECT extract(century from interval '250 years')", "2"},
+		{"SELECT extract(millennium from interval '3000 years')", "3"},
+		{"SELECT extract(epoch from " + full + ")", "71769906.5"},
+		// Negative intervals: fields negate the sign-reversed value.
+		{"SELECT extract(quarter from interval '-5 months')", "-2"},
+		{"SELECT extract(year from interval '-13 months')", "-1"},
+		{"SELECT extract(month from interval '-13 months')", "-1"},
+		// ±infinity monotonic units → ±Infinity (numeric).
+		{"SELECT extract(epoch from interval 'infinity')", "Infinity"},
+		{"SELECT extract(hour from interval 'infinity')", "Infinity"},
+		{"SELECT extract(day from interval '-infinity')", "-Infinity"},
+		// date_part('field', interval) is the function spelling — must agree.
+		{"SELECT date_part('epoch', " + full + ")", "71769906.5"},
+		{"SELECT date_part('hour', " + full + ")", "4"},
+		{"SELECT date_part('quarter', interval '-5 months')", "-2"},
+		{"SELECT date_part('epoch', interval 'infinity')", "Infinity"},
+	}
+	for _, c := range accept {
+		rows := runQuery(t, ctx, c.sql+" FROM t")
+		if len(rows) != 1 || len(rows[0]) != 1 {
+			t.Fatalf("%s: expected 1x1 result, got %v", c.sql, rows)
+		}
+		if got := rows[0][0].Format(); got != c.want {
+			t.Errorf("%s = %q, want %q", c.sql, got, c.want)
+		}
+	}
+
+	// ±infinity oscillating units → NULL.
+	null := []string{
+		"SELECT extract(month from interval 'infinity')",
+		"SELECT extract(second from interval 'infinity')",
+		"SELECT extract(quarter from interval 'infinity')",
+	}
+	for _, sql := range null {
+		rows := runQuery(t, ctx, sql+" FROM t")
+		if len(rows) != 1 || len(rows[0]) != 1 {
+			t.Fatalf("%s: expected 1x1 result, got %v", sql, rows)
+		}
+		if !rows[0][0].IsNull() {
+			t.Errorf("%s = %q, want NULL", sql, rows[0][0].Format())
+		}
+	}
+
+	// Recognized-but-unsupported (0A000) and unknown (22023) units both error.
+	reject := []string{
+		"SELECT extract(dow from interval '1 day') FROM t",
+		"SELECT extract(bogusunit from interval '1 day') FROM t",
+	}
+	for _, sql := range reject {
+		if _, err := runQueryErr(t, ctx, sql); err == nil {
+			t.Errorf("%s: expected error, got none", sql)
+		}
+	}
+}

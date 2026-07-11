@@ -1312,6 +1312,49 @@ the leading/cast-form typmod `CAST(... AS interval hour to minute)` / `interval(
 '...'`. Gates: `go build`/`go vet` clean; parser + executor suites PASS;
 `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke via pre-commit hook.
 
+## Follow-up (2026-07-11): `EXTRACT(field FROM interval)` / `date_part` (#5(d-iv))
+
+Closed the first of the "still deferred" items above: extract-from-interval was
+unsupported for **any** interval because `evalExtract` accepted only a `KindTime`
+source. `evalExtractInterval` (`internal/executor/expr.go`) line-ports PG's
+`interval_part_common` (`postgres/src/backend/utils/adt/timestamp.c:6098`):
+
+- The interval is broken down with **no justification** (`interval2itm`):
+  `year = month/12`, `mon = month%12`, `mday = day`, and hour/min/sec/usec are
+  carved straight from the raw micros field — so `hour` may exceed 24 and `day`
+  is taken verbatim (`extract(day from interval '40 days')` = 40, not rebalanced).
+- Integer fields (`year`…`microsecond`, `week`, `quarter`, `decade`, `century`,
+  `millennium`) return `int8`; `second`/`millisecond` and `epoch` return numeric.
+  `quarter` works from `interval->month` directly so a negative interval yields
+  the negated field of its sign-reversed value (`extract(quarter from '-5 months')`
+  = `-2`). `epoch` uses the `DAYS_PER_YEAR=365.25 / DAYS_PER_MONTH=30 /
+  SECS_PER_DAY=86400` weighting.
+- The `±infinity` sentinels follow `NonFiniteIntervalPart`: monotonically-
+  increasing units (hour, day, year, decade, century, millennium, epoch) yield
+  `Infinity`/`-Infinity` (carried as goopg's numeric-infinity string datum),
+  oscillating units (microsecond…minute, week, month, quarter) yield **NULL**,
+  and any other unit raises the same error the finite path would.
+- Error taxonomy (`intervalUnitError`): units PG's `DecodeUnits` recognizes but
+  does not support for interval (`dow`, `isodow`, `doy`, `isoyear`, `julian`,
+  `timezone*`) raise `0A000`; a wholly unknown unit raises `22023`.
+
+**Sibling path:** `date_part('field', interval)` is the function spelling of the
+same operation, so `evalDatePart` now routes a `KindInterval` source through the
+same `evalExtractInterval` helper — both spellings share one line-port.
+
+All `want` values in the new `TestExtractFromInterval`
+(`interval_subday_test.go`, 24 accepts + 3 NULL + 2 error, incl. 4 `date_part`
+sibling cases) were captured from **PostgreSQL 18.3** (`local_install`).
+
+**Still deferred (unchanged).** `timestamp ± interval 'infinity'` (needs an
+infinite-timestamp carrier), unary `- interval 'infinity'` (`interval_um`), and
+the cast-form typmod `CAST(... AS interval hour to minute)` / `interval(p) '...'`.
+Also open: goopg's `EXTRACT` numeric output strips trailing zeros
+(`6.5` vs PG's `6.500000`), a pre-existing scale gap shared with the timestamp
+path — not specific to intervals. Gates: `go build`/`go vet` clean; executor
+suite PASS; canonical values cross-checked against PG 18.3; pgbench smoke via
+pre-commit hook.
+
 ## Cross-references
 
 - TPC-H query bodies: HammerDB upstream

@@ -8044,6 +8044,24 @@ mirroring M0119's ledger `status` column.
       4 rejects). Design doc `docs/design/0003-0006-*` new Follow-up section. Gates:
       build/vet clean; parser+executor suites PASS; `scripts/tpch-spotcheck.sh`
       PASS (Q12=2/Q13=33); pgbench smoke (hook).
+  - [x] `unimplemented_feat #5(d-iv) (EXTRACT/date_part from interval)`
+      (2026-07-11, this loop) — closed the "extract-from-interval unsupported for
+      ANY interval" blocker the prior row named. New `evalExtractInterval`
+      (`internal/executor/expr.go`) line-ports PG's `interval_part_common`
+      (timestamp.c:6098): breaks the interval down with NO justification
+      (`interval2itm` — hour may exceed 24, day verbatim), integer fields → int8,
+      second/millisecond/epoch → numeric, `quarter` works from `interval->month`
+      so a negative interval negates the sign-reversed field. ±infinity sentinels
+      follow `NonFiniteIntervalPart`: monotonic units → ±Infinity (numeric),
+      oscillating units → NULL, other units error (0A000 known-unsupported /
+      22023 unknown). Sibling `date_part('field', interval)` (`evalDatePart`)
+      routes through the same helper. All `want` values captured from live PG
+      18.3. Still deferred (ledger 2026-07-11): `timestamp ± interval 'infinity'`,
+      unary `- interval 'infinity'`, cast-form typmod, and the EXTRACT numeric
+      trailing-zero scale gap (shared with timestamp path). Tests:
+      `interval_subday_test.go` new `TestExtractFromInterval` (24 accepts + 3
+      NULL + 2 error). Design doc `docs/design/0003-0006-*` new Follow-up. Gates:
+      build/vet clean; executor suite PASS; PG-18.3 cross-check; pgbench (hook).
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,

@@ -4028,6 +4028,11 @@ func evalExtract(x *planner.ExtractExpr, row Row, ctx *Context) (Datum, error) {
 	if src.IsNull() {
 		return NullDatum, nil
 	}
+	if src.Kind == KindInterval {
+		// EXTRACT(field FROM interval) has its own field taxonomy and
+		// broken-down representation (interval_part_common). M0097 follow-up.
+		return evalExtractInterval(src, x.Field, x.Pos())
+	}
 	if src.Kind != KindTime {
 		// Try to parse a string as timestamp (planner may assign
 		// string storage for date columns loaded via INSERT).
@@ -4111,6 +4116,122 @@ func evalExtract(x *planner.ExtractExpr, row Row, ctx *Context) (Datum, error) {
 		return Datum{}, err
 	}
 	return Datum{Kind: KindInt, Int: n}, nil
+}
+
+// evalExtractInterval implements EXTRACT(field FROM interval), a line-port of
+// interval_part_common (postgres/src/backend/utils/adt/timestamp.c:6098). PG
+// breaks the interval into a pg_itm via interval2itm with NO justification —
+// year=month/12, mon=month%12, mday=day — and hour/min/sec/usec are carved from
+// the raw micros (time) field, so hour may exceed 24 and day is taken verbatim.
+// Integer-valued fields return int8; second/millisecond return numeric (fsec is
+// fractional); epoch returns numeric via the DAYS_PER_YEAR/MONTH weighting.
+// The ±infinity sentinels follow NonFiniteIntervalPart: monotonically-increasing
+// units yield ±Infinity (numeric), oscillating units yield NULL, and any other
+// unit raises the same error the finite path would.
+func evalExtractInterval(src Datum, field string, pos int) (Datum, error) {
+	f := strings.ToLower(strings.TrimSpace(field))
+
+	// ±infinity sentinel handling (INTERVAL_NOT_FINITE → NonFiniteIntervalPart).
+	if src.IsIntervalNotFinite() {
+		switch f {
+		case "microsecond", "microseconds", "millisecond", "milliseconds",
+			"second", "seconds", "minute", "minutes", "week", "weeks",
+			"month", "months", "quarter":
+			// Oscillating units → 0.0, which PG maps to a NULL result.
+			return NullDatum, nil
+		case "hour", "hours", "day", "days", "year", "years",
+			"decade", "decades", "century", "centuries",
+			"millennium", "millenniums", "millennia", "epoch":
+			// Monotonically-increasing units → ±Infinity (numeric).
+			if src.IsIntervalNoBegin() {
+				return NewStringDatum("-Infinity"), nil
+			}
+			return NewStringDatum("Infinity"), nil
+		default:
+			return intervalUnitError(f, pos)
+		}
+	}
+
+	months := src.IntervalMonthsValue()
+	days := src.IntervalDaysValue()
+	micros := src.IntervalMicrosValue()
+
+	// interval2itm: broken-down fields (no justification).
+	tmYear := int64(months) / 12
+	tmMon := int64(months) % 12
+	tmMday := int64(days)
+	t := micros
+	tmHour := t / usecsPerHour
+	t -= tmHour * usecsPerHour
+	tmMin := t / usecsPerMinute
+	t -= tmMin * usecsPerMinute
+	tmSec := t / usecsPerSecond
+	t -= tmSec * usecsPerSecond
+	tmUsec := t
+
+	switch f {
+	case "microsecond", "microseconds":
+		return Datum{Kind: KindInt, Int: tmSec*1_000_000 + tmUsec}, nil
+	case "millisecond", "milliseconds":
+		return newNumericFromFloat(float64(tmSec)*1000.0 + float64(tmUsec)/1000.0), nil
+	case "second", "seconds":
+		return newNumericFromFloat(float64(tmSec) + float64(tmUsec)/1_000_000.0), nil
+	case "minute", "minutes":
+		return Datum{Kind: KindInt, Int: tmMin}, nil
+	case "hour", "hours":
+		return Datum{Kind: KindInt, Int: tmHour}, nil
+	case "day", "days":
+		return Datum{Kind: KindInt, Int: tmMday}, nil
+	case "week", "weeks":
+		return Datum{Kind: KindInt, Int: tmMday / 7}, nil
+	case "month", "months":
+		return Datum{Kind: KindInt, Int: tmMon}, nil
+	case "quarter":
+		// Work from interval->month directly so a negative interval yields the
+		// negated field of its sign-reversed value (interval_part_common).
+		var q int64
+		if months >= 0 {
+			q = (tmMon / 3) + 1
+		} else {
+			q = -(((-int64(months) % 12) / 3) + 1)
+		}
+		return Datum{Kind: KindInt, Int: q}, nil
+	case "year", "years":
+		return Datum{Kind: KindInt, Int: tmYear}, nil
+	case "decade", "decades":
+		return Datum{Kind: KindInt, Int: tmYear / 10}, nil
+	case "century", "centuries":
+		return Datum{Kind: KindInt, Int: tmYear / 100}, nil
+	case "millennium", "millenniums", "millennia":
+		return Datum{Kind: KindInt, Int: tmYear / 1000}, nil
+	case "epoch":
+		// DAYS_PER_YEAR=365.25, DAYS_PER_MONTH=30, SECS_PER_DAY=86400.
+		result := float64(micros) / 1_000_000.0
+		result += 365.25 * 86400.0 * float64(int64(months)/12)
+		result += 30.0 * 86400.0 * float64(int64(months)%12)
+		result += 86400.0 * float64(days)
+		return newNumericFromFloat(result), nil
+	default:
+		return intervalUnitError(f, pos)
+	}
+}
+
+// intervalUnitError reproduces interval_part_common's two error taxonomies:
+// a unit that PG's DecodeUnits recognizes but does not support for interval
+// raises 0A000 (feature not supported); a wholly unknown unit raises 22023
+// (invalid parameter value / not recognized).
+func intervalUnitError(field string, pos int) (Datum, error) {
+	knownUnsupported := map[string]bool{
+		"dow": true, "isodow": true, "doy": true, "isoyear": true,
+		"julian": true, "timezone": true, "timezone_hour": true,
+		"timezone_minute": true,
+	}
+	if knownUnsupported[field] {
+		return Datum{}, &ExecError{Code: "0A000", Pos: pos,
+			Message: fmt.Sprintf("unit %q not supported for type interval", field)}
+	}
+	return Datum{}, &ExecError{Code: "22023", Pos: pos,
+		Message: fmt.Sprintf("unit %q not recognized for type interval", field)}
 }
 
 // extractTimestampField returns the integer value of a named
@@ -4202,6 +4323,11 @@ func evalDatePart(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	}
 	if fieldArg.Kind != KindString {
 		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "date_part first argument must be text"}
+	}
+	if src.Kind == KindInterval {
+		// date_part('field', interval) is the function spelling of
+		// EXTRACT(field FROM interval); share the same line-port. M0097 follow-up.
+		return evalExtractInterval(src, fieldArg.StringValue(), x.Pos())
 	}
 	if src.Kind != KindTime {
 		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "date_part second argument must be timestamp/date"}

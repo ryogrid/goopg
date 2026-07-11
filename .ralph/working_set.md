@@ -1,39 +1,42 @@
 (idle — nothing in flight)
 
-## Loop summary (2026-07-11, loop #39)
+## Loop summary (2026-07-11, loop #40)
 
-**Nightly triage:** action-items batch `20260711-011536` — all 3 AI items
-(IsolationTimeouts, TuplelockUpgradeNoDeadlock, PgWaldumpVacuumPruneRoundtrip)
-already `[x]` (2 co-load timing flakes + 1 resolved). Same batch loops #37/#38;
-no new batch → triage complete. Proceeded to feature work.
+**Nightly triage:** action-items batch `20260711-011536` — all 3 AI items already
+`[x]` (2 co-load timing flakes + 1 resolved), same batch as loops #37–#39, no new
+batch → triage complete. Proceeded to feature work.
 
-**Task — `unimplemented_feat #5(d-iv)` interval ±infinity ADD/SUB + ORDERING —
-DONE (committing this loop).** Closed the first half of the operator
-short-circuits the ±infinity-literal loop (#38) deferred.
-- `addIntervalInterval` (internal/executor/expr.go) line-ports PG interval_pl /
-  interval_mi: sign passes through (`'infinity'+'1 day'`=infinity), and every
-  "infinity − infinity" combo raises `interval out of range` (22008,
-  ERRCODE_DATETIME_VALUE_OUT_OF_RANGE). Signature now returns error; pos threaded.
-- New `finiteIntervalArith` overflow-guards each field + rejects a finite result
-  landing on a sentinel (mirrors finite_interval_pl/_mi INTERVAL_NOT_FINITE).
-- `compareDatums` KindInterval arm exact-orders sentinels via new
-  `intervalInfinityRank` BEFORE the lossy 30-day-widening sum.
-Files: internal/executor/expr.go (addIntervalInterval + finiteIntervalArith +
-intervalOutOfRange + intervalInfinityRank + compareDatums arm),
-internal/executor/interval_subday_test.go (new TestIntervalInfinityArithmetic,
-18 accepts + 4 rejects), docs/design/0003-0006-*.md (new Follow-up),
+**Task — `unimplemented_feat #5(d-iv)` EXTRACT/date_part FROM interval — DONE
+(committing this loop).** Closed the "extract-from-interval unsupported for ANY
+interval" blocker the prior #5(d-iv) infinity rows named.
+- New `evalExtractInterval` (internal/executor/expr.go) line-ports PG
+  `interval_part_common` (timestamp.c:6098): NO justification (`interval2itm` —
+  hour may exceed 24, day verbatim); integer fields→int8, second/ms/epoch→numeric;
+  `quarter` from `interval->month` (negative interval negates sign-reversed field);
+  epoch weighting 365.25/30/86400. ±infinity sentinels → ±Infinity (monotonic
+  units) / NULL (oscillating) / error, per `NonFiniteIntervalPart`.
+- `intervalUnitError`: 0A000 for DecodeUnits-known-but-unsupported
+  (dow/isodow/doy/isoyear/julian/timezone*), 22023 for unknown.
+- Sibling `date_part('field', interval)` (`evalDatePart`) routes KindInterval
+  through the same helper.
+- Wired the branch into `evalExtract` (before the KindTime coercion).
+Files: internal/executor/expr.go (evalExtractInterval + intervalUnitError +
+evalExtract/evalDatePart branches), internal/executor/interval_subday_test.go
+(new TestExtractFromInterval: 24 accepts incl. 4 date_part + 3 NULL + 2 error),
+docs/design/0003-0006-*.md (new Follow-up), docs/design/README.md (index note),
 .ralph/deferral_ledger.md (new row), .ralph/fix_plan.md (checked item).
+All `want` values captured from live PG 18.3 (local_install, unix socket).
 
-**Next feature step (deferral ledger 2026-07-11):** `extract(epoch from interval …)`
-→ blocked by a LARGER gap: `evalExtract` (expr.go) only accepts KindTime source, so
-extract-from-interval is unsupported for ANY interval — add a KindInterval arm (all
-fields, interval_part in timestamp.c), ±math.Inf for the two sentinels. Then unary
+**Next feature step (deferral ledger 2026-07-11):** remaining #5(d-iv) items —
+(1) `timestamp ± interval 'infinity'` (needs a NEW infinite-timestamp carrier +
+timestamp_pl_interval short-circuit in addTimeInterval); (2) unary
 `- interval 'infinity'` (interval_um: NOBEGIN↔NOEND swap + overflow-guarded negate,
-extend evalUnary). timestamp ± interval 'infinity' needs a new infinite-timestamp
-carrier. Then the leading/cast typmod form `CAST(... AS interval hour to minute)` /
-`interval(p) '...'`.
+extend evalUnary `-` arm); (3) cast-form typmod `CAST(... AS interval hour to
+minute)` / `interval(p) '...'` (type-name typmod path + AdjustIntervalForTypmod);
+(4) EXTRACT numeric trailing-zero scale gap (`6.5` vs PG `6.500000`) — shared with
+timestamp EXTRACT path, scope on its own with a full EXTRACT re-verify.
 
-Gates: build/vet clean; parser+executor suites PASS; tpch-spotcheck PASS
-(Q12=2/Q13=33); pgbench smoke via pre-commit hook.
+Gates: build/vet clean; executor suite PASS; values cross-checked vs PG 18.3;
+tpch-spotcheck + pgbench smoke via pre-commit hook.
 
 In-flight: none
