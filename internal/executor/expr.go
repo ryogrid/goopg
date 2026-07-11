@@ -1406,7 +1406,7 @@ func evalBinary(op parser.OpCode, left, right Datum, pos int) (Datum, error) {
 		// (interval_justify_hours), while a pure date pair yields an int4
 		// day count instead of an interval.
 		if op == parser.OpSub && left.Kind == KindTime && right.Kind == KindTime {
-			return subTimeTime(left, right), nil
+			return subTimeTime(left, right, pos)
 		}
 		// interval ± interval → interval (component-wise), matching
 		// interval_pl / interval_mi.
@@ -1983,12 +1983,36 @@ const (
 // timestamp, so date − date also flows through here and yields an interval
 // (e.g. "9 days") rather than upstream date_mi's integer day count — a
 // documented divergence deferred to the type system (deferral_ledger.md).
-func subTimeTime(left, right Datum) Datum {
+//
+// ±infinity operands follow timestamp_mi's infinity block exactly: any
+// "infinity − same-signed infinity" is an error (the interval type has no
+// NaN), while a single infinite operand yields the correspondingly-signed
+// infinite interval. -inf−x = -inf, +inf−x = +inf, x−(-inf) = +inf,
+// x−(+inf) = -inf. (unimplemented_feat #5(d-iv))
+func subTimeTime(left, right Datum, pos int) (Datum, error) {
+	if left.IsTimestampNotFinite() || right.IsTimestampNotFinite() {
+		switch {
+		case left.IsTimestampNegInf():
+			if right.IsTimestampNegInf() {
+				return Datum{}, intervalOutOfRange(pos)
+			}
+			return NewIntervalInfinity(false), nil
+		case left.IsTimestampPosInf():
+			if right.IsTimestampPosInf() {
+				return Datum{}, intervalOutOfRange(pos)
+			}
+			return NewIntervalInfinity(true), nil
+		case right.IsTimestampNegInf(): // left finite − (−inf) = +inf
+			return NewIntervalInfinity(true), nil
+		default: // right.IsTimestampPosInf(): left finite − (+inf) = −inf
+			return NewIntervalInfinity(false), nil
+		}
+	}
 	diff := left.TimeValue().Sub(right.TimeValue()) // time.Duration (ns)
 	micros := int64(diff / time.Microsecond)
 	days := micros / usecsPerDay
 	micros -= days * usecsPerDay
-	return NewIntervalDatumFull(0, int32(days), micros)
+	return NewIntervalDatumFull(0, int32(days), micros), nil
 }
 
 // intervalOutOfRange is PG's error for a non-representable interval result

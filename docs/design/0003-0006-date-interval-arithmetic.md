@@ -1648,6 +1648,39 @@ parsing + wire codec, and `timestamp − timestamp` with an infinite operand (PG
 returns an infinite *interval*) — both listed on the carrier-row above, unchanged
 by this loop.
 
+## Follow-up: `timestamp − timestamp` over the ±infinity sentinels (unimplemented_feat #5(d-iv), 2026-07-11)
+
+Closed the infinite-timestamp carrier-row's deferred item — `timestamp −
+timestamp` with an infinite operand. `subTimeTime` (`internal/executor/expr.go`)
+previously always took the finite path (`left.TimeValue().Sub(right.TimeValue())`),
+so a ±infinity sentinel (INT64-extreme `Int`) was read as an ordinary ~year-2262 /
+far-past timestamp and produced a nonsense finite interval.
+
+It now line-ports upstream `timestamp_mi`'s infinity block
+(`postgres/src/backend/utils/adt/timestamp.c`): when either operand is
+non-finite, a single infinite operand yields the correspondingly-signed infinite
+*interval* (`-inf − x = -inf`, `+inf − x = +inf`, `x − (-inf) = +inf`,
+`x − (+inf) = -inf` via `NewIntervalInfinity`), while any same-signed
+`infinity − infinity` raises `22008` "interval out of range" (the interval type
+has no NaN). `subTimeTime` gained an `(Datum, error)` signature and a `pos`
+argument for the error; its single caller in `evalBinary` propagates it. The
+reused sentinel predicates are `IsTimestampNegInf` / `IsTimestampPosInf` /
+`IsTimestampNotFinite` and the `NewIntervalInfinity(bool)` constructor added by
+the carrier loop — no new Datum machinery.
+
+Every `want` byte-for-byte from live PG 18.3 (socket /tmp:5599): `(+inf)−fin`=
+`infinity`, `(-inf)−fin`=`-infinity`, `fin−(+inf)`=`-infinity`, `fin−(-inf)`=
+`infinity`, `(+inf)−(-inf)`=`infinity`, `(-inf)−(+inf)`=`-infinity`, finite
+control=`777 days 20:38:40`, `(+inf)−(+inf)`/`(-inf)−(-inf)`=ERROR. Tests:
+`internal/executor/timestamp_sub_infinity_test.go` new `TestTimestampSubInfinity`
+(7 accepts + 2 rejects). Gates: `go build` clean; full executor suite PASS;
+`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke via pre-commit hook.
+
+**Still deferred (broader, pre-existing).** Only `timestamp 'infinity'`
+literal-input parsing + `::timestamp` cast + wire-codec binary encode/decode of
+the sentinel remains — goopg still produces an infinite timestamp *only* via the
+arithmetic short-circuits, never from a typed literal.
+
 ## Cross-references
 
 - TPC-H query bodies: HammerDB upstream
