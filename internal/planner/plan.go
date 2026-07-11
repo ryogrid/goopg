@@ -860,12 +860,13 @@ type WindowAgg struct {
 	PartitionBy []Expr
 	OrderBy     []SortKey
 	Funcs       []WindowFunc
-	// Frame is the resolved ROWS window frame clause shared by every
+	// Frame is the resolved window frame clause shared by every
 	// func in this node (nil when no explicit frame clause was
 	// written — the executor's default frame applies). The analyzer
-	// already rejected RANGE/GROUPS and validated bound ordering, so
-	// by the time a Frame reaches the planner it is always ROWS-mode
-	// and well-formed (M0122-0004 frame-clause slice).
+	// already validated bound ordering and restricted RANGE to
+	// UNBOUNDED/CURRENT ROW bounds (RANGE value offsets rejected), so
+	// by the time a Frame reaches the planner it is a well-formed
+	// ROWS/GROUPS/RANGE frame (M0122-0004 frame-clause slice).
 	Frame  *WindowFrame
 	schema Schema
 }
@@ -878,7 +879,7 @@ type WindowAgg struct {
 // than duplicating them, matching the existing convention of BinaryOp/
 // UnaryOp.Op reusing parser.OpCode.
 type WindowFrame struct {
-	Mode        parser.FrameMode // FrameModeRows or FrameModeGroups (RANGE is rejected by the analyzer)
+	Mode        parser.FrameMode // FrameModeRows/Groups, or Range with UNBOUNDED/CURRENT ROW bounds only (RANGE value offsets rejected by the analyzer)
 	StartKind   parser.FrameBoundKind
 	StartOffset Expr // non-nil only for FrameBoundOffsetPreceding/Following
 	EndKind     parser.FrameBoundKind

@@ -4302,9 +4302,21 @@ mirroring M0119's ledger `status` column.
       ./internal/executor/...` PASS; `scripts/tpch-spotcheck.sh` PASS
       (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
       scripts/ralph-precommit-test.sh` PASS (0 failed txns, all 3
-      workloads). **Still open in this bucket:** RANGE window frame mode
-      (documented v0 scope limit — needs the per-ORDER-BY-column
-      operator-lookup machinery described above), sub-day intervals +
+      workloads). **RANGE window frame mode (non-offset bounds) landed
+      (2026-07-11, this loop):** analyzer now accepts `RANGE` with
+      UNBOUNDED/CURRENT ROW bounds (executor dispatches `FrameModeRange`
+      to the existing `frameBoundsGroups` — in RANGE mode CURRENT ROW
+      means "the current row and all its ORDER BY peers", identical to
+      GROUPS' non-offset behavior, so no new arithmetic); RANGE with a
+      value offset (`RANGE BETWEEN n PRECEDING`) still rejected 0A000
+      (needs per-ORDER-BY-column type-aware `in_range` operators —
+      ledger row + design `docs/design/0122-0004-range-window-frame.md`).
+      Verified vs live PG 18.3. Tests:
+      `TestAnalyzeWindowFrameRange{OffsetRejected,NonOffsetAccepted}`,
+      `TestCompatWindowExplicitRangePeers`,
+      `TestCompatWindowRangeUnboundedPrecedingCumulative`.
+      **Still open in this bucket:** RANGE with a value offset bound
+      (the only open window-frame item), sub-day intervals +
       multi-component interval strings.
 - [x] **M0122-0005 — Types / opclasses / casts / collation / domains** (~11).
       1-byte `char`(OID 18) disambiguation, `pg_collation_for`, function-based cast

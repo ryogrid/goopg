@@ -1071,3 +1071,138 @@ func TestCompatWindowGroupsUnboundedPrecedingCumulative(t *testing.T) {
 		}
 	}
 }
+
+// TestCompatWindowExplicitRangePeers pins RANGE-mode frame arithmetic
+// for the non-offset bound kinds (M0122-0004 RANGE follow-up). RANGE
+// CURRENT ROW means "the current row and ALL its ORDER BY peers"
+// (unlike ROWS, where CURRENT ROW is the single row) — so on
+// duplicate-key data it genuinely diverges from an equivalent ROWS
+// frame. Uses the same seed as the GROUPS test; grp=1 has three peer
+// groups on val (10,10 / 20 / 30,30). Every expectation below was
+// cross-checked against a real PostgreSQL 18.3 instance.
+func TestCompatWindowExplicitRangePeers(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE t (grp int, val int)"); err != nil {
+		t.Fatal(err)
+	}
+	tbl, _ := ctx.Catalog.LookupTable(parser.ObjectName{Name: "t"})
+	rel := ctx.Catalog.RelFileNode(tbl)
+	seed := []Row{
+		{{Kind: KindInt, Int: 1}, {Kind: KindInt, Int: 10}},
+		{{Kind: KindInt, Int: 1}, {Kind: KindInt, Int: 10}},
+		{{Kind: KindInt, Int: 1}, {Kind: KindInt, Int: 20}},
+		{{Kind: KindInt, Int: 1}, {Kind: KindInt, Int: 30}},
+		{{Kind: KindInt, Int: 1}, {Kind: KindInt, Int: 30}},
+		{{Kind: KindInt, Int: 2}, {Kind: KindInt, Int: 100}},
+		{{Kind: KindInt, Int: 2}, {Kind: KindInt, Int: 200}},
+	}
+	for _, r := range seed {
+		if err := writeHeapRow(ctx, rel, tbl.Columns, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// RANGE BETWEEN CURRENT ROW AND CURRENT ROW: the whole peer group.
+	rows := runQuery(t, ctx,
+		"SELECT grp, val, "+
+			"sum(val) OVER w AS s, "+
+			"count(*) OVER w AS c, "+
+			"first_value(val) OVER w AS fv, "+
+			"last_value(val) OVER w AS lv "+
+			"FROM t "+
+			"WINDOW w AS (PARTITION BY grp ORDER BY val RANGE BETWEEN CURRENT ROW AND CURRENT ROW) "+
+			"ORDER BY grp, val")
+	want := []struct{ grp, val, s, c, fv, lv int64 }{
+		{1, 10, 20, 2, 10, 10},
+		{1, 10, 20, 2, 10, 10},
+		{1, 20, 20, 1, 20, 20},
+		{1, 30, 60, 2, 30, 30},
+		{1, 30, 60, 2, 30, 30},
+		{2, 100, 100, 1, 100, 100},
+		{2, 200, 200, 1, 200, 200},
+	}
+	if len(rows) != len(want) {
+		t.Fatalf("rows=%d want %d", len(rows), len(want))
+	}
+	for i, w := range want {
+		got := []int64{rows[i][0].Int, rows[i][1].Int, rows[i][2].Int, rows[i][3].Int, rows[i][4].Int, rows[i][5].Int}
+		wantVals := []int64{w.grp, w.val, w.s, w.c, w.fv, w.lv}
+		for col, g := range got {
+			if rows[i][col].Kind != KindInt || g != wantVals[col] {
+				t.Fatalf("row[%d]=%+v want %v", i, rows[i], wantVals)
+			}
+		}
+	}
+
+	// RANGE BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING: from the start
+	// of the current peer group through the partition end — grp=1 →
+	// {100,100,80,60,60} (contrast the cumulative default frame).
+	rows2 := runQuery(t, ctx,
+		"SELECT val, sum(val) OVER (PARTITION BY grp ORDER BY val "+
+			"RANGE BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) AS r "+
+			"FROM t WHERE grp = 1 ORDER BY val")
+	wantR := []int64{100, 100, 80, 60, 60}
+	if len(rows2) != len(wantR) {
+		t.Fatalf("rows2=%d want %d", len(rows2), len(wantR))
+	}
+	for i, w := range wantR {
+		if rows2[i][1].Kind != KindInt || rows2[i][1].Int != w {
+			t.Fatalf("rows2[%d]=%+v want r=%d", i, rows2[i], w)
+		}
+	}
+
+	// RANGE without ORDER BY: all rows are peers → the whole partition
+	// for every row (legal for non-offset RANGE, unlike GROUPS).
+	rows3 := runQuery(t, ctx,
+		"SELECT val, sum(val) OVER (PARTITION BY grp "+
+			"RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS s "+
+			"FROM t WHERE grp = 1 ORDER BY val")
+	for i := range rows3 {
+		if rows3[i][1].Kind != KindInt || rows3[i][1].Int != 100 {
+			t.Fatalf("rows3[%d]=%+v want s=100", i, rows3[i])
+		}
+	}
+}
+
+// TestCompatWindowRangeUnboundedPrecedingCumulative pins the default
+// frame spelled explicitly (RANGE BETWEEN UNBOUNDED PRECEDING AND
+// CURRENT ROW): cumulative, peer-inclusive. Cross-checked against a
+// real PostgreSQL 18.3 instance: val {10,10,20,30,30} → cum
+// {20,20,40,100,100} (identical to the GROUPS UNBOUNDED PRECEDING
+// case, since both treat CURRENT ROW as the whole peer group).
+func TestCompatWindowRangeUnboundedPrecedingCumulative(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE t (val int)"); err != nil {
+		t.Fatal(err)
+	}
+	tbl, _ := ctx.Catalog.LookupTable(parser.ObjectName{Name: "t"})
+	rel := ctx.Catalog.RelFileNode(tbl)
+	seed := []Row{
+		{{Kind: KindInt, Int: 10}},
+		{{Kind: KindInt, Int: 10}},
+		{{Kind: KindInt, Int: 20}},
+		{{Kind: KindInt, Int: 30}},
+		{{Kind: KindInt, Int: 30}},
+	}
+	for _, r := range seed {
+		if err := writeHeapRow(ctx, rel, tbl.Columns, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	rows := runQuery(t, ctx,
+		"SELECT val, sum(val) OVER (ORDER BY val RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cum FROM t ORDER BY val")
+	want := []int64{20, 20, 40, 100, 100}
+	if len(rows) != len(want) {
+		t.Fatalf("rows=%d want %d", len(rows), len(want))
+	}
+	for i, w := range want {
+		if rows[i][1].Kind != KindInt || rows[i][1].Int != w {
+			t.Fatalf("row[%d]=%+v want cum=%d", i, rows[i], w)
+		}
+	}
+}

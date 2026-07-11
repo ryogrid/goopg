@@ -213,7 +213,9 @@ func (o *windowOp) evalWindowFuncs() error {
 		var frameEnd []int
 		var valueGroupBounds []int
 		needsValueGroupBounds := o.plan.Frame != nil &&
-			(o.plan.Frame.Exclusion != parser.FrameExcludeNone || o.plan.Frame.Mode == parser.FrameModeGroups) &&
+			(o.plan.Frame.Exclusion != parser.FrameExcludeNone ||
+				o.plan.Frame.Mode == parser.FrameModeGroups ||
+				o.plan.Frame.Mode == parser.FrameModeRange) &&
 			hasFrameValueWindowFunc(o.plan.Funcs)
 		if hasFrameValueWindowFunc(o.plan.Funcs) {
 			groupBounds, err := o.peerGroupBounds(pStart, pEnd)
@@ -554,7 +556,9 @@ func (o *windowOp) evalFrameAggFuncs(aggHelper *aggregateOp, colBase, pStart, pE
 // doesn't use frame clauses, so this doesn't touch the spot-check gate.
 func (o *windowOp) evalExplicitFrameAggFuncs(aggHelper *aggregateOp, colBase, pStart, pEnd int) error {
 	var groupBounds []int
-	if o.plan.Frame.Exclusion != parser.FrameExcludeNone || o.plan.Frame.Mode == parser.FrameModeGroups {
+	if o.plan.Frame.Exclusion != parser.FrameExcludeNone ||
+		o.plan.Frame.Mode == parser.FrameModeGroups ||
+		o.plan.Frame.Mode == parser.FrameModeRange {
 		gb, err := o.peerGroupBounds(pStart, pEnd)
 		if err != nil {
 			return err
@@ -663,7 +667,13 @@ func (o *windowOp) resolveFrameOffset(expr planner.Expr, label string) (int64, e
 // collapses to an empty frame rather than erroring, matching upstream.
 func (o *windowOp) frameBounds(pStart, pEnd, i int, groupBounds []int) (int, int) {
 	fr := o.plan.Frame
-	if fr.Mode == parser.FrameModeGroups {
+	if fr.Mode == parser.FrameModeGroups || fr.Mode == parser.FrameModeRange {
+		// RANGE mode reaches here only with UNBOUNDED/CURRENT ROW bounds
+		// (the analyzer rejects RANGE value offsets). For those bound
+		// kinds RANGE is peer-based — CURRENT ROW means "the current
+		// row's whole ORDER BY peer group" — which is exactly what
+		// frameBoundsGroups computes for the non-offset bound kinds, so
+		// the two modes share this path.
 		return o.frameBoundsGroups(i, groupBounds)
 	}
 	local := i - pStart

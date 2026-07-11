@@ -409,14 +409,40 @@ func TestAnalyzeWindowFrameRowsAccepted(t *testing.T) {
 	}
 }
 
-// TestAnalyzeWindowFrameRangeRejected pins that RANGE frame units are
-// rejected with 0A000 — only ROWS and GROUPS reach the executor in
-// this slice (see docs/design/0020-0001-window-parser-and-ast.md).
-func TestAnalyzeWindowFrameRangeRejected(t *testing.T) {
+// TestAnalyzeWindowFrameRangeOffsetRejected pins that RANGE with a
+// value offset bound (PRECEDING/FOLLOWING) is rejected with 0A000 —
+// it needs type-aware value arithmetic on the ORDER BY column that is
+// still deferred (see docs/design/0122-0004-range-window-frame.md).
+func TestAnalyzeWindowFrameRangeOffsetRejected(t *testing.T) {
 	cat := analyzerCatalog(t)
 	expectAnalyzeCode(t, cat,
-		"SELECT sum(abalance) OVER (ORDER BY aid RANGE UNBOUNDED PRECEDING) FROM pgbench_accounts",
+		"SELECT sum(abalance) OVER (ORDER BY aid RANGE 5 PRECEDING) FROM pgbench_accounts",
 		"0A000")
+	expectAnalyzeCode(t, cat,
+		"SELECT sum(abalance) OVER (ORDER BY aid RANGE BETWEEN 1 PRECEDING AND 2 FOLLOWING) FROM pgbench_accounts",
+		"0A000")
+}
+
+// TestAnalyzeWindowFrameRangeNonOffsetAccepted pins that RANGE with
+// only UNBOUNDED/CURRENT ROW bounds analyzes cleanly — those bounds
+// are purely peer-based and need no value arithmetic
+// (see docs/design/0122-0004-range-window-frame.md).
+func TestAnalyzeWindowFrameRangeNonOffsetAccepted(t *testing.T) {
+	cat := analyzerCatalog(t)
+	queries := []string{
+		"SELECT sum(abalance) OVER (ORDER BY aid RANGE UNBOUNDED PRECEDING) FROM pgbench_accounts",
+		"SELECT sum(abalance) OVER (ORDER BY aid RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM pgbench_accounts",
+		"SELECT sum(abalance) OVER (ORDER BY aid RANGE BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) FROM pgbench_accounts",
+		"SELECT sum(abalance) OVER (ORDER BY aid RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM pgbench_accounts",
+		// RANGE without ORDER BY is legal for non-offset bounds (all
+		// rows are peers → whole partition), unlike GROUPS.
+		"SELECT sum(abalance) OVER (RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM pgbench_accounts",
+	}
+	for _, sql := range queries {
+		if err := Analyze(parseOne(t, sql), cat); err != nil {
+			t.Fatalf("Analyze(%q): %v", sql, err)
+		}
+	}
 }
 
 // TestAnalyzeWindowFrameGroupsAccepted pins that a GROUPS frame clause

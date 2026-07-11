@@ -1644,8 +1644,9 @@ func analyzeWindowFuncCall(x *parser.FuncCall, ctx *scope) (catalog.Type, error)
 // validateWindowFrame validates a parsed window frame clause's mode
 // and bound ordering (SQL:2003 <window frame clause>), mirroring
 // gram.y's frame_extent/frame_bound reduce-time checks — all
-// ERRCODE_WINDOWING_ERROR (42P20) — plus this v0's RANGE scope
-// limitation (0A000; GROUPS is fully implemented, see
+// ERRCODE_WINDOWING_ERROR (42P20) — plus this v0's RANGE-with-offset
+// scope limitation (0A000; ROWS, GROUPS, and RANGE with only
+// UNBOUNDED/CURRENT ROW bounds are implemented, see
 // internal/executor/operators_window.go). Returns nil for a nil frame
 // (no explicit frame clause was written — the default frame applies).
 // Also type-checks (but does not range-check) any offset expressions;
@@ -1667,8 +1668,21 @@ func validateWindowFrame(fr *parser.WindowFrame, pos int, orderByLen int, ctx *s
 		if orderByLen == 0 {
 			return analyzeError(pos, "42P20", "GROUPS mode requires an ORDER BY clause")
 		}
+	case parser.FrameModeRange:
+		// RANGE with a value offset bound (RANGE BETWEEN n PRECEDING /
+		// FOLLOWING) compares the ORDER BY column value against
+		// value±offset, which needs type-aware +/-/< operator lookup on
+		// the single ORDER BY column (still deferred — see the ledger).
+		// RANGE with only UNBOUNDED and CURRENT ROW bounds is purely
+		// peer-based (CURRENT ROW means "the current row and all its
+		// ORDER BY peers"), identical to the default frame's semantics
+		// and to GROUPS mode's non-offset behavior, so it is supported.
+		if fr.StartKind == parser.FrameBoundOffsetPreceding || fr.StartKind == parser.FrameBoundOffsetFollowing ||
+			fr.EndKind == parser.FrameBoundOffsetPreceding || fr.EndKind == parser.FrameBoundOffsetFollowing {
+			return analyzeError(pos, "0A000", "RANGE with a value offset (PRECEDING/FOLLOWING) is not supported in v0; only UNBOUNDED PRECEDING/FOLLOWING and CURRENT ROW bounds are implemented")
+		}
 	default:
-		return analyzeError(pos, "0A000", "RANGE window frame units are not supported in v0; only ROWS and GROUPS are implemented")
+		return analyzeError(pos, "0A000", "unsupported window frame mode")
 	}
 	if fr.StartKind == parser.FrameBoundUnboundedFollowing {
 		return analyzeError(pos, "42P20", "frame start cannot be UNBOUNDED FOLLOWING")
