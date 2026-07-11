@@ -1615,6 +1615,39 @@ timestamp` where one side is infinite (PG returns an infinite *interval* —
 whole #5(d-iv) interval group (typmod grammar, EXTRACT/date_part, ±infinity
 arithmetic/ordering across interval and now timestamp, unary negation) is complete.
 
+## Follow-up: `isfinite(timestamp/date/interval)` over the ±infinity sentinels (unimplemented_feat #5(d-iv), 2026-07-11)
+
+Closes deferred item (2) of the infinite-timestamp-carrier row above: after that
+loop introduced the `KindTime` and `KindInterval` infinity sentinels, `isfinite()`
+was still the `evalIsFinite` stub that returned TRUE for **any** non-NULL argument,
+so `isfinite(interval 'infinity')` and `isfinite(ts + interval 'infinity')`
+wrongly reported `t`.
+
+**Fix — one function, no sibling.** `evalIsFinite` (`internal/executor/expr.go`)
+now line-ports PG's `date_finite` / `timestamp_finite` / `interval_finite`
+(`postgres/src/backend/utils/adt/{date,timestamp}.c`), which each return
+`!X_NOT_FINITE(arg)`. goopg carries the timestamp/date sentinels on `KindTime`
+(INT64 extremes, `flagDate`-agnostic — so `IsTimestampNotFinite()` catches both a
+timestamp and a date sentinel) and the interval sentinels on `KindInterval`, so the
+result is FALSE when `d.IsTimestampNotFinite() || d.IsIntervalNotFinite()` and TRUE
+otherwise. NULL still propagates to NULL (isfinite is strict — no `NotStrict`
+marker on OIDs 1373/1389/1390/2048; the pre-existing NULL guard is unchanged).
+`isfinite` has a single evaluation funnel (both the fast-path and interpreted
+evaluators dispatch through `evalIsFinite`), so there is no twin to update.
+
+Verified byte-for-byte vs live PG 18.3 (socket /tmp:5599): `isfinite(interval
+'±infinity')`=`f`, `isfinite(ts ± interval 'infinity')`=`f`,
+`isfinite(timestamptz + interval 'infinity')`=`f`, finite interval/timestamp=`t`.
+Tests: `internal/executor/isfinite_test.go` new `TestIsFiniteInfinity` (8 cases);
+the pre-existing `TestIsFiniteNullPropagates` stale comment updated. Gates:
+`go build` clean; full executor suite PASS; `scripts/tpch-spotcheck.sh` PASS
+(Q12=2/Q13=33); pgbench smoke via pre-commit hook.
+
+**Still deferred (broader, pre-existing).** `timestamp 'infinity'` literal-input
+parsing + wire codec, and `timestamp − timestamp` with an infinite operand (PG
+returns an infinite *interval*) — both listed on the carrier-row above, unchanged
+by this loop.
+
 ## Cross-references
 
 - TPC-H query bodies: HammerDB upstream

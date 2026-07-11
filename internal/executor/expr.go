@@ -5799,8 +5799,6 @@ func evalMakeTime(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	return NewTimeDatum(t), nil
 }
 
-// evalIsFinite stubs isfinite(date/timestamp/interval). goopg v0 does not
-// store infinity values, so always returns TRUE for non-NULL input. M0097-0004.
 // regexpFirstMatchArray computes the text[] datum for the FIRST match of re
 // against s, mirroring PostgreSQL's regexp_match/regexp_matches element
 // semantics (postgres/src/backend/utils/adt/regexp.c setup_regexp_matches):
@@ -5886,6 +5884,15 @@ func evalRegexpMatchesSRF(sD, patD, flagsD Datum) []Datum {
 	return regexpAllMatchesArrays(re, sD.StringValue(), strings.Contains(flags, "g"))
 }
 
+// evalIsFinite implements isfinite(date/timestamp/timestamptz/interval),
+// line-porting PG's date_finite / timestamp_finite / interval_finite
+// (postgres/src/backend/utils/adt/{date,timestamp}.c): the result is FALSE
+// only for a ±infinity sentinel (DATE_NOT_FINITE / TIMESTAMP_NOT_FINITE /
+// INTERVAL_NOT_FINITE), TRUE for every other finite value. goopg carries the
+// timestamp/date ±infinity sentinels on KindTime (INT64 extremes, flagDate-
+// agnostic) and the interval sentinels on KindInterval (unimplemented_feat
+// #5(d-iv)), so both must be checked. NULL input propagates to NULL (isfinite
+// is strict — no NotStrict marker on its pg_proc OIDs; see isfinite_test.go).
 func evalIsFinite(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	if len(x.Args) != 1 {
 		return NullDatum, nil
@@ -5893,6 +5900,9 @@ func evalIsFinite(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	d, err := evalExpr(x.Args[0], row, ctx)
 	if err != nil || d.IsNull() {
 		return NullDatum, nil
+	}
+	if d.IsTimestampNotFinite() || d.IsIntervalNotFinite() {
+		return NewBoolDatum(false), nil
 	}
 	return NewBoolDatum(true), nil
 }

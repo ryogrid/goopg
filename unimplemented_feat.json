@@ -2150,7 +2150,7 @@
    "feature": "isfinite() function is not implemented (goopg v0 has no infinity values to check).",
    "task_id": "m0097-0004",
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "isfinite(x): stub"
    ],
@@ -2165,7 +2165,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/executor/expr.go:5017 — isfinite() is a stub that always returns TRUE for non-NULL input"
+   "code_audit": "RESOLVED 2026-07-11 (unimplemented_feat #5(d-iv) follow-up): once the interval (NOBEGIN/NOEND) and timestamp/date (KindTime INT64-extreme) ±infinity sentinels landed, evalIsFinite (internal/executor/expr.go) was upgraded from the v0 always-TRUE stub to a line-port of PG's date_finite/timestamp_finite/interval_finite (postgres/src/backend/utils/adt/{date,timestamp}.c): returns FALSE when d.IsTimestampNotFinite() || d.IsIntervalNotFinite(), TRUE for any other finite value, NULL still propagates (strict). isfinite() is now correct for every value goopg can produce; the only remaining gaps are the separate ability to CONSTRUCT an infinite timestamp/date from a typed literal (timestamp 'infinity' input parsing + wire codec) and timestamp-minus-timestamp with an infinite operand — both tracked on the timestamp-infinity carrier row in deferral_ledger.md, neither an isfinite defect. Tests: internal/executor/isfinite_test.go TestIsFiniteInfinity (8 cases, all cross-checked vs live PG 18.3 socket /tmp:5599) + TestIsFiniteNullPropagates. Design: docs/design/0003-0006-date-interval-arithmetic.md new Follow-up."
   },
   {
    "feature": "justify_hours(), justify_days(), and justify_interval() functions are stubs that return input unchanged.",
