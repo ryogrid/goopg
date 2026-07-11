@@ -261,6 +261,77 @@ func registerStatSubscriptionView(cat *catalog.InMemory, subs *wal.Subscribers) 
 	return cat.RegisterVirtualTable(tbl)
 }
 
+// registerStatSubscriptionStatsView installs
+// `pg_catalog.pg_stat_subscription_stats` backed by the *catalog.PubSub
+// registry — one row PER SUBSCRIPTION (from pg_subscription), NOT per apply
+// worker like the sibling pg_stat_subscription. Upstream's view is
+//
+//	SELECT ss.subid, s.subname, ss.apply_error_count, ss.sync_error_count,
+//	       ss.confl_insert_exists, ss.confl_update_origin_differs,
+//	       ss.confl_update_exists, ss.confl_update_missing,
+//	       ss.confl_delete_origin_differs, ss.confl_delete_missing,
+//	       ss.confl_multiple_unique_conflicts, ss.stats_reset
+//	  FROM pg_subscription s, pg_stat_get_subscription_stats(s.oid) ss;
+//
+// (src/backend/catalog/system_views.sql). goopg has no cumulative-stats
+// accumulator for apply/sync errors or the seven per-conflict-type counters
+// (PG's PgStat_StatSubEntry, populated by pgstat_report_subscription_error /
+// pgstat_report_subscription_conflict), so every counter is a faithful 0 and
+// stats_reset is NULL — byte-identical to a real PG 18.3 subscription that has
+// applied cleanly and never been reset. Column types are transcribed from
+// pg_stat_get_subscription_stats' pg_proc.proallargtypes (subid oid, counters
+// int8, stats_reset timestamptz); subname is name per pg_subscription.
+//
+// Rows track the subscription catalog itself, so a subscription with no live
+// worker still appears (matching upstream: pg_subscription drives the join).
+// See docs/design/0008-0005-logical-replication-observability.md.
+func registerStatSubscriptionStatsView(cat *catalog.InMemory, ps *catalog.PubSub) error {
+	tbl := &catalog.Table{
+		Schema: "pg_catalog",
+		Name:   "pg_stat_subscription_stats",
+		Columns: []catalog.Column{
+			{Name: "subid", Type: catalog.Type{Name: "oid"}},
+			{Name: "subname", Type: catalog.Type{Name: "name"}},
+			{Name: "apply_error_count", Type: catalog.Type{Name: "int8"}},
+			{Name: "sync_error_count", Type: catalog.Type{Name: "int8"}},
+			{Name: "confl_insert_exists", Type: catalog.Type{Name: "int8"}},
+			{Name: "confl_update_origin_differs", Type: catalog.Type{Name: "int8"}},
+			{Name: "confl_update_exists", Type: catalog.Type{Name: "int8"}},
+			{Name: "confl_update_missing", Type: catalog.Type{Name: "int8"}},
+			{Name: "confl_delete_origin_differs", Type: catalog.Type{Name: "int8"}},
+			{Name: "confl_delete_missing", Type: catalog.Type{Name: "int8"}},
+			{Name: "confl_multiple_unique_conflicts", Type: catalog.Type{Name: "int8"}},
+			{Name: "stats_reset", Type: catalog.Type{Name: "timestamptz"}},
+		},
+		Virtual: true,
+	}
+	tbl.VirtualRows = func() [][]string {
+		if ps == nil {
+			return nil
+		}
+		subs := ps.Subscriptions()
+		out := make([][]string, 0, len(subs))
+		for _, s := range subs {
+			out = append(out, []string{
+				fmt.Sprintf("%d", s.OID),
+				s.Name,
+				"0", // apply_error_count: no cumulative error accumulator yet
+				"0", // sync_error_count
+				"0", // confl_insert_exists
+				"0", // confl_update_origin_differs
+				"0", // confl_update_exists
+				"0", // confl_update_missing
+				"0", // confl_delete_origin_differs
+				"0", // confl_delete_missing
+				"0", // confl_multiple_unique_conflicts
+				"",  // stats_reset: NULL until a PgStat_StatSubEntry reset lands
+			})
+		}
+		return out
+	}
+	return cat.RegisterVirtualTable(tbl)
+}
+
 // registerReplicationSlotsView installs `pg_catalog.pg_replication_slots`
 // backed by the process-wide *wal.Slots registry. Renders both
 // physical and logical slots with the upstream PG 18.x column shape;

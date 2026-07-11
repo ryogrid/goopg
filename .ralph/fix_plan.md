@@ -4012,9 +4012,25 @@ mirroring M0119's ledger `status` column.
       `internal/initdb/pg_stat_ssl_gssapi_view_test.go`
       (`TestPgStatSslView`/`TestPgStatGssapiView`). Design +README +ledger updated.
       TLS/GSSAPI transport-detail population deferred (ledger).
-      Still unregistered pg_stat view for a later slice:
-      `pg_stat_subscription_stats` (per-subscription, belongs with the subscription
-      infra in `replication_views.go`; needs a `PgStat_StatSubEntry` accumulator).
+      **`pg_stat_subscription_stats` done (2026-07-12, later loop) — COMPLETES the
+      `pg_stat_*` family:** the per-subscription error/conflict-counter view (12 cols).
+      Unlike the sibling `pg_stat_subscription` (per apply worker, backed by
+      `*wal.Subscribers`), this is driven by the *subscription catalog* — upstream
+      joins `pg_subscription s` with `pg_stat_get_subscription_stats(s.oid)`, one row
+      per subscription (a subscription with no live worker still appears). So it lives
+      next to `registerStatSubscriptionView` in
+      `internal/initdb/replication_views.go` (`registerStatSubscriptionStatsView`),
+      backed by the same `*catalog.PubSub`, wired in `initdb.Open` after
+      `registerSubscriptionViews`. goopg has no `PgStat_StatSubEntry` accumulator, so
+      every apply/sync error + seven `confl_*` counters are a faithful `0` and
+      `stats_reset` NULL — byte-identical to a real PG 18.3 subscription that applied
+      cleanly and never reset (VERIFIED end-to-end this loop, correct 12-col shape).
+      Column types from `pg_stat_get_subscription_stats`' `proallargtypes` (`subid`
+      oid, counters int8, `stats_reset` timestamptz). Test:
+      `TestStatSubscriptionStatsRendersPerSubscription`
+      (`internal/initdb/replication_views_test.go`). README 0122-0003 row + ledger
+      updated. Live subscription-stats accumulator deferred (ledger). No pg_stat view
+      remains unregistered.
 - [x] **M0122-0004 — SQL language / executor features** (~21). Window frame
       ROWS/RANGE/GROUPS, GROUPING SETS/ROLLUP/CUBE, DEFAULT-clause
       parsing, intervals. **WITH CHECK

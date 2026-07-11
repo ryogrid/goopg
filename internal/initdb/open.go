@@ -1783,6 +1783,12 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = mgr.Close()
 		return nil, err
 	}
+	if err := registerStatSubscriptionStatsView(cat, pubsub); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, err
+	}
 
 	// DU-002 restart-persistence follow-up (M0119-0004, loop #70 ledger
 	// resume point): restore CREATE/DROP/ALTER EVENT TRIGGER objects from

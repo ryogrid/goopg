@@ -482,9 +482,51 @@ rendering. Verified end-to-end against a throwaway goopg instance this loop
 (`SELECT * FROM pg_stat_ssl` / `pg_stat_gssapi` each returned one row for the
 connecting psql backend, `ssl='f'`, detail columns NULL).
 
-Still unregistered from the pg_stat family: `pg_stat_subscription_stats`
-(per-subscription error/apply counters — belongs with the subscription infra in
-`replication_views.go`).
+## `pg_stat_subscription_stats` (per-subscription error/conflict view, 2026-07-12) — completes the family
+
+The last unregistered `pg_stat_*` view. Upstream (`system_views.sql`):
+
+```sql
+CREATE VIEW pg_stat_subscription_stats AS
+    SELECT ss.subid, s.subname, ss.apply_error_count, ss.sync_error_count,
+           ss.confl_insert_exists, ss.confl_update_origin_differs,
+           ss.confl_update_exists, ss.confl_update_missing,
+           ss.confl_delete_origin_differs, ss.confl_delete_missing,
+           ss.confl_multiple_unique_conflicts, ss.stats_reset
+      FROM pg_subscription s, pg_stat_get_subscription_stats(s.oid) ss;
+```
+
+Crucially the row source is the **subscription catalog** (`pg_subscription`), not
+the apply-worker registry — so this view emits one row *per subscription* (a
+subscription whose apply worker is not currently running still appears), which is
+the opposite of the sibling `pg_stat_subscription` (one row per live worker,
+backed by `*wal.Subscribers`). It therefore lives alongside
+`registerStatSubscriptionView` in `internal/initdb/replication_views.go`
+(`registerStatSubscriptionStatsView`), is backed by the same `*catalog.PubSub`
+registry that drives `pg_subscription`, and is wired in `initdb.Open`
+immediately after `registerSubscriptionViews`. The `VirtualRows` closure walks
+`ps.Subscriptions()` and, for each, emits the subscription's real `OID`/`Name`
+plus all-zero counters and a NULL `stats_reset`.
+
+goopg has no cumulative subscription-stats accumulator — PG's
+`PgStat_StatSubEntry` (`src/backend/utils/activity/pgstat_subscription.c`),
+populated by `pgstat_report_subscription_error` (the two `*_error_count` columns)
+and `pgstat_report_subscription_conflict` (the seven `confl_*` columns, one per
+`ConflictType`) — so every counter is a faithful `0` and `stats_reset` is NULL
+(never set by `pg_stat_reset_subscription_stats`). This is byte-identical to a
+real PG 18.3 subscription that has applied cleanly and never been reset. Column
+types are transcribed from `pg_stat_get_subscription_stats`' `proallargtypes`
+(`subid` oid, all nine counters int8, `stats_reset` timestamptz); `subname` is
+`name` per `pg_subscription`.
+
+Test: `TestStatSubscriptionStatsRendersPerSubscription`
+(`internal/initdb/replication_views_test.go`) asserts the empty-registry 0-row
+case, the one-row-per-subscription shape (subid/subname real), all-zero counters,
+and the NULL `stats_reset`. Verified end-to-end against a throwaway goopg
+instance this loop (`SELECT * FROM pg_stat_subscription_stats` returned the
+correct 12-column shape/order, 0 rows with no subscription defined).
+
+With this view registered, **no `pg_stat_*` view remains unregistered** in goopg.
 
 ## Deferred
 
@@ -494,5 +536,8 @@ zeros/NULLs until goopg grows a cumulative per-table statistics subsystem
 `idx_tup_read` / `idx_tup_fetch` / `last_idx_scan` stay `0`/`NULL` until a
 `PgStat_StatIndEntry` analog exists. Because system catalogs are storage-less and
 carry no user indexes, `pg_stat_sys_tables` and `pg_stat_sys_indexes` return no
-rows even though upstream lists the catalog relations. All are recorded in
+rows even though upstream lists the catalog relations. Likewise
+`pg_stat_subscription_stats`' apply/sync error counts and seven `confl_*`
+conflict counters stay `0` and `stats_reset` NULL until a `PgStat_StatSubEntry`
+analog is wired into the apply worker's error/conflict paths. All are recorded in
 `.ralph/deferral_ledger.md` with a resume point.
