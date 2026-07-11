@@ -3779,7 +3779,7 @@
    "feature": "pg_subtrans truncation (cleanup of subtransaction ancestry records) is deferred.",
    "task_id": "M0117-0003",
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "no pg_subtrans truncation yet"
    ],
@@ -3791,10 +3791,10 @@
    "resolution_check": {
     "ledger": "no-match",
     "fix_plan": "no-match",
-    "later_commits": "superseded-by-code-audit"
+    "later_commits": "resolved-by-M0122-0009"
    },
-   "confidence": "medium",
-   "code_audit": "unclear: pg_subtrans files exist but truncation deferred status not verified"
+   "confidence": "high",
+   "code_audit": "RESOLVED (2026-07-12 code audit) by M0122-0009 (commit 41e119b8). pg_subtrans truncation is fully implemented and wired end-to-end: (1) internal/mvcc/subxact_slru.go SubtransSLRU.TruncateBefore unlinks segment files whose highest page wraparound-precedes the cutoff (SubtransPagePrecedes); (2) internal/mvcc/subxact_visibility.go SubxactMap.Truncate drops in-memory parent/abort entries older than the horizon and cascades to the SLRU; (3) internal/initdb/open.go:1628 TruncateSubtransFn computes the same conservative min(datfrozenxid, OldestXmin) horizon as TruncateCLOGFn and calls subxactMap.Truncate; (4) internal/wal/checkpointer.go:665 invokes TruncateSubtransFn post-checkpoint (after the checkpoint marker is durable), mirroring TruncateCLOGFn ordering. Tests: mvcc/subxact_truncate_test.go, wal/checkpointer_test.go TestCheckpointerCallsTruncateSubtransFn + TestCheckpointerTruncateSubtransFnErrorIsNonFatal. Matches PG subtrans.c:TruncateSUBTRANS (checkpoint-driven; goopg's horizon is at-least-as-conservative as GetOldestTransactionIdConsideredRunning)."
   },
   {
    "feature": "Domain CHECK predicates still use legacy wrap instead of new fully-parenthesizing renderer.",
