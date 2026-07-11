@@ -1270,3 +1270,41 @@ func TestExtractFromInterval(t *testing.T) {
 		}
 	}
 }
+
+
+// TestNegateInterval drives unary `- interval` (interval_um) end-to-end through
+// the SQL executor: finite intervals negate every field, the ±infinity sentinels
+// swap (NOBEGIN↔NOEND), and the rendered output matches PostgreSQL 18.3
+// (captured live from local_install). (unimplemented_feat #5(d-iv))
+func TestNegateInterval(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+	if err := runDDL(t, ctx, "CREATE TABLE t (id int)"); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	if err := runDDL(t, ctx, "INSERT INTO t VALUES (1)"); err != nil {
+		t.Fatalf("INSERT: %v", err)
+	}
+	cases := []struct{ sql, want string }{
+		{"SELECT - interval '1 day'", "-1 days"},
+		{"SELECT - interval '1 year 2 months 3 days 4:05:06.5'", "-1 years -2 mons -3 days -04:05:06.5"},
+		{"SELECT - interval '0'", "00:00:00"},
+		{"SELECT - interval '-5 minutes'", "00:05:00"},
+		// Mixed-sign fields negate independently (each field flips its own sign).
+		{"SELECT - interval '2 mons -4 days 03:00:00'", "-2 mons +4 days -03:00:00"},
+		// ±infinity sentinels swap: -(+inf) = -inf, -(-inf) = +inf.
+		{"SELECT - interval 'infinity'", "-infinity"},
+		{"SELECT - interval '-infinity'", "infinity"},
+		// Double negation returns the original finite value.
+		{"SELECT - - interval '1 day 02:00:00'", "1 day 02:00:00"},
+	}
+	for _, c := range cases {
+		rows := runQuery(t, ctx, c.sql+" FROM t")
+		if len(rows) != 1 || len(rows[0]) != 1 {
+			t.Fatalf("%s: expected 1x1 result, got %v", c.sql, rows)
+		}
+		if got := rows[0][0].Format(); got != c.want {
+			t.Errorf("%s = %q, want %q", c.sql, got, c.want)
+		}
+	}
+}

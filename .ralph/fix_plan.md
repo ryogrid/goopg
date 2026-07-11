@@ -8062,6 +8062,25 @@ mirroring M0119's ledger `status` column.
       `interval_subday_test.go` new `TestExtractFromInterval` (24 accepts + 3
       NULL + 2 error). Design doc `docs/design/0003-0006-*` new Follow-up. Gates:
       build/vet clean; executor suite PASS; PG-18.3 cross-check; pgbench (hook).
+  - [x] `unimplemented_feat #5(d-iv) (unary - interval negation)`
+      (2026-07-11, this loop) — closed the prior EXTRACT row's deferred item (2):
+      `- interval '1 day'` was rejected at TWO layers. Analyzer
+      (`internal/analyzer/analyzer.go`): split the combined `OpUnaryPos,
+      OpUnaryNeg` arm so `OpUnaryNeg` also accepts a type named `interval`
+      (PG's `interval_um`) while `OpUnaryPos` stays numeric-only — PG has NO
+      unary `+ interval` (verified live: 42883). Evaluator: new `negateInterval`
+      (`internal/executor/expr.go`) line-ports `interval_um_internal`
+      (timestamp.c:3444): `±infinity` sentinels SWAP (NOBEGIN↔NOEND, so
+      `-(-infinity)=infinity`), a finite interval negates each field with the
+      signed-min overflow guard + an `INTERVAL_NOT_FINITE(result)` guard so a
+      finite operand never lands on a sentinel. Wired into `evalUnary`
+      (single funnel; fast-path + interpreted both delegate). Tests:
+      `interval_subday_test.go` new `TestNegateInterval` (8 cases incl.
+      mixed-sign, both infinities, double negation). All `want` from live PG
+      18.3. Still deferred (ledger 2026-07-11): `timestamp ± interval 'infinity'`,
+      cast-form typmod, EXTRACT numeric scale gap. Design doc
+      `docs/design/0003-0006-*` new Follow-up. Gates: build/vet clean; analyzer
+      + executor suites PASS; PG-18.3 cross-check; pgbench (hook).
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,

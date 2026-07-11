@@ -1172,6 +1172,9 @@ func evalUnary(op parser.OpCode, d Datum, pos int) (Datum, error) {
 				return newBigNumericInCtx(mctx.Perm(), neg, d.Scale), nil
 			}
 			return Datum{Kind: KindNumeric, Int: -d.Int, Scale: d.Scale}, nil
+		case KindInterval:
+			// Unary interval negation (interval_um). (unimplemented_feat #5(d-iv))
+			return negateInterval(d, pos)
 		default:
 			return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: "operator unary - requires integer or numeric"}
 		}
@@ -2038,6 +2041,35 @@ func addIntervalInterval(left, right Datum, subtract bool, pos int) (Datum, erro
 		return NewIntervalInfinity(false), nil
 	}
 	return finiteIntervalArith(left, right, true, pos)
+}
+
+// negateInterval implements unary `- interval` (interval_um / interval_um_internal,
+// postgres/src/backend/utils/adt/timestamp.c:3444): the ±infinity sentinels swap
+// (NOBEGIN↔NOEND) and every finite field is negated with an overflow guard, also
+// erroring if the negation lands exactly on a ±infinity sentinel.
+// (unimplemented_feat #5(d-iv))
+func negateInterval(d Datum, pos int) (Datum, error) {
+	switch {
+	case d.IsIntervalNoBegin():
+		// -(-infinity) = +infinity (INTERVAL_NOBEGIN -> INTERVAL_NOEND)
+		return NewIntervalInfinity(true), nil
+	case d.IsIntervalNoEnd():
+		// -(+infinity) = -infinity (INTERVAL_NOEND -> INTERVAL_NOBEGIN)
+		return NewIntervalInfinity(false), nil
+	}
+	months := d.IntervalMonthsValue()
+	days := d.IntervalDaysValue()
+	micros := d.IntervalMicrosValue()
+	// pg_sub_s64/s32_overflow(0, x): 0-x overflows only when x is the signed min.
+	if micros == math.MinInt64 || months == math.MinInt32 || days == math.MinInt32 {
+		return Datum{}, intervalOutOfRange(pos)
+	}
+	res := NewIntervalDatumFull(-months, -days, -micros)
+	if res.IsIntervalNotFinite() {
+		// Negating a finite interval must never synthesise a ±infinity sentinel.
+		return Datum{}, intervalOutOfRange(pos)
+	}
+	return res, nil
 }
 
 func arithmetic(op parser.OpCode, a, b int64, pos int) (Datum, error) {

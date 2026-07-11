@@ -1355,6 +1355,45 @@ path — not specific to intervals. Gates: `go build`/`go vet` clean; executor
 suite PASS; canonical values cross-checked against PG 18.3; pgbench smoke via
 pre-commit hook.
 
+## Follow-up (2026-07-11): unary `- interval` negation (#5(d-iv))
+
+Closed the second "still deferred" item above: unary minus rejected a
+`KindInterval` operand at **two** layers, so `- interval '1 day'` failed in the
+analyzer before it could ever reach the evaluator.
+
+- **Analyzer** (`internal/analyzer/analyzer.go`): the `OpUnaryPos, OpUnaryNeg`
+  arm required `isNumericLike(operand)`. Split it — `OpUnaryNeg` now also accepts
+  a type named `interval` (mirroring PG's `interval_um` operator), while
+  `OpUnaryPos` stays numeric-only because **PG has no unary `+ interval`
+  operator** (`SELECT + interval '1 day'` → `42883 operator does not exist:
+  + interval`, verified live on 18.3).
+- **Evaluator** (`negateInterval`, `internal/executor/expr.go`): line-ports
+  `interval_um_internal` (`postgres/src/backend/utils/adt/timestamp.c:3444`). The
+  `±infinity` sentinels **swap** — `NOBEGIN`→`NOEND` and `NOEND`→`NOBEGIN`, so
+  `-(-infinity)=infinity` and `-(infinity)=-infinity`. A finite interval negates
+  each field independently (`month`/`day` are `int32`, `time` is `int64`), with
+  the same signed-min overflow guard PG's `pg_sub_s32/s64_overflow(0, x)` applies
+  (a field equal to its signed minimum has no representable negation), plus the
+  `INTERVAL_NOT_FINITE(result)` guard so a finite operand can never negate onto a
+  `±infinity` sentinel (e.g. `-(−2147483647 mons −2147483647 days −MaxInt64 us)`
+  would land exactly on `NOEND` → `interval out of range`, matching PG).
+
+Unary minus funnels through a single `evalUnary`; both the fast-path
+(`evalFastExpr`, `exprnode.go`) and the interpreted path delegate to it, so there
+is no sibling evaluator to keep in sync. All `want` values in the new
+`TestNegateInterval` (`interval_subday_test.go`, 8 cases incl. mixed-sign,
+both infinities, and double negation) were captured from **PostgreSQL 18.3**
+(`local_install`): `-1 days`, `-1 years -2 mons -3 days -04:05:06.5`,
+`-2 mons +4 days -03:00:00`, `-infinity`, `infinity`.
+
+**Still deferred (narrowed).** `timestamp ± interval 'infinity'` (needs an
+infinite-timestamp carrier), and the cast-form typmod
+`CAST(... AS interval hour to minute)` / `interval(p) '...'`. Also open: goopg's
+`EXTRACT` numeric output strips trailing zeros (`6.5` vs PG's `6.500000`), a
+pre-existing scale gap shared with the timestamp path — not specific to
+intervals. Gates: `go build`/`go vet` clean; analyzer + executor suites PASS;
+canonical values cross-checked against PG 18.3; pgbench smoke via pre-commit hook.
+
 ## Cross-references
 
 - TPC-H query bodies: HammerDB upstream

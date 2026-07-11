@@ -1240,7 +1240,15 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 			return catalog.Type{}, err
 		}
 		switch x.Op {
-		case parser.OpUnaryPos, parser.OpUnaryNeg:
+		case parser.OpUnaryNeg:
+			// Unary minus accepts numeric operands and also `interval`
+			// (interval_um, unimplemented_feat #5(d-iv)); PG has no unary
+			// `+ interval` operator, so OpUnaryPos below stays numeric-only.
+			if !isNumericLike(opTyp) && !strings.EqualFold(opTyp.Name, "interval") {
+				return catalog.Type{}, analyzeError(x.Pos(), "42804", fmt.Sprintf("operator %s requires a numeric operand", x.Op))
+			}
+			return opTyp, nil
+		case parser.OpUnaryPos:
 			if !isNumericLike(opTyp) {
 				return catalog.Type{}, analyzeError(x.Pos(), "42804", fmt.Sprintf("operator %s requires a numeric operand", x.Op))
 			}
