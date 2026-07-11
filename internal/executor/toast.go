@@ -8,6 +8,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/pglz"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -20,6 +21,14 @@ const ToastThreshold = 2000
 // ToastMaxChunkSize is the maximum payload size per TOAST chunk row.
 // Each chunk carries at most this many bytes of the original value.
 const ToastMaxChunkSize = 1996
+
+// toastCompressedFlag marks, in the high bit of a TOAST pointer's
+// num_chunks word, that the out-of-line bytes are a PGLZ-compressed inline
+// varlena (VARATT_IS_4B_C, built by pglz.BuildCompressedVarlena) rather
+// than the raw value, and must be run through pglz.DecodeInlineCompressed
+// on detoast. Free to steal because num_chunks is bounded by
+// maxDetoastChunks (1<<20) and never approaches 2^31.
+const toastCompressedFlag = uint32(1) << 31
 
 // Detoast sanity bounds reject corrupted or accidental TOAST pointers before
 // they can trigger unbounded allocations during reassembly.
@@ -213,12 +222,28 @@ func ToastLargeColumnsIfNeeded(ctx *Context, rel storage.RelFileNode, cols []cat
 		if len(data) <= ToastThreshold {
 			continue
 		}
+		// PG's toast_tuple_try_compression: before pushing an oversized
+		// value out-of-line, try to PGLZ-compress it, unless the column's
+		// STORAGE is EXTERNAL (which forbids compression). Keep the
+		// compressed form only when it is strictly smaller than the raw
+		// bytes, mirroring toast_compress_datum's "VARSIZE(tmp) <
+		// VARSIZE(value)" acceptance test — an incompressible value is
+		// stored raw exactly as before.
+		storeData, compressed := data, false
+		if col.Storage != "external" {
+			if comp := pglz.Compress(data); comp != nil {
+				blob := pglz.BuildCompressedVarlena(comp, len(data))
+				if len(blob) < len(data) {
+					storeData, compressed = blob, true
+				}
+			}
+		}
 		// Need to toast this column — lazily allocate the output row.
 		if newRow == nil {
 			newRow = make(Row, len(row))
 			copy(newRow, row)
 		}
-		ptr, err := toastStore(ctx, toastRel, data)
+		ptr, err := toastStore(ctx, toastRel, storeData, compressed)
 		if err != nil {
 			return nil, fmt.Errorf("TOAST %s: %w", col.Name, err)
 		}
@@ -233,7 +258,7 @@ func ToastLargeColumnsIfNeeded(ctx *Context, rel storage.RelFileNode, cols []cat
 // toastStore slices data into ToastMaxChunkSize chunks, writes each chunk
 // as a tuple in the TOAST relation, and returns the 12-byte pointer that
 // will be embedded in the main heap tuple.
-func toastStore(ctx *Context, toastRel storage.RelFileNode, data []byte) ([]byte, error) {
+func toastStore(ctx *Context, toastRel storage.RelFileNode, data []byte, compressed bool) ([]byte, error) {
 	oid := toastNextOID()
 	var seq int32
 	for off := 0; off < len(data); off += ToastMaxChunkSize {
@@ -263,11 +288,19 @@ func toastStore(ctx *Context, toastRel storage.RelFileNode, data []byte) ([]byte
 		}
 		seq++
 	}
-	// 12-byte pointer: toast_oid(4) | total_len(4) | num_chunks(4)
+	// 12-byte pointer: toast_oid(4) | total_len(4) | num_chunks(4).
+	// total_len/num_chunks describe the bytes physically stored in the
+	// TOAST relation (the compressed varlena blob when compressed==true);
+	// the high bit of the num_chunks word carries the compressed flag so
+	// DetoastValue knows to decode the reassembled blob.
+	chunkWord := uint32(seq)
+	if compressed {
+		chunkWord |= toastCompressedFlag
+	}
 	ptr := make([]byte, 12)
 	binary.BigEndian.PutUint32(ptr[0:4], oid)
 	binary.BigEndian.PutUint32(ptr[4:8], uint32(len(data)))
-	binary.BigEndian.PutUint32(ptr[8:12], uint32(seq))
+	binary.BigEndian.PutUint32(ptr[8:12], chunkWord)
 	return ptr, nil
 }
 
@@ -356,7 +389,9 @@ func DetoastValue(ctx *Context, toastRel storage.RelFileNode, pointer []byte) ([
 	}
 	oid := binary.BigEndian.Uint32(pointer[0:4])
 	totalLen := int(binary.BigEndian.Uint32(pointer[4:8]))
-	numChunks := int(binary.BigEndian.Uint32(pointer[8:12]))
+	chunkWord := binary.BigEndian.Uint32(pointer[8:12])
+	compressed := chunkWord&toastCompressedFlag != 0
+	numChunks := int(chunkWord &^ toastCompressedFlag)
 	if totalLen < 0 || totalLen > maxDetoastTotalLen {
 		return nil, fmt.Errorf("invalid TOAST pointer: implausible total length %d", totalLen)
 	}
@@ -426,6 +461,16 @@ func DetoastValue(ctx *Context, toastRel storage.RelFileNode, pointer []byte) ([
 	result := make([]byte, 0, totalLen)
 	for _, c := range chunks {
 		result = append(result, c...)
+	}
+	if compressed {
+		// The reassembled bytes are the inline-compressed varlena built by
+		// pglz.BuildCompressedVarlena at store time; decode back to the raw
+		// value (the length is self-described in the varlena's va_tcinfo).
+		orig, _, err := pglz.DecodeInlineCompressed(result)
+		if err != nil {
+			return nil, fmt.Errorf("detoast decompress oid %d: %w", oid, err)
+		}
+		return orig, nil
 	}
 	return result, nil
 }

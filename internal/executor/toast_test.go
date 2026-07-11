@@ -8,8 +8,26 @@ import (
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/parser"
+	"github.com/goopg/goopg/internal/pglz"
 	"github.com/goopg/goopg/internal/storage"
 )
+
+// incompressibleString returns a deterministic pseudo-random string of n
+// printable-ASCII bytes that PGLZ cannot shrink (an xorshift stream has no
+// 3+ byte back-references to match), so a value built from it is always
+// stored raw out-of-line rather than compressed — used by chunk-count
+// assertions that must remain independent of the TOAST compression path.
+func incompressibleString(n int) string {
+	b := make([]byte, n)
+	x := uint32(0x9e3779b9)
+	for i := range b {
+		x ^= x << 13
+		x ^= x >> 17
+		x ^= x << 5
+		b[i] = byte(33 + (x % 94)) // printable ASCII 33..126
+	}
+	return string(b)
+}
 
 // newToastFixture creates a test context suitable for TOAST tests.
 func newToastFixture(t *testing.T) (*Context, func()) {
@@ -192,7 +210,10 @@ func TestToastChunkInsertsAreIndividuallyWALLogged(t *testing.T) {
 	// 3 full chunks (3*1996 = 5988 B) fit on one 8 KiB TOAST page: chunk 0
 	// dirties the page, chunks 1 and 2 write into the already-dirty page in
 	// the same checkpoint epoch — exactly the scenario that used to be lost.
-	threeChunks := strings.Repeat("A", 3*ToastMaxChunkSize)
+	// Use incompressible content so the value is stored raw (a compressible
+	// value would PGLZ-shrink to a single chunk and defeat the multi-chunk
+	// intent of this WAL-per-chunk regression test).
+	threeChunks := incompressibleString(3 * ToastMaxChunkSize)
 	tbl, _ := ctx.Catalog.LookupTable(parser.ObjectName{Name: "wal_chunk_test"})
 	rel := ctx.Catalog.RelFileNode(tbl)
 	row := Row{
@@ -255,6 +276,146 @@ func TestToastByteaRoundTrip(t *testing.T) {
 	if len(rows) != 1 || rows[0][0].Int != 7 {
 		t.Errorf("bytea row not found: %+v", rows)
 	}
+}
+
+// toastPointerCompressed reports whether a 12-byte TOAST pointer's
+// num_chunks word has the compressed flag set.
+func toastPointerCompressed(t *testing.T, ptr []byte) bool {
+	t.Helper()
+	if len(ptr) != 12 {
+		t.Fatalf("TOAST pointer: want 12 bytes, got %d", len(ptr))
+	}
+	return binary.BigEndian.Uint32(ptr[8:12])&toastCompressedFlag != 0
+}
+
+// TestToastCompressionRoundTrip pins DU-002 slice 183 (unimplemented_feat
+// #151): an oversized, compressible value is PGLZ-compressed before it is
+// stored out-of-line (fewer physical chunks than the raw size would need),
+// the pointer carries the compressed flag, and it detoasts back with full
+// fidelity for both text and bytea.
+func TestToastCompressionRoundTrip(t *testing.T) {
+	ctx, cleanup := newToastFixture(t)
+	defer cleanup()
+
+	// A highly compressible value: 40 KiB of a repeating pattern. Raw it
+	// would need ceil(40960/1996)=21 chunks; PGLZ crushes it to one.
+	const rawLen = 40960
+	compressible := strings.Repeat("goopg-toast-", rawLen/12+1)[:rawLen]
+
+	toastRel := ToastRelFor(storage.RelFileNode{DBOid: 1, RelOid: 900, Fork: storage.MainFork})
+
+	// Materialise the writer XID so the chunk tuples we write directly are
+	// visible to our own snapshot on read-back (the SQL write path does this
+	// for us; the low-level toastStore call below does not).
+	if err := ctx.MaterializeWriterXID(); err != nil {
+		t.Fatalf("MaterializeWriterXID: %v", err)
+	}
+
+	// Store directly through the low-level path so we can inspect the pointer.
+	blob := pglzMustCompress(t, []byte(compressible))
+	ptr, err := toastStore(ctx, toastRel, blob, true)
+	if err != nil {
+		t.Fatalf("toastStore compressed: %v", err)
+	}
+	if !toastPointerCompressed(t, ptr) {
+		t.Fatalf("expected compressed flag set in TOAST pointer")
+	}
+	// The compressed blob is far smaller than the raw value, so it fits in a
+	// single chunk — proving compression actually reduced physical storage.
+	numChunks := int(binary.BigEndian.Uint32(ptr[8:12]) &^ toastCompressedFlag)
+	if numChunks != 1 {
+		t.Errorf("compressed 40 KiB value: want 1 chunk, got %d", numChunks)
+	}
+
+	got, err := DetoastValue(ctx, toastRel, ptr)
+	if err != nil {
+		t.Fatalf("DetoastValue compressed: %v", err)
+	}
+	if string(got) != compressible {
+		t.Errorf("compressed round-trip mismatch: got %d bytes, want %d", len(got), rawLen)
+	}
+
+	// End-to-end through the SQL path: text + bytea columns, one compressible
+	// (stored compressed) and one incompressible (stored raw), both must
+	// survive INSERT → SELECT unchanged.
+	if err := runDDL(t, ctx, "CREATE TABLE toast_cmp (id int, t text, b bytea)"); err != nil {
+		t.Fatal(err)
+	}
+	incompressible := incompressibleString(8000)
+	tbl, _ := ctx.Catalog.LookupTable(parser.ObjectName{Name: "toast_cmp"})
+	rel := ctx.Catalog.RelFileNode(tbl)
+	row := Row{
+		{Kind: KindInt, Int: 1},
+		NewStringDatum(compressible),
+		NewBytesDatum([]byte(incompressible)),
+	}
+	if err := writeHeapRow(ctx, rel, tbl.Columns, row); err != nil {
+		t.Fatalf("INSERT: %v", err)
+	}
+	rows := runQuery(t, ctx, "SELECT t, b FROM toast_cmp WHERE id = 1")
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(rows))
+	}
+	if rows[0][0].StringValue() != compressible {
+		t.Errorf("text column round-trip mismatch (len got=%d want=%d)", len(rows[0][0].StringValue()), rawLen)
+	}
+	if string(rows[0][1].BytesValue()) != incompressible {
+		t.Errorf("bytea column round-trip mismatch (len got=%d want=%d)", len(rows[0][1].BytesValue()), len(incompressible))
+	}
+}
+
+// TestToastStorageExternalSkipsCompression verifies that a column whose
+// STORAGE is EXTERNAL is stored out-of-line uncompressed, matching PG's
+// EXTERNAL semantics (out-of-line permitted, compression forbidden).
+func TestToastStorageExternalSkipsCompression(t *testing.T) {
+	ctx, cleanup := newToastFixture(t)
+	defer cleanup()
+
+	const rawLen = 8000
+	compressible := strings.Repeat("goopg-toast-", rawLen/12+1)[:rawLen]
+
+	cols := []catalog.Column{
+		{Name: "id", Type: catalog.Type{Name: "int4"}, Ordinal: 0},
+		{Name: "v", Type: catalog.Type{Name: "text"}, Ordinal: 1, Storage: "external"},
+	}
+	rel := storage.RelFileNode{DBOid: 1, RelOid: 901, Fork: storage.MainFork}
+	if err := ctx.MaterializeWriterXID(); err != nil {
+		t.Fatalf("MaterializeWriterXID: %v", err)
+	}
+	row := Row{{Kind: KindInt, Int: 1}, NewStringDatum(compressible)}
+	out, err := ToastLargeColumnsIfNeeded(ctx, rel, cols, row)
+	if err != nil {
+		t.Fatalf("ToastLargeColumnsIfNeeded: %v", err)
+	}
+	if out[1].Kind != KindToastPointer {
+		t.Fatalf("expected column toasted, got kind %d", out[1].Kind)
+	}
+	if toastPointerCompressed(t, out[1].BytesValue()) {
+		t.Errorf("STORAGE EXTERNAL column must not be compressed")
+	}
+	// Full-fidelity detoast still works for the raw out-of-line value.
+	got, err := DetoastValue(ctx, ToastRelFor(rel), out[1].BytesValue())
+	if err != nil {
+		t.Fatalf("DetoastValue: %v", err)
+	}
+	if string(got) != compressible {
+		t.Errorf("EXTERNAL raw round-trip mismatch")
+	}
+}
+
+// pglzMustCompress builds the inline-compressed varlena blob for data,
+// failing the test if the value is not actually compressible.
+func pglzMustCompress(t *testing.T, data []byte) []byte {
+	t.Helper()
+	comp := pglz.Compress(data)
+	if comp == nil {
+		t.Fatalf("pglz.Compress returned nil for %d bytes", len(data))
+	}
+	blob := pglz.BuildCompressedVarlena(comp, len(data))
+	if len(blob) >= len(data) {
+		t.Fatalf("test data is not compressible: blob=%d raw=%d", len(blob), len(data))
+	}
+	return blob
 }
 
 // TestToastPointerCodecRoundTrip verifies that a KindToastPointer datum

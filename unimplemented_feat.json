@@ -3207,7 +3207,7 @@
    "feature": "TOAST compression functionality is not implemented. Compression metadata round-trips through pg_dump for schema fidelity, but actual data compression is not performed.",
    "task_id": "DU-002 slice 183",
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "Dump-fidelity only: goopg does not TOAST/compress."
    ],
@@ -3222,7 +3222,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/executor/operators_ddl.go:7335 TOAST compression dump-fidelity only"
+   "code_audit": "RESOLVED 2026-07-12 (M0122, docs/design/0046-0008-toast-compress-on-write.md): out-of-line TOAST values are now PGLZ-compressed on write. internal/executor/toast.go ToastLargeColumnsIfNeeded compresses a compressible over-threshold value via pglz.BuildCompressedVarlena and keeps it only when strictly smaller than raw (mirrors toast_compress_datum's VARSIZE(tmp) < VARSIZE(value)); STORAGE EXTERNAL columns skip compression. toastStore's num_chunks-word high bit (toastCompressedFlag=1<<31) flags a compressed blob; DetoastValue runs it through pglz.DecodeInlineCompressed. Legacy 12-byte pointers decode unchanged. Still deferred (see .ralph/deferral_ledger.md 2026-07-12 row): inline-compression-stays-inline, STORAGE PLAIN/MAIN toast-decision semantics, and LZ4."
   },
   {
    "feature": "Autovacuum functionality is not implemented; autovacuum_vacuum_scale_factor values are stored and dumped for compatibility but do not trigger automatic vacuuming",
