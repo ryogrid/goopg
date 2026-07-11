@@ -261,7 +261,10 @@ func (s *Server) handleDescribeFrame(state *extendedState, payload []byte, w *pr
 			return nil, err
 		}
 		fields := s.describeExtendedQuery(stmt.Query)
-		if len(fields) == 0 {
+		// nil = no result set (write/DDL/txn) → NoData; a non-nil but empty
+		// slice is a zero-column read (`SELECT FROM t`) → RowDescription with
+		// 0 fields, matching PostgreSQL.
+		if fields == nil {
 			if err := w.WriteNoData(); err != nil {
 				return nil, err
 			}
@@ -281,7 +284,10 @@ func (s *Server) handleDescribeFrame(state *extendedState, payload []byte, w *pr
 			}, nil
 		}
 		fields := s.describeExtendedQuery(portal.Statement.Query)
-		if len(fields) == 0 {
+		// nil = no result set (write/DDL/txn) → NoData; a non-nil but empty
+		// slice is a zero-column read (`SELECT FROM t`) → RowDescription with
+		// 0 fields, matching PostgreSQL.
+		if fields == nil {
 			if err := w.WriteNoData(); err != nil {
 				return nil, err
 			}
@@ -644,10 +650,14 @@ func (s *Server) describeViaPlanner(query string) ([]protocol.FieldDescription, 
 		return nil, false
 	}
 	schema := node.Output()
-	if len(schema) == 0 {
-		// Write-only / DDL / transaction — no rows.
+	if schema == nil {
+		// Write-only / DDL / transaction — no result set at all → NoData.
 		return nil, true
 	}
+	// A non-nil but zero-length schema is a zero-column read (e.g.
+	// `SELECT FROM t`, `SELECT;`): PostgreSQL Describe replies with a
+	// RowDescription carrying 0 fields, NOT NoData. Returning a non-nil
+	// empty slice signals that to describeExtendedQuery's callers.
 	fields := make([]protocol.FieldDescription, len(schema))
 	for i, sc := range schema {
 		fields[i] = protocol.FieldDescription{

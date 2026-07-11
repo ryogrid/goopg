@@ -265,7 +265,14 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 
 	schema := node.Output()
 	res := &extendedQueryResult{}
-	if len(schema) > 0 {
+	// A read-shaped plan reports a non-nil schema; writers (Insert/Update/
+	// Delete/DDL/Transaction) report nil. A zero-column read (e.g.
+	// `SELECT FROM t`, `SELECT;`) reports a non-nil zero-length schema and
+	// MUST still emit one DataRow per source row per PostgreSQL — so gate on
+	// `schema != nil`, NOT `len(schema) > 0` (which silently dropped every
+	// zero-column row here while the simple-query path emitted them). Mirrors
+	// dispatch.go's `if schema != nil` guard.
+	if schema != nil {
 		res.Fields = make([]protocol.FieldDescription, len(schema))
 		for i, sc := range schema {
 			res.Fields[i] = protocol.FieldDescription{
@@ -288,7 +295,7 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 			_ = op.Close()
 			return nil, &extendedQueryError{Code: execErrCode(err), Message: execErrMsg(err)}
 		}
-		if len(schema) > 0 {
+		if schema != nil {
 			row := slot.Row()
 			cells := make([][]byte, len(row))
 			for i, d := range row {

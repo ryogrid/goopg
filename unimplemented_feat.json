@@ -3525,7 +3525,7 @@
    "feature": "goopg does not emit a blank data row for 0-column SELECT results; PostgreSQL outputs one that goopg omits.",
    "task_id": "m0097",
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "goopg does not currently emit"
    ],
@@ -3539,8 +3539,8 @@
     "fix_plan": "no-match",
     "later_commits": "superseded-by-code-audit"
    },
-   "confidence": "medium",
-   "code_audit": "unclear: Zero-column SELECT path not traced in protocol"
+   "confidence": "high",
+   "code_audit": "RESOLVED 2026-07-11: traced to a sibling-path divergence. The simple-query path (internal/server/dispatch.go, `if schema != nil` guards) already emitted RowDescription-with-0-fields + one zero-column DataRow per source row for `SELECT FROM t`/`SELECT;`. The EXTENDED-protocol path dropped them: executeExtendedQueryViaExecutor (internal/server/dispatch_extended.go) gated both res.Fields construction and per-row res.Rows population on `len(schema) > 0`, so a non-nil zero-length schema (a zero-column read) built no rows and the command tag read `SELECT 0`; and Describe (describeViaPlanner/handleDescribeFrame, internal/server/extended.go) collapsed `len(schema)==0` to NoData instead of RowDescription-with-0-fields. Fix: gate all four sites on `schema != nil` / `schema == nil` (nil = write/DDL/txn = NoData; non-nil-empty = zero-column read = RowDescription 0 fields). Verified vs PG 18.3 (`SELECT FROM t` over 3 rows returns 3 rows via `\\bind \\g`). Tests: internal/server/extended_zero_column_test.go (TestExtendedZeroColumnSelectEmitsRows, TestExtendedZeroColumnSelectWithFilter)."
   },
   {
    "feature": "Resolve subscriber apply stall issue during logical replication",
