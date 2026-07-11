@@ -896,6 +896,22 @@ func TestIntervalTypmodRangeAndPrecision(t *testing.T) {
 		{"SELECT interval '100' minute to second", "00:01:40"},
 		{"SELECT interval '1.5' minute to second", "00:00:01.5"},
 		{"SELECT interval '-1.5' hour to minute", "-00:01:00"},
+		// Complex (multi-field) body under a range: the TRAILING unitless number
+		// resolves via the range's low field, then AdjustIntervalForTypmod's range
+		// truncation applies (unimplemented_feat #5(d-iv) complex-body-under-range).
+		// Higher-order explicit fields are kept; verified byte-for-byte vs live PG
+		// 18.3: `interval '1 day 5' hour to minute` → 1 day 00:05:00, etc.
+		{"SELECT interval '1 day 5' hour to minute", "1 day 00:05:00"},
+		{"SELECT interval '1 day 5' day to hour", "1 day 05:00:00"},
+		{"SELECT interval '2 hour 5' hour to minute", "02:05:00"},
+		{"SELECT interval '1 day 90' minute to second", "1 day 00:01:30"},
+		{"SELECT interval '1 day 1.5' hour to minute", "1 day 00:01:00"},
+		{"SELECT interval '1 mon 2 day 5' hour to minute", "1 mon 2 days 00:05:00"},
+		{"SELECT interval '1 day 5' minute to second", "1 day 00:00:05"},
+		{"SELECT interval '1 day 30' day to minute", "1 day 00:30:00"},
+		{"SELECT interval '1 day 5' hour to second", "1 day 00:00:05"},
+		{"SELECT interval '-1 day 5' hour to minute", "-1 days +00:05:00"},
+		{"SELECT interval '1 day 5' minute to second(0)", "1 day 00:00:05"},
 		// Single field (existing behaviour, now via the same helper).
 		{"SELECT interval '5' second", "00:00:05"},
 		{"SELECT interval '5' minute", "00:05:00"},
@@ -934,6 +950,14 @@ func TestIntervalTypmodRangeAndPrecision(t *testing.T) {
 		"SELECT interval '5' second to minute FROM t",
 		"SELECT interval '5' minute to minute FROM t",
 		"SELECT interval '5' hour to hour FROM t",
+		// DEFERRED (unimplemented_feat #5(d-iv), ledger 2026-07-11): a bare number
+		// to the LEFT of a time/year-month word takes that field's carried type in
+		// PostgreSQL's right-to-left DecodeInterval (`interval '1 2:03:04' day to
+		// second` = 1 day 02:03:04, the `1` becoming DAY). goopg's left-to-right
+		// decodeIntervalFields rejects a non-final bare magnitude, so it errors here
+		// even at full range (`interval '1 2:03:04'` also errors) — this is not a
+		// range-specific gap. When leftward carry lands, move this to `accept`.
+		"SELECT interval '1 2:03:04' day to second FROM t",
 	}
 	for _, sql := range reject {
 		if _, err := runQueryErr(t, ctx, sql); err == nil {

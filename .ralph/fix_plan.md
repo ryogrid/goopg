@@ -7989,6 +7989,37 @@ mirroring M0119's ledger `status` column.
       doc `docs/design/0003-0006-*` new Follow-up section + README row. Gates:
       build/vet clean; parser/analyzer/planner/executor suites PASS;
       `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke (hook).
+  - [x] `unimplemented_feat #5(d-iv) (complex interval body under a range)`
+      (2026-07-11, this loop) — closed the **trailing-bare-number half** of the
+      prior row's deferred complex-body-under-range item. A multi-field Form-1
+      body whose FINAL field is unitless now decodes, that number resolving via
+      the range's low field: `interval '1 day 5' hour to minute`=1 day 00:05:00,
+      `'1 day 5' day to hour`=1 day 05:00:00, `'2 hour 5' hour to minute`=02:05:00,
+      `'1 day 90' minute to second`=1 day 00:01:30, `'1 day 1.5' hour to minute`=
+      1 day 00:01:00, `'1 mon 2 day 5' hour to minute`=1 mon 2 days 00:05:00,
+      `'-1 day 5' hour to minute`=-1 days +00:05:00, `'1 day 5' minute to
+      second(0)`=1 day 00:00:05 (all byte-for-byte vs live PG 18.3 port 5601).
+      PG's `DecodeInterval switch(range)` (datetime.c ~L3604) picks the range's
+      LOW field as the default for the rightmost unmarked number, so a new
+      `parser.ParseIntervalBodyWithDefault(body, defaultUnit)` threads that field
+      into `decodeIntervalFields`'s trailing-unitless branch (now
+      `IntervalUnitToParts`/`intervalUnitMask(defaultUnit,…)` instead of hardcoded
+      SECOND); `ParseIntervalBody(body)` delegates with `"second"` so the
+      `::interval`/CAST + Form-2 full-range siblings are byte-identical (guarded
+      by `TestParseIntervalBodySingleFieldMatchesUnitToParts`). `evalIntervalLit`
+      (executor `expr.go`) routes a Qualified literal whose body is NOT a bare
+      magnitude through it; the existing `truncIntervalToUnit`/
+      `roundIntervalMicrosToPrec` range truncation runs unchanged (matches
+      `AdjustIntervalForTypmod` — HOUR..SECOND ranges only truncate `time`, keep
+      day/month). Still deferred (ledger 2026-07-11): a bare number to the LEFT of
+      a time/year-month word (`interval '1 2:03:04' day to second`=1 day 02:03:04;
+      PG's right-to-left leftward carry, pre-exists at full range too — added as a
+      documented reject case), `±infinity`, cast-form typmod. Tests:
+      `interval_subday_test.go` `TestIntervalTypmodRangeAndPrecision` (+11 accepts
+      + 1 deferred-leftward-carry reject). Design doc `docs/design/0003-0006-*` new
+      Follow-up section + README row. Gates: build/vet clean;
+      parser/planner/executor suites PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); pgbench smoke (hook).
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,

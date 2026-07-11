@@ -5710,13 +5710,30 @@ func evalIntervalLit(x *planner.IntervalLit) (Datum, error) {
 		x.CacheValid = true
 		return NewIntervalDatumFull(x.PreMonths, x.PreDays, x.PreMicros), nil
 	}
-	val, fval, ok := parser.ParseIntervalMagnitude(x.Value)
-	if !ok {
+	var months, days int32
+	var micros int64
+	if val, fval, magOK := parser.ParseIntervalMagnitude(x.Value); magOK {
+		var ok bool
+		months, days, micros, ok = parser.IntervalUnitToParts(val, fval, x.Unit)
+		if !ok {
+			return Datum{}, &ExecError{Code: "0A000", Pos: x.Pos(), Message: fmt.Sprintf("interval unit %q is not supported in v0", x.Unit)}
+		}
+	} else if x.Qualified {
+		// Complex body under a range/typmod qualifier
+		// (`interval '1 day 5' hour to minute`): the body is not a single bare
+		// magnitude, so decode the whole multi-field body up front. A trailing
+		// unitless number resolves via the qualifier's low field (x.Unit) —
+		// PostgreSQL's DecodeInterval `switch (range)` picks the same default
+		// field (datetime.c). AdjustIntervalForTypmod's range truncation is then
+		// applied below exactly as for the bare-magnitude case.
+		// unimplemented_feat #5(d-iv) complex-body-under-range.
+		var ok bool
+		months, days, micros, ok = parser.ParseIntervalBodyWithDefault(x.Value, x.Unit)
+		if !ok {
+			return Datum{}, &ExecError{Code: "22007", Pos: x.Pos(), Message: fmt.Sprintf("invalid interval count %q", x.Value)}
+		}
+	} else {
 		return Datum{}, &ExecError{Code: "22007", Pos: x.Pos(), Message: fmt.Sprintf("invalid interval count %q", x.Value)}
-	}
-	months, days, micros, ok := parser.IntervalUnitToParts(val, fval, x.Unit)
-	if !ok {
-		return Datum{}, &ExecError{Code: "0A000", Pos: x.Pos(), Message: fmt.Sprintf("interval unit %q is not supported in v0", x.Unit)}
 	}
 	// Form 1 `interval 'N' <unit>`: the trailing unit is an SQL typmod
 	// field that truncates the value to that field's granularity. For a range

@@ -1136,16 +1136,53 @@ to become aliases exactly as PG does. TPC-H uses only singular trailing units
 changed. `TestParseIntervalLiteral` was updated to pin the corrected semantics.
 
 Parse path only handles a **plain-magnitude** body (the set current Form-1
-already accepted); a complex body under a range (`interval '1 2:03:04' day to
-second`) stays deferred — it needs the `range` threaded into the shared
-`ParseIntervalBody` so a *trailing bare number inside a complex body* resolves
-its default field by range (the entangled part). Also still deferred: interval
-`±infinity`, and the leading-typmod cast form `CAST(... AS interval hour to
-minute)`. Tests: `interval_subday_test.go`
-`TestIntervalTypmodRangeAndPrecision` (25 accepts + 5 range-syntax rejects,
-byte-for-byte vs live PG 18.3 on port 5599); parser
-`date_interval_test.go` `TestParseIntervalLiteral`. Gates: `go build`/`go vet`
-clean; parser + analyzer + planner + executor suites PASS;
+already accepted); a complex body under a range stays deferred — see the next
+Follow-up section, which closes the trailing-bare-number half of it.
+
+## Follow-up (2026-07-11): complex interval body under a range (#5(d-iv))
+
+Closes the trailing-bare-number half of the prior section's deferred
+"complex-body-under-range" item. A multi-field Form-1 body whose **final field is
+a unitless number** now decodes, with that number resolving via the range's low
+field — verified byte-for-byte vs live PG 18.3:
+
+- `interval '1 day 5' hour to minute` → `1 day 00:05:00` (the `5` is a MINUTE)
+- `interval '1 day 5' day to hour` → `1 day 05:00:00` (the `5` is an HOUR)
+- `interval '2 hour 5' hour to minute` → `02:05:00`
+- `interval '1 day 90' minute to second` → `1 day 00:01:30`
+- `interval '1 day 1.5' hour to minute` → `1 day 00:01:00` (decode to 90s, then
+  range-truncate to the minute)
+- `interval '1 mon 2 day 5' hour to minute` → `1 mon 2 days 00:05:00`
+- `interval '-1 day 5' hour to minute` → `-1 days +00:05:00`
+- `interval '1 day 5' minute to second(0)` → `1 day 00:00:05`
+
+**How.** PostgreSQL's `DecodeInterval` resolves the rightmost unmarked number via
+its typmod `range` switch (datetime.c ~L3604), and that default field is exactly
+the range's **low field** (HOUR TO MINUTE → MINUTE, DAY TO HOUR → HOUR, …). The
+shared body tokenizer `parser.ParseIntervalBody` hardcoded SECOND as that
+default; a new `parser.ParseIntervalBodyWithDefault(body, defaultUnit)` threads
+the field through to `decodeIntervalFields`'s trailing-unitless branch (which now
+uses `IntervalUnitToParts(val,fval,defaultUnit)` + `intervalUnitMask(defaultUnit,
+…)` in place of the SECOND literals). `ParseIntervalBody(body)` delegates with
+`"second"`, so the sibling `::interval`/CAST and Form-2 full-range paths are
+byte-identical (guarded by `TestParseIntervalBodySingleFieldMatchesUnitToParts`).
+`evalIntervalLit` (executor `expr.go`) now routes a Qualified literal whose body
+is *not* a bare magnitude through `ParseIntervalBodyWithDefault(x.Value,
+x.Unit)`; the existing `truncIntervalToUnit`/`roundIntervalMicrosToPrec` range
+truncation then runs unchanged — confirmed to match `AdjustIntervalForTypmod`,
+which for HOUR..SECOND ranges only truncates `interval->time` and keeps the
+higher-order day/month fields.
+
+**Still deferred.** A bare number to the **left** of a time or year-month word
+(`interval '1 2:03:04' day to second` = `1 day 02:03:04`, the `1` taking DAY via
+PG's right-to-left carry) is *not* handled — goopg's left-to-right
+`decodeIntervalFields` rejects a non-final bare magnitude, and this pre-exists at
+full range too (`interval '1 2:03:04'` also errors), so it is not range-specific.
+Also still deferred: interval `±infinity`, and the leading-typmod cast form
+`CAST(... AS interval hour to minute)` / `interval(p) '...'`. Tests:
+`interval_subday_test.go` `TestIntervalTypmodRangeAndPrecision` (+11 complex-body
+accepts, +1 deferred-leftward-carry reject, byte-for-byte vs live PG 18.3). Gates:
+`go build`/`go vet` clean; parser + planner + executor suites PASS;
 `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke via pre-commit hook.
 
 ## Cross-references

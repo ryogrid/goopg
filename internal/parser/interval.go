@@ -763,8 +763,32 @@ func splitSignedTZTrailer(body string) (pre, rest string, ok bool) {
 // practice card warns must not diverge).
 //
 // Returns ok=false for any body that neither decoder accepts.
+//
+// The default field for a trailing unitless number is SECOND, matching
+// PostgreSQL's full-range typmod. A caller that knows the interval's SQL typmod
+// range (`interval '1 day 5' hour to minute`) must instead use
+// ParseIntervalBodyWithDefault so the bare number resolves via the range's low
+// field (unimplemented_feat #5(d-iv) complex-body-under-range).
 func ParseIntervalBody(body string) (months, days int32, micros int64, ok bool) {
-	if mo, d, mu, fok := decodeIntervalFields(body); fok {
+	return ParseIntervalBodyWithDefault(body, "second")
+}
+
+// ParseIntervalBodyWithDefault is ParseIntervalBody with an explicit default
+// field for a trailing unitless number. PostgreSQL's DecodeInterval resolves the
+// rightmost unmarked number via the typmod `range` switch (datetime.c ~L3604):
+// the default type equals the range's LOW field (HOUR TO MINUTE → MINUTE, DAY TO
+// HOUR → HOUR, …), falling through to SECOND for the default full-range typmod.
+// So a range's low field is exactly the default unit to feed here; a full-range
+// body passes "second". The ISO 8601 fallback is unaffected — every ISO field
+// carries an explicit designator, so no range default ever applies there
+// (PostgreSQL's DecodeISO8601Interval takes no range argument).
+//
+// This is the single tokenizer shared by the parser's Form-2 typed-literal
+// path (full range) and the executor's `::interval` / CAST path (full range) as
+// well as the Form-1 typmod-qualified path (low-field default); the sibling
+// paths the practice card warns must not diverge all funnel through here.
+func ParseIntervalBodyWithDefault(body, defaultUnit string) (months, days int32, micros int64, ok bool) {
+	if mo, d, mu, fok := decodeIntervalFields(body, defaultUnit); fok {
 		return mo, d, mu, true
 	}
 	// PostgreSQL feeds the ORIGINAL (untrimmed) string to DecodeISO8601Interval,
@@ -1054,8 +1078,13 @@ func decodeISO8601Interval(str string) (months, days int32, micros int64, ok boo
 // explicit seconds unit occupies it, making the default-seconds field a
 // collision (`interval '1 day 05:00:00 5'` errors, matching PG).
 //
+// A trailing unitless number defaults to defaultUnit — SECOND for a full-range
+// body, or the SQL typmod range's low field when the caller carries one (e.g.
+// `interval '1 day 5' hour to minute` decodes the `5` as MINUTE); see
+// ParseIntervalBodyWithDefault and PostgreSQL's DecodeInterval `switch (range)`.
+//
 // Returns ok=false for any body that doesn't decompose cleanly.
-func decodeIntervalFields(body string) (months, days int32, micros int64, ok bool) {
+func decodeIntervalFields(body, defaultUnit string) (months, days int32, micros int64, ok bool) {
 	// Expand glued `<magnitude><unit>` fields (`2h30m`, `1.5h`, `1y2mon`) into
 	// separate tokens first, so the field loop below sees the same token stream
 	// whether the literal was written glued or spaced. expandIntervalFields
@@ -1159,16 +1188,15 @@ func decodeIntervalFields(body string) (months, days int32, micros int64, ok boo
 			consumedAny = true
 			continue
 		}
-		// Trailing unitless magnitude: default to SECONDS per PostgreSQL's
-		// full-range typmod. A collision with an already-occupied SECOND slot
-		// is a bad-format error, exactly as DecodeInterval's `tmask & fmask`
-		// check rejects it (a fractional value widens to imAllSecs).
-		m, d, mu, pok := IntervalUnitToParts(val, fval, "second")
-		secondMask := imSecond
-		if fval != 0 {
-			secondMask = imAllSecs
-		}
-		if !pok || !add(secondMask) {
+		// Trailing unitless magnitude: default to defaultUnit — SECOND for a
+		// full-range body, or the typmod range's low field when the caller
+		// supplied one (`interval '1 day 5' hour to minute` → the `5` is a
+		// MINUTE). A collision with an already-occupied slot for that field is a
+		// bad-format error, exactly as DecodeInterval's `tmask & fmask` check
+		// rejects it (a fractional SECOND value widens to imAllSecs, per
+		// intervalUnitMask).
+		m, d, mu, pok := IntervalUnitToParts(val, fval, defaultUnit)
+		if !pok || !add(intervalUnitMask(defaultUnit, fval != 0)) {
 			return 0, 0, 0, false
 		}
 		months += m
