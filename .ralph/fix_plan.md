@@ -3899,6 +3899,31 @@ mirroring M0119's ledger `status` column.
       `PgStat_TableXactStatus` per-transaction accumulator. Gates:
       catalog+executor full packages PASS; go build ./... clean;
       `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33).
+      **`pg_stat_bgwriter` + `pg_stat_archiver` done (2026-07-12, later
+      loop):** the two remaining unregistered *global* single-row cluster stat
+      views now resolve (previously unknown-relation errors). Both are
+      cluster-wide summaries (not per-object row sets), so they follow the
+      `pg_stat_wal`/`pg_stat_slru` precedent — a static `VirtualRows`
+      returning one honest row registered in `registerSystemTables`
+      (`internal/catalog/catalog.go`) right after `pg_stat_wal`, NO
+      per-connection executor twin, NO relation scoping. `pg_stat_bgwriter`
+      (OID 3406) uses the PG 17+ 4-col shape `buffers_clean/maxwritten_clean/
+      buffers_alloc/stats_reset` (checkpoint columns already split into the
+      earlier `pg_stat_checkpointer`); goopg's bgwriter
+      (`storage.Pool.WriteDirtyPages`) has no counter accumulator wired to
+      these columns, so all three are a faithful 0. `pg_stat_archiver` (OID
+      3407) uses the 7-col shape `archived_count/last_archived_wal/
+      last_archived_time/failed_count/last_failed_wal/last_failed_time/
+      stats_reset`; goopg has no WAL archiver (`archive_mode` unsupported), so
+      both counts are 0 and all four `last_*` cells NULL (`VirtualNull`) —
+      byte-identical to a real PG 18.3 cluster with `archive_mode=off`. Tests:
+      `internal/catalog/pgstat_global_test.go` +
+      `internal/executor/pgstat_global_e2e_test.go`. Design:
+      `docs/design/0122-0003-pg-stat-user-tables.md` new "Global cluster
+      views" section + README row. Ledger row (2026-07-12) records the missing
+      live bgwriter/archiver counter subsystems. Gates: catalog+executor full
+      packages PASS; go build ./... clean; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33).
 - [x] **M0122-0004 — SQL language / executor features** (~21). Window frame
       ROWS/RANGE/GROUPS, GROUPING SETS/ROLLUP/CUBE, DEFAULT-clause
       parsing, intervals. **WITH CHECK

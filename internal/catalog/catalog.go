@@ -8427,6 +8427,59 @@ func (c *InMemory) registerSystemTables() {
 	}
 	c.ns(DefaultDBOid).tables["pg_catalog.pg_stat_wal"] = pgStatWal
 
+	// pg_stat_bgwriter — exactly 1 row (a single global cluster-wide summary).
+	// Upstream `system_views.sql` (PG 17+, after the checkpointer columns split
+	// out into pg_stat_checkpointer): buffers_clean / maxwritten_clean /
+	// buffers_alloc / stats_reset. goopg has no live background-writer counter
+	// accumulator wired to these columns (the storage.Pool bgwriter runs but its
+	// clean-write / buffer-allocation activity is not attributed here), so — like
+	// pg_stat_wal above — every counter is a faithful 0 and stats_reset is the
+	// fixed boot timestamp. See docs/design/0122-0003-pg-stat-user-tables.md.
+	pgStatBgwriter := &Table{
+		Schema: "pg_catalog", Name: "pg_stat_bgwriter", Virtual: true,
+		Columns: []Column{
+			{Name: "buffers_clean", Type: Type{Name: "int8"}, Ordinal: 0},
+			{Name: "maxwritten_clean", Type: Type{Name: "int8"}, Ordinal: 1},
+			{Name: "buffers_alloc", Type: Type{Name: "int8"}, Ordinal: 2},
+			{Name: "stats_reset", Type: Type{Name: "timestamptz"}, Ordinal: 3},
+		},
+		OID: 3406,
+	}
+	pgStatBgwriter.VirtualRows = func() [][]string {
+		return [][]string{
+			{"0", "0", "0", "2026-01-01 00:00:00+00"},
+		}
+	}
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_stat_bgwriter"] = pgStatBgwriter
+
+	// pg_stat_archiver — exactly 1 row (a single global WAL-archiver summary).
+	// Upstream `system_views.sql` (from pg_stat_get_archiver()): archived_count /
+	// last_archived_wal / last_archived_time / failed_count / last_failed_wal /
+	// last_failed_time / stats_reset. goopg has no WAL archiver (archive_mode is
+	// unsupported), so on a fresh cluster the two counts are 0, both last_*
+	// WAL-name and last_* timestamp cells are NULL (never archived / never
+	// failed), and stats_reset is the fixed boot timestamp — matching a real PG
+	// 18.3 cluster with archive_mode=off out of the box.
+	pgStatArchiver := &Table{
+		Schema: "pg_catalog", Name: "pg_stat_archiver", Virtual: true,
+		Columns: []Column{
+			{Name: "archived_count", Type: Type{Name: "int8"}, Ordinal: 0},
+			{Name: "last_archived_wal", Type: Type{Name: "text"}, Ordinal: 1},
+			{Name: "last_archived_time", Type: Type{Name: "timestamptz"}, Ordinal: 2},
+			{Name: "failed_count", Type: Type{Name: "int8"}, Ordinal: 3},
+			{Name: "last_failed_wal", Type: Type{Name: "text"}, Ordinal: 4},
+			{Name: "last_failed_time", Type: Type{Name: "timestamptz"}, Ordinal: 5},
+			{Name: "stats_reset", Type: Type{Name: "timestamptz"}, Ordinal: 6},
+		},
+		OID: 3407,
+	}
+	pgStatArchiver.VirtualRows = func() [][]string {
+		return [][]string{
+			{"0", VirtualNull, VirtualNull, "0", VirtualNull, VirtualNull, "2026-01-01 00:00:00+00"},
+		}
+	}
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_stat_archiver"] = pgStatArchiver
+
 	// pg_stat_io — per-backend-type I/O statistics (PG 16+, OID 8061).
 	// The static VirtualRows fallback below returns no rows; the real,
 	// live row set (upstream's exact 79-row valid-combination shape, with

@@ -282,6 +282,47 @@ accumulator (`PgStat_TableXactStatus` analog) that folds into commit-time cumula
 stats — the same not-yet-built subsystem the cumulative views' non-identity columns
 wait on.
 
+## Global cluster views (`pg_stat_bgwriter` / `pg_stat_archiver`)
+
+Two of the remaining unregistered stat views are *global* single-row cluster
+summaries rather than per-object row sets, so they follow the simpler
+`pg_stat_wal`/`pg_stat_slru` precedent (a static `VirtualRows` returning one row
+with honest zeros/NULLs) — no per-connection executor twin, no relation scoping.
+
+`pg_stat_bgwriter` (PG 17+ shape, after the checkpoint columns split out into the
+already-registered `pg_stat_checkpointer`) carries four columns:
+
+```
+buffers_clean, maxwritten_clean, buffers_alloc, stats_reset
+```
+
+goopg runs a background writer (`storage.Pool`'s `WriteDirtyPages`) but has no
+counter accumulator attributing clean writes / buffer allocations to these
+columns, so — exactly like `pg_stat_wal` reports `wal_records = 0` despite goopg
+writing WAL — the three counters are a faithful `0` and `stats_reset` is the
+fixed boot timestamp (`2026-01-01 00:00:00+00`). OID 3406.
+
+`pg_stat_archiver` (from upstream `pg_stat_get_archiver()`) carries seven columns:
+
+```
+archived_count, last_archived_wal, last_archived_time,
+failed_count, last_failed_wal, last_failed_time, stats_reset
+```
+
+goopg has no WAL archiver (`archive_mode` is unsupported), so on a fresh cluster
+the two counts are `0`, both `last_archived_*` and `last_failed_*` cells are NULL
+(nothing has ever been archived or failed), and `stats_reset` is the fixed boot
+timestamp — matching a real PG 18.3 cluster with `archive_mode = off` out of the
+box. NULLs use the `catalog.VirtualNull` sentinel. OID 3407.
+
+Both are registered in `registerSystemTables` (`internal/catalog/catalog.go`)
+right after `pg_stat_wal`. Tests:
+`internal/catalog/pgstat_global_test.go` (`TestPGStatBgwriterViewRegistered`,
+`TestPGStatArchiverViewRegistered` — column shape + honest-0/NULL row) and
+`internal/executor/pgstat_global_e2e_test.go` (`TestPgStatBgwriterEndToEnd`,
+`TestPgStatArchiverEndToEnd` — full SELECT resolves the view). A live
+bgwriter/archiver counter subsystem is deferred (ledger).
+
 ## Deferred
 
 The scan/tuple/vacuum/analyze counters and `last_*` timestamps remain honest
