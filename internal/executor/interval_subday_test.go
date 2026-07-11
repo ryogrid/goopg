@@ -912,6 +912,13 @@ func TestIntervalTypmodRangeAndPrecision(t *testing.T) {
 		{"SELECT interval '1 day 5' hour to second", "1 day 00:00:05"},
 		{"SELECT interval '-1 day 5' hour to minute", "-1 days +00:05:00"},
 		{"SELECT interval '1 day 5' minute to second(0)", "1 day 00:00:05"},
+		// Bare number to the LEFT of a time word takes DAY via PG's right-to-left
+		// carry (unimplemented_feat #5(d-iv) leftward carry); the DAY assignment
+		// overrides the typmod range default, then range truncation applies.
+		{"SELECT interval '1 2:03:04' day to second", "1 day 02:03:04"},
+		{"SELECT interval '1 2:03:04' hour to minute", "1 day 02:03:00"},
+		{"SELECT interval '10 2:03:04' minute to second", "10 days 02:03:04"},
+		{"SELECT interval '5 2:03:04' second", "5 days 02:03:04"},
 		// Single field (existing behaviour, now via the same helper).
 		{"SELECT interval '5' second", "00:00:05"},
 		{"SELECT interval '5' minute", "00:05:00"},
@@ -950,14 +957,70 @@ func TestIntervalTypmodRangeAndPrecision(t *testing.T) {
 		"SELECT interval '5' second to minute FROM t",
 		"SELECT interval '5' minute to minute FROM t",
 		"SELECT interval '5' hour to hour FROM t",
-		// DEFERRED (unimplemented_feat #5(d-iv), ledger 2026-07-11): a bare number
-		// to the LEFT of a time/year-month word takes that field's carried type in
-		// PostgreSQL's right-to-left DecodeInterval (`interval '1 2:03:04' day to
-		// second` = 1 day 02:03:04, the `1` becoming DAY). goopg's left-to-right
-		// decodeIntervalFields rejects a non-final bare magnitude, so it errors here
-		// even at full range (`interval '1 2:03:04'` also errors) — this is not a
-		// range-specific gap. When leftward carry lands, move this to `accept`.
-		"SELECT interval '1 2:03:04' day to second FROM t",
+	}
+	for _, sql := range reject {
+		if _, err := runQueryErr(t, ctx, sql); err == nil {
+			t.Errorf("%s: expected error, got none", sql)
+		}
+	}
+}
+
+// TestIntervalLeftwardTimeCarry covers PostgreSQL's right-to-left DecodeInterval
+// type carry: a bare magnitude immediately to the LEFT of a time field takes
+// DTK_DAY (datetime.c L3549 for an unsigned DTK_TIME, L3587 for a signed DTK_TZ
+// with ':'), so `interval '1 2:03:04'` → 1 day 02:03:04. This carry runs in the
+// free-form decoder (bare `interval '…'` and `::interval`/CAST), independent of
+// any typmod range; TestIntervalTypmodRangeAndPrecision covers the range-qualified
+// forms where the DAY assignment overrides the range default. All accept/reject
+// results captured byte-for-byte from live PG 18.3 (port 5601).
+func TestIntervalLeftwardTimeCarry(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+	if err := runDDL(t, ctx, "CREATE TABLE t (id int)"); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	if err := runDDL(t, ctx, "INSERT INTO t VALUES (1)"); err != nil {
+		t.Fatalf("INSERT: %v", err)
+	}
+	accept := []struct{ sql, want string }{
+		// Bare integer/fraction/sign before an unsigned time word → DAY.
+		{"SELECT interval '1 2:03:04'", "1 day 02:03:04"},
+		{"SELECT interval '1.5 2:03:04'", "1 day 14:03:04"},
+		{"SELECT interval '-1 2:03:04'", "-1 days +02:03:04"},
+		{"SELECT interval '10 2:03:04'", "10 days 02:03:04"},
+		{"SELECT interval '1 2:03'", "1 day 02:03:00"},
+		{"SELECT interval '1 100:00:00'", "1 day 100:00:00"},
+		// Signed time word (DTK_TZ with ':'): still sets DAY for the number left.
+		{"SELECT interval '1 -2:03:04'", "1 day -02:03:04"},
+		// The time word discards a pending unit word to its right (absorb), and
+		// the number to the time's left still takes DAY.
+		{"SELECT interval '1 12:00 h'", "1 day 12:00:00"},
+		// Same carry via the ::interval / CAST sibling path.
+		{"SELECT '1 2:03:04'::interval", "1 day 02:03:04"},
+		{"SELECT CAST('1.5 2:03:04' AS interval)", "1 day 14:03:04"},
+	}
+	for _, c := range accept {
+		rows := runQuery(t, ctx, c.sql+" FROM t")
+		if len(rows) != 1 || len(rows[0]) != 1 {
+			t.Fatalf("%s: expected 1x1 result, got %v", c.sql, rows)
+		}
+		if got := rows[0][0].Format(); got != c.want {
+			t.Errorf("%s = %q, want %q", c.sql, got, c.want)
+		}
+	}
+
+	// PG rejects a SECOND bare number carried into the same slot (both DAY →
+	// tmask&fmask collision), a bare number left of a year-month field (forced
+	// DTK_MONTH collides with the number's MONTH), a trailing bare number after
+	// a time field (SECOND collides with the time's SECOND slot), and a
+	// day/hour pair whose HOUR collides with the time word's HOUR.
+	reject := []string{
+		"SELECT interval '1 2 2:03:04' FROM t",
+		"SELECT interval '1 day 2 2:03:04' FROM t",
+		"SELECT interval '1 hour 2 2:03:04' FROM t",
+		"SELECT interval '1 1-2' FROM t",
+		"SELECT interval '2:03:04 1' FROM t",
+		"SELECT '1 2 2:03:04'::interval FROM t",
 	}
 	for _, sql := range reject {
 		if _, err := runQueryErr(t, ctx, sql); err == nil {

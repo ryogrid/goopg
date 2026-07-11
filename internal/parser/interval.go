@@ -1172,9 +1172,36 @@ func decodeIntervalFields(body, defaultUnit string) (months, days int32, micros 
 		if i+1 < len(fields) {
 			unit, uok := canonicalIntervalUnit(fields[i+1])
 			if !uok {
-				// A non-final magnitude with no following unit word is the
-				// ambiguous type-carry case PostgreSQL rejects (a second bare
-				// number, or one preceding a `<num> <unit>` pair / time word).
+				// PostgreSQL reads the field list right-to-left, carrying a
+				// pending `type` for the next (leftward) bare number. After a
+				// DTK_TIME field — an unsigned `HH:MM[:SS]` word or a signed
+				// `[+-]HH:MM[:SS]` DTK_TZ token, both of which contain a ':' —
+				// DecodeInterval sets `type = DTK_DAY` (datetime.c L3549/L3587),
+				// so a bare magnitude immediately to the LEFT of a time field
+				// takes DAY: `interval '1 2:03:04'` → 1 day 02:03:04,
+				// `'1.5 2:03:04'` → 1 day 14:03:04, `'-1 2:03:04'` → -1 days
+				// +02:03:04. This DAY assignment overrides any typmod range
+				// default (`interval '10 2:03:04' minute to second` → 10 days
+				// 02:03:04, NOT 10 minutes), matching PG. The time field itself
+				// is decoded normally on the next iteration, so we do NOT
+				// consume fields[i+1] here — only stamp the DAY value + fmask
+				// bit (a second DAY, as in `interval '1 2 2:03:04'` or
+				// `'1 day 2 2:03:04'`, then collides and errors, exactly as PG's
+				// tmask&fmask check rejects it). Any OTHER non-unit successor —
+				// a second bare number, or a year-month field (whose forced
+				// DTK_MONTH type would collide with the number's own MONTH) — is
+				// the ambiguous type-carry case PostgreSQL rejects.
+				if strings.ContainsRune(fields[i+1], ':') {
+					m, d, mu, pok := IntervalUnitToParts(val, fval, "day")
+					if !pok || !add(intervalUnitMask("day", fval != 0)) {
+						return 0, 0, 0, false
+					}
+					months += m
+					days += d
+					micros += mu
+					consumedAny = true
+					continue
+				}
 				return 0, 0, 0, false
 			}
 			i++ // consume the unit word

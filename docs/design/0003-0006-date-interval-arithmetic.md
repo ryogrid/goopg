@@ -1185,6 +1185,52 @@ accepts, +1 deferred-leftward-carry reject, byte-for-byte vs live PG 18.3). Gate
 `go build`/`go vet` clean; parser + planner + executor suites PASS;
 `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke via pre-commit hook.
 
+## Follow-up (2026-07-11): leftward DAY carry before a time field (#5(d-iv))
+
+Closes the prior section's deferred **leftward-carry** item — the other half of a
+complex interval body. A bare magnitude immediately to the **left** of a time word
+now takes DAY, verified byte-for-byte vs live PG 18.3:
+
+- `interval '1 2:03:04'` → `1 day 02:03:04`
+- `interval '1.5 2:03:04'` → `1 day 14:03:04` (fractional day spills +12h)
+- `interval '-1 2:03:04'` → `-1 days +02:03:04`
+- `interval '1 -2:03:04'` → `1 day -02:03:04` (signed time word)
+- `interval '1 12:00 h'` → `1 day 12:00:00` (time word absorbs the trailing `h`)
+- `interval '1 2:03:04' day to second` → `1 day 02:03:04`
+- `interval '10 2:03:04' minute to second` → `10 days 02:03:04` — the DAY
+  assignment **overrides** the typmod range default (NOT 10 minutes)
+
+**PG mechanism (right-to-left `DecodeInterval`).** PostgreSQL reads the field list
+from the end, carrying a pending `type` for the next (leftward) bare number. After
+a `DTK_TIME` field (unsigned `HH:MM[:SS]`, datetime.c L3549) or a `DTK_TZ` token
+that contains a `:` (signed `[+-]HH:MM[:SS]`, L3587) it sets `type = DTK_DAY`, so a
+bare number to that field's left is a DAY. This DAY is independent of the typmod
+`range` (the range only supplies the default for a number with *no* time field to
+its right), which is why `interval '10 2:03:04' minute to second` is 10 *days*, not
+10 minutes.
+
+**How (goopg, left-to-right peephole).** goopg's `decodeIntervalFields`
+(`internal/parser/interval.go`) stays left-to-right. When a bare magnitude's
+successor field is not a unit word but **contains `:`** (the loop's own time-field
+test), the magnitude is stamped as DAY (`IntervalUnitToParts(val,fval,"day")` +
+`intervalUnitMask("day",…)`) and the time field itself is decoded normally on the
+next iteration — so a second DAY (`interval '1 2 2:03:04'`, `'1 day 2 2:03:04'`)
+collides via the existing `fmask` check and errors, exactly as PG's `tmask&fmask`
+rejects it. A bare number left of a year-month field still errors (its forced
+`DTK_MONTH` collides with the number's own MONTH — PG rejects it too), and a
+trailing bare number after a time field errors (SECOND vs the time's SECOND slot).
+Both sibling entry points (bare `interval '…'` via `evalIntervalLit`, and
+`::interval`/CAST via `parseIntervalCastString`) reach it through the shared
+`ParseIntervalBody`/`ParseIntervalBodyWithDefault`, so they stay in lock-step.
+
+**Still deferred.** interval `±infinity`, and the leading-typmod cast form
+`CAST(... AS interval hour to minute)` / `interval(p) '...'`. Tests:
+`interval_subday_test.go` new `TestIntervalLeftwardTimeCarry` (10 accepts + 6
+rejects, both sibling paths) and the moved `TestIntervalTypmodRangeAndPrecision`
+range cases. Gates: `go build`/`go vet` clean; parser + analyzer + planner +
+executor suites PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench
+smoke via pre-commit hook.
+
 ## Cross-references
 
 - TPC-H query bodies: HammerDB upstream
