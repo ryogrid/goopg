@@ -684,6 +684,58 @@ func TestPgSettingsPlannerTuningGUCs(t *testing.T) {
 	}
 }
 
+// TestPgSettingsObjectDefaultGUCs pins the three object-creation default GUCs
+// (default_table_access_method / default_tablespace / default_toast_compression)
+// in the pg_settings virtual view. pg_dump/pg_restore emit `SET
+// default_tablespace`/`default_table_access_method` before every CREATE TABLE,
+// and pg_settings-reading tooling expects the rows present with PG's byte-exact
+// category/vartype/boot_val. M0122-0007 follow-up.
+func TestPgSettingsObjectDefaultGUCs(t *testing.T) {
+	c := NewInMemory()
+	tbl, ok := c.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_settings"})
+	if !ok || tbl.VirtualRows == nil {
+		t.Fatal("pg_settings virtual table not registered")
+	}
+	byName := map[string][]string{}
+	for _, row := range tbl.VirtualRows() {
+		byName[row[0]] = row
+	}
+	want := []struct {
+		name, setting, category, vartype string
+	}{
+		{"default_table_access_method", "heap", "Client Connection Defaults / Statement Behavior", "string"},
+		{"default_tablespace", "", "Client Connection Defaults / Statement Behavior", "string"},
+		{"default_toast_compression", "pglz", "Client Connection Defaults / Statement Behavior", "enum"},
+	}
+	for _, w := range want {
+		row, ok := byName[w.name]
+		if !ok {
+			t.Errorf("pg_settings missing GUC %q", w.name)
+			continue
+		}
+		if row[1] != w.setting {
+			t.Errorf("%s: setting = %q, want %q", w.name, row[1], w.setting)
+		}
+		if row[3] != w.category {
+			t.Errorf("%s: category = %q, want %q", w.name, row[3], w.category)
+		}
+		if row[7] != w.vartype {
+			t.Errorf("%s: vartype = %q, want %q", w.name, row[7], w.vartype)
+		}
+		if row[12] != w.setting {
+			t.Errorf("%s: boot_val = %q, want %q (== setting at default source)", w.name, row[12], w.setting)
+		}
+		if row[8] != "default" {
+			t.Errorf("%s: source = %q, want %q", w.name, row[8], "default")
+		}
+	}
+	// default_toast_compression is the only enum here; its enumvals must render
+	// the PG `{pglz,lz4}` set (--with-lz4 reference build; column 11).
+	if row := byName["default_toast_compression"]; row != nil && row[11] != "{pglz,lz4}" {
+		t.Errorf("default_toast_compression: enumvals = %q, want %q", row[11], "{pglz,lz4}")
+	}
+}
+
 // TestVerboseIntervalOffset pins the postgres_verbose interval rendering used
 // by the timezone system views. pg_regress forces intervalstyle=
 // postgres_verbose, so the LMT row must read "@ 7 hours 52 mins 58 secs ago".

@@ -292,6 +292,9 @@
                                         # read uncommitted | read committed |
                                         # repeatable read | serializable
 #default_transaction_read_only = off
+#default_table_access_method = 'heap'   # accepted; goopg only implements heap
+#default_tablespace = ''                # accepted; goopg has no real tablespaces
+#default_toast_compression = 'pglz'     # pglz | lz4; accepted, column default not GUC-driven
 #transaction_isolation = 'read committed'   # current-transaction read-only;
                                             # SHOW only
 #application_name = ''                  # session label echoed in pg_stat_activity

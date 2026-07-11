@@ -10137,6 +10137,25 @@ func (c *InMemory) registerSystemTables() {
 			{"recursive_worktable_factor", "10", "", "Query Tuning / Other Planner Options",
 				"Sets the planner's estimate of the average size of a recursive query's working table.", "",
 				"user", "real", "default", "0.001", "1000000", "", "10", "10", "", "", "f"},
+			// Object-creation default GUCs (CLIENT_CONN_STATEMENT). Registered in
+			// internal/config/defaults.go so SET/SHOW succeed (pg_dump/pg_restore
+			// emit `SET default_tablespace`/`default_table_access_method` before
+			// every CREATE TABLE); surfaced here so pg_settings-reading tooling
+			// finds them too. goopg only implements the heap access method, has no
+			// real tablespaces, and uses its own built-in TOAST default — pure
+			// stubs. Names, defaults, category, short_desc, and enumvals are
+			// byte-for-byte from guc_tables.c; the toast enum matches the reference
+			// PG 18.3 build's --with-lz4. M0122-0007 follow-up.
+			{"default_table_access_method", "heap", "", "Client Connection Defaults / Statement Behavior",
+				"Sets the default table access method for new tables.", "",
+				"user", "string", "default", "", "", "", "heap", "heap", "", "", "f"},
+			{"default_tablespace", "", "", "Client Connection Defaults / Statement Behavior",
+				"Sets the default tablespace to create tables and indexes in.",
+				"An empty string means use the database's default tablespace.",
+				"user", "string", "default", "", "", "", "", "", "", "", "f"},
+			{"default_toast_compression", "pglz", "", "Client Connection Defaults / Statement Behavior",
+				"Sets the default compression method for compressible values.", "",
+				"user", "enum", "default", "", "", "{pglz,lz4}", "pglz", "pglz", "", "", "f"},
 		}
 		// PostgreSQL's pg_settings view is backed by the alphabetically
 		// sorted GUC table, so callers that query it without ORDER BY (e.g.

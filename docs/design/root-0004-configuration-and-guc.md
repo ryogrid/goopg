@@ -448,3 +448,51 @@ context/`SET`-acceptance for all ten) and `TestGeqoTuningGUCBoundsEnforced`
 rows' `setting`/`category`/`vartype`/`boot_val`/`source`/enumvals. Gates:
 `go build ./...`/`go vet ./internal/config/... ./internal/catalog/...`
 clean; `go test ./internal/config/... ./internal/catalog/...` PASS.
+
+## Follow-up: object-creation default GUC stubs (2026-07-12, M0122-0007)
+
+`pg_dump`/`pg_restore` emit a fixed SET preamble before every `CREATE TABLE`
+section:
+
+```
+SET default_tablespace = '';
+SET default_table_access_method = heap;
+```
+
+plus `SET default_toast_compression = 'pglz';` when a column carries a
+non-default compression method. None of these three GUCs
+(`CLIENT_CONN_STATEMENT`, all `PGC_USERSET` in
+`postgres/src/backend/utils/misc/guc_tables.c`) were registered in goopg, so
+replaying a real-PG dump aborted at the first such line with
+`unrecognized configuration parameter`. Registered them as accepted stubs in
+`internal/config/defaults.go` and surfaced them in the hand-curated
+`pg_settings` list (`internal/catalog/catalog.go`), plus
+`internal/config/postgresql.conf.sample` (the `TestSampleConfigCoversRegistry`
+invariant requires every registered GUC there):
+
+- **`default_table_access_method`** — string, boot `heap`
+  (`DEFAULT_TABLE_ACCESS_METHOD`, `access/tableam.h`).
+- **`default_tablespace`** — string, boot `''`.
+- **`default_toast_compression`** — enum `{pglz,lz4}`, boot `pglz`
+  (`TOAST_PGLZ_COMPRESSION`, `access/toast_compression.h`); the `lz4` option
+  matches the reference PG 18.3 `--with-lz4` build and goopg's existing
+  column-level `COMPRESSION lz4` support.
+
+**Behavioral scope (deferred, ledgered):** these are compatibility stubs.
+goopg only implements the `heap` access method, has no real tablespaces, and
+chooses a column's TOAST compression from its own built-in default rather than
+consulting `default_toast_compression`. So a `SET` to the boot value is a true
+no-op and a non-default value is accepted and ignored — the same
+accepted-and-ignored contract as the `enable_*`/GEQO planner stubs. The enum
+*domain* is still enforced (`SET default_toast_compression = 'zstd'` errors),
+matching upstream. Verified end-to-end against the real `cmd/goopg` binary over
+the wire: the three pg_dump-preamble `SET`s all succeed, `SHOW` and
+`pg_settings` report them, `SET ... = 'lz4'` moves the value, and the invalid
+`'zstd'` is rejected.
+
+Tests: `TestObjectDefaultGUCStubs` + `TestObjectDefaultGUCValuesAccepted`
+(`internal/config/object_default_guc_stubs_test.go`);
+`TestPgSettingsObjectDefaultGUCs` (`internal/catalog/catalog_test.go`);
+`TestSampleConfigCoversRegistry` (unchanged, now covers the three new names).
+Gates: `go build ./...` clean; `go test ./internal/config/...
+./internal/catalog/...` PASS; live server SET/SHOW/pg_settings smoke.

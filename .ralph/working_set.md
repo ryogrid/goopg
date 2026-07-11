@@ -1,41 +1,41 @@
 (idle — nothing in flight)
 
-## Loop summary (2026-07-12, loop #66)
+## Loop summary (2026-07-12, loop #68)
 
-**Nightly triage:** action-items batch `20260711-011536` (same as #58–#65) —
+**Nightly triage:** action-items batch `20260711-011536` (same as #58–#67) —
 all 3 AI items already `[x]` in M-NIGHTLY. No new nightly work.
 
-**Task — M0122-0004 follow-up: RANGE interval-offset sign matches PG.**
-The working_set candidate "RANGE window value-offset — only interval-sign edge
-deferred" (deferral-ledger row 716 item 2). `rangeOffsetNegative`
-(internal/executor/operators_window.go) rejected an interval RANGE offset when
-ANY component was negative (`months<0||days<0||micros<0`); PG's
-`in_range_interval_interval` (timestamp.c) instead uses `interval_sign(offset)<0`
-= sign of the linear span `time_micros + (months*30+days)*USECS_PER_DAY`
-(interval_cmp_value). So `INTERVAL '1 mon -10 days'` (+20-day span) was wrongly
-`22013`-rejected. Fixed via the same overflow-safe day/frac decomposition
-`compareDatum` already uses for interval ordering (sign = sign(days) if days≠0
-else sign(frac)); ±infinity sentinels handled (NOEND +, NOBEGIN −).
+**Task — M0122-0007 (object-creation default GUC stubs).** pg_dump/pg_restore
+emit a fixed SET preamble before every CREATE TABLE (`SET default_tablespace =
+'';`, `SET default_table_access_method = heap;`, and `SET
+default_toast_compression = 'pglz';` for non-default column compression) — but
+none of these three CLIENT_CONN_STATEMENT/PGC_USERSET GUCs were registered, so
+replaying a real-PG dump aborted with "unrecognized configuration parameter".
+Registered all three as accepted stubs.
 
-Landed:
-- internal/executor/operators_window.go: rewrote `rangeOffsetNegative` KindInterval arm.
-- internal/executor/window_compat_test.go: `TestRangeOffsetNegativeIntervalSign`
-  (10 sign cases incl. the +20-day mixed-sign edge and span-exactly-0).
-- docs/design/0122-0004-range-offset-window-frame.md: new Follow-up section
-  (moved item out of Deferred). docs/design/README.md row note updated.
-- .ralph/deferral_ledger.md: appended `resolved` row (row 716 item 2 closed;
-  item 1 — per-type in_range parse-time 0A000 catalog — still open).
-- .ralph/fix_plan.md: M0122-0004 bucket dated closure note.
+Landed (files):
+- internal/config/defaults.go: 3 GUCs (default_table_access_method string/heap,
+  default_tablespace string/'', default_toast_compression enum {pglz,lz4}/pglz).
+- internal/config/postgresql.conf.sample: 3 entries (TestSampleConfigCoversRegistry).
+- internal/catalog/catalog.go: 3 pg_settings literal rows (winning VirtualRows list).
+- internal/config/object_default_guc_stubs_test.go (new); catalog_test.go
+  TestPgSettingsObjectDefaultGUCs (new).
+- docs/design/root-0004-configuration-and-guc.md new section; .ralph/fix_plan.md
+  done-note under M0122-0007; deferral_ledger.md row (behavioral no-op:
+  goopg ignores the values at CREATE TABLE — heap-only AM, no tablespaces,
+  built-in TOAST default).
 
-Gates: go build ./... clean; executor Window/Interval/Range/Frame tests PASS;
-tpch-spotcheck PASS (Q12=2/Q13=33); ralph-state-guard consistent (auto-repaired
-prev clean-exit marker). gofmt: my new lines clean; a pre-existing
-compareSortDatums comment diff (go1.25 vs local 1.26.3) left untouched per rule.
+Gates: go build ./... clean; go vet config+catalog clean; config+catalog tests
+PASS; end-to-end wire smoke vs cmd/goopg (all 3 SETs succeed, SHOW/pg_settings
+report, ='lz4' moves, 'zstd' rejected); ralph-state-guard consistent (repaired
+prev clean-exit marker); pgbench smoke via pre-commit hook (see commit).
 
-Next-loop candidates (open, bounded-ish):
-- M0122-0004 remaining: general frame-clause combining forms; per-type in_range
-  parse-time 0A000 catalog (ledger row 716 item 1) — cross-cutting.
-- pg_get_expr stub entry (if any) — already functional pass-through; bookkeeping.
-- ALTER DOMAIN SET SCHEMA: LARGE — no Domain.Schema field.
+Next-loop candidates (genuinely open, larger):
+- M0122-0006 On-disk catalog persistence (persistent pg_index heap).
+- ALTER DOMAIN SET SCHEMA — BLOCKED: domains (and all user types: enum/composite)
+  hardcode typnamespace=public; needs broad "namespace-scope user types" feature,
+  NOT a one-loop task. Avoid until that infra exists.
+- More missing GUC families (autovacuum ~22, log_* ~40, vacuum cost) — bounded
+  per-family, low value/risk.
 
 In-flight: none

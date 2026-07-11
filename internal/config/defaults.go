@@ -111,6 +111,35 @@ func BuildDefaultRegistry() *Registry {
 		Context:     ContextUserset,
 		Scope:       ScopeSession | ScopeTransaction,
 	}))
+	// Object-creation default GUCs (CLIENT_CONN_STATEMENT). pg_dump/pg_restore
+	// emit `SET default_tablespace = '';` and `SET default_table_access_method
+	// = heap;` before every CREATE TABLE section (and `SET
+	// default_toast_compression = 'pglz';` when a column carries non-default
+	// compression), so an unregistered name aborted a real-PG dump replay on
+	// goopg with "unrecognized configuration parameter". Register them as
+	// accepted stubs: goopg only implements the heap access method and uses its
+	// own built-in TOAST default, and has no real tablespaces, so a SET to the
+	// default value is a true no-op and a non-default value is accepted and
+	// ignored (behavioral no-op ledgered, same as the enable_*/geqo stubs).
+	// Names, contexts, and boot values mirror
+	// postgres/src/backend/utils/misc/guc_tables.c (CLIENT_CONN_STATEMENT, all
+	// PGC_USERSET); DEFAULT_TABLE_ACCESS_METHOD ("heap", tableam.h) and
+	// TOAST_PGLZ_COMPRESSION ("pglz", toast_compression.h) supply the defaults;
+	// the toast enum options match the reference PG 18.3 build's --with-lz4.
+	// M0122-0007.
+	r.MustRegister(NewVariable(Variable{
+		Name: "default_table_access_method", Type: TypeString, BootVal: "heap",
+		Context: ContextUserset, Scope: ScopeSession | ScopeTransaction,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "default_tablespace", Type: TypeString, BootVal: "",
+		Context: ContextUserset, Scope: ScopeSession | ScopeTransaction,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "default_toast_compression", Type: TypeEnum, BootVal: "pglz",
+		EnumOptions: []string{"pglz", "lz4"},
+		Context:     ContextUserset, Scope: ScopeSession | ScopeTransaction,
+	}))
 	// SSI predicate-lock sizing (M0104-0003). Names, defaults, and
 	// ranges mirror postgres/src/backend/utils/misc/guc_tables.c so
 	// existing tooling (postgresql.conf templates, parameter probes,

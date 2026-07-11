@@ -8388,6 +8388,37 @@ mirroring M0119's ledger `status` column.
       "`pg_settings` surfacing" subsection. Gates: `go build ./...` clean;
       `go vet`/`go test ./internal/catalog/... ./internal/config/...` PASS;
       pgbench smoke via pre-commit hook.
+      **Object-creation default GUC stubs — DONE (2026-07-12, this loop):**
+      `pg_dump`/`pg_restore` emit a fixed SET preamble before every
+      `CREATE TABLE` section — `SET default_tablespace = '';` and
+      `SET default_table_access_method = heap;` (plus
+      `SET default_toast_compression = 'pglz';` for non-default column
+      compression) — but none of these three GUCs were registered, so
+      replaying a real-PG dump on goopg aborted at the first such line with
+      `unrecognized configuration parameter`. Registered all three
+      (`CLIENT_CONN_STATEMENT` / `PGC_USERSET`) in
+      `internal/config/defaults.go`: `default_table_access_method` (string,
+      boot `heap`), `default_tablespace` (string, boot `''`),
+      `default_toast_compression` (enum `{pglz,lz4}`, boot `pglz` — `lz4`
+      matches the reference `--with-lz4` build). Added matching
+      `postgresql.conf.sample` entries (`TestSampleConfigCoversRegistry`
+      invariant) and `pg_catalog.pg_settings` literal rows
+      (`internal/catalog/catalog.go`). Behavioral no-op ledgered: goopg only
+      implements the heap AM, has no real tablespaces, and picks a column's
+      TOAST compression from its own default rather than consulting the GUC,
+      so a non-default SET is accepted-and-ignored (enum domain still
+      enforced — `SET default_toast_compression='zstd'` errors). Verified
+      end-to-end over the wire against `cmd/goopg`: the three pg_dump-preamble
+      SETs succeed, `SHOW`/`pg_settings` report them, `='lz4'` moves the
+      value, `'zstd'` rejected. Tests:
+      `internal/config/object_default_guc_stubs_test.go`
+      (`TestObjectDefaultGUCStubs`, `TestObjectDefaultGUCValuesAccepted`);
+      `internal/catalog/catalog_test.go` `TestPgSettingsObjectDefaultGUCs`.
+      Design: `docs/design/root-0004-configuration-and-guc.md` new
+      "object-creation default GUC stubs" section. Gates: `go build ./...`
+      clean; `go test ./internal/config/... ./internal/catalog/...` PASS;
+      live server SET/SHOW/pg_settings smoke; pgbench smoke via pre-commit
+      hook.
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,
