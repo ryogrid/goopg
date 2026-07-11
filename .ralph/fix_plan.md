@@ -8177,6 +8177,30 @@ mirroring M0119's ledger `status` column.
       (Q12=2/Q13=33); pgbench (hook). Still deferred: `timestamp ± interval
       'infinity'` (infinite-timestamp carrier), `interval(p) '<lit>'`
       leading-precision typed-literal grammar.
+  - [x] `unimplemented_feat #5(d-iv) (leading-precision interval literal)`
+      (2026-07-11, this loop) — closed the prior row's deferred item (2). The
+      leading-precision typed literal `interval(p) '<lit>'` (PG grammar
+      `ConstInterval '(' Iconst ')' Sconst`, precision paren BEFORE the string)
+      now applies the fractional-seconds precision; previously a parse error (the
+      `interval` primary-expr case required `peek(1)` to be a string, so
+      `interval ( … )` became a bare identifier). PG packs a FULL-range typmod
+      with precision `p`, so NO field is truncated — only sub-second digits round
+      (a bare magnitude defaults to seconds): `interval(2) '90'`=`00:01:30`,
+      `interval(2) '1 day 2:03:04.56789'`=`1 day 02:03:04.57` (day kept),
+      `interval(2) '1.23456789'`=`00:00:01.23`, `interval(0) '1.6'`=`00:00:02`.
+      Parser (`internal/parser/select.go`, `parsePrimaryExpr` interval case): a
+      lookahead `interval ( <int> ) '<str>'` builds `IntervalLit{Value:body,
+      Unit:"second", Qualified:true, HasPrec:true, Prec:p}` — modelling full range
+      as `Unit="second"` so the existing `truncIntervalToUnit("second")` no-op
+      keeps every field while `roundIntervalMicrosToPrec` still rounds; >6 clamps
+      to 6 silently. NO executor change (reuses `evalIntervalLit`'s tested
+      Qualified path — same helpers as the trailing `SECOND(p)` and cast-typmod
+      forms, cannot drift). All `want` byte-for-byte from live PG 18.3. Test:
+      `interval_subday_test.go` `TestIntervalTypmodRangeAndPrecision` (+10 rows).
+      Design doc `docs/design/0003-0006-*` Follow-up. Gates: build/vet clean;
+      parser + executor interval suites PASS; pgbench (hook). Still deferred (the
+      LAST open #5(d-iv) sub-item): `timestamp ± interval 'infinity'`
+      (infinite-timestamp carrier).
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,

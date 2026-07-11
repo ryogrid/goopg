@@ -3021,6 +3021,39 @@ func (p *parser) tryTypedLiteral() (Expr, bool) {
 		strTok := p.advance()
 		return &TypedStringLit{pos: t.Pos, Type: name, Value: strTok.Value}, true
 	case "interval":
+		// Leading-precision form `interval ( p ) '<lit>'` (PG grammar
+		// ConstInterval '(' Iconst ')' Sconst): the precision paren precedes
+		// the string. It packs a FULL-range typmod with only a fractional-
+		// seconds precision p — the body is parsed with the default (seconds)
+		// unit and NO field is truncated; only sub-second digits beyond p are
+		// rounded (AdjustIntervalForTypmod, full range). Modelled with
+		// Unit="second" so the no-op SECOND truncation leaves every field
+		// intact while the precision arm still rounds. unimplemented_feat
+		// #5(d-iv).
+		if p.peek(1).Kind == TokenSymbol && p.peek(1).Value == "(" {
+			numTok := p.peek(2)
+			closeTok := p.peek(3)
+			strTok := p.peek(4)
+			if numTok.Kind == TokenIntLit && closeTok.Kind == TokenSymbol &&
+				closeTok.Value == ")" && strTok.Kind == TokenStringLit {
+				if prec, cerr := strconv.Atoi(numTok.Value); cerr == nil && prec >= 0 {
+					// PostgreSQL clamps precision above MAX_INTERVAL_PRECISION
+					// (6) to 6 with a warning (intervaltypmodin); clamp silently.
+					if prec > 6 {
+						prec = 6
+					}
+					p.advance() // INTERVAL
+					p.advance() // (
+					p.advance() // p
+					p.advance() // )
+					p.advance() // string literal
+					return &IntervalLit{pos: t.Pos, Value: strTok.Value, Unit: "second",
+						Qualified: true, HasPrec: true, Prec: prec}, true
+				}
+			}
+			// `interval (` that is not a valid `( p ) 'lit'` is not a literal.
+			return nil, false
+		}
 		next := p.peek(1)
 		if next.Kind != TokenStringLit {
 			return nil, false

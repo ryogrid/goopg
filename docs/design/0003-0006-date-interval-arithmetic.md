@@ -1523,6 +1523,44 @@ typed-literal grammar. Gates: `go build`/`go vet` clean; parser + full
 executor/planner suites PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
 pgbench smoke via pre-commit hook.
 
+## Follow-up (2026-07-11): leading-precision interval literal (#5(d-iv))
+
+Closed the `interval(p) '<lit>'` *leading-precision typed literal* deferred just
+above (PG grammar `ConstInterval '(' Iconst ')' Sconst` — the precision paren
+precedes the string, distinguishing it from the trailing `SECOND(p)` qualifier
+and from a cast). Previously a **parse error**: the `interval` primary-expression
+case required `peek(1)` to be a string literal, so `interval ( … )` fell through
+to being treated as a bare identifier.
+
+**Semantics — full range, precision only.** PG builds a `INTERVAL_FULL_RANGE`
+typmod with precision `p`, so `AdjustIntervalForTypmod` truncates **no** field —
+it only rounds the fractional seconds to `p` digits. A bare magnitude defaults to
+seconds. Thus `interval(2) '90'` = `00:01:30` (90 s normalised, nothing
+truncated), `interval(2) '1 day 2:03:04.56789'` = `1 day 02:03:04.57` (the day is
+kept, unlike a trailing field qualifier), `interval(2) '1.23456789'` =
+`00:00:01.23`, `interval(0) '1.6'` = `00:00:02` (round-half-away).
+
+**Encoding — no executor change.** The parser (`internal/parser/select.go`,
+`parsePrimaryExpr` interval case) uses a lookahead on `interval ( <int> ) '<str>'`
+and builds `IntervalLit{Value: body, Unit: "second", Qualified: true, HasPrec:
+true, Prec: p}`. Modelling the full range as `Unit="second"` makes the existing
+`truncIntervalToUnit("second")` a no-op (its `default` arm drops nothing and keeps
+every field the body set), while the existing `roundIntervalMicrosToPrec`
+precision arm still rounds — so the whole thing reuses `evalIntervalLit`'s
+already-tested `Qualified` path, the same helpers as the trailing `SECOND(p)` and
+cast-typmod forms (the three sibling paths therefore cannot drift). Precision > 6
+clamps to 6 silently (PG emits a warning but yields the same value).
+
+Verified byte-for-byte vs live PG 18.3 (initdb throwaway, socket /tmp:54399):
+the six representative cases above plus `interval(6) '1.23456789'`=`00:00:01.234568`
+and the `interval(9) …` clamp. Tests: `TestIntervalTypmodRangeAndPrecision`
+(`interval_subday_test.go`, +10 leading-precision accept rows).
+
+**Still deferred.** `timestamp ± interval 'infinity'` (needs an infinite-timestamp
+carrier) is now the **last** open #5(d-iv) sub-item — every interval-typmod /
+EXTRACT / infinity-literal / unary form is landed. Gates: `go build`/`go vet`
+clean; parser + executor interval suites PASS; pgbench smoke via pre-commit hook.
+
 ## Cross-references
 
 - TPC-H query bodies: HammerDB upstream

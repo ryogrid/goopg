@@ -1011,6 +1011,23 @@ func TestIntervalTypmodRangeAndPrecision(t *testing.T) {
 		{"SELECT interval '5' hours", "00:00:05"},
 		{"SELECT interval '5' millisecond", "00:00:05"},
 		{"SELECT interval '5' min", "00:00:05"},
+		// Leading-precision form `interval(p) '<lit>'` (PG grammar
+		// ConstInterval '(' Iconst ')' Sconst): FULL range, so NO field is
+		// truncated — only the fractional seconds round to p. A bare magnitude
+		// defaults to seconds.
+		{"SELECT interval(2) '1.23456789'", "00:00:01.23"},
+		{"SELECT interval(2) '-1.23456789'", "-00:00:01.23"},
+		{"SELECT interval(2) '1.999999'", "00:00:02"},
+		{"SELECT interval(0) '1.6'", "00:00:02"},
+		{"SELECT interval(2) '5'", "00:00:05"},
+		{"SELECT interval(2) '90'", "00:01:30"},
+		// Full range keeps every field the body sets (unlike a trailing field
+		// qualifier), rounding only the sub-second part.
+		{"SELECT interval(2) '1 day 2:03:04.56789'", "1 day 02:03:04.57"},
+		{"SELECT interval(2) '1 year 2 mons 3 days'", "1 year 2 mons 3 days"},
+		{"SELECT interval(6) '1.23456789'", "00:00:01.234568"},
+		// Precision above 6 clamps to 6.
+		{"SELECT interval(9) '1.23456789'", "00:00:01.234568"},
 	}
 	for _, c := range accept {
 		rows := runQuery(t, ctx, c.sql+" FROM t")
