@@ -3786,7 +3786,7 @@ mirroring M0119's ledger `status` column.
       ./internal/executor/... ./internal/planner/...` PASS (full EXPLAIN
       suite, no regressions); `scripts/tpch-spotcheck.sh` PASS (Q12=2/
       Q13=33).
-- [ ] **M0122-0004 — SQL language / executor features** (~21). Window frame
+- [x] **M0122-0004 — SQL language / executor features** (~21). Window frame
       ROWS/RANGE/GROUPS, GROUPING SETS/ROLLUP/CUBE, DEFAULT-clause
       parsing, intervals. **WITH CHECK
       OPTION removed from this bucket (2026-07-04, loop #14):** verify-before-
@@ -4330,9 +4330,35 @@ mirroring M0119's ledger `status` column.
       `TestAnalyzeWindowFrameRange{OffsetRejected,NonOffsetAccepted}`,
       `TestCompatWindowExplicitRangePeers`,
       `TestCompatWindowRangeUnboundedPrecedingCumulative`.
-      **Still open in this bucket:** RANGE with a value offset bound
-      (the only open window-frame item), sub-day intervals +
-      multi-component interval strings.
+      **BUCKET CLOSED (2026-07-12, loop #67, verify-before-implement):** the
+      two items the prior "Still open" note listed are BOTH resolved, so
+      M0122-0004 is now fully closed and the checkbox is flipped to `[x]`.
+      (A) RANGE with a value offset bound: resolved 2026-07-11 by
+      `frameBoundsRange` (`internal/executor/operators_window.go`, PG
+      `in_range` semantics; analyzer requires exactly one ORDER BY column,
+      42P20) and further refined 2026-07-12 (loop #66) by the
+      `rangeOffsetNegative` interval-sign fix (`interval_sign`-based span,
+      commit b7bdb819). (B) sub-day intervals + multi-component interval
+      strings: resolved by the sub-day microsecond `KindInterval` carrier
+      (`Datum.IntervalMicrosValue`, 2026-07-11) plus the multi-field / HH:MM:SS
+      tokenizer (`internal/parser/interval.go` `ParseIntervalBody`, commit
+      fda418cf and follow-ups) — `INTERVAL '1 day 05:30:00'` now parses and
+      renders as `1 day 05:30:00`. Every other named scope item (all 11 window
+      functions, all three frame modes ROWS/RANGE/GROUPS + EXCLUDE, named
+      windows, combining forms `OVER (win ORDER BY …)`, GROUPING SETS/
+      ROLLUP/CUBE, DEFAULT-clause, coarse/single-letter/typmod/±infinity
+      interval forms, BETWEEN SYMMETRIC, ANY/SOME/ALL) is landed and
+      byte-for-byte PG-18.3-verified; `unimplemented_feat.json`'s window +
+      interval entries are all marked `RESOLVED` and a sweep of its
+      `confirmed-open` audits finds zero remaining SQL-language items in this
+      bucket. Verification this loop: `go build ./...` clean;
+      `go test ./internal/parser/... ./internal/analyzer/...` PASS; 56
+      `CompatWindow|Interval|GroupingSets|RangeOffset` executor tests PASS
+      (incl. `TestCompatWindowCombiningForms`,
+      `TestCompatWindowExplicitGroupsFrameSliding`,
+      `TestRangeOffsetNegativeIntervalSign`, `TestMultiFieldIntervalLiterals`);
+      throwaway probe confirmed `RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING`
+      (x=1→3, 2→6, 3→5, 5→5) and `INTERVAL '1 day 05:30:00'` end-to-end.
 - [x] **M0122-0005 — Types / opclasses / casts / collation / domains** (~11).
       1-byte `char`(OID 18) disambiguation, `pg_collation_for`, function-based cast
       dumping, ALTER TYPE RENAME/OWNER, domain CHECK renderer, `pg_ts_config` OIDs.
