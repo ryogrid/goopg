@@ -463,7 +463,8 @@ func (o *mergeOp) Next() (TupleSlot, error) {
 			// PostgreSQL produces. M0100-0007.
 			if mod.hasDuplicate {
 				return nil, &ExecError{Code: "21000", Pos: o.plan.Pos(),
-					Message: "MERGE command cannot affect row a second time"}
+					Message: "MERGE command cannot affect row a second time",
+					Hint:    "Ensure that not more than one source row matches any one target row."}
 			}
 		}
 	}

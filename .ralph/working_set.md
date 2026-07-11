@@ -1,39 +1,42 @@
 (idle — nothing in flight)
 
-## Loop summary (2026-07-11, loop #57)
+## Loop summary (2026-07-11, loop #58)
 
-**Nightly triage:** action-items batch `20260711-011536` — all 3 AI items already
-`[x]` in fix_plan.md (same batch triaged loop #56, co-load timing flakes). No new
-nightly work.
+**Nightly triage:** action-items batch `20260711-011536` — all 3 AI items
+(IsolationTimeouts, IsolationTuplelockUpgradeNoDeadlock,
+PgWaldumpVacuumPruneRoundtrip) already `[x]` in fix_plan.md M-NIGHTLY (co-load
+timing flakes / already-fixed). No new nightly work.
 
-**Task — M0122-0004: RANGE value-offset window frame bounds** (last window-frame
-gap, follow-up to commit 794872f4 which did RANGE non-offset bounds).
-Implemented `RANGE BETWEEN n PRECEDING AND m FOLLOWING`: a row is in-frame when its
-ORDER BY value is within `current±offset` (PostgreSQL in_range).
+**Task — M0122-0004 / unimplemented_feat.json M0100-0007: MERGE
+duplicate-source cardinality rule.** Verify-before-implement: entry was
+medium-confidence with an `unclear` code audit ("cross-partition routing not
+found"). Re-verified via 4 end-to-end probes (newDDLFixture harness) — the rule
+is ALREADY fully implemented and correct across partition routing, including the
+specifically-flagged cross-partition UPDATE-move case. goopg raises SQLSTATE
+21000 "MERGE command cannot affect row a second time" after applying the first
+mod (operators_merge.go hasDuplicate). Only real gap: PG's errhint was omitted.
 
-Files:
-- internal/analyzer/analyzer.go: validateWindowFrame requires exactly one ORDER BY
-  column for a RANGE value offset (42P20) instead of rejecting 0A000.
-- internal/executor/operators_window.go: frameBounds now returns error + dispatches
-  RANGE value offsets to new frameBoundsRange (scans partition for head/tail per
-  nodeWindowAgg.c in_range semantics; NULL handling matches PG). Helpers:
-  rangeStartReached/rangeEndReached/inRange (reuse evalBinary + compareDatum),
-  resolveRangeOffset (22004 null / 22013 negative), rangeOffsetNegative, rangePos,
-  frameHasValueOffset. Added frameStartOffDatum/frameEndOffDatum fields. Updated the
-  4 frameBounds call sites for the new error return.
-- Tests: analyzer_test.go TestAnalyzeWindowFrameRangeOffsetOrderByCount (was
-  ...OffsetRejected); window_compat_test.go TestCompatWindowRangeValueOffset{,
-  PeersAndFrameFuncs,Nulls}, TestWindowRangeOffsetNegative.
-- Docs: docs/design/0122-0004-range-offset-window-frame.md (+README row); ledger row;
-  unimplemented_feat.json two window-frame entries open→resolved (96 resolved/85 open).
+Landed:
+- internal/executor/operators_merge.go: added PG's errhint "Ensure that not
+  more than one source row matches any one target row." at the hasDuplicate
+  raise site (byte-faithful to nodeModifyTable.c ExecMergeMatched).
+- internal/executor/merge_dup_source_test.go (NEW): first-ever coverage —
+  TestMergeDupSource{UpdateNonPartitioned,DeleteNonPartitioned,
+  UpdateWithinOnePartition,CrossPartitionMove}; asserts code/message/hint +
+  first-mod-applied + cross-partition row relocation.
+- unimplemented_feat.json: M0100-0007 status open→resolved (surgical Edit; cited
+  proof in code_audit). json re-validated.
+- docs/design/0096-0010-merge-into.md: new Follow-up section; README row updated.
+- .ralph/deferral_ledger.md: resolved row appended.
 
-Gates: analyzer + executor + planner suites PASS; go build ./... clean; go vet clean;
-6-case cross-check vs live PG 18.3 all byte-for-byte match; tpch-spotcheck PASS
-(Q12=2/Q13=33). gofmt flags only pre-existing version-mismatch noise (compareSortDatums
-comment), not my code — not touched per goopg_gofmt_version_mismatch_no_w.
+Gates: go build ./... clean; go vet ./internal/executor clean; merge/upsert/
+explain executor tests PASS; tpch-spotcheck PASS (Q12=2/Q13=33);
+make ralph-state-guard OK (auto-repaired prev-loop completed marker).
 
-Next loop: M0122 has ~19 other open sub-items; unimplemented_feat.json still 85 open
-(e.g. Planner GUC stubs wiring, LANGUAGE C stubs, pg_collation_for's broader
-collation-tracking scope, FilterOp/SeqScanOp vectorization pair).
+Next loop: unimplemented_feat.json still has ~84 open entries (was 85). Bounded
+candidates: parsePrimaryConninfo password (blocked on trust-only handshake),
+Planner GUC stubs actual behavior, pg_index expression-index restart
+persistence (hard — null-bitmap-aware decode). Avoid the interval/date hot area
+(ledger rows 692-714 heavily worked 2026-07-11).
 
 In-flight: none

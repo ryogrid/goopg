@@ -89,3 +89,44 @@ The `*parser.MergeStmt` case is wired into `Plan()` immediately after
   extensions.
 - Generated-column recomputation after UPDATE is supported; constraint checks
   (FK, CHECK) are deferred to M0096-0011.
+
+## Follow-up (2026-07-11, M0122-0004): duplicate-source cardinality rule verified across partition routing + errhint added
+
+PostgreSQL enforces that a single target row may not be affected more than
+once by one MERGE: when two or more source rows match the same target row and
+the WHEN MATCHED action modifies it (UPDATE or DELETE), it raises SQLSTATE
+`21000` (`ERRCODE_CARDINALITY_VIOLATION`) `"MERGE command cannot affect row a
+second time"` with the hint `"Ensure that not more than one source row matches
+any one target row."` (see `src/backend/executor/nodeModifyTable.c`
+`ExecMergeMatched`).
+
+`unimplemented_feat.json` carried an `open`, medium-confidence M0100-0007
+entry claiming this was *"not fully implemented for merge cross-partition
+routing"* with an `unclear` code audit. Re-verification this loop shows the
+rule is fully implemented and was already correct across partition routing:
+
+- `mergeOp` (`internal/executor/operators_merge.go`) sets the pending mod's
+  `hasDuplicate` flag when, during the (per-partition-child) target scan, a
+  second source row matches an already-matched target tuple, and raises the
+  `21000` error **after** applying the first modification (and after any
+  `epqWait` blocking) so concurrent callers observe PG's
+  `<waiting…>`/`<…completed>` ordering.
+- Because the duplicate is detected per target *tuple*, it holds whether the
+  target is a plain table, a partitioned table scanned child-by-child, or —
+  the specifically-flagged case — a MERGE UPDATE whose new key relocates the
+  target to a *different* leaf partition (delete + re-insert): the first
+  source row's cross-partition move still leaves the second matching source
+  row to trip the guard.
+
+The only real gap found was cosmetic: goopg omitted PG's `errhint`. This loop
+adds it (`operators_merge.go`, the `hasDuplicate` raise site) so the error is
+byte-faithful to upstream.
+
+The behavior had **zero** prior test coverage. New regression tests in
+`internal/executor/merge_dup_source_test.go` pin all four shapes:
+`TestMergeDupSourceUpdateNonPartitioned` (asserts message + hint + first-mod
+applied), `TestMergeDupSourceDeleteNonPartitioned`,
+`TestMergeDupSourceUpdateWithinOnePartition`, and
+`TestMergeDupSourceCrossPartitionMove` (asserts the row moved to the second
+partition before the duplicate was raised). The `unimplemented_feat.json`
+M0100-0007 entry is flipped `open → resolved` with this proof.

@@ -3672,7 +3672,7 @@
    "feature": "Duplicate-source error handling in merge cross-partition routing is not fully implemented.",
    "task_id": "M0100-0007",
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "deferred duplicate-source error"
    ],
@@ -3687,7 +3687,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "medium",
-   "code_audit": "unclear: Duplicate-source error handling in merge cross-partition routing not found"
+   "code_audit": "RESOLVED (verified 2026-07-11, M0122-0004): duplicate-source detection is fully implemented and works across partition routing. internal/executor/operators_merge.go marks mods[].hasDuplicate when a second source row matches an already-matched target during the (per-partition-child) scan, and raises SQLSTATE 21000 'MERGE command cannot affect row a second time' AFTER applying the first modification (matching PG src/backend/executor/nodeModifyTable.c ExecMergeMatched). Confirmed via end-to-end probes for: non-partitioned UPDATE, non-partitioned DELETE, single-partition UPDATE, and the specific cross-partition-MOVE case (first source row's UPDATE relocates the row from ptgt1 to ptgt2, second matching source row still trips the guard). This loop also added PG's errhint 'Ensure that not more than one source row matches any one target row.' (previously omitted) and regression tests internal/executor/merge_dup_source_test.go (TestMergeDupSource{UpdateNonPartitioned,DeleteNonPartitioned,UpdateWithinOnePartition,CrossPartitionMove}) — the behavior had zero prior test coverage."
   },
   {
    "feature": "Server-side enforcement of character encoding constraints during cluster bootstrap and runtime",
