@@ -626,7 +626,7 @@
    "feature": "KindDate carrier type for proper date-specific BETWEEN codec semantics",
    "task_id": "m0003",
    "resume_point": "0003-0013",
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "KindDate carrier"
    ],
@@ -636,12 +636,12 @@
     "64c0eeb2f3d6b970c94eac81575c9249a1f2c23e"
    ],
    "resolution_check": {
-    "ledger": "no-match",
+    "ledger": "match",
     "fix_plan": "no-match",
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open 2026-07-07: no KindDate carrier exists — internal/executor/datum.go:21-64 DatumKind enum lists KindNull/KindBool/KindInt/KindString/KindBytes/KindTime/KindInterval/KindNumeric/KindToastPointer/KindEnum only; date and timestamp values both still share KindTime. Repo-wide grep for KindDate hits only docs/design/0003-0013-between-operator.md:104-106 (which still lists it under 'Out of scope (deferred)') and backlog/tooling artifacts — zero hits in any .go source file. Gap is unaddressed."
+   "code_audit": "RESOLVED 2026-07-12 (m0003): goopg carries date-ness on the shared KindTime datum via the flagDate bit (internal/executor/datum.go), not a distinct DatumKind — functionally equivalent for the date-specific codec/rendering semantics this item tracked. The concrete gap was that decodePhysicalPGValueMctx's `date` case (internal/executor/codec.go) returned a flagless NewTimeDatum, so a storage-decoded date rendered via Datum.Format() as the full timestamp shape (2001-02-16 00:00:00.000000) instead of the date shape a literal produces; text casts, string concat, and array/composite element rendering were affected (the wire path in server/dispatch.go was already correct because it re-derives date formatting from the column type). Fixed: new NewDateDatum constructor sets flagDate; the decode `date` case now uses it. BETWEEN over dates already worked (compareDatum/datumKey are flag-agnostic). Test: internal/executor/codec_date_test.go TestDateDecodeCarriesDateFlag. Design: docs/design/0003-0013-between-operator.md Follow-up section. A dedicated KindDate enum value is deliberately not introduced (flagDate is the carrier)."
   },
   {
    "feature": "Implement window frame clause semantics for ROWS, RANGE, GROUPS frame modes and frame exclusion options.",

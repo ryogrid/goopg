@@ -1146,7 +1146,12 @@ func decodePhysicalPGValueMctx(t catalog.Type, data []byte, sctx *mctx.Context) 
 			return NewDateInfinity(false), 4, nil
 		}
 		micros := int64(days)*24*3600*1000000 + pgEpochUnixMicros
-		return NewTimeDatum(time.UnixMicro(micros).UTC()), 4, nil
+		// Tag as DATE (flagDate) so a storage-decoded date renders identically
+		// to a date literal in type-agnostic paths (Datum.Format(): text casts,
+		// string concat, array/composite element rendering). The wire path
+		// (server dispatch) re-derives date formatting from the column type and
+		// is unaffected. M0003 / 0003-0013 KindDate carrier gap.
+		return NewDateDatum(time.UnixMicro(micros).UTC()), 4, nil
 	case "time":
 		if len(data) < 8 {
 			return Datum{}, 0, fmt.Errorf("truncated time")

@@ -437,6 +437,16 @@ func NewTimeDatum(t time.Time) Datum {
 	return Datum{Kind: KindTime, Int: t.UTC().UnixNano()}
 }
 
+// NewDateDatum constructs a KindTime Datum tagged as a DATE (flagDate set).
+// Date and timestamp values share the KindTime carrier, so the flag is what
+// distinguishes them for type-agnostic rendering: Datum.Format() emits the
+// date-only shape ("MM-DD-YYYY", M0097-0063) for a flagged datum and the full
+// timestamp shape otherwise. Use this at every date-producing site (literals,
+// casts, on-disk decode) so a date is indistinguishable regardless of origin.
+func NewDateDatum(t time.Time) Datum {
+	return Datum{Kind: KindTime, Int: t.UTC().UnixNano(), Flags: flagDate}
+}
+
 // NewTimeTZDatum constructs a KindTime Datum for a timetz column.
 // The local time is stored as nanoseconds since 1970-01-01 00:00:00 UTC.
 // offsetSecs is the timezone offset east of UTC in seconds (e.g., PDT = -25200).

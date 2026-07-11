@@ -102,7 +102,8 @@ critical precedence-handling case.
   cheaper and re-uses every downstream operator path; the AST
   shape stays standard-comparison.
 - KindDate carrier with date-only Format() — see "Date codec
-  coverage" above.
+  coverage" above. **(Closed 2026-07-12 — see the Follow-up
+  section below.)**
 
 ## Follow-up: `BETWEEN SYMMETRIC` / `ASYMMETRIC` (2026-07-04, M0122-0004)
 
@@ -124,3 +125,43 @@ analyzer/planner/executor changes, same as the plain-BETWEEN desugar.
 Tests: `TestParseBetweenSymmetricDesugar`,
 `TestParseNotBetweenSymmetricDesugar`,
 `TestParseBetweenAsymmetricDesugar` (`internal/parser/between_test.go`).
+
+## Follow-up: date decode carries `flagDate` (2026-07-12, m0003 / 0003-0013)
+
+Closed the "KindDate carrier with date-only Format()" deferral above.
+goopg does not introduce a distinct `DatumKind` for dates — date and
+timestamp share the `KindTime` carrier and are told apart by the
+`flagDate` bit on `Datum.Flags` (`internal/executor/datum.go`).
+`Datum.Format()` emits the date-only shape (`MM-DD-YYYY`, the pg_regress
+`Postgres, MDY` DateStyle, M0097-0063) when the flag is set and the full
+timestamp shape (`YYYY-MM-DD HH:MM:SS.ffffff`) otherwise.
+
+The gap: `decodePhysicalPGValueMctx`'s `date` case
+(`internal/executor/codec.go`) reconstructed a date from its on-disk
+4-byte days-since-epoch form with a **flagless** `NewTimeDatum`, so a
+date read back from storage was indistinguishable from a timestamp in
+every type-agnostic path. Concretely, a stored date rendered through
+`Datum.Format()` as `2001-02-16 00:00:00.000000` instead of the date
+shape a literal produces. This affected `date::text` casts, string
+concatenation, and array/composite element rendering. It did **not**
+affect a plain `SELECT date_col`, because the wire text encoder
+(`internal/server/dispatch.go`, `case "date":`) re-derives the format
+from the column's declared type (`RowDescription`), ignoring the flag.
+
+Fix: a new `NewDateDatum(t)` constructor sets `flagDate`, and the decode
+`date` case now uses it, so a storage-decoded date is byte-identical to a
+date literal. Encode stays type-driven (`encodeValuePG` keys on the
+column `catalog.Type`, not the flag), so the encode↔decode sibling pair
+agree. BETWEEN and other comparisons over dates were already correct:
+`compareDatum` and `datumKey` (GROUP BY/DISTINCT/join hashing) key on the
+`KindTime` instant only and never consult `flagDate`, so the change is
+render-only with no ordering, grouping, or join impact.
+
+Test: `internal/executor/codec_date_test.go`
+(`TestDateDecodeCarriesDateFlag`) — round-trips a date through the
+physical codec and asserts the decoded value carries `flagDate` and
+`Format()`s identically to the literal, plus a negative case that a
+decoded `timestamp` is not tagged. Gates: `go build ./...` clean;
+`internal/executor` + `internal/server` suites PASS;
+`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33 — the TPC-H date columns
+`l_shipdate`/`o_orderdate` exercise this decode path).
