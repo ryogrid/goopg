@@ -1,46 +1,46 @@
 (idle — nothing in flight)
 
-## Loop summary (2026-07-12, loop #63)
+## Loop summary (2026-07-12, loop #65)
 
-**Nightly triage:** action-items batch `20260711-011536` (same as #58–#62) —
+**Nightly triage:** action-items batch `20260711-011536` (same as #58–#64) —
 all 3 AI items already `[x]` in M-NIGHTLY. No new nightly work.
 
-**Task — m0003 / KindDate carrier (0003-0013): storage-decoded dates now carry
-`flagDate`.** Dates share the `KindTime` carrier with timestamps; only the
-`flagDate` bit distinguishes them for `Datum.Format()` (date shape `MM-DD-YYYY`
-vs timestamp `YYYY-MM-DD HH:MM:SS.ffffff`). `decodePhysicalPGValueMctx`'s `date`
-case returned a **flagless** `NewTimeDatum`, so a date read back from on-disk
-storage rendered via `Datum.Format()` as a full timestamp
-(`2001-02-16 00:00:00.000000`) — hitting `date::text` casts, string concat, and
-array/composite element rendering. (Plain `SELECT date_col` was already correct:
-the wire encoder in server/dispatch.go re-derives format from the column type.)
+**Task — M0122-0007 follow-up: surface GEQO + planner-tuning GUCs in
+pg_settings.** Last loop registered the 10 GUCs in the config registry (SET/SHOW
+work) but deferred the pg_settings half: `pg_catalog.pg_settings` is a
+*separately* hand-curated literal list (`pgSettings.VirtualRows`,
+internal/catalog/catalog.go ~L10010), NOT registry-derived, so
+`SELECT * FROM pg_settings WHERE name='geqo_threshold'` returned nothing while
+`SHOW geqo_threshold` worked. Ledger row 722 named this exact resume point.
 
 Landed:
-- internal/executor/datum.go: new `NewDateDatum(t)` (sets flagDate).
-- internal/executor/codec.go: decode `date` case uses `NewDateDatum`.
-- internal/executor/codec_date_test.go: `TestDateDecodeCarriesDateFlag` (+neg
-  case: decoded timestamp not tagged).
-- unimplemented_feat.json m0003 KindDate entry open→resolved (surgical Edit,
-  JSON revalidated).
-- docs/design/0003-0013-between-operator.md new Follow-up section; the deferred
-  bullet flipped to "Closed 2026-07-12".
-- deferral_ledger.md `resolved` row.
+- internal/catalog/catalog.go: added 10 rows (geqo/geqo_threshold/geqo_effort/
+  geqo_pool_size/geqo_generations/geqo_selection_bias/geqo_seed +
+  constraint_exclusion/cursor_tuple_fraction/recursive_worktable_factor) to the
+  pg_settings VirtualRows literal. name/setting/category/vartype/min/max/enumvals/
+  boot_val byte-for-byte from guc_tables.c (categories "Query Tuning / Genetic
+  Query Optimizer" + "Query Tuning / Other Planner Options"; short_desc/extra_desc
+  from same gettext_noop literals; constraint_exclusion enumvals {partition,on,off}).
+  List re-sorted by name after append → name-sort contract preserved.
+- internal/catalog/catalog_test.go: TestPgSettingsPlannerTuningGUCs.
+- docs/design/root-0004-configuration-and-guc.md new "pg_settings surfacing"
+  subsection; fix_plan + deferral-ledger (row appended) + unimplemented_feat.json
+  M0097-0069 code_audit updated in place.
 
-Verified flag-agnostic: compareDatum + datumKey key on the KindTime instant only
-(no ordering/grouping/join impact). Encode stays type-driven (encodeValuePG keys
-on catalog.Type) — encode↔decode sibling pair agree.
+Still deferred (ledgered): behavioral no-op (planner reads none of the 10) +
+pg_settings remains a hand-curated subset, not registry-derived.
 
-Gates: go build ./... clean; internal/executor + internal/server suites PASS;
-scripts/tpch-spotcheck.sh PASS (Q12=2/Q13=33 — l_shipdate/o_orderdate exercise
-the decode path). pgbench smoke via pre-commit hook at commit.
+Gates: go build ./... clean; go vet + go test ./internal/catalog/...
+./internal/config/... PASS; make ralph-state-guard consistent (auto-repaired
+prev-loop clean-exit marker). Catalog virtual-rows only — no planner/executor/
+codec logic; tpch-spotcheck not implicated; pgbench smoke runs via pre-commit hook.
 
-**Stale bookkeeping noticed (NOT fixed — different milestone, one-task rule):**
-fix_plan.md M0122-0004 lines ~4305-4320 still say "RANGE value-offset … still
-rejected 0A000", but commit 3b98c119 CLOSED it. A future M0122-0004 loop should
-reconcile that "Still open in this bucket" note (only sub-day/multi-component
-intervals actually remain).
-
-Next loop: unimplemented_feat.json still ~81 open. Bounded candidates: per-slot
-catalog-xmin retention hook; `pg_get_expr()` stub (returns empty string).
+Next-loop candidates (open, bounded-ish):
+- pg_get_expr stub entry is STALE — it's actually a functional pass-through.
+- ALTER DOMAIN SET SCHEMA: LARGE — domains are hardcoded namespace=public (2200)
+  everywhere; no Domain.Schema field; needs schema-qualified domain infra.
+- RANGE window value-offset (M0122-0004): already implemented (inRange/
+  frameBoundsRange handle numeric/float/interval); only interval-sign edge deferred.
+- scram_iterations GUC: already fully wired (resolveScramIterations).
 
 In-flight: none

@@ -10098,6 +10098,45 @@ func (c *InMemory) registerSystemTables() {
 			{"parallel_leader_participation", "on", "", "Query Tuning / Planner Method Configuration",
 				"Controls whether Gather and Gather Merge also run subplans.", "",
 				"user", "bool", "default", "", "", "", "on", "on", "", "", "f"},
+			// GEQO family (QUERY_TUNING_GEQO) + other planner-tuning GUCs
+			// (QUERY_TUNING_OTHER). Registered in internal/config/defaults.go so
+			// SET/SHOW succeed; surfaced here so pg_settings-reading tooling (ORMs,
+			// monitoring, `SELECT * FROM pg_settings WHERE name = 'geqo_threshold'`)
+			// finds them too. goopg's rule/cost planner ignores every one — pure
+			// stubs — but the catalog view must still report them. Names, defaults,
+			// bounds, category, short_desc, and extra_desc are byte-for-byte from
+			// postgres/src/backend/utils/misc/guc_tables.c. M0122-0007 follow-up.
+			{"geqo", "on", "", "Query Tuning / Genetic Query Optimizer",
+				"Enables genetic query optimization.", "This algorithm attempts to do planning without exhaustive searching.",
+				"user", "bool", "default", "", "", "", "on", "on", "", "", "f"},
+			{"geqo_threshold", "12", "", "Query Tuning / Genetic Query Optimizer",
+				"Sets the threshold of FROM items beyond which GEQO is used.", "",
+				"user", "integer", "default", "2", "2147483647", "", "12", "12", "", "", "f"},
+			{"geqo_effort", "5", "", "Query Tuning / Genetic Query Optimizer",
+				"GEQO: effort is used to set the default for other GEQO parameters.", "",
+				"user", "integer", "default", "1", "10", "", "5", "5", "", "", "f"},
+			{"geqo_pool_size", "0", "", "Query Tuning / Genetic Query Optimizer",
+				"GEQO: number of individuals in the population.", "0 means use a suitable default value.",
+				"user", "integer", "default", "0", "2147483647", "", "0", "0", "", "", "f"},
+			{"geqo_generations", "0", "", "Query Tuning / Genetic Query Optimizer",
+				"GEQO: number of iterations of the algorithm.", "0 means use a suitable default value.",
+				"user", "integer", "default", "0", "2147483647", "", "0", "0", "", "", "f"},
+			{"geqo_selection_bias", "2", "", "Query Tuning / Genetic Query Optimizer",
+				"GEQO: selective pressure within the population.", "",
+				"user", "real", "default", "1.5", "2", "", "2", "2", "", "", "f"},
+			{"geqo_seed", "0", "", "Query Tuning / Genetic Query Optimizer",
+				"GEQO: seed for random path selection.", "",
+				"user", "real", "default", "0", "1", "", "0", "0", "", "", "f"},
+			{"constraint_exclusion", "partition", "", "Query Tuning / Other Planner Options",
+				"Enables the planner to use constraints to optimize queries.",
+				"Table scans will be skipped if their constraints guarantee that no rows match the query.",
+				"user", "enum", "default", "", "", "{partition,on,off}", "partition", "partition", "", "", "f"},
+			{"cursor_tuple_fraction", "0.1", "", "Query Tuning / Other Planner Options",
+				"Sets the planner's estimate of the fraction of a cursor's rows that will be retrieved.", "",
+				"user", "real", "default", "0", "1", "", "0.1", "0.1", "", "", "f"},
+			{"recursive_worktable_factor", "10", "", "Query Tuning / Other Planner Options",
+				"Sets the planner's estimate of the average size of a recursive query's working table.", "",
+				"user", "real", "default", "0.001", "1000000", "", "10", "10", "", "", "f"},
 		}
 		// PostgreSQL's pg_settings view is backed by the alphabetically
 		// sorted GUC table, so callers that query it without ORDER BY (e.g.

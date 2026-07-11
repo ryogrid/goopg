@@ -8324,6 +8324,29 @@ mirroring M0119's ledger `status` column.
       (full package, incl. `TestSampleConfigCoversRegistry`). Config-only GUC
       registration — no planner/executor/codec logic touched; pgbench smoke
       runs via the pre-commit hook at commit.
+      **GEQO + planner-tuning GUCs surfaced in `pg_settings` — DONE
+      (2026-07-12, follow-up loop):** the GEQO landing above deferred one half
+      — `pg_catalog.pg_settings` is a *separately* hand-curated literal list
+      (`pgSettings.VirtualRows` in `internal/catalog/catalog.go`), not derived
+      from the config registry, so `SHOW geqo_threshold` worked while
+      `SELECT * FROM pg_settings WHERE name = 'geqo_threshold'` returned zero
+      rows (a real-PG monitoring/ORM query reading `pg_settings` missed every
+      one). Added all ten rows (7 `QUERY_TUNING_GEQO` + 3 `QUERY_TUNING_OTHER`)
+      to that list with `name`/`setting`/`category`/`vartype`/`min_val`/
+      `max_val`/`enumvals`/`boot_val` byte-for-byte from `guc_tables.c`
+      (categories `Query Tuning / Genetic Query Optimizer` +
+      `Query Tuning / Other Planner Options`; `short_desc`/`extra_desc` from the
+      same `gettext_noop` literals; `constraint_exclusion` enumvals
+      `{partition,on,off}`). List is re-sorted by name after append so the
+      sysviews name-sort contract (`TestPgSettingsEnableGUCsCompleteAndSorted`)
+      holds. Still deferred (ledgered): the behavioral no-op (planner still
+      ignores every value) and the fact that the `pg_settings` list stays a
+      hand-curated subset, not registry-derived. Tests:
+      `TestPgSettingsPlannerTuningGUCs` (`internal/catalog/catalog_test.go`).
+      Design: `docs/design/root-0004-configuration-and-guc.md` new
+      "`pg_settings` surfacing" subsection. Gates: `go build ./...` clean;
+      `go vet`/`go test ./internal/catalog/... ./internal/config/...` PASS;
+      pgbench smoke via pre-commit hook.
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,

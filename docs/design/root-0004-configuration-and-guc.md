@@ -415,13 +415,36 @@ These are **accepted-and-ignored** stubs: goopg's planner is
 rule/cost-based and reads none of them, so `SET`/`SHOW` succeed but the
 chosen plan is unchanged — identical to the pre-existing `enable_*`
 toggles. The behavioral no-op (real PG's planner *does* honour these) is
-recorded in the deferral ledger as a deliberate scope boundary. The
-hand-curated `pg_catalog.pg_settings` literal list (an intentionally
-incomplete subset) was not extended for these — `SET`/`SHOW` route
-through the registry, not `pg_settings`; ledgered.
+recorded in the deferral ledger as a deliberate scope boundary.
+
+### `pg_settings` surfacing (2026-07-12, M0122-0007 follow-up)
+
+The initial GEQO landing deferred one half: `pg_catalog.pg_settings` is a
+*separately* hand-curated literal list in
+`internal/catalog/catalog.go` (`pgSettings.VirtualRows`), **not** derived
+from the config registry, so `SHOW geqo_threshold` worked while
+`SELECT * FROM pg_settings WHERE name = 'geqo_threshold'` returned nothing.
+A real-PG-authored monitoring/ORM query reading `pg_settings` would have
+missed every one. This follow-up adds all ten rows (seven
+`QUERY_TUNING_GEQO` + three `QUERY_TUNING_OTHER`) to that list, with
+`name`/`setting`/`category`/`vartype`/`min_val`/`max_val`/`enumvals`/
+`boot_val` byte-for-byte from
+`postgres/src/backend/utils/misc/guc_tables.c` (category strings
+`Query Tuning / Genetic Query Optimizer` and
+`Query Tuning / Other Planner Options`, `short_desc`/`extra_desc` from the
+same `gettext_noop` literals; `constraint_exclusion`'s enumvals render
+`{partition,on,off}`). The list is re-sorted by name after append, so the
+existing sysviews name-sort contract holds. Remaining deferral: the
+*behavioral* no-op (the planner still ignores every value) is unchanged
+and the `pg_settings` list is still not registry-derived (only the GUCs a
+regress/tooling query needs are hand-added).
 
 Tests: `TestGeqoAndPlannerTuningGUCStubs` (boot value/type/USERSET
 context/`SET`-acceptance for all ten) and `TestGeqoTuningGUCBoundsEnforced`
 (out-of-range/invalid-enum `SET` rejected, in-range accepted), both
-`internal/config/geqo_guc_stubs_test.go`. Gates: `go build ./...`/`go vet
-./internal/config/...` clean; `go test ./internal/config/...` PASS.
+`internal/config/geqo_guc_stubs_test.go`; plus
+`TestPgSettingsPlannerTuningGUCs`
+(`internal/catalog/catalog_test.go`) pinning the ten new `pg_settings`
+rows' `setting`/`category`/`vartype`/`boot_val`/`source`/enumvals. Gates:
+`go build ./...`/`go vet ./internal/config/... ./internal/catalog/...`
+clean; `go test ./internal/config/... ./internal/catalog/...` PASS.

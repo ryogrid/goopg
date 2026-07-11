@@ -622,6 +622,68 @@ func TestPgSettingsEnableGUCsCompleteAndSorted(t *testing.T) {
 	}
 }
 
+// TestPgSettingsPlannerTuningGUCs pins the GEQO family + other planner-tuning
+// GUCs (QUERY_TUNING_GEQO / QUERY_TUNING_OTHER) in the pg_settings virtual
+// table. They are registered in internal/config/defaults.go (so SET/SHOW work)
+// but pg_settings is a separately hand-maintained literal list, so a real-PG
+// script issuing `SELECT * FROM pg_settings WHERE name = 'geqo_threshold'`
+// would find nothing until these rows exist too. M0122-0007 follow-up.
+func TestPgSettingsPlannerTuningGUCs(t *testing.T) {
+	c := NewInMemory()
+	tbl, ok := c.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_settings"})
+	if !ok || tbl.VirtualRows == nil {
+		t.Fatal("pg_settings virtual table not registered")
+	}
+	byName := map[string][]string{}
+	for _, row := range tbl.VirtualRows() {
+		byName[row[0]] = row
+	}
+	// name -> {setting(1), category(3), vartype(7), boot_val(12)} spot-checks.
+	// Columns per the pg_settings table definition; setting == boot_val at
+	// default source.
+	want := []struct {
+		name, setting, category, vartype string
+	}{
+		{"geqo", "on", "Query Tuning / Genetic Query Optimizer", "bool"},
+		{"geqo_threshold", "12", "Query Tuning / Genetic Query Optimizer", "integer"},
+		{"geqo_effort", "5", "Query Tuning / Genetic Query Optimizer", "integer"},
+		{"geqo_pool_size", "0", "Query Tuning / Genetic Query Optimizer", "integer"},
+		{"geqo_generations", "0", "Query Tuning / Genetic Query Optimizer", "integer"},
+		{"geqo_selection_bias", "2", "Query Tuning / Genetic Query Optimizer", "real"},
+		{"geqo_seed", "0", "Query Tuning / Genetic Query Optimizer", "real"},
+		{"constraint_exclusion", "partition", "Query Tuning / Other Planner Options", "enum"},
+		{"cursor_tuple_fraction", "0.1", "Query Tuning / Other Planner Options", "real"},
+		{"recursive_worktable_factor", "10", "Query Tuning / Other Planner Options", "real"},
+	}
+	for _, w := range want {
+		row, ok := byName[w.name]
+		if !ok {
+			t.Errorf("pg_settings missing GUC %q", w.name)
+			continue
+		}
+		if row[1] != w.setting {
+			t.Errorf("%s: setting = %q, want %q", w.name, row[1], w.setting)
+		}
+		if row[3] != w.category {
+			t.Errorf("%s: category = %q, want %q", w.name, row[3], w.category)
+		}
+		if row[7] != w.vartype {
+			t.Errorf("%s: vartype = %q, want %q", w.name, row[7], w.vartype)
+		}
+		if row[12] != w.setting {
+			t.Errorf("%s: boot_val = %q, want %q (== setting at default source)", w.name, row[12], w.setting)
+		}
+		if row[8] != "default" {
+			t.Errorf("%s: source = %q, want %q", w.name, row[8], "default")
+		}
+	}
+	// constraint_exclusion is the only enum here; its enumvals must render the
+	// PG `{partition,on,off}` set (pg_settings.enumvals is column 11).
+	if row := byName["constraint_exclusion"]; row != nil && row[11] != "{partition,on,off}" {
+		t.Errorf("constraint_exclusion: enumvals = %q, want %q", row[11], "{partition,on,off}")
+	}
+}
+
 // TestVerboseIntervalOffset pins the postgres_verbose interval rendering used
 // by the timezone system views. pg_regress forces intervalstyle=
 // postgres_verbose, so the LMT row must read "@ 7 hours 52 mins 58 secs ago".
