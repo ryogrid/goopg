@@ -1911,6 +1911,22 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, err
 	}
 
+	// pg_stat_ssl / pg_stat_gssapi — per-client-backend auth-transport views
+	// backed by the same activity.Registry as pg_stat_activity. goopg has no
+	// TLS/GSSAPI, so both report faithful all-false/NULL rows (M0122-0003).
+	if err := registerPgStatSslView(cat, act); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, err
+	}
+	if err := registerPgStatGssapiView(cat, act); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, err
+	}
+
 	// Wire AIO + data-file I/O wait-event hooks so pg_stat_activity can
 	// report blocking reasons. Wired unconditionally (not gated on the
 	// boot-time TrackIOTiming value) so a runtime `SET track_io_timing`

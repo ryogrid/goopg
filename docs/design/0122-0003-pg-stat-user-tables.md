@@ -445,6 +445,47 @@ all six shapes, empty row sets) and `TestPgStatProgressViewsEndToEnd`
 (`internal/executor/pgstat_global_e2e_test.go` — full SELECT through the executor,
 zero rows). The live per-backend progress feed is deferred (ledger).
 
+## Per-backend auth-transport views (`pg_stat_ssl` / `pg_stat_gssapi`, 2026-07-12)
+
+`pg_stat_ssl` and `pg_stat_gssapi` report the TLS and GSSAPI transport state of
+every **client** backend. Upstream both are thin projections over
+`pg_stat_get_activity(NULL)` filtered on `WHERE S.client_port IS NOT NULL` (i.e.
+real client connections, not background workers):
+
+- `pg_stat_ssl(pid int4, ssl bool, version text, cipher text, bits int4,
+  client_dn text, client_serial numeric, issuer_dn text)`
+- `pg_stat_gssapi(pid int4, gss_authenticated bool, principal text,
+  encrypted bool, credentials_delegated bool)`
+
+goopg implements neither TLS nor GSSAPI, so `ssl` /
+`gss_authenticated` / `encrypted` / `credentials_delegated` are all a faithful
+`false` and every detail column (`version`, `cipher`, `bits`, `client_dn`,
+`client_serial`, `issuer_dn`, `principal`) is NULL — byte-identical to a real PG
+18.3 cluster with `ssl = off` built without GSSAPI. Unlike the per-object /
+global stat views above, these are **per-backend**, so they belong with
+`pg_stat_activity` in `internal/initdb/` and are backed by the SAME
+`activity.Registry`: `registerPgStatSslView` / `registerPgStatGssapiView`
+(`internal/initdb/pg_stat_ssl_gssapi_view.go`) walk `reg.Snapshot()`, skip any
+backend whose `ClientPort == ""` (the `client_port IS NOT NULL` filter — drops
+checkpointer/walwriter/etc.), and emit one row each. They are wired in
+`initdb.Open` immediately after `registerPgStatActivityView`. No per-connection
+executor twin is needed — the registry snapshot is already global, and the row
+set is exactly `pg_stat_activity` minus the background-worker rows.
+
+Column types transcribed from `pg_stat_get_activity`'s `proallargtypes`
+(`src/include/catalog/pg_proc.dat`): `bits` is `int4`, `client_serial` is
+`numeric`, the flags are `bool`, the rest `text`. Tests: `TestPgStatSslView` /
+`TestPgStatGssapiView` (`internal/initdb/pg_stat_ssl_gssapi_view_test.go`) assert
+the exact column shape, the empty-registry 0-row case, the `client_port` filter
+(client backend surfaces, background worker dropped), and the all-false/NULL
+rendering. Verified end-to-end against a throwaway goopg instance this loop
+(`SELECT * FROM pg_stat_ssl` / `pg_stat_gssapi` each returned one row for the
+connecting psql backend, `ssl='f'`, detail columns NULL).
+
+Still unregistered from the pg_stat family: `pg_stat_subscription_stats`
+(per-subscription error/apply counters — belongs with the subscription infra in
+`replication_views.go`).
+
 ## Deferred
 
 The scan/tuple/vacuum/analyze counters and `last_*` timestamps remain honest

@@ -3991,11 +3991,30 @@ mirroring M0119's ledger `status` column.
       Design +README +ledger updated. Live per-backend progress feed deferred.
       Note: `pg_stat_replication`/`pg_stat_wal_receiver`/`pg_stat_subscription`
       already exist in `internal/initdb/replication_views.go` (live walsender/
-      receiver/subscription rows). Still unregistered pg_stat views for a later
-      slice: `pg_stat_ssl`, `pg_stat_gssapi` (per-backend, need the live session
-      registry — belong in initdb like `pg_stat_activity`), and
+      receiver/subscription rows).
+      **`pg_stat_ssl` + `pg_stat_gssapi` done (2026-07-12, later loop):** the two
+      per-client-backend auth-transport views — unlike every pg_stat view above
+      these are *per-backend*, so they live in `internal/initdb/` alongside
+      `pg_stat_activity` and are backed by the SAME `activity.Registry`, NOT base
+      `catalog.go`. `registerPgStatSslView`/`registerPgStatGssapiView`
+      (`internal/initdb/pg_stat_ssl_gssapi_view.go`) walk `reg.Snapshot()` and skip
+      any backend whose `ClientPort==""` (upstream's `WHERE client_port IS NOT NULL`
+      filter, which drops background workers), emitting one row per live client
+      backend; wired in `initdb.Open` right after `registerPgStatActivityView`, no
+      per-connection twin (the registry snapshot is already global). goopg has
+      neither TLS nor GSSAPI, so `pg_stat_ssl.ssl` and all three
+      `pg_stat_gssapi` flags are a faithful `f` and every detail column
+      (version/cipher/bits/client_dn/client_serial/issuer_dn, principal) NULL —
+      byte-identical to a real PG 18.3 cluster with `ssl=off` built without
+      GSSAPI (VERIFIED end-to-end against a throwaway goopg server this loop).
+      Column types transcribed from `pg_stat_get_activity`'s `proallargtypes`
+      (`bits` int4, `client_serial` numeric, flags bool). Tests:
+      `internal/initdb/pg_stat_ssl_gssapi_view_test.go`
+      (`TestPgStatSslView`/`TestPgStatGssapiView`). Design +README +ledger updated.
+      TLS/GSSAPI transport-detail population deferred (ledger).
+      Still unregistered pg_stat view for a later slice:
       `pg_stat_subscription_stats` (per-subscription, belongs with the subscription
-      infra in `replication_views.go`).
+      infra in `replication_views.go`; needs a `PgStat_StatSubEntry` accumulator).
 - [x] **M0122-0004 — SQL language / executor features** (~21). Window frame
       ROWS/RANGE/GROUPS, GROUPING SETS/ROLLUP/CUBE, DEFAULT-clause
       parsing, intervals. **WITH CHECK
