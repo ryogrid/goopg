@@ -34,7 +34,7 @@
    "feature": "Implement signal-based configuration refresh (SIGHUP-style) for the reload command so configuration changes take effect without restarting the server.",
    "task_id": null,
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "v0 server-side handler is a no-op until per-GUC SIGHUP-style refresh wires up"
    ],
@@ -49,13 +49,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open 2026-07-07: cmd/goopg/main.go:1181 runReload prints 'configuration reload signalled (v0 no-op)'; server-side internal/server/server.go:634-637 OnReload callback logs 'reload requested (v0 no-op)' and returns nil. Control-socket RELOAD plumbing (internal/control/control.go:286-293) is fully wired end-to-end, but the callback itself does no GUC re-read/config-file re-parse. Old line citation (main.go:1171) was stale from file drift; substance unchanged."
+   "code_audit": "RESOLVED 2026-07-11 (verify-before-implement; landed 2026-07-08 commit e146b321 'fix(M0122-0007): SIGHUP/goopg-reload actually reloads postgresql.conf'). The audit below described the 2026-07-07 state, which was superseded one day later. Current state: cmd/goopg/main.go runReload sends RELOAD over the control socket; server.go OnReload calls s.reloadConfig() (server.go:699), which re-parses cfg.ConfigPath via config.ParseConfigFile and applies each entry through Registry.ApplyReloadEntries (internal/config/guc.go:522) -- that rejects ContextInternal/ContextPostmaster params with the exact upstream 'cannot be changed [without restarting]' warnings, canonicalizes each value, updates the live GUC, and fires invokeOnChange hooks so subsystems observe the new value. A SIGHUP handler is wired to the same reloadConfig path (server.go:685). Prior confirmed-open 2026-07-07 note (now stale): cmd/goopg/main.go:1181 runReload printed 'configuration reload signalled (v0 no-op)'; OnReload logged 'reload requested (v0 no-op)'."
   },
   {
    "feature": "Implement the restart command for goopg ctl control socket (currently a documented stub).",
    "task_id": null,
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "restart: documented stub since v0 runs in the foreground"
    ],
@@ -70,7 +70,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: cmd/goopg/main.go:1138 explicit not yet implemented message"
+   "code_audit": "RESOLVED 2026-07-11 (verify-before-implement; landed commit b01eae13 'fix(M0122-0007): implement `goopg restart` (was a hard stub)'). cmd/goopg/main.go runRestart -> runRestartWithStarter (main.go:1179) reads -D's postmaster.pid, and if a live instance owns it sends STOP (or STOPIMMEDIATE for -mode immediate) over the control socket, polls ProcessAlive until the pid exits (bounded by -t, default 30s), inherits the stopped instance's listen address when -listen was omitted, then hands off to runStart with the same -D/-config/-hba -- i.e. the foreground 'stop then start' an operator would run by hand (v0 has no postmaster fork, so restart cannot daemonize a replacement, matching pg_ctl restart's behavior only in-foreground). A stale/absent postmaster.pid is treated as 'nothing to stop'. Tests: cmd/goopg/main_test.go TestRunRestartWithStarter (injects a fake starter; covers no-pidfile, stale-pidfile, and live-stop paths). The old line citation main.go:1138 now points into runStop, not a stub."
   },
   {
    "feature": "Implement tablespace support for directing table and index storage to different physical locations.",
@@ -3101,7 +3101,7 @@
    "feature": "Index column ordering (ASC/DESC/NULLS FIRST/NULLS LAST) is not persisted to disk; ordering is lost across server restart despite faithful dumps within a session",
    "task_id": "DU-002",
    "resume_point": "Persist indoption bits to on-disk pg_index heap to enable cross-restart index ordering preservation",
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "indoption bits are not persisted to the on-disk pg_index heap, so ordering is lost across a restart"
    ],
@@ -3116,7 +3116,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: initdb/index_ddl_recovery.go:4 - indoption not persisted to disk across restarts"
+   "code_audit": "RESOLVED 2026-07-11 (verify-before-implement; landed 2026-07-08 across M0122-0006 commits 945f48b4/8069f66d/c699e083, design docs/design/0122-0006-index-column-order-restart-persistence.md). Per-key ASC/DESC + NULLS FIRST/LAST ordering now survives both a checkpointed and an uncheckpointed (crash) restart. Three gaps closed: (1) live pg_index.indoption is rendered from catalog.Index.ColDescending/ColNullsFirst instead of buildZeroVec; (2) the heap-persisted pg_index shadow row (buildUserPGIndexRow) carries the real indoption int2vector and catalog.DecodePGIndexPhysicalRow decodes it (internal/catalog/codec.go IndOption, decoded on checkpointed restart); (3) the CREATE INDEX WAL record itself now serializes ColDescending/ColNullsFirst as two trailing per-column byte blocks (internal/wal/recovery.go:6826/6894/7195) and RegisterIndexDuringRecovery threads them back into the rebuilt catalog.Index (internal/initdb/index_ddl_recovery.go:41/98), so a true kill -9 with no intervening checkpoint replays the ordering. Tests: internal/wal/index_ddl_test.go, internal/initdb/index_ddl_recovery_test.go, internal/catalog/index_def_order_test.go."
   },
   {
    "feature": "Per-function SET configuration parameters are not tracked; all functions report NULL for the proconfig column.",
