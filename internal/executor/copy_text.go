@@ -773,6 +773,24 @@ func parseCopyTimestamp(s string) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("invalid timestamp %q", s)
 }
 
+// parseTimestampInfinityLiteral recognises PostgreSQL's special timestamp input
+// spellings that have no finite time.Time representation: 'infinity' / '+infinity'
+// (DTK_LATE) and '-infinity' (DTK_EARLY). Matching is case-insensitive on the
+// trimmed text, mirroring the RESERV token lookup in datetime.c (the
+// {"+infinity",…,DTK_LATE}, {LATE,…,DTK_LATE} and {EARLY,…,DTK_EARLY} entries in
+// datetbl, consumed by DecodeDateTime). Returns the matching KindTime ±infinity
+// sentinel Datum and true, or (zero, false) when s is not an infinity literal.
+// (unimplemented_feat #5(d-iv))
+func parseTimestampInfinityLiteral(s string) (Datum, bool) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "infinity", "+infinity":
+		return NewTimestampInfinity(true), true
+	case "-infinity":
+		return NewTimestampInfinity(false), true
+	}
+	return Datum{}, false
+}
+
 // parseFullTimestamp parses PostgreSQL verbose timestamp strings such as
 // "Tuesday, February 22, 2022 2:22:22.00 PM GMT+05:00".
 // Timezone offset follows ISO convention: +05:00 means UTC+5.

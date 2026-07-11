@@ -1681,6 +1681,59 @@ literal-input parsing + `::timestamp` cast + wire-codec binary encode/decode of
 the sentinel remains — goopg still produces an infinite timestamp *only* via the
 arithmetic short-circuits, never from a typed literal.
 
+## Follow-up: `timestamp 'infinity'` literal input + cast + wire codec
+
+Closed the last item above — the infinite-timestamp sentinel is now reachable
+from **direct text input**, not just arithmetic. PostgreSQL's `timestamp_in` /
+`timestamptz_in` recognise three special spellings via the `RESERV` tokens in
+`datetime.c`'s `datetbl` (consumed by `DecodeDateTime` → the `DTK_LATE` /
+`DTK_EARLY` cases): `infinity` and `+infinity` (`DTK_LATE`, `#define LATE`),
+and `-infinity` (`DTK_EARLY`, `#define EARLY`), all case-insensitive on the
+trimmed field. None of these has a finite `time.Time`, so the four goopg input
+paths that funnel timestamp text through `parseCopyTimestamp` (which returns a
+`time.Time`) or the `evalTypedStringLit` layout list silently rejected them.
+
+A single choke-point helper `parseTimestampInfinityLiteral(s) (Datum, bool)`
+(`internal/executor/copy_text.go`, next to `parseCopyTimestamp`) maps the trimmed
+lower-cased text to the existing `NewTimestampInfinity(±)` `KindTime` sentinel
+(`Int` = `math.MaxInt64` / `math.MinInt64`), returning `false` for anything else.
+It is wired in before the ordinary parse at every input site:
+
+- **Typed literal** `timestamp 'infinity'` — `evalTypedStringLit`'s
+  `timestamp`/`timestamptz` case (`internal/executor/expr.go`), before the layout
+  loop. The sentinel is not time-cached (`CacheValid` stays false; detection is a
+  trivial string compare).
+- **Cast** `'infinity'::timestamp` / `CAST(... AS timestamptz)` — `evalCast`'s
+  `timestamp`/`timestamptz` case, before `parseCopyTimestamp`.
+- **Binary wire codec** — `encodeValuePG` writes the sentinel as PG's
+  `timestamp_send` value `DT_NOEND` / `DT_NOBEGIN` = `PG_INT64_MAX` /
+  `PG_INT64_MIN` **microseconds** (a `switch` on `IsTimestampPosInf` /
+  `IsTimestampNegInf` bypasses the `UnixMicro()−epoch` finite path);
+  `decodePhysicalPGValueMctx` intercepts those two micro values back to the
+  sentinel *before* adding the PG-epoch offset (which would overflow).
+- **`pg_input_is_valid('infinity','timestamp')`** — returns `true` for the
+  infinity spellings (`internal/executor/expr.go`, the type-validation switch).
+
+Text *output* already rendered `infinity` / `-infinity` (the carrier loop's
+`Format` / `AppendValueText` sentinel intercepts) and ordering already sorted the
+INT64 extremes correctly (`compareDatum` `KindTime` orders by `Int`), so no
+change there. Every `want` verified byte-for-byte against live PostgreSQL 18.3
+(socket `/tmp:5599`): `timestamp '{,-,+}infinity'`, `'Infinity'`,
+`'  -INFINITY  '`, `'infinity'::timestamp`, `CAST('infinity' AS timestamptz)`,
+`isfinite(...)`=`f`, `pg_input_is_valid`=`t`/`t`/`f`, and the two ordering
+comparisons — all 14 identical. Tests:
+`internal/executor/timestamp_infinity_literal_test.go`
+(`TestTimestampInfinityLiteral`, 17 cases; `TestTimestampInfinityWireCodec`, the
+binary round-trip). Gates: `go build ./...` clean; full executor suite PASS;
+`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke via pre-commit
+hook. **With this the whole `#5(d-iv)` interval/infinity group is complete.**
+
+**Still deferred (out of this scope).** `date 'infinity'` / `'infinity'::date`
+literal input remains unimplemented — the `date` type uses a *different* sentinel
+(`DATEVAL_NOEND`/`NOBEGIN` = `PG_INT32_MAX`/`MIN` days, not the timestamp INT64
+domain), and `evalTypedStringLit`'s `date` case + the date codec would each need
+an analogous carrier + interception. Recorded in the deferral ledger.
+
 ## Cross-references
 
 - TPC-H query bodies: HammerDB upstream

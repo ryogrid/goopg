@@ -2836,6 +2836,14 @@ func evalTypedStringLit(x *planner.TypedStringLit) (Datum, error) {
 		// receipt-report specs (which book rooms on the half-hour with
 		// `TIMESTAMP WITH TIME ZONE '2010-04-01 10:00'`) fail their
 		// setup INSERT with `invalid timestamp` (22007).
+		//
+		// PG's special 'infinity' / '-infinity' spellings have no finite
+		// time.Time and so are intercepted before the layout loop; the
+		// ±infinity sentinel is not time-cached (detection is a trivial
+		// string compare). (unimplemented_feat #5(d-iv))
+		if inf, ok := parseTimestampInfinityLiteral(x.Value); ok {
+			return inf, nil
+		}
 		layouts := []string{
 			"2006-01-02 15:04:05.999999-07",
 			"2006-01-02 15:04:05-07",
@@ -3432,6 +3440,10 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 	case "timestamp", "timestamptz":
 		// Cast to timestamp: parse strings, keep KindTime as-is. M0097-0004.
 		if d.Kind == KindString {
+			// 'infinity' / '-infinity' have no finite time.Time (#5(d-iv)).
+			if inf, ok := parseTimestampInfinityLiteral(d.StringValue()); ok {
+				return inf, nil
+			}
 			ts, err := parseCopyTimestamp(d.StringValue())
 			if err != nil {
 				return Datum{}, &ExecError{Code: "22007", Pos: pos,
@@ -8290,6 +8302,10 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 				_, err := time.Parse("2006-01-02", v)
 				return NewBoolDatum(err == nil), nil
 			case "timestamp", "timestamptz":
+				// 'infinity' / '-infinity' are valid timestamp input (#5(d-iv)).
+				if _, ok := parseTimestampInfinityLiteral(v); ok {
+					return NewBoolDatum(true), nil
+				}
 				_, err := parseCopyTimestamp(v)
 				return NewBoolDatum(err == nil), nil
 			default:

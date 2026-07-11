@@ -8228,6 +8228,29 @@ mirroring M0119's ledger `status` column.
       pre-existing): `timestamp 'infinity'` literal-input parsing + wire codec,
       `isfinite(timestamp)` stub, `timestamp − timestamp` with an infinite operand.
       With this, the whole #5(d-iv) interval group is complete.
+  - [x] `unimplemented_feat #5(d-iv) (timestamp 'infinity' literal input +
+      cast + wire codec)` (2026-07-11, this loop) — closed the LAST deferred
+      item of the infinity thread: the ±infinity timestamp sentinel is now
+      reachable from **direct text input**, not just arithmetic. New choke-point
+      helper `parseTimestampInfinityLiteral(s)` (`internal/executor/copy_text.go`)
+      maps PG's three RESERV spellings — `infinity`/`+infinity` (`DTK_LATE`) and
+      `-infinity` (`DTK_EARLY`), case-insensitive/trimmed per `datetime.c`'s
+      `datetbl` — to the existing `NewTimestampInfinity(±)` `KindTime` sentinel.
+      Wired before the ordinary parse at: (a) typed literal `evalTypedStringLit`
+      (`expr.go`, not time-cached); (b) cast `evalCast`; (c) binary codec
+      `encodeValuePG` writes PG's `timestamp_send` `DT_NOEND`/`DT_NOBEGIN` =
+      PG_INT64_MAX/MIN **micros** (switch bypasses `UnixMicro()−epoch`) and
+      `decodePhysicalPGValueMctx` intercepts those back to the sentinel before
+      the overflow-prone epoch add; (d) `pg_input_is_valid`. Output + ordering
+      already correct. All 14 `want` byte-for-byte vs live PG 18.3 (socket
+      /tmp:5599). Tests: `internal/executor/timestamp_infinity_literal_test.go`
+      `TestTimestampInfinityLiteral` (17 cases) + `TestTimestampInfinityWireCodec`.
+      Design doc `docs/design/0003-0006-date-interval-arithmetic.md` new Follow-up.
+      Gates: build clean; full executor suite PASS; `scripts/tpch-spotcheck.sh`
+      PASS (Q12=2/Q13=33); pgbench smoke via pre-commit hook. Newly deferred (own
+      slice): `date 'infinity'` literal input — the date type uses a different
+      INT32-days sentinel domain (`DATEVAL_NOEND`/`NOBEGIN`), needs its own
+      carrier. Ledger row appended.
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,
