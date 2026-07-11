@@ -419,19 +419,34 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 		return buf[:], nil
 	case "date":
 		if d.Kind == KindString {
-			t, err := parseCopyTimestamp(d.StringValue())
-			if err != nil {
-				return nil, &ExecError{Code: "22007", Pos: 0, Message: fmt.Sprintf("invalid input syntax for type date: %q", d.StringValue())}
+			// 'infinity' / '-infinity' have no finite time.Time (#5(d-iv)).
+			if inf, ok := parseDateInfinityLiteral(d.StringValue()); ok {
+				d = inf
+			} else {
+				t, err := parseCopyTimestamp(d.StringValue())
+				if err != nil {
+					return nil, &ExecError{Code: "22007", Pos: 0, Message: fmt.Sprintf("invalid input syntax for type date: %q", d.StringValue())}
+				}
+				d = NewTimeDatum(t.UTC())
 			}
-			d = NewTimeDatum(t.UTC())
 		}
 		if d.Kind != KindTime {
 			return nil, fmt.Errorf("expected time, got kind %d", d.Kind)
 		}
-		// PG date: days since 2000-01-01 (Julian-style)
-		t := d.TimeValue()
-		micros := t.UnixMicro() - pgEpochUnixMicros
-		days := int32(micros / (24 * 3600 * 1000000))
+		// PG date: days since 2000-01-01 (Julian-style). The ±infinity sentinels
+		// serialise to PG's DATEVAL_NOEND / DATEVAL_NOBEGIN wire value =
+		// PG_INT32_MAX / PG_INT32_MIN days (date_send). (#5(d-iv))
+		var days int32
+		switch {
+		case d.IsTimestampPosInf():
+			days = math.MaxInt32
+		case d.IsTimestampNegInf():
+			days = math.MinInt32
+		default:
+			t := d.TimeValue()
+			micros := t.UnixMicro() - pgEpochUnixMicros
+			days = int32(micros / (24 * 3600 * 1000000))
+		}
 		var buf [4]byte
 		binary.LittleEndian.PutUint32(buf[:], uint32(days))
 		return buf[:], nil
@@ -1121,6 +1136,15 @@ func decodePhysicalPGValueMctx(t catalog.Type, data []byte, sctx *mctx.Context) 
 			return Datum{}, 0, fmt.Errorf("truncated date")
 		}
 		days := int32(binary.LittleEndian.Uint32(data[:4]))
+		// PG's DATEVAL_NOEND / DATEVAL_NOBEGIN sentinels (PG_INT32_MAX /
+		// PG_INT32_MIN days) decode to the ±infinity DATE carrier; the epoch
+		// arithmetic below would overflow, so intercept first. (#5(d-iv))
+		switch days {
+		case math.MaxInt32:
+			return NewDateInfinity(true), 4, nil
+		case math.MinInt32:
+			return NewDateInfinity(false), 4, nil
+		}
 		micros := int64(days)*24*3600*1000000 + pgEpochUnixMicros
 		return NewTimeDatum(time.UnixMicro(micros).UTC()), 4, nil
 	case "time":

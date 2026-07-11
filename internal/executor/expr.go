@@ -2803,6 +2803,12 @@ func evalTypedStringLit(x *planner.TypedStringLit) (Datum, error) {
 		return Datum{Kind: KindInt, Int: int64(n)}, nil
 
 	case "date":
+		// PG's 'infinity' / '-infinity' spellings have no finite time.Time and
+		// map to the DATEVAL_NOEND / DATEVAL_NOBEGIN sentinel; intercept before
+		// the layout parse (not time-cached). (unimplemented_feat #5(d-iv))
+		if inf, ok := parseDateInfinityLiteral(x.Value); ok {
+			return inf, nil
+		}
 		t, err := time.Parse("2006-01-02", x.Value)
 		if err != nil {
 			return Datum{}, &ExecError{Code: "22007", Pos: x.Pos(), Message: fmt.Sprintf("invalid date %q: %v", x.Value, err)}
@@ -3395,6 +3401,10 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 		// Cast to date: truncate KindTime to midnight UTC, parse strings as dates. M0097-0004.
 		if d.Kind == KindString {
 			s := d.StringValue()
+			// 'infinity' / '-infinity' → DATEVAL_NOEND / NOBEGIN (#5(d-iv)).
+			if inf, ok := parseDateInfinityLiteral(s); ok {
+				return inf, nil
+			}
 			if t, err := parseCopyTimestamp(s); err == nil {
 				t2 := t.UTC()
 				return NewTimeDatum(time.Date(t2.Year(), t2.Month(), t2.Day(), 0, 0, 0, 0, time.UTC)), nil
@@ -3403,6 +3413,11 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 				Message: fmt.Sprintf("invalid input syntax for type date: %q", s)}
 		}
 		if d.Kind == KindTime {
+			// A ±infinity timestamp/date sentinel casts to the same-signed date
+			// infinity (PG timestamp2date / date passthrough). (#5(d-iv))
+			if d.IsTimestampNotFinite() {
+				return NewDateInfinity(d.IsTimestampPosInf()), nil
+			}
 			t := d.TimeValue().UTC()
 			return NewTimeDatum(time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)), nil
 		}
@@ -8299,6 +8314,10 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 				_, err := parseTimeString(v)
 				return NewBoolDatum(err == nil), nil
 			case "date":
+				// 'infinity' / '-infinity' are valid date input (#5(d-iv)).
+				if _, ok := parseDateInfinityLiteral(v); ok {
+					return NewBoolDatum(true), nil
+				}
 				_, err := time.Parse("2006-01-02", v)
 				return NewBoolDatum(err == nil), nil
 			case "timestamp", "timestamptz":

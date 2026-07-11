@@ -8251,6 +8251,33 @@ mirroring M0119's ledger `status` column.
       slice): `date 'infinity'` literal input — the date type uses a different
       INT32-days sentinel domain (`DATEVAL_NOEND`/`NOBEGIN`), needs its own
       carrier. Ledger row appended.
+  - [x] `unimplemented_feat #5(d-iv) (date 'infinity' literal input + cast +
+      wire codec)` (2026-07-11, this loop) — closed the LAST deferred item of the
+      whole interval/infinity group: the ±infinity **date** sentinel is now
+      reachable from direct text input, cast, `pg_input_is_valid` and the binary
+      wire codec, mirroring the timestamp follow-up above. CARRIER: internally a
+      date is a `KindTime` datum (same Unix-ns `Int` field as timestamp, tagged
+      `flagDate`), so it REUSES the same `math.MaxInt64`/`MinInt64` sentinel —
+      `Format`/`AppendValueText` (intercept the extremes before the flagDate
+      render), `IsTimestampNotFinite`, `isfinite`, `compareDatum` are all already
+      sentinel-aware for dates with no change. Only the WIRE value differs: PG's
+      `date_send` emits `DATEVAL_NOEND`/`DATEVAL_NOBEGIN` = PG_INT32_MAX/MIN
+      **days** (`postgres/src/include/utils/date.h`), 4-byte INT32. New
+      `NewDateInfinity(±)` (`datum.go`) + `parseDateInfinityLiteral`
+      (`copy_text.go`) wired at: (a) `evalTypedStringLit` `date` case; (b)
+      `evalCast` `date` case — string form + a ±infinity timestamp operand mapped
+      to same-signed date infinity; (c) `encodeValuePG` `date` writes INT32_MAX/MIN
+      days via a posinf/neginf switch; (d) `decodePhysicalPGValueMctx` `date`
+      intercepts those days back to `NewDateInfinity` before the overflow-prone
+      epoch-day math; (e) `pg_input_is_valid('infinity','date')`. All 11 `want`
+      byte-for-byte vs live PG 18.3 (throwaway initdb, socket /tmp:5601). Tests:
+      `internal/executor/date_infinity_literal_test.go` `TestDateInfinityLiteral`
+      (17 cases) + `TestDateInfinityWireCodec` (INT32 round-trip). Design doc
+      `docs/design/0003-0006-date-interval-arithmetic.md` new Follow-up. Gates:
+      build clean; full executor suite PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); pgbench smoke via pre-commit hook. **With this the whole
+      `#5(d-iv)` interval/infinity group is COMPLETE across both the timestamp
+      INT64-micros and date INT32-days domains.** Nothing further deferred.
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,

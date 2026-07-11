@@ -257,6 +257,22 @@ func NewTimestampInfinity(positive bool) Datum {
 	return Datum{Kind: KindTime, Int: math.MinInt64}
 }
 
+// NewDateInfinity constructs the +infinity / -infinity DATE sentinel. The date
+// type shares the KindTime INT64-extremes carrier with timestamp — Format /
+// AppendValueText (both intercept Int==MaxInt64/MinInt64 before the flagDate
+// shape), IsTimestampNotFinite (Kind/Int only), and compareDatum (KindTime by
+// Int) are all already sentinel-aware, so no per-domain internal value is
+// needed. flagDate is set to keep the datum tagged as a date (matching ordinary
+// date datums). On the wire the sentinel serialises to PG's DATEVAL_NOEND /
+// DATEVAL_NOBEGIN = PG_INT32_MAX / PG_INT32_MIN days (date_send,
+// postgres/src/include/utils/date.h); see codec.go. (unimplemented_feat #5(d-iv))
+func NewDateInfinity(positive bool) Datum {
+	if positive {
+		return Datum{Kind: KindTime, Int: math.MaxInt64, Flags: flagDate}
+	}
+	return Datum{Kind: KindTime, Int: math.MinInt64, Flags: flagDate}
+}
+
 // NumericMantissaValue is the int64 fast-path mantissa of KindNumeric
 // (valid only when Big == nil).
 func (d Datum) NumericMantissaValue() int64 { return d.Int }

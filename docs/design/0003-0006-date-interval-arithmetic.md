@@ -1732,7 +1732,58 @@ hook. **With this the whole `#5(d-iv)` interval/infinity group is complete.**
 literal input remains unimplemented — the `date` type uses a *different* sentinel
 (`DATEVAL_NOEND`/`NOBEGIN` = `PG_INT32_MAX`/`MIN` days, not the timestamp INT64
 domain), and `evalTypedStringLit`'s `date` case + the date codec would each need
-an analogous carrier + interception. Recorded in the deferral ledger.
+an analogous carrier + interception. Recorded in the deferral ledger. *(Closed by
+the next follow-up.)*
+
+## Follow-up: `date 'infinity'` literal input + cast + wire codec (unimplemented_feat #5(d-iv), 2026-07-11)
+
+Closed the last deferred row of the whole interval/infinity group: the ±infinity
+**date** sentinel is now reachable from direct text input, cast, `pg_input_is_valid`
+and the binary wire codec — mirroring the `timestamp 'infinity'` follow-up above.
+PostgreSQL's `date_in` reuses the same `DecodeDateTime` `DTK_LATE` / `DTK_EARLY`
+`RESERV` tokens, so the accepted spellings are identical (`infinity`, `+infinity`,
+`-infinity`, case-insensitive, trimmed).
+
+**Carrier — shared INT64 value, distinct wire domain.** Internally a date is a
+`KindTime` datum (the same `Int` = Unix-nanoseconds field a timestamp uses, tagged
+with `flagDate`), so the ±infinity date reuses the *same* `math.MaxInt64` /
+`math.MinInt64` sentinel as the timestamp — `Format` / `AppendValueText` (both
+intercept the extremes *before* the `flagDate` render), `IsTimestampNotFinite`
+(`Kind`/`Int` only), `isfinite`, and `compareDatum` (`KindTime` orders by `Int`)
+are therefore already sentinel-aware for dates with **no** change. Only the **wire
+value** differs: PG's `date_send` emits `DATEVAL_NOEND` / `DATEVAL_NOBEGIN` =
+`PG_INT32_MAX` / `PG_INT32_MIN` **days** (`postgres/src/include/utils/date.h`), a
+4-byte INT32 — not the timestamp's 8-byte INT64 micros. New constructor
+`NewDateInfinity(±)` (`datum.go`, sets `flagDate`) + parse helper
+`parseDateInfinityLiteral(s) (Datum, bool)` (`copy_text.go`, sibling of
+`parseTimestampInfinityLiteral`). Wired before the ordinary parse at:
+
+- **Typed literal** `date 'infinity'` — `evalTypedStringLit`'s `date` case
+  (`expr.go`), before the `time.Parse` layout; not time-cached.
+- **Cast** `'infinity'::date` / `CAST(... AS date)` — `evalCast`'s `date` case,
+  before `parseCopyTimestamp`. The same case also now maps a ±infinity
+  **timestamp** operand (`d.Kind == KindTime && IsTimestampNotFinite()`) to the
+  same-signed date infinity instead of reading the sentinel as a garbage instant.
+- **Binary wire codec** — `encodeValuePG`'s `date` case writes `PG_INT32_MAX` /
+  `PG_INT32_MIN` days via a `switch` on `IsTimestampPosInf` / `IsTimestampNegInf`
+  (bypassing the finite `UnixMicro()−epoch`/86400 path); `decodePhysicalPGValueMctx`
+  intercepts those two day values back to `NewDateInfinity` *before* the epoch-day
+  arithmetic (which would overflow).
+- **`pg_input_is_valid('infinity','date')`** — returns `true` for the spellings.
+
+Every `want` verified byte-for-byte against live PostgreSQL 18.3 (throwaway
+initdb, socket `/tmp:5601`): `date '{,-,+}infinity'`, `'Infinity'`,
+`'  -INFINITY  '`, `'infinity'::date`, `CAST('infinity' AS date)`,
+`(timestamp '±infinity')::date`, `isfinite(...)`=`f`,
+`pg_input_is_valid('infinity'/'-infinity'/'not-a-date','date')`=`t`/`t`/`f`, and
+the two ordering comparisons (`> date '9999-12-31'`, `< date '0001-01-01'`) — all
+11 identical. Tests: `internal/executor/date_infinity_literal_test.go`
+(`TestDateInfinityLiteral`, 17 cases; `TestDateInfinityWireCodec`, the INT32
+round-trip). Gates: `go build ./...` clean; full executor suite PASS;
+`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke via pre-commit
+hook. **With this the whole `#5(d-iv)` interval/infinity group — every interval
+typmod / EXTRACT / unary / arithmetic / literal-input form over both the
+timestamp and the date infinity domains — is complete.**
 
 ## Cross-references
 
