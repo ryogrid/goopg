@@ -113,6 +113,15 @@ func (o *valuesOp) Open(ctx *Context) error {
 			o.rows = rematerialiseVirtualRowsFromStrings(tbl, fetchStatTablesRows(ctx, catalog.StatScopeSys))
 		} else if tbl.Name == "pg_stat_user_tables" && ctx != nil {
 			o.rows = rematerialiseVirtualRowsFromStrings(tbl, fetchStatTablesRows(ctx, catalog.StatScopeUser))
+		} else if tbl.Name == "pg_stat_all_indexes" && ctx != nil {
+			// pg_stat_*_indexes list the connecting database's own indexes (the
+			// per-index sibling of pg_stat_*_tables), which the static catalog
+			// VirtualRows fallback cannot scope. M0122-0003.
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, fetchStatIndexesRows(ctx, catalog.StatScopeAll))
+		} else if tbl.Name == "pg_stat_sys_indexes" && ctx != nil {
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, fetchStatIndexesRows(ctx, catalog.StatScopeSys))
+		} else if tbl.Name == "pg_stat_user_indexes" && ctx != nil {
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, fetchStatIndexesRows(ctx, catalog.StatScopeUser))
 		} else if tbl.Name == "pg_class" && ctx != nil && ctx.PgClassRows != nil {
 			// pg_class must list the connecting database's own tables/indexes,
 			// not always DefaultDBOid's — use the per-connection, dbOid-scoped

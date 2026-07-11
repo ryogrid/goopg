@@ -32,3 +32,26 @@ func fetchStatTablesRows(ctx *Context, scope catalog.StatTableScope) [][]string 
 		return nil
 	}
 }
+
+// fetchStatIndexesRows is the per-index sibling of fetchStatTablesRows: it builds
+// the live, per-connection database-scoped row set for the pg_stat_all_indexes /
+// pg_stat_user_indexes / pg_stat_sys_indexes virtual views (scope selects which),
+// using the identical ctx.Catalog-unwrap + ctx.CurrentDatabaseOid scoping. See
+// catalog.PGStatIndexesRowsForDBOid and docs/design/0122-0003-pg-stat-user-tables.md.
+func fetchStatIndexesRows(ctx *Context, scope catalog.StatTableScope) [][]string {
+	if ctx == nil || ctx.Catalog == nil {
+		return nil
+	}
+	type unwrapper interface{ Unwrap() catalog.Catalog }
+	base := ctx.Catalog
+	for {
+		if im, ok := base.(*catalog.InMemory); ok {
+			return im.PGStatIndexesRowsForDBOid(catalog.NamespaceDBOid(ctx.CurrentDatabaseOid), scope)
+		}
+		if u, ok := base.(unwrapper); ok {
+			base = u.Unwrap()
+			continue
+		}
+		return nil
+	}
+}

@@ -7068,6 +7068,87 @@ func (c *InMemory) PGStatTablesRowsForDBOid(dbOid uint32, scope StatTableScope) 
 	return out
 }
 
+// PGStatIndexesRowsForDBOid builds the pg_stat_all_indexes / pg_stat_user_indexes
+// / pg_stat_sys_indexes row set for one database, scoped by `scope` (reusing the
+// same StatTableScope user/sys split as the per-table views). It mirrors
+// upstream's view (system_views.sql: pg_class C JOIN pg_index X JOIN pg_class I,
+// WHERE C.relkind IN ('r','t','m'), one row per index) but goopg has no
+// incremental pgstat index-scan counters (no PgStat_StatIndEntry), so idx_scan /
+// idx_tup_read / idx_tup_fetch are a faithful 0 and last_idx_scan is NULL — the
+// same honest-0/NULL shape the per-table views use. The five real cells are
+// relid / indexrelid / schemaname / relname / indexrelname.
+//
+// Enumeration reuses AllIndexes(dbOid); the parent table (idx.Table) is filtered
+// through the same relation predicate as PGStatTablesRowsForDBOid so the two views
+// agree on the relkind r/m/p set (system-catalog virtual tables, sequences, plain
+// views and foreign tables are skipped). schemaname is the parent table's schema
+// (upstream: N.nspname on C.relnamespace), matching the sys/user split key.
+// pg_stat_sys_indexes is therefore effectively empty, since goopg's system
+// catalogs are storage-less and carry no user indexes. See docs/design/
+// 0122-0003-pg-stat-user-tables.md.
+func (c *InMemory) PGStatIndexesRowsForDBOid(dbOid uint32, scope StatTableScope) [][]string {
+	idxs := c.AllIndexes(dbOid)
+	rows := make([][]string, 0, len(idxs))
+	for _, idx := range idxs {
+		t := idx.Table
+		if t == nil {
+			continue
+		}
+		// Same relation filter as PGStatTablesRowsForDBOid: skip system-catalog
+		// virtual tables, sequences, plain views and foreign tables so the table
+		// and index stat views agree on the underlying relkind r/m/p set.
+		if t.Virtual && t.View == nil && !t.IsMatView && !t.IsSequence {
+			continue
+		}
+		if t.IsSequence {
+			continue
+		}
+		if t.View != nil && !t.IsMatView {
+			continue
+		}
+		if t.ForeignServerName != "" {
+			continue
+		}
+		schema := t.Schema
+		if schema == "" {
+			schema = "public"
+		}
+		switch scope {
+		case StatScopeUser:
+			if isSystemStatSchema(schema) {
+				continue
+			}
+		case StatScopeSys:
+			if !isSystemStatSchema(schema) {
+				continue
+			}
+		}
+		rows = append(rows, []string{
+			strconv.Itoa(int(t.OID)),   // 0: relid (parent table oid)
+			strconv.Itoa(int(idx.OID)), // 1: indexrelid
+			schema,                     // 2: schemaname (parent table schema)
+			t.Name,                     // 3: relname (parent table name)
+			idx.Name,                   // 4: indexrelname
+			"0",                        // 5: idx_scan
+			VirtualNull,                // 6: last_idx_scan
+			"0",                        // 7: idx_tup_read
+			"0",                        // 8: idx_tup_fetch
+		})
+	}
+	// Deterministic order: by (schemaname, relname, indexrelname) — AllIndexes
+	// iteration order is map-derived and unstable.
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i][2] != rows[j][2] {
+			return rows[i][2] < rows[j][2]
+		}
+		if rows[i][3] != rows[j][3] {
+			return rows[i][3] < rows[j][3]
+		}
+		return rows[i][4] < rows[j][4]
+	})
+	return rows
+}
+
 func (c *InMemory) registerSystemTables() {
 	pgClass := &Table{
 		Schema: "pg_catalog",
@@ -8167,6 +8248,47 @@ func (c *InMemory) registerSystemTables() {
 			OID:     v.oid,
 		}
 		tbl.VirtualRows = func() [][]string { return c.PGStatTablesRowsForDBOid(DefaultDBOid, scope) }
+		c.ns(DefaultDBOid).tables["pg_catalog."+v.name] = tbl
+	}
+
+	// pg_stat_all_indexes / pg_stat_user_indexes / pg_stat_sys_indexes — per-index
+	// access statistics (PG's system_views.sql), the direct sibling of the per-table
+	// views above. Same live-scoping wiring: the static VirtualRows fallback scopes
+	// to DefaultDBOid, executor.fetchStatIndexesRows resolves the connecting
+	// database and is swapped in at valuesOp.Open. goopg has no incremental index
+	// scan counters, so idx_scan/idx_tup_read/idx_tup_fetch are a faithful 0 and
+	// last_idx_scan NULL; relid/indexrelid/schemaname/relname/indexrelname are real.
+	// See catalog.PGStatIndexesRowsForDBOid and docs/design/
+	// 0122-0003-pg-stat-user-tables.md.
+	statIndexesColumns := func() []Column {
+		return []Column{
+			{Name: "relid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "indexrelid", Type: Type{Name: "oid"}, Ordinal: 1},
+			{Name: "schemaname", Type: Type{Name: "name"}, Ordinal: 2},
+			{Name: "relname", Type: Type{Name: "name"}, Ordinal: 3},
+			{Name: "indexrelname", Type: Type{Name: "name"}, Ordinal: 4},
+			{Name: "idx_scan", Type: Type{Name: "int8"}, Ordinal: 5},
+			{Name: "last_idx_scan", Type: Type{Name: "timestamptz"}, Ordinal: 6},
+			{Name: "idx_tup_read", Type: Type{Name: "int8"}, Ordinal: 7},
+			{Name: "idx_tup_fetch", Type: Type{Name: "int8"}, Ordinal: 8},
+		}
+	}
+	for _, v := range []struct {
+		name  string
+		oid   uint32
+		scope StatTableScope
+	}{
+		{"pg_stat_all_indexes", 9084, StatScopeAll},
+		{"pg_stat_sys_indexes", 9085, StatScopeSys},
+		{"pg_stat_user_indexes", 9086, StatScopeUser},
+	} {
+		scope := v.scope
+		tbl := &Table{
+			Schema: "pg_catalog", Name: v.name, Virtual: true,
+			Columns: statIndexesColumns(),
+			OID:     v.oid,
+		}
+		tbl.VirtualRows = func() [][]string { return c.PGStatIndexesRowsForDBOid(DefaultDBOid, scope) }
 		c.ns(DefaultDBOid).tables["pg_catalog."+v.name] = tbl
 	}
 

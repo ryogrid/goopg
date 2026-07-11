@@ -83,11 +83,57 @@ branches exactly.
   with real relname/schemaname and non-NULL `n_live_tup`),
   `TestPgStatSysTablesExcludesUserTable` (schemaname split end-to-end).
 
+## Sibling: `pg_stat_all_indexes` / `pg_stat_user_indexes` / `pg_stat_sys_indexes`
+
+The per-index access-statistics views are the direct sibling of the per-table
+views and land the same way. Upstream (`system_views.sql`):
+
+```sql
+CREATE VIEW pg_stat_all_indexes AS
+    SELECT C.oid AS relid, I.oid AS indexrelid, N.nspname AS schemaname,
+           C.relname AS relname, I.relname AS indexrelname,
+           pg_stat_get_numscans(I.oid)          AS idx_scan,
+           pg_stat_get_lastscan(I.oid)          AS last_idx_scan,
+           pg_stat_get_tuples_returned(I.oid)   AS idx_tup_read,
+           pg_stat_get_tuples_fetched(I.oid)    AS idx_tup_fetch
+    FROM pg_class C JOIN pg_index X ON C.oid = X.indrelid
+                    JOIN pg_class I ON I.oid = X.indexrelid
+                    LEFT JOIN pg_namespace N ON N.oid = C.relnamespace
+    WHERE C.relkind IN ('r', 't', 'm');
+```
+
+`pg_stat_{user,sys}_indexes` reuse the identical `schemaname` split as the table
+views (keyed on the parent table's schema), so the row builder reuses the same
+`StatTableScope`.
+
+- Row builder — `catalog.PGStatIndexesRowsForDBOid(dbOid, scope)`: enumerates
+  `AllIndexes(dbOid)`, filters each index's parent table (`idx.Table`) through
+  the *same* relation predicate as `PGStatTablesRowsForDBOid` so the two views
+  agree on the underlying relkind `r`/`m`/`p` set, and emits the 9-column row
+  `relid / indexrelid / schemaname / relname / indexrelname / idx_scan /
+  last_idx_scan / idx_tup_read / idx_tup_fetch`. The five identity cells are real;
+  the three scan counters are a faithful `0` and `last_idx_scan` is `NULL`
+  (honest-0/NULL, matching the table views and `pg_stat_io`). Rows are sorted by
+  `(schemaname, relname, indexrelname)` since `AllIndexes` order is map-derived.
+- Per-connection scoping — `executor.fetchStatIndexesRows(ctx, scope)`: the exact
+  `ctx.Catalog`-unwrap + `ctx.CurrentDatabaseOid` twin of `fetchStatTablesRows`,
+  swapped in at `valuesOp.Open`'s three new `pg_stat_*_indexes` branches; the
+  static `VirtualRows` fallback scopes to `DefaultDBOid`.
+
+Tests: `internal/catalog/pgstat_indexes_test.go`
+(`TestPGStatIndexesRowsBasicShape` — 9-col width, real identity cells, counters
+`0`/`last_idx_scan` NULL; `TestPGStatIndexesScopeFilter` — public-schema index in
+all+user, not sys) and `internal/executor/pgstat_indexes_e2e_test.go`
+(`TestPgStatUserIndexesEndToEnd` full planner→executor resolution;
+`TestPgStatSysIndexesExcludesUserIndex` schemaname split end-to-end).
+
 ## Deferred
 
 The scan/tuple/vacuum/analyze counters and `last_*` timestamps remain honest
 zeros/NULLs until goopg grows a cumulative per-table statistics subsystem
-(`PgStat_StatTabEntry` analog). Because system catalogs are storage-less,
-`pg_stat_sys_tables` returns no rows even though upstream lists the catalog
-relations. Both are recorded in `.ralph/deferral_ledger.md` with a resume
-point.
+(`PgStat_StatTabEntry` analog). The index views share the same gap: `idx_scan` /
+`idx_tup_read` / `idx_tup_fetch` / `last_idx_scan` stay `0`/`NULL` until a
+`PgStat_StatIndEntry` analog exists. Because system catalogs are storage-less and
+carry no user indexes, `pg_stat_sys_tables` and `pg_stat_sys_indexes` return no
+rows even though upstream lists the catalog relations. All are recorded in
+`.ralph/deferral_ledger.md` with a resume point.

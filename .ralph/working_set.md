@@ -1,25 +1,34 @@
 (idle — nothing in flight)
 
-## Loop summary (2026-07-12, loop #75)
+## Loop summary (2026-07-12, loop #76)
 
-**Resumed cut-off loop #74's in-flight WIP** (working_set was stale from #73):
-`pg_stat_all_tables` / `pg_stat_user_tables` / `pg_stat_sys_tables` system views
-(M0122-0003 sub-slice). Files were already written+building; I finished it:
-- Verified build + targeted/full catalog & executor package tests PASS.
-- Wrote the MISSING referenced design doc
-  `docs/design/0122-0003-pg-stat-user-tables.md` + README index row.
-- Appended deferral-ledger row (missing per-table counter subsystem;
-  empty pg_stat_sys_tables since system catalogs are storage-less).
-- Added the fix_plan M0122-0003 banner note.
-- Gates: catalog+executor full PASS; tpch-spotcheck PASS (Q12=2/Q13=33);
-  pgbench smoke via pre-commit hook. Committed.
+**Task (M0122-0003 sub-slice):** added the three per-index access-statistics
+system views `pg_stat_all_indexes` / `pg_stat_user_indexes` /
+`pg_stat_sys_indexes` — the direct sibling of the per-table views landed
+earlier the same day.
 
-**Nightly triage — batch `20260712-020530` (39 items):** NOT real regressions.
-Evidence log (`ci/logs/20260712-020530/testport/go-test.log`) shows the failures
-are all `dial tcp 127.0.0.1:39219: connect: connection refused` — a single
-co-load server-unavailability cascade (TPC-H co-load starves initdb/server
-start, known signature). No new M-NIGHTLY tasks added; do NOT treat these 39 as
-independent product regressions. If they recur in an ISOLATED (non-co-load) run,
-re-triage.
+- `catalog.PGStatIndexesRowsForDBOid(dbOid, scope)` (internal/catalog/catalog.go):
+  enumerates `AllIndexes(dbOid)`, filters each index's parent table through the
+  SAME relation predicate as `PGStatTablesRowsForDBOid`, emits the 9-col upstream
+  row (`relid/indexrelid/schemaname/relname/indexrelname/idx_scan/last_idx_scan/
+  idx_tup_read/idx_tup_fetch`) sorted by (schemaname,relname,indexrelname).
+  Reuses `StatTableScope` for the identical user/sys split.
+- Registered 3 virtual views (OIDs 9084/9085/9086) in `registerSystemTables`.
+- `executor.fetchStatIndexesRows` (internal/executor/pgstat_tables.go) is the
+  per-connection twin of `fetchStatTablesRows`; wired at valuesOp.Open
+  (internal/executor/operators.go) via three new branches.
+- Honest-0/NULL: 5 identity cells real, 3 scan counters 0, last_idx_scan NULL.
+- Tests: internal/catalog/pgstat_indexes_test.go +
+  internal/executor/pgstat_indexes_e2e_test.go — PASS.
+- Design: docs/design/0122-0003-pg-stat-user-tables.md new sibling section +
+  README row. Ledger row + fix_plan banner note appended.
+
+**Gates:** catalog+executor full packages PASS; go build ./... clean;
+tpch-spotcheck PASS (Q12=2/Q13=33); pgbench smoke via pre-commit hook.
+Committed + pushed.
+
+**Nightly:** batch 20260712-020530 already triaged by loop #75 (121
+connection-refused lines = co-load cascade, not real regressions). No new
+M-NIGHTLY tasks.
 
 In-flight: none

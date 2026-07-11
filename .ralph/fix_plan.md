@@ -3806,6 +3806,28 @@ mirroring M0119's ledger `status` column.
       Ledger row (2026-07-12) records the missing per-table counter
       subsystem + empty `pg_stat_sys_tables`. Gates: catalog+executor full
       packages PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33).
+      **`pg_stat_all_indexes`/`pg_stat_user_indexes`/`pg_stat_sys_indexes`
+      done (2026-07-12, later loop):** the direct per-index sibling of the
+      table views now resolves (previously unknown-relation errors).
+      `catalog.PGStatIndexesRowsForDBOid(dbOid, scope)` enumerates
+      `AllIndexes(dbOid)`, filters each index's parent table through the SAME
+      relation predicate as the table view, and emits the 9-col upstream row
+      (`relid/indexrelid/schemaname/relname/indexrelname/idx_scan/
+      last_idx_scan/idx_tup_read/idx_tup_fetch`) sorted by
+      `(schemaname,relname,indexrelname)`, reusing `StatTableScope` for the
+      identical user/sys split. `executor.fetchStatIndexesRows`
+      (`internal/executor/pgstat_tables.go`) is the per-connection twin of
+      `fetchStatTablesRows`, wired at `valuesOp.Open`'s three new
+      `pg_stat_*_indexes` branches; static `VirtualRows` fallback scopes to
+      `DefaultDBOid`. Following the `pg_stat_io` honest-0/NULL precedent the
+      five identity cells are real, the three scan counters 0 /
+      `last_idx_scan` NULL. Tests: `internal/catalog/pgstat_indexes_test.go`
+      + `internal/executor/pgstat_indexes_e2e_test.go`. Design:
+      `docs/design/0122-0003-pg-stat-user-tables.md` new sibling section +
+      README row. Ledger row (2026-07-12) records the missing per-index
+      counter subsystem (`PgStat_StatIndEntry` analog) + empty
+      `pg_stat_sys_indexes`. Gates: catalog+executor full packages PASS;
+      `scripts/tpch-spotcheck.sh` PASS.
 - [x] **M0122-0004 — SQL language / executor features** (~21). Window frame
       ROWS/RANGE/GROUPS, GROUPING SETS/ROLLUP/CUBE, DEFAULT-clause
       parsing, intervals. **WITH CHECK
