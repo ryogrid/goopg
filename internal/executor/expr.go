@@ -1400,7 +1400,7 @@ func evalBinary(op parser.OpCode, left, right Datum, pos int) (Datum, error) {
 		// interval ± interval → interval (component-wise), matching
 		// interval_pl / interval_mi.
 		if left.Kind == KindInterval && right.Kind == KindInterval {
-			return addIntervalInterval(left, right, op == parser.OpSub), nil
+			return addIntervalInterval(left, right, op == parser.OpSub, pos)
 		}
 		// NUMERIC ± NUMERIC, NUMERIC ± INT, INT ± NUMERIC: promote
 		// the int side to KindNumeric{scale=0} and reuse the same
@@ -1939,17 +1939,105 @@ func subTimeTime(left, right Datum) Datum {
 	return NewIntervalDatumFull(0, int32(days), micros)
 }
 
-// addIntervalInterval implements `interval ± interval`, combining the
-// month/day/microsecond fields independently (interval_pl / interval_mi).
-func addIntervalInterval(left, right Datum, subtract bool) Datum {
+// intervalOutOfRange is PG's error for a non-representable interval result
+// (overflow, or an "infinity − infinity" that has no NaN equivalent).
+// Mirrors ereport(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE, "interval out of range").
+func intervalOutOfRange(pos int) error {
+	return &ExecError{Code: "22008", Pos: pos, Message: "interval out of range"}
+}
+
+// finiteIntervalArith adds (or subtracts, when subtract) two FINITE intervals
+// field-by-field, erroring on int32/int64 field overflow OR on a result that
+// lands on a ±infinity sentinel — matching finite_interval_pl / finite_interval_mi
+// (both guard with INTERVAL_NOT_FINITE(result)). (unimplemented_feat #5(d-iv))
+func finiteIntervalArith(left, right Datum, subtract bool, pos int) (Datum, error) {
 	sign := int64(1)
 	if subtract {
 		sign = -1
 	}
 	months := int64(left.IntervalMonthsValue()) + sign*int64(right.IntervalMonthsValue())
 	days := int64(left.IntervalDaysValue()) + sign*int64(right.IntervalDaysValue())
-	micros := left.IntervalMicrosValue() + sign*right.IntervalMicrosValue()
-	return NewIntervalDatumFull(int32(months), int32(days), micros)
+	// time is int64; detect true 64-bit add/sub overflow (same guards as arithmetic()).
+	lt, rt := left.IntervalMicrosValue(), right.IntervalMicrosValue()
+	var micros int64
+	if subtract {
+		micros = lt - rt
+		if (lt^rt)&(lt^micros) < 0 {
+			return Datum{}, intervalOutOfRange(pos)
+		}
+	} else {
+		micros = lt + rt
+		if (lt^micros)&(rt^micros) < 0 {
+			return Datum{}, intervalOutOfRange(pos)
+		}
+	}
+	if months > math.MaxInt32 || months < math.MinInt32 ||
+		days > math.MaxInt32 || days < math.MinInt32 {
+		return Datum{}, intervalOutOfRange(pos)
+	}
+	res := NewIntervalDatumFull(int32(months), int32(days), micros)
+	if res.IsIntervalNotFinite() {
+		// Finite arithmetic must never synthesise a ±infinity sentinel.
+		return Datum{}, intervalOutOfRange(pos)
+	}
+	return res, nil
+}
+
+// intervalInfinityRank maps an interval to its ordering rank against the
+// ±infinity sentinels: −1 for −infinity, +1 for +infinity, 0 for any finite
+// interval. Used only to order the sentinels exactly in compareDatums.
+func intervalInfinityRank(d Datum) int {
+	switch {
+	case d.IsIntervalNoBegin():
+		return -1
+	case d.IsIntervalNoEnd():
+		return 1
+	default:
+		return 0
+	}
+}
+
+// addIntervalInterval implements `interval ± interval`, combining the
+// month/day/microsecond fields independently (interval_pl / interval_mi).
+// ±infinity operands short-circuit exactly as upstream: like-signed infinities
+// pass through, but any "infinity − infinity" (interval has no NaN) errors.
+func addIntervalInterval(left, right Datum, subtract bool, pos int) (Datum, error) {
+	if !subtract {
+		// interval_pl
+		switch {
+		case left.IsIntervalNoBegin():
+			if right.IsIntervalNoEnd() {
+				return Datum{}, intervalOutOfRange(pos)
+			}
+			return NewIntervalInfinity(false), nil
+		case left.IsIntervalNoEnd():
+			if right.IsIntervalNoBegin() {
+				return Datum{}, intervalOutOfRange(pos)
+			}
+			return NewIntervalInfinity(true), nil
+		case right.IsIntervalNotFinite():
+			return right, nil
+		}
+		return finiteIntervalArith(left, right, false, pos)
+	}
+	// interval_mi
+	switch {
+	case left.IsIntervalNoBegin():
+		if right.IsIntervalNoBegin() {
+			return Datum{}, intervalOutOfRange(pos)
+		}
+		return NewIntervalInfinity(false), nil
+	case left.IsIntervalNoEnd():
+		if right.IsIntervalNoEnd() {
+			return Datum{}, intervalOutOfRange(pos)
+		}
+		return NewIntervalInfinity(true), nil
+	case right.IsIntervalNoBegin():
+		return NewIntervalInfinity(true), nil
+	case right.IsIntervalNoEnd():
+		return NewIntervalInfinity(false), nil
+	}
+	return finiteIntervalArith(left, right, true, pos)
 }
 
 func arithmetic(op parser.OpCode, a, b int64, pos int) (Datum, error) {
@@ -2389,6 +2477,22 @@ func compareDatum(a, b Datum, pos int) (int, error) {
 		}
 		return 0, nil
 	case KindInterval:
+		// ±infinity sentinels order exactly: −infinity precedes and +infinity
+		// follows every finite interval (and each other), matching
+		// interval_cmp_internal's non-finite short-circuit. Must run before the
+		// lossy day-widening below, whose int64 sum is not exact at the extremes.
+		if a.IsIntervalNotFinite() || b.IsIntervalNotFinite() {
+			ra := intervalInfinityRank(a)
+			rb := intervalInfinityRank(b)
+			switch {
+			case ra < rb:
+				return -1, nil
+			case ra > rb:
+				return 1, nil
+			default:
+				return 0, nil
+			}
+		}
 		// Mirrors PostgreSQL's interval_cmp_value (timestamp.c): months are
 		// widened to days at a fixed 30-day rate and combined with the day
 		// field plus the whole-day part of the microsecond component into a

@@ -1127,3 +1127,64 @@ func TestIntervalInfinityLiterals(t *testing.T) {
 		}
 	}
 }
+
+// TestIntervalInfinityArithmetic exercises the operator short-circuits for
+// ±infinity interval operands, mirroring interval_pl / interval_mi and
+// interval_cmp_internal (postgres/src/backend/utils/adt/timestamp.c).
+// (unimplemented_feat #5(d-iv))
+func TestIntervalInfinityArithmetic(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+	if err := runDDL(t, ctx, "CREATE TABLE t (id int)"); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	if err := runDDL(t, ctx, "INSERT INTO t VALUES (1)"); err != nil {
+		t.Fatalf("INSERT: %v", err)
+	}
+	accept := []struct{ sql, want string }{
+		// interval_pl: like-signed / one-finite infinities pass through.
+		{"SELECT interval 'infinity' + interval '1 day'", "infinity"},
+		{"SELECT interval '1 day' + interval 'infinity'", "infinity"},
+		{"SELECT interval 'infinity' + interval 'infinity'", "infinity"},
+		{"SELECT interval '-infinity' + interval '1 day'", "-infinity"},
+		{"SELECT interval '1 day' + interval '-infinity'", "-infinity"},
+		{"SELECT interval '-infinity' + interval '-infinity'", "-infinity"},
+		// interval_mi.
+		{"SELECT interval 'infinity' - interval '1 day'", "infinity"},
+		{"SELECT interval '-infinity' - interval '1 day'", "-infinity"},
+		{"SELECT interval 'infinity' - interval '-infinity'", "infinity"},
+		{"SELECT interval '-infinity' - interval 'infinity'", "-infinity"},
+		{"SELECT interval '1 day' - interval 'infinity'", "-infinity"},
+		{"SELECT interval '1 day' - interval '-infinity'", "infinity"},
+		// Ordering: −infinity precedes and +infinity follows every finite value
+		// and each other.
+		{"SELECT interval 'infinity' > interval '1000 years'", "t"},
+		{"SELECT interval '-infinity' < interval '1 day'", "t"},
+		{"SELECT interval 'infinity' > interval '-infinity'", "t"},
+		{"SELECT interval 'infinity' = interval 'infinity'", "t"},
+		{"SELECT interval '-infinity' = interval '-infinity'", "t"},
+		{"SELECT interval 'infinity' = interval '-infinity'", "f"},
+	}
+	for _, c := range accept {
+		rows := runQuery(t, ctx, c.sql+" FROM t")
+		if len(rows) != 1 || len(rows[0]) != 1 {
+			t.Fatalf("%s: expected 1x1 result, got %v", c.sql, rows)
+		}
+		if got := rows[0][0].Format(); got != c.want {
+			t.Errorf("%s = %q, want %q", c.sql, got, c.want)
+		}
+	}
+
+	// "infinity − infinity" has no NaN equivalent → error (interval out of range).
+	reject := []string{
+		"SELECT interval 'infinity' + interval '-infinity' FROM t",
+		"SELECT interval '-infinity' + interval 'infinity' FROM t",
+		"SELECT interval 'infinity' - interval 'infinity' FROM t",
+		"SELECT interval '-infinity' - interval '-infinity' FROM t",
+	}
+	for _, sql := range reject {
+		if _, err := runQueryErr(t, ctx, sql); err == nil {
+			t.Errorf("%s: expected error, got none", sql)
+		}
+	}
+}

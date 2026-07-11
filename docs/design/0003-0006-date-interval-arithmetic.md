@@ -1277,6 +1277,41 @@ accepts + 10 rejects, both sibling paths). Gates: `go build`/`go vet` clean; par
 + executor suites PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench
 smoke via pre-commit hook.
 
+## Follow-up (2026-07-11): interval `±infinity` add/sub + ordering (#5(d-iv))
+
+Closed the first half of the operator short-circuits the literal follow-up above
+deferred. `interval ± interval` (`addIntervalInterval`, `internal/executor/expr.go`)
+now line-ports PG's `interval_pl` / `interval_mi`
+(`postgres/src/backend/utils/adt/timestamp.c`): a `NOBEGIN`/`NOEND` operand carries
+its sign through the result (`interval 'infinity' + '1 day'` → `infinity`,
+`'1 day' - 'infinity'` → `-infinity`, `'infinity' - '-infinity'` → `infinity`),
+while every "infinity − infinity" combination (`'infinity' + '-infinity'`,
+`'-infinity' + 'infinity'`, `'infinity' - 'infinity'`, `'-infinity' - '-infinity'`)
+raises **`interval out of range`** (SQLSTATE `22008`, `ERRCODE_DATETIME_VALUE_OUT_OF_RANGE`)
+— the interval type has no `NaN`. The finite arm (`finiteIntervalArith`) additionally
+int32/int64-overflow-guards each field and rejects a finite computation that lands on
+a sentinel triple, mirroring `finite_interval_pl` / `finite_interval_mi`'s
+`INTERVAL_NOT_FINITE(result)` guard (goopg previously wrapped silently).
+
+Comparison is exact, not incidental: the `KindInterval` arm of `compareDatums` now
+routes non-finite operands through `intervalInfinityRank` **before** the lossy
+30-day-widening sum (whose `int64` accumulation is not exact at the field extremes),
+so `−infinity` sorts below every finite interval, `+infinity` above, and the two
+sentinels compare equal to themselves / unequal to each other. Tests:
+`interval_subday_test.go` new `TestIntervalInfinityArithmetic` (18 accepts + 4
+out-of-range rejects).
+
+**Still deferred.** `extract(epoch from interval 'infinity')` → `Infinity` is blocked
+by a *larger* gap than infinity: `evalExtract` accepts only a `KindTime` source, so
+extract-from-interval is unsupported for **any** interval; add a `KindInterval` arm
+(all fields, `interval_part` in `timestamp.c`) as its own feature, returning
+±`math.Inf` for the sentinels. Also open: `timestamp ± interval 'infinity'` (needs a
+new **infinite-timestamp** carrier, analogous to this interval sentinel), unary
+`- interval 'infinity'` (`interval_um` — extend `evalUnary` to accept intervals), and
+the leading/cast-form typmod `CAST(... AS interval hour to minute)` / `interval(p)
+'...'`. Gates: `go build`/`go vet` clean; parser + executor suites PASS;
+`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke via pre-commit hook.
+
 ## Cross-references
 
 - TPC-H query bodies: HammerDB upstream

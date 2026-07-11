@@ -8020,6 +8020,30 @@ mirroring M0119's ledger `status` column.
       Follow-up section + README row. Gates: build/vet clean;
       parser/planner/executor suites PASS; `scripts/tpch-spotcheck.sh` PASS
       (Q12=2/Q13=33); pgbench smoke (hook).
+  - [x] `unimplemented_feat #5(d-iv) (interval ±infinity add/sub + ordering)`
+      (2026-07-11, this loop) — closed the FIRST half of the operator
+      short-circuits the ±infinity-literal loop deferred. `interval ± interval`
+      (`addIntervalInterval`, `internal/executor/expr.go`) line-ports PG's
+      `interval_pl`/`interval_mi` (timestamp.c): a NOBEGIN/NOEND operand carries
+      its sign through (`'infinity' + '1 day'`=infinity, `'1 day' - 'infinity'`=
+      -infinity, `'infinity' - '-infinity'`=infinity), while every
+      "infinity − infinity" (`'infinity' + '-infinity'`, `'-infinity' +
+      'infinity'`, `'infinity' - 'infinity'`, `'-infinity' - '-infinity'`) raises
+      `interval out of range` (SQLSTATE 22008, ERRCODE_DATETIME_VALUE_OUT_OF_RANGE
+      — interval has no NaN). New `finiteIntervalArith` int32/int64-overflow-guards
+      each field AND rejects a finite result landing on a sentinel (mirrors
+      `finite_interval_pl/_mi`'s `INTERVAL_NOT_FINITE(result)`; previously wrapped
+      silently). Comparison (`compareDatums` KindInterval arm) exact-orders the
+      sentinels via new `intervalInfinityRank` BEFORE the lossy 30-day-widening
+      sum: −infinity < finite < +infinity, self=self, +inf≠−inf. Still deferred
+      (ledger 2026-07-11): `extract(epoch from interval …)` (blocked by
+      extract-from-interval being unsupported for ANY interval, not just infinity),
+      `timestamp ± interval 'infinity'` (needs infinite-timestamp carrier), unary
+      `- interval 'infinity'` (`interval_um`), cast-form typmod. Tests:
+      `interval_subday_test.go` new `TestIntervalInfinityArithmetic` (18 accepts +
+      4 rejects). Design doc `docs/design/0003-0006-*` new Follow-up section. Gates:
+      build/vet clean; parser+executor suites PASS; `scripts/tpch-spotcheck.sh`
+      PASS (Q12=2/Q13=33); pgbench smoke (hook).
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,
