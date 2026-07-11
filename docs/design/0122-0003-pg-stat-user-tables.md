@@ -169,12 +169,36 @@ block counters `0`; `TestPGStatioTablesScopeFilter`; `TestPGStatioIndexesRowsBas
 (`TestPgStatioUserTablesEndToEnd`, `TestPgStatioUserIndexesEndToEnd`,
 `TestPgStatioSysTablesExcludesUserTable`).
 
-**Deferred (this sibling):** the `pg_statio_all_sequences` / `pg_statio_{user,sys}_sequences`
-trio (relkind `'S'`, columns `relid/schemaname/relname/blks_read/blks_hit`) is
-not yet registered — sequence enumeration is a distinct filter (`t.IsSequence`,
-skipped by both table and index builders) and lands as a follow-up. The block
-counters themselves stay `0` until goopg grows per-relation buffer-pool
-attribution (a `BufferUsage`-per-relation analog).
+## Sequence sibling: `pg_statio_all_sequences` / `pg_statio_{user,sys}_sequences`
+
+The sequence I/O trio completes the `pg_statio_*` family. Upstream
+(`system_views.sql`) selects `pg_class` `WHERE relkind = 'S'` and exposes five
+columns:
+
+```sql
+-- pg_statio_all_sequences (5 cols)
+relid, schemaname, relname, blks_read, blks_hit
+```
+
+This is the only `pg_statio_*` view whose relation filter *selects* sequences
+rather than skipping them: `catalog.PGStatioSequencesRowsForDBOid(dbOid, scope)`
+loops the per-DB tables keeping exactly `t.IsSequence`, applies the same
+`StatTableScope` user/sys `schemaname` split, and emits real
+`relid/schemaname/relname` with `blks_read`/`blks_hit` a faithful `0` (no
+per-relation buffer attribution). `executor.fetchStatioSequencesRows` is the
+per-connection `ctx.Catalog`-unwrap + `ctx.CurrentDatabaseOid` twin, wired at
+`valuesOp.Open`'s three new `pg_statio_*_sequences` branches; static
+`VirtualRows` fallbacks (OIDs 9093–9095) scope to `DefaultDBOid`.
+
+Tests: `internal/catalog/pgstatio_test.go`
+(`TestPGStatioSequencesRowsBasicShape` — 5-col width, real identity cells, both
+block counters `0`, plain table excluded; `TestPGStatioSequencesScopeFilter`) and
+`internal/executor/pgstatio_e2e_test.go` (`TestPgStatioUserSequencesEndToEnd` —
+sequence projected, plain table excluded).
+
+The block counters stay `0` until goopg grows per-relation buffer-pool
+attribution (a `BufferUsage`-per-relation analog), shared with the table/index
+gap above.
 
 ## Deferred
 

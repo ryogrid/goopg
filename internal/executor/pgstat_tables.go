@@ -103,3 +103,27 @@ func fetchStatioIndexesRows(ctx *Context, scope catalog.StatTableScope) [][]stri
 		return nil
 	}
 }
+
+// fetchStatioSequencesRows is the per-sequence buffer-pool I/O sibling of
+// fetchStatioTablesRows: it builds the live, per-connection database-scoped row set
+// for the pg_statio_all_sequences / pg_statio_user_sequences / pg_statio_sys_sequences
+// virtual views (scope selects which), using the identical ctx.Catalog-unwrap +
+// ctx.CurrentDatabaseOid scoping. See catalog.PGStatioSequencesRowsForDBOid and
+// docs/design/0122-0003-pg-stat-user-tables.md.
+func fetchStatioSequencesRows(ctx *Context, scope catalog.StatTableScope) [][]string {
+	if ctx == nil || ctx.Catalog == nil {
+		return nil
+	}
+	type unwrapper interface{ Unwrap() catalog.Catalog }
+	base := ctx.Catalog
+	for {
+		if im, ok := base.(*catalog.InMemory); ok {
+			return im.PGStatioSequencesRowsForDBOid(catalog.NamespaceDBOid(ctx.CurrentDatabaseOid), scope)
+		}
+		if u, ok := base.(unwrapper); ok {
+			base = u.Unwrap()
+			continue
+		}
+		return nil
+	}
+}

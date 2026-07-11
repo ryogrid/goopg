@@ -139,6 +139,14 @@ func (o *valuesOp) Open(ctx *Context) error {
 			o.rows = rematerialiseVirtualRowsFromStrings(tbl, fetchStatioIndexesRows(ctx, catalog.StatScopeSys))
 		} else if tbl.Name == "pg_statio_user_indexes" && ctx != nil {
 			o.rows = rematerialiseVirtualRowsFromStrings(tbl, fetchStatioIndexesRows(ctx, catalog.StatScopeUser))
+		} else if tbl.Name == "pg_statio_all_sequences" && ctx != nil {
+			// pg_statio_*_sequences list the connecting database's own sequences'
+			// buffer-pool I/O stats (the sequence sibling of pg_statio_*_tables). M0122-0003.
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, fetchStatioSequencesRows(ctx, catalog.StatScopeAll))
+		} else if tbl.Name == "pg_statio_sys_sequences" && ctx != nil {
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, fetchStatioSequencesRows(ctx, catalog.StatScopeSys))
+		} else if tbl.Name == "pg_statio_user_sequences" && ctx != nil {
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, fetchStatioSequencesRows(ctx, catalog.StatScopeUser))
 		} else if tbl.Name == "pg_class" && ctx != nil && ctx.PgClassRows != nil {
 			// pg_class must list the connecting database's own tables/indexes,
 			// not always DefaultDBOid's — use the per-connection, dbOid-scoped

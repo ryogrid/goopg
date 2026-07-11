@@ -127,3 +127,86 @@ func TestPGStatioIndexesRowsBasicShape(t *testing.T) {
 		}
 	}
 }
+
+// TestPGStatioSequencesRowsBasicShape pins the pg_statio_all_sequences row set built
+// by PGStatioSequencesRowsForDBOid: a sequence is emitted with real relid/schemaname/
+// relname and both block counters a faithful 0. Crucially this view selects sequences
+// (relkind 'S') — the inverse of the table/index filter, which skips them. M0122-0003.
+func TestPGStatioSequencesRowsBasicShape(t *testing.T) {
+	c := NewInMemory()
+	seq, err := c.CreateTable(parser.ObjectName{Name: "widgets_id_seq"}, []Column{
+		{Name: "last_value", Type: Type{Name: "int8"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seq.IsSequence = true
+
+	// A plain table must NOT appear in the sequences view.
+	if _, err := c.CreateTable(parser.ObjectName{Name: "widgets"}, []Column{
+		{Name: "id", Type: Type{Name: "int4"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	rows := c.PGStatioSequencesRowsForDBOid(DefaultDBOid, StatScopeAll)
+	var got []string
+	for _, r := range rows {
+		if r[2] == "widgets" {
+			t.Fatalf("plain table widgets must not appear in pg_statio_all_sequences")
+		}
+		if r[2] == "widgets_id_seq" {
+			got = r
+		}
+	}
+	if got == nil {
+		t.Fatalf("widgets_id_seq not found in pg_statio_all_sequences rows (%d rows)", len(rows))
+	}
+	if len(got) != 5 {
+		t.Fatalf("row width = %d, want 5", len(got))
+	}
+	if got[0] != strconv.Itoa(int(seq.OID)) {
+		t.Errorf("relid = %q, want sequence OID %d", got[0], seq.OID)
+	}
+	if got[1] != "public" {
+		t.Errorf("schemaname = %q, want public", got[1])
+	}
+	// blks_read(3) / blks_hit(4) are a faithful 0.
+	for _, i := range []int{3, 4} {
+		if got[i] != "0" {
+			t.Errorf("column %d = %q, want 0 (untracked)", i, got[i])
+		}
+	}
+}
+
+// TestPGStatioSequencesScopeFilter confirms a user-schema sequence appears in
+// pg_statio_all_sequences and pg_statio_user_sequences but not pg_statio_sys_sequences,
+// matching upstream's schemaname WHERE split. M0122-0003.
+func TestPGStatioSequencesScopeFilter(t *testing.T) {
+	c := NewInMemory()
+	seq, err := c.CreateTable(parser.ObjectName{Name: "gadgets_id_seq"}, []Column{
+		{Name: "last_value", Type: Type{Name: "int8"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seq.IsSequence = true
+
+	has := func(scope StatTableScope) bool {
+		for _, r := range c.PGStatioSequencesRowsForDBOid(DefaultDBOid, scope) {
+			if r[2] == "gadgets_id_seq" {
+				return true
+			}
+		}
+		return false
+	}
+	if !has(StatScopeAll) {
+		t.Error("gadgets_id_seq missing from pg_statio_all_sequences")
+	}
+	if !has(StatScopeUser) {
+		t.Error("gadgets_id_seq missing from pg_statio_user_sequences")
+	}
+	if has(StatScopeSys) {
+		t.Error("gadgets_id_seq must not appear in pg_statio_sys_sequences (public is a user schema)")
+	}
+}

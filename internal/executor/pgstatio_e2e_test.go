@@ -69,6 +69,52 @@ func TestPgStatioUserIndexesEndToEnd(t *testing.T) {
 	}
 }
 
+// TestPgStatioUserSequencesEndToEnd confirms pg_statio_user_sequences resolves as a
+// virtual view, the pg_statio_*_sequences valuesOp branch fires, and a user sequence
+// is projected with real schemaname/relname and honest-0 block counters. The plain
+// user table (items) must NOT appear (relkind 'S' filter). M0122-0003.
+func TestPgStatioUserSequencesEndToEnd(t *testing.T) {
+	ctx, cat, cleanup := newStorageFixture(t)
+	defer cleanup()
+
+	im := cat.(*catalog.InMemory)
+	seq, err := im.CreateTable(parser.ObjectName{Name: "items_id_seq"}, []catalog.Column{
+		{Name: "last_value", Type: catalog.Type{Name: "int8"}},
+	})
+	if err != nil {
+		t.Fatalf("CreateTable(sequence): %v", err)
+	}
+	seq.IsSequence = true
+
+	rows := runQueryRows(t, ctx,
+		"SELECT schemaname, relname, blks_read, blks_hit FROM pg_statio_user_sequences WHERE relname = 'items_id_seq'")
+	if len(rows) != 1 {
+		t.Fatalf("row count = %d, want 1 (items_id_seq)", len(rows))
+	}
+	if got := rows[0][0].Format(); got != "public" {
+		t.Errorf("schemaname = %q, want public", got)
+	}
+	if got := rows[0][1].Format(); got != "items_id_seq" {
+		t.Errorf("relname = %q, want items_id_seq", got)
+	}
+	// blks_read / blks_hit are honest integer 0 (no per-relation buffer tracking).
+	for i := 2; i <= 3; i++ {
+		if rows[0][i].IsNull() {
+			t.Errorf("block counter col %d is NULL, want integer 0", i)
+		}
+		if got := rows[0][i].Format(); got != "0" {
+			t.Errorf("block counter col %d = %q, want 0", i, got)
+		}
+	}
+
+	// A plain table must not leak into the sequences view.
+	tblRows := runQueryRows(t, ctx,
+		"SELECT relname FROM pg_statio_all_sequences WHERE relname = 'items'")
+	if len(tblRows) != 0 {
+		t.Fatalf("plain table items appeared in pg_statio_all_sequences (%d rows)", len(tblRows))
+	}
+}
+
 // TestPgStatioSysTablesExcludesUserTable confirms the schemaname split: a
 // public-schema user table appears in pg_statio_user_tables but not
 // pg_statio_sys_tables. M0122-0003.

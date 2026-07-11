@@ -7282,6 +7282,54 @@ func (c *InMemory) PGStatioIndexesRowsForDBOid(dbOid uint32, scope StatTableScop
 	return rows
 }
 
+// PGStatioSequencesRowsForDBOid builds the pg_statio_all_sequences /
+// pg_statio_user_sequences / pg_statio_sys_sequences row set for one database, scoped
+// by `scope`. It mirrors upstream's view (system_views.sql: SELECT over pg_class
+// WHERE relkind = 'S') — the sequence counterpart of the per-table/per-index I/O
+// views. This is the ONLY pg_statio view whose relation filter selects sequences
+// (t.IsSequence) rather than skipping them. goopg has no per-relation buffer-pool
+// counters, so blks_read / blks_hit are a faithful 0; the three real cells are
+// relid / schemaname / relname. See docs/design/0122-0003-pg-stat-user-tables.md.
+func (c *InMemory) PGStatioSequencesRowsForDBOid(dbOid uint32, scope StatTableScope) [][]string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	keys := make([]string, 0, len(c.ns(dbOid).tables))
+	for k := range c.ns(dbOid).tables {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([][]string, 0, len(keys))
+	for _, k := range keys {
+		t := c.ns(dbOid).tables[k]
+		// Inverse of the table/index filter: emit ONLY sequences (relkind 'S').
+		if !t.IsSequence {
+			continue
+		}
+		schema := t.Schema
+		if schema == "" {
+			schema = "public"
+		}
+		switch scope {
+		case StatScopeUser:
+			if isSystemStatSchema(schema) {
+				continue
+			}
+		case StatScopeSys:
+			if !isSystemStatSchema(schema) {
+				continue
+			}
+		}
+		out = append(out, []string{
+			strconv.Itoa(int(t.OID)), // 0: relid
+			schema,                   // 1: schemaname
+			t.Name,                   // 2: relname
+			"0",                      // 3: blks_read
+			"0",                      // 4: blks_hit
+		})
+	}
+	return out
+}
+
 func (c *InMemory) registerSystemTables() {
 	pgClass := &Table{
 		Schema: "pg_catalog",
@@ -8501,6 +8549,41 @@ func (c *InMemory) registerSystemTables() {
 			OID:     v.oid,
 		}
 		tbl.VirtualRows = func() [][]string { return c.PGStatioIndexesRowsForDBOid(DefaultDBOid, scope) }
+		c.ns(DefaultDBOid).tables["pg_catalog."+v.name] = tbl
+	}
+
+	// pg_statio_all_sequences / pg_statio_user_sequences / pg_statio_sys_sequences —
+	// per-sequence buffer-pool I/O statistics (PG's system_views.sql, relkind 'S'),
+	// the sequence sibling of the per-table/per-index I/O views above. Same honest-0
+	// shape: blks_read / blks_hit are a faithful 0 (no per-relation buffer counters);
+	// relid / schemaname / relname are real. Unlike the table/index views, the row
+	// builder selects sequences (t.IsSequence) instead of skipping them. See
+	// catalog.PGStatioSequencesRowsForDBOid and docs/design/0122-0003-pg-stat-user-tables.md.
+	statioSequencesColumns := func() []Column {
+		return []Column{
+			{Name: "relid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "schemaname", Type: Type{Name: "name"}, Ordinal: 1},
+			{Name: "relname", Type: Type{Name: "name"}, Ordinal: 2},
+			{Name: "blks_read", Type: Type{Name: "int8"}, Ordinal: 3},
+			{Name: "blks_hit", Type: Type{Name: "int8"}, Ordinal: 4},
+		}
+	}
+	for _, v := range []struct {
+		name  string
+		oid   uint32
+		scope StatTableScope
+	}{
+		{"pg_statio_all_sequences", 9093, StatScopeAll},
+		{"pg_statio_sys_sequences", 9094, StatScopeSys},
+		{"pg_statio_user_sequences", 9095, StatScopeUser},
+	} {
+		scope := v.scope
+		tbl := &Table{
+			Schema: "pg_catalog", Name: v.name, Virtual: true,
+			Columns: statioSequencesColumns(),
+			OID:     v.oid,
+		}
+		tbl.VirtualRows = func() [][]string { return c.PGStatioSequencesRowsForDBOid(DefaultDBOid, scope) }
 		c.ns(DefaultDBOid).tables["pg_catalog."+v.name] = tbl
 	}
 
