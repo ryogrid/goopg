@@ -1679,7 +1679,14 @@ func validateWindowFrame(fr *parser.WindowFrame, pos int, orderByLen int, ctx *s
 		// and to GROUPS mode's non-offset behavior, so it is supported.
 		if fr.StartKind == parser.FrameBoundOffsetPreceding || fr.StartKind == parser.FrameBoundOffsetFollowing ||
 			fr.EndKind == parser.FrameBoundOffsetPreceding || fr.EndKind == parser.FrameBoundOffsetFollowing {
-			return analyzeError(pos, "0A000", "RANGE with a value offset (PRECEDING/FOLLOWING) is not supported in v0; only UNBOUNDED PRECEDING/FOLLOWING and CURRENT ROW bounds are implemented")
+			// A RANGE value offset bound (RANGE BETWEEN n PRECEDING /
+			// FOLLOWING) compares the ORDER BY column value against
+			// value±offset, so the comparison target must be unambiguous:
+			// exactly one ORDER BY column is required. parse_clause.c's
+			// transformFrameOffset enforces the same check (42P20).
+			if orderByLen != 1 {
+				return analyzeError(pos, "42P20", "RANGE with offset PRECEDING/FOLLOWING requires exactly one ORDER BY column")
+			}
 		}
 	default:
 		return analyzeError(pos, "0A000", "unsupported window frame mode")

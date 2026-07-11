@@ -646,7 +646,7 @@
    "feature": "Implement window frame clause semantics for ROWS, RANGE, GROUPS frame modes and frame exclusion options.",
    "task_id": "M0020",
    "resume_point": "implement frame clause execution logic",
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "Frame clauses (ROWS / RANGE / GROUPS / frame-exclusion) parse but error explicitly with 'frame clauses are not supported in v0'"
    ],
@@ -661,7 +661,7 @@
     "later_commits": "confirmed-open-code-audit: select.go:3439 frame clauses rejected by parser"
    },
    "confidence": "high",
-   "code_audit": "partially-resolved 2026-07-09: GROUPS frame mode now implemented end-to-end (internal/analyzer/analyzer.go's validateWindowFrame requires an ORDER BY column for GROUPS per parse_clause.c; internal/executor/operators_window.go's frameBoundsGroups performs the ROWS-mode arithmetic on peer-group indices instead of row indices) — TestCompatWindowExplicitGroupsFrameSliding/TestCompatWindowGroupsUnboundedPrecedingCumulative PASS, both cross-checked against a real PostgreSQL 18.3 instance. RANGE frame mode remains rejected with 0A000 (analyzer.go's validateWindowFrame default case) — its offset PRECEDING/FOLLOWING bounds need a per-ORDER-BY-column type-aware +/-/< operator lookup that GROUPS' plain integer peer-group counting didn't require. Design: docs/design/0020-0001-window-parser-and-ast.md 'Follow-up: GROUPS window frame mode' section; see .ralph/deferral_ledger.md (2026-07-09 row)."
+   "code_audit": "partially-resolved 2026-07-09: GROUPS frame mode now implemented end-to-end (internal/analyzer/analyzer.go's validateWindowFrame requires an ORDER BY column for GROUPS per parse_clause.c; internal/executor/operators_window.go's frameBoundsGroups performs the ROWS-mode arithmetic on peer-group indices instead of row indices) — TestCompatWindowExplicitGroupsFrameSliding/TestCompatWindowGroupsUnboundedPrecedingCumulative PASS, both cross-checked against a real PostgreSQL 18.3 instance. RANGE frame mode remains rejected with 0A000 (analyzer.go's validateWindowFrame default case) — its offset PRECEDING/FOLLOWING bounds need a per-ORDER-BY-column type-aware +/-/< operator lookup that GROUPS' plain integer peer-group counting didn't require. Design: docs/design/0020-0001-window-parser-and-ast.md 'Follow-up: GROUPS window frame mode' section; see .ralph/deferral_ledger.md (2026-07-09 row). RESOLVED 2026-07-11 (M0122-0004): RANGE value-offset bounds (RANGE BETWEEN n PRECEDING AND m FOLLOWING) now implemented via internal/executor/operators_window.go's frameBoundsRange (PostgreSQL in_range semantics reusing evalBinary/compareDatum), analyzer requires exactly one ORDER BY column (42P20). All three frame modes (ROWS/RANGE/GROUPS) + exclusion are now complete; cross-checked byte-for-byte vs PG 18.3. See docs/design/0122-0004-range-offset-window-frame.md."
   },
   {
    "feature": "Support window function references by name using OVER window_name syntax and WINDOW clause definitions.",
@@ -842,7 +842,7 @@
    "feature": "Window function frame clauses and named windows are not yet implemented.",
    "task_id": "M0020",
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "Frame clauses and named windows remain deferred"
    ],
@@ -857,7 +857,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "partially-resolved 2026-07-09: named windows, ROWS frame clause, and now GROUPS frame clause are all landed and working — TestCompatWindowNamedWindowClause, the ROWS-frame test set, and the new TestCompatWindowExplicitGroupsFrameSliding/TestCompatWindowGroupsUnboundedPrecedingCumulative (internal/executor/window_compat_test.go) all PASS, cross-checked against a real PostgreSQL 18.3 instance. RANGE frame mode is now the sole open item: internal/analyzer/analyzer.go's validateWindowFrame default case rejects it with 0A000 (needs a per-ORDER-BY-column type-aware +/-/< operator lookup GROUPS' integer peer-group counting didn't require). All 11 standard PostgreSQL window functions are implemented under the default frame (see prior audit history); design: docs/design/0020-0001-window-parser-and-ast.md Follow-up sections."
+   "code_audit": "partially-resolved 2026-07-09: named windows, ROWS frame clause, and now GROUPS frame clause are all landed and working — TestCompatWindowNamedWindowClause, the ROWS-frame test set, and the new TestCompatWindowExplicitGroupsFrameSliding/TestCompatWindowGroupsUnboundedPrecedingCumulative (internal/executor/window_compat_test.go) all PASS, cross-checked against a real PostgreSQL 18.3 instance. RANGE frame mode is now the sole open item: internal/analyzer/analyzer.go's validateWindowFrame default case rejects it with 0A000 (needs a per-ORDER-BY-column type-aware +/-/< operator lookup GROUPS' integer peer-group counting didn't require). All 11 standard PostgreSQL window functions are implemented under the default frame (see prior audit history); design: docs/design/0020-0001-window-parser-and-ast.md Follow-up sections. RESOLVED 2026-07-11 (M0122-0004): the last frame-clause gap, RANGE value-offset bounds, now lands via frameBoundsRange (internal/executor/operators_window.go) — all frame modes and named windows complete; see docs/design/0122-0004-range-offset-window-frame.md."
   },
   {
    "feature": "Implement full Borrow-semantics architectural rewrite for comprehensive allocation optimization (current stage only addresses specific call sites without the architectural change).",

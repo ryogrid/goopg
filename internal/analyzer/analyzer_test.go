@@ -409,18 +409,31 @@ func TestAnalyzeWindowFrameRowsAccepted(t *testing.T) {
 	}
 }
 
-// TestAnalyzeWindowFrameRangeOffsetRejected pins that RANGE with a
-// value offset bound (PRECEDING/FOLLOWING) is rejected with 0A000 —
-// it needs type-aware value arithmetic on the ORDER BY column that is
-// still deferred (see docs/design/0122-0004-range-window-frame.md).
-func TestAnalyzeWindowFrameRangeOffsetRejected(t *testing.T) {
+// TestAnalyzeWindowFrameRangeOffsetOrderByCount pins that a RANGE value
+// offset bound (PRECEDING/FOLLOWING) requires exactly one ORDER BY column
+// (42P20, mirroring parse_clause.c's transformFrameOffset); a single ORDER
+// BY column analyzes cleanly (the executor applies the in_range arithmetic,
+// see docs/design/0122-0004-range-offset-window-frame.md).
+func TestAnalyzeWindowFrameRangeOffsetOrderByCount(t *testing.T) {
 	cat := analyzerCatalog(t)
+	// Zero ORDER BY columns → 42P20.
 	expectAnalyzeCode(t, cat,
+		"SELECT sum(abalance) OVER (RANGE 5 PRECEDING) FROM pgbench_accounts",
+		"42P20")
+	// Two ORDER BY columns → 42P20.
+	expectAnalyzeCode(t, cat,
+		"SELECT sum(abalance) OVER (ORDER BY aid, bid RANGE BETWEEN 1 PRECEDING AND 2 FOLLOWING) FROM pgbench_accounts",
+		"42P20")
+	// Exactly one ORDER BY column → accepted.
+	accepted := []string{
 		"SELECT sum(abalance) OVER (ORDER BY aid RANGE 5 PRECEDING) FROM pgbench_accounts",
-		"0A000")
-	expectAnalyzeCode(t, cat,
 		"SELECT sum(abalance) OVER (ORDER BY aid RANGE BETWEEN 1 PRECEDING AND 2 FOLLOWING) FROM pgbench_accounts",
-		"0A000")
+	}
+	for _, sql := range accepted {
+		if err := Analyze(parseOne(t, sql), cat); err != nil {
+			t.Fatalf("Analyze(%q): %v", sql, err)
+		}
+	}
 }
 
 // TestAnalyzeWindowFrameRangeNonOffsetAccepted pins that RANGE with
