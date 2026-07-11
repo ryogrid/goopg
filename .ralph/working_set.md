@@ -1,41 +1,40 @@
 (idle — nothing in flight)
 
-## Loop summary (2026-07-12, loop #68)
+## Loop summary (2026-07-12, loop #69)
 
-**Nightly triage:** action-items batch `20260711-011536` (same as #58–#67) —
+**Nightly triage:** action-items batch `20260711-011536` (unchanged since #58) —
 all 3 AI items already `[x]` in M-NIGHTLY. No new nightly work.
 
-**Task — M0122-0007 (object-creation default GUC stubs).** pg_dump/pg_restore
-emit a fixed SET preamble before every CREATE TABLE (`SET default_tablespace =
-'';`, `SET default_table_access_method = heap;`, and `SET
-default_toast_compression = 'pglz';` for non-default column compression) — but
-none of these three CLIENT_CONN_STATEMENT/PGC_USERSET GUCs were registered, so
-replaying a real-PG dump aborted with "unrecognized configuration parameter".
-Registered all three as accepted stubs.
+**Task — unimplemented_feat #135 (pg_get_expr, indexprs heap slice) — RESOLVED.**
+Closed the last open piece: the heap-persisted `pg_index.indexprs` was always
+NULL because `DecodePGIndexPhysicalRow` inferred `indpred` presence from
+remaining byte length (only unambiguous while indexprs is NULL — two consecutive
+nullable pg_node_tree varlenas can't be told apart without the tuple null bitmap).
 
 Landed (files):
-- internal/config/defaults.go: 3 GUCs (default_table_access_method string/heap,
-  default_tablespace string/'', default_toast_compression enum {pglz,lz4}/pglz).
-- internal/config/postgresql.conf.sample: 3 entries (TestSampleConfigCoversRegistry).
-- internal/catalog/catalog.go: 3 pg_settings literal rows (winning VirtualRows list).
-- internal/config/object_default_guc_stubs_test.go (new); catalog_test.go
-  TestPgSettingsObjectDefaultGUCs (new).
-- docs/design/root-0004-configuration-and-guc.md new section; .ralph/fix_plan.md
-  done-note under M0122-0007; deferral_ledger.md row (behavioral no-op:
-  goopg ignores the values at CREATE TABLE — heap-only AM, no tablespaces,
-  built-in TOAST default).
+- internal/catalog/codec.go: DecodePGIndexPhysicalRow(data, bitmap []byte) is now
+  null-bitmap-aware (probes bits 19/20); new PGIndexRow.IndExprs/IndHasExprs;
+  helpers pgIndexBitNotNull (nil bitmap ⇒ present), pgIndexVarlenaLen.
+- internal/executor/pg18_user_catalog_rows.go: buildUserPGIndexRow emits indexprs
+  via catalog.IndexExprsText (was hardcoded NullDatum).
+- internal/initdb/open.go: recovery caller passes ht.Bitmap.
+- internal/executor/operators_ddl.go: resyncIndexHeapRow matcher passes nil
+  (matches only fixed-offset indexrelid).
+- Test TestBuildUserPGIndexRowExprPredNullBitmapRoundTrip (all 4 NULL combos).
+- docs/design/0122-0019-pg-index-node-tree-columns.md Follow-up(2026-07-12);
+  README row; deferral_ledger.md (2 rows flipped resolved + 1 new resolved row);
+  unimplemented_feat.json #135/#57 → resolved.
 
-Gates: go build ./... clean; go vet config+catalog clean; config+catalog tests
-PASS; end-to-end wire smoke vs cmd/goopg (all 3 SETs succeed, SHOW/pg_settings
-report, ='lz4' moves, 'zstd' rejected); ralph-state-guard consistent (repaired
-prev clean-exit marker); pgbench smoke via pre-commit hook (see commit).
+Backward-compatible: legacy rows always carried a bitmap (indexprs was always
+NULL). Alignment verified (both pg_node_tree → 4-align, encoder always pads,
+PG-standby-readable).
 
-Next-loop candidates (genuinely open, larger):
-- M0122-0006 On-disk catalog persistence (persistent pg_index heap).
-- ALTER DOMAIN SET SCHEMA — BLOCKED: domains (and all user types: enum/composite)
-  hardcode typnamespace=public; needs broad "namespace-scope user types" feature,
-  NOT a one-loop task. Avoid until that infra exists.
-- More missing GUC families (autovacuum ~22, log_* ~40, vacuum cost) — bounded
-  per-family, low value/risk.
+Gates: go build clean; catalog+executor+initdb(CreateIndex) tests PASS;
+tpch-spotcheck PASS (Q12=2/Q13=33); ralph-state-guard consistent (repaired prev
+clean-exit marker); pgbench smoke via pre-commit hook (see commit).
+
+Deferred (new ledger row): initdb heap-scan recovery (loadUserIndexesFromHeap)
+still rebuilds expression indexes via WAL replay, not from recovered IndExprs
+text — separate larger recovery feature.
 
 In-flight: none

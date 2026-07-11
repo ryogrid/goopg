@@ -107,7 +107,11 @@ bare function call has none). An earlier draft that reused
 `buildIndexDefString`'s `indexKeyIsBareFuncCall` rule to add parens on top
 double-wrapped binexprs into `((a + c))`; the helper joins verbatim instead.
 
-### Heap-persisted twin stays NULL — deliberate
+### Heap-persisted twin stays NULL — deliberate (SUPERSEDED 2026-07-12)
+
+> This decision was reversed by the 2026-07-12 follow-up below: the heap twin now
+> populates `indexprs`, unblocked by a null-bitmap-aware decoder. The paragraph
+> is kept for historical context.
 
 `buildUserPGIndexRow` (`internal/executor/pg18_user_catalog_rows.go`) still
 writes `indexprs=NULL` in the heap row, so the live and heap renderings diverge
@@ -132,6 +136,62 @@ slice).
   `catalog.IndexExprsText` guarding the no-double-paren and NULL-vs-present
   contract.
 
+## Follow-up (2026-07-12): heap-persisted `indexprs` via null-bitmap-aware decode
+
+The decode-ambiguity landmine described under "Heap-persisted twin stays NULL"
+is now removed, so the heap row carries `indexprs` for expression indexes too —
+closing the last open piece of unimplemented_feat #135.
+
+The blocker was that `DecodePGIndexPhysicalRow` inferred `indpred`'s presence
+from the bytes remaining after `indoption`, which only works while `indexprs`
+(the immediately-preceding nullable varlena) is NULL. The fix threads the tuple
+**null bitmap** into the decoder so the two trailing nullable `pg_node_tree`
+varlenas can be told apart:
+
+- `catalog.DecodePGIndexPhysicalRow(data, bitmap []byte)` now probes the bitmap
+  (PG `heap_fill_tuple` convention: bit *i* set ⇒ column *i* NOT NULL) at
+  columns 19 (`indexprs`) and 20 (`indpred`). A **nil** bitmap means the tuple
+  has no NULL columns (`HEAP_HASNULL` clear) — i.e. both varlenas are present —
+  or the caller has no bitmap handy; both are treated as "present" and the
+  decoder simply decodes whatever trailing bytes exist. New `PGIndexRow.IndExprs`
+  / `IndHasExprs` fields carry the decoded expression text.
+- `buildUserPGIndexRow` (`internal/executor/pg18_user_catalog_rows.go`) now
+  emits the expression text via the same `catalog.IndexExprsText` helper the
+  live renderer uses, instead of a hardcoded `NullDatum`. The canonical heap
+  writer (`writeHeapRowReturningPG` → `NullBitmapPG` → `NewHeapTupleWithNulls`)
+  already stamps `HEAP_HASNULL` + the null bitmap whenever any column is NULL,
+  so no write-path change was needed.
+- Callers: `internal/initdb/open.go`'s checkpointed-restart recovery passes the
+  real `ht.Bitmap` from `PageGetHeapTuple`; `operators_ddl.go`'s
+  `resyncIndexHeapRow` matcher passes `nil` (it only matches on the fixed-offset
+  `indexrelid`, so the trailing varlenas are irrelevant to it).
+
+**Backward compatibility:** every legacy on-disk `pg_index` row already carried a
+null bitmap, because `indexprs` was always NULL (a NULL column forces
+`HEAP_HASNULL`). A plain index had both varlenas NULL (bitmap bits 19,20 clear);
+a partial index had `indexprs` NULL, `indpred` set (bits 19 clear, 20 set). The
+bitmap-aware decoder reads both correctly, so no on-disk migration is required.
+
+**Alignment:** both `indexprs` and `indpred` are `pg_node_tree`, which
+`physicalPGTypeAlign` maps to PG `'i'` (4-byte) alignment; `encodeRowPG`
+unconditionally 4-aligns each, and the decoder mirrors that with `pgIndexAlign4`
+between the two columns (`pgIndexVarlenaLen` computes the on-disk length of the
+first to find the second). goopg's always-pad approach stays PG-standby-readable
+because PG's `att_align_pointer` only skips padding when the byte at the
+unaligned offset is a short-varlena header (nonzero); goopg writes zero pad bytes
+followed by the aligned header, so a standby's `heap_deform_tuple` aligns to the
+same offset.
+
+### Tests
+
+`internal/executor/pg18_user_catalog_rows_test.go`:
+
+- `TestBuildUserPGIndexRowExprPredNullBitmapRoundTrip` — encode→decode round
+  trip through `buildUserPGIndexRow` + `NullBitmapPG` +
+  `DecodePGIndexPhysicalRow` for all four NULL/non-NULL combinations of
+  (`indexprs`, `indpred`), pinning that the expression text is never mis-decoded
+  as the WHERE predicate.
+
 ## Remaining gap (deferred) — historical, live path now closed above
 
 Expression-index `indexprs` was never populated: `catalog.Index.ColExprs`
@@ -140,5 +200,11 @@ surfaced into `pg_index.indexprs`, so `pg_get_expr(indexprs, indrelid)` on an
 expression index returned NULL rather than the deparsed expression. psql `\d`
 and `pg_dump` are unaffected — both reconstruct index DDL via
 `pg_get_indexdef` / `buildIndexDefString` directly from index metadata, never
-from `indexprs`. The live path is now fixed (see Follow-up above); the
-heap-persisted path remains deferred (decode-ambiguity landmine).
+from `indexprs`. The live path is now fixed (see the 2026-07-10 Follow-up);
+the heap-persisted path is now **also closed** (see the 2026-07-12 Follow-up —
+null-bitmap-aware decode). Note the initdb heap-scan recovery
+(`loadUserIndexesFromHeap`) still skips columns whose `indkey` attnum is 0
+(expression columns), so a pure expression index is reconstructed via the
+CREATE INDEX WAL-replay path, not the heap scan; making the heap-scan path
+rebuild expression indexes from the recovered `IndExprs` text is a separate,
+larger feature.

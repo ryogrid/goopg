@@ -1142,6 +1142,8 @@ type PGIndexRow struct {
 	IndCollation        []uint32 // per-key-column indcollation OIDs (M0122-0006 follow-up 3)
 	IndClass            []uint32 // per-key-column indclass (opclass) OIDs (M0122-0006 follow-up 3)
 	IndOption           []int16  // per-key ASC/DESC + NULLS FIRST/LAST bitmask (INDOPTION_DESC=0x1, INDOPTION_NULLS_FIRST=0x2)
+	IndHasExprs         bool     // true if indexprs is non-NULL (expression index)
+	IndExprs            string   // indexprs's deparsed expression SQL text (goopg stores pg_node_tree columns as SQL text; see IndexExprsText)
 	IndHasPred          bool     // true if indpred is non-NULL (partial index)
 	IndPred             string   // indpred's WHERE-clause SQL text (goopg stores pg_node_tree columns as SQL text; see column_defaults_recovery.go)
 }
@@ -1166,7 +1168,7 @@ const (
 // DecodePGIndexPhysicalRow decodes the PG18 physical on-disk format of a
 // pg_index tuple. Only the fields needed for catalog recovery are extracted.
 // The int2vector indkey blob is decoded to extract attnum values.
-func DecodePGIndexPhysicalRow(data []byte) (PGIndexRow, error) {
+func DecodePGIndexPhysicalRow(data, bitmap []byte) (PGIndexRow, error) {
 	var r PGIndexRow
 	if len(data) < pgIndexFixedSize {
 		return r, fmt.Errorf("pg_index physical row too short: len=%d", len(data))
@@ -1239,27 +1241,86 @@ func DecodePGIndexPhysicalRow(data []byte) (PGIndexRow, error) {
 		r.IndOption[i] = int16(binary.LittleEndian.Uint16(optBlob[vectorHdrSize+2*i : vectorHdrSize+2*i+2]))
 	}
 
-	// indexprs follows indoption but is always NULL in practice: goopg has
-	// no expression-index support (catalog.Index.Columns holds only plain
-	// column names), so buildUserPGIndexRow (internal/executor/
-	// pg18_user_catalog_rows.go) never writes it. A NULL varlena column
-	// consumes zero bytes in a physical heap tuple (see encodeRowPG), so any
-	// bytes remaining after indoption belong entirely to indpred — the
-	// WHERE-clause predicate, stored as SQL text (mirroring
-	// column_defaults_recovery.go's expression-as-text round-trip). This
-	// lets indpred's presence be inferred from data length alone, without
-	// needing the tuple's null bitmap (some callers, e.g.
-	// operators_ddl.go's stampCatalogRows, only have the data bytes handy).
-	// If expression-index support is ever added, this assumption breaks and
-	// indexprs/indpred will need real null-bitmap-aware decoding.
-	predOff := pgIndexAlign4(off + vectorHdrSize + 2*m)
-	if predOff < len(data) {
-		if text, ok := decodePGIndexVarlenaText(data[predOff:]); ok {
+	// indexprs (col 19) and indpred (col 20) are the two trailing nullable
+	// varlena columns, stored as SQL text (goopg represents pg_node_tree
+	// columns as deparsed text — mirroring column_defaults_recovery.go and
+	// IndexExprsText). A NULL varlena consumes zero bytes in a physical heap
+	// tuple (see encodeRowPG), so two consecutive nullable varlenas can only
+	// be told apart via the tuple's null bitmap. The bitmap follows PG's
+	// heap_fill_tuple convention (bit i set == column i NOT NULL); it is
+	// non-nil exactly when the tuple has at least one NULL column. Since
+	// columns 0..18 are never NULL, the bitmap is present whenever indexprs
+	// OR indpred is NULL, and absent only when BOTH are non-NULL (an
+	// expression index that is also partial). When bitmap is nil the caller
+	// either has no null bitmap handy (e.g. operators_ddl.go's
+	// stampCatalogRows, which only matches on indexrelid) or the tuple truly
+	// has no NULLs — either way, decode whatever trailing varlenas fit.
+	exprsPresent := pgIndexBitNotNull(bitmap, pgIndexColIndExprs)
+	predPresent := pgIndexBitNotNull(bitmap, pgIndexColIndPred)
+	fieldOff := pgIndexAlign4(off + vectorHdrSize + 2*m)
+	if exprsPresent && fieldOff < len(data) {
+		if text, ok := decodePGIndexVarlenaText(data[fieldOff:]); ok {
+			r.IndHasExprs = true
+			r.IndExprs = text
+			fieldOff = pgIndexAlign4(fieldOff + pgIndexVarlenaLen(data[fieldOff:]))
+		}
+	}
+	if predPresent && fieldOff < len(data) {
+		if text, ok := decodePGIndexVarlenaText(data[fieldOff:]); ok {
 			r.IndHasPred = true
 			r.IndPred = text
 		}
 	}
 	return r, nil
+}
+
+const (
+	// Column indices of the two trailing nullable varlena attributes in the
+	// 21-column PG18 pg_index tuple (see buildUserPGIndexRow). Used to probe
+	// the null bitmap.
+	pgIndexColIndExprs = 19
+	pgIndexColIndPred  = 20
+)
+
+// pgIndexBitNotNull reports whether column i is NOT NULL according to the
+// PG null bitmap (bit i set == not null, matching heap_fill_tuple). A nil
+// bitmap means the tuple has no NULL columns (HEAP_HASNULL clear) OR the
+// caller did not supply one; both are treated as "present" so a caller
+// without the bitmap still attempts to decode whatever trailing bytes exist.
+func pgIndexBitNotNull(bitmap []byte, i int) bool {
+	if len(bitmap) == 0 {
+		return true
+	}
+	byteIdx := i / 8
+	if byteIdx >= len(bitmap) {
+		return true
+	}
+	return bitmap[byteIdx]>>(uint(i)%8)&1 == 1
+}
+
+// pgIndexVarlenaLen returns the total on-disk byte length of the varlena at
+// data[0:] (1-byte short header or 4-byte header form), or 0 if the header
+// doesn't parse — mirroring decodePGIndexVarlenaText's header handling so the
+// two stay in lockstep when advancing past indexprs to reach indpred.
+func pgIndexVarlenaLen(data []byte) int {
+	if len(data) == 0 {
+		return 0
+	}
+	header := data[0]
+	if header&0x01 == 0x01 {
+		if header == 0x01 {
+			return 0 // external (TOAST) — not expected here
+		}
+		return int(header >> 1)
+	}
+	if len(data) < 4 {
+		return 0
+	}
+	hdr4 := binary.LittleEndian.Uint32(data[:4])
+	if hdr4&0x03 == 0x02 {
+		return 0 // compressed — not expected here
+	}
+	return int(hdr4 >> 2)
 }
 
 // decodePGIndexVarlenaText decodes a PG varlena text payload (either the

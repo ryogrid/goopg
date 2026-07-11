@@ -3083,7 +3083,7 @@ func loadUserIndexesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *
 			if clog != nil && clog.GetStatus(ht.Header.Xmin) == mvcc.TxnStatusAborted {
 				continue
 			}
-			row, err := catalog.DecodePGIndexPhysicalRow(ht.Data)
+			row, err := catalog.DecodePGIndexPhysicalRow(ht.Data, ht.Bitmap)
 			if err != nil {
 				continue
 			}

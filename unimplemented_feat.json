@@ -2864,7 +2864,7 @@
    "feature": "pg_get_expr() function is stubbed to return empty string; does not reconstruct constraint or index expressions.",
    "task_id": null,
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "pg_get_expr stub (→ \"\")"
    ],
@@ -2874,12 +2874,12 @@
     "a910cc325cacea137e68081a5d41b8976f016368"
    ],
    "resolution_check": {
-    "ledger": "open",
+    "ledger": "resolved",
     "fix_plan": "no-match",
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "narrowed 2026-07-10: pg_get_expr pass-through is architecturally correct for goopg (all populated pg_node_tree columns adbin/conbin/relpartbound store pre-formatted deparsed SQL text, not serialized node trees). Fixed the live pg_index renderer catalog.InMemory.PGIndexRowsForDBOid, which hardcoded indexprs/indpred to \"\" (a non-NULL empty string for a text column) instead of VirtualNull/PredicateString, diverging from the heap-row twin buildUserPGIndexRow and breaking indpred IS NOT NULL + pg_get_expr(indpred,indrelid) on partial indexes. Narrowed again 2026-07-10: live-path expression-index indexprs now populated via shared catalog.IndexExprsText (joins idx.ColExprStrings for expression key columns, comma-separated, verbatim natural deparse — byte-matched to PG 18.3), wired into PGIndexRowsForDBOid; pg_get_expr(indexprs,indrelid) now returns e.g. 'lower(b)' / '(a + c), upper(b)' on live queries. Remaining open: the heap-persisted twin buildUserPGIndexRow deliberately still writes indexprs=NULL — DecodePGIndexPhysicalRow infers indpred from the bytes after indoption assuming indexprs is NULL (two consecutive nullable varlenas are indistinguishable without the tuple null bitmap, which the decoder doesn't receive), so populating it would corrupt an expression index's indpred on restart — see deferral_ledger.md"
+   "code_audit": "RESOLVED 2026-07-12: pg_get_expr pass-through is architecturally correct for goopg (all populated pg_node_tree columns adbin/conbin/relpartbound store pre-formatted deparsed SQL text, not serialized node trees), and both the live and heap-persisted pg_index renderers now populate indexprs/indpred correctly. Timeline: (1) fixed the live pg_index renderer catalog.InMemory.PGIndexRowsForDBOid (hardcoded indexprs/indpred to \"\" instead of VirtualNull/PredicateString); (2) live-path expression-index indexprs populated via shared catalog.IndexExprsText (byte-matched to PG 18.3); (3) 2026-07-12 closed the last heap slice — DecodePGIndexPhysicalRow(data,bitmap) is now null-bitmap-aware (probes bits 19/20 to disambiguate the two trailing nullable pg_node_tree varlenas), buildUserPGIndexRow emits IndexExprsText, and internal/initdb/open.go passes ht.Bitmap; backward-compatible (legacy rows always carried a bitmap since indexprs was always NULL). Test TestBuildUserPGIndexRowExprPredNullBitmapRoundTrip covers all four combos. Separately tracked (NOT a pg_get_expr gap): initdb heap-scan recovery loadUserIndexesFromHeap still rebuilds expression indexes via WAL replay, not from the recovered IndExprs text — see deferral_ledger.md 2026-07-12 row."
   },
   {
    "feature": "MVCC/attribute tier of verify_heapam (multi-version visibility and per-column consistency checks) remains deferred beyond Tier 1 page-structure checks.",

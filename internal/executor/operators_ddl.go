@@ -13354,7 +13354,11 @@ func resyncIndexHeapRow(ctx *Context, idx *catalog.Index) error {
 				Fork:   storage.MainFork,
 			}
 			stampCatalogRows(ctx, indexRel, xmax, func(data []byte) bool {
-				row, derr := catalog.DecodePGIndexPhysicalRow(data)
+				// stampCatalogRows only hands the caller the column-data area,
+				// not the tuple null bitmap; that's fine here because the match
+				// key (indexrelid) is a fixed-offset field independent of the
+				// trailing nullable indexprs/indpred varlenas.
+				row, derr := catalog.DecodePGIndexPhysicalRow(data, nil)
 				return derr == nil && row.IndexRelid == idx.OID
 			})
 		}

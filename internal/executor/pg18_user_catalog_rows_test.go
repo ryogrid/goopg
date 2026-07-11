@@ -2430,7 +2430,7 @@ func TestBuildUserPGIndexRowIndoptionRoundTrip(t *testing.T) {
 		t.Fatalf("EncodeRowPG: %v", err)
 	}
 
-	decoded, err := catalog.DecodePGIndexPhysicalRow(data)
+	decoded, err := catalog.DecodePGIndexPhysicalRow(data, NullBitmapPG(row))
 	if err != nil {
 		t.Fatalf("DecodePGIndexPhysicalRow: %v", err)
 	}
@@ -2442,5 +2442,83 @@ func TestBuildUserPGIndexRowIndoptionRoundTrip(t *testing.T) {
 		if decoded.IndOption[i] != want[i] {
 			t.Errorf("IndOption[%d] = %#x, want %#x", i, decoded.IndOption[i], want[i])
 		}
+	}
+}
+
+// TestBuildUserPGIndexRowExprPredNullBitmapRoundTrip pins the unimplemented_feat
+// #135 fix (see .ralph/deferral_ledger.md): the two trailing nullable pg_node_tree
+// varlenas indexprs (expression index) and indpred (partial index) must survive an
+// encode→decode round trip in all four NULL/non-NULL combinations. Before the fix,
+// buildUserPGIndexRow always wrote indexprs=NULL and the decoder inferred indpred's
+// presence purely from remaining byte length — so populating indexprs would have
+// silently mis-decoded an expression index's expression text AS its WHERE predicate.
+// The fix carries the real expression text (via catalog.IndexExprsText) and makes
+// catalog.DecodePGIndexPhysicalRow null-bitmap-aware, disambiguating the two columns.
+func TestBuildUserPGIndexRowExprPredNullBitmapRoundTrip(t *testing.T) {
+	tbl := &catalog.Table{
+		Schema: "public", Name: "expr_idx_tbl", OID: 16800,
+		Columns: []catalog.Column{
+			{Name: "a", Type: catalog.Type{Name: "int4"}, Ordinal: 0},
+			{Name: "b", Type: catalog.Type{Name: "text"}, Ordinal: 1},
+		},
+	}
+	cases := []struct {
+		name      string
+		idx       *catalog.Index
+		wantExprs string // "" == indexprs absent (NULL)
+		wantPred  string // "" == indpred absent (NULL)
+	}{
+		{
+			name: "plain: both NULL",
+			idx: &catalog.Index{Schema: "public", Name: "i_plain", Table: tbl, OID: 16801,
+				Columns: []string{"a"}},
+		},
+		{
+			name: "partial only: indpred set, indexprs NULL",
+			idx: &catalog.Index{Schema: "public", Name: "i_partial", Table: tbl, OID: 16802,
+				Columns: []string{"a"}, HasPredicate: true, PredicateString: "(a > 0)"},
+			wantPred: "(a > 0)",
+		},
+		{
+			name: "expression only: indexprs set, indpred NULL",
+			idx: &catalog.Index{Schema: "public", Name: "i_expr", Table: tbl, OID: 16803,
+				Columns: []string{""}, ColExprStrings: []string{"lower(b)"}},
+			wantExprs: "lower(b)",
+		},
+		{
+			name: "expression + partial: both set (tuple has no null bitmap)",
+			idx: &catalog.Index{Schema: "public", Name: "i_expr_partial", Table: tbl, OID: 16804,
+				Columns: []string{""}, ColExprStrings: []string{"lower(b)"},
+				HasPredicate: true, PredicateString: "(a > 0)"},
+			wantExprs: "lower(b)", wantPred: "(a > 0)",
+		},
+	}
+	cols := pgIndexColumnsPG18()
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			row := buildUserPGIndexRow(catalog.NewInMemory(), tc.idx)
+			data, err := EncodeRowPG(cols, row)
+			if err != nil {
+				t.Fatalf("EncodeRowPG: %v", err)
+			}
+			decoded, err := catalog.DecodePGIndexPhysicalRow(data, NullBitmapPG(row))
+			if err != nil {
+				t.Fatalf("DecodePGIndexPhysicalRow: %v", err)
+			}
+			if tc.wantExprs == "" {
+				if decoded.IndHasExprs {
+					t.Errorf("IndHasExprs = true (%q), want NULL", decoded.IndExprs)
+				}
+			} else if !decoded.IndHasExprs || decoded.IndExprs != tc.wantExprs {
+				t.Errorf("IndExprs = %q (has=%v), want %q", decoded.IndExprs, decoded.IndHasExprs, tc.wantExprs)
+			}
+			if tc.wantPred == "" {
+				if decoded.IndHasPred {
+					t.Errorf("IndHasPred = true (%q), want NULL", decoded.IndPred)
+				}
+			} else if !decoded.IndHasPred || decoded.IndPred != tc.wantPred {
+				t.Errorf("IndPred = %q (has=%v), want %q", decoded.IndPred, decoded.IndHasPred, tc.wantPred)
+			}
+		})
 	}
 }
