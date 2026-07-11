@@ -204,6 +204,13 @@ type SCRAMServer struct {
 	clientNonce string
 	serverNonce string
 
+	// cbindFlag is the gs2-cbind-flag byte ('n' or 'y') the client sent
+	// in client-first-message. Retained so client-final's c= attribute can
+	// be verified to echo the SAME flag (RFC 5802 §5.1 / auth-scram.c's
+	// read_client_final_message), preventing a MITM from tampering with the
+	// negotiated channel-binding flag when no binding is in use.
+	cbindFlag byte
+
 	// authMessage = client-first-bare + "," + server-first + "," + client-final-without-proof
 	// (RFC 5802 §3, used for verifying the client proof and computing the
 	// server signature.)
@@ -293,6 +300,9 @@ func (s *SCRAMServer) handleClientFirst(input []byte) ([]byte, error) {
 	case "n", "y":
 		// Acceptable: "n" = client doesn't support binding;
 		// "y" = client supports binding but server didn't advertise PLUS.
+		// Remember which flag was sent so client-final's c= can be
+		// verified to echo the identical flag (downgrade protection).
+		s.cbindFlag = cbindFlag[0]
 	default:
 		// "p=..." (channel binding requested) is not supported until
 		// TLS lands; reject explicitly.
@@ -347,8 +357,8 @@ func (s *SCRAMServer) handleClientFinal(input []byte) ([]byte, error) {
 	if !ok {
 		return nil, errors.New("scram: missing c= channel attribute")
 	}
-	if !validNoBindingChannelAttr(channel) {
-		return nil, errors.New("scram: unsupported channel-binding response")
+	if !validNoBindingChannelAttr(channel, s.cbindFlag) {
+		return nil, errors.New("scram: unexpected channel-binding attribute in client-final-message")
 	}
 	r, ok := attrs["r"]
 	if !ok || r != s.clientNonce+s.serverNonce {
@@ -417,14 +427,21 @@ func cutLastAttr(s, prefix string) (before, attr string, ok bool) {
 //
 // Anything else (a "p=..." gs2 header, an unexpected authzid) is
 // rejected.
-func validNoBindingChannelAttr(c string) bool {
+func validNoBindingChannelAttr(c string, cbindFlag byte) bool {
 	bytes, err := base64.StdEncoding.DecodeString(c)
 	if err != nil {
 		return false
 	}
+	// When no channel binding is in use, the client repeats its original
+	// gs2-cbind-flag in the c= attribute: "n,," for flag 'n' and "y,," for
+	// flag 'y'. The flag MUST match the one sent in client-first-message,
+	// mirroring auth-scram.c's read_client_final_message — accepting the
+	// other spelling would let a MITM tamper with the negotiated flag.
 	switch string(bytes) {
-	case "n,,", "y,,":
-		return true
+	case "n,,":
+		return cbindFlag == 'n'
+	case "y,,":
+		return cbindFlag == 'y'
 	}
 	return false
 }

@@ -1,42 +1,39 @@
 (idle — nothing in flight)
 
-## Loop summary (2026-07-11, loop #59)
+## Loop summary (2026-07-12, loop #61)
 
-**Nightly triage:** action-items batch `20260711-011536` (same as loop #58) —
-all 3 AI items (IsolationTimeouts, IsolationTuplelockUpgradeNoDeadlock,
-PgWaldumpVacuumPruneRoundtrip) already `[x]` in fix_plan.md M-NIGHTLY. No new
-nightly work.
+**Nightly triage:** action-items batch `20260711-011536` (same as #58-#60) —
+all 3 AI items already `[x]` in M-NIGHTLY (co-load timing flakes +
+PgWaldumpVacuumPruneRoundtrip). No new nightly work.
 
-**Task — M0122 backlog / unimplemented_feat.json M0097-0035: pg_collation_for.**
-Verify-before-implement: entry claimed "returns hardcoded 'default'" with a
-STALE code_audit (cited internal/executor/expr.go:6249-6253, now interval-cast
-code). Reality: pg_collation_for is a full plan-time fold (planner.foldPgCollationFor,
-M0122-0005) mirroring PG's misc.c — NULL/UNKNOWNOID, explicit COLLATE, per-type
-defaults, arrays, domains, 42804. Closed the one residual the code comment
-flagged.
+**Task — M0122-0008 / unimplemented_feat.json SASLprep+channel-binding+
+scram_iterations.** Verify-before-implement: 2 of 3 sub-features already done
+(SASLprep fully ported+wired at both scramBuildSecret sites; scram_iterations
+GUC read live on the password-set path role_ddl.go:320). Channel binding PROPER
+is architecturally blocked — goopg has no TLS (server.go:1211 rejects
+SSLRequest). Closed the one implementable half: no-binding downgrade protection.
 
 Landed:
-- internal/planner/planner.go: foldPgCollationFor now takes ctx; new
-  resolveContext.explicitColumnCollationName resolves a bare *ColumnRef's
-  DDL-declared COLLATE from catalog.Column.Collation via the in-scope
-  rangeBinding (sourceIdx identity, range fallback). Pure plan-time constant
-  fold — no plan-shape/row-count impact.
-- internal/planner/pg_collation_for_test.go: +4 cases (collated_tbl c_ub→
-  ucs_basic, c_c→"C", c_plain→default, qualified ref).
-- unimplemented_feat.json: M0097-0035 open→resolved (surgical Edit, cited proof).
-- docs/design/0122-0005-pg-collation-for-array-types.md: Follow-up section.
-- .ralph/deferral_ledger.md: `-` row (computed-expr collation still deferred:
-  assign_expr_collations pass).
+- internal/auth/scram.go: new SCRAMServer.cbindFlag field; handleClientFirst
+  records the gs2-cbind-flag; validNoBindingChannelAttr(c, flag) now ties c= to
+  the original flag (n→"n,,"/biws, y→"y,,"/eSws) per auth-scram.c
+  read_client_final_message:211 (was accepting either → downgrade-tamper gap).
+- internal/auth/scram_test.go: TestSCRAMExchangeRejectsChannelBindingFlagMismatch
+  (non-vacuous: asserts NOT ErrInvalidPassword, i.e. caught at c= before proof),
+  TestSCRAMExchangeAcceptsYFlag.
+- unimplemented_feat.json: added code_audit narrowing (kept open — channel
+  binding blocked on TLS). Surgical Edit, JSON re-validated.
+- docs/design/0049-0003-scram-sha-256.md §3b + 2 test rows; README row updated.
+- .ralph/deferral_ledger.md: `-` row (channel binding proper deferred, TLS blocker).
 
-Gates: go build ./... clean; go vet ./internal/planner clean; planner suite PASS;
-collation tests (planner+executor) PASS; tpch-spotcheck PASS (Q12=2/Q13=33);
-make ralph-state-guard OK (auto-repaired prev-loop completed marker).
+Gates: go build ./... clean; go vet ./internal/auth clean; ./internal/auth PASS;
+server+initdb SCRAM/Auth/Role tests PASS. (Auth/protocol change — not
+executor/planner, so TPC-H spotcheck N/A; pgbench smoke via pre-commit hook.)
 
-Next loop: unimplemented_feat.json now 98 resolved / 83 open. Still-deferred
-computed-expression collation (assign_expr_collations) is a larger pass — see
-today's ledger row. Bounded candidates unchanged from #58: Planner GUC stubs
-actual behavior, parsePrimaryConninfo (blocked on trust-only handshake). Avoid
-pg_index expression-index restart persistence (hard — null-bitmap decode) and
-the interval/date hot area.
+Next loop: unimplemented_feat.json ~97 open. Channel binding proper needs TLS
+first (large). Other bounded candidates: WAL segment recycling, per-CTE
+pg_stat_* tracking. Avoid: pg_index expression-index restart persistence (hard
+null-bitmap decode), parallel-query GUC stubs (moot — no parallel executor),
+date/interval hot area.
 
 In-flight: none
