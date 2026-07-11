@@ -3165,7 +3165,7 @@
    "feature": "Per-column n_distinct planner hints are stored in attoptions for dump compatibility but are not used by the query planner for optimization",
    "task_id": "M0110-0001",
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "goopg does not act on n_distinct planner hints"
    ],
@@ -3180,7 +3180,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/executor/operators_ddl.go:7564 n_distinct stored dump-fidelity only"
+   "code_audit": "RESOLVED 2026-07-12: the n_distinct attribute option (catalog.Column.Options) is now consumed by the planner. New columnNDistinctOverride (internal/executor/operators_analyze.go) applies it at ANALYZE time (mirroring analyze.c:571-581) so the planner's existing columnNDistinctForChild reader (internal/planner/cardinality.go) transparently uses it for eq-selectivity (1/NDistinct) and join cardinality: positive v => absolute distinct count, v in [-1,0) => |v|*RowCount fraction (clamped to -1, floored at 1), 0/unset/n_distinct_inherited/other/malformed => no-op. Tests: TestColumnNDistinctOverride, TestAnalyzeRespectsNDistinctOption. Design: docs/design/0006-0006-n-distinct-attoption-override.md. Deferred (ledger 2026-07-12): NDistinct is stored as an absolute int64 so the negative fraction is resolved at ANALYZE time against the then-current RowCount, not re-resolved against reltuples at plan time like PG's get_variable_numdistinct; diverges only for tables that resize between ANALYZE and query."
   },
   {
    "feature": "SET STATISTICS column option is only supported in ALTER TABLE but not in CREATE TABLE; statistics targets cannot be specified when creating a table",

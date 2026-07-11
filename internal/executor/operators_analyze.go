@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"math/rand"
 	"sort"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -353,8 +355,59 @@ func analyzeRelationWith(pool *storage.Pool, mgr *mvcc.Manager, cat catalog.Cata
 			continue
 		}
 		stats.Columns[i] = computeColumnStats(reservoir, i, colTarget)
+		// Honor a per-column `n_distinct` attribute option, mirroring
+		// upstream's override in compute_index_stats/do_analyze_rel
+		// (postgres/src/backend/commands/analyze.c:571-581): a manual
+		// n_distinct baked into the stored statistics at ANALYZE time,
+		// so the planner consults it like any other stadistinct value.
+		if nd, ok := columnNDistinctOverride(&tbl.Columns[i], stats.RowCount); ok {
+			stats.Columns[i].NDistinct = nd
+		}
 	}
 	return stats, nil
+}
+
+// columnNDistinctOverride resolves a per-column `n_distinct` attribute option
+// (set via `ALTER TABLE ... ALTER COLUMN ... SET (n_distinct = <v>)`, stored on
+// catalog.Column.Options) into an absolute distinct-value count for the given
+// row count, mirroring upstream's stadistinct convention
+// (postgres/src/backend/utils/adt/selfuncs.c get_variable_numdistinct and the
+// override in analyze.c):
+//
+//   - v == 0 (or unset): no override — ok is false.
+//   - v  > 0: absolute number of distinct values (rounded to an integer).
+//   - v  < 0: a fraction, clamped to the valid [-1, 0) range; the estimate is
+//     |v| * rowCount (so -1 ⇒ all rows distinct, -0.5 ⇒ each value twice).
+//
+// Only the non-inherited `n_distinct` flavor is honored: goopg's ANALYZE is a
+// single-relation (non-inherited) scan, so `n_distinct_inherited` — which
+// upstream applies only during the inheritance-tree pass — never fires here.
+func columnNDistinctOverride(col *catalog.Column, rowCount int64) (int64, bool) {
+	for _, opt := range col.Options {
+		name, val, found := strings.Cut(opt, "=")
+		if !found || !strings.EqualFold(strings.TrimSpace(name), "n_distinct") {
+			continue
+		}
+		v, err := strconv.ParseFloat(strings.TrimSpace(val), 64)
+		if err != nil || v == 0 {
+			return 0, false
+		}
+		if v > 0 {
+			return int64(v + 0.5), true
+		}
+		// Negative: a fraction of the table's rows. PG's validated range
+		// floors at -1; clamp defensively in case an out-of-range value was
+		// stored (goopg's parser does not validate reloption bounds).
+		if v < -1 {
+			v = -1
+		}
+		nd := int64(-v*float64(rowCount) + 0.5)
+		if nd < 1 && rowCount > 0 {
+			nd = 1
+		}
+		return nd, true
+	}
+	return 0, false
 }
 
 // columnStatsTarget resolves the effective sampling target for one column,
