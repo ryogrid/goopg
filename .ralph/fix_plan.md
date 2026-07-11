@@ -3976,10 +3976,26 @@ mirroring M0119's ledger `status` column.
       `catalog.databaseDisplayOID` helper. Tests:
       `TestPGStatDatabaseConflictsViewRegistered` +
       `TestPgStatDatabaseConflictsEndToEnd`. Design +README +ledger updated.
-      Recovery-conflict accumulator deferred. Still unregistered pg_stat views
-      for a later slice: `pg_stat_ssl`, `pg_stat_gssapi`,
-      `pg_stat_subscription_stats`, `pg_stat_progress_*`, `pg_stat_replication`,
-      `pg_stat_wal_receiver`.
+      Recovery-conflict accumulator deferred.
+      **`pg_stat_progress_*` done (2026-07-12, later loop):** the six
+      command-progress views `pg_stat_progress_vacuum`/`analyze`/`cluster`/
+      `create_index`/`basebackup`/`copy` (OIDs 9103–9108) as static ZERO-row
+      virtual views via a local `mkProgressView(name, oid, cols)` helper. Upstream
+      each projects `pg_stat_get_progress_info('<CMD>')` (one row per backend with
+      an active `pgstat_progress_start_command` slot); goopg has no command-progress
+      instrumentation, so all six are empty — byte-identical to an *idle* real PG
+      18.3 cluster. Columns/types transcribed verbatim from `system_views.sql`
+      (CASE-mapped phase/command/type text, paramN int8, pid int4, delay_time
+      float8, *id oid); no per-connection twin. Tests:
+      `TestPGStatProgressViewsRegistered` + `TestPgStatProgressViewsEndToEnd`.
+      Design +README +ledger updated. Live per-backend progress feed deferred.
+      Note: `pg_stat_replication`/`pg_stat_wal_receiver`/`pg_stat_subscription`
+      already exist in `internal/initdb/replication_views.go` (live walsender/
+      receiver/subscription rows). Still unregistered pg_stat views for a later
+      slice: `pg_stat_ssl`, `pg_stat_gssapi` (per-backend, need the live session
+      registry — belong in initdb like `pg_stat_activity`), and
+      `pg_stat_subscription_stats` (per-subscription, belongs with the subscription
+      infra in `replication_views.go`).
 - [x] **M0122-0004 — SQL language / executor features** (~21). Window frame
       ROWS/RANGE/GROUPS, GROUPING SETS/ROLLUP/CUBE, DEFAULT-clause
       parsing, intervals. **WITH CHECK

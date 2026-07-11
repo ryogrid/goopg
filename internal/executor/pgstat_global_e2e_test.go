@@ -111,3 +111,29 @@ func TestPgStatDatabaseConflictsEndToEnd(t *testing.T) {
 		}
 	}
 }
+
+// TestPgStatProgressViewsEndToEnd drives every pg_stat_progress_* view through
+// the full SQL executor and confirms each resolves as a virtual view and returns
+// zero rows: goopg has no command-progress instrumentation, so like an idle real
+// PG cluster these views are always empty. This is the tripwire that the views
+// are actually queryable end-to-end (not just registered in the catalog struct).
+// M0122-0003.
+func TestPgStatProgressViewsEndToEnd(t *testing.T) {
+	ctx, _, cleanup := newStorageFixture(t)
+	defer cleanup()
+
+	queries := map[string]string{
+		"pg_stat_progress_vacuum":       "SELECT pid, datid, relid, phase, heap_blks_total, delay_time FROM pg_stat_progress_vacuum",
+		"pg_stat_progress_analyze":      "SELECT pid, datid, phase, sample_blks_total, current_child_table_relid, delay_time FROM pg_stat_progress_analyze",
+		"pg_stat_progress_cluster":      "SELECT pid, datid, command, phase, cluster_index_relid, index_rebuild_count FROM pg_stat_progress_cluster",
+		"pg_stat_progress_create_index": "SELECT pid, datid, index_relid, command, phase, partitions_done FROM pg_stat_progress_create_index",
+		"pg_stat_progress_basebackup":   "SELECT pid, phase, backup_total, tablespaces_streamed FROM pg_stat_progress_basebackup",
+		"pg_stat_progress_copy":         "SELECT pid, datid, command, type, bytes_processed, tuples_skipped FROM pg_stat_progress_copy",
+	}
+	for view, q := range queries {
+		rows := runQueryRows(t, ctx, q)
+		if len(rows) != 0 {
+			t.Errorf("%s: row count = %d, want 0 (no progress instrumentation)", view, len(rows))
+		}
+	}
+}

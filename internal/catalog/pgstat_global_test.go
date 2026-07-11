@@ -263,3 +263,72 @@ func TestPGStatDatabaseConflictsViewRegistered(t *testing.T) {
 		t.Error("pg_stat_database_conflicts: new database confldb not listed after CREATE DATABASE")
 	}
 }
+
+// TestPGStatProgressViewsRegistered confirms every pg_stat_progress_* view
+// resolves as a virtual pg_catalog relation with the upstream PG 18.3 tupledesc
+// (column names transcribed from system_views.sql) and returns ZERO rows: goopg
+// does not instrument command progress, so — exactly like an idle real PG
+// cluster with no VACUUM/ANALYZE/etc. in flight — these views are empty.
+// M0122-0003.
+func TestPGStatProgressViewsRegistered(t *testing.T) {
+	c := NewInMemory()
+	want := map[string][]string{
+		"pg_stat_progress_vacuum": {
+			"pid", "datid", "datname", "relid", "phase", "heap_blks_total",
+			"heap_blks_scanned", "heap_blks_vacuumed", "index_vacuum_count",
+			"max_dead_tuple_bytes", "dead_tuple_bytes", "num_dead_item_ids",
+			"indexes_total", "indexes_processed", "delay_time",
+		},
+		"pg_stat_progress_analyze": {
+			"pid", "datid", "datname", "relid", "phase", "sample_blks_total",
+			"sample_blks_scanned", "ext_stats_total", "ext_stats_computed",
+			"child_tables_total", "child_tables_done", "current_child_table_relid",
+			"delay_time",
+		},
+		"pg_stat_progress_cluster": {
+			"pid", "datid", "datname", "relid", "command", "phase",
+			"cluster_index_relid", "heap_tuples_scanned", "heap_tuples_written",
+			"heap_blks_total", "heap_blks_scanned", "index_rebuild_count",
+		},
+		"pg_stat_progress_create_index": {
+			"pid", "datid", "datname", "relid", "index_relid", "command", "phase",
+			"lockers_total", "lockers_done", "current_locker_pid", "blocks_total",
+			"blocks_done", "tuples_total", "tuples_done", "partitions_total",
+			"partitions_done",
+		},
+		"pg_stat_progress_basebackup": {
+			"pid", "phase", "backup_total", "backup_streamed", "tablespaces_total",
+			"tablespaces_streamed",
+		},
+		"pg_stat_progress_copy": {
+			"pid", "datid", "datname", "relid", "command", "type", "bytes_processed",
+			"bytes_total", "tuples_processed", "tuples_excluded", "tuples_skipped",
+		},
+	}
+	for name, wantCols := range want {
+		tbl := c.ns(DefaultDBOid).tables["pg_catalog."+name]
+		if tbl == nil {
+			t.Errorf("%s not registered as a virtual pg_catalog table", name)
+			continue
+		}
+		if !tbl.Virtual {
+			t.Errorf("%s: Virtual = false, want true", name)
+		}
+		if len(tbl.Columns) != len(wantCols) {
+			t.Errorf("%s: %d columns, want %d", name, len(tbl.Columns), len(wantCols))
+			continue
+		}
+		for i, wc := range wantCols {
+			if tbl.Columns[i].Name != wc {
+				t.Errorf("%s: column %d = %q, want %q", name, i, tbl.Columns[i].Name, wc)
+			}
+		}
+		if tbl.VirtualRows == nil {
+			t.Errorf("%s: VirtualRows is nil", name)
+			continue
+		}
+		if rows := tbl.VirtualRows(); len(rows) != 0 {
+			t.Errorf("%s: VirtualRows() = %d rows, want 0 (no progress instrumentation)", name, len(rows))
+		}
+	}
+}

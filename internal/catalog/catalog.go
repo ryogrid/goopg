@@ -8656,6 +8656,72 @@ func (c *InMemory) registerSystemTables() {
 	pgStatDatabaseConflicts.VirtualRows = c.PGStatDatabaseConflictsRows
 	c.ns(DefaultDBOid).tables["pg_catalog.pg_stat_database_conflicts"] = pgStatDatabaseConflicts
 
+	// pg_stat_progress_* — the command-progress reporting family (VACUUM,
+	// ANALYZE, CLUSTER, CREATE INDEX, BASEBACKUP, COPY). Upstream each view is a
+	// projection over pg_stat_get_progress_info('<CMD>'), which returns exactly
+	// one row per backend currently executing that command with a progress-report
+	// slot registered (pgstat_progress_start_command / pgstat_progress_update_param
+	// in the backend). goopg does NOT instrument command progress — no backend
+	// ever calls pgstat_progress_start_command — so on a running instance, exactly
+	// as on an *idle* real PG 18.3 cluster (no VACUUM/ANALYZE/etc. in flight),
+	// every one of these views is empty. Registering them as static zero-row
+	// virtual views makes `SELECT * FROM pg_stat_progress_vacuum` (and siblings)
+	// resolve with the correct byte-identical tupledesc and return no rows, which
+	// is what monitoring tooling probes for. The live per-backend progress feed is
+	// a deferred gap — see docs/design/0122-0003-pg-stat-user-tables.md and the
+	// deferral ledger (2026-07-12, M0122-0003). Column names/types are transcribed
+	// from src/backend/catalog/system_views.sql; the CASE-mapped phase/command
+	// columns are text, the paramN counters are int8, pid is int4, and the *id
+	// columns are oid, matching pg_stat_get_progress_info's tupledesc.
+	mkProgressView := func(name string, oid uint32, cols [][2]string) {
+		tbl := &Table{Schema: "pg_catalog", Name: name, Virtual: true, OID: oid}
+		for i, col := range cols {
+			tbl.Columns = append(tbl.Columns, Column{Name: col[0], Type: Type{Name: col[1]}, Ordinal: i})
+		}
+		tbl.VirtualRows = func() [][]string { return [][]string{} }
+		c.ns(DefaultDBOid).tables["pg_catalog."+name] = tbl
+	}
+	mkProgressView("pg_stat_progress_vacuum", 9103, [][2]string{
+		{"pid", "int4"}, {"datid", "oid"}, {"datname", "name"}, {"relid", "oid"},
+		{"phase", "text"}, {"heap_blks_total", "int8"}, {"heap_blks_scanned", "int8"},
+		{"heap_blks_vacuumed", "int8"}, {"index_vacuum_count", "int8"},
+		{"max_dead_tuple_bytes", "int8"}, {"dead_tuple_bytes", "int8"},
+		{"num_dead_item_ids", "int8"}, {"indexes_total", "int8"},
+		{"indexes_processed", "int8"}, {"delay_time", "float8"},
+	})
+	mkProgressView("pg_stat_progress_analyze", 9104, [][2]string{
+		{"pid", "int4"}, {"datid", "oid"}, {"datname", "name"}, {"relid", "oid"},
+		{"phase", "text"}, {"sample_blks_total", "int8"}, {"sample_blks_scanned", "int8"},
+		{"ext_stats_total", "int8"}, {"ext_stats_computed", "int8"},
+		{"child_tables_total", "int8"}, {"child_tables_done", "int8"},
+		{"current_child_table_relid", "oid"}, {"delay_time", "float8"},
+	})
+	mkProgressView("pg_stat_progress_cluster", 9105, [][2]string{
+		{"pid", "int4"}, {"datid", "oid"}, {"datname", "name"}, {"relid", "oid"},
+		{"command", "text"}, {"phase", "text"}, {"cluster_index_relid", "oid"},
+		{"heap_tuples_scanned", "int8"}, {"heap_tuples_written", "int8"},
+		{"heap_blks_total", "int8"}, {"heap_blks_scanned", "int8"},
+		{"index_rebuild_count", "int8"},
+	})
+	mkProgressView("pg_stat_progress_create_index", 9106, [][2]string{
+		{"pid", "int4"}, {"datid", "oid"}, {"datname", "name"}, {"relid", "oid"},
+		{"index_relid", "oid"}, {"command", "text"}, {"phase", "text"},
+		{"lockers_total", "int8"}, {"lockers_done", "int8"}, {"current_locker_pid", "int8"},
+		{"blocks_total", "int8"}, {"blocks_done", "int8"}, {"tuples_total", "int8"},
+		{"tuples_done", "int8"}, {"partitions_total", "int8"}, {"partitions_done", "int8"},
+	})
+	mkProgressView("pg_stat_progress_basebackup", 9107, [][2]string{
+		{"pid", "int4"}, {"phase", "text"}, {"backup_total", "int8"},
+		{"backup_streamed", "int8"}, {"tablespaces_total", "int8"},
+		{"tablespaces_streamed", "int8"},
+	})
+	mkProgressView("pg_stat_progress_copy", 9108, [][2]string{
+		{"pid", "int4"}, {"datid", "oid"}, {"datname", "name"}, {"relid", "oid"},
+		{"command", "text"}, {"type", "text"}, {"bytes_processed", "int8"},
+		{"bytes_total", "int8"}, {"tuples_processed", "int8"},
+		{"tuples_excluded", "int8"}, {"tuples_skipped", "int8"},
+	})
+
 	// pg_stat_io — per-backend-type I/O statistics (PG 16+, OID 8061).
 	// The static VirtualRows fallback below returns no rows; the real,
 	// live row set (upstream's exact 79-row valid-combination shape, with

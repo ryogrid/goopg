@@ -413,6 +413,38 @@ counters, bootstrap-database display oids, `CREATE DATABASE` reflected) and
 (`internal/executor/pgstat_global_e2e_test.go` — full SELECT, no `datid=0` row,
 every `confl_*` 0). The live recovery-conflict accumulator is deferred (ledger).
 
+## `pg_stat_progress_*` command-progress views (2026-07-12)
+
+The six `pg_stat_progress_*` views report the live progress of a long-running
+command executing in some backend: `pg_stat_progress_vacuum`,
+`pg_stat_progress_analyze`, `pg_stat_progress_cluster`,
+`pg_stat_progress_create_index`, `pg_stat_progress_basebackup`, and
+`pg_stat_progress_copy`. Upstream each is a projection over
+`pg_stat_get_progress_info('<CMD>')`, which returns exactly one row per backend
+that has an active progress-report slot registered via
+`pgstat_progress_start_command` / `pgstat_progress_update_param` (see
+`src/backend/utils/activity/backend_progress.c` and `commands/vacuum.c` etc.).
+
+goopg does **not** instrument command progress — no code path calls
+`pgstat_progress_start_command` — so every one of these views is empty, which is
+byte-identical to a real PG 18.3 cluster that is simply *idle* (no VACUUM /
+ANALYZE / CLUSTER / CREATE INDEX / base backup / COPY in flight at the instant of
+the query). They are therefore registered as **static zero-row** virtual views in
+`registerSystemTables` via the local `mkProgressView` helper (OIDs 9103–9108),
+right after `pg_stat_database_conflicts`. Column names and per-column types are
+transcribed verbatim from `src/backend/catalog/system_views.sql`: the CASE-mapped
+`phase` / `command` / `type` columns are `text`, the `paramN` counters are `int8`,
+`pid` is `int4`, the `delay_time` columns are `float8` (`paramN / 1000000::double
+precision`), and the `*id` columns are `oid`.
+
+This gives the correct byte-identical tupledesc so `SELECT * FROM
+pg_stat_progress_vacuum` (and siblings) resolves and returns no rows — what
+monitoring tooling probes for — instead of an unknown-relation error. Tests:
+`TestPGStatProgressViewsRegistered` (`internal/catalog/pgstat_global_test.go` —
+all six shapes, empty row sets) and `TestPgStatProgressViewsEndToEnd`
+(`internal/executor/pgstat_global_e2e_test.go` — full SELECT through the executor,
+zero rows). The live per-backend progress feed is deferred (ledger).
+
 ## Deferred
 
 The scan/tuple/vacuum/analyze counters and `last_*` timestamps remain honest
