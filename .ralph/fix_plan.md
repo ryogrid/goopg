@@ -8081,6 +8081,29 @@ mirroring M0119's ledger `status` column.
       cast-form typmod, EXTRACT numeric scale gap. Design doc
       `docs/design/0003-0006-*` new Follow-up. Gates: build/vet clean; analyzer
       + executor suites PASS; PG-18.3 cross-check; pgbench (hook).
+  - [x] `unimplemented_feat #5(d-iv) (EXTRACT numeric display scale)`
+      (2026-07-11, this loop) — closed the prior d-iv rows' deferred "EXTRACT
+      numeric trailing-zero scale gap" (`6.5` vs PG `6.500000`). PG's `EXTRACT`
+      is the numeric-returning spelling (`retnumeric=true`,
+      `interval_part_common`/`timestamp_part`) whose fractional-second fields go
+      through `int64_div_fast_to_numeric(val, log10)` — result display scale =
+      `log10`, trailing zeros preserved (second=6, millisecond=3, epoch=6). New
+      `int64DivFastToNumeric` helper (`internal/executor/expr.go`) builds
+      `Datum{KindNumeric, Int:val, Scale:log10}`; `formatNumeric` already renders
+      the zeros. Threaded `retnumeric bool` through `evalExtractInterval` so
+      `evalExtract` (EXTRACT node) → `true` (scaled) and `evalDatePart` →
+      `false` (PG's float8 spelling, stays zero-stripped:
+      `date_part('second',interval '5 seconds')`=`5`). Timestamp/time
+      second/millisecond migrated to the helper; interval `epoch` numeric
+      line-ported to PG's exact ×4/÷4 integer arithmetic. Byte-for-byte vs live
+      PG 18.3. Tests: `interval_subday_test.go` `TestExtractFromInterval`
+      (EXTRACT rows rescaled + new `date_part` float8 rows + new timestamp/time
+      EXTRACT rows). **Newly-discovered & deferred (ledger 2026-07-11):**
+      `EXTRACT(EPOCH FROM timestamp)` returns seconds-of-day not the full Unix
+      epoch — a distinct VALUE bug in `evalExtract`'s `case "epoch"`, left
+      untouched. Design doc `docs/design/0003-0006-*` new Follow-up. Gates:
+      build/vet clean; executor suite PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); pgbench (hook).
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,

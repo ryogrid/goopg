@@ -1386,13 +1386,47 @@ both infinities, and double negation) were captured from **PostgreSQL 18.3**
 (`local_install`): `-1 days`, `-1 years -2 mons -3 days -04:05:06.5`,
 `-2 mons +4 days -03:00:00`, `-infinity`, `infinity`.
 
+## Follow-up: `EXTRACT` numeric display scale (`6.5` → `6.500000`)
+
+PostgreSQL's `EXTRACT(field FROM …)` returns **numeric** (the `retnumeric=true`
+arm of `interval_part_common`/`timestamp_part`,
+`postgres/src/backend/utils/adt/timestamp.c`), and its fractional-second fields
+build the result via `int64_div_fast_to_numeric(val, log10)`
+(`.../numeric.c:4423`), whose result **display scale is exactly `log10`** —
+trailing zeros preserved. So `EXTRACT(SECOND FROM INTERVAL '5 seconds')` is
+`5.000000` (scale 6), `EXTRACT(MILLISECOND …)` is scale 3, and `EXTRACT(EPOCH …)`
+is scale 6. goopg previously funnelled these through `newNumericFromFloat`, which
+strips trailing zeros, emitting `5` / `6.5`.
+
+The distinct **`date_part(text, …)`** spelling is the `retnumeric=false` arm and
+returns **float8** (`PG_RETURN_FLOAT8`) — trailing zeros *are* stripped
+(`date_part('second', INTERVAL '5 seconds')` = `5`). goopg's `evalExtractInterval`
+is shared by both spellings, so it now takes a `retnumeric bool`: `evalExtract`
+(the `EXTRACT` syntax node) passes `true` and builds a fixed-scale numeric via the
+new `int64DivFastToNumeric` helper; `evalDatePart` passes `false` and keeps the
+zero-stripping `newNumericFromFloat`. The `EXTRACT` timestamp/time path
+(`evalExtract`'s own `second`/`millisecond` cases) was migrated to the same helper.
+The interval `EPOCH` numeric case was line-ported to PG's exact integer arithmetic
+(`secs_from_day_month = (1461·(mon/12) + 120·(mon%12) + 4·day)·21600`, then
+`(secs·1e6 + micros)/1e6` at scale 6) so the ×4/÷4 trick keeps the fractional
+`DAYS_PER_YEAR=365.25` exact. Verified byte-for-byte vs PG 18.3 (`extract(second
+from interval '2 years … 6.5 seconds')`=`6.500000`, `extract(epoch …)`=
+`71769906.500000`, `extract(millisecond from interval '6.5 seconds')`=`6500.000`,
+`extract(second from time '20:38:40.123456')`=`40.123456`). Tests:
+`TestExtractFromInterval` (`interval_subday_test.go`) — EXTRACT rows now assert the
+scaled form, new `date_part` rows lock the stripped-float8 form, new
+timestamp/time EXTRACT rows.
+
 **Still deferred (narrowed).** `timestamp ± interval 'infinity'` (needs an
 infinite-timestamp carrier), and the cast-form typmod
-`CAST(... AS interval hour to minute)` / `interval(p) '...'`. Also open: goopg's
-`EXTRACT` numeric output strips trailing zeros (`6.5` vs PG's `6.500000`), a
-pre-existing scale gap shared with the timestamp path — not specific to
-intervals. Gates: `go build`/`go vet` clean; analyzer + executor suites PASS;
-canonical values cross-checked against PG 18.3; pgbench smoke via pre-commit hook.
+`CAST(... AS interval hour to minute)` / `interval(p) '...'`. Also open and
+newly-discovered: `EXTRACT(EPOCH FROM timestamp)` computes only *seconds-of-day*
+(`evalExtract`'s `case "epoch"`) instead of the full Unix epoch — e.g. PG returns
+`982355920.500000` for `2001-02-16 20:38:40.5` but goopg returns `74320.5`; the
+`EXTRACT(EPOCH …)` case for the timestamp/time source was deliberately left
+untouched this loop (a distinct value bug, plus the same scale gap), see the
+deferral ledger. Gates: `go build`/`go vet` clean; full executor suite PASS;
+`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke via pre-commit hook.
 
 ## Cross-references
 

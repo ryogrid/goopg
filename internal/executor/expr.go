@@ -4047,6 +4047,22 @@ func newNumericFromFloat(f float64) Datum {
 	return newNumeric(m, int(scale))
 }
 
+// int64DivFastToNumeric reproduces PostgreSQL's int64_div_fast_to_numeric
+// (postgres/src/backend/utils/adt/numeric.c:4423): it renders val / 10^log10
+// as a NUMERIC whose *display scale* is exactly log10 (log10<0 → scale 0), so
+// trailing zeros are preserved. EXTRACT (the numeric-returning spelling) uses
+// this for its fractional-second fields — PG prints `EXTRACT(SECOND FROM
+// INTERVAL '5 seconds')` as `5.000000` (scale 6), not `5`. This is distinct
+// from date_part (the float8-returning spelling, retnumeric=false), which
+// strips trailing zeros via newNumericFromFloat.
+func int64DivFastToNumeric(val int64, log10 int) Datum {
+	scale := log10
+	if scale < 0 {
+		scale = 0
+	}
+	return Datum{Kind: KindNumeric, Int: val, Scale: int16(scale)}
+}
+
 // evalExtract implements `EXTRACT(field FROM source)` for the
 // timestamp-component fields TPC-H Q7/Q8/Q9 use (year), plus
 // the obvious neighbours (month, day, hour, minute, dow, doy,
@@ -4063,7 +4079,8 @@ func evalExtract(x *planner.ExtractExpr, row Row, ctx *Context) (Datum, error) {
 	if src.Kind == KindInterval {
 		// EXTRACT(field FROM interval) has its own field taxonomy and
 		// broken-down representation (interval_part_common). M0097 follow-up.
-		return evalExtractInterval(src, x.Field, x.Pos())
+		// EXTRACT returns numeric (retnumeric=true) → scale-preserved.
+		return evalExtractInterval(src, x.Field, x.Pos(), true)
 	}
 	if src.Kind != KindTime {
 		// Try to parse a string as timestamp (planner may assign
@@ -4085,11 +4102,14 @@ func evalExtract(x *planner.ExtractExpr, row Row, ctx *Context) (Datum, error) {
 	isTimeOnly := srcType == "time" || srcType == "timetz"
 	switch field {
 	case "second", "seconds":
-		f := float64(u.Second()) + float64(u.Nanosecond())/1e9
-		return newNumericFromFloat(f), nil
+		// EXTRACT returns numeric: (tm_sec*1e6 + fsec) / 1e6 at scale 6
+		// (timestamp_part / interval_part_common, retnumeric=true), so PG
+		// prints `40.500000` not `40.5`.
+		usec := int64(u.Second())*1_000_000 + int64(u.Nanosecond())/1000
+		return int64DivFastToNumeric(usec, 6), nil
 	case "milliseconds", "millisecond":
-		f := float64(u.Second())*1000 + float64(u.Nanosecond())/1_000_000.0
-		return newNumericFromFloat(f), nil
+		usec := int64(u.Second())*1_000_000 + int64(u.Nanosecond())/1000
+		return int64DivFastToNumeric(usec, 3), nil
 	case "epoch":
 		localSecs := float64(u.Hour()*3600+u.Minute()*60+u.Second()) + float64(u.Nanosecond())/1e9
 		if srcType == "timetz" {
@@ -4160,7 +4180,7 @@ func evalExtract(x *planner.ExtractExpr, row Row, ctx *Context) (Datum, error) {
 // The ±infinity sentinels follow NonFiniteIntervalPart: monotonically-increasing
 // units yield ±Infinity (numeric), oscillating units yield NULL, and any other
 // unit raises the same error the finite path would.
-func evalExtractInterval(src Datum, field string, pos int) (Datum, error) {
+func evalExtractInterval(src Datum, field string, pos int, retnumeric bool) (Datum, error) {
 	f := strings.ToLower(strings.TrimSpace(field))
 
 	// ±infinity sentinel handling (INTERVAL_NOT_FINITE → NonFiniteIntervalPart).
@@ -4205,8 +4225,16 @@ func evalExtractInterval(src Datum, field string, pos int) (Datum, error) {
 	case "microsecond", "microseconds":
 		return Datum{Kind: KindInt, Int: tmSec*1_000_000 + tmUsec}, nil
 	case "millisecond", "milliseconds":
+		if retnumeric {
+			// EXTRACT: (tm_sec*1e6 + usec) / 1e3 at scale 3.
+			return int64DivFastToNumeric(tmSec*1_000_000+tmUsec, 3), nil
+		}
 		return newNumericFromFloat(float64(tmSec)*1000.0 + float64(tmUsec)/1000.0), nil
 	case "second", "seconds":
+		if retnumeric {
+			// EXTRACT: (tm_sec*1e6 + usec) / 1e6 at scale 6.
+			return int64DivFastToNumeric(tmSec*1_000_000+tmUsec, 6), nil
+		}
 		return newNumericFromFloat(float64(tmSec) + float64(tmUsec)/1_000_000.0), nil
 	case "minute", "minutes":
 		return Datum{Kind: KindInt, Int: tmMin}, nil
@@ -4238,6 +4266,15 @@ func evalExtractInterval(src Datum, field string, pos int) (Datum, error) {
 		return Datum{Kind: KindInt, Int: tmYear / 1000}, nil
 	case "epoch":
 		// DAYS_PER_YEAR=365.25, DAYS_PER_MONTH=30, SECS_PER_DAY=86400.
+		if retnumeric {
+			// EXTRACT: integer arithmetic per interval_part_common — multiply
+			// by 4 and divide by 4 so the fractional DAYS_PER_YEAR (365.25)
+			// stays exact: 4*365.25=1461, 4*30=120, SECS_PER_DAY/4=21600.
+			// result = (secs_from_day_month*1e6 + micros) / 1e6 at scale 6.
+			m := int64(months)
+			secsFromDayMonth := (1461*(m/12) + 120*(m%12) + 4*int64(days)) * 21600
+			return int64DivFastToNumeric(secsFromDayMonth*1_000_000+micros, 6), nil
+		}
 		result := float64(micros) / 1_000_000.0
 		result += 365.25 * 86400.0 * float64(int64(months)/12)
 		result += 30.0 * 86400.0 * float64(int64(months)%12)
@@ -4359,7 +4396,8 @@ func evalDatePart(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	if src.Kind == KindInterval {
 		// date_part('field', interval) is the function spelling of
 		// EXTRACT(field FROM interval); share the same line-port. M0097 follow-up.
-		return evalExtractInterval(src, fieldArg.StringValue(), x.Pos())
+		// date_part returns float8 (retnumeric=false) → trailing zeros stripped.
+		return evalExtractInterval(src, fieldArg.StringValue(), x.Pos(), false)
 	}
 	if src.Kind != KindTime {
 		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "date_part second argument must be timestamp/date"}

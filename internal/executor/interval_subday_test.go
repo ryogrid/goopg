@@ -1210,15 +1210,18 @@ func TestExtractFromInterval(t *testing.T) {
 		{"SELECT extract(day from " + full + ")", "10"},
 		{"SELECT extract(hour from " + full + ")", "4"},
 		{"SELECT extract(minute from " + full + ")", "5"},
-		{"SELECT extract(second from " + full + ")", "6.5"},
-		{"SELECT extract(millisecond from interval '6.5 seconds')", "6500"},
+		// EXTRACT returns numeric with a fixed display scale (retnumeric=true):
+		// second scale 6, millisecond scale 3, microsecond integer. Values
+		// captured byte-for-byte from live PG 18.3.
+		{"SELECT extract(second from " + full + ")", "6.500000"},
+		{"SELECT extract(millisecond from interval '6.5 seconds')", "6500.000"},
 		{"SELECT extract(microsecond from interval '6.5 seconds')", "6500000"},
 		{"SELECT extract(week from interval '10 days')", "1"},
 		{"SELECT extract(quarter from interval '2 years 3 months 10 days')", "2"},
 		{"SELECT extract(decade from interval '2 years')", "0"},
 		{"SELECT extract(century from interval '250 years')", "2"},
 		{"SELECT extract(millennium from interval '3000 years')", "3"},
-		{"SELECT extract(epoch from " + full + ")", "71769906.5"},
+		{"SELECT extract(epoch from " + full + ")", "71769906.500000"},
 		// Negative intervals: fields negate the sign-reversed value.
 		{"SELECT extract(quarter from interval '-5 months')", "-2"},
 		{"SELECT extract(year from interval '-13 months')", "-1"},
@@ -1227,11 +1230,26 @@ func TestExtractFromInterval(t *testing.T) {
 		{"SELECT extract(epoch from interval 'infinity')", "Infinity"},
 		{"SELECT extract(hour from interval 'infinity')", "Infinity"},
 		{"SELECT extract(day from interval '-infinity')", "-Infinity"},
-		// date_part('field', interval) is the function spelling — must agree.
+		// date_part('field', interval) is the function spelling — returns
+		// float8 (retnumeric=false), so trailing zeros are STRIPPED, unlike the
+		// EXTRACT rows above. This locks the scale distinction PG makes.
 		{"SELECT date_part('epoch', " + full + ")", "71769906.5"},
+		{"SELECT date_part('second', interval '6.5 seconds')", "6.5"},
+		{"SELECT date_part('millisecond', interval '6.5 seconds')", "6500"},
+		{"SELECT date_part('second', interval '5 seconds')", "5"},
 		{"SELECT date_part('hour', " + full + ")", "4"},
 		{"SELECT date_part('quarter', interval '-5 months')", "-2"},
 		{"SELECT date_part('epoch', interval 'infinity')", "Infinity"},
+		// EXTRACT from a timestamp/time source is numeric too (scale 6/3).
+		{"SELECT extract(second from timestamp '2001-02-16 20:38:40.5')", "40.500000"},
+		{"SELECT extract(second from timestamp '2001-02-16 20:38:40')", "40.000000"},
+		{"SELECT extract(millisecond from timestamp '2001-02-16 20:38:40.5')", "40500.000"},
+		{"SELECT extract(second from time '20:38:40.123456')", "40.123456"},
+		{"SELECT extract(millisecond from time '20:38:40.123456')", "40123.456"},
+		// EXTRACT from a whole-second interval keeps the trailing zeros.
+		{"SELECT extract(second from interval '90 seconds')", "30.000000"},
+		{"SELECT extract(second from interval '-6.5 seconds')", "-6.500000"},
+		{"SELECT extract(epoch from interval '1 day 2 hours')", "93600.000000"},
 	}
 	for _, c := range accept {
 		rows := runQuery(t, ctx, c.sql+" FROM t")
