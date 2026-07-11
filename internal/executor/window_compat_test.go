@@ -1374,6 +1374,46 @@ func TestWindowRangeOffsetNegative(t *testing.T) {
 	}
 }
 
+// TestRangeOffsetNegativeIntervalSign pins that a RANGE interval offset's
+// validity is decided by its linear span (interval_sign), NOT the sign of any
+// individual month/day/micro component — matching in_range_interval_interval /
+// interval_cmp_value in PostgreSQL's timestamp.c. An offset like '1 mon -10 days'
+// has a +20-day span and is a valid (positive) offset even though its day field
+// is negative; the pre-fix per-component heuristic wrongly rejected it (22013).
+func TestRangeOffsetNegativeIntervalSign(t *testing.T) {
+	const usecPerDay = int64(24 * 60 * 60 * 1_000_000)
+	cases := []struct {
+		name         string
+		months       int32
+		days         int32
+		micros       int64
+		wantNegative bool
+	}{
+		// Net span > 0 → accepted (this is the edge the old heuristic broke).
+		{"1mon_minus_10days", 1, -10, 0, false}, // 30-10 = +20 days
+		{"minus_10days_plus_1mon_micros", 1, -10, 5, false},
+		{"pure_positive_days", 0, 5, 0, false},
+		{"pure_positive_micros", 0, 0, 123, false},
+		{"zero_interval", 0, 0, 0, false}, // span 0 is not negative
+		// Net span < 0 → rejected.
+		{"minus_1mon_10days", -1, 10, 0, true}, // -30+10 = -20 days
+		{"pure_negative_day", 0, -1, 0, true},
+		{"pure_negative_micros", 0, 0, -1, true},
+		{"positive_days_negative_micros_net_pos", 0, 1, -usecPerDay / 2, false}, // +0.5 day
+		{"one_day_minus_one_day_micros_net_zero", 0, 1, -usecPerDay, false},     // +1 day -1 day = span 0
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			iv := NewIntervalDatumFull(c.months, c.days, c.micros)
+			got := rangeOffsetNegative(iv)
+			if got != c.wantNegative {
+				t.Fatalf("rangeOffsetNegative(%d mon %d day %d us) = %v, want %v",
+					c.months, c.days, c.micros, got, c.wantNegative)
+			}
+		})
+	}
+}
+
 // assertRangeSums runs sql (whose second projected column is a sum) and
 // checks the per-row sums against want.
 func assertRangeSums(t *testing.T, ctx *Context, sql string, want []int64) {

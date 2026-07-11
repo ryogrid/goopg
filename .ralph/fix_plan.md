@@ -4017,6 +4017,21 @@ mirroring M0119's ledger `status` column.
       Combining forms (`OVER (win ORDER BY ...)`, a named window based on
       another named window) are also out of scope (real upstream syntax,
       deferred — see design doc). Intervals also remain.
+      **RANGE interval-offset sign matched to PG (2026-07-12, this loop):**
+      `rangeOffsetNegative` (`internal/executor/operators_window.go`) previously
+      rejected an interval RANGE offset when *any* component was negative
+      (`months<0||days<0||micros<0`); PG's `in_range_interval_interval`
+      (`timestamp.c`) instead rejects on the sign of the *linear span*
+      `interval_sign(offset)` = `time_micros + (months*30+days)*USECS_PER_DAY`.
+      So `INTERVAL '1 mon -10 days'` (a +20-day span) is a valid positive offset
+      that goopg wrongly `22013`-rejected. Now computed via the same
+      overflow-safe day/frac decomposition `compareDatum` uses for interval
+      ordering; ±infinity sentinels handled (NOEND positive / NOBEGIN negative).
+      Test `TestRangeOffsetNegativeIntervalSign`
+      (`internal/executor/window_compat_test.go`); design doc
+      `0122-0004-range-offset-window-frame.md` Follow-up section; deferral-ledger
+      row 716's item (2) resolved (item (1), the per-type in_range parse-time
+      `0A000` catalog, remains open). tpch-spotcheck PASS (Q12=2/Q13=33).
       **GROUPING SETS/ROLLUP/CUBE removed from this bucket (2026-07-05,
       this loop):** implemented real SQL:1999 §7.9 semantics — previously
       the parser discarded the construct into a plain GROUP BY (an

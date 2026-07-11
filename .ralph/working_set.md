@@ -1,46 +1,41 @@
 (idle — nothing in flight)
 
-## Loop summary (2026-07-12, loop #65)
+## Loop summary (2026-07-12, loop #66)
 
-**Nightly triage:** action-items batch `20260711-011536` (same as #58–#64) —
+**Nightly triage:** action-items batch `20260711-011536` (same as #58–#65) —
 all 3 AI items already `[x]` in M-NIGHTLY. No new nightly work.
 
-**Task — M0122-0007 follow-up: surface GEQO + planner-tuning GUCs in
-pg_settings.** Last loop registered the 10 GUCs in the config registry (SET/SHOW
-work) but deferred the pg_settings half: `pg_catalog.pg_settings` is a
-*separately* hand-curated literal list (`pgSettings.VirtualRows`,
-internal/catalog/catalog.go ~L10010), NOT registry-derived, so
-`SELECT * FROM pg_settings WHERE name='geqo_threshold'` returned nothing while
-`SHOW geqo_threshold` worked. Ledger row 722 named this exact resume point.
+**Task — M0122-0004 follow-up: RANGE interval-offset sign matches PG.**
+The working_set candidate "RANGE window value-offset — only interval-sign edge
+deferred" (deferral-ledger row 716 item 2). `rangeOffsetNegative`
+(internal/executor/operators_window.go) rejected an interval RANGE offset when
+ANY component was negative (`months<0||days<0||micros<0`); PG's
+`in_range_interval_interval` (timestamp.c) instead uses `interval_sign(offset)<0`
+= sign of the linear span `time_micros + (months*30+days)*USECS_PER_DAY`
+(interval_cmp_value). So `INTERVAL '1 mon -10 days'` (+20-day span) was wrongly
+`22013`-rejected. Fixed via the same overflow-safe day/frac decomposition
+`compareDatum` already uses for interval ordering (sign = sign(days) if days≠0
+else sign(frac)); ±infinity sentinels handled (NOEND +, NOBEGIN −).
 
 Landed:
-- internal/catalog/catalog.go: added 10 rows (geqo/geqo_threshold/geqo_effort/
-  geqo_pool_size/geqo_generations/geqo_selection_bias/geqo_seed +
-  constraint_exclusion/cursor_tuple_fraction/recursive_worktable_factor) to the
-  pg_settings VirtualRows literal. name/setting/category/vartype/min/max/enumvals/
-  boot_val byte-for-byte from guc_tables.c (categories "Query Tuning / Genetic
-  Query Optimizer" + "Query Tuning / Other Planner Options"; short_desc/extra_desc
-  from same gettext_noop literals; constraint_exclusion enumvals {partition,on,off}).
-  List re-sorted by name after append → name-sort contract preserved.
-- internal/catalog/catalog_test.go: TestPgSettingsPlannerTuningGUCs.
-- docs/design/root-0004-configuration-and-guc.md new "pg_settings surfacing"
-  subsection; fix_plan + deferral-ledger (row appended) + unimplemented_feat.json
-  M0097-0069 code_audit updated in place.
+- internal/executor/operators_window.go: rewrote `rangeOffsetNegative` KindInterval arm.
+- internal/executor/window_compat_test.go: `TestRangeOffsetNegativeIntervalSign`
+  (10 sign cases incl. the +20-day mixed-sign edge and span-exactly-0).
+- docs/design/0122-0004-range-offset-window-frame.md: new Follow-up section
+  (moved item out of Deferred). docs/design/README.md row note updated.
+- .ralph/deferral_ledger.md: appended `resolved` row (row 716 item 2 closed;
+  item 1 — per-type in_range parse-time 0A000 catalog — still open).
+- .ralph/fix_plan.md: M0122-0004 bucket dated closure note.
 
-Still deferred (ledgered): behavioral no-op (planner reads none of the 10) +
-pg_settings remains a hand-curated subset, not registry-derived.
-
-Gates: go build ./... clean; go vet + go test ./internal/catalog/...
-./internal/config/... PASS; make ralph-state-guard consistent (auto-repaired
-prev-loop clean-exit marker). Catalog virtual-rows only — no planner/executor/
-codec logic; tpch-spotcheck not implicated; pgbench smoke runs via pre-commit hook.
+Gates: go build ./... clean; executor Window/Interval/Range/Frame tests PASS;
+tpch-spotcheck PASS (Q12=2/Q13=33); ralph-state-guard consistent (auto-repaired
+prev clean-exit marker). gofmt: my new lines clean; a pre-existing
+compareSortDatums comment diff (go1.25 vs local 1.26.3) left untouched per rule.
 
 Next-loop candidates (open, bounded-ish):
-- pg_get_expr stub entry is STALE — it's actually a functional pass-through.
-- ALTER DOMAIN SET SCHEMA: LARGE — domains are hardcoded namespace=public (2200)
-  everywhere; no Domain.Schema field; needs schema-qualified domain infra.
-- RANGE window value-offset (M0122-0004): already implemented (inRange/
-  frameBoundsRange handle numeric/float/interval); only interval-sign edge deferred.
-- scram_iterations GUC: already fully wired (resolveScramIterations).
+- M0122-0004 remaining: general frame-clause combining forms; per-type in_range
+  parse-time 0A000 catalog (ledger row 716 item 1) — cross-cutting.
+- pg_get_expr stub entry (if any) — already functional pass-through; bookkeeping.
+- ALTER DOMAIN SET SCHEMA: LARGE — no Domain.Schema field.
 
 In-flight: none

@@ -953,8 +953,7 @@ func (o *windowOp) resolveRangeOffset(expr planner.Expr, label string) (Datum, e
 }
 
 // rangeOffsetNegative reports whether a RANGE offset value is negative,
-// which PostgreSQL rejects in every type's in_range function. Interval uses
-// a component-sign heuristic (see the design doc's deferred note).
+// which PostgreSQL rejects in every type's in_range function.
 func rangeOffsetNegative(v Datum) bool {
 	switch v.Kind {
 	case KindInt:
@@ -965,7 +964,22 @@ func rangeOffsetNegative(v Datum) bool {
 		cmp, err := compareDatum(v, z, 0)
 		return err == nil && cmp < 0
 	case KindInterval:
-		return v.IntervalMonthsValue() < 0 || v.IntervalDaysValue() < 0 || v.IntervalMicrosValue() < 0
+		// PostgreSQL's in_range_interval_interval rejects the offset when
+		// interval_sign(offset) < 0 — the sign of the *linear span*
+		// span = time_micros + (months*30 + days)*USECS_PER_DAY — NOT the sign
+		// of any individual component (timestamp.c: interval_cmp_value). So
+		// '1 mon -10 days' (a +20-day span) is a valid, positive offset even
+		// though its day field is negative. Mirror interval_cmp_value via the
+		// same overflow-safe day/frac decomposition compareDatum already uses
+		// for interval ordering: days carries the whole-day part, frac the
+		// sub-day microsecond remainder, and the sign of the whole equals the
+		// sign of days when nonzero (|frac| < usecsPerDay) else the sign of frac.
+		days := int64(v.IntervalMonthsValue())*30 + int64(v.IntervalDaysValue()) + v.IntervalMicrosValue()/usecsPerDay
+		frac := v.IntervalMicrosValue() % usecsPerDay
+		if days != 0 {
+			return days < 0
+		}
+		return frac < 0
 	}
 	return false
 }

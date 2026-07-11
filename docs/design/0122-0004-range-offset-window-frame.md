@@ -98,9 +98,25 @@ existing frame-aggregate loop; window partitions are already materialized.
   (e.g. an exotic user type) surfaces as `0A000` at execution time rather than
   as PG's parse-time "not supported for column type" — goopg has no per-type
   `in_range` catalog registry, so the check is arithmetic-driven and lazy.
-- Negative-interval offset detection uses a component-sign heuristic
-  (`months<0 || days<0 || micros<0`), not PG's exact `interval` comparison
-  against zero.
+
+## Follow-up — interval-offset sign now matches PG (2026-07-12)
+
+The former component-sign heuristic (`months<0 || days<0 || micros<0`) was
+replaced with PostgreSQL's actual `interval_sign(offset) < 0` test from
+`in_range_interval_interval` (`postgres/src/backend/utils/adt/timestamp.c`).
+That function rejects the offset by the sign of its **linear span**
+`span = time_micros + (months*30 + days)*USECS_PER_DAY` (`interval_cmp_value`),
+not by any single component. So a mixed offset like `INTERVAL '1 mon -10 days'`
+has a **+20-day** span and is a *valid, positive* offset, while the old
+heuristic wrongly raised `22013` for it. `rangeOffsetNegative`
+(`internal/executor/operators_window.go`) now computes the sign via the same
+overflow-safe day/frac decomposition `compareDatum` already uses for interval
+ordering (whole-day part in `days`, sub-day remainder in `frac`; the sign of
+the whole equals the sign of `days` when nonzero, else of `frac`), which keeps
+the arithmetic inside int64 for the ranges goopg produces and handles the
+`±infinity` interval sentinels correctly (NOEND → positive, NOBEGIN →
+negative). Regression: `TestRangeOffsetNegativeIntervalSign`
+(`internal/executor/window_compat_test.go`).
 
 ## Tests
 
