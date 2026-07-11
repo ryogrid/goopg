@@ -877,6 +877,82 @@ func BuildDefaultRegistry() *Registry {
 		}))
 	}
 
+	// GEQO (genetic query optimization) GUCs. goopg's planner is
+	// rule/cost-based and never runs GEQO, so these are pure no-op
+	// stubs — but psql tab-completion, ORMs, and tuning scripts issue
+	// `SET geqo_threshold = ...` etc., and pg_settings tooling expects
+	// the whole family present. Names, defaults, and ranges mirror
+	// postgres/src/backend/utils/misc/guc_tables.c (QUERY_TUNING_GEQO,
+	// all PGC_USERSET / GUC_EXPLAIN); numeric bounds come from
+	// src/include/optimizer/geqo.h. M0122-0007.
+	r.MustRegister(NewVariable(Variable{
+		Name: "geqo", Type: TypeBool, BootVal: "on",
+		Context: ContextUserset, Scope: ScopeSession | ScopeTransaction,
+		Flags: FlagExplain,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "geqo_threshold", Type: TypeInt, BootVal: "12",
+		MinVal: 2, MaxVal: 2147483647,
+		Context: ContextUserset, Scope: ScopeSession | ScopeTransaction,
+		Flags: FlagExplain,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "geqo_effort", Type: TypeInt, BootVal: "5",
+		MinVal: 1, MaxVal: 10,
+		Context: ContextUserset, Scope: ScopeSession | ScopeTransaction,
+		Flags: FlagExplain,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "geqo_pool_size", Type: TypeInt, BootVal: "0",
+		MinVal: 0, MaxVal: 2147483647,
+		Context: ContextUserset, Scope: ScopeSession | ScopeTransaction,
+		Flags: FlagExplain,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "geqo_generations", Type: TypeInt, BootVal: "0",
+		MinVal: 0, MaxVal: 2147483647,
+		Context: ContextUserset, Scope: ScopeSession | ScopeTransaction,
+		Flags: FlagExplain,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "geqo_selection_bias", Type: TypeReal, BootVal: "2",
+		MinVal: 1.5, MaxVal: 2,
+		Context: ContextUserset, Scope: ScopeSession | ScopeTransaction,
+		Flags: FlagExplain,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "geqo_seed", Type: TypeReal, BootVal: "0",
+		MinVal: 0, MaxVal: 1,
+		Context: ContextUserset, Scope: ScopeSession | ScopeTransaction,
+		Flags: FlagExplain,
+	}))
+	// Other planner-tuning GUCs (QUERY_TUNING_OTHER). goopg's planner
+	// ignores all three, but SET must succeed and the values surface in
+	// pg_settings. constraint_exclusion is an enum {partition,on,off}
+	// (default partition); cursor_tuple_fraction / recursive_worktable_factor
+	// are reals. Mirrors guc_tables.c; recursive_worktable_factor's default
+	// (10.0) is DEFAULT_RECURSIVE_WORKTABLE_FACTOR (cost.h),
+	// cursor_tuple_fraction's (0.1) is DEFAULT_CURSOR_TUPLE_FRACTION
+	// (planmain.h). M0122-0007.
+	r.MustRegister(NewVariable(Variable{
+		Name: "constraint_exclusion", Type: TypeEnum, BootVal: "partition",
+		EnumOptions: []string{"partition", "on", "off"},
+		Context:     ContextUserset, Scope: ScopeSession | ScopeTransaction,
+		Flags: FlagExplain,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "cursor_tuple_fraction", Type: TypeReal, BootVal: "0.1",
+		MinVal: 0, MaxVal: 1,
+		Context: ContextUserset, Scope: ScopeSession | ScopeTransaction,
+		Flags: FlagExplain,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "recursive_worktable_factor", Type: TypeReal, BootVal: "10",
+		MinVal: 0.001, MaxVal: 1000000,
+		Context: ContextUserset, Scope: ScopeSession | ScopeTransaction,
+		Flags: FlagExplain,
+	}))
+
 	// Additional planner cost/limit GUCs. v0 ignores them but registers
 	// them so SET succeeds. M0097-0069.
 	r.MustRegister(NewVariable(Variable{

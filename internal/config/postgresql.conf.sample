@@ -209,6 +209,23 @@
 #join_collapse_limit = 8               # 1-2147483647; 1 disables collapsing of explicit JOIN clauses
 #hash_mem_multiplier = 2.0             # 1-1000
 
+# - Genetic Query Optimizer -
+# (goopg's planner never runs GEQO; these are accepted no-op compatibility stubs)
+
+#geqo = on
+#geqo_threshold = 12                    # 2-2147483647
+#geqo_effort = 5                        # range 1-10
+#geqo_pool_size = 0                     # selects default based on effort
+#geqo_generations = 0                   # selects default based on effort
+#geqo_selection_bias = 2                # range 1.5-2.0
+#geqo_seed = 0                          # range 0.0-1.0
+
+# - Other Planner Options -
+
+#constraint_exclusion = partition       # on, off, or partition
+#cursor_tuple_fraction = 0.1            # range 0.0-1.0
+#recursive_worktable_factor = 10        # range 0.001-1000000.0
+
 
 #------------------------------------------------------------------------------
 # REPORTING AND LOGGING

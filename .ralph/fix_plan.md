@@ -4907,9 +4907,9 @@ mirroring M0119's ledger `status` column.
       `git stash` on `defaults.go` + `postgresql.conf.sample`. Design:
       `docs/design/root-0004-configuration-and-guc.md` new "Completing the
       `jit_*` GUC stub family" section; `docs/design/README.md` row updated.
-      **M0122-0007's planner/jit GUC stubs item now has no known open
-      residuals; CREATE/DROP DATABASE full DDL, REINDEX physical rebuild, and
-      tablespaces remain** (~8 items). Gates: `go build ./...`/`go vet ./...`
+      **The `jit_*` family is complete; the *planner*-tuning half had a
+      residual — closed 2026-07-12 (see the GEQO block near the bottom of
+      this bucket).** Gates: `go build ./...`/`go vet ./...`
       clean; `go test ./internal/config/...` PASS; `go test
       ./internal/executor/... ./internal/initdb/...` PASS (minus the
       pre-existing, unrelated `TestSeqScanFiresPrefetchesAcrossBlocks` hang
@@ -8290,6 +8290,40 @@ mirroring M0119's ledger `status` column.
       (Q12=2/Q13=33); pgbench smoke via pre-commit hook. **With this the whole
       `#5(d-iv)` interval/infinity group is COMPLETE across both the timestamp
       INT64-micros and date INT32-days domains.** Nothing further deferred.
+      **GEQO + remaining planner-tuning GUC stubs — DONE (2026-07-12, this
+      loop):** the `jit_*` completion above left a *planner*-tuning residual
+      — the registry still lacked the whole GEQO family and three
+      `QUERY_TUNING_OTHER` GUCs, so a real-PG-authored script issuing `SET
+      geqo_threshold = 20` / `SET constraint_exclusion = off` / `SET
+      cursor_tuple_fraction = 0.05` / `SET recursive_worktable_factor = 5`
+      hit "unrecognized configuration parameter". Registered all ten in
+      `internal/config/defaults.go` — `geqo`, `geqo_threshold`, `geqo_effort`,
+      `geqo_pool_size`, `geqo_generations`, `geqo_selection_bias`, `geqo_seed`
+      (QUERY_TUNING_GEQO) + `constraint_exclusion` (enum
+      `{partition,on,off}`), `cursor_tuple_fraction`, `recursive_worktable_factor`
+      (QUERY_TUNING_OTHER) — all PGC_USERSET / GUC_EXPLAIN with
+      `guc_tables.c`-faithful boot values and bounds (GEQO bounds from
+      `optimizer/geqo.h`, `cursor_tuple_fraction` from `planmain.h`,
+      `recursive_worktable_factor` from `cost.h`). Boot values use the form
+      real-PG `SHOW` returns (e.g. `geqo_selection_bias` → `2`) so the
+      matching commented-out `postgresql.conf.sample` entries satisfy
+      `TestSampleConfigCoversRegistry` (sample default must equal registry
+      `BootVal`). These are accepted-and-ignored stubs (goopg's rule/cost
+      planner reads none of them — zero references in `internal/planner`),
+      identical in spirit to the pre-existing `enable_*` toggles; the
+      behavioral no-op + the `pg_settings` literal-list non-extension are
+      both recorded in the deferral ledger as deliberate scope boundaries.
+      Tests: `internal/config/geqo_guc_stubs_test.go`
+      (`TestGeqoAndPlannerTuningGUCStubs`, `TestGeqoTuningGUCBoundsEnforced`).
+      Design: `docs/design/root-0004-configuration-and-guc.md` new "Follow-up:
+      GEQO + remaining planner-tuning GUC stubs" section;
+      `docs/design/README.md` root-0004 row extended; `unimplemented_feat.json`
+      M0097-0069 code_audit updated in place (kept open — the behavioral half
+      is the deferred part). Gates: `go build ./...` clean; `go vet
+      ./internal/config/...` clean; `go test ./internal/config/...` PASS
+      (full package, incl. `TestSampleConfigCoversRegistry`). Config-only GUC
+      registration — no planner/executor/codec logic touched; pgbench smoke
+      runs via the pre-commit hook at commit.
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,

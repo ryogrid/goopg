@@ -386,3 +386,42 @@ hang tracked in the deferral ledger); `scripts/tpch-spotcheck.sh` PASS
 (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
 scripts/ralph-precommit-test.sh` PASS (0 failed txns, all 3
 workloads).
+
+## Follow-up: GEQO + remaining planner-tuning GUC stubs (2026-07-12, M0122-0007)
+
+Registered the last commonly-issued planner-tuning GUCs that were still
+missing from the registry, so a script written against real PostgreSQL
+never trips `unrecognized configuration parameter` on them:
+
+- **GEQO family (`QUERY_TUNING_GEQO`)** — `geqo`, `geqo_threshold`,
+  `geqo_effort`, `geqo_pool_size`, `geqo_generations`,
+  `geqo_selection_bias`, `geqo_seed`.
+- **`QUERY_TUNING_OTHER`** — `constraint_exclusion` (enum
+  `{partition,on,off}`, default `partition`), `cursor_tuple_fraction`
+  (real, 0.1), `recursive_worktable_factor` (real, 10).
+
+All ten are `PGC_USERSET` / `GUC_EXPLAIN` in upstream. Names, boot
+values, types, and numeric bounds mirror
+`postgres/src/backend/utils/misc/guc_tables.c` (GEQO bounds from
+`optimizer/geqo.h`, `cursor_tuple_fraction` from `planmain.h`,
+`recursive_worktable_factor` from `cost.h`). Boot values use the form
+real-PG `SHOW` returns (`geqo_selection_bias` → `2`,
+`recursive_worktable_factor` → `10`, `geqo_seed` → `0`), which the
+matching `postgresql.conf.sample` entries also use so
+`TestSampleConfigCoversRegistry` (sample default must equal registry
+`BootVal`) is satisfied.
+
+These are **accepted-and-ignored** stubs: goopg's planner is
+rule/cost-based and reads none of them, so `SET`/`SHOW` succeed but the
+chosen plan is unchanged — identical to the pre-existing `enable_*`
+toggles. The behavioral no-op (real PG's planner *does* honour these) is
+recorded in the deferral ledger as a deliberate scope boundary. The
+hand-curated `pg_catalog.pg_settings` literal list (an intentionally
+incomplete subset) was not extended for these — `SET`/`SHOW` route
+through the registry, not `pg_settings`; ledgered.
+
+Tests: `TestGeqoAndPlannerTuningGUCStubs` (boot value/type/USERSET
+context/`SET`-acceptance for all ten) and `TestGeqoTuningGUCBoundsEnforced`
+(out-of-range/invalid-enum `SET` rejected, in-range accepted), both
+`internal/config/geqo_guc_stubs_test.go`. Gates: `go build ./...`/`go vet
+./internal/config/...` clean; `go test ./internal/config/...` PASS.
