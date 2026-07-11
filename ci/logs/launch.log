@@ -19,3 +19,8 @@
 2026-07-11T01:15:36+09:00 [RUN]	S1 lanes start (L: units,race | H: testport,pgbench — filtered by NIGHTLY_STAGES)
 2026-07-11T05:24:36+09:00 [RUN]	S1 barrier reached
 2026-07-11T05:58:02+09:00 [RUN]	end status_rc=2 (0 pass / 2 fail / 3 inconclusive) — see summary.md
+2026-07-11T05:59:51+09:00 [RUN]	log-push: committed + pushed batch logs to origin/align-data-structure-with-pg
+2026-07-12T02:05:30+09:00 [RUN]	start run_id=20260712-020530 sha=401e6212 dirty=8 stages=preflight,units,race,testport,pgbench,tpch,summary
+2026-07-12T02:05:41+09:00 [RUN]	S1 lanes start (L: units,race | H: testport,pgbench — filtered by NIGHTLY_STAGES)
+2026-07-12T04:56:53+09:00 [RUN]	S1 barrier reached
+2026-07-12T05:29:20+09:00 [RUN]	end status_rc=2 (0 pass / 2 fail / 3 inconclusive) — see summary.md
