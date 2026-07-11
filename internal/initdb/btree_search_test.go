@@ -183,10 +183,11 @@ func TestPgRewriteRowLayout(t *testing.T) {
 	compressedTotalSize := int(vaHeader >> 2)
 	t.Logf("ev_action compressed total size (including header+tcinfo): %d bytes", compressedTotalSize)
 
-	// tcinfo at [84..87]: bits 1-0 = 0x00 (PGLZ method), upper 30 bits = raw size.
+	// va_tcinfo at [84..87] (PG18 varatt.h): low 30 bits = raw (decompressed)
+	// size, top 2 bits = compression method (PGLZ = 0).
 	tcinfo := le.Uint32(tupleData[84:88])
-	compressionMethod := tcinfo & 0x03
-	rawSize := int(tcinfo >> 2)
+	compressionMethod := tcinfo >> 30
+	rawSize := int(tcinfo & ((1 << 30) - 1))
 	t.Logf("tcinfo: method=%d rawSize=%d", compressionMethod, rawSize)
 
 	if compressionMethod != 0 {

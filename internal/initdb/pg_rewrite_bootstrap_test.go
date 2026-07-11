@@ -185,7 +185,12 @@ func TestPgRewriteRowOrderMatchesColDefs(t *testing.T) {
 				t.Errorf("row[7] varlena header bits 1-0 = %d, want 0x02 (compressed)", vaHeader&0x03)
 			}
 			tcinfo := binary.LittleEndian.Uint32(b[4:8])
-			rawSize := int(tcinfo >> 2)
+			// va_tcinfo (PG18 varatt.h): rawsize in the low 30 bits,
+			// compression method (PGLZ=0) in the top 2 bits.
+			rawSize := int(tcinfo & ((1 << 30) - 1))
+			if method := tcinfo >> 30; method != 0 {
+				t.Errorf("row[7] tcinfo method = %d, want 0 (PGLZ)", method)
+			}
 			if rawSize != len(entries[0].EvAction) {
 				t.Errorf("row[7] tcinfo rawSize = %d, want %d (ev_action length)", rawSize, len(entries[0].EvAction))
 			}

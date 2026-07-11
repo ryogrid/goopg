@@ -10,6 +10,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/mctx"
+	"github.com/goopg/goopg/internal/pglz"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -1364,7 +1365,9 @@ func decodePhysicalPGVarlena(data []byte) ([]byte, int, error) {
 		return nil, 0, fmt.Errorf("truncated 4-byte varlena header")
 	}
 	if header&0x03 == 0x02 {
-		return nil, 0, fmt.Errorf("compressed varlena not supported")
+		// VARATT_IS_4B_C: inline PGLZ-compressed varlena. Decompress to the
+		// original payload (mirrors wal.pgoDecodePhysicalVarlena).
+		return pglz.DecodeInlineCompressed(data)
 	}
 	total := int(binary.LittleEndian.Uint32(data[:4]) >> 2)
 	if total < 4 || total > len(data) {
