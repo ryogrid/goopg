@@ -127,6 +127,55 @@ all+user, not sys) and `internal/executor/pgstat_indexes_e2e_test.go`
 (`TestPgStatUserIndexesEndToEnd` full planner→executor resolution;
 `TestPgStatSysIndexesExcludesUserIndex` schemaname split end-to-end).
 
+## I/O sibling: `pg_statio_all_tables` / `pg_statio_{user,sys}_tables` and `pg_statio_all_indexes` / `pg_statio_{user,sys}_indexes`
+
+The `pg_statio_*` views are the buffer-pool I/O counterparts of the access-stat
+views above, reporting per-relation heap/index/toast block reads and hits.
+Upstream (`system_views.sql`, `WHERE C.relkind IN ('r','t','m')`) columns:
+
+```sql
+-- pg_statio_all_tables (11 cols)
+relid, schemaname, relname,
+heap_blks_read, heap_blks_hit, idx_blks_read, idx_blks_hit,
+toast_blks_read, toast_blks_hit, tidx_blks_read, tidx_blks_hit
+-- pg_statio_all_indexes (7 cols)
+relid, indexrelid, schemaname, relname, indexrelname,
+idx_blks_read, idx_blks_hit
+```
+
+goopg has **no per-relation buffer-pool counters**. The shared-buffer hit/read
+counters `pg_stat_io` exposes (`storage.Pool.sharedHitCount`/`sharedReadCount`)
+are process-wide pool totals, not attributable to an individual relation, so
+every block counter here is a faithful `0` — the same honest-0 discipline as the
+untracked `pg_stat_io` cells. The identity cells are real (`relid`/`schemaname`/
+`relname` for tables; those plus `indexrelid`/`indexrelname` for indexes).
+
+- Row builders — `catalog.PGStatioTablesRowsForDBOid(dbOid, scope)` (11-col) and
+  `catalog.PGStatioIndexesRowsForDBOid(dbOid, scope)` (7-col): each applies the
+  *same* relation filter as its access-stat twin (relkind `r`/`m`/`p`; the index
+  builder enumerates `AllIndexes(dbOid)` and filters `idx.Table`), reusing
+  `StatTableScope` for the identical `schemaname` user/sys split. Index rows are
+  sorted by `(schemaname, relname, indexrelname)`.
+- Per-connection scoping — `executor.fetchStatioTablesRows(ctx, scope)` /
+  `fetchStatioIndexesRows(ctx, scope)`: the exact `ctx.Catalog`-unwrap +
+  `ctx.CurrentDatabaseOid` twins of the access-stat fetchers, swapped in at
+  `valuesOp.Open`'s six new `pg_statio_*` branches; static `VirtualRows`
+  fallbacks (OIDs 9087–9092) scope to `DefaultDBOid`.
+
+Tests: `internal/catalog/pgstatio_test.go`
+(`TestPGStatioTablesRowsBasicShape` — 11-col width, real identity cells, all 8
+block counters `0`; `TestPGStatioTablesScopeFilter`; `TestPGStatioIndexesRowsBasicShape`
+— 7-col width) and `internal/executor/pgstatio_e2e_test.go`
+(`TestPgStatioUserTablesEndToEnd`, `TestPgStatioUserIndexesEndToEnd`,
+`TestPgStatioSysTablesExcludesUserTable`).
+
+**Deferred (this sibling):** the `pg_statio_all_sequences` / `pg_statio_{user,sys}_sequences`
+trio (relkind `'S'`, columns `relid/schemaname/relname/blks_read/blks_hit`) is
+not yet registered — sequence enumeration is a distinct filter (`t.IsSequence`,
+skipped by both table and index builders) and lands as a follow-up. The block
+counters themselves stay `0` until goopg grows per-relation buffer-pool
+attribution (a `BufferUsage`-per-relation analog).
+
 ## Deferred
 
 The scan/tuple/vacuum/analyze counters and `last_*` timestamps remain honest

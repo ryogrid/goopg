@@ -122,6 +122,23 @@ func (o *valuesOp) Open(ctx *Context) error {
 			o.rows = rematerialiseVirtualRowsFromStrings(tbl, fetchStatIndexesRows(ctx, catalog.StatScopeSys))
 		} else if tbl.Name == "pg_stat_user_indexes" && ctx != nil {
 			o.rows = rematerialiseVirtualRowsFromStrings(tbl, fetchStatIndexesRows(ctx, catalog.StatScopeUser))
+		} else if tbl.Name == "pg_statio_all_tables" && ctx != nil {
+			// pg_statio_*_tables list the connecting database's own tables' buffer-pool
+			// I/O stats (honest-0 counters, no per-relation buffer tracking), which the
+			// static catalog VirtualRows fallback cannot scope. M0122-0003.
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, fetchStatioTablesRows(ctx, catalog.StatScopeAll))
+		} else if tbl.Name == "pg_statio_sys_tables" && ctx != nil {
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, fetchStatioTablesRows(ctx, catalog.StatScopeSys))
+		} else if tbl.Name == "pg_statio_user_tables" && ctx != nil {
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, fetchStatioTablesRows(ctx, catalog.StatScopeUser))
+		} else if tbl.Name == "pg_statio_all_indexes" && ctx != nil {
+			// pg_statio_*_indexes list the connecting database's own indexes' buffer-pool
+			// I/O stats (the per-index sibling of pg_statio_*_tables). M0122-0003.
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, fetchStatioIndexesRows(ctx, catalog.StatScopeAll))
+		} else if tbl.Name == "pg_statio_sys_indexes" && ctx != nil {
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, fetchStatioIndexesRows(ctx, catalog.StatScopeSys))
+		} else if tbl.Name == "pg_statio_user_indexes" && ctx != nil {
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, fetchStatioIndexesRows(ctx, catalog.StatScopeUser))
 		} else if tbl.Name == "pg_class" && ctx != nil && ctx.PgClassRows != nil {
 			// pg_class must list the connecting database's own tables/indexes,
 			// not always DefaultDBOid's — use the per-connection, dbOid-scoped

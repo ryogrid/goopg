@@ -55,3 +55,51 @@ func fetchStatIndexesRows(ctx *Context, scope catalog.StatTableScope) [][]string
 		return nil
 	}
 }
+
+// fetchStatioTablesRows is the buffer-pool I/O sibling of fetchStatTablesRows: it
+// builds the live, per-connection database-scoped row set for the
+// pg_statio_all_tables / pg_statio_user_tables / pg_statio_sys_tables virtual views
+// (scope selects which), using the identical ctx.Catalog-unwrap +
+// ctx.CurrentDatabaseOid scoping. goopg has no per-relation buffer-pool counters, so
+// every block counter is a faithful 0. See catalog.PGStatioTablesRowsForDBOid and
+// docs/design/0122-0003-pg-stat-user-tables.md.
+func fetchStatioTablesRows(ctx *Context, scope catalog.StatTableScope) [][]string {
+	if ctx == nil || ctx.Catalog == nil {
+		return nil
+	}
+	type unwrapper interface{ Unwrap() catalog.Catalog }
+	base := ctx.Catalog
+	for {
+		if im, ok := base.(*catalog.InMemory); ok {
+			return im.PGStatioTablesRowsForDBOid(catalog.NamespaceDBOid(ctx.CurrentDatabaseOid), scope)
+		}
+		if u, ok := base.(unwrapper); ok {
+			base = u.Unwrap()
+			continue
+		}
+		return nil
+	}
+}
+
+// fetchStatioIndexesRows is the per-index buffer-pool I/O sibling of
+// fetchStatioTablesRows: it builds the live, per-connection database-scoped row set
+// for the pg_statio_all_indexes / pg_statio_user_indexes / pg_statio_sys_indexes
+// virtual views (scope selects which). See catalog.PGStatioIndexesRowsForDBOid and
+// docs/design/0122-0003-pg-stat-user-tables.md.
+func fetchStatioIndexesRows(ctx *Context, scope catalog.StatTableScope) [][]string {
+	if ctx == nil || ctx.Catalog == nil {
+		return nil
+	}
+	type unwrapper interface{ Unwrap() catalog.Catalog }
+	base := ctx.Catalog
+	for {
+		if im, ok := base.(*catalog.InMemory); ok {
+			return im.PGStatioIndexesRowsForDBOid(catalog.NamespaceDBOid(ctx.CurrentDatabaseOid), scope)
+		}
+		if u, ok := base.(unwrapper); ok {
+			base = u.Unwrap()
+			continue
+		}
+		return nil
+	}
+}

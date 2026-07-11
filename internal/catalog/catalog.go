@@ -7149,6 +7149,139 @@ func (c *InMemory) PGStatIndexesRowsForDBOid(dbOid uint32, scope StatTableScope)
 	return rows
 }
 
+// PGStatioTablesRowsForDBOid builds the pg_statio_all_tables / pg_statio_user_tables
+// / pg_statio_sys_tables row set for one database, scoped by `scope` (reusing the
+// same StatTableScope user/sys split as the per-table access-stat views). It mirrors
+// upstream's view (system_views.sql: SELECT over pg_class, relkind IN ('r','t','m'))
+// but goopg has no per-relation buffer-pool hit/read counters — the shared pool
+// counters pg_stat_io exposes are pool-wide, not attributable to an individual
+// relation — so every heap/idx/toast/tidx block counter is a faithful 0. The three
+// real cells are relid / schemaname / relname. This is the I/O sibling of
+// PGStatTablesRowsForDBOid and applies the identical relation filter so the two
+// views agree on the relkind r/m/p set. See docs/design/0122-0003-pg-stat-user-tables.md.
+func (c *InMemory) PGStatioTablesRowsForDBOid(dbOid uint32, scope StatTableScope) [][]string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	keys := make([]string, 0, len(c.ns(dbOid).tables))
+	for k := range c.ns(dbOid).tables {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([][]string, 0, len(keys))
+	for _, k := range keys {
+		t := c.ns(dbOid).tables[k]
+		// Same relation filter as PGStatTablesRowsForDBOid: skip system-catalog
+		// virtual tables, sequences, plain views and foreign tables.
+		if t.Virtual && t.View == nil && !t.IsMatView && !t.IsSequence {
+			continue
+		}
+		if t.IsSequence {
+			continue
+		}
+		if t.View != nil && !t.IsMatView {
+			continue
+		}
+		if t.ForeignServerName != "" {
+			continue
+		}
+		schema := t.Schema
+		if schema == "" {
+			schema = "public"
+		}
+		switch scope {
+		case StatScopeUser:
+			if isSystemStatSchema(schema) {
+				continue
+			}
+		case StatScopeSys:
+			if !isSystemStatSchema(schema) {
+				continue
+			}
+		}
+		out = append(out, []string{
+			strconv.Itoa(int(t.OID)), // 0:  relid
+			schema,                   // 1:  schemaname
+			t.Name,                   // 2:  relname
+			"0",                      // 3:  heap_blks_read
+			"0",                      // 4:  heap_blks_hit
+			"0",                      // 5:  idx_blks_read
+			"0",                      // 6:  idx_blks_hit
+			"0",                      // 7:  toast_blks_read
+			"0",                      // 8:  toast_blks_hit
+			"0",                      // 9:  tidx_blks_read
+			"0",                      // 10: tidx_blks_hit
+		})
+	}
+	return out
+}
+
+// PGStatioIndexesRowsForDBOid builds the pg_statio_all_indexes / pg_statio_user_indexes
+// / pg_statio_sys_indexes row set for one database, scoped by `scope`. It mirrors
+// upstream's view (system_views.sql: pg_class C JOIN pg_index X JOIN pg_class I,
+// WHERE C.relkind IN ('r','t','m'), one row per index) but goopg has no per-relation
+// buffer-pool counters, so idx_blks_read / idx_blks_hit are a faithful 0. The five
+// real cells are relid / indexrelid / schemaname / relname / indexrelname. Enumeration
+// reuses AllIndexes(dbOid) with the same relation filter as PGStatIndexesRowsForDBOid,
+// so the access-stat and I/O-stat index views agree on the relkind set. See
+// docs/design/0122-0003-pg-stat-user-tables.md.
+func (c *InMemory) PGStatioIndexesRowsForDBOid(dbOid uint32, scope StatTableScope) [][]string {
+	idxs := c.AllIndexes(dbOid)
+	rows := make([][]string, 0, len(idxs))
+	for _, idx := range idxs {
+		t := idx.Table
+		if t == nil {
+			continue
+		}
+		if t.Virtual && t.View == nil && !t.IsMatView && !t.IsSequence {
+			continue
+		}
+		if t.IsSequence {
+			continue
+		}
+		if t.View != nil && !t.IsMatView {
+			continue
+		}
+		if t.ForeignServerName != "" {
+			continue
+		}
+		schema := t.Schema
+		if schema == "" {
+			schema = "public"
+		}
+		switch scope {
+		case StatScopeUser:
+			if isSystemStatSchema(schema) {
+				continue
+			}
+		case StatScopeSys:
+			if !isSystemStatSchema(schema) {
+				continue
+			}
+		}
+		rows = append(rows, []string{
+			strconv.Itoa(int(t.OID)),   // 0: relid (parent table oid)
+			strconv.Itoa(int(idx.OID)), // 1: indexrelid
+			schema,                     // 2: schemaname (parent table schema)
+			t.Name,                     // 3: relname (parent table name)
+			idx.Name,                   // 4: indexrelname
+			"0",                        // 5: idx_blks_read
+			"0",                        // 6: idx_blks_hit
+		})
+	}
+	// Deterministic order: by (schemaname, relname, indexrelname) — AllIndexes
+	// iteration order is map-derived and unstable.
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i][2] != rows[j][2] {
+			return rows[i][2] < rows[j][2]
+		}
+		if rows[i][3] != rows[j][3] {
+			return rows[i][3] < rows[j][3]
+		}
+		return rows[i][4] < rows[j][4]
+	})
+	return rows
+}
+
 func (c *InMemory) registerSystemTables() {
 	pgClass := &Table{
 		Schema: "pg_catalog",
@@ -8289,6 +8422,85 @@ func (c *InMemory) registerSystemTables() {
 			OID:     v.oid,
 		}
 		tbl.VirtualRows = func() [][]string { return c.PGStatIndexesRowsForDBOid(DefaultDBOid, scope) }
+		c.ns(DefaultDBOid).tables["pg_catalog."+v.name] = tbl
+	}
+
+	// pg_statio_all_tables / pg_statio_user_tables / pg_statio_sys_tables — per-table
+	// buffer-pool I/O statistics (PG's system_views.sql), the I/O sibling of the
+	// per-table access-stat views above. goopg has no per-relation buffer-pool
+	// hit/read counters (the shared counters pg_stat_io exposes are pool-wide, not
+	// attributable to one relation), so every heap/idx/toast/tidx block counter is a
+	// faithful 0; relid / schemaname / relname are real. Same live-scoping wiring:
+	// the static VirtualRows fallback scopes to DefaultDBOid, executor.
+	// fetchStatioTablesRows resolves the connecting database at valuesOp.Open. See
+	// catalog.PGStatioTablesRowsForDBOid and docs/design/0122-0003-pg-stat-user-tables.md.
+	statioTablesColumns := func() []Column {
+		return []Column{
+			{Name: "relid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "schemaname", Type: Type{Name: "name"}, Ordinal: 1},
+			{Name: "relname", Type: Type{Name: "name"}, Ordinal: 2},
+			{Name: "heap_blks_read", Type: Type{Name: "int8"}, Ordinal: 3},
+			{Name: "heap_blks_hit", Type: Type{Name: "int8"}, Ordinal: 4},
+			{Name: "idx_blks_read", Type: Type{Name: "int8"}, Ordinal: 5},
+			{Name: "idx_blks_hit", Type: Type{Name: "int8"}, Ordinal: 6},
+			{Name: "toast_blks_read", Type: Type{Name: "int8"}, Ordinal: 7},
+			{Name: "toast_blks_hit", Type: Type{Name: "int8"}, Ordinal: 8},
+			{Name: "tidx_blks_read", Type: Type{Name: "int8"}, Ordinal: 9},
+			{Name: "tidx_blks_hit", Type: Type{Name: "int8"}, Ordinal: 10},
+		}
+	}
+	for _, v := range []struct {
+		name  string
+		oid   uint32
+		scope StatTableScope
+	}{
+		{"pg_statio_all_tables", 9087, StatScopeAll},
+		{"pg_statio_sys_tables", 9088, StatScopeSys},
+		{"pg_statio_user_tables", 9089, StatScopeUser},
+	} {
+		scope := v.scope
+		tbl := &Table{
+			Schema: "pg_catalog", Name: v.name, Virtual: true,
+			Columns: statioTablesColumns(),
+			OID:     v.oid,
+		}
+		tbl.VirtualRows = func() [][]string { return c.PGStatioTablesRowsForDBOid(DefaultDBOid, scope) }
+		c.ns(DefaultDBOid).tables["pg_catalog."+v.name] = tbl
+	}
+
+	// pg_statio_all_indexes / pg_statio_user_indexes / pg_statio_sys_indexes — per-index
+	// buffer-pool I/O statistics (PG's system_views.sql), the I/O sibling of the
+	// per-index access-stat views above. Same honest-0 shape: idx_blks_read /
+	// idx_blks_hit are a faithful 0 (no per-relation buffer counters);
+	// relid/indexrelid/schemaname/relname/indexrelname are real. See
+	// catalog.PGStatioIndexesRowsForDBOid and docs/design/0122-0003-pg-stat-user-tables.md.
+	statioIndexesColumns := func() []Column {
+		return []Column{
+			{Name: "relid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "indexrelid", Type: Type{Name: "oid"}, Ordinal: 1},
+			{Name: "schemaname", Type: Type{Name: "name"}, Ordinal: 2},
+			{Name: "relname", Type: Type{Name: "name"}, Ordinal: 3},
+			{Name: "indexrelname", Type: Type{Name: "name"}, Ordinal: 4},
+			{Name: "idx_blks_read", Type: Type{Name: "int8"}, Ordinal: 5},
+			{Name: "idx_blks_hit", Type: Type{Name: "int8"}, Ordinal: 6},
+		}
+	}
+	for _, v := range []struct {
+		name  string
+		oid   uint32
+		scope StatTableScope
+	}{
+		{"pg_statio_all_indexes", 9090, StatScopeAll},
+		{"pg_statio_sys_indexes", 9091, StatScopeSys},
+		{"pg_statio_user_indexes", 9092, StatScopeUser},
+	} {
+		scope := v.scope
+		tbl := &Table{
+			Schema: "pg_catalog", Name: v.name, Virtual: true,
+			Columns: statioIndexesColumns(),
+			OID:     v.oid,
+		}
+		tbl.VirtualRows = func() [][]string { return c.PGStatioIndexesRowsForDBOid(DefaultDBOid, scope) }
 		c.ns(DefaultDBOid).tables["pg_catalog."+v.name] = tbl
 	}
 

@@ -3828,6 +3828,30 @@ mirroring M0119's ledger `status` column.
       counter subsystem (`PgStat_StatIndEntry` analog) + empty
       `pg_stat_sys_indexes`. Gates: catalog+executor full packages PASS;
       `scripts/tpch-spotcheck.sh` PASS.
+      **`pg_statio_all/user/sys_tables` + `pg_statio_all/user/sys_indexes`
+      done (2026-07-12, later loop):** the six per-relation buffer-pool I/O
+      statistics views now resolve (previously unknown-relation errors) — the
+      I/O sibling of the access-stat views above.
+      `catalog.PGStatioTablesRowsForDBOid` (11 cols: `relid/schemaname/relname/
+      heap_blks_{read,hit}/idx_blks_{read,hit}/toast_blks_{read,hit}/
+      tidx_blks_{read,hit}`) and `PGStatioIndexesRowsForDBOid` (7 cols:
+      `relid/indexrelid/schemaname/relname/indexrelname/idx_blks_{read,hit}`)
+      each reuse the SAME relation filter + `StatTableScope` user/sys split as
+      their access-stat twin (index builder enumerates `AllIndexes(dbOid)`).
+      `executor.fetchStatioTablesRows`/`fetchStatioIndexesRows`
+      (`internal/executor/pgstat_tables.go`) are the per-connection twins wired
+      at `valuesOp.Open`'s six new `pg_statio_*` branches; static `VirtualRows`
+      fallbacks (OIDs 9087–9092) scope to `DefaultDBOid`. goopg has no
+      per-relation buffer-pool counters (the `pg_stat_io` counters are pool-wide,
+      not attributable to one relation), so every heap/idx/toast/tidx block
+      counter is a faithful 0; identity cells are real. Tests:
+      `internal/catalog/pgstatio_test.go` +
+      `internal/executor/pgstatio_e2e_test.go`. Design:
+      `docs/design/0122-0003-pg-stat-user-tables.md` new "I/O sibling" section +
+      README row. Ledger row (2026-07-12) records the missing per-relation block
+      attribution + the not-yet-registered `pg_statio_*_sequences` trio. Gates:
+      catalog+executor full packages PASS; go build ./... clean;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33).
 - [x] **M0122-0004 — SQL language / executor features** (~21). Window frame
       ROWS/RANGE/GROUPS, GROUPING SETS/ROLLUP/CUBE, DEFAULT-clause
       parsing, intervals. **WITH CHECK
