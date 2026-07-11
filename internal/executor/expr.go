@@ -482,6 +482,14 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 		if err != nil {
 			return Datum{}, err
 		}
+		// `CAST(x AS interval <qualifier>)` / `x::interval <qualifier>` with an
+		// interval typmod (a field qualifier and/or SECOND precision): the low
+		// field changes the bare-magnitude default unit during parsing, so it
+		// cannot be applied as a post-hoc truncation of an already-parsed value.
+		// unimplemented_feat #5(d-iv).
+		if x.Typmod != 0 && strings.EqualFold(x.TargetType, "interval") {
+			return applyIntervalCastTypmod(v, x.Typmod, x.Pos())
+		}
 		// `::regclass` is catalog-aware in both directions:
 		//   - `<oid>::regclass` renders as the relation name (PG's regclassout)
 		//   - `<text>::regclass` resolves the relation name to its numeric OID
@@ -6105,6 +6113,66 @@ func evalIntervalLit(x *planner.IntervalLit) (Datum, error) {
 	}
 	x.CachedMonths, x.CachedDays, x.CachedMicros = months, days, micros
 	x.CacheValid = true
+	return NewIntervalDatumFull(months, days, micros), nil
+}
+
+// applyIntervalCastTypmod evaluates a `CAST(x AS interval <qualifier>)` /
+// `x::interval <qualifier>` whose target type carries an interval typmod (a
+// field qualifier and/or SECOND precision, packed by the parser's
+// packIntervalCastTypmod). Unlike a bare interval cast, the low field changes
+// the DEFAULT UNIT a bare-magnitude body is interpreted in — PG's interval_in
+// receives the typmod and DecodeInterval's `switch (range)` picks that field
+// (`'90'::interval minute` = 90 minutes = 01:30:00, not 90 seconds) — after
+// which AdjustIntervalForTypmod truncates to the field's granularity and rounds
+// the fractional seconds to the precision. This mirrors the typed-literal path
+// evalIntervalLit takes for `interval '90' minute`. An already-typed interval
+// operand (`some_interval::interval minute`) is only truncated/rounded, never
+// reinterpreted. unimplemented_feat #5(d-iv).
+func applyIntervalCastTypmod(v Datum, typmod int64, pos int) (Datum, error) {
+	if v.IsNull() {
+		return NullDatum, nil
+	}
+	lowField, hasPrec, prec := parser.DecodeIntervalCastTypmod(typmod)
+	// Precision-only typmod (`interval(2)`) has no low field, so a bare
+	// magnitude still defaults to seconds (the typmod-free interval default).
+	unit := lowField
+	if unit == "" {
+		unit = "second"
+	}
+	var months, days int32
+	var micros int64
+	switch v.Kind {
+	case KindInterval:
+		months, days, micros = v.IntervalMonthsValue(), v.IntervalDaysValue(), v.IntervalMicrosValue()
+	case KindString:
+		s := v.StringValue()
+		// interval 'infinity' / '-infinity' carries through unchanged (the
+		// typmod is ignored), mirroring evalIntervalLit's infinity pre-emption.
+		if mo, d, mu, isInf := parser.IntervalInfinitySentinel(s); isInf {
+			return NewIntervalDatumFull(mo, d, mu), nil
+		}
+		if val, fval, magOK := parser.ParseIntervalMagnitude(s); magOK {
+			var ok bool
+			months, days, micros, ok = parser.IntervalUnitToParts(val, fval, unit)
+			if !ok {
+				return Datum{}, &ExecError{Code: "22007", Pos: pos,
+					Message: fmt.Sprintf("invalid input syntax for type interval: %q", s)}
+			}
+		} else if mo, d, mu, ok := parser.ParseIntervalBodyWithDefault(s, unit); ok {
+			months, days, micros = mo, d, mu
+		} else {
+			return Datum{}, &ExecError{Code: "22007", Pos: pos,
+				Message: fmt.Sprintf("invalid input syntax for type interval: %q", s)}
+		}
+	default:
+		return Datum{}, &ExecError{Code: "22P02", Pos: pos, Message: "cannot cast to interval"}
+	}
+	if lowField != "" {
+		months, days, micros = truncIntervalToUnit(months, days, micros, lowField)
+	}
+	if hasPrec {
+		micros = roundIntervalMicrosToPrec(micros, prec)
+	}
 	return NewIntervalDatumFull(months, days, micros), nil
 }
 

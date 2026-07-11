@@ -552,6 +552,79 @@ func TestTrailingBareNumberDefaultsToSeconds(t *testing.T) {
 	}
 }
 
+// TestIntervalCastTypmod covers the cast-form interval typmod qualifier
+// (`CAST(x AS interval hour to minute)`, `x::interval second(2)`,
+// `x::interval(2)`) — unimplemented_feat #5(d-iv). Unlike the typed-literal
+// form (`interval '90' minute`), the qualifier here rides the CAST/`::`
+// type-name position; the parser packs it as a PG-style INTERVAL_TYPMOD and the
+// executor's applyIntervalCastTypmod reproduces PG's interval_in + typmod
+// semantics: the LOW field first sets the DEFAULT UNIT a bare magnitude is
+// interpreted in (`'90'::interval minute` = 90 minutes, not 90 seconds), then
+// AdjustIntervalForTypmod truncates below the field and rounds the fractional
+// seconds to a SECOND precision. Every `want` was captured byte-for-byte from a
+// real PostgreSQL 18.3 instance (socket /tmp:5599).
+func TestIntervalCastTypmod(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+	if err := runDDL(t, ctx, "CREATE TABLE t (id int)"); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	if err := runDDL(t, ctx, "INSERT INTO t VALUES (1)"); err != nil {
+		t.Fatalf("INSERT: %v", err)
+	}
+	cases := []struct{ sql, want string }{
+		// CAST(... AS interval <field> [TO <lo>]) — truncation to the low field.
+		{"SELECT CAST('1 day 2:03:04' AS interval hour to minute)", "1 day 02:03:00"},
+		{"SELECT CAST('1.5' AS interval hour)", "01:00:00"},
+		{"SELECT CAST('90 minutes' AS interval hour)", "01:00:00"},
+		{"SELECT CAST('1 year 2 months 3 days' AS interval year to month)", "1 year 2 mons"},
+		// :: form, same semantics.
+		{"SELECT '1 day 2:03:04'::interval hour to minute", "1 day 02:03:00"},
+		{"SELECT '1.5'::interval hour", "01:00:00"},
+		// LOW field sets the bare-magnitude default unit ('90' → minutes/seconds).
+		{"SELECT '90'::interval minute", "01:30:00"},
+		{"SELECT '90'::interval second", "00:01:30"},
+		// Bare magnitude under year/day: fraction spills, then truncates to field.
+		{"SELECT '1.5'::interval day", "1 day"},
+		{"SELECT '1.9'::interval year", "1 year"},
+		// Explicit-unit body: day truncation zeroes the time field WITHOUT
+		// carrying hours into days (PG stores days/micros separately).
+		{"SELECT '36 hours'::interval day", "00:00:00"},
+		{"SELECT '25 months'::interval year", "2 years"},
+		{"SELECT '-1.5'::interval hour", "-01:00:00"},
+		// SECOND(p) precision — rounds fractional seconds (half away from zero).
+		{"SELECT '1.23456789 sec'::interval(2)", "00:00:01.23"},
+		{"SELECT CAST('1.99999 sec' AS interval second(2))", "00:00:02"},
+		{"SELECT CAST('1 day 1.99999 sec' AS interval day to second(2))", "1 day 00:00:02"},
+		{"SELECT '2:03:04.56789'::interval second(2)", "02:03:04.57"},
+	}
+	for _, c := range cases {
+		rows := runQuery(t, ctx, c.sql+" FROM t")
+		if len(rows) != 1 || len(rows[0]) != 1 {
+			t.Fatalf("%s: expected 1x1 result, got %v", c.sql, rows)
+		}
+		if got := rows[0][0].Format(); got != c.want {
+			t.Errorf("%s = %q, want %q", c.sql, got, c.want)
+		}
+	}
+
+	// A bare `::interval` with no qualifier is unaffected (bare number →
+	// seconds), and a plural / alias after the type is NOT consumed as a typmod.
+	bare := []struct{ sql, want string }{
+		{"SELECT '90'::interval", "00:01:30"},
+		{"SELECT '90'::interval days", "00:01:30"}, // `days` is a column alias, not a typmod
+	}
+	for _, c := range bare {
+		rows := runQuery(t, ctx, c.sql+" FROM t")
+		if len(rows) != 1 || len(rows[0]) != 1 {
+			t.Fatalf("%s: expected 1x1 result, got %v", c.sql, rows)
+		}
+		if got := rows[0][0].Format(); got != c.want {
+			t.Errorf("%s = %q, want %q", c.sql, got, c.want)
+		}
+	}
+}
+
 // TestYearMonthHyphenIntervals covers the SQL-standard "years-months" hyphen
 // field (unimplemented_feat #5, year-month hyphen): a `<int>-<int>` token
 // decodes to years*12 ± months (PostgreSQL's DecodeInterval DTK_NUMBER hyphen

@@ -1471,6 +1471,58 @@ infinite-timestamp carrier), and the cast-form typmod
 `go build`/`go vet` clean; interval/numeric/extract executor tests PASS;
 `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke via pre-commit hook.
 
+## Follow-up (2026-07-11): cast-form interval typmod (#5(d-iv))
+
+Closed the "cast-form typmod" half of the item deferred just above:
+`CAST(x AS interval hour to minute)`, `x::interval second(2)`, and the
+precision-only `x::interval(2)` now apply an interval typmod, where previously
+the field qualifier either errored (inside `CAST(...)`) or was silently ignored.
+(The `interval(p) '<lit>'` *leading-precision typed literal* form remains
+deferred — it is a distinct primary-expression grammar, not a cast.)
+
+**Semantics — why this is not just post-truncation.** PG's `interval_in`
+receives the typmod, and `DecodeInterval`'s `switch (range)` makes the LOW field
+the DEFAULT UNIT of a bare magnitude *before* `AdjustIntervalForTypmod`
+truncates. So `'90'::interval minute` = **90 minutes** = `01:30:00` (not 90
+seconds), whereas `'90'::interval second` = `00:01:30`. A bare `'1.5'::interval
+hour` first becomes 1.5 h then truncates to `01:00:00`. An already-typed
+interval operand is only truncated/rounded, never reinterpreted. Day truncation
+zeroes the (separately stored) micros field without carrying hours into days:
+`'36 hours'::interval day` = `00:00:00`.
+
+**Encoding.** The parser (`internal/parser/select.go`) parses the qualifier in
+both cast entry points (`parseCastTail` for `::`, `parseCastFuncExpr` for
+`CAST(...)`) via the shared `parseIntervalCastQualifier`, reusing
+`intervalTypmodField`/`intervalRangeLowField` from the literal path. It packs a
+PG-style `INTERVAL_TYPMOD` (`(range << 16) | precision`,
+`packIntervalCastTypmod`) into `CastExpr.Typmods[0]`; only the low field's
+`INTERVAL_MASK` bit is stored (the range collapses to its low field for both
+interpretation and truncation). A qualifier is always non-zero, so `0` still
+means "bare interval". The executor
+(`applyIntervalCastTypmod`, `internal/executor/expr.go`, intercepted in the
+`CastExpr` eval branch when `TargetType=="interval" && Typmod!=0`) decodes it via
+`parser.DecodeIntervalCastTypmod`, parses a string body exactly as
+`evalIntervalLit` does for `interval '90' minute` (`ParseIntervalMagnitude` +
+`IntervalUnitToParts(…, lowField)`, else `ParseIntervalBodyWithDefault`), then
+applies `truncIntervalToUnit` + `roundIntervalMicrosToPrec` — the same two
+helpers the literal typmod path uses, so the sibling paths cannot drift.
+`interval 'infinity'` short-circuits (typmod ignored), mirroring
+`evalIntervalLit`.
+
+Verified byte-for-byte vs live PG 18.3 (socket /tmp:5599): `'1 day
+2:03:04'::interval hour to minute`=`1 day 02:03:00`, `'90'::interval
+minute`=`01:30:00`, `'1.5'::interval day`=`1 day`, `'25 months'::interval
+year`=`2 years`, `'2:03:04.56789'::interval second(2)`=`02:03:04.57`,
+`CAST('1.99999 sec' AS interval second(2))`=`00:00:02`. Tests:
+`TestIntervalCastTypmod` (`interval_subday_test.go`, 16 value cases + 2
+bare/alias non-consumption cases).
+
+**Still deferred (narrowed further).** `timestamp ± interval 'infinity'` (needs
+an infinite-timestamp carrier), and the `interval(p) '<lit>'` leading-precision
+typed-literal grammar. Gates: `go build`/`go vet` clean; parser + full
+executor/planner suites PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+pgbench smoke via pre-commit hook.
+
 ## Cross-references
 
 - TPC-H query bodies: HammerDB upstream

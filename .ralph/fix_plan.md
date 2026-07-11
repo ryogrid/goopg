@@ -8149,6 +8149,34 @@ mirroring M0119's ledger `status` column.
       `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench (hook). Still
       deferred: `timestamp ± interval 'infinity'` (needs an infinite-timestamp
       carrier), cast-form interval typmod.
+  - [x] `unimplemented_feat #5(d-iv) (cast-form interval typmod)` (2026-07-11,
+      this loop) — closed the prior row's deferred item (2). `CAST(x AS interval
+      hour to minute)`, `x::interval second(2)`, and precision-only
+      `x::interval(2)` now apply an interval typmod (previously a parse error
+      inside `CAST(...)` or silently ignored on `::`). PG's `interval_in` uses
+      the typmod's LOW field as the DEFAULT UNIT of a bare magnitude BEFORE
+      `AdjustIntervalForTypmod` truncates, so `'90'::interval minute`=`01:30:00`
+      (90 min, not 90 s), `'1.5'::interval hour`=`01:00:00`, `'36 hours'::interval
+      day`=`00:00:00` (day-trunc zeroes the separate micros without carrying
+      hours). Parser (`internal/parser/select.go`) parses the qualifier in BOTH
+      cast entry points (`parseCastTail`, `parseCastFuncExpr`) via a shared new
+      `parseIntervalCastQualifier` (reuses `intervalTypmodField`/
+      `intervalRangeLowField`) and packs a PG-style `INTERVAL_TYPMOD`
+      (`packIntervalCastTypmod`) into `CastExpr.Typmods[0]`. Executor
+      `applyIntervalCastTypmod` (`internal/executor/expr.go`, gated on
+      `TargetType=="interval" && Typmod!=0`) decodes via
+      `parser.DecodeIntervalCastTypmod`, parses the body exactly as
+      `evalIntervalLit` does for `interval '90' minute`, then applies the SHARED
+      `truncIntervalToUnit`+`roundIntervalMicrosToPrec` (sibling paths cannot
+      drift); `interval 'infinity'` short-circuits. A plural/alias
+      (`'90'::interval days`) is NOT consumed as a typmod. All `want`
+      byte-for-byte from live PG 18.3. Test: `interval_subday_test.go` new
+      `TestIntervalCastTypmod` (16 value + 2 bare/alias cases). Design doc
+      `docs/design/0003-0006-*` Follow-up. Gates: build/vet clean; parser + full
+      executor/planner suites PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); pgbench (hook). Still deferred: `timestamp ± interval
+      'infinity'` (infinite-timestamp carrier), `interval(p) '<lit>'`
+      leading-precision typed-literal grammar.
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,

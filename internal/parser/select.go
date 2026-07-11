@@ -2452,7 +2452,19 @@ func (p *parser) parseCastTail(operand Expr) (Expr, error) {
 		name.Name += "[]"
 	}
 	var typmods []int64
-	if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+	// Interval carries a field/precision typmod qualifier in the type-name
+	// position (`x::interval hour to minute`, `x::interval second(2)`,
+	// `x::interval(2)`) rather than a generic `(N[,M])` typmod list.
+	// unimplemented_feat #5(d-iv).
+	if name.Schema == "" && strings.EqualFold(name.Name, "interval") {
+		tm, matched, terr := p.parseIntervalCastQualifier()
+		if terr != nil {
+			return nil, terr
+		}
+		if matched {
+			typmods = []int64{tm}
+		}
+	} else if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
 		p.advance()
 		for {
 			if p.cur().Kind != TokenIntLit {
@@ -2543,7 +2555,19 @@ func (p *parser) parseCastFuncExpr(pos int) (Expr, error) {
 	}
 	// Optional typmod list: char(4), varchar(100), numeric(10,2), etc.
 	var typmods []int64
-	if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+	// Interval carries a field/precision typmod qualifier in the type-name
+	// position (`CAST(x AS interval hour to minute)`, `... interval second(2)`,
+	// `... interval(2)`) rather than a generic `(N[,M])` typmod list.
+	// unimplemented_feat #5(d-iv).
+	if name.Schema == "" && strings.EqualFold(name.Name, "interval") {
+		tm, matched, terr := p.parseIntervalCastQualifier()
+		if terr != nil {
+			return nil, terr
+		}
+		if matched {
+			typmods = []int64{tm}
+		}
+	} else if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
 		p.advance()
 		for {
 			if p.cur().Kind != TokenIntLit {
@@ -3230,6 +3254,156 @@ func (p *parser) tryIntervalTypmodQualifier(pos int, body string) (*IntervalLit,
 	}
 
 	return &IntervalLit{pos: pos, Value: body, Unit: lowField, Qualified: true, HasPrec: hasPrec, Prec: prec}, consumed, true
+}
+
+// Interval typmod packing for the cast / type-name position
+// (`CAST(x AS interval hour to minute)`, `x::interval second(2)`,
+// `x::interval(2)`), mirroring PostgreSQL's INTERVAL_TYPMOD packing
+// (postgres/src/include/utils/timestamp.h): typmod = (range << 16) | precision,
+// where `range` is the OR of INTERVAL_MASK(field) bits and `precision` defaults
+// to INTERVAL_FULL_PRECISION when unspecified. Only the LOW field's mask bit is
+// stored — the range collapses to its low field for both interpretation and
+// AdjustIntervalForTypmod truncation (see intervalRangeLowField) — which is
+// enough for the executor to reconstruct the truncation and the bare-magnitude
+// default unit. unimplemented_feat #5(d-iv).
+const (
+	intervalFullPrecision = 0xFFFF
+	intervalFullRange     = 0x7FFF
+)
+
+// intervalFieldTypmodBit maps a singular interval field to its PostgreSQL DTK
+// bit position (MONTH=1, YEAR=2, DAY=3, HOUR=10, MINUTE=11, SECOND=12; see
+// postgres/src/include/utils/datetime.h). INTERVAL_MASK(f) == 1<<bit.
+var intervalFieldTypmodBit = map[string]int{
+	"month": 1, "year": 2, "day": 3, "hour": 10, "minute": 11, "second": 12,
+}
+
+// packIntervalCastTypmod packs an interval cast typmod. lowField=="" means no
+// field qualifier (precision-only or bare); prec<0 means no precision. The
+// result is always non-zero when any qualifier is present, so 0 unambiguously
+// means "bare interval, no typmod".
+func packIntervalCastTypmod(lowField string, prec int) int64 {
+	rangeMask := intervalFullRange
+	if bit, ok := intervalFieldTypmodBit[lowField]; ok {
+		rangeMask = 1 << bit
+	}
+	p := intervalFullPrecision
+	if prec >= 0 {
+		p = prec
+	}
+	return (int64(rangeMask) << 16) | int64(p)
+}
+
+// DecodeIntervalCastTypmod unpacks a typmod produced by packIntervalCastTypmod
+// back into the executor-facing (lowField, hasPrec, prec). A typmod of 0 (a
+// bare interval with no qualifier) yields ("", false, 0).
+func DecodeIntervalCastTypmod(typmod int64) (lowField string, hasPrec bool, prec int) {
+	if typmod == 0 {
+		return "", false, 0
+	}
+	rangeMask := int((typmod >> 16) & intervalFullRange)
+	p := int(typmod & intervalFullPrecision)
+	if p != intervalFullPrecision {
+		hasPrec, prec = true, p
+	}
+	if rangeMask != intervalFullRange {
+		for f, bit := range intervalFieldTypmodBit {
+			if rangeMask == 1<<bit {
+				lowField = f
+				break
+			}
+		}
+	}
+	return lowField, hasPrec, prec
+}
+
+// parseIntervalCastQualifier parses the optional interval typmod qualifier in
+// the CAST / `::` type-name position, after the `interval` type keyword has been
+// consumed:
+//
+//	interval <field> [TO <lo>] [(p)]   -- CAST(x AS interval hour to minute)
+//	interval second (p)                -- SECOND(p) precision
+//	interval (p)                       -- precision-only (full range)
+//
+// It consumes the tokens it recognises and returns the packed typmod with
+// matched=true. When no qualifier is present it consumes nothing and returns
+// matched=false, so a bare `::interval` (and any following column alias) is
+// unaffected. Only the singular field keywords are recognised (intervalTypmodField);
+// a plural / abbreviation falls through as an alias, matching the literal-form
+// grammar. unimplemented_feat #5(d-iv).
+func (p *parser) parseIntervalCastQualifier() (typmod int64, matched bool, err error) {
+	// Precision-only `interval(p)`.
+	if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+		prec, ok := p.tryConsumeIntervalPrecParen()
+		if !ok {
+			return 0, false, nil
+		}
+		return packIntervalCastTypmod("", prec), true, nil
+	}
+	// Field qualifier `interval <field> [TO <lo>] [(p)]`.
+	f1 := p.cur()
+	if f1.Kind != TokenIdent {
+		return 0, false, nil
+	}
+	hi := strings.ToLower(identText(f1))
+	if !intervalTypmodField[hi] {
+		return 0, false, nil
+	}
+	p.advance() // consume the high field
+	lowField := hi
+	// Optional `TO <lo>` range. Once a field keyword has been consumed the TO is
+	// unambiguously part of the interval typmod, so an invalid low field is an
+	// error rather than a fall-through.
+	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwTo {
+		p.advance() // TO
+		f2 := p.cur()
+		if f2.Kind != TokenIdent {
+			return 0, false, p.errAtCur("expected interval field after TO")
+		}
+		low, ok := intervalRangeLowField(hi, strings.ToLower(identText(f2)))
+		if !ok {
+			return 0, false, p.errAtCur("invalid interval field combination")
+		}
+		p.advance() // low field
+		lowField = low
+	}
+	// Optional `( p )` precision — only valid when the low field is SECOND
+	// (postgres interval_second grammar).
+	prec := -1
+	if lowField == "second" && p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+		if pp, ok := p.tryConsumeIntervalPrecParen(); ok {
+			prec = pp
+		}
+	}
+	return packIntervalCastTypmod(lowField, prec), true, nil
+}
+
+// tryConsumeIntervalPrecParen consumes a simple `( <int> )` precision group when
+// the current token is `(` and the group is exactly a non-negative integer
+// literal followed by `)`. PostgreSQL clamps a precision above
+// MAX_INTERVAL_PRECISION (6) to 6 (intervaltypmodin); the clamp is applied
+// silently here. Returns ok=false without consuming anything if the group is not
+// a bare integer precision, so a caller can fall through.
+func (p *parser) tryConsumeIntervalPrecParen() (int, bool) {
+	if p.cur().Kind != TokenSymbol || p.cur().Value != "(" {
+		return 0, false
+	}
+	numTok := p.peek(1)
+	closeTok := p.peek(2)
+	if numTok.Kind != TokenIntLit || closeTok.Kind != TokenSymbol || closeTok.Value != ")" {
+		return 0, false
+	}
+	n, convErr := strconv.Atoi(numTok.Value)
+	if convErr != nil || n < 0 {
+		return 0, false
+	}
+	if n > 6 {
+		n = 6
+	}
+	p.advance() // (
+	p.advance() // int
+	p.advance() // )
+	return n, true
 }
 
 // parseInTail consumes the right side of `expr [NOT] IN (...)`
