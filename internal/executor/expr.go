@@ -4297,10 +4297,25 @@ func evalExtractInterval(src Datum, field string, pos int, retnumeric bool) (Dat
 			// EXTRACT: integer arithmetic per interval_part_common — multiply
 			// by 4 and divide by 4 so the fractional DAYS_PER_YEAR (365.25)
 			// stays exact: 4*365.25=1461, 4*30=120, SECS_PER_DAY/4=21600.
+			// secs_from_day_month always fits int64, but its product with 1e6
+			// overflows around 10^9 days (~1.07e8 days for a whole-day interval,
+			// or fewer via the months arm). PG guards that with
+			// pg_mul/pg_add_s64_overflow and, on overflow, redoes the sum in
+			// numeric (interval_part_common); we mirror both paths so huge
+			// intervals return the correct value instead of a silent int64 wrap.
 			// result = (secs_from_day_month*1e6 + micros) / 1e6 at scale 6.
 			m := int64(months)
 			secsFromDayMonth := (1461*(m/12) + 120*(m%12) + 4*int64(days)) * 21600
-			return int64DivFastToNumeric(secsFromDayMonth*1_000_000+micros, 6), nil
+			if v, ok := mulInt64Overflow(secsFromDayMonth, 1_000_000); ok {
+				if val, ok := addInt64Overflow(v, micros); ok {
+					return int64DivFastToNumeric(val, 6), nil
+				}
+			}
+			// Overflow fallback: numeric_add(int64_div_fast_to_numeric(time,6),
+			// int64_to_numeric(secs_from_day_month)) — the whole-seconds term is
+			// scale 0, the time term scale 6, so the sum lands at scale 6 exactly
+			// like the fast path but backed by big.Int.
+			return numericAdd(int64DivFastToNumeric(micros, 6), numericFromInt(secsFromDayMonth))
 		}
 		result := float64(micros) / 1_000_000.0
 		result += 365.25 * 86400.0 * float64(int64(months)/12)

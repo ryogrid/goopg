@@ -8128,6 +8128,27 @@ mirroring M0119's ledger `status` column.
       executor suite PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
       pgbench (hook). Still deferred: `timestamp ± interval 'infinity'` (needs an
       infinite-timestamp carrier), cast-form interval typmod.
+  - [x] `unimplemented_feat #5(d-iv) (EXTRACT(EPOCH FROM interval) int64
+      overflow)` (2026-07-11, this loop) — closed the prior row's deferred item
+      (3). `interval_part_common`'s EXTRACT/numeric epoch arm computes
+      `secs_from_day_month*10^6 + time` in int64; `secs_from_day_month` fits but
+      the `·10^6` product overflows int64 around 10^9 days (boundary
+      `106751991`→`106751992` whole days, or fewer via the months arm). goopg's
+      `evalExtractInterval` (`internal/executor/expr.go`) did the whole sum
+      unconditionally in int64 → a huge interval *wrapped silently*. Now mirrors
+      PG's `pg_mul_s64_overflow`/`pg_add_s64_overflow` guard (via existing
+      `mulInt64Overflow`/`addInt64Overflow`) and, on overflow, redoes the sum in
+      numeric: `numericAdd(int64DivFastToNumeric(micros,6),
+      numericFromInt(secsFromDayMonth))` — scale-0 whole-seconds + scale-6
+      fractional → scale-6 big.Int sum, identical to the fast path. The float8
+      `date_part('epoch', …)` spelling was already overflow-safe (double). All
+      `want` byte-for-byte from live PG 18.3. Test: `interval_subday_test.go` new
+      `TestExtractEpochIntervalOverflow` (9 cases bracketing both boundary arms +
+      sign + mixed day/time). Design doc `docs/design/0003-0006-*` Follow-up.
+      Gates: build/vet clean; interval/numeric/extract executor tests PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench (hook). Still
+      deferred: `timestamp ± interval 'infinity'` (needs an infinite-timestamp
+      carrier), cast-form interval typmod.
 
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,

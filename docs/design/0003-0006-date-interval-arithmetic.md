@@ -1445,11 +1445,30 @@ timetz '20:38:40.5-08'`=`103120.500000`, negative `… from timestamp '1960-01-0
 00:00:00'`=`-315619200.000000`). Tests: `TestExtractEpochFromTimestamp`
 (`interval_subday_test.go`, 11 cases across both spellings).
 
+**Follow-up (EXTRACT(EPOCH FROM interval) int64-overflow fallback — 2026-07-11).**
+Closed the "numeric int64 overflow fallback" item deferred just above.
+`interval_part_common`'s EXTRACT (numeric) epoch case computes
+`secs_from_day_month*10^6 + time` in int64; `secs_from_day_month` (= `86400·day +
+1461·(mon/12)·21600 + …`) always fits, but the `·10^6` product overflows int64
+around 10^9 days — roughly `106_751_991 → 106_751_992` days for a whole-day
+interval, or fewer through the months arm. goopg previously did this
+unconditionally in int64 and *wrapped silently* (a huge interval returned a
+garbage epoch). We now mirror PG's `pg_mul_s64_overflow`/`pg_add_s64_overflow`
+guard: on overflow, redo the sum in numeric as
+`numericAdd(int64DivFastToNumeric(time,6), numericFromInt(secs_from_day_month))`
+— the whole-seconds term is scale 0, the fractional-seconds term scale 6, so the
+numeric sum lands at scale 6 exactly like the fast path but backed by `big.Int`.
+The float8 `date_part('epoch', …)` spelling is untouched (a double can't wrap).
+Verified byte-for-byte vs live PG 18.3 (`extract(epoch from interval '1000000000
+days')`=`86400000000000.000000`, `… '106751991 days'`=`9223372022400.000000`
+(fast), `… '106751992 days'`=`9223372108800.000000` (fallback), `… '2000000
+years'`=`63115200000000.000000`). Tests: `TestExtractEpochIntervalOverflow`
+(`interval_subday_test.go`, 9 boundary/sign/mixed cases).
+
 **Still deferred (narrowed).** `timestamp ± interval 'infinity'` (needs an
 infinite-timestamp carrier), and the cast-form typmod
-`CAST(... AS interval hour to minute)` / `interval(p) '...'`. The interval-epoch
-numeric int64 overflow fallback (PG's `numeric_add_opt_error` above ~10^9 days)
-is also not modeled. Gates: `go build`/`go vet` clean; full executor suite PASS;
+`CAST(... AS interval hour to minute)` / `interval(p) '...'`. Gates:
+`go build`/`go vet` clean; interval/numeric/extract executor tests PASS;
 `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke via pre-commit hook.
 
 ## Cross-references

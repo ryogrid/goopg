@@ -1289,6 +1289,54 @@ func TestExtractFromInterval(t *testing.T) {
 	}
 }
 
+// TestExtractEpochIntervalOverflow locks the int64-overflow fallback of
+// EXTRACT(EPOCH FROM interval). interval_part_common computes the epoch as
+// secs_from_day_month*10^6 + time in int64, but that product overflows int64
+// around 10^9 days (a whole-day interval crosses at 106_751_991 → 106_751_992
+// days, since 106751992*86400*10^6 > INT64_MAX). PG then redoes the sum in
+// numeric; goopg previously did it unconditionally in int64 and wrapped
+// silently. These pairs bracket the fast-path/fallback boundary on both the
+// day and month arms, plus the mixed day+time and negative cases. Every `want`
+// is byte-for-byte from live PostgreSQL 18.3 (local_install). The EXTRACT
+// (numeric, scale-6) spelling is the overflow-prone one; the date_part (float8)
+// spelling is unaffected — a double can't wrap — and is included as a guard
+// that the two spellings still agree at magnitude.
+func TestExtractEpochIntervalOverflow(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+	if err := runDDL(t, ctx, "CREATE TABLE t (id int)"); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	if err := runDDL(t, ctx, "INSERT INTO t VALUES (1)"); err != nil {
+		t.Fatalf("INSERT: %v", err)
+	}
+	cases := []struct{ sql, want string }{
+		// Day arm: last value that fits int64 vs first that overflows.
+		{"SELECT extract(epoch from interval '106751991 days')", "9223372022400.000000"},
+		{"SELECT extract(epoch from interval '106751992 days')", "9223372108800.000000"},
+		// Well past the boundary, both signs.
+		{"SELECT extract(epoch from interval '1000000000 days')", "86400000000000.000000"},
+		{"SELECT extract(epoch from interval '-1000000000 days')", "-86400000000000.000000"},
+		// Mixed day + time under the fallback: the fractional seconds must add in.
+		{"SELECT extract(epoch from interval '200000000 days 06:30:00')", "17280000023400.000000"},
+		// A case that stays on the int64 fast path near the boundary (day+time).
+		{"SELECT extract(epoch from interval '100000000 days 12:00:00')", "8640000043200.000000"},
+		// Month arm overflow (years feed the 1461/120 weighting).
+		{"SELECT extract(epoch from interval '2000000 years')", "63115200000000.000000"},
+		// date_part (float8 spelling) is not overflow-prone; magnitude must match.
+		{"SELECT date_part('epoch', interval '1000000000 days')", "86400000000000"},
+	}
+	for _, c := range cases {
+		rows := runQuery(t, ctx, c.sql+" FROM t")
+		if len(rows) != 1 || len(rows[0]) != 1 {
+			t.Fatalf("%s: expected 1x1 result, got %v", c.sql, rows)
+		}
+		if got := rows[0][0].Format(); got != c.want {
+			t.Errorf("%s = %q, want %q", c.sql, got, c.want)
+		}
+	}
+}
+
 // TestExtractEpochFromTimestamp locks EXTRACT(EPOCH …)/date_part('epoch', …) for
 // the non-interval temporal source types. The prior EXTRACT loops left a VALUE
 // bug: the timestamp/date paths returned only the seconds-of-day component
