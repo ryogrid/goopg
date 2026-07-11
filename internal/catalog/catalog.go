@@ -6955,6 +6955,119 @@ func (c *InMemory) PGClassRowsForDBOid(dbOid uint32) [][]string {
 		return out
 }
 
+// StatTableScope selects which relations PGStatTablesRowsForDBOid emits, mirroring
+// the WHERE clauses of PG's pg_stat_{all,user,sys}_tables system views
+// (src/backend/catalog/system_views.sql).
+type StatTableScope int
+
+const (
+	StatScopeAll  StatTableScope = iota // pg_stat_all_tables (every relkind r/m/p relation)
+	StatScopeUser                       // pg_stat_user_tables (non-system schemas)
+	StatScopeSys                        // pg_stat_sys_tables (pg_catalog/information_schema/pg_toast*)
+)
+
+// isSystemStatSchema reports whether a schema belongs to the "system" side of
+// PG's pg_stat_sys_tables/pg_stat_user_tables split: schemaname IN
+// ('pg_catalog','information_schema') OR schemaname ~ '^pg_toast'.
+func isSystemStatSchema(schema string) bool {
+	s := strings.ToLower(schema)
+	return s == "pg_catalog" || s == "information_schema" || strings.HasPrefix(s, "pg_toast")
+}
+
+// PGStatTablesRowsForDBOid builds the pg_stat_all_tables / pg_stat_user_tables /
+// pg_stat_sys_tables row set for one database, scoped by `scope`. It mirrors
+// upstream's view (system_views.sql: SELECT over pg_class LEFT JOIN pg_index,
+// relkind IN ('r','t','m','p')) but goopg has no incremental pgstat mutation
+// counters (no PgStat_StatTabEntry), so every per-tuple/scan counter is a
+// faithful 0 and every last_* timestamp is NULL — the same honest-0/NULL shape
+// pg_stat_io uses for the I/O cells goopg does not track. The three real cells
+// are relid / schemaname / relname; n_live_tup is backed by the table's
+// ANALYZE-persisted live-tuple estimate (reltuples, TableStats.RowCount), the
+// best available signal absent a live counter. See docs/design/
+// 0122-0003-pg-stat-user-tables.md.
+//
+// Only ordinary tables ('r'), materialized views ('m') and partitioned parents
+// ('p') are emitted — the same user-relation set PGClassRowsForDBOid surfaces.
+// goopg's system catalogs are storage-less virtual tables with no TableStats, so
+// pg_stat_sys_tables is effectively empty (documented deferral); TOAST relations
+// ('t') are synthesized only in pg_class and are likewise omitted here.
+func (c *InMemory) PGStatTablesRowsForDBOid(dbOid uint32, scope StatTableScope) [][]string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	keys := make([]string, 0, len(c.ns(dbOid).tables))
+	for k := range c.ns(dbOid).tables {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([][]string, 0, len(keys))
+	for _, k := range keys {
+		t := c.ns(dbOid).tables[k]
+		// Skip system-catalog virtual tables, sequences, plain views and
+		// foreign tables — mirrors PGClassRowsForDBOid's relation filter so the
+		// two agree on the relkind r/m/p set.
+		if t.Virtual && t.View == nil && !t.IsMatView && !t.IsSequence {
+			continue
+		}
+		if t.IsSequence {
+			continue
+		}
+		if t.View != nil && !t.IsMatView {
+			continue
+		}
+		if t.ForeignServerName != "" {
+			continue
+		}
+		schema := t.Schema
+		if schema == "" {
+			schema = "public"
+		}
+		switch scope {
+		case StatScopeUser:
+			if isSystemStatSchema(schema) {
+				continue
+			}
+		case StatScopeSys:
+			if !isSystemStatSchema(schema) {
+				continue
+			}
+		}
+		nLiveTup := "0"
+		if t.Stats != nil {
+			nLiveTup = strconv.FormatInt(t.Stats.RowCount, 10)
+		}
+		N := VirtualNull
+		out = append(out, []string{
+			strconv.Itoa(int(t.OID)), // 0:  relid
+			schema,                   // 1:  schemaname
+			t.Name,                   // 2:  relname
+			"0",                      // 3:  seq_scan
+			N,                        // 4:  last_seq_scan
+			"0",                      // 5:  seq_tup_read
+			"0",                      // 6:  idx_scan
+			N,                        // 7:  last_idx_scan
+			"0",                      // 8:  idx_tup_fetch
+			"0",                      // 9:  n_tup_ins
+			"0",                      // 10: n_tup_upd
+			"0",                      // 11: n_tup_del
+			"0",                      // 12: n_tup_hot_upd
+			"0",                      // 13: n_tup_newpage_upd
+			nLiveTup,                 // 14: n_live_tup (reltuples estimate)
+			"0",                      // 15: n_dead_tup
+			"0",                      // 16: n_mod_since_analyze
+			"0",                      // 17: n_ins_since_vacuum
+			N,                        // 18: last_vacuum
+			N,                        // 19: last_autovacuum
+			N,                        // 20: last_analyze
+			N,                        // 21: last_autoanalyze
+			"0",                      // 22: vacuum_count
+			"0",                      // 23: autovacuum_count
+			"0",                      // 24: analyze_count
+			"0",                      // 25: autoanalyze_count
+		})
+	}
+	return out
+}
+
 func (c *InMemory) registerSystemTables() {
 	pgClass := &Table{
 		Schema: "pg_catalog",
@@ -7998,6 +8111,64 @@ func (c *InMemory) registerSystemTables() {
 	}
 	pgStatIO.VirtualRows = func() [][]string { return nil }
 	c.ns(DefaultDBOid).tables["pg_catalog.pg_stat_io"] = pgStatIO
+
+	// pg_stat_all_tables / pg_stat_user_tables / pg_stat_sys_tables — per-table
+	// access statistics (PG's system_views.sql). The static VirtualRows fallback
+	// below scopes to DefaultDBOid; the live, per-connection database-scoped row
+	// set is built by executor.fetchStatTablesRows and swapped in at Open time
+	// (valuesOp.Open's pg_stat_*_tables cases), mirroring the pg_stat_io wiring.
+	// goopg has no incremental pgstat mutation counters, so every per-tuple/scan
+	// counter is a faithful 0 and every last_* timestamp is NULL; relid /
+	// schemaname / relname are real and n_live_tup is the ANALYZE reltuples
+	// estimate. See docs/design/0122-0003-pg-stat-user-tables.md.
+	statTablesColumns := func() []Column {
+		return []Column{
+			{Name: "relid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "schemaname", Type: Type{Name: "name"}, Ordinal: 1},
+			{Name: "relname", Type: Type{Name: "name"}, Ordinal: 2},
+			{Name: "seq_scan", Type: Type{Name: "int8"}, Ordinal: 3},
+			{Name: "last_seq_scan", Type: Type{Name: "timestamptz"}, Ordinal: 4},
+			{Name: "seq_tup_read", Type: Type{Name: "int8"}, Ordinal: 5},
+			{Name: "idx_scan", Type: Type{Name: "int8"}, Ordinal: 6},
+			{Name: "last_idx_scan", Type: Type{Name: "timestamptz"}, Ordinal: 7},
+			{Name: "idx_tup_fetch", Type: Type{Name: "int8"}, Ordinal: 8},
+			{Name: "n_tup_ins", Type: Type{Name: "int8"}, Ordinal: 9},
+			{Name: "n_tup_upd", Type: Type{Name: "int8"}, Ordinal: 10},
+			{Name: "n_tup_del", Type: Type{Name: "int8"}, Ordinal: 11},
+			{Name: "n_tup_hot_upd", Type: Type{Name: "int8"}, Ordinal: 12},
+			{Name: "n_tup_newpage_upd", Type: Type{Name: "int8"}, Ordinal: 13},
+			{Name: "n_live_tup", Type: Type{Name: "int8"}, Ordinal: 14},
+			{Name: "n_dead_tup", Type: Type{Name: "int8"}, Ordinal: 15},
+			{Name: "n_mod_since_analyze", Type: Type{Name: "int8"}, Ordinal: 16},
+			{Name: "n_ins_since_vacuum", Type: Type{Name: "int8"}, Ordinal: 17},
+			{Name: "last_vacuum", Type: Type{Name: "timestamptz"}, Ordinal: 18},
+			{Name: "last_autovacuum", Type: Type{Name: "timestamptz"}, Ordinal: 19},
+			{Name: "last_analyze", Type: Type{Name: "timestamptz"}, Ordinal: 20},
+			{Name: "last_autoanalyze", Type: Type{Name: "timestamptz"}, Ordinal: 21},
+			{Name: "vacuum_count", Type: Type{Name: "int8"}, Ordinal: 22},
+			{Name: "autovacuum_count", Type: Type{Name: "int8"}, Ordinal: 23},
+			{Name: "analyze_count", Type: Type{Name: "int8"}, Ordinal: 24},
+			{Name: "autoanalyze_count", Type: Type{Name: "int8"}, Ordinal: 25},
+		}
+	}
+	for _, v := range []struct {
+		name  string
+		oid   uint32
+		scope StatTableScope
+	}{
+		{"pg_stat_all_tables", 9081, StatScopeAll},
+		{"pg_stat_sys_tables", 9082, StatScopeSys},
+		{"pg_stat_user_tables", 9083, StatScopeUser},
+	} {
+		scope := v.scope
+		tbl := &Table{
+			Schema: "pg_catalog", Name: v.name, Virtual: true,
+			Columns: statTablesColumns(),
+			OID:     v.oid,
+		}
+		tbl.VirtualRows = func() [][]string { return c.PGStatTablesRowsForDBOid(DefaultDBOid, scope) }
+		c.ns(DefaultDBOid).tables["pg_catalog."+v.name] = tbl
+	}
 
 	// pg_description — stores COMMENT ON object descriptions (OID 2609).
 	// COMMENT ON is parsed as a no-op in goopg v0; this stub allows queries

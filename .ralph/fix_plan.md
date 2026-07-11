@@ -3786,6 +3786,26 @@ mirroring M0119's ledger `status` column.
       ./internal/executor/... ./internal/planner/...` PASS (full EXPLAIN
       suite, no regressions); `scripts/tpch-spotcheck.sh` PASS (Q12=2/
       Q13=33).
+      **`pg_stat_all_tables`/`pg_stat_user_tables`/`pg_stat_sys_tables`
+      done (2026-07-12):** the three per-table access-statistics system
+      views now resolve (previously unknown-relation errors).
+      `catalog.PGStatTablesRowsForDBOid(dbOid, scope)` + `StatTableScope`
+      build the 26-col row set reusing `PGClassRowsForDBOid`'s relation
+      filter + upstream's `schemaname` user/sys split (`isSystemStatSchema`);
+      `executor.fetchStatTablesRows` (`internal/executor/pgstat_tables.go`)
+      unwraps `ctx.Catalog`→`*catalog.InMemory` and scopes to
+      `ctx.CurrentDatabaseOid`, swapped in at `valuesOp.Open` (three new
+      branches mirroring the `pg_stat_io` case); the static `VirtualRows`
+      fallback scopes to `DefaultDBOid`. Following the `pg_stat_io`
+      honest-0/NULL precedent, `relid`/`schemaname`/`relname` are real,
+      `n_live_tup` is the ANALYZE `reltuples` estimate (`TableStats.RowCount`)
+      and every other counter is a faithful 0 / every `last_*` NULL. Tests:
+      `internal/catalog/pgstat_tables_test.go` +
+      `internal/executor/pgstat_tables_e2e_test.go`. Design:
+      `docs/design/0122-0003-pg-stat-user-tables.md` + README index row.
+      Ledger row (2026-07-12) records the missing per-table counter
+      subsystem + empty `pg_stat_sys_tables`. Gates: catalog+executor full
+      packages PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33).
 - [x] **M0122-0004 — SQL language / executor features** (~21). Window frame
       ROWS/RANGE/GROUPS, GROUPING SETS/ROLLUP/CUBE, DEFAULT-clause
       parsing, intervals. **WITH CHECK

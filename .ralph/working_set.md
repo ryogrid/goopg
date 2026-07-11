@@ -1,37 +1,25 @@
 (idle — nothing in flight)
 
-## Loop summary (2026-07-12, loop #73)
+## Loop summary (2026-07-12, loop #75)
 
-**Nightly triage:** action-items batch `20260711-011536` — all 3 AI items
-(IsolationTimeouts / TuplelockUpgradeNoDeadlock / PgWaldumpVacuumPruneRoundtrip)
-already `[x]` in M-NIGHTLY (co-load timing flakes). No new nightly work.
+**Resumed cut-off loop #74's in-flight WIP** (working_set was stale from #73):
+`pg_stat_all_tables` / `pg_stat_user_tables` / `pg_stat_sys_tables` system views
+(M0122-0003 sub-slice). Files were already written+building; I finished it:
+- Verified build + targeted/full catalog & executor package tests PASS.
+- Wrote the MISSING referenced design doc
+  `docs/design/0122-0003-pg-stat-user-tables.md` + README index row.
+- Appended deferral-ledger row (missing per-table counter subsystem;
+  empty pg_stat_sys_tables since system catalogs are storage-less).
+- Added the fix_plan M0122-0003 banner note.
+- Gates: catalog+executor full PASS; tpch-spotcheck PASS (Q12=2/Q13=33);
+  pgbench smoke via pre-commit hook. Committed.
 
-**Task — code-audit resolution of unimplemented_feat #178 "pg_subtrans
-truncation is deferred" (task_id M0117-0003). COMPLETE + committed.**
-
-Finding: the item was STALE. Its `code_audit` field literally read "unclear...
-not verified". Verified pg_subtrans truncation is fully implemented and wired
-end-to-end by M0122-0009 (commit 41e119b8):
-- `internal/mvcc/subxact_slru.go` `SubtransSLRU.TruncateBefore` — unlinks
-  segment files whose highest page wraparound-precedes the cutoff.
-- `internal/mvcc/subxact_visibility.go` `SubxactMap.Truncate` — drops in-memory
-  parent/abort entries older than horizon + cascades to SLRU.
-- `internal/initdb/open.go:1628` `TruncateSubtransFn` — same conservative
-  `min(datfrozenxid, OldestXmin)` horizon as `TruncateCLOGFn`.
-- `internal/wal/checkpointer.go:665` invokes it post-checkpoint (durable order).
-- Tests: `mvcc/subxact_truncate_test.go`, `wal/checkpointer_test.go`
-  `TestCheckpointerCallsTruncateSubtransFn` + `...ErrorIsNonFatal`.
-
-Landed: unimplemented_feat.json #178 status open→resolved, confidence→high,
-code_audit rewritten with the full wiring citation + PG parity note (goopg's
-horizon is at-least-as-conservative as PG's GetOldestTransactionIdConsideredRunning).
-Open count 78→77.
-
-No deferral (nothing left unimplemented). No design-doc change (metadata-only,
-no subsystem code touched).
-
-Gates: mvcc + wal subtrans/checkpointer tests PASS; JSON re-validated;
-ralph-state-guard consistent (auto-repaired stale completed marker); pgbench
-smoke via pre-commit hook.
+**Nightly triage — batch `20260712-020530` (39 items):** NOT real regressions.
+Evidence log (`ci/logs/20260712-020530/testport/go-test.log`) shows the failures
+are all `dial tcp 127.0.0.1:39219: connect: connection refused` — a single
+co-load server-unavailability cascade (TPC-H co-load starves initdb/server
+start, known signature). No new M-NIGHTLY tasks added; do NOT treat these 39 as
+independent product regressions. If they recur in an ISOLATED (non-co-load) run,
+re-triage.
 
 In-flight: none
