@@ -8105,6 +8105,30 @@ mirroring M0119's ledger `status` column.
       build/vet clean; executor suite PASS; `scripts/tpch-spotcheck.sh` PASS
       (Q12=2/Q13=33); pgbench (hook).
 
+  - [x] `unimplemented_feat #5(d-iv) (EXTRACT(EPOCH) full Unix epoch for
+      timestamp/date)` (2026-07-11, this loop) — closed the prior row's
+      newly-discovered VALUE bug: `EXTRACT(EPOCH FROM timestamp)` /
+      `date_part('epoch', …)` returned only *seconds-of-day* instead of the full
+      Unix epoch (`982355920.5` PG vs goopg `74320.5`). Rewrote the `epoch` case
+      in BOTH sibling paths (`evalExtract` numeric spelling + `evalDatePart`
+      float8 spelling, `internal/executor/expr.go`) to be source-type dependent,
+      line-porting PG's `timestamp_part`/`timetz_part`/`extract_date` DTK_EPOCH:
+      timestamp/timestamptz → full Unix epoch µs at scale 6; `time` →
+      seconds-of-day scale 6; `timetz` → local seconds-of-day − offset scale 6;
+      `date` → integer seconds since 1970 at scale 0. New `timeOfDayMicros`
+      helper. `evalExtract` uses `x.SourceTypeName` (+ `flagDate`) to pick the
+      arm; `evalDatePart` (no source type) distinguishes only `timetz` via
+      `Scale!=0` and computes the full Unix epoch uniformly for the rest — which
+      is correct for `time` too because a `time` value is always stored on
+      1970-01-01, where its full Unix epoch equals its seconds-of-day. All `want`
+      byte-for-byte from live PG 18.3. Tests: `interval_subday_test.go` new
+      `TestExtractEpochFromTimestamp` (11 cases: timestamp/timestamptz/negative/
+      date/time/timetz±, both EXTRACT and date_part). Design doc
+      `docs/design/0003-0006-*` Follow-up updated. Gates: build/vet clean;
+      executor suite PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      pgbench (hook). Still deferred: `timestamp ± interval 'infinity'` (needs an
+      infinite-timestamp carrier), cast-form interval typmod.
+
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,
       encoding constraints during bootstrap/runtime.

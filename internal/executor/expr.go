@@ -4063,6 +4063,16 @@ func int64DivFastToNumeric(val int64, log10 int) Datum {
 	return Datum{Kind: KindNumeric, Int: val, Scale: int16(scale)}
 }
 
+// timeOfDayMicros returns t's wall-clock time-of-day (hour/minute/second and
+// fractional microseconds) expressed as microseconds since midnight, ignoring
+// the date component. Used by EXTRACT(EPOCH …)/date_part('epoch', …) for the
+// time / timetz source types, whose epoch is a seconds-of-day quantity rather
+// than a full Unix epoch.
+func timeOfDayMicros(t time.Time) int64 {
+	return (int64(t.Hour())*3600+int64(t.Minute())*60+int64(t.Second()))*1_000_000 +
+		int64(t.Nanosecond())/1000
+}
+
 // evalExtract implements `EXTRACT(field FROM source)` for the
 // timestamp-component fields TPC-H Q7/Q8/Q9 use (year), plus
 // the obvious neighbours (month, day, hour, minute, dow, doy,
@@ -4111,12 +4121,29 @@ func evalExtract(x *planner.ExtractExpr, row Row, ctx *Context) (Datum, error) {
 		usec := int64(u.Second())*1_000_000 + int64(u.Nanosecond())/1000
 		return int64DivFastToNumeric(usec, 3), nil
 	case "epoch":
-		localSecs := float64(u.Hour()*3600+u.Minute()*60+u.Second()) + float64(u.Nanosecond())/1e9
-		if srcType == "timetz" {
-			// timetz epoch = UTC seconds-of-day = local_time - offset
-			return newNumericFromFloat(localSecs - float64(src.TimeTZOffsetSecs())), nil
+		// EXTRACT returns numeric (retnumeric=true), so the display scale is
+		// preserved. PG's epoch is source-type dependent (timestamp_part /
+		// timetz_part / extract_date, all in .../adt/*.c):
+		//   timestamp/timestamptz → full Unix epoch, µs/1e6 at scale 6
+		//     (982355920.500000);
+		//   time                  → seconds-of-day at scale 6 (74320.500000);
+		//   timetz                → local seconds-of-day − offset at scale 6
+		//     (offset east-positive; stored Int is the local wall-clock as UTC
+		//      nanos, so u's time-of-day is the local time);
+		//   date                  → integer seconds since the Unix epoch at
+		//     scale 0 (982281600, no fractional part).
+		switch {
+		case srcType == "timetz":
+			epochMicros := timeOfDayMicros(u) - int64(src.TimeTZOffsetSecs())*1_000_000
+			return int64DivFastToNumeric(epochMicros, 6), nil
+		case srcType == "time":
+			return int64DivFastToNumeric(timeOfDayMicros(u), 6), nil
+		case srcType == "date" || src.Flags&flagDate != 0:
+			return int64DivFastToNumeric(u.Unix(), 0), nil
+		default: // timestamp / timestamptz
+			epochMicros := u.Unix()*1_000_000 + int64(u.Nanosecond())/1000
+			return int64DivFastToNumeric(epochMicros, 6), nil
 		}
-		return newNumericFromFloat(localSecs), nil
 	case "timezone", "timezone_hour", "timezone_minute":
 		if srcType == "time" {
 			return Datum{}, &ExecError{Code: "22023", Pos: x.Pos(),
@@ -4413,13 +4440,18 @@ func evalDatePart(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		f := float64(u.Second())*1000 + float64(u.Nanosecond())/1_000_000.0
 		return newNumericFromFloat(f), nil
 	case "epoch":
-		f := float64(u.Hour()*3600+u.Minute()*60+u.Second()) + float64(u.Nanosecond())/1e9
-		// For timetz datums, epoch = UTC seconds-of-day = local_time - offset.
-		// Scale stores timezone offset in minutes east of UTC.
+		// date_part returns float8 (retnumeric=false) → trailing zeros stripped.
+		// timetz carries its offset in Scale (minutes east of UTC): its epoch is
+		// local seconds-of-day − offset. Every other KindTime source (time,
+		// timestamp, timestamptz, date) has Scale 0 and uses the full Unix epoch;
+		// for a `time` value (always stored on 1970-01-01) the full Unix epoch
+		// equals its seconds-of-day, so the uniform formula is correct there too.
 		if src.Scale != 0 {
-			f -= float64(src.TimeTZOffsetSecs())
+			f := float64(timeOfDayMicros(u))/1e6 - float64(src.TimeTZOffsetSecs())
+			return newNumericFromFloat(f), nil
 		}
-		return newNumericFromFloat(f), nil
+		epochMicros := u.Unix()*1_000_000 + int64(u.Nanosecond())/1000
+		return newNumericFromFloat(float64(epochMicros)/1e6), nil
 	}
 	n, err := extractTimestampField(field, u, x.Pos())
 	if err != nil {

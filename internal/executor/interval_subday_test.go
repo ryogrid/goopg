@@ -1289,6 +1289,51 @@ func TestExtractFromInterval(t *testing.T) {
 	}
 }
 
+// TestExtractEpochFromTimestamp locks EXTRACT(EPOCH …)/date_part('epoch', …) for
+// the non-interval temporal source types. The prior EXTRACT loops left a VALUE
+// bug: the timestamp/date paths returned only the seconds-of-day component
+// instead of the full Unix epoch (`982355920.5` PG vs `74320.5` goopg). PG's
+// epoch is source-type dependent (timestamp_part / timetz_part / extract_date):
+//   - timestamp/timestamptz → full Unix epoch, numeric scale 6 for EXTRACT;
+//   - time                  → seconds-of-day, scale 6;
+//   - timetz                → local seconds-of-day − offset, scale 6;
+//   - date                  → integer seconds since 1970, scale 0.
+// date_part is the float8 spelling (trailing zeros stripped). All `want` values
+// were captured byte-for-byte from live PostgreSQL 18.3 (local_install).
+func TestExtractEpochFromTimestamp(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+	if err := runDDL(t, ctx, "CREATE TABLE t (id int)"); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	if err := runDDL(t, ctx, "INSERT INTO t VALUES (1)"); err != nil {
+		t.Fatalf("INSERT: %v", err)
+	}
+	cases := []struct{ sql, want string }{
+		// EXTRACT (numeric, scale-preserved).
+		{"SELECT extract(epoch from timestamp '2001-02-16 20:38:40.5')", "982355920.500000"},
+		{"SELECT extract(epoch from timestamptz '2001-02-16 20:38:40.5+00')", "982355920.500000"},
+		{"SELECT extract(epoch from timestamp '1960-01-01 00:00:00')", "-315619200.000000"},
+		{"SELECT extract(epoch from date '2001-02-16')", "982281600"},
+		{"SELECT extract(epoch from time '20:38:40.5')", "74320.500000"},
+		{"SELECT extract(epoch from timetz '20:38:40.5+05')", "56320.500000"},
+		{"SELECT extract(epoch from timetz '20:38:40.5-08')", "103120.500000"},
+		// date_part (float8, trailing zeros stripped).
+		{"SELECT date_part('epoch', timestamp '2001-02-16 20:38:40.5')", "982355920.5"},
+		{"SELECT date_part('epoch', date '2001-02-16')", "982281600"},
+		{"SELECT date_part('epoch', time '20:38:40.5')", "74320.5"},
+		{"SELECT date_part('epoch', timetz '20:38:40.5+05')", "56320.5"},
+	}
+	for _, c := range cases {
+		rows := runQuery(t, ctx, c.sql+" FROM t")
+		if len(rows) != 1 || len(rows[0]) != 1 {
+			t.Fatalf("%s: expected 1x1 result, got %v", c.sql, rows)
+		}
+		if got := rows[0][0].Format(); got != c.want {
+			t.Errorf("%s = %q, want %q", c.sql, got, c.want)
+		}
+	}
+}
 
 // TestNegateInterval drives unary `- interval` (interval_um) end-to-end through
 // the SQL executor: finite intervals negate every field, the ±infinity sentinels

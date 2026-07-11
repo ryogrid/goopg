@@ -1417,15 +1417,39 @@ from interval '2 years … 6.5 seconds')`=`6.500000`, `extract(epoch …)`=
 scaled form, new `date_part` rows lock the stripped-float8 form, new
 timestamp/time EXTRACT rows.
 
+**Follow-up (EXTRACT(EPOCH) full Unix epoch — 2026-07-11).** Fixed the
+newly-discovered VALUE bug above: `EXTRACT(EPOCH FROM timestamp)` /
+`date_part('epoch', …)` returned only *seconds-of-day* rather than the full Unix
+epoch (`982355920.5` PG vs goopg `74320.5`). The `epoch` case in both sibling
+paths (`evalExtract`, `evalDatePart`) is now source-type dependent, line-porting
+PG's `timestamp_part`/`timetz_part`/`extract_date` DTK_EPOCH:
+
+| source | epoch | scale |
+|--------|-------|-------|
+| `timestamp`/`timestamptz` | full Unix epoch (µs / 1e6) | 6 |
+| `time` | seconds-of-day | 6 |
+| `timetz` | local seconds-of-day − offset (east-positive) | 6 |
+| `date` | integer seconds since 1970 | 0 |
+
+`evalExtract` (the numeric-returning EXTRACT node) selects the arm from
+`x.SourceTypeName` (plus the `flagDate` fallback) and returns the scale-preserved
+`int64_div_fast_to_numeric` form. `evalDatePart` (the float8 `date_part`
+spelling, no source-type info at eval time) distinguishes only `timetz` via
+`Scale != 0` and computes the full Unix epoch uniformly for every other KindTime
+source — correct for `time` as well, because a `time` value is always stored on
+1970-01-01, so its full Unix epoch equals its seconds-of-day. New helper
+`timeOfDayMicros`. Verified byte-for-byte vs live PG 18.3 (`extract(epoch from
+timestamp '2001-02-16 20:38:40.5')`=`982355920.500000`, `… from date
+'2001-02-16'`=`982281600`, `… from time '20:38:40.5'`=`74320.500000`, `… from
+timetz '20:38:40.5-08'`=`103120.500000`, negative `… from timestamp '1960-01-01
+00:00:00'`=`-315619200.000000`). Tests: `TestExtractEpochFromTimestamp`
+(`interval_subday_test.go`, 11 cases across both spellings).
+
 **Still deferred (narrowed).** `timestamp ± interval 'infinity'` (needs an
 infinite-timestamp carrier), and the cast-form typmod
-`CAST(... AS interval hour to minute)` / `interval(p) '...'`. Also open and
-newly-discovered: `EXTRACT(EPOCH FROM timestamp)` computes only *seconds-of-day*
-(`evalExtract`'s `case "epoch"`) instead of the full Unix epoch — e.g. PG returns
-`982355920.500000` for `2001-02-16 20:38:40.5` but goopg returns `74320.5`; the
-`EXTRACT(EPOCH …)` case for the timestamp/time source was deliberately left
-untouched this loop (a distinct value bug, plus the same scale gap), see the
-deferral ledger. Gates: `go build`/`go vet` clean; full executor suite PASS;
+`CAST(... AS interval hour to minute)` / `interval(p) '...'`. The interval-epoch
+numeric int64 overflow fallback (PG's `numeric_add_opt_error` above ~10^9 days)
+is also not modeled. Gates: `go build`/`go vet` clean; full executor suite PASS;
 `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke via pre-commit hook.
 
 ## Cross-references
