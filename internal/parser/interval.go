@@ -769,6 +769,46 @@ func splitSignedTZTrailer(body string) (pre, rest string, ok bool) {
 // range (`interval '1 day 5' hour to minute`) must instead use
 // ParseIntervalBodyWithDefault so the bare number resolves via the range's low
 // field (unimplemented_feat #5(d-iv) complex-body-under-range).
+// Interval ±infinity sentinel components. PostgreSQL represents an infinite
+// interval by setting all three fields to the extreme of their signed range
+// (INTERVAL_NOBEGIN / INTERVAL_NOEND, postgres/src/include/datatype/timestamp.h):
+// +infinity = {INT32_MAX months, INT32_MAX days, INT64_MAX µs}, -infinity the
+// mirror at INT_MIN. goopg's KindInterval carrier (month/day/micros) reproduces
+// the same sentinel triple, so ordering falls out of the ordinary field compare
+// for free; the values round-trip through ParseInterval* and formatInterval.
+const (
+	IntervalNoEndMonths   = math.MaxInt32
+	IntervalNoEndDays     = math.MaxInt32
+	IntervalNoEndMicros   = math.MaxInt64
+	IntervalNoBeginMonths = math.MinInt32
+	IntervalNoBeginDays   = math.MinInt32
+	IntervalNoBeginMicros = math.MinInt64
+)
+
+// IntervalInfinitySentinel recognises a whole-body interval infinity literal —
+// `infinity`, `-infinity`, `+infinity` (case-insensitive) — returning the PG
+// sentinel triple when matched. It mirrors PostgreSQL's DecodeInterval, which
+// tokenises the word to DTK_LATE / DTK_EARLY (datetime.c) and rejects anything
+// but a lone infinity field: `1 infinity`, `infinity 1`, `inf`, `infinityx` all
+// fail. Surrounding whitespace and a single leading sign (which PG may separate
+// from the word by spaces — `- infinity`, `+ infinity` are valid) are tolerated,
+// but a doubled/mixed sign (`--infinity`, `-+infinity`, `- -infinity`) is not.
+func IntervalInfinitySentinel(body string) (months, days int32, micros int64, isInf bool) {
+	s := strings.TrimSpace(body)
+	positive := true
+	if len(s) > 0 && (s[0] == '+' || s[0] == '-') {
+		positive = s[0] != '-'
+		s = strings.TrimSpace(s[1:])
+	}
+	if !strings.EqualFold(s, "infinity") {
+		return 0, 0, 0, false
+	}
+	if positive {
+		return IntervalNoEndMonths, IntervalNoEndDays, IntervalNoEndMicros, true
+	}
+	return IntervalNoBeginMonths, IntervalNoBeginDays, IntervalNoBeginMicros, true
+}
+
 func ParseIntervalBody(body string) (months, days int32, micros int64, ok bool) {
 	return ParseIntervalBodyWithDefault(body, "second")
 }
@@ -788,6 +828,12 @@ func ParseIntervalBody(body string) (months, days int32, micros int64, ok bool) 
 // well as the Form-1 typmod-qualified path (low-field default); the sibling
 // paths the practice card warns must not diverge all funnel through here.
 func ParseIntervalBodyWithDefault(body, defaultUnit string) (months, days int32, micros int64, ok bool) {
+	// interval ±infinity is a whole-body special that pre-empts field decoding
+	// and ignores any typmod default (`interval 'infinity' hour to minute` is
+	// still infinity). unimplemented_feat #5(d-iv).
+	if mo, d, mu, isInf := IntervalInfinitySentinel(body); isInf {
+		return mo, d, mu, true
+	}
 	if mo, d, mu, fok := decodeIntervalFields(body, defaultUnit); fok {
 		return mo, d, mu, true
 	}

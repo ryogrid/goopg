@@ -5710,6 +5710,16 @@ func evalIntervalLit(x *planner.IntervalLit) (Datum, error) {
 		x.CacheValid = true
 		return NewIntervalDatumFull(x.PreMonths, x.PreDays, x.PreMicros), nil
 	}
+	// interval 'infinity' / '-infinity' / '+infinity' (unimplemented_feat
+	// #5(d-iv)): a whole-body infinity token maps to PG's INTERVAL_NOBEGIN /
+	// INTERVAL_NOEND sentinel and pre-empts the numeric / qualified paths — any
+	// trailing typmod qualifier (`interval 'infinity' hour to minute`) is ignored
+	// and must NOT drive truncIntervalToUnit, so it is recognised before both.
+	if mo, d, mu, isInf := parser.IntervalInfinitySentinel(x.Value); isInf {
+		x.CachedMonths, x.CachedDays, x.CachedMicros = mo, d, mu
+		x.CacheValid = true
+		return NewIntervalDatumFull(mo, d, mu), nil
+	}
 	var months, days int32
 	var micros int64
 	if val, fval, magOK := parser.ParseIntervalMagnitude(x.Value); magOK {

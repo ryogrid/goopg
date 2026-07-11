@@ -1061,3 +1061,69 @@ func TestParseIntervalBodySingleFieldMatchesUnitToParts(t *testing.T) {
 		}
 	}
 }
+
+// TestIntervalInfinityLiterals covers interval ±infinity literals
+// (unimplemented_feat #5(d-iv)): `infinity`, `-infinity`, `+infinity`
+// (case-insensitive, sign optionally space-separated, surrounding whitespace
+// tolerated) map to PostgreSQL's INTERVAL_NOEND / INTERVAL_NOBEGIN sentinel
+// (DTK_LATE / DTK_EARLY in DecodeInterval) and round-trip to the bare word on
+// output. A trailing typmod qualifier is ignored (`interval 'infinity' hour to
+// minute` is still infinity). Both the typed-literal and `::interval`/CAST entry
+// points are exercised (they share parser.ParseIntervalBody). Every `want` /
+// rejection was captured byte-for-byte from live PostgreSQL 18.3 (port 5599).
+func TestIntervalInfinityLiterals(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+	if err := runDDL(t, ctx, "CREATE TABLE t (id int)"); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	if err := runDDL(t, ctx, "INSERT INTO t VALUES (1)"); err != nil {
+		t.Fatalf("INSERT: %v", err)
+	}
+	accept := []struct{ sql, want string }{
+		{"SELECT interval 'infinity'", "infinity"},
+		{"SELECT interval '-infinity'", "-infinity"},
+		{"SELECT interval '+infinity'", "infinity"},
+		{"SELECT interval 'Infinity'", "infinity"},
+		{"SELECT interval 'INFINITY'", "infinity"},
+		{"SELECT interval '  infinity  '", "infinity"},
+		{"SELECT interval '- infinity'", "-infinity"},
+		{"SELECT interval '+ infinity'", "infinity"},
+		// Typmod qualifier is ignored for infinity.
+		{"SELECT interval 'infinity' hour to minute", "infinity"},
+		{"SELECT interval 'infinity' day", "infinity"},
+		{"SELECT interval '-infinity' second(2)", "-infinity"},
+		// The ::interval / CAST path shares the tokenizer.
+		{"SELECT 'infinity'::interval", "infinity"},
+		{"SELECT '-infinity'::interval", "-infinity"},
+		{"SELECT CAST('infinity' AS interval)", "infinity"},
+		{"SELECT CAST('-infinity' AS interval)", "-infinity"},
+	}
+	for _, c := range accept {
+		rows := runQuery(t, ctx, c.sql+" FROM t")
+		if len(rows) != 1 || len(rows[0]) != 1 {
+			t.Fatalf("%s: expected 1x1 result, got %v", c.sql, rows)
+		}
+		if got := rows[0][0].Format(); got != c.want {
+			t.Errorf("%s = %q, want %q", c.sql, got, c.want)
+		}
+	}
+
+	reject := []string{
+		"SELECT interval 'inf' FROM t",         // must be the full word
+		"SELECT interval '-inf' FROM t",
+		"SELECT interval 'infi' FROM t",
+		"SELECT interval 'infinityx' FROM t",   // trailing garbage
+		"SELECT interval '-infinityy' FROM t",
+		"SELECT interval '1 infinity' FROM t",  // infinity must be the sole field
+		"SELECT interval 'infinity 1' FROM t",
+		"SELECT interval '--infinity' FROM t",  // doubled / mixed sign
+		"SELECT interval '-+infinity' FROM t",
+		"SELECT interval '- -infinity' FROM t",
+	}
+	for _, sql := range reject {
+		if _, err := runQueryErr(t, ctx, sql); err == nil {
+			t.Errorf("%s: expected error, got none", sql)
+		}
+	}
+}

@@ -1231,6 +1231,52 @@ range cases. Gates: `go build`/`go vet` clean; parser + analyzer + planner +
 executor suites PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench
 smoke via pre-commit hook.
 
+## Follow-up (2026-07-11): interval `±infinity` literals (#5(d-iv))
+
+Closed the interval-`±infinity` literal that every prior `#5(d-*)` row deferred as
+"needs a new infinite-interval Datum carrier". It turned out **no new carrier is
+needed**: PostgreSQL represents an infinite interval with the `INTERVAL_NOEND` /
+`INTERVAL_NOBEGIN` sentinel — all three fields at the extreme of their signed
+range (`postgres/src/include/datatype/timestamp.h`): `+infinity` =
+`{INT32_MAX months, INT32_MAX days, INT64_MAX µs}`, `-infinity` the mirror at
+`INT_MIN`. goopg's existing `KindInterval` carrier (month | day packed in `Int`,
+micros in `Hi`) reproduces the same triple exactly, so this loop scoped itself to
+the **literal round-trip** (parse + output) plus sentinel predicates/constructors,
+and deferred the operator short-circuits.
+
+**Recognition (parse).** New `parser.IntervalInfinitySentinel(body)`
+(`internal/parser/interval.go`) mirrors PG's `DecodeInterval`, which tokenises the
+word to `DTK_LATE` / `DTK_EARLY` and accepts only a **lone** infinity field: it
+trims surrounding whitespace, peels a single optional leading sign (PG allows the
+sign to be space-separated: `- infinity`, `+ infinity` are valid), then requires a
+case-insensitive exact `infinity`. `inf` / `infi` / `infinityx` (partial/trailing
+garbage), `1 infinity` / `infinity 1` (not the sole field), and `--infinity` /
+`-+infinity` / `- -infinity` (doubled/mixed sign) all fail, byte-for-byte with PG
+18.3 (port 5599). It is wired into the shared `ParseIntervalBodyWithDefault` (so
+`::interval`/CAST and the Form-1 typmod path get it) **and** into `evalIntervalLit`
+before the numeric/qualified branches — the early position matters: a trailing
+typmod qualifier is *ignored* for infinity (`interval 'infinity' hour to minute`
+is still `infinity`), so recognition must pre-empt `truncIntervalToUnit`, which
+would otherwise corrupt the sentinel.
+
+**Output.** `formatInterval` (`internal/executor/datum.go`) short-circuits the two
+sentinel triples to the bare words `infinity` / `-infinity` before any field
+decomposition. New `Datum.IsIntervalNoEnd`/`IsIntervalNoBegin`/`IsIntervalNotFinite`
+predicates and `NewIntervalInfinity(positive)` constructor expose the sentinel for
+the deferred operator work.
+
+**Still deferred.** The engine-wide operator short-circuits: interval arithmetic
+(`interval 'infinity' + interval '1 day'` → `infinity` in PG; goopg would overflow
+`INT64_MAX + µs`), `extract(epoch …)` → `Infinity`, and the explicit "interval out
+of range" error PG raises for `infinity − infinity`. Ordering (`=`/`<`/`>`) may
+fall out of the ordinary field compare for free because the sentinel is the field
+extreme, but that is unverified and left to the operator loop. Also still open: the
+leading/cast-form typmod `CAST(... AS interval hour to minute)` / `interval(p)
+'...'`. Tests: `interval_subday_test.go` new `TestIntervalInfinityLiterals` (15
+accepts + 10 rejects, both sibling paths). Gates: `go build`/`go vet` clean; parser
++ executor suites PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench
+smoke via pre-commit hook.
+
 ## Cross-references
 
 - TPC-H query bodies: HammerDB upstream

@@ -200,6 +200,34 @@ func (d Datum) IntervalMicrosValue() int64 {
 	return int64(d.Hi)
 }
 
+// IsIntervalNoEnd / IsIntervalNoBegin report whether a KindInterval Datum
+// carries PostgreSQL's +infinity / -infinity sentinel (INTERVAL_NOEND /
+// INTERVAL_NOBEGIN, all three fields at their signed extreme;
+// postgres/src/include/datatype/timestamp.h). IsIntervalNotFinite is the union.
+// (unimplemented_feat #5(d-iv))
+func (d Datum) IsIntervalNoEnd() bool {
+	return d.Kind == KindInterval && d.IntervalMonthsValue() == math.MaxInt32 &&
+		d.IntervalDaysValue() == math.MaxInt32 && d.IntervalMicrosValue() == math.MaxInt64
+}
+
+func (d Datum) IsIntervalNoBegin() bool {
+	return d.Kind == KindInterval && d.IntervalMonthsValue() == math.MinInt32 &&
+		d.IntervalDaysValue() == math.MinInt32 && d.IntervalMicrosValue() == math.MinInt64
+}
+
+func (d Datum) IsIntervalNotFinite() bool {
+	return d.IsIntervalNoEnd() || d.IsIntervalNoBegin()
+}
+
+// NewIntervalInfinity constructs the +infinity (positive) or -infinity
+// KindInterval sentinel Datum.
+func NewIntervalInfinity(positive bool) Datum {
+	if positive {
+		return NewIntervalDatumFull(math.MaxInt32, math.MaxInt32, math.MaxInt64)
+	}
+	return NewIntervalDatumFull(math.MinInt32, math.MinInt32, math.MinInt64)
+}
+
 // NumericMantissaValue is the int64 fast-path mantissa of KindNumeric
 // (valid only when Big == nil).
 func (d Datum) NumericMantissaValue() int64 { return d.Int }
@@ -586,6 +614,15 @@ func (d Datum) Format() string {
 // zero interval prints "00:00:00"). Verified byte-for-byte against real
 // PostgreSQL 18.3 (see docs/design/0003-0006-date-interval-arithmetic.md).
 func formatInterval(months, days int32, micros int64) string {
+	// interval ±infinity: PG's INTERVAL_NOEND / INTERVAL_NOBEGIN sentinel (all
+	// fields at their signed extreme) prints as the bare word, no field
+	// decomposition. unimplemented_feat #5(d-iv).
+	if months == math.MaxInt32 && days == math.MaxInt32 && micros == math.MaxInt64 {
+		return "infinity"
+	}
+	if months == math.MinInt32 && days == math.MinInt32 && micros == math.MinInt64 {
+		return "-infinity"
+	}
 	const usecsPerHour = 3600 * 1_000_000
 	const usecsPerMin = 60 * 1_000_000
 	const usecsPerSec = 1_000_000
