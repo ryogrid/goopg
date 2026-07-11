@@ -3944,6 +3944,28 @@ mirroring M0119's ledger `status` column.
       live bgwriter/archiver counter subsystems. Gates: catalog+executor full
       packages PASS; go build ./... clean; `scripts/tpch-spotcheck.sh` PASS
       (Q12=2/Q13=33).
+      **`pg_stat_database` done (2026-07-12, later loop):** the headline
+      per-database cluster statistics view (30-col PG 18.3 shape) now resolves.
+      Unlike the per-object `pg_stat_*_tables` views it is *global* — it lists
+      every database plus a leading shared-objects row (`datid=0`,
+      `datname=NULL`) regardless of the connected database — so, like
+      `pg_stat_bgwriter`, NO per-connection twin: the `VirtualRows` closure is
+      `catalog.PGStatDatabaseRows`, which enumerates the live registry
+      (`c.ListDatabases`) at query time so `CREATE`/`DROP DATABASE` shows up
+      immediately. OID 9101, registered after `pg_stat_archiver`. Every counter
+      is a faithful 0, `numbackends` honest 0, and `checksum_last_failure`/
+      `stats_reset` NULL — VERIFIED byte-identical to a fresh real PG 18.3
+      cluster (spun a throwaway instance this loop). `datid` uses a NEW shared
+      helper `catalog.databaseDisplayOID(name)` that `pg_database.VirtualRows`
+      now also routes through (sibling-paths: the two views' oids join
+      byte-for-byte; resolves the old "keep this switch in sync" comment on
+      `ResolveDatabaseOid`). Tests: `TestPGStatDatabaseViewRegistered`
+      (`internal/catalog/pgstat_global_test.go`) + `TestPgStatDatabaseEndToEnd`
+      (`internal/executor/pgstat_global_e2e_test.go`). Design +README +ledger
+      updated. `PgStat_StatDBEntry` accumulator deferred. Still unregistered
+      pg_stat views for a later slice: `pg_stat_database_conflicts`,
+      `pg_stat_ssl`, `pg_stat_gssapi`, `pg_stat_subscription_stats`,
+      `pg_stat_progress_*`, `pg_stat_replication`, `pg_stat_wal_receiver`.
 - [x] **M0122-0004 — SQL language / executor features** (~21). Window frame
       ROWS/RANGE/GROUPS, GROUPING SETS/ROLLUP/CUBE, DEFAULT-clause
       parsing, intervals. **WITH CHECK

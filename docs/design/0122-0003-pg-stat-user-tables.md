@@ -323,6 +323,64 @@ right after `pg_stat_wal`. Tests:
 `TestPgStatArchiverEndToEnd` — full SELECT resolves the view). A live
 bgwriter/archiver counter subsystem is deferred (ledger).
 
+## `pg_stat_database` (per-database cluster view, 2026-07-12)
+
+`pg_stat_database` is the headline database-level statistics view (monitoring
+tools query it constantly). Unlike the per-object `pg_stat_*_tables` views it is
+a **global** row set: it lists *every* database regardless of which one the
+client is connected to, plus a leading shared-objects row (`datid = 0`,
+`datname = NULL`). Upstream `system_views.sql` builds its FROM clause as
+`SELECT 0 AS oid, NULL AS datname UNION ALL SELECT oid, datname FROM
+pg_database`. Because the row set does not depend on the connected database, it
+needs **no per-connection twin** — it follows the `pg_stat_bgwriter` /
+`pg_stat_wal` precedent (a static `VirtualRows` closure), except the closure
+enumerates the live database registry (`catalog.PGStatDatabaseRows`, calling
+`c.ListDatabases()`) at query time so `CREATE`/`DROP DATABASE` is reflected
+immediately. OID 9101.
+
+The 30-column PG 18.3 shape is:
+
+```
+datid, datname, numbackends, xact_commit, xact_rollback, blks_read, blks_hit,
+tup_returned, tup_fetched, tup_inserted, tup_updated, tup_deleted, conflicts,
+temp_files, temp_bytes, deadlocks, checksum_failures, checksum_last_failure,
+blk_read_time, blk_write_time, session_time, active_time,
+idle_in_transaction_time, sessions, sessions_abandoned, sessions_fatal,
+sessions_killed, parallel_workers_to_launch, parallel_workers_launched,
+stats_reset
+```
+
+goopg has no live per-database cumulative-statistics accumulator
+(`PgStat_StatDBEntry` analog), so every counter is a faithful `0`, both
+timestamp columns (`checksum_last_failure`, `stats_reset`) are NULL via
+`catalog.VirtualNull`, and `numbackends` is an honest `0` too (goopg does not
+attribute live backends per database). This is exactly what a **real** PG 18.3
+cluster reports for a database no backend has yet touched — verified against a
+fresh cluster: `numbackends 0`, every counter `0`, `stats_reset` and
+`checksum_last_failure` NULL. (On a real cluster the *connected* database's row
+would show `numbackends ≥ 1` and a non-zero `xact_commit`/`blks_read` from the
+querying backend itself; goopg's honest-0 shape is the "no stats collected"
+answer.)
+
+`datid` is the SQL-visible `pg_database.oid` **as goopg displays it**
+(`template1 → 1`, `template0 → 4`, a `CreateDatabase`-allocated database → its
+real distinct oid, everything else — notably `postgres` — the legacy `16384`
+placeholder). To guarantee `pg_stat_database.datid` joins to `pg_database.oid`
+byte-for-byte, both the `pg_database` `VirtualRows` closure and
+`PGStatDatabaseRows` now derive that oid through a single shared helper,
+`catalog.databaseDisplayOID(name)` — resolving the long-standing "keep this
+switch in sync" hazard the code previously carried only as a comment on
+`ResolveDatabaseOid`.
+
+Registered in `registerSystemTables` right after `pg_stat_archiver`. Tests:
+`internal/catalog/pgstat_global_test.go` (`TestPGStatDatabaseViewRegistered` —
+30-col shape, shared row, honest-0/NULL cells, bootstrap-database display oids,
+and `CREATE DATABASE` reflected immediately) and
+`internal/executor/pgstat_global_e2e_test.go` (`TestPgStatDatabaseEndToEnd` —
+full SELECT resolves the view, shared row first under `ORDER BY datid`, NULL
+`stats_reset`). A live `PgStat_StatDBEntry`-style accumulator is deferred
+(ledger).
+
 ## Deferred
 
 The scan/tuple/vacuum/analyze counters and `last_*` timestamps remain honest

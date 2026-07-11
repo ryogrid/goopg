@@ -46,3 +46,38 @@ func TestPgStatArchiverEndToEnd(t *testing.T) {
 		t.Errorf("last_failed_time = %v, want NULL", rows[0][3].Format())
 	}
 }
+
+// TestPgStatDatabaseEndToEnd drives a real SELECT through the planner and
+// executor to confirm pg_stat_database resolves as a virtual view, returns the
+// shared-objects row (datid=0, datname NULL) plus one honest-0 row per
+// database, and renders NULL for stats_reset. M0122-0003.
+func TestPgStatDatabaseEndToEnd(t *testing.T) {
+	ctx, _, cleanup := newStorageFixture(t)
+	defer cleanup()
+
+	rows := runQueryRows(t, ctx,
+		"SELECT datid, datname, numbackends, xact_commit, blks_read, session_time, stats_reset FROM pg_stat_database ORDER BY datid")
+	if len(rows) < 1 {
+		t.Fatalf("row count = %d, want >= 1", len(rows))
+	}
+	// datid ordered ascending -> the shared row (datid 0, datname NULL) is first.
+	shared := rows[0]
+	if shared[0].IsNull() || shared[0].Format() != "0" {
+		t.Errorf("shared row datid = %v, want 0", shared[0].Format())
+	}
+	if !shared[1].IsNull() {
+		t.Errorf("shared row datname = %v, want NULL", shared[1].Format())
+	}
+	// Every row: numbackends/xact_commit/blks_read honest 0, session_time 0,
+	// stats_reset NULL.
+	for i, row := range rows {
+		for c, name := range map[int]string{2: "numbackends", 3: "xact_commit", 4: "blks_read", 5: "session_time"} {
+			if row[c].IsNull() || row[c].Format() != "0" {
+				t.Errorf("row %d %s = %v, want 0", i, name, row[c].Format())
+			}
+		}
+		if !row[6].IsNull() {
+			t.Errorf("row %d stats_reset = %v, want NULL", i, row[6].Format())
+		}
+	}
+}

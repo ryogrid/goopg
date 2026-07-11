@@ -4737,6 +4737,77 @@ func (c *InMemory) DatabaseOid(name string) uint32 {
 	return c.databaseOid[name]
 }
 
+// databaseDisplayOID returns the SQL-visible pg_database.oid that goopg
+// DISPLAYS for name: template1→1, template0→4, a CreateDatabase-allocated
+// database→its real distinct oid, and every other row (notably the live
+// "postgres" database — whose real on-disk oid is c.DBOID() but which is shown
+// as the legacy 16384 placeholder for CREATE SUBSCRIPTION / datacl compat)
+// →16384. This is deliberately the DISPLAY oid, not ResolveDatabaseOid's
+// physical oid: pg_stat_database.datid must join to pg_database.oid exactly as
+// goopg renders it, so both the pg_database VirtualRows closure and
+// PGStatDatabaseRows go through this single helper to stay in sync (resolving
+// the long-standing "keep this switch in sync" hazard noted on
+// ResolveDatabaseOid).
+func (c *InMemory) databaseDisplayOID(name string) string {
+	switch name {
+	case "template1":
+		return "1"
+	case "template0":
+		return "4"
+	default:
+		if realOid := c.DatabaseOid(name); realOid != 0 {
+			return strconv.FormatUint(uint64(realOid), 10)
+		}
+		return "16384"
+	}
+}
+
+// PGStatDatabaseRows builds the pg_stat_database row set: one leading row for
+// shared objects (datid=0, datname=NULL) followed by one row per database the
+// catalog knows about, mirroring upstream system_views.sql's FROM clause
+// "SELECT 0 AS oid, NULL AS datname UNION ALL SELECT oid, datname FROM
+// pg_database".
+//
+// Every per-database counter is a faithful 0 and every timestamp/last-failure
+// cell is NULL. goopg has no live per-database cumulative-statistics
+// accumulator (PgStat_StatDBEntry analog), so on a busy cluster a real PG
+// backend would bump numbackends / xact_commit / blks_* / session_time for its
+// connected database — goopg reports the honest "no stats collected" shape.
+// That is also exactly what a real PG 18.3 cluster shows for a database no
+// backend has yet touched (numbackends 0, every counter 0, stats_reset NULL,
+// checksum_last_failure NULL — verified against a fresh cluster). See
+// docs/design/0122-0003-pg-stat-user-tables.md.
+func (c *InMemory) PGStatDatabaseRows() [][]string {
+	// 30-col shape (PG 18.3): datid, datname, numbackends, xact_commit,
+	// xact_rollback, blks_read, blks_hit, tup_returned, tup_fetched,
+	// tup_inserted, tup_updated, tup_deleted, conflicts, temp_files, temp_bytes,
+	// deadlocks, checksum_failures, checksum_last_failure, blk_read_time,
+	// blk_write_time, session_time, active_time, idle_in_transaction_time,
+	// sessions, sessions_abandoned, sessions_fatal, sessions_killed,
+	// parallel_workers_to_launch, parallel_workers_launched, stats_reset.
+	const nCols = 30
+	row := func(datid, datname string) []string {
+		r := make([]string, nCols)
+		for i := range r {
+			r[i] = "0" // int/float counter columns default to a faithful 0
+		}
+		r[0] = datid   // datid oid
+		r[1] = datname // datname name
+		r[17] = VirtualNull // checksum_last_failure timestamptz — never failed
+		r[29] = VirtualNull // stats_reset timestamptz — never reset
+		return r
+	}
+	out := make([][]string, 0, 4)
+	// Shared-objects row first (upstream's "SELECT 0, NULL"): datid 0, datname
+	// NULL. Upstream's view also forces its numbackends to 0 via a CASE; here
+	// every row's numbackends is already 0, so no special-case is needed.
+	out = append(out, row("0", VirtualNull))
+	for _, n := range c.ListDatabases() {
+		out = append(out, row(c.databaseDisplayOID(n), n))
+	}
+	return out
+}
+
 // ResolveDatabaseOid returns the REAL, physical pg_database.oid for name —
 // the same oid that keys on-disk storage/ACLs (c.DBOID() for "postgres",
 // the fixed bootstrap oids for template1/template0, or the CreateDatabase-
@@ -7658,26 +7729,21 @@ func (c *InMemory) registerSystemTables() {
 			// (initdb.go buildRow). Clients such as pg_amcheck filter on
 			// `datallowconn AND datconnlimit != -2`, so template0 is
 			// correctly omitted from --all while template1 is included.
-			oid, datallowconn, datistemplate := "16384", "true", "false"
+			// databaseDisplayOID renders the SQL-visible oid: template1→1,
+			// template0→4, a CreateDatabase-allocated database→its real distinct
+			// oid (M0122-0007 physical-storage-isolation slice 1), and every
+			// other row (notably the live "postgres" row, which never goes
+			// through CreateDatabase so DatabaseOid is 0)→the legacy 16384
+			// placeholder CREATE SUBSCRIPTION's subdbid and the datacl heap
+			// resync both key off (see the datacl comment below). Shared with
+			// PGStatDatabaseRows so pg_stat_database.datid joins to this exactly.
+			oid := c.databaseDisplayOID(n)
+			datallowconn, datistemplate := "true", "false"
 			switch n {
 			case "template1":
-				oid, datallowconn, datistemplate = "1", "true", "true"
+				datallowconn, datistemplate = "true", "true"
 			case "template0":
-				oid, datallowconn, datistemplate = "4", "false", "true"
-			default:
-				// A database registered via CreateDatabase (i.e. not one of
-				// the three bootstrap rows above) now carries a real,
-				// distinct oid (M0122-0007 physical-storage-isolation slice
-				// 1) instead of reusing the shared "16384" placeholder every
-				// non-template row rendered before. Deliberately does NOT
-				// touch the live "postgres" row: it never goes through
-				// CreateDatabase, so DatabaseOid("postgres") is 0 and the
-				// placeholder above stands — CREATE SUBSCRIPTION's subdbid
-				// and the datacl heap resync both key off that placeholder
-				// (see the datacl comment below).
-				if realOid := c.DatabaseOid(n); realOid != 0 {
-					oid = strconv.FormatUint(uint64(realOid), 10)
-				}
+				datallowconn, datistemplate = "false", "true"
 			}
 			// datacl is keyed by c.DBOID() — the REAL on-disk OID read from the
 			// physical global/1262 heap by detectCatalogDBOID at startup (PG18's
@@ -8479,6 +8545,55 @@ func (c *InMemory) registerSystemTables() {
 		}
 	}
 	c.ns(DefaultDBOid).tables["pg_catalog.pg_stat_archiver"] = pgStatArchiver
+
+	// pg_stat_database — one row per database plus a leading shared-objects row
+	// (datid=0, datname=NULL). Unlike the per-object pg_stat_*_tables views this
+	// is a GLOBAL row set (it lists every database regardless of which one the
+	// client is connected to), so — like pg_stat_bgwriter/pg_stat_archiver above
+	// — it needs no per-connection twin: the VirtualRows closure enumerates the
+	// live database registry (c.ListDatabases via PGStatDatabaseRows) at query
+	// time, so CREATE/DROP DATABASE is reflected immediately. Every per-database
+	// counter is a faithful 0 and stats_reset/checksum_last_failure are NULL
+	// (goopg has no PgStat_StatDBEntry accumulator). See
+	// docs/design/0122-0003-pg-stat-user-tables.md and catalog.PGStatDatabaseRows.
+	pgStatDatabase := &Table{
+		Schema: "pg_catalog", Name: "pg_stat_database", Virtual: true,
+		Columns: []Column{
+			{Name: "datid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "datname", Type: Type{Name: "name"}, Ordinal: 1},
+			{Name: "numbackends", Type: Type{Name: "int4"}, Ordinal: 2},
+			{Name: "xact_commit", Type: Type{Name: "int8"}, Ordinal: 3},
+			{Name: "xact_rollback", Type: Type{Name: "int8"}, Ordinal: 4},
+			{Name: "blks_read", Type: Type{Name: "int8"}, Ordinal: 5},
+			{Name: "blks_hit", Type: Type{Name: "int8"}, Ordinal: 6},
+			{Name: "tup_returned", Type: Type{Name: "int8"}, Ordinal: 7},
+			{Name: "tup_fetched", Type: Type{Name: "int8"}, Ordinal: 8},
+			{Name: "tup_inserted", Type: Type{Name: "int8"}, Ordinal: 9},
+			{Name: "tup_updated", Type: Type{Name: "int8"}, Ordinal: 10},
+			{Name: "tup_deleted", Type: Type{Name: "int8"}, Ordinal: 11},
+			{Name: "conflicts", Type: Type{Name: "int8"}, Ordinal: 12},
+			{Name: "temp_files", Type: Type{Name: "int8"}, Ordinal: 13},
+			{Name: "temp_bytes", Type: Type{Name: "int8"}, Ordinal: 14},
+			{Name: "deadlocks", Type: Type{Name: "int8"}, Ordinal: 15},
+			{Name: "checksum_failures", Type: Type{Name: "int8"}, Ordinal: 16},
+			{Name: "checksum_last_failure", Type: Type{Name: "timestamptz"}, Ordinal: 17},
+			{Name: "blk_read_time", Type: Type{Name: "float8"}, Ordinal: 18},
+			{Name: "blk_write_time", Type: Type{Name: "float8"}, Ordinal: 19},
+			{Name: "session_time", Type: Type{Name: "float8"}, Ordinal: 20},
+			{Name: "active_time", Type: Type{Name: "float8"}, Ordinal: 21},
+			{Name: "idle_in_transaction_time", Type: Type{Name: "float8"}, Ordinal: 22},
+			{Name: "sessions", Type: Type{Name: "int8"}, Ordinal: 23},
+			{Name: "sessions_abandoned", Type: Type{Name: "int8"}, Ordinal: 24},
+			{Name: "sessions_fatal", Type: Type{Name: "int8"}, Ordinal: 25},
+			{Name: "sessions_killed", Type: Type{Name: "int8"}, Ordinal: 26},
+			{Name: "parallel_workers_to_launch", Type: Type{Name: "int8"}, Ordinal: 27},
+			{Name: "parallel_workers_launched", Type: Type{Name: "int8"}, Ordinal: 28},
+			{Name: "stats_reset", Type: Type{Name: "timestamptz"}, Ordinal: 29},
+		},
+		OID: 9101,
+	}
+	pgStatDatabase.VirtualRows = c.PGStatDatabaseRows
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_stat_database"] = pgStatDatabase
 
 	// pg_stat_io — per-backend-type I/O statistics (PG 16+, OID 8061).
 	// The static VirtualRows fallback below returns no rows; the real,
