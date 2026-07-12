@@ -13,7 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/goopg/goopg/internal/activity"
+	"github.com/goopg/goopg/internal/gls"
 	"github.com/goopg/goopg/internal/stats"
 )
 
@@ -318,6 +318,15 @@ type Writer struct {
 	// op channel.
 	writeLSNAtomic atomic.Uint64
 
+	// flushedLSNAtomic mirrors state.flushedLSN — the highest LSN whose
+	// bytes have been fdatasync'd to the segment files. Published by the
+	// writer goroutine AFTER each sync barrier so a reader that observes
+	// lsn <= flushedLSNAtomic knows lsn is durable. FlushUpTo reads it to
+	// skip the group-flush queue entirely when the target is already
+	// durable — the goopg analog of PG's `record <= LogwrtResult.Flush`
+	// fast exit in XLogFlush (analysis/perf-optimize2, fix-03).
+	flushedLSNAtomic atomic.Uint64
+
 	// subscribers receive a non-blocking wake-up after every
 	// successful Append. Used by RecordIterator (and walsender
 	// goroutines) to block until more WAL is available instead of
@@ -423,6 +432,11 @@ type state struct {
 	// stored after each successful append. The Writer reads it
 	// without locking.
 	writeLSNMirror *atomic.Uint64
+
+	// flushedLSNMirror, when non-nil, gets flushedLSN stored after each
+	// sync barrier (in flushUpTo, after the fdatasync loop). The Writer
+	// reads it in FlushUpTo for the pre-enqueue already-flushed fast exit.
+	flushedLSNMirror *atomic.Uint64
 
 	// onAppend, when non-nil, is invoked after every successful
 	// append to wake subscribers (RecordIterators, walsender
@@ -580,6 +594,8 @@ func NewWriter(cfg Config) (*Writer, error) {
 	}
 	w.writeLSNAtomic.Store(uint64(st.writePos))
 	st.writeLSNMirror = &w.writeLSNAtomic
+	w.flushedLSNAtomic.Store(st.flushedLSN)
+	st.flushedLSNMirror = &w.flushedLSNAtomic
 	st.onAppend = w.notifyAppend
 	st.onLoopStart = cfg.OnLoopStart
 	st.onLoopEnd = cfg.OnLoopEnd
@@ -858,6 +874,18 @@ func (w *Writer) AppendRaw(stream []byte) (uint64, uint64, error) {
 // batched into a single fdatasync by the writer goroutine.
 func (w *Writer) FlushUpTo(lsn uint64) error {
 	if lsn == 0 {
+		return nil
+	}
+	// Pre-enqueue fast exit (fix-03): if lsn is already durable — the
+	// background walwriter (FlushUpTo(WrittenLSN()) every WalWriterDelay) or
+	// a prior group-flush already synced past it — skip the flush queue and
+	// the channel round-trip entirely. Mirrors PG XLogFlush's
+	// `record <= LogwrtResult.Flush` early return. flushedLSNAtomic is
+	// published only after the fdatasync loop, so any lsn that passes this
+	// check is genuinely durable; a stale (too-low) read merely falls
+	// through to the normal queue path. No sync occurs, so the WalSync
+	// wait-event hooks are intentionally not fired.
+	if lsn <= w.flushedLSNAtomic.Load() {
 		return nil
 	}
 	if w.OnWALSync != nil {
@@ -1863,16 +1891,30 @@ func (s *state) drainBufferBytes(n int64, reason drainReason) error {
 	return nil
 }
 
-// stripeNum returns the caller's process number for stripe selection in
-// core.AppendXLogPayload. Falls back to 0 for goroutines that are not
-// registered in the activity registry (initdb, checkpointer, walreceiver,
-// tests) — they all land on stripe 0, which is always valid.
+// stripeNum returns the caller's backend process number for stripe
+// selection in core.AppendXLogPayload. It reads a goroutine-local id set
+// once per connection (gls.SetBackendID at backend startup) instead of
+// deriving the id via runtime.Stack.
+//
+// Falls back to 0 for goroutines that have no backend id (initdb,
+// checkpointer, walwriter/state.loop, walreceiver, tests) — they land on
+// stripe 0, which is always valid AND is a required invariant: the
+// state.loop slow path (appendPGCompat) runs on the unregistered writer
+// goroutine and its cross-segment pad bookkeeping in insertPosTracker
+// assumes stripe 0. Delivering the exact procNum (not, e.g., a per-P
+// index) preserves today's behavior precisely: registered backends keep
+// their stable per-backend stripe and unregistered goroutines keep 0.
+//
+// The previous implementation obtained the same procNum via
+// activity.LookupCurrentGoroutine(), which called runtime.Stack on EVERY
+// WAL append — 57% of server CPU under pgbench simple-update (see
+// analysis/perf-optimize2, fix-01). gls.BackendID is a pointer load +
+// tiny label scan, allocation-free.
 func (s *state) stripeNum() int32 {
-	_, procNum, ok := activity.LookupCurrentGoroutine()
-	if !ok {
-		return 0
+	if id, ok := gls.BackendID(); ok {
+		return id
 	}
-	return procNum
+	return 0
 }
 
 // drainBufferUpTo drains every byte from walBuf.head through (but
@@ -1954,12 +1996,21 @@ func (s *state) flushUpTo(lsn uint64) error {
 	}
 
 	s.flushedLSN = lsn
-	// M0057-0001: LOG each WAL flush so benchmark runs show WAL writer activity.
+	// Publish the durable LSN AFTER the fdatasync loop above so FlushUpTo's
+	// pre-enqueue fast exit only ever observes a genuinely durable value
+	// (analysis/perf-optimize2, fix-03).
+	if s.flushedLSNMirror != nil {
+		s.flushedLSNMirror.Store(lsn)
+	}
+	// M0057-0001: log each WAL flush so benchmark runs show WAL writer
+	// activity. Demoted to Debug (fix-03): at c=50 simple-update this fired
+	// ~143×/s on the commit critical path while committers waited on the
+	// flush-done channel — a per-barrier structured-log formatting cost.
 	l := s.cfg.Logger
 	if l == nil {
 		l = slog.Default()
 	}
-	l.Info("walwriter flush", "lsn", lsn, "segments_fsynced", len(dirty))
+	l.Debug("walwriter flush", "lsn", lsn, "segments_fsynced", len(dirty))
 	return nil
 }
 

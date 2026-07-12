@@ -90,14 +90,24 @@ Before flushing data pages, WAL is flushed up to each page LSN.
 
 So the write-ahead rule is preserved: corresponding WAL is made durable before page data writeback.
 
-## 7. Current Note on Background walwriter Loop
+## 7. Background walwriter Loop
 
-The background walwriter periodically calls `FlushUpTo(^uint64(0))`.
+The background walwriter periodically calls `FlushUpTo(walWriter.WrittenLSN())`
+every `WalWriterDelay` (default 200 ms), draining and fsyncing any WAL buffered
+since the last flush. `WrittenLSN()` is a lock-free read of the current write
+position, so the target is always in range (an earlier revision passed the
+sentinel `^uint64(0)`, which `flushUpTo` rejected; that bug is fixed).
 
-- Call site: [internal/initdb/open.go](internal/initdb/open.go#L779)
+- Call site: [internal/initdb/open.go](internal/initdb/open.go) — the
+  `WalWriterDelay` ticker loop, `FlushUpTo(walWriter.WrittenLSN())`.
 
-At the same time, `flushUpTo` returns an error when `lsn > writeLSN`, so raw `^uint64(0)` is out of range.
+Since M0107 fix-03, `Writer.FlushUpTo` also takes a **pre-enqueue fast exit**:
+when the requested LSN is already durable (`lsn <= flushedLSNAtomic`), it
+returns immediately without touching the group-flush queue or the writer
+goroutine — the goopg analog of PostgreSQL's `record <= LogwrtResult.Flush`
+early return in `XLogFlush`. Combined with the background pre-flush above, a
+commit whose LSN the walwriter already synced skips WAL I/O and all
+coordination.
 
-- Check: [internal/wal/writer.go](internal/wal/writer.go#L1085)
-
-This does not directly affect the synchronous commit hot path, but alignment with background flush intent is worth reviewing.
+- Fast exit: [internal/wal/writer.go](internal/wal/writer.go) —
+  `FlushUpTo`, `if lsn <= w.flushedLSNAtomic.Load()`.

@@ -55,6 +55,7 @@ import (
 	"github.com/goopg/goopg/internal/config"
 	"github.com/goopg/goopg/internal/control"
 	"github.com/goopg/goopg/internal/executor"
+	"github.com/goopg/goopg/internal/gls"
 	"github.com/goopg/goopg/internal/lockmgr"
 	"github.com/goopg/goopg/internal/mctx"
 	"github.com/goopg/goopg/internal/multixact"
@@ -947,6 +948,11 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 		// Hot-path client-I/O closures (below) capture procNum directly
 		// and do not touch the goroutine map.
 		activity.SetCurrentGoroutine(reg, procNum)
+		// Stamp the same procNum as a goroutine-local id so the WAL insert
+		// path (wal.state.stripeNum) can pick this backend's stripe with a
+		// cheap label read instead of runtime.Stack (analysis/perf-optimize2,
+		// fix-01). Inherited by any helper goroutines this backend spawns.
+		gls.SetBackendID(procNum)
 	}
 	defer func() {
 		if reg != nil {

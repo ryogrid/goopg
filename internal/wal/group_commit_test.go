@@ -80,6 +80,44 @@ func TestGroupCommitSingleCaller(t *testing.T) {
 	}
 }
 
+// TestFlushUpToPreEnqueueFastExit verifies the fix-03 pre-enqueue fast
+// exit: after a flush publishes flushedLSNAtomic, a subsequent FlushUpTo
+// for an already-durable LSN returns without work and does not enqueue a
+// group-flush request.
+func TestFlushUpToPreEnqueueFastExit(t *testing.T) {
+	dir := t.TempDir()
+	w, err := NewWriter(Config{WALDir: dir})
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	defer w.Close()
+
+	_, end, err := w.Append([]byte("durable"))
+	if err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if err := w.FlushUpTo(end); err != nil {
+		t.Fatalf("FlushUpTo: %v", err)
+	}
+	// The mirror must be published after the sync barrier, otherwise the
+	// fast exit can never trigger.
+	if got := w.flushedLSNAtomic.Load(); got < end {
+		t.Fatalf("flushedLSNAtomic=%d not advanced to flushed end=%d", got, end)
+	}
+
+	// A second flush at or below the durable LSN must take the fast exit:
+	// no request is appended to the group-flush queue.
+	if err := w.FlushUpTo(end); err != nil {
+		t.Fatalf("FlushUpTo(already-durable): %v", err)
+	}
+	w.fg.mu.Lock()
+	qlen := len(w.fg.queue)
+	w.fg.mu.Unlock()
+	if qlen != 0 {
+		t.Errorf("already-durable FlushUpTo enqueued %d request(s); want 0 (fast exit)", qlen)
+	}
+}
+
 // TestGroupCommitBatchingDelay verifies that commitSiblings+1 concurrent
 // callers all complete (the batching delay path is exercised without hang
 // or error). M0099-0003 (re-enabled after Path A race fix). M0099.

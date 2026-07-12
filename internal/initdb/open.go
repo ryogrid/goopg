@@ -185,9 +185,9 @@ type OpenOptions struct {
 	WALSegmentSize int64
 
 	// WalWriterDelay controls the period of the background WAL writer
-	// loop (M0042-0003). The loop calls FlushUpTo(maxUint64) every
-	// WalWriterDelay to ensure buffered WAL bytes reach disk even when
-	// no commits or checkpoints are in flight. 0 disables the loop
+	// loop (M0042-0003). The loop calls FlushUpTo(walWriter.WrittenLSN())
+	// every WalWriterDelay to ensure buffered WAL bytes reach disk even
+	// when no commits or checkpoints are in flight. 0 disables the loop
 	// (used by tests that don't need background flushing). Default in
 	// production: 200ms (mirrors upstream's wal_writer_delay GUC).
 	WalWriterDelay time.Duration

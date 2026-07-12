@@ -319,8 +319,10 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	}
 	if v := os.Getenv("GOMEMLIMIT"); v != "" {
 		// Go runtime already reads GOMEMLIMIT at startup, but log it
-		// so operators know it was applied.
-		cur := debug.SetMemoryLimit(debug.SetMemoryLimit(1<<63 - 1))
+		// so operators know it was applied. A negative argument reads the
+		// currently-set limit without changing it (the previous double-swap
+		// logged the temporary max-int sentinel, not the real limit).
+		cur := debug.SetMemoryLimit(-1)
 		logger.Info("GOMEMLIMIT applied", "bytes", cur)
 	}
 
