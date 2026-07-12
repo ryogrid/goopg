@@ -96,6 +96,9 @@
                                         # (change requires restart)
 #wal_writer_flush_after = 1048576       # 0-1073741824 bytes; 0 fsyncs every round
                                         # (change requires restart)
+#commit_delay = 0                       # 0-100000 microseconds
+#commit_siblings = 5                    # 0-1000 range; min concurrent flushers
+                                        # before commit_delay applies
 #wal_init_zero = on                     # zero-fill new WAL segments
                                         # (change requires restart)
 #wal_sync_method = fdatasync            # fsync, fdatasync, open_sync, open_datasync

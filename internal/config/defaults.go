@@ -488,6 +488,24 @@ func BuildDefaultRegistry() *Registry {
 		Scope:   ScopeServer,
 	}))
 
+	// commit_delay / commit_siblings drive the backend-driven WAL flush group
+	// commit (docs/design/wal-backend-flush/). The would-be flush holder sleeps
+	// commit_delay microseconds — holding the WAL write lock — to widen the
+	// batch, but only when at least commit_siblings other flushers are in
+	// flight. PG defaults: commit_delay 0 (no delay), commit_siblings 5.
+	r.MustRegister(NewVariable(Variable{
+		Name: "commit_delay", Type: TypeInt, BootVal: "0",
+		MinVal: 0, MaxVal: 100000,
+		Context: ContextUserset,
+		Scope:   ScopeServer,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "commit_siblings", Type: TypeInt, BootVal: "5",
+		MinVal: 0, MaxVal: 1000,
+		Context: ContextUserset,
+		Scope:   ScopeServer,
+	}))
+
 	// bgwriter_delay controls how often (in milliseconds) the background
 	// writer goroutine wakes up to flush dirty buffer-pool pages.
 	// Default 200ms mirrors upstream's bgwriter_delay GUC (M0048-0003).

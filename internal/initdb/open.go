@@ -155,6 +155,13 @@ type OpenOptions struct {
 	// docs/design/0007-0002-fdatasync-commit-path.md.
 	WALSyncMethod string
 
+	// CommitDelayUs / CommitSiblings forward to wal.Config for the
+	// backend-driven flush group commit (docs/design/wal-backend-flush/).
+	// Mirror the `commit_delay` (µs) and `commit_siblings` GUCs; PG defaults
+	// 0 / 5 (a zero CommitSiblings resolves to 5 in wal.NewWriter).
+	CommitDelayUs  int64
+	CommitSiblings int
+
 	// WALMinSize forwards to wal.Config.MinWALSize (bytes), the floor
 	// on how many obsolete WAL segments RemoveOldSegments recycles
 	// (zero-fill + rename into a future slot) instead of unlinking.
@@ -377,6 +384,8 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		SyncMethod:         opts.WALSyncMethod,
 		MinWALSize:         opts.WALMinSize,
 		MaxWALSize:         opts.WALMaxSize,
+		CommitDelayUs:      opts.CommitDelayUs,
+		CommitSiblings:     opts.CommitSiblings,
 		// M0101-0001: emit PG-compatible XLOG page headers so pg_waldump
 		// can parse the WAL segments. SystemID is embedded in every page
 		// header for cross-segment consistency checking.

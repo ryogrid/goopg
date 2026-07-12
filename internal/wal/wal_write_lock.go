@@ -61,6 +61,11 @@ func (l *walWriteLock) acquireOrWait(closed <-chan struct{}) (held bool, err err
 	}
 }
 
+// lock is the plain (blocking) acquire used by callers that are NOT part of
+// group commit — the loop-side slow-append and segment-recycle paths, and the
+// shutdown flush — mirroring PG's plain LWLockAcquire. Pair with release().
+func (l *walWriteLock) lock() { l.mu.Lock() }
+
 // release unlocks the lock and wakes every waiter parked on the current
 // generation, then swaps in a fresh generation for the next holders.
 func (l *walWriteLock) release() {

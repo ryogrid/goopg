@@ -25,6 +25,18 @@ type groupFlushReq struct {
 	err  error         // set before done is closed
 }
 
+// backendFlush selects the backend-driven WAL flush path (each committing
+// goroutine performs its own write+fdatasync under the WAL write lock,
+// docs/design/wal-backend-flush/). When false, the legacy group-commit queue
+// (flushGroup / handleGroupFlush, retired in slice 6) is used instead. It is a
+// compile-time const so the two concurrency protocols never run against the
+// same files/dirty state at once; it exists only as a rollback lever until the
+// legacy path is deleted.
+const backendFlush = true
+
+// flushErr wraps a flush error for atomic publication in Writer.stickyErr.
+type flushErr struct{ err error }
+
 // flushGroup holds the shared queue and signal channel for WAL group
 // commit (M0098-0002). Multiple concurrent FlushUpTo callers append
 // their requests and the writer goroutine drains the entire batch in
@@ -82,6 +94,16 @@ var (
 type Config struct {
 	WALDir      string
 	SegmentSize int64
+
+	// CommitDelayUs / CommitSiblings are the backend-driven flush GUCs
+	// (docs/design/wal-backend-flush/). CommitDelayUs is PostgreSQL's
+	// commit_delay in microseconds (BootVal 0 = no delay); the flush holder
+	// sleeps this long, holding the WAL write lock, only when at least
+	// CommitSiblings other flushers are in flight, to widen the batch.
+	// CommitSiblings is commit_siblings (BootVal 5). Zero values are treated
+	// as the PG defaults (0 / 5) by NewWriter.
+	CommitDelayUs  int64
+	CommitSiblings int
 
 	// Preallocate, when true, zero-fills new segment files to
 	// SegmentSize and fsyncs them at creation time so subsequent
@@ -351,6 +373,16 @@ type Writer struct {
 	// through the writer's loop. nil when
 	memRing *MemRing
 
+	// --- backend-driven flush (docs/design/wal-backend-flush/, slice 3) ---
+	// writeMuOf reaches the state's WAL write lock; flushWaiters counts
+	// in-flight FlushUpTo callers (the commit_siblings gate); commitDelayUs /
+	// commitSiblings snapshot the GUCs; stickyErr lets losing committers
+	// return a flush error without re-acquiring the lock (stampede guard).
+	flushWaiters   atomic.Int32
+	commitDelayUs  atomic.Int64
+	commitSiblings atomic.Int32
+	stickyErr      atomic.Pointer[flushErr]
+
 	// stateRef is a reference to the state struct, needed by
 	// Writer.Append to call encodeAndBuffer directly (M0026
 	// concurrent append path).
@@ -451,6 +483,16 @@ type state struct {
 	// it via drainedLSNAtomic. Single-writer-at-a-time (the WAL-write-lock
 	// holder), so a plain Store is safe.
 	drainedLSNMirror *atomic.Uint64
+
+	// writeMu is the WAL write lock (PG WALWriteLock analog): it serialises all
+	// segment write+fdatasync and the files/dirty maps across the backend flush
+	// holders (docs/design/wal-backend-flush/ 03 §3.1). In slice 3 the flush
+	// holder additionally takes appendMu.Lock around its drain (order
+	// appendMu→writeMu at the append sites; writeMu→appendMu at the flusher),
+	// which quiesces in-flight appenders — the WaitXLogInsertionsToFinish
+	// analog — so the loop-side append/recycle paths need not each take writeMu
+	// until slice 7 moves the drain off appendMu.
+	writeMu *walWriteLock
 
 	// onAppend, when non-nil, is invoked after every successful
 	// append to wake subscribers (RecordIterators, walsender
@@ -625,8 +667,27 @@ func NewWriter(cfg Config) (*Writer, error) {
 		st.memRing,
 	)
 	st.core = w.core // share core pointer so state.append can call AppendXLogPayload
+	st.writeMu = newWALWriteLock()
+	// Snapshot the backend-flush GUCs (PG defaults 0 / 5 when unset).
+	w.commitDelayUs.Store(cfg.CommitDelayUs)
+	sib := int32(cfg.CommitSiblings)
+	if sib <= 0 {
+		sib = 5
+	}
+	w.commitSiblings.Store(sib)
 	go st.loop(w.ops, w.done)
 	return w, nil
+}
+
+// SetCommitDelayUs / SetCommitSiblings live-update the backend-flush GUCs
+// (SIGHUP). commit_delay is in microseconds (0 = no delay); commit_siblings
+// clamps to at least 1.
+func (w *Writer) SetCommitDelayUs(us int64) { w.commitDelayUs.Store(us) }
+func (w *Writer) SetCommitSiblings(n int) {
+	if n < 1 {
+		n = 1
+	}
+	w.commitSiblings.Store(int32(n))
 }
 
 // PageHeadersEnabled reports whether the writer is emitting
@@ -910,6 +971,133 @@ func (w *Writer) FlushUpTo(lsn uint64) error {
 	if w.OnWALSyncDone != nil {
 		defer w.OnWALSyncDone()
 	}
+	if backendFlush {
+		return w.flushUpToBackend(lsn)
+	}
+	return w.flushUpToViaQueue(lsn)
+}
+
+// flushUpToBackend is the PG-parity backend-driven flush (slice 3): the calling
+// goroutine performs its own write+fdatasync under the WAL write lock; group
+// commit is emergent — the holder flushes the aggregate written frontier, and
+// losers, woken on release, re-check the durable LSN and usually return with
+// zero I/O (docs/design/wal-backend-flush/ 03 §3.3).
+func (w *Writer) flushUpToBackend(lsn uint64) error {
+	w.flushWaiters.Add(1)
+	defer w.flushWaiters.Add(-1)
+	st := w.stateRef
+	// Compute a published contiguous frontier ≥ lsn BEFORE taking the write
+	// lock (PG's WaitXLogInsertionsToFinish-before-WALWriteLock discipline): a
+	// stripe insert for an LSN below ours may still be in flight, holding the
+	// contiguous tail back below lsn, so we must let it publish first. Done
+	// outside writeMu so the flusher never blocks fast-path appends (RLock)
+	// while draining — that is what keeps commits batching (04 §4.4).
+	frontier := st.waitInsertionsToFinish(lsn)
+	for {
+		if lsn <= w.flushedLSNAtomic.Load() {
+			return nil // covered by another holder's flush
+		}
+		held, err := st.writeMu.acquireOrWait(w.done)
+		if err != nil {
+			return err // ErrClosed
+		}
+		if !held {
+			// Woken without holding: recheck durability, then the sticky
+			// error (a failing disk) so we return without re-acquiring the
+			// lock and hammering the device.
+			if lsn <= w.flushedLSNAtomic.Load() {
+				return nil
+			}
+			if fe := w.stickyErr.Load(); fe != nil {
+				return fe.err
+			}
+			continue
+		}
+		return w.flushAsHolder(lsn, frontier)
+	}
+}
+
+// flushAsHolder runs the holder section under writeMu ONLY (never appendMu, so
+// fast-path RLock appenders keep running during the fsync — the drain is safe
+// against them via the atomic ring, and writeMu guarantees a single drainer).
+// The deferred release is mandatory: goopg recovers backend-goroutine panics
+// per connection, so a bare unlock would leak writeMu forever on any panic in
+// xlogWrite, permanently wedging every commit (04 §4.7).
+func (w *Writer) flushAsHolder(lsn, frontier uint64) (err error) {
+	st := w.stateRef
+	defer st.writeMu.release()
+	if lsn <= st.flushedLSN {
+		return nil // covered under the lock
+	}
+	if d := w.commitDelayUs.Load(); d > 0 && w.flushWaiters.Load() >= w.commitSiblings.Load() {
+		// Holder-only sleep, holding the write lock, to widen the batch
+		// (PG commit_delay; BootVal 0 → never sleeps).
+		time.Sleep(time.Duration(d) * time.Microsecond)
+	}
+	// Widen the frontier with records published since we computed it — no
+	// waiting (publish-only), the group-commit batching step.
+	if t := st.publishedFrontier(); t > frontier {
+		frontier = t
+	}
+	err = st.xlogWrite(writeRqst{write: frontier, flush: frontier})
+	if err != nil {
+		w.stickyErr.Store(&flushErr{err: err})
+		return err
+	}
+	w.stickyErr.Store(nil)
+	if lsn > st.flushedLSN {
+		// The caller asked to flush beyond what was ever written.
+		return fmt.Errorf("%w: have %d, need %d", ErrLSNNotWritten, st.flushedLSN, lsn)
+	}
+	return nil
+}
+
+// publishedFrontier returns the current published contiguous WAL frontier
+// (the highest LSN whose bytes are all safely in the ring/segments), without
+// waiting. In pageHeaders mode it is the stripe core's PublishUpTo result; in
+// legacy mode appends complete atomically under appendMu, so it is
+// writeLSNMirror.
+func (s *state) publishedFrontier() uint64 {
+	if !s.pageHeaders {
+		if s.writeLSNMirror != nil {
+			return s.writeLSNMirror.Load()
+		}
+		return 0
+	}
+	curr, _ := s.core.Load()
+	return uint64(s.core.PublishUpTo(int64(curr)))
+}
+
+// waitInsertionsToFinish spins until the published contiguous frontier reaches
+// lsn (the goopg WaitXLogInsertionsToFinish analog). It is called BEFORE
+// acquiring writeMu. The in-flight window is a bounded stripe memcpy, so a
+// yield-spin with escalation suffices. Legacy mode has no stripe in-flight
+// window (appends publish atomically under appendMu), so it returns the written
+// frontier immediately.
+func (s *state) waitInsertionsToFinish(lsn uint64) uint64 {
+	if !s.pageHeaders {
+		if s.writeLSNMirror != nil {
+			if m := s.writeLSNMirror.Load(); m >= lsn {
+				return m
+			}
+		}
+		return lsn
+	}
+	for i := 0; ; i++ {
+		if f := s.publishedFrontier(); f >= lsn {
+			return f
+		}
+		if i < 64 {
+			runtime.Gosched()
+		} else {
+			time.Sleep(10 * time.Microsecond)
+		}
+	}
+}
+
+// flushUpToViaQueue is the legacy group-commit path (retired in slice 6). Kept
+// compilable behind the backendFlush const as a rollback lever.
+func (w *Writer) flushUpToViaQueue(lsn uint64) error {
 	req := &groupFlushReq{lsn: lsn, done: make(chan struct{})}
 	w.fg.mu.Lock()
 	w.fg.queue = append(w.fg.queue, req)
@@ -1438,6 +1626,14 @@ func (s *state) append(payload []byte) (uint64, uint64, error) {
 	}
 
 	// Non-pageHeaders (legacy binary format): original encodeRecord path.
+	// This slow append drains the ring and mutates files/dirty/head, so it
+	// takes writeMu to serialise against the backend flush holder (which is
+	// writeMu-only, slice 3). Order: writeMu → appendMu (the flusher takes
+	// writeMu only, fast-path tryAppend takes appendMu.RLock only, so no
+	// cycle). The hot fast path (tryAppend) never reaches here.
+	s.writeMu.lock()
+	defer s.writeMu.release()
+
 	record := encodeRecord(payload)
 	realRecLen := len(record)
 
@@ -1512,6 +1708,12 @@ func (s *state) append(payload []byte) (uint64, uint64, error) {
 //
 // Called exclusively when s.pageHeaders == true.
 func (s *state) appendPGCompat(payload []byte) (uint64, uint64, error) {
+	// Slow (loop) append path: drains the ring and mutates files/dirty/head, so
+	// it takes writeMu to serialise against the backend flush holder (slice 3).
+	// Order: writeMu → appendMu. The hot fast path (tryAppend) never reaches here.
+	s.writeMu.lock()
+	defer s.writeMu.release()
+
 	// Conservative emitted size: paddedLen + max page-header overhead
 	// (40-byte long PHD at a segment boundary + 24-byte contrecord header).
 	_, paddedLen := predictXLogRecordLen(payload)
@@ -1668,6 +1870,11 @@ func (s *state) appendRaw(stream []byte) (uint64, uint64, error) {
 	if len(stream) == 0 {
 		return 0, 0, ErrEmptyPayload
 	}
+	// Walreceiver (standby) append: drains + resets the ring and mutates
+	// files/dirty, so it takes writeMu to serialise against the backend flush
+	// holder (slice 3). Order: writeMu → appendMu.
+	s.writeMu.lock()
+	defer s.writeMu.release()
 
 	if s.walBuf == nil || !s.walBuf.canHold(len(stream)) {
 		s.appendMu.Lock()
@@ -2155,6 +2362,15 @@ func (s *state) removeOldSegments(keepLSN uint64, distanceEstimateBytes, complet
 	// RemoveOldXlogFiles, which walks toward the retention cutoff from
 	// the current end of WAL).
 	sort.Slice(stale, func(i, j int) bool { return stale[i].segNo > stale[j].segNo })
+
+	// Serialise the s.files / s.dirty map mutations below against the backend
+	// flush holder, which iterates s.dirty and opens s.files under writeMu
+	// during xlogWrite (docs/design/wal-backend-flush/ slice 3). Without this,
+	// a concurrent recycle and flush race the maps → fatal concurrent map
+	// access. Recycle is checkpoint-rare, so holding writeMu across the (slow)
+	// file rename/remove I/O here is acceptable; slice 7 may narrow it.
+	s.writeMu.lock()
+	defer s.writeMu.release()
 
 	nextTarget := keepSeg
 	anyRecycled := false

@@ -81,6 +81,32 @@ func TestWALWriteLockCloseWakesWaiter(t *testing.T) {
 	l.release()
 }
 
+// TestWALWriteLockReleasedOnPanic pins the M4 mitigation: flushAsHolder uses a
+// deferred release so a panic in xlogWrite (recovered per-connection by the
+// server) does not leak the lock and wedge every future commit. This exercises
+// the same defer-release-then-repanic pattern at the primitive level.
+func TestWALWriteLockReleasedOnPanic(t *testing.T) {
+	l := newWALWriteLock()
+	done := make(chan struct{})
+
+	func() {
+		defer func() { _ = recover() }()
+		held, err := l.acquireOrWait(done)
+		if !held || err != nil {
+			t.Fatalf("acquire: held=%v err=%v", held, err)
+		}
+		defer l.release() // the flushAsHolder pattern
+		panic("boom in xlogWrite")
+	}()
+
+	// After the recovered panic the lock must be free for the next committer.
+	held, err := l.acquireOrWait(done)
+	if !held || err != nil {
+		t.Fatalf("lock not released after panic: held=%v err=%v", held, err)
+	}
+	l.release()
+}
+
 // TestWALWriteLockGroupCommitModel stresses the missed-wakeup / coverage
 // properties by modeling emergent group commit: N workers each want a distinct
 // "flush target"; a holder advances a shared durable counter to at least its

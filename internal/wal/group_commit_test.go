@@ -58,6 +58,14 @@ func TestGroupCommitBatchesFlushes(t *testing.T) {
 			t.Errorf("FlushUpTo[%d]: %v", i, err)
 		}
 	}
+
+	// Emergent group commit: N concurrent flushes of already-written LSNs must
+	// be satisfied by FEWER than N fdatasyncs — the first holder flushes the
+	// aggregate frontier and the losers return with zero I/O (observable
+	// effect, not queue mechanics). Backend-driven path, slice 3.
+	if got := w.walBufferCounters.fsyncCount.Sum(); got >= N {
+		t.Errorf("fsyncCount = %d for %d concurrent flushes; want < %d (no batching)", got, N, N)
+	}
 }
 
 // TestGroupCommitSingleCaller verifies FlushUpTo still works for a
@@ -105,16 +113,15 @@ func TestFlushUpToPreEnqueueFastExit(t *testing.T) {
 		t.Fatalf("flushedLSNAtomic=%d not advanced to flushed end=%d", got, end)
 	}
 
-	// A second flush at or below the durable LSN must take the fast exit:
-	// no request is appended to the group-flush queue.
+	// A second flush at or below the durable LSN must take the fast exit and
+	// do NO additional fdatasync (the observable effect of the fix-03
+	// pre-lock early return; the backend-driven path has no queue to inspect).
+	before := w.walBufferCounters.fsyncCount.Sum()
 	if err := w.FlushUpTo(end); err != nil {
 		t.Fatalf("FlushUpTo(already-durable): %v", err)
 	}
-	w.fg.mu.Lock()
-	qlen := len(w.fg.queue)
-	w.fg.mu.Unlock()
-	if qlen != 0 {
-		t.Errorf("already-durable FlushUpTo enqueued %d request(s); want 0 (fast exit)", qlen)
+	if after := w.walBufferCounters.fsyncCount.Sum(); after != before {
+		t.Errorf("already-durable FlushUpTo did %d extra fdatasync(s); want 0 (fast exit)", after-before)
 	}
 }
 
