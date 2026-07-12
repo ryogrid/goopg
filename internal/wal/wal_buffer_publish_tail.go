@@ -45,15 +45,20 @@ package wal
 //
 // Concurrent safety. b.tail is `atomic.Int64` (see
 // docs/design/0107-0007r-wal-buffer-tail-atomic.md). publishTail
-// reads it with Load and writes it with Store; resident /
-// readForDrain / readAt read it with Load. A single drain
-// goroutine's publishTail can therefore advance the watermark
-// while concurrent stripe writers' readers observe it without a
-// data race. publishTail itself takes no lock — it is intended to
-// run on a single drain goroutine; concurrent publishers would
-// still be monotonic-by-Load+Store but would lose updates under
-// CAS races (acceptable only if the caller subsumes that into the
-// "monotonic snapshot" contract).
+// advances the watermark with a CAS-max loop, so ANY number of
+// concurrent publishers are safe and none is lost: the watermark
+// only ever moves forward to the highest published value. This is a
+// hard requirement of the backend-driven WAL write path
+// (docs/design/wal-backend-flush/ 04 §4.3, M2), where publishTail is
+// a hot multi-caller path — every waiting committer's
+// waitInsertionsToFinish spin, the flush holder's under-lock widen,
+// the walwriter's pre-lock frontier, and the existing fast-path
+// RLock stripe appenders all call it. A plain Load-then-Store loses
+// a racing higher publish (A loads 90, B stores 105, A stores 100 →
+// tail regresses to 100), stranding reservedBytes and shrinking the
+// effective cap so tryReserve can double-grant ring space over
+// undrained WAL bytes — silent corruption. resident / readForDrain /
+// readAt read the watermark with Load, unchanged.
 //
 // Lock-ordering tier (leaf publisher; the publisher never reaches
 // back up the chain):
@@ -67,10 +72,15 @@ func (b *walBuffer) publishTail(safeTail int64) int64 {
 	if b == nil {
 		return 0
 	}
-	cur := b.tail.Load()
-	if safeTail <= cur {
-		return cur
+	// CAS-max: advance monotonically so a concurrent higher publish is
+	// never clobbered by a lower one (see "Concurrent safety" above).
+	for {
+		cur := b.tail.Load()
+		if safeTail <= cur {
+			return cur
+		}
+		if b.tail.CompareAndSwap(cur, safeTail) {
+			return safeTail
+		}
 	}
-	b.tail.Store(safeTail)
-	return safeTail
 }
