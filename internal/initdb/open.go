@@ -1073,6 +1073,17 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: system catalog load: %w", err)
 	}
+	// fix-05 (analysis/perf-optimize2): the ~30 catalog-recovery passes below
+	// each scan the entire pg_wal for their own record kinds. The WAL is
+	// immutable here (the writer starts only after recovery), so memoize the
+	// decode: read+decode the WAL once and share it across every pass instead
+	// of ~20 full re-reads (the dominant startup allocation). Bracketed tightly
+	// around the recovery block; the deferred End is a safety net for the error
+	// return paths, and an explicit End (below, after the last pass) frees the
+	// decoded records promptly.
+	wal.BeginRecoveryCache(filepath.Join(abs, "pg_wal"))
+	defer wal.EndRecoveryCache()
+
 	// M0110-0003: restore user-created schemas (CREATE/DROP SCHEMA) from the
 	// WAL BEFORE loading user tables. goopg has no per-schema on-disk namespace,
 	// so the catalog's schema registry is reconstructed here from the WAL
@@ -1888,6 +1899,10 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: operator class/family DDL replay: %w", err)
 	}
+
+	// fix-05: last WAL-scanning recovery pass done — release the memoized WAL
+	// decode now (the deferred EndRecoveryCache remains as a harmless no-op).
+	wal.EndRecoveryCache()
 
 	// pg_sequences: virtual catalog view listing all registered sequences.
 	// M0097-0024.
