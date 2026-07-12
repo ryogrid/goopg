@@ -26,13 +26,16 @@ type pacedFlusher interface {
 	FlushAllPaced(pacer func(progress float64) error) error
 }
 
-// epochResetter is implemented by *storage.Pool so the
-// checkpointer can clear the per-page "FPI emitted this epoch"
-// flag after a successful checkpoint. Optional — checkpointers
-// constructed in tests with a flusher that doesn't satisfy this
-// interface keep working.
-type epochResetter interface {
-	ResetCheckpointEpoch()
+// redoPublisher is implemented by *storage.Pool so the checkpointer can
+// publish the redo pointer at checkpoint START (before the buffer flush) —
+// PG CreateCheckPoint order. Publication is the FPI epoch boundary: the
+// pool's per-record pd_lsn<=redo test keys on it, replacing the old
+// post-checkpoint ResetCheckpointEpoch sweep whose reset-after-redo-sample
+// ordering left an image-less replay window (perf-optimize3-dash/03).
+// Optional — checkpointers constructed in tests with a flusher that doesn't
+// satisfy this interface keep working.
+type redoPublisher interface {
+	PublishRedoBarrier(sample func() uint64) uint64
 }
 
 // dataFileSyncer is implemented by anything that can fdatasync every
@@ -477,6 +480,41 @@ func (c *Checkpointer) runCheckpoint(ctx context.Context, spread, shutdown bool)
 	c.cfg.Logger.Info("checkpoint start", "type", checkpointType)
 	pacer := c.buildPacer(ctx, spread, start)
 
+	// perf-optimize3-dash/03: compute AND PUBLISH the redo pointer BEFORE
+	// the buffer flush (PG CreateCheckPoint order). The published pointer is
+	// the FPI-epoch boundary for the pool's pd_lsn<=redo image test; the
+	// flush below then trivially covers everything <= redo, and every page's
+	// first post-redo modification carries a fresh image — closing the
+	// image-less replay window the old post-record epoch reset left open.
+	computeRedo := func() uint64 {
+		pos := int64(0)
+		if vr, ok := c.wal.(volumeReporter); ok {
+			pos = int64(vr.WrittenLSN())
+		}
+		segSize := c.cfg.SegmentSize
+		if segSize <= 0 {
+			segSize = DefaultSegmentSize
+		}
+		leading := 0
+		if pos%XLOGBlockSize == 0 {
+			leading = SizeOfXLogShortPHD
+			if segSize > 0 && pos%segSize == 0 {
+				leading = SizeOfXLogLongPHD
+			}
+		}
+		return uint64(pos + int64(leading))
+	}
+	var redoLSN0 uint64
+	if rp, ok := c.flusher.(redoPublisher); ok {
+		// The barrier waits out every in-flight FPI-decision->append critical
+		// section BEFORE sampling the frontier, so no record decided against
+		// the old redo can land at an LSN >= the new redo (PG's
+		// fpw_lsn-under-insert-locks analog; adversarial review F1).
+		redoLSN0 = rp.PublishRedoBarrier(computeRedo)
+	} else {
+		redoLSN0 = computeRedo()
+	}
+
 	flushStart := time.Now()
 	if err := c.flushDirty(pacer); err != nil {
 		return fmt.Errorf("flush dirty pages: %w", err)
@@ -502,25 +540,9 @@ func (c *Checkpointer) runCheckpoint(ctx context.Context, spread, shutdown bool)
 		}
 	}
 	c.writeTimeMs.Add(time.Since(flushStart).Milliseconds())
-	// M0102-0007: pre-compute the 0-based redo LSN so the
-	// PG-compatible checkpoint record carries the correct
-	// checkPoint.redo — PG's xlogreader validates it.
-	pos := int64(uint64(0))
-	if vr, ok := c.wal.(volumeReporter); ok {
-		pos = int64(vr.WrittenLSN())
-	}
-	segSize := c.cfg.SegmentSize
-	if segSize <= 0 {
-		segSize = DefaultSegmentSize
-	}
-	leading := 0
-	if pos%XLOGBlockSize == 0 {
-		leading = SizeOfXLogShortPHD
-		if segSize > 0 && pos%segSize == 0 {
-			leading = SizeOfXLogLongPHD
-		}
-	}
-	redoLSN0 := uint64(pos + int64(leading))
+	// M0102-0007: redoLSN0 (computed and published above, BEFORE the flush)
+	// is what the PG-compatible checkpoint record carries — PG's xlogreader
+	// validates it.
 	// M0122-0009 follow-up: feed this cycle's redo distance into the
 	// moving-average estimate SlotAwareRetainer consults for
 	// XLOGfileslop-style WAL-segment recycling. Must run before the
@@ -628,12 +650,10 @@ func (c *Checkpointer) runCheckpoint(ctx context.Context, spread, shutdown bool)
 	} else {
 		c.numRequested.Add(1)
 	}
-	// Open a new full-page-image epoch: the next mutation of each
-	// page must emit a fresh FPI so crash recovery from this
-	// checkpoint can replay it on a torn page.
-	if er, ok := c.flusher.(epochResetter); ok {
-		er.ResetCheckpointEpoch()
-	}
+	// NOTE (perf-optimize3-dash/03): the FPI epoch boundary is the redo
+	// publication at checkpoint START above — there is no post-record epoch
+	// reset any more (the old ResetCheckpointEpoch sweep here raced writers
+	// between the redo sample and the sweep, leaving image-less records).
 	// Slot-aware WAL retention: prune segments that are no longer
 	// needed by either crash recovery (everything below this
 	// checkpoint LSN is now redo-redundant) or any live

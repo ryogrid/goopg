@@ -81,7 +81,7 @@ func TestPoolHighConcurrencyPinUnpinStress(t *testing.T) {
 				}
 				pinOK.Add(1)
 				// Mix a MarkDirty into roughly 1/8 of iterations so the
-				// FPI path (atomic fpiSinceCheckpoint flag) is exercised
+				// FPI path (pd_lsn<=publishedRedo needsImage test) is exercised
 				// alongside Pin/Unpin churn.
 				if r.Intn(8) == 0 {
 					pool.MarkDirty(s)

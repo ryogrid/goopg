@@ -77,10 +77,24 @@ consumer):
      close. Since the load-bearing catalog-insert path
      (`MarkDirtyLogicalChange`) sits exactly in that window (doc 02 §1a),
      shrink-not-close is unacceptable.
-4. **Ordering invariant (restated)**: publish redo → flush data+CLOG (flush
-   now trivially covers everything ≤ redo) → append record with published
-   redo → pg_control. `FlushCLOGFn`'s error-fails-checkpoint contract is
-   untouched (C2's dependency, perf-optimize3/05/02 §I3).
+4. **Publication barrier (rev 3 — implementation review F1)**: option (b)
+   alone still left a decide→append race: a writer whose `needsImage` ran
+   against the OLD redo could be descheduled, the publication land, and its
+   record then append at an LSN ≥ the NEW redo with no image (PG guards this
+   with the `fpw_lsn` recheck under the WAL insert locks,
+   xlog.c XLogInsertRecord). Implemented as `Pool.fpiPublishMu`
+   (sync.RWMutex): the three MarkDirty* variants hold RLock across
+   decision→append; `PublishRedoBarrier(sample)` takes the exclusive lock,
+   THEN samples the WAL frontier, then stores — so every straddling writer's
+   record is below the sampled frontier and covered by the previous epoch's
+   image on any replay from the new redo. `MarkDirtyForceFPI` needs no lock
+   (it always images). Pinned by
+   `storage.TestPublishRedoBarrierWaitsForInFlightDecision`.
+5. **Ordering invariant (restated)**: publish redo (under the barrier) →
+   flush data+CLOG (flush now trivially covers everything ≤ redo) → append
+   record with published redo → pg_control. `FlushCLOGFn`'s
+   error-fails-checkpoint contract is untouched (C2's dependency,
+   perf-optimize3/05/02 §I3).
 
 ### Interaction with C2 (CLOG fsync removal)
 

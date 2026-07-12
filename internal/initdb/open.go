@@ -1032,6 +1032,15 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// the OID counter survives a crash (pg_control is durably updated at
 	// every checkpoint).
 	if pgCtrl, pce := control.ReadControlFile(abs); pce == nil && pgCtrl != nil {
+		// perf-optimize3-dash/03: seed the pool's published redo pointer from
+		// the last checkpoint so the first post-restart FPI epoch is anchored
+		// at the same point crash recovery replays from. Without this seed
+		// (redo=0), pages whose pd_lsn already exceeds 0 would skip their
+		// first-touch image for the whole first checkpoint interval. The
+		// pd_lsn<=redo test is self-healing across restarts within an epoch:
+		// replay-from-redo always encounters each page's original image
+		// before any of its incrementals.
+		pool.PublishRedoRecPtr(pgCtrl.CheckPointCopyRedo)
 		cat.AdvanceNextOIDPast(pgCtrl.CheckPointCopyNextOid)
 		// M0106-0013: also advance txnMgr.NextXID from the checkpoint's
 		// nextXid so snapshots taken after restart have Xmax >= the

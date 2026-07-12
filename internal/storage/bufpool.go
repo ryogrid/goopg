@@ -35,12 +35,12 @@ const (
 )
 
 // slotState helpers — extract fields from a packed state word.
-func statePin(st uint64) uint64    { return st & slotPinMask }
-func stateUsage(st uint64) uint64  { return (st & slotUsageMask) >> slotUsageShift }
-func stateGen(st uint64) uint32    { return uint32((st & slotGenMask) >> slotGenShift) }
-func stateValid(st uint64) bool    { return st&slotValidBit != 0 }
-func stateDirty(st uint64) bool    { return st&slotDirtyBit != 0 }
-func stateIO(st uint64) bool       { return st&slotIOBit != 0 }
+func statePin(st uint64) uint64   { return st & slotPinMask }
+func stateUsage(st uint64) uint64 { return (st & slotUsageMask) >> slotUsageShift }
+func stateGen(st uint64) uint32   { return uint32((st & slotGenMask) >> slotGenShift) }
+func stateValid(st uint64) bool   { return st&slotValidBit != 0 }
+func stateDirty(st uint64) bool   { return st&slotDirtyBit != 0 }
+func stateIO(st uint64) bool      { return st&slotIOBit != 0 }
 
 // Slot is one buffer-pool entry holding one Page. Callers receive
 // *Slot from Pin and return it via Unpin. Direct field access is
@@ -61,15 +61,6 @@ type Slot struct {
 	// state packs pinCount, usageCount, dirty, valid, ioInflight, gen
 	// into a single 64-bit atomic word for lock-free Pin/Unpin.
 	state atomic.Uint64
-
-	// fpiSinceCheckpoint records whether a full-page-image WAL
-	// record has already been emitted for this page in the current
-	// checkpoint epoch. It is read/written atomically so that the FPI
-	// path is safe to call while the caller already holds contentMu
-	// (e.g. test pattern: s.Lock(); s.Page()[i] = b; MarkDirty(s);
-	// s.Unlock()).  The checkpointer clears it across all slots after
-	// a successful checkpoint via Pool.ResetCheckpointEpoch.
-	fpiSinceCheckpoint atomic.Bool
 
 	// contentMu guards the Page bytes for read/write. The pool does
 	// not hold any global lock while this is taken.
@@ -137,6 +128,21 @@ type Pool struct {
 	logChangeRecord func(payload []byte) (LSN, error)
 	// fullPageWrites gates FPI emission.
 	fullPageWrites atomic.Bool
+
+	// redoRecPtr is the published checkpoint redo pointer gating FPI
+	// emission (see PublishRedoRecPtr). Zero until seeded/published.
+	redoRecPtr atomic.Uint64
+
+	// fpiPublishMu interlocks redo publication with in-flight FPI
+	// decisions (the goopg analog of PG's fpw_lsn recheck under the WAL
+	// insert locks, xlog.c XLogInsertRecord). Writers hold RLock across
+	// needsImage -> record append inside the MarkDirty* variants; the
+	// checkpointer's PublishRedoBarrier takes Lock, so by the time the new
+	// redo is sampled+stored every straddling writer has completed its
+	// append — its record LSN is below the sampled frontier and therefore
+	// below the new redo, closing the decide->append window (adversarial
+	// review F1 of perf-optimize3-dash S2).
+	fpiPublishMu sync.RWMutex
 	// logger surfaces non-fatal FPI failures.
 	logger *slog.Logger
 
@@ -288,10 +294,10 @@ type Pool struct {
 	// writes to the checkpointer too), bgwriter in WriteDirtyPages.
 	// *WriteTimeNanos are their real wall-clock time siblings (write_time),
 	// gated on track_io_timing exactly like the writeback counters above.
-	sharedCheckpointWrittenCount     atomic.Int64
-	sharedCheckpointWriteTimeNanos   atomic.Int64
-	sharedBgwriterWrittenCount       atomic.Int64
-	sharedBgwriterWriteTimeNanos     atomic.Int64
+	sharedCheckpointWrittenCount   atomic.Int64
+	sharedCheckpointWriteTimeNanos atomic.Int64
+	sharedBgwriterWrittenCount     atomic.Int64
+	sharedBgwriterWriteTimeNanos   atomic.Int64
 
 	// OnCheckpointerWritebackWait/Done, OnBgwriterWritebackWait/Done, and
 	// OnBackendWritebackWait/Done bracket each context's real
@@ -773,12 +779,60 @@ func (p *Pool) SetFullPageWrites(on bool) { p.fullPageWrites.Store(on) }
 // FullPageWrites reports the current setting.
 func (p *Pool) FullPageWrites() bool { return p.fullPageWrites.Load() }
 
-// ResetCheckpointEpoch clears the per-slot "FPI emitted" flag.
-// The checkpointer calls this after a successful checkpoint.
-func (p *Pool) ResetCheckpointEpoch() {
-	for i := range p.slots {
-		p.slots[i].fpiSinceCheckpoint.Store(false)
-	}
+// PublishRedoRecPtr publishes the checkpoint redo pointer that gates
+// full-page-image emission (perf-optimize3-dash/03, option (b) — PG's
+// CreateCheckPoint semantics): a page needs a fresh image iff its pd_lsn is
+// <= the published redo, i.e. its last WAL-logged change predates the redo
+// point crash recovery (or a standby restartpoint) will replay from.
+// Publication IS the epoch boundary — there is no separately-timed per-slot
+// reset to race, which is what closed the image-less replay window the old
+// fpiSinceCheckpoint sweep left open (adversarial review F-1).
+//
+// Called by the checkpointer at checkpoint START (before the buffer flush),
+// and by initdb.Open at startup with pg_control's checkPointCopy.redo so the
+// first post-restart epoch is anchored correctly. Checkpoints are serialized,
+// so a plain store suffices; the seed and the first checkpoint publication
+// are monotone by construction.
+func (p *Pool) PublishRedoRecPtr(redo uint64) {
+	p.redoRecPtr.Store(redo)
+}
+
+// PublishRedoBarrier atomically (with respect to in-flight FPI decisions)
+// samples the redo pointer via the caller-supplied closure and publishes it.
+// The exclusive lock waits for every writer currently inside a
+// needsImage->append critical section (RLock held by the MarkDirty*
+// variants), so a record decided against the OLD redo always has
+// LSN < the frontier the closure samples — i.e. < the NEW redo — and is
+// covered by the previous epoch's image on any replay that starts at the new
+// redo's checkpoint. sample must not acquire pool or slot locks (the
+// checkpointer passes a WAL-frontier read). Returns the published redo.
+func (p *Pool) PublishRedoBarrier(sample func() uint64) uint64 {
+	p.fpiPublishMu.Lock()
+	redo := sample()
+	p.redoRecPtr.Store(redo)
+	p.fpiPublishMu.Unlock()
+	return redo
+}
+
+// RedoRecPtr returns the currently published redo pointer (0 on a fresh
+// cluster before any checkpoint — every page images on first touch, the safe
+// direction).
+func (p *Pool) RedoRecPtr() uint64 { return p.redoRecPtr.Load() }
+
+// needsImage is the per-record FPI decision: pd_lsn <= publishedRedo means
+// the page's first post-redo modification is happening now and must carry a
+// full image (torn-page anchor for replay-from-redo). The caller holds the
+// slot's content lock (same access contract as reading/writing s.page in the
+// MarkDirty* variants below) AND fpiPublishMu.RLock (see PublishRedoBarrier).
+//
+// LSN-base note (review SHOULD-2): pd_lsn carries 1-based writer LSNs while
+// the published redo is the 0-based redoLSN0 the PG checkpoint record uses
+// (= frontier pos + page-header leading). The mismatch is deliberate and
+// errs only toward EXTRA images: every pre-publication pd_lsn <= pos <=
+// pos+leading, so a needed image is never skipped. Do not "fix" one side
+// without renormalizing the other.
+func (p *Pool) needsImage(s *Slot) bool {
+	return uint64(MustHeader(s.page).LSN()) <= p.redoRecPtr.Load()
 }
 
 // Close flushes every dirty slot through smgr and releases the arena.
@@ -1257,7 +1311,6 @@ func (p *Pool) evictVictim(victimIdx int, wasDirty bool, oldTag BufferTag) error
 	return nil
 }
 
-
 // debugValidateCleanEviction is an M-NIGHTLY investigation aid
 // (AI-20260708-064334-001) gated by DebugValidateCleanEvictions. It
 // re-reads oldTag's block from disk and compares it byte-for-byte
@@ -1429,7 +1482,6 @@ func (p *Pool) PinNew(rel RelFileNode) (*Slot, BlockNumber, error) {
 	p.pinMu.Unlock()
 	return s, blk, nil
 }
-
 
 // ExtendRelationBatch appends n empty, initialized blocks to rel as a
 // single batched smgr write, and returns the block number of the first
@@ -1754,11 +1806,12 @@ func (p *Pool) MarkDirtyWithLSNLocked(s *Slot, lsn LSN) {
 }
 
 func (p *Pool) markDirtyWithLSNCommon(s *Slot) {
-	// Set dirty bit and mark fpiSinceCheckpoint.
+	// Set dirty bit. The caller already stamped pd_lsn (> published redo),
+	// which is what suppresses redundant images this epoch under the
+	// pd_lsn<=redo test — no per-slot flag to maintain.
 	for {
 		old := s.state.Load()
 		if old&slotDirtyBit != 0 {
-			// Already dirty; still need to update fpiSinceCheckpoint.
 			break
 		}
 		newSt := old | slotDirtyBit
@@ -1768,7 +1821,6 @@ func (p *Pool) markDirtyWithLSNCommon(s *Slot) {
 			break
 		}
 	}
-	s.fpiSinceCheckpoint.Store(true)
 }
 
 // MarkDirtyForceFPI emits a fresh full-page image, overriding any stale FPI.
@@ -1813,39 +1865,48 @@ func (p *Pool) MarkDirtyForceFPI(s *Slot) {
 			break
 		}
 	}
-	s.fpiSinceCheckpoint.Store(true)
 }
 
 // MarkDirtyChangeRecord is the change-record-aware variant of MarkDirty.
 func (p *Pool) MarkDirtyChangeRecord(s *Slot, emitter func() (LSN, error)) error {
-	needFPI := !s.fpiSinceCheckpoint.Load()
-	tag := s.tag
+	// RLock spans the FPI decision AND the record append so a concurrent
+	// redo publication cannot land between them (PublishRedoBarrier).
+	p.fpiPublishMu.RLock()
+	err := func() error {
+		needFPI := p.needsImage(s)
+		tag := s.tag
 
-	if needFPI {
-		if p.logFPI != nil && p.fullPageWrites.Load() {
-			pageCopy := make(Page, BlockSize)
-			copy(pageCopy, s.page)
-			lsn, err := p.logFPI(tag.Rel, tag.Block, pageCopy)
-			if err != nil {
-				return err
+		if needFPI {
+			if p.logFPI != nil && p.fullPageWrites.Load() {
+				pageCopy := make(Page, BlockSize)
+				copy(pageCopy, s.page)
+				lsn, err := p.logFPI(tag.Rel, tag.Block, pageCopy)
+				if err != nil {
+					return err
+				}
+				MustHeader(s.page).SetLSN(lsn)
+			} else if emitter != nil {
+				lsn, err := emitter()
+				if err != nil {
+					return err
+				}
+				MustHeader(s.page).SetLSN(lsn)
 			}
-			MustHeader(s.page).SetLSN(lsn)
-		} else if emitter != nil {
+		} else {
+			if emitter == nil {
+				return fmt.Errorf("MarkDirtyChangeRecord: emitter required after first dirty")
+			}
 			lsn, err := emitter()
 			if err != nil {
 				return err
 			}
 			MustHeader(s.page).SetLSN(lsn)
 		}
-	} else {
-		if emitter == nil {
-			return fmt.Errorf("MarkDirtyChangeRecord: emitter required after first dirty")
-		}
-		lsn, err := emitter()
-		if err != nil {
-			return err
-		}
-		MustHeader(s.page).SetLSN(lsn)
+		return nil
+	}()
+	p.fpiPublishMu.RUnlock()
+	if err != nil {
+		return err
 	}
 
 	for {
@@ -1860,7 +1921,6 @@ func (p *Pool) MarkDirtyChangeRecord(s *Slot, emitter func() (LSN, error)) error
 			break
 		}
 	}
-	s.fpiSinceCheckpoint.Store(true)
 	return nil
 }
 
@@ -1869,23 +1929,32 @@ func (p *Pool) MarkDirtyLogicalChange(s *Slot, emitter func() (LSN, error)) erro
 	if emitter == nil {
 		return fmt.Errorf("MarkDirtyLogicalChange: emitter required")
 	}
-	needFPI := !s.fpiSinceCheckpoint.Load()
-	tag := s.tag
+	// RLock spans decision + both appends (see MarkDirtyChangeRecord).
+	p.fpiPublishMu.RLock()
+	err := func() error {
+		needFPI := p.needsImage(s)
+		tag := s.tag
 
-	lsn, err := emitter()
+		lsn, err := emitter()
+		if err != nil {
+			return err
+		}
+		MustHeader(s.page).SetLSN(lsn)
+
+		if needFPI && p.logFPI != nil && p.fullPageWrites.Load() {
+			pageCopy := make(Page, BlockSize)
+			copy(pageCopy, s.page)
+			fpiLSN, fpiErr := p.logFPI(tag.Rel, tag.Block, pageCopy)
+			if fpiErr != nil {
+				return fpiErr
+			}
+			MustHeader(s.page).SetLSN(fpiLSN)
+		}
+		return nil
+	}()
+	p.fpiPublishMu.RUnlock()
 	if err != nil {
 		return err
-	}
-	MustHeader(s.page).SetLSN(lsn)
-
-	if needFPI && p.logFPI != nil && p.fullPageWrites.Load() {
-		pageCopy := make(Page, BlockSize)
-		copy(pageCopy, s.page)
-		fpiLSN, fpiErr := p.logFPI(tag.Rel, tag.Block, pageCopy)
-		if fpiErr != nil {
-			return fpiErr
-		}
-		MustHeader(s.page).SetLSN(fpiLSN)
 	}
 
 	for {
@@ -1898,17 +1967,19 @@ func (p *Pool) MarkDirtyLogicalChange(s *Slot, emitter func() (LSN, error)) erro
 			break
 		}
 	}
-	s.fpiSinceCheckpoint.Store(true)
 	return nil
 }
 
 // maybeEmitFPI runs the FPI side-effect of MarkDirty for the first
-// mutation in each checkpoint epoch.
+// mutation of a page since the published redo pointer.
 func (p *Pool) maybeEmitFPI(s *Slot) {
 	if p.logFPI == nil || !p.fullPageWrites.Load() {
 		return
 	}
-	if s.fpiSinceCheckpoint.Load() {
+	// RLock spans decision + append (see MarkDirtyChangeRecord).
+	p.fpiPublishMu.RLock()
+	defer p.fpiPublishMu.RUnlock()
+	if !p.needsImage(s) {
 		return
 	}
 
@@ -1922,8 +1993,9 @@ func (p *Pool) maybeEmitFPI(s *Slot) {
 			"rel", tag.Rel, "block", tag.Block, "err", err)
 		return
 	}
+	// Stamping pd_lsn above the published redo is what suppresses further
+	// images for this page until the next redo publication.
 	MustHeader(s.page).SetLSN(lsn)
-	s.fpiSinceCheckpoint.Store(true)
 }
 
 // FlushAll writes every dirty slot and clears the dirty bit.
@@ -2154,7 +2226,6 @@ func (p *Pool) flushSlot(tag BufferTag, page Page) error {
 	}
 	return nil
 }
-
 
 // maybeCompact triggers a tombstone compaction if the tombstone ratio exceeds 25%.
 func (p *Pool) maybeCompact() {

@@ -472,10 +472,11 @@ func TestPoolEvictionFlushesWALBeforeData(t *testing.T) {
 	}
 }
 
-// TestPoolFPIEmittedOncePerEpoch pins the restored FPI contract:
-// MarkDirty emits at most one full-page-image per slot per
-// checkpoint epoch. ResetCheckpointEpoch re-arms emission for the
-// next mutation.
+// TestPoolFPIEmittedOncePerEpoch pins the FPI contract under the
+// published-redo test (perf-optimize3-dash/03 option (b)): MarkDirty emits at
+// most one full-page-image per page per redo epoch (pd_lsn <= publishedRedo
+// gates emission), and publishing a NEW redo pointer above the page's pd_lsn
+// re-arms emission for the next mutation.
 func TestPoolFPIEmittedOncePerEpoch(t *testing.T) {
 	dir := t.TempDir()
 	mgr := NewManager(ManagerConfig{DataDir: dir})
@@ -513,8 +514,9 @@ func TestPoolFPIEmittedOncePerEpoch(t *testing.T) {
 		t.Fatalf("emitted=%d FPIs across 3 mutations in one epoch, want 1", emitted)
 	}
 
-	// ResetCheckpointEpoch re-arms the first-dirty emission.
-	pool.ResetCheckpointEpoch()
+	// Publishing a redo pointer at/above the page's pd_lsn re-arms the
+	// first-touch emission (the checkpointer does this at checkpoint start).
+	pool.PublishRedoRecPtr(200)
 	s, err = pool.Pin(BufferTag{Rel: rel, Block: 0})
 	if err != nil {
 		t.Fatal(err)
@@ -566,7 +568,6 @@ func TestPoolFPISkippedWhenDisabled(t *testing.T) {
 		t.Fatalf("FPI callback called %d times when full_page_writes=off", calls)
 	}
 }
-
 
 // TestMarkDirtyLogicalChangeEmitsLogicalAndFPIOnFirstDirty pins the
 // design 0103-0018 contract: heap mutation paths emit the logical
@@ -1471,7 +1472,6 @@ func TestPinNewEmitsSmgrCreateOnFirstBlock(t *testing.T) {
 	}
 }
 
-
 func TestExtendRelationBatchAppendsContiguousBlocks(t *testing.T) {
 	dir := t.TempDir()
 	mgr := NewManager(ManagerConfig{DataDir: dir})
@@ -1644,7 +1644,6 @@ func TestExtendRelationBatchRejectsNonPositiveN(t *testing.T) {
 	}
 }
 
-
 // TestSlotPinCountUnmappedTag verifies SlotPinCount returns 0 when the
 // tag is not currently mapped (never pinned, or already evicted).
 func TestSlotPinCountUnmappedTag(t *testing.T) {
@@ -1802,7 +1801,6 @@ func TestSlotPinCountIsolatesByTag(t *testing.T) {
 	pool.Unpin(s0c)
 	pool.Unpin(s1a)
 }
-
 
 // gatedAIOEngine is a fake AIOEngine whose Submit performs the
 // real I/O immediately (so the bytes land on disk right away,
