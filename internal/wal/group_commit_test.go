@@ -125,9 +125,11 @@ func TestFlushUpToPreEnqueueFastExit(t *testing.T) {
 	}
 }
 
-// TestGroupCommitBatchingDelay verifies that commitSiblings+1 concurrent
-// callers all complete (the batching delay path is exercised without hang
-// or error). M0099-0003 (re-enabled after Path A race fix). M0099.
+// TestGroupCommitBatchingDelay verifies that many concurrent FlushUpTo callers
+// all complete without hang or error under the backend-driven flush path (each
+// backend flushes its own frontier; group commit is emergent). Formerly
+// exercised the commit_siblings batching-delay queue (M0099-0003), retired in
+// slice 6 of docs/design/wal-backend-flush/.
 func TestGroupCommitBatchingDelay(t *testing.T) {
 	dir := t.TempDir()
 	w, err := NewWriter(Config{WALDir: dir})
@@ -137,7 +139,8 @@ func TestGroupCommitBatchingDelay(t *testing.T) {
 	defer w.Close()
 
 	// Append enough records so all goroutines have distinct LSNs to flush.
-	const N = commitSiblings + 5 // comfortably above the threshold
+	// 10 is comfortably above the default commit_siblings (5).
+	const N = 10
 	lsns := make([]uint64, N)
 	for i := range lsns {
 		_, end, err := w.Append([]byte("batchtest"))

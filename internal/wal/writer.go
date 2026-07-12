@@ -17,50 +17,12 @@ import (
 	"github.com/goopg/goopg/internal/stats"
 )
 
-// groupFlushReq represents a single caller's flush request in the
-// group-commit queue. M0098-0002.
-type groupFlushReq struct {
-	lsn  uint64
-	done chan struct{} // closed by writer goroutine when flush is complete
-	err  error         // set before done is closed
-}
-
-// backendFlush selects the backend-driven WAL flush path (each committing
-// goroutine performs its own write+fdatasync under the WAL write lock,
-// docs/design/wal-backend-flush/). When false, the legacy group-commit queue
-// (flushGroup / handleGroupFlush, retired in slice 6) is used instead. It is a
-// compile-time const so the two concurrency protocols never run against the
-// same files/dirty state at once; it exists only as a rollback lever until the
-// legacy path is deleted.
-const backendFlush = true
-
 // flushErr wraps a flush error for atomic publication in Writer.stickyErr.
 type flushErr struct{ err error }
-
-// flushGroup holds the shared queue and signal channel for WAL group
-// commit (M0098-0002). Multiple concurrent FlushUpTo callers append
-// their requests and the writer goroutine drains the entire batch in
-// one fdatasync.
-type flushGroup struct {
-	mu     sync.Mutex
-	queue  []*groupFlushReq
-	signal chan struct{} // capacity-1 channel; non-blocking send triggers writer
-}
 
 const (
 	// DefaultSegmentSize matches PostgreSQL's default WAL segment size.
 	DefaultSegmentSize int64 = 16 * 1024 * 1024
-
-	// commitDelayUs is the number of microseconds handleGroupFlush sleeps
-	// after the initial drain to accumulate more concurrent FlushUpTo callers
-	// into the same fdatasync batch. Mirrors PostgreSQL's commit_delay GUC.
-	// Re-enabled after the state.append Path A race was fixed (M0099).
-	commitDelayUs = 1000
-
-	// commitSiblings is the minimum number of concurrent waiters required
-	// before applying the commitDelayUs sleep. Below this threshold we flush
-	// immediately to avoid adding latency to low-concurrency workloads.
-	commitSiblings = 5
 )
 
 var (
@@ -173,13 +135,6 @@ type Config struct {
 	// when PageHeaders=true.
 	TimelineID uint32
 
-	// OnLoopStart / OnLoopEnd are optional hooks called at the
-	// beginning and end of the WAL state-loop goroutine, so the
-	// caller can register/deregister the WAL writer goroutine in
-	// the activity registry via RegisterCurrentGoroutine.
-	OnLoopStart func()
-	OnLoopEnd   func()
-
 	// OnWALWrite is an optional hook called before each WAL page
 	// write in the state loop.  Set by initdb.Open so the activity
 	// registry can report WALWrite wait events.
@@ -285,59 +240,21 @@ func (c *Config) withDefaults() {
 	}
 }
 
-type opKind int
-
-const (
-	opAppend opKind = iota
-	opAppendRaw
-	opFlush
-	opRecycle
-	opClose
-	// opWALBufStat is a read-only op the M0013-0003 observability
-	// surface uses to snapshot walBuf cap + resident under the
-	// writer goroutine's serialisation (avoids racing append /
-	// drain). The snapshot lands in result.walBufStat.
-	opWALBufStat
-)
-
-type op struct {
-	kind    opKind
-	payload []byte
-	lsn     uint64
-	resp    chan result
-
-	// distanceEstimate and completionTarget are only meaningful for
-	// opRecycle: RemoveOldSegmentsWithEstimate's CheckPointDistanceEstimate
-	// (bytes) and checkpoint_completion_target inputs to the
-	// XLOGfileslop-style spares formula. Both zero (RemoveOldSegments'
-	// plain path) reproduces the pre-M0122-0009 MinWALSize-only floor
-	// exactly.
-	distanceEstimate float64
-	completionTarget float64
-}
-
-type walBufStatSnapshot struct {
-	cap      int64
-	resident int64
-}
-
-type result struct {
-	startLSN   uint64
-	endLSN     uint64
-	removed    int
-	recycled   int
-	walBufStat walBufStatSnapshot
-	err        error
-}
-
-// Writer serializes all WAL writes through one internal goroutine.
+// Writer coordinates WAL writes. Committing backends perform their own
+// write+fdatasync under the WAL write lock (writeMu), the background walwriter
+// pre-writes via BackgroundWrite, and the slow-append/recycle paths run directly
+// in the caller's goroutine — there is no dedicated writer goroutine (the old
+// state.loop was retired in slice 6 of docs/design/wal-backend-flush/).
 //
 // LSN is represented as a 1-based byte position in the WAL stream:
 // the first byte written has LSN 1, and the zero value means
 // "no WAL record assigned".
 type Writer struct {
-	ops  chan op
-	done chan struct{}
+	// done is closed exactly once by Close to wake parked flush waiters and
+	// reject new appends. closeOnce/closeErr make Close idempotent.
+	done      chan struct{}
+	closeOnce sync.Once
+	closeErr  error
 
 	// writeLSNAtomic mirrors state.writeLSN so external observers
 	// (notably the checkpointer's max_wal_size trigger) can read
@@ -441,11 +358,6 @@ type Writer struct {
 	// code can balance every WaitEventStart with a WaitEventEnd.
 	// (M0058-0006.)
 	OnWALSyncDone func()
-
-	// fg is the group-commit queue. FlushUpTo appends to fg.queue
-	// and signals fg.signal; the writer goroutine drains the entire
-	// batch in one fdatasync. M0098-0002.
-	fg *flushGroup
 
 	// sharedFsyncTimeNanos accumulates real wall-clock time spent inside
 	// FlushUpTo's fdatasync wait, backing pg_stat_io's (client backend,
@@ -554,12 +466,6 @@ type state struct {
 	sysID      uint64
 	tli        uint32
 
-	// onLoopStart / onLoopEnd are optional hooks called at the
-	// beginning and end of the state-loop goroutine, respectively.
-	// Set by NewWriter from the Writer's OnLoopStart / OnLoopEnd.
-	onLoopStart func()
-	onLoopEnd   func()
-
 	// onWALWrite is an optional hook called before each WAL page
 	// write in writeAt. Set by NewWriter from the Writer's OnWALWrite.
 	onWALWrite func()
@@ -570,9 +476,6 @@ type state struct {
 	// encodeRecordXLog + emitWithPageHeaders + walBuf.append sequence.
 	// nil before NewWriter completes; nil-safe across all core methods.
 	core *stripeWriterCore
-
-	// fg is the group-commit flush queue, shared with Writer. M0098-0002.
-	fg *flushGroup
 
 	// eagerMu guards eagerInFlight; eagerWG lets close() wait for any
 	// background eager-preallocation goroutines to finish before the
@@ -647,18 +550,13 @@ func NewWriter(cfg Config) (*Writer, error) {
 
 	bufCounters := &walBufferCounters{}
 	st.walBufferCounters = bufCounters
-	fg := &flushGroup{
-		signal: make(chan struct{}, 1),
-	}
 	w := &Writer{
-		ops:               make(chan op),
 		done:              make(chan struct{}),
 		memRing:           st.memRing,
 		stateRef:          st,
 		walBufferCounters: bufCounters,
 		pageHeaders:       cfg.PageHeaders,
 		segmentSize:       cfg.SegmentSize,
-		fg:                fg,
 	}
 	w.writeLSNAtomic.Store(uint64(st.writePos))
 	st.writeLSNMirror = &w.writeLSNAtomic
@@ -667,10 +565,7 @@ func NewWriter(cfg Config) (*Writer, error) {
 	w.drainedLSNAtomic.Store(st.drainedLSN)
 	st.drainedLSNMirror = &w.drainedLSNAtomic
 	st.onAppend = w.notifyAppend
-	st.onLoopStart = cfg.OnLoopStart
-	st.onLoopEnd = cfg.OnLoopEnd
 	st.onWALWrite = cfg.OnWALWrite
-	st.fg = fg
 	w.core = newStripeWriterCore(
 		uint64(cfg.SegmentSize),
 		uint64(st.writePos),
@@ -688,7 +583,6 @@ func NewWriter(cfg Config) (*Writer, error) {
 	}
 	w.commitSiblings.Store(sib)
 	w.walWriterFlushAfter.Store(cfg.WalWriterFlushAfter)
-	go st.loop(w.ops, w.done)
 	return w, nil
 }
 
@@ -1009,10 +903,7 @@ func (w *Writer) FlushUpTo(lsn uint64) error {
 	if w.OnWALSyncDone != nil {
 		defer w.OnWALSyncDone()
 	}
-	if backendFlush {
-		return w.flushUpToBackend(lsn)
-	}
-	return w.flushUpToViaQueue(lsn)
+	return w.flushUpToBackend(lsn)
 }
 
 // flushUpToBackend is the PG-parity backend-driven flush (slice 3): the calling
@@ -1132,6 +1023,11 @@ func (w *Writer) backgroundFlushLocked(frontier uint64) (err error) {
 	st := w.stateRef
 	st.writeMu.lock()
 	defer st.writeMu.release()
+	select {
+	case <-w.done:
+		return nil // Close won the lock and tore down the files; do not touch them
+	default:
+	}
 	if frontier <= st.flushedLSN {
 		return nil // a committer flushed past us while we waited for the lock
 	}
@@ -1192,28 +1088,6 @@ func (s *state) waitInsertionsToFinish(lsn uint64) uint64 {
 	}
 }
 
-// flushUpToViaQueue is the legacy group-commit path (retired in slice 6). Kept
-// compilable behind the backendFlush const as a rollback lever.
-func (w *Writer) flushUpToViaQueue(lsn uint64) error {
-	req := &groupFlushReq{lsn: lsn, done: make(chan struct{})}
-	w.fg.mu.Lock()
-	w.fg.queue = append(w.fg.queue, req)
-	w.fg.mu.Unlock()
-	// Signal writer goroutine. Non-blocking: if signal is already
-	// pending the writer will pick up our request on the next drain.
-	select {
-	case w.fg.signal <- struct{}{}:
-	default:
-	}
-	// Wait for the writer to complete our flush (or the writer to close).
-	select {
-	case <-req.done:
-		return req.err
-	case <-w.done:
-		return ErrClosed
-	}
-}
-
 // RemoveOldSegments retires any WAL segment file whose contents end
 // strictly before the segment that contains keepLSN. The segment
 // containing keepLSN — and every segment after it — is preserved, so
@@ -1230,10 +1104,10 @@ func (w *Writer) flushUpToViaQueue(lsn uint64) error {
 //
 // keepLSN == 0 is a no-op (no records have been written yet).
 //
-// The op runs on the writer's serialised loop so it cannot race with
-// an in-flight Append or Flush. Open file handles for retired segments
-// are closed before the unlink/rename and dropped from the writer's
-// cache so subsequent writes never re-touch the old file.
+// removeOldSegments takes writeMu so it cannot race an in-flight backend
+// flush or slow append. Open file handles for retired segments are closed
+// before the unlink/rename and dropped from the writer's cache so subsequent
+// writes never re-touch the old file.
 //
 // Returns the number of segment files unlinked and the number recycled.
 func (w *Writer) RemoveOldSegments(keepLSN uint64) (removed, recycled int, err error) {
@@ -1275,26 +1149,28 @@ func (w *Writer) sendRemoveOldSegments(keepLSN uint64, distanceEstimateBytes, co
 }
 
 // Close flushes dirty segments, closes files, and stops the worker.
+// Close flushes any remaining WAL, closes the segment files, and wakes every
+// parked flush waiter. It is idempotent (safe to call more than once) and must
+// be called only after all appenders have quiesced — the caller's lifecycle
+// contract, unchanged from when a single writer goroutine owned teardown.
 func (w *Writer) Close() error {
-	resp := make(chan result, 1)
-	if err := w.send(op{kind: opClose, resp: resp}); err != nil {
-		if errors.Is(err, ErrClosed) {
-			return nil
+	w.closeOnce.Do(func() {
+		st := w.stateRef
+		// Signal closed first so any flush waiter parked in acquireOrWait wakes
+		// with ErrClosed and new appends short-circuit.
+		close(w.done)
+		if st == nil {
+			return
 		}
-		return err
-	}
-	r := <-resp
-	<-w.done
-	return r.err
-}
-
-func (w *Writer) send(req op) error {
-	select {
-	case <-w.done:
-		return ErrClosed
-	case w.ops <- req:
-		return nil
-	}
+		// Serialise the final flush + file teardown against any in-flight
+		// holder (a backend flusher or a racing walwriter tick) via the WAL
+		// write lock; BackgroundWrite re-checks done under the lock and bails,
+		// so whoever loses the lock never touches torn-down files.
+		st.writeMu.lock()
+		w.closeErr = st.close()
+		st.writeMu.release()
+	})
+	return w.closeErr
 }
 
 func loadState(cfg Config) (*state, error) {
@@ -1598,107 +1474,6 @@ func scanLastSegmentEnd(walDir string, segNo uint64, segSize int64, cfgSegSize i
 		off += consumed
 	}
 	return int64(off), lastRecPtr, nil
-}
-
-func (s *state) loop(ops <-chan op, done chan<- struct{}) {
-	// Pin this goroutine to its OS thread to eliminate migration
-	// overhead on the fdatasync hot path. M0098-0002.
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-	if s.onLoopStart != nil {
-		s.onLoopStart()
-	}
-	if s.onLoopEnd != nil {
-		defer s.onLoopEnd()
-	}
-	defer close(done)
-	// flushSig is s.fg.signal; using a local avoids a nil-check on
-	// every select iteration when fg is absent (tests that build a
-	// state without a Writer use fg=nil).
-	var flushSig <-chan struct{}
-	if s.fg != nil {
-		flushSig = s.fg.signal
-	}
-	for {
-		select {
-		case req, ok := <-ops:
-			if !ok {
-				return
-			}
-			switch req.kind {
-			// opAppend / opAppendRaw / opRecycle / opWALBufStat now run
-			// directly in the caller's goroutine (slice 5), serialised on
-			// writeMu; they are no longer routed through this loop. Only Close
-			// remains (the loop itself is deleted in slice 6).
-			case opClose:
-				// Drain any pending group-flush requests before closing.
-				s.handleGroupFlush()
-				err := s.close()
-				req.resp <- result{err: err}
-				return
-			default:
-				req.resp <- result{err: fmt.Errorf("wal: unknown operation %d", req.kind)}
-			}
-		case _, ok := <-flushSig:
-			if !ok {
-				return
-			}
-			s.handleGroupFlush()
-		}
-	}
-}
-
-// handleGroupFlush drains the entire pending flush queue, issues one
-// fdatasync for the maximum LSN requested, then notifies all waiters.
-// Called only from the writer goroutine. M0098-0002.
-//
-// M0099-0003: when commitSiblings or more concurrent waiters are already
-// in the queue, sleep commitDelayUs microseconds before flushing so that
-// additional FlushUpTo callers can arrive and be served by the same
-// fdatasync. This mirrors PostgreSQL's commit_delay / commit_siblings
-// semantics and increases the average batch size under high concurrency.
-func (s *state) handleGroupFlush() {
-	if s.fg == nil {
-		return
-	}
-	s.fg.mu.Lock()
-	queue := s.fg.queue
-	s.fg.queue = nil
-	s.fg.mu.Unlock()
-	if len(queue) == 0 {
-		return
-	}
-	// Batching delay (M0099-0003, re-enabled after Path A race fix M0099):
-	// if commitSiblings or more concurrent waiters are queued, sleep
-	// commitDelayUs so additional callers can arrive and be served by the
-	// same fdatasync. The sleep runs on the OS-thread-pinned writer goroutine
-	// (runtime.LockOSThread, M0098-0002). The state.append Path A race that
-	// previously caused stale writePos under concurrency is now fixed.
-	if commitDelayUs > 0 && len(queue) >= commitSiblings {
-		time.Sleep(commitDelayUs * time.Microsecond)
-		s.fg.mu.Lock()
-		extra := s.fg.queue
-		s.fg.queue = nil
-		s.fg.mu.Unlock()
-		if len(extra) > 0 {
-			queue = append(queue, extra...)
-		}
-	}
-	// Find the highest LSN across all requests; one flush satisfies all.
-	var maxLSN uint64
-	for _, req := range queue {
-		if req.lsn > maxLSN {
-			maxLSN = req.lsn
-		}
-	}
-	err := s.flushUpTo(maxLSN)
-	// Notify all callers. req.err is set before close(req.done) so the
-	// caller's read of req.err after <-req.done is race-free (close is
-	// a happens-before barrier in Go).
-	for _, req := range queue {
-		req.err = err
-		close(req.done)
-	}
 }
 
 func (s *state) append(payload []byte) (uint64, uint64, error) {

@@ -1,6 +1,7 @@
 # wal-backend-flush — PG-parity backend-driven WAL write/flush (Design Bundle)
 
-**Status: draft (design only — implementation not started; milestone TBD)**
+**Status: implemented (2026-07-12) — slices 1–6 landed on branch
+`wal-system-pgnize`; slice 7 is verification/certification only.**
 **Date: 2026-07-12**
 
 Restructures goopg's WAL write path to match PostgreSQL's: the **committing

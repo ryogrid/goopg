@@ -397,14 +397,6 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		PageHeaders: true,
 		SystemID:    systemID,
 		TimelineID:  tli,
-		OnLoopStart: func() {
-			// Register this goroutine so pool/AIO hooks can find procNum
-			// via LookupCurrentGoroutine (M0107-0005).
-			activity.SetCurrentGoroutine(act, walProcNum)
-		},
-		OnLoopEnd: func() {
-			activity.ClearCurrentGoroutine()
-		},
 		// M0107-0005: closure-captures walProcNum (int32) for the atomic
 		// hot path; no goroutine map lookup and no mutex.
 		OnWALWrite: func() {
@@ -2145,6 +2137,13 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		stop := make(chan struct{})
 		rt.walwriterStop = stop
 		go func() {
+			// This goroutine is now the walwriter process: register it in the
+			// activity registry so pool/AIO hooks attribute its I/O to
+			// walProcNum via LookupCurrentGoroutine (M0107-0005). Previously
+			// registered on the WAL state-loop goroutine, retired in slice 6 of
+			// docs/design/wal-backend-flush/.
+			activity.SetCurrentGoroutine(act, walProcNum)
+			defer activity.ClearCurrentGoroutine()
 			ticker := time.NewTicker(opts.WalWriterDelay)
 			defer ticker.Stop()
 			for {
