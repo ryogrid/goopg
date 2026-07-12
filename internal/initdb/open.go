@@ -30,6 +30,26 @@ var pgEpoch2000 = time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
 
 func pgTimestampNowUsec() int64 { return time.Since(pgEpoch2000).Microseconds() }
 
+// emitCanonicalDefault resolves whether this server emits the canonical
+// (PG-format, real-standby-replayable) WAL record family, from the
+// GOOPG_WAL_CANONICAL environment variable (perf-optimize3-dash/01 §3.1).
+// Read at Open() time — not only in cmd/goopg — so in-process test suites
+// flip modes with t.Setenv. Not a GUC: no PostgreSQL equivalent exists and
+// the postgresql.conf.sample template stays PG-parity (0108-0001).
+//
+//	GOOPG_WAL_CANONICAL=on|1|true   -> emit canonical records
+//	GOOPG_WAL_CANONICAL=off|0|false -> native-only stream
+//	unset                           -> default (S1: on; flipped off in S4)
+func emitCanonicalDefault() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("GOOPG_WAL_CANONICAL"))) {
+	case "on", "1", "true":
+		return true
+	case "off", "0", "false":
+		return false
+	}
+	return true // slice S1 default: canonical ON (behavior-identical)
+}
+
 // Runtime is the bundle of long-lived handles a running goopg
 // server needs to drive table-touching statements: a storage
 // Manager + Pool, an MVCC manager, and an in-memory catalog. Each
@@ -395,8 +415,13 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		// can parse the WAL segments. SystemID is embedded in every page
 		// header for cross-segment consistency checking.
 		PageHeaders: true,
-		SystemID:    systemID,
-		TimelineID:  tli,
+		// Canonical-family content gating (analysis/perf-optimize3-dash/01):
+		// resolved from GOOPG_WAL_CANONICAL at every Open() so in-process
+		// test suites can flip modes with t.Setenv. Slice S1 default: ON
+		// (behavior-identical); the S4 slice flips the default to OFF.
+		EmitCanonical: emitCanonicalDefault(),
+		SystemID:      systemID,
+		TimelineID:    tli,
 		// M0107-0005: closure-captures walProcNum (int32) for the atomic
 		// hot path; no goroutine map lookup and no mutex.
 		OnWALWrite: func() {
@@ -940,7 +965,10 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		// canonical record because their walWriter is not in PG-wire format.
 		// The flush waits for the canonical end LSN below so both records land
 		// before the client acknowledges commit (synchronous_commit = on).
-		if walWriter.PageHeadersEnabled() {
+		// Additionally gated on CanonicalEnabled (perf-optimize3-dash S1):
+		// canonical content off => native-only stream, endLSN stays at the
+		// native commit record.
+		if walWriter.PageHeadersEnabled() && walWriter.CanonicalEnabled() {
 			xactTime := pgTimestampNowUsec()
 			switch kind {
 			case mvcc.XactCommit:
@@ -2057,8 +2085,11 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// writer is in PG-compat PageHeaders mode so canonical records can be read
 	// by PG18 standbys. In legacy mode (tests, no standby), LogCanonical stays
 	// nil and DDL paths skip the canonical record emission.
+	// Additionally gated on CanonicalEnabled (perf-optimize3-dash S1): with
+	// the switch off, LogCanonical stays nil and every canonical emitter
+	// (heap/btree/vacuum/DDL) no-ops on its existing nil guard.
 	var logCanonical catalog.LogCanonicalFunc
-	if walWriter != nil && walWriter.PageHeadersEnabled() {
+	if walWriter != nil && walWriter.PageHeadersEnabled() && walWriter.CanonicalEnabled() {
 		logCanonical = func(payload []byte) (uint64, error) {
 			_, end, err := walWriter.Append(payload)
 			return end, err
