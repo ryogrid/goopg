@@ -98,6 +98,15 @@ start immediately in parallel with C2.
   > image (C1's torn-page cover). Implemented in C1-S3; C2 must not weaken
   > `FlushCLOGFn`'s error-fails-checkpoint contract.
 
+## Supersession note (2026-07-13)
+
+`analysis/perf-optimize3-dash/` (single-stream native-only WAL) partially
+supersedes **C1**: real-PG-standby compat is deferred, canonical emission is
+gated off by default, and C1's §4.2 gating machinery is inherited there as its
+doc 03 (redo-publication fix — now mandatory and mode-independent). C1's
+record-shape work (incremental `xl_heap_*`) becomes the **resume path** when
+replication returns. **C2 and C3 are unaffected and remain live.**
+
 ## Relationship to prior work
 
 The wal-backend-flush bundle (`docs/design/wal-backend-flush/`, implemented
