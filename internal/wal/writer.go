@@ -739,24 +739,25 @@ func (w *Writer) MemRing() *MemRing { return w.memRing }
 // the writer's lifetime. Surfaced as
 // `wal_buffers_capacity_bytes` in pg_stat_wal_io (M0013-0003).
 func (w *Writer) WALBuffersCapacity() int64 {
-	resp := make(chan result, 1)
-	if err := w.send(op{kind: opWALBufStat, resp: resp}); err != nil {
+	// cap is fixed at construction (immutable); read it directly rather than
+	// round-tripping through the writer goroutine (slice 5).
+	if w.stateRef == nil || w.stateRef.walBuf == nil {
 		return 0
 	}
-	return (<-resp).walBufStat.cap
+	return w.stateRef.walBuf.cap
 }
 
 // WALBuffersBytesResident returns the live byte count currently
 // held in the in-memory WAL buffer (i.e. not yet drained to a
 // segment file). Surfaced as `wal_buffers_bytes_resident` in
-// pg_stat_wal_io. Reads serialise on the writer goroutine to
-// avoid racing with append/drain.
+// pg_stat_wal_io. resident() reads the ring's head/tail atomics, so it is
+// safe to sample directly from any goroutine (slice 5) — an occasionally
+// slightly-stale count is acceptable for observability.
 func (w *Writer) WALBuffersBytesResident() int64 {
-	resp := make(chan result, 1)
-	if err := w.send(op{kind: opWALBufStat, resp: resp}); err != nil {
+	if w.stateRef == nil || w.stateRef.walBuf == nil {
 		return 0
 	}
-	return (<-resp).walBufStat.resident
+	return w.stateRef.walBuf.resident()
 }
 
 // WALBuffersOverflowDrainBytes returns the lifetime total bytes
@@ -930,16 +931,29 @@ func (w *Writer) Append(payload []byte) (uint64, uint64, error) {
 		}
 	}
 
-	// Slow path: no WAL buffer, or buffer overflow — fall back
-	// to the state-loop goroutine (legacy serialised path).
-	resp := make(chan result, 1)
-	buf := make([]byte, len(payload))
-	copy(buf, payload)
-	if err := w.send(op{kind: opAppend, payload: buf, resp: resp}); err != nil {
-		return 0, 0, err
+	// Slow path: no WAL buffer, or buffer overflow. Run the append directly in
+	// the caller's goroutine (slice 5): the slow-append leaves serialise on
+	// writeMu (slice 3), so the dedicated writer goroutine is no longer needed
+	// to order writePos mutations, and concurrent slow appends serialise on the
+	// lock exactly as they did on the single loop. append encodes synchronously
+	// into the ring/segment, so payload need not outlive the call. The
+	// best-effort closed-check preserves send()'s ErrClosed-on-shutdown; the
+	// real append/close ordering is the caller's lifecycle contract (Close after
+	// appenders quiesce), the same discipline the fast path already relies on.
+	st := w.stateRef
+	if st == nil {
+		return 0, 0, ErrClosed
 	}
-	r := <-resp
-	return r.startLSN, r.endLSN, r.err
+	select {
+	case <-w.done:
+		return 0, 0, ErrClosed
+	default:
+	}
+	start, end, err := st.append(payload)
+	if err == nil && st.onAppend != nil {
+		st.onAppend()
+	}
+	return start, end, err
 }
 
 // AppendRaw writes an already-encoded WAL byte stream verbatim.
@@ -952,14 +966,22 @@ func (w *Writer) AppendRaw(stream []byte) (uint64, uint64, error) {
 	if len(stream) == 0 {
 		return 0, 0, ErrEmptyPayload
 	}
-	resp := make(chan result, 1)
-	buf := make([]byte, len(stream))
-	copy(buf, stream)
-	if err := w.send(op{kind: opAppendRaw, payload: buf, resp: resp}); err != nil {
-		return 0, 0, err
+	// Direct call (slice 5): appendRaw serialises on writeMu; the physical
+	// walreceiver is the sole caller and is single-threaded per writer.
+	st := w.stateRef
+	if st == nil {
+		return 0, 0, ErrClosed
 	}
-	r := <-resp
-	return r.startLSN, r.endLSN, r.err
+	select {
+	case <-w.done:
+		return 0, 0, ErrClosed
+	default:
+	}
+	start, end, err := st.appendRaw(stream)
+	if err == nil && st.onAppend != nil {
+		st.onAppend()
+	}
+	return start, end, err
 }
 
 // FlushUpTo persists WAL bytes up to lsn with fdatasync semantics.
@@ -1236,12 +1258,20 @@ func (w *Writer) sendRemoveOldSegments(keepLSN uint64, distanceEstimateBytes, co
 	if keepLSN == 0 {
 		return 0, 0, nil
 	}
-	resp := make(chan result, 1)
-	if err := w.send(op{kind: opRecycle, lsn: keepLSN, resp: resp, distanceEstimate: distanceEstimateBytes, completionTarget: completionTarget}); err != nil {
-		return 0, 0, err
+	// Direct call (slice 5): removeOldSegments takes writeMu, serialising its
+	// files/dirty mutations against the backend flush holder and slow appends
+	// (slice 3); the dedicated writer goroutine is no longer needed. Recycle is
+	// checkpoint-driven and the checkpointer is quiesced before Close.
+	st := w.stateRef
+	if st == nil {
+		return 0, 0, ErrClosed
 	}
-	r := <-resp
-	return r.removed, r.recycled, r.err
+	select {
+	case <-w.done:
+		return 0, 0, ErrClosed
+	default:
+	}
+	return st.removeOldSegments(keepLSN, distanceEstimateBytes, completionTarget)
 }
 
 // Close flushes dirty segments, closes files, and stops the worker.
@@ -1596,38 +1626,16 @@ func (s *state) loop(ops <-chan op, done chan<- struct{}) {
 				return
 			}
 			switch req.kind {
-			case opAppend:
-				start, end, err := s.append(req.payload)
-				req.resp <- result{startLSN: start, endLSN: end, err: err}
-				if err == nil && s.onAppend != nil {
-					s.onAppend()
-				}
-			case opAppendRaw:
-				start, end, err := s.appendRaw(req.payload)
-				req.resp <- result{startLSN: start, endLSN: end, err: err}
-				if err == nil && s.onAppend != nil {
-					s.onAppend()
-				}
-			case opFlush:
-				// Legacy path kept for backward compatibility.
-				// New code routes through flushSig via FlushUpTo.
-				req.resp <- result{err: s.flushUpTo(req.lsn)}
-			case opRecycle:
-				n, rc, err := s.removeOldSegments(req.lsn, req.distanceEstimate, req.completionTarget)
-				req.resp <- result{removed: n, recycled: rc, err: err}
+			// opAppend / opAppendRaw / opRecycle / opWALBufStat now run
+			// directly in the caller's goroutine (slice 5), serialised on
+			// writeMu; they are no longer routed through this loop. Only Close
+			// remains (the loop itself is deleted in slice 6).
 			case opClose:
 				// Drain any pending group-flush requests before closing.
 				s.handleGroupFlush()
 				err := s.close()
 				req.resp <- result{err: err}
 				return
-			case opWALBufStat:
-				snap := walBufStatSnapshot{}
-				if s.walBuf != nil {
-					snap.cap = s.walBuf.cap
-					snap.resident = s.walBuf.resident()
-				}
-				req.resp <- result{walBufStat: snap}
 			default:
 				req.resp <- result{err: fmt.Errorf("wal: unknown operation %d", req.kind)}
 			}
