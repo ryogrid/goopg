@@ -35,6 +35,29 @@ Fix designs with expected-lift arithmetic are in `04-improvement-designs/`
 
 ## Documents
 
+## Fixes implemented (2026-07-12)
+
+fix-01 + fix-03(a,b,d) + fix-05 landed (commits `8f30f11d`, `fedb0eec`). Results
+in [05-improvement-results.md](05-improvement-results.md):
+
+| metric | before | after | change |
+|---|---:|---:|---|
+| CPU busy (c=50 -N) | 2.39 cores | 1.01 cores | **2.4× less** |
+| `runtime.Stack` (`wal.stripeNum`) | 56.7 % CPU | 0.09 % | eliminated |
+| startup (scale-100, 1.1 GB WAL) | 28.02 s | 6.73 s | **4.2×** |
+| c=50 -N TPS, sync=on | 1,121 | 1,145 | +2 % (flush-bound) |
+| c=50 -N TPS, sync=off | 2,494 | 9,820 | **3.9×** |
+
+Key finding: fix-01 removes the 57 %-CPU `runtime.Stack` storm (confirmed) and
+cuts total CPU 2.4×, but at c=50 with `synchronous_commit=on` the throughput
+gate is WAL fdatasync latency, not CPU — so sync-on TPS is flat while sync-off
+(CPU-bound) jumps 3.9×. This re-frames the remaining gap vs PG as the
+commit-flush path (fix-02/03c), not CPU. fix-02 (single commit record) and
+fix-04 (COPY multi-insert) remain deferred — both change WAL format (PG-
+compatible) and need the full regress/pg_waldump/crash-recovery verification.
+
+## Documents
+
 | doc | content |
 |---|---|
 | [00-methodology.md](00-methodology.md) | exact conditions, parity with perf-optimize, provenance, incidents/deviations, noise policy |
@@ -42,6 +65,7 @@ Fix designs with expected-lift arithmetic are in `04-improvement-designs/`
 | [02-bottleneck-analysis.md](02-bottleneck-analysis.md) | ranked bottlenecks with profile evidence; Q1–Q5 verdicts; COPY attribution; per-txn cost model |
 | [03-postgres-mechanisms.md](03-postgres-mechanisms.md) | how PG 18.3 implements each mechanism, with `postgres/src` file/function citations |
 | [04-improvement-designs/](04-improvement-designs/README.md) | seven implementable fix designs, priority-ordered with lift estimates, risks, verification plans |
+| [05-improvement-results.md](05-improvement-results.md) | before/after measurement of the landed fixes (fix-01/03/05): CPU 2.4×, startup 4.2×, sync-off TPS 3.9×, and why sync-on TPS is flush-bound |
 | `scripts/run_su50.sh` | the reproducible driver (byte-parity conditions + diagnostics) |
 | `runs/20260712_114859/` | raw artifacts: pgbench outputs, pprof profiles, wait samples, env.txt, COPY diagnostic |
 

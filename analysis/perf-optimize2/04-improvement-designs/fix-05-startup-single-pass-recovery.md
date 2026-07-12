@@ -1,5 +1,18 @@
 # fix-05 — Single-pass startup recovery (P2, operational)
 
+> **Status: IMPLEMENTED via memoization** (commit `fedb0eec`, 2026-07-12).
+> Rather than the full single-pass rmgr-style dispatcher below, landed a
+> semantics-preserving WAL-decode memoization (`wal.BeginRecoveryCache`/
+> `EndRecoveryCache`, bracketing the recovery block in `initdb.Open`): the WAL
+> is decoded ONCE and shared across the ~30 recovery passes instead of ~20
+> re-reads. Reason for the narrower approach: the surface analysis found the
+> passes run across 2–3 hard ordering boundaries (around `loadUserTablesFromHeap`)
+> and a true LSN-ordered single pass would change recovery visibility semantics
+> (each module today sees the entire WAL, not just earlier-LSN records) — too
+> risky for one loop. Per-record streaming of `readStreamFrom` remains a
+> follow-up (ledger). Measured: startup 28.02 s → 6.73 s (4.2×) on a 1.1 GB-WAL
+> scale-100 dir. Results: `05-improvement-results.md`.
+
 ## Problem (evidence)
 
 Opening a scale-100 data directory takes ~28 s. The cumulative allocation

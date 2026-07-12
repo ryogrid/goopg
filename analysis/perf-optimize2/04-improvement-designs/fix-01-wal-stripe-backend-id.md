@@ -1,5 +1,11 @@
 # fix-01 — Eliminate `runtime.Stack` from WAL stripe selection (P0)
 
+> **Status: IMPLEMENTED** (commit `8f30f11d`, 2026-07-12). Landed via the
+> Option A `internal/gls` package (pprof-label carrier + linkname read, runtime
+> layout probe + canary test). `wal.stripeNum` now reads the goroutine-local
+> backend id instead of `activity.LookupCurrentGoroutine`→`runtime.Stack`.
+> Results: `05-improvement-results.md`.
+
 ## Problem (evidence)
 
 `internal/wal/writer.go:1870` `(*state).stripeNum()` calls

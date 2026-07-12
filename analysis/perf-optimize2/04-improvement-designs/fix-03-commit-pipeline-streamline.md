@@ -1,5 +1,11 @@
 # fix-03 — Commit-pipeline streamlining (P1, re-profile after fix-01)
 
+> **Status: PARTIALLY IMPLEMENTED** (commit `8f30f11d`, 2026-07-12). Landed
+> items (a) per-flush log demotion, (b) pre-enqueue already-flushed fast exit
+> (`flushedLSNAtomic`), and (d) stale-sentinel doc hygiene. Item (c) commit-
+> wakeup batching remains DEFERRED ("measure first" — no waiter count exists;
+> `commitCond` is broadcast from ~8 sites) — see `.ralph/deferral_ledger.md`.
+
 ## Problem (evidence)
 
 goopg's group commit batches correctly (143 fdatasync/s at 1,269 TPS,
