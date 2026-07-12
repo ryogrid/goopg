@@ -1,0 +1,17 @@
+RUN_ID=20260713_004324  scale=100 c=50 T=120
+--- goopg_S ---
+latency average = 0.544 ms
+latency stddev = 2.518 ms
+tps = 91782.748160 (without initial connection time)
+--- goopg_N ---
+latency average = 23.351 ms
+latency stddev = 13.645 ms
+tps = 2141.097997 (without initial connection time)
+--- pg_S ---
+latency average = 0.276 ms
+latency stddev = 3.548 ms
+tps = 180256.814238 (without initial connection time)
+--- pg_N ---
+latency average = 3.162 ms
+latency stddev = 1.120 ms
+tps = 15806.291860 (without initial connection time)
