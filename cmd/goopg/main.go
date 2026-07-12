@@ -453,6 +453,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			CommitDelayUs:         int64(intGUC(registry, "commit_delay", 0)),
 			CommitSiblings:        intGUC(registry, "commit_siblings", 5),
 			WalWriterDelay:        time.Duration(walWriterDelayMS) * time.Millisecond,
+			WalWriterFlushAfter:   int64(intGUC(registry, "wal_writer_flush_after", 1048576)),
 			BgwriterDelay:         time.Duration(bgwriterDelayMS) * time.Millisecond,
 			BgwriterMaxPages:      bgwriterMaxPages,
 			CheckpointFlushAfter:  checkpointFlushAfter,

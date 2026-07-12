@@ -105,6 +105,11 @@ type Config struct {
 	CommitDelayUs  int64
 	CommitSiblings int
 
+	// WalWriterFlushAfter is wal_writer_flush_after in bytes (BootVal 1MB): the
+	// background walwriter's fsync-throttle threshold. Zero disables the throttle
+	// (always flush). See Writer.BackgroundWrite.
+	WalWriterFlushAfter int64
+
 	// Preallocate, when true, zero-fills new segment files to
 	// SegmentSize and fsyncs them at creation time so subsequent
 	// commit-path syncs don't pay for inode metadata updates and
@@ -382,6 +387,13 @@ type Writer struct {
 	commitDelayUs  atomic.Int64
 	commitSiblings atomic.Int32
 	stickyErr      atomic.Pointer[flushErr]
+
+	// walWriterFlushAfter is wal_writer_flush_after (bytes; BootVal 1MB): the
+	// background walwriter fsync-throttle threshold. Stored for BackgroundWrite;
+	// it only gates a skip once async-LSN early wakeups land (a timer tick always
+	// satisfies PG's "≥ wal_writer_delay since last flush" rule and therefore
+	// flushes) — see BackgroundWrite (docs/design/wal-backend-flush/ 03 §3.4).
+	walWriterFlushAfter atomic.Int64
 
 	// stateRef is a reference to the state struct, needed by
 	// Writer.Append to call encodeAndBuffer directly (M0026
@@ -675,6 +687,7 @@ func NewWriter(cfg Config) (*Writer, error) {
 		sib = 5
 	}
 	w.commitSiblings.Store(sib)
+	w.walWriterFlushAfter.Store(cfg.WalWriterFlushAfter)
 	go st.loop(w.ops, w.done)
 	return w, nil
 }
@@ -689,6 +702,9 @@ func (w *Writer) SetCommitSiblings(n int) {
 	}
 	w.commitSiblings.Store(int32(n))
 }
+
+// SetWalWriterFlushAfter live-updates wal_writer_flush_after (bytes; SIGHUP).
+func (w *Writer) SetWalWriterFlushAfter(bytes int64) { w.walWriterFlushAfter.Store(bytes) }
 
 // PageHeadersEnabled reports whether the writer is emitting
 // PG-compatible XLOG page headers (M0014-0001 step 2). Returns the
@@ -1049,6 +1065,65 @@ func (w *Writer) flushAsHolder(lsn, frontier uint64) (err error) {
 		// The caller asked to flush beyond what was ever written.
 		return fmt.Errorf("%w: have %d, need %d", ErrLSNNotWritten, st.flushedLSN, lsn)
 	}
+	return nil
+}
+
+// BackgroundWrite is the background walwriter's periodic pre-write+flush, the
+// goopg analog of PostgreSQL's XLogBackgroundFlush (walwriter.c). It runs on the
+// dedicated walwriter goroutine every wal_writer_delay and is NOT a group-commit
+// participant: it takes the WAL write lock with a plain blocking lock() (PG's
+// walwriter does a plain LWLockAcquire, not AcquireOrWait), drains the published
+// frontier and fdatasyncs it, so buffered WAL reaches disk even when no backend
+// is committing.
+//
+// It flushes the full published contiguous frontier each tick (write == flush).
+// PostgreSQL's walwriter throttles fsyncs via wal_writer_flush_after and page-
+// rounds its writes, doing a write-only (no fsync) tick when little has
+// accumulated; that only fires on an async-LSN early wakeup, because a plain
+// timer tick always satisfies the "≥ wal_writer_delay since the last flush"
+// rule and therefore flushes. goopg has no async-LSN early-wakeup latch yet, so
+// every tick is a timer tick and we flush the whole frontier — matching the
+// prior FlushUpTo(WrittenLSN()) durability (async commits are durable within one
+// wal_writer_delay) while now going through the plain-lock backend-flush path.
+// The wal_writer_flush_after / page-rounding / write-only split activate once
+// the early-wakeup latch lands (deferred; see the deferral ledger).
+func (w *Writer) BackgroundWrite() error {
+	st := w.stateRef
+	frontier := st.publishedFrontier()
+	if frontier == 0 || frontier <= w.flushedLSNAtomic.Load() {
+		return nil // nothing new to make durable
+	}
+	if w.OnWALSync != nil {
+		w.OnWALSync()
+	}
+	if w.OnWALSyncDone != nil {
+		defer w.OnWALSyncDone()
+	}
+	return w.backgroundFlushLocked(frontier)
+}
+
+// backgroundFlushLocked takes writeMu with a plain blocking lock (no group-
+// commit tri-state — the walwriter is a background pre-writer, not a committer)
+// and flushes up to at least frontier. The deferred release is panic-safe:
+// leaking writeMu would wedge every commit (04 §4.7).
+func (w *Writer) backgroundFlushLocked(frontier uint64) (err error) {
+	st := w.stateRef
+	st.writeMu.lock()
+	defer st.writeMu.release()
+	if frontier <= st.flushedLSN {
+		return nil // a committer flushed past us while we waited for the lock
+	}
+	// Widen with anything published since we sampled the frontier (publish-only,
+	// no waiting) so a late-arriving record rides this same fsync.
+	if t := st.publishedFrontier(); t > frontier {
+		frontier = t
+	}
+	err = st.xlogWrite(writeRqst{write: frontier, flush: frontier})
+	if err != nil {
+		w.stickyErr.Store(&flushErr{err: err})
+		return err
+	}
+	w.stickyErr.Store(nil)
 	return nil
 }
 

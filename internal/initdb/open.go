@@ -199,6 +199,10 @@ type OpenOptions struct {
 	// production: 200ms (mirrors upstream's wal_writer_delay GUC).
 	WalWriterDelay time.Duration
 
+	// WalWriterFlushAfter is wal_writer_flush_after in bytes (BootVal 1MB),
+	// forwarded to wal.Config for the background walwriter's fsync throttle.
+	WalWriterFlushAfter int64
+
 	// BgwriterDelay controls the period of the background page-writer
 	// goroutine (M0048-0003). The bgwriter proactively flushes dirty
 	// buffer-pool pages to reduce synchronous I/O on eviction.
@@ -376,16 +380,17 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	}
 
 	walCfg := wal.Config{
-		WALDir:             filepath.Join(abs, "pg_wal"),
-		SegmentSize:        opts.WALSegmentSize, // 0 → wal.DefaultSegmentSize
-		Preallocate:        opts.WALInitZero,
-		SenderMemoryBuffer: opts.WALSenderMemoryBuffer,
-		WALBuffers:         opts.WALBuffers,
-		SyncMethod:         opts.WALSyncMethod,
-		MinWALSize:         opts.WALMinSize,
-		MaxWALSize:         opts.WALMaxSize,
-		CommitDelayUs:      opts.CommitDelayUs,
-		CommitSiblings:     opts.CommitSiblings,
+		WALDir:              filepath.Join(abs, "pg_wal"),
+		SegmentSize:         opts.WALSegmentSize, // 0 → wal.DefaultSegmentSize
+		Preallocate:         opts.WALInitZero,
+		SenderMemoryBuffer:  opts.WALSenderMemoryBuffer,
+		WALBuffers:          opts.WALBuffers,
+		SyncMethod:          opts.WALSyncMethod,
+		MinWALSize:          opts.WALMinSize,
+		MaxWALSize:          opts.WALMaxSize,
+		CommitDelayUs:       opts.CommitDelayUs,
+		CommitSiblings:      opts.CommitSiblings,
+		WalWriterFlushAfter: opts.WalWriterFlushAfter,
 		// M0101-0001: emit PG-compatible XLOG page headers so pg_waldump
 		// can parse the WAL segments. SystemID is embedded in every page
 		// header for cross-segment consistency checking.
@@ -2145,9 +2150,12 @@ func Open(opts OpenOptions) (*Runtime, error) {
 			for {
 				select {
 				case <-ticker.C:
-					// Drain and sync any buffered WAL. Fast no-op when
-					// nothing was written since the last flush.
-					_ = walWriter.FlushUpTo(walWriter.WrittenLSN())
+					// Background pre-write+flush (PG XLogBackgroundFlush):
+					// drain and sync the published WAL frontier under the
+					// plain WAL write lock so buffered bytes reach disk even
+					// with no commits in flight. Fast no-op when nothing was
+					// written since the last flush.
+					_ = walWriter.BackgroundWrite()
 				case <-stop:
 					return
 				}
