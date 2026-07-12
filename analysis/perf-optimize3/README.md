@@ -44,6 +44,10 @@ floor — see 02 for the storage-dependence discussion.
   function level
 - [04-improvement-candidates.md](04-improvement-candidates.md) — ranked fix
   directions with expected impact and blast radius, plus observability gaps
+- [05-improvement-designs/](05-improvement-designs/README.md) — **detailed,
+  implementation-ready designs**: C1/C2/C3 full (slice-decomposed with
+  per-slice gates), C4/C5 direction docs, observability appendix, cross-risk
+  register
 
 Artifacts: `runs/20260713_004324/` (pgbench outputs, wait samples, size/WAL
 snapshots, pprof profiles, env provenance, `SUMMARY.txt`; AUX in `aux/`,
