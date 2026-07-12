@@ -327,6 +327,14 @@ type Writer struct {
 	// fast exit in XLogFlush (analysis/perf-optimize2, fix-03).
 	flushedLSNAtomic atomic.Uint64
 
+	// drainedLSNAtomic mirrors state.drainedLSN — the highest LSN whose bytes
+	// have been drained from the ring to the segment files (pwritten to the OS
+	// cache, not necessarily fdatasync'd). This is the goopg analog of PG's
+	// logWriteResult; the background walwriter reads it to decide whether a
+	// pre-write round has anything to do (docs/design/wal-backend-flush/, 03/04).
+	// Invariant: writeLSNAtomic >= drainedLSNAtomic >= flushedLSNAtomic.
+	drainedLSNAtomic atomic.Uint64
+
 	// subscribers receive a non-blocking wake-up after every
 	// successful Append. Used by RecordIterator (and walsender
 	// goroutines) to block until more WAL is available instead of
@@ -437,6 +445,12 @@ type state struct {
 	// sync barrier (in flushUpTo, after the fdatasync loop). The Writer
 	// reads it in FlushUpTo for the pre-enqueue already-flushed fast exit.
 	flushedLSNMirror *atomic.Uint64
+
+	// drainedLSNMirror, when non-nil, gets drainedLSN stored after Stage 1 of
+	// xlogWrite (bytes pwritten to segment files). The Writer / walwriter read
+	// it via drainedLSNAtomic. Single-writer-at-a-time (the WAL-write-lock
+	// holder), so a plain Store is safe.
+	drainedLSNMirror *atomic.Uint64
 
 	// onAppend, when non-nil, is invoked after every successful
 	// append to wake subscribers (RecordIterators, walsender
@@ -596,6 +610,8 @@ func NewWriter(cfg Config) (*Writer, error) {
 	st.writeLSNMirror = &w.writeLSNAtomic
 	w.flushedLSNAtomic.Store(st.flushedLSN)
 	st.flushedLSNMirror = &w.flushedLSNAtomic
+	w.drainedLSNAtomic.Store(st.drainedLSN)
+	st.drainedLSNMirror = &w.drainedLSNAtomic
 	st.onAppend = w.notifyAppend
 	st.onLoopStart = cfg.OnLoopStart
 	st.onLoopEnd = cfg.OnLoopEnd
@@ -1942,33 +1958,66 @@ func (s *state) doSync(f *os.File) error {
 	return dataSync(f)
 }
 
-func (s *state) flushUpTo(lsn uint64) error {
-	if lsn == 0 {
+// writeRqst describes a WAL write/flush request, the goopg analog of
+// PostgreSQL's XLogwrtRqst. `flush == 0` means "write ring bytes to the segment
+// files (OS cache) only, do NOT fdatasync" — the walwriter pre-write and the
+// ring-overflow-drain path (PG's AdvanceXLInsertBuffer eviction, WriteRqst.Flush
+// == 0). A committer always passes flush == write. See
+// docs/design/wal-backend-flush/ 03 §3.2 / 04 §4.5.
+type writeRqst struct {
+	write uint64 // drain ring bytes up to here into segment files (pwrite)
+	flush uint64 // additionally fdatasync segments up to here; 0 = write-only
+}
+
+// xlogWrite is the goopg analog of PostgreSQL's XLogWrite: Stage 1 drains
+// buffered WAL bytes ≤ rq.write from the ring to segment files ("written to the
+// OS cache", published via drainedLSNAtomic = PG logWriteResult); Stage 2, only
+// when rq.flush > 0, fdatasyncs the dirty segments ≤ rq.flush ("durable",
+// published via flushedLSNAtomic = PG logFlushResult, AFTER the sync).
+//
+// Today it is called only by the writer goroutine with rq.write == rq.flush, so
+// it is behavior-identical to the pre-slice-2 flushUpTo. In the backend-driven
+// model (slice 3+) the caller holds the WAL write lock and passes a widened
+// frontier; the walwriter (slice 4) and the overflow drain pass rq.flush == 0.
+func (s *state) xlogWrite(rq writeRqst) error {
+	if rq.write == 0 {
 		return nil
 	}
-	// Use writeLSNMirror (atomic) so LSNs written by concurrent
-	// tryAppend goroutines under RLock are visible here without holding appendMu.
+	// Bound rq.write against the written frontier. Use writeLSNMirror (atomic)
+	// so LSNs written by concurrent tryAppend goroutines under RLock are visible
+	// here without holding appendMu.
 	writtenLSN := s.writeLSN
 	if s.writeLSNMirror != nil {
 		if m := s.writeLSNMirror.Load(); m > writtenLSN {
 			writtenLSN = m
 		}
 	}
-	if lsn > writtenLSN {
-		return fmt.Errorf("%w: have %d, need %d", ErrLSNNotWritten, writtenLSN, lsn)
+	if rq.write > writtenLSN {
+		return fmt.Errorf("%w: have %d, need %d", ErrLSNNotWritten, writtenLSN, rq.write)
 	}
-	if lsn <= s.flushedLSN {
+
+	// --- Stage 1: drain ring bytes ≤ rq.write to segment files (pwrite) ---
+	// (M0013-0001) No-op when walBuf is nil or already drained past rq.write.
+	if rq.write > s.drainedLSN {
+		if err := s.drainBufferUpTo(rq.write); err != nil {
+			return err
+		}
+	}
+	// Publish the OS-cache write frontier (PG logWriteResult). Single writer at
+	// a time (writer goroutine today; the write-lock holder in slice 3+).
+	if s.drainedLSNMirror != nil {
+		s.drainedLSNMirror.Store(s.drainedLSN)
+	}
+
+	// --- Stage 2: fdatasync dirty segments ≤ rq.flush (skipped when write-only) ---
+	if rq.flush == 0 {
+		return nil
+	}
+	if rq.flush <= s.flushedLSN {
 		return nil
 	}
 
-	// Stage 1 (M0013-0001): drain walBuf bytes ≤ lsn to segment
-	// files so Stage 2's dataSync covers every byte the caller
-	// asked for. No-op when walBuf is nil or already drained.
-	if err := s.drainBufferUpTo(lsn); err != nil {
-		return err
-	}
-
-	targetSeg := segmentForLSN(lsn, s.cfg.SegmentSize)
+	targetSeg := segmentForLSN(rq.flush, s.cfg.SegmentSize)
 	dirty := make([]uint64, 0, len(s.dirty))
 	for seg := range s.dirty {
 		if seg <= targetSeg {
@@ -1995,12 +2044,12 @@ func (s *state) flushUpTo(lsn uint64) error {
 		delete(s.dirty, seg)
 	}
 
-	s.flushedLSN = lsn
+	s.flushedLSN = rq.flush
 	// Publish the durable LSN AFTER the fdatasync loop above so FlushUpTo's
 	// pre-enqueue fast exit only ever observes a genuinely durable value
 	// (analysis/perf-optimize2, fix-03).
 	if s.flushedLSNMirror != nil {
-		s.flushedLSNMirror.Store(lsn)
+		s.flushedLSNMirror.Store(rq.flush)
 	}
 	// M0057-0001: log each WAL flush so benchmark runs show WAL writer
 	// activity. Demoted to Debug (fix-03): at c=50 simple-update this fired
@@ -2010,8 +2059,22 @@ func (s *state) flushUpTo(lsn uint64) error {
 	if l == nil {
 		l = slog.Default()
 	}
-	l.Debug("walwriter flush", "lsn", lsn, "segments_fsynced", len(dirty))
+	l.Debug("walwriter flush", "lsn", rq.flush, "segments_fsynced", len(dirty))
 	return nil
+}
+
+// flushUpTo persists WAL bytes up to lsn with fdatasync semantics (write ==
+// flush). Thin wrapper over xlogWrite retained for the current writer-goroutine
+// caller; the lsn == 0 and already-flushed fast paths preserve the pre-slice-2
+// semantics exactly.
+func (s *state) flushUpTo(lsn uint64) error {
+	if lsn == 0 {
+		return nil
+	}
+	if lsn <= s.flushedLSN {
+		return nil
+	}
+	return s.xlogWrite(writeRqst{write: lsn, flush: lsn})
 }
 
 // removeOldSegments retires every segment whose final byte sits
