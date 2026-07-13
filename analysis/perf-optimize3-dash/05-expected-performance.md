@@ -78,3 +78,38 @@ The 06-appendix items from perf-optimize3/05 (notably `pg_stat_wal.wal_bytes`
 / `wal_fpi` wiring) make the §2 curve visible in production; under
 native-only the `wal_fpi` double-count caveat recorded there disappears (only
 native images remain — the counter becomes PG-comparable immediately).
+
+## 6. S5 actuals (2026-07-13, commit dff94fca, tmp/goopg-bench-bin optimized build)
+
+run_rw50.sh (scale 100, c=50, T=120, uncapped, engines sequential; PG 18.3
+same host for env-consistency: pg -S 194-196k / -N 15.3-15.8k both runs):
+
+| metric | canonical ON | native-only OFF (default) | delta |
+|---|---|---|---|
+| `-N` TPS | 1,765 | **2,689** | **+52%** |
+| UPDATE latency | 1.019 ms | **0.560 ms** | -45% |
+| INSERT latency | 0.881 ms | **0.278 ms** | -68% |
+| `-S` TPS | 94.9k | 92.8k | neutral (±2%, §3 asserted) |
+
+aux2_fsync_probe.sh (60 s, strace-child AUX conditions, drain-bytes basis):
+
+| metric | ON | OFF | PG (prior aux2) |
+|---|---|---|---|
+| WAL bytes/txn | 30.7 KB (2.29 GB / 72,993) | **6.3 KB** (492 MB / 75,820) | 2.85 KB |
+| fdatasync count | 17,196 | 19,467 | — |
+
+Convergence (§2 curve): DUR=600 off-mode run drained 3.01 GB over 837,817
+txns = **3.5 KB/txn** — first-touch images amortize toward PG's ~2.9 KB.
+
+Notes vs the §2/§3 model:
+- OFF-mode bytes beat the ~16.5 KB @60 s prediction (6.3 KB): the model
+  predates doc 03 rev 5 — the eviction-stash fix removed the reload
+  re-images the model still counted.
+- The per-commit fsync floor is unchanged between modes (17.2k vs 19.5k
+  fdatasync in 60 s) — C2 territory, as §3 predicted.
+- Write gap vs PG at T=120: 5.9x (was 12.3x at perf-optimize3 baseline
+  conditions; remaining gap = fsync floor + M4 engine tax).
+- Raw artifacts: analysis/perf-optimize3/runs/s5_{off,on}_dff94fca/
+  (the off aux2 files were re-used for the DUR=600 convergence pass; the
+  60 s off numbers above are from the first pass, recorded here).
+

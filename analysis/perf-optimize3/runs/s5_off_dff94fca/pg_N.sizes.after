@@ -1,0 +1,7 @@
+pgbench_accounts|1365884928
+pgbench_accounts_pkey|224641024
+pgbench_branches|8192
+pgbench_branches_pkey|16384
+pgbench_history|99049472
+pgbench_tellers|49152
+pgbench_tellers_pkey|40960
