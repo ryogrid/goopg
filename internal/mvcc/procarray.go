@@ -44,7 +44,8 @@ type procSlot struct {
 	isolation    int32         // IsolationLevel stored as int32
 	inTxn        atomic.Uint32 // 1 = active txn; 0 = idle
 	pinnedSnap   atomic.Bool   // true once an RR/SSI snapshot is pinned for the txn
-	_pad         [24]byte      // explicit pad to 64 B
+	connHeld     atomic.Uint32 // 1 = a live CONNECTION owns this slot (spans txns)
+	_pad         [20]byte      // explicit pad to 64 B
 }
 
 // ProcArray is the shared array of per-backend transaction slots.

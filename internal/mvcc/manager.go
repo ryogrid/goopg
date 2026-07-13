@@ -128,6 +128,9 @@ type Manager struct {
 	// within a Manager lifetime, so the counter wraps modulo procArray size.
 	autoProcNum atomic.Int32
 
+	// connSlotCursor rotates AcquireConnSlot's scan start (see its doc).
+	connSlotCursor atomic.Int32
+
 	// Cold path: SSI + predicate locks share ssiMu.
 	ssiMu          sync.Mutex
 	ssiState       ssiState
@@ -461,6 +464,47 @@ func (m *Manager) SnapshotFor(tx Transaction) (Snapshot, error) {
 	default:
 		return Snapshot{}, fmt.Errorf("mvcc: unsupported isolation level %v", tx.Isolation)
 	}
+}
+
+// AcquireConnSlot claims a free connection proc slot for the lifetime of
+// one client connection and returns its procNum; ReleaseConnSlot frees it
+// at disconnect. Connection-level ownership (connHeld) is DISTINCT from
+// per-transaction occupancy (inTxn): an idle connection holds its slot
+// between transactions.
+//
+// This replaces the historical `(pid-1) % ConnSlotCount` assignment in the
+// server, which WRAPPED once cumulative connections exceeded the slot
+// count and handed a live long-running session's slot to a brand-new
+// connection — the new session's Begin then clobbered the victim's
+// in-flight transaction ("mvcc: unknown transaction" storms ~180 s into
+// any run with ~5 conn/s churn, found by the C3-S5 soak's wait-event
+// sampler). Slot 0 stays reserved for explicit-procNum callers.
+func (m *Manager) AcquireConnSlot() (int32, error) {
+	sz := min(ConnSlotCount, len(m.procArray.slots))
+	// Round-robin from a rotating cursor rather than lowest-free: always
+	// reusing the just-freed slot puts a brand-new connection on a
+	// procNum whose previous owner's peripheral state (activity registry,
+	// per-backend undo bookkeeping) may still be draining — the temporal
+	// spacing the old modulo scheme provided implicitly. The cursor keeps
+	// that spacing while still never handing out a HELD slot.
+	start := m.connSlotCursor.Add(1)
+	for off := int32(0); off < int32(sz-1); off++ {
+		i := 1 + (start+off)%int32(sz-1)
+		if m.procArray.slots[i].connHeld.CompareAndSwap(0, 1) {
+			return i, nil
+		}
+	}
+	return 0, fmt.Errorf("mvcc: no free connection slots (max %d concurrent connections)", sz-1)
+}
+
+// ReleaseConnSlot returns a connection's slot to the free pool. The caller
+// must have finished/rolled back any open transaction first (connection
+// teardown does).
+func (m *Manager) ReleaseConnSlot(procNum int32) {
+	if procNum <= 0 || int(procNum) >= len(m.procArray.slots) {
+		return
+	}
+	m.procArray.slots[procNum].connHeld.Store(0)
 }
 
 // Commit marks tx committed and removes it from the active set.

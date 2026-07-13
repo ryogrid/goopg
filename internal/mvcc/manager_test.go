@@ -840,3 +840,40 @@ func TestCommit_XactMarkerErrorFailsCommitAndStaysInProgress(t *testing.T) {
 		t.Fatalf("xid %d no longer active after a failed sync-commit flush — it must stay in-progress", xid)
 	}
 }
+
+// TestConnSlotChurnDoesNotClobberLiveSlots pins the AcquireConnSlot fix:
+// the historical (pid-1)%ConnSlotCount assignment wrapped after
+// ConnSlotCount cumulative connections and handed a LIVE session's slot to
+// a new connection (soak finding: "mvcc: unknown transaction" storms once
+// a 5 conn/s sampler pushed the counter past ~1000 at ~180s). Churning
+// far more acquire/release cycles than the array size must never touch a
+// held slot.
+func TestConnSlotChurnDoesNotClobberLiveSlots(t *testing.T) {
+	m := NewManager()
+	held, err := m.AcquireConnSlot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := m.Begin(IsolationReadCommitted, held)
+	if err != nil {
+		t.Fatalf("Begin(at %d): %v", held, err)
+	}
+	for i := 0; i < 5*DefaultProcArraySize; i++ {
+		p, err := m.AcquireConnSlot()
+		if err != nil {
+			t.Fatalf("churn acquire %d: %v", i, err)
+		}
+		if p == held {
+			t.Fatalf("churn handed out the HELD slot %d at cycle %d", held, i)
+		}
+		m.ReleaseConnSlot(p)
+	}
+	// The long-lived session's transaction is still intact.
+	if _, err := m.SnapshotFor(tx); err != nil {
+		t.Fatalf("held session's txn lost after churn: %v", err)
+	}
+	if err := m.Commit(tx); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	m.ReleaseConnSlot(held)
+}

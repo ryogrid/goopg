@@ -39,11 +39,16 @@ const (
 //	offset 24: _pad1       (40 B)
 //	total:                 64 B
 type activitySlot struct {
-	waitInfo    atomic.Uint32  // packed (typeCode<<16)|eventCode; 0 = no wait
-	_pad0       [4]byte        //nolint:structcheck // explicit alignment padding
-	stateChange atomic.Int64   // unix nanos; updated on every WaitEvent* call
-	cold        *coldActivity  // set once at Acquire; nil when slot is free
-	_pad1       [40]byte       //nolint:structcheck // pad to 64 B
+	waitInfo    atomic.Uint32 // packed (typeCode<<16)|eventCode; 0 = no wait
+	_pad0       [4]byte       //nolint:structcheck // explicit alignment padding
+	stateChange atomic.Int64  // unix nanos; updated on every WaitEvent* call
+	// cold is an atomic pointer (C3-S5 fix): connection proc slots are
+	// now RECYCLED on disconnect (mvcc.AcquireConnSlot), so a re-acquire
+	// of a just-freed slot races concurrent registry scans
+	// (CountByDatName / Snapshot) on this field — plain pointer accesses
+	// were only quiet under the old never-reused modulo procNums.
+	cold  atomic.Pointer[coldActivity] // set at acquire; nil when slot is free
+	_pad1 [40]byte                     //nolint:structcheck // pad to 64 B
 }
 
 // Compile-time assertion: activitySlot must be exactly 64 bytes.
@@ -71,12 +76,12 @@ type coldActivity struct {
 
 	// Mutable; updated at transaction / query boundaries by the owning backend.
 	// Atomic so Snapshot() readers see consistent values without taking a lock.
-	XactStart  atomic.Int64  // unix nanos; 0 = not in transaction
-	QueryStart atomic.Int64  // unix nanos; 0 = no active query
-	State      atomic.Uint32 // backendStateCode
-	BackendXID atomic.Uint64
+	XactStart   atomic.Int64  // unix nanos; 0 = not in transaction
+	QueryStart  atomic.Int64  // unix nanos; 0 = no active query
+	State       atomic.Uint32 // backendStateCode
+	BackendXID  atomic.Uint64
 	BackendXMin atomic.Uint64
-	Query      atomic.Pointer[string] // nil = no active query
+	Query       atomic.Pointer[string] // nil = no active query
 
 	// TrackIOTimingOn is this backend's effective track_io_timing
 	// setting. Seeded at connection setup from the session's boot-time
@@ -294,7 +299,7 @@ func (r *ActivityRegistry) UpdateState(procNum int32, state, query string) {
 	if procNum < 0 || int(procNum) >= len(r.slots) {
 		return
 	}
-	c := r.slots[procNum].cold
+	c := r.slots[procNum].cold.Load()
 	if c == nil {
 		return
 	}
@@ -338,7 +343,7 @@ func (r *ActivityRegistry) BeginTransaction(pid string) {
 	if procNum < 0 || int(procNum) >= len(r.slots) {
 		return
 	}
-	c := r.slots[procNum].cold
+	c := r.slots[procNum].cold.Load()
 	if c == nil {
 		return
 	}
@@ -359,7 +364,7 @@ func (r *ActivityRegistry) EndTransaction(pid string) {
 	if procNum < 0 || int(procNum) >= len(r.slots) {
 		return
 	}
-	c := r.slots[procNum].cold
+	c := r.slots[procNum].cold.Load()
 	if c == nil {
 		return
 	}
@@ -375,7 +380,7 @@ func (r *ActivityRegistry) GetBackendType(procNum int32) string {
 	if procNum < 0 || int(procNum) >= len(r.slots) {
 		return ""
 	}
-	c := r.slots[procNum].cold
+	c := r.slots[procNum].cold.Load()
 	if c == nil {
 		return ""
 	}
@@ -391,7 +396,7 @@ func (r *ActivityRegistry) PIDForProcNum(procNum int32) string {
 	if procNum < 0 || int(procNum) >= len(r.slots) {
 		return ""
 	}
-	c := r.slots[procNum].cold
+	c := r.slots[procNum].cold.Load()
 	if c == nil {
 		return ""
 	}
@@ -415,7 +420,7 @@ func (r *ActivityRegistry) Snapshot() []Backend {
 	out := make([]Backend, 0, 32)
 	for i := range r.slots {
 		s := &r.slots[i]
-		c := s.cold
+		c := s.cold.Load()
 		if c == nil {
 			continue
 		}
@@ -468,7 +473,7 @@ func (r *ActivityRegistry) Snapshot() []Backend {
 func (r *ActivityRegistry) CountByDatName(name string) int32 {
 	var n int32
 	for i := range r.slots {
-		if c := r.slots[i].cold; c != nil && c.DatName == name {
+		if c := r.slots[i].cold.Load(); c != nil && c.DatName == name {
 			n++
 		}
 	}
@@ -493,7 +498,7 @@ func (r *ActivityRegistry) acquire(procNum int32, cold *coldActivity) {
 		return
 	}
 	s := &r.slots[procNum]
-	s.cold = cold
+	s.cold.Store(cold)
 	s.waitInfo.Store(0)
 	s.stateChange.Store(runtimeshim.Nanotime())
 }
@@ -503,7 +508,7 @@ func (r *ActivityRegistry) release(procNum int32) {
 		return
 	}
 	s := &r.slots[procNum]
-	s.cold = nil
+	s.cold.Store(nil)
 	s.waitInfo.Store(0)
 }
 
@@ -545,7 +550,7 @@ func (r *ActivityRegistry) UpdateApplicationName(procNum int32, name string) {
 	if procNum < 0 || int(procNum) >= len(r.slots) {
 		return
 	}
-	c := r.slots[procNum].cold
+	c := r.slots[procNum].cold.Load()
 	if c == nil {
 		return
 	}
@@ -564,7 +569,7 @@ func (r *ActivityRegistry) UpdateTrackIOTiming(procNum int32, on bool) {
 	if procNum < 0 || int(procNum) >= len(r.slots) {
 		return
 	}
-	c := r.slots[procNum].cold
+	c := r.slots[procNum].cold.Load()
 	if c == nil {
 		return
 	}
@@ -580,7 +585,7 @@ func (r *ActivityRegistry) TrackIOTiming(procNum int32) bool {
 	if procNum < 0 || int(procNum) >= len(r.slots) {
 		return false
 	}
-	c := r.slots[procNum].cold
+	c := r.slots[procNum].cold.Load()
 	if c == nil {
 		return false
 	}
@@ -627,7 +632,7 @@ func (r *ActivityRegistry) UpdateBackendFlushAfter(procNum int32, n int32) {
 	if procNum < 0 || int(procNum) >= len(r.slots) {
 		return
 	}
-	c := r.slots[procNum].cold
+	c := r.slots[procNum].cold.Load()
 	if c == nil {
 		return
 	}
@@ -648,7 +653,7 @@ func (r *ActivityRegistry) BackendFlushAfterOverride() (int32, bool) {
 	if !ok || reg != r {
 		return 0, false
 	}
-	c := reg.slots[procNum].cold
+	c := reg.slots[procNum].cold.Load()
 	if c == nil {
 		return 0, false
 	}
