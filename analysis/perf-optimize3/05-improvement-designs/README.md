@@ -1,5 +1,10 @@
 # perf-optimize3 / 05 — Improvement design bundle
 
+> **perf-optimize3-dash note (2026-07-13)**: C1's FPI-gating machinery (§4.2) is
+> inherited by perf-optimize3-dash/03 (published-redo watermark, landed); C1's
+> record-shape work is now the canonical **resume path** (re-enable with
+> GOOPG_WAL_CANONICAL=on). C2/C3 are unaffected by the native-only default.
+
 date: 2026-07-13 · designs against goopg `e453e3f2`+`b28e2a80` · status: design only
 (implementation not started)
 

@@ -60,20 +60,30 @@ func runCanonicalSwitchWorkload(t *testing.T, dir string) {
 	rt.Close()
 }
 
-// TestEmitCanonicalSwitch pins the perf-optimize3-dash S1 switch semantics:
-// default (and =on) emits canonical records; =off yields a native-only
-// stream in which the ONLY RecordKindCanonical envelope left is the retained
-// XLOG_PARAMETER_CHANGE.
+// TestEmitCanonicalSwitch pins the perf-optimize3-dash S1 switch + S4
+// default semantics: default (unset) and =off yield a native-only stream in
+// which the ONLY RecordKindCanonical envelope left is the retained
+// XLOG_PARAMETER_CHANGE; =on emits canonical records.
 func TestEmitCanonicalSwitch(t *testing.T) {
-	t.Run("default_on", func(t *testing.T) {
-		// Pin the mode explicitly so an ambient GOOPG_WAL_CANONICAL=off in
-		// the developer's shell cannot flip this subtest (review nit 2).
+	t.Run("default_native_only", func(t *testing.T) {
+		// S4: the unset default is native-only. Clear any ambient override.
+		t.Setenv("GOOPG_WAL_CANONICAL", "")
+		dir := filepath.Join(t.TempDir(), "data")
+		runCanonicalSwitchWorkload(t, dir)
+		other, _ := countCanonicalRecords(t, dir)
+		if other != 0 {
+			t.Fatalf("S4 default: found %d canonical content records; want 0 (native-only)", other)
+		}
+	})
+
+	t.Run("env_on_emits_canonical", func(t *testing.T) {
+		// The resume path: explicit on restores canonical emission.
 		t.Setenv("GOOPG_WAL_CANONICAL", "on")
 		dir := filepath.Join(t.TempDir(), "data")
 		runCanonicalSwitchWorkload(t, dir)
 		other, _ := countCanonicalRecords(t, dir)
 		if other == 0 {
-			t.Fatalf("default mode: expected canonical records in the stream, found none")
+			t.Fatalf("env on: expected canonical records in the stream, found none")
 		}
 	})
 

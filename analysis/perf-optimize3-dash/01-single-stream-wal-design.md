@@ -1,5 +1,11 @@
 # 01 — Single-stream WAL: the `EmitCanonical` switch
 
+> **Implementation note (S4, 2026-07-13)**: the switch landed env-only
+> (`GOOPG_WAL_CANONICAL` resolved by `emitCanonicalDefault()` at every
+> `initdb.Open()`); the §3.1 `OpenOptions.EmitCanonical` field and
+> `testutil.WithCanonical` helper were not needed — in-process suites flip
+> modes with `t.Setenv`, subprocess harnesses inherit the env.
+
 status: design · date: 2026-07-13 · base: `e453e3f2` · slices: S1 (switch,
 default ON), S4 (default flip) · gates: see [README](README.md)
 

@@ -1,5 +1,10 @@
 # C1 — Incremental canonical heap WAL records
 
+> **perf-optimize3-dash note (2026-07-13)**: §4.2's redo-pointer FPI gating landed
+> via perf-optimize3-dash/03 (nativeImageLSN watermark + PublishRedoBarrier). The
+> incremental record-shape work in this doc is the RESUME path for canonical
+> emission, which is now off by default (GOOPG_WAL_CANONICAL).
+
 status: design (rev 2 — adversarial review incorporated) · date: 2026-07-13 ·
 base: goopg `e453e3f2` · depends on: nothing (S1/S2a/S2b may run in parallel
 with C2) · gate names: see

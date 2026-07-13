@@ -1,5 +1,9 @@
 # 0101-0001 — WAL Page Header Compatibility: Enable PG-Compatible Format by Default
 
+> **perf-optimize3-dash S4 note (2026-07-13)**: PageHeaders (the FRAME format
+> this doc establishes) stays ON and is now independent of canonical record
+> CONTENT emission (`EmitCanonical`, default off — native-only stream).
+
 **Status:** accepted
 **Date:** 2026-05-13
 **Milestone:** M0101-0001, M0101-0002

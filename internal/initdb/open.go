@@ -37,9 +37,10 @@ func pgTimestampNowUsec() int64 { return time.Since(pgEpoch2000).Microseconds() 
 // flip modes with t.Setenv. Not a GUC: no PostgreSQL equivalent exists and
 // the postgresql.conf.sample template stays PG-parity (0108-0001).
 //
-//	GOOPG_WAL_CANONICAL=on|1|true   -> emit canonical records
+//	GOOPG_WAL_CANONICAL=on|1|true   -> emit canonical records (the resume
+//	                                   path: re-enable + land C1)
 //	GOOPG_WAL_CANONICAL=off|0|false -> native-only stream
-//	unset                           -> default (S1: on; flipped off in S4)
+//	unset                           -> default OFF (native-only; slice S4)
 func emitCanonicalDefault() bool {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("GOOPG_WAL_CANONICAL"))) {
 	case "on", "1", "true":
@@ -47,7 +48,9 @@ func emitCanonicalDefault() bool {
 	case "off", "0", "false":
 		return false
 	}
-	return true // slice S1 default: canonical ON (behavior-identical)
+	// Slice S4 (perf-optimize3-dash): native-only is the production default.
+	// Real-PG-standby compatibility is deferred — see the deferral ledger.
+	return false
 }
 
 // Runtime is the bundle of long-lived handles a running goopg
@@ -417,8 +420,8 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		PageHeaders: true,
 		// Canonical-family content gating (analysis/perf-optimize3-dash/01):
 		// resolved from GOOPG_WAL_CANONICAL at every Open() so in-process
-		// test suites can flip modes with t.Setenv. Slice S1 default: ON
-		// (behavior-identical); the S4 slice flips the default to OFF.
+		// test suites can flip modes with t.Setenv. Default OFF since slice
+		// S4 (native-only WAL; real-PG-standby compat deferred).
 		EmitCanonical: emitCanonicalDefault(),
 		SystemID:      systemID,
 		TimelineID:    tli,
@@ -437,6 +440,15 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	if err != nil {
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: wal: %w", err)
+	}
+	if !walWriter.CanonicalEnabled() {
+		// perf-optimize3-dash S4: an already-attached real-PG standby would
+		// keep streaming but silently apply nothing from a native-only
+		// primary (PG's xlog_redo no-ops unknown RmgrXLog info bits), so
+		// announce the family at startup where the BASE_BACKUP clone-time
+		// WARN cannot reach.
+		slog.Info("WAL canonical emission disabled (native-only stream); " +
+			"real-PG standbys cannot replay this WAL — set GOOPG_WAL_CANONICAL=on to re-enable")
 	}
 
 	// Bridge the buffer pool's FPI hook to the WAL writer.

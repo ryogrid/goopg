@@ -1,5 +1,9 @@
 # 0102-0003 — Heterogeneous Failover E2E Harness
 
+> **perf-optimize3-dash S4 note (2026-07-13)**: goopg→real-PG replay is DEFERRED
+> under the native-only WAL default; TestE2E_FailoverGoopgToPG assert-skips unless
+> GOOPG_WAL_CANONICAL=on (deferral ledger; resume = env on + perf-optimize3/05 C1).
+
 **Status:** accepted (implemented 2026-05-20)
 **Date:** 2026-05-13
 **Milestone:** M0102-0006, M0102-0007, M0102-0008

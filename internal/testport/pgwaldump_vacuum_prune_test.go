@@ -64,6 +64,7 @@ func segmentIsAllZero(t *testing.T, path string) bool {
 }
 
 func TestPort_PgWaldumpVacuumPruneRoundtrip(t *testing.T) {
+	skipUnlessCanonicalWAL(t) // perf-optimize3-dash S4: canonical rmgr content (WD-004 deferred)
 	waldump := findPGWaldumpBin(t)
 	psqlBin := clientToolBin(t, "psql")
 	if psqlBin == "" {

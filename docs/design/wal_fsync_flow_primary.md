@@ -1,5 +1,9 @@
 # Processing Flow from WAL Generation to fdatasync Durability on Primary
 
+> **perf-optimize3-dash S4 note (2026-07-13)**: with EmitCanonical off (default)
+> the commit path no longer appends a canonical XLOG_XACT_COMMIT record, so the
+> flush-wait endLSN is the native commit record's end.
+
 This note summarizes the current goopg execution path from WAL generation to fdatasync-based durability, following the actual call order in code.
 
 ## Overview

@@ -29,6 +29,7 @@ func TestE2E_FailoverGoopgToPG(t *testing.T) {
 	if testing.Short() || os.Getenv("GOOPG_SKIP_M0102_E2E") != "" {
 		t.Skip("skipping heterogeneous failover e2e (short mode or GOOPG_SKIP_M0102_E2E set)")
 	}
+	skipUnlessCanonicalWAL(t) // perf-optimize3-dash S4: real-PG consumer
 
 	repo := repoRoot(t)
 	binDir := filepath.Join(repo, "postgres", "local_install", "bin")

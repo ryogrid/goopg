@@ -1,5 +1,11 @@
 # 0103-0018 — Heap FPI and Logical-Record Coexistence
 
+> **perf-optimize3-dash S4 note (2026-07-13)**: the CANONICAL half of this
+> coexistence is gated off by default (`EmitCanonical`/`GOOPG_WAL_CANONICAL`,
+> native-only stream); the native logical-record + first-touch-image half
+> described here is unchanged and now keyed on the published redo pointer
+> (perf-optimize3-dash/03 rev 4) rather than the per-slot epoch flag.
+
 **Status:** Accepted (2026-05-14, M0103-0008 rung 12 second half)
 **Owner:** logical replication / WAL
 **Tracks:** `.ralph/fix_plan.md` → M0103-0008 (Scenario B E2E: goopg primary

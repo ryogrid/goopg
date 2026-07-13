@@ -1,5 +1,8 @@
 # 0110-0002 — pg_waldump TAP test port (001_basic CLI tier)
 
+> **perf-optimize3-dash S4 note (2026-07-13)**: WD-003/WD-004 are deferred
+> (assert-skip) under the native-only WAL default; resume = GOOPG_WAL_CANONICAL=on + C1.
+
 Status: accepted (partial)
 Milestone: M0110-0002
 Date: 2026-06-13
