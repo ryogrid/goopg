@@ -582,9 +582,15 @@ func (c *Checkpointer) runCheckpoint(ctx context.Context, spread, shutdown bool)
 	if err := c.wal.FlushUpTo(endLSN); err != nil {
 		return fmt.Errorf("flush checkpoint marker up to lsn %d: %w", endLSN, err)
 	}
-	// M0102-0007: store REDO LSN (start of checkpoint record) for
-	// BASE_BACKUP so pg_control carries a valid redo point.
-	c.lastCheckpointRedoLSN.Store(startLSN)
+	// M0102-0007 / C2-S3 (review MUST-FIX): store the checkpoint's REDO
+	// pointer — the position published at checkpoint START — not the
+	// checkpoint record's own start. Records in the (redo, record] window
+	// cover state the dirty-page/CLOG flush phase may not have captured
+	// (a commit acked mid-flush leaves only its WAL record), so BASE_BACKUP
+	// streams and recovery must begin at redo, exactly like PG's
+	// checkPoint.redo. Stored 1-based (internal convention; redoLSN0 is
+	// 0-based).
+	c.lastCheckpointRedoLSN.Store(redoLSN0 + 1)
 	c.lastCheckpointLSN.Store(endLSN)
 	// Update pg_control on disk so pg_controldata and standbys see the
 	// current checkpoint location. Mirrors CreateCheckPoint (post-flush)
@@ -661,7 +667,12 @@ func (c *Checkpointer) runCheckpoint(ctx context.Context, spread, shutdown bool)
 	// fail the checkpoint — the marker is already durable, and
 	// retention is best-effort.
 	if c.retainer != nil {
-		if err := c.retainer.Retain(endLSN); err != nil {
+		// C2-S3 (review MUST-FIX): retain from the REDO pointer, not the
+		// checkpoint record — recycling the (redo, record] window would
+		// destroy commit records whose CLOG lanes exist only in memory,
+		// making the redo-anchored replay (wal.replayStart) unable to
+		// reconstruct an acked commit after a crash.
+		if err := c.retainer.Retain(redoLSN0 + 1); err != nil {
 			c.cfg.Logger.Warn("wal retention failed", "err", err)
 		}
 	}

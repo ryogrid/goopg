@@ -104,8 +104,18 @@ func (c *CLog) runLeader(self *clogGroupNode) error {
 // flat-file + bank→SLRU mirror alternative once the buffer pool became the
 // only store.
 func (c *CLog) applyGroupBatchLocked() error {
-	// Each batch member's 2-bit lane was already written by setStatus
-	// (p.setStatus). One flushDirty writes every dirty resident page back with
-	// one fsync per touched segment.
-	return c.pool.Load().flushDirty()
+	// C2-S3 (the cut): the eager durable write-back is gone — PG performs
+	// ZERO SLRU I/O at commit (clog.c TransactionIdSetPageStatus sets bits
+	// in the shared buffer under the bank lock only). Each batch member's
+	// 2-bit lane was already written to the resident page by setStatus
+	// before the group formed; durability now rides exclusively on
+	//   (a) the checkpointer's FlushCLOGFn (CLog.FlushAll, error fails the
+	//       checkpoint — pg_xact on disk covers everything before redo),
+	//   (b) pool eviction's writePageToDisk (barrier-protected: the page's
+	//       group LSNs — armed for sync commits since C2-S2 — force a WAL
+	//       FlushUpTo before the bytes reach disk), and
+	//   (c) startup replayCLogFromWAL re-stamping from WAL commit records
+	//       (pinned by TestReplayCLogFromWAL_RecoversUnflushedSyncCommit).
+	// The now-vestigial group machinery itself is removed in C2-S4.
+	return nil
 }

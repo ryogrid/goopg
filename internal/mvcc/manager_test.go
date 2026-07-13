@@ -802,3 +802,41 @@ func TestOldestXminFoldsCatalogXminSource(t *testing.T) {
 		t.Fatalf("OldestXmin after clearing source = %d, want %d", got, base)
 	}
 }
+
+// TestCommit_XactMarkerErrorFailsCommitAndStaysInProgress is the C2-S3
+// fault-injection anchor for the sync-commit flush contract: since the cut,
+// EVERY flush error on the sync path (including wal.ErrLSNNotWritten, which
+// the xact-marker logger used to swallow) is returned from the hook, and
+// Commit must (a) surface the error — the client is never acked — and
+// (b) leave the transaction in-progress so no reader observes it committed.
+// Crash safety follows: an un-acked, in-progress txn is blanket-aborted by
+// MarkUnknownAsAborted on restart, with no durable commit record to
+// resurrect it.
+func TestCommit_XactMarkerErrorFailsCommitAndStaysInProgress(t *testing.T) {
+	m := NewManager()
+	injected := errors.New("injected: sync commit flush: LSN not written")
+	m.SetXactMarkerLogger(func(_ storage.TransactionID, kind XactMarker, waitLocalFlush bool) error {
+		if kind == XactCommit && waitLocalFlush {
+			return injected
+		}
+		return nil
+	})
+	tx, _ := m.Begin(IsolationReadCommitted)
+	// Materialize a real XID so the hook fires (read-only commits skip it).
+	xid, err := m.AssignXID(tx)
+	if err != nil {
+		t.Fatalf("AssignXID: %v", err)
+	}
+	err = m.Commit(tx)
+	if err == nil {
+		t.Fatal("Commit succeeded despite a failing sync-commit flush — the client would be acked for a non-durable commit")
+	}
+	if !errors.Is(err, injected) {
+		t.Fatalf("Commit error = %v, want the injected flush error surfaced", err)
+	}
+	// The txn must still be in-progress for snapshots (finish propagates the
+	// hook error BEFORE the active-set removal).
+	if !m.IsXIDActive(xid) {
+		t.Fatalf("xid %d no longer active after a failed sync-commit flush — it must stay in-progress", xid)
+	}
+}

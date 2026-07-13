@@ -196,15 +196,16 @@ func (c *CLog) SetCommittedWithLSN(xid storage.TransactionID, lsn uint64) error 
 	return c.setStatusWithLSN(xid, TxnStatusCommitted, lsn)
 }
 
-// SetCommittedDurable marks xid committed, associates the commit record's
-// end-LSN with the XID's CLOG page (arming the SLRU write barrier exactly
-// like SetCommittedWithLSN — C2 design D2: a sync page written back later by
-// eviction/checkpoint must not skip the XLogFlush-before-SLRU-write rule),
-// and STILL performs the synchronous group-commit durable write-back.
-// Transitional C2-S2 plumbing for the synchronous-commit path: S3 removes
-// the write-back, collapsing this into SetCommittedWithLSN. For a sync
-// commit the record is already durable at this point, so the armed barrier
-// fast-exits inside FlushUpTo.
+// SetCommittedDurable marks xid committed and associates the commit
+// record's end-LSN with the XID's CLOG page (arming the SLRU write barrier
+// exactly like SetCommittedWithLSN — C2 design D2: a sync page written back
+// later by eviction/checkpoint must not skip the
+// XLogFlush-before-SLRU-write rule). Since the C2-S3 cut the group
+// round-trip below performs NO disk write (applyGroupBatchLocked is
+// I/O-free); the name records the caller's contract — the commit record IS
+// durable before this is called (the sync path's flush precedes it), so
+// the armed barrier fast-exits at write-back time. C2-S4 collapses this
+// into SetCommittedWithLSN together with the group machinery.
 func (c *CLog) SetCommittedDurable(xid storage.TransactionID, lsn uint64) error {
 	p := c.pool.Load()
 	if xid < FirstNormalTransactionID {

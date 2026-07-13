@@ -10251,20 +10251,47 @@ func replayPageImage(mgr *storage.Manager, payload []byte) error {
 	return writeBlockOrExtend(mgr, rel, blk, page)
 }
 
-// replayStart returns the index of the LAST checkpoint record in
-// records plus its EndLSN. Crash recovery should replay records
-// starting from this index: everything before the checkpoint was
-// already flushed to disk by the checkpoint operation.
+// replayStart returns the replay start index plus the last checkpoint
+// record's EndLSN. Crash recovery replays from the last checkpoint's REDO
+// position — NOT from the checkpoint record itself (C2-S3 review MUST-FIX):
+// the checkpoint's dirty-page/CLOG flush phase runs BEFORE its record is
+// appended, so records in the (redo, checkpoint-record] window cover state
+// the flush may not have captured (a commit acked during the flush phase
+// leaves its CLOG lane dirty in memory with its record before the
+// checkpoint record — anchoring at the record skipped it and the startup
+// implicit-abort sweep then stamped the ACKED commit aborted). Mirrors PG:
+// InitWalRecovery starts redo at checkPoint.redo. Replaying the extra
+// (redo, record] span is idempotent — pages carry pd_lsn guards and CLOG
+// stamps are terminal-state writes.
+//
+// The redo pointer is decoded from the PG-compat 88-byte CheckPoint payload
+// (offset 0, 0-based LSN); legacy 1-byte checkpoint records carry no redo
+// and keep the historical record-anchored behavior.
 //
 // If no checkpoint is found, returns (0, 0) — replay all records
 // from the beginning (correct for fresh clusters or early startup).
 func replayStart(records []Record) (int, uint64) {
-	startIdx := 0
+	ckptIdx := -1
 	var checkpointLSN uint64
 	for i, r := range records {
 		if isCheckpointRecord(r) {
-			startIdx = i // start FROM this checkpoint (inclusive)
+			ckptIdx = i
 			checkpointLSN = r.EndLSN
+		}
+	}
+	if ckptIdx < 0 {
+		return 0, 0
+	}
+	startIdx := ckptIdx
+	if p := records[ckptIdx].Payload; len(p) == 88 {
+		redo0 := binary.LittleEndian.Uint64(p[0:8])
+		// Walk back to the first record whose span ends beyond redo.
+		// Record LSNs are 1-based absolute positions; redo0 is 0-based
+		// (EncodeCheckpointCompat), so EndLSN > redo0+? — comparing
+		// EndLSN (1-based) > redo0 (0-based position) errs toward
+		// replaying one extra byte-adjacent record, which is idempotent.
+		for startIdx > 0 && records[startIdx-1].EndLSN > redo0 {
+			startIdx--
 		}
 	}
 	return startIdx, checkpointLSN

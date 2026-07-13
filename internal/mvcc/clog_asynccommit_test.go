@@ -94,11 +94,11 @@ func TestCLogFlushAllBeforePoolExistsIsNoop(t *testing.T) {
 // TestCLogSetCommittedDurableArmsBarrierFastExit inverts the retired
 // TestCLogSetCommittedNoLSNNeverFiresBarrier: since C2-S2 every synchronous
 // commit associates its commit record's end-LSN with the CLOG page
-// (SetCommittedDurable), so the group leader's flushDirty write-back now
-// fires the WAL barrier with that LSN — armed, but cheap: the record is
-// already durable at commit time, so the hook's FlushUpTo fast-exits on the
-// flushed-LSN check. The barrier must observe an LSN >= the one passed in
-// (flushDirty flushes the max across dirty pages).
+// (SetCommittedDurable). Since the C2-S3 cut the commit itself performs NO
+// write-back (asserted below); the armed barrier fires at the next flush
+// point (checkpoint FlushAll here; eviction in production) with an LSN >=
+// the one passed in — cheap for a sync commit, whose record is already
+// durable, so the hook's FlushUpTo fast-exits on the flushed-LSN check.
 func TestCLogSetCommittedDurableArmsBarrierFastExit(t *testing.T) {
 	dir := t.TempDir()
 	c, err := OpenCLog(filepath.Join(dir, "pg_xact_flat"))
@@ -120,6 +120,14 @@ func TestCLogSetCommittedDurableArmsBarrierFastExit(t *testing.T) {
 	const commitLSN = 7777
 	if err := c.SetCommittedDurable(xid, commitLSN); err != nil {
 		t.Fatalf("SetCommittedDurable: %v", err)
+	}
+	// C2-S3: the commit itself performs no write-back; the armed barrier
+	// fires at the next flush point (checkpoint FlushAll / eviction).
+	if flushCalls != 0 {
+		t.Fatalf("flushWAL hook fired %d times AT commit — the C2-S3 cut must leave the commit path I/O-free", flushCalls)
+	}
+	if err := c.FlushAll(); err != nil {
+		t.Fatalf("FlushAll: %v", err)
 	}
 	if flushCalls == 0 {
 		t.Fatal("WAL barrier never fired for a durable sync commit carrying an LSN (D2 requires it armed)")

@@ -8,8 +8,10 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/goopg/goopg/internal/activity"
@@ -927,7 +929,21 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, fmt.Errorf("goopg: restore pg_subtrans: %w", err)
 	}
 	txnMgr.SetSubxactMap(subxactMap)
+	// commitStampMu is goopg's DELAY_CHKPT_START analog (C2-S3 review
+	// MUST-FIX; PG RecordTransactionCommit marks the record-insert →
+	// CLOG-update span so CreateCheckPoint waits it out). Every xact-marker
+	// invocation holds RLock across [WAL append → CLOG stamp]; the
+	// checkpointer's CLOG flush takes Lock+Unlock as a pure barrier first
+	// (see FlushCLOGFn below), so by the time FlushAll scans dirty pages,
+	// every commit whose record predates the scan has stamped its lane —
+	// no acked commit can fall between the CLOG flush and the checkpoint
+	// record with only an in-memory lane. Commits that start after the
+	// barrier have records above the already-published redo, which the
+	// redo-anchored replay (wal.replayStart) re-stamps after a crash.
+	var commitStampMu sync.RWMutex
 	txnMgr.SetXactMarkerLogger(func(xid storage.TransactionID, kind mvcc.XactMarker, waitLocalFlush bool) error {
+		commitStampMu.RLock()
+		defer commitStampMu.RUnlock()
 		var payload []byte
 		switch kind {
 		case mvcc.XactCommit:
@@ -1009,18 +1025,50 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		// associates endLSN with this XID's CLOG page, and
 		// flushWALBeforeWriteLocked flushes the WAL up to it the moment that
 		// page is written back to disk, whenever that happens).
-		if kind == mvcc.XactCommit && waitLocalFlush {
-			if werr := walWriter.FlushUpTo(endLSN); werr != nil {
-				// ErrLSNNotWritten can surface when the WAL buffer
-				// position accounting has a transient race (the WAL
-				// Append comment calls this out for Path A, M0099).
-				// The commit record IS in the WAL buffer and will be
-				// persisted by the next checkpoint or explicit flush.
-				// Treat as non-fatal to avoid aborting transactions
-				// (same as the background flusher on line 1005 of
-				// writer.go which also ignores this sentinel).
+		if waitLocalFlush && (kind == mvcc.XactCommit || kind == mvcc.XactAbort) {
+			// C2-S3: a synchronous COMMIT waits for its flush — it is never
+			// acked with the commit record unflushed (PG's XLogFlush blocks
+			// the committer; design 02 §4 adversarial F3: post-cut the WAL
+			// record is the ONLY durability for the acked commit —
+			// replayCLogFromWAL cannot reconstruct a record that never
+			// reached disk, and MarkUnknownAsAborted would leave the acked
+			// txn aborted). An acked ROLLBACK is flushed too — a goopg
+			// deviation from PG (RecordTransactionAbort never XLogFlushes):
+			// PG survives an unflushed abort because every record carries
+			// xl_xid and redo advances nextXid past it; goopg's native
+			// records don't, so a crashed unflushed abort could leave the
+			// XID unknown AND un-advanced — its rolled-back rows resurrect
+			// when the XID is reused or Unknown falls through to committed
+			// (adversarial review MUST-FIX 2). The durable abort record
+			// makes replay re-stamp Aborted and advance NextXID past it.
+			//
+			// The old code swallowed ErrLSNNotWritten; that was
+			// underwritten by the eager pg_xact write-back this slice
+			// removes. The sentinel is NOT rare: Append(endLSN) has
+			// returned while the writer's position accounting momentarily
+			// lags (M0099 Path A) — a c=50 pgbench probe hit it on 42/50
+			// clients — so treating it as fatal aborts live transactions.
+			// Resolution per §4's "or forces a real flush" arm: retry until
+			// the accounting catches up (guaranteed: our Append returned).
+			// Any other error is fatal — no ack, txn stays in-progress
+			// (Manager.finish propagates before the active-set removal).
+			warned := false
+			for attempt := 0; ; attempt++ {
+				werr := walWriter.FlushUpTo(endLSN)
+				if werr == nil {
+					break
+				}
 				if !errors.Is(werr, wal.ErrLSNNotWritten) {
-					return werr
+					return fmt.Errorf("goopg: sync %v flush xid=%d lsn=%d: %w", kind, xid, endLSN, werr)
+				}
+				if attempt < 100 {
+					runtime.Gosched()
+				} else {
+					if !warned && attempt > 5000 { // ~1s of 200µs sleeps: diagnose a wedged writer
+						slog.Warn("sync xact flush retrying on ErrLSNNotWritten", "xid", xid, "lsn", endLSN, "attempts", attempt)
+						warned = true
+					}
+					time.Sleep(200 * time.Microsecond)
 				}
 			}
 		}
@@ -1030,14 +1078,13 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		switch kind {
 		case mvcc.XactCommit:
 			if waitLocalFlush {
-				// C2-S2: the sync branch also associates endLSN with the
-				// CLOG page (D2 — arms the SLRU write barrier for the later
+				// C2-S2/S3: the sync branch associates endLSN with the
+				// CLOG page (D2 — arms the SLRU write barrier for the
 				// eviction/checkpoint write-back; the record is already
-				// durable so the barrier fast-exits — EXCEPT after the
-				// ErrLSNNotWritten swallow above, where the armed barrier
-				// retries the flush and blocks the pg_xact write until it
-				// succeeds; that sentinel becomes fatal in C2-S3). Eager
-				// write-back still on until the S3 cut.
+				// durable — the retry loop above never falls through — so
+				// the barrier fast-exits). Since the S3 cut this stamp is
+				// memory-only; durability rides on checkpoint/eviction/
+				// replay (see applyGroupBatchLocked).
 				_ = clog.SetCommittedDurable(xid, endLSN)
 			} else {
 				_ = clog.SetCommittedWithLSN(xid, endLSN)
@@ -1076,7 +1123,26 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// Upgrade path: if the clog is empty (old cluster started before M0030-0007
 	// landed), initialize all prior XIDs as committed so loadUserTablesFromHeap
 	// doesn't reject their rows.
-	if clog.IsEmpty() {
+	// Recovery-window ReadAll memoization (perf-optimize2 fix-05). Hoisted
+	// above the IsEmpty branch (C2-S3) so walHasXactRecords shares the
+	// decode with every replay pass below; nothing appends to the WAL in
+	// this window.
+	wal.BeginRecoveryCache(filepath.Join(abs, "pg_wal"))
+	defer wal.EndRecoveryCache()
+	// C2-S3 (review MUST-FIX): IsEmpty alone no longer implies "no txn
+	// history" — post-cut, a crashed cluster that never reached its first
+	// checkpoint has an all-zero on-disk pg_xact. Any xact record in the
+	// WAL proves history and forces the crash-recovery sweep branch;
+	// misrouting into the upgrade branch would stamp crashed in-flight
+	// XIDs Committed (row resurrection).
+	hasXactHistory, xerr := walHasXactRecords(filepath.Join(abs, "pg_wal"))
+	if xerr != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: scan wal for xact history: %w", xerr)
+	}
+	if clog.IsEmpty() && !hasXactHistory {
 		if uerr := clog.InitializeAsCommitted(txnMgr.NextXID()); uerr != nil {
 			_ = pool.Close()
 			_ = walWriter.Close()
@@ -1084,6 +1150,24 @@ func Open(opts OpenOptions) (*Runtime, error) {
 			return nil, fmt.Errorf("goopg: clog upgrade: %w", uerr)
 		}
 	} else {
+		// C2-S3 (review MUST-FIX rework): re-stamp CLOG from durable WAL
+		// commit/abort records FIRST — post-cut, runtime lanes are
+		// memory-only, so the on-disk SLRU can lag arbitrarily and every
+		// acked transaction's status must be reconstructed from its WAL
+		// record BEFORE the implicit-abort sweep below and before any
+		// catalog load consults the clog. (The pre-C2 order — sweep first,
+		// replay later — relied on the eager lane flush having already
+		// persisted committed DDL lanes; without it the sweep stamped an
+		// acked DDL commit Aborted and loadUserTablesFromHeap dropped the
+		// table.) The sweep stays Unknown-only, so it cannot clobber these
+		// replayed stamps; replay also advances NextXID past every durable
+		// record's XID, tightening the sweep bound.
+		if rerr := replayCLogFromWAL(filepath.Join(abs, "pg_wal"), clog, txnMgr); rerr != nil {
+			_ = pool.Close()
+			_ = walWriter.Close()
+			_ = mgr.Close()
+			return nil, fmt.Errorf("goopg: clog replay from WAL: %w", rerr)
+		}
 		// (M0106-0011) Crash-recovery implicit abort: WAL replay
 		// restored the on-disk pg_class / pg_attribute heap pages,
 		// but the JSON catalog snapshot at last clean shutdown does
@@ -1144,8 +1228,6 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// around the recovery block; the deferred End is a safety net for the error
 	// return paths, and an explicit End (below, after the last pass) frees the
 	// decoded records promptly.
-	wal.BeginRecoveryCache(filepath.Join(abs, "pg_wal"))
-	defer wal.EndRecoveryCache()
 
 	// M0110-0003: restore user-created schemas (CREATE/DROP SCHEMA) from the
 	// WAL BEFORE loading user tables. goopg has no per-schema on-disk namespace,
@@ -1517,15 +1599,13 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// SLRU/flat-file (the narrow window between WAL fsync and clog writes).
 	// This is the authoritative clog-from-WAL path that mirrors PG's
 	// StartupXLOG xact_redo_commit behaviour. Non-fatal: physical replay
-	// already succeeded; a clog-stamp failure only affects visibility of
-	// some committed rows, which will surface as a user error rather than
-	// a startup error.
+	// already succeeded. C2-S3: the replay itself moved EARLY — it now runs
+	// inside the crash-recovery branch above, BEFORE the implicit-abort
+	// sweep and every catalog load (post-cut it is the sole reconstructor
+	// of acked lanes, and it is fatal on error there). This late site only
+	// keeps the on-disk-lane NextXID re-advance for basebackup-attached
+	// clusters whose SLRU was shipped populated.
 	if abs != "" {
-		if err := replayCLogFromWAL(filepath.Join(abs, "pg_wal"), clog, txnMgr); err != nil {
-			slog.Default().Warn("replayCLogFromWAL failed", "err", err)
-		}
-		// Re-advance NextXID after replayCLogFromWAL may have stamped more
-		// XIDs into the clog.
 		if highClogXID := clog.HighestKnownXID(); highClogXID > 0 {
 			txnMgr.SetNextXID(highClogXID + 1)
 		}
@@ -1716,7 +1796,16 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		// M0117-0007 Part B continuation: bound how long an async commit's
 		// deferred CLOG write-back can stay dirty in memory (see
 		// mvcc.CLog.setStatusWithLSN / FlushAll).
-		FlushCLOGFn: clog.FlushAll,
+		FlushCLOGFn: func() error {
+			// DELAY_CHKPT_START barrier (see commitStampMu): drain every
+			// in-flight [WAL append → CLOG stamp] section so the FlushAll
+			// scan below observes the lane of every commit whose record
+			// predates it.
+			commitStampMu.Lock()
+			//lint:ignore SA2001 empty critical section is the barrier
+			commitStampMu.Unlock()
+			return clog.FlushAll()
+		},
 	})
 
 	// Surface the M0002 checkpointer counters as the
