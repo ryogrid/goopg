@@ -58,15 +58,19 @@ consumer):
    `EncodeCheckpointCompat`'s redo field just gets the earlier value).
 3. **Re-key the FPI decision to the published pointer — option (b) is
    MANDATORY** (rev 2; adversarial review F-1 rejected option (a)):
-   - **(b) — adopted**: replace the per-slot bool with a per-record
-     `page_lsn <= publishedRedo` test inside `MarkDirtyChangeRecord` /
-     `MarkDirtyLogicalChange` / `maybeEmitFPI`, against the single
-     atomically-published pointer. No sweep, no separately-timed reset event
-     — publication IS the epoch boundary, exactly PG's shape. Scope: the test
-     applies to heap/btree/TOAST main-fork pages (which carry `pd_lsn`);
-     **FSM is excluded** (snapshot-persisted, never WAL-logged — unchanged by
-     this bundle) and **VM** keeps its own native record
-     (`RecordKindHeapVisible`).
+   - **(b) — adopted, rev 4 token form**: the per-record test is
+     `slot.nativeImageLSN <= publishedRedo` inside `MarkDirtyChangeRecord` /
+     `MarkDirtyLogicalChange` / `maybeEmitFPI`, where `nativeImageLSN` is a
+     slot-level watermark advanced ONLY by native image emission (logFPI,
+     the WithLSN variants' image-bearing multi-page records, ForceFPI) and
+     zeroed on slot reuse. No sweep, no separately-timed reset — publication
+     IS the epoch boundary. **Why not raw `pd_lsn` (rev 3's shape)**: pd_lsn
+     is stamped by BOTH record families, so a canonical record's stamp
+     satisfied the test and suppressed the native first-touch image the
+     native replay depends on — the same cross-family poisoning class the C1
+     review rejected as F1, rediscovered live by the S3a crash-sim tests
+     (single-DDL crash lost the table). FSM excluded (snapshot-persisted,
+     never WAL-logged); VM keeps its own native record.
    - **(a) — rejected**: "clear the per-slot bool at publication time" is
      unimplementable as an atomic event: `ResetCheckpointEpoch` is a
      **lock-free O(nslots) sweep** (bufpool.go:776-782, plain

@@ -62,6 +62,18 @@ type Slot struct {
 	// into a single 64-bit atomic word for lock-free Pin/Unpin.
 	state atomic.Uint64
 
+	// nativeImageLSN is the end-LSN of the last NATIVE full-page image
+	// (RecordKindPageImage via logFPI, or the multi-page-image records the
+	// MarkDirtyWithLSN* callers log) emitted for the page occupying this
+	// slot; 0 on load/reuse. The FPI decision keys on THIS token — not on
+	// pd_lsn — because pd_lsn is stamped by BOTH record families: a
+	// canonical record's stamp would otherwise satisfy the test and
+	// suppress the native image the native-family replay depends on (the
+	// cross-family poisoning class rejected as F1 in the C1 design review;
+	// rediscovered as a live S2 regression by the S3a crash-sim tests).
+	// Slot-keyed: eviction/reload re-arms conservatively (extra image).
+	nativeImageLSN atomic.Uint64
+
 	// contentMu guards the Page bytes for read/write. The pool does
 	// not hold any global lock while this is taken.
 	contentMu sync.RWMutex
@@ -819,20 +831,23 @@ func (p *Pool) PublishRedoBarrier(sample func() uint64) uint64 {
 // direction).
 func (p *Pool) RedoRecPtr() uint64 { return p.redoRecPtr.Load() }
 
-// needsImage is the per-record FPI decision: pd_lsn <= publishedRedo means
-// the page's first post-redo modification is happening now and must carry a
-// full image (torn-page anchor for replay-from-redo). The caller holds the
-// slot's content lock (same access contract as reading/writing s.page in the
-// MarkDirty* variants below) AND fpiPublishMu.RLock (see PublishRedoBarrier).
+// needsImage is the per-record FPI decision: the slot's last NATIVE image
+// predates the published redo, so the page's first post-redo native-family
+// modification must carry a fresh image (torn-page anchor for
+// replay-from-redo). Callers hold fpiPublishMu.RLock (see
+// PublishRedoBarrier); the read is a plain atomic — no page-byte access.
 //
-// LSN-base note (review SHOULD-2): pd_lsn carries 1-based writer LSNs while
-// the published redo is the 0-based redoLSN0 the PG checkpoint record uses
-// (= frontier pos + page-header leading). The mismatch is deliberate and
-// errs only toward EXTRA images: every pre-publication pd_lsn <= pos <=
-// pos+leading, so a needed image is never skipped. Do not "fix" one side
-// without renormalizing the other.
+// Deliberately NOT pd_lsn: pd_lsn is stamped by both record families, and a
+// canonical record's stamp must not suppress the native image (cross-family
+// poisoning — see Slot.nativeImageLSN).
+//
+// LSN-base note: nativeImageLSN carries 1-based writer LSNs while the
+// published redo is the 0-based redoLSN0 of the PG checkpoint record
+// (= frontier pos + page-header leading). The mismatch errs only toward
+// EXTRA images (every pre-publication LSN <= pos <= pos+leading); a needed
+// image is never skipped. Do not renormalize one side alone.
 func (p *Pool) needsImage(s *Slot) bool {
-	return uint64(MustHeader(s.page).LSN()) <= p.redoRecPtr.Load()
+	return s.nativeImageLSN.Load() <= p.redoRecPtr.Load()
 }
 
 // Close flushes every dirty slot through smgr and releases the arena.
@@ -1459,6 +1474,7 @@ func (p *Pool) PinNew(rel RelFileNode) (*Slot, BlockNumber, error) {
 	gen := stateGen(s.state.Load())
 	prevSt := s.state.Load()
 	s.tag = tag
+	s.nativeImageLSN.Store(0) // fresh page in this slot: re-arm first-touch image
 	newSt := slotValidBit | slotDirtyBit | uint64(1) | (uint64(1) << slotUsageShift) | (uint64(gen) << slotGenShift)
 	s.state.Store(newSt)
 	p.traceSlotEvent(int32(victimIdx), evPinNewPublish, tag, prevSt, newSt)
@@ -1642,6 +1658,7 @@ func (p *Pool) pinLoad(tag BufferTag) (*Slot, error) {
 	// see the slot and wait in the "stateIO" branch above.
 	gen := stateGen(s.state.Load())
 	s.tag = tag
+	s.nativeImageLSN.Store(0) // slot reused for a different page: re-arm image
 	if !p.bmInsert(tag, int32(victimIdx), gen) {
 		// Another goroutine (in a concurrent PinNew?) published this tag.
 		p.traceSlotEvent(int32(victimIdx), evReleaseVictimSlot, tag, s.state.Load(), 0)
@@ -1792,16 +1809,21 @@ func (p *Pool) MarkDirtyHintBit(s *Slot) {
 }
 
 // MarkDirtyWithLSN records an explicit page LSN and marks the slot dirty.
+// Callers of the WithLSN variants log their own image-bearing multi-page
+// records (e.g. btree split left+right+sibling images), so the LSN also
+// advances the native-image watermark.
 func (p *Pool) MarkDirtyWithLSN(s *Slot, lsn LSN) {
 	s.contentMu.Lock()
 	MustHeader(s.page).SetLSN(lsn)
 	s.contentMu.Unlock()
+	s.nativeImageLSN.Store(uint64(lsn))
 	p.markDirtyWithLSNCommon(s)
 }
 
 // MarkDirtyWithLSNLocked is the variant for callers that already hold s.contentMu.
 func (p *Pool) MarkDirtyWithLSNLocked(s *Slot, lsn LSN) {
 	MustHeader(s.page).SetLSN(lsn)
+	s.nativeImageLSN.Store(uint64(lsn))
 	p.markDirtyWithLSNCommon(s)
 }
 
@@ -1855,6 +1877,7 @@ func (p *Pool) MarkDirtyForceFPI(s *Slot) {
 		}
 	}
 	MustHeader(s.page).SetLSN(lsn)
+	s.nativeImageLSN.Store(uint64(lsn))
 	for {
 		old := s.state.Load()
 		if old&slotDirtyBit != 0 {
@@ -1885,12 +1908,16 @@ func (p *Pool) MarkDirtyChangeRecord(s *Slot, emitter func() (LSN, error)) error
 					return err
 				}
 				MustHeader(s.page).SetLSN(lsn)
+				s.nativeImageLSN.Store(uint64(lsn))
 			} else if emitter != nil {
 				lsn, err := emitter()
 				if err != nil {
 					return err
 				}
 				MustHeader(s.page).SetLSN(lsn)
+				// Legacy mode (no logFPI): the change record itself is the
+				// replay anchor; treat it as the image watermark.
+				s.nativeImageLSN.Store(uint64(lsn))
 			}
 		} else {
 			if emitter == nil {
@@ -1949,6 +1976,7 @@ func (p *Pool) MarkDirtyLogicalChange(s *Slot, emitter func() (LSN, error)) erro
 				return fpiErr
 			}
 			MustHeader(s.page).SetLSN(fpiLSN)
+			s.nativeImageLSN.Store(uint64(fpiLSN))
 		}
 		return nil
 	}()
@@ -1993,9 +2021,10 @@ func (p *Pool) maybeEmitFPI(s *Slot) {
 			"rel", tag.Rel, "block", tag.Block, "err", err)
 		return
 	}
-	// Stamping pd_lsn above the published redo is what suppresses further
-	// images for this page until the next redo publication.
 	MustHeader(s.page).SetLSN(lsn)
+	// Advancing the native-image watermark above the published redo is what
+	// suppresses further images until the next redo publication.
+	s.nativeImageLSN.Store(uint64(lsn))
 }
 
 // FlushAll writes every dirty slot and clears the dirty bit.
