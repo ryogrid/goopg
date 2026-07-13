@@ -1,0 +1,17 @@
+RUN_ID=postdash_6e3b7a37  scale=100 c=50 T=120
+--- goopg_S ---
+latency average = 0.555 ms
+latency stddev = 2.638 ms
+tps = 89955.288465 (without initial connection time)
+--- goopg_N ---
+latency average = 5.051 ms
+latency stddev = 6.899 ms
+tps = 9898.409996 (without initial connection time)
+--- pg_S ---
+latency average = 0.273 ms
+latency stddev = 2.531 ms
+tps = 182384.494104 (without initial connection time)
+--- pg_N ---
+latency average = 3.443 ms
+latency stddev = 1.100 ms
+tps = 14516.546269 (without initial connection time)
