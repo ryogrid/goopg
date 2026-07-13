@@ -106,6 +106,62 @@ func followHOTChainNoCopy(page storage.Page, startSlot uint16, snap mvcc.Snapsho
 	return storage.HeapTuple{}, 0, false
 }
 
+// heapChainDeadToAll walks the HOT chain from startSlot testing every
+// member against storage.TupleDeadToAll (C3-S2: the executor's analog of
+// PG heap_hot_search_buffer's all_dead outcome). It returns true only when
+// EVERY reachable member is provably dead to all snapshots — the oracle
+// that admits an index entry to the kill list (design D6: strict subset of
+// VACUUM's reclaim; a single unprovable member vetoes the kill). A broken
+// or recycled chain (Unused/Dead line pointer, decode failure) is
+// conservatively NOT dead-to-all: the heap slot may already carry an
+// unrelated tuple.
+func heapChainDeadToAll(page storage.Page, startSlot uint16, oldestXmin storage.TransactionID) bool {
+	const maxChain = 64
+	cur := startSlot
+	for i := 0; i < maxChain; i++ {
+		item, err := storage.PageGetItemID(page, cur)
+		if err != nil {
+			return false
+		}
+		if item.Flags == storage.ItemIDRedirect {
+			next := item.Offset
+			if next == cur {
+				return false
+			}
+			cur = next
+			continue
+		}
+		if item.Flags != storage.ItemIDNormal {
+			return false
+		}
+		t, err := storage.PageGetHeapTupleNoCopy(page, cur)
+		if err != nil {
+			return false
+		}
+		if !storage.TupleDeadToAll(t.Header, oldestXmin) {
+			return false
+		}
+		if t.Header.Infomask&storage.HeapHotUpdated == 0 {
+			return true // chain ends here; every member was dead-to-all
+		}
+		next := t.Header.CTID.Offset
+		if next == cur {
+			return false
+		}
+		cur = next
+	}
+	return false
+}
+
+// killEntry is one pending index-entry kill: the physical position (with
+// the D7 re-verify LSN) plus the entry's TID — S3's cheap pre-filter and
+// the posting-list all-TIDs-dead accounting both need the TID (C3-S2
+// review SHOULD-FIX 5).
+type killEntry struct {
+	Pos btree.ScanPos
+	Ptr storage.ItemPointer
+}
+
 type indexScanOp struct {
 	plan *planner.IndexScan
 	ctx  *Context
@@ -126,6 +182,14 @@ type indexScanOp struct {
 	idx     int
 	lastTID storage.ItemPointer
 	hasLast bool
+
+	// C3-S2: physical index-entry positions parallel to tids (from
+	// RangeScanWithPos), and the kill list of entries whose whole heap
+	// chain proved dead-to-all at the Next() visibility step. S3 turns
+	// killList into the deferred exclusive-latched mark pass at
+	// Close/Rescan; S2 only collects.
+	poss     []btree.ScanPos
+	killList []killEntry
 
 	// M0054-0006a: state captured at Open() time and reused across
 	// Rescan() calls when the index probe is driven by an outer row
@@ -209,6 +273,8 @@ func (o *indexScanOp) openPrep(ctx *Context) error {
 	}
 	o.ctx = ctx
 	o.tids = nil
+	o.poss = nil
+	o.killList = nil
 	o.idx = 0
 	o.hasLast = false
 	o.outerSlot = nil
@@ -270,6 +336,8 @@ func (o *indexScanOp) BindOuter(slot SlotView, outerWidth int) {
 // per outer row.
 func (o *indexScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 	o.tids = o.tids[:0]
+	o.poss = o.poss[:0]
+	o.killList = o.killList[:0] // S3 will flush pending kills BEFORE the reset
 	o.idx = 0
 	o.hasLast = false
 	o.outerSlot = outerSlot
@@ -355,12 +423,13 @@ func (o *indexScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 	// M0092-0001: lazy iteration. The scanFn collects only TIDs;
 	// HOT-chain follow + decode + detoast happen per Next() so the
 	// produced row aliases scanRow (no cloneRow per match).
-	scanFn := func(_ []byte, ptr storage.ItemPointer) (bool, error) {
+	scanFn := func(_ []byte, ptr storage.ItemPointer, pos btree.ScanPos) (bool, error) {
 		o.tids = append(o.tids, ptr)
+		o.poss = append(o.poss, pos) // C3-S2: kill-list coordinates
 		return true, nil
 	}
 
-	if err := o.tree.RangeScan(loBytes, hiBytes, scanFn); err != nil {
+	if err := o.tree.RangeScanWithPos(loBytes, hiBytes, scanFn); err != nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
 	}
 	if o.hashBucketScan && len(loBytes) > 0 {
@@ -435,6 +504,18 @@ func (o *indexScanOp) Next() (TupleSlot, error) {
 		slot.RLock()
 		tuple, actualSlot, found := followHOTChainNoCopy(slot.Page(), ptr.Offset, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.MultiXact)
 		if !found {
+			// C3-S2 kill-list oracle: invisible-to-me is upgraded to
+			// dead-to-ALL only when every HOT-chain member proves dead
+			// under the OldestXmin horizon (the same predicate prune/
+			// VACUUM use — design D6). tidIdx is o.idx-1: Next() has
+			// already advanced past the tid it is resolving.
+			if o.ctx.TxnMgr != nil {
+				if tidIdx := o.idx - 1; tidIdx >= 0 && tidIdx < len(o.poss) {
+					if heapChainDeadToAll(slot.Page(), ptr.Offset, o.ctx.TxnMgr.OldestXmin()) {
+						o.killList = append(o.killList, killEntry{Pos: o.poss[tidIdx], Ptr: ptr})
+					}
+				}
+			}
 			// M0118-0001: SSI phantom conflict-out for an index-scanned tuple
 			// that is physically present at this TID but invisible to us because
 			// a concurrent transaction inserted it. Register the reader→inserter
@@ -538,6 +619,8 @@ func (o *indexScanOp) Next() (TupleSlot, error) {
 
 func (o *indexScanOp) Close() error {
 	o.tids = nil
+	o.poss = nil
+	o.killList = nil // S3 will flush pending kills BEFORE the release
 	o.hasLast = false
 	if o.scanRow != nil {
 		releaseRow(o.scanRow)

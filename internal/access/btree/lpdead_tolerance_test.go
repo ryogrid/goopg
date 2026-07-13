@@ -259,3 +259,62 @@ func TestLPDeadVacuumDropsMarkedEntries(t *testing.T) {
 		}
 	}
 }
+
+// TestRangeScanWithPosCoordinates pins the C3-S2 ScanPos contract: for
+// every callback, (Blk, Slot) must address the exact line pointer whose
+// item carries the delivered key/ptr, and PageLSN must equal the leaf's
+// pd_lsn at scan time (D7's re-verify token). Multi-leaf coverage ensures
+// per-leaf capture (not first-leaf reuse).
+func TestRangeScanWithPosCoordinates(t *testing.T) {
+	bt, _, cleanup := newTestTree(t)
+	defer cleanup()
+	const n = 600 // enough to split across leaves
+	for i := 0; i < n; i++ {
+		ptr := storage.ItemPointer{Block: storage.BlockNumber(i + 1), Offset: uint16(i%100 + 1)}
+		if err := bt.Insert(EncodeInt4(int32(i)), ptr); err != nil {
+			t.Fatal(err)
+		}
+	}
+	type seen struct {
+		ptr storage.ItemPointer
+		pos ScanPos
+	}
+	var entries []seen
+	blks := map[storage.BlockNumber]bool{}
+	if err := bt.RangeScanWithPos(nil, nil, func(key []byte, ptr storage.ItemPointer, pos ScanPos) (bool, error) {
+		entries = append(entries, seen{ptr: ptr, pos: pos})
+		blks[pos.Blk] = true
+		return true, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != n {
+		t.Fatalf("scanned %d entries, want %d", len(entries), n)
+	}
+	if len(blks) < 2 {
+		t.Fatalf("expected >=2 leaves, got %d (test needs a split)", len(blks))
+	}
+	for _, e := range entries {
+		slot, err := bt.pinR(e.pos.Blk)
+		if err != nil {
+			t.Fatal(err)
+		}
+		p := slot.Page()
+		raw, rerr := storage.PageGetItemRawAllowDead(p, e.pos.Slot)
+		if rerr != nil {
+			t.Fatalf("blk=%d slot=%d: %v", e.pos.Blk, e.pos.Slot, rerr)
+		}
+		it, perr := parseItem(raw)
+		if perr != nil {
+			t.Fatalf("parseItem blk=%d slot=%d: %v", e.pos.Blk, e.pos.Slot, perr)
+		}
+		if it.ptr != e.ptr {
+			t.Fatalf("blk=%d slot=%d: item ptr %v != callback ptr %v", e.pos.Blk, e.pos.Slot, it.ptr, e.ptr)
+		}
+		if got := storage.MustHeader(p).LSN(); got != e.pos.PageLSN {
+			t.Fatalf("blk=%d: PageLSN %d != pd_lsn %d", e.pos.Blk, e.pos.PageLSN, got)
+		}
+		slot.RUnlock()
+		bt.pool.Unpin(slot)
+	}
+}

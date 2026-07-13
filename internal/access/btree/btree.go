@@ -3115,6 +3115,31 @@ func (bt *BTree) Search(key []byte) (storage.ItemPointer, bool, error) {
 	}
 }
 
+// ScanPos identifies where a RangeScan callback's entry physically lives:
+// the leaf block, the 1-based line-pointer slot, and the leaf's pd_lsn AS
+// CAPTURED AT SCAN TIME. C3-S2 scan plumbing: the executor records these
+// alongside TIDs so the deferred kill pass (S3) can re-latch the leaf and
+// re-verify identity keyed on PageLSN (design D7 — a changed LSN means the
+// page split/vacuumed/recycled and the pending kill is dropped).
+type ScanPos struct {
+	Blk     storage.BlockNumber
+	Slot    uint16
+	PageLSN storage.LSN
+}
+
+// RangeScanWithPos is RangeScan carrying a ScanPos per callback (C3-S2,
+// additive — the plain RangeScan signature and its callers are untouched;
+// both share one implementation).
+func (bt *BTree) RangeScanWithPos(lo, hi []byte, fn func(key []byte, ptr storage.ItemPointer, pos ScanPos) (bool, error)) error {
+	return bt.rangeScanPos(lo, hi, fn)
+}
+
+func (bt *BTree) RangeScan(lo, hi []byte, fn func(key []byte, ptr storage.ItemPointer) (bool, error)) error {
+	return bt.rangeScanPos(lo, hi, func(key []byte, ptr storage.ItemPointer, _ ScanPos) (bool, error) {
+		return fn(key, ptr)
+	})
+}
+
 // RangeScan invokes fn for every (key, ptr) pair where lo ≤ key ≤ hi.
 // Either bound may be nil to indicate an open-ended range:
 //   - nil lo means no lower bound (scan from the leftmost key).
@@ -3146,7 +3171,7 @@ func (bt *BTree) Search(key []byte) (storage.ItemPointer, bool, error) {
 // buffer pool's per-slot shared content latch. The first leaf is
 // reached via descendToLeaf (which already handles right-link
 // recovery); subsequent leaves are walked rightward via op.Next.
-func (bt *BTree) RangeScan(lo, hi []byte, fn func(key []byte, ptr storage.ItemPointer) (bool, error)) error {
+func (bt *BTree) rangeScanPos(lo, hi []byte, fn func(key []byte, ptr storage.ItemPointer, pos ScanPos) (bool, error)) error {
 	cur, _, err := bt.descendToLeaf(lo)
 	if err != nil {
 		return err
@@ -3178,6 +3203,7 @@ func (bt *BTree) RangeScan(lo, hi []byte, fn func(key []byte, ptr storage.ItemPo
 		// callers are CAT-1 (see contract above); none retain
 		// key beyond fn, none re-enter the btree.
 		count, countErr := storage.PageLinePointerCount(slot.Page())
+		pageLSN := storage.MustHeader(slot.Page()).LSN()
 		nextBlk := op.Next
 		stop := false
 		var fnErr error
@@ -3211,7 +3237,7 @@ func (bt *BTree) RangeScan(lo, hi []byte, fn func(key []byte, ptr storage.ItemPo
 						break slotLoop
 					}
 					for _, tid := range tids {
-						ok, ferr := fn(key, tid)
+						ok, ferr := fn(key, tid, ScanPos{Blk: cur, Slot: s, PageLSN: pageLSN})
 						if ferr != nil {
 							fnErr = ferr
 							stop = true
@@ -3236,7 +3262,7 @@ func (bt *BTree) RangeScan(lo, hi []byte, fn func(key []byte, ptr storage.ItemPo
 						stop = true
 						break slotLoop
 					}
-					ok, ferr := fn(it.key, it.ptr)
+					ok, ferr := fn(it.key, it.ptr, ScanPos{Blk: cur, Slot: s, PageLSN: pageLSN})
 					if ferr != nil {
 						fnErr = ferr
 						stop = true
