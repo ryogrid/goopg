@@ -171,3 +171,99 @@ func TestPublishRedoBarrierWaitsForInFlightDecision(t *testing.T) {
 		t.Fatal("PublishRedoBarrier did not complete after the writer finished")
 	}
 }
+
+// TestFPIWatermarkSurvivesEviction pins the eviction fix: a page already
+// imaged in the current epoch must NOT re-image after its slot is evicted
+// and the page is reloaded (observed storm: one hot sys-catalog page imaged
+// 19k times = 97.5% of a regress run's WAL). The watermark must ride the
+// evictedImageLSN stash across the slot generation.
+func TestFPIWatermarkSurvivesEviction(t *testing.T) {
+	dir := t.TempDir()
+	mgr := NewManager(ManagerConfig{DataDir: dir})
+	defer mgr.Close()
+
+	var nextLSN LSN = 100
+	var images int
+	logFPI := func(_ RelFileNode, _ BlockNumber, _ Page) (LSN, error) {
+		images++
+		nextLSN++
+		return nextLSN, nil
+	}
+	// Slots:2 so pinning two other pages evicts the target.
+	pool, err := NewPool(mgr, PoolConfig{
+		Slots:          2,
+		LogPageImage:   logFPI,
+		FullPageWrites: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+
+	rel := RelFileNode{DBOid: 1, RelOid: 603, Fork: MainFork}
+	s, _, err := pool.PinNew(rel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Lock()
+	s.Page()[300] = 1
+	pool.MarkDirty(s) // first touch: image #1
+	s.Unlock()
+	pool.Unpin(s)
+	if images != 1 {
+		t.Fatalf("first touch: images=%d, want 1", images)
+	}
+
+	// Evict block 0 by cycling two other pages through the 2-slot pool.
+	for i := 0; i < 2; i++ {
+		s2, _, err := pool.PinNew(rel)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s2.Lock()
+		s2.Page()[300] = byte(i)
+		pool.MarkDirty(s2)
+		s2.Unlock()
+		pool.Unpin(s2)
+	}
+
+	// Reload block 0 and write again: same epoch, image already in WAL —
+	// must NOT image again.
+	s3, err := pool.Pin(BufferTag{Rel: rel, Block: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Unpin(s3)
+	imagesBefore := images
+	s3.Lock()
+	s3.Page()[301] = 1
+	if err := pool.MarkDirtyChangeRecord(s3, func() (LSN, error) {
+		nextLSN++
+		return nextLSN, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	s3.Unlock()
+	// The two PinNew extends imaged their own first touches; only the
+	// RELOADED page must not have re-imaged.
+	if images != imagesBefore {
+		t.Fatalf("reloaded page re-imaged after eviction: images=%d, want %d (watermark lost)", images, imagesBefore)
+	}
+
+	// After a redo publication above the watermark, the next write must
+	// image again (epoch change is the only re-arm).
+	pool.PublishRedoRecPtr(uint64(nextLSN) + 10)
+	nextLSN += 20
+	s3.Lock()
+	s3.Page()[302] = 1
+	if err := pool.MarkDirtyChangeRecord(s3, func() (LSN, error) {
+		nextLSN++
+		return nextLSN, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	s3.Unlock()
+	if images != imagesBefore+1 {
+		t.Fatalf("post-publication write: images=%d, want %d", images, imagesBefore+1)
+	}
+}

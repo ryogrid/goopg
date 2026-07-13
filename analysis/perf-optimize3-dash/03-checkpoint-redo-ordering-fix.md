@@ -143,3 +143,25 @@ invariant text).
 - **O-03-2**: does the checkpointer's `redoLSN0` page-header adjustment
   (:508-523) need re-derivation when sampled pre-flush? (The adjustment logic
   moves with the sample; verify the segment-boundary edge cases it comments.)
+
+## Rev 5 (2026-07-13, S4 gate finding): watermark must survive slot eviction
+
+The rev-4 `nativeImageLSN` watermark lives on the buffer-pool Slot. On slot
+eviction + reload the watermark reset to zero, re-arming first-touch imaging
+for a page that already has an image in the WAL since redo — a hot
+sys-catalog page cycling through the pool re-imaged on every reload. Observed
+in the S4 gate run (regress suite): 55,838 images = 97.5% of 497MB retained
+WAL, one page imaged 19,306 times; the flooded WAL turned a 212s checkpoint
+into a never-completing one and wedged the server.
+
+Fix: `Pool.evictedImageLSN` map (bufpool.go) — stash the watermark under the
+page's BufferTag before re-tagging the slot, consume it when the page is
+re-tagged back in, delete on PinNew (truncate-then-re-extend must re-arm),
+clear wholesale inside `PublishRedoBarrier` (stale entries are <= the old
+redo and would re-image against the new redo anyway). Errs only toward extra
+images (a consumed-then-lost stash on a bmInsert race re-images once).
+Pinned by `TestFPIWatermarkSurvivesEviction` (fpi_redo_window_test.go).
+
+PG needs no analog: its decision reads `pd_lsn`, which lives on the page and
+survives eviction; goopg cannot use raw `pd_lsn` because canonical-family
+stamps poison it (rev 4).

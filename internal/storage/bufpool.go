@@ -155,6 +155,21 @@ type Pool struct {
 	// below the new redo, closing the decide->append window (adversarial
 	// review F1 of perf-optimize3-dash S2).
 	fpiPublishMu sync.RWMutex
+
+	// evictedImageLSN preserves a page's nativeImageLSN watermark across
+	// slot eviction. The watermark lives on the Slot, so without this a
+	// hot page cycling through the pool re-arms first-touch imaging on
+	// every reload and emits a fresh 8KB FPI per write — a WAL storm
+	// (observed: one sys-catalog page imaged 19k times in one regress
+	// run, 97.5% of WAL). Entries are stashed when a slot is re-tagged
+	// away from a page, consumed when that page is re-tagged back in,
+	// deleted on PinNew (a truncated-then-re-extended block must re-arm),
+	// and cleared wholesale at PublishRedoBarrier (a new redo forces
+	// re-imaging regardless, so stale entries only waste memory).
+	// Guarded by evictedImageMu.
+	evictedImageMu  sync.Mutex
+	evictedImageLSN map[BufferTag]uint64
+
 	// logger surfaces non-fatal FPI failures.
 	logger *slog.Logger
 
@@ -823,7 +838,49 @@ func (p *Pool) PublishRedoBarrier(sample func() uint64) uint64 {
 	redo := sample()
 	p.redoRecPtr.Store(redo)
 	p.fpiPublishMu.Unlock()
+	// Stale evicted watermarks are all <= the old redo frontier; against
+	// the new redo they would force a re-image anyway, so drop them
+	// rather than let the map grow across epochs.
+	p.evictedImageMu.Lock()
+	p.evictedImageLSN = nil
+	p.evictedImageMu.Unlock()
 	return redo
+}
+
+// stashEvictedImageLSN saves the slot's current page watermark under its
+// current tag, so a later reload of the same page inherits it instead of
+// re-arming first-touch imaging. Call BEFORE re-tagging the slot.
+func (p *Pool) stashEvictedImageLSN(s *Slot) {
+	lsn := s.nativeImageLSN.Load()
+	if lsn == 0 || s.tag == (BufferTag{}) {
+		return
+	}
+	p.evictedImageMu.Lock()
+	if p.evictedImageLSN == nil {
+		p.evictedImageLSN = make(map[BufferTag]uint64)
+	}
+	p.evictedImageLSN[s.tag] = lsn
+	p.evictedImageMu.Unlock()
+}
+
+// takeEvictedImageLSN consumes (returns and deletes) the stashed watermark
+// for tag; zero if none.
+func (p *Pool) takeEvictedImageLSN(tag BufferTag) uint64 {
+	p.evictedImageMu.Lock()
+	lsn := p.evictedImageLSN[tag]
+	if lsn != 0 {
+		delete(p.evictedImageLSN, tag)
+	}
+	p.evictedImageMu.Unlock()
+	return lsn
+}
+
+// dropEvictedImageLSN removes any stashed watermark for tag (fresh-page
+// creation: a truncated-then-re-extended block must re-arm imaging).
+func (p *Pool) dropEvictedImageLSN(tag BufferTag) {
+	p.evictedImageMu.Lock()
+	delete(p.evictedImageLSN, tag)
+	p.evictedImageMu.Unlock()
 }
 
 // RedoRecPtr returns the currently published redo pointer (0 on a fresh
@@ -1473,8 +1530,10 @@ func (p *Pool) PinNew(rel RelFileNode) (*Slot, BlockNumber, error) {
 	// Publish this slot as valid+dirty+pinned.
 	gen := stateGen(s.state.Load())
 	prevSt := s.state.Load()
+	p.stashEvictedImageLSN(s) // preserve the evicted page's watermark
 	s.tag = tag
-	s.nativeImageLSN.Store(0) // fresh page in this slot: re-arm first-touch image
+	s.nativeImageLSN.Store(0)  // fresh page in this slot: re-arm first-touch image
+	p.dropEvictedImageLSN(tag) // fresh block: any stale stash must not suppress its image
 	newSt := slotValidBit | slotDirtyBit | uint64(1) | (uint64(1) << slotUsageShift) | (uint64(gen) << slotGenShift)
 	s.state.Store(newSt)
 	p.traceSlotEvent(int32(victimIdx), evPinNewPublish, tag, prevSt, newSt)
@@ -1657,8 +1716,11 @@ func (p *Pool) pinLoad(tag BufferTag) (*Slot, error) {
 	// Publish tag in bufmap with ioInflight set. Any concurrent Lookup will
 	// see the slot and wait in the "stateIO" branch above.
 	gen := stateGen(s.state.Load())
+	p.stashEvictedImageLSN(s) // preserve the evicted page's watermark
 	s.tag = tag
-	s.nativeImageLSN.Store(0) // slot reused for a different page: re-arm image
+	// Slot reused for a different page: inherit the watermark stashed when
+	// this page was last evicted (zero if none — first-touch re-arms).
+	s.nativeImageLSN.Store(p.takeEvictedImageLSN(tag))
 	if !p.bmInsert(tag, int32(victimIdx), gen) {
 		// Another goroutine (in a concurrent PinNew?) published this tag.
 		p.traceSlotEvent(int32(victimIdx), evReleaseVictimSlot, tag, s.state.Load(), 0)
