@@ -91,15 +91,16 @@ func TestCLogFlushAllBeforePoolExistsIsNoop(t *testing.T) {
 	}
 }
 
-// TestCLogSetCommittedDurableArmsBarrierFastExit inverts the retired
+// TestCLogSyncCommitLSNArmsBarrierFastExit inverts the retired
 // TestCLogSetCommittedNoLSNNeverFiresBarrier: since C2-S2 every synchronous
-// commit associates its commit record's end-LSN with the CLOG page
-// (SetCommittedDurable). Since the C2-S3 cut the commit itself performs NO
-// write-back (asserted below); the armed barrier fires at the next flush
-// point (checkpoint FlushAll here; eviction in production) with an LSN >=
-// the one passed in — cheap for a sync commit, whose record is already
+// commit associates its commit record's end-LSN with the CLOG page (since
+// the C2-S4 collapse, via the same SetCommittedWithLSN the async path
+// uses). Since the C2-S3 cut the commit itself performs NO write-back
+// (asserted below); the armed barrier fires at the next flush point
+// (checkpoint FlushAll here; eviction in production) with an LSN >= the
+// one passed in — cheap for a sync commit, whose record is already
 // durable, so the hook's FlushUpTo fast-exits on the flushed-LSN check.
-func TestCLogSetCommittedDurableArmsBarrierFastExit(t *testing.T) {
+func TestCLogSyncCommitLSNArmsBarrierFastExit(t *testing.T) {
 	dir := t.TempDir()
 	c, err := OpenCLog(filepath.Join(dir, "pg_xact_flat"))
 	if err != nil {
@@ -118,8 +119,8 @@ func TestCLogSetCommittedDurableArmsBarrierFastExit(t *testing.T) {
 
 	const xid = FirstNormalTransactionID + 42
 	const commitLSN = 7777
-	if err := c.SetCommittedDurable(xid, commitLSN); err != nil {
-		t.Fatalf("SetCommittedDurable: %v", err)
+	if err := c.SetCommittedWithLSN(xid, commitLSN); err != nil {
+		t.Fatalf("SetCommittedWithLSN: %v", err)
 	}
 	// C2-S3: the commit itself performs no write-back; the armed barrier
 	// fires at the next flush point (checkpoint FlushAll / eviction).

@@ -8,23 +8,14 @@ import (
 	"github.com/goopg/goopg/internal/storage"
 )
 
-// M0117-0005: group commit. M0117-0006 Part C retired the incremental
-// flat-file flush this file used to also pin (TestIncrementalFlushMatchesWholeFile,
-// TestGroupCommitIdempotentResetsDirty) — the flat file and its dirty-page
-// tracking no longer exist; the SLRU buffer pool is the sole store, and its own
-// idempotent-set behavior is pinned directly in clog_bufferpool_test.go
-// (TestCLOGBufferPoolIdempotentSet). What remains here pins that the
-// group-commit Treiber stack never loses or mis-applies an update under heavy
-// concurrency: every committed/aborted XID is durably readable from BOTH a
-// fresh recovery reopen AND an independent SLRU-only reconstruction after the
-// writers finish.
+// Historical name: this file exercised the M0117-0005 group-commit Treiber
+// stack, deleted in C2-S4 (the commit path performs no eager write-back any
+// more, so there is nothing to batch). The test remains valuable as a pure
+// CONCURRENCY oracle: many concurrent SetCommitted/SetAborted stampers
+// against one CLog must never lose or mis-apply a lane, observed through
+// three views — live GetStatus, a full recovery reopen, and an independent
+// SLRU byte decode (after an explicit FlushAll — C2-S1).
 
-// TestGroupCommitConcurrent fans out many concurrent committers against one
-// CLog with the SLRU mirror enabled. Each goroutine sets a distinct XID to a
-// terminal status; afterwards every status must survive a recovery reopen and
-// an SLRU-only reconstruction (the crash-recovery / standby path). A lost
-// update from a Treiber-stack race, or an SLRU lane dropped by the per-segment
-// batching, shows up as a mismatch here.
 func TestGroupCommitConcurrent(t *testing.T) {
 	dir := t.TempDir()
 	flatPath := filepath.Join(dir, "pg_xact_flat")
@@ -38,7 +29,7 @@ func TestGroupCommitConcurrent(t *testing.T) {
 		t.Fatalf("EnablePGSLRUMirror: %v", err)
 	}
 
-	// XIDs span >1 SLRU page so the leader batches across segments. Use a
+	// XIDs span >1 SLRU page so stampers cross segment boundaries concurrently. Use a
 	// deterministic want per XID.
 	const n = 2000
 	want := make(map[storage.TransactionID]TxnStatus, n)
@@ -107,7 +98,7 @@ func TestGroupCommitConcurrent(t *testing.T) {
 	}
 	for xid, st := range want {
 		if got := reopened.GetStatus(xid); got != st {
-			t.Errorf("recovery-reopened GetStatus(%d) = %d, want %d (flushed group write lost)", xid, got, st)
+			t.Errorf("recovery-reopened GetStatus(%d) = %d, want %d (flushed concurrent write lost)", xid, got, st)
 		}
 	}
 
@@ -115,7 +106,7 @@ func TestGroupCommitConcurrent(t *testing.T) {
 	fresh := freshFromSLRU(t, slruDir)
 	for xid, st := range want {
 		if got := fresh.GetStatus(xid); got != st {
-			t.Errorf("SLRU-derived GetStatus(%d) = %d, want %d (group SLRU batch dropped a lane)", xid, got, st)
+			t.Errorf("SLRU-derived GetStatus(%d) = %d, want %d (concurrent SLRU stamping dropped a lane)", xid, got, st)
 		}
 	}
 }

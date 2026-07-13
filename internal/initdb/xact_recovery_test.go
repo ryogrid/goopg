@@ -232,10 +232,10 @@ func TestReplayCLogFromWAL_RecoversUnflushedSyncCommit(t *testing.T) {
 	if err := live.EnablePGSLRUMirror(slruDir); err != nil {
 		t.Fatal(err)
 	}
-	// The sync path since C2-S2/S3: LSN associated, group entered, NO disk
-	// write-back.
-	if err := live.SetCommittedDurable(xid, lsn); err != nil {
-		t.Fatalf("SetCommittedDurable: %v", err)
+	// The sync path since C2-S2..S4: LSN associated, NO disk write-back
+	// (the sync branch now calls the same SetCommittedWithLSN as async).
+	if err := live.SetCommittedWithLSN(xid, lsn); err != nil {
+		t.Fatalf("SetCommittedWithLSN: %v", err)
 	}
 	if got := live.GetStatus(xid); got != mvcc.TxnStatusCommitted {
 		t.Fatalf("live GetStatus(%d) = %v, want Committed", xid, got)

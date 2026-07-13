@@ -1077,18 +1077,14 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		// an async commit, the CLOG write barrier — see above).
 		switch kind {
 		case mvcc.XactCommit:
-			if waitLocalFlush {
-				// C2-S2/S3: the sync branch associates endLSN with the
-				// CLOG page (D2 — arms the SLRU write barrier for the
-				// eviction/checkpoint write-back; the record is already
-				// durable — the retry loop above never falls through — so
-				// the barrier fast-exits). Since the S3 cut this stamp is
-				// memory-only; durability rides on checkpoint/eviction/
-				// replay (see applyGroupBatchLocked).
-				_ = clog.SetCommittedDurable(xid, endLSN)
-			} else {
-				_ = clog.SetCommittedWithLSN(xid, endLSN)
-			}
+			// C2 (S2..S4): sync and async commits stamp identically —
+			// endLSN is associated with the CLOG page (D2: arms the SLRU
+			// write barrier for the eviction/checkpoint write-back; on the
+			// sync path the record is already durable — the retry loop
+			// above never falls through — so the barrier fast-exits). The
+			// stamp is memory-only; durability rides on checkpoint/
+			// eviction/replay (C2-S3).
+			_ = clog.SetCommittedWithLSN(xid, endLSN)
 		case mvcc.XactAbort:
 			_ = clog.SetAborted(xid)
 		}

@@ -228,3 +228,36 @@ Draft ledger row for S4 (copy into `.ralph/deferral_ledger.md`, matching its
 - **O-C2-4**: exact async-vs-sync divergence inside `applyGroupBatchLocked`
   today (does any async commit ever reach the leader's flush?) — determines
   whether S3 removes the call or the enqueue.
+
+## 10. S4 closure notes (2026-07-13, implemented at 8324ef75+)
+
+- **O-C2-1 (durable-point audit)**: resolved in S3 — the sync path's
+  FlushUpTo (now a retry loop; ErrLSNNotWritten forces a real flush, any
+  other error fails the commit un-acked) strictly precedes the CLOG stamp
+  in straight-line code; the D2 fast-exit claim holds because the retry
+  loop never falls through with the record unflushed.
+- **O-C2-2 (pool bounds)**: clogBufferPool residency = EffectiveCLOGBuffers
+  (clog_bufferpool.go): auto-tune sharedBuffers/512 clamped to [16, 1024]
+  pages (bank-aligned) — at 8KB/page that is <=8MB resident, ~32k XIDs per
+  page. Between checkpoints, dirty pages accumulate at ~1 page per 32k
+  XIDs; LRU eviction (barrier-protected) bounds residency when the XID
+  range outruns the pool. Checkpoint burst measured in the S4 commit
+  message (60s c=50 -N accumulation, explicit CHECKPOINT).
+- **O-C2-3 (two-phase)**: COMMIT PREPARED funnels through the same
+  xact-marker hook (server/twophase.go -> Manager.Commit); no separate
+  eager CLOG flush existed. Verified by the S3 correctness review.
+- **O-C2-4 (group divergence)**: async commits never reached the leader's
+  flush; the cut therefore landed in applyGroupBatchLocked (covering sync
+  commits, aborts, AND replay stamps), and S4 deleted the whole group
+  machinery (D4: with no commit-path I/O there is nothing to batch).
+- **S3 review fallout folded in** (see commit 8324ef75): redo-anchored
+  replay/retention/basebackup, commitStampMu DELAY_CHKPT_START analog,
+  replay-before-sweep + fatal replay errors, IsEmpty x walHasXactRecords
+  branch fix, acked-ROLLBACK record flush (goopg deviation from PG,
+  compensating for the missing xl_xid), sync-path ErrLSNNotWritten retry.
+- **Eviction-barrier contention watch item** (design S4 note): the
+  eviction-path FlushUpTo runs inside clogBufferPool.mu; verified deadlock-
+  free (S3 adversarial review, lens C) but it serializes getStatus behind
+  a device fsync during eviction storms — revisit if pg_stat wait sampling
+  shows CLOG-lock inflation.
+
