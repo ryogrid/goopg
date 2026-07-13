@@ -128,6 +128,9 @@ func TestCLog_SLRUMirror_StatusBitLayout(t *testing.T) {
 		t.Fatalf("SetCommitted(9): %v", err)
 	}
 
+	if err := clog.FlushAll(); err != nil { // C2-S1
+		t.Fatalf("FlushAll: %v", err)
+	}
 	raw, err := os.ReadFile(filepath.Join(pgXactDir, "0000"))
 	if err != nil {
 		t.Fatalf("read seg0: %v", err)
@@ -171,6 +174,9 @@ func TestCLog_SLRUMirror_ExtendsSegmentFile(t *testing.T) {
 	if err := clog.SetCommitted(storage.TransactionID(firstXIDOnPage1)); err != nil {
 		t.Fatalf("SetCommitted: %v", err)
 	}
+	if err := clog.FlushAll(); err != nil { // C2-S1: extension reaches disk at flush points
+		t.Fatalf("FlushAll: %v", err)
+	}
 	fi, err := os.Stat(filepath.Join(pgXactDir, "0000"))
 	if err != nil {
 		t.Fatalf("stat seg0: %v", err)
@@ -202,6 +208,9 @@ func TestCLog_SLRUMirror_SegmentRollover(t *testing.T) {
 		t.Fatalf("SetCommitted: %v", err)
 	}
 	seg1 := filepath.Join(pgXactDir, fmt.Sprintf("%04X", 1))
+	if err := clog.FlushAll(); err != nil { // C2-S1
+		t.Fatalf("FlushAll: %v", err)
+	}
 	fi, err := os.Stat(seg1)
 	if err != nil {
 		t.Fatalf("stat %q: %v", seg1, err)

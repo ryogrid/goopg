@@ -180,6 +180,9 @@ func TestCLogDualStoreConsistency(t *testing.T) {
 	}
 
 	// View 2: SLRU-derived store (durable PG-compatible mirror).
+	if err := c.FlushAll(); err != nil { // C2-S1: SLRU bytes reach disk at flush points
+		t.Fatalf("FlushAll: %v", err)
+	}
 	fresh := freshFromSLRU(t, slruDir)
 	for _, s := range set {
 		if got := fresh.GetStatus(s.xid); got != s.want {
@@ -295,6 +298,9 @@ func TestCLogSubCommittedResolvesViaParent(t *testing.T) {
 	}
 
 	// SUB_COMMITTED round-trips through the durable SLRU mirror.
+	if err := c.FlushAll(); err != nil { // C2-S1: SLRU bytes reach disk at flush points
+		t.Fatalf("FlushAll: %v", err)
+	}
 	fresh := freshFromSLRU(t, filepath.Join(dir, "pg_xact"))
 	for _, child := range []storage.TransactionID{childOfCommitted, childOfAborted, childOfInProgress, orphanChild} {
 		if got := fresh.GetStatus(child); got != TxnStatusSubCommitted {
@@ -344,6 +350,10 @@ func TestCLogTruncateKeepsStoresConsistent(t *testing.T) {
 	writeStatuses(t, c, below)
 	writeStatuses(t, c, above)
 
+	// C2-S1: segment files materialize at flush points, not per commit.
+	if err := c.FlushAll(); err != nil {
+		t.Fatalf("FlushAll: %v", err)
+	}
 	// Sanity: both segment files exist before truncation.
 	for _, seg := range []string{"0000", "0001"} {
 		if _, err := os.Stat(filepath.Join(slruDir, seg)); err != nil {
@@ -381,6 +391,9 @@ func TestCLogTruncateKeepsStoresConsistent(t *testing.T) {
 		if got := c.GetStatus(s.xid); got != s.want {
 			t.Errorf("in-memory GetStatus(%d) = %d, want %d (retained XID must survive truncate)", s.xid, got, s.want)
 		}
+	}
+	if err := c.FlushAll(); err != nil { // C2-S1: SLRU bytes reach disk at flush points
+		t.Fatalf("FlushAll: %v", err)
 	}
 	fresh := freshFromSLRU(t, slruDir)
 	for _, s := range retained {

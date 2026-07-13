@@ -293,6 +293,9 @@ func TestCLogMarkUnknownAsAbortedBatchedSLRU(t *testing.T) {
 	// Re-derive statuses purely from the on-disk SLRU (the durable mirror) via
 	// an independent decode. This proves the batched write encoded every lane
 	// correctly.
+	if err := c.FlushAll(); err != nil { // C2-S1: SLRU bytes reach disk at flush points
+		t.Fatalf("FlushAll: %v", err)
+	}
 	fresh := freshFromSLRU(t, slruDir)
 	checks := []struct {
 		xid  storage.TransactionID

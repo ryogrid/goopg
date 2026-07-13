@@ -88,9 +88,15 @@ func TestGroupCommitConcurrent(t *testing.T) {
 		}
 	}
 
+	// C2-S1: group commits no longer write eagerly at commit; flush before
+	// the on-disk views (View 2 recovery reopen + View 3 SLRU decode).
+	if err := c.FlushAll(); err != nil {
+		t.Fatalf("FlushAll: %v", err)
+	}
 	// View 2: full production recovery reopen (OpenCLog + EnablePGSLRUMirror).
 	// The SLRU is the sole durable store, so the recovery path reconstructs
-	// every status from the fsynced SLRU segments — proving each incremental
+	// every status from the flushed SLRU segments (C2-S1: bytes reach disk
+	// via the explicit FlushAll above, not per commit) — proving the group
 	// group-commit write landed durably across a restart.
 	reopened, err := OpenCLog(flatPath)
 	if err != nil {
@@ -101,7 +107,7 @@ func TestGroupCommitConcurrent(t *testing.T) {
 	}
 	for xid, st := range want {
 		if got := reopened.GetStatus(xid); got != st {
-			t.Errorf("recovery-reopened GetStatus(%d) = %d, want %d (durable incremental write lost)", xid, got, st)
+			t.Errorf("recovery-reopened GetStatus(%d) = %d, want %d (flushed group write lost)", xid, got, st)
 		}
 	}
 
