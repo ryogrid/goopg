@@ -193,6 +193,17 @@ func IsHeapTupleXmaxMulti(infomask uint16) bool {
 // this — an all-locker multi never reaches the hook.
 var ResolveMultiUpdater func(xmax TransactionID) (updater TransactionID, hasUpdater bool, resolved bool)
 
+// XidCommitted, when non-nil, reports whether xid COMMITTED (false for
+// aborted, unknown, or in-progress). Installed by initdb.Open from the
+// CLOG (same injection pattern as ResolveMultiUpdater — storage cannot
+// import mvcc). Consulted by TupleDeadToAll (C3-S3 blocker fix B): an
+// ABORTED deleter's xmax stamp survives on the tuple and the oldestXmin
+// horizon advances past the aborted xid freely, so without the commit
+// check prune/VACUUM/the index kill oracle could reclaim a LIVE row (PG's
+// HeapTupleSatisfiesVacuum checks TransactionIdDidCommit). nil (tests,
+// bootstrap) => conservatively NOT dead.
+var XidCommitted func(xid TransactionID) bool
+
 // MovedPartitionsOffsetNumber is the special t_ctid.ip_posid value
 // PostgreSQL stamps on a tuple whose UPDATE moved the row to a
 // different partition (the old version's CTID can't point to the new

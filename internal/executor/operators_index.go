@@ -131,6 +131,12 @@ func heapChainDeadToAll(page storage.Page, startSlot uint16, oldestXmin storage.
 			cur = next
 			continue
 		}
+		if item.Flags == storage.ItemIDDead {
+			// PG heap_hot_search_buffer parity: a heap LP_DEAD line
+			// pointer means prune already proved the chain member dead
+			// to all snapshots — the most common post-prune kill case.
+			return true
+		}
 		if item.Flags != storage.ItemIDNormal {
 			return false
 		}
@@ -153,13 +159,15 @@ func heapChainDeadToAll(page storage.Page, startSlot uint16, oldestXmin storage.
 	return false
 }
 
-// killEntry is one pending index-entry kill: the physical position (with
-// the D7 re-verify LSN) plus the entry's TID — S3's cheap pre-filter and
-// the posting-list all-TIDs-dead accounting both need the TID (C3-S2
-// review SHOULD-FIX 5).
-type killEntry struct {
-	Pos btree.ScanPos
-	Ptr storage.ItemPointer
+// flushKills runs the deferred exclusive-latched marking pass (C3-S3,
+// design §4b) over the kill list collected during Next(). Best-effort:
+// KillItems drops anything whose leaf changed since capture (D7).
+func (o *indexScanOp) flushKills() {
+	if len(o.killList) == 0 || o.tree == nil {
+		return
+	}
+	o.tree.KillItems(o.killList)
+	o.killList = o.killList[:0]
 }
 
 type indexScanOp struct {
@@ -189,7 +197,7 @@ type indexScanOp struct {
 	// killList into the deferred exclusive-latched mark pass at
 	// Close/Rescan; S2 only collects.
 	poss     []btree.ScanPos
-	killList []killEntry
+	killList []btree.KillItem
 
 	// M0054-0006a: state captured at Open() time and reused across
 	// Rescan() calls when the index probe is driven by an outer row
@@ -335,9 +343,10 @@ func (o *indexScanOp) BindOuter(slot SlotView, outerWidth int) {
 // Rescan(nil, 0); the M0054-0006 NLI path calls Open once then Rescan
 // per outer row.
 func (o *indexScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
+	o.flushKills() // C3-S3: mark pending kills before discarding them
 	o.tids = o.tids[:0]
 	o.poss = o.poss[:0]
-	o.killList = o.killList[:0] // S3 will flush pending kills BEFORE the reset
+	o.killList = o.killList[:0]
 	o.idx = 0
 	o.hasLast = false
 	o.outerSlot = outerSlot
@@ -512,7 +521,7 @@ func (o *indexScanOp) Next() (TupleSlot, error) {
 			if o.ctx.TxnMgr != nil {
 				if tidIdx := o.idx - 1; tidIdx >= 0 && tidIdx < len(o.poss) {
 					if heapChainDeadToAll(slot.Page(), ptr.Offset, o.ctx.TxnMgr.OldestXmin()) {
-						o.killList = append(o.killList, killEntry{Pos: o.poss[tidIdx], Ptr: ptr})
+						o.killList = append(o.killList, btree.KillItem{Pos: o.poss[tidIdx], Ptr: ptr})
 					}
 				}
 			}
@@ -618,9 +627,10 @@ func (o *indexScanOp) Next() (TupleSlot, error) {
 }
 
 func (o *indexScanOp) Close() error {
+	o.flushKills() // C3-S3: mark pending kills before releasing state
 	o.tids = nil
 	o.poss = nil
-	o.killList = nil // S3 will flush pending kills BEFORE the release
+	o.killList = nil
 	o.hasLast = false
 	if o.scanRow != nil {
 		releaseRow(o.scanRow)

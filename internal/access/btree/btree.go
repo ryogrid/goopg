@@ -2351,9 +2351,37 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 		// Drop the freshly-allocated right slot — split avoided.
 		rightSlot.Unlock()
 		bt.pool.Unpin(rightSlot)
-		// MarkDirty the left page so the dedup'd content
-		// reaches WAL.
-		bt.pool.MarkDirty(slot)
+		// C3-S3 (S2-review blocker fix A): this rewrite SHIFTS SLOT
+		// NUMBERS, so it must bump pd_lsn — the deferred kill pass
+		// re-verifies leaf identity by LSN equality (D7) and a plain
+		// MarkDirty leaves pd_lsn unchanged when an FPI already exists
+		// this epoch, letting a stale kill mark the WRONG slot. Route
+		// through the logical kept-items record (same emitter VACUUM
+		// uses; also fixes the pre-existing unlogged-rewrite crash gap
+		// the S1 review noted). Falls back to a page-image record for
+		// harnesses without the vacuum hook.
+		if opAfter := readOpaque(slot.Page()); opAfter.HasGarbage() {
+			// The rewrite dropped every dead-marked item (pageItems skips
+			// them) — clear the hint like VacuumIndexPages does (O-C3-5).
+			opAfter.Flags &^= BTHasGarbage
+			writeOpaque(slot.Page(), opAfter)
+		}
+		if logVac := bt.pool.LogBtreeVacuum(); logVac != nil {
+			keptRaw := make([][]byte, 0, len(allItems))
+			for _, x := range allItems {
+				keptRaw = append(keptRaw, x.marshal())
+			}
+			flagsAfter := readOpaque(slot.Page()).Flags
+			if err := bt.pool.MarkDirtyChangeRecord(slot, func() (storage.LSN, error) {
+				return logVac(bt.rel, blk, keptRaw, flagsAfter)
+			}); err != nil {
+				bt.unpinW(slot)
+				return err
+			}
+		} else if err := bt.markDirtyWithPageRecord(slot, blk); err != nil {
+			bt.unpinW(slot)
+			return err
+		}
 		bt.unpinW(slot)
 		return nil
 	}

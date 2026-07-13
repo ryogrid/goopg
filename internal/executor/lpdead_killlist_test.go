@@ -12,6 +12,7 @@ import (
 func TestHeapChainDeadToAllOracle(t *testing.T) {
 	const oldestXmin = storage.TransactionID(10)
 
+
 	newPage := func() storage.Page {
 		p := make(storage.Page, storage.BlockSize)
 		if err := storage.InitPage(p); err != nil {

@@ -105,7 +105,14 @@ func TupleDeadToAll(hdr HeapTupleHeader, oldestXmin TransactionID) bool {
 		}
 		effXmax = upd
 	}
-	return effXmax < oldestXmin
+	if effXmax >= oldestXmin {
+		return false
+	}
+	// C3-S3 blocker fix B: the deleter must have COMMITTED. An aborted
+	// deleter's stamp survives physically; reclaiming its tuple would
+	// destroy a live row. nil hook (unit tests without a server) is
+	// conservative: nothing is provably dead.
+	return XidCommitted != nil && XidCommitted(effXmax)
 }
 
 // pagePruneCore is the shared dead-tuple reclamation kernel behind both

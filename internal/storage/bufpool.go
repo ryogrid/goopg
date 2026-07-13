@@ -156,6 +156,22 @@ type Pool struct {
 	// review F1 of perf-optimize3-dash S2).
 	fpiPublishMu sync.RWMutex
 
+	// hintFlushBarrier (C3-S3 review MUST-FIX: async-commit durability):
+	// unlogged hint marks (LP_DEAD) depend on facts — the deleter's commit
+	// record — that pd_lsn does NOT cover (MarkDirtyHint never bumps it,
+	// by D7 design). Before ANY page write-back, WAL is flushed up to
+	// max(page pd_lsn, this barrier); MarkDirtyHint CAS-maxes it to the
+	// WAL frontier at mark time, so a persisted hint can never outlive a
+	// crash that loses the commit record it was derived from (goopg's
+	// analog of PG SetHintBits' XLogNeedsFlush guard, deferred to
+	// write-back). Coarse (pool-wide, not per-slot) but conservative.
+	hintFlushBarrier atomic.Uint64
+	// walFrontier returns the WAL writer's current written frontier
+	// (wired to Writer.WrittenLSN by initdb.Open); nil in harnesses
+	// without WAL — MarkDirtyHint then leaves the barrier untouched and
+	// KillItems refuses to mark anyway (vacuous D7 token guard).
+	walFrontier func() uint64
+
 	// evictedImageLSN preserves a page's nativeImageLSN watermark across
 	// slot eviction. The watermark lives on the Slot, so without this a
 	// hot page cycling through the pool re-arms first-touch imaging on
@@ -613,6 +629,7 @@ type PoolConfig struct {
 	LogHeapLock              LogHeapLockFunc
 	LogHeapVacuum            LogHeapVacuumFunc
 	LogBtreeVacuum           LogBtreeVacuumFunc
+	WALFrontier              func() uint64
 	LogBtreeUnlinkPage       LogBtreeUnlinkPageFunc
 	LogBtreeNewRoot          LogBtreeNewRootFunc
 	LogBtreeMarkPageHalfDead LogBtreeMarkPageHalfDeadFunc
@@ -717,6 +734,7 @@ func NewPool(mgr *Manager, cfg PoolConfig) (*Pool, error) {
 		logHeapLock:              cfg.LogHeapLock,
 		logHeapVacuum:            cfg.LogHeapVacuum,
 		logBtreeVacuum:           cfg.LogBtreeVacuum,
+		walFrontier:              cfg.WALFrontier,
 		logBtreeUnlinkPage:       cfg.LogBtreeUnlinkPage,
 		logBtreeNewRoot:          cfg.LogBtreeNewRoot,
 		logBtreeMarkPageHalfDead: cfg.LogBtreeMarkPageHalfDead,
@@ -776,6 +794,10 @@ func (p *Pool) LogHeapLock() LogHeapLockFunc { return p.logHeapLock }
 
 // LogHeapVacuum returns the configured heap-vacuum change-record hook.
 func (p *Pool) LogHeapVacuum() LogHeapVacuumFunc { return p.logHeapVacuum }
+
+// HasWALFrontier reports whether the hint flush-barrier source is wired
+// (see hintFlushBarrier) — a precondition for LP_DEAD marking.
+func (p *Pool) HasWALFrontier() bool { return p.walFrontier != nil }
 
 // LogBtreeVacuum returns the configured btree-vacuum kept-items change-record emitter.
 func (p *Pool) LogBtreeVacuum() LogBtreeVacuumFunc { return p.logBtreeVacuum }
@@ -1836,6 +1858,43 @@ func (p *Pool) Unpin(s *Slot) {
 }
 
 // MarkDirty flags the slot as having been mutated.
+// MarkDirtyHint sets the dirty bit WITHOUT the first-touch FPI or any
+// pd_lsn change (C3-S3: PG's MarkBufferDirtyHint analog for unlogged
+// hints — LP_DEAD index marks). The hint may reach disk via checkpoint/
+// eviction write-back; a crash simply loses it (advisory by contract,
+// design D2). Deliberately no maybeEmitFPI: an image would bump pd_lsn and
+// self-invalidate the D7 LSN re-verify, and hints are not WAL-logged in
+// PG either. Torn-write exposure is a 2-bit line-pointer flag within one
+// sector — the PG-without-checksums stance.
+func (p *Pool) MarkDirtyHint(s *Slot) {
+	// Raise the pool-wide hint flush barrier to the CURRENT WAL frontier:
+	// any commit record the hint's oracle observed is already appended,
+	// so flushing up to the frontier before this page reaches disk makes
+	// the hint's premises durable first (async-commit hole; see the
+	// hintFlushBarrier field doc).
+	if p.walFrontier != nil {
+		f := p.walFrontier()
+		for {
+			cur := p.hintFlushBarrier.Load()
+			if f <= cur || p.hintFlushBarrier.CompareAndSwap(cur, f) {
+				break
+			}
+		}
+	}
+	for {
+		old := s.state.Load()
+		if old&slotDirtyBit != 0 {
+			return
+		}
+		newSt := old | slotDirtyBit
+		if s.state.CompareAndSwap(old, newSt) {
+			p.sharedDirtiedCount.Add(1)
+			p.traceSlotEvent(s.idx, evMarkDirty, s.tag, old, newSt)
+			return
+		}
+	}
+}
+
 func (p *Pool) MarkDirty(s *Slot) {
 	p.maybeEmitFPI(s)
 	// Atomically set dirty bit.
@@ -1858,16 +1917,10 @@ func (p *Pool) MarkDirty(s *Slot) {
 // crash recovery and are never WAL-logged. The page is flushed to disk at
 // checkpoint time, persisting the cached bits for future restarts.
 func (p *Pool) MarkDirtyHintBit(s *Slot) {
-	for {
-		old := s.state.Load()
-		if old&slotDirtyBit != 0 {
-			return
-		}
-		if s.state.CompareAndSwap(old, old|slotDirtyBit) {
-			p.sharedDirtiedCount.Add(1)
-			return
-		}
-	}
+	// Unified with MarkDirtyHint (C3-S3 review: identical CAS twin, and
+	// heap hint bits share the same commit-durability dependency — the
+	// barrier covers both).
+	p.MarkDirtyHint(s)
 }
 
 // MarkDirtyWithLSN records an explicit page LSN and marks the slot dirty.
@@ -2226,9 +2279,13 @@ func (p *Pool) flushBatch(slots []*Slot, tags []BufferTag) error {
 		}
 	}
 
-	if p.wal != nil && maxLSN != 0 {
-		if err := p.wal.FlushUpTo(uint64(maxLSN)); err != nil {
-			return fmt.Errorf("flush wal up to %d: %w", maxLSN, err)
+	flushTo := uint64(maxLSN)
+	if b := p.hintFlushBarrier.Load(); b > flushTo {
+		flushTo = b // hint marks' premises must be durable first
+	}
+	if p.wal != nil && flushTo != 0 {
+		if err := p.wal.FlushUpTo(flushTo); err != nil {
+			return fmt.Errorf("flush wal up to %d: %w", flushTo, err)
 		}
 	}
 
@@ -2295,10 +2352,13 @@ func (p *Pool) flushBatch(slots []*Slot, tags []BufferTag) error {
 
 func (p *Pool) flushSlot(tag BufferTag, page Page) error {
 	if p.wal != nil {
-		lsn := MustHeader(page).LSN()
-		if lsn != 0 {
-			if err := p.wal.FlushUpTo(uint64(lsn)); err != nil {
-				return fmt.Errorf("flush wal up to %d: %w", lsn, err)
+		flushTo := uint64(MustHeader(page).LSN())
+		if b := p.hintFlushBarrier.Load(); b > flushTo {
+			flushTo = b // hint marks' premises must be durable first
+		}
+		if flushTo != 0 {
+			if err := p.wal.FlushUpTo(flushTo); err != nil {
+				return fmt.Errorf("flush wal up to %d: %w", flushTo, err)
 			}
 		}
 	}

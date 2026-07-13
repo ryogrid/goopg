@@ -133,6 +133,13 @@ func (bt *BTree) VacuumIndexPages(deadTIDs []storage.ItemPointer) (int, error) {
 			// back to FPI via `markDirtyWithPageRecord` when no
 			// hook is wired (test harnesses without a WAL
 			// writer).
+			// O-C3-5: the rewrite dropped every dead-marked item, so the
+			// garbage hint clears unconditionally (stale-set is harmless
+			// but pointless to persist through a logged rewrite).
+			if opAfter := readOpaque(slot.Page()); opAfter.HasGarbage() {
+				opAfter.Flags &^= BTHasGarbage
+				writeOpaque(slot.Page(), opAfter)
+			}
 			if logVac := bt.pool.LogBtreeVacuum(); logVac != nil {
 				flagsAfter := readOpaque(slot.Page()).Flags
 				if err := bt.pool.MarkDirtyChangeRecord(slot, func() (storage.LSN, error) {

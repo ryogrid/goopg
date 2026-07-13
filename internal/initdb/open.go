@@ -656,15 +656,18 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	}
 
 	pool, err := storage.NewPool(mgr, storage.PoolConfig{
-		Slots:                    slots,
-		WAL:                      walWriter,
-		LogPageImage:             logFPI,
-		LogBtreeSplit:            logBtreeSplit,
-		LogHeapInsert:            logHeapInsert,
-		LogBtreeInsert:           logBtreeInsert,
-		LogHeapDelete:            logHeapDelete,
-		LogHeapVacuum:            logHeapVacuum,
-		LogBtreeVacuum:           logBtreeVacuum,
+		Slots:          slots,
+		WAL:            walWriter,
+		LogPageImage:   logFPI,
+		LogBtreeSplit:  logBtreeSplit,
+		LogHeapInsert:  logHeapInsert,
+		LogBtreeInsert: logBtreeInsert,
+		LogHeapDelete:  logHeapDelete,
+		LogHeapVacuum:  logHeapVacuum,
+		LogBtreeVacuum: logBtreeVacuum,
+		// C3-S3: unlogged-hint flush barrier source (see
+		// Pool.hintFlushBarrier) — the WAL frontier at hint-mark time.
+		WALFrontier:              walWriter.WrittenLSN,
 		LogBtreeUnlinkPage:       logBtreeUnlinkPage,
 		LogBtreeNewRoot:          logBtreeNewRoot,
 		LogBtreeMarkPageHalfDead: logBtreeMarkPageHalfDead,
@@ -929,6 +932,20 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, fmt.Errorf("goopg: restore pg_subtrans: %w", err)
 	}
 	txnMgr.SetSubxactMap(subxactMap)
+	// C3-S3 blocker fix B: storage.TupleDeadToAll (prune / VACUUM / the
+	// index kill oracle) must only treat a deleter as dead-making when it
+	// COMMITTED — an aborted DELETE's xmax stamp survives physically and
+	// the oldestXmin horizon advances past aborted xids freely (PG's
+	// HeapTupleSatisfiesVacuum checks TransactionIdDidCommit). Same
+	// injection pattern as storage.ResolveMultiUpdater (storage cannot
+	// import mvcc). XIDs below the CLOG truncation horizon are committed
+	// by contract (OldestClogXid doc).
+	storage.XidCommitted = func(xid storage.TransactionID) bool {
+		if oldest := clog.OldestClogXid(); oldest != 0 && storage.XIDPrecedes(xid, oldest) {
+			return true
+		}
+		return clog.DidCommit(xid, subxactMap.Parent)
+	}
 	// commitStampMu is goopg's DELAY_CHKPT_START analog (C2-S3 review
 	// MUST-FIX; PG RecordTransactionCommit marks the record-insert →
 	// CLOG-update span so CreateCheckPoint waits it out). Every xact-marker
