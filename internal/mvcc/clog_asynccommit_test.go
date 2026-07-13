@@ -91,12 +91,15 @@ func TestCLogFlushAllBeforePoolExistsIsNoop(t *testing.T) {
 	}
 }
 
-// TestCLogSetCommittedNoLSNNeverFiresBarrier pins the sync-commit-path
-// invariant this design deliberately preserves: plain SetCommitted (lsn=0,
-// used by every synchronous commit and by WAL replay) must NEVER trigger the
-// flushWAL hook, so a synchronous commit never pays a second, redundant
-// FlushUpTo round trip on top of the explicit one the caller already made.
-func TestCLogSetCommittedNoLSNNeverFiresBarrier(t *testing.T) {
+// TestCLogSetCommittedDurableArmsBarrierFastExit inverts the retired
+// TestCLogSetCommittedNoLSNNeverFiresBarrier: since C2-S2 every synchronous
+// commit associates its commit record's end-LSN with the CLOG page
+// (SetCommittedDurable), so the group leader's flushDirty write-back now
+// fires the WAL barrier with that LSN — armed, but cheap: the record is
+// already durable at commit time, so the hook's FlushUpTo fast-exits on the
+// flushed-LSN check. The barrier must observe an LSN >= the one passed in
+// (flushDirty flushes the max across dirty pages).
+func TestCLogSetCommittedDurableArmsBarrierFastExit(t *testing.T) {
 	dir := t.TempDir()
 	c, err := OpenCLog(filepath.Join(dir, "pg_xact_flat"))
 	if err != nil {
@@ -106,19 +109,38 @@ func TestCLogSetCommittedNoLSNNeverFiresBarrier(t *testing.T) {
 		t.Fatalf("EnablePGSLRUMirror: %v", err)
 	}
 	flushCalls := 0
+	var flushLSN uint64
 	c.SetFlushWALHook(func(lsn uint64) error {
 		flushCalls++
+		flushLSN = lsn
 		return nil
 	})
 
 	const xid = FirstNormalTransactionID + 42
-	if err := c.SetCommitted(xid); err != nil {
-		t.Fatalf("SetCommitted: %v", err)
+	const commitLSN = 7777
+	if err := c.SetCommittedDurable(xid, commitLSN); err != nil {
+		t.Fatalf("SetCommittedDurable: %v", err)
 	}
-	if flushCalls != 0 {
-		t.Fatalf("flushWAL hook called %d times for a plain SetCommitted, want 0", flushCalls)
+	if flushCalls == 0 {
+		t.Fatal("WAL barrier never fired for a durable sync commit carrying an LSN (D2 requires it armed)")
+	}
+	if flushLSN < commitLSN {
+		t.Fatalf("barrier LSN = %d, want >= %d (page group LSN lost)", flushLSN, commitLSN)
 	}
 	if got := c.GetStatus(xid); got != TxnStatusCommitted {
 		t.Fatalf("GetStatus(%d) = %v, want Committed", xid, got)
+	}
+
+	// WAL replay's plain SetCommitted (lsn=0) still must not fire the
+	// barrier — recovery has no WAL writer to flush (PG's recovery branch).
+	// Use an XID on a FRESH CLOG page: the first commit's page legitimately
+	// retains its group LSN, so a same-page write-back would (correctly)
+	// re-fire the barrier.
+	flushCalls = 0
+	if err := c.SetCommitted(xid + clogXactsPerPage); err != nil {
+		t.Fatalf("SetCommitted: %v", err)
+	}
+	if flushCalls != 0 {
+		t.Fatalf("flushWAL hook called %d times for a plain lsn=0 SetCommitted (replay path, fresh page), want 0", flushCalls)
 	}
 }

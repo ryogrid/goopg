@@ -1030,7 +1030,15 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		switch kind {
 		case mvcc.XactCommit:
 			if waitLocalFlush {
-				_ = clog.SetCommitted(xid)
+				// C2-S2: the sync branch also associates endLSN with the
+				// CLOG page (D2 — arms the SLRU write barrier for the later
+				// eviction/checkpoint write-back; the record is already
+				// durable so the barrier fast-exits — EXCEPT after the
+				// ErrLSNNotWritten swallow above, where the armed barrier
+				// retries the flush and blocks the pg_xact write until it
+				// succeeds; that sentinel becomes fatal in C2-S3). Eager
+				// write-back still on until the S3 cut.
+				_ = clog.SetCommittedDurable(xid, endLSN)
 			} else {
 				_ = clog.SetCommittedWithLSN(xid, endLSN)
 			}

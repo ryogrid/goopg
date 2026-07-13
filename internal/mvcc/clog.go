@@ -196,6 +196,30 @@ func (c *CLog) SetCommittedWithLSN(xid storage.TransactionID, lsn uint64) error 
 	return c.setStatusWithLSN(xid, TxnStatusCommitted, lsn)
 }
 
+// SetCommittedDurable marks xid committed, associates the commit record's
+// end-LSN with the XID's CLOG page (arming the SLRU write barrier exactly
+// like SetCommittedWithLSN — C2 design D2: a sync page written back later by
+// eviction/checkpoint must not skip the XLogFlush-before-SLRU-write rule),
+// and STILL performs the synchronous group-commit durable write-back.
+// Transitional C2-S2 plumbing for the synchronous-commit path: S3 removes
+// the write-back, collapsing this into SetCommittedWithLSN. For a sync
+// commit the record is already durable at this point, so the armed barrier
+// fast-exits inside FlushUpTo.
+func (c *CLog) SetCommittedDurable(xid storage.TransactionID, lsn uint64) error {
+	p := c.pool.Load()
+	if xid < FirstNormalTransactionID {
+		return nil
+	}
+	changed, err := p.setStatusWithLSN(xid, TxnStatusCommitted, lsn)
+	if err != nil {
+		return err
+	}
+	if !changed {
+		return nil
+	}
+	return c.groupUpdate(xid, TxnStatusCommitted)
+}
+
 // SetAborted marks xid as aborted and persists the change to disk.
 func (c *CLog) SetAborted(xid storage.TransactionID) error {
 	return c.setStatus(xid, TxnStatusAborted)
