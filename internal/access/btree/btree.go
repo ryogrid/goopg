@@ -70,6 +70,11 @@ const (
 	// recycled. Crash-replay restores the half-dead state from
 	// the Phase 1 WAL record.
 	BTHalfDead uint16 = 0x0020
+	// BTHasGarbage (C3, PG BTP_HAS_GARBAGE) hints that the page carries at
+	// least one ItemIDDead line pointer set by the on-access kill pass.
+	// Purely advisory: stale-set is harmless (the purge scan finds no Dead
+	// items and clears it); cleared by the pre-split purge and by VACUUM.
+	BTHasGarbage uint16 = 0x0040
 )
 
 // MetaBlock is always block 0 — the metapage. RootStart is the first
@@ -140,6 +145,10 @@ func (o BTPageOpaque) IsDeleted() bool { return o.Flags&BTDeleted != 0 }
 // boundary. Pages without a high key are rightmost on their level
 // (or freshly created) and cover all remaining keys.
 func (o BTPageOpaque) HasHighKey() bool { return o.Flags&BTHasHighKey != 0 }
+
+// HasGarbage reports the BTHasGarbage hint (C3: at least one ItemIDDead
+// line pointer may be present).
+func (o BTPageOpaque) HasGarbage() bool { return o.Flags&BTHasGarbage != 0 }
 
 // ParseOpaque exposes the page-bytes → BTPageOpaque decode for out-of-package
 // readers (notably the amcheck verify engine, internal/amcheck) so they share
@@ -1730,6 +1739,53 @@ func (bt *BTree) updateRootMetaWithLSN(root storage.BlockNumber, level uint32, l
 }
 
 // pageItems lists every item on a page in slot order.
+// pageItemsWithDead is pageItems WITHOUT the ItemIDDead skip: it returns
+// every item (posting lists expanded) plus a parallel dead flag per
+// returned element. VACUUM is the one consumer that must SEE dead-marked
+// entries — skipping them there would leave a marked entry out of the
+// kept-items WAL rewrite while the heap side reclaims its TID; a crash
+// then replays the entry back as Normal pointing at a recycled heap slot
+// (C3-S1 review MUST-FIX 1). PG's btbulkdelete likewise deletes by TID
+// regardless of LP_DEAD.
+func pageItemsWithDead(p storage.Page) ([]item, []bool, error) {
+	count, err := storage.PageLinePointerCount(p)
+	if err != nil {
+		return nil, nil, err
+	}
+	out := make([]item, 0, count)
+	dead := make([]bool, 0, count)
+	for slot := uint16(1); slot <= uint16(count); slot++ {
+		isDead, derr := storage.PageItemIsDead(p, slot)
+		if derr != nil {
+			return nil, nil, derr
+		}
+		raw, err := storage.PageGetItemRawAllowDead(p, slot)
+		if err != nil {
+			return nil, nil, err
+		}
+		if isPostingRaw(raw) {
+			key, tids, perr := parsePostingRaw(raw)
+			if perr != nil {
+				maybeDumpPageOnParseErr(p, "pageItemsWithDead: parsePostingRaw")
+				return nil, nil, perr
+			}
+			for _, tid := range tids {
+				out = append(out, item{keyLen: uint16(len(key)), ptr: tid, key: key})
+				dead = append(dead, isDead)
+			}
+		} else {
+			it, perr := parseItem(raw)
+			if perr != nil {
+				maybeDumpPageOnParseErr(p, "pageItemsWithDead: parseItem")
+				return nil, nil, perr
+			}
+			out = append(out, it)
+			dead = append(dead, isDead)
+		}
+	}
+	return out, dead, nil
+}
+
 func pageItems(p storage.Page) ([]item, error) {
 	count, err := storage.PageLinePointerCount(p)
 	if err != nil {
@@ -1737,6 +1793,12 @@ func pageItems(p storage.Page) ([]item, error) {
 	}
 	out := make([]item, 0, count)
 	for slot := uint16(1); slot <= uint16(count); slot++ {
+		if dead, derr := storage.PageItemIsDead(p, slot); derr == nil && dead {
+			// C3-S1: ItemIDDead entries are invisible to every reader —
+			// the referenced heap tuple is dead to all snapshots and the
+			// entry awaits the pre-split purge / VACUUM.
+			continue
+		}
 		raw, err := storage.PageGetItemRaw(p, slot)
 		if err != nil {
 			return nil, err
@@ -1784,6 +1846,12 @@ func PageItemKeys(p storage.Page) ([][]byte, error) {
 	}
 	out := make([][]byte, 0, count)
 	for slot := uint16(1); slot <= uint16(count); slot++ {
+		if dead, derr := storage.PageItemIsDead(p, slot); derr == nil && dead {
+			// C3-S1: ItemIDDead entries are invisible to every reader —
+			// the referenced heap tuple is dead to all snapshots and the
+			// entry awaits the pre-split purge / VACUUM.
+			continue
+		}
 		raw, err := storage.PageGetItemRaw(p, slot)
 		if err != nil {
 			return nil, err
@@ -1839,6 +1907,12 @@ func PageLeafEntries(p storage.Page) ([]LeafEntry, error) {
 	}
 	out := make([]LeafEntry, 0, count)
 	for slot := uint16(1); slot <= uint16(count); slot++ {
+		if dead, derr := storage.PageItemIsDead(p, slot); derr == nil && dead {
+			// C3-S1: ItemIDDead entries are invisible to every reader —
+			// the referenced heap tuple is dead to all snapshots and the
+			// entry awaits the pre-split purge / VACUUM.
+			continue
+		}
 		raw, err := storage.PageGetItemRaw(p, slot)
 		if err != nil {
 			return nil, err
@@ -1893,6 +1967,12 @@ func PageDownlinks(p storage.Page) ([]Downlink, error) {
 	}
 	out := make([]Downlink, 0, count)
 	for slot := uint16(1); slot <= uint16(count); slot++ {
+		if dead, derr := storage.PageItemIsDead(p, slot); derr == nil && dead {
+			// C3-S1: ItemIDDead entries are invisible to every reader —
+			// the referenced heap tuple is dead to all snapshots and the
+			// entry awaits the pre-split purge / VACUUM.
+			continue
+		}
 		raw, err := storage.PageGetItemRaw(p, slot)
 		if err != nil {
 			return nil, err
@@ -1942,7 +2022,7 @@ func findChildBlockDirect(p storage.Page, key []byte) (storage.BlockNumber, erro
 	// Binary search across line pointers.
 	n := count
 	idx := sort.Search(n, func(i int) bool {
-		raw, err := storage.PageGetItemRaw(p, uint16(i+1))
+		raw, err := storage.PageGetItemRawAllowDead(p, uint16(i+1)) // C3-S1: dead items keep ordering bytes
 		if err != nil {
 			return true // will surface at the final error check
 		}
@@ -1961,7 +2041,7 @@ func findChildBlockDirect(p storage.Page, key []byte) (storage.BlockNumber, erro
 		idx--
 	}
 	// idx==0 stays 0: first child.
-	raw, err := storage.PageGetItemRaw(p, uint16(idx+1))
+	raw, err := storage.PageGetItemRawAllowDead(p, uint16(idx+1)) // C3-S1
 	if err != nil {
 		return 0, err
 	}
@@ -2945,7 +3025,10 @@ func byteAwareSplitLoc(items []item) int {
 // — that's enough for the binary search since all posting tids
 // share the same key.
 func readPageItem(p storage.Page, idx int) (item, error) {
-	raw, err := storage.PageGetItemRaw(p, uint16(idx+1))
+	// C3-S1: AllowDead — this is a binary-search ordering probe; Dead
+	// items retain valid key bytes until purged, and result filtering
+	// happens at the caller's visibility layer.
+	raw, err := storage.PageGetItemRawAllowDead(p, uint16(idx+1))
 	if err != nil {
 		return item{}, err
 	}
@@ -3106,6 +3189,8 @@ func (bt *BTree) RangeScan(lo, hi []byte, fn func(key []byte, ptr storage.ItemPo
 				// and the pin is held across this whole loop.
 				r, rawErr := storage.PageGetItemRawNoCopy(slot.Page(), s)
 				if rawErr != nil {
+					// Includes ItemIDDead slots (ErrUnsupportedItem):
+					// C3-S1 — dead entries are invisible to scans.
 					continue
 				}
 				if isPostingRaw(r) {

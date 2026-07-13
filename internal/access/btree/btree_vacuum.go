@@ -31,6 +31,11 @@ type emptyLeafInfo struct {
 // Returns the number of index entries removed.
 func (bt *BTree) VacuumIndexPages(deadTIDs []storage.ItemPointer) (int, error) {
 	if len(deadTIDs) == 0 {
+		// Safe to skip even with C3 ItemIDDead marks outstanding: the
+		// resurrection hazard (review MUST-FIX 1) requires the HEAP side
+		// to reclaim a marked entry's TID, which only happens when heap
+		// vacuum found dead tuples — i.e. deadTIDs is non-empty. Marked
+		// entries wait for the next real vacuum or the S4 pre-split purge.
 		return 0, nil
 	}
 
@@ -61,7 +66,14 @@ func (bt *BTree) VacuumIndexPages(deadTIDs []storage.ItemPointer) (int, error) {
 			break
 		}
 
-		items, err := pageItems(slot.Page())
+		// C3-S1 (review MUST-FIX 1): enumerate INCLUDING ItemIDDead-marked
+		// entries — VACUUM must physically drop them inside its logged
+		// kept-items rewrite (D3: the mark was verified dead-to-all at mark
+		// time, so trusting it is exactly PG's LP_DEAD model). Skipping
+		// them here would leave marked entries out of the rewrite while
+		// the heap reclaims their TIDs; a crash replays them back as
+		// Normal pointing at recycled heap slots.
+		items, itemDead, err := pageItemsWithDead(slot.Page())
 		if err != nil {
 			bt.unpinW(slot)
 			return totalRemoved, err
@@ -74,8 +86,8 @@ func (bt *BTree) VacuumIndexPages(deadTIDs []storage.ItemPointer) (int, error) {
 		}
 
 		var kept []item
-		for _, it := range items {
-			if deadSet[tidKey(it.ptr)] {
+		for i, it := range items {
+			if itemDead[i] || deadSet[tidKey(it.ptr)] {
 				totalRemoved++
 			} else {
 				kept = append(kept, it)
