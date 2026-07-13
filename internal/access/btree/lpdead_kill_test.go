@@ -170,3 +170,140 @@ func TestKillItemsRefusesWithoutWALHook(t *testing.T) {
 		t.Fatalf("entry killed despite vacuous LSN token (ok=%v err=%v)", ok, err)
 	}
 }
+
+// TestNoSpaceRewritePurgesDeadItems (C3-S4): when an insert hits a full
+// leaf, the no-space recovery rewrite must physically DROP ItemIDDead
+// entries and log the survivor set as a kept-items record (the
+// _bt_simpledel_pass analog — S1's reader skip supplies the drop, the
+// S3 blocker-A fix supplies the record). The recorder asserts the dead
+// key is absent from keptRaw, so a crash replay reconstructs the page
+// without it.
+func TestNoSpaceRewritePurgesDeadItems(t *testing.T) {
+	dir := t.TempDir()
+	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dir})
+	defer mgr.Close()
+	var lsn storage.LSN = 100
+	next := func() storage.LSN { lsn += 8; return lsn }
+	var lastKept [][]byte
+	var lastFlags uint16
+	var vacCalls int
+	pool, err := storage.NewPool(mgr, storage.PoolConfig{
+		Slots:          64,
+		FullPageWrites: true,
+		LogPageImage: func(_ storage.RelFileNode, _ storage.BlockNumber, _ storage.Page) (storage.LSN, error) {
+			return next(), nil
+		},
+		LogBtreeVacuum: func(_ storage.RelFileNode, _ storage.BlockNumber, kept [][]byte, flags uint16) (storage.LSN, error) {
+			vacCalls++
+			lastKept = kept
+			lastFlags = flags
+			return next(), nil
+		},
+		WALFrontier: func() uint64 { return uint64(lsn) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	rel := storage.RelFileNode{DBOid: 1, RelOid: 9002, Fork: storage.MainFork}
+	bt, err := Create(pool, rel)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Fill one leaf with wide keys until the NEXT insert would not fit.
+	wide := func(i int) []byte {
+		k := make([]byte, 512)
+		copy(k, EncodeInt4(int32(i)))
+		return k
+	}
+	i := 0
+	filled := false
+	for ; i < 64; i++ {
+		if err := bt.Insert(wide(i), storage.ItemPointer{Block: storage.BlockNumber(i + 1), Offset: 1}); err != nil {
+			t.Fatal(err)
+		}
+		meta, _ := bt.readMeta()
+		slot, perr := bt.pinR(meta.Root)
+		if perr != nil {
+			t.Fatal(perr)
+		}
+		full := !pageHasSpaceFor(slot.Page(), item{keyLen: 512, key: make([]byte, 512)})
+		slot.RUnlock()
+		bt.pool.Unpin(slot)
+		if full {
+			filled = true
+			break
+		}
+	}
+	if !filled {
+		t.Skip("64 x 512B keys never filled the leaf — page sizing drifted")
+	}
+
+	// Mark one mid-page entry dead, then insert one more (no space →
+	// recovery rewrite fires).
+	kills := map[int32]KillItem{}
+	if err := bt.RangeScanWithPos(nil, nil, func(key []byte, ptr storage.ItemPointer, pos ScanPos) (bool, error) {
+		v, _ := DecodeInt4(key[:4])
+		kills[v] = KillItem{Pos: pos, Ptr: ptr}
+		return true, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	bt.KillItems([]KillItem{kills[2]})
+	if _, ok, _ := bt.Search(wide(2)); ok {
+		t.Fatal("kill did not apply")
+	}
+
+	vacCalls = 0
+	if err := bt.Insert(wide(1000), storage.ItemPointer{Block: 999, Offset: 1}); err != nil {
+		t.Fatalf("insert onto full dead-carrying leaf: %v", err)
+	}
+	if vacCalls == 0 {
+		t.Fatal("no-space rewrite did not emit the kept-items record (purge unlogged or split taken — S3 blocker-A regression)")
+	}
+	// The kept-items record must exclude the dead key's item.
+	deadKey := wide(2)
+	for _, raw := range lastKept {
+		it, perr := parseItem(raw)
+		if perr != nil {
+			t.Fatalf("kept-items entry unparseable (format drift): %v", perr)
+		}
+		if CompareKeys(it.key, deadKey) == 0 {
+			t.Fatal("kept-items record still carries the dead entry — purge not logged")
+		}
+	}
+	// Total survivor accounting: i+1 inserted, minus the dead one, plus
+	// the incoming key — dedup cannot legally shrink further (no dups).
+	if want := i + 1; len(lastKept) != want {
+		t.Fatalf("kept-items carries %d entries, want %d (a LIVE item was dropped)", len(lastKept), want)
+	}
+	// And the live neighbors + the new key survive.
+	for _, k := range [][]byte{wide(0), wide(1), wide(3), wide(1000)} {
+		if _, ok, err := bt.Search(k); err != nil || !ok {
+			t.Fatalf("live key lost across the purge rewrite (ok=%v err=%v)", ok, err)
+		}
+	}
+
+	// Crash-replay closure (review SHOULD-FIX 2): the kept set must
+	// reconstruct a fresh page via the SAME replay entry production uses.
+	fresh := make(storage.Page, storage.BlockSize)
+	if err := storage.InitPage(fresh); err != nil {
+		t.Fatal(err)
+	}
+	if err := ReplayVacuumPage(fresh, lastKept, lastFlags); err != nil {
+		t.Fatalf("ReplayVacuumPage on the dedup-path kept set: %v", err)
+	}
+	keys, err := PageItemKeys(fresh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(keys) != i+1 {
+		t.Fatalf("replayed page has %d items, want %d", len(keys), i+1)
+	}
+	for _, k := range keys {
+		if CompareKeys(k, deadKey) == 0 {
+			t.Fatal("replayed page resurrected the dead entry")
+		}
+	}
+}

@@ -202,3 +202,36 @@ record, retry the space check, and only split if still full.
 - **O-C3-5**: `BTP_HAS_GARBAGE` clearing protocol (purge clears when no Dead
   remain; VACUUM clears unconditionally; stale-set harmless) — document the
   final protocol in S3.
+
+## 10. Implementation notes (S1-S4, 2026-07-13)
+
+- S1 d78d0199, S2 3c193124, S3 d8d450c1 (see each commit message for the
+  review fallout). Key deviations from the design as written:
+  - The S4 "pre-split simple deletion" needed NO new purge pass: S1's
+    reader skip makes every no-space rewrite (dedup-recovery, split) drop
+    Dead items structurally, and the S3 blocker-A fix routes the
+    dedup-recovery rewrite through the LogBtreeVacuum kept-items record —
+    so the purge is logged and crash-replayable via the existing
+    ReplayVacuumPage path. Pinned by TestNoSpaceRewritePurgesDeadItems.
+    D5 (never-empty) holds trivially: the rewrite set always contains the
+    incoming item.
+  - D7 gained a THIRD leg beyond the LSN token: KillItems refuses unless
+    LogBtreeVacuum+LogPageImage+WALFrontier are all wired, and
+    Pool.hintFlushBarrier defers every page write-back until WAL is
+    flushed past the mark-time frontier (async-commit durability hole —
+    S3 review; PG SetHintBits/XLogNeedsFlush analog).
+  - TupleDeadToAll now requires a COMMITTED deleter via the
+    storage.XidCommitted hook (S3 blocker B) — this also fixed a
+    pre-existing prune/VACUUM hazard (aborted DELETE reclaiming a live
+    row). Sub-xid CLOG lanes are not stamped in production yet: subxact
+    deleters stay conservatively unreclaimable (ledger row; resume =
+    TransactionIdCommitTree parity).
+  - Posting-list kills deferred (O-C3-1): KillItems skips posting slots.
+- **O-C3-2 / README X3 settled**: under the native-only WAL default
+  (perf-optimize3-dash S4, commit dff94fca), user-index pages are not
+  canonically replicated to real PG at all — the purge record is
+  native-family WAL replayed by goopg standbys via AppendRaw byte copy;
+  no canonical counterpart is required until the GOOPG_WAL_CANONICAL=on
+  resume path lands C1, which will need a canonical XLOG_BTREE_DELETE
+  sibling at that point (deferral ledger, dash rows).
+
