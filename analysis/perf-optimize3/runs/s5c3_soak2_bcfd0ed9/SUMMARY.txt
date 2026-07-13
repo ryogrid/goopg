@@ -1,0 +1,17 @@
+RUN_ID=s5c3_soak2_bcfd0ed9  scale=100 c=50 T=600
+--- goopg_S ---
+latency average = 1.056 ms
+latency stddev = 5.318 ms
+tps = 47303.303732 (without initial connection time)
+--- goopg_N ---
+latency average = 7.834 ms
+latency stddev = 8.824 ms
+tps = 6382.213347 (without initial connection time)
+--- pg_S ---
+latency average = 0.269 ms
+latency stddev = 1.016 ms
+tps = 185094.330551 (without initial connection time)
+--- pg_N ---
+latency average = 4.710 ms
+latency stddev = 2.481 ms
+tps = 10614.013007 (without initial connection time)

@@ -235,3 +235,32 @@ record, retry the space check, and only split if still full.
   resume path lands C1, which will need a canonical XLOG_BTREE_DELETE
   sibling at that point (deferral ledger, dash rows).
 
+## 11. S5 soak results (2026-07-14, commit bcfd0ed9, run s5c3_soak2)
+
+run_rw50 DURATION=600, scale 100, c=50, uncapped, diagnostics on:
+
+| metric | result | baseline (perf-optimize3 01-results) |
+|---|---|---|
+| `-N` TPS over time | 4.7k@30s -> 6.4k@150s -> 6.4k@300s -> 6.3k@450s — **FLAT** | degraded with runtime |
+| `-N` full-run TPS | 6,382 (PG same host: 10,614 — 1.66x gap) | 12.3x write gap at baseline conditions |
+| aborted clients | 0 / 50 | — |
+| pkey growth | +166.8 MB / **600 s** | +166.8 MB / **120 s** (5x slower growth) |
+
+- The §8 target "pkey growth ~= 0" is NOT yet met: kill-list collection
+  rides indexScanOp only (S2's deliberate first-caller scope); pgbench
+  -N's UPDATE probes (updateViaIndex, the non-HOT UPDATE probe,
+  upsert/deferred paths — the other 9 RangeScan callers) do not collect
+  kills yet, so dead entries accumulate until no-space purges reclaim
+  them (that purge is what buys the 5x). Deferral-ledger row: migrate the
+  UPDATE-probe callers to RangeScanWithPos + kill collection; expected to
+  close the remaining growth.
+- bt.stats.splits read-out (§6 S5) not surfaced this pass — the pkey size
+  delta is the operative metric; read-out deferred with the same row.
+- Soak1 (first attempt) found and fixed a pre-existing server bug: the
+  pid-modulo proc-slot assignment wrapped under connection churn and
+  clobbered live sessions ("mvcc: unknown transaction" storms at ~180s;
+  fixed in bcfd0ed9 via connection-lifetime slot ownership).
+- goopg -S varied across soaks (79.8k / 47.3k) under diagnostics load;
+  the 120 s controlled comparison (05 dash §6: 92.8k vs 94.9k) remains
+  the read-path-neutrality reference.
+
