@@ -123,3 +123,34 @@ deferral ledger.
 `internal/initdb`/`internal/mvcc`'s still-open ambiguous-SIGQUIT `units`-lane
 timeouts (tracked separately since `root-0027`) were not investigated this
 loop.
+
+## Follow-up (2026-07-15): `internal/initdb`/`internal/mvcc` confirmed resolved as collateral resource contention
+
+Resume point from the section above. Re-ran the exact nightly `units`-lane
+repro technique (`ci/batch/stages/stage-units.sh`'s own command, all 44
+non-excluded packages, identical cgroup config) now that this loop's `amcheck`
+fix (above) is in place:
+
+```
+GOOPG_CG_UNIT=<unique> GOOPG_MEM_HIGH=6G GOOPG_MEM_MAX=8G GOOPG_MEM_SWAP_MAX=0 \
+GOMEMLIMIT=5GiB scripts/goopg-test-run.sh env GOFLAGS=-p=4 \
+go test -timeout 30m <all 44 units-lane packages>
+```
+
+Result: **clean pass**, no timeout, no `signal: killed`, no SIGQUIT dump —
+`internal/initdb` 237.79s, `internal/mvcc` 1.30s, 0 `FAIL` across the whole
+run. `internal/amcheck` also runs in the (non-`-race`) `units` lane alongside
+`initdb`/`mvcc` as one of the same 44 concurrent packages; before this loop's
+fix it was the same debug-tracing-bloated
+`TestVerifyBtreeEngineSilentOnRealConcurrentContended` (172s→7s standalone)
+eating a disproportionate share of the shared 6G/8G memory-capped, `-p=4`
+co-load window that `initdb`/`internal/mvcc` were both running inside. With
+that hog removed, the full 44-package concurrent run now finishes with
+comfortable margin under the nightly's 30-minute budget for every package,
+confirming — rather than merely hypothesizing — that `initdb`/`mvcc`'s
+`AI-20260715-010036-001`/`-002` nightly timeouts were the SAME collateral
+resource-starvation class as `cmd/goopg`/`amcheck`'s already-classified
+resource kills, not an independent product hang. No further product code
+change needed; this closes the last open item from the `20260715-010036`
+nightly triage thread. Deferral ledger: the still-open row is flipped to
+`resolved`.

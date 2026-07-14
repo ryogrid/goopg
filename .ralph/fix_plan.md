@@ -3973,6 +3973,37 @@ survey the deferral ledger for a fresh open (`status = -`) row.
       follow-up, not required). `internal/initdb`/`internal/mvcc`'s
       still-open ambiguous-SIGQUIT `units`-lane items remain open, see the
       row above.
+- [x] **M-NIGHTLY (run 20260715-010036 triage) — `internal/initdb`/`internal/mvcc`
+      last-open items confirmed resolved (resume point from the item
+      above).** Re-ran the exact nightly `units`-lane repro
+      (`ci/batch/stages/stage-units.sh`'s own command: all 44 non-excluded
+      packages, `GOOPG_MEM_HIGH=6G MEM_MAX=8G MEM_SWAP_MAX=0 GOMEMLIMIT=5GiB
+      GOFLAGS=-p=4`, `scripts/goopg-test-run.sh`, `-timeout 30m`) now that the
+      `amcheck` debug-instrumentation fix above is in place — `internal/initdb`
+      (237.79s) and `internal/mvcc` (1.30s) both PASS cleanly, 0 `FAIL` across
+      the whole run, no `signal: killed`/SIGQUIT/panic anywhere in the log,
+      comfortable margin under the 30-minute nightly budget. Confirms (not
+      merely hypothesizes) that their `AI-20260715-010036-001`/`-002` nightly
+      timeouts were the same collateral resource-starvation class as
+      `cmd/goopg`/`amcheck`'s already-classified resource kills: `amcheck`
+      runs in the (non-`-race`) `units` lane too, as one of the same 44
+      concurrently-scheduled packages, and its pre-fix debug-tracing-bloated
+      stress test (172s standalone) was disproportionately eating the shared
+      6G/8G memory-capped `-p=4` co-load window `initdb`/`mvcc` shared. With
+      that hog removed, the whole lane now finishes with margin to spare. No
+      product code touched this loop. This closes the last open item from the
+      `20260715-010036` nightly triage thread — all 11 `AI-20260715-010036-*`
+      items now resolved. Design doc
+      `docs/design/root-0028-amcheck-realtree-stress-debug-instrumentation-cleanup.md`
+      "Follow-up (2026-07-15)" section + README index row updated. Deferral
+      ledger: new `resolved` row closing the still-open row above. Gates: full
+      44-package nightly-config repro run itself is the verification (0 FAIL);
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh` PASS
+      (0 failed, all 3 workloads; first attempt hit 1 transient pgbench
+      failure out of 11,761 txns — 0.009%, unrelated to this loop's
+      docs/ledger-only diff — retry passed clean, 0 failed across all 3
+      workloads).
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 

@@ -1,68 +1,49 @@
 (idle — nothing in flight)
 
-Last completed (about to commit): M-NIGHTLY (run 20260715-010036 triage) —
-root-caused + fixed the `cmd/goopg`/`internal/amcheck` "units-timeout"
-mystery left open by the last 2 loops. It was a classifier bug in
-`ci/batch/lib/summarize.py`, NOT a product hang.
+Last completed (this loop, about to commit): M-NIGHTLY (run 20260715-010036
+triage) — closed the LAST open item, `internal/initdb`/`internal/mvcc`'s
+ambiguous-SIGQUIT `units`-lane ("hang") timeouts.
 
-Reproduced the whole `units` package set failing identically (`cmd/goopg`/
-`internal/amcheck`/`internal/initdb`/`internal/mvcc`) in 16.5 minutes under
-the EXACT nightly cgroup config (`GOOPG_MEM_HIGH=6G MEM_MAX=8G
-MEM_SWAP_MAX=0 GOMEMLIMIT=5GiB GOFLAGS=-p=4`, matching
-`ci/batch/stages/stage-units.sh`) — confirms genuine multi-package resource
-contention, not per-package flakiness (`initdb` was already proven clean
-standalone). `cmd/goopg`/`internal/amcheck` die via a bare `signal: killed`
-(unambiguous cgroup/OOM per `ci/design/03` §C). Root cause:
-`summarize.py`'s existing `looks_resource_killed(log) and "--- FAIL" not in
-log` rule ran over the WHOLE combined ~40-package log instead of
-per-package — `internal/wal`'s one genuine `--- FAIL` that night (already
-fixed by an earlier loop today) flipped the guard for the whole `units`
-stage, misreporting the 2 pure resource-kills as regressions. Same bug,
-inverted, silently swallowed `race/internal/access/btree`/
-`race/internal/amcheck` (real, NEVER-before-surfaced `-race` failures) into
-one uninformative whole-stage notice on every prior night.
+No product code touched. Re-ran the exact nightly `units`-lane repro
+(`ci/batch/stages/stage-units.sh`'s own command: all 44 non-excluded
+packages, `GOOPG_MEM_HIGH=6G MEM_MAX=8G MEM_SWAP_MAX=0 GOMEMLIMIT=5GiB
+GOFLAGS=-p=4`, `scripts/goopg-test-run.sh`, `-timeout 30m`) now that last
+loop's `amcheck` debug-instrumentation fix is in place — `internal/initdb`
+(237.79s) and `internal/mvcc` (1.30s) both PASS cleanly, 0 FAIL anywhere, no
+`signal: killed`/SIGQUIT/panic in the log. Confirms their nightly timeouts
+were the same collateral resource-starvation class as `cmd/goopg`/`amcheck`'s
+already-classified resource kills (amcheck's pre-fix debug-tracing-bloated
+stress test was hogging the shared memory-capped co-load window). This
+closes ALL 11 `AI-20260715-010036-*` items from the nightly triage thread —
+no open M-NIGHTLY items remain as of this loop.
 
-Fix: `split_go_test_pkg_blocks()` in `ci/batch/lib/summarize.py` — splits a
-`go test` log into per-package blocks on `ok`/`FAIL`/`?` lines; the
-units/race classification loop now runs resource-kill-vs-regression
-per-block. New `ci/batch/lib/test_summarize.py` (stdlib unittest, 4 tests,
-all PASS) using a synthetic fixture modeled on the real log, PLUS
-cross-checked directly against the real
-`ci/logs/20260715-010036/units+race/go-test.log`. Regenerated
-`ci/logs/action-items.md` from the real historical logs (kept — correctly
-reflects the fixed classifier); reverted an incidental duplicate append this
-produced in `ci/logs/history.jsonl` (git checkout — append-only file, must
-not gain a phantom entry from a manual verification run).
+fix_plan.md: new [x] item appended after the btree/amcheck fix (search
+"internal/initdb`/`internal/mvcc` last-open items confirmed resolved").
+Deferral ledger: new `resolved` row appended (last row in the file) closing
+the still-open row from 2 loops ago. Design doc
+`docs/design/root-0028-amcheck-realtree-stress-debug-instrumentation-cleanup.md`
+"Follow-up (2026-07-15)" section + README index row updated.
 
-fix_plan.md: 1 new [x] M-NIGHTLY entry (the fix) + 2 new [ ] M-NIGHTLY tasks
-(`race/internal/access/btree`, `race/internal/amcheck` — brand new findings,
-NOT investigated this loop, time-boxed). Deferral ledger: 1 new `resolved`
-row (this fix) narrowing the `internal/initdb`/`internal/mvcc` still-open
-row + noting the 2 new race items. Design doc
-`docs/design/root-0027-nightly-classifier-per-package-resource-kill.md` +
-README index.
+Next step: check `ci/logs/action-items.md` for a NEW nightly run first
+(regenerates nightly; 20260715-010036 is now fully closed) per the M-NIGHTLY
+preemption rule. If none, resume normal fix_plan.md priority work — the
+M-NIGHTLY queue is empty for the first time in several loops.
 
-Next step: pick the highest-priority M-NIGHTLY item — likely
-`race/internal/access/btree` (real concurrency-bug history, e.g. M0110-0007)
-or `race/internal/amcheck`, neither ever investigated. Repro:
-`go test -race -timeout 15m ./internal/access/btree/` (and `./internal/amcheck/`)
-standalone first; if clean, use the SAME concurrent-load repro technique
-this loop validated (full package set through `scripts/goopg-test-run.sh`
-with the nightly's exact env) to try to force it, capturing a FULL
-(non-truncated) goroutine dump if it hangs. `internal/initdb`/`internal/mvcc`
-(units) remain open too — same repro technique applies.
+Gates run: full 44-package nightly-config repro run (0 FAIL, this loop's
+actual verification); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+`RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh` — first
+attempt hit 1 transient pgbench failure (0.009%, 11761 txns), unrelated to
+this loop's docs/ledger-only diff (no Go code touched); retry PASS clean (0
+failed, all 3 workloads). `make ralph-state-guard` — found+auto-repaired 1
+stale status/progress inconsistency (prior loop's clean-exit marker, same
+pattern as every recent loop), consistent after repair.
 
-Gates run: `python3 ci/batch/lib/test_summarize.py -v` 4/4 PASS; `python3 -m
-py_compile ci/batch/lib/summarize.py` clean; `scripts/tpch-spotcheck.sh`
-PASS (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke bash
-scripts/ralph-precommit-test.sh` PASS (exit 0, 0 failed both workloads);
-`make ralph-state-guard` — found+auto-repaired 1 stale status/progress
-inconsistency (previous loop's clean-exit marker), consistent after repair.
-
-In-flight: none. About to `git add`/`git commit` (pathspec-scoped to my own
-files — `.ralph/{deferral_ledger,fix_plan,working_set}.md`,
-`ci/batch/lib/{summarize.py,test_summarize.py}`, `ci/logs/action-items.md`,
-`docs/design/{README.md,root-0027-*.md}`) then push. Untouched foreign/stray
-files present (`analysis/tpch-explain-baseline.md`, `ci/logs/launch.log`,
-`postgres` submodule dirty, `weekly_loc.*`, `analysis/perf-optimize3/runs/*`)
-— same as every prior loop, left alone.
+In-flight: none. About to commit (docs/ledger/fix_plan only — no product
+code, no test code). Untouched foreign/stray files present at loop start
+(`analysis/tpch-explain-baseline.md`, `ci/logs/launch.log`, `postgres`
+submodule dirty, `weekly_loc.*`, `analysis/perf-optimize3/runs/*`) — same as
+every prior loop, left alone (not part of this loop's diff). Also noted: a
+long-lived leaked `goopg` server process from a prior `TestPort_RegressSuite`
+run (PID ~3848262, since Jul14, port 44791) is idle-resident but harmless —
+not part of this loop's work, left alone (belongs to another
+session/process, not this ralph loop).
