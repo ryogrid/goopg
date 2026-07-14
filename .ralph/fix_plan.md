@@ -3033,6 +3033,93 @@ survey the deferral ledger for a fresh open (`status = -`) row.
       row: nothing new was left unimplemented, this was pure stale-log
       triage.
 
+- [x] **M-NIGHTLY triage — run 20260714-011651 (sha d8a4ed6e, 96 AI items)** —
+      the nightly built at d8a4ed6e (00:33), which predates two same-day
+      fixes that landed by the time this loop ran (2159d329 WAL-accounting-
+      lag retry at 10:02, plus 18 other commits up to HEAD ef38217f). Triaged
+      all 96 items:
+      - `AI-096 pgbench/nightly` (`flush victim: ... wal: requested LSN is
+        beyond written WAL: have 2012952632, need 2012952728`) — **STALE**,
+        confirmed fixed by 2159d329 (landed 10:02, after the 00:33 nightly
+        sha). Re-ran the full nightly-parameter repro at HEAD
+        (`REPO_ROOT=$PWD RUN_DIR=$(mktemp -d) bash
+        ci/batch/stages/stage-pgbench.sh`, s=50 c=100 j=20 T=180x3): PASS,
+        0 failed txns, tps 6202/12019/109096. No code change needed.
+      - `AI-002 testport/TestE2E_FailoverPGtoGoopg` (subtest `sync_on`) and
+        `AI-005 testport/TestPort_TimeoutsRowLevel` (subtest `lock_timeout`)
+        — **STALE**, both PASS standalone at HEAD; matches the known
+        co-load-timing-flake pattern (`iso_runner_blocking_is_timing_only`,
+        `TestPort_TimeoutsRowLevel`'s 300ms lock_timeout/statement_timeout
+        race under nightly CPU contention). Not a regression.
+      - `AI-001 testport/TestDebugSpecconflictActualOutput` — **FIXED**:
+        this was a committed-by-mistake scratch probe
+        (`internal/testport/tmp_spec_debug_test.go`, added in 282174f6) that
+        dumps `insert-conflict-specconflict.spec`'s actual isolation-runner
+        output and unconditionally `t.Fatalf`s so a human could eyeball it —
+        it can never pass and has polluted every nightly run since it was
+        committed. Deleted the file; the real coverage for that spec lives
+        in `TestPort_IsolationInsertConflictSpecconflict`
+        (isolation_port_test.go:354, unaffected).
+      - `AI-003/AI-004 testport/TestPort_Subscription001RepChanges` /
+        `TestPort_Subscription004Sync` — **FIXED, real (reproduces
+        standalone).** Root cause: `subTuple1`/`subTuple2`
+        (subscription_port_test.go) build a synthetic wire-level heap tuple
+        via `storage.NewHeapTuple(xmin, xmax, body).MarshalBinary()` but
+        never call `.Header.SetNatts(len(cols))` first, so the encoded
+        tuple's `Infomask2` natts field stays 0. `wal.encodePgoTuple`
+        (pgoutput.go:299) derives `storedNatts` from that same
+        `Infomask2 & HeapNattsMask` field, and every column index `i` with
+        `i >= storedNatts` is treated as an ALTER-TABLE-added column and
+        forced NULL (pgoutput.go:312-315) — with `storedNatts=0` that's
+        every column, every INSERT — so the subscriber-side apply always
+        wrote an all-NULL tuple (confirmed via a throwaway probe test:
+        `nBlocks=1` but the written tuple had `Bitmap:[0] Data:[]`), and
+        `subScanInt2`'s int-column decode then produced 0 rows. The sibling
+        helper in `internal/executor/applyworker_test.go`
+        (`wrapAsHeapTuple`) already calls `tup.Header.SetNatts(natts)` —
+        this was a test-harness bug isolated to
+        `internal/testport/subscription_port_test.go`, not a product
+        regression (ApplyWorker's own package tests were always green).
+        Fix: added the missing `ht.Header.SetNatts(1)` /
+        `ht.Header.SetNatts(2)` calls to `subTuple1`/`subTuple2`. Verified:
+        `TestPort_Subscription001RepChanges` +
+        `TestPort_Subscription004Sync` + `TestPort_Subscription026Stats`
+        all PASS. No deferral-ledger row (fully fixed, no remaining gap).
+      - `AI-006..AI-095 regress/*` (90 items, all sharing the identical
+        `regress_suite_test.go:121: deferred: output mismatch;
+        normalization rules need extension` rationale, joined against
+        `docs/test-port/regress-diff-baseline.csv` — **NOT attempted this
+        loop, too large for one pass.** The baseline CSV was last refreshed
+        2026-06-10 (commit 4ff7033b), over a month before this nightly;
+        spot-checked 10 of the 90 flagged suites at HEAD
+        (`aggregates|with|join|numeric|create_table|truncate|update|insert|
+        select|subselect` via `go test -v -run
+        'TestPort_RegressSuite/(...)$' ./internal/testport/`): `select` and
+        `truncate` now PASS (stale — already fixed by one of the 19 commits
+        since the baseline's sha), the rest still genuinely diverge. Pulled
+        an actual diff for `aggregates`
+        (`GOOPG_REGRESS_DIFF_DIR=/tmp go test -run
+        'TestPort_RegressSuite/aggregates$' ./internal/testport/`): real
+        bugs, not just baseline drift — `ERROR: column ref f1/0 on nil
+        slot` and `ERROR: outer column ref s1/level=1 out of range
+        (depth=0)` (correlated-subquery/LATERAL evaluator gap) plus a
+        `lc_collate` "POSIX" vs "default" normalization gap and a missing
+        9-row result set. Deferral-ledger row appended below. **Resume
+        point:** this needs its own dedicated non-rushed loop (or a few):
+        (1) regenerate `docs/test-port/regress-diff-baseline.csv` from a
+        full clean run at HEAD so future nightlies report real deltas
+        instead of month-old drift noise, (2) triage the aggregates
+        LATERAL/correlated-subquery errors as a fresh M0097-style bug, (3)
+        re-classify each of the other 88 flagged suites the same way before
+        assuming they're all genuine regressions — do NOT attempt to fix
+        all 90 in one loop.
+      Gates this loop: `go build ./...`/`go vet` (testport, executor,
+      storage, wal packages) clean; `go test ./internal/executor/...` PASS
+      (full package); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh`
+      PASS (0 failed, both pgbench workloads); nightly-parameter pgbench
+      re-run PASS (0 failed txns, see AI-096 above).
+
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 
 M0117 (CLOG ↔ PostgreSQL subsystem alignment), M0118 (Upstream Isolation Spec
