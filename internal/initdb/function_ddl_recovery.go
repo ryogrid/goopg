@@ -117,6 +117,12 @@ func replayFunctionDDLRecords(walDir string, cat *catalog.InMemory) error {
 				return fmt.Errorf("decode alter-function-set-schema at lsn %d: %w", rec.StartLSN, derr)
 			}
 			rs.SetSchemaByOIDDuringRecovery(oid, newSchema)
+		case wal.RecordKindAlterFunctionConfig:
+			oid, config, derr := wal.DecodeAlterFunctionConfig(rec.Payload)
+			if derr != nil {
+				return fmt.Errorf("decode alter-function-config at lsn %d: %w", rec.StartLSN, derr)
+			}
+			rs.ReplaceConfigByOIDDuringRecovery(oid, config)
 		}
 	}
 	return nil
@@ -161,5 +167,6 @@ func createFunctionPayloadToRoutine(p wal.CreateFunctionPayload) *catalog.Routin
 		BeginAtomic:     p.BeginAtomic,
 		IsReturnForm:    p.IsReturnForm,
 		KindChar:        p.KindChar,
+		Config:          p.Config,
 	}
 }

@@ -70,6 +70,11 @@ const (
 	// recycled. Crash-replay restores the half-dead state from
 	// the Phase 1 WAL record.
 	BTHalfDead uint16 = 0x0020
+	// BTHasGarbage (C3, PG BTP_HAS_GARBAGE) hints that the page carries at
+	// least one ItemIDDead line pointer set by the on-access kill pass.
+	// Purely advisory: stale-set is harmless (the purge scan finds no Dead
+	// items and clears it); cleared by the pre-split purge and by VACUUM.
+	BTHasGarbage uint16 = 0x0040
 )
 
 // MetaBlock is always block 0 — the metapage. RootStart is the first
@@ -141,6 +146,10 @@ func (o BTPageOpaque) IsDeleted() bool { return o.Flags&BTDeleted != 0 }
 // (or freshly created) and cover all remaining keys.
 func (o BTPageOpaque) HasHighKey() bool { return o.Flags&BTHasHighKey != 0 }
 
+// HasGarbage reports the BTHasGarbage hint (C3: at least one ItemIDDead
+// line pointer may be present).
+func (o BTPageOpaque) HasGarbage() bool { return o.Flags&BTHasGarbage != 0 }
+
 // ParseOpaque exposes the page-bytes → BTPageOpaque decode for out-of-package
 // readers (notably the amcheck verify engine, internal/amcheck) so they share
 // this package's single definition of the opaque layout rather than
@@ -198,6 +207,28 @@ func keyExceedsHighKey(op BTPageOpaque, key []byte) bool {
 		return false
 	}
 	return CompareKeys(key, op.HighKey) > 0
+}
+
+// itemOvershootsHighKey reports whether a new item keyed `key` belongs
+// strictly to the right of the page described by `op` rather than on it —
+// the Lehman-Yao "move right" test applied to a structural INSERT rather
+// than a search descent. It differs from keyExceedsHighKey in the
+// boundary case: a search key equal to HighKey may legitimately stay on
+// this page (HighKey is inclusive for routing), but a stored ITEM equal
+// to HighKey is only valid on a leaf (leaf: key<=HighKey); on an internal
+// page it must move right (internal: key<HighKey), matching amcheck's
+// stored-item invariant in VerifyBtreeItemOrder (verify_nbtree.go) —
+// HighKey is itself the separator that was pushed up when this page last
+// split, so a downlink equal to it belongs to the right sibling.
+func itemOvershootsHighKey(op BTPageOpaque, key []byte) bool {
+	if !op.HasHighKey() || op.Next == storage.InvalidBlockNumber {
+		return false
+	}
+	cmp := CompareKeys(key, op.HighKey)
+	if op.IsLeaf() {
+		return cmp > 0
+	}
+	return cmp >= 0
 }
 
 // initPage prepares a freshly extended block as a B-tree page with the
@@ -636,6 +667,651 @@ type BTree struct {
 	// pop/push atomic.
 	freeListMu sync.Mutex
 	freeList   []storage.BlockNumber
+
+	// DebugTraceInserts (M-NIGHTLY AI-20260708-064334-001 investigation
+	// aid, 5th loop): when true, every insertItemSorted call anywhere in
+	// this BTree (fast-path, cached-rightmost, split-left-refill,
+	// split-right-fill, dedup-recovery-rebuild) appends a record to
+	// insertLog: which block the item physically landed on, at which
+	// 0-based line-pointer slot, with the item's key/TID. Off by default,
+	// a single bool check when unset — same zero-cost-when-off pattern as
+	// storage.Pool.DebugTraceSlotEvents. Lets a caller cross-reference
+	// "was this (key,TID) ever actually written, and where" against the
+	// final on-disk leaf walk to localize a lost entry to an exact
+	// (block, slot) instead of only knowing it vanished somewhere.
+	DebugTraceInserts bool
+	insertLogMu       sync.Mutex
+	insertLog         []btreeInsertLogEvent
+	// rewriteLog records insertIntoBlock's page-rewrite checkpoints (see
+	// RewriteLogEvent); guarded by insertLogMu alongside insertLog.
+	rewriteLog []RewriteLogEvent
+	// DebugVerifyFastPathInserts (M-NIGHTLY AI-20260708-064334-001
+	// investigation aid, 7th loop): when true, every single-item fast-path
+	// insertItemSorted call (tryInsertNoSplit, insertIntoBlock's own
+	// no-split branch, tryInsertOnCachedRightmost -- deliberately NOT the
+	// split/dedup-rewrite path's insertItemSorted calls, which resetPageItems
+	// first and are already covered by RewriteLogEvent) snapshots
+	// pageItems() immediately before and after the call and verifies every
+	// pre-existing (key,TID) pair is still present afterward -- a plain
+	// insert only ever adds a line pointer, so any pre-existing entry that
+	// vanishes is captured as a FastPathViolation with the exact call site,
+	// block, and the item that was inserted alongside it. Off by default,
+	// zero cost when unset -- same pattern as DebugTraceInserts.
+	DebugVerifyFastPathInserts bool
+	fastPathViolations         []FastPathViolation
+	// DebugTraceFlushes (M-NIGHTLY AI-20260708-064334-001 investigation
+	// aid, 8th loop): when true, arms RecordFlushSnapshot as the target for
+	// storage.Pool.OnFlushSnapshot — every dirty-page flush of a block
+	// belonging to this BTree's relation (evictVictim's wasDirty branch,
+	// via flushSlot) is decoded with pageItems() and appended to flushLog,
+	// sharing insertLog/rewriteLog's Seq counter. The 7th loop isolated the
+	// loss window to an unpin/re-pin gap on the same block — a flush is the
+	// only thing that touches a page's bytes while nobody holds a pin on
+	// it, so this lets a caller directly compare "what a flush wrote to
+	// disk" against the last known-good insert/rewrite/fast-path snapshot
+	// for the same block. Off by default, zero cost when unset — same
+	// pattern as DebugTraceInserts.
+	DebugTraceFlushes bool
+	flushLog          []FlushSnapshotEvent
+	// DebugTraceReloads (M-NIGHTLY AI-20260708-064334-001 investigation
+	// aid, 9th loop): when true, arms RecordReloadSnapshot as the target
+	// for storage.Pool.OnBlockReload — every disk reload of a block
+	// belonging to this BTree's relation (pinLoad's cache-miss branch,
+	// right after Manager.ReadBlock, before the slot is published for Pin)
+	// is decoded with pageItems() and appended to reloadLog, sharing
+	// insertLog/rewriteLog/flushLog's Seq counter. The 8th loop proved the
+	// dirty-flush WRITE side always faithfully writes whatever bytes are
+	// in memory (18/18), narrowing the loss window to the READ side: does
+	// a reload ever serve stale or wrong bytes for a block that was just
+	// correctly flushed? This lets a caller compare "what a reload
+	// actually read" against the immediately preceding FlushSnapshotEvent
+	// for the same block. Off by default, zero cost when unset — same
+	// pattern as DebugTraceFlushes.
+	DebugTraceReloads bool
+	reloadLog         []ReloadSnapshotEvent
+	// DebugTraceContentMu (M-NIGHTLY AI-20260708-064334-001 investigation
+	// aid, 11th loop): when true, arms pinW/unpinW to snapshot pageItems()
+	// for the block being locked, bracketing the FULL contentMu hold (the
+	// "before" snapshot is taken right after s.Lock(), the "after"
+	// snapshot right before s.Unlock()) rather than any one caller's
+	// fast-path/split/dedup call. pinW/unpinW is every CALLER-SIDE
+	// mutation's choke point, but NOT the only code that takes
+	// storage.Slot.contentMu — storage.Pool.pinLoad (bufpool.go
+	// ~1561-1572) independently Lock()s/Unlock()s the same mutex around
+	// its own ReadBlock call during a cache-miss reload, so a hold
+	// recorded here can show a page's content valid at Unlock and already
+	// different at the very next traced Lock with nothing in between at
+	// THIS layer — that gap is real and lives inside pinLoad's reload
+	// hold, observable via DebugTraceReloads/OnBlockReload instead (see
+	// the 11th loop's writeup in
+	// TestVerifyBtreeEngineSilentOnRealConcurrentContended's skip message
+	// for how this was used to narrow the loss window further). Shares
+	// insertLog/rewriteLog/flushLog/reloadLog's Seq counter. Off by
+	// default, zero cost when unset — same pattern as DebugTraceFlushes/
+	// DebugTraceReloads.
+	DebugTraceContentMu bool
+	contentMuLog        []ContentMuEvent
+	// contentMuBefore holds, per in-flight pinW hold, the pageItems()
+	// snapshot taken right after acquiring the exclusive content latch, so
+	// unpinW can pair it with a post-mutation snapshot into one
+	// ContentMuEvent. Keyed by block number: safe without extra
+	// synchronization beyond insertLogMu because storage.Slot.contentMu is
+	// itself exclusive per block, so only one goroutine can hold a pinW on
+	// a given block at a time — no two concurrent holds for the same key
+	// can race this map.
+	contentMuBefore map[storage.BlockNumber][]InsertLogRecord
+	// DebugTraceBufmap (M-NIGHTLY AI-20260708-064334-001 investigation aid,
+	// 14th loop): when true, arms RecordBufmapInsert/RecordBufmapDelete as
+	// the target for storage.Pool.OnBufmapInsert/OnBufmapDelete — every
+	// bufmap mutation (Insert success/failure, Delete) for a block
+	// belonging to this BTree's relation is appended to bufmapLog, sharing
+	// insertLog/rewriteLog/flushLog/reloadLog/contentMuLog's Seq counter.
+	// Unlike those other logs, the hook fires synchronously INSIDE
+	// storage.Pool.bmInsert/bmDelete while bufmap's own internal mu is
+	// still held, so bufmapLog's recorded order is bufmap's TRUE
+	// serialization order for the tag — not subject to the Seq-vs-real-
+	// completion-order drift the 11th loop found in the flush/reload hooks
+	// (those stamp Seq from a later, separately-locked call). This is the
+	// only way, after 13 loops of hypothesis-refinement without ever
+	// directly instrumenting bufmap itself, to prove or refute whether two
+	// different slots simultaneously believe they own the same tag — scan
+	// bufmapLog for a tag whose Insert(slotA) has no intervening Delete
+	// before a LATER Insert(slotB) for the same tag succeeds. Off by
+	// default, zero cost when unset — same pattern as DebugTraceFlushes/
+	// DebugTraceReloads/DebugTraceContentMu.
+	DebugTraceBufmap bool
+	bufmapLog        []BufmapEvent
+	// logSeqNext is a single monotonic counter shared by insertLog and
+	// rewriteLog (instead of each using its own len()-based sequence) so a
+	// caller can compare Seq values ACROSS the two logs to establish
+	// temporal ordering — e.g. "did any rewrite event on this block happen
+	// after this specific insert". Guarded by insertLogMu.
+	logSeqNext uint64
+}
+
+// btreeInsertLogEvent is one recorded insertItemSorted call (see
+// BTree.DebugTraceInserts).
+type btreeInsertLogEvent struct {
+	Seq     uint64
+	Block   storage.BlockNumber
+	LineIdx int // 0-based line-pointer index the item was inserted at
+	Key     []byte
+	Ptr     storage.ItemPointer
+}
+
+// traceInsert records one insertItemSorted call when DebugTraceInserts is
+// enabled; a no-op otherwise.
+func (bt *BTree) traceInsert(blk storage.BlockNumber, lineIdx int, it item) {
+	if !bt.DebugTraceInserts {
+		return
+	}
+	bt.insertLogMu.Lock()
+	seq := bt.logSeqNext
+	bt.logSeqNext++
+	bt.insertLog = append(bt.insertLog, btreeInsertLogEvent{
+		Seq:     seq,
+		Block:   blk,
+		LineIdx: lineIdx,
+		Key:     append([]byte(nil), it.key...),
+		Ptr:     it.ptr,
+	})
+	bt.insertLogMu.Unlock()
+}
+
+// FastPathViolation records a fast-path insertItemSorted call (see
+// BTree.DebugVerifyFastPathInserts) after which a (key,TID) pair that was
+// present on the page immediately BEFORE the call is no longer present
+// immediately after it -- despite a fast-path insert only ever adding a
+// line pointer, never removing one. M-NIGHTLY AI-20260708-064334-001, 7th
+// loop: localizes a lost entry to the exact fast-path call that dropped
+// it, complementing RewriteLogEvent's coverage of the split/dedup-rewrite
+// path (already cleared -- see the 6th loop's update in
+// verify_nbtree_realtree_test.go).
+type FastPathViolation struct {
+	Seq       uint64
+	Block     storage.BlockNumber
+	Site      string // "tryInsertNoSplit" | "insertIntoBlock-nosplit" | "tryInsertOnCachedRightmost"
+	Inserted  InsertLogRecord
+	PreCount  int
+	PostCount int
+	Missing   []InsertLogRecord
+}
+
+// fastPathItemIdent identifies an item by its (key,TID) pair for the
+// pre/post survivor-set comparison in insertItemSortedVerified.
+type fastPathItemIdent struct {
+	key string
+	ptr storage.ItemPointer
+}
+
+// insertItemSortedVerified wraps insertItemSorted with the pre/post
+// pageItems()-snapshot check described by FastPathViolation. A no-op
+// wrapper (falls straight through to insertItemSorted) when
+// DebugVerifyFastPathInserts is false.
+func (bt *BTree) insertItemSortedVerified(site string, blk storage.BlockNumber, p storage.Page, it item) int {
+	if !bt.DebugVerifyFastPathInserts {
+		return insertItemSorted(p, it)
+	}
+	pre, err := pageItems(p)
+	if err != nil {
+		panic(err)
+	}
+	preSnap := append([]item(nil), pre...)
+	lineIdx := insertItemSorted(p, it)
+	post, err := pageItems(p)
+	if err != nil {
+		panic(err)
+	}
+	bt.checkFastPathSurvivors(site, blk, it, preSnap, post)
+	return lineIdx
+}
+
+// checkFastPathSurvivors is the pre/post survivor-set comparison behind
+// insertItemSortedVerified, split out so it can be unit-tested and read
+// independently of the pinning/locking around it.
+func (bt *BTree) checkFastPathSurvivors(site string, blk storage.BlockNumber, it item, pre, post []item) {
+	postSet := make(map[fastPathItemIdent]int, len(post))
+	for _, x := range post {
+		postSet[fastPathItemIdent{string(x.key), x.ptr}]++
+	}
+	var missing []InsertLogRecord
+	for _, x := range pre {
+		id := fastPathItemIdent{string(x.key), x.ptr}
+		if postSet[id] > 0 {
+			postSet[id]--
+			continue
+		}
+		missing = append(missing, InsertLogRecord{Block: blk, Key: append([]byte(nil), x.key...), Ptr: x.ptr})
+	}
+	if len(missing) == 0 {
+		return
+	}
+	bt.insertLogMu.Lock()
+	defer bt.insertLogMu.Unlock()
+	seq := bt.logSeqNext
+	bt.logSeqNext++
+	bt.fastPathViolations = append(bt.fastPathViolations, FastPathViolation{
+		Seq:       seq,
+		Block:     blk,
+		Site:      site,
+		Inserted:  InsertLogRecord{Seq: seq, Block: blk, Key: append([]byte(nil), it.key...), Ptr: it.ptr},
+		PreCount:  len(pre),
+		PostCount: len(post),
+		Missing:   missing,
+	})
+}
+
+// FastPathViolations returns every recorded FastPathViolation, in recorded
+// order. Test/investigation helper for DebugVerifyFastPathInserts.
+func (bt *BTree) FastPathViolations() []FastPathViolation {
+	bt.insertLogMu.Lock()
+	defer bt.insertLogMu.Unlock()
+	return append([]FastPathViolation(nil), bt.fastPathViolations...)
+}
+
+// InsertLogRecord is one recorded insertItemSorted call, exported for
+// investigation tooling outside this package. See BTree.DebugTraceInserts.
+type InsertLogRecord struct {
+	Seq     uint64
+	Block   storage.BlockNumber
+	LineIdx int
+	Key     []byte
+	Ptr     storage.ItemPointer
+}
+
+func (r InsertLogRecord) String() string {
+	return fmt.Sprintf("seq=%d blk=%d lineIdx=%d key=%x ptr=%v", r.Seq, r.Block, r.LineIdx, r.Key, r.Ptr)
+}
+
+// InsertLogRecordsForTID returns every recorded insertItemSorted call whose
+// item pointer matches tid, in recorded order. Test/investigation helper for
+// DebugTraceInserts.
+func (bt *BTree) InsertLogRecordsForTID(tid storage.ItemPointer) []InsertLogRecord {
+	bt.insertLogMu.Lock()
+	defer bt.insertLogMu.Unlock()
+	var out []InsertLogRecord
+	for _, e := range bt.insertLog {
+		if e.Ptr == tid {
+			out = append(out, InsertLogRecord{e.Seq, e.Block, e.LineIdx, e.Key, e.Ptr})
+		}
+	}
+	return out
+}
+
+// InsertLogRecordsForBlockAfter returns every recorded insertItemSorted call
+// that landed on blk with Seq >= afterSeq, in recorded order. Test/
+// investigation helper for DebugTraceInserts: used to see whether a target
+// block was later rewritten wholesale (a resetPageItems + reinsert-everything
+// burst, the signature of a split/dedup-recovery redistribution) after a
+// specific insert, and whether a specific TID's item survived that rewrite.
+func (bt *BTree) InsertLogRecordsForBlockAfter(blk storage.BlockNumber, afterSeq uint64) []InsertLogRecord {
+	bt.insertLogMu.Lock()
+	defer bt.insertLogMu.Unlock()
+	var out []InsertLogRecord
+	for _, e := range bt.insertLog {
+		if e.Block == blk && e.Seq >= afterSeq {
+			out = append(out, InsertLogRecord{e.Seq, e.Block, e.LineIdx, e.Key, e.Ptr})
+		}
+	}
+	return out
+}
+
+// RewriteLogEvent is one recorded insertIntoBlock page-rewrite event (the
+// dedup-recovery no-split rebuild, or a genuine split): the full survivor set
+// captured at the two checkpoints that matter for the M-NIGHTLY
+// AI-20260708-064334-001 investigation — immediately after `pageItems()`
+// (what the rewrite believes is currently on the page, plus the incoming
+// item) and immediately after `dedupConsolidate()` (what it's about to write
+// back). Comparing a specific (key,TID)'s presence across these two
+// snapshots localizes a lost entry to either "pageItems undercounted a page
+// that genuinely held it" or "dedupConsolidate dropped a non-duplicate".
+// Gated by DebugTraceInserts, same zero-cost-when-off contract as insertLog.
+type RewriteLogEvent struct {
+	Seq             uint64
+	Block           storage.BlockNumber
+	Phase           string // "dedup-recovery" or "split"
+	PreLineCount    int    // storage.PageLinePointerCount(slot.Page()) just before pageItems()
+	PostPageItems   []InsertLogRecord
+	PostDedup       []InsertLogRecord
+}
+
+func (bt *BTree) traceRewrite(blk storage.BlockNumber, phase string, preLineCount int, postPageItems, postDedup []item) {
+	if !bt.DebugTraceInserts {
+		return
+	}
+	toRecords := func(items []item) []InsertLogRecord {
+		out := make([]InsertLogRecord, len(items))
+		for i, it := range items {
+			out[i] = InsertLogRecord{Block: blk, LineIdx: i, Key: append([]byte(nil), it.key...), Ptr: it.ptr}
+		}
+		return out
+	}
+	bt.insertLogMu.Lock()
+	defer bt.insertLogMu.Unlock()
+	seq := bt.logSeqNext
+	bt.logSeqNext++
+	bt.rewriteLog = append(bt.rewriteLog, RewriteLogEvent{
+		Seq:           seq,
+		Block:         blk,
+		Phase:         phase,
+		PreLineCount:  preLineCount,
+		PostPageItems: toRecords(postPageItems),
+		PostDedup:     toRecords(postDedup),
+	})
+}
+
+// RewriteLogRecordsForBlock returns every recorded insertIntoBlock rewrite
+// event (see RewriteLogEvent) for blk, in recorded order. Test/investigation
+// helper for DebugTraceInserts.
+func (bt *BTree) RewriteLogRecordsForBlock(blk storage.BlockNumber) []RewriteLogEvent {
+	bt.insertLogMu.Lock()
+	defer bt.insertLogMu.Unlock()
+	var out []RewriteLogEvent
+	for _, e := range bt.rewriteLog {
+		if e.Block == blk {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// PresentIn reports whether tid appears among a RewriteLogEvent snapshot's
+// recorded (key,TID) pairs. Investigation helper — avoids callers
+// hand-rolling the same linear scan at every call site.
+func RewriteSnapshotHasTID(recs []InsertLogRecord, tid storage.ItemPointer) bool {
+	for _, r := range recs {
+		if r.Ptr == tid {
+			return true
+		}
+	}
+	return false
+}
+
+// FlushSnapshotEvent records one dirty-page flush to disk: the leaf
+// entries pageItems() decodes from the exact bytes flushSlot is about to
+// write, keyed to bt's shared Seq counter (see DebugTraceFlushes) so a
+// caller can compare temporal order against insertLog/rewriteLog/
+// fastPathViolations for the same block.
+type FlushSnapshotEvent struct {
+	Seq   uint64
+	Block storage.BlockNumber
+	Items []InsertLogRecord
+}
+
+// RecordFlushSnapshot is the storage.Pool.OnFlushSnapshot hook this BTree
+// wires when DebugTraceFlushes is set (e.g. `pool.OnFlushSnapshot =
+// bt.RecordFlushSnapshot`): given the exact tag and bytes a dirty-page
+// flush is about to write to disk, it decodes pageItems() and appends a
+// FlushSnapshotEvent. A no-op when DebugTraceFlushes is false, tag
+// belongs to a different relation, or pageItems() can't decode the page
+// (e.g. the meta page) — matches the signature
+// storage.Pool.OnFlushSnapshot expects.
+func (bt *BTree) RecordFlushSnapshot(tag storage.BufferTag, page storage.Page) {
+	if !bt.DebugTraceFlushes || tag.Rel != bt.rel {
+		return
+	}
+	items, err := pageItems(page)
+	if err != nil {
+		return
+	}
+	recs := make([]InsertLogRecord, len(items))
+	for i, it := range items {
+		recs[i] = InsertLogRecord{Block: tag.Block, LineIdx: i, Key: append([]byte(nil), it.key...), Ptr: it.ptr}
+	}
+	bt.insertLogMu.Lock()
+	seq := bt.logSeqNext
+	bt.logSeqNext++
+	bt.flushLog = append(bt.flushLog, FlushSnapshotEvent{Seq: seq, Block: tag.Block, Items: recs})
+	bt.insertLogMu.Unlock()
+}
+
+// FlushSnapshotRecordsForBlock returns every recorded FlushSnapshotEvent
+// (see DebugTraceFlushes) for blk, in recorded order. Test/investigation
+// helper.
+func (bt *BTree) FlushSnapshotRecordsForBlock(blk storage.BlockNumber) []FlushSnapshotEvent {
+	bt.insertLogMu.Lock()
+	defer bt.insertLogMu.Unlock()
+	var out []FlushSnapshotEvent
+	for _, e := range bt.flushLog {
+		if e.Block == blk {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// ReloadSnapshotEvent records one disk reload of a block: the leaf
+// entries pageItems() decodes from the exact bytes Manager.ReadBlock just
+// served, keyed to bt's shared Seq counter (see DebugTraceReloads) so a
+// caller can compare temporal order against flushLog for the same block.
+type ReloadSnapshotEvent struct {
+	Seq   uint64
+	Block storage.BlockNumber
+	Items []InsertLogRecord
+}
+
+// RecordReloadSnapshot is the storage.Pool.OnBlockReload hook this BTree
+// wires when DebugTraceReloads is set (e.g. `pool.OnBlockReload =
+// bt.RecordReloadSnapshot`): given the exact tag and bytes a disk reload
+// just read, it decodes pageItems() and appends a ReloadSnapshotEvent. A
+// no-op when DebugTraceReloads is false, tag belongs to a different
+// relation, or pageItems() can't decode the page (e.g. the meta page) —
+// matches the signature storage.Pool.OnBlockReload expects.
+func (bt *BTree) RecordReloadSnapshot(tag storage.BufferTag, page storage.Page) {
+	if !bt.DebugTraceReloads || tag.Rel != bt.rel {
+		return
+	}
+	items, err := pageItems(page)
+	if err != nil {
+		return
+	}
+	recs := make([]InsertLogRecord, len(items))
+	for i, it := range items {
+		recs[i] = InsertLogRecord{Block: tag.Block, LineIdx: i, Key: append([]byte(nil), it.key...), Ptr: it.ptr}
+	}
+	bt.insertLogMu.Lock()
+	seq := bt.logSeqNext
+	bt.logSeqNext++
+	bt.reloadLog = append(bt.reloadLog, ReloadSnapshotEvent{Seq: seq, Block: tag.Block, Items: recs})
+	bt.insertLogMu.Unlock()
+}
+
+// ReloadSnapshotRecordsForBlock returns every recorded ReloadSnapshotEvent
+// (see DebugTraceReloads) for blk, in recorded order. Test/investigation
+// helper.
+func (bt *BTree) ReloadSnapshotRecordsForBlock(blk storage.BlockNumber) []ReloadSnapshotEvent {
+	bt.insertLogMu.Lock()
+	defer bt.insertLogMu.Unlock()
+	var out []ReloadSnapshotEvent
+	for _, e := range bt.reloadLog {
+		if e.Block == blk {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// BufmapEvent records one bufmap mutation for a block belonging to this
+// BTree's relation: an Insert attempt (Ok reports whether it succeeded —
+// false means some other slot already owned the tag) or a Delete, keyed to
+// bt's shared Seq counter (see DebugTraceBufmap). Op is "insert" or
+// "delete".
+type BufmapEvent struct {
+	Seq     uint64
+	Block   storage.BlockNumber
+	Op      string
+	SlotIdx int32
+	Gen     uint32
+	Ok      bool
+}
+
+// RecordBufmapInsert is the storage.Pool.OnBufmapInsert hook this BTree
+// wires when DebugTraceBufmap is set (e.g. `pool.OnBufmapInsert =
+// bt.RecordBufmapInsert`). Fires synchronously inside storage.Pool.bmInsert
+// while bufmap's own internal mu is still held, so bufmapLog's recorded
+// order is bufmap's TRUE mutation order for the tag (see DebugTraceBufmap's
+// doc comment for why this differs from the flush/reload hooks). A no-op
+// when DebugTraceBufmap is false or tag belongs to a different relation.
+func (bt *BTree) RecordBufmapInsert(tag storage.BufferTag, slotIdx int32, gen uint32, ok bool) {
+	if !bt.DebugTraceBufmap || tag.Rel != bt.rel {
+		return
+	}
+	bt.insertLogMu.Lock()
+	seq := bt.logSeqNext
+	bt.logSeqNext++
+	bt.bufmapLog = append(bt.bufmapLog, BufmapEvent{Seq: seq, Block: tag.Block, Op: "insert", SlotIdx: slotIdx, Gen: gen, Ok: ok})
+	bt.insertLogMu.Unlock()
+}
+
+// RecordBufmapDelete is the storage.Pool.OnBufmapDelete hook this BTree
+// wires when DebugTraceBufmap is set (e.g. `pool.OnBufmapDelete =
+// bt.RecordBufmapDelete`). See RecordBufmapInsert's doc comment. A no-op
+// when DebugTraceBufmap is false or tag belongs to a different relation.
+func (bt *BTree) RecordBufmapDelete(tag storage.BufferTag, slotIdx int32) {
+	if !bt.DebugTraceBufmap || tag.Rel != bt.rel {
+		return
+	}
+	bt.insertLogMu.Lock()
+	seq := bt.logSeqNext
+	bt.logSeqNext++
+	bt.bufmapLog = append(bt.bufmapLog, BufmapEvent{Seq: seq, Block: tag.Block, Op: "delete", SlotIdx: slotIdx, Ok: true})
+	bt.insertLogMu.Unlock()
+}
+
+// BufmapEventsForBlock returns every recorded BufmapEvent (see
+// DebugTraceBufmap) for blk, in recorded (true bufmap-lock) order.
+// Test/investigation helper.
+func (bt *BTree) BufmapEventsForBlock(blk storage.BlockNumber) []BufmapEvent {
+	bt.insertLogMu.Lock()
+	defer bt.insertLogMu.Unlock()
+	var out []BufmapEvent
+	for _, e := range bt.bufmapLog {
+		if e.Block == blk {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// CheckBufmapExclusivity scans every recorded BufmapEvent (see
+// DebugTraceBufmap) for blk and reports the first point at which two
+// DIFFERENT slot indices both hold a live (successful-Insert,
+// no-matching-Delete-yet) ownership of the same block's tag at once — a
+// direct, ground-truth violation of bufmap's single-owner invariant. Returns
+// ok=true (no violation found) or ok=false plus the two conflicting events.
+// Test/investigation helper.
+func (bt *BTree) CheckBufmapExclusivity(blk storage.BlockNumber) (ok bool, first, second BufmapEvent) {
+	events := bt.BufmapEventsForBlock(blk)
+	live := map[int32]bool{}
+	var liveEvent map[int32]BufmapEvent = map[int32]BufmapEvent{}
+	for _, e := range events {
+		switch e.Op {
+		case "insert":
+			if !e.Ok {
+				continue
+			}
+			for slot, isLive := range live {
+				if isLive && slot != e.SlotIdx {
+					return false, liveEvent[slot], e
+				}
+			}
+			live[e.SlotIdx] = true
+			liveEvent[e.SlotIdx] = e
+		case "delete":
+			live[e.SlotIdx] = false
+		}
+	}
+	return true, BufmapEvent{}, BufmapEvent{}
+}
+
+// ContentMuEvent records one full pinW..unpinW hold on a block: the
+// pageItems() decoded right after the exclusive content latch was
+// acquired (Before) and right before it was released (After), keyed to
+// bt's shared Seq counter (see DebugTraceContentMu) so a caller can find
+// the exact hold where a previously-present (key,TID) pair is in Before
+// but missing from After.
+type ContentMuEvent struct {
+	Seq    uint64
+	Block  storage.BlockNumber
+	Before []InsertLogRecord
+	After  []InsertLogRecord
+}
+
+// recordContentMuLock is called from pinW immediately after s.Lock(),
+// while DebugTraceContentMu is armed — it snapshots pageItems() for the
+// page about to be mutated and stashes it in contentMuBefore, keyed by
+// block, for recordContentMuUnlock to pair with the post-mutation
+// snapshot. A no-op when DebugTraceContentMu is false.
+func (bt *BTree) recordContentMuLock(blk storage.BlockNumber, page storage.Page) {
+	if !bt.DebugTraceContentMu {
+		return
+	}
+	recs := snapshotPageItemsAsLog(blk, page)
+	if recs == nil {
+		return
+	}
+	bt.insertLogMu.Lock()
+	if bt.contentMuBefore == nil {
+		bt.contentMuBefore = make(map[storage.BlockNumber][]InsertLogRecord)
+	}
+	bt.contentMuBefore[blk] = recs
+	bt.insertLogMu.Unlock()
+}
+
+// recordContentMuUnlock is called from unpinW immediately before
+// s.Unlock(), while DebugTraceContentMu is armed — it snapshots
+// pageItems() again, pairs it with the matching recordContentMuLock
+// snapshot for the same block, and appends a ContentMuEvent. A no-op
+// when DebugTraceContentMu is false or no matching "before" snapshot was
+// recorded (e.g. pageItems() failed to decode at lock time).
+func (bt *BTree) recordContentMuUnlock(blk storage.BlockNumber, page storage.Page) {
+	if !bt.DebugTraceContentMu {
+		return
+	}
+	recs := snapshotPageItemsAsLog(blk, page)
+	bt.insertLogMu.Lock()
+	before, ok := bt.contentMuBefore[blk]
+	if ok {
+		delete(bt.contentMuBefore, blk)
+		seq := bt.logSeqNext
+		bt.logSeqNext++
+		bt.contentMuLog = append(bt.contentMuLog, ContentMuEvent{Seq: seq, Block: blk, Before: before, After: recs})
+	}
+	bt.insertLogMu.Unlock()
+}
+
+// snapshotPageItemsAsLog decodes pageItems() and converts it to the
+// []InsertLogRecord shape shared by insertLog/rewriteLog/flushLog/
+// reloadLog/contentMuLog so RewriteSnapshotHasTID and the other existing
+// diagnostic helpers work unchanged against a ContentMuEvent. Returns nil
+// (not an error) on decode failure, matching RecordFlushSnapshot/
+// RecordReloadSnapshot's best-effort behavior — this is debug
+// instrumentation, not a correctness path.
+func snapshotPageItemsAsLog(blk storage.BlockNumber, page storage.Page) []InsertLogRecord {
+	items, err := pageItems(page)
+	if err != nil {
+		return nil
+	}
+	recs := make([]InsertLogRecord, len(items))
+	for i, it := range items {
+		recs[i] = InsertLogRecord{Block: blk, LineIdx: i, Key: append([]byte(nil), it.key...), Ptr: it.ptr}
+	}
+	return recs
+}
+
+// ContentMuRecordsForBlock returns every recorded ContentMuEvent (see
+// DebugTraceContentMu) for blk, in recorded order. Test/investigation
+// helper.
+func (bt *BTree) ContentMuRecordsForBlock(blk storage.BlockNumber) []ContentMuEvent {
+	bt.insertLogMu.Lock()
+	defer bt.insertLogMu.Unlock()
+	var out []ContentMuEvent
+	for _, e := range bt.contentMuLog {
+		if e.Block == blk {
+			out = append(out, e)
+		}
+	}
+	return out
 }
 
 // pinNewOrRecycled (M0055-0005 Phase D) returns a writable slot
@@ -951,17 +1627,25 @@ func (bt *BTree) unpinR(s *storage.Slot) {
 
 // pinW pins a buffer and acquires its exclusive content latch.
 // Used at every mutation site so concurrent readers (which take
-// the shared latch) see a coherent page image.
+// the shared latch) see a coherent page image. NOTE: this is every
+// CALLER-side choke point for this latch, but storage.Pool.pinLoad also
+// independently Lock()s/Unlock()s the same per-slot contentMu around its
+// own ReadBlock call during a cache-miss reload (bufpool.go
+// ~1561-1572) -- see DebugTraceContentMu's doc comment for why that
+// distinction mattered to the M-NIGHTLY AI-20260708-064334-001
+// investigation.
 func (bt *BTree) pinW(blk storage.BlockNumber) (*storage.Slot, error) {
 	s, err := bt.pool.Pin(storage.BufferTag{Rel: bt.rel, Block: blk})
 	if err != nil {
 		return nil, err
 	}
 	s.Lock()
+	bt.recordContentMuLock(blk, s.Page())
 	return s, nil
 }
 
 func (bt *BTree) unpinW(s *storage.Slot) {
+	bt.recordContentMuUnlock(s.Tag().Block, s.Page())
 	s.Unlock()
 	bt.pool.Unpin(s)
 }
@@ -1055,6 +1739,53 @@ func (bt *BTree) updateRootMetaWithLSN(root storage.BlockNumber, level uint32, l
 }
 
 // pageItems lists every item on a page in slot order.
+// pageItemsWithDead is pageItems WITHOUT the ItemIDDead skip: it returns
+// every item (posting lists expanded) plus a parallel dead flag per
+// returned element. VACUUM is the one consumer that must SEE dead-marked
+// entries — skipping them there would leave a marked entry out of the
+// kept-items WAL rewrite while the heap side reclaims its TID; a crash
+// then replays the entry back as Normal pointing at a recycled heap slot
+// (C3-S1 review MUST-FIX 1). PG's btbulkdelete likewise deletes by TID
+// regardless of LP_DEAD.
+func pageItemsWithDead(p storage.Page) ([]item, []bool, error) {
+	count, err := storage.PageLinePointerCount(p)
+	if err != nil {
+		return nil, nil, err
+	}
+	out := make([]item, 0, count)
+	dead := make([]bool, 0, count)
+	for slot := uint16(1); slot <= uint16(count); slot++ {
+		isDead, derr := storage.PageItemIsDead(p, slot)
+		if derr != nil {
+			return nil, nil, derr
+		}
+		raw, err := storage.PageGetItemRawAllowDead(p, slot)
+		if err != nil {
+			return nil, nil, err
+		}
+		if isPostingRaw(raw) {
+			key, tids, perr := parsePostingRaw(raw)
+			if perr != nil {
+				maybeDumpPageOnParseErr(p, "pageItemsWithDead: parsePostingRaw")
+				return nil, nil, perr
+			}
+			for _, tid := range tids {
+				out = append(out, item{keyLen: uint16(len(key)), ptr: tid, key: key})
+				dead = append(dead, isDead)
+			}
+		} else {
+			it, perr := parseItem(raw)
+			if perr != nil {
+				maybeDumpPageOnParseErr(p, "pageItemsWithDead: parseItem")
+				return nil, nil, perr
+			}
+			out = append(out, it)
+			dead = append(dead, isDead)
+		}
+	}
+	return out, dead, nil
+}
+
 func pageItems(p storage.Page) ([]item, error) {
 	count, err := storage.PageLinePointerCount(p)
 	if err != nil {
@@ -1062,6 +1793,12 @@ func pageItems(p storage.Page) ([]item, error) {
 	}
 	out := make([]item, 0, count)
 	for slot := uint16(1); slot <= uint16(count); slot++ {
+		if dead, derr := storage.PageItemIsDead(p, slot); derr == nil && dead {
+			// C3-S1: ItemIDDead entries are invisible to every reader —
+			// the referenced heap tuple is dead to all snapshots and the
+			// entry awaits the pre-split purge / VACUUM.
+			continue
+		}
 		raw, err := storage.PageGetItemRaw(p, slot)
 		if err != nil {
 			return nil, err
@@ -1109,6 +1846,12 @@ func PageItemKeys(p storage.Page) ([][]byte, error) {
 	}
 	out := make([][]byte, 0, count)
 	for slot := uint16(1); slot <= uint16(count); slot++ {
+		if dead, derr := storage.PageItemIsDead(p, slot); derr == nil && dead {
+			// C3-S1: ItemIDDead entries are invisible to every reader —
+			// the referenced heap tuple is dead to all snapshots and the
+			// entry awaits the pre-split purge / VACUUM.
+			continue
+		}
 		raw, err := storage.PageGetItemRaw(p, slot)
 		if err != nil {
 			return nil, err
@@ -1164,6 +1907,12 @@ func PageLeafEntries(p storage.Page) ([]LeafEntry, error) {
 	}
 	out := make([]LeafEntry, 0, count)
 	for slot := uint16(1); slot <= uint16(count); slot++ {
+		if dead, derr := storage.PageItemIsDead(p, slot); derr == nil && dead {
+			// C3-S1: ItemIDDead entries are invisible to every reader —
+			// the referenced heap tuple is dead to all snapshots and the
+			// entry awaits the pre-split purge / VACUUM.
+			continue
+		}
 		raw, err := storage.PageGetItemRaw(p, slot)
 		if err != nil {
 			return nil, err
@@ -1218,6 +1967,12 @@ func PageDownlinks(p storage.Page) ([]Downlink, error) {
 	}
 	out := make([]Downlink, 0, count)
 	for slot := uint16(1); slot <= uint16(count); slot++ {
+		if dead, derr := storage.PageItemIsDead(p, slot); derr == nil && dead {
+			// C3-S1: ItemIDDead entries are invisible to every reader —
+			// the referenced heap tuple is dead to all snapshots and the
+			// entry awaits the pre-split purge / VACUUM.
+			continue
+		}
 		raw, err := storage.PageGetItemRaw(p, slot)
 		if err != nil {
 			return nil, err
@@ -1267,7 +2022,7 @@ func findChildBlockDirect(p storage.Page, key []byte) (storage.BlockNumber, erro
 	// Binary search across line pointers.
 	n := count
 	idx := sort.Search(n, func(i int) bool {
-		raw, err := storage.PageGetItemRaw(p, uint16(i+1))
+		raw, err := storage.PageGetItemRawAllowDead(p, uint16(i+1)) // C3-S1: dead items keep ordering bytes
 		if err != nil {
 			return true // will surface at the final error check
 		}
@@ -1286,7 +2041,7 @@ func findChildBlockDirect(p storage.Page, key []byte) (storage.BlockNumber, erro
 		idx--
 	}
 	// idx==0 stays 0: first child.
-	raw, err := storage.PageGetItemRaw(p, uint16(idx+1))
+	raw, err := storage.PageGetItemRawAllowDead(p, uint16(idx+1)) // C3-S1
 	if err != nil {
 		return 0, err
 	}
@@ -1436,7 +2191,8 @@ func (bt *BTree) tryInsertNoSplit(it item) error {
 		return errNeedsSplit
 	}
 
-	insertItemSorted(slot.Page(), it)
+	lineIdx := bt.insertItemSortedVerified("tryInsertNoSplit", leafBlk, slot.Page(), it)
+	bt.traceInsert(leafBlk, lineIdx, it)
 	if logIns := bt.pool.LogBtreeInsert(); logIns != nil {
 		itemBytes := it.marshal()
 		return bt.pool.MarkDirtyChangeRecord(slot, func() (storage.LSN, error) {
@@ -1459,13 +2215,39 @@ func (bt *BTree) tryInsertNoSplit(it item) error {
 // dropping its latch — readers that descended to it under shared
 // latch will follow the new right-link to find the moved keys.
 func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNumber, it item) error {
-	slot, err := bt.pinW(blk)
-	if err != nil {
-		return err
+	// Lehman-Yao move-right: `blk` was decided by the caller (a fresh
+	// descendToLeaf under splitMu, or a path[] ancestor recorded before
+	// or during this connection's own split). `bt.splitMu` only
+	// serializes structural changes within THIS *BTree Go instance —
+	// each backend opens its own instance per statement — so a
+	// concurrent split on a DIFFERENT connection's instance for the
+	// SAME relation can move the key range `it` belongs in to blk's
+	// right sibling between that decision and this pin (M-NIGHTLY
+	// AI-20260709-010336-082: reproduced as a "high key invariant
+	// violated" internal-page finding). Detect via the same
+	// leaf/internal high-key boundary amcheck enforces and step right
+	// instead of inserting out of bounds.
+	var slot *storage.Slot
+	var op BTPageOpaque
+	for {
+		var err error
+		slot, err = bt.pinW(blk)
+		if err != nil {
+			return err
+		}
+		op = readOpaque(slot.Page())
+		if itemOvershootsHighKey(op, it.key) {
+			next := op.Next
+			bt.unpinW(slot)
+			blk = next
+			continue
+		}
+		break
 	}
 
 	if pageHasSpaceFor(slot.Page(), it) {
-		insertItemSorted(slot.Page(), it)
+		lineIdx := bt.insertItemSortedVerified("insertIntoBlock-nosplit", blk, slot.Page(), it)
+		bt.traceInsert(blk, lineIdx, it)
 		// Logical-record path (M0002 redo-records): if the pool
 		// has a btree-insert hook configured, emit a small
 		// change record on subsequent dirties of this page in
@@ -1488,8 +2270,8 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 
 	// Split. Pin a freshly-extended right page exclusively,
 	// redistribute items, stamp the high key, then drop both
-	// latches before walking up.
-	op := readOpaque(slot.Page())
+	// latches before walking up. `op` already holds this page's
+	// pre-split opaque header from the move-right loop above.
 	// The block that is currently left's right sibling (if any).
 	// After the split the new right page is spliced between them, so
 	// this sibling's btpo_prev must be relinked from blk to rightBlk
@@ -1520,6 +2302,18 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 	}
 	initPage(rightSlot.Page(), rightOpaque)
 
+	// M-NIGHTLY investigation aid (AI-20260708-064334-001, 6th loop):
+	// snapshot the two checkpoints that matter for localizing a lost
+	// entry — right after pageItems()+appendSorted() (what the rewrite
+	// believes is on the page, plus the incoming item) and right after
+	// dedupConsolidate() (what it's about to write back). Both are DEEP
+	// COPIES of the item-struct slice (not the post-dedup slice itself,
+	// which reuses pageItems's backing array via `items[:0]` in-place
+	// compaction — holding a live reference into it would read corrupted
+	// data once dedupConsolidate runs). Zero cost when DebugTraceInserts
+	// is off (traceRewrite no-ops immediately).
+	preLineCount, _ := storage.PageLinePointerCount(slot.Page())
+
 	allItems, err := pageItems(slot.Page())
 	if err != nil {
 		rightSlot.Unlock()
@@ -1528,6 +2322,10 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 		return err
 	}
 	allItems = appendSorted(allItems, it)
+	var postPageItemsSnap []item
+	if bt.DebugTraceInserts {
+		postPageItemsSnap = append([]item(nil), allItems...)
+	}
 
 	// M0055-0003 Phase B (pre-split dedup compaction): consolidate
 	// adjacent same-key items into postings. For duplicate-heavy
@@ -1536,23 +2334,58 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 	// avoiding the split entirely. We bail back to the no-split
 	// path if dedup recovers enough space.
 	allItems = dedupConsolidate(allItems)
+	var postDedupSnap []item
+	if bt.DebugTraceInserts {
+		postDedupSnap = append([]item(nil), allItems...)
+	}
 	if compactRawSize(allItems) < pageFreeBudget(slot.Page())+pageOccupied(slot.Page()) {
+		bt.traceRewrite(blk, "dedup-recovery", preLineCount, postPageItemsSnap, postDedupSnap)
 		// Re-attempt no-split insert with the dedup'd content.
 		// Reset the page and write the dedup'd items back, no
 		// split needed. The right-side allocation is rolled back.
 		resetPageItems(slot.Page())
 		for _, x := range allItems {
-			insertItemSorted(slot.Page(), x)
+			lineIdx := insertItemSorted(slot.Page(), x)
+			bt.traceInsert(blk, lineIdx, x)
 		}
 		// Drop the freshly-allocated right slot — split avoided.
 		rightSlot.Unlock()
 		bt.pool.Unpin(rightSlot)
-		// MarkDirty the left page so the dedup'd content
-		// reaches WAL.
-		bt.pool.MarkDirty(slot)
+		// C3-S3 (S2-review blocker fix A): this rewrite SHIFTS SLOT
+		// NUMBERS, so it must bump pd_lsn — the deferred kill pass
+		// re-verifies leaf identity by LSN equality (D7) and a plain
+		// MarkDirty leaves pd_lsn unchanged when an FPI already exists
+		// this epoch, letting a stale kill mark the WRONG slot. Route
+		// through the logical kept-items record (same emitter VACUUM
+		// uses; also fixes the pre-existing unlogged-rewrite crash gap
+		// the S1 review noted). Falls back to a page-image record for
+		// harnesses without the vacuum hook.
+		if opAfter := readOpaque(slot.Page()); opAfter.HasGarbage() {
+			// The rewrite dropped every dead-marked item (pageItems skips
+			// them) — clear the hint like VacuumIndexPages does (O-C3-5).
+			opAfter.Flags &^= BTHasGarbage
+			writeOpaque(slot.Page(), opAfter)
+		}
+		if logVac := bt.pool.LogBtreeVacuum(); logVac != nil {
+			keptRaw := make([][]byte, 0, len(allItems))
+			for _, x := range allItems {
+				keptRaw = append(keptRaw, x.marshal())
+			}
+			flagsAfter := readOpaque(slot.Page()).Flags
+			if err := bt.pool.MarkDirtyChangeRecord(slot, func() (storage.LSN, error) {
+				return logVac(bt.rel, blk, keptRaw, flagsAfter)
+			}); err != nil {
+				bt.unpinW(slot)
+				return err
+			}
+		} else if err := bt.markDirtyWithPageRecord(slot, blk); err != nil {
+			bt.unpinW(slot)
+			return err
+		}
 		bt.unpinW(slot)
 		return nil
 	}
+	bt.traceRewrite(blk, "split", preLineCount, postPageItemsSnap, postDedupSnap)
 
 	// M0055-0002-followup-byte-split: byte-aware split-loc.
 	// Pick the entry whose cumulative encoded byte size lands
@@ -1567,10 +2400,12 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 	// Reset left page to empty, refill.
 	resetPageItems(slot.Page())
 	for _, x := range leftItems {
-		insertItemSorted(slot.Page(), x)
+		lineIdx := insertItemSorted(slot.Page(), x)
+		bt.traceInsert(blk, lineIdx, x)
 	}
 	for _, x := range rightItems {
-		insertItemSorted(rightSlot.Page(), x)
+		lineIdx := insertItemSorted(rightSlot.Page(), x)
+		bt.traceInsert(rightBlk, lineIdx, x)
 	}
 
 	// Stamp the new high key onto the left page: left now covers
@@ -1976,7 +2811,9 @@ func pageHasSpaceFor(p storage.Page, it item) bool {
 // encoded every item. The pre-Phase-A path was the chief CPU
 // hotspot per the M0055 baseline pprof (analysis/btree-baseline-
 // 2026-05-06.md) — this rewrite eliminates the O(n) re-encode.
-func insertItemSorted(p storage.Page, it item) {
+// insertItemSorted writes it into p at its sorted position and returns the
+// 0-based line-pointer index it landed at (used by BTree.traceInsert).
+func insertItemSorted(p storage.Page, it item) int {
 	count, err := storage.PageLinePointerCount(p)
 	if err != nil {
 		panic(err)
@@ -2008,6 +2845,7 @@ func insertItemSorted(p storage.Page, it item) {
 	if _, err := storage.PageInsertItemRawAt(p, uint16(lo+1), raw); err != nil {
 		panic(err)
 	}
+	return lo
 }
 
 // tryInsertOnCachedRightmost (M0055-0002-followup-rightmost-cache)
@@ -2062,7 +2900,8 @@ func (bt *BTree) tryInsertOnCachedRightmost(blk storage.BlockNumber, it item) (b
 		bt.unpinW(slot)
 		return false, nil
 	}
-	insertItemSorted(slot.Page(), it)
+	lineIdx := bt.insertItemSortedVerified("tryInsertOnCachedRightmost", blk, slot.Page(), it)
+	bt.traceInsert(blk, lineIdx, it)
 	if logIns := bt.pool.LogBtreeInsert(); logIns != nil {
 		itemBytes := it.marshal()
 		err := bt.pool.MarkDirtyChangeRecord(slot, func() (storage.LSN, error) {
@@ -2214,7 +3053,10 @@ func byteAwareSplitLoc(items []item) int {
 // — that's enough for the binary search since all posting tids
 // share the same key.
 func readPageItem(p storage.Page, idx int) (item, error) {
-	raw, err := storage.PageGetItemRaw(p, uint16(idx+1))
+	// C3-S1: AllowDead — this is a binary-search ordering probe; Dead
+	// items retain valid key bytes until purged, and result filtering
+	// happens at the caller's visibility layer.
+	raw, err := storage.PageGetItemRawAllowDead(p, uint16(idx+1))
 	if err != nil {
 		return item{}, err
 	}
@@ -2301,6 +3143,31 @@ func (bt *BTree) Search(key []byte) (storage.ItemPointer, bool, error) {
 	}
 }
 
+// ScanPos identifies where a RangeScan callback's entry physically lives:
+// the leaf block, the 1-based line-pointer slot, and the leaf's pd_lsn AS
+// CAPTURED AT SCAN TIME. C3-S2 scan plumbing: the executor records these
+// alongside TIDs so the deferred kill pass (S3) can re-latch the leaf and
+// re-verify identity keyed on PageLSN (design D7 — a changed LSN means the
+// page split/vacuumed/recycled and the pending kill is dropped).
+type ScanPos struct {
+	Blk     storage.BlockNumber
+	Slot    uint16
+	PageLSN storage.LSN
+}
+
+// RangeScanWithPos is RangeScan carrying a ScanPos per callback (C3-S2,
+// additive — the plain RangeScan signature and its callers are untouched;
+// both share one implementation).
+func (bt *BTree) RangeScanWithPos(lo, hi []byte, fn func(key []byte, ptr storage.ItemPointer, pos ScanPos) (bool, error)) error {
+	return bt.rangeScanPos(lo, hi, fn)
+}
+
+func (bt *BTree) RangeScan(lo, hi []byte, fn func(key []byte, ptr storage.ItemPointer) (bool, error)) error {
+	return bt.rangeScanPos(lo, hi, func(key []byte, ptr storage.ItemPointer, _ ScanPos) (bool, error) {
+		return fn(key, ptr)
+	})
+}
+
 // RangeScan invokes fn for every (key, ptr) pair where lo ≤ key ≤ hi.
 // Either bound may be nil to indicate an open-ended range:
 //   - nil lo means no lower bound (scan from the leftmost key).
@@ -2332,7 +3199,7 @@ func (bt *BTree) Search(key []byte) (storage.ItemPointer, bool, error) {
 // buffer pool's per-slot shared content latch. The first leaf is
 // reached via descendToLeaf (which already handles right-link
 // recovery); subsequent leaves are walked rightward via op.Next.
-func (bt *BTree) RangeScan(lo, hi []byte, fn func(key []byte, ptr storage.ItemPointer) (bool, error)) error {
+func (bt *BTree) rangeScanPos(lo, hi []byte, fn func(key []byte, ptr storage.ItemPointer, pos ScanPos) (bool, error)) error {
 	cur, _, err := bt.descendToLeaf(lo)
 	if err != nil {
 		return err
@@ -2364,6 +3231,7 @@ func (bt *BTree) RangeScan(lo, hi []byte, fn func(key []byte, ptr storage.ItemPo
 		// callers are CAT-1 (see contract above); none retain
 		// key beyond fn, none re-enter the btree.
 		count, countErr := storage.PageLinePointerCount(slot.Page())
+		pageLSN := storage.MustHeader(slot.Page()).LSN()
 		nextBlk := op.Next
 		stop := false
 		var fnErr error
@@ -2375,6 +3243,8 @@ func (bt *BTree) RangeScan(lo, hi []byte, fn func(key []byte, ptr storage.ItemPo
 				// and the pin is held across this whole loop.
 				r, rawErr := storage.PageGetItemRawNoCopy(slot.Page(), s)
 				if rawErr != nil {
+					// Includes ItemIDDead slots (ErrUnsupportedItem):
+					// C3-S1 — dead entries are invisible to scans.
 					continue
 				}
 				if isPostingRaw(r) {
@@ -2395,7 +3265,7 @@ func (bt *BTree) RangeScan(lo, hi []byte, fn func(key []byte, ptr storage.ItemPo
 						break slotLoop
 					}
 					for _, tid := range tids {
-						ok, ferr := fn(key, tid)
+						ok, ferr := fn(key, tid, ScanPos{Blk: cur, Slot: s, PageLSN: pageLSN})
 						if ferr != nil {
 							fnErr = ferr
 							stop = true
@@ -2420,7 +3290,7 @@ func (bt *BTree) RangeScan(lo, hi []byte, fn func(key []byte, ptr storage.ItemPo
 						stop = true
 						break slotLoop
 					}
-					ok, ferr := fn(it.key, it.ptr)
+					ok, ferr := fn(it.key, it.ptr, ScanPos{Blk: cur, Slot: s, PageLSN: pageLSN})
 					if ferr != nil {
 						fnErr = ferr
 						stop = true

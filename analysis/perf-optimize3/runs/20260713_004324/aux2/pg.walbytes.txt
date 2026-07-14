@@ -1,0 +1,6 @@
+lsn0=1/2CE14E70 lsn1=1/874DBC10 wal_bytes_delta=1517055392
+wal_io fsyncs/writes before: 119903 124765   after: 148093 152955
+pg_stat_wal (lifetime fpi records bytes): 564878 14342026 6475488537
+number of transactions actually processed: 531649
+latency average = 5.648 ms
+tps = 8852.419999 (without initial connection time)

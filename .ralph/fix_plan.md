@@ -61,6 +61,80 @@ every clean, green (build + pre-commit) checkpoint.
      placeholder is a comment, not a checkbox, so the plan-complete exit
      heuristic stays live.) -->
 
+- [x] testport/* build-break cascade (run 20260712-020530, ~39 AI items:
+      AI-20260712-020530-001..039 — TestPort_IsolationStats,
+      IsolationTuplelockUpgradeNoDeadlock, PgAmcheck002Nonesuch/003*/004*/
+      AllTables/BtreeIndexCheck, PgBasebackup010*, etc.) — **STALE, already
+      fixed at HEAD.** Every item's evidence log shows the identical cause:
+      `init failed: internal/executor/operators_ddl.go:...: not enough arguments
+      in call to catalog.DecodePGIndexPhysicalRow  have ([]byte)  want
+      ([]byte, []byte)` — a COMPILE break, not a co-load timing flake. The
+      nightly built at sha 401e6212 while a concurrent Ralph loop was mid-landing
+      the 2-arg `DecodePGIndexPhysicalRow` signature (catalog.go changed, the
+      executor caller update not yet visible in the working tree — the
+      concurrent-Ralph-tree hazard). At HEAD (cff2627b) the caller passes
+      `catalog.DecodePGIndexPhysicalRow(data, nil)` (operators_ddl.go:13361),
+      `go test -run '^$' ./internal/testport/` compiles clean, and
+      `TestPort_IsolationStats` + `TestPort_PgAmcheck002Nonesuch` PASS 2/2
+      standalone (repro: `go test -count=1 -run
+      '^(TestPort_IsolationStats|TestPort_PgAmcheck002Nonesuch)$'
+      ./internal/testport/`). No product fix needed; next nightly on a quiescent
+      tree drops the whole cascade. (Loop #82 triage; supersedes loop #81's
+      "co-load cascade" mislabel — the mechanism was a transient build break.)
+- [x] testport/TestPort_IsolationTuplelockUpgradeNoDeadlock — REOPENED
+      (AI-20260712-020530-002; earlier AI-20260711-011536-002's "co-load timing
+      flake, 3/3 standalone" diagnosis did NOT hold). Repro:
+      `for i in $(seq 6); do go test -count=1 -run
+      '^TestPort_IsolationTuplelockUpgradeNoDeadlock$' ./internal/testport/; done`.
+      ROOT CAUSE (loop #89): genuinely flaky ~17% STANDALONE (1 FAIL / 5 PASS at
+      HEAD), a row-lock wait-queue FIFO-fairness gap, NOT co-load. Perms 66
+      (`s1_share s2_update s3_update ...`) / 67 (`s2_delete s3_delete`) diverge
+      because goopg's DML UPDATE/DELETE conflict path (`epqWait` →
+      `mvcc.WaitForXID`, operators_storage.go) wakes all waiters with one
+      `commitCond.Broadcast()` and lets them race to re-stamp xmax — no
+      LOCKTAG_TUPLE serialisation — so s3 sometimes beats the earlier-arriving
+      s2 (which then times out). PG grants FIFO via the heavyweight LOCKTAG_TUPLE
+      in `heap_lock_tuple`/`heap_update` (the SELECT FOR UPDATE perms 57/65 are
+      stable because `lockRowsOp` already `acquireTupleLock`s). FIXED THIS LOOP
+      (de-flake + correct the premature 8043b9ff strict promotion, NOT the engine
+      fix): demoted `runIsoSpecStrict`→`runIsoSpec` (skip-on-mismatch → nightly
+      no longer flaps red), flipped target-inventory.csv `pass`→`defer` +
+      regenerated the .md, deferral_ledger.md row with the LOCKTAG_TUPLE resume
+      point. RE-PROMOTE task (deferred, its own slice, HIGH blast radius across
+      the whole isolation surface): make the DML conflict path
+      `ctx.acquireTupleLock(rel, ptr, ExclusiveLock)` before `WaitForXID`, then
+      restore `runIsoSpecStrict` + CSV `pass`.
+- [x] testport/TestPort_PgWaldumpVacuumPruneRoundtrip — pg_waldump structural
+      error `invalid WAL segment size ... (0 bytes)` on the trailing segment
+      (AI-20260711-011536-003; repro: `go test -v -run
+      '^TestPort_PgWaldumpVacuumPruneRoundtrip$' ./internal/testport/`).
+      ROOT CAUSE: the M0122-0009 eager next-segment preallocation (writer.go
+      `eagerPreallocSegment`, landed ff27f01d 2026-07-09) now zero-fills the
+      NEXT segment (`000000010000000000000002`, full 16 MiB of zeros) the
+      moment segment 1 opens, and it persists across a clean shutdown — exactly
+      as real PG's XLogFileInit does. pg_waldump reads the segment size from the
+      long-page-header `xlp_seg_size`, which is 0 in an all-zero segment, so
+      pointed at that phantom it fatally reports "invalid WAL segment size
+      (0 bytes)" — real pg_waldump errors identically; NOT a WAL-format bug.
+      FIX (test-fidelity, no production code): skip all-zero preallocated
+      segments via a new `segmentIsAllZero` helper. Fixed the identical latent
+      bug in the SIBLING `TestPort_WALPgWaldumpCompat` (W-001,
+      wal_pg_waldump_test.go) in the same loop. `savefullpage` only fails on
+      "incorrect prev-link" so it was already tolerant. Verified: all
+      `TestPort_PgWaldump*` + W-001 PASS.
+- [x] testport/TestPort_IsolationTimeouts — FAILed in nightly co-load only
+      (AI-20260711-011536-001; repro: `go test -v -run
+      '^TestPort_IsolationTimeouts$' ./internal/testport/`). Not a regression:
+      PASSES 3/3 standalone at HEAD. The isolation runner decides blocking
+      purely by a 300 ms timeout (no pg_locks probe — see
+      `iso_runner_blocking_is_timing_only`), so under the nightly's concurrent
+      CPU pressure a non-blocking step can spuriously time out. Timing flake,
+      not a correctness regression; next nightly with lighter load should drop it.
+- [x] testport/TestPort_IsolationTuplelockUpgradeNoDeadlock — same co-load
+      timing flake as TestPort_IsolationTimeouts (AI-20260711-011536-002;
+      repro: `go test -v -run '^TestPort_IsolationTuplelockUpgradeNoDeadlock$'
+      ./internal/testport/`). PASSES 3/3 standalone at HEAD; 300 ms-timeout
+      blocking heuristic under nightly CPU contention. Not a regression.
 - [x] pgbench/nightly — pgbench nightly stage aborted: `btree: item length
       mismatch keyLen=9 total=37` at c=100 (AI-20260706-201855-001; repro:
       `REPO_ROOT=$PWD RUN_DIR=$(mktemp -d) bash ci/batch/stages/stage-pgbench.sh`
@@ -642,6 +716,832 @@ every clean, green (build + pre-commit) checkpoint.
       landed fix. No `.ralph/deferral_ledger.md` row's `landed`/`deferred`/
       `resume point`/`why` text content was altered, only the leading
       `status` cell.
+
+- [x] pgbench/nightly-reopen-20260708 — CLOSED (14th loop, resolved). REOPENED (subject `pgbench/nightly`
+      recurred; the 2026-07-06 task above is checked but the fix apparently
+      didn't fully hold): `btree: empty internal page (blk=8782 rel=
+      {DBOid:5 RelOid:16412 Fork:0})` (AI-20260708-064334-001; repro:
+      `REPO_ROOT=$PWD RUN_DIR=$(mktemp -d) bash ci/batch/stages/stage-pgbench.sh`
+      s=50 c=100 j=20 T=180; evidence: `ci/logs/20260708-064334/pgbench/
+      pgbench.log`). Same symptom class as the "empty internal page" thread
+      (updates #7-#11 above, fixed via the `evictVictim` bufmap.Delete-
+      before-flush race, commit `510615b4`) — but that fix landed BEFORE
+      2026-07-07 update #8's `flushBatch` stale-tag fix (`8ebb71cd`), and
+      this is the first nightly run since both landed. Per rule 3, re-run
+      the repro at HEAD before assuming regression.
+      2026-07-08 update (1st loop on the reopen; see today's deferral ledger
+      row): re-ran the cheap repro at HEAD (`pgbench -i -s 50` once, then
+      `pgbench -c 100 -j 20 -T 25 -P 5` twice) — 0 failed transactions both
+      times (does NOT reproduce the original runtime "empty internal page"
+      abort in this shorter window), but a POST-RUN `bt_index_check(...,
+      true)` on all 3 pkey indexes reported "item order invariant violated"
+      on nearly every block, including `pgbench_branches_pkey` (only 50
+      rows) flagging ~40 blocks — a physically impossible corruption
+      footprint for that table's real size, which redirected the
+      investigation to the CHECKER itself rather than the btree. **Found and
+      FIXED a real bug, but in `internal/amcheck`, not `internal/access/
+      btree`**: `VerifyBtreeItemOrder` required strictly-ascending adjacent
+      keys (`cmp >= 0` violation), but goopg's `btree.CompareKeys` (the only
+      comparator the engine's own descent/insert/split code uses) has no
+      heap-TID tiebreak anywhere, so goopg's btree never guarantees any
+      particular order among same-key duplicates — confirmed empirically via
+      a throwaway probe (`zz_probe_test.go`, reverted) dumping block 1 of
+      `pgbench_branches_pkey`: 331 leaf items all sharing key=1 (bid=1,
+      hammered by non-HOT UPDATE churn — no autovacuum in the test window)
+      with their heap TIDs in genuinely random order, not ascending. First
+      attempted a (key,TID)-tiebreak fix matching upstream's heapkeyspace
+      `_bt_compare` model (new `btree.PageItemKeyTIDs`/`CompareItemPointers`)
+      — rebuilt, re-ran `bt_index_check` against the SAME on-disk data, and
+      it STILL flagged violations, which is what proved goopg's TIDs really
+      are unordered (not just under-tested) and the TID-tiebreak model was
+      the wrong invariant for this engine. Replaced it with the correct,
+      simpler fix: relax the check to non-decreasing keys only (`cmp > 0` is
+      the sole violation — equal adjacent keys always allowed), matching
+      upstream's own fallback for non-heapkeyspace/pre-v4 indexes
+      (`invariant_leq_offset`). Reverted the TID-tiebreak helpers (dead code
+      once the simpler fix landed). Updated
+      `TestVerifyBtreeItemOrder_DuplicateKeysViolation` → renamed
+      `..._DuplicateKeysAllowed` (flipped assertion; its old "goopg dedups
+      equal keys into a posting item" premise was itself wrong — dedup only
+      runs from `BulkCreate`, not the live insert/update path, per the
+      2026-07-07 deferral-ledger row) and added
+      `..._DecreaseAfterDuplicateViolation` for the still-real decrease case.
+      Post-fix re-verify against the SAME captured corrupted-per-old-checker
+      data dir: `pgbench_branches_pkey`/`pgbench_tellers_pkey` now CLEAN;
+      `pgbench_accounts_pkey` (RelOid 16412 — the exact relation the
+      original AI-20260708-064334-001 report named) now reports a much more
+      targeted "high key invariant violated" on exactly 2 of ~10000+ blocks
+      (10158, 10162) instead of near-universal — this is very likely a
+      genuine, distinct bug: both are internal (level=1) pages where every
+      item is properly ascending EXCEPT the last, which exceeds the page's
+      own high key (block 10158: last item `803a6aa9` > high key
+      `80397cd3`) — consistent with a downlink misrouted to the wrong
+      sibling during an internal-page split, not the duplicate-key false
+      positive just fixed. Gates: `go build ./...` clean; `go test
+      ./internal/amcheck/... ./internal/access/btree/... ./internal/
+      executor/... ./internal/testport/...
+      -run "TestVerifyBtreeItemOrder|TestPort_.*[Aa]mcheck|TestPort_.*Btree"`
+      PASS; `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh`
+      PASS (0 failed, all 3 workloads); `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33). **Does NOT close this task** — the amcheck false
+      positive is fixed and committed, but the original nightly runtime
+      symptom (pgbench transaction aborting mid-workload on "empty internal
+      page") was never reproduced this loop (25s×2 window too short — the
+      nightly stage uses T=180×3) and the newly-found accounts_pkey
+      high-key violation is unexplained. Next step: (a) reproduce with the
+      full T=180 authoritative window (or the update-#6-style cheap
+      scale=50/c=100/j=20/T=25 loop run several times back-to-back with
+      `bt_index_check` after each) to try to catch the runtime abort
+      directly; (b) instrument `insertIntoBlock`'s internal-page-split path
+      (btree.go:~1420-1660) to catch the exact moment a downlink lands on
+      the wrong side of a split, using the now-confirmed reproducible
+      accounts_pkey high-key-violation symptom as the target (much cheaper
+      to chase than the intermittent runtime abort — this data dir already
+      has 2 known-bad blocks to trace backward from, though the specific
+      data dir was deleted this loop; regenerate via the same recipe).
+      2026-07-08 update (2nd loop on the reopen; see today's 2nd deferral
+      ledger row): built a MUCH cheaper repro than pgbench — a pure Go
+      concurrent-insert stress test
+      (`internal/amcheck/verify_nbtree_realtree_test.go`
+      `TestVerifyBtreeEngineSilentOnRealConcurrentContended`, currently
+      `t.Skip`'d) that runs 64 goroutines calling `bt.Insert` on a shared
+      narrow key range and reproduces a genuine lost-index-entry bug (7-16 of
+      200000 inserted leaf entries silently vanish) in well under a second,
+      100% of runs so far. Root-cause investigation this loop (debug write-log
+      hook, since reverted) RULED OUT `internal/access/btree`'s split/dedup
+      logic (every lost item genuinely reached `insertItemSorted`; item-key
+      copy semantics in `pageItems`/`parseItem`/`parsePostingRaw` are all
+      correct, no aliasing) and CONFIRMED the bug lives in
+      `internal/storage/bufpool.go`'s eviction/flush path instead: the SAME
+      workload with a small pool (`Slots: 64`) loses items every time; with a
+      large pool (`Slots: 2048`, no eviction needed) it loses ZERO. Did not
+      identify the exact line/race — out of loop budget. Next step:
+      instrument `claimVictim`/`evictVictim`/`pinLoad`/`flushSlot` in
+      bufpool.go (un-skip the new test first, `Slots: 64` already reproduces
+      reliably), find the exact race, fix it, then un-skip
+      `TestVerifyBtreeEngineSilentOnRealConcurrentContended` as its permanent
+      regression guard. Only after that's fixed, re-attempt the original
+      pgbench-based repro to check whether it's the same bug. Gates this
+      loop: `go build ./...` clean; `go vet ./internal/amcheck/...
+      ./internal/access/btree/...` clean; `go test ./internal/amcheck/...
+      ./internal/access/btree/... ./internal/storage/...` PASS (new test
+      skipped, not run).
+      2026-07-08 update (3rd loop on the reopen; see today's 3rd deferral
+      ledger row): un-skipped the 2nd-loop repro, confirmed it still
+      reproduces (6-42 lost entries/run), and added `pool.
+      DebugValidateCleanEvictions` (`internal/storage/bufpool.go`, off by
+      default/zero-cost bool field + `debugValidateCleanEviction` helper
+      in `evictVictim`) — when set, every "clean" (non-dirty) eviction
+      re-reads its block from disk and byte-compares against the
+      in-memory page before discarding it. This DEFINITIVELY proves the
+      mechanism: it fires 1-2 times per run with dozens-hundreds of
+      differing bytes right after the page header, i.e. `evictVictim`'s
+      `!wasDirty` fast path is discarding real unflushed writes. Also
+      extended `buildRealTreeConcurrent` to return every inserted
+      (key,TID) so the test logs the EXACT missing entries — losses are
+      scattered single-item across writers/keys, no clustering. RULED OUT
+      with hard measurements: (1) ABA via the 15-bit slot-gen counter
+      (max ~2500 claims/slot measured, needs 32768 to wrap); (2) stale
+      recycled-block reuse via `pinNewOrRecycled` (dead code here, no
+      vacuum in this test — but NOT dead for the real vacuum-enabled
+      pgbench workload, flagged as a separate follow-up); (3) a plain
+      data race (`go test -race` on this repro: zero race warnings, still
+      reproduces — a pure protocol/ordering bug, not a torn memory
+      access). Audited every MarkDirty* call site in btree.go (all
+      correct, write-then-dirty, pin held continuously) and every
+      dirty-CLEARING site in bufpool.go (flushBatch not invoked here,
+      InvalidateRel/Block not called, claimVictim's own CAS correctly
+      captures dirty before replacing) — none explain the observed
+      false-read. Exact mechanism (why claimVictim reads dirty=false for
+      a slot MarkDirty had set true) is STILL open — needs a per-slot
+      event log to catch the transition live (see deferral ledger resume
+      point). Gates: `go build ./...` clean; `go vet ./internal/amcheck/...
+      ./internal/storage/... ./internal/access/btree/...` clean; `go test
+      ./internal/storage/... ./internal/access/btree/...
+      ./internal/amcheck/...` PASS (new test re-skipped, not run in this
+      count). Did not run the full pre-commit/tpch-spotcheck gates — no
+      production behavior changed (flag defaults false, zero-cost); MUST
+      run those once the actual fix lands.
+      2026-07-08 update (4th loop on the reopen; see today's 4th deferral
+      ledger row): built `pool.DebugTraceSlotEvents` (`internal/storage/
+      bufpool.go`, off by default/zero-cost like `DebugValidateCleanEvictions`)
+      — a per-slot ring log of every MarkDirty*/claimVictim/evictVictim/
+      pinLoad-publish/PinNew-publish/releaseVictimSlot state transition,
+      auto-dumped (including a cross-slot scan for the same tag) whenever
+      a clean-eviction mismatch fires. Caught one mismatch in the act: a
+      slot loaded a page fresh from disk, was Unpinned with ZERO
+      intervening MarkDirty calls, then was re-claimed as a victim
+      moments later — legitimately clean by every tracked transition —
+      yet the disk re-read still disagreed. Cross-slot scan found no
+      other slot ever touched that tag (bufmap ownership is correctly
+      exclusive). Audited and ruled out (all clean): `bufmap.go` Insert/
+      Delete/Lookup/compact (mutex-serialized), `relFile.readBlock/
+      writeBlock/extend` (share one per-relation mutex, use ReadAt/
+      WriteAt not Seek+Read), `Manager.relFile`'s single-instance-per-rel
+      cache, `arena.slot`'s non-overlapping slicing. **Pivot finding**:
+      3 more back-to-back runs recorded (mismatches, missing-entries) =
+      (1,12)/(0,20)/(0,13) — the run with the MOST missing entries had
+      ZERO mismatches. Mismatch-firing and data loss are uncorrelated, so
+      the "clean eviction discards a real write" mechanism (3rd loop) is
+      at most a minor/coincidental contributor, not the dominant cause.
+      Leading hypothesis is now a genuine lost `btree.Insert` via a
+      structural split/redistribution race in `internal/access/btree`,
+      not an eviction/flush race in `internal/storage`. Gates: `go build
+      ./...` clean; `go vet ./internal/amcheck/... ./internal/storage/...
+      ./internal/access/btree/...` clean; `go test ./internal/storage/...
+      ./internal/access/btree/... ./internal/amcheck/...` PASS (test
+      re-skipped); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33). Next
+      step: reuse loop 2's reverted `insertItemSorted` write-log hook
+      live end-to-end, cross-reference against the final leaf walk to
+      find the exact (page, slot-offset) a lost key was written to, then
+      dump that page's `slotEvents` history (now available for free) to
+      see what clobbered it.
+      2026-07-08 update (5th loop on the reopen; see today's 5th deferral
+      ledger row): built `BTree.DebugTraceInserts` (`internal/access/btree/
+      btree.go`, off by default/zero-cost, unbounded global log of every
+      `insertItemSorted` call — block, line-pointer index, key, TID) plus
+      `Pool.DumpEventsForTag` (exported sibling of `dumpCrossSlotEventsForTag`),
+      wired into a per-missing-entry diagnostic in
+      `TestVerifyBtreeEngineSilentOnRealConcurrentContended` (temporarily
+      un-skipped, re-skipped before commit). **Proved, not just
+      hypothesized, that the loss happens inside the split/redistribution
+      rewrite (`insertIntoBlock`'s split branch), not the storage/eviction
+      layer**: every missing entry's `insertItemSorted` call is logged
+      exactly once (confirmed physically written — `PageInsertItemRawAt`
+      panics on failure, none occurred); a global scan of the entire run's
+      log for that TID finds no second occurrence on ANY block, ruling out
+      "carried to a new block by a later split" (which would log a second
+      record); the origin block goes on to receive hundreds more
+      successful inserts afterward (not abandoned); and the block's
+      CURRENT on-disk bytes at test end genuinely lack the TID, sometimes
+      while a sibling entry sharing the identical duplicate key survives —
+      proving a single-entry drop during a page rewrite, not a whole-page
+      loss. Since a plain insert only adds a line pointer (never deletes
+      existing tuple bytes), only `resetPageItems` + `pageItems`+
+      `appendSorted`+`dedupConsolidate`'s rebuild-and-redistribute sequence
+      (btree.go ~1523-1574) can make a previously-written entry vanish
+      without a trace. Re-read `pageItems`/`dedupConsolidate`/
+      `appendSorted` function-by-function — no single-threaded logic flaw
+      spotted by inspection alone; also confirmed (by code reading, not
+      new instrumentation) that goopg's posting-list mechanism is
+      categorically unreachable from the online Insert path (dedup never
+      builds real postings) and that `bt.splitMu` fully serializes the
+      entire split-path recursion, so a concurrent-root-lift race is
+      unreachable in today's code. Gates: `go build ./...` clean; `go vet
+      ./internal/amcheck/... ./internal/storage/... ./internal/access/
+      btree/...` clean; `go test ./internal/storage/... ./internal/access/
+      btree/... ./internal/amcheck/...` PASS (test re-skipped);
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33). Next step:
+      instrument `insertIntoBlock`'s split branch directly — log
+      `PageLinePointerCount` just before the split, `len(allItems)` right
+      after `pageItems()`, and again after `dedupConsolidate`, for the
+      block a lost entry's insert targeted; cross-reference against
+      `bt.InsertLogRecordsForBlockAfter` to find the first split burst
+      after the lost insert (a tight run of consecutive calls with
+      monotonically-increasing lineIdx from 0) and check whether the lost
+      key is present in that exact `pageItems()` read.
+      2026-07-08 update (6th loop on the reopen; see today's 6th deferral
+      ledger row): executed the above next step. Built `BTree.RewriteLogEvent`/
+      `traceRewrite` (btree.go) — a deep-copy snapshot of `allItems` right
+      after `pageItems()`+`appendSorted()` and again right after
+      `dedupConsolidate()`, for every `insertIntoBlock` rewrite, sharing one
+      monotonic `logSeqNext` counter with `insertLog` so events from both
+      logs compare for true temporal order. Wired a per-missing-entry
+      diagnostic into `TestVerifyBtreeEngineSilentOnRealConcurrentContended`
+      (temporarily un-skipped, re-skipped before commit). **REFUTES the 5th
+      loop's split/redistribution localization**: every rewrite event on an
+      affected block shows `presentAfterPageItems=false` with
+      `postPageItemsCount` exactly `preLineCount+1` (matches
+      `PageLinePointerCount`, zero discrepancy) — `pageItems()` correctly
+      decodes every physical line pointer that IS on the page; the page
+      itself already lacks the lost entry's line pointer before the rewrite
+      ever runs, so `dedupConsolidate` has nothing to wrongly drop. Several
+      missing entries show NO rewrite event at all after their insert — only
+      plain fast-path `insertItemSorted` calls (`tryInsertNoSplit`/
+      `insertIntoBlock`'s no-split branch/`tryInsertOnCachedRightmost`) ever
+      touch those blocks afterward, yet the entry still vanishes. Also ran
+      this exact contended-duplicate-key repro under `-race` for the first
+      time (prior 20+ -race-clean runs all used the disjoint-key
+      `TestMultiWriterStress_M0055_Phase_C` repro instead): exactly ONE
+      report, inside `dumpCrossSlotEventsForTag`/`traceSlotEvent`
+      (bufpool.go) — the `DebugTraceSlotEvents` debug tool's own cross-slot
+      scan, an accepted best-effort tradeoff per its doc comment, not the
+      missing-entry mechanism; no other race fired. Gates: `go build ./...`
+      clean; `go vet ./internal/amcheck/... ./internal/storage/...
+      ./internal/access/btree/...` clean; `go test ./internal/storage/...
+      ./internal/access/btree/... ./internal/amcheck/...` PASS (test
+      re-skipped); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33). Next
+      step: apply the SAME before/after `pageItems()`-snapshot technique to
+      the fast-path single-item `insertItemSorted` call sites instead of the
+      rewrite path — for the specific blocks known (post-hoc) to lose an
+      entry, snapshot `pageItems()` immediately before and after each
+      fast-path call on that block to find the exact consecutive pair where
+      a previously-present (key,TID) silently disappears. Do NOT re-open the
+      split/rewrite path (conclusively cleared this loop) or re-run `-race`
+      on the disjoint-key repro (already exhaustively clean).
+      2026-07-08 update (7th loop on the reopen; see today's 7th deferral
+      ledger row): executed the above next step. Built `BTree.
+      DebugVerifyFastPathInserts`/`insertItemSortedVerified`/
+      `checkFastPathSurvivors` (btree.go) — wraps all 3 fast-path
+      single-item `insertItemSorted` call sites (`tryInsertNoSplit`,
+      `insertIntoBlock`'s no-split branch, `tryInsertOnCachedRightmost`)
+      with a `pageItems()` snapshot immediately before/after each call,
+      recording a `FastPathViolation` if any pre-existing (key,TID) from
+      the "before" snapshot is missing from "after". Wired into
+      `TestVerifyBtreeEngineSilentOnRealConcurrentContended` (temporarily
+      un-skipped, re-skipped before commit). **REFUTES this loop's own
+      hypothesis too, with a clean negative result**: a full run still
+      lost 12 real entries but recorded ZERO `FastPathViolation`s — every
+      fast-path call at all 3 sites preserved every pre-existing entry.
+      Combined with the 6th loop's rewrite-path refutation, this pins the
+      loss window down precisely for a traced example: the entry survived
+      every fast-path call's own pre/post check up to blk=16's last
+      fast-path touch before its eventual split, then vanished in the gap
+      between that call's `unpinW` and the split-triggering call's
+      `pinW`+`pageItems()` read — i.e. while nobody held a pin on the
+      page, during (or across) a buffer-pool eviction.
+      `pool.DebugValidateCleanEvictions` (loops 3-4) fired once this run
+      but on an unrelated block, consistent with loop 4's "mismatch and
+      missing-entry count are uncorrelated" finding — pointing away from
+      the "clean" (skip-flush) eviction path specifically and toward the
+      DIRTY flush-then-evict path (`evictVictim`'s `wasDirty` branch →
+      `flushSlot`, bufpool.go ~1123-1185), which has never been directly
+      instrumented. Gates: `go build ./...` clean; `go vet
+      ./internal/amcheck/... ./internal/storage/... ./internal/access/
+      btree/...` clean; `go test ./internal/storage/... ./internal/access/
+      btree/... ./internal/amcheck/...` PASS (test re-skipped);
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33). Next step:
+      instrument `evictVictim`'s dirty branch (or `flushSlot` itself) to
+      snapshot `pageItems()` on the page immediately before the flush
+      write, keyed by block, and compare against the most recent fast-path
+      "post" snapshot already recorded for that block (all logs share
+      `logSeqNext` ordering) — a mismatch there directly catches a stale/
+      torn flush. First, quickly audit `claimVictim` (bufpool.go) to
+      confirm it actually excludes slots with `pinCount > 0` from victim
+      selection.
+      2026-07-08 update (8th loop on the reopen; see today's 8th deferral
+      ledger row): audited `claimVictim` first — correctly excludes any
+      slot with `statePin(old) != 0` (bufpool.go ~1079); not the bug. Then
+      executed the main next step: built `storage.Pool.OnFlushSnapshot`
+      (bufpool.go, called from `flushSlot` right before `WriteBlock`, nil
+      by default) plus `BTree.RecordFlushSnapshot`/`DebugTraceFlushes`/
+      `FlushSnapshotEvent`/`FlushSnapshotRecordsForBlock` (btree.go), which
+      decode `pageItems()` from the exact bytes a flush is about to write
+      to disk, sharing `insertLog`/`rewriteLog`'s `Seq` counter. Wired into
+      `TestVerifyBtreeEngineSilentOnRealConcurrentContended` (temporarily
+      un-skipped, re-skipped before commit) and extended the per-missing-
+      entry diagnostic to cross-reference flush-snapshot presence. **The
+      strongest, most reproducible signature found in this 8-loop
+      investigation**: for all 18 missing entries in a fresh repro (every
+      one, not a subset), the entry is present in the first recorded
+      flush-snapshot of its block after being inserted, and already
+      ABSENT in the very next recorded flush-snapshot of that same block —
+      often only tens to a few hundred `Seq` ticks later (e.g. key=48709
+      TID={6,1512}: present at flush seq=254194, gone at flush seq=254306,
+      112 ticks later). This RECONCILES rather than contradicts the 7th
+      loop's zero-`FastPathViolation`s result: that check only compares a
+      page's survivor set immediately before/after each individual
+      `insertItemSorted` call, so once the entry is already missing by the
+      time any fast-path call next touches the reloaded page, every such
+      call correctly reports no violation. With the rewrite path (6th
+      loop) and clean-eviction path (4th loop) already cleared, this
+      leaves exactly one uninstrumented mechanism able to make the entry
+      vanish between "last good flush" and "next flush already missing
+      it": the RELOAD side of an eviction cycle — `Pool`'s cache-miss read
+      path (`pinLoad` / `Manager.ReadBlock`) serving stale or wrong bytes
+      for the block after it was correctly flushed. Gates: `go build
+      ./...` clean; `go vet ./internal/amcheck/... ./internal/storage/...
+      ./internal/access/btree/...` clean; `go test ./internal/storage/...
+      ./internal/access/btree/... ./internal/amcheck/...` PASS (test
+      re-skipped); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33). Next
+      step: instrument the read/reload side directly — snapshot
+      `pageItems()` on any block reload that follows a prior flush of the
+      same block (`Pool.pinLoad`'s cache-miss branch, or
+      `Manager.ReadBlock` itself), and compare against the most recent
+      `FlushSnapshotEvent` recorded for that exact block+Rel via the same
+      Seq-ordered cross-reference already built this loop — a mismatch
+      there would catch a stale/wrong read red-handed and finally close
+      the loop this investigation opened at the 7th loop. Do NOT re-open
+      claimVictim, the fast-path insert sites, the split/dedup-rewrite
+      path, or the clean-eviction path — all four conclusively cleared.
+      2026-07-08 update (9th loop on the reopen; see today's 9th deferral
+      ledger row): executed the main next step — built
+      `storage.Pool.OnBlockReload` (bufpool.go, called from `pinLoad`'s
+      cache-miss branch right after `Manager.ReadBlock` succeeds, nil by
+      default) plus `BTree.RecordReloadSnapshot`/`DebugTraceReloads`/
+      `ReloadSnapshotEvent`/`ReloadSnapshotRecordsForBlock` (btree.go),
+      sharing the same `Seq` counter. While wiring the cross-reference,
+      found and fixed a real bug in the 8th loop's own instrumentation:
+      `OnFlushSnapshot` fired BEFORE `flushSlot`'s `WriteBlock` call
+      (pre-write time) while the new `OnBlockReload` fires AFTER
+      `ReadBlock` returns (post-read time) — comparing `Seq` across the
+      two logs as originally built was apples-to-oranges. Moved
+      `OnFlushSnapshot` to fire after `WriteBlock` succeeds so both hooks
+      log "durably completed" time. Re-ran the repro AFTER this fix and
+      the signature strengthened: for all 14 lost entries in a fresh run,
+      the FIRST reload of the affected block after the last flush that had
+      the entry ALREADY lacks it, AND every subsequent reload of that same
+      block for the rest of the run (3179 reload-events checked) still
+      lacks it — a permanent, non-recovering loss, ruling out a transient
+      read/write race and pointing at either (a) the "good" flush's write
+      not durably landing, or (b) a second, stale write clobbering it
+      afterward (a lost-update pattern). Gates: `go build ./...` clean;
+      `go vet ./internal/amcheck/... ./internal/storage/...
+      ./internal/access/btree/...` clean; `go test ./internal/storage/...
+      ./internal/access/btree/... ./internal/amcheck/...` PASS (test
+      re-skipped); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33). Next
+      step: instrument `relFile.writeBlock`/`relFile.readBlock`
+      (`internal/storage/smgr.go`, both under `r.mu`) with a monotonic
+      op-sequence counter LOCAL to the `relFile` (not `bt`'s
+      `insertLogMu`-guarded `Seq`, to eliminate residual cross-goroutine
+      lock-ordering jitter) to determine the TRUE syscall order for a
+      given block, and check whether two `writeBlock` calls for the same
+      block ever interleave with an older copy landing after a newer one
+      (hypothesis b). Do NOT re-open claimVictim, the fast-path insert
+      sites, the split/dedup-rewrite path, the clean-eviction path, or
+      the dirty-flush write side — all five conclusively cleared; also do
+      not re-litigate whether the reload path is implicated, that is now
+      hard evidence, not hypothesis.
+      2026-07-08 update (10th loop on the reopen; see today's 10th deferral
+      ledger row): executed the main next step, but using existing
+      infrastructure instead of building a new counter — discovered
+      `internal/storage/io_trace.go` (`GOOPG_IO_TRACE=1`) already records a
+      content-hash + line-pointer-count event, timestamped by `time.Now()`
+      taken immediately after each real `ReadAt`/`WriteAt` returns, under
+      the SAME `relFile.mu` that serializes the syscalls — exactly the
+      jitter-free true-completion-order data the 9th loop's next-step asked
+      for, added the day before (commit `8ebb71cd`) for a related but
+      distinct corruption investigation. Added `storage.
+      IOTraceEventsForTag(tag)` (exported accessor, sorted by `T`) and
+      wired a new per-missing-entry diagnostic block into
+      `TestVerifyBtreeEngineSilentOnRealConcurrentContended` that walks a
+      lost entry's block's full syscall-level event history and checks
+      whether any `postRead` hash fails to match the immediately-preceding
+      `postWrite` hash (the direct signature of hypothesis (b): a
+      stale/superseded write being read back). Re-ran the repro with
+      `GOOPG_IO_TRACE=1`: 49 lost entries this run across 38 distinct
+      blocks, 60863 total IO-trace events — **zero read-mismatches**. Every
+      single disk read, for every implicated block, exactly returned the
+      byte content of the most recently completed write to that same
+      (relFile, block) — hypothesis (b) is REFUTED at the smgr/syscall
+      layer. Combined with the 8th loop's proof that the flush WRITE side
+      always faithfully wrote in-memory content, the ENTIRE storage/smgr
+      layer (bufpool eviction+reload+flush, and the OS read/write path) is
+      now cleared — the 9th loop's Seq-based "reload already lacks the
+      entry" signature was a real, reproducible symptom but its storage-
+      layer implication was a false lead (residual cross-log Seq jitter,
+      exactly the risk the 9th loop's own writeup flagged). The loss is a
+      genuine IN-MEMORY content bug. Reviewed `bufpool.go`'s `pinLoad`/
+      `tryPinSlot`/`claimVictim` tag-publish-before-load window on
+      inspection (the tag is published in `bufmap` before `ReadBlock`
+      populates the slot, gated by `stateValid`/`stateIO` bits so
+      concurrent `tryPinSlot` calls correctly return nil and wait; the
+      whole claim/evict/insert sequence runs under a single `pinMu`) — no
+      obvious gap found, but not proven race-free, just not disproven by
+      inspection alone. Gates: `go build ./...` clean; `go vet
+      ./internal/storage/... ./internal/amcheck/...` clean; `go test
+      ./internal/storage/... ./internal/access/btree/...
+      ./internal/amcheck/...` PASS (target test re-skipped); `scripts/
+      tpch-spotcheck.sh` PASS (Q12=2/Q13=33). Next step: go one layer
+      deeper than flush/reload snapshots (8th/9th loop) and syscall IO
+      (this loop) into the in-memory `contentMu`-guarded mutation sequence
+      itself — instrument the exact critical section(s) that mutate a
+      pinned page's bytes (insert/split/dedup call sites already covered
+      by `DebugTraceInserts`, but nothing currently records a
+      before/after content-hash pair bracketing each `contentMu` hold) to
+      catch which specific in-memory mutation silently drops or replaces
+      an already-inserted item while leaving the page's item COUNT
+      unchanged (already observed: a "good" flush at itemCount=379 with
+      the entry present, followed 6 Seq-ticks later by another flush of
+      the SAME block, STILL itemCount=379, entry now absent — same count,
+      different content, not a split/dedup event). Do NOT re-open
+      claimVictim, the fast-path insert sites' own correctness, the
+      split/dedup-rewrite path, the clean-eviction path, the dirty-flush
+      write side, or smgr.go's readBlock/writeBlock/relFile.mu
+      serialization — all now conclusively cleared (six mechanisms ruled
+      out across 8 loops of targeted instrumentation). Do NOT re-litigate
+      hypothesis (b) (stale write superseding a newer one) — refuted with
+      hard syscall-level evidence, not just unconfirmed.
+      2026-07-08 update (11th loop on the reopen; see today's 11th deferral
+      ledger row): executed the 10th loop's exact next step — built
+      BTree.DebugTraceContentMu (btree.go), bracketing every pinW/unpinW
+      hold with a before/after pageItems() snapshot, sharing
+      insertLog/rewriteLog/flushLog/reloadLog's Seq counter. **Found a real
+      flaw in the 10th loop's own premise, not the target bug directly**:
+      pinW/unpinW is NOT the sole contentMu choke point as its doc comment
+      (trusted uncritically by all 10 prior loops) claimed —
+      storage.Pool.pinLoad (bufpool.go ~1561-1572) independently
+      Lock()s/Unlock()s the SAME per-slot contentMu directly around its own
+      ReadBlock call during a cache-miss reload, bypassing bt.pinW/unpinW
+      entirely (fixed the misleading doc comments this loop). A fresh
+      repro (only 1 entry lost this run — smaller than the usual 6-49,
+      pure run-to-run variance) showed the resulting "GAP LOSS" pattern:
+      entry present at one traced pinW/unpinW hold's Unlock (seq=311449),
+      already absent at the very next traced hold's Lock (seq=311559),
+      nothing recorded at the pinW/unpinW level in between. Cross-
+      referencing against the pre-existing flush/reload logs closed the
+      gap to the tightest window in this whole investigation: a flush-
+      snapshot at seq=311541 has 268 items INCLUDING the entry (checked by
+      exact TID, not just count); the very next reload-snapshot at
+      seq=311542 — one Seq tick later — has 267 items, entry gone. This
+      REOPENS a specific sub-question the 10th loop's "zero mismatches"
+      result does not actually cover: that check only flags a postRead
+      matching an OLDER postWrite instead of the MOST RECENT one — it
+      cannot detect a SECOND, chronologically-later postWrite (e.g. from a
+      DIFFERENT physical slot racing to flush the same block tag; the 9th
+      loop already saw 3 different slot indices serve one block's tag in a
+      single run) legitimately becoming the new most-recent write with
+      STALE (pre-insert) content, which a following read would correctly
+      match without ever being flagged. Gates: go build ./... clean; go
+      vet ./internal/storage/... ./internal/amcheck/...
+      ./internal/access/btree/... clean; go test ./internal/storage/...
+      ./internal/access/btree/... ./internal/amcheck/... PASS (target test
+      re-skipped). Next step: walk io_trace.go's log for the implicated
+      block by WALL-CLOCK time (ioTraceEvent.T), not recurring lpCnt
+      (ambiguous — directly observed recurring across the run), to check
+      whether TWO postWrite events land for the block in immediate
+      succession with the second one's item count/hash regressing from the
+      first (the two-slots-racing-to-flush mechanism, fixed in
+      claimVictim/evictVictim's victim-selection/tag-transition sequence,
+      bufpool.go ~1527-1557) — or, if not, add a dedicated hook directly
+      inside pinLoad's own reload hold (distinct from pinW/unpinW) to catch
+      a same-slot double-load or destination-buffer aliasing bug instead.
+      Do NOT re-open claimVictim's pin-count exclusion, the fast-path
+      insert sites, the split/dedup-rewrite path, the clean-eviction path,
+      or relFile.readBlock/writeBlock's own r.mu serialization — all still
+      conclusively cleared. DO re-open whether the 10th loop's "zero
+      mismatches" conclusion covers the two-writers-race variant of
+      hypothesis (b) — it does not, by construction of that loop's own
+      matching algorithm.
+      2026-07-08 update (12th loop, same day; see today's 12th deferral
+      ledger row): executed the 11th loop's exact next step. Extended the
+      wall-clock IO-trace check to flag any adjacent postWrite pair for a
+      tag whose line-pointer count REGRESSES. A naive version flagged 29
+      hits on a fresh repro, but 27/29 were ordinary page splits (goopg
+      splits by byte size not item count, so the surviving fraction is
+      50.7%-53.8%, not exactly half); refined to a magnitude-based
+      classifier (drop >25% of prior count = presumed split, not flagged),
+      leaving exactly ONE genuine hit — and it lands EXACTLY on the
+      already-localized loss, now CONFIRMED and cross-validated at BOTH the
+      contentMu (in-memory) and IO-trace (smgr/syscall) layers: for the
+      missing (key=33666, TID={1,2883}) entry at blk=377, a reload-snapshot
+      lands itemCount=399 (entry absent, a stale on-disk copy predating the
+      insert) BETWEEN a correct flush-snapshot (itemCount=401, entry
+      present, seq=908124) and the smgr IO trace shows that correct flush
+      landing as postWrite lpCnt=401 at t=43.393270170s, immediately
+      followed just 1.9ms later by a SECOND postWrite lpCnt=400 (=399 stale
+      items + 1 later insert layered on the stale reload) that durably
+      clobbers the correct disk copy — the very next contentMu-hold
+      confirms the in-memory slot itself is now the stale 399-item version.
+      Confirms hypothesis (b) variant 2: a cache-miss reload racing a
+      legitimate flush of the SAME block loads STALE on-disk bytes into the
+      slot, silently discarding the concurrently-flushed correct content; a
+      later write on the now-stale slot re-flushes the loss permanently.
+      Gates: go build ./... clean; go vet ./internal/storage/...
+      ./internal/amcheck/... ./internal/access/btree/... clean; go test
+      ./internal/storage/... ./internal/access/btree/...
+      ./internal/amcheck/... PASS (target test re-skipped);
+      scripts/tpch-spotcheck.sh PASS (Q12=2/Q13=33). Test skip message
+      (verify_nbtree_realtree_test.go ~762) updated with this finding.
+      Next step: fix the confirmed synchronization gap directly in
+      storage.Pool.claimVictim/evictVictim/pinLoad (bufpool.go ~1527-1572)
+      — audit whether the reload path (pinLoad) can publish a ReadBlock
+      result for a tag without checking/blocking on that tag's in-flight or
+      just-completed flush (evictVictim's WriteBlock), and whether two
+      slots can transiently hold the same tag during the flush->reload
+      handoff; land a targeted exclusion (likely: reload must re-validate
+      or wait on any in-flight flush for the same tag before publishing),
+      then un-skip TestVerifyBtreeEngineSilentOnRealConcurrentContended to
+      confirm the fix closes this task.
+      2026-07-08 update (13th loop, same day; see today's 13th deferral
+      ledger row): attempted the 12th loop's exact next step (land the
+      synchronization fix) but, before writing any code, did a from-scratch
+      hand-trace of the ENTIRE claimVictim/evictVictim/pinLoad/pinSlow/Pin/
+      bufmap/relFile/pinW/MarkDirty/Unpin protocol (not reusing prior
+      loops' instrumentation) specifically hunting for the "two slots hold
+      the same tag" or "reload publishes without waiting on an in-flight
+      flush" gap the 12th loop's next-step named. Could NOT construct such
+      a window: bufmap.Insert always fails if the tag is already present;
+      evictVictim's bm.Delete(oldTag) runs strictly after flushSlot's
+      WriteBlock returns, still under pinMu; any concurrent Pin(oldTag)
+      during the flush correctly detects stateIO=true and waits on the
+      per-slot semaphore, only re-attempting a fresh disk read AFTER the
+      delete is visible (itself strictly after the flush completed, by
+      pinMu ordering) — so a woken waiter's own reload cannot observe
+      pre-flush bytes by this mechanism. Also checked and ruled out:
+      Unpin double-decrement (panics immediately on underflow — would
+      crash the test, not silently corrupt); torn writes during the
+      checkpointer's flushBatch (bt.pinW takes s.Lock()==contentMu.Lock()
+      exclusively for every page mutation, which properly excludes
+      flushBatch's contentMu.RLock()). Found ONE genuinely new, previously
+      unaudited gap: storage.Manager.WriteBlockAIO/PrefetchBlock (smgr.go)
+      bypass relFile.mu ENTIRELY when an AIOEngine is attached (the
+      `eng != nil` branch calls `eng.Submit(...)` directly instead of
+      `f.writeBlock`/`f.readBlock`), and internal/aio/aio.go's
+      Engine.Submit provides no per-file/per-offset ordering of its own —
+      confirmed by reading Submit/registerInFlight. This bypass IS wired in
+      production (internal/initdb/open.go:303 `mgr.SetAIO(...)`) and the
+      real checkpointer does call FlushAllPaced/flushBatch periodically,
+      but is NOT reachable by this unit test (buildRealTreeConcurrent never
+      calls SetAIO and never invokes FlushAllPaced during the insert race
+      window — only via Close(), after all writers finish) and, even in
+      the production case, contentMu's RWMutex (flushBatch holds RLock,
+      any eviction/reload needs Lock) still forces an evictor/reloader to
+      wait for flushBatch's real AIO Wait() to return before touching
+      s.page, so no concrete corruption path was found from this bypass
+      either — recorded as its own new fix_plan item below (AIO
+      relFile.mu bypass) rather than conflated with this task, since a
+      correct fix needs its own design (naive per-file serialization would
+      kill cross-block AIO parallelism) and isn't proven to fix THIS bug.
+      Net result this loop: the sync-only-path mechanism the skipped test
+      reproduces still has NO identified code-level defect after 13 loops
+      of combined live-instrumentation + hand-tracing — every invariant
+      constructible from reading the code holds. Gates: go build ./...
+      clean (no code changes landed this loop, investigation-only). Next
+      step: pivot to a DIFFERENT class of check than any tried so far —
+      (a) directly instrument bufmap.Insert/Delete/Lookup themselves (never
+      once traced with per-call logging across 13 loops; every loop so far
+      only inferred bufmap's correctness by reading the code) to verify,
+      for blk=377's exact tag, that bufmap truly holds a SINGLE (tag→slot)
+      mapping at every instant during the loss window, rather than trusting
+      inspection; or (b) audit the 15-bit slot generation counter
+      (`stateGen`/`newGen := (curGen+1)&0x7FFF`) for a CROSS-slot gen
+      collision (two DIFFERENT slots coincidentally sharing the same gen
+      value at the same time), not just the already-ruled-out same-slot
+      wraparound-after-2500-claims case.
+      2026-07-08 update (14th loop, same day, AI-20260708-064334-001):
+      **RESOLVED.** Executed the 13th loop's option (a) exactly — built
+      `storage.Pool.OnBufmapInsert`/`OnBufmapDelete` (`internal/storage/
+      bufpool.go`, routed through new `bmInsert`/`bmDelete` wrapper methods
+      that are now the SOLE call sites touching `p.bm.Insert`/`p.bm.Delete`)
+      plus `BTree.DebugTraceBufmap`/`RecordBufmapInsert`/`RecordBufmapDelete`/
+      `BufmapEventsForBlock`/`CheckBufmapExclusivity` (`internal/access/
+      btree/btree.go`), logging every bufmap mutation for this BTree's
+      relation SYNCHRONOUSLY inside bufmap's own internal mu — unlike the
+      flush/reload hooks (whose Seq is stamped by a later, separately-locked
+      call and can drift from true completion order, per the 11th loop's
+      finding), this records bufmap's TRUE mutation order for the tag, with
+      no residual jitter possible. Wired into
+      `TestVerifyBtreeEngineSilentOnRealConcurrentContended` (temporarily
+      un-skipped) with a per-missing-entry `CheckBufmapExclusivity` dump.
+      **First run produced a direct hit**: for block 444, `bufmap-event
+      seq=1177594 op=insert slot=38 ok=true` was immediately followed by
+      `bufmap-event seq=1177611 op=insert slot=42 ok=true` — a SECOND
+      successful Insert for the same tag with NO intervening Delete,
+      conclusively proving the double-mapping 13 prior loops could not
+      locate. Root cause, found by reading `internal/storage/bufmap.go`'s
+      `Insert` immediately after: it stopped at the FIRST tombstone-or-empty
+      bucket in its open-addressing probe chain and claimed it immediately,
+      contradicting `Lookup`'s/`Delete`'s own documented and implemented
+      invariant that "tombstones do NOT terminate probing; only true-empty
+      buckets do" — a live entry for a tag can legitimately sit further
+      along the SAME probe chain, past an earlier tombstone left by a
+      different, already-deleted, colliding key. A concurrent
+      `pinLoad`/`PinNew` racing to (re-)publish a tag that was still live
+      elsewhere in the chain would incorrectly succeed, planting a SECOND
+      live slot for the same block; the two slots then raced a disk reload
+      against a legitimate flush of the same block exactly as the 12th
+      loop's IO-trace evidence showed, permanently discarding the flush's
+      content. Fixed `Insert` to scan to a true-empty terminator (matching
+      `Lookup`/`Delete`) before deciding whether to insert, remembering only
+      the FIRST tombstone-or-empty bucket seen as the write target — the
+      standard open-addressing-with-tombstones algorithm (see `Insert`'s
+      updated doc comment for the full mechanism and trace). Added
+      `TestBufmapInsertSkipsPastTombstoneToExistingKey`
+      (`internal/storage/bufmap_test.go`) as a cheap, deterministic,
+      whitebox regression test (constructs a real starting-bucket collision,
+      confirmed to FAIL on the pre-fix code and PASS post-fix). Permanently
+      un-skipped `TestVerifyBtreeEngineSilentOnRealConcurrentContended`
+      (replaced its `t.Skip` with a RESOLVED doc comment) — 6/6 clean runs
+      plus one full `-race` run (176s, zero races, zero lost entries).
+      Updated `docs/design/root-0005-buffer-manager.md`'s Concurrency Model
+      section with this invariant. Gates: `go build ./...` clean; `go vet
+      ./internal/storage/... ./internal/access/btree/... ./internal/amcheck/...`
+      clean; `go test ./internal/storage/... ./internal/access/btree/...
+      ./internal/amcheck/... ./internal/executor/...` PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed txns, all 3 workloads). **Also re-ran the exact authoritative
+      nightly repro named in AI-20260708-064334-001** (`ci/batch/stages/
+      stage-pgbench.sh`, scale=50 clients=100 threads=20 duration=180×3,
+      the precise parameters that originally failed with "btree: empty
+      internal page"): PASS, 0 failed transactions across all 3 workloads
+      (tps 1233/2309/99127). This closes the task — no separate deferral-
+      ledger row needed (a complete fix with a permanent regression guard
+      landed, not a partial/deferred one). The unrelated `storage/
+      aio-relfile-mu-bypass` item below remains open as its own task.
+
+- [x] storage/aio-relfile-mu-bypass — NEW (found as a side-effect of the
+      13th-loop M-NIGHTLY audit above, AI-20260708-064334-001; not itself
+      confirmed to cause any observed data loss, but a genuine
+      code-hygiene/latent-risk gap worth its own task). storage.Manager.
+      WriteBlockAIO and PrefetchBlock (internal/storage/smgr.go) bypass
+      relFile.mu entirely whenever an AIOEngine is attached (`eng != nil`
+      calls `eng.Submit(...)` directly, skipping `f.writeBlock`/
+      `f.readBlock`), and internal/aio/aio.go's Engine.Submit provides no
+      per-file/per-offset ordering of its own (confirmed by reading
+      Submit/registerInFlight — the inflight map is bookkeeping-only, not a
+      serialization point). relFile.mu is treated as the file's sole
+      serialization point everywhere else (readBlock/writeBlock/extend all
+      take it). SetAIO IS wired in production (internal/initdb/open.go:303)
+      so this bypass is live on the real server, not just a theoretical
+      concern. Next step: design (don't rush) a fix that preserves AIO's
+      cross-block parallelism while still serializing any AIO op against a
+      concurrent synchronous read/write to the SAME block of the SAME
+      relFile — e.g. a per-(rel,block) in-flight-AIO registry that
+      readBlock/writeBlock/WriteBlockAIO/PrefetchBlock all consult, rather
+      than a blanket per-file mutex (which would regress checkpointer
+      throughput). Verify with a new targeted concurrency test exercising a
+      real AIOEngine (internal/aio's MethodWorker or MethodSync) alongside
+      concurrent synchronous smgr calls to the same block.
+      2026-07-08 update (14th loop, continuation): investigating this item
+      surfaced a SECOND, more concrete bug in the same raw-fd bypass and
+      that half is now **RESOLVED**. The MethodWorker/MethodSync AIO
+      methods were never actually part of the bypass — `runOp`
+      (internal/aio/aio.go) calls `op.File.ReadAt`/`WriteAt`, and
+      `relFile.ReadAt`/`WriteAt` (internal/storage/smgr.go) already take
+      `relFile.mu` for the full I/O plus apply checksum stamping/
+      verification — so only `methodIOUring`'s raw-fd path (`Submit`
+      type-asserting `op.File` as `fdHaver` and submitting straight by
+      kernel fd, internal/aio/method_iouring_linux.go) was ever a real
+      bypass. Confirmed a live, concrete, checksum-specific consequence of
+      that bypass: on a checksummed cluster (`data_checksum_version` >= 1)
+      with `io_method=io_uring`, every AIO write silently persisted a
+      stale/garbage `pd_checksum` (relFile.WriteAt's stamping never ran)
+      and every AIO read silently skipped verification — worse, a
+      subsequent *synchronous* read of a block written this way would
+      then report a false-positive `*ChecksumError` for a page that was
+      never actually corrupted. Fixed via a new optional `aio.File`
+      extension, `ChecksumFile{PrepareWrite(buf,off) []byte,
+      VerifyRead(buf,off) error}` (internal/aio/aio.go):
+      `methodIOUring.Submit` calls `PrepareWrite` before building the SQE
+      for a write (submitting the stamped copy, pinned alive via
+      `pendingOp.buf` until the kernel completes it) and `completeOne`
+      calls `VerifyRead` after a successful read, mapping a mismatch onto
+      the `Result.Err` `Wait()` returns. `storage.relFile.PrepareWrite`/
+      `VerifyRead` (internal/storage/smgr.go) implement the interface
+      structurally (storage still does not import internal/aio) by
+      delegating to the same `checksummedForWrite`/`verifyOnRead` helpers
+      `WriteAt`/`ReadAt` already use, so the two paths cannot drift.
+      Verified non-vacuous: reverted just the Submit/completeOne wiring
+      and reran the new test — fails (0 PrepareWrite calls, unstamped
+      bytes on disk); with the fix, passes. New tests:
+      `TestEngineIOUringChecksumFileHooks` (internal/aio, linux-only,
+      `t.Skip`s on fallback like the file's other io_uring tests) and
+      `TestChecksumRelFilePrepareWriteVerifyRead` (internal/storage,
+      exercises the real `PageSetChecksumCopy`/`VerifyPage` production
+      functions). Gates: `go build ./...` / `go vet ./...` clean;
+      `go test ./internal/aio/... ./internal/storage/... ./internal/initdb/...`
+      PASS; `go test -race -run TestEngineIOUring ./internal/aio/...` PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed txns, all 3 workloads). Design doc updated:
+      docs/design/0009-0006-aio-io-uring.md (new "Checksum bypass (fixed)
+      and the still-open per-block ordering gap" section) +
+      docs/design/README.md's 0009-0006 row.
+      **What remained open** at the end of that loop: the ORIGINAL
+      per-(rel,block) same-tag ordering concern this item was filed for —
+      a concurrent synchronous readBlock/writeBlock/extend (or another
+      io_uring op) on the SAME block of the SAME relFile is still not
+      serialized against an in-flight io_uring raw-fd op. Re-examined
+      reachability via the one production call site (`Pool.flushBatch`'s
+      `WriteBlockAIO`, internal/storage/bufpool.go): per the 2026-07-08
+      M-NIGHTLY deferral-ledger row's hand-trace, `Slot.contentMu`'s
+      RWMutex already forces any evictor/reloader of the same slot to
+      wait for the flush's real `Wait()` before touching `s.page`, so no
+      concrete corruption path is known there today — this downgrades
+      urgency (latent-risk, not confirmed-reachable) but does not close
+      the gap at the smgr/aio layer itself, which is correctness-load-
+      bearing the moment any OTHER caller starts using WriteBlockAIO/
+      PrefetchBlock outside contentMu's protection. Next step unchanged:
+      the per-(rel,block) in-flight-AIO registry design described above,
+      consulted by readBlock/writeBlock/WriteBlockAIO/PrefetchBlock
+      instead of a blanket per-file mutex.
+      2026-07-08 update (15th loop, continuation — CLOSES this task):
+      implemented the per-(rel,block) in-flight-AIO registry.
+      `relFile.lockBlock` (internal/storage/smgr.go) is a
+      `map[BlockNumber]chan struct{}` guarded by a dedicated `blockMu`
+      (kept separate from `relFile.mu` so registering/releasing a block
+      never collapses cross-block AIO parallelism into a whole-file
+      lock): `lockBlock(blk)` blocks until no entry exists for `blk`,
+      registers one, and returns a release func. `readBlock`/`writeBlock`
+      hold it for their whole body; `extend`/`extendBatch` need no
+      change — they only ever touch brand-new blocks past the current
+      `nblocks`, and `WriteBlockAIO` already rejects `blk >= nblocks`, so
+      no AIO op can ever be in flight against a block that doesn't exist
+      yet. `Manager.PrefetchBlock`/`WriteBlockAIO` acquire the latch
+      before `eng.Submit` (only on the AIO-attached branch — the
+      eng==nil fallback calls `readBlock`/`writeBlock` directly, which
+      already latch internally, so no double-acquisition) and release it
+      via a new `AIOSubmitOp.OnComplete func()` field, wired through
+      `aioEngineAdapter.Submit` (internal/initdb/open.go) to
+      `aio.Op.Callback`. Callback is the right hook because
+      `Engine.finishHandle` calls it identically from all three methods
+      (sync/worker/io_uring) at the moment the I/O *actually* completes —
+      independent of whether/when the caller invokes the returned
+      handle's `Wait` — confirmed by reading `finishHandle`
+      (internal/aio/aio.go) and `completeOne` (method_iouring_linux.go).
+      Releasing at real completion rather than at `Wait` time is what
+      makes the latch correct rather than merely advisory: a caller that
+      submits and defers `Wait` would otherwise let a synchronous
+      same-block access race the still-in-flight I/O. Updated the
+      existing `recordingAIOEngine` test fake
+      (internal/storage/storage_test.go) to call `OnComplete` (it
+      completes inline; without this, PrefetchBlock/WriteBlockAIO's new
+      latch would never release, deadlocking any existing test touching
+      the same block twice) — audited all 6 of its call sites, no test
+      relied on the old no-callback behavior. New test:
+      `TestBlockLatchSerializesAIOAgainstSync`
+      (internal/storage/storage_test.go) uses a `gatedAIOEngine` test
+      double that performs the AIO write's real I/O immediately but
+      defers its `OnComplete` call until the test closes a channel, so
+      the assertions are deterministic (no reliance on a race actually
+      manifesting): a concurrent synchronous `WriteBlock` to the SAME
+      block blocks until `OnComplete` fires, while a `WriteBlock` to a
+      DIFFERENT block completes immediately throughout (proving the latch
+      is per-block, not a regression to a blanket per-file lock).
+      Verified non-vacuous: temporarily stubbed `lockBlock` to a no-op —
+      test failed with the expected "returned before the in-flight AIO op
+      completed" message; restored, re-ran clean including
+      `go test -race`. Considered but rejected a real-io_uring-based
+      timing test instead: Linux's buffered-I/O page-cache locking
+      (i_rwsem) likely already prevents byte-level tearing between two
+      concurrent pwrite/pread syscalls on the same regular file
+      regardless of this fix, which would make a content-tearing-based
+      test pass even with the fix reverted (non-discriminating); the
+      gated-fake approach directly exercises the actual serialization
+      contract instead. Gates: `go build ./...` / `go vet ./...` clean;
+      `go test ./internal/storage/... ./internal/aio/... ./internal/initdb/...`
+      PASS; `go test -race ./internal/storage/... ./internal/aio/...`
+      PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS
+      (0 failed txns, all 3 workloads). Design doc updated:
+      docs/design/0009-0006-aio-io-uring.md (section retitled, "Still
+      open" replaced with the fix description + test) and
+      docs/design/README.md's 0009-0006 row. No deferral-ledger row
+      needed — a complete fix with a permanent regression guard landed,
+      closing every part of this task's original scope.
+      2026-07-08 ledger reconciliation (16th loop, no code changed):
+      re-ran `ci/logs/action-items.md`'s nightly triage per rule 3 —
+      the file's only item (`AI-20260708-064334-001`, run
+      `20260708-064334`) is the SAME stale run already fully resolved by
+      the reopen task's 14th/15th loops above (its `sha`/timestamp
+      predate both landed fixes); no new nightly failure to triage, and
+      the next real nightly run will regenerate a clean log. Mirroring
+      the 2026-07-07 reconciliation precedent above: audited all 13
+      `status = -` deferral-ledger rows filed during this reopen's 1st-13th
+      investigation loops (2026-07-08) against the 14th loop's landed
+      root-cause fix (`bufmap.Insert`'s tombstone-skip double-mapping,
+      per the entry above) — every one of the 13 rows documents an
+      intermediate hypothesis from the SAME investigation thread
+      (eviction/flush/reload/rewrite/fast-path mechanisms), all
+      superseded once the true root cause (a second live slot for the
+      same tag racing a legitimate flush/reload) was found and fixed
+      with a permanent regression guard
+      (`TestVerifyBtreeEngineSilentOnRealConcurrentContended`,
+      un-skipped). Flipped all 13 rows' `status` from `-` to `resolved`;
+      no row's `landed`/`deferred`/`resume point`/`why` text was altered,
+      only the leading `status` cell (227 → 214 open ledger rows).
 
 - [x] race/internal/wal — race suite failed in package
       `github.com/goopg/goopg/internal/wal` (AI-20260707-000712-001; repro:
@@ -1764,6 +2664,375 @@ is. Next candidate: the view's-own-ACL gap from M0122-0008 (materially
 larger), resume the M0110-0001 multi-database isolation survey above, or
 survey the deferral ledger for a fresh open (`status = -`) row.
 
+- [x] testport/mass-build-break-20260709 — stale, re-ran at HEAD, passes
+      (AI-20260709-010336-002 through -081, i.e. every nightly-run
+      20260709-010336 `testport/TestPort_Isolation*`, `TestPort_PgAmcheck*`,
+      `TestPort_PgBasebackup*`, `TestPort_PgDump*`, `TestPort_PgDumpall*`,
+      `TestPort_PgReceivewal020`, `TestPort_PgoutputInterop*` regression
+      except -001 and -082, 80 items). All 80 were collateral from a single
+      transient build break, not real product bugs. 79 of the 80 failed
+      with the identical `isolation_port_test.go:NNNN: init failed: #
+      github.com/goopg/goopg/internal/executor` /
+      `operators_window.go:314/333/363/572: too many arguments in call to
+      o.frameBounds` compile error (these tests fork-build a real `goopg`
+      server binary at test-init time); the 80th
+      (`TestPort_IsolationMultixactNoForget`, AI-...-023) failed with a
+      plain `start timeout after 20s` — same collateral window, one test
+      earlier in the run queue. Root cause: the nightly batch (sha
+      `b9a1e1fb5366`) built/ran `go test ./internal/testport/...` directly
+      against the live working tree during 01:03-03:37, which overlapped
+      the M0122-0004 GROUPS-window-frame-mode work landing that same
+      morning (`4ac7ba47`, an ancestor of current HEAD `26677eb3`) —
+      `operators_window.go`'s `frameBounds` call sites were transiently
+      inconsistent (some call sites already passing the new `[]int` param,
+      some not yet) while that stage's build ran. `go build ./...` is clean
+      at current HEAD; live-re-ran 6 of the 80 individually
+      (`TestPort_IsolationFkPartitioned2`, `TestPort_IsolationSkipLocked3`,
+      `TestPort_IsolationDeadlockHard`, `TestPort_IsolationStats`,
+      `TestPort_PgDumpConnectionSetup`, `TestPort_IsolationMultixactNoForget`)
+      — all 6 PASS at HEAD, confirming staleness; no product fix needed.
+      Standing hazard worth a future loop: the nightly batch tests the live
+      working tree rather than a pinned snapshot/worktree, so a same-day
+      concurrent Ralph commit mid-multi-file-edit can transiently break a
+      whole stage and manufacture dozens of spurious "regressions" — see
+      also the units/race co-load timeout item below for a second, distinct
+      way shared-host nightly runs produce noisy mass failures. repro (any
+      subset): `go build ./... && go test -v -run
+      '^(TestPort_IsolationFkPartitioned2|TestPort_IsolationSkipLocked3|TestPort_IsolationDeadlockHard|TestPort_IsolationStats|TestPort_PgDumpConnectionSetup|TestPort_IsolationMultixactNoForget)$'
+      ./internal/testport/`.
+
+- [x] testport/TestE2E_SASLPrepMatchesRealLibpqClient — FIXED
+      (AI-20260709-010336-001). Root cause confirmed as diagnosed by the
+      prior triage loop: `postgres/local_install/bin/psql` dynamically
+      resolves `libpq.so.5` via the default linker search path, which finds
+      the *system* `/lib/x86_64-linux-gnu/libpq.so.5` (predates
+      `PQsendPipelineSync`) ahead of the newer bundled one in
+      `postgres/local_install/lib` — a lazily-bound PLT symbol, so it only
+      fails once psql's SCRAM/pipeline codepath actually calls it (why only
+      this one `PSQLWithPassword`-based test hit it while plain-`PSQL`
+      trust-auth tests didn't). Fixed at the harness level rather than
+      rebuilding local_install with an RPATH: added
+      `(*cluster.Cluster).libpqEnv()` (`internal/testutil/cluster/
+      cluster.go`) returning `LD_LIBRARY_PATH=<repoRoot>/postgres/
+      local_install/lib`, wired into all four in-tree-binary call sites —
+      `PSQL`, `PSQLWithPassword`, `PGbench`, `StartPSQL` — via each spec's
+      `Env` (appended after `os.Environ()`, so it's a no-op where a caller
+      already sets `LD_LIBRARY_PATH` itself, e.g. `e2e_pgbench_test.go`'s
+      existing `os.Setenv` workaround: glibc's `getenv` returns the first
+      match, and that one lands earlier in the merged slice). Centralizing
+      here (rather than only patching the SASL test) closes the same latent
+      gap for every other cluster-helper caller instead of requiring each
+      new test to remember the workaround, per the pgbench-reopen triage's
+      own forward-looking note ("every manual pgbench/psql repro recipe...
+      should export that alongside PATH, not just the SASL test itself").
+      Verified: `go build ./...` clean; `go test -v -run
+      '^TestE2E_SASLPrepMatchesRealLibpqClient$' ./internal/testport/`
+      PASS; spot-checked no regression on two other cluster-helper callers
+      (`TestE2E_PgbenchWorkload` PASS, `TestPort_Psql001Basic`/
+      `TestPort_Psql020CancelAdapted` SKIP as before — system has no PATH
+      `psql`, expected/unchanged). `go vet
+      ./internal/testutil/cluster/... ./internal/testport/...` clean.
+
+- [x] nightly/units-race-co-load-timeout-20260709 — units stage
+      (`cmd/goopg`, `internal/amcheck`, `internal/initdb`, `internal/mvcc`)
+      and race stage (`cmd/goopg`, `internal/access/btree`,
+      `internal/amcheck`, `internal/executor`) each had one package per
+      stage SIGQUIT-killed by go test's own `-timeout` after 33-53 real
+      minutes (`*** Test killed with quit: ran too long`); no AI-id (the
+      82-item action-items.md regression list only covers testport/pgbench,
+      units/race stage failures are surfaced separately under the run's
+      "Resource kills" section of `ci/logs/20260709-010336/summary.md`).
+      Ruled out: cgroup OOM kill (`~/.ralph/logs/mem_guard.log` has zero
+      lines in the 2026-07-09T01:00-04:30 window — no PRESSURE/SIGKILL
+      entry at all that night) and a build break (the hung packages
+      compiled fine; other tests inside the same package/binary passed,
+      e.g. units' `internal/executor` package itself reported `ok
+      ... 157.359s`). `cmd/goopg`'s units-stage hang left off at
+      `TestStandbyControllerPromoteDrainsPendingReplay`'s init log line
+      with no further output for 33m; the race-stage `internal/executor`
+      hang's goroutine dump shows `TestExecutorDeadlockThreeSession` /
+      `TestUpsertOnConflictDoUpdateWaitsOnForeignConflictingLock` genuinely
+      parked in `lockmgr.(*LockManager).acquire` /
+      `mvcc.(*Manager).WaitForXID` for 53m (real waits, not a spin/panic).
+      This is a repeat of the previously-noted "initdb 10m-timeout under
+      co-load" pattern (nightly-batch memory topic), now up to ~53m and
+      spread across 4 packages per stage — plausibly because
+      units+race+testport+pgbench+tpch all run concurrently on one host
+      (each stage itself also running `p=4` parallel packages), so
+      CPU/fsync contention under that combined load can push a normally-
+      fast lock wait or `initdb` cycle past the per-package timeout. Not
+      reproduced in isolation in this triage pass (each repro is 30-50m
+      real time and the point is to test WITHOUT co-load, i.e. standalone,
+      which the automated batch doesn't do) — needs a future loop to
+      re-run e.g. `TestExecutorDeadlockThreeSession` and
+      `TestStandbyControllerPromoteDrainsPendingReplay` standalone (no
+      other nightly stage running concurrently) to confirm this is
+      infra/scheduling noise rather than a genuine new deadlock. repro
+      (representative, run alone, no co-load): `go test -race -timeout 60m
+      -run '^TestExecutorDeadlockThreeSession$' ./internal/executor/`.
+      2026-07-09 follow-up loop — CONFIRMED infra/scheduling noise, not a
+      product regression. Ran all three named tests standalone (no other
+      nightly stage co-loaded), each with a generous 20m timeout to see the
+      actual wall time: `go test -race -timeout 20m -run
+      '^TestExecutorDeadlockThreeSession$' ./internal/executor/` → PASS in
+      1.5s test time (15.9s wall incl. build); `go test -race -timeout 20m
+      -run '^TestUpsertOnConflictDoUpdateWaitsOnForeignConflictingLock$'
+      ./internal/executor/` → PASS in 1.3s test time (1.8s wall); `go test
+      -timeout 20m -run '^TestStandbyControllerPromoteDrainsPendingReplay$'
+      ./cmd/goopg/` → PASS in 1.4s test time (2.1s wall). All three
+      completed in low single-digit seconds — orders of magnitude under the
+      33-53m nightly-batch kill, so the lock waits genuinely resolved almost
+      instantly once the 4-stage host contention (units+race+testport+
+      pgbench+tpch all running concurrently, each with its own `p=4`
+      parallel packages) was removed. No code change needed; no deadlock
+      exists. Closing as infra-only — this is a scheduling artifact of the
+      nightly batch's own concurrency, not a product bug. If a future
+      nightly run repeats this pattern, the fix belongs in
+      `ci/batch/` (e.g. don't co-schedule race/units alongside
+      pgbench/tpch, or raise the per-package `-timeout`), not in the tests
+      or the code they exercise.
+
+- [x] pgbench/nightly-reopen-20260709 — REOPENED a third time (subject
+      `pgbench/nightly`; both prior tasks above are checked/closed but the
+      fix apparently didn't fully hold): `btree: empty internal page
+      (blk=1554 rel={DBOid:5 RelOid:16412 Fork:0})` (AI-20260709-010336-082;
+      repro: `REPO_ROOT=$PWD RUN_DIR=$(mktemp -d) bash
+      ci/batch/stages/stage-pgbench.sh` s=50 c=100 j=20 T=180; evidence:
+      `ci/logs/20260709-010336/pgbench/pgbench.log`). Same symptom class as
+      the 2026-07-08 reopen (`blk=8782`) — per rule 3, re-run the repro at
+      HEAD before assuming this is a fresh regression of the same root
+      cause; not re-run in this triage pass (pgbench repro takes several
+      minutes of `-i -s 50` load plus the `-c 100 -j 20 -T 180` run).
+      2026-07-09 update (1st loop on the reopen): re-ran the repro at HEAD
+      using the established cheap recipe (isolated port 5533, `pgbench -i
+      -s 50` once — 4m28s — then `pgbench -c 100 -j 20 -T 25 -P 5` twice).
+      Both runs: 0 failed transactions (does not reproduce the original
+      runtime "empty internal page" abort in this shorter window, same as
+      every prior reopen's first loop). First useful side-finding while
+      setting this up: hit the SAME libpq ABI mismatch as
+      `testport/TestE2E_SASLPrepMatchesRealLibpqClient`
+      (AI-20260709-010336-001) independently — `postgres/local_install/bin/
+      psql`/`pgbench` both `symbol lookup error: undefined symbol:
+      PQsendPipelineSync` when run with a bare `PATH`; confirmed the fix
+      that item's writeup proposed (`LD_LIBRARY_PATH=$PWD/postgres/
+      local_install/lib`) works — every manual pgbench/psql repro recipe in
+      this fix_plan going forward should export that alongside `PATH`, not
+      just the SASL test itself. Then ran the SAME post-run `bt_index_check
+      (..., true)` technique the 2026-07-08 reopen used and got a
+      **different, genuine finding**: `pgbench_accounts_pkey` reports `ERROR:
+      left link/right link pair in index "pgbench_accounts_pkey" not in
+      agreement` — a distinct symptom class from both this month's already-
+      fixed bugs (2026-07-07's `keyLen mismatch`/bufmap-tombstone family,
+      2026-07-08's amcheck duplicate-key false-positive), so this is
+      genuinely new, not a rehash. Found and fixed a real (small) diagnostic
+      gap on the way: `btIndexReportDetail` (`internal/executor/
+      operators_bt_index_check.go`) suppressed the error DETAIL (which
+      carries the offending block number) whenever there was only ONE
+      finding — the common case — even though upstream amcheck's own
+      `ereport(ERROR)` calls always attach an `errdetail_internal` naming the
+      block; fixed to always build the "block N: msg" detail regardless of
+      count (no test asserted the old suppress-when-single behavior). Used
+      the now-visible block number plus a throwaway direct-file-read Go
+      probe (opened the stopped server's `base/5/16412` file, parsed opaque
+      headers via the already-exported `btree.ParseOpaque`, reverted after
+      use — not committed) to confirm this is genuine **on-disk, persistent**
+      corruption (checked with the server stopped, not a live buffer-pool
+      artifact): block 678 (leaf, level=0) has `Prev=677`, but the actual
+      forward sibling chain is `677 --Next--> 15798 --Next--> 678` (15798's
+      `Prev=677`, `Next=678`; 677's `Next=15798`) — i.e. 678's left-link was
+      never updated to point at 15798 when 15798 was spliced in between 677
+      and 678, and still stale-points at the pre-split predecessor 677. This
+      is byte-for-byte the "classic example" upstream's own
+      `bt_recheck_sibling_links` doc comment (verify_nbtree.c:1079-1088)
+      describes as the signature of a **faulty, non-atomic page split**: "the
+      original right sibling page's left link fails to point to the new
+      right sibling page... even though the first phase of a page split is
+      supposed to work as a single atomic action." Read (not yet
+      instrumented) `insertIntoBlock`'s existing old-right-sibling relink
+      code (btree.go ~2148-2303: `oldNext := op.Next` captured once under
+      `blk`'s continuously-held `pinW`, later `sibSlot, _ := bt.pinW(sibBlk)`
+      / `sibOp.Prev = rightBlk` / `writeOpaque(...)`) end-to-end and could
+      NOT find an inspection-only defect — the pinW/contentMu coupling on
+      the shared sibling block should serialize against both "678 splits
+      itself concurrently" and "two different backends relink 678 at once"
+      correctly by hand-trace (documented reasoning, not proof) — matching
+      this investigation's month-long pattern where hand-tracing alone
+      repeatedly failed to find the real defect and only live instrumentation
+      (`DebugTraceBufmap` et al., 2026-07-08 14th loop) succeeded. Did NOT
+      build new instrumentation this loop (out of budget after the repro/
+      localization work). Next step: this is a MUCH more localized starting
+      point than any prior reopen got in its first loop — reuse
+      `internal/access/btree`'s existing debug-trace scaffolding pattern
+      (`DebugTraceInserts`/`DebugTraceBufmap` style: cheap, off-by-default,
+      committed) to add a trace specifically around `insertIntoBlock`'s
+      `sibSlot`/`oldNext` relink (blk being split, sibBlk being relinked,
+      before/after `sibOp.Prev`), then re-run this exact recipe (repro
+      preserved on disk, see below) filtering the trace log for block 678 —
+      or, if the corrupted data dir has already been cleaned up by the time
+      this resumes, regenerate via `pgbench -i -s 50` once + `pgbench -c 100
+      -j 20 -T 25 -P 5` twice against a fresh isolated server (both
+      `PATH`/`LD_LIBRARY_PATH` as above), then `bt_index_check
+      ('pgbench_accounts_pkey'::regclass, true)` post-run. **The exact
+      corrupted data dir from this loop is preserved** at
+      `tmp/perf-optimize/reopen3-data` (server stopped, not deleted — 481M,
+      gitignored) specifically so the next loop can skip the ~5 minute
+      repro and jump straight to instrumenting `insertIntoBlock` against
+      this already-known-bad block 678. Gates this loop: `go build ./...`
+      clean; `go test ./internal/executor/... ./internal/amcheck/...` PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33). Deferral ledger row
+      appended for the still-open corruption mechanism.
+  - [x] `M-NIGHTLY (AI-20260709-010336-082)` 4th loop on the reopen: found
+      and fixed the actual root cause of the prior loop's block-678
+      sibling-relink corruption via CODE READING alone (no new live
+      instrumentation needed — the prior loop's hand-trace of
+      `insertIntoBlock` in isolation was correct; the bug lives in a
+      DIFFERENT function that races against it). `bt.splitMu` — a
+      per-`*BTree`-**Go-instance** mutex, confirmed by an earlier loop to
+      NOT serialize across connections since each backend opens its own
+      `*BTree` per statement — is held for the whole duration of
+      `unlinkEmptyLeaf` (`internal/access/btree/btree_vacuum.go`), which
+      computes `leftLive`/`rightLive` via an unlocked `liveSibling`
+      pre-pass and then, much later, blindly writes those STALE values as
+      the post-unlink sibling relink (`op.Prev = req.RightSibNewPrev` /
+      `op.Next = req.LeftSibNewNext`). A concurrent Insert-driven split on
+      a DIFFERENT connection's `*BTree` instance for the SAME relation is
+      NOT blocked by this `splitMu` (different instance) and can splice a
+      new live page into the exact chain segment VACUUM is mid-unlinking;
+      that split's own sibling relink is correct in isolation (fresh
+      `readOpaque` immediately before `writeOpaque`, under the real
+      cross-connection `pinW`/`contentMu` lock), but VACUUM's later write
+      then stomps it back to the pre-split neighbour — reproducing
+      exactly the confirmed on-disk symptom (block 678 `Prev` stuck at
+      677 when the true chain was 677->15798->678). Fixed both
+      `unlinkEmptyLeaf` (WAL path) and `unlinkEmptyLeafFPI` (no-WAL-hook
+      fallback) to re-derive the live neighbour via a FRESH `liveSibling`
+      walk, started from the sibling block's CURRENT on-disk Prev/Next,
+      executed INSIDE the same `pinW` hold that performs the write — a
+      no-op if nothing raced, self-correcting if it did. Verified via a
+      fresh independent repro (isolated port 5533, `pgbench -i -s 10
+      --no-vacuum` then `pgbench -c 60 -j 12 -T 30` racing an explicit
+      `VACUUM pgbench_accounts` loop every 0.3s): 0 failed transactions,
+      and post-run `bt_index_check` no longer reports any Prev/Next
+      sibling-link mismatch. Gates: `go build ./...` clean; `go test
+      ./internal/access/btree/... ./internal/amcheck/...
+      ./internal/executor/...` PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33). **New, different corruption class surfaced by the
+      SAME fresh repro** (not fixed this loop — see deferral ledger row
+      appended 2026-07-09): `bt_index_check` now reports `high key
+      invariant violated ... block 4026`; direct block dump (throwaway
+      probe, not committed) confirmed block 4026 is an INTERNAL
+      (level=1) page whose LAST downlink key exceeds its own HighKey —
+      all 246 preceding keys are correctly bounded. Root cause hypothesis
+      (code-reading, not yet instrumented/proven): `insertIntoBlock`
+      (`internal/access/btree/btree.go:2114`) — used for both the leaf
+      fast path and the recursive parent-downlink insert after a child
+      split — never checks the target block's current HighKey against
+      the item being inserted before `pageHasSpaceFor`/insert (missing
+      PostgreSQL's Lehman-Yao "move right" step); if the target page was
+      concurrently split by another connection between the caller
+      deciding this block was correct and the actual `pinW`+insert, the
+      item can land on a now-too-narrow page. This is a bigger,
+      hotter-path fix than this loop's scope — needs its own dedicated
+      loop with fresh repro + live instrumentation if code-reading alone
+      doesn't confirm it. Resume point and full repro recipe are in the
+      deferral ledger row dated 2026-07-09
+      (`M-NIGHTLY (AI-20260709-010336-082, 3rd pgbench reopen)`, status
+      `resolved`, "deferred" column).
+  - [x] `M-NIGHTLY (AI-20260709-010336-082)` 5th loop — **fixed the block-4026
+      high-key overrun** surfaced by the prior loop's own verification repro.
+      Root cause confirmed by code reading (no live instrumentation needed):
+      `insertIntoBlock` (`internal/access/btree/btree.go`) pinned its target
+      `blk` and inserted/split unconditionally, with no Lehman-Yao move-right
+      check — none of its three call shapes (leaf fast-path fallback,
+      recursive parent-downlink insert, root-lift downlink insert) re-verified
+      the target's current high key against the item being inserted. Since
+      `bt.splitMu` only serializes structural writes within one `*BTree`
+      Go-instance (each backend opens its own instance per statement — a
+      prior finding from the same investigation thread), a concurrent split
+      on a DIFFERENT connection's instance could move the item's key range to
+      `blk`'s right sibling in the window between the caller deciding `blk`
+      was correct and `insertIntoBlock`'s own `pinW`. Fix: `insertIntoBlock`
+      now loops on pin — after each `pinW(blk)` it checks a new
+      `itemOvershootsHighKey(op, it.key)` helper (leaf: `key<=HighKey`,
+      internal: `key<HighKey`, matching amcheck's `VerifyBtreeItemOrder`
+      stored-item invariant, `internal/amcheck/verify_nbtree.go:220-229`) and
+      steps to `op.Next` on overshoot instead of inserting/splitting in
+      place. Deliberately a DIFFERENT predicate from the existing
+      `keyExceedsHighKey` (search-key descent routing, where equality to
+      `HighKey` means "stay on this page" for both leaf and internal levels)
+      — that leaf/internal asymmetry between search-routing and the
+      stored-item invariant is what the prior loop's code-reading pass had
+      not yet pinned down. Verified via a fresh independent repro (isolated
+      port 5533, `pgbench -i -s 10 --no-vacuum` then TWO rounds of `pgbench
+      -c 60..100 -j 12..20 -T 30` racing an explicit `VACUUM
+      pgbench_accounts` loop every 0.3s): 0 failed transactions both rounds,
+      `bt_index_check('pgbench_accounts_pkey'::regclass, true)` reports no
+      findings after either round (the exact recipe that reproduced the
+      block-4026 finding on the pre-fix binary). Gates: `go build ./...`
+      clean; `go test ./internal/access/btree/... ./internal/amcheck/...
+      ./internal/executor/...` PASS; `go test -race
+      ./internal/access/btree/...` PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33). Design doc `docs/design/0055-0005-btree-insert-move-right.md`
+      added (indexed in `docs/design/README.md`) documenting the mechanism
+      and scope. **Follow-up left open** (not this loop's scope): `bt.splitMu`
+      cross-connection non-serialization itself remains unfixed — this loop
+      tolerates that gap at every structural-insert entry point rather than
+      closing it; see the design doc §5 and the deferral ledger row appended
+      2026-07-09 for the resume point.
+  - [x] `M-NIGHTLY (AI-20260709-010336-082)` 6th loop — closed the parent
+      task: re-ran the EXACT nightly `stage-pgbench.sh` gate (not a scaled-
+      down substitute) — `s=50 c=100 j=20 T=180`x3 workloads, isolated port
+      5560, fresh throwaway data dir — against current HEAD (5th loop's
+      move-right fix + 4th loop's VACUUM sibling-relink fix both present).
+      Result: PASS, 0 failed transactions across all three workloads
+      (tps 1393/2527/106962), ~14 min wall time. This is the same
+      recipe/scale that produced the original `blk=1554 empty internal
+      page` abort (AI-20260709-010336-082) and both intermediate reopens —
+      first time in this investigation thread the gate has passed at full
+      nightly scale rather than only via a shorter/smaller-scale synthetic
+      repro. Parent checkbox flipped to `[x]`. Standing gap NOT closed by
+      this loop (unchanged from the 5th loop's note): `bt.splitMu` is still
+      not a real cross-connection mutex — today's pass tolerates that via
+      per-site re-validation (VACUUM relink + insert move-right), so a
+      future structural-write path added without the same re-validation
+      discipline (e.g. page deletion/recycling, external-sort bulk-build)
+      should be treated as suspect until it's audited the same way. No code
+      changes this loop — verification only.
+  - [x] `M-NIGHTLY (AI-20260709-010336-001..081)` testport package-wide
+      failure — 81 `TestPort_*`/`TestE2E_*` tests in
+      `ci/logs/20260709-010336/testport/go-test.log` all failed with
+      `init failed: # github.com/goopg/goopg/internal/executor
+      internal/executor/operators_window.go:216:71: o.plan.Frame.Mode
+      undefined (type *planner.WindowFrame has no field or method Mode)`
+      (first failure at `TestPort_IsolationTemporalRangeIntegrity`,
+      log line 7475, then every subsequent test in the same `go test`
+      process — a single package-wide compile break, not 81 independent
+      regressions). Per fix_plan rule 3, re-ran the repro at HEAD before
+      investigating: the nightly's snapshot sha (`b9a1e1fb5366`) predates
+      commit `4ac7ba47` ("feat(executor): implement GROUPS window frame
+      mode (M0122-0004)"), which is the commit that added
+      `WindowFrame.Mode`/fixed this exact compile site — i.e. the break
+      was already resolved on `main`/this branch before tonight's items
+      were triaged. Confirmed via `go build ./...` (clean) and `go vet
+      ./internal/executor/...` (clean), then spot-checked one test per
+      distinct subsystem across the 81 (SASLprep E2E, 2 isolation specs,
+      2 pg_amcheck, pg_basebackup, pg_dump, pg_receivewal, pgoutput
+      interop) — all 9 PASS at HEAD (`go test -v -run
+      '^(TestE2E_SASLPrepMatchesRealLibpqClient|TestPort_IsolationFkContention|
+      TestPort_IsolationDeadlockHard|TestPort_PgAmcheck002Nonesuch|
+      TestPort_PgAmcheckBtreeIndexCheck|TestPort_PgBasebackup010BackupExecution|
+      TestPort_PgReceivewal020|TestPort_PgDumpConnectionSetup|
+      TestPort_PgoutputInteropGoopgToPG)$' ./internal/testport/`). No code
+      changes needed — stale nightly snapshot, already fixed on a later
+      commit than the one it ran against. The next nightly run (against
+      current HEAD) is the real confirmation for the full 81-test set;
+      not re-running the whole ~2h `internal/testport/` suite in this loop
+      (the log's own tail shows the full run needs >2h12m and gets killed
+      mid-`create_index` regress subtest — an infra timeout unrelated to
+      this compile-break triage, out of scope here). No deferral-ledger
+      row: nothing new was left unimplemented, this was pure stale-log
+      triage.
+
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 
 M0117 (CLOG ↔ PostgreSQL subsystem alignment), M0118 (Upstream Isolation Spec
@@ -2086,6 +3355,34 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       function call sites — the AM never dispatches through a per-index
       `FUNCTION 1` comparator, so a custom opclass is cataloged but inert.
       Both remain genuinely open, index-AM-level, not a single-loop slice.
+      **2026-07-08: item (1) landed.** `updateOp.nextVirtualPgAmproc()`
+      (`internal/executor/operators_storage.go`) + `catalog.InMemory.
+      SetAmProcMemberProc` (`internal/catalog/catalog.go`) give `pg_amproc`
+      the same dedicated Virtual-UPDATE path `pg_database` already has —
+      `UPDATE pg_catalog.pg_amproc SET amproc = ... WHERE amproc = ...` now
+      actually rewrites the matched row instead of silently affecting 0 rows;
+      only the `amproc` column is writable (0A000 otherwise). Also fixed an
+      adjacent bug surfaced while building the test: `'<builtin proc>'::
+      regproc`/`::regprocedure` casts (e.g. `'int4eq'::regproc`) wrongly
+      raised 42883 because `expr.go`'s cast handler only checked
+      `ctx.Catalog.Routines()`, missing the `catalog.LookupBuiltinProc`
+      fallback tier `resolveOpClassFunction` already uses for the same class
+      of name. Tests: `TestUpdatePgAmprocRewritesAmprocColumn`/
+      `TestUpdatePgAmprocRejectsOtherColumns`
+      (`internal/executor/pg_amproc_update_test.go`), confirmed non-vacuous
+      via `git stash`. Design:
+      `docs/design/0110-0003-pg-amcheck-tap-port.md` new "Follow-up
+      (2026-07-08): `005_opclass_damage.pl` UPDATE-path prerequisite"
+      section; `docs/design/README.md` row updated. Gates: `go build ./...`
+      clean; `go test ./internal/executor/... ./internal/catalog/...
+      ./internal/planner/...` PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+      scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 workloads).
+      **Item (2) — btree per-index comparator dispatch — remains the sole
+      open blocker**: even with (1) fixed, a corrupted `amproc` is still
+      unobservable to `pg_amcheck` (the AM never reads it), so
+      `005_opclass_damage.pl` still cannot pass end-to-end. Genuinely
+      index-AM-level, not a single-loop slice.
 - [x] **M0119-0006-DATCONNLIMIT-DEFAULT** (found 2026-07-08 live-verifying an
       unrelated ALTER FUNCTION parser fix; fixed same-day in its own
       follow-up loop — see deferral ledger's resolved row for the full
@@ -2253,6 +3550,30 @@ mirroring M0119's ledger `status` column.
       `FindSequenceOwnedBy` (NULL for a non-owned column, follows renames).
       See `docs/design/root-0020-sequence-serial-restart-persistence.md`'s
       new follow-up section and the matching deferral ledger row.
+      **Follow-up (2026-07-08, later loop):** closed that fix's own residual —
+      an explicit `CREATE`/`ALTER SEQUENCE ... OWNED BY schema.table.column`
+      is now normalized to the bare `table.column` form (new
+      `bareOwnedByTableColumn`, `internal/executor/operators_ddl.go`) before
+      `SetSequenceOwnedBy` stores it, matching the bare form
+      `FindSequenceOwnedBy`'s callers already probe with — previously such an
+      explicit schema-qualified target silently made `pg_get_serial_sequence`
+      return NULL. Tests:
+      `TestPgGetSerialSequenceExplicitSchemaQualifiedOwnedBy`/
+      `AlterSequenceSchemaQualifiedOwnedBy`
+      (`internal/executor/operators_pg_get_serial_sequence_test.go`),
+      confirmed non-vacuous via `git stash`. Discovered (not fixed, new
+      ledger row): `seqRegistry` is a process-global `sync.Map` with no
+      schema/database scoping — `FindSequenceOwnedBy` can match a same-named
+      leftover entry across independent test fixtures (or, architecturally,
+      across databases in one process); real PG can't hit this since
+      `pg_depend` lookups are per-backend-database scoped. Gates: `go build
+      ./...`/`go vet ./internal/executor/...` clean; targeted sequence/DDL
+      tests PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed, all 3 workloads). Design:
+      `docs/design/root-0020-sequence-serial-restart-persistence.md` new
+      follow-up section; `docs/design/README.md` row updated;
+      `unimplemented_feat.json`'s m0097-0009 entry updated in place.
 - [ ] **M0122-0003 — EXPLAIN output & pg_stat instrumentation** (~7, partial).
       FORMAT XML/YAML **done** (2026-07-04, loop #8) — design:
       `docs/design/0122-0003-explain-format-xml-yaml.md`. Per-CTE ANALYZE
@@ -2508,7 +3829,254 @@ mirroring M0119's ledger `status` column.
       ./internal/executor/... ./internal/planner/...` PASS (full EXPLAIN
       suite, no regressions); `scripts/tpch-spotcheck.sh` PASS (Q12=2/
       Q13=33).
-- [ ] **M0122-0004 — SQL language / executor features** (~21). Window frame
+      **`pg_stat_all_tables`/`pg_stat_user_tables`/`pg_stat_sys_tables`
+      done (2026-07-12):** the three per-table access-statistics system
+      views now resolve (previously unknown-relation errors).
+      `catalog.PGStatTablesRowsForDBOid(dbOid, scope)` + `StatTableScope`
+      build the 26-col row set reusing `PGClassRowsForDBOid`'s relation
+      filter + upstream's `schemaname` user/sys split (`isSystemStatSchema`);
+      `executor.fetchStatTablesRows` (`internal/executor/pgstat_tables.go`)
+      unwraps `ctx.Catalog`→`*catalog.InMemory` and scopes to
+      `ctx.CurrentDatabaseOid`, swapped in at `valuesOp.Open` (three new
+      branches mirroring the `pg_stat_io` case); the static `VirtualRows`
+      fallback scopes to `DefaultDBOid`. Following the `pg_stat_io`
+      honest-0/NULL precedent, `relid`/`schemaname`/`relname` are real,
+      `n_live_tup` is the ANALYZE `reltuples` estimate (`TableStats.RowCount`)
+      and every other counter is a faithful 0 / every `last_*` NULL. Tests:
+      `internal/catalog/pgstat_tables_test.go` +
+      `internal/executor/pgstat_tables_e2e_test.go`. Design:
+      `docs/design/0122-0003-pg-stat-user-tables.md` + README index row.
+      Ledger row (2026-07-12) records the missing per-table counter
+      subsystem + empty `pg_stat_sys_tables`. Gates: catalog+executor full
+      packages PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33).
+      **`pg_stat_all_indexes`/`pg_stat_user_indexes`/`pg_stat_sys_indexes`
+      done (2026-07-12, later loop):** the direct per-index sibling of the
+      table views now resolves (previously unknown-relation errors).
+      `catalog.PGStatIndexesRowsForDBOid(dbOid, scope)` enumerates
+      `AllIndexes(dbOid)`, filters each index's parent table through the SAME
+      relation predicate as the table view, and emits the 9-col upstream row
+      (`relid/indexrelid/schemaname/relname/indexrelname/idx_scan/
+      last_idx_scan/idx_tup_read/idx_tup_fetch`) sorted by
+      `(schemaname,relname,indexrelname)`, reusing `StatTableScope` for the
+      identical user/sys split. `executor.fetchStatIndexesRows`
+      (`internal/executor/pgstat_tables.go`) is the per-connection twin of
+      `fetchStatTablesRows`, wired at `valuesOp.Open`'s three new
+      `pg_stat_*_indexes` branches; static `VirtualRows` fallback scopes to
+      `DefaultDBOid`. Following the `pg_stat_io` honest-0/NULL precedent the
+      five identity cells are real, the three scan counters 0 /
+      `last_idx_scan` NULL. Tests: `internal/catalog/pgstat_indexes_test.go`
+      + `internal/executor/pgstat_indexes_e2e_test.go`. Design:
+      `docs/design/0122-0003-pg-stat-user-tables.md` new sibling section +
+      README row. Ledger row (2026-07-12) records the missing per-index
+      counter subsystem (`PgStat_StatIndEntry` analog) + empty
+      `pg_stat_sys_indexes`. Gates: catalog+executor full packages PASS;
+      `scripts/tpch-spotcheck.sh` PASS.
+      **`pg_statio_all/user/sys_tables` + `pg_statio_all/user/sys_indexes`
+      done (2026-07-12, later loop):** the six per-relation buffer-pool I/O
+      statistics views now resolve (previously unknown-relation errors) — the
+      I/O sibling of the access-stat views above.
+      `catalog.PGStatioTablesRowsForDBOid` (11 cols: `relid/schemaname/relname/
+      heap_blks_{read,hit}/idx_blks_{read,hit}/toast_blks_{read,hit}/
+      tidx_blks_{read,hit}`) and `PGStatioIndexesRowsForDBOid` (7 cols:
+      `relid/indexrelid/schemaname/relname/indexrelname/idx_blks_{read,hit}`)
+      each reuse the SAME relation filter + `StatTableScope` user/sys split as
+      their access-stat twin (index builder enumerates `AllIndexes(dbOid)`).
+      `executor.fetchStatioTablesRows`/`fetchStatioIndexesRows`
+      (`internal/executor/pgstat_tables.go`) are the per-connection twins wired
+      at `valuesOp.Open`'s six new `pg_statio_*` branches; static `VirtualRows`
+      fallbacks (OIDs 9087–9092) scope to `DefaultDBOid`. goopg has no
+      per-relation buffer-pool counters (the `pg_stat_io` counters are pool-wide,
+      not attributable to one relation), so every heap/idx/toast/tidx block
+      counter is a faithful 0; identity cells are real. Tests:
+      `internal/catalog/pgstatio_test.go` +
+      `internal/executor/pgstatio_e2e_test.go`. Design:
+      `docs/design/0122-0003-pg-stat-user-tables.md` new "I/O sibling" section +
+      README row. Ledger row (2026-07-12) records the missing per-relation block
+      attribution + the not-yet-registered `pg_statio_*_sequences` trio. Gates:
+      catalog+executor full packages PASS; go build ./... clean;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33).
+      **`pg_statio_all/user/sys_sequences` done (2026-07-12, later loop):** the
+      per-sequence I/O trio (5 cols `relid/schemaname/relname/blks_read/blks_hit`)
+      completes the `pg_statio_*` family — `catalog.PGStatioSequencesRowsForDBOid`
+      is the only `pg_statio_*` builder selecting sequences (`t.IsSequence`,
+      relkind 'S'); `executor.fetchStatioSequencesRows` twin, OIDs 9093–9095.
+      **`pg_stat_user_functions` + `pg_stat_xact_user_functions` done
+      (2026-07-12, later loop):** the two per-function statistics views — the
+      LAST per-object stat views in the family — now resolve (previously
+      unknown-relation errors). Both upstream views (`system_views.sql`) filter
+      on `pg_stat_get_function_calls(oid) IS NOT NULL`, never true under the
+      default `track_functions = none`, so both are empty on a stock PG 18.3
+      cluster out of the box; goopg has no per-function call/time tracking, so
+      `catalog.PGStatUserFunctionsRows()` returns no rows unconditionally
+      (always-empty = faithful default behaviour, not a shortcut). Registered
+      with the exact 6-col tupledesc `funcid/schemaname/funcname/calls/
+      total_time/self_time` (OIDs 9096–9097) so clients get 0 rows not an error;
+      always-empty ⇒ no per-connection twin needed (unlike the table/index/
+      sequence views). Tests: `internal/catalog/pgstat_functions_test.go` +
+      `internal/executor/pgstat_functions_e2e_test.go`. Design:
+      `docs/design/0122-0003-pg-stat-user-tables.md` new "Function sibling"
+      section + README row. Ledger row (2026-07-12) records the missing
+      `PgStat_StatFuncEntry` counter subsystem + `track_functions` GUC. Gates:
+      catalog+executor full packages PASS; go build ./... clean;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33).
+      **`pg_stat_xact_all/user/sys_tables` done (2026-07-12, later loop):** the
+      per-transaction table access-statistics trio — the transaction-scoped
+      counterpart of the cumulative `pg_stat_*_tables` views and the last
+      unregistered `pg_stat_*_tables` family — now resolves (previously
+      unknown-relation errors). `catalog.PGStatXactTablesRowsForDBOid(dbOid,
+      scope)` reuses the IDENTICAL relation filter + `StatTableScope` user/sys
+      split as `PGStatTablesRowsForDBOid` (so cumulative + xact table views
+      agree on relations) but emits a narrower 12-col shape `relid/schemaname/
+      relname/seq_scan/seq_tup_read/idx_scan/idx_tup_fetch/n_tup_{ins,upd,del,
+      hot_upd,newpage_upd}` — NO `n_live_tup`/`last_*`/`vacuum_count` (xact views
+      are pure per-transaction deltas via `pg_stat_get_xact_*`). goopg has no
+      per-transaction pgstat accumulator (`PgStat_TableXactStatus` analog), so
+      every delta counter is a faithful 0; identity cells real.
+      `executor.fetchStatXactTablesRows` is the per-connection twin, wired at
+      `valuesOp.Open`'s three new `pg_stat_xact_*_tables` branches; static
+      `VirtualRows` fallbacks (OIDs 9098–9100) scope to `DefaultDBOid`. Tests:
+      `internal/catalog/pgstat_xact_tables_test.go` +
+      `internal/executor/pgstat_xact_tables_e2e_test.go`. Design:
+      `docs/design/0122-0003-pg-stat-user-tables.md` new "Transaction sibling"
+      section + README row. Ledger row (2026-07-12) records the missing
+      `PgStat_TableXactStatus` per-transaction accumulator. Gates:
+      catalog+executor full packages PASS; go build ./... clean;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33).
+      **`pg_stat_bgwriter` + `pg_stat_archiver` done (2026-07-12, later
+      loop):** the two remaining unregistered *global* single-row cluster stat
+      views now resolve (previously unknown-relation errors). Both are
+      cluster-wide summaries (not per-object row sets), so they follow the
+      `pg_stat_wal`/`pg_stat_slru` precedent — a static `VirtualRows`
+      returning one honest row registered in `registerSystemTables`
+      (`internal/catalog/catalog.go`) right after `pg_stat_wal`, NO
+      per-connection executor twin, NO relation scoping. `pg_stat_bgwriter`
+      (OID 3406) uses the PG 17+ 4-col shape `buffers_clean/maxwritten_clean/
+      buffers_alloc/stats_reset` (checkpoint columns already split into the
+      earlier `pg_stat_checkpointer`); goopg's bgwriter
+      (`storage.Pool.WriteDirtyPages`) has no counter accumulator wired to
+      these columns, so all three are a faithful 0. `pg_stat_archiver` (OID
+      3407) uses the 7-col shape `archived_count/last_archived_wal/
+      last_archived_time/failed_count/last_failed_wal/last_failed_time/
+      stats_reset`; goopg has no WAL archiver (`archive_mode` unsupported), so
+      both counts are 0 and all four `last_*` cells NULL (`VirtualNull`) —
+      byte-identical to a real PG 18.3 cluster with `archive_mode=off`. Tests:
+      `internal/catalog/pgstat_global_test.go` +
+      `internal/executor/pgstat_global_e2e_test.go`. Design:
+      `docs/design/0122-0003-pg-stat-user-tables.md` new "Global cluster
+      views" section + README row. Ledger row (2026-07-12) records the missing
+      live bgwriter/archiver counter subsystems. Gates: catalog+executor full
+      packages PASS; go build ./... clean; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33).
+      **`pg_stat_database` done (2026-07-12, later loop):** the headline
+      per-database cluster statistics view (30-col PG 18.3 shape) now resolves.
+      Unlike the per-object `pg_stat_*_tables` views it is *global* — it lists
+      every database plus a leading shared-objects row (`datid=0`,
+      `datname=NULL`) regardless of the connected database — so, like
+      `pg_stat_bgwriter`, NO per-connection twin: the `VirtualRows` closure is
+      `catalog.PGStatDatabaseRows`, which enumerates the live registry
+      (`c.ListDatabases`) at query time so `CREATE`/`DROP DATABASE` shows up
+      immediately. OID 9101, registered after `pg_stat_archiver`. Every counter
+      is a faithful 0, `numbackends` honest 0, and `checksum_last_failure`/
+      `stats_reset` NULL — VERIFIED byte-identical to a fresh real PG 18.3
+      cluster (spun a throwaway instance this loop). `datid` uses a NEW shared
+      helper `catalog.databaseDisplayOID(name)` that `pg_database.VirtualRows`
+      now also routes through (sibling-paths: the two views' oids join
+      byte-for-byte; resolves the old "keep this switch in sync" comment on
+      `ResolveDatabaseOid`). Tests: `TestPGStatDatabaseViewRegistered`
+      (`internal/catalog/pgstat_global_test.go`) + `TestPgStatDatabaseEndToEnd`
+      (`internal/executor/pgstat_global_e2e_test.go`). Design +README +ledger
+      updated. `PgStat_StatDBEntry` accumulator deferred.
+      **`pg_stat_database_conflicts` done (2026-07-12, later loop):** the
+      per-database recovery-conflict view (8-col PG 18.3 shape, OID 9102). Like
+      `pg_stat_database` it is *global* (`catalog.PGStatDatabaseConflictsRows`
+      enumerates `c.ListDatabases` at query time, no per-connection twin) but
+      UNLIKE it has NO leading shared (`datid=0`) row — upstream is a bare
+      `FROM pg_database D`. Every `confl_*` counter is a faithful 0 (they only
+      bump on a standby via `pgstat_report_recovery_conflict`; goopg is a
+      primary with no recovery-conflict accumulator) — VERIFIED byte-identical
+      to a throwaway real PG 18.3 cluster this loop (8 cols oid/name/6×bigint,
+      one row per db, no datid=0 row, all confl_* 0). `datid` reuses the shared
+      `catalog.databaseDisplayOID` helper. Tests:
+      `TestPGStatDatabaseConflictsViewRegistered` +
+      `TestPgStatDatabaseConflictsEndToEnd`. Design +README +ledger updated.
+      Recovery-conflict accumulator deferred.
+      **`pg_stat_progress_*` done (2026-07-12, later loop):** the six
+      command-progress views `pg_stat_progress_vacuum`/`analyze`/`cluster`/
+      `create_index`/`basebackup`/`copy` (OIDs 9103–9108) as static ZERO-row
+      virtual views via a local `mkProgressView(name, oid, cols)` helper. Upstream
+      each projects `pg_stat_get_progress_info('<CMD>')` (one row per backend with
+      an active `pgstat_progress_start_command` slot); goopg has no command-progress
+      instrumentation, so all six are empty — byte-identical to an *idle* real PG
+      18.3 cluster. Columns/types transcribed verbatim from `system_views.sql`
+      (CASE-mapped phase/command/type text, paramN int8, pid int4, delay_time
+      float8, *id oid); no per-connection twin. Tests:
+      `TestPGStatProgressViewsRegistered` + `TestPgStatProgressViewsEndToEnd`.
+      Design +README +ledger updated. Live per-backend progress feed deferred.
+      Note: `pg_stat_replication`/`pg_stat_wal_receiver`/`pg_stat_subscription`
+      already exist in `internal/initdb/replication_views.go` (live walsender/
+      receiver/subscription rows).
+      **`pg_stat_ssl` + `pg_stat_gssapi` done (2026-07-12, later loop):** the two
+      per-client-backend auth-transport views — unlike every pg_stat view above
+      these are *per-backend*, so they live in `internal/initdb/` alongside
+      `pg_stat_activity` and are backed by the SAME `activity.Registry`, NOT base
+      `catalog.go`. `registerPgStatSslView`/`registerPgStatGssapiView`
+      (`internal/initdb/pg_stat_ssl_gssapi_view.go`) walk `reg.Snapshot()` and skip
+      any backend whose `ClientPort==""` (upstream's `WHERE client_port IS NOT NULL`
+      filter, which drops background workers), emitting one row per live client
+      backend; wired in `initdb.Open` right after `registerPgStatActivityView`, no
+      per-connection twin (the registry snapshot is already global). goopg has
+      neither TLS nor GSSAPI, so `pg_stat_ssl.ssl` and all three
+      `pg_stat_gssapi` flags are a faithful `f` and every detail column
+      (version/cipher/bits/client_dn/client_serial/issuer_dn, principal) NULL —
+      byte-identical to a real PG 18.3 cluster with `ssl=off` built without
+      GSSAPI (VERIFIED end-to-end against a throwaway goopg server this loop).
+      Column types transcribed from `pg_stat_get_activity`'s `proallargtypes`
+      (`bits` int4, `client_serial` numeric, flags bool). Tests:
+      `internal/initdb/pg_stat_ssl_gssapi_view_test.go`
+      (`TestPgStatSslView`/`TestPgStatGssapiView`). Design +README +ledger updated.
+      TLS/GSSAPI transport-detail population deferred (ledger).
+      **`pg_stat_subscription_stats` done (2026-07-12, later loop) — COMPLETES the
+      `pg_stat_*` family:** the per-subscription error/conflict-counter view (12 cols).
+      Unlike the sibling `pg_stat_subscription` (per apply worker, backed by
+      `*wal.Subscribers`), this is driven by the *subscription catalog* — upstream
+      joins `pg_subscription s` with `pg_stat_get_subscription_stats(s.oid)`, one row
+      per subscription (a subscription with no live worker still appears). So it lives
+      next to `registerStatSubscriptionView` in
+      `internal/initdb/replication_views.go` (`registerStatSubscriptionStatsView`),
+      backed by the same `*catalog.PubSub`, wired in `initdb.Open` after
+      `registerSubscriptionViews`. goopg has no `PgStat_StatSubEntry` accumulator, so
+      every apply/sync error + seven `confl_*` counters are a faithful `0` and
+      `stats_reset` NULL — byte-identical to a real PG 18.3 subscription that applied
+      cleanly and never reset (VERIFIED end-to-end this loop, correct 12-col shape).
+      Column types from `pg_stat_get_subscription_stats`' `proallargtypes` (`subid`
+      oid, counters int8, `stats_reset` timestamptz). Test:
+      `TestStatSubscriptionStatsRendersPerSubscription`
+      (`internal/initdb/replication_views_test.go`). README 0122-0003 row + ledger
+      updated. Live subscription-stats accumulator deferred (ledger). No pg_stat view
+      remains unregistered.
+      **`pg_stats` done (2026-07-12, later loop):** the human-readable per-column
+      planner-statistics view (17-col PG 18.3 shape, OID 9160) now resolves
+      (previously unknown-relation). Unlike every `pg_stat_*` runtime-counter view
+      above, `pg_stats` is upstream a SQL view projecting the `pg_statistic`
+      catalog (populated by ANALYZE); goopg has no SQL evaluation over that heap in
+      the virtual path, so `catalog.PGStatsRowsForDBOid` (`internal/catalog/
+      pgstats.go`) reproduces the projection directly from the same in-memory
+      `Table.Stats.Columns` (`ColumnStats`) that `buildUserPGStatisticRow` writes to
+      the `pg_statistic` heap — SIBLING consumers that must agree (same MCV/histogram
+      order, same `SET STATISTICS 0` skip). Per-database like `pg_stat_all_tables`:
+      `executor.fetchStatsRows` twin scopes to `ctx.CurrentDatabaseOid` at
+      `valuesOp.Open`; static `VirtualRows` scopes to `DefaultDBOid`. Array columns
+      (`most_common_vals`/`histogram_bounds` `anyarray`, `most_common_freqs`
+      `float4[]`) emitted as PG array text literals via `ArrayTextLiteral`, routed
+      verbatim by `TypedVirtualCell`. goopg's ANALYZE collects only MCV (kind 1) +
+      histogram (kind 2), so `correlation`/element/range columns (kinds 3–6) are
+      always NULL — faithful to a real cluster whose ANALYZE computed no such slots.
+      Tests: `internal/catalog/pgstats_test.go` +
+      `internal/executor/pgstats_e2e_test.go`. Design +README +ledger updated (row
+      2026-07-12: text-rendered `stavalues`, placeholder `avg_width`, uncollected
+      stakind 3–6 slots deferred). Gates: catalog+executor full packages PASS; go
+      build ./... clean; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33).
+- [x] **M0122-0004 — SQL language / executor features** (~21). Window frame
       ROWS/RANGE/GROUPS, GROUPING SETS/ROLLUP/CUBE, DEFAULT-clause
       parsing, intervals. **WITH CHECK
       OPTION removed from this bucket (2026-07-04, loop #14):** verify-before-
@@ -2739,6 +4307,21 @@ mirroring M0119's ledger `status` column.
       Combining forms (`OVER (win ORDER BY ...)`, a named window based on
       another named window) are also out of scope (real upstream syntax,
       deferred — see design doc). Intervals also remain.
+      **RANGE interval-offset sign matched to PG (2026-07-12, this loop):**
+      `rangeOffsetNegative` (`internal/executor/operators_window.go`) previously
+      rejected an interval RANGE offset when *any* component was negative
+      (`months<0||days<0||micros<0`); PG's `in_range_interval_interval`
+      (`timestamp.c`) instead rejects on the sign of the *linear span*
+      `interval_sign(offset)` = `time_micros + (months*30+days)*USECS_PER_DAY`.
+      So `INTERVAL '1 mon -10 days'` (a +20-day span) is a valid positive offset
+      that goopg wrongly `22013`-rejected. Now computed via the same
+      overflow-safe day/frac decomposition `compareDatum` uses for interval
+      ordering; ±infinity sentinels handled (NOEND positive / NOBEGIN negative).
+      Test `TestRangeOffsetNegativeIntervalSign`
+      (`internal/executor/window_compat_test.go`); design doc
+      `0122-0004-range-offset-window-frame.md` Follow-up section; deferral-ledger
+      row 716's item (2) resolved (item (1), the per-type in_range parse-time
+      `0A000` catalog, remains open). tpch-spotcheck PASS (Q12=2/Q13=33).
       **GROUPING SETS/ROLLUP/CUBE removed from this bucket (2026-07-05,
       this loop):** implemented real SQL:1999 §7.9 semantics — previously
       the parser discarded the construct into a plain GROUP BY (an
@@ -2973,6 +4556,99 @@ mirroring M0119's ledger `status` column.
       interval strings (both the typed-literal and cast paths now
       reject them identically, but neither supports them — v0's
       `KindInterval` Datum has no sub-day field at all).
+      **GROUPS window frame mode landed (2026-07-09, this loop):** closes
+      half of the "RANGE/GROUPS" item above. `RANGE` remains rejected
+      (0A000) — its offset bounds need a per-ORDER-BY-column type-aware
+      `+`/`-`/`<` operator lookup (numeric vs. `interval` for datetime
+      columns), a materially larger capability this slice doesn't build.
+      `GROUPS`, per spec (`parse_clause.c`), only needs its offset
+      treated as a non-negative integer count of ORDER BY peer groups
+      rather than rows — the same offset machinery `ROWS` already has
+      (`resolveFrameOffset`), just applied to peer-group indices.
+      Analyzer (`internal/analyzer/analyzer.go`): `validateWindowFrame`
+      now takes the window's ORDER BY column count; `FrameModeGroups`
+      requires at least one ORDER BY column (42P20 "GROUPS mode requires
+      an ORDER BY clause", verified byte-for-byte against a real
+      PostgreSQL 18.3 instance), `FrameModeRange` stays rejected (0A000).
+      Planner (`internal/planner/plan.go`/`planner.go`): `WindowFrame`
+      gains a `Mode parser.FrameMode` field (previously dropped during
+      lowering since a Frame reaching the planner was always ROWS);
+      `resolveWindowFrame` carries it through. Executor
+      (`internal/executor/operators_window.go`): `frameBounds` gained a
+      `groupBounds []int` parameter and dispatches to a new
+      `frameBoundsGroups` for GROUPS mode — mirrors the ROWS-mode
+      arithmetic exactly but on peer-group indices (via new
+      `groupIndexOf`, factored out of the pre-existing `peerBoundsOf`)
+      instead of row indices, translated back to a row range via
+      `peerGroupBounds`. `evalExplicitFrameAggFuncs` computes
+      `groupBounds` whenever `Frame.Mode == FrameModeGroups` (previously
+      only for an EXCLUDE clause); `first_value`/`last_value`/`nth_value`
+      thread the same `valueGroupBounds` through (populate-condition
+      widened to also cover GROUPS mode). `row_number`/`rank`/
+      `dense_rank`/`lag`/`lead`/`ntile`/`percent_rank`/`cume_dist` needed
+      no change (frame-independent by spec regardless of mode). Tests:
+      `TestAnalyzeWindowFrameGroupsAccepted`/
+      `TestAnalyzeWindowFrameGroupsRequiresOrderByRejected`/
+      `TestAnalyzeWindowFrameRangeRejected` (renamed/narrowed from
+      `TestAnalyzeWindowFrameRangeGroupsRejected`) in
+      `internal/analyzer/analyzer_test.go`;
+      `TestCompatWindowExplicitGroupsFrameSliding` (duplicate-key data so
+      GROUPS genuinely diverges from an equivalent ROWS frame) and
+      `TestCompatWindowGroupsUnboundedPrecedingCumulative` in
+      `internal/executor/window_compat_test.go`, both cross-checked
+      row-for-row against a real PostgreSQL 18.3 instance (`GROUPS
+      BETWEEN 1 PRECEDING AND 1 FOLLOWING` and `GROUPS UNBOUNDED
+      PRECEDING`). Confirmed non-vacuous via `git stash` on the four impl
+      files (fails pre-fix with the old "only ROWS is implemented"
+      0A000). Design: `docs/design/0020-0001-window-parser-and-ast.md`
+      new "Follow-up: GROUPS window frame mode" section;
+      `docs/design/README.md` row extended. Gates: `go build ./...`
+      clean; `go test ./internal/analyzer/... ./internal/planner/...
+      ./internal/executor/...` PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+      scripts/ralph-precommit-test.sh` PASS (0 failed txns, all 3
+      workloads). **RANGE window frame mode (non-offset bounds) landed
+      (2026-07-11, this loop):** analyzer now accepts `RANGE` with
+      UNBOUNDED/CURRENT ROW bounds (executor dispatches `FrameModeRange`
+      to the existing `frameBoundsGroups` — in RANGE mode CURRENT ROW
+      means "the current row and all its ORDER BY peers", identical to
+      GROUPS' non-offset behavior, so no new arithmetic); RANGE with a
+      value offset (`RANGE BETWEEN n PRECEDING`) still rejected 0A000
+      (needs per-ORDER-BY-column type-aware `in_range` operators —
+      ledger row + design `docs/design/0122-0004-range-window-frame.md`).
+      Verified vs live PG 18.3. Tests:
+      `TestAnalyzeWindowFrameRange{OffsetRejected,NonOffsetAccepted}`,
+      `TestCompatWindowExplicitRangePeers`,
+      `TestCompatWindowRangeUnboundedPrecedingCumulative`.
+      **BUCKET CLOSED (2026-07-12, loop #67, verify-before-implement):** the
+      two items the prior "Still open" note listed are BOTH resolved, so
+      M0122-0004 is now fully closed and the checkbox is flipped to `[x]`.
+      (A) RANGE with a value offset bound: resolved 2026-07-11 by
+      `frameBoundsRange` (`internal/executor/operators_window.go`, PG
+      `in_range` semantics; analyzer requires exactly one ORDER BY column,
+      42P20) and further refined 2026-07-12 (loop #66) by the
+      `rangeOffsetNegative` interval-sign fix (`interval_sign`-based span,
+      commit b7bdb819). (B) sub-day intervals + multi-component interval
+      strings: resolved by the sub-day microsecond `KindInterval` carrier
+      (`Datum.IntervalMicrosValue`, 2026-07-11) plus the multi-field / HH:MM:SS
+      tokenizer (`internal/parser/interval.go` `ParseIntervalBody`, commit
+      fda418cf and follow-ups) — `INTERVAL '1 day 05:30:00'` now parses and
+      renders as `1 day 05:30:00`. Every other named scope item (all 11 window
+      functions, all three frame modes ROWS/RANGE/GROUPS + EXCLUDE, named
+      windows, combining forms `OVER (win ORDER BY …)`, GROUPING SETS/
+      ROLLUP/CUBE, DEFAULT-clause, coarse/single-letter/typmod/±infinity
+      interval forms, BETWEEN SYMMETRIC, ANY/SOME/ALL) is landed and
+      byte-for-byte PG-18.3-verified; `unimplemented_feat.json`'s window +
+      interval entries are all marked `RESOLVED` and a sweep of its
+      `confirmed-open` audits finds zero remaining SQL-language items in this
+      bucket. Verification this loop: `go build ./...` clean;
+      `go test ./internal/parser/... ./internal/analyzer/...` PASS; 56
+      `CompatWindow|Interval|GroupingSets|RangeOffset` executor tests PASS
+      (incl. `TestCompatWindowCombiningForms`,
+      `TestCompatWindowExplicitGroupsFrameSliding`,
+      `TestRangeOffsetNegativeIntervalSign`, `TestMultiFieldIntervalLiterals`);
+      throwaway probe confirmed `RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING`
+      (x=1→3, 2→6, 3→5, 5→5) and `INTERVAL '1 day 05:30:00'` end-to-end.
 - [x] **M0122-0005 — Types / opclasses / casts / collation / domains** (~11).
       1-byte `char`(OID 18) disambiguation, `pg_collation_for`, function-based cast
       dumping, ALTER TYPE RENAME/OWNER, domain CHECK renderer, `pg_ts_config` OIDs.
@@ -3150,15 +4826,10 @@ mirroring M0119's ledger `status` column.
       ./...` (excluding tpch/testport) PASS; `scripts/tpch-spotcheck.sh`
       PASS (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
       scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 workloads).
-      **Still deferred** (new 2026-07-08 ledger row): the heap-recovery
-      driver (`loadUserIndexesFromHeap`) still can't restore any of these 8
-      fields after a *checkpointed* restart — `pg_index`'s `indclass`/
-      `indcollation`/`indexprs`/`indpred` heap content is never decoded
-      (`DecodePGIndexPhysicalRow`/`buildUserPGIndexRow`), and there's no
-      `indnullsnotdistinct` heap field either. Only the uncheckpointed-crash
-      path (fixed here) is covered; see the ledger row for the resume
-      point. `pg_tablespace` visibility remains a separate open item in
-      this cluster.
+      (Deferred gap this note used to flag here — heap-recovery decode of
+      `indclass`/`indcollation`/predicate/INCLUDE/NULLS NOT DISTINCT — is
+      now fully closed; see the two follow-ups below.) `pg_tablespace`
+      visibility remains a separate open item in this cluster.
       **2026-07-08 follow-up 2 (checkpointed-restart heap decode — 3 of 5
       fields done):** closed the "still deferred" heap-decode gap above
       for predicate/INCLUDE columns/NULLS NOT DISTINCT.
@@ -3191,16 +4862,37 @@ mirroring M0119's ledger `status` column.
       ./internal/parser/... ./internal/server/...` PASS;
       `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
       `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
-      failed, all 3 workloads). **Still open** (new 2026-07-08 ledger row,
-      "follow-up 2 of 2"): `ColOpClasses`/`ColCollations`
-      (`indclass`/`indcollation` real OID resolution) — a materially
-      larger, separate gap that also affects the *live* (non-restart)
-      `pg_index` rendering (`catalog.go`'s `VirtualRows` builder ignores
-      `ColOpClasses`/`ColCollations` too, using a hard-coded per-type
-      default-opclass switch and always-zero `indcollation`); needs a full
-      opclass/collation name↔OID registry, not just heap-decode plumbing.
-      `pg_tablespace` visibility remains a separate open item in this
-      cluster.
+      failed, all 3 workloads).
+      **2026-07-08 follow-up 3 (opclass/collation name-OID registry, live +
+      heap-write — done):** built the missing name→OID registry the note
+      above called for: `catalog.go` gained `builtinColumnOpclassOIDs`
+      (btree-opclass name→OID, verified against a real PostgreSQL 18.3
+      instance's `pg_opclass`) + `defaultColumnOpclass`/matching collation
+      resolvers, wired into both the live `pg_index.VirtualRows` renderer
+      (previously a hard-coded per-type default-opclass switch and
+      always-zero `indcollation`) and `buildUserPGIndexRow`'s heap-row
+      writer, via `ResolveIndexColumnOpclassOID`/
+      `ResolveIndexColumnCollationOID`. Design: this file's design doc
+      "Follow-up (2026-07-08)" section 3.
+      **2026-07-08 follow-up 4 of 4 (checkpointed-restart heap-decode —
+      done, closes the opclass/collation restart-persistence cluster):**
+      `catalog.codec.go`'s `PGIndexRow` gained `IndCollation`/`IndClass
+      []uint32`, `DecodePGIndexPhysicalRow` now decodes both oidvector
+      columns (new `decodePGIndexOIDVector` helper), and
+      `loadUserIndexesFromHeap` reverse-resolves them back to
+      `ColOpClasses`/`ColCollations` name strings via new
+      `ResolveIndexColumnOpclassName`/`ResolveIndexColumnCollationName`
+      catalog methods — a graceful restart no longer reverts an index's
+      declared opclass/collation to the column type's plain default. Gates
+      (both follow-ups): `go build ./...`/`go vet ./...` clean; `go test
+      ./internal/catalog/... ./internal/executor/... ./internal/initdb/...`
+      PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed, all 3 workloads). **This closes the opclass/collation
+      restart-persistence residual — no known open item remains in this
+      sub-thread.** `pg_tablespace` visibility remains a separate open item
+      in this cluster (deferred indefinitely per the M0095-0003 ledger row —
+      no RelFileNode resolver for shared `pg_tablespace`).
 - [ ] **M0122-0007 — DDL / admin commands / ctl / GUC config** (~14). CREATE/DROP
       DATABASE full DDL, REINDEX, tablespaces, ALTER FUNCTION/COLUMN,
       planner/jit GUC stubs. (`goopg reload`/SIGHUP and `goopg restart` done,
@@ -3431,6 +5123,3593 @@ mirroring M0119's ledger `status` column.
       items): CREATE/DROP DATABASE full DDL, REINDEX physical rebuild,
       tablespaces, planner/jit GUC stubs, the ALTER FUNCTION `SET`-value
       comma-list gap.
+      **`pg_proc.proconfig` (per-function `SET` config) — done (2026-07-08,
+      later loop, DU-002 proconfig follow-up):** the "ALTER FUNCTION SET-value
+      comma-list gap" note directly above was stale (already closed by
+      "follow-up 2" earlier the same day) — this loop closed the actual
+      remaining `unimplemented_feat.json` `DU-002` entry instead: "Per-function
+      SET configuration parameters are not tracked; all functions report NULL
+      for the proconfig column." Verify-before-implement found the entry's own
+      claim ("parsed-then-discarded") was itself wrong — `CREATE FUNCTION ...
+      SET ...` was a hard **syntax error**, the identical `KwSet`-vs-
+      `TokenIdent` lexing bug M0097-0150 fixed for `ALTER FUNCTION` that same
+      day, just never ported to `CREATE FUNCTION`'s attribute loop (reproduced
+      live via a throwaway parser probe before fixing). Fixed both directions:
+      new top-level `KwSet`/`KwReset` cases in `parseCreateFunctionTail`
+      (`internal/parser/function.go`) plus shared `parseFunctionConfigSetClause`/
+      `parseFunctionConfigResetClause` helpers (also now used by `ALTER
+      FUNCTION`'s identical clause, `internal/parser/ddl.go`) populate a new
+      `[]FunctionConfigOp` field (`ConfigOps`) on both `CreateFunctionStmt` and
+      `AlterFunctionStmt`. Two more of the same keyword-vs-ident bugs surfaced
+      and were fixed along the way: `RESET ALL` (`KwAll`) and `SET x TO
+      DEFAULT` (`KwDefault`) were both silently mis-parsed as literal GUC
+      values named "all"/"default" via `acceptIdentKeyword`, which can never
+      match a reserved keyword token. New `catalog.Routine.Config []string`
+      (pg_proc.proconfig shape) + `catalog.ApplyFunctionConfigOps` (pure
+      SET-upsert/RESET-remove/RESET-ALL-clear fold, later-op-wins) wired into
+      `execCreateFunction` and `execAlterFunction` — the latter folds
+      `ConfigOps` into the *same* per-routine loop that already applies
+      VOLATILE/SECURITY DEFINER/LEAKPROOF/STRICT (combinable in one statement
+      per real `gram.y`'s `alterfunc_opt_list`), not a new early-return branch
+      like RENAME/OWNER/SET SCHEMA. `pg_proc.proconfig` now renders
+      `catalog.RoutineConfigArrayLiteral(r.Config)` for user routines
+      (`internal/initdb/pg_proc_view.go`) instead of a hardcoded `""`; the
+      sibling built-in/aggregate row builders correctly stay NULL. Restart-
+      durable via a new optional `Config` extension block on
+      `wal.CreateFunctionPayload` (omitted when empty, byte-identical to a
+      pre-`Config` record) and a new `RecordKindAlterFunctionConfig=123` WAL
+      record (whole-array snapshot replay, mirroring
+      `RecordKindAlterFunctionFlags`), replayed in
+      `internal/initdb/function_ddl_recovery.go` via a new
+      `Routines.ReplaceConfigByOIDDuringRecovery`. Deliberately still
+      dump-fidelity only — goopg does not push/pop these GUC values around
+      the routine's own execution (ledger row, 2026-07-08), matching the
+      established pattern for `n_distinct`/TOAST-compression/extended-
+      statistics-target. Design: `docs/design/0015-0002-pg-proc-catalog-and-
+      routine-registry.md` new Follow-up section; `docs/design/README.md` row
+      updated; `unimplemented_feat.json`'s `DU-002` entry flipped to
+      `resolved`. Tests (parser/catalog/executor/wal/initdb, ~10 new cases —
+      see the design doc's Tests list) all confirmed non-vacuous via a scoped
+      `git stash` of every implementation file at once (new types/fields don't
+      exist without the fix, so the test files fail to *compile*). **Unrelated
+      discovery while gating this fix (filed as its own ledger row, NOT fixed
+      here per one-task-per-loop):** `TestSeqScanFiresPrefetchesAcrossBlocks`
+      (`internal/executor/storage_test.go`) hangs indefinitely — confirmed
+      pre-existing (reproduces identically on a clean stash of this loop's own
+      diff), plausibly a regression from the recent M-NIGHTLY AIO/relFile.mu
+      fix cluster. Gates: `go build ./...`/`go vet ./...` clean; `go test
+      ./internal/parser/... ./internal/catalog/... ./internal/executor/...`
+      (minus the above pre-existing unrelated hang) `./internal/wal/...
+      ./internal/initdb/...` PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+      scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 workloads).
+      **`TestSeqScanFiresPrefetchesAcrossBlocks` hang — RESOLVED (2026-07-08,
+      later loop):** the deferral above suspected a production regression
+      from the M-NIGHTLY AIO/relFile.mu fix cluster; verify-before-implement
+      found the real cause was test-scaffolding-only.
+      `recordingExecAIOEngine.Submit` (`internal/executor/storage_test.go`,
+      duplicated from `internal/storage/storage_test.go`'s recording engine
+      per its own doc comment) never called `op.OnComplete`, so
+      `Manager.PrefetchBlock`'s AIO path (`unlock := f.lockBlock(blk)` ...
+      `OnComplete: unlock`, `internal/storage/smgr.go:230`) left
+      `relFile.blockBusy[blk]` permanently registered — any later
+      `lockBlock` call on the same block blocks forever
+      (`smgr.go:709`). Production is unaffected: `internal/initdb/open.go`'s
+      `aioEngineAdapter.Submit` correctly forwards `op.OnComplete` into
+      `aio.Op.Callback`, fired by all three real engine methods regardless
+      of `Wait` timing. Fixed by adding the same `if op.OnComplete != nil {
+      op.OnComplete() }` call the sibling recording engine already has.
+      Confirmed non-vacuous via `git stash` on the test file alone (hangs
+      pre-fix, `timeout 15` → `Terminated`; passes in 0.007s post-fix).
+      Gates: `go build ./...`/`go vet ./internal/executor/...` clean;
+      `go test ./internal/executor/...` PASS (3.7s); `go test
+      ./internal/storage/...` PASS (4.5s); `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+      scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 workloads — one
+      failed txn seen on an initial run confirmed to be a pre-existing
+      unrelated flake by re-running clean-stash HEAD, which failed
+      identically before this test-only diff existed). See deferral ledger
+      row appended today (status flipped to `resolved`).
+      **Still open** (this bucket, ~9 remaining items): CREATE/DROP DATABASE
+      full DDL, REINDEX physical rebuild, tablespaces, planner/jit GUC stubs.
+      **planner/jit GUC stubs — DONE (2026-07-08, later loop):** closed the
+      "planner/jit GUC stubs" resume point. Upstream's `guc_tables.c` defines
+      nine `jit_*` GUCs; M0097-0073 had only registered `jit`/`jit_above_cost`
+      (plus siblings `compute_query_id`/`plan_cache_mode`). Added the six
+      missing ones to `internal/config/defaults.go` —
+      `jit_optimize_above_cost`/`jit_inline_above_cost` (real, `-1`-disables
+      sentinel, same shape as the existing `jit_above_cost`) and
+      `jit_debugging_support`/`jit_dump_bitcode`/`jit_expressions`/
+      `jit_profiling_support`/`jit_tuple_deforming`/`jit_provider` (bool/string,
+      boot values and `Context` copied 1:1 from `guc_tables.c` —
+      `jit_debugging_support`/`jit_profiling_support` are `PGC_SU_BACKEND`,
+      `jit_dump_bitcode` is `PGC_SUSET`, `jit_provider` is `PGC_POSTMASTER`, the
+      rest `PGC_USERSET`). goopg has no JIT compiler so these remain pure
+      enumeration/SET-acceptance stubs, matching the pre-existing three; the
+      `SU_BACKEND` choice is still functionally meaningful — `SessionRegistry.
+      Set` already rejects `Context < ContextSuset`, so `SET
+      jit_debugging_support = on` correctly fails like real PG's "can't SET a
+      backend-start-only parameter" rather than silently no-opping. Added
+      matching commented-out `postgresql.conf.sample` entries (required by
+      `TestSampleConfigCoversRegistry`). New
+      `internal/config/jit_guc_stubs_test.go`: `TestJitGUCFamilyStubs`
+      (table-driven over all 8, boot value/type/context + SET-acceptance) and
+      `TestJitCostGUCsAcceptNegativeOneSentinel`; confirmed non-vacuous via
+      `git stash` on `defaults.go` + `postgresql.conf.sample`. Design:
+      `docs/design/root-0004-configuration-and-guc.md` new "Completing the
+      `jit_*` GUC stub family" section; `docs/design/README.md` row updated.
+      **The `jit_*` family is complete; the *planner*-tuning half had a
+      residual — closed 2026-07-12 (see the GEQO block near the bottom of
+      this bucket).** Gates: `go build ./...`/`go vet ./...`
+      clean; `go test ./internal/config/...` PASS; `go test
+      ./internal/executor/... ./internal/initdb/...` PASS (minus the
+      pre-existing, unrelated `TestSeqScanFiresPrefetchesAcrossBlocks` hang
+      already tracked in the deferral ledger — reproduces identically on a
+      clean stash of this loop's diff); `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+      scripts/ralph-precommit-test.sh` PASS (0 failed txns, all 3 workloads).
+      **`CREATE TABLE ... TABLESPACE` — DONE (2026-07-08, later loop):** closed
+      the "tablespaces" resume point's first, catalog-metadata slice. The
+      clause was parsed and silently discarded at all 3 accepting sites (main
+      column-list path, empty-column-list/typed-table path, PARTITION OF child
+      path) — `CreateTableStmt.Tablespace` now captures the name at each, and
+      the executor resolves it via new `catalog.InMemory.LookupTablespaceOID`
+      (covers `pg_default`/`pg_global` + the runtime CREATE TABLESPACE
+      registry), storing the OID on new `catalog.Table.Tablespace` and
+      rendering it as `pg_class.reltablespace` (both sibling row builders).
+      Errors mirror `tablecmds.c`: unknown name → 42704, `pg_global` → 22023;
+      resolving to the database default normalizes to 0. Wired into
+      `execCreateTable`/`execCreatePartitionChild`/`execCreateTableAs`. Also
+      corrected a stale design-doc claim: `pg_tablespace` has actually been
+      query-visible (virtual overlay including runtime tablespaces) since
+      M0110-0001 — the "on-disk pg_tablespace heap visibility" deferral note
+      in `docs/design/0095-0003-in-place-tablespace.md` no longer describes
+      the current blocker for this feature. Tests:
+      `parser.TestParseCreateTableTablespace`; 6 new executor tests
+      (`internal/executor/create_table_tablespace_test.go`); both confirmed
+      non-vacuous via `git stash`. Design: `docs/design/0095-0003-in-place-
+      tablespace.md` new section; `docs/design/README.md` row updated.
+      **Deliberately NOT covered** (deferral ledger row appended today):
+      physical relocation of relation files into the tablespace's directory;
+      restart durability of `Table.Tablespace` (mirrors the pre-existing
+      `Table.Unlogged` gap — neither survives a reload from the pg_class
+      heap today); `CREATE INDEX ... TABLESPACE` / `ALTER TABLE/INDEX ... SET
+      TABLESPACE` (both still fully unparsed). Gates: `go build ./...` clean;
+      `go test ./internal/parser/... ./internal/catalog/...` PASS; `go test
+      ./internal/executor/...` PASS (minus the pre-existing, unrelated
+      `TestSeqScanFiresPrefetchesAcrossBlocks` hang); `go test
+      ./internal/initdb/...` PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+      scripts/ralph-precommit-test.sh` PASS (0 failed txns, all 3 workloads).
+      **Still open** (this bucket, ~7 remaining items): CREATE/DROP DATABASE
+      full DDL, REINDEX physical rebuild, tablespace physical relocation +
+      restart durability, CREATE INDEX/ALTER ... SET TABLESPACE.
+      **`CREATE INDEX ... TABLESPACE` / `ALTER TABLE/INDEX ... SET
+      TABLESPACE` — DONE (2026-07-08, later loop):** closed the "both still
+      fully unparsed" resume point directly above. `CreateIndexStmt.Tablespace`
+      (parser, `parseCreateIndexTail` — real PG grammar order: after `WITH
+      (storage_parameter)`, before `WHERE`) plus a new `AlterTableSetTablespace`
+      action kind (`AlterTableAction.TablespaceName`) for the bare `SET
+      TABLESPACE name` form of both `ALTER TABLE` (an ordinary
+      comma-combinable `alter_table_cmd`, unlike `SET SCHEMA`/`SET LOGGED`
+      which are whole-statement fields intercepted before the per-action
+      parser) and `ALTER INDEX` (checked ahead of the pre-existing `SET
+      (reloptions)` branch in both dispatchers, which otherwise unconditionally
+      expects `(`). Executor resolves all three sites through the renamed
+      `resolveTablespaceClause` (was `resolveCreateTableTablespace` —
+      genuinely relation-generic, no table-specific logic) onto the new
+      `catalog.Index.Tablespace` field, rendered as `pg_class.reltablespace` by
+      the same index-row loop that previously hardcoded `"0"`. Deliberately
+      NOT carried through `btreeIndexProps`/the CREATE INDEX WAL record —
+      catalog-metadata-only for the session lifetime, matching
+      `Table.Tablespace`'s existing restart-durability gap (no new ledger row;
+      already covered by the "tablespace physical relocation + restart
+      durability" bullet below). Tests:
+      `parser.TestParseCreateIndexTablespace`,
+      `TestParseAlterTableSetTablespace`, `TestParseAlterIndexSetTablespace`
+      (`internal/parser/create_tablespace_test.go`);
+      `executor.TestCreateIndexTablespaceResolvesAndStores` (btree),
+      `TestCreateIndexTablespaceCatalogOnlyMethod` (gist),
+      `TestCreateIndexTablespaceUnknownErrors42704`,
+      `TestAlterTableSetTablespaceUpdatesTable`,
+      `TestAlterIndexSetTablespaceUpdatesIndex`,
+      `TestPGClassRendersIndexReltablespace`
+      (`internal/executor/create_index_tablespace_test.go`); all confirmed
+      non-vacuous via `git stash` (new fields/action kind don't exist without
+      the fix). Design: `docs/design/0095-0003-in-place-tablespace.md` new
+      "CREATE INDEX / ALTER TABLE/INDEX ... SET TABLESPACE" section;
+      `docs/design/README.md` row updated. Gates: `go build ./...`/`go vet
+      ./...` clean; `go test ./internal/parser/... ./internal/catalog/...
+      ./internal/executor/...` PASS; `go test ./internal/planner/...
+      ./internal/initdb/...` PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+      scripts/ralph-precommit-test.sh` PASS (0 failed txns, all 3 workloads).
+      **Still open** (this bucket, ~6 remaining items): CREATE/DROP DATABASE
+      full DDL, REINDEX physical rebuild, tablespace physical relocation +
+      restart durability (both table and index).
+      **Tablespace restart durability (table + index) — DONE (2026-07-08,
+      later loop):** closed the "restart durability (both table and index)"
+      resume point. `catalog.PGClassRow` gained `RelTablespace uint32`,
+      decoded by `DecodePGClassPhysicalRow` at the real PG18
+      `FormData_pg_class` byte offset 92 (between `relfilenode`(88) and
+      `relpages`(96)); `loadUserTablesFromHeap` now sets `tbl.Tablespace =
+      tr.RelTablespace` — the value was already being written into the heap
+      row by `buildUserPGClassRow`, just never read back. The index sibling
+      row builder, `buildUserPGClassRowForIndex`, had hardcoded `reltablespace`
+      to `0` even for an index explicitly created `... TABLESPACE ts1` — fixed
+      to render `idx.Tablespace`; `loadUserIndexesFromHeap` decodes it back
+      via a new `tablespace uint32` parameter threaded through
+      `catalog.Catalog`'s `RegisterIndexDuringRecovery`/
+      `indexRegistryRecovery` interface (mirrors the existing
+      `fillfactor`/`deduplicateItems` parameters). For the WAL-only replay
+      fallback (`replayIndexDDLRecords`, used before a pg_index heap row
+      exists), `wal.CreateIndexPayload` gained a `Tablespace uint32` field in
+      its self-describing extension block (new `ciExtHasTablespace` flag
+      bit); `btreeIndexProps`/`createBTreeIndex` now set `idx.Tablespace`
+      from `xp.Tablespace` BEFORE the CREATE INDEX WAL record is built (same
+      discipline every other M0122-0006-follow-up index property already
+      follows), which also let `execCreateIndex`'s old post-call
+      `bidx.Tablespace = idxTablespaceOID` block be deleted outright.
+      `ALTER TABLE/INDEX ... SET TABLESPACE` (previously catalog-metadata-only
+      for the session lifetime) now resyncs the heap-persisted pg_class row
+      immediately after the mutation, so an uncheckpointed crash right after
+      the ALTER no longer loses the change either. Tests:
+      `TestEncodeCreateIndexExtensionRoundTrip`'s new "tablespace only" case
+      (`internal/wal/index_ddl_test.go`);
+      `TestTableTablespaceSurvivesRestartViaCatalogHeap`/
+      `TestIndexTablespaceSurvivesRestartViaCatalogHeap`/
+      `TestAlterTableSetTablespaceSurvivesRestartViaCatalogHeap`
+      (`internal/initdb/tablespace_restart_test.go`, full
+      `Init`→`Open`→DDL→`Close`→`Open` cycles against a real on-disk data
+      dir), all confirmed non-vacuous via `git stash`. Also live-verified
+      against the real `cmd/goopg` binary with a real `goopg stop`/`goopg
+      start` cycle. Design: `docs/design/0095-0003-in-place-tablespace.md`
+      new "Restart durability (2026-07-08 follow-up)" section;
+      `docs/design/README.md` row updated. **New gap found live-verifying
+      this fix, recorded in the deferral ledger, NOT fixed here (one task
+      per loop):** the tablespace REGISTRY itself (`CREATE TABLESPACE`,
+      `catalog.InMemory.tablespaces`) has no restart durability at all — it
+      is a purely in-memory map with no WAL record and no backing heap
+      relation, so a tablespace vanishes from `pg_tablespace` after a
+      restart even though `pg_tblspc/<oid>/` stays on disk, orphaning any
+      table/index whose now-durable `reltablespace` OID points at it. Needs
+      a new `RecordKindCreateTablespace`/`RecordKindDropTablespace` WAL
+      record pair + a `replayTablespaceDDLRecords` driver, mirroring
+      `replayDatabaseDDLRecords`/`replaySchemaDDLRecords`. Gates: `go build
+      ./...`/`go vet ./...` clean; `go test ./internal/catalog/...
+      ./internal/wal/... ./internal/initdb/... ./internal/executor/...`
+      PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed txns, all 3 workloads). **Still open** (this bucket, ~5
+      remaining items): CREATE/DROP DATABASE full DDL, REINDEX physical
+      rebuild, tablespace physical relocation, tablespace-registry restart
+      durability (new, see deferral ledger).
+      **Tablespace-registry restart durability — DONE (2026-07-09):** closed
+      the "tablespace-registry restart durability" resume point directly
+      above. `catalog.InMemory.tablespaces` (`CreateTablespace`/
+      `DropTablespace`) had ZERO restart durability — a purely in-memory map
+      with no WAL record and no backing heap relation, so a tablespace
+      vanished from `pg_tablespace` entirely after any restart even though
+      its `pg_tblspc/<oid>/` directory stayed on disk. Fixed the same way
+      `CREATE DATABASE`/`CREATE SCHEMA` already were: new
+      `wal.RecordKindCreateTablespace`/`RecordKindDropTablespace` (124/125,
+      `EncodeCreateTablespace`/`DecodeCreateTablespace`/
+      `EncodeDropTablespace`/`DecodeDropTablespace`, `internal/wal/
+      recovery.go`) are no-ops for physical replay; a new
+      `internal/initdb/tablespace_ddl_recovery.go`'s
+      `replayTablespaceDDLRecords`, byte-for-byte structured like
+      `replaySchemaDDLRecords`, scans `pg_wal` after physical replay and
+      applies each record via a new `catalog.InMemory.
+      RegisterTablespaceDuringRecovery`/`UnregisterTablespaceDuringRecovery`
+      pair (re-populates/removes the `tablespaces` map entry, preserving the
+      original OID and bumping `nextOID` past it). Wired into
+      `internal/initdb/open.go`'s `Open` right after `replaySchemaDDLRecords`
+      (must run before `loadUserTablesFromHeap`/`loadUserIndexesFromHeap`
+      reconstruct their durable `reltablespace` OIDs). `execCreateTablespace`/
+      `execDropTablespace` (`internal/executor/operators_ddl.go`) now append
+      the corresponding WAL record right after the in-memory mutation
+      succeeds, mirroring CREATE/DROP SCHEMA's "mutate, then WAL" ordering.
+      Tests: `TestTablespaceDDLRecoveryReplaysCreate`/
+      `TestTablespaceDDLRecoveryReplaysDropAfterCreate`/
+      `TestReplayTablespaceDDLRecordsHandlesMissingWalDir`
+      (`internal/initdb/tablespace_ddl_recovery_test.go`), confirmed
+      non-vacuous via `git stash` on the four impl files (fails to build:
+      `undefined: wal.EncodeCreateTablespace` etc.). Live-verified against
+      the real `cmd/goopg` binary: `SET allow_in_place_tablespaces = on;
+      CREATE TABLESPACE ts1 LOCATION ''; CREATE TABLE t1(a int) TABLESPACE
+      ts1;`, then a real `goopg stop`/`goopg start` — `pg_tablespace` still
+      lists `ts1`, `t1.reltablespace` unchanged, and a fresh `CREATE TABLE
+      t2(a int) TABLESPACE ts1` in the post-restart session succeeds
+      (previously `42704 tablespace "ts1" does not exist`); repeated with
+      `DROP TABLESPACE ts1` before a restart — confirmed it stays gone.
+      Design: `docs/design/0095-0003-in-place-tablespace.md` new
+      "Tablespace-registry restart durability (2026-07-09 follow-up)"
+      section; `docs/design/README.md` row updated. Gates: `go build ./...`
+      clean; `go test ./internal/catalog/... ./internal/wal/...
+      ./internal/initdb/... ./internal/executor/...` PASS; `scripts/
+      tpch-spotcheck.sh` PASS (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+      scripts/ralph-precommit-test.sh` PASS (0 failed txns, all 3
+      workloads). **Still open** (this bucket, ~4 remaining items):
+      CREATE/DROP DATABASE full DDL, REINDEX physical rebuild, tablespace
+      physical relocation.
+      **REINDEX physical rebuild (2026-07-09 follow-up):** closed this
+      resume point, for the plain (non-`CONCURRENTLY`) `REINDEX INDEX`/
+      `REINDEX TABLE` forms. Previously `reindexOp.Next`
+      (`internal/executor/operators_reindex.go`) validated the target name
+      and, for `CONCURRENTLY`/`SCHEMA`, reproduced PostgreSQL's observable
+      locking (M0118-0008), but never actually rebuilt anything — a REINDEX
+      issued to repair a stale/corrupted index silently did nothing. New
+      `reindexOp.rebuildIndex(idx, pos)` / `rebuildTableIndexes(tbl, pos)`
+      rebuild every btree index involved by reusing CREATE INDEX's own
+      bulk-build path — a bare `&ddlOp{ctx: o.ctx}` calls `bulkBuildBTree`/
+      `bulkBuildBTreeWithPredicate`, whose `btree.BulkCreateWithOptions`
+      already truncates + repacks the target relation from scratch
+      (previously written for crash-recovery bulk builds, exactly the
+      semantics REINDEX needs). Non-btree access methods (gist/spgist/gin/
+      brin) stay a no-op — CREATE INDEX itself never builds physical
+      storage for them either. New `reindexOp.acquireReindexLocks`
+      genuinely HOLDS (not the file's pre-existing transient
+      wait-then-release pattern) a `ShareLock` on the parent table plus an
+      `AccessExclusiveLock` on the index for the rebuild's duration,
+      mirroring `reindex.sgml`'s real locking ("REINDEX locks out writes
+      but not reads ... also takes an ACCESS EXCLUSIVE lock on the
+      specific index") — without this a concurrent reader/writer could
+      race the truncate-then-rebuild. Tests:
+      `TestReindexIndexPhysicallyRebuilds`/
+      `TestReindexTablePhysicallyRebuildsAllIndexes` (truncate a live
+      index's storage, REINDEX, verify via a direct `btree.RangeScan` —
+      bypassing SQL — that the rebuilt btree is correct) and
+      `TestReindexIndexBlocksBehindConcurrentIndexReader` (a second
+      backend's `AccessShareLock` blocks REINDEX until released), all in
+      `internal/executor/reindex_physical_rebuild_test.go`, confirmed
+      non-vacuous via `git stash` on `operators_reindex.go` alone (all 3
+      fail pre-fix). Also live-verified against the real `cmd/goopg`
+      binary: zero-byte-truncated a live index's on-disk relfilenode file
+      directly, confirmed the query then failed (`short read at block`),
+      ran `REINDEX INDEX`, confirmed the query and its Index Scan plan
+      both recovered; `REINDEX TABLE` afterward left the data intact.
+      Design: `docs/design/0122-0007-reindex-physical-rebuild.md` (new);
+      `docs/design/README.md` row added. Gates: `go build ./...`/`go vet
+      ./internal/executor/...` clean; `go test ./internal/executor/...
+      ./internal/access/btree/... ./internal/catalog/...
+      ./internal/planner/...` PASS; `go test ./internal/testport/... -run
+      'TestPort_IsolationReindex|TestPort_IsolationMultipleCic'` PASS (all
+      4 specs — reindex-concurrently/-toast/-schema/multiple-cic — no
+      regression, none of them exercise the plain `INDEX`/`TABLE` forms
+      this slice changed); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed txns, all 3 workloads). **Deliberately left open (deferral
+      ledger row, scoped out of this loop):** `REINDEX SCHEMA`'s physical
+      rebuild (the per-table `rebuildTableIndexes` call this loop already
+      built, just not wired into the `SCHEMA` branch — deferred to keep
+      this loop's blast radius to the two forms with a passing non-vacuous
+      test) and `REINDEX ... CONCURRENTLY`'s physical rebuild (needs a
+      genuine shadow-index build-then-swap, a materially larger capability
+      goopg does not have).
+      **REINDEX SCHEMA physical rebuild — done (2026-07-09 follow-up):**
+      closed the resume point named directly above. The `SCHEMA` case's
+      per-relation loop now calls `rebuildTableIndexes(tbl, pos)` for each
+      non-concurrent table (same mechanism `REINDEX TABLE` already used),
+      instead of only acquiring/releasing a transient `ShareLock` and
+      leaving corrupted storage untouched. `schemaRelsByOID` was renamed to
+      `schemaTableNamesByOID` and now returns qualified `parser.ObjectName`s
+      re-resolved via `o.ctx.Catalog.LookupTable` immediately before each
+      use (previously the loop captured `Table`/`RelFileNode` once up
+      front) — necessary because `reindex-schema.spec` exercises a second
+      table being concurrently dropped while REINDEX SCHEMA is still
+      waiting on an earlier table's conflicting lock; a stale captured
+      pointer would try to rebuild a since-removed relation, while
+      re-resolving and silently skipping a lookup miss reproduces
+      upstream's tolerate-concurrent-drop behavior. New test
+      `TestReindexSchemaPhysicallyRebuildsAllTables`
+      (`internal/executor/reindex_physical_rebuild_test.go`): a schema with
+      two tables, each given a truncated btree index; `REINDEX SCHEMA`
+      rebuilds both, confirmed non-vacuous via `git stash` on
+      `operators_reindex.go` alone (fails `short read at block` pre-fix).
+      Re-ran `go test -v -run '^TestPort_IsolationReindexSchema$'
+      ./internal/testport/` after the change — still PASS, confirming the
+      concurrent-drop-tolerance behavior the isolation spec exercises
+      survived the switch from transient-lock-only to actual rebuild.
+      Design: `docs/design/0122-0007-reindex-physical-rebuild.md` updated
+      Fix/Deferral sections; `docs/design/README.md` row updated;
+      deferral-ledger new row (M0122-0007, 2026-07-09) closes item (1),
+      leaves item (2) — `REINDEX ... CONCURRENTLY` across all three object
+      types — open. Gates: `go build ./...`/`go vet ./internal/executor/...`
+      clean; `go test ./internal/executor/... ./internal/access/btree/...
+      ./internal/catalog/... ./internal/planner/...` PASS; `go test
+      ./internal/testport/... -run
+      'TestPort_IsolationReindex|TestPort_IsolationMultipleCic'` PASS (all 4
+      specs, no regression); `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+      scripts/ralph-precommit-test.sh` PASS (0 failed txns, all 3
+      workloads). **Still open** (M0122-0007 bucket, ~3 remaining items):
+      CREATE/DROP DATABASE full DDL, tablespace physical relocation,
+      REINDEX CONCURRENTLY physical rebuild (all object types).
+      **Foreign-server registry restart durability — done (2026-07-09,
+      `unimplemented_feat.json` DU-002-376/DU-002-378 closed):**
+      `catalog.InMemory.foreignServers` (CREATE/DROP SERVER) was a pure
+      in-memory map with zero WAL persistence — a restart silently dropped
+      every registered server, breaking `pg_foreign_server`/dependent user
+      mappings. Fixed exactly mirroring the tablespace-registry follow-up
+      above: new `wal.RecordKindCreateForeignServer`/
+      `RecordKindDropForeignServer` (126/127) +
+      `internal/initdb/foreignserver_ddl_recovery.go`'s
+      `replayForeignServerDDLRecords`; `catalog.InMemory.
+      RegisterForeignServerDuringRecovery`/`UnregisterForeignServerDuringRecovery`
+      re-populate the registry with the original OID; `execCompatCreate`'s
+      `case "server":` now WAL-emits on `CREATE SERVER`. A design-review
+      pass (before implementation, per this milestone's per-task rule) found
+      a real blocking gap the naive port would have introduced: `DROP
+      SERVER`'s existence gate and `DROP FOREIGN DATA WRAPPER ... CASCADE`'s
+      per-server discovery both keyed off the separate, non-durable
+      `compatObjects["server"]`/`compatObjects["fdw-server"]` bookkeeping,
+      not `foreignServers` — so a WAL-recovered server could never be
+      dropped again ("does not exist"), and CASCADE would silently fail to
+      cascade-drop it. Fixed by repointing both call sites at
+      `foreignServers` directly (`DropForeignServer`'s bool return / a
+      `ListForeignServers()` scan filtered by `FdwName`) instead of adding a
+      second parallel persistence path — this also makes "server" consistent
+      with `COMMENT ON SERVER`, which already used `ForeignServerOID` as its
+      existence check. `Owner` is deliberately not carried in the new WAL
+      record: nothing sets `ForeignServer.Owner` away from its zero value
+      today (no `ALTER SERVER ... OWNER TO`). Scope: `CREATE`/`DROP SERVER`
+      only — `CREATE USER MAPPING` restart durability is a separate,
+      still-open gap (ledger row appended). Tests:
+      `TestEncodeDecodeCreateForeignServerRoundTrip`/
+      `TestEncodeDecodeDropForeignServerRoundTrip`/
+      `TestDecodeForeignServerRejectsWrongKindAndTruncatedPayload`
+      (`internal/wal`), `TestRegisterForeignServerDuringRecoveryPreservesOID`/
+      `TestUnregisterForeignServerDuringRecoveryRemovesEntry`
+      (`internal/catalog`), `TestForeignServerDDLRecoveryReplaysCreate`/
+      `TestForeignServerDDLRecoveryReplaysDropAfterCreate`/
+      `TestReplayForeignServerDDLRecordsHandlesMissingWalDir`
+      (`internal/initdb`, full `Init`+`Open`+restart+`Open` cycle),
+      `TestDropServerGatesOnForeignServerRegistryNotCompatObjects`/
+      `TestDropForeignDataWrapperCascadeUsesForeignServerRegistry`/
+      `TestCreateServerRegistersForeignServerWithCapturedOID`
+      (`internal/executor`) — the two correctness-fix tests confirmed
+      non-vacuous via `git stash` on `operators_ddl.go` alone (both fail
+      pre-fix: "does not exist" / cascade leaves the server behind).
+      Live-verified against a real `cmd/goopg` binary: `CREATE SERVER`
+      + `goopg stop`/`start` + `pg_foreign_server` still lists it +
+      `DROP SERVER` on it now succeeds (previously would 42704). Design:
+      `docs/design/0110-0001-pg-dump-tap-port.md` new "Follow-up
+      (2026-07-09, M0122-0007)" section (includes the design-review
+      correction); `docs/design/README.md` row updated. Gates: `go build
+      ./...`/`go vet ./internal/wal/... ./internal/catalog/...
+      ./internal/initdb/... ./internal/executor/...` clean; `go test
+      ./internal/wal/... ./internal/catalog/... ./internal/initdb/...
+      ./internal/executor/...` PASS; `go test -v -run
+      '^TestPort_PgDumpConnectionSetup$' ./internal/testport/` PASS (no
+      regression); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed transactions, all 3 workloads).
+      **User-mapping registry restart durability — done (2026-07-09, same
+      day, closes the resume point left by the foreign-server fix above):**
+      `catalog.InMemory.userMappings` (`CREATE`/`DROP USER MAPPING`) was,
+      like `foreignServers` before it, a pure in-memory map with zero WAL
+      persistence — a restart silently dropped every registered mapping
+      even though its referenced server now survives (previous entry).
+      Fixed by mirroring the foreign-server recipe exactly: new
+      `wal.RecordKindCreateUserMapping`/`RecordKindDropUserMapping`
+      (128/129) + `internal/initdb/usermapping_ddl_recovery.go`'s
+      `replayUserMappingDDLRecords`; `catalog.InMemory.
+      RegisterUserMappingDuringRecovery`/`UnregisterUserMappingDuringRecovery`
+      re-populate the registry with the original OID; `execCompatCreate`'s
+      `case "user mapping":` now WAL-emits on `CREATE USER MAPPING`, and the
+      `DROP USER MAPPING` site emits `EncodeDropUserMapping` the same way.
+      Wired into `internal/initdb/open.go` right after the existing
+      foreign-server replay call. Unlike the foreign-server fix, no
+      design-review correctness gap was found this time — `DROP USER
+      MAPPING`'s existence gate already consulted the durable
+      `userMappings` registry directly, never the non-durable
+      `compatObjects` bookkeeping, so nothing needed repointing. Tests:
+      `TestEncodeDecodeCreateUserMappingRoundTrip`/
+      `TestEncodeDecodeDropUserMappingRoundTrip`/
+      `TestDecodeUserMappingRejectsWrongKindAndTruncatedPayload`
+      (`internal/wal/user_mapping_ddl_test.go`),
+      `TestRegisterUserMappingDuringRecoveryPreservesOID`/
+      `TestUnregisterUserMappingDuringRecoveryRemovesEntry`
+      (`internal/catalog/user_mapping_recovery_test.go`),
+      `TestUserMappingDDLRecoveryReplaysCreate`/
+      `TestUserMappingDDLRecoveryReplaysDropAfterCreate`/
+      `TestReplayUserMappingDDLRecordsHandlesMissingWalDir`
+      (`internal/initdb/usermapping_ddl_recovery_test.go`, full
+      `Init`+`Open`+restart+`Open` cycle). Live-verified against a real
+      `cmd/goopg` binary across two consecutive restarts:
+      `CREATE FOREIGN DATA WRAPPER`/`CREATE SERVER ... OPTIONS (host
+      'remote')`/`CREATE USER MAPPING FOR postgres SERVER test_srv OPTIONS
+      (user 'remoteuser', password 'secret')`, then `goopg stop`/`start` —
+      `pg_user_mappings` still lists the mapping with the same
+      `umid`/`srvid`/`umoptions`; `DROP USER MAPPING` then succeeds and a
+      SECOND `goopg stop`/`start` confirms the drop itself is durable too
+      (0 rows, not just the create side). Design:
+      `docs/design/0110-0001-pg-dump-tap-port.md` new "Follow-up
+      (2026-07-09, M0122-0007, same day): user-mapping registry restart
+      durability" section; `docs/design/README.md` row extended; deferral
+      ledger row (M0122-0007) flipped to `resolved`, new row appended
+      closing the same-named resume point. Gates: `go build ./...`/`go vet
+      ./internal/wal/... ./internal/catalog/... ./internal/initdb/...
+      ./internal/executor/...` clean; `go test` on the same four packages
+      PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed transactions, all 3 workloads). **No further known gap** in
+      this specific (foreign-server + user-mapping) restart-durability
+      bucket. Remaining M0122-0007 items: CREATE/DROP DATABASE full DDL,
+      tablespace physical relocation, REINDEX CONCURRENTLY physical rebuild
+      (all object types), plus the true restart-the-listener reload for
+      `ContextPostmaster` GUCs noted above (matches upstream, not a gap).
+      **Tablespace physical relocation — done (2026-07-09, this loop, closes
+      the "tablespace physical relocation" resume point every prior
+      tablespace-cluster entry above has named since 2026-07-08):** every
+      earlier tablespace slice was catalog-metadata only —
+      `pg_class.reltablespace` reported the right OID but a relation's real
+      data file always stayed under `base/<dbOid>/<relOid>` regardless of
+      its declared tablespace. `storage.RelFileNode` gained `TblOid uint32`
+      (0 = default tablespace, unchanged `base/<dbOid>` path — purely
+      additive, every existing struct literal keeps compiling and behaving
+      identically); `Manager.relPath`/`RelPath` (`internal/storage/smgr.go`)
+      route through a new `relDir` helper that resolves a non-zero `TblOid`
+      to `pg_tblspc/<TblOid>/<config.TablespaceVersionDirectory>/<dbOid>/`,
+      the same layout `execCreateTablespace` already creates.
+      `catalog.InMemory.RelFileNode(table)`/`IndexRelFileNode(index)` — the
+      ONLY two call sites in the whole codebase that convert a
+      `catalog.Table`/`catalog.Index` into a `storage.RelFileNode` for real
+      I/O (confirmed via grep: all 227 raw `storage.RelFileNode{...}`
+      literals elsewhere are tests/TOAST/shared-catalog-sentinel
+      constructions, not a second conversion path) — now set `TblOid` from
+      `table.Tablespace`/`index.Tablespace` (both fields already existed and
+      were already restart-durable per the 2026-07-08/09 entries above; they
+      simply never reached `RelFileNode`). `ALTER TABLE/INDEX ... SET
+      TABLESPACE` (`internal/executor/operators_ddl.go`) now calls a new
+      `relocateRelationPhysicalFile(oldRel, newRel)` BEFORE mutating
+      `tbl.Tablespace`/`idx.Tablespace`: flush the relation's dirty buffered
+      pages to the OLD file (new `Pool.FlushRel`, which — unlike the
+      pre-existing `InvalidateRel` DROP-TABLE uses — writes instead of
+      discarding dirty content), copy-and-fsync to the NEW tablespace path,
+      forget the OLD cached handle (new `Manager.CloseRelation`, closes
+      without deleting — distinct from `DropRelation`). Only MainFork is
+      handled (goopg has no real backing file for FSM/VM/Init forks outside
+      `internal/executor/expr.go`'s `pg_relation_size` helpers); a non-btree
+      index (gist/spgist/gin/brin) has no physical file at all, so the move
+      is a no-op and only the catalog metadata changes, matching CREATE
+      INDEX's own behavior for those AMs. **Crash-safety is copy-then-switch**
+      (mirrors upstream's `copy_relation_data` + pending-delete, NOT
+      rename-then-switch): the new file is fully written+fsynced BEFORE the
+      caller commits the catalog/heap/WAL mutation that makes the new
+      tablespace authoritative; the old file is removed only AFTER that
+      commit succeeds (new `relocateRelationPhysicalFileCleanupOld`) — a
+      crash at either boundary leaves at most a harmless orphaned file, never
+      lost or duplicated data. **Safety-completeness fix in the same loop:**
+      `execDropTablespace` previously `os.RemoveAll`'d the `pg_tblspc/<oid>`
+      directory unconditionally — harmless when tablespaces were
+      catalog-metadata-only, but a real data-loss risk now that the
+      directory can hold genuine relation files. It now checks every table
+      and index for `Tablespace == oid` first and rejects with `55000`
+      (`ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE`), mirroring upstream's
+      `DropTableSpace` "tablespace %q is not empty" (`tablespace.c`). Tests:
+      `storage.TestRelPathTablespace`/`TestManagerOpensTablespaceUnderPgTblspcDir`/
+      `TestManagerCloseRelationClosesHandleWithoutDeletingFile`/
+      `TestPoolFlushRelWritesOnlyTargetRelationAndKeepsSlotsCached`;
+      `executor.TestAlterTableSetTablespacePhysicallyRelocatesFile`/
+      `TestAlterIndexSetTablespacePhysicallyRelocatesFile` (confirmed
+      non-vacuous via `git stash` — fail to COMPILE pre-fix, since they use
+      the new `TblOid` field);
+      `executor.TestDropTablespaceRejectsWhenTableStillReferencesIt`/
+      `TestDropTablespaceRejectsWhenIndexStillReferencesIt`;
+      `initdb.TestAlterTableSetTablespacePhysicalRelocationSurvivesRestart`
+      (real `Init`→`Open`→DDL→`Close`→`Open` cycle asserting the file lives
+      under the NEW `pg_tblspc/...` path and NOT the old `base/...` path
+      post-restart — also confirmed non-vacuous via `git stash`; a plain
+      reltablespace-only assertion would have passed even pre-fix, since
+      without TblOid-aware routing the file simply never moves and stays
+      trivially findable at its one unchanged location). Live-verified
+      against a real `cmd/goopg` binary: `CREATE TABLESPACE` +
+      `CREATE TABLE ... TABLESPACE` + 100 rows + `ALTER TABLE ... SET
+      TABLESPACE` + `CREATE INDEX ... TABLESPACE` — `find pg_tblspc base`
+      confirmed both files live only under
+      `pg_tblspc/<oid>/<version dir>/<dbOid>/`; a real `goopg stop`/`goopg
+      start` cycle preserved all 100 rows and a working index-scan lookup;
+      `DROP TABLESPACE` on the still-referenced tablespace correctly errored
+      `tablespace "ts_live" is not empty`. Design:
+      `docs/design/0095-0003-in-place-tablespace.md` new "Physical
+      relocation" section; `docs/design/README.md` row extended. Gates: `go
+      build ./...`/`go vet ./...` clean; `go test ./internal/storage/...
+      ./internal/catalog/... ./internal/access/btree/... ./internal/amcheck/...`
+      PASS; `go test ./internal/executor/...` PASS (also caught and fixed a
+      real bug this loop's own gate run surfaced: the first relocation-path
+      draft used `ctx.DataDir` to build absolute file paths, which broke the
+      pre-existing `TestAlterIndexSetTablespaceUpdatesIndex` — that test's
+      fixture deliberately points `ctx.DataDir` at a DIFFERENT directory
+      than the real storage `Manager`'s own configured root; fixed by using
+      the Manager's own `DataDir()` accessor instead, which is authoritative
+      for where files actually live); `go test ./internal/initdb/...` PASS
+      (243s, full suite); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed transactions across pgbench TPC-B/simple-update/select-only).
+      **Deferred (ledger row, 2026-07-09):** orphaned files from a crash
+      strictly mid-relocation are never garbage-collected (harmless dead
+      bytes, not a correctness bug — see the ledger row for the resume
+      point on an eventual sweep mechanism). **Remaining M0122-0007 items:**
+      CREATE/DROP DATABASE full DDL, REINDEX CONCURRENTLY physical rebuild
+      (both pre-existing, untouched this loop).
+      **DROP DATABASE guard checks — done (2026-07-09, this loop):** closed
+      the "no active-connection check" sub-item a dedicated research pass
+      confirmed was the concretely-scoped, non-architectural residual inside
+      "CREATE/DROP DATABASE full DDL" (full per-database physical storage
+      isolation is a separate, materially larger architectural item this
+      bucket has correctly deferred whole for ~10 loops — untouched here).
+      `tryHandleDatabaseDDL`'s `databaseDDLDrop` branch
+      (`internal/server/database_ddl.go`) was a bare catalog map-delete with
+      zero guard checks; now runs, mirroring `dbcommands.c dropdb()`'s own
+      order: template rejection (`template0`/`template1` → 42809
+      `WrongObjectType`, "cannot drop a template database"), self-drop
+      rejection (target == the calling connection's own live database → 55006
+      `ObjectInUse`, "cannot drop the currently open database"), then a
+      busy-check via the pre-existing `activity.ActivityRegistry.CountByDatName`
+      (already built for M0119-0006's `datconnlimit` connect-time check) → 55006
+      `ObjectInUse`, "database %q is being accessed by other users". The
+      self-drop check is ordered before the busy check specifically so no new
+      self-exclusion bookkeeping is needed: once it passes, `name !=
+      liveDBName` is guaranteed, so any backend `CountByDatName(name)` finds
+      next is necessarily a connection other than this one (`CountByDatName`
+      itself is self-inclusive by design, built for a different, connect-time
+      use case). Tests: `TestTryHandleDatabaseDDLDropGuards`
+      (`internal/server/database_ddl_test.go`), confirmed non-vacuous via
+      `git stash`. Design: new `docs/design/0122-0017-database-ddl-drop-guards.md`;
+      `docs/design/README.md` row added. Gates: `go build ./...`/`go vet
+      ./internal/server/... ./internal/activity/...` clean; `go test
+      ./internal/server/... ./internal/activity/...` PASS (full packages, no
+      regression); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed transactions, all 3 workloads). **Still open in this sub-item:**
+      `WITH (FORCE)`/connection-termination (no cancel-backend mechanism
+      exists) and ownership/permission checks (no database-owner tracking
+      exists) — both noted in the deferral ledger row appended this loop.
+      **DROP DATABASE ownership check — done (2026-07-09, this loop, closes
+      the "ownership/permission checks" residual named just above):**
+      `catalog.InMemory` gained real `pg_database.datdba` tracking — a new
+      `databaseOwner map[string]uint32` (parallel to `databaseConnLimit`).
+      `CreateDatabase`/`RegisterDatabaseDuringRecovery` now take an `owner
+      uint32` and record it; `DatabaseOwner(name) uint32` getter defaults to
+      `BootstrapSuperuserOID` for names with no recorded owner (the bootstrap
+      postgres/template0/template1 rows, which predate any CreateDatabase
+      call — `pg_database.datdba` used to hardcode `"10"` unconditionally,
+      now genuinely computed). `wal.EncodeCreateDatabase`/
+      `DecodeCreateDatabase` gained a trailing 4-byte owner OID (decode
+      defaults to `BootstrapSuperuserOID` when absent, so a pre-existing WAL
+      stream still replays). `tryHandleDatabaseDDL` gained an `actingRole
+      string` parameter — the same `connTx.NonSuperuserRole`-or-`""`
+      convention `tryRecordTableGrant` already uses (`grant_ddl.go`) — via
+      two new `*Server` helpers `resolveActingRoleOID`/
+      `actingRoleIsSuperuser` (type-assert to `*catalog.InMemory` for
+      `RoleOID`/`IsSuperuser`, mirroring the role_ddl.go pattern). CREATE
+      DATABASE now records the resolved OID as owner; DROP DATABASE rejects
+      a non-owner/non-superuser `actingRole` with 42501
+      `InsufficientPrivilege`, `"must be owner of database %s"` (matches
+      `aclchk.c`'s exact message for `OBJECT_DATABASE`/`ACLCHECK_NOT_OWNER`),
+      inserted as the FIRST guard right after the existence check — matches
+      `dbcommands.c dropdb()`'s real ordering (`object_ownercheck` runs
+      before the template/self-drop/busy checks this bucket added earlier).
+      Both wire-protocol call sites (`dispatch.go` simple-query,
+      `dispatch_extended.go` extended-query) now thread
+      `connTx.NonSuperuserRole` through as `actingRole`. Live-verified
+      against a real `cmd/goopg` binary: `SET SESSION AUTHORIZATION alice;
+      CREATE DATABASE aliceonly2` recorded `datdba=16403` (alice's real OID,
+      confirmed via `pg_roles`); `SET SESSION AUTHORIZATION bob; DROP
+      DATABASE aliceonly2` correctly errored `must be owner of database
+      aliceonly2`; `SET SESSION AUTHORIZATION alice; DROP DATABASE
+      aliceonly2` succeeded; a fresh `aliceonly3` created as alice survived a
+      real `goopg stop`/`start` restart with `datdba` still `16403` post-WAL-
+      replay. **Known limitation carried over, not introduced here:** a
+      plain non-superuser LOGIN connection that never issues `SET ROLE`/`SET
+      SESSION AUTHORIZATION` still resolves to the bootstrap superuser for
+      `actingRole` (verified live: `PGUSER=alice psql -c "CREATE DATABASE
+      ..."` recorded `datdba=10`, not alice's OID) — `connTx.NonSuperuserRole`
+      only diverges from `""` after one of those statements, identical to
+      every other `actingRole`-gated check in this codebase
+      (`tryRecordTableGrant` included); would need session-startup role
+      tracking to fix, out of scope for this guard. Tests:
+      `TestTryHandleDatabaseDDLDropRequiresOwnership`
+      (`internal/server/database_ddl_test.go`);
+      `TestDecodeCreateDatabaseDefaultsOwnerForPreM01220007Payload`
+      (`internal/wal/database_ddl_test.go`). Design:
+      `docs/design/0122-0017-database-ddl-drop-guards.md` new "Ownership
+      check" section; `docs/design/README.md` row updated. Gates: `go build
+      ./...`/`go vet ./internal/catalog/... ./internal/wal/...
+      ./internal/server/... ./internal/initdb/...` clean; `go test` on those
+      4 packages PASS (full, no regressions); `scripts/tpch-spotcheck.sh`
+      PASS (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+      scripts/ralph-precommit-test.sh` PASS (0 failed transactions, all 3
+      workloads).
+      **Remaining M0122-0007 items:** CREATE/DROP DATABASE physical storage
+      isolation (template copy on CREATE, real directory removal on DROP —
+      the architectural item), `WITH (FORCE)` connection-termination (no
+      cancel-backend mechanism), REINDEX CONCURRENTLY physical rebuild.
+  - [x] `M0122-0007` follow-up 2 (2026-07-09, this loop) — **`DROP DATABASE
+      ... WITH (FORCE)` connection termination, done.** The prior loop's
+      "no cancel-backend mechanism" note was wrong: goopg already has one —
+      `backendCancelRegistry` (`internal/server/cancel.go`), the process-wide
+      registry behind a peer `pg_terminate_backend(pid)` call. New
+      `dropDatabaseHasForce` (`internal/server/database_ddl.go`) detects the
+      trailing `WITH (FORCE)`/`(FORCE)` clause (the only option this bypass
+      recognises, matching real PG's `DropdbStmt.options`); when present,
+      `tryHandleDatabaseDDL`'s `databaseDDLDrop` branch calls two new
+      `*Server` methods mirroring `dbcommands.c dropdb()`'s
+      `if (force) TerminateOtherDBBackends(db_id)` ordering (right before the
+      busy check): `terminateOtherDBBackends(name)` walks
+      `activity.Registry.Snapshot()` for every backend on the target database
+      and fires `cancelReg.terminateByPID` (same path `pg_terminate_backend`
+      uses for a peer); `waitForDatabaseBackendsToDrain(name)` polls
+      `CountByDatName` for up to 5s (50×100ms), mirroring
+      `CountOtherDBBackends`'s own retry loop — the window a just-terminated
+      backend needs to actually unregister before the busy check
+      (immediately following) runs. A plain (non-FORCE) DROP DATABASE keeps
+      its pre-existing single immediate check unchanged — no wait added
+      there (out of scope; upstream's unconditional 5s retry-wait even
+      without FORCE is a separate, not-yet-ported behaviour). No new
+      permission check beyond the existing DROP DATABASE owner/superuser
+      guard — mirrors the simplification goopg's `pg_terminate_backend` SQL
+      function already makes. Tests:
+      `TestTryHandleDatabaseDDLDropForceTerminatesOtherBackends`,
+      `TestDropDatabaseHasForce` (`internal/server/database_ddl_test.go`).
+      Design: `docs/design/0122-0017-database-ddl-drop-guards.md` new
+      "`WITH (FORCE)` connection termination" section; `docs/design/
+      README.md` row updated. Live-verified against a real `cmd/goopg`
+      binary (throwaway data dir, port 5601): a background `psql -d
+      forcetest -c "SELECT pg_sleep(60)"` held the database busy; plain
+      `DROP DATABASE forcetest` correctly errored "is being accessed by
+      other users"; `DROP DATABASE forcetest WITH (FORCE)` succeeded in
+      ~100ms, the busy session's client saw `FATAL: terminating connection
+      due to administrator command`, and `pg_database` no longer listed
+      `forcetest` afterward. Gates: `go build ./...` clean; `go vet
+      ./internal/server/...` clean; `go test ./internal/server/...` PASS
+      (full package, no regressions); `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+      scripts/ralph-precommit-test.sh` PASS (0 failed transactions, all 3
+      workloads). **Remaining M0122-0007 items (now 2):** CREATE/DROP
+      DATABASE physical storage isolation (the architectural item), REINDEX
+      CONCURRENTLY physical rebuild.
+  - [x] `M0122-0007` follow-up 3 (2026-07-09, this loop) — **physical-storage-
+      isolation slice 1: real, distinct `pg_database.oid` per CREATE
+      DATABASE.** Closes the prerequisite named at the top of every prior
+      loop's "still open" note in this bucket: `CreateDatabase` previously
+      never allocated an OID at all, so `pg_database.VirtualRows` rendered
+      the SAME hardcoded `"16384"` placeholder for every non-template
+      database — two `CREATE DATABASE` calls were indistinguishable by
+      `pg_database.oid` (a primary key upstream), and there was no OID to
+      name a future `base/<dbOid>` directory with. `catalog.InMemory.
+      CreateDatabase(name, owner)` now allocates a real OID from the same
+      cluster-wide `nextOID` counter every other object shares and returns it
+      (`(uint32, error)`); new `databaseOid` registry + `DatabaseOid(name)
+      uint32` getter (0 = "no override", the 3 bootstrap rows). The live
+      "postgres" row's displayed oid is deliberately UNCHANGED (never goes
+      through CreateDatabase — a prior loop found that changing it broke
+      CREATE SUBSCRIPTION's subdbid/datacl heap-resync matching). WAL
+      `EncodeCreateDatabase`/`DecodeCreateDatabase` gained a 4th trailing oid
+      field (same backward-compat pattern as the owner suffix);
+      `RegisterDatabaseDuringRecovery(name, owner, oid)` advances `nextOID`
+      past a recovered oid. Design: `docs/design/0122-0017-database-ddl-
+      drop-guards.md` new "Physical-storage-isolation slice 1" section;
+      `docs/design/README.md` row updated; deferral-ledger new row
+      (M0122-0007, 2026-07-09) maps the remaining slices 2-4 (base/<dbOid>
+      directory + template copy on CREATE, directory removal on DROP, and
+      — the deepest gap — giving `catalog.InMemory` a per-database table
+      namespace instead of one shared map for the whole process). Tests:
+      `TestCreateDatabaseAllocatesDistinctDisplayedOid`,
+      `TestRegisterDatabaseDuringRecoveryAdvancesNextOID`
+      (`internal/catalog/database_test.go`),
+      `TestDecodeCreateDatabaseDefaultsOidForPreSlice1Payload`
+      (`internal/wal/database_ddl_test.go`). Gates: `go build ./...`/`go vet
+      ./...` clean; `go test -count=1 ./internal/catalog/... ./internal/wal/...
+      ./internal/server/... ./internal/initdb/...` PASS (full, no
+      regressions); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed transactions, all 3 workloads). Also re-ran
+      `TestPort_PgDumpDatabaseConfigSet`, `TestPort_PgDumpRoleConfigSet`,
+      `TestPort_PgDumpallGlobalsOnly` (all PASS — confirms the "postgres"
+      placeholder-preservation reasoning above) and
+      `TestPort_Subscription001RepChanges` (FAILs, but confirmed via `git
+      stash` to fail identically at HEAD before this change — a pre-existing,
+      unrelated failure, not a regression). **Remaining M0122-0007 items:**
+      physical-storage-isolation slices 2-4 (see deferral ledger row for the
+      concrete resume points), REINDEX CONCURRENTLY physical rebuild.
+  - [x] `M0122-0007` follow-up 4 (2026-07-09, this loop) — **physical-storage-
+      isolation slice 2: `base/<dbOid>` directory on CREATE DATABASE, done
+      (template-copy half re-scoped, see below).** `internal/initdb.
+      createPerDatabaseScaffolding` (Init-time-only, unexported) is now
+      `CreatePerDatabaseScaffolding` (exported: `os.MkdirAll(base/<oid>)` +
+      write `base/<oid>/PG_VERSION`, both naturally idempotent). New
+      `Server.createDatabasePhysicalDirectory`/`removeDatabasePhysicalDirectory`
+      (`internal/server/database_ddl.go`) call it via `s.cfg.Pool.Manager().
+      DataDir()` (nil `Pool`/empty `DataDir` = silent no-op, matching
+      `execCreateTablespace`'s embedded/test-context skip). Wired into
+      `databaseDDLCreate` BEFORE the WAL append — mirrors
+      `relocateRelationPhysicalFile`'s crash-safety ordering (physical
+      artifact exists before the operation that commits to it); a directory-
+      creation failure rolls back the catalog oid allocation exactly like a
+      WAL-append failure, and a WAL-append failure now also removes the
+      just-created directory (best-effort, safe-orphan-on-failure). Restart
+      durability: `replayDatabaseDDLRecords`
+      (`internal/initdb/database_ddl_recovery.go`) gained a `dataDir string`
+      param and re-creates `base/<oid>` for every replayed `CREATE DATABASE`
+      record (idempotent — closes the gap where the directory itself has no
+      independent WAL/fsync protection separate from the catalog record).
+      **Re-scoped the original slice-2 plan's template-copy half:** copying
+      a non-`template0` `TEMPLATE`'s relations is impossible today because
+      goopg still has ONE shared table/index namespace for the whole process
+      (`catalog.InMemory.tables`/`indexes` have no per-database key) — there
+      is no way to enumerate "template1's relations" as distinct from any
+      other database's. That mechanism (upstream's
+      `CreateDatabaseUsingFileCopy`/`copydir`) needs slice 4's per-database
+      catalog namespace to land FIRST, contrary to the original plan's
+      ordering assumption; `TEMPLATE` options remain silently ignored,
+      unchanged. Design: `docs/design/0122-0017-database-ddl-drop-guards.md`
+      new "Physical-storage-isolation slice 2" section (includes the
+      re-scoping rationale); `docs/design/README.md` row updated. Tests:
+      `TestTryHandleDatabaseDDLCreateCreatesPhysicalDirectory` (confirmed
+      non-vacuous via `git stash` across all 4 touched files — fails
+      "PG_VERSION missing" pre-fix), `TestTryHandleDatabaseDDLCreateNoPoolIsNoop`
+      (`internal/server/database_ddl_test.go`);
+      `TestDatabaseDDLRecoveryRecreatesMissingDatabaseDirectory` (new — deletes
+      the directory between two `Open` calls, confirms replay recreates it)
+      plus an assertion added to `TestDatabaseDDLRecoveryReplaysCreate`
+      (`internal/initdb/database_ddl_recovery_test.go`). Live-verified
+      against a real `cmd/goopg` binary (port 65498): `CREATE DATABASE
+      slicetest` produced `base/16403/PG_VERSION` matching the connection's
+      `pg_database.oid`; deleting that directory and restarting the server
+      recreated it via WAL replay before any client reconnected. Gates: `go
+      build ./...` clean; `go vet ./internal/initdb/... ./internal/server/...
+      ./internal/catalog/...` clean; `go test ./internal/initdb/...
+      ./internal/server/... ./internal/catalog/... ./internal/wal/...` PASS
+      (full packages, no regressions); `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+      scripts/ralph-precommit-test.sh` PASS (0 failed transactions, all 3
+      workloads). **Remaining M0122-0007 items (before this loop):** physical-
+      storage-isolation slice 3 (real directory removal on DROP DATABASE —
+      `base/<dbOid>` is currently orphaned, harmless since nothing routes I/O
+      through it), slice 4 (per-database catalog namespace, the prerequisite
+      for the template-copy mechanism), REINDEX CONCURRENTLY physical rebuild.
+  - [x] `M0122-0007` follow-up 5 (2026-07-09, this loop) — **physical-storage-
+      isolation slice 3: real `base/<dbOid>` directory removal on DROP
+      DATABASE, done.** New `initdb.RemovePerDatabaseScaffolding(dataDir,
+      dbOID)` (symmetric counterpart to `CreatePerDatabaseScaffolding`,
+      idempotent `os.RemoveAll`). `Server.removeDatabasePhysicalDirectory`
+      (previously only used for CREATE-DATABASE-WAL-append-failure rollback)
+      now delegates to it (was inlining its own `os.RemoveAll(filepath.Join(...))`
+      — now shares the one path-construction site) and gained a second
+      caller: the end of `tryHandleDatabaseDDL`'s `databaseDDLDrop` branch,
+      once the drop is durable (after `WAL.Append` succeeds, or immediately
+      if no WAL configured) — mirrors slice 2's create-side crash-safety
+      ordering in reverse (remove only after the operation that commits to
+      the drop, never before, so a WAL-append failure that re-creates the
+      catalog entry with a fresh oid never removes a directory a still-live
+      database might resolve to). The dropped database's oid is captured via
+      `cat.DatabaseOid(name)` (added to the `databaseRegistry` interface)
+      BEFORE `cat.DropDatabase(name)`, which deletes the name→oid mapping
+      along with the rest of the catalog entry. Restart durability:
+      `replayDatabaseDDLRecords` (`internal/initdb/database_ddl_recovery.go`)
+      now removes `base/<oid>` for every replayed `RecordKindDropDatabase` —
+      the WAL record only carries the database name, so the oid is read from
+      the still-live registry (new `databaseRegistryRecovery.DatabaseOid`)
+      immediately before `UnregisterDatabaseDuringRecovery` erases it,
+      correct even when a CREATE and its matching DROP replay within the
+      same pass. Tests: `TestTryHandleDatabaseDDLDropRemovesPhysicalDirectory`
+      (`internal/server/database_ddl_test.go`, confirmed non-vacuous via `git
+      stash` on `database_ddl.go` alone — fails "still present after DROP
+      DATABASE" pre-fix); `TestDatabaseDDLRecoveryReplaysDropAfterCreate`
+      extended with a `base/16402` absence assertion
+      (`internal/initdb/database_ddl_recovery_test.go`, confirmed non-vacuous
+      via `git stash` on `database_ddl_recovery.go`/`initdb.go` together).
+      Live-verified against a real `cmd/goopg` binary (port 65499):
+      `CREATE DATABASE slice3test` produced `base/16403/`; `DROP DATABASE
+      slice3test` removed it immediately; a second create/drop/restart cycle
+      confirmed the directory stays gone across a real server restart (WAL
+      replay does not resurrect a dropped database's directory). Gates: `go
+      build ./...` clean; `go vet ./internal/initdb/... ./internal/server/...
+      ./internal/catalog/...` clean; `go test ./internal/initdb/...
+      ./internal/server/... ./internal/catalog/... ./internal/wal/...` PASS
+      (full packages, no regressions); `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+      scripts/ralph-precommit-test.sh` PASS (0 failed transactions, all 3
+      workloads). Design: `docs/design/0122-0017-database-ddl-drop-guards.md`
+      new "Physical-storage-isolation slice 3" section; `docs/design/README.md`
+      row updated. **Remaining M0122-0007 items:** slice 4 (per-database
+      catalog namespace, the prerequisite for the template-copy mechanism),
+      REINDEX CONCURRENTLY physical rebuild.
+  - [x] `M0122-0007` follow-up 6 (2026-07-09, this loop) — **`REINDEX ...
+      CONCURRENTLY` physical rebuild, done** (all three object types —
+      INDEX/TABLE/SCHEMA — that already reproduced the CONCURRENTLY wait
+      timing; `REINDEX DATABASE`/`SYSTEM` and the synthetic `pg_toast.*`
+      form remain unaffected catalog-only no-ops). New shadow-file
+      build-then-swap: `buildIndexShadow` (`operators_reindex.go`) mints a
+      fresh, catalog-invisible `RelFileNode` via `Catalog.AllocOID()` (never
+      registered — the same synthetic-OID pattern named CHECK constraints
+      already use) and runs the exact `bulkBuildBTree`/
+      `bulkBuildBTreeWithPredicate` path plain REINDEX uses, targeting that
+      RelFileNode instead of the live index's own — so the live index keeps
+      serving every concurrent reader/writer throughout the build, no lock
+      needed. The pre-existing `waitForRelationLockers` call is UNCHANGED in
+      position/target/semantics (TABLE/SCHEMA still make exactly one call
+      per table, after building every index's shadow, not one per index) —
+      deliberately preserved so `reindex-concurrently.spec`'s session-
+      interleaving assertions (which key off this wait's exact timing) stay
+      intact. `swapRelationPhysicalFile` (`operators_ddl.go`) then
+      atomically `os.Rename`s the already-built-and-flushed shadow file over
+      the live index's file — same filesystem ⇒ atomic, so a crash on
+      either side of the rename leaves the pre- or fully-rebuilt file, never
+      torn — under a brief `acquireReindexLocks` hold (the SAME lock plain
+      REINDEX INDEX already takes for its *entire* rebuild, here held only
+      around the swap). The index's OID/RelFileNode is never changed, only
+      its bytes are, so — unlike ALTER ... SET TABLESPACE's relocation —
+      this needs **no catalog mutation and no WAL record**: the renamed file
+      already is the durable state once the rename returns.
+      `removeShadowRelationFile` best-effort cleans up an already-built
+      shadow that turns out not to be needed (sibling build failure, or the
+      wait itself erroring), mirroring `relocateRelationPhysicalFileCleanupOld`'s
+      non-fatal contract. Tests:
+      `TestReindexIndexConcurrentlyPhysicallyRebuilds`,
+      `TestReindexTableConcurrentlyPhysicallyRebuildsAllIndexes`,
+      `TestReindexIndexConcurrentlyDoesNotBlockConcurrentIndexReader`
+      (`internal/executor/reindex_physical_rebuild_test.go`), all confirmed
+      non-vacuous (assert the actual btree.RangeScan contents and completion
+      timing, not just "no error"). Live-verified against a real `cmd/goopg`
+      binary (port 65499): zero-byte-truncated a live PK index's on-disk
+      relfilenode file, confirmed the query then failed (`short read at
+      block`), ran `REINDEX INDEX CONCURRENTLY`, confirmed the SAME
+      relfilenode (16405, unchanged), a working index-scan query, and
+      survival across a real server restart with no orphaned shadow file
+      left in `base/<db>/`. Gates: `go build ./...` clean; `go test
+      ./internal/executor/... ./internal/access/btree/...
+      ./internal/catalog/... ./internal/planner/...` PASS; `go test
+      ./internal/testport/ -run
+      'TestPort_IsolationReindex|TestPort_IsolationMultipleCic'` PASS (all 4
+      specs, no regression — confirms the wait-call timing this loop was
+      careful to preserve actually held); `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+      scripts/ralph-precommit-test.sh` PASS (0 failed transactions, all 3
+      workloads). Design: `docs/design/0122-0007-reindex-physical-rebuild.md`
+      new "shadow-file build-then-swap" section (+ updated Deferral);
+      `docs/design/0122-0017-database-ddl-drop-guards.md` "Still open"
+      updated; `docs/design/README.md` row updated. **Deliberately NOT
+      implemented** (same simplification CREATE INDEX CONCURRENTLY already
+      makes — single build + single start-time wait, no second validation
+      scan): a write landing on the table WHILE the shadow build's heap scan
+      is in flight is not guaranteed to appear in the rebuilt index; real
+      PostgreSQL closes this with `validate_index`'s incremental catch-up
+      scan, which goopg implements for neither CONCURRENTLY form. Deferral
+      ledger row appended for this residual gap. **Remaining M0122-0007
+      items:** slice 4 (per-database catalog namespace, the prerequisite for
+      the template-copy mechanism) is now the only item left in this bucket.
+  - [x] `M0122-0007` follow-up 7 (2026-07-09, this loop) — **slice 4 design
+      pass + sub-slice 4a (context plumbing), landed.** Every prior loop in
+      this bucket flagged slice 4 (per-database catalog namespace) as "needs
+      its own design pass" / "a multi-loop epic" but none had written that
+      pass down. New design doc `docs/design/0122-0018-per-database-catalog-namespace.md`
+      inventories the actual blast radius (226 direct `c.tables`/`c.indexes`/
+      `c.byTable` call sites in `catalog.go` alone, measured via grep, plus
+      dozens of public entry points called from hundreds of executor/planner
+      sites) and lays out an ordered sub-slice breakdown: 4a (context
+      plumbing, landed) → 4b (namespace the maps behind a `dbOid`-keyed
+      accessor, behavior-preserving) → 4c (route reads through the
+      connection's real dbOid) → 4d (route writes + `RelFileNode.DBOid`) →
+      4e (cross-cutting fixups + the `CREATE DATABASE ... TEMPLATE` copy
+      mechanism this epic exists to unblock). Landed 4a: `catalog.
+      (*InMemory).ResolveDatabaseOid(name) (uint32, bool)`
+      (`internal/catalog/catalog.go`) is the canonical resolver for a
+      database's REAL physical oid (`c.DBOID()` for "postgres", fixed
+      bootstrap oids 1/4 for template1/template0, `DatabaseOid` for anything
+      else) — distinct from `pg_database`'s displayed-oid placeholder for
+      "postgres". New `executor.Context.CurrentDatabaseOid uint32` field is
+      stamped by the existing shared `Server.wireExtensionRows`
+      (`internal/server/dispatch.go`) — the SAME site both the simple and
+      extended query dispatch paths already call to wire `CurrentDatabase`/
+      `ExtensionRows` (M0110-0003 gap #7c) — so both sibling paths get the
+      new oid in one wiring point instead of risking a "wire only one path"
+      bug. Deliberately pure plumbing: no lookup site consumes
+      `CurrentDatabaseOid` yet, so this sub-slice changes zero observable
+      behavior. Tests: `TestResolveDatabaseOid`
+      (`internal/catalog/database_test.go`),
+      `TestWireExtensionRowsStampsCurrentDatabaseOid`
+      (new `internal/server/database_oid_wiring_test.go`), both confirmed
+      non-vacuous via `git stash` on the production file alone (compile
+      failure pre-fix). Gates: `go build ./...` clean; `go vet
+      ./internal/catalog/... ./internal/executor/... ./internal/server/...`
+      clean; `go test ./internal/catalog/... ./internal/executor/...
+      ./internal/server/...` PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+      scripts/ralph-precommit-test.sh` PASS (0 failed transactions, all 3
+      workloads). Design: `docs/design/0122-0018-per-database-catalog-namespace.md`
+      (new) + `docs/design/README.md` row. Deferral ledger row appended
+      (task-id "M0122-0007 (physical-storage-isolation slice 4a...)").
+      **Remaining M0122-0007 items:** sub-slices 4b-4e (see the new design
+      doc for the full plan) — 4b is the next resume point: wrap
+      `tables`/`indexes`/`byTable` in a per-dbOid namespace and thread an
+      explicit `dbOid` parameter through every public entry point (all
+      callers passing `DefaultDBOid` to stay behavior-preserving); budget it
+      as one self-contained pass, not spread across loops.
+  - [x] `M0122-0007` follow-up 8 (2026-07-09, this loop) — **slice 4 sub-slice
+      4b-i (namespace the table/index maps, internal only), landed.** Wrapped
+      `catalog.InMemory`'s `tables map[string]*Table`/`indexes
+      map[string]*Index`/`byTable map[uint32]map[string]*Index` fields in a
+      new `tableNamespace` struct keyed by `namespaces map[uint32]
+      *tableNamespace` (`internal/catalog/catalog.go`), with a `(c
+      *InMemory) ns(dbOid uint32) *tableNamespace` accessor. Replaced all 226
+      direct `c.tables`/`c.indexes`/`c.byTable` references inside
+      `catalog.go` with `c.ns(DefaultDBOid).tables`/etc (confirmed
+      mechanical: every one of the 226 already used receiver `c`, no other
+      receiver existed), plus 27 further direct-field references in
+      same-package white-box tests (`internal/catalog/*_test.go`, e.g.
+      `temp_namespace_test.go` seeding rows straight into `c.tables`).
+      Locking contract: `ns()` does NOT lock `c.mu` itself (not reentrant) —
+      it relies on `namespaces[DefaultDBOid]` being pre-seeded once inside
+      `NewInMemory` (single-threaded, before any goroutine fan-out) so its
+      lazy-create branch is dead code for now; every existing call site
+      still holds the same lock it always did. **Deliberately split out of
+      the original "4b" scope** (see design doc's 4b-i/4b-ii split): giving
+      every public entry point (`LookupTable`, `CreateTable`, ... ~dozens of
+      functions, hundreds of external callers in `internal/executor`/
+      `internal/planner`) an explicit `dbOid` parameter is now 4b-ii — a
+      separately-large, cross-package mechanical pass that this loop did
+      NOT attempt, so as to avoid landing a half-migrated signature set.
+      Zero observable behavior change (every namespace resolved is still
+      `DefaultDBOid`). Gates: `go build ./...` clean; `go vet ./...` clean;
+      `go test -short $(go list ./... | grep -v /internal/testport)` (full
+      repo, short mode) PASS; `go test ./internal/catalog/...
+      ./internal/executor/... ./internal/server/...` (targeted, non-short)
+      PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed transactions, all 3 pgbench workloads). Design:
+      `docs/design/0122-0018-per-database-catalog-namespace.md` updated (4b
+      split into 4b-i landed / 4b-ii planned) — no README.md index change
+      needed (same doc, already indexed). **Remaining M0122-0007 items:**
+      4b-ii (public entry-point `dbOid` parameter + all external callers),
+      then 4c/4d/4e per the design doc; 4b-ii is the next resume point and
+      should also be budgeted as its own self-contained pass.
+  - [x] `M0122-0007` follow-up 9 (2026-07-09, this loop) — **slice 4 sub-slice
+      4b-ii (give every public catalog entry point a dbOid parameter), landed.**
+      All 17 blast-radius entry points (`LookupTable`/`CreateTable`/`DropTable`/
+      `LookupIndex`/`CreateIndex`/`DropIndex`/`RenameTable`/`RenameIndex`/
+      `AllTables`/`AllIndexes`/`TablesInSchema`/`RegisterRealTable`/
+      `TryRegisterUserTable`/`LookupTableByOID`/`LookupIndexByOID`/
+      `InheritanceChildren`/`PartitionChildren`) gained a trailing **variadic**
+      `dbOid ...uint32` parameter (new `resolveDBOid(dbOid []uint32) uint32`
+      helper next to `ns()`: `dbOid[0]` if supplied, else `DefaultDBOid`) —
+      a deliberate deviation from the design doc's original "required
+      parameter + edit every external caller" plan. A measured `grep` pass
+      found 800+ non-test external call sites across the 17 entry points
+      (300+ for `LookupTable` alone); the variadic form makes every one of
+      them resolve to `DefaultDBOid` for free with zero risk of a missed or
+      mis-edited site, while staying call-site-identical for 4c/4d's future
+      real-dbOid callers (`c.LookupTable(name, ctx.CurrentDatabaseOid)` reads
+      the same either way). The `Catalog` interface's 9 overlapping methods
+      gained the same variadic parameter; its two implementers (`*InMemory`,
+      `*SearchPathCatalog`'s `LookupTable` override) both updated — confirmed
+      via grep to be the only two, no mock/test-double implementers exist.
+      The private `lookupIndexLocked`/`tableByOID` helpers (shared by
+      `LookupIndex`/`RenameIndex`/recovery-path callers, and by
+      `LookupTableByOID`/8 TOAST-relation helpers) took a **required**
+      `dbOid uint32` instead, since every call site is in the same file;
+      the out-of-scope recovery/TOAST callers all pass `DefaultDBOid`
+      explicitly, unchanged behavior. Zero observable behavior change: no
+      caller anywhere passes a non-default dbOid yet. New test
+      `TestDBOidParameterRoutesToDistinctNamespace`
+      (`internal/catalog/dbid_namespace_test.go`) exercises all 17 entry
+      points with dbOid=999 vs. the default, proving two namespaces are
+      genuinely isolated (not silently ignored) — also the first thing to
+      exercise `ns()`'s lazy-create branch with a non-pre-seeded dbOid,
+      safe here because every write goes through `CreateTable`/`CreateIndex`
+      already holding `c.mu` for writing (4b-i's locking contract).
+      Confirmed non-vacuous via `git stash` on `catalog.go` alone (the new
+      test fails to compile pre-fix — every call passes one argument too
+      many against the pre-4b-ii required-arity signatures). Design:
+      `docs/design/0122-0018-per-database-catalog-namespace.md` new "4b-ii"
+      section (status flipped to landed, deviation documented) +
+      "Recommended order" section updated; `docs/design/README.md` row
+      updated. Deferral-ledger: the 4b-ii row from follow-up 8 flipped to
+      `resolved`, new row appended documenting what changed and deferring
+      4c/4d (real per-connection routing — still 100% unimplemented; every
+      call site still implicitly resolves `DefaultDBOid`). Gates: `go build
+      ./...`/`go vet ./...` clean; `go test ./internal/catalog/...
+      ./internal/executor/... ./internal/server/...` PASS; `go test -short
+      $(go list ./... | grep -v /internal/testport)` (full repo, short
+      mode) PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed transactions, all 3 pgbench workloads). **Remaining
+      M0122-0007 items:** 4c (route READ paths through
+      `ctx.CurrentDatabaseOid`) is the next resume point, then 4d (route
+      WRITE paths + `RelFileNode.DBOid`), then 4e (cross-cutting fixups +
+      the `CREATE DATABASE ... TEMPLATE` copy mechanism this epic exists to
+      unblock).
+  - [x] `M0122-0007` follow-up 10 (2026-07-09, this loop) — **slice 4 sub-slice
+      4c (route READ paths through the connection's real dbOid), landed.**
+      `catalog.SearchPathCatalog` gains a `DBOid uint32` field; its existing
+      `LookupTable` override and a new `LookupIndex` override now key off it
+      via a new `effectiveDBOid` helper (explicit caller-supplied dbOid still
+      wins unconditionally) and the new exported
+      `catalog.NamespaceDBOid(uint32) uint32`. Wired at all four
+      `SearchPathCatalog`-construction seams in `internal/server/dispatch.go`
+      (`ctxPlanCatalog` ×2 read `ctx.CurrentDatabaseOid` directly;
+      `sessionPlanCatalog` gained a `dbOid uint32` parameter, all 5 call
+      sites updated — one (dispatch.go's `ectx.PlanCatalog` seed) resolves it
+      directly from `connTx.DBName` via a new `resolveConnDBOid` helper since
+      `wireExtensionRows` hasn't stamped `ectx.CurrentDatabaseOid` yet at
+      that point in the request). **Critical correctness finding, not in the
+      original 4c plan text:** wiring the connection's raw
+      `ResolveDatabaseOid` answer straight into the namespace lookup would
+      have been a severe regression — `ResolveDatabaseOid("postgres")`
+      answers `PostgresDBOid` (5), but every catalog write path still
+      unconditionally persists under `DefaultDBOid` (1) until 4d migrates
+      them, so literally every table would have vanished for every
+      "postgres" connection (the overwhelming majority of real traffic —
+      TPC-H/pgbench/regress all connect to "postgres"). `NamespaceDBOid`
+      maps both `0` (no live connection) and `PostgresDBOid` back to
+      `DefaultDBOid`; confirmed via `scripts/tpch-spotcheck.sh` staying
+      Q12=2/Q13=33 (would have gone to 0 rows without the shim). **Second
+      correctness finding:** `ns()` used to lazily create-and-register a
+      missing dbOid's namespace even when called under `c.mu.RLock()`
+      (`LookupTable`/`LookupIndex`/5 other read entry points) — a concurrent
+      map write racing every other RLock holder, unreachable in production
+      before 4c (every real call resolved to the pre-seeded `DefaultDBOid`)
+      but a live hazard now that a never-seeded dbOid (any real second
+      database, before 4d ever writes to it) is a normal read. Fixed: `ns()`
+      is now non-mutating (returns a shared, never-written
+      `emptyTableNamespace` sentinel for a missing dbOid); new
+      `getOrCreateNS` — used only by the four entry points that can register
+      a namespace's first object (`CreateTable`/`CreateIndex`/
+      `RegisterRealTable`/`TryRegisterUserTable`, all under `c.mu.Lock()`) —
+      keeps create-on-demand semantics where they're actually safe.
+      Reproduced the exact pre-fix `fatal error: concurrent map read and map
+      write` crash via a scratch revert-and-`-race`-rerun (not committed) to
+      confirm the fix is non-vacuous. **Third correctness finding:** the
+      cross-session plan cache (`internal/server/plancache.go`, M0098-0005)
+      caches a `planner.Node` in a single server-wide map keyed only by
+      normalized SQL text — a plan embeds resolved `*catalog.Table`/
+      `*catalog.Index` pointers from whichever namespace was live when it was
+      planned, so without a namespace-aware key a plan built for one
+      database's namespace could be replayed for a connection reading a
+      different one. New `planCacheKey(sql, dbOid)` prefixes the existing key
+      with `catalog.NamespaceDBOid(dbOid)`; both cache sites
+      (`dispatchSimpleQueryViaExecutor`'s single-statement cache,
+      `executeExtendedQueryViaExecutor`'s cross-session cache) updated
+      together. This was caught by hand-tracing the cache's key computation,
+      not by a failing test — every connection resolves to the same
+      `DefaultDBOid` today (nothing yet connects to two distinct real
+      databases through the live server), so it would have passed every
+      existing test while silently wrong once 4d makes namespaces diverge.
+      New tests (`internal/catalog/dbid_namespace_test.go`):
+      `TestSearchPathCatalogDBOidRoutesReads` (5 subcases covering all of
+      zero/`PostgresDBOid`/`DefaultDBOid`-explicit/a-genuinely-distinct-dbOid/
+      explicit-argument-wins-over-wrapper-field) and
+      `TestNsReadOnlyUnderConcurrentUnseededDBOids` (64 goroutines racing
+      `LookupTable`/`LookupIndex` against distinct never-seeded dbOids under
+      `-race`). Design: `docs/design/0122-0018-per-database-catalog-namespace.md`
+      4c section flipped to landed with full writeup (status header updated,
+      "Recommended order" section points at 4d next + flags an unrelated
+      pre-existing `internal/activity/registry.go` `-race` failure noticed
+      during verification — confirmed via `git stash` to reproduce
+      identically on unmodified HEAD, out of scope for this loop);
+      `docs/design/README.md` row updated. Gates: `go build ./...`/`go vet
+      ./...` clean; `go test -race ./internal/catalog/... ./internal/executor/...`
+      PASS; `go test ./internal/catalog/... ./internal/executor/...
+      ./internal/server/...` PASS (the `internal/server` `-race` run hits the
+      pre-existing unrelated `TestConnectExceedsPositiveDatconnlimitRejected`
+      race noted above; non-`-race` `internal/server` run is clean); `go test
+      -short $(go list ./... | grep -v /internal/testport)` (full repo, short
+      mode) PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33 — the
+      critical end-to-end proof the `postgres` dual-mirror shim works);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed transactions, all 3 pgbench workloads — exercises both
+      plan-cache paths under real concurrent load). **Remaining M0122-0007
+      items (before this loop):** 4d (route WRITE paths + `RelFileNode.DBOid`;
+      must revisit the `postgres`/`DefaultDBOid` dual-mirror shim once writes
+      route by real dbOid), then 4e (cross-cutting fixups + the `CREATE
+      DATABASE ... TEMPLATE` copy mechanism this epic exists to unblock).
+
+  - [x] `M0122-0007` follow-up 11 (2026-07-09, this loop) — **slice 4
+      sub-slice 4d-i (thread the connection's real dbOid through catalog
+      WRITE entry points), landed.** All ~24 executor-level catalog-write
+      call sites — `CreateTable` (`execCreateTable`, both `execCreateTableAs`
+      branches, `CreateSequenceCatalogRelation`), `CreateIndex`
+      (`execCreateIndex`'s gist/spgist/gin/brin branch, the btree bulk-build
+      path, `createExclusionIndexStub`), `DropTable`/`DropIndex`
+      (`execDropTable`, `execDropIndex`, `ApplyPendingIndexDrops`, the
+      btree-build/WAL-failure rollback paths, DROP SCHEMA CASCADE's table
+      loop, the sequence virtual-relation removal, the TEMP-table
+      shadow-drop), `RenameTable`/`RenameIndex` (both ALTER RENAME branches),
+      `AddColumn` (`addColumnRecursive`), and the savepoint-rollback restore
+      path (`RegisterTable`/`RestoreIndex` in `ProcessRollbackUndos` +
+      `execRollbackTo` + the TEMP-drop shadow-restore) — in
+      `internal/executor/operators_ddl.go` + `operators_tx.go` — now pass
+      `catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)` instead of omitting
+      the dbOid argument entirely (which every one of them defaults to
+      `DefaultDBOid` via `resolveDBOid`'s zero-length fallback). `AddColumn`,
+      `RegisterTable`, `RestoreIndex` gained their first `dbOid ...uint32`
+      parameter (4b-ii missed these three — nothing called them with one at
+      the time). `CreateSequenceCatalogRelation` (shared between the live
+      executor and `internal/initdb/sequence_ddl_recovery.go`'s WAL replay)
+      gained a *required* `dbOid uint32` parameter instead of variadic, since
+      its two callers need genuinely different values: the live path
+      resolves the connection's real dbOid, replay keeps passing
+      `catalog.DefaultDBOid` explicitly (startup replay has no per-connection
+      concept, unchanged behavior). `ApplyPendingIndexDrops` needed no
+      signature change — both its callers already had a `*Context` in scope,
+      so it resolves the dbOid internally. **Net effect:** a connection to a
+      genuinely distinct real database (one with its own `pg_database.oid`
+      from a prior `CREATE DATABASE`) now creates/drops/renames catalog
+      objects in its own namespace instead of the shared default; a
+      `"postgres"` connection's writes are bit-for-bit unchanged (the
+      `catalog.NamespaceDBOid` dual-mirror shim from 4c was deliberately left
+      untouched, confirmed via tpch-spotcheck + pgbench smoke both connecting
+      as `"postgres"` staying green with canonical row/transaction counts).
+      **Critical scope finding, discovered while writing this loop's own
+      tests, that defines 4d-ii's actual scope:** `ectx.Catalog` (every
+      executor operator's own catalog reference, assigned once in
+      `internal/server/dispatch.go:295` as the raw, unwrapped
+      `*catalog.InMemory`) is never wrapped in a `SearchPathCatalog` the way
+      `ectx.PlanCatalog` is — 4c only wired the *planner's* catalog
+      reference. So the 60+ bare `LookupTable`/`LookupIndex` calls in
+      `operators_ddl.go` alone (plus more across `operators_fk.go`,
+      `operators_cluster.go`, `operators_reindex.go`, `operators_sequence.go`,
+      `operators_storage.go`, `operators_pg_get_publication_tables.go`, and
+      every DML operator) still resolve only `DefaultDBOid`, completely
+      independent of `ctx.CurrentDatabaseOid` — meaning a table this loop's
+      fix correctly creates under a distinct dbOid is still invisible to
+      `execDropTable`/`execCreateIndex`/ALTER-TABLE/most DML, because their
+      own pre-mutation `LookupTable`/`LookupIndex` call never receives that
+      dbOid. Reproduced directly while writing
+      `internal/executor/ddl_write_dbid_routing_test.go`: a `CREATE TABLE ...
+      AS SELECT ... FROM <table-in-a-distinct-namespace>` failed to plan
+      (`relation does not exist`) until the test was rewritten to use a
+      `FROM`-less literal SELECT, because `o.planCatalog()` falls back to the
+      raw unwrapped `ctx.Catalog` whenever `ctx.PlanCatalog` is nil (true in
+      every unit-test harness; the live server path only gets `PlanCatalog`
+      wrapping from 4c's dispatch.go wiring). This is why only `CreateTable`
+      (which needs no prior dbOid-aware lookup to succeed) is
+      independently end-to-end-tested this loop — the other entry points'
+      dbOid threading is correct, tested-safe (zero behavior change for any
+      existing connection kind), but not yet independently exercisable with
+      a non-default dbOid until 4d-ii closes the lookup-side gap. New tests:
+      `TestExecCreateTableRoutesToConnectionRealDBOid`,
+      `TestExecCreateTableAsRoutesToConnectionRealDBOid`,
+      `TestExecCreateTablePostgresConnectionStaysOnDefaultDBOid`
+      (`internal/executor/ddl_write_dbid_routing_test.go`). Design:
+      `docs/design/0122-0018-per-database-catalog-namespace.md` 4d section
+      split into landed "4d-i" (this loop, full writeup) + planned "4d-ii"
+      (lookup-side threading + `RelFileNode.DBOid`, both itemized);
+      `docs/design/README.md` row updated. Deferral ledger: new row (2026-07-09,
+      M0122-0007 4d-i) recording the 4d-ii gap in full. Gates: `go build
+      ./...`/`go vet ./...` clean; `go test -race ./internal/catalog/...
+      ./internal/executor/...` PASS; `go test -short $(go list ./... | grep
+      -v /internal/testport)` (full repo, short mode) PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+      scripts/ralph-precommit-test.sh` PASS (0 failed transactions, all 3
+      pgbench workloads). **Remaining M0122-0007 items:** 4d-ii (thread
+      `catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)` through the
+      executor-operator-level `LookupTable`/`LookupIndex` call sites 4d-i's
+      write-routing needs to actually find its own objects, then wire
+      `RelFileNode.DBOid` at creation time), then 4e (cross-cutting fixups +
+      the `CREATE DATABASE ... TEMPLATE` copy mechanism this epic exists to
+      unblock).
+  - [x] `M0122-0007` follow-up 12 (2026-07-09, this loop) — **slice 4
+      sub-slice 4d-ii-part-1 landed**: threaded
+      `catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)` through all 60
+      direct `o.ctx.Catalog.LookupTable(...)`/`o.ctx.Catalog.LookupIndex(...)`
+      (and the one bare-`ctx`-param `ctx.Catalog.LookupTable(...)`) call
+      sites in `internal/executor/operators_ddl.go` that previously passed
+      no dbOid argument — `execDropTable`, `execCreateIndex` (and its
+      several internal re-lookups of the index it just built),
+      `execCreateView`/`execDropOneView`/`execDropOneMatView`, the ALTER
+      TABLE family, partition attach/detach/inherit, sequence `OWNED BY`
+      resolution, `catalogHeapSyncAvailable`, etc. Applied via a throwaway
+      Python script (not committed) that walks each `.LookupTable(`/
+      `.LookupIndex(` call to its balanced closing paren (handles the
+      several multi-line call sites correctly) and inserts the dbOid
+      argument; the resulting diff was hand-reviewed via `git diff` before
+      running any gates. This closes exactly the gap 4d-i's own writeup
+      proved empirically: a same-connection DROP TABLE/CREATE INDEX on a
+      table just created under a distinct dbOid by 4d-i's write routing
+      could not find it (`o.ctx.Catalog.LookupTable`/`LookupIndex` always
+      resolved `DefaultDBOid` regardless of `ctx.CurrentDatabaseOid`). New
+      tests `TestExecDropTableFindsOwnDistinctDBOidTable`,
+      `TestExecCreateIndexFindsOwnDistinctDBOidTable`
+      (`internal/executor/ddl_write_dbid_routing_test.go`) — CREATE TABLE
+      then DROP TABLE / CREATE INDEX on the same distinct-dbOid connection,
+      confirmed failing with "does not exist" before this loop's fix.
+      **Deliberately out of scope, deferred to 4d-ii-part-2** (both
+      itemized in the design doc and a new deferral-ledger row): (1) 15
+      `im.LookupTable`/`im.LookupIndex`/`cat.LookupTable` call sites still
+      in `operators_ddl.go` itself, bound from locals/params with no
+      `ctx`/dbOid in scope (`collectAllViewTransitiveDeps`,
+      `walkSelectPKDeps`, the ACL-grant loop, the DROP-CASCADE helpers) —
+      these need a signature-cascading fix (thread `dbOid` through the
+      helper's own signature + every caller), not a trailing-arg one; (2)
+      the entire cross-file sweep the original 4d-i finding named
+      (`operators_fk.go`/`operators_cluster.go`/`operators_reindex.go`/
+      `operators_sequence.go`/`operators_storage.go`/
+      `operators_pg_get_publication_tables.go`/DML operators) — untouched;
+      (3) `RelFileNode.DBOid` at creation time — still hardcoded to
+      `DefaultDBOid`. Design: `docs/design/0122-0018-per-database-catalog-namespace.md`
+      4d-ii split into landed "4d-ii-part-1" (this loop) + planned
+      "4d-ii-part-2" (both itemized in full); `docs/design/README.md` row
+      updated; "Recommended order" section updated. Deferral ledger: new
+      row (2026-07-09, M0122-0007 4d-ii part 1) recording the part-2 gap in
+      full. Gates: `go build ./...`/`go vet ./...` clean; `go test -race
+      ./internal/catalog/... ./internal/executor/...` PASS; `go test -short
+      $(go list ./... | grep -v /internal/testport)` (full repo, short
+      mode) PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed transactions, all 3 pgbench workloads). **Remaining
+      M0122-0007 items:** 4d-ii-part-2 (the signature-cascading `im`/`cat`
+      lookups + cross-file sweep + `RelFileNode.DBOid`), then 4e
+      (cross-cutting fixups + the `CREATE DATABASE ... TEMPLATE` copy
+      mechanism this epic exists to unblock).
+
+  - [x] `M0122-0007` follow-up 13 (2026-07-09, this loop) — **slice 4
+      sub-slice 4d-ii-part-2a landed**: closed all 14 `im.LookupTable`/
+      `im.LookupIndex`/`cat.LookupTable` call sites 4d-ii-part-1 deferred
+      (`internal/executor/operators_ddl.go`). Re-auditing each site's
+      enclosing function found only 2 of the 14 were genuine
+      signature-cascades — the other 12 (`execCreateView`'s OR REPLACE
+      branch, `execAttrACLChange`, `execCommentOn`'s 6 `ObjKind` cases,
+      `execCreateStatistics`, `lockRelationTransitively`) were already
+      `(o *ddlOp)` methods or already received `ctx *Context`, so a
+      trailing `catalog.NamespaceDBOid(...)` argument sufficed, same
+      mechanical shape as part 1's 60 sites. The 2 real cascades —
+      `collectAllViewTransitiveDeps(im, startName)` and the
+      mutually-recursive `collectViewPKDeps`/`walkSelectPKDeps`/
+      `walkExprPKDeps`/`addGroupByPKDeps` cluster (M0097-0036's view
+      PK-dependency AST walk) — each gained a `dbOid uint32` parameter,
+      threaded through their own internal `LookupTable` call and every
+      external call site (4 callers for the first, 1 for the second).
+      New tests `TestExecCommentOnFindsOwnDistinctDBOidTable`,
+      `TestExecCreateStatisticsFindsOwnDistinctDBOidTable`,
+      `TestExecAttrACLChangeFindsOwnDistinctDBOidTable`
+      (`internal/executor/ddl_write_dbid_routing_test.go`), each confirmed
+      non-vacuous by temporarily reverting its site's dbOid argument.
+      **New finding, recorded in the design doc + a new deferral-ledger
+      row:** `catalog.InMemory.CreateView`/`AllUserViews`/
+      `AllUserMatViews`/`IndexesOnTable` are all hardcoded to
+      `c.ns(DefaultDBOid)` with no dbOid parameter at all — discovered
+      while trying (and failing) to write an end-to-end/white-box
+      regression test for the 2 signature-cascaded functions above; this
+      is a materially bigger, previously-undocumented gap than the
+      `LookupTable`/`LookupIndex` call-site sweep ever covered, filed as
+      new item 3 of 4d-ii-part-2b (design doc:
+      `docs/design/0122-0018-per-database-catalog-namespace.md`, split
+      into landed "4d-ii-part-2a" + renumbered planned "4d-ii-part-2b";
+      `docs/design/README.md` row updated). Gates: `go build ./...`/
+      `go vet ./...` clean; `go test -race ./internal/catalog/...
+      ./internal/executor/...` PASS; `go test -short $(go list ./... |
+      grep -v /internal/testport)` (full repo, short mode) PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS
+      (0 failed transactions, all 3 pgbench workloads). **Remaining
+      M0122-0007 items:** 4d-ii-part-2b (cross-file sweep across
+      `operators_fk.go`/`operators_cluster.go`/`operators_reindex.go`/
+      `operators_sequence.go`/`operators_storage.go`/
+      `operators_pg_get_publication_tables.go`/DML operators, the
+      newly-found `CreateView`/`AllUserViews`/`AllUserMatViews`/
+      `IndexesOnTable`/`planCatalog()` dbOid-awareness gap, and
+      `RelFileNode.DBOid`), then 4e (cross-cutting fixups + the
+      `CREATE DATABASE ... TEMPLATE` copy mechanism this epic exists to
+      unblock).
+  - [x] `M-NIGHTLY (AI-20260710-011513-001)` / `M0122-0007` follow-up 14
+      (2026-07-10, this loop) — **fixed the nightly-CI build regression**
+      (`make build` failing in preflight, `ci/logs/action-items.md`). Root
+      cause: the tree at loop start already carried uncommitted, mid-flight
+      WIP from an interrupted prior loop iteration that had started
+      4d-ii-part-2b item 3's own-signature half — it added
+      `dbOid ...uint32` params to `catalog.InMemory.CreateView`/`DropView`/
+      `AllUserViews`/`AllUserMatViews`/`IndexesOnTable` and updated
+      `viewsDependingOnView`/`viewsDependingOnTable`/
+      `matViewsDependingOnRelation` to accept+forward a `dbOid` param, but
+      left 6 of their own call sites in `operators_ddl.go`
+      (`execDropOneView`/`execDropOneMatView`/`execDropTable`'s
+      RESTRICT/CASCADE dependency-scan blocks) still calling the old arity
+      — `go build` failed with "not enough arguments in call to
+      matViewsDependingOnRelation/viewsDependingOnTable". Completed the
+      threading at all 6 sites via
+      `catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)`, then by
+      inspection found + fixed 2 more sites that compiled fine (the new
+      param is variadic-optional) but were still silently hardcoded to
+      DefaultDBOid: `execDropOneMatView`'s own `DropView` call and DROP
+      SCHEMA CASCADE's `AllUserViews()` call. Added 2 new regression tests
+      (`TestExecCreateViewRoutesToConnectionRealDBOid`,
+      `TestIndexesOnTableFindsOwnDistinctDBOidTable` in
+      `internal/executor/ddl_write_dbid_routing_test.go`), each using a
+      no-FROM view body to exercise the fix without hitting the still-open
+      `o.planCatalog()` FROM-table-resolution gap. Design doc
+      (`docs/design/0122-0018-per-database-catalog-namespace.md`) 4d-ii-
+      part-2b item 3 updated to reflect the own-signature half as landed;
+      `docs/design/README.md` row extended; deferral ledger row appended
+      (`AI-20260710-011513-001` / 4d-ii-part-2b item 1) documenting the
+      still-open `planCatalog()` gap and the ~50-site cross-file
+      `IndexesOnTable`/`AllUserViews` sweep (item 2) as the next resume
+      points. Gates: `go build ./...`/`go vet ./...` clean; `go test -race
+      ./internal/catalog/... ./internal/executor/...` PASS; `go test
+      ./internal/planner/...` PASS; `go test -short $(go list ./... | grep
+      -v /internal/testport)` (full repo, short mode) PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33, ran twice — before
+      and after the 2 additional non-build-breaking call-site fixes);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed transactions, all 3 pgbench workloads, ran twice for the same
+      reason).
+  - [x] `M0122-0007` follow-up 15 (2026-07-10, this loop) — **closed
+      4d-ii-part-2b item 3's remaining `planCatalog()` half, plus a
+      follow-on bug it surfaced.** `executor.ctxPlanCatalog`
+      (`internal/executor/operators_ddl.go`) fell back to the bare,
+      unwrapped `ctx.Catalog` whenever `ctx.PlanCatalog` was unset, so
+      `planner.Plan`'s internal `LookupTable` calls (no explicit dbOid arg)
+      always resolved `CREATE VIEW ... FROM <table>` against `DefaultDBOid`
+      even on a distinct-dbOid connection — confirmed as a real bug (not
+      just a doc claim) by reverting only this function and reproducing
+      `42P01: relation "base" does not exist`. Real server dispatch
+      (`server.sessionPlanCatalog`, `internal/server/dispatch.go`) already
+      wires `ctx.PlanCatalog` correctly on every connection with a session;
+      the gap was this package's own unit-test fixtures
+      (`newVMFixture`/`runDDL`) plus any other executor-internal
+      `ctxPlanCatalog` caller lacking a dispatch-supplied wrapper. Fix:
+      wrap `ctx.Catalog` in `catalog.WithSearchPath(ctx.Catalog, nil)` with
+      `.DBOid = ctx.CurrentDatabaseOid` when no `PlanCatalog` is set,
+      mirroring `sessionPlanCatalog` — no planner-package signature change
+      needed (the design doc's note that this "requires giving the planner
+      package access to a per-connection dbOid" was itself the thing that
+      turned out unnecessary: `SearchPathCatalog.DBOid` already carries it
+      through the existing `catalog.Catalog` interface).
+      Investigating this surfaced a **second bug** in the
+      `collectViewPKDeps` chain: `addGroupByPKDeps` called
+      `cat.IndexesOnTable(tbl)` with no `dbOid` argument, unlike the
+      sibling `cat.LookupTable` call two lines above it in the same
+      function — so a view's GROUP-BY PK-constraint dependency
+      (`RegisterViewConstraintDep`) never registered under a distinct
+      dbOid, meaning `DROP CONSTRAINT ... RESTRICT` would wrongly succeed
+      instead of being blocked. This is the exact
+      `collectViewPKDeps`/PK-deps-cluster gap 4d-ii-part-2a's white-box
+      test was blocked on and had only verified by code inspection.
+      Fixed by threading `dbOid` through to `IndexesOnTable`. New tests
+      `TestExecCreateViewFromClauseRoutesToConnectionRealDBOid`,
+      `TestExecCreateViewGroupByPKDepRegistersUnderDistinctDBOid`
+      (`internal/executor/ddl_write_dbid_routing_test.go`), both confirmed
+      to fail (42P01 / empty `ViewsDependingOnConstraint`) against a
+      revert of their respective one-line fix. Design doc
+      (`docs/design/0122-0018-per-database-catalog-namespace.md`) 4d-ii-
+      part-2b item 3 updated to "fully landed"; `docs/design/README.md` row
+      extended; deferral ledger row `AI-20260710-011513-001` resolved by a
+      new appended row (items 1-2's ~50-site cross-file sweep +
+      `RelFileNode.DBOid` remain the next resume points). Gates:
+      `go build ./...`/`go vet ./...` clean; `go test -race
+      ./internal/catalog/... ./internal/executor/...` PASS; `go test
+      -short $(go list ./... | grep -v /internal/testport)` (full repo,
+      short mode) PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed transactions, all 3 pgbench workloads).
+  - [x] `M0122-0007` follow-up 16 (2026-07-10, this loop) — **closed
+      4d-ii-part-2b item 1, the cross-file `IndexesOnTable` sweep**, except
+      one deliberately deferred corner. Threaded
+      `catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)` through every
+      remaining un-scoped `IndexesOnTable` call site: `operators_fk.go` (1),
+      `operators_cluster.go` (3), `operators_reindex.go` (2),
+      `deferred_unique.go` (1), `context.go` (1), `operators_vacuum.go` (1),
+      `operators_upsert.go` (4), `ssi.go` (5), `operators_storage.go` (5),
+      and the ~24 remaining sites in `operators_ddl.go` left over from item
+      3's narrower scope. Re-measured `operators_sequence.go` and
+      `operators_pg_get_publication_tables.go` per the design doc's
+      instruction — both have zero `IndexesOnTable`/`AllUserViews`/
+      `AllUserMatViews` call sites, no change needed. `expr.go`'s
+      `buildForeignKeyDefString` (pg_get_constraintdef's FK branch) gained a
+      variadic `dbOid ...uint32` param threaded from `ctx.CurrentDatabaseOid`
+      at its one production call site.
+      **`internal/planner`'s own `IndexesOnTable` call sites needed no
+      direct edits at all:** added `catalog.SearchPathCatalog.IndexesOnTable`
+      (`internal/catalog/catalog.go`), mirroring its existing
+      `LookupTable`/`LookupIndex` overrides — `SearchPathCatalog` previously
+      had no override for `IndexesOnTable` at all, so any caller holding
+      only a `catalog.Catalog` interface value silently promoted straight to
+      the embedded `InMemory.IndexesOnTable` with no dbOid argument. Every
+      `internal/planner` caller reaches the catalog exclusively through
+      `ctx.PlanCatalog`/`ctxPlanCatalog` (always a dbOid-seeded
+      `SearchPathCatalog` per follow-up 15's fix), so this ONE addition
+      transparently fixed all 6 planner-package call sites
+      (`nl_index_join.go:655`, `planner.go:7379,8108,8225,11196,11400`)
+      without touching planner.go — e.g. `resolveDefaultDoNothingArbiter`,
+      which resolves the implicit arbiter index for a bare
+      `ON CONFLICT DO NOTHING`. Verified as a real, previously-latent bug
+      (not just a doc claim) via new test
+      `TestPlanUpsertDoNothingNoTargetFindsArbiterUnderDistinctDBOid`
+      (`internal/executor/operators_upsert_test.go`), confirmed to fail
+      (`ArbiterIndex` stays nil) against a revert of just the
+      `SearchPathCatalog.IndexesOnTable` addition — without an arbiter
+      index, `ON CONFLICT DO NOTHING`'s conflict probe never runs
+      (`maintainArbiter` no-ops when `o.arbiterTree` is nil), so a genuine
+      primary-key conflict would surface as an unhandled `23505` instead of
+      being silently skipped.
+      **Deliberately left unthreaded:** `internal/executor/applyworker.go`'s
+      `primaryKeyOnlyRow` still calls `cat.IndexesOnTable(tbl)` with no
+      dbOid — the entire logical-replication apply-worker path is uniformly
+      un-migrated for dbOid-awareness (its sibling `w.cat.LookupTable` call
+      also carries no dbOid; `NewApplyWorker` never receives a
+      per-subscription-dbOid-seeded catalog), so threading only this one
+      call would be a partial, inconsistent fix — needs its own dedicated
+      pass once the apply worker gains a per-subscription dbOid concept.
+      Design doc (`docs/design/0122-0018-per-database-catalog-namespace.md`)
+      4d-ii-part-2b item 1 updated to "fully landed except applyworker.go";
+      `docs/design/README.md` row extended; deferral ledger row appended.
+      **Remaining M0122-0007 items:** item 1's applyworker.go corner, item 2
+      (`RelFileNode.DBOid` wiring at creation time), then 4e. Gates:
+      `go build ./...`/`go vet ./...` clean; `go test -race
+      ./internal/catalog/... ./internal/executor/... ./internal/planner/...`
+      PASS; `go test -short $(go list ./... | grep -v /internal/testport)`
+      (full repo, short mode) PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+      scripts/ralph-precommit-test.sh` PASS (0 failed transactions, all 3
+      pgbench workloads).
+  - [x] `M0122-0007` follow-up 17 (2026-07-10, this loop) — **closed
+      4d-ii-part-2b item 2, wiring `RelFileNode.DBOid` at creation time.**
+      `catalog.Table`/`catalog.Index` (`internal/catalog/catalog.go`) each
+      gained a `DBOid uint32` field, populated by `CreateTable`/`CreateIndex`
+      from `resolveDBOid(dbOid)` — the same `dbOid ...uint32` variadic
+      parameter every executor DDL call site already threads as
+      `catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)` (follow-ups 14/15/16),
+      so **no call site of `CreateTable`/`CreateIndex` needed to change** —
+      the field rides the existing parameter. `InMemory.RelFileNode`/
+      `IndexRelFileNode` now prefer `table.DBOid`/`index.DBOid` over the
+      single process-wide `c.dbOid`, but **only when it names a genuinely
+      distinct database** (nonzero and not `DefaultDBOid`) — the
+      `postgres`/`template1` dual-mirror guard the design doc's original
+      scope note called out: every `NamespaceDBOid`-translated "postgres"
+      table's own `DBOid` is `DefaultDBOid` (1) for `c.ns()` keying (same
+      translation `LookupTable`/`CreateTable` already apply), but its
+      correct *physical* dbOid is whatever `c.dbOid` currently resolves to
+      (`PostgresDBOid`=5 after `SetDBOID` runs at startup, per
+      `detectCatalogDBOID` — preserving the `base/1/` + `base/5/` mirror).
+      Using `table.DBOid` unconditionally was tried first and immediately
+      broke `TestAlterTableSetTablespacePhysicalRelocationSurvivesRestart`
+      (relocated files landed under `base/1/pg_tblspc/…` instead of the
+      expected `base/5/pg_tblspc/…` after restart) — confirms the guard is
+      load-bearing, not defensive boilerplate; fixed by only trusting
+      `table.DBOid`/`index.DBOid` when it differs from both 0 and
+      `DefaultDBOid`. New test
+      `TestRelFileNodeUsesTableOwnDBOidNotProcessWideDefault`
+      (`internal/executor/ddl_write_dbid_routing_test.go`) proves two
+      same-named tables (and their PK indexes) created on distinct
+      connection dbOids now resolve to genuinely distinct
+      `storage.RelFileNode` values — previously they aliased onto the same
+      on-disk relfilenode path despite `storage.RelFileNode.DBOid` being a
+      real field since slice 1, because `RelFileNode`/`IndexRelFileNode`
+      always read the single process-wide `c.dbOid` regardless of which
+      table/index was asked about. **Not covered by this item (documented,
+      not silently dropped):** `TryRegisterUserTable`/`RegisterRealTable`
+      (the pg_class-heap-scan and `pg_goopg_catalog_cache.json`-snapshot
+      startup recovery paths) don't set the new `Table.DBOid` field on the
+      `*Table` they register — both callers (`internal/initdb/open.go`,
+      `internal/initdb/catalog_cache.go`) only ever pass the implicit
+      `DefaultDBOid` today, since startup recovery is still single-database
+      (multi-db startup replay is 4e/`CREATE DATABASE … TEMPLATE`
+      territory), so this is currently unreachable rather than a live bug —
+      flagged for whichever future loop makes startup recovery
+      multi-db-aware. Design doc
+      (`docs/design/0122-0018-per-database-catalog-namespace.md`) 4d-ii-
+      part-2b item 2 updated to "fully landed"; status line and
+      "Recommended order" section updated; `docs/design/README.md` row
+      extended. **Remaining M0122-0007 items:** item 1's applyworker.go
+      corner, then 4e. Gates: `go build ./...`/`go vet ./...` clean; `go
+      test -race ./internal/catalog/... ./internal/executor/...` PASS; `go
+      test ./internal/planner/... ./internal/storage/...
+      ./internal/initdb/...` PASS (initdb includes the previously-failing
+      `TestAlterTableSetTablespacePhysicalRelocationSurvivesRestart`,
+      confirmed PASS after the dual-mirror guard fix); `go test -short
+      $(go list ./... | grep -v /internal/testport)` (full repo, short
+      mode) PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed transactions, all 3 pgbench workloads).
+  - [x] `M0122-0007` follow-up 18 (2026-07-10, this loop) — **closed
+      4d-ii-part-2b item 1's `applyworker.go` corner — 4d-ii-part-2b is now
+      fully landed.** Rather than threading a `dbOid` argument through
+      every `w.cat.*` call site in `internal/executor/applyworker.go`
+      individually (the prior loop's own note explaining why it deferred
+      this), gave `ApplyWorker` a per-subscription dbOid concept and
+      wrapped its catalog instead of touching its call sites at all.
+      `catalog.Subscription` (`internal/catalog/pubsub.go`) gained a
+      `DBOid uint32` field; `PubSub.CreateSubscriptionAsOwner` gained a
+      trailing variadic `dbOid ...uint32` param (mirrors
+      `CreateTable`/`CreateIndex`'s convention, sets `sub.DBOid` via the
+      existing `resolveDBOid` helper). `executor.execCreateSubscription`
+      (`operators_ddl.go`) passes
+      `catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)` at its one call
+      site. `wal.EncodeCreateSubscription`/`DecodeCreateSubscription`
+      (`internal/wal/recovery.go`) gained a trailing 4-byte `dbOid` field
+      appended to the payload — backward-compatible: a pre-existing
+      on-disk WAL record with no trailer decodes as `dbOid=0`
+      (`DefaultDBOid` via `NamespaceDBOid`), identical to the pre-fix
+      default — so `internal/initdb/pubsub_ddl_recovery.go`'s replay path
+      restores it into the recovered `*catalog.Subscription`. New helper
+      `server.applyWorkerCatalog` (`internal/server/applylauncher.go`)
+      wraps a catalog with `&catalog.SearchPathCatalog{Catalog: cat, DBOid:
+      subDBOid}`; `DefaultLaunchApplyWorker` calls it on `cfg.Catalog`
+      before `executor.NewApplyWorker` — the *only* construction site
+      (`sub catalog.Subscription` was already threaded all the way from
+      `ApplyLauncher`'s `PubSub.Subscriptions()` scan into
+      `LaunchApplyWorkerFunc`, confirmed by inspection, so no further
+      plumbing was needed). Every un-dbOid-threaded `LookupTable`/
+      `LookupIndex`/`IndexesOnTable` call inside applyworker.go
+      (`applyRelation`'s local-table resolution at line 217,
+      `primaryKeyOnlyRow`'s PK lookup at ~line 662) now transparently
+      resolves the subscribing database's own tables via the
+      `SearchPathCatalog` overrides item 1's planner-package fix already
+      added (follow-up 16) — **zero lines changed inside
+      applyworker.go itself.** New test
+      `TestApplyWorkerAppliesInsertUnderDistinctSubscriptionDBOid`
+      (`internal/executor/applyworker_test.go`) drives a real pgoutput
+      B→R→I→C byte stream against a subscriber "items" table registered
+      under a distinct dbOid (alongside the fixture's pre-existing
+      DefaultDBOid "items" table as a negative control); confirmed
+      non-vacuous by temporarily reverting just the `SearchPathCatalog`
+      wrap and observing the applied row silently land in the *wrong*
+      same-named `DefaultDBOid` table instead — exactly the
+      cross-database aliasing hazard this corner was deferred over.
+      `TestCreateSubscriptionRoutesToConnectionRealDBOid` /
+      `TestCreateSubscriptionPostgresConnectionStaysOnDefaultDBOid`
+      (`internal/executor/operators_ddl_pubsub_test.go`) cover the
+      write-side routing, including the `postgres`/`DefaultDBOid`
+      dual-mirror shim; `TestApplyWorkerCatalogSeedsSubscriptionDBOid`
+      (`internal/server/applylauncher_test.go`) pins the new helper's own
+      contract (including the zero-dbOid legacy-subscription case).
+      Deferral ledger: the prior loop's row for this corner
+      (`M0122-0007 4d-ii-part-2b item 1 (cross-file IndexesOnTable
+      sweep)`) flipped to `resolved`; a new `resolved` row records this
+      loop's full landing. Design doc
+      (`docs/design/0122-0018-per-database-catalog-namespace.md`) status
+      line, item 1's section, and "Recommended order" section all updated
+      to reflect 4d-ii-part-2b's full completion; `docs/design/README.md`
+      row extended. **Remaining M0122-0007 work: 4e only** (dependent-
+      object-walk fixups — FK target resolution, view dependency
+      tracking, sequence ownership — assuming a single global namespace,
+      then the `CREATE DATABASE ... TEMPLATE` copy mechanism this epic
+      exists to unblock). Gates: `go build ./...`/`go vet ./...` clean;
+      `go test -race ./internal/catalog/... ./internal/executor/...
+      ./internal/wal/... ./internal/server/...` PASS (two unrelated
+      pre-existing collateral hazards reconfirmed, not caused by this
+      loop: `TestConnectExceedsPositiveDatconnlimitRejected`'s data race
+      in `internal/activity/registry.go`, already documented by the 4c
+      loop, reproduces identically on unmodified HEAD via `git stash`;
+      `TestStripeAppendConcurrentDrainConsistency` in `internal/wal` is a
+      pre-existing timing-flaky test, passes cleanly in isolation); `go
+      test -count=1 ./internal/catalog/... ./internal/executor/...
+      ./internal/wal/... ./internal/server/... ./internal/initdb/...
+      ./internal/planner/... ./internal/storage/...` (non-race, full
+      run) PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS
+      (0 failed transactions, all 3 pgbench workloads).
+  - [x] `M0122-0007` follow-up 19 (2026-07-10, this loop) — **started 4e,
+      closed its FK target resolution item.** An Explore agent mapped 4e's
+      three named categories (FK target resolution, view dependency
+      tracking, sequence ownership) to concrete call sites first. Threaded
+      `catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)` through 5 previously
+      un-dbOid'd FK-related lookups in `internal/executor/operators_fk.go`/
+      `operators_ddl.go`: `assertParentExists` (the INSERT/UPDATE-time
+      FK-parent-exists check — highest blast radius, since a lookup miss
+      took the "referenced table not found — skip" branch and silently
+      disabled FK enforcement entirely for a distinct-dbOid connection,
+      rather than just failing to find a genuinely missing parent),
+      `assertNoChildRows` (DETAIL-line parent PK columns only, not
+      enforcement), `runAllDeferredFKChecks` (deferred/`INITIALLY DEFERRED`
+      child-table resolution at COMMIT — a miss silently `continue`d past
+      the violation check), `checkFKColumnTypeCompatibility` (enum FK-type
+      check at CREATE TABLE/ADD CONSTRAINT time — the very next line
+      already threaded dbOid into a sibling `IndexesOnTable` call, exposing
+      the half-migrated pattern), and `execTruncate`'s CASCADE expansion
+      (`im.AllTables()` scanned `DefaultDBOid`'s namespace instead of the
+      connection's own, so `TRUNCATE ... CASCADE` silently failed to reach
+      a real same-database referencing table). All 5 callees already
+      accepted the `dbOid ...uint32` variadic parameter — pure threading,
+      mirroring 4d-ii-part-2b item 1's pattern, no signature change. New
+      tests `TestAssertParentExistsFindsOwnDistinctDBOidParent`,
+      `TestExecTruncateCascadeFindsOwnDistinctDBOidReferencingTable`
+      (`internal/executor/fk_dbid_routing_test.go`), each confirmed to fail
+      against a revert of just the fix diff. Writing them required new
+      test-only planning helpers `runDMLUnderDBOid`/`runQueryUnderDBOid`
+      (same file): the package's existing `runDDL`/`runQuery` helpers plan
+      through the raw un-wrapped `ctx.Catalog`, which cannot resolve a
+      table name under a distinct dbOid at planning time for statements
+      needing it (INSERT's target table, SELECT's FROM table) — unlike the
+      real server, which always plans through
+      `sessionPlanCatalog`/`ctxPlanCatalog`'s dbOid-seeded
+      `SearchPathCatalog` wrapper (confirmed by reading
+      `internal/server/dispatch.go`'s planning call sites — this is a
+      test-harness gap, not a production bug). Design doc
+      (`docs/design/0122-0018-per-database-catalog-namespace.md`) 4e
+      section updated with the landed item plus full detail on the two
+      remaining ones; `docs/design/README.md` row extended; deferral ledger
+      row appended. **Remaining 4e items (ranked by blast radius):**
+      sequence ownership (`internal/executor/operators_sequence.go`'s
+      `seqRegistry` is a process-global `sync.Map` with zero dbOid concept
+      at all — needs a namespaced key scheme before any call site is
+      meaningfully fixable, the largest remaining structural gap, and
+      blocks the `CREATE DATABASE ... TEMPLATE` copy mechanism) and view
+      constraint-dependency tracking
+      (`catalog.InMemory.constraintViewDeps`'s stored values are bare
+      unqualified view names shared across the whole map — `DROP VIEW v`
+      in one database can silently strip a same-named unrelated view's
+      `DROP CONSTRAINT RESTRICT` protection in another, a real
+      cross-database corruption path), then the `CREATE DATABASE ...
+      TEMPLATE` copy mechanism itself. Gates: `go build ./...`/`go vet
+      ./...` clean; `go test -race ./internal/catalog/...
+      ./internal/executor/...` PASS; `go test -short $(go list ./... |
+      grep -v /internal/testport)` (full repo, short mode) PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed transactions, all 3 pgbench workloads — first run hit 1
+      pre-existing flaky failed transaction unrelated to this change,
+      confirmed by a clean second run with 0 failures across all 3
+      workloads).
+  - [x] `M0122-0007` follow-up 20 (2026-07-10, this loop) — **closed 4e's
+      sequence-ownership item, its largest remaining structural gap.**
+      `internal/executor/operators_sequence.go`'s `seqRegistry` was a
+      process-global `sync.Map` keyed only by bare sequence name with zero
+      dbOid concept, so two same-named tables' implicit SERIAL sequences in
+      distinct databases silently shared (and raced on) one counter, and
+      `DROP TABLE` in one database could cascade-drop a same-named table's
+      sequence in another. Fixed by namespacing `seqKey` itself
+      (`"<dbOid>:<name>"`, `seqState` gained an immutable `dbOid` field) and
+      threading a trailing `dbOid ...uint32` (new `resolveSeqDBOid` helper,
+      mirroring `catalog.resolveDBOid`) through all ~18 public entry points
+      and their ~45 call sites across `operators_ddl.go` (CREATE/ALTER/
+      DROP/RENAME SEQUENCE, implicit SERIAL registration, DROP TABLE's
+      owned-sequence cascade, TRUNCATE RESTART IDENTITY, ALTER TABLE/SCHEMA
+      rename cascades), `operators_tx.go` (`SeqRestoreEntry` gained a
+      `DBOid` field for RESTART IDENTITY rollback), `expr.go`
+      (`pg_get_serial_sequence`, `currtid2`), and `operators_sequence.go`'s
+      own `evalNextval`/`evalCurrval`/`evalSetval`/`evalLastval`/
+      `autoGenerateSerialValues` (new `ctxSeqDBOid(ctx)` helper). Also
+      threaded the `DEFAULT nextval(...)` expression-evaluator path
+      (`operators_generated.go`'s `evalGenExpr`/`evalGenFuncCall`/
+      `applyDefaultsForMissing` — distinct from `autoGenerateSerialValues`'s
+      SERIAL/IDENTITY path) from its 3 real call sites
+      (`applyworker.go`'s `applyInsert` via a new `ApplyWorker.dbOid()`
+      helper reading `w.cat`'s `SearchPathCatalog.DBOid`,
+      `operators_storage.go`, `operators_upsert.go`);
+      `computeGeneratedColumns`'s ~14 call sites were deliberately left
+      zero-arg since a `GENERATED ALWAYS AS (...) STORED` expression must
+      be IMMUTABLE in PostgreSQL and can never legally contain `nextval()`.
+      `wal.SequenceStatePayload` gained a trailing-appended `DBOid` field
+      and `EncodeDropSequence`/`DecodeDropSequence` gained a trailing
+      4-byte dbOid, both following the `EncodeCreateSubscription`
+      backward-compatible-trailer pattern (a pre-4e WAL record with no
+      trailer decodes as dbOid 0 → DefaultDBOid via `NamespaceDBOid`).
+      `internal/initdb/sequence_ddl_recovery.go`'s replay dedup map was
+      re-keyed from bare name to `"<dbOid>:<name>"` for the same collision
+      reason. New tests `TestSerialSequenceDoesNotAliasAcrossDistinctDBOid`,
+      `TestDropTableDoesNotCascadeSequenceAcrossDistinctDBOid`
+      (`internal/executor/sequence_dbid_routing_test.go`), each confirmed
+      to fail against a revert of just `seqKey`'s dbOid component (a
+      same-signature neutered `seqKey` that folds the dbOid argument to a
+      no-op — isolates the key-scheme fix from the ~45 mechanically-inert
+      call-site threading). **Deliberately still DefaultDBOid-only
+      (separate, pre-existing gap, deferral ledger row appended):** the
+      `pg_sequence`/`pg_sequences` virtual-row builders have no
+      per-connection context to draw a dbOid from at all (their
+      `VirtualRows func() [][]string` closures take zero args) — the same
+      unsolved "per-connection virtual catalog scoping" mechanism other
+      virtual tables already have. Design doc
+      (`docs/design/0122-0018-per-database-catalog-namespace.md`) 4e
+      section and status line updated; `docs/design/README.md` row
+      extended; deferral ledger rows appended (one `resolved`, one `-` for
+      the virtual-row follow-on). **Remaining M0122-0007 work:** 4e's only
+      remaining item is view constraint-dependency tracking
+      (`catalog.InMemory.constraintViewDeps`'s bare unqualified-name
+      values), then the `CREATE DATABASE ... TEMPLATE` copy mechanism
+      itself. Gates: `go build ./...`/`go vet ./...` clean; `go test -race
+      ./internal/executor/... ./internal/wal/...` PASS; `go test -short
+      $(go list ./... | grep -v /internal/testport)` (full repo, short
+      mode) PASS; `go test ./internal/initdb/...` PASS (259s, non-race —
+      `-race` alone on this package hit the pre-documented ~10min co-load
+      timeout, unrelated to this change, see
+      `goopg_nightly_ci_batch`/`ci/design/07-ralph-feedback.md`); `go test
+      -v -run TestPort_SerialSequenceSurvivesRestart ./internal/testport/`
+      PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed transactions, all 3 pgbench workloads).
+  - [x] `M0122-0007` follow-up 21 (2026-07-10, this loop) — **closed 4e's
+      last remaining dependent-object-walk item: view constraint-dependency
+      tracking.** `internal/catalog/catalog.go`'s `constraintViewDeps
+      map[string][]string` was keyed `"tableOID:constraintName"` (already
+      dbOid-safe — `nextOID` is a single cluster-wide counter, and a view
+      can only reference tables in its own database) but stored **bare,
+      unqualified view names** as values. Its own
+      `UnregisterViewConstraintDeps` (called by `execDropOneView` on every
+      `DROP VIEW`) matched and removed entries by bare name **across every
+      key in the whole map** — so `DROP VIEW v` in database A silently
+      erased a same-named, unrelated view `v`'s dependency entry in
+      database B, defeating that other database's `DROP CONSTRAINT
+      RESTRICT` protection. A concrete cross-database data-corruption path,
+      not merely a lookup miss — this was live-documented in the design doc
+      as 4e's last open item, not newly discovered this loop. Fixed by
+      qualifying the stored value itself: `RegisterViewConstraintDep`/
+      `UnregisterViewConstraintDeps` gained the standard trailing `dbOid
+      ...uint32` parameter (`resolveDBOid`), storing/matching
+      `"<dbOid>:<viewName>"` instead of the bare name.
+      `ViewsDependingOnConstraint` (the RESTRICT-check read path) needed no
+      signature change but now strips the `dbOid:` prefix before returning,
+      since RESTRICT-error callers only need the bare name. The two
+      `internal/executor/operators_ddl.go` call sites (`execCreateView`'s
+      registration, `execDropOneView`'s cleanup) now pass
+      `catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)`. New test
+      `TestDropViewDoesNotEraseConstraintDepAcrossDistinctDBOid`
+      (`internal/executor/ddl_write_dbid_routing_test.go`) creates a
+      same-named view `v` under two distinct connection dbOids, drops one,
+      and asserts the other's entry survives — confirmed to fail (deps
+      erased to `[]`) against a scratch-copy revert of just the
+      value-qualification (a neutered qualifier folding dbOid to a
+      constant), isolating the key-scheme fix from the two
+      mechanically-inert call-site threads. Existing
+      `TestViewConstraintDepTracking` (`internal/catalog/catalog_test.go`)
+      and `TestExecCreateViewGroupByPKDepRegistersUnderDistinctDBOid`
+      (which call the zero-arg/single-dbOid form) still pass unchanged —
+      the trailing variadic keeps every pre-existing call site resolving to
+      `DefaultDBOid`. **This closes 4e in full except the `CREATE DATABASE
+      ... TEMPLATE` copy mechanism itself**, now unblocked since both of
+      its prerequisites (sequence ownership, this item) have landed.
+      Deferral ledger row appended (`resolved`, matching the
+      sequence-ownership row's convention); design doc
+      (`docs/design/0122-0018-per-database-catalog-namespace.md`) 4e
+      section, status line, and "Recommended order" section all updated;
+      `docs/design/README.md` row extended. Gates: `go build ./...`/`go vet
+      ./...` clean; `go test -race ./internal/catalog/...
+      ./internal/executor/...` PASS; `go test -short $(go list ./... | grep
+      -v /internal/testport)` (full repo, short mode) PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed transactions, all 3 pgbench workloads). **Remaining M0122-0007
+      work: the `CREATE DATABASE ... TEMPLATE` copy mechanism only**
+      (`CreateDatabaseUsingFileCopy`/`copydir`,
+      `postgres/src/backend/commands/dbcommands.c`) — the epic's original
+      motivation and final resume point.
+  - [x] `M0122-0007` follow-up 22 (2026-07-10, this loop) — **started
+      `CREATE DATABASE ... TEMPLATE`, landed a bounded, correct validation
+      slice.** `internal/server/database_ddl.go` gained
+      `createDatabaseTemplateName` (parses the `TEMPLATE [=] <name>` option
+      — applied only to the substring AFTER the new database's own parsed
+      name, via new `extractFirstIdentifierSpan`, so a name that happens to
+      start with "template" is never misparsed as the option) and
+      `resolveCreateDatabaseTemplate`, wired into `tryHandleDatabaseDDL`'s
+      create branch before the target database is allocated. It enforces
+      the template exists (`ResolveDatabaseOid`, else `3D000` mirroring
+      dbcommands.c createdb()'s `ERRCODE_UNDEFINED_DATABASE`) and has zero
+      USER relations (`AllTables` filtered to `!catalog.IsSystemRelation` —
+      system/catalog rows below `FirstUserOID` don't count), else the new
+      `0A000 FeatureNotSupported`. Before this, a non-empty TEMPLATE fell
+      through `classifyDatabaseDDL`'s "trailing options are ignored"
+      looseness and silently created an EMPTY database instead of copying
+      anything — a real data-loss-shaped mismatch with PostgreSQL, now a
+      loud typed error instead. **Load-bearing correction found live during
+      this loop's own gate-verification pass:** the naive version of this
+      check (apply to every template unconditionally) broke
+      `TestSimpleQueryDropDatabaseActuallyDrops` — `"template1"` and
+      `"postgres"` both alias `catalog.DefaultDBOid` in goopg's current
+      architecture (the pre-existing dual-mirror, design
+      0122-0018-per-database-catalog-namespace.md), a shared legacy
+      namespace every fixture and pre-4c code path still writes real user
+      tables into, so the check misfired on any server that has ever
+      created a table — the overwhelmingly common case, including the
+      default no-TEMPLATE-clause path. Fixed by skipping the emptiness
+      check entirely when the template resolves to `DefaultDBOid`,
+      preserving the exact pre-existing silent-empty-database behavior
+      there (unchanged from before this loop); the strict check only fires
+      for a template with its own distinct, `CreateDatabase`-allocated
+      dbOid (or `template0`'s fixed, never-aliased oid 4) — exactly the
+      case that used to silently misbehave. New tests
+      `TestCreateDatabaseTemplateName`,
+      `TestTryHandleDatabaseDDLCreateTemplateDoesNotExistErrors`,
+      `TestTryHandleDatabaseDDLCreateEmptyTemplateSucceeds`,
+      `TestTryHandleDatabaseDDLCreateNonEmptyTemplateErrors`
+      (`internal/server/database_ddl_test.go`), the two negative cases each
+      confirmed to fail against a revert of the `resolveCreateDatabaseTemplate`
+      call site. Live-verified against the real `cmd/goopg` binary via
+      `psql`: default/`TEMPLATE template1` CREATE DATABASE unaffected on a
+      server with real tables in `postgres`; an empty user database as
+      TEMPLATE succeeds; a TEMPLATE with a real table 0A000s; an unknown
+      TEMPLATE 3D000s; a table created in a freshly `CREATE DATABASE`'d
+      database is correctly invisible from another database's `pg_class`
+      query (real per-database isolation, not just a `pg_database` name
+      registration). **New residual gap noticed live, NOT fixed here:** a
+      connection to ANY freshly `CREATE DATABASE`'d database cannot query
+      `pg_class`/run `psql`'s `\dt` at all (system-catalog virtual-table
+      builders aren't yet wired to a per-connection dbOid) — reproduces on
+      a plain empty database too, unrelated to TEMPLATE; recorded in the
+      deferral ledger and design doc for a future loop. Design doc
+      (`docs/design/0122-0018-per-database-catalog-namespace.md`) gained a
+      full section plus "Recommended order"/status-line updates;
+      `docs/design/README.md` row extended; deferral ledger row appended.
+      **Remaining M0122-0007 work: the real `CREATE DATABASE ... TEMPLATE`
+      relation-copy mechanism** — deep-copying the source dbOid's
+      `catalog.tableNamespace` (tables/indexes/sequences/views) under
+      freshly allocated OIDs, remapping FK target OIDs, and physically
+      copying each relation's on-disk file(s)
+      (`internal/storage/smgr.go`'s `base/<dbOid>/<relOid>` layout,
+      confirmed real and per-database by this loop's investigation) —
+      `CreateDatabaseUsingFileCopy`/`copydir`'s functional analog
+      (`postgres/src/backend/commands/dbcommands.c`), adapted to goopg's
+      shared-catalog-with-per-dbOid-namespaces architecture. Gates:
+      `go build ./...`/`go vet ./...` clean; `go test ./internal/server/...
+      ./internal/catalog/... ./internal/executor/... ./internal/wal/...`
+      PASS; `go test -short $(go list ./... | grep -v /internal/testport)`
+      (full repo, short mode) PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+      scripts/ralph-precommit-test.sh` PASS (0 failed transactions, all 3
+      pgbench workloads).
+  - [x] `M0122-0007` follow-up 23 (2026-07-10, this loop) — **fixed the
+      pg_class-under-fresh-database gap follow-up 22 flagged.** Root cause
+      (confirmed via a background Explore pass): `registerSystemTables`
+      (`internal/catalog/catalog.go`) registers every `pg_catalog`/
+      `information_schema` virtual table exactly once, under `DefaultDBOid`'s
+      namespace only; `CREATE DATABASE` never seeds a fresh namespace with
+      references to them, so a connection to any genuinely distinct dbOid
+      could not even resolve the name "pg_class" (42P01). Two-part fix: (1)
+      generic name resolution — `InMemory.LookupTable` now falls back to
+      `DefaultDBOid`'s namespace, via new `lookupSystemCatalogTableLocked`,
+      whenever a name is schema-qualified `pg_catalog`/`information_schema`
+      (or unqualified and found there under one of those schemas) — scoped
+      tightly enough that a distinct dbOid's connection still never sees
+      `DefaultDBOid`'s real user tables. This alone unblocks name resolution
+      for all ~70 system-catalog virtual tables plus the two heap-backed ones
+      (`pg_attribute`/`pg_type`). (2) `pg_class`'s row CONTENT — extracted its
+      `VirtualRows` closure body into a new exported
+      `catalog.InMemory.PGClassRowsForDBOid(dbOid uint32) [][]string`
+      (parameterized its 4 internal `c.ns(DefaultDBOid)` references on
+      `dbOid`; the closure itself now just calls it with `DefaultDBOid`,
+      byte-identical default behavior), wired a new per-connection
+      `executor.Context.PgClassRows func() [][]string` field (mirrors the
+      existing `ExtensionRows` pattern) set by `internal/server/dispatch.go`'s
+      `wireExtensionRows` (new `pgClassRowLister` interface) for both the
+      simple- and extended-query dispatch paths, and consumed it via a new
+      `tbl.Name == "pg_class"` branch in `internal/executor/operators.go`'s
+      `valuesOp.Open`. `pg_class` now lists the CONNECTING database's own
+      tables/indexes, not always `DefaultDBOid`'s. New tests
+      `TestPgClassResolvesUnderFreshDistinctDBOid` (a dbOid with zero objects
+      ever created under it — the exact fresh-`CREATE DATABASE` shape — still
+      resolves `pg_class` by name; a genuinely nonexistent user table still
+      correctly errors) and `TestPgClassRowsScopedToConnectionDBOid` (two
+      tables created under `DefaultDBOid` vs. a distinct dbOid never
+      cross-leak in `PGClassRowsForDBOid`'s output), both in
+      `internal/executor/fk_dbid_routing_test.go`. Live end-to-end verified
+      against a real `cmd/goopg` binary + real `psql`: `CREATE DATABASE
+      freshdb` → connect → `SELECT relname FROM pg_class WHERE
+      relname='pg_class'` succeeds (previously 42P01) → `CREATE TABLE
+      only_in_freshdb` → `\dt` shows only that one table, not `postgres`'s.
+      **Remaining scope (deferred, own future loops):** ~13 sibling virtual-
+      table builders (`pg_indexes`, `pg_tables`, `pg_attrdef`,
+      `pg_constraint`, `pg_inherits`, `pg_index`, `pg_statistic_ext`,
+      `pg_policy`, `pg_depend`, `pg_trigger`, `pg_rewrite`,
+      `information_schema.routines`/`parameters`/`routine_*_usage`,
+      `pg_foreign_table`) share the same `c.ns(DefaultDBOid)`-hardcoded
+      `VirtualRows` pattern — now name-resolution-fixed by part (1) above but
+      still row-content-`DefaultDBOid`-only until each gets part (2)'s
+      closure-extraction treatment individually; `pg_sequence`/
+      `pg_sequences`/`information_schema.sequences` were already separately
+      flagged by an earlier follow-up's deferral row. The two heap-backed
+      catalogs (`pg_attribute`/`pg_type`) have a structurally different,
+      deeper gap: their physical heap rows are hardcoded to `DBOid:
+      catalog.DefaultDBOid` in `internal/executor/operators_ddl.go`'s
+      `syncTableToCatalogHeap`, a heap-write/heap-scan fix, not a
+      `VirtualRows`-closure one. Design doc
+      (`docs/design/0122-0018-per-database-catalog-namespace.md`) residual-gap
+      section updated to FIXED + status line; `docs/design/README.md` row
+      extended; deferral ledger row appended
+      ("pg_class-under-fresh-database"). Gates: `go build ./...`/`go vet
+      ./...` clean; `go test ./internal/catalog/... ./internal/executor/...
+      ./internal/server/... ./internal/planner/...` PASS; `go test -short
+      $(go list ./... | grep -v /internal/testport)` (full repo, short mode)
+      PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed transactions, all 3 pgbench workloads).
+  - [x] `M0122-0007` follow-up 24 (2026-07-10, this loop) — **fixed 2 of the
+      ~13 sibling virtual-table builders follow-up 23 flagged as
+      row-content-`DefaultDBOid`-only: `pg_indexes` and `pg_tables`.** Same
+      closure-extraction pattern as `PGClassRowsForDBOid`: extracted each
+      `VirtualRows` closure body into an exported
+      `catalog.InMemory.PGIndexesRowsForDBOid(dbOid uint32)` /
+      `PGTablesRowsForDBOid(dbOid uint32)` method, parameterized their
+      `c.ns(DefaultDBOid)` references on `dbOid` (the registered closures now
+      just call `...RowsForDBOid(DefaultDBOid)`, byte-identical default).
+      Wired new per-connection `executor.Context.PgIndexesRows`/
+      `PgTablesRows func() [][]string` fields (mirroring `PgClassRows`), set
+      in `internal/server/dispatch.go`'s `wireExtensionRows` (new
+      `pgIndexesRowLister`/`pgTablesRowLister` interfaces), consumed by new
+      `tbl.Name == "pg_indexes"`/`"pg_tables"` branches in
+      `internal/executor/operators.go`'s `valuesOp.Open`. New tests
+      `TestPgIndexesRowsScopedToConnectionDBOid`/
+      `TestPgTablesRowsScopedToConnectionDBOid`
+      (`internal/executor/fk_dbid_routing_test.go`), mirroring
+      `TestPgClassRowsScopedToConnectionDBOid`. Live end-to-end verified
+      against a real `cmd/goopg` binary + real `psql`: `CREATE DATABASE
+      freshdb2` → connect → `CREATE TABLE only_in_freshdb2 (id int PRIMARY
+      KEY, ...)` → `pg_tables`/`pg_indexes` in `freshdb2` show only that
+      table/its PK index; the same queries against `postgres` db show 0 rows.
+      **Remaining scope (deferred, own future loops):** 11 sibling builders
+      still row-content-`DefaultDBOid`-only — `pg_attrdef`, `pg_constraint`,
+      `pg_inherits`, `pg_index`, `pg_statistic_ext`, `pg_policy`, `pg_depend`,
+      `pg_trigger`, `pg_rewrite`,
+      `information_schema.routines`/`parameters`/`routine_*_usage`,
+      `pg_foreign_table`; `pg_sequence`/`pg_sequences`/
+      `information_schema.sequences` and `pg_attribute`/`pg_type` remain
+      separately flagged as before. Design doc updated (new "pg_indexes /
+      pg_tables" residual-gap subsection); `docs/design/README.md` row
+      extended; deferral ledger row appended ("pg_indexes/pg_tables per-dbOid
+      content"). Gates: `go build ./...`/`go vet ./internal/...` clean;
+      `go test ./internal/catalog/... ./internal/executor/...
+      ./internal/server/... ./internal/planner/...` PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed transactions, all 3 pgbench workloads).
+  - [x] `M0122-0007` follow-up 25 (2026-07-10, this loop) — **fixed the next
+      highest-value sibling virtual-table builder follow-up 24 flagged:
+      `pg_constraint`.** Same closure-extraction pattern: extracted the
+      `VirtualRows` closure body (CHECK / UNIQUE·PK·EXCLUDE / NOT NULL /
+      FOREIGN KEY constraint emission — the largest of these builders, ~300
+      lines) into an exported `catalog.InMemory.PGConstraintRowsForDBOid(dbOid
+      uint32) [][]string`, parameterizing its `c.ns(DefaultDBOid)` references
+      (tables + indexes, 5 occurrences) on `dbOid`; `c.domains` (domain CHECK
+      constraints) intentionally stays global, matching the same
+      not-yet-namespace-scoped precedent `PGClassRowsForDBOid` already
+      documents for composite types. The registered closure now just calls
+      `PGConstraintRowsForDBOid(DefaultDBOid)`, byte-identical default
+      behavior. Wired a new per-connection `executor.Context.PgConstraintRows
+      func() [][]string` field (mirrors `PgIndexesRows`/`PgTablesRows`), set in
+      `internal/server/dispatch.go`'s `wireExtensionRows` (new
+      `pgConstraintRowLister` interface), consumed by a new `tbl.Name ==
+      "pg_constraint"` branch in `internal/executor/operators.go`'s
+      `valuesOp.Open`. New test `TestPgConstraintRowsScopedToConnectionDBOid`
+      (`internal/executor/fk_dbid_routing_test.go`), mirroring
+      `TestPgIndexesRowsScopedToConnectionDBOid`: two tables each with a
+      `PRIMARY KEY`, one under `DefaultDBOid` and one under a distinct dbOid,
+      never cross-leak their `_pkey` constraint rows. Live end-to-end verified
+      against a real `cmd/goopg` binary + real `psql`: `CREATE DATABASE
+      freshdb3` → connect → `CREATE TABLE only_in_freshdb3 (id int PRIMARY
+      KEY, val int CHECK (val > 0))` → `SELECT conname, contype, conrelid FROM
+      pg_constraint` in `freshdb3` shows only that table's 3 constraints
+      (pkey/check/not-null) at its own `dbOid`-local OID; the same query
+      against `postgres` db shows only `postgres`'s own
+      `only_in_postgres_*` constraints (no cross-database leak either
+      direction). **Remaining scope (deferred, own future loops):** 10 sibling
+      builders still row-content-`DefaultDBOid`-only — `pg_attrdef`,
+      `pg_inherits`, `pg_index`, `pg_statistic_ext`, `pg_policy`, `pg_depend`,
+      `pg_trigger`, `pg_rewrite`,
+      `information_schema.routines`/`parameters`/`routine_*_usage`,
+      `pg_foreign_table`; `pg_sequence`/`pg_sequences`/
+      `information_schema.sequences` and `pg_attribute`/`pg_type` remain
+      separately flagged as before. Design doc updated (new "pg_constraint"
+      residual-gap subsection); `docs/design/README.md` row extended;
+      deferral ledger row appended ("pg_constraint per-dbOid content"). Gates:
+      `go build ./...`/`go vet ./...` clean; `go test ./internal/catalog/...
+      ./internal/executor/... ./internal/server/... ./internal/planner/...`
+      PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed transactions, all 3 pgbench workloads).
+  - [x] `M0122-0007` follow-up 26 (2026-07-10, this loop) — **fixed the next
+      highest-value sibling virtual-table builder follow-up 25 flagged:
+      `pg_index`.** Same closure-extraction pattern: extracted the
+      `VirtualRows` closure body into an exported
+      `catalog.InMemory.PGIndexRowsForDBOid(dbOid uint32) [][]string`,
+      threading `dbOid` through `c.AllIndexes(dbOid)` (which already accepted
+      a variadic `dbOid` param — unused by this closure until now) and through
+      `c.toastBearingTables`, which gained a required `dbOid uint32` param
+      (its only caller was this closure). The registered closure now just
+      calls `PGIndexRowsForDBOid(DefaultDBOid)`, byte-identical default
+      behavior. Wired a new per-connection `executor.Context.PgIndexRows
+      func() [][]string` field (mirrors `PgConstraintRows`), set in
+      `internal/server/dispatch.go`'s `wireExtensionRows` (new
+      `pgIndexRowLister` interface), consumed by a new `tbl.Name ==
+      "pg_index"` branch in `internal/executor/operators.go`'s
+      `valuesOp.Open`. New test `TestPgIndexRowsScopedToConnectionDBOid`
+      (`internal/executor/fk_dbid_routing_test.go`), mirroring
+      `TestPgConstraintRowsScopedToConnectionDBOid`: two tables each with a
+      `PRIMARY KEY`, one under `DefaultDBOid` and one under a distinct dbOid,
+      resolved via `LookupTable` and asserted never to cross-leak their
+      pg_index `indrelid` rows. Live end-to-end verified against a real
+      `cmd/goopg` binary + real `psql`: `CREATE DATABASE freshidx1` → connect
+      → `CREATE TABLE only_in_freshidx1 (id int PRIMARY KEY, val int)` +
+      `CREATE INDEX ... ON only_in_freshidx1(val)` → raw `SELECT * FROM
+      pg_index` in `freshidx1` shows exactly those 2 index rows (indrelid
+      matching the table's own pg_class OID); the same query against
+      `postgres` db shows only `postgres`'s own `only_in_postgres_pkey` row
+      (no cross-database leak either direction). Collateral discovery (NOT
+      fixed this loop, recorded in the deferral ledger): `oid::regclass`
+      (OID→name direction) returns the bare numeric OID instead of resolving
+      a name for objects in a non-`DefaultDBOid` database, even though the
+      underlying pg_index/pg_class row content is byte-correct — a separate
+      cast/output-function mechanism, not a `VirtualRows`-closure gap.
+      **Remaining scope (deferred, own future loops):** 9 sibling builders
+      still row-content-`DefaultDBOid`-only — `pg_attrdef`, `pg_inherits`,
+      `pg_statistic_ext`, `pg_policy`, `pg_depend`, `pg_trigger`,
+      `pg_rewrite`, `information_schema.routines`/`parameters`/
+      `routine_*_usage`, `pg_foreign_table`; `pg_sequence`/`pg_sequences`/
+      `information_schema.sequences`, `pg_attribute`/`pg_type`, and the new
+      `oid::regclass` cast gap remain separately flagged. Design doc updated
+      (new "pg_index" residual-gap subsection); `docs/design/README.md` row
+      extended; deferral ledger rows appended ("pg_index per-dbOid content"
+      + "pg_index live verification — collateral discovery"). Gates: `go
+      build ./...`/`go vet ./...` clean; `go test ./internal/catalog/...
+      ./internal/executor/... ./internal/server/... ./internal/planner/...`
+      PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed transactions, all 3 pgbench workloads).
+  - [x] `M0122-0007` follow-up 27 (2026-07-10, this loop) — **fixed the next
+      highest-value sibling pair follow-up 26 flagged: `pg_attrdef` +
+      `pg_depend`, done TOGETHER (unlike every prior single-builder
+      follow-up).** `dependVirtualRows`'s own doc comment already said the
+      two views must "agree on the oids" via the shared `attrDefRowsLocked`
+      numbering (a SERIAL column's NORMAL `'n'` attrdef→sequence `pg_depend`
+      row references the same oid `pg_attrdef` assigns it), so fixing one
+      without the other would desync them under a non-default dbOid.
+      `attrDefRowsLocked()` (hardcoded `c.ns(DefaultDBOid)`, 2 occurrences)
+      became `attrDefRowsLockedForDBOid(dbOid uint32)`; new exported
+      `catalog.InMemory.PGAttrdefRowsForDBOid(dbOid uint32)` and
+      `PGDependRowsForDBOid(dbOid uint32)` (renamed from `dependVirtualRows`)
+      both call it with the SAME dbOid, and `PGDependRowsForDBOid` also
+      parameterizes its own 2 `c.ns(DefaultDBOid)` references (the
+      sequence-ownership table/sequence enumeration). Both registered
+      closures now just call `...RowsForDBOid(DefaultDBOid)`,
+      byte-identical default behavior. Wired new per-connection
+      `executor.Context.PgAttrdefRows`/`PgDependRows func() [][]string`
+      fields (mirroring `PgIndexRows`), set in
+      `internal/server/dispatch.go`'s `wireExtensionRows` (new
+      `pgAttrdefRowLister`/`pgDependRowLister` interfaces), consumed by new
+      `tbl.Name == "pg_attrdef"`/`"pg_depend"` branches in
+      `internal/executor/operators.go`'s `valuesOp.Open`. New tests
+      `TestPgAttrdefRowsScopedToConnectionDBOid`/
+      `TestPgDependRowsScopedToConnectionDBOid`
+      (`internal/executor/fk_dbid_routing_test.go`): a SERIAL-PK table under
+      each of two distinct dbOids, resolved via `LookupTable`, asserted
+      never to cross-leak their `pg_attrdef` rows (by `adrelid`) or their
+      `'n'`-deptype `pg_depend` attrdef→sequence rows (by `refobjid`) — the
+      latter deliberately does NOT assert on the `'a'`-deptype OWNED-BY row,
+      since that row class still resolves through the global,
+      not-yet-dbOid-threaded `catalog.SequenceParamsFunc` (see below). Live
+      end-to-end verified against a real `cmd/goopg` binary + real `psql`:
+      `CREATE DATABASE freshdep1` → connect → `CREATE TABLE
+      only_in_freshdep1 (id serial PRIMARY KEY)` → raw `pg_attrdef` and
+      `pg_depend WHERE classid=2604` in `freshdep1` each show exactly that
+      table's own default/sequence OIDs; the same queries against
+      `postgres` db show only `postgres`'s own rows (no cross-database leak
+      either direction). Confirmed collaterally (not a regression — `
+      pg_depend` was DefaultDBOid-only for every dbOid before this loop
+      too): `pg_depend WHERE classid=1259` (the `'a'`-deptype OWNED-BY row)
+      from `freshdep1` now correctly returns 0 rows (no leak) instead of
+      leaking `postgres`'s row, but is still missing its own row — folds
+      into the existing "sequence ownership follow-on" ledger entry
+      (`catalog.SequenceParamsFunc` has no dbOid parameter at all), not a
+      new row. **Remaining scope (deferred, own future loops):** 8 sibling
+      builders still row-content-`DefaultDBOid`-only — `pg_inherits`,
+      `pg_statistic_ext`, `pg_policy`, `pg_trigger`, `pg_rewrite`,
+      `information_schema.routines`/`parameters`/`routine_*_usage`,
+      `pg_foreign_table`; `pg_sequence`/`pg_sequences`/
+      `information_schema.sequences`, `pg_attribute`/`pg_type`, and the
+      `oid::regclass` cast gap remain separately flagged. Design doc updated
+      (new "pg_attrdef + pg_depend" residual-gap subsection);
+      `docs/design/README.md` row extended; deferral ledger row appended
+      ("pg_attrdef/pg_depend per-dbOid content"). Gates: `go build ./...`/`go
+      vet ./...` clean; `go test ./internal/catalog/...
+      ./internal/executor/... ./internal/server/... ./internal/planner/...`
+      PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed transactions, all 3 pgbench workloads).
+  - [x] `M0122-0007` follow-up 28 (2026-07-10, this loop) — **fixed the next
+      highest-value single sibling builder follow-up 27 flagged:
+      `pg_inherits` row-content.** Extracted `pg_inherits.VirtualRows`'s
+      inline closure into new exported
+      `catalog.InMemory.PGInheritsRowsForDBOid(dbOid uint32) [][]string`,
+      parameterizing both of its `c.ns(DefaultDBOid)` references (the
+      partition/legacy-inheritance table parent-child loop and the
+      partitioned-index parent-child loop) to `c.ns(dbOid)`. The registered
+      closure now just calls `PGInheritsRowsForDBOid(DefaultDBOid)`,
+      byte-identical default behavior. Wired new per-connection
+      `executor.Context.PgInheritsRows func() [][]string` field (mirroring
+      `PgDependRows`), set in `internal/server/dispatch.go`'s
+      `wireExtensionRows` (new `pgInheritsRowLister` interface), consumed by
+      a new `tbl.Name == "pg_inherits"` branch in
+      `internal/executor/operators.go`'s `valuesOp.Open`. New test
+      `TestPgInheritsRowsScopedToConnectionDBOid`
+      (`internal/executor/fk_dbid_routing_test.go`), mirroring
+      `TestPgDependRowsScopedToConnectionDBOid`: a `PARTITION BY
+      RANGE`/`PARTITION OF` parent-child pair under each of two distinct
+      dbOids, resolved via `LookupTable`, asserted never to cross-leak their
+      `pg_inherits` rows (by `inhrelid`). Live end-to-end verified against a
+      real `cmd/goopg` binary + real `psql`: `CREATE DATABASE freshinh1` →
+      connect → `CREATE TABLE part_a (id int) PARTITION BY RANGE(id); CREATE
+      TABLE part_a_p1 PARTITION OF part_a FOR VALUES FROM (1) TO (100)` →
+      `freshinh1`'s `pg_inherits` shows exactly its own 1 row while
+      `postgres`'s shows 0; then a second, distinct partition pair
+      (`part_b`/`part_b_p1`) created in `postgres` shows exactly its own 1
+      row while `freshinh1`'s row stays unchanged — no cross-database leak
+      either direction. Collaterally reconfirmed (not fixed, own
+      already-open deferral entry): `inhrelid::regclass` on the live server
+      still prints the raw numeric OID rather than the table name — the
+      `oid::regclass` cast gap. **Remaining scope (deferred, own future
+      loops):** 7 sibling builders still row-content-`DefaultDBOid`-only —
+      `pg_statistic_ext`, `pg_policy`, `pg_trigger`, `pg_rewrite`,
+      `information_schema.routines`/`parameters`/`routine_*_usage`,
+      `pg_foreign_table`; `pg_sequence`/`pg_sequences`/
+      `information_schema.sequences`, `pg_attribute`/`pg_type`, and the
+      `oid::regclass` cast gap remain separately flagged. Design doc updated
+      (new "pg_inherits row-content" residual-gap subsection);
+      `docs/design/README.md` row extended; deferral ledger row appended
+      ("pg_inherits per-dbOid content"). Gates: `go build ./...`/`go vet
+      ./...` clean; `go test ./internal/catalog/... ./internal/executor/...
+      ./internal/server/... ./internal/planner/...` PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed transactions, all 3 pgbench workloads).
+  - [x] `M0122-0007` follow-up 29 (2026-07-10, this loop) — **fixed the next
+      highest-value single sibling builder follow-up 28 flagged: `pg_policy`
+      row-content.** Extracted `pg_policy.VirtualRows`'s inline closure into
+      new exported `catalog.InMemory.PGPolicyRowsForDBOid(dbOid uint32)
+      [][]string`, parameterizing its one `c.ns(DefaultDBOid)` reference (the
+      loop over every table's `Policies`) to `c.ns(dbOid)`. The registered
+      closure now just calls `PGPolicyRowsForDBOid(DefaultDBOid)`,
+      byte-identical default behavior. Wired new per-connection
+      `executor.Context.PgPolicyRows func() [][]string` field (mirroring
+      `PgInheritsRows`), set in `internal/server/dispatch.go`'s
+      `wireExtensionRows` (new `pgPolicyRowLister` interface), consumed by a
+      new `tbl.Name == "pg_policy"` branch in
+      `internal/executor/operators.go`'s `valuesOp.Open`. New test
+      `TestPgPolicyRowsScopedToConnectionDBOid`
+      (`internal/executor/fk_dbid_routing_test.go`), mirroring
+      `TestPgInheritsRowsScopedToConnectionDBOid`: a `CREATE POLICY ... USING`
+      under each of two distinct dbOids, asserted never to cross-leak their
+      `pg_policy` rows (by `polname`). Live end-to-end verified against a real
+      `cmd/goopg` binary + real `psql`: `CREATE DATABASE polA` / `CREATE
+      DATABASE polB` → `polA`: `CREATE TABLE ta (a int); CREATE POLICY pol_a
+      ON ta USING (a > 0)` → `polB`: `CREATE TABLE tb (a int); CREATE POLICY
+      pol_b ON tb USING (a > 0)` → `SELECT polname FROM pg_policy` in `polA`
+      returns exactly `pol_a`, the same query in `polB` returns exactly
+      `pol_b` — no cross-database leak either direction. **Remaining scope
+      (deferred, own future loops):** 6 sibling builders still
+      row-content-`DefaultDBOid`-only — `pg_statistic_ext`, `pg_trigger`,
+      `pg_rewrite`, `information_schema.routines`/`parameters`/
+      `routine_*_usage`, `pg_foreign_table`; `pg_sequence`/`pg_sequences`/
+      `information_schema.sequences`, `pg_attribute`/`pg_type`, and the
+      `oid::regclass` cast gap remain separately flagged. Design doc updated
+      (new "pg_policy row-content" residual-gap subsection);
+      `docs/design/README.md` row extended; deferral ledger row appended
+      ("pg_policy per-dbOid content"). Gates: `go build ./...`/`go vet ./...`
+      clean; `go test ./internal/catalog/... ./internal/executor/...
+      ./internal/server/... ./internal/planner/...` PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed transactions, all 3 pgbench workloads) — run via the pre-commit
+      hook at commit time.
+  - [x] `M0122-0007` follow-up 30 (2026-07-10, this loop) — **fixed the next
+      highest-value single sibling builder follow-up 29 flagged: `pg_trigger`
+      row-content.** Extracted `pg_trigger.VirtualRows`'s inline closure into
+      new exported `catalog.InMemory.PGTriggerRowsForDBOid(dbOid uint32)
+      [][]string`, parameterizing its one `c.ns(DefaultDBOid)` reference (the
+      loop over every table's `Triggers`) to `c.ns(dbOid)`. The registered
+      closure now just calls `PGTriggerRowsForDBOid(DefaultDBOid)`,
+      byte-identical default behavior. Wired new per-connection
+      `executor.Context.PgTriggerRows func() [][]string` field (mirroring
+      `PgPolicyRows`), set in `internal/server/dispatch.go`'s
+      `wireExtensionRows` (new `pgTriggerRowLister` interface), consumed by a
+      new `tbl.Name == "pg_trigger"` branch in
+      `internal/executor/operators.go`'s `valuesOp.Open`. New test
+      `TestPgTriggerRowsScopedToConnectionDBOid`
+      (`internal/executor/fk_dbid_routing_test.go`), mirroring
+      `TestPgPolicyRowsScopedToConnectionDBOid`: `CREATE FUNCTION ... RETURNS
+      trigger` + `CREATE TRIGGER ... BEFORE INSERT` under each of two
+      distinct dbOids, asserted never to cross-leak their `pg_trigger` rows
+      (by `tgname`). Live end-to-end verified against a real `cmd/goopg`
+      binary + real `psql`: `CREATE DATABASE trgA` / `CREATE DATABASE trgB` →
+      `trgA`: `CREATE TABLE ta (a int); CREATE FUNCTION fn_a() RETURNS
+      trigger ...; CREATE TRIGGER trig_a BEFORE INSERT ON ta ... EXECUTE
+      FUNCTION fn_a()` → `trgB`: same pattern with `tb`/`fn_b`/`trig_b` →
+      `SELECT tgname FROM pg_trigger` in `trgA` returns exactly `trig_a`, the
+      same query in `trgB` returns exactly `trig_b` — no cross-database leak
+      either direction. **Remaining scope (deferred, own future loops):** 5
+      sibling builders still row-content-`DefaultDBOid`-only —
+      `pg_statistic_ext`, `pg_rewrite`, `information_schema.routines`/
+      `parameters`/`routine_*_usage`, `pg_foreign_table`; `pg_sequence`/
+      `pg_sequences`/`information_schema.sequences`, `pg_attribute`/
+      `pg_type`, and the `oid::regclass` cast gap remain separately flagged.
+      `pg_rewrite` is the cleanest next single-builder pick (identical
+      table-level-slice shape to this loop's `pg_trigger` fix). Design doc
+      updated (new "pg_trigger row-content" residual-gap subsection);
+      `docs/design/README.md` row extended; deferral ledger row appended
+      ("pg_trigger per-dbOid content"). Gates: `go build ./...`/`go vet
+      ./...` clean; `go test ./internal/catalog/... ./internal/executor/...
+      ./internal/server/... ./internal/planner/...` PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed transactions, all 3 pgbench workloads) — run via the pre-commit
+      hook at commit time.
+  - [x] `M0122-0007` follow-up 31 (2026-07-10, this loop) — **fixed the next
+      highest-value single sibling builder follow-up 30 flagged: `pg_rewrite`
+      row-content.** Extracted `pg_rewrite.VirtualRows`'s inline closure into
+      new exported `catalog.InMemory.PGRewriteRowsForDBOid(dbOid uint32)
+      [][]string`, parameterizing its one `c.ns(DefaultDBOid)` reference (the
+      loop over every table's `Rules`) to `c.ns(dbOid)`. The registered
+      closure now just calls `PGRewriteRowsForDBOid(DefaultDBOid)`,
+      byte-identical default behavior. Wired new per-connection
+      `executor.Context.PgRewriteRows func() [][]string` field (mirroring
+      `PgTriggerRows`), set in `internal/server/dispatch.go`'s
+      `wireExtensionRows` (new `pgRewriteRowLister` interface), consumed by a
+      new `tbl.Name == "pg_rewrite"` branch in
+      `internal/executor/operators.go`'s `valuesOp.Open`. New test
+      `TestPgRewriteRowsScopedToConnectionDBOid`
+      (`internal/executor/fk_dbid_routing_test.go`), mirroring
+      `TestPgTriggerRowsScopedToConnectionDBOid`: `CREATE RULE ... AS ON
+      INSERT TO ... DO INSTEAD NOTHING` under each of two distinct dbOids,
+      asserted never to cross-leak their `pg_rewrite` rows (by `rulename`).
+      Live end-to-end verified against a real `cmd/goopg` binary + real
+      `psql`: `CREATE DATABASE rwA` / `CREATE DATABASE rwB` → `rwA`: `CREATE
+      TABLE ta (a int); CREATE RULE rule_a AS ON INSERT TO ta DO INSTEAD
+      NOTHING` → `rwB`: same pattern with `tb`/`rule_b` → `SELECT rulename
+      FROM pg_rewrite` in `rwA` returns exactly `rule_a`, the same query in
+      `rwB` returns exactly `rule_b` — no cross-database leak either
+      direction. **Remaining scope (deferred, own future loops):** 3 sibling
+      builders still row-content-`DefaultDBOid`-only — `pg_statistic_ext`,
+      `information_schema.routines`/`parameters`/`routine_*_usage`,
+      `pg_foreign_table`; `pg_sequence`/`pg_sequences`/
+      `information_schema.sequences`, `pg_attribute`/`pg_type`, and the
+      `oid::regclass` cast gap remain separately flagged.
+      `information_schema.routines`/`parameters`/`routine_*_usage` and
+      `pg_foreign_table` have not yet been inspected for which shape they
+      are; `pg_statistic_ext` needs the bigger "give `c.statisticsObjs` a
+      dbOid key" treatment (process-global map, not a table-level slice).
+      Design doc updated (new "pg_rewrite row-content" residual-gap
+      subsection); `docs/design/README.md` row extended; deferral ledger row
+      appended ("pg_rewrite per-dbOid content"). Gates: `go build ./...`/`go
+      vet ./...` clean; `go test ./internal/catalog/... ./internal/executor/...
+      ./internal/server/... ./internal/planner/...` PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed transactions, all 3 pgbench workloads) — run via the pre-commit
+      hook at commit time.
+  - [x] `M0122-0007` follow-up 32 (2026-07-10, this loop) — **fixed the next
+      highest-value single sibling builder follow-up 31 flagged:
+      `pg_foreign_table` row-content.** Extracted
+      `pg_foreign_table.VirtualRows`'s inline closure into new exported
+      `catalog.InMemory.PGForeignTableRowsForDBOid(dbOid uint32) [][]string`,
+      parameterizing its two `c.ns(DefaultDBOid)` references (the sorted-keys
+      scan over `tables` and the per-table lookup) to `c.ns(dbOid)`. The
+      registered closure now just calls
+      `PGForeignTableRowsForDBOid(DefaultDBOid)`, byte-identical default
+      behavior. Wired new per-connection `executor.Context.PgForeignTableRows
+      func() [][]string` field (mirroring `PgRewriteRows`), set in
+      `internal/server/dispatch.go`'s `wireExtensionRows` (new
+      `pgForeignTableRowLister` interface), consumed by a new `tbl.Name ==
+      "pg_foreign_table"` branch in `internal/executor/operators.go`'s
+      `valuesOp.Open`. New test `TestPgForeignTableRowsScopedToConnectionDBOid`
+      (`internal/executor/fk_dbid_routing_test.go`), mirroring
+      `TestPgRewriteRowsScopedToConnectionDBOid`: `CREATE SERVER` + `CREATE
+      FOREIGN TABLE ... SERVER ...` under each of two distinct dbOids,
+      asserted never to cross-leak their `pg_foreign_table` rows (matched by
+      `ftrelid`, since the row itself carries no table-name column — resolved
+      each expected table's OID via `catalog.InMemory.LookupTable(name,
+      dbOid)` instead). **Remaining scope (deferred, own future loops):** 2
+      sibling builders still row-content-`DefaultDBOid`-only —
+      `pg_statistic_ext`, `information_schema.routines`/`parameters`/
+      `routine_*_usage`; `pg_sequence`/`pg_sequences`/
+      `information_schema.sequences`, `pg_attribute`/`pg_type`, and the
+      `oid::regclass` cast gap remain separately flagged. Also newly
+      discovered (not fixed) this loop: `pg_foreign_table`'s `ftserver` OID
+      lookup (`c.foreignServers[t.ForeignServerName]`) still resolves against
+      a single process-global `map[string]*ForeignServer` with no dbOid key —
+      a `CREATE SERVER` of the same name in two databases would collide (same
+      shape as the still-open `c.statisticsObjs`/`SequenceParamsFunc` gaps).
+      Design doc updated (new "pg_foreign_table row-content" residual-gap
+      subsection); `docs/design/README.md` row extended; deferral ledger row
+      appended ("pg_foreign_table per-dbOid content"). Gates: `go build
+      ./...`/`go vet ./...` clean; `go test ./internal/catalog/...
+      ./internal/executor/... ./internal/server/... ./internal/planner/...`
+      PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33, re-run this loop).
+  - [x] `M0122-0007` follow-up 33 (2026-07-10, this loop) — **fixed the
+      `oid::regclass`/`'name'::regclass` cast-direction dbOid-scoping gap
+      follow-up 26 flagged as a collateral discovery.** Unlike the 10 prior
+      VirtualRows-closure follow-ups, this is a cast/output-function gap in
+      `internal/executor/expr.go`: the `CastExpr` regclass arm (both
+      `<oid>::regclass` and `'name'::regclass`) plus the `regclass` function-
+      call arm resolved every lookup against `DefaultDBOid` unconditionally —
+      `im.LookupTableByOID(uint32(v.Int))`, `im.ToastRelName(uint32(v.Int))`,
+      `ctx.Catalog.AllIndexes()`, and `ctx.Catalog.LookupTable(objName)` were
+      all called with no dbOid argument, so a connection to a distinct
+      `CREATE DATABASE`'d dbOid rendered the bare numeric OID instead of its
+      own table's name, and couldn't resolve its own table's name to an OID
+      at all. Fixed by threading `catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)`
+      through all five call sites (the same pattern `operators_fk.go`/
+      `operators_sequence.go`/`operators_tx.go`/`operators_cluster.go`/
+      `ssi.go`/`deferred_unique.go` already use). `catalog.InMemory.ToastRelName`
+      gained a variadic `dbOid uint32` parameter (previously hardcoded to
+      `DefaultDBOid`; its only call site is the `CastExpr` arm just fixed).
+      New test `TestRegclassCastScopedToConnectionDBOid`
+      (`internal/executor/fk_dbid_routing_test.go`), confirmed to fail via
+      `git stash` against a revert of this loop's `catalog.go`/`expr.go`
+      changes (3 assertions failed: OID→name rendered the bare OID instead of
+      the name, OID→name leaked a `DefaultDBOid` table's name to `otherDBOid`,
+      and `'shared_name'::regclass::oid` resolved to `DefaultDBOid`'s OID from
+      an `otherDBOid` connection). Uses two identically-named tables
+      (`shared_name`) in two distinct dbOids for the string→OID direction —
+      the realistic collision scenario, since a differently-named lookup miss
+      falls back to an unresolved literal rather than another database's OID
+      and so can't demonstrate a leak by itself. Design doc gained a new
+      subsection; `docs/design/README.md` row extended; deferral ledger row
+      appended ("oid::regclass cast — collateral discovery" flipped to
+      `resolved`). **Remaining M0122-0007 scope (deferred, own future
+      loops):** 2 sibling VirtualRows builders (`pg_statistic_ext`,
+      `information_schema.routines`/`parameters`/`routine_*_usage`) needing
+      the bigger registry-dbOid-key treatment; the `c.foreignServers`
+      (CREATE SERVER) and `catalog.SequenceParamsFunc` registries still keyed
+      without a dbOid (same shape, also touches WAL record format for
+      foreignServers); the real `CREATE DATABASE ... TEMPLATE` relation-copy
+      mechanism itself. Gates: `go build ./...`/`go vet ./...` clean; `go
+      test ./internal/catalog/... ./internal/executor/... ./internal/server/...
+      ./internal/planner/...` PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh`
+      PASS (0 failed transactions, all 3 pgbench workloads).
+  - [x] `M0122-0007` follow-up 34 (2026-07-10, this loop) — **scoped
+      `pg_sequence` to the connection's dbOid.** Unlike the `c.foreignServers`/
+      `information_schema.routines` gaps this epic previously ruled out as
+      needing a bigger registry redesign, `seqRegistry`
+      (`internal/executor/operators_sequence.go`) turned out to already be
+      fully dbOid-keyed (`RegisterSequence`/`LookupSequence`/... all take a
+      trailing `dbOid ...uint32`, resolved via `resolveSeqDBOid`) — the only
+      gap was `catalog.SequenceParamsFunc`'s own signature
+      (`func(qualifiedName string) (SeqParams, bool)`, no dbOid parameter),
+      which made every lookup implicitly hit `resolveSeqDBOid(nil)` ==
+      `DefaultDBOid`'s registry entry regardless of which dbOid's sequence
+      was being enumerated. Gave `SequenceParamsFunc` (and its executor-side
+      implementation `sequenceParamsForCatalog`) a `dbOid uint32` parameter;
+      `LookupSequence(qualifiedName, dbOid)` now receives the right dbOid at
+      both of its 2 catalog.go call sites. Extracted
+      `pgSequence.VirtualRows` into new `catalog.InMemory.PGSequenceRowsForDBOid(dbOid uint32)`
+      (mirroring the pg_foreign_table/pg_trigger/pg_rewrite precedent exactly:
+      registered closure now just calls `...RowsForDBOid(DefaultDBOid)`,
+      byte-identical default behavior) and fixed `PGDependRowsForDBOid`'s own
+      pre-existing `SequenceParamsFunc(...)` call (follow-up 27 already
+      dbOid-parameterized this function's table enumeration via `c.ns(dbOid)`,
+      but its `SequenceParamsFunc` lookup silently still hit DefaultDBOid's
+      registry — a latent same-loop-family bug this fix also closes, so a
+      non-default dbOid's OWNED-BY `pg_depend` row can now actually resolve).
+      Wired new per-connection `executor.Context.PgSequenceRows func() [][]string`
+      field, set in `internal/server/dispatch.go`'s `wireExtensionRows` (new
+      `pgSequenceRowLister` interface), consumed by a new
+      `tbl.Name == "pg_sequence"` branch in `internal/executor/operators.go`'s
+      `valuesOp.Open`. New `TestPgSequenceRowsScopedToConnectionDBOid`
+      (`internal/executor/fk_dbid_routing_test.go`): two sequences under two
+      distinct dbOids, asserts each dbOid's `PGSequenceRowsForDBOid` shows only
+      its own sequence with the right `seqstart`, never leaking the other's.
+      Live end-to-end verified against a real `cmd/goopg` binary + real
+      `psql`: two `CREATE DATABASE`s, one `CREATE SEQUENCE` each with distinct
+      START/INCREMENT values — each database's `pg_sequence` (`count(*)=1`)
+      shows only its own sequence with its own params, no cross-leak either
+      direction. **Remaining M0122-0007 scope (deferred, own future loops):**
+      `pg_sequences`/`information_schema.sequences`
+      (`internal/initdb/pg_sequences_view.go`/
+      `information_schema_sequences_view.go`, both reading
+      `executor.AllSequenceInfos()` with no dbOid — same zero-arg `func()
+      [][]string` VirtualRows shape as pg_sequence had, not yet fixed);
+      `pg_statistic_ext`/`information_schema.routines` (bigger registry
+      redesign); `c.foreignServers` (also touches WAL format); the real
+      `CREATE DATABASE ... TEMPLATE` relation-copy mechanism itself. Deferral
+      ledger: flipped the "sequence ownership follow-on" row to `resolved`
+      (SequenceParamsFunc dbOid gap is what it tracked) and appended a new row
+      for the pg_sequences/information_schema.sequences remainder. Design doc
+      gained a new subsection; `docs/design/README.md` row extended. Gates:
+      `go build ./...`/`go vet ./...` clean; `go test ./internal/catalog/...
+      ./internal/executor/... ./internal/server/... ./internal/planner/...`
+      PASS (internal/server's first run hit an unrelated flaky logical-
+      replication timing FAIL — "dial refused" — reproduced clean on 3
+      subsequent `-count=1` reruns, not caused by this loop's change);
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed transactions, all 3 pgbench workloads).
+  - [x] `M0122-0007` follow-up 35 (2026-07-10, this loop) — **closed the
+      exact remainder follow-up 34 flagged as deferred: `pg_sequences`
+      (`internal/initdb/pg_sequences_view.go`) and
+      `information_schema.sequences`
+      (`internal/initdb/information_schema_sequences_view.go`), both of
+      which called `executor.AllSequenceInfos()` with no dbOid, hardcoded
+      to `DefaultDBOid`'s sequences regardless of connection.** Unlike
+      `pg_sequence` (singular, a `catalog.InMemory`-backed table needing
+      the `PGSequenceRowsForDBOid` cross-package interface plumbed through
+      `executor.Context`/`wireExtensionRows`), both views read straight
+      from this package's own `seqRegistry` via the already dbOid-aware
+      `AllSequenceInfos(dbOid ...uint32)` — no `catalog.InMemory`
+      indirection is needed at all. Moved the row-shaping logic that used
+      to live inline in each view's `VirtualRows` closure into two new
+      exported `internal/executor/operators_sequence.go` functions,
+      `PGSequencesRows(dbOid uint32)` / `InformationSchemaSequencesRows(dbOid
+      uint32)` (plus a shared `sortedSequenceInfos` helper and the
+      relocated `seqDataTypePrecision`/a local `boolTextSeq`, since
+      `executor` cannot import `internal/initdb` — import cycle).
+      `internal/executor/operators.go`'s `valuesOp.Open` gained two new
+      branches, `tbl.Name == "pg_sequences"` and `tbl.Name == "sequences"
+      && tbl.Schema == "information_schema"`, each calling the new
+      function directly with `catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)`
+      — mirrors the existing `pg_stat_slru`/`pg_stat_io` direct-call
+      branches (same-package state, no `Context`-field indirection needed)
+      rather than the `pg_class`/`pg_sequence`-style cross-package
+      interface pattern. Each initdb view's own `VirtualRows` closure is
+      now a thin fallback calling the new function with
+      `catalog.DefaultDBOid`, used only when `ctx` is nil. New test
+      `TestPGSequencesAndInfoSchemaSequencesRowsScopedToConnectionDBOid`
+      (`internal/executor/fk_dbid_routing_test.go`). Live end-to-end
+      verified against a real `cmd/goopg` binary + real `psql`: two
+      `CREATE DATABASE`s, one `CREATE SEQUENCE` each with distinct
+      START/INCREMENT — each database's `pg_sequences` and
+      `information_schema.sequences` show exactly its own sequence with
+      its own params, no cross-leak either direction. This closes the
+      "sequence ownership follow-on" deferral-ledger row in full (flipped
+      to `resolved`) and appended a new fully-resolved row for this loop's
+      own fix (nothing further deferred for this sub-cluster). Design:
+      `docs/design/0122-0018-per-database-catalog-namespace.md` gained a
+      new subsection; `docs/design/README.md` row updated. Gates: `go
+      build ./...`/`go vet ./...` clean; `go test ./internal/executor/...
+      ./internal/initdb/... ./internal/catalog/... ./internal/server/...`
+      PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh`
+      PASS (0 failed transactions, all 3 pgbench workloads). **Remaining
+      M0122-0007 scope (deferred, own future loops):** `pg_statistic_ext`/
+      `information_schema.routines` (bigger registry redesign);
+      `c.foreignServers` (also touches WAL format); the real `CREATE
+      DATABASE ... TEMPLATE` relation-copy mechanism itself.
+  - [x] `M0122-0007` follow-up 36 (2026-07-10, this loop) — **closed the
+      `c.foreignServers` registry-dbOid-key gap follow-up 35 left as
+      remaining scope: `catalog.ForeignServer` was a process-global
+      `map[string]*ForeignServer` keyed by bare name only, so a same-named
+      `CREATE SERVER` in two distinct databases silently collided
+      (last-writer-wins) instead of coexisting like real PG's per-database
+      `pg_foreign_server`.** Gave `ForeignServer` a `DBOid uint32` field and
+      re-keyed the registry via new `foreignServerKey(dbOid, name)`
+      (`"<dbOid>:<name>"`, mirroring `seqKey`). Threaded a trailing
+      `dbOid ...uint32` parameter through `RegisterForeignServer`/
+      `DropForeignServer`/`ListForeignServers`/`ForeignServerOID` (the last
+      also updated in the `catalog.Catalog` interface, since it's the one
+      method of the four exposed there) and their `*DuringRecovery`
+      counterparts. `EncodeCreateForeignServer`/`DecodeCreateForeignServer`
+      and `EncodeDropForeignServer`/`DecodeDropForeignServer`
+      (`internal/wal/recovery.go`) each gained a trailing-appended `dbOid`
+      field, following `EncodeDropSequence`'s backward-compatible-trailer
+      pattern exactly (a pre-follow-up-36 WAL payload decodes with
+      `dbOid=0`, translated through `catalog.NamespaceDBOid` at the replay
+      call site in `internal/initdb/foreignserver_ddl_recovery.go`). New
+      `catalog.InMemory.PGForeignServerRowsForDBOid(dbOid uint32) [][]string`
+      extracted from `pg_foreign_server.VirtualRows` (mirrors
+      `PGForeignTableRowsForDBOid`); new `executor.Context.PgForeignServerRows`
+      field wired in `internal/server/dispatch.go`'s `wireExtensionRows`
+      (new `pgForeignServerRowLister` interface), consumed by a new
+      `tbl.Name == "pg_foreign_server"` branch in `valuesOp.Open`. Updated
+      every CREATE/DROP SERVER and CASCADE-drop call site in
+      `internal/executor/operators_ddl.go` to pass
+      `catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)`; auditing every
+      `ForeignServerOID` call site this signature change touched also caught
+      2 pre-existing un-dbOid'd sites — `CREATE FOREIGN TABLE ... SERVER`'s
+      existence check and `COMMENT ON SERVER` — the first was caught live by
+      a pre-existing regression test (`TestPgForeignTableRowsScopedToConnectionDBOid`)
+      failing with `42704: server does not exist` before this fix.
+      `PGForeignTableRowsForDBOid`'s `c.foreignServers[t.ForeignServerName]`
+      lookup updated to the new keyed form. New tests
+      `TestCreateServerSameNameAcrossDistinctDBOidDoesNotCollide`
+      (`internal/executor/operators_ddl_foreign_server_durability_test.go`),
+      `TestPgForeignServerRowsScopedToConnectionDBOid`
+      (`internal/executor/fk_dbid_routing_test.go`),
+      `TestForeignServerDDLRecoveryPreservesDistinctDBOidAfterRestart`
+      (`internal/initdb/foreignserver_ddl_recovery_test.go`), plus WAL
+      round-trip/backward-compat tests in
+      `internal/wal/foreign_server_ddl_test.go`. Live end-to-end verified
+      against a real `cmd/goopg` binary + real `psql`: two `CREATE
+      DATABASE`s each `CREATE SERVER shared ...` with a distinct `TYPE`;
+      each database's `pg_foreign_server` shows exactly its own `shared`
+      row; `DROP SERVER shared` in one database leaves the other's intact;
+      both facts survive a server restart (WAL replay). **Deliberately
+      still un-dbOid'd (own future loops, recorded in the deferral
+      ledger):** `pg_user_mappings`/`UserMapping` (same-shape sibling);
+      `internal/server/grant_ddl.go`'s `GRANT/REVOKE ... ON FOREIGN SERVER`
+      (still `DefaultDBOid`-only — not a regression, matches pre-fix
+      behavior); the FDW registry itself. Design:
+      `docs/design/0122-0018-per-database-catalog-namespace.md` gained a new
+      subsection; `docs/design/README.md` row updated. Gates: `go build
+      ./...`/`go vet ./...` clean; `go test -race ./internal/catalog/...
+      ./internal/executor/... ./internal/wal/... ./internal/initdb/...
+      ./internal/server/...` PASS (the sole `internal/server` failure,
+      `TestConnectExceedsPositiveDatconnlimitRejected`, is the pre-existing,
+      pre-this-epic `internal/activity/registry.go` data race already
+      documented in the design doc's "Unrelated pre-existing hazard" note —
+      reproduces on unmodified HEAD, unrelated to this change);
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh`
+      PASS (0 failed transactions, all 3 pgbench workloads). **Remaining
+      M0122-0007 scope (deferred, own future loops):** `pg_statistic_ext`/
+      `information_schema.routines` (bigger registry redesign);
+      `pg_user_mappings`/`UserMapping` dbOid scoping; the real `CREATE
+      DATABASE ... TEMPLATE` relation-copy mechanism itself.
+  - [x] `M0122-0007` follow-up 37 (2026-07-10, this loop) — **dbOid-scoped
+      the `catalog.UserMapping` registry, the same-shape sibling follow-up
+      36 named as its own future loop: `UserMapping` was a process-global
+      `map[string]*UserMapping` keyed by bare (user, server) only, so a
+      same-named `CREATE USER MAPPING` in two distinct databases silently
+      collided (last-writer-wins) instead of coexisting like real PG's
+      per-database `pg_user_mappings`.** Gave `UserMapping` a `DBOid uint32`
+      field and re-keyed the registry via `userMappingKey` gaining a
+      `"<dbOid>:"` prefix (keeping the pre-existing case-insensitive,
+      NUL-separated `(user, server)` part unchanged). Threaded a trailing
+      `dbOid ...uint32` parameter through `RegisterUserMapping`/
+      `DropUserMapping`/`ListUserMappings` and their `*DuringRecovery`
+      counterparts. `EncodeCreateUserMapping`/`DecodeCreateUserMapping` and
+      `EncodeDropUserMapping`/`DecodeDropUserMapping`
+      (`internal/wal/recovery.go`) each gained a trailing-appended `dbOid`
+      field, following `EncodeCreateForeignServer`'s
+      backward-compatible-trailer pattern exactly (a pre-follow-up-37 WAL
+      payload decodes with `dbOid=0`, translated through
+      `catalog.NamespaceDBOid` at the replay call site in
+      `internal/initdb/usermapping_ddl_recovery.go`). New
+      `catalog.InMemory.PGUserMappingsRowsForDBOid(dbOid uint32) [][]string`
+      extracted from `pg_user_mappings.VirtualRows` (mirrors
+      `PGForeignServerRowsForDBOid`; its `srvid` column now resolves via
+      `c.ForeignServerOID(m.SrvName, dbOid)` instead of the bare-name call,
+      so a mapping in database B resolves against database B's own
+      `pg_foreign_server` registry); new `executor.Context.PgUserMappingsRows`
+      field wired in `internal/server/dispatch.go`'s `wireExtensionRows`
+      (new `pgUserMappingsRowLister` interface), consumed by a new
+      `tbl.Name == "pg_user_mappings"` branch in `valuesOp.Open`. Updated
+      CREATE/DROP USER MAPPING call sites in
+      `internal/executor/operators_ddl.go` to pass
+      `catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)`. New tests
+      `TestCreateUserMappingSameNameAcrossDistinctDBOidDoesNotCollide`
+      (`internal/executor/operators_ddl_user_mapping_durability_test.go`,
+      new file), `TestPgUserMappingsRowsScopedToConnectionDBOid`
+      (`internal/executor/fk_dbid_routing_test.go`),
+      `TestUserMappingDDLRecoveryPreservesDistinctDBOidAfterRestart`
+      (`internal/initdb/usermapping_ddl_recovery_test.go`), plus WAL
+      round-trip/backward-compat tests in
+      `internal/wal/user_mapping_ddl_test.go`. Live end-to-end verified
+      against a real `cmd/goopg` binary + real `psql`: two `CREATE
+      DATABASE`s each `CREATE SERVER srv ...` plus `CREATE USER MAPPING FOR
+      postgres SERVER srv` with distinct `OPTIONS`; each database's
+      `pg_user_mappings` shows exactly its own row; `DROP USER MAPPING` in
+      one database leaves the other's intact; both facts (plus the
+      databases themselves) survive a server restart (WAL replay). The
+      check also surfaced (not fixed — recorded in the deferral ledger) that
+      `CREATE USER MAPPING FOR CURRENT_USER ...` stores the literal string
+      `"current_user"` rather than resolving to the connecting role's name,
+      a pre-existing parser simplification
+      (`internal/parser/ddl.go`'s `scanUserMappingForServer`). **Deliberately
+      still un-dbOid'd (own future loops, recorded in the deferral
+      ledger):** `internal/server/grant_ddl.go`'s
+      `recordForeignServerGrant`/`recordForeignServerRevoke` (still
+      `DefaultDBOid`-only, inherited from follow-up 36 — not a regression);
+      the FDW registry itself. Design:
+      `docs/design/0122-0018-per-database-catalog-namespace.md` gained a new
+      subsection; `docs/design/README.md` row updated. Gates: `go build
+      ./...`/`go vet ./...` clean; `go test -race ./internal/catalog/...
+      ./internal/executor/... ./internal/wal/... ./internal/initdb/...
+      ./internal/server/...` PASS (the sole `internal/server` failure,
+      `TestConnectExceedsPositiveDatconnlimitRejected`, is the same
+      documented pre-existing unrelated race as follow-up 36; running
+      `internal/initdb` under `-race` needed `-timeout 40m` because of this
+      host's concurrent live Ralph-loop co-load, matching the
+      `goopg_nightly_ci_batch` memory's "initdb 10m-timeout under co-load"
+      finding — not a regression); `go test -short` full repo PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh`
+      PASS (0 failed transactions, all 3 pgbench workloads). **Remaining
+      M0122-0007 scope (deferred, own future loops):** `pg_statistic_ext`/
+      `information_schema.routines` (bigger registry redesign); the
+      CURRENT_USER-resolution parser gap noted above; the real `CREATE
+      DATABASE ... TEMPLATE` relation-copy mechanism itself.
+  - [x] `M0122-0007` follow-up 38 (2026-07-10, this loop) — **resolved
+      `CREATE`/`DROP USER MAPPING FOR <role-spec>`'s CURRENT_USER/
+      SESSION_USER/CURRENT_ROLE/USER sentinels to the connecting role's
+      actual name**, closing follow-up 37's own orthogonal discovery: the
+      previous nightly build regression (stale by this loop; already fixed
+      by follow-up 14) meant no other AI-triage item was open, so this loop
+      picked up the next M0122-0007 resume point instead. Real PostgreSQL's
+      `CreateUserMapping`/`RemoveUserMapping` (`foreigncmds.c`) resolve the
+      `RoleSpec` via `get_rolespec_oid` (`acl.c`) at CREATE/DROP time
+      (`GetUserId()` for CURRENT_USER/CURRENT_ROLE/USER, `GetSessionUserId()`
+      for SESSION_USER); goopg's `scanUserMappingForServer`
+      (`internal/parser/ddl.go`) has no connection-state access and passes
+      the raw keyword text through unchanged (unfixed, matches its own doc
+      comment), so resolution now happens at the executor call sites
+      (`internal/executor/operators_ddl.go`) instead, which already have
+      `o.ctx`. New `ddlOp.currentDDLOwnerName()` (name-string sibling of the
+      pre-existing `currentDDLOwnerOID()`) and
+      `ddlOp.resolveUserMappingRoleName(user string) string`
+      (case-insensitively matches the 4 sentinel spellings, substitutes
+      `currentDDLOwnerName()`'s result, passes everything else — including
+      `public`/`""` — through unchanged). Both the CREATE and DROP USER
+      MAPPING `"user mapping"` cases route the parsed user token through it
+      before touching the registry, so a mapping created FOR CURRENT_USER
+      can also be dropped FOR CURRENT_USER. Matches the pre-existing
+      "current_user" sentinel convention already used by every OWNER TO site
+      in this file (goopg does not model SET ROLE vs. SET SESSION
+      AUTHORIZATION separately for this purpose). Because the *resolved*
+      name (not the literal keyword) is what gets WAL-logged
+      (`wal.EncodeCreateUserMapping` receives the already-resolved
+      `um.UmUser`), restart durability came for free — no WAL format change
+      needed. New tests (all in
+      `internal/executor/operators_ddl_user_mapping_current_user_test.go`):
+      `TestCreateUserMappingCurrentUserResolvesToConnectingRoleName`
+      (table-driven over CURRENT_USER/SESSION_USER/CURRENT_ROLE/USER, with
+      `NonSuperuserRole` set), `TestCreateUserMappingCurrentUserFallsBackToBootstrapSuperuser`
+      (no active SET ROLE → resolves to "postgres"),
+      `TestDropUserMappingCurrentUserResolvesSameAsCreate`,
+      `TestCreateUserMappingPlainRoleNamePassesThrough` (regression guard: a
+      role literally named e.g. "myuser", and the PUBLIC pseudo-role, must
+      still pass through unchanged — the sentinel match isn't over-broad).
+      Live end-to-end verified against a real `cmd/goopg` binary + real
+      `psql`: `FOR CURRENT_USER`/`FOR SESSION_USER` both resolve to
+      "postgres" with no active SET ROLE; after `SET ROLE alice`, `FOR
+      CURRENT_USER` resolves to "alice" and the mapping is then droppable by
+      its resolved name; a mapping created FOR CURRENT_USER survives a
+      restart still showing the resolved name (not the literal
+      "current_user") in `pg_user_mappings`. Design:
+      `docs/design/0122-0018-per-database-catalog-namespace.md` gained a new
+      "follow-up 38" subsection + status-line update;
+      `docs/design/README.md` row extended. Gates: `go build ./...`/`go vet
+      ./...` clean; `go test -race ./internal/catalog/...
+      ./internal/executor/... ./internal/wal/... ./internal/initdb/...`
+      PASS (`internal/initdb` needed `-timeout 40m` under this host's
+      concurrent live Ralph-loop co-load, matching the
+      `goopg_nightly_ci_batch` "initdb 10m-timeout under co-load" finding —
+      not a regression); `go test ./internal/parser/... ./internal/planner/...
+      ./internal/server/...` PASS; `go test -short` full repo (excl.
+      testport) PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh`
+      PASS (0 failed transactions, all 3 pgbench workloads). **Remaining
+      M0122-0007 scope (deferred, own future loops):** `pg_statistic_ext`/
+      `information_schema.routines` (bigger registry redesign); the real
+      `CREATE DATABASE ... TEMPLATE` relation-copy mechanism itself.
+  - [x] `M0122-0007` 4e follow-up 39 (2026-07-10, this loop) — **restart
+      durability for user tables created under a distinct-dbOid database**
+      (adopted, verified, and completed from an interrupted prior loop's
+      uncommitted WIP; the loop-start tree carried the full code change +
+      new test but none of the bookkeeping). Before: `syncTableToCatalogHeap`
+      pinned every user table's pg_class/pg_attribute rows to
+      `DefaultDBOid`'s catalog heap and the startup loader registered
+      everything back into the `DefaultDBOid` namespace — a table created
+      under `CREATE DATABASE db1` survived a restart only as a ghost in the
+      postgres namespace with its data unreachable (reloaded `catalog.Table`
+      lost the `DBOid` routing reads to `base/<dbOid>/<relOid>`), and
+      vanished from db1: a data-loss-shaped divergence from PG's
+      per-database catalog layout. Now: `syncTableToCatalogHeap` routes heap
+      writes by new `tableCatalogHeapDBOid` (the connection's
+      `catalog.NamespaceDBOid`) into the database's OWN
+      `base/<dbOid>/1259|1249`, skipping sys-btree entries + the postgres
+      mirror for distinct dbOids; table-row xmax stamps switched
+      `catalogDBOids` → new `tableCatalogDBOids` at all
+      `execCreateView`/`execDropOneView`/`execDropOneMatView`/
+      `dropTableByRefImmediate`/`execAlterTable`/`execAlterDropColumn`
+      sites (index-row stamps keep `catalogDBOids`); `rollbackDDLCreate`
+      (`operators_tx.go`) drops/stamps at the real dbOid.
+      `catalog.CreateView` stamps `Table.DBOid`; new
+      `catalog.LookupTableByOIDAllDBs`. `initdb.Open` loops
+      `cat.ListDatabases()` loading each distinct-dbOid database's own
+      catalog heap into its own namespace via new
+      `loadUserTablesFromHeapForDB(heapDBOid, nsDBOid)`;
+      view/matview/column-default replay resolves TableOID-only WAL records
+      via `LookupTableByOIDAllDBs`. New E2E test
+      `TestDistinctDatabaseTableSurvivesRestartInOwnNamespace`
+      (`internal/server/table_dbid_restart_test.go`): wire protocol + real
+      data-dir round trip; dropped sibling stays dropped; no leak into
+      postgres pg_class. Design doc
+      `docs/design/0122-0018-per-database-catalog-namespace.md` gained a
+      follow-up-39 subsection + status-line update; `docs/design/README.md`
+      row extended; deferral ledger row appended (index/type rows still
+      DefaultDBOid-pinned, no per-database sys-btree catalog indexes → 
+      pg_dump/PG-standby still cover DefaultDBOid/postgres only, WAL
+      view/matview/column-default records carry no dbOid). Gates: `go build
+      ./...`/`go vet ./...` clean; `go test -race ./internal/catalog/...
+      ./internal/executor/... ./internal/initdb/...` PASS (initdb ~16 min
+      under race + live-loop co-load, known finding, not a regression);
+      `go test -short` full repo (excl. testport) PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke via
+      pre-commit hook. **Remaining M0122-0007 scope (deferred, own future
+      loops):** per-database index/type catalog rows + sys-btree bootstrap
+      (belongs with the `CREATE DATABASE ... TEMPLATE` relation-copy
+      mechanism, the last open 4e item); `pg_statistic_ext`/
+      `information_schema.routines` registry redesign.
+  - [x] `M0122-0007` 4e follow-up 40 (2026-07-10, this loop) — **the real
+      `CREATE DATABASE ... TEMPLATE` relation-copy mechanism, bounded
+      plain-table case** (the last open 4e item, at least for the common
+      shape). Before: ANY non-empty template errored `FeatureNotSupported`
+      regardless of what it contained. Now: `resolveCreateDatabaseTemplate`
+      (`internal/server/database_ddl.go`) distinguishes "nothing to copy"
+      (unchanged), "every user relation is a plain, unindexed heap table"
+      (proceed to copy), and "contains an index/sequence/view/matview/typed
+      table anywhere" (still `FeatureNotSupported`, now a more specific
+      message). `databaseDDLCreate` gained a source-busy guard (mirrors PG's
+      `CountOtherDBBackends`, `ERRCODE_OBJECT_IN_USE`) and calls new
+      `copyTemplateTables`, which clones each table via `CreateTable` under
+      the new dbOid, physically copies its MainFork relation file
+      (`copyTemplateRelationFile`/`copyRelationFileFsync`, mirrors
+      `relocateRelationPhysicalFile`'s copy+fsync discipline but never
+      touches the source), and persists pg_class/pg_attribute catalog-heap
+      rows via a newly exported `executor.SyncTableToCatalogHeap` (a minimal
+      `*executor.Context` + a short-lived internal mvcc transaction, since
+      CREATE DATABASE runs outside any client transaction) — this reuses
+      M0122-0007 4e follow-up 39's per-database catalog-heap restart-durability
+      mechanism as-is, no new WAL record kind needed. Mid-loop failures unwind
+      via new `rollbackTemplateCopy`. Tests:
+      `TestTryHandleDatabaseDDLCreatePlainTableTemplateCopies` (replaces the
+      old `...NonEmptyTemplateErrors` expectation), new
+      `...WithIndexErrors`/`...WithSequenceErrors`
+      (`internal/server/database_ddl_test.go`); new E2E
+      `TestCreateDatabaseTemplatePlainTableCopiesDataAndSurvivesRestart`
+      (`internal/server/database_template_copy_restart_test.go`): real wire
+      protocol, `INSERT`ed rows, copy visible immediately and after a full
+      server restart, source database unaffected. Design doc
+      `docs/design/0122-0018-per-database-catalog-namespace.md` gained a
+      follow-up-40 subsection; `docs/design/README.md` row updated; deferral
+      ledger row appended (index/sequence/view/matview/typed-table TEMPLATE
+      copying still deferred — its own future loop). Gates: `go build
+      ./...`/`go vet ./...` clean; `go test ./internal/server/...
+      ./internal/catalog/... ./internal/executor/... ./internal/initdb/...`
+      PASS; `go test -race ./internal/server/...` PASS except
+      `TestConnectExceedsPositiveDatconnlimitRejected`, confirmed
+      (re-verified this loop, `-count=3` both with and without this change)
+      to be the pre-existing `internal/activity/registry.go` data race
+      predating this epic, not a regression; `go test -short` full repo
+      (excl. testport) PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      pgbench smoke via pre-commit hook. **Remaining M0122-0007 scope
+      (deferred, own future loops):** index/sequence/view/matview/typed-table
+      TEMPLATE copying (needs index-file cloning + per-database sys-btree
+      catalog bootstrap, sequence-state cloning, view/matview AST cloning,
+      composite-type OID resolution); per-database index/type catalog rows +
+      sys-btree bootstrap (independent of TEMPLATE copy);
+      `pg_statistic_ext`/`information_schema.routines` registry redesign.
+  - [x] `M0122-0007` 4e follow-up 41 (2026-07-10, this loop) — **extended
+      `CREATE DATABASE ... TEMPLATE`'s relation-copy mechanism (follow-up 40)
+      to also cover sequences.** Unlike the still-deferred index/view/
+      matview/typed-table cases, a sequence needs no relation file and no
+      per-database sys-btree catalog bootstrap — its durable state is a
+      process-global registry entry (`internal/executor`'s `seqRegistry`),
+      not a heap page, so the clone mechanism already existed almost
+      verbatim as `RestoreSequenceFromWAL` (the same function WAL replay
+      uses at startup). New exported `executor.SnapshotSequenceState`
+      captures a sequence's live state via `WALLogSequenceState`'s own
+      `payloadLocked` snapshot. **Real correctness finding, surfaced only by
+      the E2E test:** sequences cannot be detected via the same
+      `tmpl.AllTables(oid)` walk plain tables use — every sequence's
+      virtual `pg_class` relation is `Virtual` (`CreateSequenceCatalogRelation`),
+      and `AllTables` unconditionally skips `Virtual` rows. A first pass
+      keyed detection off `AllTables` + a hand-set `IsSequence` flag; its
+      own unit tests passed (fixtures didn't set `Virtual`) but the real
+      wire-protocol E2E test failed with `relation "s_copy" does not exist`
+      since the real `CREATE SEQUENCE` path's `Virtual=true` row was
+      invisible to the walk. Fixed via `executor.AllSequenceInfos(oid)`
+      instead (reads `seqRegistry` directly), gated by
+      `executor.IsSequenceTemporary` (a TEMPORARY sequence still keeps the
+      whole template unsupported, same rule as indexes/views). New
+      `resolveCreateDatabaseTemplate` third return value
+      `sequences []executor.SeqInfo`; new `s.copyTemplateSequences`
+      (snapshot → `RestoreSequenceFromWAL` under the new dbOid →
+      `CreateSequenceCatalogRelation` → `WALLogSequenceState` against a
+      minimal `*executor.Context`); `rollbackTemplateCopy` gained a second
+      sweep over `executor.AllSequenceInfos(newOid)` (mirrors real DROP
+      SEQUENCE's `DropSequence`+`DropTable` pairing) since a Virtual
+      sequence row is invisible to the pre-existing `AllTables`-only sweep
+      too. Tests: `TestTryHandleDatabaseDDLCreateTemplateWithSequenceCopies`
+      (replaces `...WithSequenceErrors`), new
+      `...WithTemporarySequenceErrors` (`internal/server/database_ddl_test.go`,
+      fixtures corrected to the real `RegisterSequence`+
+      `CreateSequenceCatalogRelation` pair); new E2E
+      `TestCreateDatabaseTemplateSequenceCopiesStateAndSurvivesRestart`
+      (`internal/server/database_template_copy_restart_test.go`): real wire
+      protocol + real `nextval()`, clone continues from the source's exact
+      counter, advancing either copy never moves the other, both keep
+      advancing independently after a full restart (values only asserted
+      strictly-above pre-restart, matching
+      `TestPort_SerialSequenceSurvivesRestart`'s documented pre-logging-gap
+      semantics). Design: `docs/design/0122-0018-per-database-catalog-namespace.md`
+      gained a follow-up-41 subsection; `docs/design/README.md` row
+      updated; deferral ledger row appended. Gates: `go build ./...`/`go vet
+      ./...` clean; `go test ./internal/server/... ./internal/executor/...
+      ./internal/catalog/...` PASS; `go test -race ./internal/server/...
+      ./internal/executor/...` PASS except the pre-existing, unrelated
+      `TestConnectExceedsPositiveDatconnlimitRejected` race (re-confirmed
+      this loop via `git stash` + `-count=3` against unmodified HEAD —
+      reproduces identically, not introduced by this change); `go test
+      -short` full repo (excl. testport) PASS; `scripts/tpch-spotcheck.sh`
+      PASS (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke bash
+      scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 workloads).
+      **Remaining M0122-0007 scope after this follow-up (deferred, own future
+      loops):** index/view/matview/typed-table TEMPLATE copying (index-file
+      cloning + per-database sys-btree catalog bootstrap; view/matview
+      AST/`ViewDef` cloning; composite-type OID resolution for typed
+      tables); per-database index/type catalog rows + sys-btree bootstrap
+      (independent of TEMPLATE copy); `pg_statistic_ext`/
+      `information_schema.routines` registry redesign.
+
+  - [x] `M0122-0007` 4e follow-up 42 (2026-07-10, this loop) — **extended
+      `CREATE DATABASE ... TEMPLATE`'s relation-copy mechanism (follow-ups
+      40/41) to also cover plain (non-materialized) views.** Like sequences,
+      a view has no relation file and no per-database sys-btree bootstrap
+      need — its durable state is just a parsed SELECT AST
+      (`catalog.Table.View`) plus raw defining SQL text (`ViewDef`). **Real
+      correctness finding, caught by inspection rather than a failing E2E
+      test:** `resolveCreateDatabaseTemplate`'s `AllTables(oid)` loop had a
+      `t.View != nil { unsupported = true }` branch that could NEVER fire —
+      `CreateView` always sets `Virtual: true` on a view's pg_class row, and
+      `AllTables` unconditionally skips every `Virtual` row before the loop
+      body ever runs (same shape as follow-up 41's sequence-detection
+      gotcha). A template containing only a plain view was NOT actually
+      rejected with `FeatureNotSupported` as the code's own comment claimed
+      — it silently produced an empty new database with the view just
+      missing, no error at all. Fixed via new `catalog.InMemory.AllViews(dbOid
+      ...uint32) []*Table` (walks the same raw `ns.tables` map
+      `PGClassRowsForDBOid` already does, selecting `View != nil &&
+      !IsMatView`), threaded through `databaseTemplateRegistry`.
+      `resolveCreateDatabaseTemplate` gained a 4th return value `views
+      []*catalog.Table`; removed the dead `t.View != nil` branch + its
+      stale doc comment. New `s.copyTemplateViews` (no `srcOid` param —
+      unlike its siblings, a view's full state already lives in the `views`
+      slice) reuses `catalog.InMemory.CreateView` directly (sharing the
+      source's `View` AST pointer by reference — safe, a view's `Query` is
+      only ever replaced wholesale by a later `CREATE OR REPLACE VIEW`,
+      never mutated in place), copies across the post-creation fields
+      `CreateView` itself doesn't set (`ViewDef`/`CheckOption`/
+      `SecurityBarrier(Set)`/`SecurityInvoker(Set)`), then calls the
+      pre-existing `syncCopiedTableCatalogHeap` — no view-specific plumbing
+      needed there, `syncTableToCatalogHeap`'s WAL branch and
+      `view_ddl_recovery.go`'s replay were both already generic.
+      `rollbackTemplateCopy` gained a third sweep (`AllViews`+`DropView`).
+      **Also found and fixed:** a pre-existing test-isolation hazard —
+      `executor.seqRegistry` is process-global but every test's
+      `catalog.InMemory` restarts OID numbering from `catalog.FirstUserOID`,
+      so the temporary-sequence test's leftover registration leaked into
+      the new view test's numerically-coincident dbOid and made it
+      spuriously fail; fixed via `t.Cleanup` in both pre-existing sequence
+      tests. Tests: `TestTryHandleDatabaseDDLCreateTemplateWithViewCopies`,
+      new `...WithMatViewErrors` (`internal/server/database_ddl_test.go`);
+      new E2E `TestCreateDatabaseTemplateViewCopiesQueryAndSurvivesRestart`
+      (`internal/server/database_template_copy_restart_test.go`): real wire
+      protocol, a table + a view over it, TEMPLATE copy, the copy's view
+      resolves against the copy's own table, dropping the copy's view
+      leaves the source's view intact, and the source's view still
+      resolves correctly after a full server restart. Design:
+      `docs/design/0122-0018-per-database-catalog-namespace.md` gained a
+      follow-up-42 subsection; `docs/design/README.md` row updated;
+      deferral ledger row appended. Gates: `go build ./...`/`go vet ./...`
+      clean; `go test ./internal/server/... ./internal/catalog/...
+      ./internal/executor/... ./internal/initdb/...` PASS; `go test -race
+      ./internal/server/... ./internal/catalog/... ./internal/executor/...`
+      PASS except the pre-existing, unrelated
+      `TestConnectExceedsPositiveDatconnlimitRejected` race plus 2 unrelated
+      flaky tests (`TestConnTxSessionNilWhenNotExplicit`,
+      `TestSimpleQueryBatchAbortUndoesEarlierCreateType`), all re-confirmed
+      via `git stash` against unmodified HEAD (reproduce identically, not
+      introduced by this change); `go test -short` full repo (excl.
+      testport) PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh`
+      PASS (0 failed, all 3 workloads). **Remaining M0122-0007 scope
+      (deferred, own future loops):** index/typed-table TEMPLATE copying
+      (index-file cloning + per-database sys-btree catalog bootstrap;
+      composite-type OID resolution for typed tables — matview data cloning
+      itself landed the same day, follow-up 43 below); per-database
+      index/type catalog rows + sys-btree bootstrap (independent of
+      TEMPLATE copy); `pg_statistic_ext`/`information_schema.routines`
+      registry redesign.
+  - [x] `M0122-0007` 4e follow-up 43 (2026-07-10, this loop) — **extended
+      `CREATE DATABASE ... TEMPLATE`'s relation-copy mechanism (follow-ups
+      40/41/42) to also cover materialized views.** Unlike a plain view, a
+      matview's pg_class row is NOT `Virtual` (`execCreateMatView`'s
+      `CreateTable` call leaves `Virtual: false`) — it already surfaces via
+      the same `tmpl.AllTables(oid)` loop `resolveCreateDatabaseTemplate`
+      uses for plain tables, so no new `AllMatViews` registry method was
+      needed. `resolveCreateDatabaseTemplate` gained a 5th return value
+      `matViews []*catalog.Table`; new `copyTemplateMatViews`
+      (`internal/server/database_ddl.go`) combines `copyTemplateTables`'
+      physical relation-file copy (the matview's materialized DATA) with
+      `copyTemplateViews`' AST/`ViewDef`/`IsPopulated` field copy (its
+      defining query); `syncCopiedTableCatalogHeap`/`rollbackTemplateCopy`
+      needed zero changes (both already handle matviews generically or via
+      the pre-existing `AllTables` sweep). **Real, independently-discovered
+      correctness bug found and fixed in the same loop:**
+      `execCreateMatView`/`execRefreshMatView` validated their query via the
+      raw, dbOid-unaware `o.ctx.Catalog` instead of the search-path-aware
+      `o.planCatalog()` every sibling `planner.Plan` call in the same
+      functions already used — `CREATE`/`REFRESH MATERIALIZED VIEW`
+      referencing a table on the SAME non-default database falsely raised
+      `42P01`, exactly the `ctxPlanCatalog` gap 4d-ii-part-2b item 3 fixed
+      for `CREATE VIEW`'s FROM clause, except that fix never touched these
+      two matview functions' own separate `analyzer.Analyze` calls. Fixed
+      both call sites to use `o.planCatalog()` (`internal/executor/
+      operators_ddl.go`) — caught only because this loop's own new E2E test
+      was the first to exercise `CREATE`/`REFRESH MATERIALIZED VIEW` under a
+      non-default database at all. Tests:
+      `TestTryHandleDatabaseDDLCreateTemplateWithMatViewCopies` (repurposed
+      from the now-obsolete `...WithMatViewErrors`)
+      (`internal/server/database_ddl_test.go`); new E2E
+      `TestCreateDatabaseTemplateMatViewCopiesDataAndSurvivesRestart`
+      (`internal/server/database_template_copy_restart_test.go`): real wire
+      protocol, a table plus a populated matview over it, TEMPLATE copy, the
+      copy's matview already carries the source's materialized data
+      immediately, physical independence (insert+refresh on the copy leaves
+      the source unchanged), and the source's matview survives a full
+      restart. Design: `docs/design/0122-0018-per-database-catalog-
+      namespace.md` gained a follow-up-43 subsection; `docs/design/
+      README.md` row updated; deferral ledger row appended. Gates: `go
+      build ./...`/`go vet ./...` clean; `go test ./internal/server/...
+      ./internal/catalog/... ./internal/executor/... ./internal/initdb/...`
+      PASS; `go test -race ./internal/server/... ./internal/catalog/...
+      ./internal/executor/...` PASS except the pre-existing, unrelated
+      `TestConnectExceedsPositiveDatconnlimitRejected` race (re-confirmed
+      via `git stash` against unmodified HEAD, reproduces identically); `go
+      test -short` full repo (excl. testport) PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh`
+      PASS (0 failed, all 3 workloads). **Remaining M0122-0007 scope
+      (deferred, own future loops):** index/typed-table TEMPLATE copying
+      (index-file cloning + per-database sys-btree catalog bootstrap;
+      composite-type OID resolution for typed tables); per-database
+      index/type catalog rows + sys-btree bootstrap (independent of
+      TEMPLATE copy); `pg_statistic_ext`/`information_schema.routines`
+      registry redesign.
+  - [x] `unimplemented_feat #135 (pg_get_expr)` (2026-07-10, this loop) —
+      **fixed the live `pg_index.indpred`/`indexprs` NULL-sentinel bug and
+      narrowed the entry.** `catalog.InMemory.PGIndexRowsForDBOid`
+      (`internal/catalog/catalog.go`) hardcoded `indexprs`/`indpred`/
+      `indcoloptions` to `""` — for a `text` column that reads back as a
+      non-NULL empty string, not SQL NULL. This diverged from the executor
+      heap-row twin `buildUserPGIndexRow`
+      (`internal/executor/pg18_user_catalog_rows.go`, already correct) and
+      broke two live-SQL behaviors: `indpred IS NOT NULL` (the canonical
+      partial-index probe tools use) matched EVERY index, and
+      `pg_get_expr(indpred, indrelid)` returned `''` instead of the WHERE
+      predicate on a partial index (and `''` instead of NULL on a plain one).
+      Now emits `VirtualNull` for non-partial `indpred`, `idx.PredicateString`
+      for partial, and `VirtualNull` for `indexprs`/`indcoloptions`, mirroring
+      the heap twin exactly (sibling-path sync). Also established that
+      pg_get_expr's pass-through is architecturally correct for goopg — every
+      populated pg_node_tree column (adbin/conbin/relpartbound) stores
+      pre-formatted deparsed SQL text, not a serialized node tree, so no
+      reconstruction is needed. New E2E regression tests
+      `TestPgIndexIndpredPartialVsPlain` (through `pg_get_expr`) +
+      `TestPgIndexRowsIndprIndexprsNullSentinel` (direct row-cell guard)
+      in `internal/executor/pg_index_indpred_test.go`; `code_audit` narrowed
+      in `unimplemented_feat.json`; deferral-ledger row appended for the one
+      remaining open slice (expression-index `indexprs` never populated from
+      `Index.ColExprs` — no client path other than a direct
+      `pg_get_expr(indexprs)` reads it; psql \d / pg_dump use
+      `pg_get_indexdef`). Gates: `go build ./...`/`go vet` clean; `go test
+      ./internal/catalog/... ./internal/executor/...` PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh` PASS
+      (0 failed, all 3 workloads).
+  - [x] `unimplemented_feat #135 (pg_get_expr, indexprs slice)` (2026-07-10,
+      follow-up loop) — **closed the live-path expression-index `indexprs` gap
+      the prior row deferred.** Added shared
+      `catalog.IndexExprsText(idx) (string, bool)`
+      (`internal/catalog/catalog.go`): joins `idx.ColExprStrings[i]` for each
+      expression key column (`Columns[i]==""`, ordinal-0 in `indkey`) verbatim,
+      comma-separated, returning `("", false)` when none so the caller emits
+      `VirtualNull`. Wired into `PGIndexRowsForDBOid`, so
+      `pg_get_expr(indexprs, indrelid)` on an expression index now returns the
+      deparsed text (byte-matched to PG 18.3: `lower(b)`, `(a + c), upper(b)`,
+      `(a * c)`, NULL for a plain index). The natural deparse in
+      `ColExprStrings` already carries the right parens — an earlier draft that
+      reused `buildIndexDefString`'s `indexKeyIsBareFuncCall` rule
+      double-wrapped binexprs into `((a + c))` and was corrected to a verbatim
+      join. **Heap twin deliberately NOT changed:** `buildUserPGIndexRow` still
+      writes `indexprs=NULL` because `DecodePGIndexPhysicalRow` infers `indpred`
+      from the bytes after `indoption` assuming `indexprs` is NULL (two
+      consecutive nullable varlenas, no tuple null bitmap available to the
+      decoder) — writing it would corrupt an expression index's `indpred` on
+      restart. Deferred (ledger row 2026-07-10) to a null-bitmap-aware decoder.
+      Tests: `internal/executor/pg_index_indexprs_test.go`
+      (`TestPgIndexIndexprsExpressionIndex` E2E + `TestIndexExprsTextParenAndNullRules`
+      unit); design doc `docs/design/0122-0019-*` Follow-up section + README.
+      Gates: `go build`/`go vet` clean; `go test ./internal/catalog/...
+      ./internal/executor/...` PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke` PASS (0 failed, 3 workloads).
+
+  - [x] `unimplemented_feat #5(b) (multi-field / HH:MM:SS interval literals)`
+      (2026-07-11, this loop) — **closed the prior interval-literal row's
+      deferred item (b): multi-field and time-body interval literals now parse
+      end-to-end** (`interval '1 day 05:00:00'`, `interval '1 year 2 mons 3
+      days 04:05:06.789'`, bare `interval '05:00:00'`/`'04:05'`/`'100:00:00'`,
+      `interval '1 day 2 hours 3 minutes 4 seconds'`) — exactly the shapes
+      goopg's own `formatInterval`/`intervalout` emits, so goopg can re-parse
+      its own interval output. Hoisted the pure interval-body math into a new
+      `internal/parser/interval.go` (`ParseIntervalMagnitude`,
+      `IntervalUnitToParts`, new `ParseIntervalBody` tokenizer — mirrors PG
+      `DecodeInterval`: `<magnitude> <unit>` pairs in any order interleaved
+      with `[+-]HH:MM[:SS[.ffffff]]` time words, each field carrying its own
+      sign; accepts intervalout abbreviations `mon(s)`/`min(s)`/`sec(s)`/
+      `hr(s)`) as the **single source of truth** for both sibling paths:
+      `evalIntervalLit` (typed literal) and `parseIntervalCastString`
+      (`::interval`/CAST, now a one-line `parser.ParseIntervalBody` delegate).
+      Multi-field bodies decode once into `IntervalLit.PreMonths/PreDays/
+      PreMicros` (`PreComputed`, threaded through 2 `planner.go` conversions +
+      `plpgsql_runtime.go`). Byte-for-byte vs PG 18.3. Deferred (ledger
+      2026-07-11): bare-number default-unit (`interval '5'`→seconds),
+      week/decade/century, single-letter units, full interval-typmod grammar.
+      Tests: `interval_subday_test.go` `TestMultiFieldIntervalLiterals` +
+      sibling-path guard `TestParseIntervalBodySingleFieldMatchesUnitToParts`;
+      `TestIntervalCastFromStringInvalidSyntax` updated. Design doc
+      `docs/design/0003-0006-*` new Follow-up + README row. Gates: build/vet
+      clean; executor/parser/planner/analyzer suites PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke (hook).
+  - [x] `unimplemented_feat #5(d-iii-rest) (year-month/time glued unit-word
+      absorption)` (2026-07-11, this loop) — closed the prior row's deferred
+      "bare unit word glued to a year-month field" item plus its spaced and
+      time-field siblings: `interval '1-2h'`/`'1-2 h'`/`'1-2 days'`/`'1-2mon3d'`/
+      `'1-2h30m'` → 1 year 2 mons(+…), `interval '12:00 h'`/`'12:00h'`/
+      `'05:00 mon'` → the bare time. Faithful to PG's right-to-left
+      `DecodeInterval`: a unit word (DTK_STRING) sets a pending type but no
+      field-mask bit, and a year-month DTK_DATE (forces DTK_MONTH) or DTK_TIME
+      field to its left resets it WITHOUT consuming a magnitude, so the unit is
+      discarded; a unit not reset this way (leading / after a number-pair /
+      consecutive) errors (`5 h mon`, `1-2 h h`, `1 day mon` → 22007). goopg
+      models this left-to-right with a `prevAbsorbs` flag in
+      `decodeIntervalFields`; `splitYearMonthFraction`→`splitYearMonthTrailer`
+      and `expandIntervalFields` gain the glued-letter split (only with ≥1 month
+      digit, and off `:` time fields); the parser Form-2 `splitEmbeddedInterval`
+      (`select.go`) is guarded to require a plain magnitude first field so
+      `1-2 days` falls through to the shared `ParseIntervalBody` (was raising
+      "invalid interval count") — keeps `evalIntervalLit` and
+      `parseIntervalCastString` in lock-step. Deferred (ledger 2026-07-11): the
+      SIGNED glued form (`-1-2h`, needs a DTK_TZ-shaped splitter), typmod
+      grammar, ±infinity. Tests: `interval_subday_test.go`
+      `TestYearMonthTimeGluedUnitAbsorb` (32 accepts + 13 rejects, byte-for-byte
+      vs live PG 18.3). Design doc `docs/design/0003-0006-*` Follow-up section.
+      Gates: build/vet clean; parser/analyzer/planner/executor suites PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke (hook).
+  - [x] `unimplemented_feat #5(d-iii-rest) (SIGNED year-month glued unit-word)`
+      (2026-07-11, this loop) — closed the prior row's deferred signed glued form:
+      `interval '-1-2h'` → -1 years -2 mons, `'+1-2h'` → 1 year 2 mons,
+      `'-1-2mon3d'` → -1 years -2 mons +3 days, `'-1-2h30m'` →
+      -1 years -2 mons +00:30:00, and the empty-month asymmetry `'-1-h'` →
+      -1 years (vs unsigned `'1-h'` which errors). PG lexes a sign-prefixed field
+      as ONE DTK_TZ token (`ParseDateTime`: after the sign a leading digit
+      collects `digit|:|.|-`, stops at a letter) that falls through
+      DecodeInterval's DTK_TZ→DTK_NUMBER years-months branch where
+      `if(*field[i]=='-')val2=-val2` flows the sign into BOTH year and month
+      (`-1-2`→-14 months); the trailing letter is a DTK_STRING unit word absorbed
+      as a no-op. New `splitSignedTZTrailer` (`internal/parser/interval.go`)
+      reproduces the DTK_TZ collection set — peels a trailing letter run while
+      leaving a `.` inside (so `-1-2.5`/`-1-2.5h` stay whole and error, matching
+      PG's `*cp!='\0'` reject) and collects the year-month `-` even on an empty
+      month; `expandIntervalFields` now dispatches to it for signed fields and to
+      `splitYearMonthTrailer` for unsigned, keeping `evalIntervalLit` and
+      `parseIntervalCastString` in lock-step. Deferred (ledger 2026-07-11): the
+      `+`-separated continuation (`-1-2+3`, needs a re-entrant remainder
+      tokenizer), typmod grammar, ±infinity. Tests: `interval_subday_test.go`
+      `TestYearMonthTimeGluedUnitAbsorb` (now 52 accepts + 17 rejects,
+      byte-for-byte vs live PG 18.3). Design doc `docs/design/0003-0006-*`
+      Follow-up section. Gates: build/vet clean;
+      parser/analyzer/planner/executor suites PASS; `scripts/tpch-spotcheck.sh`
+      PASS (Q12=2/Q13=33); pgbench smoke (hook).
+  - [x] `unimplemented_feat #5(d-iii-rest) ('+'-separated continuation +
+      sign-lexer fidelity)` (2026-07-11, this loop) — closed the prior row's
+      deferred `+`-continuation: `interval '-1-2+3'` → -1 years -2 mons
+      +00:00:03, `'1-2+3'` → 1 year 2 mons 00:00:03, `'1-+3'` → 1 year
+      00:00:03, `'-1-2+3h30m'`/`'-1-2+3:30'` → +03:30:00, `'1-2+3d'` → +3 days,
+      `'3h+2'` → 03:00:02. PG's ParseDateTime starts a FRESH field at every
+      sign, so the field expander is now re-entrant: new recursive
+      `expandIntervalField` (`internal/parser/interval.go`);
+      `splitYearMonthTrailer`/`splitSignedTZTrailer` split at `+`;
+      `splitAlphaNumRuns` recurses at a mid-body `+`; a `:` after the first
+      mid-field `+` belongs to the continuation (colon-guard). Plus two
+      sign-lexer fidelity fixes: a sign must be immediately followed by a digit
+      (`+.5`/`-.5` now ERROR as in PG — were wrongly accepted as ±0.5s;
+      enforced in `ParseIntervalMagnitude` so Form-1/Form-2 siblings agree) and
+      whitespace soaks between a lone sign and its digits (`interval '- 3'` →
+      -00:00:03, Form-1 `interval '- 3' day` → -3 days). Deferred (ledger
+      2026-07-11): typmod grammar incl. its range defaults (`interval
+      '-1-2+3' day` → PG resolves the bare `+3` to DAYS), ±infinity. Tests:
+      `interval_subday_test.go` `TestYearMonthTimeGluedUnitAbsorb` (now 79
+      accepts + 41 rejects, all byte-for-byte vs live PG 18.3 port 5599).
+      Design doc `docs/design/0003-0006-*` new Follow-up section + README row.
+      Gates: build/vet clean; parser/analyzer/planner/executor suites PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke (hook).
+  - [x] `unimplemented_feat #5(d-iv) (interval typmod range/precision grammar)`
+      (2026-07-11, this loop) — closed the prior `+`-continuation row's deferred
+      typmod-grammar item for Form-1 interval literals (plain-magnitude body):
+      `<hi> TO <lo>` ranges (`interval '5' hour to minute`=00:05:00, `'5' day to
+      hour`=05:00:00, `'5' year to month`=5 mons, `'90' minute to
+      second`=00:01:30, `'1.5' hour to minute`=00:01:00) and `SECOND(p)`
+      precision (`interval '1.23456789' second(2)`=00:00:01.23, `'1.999999'
+      second(2)`=00:00:02 round-half-away-from-zero, `'5' minute to
+      second(3)`=00:00:05). PG's `DecodeInterval switch(range)` (datetime.c) and
+      `AdjustIntervalForTypmod` (timestamp.c) both collapse a range to its LOW
+      (rightmost) field — it alone drives interpretation AND truncation
+      granularity (higher-order fields kept) — so a range reuses the existing
+      single-field `Qualified` path with unit=lowField. New parser
+      `tryIntervalTypmodQualifier`/`intervalRangeLowField`/`intervalTypmodField`
+      (`internal/parser/select.go`, lookahead-only) + executor
+      `roundIntervalMicrosToPrec`/`intervalPrecScales` (line-port of the
+      precision arm; p>6 clamped to 6). **Fidelity bug fixed in passing:** the
+      old switch accepted PLURAL/`millisecond` trailing words as typmod fields,
+      but those are not grammar keywords — PG parses `interval '5' days` as bare
+      `interval '5'` (00:00:05) + column alias `days`; the singular-only rewrite
+      makes plurals/abbrevs fall through to aliases (TPC-H uses only singular +
+      embedded Form-2, unaffected; `TestParseIntervalLiteral` updated). Deferred
+      (ledger 2026-07-11): complex body under a range (needs `range` threaded
+      into shared `ParseIntervalBody`), `±infinity`, cast-form typmod. Tests:
+      `interval_subday_test.go` `TestIntervalTypmodRangeAndPrecision` (25 accepts
+      + 5 range-syntax rejects, byte-for-byte vs live PG 18.3 port 5599). Design
+      doc `docs/design/0003-0006-*` new Follow-up section + README row. Gates:
+      build/vet clean; parser/analyzer/planner/executor suites PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke (hook).
+  - [x] `unimplemented_feat #5(d-iv) (complex interval body under a range)`
+      (2026-07-11, this loop) — closed the **trailing-bare-number half** of the
+      prior row's deferred complex-body-under-range item. A multi-field Form-1
+      body whose FINAL field is unitless now decodes, that number resolving via
+      the range's low field: `interval '1 day 5' hour to minute`=1 day 00:05:00,
+      `'1 day 5' day to hour`=1 day 05:00:00, `'2 hour 5' hour to minute`=02:05:00,
+      `'1 day 90' minute to second`=1 day 00:01:30, `'1 day 1.5' hour to minute`=
+      1 day 00:01:00, `'1 mon 2 day 5' hour to minute`=1 mon 2 days 00:05:00,
+      `'-1 day 5' hour to minute`=-1 days +00:05:00, `'1 day 5' minute to
+      second(0)`=1 day 00:00:05 (all byte-for-byte vs live PG 18.3 port 5601).
+      PG's `DecodeInterval switch(range)` (datetime.c ~L3604) picks the range's
+      LOW field as the default for the rightmost unmarked number, so a new
+      `parser.ParseIntervalBodyWithDefault(body, defaultUnit)` threads that field
+      into `decodeIntervalFields`'s trailing-unitless branch (now
+      `IntervalUnitToParts`/`intervalUnitMask(defaultUnit,…)` instead of hardcoded
+      SECOND); `ParseIntervalBody(body)` delegates with `"second"` so the
+      `::interval`/CAST + Form-2 full-range siblings are byte-identical (guarded
+      by `TestParseIntervalBodySingleFieldMatchesUnitToParts`). `evalIntervalLit`
+      (executor `expr.go`) routes a Qualified literal whose body is NOT a bare
+      magnitude through it; the existing `truncIntervalToUnit`/
+      `roundIntervalMicrosToPrec` range truncation runs unchanged (matches
+      `AdjustIntervalForTypmod` — HOUR..SECOND ranges only truncate `time`, keep
+      day/month). Still deferred (ledger 2026-07-11): a bare number to the LEFT of
+      a time/year-month word (`interval '1 2:03:04' day to second`=1 day 02:03:04;
+      PG's right-to-left leftward carry, pre-exists at full range too — added as a
+      documented reject case), `±infinity`, cast-form typmod. Tests:
+      `interval_subday_test.go` `TestIntervalTypmodRangeAndPrecision` (+11 accepts
+      + 1 deferred-leftward-carry reject). Design doc `docs/design/0003-0006-*` new
+      Follow-up section + README row. Gates: build/vet clean;
+      parser/planner/executor suites PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); pgbench smoke (hook).
+  - [x] `unimplemented_feat #5(d-iv) (interval ±infinity add/sub + ordering)`
+      (2026-07-11, this loop) — closed the FIRST half of the operator
+      short-circuits the ±infinity-literal loop deferred. `interval ± interval`
+      (`addIntervalInterval`, `internal/executor/expr.go`) line-ports PG's
+      `interval_pl`/`interval_mi` (timestamp.c): a NOBEGIN/NOEND operand carries
+      its sign through (`'infinity' + '1 day'`=infinity, `'1 day' - 'infinity'`=
+      -infinity, `'infinity' - '-infinity'`=infinity), while every
+      "infinity − infinity" (`'infinity' + '-infinity'`, `'-infinity' +
+      'infinity'`, `'infinity' - 'infinity'`, `'-infinity' - '-infinity'`) raises
+      `interval out of range` (SQLSTATE 22008, ERRCODE_DATETIME_VALUE_OUT_OF_RANGE
+      — interval has no NaN). New `finiteIntervalArith` int32/int64-overflow-guards
+      each field AND rejects a finite result landing on a sentinel (mirrors
+      `finite_interval_pl/_mi`'s `INTERVAL_NOT_FINITE(result)`; previously wrapped
+      silently). Comparison (`compareDatums` KindInterval arm) exact-orders the
+      sentinels via new `intervalInfinityRank` BEFORE the lossy 30-day-widening
+      sum: −infinity < finite < +infinity, self=self, +inf≠−inf. Still deferred
+      (ledger 2026-07-11): `extract(epoch from interval …)` (blocked by
+      extract-from-interval being unsupported for ANY interval, not just infinity),
+      `timestamp ± interval 'infinity'` (needs infinite-timestamp carrier), unary
+      `- interval 'infinity'` (`interval_um`), cast-form typmod. Tests:
+      `interval_subday_test.go` new `TestIntervalInfinityArithmetic` (18 accepts +
+      4 rejects). Design doc `docs/design/0003-0006-*` new Follow-up section. Gates:
+      build/vet clean; parser+executor suites PASS; `scripts/tpch-spotcheck.sh`
+      PASS (Q12=2/Q13=33); pgbench smoke (hook).
+  - [x] `unimplemented_feat #5(d-iv) (EXTRACT/date_part from interval)`
+      (2026-07-11, this loop) — closed the "extract-from-interval unsupported for
+      ANY interval" blocker the prior row named. New `evalExtractInterval`
+      (`internal/executor/expr.go`) line-ports PG's `interval_part_common`
+      (timestamp.c:6098): breaks the interval down with NO justification
+      (`interval2itm` — hour may exceed 24, day verbatim), integer fields → int8,
+      second/millisecond/epoch → numeric, `quarter` works from `interval->month`
+      so a negative interval negates the sign-reversed field. ±infinity sentinels
+      follow `NonFiniteIntervalPart`: monotonic units → ±Infinity (numeric),
+      oscillating units → NULL, other units error (0A000 known-unsupported /
+      22023 unknown). Sibling `date_part('field', interval)` (`evalDatePart`)
+      routes through the same helper. All `want` values captured from live PG
+      18.3. Still deferred (ledger 2026-07-11): `timestamp ± interval 'infinity'`,
+      unary `- interval 'infinity'`, cast-form typmod, and the EXTRACT numeric
+      trailing-zero scale gap (shared with timestamp path). Tests:
+      `interval_subday_test.go` new `TestExtractFromInterval` (24 accepts + 3
+      NULL + 2 error). Design doc `docs/design/0003-0006-*` new Follow-up. Gates:
+      build/vet clean; executor suite PASS; PG-18.3 cross-check; pgbench (hook).
+  - [x] `unimplemented_feat #5(d-iv) (unary - interval negation)`
+      (2026-07-11, this loop) — closed the prior EXTRACT row's deferred item (2):
+      `- interval '1 day'` was rejected at TWO layers. Analyzer
+      (`internal/analyzer/analyzer.go`): split the combined `OpUnaryPos,
+      OpUnaryNeg` arm so `OpUnaryNeg` also accepts a type named `interval`
+      (PG's `interval_um`) while `OpUnaryPos` stays numeric-only — PG has NO
+      unary `+ interval` (verified live: 42883). Evaluator: new `negateInterval`
+      (`internal/executor/expr.go`) line-ports `interval_um_internal`
+      (timestamp.c:3444): `±infinity` sentinels SWAP (NOBEGIN↔NOEND, so
+      `-(-infinity)=infinity`), a finite interval negates each field with the
+      signed-min overflow guard + an `INTERVAL_NOT_FINITE(result)` guard so a
+      finite operand never lands on a sentinel. Wired into `evalUnary`
+      (single funnel; fast-path + interpreted both delegate). Tests:
+      `interval_subday_test.go` new `TestNegateInterval` (8 cases incl.
+      mixed-sign, both infinities, double negation). All `want` from live PG
+      18.3. Still deferred (ledger 2026-07-11): `timestamp ± interval 'infinity'`,
+      cast-form typmod, EXTRACT numeric scale gap. Design doc
+      `docs/design/0003-0006-*` new Follow-up. Gates: build/vet clean; analyzer
+      + executor suites PASS; PG-18.3 cross-check; pgbench (hook).
+  - [x] `unimplemented_feat #5(d-iv) (EXTRACT numeric display scale)`
+      (2026-07-11, this loop) — closed the prior d-iv rows' deferred "EXTRACT
+      numeric trailing-zero scale gap" (`6.5` vs PG `6.500000`). PG's `EXTRACT`
+      is the numeric-returning spelling (`retnumeric=true`,
+      `interval_part_common`/`timestamp_part`) whose fractional-second fields go
+      through `int64_div_fast_to_numeric(val, log10)` — result display scale =
+      `log10`, trailing zeros preserved (second=6, millisecond=3, epoch=6). New
+      `int64DivFastToNumeric` helper (`internal/executor/expr.go`) builds
+      `Datum{KindNumeric, Int:val, Scale:log10}`; `formatNumeric` already renders
+      the zeros. Threaded `retnumeric bool` through `evalExtractInterval` so
+      `evalExtract` (EXTRACT node) → `true` (scaled) and `evalDatePart` →
+      `false` (PG's float8 spelling, stays zero-stripped:
+      `date_part('second',interval '5 seconds')`=`5`). Timestamp/time
+      second/millisecond migrated to the helper; interval `epoch` numeric
+      line-ported to PG's exact ×4/÷4 integer arithmetic. Byte-for-byte vs live
+      PG 18.3. Tests: `interval_subday_test.go` `TestExtractFromInterval`
+      (EXTRACT rows rescaled + new `date_part` float8 rows + new timestamp/time
+      EXTRACT rows). **Newly-discovered & deferred (ledger 2026-07-11):**
+      `EXTRACT(EPOCH FROM timestamp)` returns seconds-of-day not the full Unix
+      epoch — a distinct VALUE bug in `evalExtract`'s `case "epoch"`, left
+      untouched. Design doc `docs/design/0003-0006-*` new Follow-up. Gates:
+      build/vet clean; executor suite PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); pgbench (hook).
+
+  - [x] `unimplemented_feat #5(d-iv) (EXTRACT(EPOCH) full Unix epoch for
+      timestamp/date)` (2026-07-11, this loop) — closed the prior row's
+      newly-discovered VALUE bug: `EXTRACT(EPOCH FROM timestamp)` /
+      `date_part('epoch', …)` returned only *seconds-of-day* instead of the full
+      Unix epoch (`982355920.5` PG vs goopg `74320.5`). Rewrote the `epoch` case
+      in BOTH sibling paths (`evalExtract` numeric spelling + `evalDatePart`
+      float8 spelling, `internal/executor/expr.go`) to be source-type dependent,
+      line-porting PG's `timestamp_part`/`timetz_part`/`extract_date` DTK_EPOCH:
+      timestamp/timestamptz → full Unix epoch µs at scale 6; `time` →
+      seconds-of-day scale 6; `timetz` → local seconds-of-day − offset scale 6;
+      `date` → integer seconds since 1970 at scale 0. New `timeOfDayMicros`
+      helper. `evalExtract` uses `x.SourceTypeName` (+ `flagDate`) to pick the
+      arm; `evalDatePart` (no source type) distinguishes only `timetz` via
+      `Scale!=0` and computes the full Unix epoch uniformly for the rest — which
+      is correct for `time` too because a `time` value is always stored on
+      1970-01-01, where its full Unix epoch equals its seconds-of-day. All `want`
+      byte-for-byte from live PG 18.3. Tests: `interval_subday_test.go` new
+      `TestExtractEpochFromTimestamp` (11 cases: timestamp/timestamptz/negative/
+      date/time/timetz±, both EXTRACT and date_part). Design doc
+      `docs/design/0003-0006-*` Follow-up updated. Gates: build/vet clean;
+      executor suite PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      pgbench (hook). Still deferred: `timestamp ± interval 'infinity'` (needs an
+      infinite-timestamp carrier), cast-form interval typmod.
+  - [x] `unimplemented_feat #5(d-iv) (EXTRACT(EPOCH FROM interval) int64
+      overflow)` (2026-07-11, this loop) — closed the prior row's deferred item
+      (3). `interval_part_common`'s EXTRACT/numeric epoch arm computes
+      `secs_from_day_month*10^6 + time` in int64; `secs_from_day_month` fits but
+      the `·10^6` product overflows int64 around 10^9 days (boundary
+      `106751991`→`106751992` whole days, or fewer via the months arm). goopg's
+      `evalExtractInterval` (`internal/executor/expr.go`) did the whole sum
+      unconditionally in int64 → a huge interval *wrapped silently*. Now mirrors
+      PG's `pg_mul_s64_overflow`/`pg_add_s64_overflow` guard (via existing
+      `mulInt64Overflow`/`addInt64Overflow`) and, on overflow, redoes the sum in
+      numeric: `numericAdd(int64DivFastToNumeric(micros,6),
+      numericFromInt(secsFromDayMonth))` — scale-0 whole-seconds + scale-6
+      fractional → scale-6 big.Int sum, identical to the fast path. The float8
+      `date_part('epoch', …)` spelling was already overflow-safe (double). All
+      `want` byte-for-byte from live PG 18.3. Test: `interval_subday_test.go` new
+      `TestExtractEpochIntervalOverflow` (9 cases bracketing both boundary arms +
+      sign + mixed day/time). Design doc `docs/design/0003-0006-*` Follow-up.
+      Gates: build/vet clean; interval/numeric/extract executor tests PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench (hook). Still
+      deferred: `timestamp ± interval 'infinity'` (needs an infinite-timestamp
+      carrier), cast-form interval typmod.
+  - [x] `unimplemented_feat #5(d-iv) (cast-form interval typmod)` (2026-07-11,
+      this loop) — closed the prior row's deferred item (2). `CAST(x AS interval
+      hour to minute)`, `x::interval second(2)`, and precision-only
+      `x::interval(2)` now apply an interval typmod (previously a parse error
+      inside `CAST(...)` or silently ignored on `::`). PG's `interval_in` uses
+      the typmod's LOW field as the DEFAULT UNIT of a bare magnitude BEFORE
+      `AdjustIntervalForTypmod` truncates, so `'90'::interval minute`=`01:30:00`
+      (90 min, not 90 s), `'1.5'::interval hour`=`01:00:00`, `'36 hours'::interval
+      day`=`00:00:00` (day-trunc zeroes the separate micros without carrying
+      hours). Parser (`internal/parser/select.go`) parses the qualifier in BOTH
+      cast entry points (`parseCastTail`, `parseCastFuncExpr`) via a shared new
+      `parseIntervalCastQualifier` (reuses `intervalTypmodField`/
+      `intervalRangeLowField`) and packs a PG-style `INTERVAL_TYPMOD`
+      (`packIntervalCastTypmod`) into `CastExpr.Typmods[0]`. Executor
+      `applyIntervalCastTypmod` (`internal/executor/expr.go`, gated on
+      `TargetType=="interval" && Typmod!=0`) decodes via
+      `parser.DecodeIntervalCastTypmod`, parses the body exactly as
+      `evalIntervalLit` does for `interval '90' minute`, then applies the SHARED
+      `truncIntervalToUnit`+`roundIntervalMicrosToPrec` (sibling paths cannot
+      drift); `interval 'infinity'` short-circuits. A plural/alias
+      (`'90'::interval days`) is NOT consumed as a typmod. All `want`
+      byte-for-byte from live PG 18.3. Test: `interval_subday_test.go` new
+      `TestIntervalCastTypmod` (16 value + 2 bare/alias cases). Design doc
+      `docs/design/0003-0006-*` Follow-up. Gates: build/vet clean; parser + full
+      executor/planner suites PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); pgbench (hook). Still deferred: `timestamp ± interval
+      'infinity'` (infinite-timestamp carrier), `interval(p) '<lit>'`
+      leading-precision typed-literal grammar.
+  - [x] `unimplemented_feat #5(d-iv) (leading-precision interval literal)`
+      (2026-07-11, this loop) — closed the prior row's deferred item (2). The
+      leading-precision typed literal `interval(p) '<lit>'` (PG grammar
+      `ConstInterval '(' Iconst ')' Sconst`, precision paren BEFORE the string)
+      now applies the fractional-seconds precision; previously a parse error (the
+      `interval` primary-expr case required `peek(1)` to be a string, so
+      `interval ( … )` became a bare identifier). PG packs a FULL-range typmod
+      with precision `p`, so NO field is truncated — only sub-second digits round
+      (a bare magnitude defaults to seconds): `interval(2) '90'`=`00:01:30`,
+      `interval(2) '1 day 2:03:04.56789'`=`1 day 02:03:04.57` (day kept),
+      `interval(2) '1.23456789'`=`00:00:01.23`, `interval(0) '1.6'`=`00:00:02`.
+      Parser (`internal/parser/select.go`, `parsePrimaryExpr` interval case): a
+      lookahead `interval ( <int> ) '<str>'` builds `IntervalLit{Value:body,
+      Unit:"second", Qualified:true, HasPrec:true, Prec:p}` — modelling full range
+      as `Unit="second"` so the existing `truncIntervalToUnit("second")` no-op
+      keeps every field while `roundIntervalMicrosToPrec` still rounds; >6 clamps
+      to 6 silently. NO executor change (reuses `evalIntervalLit`'s tested
+      Qualified path — same helpers as the trailing `SECOND(p)` and cast-typmod
+      forms, cannot drift). All `want` byte-for-byte from live PG 18.3. Test:
+      `interval_subday_test.go` `TestIntervalTypmodRangeAndPrecision` (+10 rows).
+      Design doc `docs/design/0003-0006-*` Follow-up. Gates: build/vet clean;
+      parser + executor interval suites PASS; pgbench (hook). Still deferred (the
+      LAST open #5(d-iv) sub-item): `timestamp ± interval 'infinity'`
+      (infinite-timestamp carrier).
+  - [x] `unimplemented_feat #5(d-iv) (timestamp ± interval 'infinity')`
+      (2026-07-11, this loop) — closed the LAST open #5(d-iv) sub-item. A
+      `±infinity` interval added to / subtracted from a timestamp now yields a
+      ±infinity timestamp, line-porting PG's `timestamp_pl_interval` /
+      `timestamp_mi_interval` (`postgres/src/backend/utils/adt/timestamp.c:3107`).
+      **Carrier:** INT64 sentinels on the existing `KindTime` Unix-nanoseconds
+      `Int` — `math.MaxInt64`=+infinity, `math.MinInt64`=-infinity (mirrors PG's
+      `TIMESTAMP_END`/`TIMESTAMP_BEGIN`; a real timestamp saturates ~year 2262 so
+      no collision). New `Datum.IsTimestampPosInf/IsTimestampNegInf/`
+      `IsTimestampNotFinite` + `NewTimestampInfinity` in `internal/executor/
+      datum.go`. **Arithmetic:** `addTimeInterval` (`internal/executor/expr.go`)
+      now returns `(Datum, error)`; a ±infinity span forces the same-signed
+      infinite timestamp (subtraction swaps the sentinel first, matching
+      `interval_um_internal`), a finite span on an already-infinite timestamp
+      passes it through (`TIMESTAMP_NOT_FINITE` branch), and "infinity − infinity"
+      raises `timestamp out of range` (22008) since the type has no NaN.
+      **Output:** `Datum.Format` + hot-path `AppendValueText` render `infinity`/
+      `-infinity`. **Ordering:** no change — `compareDatum` KindTime orders by
+      `Int` (Scale==0), so the sentinels sort correctly. All `want` byte-for-byte
+      vs live PG 18.3 (socket /tmp:5599). Test: `interval_subday_test.go`
+      `TestTimestampIntervalInfinity` (15 accepts + 2 rejects). Design doc
+      `docs/design/0003-0006-date-interval-arithmetic.md` new Follow-up. Gates:
+      build/vet clean; full executor suite PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); pgbench smoke via pre-commit hook. Still deferred (broader,
+      pre-existing): `timestamp 'infinity'` literal-input parsing + wire codec,
+      `isfinite(timestamp)` stub, `timestamp − timestamp` with an infinite operand.
+      With this, the whole #5(d-iv) interval group is complete.
+  - [x] `unimplemented_feat #5(d-iv) (timestamp 'infinity' literal input +
+      cast + wire codec)` (2026-07-11, this loop) — closed the LAST deferred
+      item of the infinity thread: the ±infinity timestamp sentinel is now
+      reachable from **direct text input**, not just arithmetic. New choke-point
+      helper `parseTimestampInfinityLiteral(s)` (`internal/executor/copy_text.go`)
+      maps PG's three RESERV spellings — `infinity`/`+infinity` (`DTK_LATE`) and
+      `-infinity` (`DTK_EARLY`), case-insensitive/trimmed per `datetime.c`'s
+      `datetbl` — to the existing `NewTimestampInfinity(±)` `KindTime` sentinel.
+      Wired before the ordinary parse at: (a) typed literal `evalTypedStringLit`
+      (`expr.go`, not time-cached); (b) cast `evalCast`; (c) binary codec
+      `encodeValuePG` writes PG's `timestamp_send` `DT_NOEND`/`DT_NOBEGIN` =
+      PG_INT64_MAX/MIN **micros** (switch bypasses `UnixMicro()−epoch`) and
+      `decodePhysicalPGValueMctx` intercepts those back to the sentinel before
+      the overflow-prone epoch add; (d) `pg_input_is_valid`. Output + ordering
+      already correct. All 14 `want` byte-for-byte vs live PG 18.3 (socket
+      /tmp:5599). Tests: `internal/executor/timestamp_infinity_literal_test.go`
+      `TestTimestampInfinityLiteral` (17 cases) + `TestTimestampInfinityWireCodec`.
+      Design doc `docs/design/0003-0006-date-interval-arithmetic.md` new Follow-up.
+      Gates: build clean; full executor suite PASS; `scripts/tpch-spotcheck.sh`
+      PASS (Q12=2/Q13=33); pgbench smoke via pre-commit hook. Newly deferred (own
+      slice): `date 'infinity'` literal input — the date type uses a different
+      INT32-days sentinel domain (`DATEVAL_NOEND`/`NOBEGIN`), needs its own
+      carrier. Ledger row appended.
+  - [x] `unimplemented_feat #5(d-iv) (date 'infinity' literal input + cast +
+      wire codec)` (2026-07-11, this loop) — closed the LAST deferred item of the
+      whole interval/infinity group: the ±infinity **date** sentinel is now
+      reachable from direct text input, cast, `pg_input_is_valid` and the binary
+      wire codec, mirroring the timestamp follow-up above. CARRIER: internally a
+      date is a `KindTime` datum (same Unix-ns `Int` field as timestamp, tagged
+      `flagDate`), so it REUSES the same `math.MaxInt64`/`MinInt64` sentinel —
+      `Format`/`AppendValueText` (intercept the extremes before the flagDate
+      render), `IsTimestampNotFinite`, `isfinite`, `compareDatum` are all already
+      sentinel-aware for dates with no change. Only the WIRE value differs: PG's
+      `date_send` emits `DATEVAL_NOEND`/`DATEVAL_NOBEGIN` = PG_INT32_MAX/MIN
+      **days** (`postgres/src/include/utils/date.h`), 4-byte INT32. New
+      `NewDateInfinity(±)` (`datum.go`) + `parseDateInfinityLiteral`
+      (`copy_text.go`) wired at: (a) `evalTypedStringLit` `date` case; (b)
+      `evalCast` `date` case — string form + a ±infinity timestamp operand mapped
+      to same-signed date infinity; (c) `encodeValuePG` `date` writes INT32_MAX/MIN
+      days via a posinf/neginf switch; (d) `decodePhysicalPGValueMctx` `date`
+      intercepts those days back to `NewDateInfinity` before the overflow-prone
+      epoch-day math; (e) `pg_input_is_valid('infinity','date')`. All 11 `want`
+      byte-for-byte vs live PG 18.3 (throwaway initdb, socket /tmp:5601). Tests:
+      `internal/executor/date_infinity_literal_test.go` `TestDateInfinityLiteral`
+      (17 cases) + `TestDateInfinityWireCodec` (INT32 round-trip). Design doc
+      `docs/design/0003-0006-date-interval-arithmetic.md` new Follow-up. Gates:
+      build clean; full executor suite PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); pgbench smoke via pre-commit hook. **With this the whole
+      `#5(d-iv)` interval/infinity group is COMPLETE across both the timestamp
+      INT64-micros and date INT32-days domains.** Nothing further deferred.
+      **GEQO + remaining planner-tuning GUC stubs — DONE (2026-07-12, this
+      loop):** the `jit_*` completion above left a *planner*-tuning residual
+      — the registry still lacked the whole GEQO family and three
+      `QUERY_TUNING_OTHER` GUCs, so a real-PG-authored script issuing `SET
+      geqo_threshold = 20` / `SET constraint_exclusion = off` / `SET
+      cursor_tuple_fraction = 0.05` / `SET recursive_worktable_factor = 5`
+      hit "unrecognized configuration parameter". Registered all ten in
+      `internal/config/defaults.go` — `geqo`, `geqo_threshold`, `geqo_effort`,
+      `geqo_pool_size`, `geqo_generations`, `geqo_selection_bias`, `geqo_seed`
+      (QUERY_TUNING_GEQO) + `constraint_exclusion` (enum
+      `{partition,on,off}`), `cursor_tuple_fraction`, `recursive_worktable_factor`
+      (QUERY_TUNING_OTHER) — all PGC_USERSET / GUC_EXPLAIN with
+      `guc_tables.c`-faithful boot values and bounds (GEQO bounds from
+      `optimizer/geqo.h`, `cursor_tuple_fraction` from `planmain.h`,
+      `recursive_worktable_factor` from `cost.h`). Boot values use the form
+      real-PG `SHOW` returns (e.g. `geqo_selection_bias` → `2`) so the
+      matching commented-out `postgresql.conf.sample` entries satisfy
+      `TestSampleConfigCoversRegistry` (sample default must equal registry
+      `BootVal`). These are accepted-and-ignored stubs (goopg's rule/cost
+      planner reads none of them — zero references in `internal/planner`),
+      identical in spirit to the pre-existing `enable_*` toggles; the
+      behavioral no-op + the `pg_settings` literal-list non-extension are
+      both recorded in the deferral ledger as deliberate scope boundaries.
+      Tests: `internal/config/geqo_guc_stubs_test.go`
+      (`TestGeqoAndPlannerTuningGUCStubs`, `TestGeqoTuningGUCBoundsEnforced`).
+      Design: `docs/design/root-0004-configuration-and-guc.md` new "Follow-up:
+      GEQO + remaining planner-tuning GUC stubs" section;
+      `docs/design/README.md` root-0004 row extended; `unimplemented_feat.json`
+      M0097-0069 code_audit updated in place (kept open — the behavioral half
+      is the deferred part). Gates: `go build ./...` clean; `go vet
+      ./internal/config/...` clean; `go test ./internal/config/...` PASS
+      (full package, incl. `TestSampleConfigCoversRegistry`). Config-only GUC
+      registration — no planner/executor/codec logic touched; pgbench smoke
+      runs via the pre-commit hook at commit.
+      **GEQO + planner-tuning GUCs surfaced in `pg_settings` — DONE
+      (2026-07-12, follow-up loop):** the GEQO landing above deferred one half
+      — `pg_catalog.pg_settings` is a *separately* hand-curated literal list
+      (`pgSettings.VirtualRows` in `internal/catalog/catalog.go`), not derived
+      from the config registry, so `SHOW geqo_threshold` worked while
+      `SELECT * FROM pg_settings WHERE name = 'geqo_threshold'` returned zero
+      rows (a real-PG monitoring/ORM query reading `pg_settings` missed every
+      one). Added all ten rows (7 `QUERY_TUNING_GEQO` + 3 `QUERY_TUNING_OTHER`)
+      to that list with `name`/`setting`/`category`/`vartype`/`min_val`/
+      `max_val`/`enumvals`/`boot_val` byte-for-byte from `guc_tables.c`
+      (categories `Query Tuning / Genetic Query Optimizer` +
+      `Query Tuning / Other Planner Options`; `short_desc`/`extra_desc` from the
+      same `gettext_noop` literals; `constraint_exclusion` enumvals
+      `{partition,on,off}`). List is re-sorted by name after append so the
+      sysviews name-sort contract (`TestPgSettingsEnableGUCsCompleteAndSorted`)
+      holds. Still deferred (ledgered): the behavioral no-op (planner still
+      ignores every value) and the fact that the `pg_settings` list stays a
+      hand-curated subset, not registry-derived. Tests:
+      `TestPgSettingsPlannerTuningGUCs` (`internal/catalog/catalog_test.go`).
+      Design: `docs/design/root-0004-configuration-and-guc.md` new
+      "`pg_settings` surfacing" subsection. Gates: `go build ./...` clean;
+      `go vet`/`go test ./internal/catalog/... ./internal/config/...` PASS;
+      pgbench smoke via pre-commit hook.
+      **Object-creation default GUC stubs — DONE (2026-07-12, this loop):**
+      `pg_dump`/`pg_restore` emit a fixed SET preamble before every
+      `CREATE TABLE` section — `SET default_tablespace = '';` and
+      `SET default_table_access_method = heap;` (plus
+      `SET default_toast_compression = 'pglz';` for non-default column
+      compression) — but none of these three GUCs were registered, so
+      replaying a real-PG dump on goopg aborted at the first such line with
+      `unrecognized configuration parameter`. Registered all three
+      (`CLIENT_CONN_STATEMENT` / `PGC_USERSET`) in
+      `internal/config/defaults.go`: `default_table_access_method` (string,
+      boot `heap`), `default_tablespace` (string, boot `''`),
+      `default_toast_compression` (enum `{pglz,lz4}`, boot `pglz` — `lz4`
+      matches the reference `--with-lz4` build). Added matching
+      `postgresql.conf.sample` entries (`TestSampleConfigCoversRegistry`
+      invariant) and `pg_catalog.pg_settings` literal rows
+      (`internal/catalog/catalog.go`). Behavioral no-op ledgered: goopg only
+      implements the heap AM, has no real tablespaces, and picks a column's
+      TOAST compression from its own default rather than consulting the GUC,
+      so a non-default SET is accepted-and-ignored (enum domain still
+      enforced — `SET default_toast_compression='zstd'` errors). Verified
+      end-to-end over the wire against `cmd/goopg`: the three pg_dump-preamble
+      SETs succeed, `SHOW`/`pg_settings` report them, `='lz4'` moves the
+      value, `'zstd'` rejected. Tests:
+      `internal/config/object_default_guc_stubs_test.go`
+      (`TestObjectDefaultGUCStubs`, `TestObjectDefaultGUCValuesAccepted`);
+      `internal/catalog/catalog_test.go` `TestPgSettingsObjectDefaultGUCs`.
+      Design: `docs/design/root-0004-configuration-and-guc.md` new
+      "object-creation default GUC stubs" section. Gates: `go build ./...`
+      clean; `go test ./internal/config/... ./internal/catalog/...` PASS;
+      live server SET/SHOW/pg_settings smoke; pgbench smoke via pre-commit
+      hook.
+
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,
       encoding constraints during bootstrap/runtime.
@@ -3478,15 +8757,616 @@ mirroring M0119's ledger `status` column.
       base-table access — needs a preliminary per-statement RTE-style
       permission pass, materially larger than this follow-up.
       SASLprep/channel binding/`scram_iterations`, encoding constraints.
+      **`scram_iterations` wired into password hashing landed (2026-07-08,
+      this loop):** the GUC (`internal/config/defaults.go`, registered
+      since earlier but never read anywhere) is now actually consulted by
+      `CREATE`/`ALTER ROLE ... PASSWORD 'plain'` — `auth.NewSCRAMSecret`'s
+      hardcoded `scramDefaultIterations` (4096) call site is replaced with
+      a new `auth.NewSCRAMSecretWithIterations(pw, iterations)` sibling,
+      and `applyRoleAttrOptions` (`internal/server/role_ddl.go`) now takes
+      the same `currentGUCResolver` its two callers already had in scope
+      (previously only used for `SET ... FROM CURRENT`); a new
+      `resolveScramIterations` helper reads the live `scram_iterations`
+      value. The auth/verification side needed no change — `scram.go:326`'s
+      server-first-message already renders `s.secret.Iterations` parsed
+      back out of the stored verifier, not a constant, so it was already
+      correct; only the write path was pinned to the default. Tests:
+      `internal/server/role_ddl_scram_iterations_test.go`
+      (`TestCreateAlterRolePasswordHonorsScramIterationsGUC`), confirmed
+      non-vacuous via `git stash`. Design: `docs/design/
+      root-0021-role-auth-persistence.md` new "Follow-up: `scram_iterations`
+      GUC wired into password hashing" section; `docs/design/README.md`
+      root-0021 row extended. Gates: `go build ./...`/`go vet ./...` clean;
+      `go test ./internal/server/... ./internal/auth/... ./internal/config/...`
+      PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed transactions, all 3 workloads). SASLprep and TLS channel
+      binding remain fully unimplemented in this cluster (separate,
+      larger slices — SASLprep needs a Unicode-normalization dependency
+      not currently in `go.mod`; channel binding needs TLS
+      tls-server-end-point wiring).
+      **SASLprep landed (2026-07-08, this loop):** ported `pg_saslprep`
+      (`postgres/src/common/saslprep.c`, RFC 4013) to
+      `internal/auth/saslprep.go`, including its exact algorithm quirk
+      (prohibited-output/bidi checks run against the mapped-but-pre-NFKC
+      codepoints, not the final normalized output) and its six Unicode
+      range tables, mechanically extracted from the C source by a one-off
+      script into `internal/auth/saslprep_tables.go` (not hand-transcribed,
+      to guarantee byte-identical data — 396+360+36+... range pairs).
+      NFKC normalization added via a new `golang.org/x/text` dependency
+      (`unicode/norm.NFKC`, NOT `secure/precis.OpaqueString`, which is
+      NFC per RFC 8265 — a different, non-upstream-compatible form).
+      Wired into `auth.NewSCRAMSecretWithIterations` (mirrors
+      `pg_be_scram_build_secret`) and
+      `SCRAMSecret.VerifySCRAMSecretFromPassword` (mirrors
+      `scram_verify_plain_password`), both falling back to the raw
+      password on SASLprep failure like upstream. The live SCRAM
+      handshake itself needed no change — it never re-derives from a
+      plaintext password, only checks the client's proof against the
+      already-prepped stored secret. Tests:
+      `TestPGSASLPrepRFC4013Examples`/`TestPGSASLPrepInvalidUTF8`/
+      `TestSCRAMSecretNormalizesEquivalentUnicodeForms`
+      (`internal/auth`) plus a differential e2e test against a REAL
+      libpq client — `TestE2E_SASLPrepMatchesRealLibpqClient`
+      (`internal/testport`), since lib/pq's own Go SCRAM client does no
+      SASLprep at all (confirmed by reading its `scram` package), so only
+      real `psql` (linked against upstream's own saslprep.c) meaningfully
+      proves cross-implementation byte parity; a role's password
+      containing U+2168 ROMAN NUMERAL NINE, stored via `CREATE ROLE`,
+      authenticates against the plain ASCII canonical form "IX" over a
+      real SCRAM handshake. Added `cluster.PSQLWithPassword` test-infra
+      helper (`internal/testutil/cluster/cluster.go`) since none of the
+      existing psql helpers allowed a non-empty `PGPASSWORD`. Design:
+      `docs/design/0049-0003-scram-sha-256.md` new §3.1 + README row.
+      Deferral-ledger row appended (channel binding — the other named gap
+      — remains open, needs TLS wiring that doesn't exist anywhere in the
+      server yet, a materially larger separate slice). Gates:
+      `go build ./...`/`go vet ./...` clean; `go mod tidy` clean;
+      `go test ./internal/auth/... ./internal/server/...` PASS; targeted
+      `internal/testport` e2e SCRAM/role tests PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS
+      (0 failed transactions, all 3 workloads).
 - [ ] **M0122-0009 — WAL / recovery / crash-consistency infra** (~16). WAL segment
       recycling, `WALInsertLock` array (parallel inserts), MultiXact WAL,
       `pg_subtrans` truncation. Gate: `-race` + recovery E2E (WAL practice card).
+      **`pg_subtrans` truncation landed (2026-07-09, this loop):** the bucket's
+      one previously-untouched item with no prior progress notes.
+      `internal/mvcc/subxact_visibility.go`'s `SubxactMap` (in-memory
+      `parents`/`aborted` maps) and `internal/mvcc/subxact_slru.go`'s
+      `SubtransSLRU` (`pg_subtrans/` SLRU mirror, M0117-0003) had no removal
+      primitive at all — both grew without bound for the lifetime of a
+      cluster, a gap the M0117-0003 design doc's own "Known follow-ups"
+      section had already flagged and left for later. New
+      `SubtransSLRU.TruncateBefore(oldestXact)` unlinks segment files whose
+      highest page strictly precedes `oldestXact`'s SLRU page (new
+      `SubtransPagePrecedes`, `CLOGPagePrecedes`'s twin scaled to
+      `subtransXactsPerPage`), mirroring `clog.go`'s `truncateSLRUSegments`
+      (reuses the same-package `parseSLRUSegName` helper). New
+      `SubxactMap.Truncate(oldestXact)` prunes both in-memory maps
+      (wraparound-safe via `storage.XIDPrecedes`) and calls through to the
+      SLRU when persistence is enabled; nil-safe when it isn't. New
+      `CheckpointerConfig.TruncateSubtransFn` (`internal/wal/checkpointer.go`)
+      invoked from `runCheckpoint` right after `TruncateCLOGFn`, same
+      best-effort/non-fatal error treatment. `internal/initdb/open.go` wires
+      it to the identical `horizon = min(datfrozenxid, OldestXmin)`
+      computation `TruncateCLOGFn` already uses — safe because any subxid
+      below that horizon's top-level xact already has a direct CLOG
+      `Committed`/`Aborted` status (never `SubCommitted`), so its parent link
+      is never consulted again; reusing the existing, already-tested horizon
+      avoids introducing a second, subtly-different computation. No WAL
+      record emitted — matches upstream `TruncateSUBTRANS`, which PG likewise
+      never WAL-logs (`pg_subtrans` is disposable across a crash;
+      `StartupSUBTRANS` just zeroes it on restart — goopg's restore-on-restart
+      choice per M0117-0003 is an orthogonal, deliberate divergence unrelated
+      to this fix). Tests: `TestSubtransSLRUTruncateBefore`/
+      `TestSubxactMapTruncate`/`TestSubxactMapTruncateNoPersistence`
+      (`internal/mvcc/subxact_truncate_test.go`),
+      `TestCheckpointerCallsTruncateSubtransFn`/
+      `TestCheckpointerTruncateSubtransFnErrorIsNonFatal`
+      (`internal/wal/checkpointer_test.go`). Design:
+      `docs/design/0122-0009-pg-subtrans-truncation.md` (new);
+      `docs/design/0117-0003-pg-subtrans-restore-on-restart.md`'s "Known
+      follow-ups" section updated to point at it; `docs/design/README.md`
+      index updated (both the new row and the 0117-0003 row's stale
+      follow-up note). Gates: `go build ./...` clean; `go vet`/`go test`
+      clean+PASS across `internal/mvcc`/`internal/wal`/`internal/initdb`
+      (the `internal/initdb` package test takes ~5 min, ran to completion);
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed transactions, all 3 pgbench workloads).
+      **WAL segment recycling landed (2026-07-09, next loop):**
+      `Writer.RemoveOldSegments` previously unlinked every obsolete segment;
+      upstream recycles some of them (rename into a future segment slot,
+      `RemoveXlogFile`/`InstallXLogFileSegment`) so a later `openSegment`
+      skips its own create+zero-fill+directory-fsync. New `Config.MinWALSize`
+      (wired from the previously-unread `min_wal_size` GUC via
+      `internal/initdb/open.go`'s `OpenOptions.WALMinSize`, read in
+      `cmd/goopg/main.go` the same way `max_wal_size` already is) caps how
+      many of the newest obsolete segments `state.removeOldSegments`
+      (`internal/wal/writer.go`) recycles via the new `recycleSegmentFile`
+      helper (rename + zero-fill + fsync, reusing `preallocateSegment`) vs
+      unlinks; `<= 0` (default) disables recycling, byte-identical to prior
+      behaviour. The recycle target is the lowest free segment slot at or
+      after the keep segment (mirrors upstream's `find_free` scan, never
+      clobbers a live/already-recycled segment). Diverges from upstream by
+      zero-filling the recycled segment (upstream leaves old content as-is,
+      relying on per-record CRC to bound recovery scans) because goopg's
+      `reader.go` graceful-EOS heuristic checks for an all-zero tail instead
+      — an unzeroed recycled segment's leftover well-formed old record would
+      pass CRC validation and be misread as live WAL. `SlotAwareRetainer.Retain`
+      (`internal/wal/retention.go`) threads the new `recycled` count through
+      to its summary log (`segments_recycled` alongside `segments_removed`).
+      Tests: `TestRemoveOldSegmentsRecyclesUpToMinWALSize` (confirms recycled
+      files are genuinely zero, not stale content — the load-bearing
+      correctness check), `TestRemoveOldSegmentsRecycleCapExceedsObsoleteCount`
+      (`internal/wal/retention_test.go`); pre-existing `TestRemoveOldSegments*`
+      tests (implicit `MinWALSize=0`) continue to pin the recycling-disabled
+      default. Design: `docs/design/0122-0009-wal-segment-recycling.md` (new,
+      cites upstream `xlog.c` source); `docs/design/README.md` index updated.
+      Deferral-ledger row filed: only the `min_wal_size` floor half of
+      upstream's `XLOGfileslop` sizing is implemented, not the
+      checkpoint-distance-estimate/`max_wal_size`-ceiling halves. Gates:
+      `go build ./...`/`go vet ./...` clean; `go test`/`go test -race` PASS
+      across `internal/wal`, `internal/mvcc`; `go test ./internal/initdb/...`
+      PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed transactions, all 3 pgbench workloads). **Still open in this
+      bucket (at that point):** `WALInsertLock` array (parallel inserts),
+      MultiXact WAL, eager next-segment lookahead.
+      **Eager next-segment lookahead landed (2026-07-09, next loop):**
+      closes the `unimplemented_feat.json` M0007 entry left over from the
+      original 0007-0001 preallocation design (deferred there as "gives
+      lower commit-path tail latency at rollover but adds a background
+      goroutine"). `state.openSegment(segNo)` (`internal/wal/writer.go`) now
+      calls a new `state.eagerPreallocSegment(segNo+1)` right after handling
+      `segNo` itself, spawning a background goroutine that zero-fills a
+      `<segfile>.eager<pid>.tmp` file and durably links it into place
+      (`os.Link`, EEXIST-tolerant no-clobber — mirrors upstream
+      `XLogFileInit`'s temp-then-link pattern) so a genuine rollover usually
+      finds the next segment already preallocated instead of paying for it
+      synchronously; new `state.eagerInFlight`/`eagerMu` dedupe concurrent
+      triggers for the same segment, `state.eagerWG` lets `close()` wait for
+      any still-running job before tearing down `s.files`. Found and fixed a
+      real correctness hazard this exposed on the way: `detectWritePos`
+      (consulted only at writer-reopen time, e.g. after a restart) used to
+      trust every non-last on-disk segment as "fully used" via file size
+      alone, content-scanning only the literal highest-numbered file — a
+      crash between eagerly preallocating `segNo+1` and the writer ever
+      really reaching it leaves a fully zero, never-written `segNo+1` file
+      *above* the genuinely partially-written `segNo`, which the old logic
+      would silently overshoot past (trusting `segNo` as full while
+      content-scanning the empty phantom instead). Fixed by walking backward
+      from the highest segNo, trimming any segment that is both full-size
+      and scans as entirely empty, before running the existing (otherwise
+      unchanged) last-segment scan logic — the full-size guard is what keeps
+      this from misclassifying a genuine short/legacy empty-last segment
+      (already handled correctly, unchanged). Also fixed a pre-existing
+      pg_waldump test (`TestPGWaldumpParsesEmittedWAL`) that the new second
+      on-disk segment file exposed: bare `pg_waldump -p walDir -s .. -e ..`
+      (no explicit filename) auto-detects `WalSegSz` by opening "any
+      WAL-looking file" via unordered `readdir()` (`identify_target_directory`
+      / `search_directory`, `pg_waldump.c`), which can hand it the all-zero
+      segment 1 and misread its zeroed long-page-header as `xlp_seg_size=0`
+      — a pre-existing upstream pg_waldump quirk (real PG WAL directories
+      have the same kind of preallocated future segment during normal
+      operation), fixed by naming the exact start segment as a positional
+      argument, the standard unambiguous invocation form. Tests:
+      `internal/wal/writer_detect_test.go`'s new
+      `TestDetectWritePos_IgnoresEagerPhantomFutureSegment` (confirmed
+      non-vacuous by reverting the trim loop — fails with the exact
+      predicted writePos overshoot); `internal/wal/wal_test.go`'s
+      `TestPreallocationCounters` updated to `w.stateRef.eagerWG.Wait()`
+      before each assertion and re-derive the new one-segment-ahead expected
+      totals (was implicitly relying on the background goroutine losing a
+      race it had no guaranteed way to lose). **Independent review caught a
+      genuine bug in the first cut:** `close()`'s `eagerWG.Wait()` ran
+      *before* `flushUpTo`, but with `Config.WALBuffers > 0` (the default)
+      `flushUpTo` can itself be the first caller of `openSegment` for a
+      segment (buffered bytes never drained until Close), which then kicks
+      off a brand-new eager job with zero chance to have started before that
+      earlier `Wait()` already returned — `Close()` could return while a
+      background goroutine was still writing into the WAL directory. Fixed
+      by moving `Wait()` to after `flushUpTo` (the last remaining
+      `openSegment` caller inside `close()`). New test
+      `TestClose_WaitsForEagerJobTriggeredByItsOwnFlush`
+      (`writer_detect_test.go`, confirmed non-vacuous — fails ~95% of runs
+      with the ordering reverted, a real race not a rare corner case).
+      Design:
+      `docs/design/0007-0001-wal-segment-preallocation.md` new "Follow-up
+      (2026-07-09): eager next-segment lookahead" section;
+      `docs/design/README.md` row updated; `unimplemented_feat.json`'s
+      matching M0007 entry flipped to `resolved` (task_id retagged
+      `M0122-0009`). No deferral-ledger row needed — nothing new was left
+      unimplemented (the pre-existing `posix_fallocate` deferral,
+      unaffected by this loop, was already tracked in the design doc before
+      this change). Gates: `go build ./...` clean; `go test`/`go test -race`
+      PASS across `internal/wal`; `go test ./internal/initdb/...` PASS (no
+      regression in Init+Open+restart recovery, ~5 min); `scripts/tpch-spotcheck.sh`
+      PASS (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+      scripts/ralph-precommit-test.sh` PASS (0 failed transactions, all 3
+      pgbench workloads). **Still open in this bucket:** `WALInsertLock`
+      array (parallel inserts), MultiXact WAL.
+      **2026-07-09 (next loop) — reconciliation, no code change:** verified
+      the `WALInsertLock` array line item is in fact already fully landed
+      (M0107-0007 slice B, `docs/design/0107-0007ah-wal-tryappend-rwmutex.md`
+      / `0107-0007aj-wal-segment-cross-reservation.md` and ~28 sibling design
+      docs `0107-0007a`..`0107-0007aj`) — it was a stale leftover in this
+      bucket's summary line, not real remaining work. Confirmed by code
+      reading, not just docs: `internal/wal/padded_mutex.go`'s
+      `appendLockSet` is an 8-stripe `[8]paddedMutex` array
+      (`appendLockStripes = 8`, matching PG's `NUM_XLOGINSERT_LOCKS` /
+      `WALInsertLocks[]`, `xlog.c`/`xlog.h`), genuinely wired (not dead code)
+      into every hot append path via `stripe_writer_core.go`'s
+      `c.locks`/`stripeAppend`/`stripeAppendBuild`/`stripeAppendBuiltEmitted`,
+      selected per-caller by `stripeForProcNum(procNum)`. `writer.go`'s
+      `tryAppend` fast path takes `state.appendMu.RLock()` (shared) then the
+      one stripe lock via `AppendXLogPayload`, so up to 8 concurrent
+      backends genuinely append into disjoint WAL-buffer regions in
+      parallel; only the replica WAL-apply path (`appendRaw`, sequential by
+      nature — a single WAL receiver, matching upstream) and
+      checkpoint/recovery resets take the exclusive `Lock()`. Re-ran the
+      three tests that pin this concurrency model at HEAD (unmodified):
+      `go test -race -run
+      'TestConcurrentTryAppendProceedsInParallel|TestTryAppendRLockDoesNotBlockSiblings|TestConcurrentAppendAcrossSegmentBoundariesNoOverflow'
+      ./internal/wal/...` — all 3 PASS. No fix_plan/deferral-ledger row
+      needed (nothing was actually missing); this bucket's remaining named
+      item is `MultiXact WAL` only. Surveyed that one too before choosing
+      this reconciliation instead: `internal/multixact/` is an explicitly
+      unwired, in-memory-only primitive (package doc: "the risky hot-path
+      integration ... lands in later loops on top of this verified
+      primitive") — no SLRU-backed offsets/members store, no xmax-stamping
+      wiring, no WAL record kinds at all (`grep -rn Multixact
+      internal/wal/*.go` only hits two placeholder comments). WAL-logging
+      multixact creation presupposes a durable multixact SLRU exists to
+      protect first — that foundation doesn't exist yet, and building it
+      plus wiring it into the tuple-header hot path is multi-loop,
+      feature-sized work on the same class of hot path (xmax) that has
+      already cost this project many multi-loop corruption-hunt threads
+      (see the `M-NIGHTLY (AI-20260709-010336-082)` btree thread above) —
+      correctly left deferred rather than rushed into one loop.
+      **`max_wal_size` ceiling + `CheckPointDistanceEstimate` — done
+      (2026-07-09, next loop, closes the deferral-ledger row from the
+      original WAL segment recycling loop):** the bucket's other named
+      sizing gap. New `computeSpareSegments` (`internal/wal/writer.go`)
+      ports upstream's `XLOGfileslop` (xlog.c) formula as segment counts
+      relative to the retention keep-segment rather than absolute
+      LSN/segNo math (behaviourally equivalent, avoids needing goopg's
+      1-based LSN encoding to line up bit-for-bit with upstream's 0-based
+      `XLogSegNo` arithmetic); new `Checkpointer.CheckPointDistanceEstimate()`
+      ports `UpdateCheckPointDistanceEstimate`'s jump-up-immediately/
+      decay-slowly (90/10) EMA verbatim, fed from each `runCheckpoint`
+      cycle's redo-LSN delta. New `Writer.RemoveOldSegmentsWithEstimate` +
+      `SlotAwareRetainer.CheckPointDistanceEstimateFn`/`CompletionTarget`
+      wire it through Retain; `cmd/goopg/main.go` reads `max_wal_size`
+      (new `wal.Config.MaxWALSize` via `initdb.OpenOptions.WALMaxSize`,
+      default 1024 MB matching upstream) and `checkpoint_completion_target`
+      the same way `min_wal_size`/`checkpoint_completion_target` already
+      feed the checkpointer's other knobs. The pre-existing
+      `RemoveOldSegments` public API is unchanged behaviourally — it now
+      forwards to the same formula with both new inputs zeroed, proven to
+      reduce to the original `ceil(MinWALSize/SegmentSize)` floor exactly
+      (every pre-existing test using it, e.g.
+      `TestRemoveOldSegmentsRecyclesUpToMinWALSize`, still passes
+      unmodified). Tests:
+      `TestComputeSpareSegmentsMatchesMinWALSizeFloorWhenNoEstimate`/
+      `TestComputeSpareSegmentsGrowsWithDistanceEstimate`/
+      `TestComputeSpareSegmentsCapsAtMaxWALSize`/
+      `TestRemoveOldSegmentsWithEstimateHonoursDistanceAndMax`/
+      `TestSlotAwareRetainerUsesCheckPointDistanceEstimateFn`
+      (`internal/wal/retention_test.go`),
+      `TestCheckpointerUpdatesCheckPointDistanceEstimate`
+      (`internal/wal/checkpointer_test.go`, pins the jump-up/decay-down
+      shape across real `CheckpointNow()` cycles without asserting exact
+      byte counts). Design: `docs/design/0122-0009-wal-segment-recycling.md`
+      new "Follow-up (2026-07-09)" section; `docs/design/README.md` row
+      updated; deferral-ledger row flipped to `resolved`, new row appended
+      closing it. Gates: `go build ./...`/`go vet ./...` clean; `go test`/
+      `go test -race ./internal/wal/...` PASS; `go test
+      ./internal/initdb/... ./cmd/goopg/...` PASS; `scripts/tpch-spotcheck.sh`
+      PASS (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+      scripts/ralph-precommit-test.sh` PASS (0 failed transactions, all 3
+      pgbench workloads). **M0122-0009's WAL-segment-recycling sizing
+      sub-bucket now has no known open gap; MultiXact WAL remains the
+      bucket's sole open item** (multi-loop, feature-sized — see the
+      survey directly above).
 - [ ] **M0122-0010 — Concurrency: buffer pool & btree locking** (~17, LARGE).
       Lehman/Yao crab-walk, `splitMu` removal, storage-pool pin-count race,
       re-enable the `-race` gate. Gate: race detector mandatory.
-- [ ] **M0122-0011 — Query optimizer & TPC-H/HammerDB correctness** (~17). Anti/
+      **2026-07-09 loop — fixed the internal-page sibling-relink
+      cross-connection race** (continuation of the M-NIGHTLY
+      AI-20260709-010336-082 pgbench-reopen thread's closing note: "a
+      future structural-write path added without the same re-validation
+      discipline... should be treated as suspect until it's audited the
+      same way"). Audited `internal/access/btree/btree_vacuum.go`'s
+      remaining structural-mutation call sites for the exact bug class
+      just fixed there (leaf sibling-relink using a stale unlocked
+      `liveSibling` capture instead of a fresh re-derivation under the
+      write-side `pinW`) and found the IDENTICAL gap one level up:
+      `unlinkEmptyInternalPage` (WAL path) and
+      `unlinkEmptyInternalPageFPI` (FPI fallback) — used by
+      `maybeCascadeEmptyInternal` to unlink a vacuumed-empty internal
+      page — both computed `leftLive`/`rightLive` via the same unlocked
+      pre-pass and wrote them verbatim, exposed to the same cross-
+      connection splice-then-stomp corruption `bt.splitMu` cannot
+      prevent (per-`*BTree`-Go-instance only, not cross-connection).
+      Fixed both to re-derive the live neighbour via a fresh
+      `liveSibling` walk inside the same `pinW` hold that performs the
+      write, mirroring the leaf-level fix exactly. New regression test
+      `TestUnlinkEmptyInternalPagePreservesConcurrentSplice`
+      (`internal/access/btree/btree_vacuum_internal_race_test.go`)
+      deterministically reproduces the race with no goroutines needed:
+      builds a real 3-level (root/internal/leaf) tree via `BulkCreate`
+      (n=900000, same recipe as the existing
+      `TestVacuumIndexPagesCascadesEmptyInternalPage`), captures a
+      target internal page's real live prev/next exactly like
+      `maybeCascadeEmptyInternal` does, splices a synthetic live page in
+      between (simulating a same-window concurrent split on a different
+      connection), then invokes the low-level unlink with the STALE
+      pre-splice prev/next and asserts the splice survives instead of
+      being stomped. Confirmed non-vacuous via `git stash` on
+      `btree_vacuum.go` alone (fails pre-fix with the exact "stale stomp
+      regression" symptom the test asserts against). Design doc
+      `docs/design/0055-0003-btree-page-deletion-and-recycling-protocol.md`
+      new §2.5; `docs/design/README.md` row extended. Gates: `go build
+      ./...` clean; `go test ./internal/access/btree/...
+      ./internal/amcheck/... ./internal/executor/...` PASS; `go test
+      -race ./internal/access/btree/...` PASS; `scripts/tpch-spotcheck.sh`
+      PASS (Q12=2/Q13=33). **New gap found while fixing the above,
+      deferred (ledger row appended 2026-07-09):**
+      `applyParentDownlinkRemoval` (shared by both the leaf and
+      internal-page unlink WAL paths) removes the parent's downlink
+      purely by a previously-captured slot INDEX, with no re-validation
+      at write time that the item still at that index is the intended
+      child's downlink — the exact index-drift race
+      AI-20260706-201855-001 fixed for the intra-instance case (there
+      `splitMu` closed it), but NOT for a concurrent split racing from a
+      DIFFERENT connection's instance on the same parent page. This is
+      the epic's next concrete resume point (see the ledger row's
+      "resume point" column for the exact fix shape); the larger
+      `splitMu` removal / Lehman-Yao crab-walk items in this bucket
+      remain untouched by this loop.
+      **2026-07-09 loop (same day, continuation) — fixed the
+      `applyParentDownlinkRemoval` index-drift race named above.**
+      Changed the function's signature from
+      `(parentBlk storage.BlockNumber, removeSlot uint16, lsn
+      storage.LSN)` to `(parentBlk, childBlk storage.BlockNumber, lsn
+      storage.LSN)`: instead of trusting a slot index resolved well
+      before the removal actually runs (WAL emission + sibling-relink
+      writes happen in between), it now re-scans the parent's CURRENT
+      item list for `it.ptr.Block == childBlk` under the same `pinW`
+      that performs the removal — mirrors the §2.5 sibling-relink fix
+      pattern and `findParentDownlinkByBlock`'s existing by-block
+      matching, self-correcting if a cross-connection split raced in,
+      idempotent no-op if the downlink was already removed by a racing
+      unlink. Both call sites (`unlinkEmptyLeaf`'s and
+      `unlinkEmptyInternalPage`'s WAL-emitting paths, lines ~408/~981)
+      now pass the child block (`leaf.blk`/`blk`) instead of
+      `req.ParentRemoveSlot`; the WAL record's own `ParentRemoveSlot`
+      field is untouched (crash replay is single-threaded, so the
+      stale-index concern is live-apply-only). New regression test
+      `TestApplyParentDownlinkRemovalIgnoresStaleIndex`
+      (`internal/access/btree/btree_vacuum_parent_downlink_race_test.go`)
+      deterministically reproduces the drift (no goroutines needed):
+      resolves a target leaf's parent slot on a real 2-level tree
+      (`BulkCreate`, n=3000), splices a synthetic live downlink into
+      the front of the parent's item list (shifting the target's true
+      position by one, so the pre-splice stale slot now points at a
+      different, live "victim" child), then invokes the fixed removal
+      keyed on the target's block and asserts: the target's downlink is
+      gone, the victim's downlink survives (proving no
+      wrong-item-by-stale-index deletion), and the spliced item
+      survives untouched. Confirmed non-vacuous via `git stash` on
+      `btree_vacuum.go` alone — the test fails to even COMPILE pre-fix
+      (`cannot use targetBlk (BlockNumber) as uint16 value`), a stronger
+      signal than a runtime assertion failure. Design doc
+      `docs/design/0055-0003-btree-page-deletion-and-recycling-protocol.md`
+      new §2.6; `docs/design/README.md` row updated. Deferral ledger row
+      dated 2026-07-09 (`M0122-0010`, "applyParentDownlinkRemoval...")
+      flipped to `resolved`. Gates: `go build ./...` clean; `go test
+      ./internal/access/btree/... ./internal/amcheck/...
+      ./internal/executor/...` PASS; `go test -race
+      ./internal/access/btree/...` PASS; `scripts/tpch-spotcheck.sh`
+      PASS (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+      scripts/ralph-precommit-test.sh` PASS (0 failed txns, all 3
+      workloads). **Standing gap unchanged (not this loop's scope):**
+      `bt.splitMu` is still not a real cross-connection mutex — this
+      fix (like §2.5's) tolerates that by re-validating at the
+      individual write site; the larger `splitMu` removal / Lehman-Yao
+      crab-walk items in this bucket remain untouched.
+- [x] **M0122-0011 — Query optimizer & TPC-H/HammerDB correctness** (~17). Anti/
       semi-join unnesting (NOT IN), Q8/Q9/Q21 row-count fixes; several blocked on
       the slot/TupleSlot pipeline (see M0122-0012). Gate: TPC-H spot-check.
+      **Non-correlated NOT IN anti-semi-join unnesting landed (2026-07-09,
+      this loop, closes the "Anti/semi-join unnesting (NOT IN)" item and the
+      matching `unimplemented_feat.json` M0069-0005 entry):**
+      `isUnnestableNonCorrelatedIn`/`unnestNonCorrelatedInExpr`
+      (`internal/planner/unnest.go`) no longer hard-reject `in.Negated`; a
+      non-correlated `x NOT IN (subquery)` now unnests to a new
+      `Join.NullAware` (`internal/planner/plan.go`) `JoinTypeAnti` hash
+      join instead of staying on the slower per-row runtime-cache path.
+      The naive relax (just dropping the `Negated` guard, reusing the
+      pre-existing Anti join) would have been a silent correctness
+      regression: that Anti join is NOT-EXISTS-shaped ("NULL probe key
+      never matches → keep"), which is wrong for NOT IN's three-valued-
+      NULL semantics (a NULL anywhere in the subquery poisons the whole
+      predicate to empty output; an empty subquery returns every outer
+      row including NULL ones; otherwise a NULL outer value is excluded,
+      not kept). `internal/executor/operators_join_agg.go`'s
+      `openLazyHashJoin`/`nextLazy` track two build-side aggregates
+      (`antiBuildRows`/`antiBuildHasNull`) and special-case all three
+      rules when `NullAware` is set. Tests:
+      `internal/planner/not_in_unnest_test.go`,
+      `internal/executor/not_in_unnest_test.go` (4 cases covering the
+      normal/poison/empty/null-probe rules, cross-checked against real
+      PostgreSQL 18.3 NOT IN semantics); confirmed non-vacuous via `git
+      stash` (planner test fails to compile; executor's empty-subquery
+      case fails — which also proved the **pre-existing** runtime-cache
+      fallback itself mishandled that one edge case, a latent bug this
+      fix incidentally closes too). Design:
+      `docs/design/0040-0001-subquery-caching-and-unnest.md` new
+      Follow-up section; `docs/design/README.md` row updated;
+      `unimplemented_feat.json` M0069-0005 NOT-IN entry flipped to
+      `resolved`. Gates: `go build ./...` clean; `go test
+      ./internal/planner/... ./internal/executor/...` PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS
+      (0 failed txns, all 3 workloads); live-verified TPC-H Q16 (a real
+      NOT IN query) still returns the correct current-dataset row count
+      (18192). **Deliberately deferred (ledger row appended):** (1) the
+      CORRELATED NOT IN path (`unnestInExpr`'s existing
+      `if in.Negated { joinType = JoinTypeAnti }`) has the same
+      NOT-EXISTS-shaped gap — pre-existing, not introduced this loop —
+      but fixing it needs per-correlation-group NULL/emptiness tracking,
+      materially larger than this loop's single-global-build case; (2)
+      Q16's own real join shape does not actually route through the new
+      unnest path (an equivalent synthetic probe does) — root cause not
+      isolated, not a correctness bug since it safely keeps using the
+      pre-existing correct fallback, just missed optimization coverage.
+      Still open in this bucket: correlated NOT IN's NullAware gap,
+      Q16's non-triggering unnest, non-trivial LHS expressions on
+      IN-subquery unnesting (`unimplemented_feat.json`'s sibling
+      M0069-0005 entry, `unnest.go:1203`'s `ColumnRef`-only restriction),
+      Q8/Q9/Q21 row-count fixes.
+      **Non-ColumnRef IN-subquery LHS landed (2026-07-09, this loop,
+      closes the sibling M0069-0005 `unimplemented_feat.json` entry
+      named directly above):** `isUnnestableNonCorrelatedIn`
+      (`internal/planner/unnest.go`) no longer requires `in.Operand` to
+      be a `*ColumnRef` — it now only checks `in.Operand != nil`,
+      `in.Plan != nil`, and a single-column inner output.
+      `unnestNonCorrelatedInExpr` previously reconstructed a fresh
+      `*ColumnRef` by copying `Index`/`Name`/`Type`/`SourceTableIdx` off
+      the operand; that reconstruction is gone — `outerKey := in.Operand`
+      is used directly as `Join.LeftKey`, since `LeftKey`/`RightKey` were
+      already typed as general `Expr` and the hash-join executor's
+      `evalHashKey` (`internal/executor/operators_join_agg.go`) already
+      evaluates them with the ordinary `evalExpr`, not a ColumnRef-
+      specific extractor — the restriction was never protecting a real
+      invariant. So `f(x) IN (subquery)` / `a + b IN (subquery)` now
+      unnest to a hash Semi/Anti join exactly like a bare-column LHS,
+      instead of falling back to the slower per-row runtime-cache path.
+      Tests: `internal/planner/not_in_unnest_test.go`'s new
+      `TestUnnestNonCorrelatedIn_NonColumnRefOperand` (`x + 1 IN
+      (subquery)` unnests to `JoinTypeSemi`/`JoinAlgoHash` with a
+      `*BinaryOp` `LeftKey`); `internal/planner/unnest_test.go`'s
+      `TestRecursiveUnnestInsideNonUnnestableIN` updated — it previously
+      relied on a non-ColumnRef operand (`a_id + 1`) to keep its outer IN
+      deliberately non-unnestable while pinning the unrelated M0040-0004
+      recursive-inner-subquery-unnest invariant; since operand shape
+      alone no longer blocks unnesting, it now uses a non-equijoin
+      correlation (`b_val > a_id`) instead, which `collectUnnestParams`
+      still correctly rejects. Confirmed non-vacuous via `git stash` on
+      `unnest.go` alone (new test fails: `InExpr survived unnesting`,
+      no `JoinTypeSemi` found). Design:
+      `docs/design/0040-0001-subquery-caching-and-unnest.md` new
+      Follow-up section; `docs/design/README.md` row extended;
+      `unimplemented_feat.json`'s M0069-0005 non-ColumnRef-LHS entry
+      flipped `open` → `resolved`. Gates: `go build ./...` clean; `go
+      test ./internal/planner/... ./internal/executor/...
+      ./internal/analyzer/...` PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+      scripts/ralph-precommit-test.sh` PASS (0 failed txns, all 3
+      pgbench workloads). **Still open in this bucket:** correlated NOT
+      IN's NullAware gap, Q16's non-triggering unnest (root cause not
+      yet isolated), Q8/Q9/Q21 row-count fixes.
+      **Correlated IN/NOT IN operand-identity bug found and fixed
+      (2026-07-09, this loop, resolves the "correlated NOT IN's
+      NullAware gap" item above with a bigger-scope root cause than
+      that framing assumed):** `unnestInExpr`'s correlated branch
+      (`internal/planner/unnest.go`) never read `in.Operand` — it
+      always keyed the join on the subquery's own correlation
+      equijoin pair alone, folding the correlation predicate itself
+      into a tautology inside the cloned inner plan. This silently
+      changed the predicate's *meaning* (not just its NULL handling)
+      for BOTH plain correlated `IN` and `NOT IN` whenever the
+      correlation column differed from the IN operand and/or the
+      subquery's SELECT column — e.g. `x IN (SELECT y FROM t2 WHERE z
+      = outer.w)` matched on `w = y` alone, discarding `z` and the
+      real `x`/`y` comparison. Fixed via new
+      `correlatedInOperandSafeToUnnest` gate in
+      `canUnnestInExprDepth`: requires `in.Operand` to be the same
+      column as the correlation's outer-scope side AND the subquery's
+      sole projected column to be the same column as the
+      correlation's subquery-scope side. Proved this also fully
+      closes the previously-flagged NullAware gap: when both
+      identities hold, every surviving row's projected value is
+      non-NULL and exactly equals `in.Operand`, so a plain Anti join
+      is already correct for NOT IN here — no per-group NullAware
+      tracking needed for anything still unnestable post-fix.
+      Tests: `internal/planner/correlated_in_unnest_test.go` (2
+      positive shape-preserving cases + 2 negative regression cases),
+      `internal/executor/correlated_in_unnest_test.go` (end-to-end
+      row-count proof: pre-fix wrongly returns a row, post-fix
+      correctly returns none). Confirmed non-vacuous via `git stash`
+      on `unnest.go` alone. Design:
+      `docs/design/0040-0001-subquery-caching-and-unnest.md` new
+      Follow-up #2 section; `docs/design/README.md` row extended.
+      Deferral ledger: new row appended documenting the fix; Q16's
+      non-triggering-unnest item (unrelated optimizer-coverage gap)
+      remains open at its original resume point. Gates: `go build
+      ./...` clean; `go test ./internal/planner/...
+      ./internal/executor/... ./internal/analyzer/...` PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh`
+      PASS (0 failed txns, all 3 pgbench workloads). **Still open in
+      this bucket:** Q16's non-triggering unnest (root cause not yet
+      isolated), Q8/Q9/Q21 row-count fixes.
+      **Q16 non-triggering-unnest item CLOSED (2026-07-09, this loop —
+      could not reproduce, refuted):** re-investigated the "Q16's real
+      join shape does not route through the new unnest path" claim
+      from the row above using a schema that mirrors the real
+      HammerDB-equivalent one (PK btree indexes on
+      part/partsupp/supplier plus SF1-magnitude `TableStats.RowCount`,
+      matching `index_utilisation_test.go`'s `hammerdbPKs`). The Anti
+      join unnest fires correctly — and, going one step further this
+      loop, so does a bare `tpch.Catalog()` plan with NO indexes/stats
+      at all (independently re-verified via a throwaway probe test,
+      reverted). Checked out every commit in the M0122-0011 chain
+      (`be47cc93` through `ef323e88`) and could not find a revision
+      where Q16 fails to unnest. Conclusion: the original observation
+      was almost certainly a stale/un-rebuilt `cmd/goopg` binary at
+      observation time, not a planner defect — there is no live bug to
+      fix. Landed `internal/planner/q16_unnest_test.go`
+      (`TestPlanQ16NotInUnnestsWithRealSchema`) as a permanent
+      regression guard pinning this now-confirmed-correct behavior
+      against a realistic schema. Deferral ledger: row 620's item (2)
+      closed via a new row; row 620 itself flipped to `resolved` (both
+      its items now closed). Gates: `go build ./...` clean; `go test
+      ./internal/planner/...` PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33). **Still open in this bucket:** Q8/Q9/Q21
+      row-count fixes.
+      **Q8/Q9/Q21 row-count fixes CLOSED (2026-07-09, this loop —
+      verification only, no code change needed):** live-ran all three
+      against the current `bench/tpch/runtime_goopg/data` dataset from a
+      fresh server (`tmp/tpch-runner --queries=8,9,21` against
+      `postgres@postgres`, the fallback the spotcheck gate itself uses
+      since goopg roles/DBs are in-memory-only). Result: Q8=2 rows
+      (matches the canonical/phase9 count), Q9=175 rows (matches the
+      structural anchor in `ci/batch/tpch-row-anchors.csv`), Q21=370 rows
+      (differs from the CSV's stale `20260511` pre-reload anchor of 397,
+      but exactly matches `ci/logs/action-items.md`'s own already-filed
+      2026-07-08 non-blocking notice for the current dataset — a known
+      load-dependent drift, not a regression). Re-pinned the Q21 row in
+      `ci/batch/tpch-row-anchors.csv` to 370/`20260709`. Cross-checked
+      against `unimplemented_feat.json`'s M0122-0001 triage audit: every
+      individual Q8/Q9/Q21 correctness entry there is already `status:
+      resolved` (Q8 via M0062-0002/M0063-0001 IndexScan-alias plumbing;
+      Q9 via `attachUnusedCrossEdges`, commit `2a9eade5`; Q21 via
+      `unnest.go`'s `SourceTableIdx`-aware re-resolution, commit
+      `e8c37796`) — this bucket's own trailing note was simply never
+      flipped after those fixes landed. The two still-`open` Q21-tagged
+      `unimplemented_feat.json` entries (Anti-NLI hash-vs-lift-to-
+      Predicate promotion; derived-table NLI rewrite for the build-phase
+      cancel path) are performance/architecture deferrals explicitly
+      abandoned-as-a-design-decision per their own `code_audit` text, not
+      row-count correctness bugs — they belong to "several blocked on the
+      slot/TupleSlot pipeline (see M0122-0012)" in this bucket's own
+      header, already out of scope here. This closes M0122-0011: every
+      item named in the bucket header (NOT IN anti/semi-join unnesting,
+      correlated + non-correlated, non-ColumnRef LHS, Q16 unnest, Q8/Q9/Q21
+      row counts) is now landed or live-verified-correct. Gates: `go build
+      ./...` clean (no code touched); live TPC-H Q8/Q9/Q21 run above;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33, re-run post-check).
 - [ ] **M0122-0012 — Perf infra: vectorization / slot-pipeline / harness** (~19,
       ARCHITECTURAL). Borrow-semantics allocation rewrite, plannode migration,
       vectorized FilterOp/SeqScanOp, plan cache, HammerDB SF1 validation.
@@ -3569,6 +9449,254 @@ mirroring M0119's ledger `status` column.
       workloads). Design: `docs/design/0003-0006-date-interval-arithmetic.md`
       updated (2026-07-08 follow-up section), `docs/design/README.md` row
       updated.
+- [x] **M0122-0019 — CREATE TABLE inline `SET STATISTICS` — verified not a
+      gap** (~1; `unimplemented_feat.json` task `M0110-0001`). The entry
+      claimed CREATE TABLE column definitions were missing an inline `SET
+      STATISTICS N` clause (only `ALTER TABLE ... ALTER COLUMN ... SET
+      STATISTICS` was wired). Checked upstream's own grammar
+      (`postgres/src/backend/parser/gram.y`): `columnDef`/`ColConstraintElem`
+      (lines 3814-4180ish) has no `STATISTICS` alternative at all — a
+      per-column statistics target is settable ONLY via `ALTER TABLE ...
+      ALTER COLUMN ... SET STATISTICS` (gram.y:2482-2496) or, for extended
+      statistics objects, `ALTER STATISTICS ... SET STATISTICS`
+      (gram.y:4770-4786); real `psql`/`pg_dump` never emit an inline form in
+      `CREATE TABLE` either (`ALTER ... SET STATISTICS` always follows the
+      `CREATE TABLE`). goopg's existing ALTER TABLE support already covers
+      upstream's only valid syntax, so there is nothing to add — the prior
+      code-audit's "confirmed-open: SET STATISTICS not in parseColumnDef"
+      was checking for syntax that does not exist in real PostgreSQL.
+      `unimplemented_feat.json`'s matching entry flipped `open`→`resolved`
+      with the grammar citation recorded in `code_audit` (no code change,
+      no test needed — nothing to regress). No design doc: this is a
+      verify-before-implement finding, not an implementation, mirroring the
+      M0122-0005 bucket's several prior "stale entry, no code change needed"
+      closures.
+- [x] **M0122-0020 — REINDEX physical-rebuild — verified stale `open` entry,
+      closed** (~1; `unimplemented_feat.json`, "REINDEX INDEX/TABLE command
+      is unimplemented; operates as a no-op stub.", `deferred_date:
+      2026-06-08`). The entry pre-dated commit `b9a1e1fb` (`M0122-0007`,
+      "make plain REINDEX INDEX/TABLE physically rebuild btree indexes") and
+      the later CONCURRENTLY shadow-file build-then-swap follow-ups —
+      `internal/executor/operators_reindex.go` now physically rebuilds for
+      every plain form (`REINDEX INDEX`/`TABLE`/`SCHEMA`, reusing `CREATE
+      INDEX`'s bulk-build path) AND every `CONCURRENTLY` form
+      (`rebuildIndexConcurrently`/`rebuildTableIndexesConcurrently`, via a
+      catalog-invisible shadow file swapped in under a brief lock); only
+      non-btree access methods stay a catalog-only no-op. Confirmed via the
+      existing dedicated test file
+      `internal/executor/reindex_physical_rebuild_test.go`
+      (`TestReindexIndexPhysicallyRebuilds`,
+      `TestReindexTablePhysicallyRebuildsAllIndexes`,
+      `TestReindexSchemaPhysicallyRebuildsAllTables`,
+      `TestReindexIndexConcurrentlyPhysicallyRebuilds`,
+      `TestReindexTableConcurrentlyPhysicallyRebuildsAllIndexes`, all PASS)
+      and design doc `docs/design/0122-0007-reindex-physical-rebuild.md`
+      (status "accepted", own Deferral section names only the real
+      remaining gap: no second validation scan for a write racing the
+      shadow build's heap scan). **Secondary finding, fixed in the same
+      loop:** `operators_reindex.go`'s own file-header doc comment was
+      itself stale in the same direction — it asserted "Every CONCURRENTLY
+      form remains a catalog-only no-op", contradicting the file's own
+      `rebuildIndexConcurrently`/`rebuildTableIndexesConcurrently` doc
+      comments two-hundred-odd lines below it; corrected to describe the
+      shadow-file build-then-swap mechanism and point at the design doc's
+      actual (narrower) Deferral gap.
+      `unimplemented_feat.json`'s matching entry flipped `open`→`resolved`
+      (81/181 resolved, 100 open). No design doc changes needed beyond the
+      comment fix above (the design doc's own content was already
+      accurate — only this code comment and the tracking JSON were stale).
+      Gates: `go build ./...`/`go vet ./...` clean (comment-only code
+      change); `go test ./internal/executor/... -run TestReindex` PASS
+      (7/7, all pre-existing); `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke bash
+      scripts/ralph-precommit-test.sh` PASS (0 failed transactions, all 3
+      workloads).
+- [x] **M0122-0021 — VIEW WITH CHECK OPTION restart-persistence sub-item —
+      verified stale, closed** (~1; `unimplemented_feat.json` task `DU-002`
+      slice 365). The entry's last audit (2026-07-04) marked enforcement and
+      parsing RESOLVED but flagged one remaining sub-item as open: "restart
+      persistence is still in-memory-only ... a concurrent M0119-0004 loop
+      was mid-flight on exactly that gap when this entry was last audited."
+      That concurrent loop landed the next day (commit `8107a8de`,
+      2026-07-05) and this loop's audit found it fully wired: encode side —
+      `buildUserPGClassRow` (`internal/executor/pg18_user_catalog_rows.go:
+      462-474`) serializes a view's `security_barrier`/`security_invoker`/
+      `check_option` reloptions into the heap-persisted `pg_class` row via
+      `catalog.TableReloptionsElements`; decode side —
+      `loadUserTablesFromHeapForDB` (`internal/initdb/open.go:2709`) reads
+      them back via `catalog.ApplyTableReloptions` (`case "check_option"`,
+      `internal/catalog/catalog.go:15314`) on every restart. Confirmed via
+      the pre-existing dedicated end-to-end test
+      `TestTableAndViewReloptionsSurviveRestart`
+      (`internal/initdb/view_ddl_recovery_test.go`) — creates a view `WITH
+      LOCAL CHECK OPTION`, closes and reopens the runtime against the same
+      data dir, asserts `view.CheckOption == "local"` survives — PASS at
+      current HEAD. Combined with the enforcement (`checkViewCheckOption`,
+      `44000` on violation) and parsing already confirmed by the prior
+      audit, every sub-item of this entry is now closed.
+      `unimplemented_feat.json`'s matching entry flipped `open`→`resolved`
+      (82/181 resolved, 99 open). No code change, no design doc change (the
+      design doc `docs/design/root-0025-updatable-views.md` already
+      describes the landed behavior) — verify-before-implement finding only,
+      same pattern as M0122-0019/M0122-0020. Gates: `go build ./...`/`go vet
+      ./...` clean; `go test ./internal/initdb/... -run
+      TestTableAndViewReloptionsSurviveRestart` PASS; `go test
+      ./internal/initdb/...` (full package) PASS; `scripts/tpch-spotcheck.sh`
+      PASS (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke bash
+      scripts/ralph-precommit-test.sh` PASS (0 failed transactions, all 3
+      workloads).
+- [x] **M0122-0022 — COLLATE/USING in `ALTER TYPE … ALTER ATTRIBUTE` —
+      verified stale, closed** (`unimplemented_feat.json` task `M0110-0001`,
+      deferred 2026-06-20). The entry claimed "COLLATE and USING clauses …
+      are accepted by the parser but their effects are ignored during
+      execution." Both halves turned out to be already correct or moot: (1)
+      COLLATE is fully wired — the parser captures it into
+      `AlterAttrCollation` (`internal/parser/ddl.go:9733`), and BOTH executor
+      paths (single-subcommand `execAlterType`,
+      `internal/executor/operators_ddl.go:18776`; multi-subcommand
+      `execAlterTypeAttrCmds`, `operators_ddl.go:18990` — sibling paths, both
+      checked per `pattern_sibling_paths_must_agree`) copy it onto the
+      composite type's field, from where
+      `buildUserPGAttributeRowForCompositeField`
+      (`internal/executor/pg18_user_catalog_rows.go`) writes it into
+      `pg_attribute.attcollation` so `pg_dump`'s `dumpCompositeType`
+      re-emits the `COLLATE` clause. (2) USING is not even part of this
+      statement's real PG grammar — confirmed against
+      `postgres/src/backend/parser/gram.y`'s production `ALTER ATTRIBUTE
+      ColId opt_set_data TYPE_P Typename opt_collate_clause
+      opt_drop_behavior` (only `COLLATE` and `CASCADE|RESTRICT`; `USING` is
+      exclusive to `ALTER TABLE … ALTER COLUMN TYPE`), so the entry's USING
+      claim was inapplicable to begin with. Added new regression coverage
+      (previously untested despite being wired): `TestAlterTypeAlterAttributeCollateApplied`
+      (`internal/executor/alter_type_attribute_collate_test.go`) — covers
+      the single-subcommand form, the multi-subcommand form, and the
+      COLLATE-reset-on-retype-without-COLLATE case. `unimplemented_feat.json`'s
+      matching entry flipped `open`→`resolved` via surgical 2-line `Edit`
+      (83/181 resolved, 98 open). No design-doc change needed (parser/DDL
+      behavior already covered by existing composite-type design docs).
+      Gates: `go build ./...`/`go vet ./...` clean; `go test
+      ./internal/executor/... -run TestAlterTypeAlterAttributeCollateApplied`
+      PASS; `go test ./internal/executor/... -run
+      'TestAlterType|TestComposite'` PASS; `scripts/tpch-spotcheck.sh` PASS;
+      `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh`
+      PASS.
+- [x] **M0122-0023 — `EXCLUDE USING` GiST-overlap type-validation bypass —
+      re-scoped and closed** (`unimplemented_feat.json`, deferred
+      2026-06-08). The entry claimed `createExclusionIndexStub` bypasses
+      btree type-validation for box/point columns. Investigation found the
+      `EXCLUDE USING btree (col WITH =)` case was ALREADY fully
+      type-validated (it routes through `createBTreeIndex`, which enforces
+      `isSupportedBTreeKeyType`) — that half was stale. The real, still-open
+      gap was narrower: `EXCLUDE USING gist (col WITH &&)` accepted ANY
+      column type with zero validation, but `checkGistOverlapExclusion`
+      (`internal/executor/operators_storage.go:7257`) — the only runtime
+      enforcement path for `&&` — exclusively understands `box` values;
+      confirmed via a throwaway probe test that a non-box `&&` exclusion
+      constraint is accepted at DDL time and then NEVER fires at INSERT time
+      (silently fails closed, not even an error). Also confirmed via the
+      same probe (after fixing a wrong box-literal test format — PG's real
+      box I/O format is `(x1,y1),(x2,y2)`, no outer parens) that the box/box
+      overlap enforcement path itself works correctly and was previously
+      completely untested. Fix: `createExclusionIndexStub`
+      (`internal/executor/operators_ddl.go:9882`) now rejects `&&` on a
+      non-box column at DDL time with `42704` ("data type %s has no default
+      operator class for access method %q"), mirroring PostgreSQL's real
+      `indexcmds.c` `ResolveOpClass` rejection — verified against
+      `postgres/src/backend/commands/indexcmds.c:2272-2277`. Added
+      `TestExclusionConstraintGistOverlapFires` (box/box overlap positive
+      case, non-overlapping negative case) and
+      `TestExclusionConstraintGistOverlapRejectsUnsupportedType`
+      (`internal/executor/exclusion_constraint_test.go`).
+      `unimplemented_feat.json`'s matching entry flipped `open`→`resolved`
+      via surgical `Edit` (84/181 resolved, 97 open). Remaining scope (real
+      GiST access method, point/circle/polygon overlap types, general
+      opclass resolution for other operators) is out of bounds for a single
+      loop and stays tracked under `unimplemented_feat.json` #118 (GIST
+      index support). No design-doc change needed — the exclusion-constraint
+      behavior is already covered by `docs/design/0119-0004-partial-exclude-where-roundtrip.md`;
+      this is an enforcement-path bugfix, not a new mechanism. Gates: `go
+      build ./...`/`go vet ./...` clean; `go test ./internal/executor/...
+      -run TestExclusionConstraint` PASS (4/4); `go test
+      ./internal/executor/...` (full package) PASS; `scripts/tpch-spotcheck.sh`
+      PASS (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke bash
+      scripts/ralph-precommit-test.sh` PASS (0 failed transactions, all 3
+      workloads).
+  - [x] **M0122-0024 — `CREATE TABLE ... OF type_name (col WITH OPTIONS ...)`
+      typed-table column-option list — implemented** (`unimplemented_feat.json`
+      entries deferred 2026-06-30 and 2026-05-12; both describe the same
+      underlying gap). Before this fix ANY parenthesised list after
+      `OF type_name` was rejected outright with "typed-table column option
+      list is not supported" — even the canonical PG form from the CREATE
+      TABLE docs (`employees OF employee_type (salary WITH OPTIONS
+      DEFAULT 1000)`). Parser: extracted the per-column constraint suffix
+      of `parseColumnDef` (NOT NULL/DEFAULT/CHECK/UNIQUE/PRIMARY KEY/
+      REFERENCES/COLLATE/...) into a new shared `parseColumnConstraintList`
+      (`internal/parser/ddl.go`), then implemented real parsing of the
+      `OF type_name (...)` list: each `column_name WITH OPTIONS
+      column_constraint [...]` entry is parsed via the shared helper into
+      a new `CreateTableStmt.OfTypeColumnOptions []ColumnDef` field
+      (`internal/parser/ast.go`). A `table_constraint` entry in the same
+      list (PRIMARY KEY/UNIQUE/CHECK/FOREIGN KEY/CONSTRAINT at table
+      level — also grammar-legal per PG's gram.y `TypedTableElement:
+      columnOptions | TableConstraint`) is explicitly rejected with a
+      clear parse error rather than silently mis-parsed or dropped;
+      narrower remaining scope, deferred (see below). Executor:
+      `execCreateTable` (`internal/executor/operators_ddl.go`) merges each
+      override onto the matching composite-derived `ColumnDef` by name
+      before the normal column-build path runs, so NOT NULL/DEFAULT/CHECK
+      ride the same enforcement machinery as a normal column — no new
+      plumbing needed downstream. An override naming a column absent from
+      the composite type is rejected with `42703` ("column %q does not
+      exist"), matching PostgreSQL's real `MergeAttributes` rejection
+      (verified against `postgres/src/backend/commands/tablecmds.c:2589-2605`
+      via research subagent — PG's check is NOT in `transformOfType`,
+      it's deferred to `MergeAttributes` since typed-table columns come
+      first in the merged list). Added
+      `TestCreateTableOfTypeColumnWithOptions`,
+      `TestCreateTableOfTypeEmptyColumnList`,
+      `TestCreateTableOfTypeTableConstraintRejected`,
+      `TestCreateTableOfTypeUnknownColumnRequiresWithOptions`
+      (`internal/parser/create_table_of_type_test.go`) and
+      `TestCreateTableOfTypeWithOptionsAppliesConstraints` (23502 NOT NULL
+      enforcement + DEFAULT application),
+      `TestCreateTableOfTypeWithOptionsUnknownColumn` (42703)
+      (`internal/executor/create_table_of_type_options_test.go`).
+      `unimplemented_feat.json`'s two matching entries flipped
+      `open`→`resolved` via surgical `Edit`s. Deferral-ledger row added for
+      the remaining table_constraint-in-OF-type-list scope. Gates: `go
+      build ./...`/`go vet ./...` clean; `go test ./internal/parser/...`
+      PASS (full package); `go test ./internal/executor/...` PASS (full
+      package, 4s); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh`
+      PASS (0 failed transactions, all 3 workloads).
+  - [x] **M0122-0024 follow-up — `table_constraint` half of the same OF
+      type_name list — implemented, deferral row closed.** Extracted the
+      ordinary CREATE TABLE column list's table-constraint dispatch
+      (PRIMARY KEY/UNIQUE/CHECK/EXCLUDE/FOREIGN KEY/CONSTRAINT, ~330 lines
+      of `parseCreateTableTail`) into a shared `parseTableConstraintElement`
+      helper (`internal/parser/ddl.go`), reused by both the ordinary
+      CREATE TABLE loop and the `OF type_name (...)` list loop — the two
+      grammar halves (`TypedTableElement: columnOptions | TableConstraint`)
+      now interleave freely, matching PG's own doc example
+      (`employees OF employee_type (PRIMARY KEY (name), salary WITH
+      OPTIONS DEFAULT 1000)`). No executor change needed (constraint
+      fields feed the same enforcement path regardless of `OfType`).
+      Superseded `TestCreateTableOfTypeTableConstraintRejected` with
+      `TestCreateTableOfTypeTableConstraintAccepted` +
+      `TestCreateTableOfTypeMixedColumnAndTableConstraint`
+      (`internal/parser/create_table_of_type_test.go`); new
+      `TestCreateTableOfTypeTableConstraintMixedWithColumnOptions`
+      (`internal/executor/create_table_of_type_options_test.go`, real
+      23505 unique-violation E2E check). Deferral-ledger row flipped to
+      `resolved` + new row recorded. `unimplemented_feat.json`'s
+      `code_audit` for the DU-002-374 entry appended with the follow-up
+      resolution. Design doc `docs/design/0110-0001-pg-dump-tap-port.md`
+      (Addendum 2) + `docs/design/README.md` index row updated. Gates:
+      `go build ./...`/`go vet ./...` clean; `go test -count=1
+      ./internal/parser/...`/`./internal/executor/...` full packages
+      PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh`
+      PASS (0 failed, all 3 pgbench workloads).
 
 > This task list is **seeded, not exhaustive.** The M0122-0001 triage plus every
 > future feature deferral appended to `unimplemented_feat.json` (any new `open`

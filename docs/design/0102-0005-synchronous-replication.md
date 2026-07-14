@@ -1,5 +1,9 @@
 # 0102-0005 — Synchronous Replication (`synchronous_standby_names` + commit-wait + standby feedback)
 
+> **perf-optimize3-dash S4 note (2026-07-13)**: the goopg→real-PG sync_remote_apply
+> e2e is DEFERRED under the native-only WAL default (assert-skip unless
+> GOOPG_WAL_CANONICAL=on); goopg→goopg sync replication is unaffected.
+
 **Status:** accepted
 **Date:** 2026-05-13 (drafted), 2026-05-14 (accepted)
 **Milestone:** M0102-0005

@@ -53,7 +53,7 @@ func replayColumnDefaultsRecords(walDir string, cat catalog.Catalog) error {
 		if derr != nil {
 			return fmt.Errorf("decode column-defaults at lsn %d: %w", rec.StartLSN, derr)
 		}
-		tbl, found := im.LookupTableByOID(p.TableOID)
+		tbl, _, found := im.LookupTableByOIDAllDBs(p.TableOID)
 		if !found || tbl == nil {
 			continue // table dropped since the snapshot
 		}

@@ -409,17 +409,81 @@ func TestAnalyzeWindowFrameRowsAccepted(t *testing.T) {
 	}
 }
 
-// TestAnalyzeWindowFrameRangeGroupsRejected pins that RANGE/GROUPS
-// frame units are rejected with 0A000 — only ROWS reaches the
-// executor in this slice (see docs/design/0020-0001-window-parser-and-ast.md).
-func TestAnalyzeWindowFrameRangeGroupsRejected(t *testing.T) {
+// TestAnalyzeWindowFrameRangeOffsetOrderByCount pins that a RANGE value
+// offset bound (PRECEDING/FOLLOWING) requires exactly one ORDER BY column
+// (42P20, mirroring parse_clause.c's transformFrameOffset); a single ORDER
+// BY column analyzes cleanly (the executor applies the in_range arithmetic,
+// see docs/design/0122-0004-range-offset-window-frame.md).
+func TestAnalyzeWindowFrameRangeOffsetOrderByCount(t *testing.T) {
+	cat := analyzerCatalog(t)
+	// Zero ORDER BY columns → 42P20.
+	expectAnalyzeCode(t, cat,
+		"SELECT sum(abalance) OVER (RANGE 5 PRECEDING) FROM pgbench_accounts",
+		"42P20")
+	// Two ORDER BY columns → 42P20.
+	expectAnalyzeCode(t, cat,
+		"SELECT sum(abalance) OVER (ORDER BY aid, bid RANGE BETWEEN 1 PRECEDING AND 2 FOLLOWING) FROM pgbench_accounts",
+		"42P20")
+	// Exactly one ORDER BY column → accepted.
+	accepted := []string{
+		"SELECT sum(abalance) OVER (ORDER BY aid RANGE 5 PRECEDING) FROM pgbench_accounts",
+		"SELECT sum(abalance) OVER (ORDER BY aid RANGE BETWEEN 1 PRECEDING AND 2 FOLLOWING) FROM pgbench_accounts",
+	}
+	for _, sql := range accepted {
+		if err := Analyze(parseOne(t, sql), cat); err != nil {
+			t.Fatalf("Analyze(%q): %v", sql, err)
+		}
+	}
+}
+
+// TestAnalyzeWindowFrameRangeNonOffsetAccepted pins that RANGE with
+// only UNBOUNDED/CURRENT ROW bounds analyzes cleanly — those bounds
+// are purely peer-based and need no value arithmetic
+// (see docs/design/0122-0004-range-window-frame.md).
+func TestAnalyzeWindowFrameRangeNonOffsetAccepted(t *testing.T) {
+	cat := analyzerCatalog(t)
+	queries := []string{
+		"SELECT sum(abalance) OVER (ORDER BY aid RANGE UNBOUNDED PRECEDING) FROM pgbench_accounts",
+		"SELECT sum(abalance) OVER (ORDER BY aid RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM pgbench_accounts",
+		"SELECT sum(abalance) OVER (ORDER BY aid RANGE BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) FROM pgbench_accounts",
+		"SELECT sum(abalance) OVER (ORDER BY aid RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM pgbench_accounts",
+		// RANGE without ORDER BY is legal for non-offset bounds (all
+		// rows are peers → whole partition), unlike GROUPS.
+		"SELECT sum(abalance) OVER (RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM pgbench_accounts",
+	}
+	for _, sql := range queries {
+		if err := Analyze(parseOne(t, sql), cat); err != nil {
+			t.Fatalf("Analyze(%q): %v", sql, err)
+		}
+	}
+}
+
+// TestAnalyzeWindowFrameGroupsAccepted pins that a GROUPS frame clause
+// (any valid bound shape, with an ORDER BY clause present) analyzes
+// cleanly, mirroring TestAnalyzeWindowFrameRowsAccepted.
+func TestAnalyzeWindowFrameGroupsAccepted(t *testing.T) {
+	cat := analyzerCatalog(t)
+	queries := []string{
+		"SELECT sum(abalance) OVER (ORDER BY aid GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM pgbench_accounts",
+		"SELECT sum(abalance) OVER (ORDER BY aid GROUPS UNBOUNDED PRECEDING) FROM pgbench_accounts",
+		"SELECT sum(abalance) OVER (ORDER BY aid GROUPS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) FROM pgbench_accounts",
+		"SELECT first_value(abalance) OVER (ORDER BY aid GROUPS BETWEEN 2 PRECEDING AND 2 FOLLOWING) FROM pgbench_accounts",
+	}
+	for _, sql := range queries {
+		if err := Analyze(parseOne(t, sql), cat); err != nil {
+			t.Fatalf("Analyze(%q): %v", sql, err)
+		}
+	}
+}
+
+// TestAnalyzeWindowFrameGroupsRequiresOrderByRejected pins the spec
+// (and gram.y parse_clause.c) restriction that GROUPS mode requires an
+// ORDER BY clause in the window definition — 42P20.
+func TestAnalyzeWindowFrameGroupsRequiresOrderByRejected(t *testing.T) {
 	cat := analyzerCatalog(t)
 	expectAnalyzeCode(t, cat,
-		"SELECT sum(abalance) OVER (ORDER BY aid RANGE UNBOUNDED PRECEDING) FROM pgbench_accounts",
-		"0A000")
-	expectAnalyzeCode(t, cat,
-		"SELECT sum(abalance) OVER (ORDER BY aid GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM pgbench_accounts",
-		"0A000")
+		"SELECT sum(abalance) OVER (GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM pgbench_accounts",
+		"42P20")
 }
 
 // TestAnalyzeWindowFrameBoundOrderingRejected pins gram.y's

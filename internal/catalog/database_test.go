@@ -29,7 +29,7 @@ func TestNewInMemorySeedsPostgresDatabase(t *testing.T) {
 // flow used by HammerDB's setup path.
 func TestCreateDropDatabaseRoundTrip(t *testing.T) {
 	c := NewInMemory()
-	if err := c.CreateDatabase("tpch"); err != nil {
+	if _, err := c.CreateDatabase("tpch", BootstrapSuperuserOID); err != nil {
 		t.Fatalf("CreateDatabase: %v", err)
 	}
 	if !c.HasDatabase("tpch") {
@@ -47,10 +47,10 @@ func TestCreateDropDatabaseRoundTrip(t *testing.T) {
 // PostgreSQL's behaviour (SQLSTATE 42P04).
 func TestCreateDatabaseDuplicateReturnsErrDatabaseExists(t *testing.T) {
 	c := NewInMemory()
-	if err := c.CreateDatabase("tpch"); err != nil {
+	if _, err := c.CreateDatabase("tpch", BootstrapSuperuserOID); err != nil {
 		t.Fatalf("first CreateDatabase: %v", err)
 	}
-	err := c.CreateDatabase("tpch")
+	_, err := c.CreateDatabase("tpch", BootstrapSuperuserOID)
 	if !errors.Is(err, ErrDatabaseExists) {
 		t.Errorf("second CreateDatabase err = %v, want ErrDatabaseExists", err)
 	}
@@ -73,8 +73,8 @@ func TestDropDatabaseUnknownReturnsErrDatabaseNotFound(t *testing.T) {
 // "database already exists" in that case.
 func TestRegisterDatabaseDuringRecoveryIsIdempotent(t *testing.T) {
 	c := NewInMemory()
-	c.RegisterDatabaseDuringRecovery("tpch")
-	c.RegisterDatabaseDuringRecovery("tpch") // must not panic / error
+	c.RegisterDatabaseDuringRecovery("tpch", BootstrapSuperuserOID, 16385)
+	c.RegisterDatabaseDuringRecovery("tpch", BootstrapSuperuserOID, 16385) // must not panic / error
 	if !c.HasDatabase("tpch") {
 		t.Error("after recovery register, tpch should be present")
 	}
@@ -85,13 +85,13 @@ func TestRegisterDatabaseDuringRecoveryIsIdempotent(t *testing.T) {
 // not the pre-M0054-0001 hard-coded `postgres` row.
 func TestPgDatabaseVirtualRowsEnumeratesRegistry(t *testing.T) {
 	c := NewInMemory()
-	if err := c.CreateDatabase("tpch"); err != nil {
+	if _, err := c.CreateDatabase("tpch", BootstrapSuperuserOID); err != nil {
 		t.Fatalf("CreateDatabase: %v", err)
 	}
 	// Reach directly into the tables map; LookupTable takes a
 	// parser.ObjectName which would pull the parser package into this
 	// test for no real benefit.
-	tbl, ok := c.tables["pg_catalog.pg_database"]
+	tbl, ok := c.ns(DefaultDBOid).tables["pg_catalog.pg_database"]
 	if !ok || tbl.VirtualRows == nil {
 		t.Fatalf("pg_database virtual table not registered")
 	}
@@ -105,6 +105,117 @@ func TestPgDatabaseVirtualRowsEnumeratesRegistry(t *testing.T) {
 	}
 }
 
+// TestCreateDatabaseAllocatesDistinctDisplayedOid pins the M0122-0007
+// physical-storage-isolation slice-1 fix: before this change every
+// non-template database rendered the SAME hardcoded "16384" placeholder in
+// pg_database.oid, so two CREATE DATABASE calls were indistinguishable by
+// oid — a real bug (pg_database.oid is a primary key in upstream PG) and the
+// blocking prerequisite for ever allocating a real base/<dbOid> directory.
+// The live "postgres" row must keep its pre-existing placeholder unchanged
+// (CREATE SUBSCRIPTION's subdbid / datacl heap resync depend on it — see the
+// VirtualRows doc comment), so only newly created, non-bootstrap databases
+// are expected to diverge.
+func TestCreateDatabaseAllocatesDistinctDisplayedOid(t *testing.T) {
+	c := NewInMemory()
+	oidA, err := c.CreateDatabase("dba", BootstrapSuperuserOID)
+	if err != nil {
+		t.Fatalf("CreateDatabase(dba): %v", err)
+	}
+	oidB, err := c.CreateDatabase("dbb", BootstrapSuperuserOID)
+	if err != nil {
+		t.Fatalf("CreateDatabase(dbb): %v", err)
+	}
+	if oidA == 0 || oidB == 0 || oidA == oidB {
+		t.Fatalf("CreateDatabase oids = (%d, %d), want distinct non-zero values", oidA, oidB)
+	}
+	if got := c.DatabaseOid("dba"); got != oidA {
+		t.Errorf("DatabaseOid(dba) = %d, want %d", got, oidA)
+	}
+	if got := c.DatabaseOid("dbb"); got != oidB {
+		t.Errorf("DatabaseOid(dbb) = %d, want %d", got, oidB)
+	}
+	// The bootstrap rows never went through CreateDatabase — DatabaseOid
+	// reports 0 ("no override") for them, same as before this change.
+	if got := c.DatabaseOid("postgres"); got != 0 {
+		t.Errorf("DatabaseOid(postgres) = %d, want 0 (no override)", got)
+	}
+
+	tbl, ok := c.ns(DefaultDBOid).tables["pg_catalog.pg_database"]
+	if !ok || tbl.VirtualRows == nil {
+		t.Fatalf("pg_database virtual table not registered")
+	}
+	byName := map[string]string{}
+	for _, r := range tbl.VirtualRows() {
+		byName[r[1]] = r[0] // r[1] datname, r[0] oid
+	}
+	wantOidA := strconv.FormatUint(uint64(oidA), 10)
+	wantOidB := strconv.FormatUint(uint64(oidB), 10)
+	if byName["dba"] != wantOidA {
+		t.Errorf("pg_database.oid for dba = %q, want %q", byName["dba"], wantOidA)
+	}
+	if byName["dbb"] != wantOidB {
+		t.Errorf("pg_database.oid for dbb = %q, want %q", byName["dbb"], wantOidB)
+	}
+	if byName["dba"] == byName["dbb"] {
+		t.Errorf("dba and dbb rendered the same pg_database.oid %q — must be distinct", byName["dba"])
+	}
+	// The live "postgres" row's displayed oid is unchanged by this slice
+	// (still the legacy 16384 placeholder — see the VirtualRows doc comment
+	// on why it must not diverge).
+	if byName["postgres"] != "16384" {
+		t.Errorf("pg_database.oid for postgres = %q, want unchanged placeholder 16384", byName["postgres"])
+	}
+}
+
+// TestResolveDatabaseOid confirms ResolveDatabaseOid reports the REAL
+// physical oid used to key on-disk storage/ACLs for each database kind, NOT
+// pg_database's displayed-oid placeholder (which TestCreateDatabaseAllocates
+// DistinctDisplayedOid above pins as unchanged for "postgres"). M0122-0007
+// physical-storage-isolation slice 4a.
+func TestResolveDatabaseOid(t *testing.T) {
+	c := NewInMemory()
+	c.SetDBOID(5) // mirrors detectCatalogDBOID's real-world PG18 "postgres" oid
+
+	if oid, ok := c.ResolveDatabaseOid("postgres"); !ok || oid != 5 {
+		t.Errorf("ResolveDatabaseOid(postgres) = (%d, %v), want (5, true)", oid, ok)
+	}
+	if oid, ok := c.ResolveDatabaseOid("template1"); !ok || oid != 1 {
+		t.Errorf("ResolveDatabaseOid(template1) = (%d, %v), want (1, true)", oid, ok)
+	}
+	if oid, ok := c.ResolveDatabaseOid("template0"); !ok || oid != 4 {
+		t.Errorf("ResolveDatabaseOid(template0) = (%d, %v), want (4, true)", oid, ok)
+	}
+
+	created, err := c.CreateDatabase("dba", BootstrapSuperuserOID)
+	if err != nil {
+		t.Fatalf("CreateDatabase(dba): %v", err)
+	}
+	if oid, ok := c.ResolveDatabaseOid("dba"); !ok || oid != created {
+		t.Errorf("ResolveDatabaseOid(dba) = (%d, %v), want (%d, true)", oid, ok, created)
+	}
+
+	if oid, ok := c.ResolveDatabaseOid("no-such-database"); ok || oid != 0 {
+		t.Errorf("ResolveDatabaseOid(no-such-database) = (%d, %v), want (0, false)", oid, ok)
+	}
+}
+
+// TestRegisterDatabaseDuringRecoveryAdvancesNextOID confirms replaying a
+// CREATE DATABASE WAL record (which carries the original real oid, M0122-0007
+// physical-storage-isolation slice 1) advances the catalog's nextOID counter
+// past it — otherwise a later CREATE TABLE/DATABASE in the same process could
+// reallocate an oid a crash-recovered database already owns.
+func TestRegisterDatabaseDuringRecoveryAdvancesNextOID(t *testing.T) {
+	c := NewInMemory()
+	const recoveredOid = 50000
+	c.RegisterDatabaseDuringRecovery("recovered", BootstrapSuperuserOID, recoveredOid)
+	if got := c.DatabaseOid("recovered"); got != recoveredOid {
+		t.Errorf("DatabaseOid(recovered) = %d, want %d", got, recoveredOid)
+	}
+	if c.NextOID() <= recoveredOid {
+		t.Errorf("NextOID() = %d after registering oid %d during recovery, want > %d", c.NextOID(), recoveredOid, recoveredOid)
+	}
+}
+
 // TestPgDatabaseExposesFrozenXidColumns pins the M0117-0008 catalog-parity
 // addition: pg_database now projects datfrozenxid and datminmxid so monitoring
 // queries (`age(datfrozenxid)`) and the intra-grant-inplace-db isolation spec
@@ -112,7 +223,7 @@ func TestPgDatabaseVirtualRowsEnumeratesRegistry(t *testing.T) {
 // bootstrap FrozenTransactionID(2); datminmxid is the FirstMultiXactId(1) floor.
 func TestPgDatabaseExposesFrozenXidColumns(t *testing.T) {
 	c := NewInMemory()
-	tbl, ok := c.tables["pg_catalog.pg_database"]
+	tbl, ok := c.ns(DefaultDBOid).tables["pg_catalog.pg_database"]
 	if !ok {
 		t.Fatalf("pg_database virtual table not registered")
 	}
@@ -209,7 +320,7 @@ func TestResetDatabaseConfigLastEntryDeletesMapKey(t *testing.T) {
 	if _, ok := c.dbRoleSettings[FirstUserOID]; ok {
 		t.Errorf("dbRoleSettings still has a key for %d after its last entry was reset", FirstUserOID)
 	}
-	tbl, ok := c.tables["pg_catalog.pg_db_role_setting"]
+	tbl, ok := c.ns(DefaultDBOid).tables["pg_catalog.pg_db_role_setting"]
 	if !ok || tbl.VirtualRows == nil {
 		t.Fatalf("pg_db_role_setting virtual table not registered")
 	}
@@ -236,7 +347,7 @@ func TestResetAllDatabaseConfigClearsEverything(t *testing.T) {
 // setconfig rendered as a PG-native text[] literal.
 func TestPgDbRoleSettingVirtualRowsProjectsOverrides(t *testing.T) {
 	c := NewInMemory()
-	tbl, ok := c.tables["pg_catalog.pg_db_role_setting"]
+	tbl, ok := c.ns(DefaultDBOid).tables["pg_catalog.pg_db_role_setting"]
 	if !ok || tbl.VirtualRows == nil {
 		t.Fatalf("pg_db_role_setting virtual table not registered")
 	}
@@ -395,7 +506,7 @@ func TestUnregisterRoleDropsRoleConfigRows(t *testing.T) {
 // setrole=0 database row, sorted deterministically by (RoleOID, DBOid).
 func TestPgDbRoleSettingVirtualRowsProjectsRoleOverrides(t *testing.T) {
 	c := NewInMemory()
-	tbl, ok := c.tables["pg_catalog.pg_db_role_setting"]
+	tbl, ok := c.ns(DefaultDBOid).tables["pg_catalog.pg_db_role_setting"]
 	if !ok || tbl.VirtualRows == nil {
 		t.Fatalf("pg_db_role_setting virtual table not registered")
 	}

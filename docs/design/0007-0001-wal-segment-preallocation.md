@@ -98,10 +98,8 @@ when it sees a zero header, and the iterator breaks.
 
 - **`fdatasync` on the commit path.** Separate seam:
   `0007-0002-fdatasync-commit-path.md`.
-- **Eager next-segment lookahead.** When the writer rolls over, the
-  next segment's preallocation happens lazily on first open. Eager
-  lookahead is a follow-up — gives lower commit-path tail latency at
-  rollover but adds a background goroutine.
+- ~~**Eager next-segment lookahead.**~~ Done — see "Follow-up
+  (2026-07-09): eager next-segment lookahead" below.
 - **`wal_recycle` (segment renaming).** Future loop. The recycler
   reuses an old segment file as the next zero-filled one rather than
   unlinking + zero-filling. Requires interaction with retention.
@@ -124,6 +122,128 @@ never double-counts. `Writer.SegmentsPreallocated()` /
 See `internal/wal/wal_test.go`'s `TestPreallocationCounters` and
 `internal/initdb/wal_io_views_test.go`'s
 `TestStatWALIOPreallocationCounters`.
+
+### Follow-up (2026-07-09): eager next-segment lookahead
+
+Closes the "Eager next-segment lookahead" gap named above (M0122-0007
+backlog entry). `state.openSegment(segNo)` now calls
+`state.eagerPreallocSegment(segNo+1)` right after it finishes handling
+`segNo` itself (whether `segNo` was freshly created or already
+existed) — so by the time the writer's own write head rolls over into
+`segNo+1`, that segment's file is (usually) already fully zero-filled
+and `openSegment`'s `os.Stat`-based `wasNew` check finds it in place,
+skipping the synchronous `preallocateSegment` zero-fill on the
+commit-path hot path. Purely a latency optimization: `openSegment`'s
+existing "does the file already exist" check is the only interface
+between the two paths, so a slow, aborted, or lost-race eager job
+changes nothing about correctness — the synchronous path always still
+preallocates `segNo` itself exactly as before if the eager job hasn't
+gotten there first.
+
+**Race-safe by construction.** `eagerPreallocWorker` never writes to
+the final segment path directly. It zero-fills a `<segfile>.eager
+<pid>.tmp` file to `SegmentSize`, fsyncs it, then durably links it
+into place with `os.Link(tmp, final)` — mirroring upstream
+`XLogFileInit`'s create-as-temp-then-link-no-clobber pattern
+(`xlog.c`). `os.Link` returning `EEXIST` (the synchronous path, or a
+second eager attempt, won the race) is treated as success, not an
+error — the file is there either way. `state.eagerInFlight` (guarded
+by `eagerMu`) prevents two concurrent eager jobs for the same segment
+number; `state.eagerWG` lets `close()` wait for any still-running
+eager goroutine before the writer tears down `s.files`, so `Close()`
+never returns while a background preallocation could still be
+touching the WAL directory.
+
+**A new correctness hazard this creates, and its fix.** Before this
+change, the highest-numbered segment file on disk was always exactly
+the segment currently receiving real writes — `detectWritePos`
+(consulted only when a writer reopens, e.g. after a restart) exploited
+this by trusting every *non-last* segment as "fully used" via a cheap
+file-size check, and content-scanning only the literal highest-numbered
+file for the true end-of-WAL. Eager lookahead breaks that assumption:
+a crash between eagerly preallocating `segNo+1` and the writer ever
+really reaching it leaves a fully zero, never-written `segNo+1` file
+sitting *above* the genuinely partially-written `segNo` — the old
+logic would then blindly trust `segNo` as "fully used" (wrong: it's
+only partially written) while content-scanning the empty phantom
+`segNo+1` (right size, wrong file). `detectWritePos` now walks
+backward from the highest segNo, dropping any segment that is *both*
+full-size (`segSize`) *and* scans as entirely empty (0 bytes before
+the first EOS sentinel), until it finds one that isn't — that becomes
+the "real last" segment for the existing (unchanged) scan-the-last-
+segment logic. The full-size guard specifically distinguishes an eager
+phantom from a legitimate legacy short/empty last segment (already
+handled correctly by the pre-existing logic, unchanged) — a
+genuinely-active, preallocated-but-partially-written segment can never
+be mistaken for a phantom because a real record stream never starts
+with a zero header (`Writer.Append` rejects empty payloads, so the
+very first byte of genuine content is never part of the EOS sentinel
+pattern). At most one phantom can exist at a time in practice (eager
+lookahead only ever preallocates one segment ahead of the one
+currently in real use), but the trim loop tolerates more defensively.
+
+Tests: `internal/wal/writer_detect_test.go`'s
+`TestDetectWritePos_IgnoresEagerPhantomFutureSegment` (writes a real,
+partially-filled segment 0 via the writer, waits for its own eager job
+to finish creating segment 1, closes, and asserts `detectWritePos`
+returns segment 0's true end rather than segment 0's full size);
+confirmed non-vacuous by reverting the trim loop locally (fails with
+the exact predicted `writePos` overshoot). `internal/wal/wal_test.go`'s
+`TestPreallocationCounters` updated to `w.stateRef.eagerWG.Wait()`
+before each count assertion and re-derive the expected totals (one
+segment ahead of the pre-eager-lookahead numbers) instead of
+implicitly relying on the background goroutine losing a race it had
+no guaranteed way to lose. `internal/wal/pg_waldump_compat_test.go`'s
+`TestPGWaldumpParsesEmittedWAL` now names an explicit STARTSEG
+argument rather than bare `-p walDir` — with a second real segment
+file now present, pg_waldump's own directory-only auto-detect mode
+(`identify_target_directory(waldir, NULL)`, `pg_waldump.c`) picks
+"any WAL-looking file" via unordered `readdir()`, which can hand it
+the all-zero segment 1 and misread its zeroed long-page-header as
+`xlp_seg_size=0`; naming the exact start segment is the standard,
+unambiguous way to invoke pg_waldump against a known LSN range and
+sidesteps this pre-existing upstream tool quirk entirely (real
+PostgreSQL WAL directories have the same kind of preallocated future
+segment during normal operation).
+
+**Review finding, fixed same loop:** an independent review of this
+change caught a genuine goroutine/leak race in the first cut of
+`close()` — `eagerWG.Wait()` originally ran *before* `flushUpTo`, but
+with `Config.WALBuffers > 0` (the default), `Append` only touches the
+in-memory buffer; nothing reaches `openSegment` until something drains
+it. If nothing had drained the buffer before `Close()`, `close()`'s own
+`flushUpTo` call became the *first* caller of `openSegment` for one or
+more segments — and `openSegment` unconditionally kicks off a
+brand-new eager job for the segment after whichever one it just
+opened, with zero chance to have started before the earlier
+`Wait()` already returned. `Close()` could then return while that
+fresh goroutine was still writing into the WAL directory. Fixed by
+moving `eagerWG.Wait()` to run *after* `flushUpTo`, not before it — the
+only remaining caller of `openSegment` inside `close()`. New test
+`internal/wal/writer_detect_test.go`'s
+`TestClose_WaitsForEagerJobTriggeredByItsOwnFlush` (buffers everything
+via a large `WALBuffers`, appends across two segment boundaries so
+`flushUpTo` opens both for the first time, then asserts the
+eager-triggered next segment is already fully sized the instant
+`Close()` returns, no explicit wait) — confirmed non-vacuous by
+reverting the ordering locally (fails ~95% of runs, a genuine race,
+not a rare corner case).
+
+Gates: `go build ./...` clean;
+`go test ./internal/wal/...` and `go test -race ./internal/wal/...`
+PASS; `go test ./internal/initdb/...` PASS (no regression in the
+Init+Open+restart recovery suites); `scripts/tpch-spotcheck.sh` PASS
+(Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+scripts/ralph-precommit-test.sh` PASS (0 failed transactions, all 3
+workloads).
+
+**Deliberately out of scope:** no new GUC gates this — it only ever
+activates when `Config.Preallocate` (`wal_init_zero`) is already on,
+matching that GUC's own default-on posture, so a dedicated on/off
+toggle for the lookahead specifically wasn't judged worth a second
+knob. `posix_fallocate`-based zero-fill (both the synchronous and
+eager paths still do a 64 KiB `WriteAt` loop) remains a separate,
+already-named follow-up.
 
 ### Recovery semantics
 

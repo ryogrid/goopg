@@ -68,11 +68,24 @@ func (s *SCRAMSecret) EncodedSalt() string {
 // development and tests; production deployments will store the
 // already-derived form.
 func NewSCRAMSecret(password string) (*SCRAMSecret, error) {
+	return NewSCRAMSecretWithIterations(password, scramDefaultIterations)
+}
+
+// NewSCRAMSecretWithIterations derives a SCRAMSecret using an explicit
+// iteration count, mirroring upstream's CreateRole/encrypt_password path
+// which reads the scram_iterations GUC (postgres/src/backend/commands/
+// user.c, postgres/src/common/scram-common.c scram_build_secret) instead
+// of always using SCRAM_SHA_256_DEFAULT_ITERATIONS. A non-positive count
+// falls back to scramDefaultIterations.
+func NewSCRAMSecretWithIterations(password string, iterations int) (*SCRAMSecret, error) {
+	if iterations <= 0 {
+		iterations = scramDefaultIterations
+	}
 	salt := make([]byte, scramDefaultSaltLen)
 	if _, err := rand.Read(salt); err != nil {
 		return nil, fmt.Errorf("scram salt: %w", err)
 	}
-	return scramBuildSecret(password, salt, scramDefaultIterations), nil
+	return scramBuildSecret(saslPrepOrOriginal(password), salt, iterations), nil
 }
 
 // ParseSCRAMSecret parses an upstream-format rolpassword string. The
@@ -164,7 +177,7 @@ func scramBuildSecret(password string, salt []byte, iter int) *SCRAMSecret {
 // Used by the cleartext path against a SCRAM-shadowed credential —
 // matches scram_verify_plain_password in upstream.
 func (s *SCRAMSecret) VerifySCRAMSecretFromPassword(password string) bool {
-	c := scramBuildSecret(password, s.Salt, s.Iterations)
+	c := scramBuildSecret(saslPrepOrOriginal(password), s.Salt, s.Iterations)
 	return subtle.ConstantTimeCompare(c.StoredKey, s.StoredKey) == 1
 }
 
@@ -190,6 +203,13 @@ type SCRAMServer struct {
 
 	clientNonce string
 	serverNonce string
+
+	// cbindFlag is the gs2-cbind-flag byte ('n' or 'y') the client sent
+	// in client-first-message. Retained so client-final's c= attribute can
+	// be verified to echo the SAME flag (RFC 5802 §5.1 / auth-scram.c's
+	// read_client_final_message), preventing a MITM from tampering with the
+	// negotiated channel-binding flag when no binding is in use.
+	cbindFlag byte
 
 	// authMessage = client-first-bare + "," + server-first + "," + client-final-without-proof
 	// (RFC 5802 §3, used for verifying the client proof and computing the
@@ -280,6 +300,9 @@ func (s *SCRAMServer) handleClientFirst(input []byte) ([]byte, error) {
 	case "n", "y":
 		// Acceptable: "n" = client doesn't support binding;
 		// "y" = client supports binding but server didn't advertise PLUS.
+		// Remember which flag was sent so client-final's c= can be
+		// verified to echo the identical flag (downgrade protection).
+		s.cbindFlag = cbindFlag[0]
 	default:
 		// "p=..." (channel binding requested) is not supported until
 		// TLS lands; reject explicitly.
@@ -334,8 +357,8 @@ func (s *SCRAMServer) handleClientFinal(input []byte) ([]byte, error) {
 	if !ok {
 		return nil, errors.New("scram: missing c= channel attribute")
 	}
-	if !validNoBindingChannelAttr(channel) {
-		return nil, errors.New("scram: unsupported channel-binding response")
+	if !validNoBindingChannelAttr(channel, s.cbindFlag) {
+		return nil, errors.New("scram: unexpected channel-binding attribute in client-final-message")
 	}
 	r, ok := attrs["r"]
 	if !ok || r != s.clientNonce+s.serverNonce {
@@ -404,14 +427,21 @@ func cutLastAttr(s, prefix string) (before, attr string, ok bool) {
 //
 // Anything else (a "p=..." gs2 header, an unexpected authzid) is
 // rejected.
-func validNoBindingChannelAttr(c string) bool {
+func validNoBindingChannelAttr(c string, cbindFlag byte) bool {
 	bytes, err := base64.StdEncoding.DecodeString(c)
 	if err != nil {
 		return false
 	}
+	// When no channel binding is in use, the client repeats its original
+	// gs2-cbind-flag in the c= attribute: "n,," for flag 'n' and "y,," for
+	// flag 'y'. The flag MUST match the one sent in client-first-message,
+	// mirroring auth-scram.c's read_client_final_message — accepting the
+	// other spelling would let a MITM tamper with the negotiated flag.
 	switch string(bytes) {
-	case "n,,", "y,,":
-		return true
+	case "n,,":
+		return cbindFlag == 'n'
+	case "y,,":
+		return cbindFlag == 'y'
 	}
 	return false
 }

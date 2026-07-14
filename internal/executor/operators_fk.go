@@ -448,7 +448,7 @@ func runAllDeferredFKChecks(ctx *Context, checks []DeferredFKCheck) error {
 		defer func() { ctx.Snap = savedSnap }()
 	}
 	for _, check := range checks {
-		childTbl, ok := im.LookupTable(parser.ObjectName{Name: check.ChildTableName})
+		childTbl, ok := im.LookupTable(parser.ObjectName{Name: check.ChildTableName}, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid))
 		if !ok {
 			continue
 		}
@@ -580,7 +580,7 @@ func assertParentExists(ctx *Context, fkOwnerTbl *catalog.Table, reportTbl *cata
 	if !ok {
 		return nil
 	}
-	parentTbl, ok := im.LookupTable(parser.ObjectName{Name: fk.RefTable})
+	parentTbl, ok := im.LookupTable(parser.ObjectName{Name: fk.RefTable}, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid))
 	if !ok {
 		return nil // referenced table not found (CREATE TABLE out of order) — skip
 	}
@@ -656,7 +656,7 @@ func checkFKColumnTypeCompatibility(ctx *Context, childTbl *catalog.Table, fk ca
 		return nil
 	}
 	// Look up the referenced table.
-	refTbl, found := ctx.Catalog.LookupTable(parser.ObjectName{Name: fk.RefTable})
+	refTbl, found := ctx.Catalog.LookupTable(parser.ObjectName{Name: fk.RefTable}, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid))
 	if !found || refTbl == nil {
 		return nil
 	}
@@ -665,7 +665,7 @@ func checkFKColumnTypeCompatibility(ctx *Context, childTbl *catalog.Table, fk ca
 	if len(fk.RefColumns) > 0 {
 		refColName = fk.RefColumns[0]
 	} else {
-		for _, idx := range ctx.Catalog.IndexesOnTable(refTbl) {
+		for _, idx := range ctx.Catalog.IndexesOnTable(refTbl, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)) {
 			if idx.Primary && len(idx.Columns) > 0 {
 				refColName = idx.Columns[0]
 				break
@@ -738,7 +738,7 @@ func assertNoChildRows(ctx *Context, childTbl *catalog.Table, fk catalog.Foreign
 		refCols := fk.RefColumns
 		if len(refCols) == 0 {
 			if parentTbl, ok2 := ctx.Catalog.(*catalog.InMemory); ok2 {
-				if pt, ok3 := parentTbl.LookupTable(parser.ObjectName{Name: fk.RefTable}); ok3 {
+				if pt, ok3 := parentTbl.LookupTable(parser.ObjectName{Name: fk.RefTable}, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)); ok3 {
 					refCols = pkColumns(pt)
 				}
 			}

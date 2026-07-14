@@ -217,8 +217,11 @@ var builtinProcs = []builtinProcRow{
 //   - prosrc: function body source.
 //   - probin: on-disk binary path for C-language functions; always NULL
 //     (goopg has no C functions). dumpFunc reads it to emit `AS '<probin>'`.
-//   - proconfig: per-function GUC SET clauses (text[]); always NULL — goopg
-//     tracks no per-function SET, so dumpFunc emits no `SET ...` lines.
+//   - proconfig: per-function GUC SET clauses (text[]). User-defined routines
+//     render CREATE/ALTER FUNCTION/PROCEDURE/ROUTINE ... SET overrides
+//     (Routine.Config, DU-002 follow-up to M0097-0150); built-ins/aggregates
+//     always NULL (they can never have a SET clause), so dumpFunc emits no
+//     `SET ...` lines for those rows.
 //   - procost: planner's estimated per-row execution cost (float4). Mirrors
 //     PG's CREATE FUNCTION default — 1 for internal/C-language functions,
 //     100 for all others. goopg stores no explicit cost, so it derives this
@@ -406,7 +409,7 @@ func registerPgProcView(cat *catalog.InMemory) error {
 				prokind,
 				retset,
 				"",       // probin: NULL (goopg has no C-language functions)
-				"",       // proconfig: NULL (goopg tracks no per-function GUC SET)
+				catalog.RoutineConfigArrayLiteral(r.Config), // proconfig: CREATE/ALTER FUNCTION ... SET, else NULL. DU-002 follow-up to M0097-0150.
 				procost,  // procost: language-derived (1 internal/C, else 100)
 				prorows,  // prorows: 1000 for SRFs, 0 otherwise
 				"",       // protrftypes: NULL (goopg supports no transforms)

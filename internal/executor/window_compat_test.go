@@ -966,3 +966,465 @@ func TestCompatWindowFrameNegativeOffsetRejected(t *testing.T) {
 		t.Fatalf("err=%v want ExecError 22013", err)
 	}
 }
+
+// TestCompatWindowExplicitGroupsFrameSliding pins GROUPS-mode frame
+// arithmetic — bounds counted in ORDER BY peer groups rather than rows
+// (M0122-0004 RANGE/GROUPS follow-up) — against duplicate-key data so
+// GROUPS genuinely diverges from an equivalent ROWS frame. grp=1 has
+// three peer groups on val (10,10 / 20 / 30,30); grp=2 has two
+// singleton groups (100 / 200). Cross-checked against a real
+// PostgreSQL 18.3 instance (`GROUPS BETWEEN 1 PRECEDING AND 1
+// FOLLOWING`): sliding={20,20,20,30,30}→{40,40,100,80,80},
+// fv={10,10,10,20,20}, lv={20,20,30,30,30}.
+func TestCompatWindowExplicitGroupsFrameSliding(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE t (grp int, val int)"); err != nil {
+		t.Fatal(err)
+	}
+	tbl, _ := ctx.Catalog.LookupTable(parser.ObjectName{Name: "t"})
+	rel := ctx.Catalog.RelFileNode(tbl)
+	seed := []Row{
+		{{Kind: KindInt, Int: 1}, {Kind: KindInt, Int: 10}},
+		{{Kind: KindInt, Int: 1}, {Kind: KindInt, Int: 10}},
+		{{Kind: KindInt, Int: 1}, {Kind: KindInt, Int: 20}},
+		{{Kind: KindInt, Int: 1}, {Kind: KindInt, Int: 30}},
+		{{Kind: KindInt, Int: 1}, {Kind: KindInt, Int: 30}},
+		{{Kind: KindInt, Int: 2}, {Kind: KindInt, Int: 100}},
+		{{Kind: KindInt, Int: 2}, {Kind: KindInt, Int: 200}},
+	}
+	for _, r := range seed {
+		if err := writeHeapRow(ctx, rel, tbl.Columns, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	rows := runQuery(t, ctx,
+		"SELECT grp, val, "+
+			"sum(val) OVER w AS sliding, "+
+			"first_value(val) OVER w AS fv, "+
+			"last_value(val) OVER w AS lv, "+
+			"count(*) OVER w AS cnt "+
+			"FROM t "+
+			"WINDOW w AS (PARTITION BY grp ORDER BY val GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING) "+
+			"ORDER BY grp, val")
+	want := []struct{ grp, val, sliding, fv, lv, cnt int64 }{
+		{1, 10, 40, 10, 20, 3},
+		{1, 10, 40, 10, 20, 3},
+		{1, 20, 100, 10, 30, 5},
+		{1, 30, 80, 20, 30, 3},
+		{1, 30, 80, 20, 30, 3},
+		{2, 100, 300, 100, 200, 2},
+		{2, 200, 300, 100, 200, 2},
+	}
+	if len(rows) != len(want) {
+		t.Fatalf("rows=%d want %d", len(rows), len(want))
+	}
+	for i, w := range want {
+		got := []int64{rows[i][0].Int, rows[i][1].Int, rows[i][2].Int, rows[i][3].Int, rows[i][4].Int, rows[i][5].Int}
+		wantVals := []int64{w.grp, w.val, w.sliding, w.fv, w.lv, w.cnt}
+		for col, g := range got {
+			if rows[i][col].Kind != KindInt || g != wantVals[col] {
+				t.Fatalf("row[%d]=%+v want %v", i, rows[i], wantVals)
+			}
+		}
+	}
+}
+
+// TestCompatWindowGroupsUnboundedPrecedingCumulative pins the default
+// end-bound (CURRENT ROW, which in GROUPS mode means the current row's
+// last peer) for a cumulative `GROUPS UNBOUNDED PRECEDING` frame —
+// cross-checked against a real PostgreSQL 18.3 instance: val
+// {10,10,20,30,30} → cum {20,20,40,100,100}.
+func TestCompatWindowGroupsUnboundedPrecedingCumulative(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE t (val int)"); err != nil {
+		t.Fatal(err)
+	}
+	tbl, _ := ctx.Catalog.LookupTable(parser.ObjectName{Name: "t"})
+	rel := ctx.Catalog.RelFileNode(tbl)
+	seed := []Row{
+		{{Kind: KindInt, Int: 10}},
+		{{Kind: KindInt, Int: 10}},
+		{{Kind: KindInt, Int: 20}},
+		{{Kind: KindInt, Int: 30}},
+		{{Kind: KindInt, Int: 30}},
+	}
+	for _, r := range seed {
+		if err := writeHeapRow(ctx, rel, tbl.Columns, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	rows := runQuery(t, ctx,
+		"SELECT val, sum(val) OVER (ORDER BY val GROUPS UNBOUNDED PRECEDING) AS cum FROM t ORDER BY val")
+	want := []int64{20, 20, 40, 100, 100}
+	if len(rows) != len(want) {
+		t.Fatalf("rows=%d want %d", len(rows), len(want))
+	}
+	for i, w := range want {
+		if rows[i][1].Kind != KindInt || rows[i][1].Int != w {
+			t.Fatalf("row[%d]=%+v want cum=%d", i, rows[i], w)
+		}
+	}
+}
+
+// TestCompatWindowExplicitRangePeers pins RANGE-mode frame arithmetic
+// for the non-offset bound kinds (M0122-0004 RANGE follow-up). RANGE
+// CURRENT ROW means "the current row and ALL its ORDER BY peers"
+// (unlike ROWS, where CURRENT ROW is the single row) — so on
+// duplicate-key data it genuinely diverges from an equivalent ROWS
+// frame. Uses the same seed as the GROUPS test; grp=1 has three peer
+// groups on val (10,10 / 20 / 30,30). Every expectation below was
+// cross-checked against a real PostgreSQL 18.3 instance.
+func TestCompatWindowExplicitRangePeers(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE t (grp int, val int)"); err != nil {
+		t.Fatal(err)
+	}
+	tbl, _ := ctx.Catalog.LookupTable(parser.ObjectName{Name: "t"})
+	rel := ctx.Catalog.RelFileNode(tbl)
+	seed := []Row{
+		{{Kind: KindInt, Int: 1}, {Kind: KindInt, Int: 10}},
+		{{Kind: KindInt, Int: 1}, {Kind: KindInt, Int: 10}},
+		{{Kind: KindInt, Int: 1}, {Kind: KindInt, Int: 20}},
+		{{Kind: KindInt, Int: 1}, {Kind: KindInt, Int: 30}},
+		{{Kind: KindInt, Int: 1}, {Kind: KindInt, Int: 30}},
+		{{Kind: KindInt, Int: 2}, {Kind: KindInt, Int: 100}},
+		{{Kind: KindInt, Int: 2}, {Kind: KindInt, Int: 200}},
+	}
+	for _, r := range seed {
+		if err := writeHeapRow(ctx, rel, tbl.Columns, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// RANGE BETWEEN CURRENT ROW AND CURRENT ROW: the whole peer group.
+	rows := runQuery(t, ctx,
+		"SELECT grp, val, "+
+			"sum(val) OVER w AS s, "+
+			"count(*) OVER w AS c, "+
+			"first_value(val) OVER w AS fv, "+
+			"last_value(val) OVER w AS lv "+
+			"FROM t "+
+			"WINDOW w AS (PARTITION BY grp ORDER BY val RANGE BETWEEN CURRENT ROW AND CURRENT ROW) "+
+			"ORDER BY grp, val")
+	want := []struct{ grp, val, s, c, fv, lv int64 }{
+		{1, 10, 20, 2, 10, 10},
+		{1, 10, 20, 2, 10, 10},
+		{1, 20, 20, 1, 20, 20},
+		{1, 30, 60, 2, 30, 30},
+		{1, 30, 60, 2, 30, 30},
+		{2, 100, 100, 1, 100, 100},
+		{2, 200, 200, 1, 200, 200},
+	}
+	if len(rows) != len(want) {
+		t.Fatalf("rows=%d want %d", len(rows), len(want))
+	}
+	for i, w := range want {
+		got := []int64{rows[i][0].Int, rows[i][1].Int, rows[i][2].Int, rows[i][3].Int, rows[i][4].Int, rows[i][5].Int}
+		wantVals := []int64{w.grp, w.val, w.s, w.c, w.fv, w.lv}
+		for col, g := range got {
+			if rows[i][col].Kind != KindInt || g != wantVals[col] {
+				t.Fatalf("row[%d]=%+v want %v", i, rows[i], wantVals)
+			}
+		}
+	}
+
+	// RANGE BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING: from the start
+	// of the current peer group through the partition end — grp=1 →
+	// {100,100,80,60,60} (contrast the cumulative default frame).
+	rows2 := runQuery(t, ctx,
+		"SELECT val, sum(val) OVER (PARTITION BY grp ORDER BY val "+
+			"RANGE BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) AS r "+
+			"FROM t WHERE grp = 1 ORDER BY val")
+	wantR := []int64{100, 100, 80, 60, 60}
+	if len(rows2) != len(wantR) {
+		t.Fatalf("rows2=%d want %d", len(rows2), len(wantR))
+	}
+	for i, w := range wantR {
+		if rows2[i][1].Kind != KindInt || rows2[i][1].Int != w {
+			t.Fatalf("rows2[%d]=%+v want r=%d", i, rows2[i], w)
+		}
+	}
+
+	// RANGE without ORDER BY: all rows are peers → the whole partition
+	// for every row (legal for non-offset RANGE, unlike GROUPS).
+	rows3 := runQuery(t, ctx,
+		"SELECT val, sum(val) OVER (PARTITION BY grp "+
+			"RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS s "+
+			"FROM t WHERE grp = 1 ORDER BY val")
+	for i := range rows3 {
+		if rows3[i][1].Kind != KindInt || rows3[i][1].Int != 100 {
+			t.Fatalf("rows3[%d]=%+v want s=100", i, rows3[i])
+		}
+	}
+}
+
+// TestCompatWindowRangeUnboundedPrecedingCumulative pins the default
+// frame spelled explicitly (RANGE BETWEEN UNBOUNDED PRECEDING AND
+// CURRENT ROW): cumulative, peer-inclusive. Cross-checked against a
+// real PostgreSQL 18.3 instance: val {10,10,20,30,30} → cum
+// {20,20,40,100,100} (identical to the GROUPS UNBOUNDED PRECEDING
+// case, since both treat CURRENT ROW as the whole peer group).
+func TestCompatWindowRangeUnboundedPrecedingCumulative(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE t (val int)"); err != nil {
+		t.Fatal(err)
+	}
+	tbl, _ := ctx.Catalog.LookupTable(parser.ObjectName{Name: "t"})
+	rel := ctx.Catalog.RelFileNode(tbl)
+	seed := []Row{
+		{{Kind: KindInt, Int: 10}},
+		{{Kind: KindInt, Int: 10}},
+		{{Kind: KindInt, Int: 20}},
+		{{Kind: KindInt, Int: 30}},
+		{{Kind: KindInt, Int: 30}},
+	}
+	for _, r := range seed {
+		if err := writeHeapRow(ctx, rel, tbl.Columns, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	rows := runQuery(t, ctx,
+		"SELECT val, sum(val) OVER (ORDER BY val RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cum FROM t ORDER BY val")
+	want := []int64{20, 20, 40, 100, 100}
+	if len(rows) != len(want) {
+		t.Fatalf("rows=%d want %d", len(rows), len(want))
+	}
+	for i, w := range want {
+		if rows[i][1].Kind != KindInt || rows[i][1].Int != w {
+			t.Fatalf("row[%d]=%+v want cum=%d", i, rows[i], w)
+		}
+	}
+}
+
+// TestCompatWindowRangeValueOffset pins RANGE-mode frames with a value
+// offset bound (M0122-0004 follow-up): a row is in the frame when its
+// ORDER BY value falls within currentValue±offset (PostgreSQL's in_range),
+// unlike ROWS (physical row count) or GROUPS (peer-group count). Every
+// expectation below was cross-checked byte-for-byte against a live
+// PostgreSQL 18.3 instance.
+func TestCompatWindowRangeValueOffset(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE t (val int)"); err != nil {
+		t.Fatal(err)
+	}
+	tbl, _ := ctx.Catalog.LookupTable(parser.ObjectName{Name: "t"})
+	rel := ctx.Catalog.RelFileNode(tbl)
+	// Distinct-value seed 1,3,5,7 exercises gapped value arithmetic.
+	for _, v := range []int64{1, 3, 5, 7} {
+		if err := writeHeapRow(ctx, rel, tbl.Columns, Row{{Kind: KindInt, Int: v}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Symmetric: RANGE BETWEEN 2 PRECEDING AND 2 FOLLOWING → value in
+	// [cur-2, cur+2]. 1→{1,3}=4; 3→{1,3,5}=9; 5→{3,5,7}=15; 7→{5,7}=12.
+	assertRangeSums(t, ctx,
+		"SELECT val, sum(val) OVER (ORDER BY val RANGE BETWEEN 2 PRECEDING AND 2 FOLLOWING) AS s FROM t ORDER BY val",
+		[]int64{4, 9, 15, 12})
+
+	// Preceding-and-current: [cur-2, cur]. 1→{1}=1; 3→{1,3}=4;
+	// 5→{3,5}=8; 7→{5,7}=12.
+	assertRangeSums(t, ctx,
+		"SELECT val, sum(val) OVER (ORDER BY val RANGE BETWEEN 2 PRECEDING AND CURRENT ROW) AS s FROM t ORDER BY val",
+		[]int64{1, 4, 8, 12})
+
+	// Asymmetric: [cur-1, cur+2]. 1→{1,3}=4; 3→{3,5}=8; 5→{5,7}=12;
+	// 7→{7}=7.
+	assertRangeSums(t, ctx,
+		"SELECT val, sum(val) OVER (ORDER BY val RANGE BETWEEN 1 PRECEDING AND 2 FOLLOWING) AS s FROM t ORDER BY val",
+		[]int64{4, 8, 12, 7})
+
+	// DESC ordering: the frame set is the same value window [cur-2,cur+2],
+	// so the per-row sums match the ASC symmetric case, in val-desc order.
+	// 7→{5,7}=12; 5→{3,5,7}=15; 3→{1,3,5}=9; 1→{1,3}=4.
+	assertRangeSums(t, ctx,
+		"SELECT val, sum(val) OVER (ORDER BY val DESC RANGE BETWEEN 2 PRECEDING AND 2 FOLLOWING) AS s FROM t ORDER BY val DESC",
+		[]int64{12, 15, 9, 4})
+}
+
+// TestCompatWindowRangeValueOffsetPeersAndFrameFuncs pins peer handling
+// (duplicate ORDER BY values share a frame) and first_value/last_value
+// under a value-offset RANGE frame, cross-checked against PostgreSQL 18.3.
+func TestCompatWindowRangeValueOffsetPeersAndFrameFuncs(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE t (val int)"); err != nil {
+		t.Fatal(err)
+	}
+	tbl, _ := ctx.Catalog.LookupTable(parser.ObjectName{Name: "t"})
+	rel := ctx.Catalog.RelFileNode(tbl)
+	for _, v := range []int64{1, 3, 3, 5} {
+		if err := writeHeapRow(ctx, rel, tbl.Columns, Row{{Kind: KindInt, Int: v}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING → value in [cur-1, cur+1].
+	// 1→{1}=1,c1; 3→{3,3}=6,c2; 3→{3,3}=6,c2; 5→{5}=5,c1.
+	rows := runQuery(t, ctx,
+		"SELECT val, sum(val) OVER w AS s, count(*) OVER w AS c, "+
+			"first_value(val) OVER w AS fv, last_value(val) OVER w AS lv "+
+			"FROM t WINDOW w AS (ORDER BY val RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING) "+
+			"ORDER BY val")
+	want := []struct{ val, s, c, fv, lv int64 }{
+		{1, 1, 1, 1, 1},
+		{3, 6, 2, 3, 3},
+		{3, 6, 2, 3, 3},
+		{5, 5, 1, 5, 5},
+	}
+	if len(rows) != len(want) {
+		t.Fatalf("rows=%d want %d", len(rows), len(want))
+	}
+	for i, w := range want {
+		got := []int64{rows[i][0].Int, rows[i][1].Int, rows[i][2].Int, rows[i][3].Int, rows[i][4].Int}
+		wv := []int64{w.val, w.s, w.c, w.fv, w.lv}
+		for col, g := range got {
+			if rows[i][col].Kind != KindInt || g != wv[col] {
+				t.Fatalf("row[%d]=%+v want %v", i, rows[i], wv)
+			}
+		}
+	}
+}
+
+// TestCompatWindowRangeValueOffsetNulls pins NULL handling for value-offset
+// RANGE frames: a non-null current row never frames a null-valued row, and
+// a null current row's frame is exactly its null peer block. Cross-checked
+// against PostgreSQL 18.3 (ORDER BY val → NULLS LAST for ASC).
+func TestCompatWindowRangeValueOffsetNulls(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE t (val int)"); err != nil {
+		t.Fatal(err)
+	}
+	tbl, _ := ctx.Catalog.LookupTable(parser.ObjectName{Name: "t"})
+	rel := ctx.Catalog.RelFileNode(tbl)
+	seed := []Row{{{Kind: KindInt, Int: 1}}, {{Kind: KindInt, Int: 3}}, {NullDatum}}
+	for _, r := range seed {
+		if err := writeHeapRow(ctx, rel, tbl.Columns, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Sorted ASC NULLS LAST: 1, 3, NULL. RANGE BETWEEN 1 PRECEDING AND 1
+	// FOLLOWING. 1→{1}=1,c1; 3→{3}=3,c1; NULL→null peer block {NULL}:
+	// sum(val)=NULL, count(*)=1.
+	rows := runQuery(t, ctx,
+		"SELECT val, sum(val) OVER w AS s, count(*) OVER w AS c "+
+			"FROM t WINDOW w AS (ORDER BY val RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING) "+
+			"ORDER BY val")
+	if len(rows) != 3 {
+		t.Fatalf("rows=%d want 3", len(rows))
+	}
+	// row 0: val=1
+	if rows[0][0].Int != 1 || rows[0][1].Int != 1 || rows[0][2].Int != 1 {
+		t.Fatalf("row0=%+v want val=1 s=1 c=1", rows[0])
+	}
+	// row 1: val=3
+	if rows[1][0].Int != 3 || rows[1][1].Int != 3 || rows[1][2].Int != 1 {
+		t.Fatalf("row1=%+v want val=3 s=3 c=1", rows[1])
+	}
+	// row 2: val=NULL, sum=NULL, count=1
+	if !rows[2][0].IsNull() {
+		t.Fatalf("row2 val=%+v want NULL", rows[2][0])
+	}
+	if !rows[2][1].IsNull() {
+		t.Fatalf("row2 sum=%+v want NULL", rows[2][1])
+	}
+	if rows[2][2].Kind != KindInt || rows[2][2].Int != 1 {
+		t.Fatalf("row2 count=%+v want 1", rows[2][2])
+	}
+}
+
+// TestWindowRangeOffsetNegative pins the runtime 22013 for a negative RANGE
+// offset (PostgreSQL rejects it inside every in_range function).
+func TestWindowRangeOffsetNegative(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE t (val int)"); err != nil {
+		t.Fatal(err)
+	}
+	tbl, _ := ctx.Catalog.LookupTable(parser.ObjectName{Name: "t"})
+	rel := ctx.Catalog.RelFileNode(tbl)
+	if err := writeHeapRow(ctx, rel, tbl.Columns, Row{{Kind: KindInt, Int: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := runQueryWithErr(ctx,
+		"SELECT sum(val) OVER (ORDER BY val RANGE BETWEEN -1 PRECEDING AND CURRENT ROW) FROM t")
+	if err == nil {
+		t.Fatal("want error for negative RANGE offset, got nil")
+	}
+	if ee, ok := err.(*ExecError); !ok || ee.Code != "22013" {
+		t.Fatalf("err=%v want ExecError 22013", err)
+	}
+}
+
+// TestRangeOffsetNegativeIntervalSign pins that a RANGE interval offset's
+// validity is decided by its linear span (interval_sign), NOT the sign of any
+// individual month/day/micro component — matching in_range_interval_interval /
+// interval_cmp_value in PostgreSQL's timestamp.c. An offset like '1 mon -10 days'
+// has a +20-day span and is a valid (positive) offset even though its day field
+// is negative; the pre-fix per-component heuristic wrongly rejected it (22013).
+func TestRangeOffsetNegativeIntervalSign(t *testing.T) {
+	const usecPerDay = int64(24 * 60 * 60 * 1_000_000)
+	cases := []struct {
+		name         string
+		months       int32
+		days         int32
+		micros       int64
+		wantNegative bool
+	}{
+		// Net span > 0 → accepted (this is the edge the old heuristic broke).
+		{"1mon_minus_10days", 1, -10, 0, false}, // 30-10 = +20 days
+		{"minus_10days_plus_1mon_micros", 1, -10, 5, false},
+		{"pure_positive_days", 0, 5, 0, false},
+		{"pure_positive_micros", 0, 0, 123, false},
+		{"zero_interval", 0, 0, 0, false}, // span 0 is not negative
+		// Net span < 0 → rejected.
+		{"minus_1mon_10days", -1, 10, 0, true}, // -30+10 = -20 days
+		{"pure_negative_day", 0, -1, 0, true},
+		{"pure_negative_micros", 0, 0, -1, true},
+		{"positive_days_negative_micros_net_pos", 0, 1, -usecPerDay / 2, false}, // +0.5 day
+		{"one_day_minus_one_day_micros_net_zero", 0, 1, -usecPerDay, false},     // +1 day -1 day = span 0
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			iv := NewIntervalDatumFull(c.months, c.days, c.micros)
+			got := rangeOffsetNegative(iv)
+			if got != c.wantNegative {
+				t.Fatalf("rangeOffsetNegative(%d mon %d day %d us) = %v, want %v",
+					c.months, c.days, c.micros, got, c.wantNegative)
+			}
+		})
+	}
+}
+
+// assertRangeSums runs sql (whose second projected column is a sum) and
+// checks the per-row sums against want.
+func assertRangeSums(t *testing.T, ctx *Context, sql string, want []int64) {
+	t.Helper()
+	rows := runQuery(t, ctx, sql)
+	if len(rows) != len(want) {
+		t.Fatalf("%s: rows=%d want %d", sql, len(rows), len(want))
+	}
+	for i, w := range want {
+		if rows[i][1].Kind != KindInt || rows[i][1].Int != w {
+			t.Fatalf("%s: row[%d]=%+v want s=%d", sql, i, rows[i], w)
+		}
+	}
+}

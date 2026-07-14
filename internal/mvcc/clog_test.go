@@ -74,6 +74,11 @@ func TestCLogPersistence(t *testing.T) {
 	if err := c1.SetAborted(storage.TransactionID(4)); err != nil {
 		t.Fatalf("SetAborted(4): %v", err)
 	}
+	// C2-S3: commit-path writes are memory-only; persistence rides on the
+	// flush points (checkpoint/eviction). Flush before the reopen.
+	if err := c1.FlushAll(); err != nil {
+		t.Fatalf("FlushAll: %v", err)
+	}
 
 	// Reopen.
 	c2, err := OpenCLog(filepath.Join(dir, "pg_xact"))
@@ -124,6 +129,9 @@ func TestCLogIsEmpty(t *testing.T) {
 	}
 	if err := c.SetCommitted(FirstNormalTransactionID); err != nil {
 		t.Fatalf("SetCommitted(%d): %v", FirstNormalTransactionID, err)
+	}
+	if err := c.FlushAll(); err != nil { // C2-S3: IsEmpty scans on-disk SLRU state
+		t.Fatalf("FlushAll: %v", err)
 	}
 	if c.IsEmpty() {
 		t.Error("clog should not be empty after write")
@@ -293,6 +301,9 @@ func TestCLogMarkUnknownAsAbortedBatchedSLRU(t *testing.T) {
 	// Re-derive statuses purely from the on-disk SLRU (the durable mirror) via
 	// an independent decode. This proves the batched write encoded every lane
 	// correctly.
+	if err := c.FlushAll(); err != nil { // C2-S1: SLRU bytes reach disk at flush points
+		t.Fatalf("FlushAll: %v", err)
+	}
 	fresh := freshFromSLRU(t, slruDir)
 	checks := []struct {
 		xid  storage.TransactionID

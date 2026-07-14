@@ -62,11 +62,19 @@ const (
 	InitFork          ForkNumber = 3
 )
 
-// RelFileNode is the (database, relation, fork) triple used by smgr to
-// resolve a backing file. Upstream calls this RelFileLocator; we keep
-// the older name because it's shorter and the v0 codebase doesn't yet
+// RelFileNode is the (tablespace, database, relation, fork) tuple used by
+// smgr to resolve a backing file. Upstream calls this RelFileLocator; we
+// keep the older name because it's shorter and the v0 codebase doesn't yet
 // have to disambiguate from upstream's variants.
+//
+// TblOid is 0 for the default tablespace (mirrors catalog.Table.Tablespace/
+// catalog.Index.Tablespace's "0 means pg_default" convention — see
+// resolveTablespaceClause in internal/executor/operators_ddl.go), in which
+// case the file resolves under the existing base/<DBOid>/ layout unchanged.
+// A non-zero TblOid routes through pg_tblspc/<TblOid>/... (M0122-0007
+// tablespace physical relocation).
 type RelFileNode struct {
+	TblOid uint32
 	DBOid  uint32
 	RelOid uint32
 	Fork   ForkNumber

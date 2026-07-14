@@ -1,0 +1,6 @@
+lsn0=0/C875FE40 lsn1=1/2CE14DF8 wal_bytes_delta=1684754360
+pg_stat_wal before: 
+pg_stat_wal after:  
+number of transactions actually processed: 935297
+latency average = 3.208 ms
+tps = 15586.263613 (without initial connection time)

@@ -394,3 +394,138 @@ used by range-type defaults), plus the reverse OID→name lookup, wired
 into both the live `VirtualRows` builder and
 `buildUserPGIndexRow`/`DecodePGIndexPhysicalRow`. See the deferral
 ledger's 2026-07-08 "follow-up 2 of 2" row for the full resume point.
+
+## Follow-up 3 (2026-07-08): opclass/collation name↔OID registry
+
+### Fix
+
+Built the registry the previous follow-up's "still deferred" section called
+for. `internal/catalog/catalog.go` gained:
+
+- `builtinColumnOpclassOIDs` — a builtin btree-opclass name→OID table (e.g.
+  `int4_ops`→1978, `text_pattern_ops`→4217, `varchar_pattern_ops`→4218),
+  verified against a real PostgreSQL 18.3 instance's `pg_opclass` (most of
+  these are genbki-autonumbered, not BKI-frozen in `pg_opclass.dat`, so the
+  only trustworthy source is a live oracle query, not the `.dat` file alone).
+- `defaultColumnOpclassNameForType` — the implicit default opclass PG picks
+  per column type (e.g. a plain `varchar` column's default is `text_ops`, not
+  a dedicated `varchar_ops` — also oracle-verified via `CREATE INDEX` +
+  reading `pg_index.indclass` back).
+- `ResolveIndexColumnOpclassOID(explicitName, typeName, methodOID)` /
+  `ResolveIndexColumnCollationOID(explicitName)` — exported `*InMemory`
+  methods that check user-created classes/collations (`CREATE OPERATOR
+  CLASS`/`CREATE COLLATION`) before the builtin tables, added to the
+  `catalog.Catalog` interface.
+
+Both the live `pg_index` `VirtualRows` builder and `buildUserPGIndexRow`
+(`internal/executor/pg18_user_catalog_rows.go`, the heap-row writer used by
+`syncIndexToCatalogHeap`/`resyncIndexHeapRow`) now call these SAME two
+methods instead of each having its own (previously each wrong in a
+different way: `VirtualRows` used a hardcoded, PG-inaccurate per-type OID
+switch that ignored `ColOpClasses` entirely; `buildUserPGIndexRow` always
+wrote all-zero `indclass`/`indcollation` regardless of
+`ColOpClasses`/`ColCollations`).
+
+goopg has no native hash access method (`Index.DeclaredHash`'s doc
+comment: a `USING hash` index is built on the btree substrate, so `Method`
+never becomes `"hash"`), so only the btree opclass table is needed.
+
+### Tests
+
+`TestPgIndexIndclassIndcollation` (`internal/catalog/catalog_test.go`):
+creates a 2-column index with the first column's opclass/collation unset
+(default-type fallback) and the second explicitly
+`text_pattern_ops`/`COLLATE "C"`, then asserts the live `pg_index`
+`VirtualRows` row renders `indclass="1978 4217"` /
+`indcollation="0 950"`. Live end-to-end verification against the real
+`cmd/goopg` binary via `psql`: `CREATE INDEX ... (body text_pattern_ops)`
+→ indclass=4217; `CREATE INDEX ... (note COLLATE "C" varchar_pattern_ops)`
+→ indclass=4218, indcollation=950; a plain `int4` column → indclass=1978
+(default) — all match a real PostgreSQL 18.3 instance queried as the
+oracle for this fix.
+
+### Gates run (this follow-up)
+
+- `go build ./...` / `go vet ./...` clean.
+- `go test ./internal/catalog/... ./internal/executor/... ./internal/initdb/...
+  ./internal/planner/... ./internal/wal/...` PASS.
+- `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33).
+- `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh` PASS
+  (0 failed transactions, all 3 workloads).
+
+### Still deferred
+
+The heap-row WRITE side is now correct, but the READ/decode side is not:
+`catalog.PGIndexRow`/`DecodePGIndexPhysicalRow` (`internal/catalog/codec.go`)
+still do not decode `indclass`/`indcollation` bytes, so
+`internal/initdb/open.go`'s `loadUserIndexesFromHeap` cannot reconstruct
+`idx.ColOpClasses`/`ColCollations` (the name strings) after a *checkpointed*
+restart — those two fields silently revert to empty even though the heap
+row itself now carries the correct OIDs. An uncheckpointed crash restart is
+unaffected (the WAL `CreateIndexPayload` extension block already carries
+`ColOpClasses`/`ColCollations` as name strings directly, replayed via
+`RegisterIndexDuringRecovery`, no OID round-trip involved). See the
+deferral ledger's 2026-07-08 "follow-up 3" row for the full resume point.
+
+## Follow-up 4 (2026-07-08): heap-decode of indclass/indcollation
+
+### Fix
+
+Closed follow-up 3's "still deferred" gap — the checkpointed-restart READ
+side. `internal/catalog/codec.go`:
+
+- `PGIndexRow` gained `IndCollation`/`IndClass []uint32`.
+- `DecodePGIndexPhysicalRow` now decodes both oidvector columns via a new
+  `decodePGIndexOIDVector` helper (mirrors the existing int2vector decode
+  used for `indkey`/`indoption` — same 24-byte header, 4-byte elements
+  instead of 2-byte) instead of walking past them unread.
+
+`internal/catalog/catalog.go` gained the reverse-lookup siblings of follow-up
+3's forward resolvers:
+
+- `ResolveIndexColumnOpclassName(oid, typeName, methodOID) string` — checks
+  user-created operator classes first, then inverts `builtinColumnOpclassOIDs`.
+  Returns `""` when `oid` equals the column type's own implicit default
+  opclass OID, mirroring how the forward direction never records an explicit
+  name for that case — this matches real PostgreSQL's own indclass-vs-default
+  comparison in `ruleutils.c`'s `pg_get_indexdef_worker`, so the round-trip
+  through an OID is lossless in exactly the same sense PG's own is (PG has no
+  separate name-string field either — the OID *is* its source of truth).
+- `ResolveIndexColumnCollationName(oid) string` — the collation-side sibling;
+  `oid == 0` returns `""` since `ResolveIndexColumnCollationOID` only ever
+  writes a nonzero `indcollation` for an explicit `COLLATE` clause.
+
+Both were added to the `catalog.Catalog` interface. `internal/initdb/open.go`'s
+`loadUserIndexesFromHeap` Pass 3 now computes per-key-column
+`ColOpClasses`/`ColCollations` slices from the decoded `indClass`/`indCollation`
+OIDs (using the fixed `"btree"` access-method OID, matching the hardcoded
+`"btree"` method this recovery driver already passes to
+`RegisterIndexDuringRecovery`) and threads them through, instead of the `nil,
+nil` it always passed before.
+
+### Tests
+
+`TestCreateIndexOpclassAndCollationSurviveCheckpointedRestart`
+(`internal/initdb/index_ddl_recovery_test.go`): creates
+`CREATE INDEX ... (body text_pattern_ops, note COLLATE "C" varchar_pattern_ops)`,
+gracefully closes the runtime (checkpointed restart — the exact gap follow-up
+3 identified), reopens, and asserts `idx.ColOpClasses` /
+`idx.ColCollations` survive. Confirmed non-vacuous via `git stash` on the 3
+impl files (fails with the predicted symptom: both slices empty/wrong).
+
+### Gates run (this follow-up)
+
+- `go build ./...` / `go vet ./...` clean.
+- `go test ./internal/catalog/... ./internal/executor/... ./internal/initdb/...
+  ./internal/planner/... ./internal/wal/... ./internal/parser/...
+  ./internal/server/...` PASS.
+- `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33).
+- `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh` PASS
+  (0 failed transactions, all 3 workloads, run twice).
+
+### Still deferred
+
+None known. The M0122-0006 index-restart-persistence cluster (column
+ordering, predicate/INCLUDE/nulls-not-distinct, opclass/collation — across
+both the WAL-crash and checkpointed-restart recovery paths) has no open
+residual as of this follow-up.

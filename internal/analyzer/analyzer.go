@@ -1240,7 +1240,15 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 			return catalog.Type{}, err
 		}
 		switch x.Op {
-		case parser.OpUnaryPos, parser.OpUnaryNeg:
+		case parser.OpUnaryNeg:
+			// Unary minus accepts numeric operands and also `interval`
+			// (interval_um, unimplemented_feat #5(d-iv)); PG has no unary
+			// `+ interval` operator, so OpUnaryPos below stays numeric-only.
+			if !isNumericLike(opTyp) && !strings.EqualFold(opTyp.Name, "interval") {
+				return catalog.Type{}, analyzeError(x.Pos(), "42804", fmt.Sprintf("operator %s requires a numeric operand", x.Op))
+			}
+			return opTyp, nil
+		case parser.OpUnaryPos:
 			if !isNumericLike(opTyp) {
 				return catalog.Type{}, analyzeError(x.Pos(), "42804", fmt.Sprintf("operator %s requires a numeric operand", x.Op))
 			}
@@ -1295,13 +1303,25 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 				isConcreteTimestampLike(leftTyp) && isConcreteTimestampLike(rightTyp) {
 				lname := pgTimeName(leftTyp.Name)
 				rname := pgTimeName(rightTyp.Name)
-				// timetz has no + or - operator at all; other time types are "not unique".
+				// timetz has no + or - operator at all (upstream defines neither),
+				// so both directions raise "operator does not exist" (42883).
 				if strings.EqualFold(leftTyp.Name, "timetz") || strings.EqualFold(rightTyp.Name, "timetz") {
 					ae := analyzeError(x.Pos(), "42883",
 						fmt.Sprintf("operator does not exist: %s %s %s", lname, x.Op, rname))
 					ae.Hint = "No operator matches the given name and argument types. You might need to add explicit type casts."
 					return catalog.Type{}, ae
 				}
+				// Subtraction of two temporal values → interval (timestamp_mi /
+				// time_mi). goopg represents DATE internally as a timestamp, so
+				// date − date also yields an interval here rather than upstream's
+				// integer day count (date_mi) — a deliberate, documented
+				// divergence deferred to the type system (see deferral_ledger.md).
+				// Executor: subTimeTime in internal/executor/expr.go.
+				if x.Op == parser.OpSub {
+					return catalog.Type{Name: "interval"}, nil
+				}
+				// Addition of two temporal values is not defined in PG:
+				// "operator is not unique" (42725) — multiple candidates.
 				ae := analyzeError(x.Pos(), "42725",
 					fmt.Sprintf("operator is not unique: %s %s %s", lname, x.Op, rname))
 				ae.Hint = "Could not choose a best candidate operator. You might need to add explicit type casts."
@@ -1322,6 +1342,12 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 			if isPgLSN(rightTyp) && (isNumericLike(leftTyp) || isUnknownType(leftTyp)) &&
 				x.Op == parser.OpAdd {
 				return catalog.Type{Name: "pg_lsn"}, nil
+			}
+			// interval ± interval → interval (interval_pl / interval_mi).
+			// Executor: addIntervalInterval in internal/executor/expr.go.
+			if strings.EqualFold(leftTyp.Name, "interval") && strings.EqualFold(rightTyp.Name, "interval") &&
+				(x.Op == parser.OpAdd || x.Op == parser.OpSub) {
+				return catalog.Type{Name: "interval"}, nil
 			}
 			if !isNumericLike(leftTyp) || !isNumericLike(rightTyp) {
 				return catalog.Type{}, analyzeError(x.Pos(), "42804", fmt.Sprintf("operator %s requires numeric operands", x.Op))
@@ -1609,7 +1635,7 @@ func analyzeWindowFuncCall(x *parser.FuncCall, ctx *scope) (catalog.Type, error)
 			return catalog.Type{}, err
 		}
 	}
-	if err := validateWindowFrame(x.Over.Frame, x.Over.Pos(), ctx); err != nil {
+	if err := validateWindowFrame(x.Over.Frame, x.Over.Pos(), len(x.Over.OrderBy), ctx); err != nil {
 		return catalog.Type{}, err
 	}
 	return retType, nil
@@ -1618,19 +1644,52 @@ func analyzeWindowFuncCall(x *parser.FuncCall, ctx *scope) (catalog.Type, error)
 // validateWindowFrame validates a parsed window frame clause's mode
 // and bound ordering (SQL:2003 <window frame clause>), mirroring
 // gram.y's frame_extent/frame_bound reduce-time checks — all
-// ERRCODE_WINDOWING_ERROR (42P20) — plus this v0's RANGE/GROUPS scope
-// limitation (0A000). Returns nil for a nil frame (no explicit frame
-// clause was written — the default frame applies). Also type-checks
-// (but does not range-check) any offset expressions; the executor
-// mirrors LIMIT's pattern of range/null-checking a once-evaluated
-// constant expression at runtime (22004/22013), since an offset can't
-// be validated until it's evaluated.
-func validateWindowFrame(fr *parser.WindowFrame, pos int, ctx *scope) error {
+// ERRCODE_WINDOWING_ERROR (42P20) — plus this v0's RANGE-with-offset
+// scope limitation (0A000; ROWS, GROUPS, and RANGE with only
+// UNBOUNDED/CURRENT ROW bounds are implemented, see
+// internal/executor/operators_window.go). Returns nil for a nil frame
+// (no explicit frame clause was written — the default frame applies).
+// Also type-checks (but does not range-check) any offset expressions;
+// the executor mirrors LIMIT's pattern of range/null-checking a
+// once-evaluated constant expression at runtime (22004/22013), since
+// an offset can't be validated until it's evaluated.
+func validateWindowFrame(fr *parser.WindowFrame, pos int, orderByLen int, ctx *scope) error {
 	if fr == nil {
 		return nil
 	}
-	if fr.Mode != parser.FrameModeRows {
-		return analyzeError(pos, "0A000", "RANGE and GROUPS window frame units are not supported in v0; only ROWS is implemented")
+	switch fr.Mode {
+	case parser.FrameModeRows:
+		// No additional mode-specific restriction.
+	case parser.FrameModeGroups:
+		// Per spec (and gram.y's post-parse check in parse_clause.c),
+		// GROUPS mode requires an ORDER BY clause in the window
+		// definition — its frame bounds are counted in ORDER BY peer
+		// groups, which are undefined without one.
+		if orderByLen == 0 {
+			return analyzeError(pos, "42P20", "GROUPS mode requires an ORDER BY clause")
+		}
+	case parser.FrameModeRange:
+		// RANGE with a value offset bound (RANGE BETWEEN n PRECEDING /
+		// FOLLOWING) compares the ORDER BY column value against
+		// value±offset, which needs type-aware +/-/< operator lookup on
+		// the single ORDER BY column (still deferred — see the ledger).
+		// RANGE with only UNBOUNDED and CURRENT ROW bounds is purely
+		// peer-based (CURRENT ROW means "the current row and all its
+		// ORDER BY peers"), identical to the default frame's semantics
+		// and to GROUPS mode's non-offset behavior, so it is supported.
+		if fr.StartKind == parser.FrameBoundOffsetPreceding || fr.StartKind == parser.FrameBoundOffsetFollowing ||
+			fr.EndKind == parser.FrameBoundOffsetPreceding || fr.EndKind == parser.FrameBoundOffsetFollowing {
+			// A RANGE value offset bound (RANGE BETWEEN n PRECEDING /
+			// FOLLOWING) compares the ORDER BY column value against
+			// value±offset, so the comparison target must be unambiguous:
+			// exactly one ORDER BY column is required. parse_clause.c's
+			// transformFrameOffset enforces the same check (42P20).
+			if orderByLen != 1 {
+				return analyzeError(pos, "42P20", "RANGE with offset PRECEDING/FOLLOWING requires exactly one ORDER BY column")
+			}
+		}
+	default:
+		return analyzeError(pos, "0A000", "unsupported window frame mode")
 	}
 	if fr.StartKind == parser.FrameBoundUnboundedFollowing {
 		return analyzeError(pos, "42P20", "frame start cannot be UNBOUNDED FOLLOWING")

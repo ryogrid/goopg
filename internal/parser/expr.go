@@ -158,7 +158,35 @@ func (*GroupingCall) exprNode()  {}
 type IntervalLit struct {
 	pos   int
 	Value string // verbatim numeric body of the literal (e.g. "90")
-	Unit  string // lower-cased unit: "day"/"month"/"year"
+	Unit  string // lower-cased singular unit: "day"/"month"/"year"/"hour"/...
+
+	// Qualified marks the trailing-qualifier form `interval 'N' <unit>`
+	// (Form 1), where the unit is an SQL interval typmod field that
+	// truncates the value to that field's granularity — e.g.
+	// `interval '1.5' hour` = 01:00:00. The embedded-string form
+	// `interval '1.5 hours'` (Form 2) carries no typmod (Qualified=false)
+	// and keeps the fractional remainder (01:30:00). See the executor's
+	// evalIntervalLit / truncIntervalToUnit.
+	Qualified bool
+
+	// HasPrec/Prec carry an explicit fractional-seconds precision from a
+	// SECOND(p) typmod field (`interval '1.23456789' second(2)` → 00:00:01.23,
+	// `interval '5' minute to second(3)`). Set only when the trailing qualifier
+	// ends in SECOND with a parenthesised precision; the executor rounds the
+	// micros to 10^(6-p) via AdjustIntervalForTypmod (postgres timestamp.c).
+	// unimplemented_feat #5(d-iv, interval typmod range/precision grammar).
+	HasPrec bool
+	Prec    int
+
+	// PreComputed marks a multi-field / HH:MM:SS embedded body
+	// (`interval '1 day 05:00:00'`, `interval '1 year 2 mons 3 days'`) that
+	// tryTypedLiteral decoded via ParseIntervalBody (unimplemented_feat
+	// #5(b)). When set, PreMonths/PreDays/PreMicros hold the final interval
+	// components and Value/Unit/Qualified are unused.
+	PreComputed bool
+	PreMonths   int32
+	PreDays     int32
+	PreMicros   int64
 }
 
 func (e *IntervalLit) Pos() int { return e.pos }

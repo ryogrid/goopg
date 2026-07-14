@@ -69,10 +69,15 @@ type SeqParams struct {
 }
 
 // SequenceParamsFunc is set by the executor at init. Given a sequence's
-// schema-qualified name (e.g. "public.s") it returns that sequence's
-// pg_sequence parameters. nil until the executor registers it (catalog-only
-// unit tests then see an empty pg_sequence). M0110-0001 (DU-002 slice 115).
-var SequenceParamsFunc func(qualifiedName string) (SeqParams, bool)
+// schema-qualified name (e.g. "public.s") and the owning connection's dbOid,
+// it returns that sequence's pg_sequence parameters. nil until the executor
+// registers it (catalog-only unit tests then see an empty pg_sequence). The
+// dbOid parameter was added by M0122-0007 4e follow-up 34 so pg_sequence and
+// pg_depend's sequence-ownership rows can resolve a CREATE DATABASE'd
+// connection's own sequences instead of always DefaultDBOid's; every
+// existing call site before that follow-up passed no dbOid and implicitly
+// meant DefaultDBOid. M0110-0001 (DU-002 slice 115).
+var SequenceParamsFunc func(qualifiedName string, dbOid uint32) (SeqParams, bool)
 
 // Type is the textual type tag plus an optional typmod argument list.
 // v0 keeps types as strings so the planner doesn't need a real type
@@ -314,6 +319,19 @@ type Table struct {
 	// storage paths; when zero, goopg falls back to OID (its native layout).
 	RelFileNodeOID uint32
 
+	// DBOid is the real physical database oid this table's namespace was
+	// created under (the value CreateTable's variadic dbOid resolved via
+	// resolveDBOid — already NamespaceDBOid-translated by every executor
+	// call site, so "postgres" tables carry DefaultDBOid here, matching
+	// c.ns(DefaultDBOid)). RelFileNode/IndexRelFileNode read it to stamp
+	// storage.RelFileNode.DBOid per-table instead of the single process-wide
+	// InMemory.dbOid, so physical storage finally separates per database
+	// (M0122-0007 4d-ii-part-2b item 2). Zero for tables never routed through
+	// CreateTable (every virtual pg_catalog/information_schema table — none
+	// of which have physical storage, so RelFileNode falls back to
+	// InMemory.dbOid for them, preserving pre-existing behavior).
+	DBOid uint32
+
 	// Virtual marks tables that don't live on the heap. The planner
 	// short-circuits SeqScan into a materialised Values node by
 	// calling VirtualRows() at plan time. v0 uses this for the
@@ -505,6 +523,17 @@ type Table struct {
 	// Unlogged / Temp track relpersistence. 'u' for UNLOGGED, 't' for TEMP, 'p' for permanent.
 	Unlogged bool
 	Temp     bool
+
+	// Tablespace is the pg_class.reltablespace value: 0 (InvalidOid) means the
+	// table lives in the database's default tablespace (pg_default), matching
+	// upstream's convention of storing 0 rather than the tablespace's own OID
+	// in that case (heap_create, RelationInitTableAccessMethod). A non-zero
+	// value is the OID of an explicit `CREATE TABLE ... TABLESPACE name`
+	// clause. goopg does not relocate the relation's physical storage into the
+	// tablespace's directory — this is catalog metadata only (dump/`\d+`
+	// fidelity), matching the pre-existing CREATE TABLESPACE scope decision.
+	// M0122-0007.
+	Tablespace uint32
 
 	// ReplicaIdentity is the single-char pg_class.relreplident code set by
 	// `ALTER TABLE ... REPLICA IDENTITY {DEFAULT|FULL|NOTHING|USING INDEX idx}`:
@@ -1035,19 +1064,23 @@ func tableHasToastRelation(t *Table) bool {
 // toastRelidOffset) to its schema-qualified name `pg_toast.pg_toast_<parentOID>`,
 // matching PG's regclassout for a relation in the pg_toast namespace (which is
 // never in search_path, hence always schema-qualified). The synthetic TOAST
-// pg_class row lives only in the virtual builder's output, not in c.tables, so
+// pg_class row lives only in the virtual builder's output, not in c.ns(DefaultDBOid).tables, so
 // `reltoastrelid::regclass` cannot find it via tableByOID and must reconstruct
 // the name here. Returns false when the OID is below the TOAST range or its
 // parent table owns no auto-exposed TOAST relation. M0118-0008 TOAST-exposure
-// slice 2 (design 0118-0084).
-func (c *InMemory) ToastRelName(oid uint32) (string, bool) {
+// slice 2 (design 0118-0084). dbOid (default DefaultDBOid, mirroring every
+// other per-dbOid lookup in this file) scopes the parent-table resolution to
+// the connection's own database namespace — M0122-0007 4e follow-up 33
+// (oid::regclass cast direction, previously hardcoded to DefaultDBOid).
+func (c *InMemory) ToastRelName(oid uint32, dbOid ...uint32) (string, bool) {
+	resolved := resolveDBOid(dbOid)
 	// The TOAST index range [200M, 300M) sits above the TOAST relation range
 	// [100M, 200M); check it first. The index name is pg_toast_<parentOID>_index.
 	if oid >= toastIndexOidOffset {
 		parentOID := oid - toastIndexOidOffset
 		c.mu.RLock()
 		defer c.mu.RUnlock()
-		t, ok := c.tableByOID(parentOID)
+		t, ok := c.tableByOID(parentOID, resolved)
 		if !ok || !tableHasToastRelation(t) {
 			return "", false
 		}
@@ -1059,7 +1092,7 @@ func (c *InMemory) ToastRelName(oid uint32) (string, bool) {
 	parentOID := oid - toastRelidOffset
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	t, ok := c.tableByOID(parentOID)
+	t, ok := c.tableByOID(parentOID, resolved)
 	if !ok || !tableHasToastRelation(t) {
 		return "", false
 	}
@@ -1112,7 +1145,7 @@ func (c *InMemory) LookupToastRel(schema, name string) (oid uint32, isIndex bool
 		} else {
 			parentOID = ov - toastRelidOffset
 		}
-		if t, found := c.tableByOID(parentOID); found && tableHasToastRelation(t) {
+		if t, found := c.tableByOID(parentOID, DefaultDBOid); found && tableHasToastRelation(t) {
 			return ov, idx, true
 		}
 	}
@@ -1132,7 +1165,7 @@ func (c *InMemory) LookupToastRel(schema, name string) (oid uint32, isIndex bool
 		return 0, false, false
 	}
 	parentOID := uint32(pOID)
-	t, found := c.tableByOID(parentOID)
+	t, found := c.tableByOID(parentOID, DefaultDBOid)
 	if !found || !tableHasToastRelation(t) {
 		return 0, false, false
 	}
@@ -1162,7 +1195,7 @@ func (c *InMemory) ToastParentTable(toastOID uint32) (*Table, bool) {
 	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	t, ok := c.tableByOID(parentOID)
+	t, ok := c.tableByOID(parentOID, DefaultDBOid)
 	if !ok || !tableHasToastRelation(t) {
 		return nil, false
 	}
@@ -1182,7 +1215,7 @@ func (c *InMemory) ToastParentTable(toastOID uint32) (*Table, bool) {
 func (c *InMemory) ToastRelFileNode(parentRel storage.RelFileNode) (storage.RelFileNode, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	t, ok := c.tableByOID(parentRel.RelOid)
+	t, ok := c.tableByOID(parentRel.RelOid, DefaultDBOid)
 	if !ok || !tableHasToastRelation(t) {
 		return storage.RelFileNode{}, false
 	}
@@ -1191,27 +1224,29 @@ func (c *InMemory) ToastRelFileNode(parentRel storage.RelFileNode) (storage.RelF
 	return toast, true
 }
 
-// toastBearingTables returns every relation that owns an auto-exposed TOAST
-// relation, under the SAME visibility filter the pg_class virtual builder
-// applies to its main table loop (non-virtual ordinary tables plus
-// materialized views and user sequences/views are admitted to the loop;
+// toastBearingTables returns every relation in dbOid's namespace that owns an
+// auto-exposed TOAST relation, under the SAME visibility filter the pg_class
+// virtual builder applies to its main table loop (non-virtual ordinary tables
+// plus materialized views and user sequences/views are admitted to the loop;
 // tableHasToastRelation then keeps only relkind 'r'/'m'). The pg_class builder
 // emits the synthetic relkind='t' TOAST row and relkind='i' TOAST-index row for
 // exactly this set, so the pg_index builder must enumerate the same set or the
 // two catalogs diverge (an indexrelid with no matching pg_class row). Returned
 // tables share the registry's backing storage; callers must only read.
-// M0118-0008 TOAST-exposure slice 3.
-func (c *InMemory) toastBearingTables() []*Table {
+// M0118-0008 TOAST-exposure slice 3; dbOid-parameterized by M0122-0007 4e
+// follow-up 26 (PGIndexRowsForDBOid) — its lone caller now threads a
+// per-connection dbOid instead of always DefaultDBOid.
+func (c *InMemory) toastBearingTables(dbOid uint32) []*Table {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	keys := make([]string, 0, len(c.tables))
-	for k := range c.tables {
+	keys := make([]string, 0, len(c.ns(dbOid).tables))
+	for k := range c.ns(dbOid).tables {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
 	out := make([]*Table, 0)
 	for _, k := range keys {
-		t := c.tables[k]
+		t := c.ns(dbOid).tables[k]
 		// Mirror the pg_class main-loop skip: drop system-catalog virtual
 		// tables but keep user views, matviews and sequences (which
 		// tableHasToastRelation subsequently rejects unless they are 'r'/'m').
@@ -1593,6 +1628,18 @@ type Index struct {
 	Method  string
 	Primary bool
 	OID     uint32
+	// Tablespace is the pg_class.reltablespace value for this index: 0
+	// (InvalidOid) means the database default. Set by `CREATE INDEX ...
+	// TABLESPACE name` or `ALTER INDEX ... SET TABLESPACE name`. Catalog
+	// metadata only (mirrors Table.Tablespace) — not yet WAL-persisted, so it
+	// resets to 0 after a restart (ledger row, M0122-0007). No physical
+	// relocation of the index's on-disk file happens either.
+	Tablespace uint32
+	// DBOid mirrors Table.DBOid: the real physical database oid this index's
+	// namespace was created under, read by IndexRelFileNode instead of the
+	// single process-wide InMemory.dbOid (M0122-0007 4d-ii-part-2b item 2).
+	// Zero falls back to InMemory.dbOid, same convention as Table.DBOid.
+	DBOid uint32
 	// DeclaredHash records that the index was created `USING hash`. goopg has no
 	// native hash access method — a hash index is built on the B-tree substrate,
 	// so Method stays "btree" (catalog/pg_am/pg_dump unchanged) — but a
@@ -1785,21 +1832,21 @@ func (i *Index) QualifiedName() string {
 
 // Catalog is the lookup interface the planner uses.
 type Catalog interface {
-	LookupTable(name parser.ObjectName) (*Table, bool)
+	LookupTable(name parser.ObjectName, dbOid ...uint32) (*Table, bool)
 	LookupColumn(table *Table, name string) (*Column, bool)
-	LookupIndex(name parser.ObjectName) (*Index, bool)
-	CreateTable(name parser.ObjectName, cols []Column) (*Table, error)
-	CreateIndex(name parser.ObjectName, table *Table, cols []string, unique bool, method string, primary bool) (*Index, error)
-	CreateView(name parser.ObjectName, cols []Column, aliases []string, query *parser.SelectStmt, orReplace bool) (*Table, error)
-	DropView(name parser.ObjectName, ifExists bool) error
+	LookupIndex(name parser.ObjectName, dbOid ...uint32) (*Index, bool)
+	CreateTable(name parser.ObjectName, cols []Column, dbOid ...uint32) (*Table, error)
+	CreateIndex(name parser.ObjectName, table *Table, cols []string, unique bool, method string, primary bool, dbOid ...uint32) (*Index, error)
+	CreateView(name parser.ObjectName, cols []Column, aliases []string, query *parser.SelectStmt, orReplace bool, dbOid ...uint32) (*Table, error)
+	DropView(name parser.ObjectName, ifExists bool, dbOid ...uint32) error
 	SetTableStats(table *Table, stats *TableStats)
 	UpdateRelStats(table *Table, pages int, tuples int64)
-	AddColumn(table *Table, col Column) (*Column, error)
-	DropTable(name parser.ObjectName) error
-	DropIndex(name parser.ObjectName) error
+	AddColumn(table *Table, col Column, dbOid ...uint32) (*Column, error)
+	DropTable(name parser.ObjectName, dbOid ...uint32) error
+	DropIndex(name parser.ObjectName, dbOid ...uint32) error
 	// TablesInSchema returns the names of all non-virtual user tables in the given
 	// schema.  Used by DROP SCHEMA CASCADE. M0097-0020.
-	TablesInSchema(schemaName string) []parser.ObjectName
+	TablesInSchema(schemaName string, dbOid ...uint32) []parser.ObjectName
 	// SchemaExists reports whether a schema has been registered.
 	SchemaExists(name string) bool
 	// SchemaOID returns the OID of a registered schema (0 if not found). Used by
@@ -1826,6 +1873,11 @@ type Catalog interface {
 	// DropTablespace removes a tablespace from the runtime registry, returning its
 	// OID and whether it was present. M0095-0003.
 	DropTablespace(name string) (uint32, bool)
+	// LookupTablespaceOID resolves a tablespace name (case-insensitive) to its
+	// OID, covering pg_default/pg_global plus the runtime registry. Used by
+	// CREATE TABLE ... TABLESPACE to validate and resolve the clause.
+	// M0122-0007.
+	LookupTablespaceOID(name string) (uint32, bool)
 	// RegisterCompatObject records a noop-created object (e.g. CREATE CONVERSION as noop).
 	// objType is "conversion", "operator", "rule", "text search configuration", etc.
 	RegisterCompatObject(objType, name string)
@@ -1894,11 +1946,12 @@ type Catalog interface {
 	// this renderer supplies the canonical aclitem[] text. M0119-0004-ACLHEAP.
 	TypeACLText(typeOID uint32) string
 	// ForeignServerOID returns the stable OID of the named foreign server
-	// (CREATE SERVER), or 0 if not found. Used by the FOREIGN SERVER GRANT
-	// recorder (internal/server/grant_ddl.go) to resolve the object named in
+	// (CREATE SERVER) under dbOid (variadic, defaults to DefaultDBOid), or 0
+	// if not found. Used by the FOREIGN SERVER GRANT recorder
+	// (internal/server/grant_ddl.go) to resolve the object named in
 	// `GRANT … ON FOREIGN SERVER <name> TO …` to the OID-keyed ACL store key.
-	// DU-002 slice 427.
-	ForeignServerOID(name string) uint32
+	// DU-002 slice 427; dbOid scoping: M0122-0007 4e follow-up 36.
+	ForeignServerOID(name string, dbOid ...uint32) uint32
 	// ForeignDataWrapperOID returns the stable OID of the named FDW (CREATE
 	// FOREIGN DATA WRAPPER), or 0 if not found. Used by the FOREIGN DATA WRAPPER
 	// GRANT recorder (internal/server/grant_ddl.go) to resolve the object named
@@ -1923,9 +1976,9 @@ type Catalog interface {
 	// DropTableACL forgets all privileges recorded for relOID (called when the
 	// relation is dropped so a recycled OID does not inherit stale grants).
 	DropTableACL(relOID uint32)
-	IndexesOnTable(table *Table) []*Index
+	IndexesOnTable(table *Table, dbOid ...uint32) []*Index
 	// AllIndexes returns every index in the catalog, sorted by OID. M0097-0023.
-	AllIndexes() []*Index
+	AllIndexes(dbOid ...uint32) []*Index
 	HasPrimaryKey(table *Table) bool
 	RelFileNode(table *Table) storage.RelFileNode
 	IndexRelFileNode(index *Index) storage.RelFileNode
@@ -1957,7 +2010,7 @@ type Catalog interface {
 	AllocOID() uint32
 	// RenameTable renames a table/sequence/view by swapping its catalog key.
 	// Returns an error if old does not exist or new already exists. M0097-0024.
-	RenameTable(old, new parser.ObjectName) error
+	RenameTable(old, new parser.ObjectName, dbOid ...uint32) error
 	// LookupEnum finds a user-defined enum type by name (case-insensitive).
 	// Exposed on the interface so the catalog-row builders can resolve an enum
 	// column's type name to its pg_type OID. DU-002 slice 88.
@@ -2020,6 +2073,26 @@ type Catalog interface {
 	// the pg_type OID of its multirange's auto-generated `_name` array type,
 	// used by format_type to render a `mymultirange[]` column. M0110-0001.
 	LookupRangeTypeByMultirangeArrayOID(oid uint32) (*RangeType, bool)
+	// ResolveIndexColumnOpclassOID resolves an index key column's pg_opclass
+	// OID for pg_index.indclass rendering. Shared by the live pg_index
+	// VirtualRows renderer and the heap-row renderer (buildUserPGIndexRow,
+	// internal/executor/pg18_user_catalog_rows.go) so both agree. M0122-0007
+	// follow-up.
+	ResolveIndexColumnOpclassOID(explicitName, typeName string, methodOID uint32) uint32
+	// ResolveIndexColumnCollationOID resolves an index key column's
+	// pg_collation OID for pg_index.indcollation rendering, for the same
+	// live/heap-row sharing reason as ResolveIndexColumnOpclassOID.
+	// M0122-0007 follow-up.
+	ResolveIndexColumnCollationOID(explicitName string) uint32
+	// ResolveIndexColumnOpclassName reverse-resolves a decoded indclass OID
+	// back to a ColOpClasses[i] name string, for checkpointed-restart
+	// recovery (loadUserIndexesFromHeap). M0122-0006 follow-up 3.
+	ResolveIndexColumnOpclassName(oid uint32, typeName string, methodOID uint32) string
+	// ResolveIndexColumnCollationName reverse-resolves a decoded
+	// indcollation OID back to a ColCollations[i] name string, the
+	// collation-side sibling of ResolveIndexColumnOpclassName. M0122-0006
+	// follow-up 3.
+	ResolveIndexColumnCollationName(oid uint32) string
 }
 
 // InMemory is the v0 implementation: a sync.RWMutex-guarded map.
@@ -2029,13 +2102,38 @@ type Catalog interface {
 // startup may override it when importing a physical PostgreSQL backup
 // whose active database lives under a different base/<oid> directory.
 // Full multi-database storage routing still arrives with milestone 7.
-type InMemory struct {
-	mu      sync.RWMutex
+// tableNamespace holds the table/index catalog for a single database,
+// keyed out of InMemory.namespaces by real physical dbOid (M0122-0007
+// slice 4b, design 0122-0018). Sub-slice 4b only wraps the data
+// structure — every access still goes through ns(DefaultDBOid), so this
+// is not yet a behavior change; 4c/4d wire a real per-connection dbOid
+// through.
+type tableNamespace struct {
 	tables  map[string]*Table
 	indexes map[string]*Index
 	byTable map[uint32]map[string]*Index
-	nextOID uint32
-	dbOid   uint32
+}
+
+func newTableNamespace() *tableNamespace {
+	return &tableNamespace{
+		tables:  make(map[string]*Table),
+		indexes: make(map[string]*Index),
+		byTable: make(map[uint32]map[string]*Index),
+	}
+}
+
+type InMemory struct {
+	mu sync.RWMutex
+	// namespaces holds the per-database table/index catalog (see
+	// tableNamespace), keyed by real physical dbOid. Access it via
+	// ns(dbOid), never directly — see ns()'s own comment for the locking
+	// contract. M0122-0007 slice 4b (design 0122-0018): pre-seeded with
+	// only the DefaultDBOid entry today; every caller still resolves
+	// through ns(DefaultDBOid), so this sub-slice changes no observable
+	// behavior. 4c/4d thread a real per-connection dbOid through.
+	namespaces map[uint32]*tableNamespace
+	nextOID    uint32
+	dbOid      uint32
 	// routines holds user-defined routines (M0015 Stage A step 2).
 	// Separate registry — not part of the table/index map space —
 	// so existing CRUD on those types stays untouched. Accessed
@@ -2059,6 +2157,28 @@ type InMemory struct {
 	// Absent entries report -1 (PG's "no limit" default, pg_database.h) via
 	// DatabaseConnLimit's comma-ok lookup.
 	databaseConnLimit map[string]int32
+	// databaseOwner holds `pg_database.datdba` for databases registered via
+	// CreateDatabase/RegisterDatabaseDuringRecovery (M0122-0007 DROP DATABASE
+	// ownership check). Absent entries (the bootstrap postgres/template0/
+	// template1 rows, which never go through CreateDatabase) report
+	// BootstrapSuperuserOID via DatabaseOwner's comma-less lookup, matching
+	// pg_database's pre-existing hardcoded "10" rendering.
+	databaseOwner map[string]uint32
+	// databaseOid holds the real, distinct `pg_database.oid` allocated for a
+	// database registered via CreateDatabase/RegisterDatabaseDuringRecovery
+	// (M0122-0007 physical-storage-isolation slice 1: a prerequisite for a
+	// future `base/<dbOid>` directory — every relation still routes through
+	// DefaultDBOid, this registry only fixes the DISPLAYED oid). Allocated
+	// from the same cluster-wide `nextOID` counter every other object uses
+	// (mirrors real PG's single shared OID space). Absent entries (the
+	// bootstrap postgres/template0/template1 rows) report 0 via DatabaseOid's
+	// comma-less lookup — pgDatabase.VirtualRows treats 0 as "no override,
+	// keep the legacy hardcoded placeholder", which is deliberate: the LIVE
+	// "postgres" database's displayed oid must stay the 16384 placeholder
+	// (see VirtualRows' own comment — CREATE SUBSCRIPTION's subdbid and the
+	// datacl heap resync both depend on it), and only a genuinely new
+	// CREATE DATABASE name is affected.
+	databaseOid map[string]uint32
 	// dbRoleSettings holds per-database `ALTER DATABASE name SET config =
 	// value` overrides (pg_db_role_setting, setrole=0 scope only — ALTER
 	// ROLE ... SET / ALTER ROLE ... IN DATABASE ... SET are a separate,
@@ -2115,7 +2235,7 @@ type InMemory struct {
 	// toastRelidOffset for the relation, + toastIndexOidOffset for its index) to
 	// a new unqualified name set by ALTER TABLE/INDEX … RENAME under
 	// allow_system_table_mods. The synthetic TOAST pg_class/pg_index rows live
-	// only in the virtual builders (not c.tables), so a rename cannot mutate a
+	// only in the virtual builders (not c.ns(DefaultDBOid).tables), so a rename cannot mutate a
 	// real row; this override is consulted by the pg_class builder (relname),
 	// ToastRelName (regclass rendering) and LookupToastRel (name→OID). The
 	// reind_con_toast spec renames pg_toast_<oid> → reind_con_toast and its
@@ -2169,9 +2289,11 @@ type InMemory struct {
 	// synthesized for pg_dump / catalog parity. DU-002 (M0110-0001).
 	rangeTypes map[string]*RangeType
 
-	// constraintViewDeps maps "tableOID:constraintName" → []viewName for
-	// views that rely on the constraint for GROUP BY functional dependency.
-	// Used to enforce DROP CONSTRAINT RESTRICT. M0097-0036 / functional_deps.
+	// constraintViewDeps maps "tableOID:constraintName" → []"dbOid:viewName"
+	// for views that rely on the constraint for GROUP BY functional
+	// dependency. Used to enforce DROP CONSTRAINT RESTRICT. M0097-0036 /
+	// functional_deps. Values are dbOid-qualified since M0122-0007 4e — see
+	// RegisterViewConstraintDep/UnregisterViewConstraintDeps.
 	constraintViewDeps map[string][]string
 
 	// opClassHashFuncs maps operator class name → hash extended routine name.
@@ -3231,18 +3353,82 @@ const DefaultDBOid uint32 = 1
 // CREATE TABLE sees the user-table row through its postgres-DB lens.
 const PostgresDBOid uint32 = 5
 
+// emptyTableNamespace is the shared, never-mutated fallback ns() returns for
+// a dbOid with no namespace yet. A package-level singleton is safe here only
+// because ns() is read-only (see its own comment) — nothing ever writes
+// through a value ns() returned, so concurrent readers sharing this one
+// instance can never race. M0122-0007 slice 4c.
+var emptyTableNamespace = newTableNamespace()
+
+// ns returns the per-database table/index namespace for dbOid, or a shared
+// empty namespace if dbOid has none yet (M0122-0007 slice 4c). It deliberately
+// does NOT acquire c.mu itself: sync.RWMutex is not reentrant, and every
+// caller already holds the right lock (RLock or Lock) before touching the
+// table/index maps. Because of that, ns() must NEVER mutate c.namespaces —
+// slice 4c wires real per-connection dbOids into LookupTable/LookupIndex
+// (RLock paths), and a dbOid with no namespace yet (any real database before
+// slice 4d starts routing writes) is now a normal, expected read, not just a
+// theoretical one exercised by a test holding c.mu for writing. Lazily
+// creating here would be a concurrent map write racing every other RLock
+// holder — see getOrCreateNS for the write-side counterpart that legitimately
+// needs to create one, called only under c.mu.Lock().
+func (c *InMemory) ns(dbOid uint32) *tableNamespace {
+	if n, ok := c.namespaces[dbOid]; ok {
+		return n
+	}
+	return emptyTableNamespace
+}
+
+// getOrCreateNS is ns()'s write-side counterpart: it creates and registers an
+// empty namespace for dbOid the first time an object is ever registered under
+// it. Callers MUST already hold c.mu.Lock() (not RLock) — this mutates
+// c.namespaces. Used only by the four entry points that can introduce a
+// dbOid's first object (CreateTable, CreateIndex, RegisterRealTable,
+// TryRegisterUserTable); every other write path (rename/drop) only mutates an
+// existing entry and correctly errors "does not exist" via plain ns() when
+// the namespace was never created. M0122-0007 slice 4c.
+func (c *InMemory) getOrCreateNS(dbOid uint32) *tableNamespace {
+	if n, ok := c.namespaces[dbOid]; ok {
+		return n
+	}
+	n := newTableNamespace()
+	c.namespaces[dbOid] = n
+	return n
+}
+
+// resolveDBOid returns the target dbOid for a catalog table/index entry
+// point: the first element of dbOid if the caller supplied one, else
+// DefaultDBOid. Every entry point in the "Blast radius" list of
+// docs/design/0122-0018-per-database-catalog-namespace.md accepts its
+// dbOid as a trailing `dbOid ...uint32` parameter rather than a required
+// one (M0122-0007 slice 4b-ii) — this keeps every existing call site
+// (hundreds, across internal/executor and internal/planner) byte-for-byte
+// unchanged and behavior-preserving, since omitting the argument resolves
+// to exactly the same DefaultDBOid these call sites hardcoded before
+// 4b-ii. A future caller that has a real per-connection dbOid (4c/4d)
+// simply passes it: `c.LookupTable(name, ctx.CurrentDatabaseOid)`. Only
+// DefaultDBOid is ever resolved today — see ns()'s locking contract for
+// why a non-pre-seeded dbOid must not reach here from a read-locked path.
+func resolveDBOid(dbOid []uint32) uint32 {
+	if len(dbOid) > 0 {
+		return dbOid[0]
+	}
+	return DefaultDBOid
+}
+
 // NewInMemory returns a catalog seeded with the v0 pg_catalog
 // virtual views.
+
 func NewInMemory() *InMemory {
 	c := &InMemory{
-		tables:                 make(map[string]*Table),
-		indexes:                make(map[string]*Index),
-		byTable:                make(map[uint32]map[string]*Index),
+		namespaces:             map[uint32]*tableNamespace{DefaultDBOid: newTableNamespace()},
 		nextOID:                FirstUserOID,
 		dbOid:                  DefaultDBOid,
 		routines:               NewRoutines(),
 		databases:              map[string]bool{"postgres": true, "template1": true, "template0": true},
 		databaseConnLimit:      make(map[string]int32),
+		databaseOwner:          make(map[string]uint32),
+		databaseOid:            make(map[string]uint32),
 		dbRoleSettings:         make(map[uint32][]string),
 		roleSettings:           make(map[roleSettingKey][]string),
 		roleMembers:            make(map[roleMembershipKey]*RoleMembership),
@@ -3847,7 +4033,7 @@ func (c *InMemory) HasTempInheritanceChildren() bool {
 			childOIDs[oid] = true
 		}
 	}
-	for _, t := range c.tables {
+	for _, t := range c.ns(DefaultDBOid).tables {
 		if t.Temp && t.TempOwner != "" && childOIDs[t.OID] {
 			return true
 		}
@@ -3936,7 +4122,7 @@ func AccessibleInheritanceChildren(children []*Table, sessionTempOwner string) [
 
 // InheritanceChildren returns the direct inheritance children of parentOID.
 // Returns nil if the table has no inheritance children. M0096-0009.
-func (c *InMemory) InheritanceChildren(parentOID uint32) []*Table {
+func (c *InMemory) InheritanceChildren(parentOID uint32, dbOid ...uint32) []*Table {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	children := c.inheritanceChildren[parentOID]
@@ -3945,7 +4131,7 @@ func (c *InMemory) InheritanceChildren(parentOID uint32) []*Table {
 	}
 	out := make([]*Table, 0, len(children))
 	for _, oid := range children {
-		for _, t := range c.tables {
+		for _, t := range c.ns(resolveDBOid(dbOid)).tables {
 			if t.OID == oid {
 				out = append(out, t)
 				break
@@ -3957,7 +4143,7 @@ func (c *InMemory) InheritanceChildren(parentOID uint32) []*Table {
 
 // PartitionChildren returns the OIDs of partition children for a partitioned table.
 // Returns nil if the table has no partitions registered.  M0096-0007.
-func (c *InMemory) PartitionChildren(parentOID uint32) []*Table {
+func (c *InMemory) PartitionChildren(parentOID uint32, dbOid ...uint32) []*Table {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	children := c.partitionChildren[parentOID]
@@ -3966,7 +4152,7 @@ func (c *InMemory) PartitionChildren(parentOID uint32) []*Table {
 	}
 	out := make([]*Table, 0, len(children))
 	for _, oid := range children {
-		for _, t := range c.tables {
+		for _, t := range c.ns(resolveDBOid(dbOid)).tables {
 			if t.OID == oid {
 				out = append(out, t)
 				break
@@ -4079,7 +4265,7 @@ func (c *InMemory) UnregisterPartitionChild(parentOID, childOID uint32) {
 func (c *InMemory) MarkPartitionDetachPending(childOID uint32, epoch uint64) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	for _, t := range c.tables {
+	for _, t := range c.ns(DefaultDBOid).tables {
 		if t.OID == childOID {
 			if t.DetachPendingEpoch == 0 {
 				c.pendingPartitionDetachCount++
@@ -4098,7 +4284,7 @@ func (c *InMemory) MarkPartitionDetachPending(childOID uint32, epoch uint64) boo
 func (c *InMemory) ClearPartitionDetachPending(childOID uint32) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	for _, t := range c.tables {
+	for _, t := range c.ns(DefaultDBOid).tables {
 		if t.OID == childOID {
 			if t.DetachPendingEpoch != 0 {
 				t.DetachPendingEpoch = 0
@@ -4217,10 +4403,10 @@ func (c *InMemory) IndexPartitionChildren(parentOID uint32) []*Index {
 
 // LookupIndexByOID returns the index with the given OID, or false if not found.
 // M0097-0023.
-func (c *InMemory) LookupIndexByOID(oid uint32) (*Index, bool) {
+func (c *InMemory) LookupIndexByOID(oid uint32, dbOid ...uint32) (*Index, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	for _, idx := range c.indexes {
+	for _, idx := range c.ns(resolveDBOid(dbOid)).indexes {
 		if idx.OID == oid {
 			return idx, true
 		}
@@ -4236,7 +4422,7 @@ func (c *InMemory) FindPartitionForValue(parentOID uint32, keyValue string) *Tab
 	defer c.mu.RUnlock()
 	var defaultPart *Table
 	for _, childOID := range c.partitionChildren[parentOID] {
-		for _, t := range c.tables {
+		for _, t := range c.ns(DefaultDBOid).tables {
 			if t.OID != childOID {
 				continue
 			}
@@ -4263,7 +4449,7 @@ func (c *InMemory) FindRangePartitionForValue(parentOID uint32, keyValue int64) 
 	defer c.mu.RUnlock()
 	var defaultPart *Table
 	for _, childOID := range c.partitionChildren[parentOID] {
-		for _, t := range c.tables {
+		for _, t := range c.ns(DefaultDBOid).tables {
 			if t.OID != childOID {
 				continue
 			}
@@ -4301,7 +4487,7 @@ func (c *InMemory) FindRangePartitionForDatums(parentOID uint32, keyStrs []strin
 	defer c.mu.RUnlock()
 	var defaultPart *Table
 	for _, childOID := range c.partitionChildren[parentOID] {
-		for _, t := range c.tables {
+		for _, t := range c.ns(DefaultDBOid).tables {
 			if t.OID != childOID {
 				continue
 			}
@@ -4428,7 +4614,7 @@ func (c *InMemory) FindHashPartitionForValue(parentOID uint32, keyValue string) 
 	}
 	var defaultPart *Table
 	for _, childOID := range c.partitionChildren[parentOID] {
-		for _, t := range c.tables {
+		for _, t := range c.ns(DefaultDBOid).tables {
 			if t.OID != childOID {
 				continue
 			}
@@ -4456,7 +4642,7 @@ func (c *InMemory) FindHashPartitionByHash(parentOID uint32, h uint64) *Table {
 	defer c.mu.RUnlock()
 	var defaultPart *Table
 	for _, childOID := range c.partitionChildren[parentOID] {
-		for _, t := range c.tables {
+		for _, t := range c.ns(DefaultDBOid).tables {
 			if t.OID != childOID {
 				continue
 			}
@@ -4485,20 +4671,29 @@ func (c *InMemory) HasDatabase(name string) bool {
 	return c.databases[name]
 }
 
-// CreateDatabase registers a new database name (M0054-0001). Returns
-// `ErrDatabaseExists` when the name is already known. Callers are
-// expected to write a `wal.RecordKindCreateDatabase` record on the
+// CreateDatabase registers a new database name (M0054-0001). owner is the
+// `pg_database.datdba` OID to record (the creating role — mirrors upstream
+// createdb()'s "owner defaults to session user" rule; callers pass
+// BootstrapSuperuserOID for the bootstrap superuser). Returns the newly
+// allocated `pg_database.oid` (M0122-0007 physical-storage-isolation slice
+// 1 — see DatabaseOid) plus `ErrDatabaseExists` when the name is already
+// known (oid is 0 in the error case). Callers are expected to write a
+// `wal.RecordKindCreateDatabase` record (with the returned oid) on the
 // success path so the registration survives a crash. Bootstrap and
 // recovery paths use `RegisterDatabaseDuringRecovery` instead, which
 // is idempotent.
-func (c *InMemory) CreateDatabase(name string) error {
+func (c *InMemory) CreateDatabase(name string, owner uint32) (uint32, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.databases[name] {
-		return ErrDatabaseExists
+		return 0, ErrDatabaseExists
 	}
+	oid := c.nextOID
+	c.nextOID++
 	c.databases[name] = true
-	return nil
+	c.databaseOwner[name] = owner
+	c.databaseOid[name] = oid
+	return oid, nil
 }
 
 // DropDatabase removes a database from the catalog (M0054-0001).
@@ -4511,7 +4706,170 @@ func (c *InMemory) DropDatabase(name string) error {
 	}
 	delete(c.databases, name)
 	delete(c.databaseConnLimit, name)
+	delete(c.databaseOwner, name)
+	delete(c.databaseOid, name)
 	return nil
+}
+
+// DatabaseOwner returns the `pg_database.datdba` OID recorded for name via
+// CreateDatabase/RegisterDatabaseDuringRecovery, or BootstrapSuperuserOID if
+// none was ever recorded (the bootstrap postgres/template0/template1 rows,
+// which predate any CreateDatabase call — mirrors their pre-existing
+// hardcoded "10" rendering in pg_database.VirtualRows). M0122-0007 (DROP
+// DATABASE ownership check).
+func (c *InMemory) DatabaseOwner(name string) uint32 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if owner, ok := c.databaseOwner[name]; ok {
+		return owner
+	}
+	return BootstrapSuperuserOID
+}
+
+// DatabaseOid returns the real `pg_database.oid` allocated for name via
+// CreateDatabase/RegisterDatabaseDuringRecovery, or 0 if name was never
+// registered through either (the bootstrap postgres/template0/template1
+// rows, which predate any CreateDatabase call). M0122-0007
+// physical-storage-isolation slice 1 — see the databaseOid field doc.
+func (c *InMemory) DatabaseOid(name string) uint32 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.databaseOid[name]
+}
+
+// databaseDisplayOID returns the SQL-visible pg_database.oid that goopg
+// DISPLAYS for name: template1→1, template0→4, a CreateDatabase-allocated
+// database→its real distinct oid, and every other row (notably the live
+// "postgres" database — whose real on-disk oid is c.DBOID() but which is shown
+// as the legacy 16384 placeholder for CREATE SUBSCRIPTION / datacl compat)
+// →16384. This is deliberately the DISPLAY oid, not ResolveDatabaseOid's
+// physical oid: pg_stat_database.datid must join to pg_database.oid exactly as
+// goopg renders it, so both the pg_database VirtualRows closure and
+// PGStatDatabaseRows go through this single helper to stay in sync (resolving
+// the long-standing "keep this switch in sync" hazard noted on
+// ResolveDatabaseOid).
+func (c *InMemory) databaseDisplayOID(name string) string {
+	switch name {
+	case "template1":
+		return "1"
+	case "template0":
+		return "4"
+	default:
+		if realOid := c.DatabaseOid(name); realOid != 0 {
+			return strconv.FormatUint(uint64(realOid), 10)
+		}
+		return "16384"
+	}
+}
+
+// PGStatDatabaseRows builds the pg_stat_database row set: one leading row for
+// shared objects (datid=0, datname=NULL) followed by one row per database the
+// catalog knows about, mirroring upstream system_views.sql's FROM clause
+// "SELECT 0 AS oid, NULL AS datname UNION ALL SELECT oid, datname FROM
+// pg_database".
+//
+// Every per-database counter is a faithful 0 and every timestamp/last-failure
+// cell is NULL. goopg has no live per-database cumulative-statistics
+// accumulator (PgStat_StatDBEntry analog), so on a busy cluster a real PG
+// backend would bump numbackends / xact_commit / blks_* / session_time for its
+// connected database — goopg reports the honest "no stats collected" shape.
+// That is also exactly what a real PG 18.3 cluster shows for a database no
+// backend has yet touched (numbackends 0, every counter 0, stats_reset NULL,
+// checksum_last_failure NULL — verified against a fresh cluster). See
+// docs/design/0122-0003-pg-stat-user-tables.md.
+func (c *InMemory) PGStatDatabaseRows() [][]string {
+	// 30-col shape (PG 18.3): datid, datname, numbackends, xact_commit,
+	// xact_rollback, blks_read, blks_hit, tup_returned, tup_fetched,
+	// tup_inserted, tup_updated, tup_deleted, conflicts, temp_files, temp_bytes,
+	// deadlocks, checksum_failures, checksum_last_failure, blk_read_time,
+	// blk_write_time, session_time, active_time, idle_in_transaction_time,
+	// sessions, sessions_abandoned, sessions_fatal, sessions_killed,
+	// parallel_workers_to_launch, parallel_workers_launched, stats_reset.
+	const nCols = 30
+	row := func(datid, datname string) []string {
+		r := make([]string, nCols)
+		for i := range r {
+			r[i] = "0" // int/float counter columns default to a faithful 0
+		}
+		r[0] = datid   // datid oid
+		r[1] = datname // datname name
+		r[17] = VirtualNull // checksum_last_failure timestamptz — never failed
+		r[29] = VirtualNull // stats_reset timestamptz — never reset
+		return r
+	}
+	out := make([][]string, 0, 4)
+	// Shared-objects row first (upstream's "SELECT 0, NULL"): datid 0, datname
+	// NULL. Upstream's view also forces its numbackends to 0 via a CASE; here
+	// every row's numbackends is already 0, so no special-case is needed.
+	out = append(out, row("0", VirtualNull))
+	for _, n := range c.ListDatabases() {
+		out = append(out, row(c.databaseDisplayOID(n), n))
+	}
+	return out
+}
+
+// PGStatDatabaseConflictsRows builds the pg_stat_database_conflicts row set:
+// one row per database the catalog knows about, mirroring upstream
+// system_views.sql's "FROM pg_database D". Unlike pg_stat_database there is NO
+// leading shared-objects (datid=0) row — the upstream view has no "SELECT 0,
+// NULL UNION ALL" prefix.
+//
+// Every confl_* counter is a faithful 0. These counters only ever increment on
+// a *standby* when a query is cancelled by a hot-standby recovery conflict
+// (see PgStat_StatDBEntry.conflict_* in pgstat_database.c, bumped only from
+// pgstat_report_recovery_conflict). goopg is a primary with no recovery-
+// conflict accumulator, so — exactly like a real PG 18.3 primary — all five
+// (six with the PG16+ logical-slot column) counters read 0. datid uses the
+// same catalog.databaseDisplayOID helper as pg_stat_database so the two views
+// join to pg_database.oid byte-for-byte. See
+// docs/design/0122-0003-pg-stat-user-tables.md.
+func (c *InMemory) PGStatDatabaseConflictsRows() [][]string {
+	// 8-col shape (PG 18.3): datid, datname, confl_tablespace, confl_lock,
+	// confl_snapshot, confl_bufferpin, confl_deadlock, confl_active_logicalslot.
+	const nCols = 8
+	row := func(datid, datname string) []string {
+		r := make([]string, nCols)
+		for i := range r {
+			r[i] = "0" // confl_* counters default to a faithful 0
+		}
+		r[0] = datid   // datid oid
+		r[1] = datname // datname name
+		return r
+	}
+	out := make([][]string, 0, 4)
+	for _, n := range c.ListDatabases() {
+		out = append(out, row(c.databaseDisplayOID(n), n))
+	}
+	return out
+}
+
+// ResolveDatabaseOid returns the REAL, physical pg_database.oid for name —
+// the same oid that keys on-disk storage/ACLs (c.DBOID() for "postgres",
+// the fixed bootstrap oids for template1/template0, or the CreateDatabase-
+// allocated oid via DatabaseOid for any other registered database) — as
+// opposed to pg_database's VirtualRows column, which deliberately DISPLAYS
+// "postgres" as the legacy 16384 placeholder for CREATE SUBSCRIPTION/datacl
+// compat (see that closure's "oid, datallowconn, datistemplate" comment).
+// Returns ok=false if name is not a database this catalog knows about.
+// M0122-0007 physical-storage-isolation slice 4a — see
+// docs/design/0122-0018-per-database-catalog-namespace.md. Keep this switch
+// in sync with the VirtualRows closure's oid selection if either changes.
+func (c *InMemory) ResolveDatabaseOid(name string) (oid uint32, ok bool) {
+	switch name {
+	case "postgres":
+		return c.DBOID(), true
+	case "template1":
+		return 1, true
+	case "template0":
+		return 4, true
+	}
+	c.mu.RLock()
+	_, known := c.databases[name]
+	c.mu.RUnlock()
+	if !known {
+		return 0, false
+	}
+	return c.DatabaseOid(name), true
 }
 
 // DatconnlimitInvalidDB mirrors PG's DATCONNLIMIT_INVALID_DB sentinel
@@ -4553,11 +4911,23 @@ func (c *InMemory) SetDatabaseConnLimit(name string, limit int32) bool {
 // RegisterDatabaseDuringRecovery is the idempotent version of
 // CreateDatabase used by the WAL-replay driver. Re-applying a record
 // that has already taken effect (e.g. because a SaveCatalog snapshot
-// captured it) is a no-op rather than an error.
-func (c *InMemory) RegisterDatabaseDuringRecovery(name string) {
+// captured it) is a no-op rather than an error. owner is the datdba OID
+// carried by the WAL record (M0122-0007). oid is the real `pg_database.oid`
+// carried by the WAL record (M0122-0007 physical-storage-isolation slice
+// 1); 0 for a pre-slice-1 payload (DecodeCreateDatabase's own backward-compat
+// default), in which case DatabaseOid falls back to "no override" exactly
+// as before this change. nextOID is advanced past a non-zero oid so a later
+// CREATE TABLE/DATABASE never reallocates it (mirrors advanceNextOIDLocked's
+// pattern for every other recovered OID).
+func (c *InMemory) RegisterDatabaseDuringRecovery(name string, owner, oid uint32) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.databases[name] = true
+	c.databaseOwner[name] = owner
+	c.databaseOid[name] = oid
+	if oid >= c.nextOID {
+		c.nextOID = oid + 1
+	}
 }
 
 // UnregisterDatabaseDuringRecovery is the idempotent counterpart to
@@ -4567,6 +4937,8 @@ func (c *InMemory) UnregisterDatabaseDuringRecovery(name string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	delete(c.databases, name)
+	delete(c.databaseOwner, name)
+	delete(c.databaseOid, name)
 }
 
 // dbRoleSettingConfigName returns the GUC name half of a "name=value"
@@ -5264,10 +5636,11 @@ func (c *InMemory) RegisterIndexDuringRecovery(
 	fillfactor int,
 	deduplicateItems *bool,
 	nullsNotDistinct bool,
+	tablespace uint32,
 ) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	tbl, ok := c.tableByOID(tableOID)
+	tbl, ok := c.tableByOID(tableOID, DefaultDBOid)
 	if !ok {
 		// Owning table not yet recovered — caller must run
 		// `loadUserTablesFromHeap` (or equivalent) before
@@ -5290,7 +5663,7 @@ func (c *InMemory) RegisterIndexDuringRecovery(
 	// follow-up). lookupIndexLocked already implements the same "" vs
 	// "public." collision fallback reads rely on, so reusing it here keeps
 	// recovery's notion of "same index" consistent with LookupIndex's.
-	if existing, existingKey, dup := c.lookupIndexLocked(parser.ObjectName{Schema: schema, Name: name}); dup {
+	if existing, existingKey, dup := c.lookupIndexLocked(parser.ObjectName{Schema: schema, Name: name}, DefaultDBOid); dup {
 		// JSON snapshot or earlier recovery pass already registered
 		// this index. Idempotent no-op.
 		_ = existing
@@ -5325,12 +5698,13 @@ func (c *InMemory) RegisterIndexDuringRecovery(
 		Fillfactor:       fillfactor,
 		DeduplicateItems: deduplicateItems,
 		NullsNotDistinct: nullsNotDistinct,
+		Tablespace:       tablespace,
 	}
-	c.indexes[k] = idx
-	if c.byTable[tbl.OID] == nil {
-		c.byTable[tbl.OID] = map[string]*Index{}
+	c.ns(DefaultDBOid).indexes[k] = idx
+	if c.ns(DefaultDBOid).byTable[tbl.OID] == nil {
+		c.ns(DefaultDBOid).byTable[tbl.OID] = map[string]*Index{}
 	}
-	c.byTable[tbl.OID][k] = idx
+	c.ns(DefaultDBOid).byTable[tbl.OID][k] = idx
 	c.advanceNextOIDLocked(oid)
 }
 
@@ -5345,16 +5719,16 @@ func (c *InMemory) UnregisterIndexDuringRecovery(schema, name string) {
 	// DROP INDEX WAL record's raw (often unqualified) schema must resolve to
 	// whatever key the index actually lives under, or the drop silently
 	// no-ops and the index is "resurrected" after restart.
-	idx, k, ok := c.lookupIndexLocked(parser.ObjectName{Schema: schema, Name: name})
+	idx, k, ok := c.lookupIndexLocked(parser.ObjectName{Schema: schema, Name: name}, DefaultDBOid)
 	if !ok {
 		return
 	}
-	delete(c.indexes, k)
+	delete(c.ns(DefaultDBOid).indexes, k)
 	if idx.Table != nil {
-		if perTable := c.byTable[idx.Table.OID]; perTable != nil {
+		if perTable := c.ns(DefaultDBOid).byTable[idx.Table.OID]; perTable != nil {
 			delete(perTable, k)
 			if len(perTable) == 0 {
-				delete(c.byTable, idx.Table.OID)
+				delete(c.ns(DefaultDBOid).byTable, idx.Table.OID)
 			}
 		}
 	}
@@ -5363,9 +5737,9 @@ func (c *InMemory) UnregisterIndexDuringRecovery(schema, name string) {
 // tableByOID returns the *Table whose OID matches; caller must
 // hold c.mu (read or write). Used by the recovery hooks to map
 // a WAL-encoded table OID back to the in-memory entry without
-// re-walking c.tables on every call site.
-func (c *InMemory) tableByOID(oid uint32) (*Table, bool) {
-	for _, t := range c.tables {
+// re-walking c.ns(DefaultDBOid).tables on every call site.
+func (c *InMemory) tableByOID(oid uint32, dbOid uint32) (*Table, bool) {
+	for _, t := range c.ns(dbOid).tables {
 		if t.OID == oid {
 			return t, true
 		}
@@ -5376,10 +5750,35 @@ func (c *InMemory) tableByOID(oid uint32) (*Table, bool) {
 // LookupTableByOID is the read-locked public accessor for tableByOID.
 // Used by the executor to render `oid::regclass` for the `tableoid`
 // system column (M0100-0005y) and similar OID-back-to-name lookups.
-func (c *InMemory) LookupTableByOID(oid uint32) (*Table, bool) {
+func (c *InMemory) LookupTableByOID(oid uint32, dbOid ...uint32) (*Table, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.tableByOID(oid)
+	return c.tableByOID(oid, resolveDBOid(dbOid))
+}
+
+// LookupTableByOIDAllDBs is LookupTableByOID without a namespace pin: it
+// searches every registered database namespace for oid and additionally
+// reports the dbOid whose namespace held the match. Table OIDs are allocated
+// from the single cluster-wide nextOID counter, so an OID identifies at most
+// one table across all namespaces. Used by the startup replay passes
+// (view/matview/column-default records key on TableOID only, with no dbOid
+// field) so state restores onto a table that reloaded into a distinct-dbOid
+// namespace, not just DefaultDBOid's. M0122-0007 4e follow-up 39.
+func (c *InMemory) LookupTableByOIDAllDBs(oid uint32) (*Table, uint32, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if t, ok := c.tableByOID(oid, DefaultDBOid); ok {
+		return t, DefaultDBOid, true
+	}
+	for nsOid := range c.namespaces {
+		if nsOid == DefaultDBOid {
+			continue
+		}
+		if t, ok := c.tableByOID(oid, nsOid); ok {
+			return t, nsOid, true
+		}
+	}
+	return nil, 0, false
 }
 
 // RegisterOpClassHashFunc records that opClassName uses routineName as its
@@ -5552,65 +5951,634 @@ func verboseIntervalOffset(totalSecs int) string {
 	return b.String()
 }
 
-func (c *InMemory) registerSystemTables() {
-	pgClass := &Table{
-		Schema: "pg_catalog",
-		Name:   "pg_class",
-		// Columns match the PG18-canonical 34-column pg_class tupdesc written by
-		// syncTableToCatalogHeap / pgClassColumnsPG18(). This alignment is required
-		// so that scanMatching can decode physical pg_class heap tuples for UPDATE
-		// (e.g. "UPDATE pg_class SET reltuples = ... WHERE oid = ...").
-		// M0100-0010: sysupd2/sysmerge2 concurrent-update blocking fix.
-		Columns: []Column{
-			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
-			{Name: "relname", Type: Type{Name: "name"}, Ordinal: 1},
-			{Name: "relnamespace", Type: Type{Name: "oid"}, Ordinal: 2},
-			{Name: "reltype", Type: Type{Name: "oid"}, Ordinal: 3},
-			{Name: "reloftype", Type: Type{Name: "oid"}, Ordinal: 4},
-			{Name: "relowner", Type: Type{Name: "oid"}, Ordinal: 5},
-			{Name: "relam", Type: Type{Name: "oid"}, Ordinal: 6},
-			{Name: "relfilenode", Type: Type{Name: "oid"}, Ordinal: 7},
-			{Name: "reltablespace", Type: Type{Name: "oid"}, Ordinal: 8},
-			{Name: "relpages", Type: Type{Name: "int4"}, Ordinal: 9},
-			{Name: "reltuples", Type: Type{Name: "float4"}, Ordinal: 10},
-			{Name: "relallvisible", Type: Type{Name: "int4"}, Ordinal: 11},
-			{Name: "relallfrozen", Type: Type{Name: "int4"}, Ordinal: 12},
-			{Name: "reltoastrelid", Type: Type{Name: "oid"}, Ordinal: 13},
-			{Name: "relhasindex", Type: Type{Name: "bool"}, Ordinal: 14},
-			{Name: "relisshared", Type: Type{Name: "bool"}, Ordinal: 15},
-			{Name: "relpersistence", Type: Type{Name: "char"}, Ordinal: 16},
-			{Name: "relkind", Type: Type{Name: "char"}, Ordinal: 17},
-			{Name: "relnatts", Type: Type{Name: "int2"}, Ordinal: 18},
-			{Name: "relchecks", Type: Type{Name: "int2"}, Ordinal: 19},
-			{Name: "relhasrules", Type: Type{Name: "bool"}, Ordinal: 20},
-			{Name: "relhastriggers", Type: Type{Name: "bool"}, Ordinal: 21},
-			{Name: "relhassubclass", Type: Type{Name: "bool"}, Ordinal: 22},
-			{Name: "relrowsecurity", Type: Type{Name: "bool"}, Ordinal: 23},
-			{Name: "relforcerowsecurity", Type: Type{Name: "bool"}, Ordinal: 24},
-			{Name: "relispopulated", Type: Type{Name: "bool"}, Ordinal: 25},
-			{Name: "relreplident", Type: Type{Name: "char"}, Ordinal: 26},
-			{Name: "relispartition", Type: Type{Name: "bool"}, Ordinal: 27},
-			{Name: "relrewrite", Type: Type{Name: "oid"}, Ordinal: 28},
-			{Name: "relfrozenxid", Type: Type{Name: "xid"}, Ordinal: 29},
-			{Name: "relminmxid", Type: Type{Name: "xid"}, Ordinal: 30},
-			{Name: "relacl", Type: Type{Name: "aclitem[]"}, Ordinal: 31},
-			{Name: "reloptions", Type: Type{Name: "text[]"}, Ordinal: 32},
-			{Name: "relpartbound", Type: Type{Name: "pg_node_tree"}, Ordinal: 33},
-		},
-		OID:     1259, // upstream's RelationRelationId
-		Virtual: true,
-	}
-	pgClass.VirtualRows = func() [][]string {
-		c.mu.RLock()
-		defer c.mu.RUnlock()
-		keys := make([]string, 0, len(c.tables))
-		for k := range c.tables {
-			keys = append(keys, k)
+
+// PGClassRowsForDBOid builds the pg_class row-set for dbOid's own tables/
+// indexes (M0122-0007 4e: per-connection pg_class scoping). Composite-type
+// and pg_class-self rows stay global — composite types aren't
+// namespace-scoped at all (see
+// docs/design/0122-0018-per-database-catalog-namespace.md's "Deferred /
+// explicitly out of scope"). registerSystemTables's VirtualRows closure
+// calls this with DefaultDBOid so every existing caller (server dispatch
+// without a per-connection PgClassRows wire-up, every test) sees
+// byte-identical behavior; a per-connection dbOid is wired in via
+// executor.Context.PgClassRows (internal/server/dispatch.go's
+// wireExtensionRows).
+// PGIndexesRowsForDBOid builds the pg_indexes view row-set for dbOid's own
+// tables/indexes (mirrors PGClassRowsForDBOid's per-connection dbOid scoping
+// below). registerSystemTables's VirtualRows closure calls this with
+// DefaultDBOid so every existing caller (server dispatch without a
+// per-connection PgIndexesRows wire-up, every test) sees byte-identical
+// behavior; a per-connection dbOid is wired in via
+// executor.Context.PgIndexesRows (internal/server/dispatch.go's
+// wireExtensionRows). M0122-0007 4e follow-up 24.
+func (c *InMemory) PGIndexesRowsForDBOid(dbOid uint32) [][]string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	// Sort for deterministic output across calls.
+	tableKeys := make([]string, 0, len(c.ns(dbOid).tables))
+	for k, t := range c.ns(dbOid).tables {
+		if t.Virtual {
+			continue
 		}
-		sort.Strings(keys)
-		out := make([][]string, 0, len(c.tables)+len(c.indexes))
-		for _, k := range keys {
-			t := c.tables[k]
+		tableKeys = append(tableKeys, k)
+	}
+	sort.Strings(tableKeys)
+	var out [][]string
+	for _, tk := range tableKeys {
+		t := c.ns(dbOid).tables[tk]
+		idxs := c.ns(dbOid).byTable[t.OID]
+		idxKeys := make([]string, 0, len(idxs))
+		for ik := range idxs {
+			idxKeys = append(idxKeys, ik)
+		}
+		sort.Strings(idxKeys)
+		for _, ik := range idxKeys {
+			idx := idxs[ik]
+			schema := idx.Schema
+			if schema == "" {
+				schema = "public"
+			}
+			out = append(out, []string{
+				schema,
+				t.Name,
+				idx.Name,
+				"", // tablespace
+				BuildIndexDef(idx),
+			})
+		}
+	}
+	return out
+}
+
+// PGTablesRowsForDBOid builds the pg_tables view row-set for dbOid's own
+// tables (mirrors PGClassRowsForDBOid's per-connection dbOid scoping below).
+// registerSystemTables's VirtualRows closure calls this with DefaultDBOid so
+// every existing caller sees byte-identical behavior; a per-connection dbOid
+// is wired in via executor.Context.PgTablesRows (internal/server/dispatch.go's
+// wireExtensionRows). M0122-0007 4e follow-up 24.
+func (c *InMemory) PGTablesRowsForDBOid(dbOid uint32) [][]string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	keys := make([]string, 0, len(c.ns(dbOid).tables))
+	for k := range c.ns(dbOid).tables {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var out [][]string
+	for _, k := range keys {
+		t := c.ns(dbOid).tables[k]
+		if t.Virtual {
+			continue
+		}
+		schema := t.Schema
+		if schema == "" {
+			schema = "public"
+		}
+		out = append(out, []string{schema, t.Name, "postgres"})
+	}
+	return out
+}
+
+// PGConstraintRowsForDBOid builds the pg_constraint row-set for dbOid's own
+// tables/indexes/domains (mirrors PGClassRowsForDBOid's per-connection dbOid
+// scoping above). registerSystemTables's VirtualRows closure calls this with
+// DefaultDBOid so every existing caller (server dispatch without a
+// per-connection PgConstraintRows wire-up, every test) sees byte-identical
+// behavior; a per-connection dbOid is wired in via
+// executor.Context.PgConstraintRows (internal/server/dispatch.go's
+// wireExtensionRows). Domain CHECK constraints (c.domains) stay global —
+// domains aren't namespace-scoped at all yet, same as composite types in
+// PGClassRowsForDBOid above. M0122-0007 4e follow-up 25.
+func (c *InMemory) PGConstraintRowsForDBOid(dbOid uint32) [][]string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	var out [][]string
+	for _, tbl := range c.ns(dbOid).tables {
+		if tbl.Virtual || tbl.OID == 0 {
+			continue
+		}
+		// Emit named CHECK constraints.
+		for _, nc := range tbl.NamedChecks {
+			if nc.Name == "" || nc.OID == 0 {
+				continue
+			}
+			row := make([]string, 26)
+			row[0] = fmt.Sprintf("%d", nc.OID)  // oid
+			row[1] = nc.Name                    // conname
+			row[2] = "2200"                     // connamespace (public)
+			row[3] = "c"                        // contype = check
+			row[4] = "f"                        // condeferrable
+			row[5] = "f"                        // condeferred
+			if nc.NotValid || nc.NotEnforced {
+				// convalidated='f' — either explicitly added NOT VALID, or
+				// NOT ENFORCED (real PG's ATAddCheckNNConstraint sets
+				// skip_validation=!is_enforced, so an unenforced constraint
+				// is implicitly unvalidated too). DU-002 slice 430.
+				row[6] = "f" // convalidated
+			} else {
+				row[6] = "t" // convalidated
+			}
+			row[7] = fmt.Sprintf("%d", tbl.OID) // conrelid
+			row[8] = "0"                        // contypid
+			row[9] = "0"                        // conindid
+			row[10] = "0"                       // conparentid
+			row[11] = "0"                       // confrelid
+			row[12] = " "                       // confupdtype
+			row[13] = " "                       // confdeltype
+			row[14] = " "                       // confmatchtype
+			if nc.IsLocal {
+				row[15] = "t"
+			} else {
+				row[15] = "f"
+			}
+			row[16] = fmt.Sprintf("%d", nc.InhCount) // coninhcount
+			if nc.NoInherit {
+				row[17] = "t" // connoinherit (CHECK ... NO INHERIT). DU-002 slice 128.
+			} else {
+				row[17] = "f"
+			}
+			row[18] = "f"     // conperiod
+			row[24] = nc.Expr // conbin
+			if nc.NotEnforced {
+				row[25] = "f" // conenforced — CHECK ... NOT ENFORCED. DU-002 slice 430.
+			} else {
+				row[25] = "t" // conenforced
+			}
+			out = append(out, row)
+		}
+	}
+	// Emit domain CHECK constraints (contype='c', keyed on contypid = the
+	// domain's pg_type OID rather than conrelid). pg_dump's
+	// getDomainConstraints reads `WHERE contypid = $1 AND contype IN ('c','n')`
+	// and renders each via pg_get_constraintdef ORDER BY conname — the ORDER BY
+	// is applied by the executor over these rows, so a domain's multiple CHECKs
+	// each get a row here. DU-002 slice 96 (single) / slice 385 (multi).
+	for _, d := range c.domains {
+		for _, ck := range d.Checks {
+			if ck.Expr == "" || ck.OID == 0 {
+				continue
+			}
+			row := make([]string, 26)
+			row[0] = fmt.Sprintf("%d", ck.OID) // oid
+			row[1] = ck.Name                   // conname
+			row[2] = "2200"                    // connamespace (public)
+			row[3] = "c"                       // contype = check
+			row[4] = "f"                       // condeferrable
+			row[5] = "f"                       // condeferred
+			row[6] = "t"                       // convalidated
+			row[7] = "0"                       // conrelid (none — domain check)
+			row[8] = fmt.Sprintf("%d", d.OID)  // contypid = domain OID
+			row[9] = "0"                       // conindid
+			row[10] = "0"                      // conparentid
+			row[11] = "0"                      // confrelid
+			row[12] = " "                      // confupdtype
+			row[13] = " "                      // confdeltype
+			row[14] = " "                      // confmatchtype
+			row[15] = "t"                      // conislocal
+			row[16] = "0"                      // coninhcount
+			row[17] = "f"                      // connoinherit
+			row[18] = "f"                      // conperiod
+			row[24] = ck.Expr                  // conbin
+			row[25] = "t"                      // conenforced: always true in v0
+			out = append(out, row)
+		}
+	}
+	// Emit UNIQUE, PRIMARY KEY, and EXCLUDE constraints from constraint-backed indexes.
+	for _, idx := range c.ns(dbOid).indexes {
+		if (!idx.IsConstraint && !idx.IsExclusion) || idx.Table == nil {
+			continue
+		}
+		colOrdMap := make(map[string]int, len(idx.Table.Columns))
+		for _, col := range idx.Table.Columns {
+			colOrdMap[col.Name] = col.Ordinal + 1
+		}
+		var keyNums []string
+		for _, colName := range idx.Columns {
+			if ord, ok := colOrdMap[colName]; ok {
+				keyNums = append(keyNums, fmt.Sprintf("%d", ord))
+			}
+		}
+		contype := "u"
+		if idx.Primary {
+			contype = "p"
+		} else if idx.IsExclusion {
+			contype = "x"
+		}
+		row := make([]string, 26)
+		row[0] = fmt.Sprintf("%d", idx.OID)
+		row[1] = idx.Name
+		row[2] = "2200"
+		row[3] = contype
+		// condeferrable / condeferred: a DEFERRABLE [INITIALLY DEFERRED]
+		// UNIQUE/PK constraint round-trips the flags so pg_dump re-emits the
+		// clause. DU-002 slice 139.
+		row[4] = "f"
+		if idx.Deferrable {
+			row[4] = "t"
+		}
+		row[5] = "f"
+		if idx.InitiallyDeferred {
+			row[5] = "t"
+		}
+		row[6] = "t"
+		row[7] = fmt.Sprintf("%d", idx.Table.OID)
+		row[8] = "0"
+		row[9] = fmt.Sprintf("%d", idx.OID)
+		row[10] = "0"
+		row[11] = "0"
+		row[12] = " "
+		row[13] = " "
+		row[14] = " "
+		row[15] = "t"
+		row[16] = "0"
+		row[17] = "f"
+		row[18] = "f"
+		row[19] = "{" + strings.Join(keyNums, ",") + "}"
+		row[25] = "t" // conenforced: always true in v0
+		out = append(out, row)
+	}
+	// Emit NOT NULL constraints (contype='n', PG18). M0097-0023.
+	for _, tbl := range c.ns(dbOid).tables {
+		if tbl.Virtual || tbl.OID == 0 {
+			continue
+		}
+		for _, nc := range tbl.NotNullConstraints {
+			if nc.Name == "" || nc.OID == 0 {
+				continue
+			}
+			colOrd := 0
+			for i, col := range tbl.Columns {
+				if strings.EqualFold(col.Name, nc.ColName) {
+					colOrd = i + 1
+					break
+				}
+			}
+			row := make([]string, 26)
+			row[0] = fmt.Sprintf("%d", nc.OID)
+			row[1] = nc.Name
+			row[2] = "2200"
+			row[3] = "n" // contype = not null
+			row[4] = "f"
+			row[5] = "f"
+			row[6] = "t"
+			row[7] = fmt.Sprintf("%d", tbl.OID)
+			row[8] = "0"
+			row[9] = "0"
+			row[10] = "0"
+			row[11] = "0"
+			row[12] = " "
+			row[13] = " "
+			row[14] = " "
+			if nc.IsLocal {
+				row[15] = "t"
+			} else {
+				row[15] = "f"
+			}
+			row[16] = fmt.Sprintf("%d", nc.InhCount)
+			if nc.NoInherit {
+				row[17] = "t"
+			} else {
+				row[17] = "f"
+			}
+			row[18] = "f"
+			if colOrd > 0 {
+				row[19] = fmt.Sprintf("{%d}", colOrd)
+			}
+			row[25] = "t" // conenforced: always true in v0
+			out = append(out, row)
+		}
+	}
+	// Emit FOREIGN KEY constraints (contype='f', PG). pg_dump's getConstraints
+	// joins `pg_constraint c ON src.tbloid = c.conrelid WHERE contype='f'` and
+	// renders each via pg_get_constraintdef(c.oid). DU-002 slice 51.
+	for _, tbl := range c.ns(dbOid).tables {
+		if tbl.Virtual || tbl.OID == 0 {
+			continue
+		}
+		colOrd := make(map[string]int, len(tbl.Columns))
+		for i, col := range tbl.Columns {
+			colOrd[strings.ToLower(col.Name)] = i + 1
+		}
+		for _, fk := range tbl.ForeignKeys {
+			if fk.Name == "" || fk.OID == 0 {
+				continue
+			}
+			// Resolve the referenced table OID + referenced column ordinals.
+			var refTbl *Table
+			for _, cand := range c.ns(dbOid).tables {
+				if cand.Virtual || cand.OID == 0 {
+					continue
+				}
+				if strings.EqualFold(cand.Name, fk.RefTable) {
+					refTbl = cand
+					break
+				}
+			}
+			var confrelid uint32
+			refColOrd := map[string]int{}
+			if refTbl != nil {
+				confrelid = refTbl.OID
+				for i, col := range refTbl.Columns {
+					refColOrd[strings.ToLower(col.Name)] = i + 1
+				}
+			}
+			var conkey, confkey []string
+			for _, cn := range fk.Columns {
+				if ord, ok := colOrd[strings.ToLower(cn)]; ok {
+					conkey = append(conkey, fmt.Sprintf("%d", ord))
+				}
+			}
+			for _, cn := range fk.RefColumns {
+				if ord, ok := refColOrd[strings.ToLower(cn)]; ok {
+					confkey = append(confkey, fmt.Sprintf("%d", ord))
+				}
+			}
+			// confdelsetcols (PG15): attnums of the columns an ON DELETE SET
+			// NULL|DEFAULT is restricted to. NULL when the action covers the
+			// whole key, matching PG (decompile_column_index_array emits the
+			// ` (col, …)` suffix only when this is non-null). DU-002 slice 311.
+			var confdelsetcols []string
+			for _, cn := range fk.OnDeleteSetCols {
+				if ord, ok := colOrd[strings.ToLower(cn)]; ok {
+					confdelsetcols = append(confdelsetcols, fmt.Sprintf("%d", ord))
+				}
+			}
+			row := make([]string, 26)
+			row[0] = fmt.Sprintf("%d", fk.OID) // oid
+			row[1] = fk.Name                   // conname
+			row[2] = "2200"                    // connamespace (public)
+			row[3] = "f"                       // contype = foreign key
+			if fk.Deferrable {
+				row[4] = "t"
+			} else {
+				row[4] = "f" // condeferrable
+			}
+			if fk.InitiallyDeferred {
+				row[5] = "t"
+			} else {
+				row[5] = "f" // condeferred
+			}
+			if fk.NotValid || fk.NotEnforced {
+				row[6] = "f" // convalidated — NOT VALID (or implied by NOT ENFORCED)
+			} else {
+				row[6] = "t" // convalidated
+			}
+			row[7] = fmt.Sprintf("%d", tbl.OID) // conrelid
+			row[8] = "0"                        // contypid
+			row[9] = "0"                        // conindid (unique idx on ref tbl; unused by deparse)
+			row[10] = "0"                       // conparentid (0 → pg_dump WHERE conparentid=0 keeps it)
+			row[11] = fmt.Sprintf("%d", confrelid)
+			row[12] = string(fkActionChar(fk.OnUpdate)) // confupdtype
+			row[13] = string(fkActionChar(fk.OnDelete)) // confdeltype
+			if fk.MatchFull {
+				row[14] = "f" // confmatchtype = MATCH FULL
+			} else {
+				row[14] = "s" // confmatchtype = MATCH SIMPLE (default)
+			}
+			row[15] = "t"                               // conislocal
+			row[16] = "0"                               // coninhcount
+			row[17] = "f"                               // connoinherit
+			row[18] = "f"                               // conperiod
+			row[19] = "{" + strings.Join(conkey, ",") + "}"
+			row[20] = "{" + strings.Join(confkey, ",") + "}"
+			if len(confdelsetcols) > 0 {
+				row[23] = "{" + strings.Join(confdelsetcols, ",") + "}" // confdelsetcols
+			}
+			if fk.NotEnforced {
+				row[25] = "f" // conenforced — FOREIGN KEY ... NOT ENFORCED. DU-002 slice 431.
+			} else {
+				row[25] = "t" // conenforced
+			}
+			out = append(out, row)
+		}
+	}
+	return out
+}
+
+// PGAttrdefRowsForDBOid builds the pg_attrdef catalog row-set for dbOid's own
+// tables' column defaults (mirrors PGConstraintRowsForDBOid's per-connection
+// dbOid scoping above). registerSystemTables's VirtualRows closure calls this
+// with DefaultDBOid so every existing caller (server dispatch without a
+// per-connection PgAttrdefRows wire-up, every test) sees byte-identical
+// behavior; a per-connection dbOid is wired in via
+// executor.Context.PgAttrdefRows (internal/server/dispatch.go's
+// wireExtensionRows). attrDefRowsLockedForDBOid's oid numbering must stay in
+// lockstep with PGDependRowsForDBOid below (both call it with the same dbOid)
+// — pg_dump's pg_depend→pg_attrdef join relies on the two views agreeing on
+// which oid names which default. M0122-0007 4e follow-up 27.
+func (c *InMemory) PGAttrdefRowsForDBOid(dbOid uint32) [][]string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	ar := c.attrDefRowsLockedForDBOid(dbOid)
+	rows := make([][]string, 0, len(ar))
+	for _, r := range ar {
+		rows = append(rows, []string{
+			strconv.FormatUint(uint64(r.oid), 10),
+			strconv.FormatUint(uint64(r.tableOID), 10),
+			strconv.Itoa(r.attnum),
+			r.adbin,
+		})
+	}
+	return rows
+}
+
+// PGIndexRowsForDBOid builds the pg_index catalog row-set for dbOid's own
+// indexes (mirrors PGConstraintRowsForDBOid's per-connection dbOid scoping
+// above). registerSystemTables's VirtualRows closure calls this with
+// DefaultDBOid so every existing caller (server dispatch without a
+// per-connection PgIndexRows wire-up, every test) sees byte-identical
+// behavior; a per-connection dbOid is wired in via
+// executor.Context.PgIndexRows (internal/server/dispatch.go's
+// wireExtensionRows). M0122-0007 4e follow-up 26.
+func (c *InMemory) PGIndexRowsForDBOid(dbOid uint32) [][]string {
+	idxs := c.AllIndexes(dbOid)
+	out := make([][]string, 0, len(idxs))
+	for _, idx := range idxs {
+		if idx.Table == nil {
+			continue
+		}
+		// Build column-ordinal lookups (1-based) for the parent table.
+		colOrd := make(map[string]int, len(idx.Table.Columns))
+		for _, col := range idx.Table.Columns {
+			colOrd[col.Name] = col.Ordinal + 1
+		}
+		// indkey: key columns then include columns; expression columns get ordinal 0.
+		keyParts := make([]string, 0, len(idx.Columns)+len(idx.IncludeColumns))
+		for _, col := range idx.Columns {
+			if col == "" {
+				keyParts = append(keyParts, "0")
+			} else if ord, ok := colOrd[col]; ok {
+				keyParts = append(keyParts, fmt.Sprintf("%d", ord))
+			} else {
+				keyParts = append(keyParts, "0")
+			}
+		}
+		for _, col := range idx.IncludeColumns {
+			if ord, ok := colOrd[col]; ok {
+				keyParts = append(keyParts, fmt.Sprintf("%d", ord))
+			} else {
+				keyParts = append(keyParts, "0")
+			}
+		}
+		indkey := strings.Join(keyParts, " ")
+		// indclass: one opclass OID per key column, via the shared
+		// resolver (also used by buildUserPGIndexRow's heap-row twin —
+		// internal/executor/pg18_user_catalog_rows.go — so the live and
+		// heap-persisted renderings never diverge).
+		opclassMethodOID := AccessMethodOIDByName(idx.Method)
+		if opclassMethodOID == 0 {
+			opclassMethodOID = btreeAccessMethodOID
+		}
+		classOIDs := make([]string, len(idx.Columns))
+		for i, col := range idx.Columns {
+			var explicit, typeName string
+			if i < len(idx.ColOpClasses) {
+				explicit = idx.ColOpClasses[i]
+			}
+			if col != "" {
+				for _, tc := range idx.Table.Columns {
+					if tc.Name == col {
+						typeName = tc.Type.Name
+						break
+					}
+				}
+			}
+			classOIDs[i] = fmt.Sprintf("%d", c.ResolveIndexColumnOpclassOID(explicit, typeName, opclassMethodOID))
+		}
+		indclass := strings.Join(classOIDs, " ")
+		boolStr := func(b bool) string {
+			if b {
+				return "t"
+			}
+			return "f"
+		}
+		natts := len(idx.Columns) + len(idx.IncludeColumns)
+		nkeyatts := len(idx.Columns)
+		// indcollation: per-key-column explicit COLLATE OID via the shared
+		// resolver (0 = not collatable / no explicit collation given; see
+		// ResolveIndexColumnCollationOID's doc comment for why this is also
+		// shared with buildUserPGIndexRow's heap-row twin).
+		collationParts := make([]string, nkeyatts)
+		for i := range collationParts {
+			var explicit string
+			if i < len(idx.ColCollations) {
+				explicit = idx.ColCollations[i]
+			}
+			collationParts[i] = fmt.Sprintf("%d", c.ResolveIndexColumnCollationOID(explicit))
+		}
+		indcollation := strings.Join(collationParts, " ")
+		// indoption: per-key ASC/DESC + NULLS FIRST/LAST bitmask, mirroring
+		// upstream's INDOPTION_DESC (0x1) / INDOPTION_NULLS_FIRST (0x2).
+		indoptionParts := make([]string, nkeyatts)
+		for i := range indoptionParts {
+			var bits int
+			if i < len(idx.ColDescending) && idx.ColDescending[i] {
+				bits |= 0x0001
+			}
+			if i < len(idx.ColNullsFirst) && idx.ColNullsFirst[i] {
+				bits |= 0x0002
+			}
+			indoptionParts[i] = fmt.Sprintf("%d", bits)
+		}
+		indoption := strings.Join(indoptionParts, " ")
+		// indpred: a partial index's WHERE predicate rendered as SQL text
+		// (goopg stores pg_node_tree columns as plain SQL, mirroring the
+		// executor heap-row twin buildUserPGIndexRow in
+		// internal/executor/pg18_user_catalog_rows.go). It reads back via
+		// pg_get_expr, which is a pass-through. Must be VirtualNull (→ SQL NULL)
+		// when the index is not partial: a plain "" here read as a non-NULL
+		// empty string, so `SELECT indpred FROM pg_index` and
+		// `pg_get_expr(indpred, indrelid)` returned '' instead of NULL, and
+		// `indpred IS NOT NULL` matched every index. indcoloptions is always NULL
+		// in this path; indexprs is populated below for expression indexes.
+		indpred := VirtualNull
+		if idx.HasPredicate {
+			indpred = idx.PredicateString
+		}
+		// indexprs: deparsed expression text for expression key columns
+		// (Columns[i]=="", the ordinal-0 indkey entries above), rendered exactly
+		// as pg_get_expr(indexprs, indrelid) does. VirtualNull (SQL NULL) when the
+		// index has no expression columns. Shared with the heap-row twin
+		// buildUserPGIndexRow via IndexExprsText.
+		indexprs := VirtualNull
+		if exprsText, ok := IndexExprsText(idx); ok {
+			indexprs = exprsText
+		}
+		out = append(out, []string{
+			fmt.Sprintf("%d", idx.OID),       // indexrelid
+			fmt.Sprintf("%d", idx.Table.OID), // indrelid
+			fmt.Sprintf("%d", natts),         // indnatts
+			fmt.Sprintf("%d", nkeyatts),      // indnkeyatts
+			boolStr(idx.Unique),              // indisunique
+			boolStr(idx.NullsNotDistinct),    // indnullsnotdistinct
+			boolStr(idx.Primary),             // indisprimary
+			boolStr(idx.IsExclusion),         // indisexclusion
+			"t",                              // indimmediate
+			boolStr(idx.IsClustered),         // indisclustered (DU-002 slice 320)
+			"t",                              // indisvalid
+			"f",                              // indcheckxmin
+			"t",                              // indisready
+			"t",                              // indislive
+			boolStr(idx.IsReplicaIdentity),   // indisreplident (DU-002 slice 306)
+			indkey,                           // indkey
+			indcollation,                     // indcollation
+			indclass,                         // indclass
+			indoption,                        // indoption
+			indexprs,                         // indexprs (expr text for expression indexes, else NULL)
+			indpred,                          // indpred (WHERE text for partial, else NULL)
+			VirtualNull,                      // indcoloptions (NULL)
+		})
+	}
+	// Synthesize the unique btree index PG auto-creates on every TOAST
+	// relation (on chunk_id, chunk_seq). The pg_class virtual builder emits
+	// the matching relkind='i' row named pg_toast_<oid>_index; this row lets
+	//   SELECT indexrelid::regclass FROM pg_index
+	//     WHERE indrelid = (SELECT oid FROM pg_class WHERE relname=<toast rel>)
+	// resolve (reindex-concurrently-toast setup). toastBearingTables uses the
+	// SAME gate as the pg_class TOAST-row emission so the two never diverge.
+	// M0118-0008 TOAST-exposure slice 3.
+	for _, t := range c.toastBearingTables(dbOid) {
+		toastRelOID := int(t.OID) + toastRelidOffset
+		toastIdxOID := int(t.OID) + toastIndexOidOffset
+		out = append(out, []string{
+			fmt.Sprintf("%d", toastIdxOID), // indexrelid
+			fmt.Sprintf("%d", toastRelOID), // indrelid
+			"2",                            // indnatts (chunk_id, chunk_seq)
+			"2",                            // indnkeyatts
+			"t",                            // indisunique
+			"f",                            // indnullsnotdistinct
+			"f",                            // indisprimary
+			"f",                            // indisexclusion
+			"t",                            // indimmediate
+			"f",                            // indisclustered
+			"t",                            // indisvalid
+			"f",                            // indcheckxmin
+			"t",                            // indisready
+			"t",                            // indislive
+			"f",                            // indisreplident
+			"1 2",                          // indkey (chunk_id=1, chunk_seq=2)
+			"0 0",                          // indcollation (int4 columns: no collation)
+			"1978 1978",                    // indclass (int4_ops btree)
+			"0 0",                          // indoption
+			VirtualNull,                    // indexprs (NULL — TOAST index is never expression/partial)
+			VirtualNull,                    // indpred (NULL)
+			VirtualNull,                    // indcoloptions (NULL)
+		})
+	}
+	return out
+}
+
+func (c *InMemory) PGClassRowsForDBOid(dbOid uint32) [][]string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	keys := make([]string, 0, len(c.ns(dbOid).tables))
+	for k := range c.ns(dbOid).tables {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([][]string, 0, len(c.ns(dbOid).tables)+len(c.ns(dbOid).indexes))
+	for _, k := range keys {
+		t := c.ns(dbOid).tables[k]
 			if t.Virtual && t.View == nil && !t.IsMatView && !t.IsSequence {
 				// Skip system-catalog virtual tables (pg_class, pg_locks, etc.)
 				// but include user views (t.View != nil), materialized views, and
@@ -5668,7 +6636,7 @@ func (c *InMemory) registerSystemTables() {
 				}
 			}
 			hasIdx := "f"
-			if len(c.byTable[t.OID]) > 0 {
+			if len(c.ns(dbOid).byTable[t.OID]) > 0 {
 				hasIdx = "t"
 			}
 			isPartition := "f"
@@ -5764,28 +6732,28 @@ func (c *InMemory) registerSystemTables() {
 				relacl = c.relaclTextLockedSeq(t.OID)
 			}
 			out = append(out, []string{
-				strconv.Itoa(int(t.OID)),     // 0:  oid
-				t.Name,                       // 1:  relname
-				strconv.Itoa(int(nsOID)),     // 2:  relnamespace
-				"0",                          // 3:  reltype
-				relOfType,                    // 4:  reloftype (typed table `OF type`; 0 otherwise, DU-002 slice 374)
-				"10",                         // 5:  relowner (bootstrap superuser)
-				relam,                        // 6:  relam (heap=2; 0 for sequences)
-				strconv.Itoa(int(t.OID)),     // 7:  relfilenode
-				"0",                          // 8:  reltablespace
-				relpages,                     // 9:  relpages
-				reltuples,                    // 10: reltuples
-				"0",                          // 11: relallvisible
-				"0",                          // 12: relallfrozen
-				reltoastrelid,                // 13: reltoastrelid
-				hasIdx,                       // 14: relhasindex
-				"f",                          // 15: relisshared
-				relpers,                      // 16: relpersistence
-				relkind,                      // 17: relkind
-				strconv.Itoa(len(t.Columns)), // 18: relnatts
-				strconv.Itoa(relchecks),      // 19: relchecks
-				"f",                          // 20: relhasrules
-				relHasTriggers,               // 21: relhastriggers
+				strconv.Itoa(int(t.OID)),        // 0:  oid
+				t.Name,                          // 1:  relname
+				strconv.Itoa(int(nsOID)),        // 2:  relnamespace
+				"0",                             // 3:  reltype
+				relOfType,                       // 4:  reloftype (typed table `OF type`; 0 otherwise, DU-002 slice 374)
+				"10",                            // 5:  relowner (bootstrap superuser)
+				relam,                           // 6:  relam (heap=2; 0 for sequences)
+				strconv.Itoa(int(t.OID)),        // 7:  relfilenode
+				strconv.Itoa(int(t.Tablespace)), // 8:  reltablespace (0 = default; explicit CREATE TABLE ... TABLESPACE otherwise, M0122-0007)
+				relpages,                        // 9:  relpages
+				reltuples,                       // 10: reltuples
+				"0",                             // 11: relallvisible
+				"0",                             // 12: relallfrozen
+				reltoastrelid,                   // 13: reltoastrelid
+				hasIdx,                          // 14: relhasindex
+				"f",                             // 15: relisshared
+				relpers,                         // 16: relpersistence
+				relkind,                         // 17: relkind
+				strconv.Itoa(len(t.Columns)),    // 18: relnatts
+				strconv.Itoa(relchecks),         // 19: relchecks
+				"f",                             // 20: relhasrules
+				relHasTriggers,                  // 21: relhastriggers
 				func() string {
 					if len(c.partitionChildren[t.OID]) > 0 {
 						return "t"
@@ -5906,13 +6874,13 @@ func (c *InMemory) registerSystemTables() {
 			}
 		}
 		// Emit index rows (relkind='i'/'I') so pg_class can be used to count indexes.
-		idxKeys := make([]string, 0, len(c.indexes))
-		for k := range c.indexes {
+		idxKeys := make([]string, 0, len(c.ns(dbOid).indexes))
+		for k := range c.ns(dbOid).indexes {
 			idxKeys = append(idxKeys, k)
 		}
 		sort.Strings(idxKeys)
 		for _, k := range idxKeys {
-			idx := c.indexes[k]
+			idx := c.ns(dbOid).indexes[k]
 			// Resolve namespace from the index's table.
 			idxNsOID := uint32(2200)
 			if idx.Table != nil {
@@ -5954,6 +6922,11 @@ func (c *InMemory) registerSystemTables() {
 			// are joined in declaration-stable order (fillfactor first), mirroring
 			// the array order PG stores. DU-002 slices 218/219.
 			idxReloptions := BuildIndexReloptions(idx)
+			// reltablespace: 0 = default; explicit CREATE/ALTER INDEX ...
+			// TABLESPACE otherwise. Hoisted to a local so the row literal
+			// below keeps its single-token column width (and comment
+			// alignment), same convention as relOfType above. M0122-0007.
+			idxTablespace := strconv.Itoa(int(idx.Tablespace))
 			out = append(out, []string{
 				strconv.Itoa(int(idx.OID)),  // 0:  oid
 				idx.Name,                    // 1:  relname
@@ -5963,7 +6936,7 @@ func (c *InMemory) registerSystemTables() {
 				"10",                        // 5:  relowner
 				idxRelam,                    // 6:  relam
 				strconv.Itoa(int(idx.OID)),  // 7:  relfilenode
-				"0",                         // 8:  reltablespace
+				idxTablespace,               // 8:  reltablespace
 				"0",                         // 9:  relpages
 				"-1",                        // 10: reltuples (-1 = unknown for indexes)
 				"0",                         // 11: relallvisible
@@ -6086,8 +7059,525 @@ func (c *InMemory) registerSystemTables() {
 			"",         // 33: relpartbound
 		})
 		return out
+}
+
+// StatTableScope selects which relations PGStatTablesRowsForDBOid emits, mirroring
+// the WHERE clauses of PG's pg_stat_{all,user,sys}_tables system views
+// (src/backend/catalog/system_views.sql).
+type StatTableScope int
+
+const (
+	StatScopeAll  StatTableScope = iota // pg_stat_all_tables (every relkind r/m/p relation)
+	StatScopeUser                       // pg_stat_user_tables (non-system schemas)
+	StatScopeSys                        // pg_stat_sys_tables (pg_catalog/information_schema/pg_toast*)
+)
+
+// isSystemStatSchema reports whether a schema belongs to the "system" side of
+// PG's pg_stat_sys_tables/pg_stat_user_tables split: schemaname IN
+// ('pg_catalog','information_schema') OR schemaname ~ '^pg_toast'.
+func isSystemStatSchema(schema string) bool {
+	s := strings.ToLower(schema)
+	return s == "pg_catalog" || s == "information_schema" || strings.HasPrefix(s, "pg_toast")
+}
+
+// PGStatTablesRowsForDBOid builds the pg_stat_all_tables / pg_stat_user_tables /
+// pg_stat_sys_tables row set for one database, scoped by `scope`. It mirrors
+// upstream's view (system_views.sql: SELECT over pg_class LEFT JOIN pg_index,
+// relkind IN ('r','t','m','p')) but goopg has no incremental pgstat mutation
+// counters (no PgStat_StatTabEntry), so every per-tuple/scan counter is a
+// faithful 0 and every last_* timestamp is NULL — the same honest-0/NULL shape
+// pg_stat_io uses for the I/O cells goopg does not track. The three real cells
+// are relid / schemaname / relname; n_live_tup is backed by the table's
+// ANALYZE-persisted live-tuple estimate (reltuples, TableStats.RowCount), the
+// best available signal absent a live counter. See docs/design/
+// 0122-0003-pg-stat-user-tables.md.
+//
+// Only ordinary tables ('r'), materialized views ('m') and partitioned parents
+// ('p') are emitted — the same user-relation set PGClassRowsForDBOid surfaces.
+// goopg's system catalogs are storage-less virtual tables with no TableStats, so
+// pg_stat_sys_tables is effectively empty (documented deferral); TOAST relations
+// ('t') are synthesized only in pg_class and are likewise omitted here.
+func (c *InMemory) PGStatTablesRowsForDBOid(dbOid uint32, scope StatTableScope) [][]string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	keys := make([]string, 0, len(c.ns(dbOid).tables))
+	for k := range c.ns(dbOid).tables {
+		keys = append(keys, k)
 	}
-	c.tables["pg_catalog.pg_class"] = pgClass
+	sort.Strings(keys)
+	out := make([][]string, 0, len(keys))
+	for _, k := range keys {
+		t := c.ns(dbOid).tables[k]
+		// Skip system-catalog virtual tables, sequences, plain views and
+		// foreign tables — mirrors PGClassRowsForDBOid's relation filter so the
+		// two agree on the relkind r/m/p set.
+		if t.Virtual && t.View == nil && !t.IsMatView && !t.IsSequence {
+			continue
+		}
+		if t.IsSequence {
+			continue
+		}
+		if t.View != nil && !t.IsMatView {
+			continue
+		}
+		if t.ForeignServerName != "" {
+			continue
+		}
+		schema := t.Schema
+		if schema == "" {
+			schema = "public"
+		}
+		switch scope {
+		case StatScopeUser:
+			if isSystemStatSchema(schema) {
+				continue
+			}
+		case StatScopeSys:
+			if !isSystemStatSchema(schema) {
+				continue
+			}
+		}
+		nLiveTup := "0"
+		if t.Stats != nil {
+			nLiveTup = strconv.FormatInt(t.Stats.RowCount, 10)
+		}
+		N := VirtualNull
+		out = append(out, []string{
+			strconv.Itoa(int(t.OID)), // 0:  relid
+			schema,                   // 1:  schemaname
+			t.Name,                   // 2:  relname
+			"0",                      // 3:  seq_scan
+			N,                        // 4:  last_seq_scan
+			"0",                      // 5:  seq_tup_read
+			"0",                      // 6:  idx_scan
+			N,                        // 7:  last_idx_scan
+			"0",                      // 8:  idx_tup_fetch
+			"0",                      // 9:  n_tup_ins
+			"0",                      // 10: n_tup_upd
+			"0",                      // 11: n_tup_del
+			"0",                      // 12: n_tup_hot_upd
+			"0",                      // 13: n_tup_newpage_upd
+			nLiveTup,                 // 14: n_live_tup (reltuples estimate)
+			"0",                      // 15: n_dead_tup
+			"0",                      // 16: n_mod_since_analyze
+			"0",                      // 17: n_ins_since_vacuum
+			N,                        // 18: last_vacuum
+			N,                        // 19: last_autovacuum
+			N,                        // 20: last_analyze
+			N,                        // 21: last_autoanalyze
+			"0",                      // 22: vacuum_count
+			"0",                      // 23: autovacuum_count
+			"0",                      // 24: analyze_count
+			"0",                      // 25: autoanalyze_count
+		})
+	}
+	return out
+}
+
+// PGStatXactTablesRowsForDBOid builds the pg_stat_xact_all_tables /
+// pg_stat_xact_user_tables / pg_stat_xact_sys_tables row set for one database,
+// scoped by `scope`. These are the per-*transaction* siblings of the cumulative
+// pg_stat_*_tables views: upstream (system_views.sql) they report only the counters
+// accumulated by the current backend's in-progress transaction via
+// pg_stat_get_xact_* (seq_scan, seq_tup_read, idx_scan, idx_tup_fetch, n_tup_ins,
+// n_tup_upd, n_tup_del, n_tup_hot_upd, n_tup_newpage_upd). There are NO n_live_tup /
+// last_* / vacuum cells — the xact views carry pure transaction-local deltas, no
+// snapshot estimates or timestamps.
+//
+// goopg has no per-transaction pgstat accumulator (no PgStat_TableXactStatus), so
+// every one of the 9 delta counters is a faithful 0 — exactly what a stock cluster
+// reports for a relation the current transaction has not yet touched. The three real
+// cells are relid / schemaname / relname. The relation set + user/sys split reuse the
+// SAME filter as PGStatTablesRowsForDBOid so the cumulative and xact table views agree
+// on which relations they surface. See docs/design/0122-0003-pg-stat-user-tables.md.
+func (c *InMemory) PGStatXactTablesRowsForDBOid(dbOid uint32, scope StatTableScope) [][]string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	keys := make([]string, 0, len(c.ns(dbOid).tables))
+	for k := range c.ns(dbOid).tables {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([][]string, 0, len(keys))
+	for _, k := range keys {
+		t := c.ns(dbOid).tables[k]
+		// Identical relation filter to PGStatTablesRowsForDBOid (relkind r/m/p):
+		// skip system-catalog virtual tables, sequences, plain views, foreign tables.
+		if t.Virtual && t.View == nil && !t.IsMatView && !t.IsSequence {
+			continue
+		}
+		if t.IsSequence {
+			continue
+		}
+		if t.View != nil && !t.IsMatView {
+			continue
+		}
+		if t.ForeignServerName != "" {
+			continue
+		}
+		schema := t.Schema
+		if schema == "" {
+			schema = "public"
+		}
+		switch scope {
+		case StatScopeUser:
+			if isSystemStatSchema(schema) {
+				continue
+			}
+		case StatScopeSys:
+			if !isSystemStatSchema(schema) {
+				continue
+			}
+		}
+		out = append(out, []string{
+			strconv.Itoa(int(t.OID)), // 0:  relid
+			schema,                   // 1:  schemaname
+			t.Name,                   // 2:  relname
+			"0",                      // 3:  seq_scan
+			"0",                      // 4:  seq_tup_read
+			"0",                      // 5:  idx_scan
+			"0",                      // 6:  idx_tup_fetch
+			"0",                      // 7:  n_tup_ins
+			"0",                      // 8:  n_tup_upd
+			"0",                      // 9:  n_tup_del
+			"0",                      // 10: n_tup_hot_upd
+			"0",                      // 11: n_tup_newpage_upd
+		})
+	}
+	return out
+}
+
+// PGStatIndexesRowsForDBOid builds the pg_stat_all_indexes / pg_stat_user_indexes
+// / pg_stat_sys_indexes row set for one database, scoped by `scope` (reusing the
+// same StatTableScope user/sys split as the per-table views). It mirrors
+// upstream's view (system_views.sql: pg_class C JOIN pg_index X JOIN pg_class I,
+// WHERE C.relkind IN ('r','t','m'), one row per index) but goopg has no
+// incremental pgstat index-scan counters (no PgStat_StatIndEntry), so idx_scan /
+// idx_tup_read / idx_tup_fetch are a faithful 0 and last_idx_scan is NULL — the
+// same honest-0/NULL shape the per-table views use. The five real cells are
+// relid / indexrelid / schemaname / relname / indexrelname.
+//
+// Enumeration reuses AllIndexes(dbOid); the parent table (idx.Table) is filtered
+// through the same relation predicate as PGStatTablesRowsForDBOid so the two views
+// agree on the relkind r/m/p set (system-catalog virtual tables, sequences, plain
+// views and foreign tables are skipped). schemaname is the parent table's schema
+// (upstream: N.nspname on C.relnamespace), matching the sys/user split key.
+// pg_stat_sys_indexes is therefore effectively empty, since goopg's system
+// catalogs are storage-less and carry no user indexes. See docs/design/
+// 0122-0003-pg-stat-user-tables.md.
+func (c *InMemory) PGStatIndexesRowsForDBOid(dbOid uint32, scope StatTableScope) [][]string {
+	idxs := c.AllIndexes(dbOid)
+	rows := make([][]string, 0, len(idxs))
+	for _, idx := range idxs {
+		t := idx.Table
+		if t == nil {
+			continue
+		}
+		// Same relation filter as PGStatTablesRowsForDBOid: skip system-catalog
+		// virtual tables, sequences, plain views and foreign tables so the table
+		// and index stat views agree on the underlying relkind r/m/p set.
+		if t.Virtual && t.View == nil && !t.IsMatView && !t.IsSequence {
+			continue
+		}
+		if t.IsSequence {
+			continue
+		}
+		if t.View != nil && !t.IsMatView {
+			continue
+		}
+		if t.ForeignServerName != "" {
+			continue
+		}
+		schema := t.Schema
+		if schema == "" {
+			schema = "public"
+		}
+		switch scope {
+		case StatScopeUser:
+			if isSystemStatSchema(schema) {
+				continue
+			}
+		case StatScopeSys:
+			if !isSystemStatSchema(schema) {
+				continue
+			}
+		}
+		rows = append(rows, []string{
+			strconv.Itoa(int(t.OID)),   // 0: relid (parent table oid)
+			strconv.Itoa(int(idx.OID)), // 1: indexrelid
+			schema,                     // 2: schemaname (parent table schema)
+			t.Name,                     // 3: relname (parent table name)
+			idx.Name,                   // 4: indexrelname
+			"0",                        // 5: idx_scan
+			VirtualNull,                // 6: last_idx_scan
+			"0",                        // 7: idx_tup_read
+			"0",                        // 8: idx_tup_fetch
+		})
+	}
+	// Deterministic order: by (schemaname, relname, indexrelname) — AllIndexes
+	// iteration order is map-derived and unstable.
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i][2] != rows[j][2] {
+			return rows[i][2] < rows[j][2]
+		}
+		if rows[i][3] != rows[j][3] {
+			return rows[i][3] < rows[j][3]
+		}
+		return rows[i][4] < rows[j][4]
+	})
+	return rows
+}
+
+// PGStatioTablesRowsForDBOid builds the pg_statio_all_tables / pg_statio_user_tables
+// / pg_statio_sys_tables row set for one database, scoped by `scope` (reusing the
+// same StatTableScope user/sys split as the per-table access-stat views). It mirrors
+// upstream's view (system_views.sql: SELECT over pg_class, relkind IN ('r','t','m'))
+// but goopg has no per-relation buffer-pool hit/read counters — the shared pool
+// counters pg_stat_io exposes are pool-wide, not attributable to an individual
+// relation — so every heap/idx/toast/tidx block counter is a faithful 0. The three
+// real cells are relid / schemaname / relname. This is the I/O sibling of
+// PGStatTablesRowsForDBOid and applies the identical relation filter so the two
+// views agree on the relkind r/m/p set. See docs/design/0122-0003-pg-stat-user-tables.md.
+func (c *InMemory) PGStatioTablesRowsForDBOid(dbOid uint32, scope StatTableScope) [][]string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	keys := make([]string, 0, len(c.ns(dbOid).tables))
+	for k := range c.ns(dbOid).tables {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([][]string, 0, len(keys))
+	for _, k := range keys {
+		t := c.ns(dbOid).tables[k]
+		// Same relation filter as PGStatTablesRowsForDBOid: skip system-catalog
+		// virtual tables, sequences, plain views and foreign tables.
+		if t.Virtual && t.View == nil && !t.IsMatView && !t.IsSequence {
+			continue
+		}
+		if t.IsSequence {
+			continue
+		}
+		if t.View != nil && !t.IsMatView {
+			continue
+		}
+		if t.ForeignServerName != "" {
+			continue
+		}
+		schema := t.Schema
+		if schema == "" {
+			schema = "public"
+		}
+		switch scope {
+		case StatScopeUser:
+			if isSystemStatSchema(schema) {
+				continue
+			}
+		case StatScopeSys:
+			if !isSystemStatSchema(schema) {
+				continue
+			}
+		}
+		out = append(out, []string{
+			strconv.Itoa(int(t.OID)), // 0:  relid
+			schema,                   // 1:  schemaname
+			t.Name,                   // 2:  relname
+			"0",                      // 3:  heap_blks_read
+			"0",                      // 4:  heap_blks_hit
+			"0",                      // 5:  idx_blks_read
+			"0",                      // 6:  idx_blks_hit
+			"0",                      // 7:  toast_blks_read
+			"0",                      // 8:  toast_blks_hit
+			"0",                      // 9:  tidx_blks_read
+			"0",                      // 10: tidx_blks_hit
+		})
+	}
+	return out
+}
+
+// PGStatioIndexesRowsForDBOid builds the pg_statio_all_indexes / pg_statio_user_indexes
+// / pg_statio_sys_indexes row set for one database, scoped by `scope`. It mirrors
+// upstream's view (system_views.sql: pg_class C JOIN pg_index X JOIN pg_class I,
+// WHERE C.relkind IN ('r','t','m'), one row per index) but goopg has no per-relation
+// buffer-pool counters, so idx_blks_read / idx_blks_hit are a faithful 0. The five
+// real cells are relid / indexrelid / schemaname / relname / indexrelname. Enumeration
+// reuses AllIndexes(dbOid) with the same relation filter as PGStatIndexesRowsForDBOid,
+// so the access-stat and I/O-stat index views agree on the relkind set. See
+// docs/design/0122-0003-pg-stat-user-tables.md.
+func (c *InMemory) PGStatioIndexesRowsForDBOid(dbOid uint32, scope StatTableScope) [][]string {
+	idxs := c.AllIndexes(dbOid)
+	rows := make([][]string, 0, len(idxs))
+	for _, idx := range idxs {
+		t := idx.Table
+		if t == nil {
+			continue
+		}
+		if t.Virtual && t.View == nil && !t.IsMatView && !t.IsSequence {
+			continue
+		}
+		if t.IsSequence {
+			continue
+		}
+		if t.View != nil && !t.IsMatView {
+			continue
+		}
+		if t.ForeignServerName != "" {
+			continue
+		}
+		schema := t.Schema
+		if schema == "" {
+			schema = "public"
+		}
+		switch scope {
+		case StatScopeUser:
+			if isSystemStatSchema(schema) {
+				continue
+			}
+		case StatScopeSys:
+			if !isSystemStatSchema(schema) {
+				continue
+			}
+		}
+		rows = append(rows, []string{
+			strconv.Itoa(int(t.OID)),   // 0: relid (parent table oid)
+			strconv.Itoa(int(idx.OID)), // 1: indexrelid
+			schema,                     // 2: schemaname (parent table schema)
+			t.Name,                     // 3: relname (parent table name)
+			idx.Name,                   // 4: indexrelname
+			"0",                        // 5: idx_blks_read
+			"0",                        // 6: idx_blks_hit
+		})
+	}
+	// Deterministic order: by (schemaname, relname, indexrelname) — AllIndexes
+	// iteration order is map-derived and unstable.
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i][2] != rows[j][2] {
+			return rows[i][2] < rows[j][2]
+		}
+		if rows[i][3] != rows[j][3] {
+			return rows[i][3] < rows[j][3]
+		}
+		return rows[i][4] < rows[j][4]
+	})
+	return rows
+}
+
+// PGStatioSequencesRowsForDBOid builds the pg_statio_all_sequences /
+// pg_statio_user_sequences / pg_statio_sys_sequences row set for one database, scoped
+// by `scope`. It mirrors upstream's view (system_views.sql: SELECT over pg_class
+// WHERE relkind = 'S') — the sequence counterpart of the per-table/per-index I/O
+// views. This is the ONLY pg_statio view whose relation filter selects sequences
+// (t.IsSequence) rather than skipping them. goopg has no per-relation buffer-pool
+// counters, so blks_read / blks_hit are a faithful 0; the three real cells are
+// relid / schemaname / relname. See docs/design/0122-0003-pg-stat-user-tables.md.
+func (c *InMemory) PGStatioSequencesRowsForDBOid(dbOid uint32, scope StatTableScope) [][]string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	keys := make([]string, 0, len(c.ns(dbOid).tables))
+	for k := range c.ns(dbOid).tables {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([][]string, 0, len(keys))
+	for _, k := range keys {
+		t := c.ns(dbOid).tables[k]
+		// Inverse of the table/index filter: emit ONLY sequences (relkind 'S').
+		if !t.IsSequence {
+			continue
+		}
+		schema := t.Schema
+		if schema == "" {
+			schema = "public"
+		}
+		switch scope {
+		case StatScopeUser:
+			if isSystemStatSchema(schema) {
+				continue
+			}
+		case StatScopeSys:
+			if !isSystemStatSchema(schema) {
+				continue
+			}
+		}
+		out = append(out, []string{
+			strconv.Itoa(int(t.OID)), // 0: relid
+			schema,                   // 1: schemaname
+			t.Name,                   // 2: relname
+			"0",                      // 3: blks_read
+			"0",                      // 4: blks_hit
+		})
+	}
+	return out
+}
+
+// PGStatUserFunctionsRows builds the pg_stat_user_functions /
+// pg_stat_xact_user_functions row set. Both upstream views (system_views.sql)
+// filter on `pg_stat_get_function_calls(oid) IS NOT NULL` (respectively the
+// _xact_ variant), which returns NULL for every function that has no collected
+// call statistics. With the default track_functions = none — and goopg has no
+// per-function call/time tracking at all — that predicate is never satisfied,
+// so both views are always empty on a faithfully-modelled default cluster,
+// exactly as they are on a stock PostgreSQL 18.3 instance out of the box.
+// Registering them lets `SELECT * FROM pg_stat_user_functions` return 0 rows
+// instead of an unknown-relation error, matching upstream. The 6-column shape
+// (funcid/schemaname/funcname/calls/total_time/self_time) is preserved for
+// clients that introspect the view's tupledesc. See
+// docs/design/0122-0003-pg-stat-user-tables.md. M0122-0003.
+func (c *InMemory) PGStatUserFunctionsRows() [][]string {
+	return nil
+}
+
+func (c *InMemory) registerSystemTables() {
+	pgClass := &Table{
+		Schema: "pg_catalog",
+		Name:   "pg_class",
+		// Columns match the PG18-canonical 34-column pg_class tupdesc written by
+		// syncTableToCatalogHeap / pgClassColumnsPG18(). This alignment is required
+		// so that scanMatching can decode physical pg_class heap tuples for UPDATE
+		// (e.g. "UPDATE pg_class SET reltuples = ... WHERE oid = ...").
+		// M0100-0010: sysupd2/sysmerge2 concurrent-update blocking fix.
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "relname", Type: Type{Name: "name"}, Ordinal: 1},
+			{Name: "relnamespace", Type: Type{Name: "oid"}, Ordinal: 2},
+			{Name: "reltype", Type: Type{Name: "oid"}, Ordinal: 3},
+			{Name: "reloftype", Type: Type{Name: "oid"}, Ordinal: 4},
+			{Name: "relowner", Type: Type{Name: "oid"}, Ordinal: 5},
+			{Name: "relam", Type: Type{Name: "oid"}, Ordinal: 6},
+			{Name: "relfilenode", Type: Type{Name: "oid"}, Ordinal: 7},
+			{Name: "reltablespace", Type: Type{Name: "oid"}, Ordinal: 8},
+			{Name: "relpages", Type: Type{Name: "int4"}, Ordinal: 9},
+			{Name: "reltuples", Type: Type{Name: "float4"}, Ordinal: 10},
+			{Name: "relallvisible", Type: Type{Name: "int4"}, Ordinal: 11},
+			{Name: "relallfrozen", Type: Type{Name: "int4"}, Ordinal: 12},
+			{Name: "reltoastrelid", Type: Type{Name: "oid"}, Ordinal: 13},
+			{Name: "relhasindex", Type: Type{Name: "bool"}, Ordinal: 14},
+			{Name: "relisshared", Type: Type{Name: "bool"}, Ordinal: 15},
+			{Name: "relpersistence", Type: Type{Name: "char"}, Ordinal: 16},
+			{Name: "relkind", Type: Type{Name: "char"}, Ordinal: 17},
+			{Name: "relnatts", Type: Type{Name: "int2"}, Ordinal: 18},
+			{Name: "relchecks", Type: Type{Name: "int2"}, Ordinal: 19},
+			{Name: "relhasrules", Type: Type{Name: "bool"}, Ordinal: 20},
+			{Name: "relhastriggers", Type: Type{Name: "bool"}, Ordinal: 21},
+			{Name: "relhassubclass", Type: Type{Name: "bool"}, Ordinal: 22},
+			{Name: "relrowsecurity", Type: Type{Name: "bool"}, Ordinal: 23},
+			{Name: "relforcerowsecurity", Type: Type{Name: "bool"}, Ordinal: 24},
+			{Name: "relispopulated", Type: Type{Name: "bool"}, Ordinal: 25},
+			{Name: "relreplident", Type: Type{Name: "char"}, Ordinal: 26},
+			{Name: "relispartition", Type: Type{Name: "bool"}, Ordinal: 27},
+			{Name: "relrewrite", Type: Type{Name: "oid"}, Ordinal: 28},
+			{Name: "relfrozenxid", Type: Type{Name: "xid"}, Ordinal: 29},
+			{Name: "relminmxid", Type: Type{Name: "xid"}, Ordinal: 30},
+			{Name: "relacl", Type: Type{Name: "aclitem[]"}, Ordinal: 31},
+			{Name: "reloptions", Type: Type{Name: "text[]"}, Ordinal: 32},
+			{Name: "relpartbound", Type: Type{Name: "pg_node_tree"}, Ordinal: 33},
+		},
+		OID:     1259, // upstream's RelationRelationId
+		Virtual: true,
+	}
+	pgClass.VirtualRows = func() [][]string {
+		return c.PGClassRowsForDBOid(DefaultDBOid)
+	}
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_class"] = pgClass
 
 	// pg_namespace — required by vacuumdb's table-discovery catalog query
 	// (M0095-0004). vacuumdb sends:
@@ -6127,7 +7617,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return out
 	}
-	c.tables["pg_catalog.pg_namespace"] = pgNamespace
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_namespace"] = pgNamespace
 
 	// pg_extension — backs pg_amcheck's "is amcheck installed?" probe
 	// (M0110-0003):
@@ -6163,7 +7653,7 @@ func (c *InMemory) registerSystemTables() {
 		defer c.mu.RUnlock()
 		return c.extensionRowsLocked("")
 	}
-	c.tables["pg_catalog.pg_extension"] = pgExtension
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_extension"] = pgExtension
 
 	// pg_indexes view. HammerDB's checkschema step queries
 	// `select tablename, indexname from pg_indexes where
@@ -6188,44 +7678,9 @@ func (c *InMemory) registerSystemTables() {
 		Virtual: true,
 	}
 	pgIndexes.VirtualRows = func() [][]string {
-		c.mu.RLock()
-		defer c.mu.RUnlock()
-		// Sort for deterministic output across calls.
-		tableKeys := make([]string, 0, len(c.tables))
-		for k, t := range c.tables {
-			if t.Virtual {
-				continue
-			}
-			tableKeys = append(tableKeys, k)
-		}
-		sort.Strings(tableKeys)
-		var out [][]string
-		for _, tk := range tableKeys {
-			t := c.tables[tk]
-			idxs := c.byTable[t.OID]
-			idxKeys := make([]string, 0, len(idxs))
-			for ik := range idxs {
-				idxKeys = append(idxKeys, ik)
-			}
-			sort.Strings(idxKeys)
-			for _, ik := range idxKeys {
-				idx := idxs[ik]
-				schema := idx.Schema
-				if schema == "" {
-					schema = "public"
-				}
-				out = append(out, []string{
-					schema,
-					t.Name,
-					idx.Name,
-					"", // tablespace
-					BuildIndexDef(idx),
-				})
-			}
-		}
-		return out
+		return c.PGIndexesRowsForDBOid(DefaultDBOid)
 	}
-	c.tables["pg_catalog.pg_indexes"] = pgIndexes
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_indexes"] = pgIndexes
 
 	// pg_database — HammerDB probes
 	// `SELECT 1 FROM pg_database WHERE datname = '<db>'` to
@@ -6309,12 +7764,21 @@ func (c *InMemory) registerSystemTables() {
 			// (initdb.go buildRow). Clients such as pg_amcheck filter on
 			// `datallowconn AND datconnlimit != -2`, so template0 is
 			// correctly omitted from --all while template1 is included.
-			oid, datallowconn, datistemplate := "16384", "true", "false"
+			// databaseDisplayOID renders the SQL-visible oid: template1→1,
+			// template0→4, a CreateDatabase-allocated database→its real distinct
+			// oid (M0122-0007 physical-storage-isolation slice 1), and every
+			// other row (notably the live "postgres" row, which never goes
+			// through CreateDatabase so DatabaseOid is 0)→the legacy 16384
+			// placeholder CREATE SUBSCRIPTION's subdbid and the datacl heap
+			// resync both key off (see the datacl comment below). Shared with
+			// PGStatDatabaseRows so pg_stat_database.datid joins to this exactly.
+			oid := c.databaseDisplayOID(n)
+			datallowconn, datistemplate := "true", "false"
 			switch n {
 			case "template1":
-				oid, datallowconn, datistemplate = "1", "true", "true"
+				datallowconn, datistemplate = "true", "true"
 			case "template0":
-				oid, datallowconn, datistemplate = "4", "false", "true"
+				datallowconn, datistemplate = "false", "true"
 			}
 			// datacl is keyed by c.DBOID() — the REAL on-disk OID read from the
 			// physical global/1262 heap by detectCatalogDBOID at startup (PG18's
@@ -6338,8 +7802,8 @@ func (c *InMemory) registerSystemTables() {
 			out = append(out, []string{
 				oid, // oid: conventional database OID (M0097-0021)
 				n,
-				"10",         // datdba: OID of owner (10 = postgres superuser)
-				"6",          // encoding: 6 = UTF8
+				strconv.FormatUint(uint64(c.DatabaseOwner(n)), 10), // datdba: real owner OID (M0122-0007), default BootstrapSuperuserOID (10)
+				"6", // encoding: 6 = UTF8
 				datallowconn, // datallowconn: allow connections
 				// datconnlimit: runtime override via `UPDATE pg_database SET
 				// datconnlimit = ...` (SetDatabaseConnLimit), default -1 = no
@@ -6361,7 +7825,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return out
 	}
-	c.tables["pg_catalog.pg_database"] = pgDatabase
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_database"] = pgDatabase
 
 	// pg_roles — HammerDB probes
 	// `SELECT 1 FROM pg_roles WHERE rolname = '<user>'` before
@@ -6433,7 +7897,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return out
 	}
-	c.tables["pg_catalog.pg_roles"] = pgRoles
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_roles"] = pgRoles
 
 	// pg_authid — the real, superuser-only role catalog pg_roles is a view
 	// over. pg_dumpall's dumpRoles/dumpUserConfig query it directly (not
@@ -6538,7 +8002,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return out
 	}
-	c.tables["pg_catalog.pg_authid"] = pgAuthid
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_authid"] = pgAuthid
 
 	// pg_auth_members — role membership (`GRANT <role> TO <role>`), sourced
 	// from the roleMembers registry GRANT/REVOKE ROLE maintains
@@ -6586,7 +8050,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return out
 	}
-	c.tables["pg_catalog.pg_auth_members"] = pgAuthMembers
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_auth_members"] = pgAuthMembers
 
 	// pg_parameter_acl — GUC-level ACLs (`GRANT SET|ALTER SYSTEM ON PARAMETER
 	// ...`). Registered so pg_dumpall's getParameterACLs query resolves
@@ -6626,7 +8090,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return out
 	}
-	c.tables["pg_catalog.pg_parameter_acl"] = pgParameterACL
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_parameter_acl"] = pgParameterACL
 
 	// pg_tables — HammerDB probes
 	// `SELECT 1 FROM pg_tables WHERE schemaname = 'public'` to
@@ -6646,28 +8110,9 @@ func (c *InMemory) registerSystemTables() {
 		Virtual: true,
 	}
 	pgTables.VirtualRows = func() [][]string {
-		c.mu.RLock()
-		defer c.mu.RUnlock()
-		keys := make([]string, 0, len(c.tables))
-		for k := range c.tables {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		var out [][]string
-		for _, k := range keys {
-			t := c.tables[k]
-			if t.Virtual {
-				continue
-			}
-			schema := t.Schema
-			if schema == "" {
-				schema = "public"
-			}
-			out = append(out, []string{schema, t.Name, "postgres"})
-		}
-		return out
+		return c.PGTablesRowsForDBOid(DefaultDBOid)
 	}
-	c.tables["pg_catalog.pg_tables"] = pgTables
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_tables"] = pgTables
 
 	// pg_settings — isolation specs use
 	// `SELECT setting FROM pg_settings WHERE name = 'default_transaction_isolation'`
@@ -6710,7 +8155,7 @@ func (c *InMemory) registerSystemTables() {
 				"user", "bool", "default", "", "", "", "on", "on", "", "", "f"},
 		}
 	}
-	c.tables["pg_catalog.pg_settings"] = pgSettings
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_settings"] = pgSettings
 
 	// pg_locks — advisory_lock.sql queries this to verify lock state.
 	// v0 returns empty rows (no lock tracking infrastructure). M0097-0010.
@@ -6738,7 +8183,7 @@ func (c *InMemory) registerSystemTables() {
 		},
 	}
 	pgLocks.VirtualRows = func() [][]string { return nil } // always empty in v0
-	c.tables["pg_catalog.pg_locks"] = pgLocks
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_locks"] = pgLocks
 
 	// pg_enum — one row per enum label. M0097-0017.
 	pgEnum := &Table{
@@ -6777,7 +8222,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return rows
 	}
-	c.tables["pg_catalog.pg_enum"] = pgEnum
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_enum"] = pgEnum
 
 	// NOTE: pg_type (OID 1247) is a heap-backed system catalog registered by
 	// initdb, NOT a virtual table. Do NOT add it here. M0097-0017 originally
@@ -6819,7 +8264,7 @@ func (c *InMemory) registerSystemTables() {
 		OID: 3391,
 	}
 	pgAvailExt.VirtualRows = func() [][]string { return nil }
-	c.tables["pg_catalog.pg_available_extensions"] = pgAvailExt
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_available_extensions"] = pgAvailExt
 
 	// pg_available_extension_versions — 0 rows is fine.
 	pgAvailExtVer := &Table{
@@ -6838,7 +8283,7 @@ func (c *InMemory) registerSystemTables() {
 		OID: 3392,
 	}
 	pgAvailExtVer.VirtualRows = func() [][]string { return nil }
-	c.tables["pg_catalog.pg_available_extension_versions"] = pgAvailExtVer
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_available_extension_versions"] = pgAvailExtVer
 
 	// pg_backend_memory_contexts — needs a row with level=1.
 	pgBackendMemCtx := &Table{
@@ -6868,7 +8313,7 @@ func (c *InMemory) registerSystemTables() {
 			{"Caller tuples", "", "TopMemoryContext", "2", "65536", "2", "32768", "0", "32768", "Bump", "{1,4}"},
 		}
 	}
-	c.tables["pg_catalog.pg_backend_memory_contexts"] = pgBackendMemCtx
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_backend_memory_contexts"] = pgBackendMemCtx
 
 	// pg_config — needs count > 20.
 	pgConfig := &Table{
@@ -6906,7 +8351,7 @@ func (c *InMemory) registerSystemTables() {
 			{"VERSION", "PostgreSQL 18.0"},
 		}
 	}
-	c.tables["pg_catalog.pg_config"] = pgConfig
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_config"] = pgConfig
 
 	// pg_cursors — count = 0 expected.
 	pgCursors := &Table{
@@ -6922,7 +8367,7 @@ func (c *InMemory) registerSystemTables() {
 		OID: 3395,
 	}
 	pgCursors.VirtualRows = func() [][]string { return nil }
-	c.tables["pg_catalog.pg_cursors"] = pgCursors
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_cursors"] = pgCursors
 
 	// pg_file_settings — 0 rows is fine.
 	pgFileSettings := &Table{
@@ -6939,7 +8384,7 @@ func (c *InMemory) registerSystemTables() {
 		OID: 3396,
 	}
 	pgFileSettings.VirtualRows = func() [][]string { return nil }
-	c.tables["pg_catalog.pg_file_settings"] = pgFileSettings
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_file_settings"] = pgFileSettings
 
 	// pg_hba_file_rules — sysviews.sql checks `count(*) > 0` and
 	// `count(*) FILTER (WHERE error IS NOT NULL) = 0`, so we must emit at
@@ -6972,7 +8417,7 @@ func (c *InMemory) registerSystemTables() {
 			{"1", "pg_hba.conf", "1", "local", "{all}", "{all}", "", "", "trust", "{}"},
 		}
 	}
-	c.tables["pg_catalog.pg_hba_file_rules"] = pgHbaRules
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_hba_file_rules"] = pgHbaRules
 
 	// pg_ident_file_mappings — 0 rows is fine, no errors needed.
 	pgIdentMappings := &Table{
@@ -6989,7 +8434,7 @@ func (c *InMemory) registerSystemTables() {
 		OID: 3398,
 	}
 	pgIdentMappings.VirtualRows = func() [][]string { return nil }
-	c.tables["pg_catalog.pg_ident_file_mappings"] = pgIdentMappings
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_ident_file_mappings"] = pgIdentMappings
 
 	// pg_prepared_statements — count = 0 expected.
 	pgPrepStmts := &Table{
@@ -7007,7 +8452,7 @@ func (c *InMemory) registerSystemTables() {
 		OID: 3399,
 	}
 	pgPrepStmts.VirtualRows = func() [][]string { return nil }
-	c.tables["pg_catalog.pg_prepared_statements"] = pgPrepStmts
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_prepared_statements"] = pgPrepStmts
 
 	// pg_prepared_xacts — 0 rows is fine.
 	pgPrepXacts := &Table{
@@ -7022,7 +8467,7 @@ func (c *InMemory) registerSystemTables() {
 		OID: 3400,
 	}
 	pgPrepXacts.VirtualRows = func() [][]string { return nil }
-	c.tables["pg_catalog.pg_prepared_xacts"] = pgPrepXacts
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_prepared_xacts"] = pgPrepXacts
 
 	// pg_stat_slru — needs count > 0.
 	pgStatSlru := &Table{
@@ -7058,7 +8503,7 @@ func (c *InMemory) registerSystemTables() {
 			{"other", "0", "0", "0", "0", "0", "0", "0", reset},
 		}
 	}
-	c.tables["pg_catalog.pg_stat_slru"] = pgStatSlru
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_stat_slru"] = pgStatSlru
 
 	// pg_stat_wal — exactly 1 row expected.
 	pgStatWal := &Table{
@@ -7081,7 +8526,238 @@ func (c *InMemory) registerSystemTables() {
 			{"0", "0", "0", "0", "0", "0", "0", "0", "2026-01-01 00:00:00+00"},
 		}
 	}
-	c.tables["pg_catalog.pg_stat_wal"] = pgStatWal
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_stat_wal"] = pgStatWal
+
+	// pg_stat_bgwriter — exactly 1 row (a single global cluster-wide summary).
+	// Upstream `system_views.sql` (PG 17+, after the checkpointer columns split
+	// out into pg_stat_checkpointer): buffers_clean / maxwritten_clean /
+	// buffers_alloc / stats_reset. goopg has no live background-writer counter
+	// accumulator wired to these columns (the storage.Pool bgwriter runs but its
+	// clean-write / buffer-allocation activity is not attributed here), so — like
+	// pg_stat_wal above — every counter is a faithful 0 and stats_reset is the
+	// fixed boot timestamp. See docs/design/0122-0003-pg-stat-user-tables.md.
+	pgStatBgwriter := &Table{
+		Schema: "pg_catalog", Name: "pg_stat_bgwriter", Virtual: true,
+		Columns: []Column{
+			{Name: "buffers_clean", Type: Type{Name: "int8"}, Ordinal: 0},
+			{Name: "maxwritten_clean", Type: Type{Name: "int8"}, Ordinal: 1},
+			{Name: "buffers_alloc", Type: Type{Name: "int8"}, Ordinal: 2},
+			{Name: "stats_reset", Type: Type{Name: "timestamptz"}, Ordinal: 3},
+		},
+		OID: 3406,
+	}
+	pgStatBgwriter.VirtualRows = func() [][]string {
+		return [][]string{
+			{"0", "0", "0", "2026-01-01 00:00:00+00"},
+		}
+	}
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_stat_bgwriter"] = pgStatBgwriter
+
+	// pg_stat_archiver — exactly 1 row (a single global WAL-archiver summary).
+	// Upstream `system_views.sql` (from pg_stat_get_archiver()): archived_count /
+	// last_archived_wal / last_archived_time / failed_count / last_failed_wal /
+	// last_failed_time / stats_reset. goopg has no WAL archiver (archive_mode is
+	// unsupported), so on a fresh cluster the two counts are 0, both last_*
+	// WAL-name and last_* timestamp cells are NULL (never archived / never
+	// failed), and stats_reset is the fixed boot timestamp — matching a real PG
+	// 18.3 cluster with archive_mode=off out of the box.
+	pgStatArchiver := &Table{
+		Schema: "pg_catalog", Name: "pg_stat_archiver", Virtual: true,
+		Columns: []Column{
+			{Name: "archived_count", Type: Type{Name: "int8"}, Ordinal: 0},
+			{Name: "last_archived_wal", Type: Type{Name: "text"}, Ordinal: 1},
+			{Name: "last_archived_time", Type: Type{Name: "timestamptz"}, Ordinal: 2},
+			{Name: "failed_count", Type: Type{Name: "int8"}, Ordinal: 3},
+			{Name: "last_failed_wal", Type: Type{Name: "text"}, Ordinal: 4},
+			{Name: "last_failed_time", Type: Type{Name: "timestamptz"}, Ordinal: 5},
+			{Name: "stats_reset", Type: Type{Name: "timestamptz"}, Ordinal: 6},
+		},
+		OID: 3407,
+	}
+	pgStatArchiver.VirtualRows = func() [][]string {
+		return [][]string{
+			{"0", VirtualNull, VirtualNull, "0", VirtualNull, VirtualNull, "2026-01-01 00:00:00+00"},
+		}
+	}
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_stat_archiver"] = pgStatArchiver
+
+	// pg_stat_database — one row per database plus a leading shared-objects row
+	// (datid=0, datname=NULL). Unlike the per-object pg_stat_*_tables views this
+	// is a GLOBAL row set (it lists every database regardless of which one the
+	// client is connected to), so — like pg_stat_bgwriter/pg_stat_archiver above
+	// — it needs no per-connection twin: the VirtualRows closure enumerates the
+	// live database registry (c.ListDatabases via PGStatDatabaseRows) at query
+	// time, so CREATE/DROP DATABASE is reflected immediately. Every per-database
+	// counter is a faithful 0 and stats_reset/checksum_last_failure are NULL
+	// (goopg has no PgStat_StatDBEntry accumulator). See
+	// docs/design/0122-0003-pg-stat-user-tables.md and catalog.PGStatDatabaseRows.
+	pgStatDatabase := &Table{
+		Schema: "pg_catalog", Name: "pg_stat_database", Virtual: true,
+		Columns: []Column{
+			{Name: "datid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "datname", Type: Type{Name: "name"}, Ordinal: 1},
+			{Name: "numbackends", Type: Type{Name: "int4"}, Ordinal: 2},
+			{Name: "xact_commit", Type: Type{Name: "int8"}, Ordinal: 3},
+			{Name: "xact_rollback", Type: Type{Name: "int8"}, Ordinal: 4},
+			{Name: "blks_read", Type: Type{Name: "int8"}, Ordinal: 5},
+			{Name: "blks_hit", Type: Type{Name: "int8"}, Ordinal: 6},
+			{Name: "tup_returned", Type: Type{Name: "int8"}, Ordinal: 7},
+			{Name: "tup_fetched", Type: Type{Name: "int8"}, Ordinal: 8},
+			{Name: "tup_inserted", Type: Type{Name: "int8"}, Ordinal: 9},
+			{Name: "tup_updated", Type: Type{Name: "int8"}, Ordinal: 10},
+			{Name: "tup_deleted", Type: Type{Name: "int8"}, Ordinal: 11},
+			{Name: "conflicts", Type: Type{Name: "int8"}, Ordinal: 12},
+			{Name: "temp_files", Type: Type{Name: "int8"}, Ordinal: 13},
+			{Name: "temp_bytes", Type: Type{Name: "int8"}, Ordinal: 14},
+			{Name: "deadlocks", Type: Type{Name: "int8"}, Ordinal: 15},
+			{Name: "checksum_failures", Type: Type{Name: "int8"}, Ordinal: 16},
+			{Name: "checksum_last_failure", Type: Type{Name: "timestamptz"}, Ordinal: 17},
+			{Name: "blk_read_time", Type: Type{Name: "float8"}, Ordinal: 18},
+			{Name: "blk_write_time", Type: Type{Name: "float8"}, Ordinal: 19},
+			{Name: "session_time", Type: Type{Name: "float8"}, Ordinal: 20},
+			{Name: "active_time", Type: Type{Name: "float8"}, Ordinal: 21},
+			{Name: "idle_in_transaction_time", Type: Type{Name: "float8"}, Ordinal: 22},
+			{Name: "sessions", Type: Type{Name: "int8"}, Ordinal: 23},
+			{Name: "sessions_abandoned", Type: Type{Name: "int8"}, Ordinal: 24},
+			{Name: "sessions_fatal", Type: Type{Name: "int8"}, Ordinal: 25},
+			{Name: "sessions_killed", Type: Type{Name: "int8"}, Ordinal: 26},
+			{Name: "parallel_workers_to_launch", Type: Type{Name: "int8"}, Ordinal: 27},
+			{Name: "parallel_workers_launched", Type: Type{Name: "int8"}, Ordinal: 28},
+			{Name: "stats_reset", Type: Type{Name: "timestamptz"}, Ordinal: 29},
+		},
+		OID: 9101,
+	}
+	pgStatDatabase.VirtualRows = c.PGStatDatabaseRows
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_stat_database"] = pgStatDatabase
+
+	// pg_stat_database_conflicts — one row per database (NO leading shared-objects
+	// row; upstream's view is a bare "FROM pg_database D"). Like pg_stat_database
+	// this is a GLOBAL row set independent of the connected DB, so it needs no
+	// per-connection twin: the VirtualRows closure enumerates the live registry
+	// (c.ListDatabases via PGStatDatabaseConflictsRows) at query time. Every
+	// confl_* counter is a faithful 0 — these only increment on a standby during
+	// hot-standby recovery conflicts and goopg is a primary with no recovery-
+	// conflict accumulator (matches a real PG 18.3 primary byte-for-byte). See
+	// docs/design/0122-0003-pg-stat-user-tables.md and PGStatDatabaseConflictsRows.
+	pgStatDatabaseConflicts := &Table{
+		Schema: "pg_catalog", Name: "pg_stat_database_conflicts", Virtual: true,
+		Columns: []Column{
+			{Name: "datid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "datname", Type: Type{Name: "name"}, Ordinal: 1},
+			{Name: "confl_tablespace", Type: Type{Name: "int8"}, Ordinal: 2},
+			{Name: "confl_lock", Type: Type{Name: "int8"}, Ordinal: 3},
+			{Name: "confl_snapshot", Type: Type{Name: "int8"}, Ordinal: 4},
+			{Name: "confl_bufferpin", Type: Type{Name: "int8"}, Ordinal: 5},
+			{Name: "confl_deadlock", Type: Type{Name: "int8"}, Ordinal: 6},
+			{Name: "confl_active_logicalslot", Type: Type{Name: "int8"}, Ordinal: 7},
+		},
+		OID: 9102,
+	}
+	pgStatDatabaseConflicts.VirtualRows = c.PGStatDatabaseConflictsRows
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_stat_database_conflicts"] = pgStatDatabaseConflicts
+
+	// pg_stats — the human-readable per-column planner-statistics view. Unlike
+	// every pg_stat_* runtime-counter view above, this projects the pg_statistic
+	// catalog (populated by ANALYZE) rather than a live counter subsystem: one row
+	// per analyzed, non-dropped column. It is per-database (lists the connecting
+	// database's own relations), so — like pg_stat_all_tables — the executor swaps
+	// in a per-connection ctx.CurrentDatabaseOid-scoped twin (fetchStatsRows); this
+	// static VirtualRows fallback scopes to DefaultDBOid. Array columns
+	// (most_common_vals / most_common_freqs / histogram_bounds) are emitted as PG
+	// array text literals, which TypedVirtualCell routes verbatim for the anyarray
+	// / float4[] cells. See catalog.PGStatsRowsForDBOid and
+	// docs/design/0122-0003-pg-stat-user-tables.md.
+	pgStats := &Table{
+		Schema: "pg_catalog", Name: "pg_stats", Virtual: true,
+		Columns: []Column{
+			{Name: "schemaname", Type: Type{Name: "name"}, Ordinal: 0},
+			{Name: "tablename", Type: Type{Name: "name"}, Ordinal: 1},
+			{Name: "attname", Type: Type{Name: "name"}, Ordinal: 2},
+			{Name: "inherited", Type: Type{Name: "bool"}, Ordinal: 3},
+			{Name: "null_frac", Type: Type{Name: "float4"}, Ordinal: 4},
+			{Name: "avg_width", Type: Type{Name: "int4"}, Ordinal: 5},
+			{Name: "n_distinct", Type: Type{Name: "float4"}, Ordinal: 6},
+			{Name: "most_common_vals", Type: Type{Name: "anyarray"}, Ordinal: 7},
+			{Name: "most_common_freqs", Type: Type{Name: "float4[]"}, Ordinal: 8},
+			{Name: "histogram_bounds", Type: Type{Name: "anyarray"}, Ordinal: 9},
+			{Name: "correlation", Type: Type{Name: "float4"}, Ordinal: 10},
+			{Name: "most_common_elems", Type: Type{Name: "anyarray"}, Ordinal: 11},
+			{Name: "most_common_elem_freqs", Type: Type{Name: "float4[]"}, Ordinal: 12},
+			{Name: "elem_count_histogram", Type: Type{Name: "float4[]"}, Ordinal: 13},
+			{Name: "range_length_histogram", Type: Type{Name: "anyarray"}, Ordinal: 14},
+			{Name: "range_empty_frac", Type: Type{Name: "float4"}, Ordinal: 15},
+			{Name: "range_bounds_histogram", Type: Type{Name: "anyarray"}, Ordinal: 16},
+		},
+		OID: 9160,
+	}
+	pgStats.VirtualRows = func() [][]string { return c.PGStatsRowsForDBOid(DefaultDBOid) }
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_stats"] = pgStats
+
+	// pg_stat_progress_* — the command-progress reporting family (VACUUM,
+	// ANALYZE, CLUSTER, CREATE INDEX, BASEBACKUP, COPY). Upstream each view is a
+	// projection over pg_stat_get_progress_info('<CMD>'), which returns exactly
+	// one row per backend currently executing that command with a progress-report
+	// slot registered (pgstat_progress_start_command / pgstat_progress_update_param
+	// in the backend). goopg does NOT instrument command progress — no backend
+	// ever calls pgstat_progress_start_command — so on a running instance, exactly
+	// as on an *idle* real PG 18.3 cluster (no VACUUM/ANALYZE/etc. in flight),
+	// every one of these views is empty. Registering them as static zero-row
+	// virtual views makes `SELECT * FROM pg_stat_progress_vacuum` (and siblings)
+	// resolve with the correct byte-identical tupledesc and return no rows, which
+	// is what monitoring tooling probes for. The live per-backend progress feed is
+	// a deferred gap — see docs/design/0122-0003-pg-stat-user-tables.md and the
+	// deferral ledger (2026-07-12, M0122-0003). Column names/types are transcribed
+	// from src/backend/catalog/system_views.sql; the CASE-mapped phase/command
+	// columns are text, the paramN counters are int8, pid is int4, and the *id
+	// columns are oid, matching pg_stat_get_progress_info's tupledesc.
+	mkProgressView := func(name string, oid uint32, cols [][2]string) {
+		tbl := &Table{Schema: "pg_catalog", Name: name, Virtual: true, OID: oid}
+		for i, col := range cols {
+			tbl.Columns = append(tbl.Columns, Column{Name: col[0], Type: Type{Name: col[1]}, Ordinal: i})
+		}
+		tbl.VirtualRows = func() [][]string { return [][]string{} }
+		c.ns(DefaultDBOid).tables["pg_catalog."+name] = tbl
+	}
+	mkProgressView("pg_stat_progress_vacuum", 9103, [][2]string{
+		{"pid", "int4"}, {"datid", "oid"}, {"datname", "name"}, {"relid", "oid"},
+		{"phase", "text"}, {"heap_blks_total", "int8"}, {"heap_blks_scanned", "int8"},
+		{"heap_blks_vacuumed", "int8"}, {"index_vacuum_count", "int8"},
+		{"max_dead_tuple_bytes", "int8"}, {"dead_tuple_bytes", "int8"},
+		{"num_dead_item_ids", "int8"}, {"indexes_total", "int8"},
+		{"indexes_processed", "int8"}, {"delay_time", "float8"},
+	})
+	mkProgressView("pg_stat_progress_analyze", 9104, [][2]string{
+		{"pid", "int4"}, {"datid", "oid"}, {"datname", "name"}, {"relid", "oid"},
+		{"phase", "text"}, {"sample_blks_total", "int8"}, {"sample_blks_scanned", "int8"},
+		{"ext_stats_total", "int8"}, {"ext_stats_computed", "int8"},
+		{"child_tables_total", "int8"}, {"child_tables_done", "int8"},
+		{"current_child_table_relid", "oid"}, {"delay_time", "float8"},
+	})
+	mkProgressView("pg_stat_progress_cluster", 9105, [][2]string{
+		{"pid", "int4"}, {"datid", "oid"}, {"datname", "name"}, {"relid", "oid"},
+		{"command", "text"}, {"phase", "text"}, {"cluster_index_relid", "oid"},
+		{"heap_tuples_scanned", "int8"}, {"heap_tuples_written", "int8"},
+		{"heap_blks_total", "int8"}, {"heap_blks_scanned", "int8"},
+		{"index_rebuild_count", "int8"},
+	})
+	mkProgressView("pg_stat_progress_create_index", 9106, [][2]string{
+		{"pid", "int4"}, {"datid", "oid"}, {"datname", "name"}, {"relid", "oid"},
+		{"index_relid", "oid"}, {"command", "text"}, {"phase", "text"},
+		{"lockers_total", "int8"}, {"lockers_done", "int8"}, {"current_locker_pid", "int8"},
+		{"blocks_total", "int8"}, {"blocks_done", "int8"}, {"tuples_total", "int8"},
+		{"tuples_done", "int8"}, {"partitions_total", "int8"}, {"partitions_done", "int8"},
+	})
+	mkProgressView("pg_stat_progress_basebackup", 9107, [][2]string{
+		{"pid", "int4"}, {"phase", "text"}, {"backup_total", "int8"},
+		{"backup_streamed", "int8"}, {"tablespaces_total", "int8"},
+		{"tablespaces_streamed", "int8"},
+	})
+	mkProgressView("pg_stat_progress_copy", 9108, [][2]string{
+		{"pid", "int4"}, {"datid", "oid"}, {"datname", "name"}, {"relid", "oid"},
+		{"command", "text"}, {"type", "text"}, {"bytes_processed", "int8"},
+		{"bytes_total", "int8"}, {"tuples_processed", "int8"},
+		{"tuples_excluded", "int8"}, {"tuples_skipped", "int8"},
+	})
 
 	// pg_stat_io — per-backend-type I/O statistics (PG 16+, OID 8061).
 	// The static VirtualRows fallback below returns no rows; the real,
@@ -7118,7 +8794,299 @@ func (c *InMemory) registerSystemTables() {
 		OID: 8061,
 	}
 	pgStatIO.VirtualRows = func() [][]string { return nil }
-	c.tables["pg_catalog.pg_stat_io"] = pgStatIO
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_stat_io"] = pgStatIO
+
+	// pg_stat_all_tables / pg_stat_user_tables / pg_stat_sys_tables — per-table
+	// access statistics (PG's system_views.sql). The static VirtualRows fallback
+	// below scopes to DefaultDBOid; the live, per-connection database-scoped row
+	// set is built by executor.fetchStatTablesRows and swapped in at Open time
+	// (valuesOp.Open's pg_stat_*_tables cases), mirroring the pg_stat_io wiring.
+	// goopg has no incremental pgstat mutation counters, so every per-tuple/scan
+	// counter is a faithful 0 and every last_* timestamp is NULL; relid /
+	// schemaname / relname are real and n_live_tup is the ANALYZE reltuples
+	// estimate. See docs/design/0122-0003-pg-stat-user-tables.md.
+	statTablesColumns := func() []Column {
+		return []Column{
+			{Name: "relid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "schemaname", Type: Type{Name: "name"}, Ordinal: 1},
+			{Name: "relname", Type: Type{Name: "name"}, Ordinal: 2},
+			{Name: "seq_scan", Type: Type{Name: "int8"}, Ordinal: 3},
+			{Name: "last_seq_scan", Type: Type{Name: "timestamptz"}, Ordinal: 4},
+			{Name: "seq_tup_read", Type: Type{Name: "int8"}, Ordinal: 5},
+			{Name: "idx_scan", Type: Type{Name: "int8"}, Ordinal: 6},
+			{Name: "last_idx_scan", Type: Type{Name: "timestamptz"}, Ordinal: 7},
+			{Name: "idx_tup_fetch", Type: Type{Name: "int8"}, Ordinal: 8},
+			{Name: "n_tup_ins", Type: Type{Name: "int8"}, Ordinal: 9},
+			{Name: "n_tup_upd", Type: Type{Name: "int8"}, Ordinal: 10},
+			{Name: "n_tup_del", Type: Type{Name: "int8"}, Ordinal: 11},
+			{Name: "n_tup_hot_upd", Type: Type{Name: "int8"}, Ordinal: 12},
+			{Name: "n_tup_newpage_upd", Type: Type{Name: "int8"}, Ordinal: 13},
+			{Name: "n_live_tup", Type: Type{Name: "int8"}, Ordinal: 14},
+			{Name: "n_dead_tup", Type: Type{Name: "int8"}, Ordinal: 15},
+			{Name: "n_mod_since_analyze", Type: Type{Name: "int8"}, Ordinal: 16},
+			{Name: "n_ins_since_vacuum", Type: Type{Name: "int8"}, Ordinal: 17},
+			{Name: "last_vacuum", Type: Type{Name: "timestamptz"}, Ordinal: 18},
+			{Name: "last_autovacuum", Type: Type{Name: "timestamptz"}, Ordinal: 19},
+			{Name: "last_analyze", Type: Type{Name: "timestamptz"}, Ordinal: 20},
+			{Name: "last_autoanalyze", Type: Type{Name: "timestamptz"}, Ordinal: 21},
+			{Name: "vacuum_count", Type: Type{Name: "int8"}, Ordinal: 22},
+			{Name: "autovacuum_count", Type: Type{Name: "int8"}, Ordinal: 23},
+			{Name: "analyze_count", Type: Type{Name: "int8"}, Ordinal: 24},
+			{Name: "autoanalyze_count", Type: Type{Name: "int8"}, Ordinal: 25},
+		}
+	}
+	for _, v := range []struct {
+		name  string
+		oid   uint32
+		scope StatTableScope
+	}{
+		{"pg_stat_all_tables", 9081, StatScopeAll},
+		{"pg_stat_sys_tables", 9082, StatScopeSys},
+		{"pg_stat_user_tables", 9083, StatScopeUser},
+	} {
+		scope := v.scope
+		tbl := &Table{
+			Schema: "pg_catalog", Name: v.name, Virtual: true,
+			Columns: statTablesColumns(),
+			OID:     v.oid,
+		}
+		tbl.VirtualRows = func() [][]string { return c.PGStatTablesRowsForDBOid(DefaultDBOid, scope) }
+		c.ns(DefaultDBOid).tables["pg_catalog."+v.name] = tbl
+	}
+
+	// pg_stat_all_indexes / pg_stat_user_indexes / pg_stat_sys_indexes — per-index
+	// access statistics (PG's system_views.sql), the direct sibling of the per-table
+	// views above. Same live-scoping wiring: the static VirtualRows fallback scopes
+	// to DefaultDBOid, executor.fetchStatIndexesRows resolves the connecting
+	// database and is swapped in at valuesOp.Open. goopg has no incremental index
+	// scan counters, so idx_scan/idx_tup_read/idx_tup_fetch are a faithful 0 and
+	// last_idx_scan NULL; relid/indexrelid/schemaname/relname/indexrelname are real.
+	// See catalog.PGStatIndexesRowsForDBOid and docs/design/
+	// 0122-0003-pg-stat-user-tables.md.
+	statIndexesColumns := func() []Column {
+		return []Column{
+			{Name: "relid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "indexrelid", Type: Type{Name: "oid"}, Ordinal: 1},
+			{Name: "schemaname", Type: Type{Name: "name"}, Ordinal: 2},
+			{Name: "relname", Type: Type{Name: "name"}, Ordinal: 3},
+			{Name: "indexrelname", Type: Type{Name: "name"}, Ordinal: 4},
+			{Name: "idx_scan", Type: Type{Name: "int8"}, Ordinal: 5},
+			{Name: "last_idx_scan", Type: Type{Name: "timestamptz"}, Ordinal: 6},
+			{Name: "idx_tup_read", Type: Type{Name: "int8"}, Ordinal: 7},
+			{Name: "idx_tup_fetch", Type: Type{Name: "int8"}, Ordinal: 8},
+		}
+	}
+	for _, v := range []struct {
+		name  string
+		oid   uint32
+		scope StatTableScope
+	}{
+		{"pg_stat_all_indexes", 9084, StatScopeAll},
+		{"pg_stat_sys_indexes", 9085, StatScopeSys},
+		{"pg_stat_user_indexes", 9086, StatScopeUser},
+	} {
+		scope := v.scope
+		tbl := &Table{
+			Schema: "pg_catalog", Name: v.name, Virtual: true,
+			Columns: statIndexesColumns(),
+			OID:     v.oid,
+		}
+		tbl.VirtualRows = func() [][]string { return c.PGStatIndexesRowsForDBOid(DefaultDBOid, scope) }
+		c.ns(DefaultDBOid).tables["pg_catalog."+v.name] = tbl
+	}
+
+	// pg_statio_all_tables / pg_statio_user_tables / pg_statio_sys_tables — per-table
+	// buffer-pool I/O statistics (PG's system_views.sql), the I/O sibling of the
+	// per-table access-stat views above. goopg has no per-relation buffer-pool
+	// hit/read counters (the shared counters pg_stat_io exposes are pool-wide, not
+	// attributable to one relation), so every heap/idx/toast/tidx block counter is a
+	// faithful 0; relid / schemaname / relname are real. Same live-scoping wiring:
+	// the static VirtualRows fallback scopes to DefaultDBOid, executor.
+	// fetchStatioTablesRows resolves the connecting database at valuesOp.Open. See
+	// catalog.PGStatioTablesRowsForDBOid and docs/design/0122-0003-pg-stat-user-tables.md.
+	statioTablesColumns := func() []Column {
+		return []Column{
+			{Name: "relid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "schemaname", Type: Type{Name: "name"}, Ordinal: 1},
+			{Name: "relname", Type: Type{Name: "name"}, Ordinal: 2},
+			{Name: "heap_blks_read", Type: Type{Name: "int8"}, Ordinal: 3},
+			{Name: "heap_blks_hit", Type: Type{Name: "int8"}, Ordinal: 4},
+			{Name: "idx_blks_read", Type: Type{Name: "int8"}, Ordinal: 5},
+			{Name: "idx_blks_hit", Type: Type{Name: "int8"}, Ordinal: 6},
+			{Name: "toast_blks_read", Type: Type{Name: "int8"}, Ordinal: 7},
+			{Name: "toast_blks_hit", Type: Type{Name: "int8"}, Ordinal: 8},
+			{Name: "tidx_blks_read", Type: Type{Name: "int8"}, Ordinal: 9},
+			{Name: "tidx_blks_hit", Type: Type{Name: "int8"}, Ordinal: 10},
+		}
+	}
+	for _, v := range []struct {
+		name  string
+		oid   uint32
+		scope StatTableScope
+	}{
+		{"pg_statio_all_tables", 9087, StatScopeAll},
+		{"pg_statio_sys_tables", 9088, StatScopeSys},
+		{"pg_statio_user_tables", 9089, StatScopeUser},
+	} {
+		scope := v.scope
+		tbl := &Table{
+			Schema: "pg_catalog", Name: v.name, Virtual: true,
+			Columns: statioTablesColumns(),
+			OID:     v.oid,
+		}
+		tbl.VirtualRows = func() [][]string { return c.PGStatioTablesRowsForDBOid(DefaultDBOid, scope) }
+		c.ns(DefaultDBOid).tables["pg_catalog."+v.name] = tbl
+	}
+
+	// pg_statio_all_indexes / pg_statio_user_indexes / pg_statio_sys_indexes — per-index
+	// buffer-pool I/O statistics (PG's system_views.sql), the I/O sibling of the
+	// per-index access-stat views above. Same honest-0 shape: idx_blks_read /
+	// idx_blks_hit are a faithful 0 (no per-relation buffer counters);
+	// relid/indexrelid/schemaname/relname/indexrelname are real. See
+	// catalog.PGStatioIndexesRowsForDBOid and docs/design/0122-0003-pg-stat-user-tables.md.
+	statioIndexesColumns := func() []Column {
+		return []Column{
+			{Name: "relid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "indexrelid", Type: Type{Name: "oid"}, Ordinal: 1},
+			{Name: "schemaname", Type: Type{Name: "name"}, Ordinal: 2},
+			{Name: "relname", Type: Type{Name: "name"}, Ordinal: 3},
+			{Name: "indexrelname", Type: Type{Name: "name"}, Ordinal: 4},
+			{Name: "idx_blks_read", Type: Type{Name: "int8"}, Ordinal: 5},
+			{Name: "idx_blks_hit", Type: Type{Name: "int8"}, Ordinal: 6},
+		}
+	}
+	for _, v := range []struct {
+		name  string
+		oid   uint32
+		scope StatTableScope
+	}{
+		{"pg_statio_all_indexes", 9090, StatScopeAll},
+		{"pg_statio_sys_indexes", 9091, StatScopeSys},
+		{"pg_statio_user_indexes", 9092, StatScopeUser},
+	} {
+		scope := v.scope
+		tbl := &Table{
+			Schema: "pg_catalog", Name: v.name, Virtual: true,
+			Columns: statioIndexesColumns(),
+			OID:     v.oid,
+		}
+		tbl.VirtualRows = func() [][]string { return c.PGStatioIndexesRowsForDBOid(DefaultDBOid, scope) }
+		c.ns(DefaultDBOid).tables["pg_catalog."+v.name] = tbl
+	}
+
+	// pg_statio_all_sequences / pg_statio_user_sequences / pg_statio_sys_sequences —
+	// per-sequence buffer-pool I/O statistics (PG's system_views.sql, relkind 'S'),
+	// the sequence sibling of the per-table/per-index I/O views above. Same honest-0
+	// shape: blks_read / blks_hit are a faithful 0 (no per-relation buffer counters);
+	// relid / schemaname / relname are real. Unlike the table/index views, the row
+	// builder selects sequences (t.IsSequence) instead of skipping them. See
+	// catalog.PGStatioSequencesRowsForDBOid and docs/design/0122-0003-pg-stat-user-tables.md.
+	statioSequencesColumns := func() []Column {
+		return []Column{
+			{Name: "relid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "schemaname", Type: Type{Name: "name"}, Ordinal: 1},
+			{Name: "relname", Type: Type{Name: "name"}, Ordinal: 2},
+			{Name: "blks_read", Type: Type{Name: "int8"}, Ordinal: 3},
+			{Name: "blks_hit", Type: Type{Name: "int8"}, Ordinal: 4},
+		}
+	}
+	for _, v := range []struct {
+		name  string
+		oid   uint32
+		scope StatTableScope
+	}{
+		{"pg_statio_all_sequences", 9093, StatScopeAll},
+		{"pg_statio_sys_sequences", 9094, StatScopeSys},
+		{"pg_statio_user_sequences", 9095, StatScopeUser},
+	} {
+		scope := v.scope
+		tbl := &Table{
+			Schema: "pg_catalog", Name: v.name, Virtual: true,
+			Columns: statioSequencesColumns(),
+			OID:     v.oid,
+		}
+		tbl.VirtualRows = func() [][]string { return c.PGStatioSequencesRowsForDBOid(DefaultDBOid, scope) }
+		c.ns(DefaultDBOid).tables["pg_catalog."+v.name] = tbl
+	}
+
+	// pg_stat_user_functions / pg_stat_xact_user_functions — per-function
+	// call/time statistics (PG's system_views.sql). Both upstream views filter
+	// on pg_stat_get_function_calls(oid) IS NOT NULL, which is never true under
+	// the default track_functions = none; goopg has no per-function call/time
+	// tracking, so both views are always empty — byte-identical to a stock
+	// PostgreSQL 18.3 cluster out of the box. Registering them turns a previous
+	// unknown-relation error into the correct 0-row result. See
+	// catalog.PGStatUserFunctionsRows and docs/design/0122-0003-pg-stat-user-tables.md.
+	statFunctionsColumns := func() []Column {
+		return []Column{
+			{Name: "funcid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "schemaname", Type: Type{Name: "name"}, Ordinal: 1},
+			{Name: "funcname", Type: Type{Name: "name"}, Ordinal: 2},
+			{Name: "calls", Type: Type{Name: "int8"}, Ordinal: 3},
+			{Name: "total_time", Type: Type{Name: "float8"}, Ordinal: 4},
+			{Name: "self_time", Type: Type{Name: "float8"}, Ordinal: 5},
+		}
+	}
+	for _, v := range []struct {
+		name string
+		oid  uint32
+	}{
+		{"pg_stat_user_functions", 9096},
+		{"pg_stat_xact_user_functions", 9097},
+	} {
+		tbl := &Table{
+			Schema: "pg_catalog", Name: v.name, Virtual: true,
+			Columns: statFunctionsColumns(),
+			OID:     v.oid,
+		}
+		tbl.VirtualRows = func() [][]string { return c.PGStatUserFunctionsRows() }
+		c.ns(DefaultDBOid).tables["pg_catalog."+v.name] = tbl
+	}
+
+	// pg_stat_xact_all_tables / pg_stat_xact_user_tables / pg_stat_xact_sys_tables —
+	// per-*transaction* table access statistics (PG's system_views.sql), the
+	// transaction-scoped sibling of the cumulative pg_stat_*_tables views. Same
+	// live-scoping wiring: the static VirtualRows fallback scopes to DefaultDBOid,
+	// executor.fetchStatXactTablesRows resolves the connecting database and is swapped
+	// in at valuesOp.Open. Unlike the cumulative views these carry only the 9 xact
+	// delta counters (no n_live_tup / last_* / vacuum cells); goopg has no
+	// per-transaction pgstat accumulator, so every counter is a faithful 0 and
+	// relid/schemaname/relname are real. See catalog.PGStatXactTablesRowsForDBOid and
+	// docs/design/0122-0003-pg-stat-user-tables.md.
+	statXactTablesColumns := func() []Column {
+		return []Column{
+			{Name: "relid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "schemaname", Type: Type{Name: "name"}, Ordinal: 1},
+			{Name: "relname", Type: Type{Name: "name"}, Ordinal: 2},
+			{Name: "seq_scan", Type: Type{Name: "int8"}, Ordinal: 3},
+			{Name: "seq_tup_read", Type: Type{Name: "int8"}, Ordinal: 4},
+			{Name: "idx_scan", Type: Type{Name: "int8"}, Ordinal: 5},
+			{Name: "idx_tup_fetch", Type: Type{Name: "int8"}, Ordinal: 6},
+			{Name: "n_tup_ins", Type: Type{Name: "int8"}, Ordinal: 7},
+			{Name: "n_tup_upd", Type: Type{Name: "int8"}, Ordinal: 8},
+			{Name: "n_tup_del", Type: Type{Name: "int8"}, Ordinal: 9},
+			{Name: "n_tup_hot_upd", Type: Type{Name: "int8"}, Ordinal: 10},
+			{Name: "n_tup_newpage_upd", Type: Type{Name: "int8"}, Ordinal: 11},
+		}
+	}
+	for _, v := range []struct {
+		name  string
+		oid   uint32
+		scope StatTableScope
+	}{
+		{"pg_stat_xact_all_tables", 9098, StatScopeAll},
+		{"pg_stat_xact_sys_tables", 9099, StatScopeSys},
+		{"pg_stat_xact_user_tables", 9100, StatScopeUser},
+	} {
+		scope := v.scope
+		tbl := &Table{
+			Schema: "pg_catalog", Name: v.name, Virtual: true,
+			Columns: statXactTablesColumns(),
+			OID:     v.oid,
+		}
+		tbl.VirtualRows = func() [][]string { return c.PGStatXactTablesRowsForDBOid(DefaultDBOid, scope) }
+		c.ns(DefaultDBOid).tables["pg_catalog."+v.name] = tbl
+	}
 
 	// pg_description — stores COMMENT ON object descriptions (OID 2609).
 	// COMMENT ON is parsed as a no-op in goopg v0; this stub allows queries
@@ -7147,7 +9115,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return out
 	}
-	c.tables["pg_catalog.pg_description"] = pgDescription
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_description"] = pgDescription
 
 	// pg_attrdef — stores column default expressions (OID 2604).
 	// COMMENT ON and DEFAULT tracking are stubs in goopg v0; this virtual table
@@ -7166,24 +9134,11 @@ func (c *InMemory) registerSystemTables() {
 	// pg_attrdef holds ordinary column DEFAULTs, the generation expression of
 	// GENERATED ALWAYS AS (expr) STORED columns (pg_dump re-emits it inline,
 	// keyed on attgenerated='s' — DU-002 slice 59), and the implicit nextval()
-	// default of a SERIAL column (slice 121). attrDefRowsLocked builds the
-	// deterministic row set so this view and dependVirtualRows agree on the oids.
-	pgAttrdef.VirtualRows = func() [][]string {
-		c.mu.RLock()
-		defer c.mu.RUnlock()
-		ar := c.attrDefRowsLocked()
-		rows := make([][]string, 0, len(ar))
-		for _, r := range ar {
-			rows = append(rows, []string{
-				strconv.FormatUint(uint64(r.oid), 10),
-				strconv.FormatUint(uint64(r.tableOID), 10),
-				strconv.Itoa(r.attnum),
-				r.adbin,
-			})
-		}
-		return rows
-	}
-	c.tables["pg_catalog.pg_attrdef"] = pgAttrdef
+	// default of a SERIAL column (slice 121). attrDefRowsLockedForDBOid builds
+	// the deterministic row set so this view and PGDependRowsForDBOid agree on
+	// the oids (same dbOid, same numbering — M0122-0007 4e follow-up 27).
+	pgAttrdef.VirtualRows = func() [][]string { return c.PGAttrdefRowsForDBOid(DefaultDBOid) }
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_attrdef"] = pgAttrdef
 
 	// pg_constraint — stores table and domain constraint definitions (OID 2606).
 	// Constraint tracking is a stub in goopg v0; this virtual table lets queries
@@ -7225,311 +9180,9 @@ func (c *InMemory) registerSystemTables() {
 		OID: 2606,
 	}
 	pgConstraint.VirtualRows = func() [][]string {
-		c.mu.RLock()
-		defer c.mu.RUnlock()
-		var out [][]string
-		for _, tbl := range c.tables {
-			if tbl.Virtual || tbl.OID == 0 {
-				continue
-			}
-			// Emit named CHECK constraints.
-			for _, nc := range tbl.NamedChecks {
-				if nc.Name == "" || nc.OID == 0 {
-					continue
-				}
-				row := make([]string, 26)
-				row[0] = fmt.Sprintf("%d", nc.OID)  // oid
-				row[1] = nc.Name                    // conname
-				row[2] = "2200"                     // connamespace (public)
-				row[3] = "c"                        // contype = check
-				row[4] = "f"                        // condeferrable
-				row[5] = "f"                        // condeferred
-				if nc.NotValid || nc.NotEnforced {
-					// convalidated='f' — either explicitly added NOT VALID, or
-					// NOT ENFORCED (real PG's ATAddCheckNNConstraint sets
-					// skip_validation=!is_enforced, so an unenforced constraint
-					// is implicitly unvalidated too). DU-002 slice 430.
-					row[6] = "f" // convalidated
-				} else {
-					row[6] = "t" // convalidated
-				}
-				row[7] = fmt.Sprintf("%d", tbl.OID) // conrelid
-				row[8] = "0"                        // contypid
-				row[9] = "0"                        // conindid
-				row[10] = "0"                       // conparentid
-				row[11] = "0"                       // confrelid
-				row[12] = " "                       // confupdtype
-				row[13] = " "                       // confdeltype
-				row[14] = " "                       // confmatchtype
-				if nc.IsLocal {
-					row[15] = "t"
-				} else {
-					row[15] = "f"
-				}
-				row[16] = fmt.Sprintf("%d", nc.InhCount) // coninhcount
-				if nc.NoInherit {
-					row[17] = "t" // connoinherit (CHECK ... NO INHERIT). DU-002 slice 128.
-				} else {
-					row[17] = "f"
-				}
-				row[18] = "f"     // conperiod
-				row[24] = nc.Expr // conbin
-				if nc.NotEnforced {
-					row[25] = "f" // conenforced — CHECK ... NOT ENFORCED. DU-002 slice 430.
-				} else {
-					row[25] = "t" // conenforced
-				}
-				out = append(out, row)
-			}
-		}
-		// Emit domain CHECK constraints (contype='c', keyed on contypid = the
-		// domain's pg_type OID rather than conrelid). pg_dump's
-		// getDomainConstraints reads `WHERE contypid = $1 AND contype IN ('c','n')`
-		// and renders each via pg_get_constraintdef ORDER BY conname — the ORDER BY
-		// is applied by the executor over these rows, so a domain's multiple CHECKs
-		// each get a row here. DU-002 slice 96 (single) / slice 385 (multi).
-		for _, d := range c.domains {
-			for _, ck := range d.Checks {
-				if ck.Expr == "" || ck.OID == 0 {
-					continue
-				}
-				row := make([]string, 26)
-				row[0] = fmt.Sprintf("%d", ck.OID) // oid
-				row[1] = ck.Name                   // conname
-				row[2] = "2200"                    // connamespace (public)
-				row[3] = "c"                       // contype = check
-				row[4] = "f"                       // condeferrable
-				row[5] = "f"                       // condeferred
-				row[6] = "t"                       // convalidated
-				row[7] = "0"                       // conrelid (none — domain check)
-				row[8] = fmt.Sprintf("%d", d.OID)  // contypid = domain OID
-				row[9] = "0"                       // conindid
-				row[10] = "0"                      // conparentid
-				row[11] = "0"                      // confrelid
-				row[12] = " "                      // confupdtype
-				row[13] = " "                      // confdeltype
-				row[14] = " "                      // confmatchtype
-				row[15] = "t"                      // conislocal
-				row[16] = "0"                      // coninhcount
-				row[17] = "f"                      // connoinherit
-				row[18] = "f"                      // conperiod
-				row[24] = ck.Expr                  // conbin
-				row[25] = "t"                      // conenforced: always true in v0
-				out = append(out, row)
-			}
-		}
-		// Emit UNIQUE, PRIMARY KEY, and EXCLUDE constraints from constraint-backed indexes.
-		for _, idx := range c.indexes {
-			if (!idx.IsConstraint && !idx.IsExclusion) || idx.Table == nil {
-				continue
-			}
-			colOrdMap := make(map[string]int, len(idx.Table.Columns))
-			for _, col := range idx.Table.Columns {
-				colOrdMap[col.Name] = col.Ordinal + 1
-			}
-			var keyNums []string
-			for _, colName := range idx.Columns {
-				if ord, ok := colOrdMap[colName]; ok {
-					keyNums = append(keyNums, fmt.Sprintf("%d", ord))
-				}
-			}
-			contype := "u"
-			if idx.Primary {
-				contype = "p"
-			} else if idx.IsExclusion {
-				contype = "x"
-			}
-			row := make([]string, 26)
-			row[0] = fmt.Sprintf("%d", idx.OID)
-			row[1] = idx.Name
-			row[2] = "2200"
-			row[3] = contype
-			// condeferrable / condeferred: a DEFERRABLE [INITIALLY DEFERRED]
-			// UNIQUE/PK constraint round-trips the flags so pg_dump re-emits the
-			// clause. DU-002 slice 139.
-			row[4] = "f"
-			if idx.Deferrable {
-				row[4] = "t"
-			}
-			row[5] = "f"
-			if idx.InitiallyDeferred {
-				row[5] = "t"
-			}
-			row[6] = "t"
-			row[7] = fmt.Sprintf("%d", idx.Table.OID)
-			row[8] = "0"
-			row[9] = fmt.Sprintf("%d", idx.OID)
-			row[10] = "0"
-			row[11] = "0"
-			row[12] = " "
-			row[13] = " "
-			row[14] = " "
-			row[15] = "t"
-			row[16] = "0"
-			row[17] = "f"
-			row[18] = "f"
-			row[19] = "{" + strings.Join(keyNums, ",") + "}"
-			row[25] = "t" // conenforced: always true in v0
-			out = append(out, row)
-		}
-		// Emit NOT NULL constraints (contype='n', PG18). M0097-0023.
-		for _, tbl := range c.tables {
-			if tbl.Virtual || tbl.OID == 0 {
-				continue
-			}
-			for _, nc := range tbl.NotNullConstraints {
-				if nc.Name == "" || nc.OID == 0 {
-					continue
-				}
-				colOrd := 0
-				for i, col := range tbl.Columns {
-					if strings.EqualFold(col.Name, nc.ColName) {
-						colOrd = i + 1
-						break
-					}
-				}
-				row := make([]string, 26)
-				row[0] = fmt.Sprintf("%d", nc.OID)
-				row[1] = nc.Name
-				row[2] = "2200"
-				row[3] = "n" // contype = not null
-				row[4] = "f"
-				row[5] = "f"
-				row[6] = "t"
-				row[7] = fmt.Sprintf("%d", tbl.OID)
-				row[8] = "0"
-				row[9] = "0"
-				row[10] = "0"
-				row[11] = "0"
-				row[12] = " "
-				row[13] = " "
-				row[14] = " "
-				if nc.IsLocal {
-					row[15] = "t"
-				} else {
-					row[15] = "f"
-				}
-				row[16] = fmt.Sprintf("%d", nc.InhCount)
-				if nc.NoInherit {
-					row[17] = "t"
-				} else {
-					row[17] = "f"
-				}
-				row[18] = "f"
-				if colOrd > 0 {
-					row[19] = fmt.Sprintf("{%d}", colOrd)
-				}
-				row[25] = "t" // conenforced: always true in v0
-				out = append(out, row)
-			}
-		}
-		// Emit FOREIGN KEY constraints (contype='f', PG). pg_dump's getConstraints
-		// joins `pg_constraint c ON src.tbloid = c.conrelid WHERE contype='f'` and
-		// renders each via pg_get_constraintdef(c.oid). DU-002 slice 51.
-		for _, tbl := range c.tables {
-			if tbl.Virtual || tbl.OID == 0 {
-				continue
-			}
-			colOrd := make(map[string]int, len(tbl.Columns))
-			for i, col := range tbl.Columns {
-				colOrd[strings.ToLower(col.Name)] = i + 1
-			}
-			for _, fk := range tbl.ForeignKeys {
-				if fk.Name == "" || fk.OID == 0 {
-					continue
-				}
-				// Resolve the referenced table OID + referenced column ordinals.
-				var refTbl *Table
-				for _, cand := range c.tables {
-					if cand.Virtual || cand.OID == 0 {
-						continue
-					}
-					if strings.EqualFold(cand.Name, fk.RefTable) {
-						refTbl = cand
-						break
-					}
-				}
-				var confrelid uint32
-				refColOrd := map[string]int{}
-				if refTbl != nil {
-					confrelid = refTbl.OID
-					for i, col := range refTbl.Columns {
-						refColOrd[strings.ToLower(col.Name)] = i + 1
-					}
-				}
-				var conkey, confkey []string
-				for _, cn := range fk.Columns {
-					if ord, ok := colOrd[strings.ToLower(cn)]; ok {
-						conkey = append(conkey, fmt.Sprintf("%d", ord))
-					}
-				}
-				for _, cn := range fk.RefColumns {
-					if ord, ok := refColOrd[strings.ToLower(cn)]; ok {
-						confkey = append(confkey, fmt.Sprintf("%d", ord))
-					}
-				}
-				// confdelsetcols (PG15): attnums of the columns an ON DELETE SET
-				// NULL|DEFAULT is restricted to. NULL when the action covers the
-				// whole key, matching PG (decompile_column_index_array emits the
-				// ` (col, …)` suffix only when this is non-null). DU-002 slice 311.
-				var confdelsetcols []string
-				for _, cn := range fk.OnDeleteSetCols {
-					if ord, ok := colOrd[strings.ToLower(cn)]; ok {
-						confdelsetcols = append(confdelsetcols, fmt.Sprintf("%d", ord))
-					}
-				}
-				row := make([]string, 26)
-				row[0] = fmt.Sprintf("%d", fk.OID) // oid
-				row[1] = fk.Name                   // conname
-				row[2] = "2200"                    // connamespace (public)
-				row[3] = "f"                       // contype = foreign key
-				if fk.Deferrable {
-					row[4] = "t"
-				} else {
-					row[4] = "f" // condeferrable
-				}
-				if fk.InitiallyDeferred {
-					row[5] = "t"
-				} else {
-					row[5] = "f" // condeferred
-				}
-				if fk.NotValid || fk.NotEnforced {
-					row[6] = "f" // convalidated — NOT VALID (or implied by NOT ENFORCED)
-				} else {
-					row[6] = "t" // convalidated
-				}
-				row[7] = fmt.Sprintf("%d", tbl.OID) // conrelid
-				row[8] = "0"                        // contypid
-				row[9] = "0"                        // conindid (unique idx on ref tbl; unused by deparse)
-				row[10] = "0"                       // conparentid (0 → pg_dump WHERE conparentid=0 keeps it)
-				row[11] = fmt.Sprintf("%d", confrelid)
-				row[12] = string(fkActionChar(fk.OnUpdate)) // confupdtype
-				row[13] = string(fkActionChar(fk.OnDelete)) // confdeltype
-				if fk.MatchFull {
-					row[14] = "f" // confmatchtype = MATCH FULL
-				} else {
-					row[14] = "s" // confmatchtype = MATCH SIMPLE (default)
-				}
-				row[15] = "t"                               // conislocal
-				row[16] = "0"                               // coninhcount
-				row[17] = "f"                               // connoinherit
-				row[18] = "f"                               // conperiod
-				row[19] = "{" + strings.Join(conkey, ",") + "}"
-				row[20] = "{" + strings.Join(confkey, ",") + "}"
-				if len(confdelsetcols) > 0 {
-					row[23] = "{" + strings.Join(confdelsetcols, ",") + "}" // confdelsetcols
-				}
-				if fk.NotEnforced {
-					row[25] = "f" // conenforced — FOREIGN KEY ... NOT ENFORCED. DU-002 slice 431.
-				} else {
-					row[25] = "t" // conenforced
-				}
-				out = append(out, row)
-			}
-		}
-		return out
+		return c.PGConstraintRowsForDBOid(DefaultDBOid)
 	}
-	c.tables["pg_catalog.pg_constraint"] = pgConstraint
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_constraint"] = pgConstraint
 
 	// pg_inherits — stores inheritance/partition parent-child relationships (OID 2611).
 	// Used by psql \d to identify partition children. M0097-0023.
@@ -7544,59 +9197,9 @@ func (c *InMemory) registerSystemTables() {
 		OID: 2611,
 	}
 	pgInherits.VirtualRows = func() [][]string {
-		c.mu.RLock()
-		defer c.mu.RUnlock()
-		var out [][]string
-		parentSeq := make(map[uint32]int)
-		for _, tbl := range c.tables {
-			if tbl.Virtual {
-				continue
-			}
-			// Partition children: one row per child → its partition parent.
-			if tbl.PartitionParentOID != 0 {
-				parentSeq[tbl.PartitionParentOID]++
-				seq := parentSeq[tbl.PartitionParentOID]
-				out = append(out, []string{
-					fmt.Sprintf("%d", tbl.OID),
-					fmt.Sprintf("%d", tbl.PartitionParentOID),
-					fmt.Sprintf("%d", seq),
-					"f",
-				})
-				continue
-			}
-			// Legacy inheritance children: one row per (child, parent) pair in
-			// declaration order, so inhseqno matches the INHERITS (...) list and
-			// pg_dump re-emits the clause. DU-002 slice 170.
-			for i, parentOID := range tbl.InheritsParentOIDs {
-				out = append(out, []string{
-					fmt.Sprintf("%d", tbl.OID),
-					fmt.Sprintf("%d", parentOID),
-					fmt.Sprintf("%d", i+1),
-					"f",
-				})
-			}
-		}
-		// Emit index partition rows: each index with PartitionParentOID set is a
-		// partition child of its parent index. These rows enable the join pattern:
-		//   pg_index LEFT JOIN pg_inherits ON (indexrelid = inhrelid)
-		// used by indexing.sql to discover partitioned-index parent/child chains.
-		idxParentSeq := make(map[uint32]int)
-		for _, idx := range c.indexes {
-			if idx.PartitionParentOID == 0 {
-				continue
-			}
-			idxParentSeq[idx.PartitionParentOID]++
-			seq := idxParentSeq[idx.PartitionParentOID]
-			out = append(out, []string{
-				fmt.Sprintf("%d", idx.OID),
-				fmt.Sprintf("%d", idx.PartitionParentOID),
-				fmt.Sprintf("%d", seq),
-				"f",
-			})
-		}
-		return out
+		return c.PGInheritsRowsForDBOid(DefaultDBOid)
 	}
-	c.tables["pg_catalog.pg_inherits"] = pgInherits
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_inherits"] = pgInherits
 
 	// pg_index — stores index definitions (OID 2610).
 	// This virtual stub lets queries that join against pg_index (e.g. psql \d+
@@ -7631,178 +9234,9 @@ func (c *InMemory) registerSystemTables() {
 		OID: 2610,
 	}
 	pgIndexCatalog.VirtualRows = func() [][]string {
-		idxs := c.AllIndexes()
-		out := make([][]string, 0, len(idxs))
-		for _, idx := range idxs {
-			if idx.Table == nil {
-				continue
-			}
-			// Build column-ordinal lookups (1-based) for the parent table.
-			colOrd := make(map[string]int, len(idx.Table.Columns))
-			for _, col := range idx.Table.Columns {
-				colOrd[col.Name] = col.Ordinal + 1
-			}
-			// indkey: key columns then include columns; expression columns get ordinal 0.
-			keyParts := make([]string, 0, len(idx.Columns)+len(idx.IncludeColumns))
-			for _, col := range idx.Columns {
-				if col == "" {
-					keyParts = append(keyParts, "0")
-				} else if ord, ok := colOrd[col]; ok {
-					keyParts = append(keyParts, fmt.Sprintf("%d", ord))
-				} else {
-					keyParts = append(keyParts, "0")
-				}
-			}
-			for _, col := range idx.IncludeColumns {
-				if ord, ok := colOrd[col]; ok {
-					keyParts = append(keyParts, fmt.Sprintf("%d", ord))
-				} else {
-					keyParts = append(keyParts, "0")
-				}
-			}
-			indkey := strings.Join(keyParts, " ")
-			// indclass: one opclass OID per key column (0 = unknown; btree int4=1978).
-			classOIDs := make([]string, len(idx.Columns))
-			for i, col := range idx.Columns {
-				oid := "0"
-				if col != "" {
-					for _, tc := range idx.Table.Columns {
-						if tc.Name == col {
-							switch tc.Type.Name {
-							case "int2", "smallint":
-								oid = "1970"
-							case "int4", "int", "integer", "serial":
-								oid = "1978"
-							case "int8", "bigint", "bigserial":
-								oid = "1980"
-							case "float4", "real":
-								oid = "2968"
-							case "float8", "double precision":
-								oid = "2970"
-							case "text", "varchar", "character varying":
-								oid = "1994"
-							case "name":
-								oid = "1996"
-							case "bpchar", "char", "character":
-								oid = "426"
-							case "oid":
-								oid = "2990"
-							case "bool", "boolean":
-								oid = "424"
-							case "date":
-								oid = "434"
-							case "timestamp", "timestamp without time zone":
-								oid = "2040"
-							case "timestamptz", "timestamp with time zone":
-								oid = "2040"
-							}
-							break
-						}
-					}
-				}
-				classOIDs[i] = oid
-			}
-			indclass := strings.Join(classOIDs, " ")
-			boolStr := func(b bool) string {
-				if b {
-					return "t"
-				}
-				return "f"
-			}
-			natts := len(idx.Columns) + len(idx.IncludeColumns)
-			nkeyatts := len(idx.Columns)
-			// Build space-separated zero-vector for indcollation.
-			buildZeroVec := func(n int) string {
-				if n <= 0 {
-					return ""
-				}
-				parts := make([]string, n)
-				for i := range parts {
-					parts[i] = "0"
-				}
-				return strings.Join(parts, " ")
-			}
-			// indoption: per-key ASC/DESC + NULLS FIRST/LAST bitmask, mirroring
-			// upstream's INDOPTION_DESC (0x1) / INDOPTION_NULLS_FIRST (0x2).
-			// M0122-0006: this live pg_index query path previously always
-			// rendered an all-zero vector (buildZeroVec) regardless of the
-			// index's declared column ordering.
-			indoptionParts := make([]string, nkeyatts)
-			for i := range indoptionParts {
-				var bits int
-				if i < len(idx.ColDescending) && idx.ColDescending[i] {
-					bits |= 0x0001
-				}
-				if i < len(idx.ColNullsFirst) && idx.ColNullsFirst[i] {
-					bits |= 0x0002
-				}
-				indoptionParts[i] = fmt.Sprintf("%d", bits)
-			}
-			indoption := strings.Join(indoptionParts, " ")
-			out = append(out, []string{
-				fmt.Sprintf("%d", idx.OID),       // indexrelid
-				fmt.Sprintf("%d", idx.Table.OID), // indrelid
-				fmt.Sprintf("%d", natts),         // indnatts
-				fmt.Sprintf("%d", nkeyatts),      // indnkeyatts
-				boolStr(idx.Unique),              // indisunique
-				boolStr(idx.NullsNotDistinct),    // indnullsnotdistinct
-				boolStr(idx.Primary),             // indisprimary
-				boolStr(idx.IsExclusion),         // indisexclusion
-				"t",                              // indimmediate
-				boolStr(idx.IsClustered),         // indisclustered (DU-002 slice 320)
-				"t",                              // indisvalid
-				"f",                              // indcheckxmin
-				"t",                              // indisready
-				"t",                              // indislive
-				boolStr(idx.IsReplicaIdentity),   // indisreplident (DU-002 slice 306)
-				indkey,                           // indkey
-				buildZeroVec(nkeyatts),           // indcollation
-				indclass,                         // indclass
-				indoption,                        // indoption
-				"",                               // indexprs (NULL)
-				"",                               // indpred (NULL)
-				"",                               // indcoloptions (NULL)
-			})
-		}
-		// Synthesize the unique btree index PG auto-creates on every TOAST
-		// relation (on chunk_id, chunk_seq). The pg_class virtual builder emits
-		// the matching relkind='i' row named pg_toast_<oid>_index; this row lets
-		//   SELECT indexrelid::regclass FROM pg_index
-		//     WHERE indrelid = (SELECT oid FROM pg_class WHERE relname=<toast rel>)
-		// resolve (reindex-concurrently-toast setup). toastBearingTables uses the
-		// SAME gate as the pg_class TOAST-row emission so the two never diverge.
-		// M0118-0008 TOAST-exposure slice 3.
-		for _, t := range c.toastBearingTables() {
-			toastRelOID := int(t.OID) + toastRelidOffset
-			toastIdxOID := int(t.OID) + toastIndexOidOffset
-			out = append(out, []string{
-				fmt.Sprintf("%d", toastIdxOID), // indexrelid
-				fmt.Sprintf("%d", toastRelOID), // indrelid
-				"2",                            // indnatts (chunk_id, chunk_seq)
-				"2",                            // indnkeyatts
-				"t",                            // indisunique
-				"f",                            // indnullsnotdistinct
-				"f",                            // indisprimary
-				"f",                            // indisexclusion
-				"t",                            // indimmediate
-				"f",                            // indisclustered
-				"t",                            // indisvalid
-				"f",                            // indcheckxmin
-				"t",                            // indisready
-				"t",                            // indislive
-				"f",                            // indisreplident
-				"1 2",                          // indkey (chunk_id=1, chunk_seq=2)
-				"0 0",                          // indcollation (int4 columns: no collation)
-				"1978 1978",                    // indclass (int4_ops btree)
-				"0 0",                          // indoption
-				"",                             // indexprs (NULL)
-				"",                             // indpred (NULL)
-				"",                             // indcoloptions (NULL)
-			})
-		}
-		return out
+		return c.PGIndexRowsForDBOid(DefaultDBOid)
 	}
-	c.tables["pg_catalog.pg_index"] = pgIndexCatalog
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_index"] = pgIndexCatalog
 
 	// pg_statistic_ext — stores extended statistics objects (OID 3381).
 	// This virtual stub lets queries against pg_statistic_ext succeed instead
@@ -7864,7 +9298,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return out
 	}
-	c.tables["pg_catalog.pg_statistic_ext"] = pgStatisticExt
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_statistic_ext"] = pgStatisticExt
 
 	// pg_collation — stores collation definitions (OID 3456).
 	// This virtual stub lets psql \d+ meta-queries succeed instead of erroring
@@ -7951,7 +9385,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return rows
 	}
-	c.tables["pg_catalog.pg_collation"] = pgCollation
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_collation"] = pgCollation
 
 	// pg_policy — stores row-level security policies (OID 3256). goopg does NOT
 	// enforce RLS, but a policy created via CREATE POLICY is recorded on its
@@ -7976,64 +9410,9 @@ func (c *InMemory) registerSystemTables() {
 		OID: 3256,
 	}
 	pgPolicy.VirtualRows = func() [][]string {
-		c.mu.RLock()
-		defer c.mu.RUnlock()
-		var out [][]string
-		for _, tbl := range c.tables {
-			if tbl == nil || tbl.Virtual || tbl.OID == 0 || len(tbl.Policies) == 0 {
-				continue
-			}
-			for _, pol := range tbl.Policies {
-				if pol.OID == 0 {
-					continue // predates OID tracking → invisible to pg_dump
-				}
-				// polroles: format the OID array as a PostgreSQL array literal.
-				// {0} is the PUBLIC sentinel; getPolicies maps it to a NULL TO
-				// clause via `CASE WHEN polroles = '{0}' THEN NULL …`.
-				roles := pol.Roles
-				if len(roles) == 0 {
-					roles = []uint32{0}
-				}
-				parts := make([]string, len(roles))
-				for i, r := range roles {
-					parts[i] = fmt.Sprintf("%d", r)
-				}
-				polroles := "{" + strings.Join(parts, ",") + "}"
-				// polqual / polwithcheck: render the parsed expression with the
-				// catalog-side pg_get_expr deparser, which fully parenthesizes
-				// every node so pg_dump emits `USING ((expr))` / `WITH CHECK
-				// ((expr))`. An absent expression stays "" (→ SQL NULL → pg_dump
-				// omits the clause).
-				var polqual, polwithcheck string
-				if pol.Using != nil {
-					polqual = formatExprForAttrdef(pol.Using)
-				}
-				if pol.WithCheck != nil {
-					polwithcheck = formatExprForAttrdef(pol.WithCheck)
-				}
-				cmd := pol.Command
-				if cmd == 0 {
-					cmd = '*'
-				}
-				permissive := "t"
-				if !pol.Permissive {
-					permissive = "f"
-				}
-				out = append(out, []string{
-					fmt.Sprintf("%d", pol.OID), // oid
-					pol.Name,                   // polname
-					fmt.Sprintf("%d", tbl.OID), // polrelid
-					string(cmd),                // polcmd
-					permissive,                 // polpermissive
-					polroles,                   // polroles
-					polqual,                    // polqual
-					polwithcheck,               // polwithcheck
-				})
-			}
-		}
-		return out
+		return c.PGPolicyRowsForDBOid(DefaultDBOid)
 	}
-	c.tables["pg_catalog.pg_policy"] = pgPolicy
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_policy"] = pgPolicy
 
 	// pg_wait_events — needs at least one row per type.
 	pgWaitEvents := &Table{
@@ -8123,7 +9502,7 @@ func (c *InMemory) registerSystemTables() {
 			{"IPC", "BgWorkerStartup", "Waiting for background worker to start up."},
 		}
 	}
-	c.tables["pg_catalog.pg_wait_events"] = pgWaitEvents
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_wait_events"] = pgWaitEvents
 
 	// pg_timezone_names — needs count(distinct utc_offset) >= 24.
 	pgTimezoneNames := &Table{
@@ -8161,7 +9540,7 @@ func (c *InMemory) registerSystemTables() {
 		rows = append(rows, []string{"America/Los_Angeles", "LMT", verboseIntervalOffset(-(7*3600 + 52*60 + 58)), "f"})
 		return rows
 	}
-	c.tables["pg_catalog.pg_timezone_names"] = pgTimezoneNames
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_timezone_names"] = pgTimezoneNames
 
 	// pg_timezone_abbrevs — needs count(distinct utc_offset) >= 24 and a row for abbrev = 'LMT'.
 	pgTimezoneAbbrevs := &Table{
@@ -8197,7 +9576,7 @@ func (c *InMemory) registerSystemTables() {
 		rows = append(rows, []string{"LMT", verboseIntervalOffset(-(7*3600 + 52*60 + 58)), "f"})
 		return rows
 	}
-	c.tables["pg_catalog.pg_timezone_abbrevs"] = pgTimezoneAbbrevs
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_timezone_abbrevs"] = pgTimezoneAbbrevs
 
 	// pg_am — access method catalog (OID 2601).
 	// Returns the standard set of PostgreSQL access methods so queries
@@ -8236,7 +9615,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return rows
 	}
-	c.tables["pg_catalog.pg_am"] = pgAm
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_am"] = pgAm
 
 	// pg_depend — dependency catalog (OID 2608).
 	// goopg does not maintain a general dependency graph (extension membership,
@@ -8263,8 +9642,8 @@ func (c *InMemory) registerSystemTables() {
 		},
 		OID: 2608,
 	}
-	pgDepend.VirtualRows = c.dependVirtualRows
-	c.tables["pg_catalog.pg_depend"] = pgDepend
+	pgDepend.VirtualRows = func() [][]string { return c.PGDependRowsForDBOid(DefaultDBOid) }
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_depend"] = pgDepend
 
 	// pg_tablespace — tablespace catalog (OID 1213). The on-disk shared heap
 	// (initialized by initdb with pg_default/pg_global) is not wired into the SQL
@@ -8285,7 +9664,7 @@ func (c *InMemory) registerSystemTables() {
 		OID: 1213,
 	}
 	pgTablespace.VirtualRows = c.tablespaceVirtualRows
-	c.tables["pg_catalog.pg_tablespace"] = pgTablespace
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_tablespace"] = pgTablespace
 
 	// pg_foreign_table — foreign-table catalog (OID 3118). pg_dump's getTables
 	// runs a `SELECT ftserver FROM pg_foreign_table WHERE ftrelid = c.oid`
@@ -8308,32 +9687,9 @@ func (c *InMemory) registerSystemTables() {
 	// is NULL (empty string) when no table-level OPTIONS were given, so
 	// dumpTableSchema omits the OPTIONS clause. DU-002 slice 417.
 	pgForeignTable.VirtualRows = func() [][]string {
-		c.mu.RLock()
-		defer c.mu.RUnlock()
-		keys := make([]string, 0, len(c.tables))
-		for k := range c.tables {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		var out [][]string
-		for _, k := range keys {
-			t := c.tables[k]
-			if t.ForeignServerName == "" {
-				continue
-			}
-			var srvOID uint32
-			if s, ok := c.foreignServers[t.ForeignServerName]; ok {
-				srvOID = s.OID
-			}
-			out = append(out, []string{
-				strconv.FormatUint(uint64(t.OID), 10),  // ftrelid
-				strconv.FormatUint(uint64(srvOID), 10), // ftserver
-				optionsArrayLiteral(t.ForeignOptions),  // ftoptions
-			})
-		}
-		return out
+		return c.PGForeignTableRowsForDBOid(DefaultDBOid)
 	}
-	c.tables["pg_catalog.pg_foreign_table"] = pgForeignTable
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_foreign_table"] = pgForeignTable
 
 	// pg_init_privs — initial-privileges catalog (OID 3394). PG records here the
 	// privileges an object had immediately after initdb (privtype 'i') or after
@@ -8360,7 +9716,7 @@ func (c *InMemory) registerSystemTables() {
 		OID: 3394,
 	}
 	pgInitPrivs.VirtualRows = func() [][]string { return nil }
-	c.tables["pg_catalog.pg_init_privs"] = pgInitPrivs
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_init_privs"] = pgInitPrivs
 
 	// pg_cast — cast catalog (OID 2605). goopg registers no user-defined casts, so
 	// this view is empty. pg_dump's getFuncs runs `EXISTS (SELECT 1 FROM pg_cast
@@ -8409,7 +9765,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return out
 	}
-	c.tables["pg_catalog.pg_cast"] = pgCast
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_cast"] = pgCast
 
 	// pg_transform — transform catalog (OID 3576). Schema matches PG's
 	// pg_transform (oid, trftype, trflang, trffromsql, trftosql); trffromsql/
@@ -8446,7 +9802,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return out
 	}
-	c.tables["pg_catalog.pg_transform"] = pgTransform
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_transform"] = pgTransform
 
 	// pg_language — procedural-language catalog (OID 2612). pg_dump's getProcLangs
 	// runs `SELECT tableoid, oid, lanname, lanpltrusted, lanplcallfoid, laninline,
@@ -8501,7 +9857,7 @@ func (c *InMemory) registerSystemTables() {
 			{"13627", "plpgsql", "10", "f", "t", "0", "0", "0", ""},
 		}
 	}
-	c.tables["pg_catalog.pg_language"] = pgLanguage
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_language"] = pgLanguage
 
 	// pg_operator — operator catalog (OID 2617). pg_dump's getOperators runs
 	// `SELECT tableoid, oid, oprname, oprnamespace, oprowner, oprkind, oprleft,
@@ -8586,7 +9942,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return out
 	}
-	c.tables["pg_catalog.pg_operator"] = pgOperator
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_operator"] = pgOperator
 
 	// pg_opclass — operator-class catalog (OID 2616). pg_dump's getOpclasses runs
 	// `SELECT tableoid, oid, opcmethod, opcname, opcnamespace, opcowner FROM
@@ -8654,7 +10010,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return out
 	}
-	c.tables["pg_catalog.pg_opclass"] = pgOpclass
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_opclass"] = pgOpclass
 
 	// pg_opfamily — operator-family catalog (OID 2753). pg_dump's getOpfamilies
 	// runs `SELECT tableoid, oid, opfmethod, opfname, opfnamespace, opfowner FROM
@@ -8694,7 +10050,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return out
 	}
-	c.tables["pg_catalog.pg_opfamily"] = pgOpfamily
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_opfamily"] = pgOpfamily
 
 	// pg_ts_parser — text-search parser catalog (OID 3601). pg_dump's
 	// getTSParsers runs `SELECT tableoid, oid, prsname, prsnamespace,
@@ -8751,7 +10107,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return rows
 	}
-	c.tables["pg_catalog.pg_ts_parser"] = pgTSParser
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_ts_parser"] = pgTSParser
 
 	// pg_ts_template — text-search template catalog (OID 3764). pg_dump's
 	// getTSTemplates runs `SELECT tableoid, oid, tmplname, tmplnamespace,
@@ -8804,7 +10160,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return rows
 	}
-	c.tables["pg_catalog.pg_ts_template"] = pgTSTemplate
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_ts_template"] = pgTSTemplate
 
 	// pg_ts_dict — text-search dictionary catalog (OID 3600). pg_dump's
 	// getTSDictionaries runs `SELECT tableoid, oid, dictname, dictnamespace,
@@ -8864,7 +10220,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return rows
 	}
-	c.tables["pg_catalog.pg_ts_dict"] = pgTSDict
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_ts_dict"] = pgTSDict
 
 	// pg_ts_config — text-search configuration catalog (OID 3602). pg_dump's
 	// getTSConfigurations runs `SELECT tableoid, oid, cfgname, cfgnamespace,
@@ -8903,7 +10259,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return rows
 	}
-	c.tables["pg_catalog.pg_ts_config"] = pgTSConfig
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_ts_config"] = pgTSConfig
 
 	// pg_ts_config_map — per-token-type dictionary mapping for a text search
 	// configuration (OID 3603). dumpTSConfig's own query (`SELECT ... FROM
@@ -8952,7 +10308,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return rows
 	}
-	c.tables["pg_catalog.pg_ts_config_map"] = pgTSConfigMap
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_ts_config_map"] = pgTSConfigMap
 
 	// pg_foreign_data_wrapper — foreign-data wrapper catalog (OID 2328).
 	// pg_dump's getForeignDataWrappers runs `SELECT tableoid, oid, fdwname,
@@ -9014,7 +10370,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return out
 	}
-	c.tables["pg_catalog.pg_foreign_data_wrapper"] = pgForeignDataWrapper
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_foreign_data_wrapper"] = pgForeignDataWrapper
 
 	// pg_foreign_server — foreign-server catalog (OID 1417). pg_dump's
 	// getForeignServers runs `SELECT tableoid, oid, srvname, srvowner,
@@ -9055,30 +10411,9 @@ func (c *InMemory) registerSystemTables() {
 	// producing no spurious dumpACL output for the common no-grant case. DU-002
 	// slice 427.
 	pgForeignServer.VirtualRows = func() [][]string {
-		servers := c.ListForeignServers()
-		if len(servers) == 0 {
-			return nil
-		}
-		out := make([][]string, 0, len(servers))
-		for _, s := range servers {
-			owner := s.Owner
-			if owner == 0 {
-				owner = 10 // bootstrap superuser (postgres); getRoleName(10) → "postgres"
-			}
-			out = append(out, []string{
-				strconv.FormatUint(uint64(s.OID), 10), // oid
-				s.Name,                                // srvname
-				strconv.FormatUint(uint64(owner), 10), // srvowner
-				strconv.FormatUint(uint64(c.ForeignDataWrapperOID(s.FdwName)), 10), // srvfdw
-				s.Type,                         // srvtype ("" → NULL, TYPE clause omitted)
-				s.Version,                      // srvversion ("" → NULL, VERSION clause omitted)
-				c.ForeignServerACLText(s.OID),  // srvacl (NULL until a GRANT, DU-002 slice 427)
-				optionsArrayLiteral(s.Options), // srvoptions text[] ("{name=value,…}" or "" for NULL)
-			})
-		}
-		return out
+		return c.PGForeignServerRowsForDBOid(DefaultDBOid)
 	}
-	c.tables["pg_catalog.pg_foreign_server"] = pgForeignServer
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_foreign_server"] = pgForeignServer
 
 	// pg_user_mappings — the publicly-readable view over pg_user_mapping JOIN
 	// pg_foreign_server (system_views.sql). For every foreign server, pg_dump's
@@ -9113,31 +10448,9 @@ func (c *InMemory) registerSystemTables() {
 	// with no options it emits the bare `CREATE USER MAPPING FOR <usename> SERVER
 	// <srv>;`. DU-002 slice 377 (options: slice 379).
 	pgUserMappings.VirtualRows = func() [][]string {
-		mappings := c.ListUserMappings()
-		if len(mappings) == 0 {
-			return nil
-		}
-		out := make([][]string, 0, len(mappings))
-		for _, m := range mappings {
-			usename := m.UmUser
-			umuser := uint32(0) // ACL_ID_PUBLIC
-			if usename == "" || strings.EqualFold(usename, "public") {
-				usename = "public"
-			} else if oid, ok := c.RoleOID(m.UmUser); ok {
-				umuser = oid
-			}
-			out = append(out, []string{
-				strconv.FormatUint(uint64(m.OID), 10),                         // umid
-				strconv.FormatUint(uint64(c.ForeignServerOID(m.SrvName)), 10), // srvid
-				m.SrvName,                              // srvname
-				strconv.FormatUint(uint64(umuser), 10), // umuser
-				usename,                                // usename
-				optionsArrayLiteral(m.Options),         // umoptions text[] ("{name=value,…}" or "" for NULL)
-			})
-		}
-		return out
+		return c.PGUserMappingsRowsForDBOid(DefaultDBOid)
 	}
-	c.tables["pg_catalog.pg_user_mappings"] = pgUserMappings
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_user_mappings"] = pgUserMappings
 
 	// pg_default_acl — default-ACL catalog (OID 826). After getForeignServers,
 	// pg_dump's getUserMappings short-circuits (no foreign servers → no catalog
@@ -9189,7 +10502,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return out
 	}
-	c.tables["pg_catalog.pg_default_acl"] = pgDefaultACL
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_default_acl"] = pgDefaultACL
 
 	// pg_conversion — encoding-conversion catalog (OID 2607). After
 	// getDefaultACLs, pg_dump's getConversions runs:
@@ -9268,7 +10581,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return out
 	}
-	c.tables["pg_catalog.pg_conversion"] = pgConversion
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_conversion"] = pgConversion
 
 	// pg_range — range-type catalog (OID 3541). After getConversions, pg_dump's
 	// getCasts runs:
@@ -9326,7 +10639,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return out
 	}
-	c.tables["pg_catalog.pg_range"] = pgRange
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_range"] = pgRange
 
 	// pg_event_trigger — event-trigger catalog (OID 3466). After getCasts,
 	// pg_dump's getEventTriggers runs:
@@ -9383,7 +10696,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return out
 	}
-	c.tables["pg_catalog.pg_event_trigger"] = pgEventTrigger
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_event_trigger"] = pgEventTrigger
 
 	// pg_partitioned_table — partition-key catalog (OID 3350). After
 	// getEventTriggers, pg_dump's getTableAttrs / collectComments path probes
@@ -9417,7 +10730,7 @@ func (c *InMemory) registerSystemTables() {
 		OID: 3350,
 	}
 	pgPartitionedTable.VirtualRows = func() [][]string { return nil }
-	c.tables["pg_catalog.pg_partitioned_table"] = pgPartitionedTable
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_partitioned_table"] = pgPartitionedTable
 
 	// pg_trigger — trigger catalog (OID 2620). After getTableAttrs, pg_dump's
 	// getTriggers probes per-table triggers. The query that first hits this
@@ -9471,105 +10784,9 @@ func (c *InMemory) registerSystemTables() {
 		OID: 2620,
 	}
 	pgTrigger.VirtualRows = func() [][]string {
-		c.mu.RLock()
-		defer c.mu.RUnlock()
-		var out [][]string
-		for _, tbl := range c.tables {
-			if tbl == nil || tbl.Virtual || tbl.OID == 0 || len(tbl.Triggers) == 0 {
-				continue
-			}
-			for _, trig := range tbl.Triggers {
-				if trig.OID == 0 {
-					continue // predates OID tracking → invisible to pg_dump
-				}
-				// tgtype bitmask (pg_trigger.h): ROW=1, BEFORE=2, INSERT=4,
-				// DELETE=8, UPDATE=16, TRUNCATE=32, INSTEAD=64. AFTER is the
-				// absence of the BEFORE and INSTEAD bits.
-				var tgtype int
-				if trig.ForEachRow {
-					tgtype |= 1 << 0
-				}
-				switch trig.Timing {
-				case TriggerBefore:
-					tgtype |= 1 << 1
-				case TriggerInsteadOf:
-					tgtype |= 1 << 6
-				}
-				for _, ev := range trig.Events {
-					switch strings.ToLower(ev) {
-					case "insert":
-						tgtype |= 1 << 2
-					case "delete":
-						tgtype |= 1 << 3
-					case "update":
-						tgtype |= 1 << 4
-					case "truncate":
-						tgtype |= 1 << 5
-					}
-				}
-				// tgfoid: resolve the trigger function's OID from the routine
-				// registry. pg_dump's getTriggers does not read tgfoid (it calls
-				// pg_get_triggerdef), so 0 (unresolved) is harmless, but project
-				// the real OID for catalog faithfulness.
-				var tgfoid uint32
-				fnSchema := trig.FuncSchema
-				if fnSchema == "" {
-					fnSchema = "public"
-				}
-				if c.routines != nil {
-					for _, r := range c.routines.LookupByName(parser.ObjectName{Schema: trig.FuncSchema, Name: trig.FuncName}) {
-						tgfoid = r.OID
-						break
-					}
-				}
-				row := make([]string, 19)
-				row[0] = fmt.Sprintf("%d", trig.OID)     // oid
-				row[1] = fmt.Sprintf("%d", trig.TableOID) // tgrelid
-				row[2] = "0"                              // tgparentid
-				row[3] = trig.Name                        // tgname
-				row[4] = fmt.Sprintf("%d", tgfoid)        // tgfoid
-				row[5] = fmt.Sprintf("%d", tgtype)        // tgtype
-				row[6] = "O"                              // tgenabled (origin/enabled)
-				row[7] = "f"                              // tgisinternal
-				row[8] = "0"                              // tgconstrrelid
-				row[9] = "0"                              // tgconstrindid
-				// tgconstraint / tgdeferrable / tginitdeferred — a CREATE CONSTRAINT
-				// TRIGGER carries a non-zero tgconstraint (the implicit pg_constraint
-				// OID) so pg_get_triggerdef emits `CREATE CONSTRAINT TRIGGER` plus the
-				// deferrability clause. DU-002 slice 327.
-				tgconstraint := "0"
-				tgdeferrable := "f"
-				tginitdeferred := "f"
-				if trig.IsConstraint {
-					tgconstraint = fmt.Sprintf("%d", trig.ConstraintOID)
-					if trig.Deferrable {
-						tgdeferrable = "t"
-					}
-					if trig.InitDeferred {
-						tginitdeferred = "t"
-					}
-				}
-				row[10] = tgconstraint   // tgconstraint
-				row[11] = tgdeferrable   // tgdeferrable
-				row[12] = tginitdeferred // tginitdeferred
-				row[13] = fmt.Sprintf("%d", len(trig.Args)) // tgnargs
-				// tgattr (int2vector→int2[], space-separated like pg_index.indkey):
-				// the 1-based attnums of an `UPDATE OF col1, col2` column list, or
-				// empty for every non-column-specific trigger. DU-002 slice 326.
-				row[14] = triggerUpdateColAttrs(tbl, trig.UpdateColumns)
-				row[15] = ""                              // tgargs (bytea; def built from catalog.Trigger.Args)
-				row[16] = ""                              // tgqual (pg_node_tree; WHEN unsupported)
-				// tgoldtable / tgnewtable — the REFERENCING transition-table names
-				// (`OLD TABLE AS …` / `NEW TABLE AS …`), empty when absent. DU-002
-				// slice 328.
-				row[17] = trig.OldTransitionTable        // tgoldtable (name)
-				row[18] = trig.NewTransitionTable        // tgnewtable (name)
-				out = append(out, row)
-			}
-		}
-		return out
+		return c.PGTriggerRowsForDBOid(DefaultDBOid)
 	}
-	c.tables["pg_catalog.pg_trigger"] = pgTrigger
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_trigger"] = pgTrigger
 
 	// pg_rewrite — rewrite-rule catalog (OID 2618). After getTriggers, pg_dump's
 	// getRules dumps any ON SELECT/INSERT/UPDATE/DELETE rules. The query that
@@ -9609,40 +10826,9 @@ func (c *InMemory) registerSystemTables() {
 	// absent — goopg has no stored user views feeding this dump path. DU-002
 	// slice 324.
 	pgRewrite.VirtualRows = func() [][]string {
-		c.mu.RLock()
-		defer c.mu.RUnlock()
-		var out [][]string
-		for _, tbl := range c.tables {
-			if tbl == nil || tbl.Virtual || tbl.OID == 0 || len(tbl.Rules) == 0 {
-				continue
-			}
-			for _, r := range tbl.Rules {
-				if r.OID == 0 {
-					continue // predates OID tracking → invisible to pg_dump
-				}
-				evType := r.EvType()
-				if evType == "" {
-					continue
-				}
-				isInstead := "f"
-				if r.Instead {
-					isInstead = "t"
-				}
-				out = append(out, []string{
-					fmt.Sprintf("%d", r.OID),   // oid
-					r.Name,                     // rulename
-					fmt.Sprintf("%d", tbl.OID), // ev_class
-					evType,                     // ev_type
-					string(r.EvEnabled()),      // ev_enabled ('O' default; ALTER TABLE … RULE sets D/R/A)
-					isInstead,                  // is_instead
-					"",                         // ev_qual  (NULL — unconditional rule)
-					"",                         // ev_action (NULL — DO NOTHING)
-				})
-			}
-		}
-		return out
+		return c.PGRewriteRowsForDBOid(DefaultDBOid)
 	}
-	c.tables["pg_catalog.pg_rewrite"] = pgRewrite
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_rewrite"] = pgRewrite
 
 	// pg_largeobject_metadata — large-object ownership/ACL catalog (OID 2995).
 	// After getRules, pg_dump's getBlobs probes large objects with:
@@ -9663,7 +10849,7 @@ func (c *InMemory) registerSystemTables() {
 		OID: 2995,
 	}
 	pgLargeobjectMetadata.VirtualRows = func() [][]string { return nil }
-	c.tables["pg_catalog.pg_largeobject_metadata"] = pgLargeobjectMetadata
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_largeobject_metadata"] = pgLargeobjectMetadata
 
 	// pg_amop — access-method operator catalog (OID 2602). After getBlobs,
 	// pg_dump's getDependencies issues a pg_depend UNION that joins both pg_amop
@@ -9722,7 +10908,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return out
 	}
-	c.tables["pg_catalog.pg_amop"] = pgAmop
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_amop"] = pgAmop
 
 	// pg_amproc — access-method support-procedure catalog (OID 2603). Joined
 	// alongside pg_amop in the same getDependencies pg_depend UNION (see pg_amop
@@ -9763,7 +10949,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return out
 	}
-	c.tables["pg_catalog.pg_amproc"] = pgAmproc
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_amproc"] = pgAmproc
 
 	// pg_seclabels — system view exposing security labels (a join over the
 	// pg_seclabel + pg_shseclabel catalogs). After getDependencies, pg_dump's
@@ -9791,7 +10977,7 @@ func (c *InMemory) registerSystemTables() {
 		OID: 3597,
 	}
 	pgSeclabels.VirtualRows = func() [][]string { return nil }
-	c.tables["pg_catalog.pg_seclabels"] = pgSeclabels
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_seclabels"] = pgSeclabels
 
 	// pg_shseclabel — the raw shared (cluster-wide) security-label catalog
 	// (pg_shseclabel.h, SharedSecLabelRelationId 3592). dumpDatabase's
@@ -9813,7 +10999,7 @@ func (c *InMemory) registerSystemTables() {
 		OID: 3592,
 	}
 	pgShseclabel.VirtualRows = func() [][]string { return nil }
-	c.tables["pg_catalog.pg_shseclabel"] = pgShseclabel
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_shseclabel"] = pgShseclabel
 
 	// pg_db_role_setting — per-database/per-role GUC override catalog
 	// (pg_db_role_setting.h, DbRoleSettingRelationId 2964). dumpDatabaseConfig
@@ -9864,7 +11050,7 @@ func (c *InMemory) registerSystemTables() {
 		}
 		return out
 	}
-	c.tables["pg_catalog.pg_db_role_setting"] = pgDbRoleSetting
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_db_role_setting"] = pgDbRoleSetting
 
 	// pg_sequence — per-sequence parameter catalog (OID 2224, one row per
 	// sequence relation). After getTables, pg_dump's getSequences issues:
@@ -9904,47 +11090,9 @@ func (c *InMemory) registerSystemTables() {
 	// registry via SequenceParamsFunc. pg_dump's getSequences comma-joins this
 	// with pg_get_sequence_data(seqrelid). M0110-0001 (DU-002 slice 115).
 	pgSequence.VirtualRows = func() [][]string {
-		if SequenceParamsFunc == nil {
-			return nil
-		}
-		c.mu.RLock()
-		defer c.mu.RUnlock()
-		keys := make([]string, 0, len(c.tables))
-		for k, t := range c.tables {
-			if t.IsSequence {
-				keys = append(keys, k)
-			}
-		}
-		sort.Strings(keys)
-		rows := make([][]string, 0, len(keys))
-		for _, k := range keys {
-			t := c.tables[k]
-			schema := t.Schema
-			if schema == "" {
-				schema = "public"
-			}
-			p, ok := SequenceParamsFunc(schema + "." + t.Name)
-			if !ok {
-				continue
-			}
-			cyc := "f"
-			if p.Cycle {
-				cyc = "t"
-			}
-			rows = append(rows, []string{
-				strconv.Itoa(int(t.OID)),           // 0: seqrelid
-				strconv.Itoa(int(p.TypeOID)),       // 1: seqtypid
-				strconv.FormatInt(p.Start, 10),     // 2: seqstart
-				strconv.FormatInt(p.Increment, 10), // 3: seqincrement
-				strconv.FormatInt(p.Max, 10),       // 4: seqmax
-				strconv.FormatInt(p.Min, 10),       // 5: seqmin
-				strconv.FormatInt(p.Cache, 10),     // 6: seqcache
-				cyc,                                // 7: seqcycle
-			})
-		}
-		return rows
+		return c.PGSequenceRowsForDBOid(DefaultDBOid)
 	}
-	c.tables["pg_catalog.pg_sequence"] = pgSequence
+	c.ns(DefaultDBOid).tables["pg_catalog.pg_sequence"] = pgSequence
 
 	// Update pg_settings to include more enable_* settings so sysviews.sql
 	// `select name, setting from pg_settings where name like 'enable%'` is non-empty.
@@ -10039,6 +11187,64 @@ func (c *InMemory) registerSystemTables() {
 			{"parallel_leader_participation", "on", "", "Query Tuning / Planner Method Configuration",
 				"Controls whether Gather and Gather Merge also run subplans.", "",
 				"user", "bool", "default", "", "", "", "on", "on", "", "", "f"},
+			// GEQO family (QUERY_TUNING_GEQO) + other planner-tuning GUCs
+			// (QUERY_TUNING_OTHER). Registered in internal/config/defaults.go so
+			// SET/SHOW succeed; surfaced here so pg_settings-reading tooling (ORMs,
+			// monitoring, `SELECT * FROM pg_settings WHERE name = 'geqo_threshold'`)
+			// finds them too. goopg's rule/cost planner ignores every one — pure
+			// stubs — but the catalog view must still report them. Names, defaults,
+			// bounds, category, short_desc, and extra_desc are byte-for-byte from
+			// postgres/src/backend/utils/misc/guc_tables.c. M0122-0007 follow-up.
+			{"geqo", "on", "", "Query Tuning / Genetic Query Optimizer",
+				"Enables genetic query optimization.", "This algorithm attempts to do planning without exhaustive searching.",
+				"user", "bool", "default", "", "", "", "on", "on", "", "", "f"},
+			{"geqo_threshold", "12", "", "Query Tuning / Genetic Query Optimizer",
+				"Sets the threshold of FROM items beyond which GEQO is used.", "",
+				"user", "integer", "default", "2", "2147483647", "", "12", "12", "", "", "f"},
+			{"geqo_effort", "5", "", "Query Tuning / Genetic Query Optimizer",
+				"GEQO: effort is used to set the default for other GEQO parameters.", "",
+				"user", "integer", "default", "1", "10", "", "5", "5", "", "", "f"},
+			{"geqo_pool_size", "0", "", "Query Tuning / Genetic Query Optimizer",
+				"GEQO: number of individuals in the population.", "0 means use a suitable default value.",
+				"user", "integer", "default", "0", "2147483647", "", "0", "0", "", "", "f"},
+			{"geqo_generations", "0", "", "Query Tuning / Genetic Query Optimizer",
+				"GEQO: number of iterations of the algorithm.", "0 means use a suitable default value.",
+				"user", "integer", "default", "0", "2147483647", "", "0", "0", "", "", "f"},
+			{"geqo_selection_bias", "2", "", "Query Tuning / Genetic Query Optimizer",
+				"GEQO: selective pressure within the population.", "",
+				"user", "real", "default", "1.5", "2", "", "2", "2", "", "", "f"},
+			{"geqo_seed", "0", "", "Query Tuning / Genetic Query Optimizer",
+				"GEQO: seed for random path selection.", "",
+				"user", "real", "default", "0", "1", "", "0", "0", "", "", "f"},
+			{"constraint_exclusion", "partition", "", "Query Tuning / Other Planner Options",
+				"Enables the planner to use constraints to optimize queries.",
+				"Table scans will be skipped if their constraints guarantee that no rows match the query.",
+				"user", "enum", "default", "", "", "{partition,on,off}", "partition", "partition", "", "", "f"},
+			{"cursor_tuple_fraction", "0.1", "", "Query Tuning / Other Planner Options",
+				"Sets the planner's estimate of the fraction of a cursor's rows that will be retrieved.", "",
+				"user", "real", "default", "0", "1", "", "0.1", "0.1", "", "", "f"},
+			{"recursive_worktable_factor", "10", "", "Query Tuning / Other Planner Options",
+				"Sets the planner's estimate of the average size of a recursive query's working table.", "",
+				"user", "real", "default", "0.001", "1000000", "", "10", "10", "", "", "f"},
+			// Object-creation default GUCs (CLIENT_CONN_STATEMENT). Registered in
+			// internal/config/defaults.go so SET/SHOW succeed (pg_dump/pg_restore
+			// emit `SET default_tablespace`/`default_table_access_method` before
+			// every CREATE TABLE); surfaced here so pg_settings-reading tooling
+			// finds them too. goopg only implements the heap access method, has no
+			// real tablespaces, and uses its own built-in TOAST default — pure
+			// stubs. Names, defaults, category, short_desc, and enumvals are
+			// byte-for-byte from guc_tables.c; the toast enum matches the reference
+			// PG 18.3 build's --with-lz4. M0122-0007 follow-up.
+			{"default_table_access_method", "heap", "", "Client Connection Defaults / Statement Behavior",
+				"Sets the default table access method for new tables.", "",
+				"user", "string", "default", "", "", "", "heap", "heap", "", "", "f"},
+			{"default_tablespace", "", "", "Client Connection Defaults / Statement Behavior",
+				"Sets the default tablespace to create tables and indexes in.",
+				"An empty string means use the database's default tablespace.",
+				"user", "string", "default", "", "", "", "", "", "", "", "f"},
+			{"default_toast_compression", "pglz", "", "Client Connection Defaults / Statement Behavior",
+				"Sets the default compression method for compressible values.", "",
+				"user", "enum", "default", "", "", "{pglz,lz4}", "pglz", "pglz", "", "", "f"},
 		}
 		// PostgreSQL's pg_settings view is backed by the alphabetically
 		// sorted GUC table, so callers that query it without ORDER BY (e.g.
@@ -10093,7 +11299,7 @@ func (c *InMemory) registerInformationSchemaTables() {
 		}
 		return rows
 	}
-	c.tables["information_schema.routines"] = isRoutines
+	c.ns(DefaultDBOid).tables["information_schema.routines"] = isRoutines
 
 	// information_schema.parameters — one row per parameter per routine.
 	isParams := &Table{
@@ -10163,7 +11369,7 @@ func (c *InMemory) registerInformationSchemaTables() {
 		}
 		return rows
 	}
-	c.tables["information_schema.parameters"] = isParams
+	c.ns(DefaultDBOid).tables["information_schema.parameters"] = isParams
 
 	// Stub usage views — columns match PG's information_schema; return no rows
 	// (body-dependency analysis not yet implemented).
@@ -10234,7 +11440,7 @@ func (c *InMemory) registerInformationSchemaTables() {
 		}
 		return rows
 	}
-	c.tables["information_schema.routine_routine_usage"] = rruTbl
+	c.ns(DefaultDBOid).tables["information_schema.routine_routine_usage"] = rruTbl
 
 	// routine_sequence_usage: one row per sequence dependency.
 	rsuCols := isRoutineUsageViews["routine_sequence_usage"]
@@ -10267,7 +11473,7 @@ func (c *InMemory) registerInformationSchemaTables() {
 		}
 		return rows
 	}
-	c.tables["information_schema.routine_sequence_usage"] = rsuTbl
+	c.ns(DefaultDBOid).tables["information_schema.routine_sequence_usage"] = rsuTbl
 
 	// routine_column_usage: one row per column dependency.
 	rcuCols := isRoutineUsageViews["routine_column_usage"]
@@ -10306,7 +11512,7 @@ func (c *InMemory) registerInformationSchemaTables() {
 		}
 		return rows
 	}
-	c.tables["information_schema.routine_column_usage"] = rcuTbl
+	c.ns(DefaultDBOid).tables["information_schema.routine_column_usage"] = rcuTbl
 
 	// routine_table_usage: one row per table dependency.
 	rtuCols := isRoutineUsageViews["routine_table_usage"]
@@ -10345,7 +11551,7 @@ func (c *InMemory) registerInformationSchemaTables() {
 		}
 		return rows
 	}
-	c.tables["information_schema.routine_table_usage"] = rtuTbl
+	c.ns(DefaultDBOid).tables["information_schema.routine_table_usage"] = rtuTbl
 }
 
 // TryRegisterUserTable installs a user table recovered from the pg_class/
@@ -10355,20 +11561,21 @@ func (c *InMemory) registerInformationSchemaTables() {
 // the JSON snapshot), the call is a no-op and returns nil. nextOID is
 // advanced past tbl.OID to prevent future allocations from colliding with
 // existing heap-stored relations.
-func (c *InMemory) TryRegisterUserTable(tbl *Table) error {
+func (c *InMemory) TryRegisterUserTable(tbl *Table, dbOid ...uint32) error {
 	if tbl == nil {
 		return fmt.Errorf("TryRegisterUserTable: nil table")
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	ns := c.getOrCreateNS(resolveDBOid(dbOid))
 	k := key(parser.ObjectName{Schema: tbl.Schema, Name: tbl.Name})
-	if _, exists := c.tables[k]; exists {
+	if _, exists := ns.tables[k]; exists {
 		return nil // already registered — idempotent
 	}
 	for i := range tbl.Columns {
 		tbl.Columns[i].Ordinal = i
 	}
-	c.tables[k] = tbl
+	ns.tables[k] = tbl
 	if tbl.OID >= c.nextOID {
 		c.nextOID = tbl.OID + 1
 	}
@@ -10389,7 +11596,7 @@ func (c *InMemory) TryRegisterUserTable(tbl *Table) error {
 // System catalog tables are excluded from Snapshot() so they are
 // never persisted to JSON — they are always re-registered at
 // startup from their heap relfiles.
-func (c *InMemory) RegisterRealTable(t *Table) error {
+func (c *InMemory) RegisterRealTable(t *Table, dbOid ...uint32) error {
 	if t == nil {
 		return fmt.Errorf("RegisterRealTable: nil table")
 	}
@@ -10401,8 +11608,9 @@ func (c *InMemory) RegisterRealTable(t *Table) error {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	ns := c.getOrCreateNS(resolveDBOid(dbOid))
 	k := key(parser.ObjectName{Schema: t.Schema, Name: t.Name})
-	if existing, ok := c.tables[k]; ok {
+	if existing, ok := ns.tables[k]; ok {
 		if existing.OID == t.OID {
 			return nil // already registered — idempotent
 		}
@@ -10411,7 +11619,7 @@ func (c *InMemory) RegisterRealTable(t *Table) error {
 	for i := range t.Columns {
 		t.Columns[i].Ordinal = i
 	}
-	c.tables[k] = t
+	ns.tables[k] = t
 	return nil
 }
 
@@ -10434,7 +11642,7 @@ func (c *InMemory) RegisterVirtualTable(t *Table) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	k := key(parser.ObjectName{Schema: t.Schema, Name: t.Name})
-	if _, exists := c.tables[k]; exists {
+	if _, exists := c.ns(DefaultDBOid).tables[k]; exists {
 		return fmt.Errorf("relation %q already exists", k)
 	}
 	if t.OID == 0 {
@@ -10444,7 +11652,7 @@ func (c *InMemory) RegisterVirtualTable(t *Table) error {
 	for i := range t.Columns {
 		t.Columns[i].Ordinal = i
 	}
-	c.tables[k] = t
+	c.ns(DefaultDBOid).tables[k] = t
 	return nil
 }
 
@@ -10465,17 +11673,19 @@ func key(name parser.ObjectName) string {
 // and `SELECT FROM pg_class ...` shapes resolve without an
 // explicit schema qualifier — mirrors upstream's implicit
 // `pg_catalog` entry on the search_path.
-func (c *InMemory) LookupTable(name parser.ObjectName) (*Table, bool) {
+func (c *InMemory) LookupTable(name parser.ObjectName, dbOid ...uint32) (*Table, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	if t, ok := c.tables[key(name)]; ok {
+	resolved := resolveDBOid(dbOid)
+	ns := c.ns(resolved)
+	if t, ok := ns.tables[key(name)]; ok {
 		return t, true
 	}
 	if name.Schema == "" {
-		if t, ok := c.tables[key(parser.ObjectName{Schema: "public", Name: name.Name})]; ok {
+		if t, ok := ns.tables[key(parser.ObjectName{Schema: "public", Name: name.Name})]; ok {
 			return t, true
 		}
-		if t, ok := c.tables[key(parser.ObjectName{Schema: "pg_catalog", Name: name.Name})]; ok {
+		if t, ok := ns.tables[key(parser.ObjectName{Schema: "pg_catalog", Name: name.Name})]; ok {
 			return t, true
 		}
 	} else {
@@ -10483,7 +11693,7 @@ func (c *InMemory) LookupTable(name parser.ObjectName) (*Table, bool) {
 		// that were moved to a different schema via SET SCHEMA (catalog key is unchanged).
 		// A table stored without an explicit schema (t.Schema="") is treated as being
 		// in "public", so a "public.foo" lookup finds a bare-keyed "foo" entry. M0097-0023.
-		if t, ok := c.tables[name.Name]; ok {
+		if t, ok := ns.tables[name.Name]; ok {
 			tSchema := t.Schema
 			if tSchema == "" {
 				tSchema = "public"
@@ -10492,6 +11702,45 @@ func (c *InMemory) LookupTable(name parser.ObjectName) (*Table, bool) {
 				return t, true
 			}
 		}
+	}
+	// System catalogs (pg_catalog/information_schema) are registered exactly
+	// once, under DefaultDBOid, by registerSystemTables — CREATE DATABASE
+	// never seeds a fresh namespace with its own copies of them (they carry
+	// no per-database data of their own beyond what PGClassRowsForDBOid etc.
+	// materialize from the namespace at read time). Without this fallback, a
+	// connection to any genuinely distinct dbOid (anything but DefaultDBOid/
+	// PostgresDBOid, both of which alias to it via NamespaceDBOid) cannot
+	// resolve "pg_class" et al. at all — "relation \"pg_class\" does not
+	// exist" (42P01) — even though the virtual table objects clearly exist.
+	// Scoped to pg_catalog/information_schema only, so a distinct dbOid's
+	// connection can never see DefaultDBOid's real *user* tables (which stay
+	// correctly isolated via the ns.tables lookups above). M0122-0007 4e.
+	if resolved != DefaultDBOid {
+		if t, ok := c.lookupSystemCatalogTableLocked(name); ok {
+			return t, true
+		}
+	}
+	return nil, false
+}
+
+// lookupSystemCatalogTableLocked resolves name against DefaultDBOid's
+// namespace, but only when name is (or could be, if unqualified) a
+// pg_catalog/information_schema object — see LookupTable's fallback above.
+// Callers must already hold c.mu (RLock or Lock).
+func (c *InMemory) lookupSystemCatalogTableLocked(name parser.ObjectName) (*Table, bool) {
+	ns := c.ns(DefaultDBOid)
+	if name.Schema != "" {
+		if !strings.EqualFold(name.Schema, "pg_catalog") && !strings.EqualFold(name.Schema, "information_schema") {
+			return nil, false
+		}
+		t, ok := ns.tables[key(name)]
+		return t, ok
+	}
+	if t, ok := ns.tables[key(parser.ObjectName{Schema: "pg_catalog", Name: name.Name})]; ok {
+		return t, true
+	}
+	if t, ok := ns.tables[key(parser.ObjectName{Schema: "information_schema", Name: name.Name})]; ok {
+		return t, true
 	}
 	return nil, false
 }
@@ -10511,10 +11760,10 @@ func (c *InMemory) LookupColumn(table *Table, name string) (*Column, bool) {
 // LookupIndex returns the index with the given name, or false when
 // unresolved. Unqualified lookups fall back to an unqualified search
 // so schema-qualified references find indexes stored without a schema.
-func (c *InMemory) LookupIndex(name parser.ObjectName) (*Index, bool) {
+func (c *InMemory) LookupIndex(name parser.ObjectName, dbOid ...uint32) (*Index, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	idx, _, ok := c.lookupIndexLocked(name)
+	idx, _, ok := c.lookupIndexLocked(name, resolveDBOid(dbOid))
 	return idx, ok
 }
 
@@ -10532,20 +11781,21 @@ func (c *InMemory) LookupIndex(name parser.ObjectName) (*Index, bool) {
 // resolves the namespace OID to the explicit string "public" instead. A
 // rename/lookup issued before vs. after a restart can therefore target the
 // same logical index under two different literal keys.
-func (c *InMemory) lookupIndexLocked(name parser.ObjectName) (*Index, string, bool) {
-	if idx, ok := c.indexes[key(name)]; ok {
+func (c *InMemory) lookupIndexLocked(name parser.ObjectName, dbOid uint32) (*Index, string, bool) {
+	ns := c.ns(dbOid)
+	if idx, ok := ns.indexes[key(name)]; ok {
 		return idx, key(name), ok
 	}
 	if name.Schema == "" {
 		// Unqualified name: try "public.<name>" first (indexes created via DDL
 		// always carry the table's schema, which defaults to "public").
-		if idx, ok := c.indexes["public."+name.Name]; ok {
+		if idx, ok := ns.indexes["public."+name.Name]; ok {
 			return idx, "public." + name.Name, ok
 		}
 	} else {
 		// Schema-qualified lookup failed: fall back to bare name for indexes
 		// created without an explicit schema in the catalog key.
-		if idx, ok := c.indexes[name.Name]; ok {
+		if idx, ok := ns.indexes[name.Name]; ok {
 			return idx, name.Name, ok
 		}
 	}
@@ -10554,11 +11804,12 @@ func (c *InMemory) lookupIndexLocked(name parser.ObjectName) (*Index, string, bo
 
 // CreateTable installs a new table in the catalog. Returns an error
 // when a table with the same name already exists.
-func (c *InMemory) CreateTable(name parser.ObjectName, cols []Column) (*Table, error) {
+func (c *InMemory) CreateTable(name parser.ObjectName, cols []Column, dbOid ...uint32) (*Table, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	ns := c.getOrCreateNS(resolveDBOid(dbOid))
 	k := key(name)
-	if _, exists := c.tables[k]; exists {
+	if _, exists := ns.tables[k]; exists {
 		return nil, fmt.Errorf("relation %q already exists", k)
 	}
 	for i := range cols {
@@ -10569,22 +11820,24 @@ func (c *InMemory) CreateTable(name parser.ObjectName, cols []Column) (*Table, e
 		Name:    name.Name,
 		Columns: append([]Column(nil), cols...),
 		OID:     c.nextOID,
+		DBOid:   resolveDBOid(dbOid),
 	}
 	c.nextOID++
-	c.tables[k] = t
+	ns.tables[k] = t
 	return t, nil
 }
 
 // CreateIndex installs a new index in the catalog. Returns an error
 // when an index with the same name already exists.
-func (c *InMemory) CreateIndex(name parser.ObjectName, table *Table, cols []string, unique bool, method string, primary bool) (*Index, error) {
+func (c *InMemory) CreateIndex(name parser.ObjectName, table *Table, cols []string, unique bool, method string, primary bool, dbOid ...uint32) (*Index, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if table == nil {
 		return nil, fmt.Errorf("table is nil")
 	}
+	ns := c.getOrCreateNS(resolveDBOid(dbOid))
 	k := key(name)
-	if _, exists := c.indexes[k]; exists {
+	if _, exists := ns.indexes[k]; exists {
 		return nil, fmt.Errorf("relation %q already exists", k)
 	}
 	idx := &Index{
@@ -10596,25 +11849,26 @@ func (c *InMemory) CreateIndex(name parser.ObjectName, table *Table, cols []stri
 		Method:  strings.ToLower(method),
 		Primary: primary,
 		OID:     c.nextOID,
+		DBOid:   resolveDBOid(dbOid),
 	}
 	c.nextOID++
-	c.indexes[k] = idx
-	if c.byTable[table.OID] == nil {
-		c.byTable[table.OID] = map[string]*Index{}
+	ns.indexes[k] = idx
+	if ns.byTable[table.OID] == nil {
+		ns.byTable[table.OID] = map[string]*Index{}
 	}
-	c.byTable[table.OID][k] = idx
+	ns.byTable[table.OID][k] = idx
 	return idx, nil
 }
 
 // AddColumn appends one column to an existing table definition.
-func (c *InMemory) AddColumn(table *Table, col Column) (*Column, error) {
+func (c *InMemory) AddColumn(table *Table, col Column, dbOid ...uint32) (*Column, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if table == nil {
 		return nil, fmt.Errorf("table is nil")
 	}
 	k := key(parser.ObjectName{Schema: table.Schema, Name: table.Name})
-	t, ok := c.tables[k]
+	t, ok := c.ns(resolveDBOid(dbOid)).tables[k]
 	if !ok {
 		return nil, fmt.Errorf("relation %q does not exist", table.QualifiedName())
 	}
@@ -10630,74 +11884,78 @@ func (c *InMemory) AddColumn(table *Table, col Column) (*Column, error) {
 
 // RenameTable renames a catalog table/view/sequence entry from old to new.
 // Returns an error when old does not exist or new already exists. M0097-0024.
-func (c *InMemory) RenameTable(old, new parser.ObjectName) error {
+func (c *InMemory) RenameTable(old, new parser.ObjectName, dbOid ...uint32) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	ns := c.ns(resolveDBOid(dbOid))
 	oldK := key(old)
 	newK := key(new)
-	tbl, exists := c.tables[oldK]
+	tbl, exists := ns.tables[oldK]
 	if !exists {
 		return fmt.Errorf("relation %q does not exist", oldK)
 	}
-	if _, exists2 := c.tables[newK]; exists2 {
+	if _, exists2 := ns.tables[newK]; exists2 {
 		return fmt.Errorf("relation %q already exists", newK)
 	}
 	// Re-key the table entry under the new name, preserving the pointer.
 	tbl.Schema = new.Schema
 	tbl.Name = new.Name
-	c.tables[newK] = tbl
-	delete(c.tables, oldK)
+	ns.tables[newK] = tbl
+	delete(ns.tables, oldK)
 	return nil
 }
 
 // RegisterTable re-inserts a previously-dropped table back into the catalog.
 // Used when a TEMP TABLE shadows a permanent table and is then dropped —
 // the permanent table is restored by re-registering its saved *Table. M0097-0003.
-func (c *InMemory) RegisterTable(tbl *Table) {
+func (c *InMemory) RegisterTable(tbl *Table, dbOid ...uint32) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	k := strings.ToLower(tbl.Name)
 	if tbl.Schema != "" {
 		k = strings.ToLower(tbl.Schema) + "." + k
 	}
-	c.tables[k] = tbl
+	c.getOrCreateNS(resolveDBOid(dbOid)).tables[k] = tbl
 }
 
 // RestoreIndex re-inserts a previously-dropped index back into the catalog.
 // Used when ROLLBACK TO SAVEPOINT undoes a DROP TABLE that happened inside
 // a savepoint. M0097-0023.
-func (c *InMemory) RestoreIndex(idx *Index) {
+func (c *InMemory) RestoreIndex(idx *Index, dbOid ...uint32) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	k := key(parser.ObjectName{Schema: idx.Schema, Name: idx.Name})
-	c.indexes[k] = idx
-	if c.byTable[idx.Table.OID] == nil {
-		c.byTable[idx.Table.OID] = map[string]*Index{}
+	ns := c.getOrCreateNS(resolveDBOid(dbOid))
+	ns.indexes[k] = idx
+	if ns.byTable[idx.Table.OID] == nil {
+		ns.byTable[idx.Table.OID] = map[string]*Index{}
 	}
-	c.byTable[idx.Table.OID][k] = idx
+	ns.byTable[idx.Table.OID][k] = idx
 }
 
 // RenameIndex renames a catalog index entry from old to new, re-keying both
-// `c.indexes` and the owning table's `c.byTable` slot (mirrors RenameTable's
+// `c.ns(DefaultDBOid).indexes` and the owning table's `c.ns(DefaultDBOid).byTable` slot (mirrors RenameTable's
 // shape, DU-002 slice 443). Returns an error when old does not exist or new
 // already exists — real PostgreSQL raises 42P07 for the latter
 // (RenameRelation -> RangeVarCallbackForAlterRelation's namespace check).
-func (c *InMemory) RenameIndex(old, new parser.ObjectName) error {
+func (c *InMemory) RenameIndex(old, new parser.ObjectName, dbOid ...uint32) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	idx, oldK, exists := c.lookupIndexLocked(old)
+	resolved := resolveDBOid(dbOid)
+	ns := c.ns(resolved)
+	idx, oldK, exists := c.lookupIndexLocked(old, resolved)
 	if !exists {
 		return fmt.Errorf("relation %q does not exist", key(old))
 	}
 	newK := key(parser.ObjectName{Schema: idx.Schema, Name: new.Name})
-	if _, _, collides := c.lookupIndexLocked(parser.ObjectName{Schema: idx.Schema, Name: new.Name}); collides {
+	if _, _, collides := c.lookupIndexLocked(parser.ObjectName{Schema: idx.Schema, Name: new.Name}, resolved); collides {
 		return fmt.Errorf("relation %q already exists", newK)
 	}
 	idx.Name = new.Name
-	c.indexes[newK] = idx
-	delete(c.indexes, oldK)
+	ns.indexes[newK] = idx
+	delete(ns.indexes, oldK)
 	if idx.Table != nil {
-		if perTable := c.byTable[idx.Table.OID]; perTable != nil {
+		if perTable := ns.byTable[idx.Table.OID]; perTable != nil {
 			delete(perTable, oldK)
 			perTable[newK] = idx
 		}
@@ -10716,16 +11974,16 @@ func (c *InMemory) RenameIndex(old, new parser.ObjectName) error {
 func (c *InMemory) RenameIndexDuringRecovery(schema, oldName, newName string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	idx, oldK, exists := c.lookupIndexLocked(parser.ObjectName{Schema: schema, Name: oldName})
+	idx, oldK, exists := c.lookupIndexLocked(parser.ObjectName{Schema: schema, Name: oldName}, DefaultDBOid)
 	if !exists {
 		return
 	}
 	newK := key(parser.ObjectName{Schema: idx.Schema, Name: newName})
 	idx.Name = newName
-	c.indexes[newK] = idx
-	delete(c.indexes, oldK)
+	c.ns(DefaultDBOid).indexes[newK] = idx
+	delete(c.ns(DefaultDBOid).indexes, oldK)
 	if idx.Table != nil {
-		if perTable := c.byTable[idx.Table.OID]; perTable != nil {
+		if perTable := c.ns(DefaultDBOid).byTable[idx.Table.OID]; perTable != nil {
 			delete(perTable, oldK)
 			perTable[newK] = idx
 		}
@@ -10742,18 +12000,19 @@ func (c *InMemory) RenameIndexDuringRecovery(schema, oldName, newName string) {
 // responsibility — passes already-typed []Column). orReplace
 // drops an existing same-name view first; CREATE VIEW (without
 // REPLACE) over an existing object is an error per upstream.
-func (c *InMemory) CreateView(name parser.ObjectName, cols []Column, aliases []string, query *parser.SelectStmt, orReplace bool) (*Table, error) {
+func (c *InMemory) CreateView(name parser.ObjectName, cols []Column, aliases []string, query *parser.SelectStmt, orReplace bool, dbOid ...uint32) (*Table, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	ns := c.getOrCreateNS(resolveDBOid(dbOid))
 	k := key(name)
-	if existing, ok := c.tables[k]; ok {
+	if existing, ok := ns.tables[k]; ok {
 		if !orReplace {
 			return nil, fmt.Errorf("relation %q already exists", k)
 		}
 		if existing.View == nil {
 			return nil, fmt.Errorf("%q is not a view", k)
 		}
-		delete(c.tables, k)
+		delete(ns.tables, k)
 	}
 	for i := range cols {
 		cols[i].Ordinal = i
@@ -10766,9 +12025,13 @@ func (c *InMemory) CreateView(name parser.ObjectName, cols []Column, aliases []s
 		Virtual:           true,
 		View:              query,
 		ViewColumnAliases: append([]string(nil), aliases...),
+		// DBOid mirrors CreateTable's stamping (M0122-0007 4e follow-up 39):
+		// syncTableToCatalogHeap routes a view's pg_class row by the owning
+		// database, so a view created under a distinct dbOid must carry it.
+		DBOid: resolveDBOid(dbOid),
 	}
 	c.nextOID++
-	c.tables[k] = t
+	ns.tables[k] = t
 	return t, nil
 }
 
@@ -10814,11 +12077,12 @@ func (c *InMemory) UpdateRelStats(table *Table, pages int, tuples int64) {
 
 // DropView removes a view from the catalog. Errors when the
 // name resolves to a non-view relation; respects ifExists.
-func (c *InMemory) DropView(name parser.ObjectName, ifExists bool) error {
+func (c *InMemory) DropView(name parser.ObjectName, ifExists bool, dbOid ...uint32) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	ns := c.ns(resolveDBOid(dbOid))
 	k := key(name)
-	t, ok := c.tables[k]
+	t, ok := ns.tables[k]
 	if !ok {
 		if ifExists {
 			return nil
@@ -10828,7 +12092,7 @@ func (c *InMemory) DropView(name parser.ObjectName, ifExists bool) error {
 	if t.View == nil {
 		return fmt.Errorf("%q is not a view", k)
 	}
-	delete(c.tables, k)
+	delete(ns.tables, k)
 	return nil
 }
 
@@ -10961,29 +12225,29 @@ func (c *InMemory) RenameSchema(old, new string) ([]*Table, error) {
 		c.schemaOwners[lcNew] = owner
 	}
 	var movedSequences []*Table
-	for k, tbl := range c.tables {
+	for k, tbl := range c.ns(DefaultDBOid).tables {
 		if !strings.EqualFold(tbl.Schema, old) {
 			continue
 		}
 		tbl.Schema = new
 		newK := key(parser.ObjectName{Schema: new, Name: tbl.Name})
 		if newK != k {
-			delete(c.tables, k)
-			c.tables[newK] = tbl
+			delete(c.ns(DefaultDBOid).tables, k)
+			c.ns(DefaultDBOid).tables[newK] = tbl
 		}
 		if tbl.IsSequence {
 			movedSequences = append(movedSequences, tbl)
 		}
 	}
-	for k, idx := range c.indexes {
+	for k, idx := range c.ns(DefaultDBOid).indexes {
 		if !strings.EqualFold(idx.Schema, old) {
 			continue
 		}
 		idx.Schema = new
 		newK := key(parser.ObjectName{Schema: new, Name: idx.Name})
 		if newK != k {
-			delete(c.indexes, k)
-			c.indexes[newK] = idx
+			delete(c.ns(DefaultDBOid).indexes, k)
+			c.ns(DefaultDBOid).indexes[newK] = idx
 		}
 	}
 	for name, schema := range c.opClassSchemas {
@@ -12274,9 +13538,31 @@ func (c *InMemory) tablespaceVirtualRows() [][]string {
 	return rows
 }
 
-// dependVirtualRows builds pg_depend's only non-empty dependency class: the
-// AUTO ('a') link from an OWNED-BY sequence to the column it is tied to. Each
-// row matches what PG records for `ALTER/CREATE SEQUENCE ... OWNED BY t.c`:
+// PGDependRowsForDBOid builds pg_depend's row-set for dbOid's own relations
+// (mirrors PGConstraintRowsForDBOid's per-connection dbOid scoping above).
+// registerSystemTables's VirtualRows closure calls this with DefaultDBOid so
+// every existing caller (server dispatch without a per-connection
+// PgDependRows wire-up, every test) sees byte-identical behavior; a
+// per-connection dbOid is wired in via executor.Context.PgDependRows
+// (internal/server/dispatch.go's wireExtensionRows). The
+// attrDefRowsLockedForDBOid(dbOid) call below must use the SAME dbOid as the
+// caller's PGAttrdefRowsForDBOid(dbOid) so the two views' oid numbering stays
+// in lockstep (see PGAttrdefRowsForDBOid's doc comment). Two class of rows
+// stay dbOid-agnostic pending their own dedicated fix, matching the
+// PGConstraintRowsForDBOid precedent of leaving c.domains global: the AM
+// operator-class member rows (c.amOpMembers/c.amProcMembers — operator
+// classes/families are not yet namespace-scoped at all, an M0122-0007 4e
+// non-goal). M0122-0007 4e follow-up 27. The sequence-ownership lookup
+// (SequenceParamsFunc) below now DOES pass this function's own dbOid — fixed
+// by follow-up 34, which also gave PGSequenceRowsForDBOid the same dbOid
+// param; pg_sequences/information_schema.sequences (internal/initdb, reading
+// executor.AllSequenceInfos() with no dbOid) remain separately deferred.
+//
+// The rows built here cover pg_depend's non-empty dependency classes: the
+// AUTO ('a') link from an OWNED-BY sequence to the column it is tied to, plus
+// the NORMAL ('n')/INTERNAL ('i') attrdef→sequence and AM opclass/opfamily
+// member links below. Each sequence-ownership row matches what PG records for
+// `ALTER/CREATE SEQUENCE ... OWNED BY t.c`:
 //
 //	classid     = pg_class (1259)   objid       = sequence's pg_class OID
 //	objsubid    = 0                 refclassid  = pg_class (1259)
@@ -12287,7 +13573,7 @@ func (c *InMemory) tablespaceVirtualRows() [][]string {
 // into owning_tab/owning_col so dumpSequence emits the ALTER SEQUENCE OWNED BY.
 // Standalone sequences have no OwnedBy and contribute no row. M0110-0001
 // (DU-002 slice 118).
-func (c *InMemory) dependVirtualRows() [][]string {
+func (c *InMemory) PGDependRowsForDBOid(dbOid uint32) [][]string {
 	if SequenceParamsFunc == nil {
 		return nil
 	}
@@ -12301,9 +13587,9 @@ func (c *InMemory) dependVirtualRows() [][]string {
 		oid     uint32
 		columns []Column
 	}
-	byName := make(map[string]tblRef, len(c.tables))
+	byName := make(map[string]tblRef, len(c.ns(dbOid).tables))
 	seqKeys := make([]string, 0)
-	for k, t := range c.tables {
+	for k, t := range c.ns(dbOid).tables {
 		if t.IsSequence {
 			seqKeys = append(seqKeys, k)
 			continue
@@ -12321,12 +13607,12 @@ func (c *InMemory) dependVirtualRows() [][]string {
 
 	rows := make([][]string, 0, len(seqKeys))
 	for _, k := range seqKeys {
-		t := c.tables[k]
+		t := c.ns(dbOid).tables[k]
 		seqSchema := strings.ToLower(t.Schema)
 		if seqSchema == "" {
 			seqSchema = "public"
 		}
-		p, ok := SequenceParamsFunc(seqSchema + "." + t.Name)
+		p, ok := SequenceParamsFunc(seqSchema+"."+t.Name, dbOid)
 		if !ok || p.OwnedBy == "" {
 			continue
 		}
@@ -12387,8 +13673,8 @@ func (c *InMemory) dependVirtualRows() [][]string {
 	// by emitting the default as a separate `ALTER TABLE ... SET DEFAULT
 	// nextval(...)` (repairTableAttrDefMultiLoop) — exactly upstream's behavior.
 	// The pg_attrdef.oid pg_dump scanned must equal this objid, so both come from
-	// the shared attrDefRowsLocked numbering. DU-002 slice 121.
-	for _, ad := range c.attrDefRowsLocked() {
+	// the shared attrDefRowsLockedForDBOid(dbOid) numbering. DU-002 slice 121.
+	for _, ad := range c.attrDefRowsLockedForDBOid(dbOid) {
 		if ad.seqOID == 0 {
 			continue
 		}
@@ -12522,6 +13808,370 @@ func (c *InMemory) dependVirtualRows() [][]string {
 	return rows
 }
 
+// PGInheritsRowsForDBOid builds the pg_inherits catalog row-set for dbOid's
+// own inheritance/partition parent-child relationships (mirrors
+// PGIndexRowsForDBOid's per-connection dbOid scoping above).
+// registerSystemTables's VirtualRows closure calls this with DefaultDBOid so
+// every existing caller (server dispatch without a per-connection
+// PgInheritsRows wire-up, every test) sees byte-identical behavior; a
+// per-connection dbOid is wired in via executor.Context.PgInheritsRows
+// (internal/server/dispatch.go's wireExtensionRows). M0122-0007 4e follow-up 28.
+func (c *InMemory) PGInheritsRowsForDBOid(dbOid uint32) [][]string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	var out [][]string
+	parentSeq := make(map[uint32]int)
+	for _, tbl := range c.ns(dbOid).tables {
+		if tbl.Virtual {
+			continue
+		}
+		// Partition children: one row per child → its partition parent.
+		if tbl.PartitionParentOID != 0 {
+			parentSeq[tbl.PartitionParentOID]++
+			seq := parentSeq[tbl.PartitionParentOID]
+			out = append(out, []string{
+				fmt.Sprintf("%d", tbl.OID),
+				fmt.Sprintf("%d", tbl.PartitionParentOID),
+				fmt.Sprintf("%d", seq),
+				"f",
+			})
+			continue
+		}
+		// Legacy inheritance children: one row per (child, parent) pair in
+		// declaration order, so inhseqno matches the INHERITS (...) list and
+		// pg_dump re-emits the clause. DU-002 slice 170.
+		for i, parentOID := range tbl.InheritsParentOIDs {
+			out = append(out, []string{
+				fmt.Sprintf("%d", tbl.OID),
+				fmt.Sprintf("%d", parentOID),
+				fmt.Sprintf("%d", i+1),
+				"f",
+			})
+		}
+	}
+	// Emit index partition rows: each index with PartitionParentOID set is a
+	// partition child of its parent index. These rows enable the join pattern:
+	//   pg_index LEFT JOIN pg_inherits ON (indexrelid = inhrelid)
+	// used by indexing.sql to discover partitioned-index parent/child chains.
+	idxParentSeq := make(map[uint32]int)
+	for _, idx := range c.ns(dbOid).indexes {
+		if idx.PartitionParentOID == 0 {
+			continue
+		}
+		idxParentSeq[idx.PartitionParentOID]++
+		seq := idxParentSeq[idx.PartitionParentOID]
+		out = append(out, []string{
+			fmt.Sprintf("%d", idx.OID),
+			fmt.Sprintf("%d", idx.PartitionParentOID),
+			fmt.Sprintf("%d", seq),
+			"f",
+		})
+	}
+	return out
+}
+
+// PGPolicyRowsForDBOid builds the pg_policy catalog row-set for dbOid's own
+// tables' row-level-security policies (mirrors PGInheritsRowsForDBOid's
+// per-connection dbOid scoping above). registerSystemTables's VirtualRows
+// closure calls this with DefaultDBOid so every existing caller (server
+// dispatch without a per-connection PgPolicyRows wire-up, every test) sees
+// byte-identical behavior; a per-connection dbOid is wired in via
+// executor.Context.PgPolicyRows (internal/server/dispatch.go's
+// wireExtensionRows). M0122-0007 4e follow-up 29.
+func (c *InMemory) PGPolicyRowsForDBOid(dbOid uint32) [][]string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	var out [][]string
+	for _, tbl := range c.ns(dbOid).tables {
+		if tbl == nil || tbl.Virtual || tbl.OID == 0 || len(tbl.Policies) == 0 {
+			continue
+		}
+		for _, pol := range tbl.Policies {
+			if pol.OID == 0 {
+				continue // predates OID tracking → invisible to pg_dump
+			}
+			// polroles: format the OID array as a PostgreSQL array literal.
+			// {0} is the PUBLIC sentinel; getPolicies maps it to a NULL TO
+			// clause via `CASE WHEN polroles = '{0}' THEN NULL …`.
+			roles := pol.Roles
+			if len(roles) == 0 {
+				roles = []uint32{0}
+			}
+			parts := make([]string, len(roles))
+			for i, r := range roles {
+				parts[i] = fmt.Sprintf("%d", r)
+			}
+			polroles := "{" + strings.Join(parts, ",") + "}"
+			// polqual / polwithcheck: render the parsed expression with the
+			// catalog-side pg_get_expr deparser, which fully parenthesizes
+			// every node so pg_dump emits `USING ((expr))` / `WITH CHECK
+			// ((expr))`. An absent expression stays "" (→ SQL NULL → pg_dump
+			// omits the clause).
+			var polqual, polwithcheck string
+			if pol.Using != nil {
+				polqual = formatExprForAttrdef(pol.Using)
+			}
+			if pol.WithCheck != nil {
+				polwithcheck = formatExprForAttrdef(pol.WithCheck)
+			}
+			cmd := pol.Command
+			if cmd == 0 {
+				cmd = '*'
+			}
+			permissive := "t"
+			if !pol.Permissive {
+				permissive = "f"
+			}
+			out = append(out, []string{
+				fmt.Sprintf("%d", pol.OID), // oid
+				pol.Name,                   // polname
+				fmt.Sprintf("%d", tbl.OID), // polrelid
+				string(cmd),                // polcmd
+				permissive,                 // polpermissive
+				polroles,                   // polroles
+				polqual,                    // polqual
+				polwithcheck,               // polwithcheck
+			})
+		}
+	}
+	return out
+}
+
+// PGTriggerRowsForDBOid builds the pg_trigger catalog row-set for dbOid's own
+// tables' triggers (mirrors PGPolicyRowsForDBOid's per-connection dbOid
+// scoping above). registerSystemTables's VirtualRows closure calls this with
+// DefaultDBOid so every existing caller (server dispatch without a
+// per-connection PgTriggerRows wire-up, every test) sees byte-identical
+// behavior; a per-connection dbOid is wired in via executor.Context.PgTriggerRows
+// (internal/server/dispatch.go's wireExtensionRows). M0122-0007 4e follow-up 30.
+func (c *InMemory) PGTriggerRowsForDBOid(dbOid uint32) [][]string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	var out [][]string
+	for _, tbl := range c.ns(dbOid).tables {
+		if tbl == nil || tbl.Virtual || tbl.OID == 0 || len(tbl.Triggers) == 0 {
+			continue
+		}
+		for _, trig := range tbl.Triggers {
+			if trig.OID == 0 {
+				continue // predates OID tracking → invisible to pg_dump
+			}
+			// tgtype bitmask (pg_trigger.h): ROW=1, BEFORE=2, INSERT=4,
+			// DELETE=8, UPDATE=16, TRUNCATE=32, INSTEAD=64. AFTER is the
+			// absence of the BEFORE and INSTEAD bits.
+			var tgtype int
+			if trig.ForEachRow {
+				tgtype |= 1 << 0
+			}
+			switch trig.Timing {
+			case TriggerBefore:
+				tgtype |= 1 << 1
+			case TriggerInsteadOf:
+				tgtype |= 1 << 6
+			}
+			for _, ev := range trig.Events {
+				switch strings.ToLower(ev) {
+				case "insert":
+					tgtype |= 1 << 2
+				case "delete":
+					tgtype |= 1 << 3
+				case "update":
+					tgtype |= 1 << 4
+				case "truncate":
+					tgtype |= 1 << 5
+				}
+			}
+			// tgfoid: resolve the trigger function's OID from the routine
+			// registry. pg_dump's getTriggers does not read tgfoid (it calls
+			// pg_get_triggerdef), so 0 (unresolved) is harmless, but project
+			// the real OID for catalog faithfulness.
+			var tgfoid uint32
+			fnSchema := trig.FuncSchema
+			if fnSchema == "" {
+				fnSchema = "public"
+			}
+			if c.routines != nil {
+				for _, r := range c.routines.LookupByName(parser.ObjectName{Schema: trig.FuncSchema, Name: trig.FuncName}) {
+					tgfoid = r.OID
+					break
+				}
+			}
+			row := make([]string, 19)
+			row[0] = fmt.Sprintf("%d", trig.OID)      // oid
+			row[1] = fmt.Sprintf("%d", trig.TableOID) // tgrelid
+			row[2] = "0"                              // tgparentid
+			row[3] = trig.Name                        // tgname
+			row[4] = fmt.Sprintf("%d", tgfoid)        // tgfoid
+			row[5] = fmt.Sprintf("%d", tgtype)        // tgtype
+			row[6] = "O"                              // tgenabled (origin/enabled)
+			row[7] = "f"                              // tgisinternal
+			row[8] = "0"                              // tgconstrrelid
+			row[9] = "0"                              // tgconstrindid
+			// tgconstraint / tgdeferrable / tginitdeferred — a CREATE CONSTRAINT
+			// TRIGGER carries a non-zero tgconstraint (the implicit pg_constraint
+			// OID) so pg_get_triggerdef emits `CREATE CONSTRAINT TRIGGER` plus the
+			// deferrability clause. DU-002 slice 327.
+			tgconstraint := "0"
+			tgdeferrable := "f"
+			tginitdeferred := "f"
+			if trig.IsConstraint {
+				tgconstraint = fmt.Sprintf("%d", trig.ConstraintOID)
+				if trig.Deferrable {
+					tgdeferrable = "t"
+				}
+				if trig.InitDeferred {
+					tginitdeferred = "t"
+				}
+			}
+			row[10] = tgconstraint                      // tgconstraint
+			row[11] = tgdeferrable                       // tgdeferrable
+			row[12] = tginitdeferred                     // tginitdeferred
+			row[13] = fmt.Sprintf("%d", len(trig.Args))  // tgnargs
+			// tgattr (int2vector→int2[], space-separated like pg_index.indkey):
+			// the 1-based attnums of an `UPDATE OF col1, col2` column list, or
+			// empty for every non-column-specific trigger. DU-002 slice 326.
+			row[14] = triggerUpdateColAttrs(tbl, trig.UpdateColumns)
+			row[15] = "" // tgargs (bytea; def built from catalog.Trigger.Args)
+			row[16] = "" // tgqual (pg_node_tree; WHEN unsupported)
+			// tgoldtable / tgnewtable — the REFERENCING transition-table names
+			// (`OLD TABLE AS …` / `NEW TABLE AS …`), empty when absent. DU-002
+			// slice 328.
+			row[17] = trig.OldTransitionTable // tgoldtable (name)
+			row[18] = trig.NewTransitionTable // tgnewtable (name)
+			out = append(out, row)
+		}
+	}
+	return out
+}
+
+// PGSequenceRowsForDBOid builds the pg_sequence catalog row-set for dbOid's
+// own sequences (mirrors PGTriggerRowsForDBOid's per-connection dbOid scoping
+// above). registerSystemTables's VirtualRows closure calls this with
+// DefaultDBOid so every existing caller (server dispatch without a
+// per-connection PgSequenceRows wire-up, every test) sees byte-identical
+// behavior; a per-connection dbOid is wired in via
+// executor.Context.PgSequenceRows (internal/server/dispatch.go's
+// wireExtensionRows). M0122-0007 4e follow-up 34.
+func (c *InMemory) PGSequenceRowsForDBOid(dbOid uint32) [][]string {
+	if SequenceParamsFunc == nil {
+		return nil
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	keys := make([]string, 0, len(c.ns(dbOid).tables))
+	for k, t := range c.ns(dbOid).tables {
+		if t.IsSequence {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	rows := make([][]string, 0, len(keys))
+	for _, k := range keys {
+		t := c.ns(dbOid).tables[k]
+		schema := t.Schema
+		if schema == "" {
+			schema = "public"
+		}
+		p, ok := SequenceParamsFunc(schema+"."+t.Name, dbOid)
+		if !ok {
+			continue
+		}
+		cyc := "f"
+		if p.Cycle {
+			cyc = "t"
+		}
+		rows = append(rows, []string{
+			strconv.Itoa(int(t.OID)),           // 0: seqrelid
+			strconv.Itoa(int(p.TypeOID)),       // 1: seqtypid
+			strconv.FormatInt(p.Start, 10),     // 2: seqstart
+			strconv.FormatInt(p.Increment, 10), // 3: seqincrement
+			strconv.FormatInt(p.Max, 10),       // 4: seqmax
+			strconv.FormatInt(p.Min, 10),       // 5: seqmin
+			strconv.FormatInt(p.Cache, 10),     // 6: seqcache
+			cyc,                                // 7: seqcycle
+		})
+	}
+	return rows
+}
+
+// PGRewriteRowsForDBOid builds the pg_rewrite catalog row-set for dbOid's own
+// tables' CREATE RULE DO-NOTHING rules (mirrors PGTriggerRowsForDBOid's
+// per-connection dbOid scoping above). registerSystemTables's VirtualRows
+// closure calls this with DefaultDBOid so every existing caller (server
+// dispatch without a per-connection PgRewriteRows wire-up, every test) sees
+// byte-identical behavior; a per-connection dbOid is wired in via
+// executor.Context.PgRewriteRows (internal/server/dispatch.go's
+// wireExtensionRows). M0122-0007 4e follow-up 31.
+func (c *InMemory) PGRewriteRowsForDBOid(dbOid uint32) [][]string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	var out [][]string
+	for _, tbl := range c.ns(dbOid).tables {
+		if tbl == nil || tbl.Virtual || tbl.OID == 0 || len(tbl.Rules) == 0 {
+			continue
+		}
+		for _, r := range tbl.Rules {
+			if r.OID == 0 {
+				continue // predates OID tracking → invisible to pg_dump
+			}
+			evType := r.EvType()
+			if evType == "" {
+				continue
+			}
+			isInstead := "f"
+			if r.Instead {
+				isInstead = "t"
+			}
+			out = append(out, []string{
+				fmt.Sprintf("%d", r.OID),   // oid
+				r.Name,                     // rulename
+				fmt.Sprintf("%d", tbl.OID), // ev_class
+				evType,                     // ev_type
+				string(r.EvEnabled()),      // ev_enabled ('O' default; ALTER TABLE … RULE sets D/R/A)
+				isInstead,                  // is_instead
+				"",                         // ev_qual  (NULL — unconditional rule)
+				"",                         // ev_action (NULL — DO NOTHING)
+			})
+		}
+	}
+	return out
+}
+
+// PGForeignTableRowsForDBOid builds the pg_foreign_table catalog row-set for
+// dbOid's own foreign tables (mirrors PGRewriteRowsForDBOid's per-connection
+// dbOid scoping above). registerSystemTables's VirtualRows closure calls this
+// with DefaultDBOid so every existing caller (server dispatch without a
+// per-connection PgForeignTableRows wire-up, every test) sees byte-identical
+// behavior; a per-connection dbOid is wired in via
+// executor.Context.PgForeignTableRows (internal/server/dispatch.go's
+// wireExtensionRows). M0122-0007 4e follow-up 32.
+func (c *InMemory) PGForeignTableRowsForDBOid(dbOid uint32) [][]string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	keys := make([]string, 0, len(c.ns(dbOid).tables))
+	for k := range c.ns(dbOid).tables {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var out [][]string
+	for _, k := range keys {
+		t := c.ns(dbOid).tables[k]
+		if t.ForeignServerName == "" {
+			continue
+		}
+		var srvOID uint32
+		if s, ok := c.foreignServers[foreignServerKey(dbOid, t.ForeignServerName)]; ok {
+			srvOID = s.OID
+		}
+		out = append(out, []string{
+			strconv.FormatUint(uint64(t.OID), 10),  // ftrelid
+			strconv.FormatUint(uint64(srvOID), 10), // ftserver
+			optionsArrayLiteral(t.ForeignOptions),  // ftoptions
+		})
+	}
+	return out
+}
+
 // CreateTablespace records an in-place tablespace in the runtime registry and
 // returns the freshly allocated OID. A name already present returns a duplicate
 // error mirroring PG's get_tablespace_oid collision message. The caller (the DDL
@@ -12556,6 +14206,67 @@ func (c *InMemory) DropTablespace(name string) (uint32, bool) {
 		return 0, false
 	}
 	delete(c.tablespaces, lc)
+	return ts.oid, true
+}
+
+// RegisterTablespaceDuringRecovery re-registers a tablespace with its
+// original OID/owner/location, replayed from a RecordKindCreateTablespace WAL
+// record (M0122-0007 tablespace-registry restart-durability follow-up).
+// Mirrors RegisterSchemaDuringRecovery.
+func (c *InMemory) RegisterTablespaceDuringRecovery(name, owner, location string, oid uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	lc := strings.ToLower(name)
+	c.tablespaces[lc] = &tablespaceRow{
+		oid:      oid,
+		name:     name,
+		owner:    owner,
+		location: location,
+	}
+	if oid >= c.nextOID {
+		c.nextOID = oid + 1
+	}
+}
+
+// UnregisterTablespaceDuringRecovery removes a tablespace from the registry,
+// replayed from a RecordKindDropTablespace WAL record. Counterpart to
+// RegisterTablespaceDuringRecovery; mirrors UnregisterSchemaDuringRecovery.
+func (c *InMemory) UnregisterTablespaceDuringRecovery(name string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.tablespaces, strings.ToLower(name))
+}
+
+// DefaultTablespaceOID / GlobalTablespaceOID are the bootstrap pg_tablespace
+// OIDs (pg_tablespace.dat), matching upstream's DEFAULTTABLESPACE_OID /
+// GLOBALTABLESPACE_OID. Every database's default tablespace is pg_default —
+// goopg has no per-database tablespace override (dattablespace is always
+// hardcoded to 1663, see pg_database_bootstrap.go) — so a table's explicit
+// `TABLESPACE pg_default` always normalizes to reltablespace=0, mirroring
+// heap_create's `reltablespaceOid == MyDatabaseTableSpace ? InvalidOid : ...`.
+const (
+	DefaultTablespaceOID uint32 = 1663
+	GlobalTablespaceOID  uint32 = 1664
+)
+
+// LookupTablespaceOID resolves a tablespace name (case-insensitive) to its
+// OID, covering the two bootstrap tablespaces (pg_default/pg_global) plus any
+// runtime-registered ones (CREATE TABLESPACE). Mirrors get_tablespace_oid
+// (tablespace.c). M0122-0007 (CREATE TABLE ... TABLESPACE).
+func (c *InMemory) LookupTablespaceOID(name string) (uint32, bool) {
+	lc := strings.ToLower(name)
+	switch lc {
+	case "pg_default":
+		return DefaultTablespaceOID, true
+	case "pg_global":
+		return GlobalTablespaceOID, true
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	ts, ok := c.tablespaces[lc]
+	if !ok {
+		return 0, false
+	}
 	return ts.oid, true
 }
 
@@ -14895,6 +16606,20 @@ func optionsArrayLiteral(opts []string) string {
 	return arrayTextLiteral(opts)
 }
 
+// RoutineConfigArrayLiteral renders a routine's pg_proc.proconfig entries
+// ("name=value" strings, see Routine.Config) as the PostgreSQL text[]
+// external literal pg_dump's dumpFunc reads back to emit `SET name = value`
+// lines. Exported (unlike the sibling optionsArrayLiteral) so the initdb
+// package's pg_proc VirtualRows renderer — a different package, plain-string
+// cells rather than a heap-encoded array — can reuse the exact same
+// array_out quoting rules (quoteArrayElement) instead of a second,
+// potentially divergent implementation. An empty/nil list yields "" (SQL
+// NULL, so dumpFunc emits no SET clause at all — matches a routine that
+// never had a SET clause). DU-002 proconfig follow-up to M0097-0150.
+func RoutineConfigArrayLiteral(cfg []string) string {
+	return optionsArrayLiteral(cfg)
+}
+
 type ForeignServer struct {
 	Name    string // srvname
 	OID     uint32 // pg_foreign_server.oid (assigned from the catalog OID counter)
@@ -14911,6 +16636,21 @@ type ForeignServer struct {
 	// dumpForeignServer re-emits an `OPTIONS (name 'value', …)` clause. Nil/empty
 	// → no OPTIONS clause. DU-002 slice 378.
 	Options []string
+	// DBOid is the real physical database oid this server was CREATE SERVER'd
+	// under (mirrors catalog.Table.DBOid / seqState.dbOid). Registry entries
+	// are keyed by foreignServerKey(DBOid, Name), so two distinct databases
+	// may each CREATE SERVER a same-named server without colliding.
+	// M0122-0007 4e follow-up 36.
+	DBOid uint32
+}
+
+// foreignServerKey builds the foreignServers registry key from a (dbOid,
+// name) pair, mirroring seqKey's "<dbOid>:<name>" scheme
+// (internal/executor/operators_sequence.go) so a same-named server in two
+// distinct databases no longer collides (last-writer-wins) the way the
+// pre-4e-follow-up-36 bare-name key did. M0122-0007 4e follow-up 36.
+func foreignServerKey(dbOid uint32, name string) string {
+	return strconv.FormatUint(uint64(dbOid), 10) + ":" + name
 }
 
 // RegisterForeignServer records a foreign server, allocating a stable OID on
@@ -14918,13 +16658,23 @@ type ForeignServer struct {
 // entry without changing its OID (the FDW association, TYPE/VERSION, and OPTIONS
 // are refreshed when non-empty). DU-002 slice 376 (options: slice 378;
 // type/version: slice 381).
-func (c *InMemory) RegisterForeignServer(name, fdwName, srvType, srvVersion string, options []string) *ForeignServer {
+// RegisterForeignServer records a foreign server under dbOid (variadic,
+// defaults to DefaultDBOid — every pre-4e-follow-up-36 call site keeps
+// resolving there unchanged, mirroring resolveDBOid's convention),
+// allocating a stable OID on first sight. Idempotent: re-registering an
+// existing (dbOid, name) pair returns the existing entry without changing
+// its OID (the FDW association, TYPE/VERSION, and OPTIONS are refreshed
+// when non-empty). DU-002 slice 376 (options: slice 378; type/version:
+// slice 381; dbOid scoping: M0122-0007 4e follow-up 36).
+func (c *InMemory) RegisterForeignServer(name, fdwName, srvType, srvVersion string, options []string, dbOid ...uint32) *ForeignServer {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.foreignServers == nil {
 		c.foreignServers = make(map[string]*ForeignServer)
 	}
-	if s, ok := c.foreignServers[name]; ok {
+	oid := resolveDBOid(dbOid)
+	key := foreignServerKey(oid, name)
+	if s, ok := c.foreignServers[key]; ok {
 		if fdwName != "" {
 			s.FdwName = fdwName
 		}
@@ -14939,52 +16689,187 @@ func (c *InMemory) RegisterForeignServer(name, fdwName, srvType, srvVersion stri
 		}
 		return s
 	}
-	s := &ForeignServer{Name: name, OID: c.allocOIDLocked(), FdwName: fdwName, Type: srvType, Version: srvVersion, Options: options}
-	c.foreignServers[name] = s
+	s := &ForeignServer{Name: name, OID: c.allocOIDLocked(), FdwName: fdwName, Type: srvType, Version: srvVersion, Options: options, DBOid: oid}
+	c.foreignServers[key] = s
 	return s
 }
 
-// DropForeignServer removes a foreign server from the registry. Returns true if
-// found. DU-002 slice 376.
-func (c *InMemory) DropForeignServer(name string) bool {
+// DropForeignServer removes a foreign server from dbOid's registry
+// (variadic, defaults to DefaultDBOid). Returns true if found. DU-002 slice
+// 376; dbOid scoping: M0122-0007 4e follow-up 36.
+func (c *InMemory) DropForeignServer(name string, dbOid ...uint32) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.foreignServers == nil {
 		return false
 	}
-	if _, ok := c.foreignServers[name]; ok {
-		delete(c.foreignServers, name)
+	key := foreignServerKey(resolveDBOid(dbOid), name)
+	if _, ok := c.foreignServers[key]; ok {
+		delete(c.foreignServers, key)
 		return true
 	}
 	return false
 }
 
-// ListForeignServers returns all registered foreign servers sorted by name.
-// DU-002 slice 376.
-func (c *InMemory) ListForeignServers() []*ForeignServer {
+// ListForeignServers returns dbOid's own registered foreign servers
+// (variadic, defaults to DefaultDBOid), sorted by name. DU-002 slice 376;
+// dbOid scoping: M0122-0007 4e follow-up 36.
+func (c *InMemory) ListForeignServers(dbOid ...uint32) []*ForeignServer {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	if len(c.foreignServers) == 0 {
 		return nil
 	}
+	oid := resolveDBOid(dbOid)
 	out := make([]*ForeignServer, 0, len(c.foreignServers))
 	for _, s := range c.foreignServers {
-		out = append(out, s)
+		if s.DBOid == oid {
+			out = append(out, s)
+		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
 }
 
-// ForeignServerOID returns the stable OID of the named foreign server, or 0 if
-// no such server is registered. Used by pg_user_mappings.VirtualRows to populate
-// srvid (the column pg_dump's dumpUserMappings filters on). DU-002 slice 377.
-func (c *InMemory) ForeignServerOID(name string) uint32 {
+// ForeignServerOID returns the stable OID of the named foreign server under
+// dbOid (variadic, defaults to DefaultDBOid), or 0 if no such server is
+// registered. Used by pg_user_mappings.VirtualRows to populate srvid (the
+// column pg_dump's dumpUserMappings filters on). DU-002 slice 377; dbOid
+// scoping: M0122-0007 4e follow-up 36.
+func (c *InMemory) ForeignServerOID(name string, dbOid ...uint32) uint32 {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	if s, ok := c.foreignServers[name]; ok {
+	if s, ok := c.foreignServers[foreignServerKey(resolveDBOid(dbOid), name)]; ok {
 		return s.OID
 	}
 	return 0
+}
+
+// RegisterForeignServerDuringRecovery re-registers a foreign server with its
+// original OID under dbOid (variadic, defaults to DefaultDBOid), replayed
+// from a RecordKindCreateForeignServer WAL record (M0122-0007 foreign-server
+// registry restart-durability follow-up). Mirrors
+// RegisterTablespaceDuringRecovery. Owner is not carried (see
+// RecordKindCreateForeignServer's doc comment). dbOid scoping: M0122-0007 4e
+// follow-up 36.
+func (c *InMemory) RegisterForeignServerDuringRecovery(name, fdwName, srvType, srvVersion string, options []string, oid uint32, dbOid ...uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.foreignServers == nil {
+		c.foreignServers = make(map[string]*ForeignServer)
+	}
+	dboid := resolveDBOid(dbOid)
+	c.foreignServers[foreignServerKey(dboid, name)] = &ForeignServer{Name: name, OID: oid, FdwName: fdwName, Type: srvType, Version: srvVersion, Options: options, DBOid: dboid}
+	if oid >= c.nextOID {
+		c.nextOID = oid + 1
+	}
+}
+
+// UnregisterForeignServerDuringRecovery removes a foreign server from
+// dbOid's registry (variadic, defaults to DefaultDBOid), replayed from a
+// RecordKindDropForeignServer WAL record. Counterpart to
+// RegisterForeignServerDuringRecovery; mirrors
+// UnregisterTablespaceDuringRecovery. dbOid scoping: M0122-0007 4e follow-up
+// 36.
+func (c *InMemory) UnregisterForeignServerDuringRecovery(name string, dbOid ...uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.foreignServers, foreignServerKey(resolveDBOid(dbOid), name))
+}
+
+// PGForeignServerRowsForDBOid builds the pg_foreign_server catalog row-set
+// for dbOid's own registered servers (mirrors PGForeignTableRowsForDBOid's
+// per-connection dbOid scoping). registerSystemTables's VirtualRows closure
+// calls this with DefaultDBOid so every existing caller (server dispatch
+// without a per-connection PgForeignServerRows wire-up, every test) sees
+// byte-identical behavior; a per-connection dbOid is wired in via
+// executor.Context.PgForeignServerRows (internal/server/dispatch.go's
+// wireExtensionRows). M0122-0007 4e follow-up 36.
+func (c *InMemory) PGForeignServerRowsForDBOid(dbOid uint32) [][]string {
+	servers := c.ListForeignServers(dbOid)
+	if len(servers) == 0 {
+		return nil
+	}
+	out := make([][]string, 0, len(servers))
+	for _, s := range servers {
+		owner := s.Owner
+		if owner == 0 {
+			owner = 10 // bootstrap superuser (postgres); getRoleName(10) → "postgres"
+		}
+		out = append(out, []string{
+			strconv.FormatUint(uint64(s.OID), 10), // oid
+			s.Name,                                // srvname
+			strconv.FormatUint(uint64(owner), 10), // srvowner
+			strconv.FormatUint(uint64(c.ForeignDataWrapperOID(s.FdwName)), 10), // srvfdw
+			s.Type,                         // srvtype ("" → NULL, TYPE clause omitted)
+			s.Version,                      // srvversion ("" → NULL, VERSION clause omitted)
+			c.ForeignServerACLText(s.OID),  // srvacl (NULL until a GRANT, DU-002 slice 427)
+			optionsArrayLiteral(s.Options), // srvoptions text[] ("{name=value,…}" or "" for NULL)
+		})
+	}
+	return out
+}
+
+// RegisterUserMappingDuringRecovery restores a user mapping with its
+// original OID under dbOid (variadic, defaults to DefaultDBOid) during WAL
+// replay (M0122-0007 user-mapping restart-durability follow-up). Mirrors
+// RegisterForeignServerDuringRecovery. dbOid scoping: M0122-0007 4e
+// follow-up 37.
+func (c *InMemory) RegisterUserMappingDuringRecovery(user, server string, options []string, oid uint32, dbOid ...uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.userMappings == nil {
+		c.userMappings = make(map[string]*UserMapping)
+	}
+	dboid := resolveDBOid(dbOid)
+	c.userMappings[userMappingKey(dboid, user, server)] = &UserMapping{OID: oid, UmUser: user, SrvName: server, Options: options, DBOid: dboid}
+	if oid >= c.nextOID {
+		c.nextOID = oid + 1
+	}
+}
+
+// UnregisterUserMappingDuringRecovery removes a user mapping from dbOid's
+// registry (variadic, defaults to DefaultDBOid) during WAL replay of a DROP
+// USER MAPPING record. Mirrors UnregisterForeignServerDuringRecovery. dbOid
+// scoping: M0122-0007 4e follow-up 37.
+func (c *InMemory) UnregisterUserMappingDuringRecovery(user, server string, dbOid ...uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.userMappings, userMappingKey(resolveDBOid(dbOid), user, server))
+}
+
+// PGUserMappingsRowsForDBOid builds the pg_user_mappings catalog row-set for
+// dbOid's own registered user mappings (mirrors PGForeignServerRowsForDBOid's
+// per-connection dbOid scoping). registerSystemTables's VirtualRows closure
+// calls this with DefaultDBOid so every existing caller (server dispatch
+// without a per-connection PgUserMappingsRows wire-up, every test) sees
+// byte-identical behavior; a per-connection dbOid is wired in via
+// executor.Context.PgUserMappingsRows (internal/server/dispatch.go's
+// wireExtensionRows). M0122-0007 4e follow-up 37.
+func (c *InMemory) PGUserMappingsRowsForDBOid(dbOid uint32) [][]string {
+	mappings := c.ListUserMappings(dbOid)
+	if len(mappings) == 0 {
+		return nil
+	}
+	out := make([][]string, 0, len(mappings))
+	for _, m := range mappings {
+		usename := m.UmUser
+		umuser := uint32(0) // ACL_ID_PUBLIC
+		if usename == "" || strings.EqualFold(usename, "public") {
+			usename = "public"
+		} else if oid, ok := c.RoleOID(m.UmUser); ok {
+			umuser = oid
+		}
+		out = append(out, []string{
+			strconv.FormatUint(uint64(m.OID), 10),                                  // umid
+			strconv.FormatUint(uint64(c.ForeignServerOID(m.SrvName, dbOid)), 10), // srvid
+			m.SrvName,                              // srvname
+			strconv.FormatUint(uint64(umuser), 10), // umuser
+			usename,                                // usename
+			optionsArrayLiteral(m.Options),         // umoptions text[] ("{name=value,…}" or "" for NULL)
+		})
+	}
+	return out
 }
 
 // Cast is a user-defined cast (CREATE CAST (source AS target) …). goopg does not
@@ -16065,6 +17950,26 @@ func (c *InMemory) RemoveAmProcMember(familyOID, leftType, rightType, procNum ui
 	return false
 }
 
+// SetAmProcMemberProc rewrites the amproc (support-function OID) of the
+// pg_amproc row keyed by its own oid — the row identity a Virtual-UPDATE
+// path (updateOp.nextVirtualPgAmproc) resolves from the already-matched
+// row rather than re-deriving family/lefttype/righttype/procnum. Mirrors
+// SetDatabaseConnLimit's "runtime InMemory truth, no on-disk write"
+// precedent; used to let pg_amcheck's 005_opclass_damage-style
+// `UPDATE pg_amproc SET amproc = ...` corruption injection actually take
+// effect. M0119-0006 (005_opclass_damage UPDATE-path prerequisite).
+func (c *InMemory) SetAmProcMemberProc(oid, newProcOID uint32) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, m := range c.amProcMembers {
+		if m.OID == oid {
+			m.ProcOID = newProcOID
+			return true
+		}
+	}
+	return false
+}
+
 // amGISTMethodOID / amSPGistMethodOID are pg_am.oid for "gist"/"spgist"
 // (see AccessMethodOIDByName below) — the only two in-tree access methods
 // whose amadjustmembers override (gistvalidate.c gistadjustmembers,
@@ -16580,45 +18485,59 @@ type UserMapping struct {
 	// pg_options_to_table(umoptions); an empty list → NULL → no OPTIONS clause.
 	// DU-002 slice 379.
 	Options []string
+	// DBOid is the real physical database oid this mapping was CREATE USER
+	// MAPPING'd under (mirrors catalog.ForeignServer.DBOid). Registry entries
+	// are keyed by userMappingKey(DBOid, user, server), so two distinct
+	// databases may each CREATE USER MAPPING a same-named (user, server) pair
+	// without colliding. M0122-0007 4e follow-up 37.
+	DBOid uint32
 }
 
-// userMappingKey builds the registry key for a (user, server) pair. The user and
-// server names are matched case-insensitively (goopg lowercases unquoted idents).
-func userMappingKey(user, server string) string {
-	return strings.ToLower(user) + "\x00" + strings.ToLower(server)
+// userMappingKey builds the registry key for a (dbOid, user, server) triple.
+// The user and server names are matched case-insensitively (goopg lowercases
+// unquoted idents); the dbOid prefix mirrors foreignServerKey's "<dbOid>:"
+// scheme so a same-named (user, server) pair in two distinct databases no
+// longer collides. M0122-0007 4e follow-up 37.
+func userMappingKey(dbOid uint32, user, server string) string {
+	return strconv.FormatUint(uint64(dbOid), 10) + ":" + strings.ToLower(user) + "\x00" + strings.ToLower(server)
 }
 
-// RegisterUserMapping records a user mapping, allocating a stable OID on first
-// sight. Idempotent: re-registering an existing (user, server) pair returns the
-// existing entry without changing its OID (OPTIONS are refreshed when non-empty).
-// DU-002 slice 377 (options: slice 379).
-func (c *InMemory) RegisterUserMapping(user, server string, options []string) *UserMapping {
+// RegisterUserMapping records a user mapping under dbOid (variadic, defaults
+// to DefaultDBOid — every pre-4e-follow-up-37 call site keeps resolving
+// there unchanged, mirroring resolveDBOid's convention), allocating a stable
+// OID on first sight. Idempotent: re-registering an existing (dbOid, user,
+// server) triple returns the existing entry without changing its OID
+// (OPTIONS are refreshed when non-empty). DU-002 slice 377 (options: slice
+// 379; dbOid scoping: M0122-0007 4e follow-up 37).
+func (c *InMemory) RegisterUserMapping(user, server string, options []string, dbOid ...uint32) *UserMapping {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.userMappings == nil {
 		c.userMappings = make(map[string]*UserMapping)
 	}
-	key := userMappingKey(user, server)
+	oid := resolveDBOid(dbOid)
+	key := userMappingKey(oid, user, server)
 	if m, ok := c.userMappings[key]; ok {
 		if len(options) > 0 {
 			m.Options = options
 		}
 		return m
 	}
-	m := &UserMapping{OID: c.allocOIDLocked(), UmUser: user, SrvName: server, Options: options}
+	m := &UserMapping{OID: c.allocOIDLocked(), UmUser: user, SrvName: server, Options: options, DBOid: oid}
 	c.userMappings[key] = m
 	return m
 }
 
-// DropUserMapping removes a user mapping from the registry. Returns true if found.
-// DU-002 slice 377.
-func (c *InMemory) DropUserMapping(user, server string) bool {
+// DropUserMapping removes a user mapping from dbOid's registry (variadic,
+// defaults to DefaultDBOid). Returns true if found. DU-002 slice 377; dbOid
+// scoping: M0122-0007 4e follow-up 37.
+func (c *InMemory) DropUserMapping(user, server string, dbOid ...uint32) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.userMappings == nil {
 		return false
 	}
-	key := userMappingKey(user, server)
+	key := userMappingKey(resolveDBOid(dbOid), user, server)
 	if _, ok := c.userMappings[key]; ok {
 		delete(c.userMappings, key)
 		return true
@@ -16626,17 +18545,22 @@ func (c *InMemory) DropUserMapping(user, server string) bool {
 	return false
 }
 
-// ListUserMappings returns all registered user mappings sorted by server name
-// then user name (deterministic dump order). DU-002 slice 377.
-func (c *InMemory) ListUserMappings() []*UserMapping {
+// ListUserMappings returns dbOid's own registered user mappings (variadic,
+// defaults to DefaultDBOid), sorted by server name then user name
+// (deterministic dump order). DU-002 slice 377; dbOid scoping: M0122-0007
+// 4e follow-up 37.
+func (c *InMemory) ListUserMappings(dbOid ...uint32) []*UserMapping {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	if len(c.userMappings) == 0 {
 		return nil
 	}
+	oid := resolveDBOid(dbOid)
 	out := make([]*UserMapping, 0, len(c.userMappings))
 	for _, m := range c.userMappings {
-		out = append(out, m)
+		if m.DBOid == oid {
+			out = append(out, m)
+		}
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].SrvName != out[j].SrvName {
@@ -16677,12 +18601,12 @@ func (c *InMemory) TableRuleKind(tableName string) string {
 	return c.tableRuleKinds[strings.ToLower(tableName)]
 }
 
-func (c *InMemory) TablesInSchema(schemaName string) []parser.ObjectName {
+func (c *InMemory) TablesInSchema(schemaName string, dbOid ...uint32) []parser.ObjectName {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	schemaLC := strings.ToLower(schemaName)
 	var out []parser.ObjectName
-	for k, t := range c.tables {
+	for k, t := range c.ns(resolveDBOid(dbOid)).tables {
 		if t.Virtual {
 			continue // skip system/virtual tables
 		}
@@ -16711,21 +18635,22 @@ func (c *InMemory) TablesInSchema(schemaName string) []parser.ObjectName {
 	return out
 }
 
-func (c *InMemory) DropTable(name parser.ObjectName) error {
+func (c *InMemory) DropTable(name parser.ObjectName, dbOid ...uint32) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	ns := c.ns(resolveDBOid(dbOid))
 	k := key(name)
-	tbl, exists := c.tables[k]
+	tbl, exists := ns.tables[k]
 	if !exists {
 		return fmt.Errorf("relation %q does not exist", k)
 	}
-	if idxs, ok := c.byTable[tbl.OID]; ok {
+	if idxs, ok := ns.byTable[tbl.OID]; ok {
 		for idxKey := range idxs {
-			delete(c.indexes, idxKey)
+			delete(ns.indexes, idxKey)
 		}
-		delete(c.byTable, tbl.OID)
+		delete(ns.byTable, tbl.OID)
 	}
-	delete(c.tables, k)
+	delete(ns.tables, k)
 	delete(c.tableACLs, tbl.OID) // forget any granted privileges (M0118-0008)
 	delete(c.tableACLOrder, tbl.OID)
 	return nil
@@ -16745,20 +18670,20 @@ func (c *InMemory) DropSessionTempObjects(owner string) int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	var victims []string
-	for k, t := range c.tables {
+	for k, t := range c.ns(DefaultDBOid).tables {
 		if t != nil && t.Temp && t.TempOwner == owner {
 			victims = append(victims, k)
 		}
 	}
 	for _, k := range victims {
-		tbl := c.tables[k]
-		if idxs, ok := c.byTable[tbl.OID]; ok {
+		tbl := c.ns(DefaultDBOid).tables[k]
+		if idxs, ok := c.ns(DefaultDBOid).byTable[tbl.OID]; ok {
 			for idxKey := range idxs {
-				delete(c.indexes, idxKey)
+				delete(c.ns(DefaultDBOid).indexes, idxKey)
 			}
-			delete(c.byTable, tbl.OID)
+			delete(c.ns(DefaultDBOid).byTable, tbl.OID)
 		}
-		delete(c.tables, k)
+		delete(c.ns(DefaultDBOid).tables, k)
 		delete(c.tableACLs, tbl.OID)
 		delete(c.tableACLOrder, tbl.OID)
 	}
@@ -16780,7 +18705,7 @@ func (c *InMemory) SessionTempTableNames(owner string) []string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	var names []string
-	for _, t := range c.tables {
+	for _, t := range c.ns(DefaultDBOid).tables {
 		if t != nil && t.Temp && t.TempOwner == owner {
 			names = append(names, t.Name)
 		}
@@ -16789,32 +18714,33 @@ func (c *InMemory) SessionTempTableNames(owner string) []string {
 }
 
 // DropIndex removes an index from the catalog.
-func (c *InMemory) DropIndex(name parser.ObjectName) error {
+func (c *InMemory) DropIndex(name parser.ObjectName, dbOid ...uint32) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	ns := c.ns(resolveDBOid(dbOid))
 	k := key(name)
-	idx, ok := c.indexes[k]
+	idx, ok := ns.indexes[k]
 	if !ok {
 		return fmt.Errorf("index %q does not exist", k)
 	}
-	delete(c.indexes, k)
-	if idxs, ok := c.byTable[idx.Table.OID]; ok {
+	delete(ns.indexes, k)
+	if idxs, ok := ns.byTable[idx.Table.OID]; ok {
 		delete(idxs, k)
 		if len(idxs) == 0 {
-			delete(c.byTable, idx.Table.OID)
+			delete(ns.byTable, idx.Table.OID)
 		}
 	}
 	return nil
 }
 
 // IndexesOnTable returns indexes whose base relation is table.
-func (c *InMemory) IndexesOnTable(table *Table) []*Index {
+func (c *InMemory) IndexesOnTable(table *Table, dbOid ...uint32) []*Index {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	if table == nil {
 		return nil
 	}
-	idxs := c.byTable[table.OID]
+	idxs := c.ns(resolveDBOid(dbOid)).byTable[table.OID]
 	out := make([]*Index, 0, len(idxs))
 	for _, idx := range idxs {
 		out = append(out, idx)
@@ -16885,6 +18811,51 @@ func indexKeyIsBareFuncCall(e *parser.Expr) bool {
 		return false
 	}
 	return true
+}
+
+// IndexExprsText renders pg_index.indexprs for an expression index the way
+// pg_get_expr(indexprs, indrelid) does in upstream PostgreSQL: the deparsed
+// expression text of ONLY the expression key columns (Columns[i]=="", the
+// ordinal-0 entries in indkey), comma-joined in column order. Plain-column key
+// columns and INCLUDE columns are omitted, exactly as PG's indexprs list holds
+// only the expression trees.
+//
+// Each expression's text comes straight from idx.ColExprStrings[i], which is
+// the natural deparse produced by defaultExprToSQL (the same serialization
+// buildIndexDefString consumes). That deparse already carries whatever parens
+// the expression needs — a binary/arithmetic expression such as (a + c) keeps
+// its wrapping parens, a bare function call such as lower(b) has none — which
+// is exactly how PG's expression printer renders each list element. So the
+// elements are joined verbatim with ", "; adding parens here would double-wrap
+// non-function expressions (e.g. ((a + c))) and diverge from PG.
+//
+// Returns ("", false) when the index has no expression columns, so callers
+// emit VirtualNull (SQL NULL) rather than a non-NULL empty string — matching
+// real PG, where indexprs IS NULL for a non-expression index.
+//
+// This is the single source of truth for the expression text so the live
+// virtual pg_index renderer (PGIndexRowsForDBOid) and any future heap-persisted
+// consumer never diverge.
+func IndexExprsText(idx *Index) (string, bool) {
+	if idx == nil {
+		return "", false
+	}
+	parts := make([]string, 0, len(idx.Columns))
+	for i, col := range idx.Columns {
+		if col != "" {
+			continue // plain column key, not an expression
+		}
+		if i >= len(idx.ColExprStrings) {
+			continue
+		}
+		if exprStr := idx.ColExprStrings[i]; exprStr != "" {
+			parts = append(parts, exprStr)
+		}
+	}
+	if len(parts) == 0 {
+		return "", false
+	}
+	return strings.Join(parts, ", "), true
 }
 
 func BuildIndexDef(idx *Index) string {
@@ -17037,11 +19008,12 @@ func BuildIndexDef(idx *Index) string {
 }
 
 // AllIndexes returns every index in the catalog, sorted by OID.
-func (c *InMemory) AllIndexes() []*Index {
+func (c *InMemory) AllIndexes(dbOid ...uint32) []*Index {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	out := make([]*Index, 0, len(c.indexes))
-	for _, idx := range c.indexes {
+	ns := c.ns(resolveDBOid(dbOid))
+	out := make([]*Index, 0, len(ns.indexes))
+	for _, idx := range ns.indexes {
 		out = append(out, idx)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].OID < out[j].OID })
@@ -17049,28 +19021,40 @@ func (c *InMemory) AllIndexes() []*Index {
 }
 
 // RegisterViewConstraintDep records that a view relies on a PK constraint for
-// GROUP BY functional dependency. Called by CREATE VIEW. M0097-0036.
-func (c *InMemory) RegisterViewConstraintDep(viewName string, tableOID uint32, constraintName string) {
+// GROUP BY functional dependency. Called by CREATE VIEW. M0097-0036. dbOid
+// qualifies the stored viewName (M0122-0007 4e) so a same-named view in a
+// different database is never conflated by UnregisterViewConstraintDeps;
+// tableOID/constraintName need no such qualifier since nextOID is a single
+// cluster-wide counter and a view can only reference tables in its own
+// database.
+func (c *InMemory) RegisterViewConstraintDep(viewName string, tableOID uint32, constraintName string, dbOid ...uint32) {
 	key := fmt.Sprintf("%d:%s", tableOID, constraintName)
+	qualified := fmt.Sprintf("%d:%s", resolveDBOid(dbOid), viewName)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for _, existing := range c.constraintViewDeps[key] {
-		if existing == viewName {
+		if existing == qualified {
 			return
 		}
 	}
-	c.constraintViewDeps[key] = append(c.constraintViewDeps[key], viewName)
+	c.constraintViewDeps[key] = append(c.constraintViewDeps[key], qualified)
 }
 
 // UnregisterViewConstraintDeps removes all constraint dependencies recorded for
-// the given view name. Called by DROP VIEW. M0097-0036.
-func (c *InMemory) UnregisterViewConstraintDeps(viewName string) {
+// the given view name. Called by DROP VIEW. M0097-0036. dbOid scopes the
+// removal (M0122-0007 4e) to the view being dropped's own database, matching
+// the qualifier RegisterViewConstraintDep stored — without it, DROP VIEW in
+// one database could erase a same-named view's dependency tracking in
+// another, silently defeating that other view's DROP CONSTRAINT RESTRICT
+// check.
+func (c *InMemory) UnregisterViewConstraintDeps(viewName string, dbOid ...uint32) {
+	qualified := fmt.Sprintf("%d:%s", resolveDBOid(dbOid), viewName)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for key, names := range c.constraintViewDeps {
 		var kept []string
 		for _, n := range names {
-			if n != viewName {
+			if n != qualified {
 				kept = append(kept, n)
 			}
 		}
@@ -17083,7 +19067,10 @@ func (c *InMemory) UnregisterViewConstraintDeps(viewName string) {
 }
 
 // ViewsDependingOnConstraint returns the names of views that depend on the
-// given PK constraint via GROUP BY functional dependency. M0097-0036.
+// given PK constraint via GROUP BY functional dependency. M0097-0036. Stored
+// values are dbOid-qualified (M0122-0007 4e); the qualifier is stripped here
+// since callers only use the bare name for RESTRICT error messages, and
+// tableOID already pins the result to one database.
 func (c *InMemory) ViewsDependingOnConstraint(tableOID uint32, constraintName string) []string {
 	key := fmt.Sprintf("%d:%s", tableOID, constraintName)
 	c.mu.RLock()
@@ -17093,7 +19080,13 @@ func (c *InMemory) ViewsDependingOnConstraint(tableOID uint32, constraintName st
 		return nil
 	}
 	out := make([]string, len(src))
-	copy(out, src)
+	for i, qualified := range src {
+		if idx := strings.IndexByte(qualified, ':'); idx >= 0 {
+			out[i] = qualified[idx+1:]
+		} else {
+			out[i] = qualified
+		}
+	}
 	return out
 }
 
@@ -17135,7 +19128,7 @@ func (c *InMemory) DropExclusionConstraint(tableOID uint32, constraintName strin
 // UNIQUE constraint) from both the per-table and flat index registries.
 // Caller must hold c.mu for writing.
 func (c *InMemory) dropIndexByName(tableOID uint32, constraintName string) bool {
-	inner, ok := c.byTable[tableOID]
+	inner, ok := c.ns(DefaultDBOid).byTable[tableOID]
 	if !ok {
 		return false
 	}
@@ -17144,9 +19137,9 @@ func (c *InMemory) dropIndexByName(tableOID uint32, constraintName string) bool 
 	}
 	delete(inner, constraintName)
 	// Also remove from the flat indexes map.
-	for k, idx := range c.indexes {
+	for k, idx := range c.ns(DefaultDBOid).indexes {
 		if idx.Table != nil && idx.Table.OID == tableOID && idx.Name == constraintName {
-			delete(c.indexes, k)
+			delete(c.ns(DefaultDBOid).indexes, k)
 			break
 		}
 	}
@@ -17162,7 +19155,7 @@ func (c *InMemory) dropIndexByName(tableOID uint32, constraintName string) bool 
 func (c *InMemory) DropForeignKeyConstraint(tableOID uint32, constraintName string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	tbl, ok := c.tableByOID(tableOID)
+	tbl, ok := c.tableByOID(tableOID, DefaultDBOid)
 	if !ok {
 		return false
 	}
@@ -17182,7 +19175,7 @@ func (c *InMemory) HasPrimaryKey(table *Table) bool {
 	if table == nil {
 		return false
 	}
-	idxs := c.byTable[table.OID]
+	idxs := c.ns(DefaultDBOid).byTable[table.OID]
 	for _, idx := range idxs {
 		if idx.Primary {
 			return true
@@ -17191,7 +19184,23 @@ func (c *InMemory) HasPrimaryKey(table *Table) bool {
 	return false
 }
 
-// RelFileNode returns the storage manager identity for a table.
+// RelFileNode returns the storage manager identity for a table. TblOid comes
+// from table.Tablespace (0 = pg_default, i.e. the pre-existing base/<dbOid>
+// layout — see resolveTablespaceClause in internal/executor/operators_ddl.go)
+// so a table created or ALTERed onto a non-default tablespace resolves its
+// file under pg_tblspc/<TblOid>/... . M0122-0007 tablespace physical
+// relocation. DBOid prefers table.DBOid (the table's own creation-time
+// namespace, M0122-0007 4d-ii-part-2b item 2) but only when it names a
+// genuinely distinct database (a real CreateDatabase-allocated oid); a zero
+// or DefaultDBOid table.DBOid falls back to the single process-wide c.dbOid,
+// which is what preserves the pre-existing "postgres"/template1 dual-mirror
+// override (SetDBOID stamps c.dbOid = PostgresDBOid (5) — the real on-disk
+// oid detectCatalogDBOID reads back at startup — while every "postgres"-
+// routed table's own DBOid is NamespaceDBOid-translated to DefaultDBOid (1)
+// for c.ns() keying, same as LookupTable/CreateTable's existing convention;
+// using table.DBOid unconditionally here would have physically relocated
+// every "postgres" relation from base/5/… to base/1/… and broken the
+// mirror, confirmed by TestAlterTableSetTablespacePhysicalRelocationSurvivesRestart).
 func (c *InMemory) RelFileNode(table *Table) storage.RelFileNode {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -17199,14 +19208,24 @@ func (c *InMemory) RelFileNode(table *Table) storage.RelFileNode {
 	if table.RelFileNodeOID != 0 {
 		relOID = table.RelFileNodeOID
 	}
-	return storage.RelFileNode{DBOid: c.dbOid, RelOid: relOID, Fork: storage.MainFork}
+	dbOid := c.dbOid
+	if table.DBOid != 0 && table.DBOid != DefaultDBOid {
+		dbOid = table.DBOid
+	}
+	return storage.RelFileNode{TblOid: table.Tablespace, DBOid: dbOid, RelOid: relOID, Fork: storage.MainFork}
 }
 
 // IndexRelFileNode returns the storage manager identity for an index.
+// TblOid comes from index.Tablespace, mirroring RelFileNode above. DBOid
+// prefers index.DBOid, same fallback convention as RelFileNode.
 func (c *InMemory) IndexRelFileNode(index *Index) storage.RelFileNode {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return storage.RelFileNode{DBOid: c.dbOid, RelOid: index.OID, Fork: storage.MainFork}
+	dbOid := c.dbOid
+	if index.DBOid != 0 && index.DBOid != DefaultDBOid {
+		dbOid = index.DBOid
+	}
+	return storage.RelFileNode{TblOid: index.Tablespace, DBOid: dbOid, RelOid: index.OID, Fork: storage.MainFork}
 }
 
 // AllTables returns deep copies of every non-virtual user table
@@ -17215,16 +19234,45 @@ func (c *InMemory) IndexRelFileNode(index *Index) storage.RelFileNode {
 // creation time so plugins can interpret tuple bytes against a
 // stable shape. See
 // docs/design/0008-0001-logical-decoding-pipeline.md.
-func (c *InMemory) AllTables() []*Table {
+func (c *InMemory) AllTables(dbOid ...uint32) []*Table {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	out := make([]*Table, 0, len(c.tables))
-	for _, t := range c.tables {
+	ns := c.ns(resolveDBOid(dbOid))
+	out := make([]*Table, 0, len(ns.tables))
+	for _, t := range ns.tables {
 		if t.Virtual {
 			continue
 		}
 		cp := *t
 		cp.Columns = append([]Column(nil), t.Columns...)
+		out = append(out, &cp)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].OID < out[j].OID })
+	return out
+}
+
+// AllViews reports every plain (non-materialized) view registered under
+// dbOid — a sibling of AllTables for CREATE DATABASE ... TEMPLATE's view-copy
+// slice (M0122-0007 4e follow-up 42). A plain view's pg_class row is always
+// Virtual (CreateView sets Virtual: true), so AllTables — which unconditionally
+// skips every Virtual row — can never see it; this method walks the same raw
+// namespace map PGClassRowsForDBOid does to surface view rows specifically,
+// mirroring AllSequenceInfos' analogous role for sequences (also Virtual).
+// Materialized views are excluded (IsMatView): they have real heap storage
+// (Virtual: false, see execCreateMatView's CreateTable call) and already
+// surface via AllTables.
+func (c *InMemory) AllViews(dbOid ...uint32) []*Table {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	ns := c.ns(resolveDBOid(dbOid))
+	out := make([]*Table, 0)
+	for _, t := range ns.tables {
+		if t.View == nil || t.IsMatView {
+			continue
+		}
+		cp := *t
+		cp.Columns = append([]Column(nil), t.Columns...)
+		cp.ViewColumnAliases = append([]string(nil), t.ViewColumnAliases...)
 		out = append(out, &cp)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].OID < out[j].OID })
@@ -17243,7 +19291,7 @@ func (c *InMemory) DatFrozenXID() storage.TransactionID {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	var oldest storage.TransactionID
-	for _, t := range c.tables {
+	for _, t := range c.ns(DefaultDBOid).tables {
 		if t.Virtual || IsSystemRelation(t.OID) {
 			continue
 		}
@@ -17425,11 +19473,11 @@ func (c *InMemory) ClearPgClassRowMarksForXID(xid uint32) {
 
 // AllUserViews returns deep copies of every user-created non-materialized view.
 // Used by DROP VIEW CASCADE dependency scanning. M0097-0021.
-func (c *InMemory) AllUserViews() []*Table {
+func (c *InMemory) AllUserViews(dbOid ...uint32) []*Table {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	out := make([]*Table, 0)
-	for _, t := range c.tables {
+	for _, t := range c.ns(resolveDBOid(dbOid)).tables {
 		if !t.Virtual || t.View == nil || t.IsMatView {
 			continue
 		}
@@ -17443,11 +19491,11 @@ func (c *InMemory) AllUserViews() []*Table {
 
 // AllUserMatViews returns deep copies of every user-created materialized view.
 // Used by DROP TABLE/VIEW/MATERIALIZED VIEW CASCADE dependency scanning.
-func (c *InMemory) AllUserMatViews() []*Table {
+func (c *InMemory) AllUserMatViews(dbOid ...uint32) []*Table {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	out := make([]*Table, 0)
-	for _, t := range c.tables {
+	for _, t := range c.ns(resolveDBOid(dbOid)).tables {
 		if !t.IsMatView {
 			continue
 		}
@@ -17465,7 +19513,7 @@ func (c *InMemory) AllUserMatViews() []*Table {
 func (c *InMemory) RenameColumnInViews(tableName, oldCol, newCol string) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	for _, t := range c.tables {
+	for _, t := range c.ns(DefaultDBOid).tables {
 		if t.View == nil {
 			continue
 		}
@@ -17557,7 +19605,7 @@ func (c *InMemory) FindFKsReferencingTable(tableName string) []FKRef {
 	defer c.mu.RUnlock()
 	name := strings.ToLower(tableName)
 	var out []FKRef
-	for _, t := range c.tables {
+	for _, t := range c.ns(DefaultDBOid).tables {
 		if t.Virtual {
 			continue
 		}
@@ -18205,6 +20253,224 @@ func builtinOpclassOIDByName(name string) (builtinOpclassInfo, bool) {
 		}
 	}
 	return builtinOpclassInfo{}, false
+}
+
+// builtinColumnOpclassOIDs maps a builtin (BKI-pinned) btree operator-class
+// name to its pg_opclass.oid, covering the classes reachable from an
+// ordinary (non-range) column's index definition: both a column type's
+// implicit default opclass and any name a user gives explicitly via
+// `CREATE INDEX ... (col opclass_name)`. Verified against a real
+// PostgreSQL 18.3 instance (`SELECT opcname, oid FROM pg_opclass WHERE
+// opcmethod = 'btree'::regclass`) since only a handful of these have a
+// BKI-frozen oid in pg_opclass.dat -- the rest are genbki-autonumbered but
+// stable for a given PG18.3 build. goopg has no native hash access method
+// (Index.DeclaredHash's doc comment: a `USING hash` index is built on the
+// btree substrate, so Method never becomes "hash"), so only the btree
+// table is needed here. M0122-0007 follow-up (ColOpClasses live-query gap).
+var builtinColumnOpclassOIDs = map[string]uint32{
+	"array_ops": 10000, "bit_ops": 10002, "bool_ops": 10003,
+	"bpchar_ops": 10004, "bpchar_pattern_ops": 4219, "bytea_ops": 10006,
+	"char_ops": 10007, "cidr_ops": 10009, "date_ops": 3122,
+	"enum_ops": 10069, "float4_ops": 10012, "float8_ops": 3123,
+	"inet_ops": 10015, "int2_ops": 1979, "int4_ops": 1978, "int8_ops": 3124,
+	"interval_ops": 10022, "jsonb_ops": 10088, "macaddr8_ops": 10026,
+	"macaddr_ops": 10024, "money_ops": 10047, "multirange_ops": 10080,
+	"name_ops": 10028, "numeric_ops": 3125, "oid_ops": 1981,
+	"oidvector_ops": 10032, "pg_lsn_ops": 10067, "range_ops": 10076,
+	"record_image_ops": 10036, "record_ops": 10034, "text_ops": 3126,
+	"text_pattern_ops": 4217, "tid_ops": 10050, "time_ops": 10038,
+	"timestamp_ops": 3128, "timestamptz_ops": 3127, "timetz_ops": 10041,
+	"tsquery_ops": 10074, "tsvector_ops": 10071, "uuid_ops": 10065,
+	"varbit_ops": 10043, "varchar_ops": 10044, "varchar_pattern_ops": 4218,
+	"xid8_ops": 10053,
+}
+
+// defaultColumnOpclassNameForType returns the implicit default btree
+// opclass name PostgreSQL picks for a column type when no explicit opclass
+// is named in CREATE INDEX, for the subset of type-name spellings goopg's
+// index-column type resolution covers. Verified against a real PostgreSQL
+// 18.3 instance (`CREATE INDEX` on a column of each type, then reading
+// pg_index.indclass back) rather than derived from pg_opclass.dat's
+// opcdefault rows alone, since a type's default opclass is keyed by its
+// pg_type OID, not by name (e.g. "varchar"'s default opclass is text_ops,
+// not a dedicated varchar_ops). M0122-0007 follow-up.
+func defaultColumnOpclassNameForType(typeName string) (string, bool) {
+	switch typeName {
+	case "int2", "smallint":
+		return "int2_ops", true
+	case "int4", "int", "integer", "serial":
+		return "int4_ops", true
+	case "int8", "bigint", "bigserial":
+		return "int8_ops", true
+	case "float4", "real":
+		return "float4_ops", true
+	case "float8", "double precision":
+		return "float8_ops", true
+	case "text", "varchar", "character varying":
+		return "text_ops", true
+	case "name":
+		return "name_ops", true
+	case "bpchar", "char", "character":
+		return "bpchar_ops", true
+	case "oid":
+		return "oid_ops", true
+	case "bool", "boolean":
+		return "bool_ops", true
+	case "date":
+		return "date_ops", true
+	case "timestamp", "timestamp without time zone":
+		return "timestamp_ops", true
+	case "timestamptz", "timestamp with time zone":
+		return "timestamptz_ops", true
+	case "numeric", "decimal":
+		return "numeric_ops", true
+	case "uuid":
+		return "uuid_ops", true
+	case "interval":
+		return "interval_ops", true
+	case "inet":
+		return "inet_ops", true
+	case "bytea":
+		return "bytea_ops", true
+	}
+	return "", false
+}
+
+// resolveColumnOpclassOID resolves an explicit per-column operator class
+// name (idx.ColOpClasses[i]) to its pg_opclass OID for indclass rendering,
+// checking user-created classes (CREATE OPERATOR CLASS) for the index's
+// access method before the builtin pinned table (mirroring PG's single
+// pg_opclass scan covering both). Returns 0 when the name isn't found for
+// that method, so the caller falls back to the column's default opclass.
+// M0122-0007 follow-up.
+func (c *InMemory) resolveColumnOpclassOID(name string, methodOID uint32) uint32 {
+	for _, uoc := range c.ListUserOperatorClasses() {
+		if uoc.Method == methodOID && uoc.Name == name {
+			return uoc.OID
+		}
+	}
+	if methodOID == btreeAccessMethodOID {
+		return builtinColumnOpclassOIDs[name]
+	}
+	return 0
+}
+
+// ResolveIndexColumnOpclassOID resolves the pg_opclass OID for one index key
+// column, given an explicit operator class name (empty if CREATE INDEX named
+// none) and the column's own type name. Tries, in order: (1) an explicit
+// name against user-created classes (CREATE OPERATOR CLASS) then the builtin
+// pinned table, (2) the column type's implicit default opclass. Returns 0 if
+// nothing resolves. Exported so both the live pg_index VirtualRows renderer
+// (this file) and the heap-row renderer (buildUserPGIndexRow,
+// internal/executor/pg18_user_catalog_rows.go, used for restart recovery and
+// a real PG standby's direct heap scan) share one resolution path instead of
+// two that could silently diverge. M0122-0007 follow-up.
+func (c *InMemory) ResolveIndexColumnOpclassOID(explicitName, typeName string, methodOID uint32) uint32 {
+	if explicitName != "" {
+		if oid := c.resolveColumnOpclassOID(explicitName, methodOID); oid != 0 {
+			return oid
+		}
+	}
+	if name, ok := defaultColumnOpclassNameForType(typeName); ok {
+		return builtinColumnOpclassOIDs[name]
+	}
+	return 0
+}
+
+// ResolveIndexColumnCollationOID resolves the pg_collation OID for one index
+// key column's explicit COLLATE name (0 for an empty name, matching a
+// non-collatable column's real attcollation=0): a user-created collation
+// (CREATE COLLATION) first, then the 7 BKI-pinned builtin ones. Exported for
+// the same live/heap-row sharing reason as ResolveIndexColumnOpclassOID.
+// M0122-0007 follow-up.
+func (c *InMemory) ResolveIndexColumnCollationOID(explicitName string) uint32 {
+	if explicitName == "" {
+		return 0
+	}
+	if oid := c.UserCollationOIDByName(explicitName); oid != 0 {
+		return oid
+	}
+	if oid, ok := builtinCollationOIDByName(explicitName); ok {
+		return oid
+	}
+	return 0
+}
+
+// builtinCollationNameByOID is the reverse of builtinCollationOIDByName,
+// needed to reconstruct a ColCollations[i] name string from a heap-decoded
+// indcollation OID (loadUserIndexesFromHeap, checkpointed-restart recovery —
+// M0122-0006 follow-up 3). Only a handful of collations are BKI-pinned, so a
+// plain switch mirrors the forward lookup rather than adding a second map.
+func builtinCollationNameByOID(oid uint32) (string, bool) {
+	switch oid {
+	case 100:
+		return "default", true
+	case 950:
+		return "C", true
+	case 951:
+		return "POSIX", true
+	case 962:
+		return "ucs_basic", true
+	case 963:
+		return "unicode", true
+	case 811:
+		return "pg_c_utf8", true
+	case 6411:
+		return "pg_unicode_fast", true
+	}
+	return "", false
+}
+
+// ResolveIndexColumnOpclassName reverse-resolves a pg_opclass OID (as decoded
+// from a heap-persisted indclass by DecodePGIndexPhysicalRow) back to the
+// ColOpClasses[i] name string loadUserIndexesFromHeap needs to restore an
+// index across a *checkpointed* restart — the WAL-replay crash-recovery path
+// never needs this since wal.CreateIndexPayload already carries the name
+// strings directly (see the M0122-0006 follow-up 3 ledger entry). Returns ""
+// when oid equals the column type's own implicit default opclass, mirroring
+// how ResolveIndexColumnOpclassOID/buildUserPGIndexRow never record an
+// explicit name for that case (so an empty string round-trips exactly) and
+// matching real PostgreSQL's own indclass-vs-default comparison in
+// ruleutils.c's pg_get_indexdef_worker. M0122-0006 follow-up 3.
+func (c *InMemory) ResolveIndexColumnOpclassName(oid uint32, typeName string, methodOID uint32) string {
+	if oid == 0 {
+		return ""
+	}
+	if defName, ok := defaultColumnOpclassNameForType(typeName); ok && builtinColumnOpclassOIDs[defName] == oid {
+		return ""
+	}
+	for _, uoc := range c.ListUserOperatorClasses() {
+		if uoc.Method == methodOID && uoc.OID == oid {
+			return uoc.Name
+		}
+	}
+	for name, candidateOID := range builtinColumnOpclassOIDs {
+		if candidateOID == oid {
+			return name
+		}
+	}
+	return ""
+}
+
+// ResolveIndexColumnCollationName reverse-resolves a pg_collation OID (as
+// decoded from a heap-persisted indcollation) back to the ColCollations[i]
+// COLLATE-name string — the collation-side sibling of
+// ResolveIndexColumnOpclassName. Returns "" for oid==0, since
+// ResolveIndexColumnCollationOID only ever writes a nonzero indcollation for
+// an explicit COLLATE clause (see its own doc comment). M0122-0006 follow-up 3.
+func (c *InMemory) ResolveIndexColumnCollationName(oid uint32) string {
+	if oid == 0 {
+		return ""
+	}
+	for _, uc := range c.ListUserCollations() {
+		if uc.OID == oid {
+			return uc.Name
+		}
+	}
+	if name, ok := builtinCollationNameByOID(oid); ok {
+		return name
+	}
+	return ""
 }
 
 // defaultUserBtreeOpclassForSubtype mirrors GetDefaultOpClass's (postgres/
@@ -18863,7 +21129,7 @@ func (c *InMemory) TablesWithColumnOfType(typeName string) []*Table {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	var out []*Table
-	for _, tbl := range c.tables {
+	for _, tbl := range c.ns(DefaultDBOid).tables {
 		if tbl.Virtual {
 			continue
 		}
@@ -18908,17 +21174,17 @@ type attrDefRow struct {
 // Tables are walked in sorted-key order so the synthetic oids are stable across
 // calls — pg_dump matches the pg_attrdef.oid it scanned against the pg_depend
 // objid, so the two producers cannot disagree. DU-002 slice 121.
-func (c *InMemory) attrDefRowsLocked() []attrDefRow {
+func (c *InMemory) attrDefRowsLockedForDBOid(dbOid uint32) []attrDefRow {
 	// Index sequence relations by their bare (lowercased) name so a SERIAL
 	// column's default can resolve the owned sequence's pg_class OID.
 	seqOIDByName := make(map[string]uint32)
-	for _, t := range c.tables {
+	for _, t := range c.ns(dbOid).tables {
 		if t.IsSequence {
 			seqOIDByName[strings.ToLower(t.Name)] = t.OID
 		}
 	}
-	keys := make([]string, 0, len(c.tables))
-	for k, t := range c.tables {
+	keys := make([]string, 0, len(c.ns(dbOid).tables))
+	for k, t := range c.ns(dbOid).tables {
 		if t.Virtual {
 			continue
 		}
@@ -18928,7 +21194,7 @@ func (c *InMemory) attrDefRowsLocked() []attrDefRow {
 	var rows []attrDefRow
 	var oid uint32 = 1
 	for _, k := range keys {
-		tbl := c.tables[k]
+		tbl := c.ns(dbOid).tables[k]
 		for _, col := range tbl.Columns {
 			var adbin string
 			var seqOID uint32
@@ -19261,7 +21527,7 @@ func (c *InMemory) DropDomain(name string, ifExists bool, cascade bool) ([]strin
 	}
 	// Find tables that use this domain as a column type.
 	var dependentTables []string
-	for _, tbl := range c.tables {
+	for _, tbl := range c.ns(DefaultDBOid).tables {
 		if tbl.Virtual {
 			continue
 		}
@@ -19280,15 +21546,15 @@ func (c *InMemory) DropDomain(name string, ifExists bool, cascade bool) ([]strin
 	var dropped []string
 	if cascade {
 		for _, tblName := range dependentTables {
-			for tableKey, tbl := range c.tables {
+			for tableKey, tbl := range c.ns(DefaultDBOid).tables {
 				if strings.EqualFold(tbl.Name, tblName) {
 					dropped = append(dropped, tblName)
 					tblOID := tbl.OID
-					delete(c.tables, tableKey)
+					delete(c.ns(DefaultDBOid).tables, tableKey)
 					// Remove indexes on this table.
-					for idxOID, idx := range c.indexes {
+					for idxOID, idx := range c.ns(DefaultDBOid).indexes {
 						if idx.Table != nil && idx.Table.OID == tblOID {
-							delete(c.indexes, idxOID)
+							delete(c.ns(DefaultDBOid).indexes, idxOID)
 						}
 					}
 					break
@@ -19357,6 +21623,16 @@ type SearchPathCatalog struct {
 	// false in the default (toggle-untouched) case so legacy plans are unchanged.
 	// Design 0118-0103 (M0118-0009 horizons enabler).
 	DisableSeqScan bool
+	// DBOid is the querying connection's real, physical database oid
+	// (executor.Context.CurrentDatabaseOid, resolved via ResolveDatabaseOid).
+	// Zero for connection-less contexts (embedded/test callers, or a
+	// connection whose database didn't resolve) — effectiveDBOid falls back
+	// to DefaultDBOid in that case, matching pre-4c behavior. LookupTable and
+	// LookupIndex read it via effectiveDBOid to key the per-database
+	// table/index namespace (catalog.InMemory.ns) at the connection's own
+	// database instead of always DefaultDBOid. Design 0122-0018 (M0122-0007
+	// slice 4c).
+	DBOid uint32
 }
 
 // WithSearchPath returns a SearchPathCatalog that falls back to the schemas
@@ -19387,19 +21663,83 @@ func (c *SearchPathCatalog) CurrentPartitionDetachEpoch() uint64 {
 	return c.SnapshotPartitionDetachEpoch
 }
 
+// NamespaceDBOid translates a connection's real database oid (e.g.
+// executor.Context.CurrentDatabaseOid) into the table/index namespace dbOid
+// read-side lookups should key off. Exported so callers outside this package
+// that need to agree with SearchPathCatalog.effectiveDBOid on "which
+// namespace does this connection read" — e.g. a plan-cache key, which must
+// not conflate two connections that read different namespaces — share the
+// exact same mapping instead of re-deriving it. Two special cases, both
+// documented in docs/design/0122-0018-per-database-catalog-namespace.md's
+// "Blast radius":
+//   - zero (no live connection — embedded/test contexts, or an unresolved
+//     database) falls back to DefaultDBOid, matching pre-4c behavior exactly.
+//   - PostgresDBOid (5, ResolveDatabaseOid("postgres")'s answer) also falls
+//     back to DefaultDBOid. This is NOT a bug: every catalog write path still
+//     unconditionally persists under DefaultDBOid (1) until slice 4d migrates
+//     them, so a "postgres" connection (the overwhelming majority of real
+//     traffic — every TPC-H/pgbench/regress gate connects to it) must keep
+//     reading DefaultDBOid's namespace, the one writes actually land in, or
+//     every existing table would appear to vanish. Only a genuinely distinct
+//     database oid (a real CREATE DATABASE, or template0) gets routed to its
+//     own — today still empty, since 4d hasn't landed — namespace. Slice 4d
+//     must revisit this mapping together with the on-disk base/1+base/5
+//     dual-mirror it's paired with. M0122-0007 slice 4c.
+func NamespaceDBOid(connDBOid uint32) uint32 {
+	if connDBOid == 0 || connDBOid == PostgresDBOid {
+		return DefaultDBOid
+	}
+	return connDBOid
+}
+
+// effectiveDBOid resolves the dbOid a LookupTable/LookupIndex call should key
+// off: an explicit caller-supplied dbOid wins (unchanged pre-4c behavior for
+// any future caller that already knows exactly which database it means), else
+// c.DBOid translated via NamespaceDBOid.
+func (c *SearchPathCatalog) effectiveDBOid(explicit []uint32) []uint32 {
+	if len(explicit) > 0 {
+		return explicit
+	}
+	return []uint32{NamespaceDBOid(c.DBOid)}
+}
+
 // LookupTable overrides the embedded Catalog.LookupTable to apply the
-// current search_path when the name has no explicit schema qualifier.
-func (c *SearchPathCatalog) LookupTable(name parser.ObjectName) (*Table, bool) {
-	tbl, ok := c.Catalog.LookupTable(name)
+// current search_path when the name has no explicit schema qualifier, and to
+// key the lookup off the querying connection's real database (effectiveDBOid,
+// M0122-0007 slice 4c).
+func (c *SearchPathCatalog) LookupTable(name parser.ObjectName, dbOid ...uint32) (*Table, bool) {
+	dbOid = c.effectiveDBOid(dbOid)
+	tbl, ok := c.Catalog.LookupTable(name, dbOid...)
 	if !ok && name.Schema == "" && c.GetSchemas != nil {
 		for _, sc := range c.GetSchemas() {
-			tbl, ok = c.Catalog.LookupTable(parser.ObjectName{Schema: sc, Name: name.Name})
+			tbl, ok = c.Catalog.LookupTable(parser.ObjectName{Schema: sc, Name: name.Name}, dbOid...)
 			if ok {
 				return tbl, ok
 			}
 		}
 	}
 	return tbl, ok
+}
+
+// LookupIndex overrides the embedded Catalog.LookupIndex to key the lookup
+// off the querying connection's real database (effectiveDBOid, M0122-0007
+// slice 4c) — mirrors LookupTable above, minus the search_path fallback
+// (index names aren't schema-search-path resolved the way unqualified table
+// names are; callers that need that already qualify the constraint name).
+func (c *SearchPathCatalog) LookupIndex(name parser.ObjectName, dbOid ...uint32) (*Index, bool) {
+	return c.Catalog.LookupIndex(name, c.effectiveDBOid(dbOid)...)
+}
+
+// IndexesOnTable overrides the embedded Catalog.IndexesOnTable to key the
+// lookup off the querying connection's real database (effectiveDBOid,
+// M0122-0007 slice 4c) — mirrors LookupTable/LookupIndex above. Without this
+// override, every planner-package caller that holds only a catalog.Catalog
+// interface value (e.g. cat.IndexesOnTable(tbl) in internal/planner) silently
+// promoted straight to the embedded InMemory.IndexesOnTable with no dbOid
+// argument, always resolving DefaultDBOid's indexes regardless of c.DBOid —
+// 4d-ii-part-2b item 1.
+func (c *SearchPathCatalog) IndexesOnTable(table *Table, dbOid ...uint32) []*Index {
+	return c.Catalog.IndexesOnTable(table, c.effectiveDBOid(dbOid)...)
 }
 
 // Unwrap returns the underlying Catalog, allowing callers to peel the

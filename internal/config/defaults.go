@@ -111,6 +111,35 @@ func BuildDefaultRegistry() *Registry {
 		Context:     ContextUserset,
 		Scope:       ScopeSession | ScopeTransaction,
 	}))
+	// Object-creation default GUCs (CLIENT_CONN_STATEMENT). pg_dump/pg_restore
+	// emit `SET default_tablespace = '';` and `SET default_table_access_method
+	// = heap;` before every CREATE TABLE section (and `SET
+	// default_toast_compression = 'pglz';` when a column carries non-default
+	// compression), so an unregistered name aborted a real-PG dump replay on
+	// goopg with "unrecognized configuration parameter". Register them as
+	// accepted stubs: goopg only implements the heap access method and uses its
+	// own built-in TOAST default, and has no real tablespaces, so a SET to the
+	// default value is a true no-op and a non-default value is accepted and
+	// ignored (behavioral no-op ledgered, same as the enable_*/geqo stubs).
+	// Names, contexts, and boot values mirror
+	// postgres/src/backend/utils/misc/guc_tables.c (CLIENT_CONN_STATEMENT, all
+	// PGC_USERSET); DEFAULT_TABLE_ACCESS_METHOD ("heap", tableam.h) and
+	// TOAST_PGLZ_COMPRESSION ("pglz", toast_compression.h) supply the defaults;
+	// the toast enum options match the reference PG 18.3 build's --with-lz4.
+	// M0122-0007.
+	r.MustRegister(NewVariable(Variable{
+		Name: "default_table_access_method", Type: TypeString, BootVal: "heap",
+		Context: ContextUserset, Scope: ScopeSession | ScopeTransaction,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "default_tablespace", Type: TypeString, BootVal: "",
+		Context: ContextUserset, Scope: ScopeSession | ScopeTransaction,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "default_toast_compression", Type: TypeEnum, BootVal: "pglz",
+		EnumOptions: []string{"pglz", "lz4"},
+		Context:     ContextUserset, Scope: ScopeSession | ScopeTransaction,
+	}))
 	// SSI predicate-lock sizing (M0104-0003). Names, defaults, and
 	// ranges mirror postgres/src/backend/utils/misc/guc_tables.c so
 	// existing tooling (postgresql.conf templates, parameter probes,
@@ -332,6 +361,45 @@ func BuildDefaultRegistry() *Registry {
 		Context:     ContextUserset,
 		Scope:       ScopeServer,
 	}))
+	// The rest of upstream's jit_* GUC family (guc_tables.c) — goopg has
+	// no JIT compiler at all (not even a stub code path consulted at
+	// runtime, unlike enable_nestloop-style planner toggles), so these
+	// exist purely so SET/SHOW and pg_settings enumeration don't fail
+	// with "unrecognized configuration parameter" on scripts written
+	// against a real PostgreSQL. Contexts/defaults/bounds mirror
+	// guc_tables.c exactly (jit_debugging_support/jit_profiling_support
+	// are PGC_SU_BACKEND; jit_dump_bitcode is PGC_SUSET; jit_provider is
+	// PGC_POSTMASTER; the rest are PGC_USERSET).
+	r.MustRegister(NewVariable(Variable{
+		Name: "jit_debugging_support", Type: TypeBool, BootVal: "off",
+		Context: ContextSuBackend,
+		Scope:   ScopeServer,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "jit_dump_bitcode", Type: TypeBool, BootVal: "off",
+		Context: ContextSuset,
+		Scope:   ScopeServer,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "jit_expressions", Type: TypeBool, BootVal: "on",
+		Context: ContextUserset,
+		Scope:   ScopeServer,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "jit_profiling_support", Type: TypeBool, BootVal: "off",
+		Context: ContextSuBackend,
+		Scope:   ScopeServer,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "jit_tuple_deforming", Type: TypeBool, BootVal: "on",
+		Context: ContextUserset,
+		Scope:   ScopeServer,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "jit_provider", Type: TypeString, BootVal: "llvmjit",
+		Context: ContextPostmaster,
+		Scope:   ScopeServer,
+	}))
 
 	// wal_sender_memory_buffer sizes (in bytes) the in-memory
 	// ring of recent WAL bytes used by walsender's
@@ -417,6 +485,24 @@ func BuildDefaultRegistry() *Registry {
 		Name: "wal_writer_flush_after", Type: TypeInt, BootVal: "1048576",
 		MinVal: 0, MaxVal: 1 << 30,
 		Context: ContextPostmaster,
+		Scope:   ScopeServer,
+	}))
+
+	// commit_delay / commit_siblings drive the backend-driven WAL flush group
+	// commit (docs/design/wal-backend-flush/). The would-be flush holder sleeps
+	// commit_delay microseconds — holding the WAL write lock — to widen the
+	// batch, but only when at least commit_siblings other flushers are in
+	// flight. PG defaults: commit_delay 0 (no delay), commit_siblings 5.
+	r.MustRegister(NewVariable(Variable{
+		Name: "commit_delay", Type: TypeInt, BootVal: "0",
+		MinVal: 0, MaxVal: 100000,
+		Context: ContextUserset,
+		Scope:   ScopeServer,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "commit_siblings", Type: TypeInt, BootVal: "5",
+		MinVal: 0, MaxVal: 1000,
+		Context: ContextUserset,
 		Scope:   ScopeServer,
 	}))
 
@@ -595,6 +681,20 @@ func BuildDefaultRegistry() *Registry {
 	// Values mirror postgres/src/backend/utils/misc/guc_tables.c.
 	r.MustRegister(NewVariable(Variable{
 		Name: "jit_above_cost", Type: TypeReal, BootVal: "100000",
+		MinVal: -1, MaxVal: 1e15,
+		Context: ContextUserset,
+		Scope:   ScopeSession | ScopeTransaction,
+		Flags:   FlagExplain,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "jit_optimize_above_cost", Type: TypeReal, BootVal: "500000",
+		MinVal: -1, MaxVal: 1e15,
+		Context: ContextUserset,
+		Scope:   ScopeSession | ScopeTransaction,
+		Flags:   FlagExplain,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "jit_inline_above_cost", Type: TypeReal, BootVal: "500000",
 		MinVal: -1, MaxVal: 1e15,
 		Context: ContextUserset,
 		Scope:   ScopeSession | ScopeTransaction,
@@ -823,6 +923,82 @@ func BuildDefaultRegistry() *Registry {
 			Flags: FlagExplain,
 		}))
 	}
+
+	// GEQO (genetic query optimization) GUCs. goopg's planner is
+	// rule/cost-based and never runs GEQO, so these are pure no-op
+	// stubs — but psql tab-completion, ORMs, and tuning scripts issue
+	// `SET geqo_threshold = ...` etc., and pg_settings tooling expects
+	// the whole family present. Names, defaults, and ranges mirror
+	// postgres/src/backend/utils/misc/guc_tables.c (QUERY_TUNING_GEQO,
+	// all PGC_USERSET / GUC_EXPLAIN); numeric bounds come from
+	// src/include/optimizer/geqo.h. M0122-0007.
+	r.MustRegister(NewVariable(Variable{
+		Name: "geqo", Type: TypeBool, BootVal: "on",
+		Context: ContextUserset, Scope: ScopeSession | ScopeTransaction,
+		Flags: FlagExplain,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "geqo_threshold", Type: TypeInt, BootVal: "12",
+		MinVal: 2, MaxVal: 2147483647,
+		Context: ContextUserset, Scope: ScopeSession | ScopeTransaction,
+		Flags: FlagExplain,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "geqo_effort", Type: TypeInt, BootVal: "5",
+		MinVal: 1, MaxVal: 10,
+		Context: ContextUserset, Scope: ScopeSession | ScopeTransaction,
+		Flags: FlagExplain,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "geqo_pool_size", Type: TypeInt, BootVal: "0",
+		MinVal: 0, MaxVal: 2147483647,
+		Context: ContextUserset, Scope: ScopeSession | ScopeTransaction,
+		Flags: FlagExplain,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "geqo_generations", Type: TypeInt, BootVal: "0",
+		MinVal: 0, MaxVal: 2147483647,
+		Context: ContextUserset, Scope: ScopeSession | ScopeTransaction,
+		Flags: FlagExplain,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "geqo_selection_bias", Type: TypeReal, BootVal: "2",
+		MinVal: 1.5, MaxVal: 2,
+		Context: ContextUserset, Scope: ScopeSession | ScopeTransaction,
+		Flags: FlagExplain,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "geqo_seed", Type: TypeReal, BootVal: "0",
+		MinVal: 0, MaxVal: 1,
+		Context: ContextUserset, Scope: ScopeSession | ScopeTransaction,
+		Flags: FlagExplain,
+	}))
+	// Other planner-tuning GUCs (QUERY_TUNING_OTHER). goopg's planner
+	// ignores all three, but SET must succeed and the values surface in
+	// pg_settings. constraint_exclusion is an enum {partition,on,off}
+	// (default partition); cursor_tuple_fraction / recursive_worktable_factor
+	// are reals. Mirrors guc_tables.c; recursive_worktable_factor's default
+	// (10.0) is DEFAULT_RECURSIVE_WORKTABLE_FACTOR (cost.h),
+	// cursor_tuple_fraction's (0.1) is DEFAULT_CURSOR_TUPLE_FRACTION
+	// (planmain.h). M0122-0007.
+	r.MustRegister(NewVariable(Variable{
+		Name: "constraint_exclusion", Type: TypeEnum, BootVal: "partition",
+		EnumOptions: []string{"partition", "on", "off"},
+		Context:     ContextUserset, Scope: ScopeSession | ScopeTransaction,
+		Flags: FlagExplain,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "cursor_tuple_fraction", Type: TypeReal, BootVal: "0.1",
+		MinVal: 0, MaxVal: 1,
+		Context: ContextUserset, Scope: ScopeSession | ScopeTransaction,
+		Flags: FlagExplain,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "recursive_worktable_factor", Type: TypeReal, BootVal: "10",
+		MinVal: 0.001, MaxVal: 1000000,
+		Context: ContextUserset, Scope: ScopeSession | ScopeTransaction,
+		Flags: FlagExplain,
+	}))
 
 	// Additional planner cost/limit GUCs. v0 ignores them but registers
 	// them so SET succeeds. M0097-0069.

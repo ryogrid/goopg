@@ -48,6 +48,7 @@ func TestFunctionDDLRecoveryReplaysCreate(t *testing.T) {
 		ReturnTypeName: "integer",
 		Language:       "sql", Body: "select $1 + $2",
 		Volatile: "i", KindChar: "f",
+		Config: []string{"search_path=app,public"},
 	}
 	if _, _, werr := rt1.WAL.Append(wal.EncodeCreateFunction(payload)); werr != nil {
 		_ = rt1.Close()
@@ -82,6 +83,9 @@ func TestFunctionDDLRecoveryReplaysCreate(t *testing.T) {
 	}
 	if len(r.ArgTypes) == 2 && (len(r.ArgTypes[1].Args) != 2 || r.ArgTypes[1].Args[0] != 10 || r.ArgTypes[1].Args[1] != 2) {
 		t.Errorf("after WAL replay, ArgTypes[1].Args = %v, want [10 2] (numeric(10,2) precision/scale)", r.ArgTypes[1].Args)
+	}
+	if len(r.Config) != 1 || r.Config[0] != "search_path=app,public" {
+		t.Errorf("after WAL replay, Config = %#v, want [search_path=app,public] (DU-002 proconfig follow-up to M0097-0150)", r.Config)
 	}
 
 	// A later CREATE FUNCTION statement must not collide with the
@@ -214,6 +218,7 @@ func TestFunctionDDLRecoveryReplaysAlterAfterCreate(t *testing.T) {
 		OID: wantOID, Schema: "public", Name: "origfunc",
 		ReturnTypeName: "integer", Language: "sql", Body: "select 1",
 		Volatile: "v", KindChar: "f",
+		Config: []string{"search_path=app,public"},
 	}
 	if _, _, werr := rt1.WAL.Append(wal.EncodeCreateFunction(payload)); werr != nil {
 		_ = rt1.Close()
@@ -234,6 +239,13 @@ func TestFunctionDDLRecoveryReplaysAlterAfterCreate(t *testing.T) {
 	if _, _, werr := rt1.WAL.Append(wal.EncodeAlterFunctionSetSchema(wantOID, "app")); werr != nil {
 		_ = rt1.Close()
 		t.Fatalf("WAL.Append set-schema: %v", werr)
+	}
+	// DU-002 proconfig follow-up to M0097-0150: an ALTER FUNCTION ... SET/
+	// RESET clause replaces the CREATE FUNCTION-time Config wholesale (the
+	// whole-array-snapshot replay contract, mirroring AlterFunctionFlags).
+	if _, _, werr := rt1.WAL.Append(wal.EncodeAlterFunctionConfig(wantOID, []string{"search_path=app,public", "work_mem=64MB"})); werr != nil {
+		_ = rt1.Close()
+		t.Fatalf("WAL.Append config: %v", werr)
 	}
 	if ferr := rt1.WAL.FlushUpTo(rt1.WAL.WrittenLSN()); ferr != nil {
 		_ = rt1.Close()
@@ -269,6 +281,9 @@ func TestFunctionDDLRecoveryReplaysAlterAfterCreate(t *testing.T) {
 	}
 	if rs.LookupByOID(wantOID) != r {
 		t.Fatal("LookupByOID should still resolve the same routine pointer after SET SCHEMA re-keying")
+	}
+	if len(r.Config) != 2 || r.Config[0] != "search_path=app,public" || r.Config[1] != "work_mem=64MB" {
+		t.Errorf("after replay, Config = %#v, want [search_path=app,public work_mem=64MB]", r.Config)
 	}
 }
 

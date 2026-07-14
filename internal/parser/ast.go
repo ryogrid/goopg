@@ -1341,6 +1341,15 @@ type CreateTableStmt struct {
 	// pg_class.reloftype is set to the type's OID, so pg_dump re-emits the
 	// `OF type_name` form (suppressing the column list). DU-002 slice 374.
 	OfType *ObjectName
+	// OfTypeColumnOptions holds per-column constraint overrides from the
+	// optional `( column_name WITH OPTIONS column_constraint [ ... ] [, ...] )`
+	// list that may follow `OF type_name`. Each entry's Name matches a field
+	// of the composite type named by OfType; Type is left zero since the
+	// column's type is derived from the composite field, not redeclared here.
+	// Table-level constraints in that same list (PRIMARY KEY/UNIQUE/CHECK/
+	// FOREIGN KEY/CONSTRAINT) are rejected at parse time — not yet supported.
+	// DU-002 slice 374 follow-up.
+	OfTypeColumnOptions []ColumnDef
 	// ColumnAliases holds the optional column-name list from
 	// `CREATE TABLE name (col1, col2, …) AS SELECT …`. When non-nil its
 	// length must not exceed the number of columns the SELECT returns; alias
@@ -1435,6 +1444,10 @@ type CreateTableStmt struct {
 	// the on-disk pg_foreign_table.ftoptions text[] representation pg_dump's
 	// getTables reads via pg_options_to_table. DU-002 slice 417.
 	ForeignOptions []string
+	// Tablespace holds the name from an optional `TABLESPACE name` clause.
+	// Empty means unspecified (the table lands in the database's default
+	// tablespace). M0122-0007.
+	Tablespace string
 }
 
 func (s *CreateTableStmt) Pos() int  { return s.pos }
@@ -1592,6 +1605,10 @@ type CreateIndexStmt struct {
 	// explicitly-declared value so pg_get_indexdef can re-emit
 	// `WITH (autosummarize='on'|'off')`. DU-002 slice 223.
 	AutoSummarize *bool
+	// Tablespace holds the name from an optional `TABLESPACE name` clause
+	// (empty = database default). Mirrors CreateTableStmt.Tablespace.
+	// M0122-0007.
+	Tablespace string
 }
 
 // IndexColOrder captures the ASC/DESC + NULLS ordering of one CREATE INDEX key
@@ -3068,6 +3085,14 @@ const (
 	// ConstraintName holds the target constraint; AlterConstraint* fields
 	// carry the parsed attributes. DU-002 slice 433.
 	AlterTableAlterConstraint
+	// AlterTableSetTablespace — `ALTER TABLE name SET TABLESPACE tablespace_name`
+	// (also reused for `ALTER INDEX name SET TABLESPACE tablespace_name`, real
+	// PG's alter_table_cmd grammar shares the AT_SetTableSpace subtype across
+	// both relkinds — gram.y's `SET TABLESPACE name`). TablespaceName carries
+	// the target tablespace. goopg records the catalog metadata only — no
+	// physical relocation of the relation's files, matching the CREATE TABLE/
+	// INDEX ... TABLESPACE precedent (M0122-0007).
+	AlterTableSetTablespace
 )
 
 // FDWOptionVerb tags one entry of an `ALTER FOREIGN TABLE ... OPTIONS (...)`
@@ -3167,6 +3192,9 @@ type AlterTableAction struct {
 	// ClusterIndexName is the index named in `CLUSTER ON index_name` for
 	// AlterTableClusterOn. DU-002 slice 321.
 	ClusterIndexName string
+	// TablespaceName is the target tablespace for AlterTableSetTablespace
+	// (`SET TABLESPACE name`, table or index). M0122-0007.
+	TablespaceName string
 	// DefaultExpr is the parsed DEFAULT expression for AlterTableSetDefault
 	// (`ALTER COLUMN name SET DEFAULT expr`). Nil for AlterTableDropDefault.
 	// DU-002 slice 269.
@@ -3415,6 +3443,27 @@ type CreateFunctionStmt struct {
 	Parallel        string // proparallel: "u"=unsafe (default), "s"=safe, "r"=restricted
 	Cost            string // procost: planner per-row cost override (COST n); "" = language default
 	Rows            string // prorows: SRF result-row estimate override (ROWS n); "" = default
+	// ConfigOps records CREATE FUNCTION's `SET name {TO|=} value` / `RESET
+	// name` / `RESET ALL` clauses (real PG's FunctionSetResetClause, part of
+	// common_func_opt_item — shared with ALTER FUNCTION's identical clause
+	// below) in statement order, for pg_proc.proconfig (DU-002 follow-up).
+	ConfigOps []FunctionConfigOp
+}
+
+// FunctionConfigOp is one `SET name {TO|=} value[, ...]` / `RESET name` /
+// `RESET ALL` clause of a CREATE/ALTER FUNCTION/PROCEDURE/ROUTINE statement,
+// applied in the order recorded (mirrors pg_proc.proconfig's "name=value"
+// array-element shape, same storage convention as InMemory's
+// role/database-level SetRoleConfig/SetDatabaseConfig). `SET name FROM
+// CURRENT` and `SET name TO DEFAULT` never produce an op (see the parser's
+// doc comment) — goopg has no per-session GUC snapshot to capture at
+// CREATE/ALTER time, so both collapse to "leave unset", not a distinguishable
+// value.
+type FunctionConfigOp struct {
+	Reset    bool   // RESET name
+	ResetAll bool   // RESET ALL
+	Name     string // GUC name (empty when ResetAll)
+	Value    string // comma-joined flattened value(s), SET only
 }
 
 // AlterFunctionStmt — `ALTER FUNCTION name([argtypes]) attribute ...`
@@ -3433,6 +3482,11 @@ type AlterFunctionStmt struct {
 	SecurityDefiner *bool
 	Leakproof       *bool
 	Strict          *bool
+	// ConfigOps records the generic `SET name {TO|=} value` / `RESET name` /
+	// `RESET ALL` clauses (distinct from the dedicated `SET SCHEMA` rule
+	// above — real PG grammar treats them as separate productions) in
+	// statement order. DU-002 proconfig follow-up to M0097-0150.
+	ConfigOps []FunctionConfigOp
 }
 
 func (s *AlterFunctionStmt) Pos() int  { return s.pos }

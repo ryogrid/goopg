@@ -213,7 +213,7 @@ func recheckDeferredNNDUniqueKey(ctx *Context, tbl *catalog.Table, idx *catalog.
 // indexByNameOnTable returns the named index on tbl, or nil if absent (it may
 // have been dropped within the transaction after the check was queued).
 func indexByNameOnTable(ctx *Context, tbl *catalog.Table, name string) *catalog.Index {
-	for _, idx := range ctx.Catalog.IndexesOnTable(tbl) {
+	for _, idx := range ctx.Catalog.IndexesOnTable(tbl, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)) {
 		if idx.Name == name {
 			return idx
 		}

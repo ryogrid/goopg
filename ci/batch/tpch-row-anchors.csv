@@ -10,4 +10,4 @@ Q10,20412,load-dependent,20260511,analysis/tpch/m0093-q1-q22-regression-sweep.md
 Q11,791,load-dependent,20260511,analysis/tpch/m0093-q1-q22-regression-sweep.md (informational until re-pinned)
 Q16,18360,load-dependent,20260511,analysis/tpch/m0093-q1-q22-regression-sweep.md (informational until re-pinned)
 Q18,9,load-dependent,20260511,analysis/tpch/m0093-q1-q22-regression-sweep.md (informational until re-pinned)
-Q21,397,load-dependent,20260511,analysis/tpch/m0093-q1-q22-regression-sweep.md (informational until re-pinned)
+Q21,370,load-dependent,20260709,M0122-0011 live re-verification (bench/tpch/runtime_goopg/data, tmp/tpch-runner --queries=21); matches ci/logs/action-items.md's already-flagged non-blocking 20260708 notice, not a regression

@@ -30,6 +30,14 @@ type windowOp struct {
 	// FrameBoundOffsetPreceding/Following.
 	frameStartOff int64
 	frameEndOff   int64
+
+	// frameStartOffDatum/frameEndOffDatum are the RANGE-mode value offsets
+	// (numeric/float/interval, not just int), evaluated once alongside
+	// frameStartOff/frameEndOff. Only meaningful when Frame.Mode is
+	// FrameModeRange and the corresponding bound is
+	// FrameBoundOffsetPreceding/Following; see frameBoundsRange.
+	frameStartOffDatum Datum
+	frameEndOffDatum   Datum
 }
 
 func newWindowOp(plan *planner.WindowAgg, child Operator) *windowOp {
@@ -170,19 +178,40 @@ func (o *windowOp) evalWindowFuncs() error {
 	// references in them for exactly this reason) — mirrors
 	// limitOp.Open's once-per-query LIMIT/OFFSET evaluation.
 	if fr := o.plan.Frame; fr != nil {
-		if fr.StartOffset != nil {
-			v, err := o.resolveFrameOffset(fr.StartOffset, "starting")
-			if err != nil {
-				return err
+		if fr.Mode == parser.FrameModeRange {
+			// RANGE value offsets are compared against the ORDER BY column
+			// value (value±offset), so the offset keeps its native type
+			// (numeric/float/interval) rather than being coerced to an int
+			// row count. resolveRangeOffset null/negative-checks it.
+			if fr.StartOffset != nil {
+				v, err := o.resolveRangeOffset(fr.StartOffset, "starting")
+				if err != nil {
+					return err
+				}
+				o.frameStartOffDatum = v
 			}
-			o.frameStartOff = v
-		}
-		if fr.EndOffset != nil {
-			v, err := o.resolveFrameOffset(fr.EndOffset, "ending")
-			if err != nil {
-				return err
+			if fr.EndOffset != nil {
+				v, err := o.resolveRangeOffset(fr.EndOffset, "ending")
+				if err != nil {
+					return err
+				}
+				o.frameEndOffDatum = v
 			}
-			o.frameEndOff = v
+		} else {
+			if fr.StartOffset != nil {
+				v, err := o.resolveFrameOffset(fr.StartOffset, "starting")
+				if err != nil {
+					return err
+				}
+				o.frameStartOff = v
+			}
+			if fr.EndOffset != nil {
+				v, err := o.resolveFrameOffset(fr.EndOffset, "ending")
+				if err != nil {
+					return err
+				}
+				o.frameEndOff = v
+			}
 		}
 	}
 
@@ -212,7 +241,11 @@ func (o *windowOp) evalWindowFuncs() error {
 		// computed when one of those functions is actually present.
 		var frameEnd []int
 		var valueGroupBounds []int
-		needsValueGroupBounds := o.plan.Frame != nil && o.plan.Frame.Exclusion != parser.FrameExcludeNone && hasFrameValueWindowFunc(o.plan.Funcs)
+		needsValueGroupBounds := o.plan.Frame != nil &&
+			(o.plan.Frame.Exclusion != parser.FrameExcludeNone ||
+				o.plan.Frame.Mode == parser.FrameModeGroups ||
+				o.plan.Frame.Mode == parser.FrameModeRange) &&
+			hasFrameValueWindowFunc(o.plan.Funcs)
 		if hasFrameValueWindowFunc(o.plan.Funcs) {
 			groupBounds, err := o.peerGroupBounds(pStart, pEnd)
 			if err != nil {
@@ -309,7 +342,11 @@ func (o *windowOp) evalWindowFuncs() error {
 				case "first_value":
 					start, end := pStart, frameEnd[localIdx]
 					if o.plan.Frame != nil {
-						start, end = o.frameBounds(pStart, pEnd, i)
+						var err error
+						start, end, err = o.frameBounds(pStart, pEnd, i, valueGroupBounds)
+						if err != nil {
+							return err
+						}
 					}
 					idx := start
 					if o.plan.Frame != nil && o.plan.Frame.Exclusion != parser.FrameExcludeNone {
@@ -328,7 +365,11 @@ func (o *windowOp) evalWindowFuncs() error {
 				case "last_value":
 					start, end := pStart, frameEnd[localIdx]
 					if o.plan.Frame != nil {
-						start, end = o.frameBounds(pStart, pEnd, i)
+						var err error
+						start, end, err = o.frameBounds(pStart, pEnd, i, valueGroupBounds)
+						if err != nil {
+							return err
+						}
 					}
 					idx := end - 1
 					if o.plan.Frame != nil && o.plan.Frame.Exclusion != parser.FrameExcludeNone {
@@ -358,7 +399,11 @@ func (o *windowOp) evalWindowFuncs() error {
 					}
 					start, end := pStart, frameEnd[localIdx]
 					if o.plan.Frame != nil {
-						start, end = o.frameBounds(pStart, pEnd, i)
+						var err error
+						start, end, err = o.frameBounds(pStart, pEnd, i, valueGroupBounds)
+						if err != nil {
+							return err
+						}
 					}
 					var target int
 					if o.plan.Frame != nil && o.plan.Frame.Exclusion != parser.FrameExcludeNone {
@@ -540,19 +585,21 @@ func (o *windowOp) evalFrameAggFuncs(aggHelper *aggregateOp, colBase, pStart, pE
 }
 
 // evalExplicitFrameAggFuncs computes sum/count/avg/min/max for an
-// explicit ROWS frame clause. Unlike the default-frame path above (one
-// running total per peer group, since the default frame only ever
-// grows), an explicit frame's bounds can both grow and shrink from one
-// row to the next (e.g. `ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING`
-// slides rather than accumulates), so there is no valid single running
-// total to share across rows — each row's frame is recomputed from
-// scratch via the same aggregate accumulator. This is a new feature
-// with no prior consumer, so correctness-first O(partition size ×
-// average frame size) is the deliberate v0 tradeoff; TPC-H doesn't use
-// frame clauses, so this doesn't touch the spot-check gate.
+// explicit ROWS or GROUPS frame clause. Unlike the default-frame path
+// above (one running total per peer group, since the default frame
+// only ever grows), an explicit frame's bounds can both grow and
+// shrink from one row to the next (e.g. `ROWS BETWEEN 1 PRECEDING AND
+// 1 FOLLOWING` slides rather than accumulates), so there is no valid
+// single running total to share across rows — each row's frame is
+// recomputed from scratch via the same aggregate accumulator. This is
+// a new feature with no prior consumer, so correctness-first O(partition
+// size × average frame size) is the deliberate v0 tradeoff; TPC-H
+// doesn't use frame clauses, so this doesn't touch the spot-check gate.
 func (o *windowOp) evalExplicitFrameAggFuncs(aggHelper *aggregateOp, colBase, pStart, pEnd int) error {
 	var groupBounds []int
-	if o.plan.Frame.Exclusion != parser.FrameExcludeNone {
+	if o.plan.Frame.Exclusion != parser.FrameExcludeNone ||
+		o.plan.Frame.Mode == parser.FrameModeGroups ||
+		o.plan.Frame.Mode == parser.FrameModeRange {
 		gb, err := o.peerGroupBounds(pStart, pEnd)
 		if err != nil {
 			return err
@@ -567,7 +614,10 @@ func (o *windowOp) evalExplicitFrameAggFuncs(aggHelper *aggregateOp, colBase, pS
 		colIdx := colBase + j
 		call := windowFuncToAggregateCall(fn)
 		for i := pStart; i < pEnd; i++ {
-			start, end := o.frameBounds(pStart, pEnd, i)
+			start, end, err := o.frameBounds(pStart, pEnd, i, groupBounds)
+			if err != nil {
+				return err
+			}
 			peerStart, peerEnd := 0, 0
 			if o.plan.Frame.Exclusion != parser.FrameExcludeNone {
 				peerStart, peerEnd = peerBoundsOf(groupBounds, i)
@@ -650,14 +700,32 @@ func (o *windowOp) resolveFrameOffset(expr planner.Expr, label string) (int64, e
 }
 
 // frameBounds returns the absolute [start, end) row-index bounds of
-// row i's ROWS window frame within partition [pStart, pEnd),
-// reproducing update_frameheadpos/update_frametailpos's ROWS-mode
-// arithmetic (postgres/src/backend/executor/nodeWindowAgg.c) exactly:
-// both bounds are clamped to the partition, and an out-of-order result
-// (e.g. a FOLLOWING start past a PRECEDING end) collapses to an empty
-// frame rather than erroring, matching upstream.
-func (o *windowOp) frameBounds(pStart, pEnd, i int) (int, int) {
+// row i's window frame within partition [pStart, pEnd). groupBounds is
+// the partition's peer-group boundary array (as returned by
+// peerGroupBounds) and is only consulted for GROUPS mode — ROWS-mode
+// callers may pass nil. Dispatches to frameBoundsGroups for GROUPS
+// mode; otherwise reproduces update_frameheadpos/update_frametailpos's
+// ROWS-mode arithmetic (postgres/src/backend/executor/nodeWindowAgg.c)
+// exactly: both bounds are clamped to the partition, and an
+// out-of-order result (e.g. a FOLLOWING start past a PRECEDING end)
+// collapses to an empty frame rather than erroring, matching upstream.
+func (o *windowOp) frameBounds(pStart, pEnd, i int, groupBounds []int) (int, int, error) {
 	fr := o.plan.Frame
+	if fr.Mode == parser.FrameModeRange && frameHasValueOffset(fr) {
+		// RANGE with a value offset bound compares each row's ORDER BY
+		// value against currentValue±offset (PostgreSQL's in_range), so it
+		// cannot use the physical-index arithmetic below.
+		return o.frameBoundsRange(pStart, pEnd, i)
+	}
+	if fr.Mode == parser.FrameModeGroups || fr.Mode == parser.FrameModeRange {
+		// RANGE mode reaches here only with UNBOUNDED/CURRENT ROW bounds.
+		// For those bound kinds RANGE is peer-based — CURRENT ROW means
+		// "the current row's whole ORDER BY peer group" — which is exactly
+		// what frameBoundsGroups computes for the non-offset bound kinds,
+		// so the two modes share this path.
+		s, e := o.frameBoundsGroups(i, groupBounds)
+		return s, e, nil
+	}
 	local := i - pStart
 	n := pEnd - pStart
 	clamp := func(v int) int {
@@ -693,7 +761,287 @@ func (o *windowOp) frameBounds(pStart, pEnd, i int) (int, int) {
 	if end < start {
 		end = start
 	}
-	return pStart + start, pStart + end
+	return pStart + start, pStart + end, nil
+}
+
+// frameHasValueOffset reports whether either frame bound is a value
+// offset (n PRECEDING / n FOLLOWING).
+func frameHasValueOffset(fr *planner.WindowFrame) bool {
+	return fr.StartKind == parser.FrameBoundOffsetPreceding ||
+		fr.StartKind == parser.FrameBoundOffsetFollowing ||
+		fr.EndKind == parser.FrameBoundOffsetPreceding ||
+		fr.EndKind == parser.FrameBoundOffsetFollowing
+}
+
+// frameBoundsRange computes the [start, end) frame for row i in RANGE mode
+// with a value offset bound. It mirrors nodeWindowAgg.c's update_frameheadpos
+// / update_frametailpos RANGE START_OFFSET / END_OFFSET scans: rows are
+// already sorted by the single ORDER BY column, so the frame head is the
+// first row satisfying the start in_range predicate and the frame tail is
+// the first row that fails the end predicate. The boundary value
+// currentValue±offset reuses evalBinary (numeric/interval/date arithmetic)
+// and the value comparison reuses compareDatum, so a column/offset type
+// combination evalBinary cannot add/subtract surfaces as 0A000 here (goopg
+// has no per-type in_range catalog). NULL handling matches PG: a non-null
+// current row never frames a null-valued row; a null current row frames
+// exactly its null peer block (UNBOUNDED extends that side to the edge).
+func (o *windowOp) frameBoundsRange(pStart, pEnd, i int) (int, int, error) {
+	ok := o.plan.OrderBy[0]
+	desc := ok.Desc
+	nullsFirst := ok.NullsFirst
+	cur, err := evalExpr(ok.Expr, o.rows[i], o.ctx)
+	if err != nil {
+		return 0, 0, err
+	}
+	fr := o.plan.Frame
+
+	// head: first index that is the frame start.
+	head := pStart
+	if fr.StartKind != parser.FrameBoundUnboundedPreceding {
+		for head < pEnd {
+			val, err := evalExpr(ok.Expr, o.rows[head], o.ctx)
+			if err != nil {
+				return 0, 0, err
+			}
+			stop, err := o.rangeStartReached(val, cur, desc, nullsFirst)
+			if err != nil {
+				return 0, 0, err
+			}
+			if stop {
+				break
+			}
+			head++
+		}
+	}
+
+	// tail: the exclusive frame end — the first row that no longer
+	// satisfies the end predicate.
+	tail := pStart
+	if fr.EndKind == parser.FrameBoundUnboundedFollowing {
+		tail = pEnd
+	} else {
+		for tail < pEnd {
+			val, err := evalExpr(ok.Expr, o.rows[tail], o.ctx)
+			if err != nil {
+				return 0, 0, err
+			}
+			stop, err := o.rangeEndReached(val, cur, desc, nullsFirst)
+			if err != nil {
+				return 0, 0, err
+			}
+			if stop {
+				break
+			}
+			tail++
+		}
+	}
+	if tail < head {
+		tail = head
+	}
+	return head, tail, nil
+}
+
+// rangeStartReached reports whether the candidate row's ORDER BY value val
+// is the frame head for the current row's value cur, mirroring the break
+// condition of nodeWindowAgg.c's update_frameheadpos RANGE loop.
+func (o *windowOp) rangeStartReached(val, cur Datum, desc, nullsFirst bool) (bool, error) {
+	if val.IsNull() || cur.IsNull() {
+		if nullsFirst {
+			// stop (frame head) unless head is null while cur is not
+			return !val.IsNull() || cur.IsNull(), nil
+		}
+		return val.IsNull() || !cur.IsNull(), nil
+	}
+	// sub = START_OFFSET_PRECEDING (CURRENT ROW == offset 0 preceding);
+	// less = false; flip both if DESC.
+	sub := o.plan.Frame.StartKind != parser.FrameBoundOffsetFollowing
+	less := false
+	if desc {
+		sub = !sub
+		less = true
+	}
+	return o.inRange(val, cur, o.frameStartOffDatum, sub, less)
+}
+
+// rangeEndReached reports whether the candidate row's ORDER BY value val is
+// the frame tail (first row past the frame end) for the current row's value
+// cur, mirroring update_frametailpos's RANGE loop (which breaks when the
+// in_range predicate first turns false).
+func (o *windowOp) rangeEndReached(val, cur Datum, desc, nullsFirst bool) (bool, error) {
+	if val.IsNull() || cur.IsNull() {
+		if nullsFirst {
+			return !val.IsNull(), nil
+		}
+		return !cur.IsNull(), nil
+	}
+	// sub = END_OFFSET_PRECEDING (CURRENT ROW == offset 0 preceding);
+	// less = true; flip both if DESC.
+	sub := o.plan.Frame.EndKind != parser.FrameBoundOffsetFollowing
+	less := true
+	if desc {
+		sub = !sub
+		less = false
+	}
+	in, err := o.inRange(val, cur, o.frameEndOffDatum, sub, less)
+	if err != nil {
+		return false, err
+	}
+	// The scan advances while the row is still in range; it stops at the
+	// first row that is NOT in range (the exclusive frame tail).
+	return !in, nil
+}
+
+// inRange implements PostgreSQL's in_range(val, base, offset, sub, less):
+// sum = base∓offset (sub subtracts), result = val<=sum (less) or val>=sum.
+// offset is nil for a CURRENT ROW bound, where sum degenerates to base.
+func (o *windowOp) inRange(val, base, offset Datum, sub, less bool) (bool, error) {
+	sum := base
+	if !offset.IsNull() {
+		op := parser.OpAdd
+		if sub {
+			op = parser.OpSub
+		}
+		var err error
+		sum, err = evalBinary(op, base, offset, o.rangePos())
+		if err != nil {
+			return false, err
+		}
+	}
+	cmp, err := compareDatum(val, sum, o.rangePos())
+	if err != nil {
+		return false, err
+	}
+	if less {
+		return cmp <= 0, nil
+	}
+	return cmp >= 0, nil
+}
+
+// rangePos returns a parse position for RANGE arithmetic/comparison error
+// messages: the offset expression's position when present, else the single
+// ORDER BY expression's, else 0.
+func (o *windowOp) rangePos() int {
+	if fr := o.plan.Frame; fr != nil {
+		if fr.StartOffset != nil {
+			return fr.StartOffset.Pos()
+		}
+		if fr.EndOffset != nil {
+			return fr.EndOffset.Pos()
+		}
+	}
+	if len(o.plan.OrderBy) > 0 {
+		return o.plan.OrderBy[0].Expr.Pos()
+	}
+	return 0
+}
+
+// resolveRangeOffset evaluates a RANGE frame offset once, keeping its native
+// type (numeric/float/interval), and enforces PG's non-null (22004) and
+// non-negative (22013) checks.
+func (o *windowOp) resolveRangeOffset(expr planner.Expr, label string) (Datum, error) {
+	v, err := evalExpr(expr, nil, o.ctx)
+	if err != nil {
+		return Datum{}, err
+	}
+	if v.IsNull() {
+		return Datum{}, &ExecError{Code: "22004", Pos: expr.Pos(), Message: fmt.Sprintf("frame %s offset must not be null", label)}
+	}
+	if rangeOffsetNegative(v) {
+		return Datum{}, &ExecError{Code: "22013", Pos: expr.Pos(), Message: "invalid preceding or following size in window function"}
+	}
+	return v, nil
+}
+
+// rangeOffsetNegative reports whether a RANGE offset value is negative,
+// which PostgreSQL rejects in every type's in_range function.
+func rangeOffsetNegative(v Datum) bool {
+	switch v.Kind {
+	case KindInt:
+		return v.Int < 0
+	case KindNumeric:
+		// float8/float4 offsets are also carried as KindNumeric in v0.
+		z := numericFromInt(0)
+		cmp, err := compareDatum(v, z, 0)
+		return err == nil && cmp < 0
+	case KindInterval:
+		// PostgreSQL's in_range_interval_interval rejects the offset when
+		// interval_sign(offset) < 0 — the sign of the *linear span*
+		// span = time_micros + (months*30 + days)*USECS_PER_DAY — NOT the sign
+		// of any individual component (timestamp.c: interval_cmp_value). So
+		// '1 mon -10 days' (a +20-day span) is a valid, positive offset even
+		// though its day field is negative. Mirror interval_cmp_value via the
+		// same overflow-safe day/frac decomposition compareDatum already uses
+		// for interval ordering: days carries the whole-day part, frac the
+		// sub-day microsecond remainder, and the sign of the whole equals the
+		// sign of days when nonzero (|frac| < usecsPerDay) else the sign of frac.
+		days := int64(v.IntervalMonthsValue())*30 + int64(v.IntervalDaysValue()) + v.IntervalMicrosValue()/usecsPerDay
+		frac := v.IntervalMicrosValue() % usecsPerDay
+		if days != 0 {
+			return days < 0
+		}
+		return frac < 0
+	}
+	return false
+}
+
+// frameBoundsGroups returns the absolute [start, end) row-index bounds
+// of row i's GROUPS-mode window frame, given groupBounds — the
+// partition's peer-group boundary array (ascending absolute
+// group-start row indices plus a trailing partition-end sentinel, as
+// returned by peerGroupBounds). GROUPS-mode bounds are counted in
+// peer groups rather than rows (an offset PRECEDING/FOLLOWING moves N
+// whole peer groups, and CURRENT ROW means the current row's own peer
+// group), mirroring update_frameheadpos/update_frametailpos's GROUPS
+// branch exactly — the row-index arithmetic above is otherwise
+// identical, just performed on group indices and then translated back
+// to row indices via groupBounds.
+func (o *windowOp) frameBoundsGroups(i int, groupBounds []int) (int, int) {
+	fr := o.plan.Frame
+	numGroups := len(groupBounds) - 1
+	curGroup := groupIndexOf(groupBounds, i)
+	clamp := func(v int) int {
+		if v < 0 {
+			return 0
+		}
+		if v > numGroups {
+			return numGroups
+		}
+		return v
+	}
+	var startG, endG int
+	switch fr.StartKind {
+	case parser.FrameBoundUnboundedPreceding:
+		startG = 0
+	case parser.FrameBoundCurrentRow:
+		startG = curGroup
+	case parser.FrameBoundOffsetPreceding:
+		startG = clamp(curGroup - int(o.frameStartOff))
+	case parser.FrameBoundOffsetFollowing:
+		startG = clamp(curGroup + int(o.frameStartOff))
+	}
+	switch fr.EndKind {
+	case parser.FrameBoundUnboundedFollowing:
+		endG = numGroups
+	case parser.FrameBoundCurrentRow:
+		endG = curGroup + 1
+	case parser.FrameBoundOffsetPreceding:
+		endG = clamp(curGroup - int(o.frameEndOff) + 1)
+	case parser.FrameBoundOffsetFollowing:
+		endG = clamp(curGroup + int(o.frameEndOff) + 1)
+	}
+	if endG < startG {
+		endG = startG
+	}
+	return groupBounds[startG], groupBounds[endG]
+}
+
+// groupIndexOf returns the index k of the peer group containing
+// absolute row index i, given groupBounds as returned by
+// peerGroupBounds (ascending group-start indices plus a trailing
+// partition-end sentinel) — i.e. the k such that
+// groupBounds[k] <= i < groupBounds[k+1].
+func groupIndexOf(groupBounds []int, i int) int {
+	return sort.Search(len(groupBounds)-1, func(k int) bool { return groupBounds[k+1] > i })
 }
 
 // peerBoundsOf returns the [start, end) peer-group bounds containing
@@ -701,7 +1049,7 @@ func (o *windowOp) frameBounds(pStart, pEnd, i int) (int, int) {
 // peerGroupBounds (ascending group-start indices plus a trailing pEnd
 // sentinel).
 func peerBoundsOf(groupBounds []int, i int) (int, int) {
-	k := sort.Search(len(groupBounds)-1, func(k int) bool { return groupBounds[k+1] > i })
+	k := groupIndexOf(groupBounds, i)
 	return groupBounds[k], groupBounds[k+1]
 }
 

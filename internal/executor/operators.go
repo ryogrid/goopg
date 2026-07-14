@@ -103,6 +103,154 @@ func (o *valuesOp) Open(ctx *Context) error {
 			// IO signal goopg instruments), which the static catalog VirtualRows
 			// fallback cannot do. M0122-0003.
 			o.rows = rematerialiseVirtualRowsFromStrings(tbl, fetchIOStatRows(ctx))
+		} else if tbl.Name == "pg_stat_all_tables" && ctx != nil {
+			// pg_stat_*_tables list the connecting database's own tables (not
+			// always DefaultDBOid's), which the static catalog VirtualRows
+			// fallback cannot do. Resolved directly from ctx.Catalog like the
+			// pg_stat_io/pg_sequences branches. M0122-0003.
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, fetchStatTablesRows(ctx, catalog.StatScopeAll))
+		} else if tbl.Name == "pg_stat_sys_tables" && ctx != nil {
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, fetchStatTablesRows(ctx, catalog.StatScopeSys))
+		} else if tbl.Name == "pg_stat_user_tables" && ctx != nil {
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, fetchStatTablesRows(ctx, catalog.StatScopeUser))
+		} else if tbl.Name == "pg_stat_xact_all_tables" && ctx != nil {
+			// pg_stat_xact_*_tables list the connecting database's own tables'
+			// per-transaction delta counters (honest-0, no per-xact tracking), the
+			// transaction-scoped sibling of pg_stat_*_tables. M0122-0003.
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, fetchStatXactTablesRows(ctx, catalog.StatScopeAll))
+		} else if tbl.Name == "pg_stat_xact_sys_tables" && ctx != nil {
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, fetchStatXactTablesRows(ctx, catalog.StatScopeSys))
+		} else if tbl.Name == "pg_stat_xact_user_tables" && ctx != nil {
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, fetchStatXactTablesRows(ctx, catalog.StatScopeUser))
+		} else if tbl.Name == "pg_stat_all_indexes" && ctx != nil {
+			// pg_stat_*_indexes list the connecting database's own indexes (the
+			// per-index sibling of pg_stat_*_tables), which the static catalog
+			// VirtualRows fallback cannot scope. M0122-0003.
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, fetchStatIndexesRows(ctx, catalog.StatScopeAll))
+		} else if tbl.Name == "pg_stat_sys_indexes" && ctx != nil {
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, fetchStatIndexesRows(ctx, catalog.StatScopeSys))
+		} else if tbl.Name == "pg_stat_user_indexes" && ctx != nil {
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, fetchStatIndexesRows(ctx, catalog.StatScopeUser))
+		} else if tbl.Name == "pg_statio_all_tables" && ctx != nil {
+			// pg_statio_*_tables list the connecting database's own tables' buffer-pool
+			// I/O stats (honest-0 counters, no per-relation buffer tracking), which the
+			// static catalog VirtualRows fallback cannot scope. M0122-0003.
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, fetchStatioTablesRows(ctx, catalog.StatScopeAll))
+		} else if tbl.Name == "pg_statio_sys_tables" && ctx != nil {
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, fetchStatioTablesRows(ctx, catalog.StatScopeSys))
+		} else if tbl.Name == "pg_statio_user_tables" && ctx != nil {
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, fetchStatioTablesRows(ctx, catalog.StatScopeUser))
+		} else if tbl.Name == "pg_statio_all_indexes" && ctx != nil {
+			// pg_statio_*_indexes list the connecting database's own indexes' buffer-pool
+			// I/O stats (the per-index sibling of pg_statio_*_tables). M0122-0003.
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, fetchStatioIndexesRows(ctx, catalog.StatScopeAll))
+		} else if tbl.Name == "pg_statio_sys_indexes" && ctx != nil {
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, fetchStatioIndexesRows(ctx, catalog.StatScopeSys))
+		} else if tbl.Name == "pg_statio_user_indexes" && ctx != nil {
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, fetchStatioIndexesRows(ctx, catalog.StatScopeUser))
+		} else if tbl.Name == "pg_statio_all_sequences" && ctx != nil {
+			// pg_statio_*_sequences list the connecting database's own sequences'
+			// buffer-pool I/O stats (the sequence sibling of pg_statio_*_tables). M0122-0003.
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, fetchStatioSequencesRows(ctx, catalog.StatScopeAll))
+		} else if tbl.Name == "pg_statio_sys_sequences" && ctx != nil {
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, fetchStatioSequencesRows(ctx, catalog.StatScopeSys))
+		} else if tbl.Name == "pg_statio_user_sequences" && ctx != nil {
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, fetchStatioSequencesRows(ctx, catalog.StatScopeUser))
+		} else if tbl.Name == "pg_stats" && ctx != nil {
+			// pg_stats projects the connecting database's own per-column ANALYZE
+			// statistics (pg_statistic), which the static DefaultDBOid VirtualRows
+			// fallback cannot scope. M0122-0003.
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, fetchStatsRows(ctx))
+		} else if tbl.Name == "pg_class" && ctx != nil && ctx.PgClassRows != nil {
+			// pg_class must list the connecting database's own tables/indexes,
+			// not always DefaultDBOid's — use the per-connection, dbOid-scoped
+			// lister. M0122-0007 4e.
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, ctx.PgClassRows())
+		} else if tbl.Name == "pg_indexes" && ctx != nil && ctx.PgIndexesRows != nil {
+			// pg_indexes must list the connecting database's own indexes, not
+			// always DefaultDBOid's — mirrors the pg_class branch above.
+			// M0122-0007 4e follow-up 24.
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, ctx.PgIndexesRows())
+		} else if tbl.Name == "pg_tables" && ctx != nil && ctx.PgTablesRows != nil {
+			// pg_tables must list the connecting database's own tables, not
+			// always DefaultDBOid's — mirrors the pg_class branch above.
+			// M0122-0007 4e follow-up 24.
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, ctx.PgTablesRows())
+		} else if tbl.Name == "pg_constraint" && ctx != nil && ctx.PgConstraintRows != nil {
+			// pg_constraint must list the connecting database's own
+			// tables'/indexes' constraints, not always DefaultDBOid's —
+			// mirrors the pg_class branch above. M0122-0007 4e follow-up 25.
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, ctx.PgConstraintRows())
+		} else if tbl.Name == "pg_index" && ctx != nil && ctx.PgIndexRows != nil {
+			// pg_index must list the connecting database's own indexes, not
+			// always DefaultDBOid's — mirrors the pg_constraint branch
+			// above. M0122-0007 4e follow-up 26.
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, ctx.PgIndexRows())
+		} else if tbl.Name == "pg_attrdef" && ctx != nil && ctx.PgAttrdefRows != nil {
+			// pg_attrdef must list the connecting database's own tables'
+			// column defaults, not always DefaultDBOid's — mirrors the
+			// pg_index branch above. M0122-0007 4e follow-up 27.
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, ctx.PgAttrdefRows())
+		} else if tbl.Name == "pg_depend" && ctx != nil && ctx.PgDependRows != nil {
+			// pg_depend must list the connecting database's own dependency
+			// rows, not always DefaultDBOid's — mirrors the pg_attrdef
+			// branch above. M0122-0007 4e follow-up 27.
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, ctx.PgDependRows())
+		} else if tbl.Name == "pg_inherits" && ctx != nil && ctx.PgInheritsRows != nil {
+			// pg_inherits must list the connecting database's own
+			// inheritance/partition parent-child rows, not always
+			// DefaultDBOid's — mirrors the pg_depend branch above.
+			// M0122-0007 4e follow-up 28.
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, ctx.PgInheritsRows())
+		} else if tbl.Name == "pg_policy" && ctx != nil && ctx.PgPolicyRows != nil {
+			// pg_policy must list the connecting database's own tables' RLS
+			// policies, not always DefaultDBOid's — mirrors the pg_inherits
+			// branch above. M0122-0007 4e follow-up 29.
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, ctx.PgPolicyRows())
+		} else if tbl.Name == "pg_trigger" && ctx != nil && ctx.PgTriggerRows != nil {
+			// pg_trigger must list the connecting database's own tables'
+			// triggers, not always DefaultDBOid's — mirrors the pg_policy
+			// branch above. M0122-0007 4e follow-up 30.
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, ctx.PgTriggerRows())
+		} else if tbl.Name == "pg_rewrite" && ctx != nil && ctx.PgRewriteRows != nil {
+			// pg_rewrite must list the connecting database's own tables'
+			// CREATE RULE DO-NOTHING rules, not always DefaultDBOid's —
+			// mirrors the pg_trigger branch above. M0122-0007 4e follow-up 31.
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, ctx.PgRewriteRows())
+		} else if tbl.Name == "pg_foreign_table" && ctx != nil && ctx.PgForeignTableRows != nil {
+			// pg_foreign_table must list the connecting database's own
+			// foreign tables, not always DefaultDBOid's — mirrors the
+			// pg_rewrite branch above. M0122-0007 4e follow-up 32.
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, ctx.PgForeignTableRows())
+		} else if tbl.Name == "pg_sequence" && ctx != nil && ctx.PgSequenceRows != nil {
+			// pg_sequence must list the connecting database's own
+			// sequences, not always DefaultDBOid's — mirrors the
+			// pg_foreign_table branch above. M0122-0007 4e follow-up 34.
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, ctx.PgSequenceRows())
+		} else if tbl.Name == "pg_sequences" && ctx != nil {
+			// pg_sequences must list the connecting database's own sequences,
+			// not always DefaultDBOid's. Unlike pg_sequence (singular) above,
+			// this reads straight from the executor's own seqRegistry (no
+			// catalog.InMemory indirection needed), so it is resolved here
+			// directly rather than through a Context-field wire-up — mirrors
+			// the pg_stat_slru/pg_stat_io direct-call branches above.
+			// M0122-0007 4e follow-up 35.
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, PGSequencesRows(catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)))
+		} else if tbl.Name == "sequences" && ctx != nil && tbl.Schema == "information_schema" {
+			// information_schema.sequences mirrors the pg_sequences branch
+			// above. M0122-0007 4e follow-up 35.
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, InformationSchemaSequencesRows(catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)))
+		} else if tbl.Name == "pg_foreign_server" && ctx != nil && ctx.PgForeignServerRows != nil {
+			// pg_foreign_server must list the connecting database's own
+			// CREATE SERVER'd servers, not always DefaultDBOid's — mirrors
+			// the pg_foreign_table branch above. M0122-0007 4e follow-up 36.
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, ctx.PgForeignServerRows())
+		} else if tbl.Name == "pg_user_mappings" && ctx != nil && ctx.PgUserMappingsRows != nil {
+			// pg_user_mappings must list the connecting database's own
+			// CREATE USER MAPPING'd mappings, not always DefaultDBOid's —
+			// mirrors the pg_foreign_server branch above. M0122-0007 4e
+			// follow-up 37.
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, ctx.PgUserMappingsRows())
 		} else if tbl.VirtualRows != nil {
 			o.rows = rematerialiseVirtualRows(o.plan)
 		}

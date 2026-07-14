@@ -163,6 +163,32 @@ func (m *bufmap) Lookup(tag BufferTag) (int32, uint32) {
 // Insert publishes (tag, slotIdx, gen) under mu. Returns true on success,
 // false if an entry for the same tag already exists. Callers should call
 // Lookup first (lock-free) to avoid unnecessary lock acquisition.
+//
+// M-NIGHTLY AI-20260708-064334-001 (14th loop): this used to stop at the
+// FIRST tombstone or empty bucket in the probe chain and claim it
+// immediately, on the mistaken assumption that reaching a tombstone meant
+// "safe to reuse, key can't be present here". That contradicts Lookup's and
+// Delete's own documented/implemented invariant that "tombstones do NOT
+// terminate probing; only true-empty buckets do" — a live entry for `tag`
+// can legitimately sit FURTHER ALONG the probe chain, past an earlier
+// tombstone left by a different, unrelated key that happened to collide on
+// the same starting bucket and was since deleted. Reusing that earlier
+// tombstone without checking the rest of the chain let two DIFFERENT slots
+// both hold a "live" bufmap entry for the same BufferTag at once — proved
+// directly via live bufmapLog instrumentation
+// (internal/amcheck/verify_nbtree_realtree_test.go's
+// TestVerifyBtreeEngineSilentOnRealConcurrentContended,
+// BTree.CheckBufmapExclusivity): block 444's tag was inserted at slot 38
+// (bufmap-event seq=1177594), then AGAIN at slot 42 (seq=1177611) with NO
+// intervening Delete, because slot 38's actual bucket sat past a stale
+// tombstone that a colliding, unrelated, already-deleted tag had left
+// behind. The two "owners" then raced a reload against a flush of the same
+// block, permanently discarding an insert (12 loops of investigation
+// narrowed the symptom to exactly this shape without ever finding this
+// cause). Fixed by scanning the FULL probe chain to a true-empty
+// terminator (matching Lookup/Delete) before deciding whether to insert,
+// while remembering the first tombstone-or-empty bucket seen as the actual
+// write target — the standard open-addressing-with-tombstones algorithm.
 func (m *bufmap) Insert(tag BufferTag, slotIdx int32, gen uint32) bool {
 	val := packVal(slotIdx, gen)
 	wantKey0, wantKey1 := packKey(tag)
@@ -171,36 +197,56 @@ func (m *bufmap) Insert(tag BufferTag, slotIdx int32, gen uint32) bool {
 	in := m.inner.Load()
 	h := bufTagHash(tag) & in.mask
 	size := in.mask + 1
+	insertAt := uint64(0)
+	haveInsertAt := false
 	for i := uint64(0); i < size; i++ {
 		b := &in.buckets[h]
 		v := b.val.Load()
-		switch {
-		case v == bufmapEmpty || v == bufmapTombstone:
-			// Park val at tombstone first (we already aren't "empty
-			// terminator" to readers, since v was empty/tombstone — but
-			// we want to be explicit about the protocol). Writing keys
-			// while val is tombstone is safe because Lookup skips
-			// tombstone buckets without reading keys.
-			b.val.Store(bufmapTombstone)
-			b.key0.Store(wantKey0)
-			b.key1.Store(wantKey1)
-			// Release-store the live val. Concurrent readers that
-			// observe `live` will retry their snapshot if they raced
-			// the key write, and on the retry will see val == live
-			// alongside the new keys.
-			b.val.Store(val)
+		switch v {
+		case bufmapEmpty:
+			// Definitive terminator (same rule Lookup/Delete use): tag is
+			// not present anywhere in the chain. Use the first
+			// tombstone-or-empty bucket seen as the write target.
+			if !haveInsertAt {
+				insertAt = h
+			}
+			m.writeBucket(&in.buckets[insertAt], wantKey0, wantKey1, val)
 			return true
+		case bufmapTombstone:
+			if !haveInsertAt {
+				insertAt = h
+				haveInsertAt = true
+			}
 		default:
 			k0 := b.key0.Load()
 			k1 := b.key1.Load()
 			if k0 == wantKey0 && k1 == wantKey1 {
-				return false // already present
+				return false // already present, possibly past an earlier tombstone
 			}
-			h = (h + 1) & in.mask
 		}
+		h = (h + 1) & in.mask
+	}
+	// Probed the whole table without hitting a true-empty terminator
+	// (table saturated with live entries + tombstones). If we saw a
+	// reusable tombstone along the way, and confirmed (by completing the
+	// full scan) that tag isn't already present, use it.
+	if haveInsertAt {
+		m.writeBucket(&in.buckets[insertAt], wantKey0, wantKey1, val)
+		return true
 	}
 	// Table full — should not happen at ≤50% load.
 	return false
+}
+
+// writeBucket publishes (key0, key1, val) into bucket b, parking val at
+// tombstone first so concurrent lock-free Lookups never observe a torn key
+// (Lookup skips tombstone buckets without reading keys; a reader that races
+// the key writes retries on its val seqlock check).
+func (m *bufmap) writeBucket(b *bufmapBucket, key0, key1, val uint64) {
+	b.val.Store(bufmapTombstone)
+	b.key0.Store(key0)
+	b.key1.Store(key1)
+	b.val.Store(val)
 }
 
 // Delete marks the entry for (tag, slotIdx) as tombstone under mu.

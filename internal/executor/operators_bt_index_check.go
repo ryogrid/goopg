@@ -245,10 +245,12 @@ func btIndexResolve(d Datum, im *catalog.InMemory) (*catalog.Index, bool) {
 }
 
 // btIndexReportDetail joins every finding's "block N: msg" line into the error
-// DETAIL when more than one was found (the first is already the primary
-// message), so a multi-fault index surfaces all findings on one raise.
+// DETAIL, so the block a corruption was found on is always surfaced even for
+// a single-finding raise (upstream amcheck's own ereport calls always include
+// an errdetail_internal naming the offending block; dropping it here for the
+// single-finding case was a parity gap, not a deliberate simplification).
 func btIndexReportDetail(reports []amcheck.BtreeReport) string {
-	if len(reports) <= 1 {
+	if len(reports) == 0 {
 		return ""
 	}
 	var b strings.Builder

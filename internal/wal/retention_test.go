@@ -85,7 +85,7 @@ func TestRemoveOldSegmentsKeepsContainingSegment(t *testing.T) {
 	// (segNo=2, byte offset 0 inside the segment, 1-based LSN =
 	// 2*32 + 1 = 65). Segments 0 and 1 are obsolete; 2 and 3 stay.
 	keepLSN := uint64(2*32 + 1)
-	removed, err := w.RemoveOldSegments(keepLSN)
+	removed, _, err := w.RemoveOldSegments(keepLSN)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,7 +115,7 @@ func TestRemoveOldSegmentsZeroLSNIsNoop(t *testing.T) {
 	if _, _, err := w.Append(make([]byte, 24)); err != nil {
 		t.Fatal(err)
 	}
-	removed, err := w.RemoveOldSegments(0)
+	removed, _, err := w.RemoveOldSegments(0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,7 +144,7 @@ func TestRemoveOldSegmentsClosesCachedHandle(t *testing.T) {
 		}
 	}
 	// Drop segments 0 and 1 (keep segment 2).
-	if _, err := w.RemoveOldSegments(uint64(2*32 + 1)); err != nil {
+	if _, _, err := w.RemoveOldSegments(uint64(2*32 + 1)); err != nil {
 		t.Fatal(err)
 	}
 	// Append more — the writer should open segment 3 fresh.
@@ -158,6 +158,204 @@ func TestRemoveOldSegmentsClosesCachedHandle(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(walDir, name)); !errors.Is(err, fs.ErrNotExist) {
 			t.Fatalf("segment %s reappeared (err=%v)", name, err)
 		}
+	}
+}
+
+// TestRemoveOldSegmentsRecyclesUpToMinWALSize confirms MinWALSize
+// caps how many of the newest obsolete segments get recycled
+// (zero-filled + renamed into a future slot) instead of unlinked,
+// and that the recycled file's content is genuinely zeroed rather
+// than the old segment's leftover WAL bytes (required for
+// decodeRecord's graceful-EOS heuristic -- see removeOldSegments).
+func TestRemoveOldSegmentsRecyclesUpToMinWALSize(t *testing.T) {
+	walDir := filepath.Join(t.TempDir(), "pg_wal")
+	const segSize = 32
+	w, err := NewWriter(Config{WALDir: walDir, SegmentSize: segSize, MinWALSize: 2 * segSize})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	// Fill segments 0..4 (5 segments, one 24-byte record each).
+	for i := 0; i < 5; i++ {
+		payload := make([]byte, 24)
+		payload[0] = byte('a' + i)
+		if _, _, err := w.Append(payload); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if names := segmentNames(t, walDir); len(names) != 5 {
+		t.Fatalf("pre-recycle segment count = %d (%v), want 5", len(names), names)
+	}
+
+	// Keep segment 3 onward (segments 0,1,2 obsolete). MinWALSize=2
+	// segments caps recycling at the 2 newest obsolete segments (2
+	// and 1); the oldest (0) is unlinked.
+	keepLSN := uint64(3*segSize + 1)
+	removed, recycled, err := w.RemoveOldSegments(keepLSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removed != 1 {
+		t.Fatalf("removed = %d, want 1", removed)
+	}
+	if recycled != 2 {
+		t.Fatalf("recycled = %d, want 2", recycled)
+	}
+
+	// Segment 0 must be gone; segments 3,4 (kept) plus two freshly
+	// recycled slots (5,6 -- the first free slots at/after keepSeg=3)
+	// must be present.
+	got := segmentNames(t, walDir)
+	want := []string{
+		formatSegmentName(3),
+		formatSegmentName(4),
+		formatSegmentName(5),
+		formatSegmentName(6),
+	}
+	if !equalStringSlices(got, want) {
+		t.Fatalf("post-recycle segments = %v, want %v", got, want)
+	}
+
+	// The recycled slots must be genuinely zero-filled, not the
+	// donor segment's old WAL bytes.
+	for _, segNo := range []uint64{5, 6} {
+		data, err := os.ReadFile(filepath.Join(walDir, formatSegmentName(segNo)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(data) != segSize {
+			t.Fatalf("recycled segment %d size = %d, want %d", segNo, len(data), segSize)
+		}
+		for i, b := range data {
+			if b != 0 {
+				t.Fatalf("recycled segment %d byte %d = %#x, want zero (stale WAL content leaked through)", segNo, i, b)
+			}
+		}
+	}
+}
+
+// TestRemoveOldSegmentsRecycleCapExceedsObsoleteCount confirms that
+// when MinWALSize requests more spares than there are obsolete
+// segments, every obsolete segment is recycled and none are
+// unlinked (no divide-by-zero or out-of-range panics on the small
+// side either).
+func TestRemoveOldSegmentsRecycleCapExceedsObsoleteCount(t *testing.T) {
+	walDir := filepath.Join(t.TempDir(), "pg_wal")
+	const segSize = 32
+	w, err := NewWriter(Config{WALDir: walDir, SegmentSize: segSize, MinWALSize: 10 * segSize})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	for i := 0; i < 3; i++ {
+		if _, _, err := w.Append(make([]byte, 24)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	keepLSN := uint64(2*segSize + 1)
+	removed, recycled, err := w.RemoveOldSegments(keepLSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removed != 0 {
+		t.Fatalf("removed = %d, want 0", removed)
+	}
+	if recycled != 2 {
+		t.Fatalf("recycled = %d, want 2", recycled)
+	}
+	got := segmentNames(t, walDir)
+	want := []string{formatSegmentName(2), formatSegmentName(3), formatSegmentName(4)}
+	if !equalStringSlices(got, want) {
+		t.Fatalf("post-recycle segments = %v, want %v", got, want)
+	}
+}
+
+// TestComputeSpareSegmentsMatchesMinWALSizeFloorWhenNoEstimate confirms
+// computeSpareSegments(minWALSize, maxWALSize, segSize, 0, 0) reduces to
+// exactly the pre-M0122-0009-follow-up `ceil(minWALSize/segSize)` floor —
+// the invariant RemoveOldSegments (and every test above) depends on.
+func TestComputeSpareSegmentsMatchesMinWALSizeFloorWhenNoEstimate(t *testing.T) {
+	cases := []struct {
+		minWALSize, maxWALSize, segSize int64
+		want                            int
+	}{
+		{0, 0, 32, 0},
+		{2 * 32, 0, 32, 2},
+		{33, 0, 32, 2},  // ceil(33/32) = 2
+		{64, 0, 32, 2},
+		{2 * 32, 10 * 32, 32, 2}, // maxWALSize well above the floor: no clamp
+	}
+	for _, tc := range cases {
+		if got := computeSpareSegments(tc.minWALSize, tc.maxWALSize, tc.segSize, 0, 0); got != tc.want {
+			t.Errorf("computeSpareSegments(%d, %d, %d, 0, 0) = %d, want %d",
+				tc.minWALSize, tc.maxWALSize, tc.segSize, got, tc.want)
+		}
+	}
+}
+
+// TestComputeSpareSegmentsGrowsWithDistanceEstimate confirms a non-zero
+// CheckPointDistanceEstimate can push spares above the MinWALSize floor
+// (mirrors upstream XLOGfileslop's distance term).
+func TestComputeSpareSegmentsGrowsWithDistanceEstimate(t *testing.T) {
+	const segSize = int64(32)
+	// MinWALSize floor alone wants 1 segment; a distance estimate of 5
+	// segments' worth of bytes should win.
+	distanceBytes := float64(5 * segSize)
+	got := computeSpareSegments(segSize, 0 /* no max */, segSize, distanceBytes, 0)
+	// distance *= 1.10 fudge factor -> ceil(5*1.10) = 6 segments.
+	if want := 6; got != want {
+		t.Fatalf("computeSpareSegments with distance estimate = %d, want %d", got, want)
+	}
+}
+
+// TestComputeSpareSegmentsCapsAtMaxWALSize confirms MaxWALSize clamps the
+// distance-driven spares count back down, even when the distance estimate
+// alone would request more (mirrors upstream's maxSegNo clamp).
+func TestComputeSpareSegmentsCapsAtMaxWALSize(t *testing.T) {
+	const segSize = int64(32)
+	distanceBytes := float64(20 * segSize) // would want ~22 segments after the 1.10 fudge
+	got := computeSpareSegments(segSize, 3*segSize /* max */, segSize, distanceBytes, 0)
+	if want := 3; got != want {
+		t.Fatalf("computeSpareSegments with max_wal_size cap = %d, want %d", got, want)
+	}
+}
+
+// TestRemoveOldSegmentsWithEstimateHonoursDistanceAndMax is the
+// RemoveOldSegments-level integration counterpart to the
+// computeSpareSegments unit tests above: no MinWALSize floor is
+// configured, so only a wired distance estimate causes any recycling —
+// and MaxWALSize still caps it below what the raw estimate would request.
+func TestRemoveOldSegmentsWithEstimateHonoursDistanceAndMax(t *testing.T) {
+	walDir := filepath.Join(t.TempDir(), "pg_wal")
+	const segSize = 32
+	w, err := NewWriter(Config{WALDir: walDir, SegmentSize: segSize, MaxWALSize: 2 * segSize})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	for i := 0; i < 5; i++ {
+		if _, _, err := w.Append(make([]byte, 24)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Keep segment 3 onward (0,1,2 obsolete). Plain RemoveOldSegments
+	// (MinWALSize unset) would unlink all three.
+	keepLSN := uint64(3*segSize + 1)
+	distanceBytes := float64(10 * segSize) // would want far more than 3 obsolete segments exist
+	removed, recycled, err := w.RemoveOldSegmentsWithEstimate(keepLSN, distanceBytes, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// MaxWALSize=2 segments caps recycling at 2; the 3rd obsolete segment
+	// (the oldest) is unlinked instead.
+	if recycled != 2 {
+		t.Fatalf("recycled = %d, want 2 (capped by MaxWALSize)", recycled)
+	}
+	if removed != 1 {
+		t.Fatalf("removed = %d, want 1", removed)
 	}
 }
 
@@ -311,6 +509,54 @@ func TestSlotAwareRetainerPrunesBelowSlotHorizon(t *testing.T) {
 	}
 	if !equalStringSlices(got, want) {
 		t.Fatalf("segments after retain = %v, want %v", got, want)
+	}
+}
+
+// TestSlotAwareRetainerUsesCheckPointDistanceEstimateFn confirms Retain
+// routes through RemoveOldSegmentsWithEstimate (not the plain
+// MinWALSize-only RemoveOldSegments) whenever CheckPointDistanceEstimateFn
+// is wired — the production path main.go sets up alongside
+// (*Checkpointer).CheckPointDistanceEstimate. No MinWALSize/MaxWALSize is
+// configured on the writer, so any recycling observed can only have come
+// from the distance-estimate path.
+func TestSlotAwareRetainerUsesCheckPointDistanceEstimateFn(t *testing.T) {
+	walDir := filepath.Join(t.TempDir(), "pg_wal")
+	const segSize = 32
+	w, err := NewWriter(Config{WALDir: walDir, SegmentSize: segSize})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	for i := 0; i < 5; i++ {
+		if _, _, err := w.Append(make([]byte, 24)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	r := &SlotAwareRetainer{
+		Writer:                       w,
+		CheckPointDistanceEstimateFn: func() float64 { return 10 * segSize },
+	}
+	// Checkpoint sits at the start of segment 3 (0,1,2 obsolete).
+	if err := r.Retain(uint64(3*segSize + 1)); err != nil {
+		t.Fatal(err)
+	}
+	got := segmentNames(t, walDir)
+	// Every obsolete segment must have been recycled (renamed into a
+	// fresh future slot), not unlinked — proof the large distance
+	// estimate reached RemoveOldSegmentsWithEstimate, since plain
+	// RemoveOldSegments (MinWALSize unset) would have unlinked all three.
+	if len(got) != 5 {
+		t.Fatalf("segments after retain = %v, want 5 (3 kept + 2 recycled by keepSeg=3..7 slot fill)", got)
+	}
+	for _, name := range got {
+		segNo, ok := parseSegmentName(name)
+		if !ok {
+			t.Fatalf("unparseable segment name %q", name)
+		}
+		if segNo < 3 {
+			t.Fatalf("segment %s (segNo=%d) should have been recycled away, not left below keepSeg=3", name, segNo)
+		}
 	}
 }
 

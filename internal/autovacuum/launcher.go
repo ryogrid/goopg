@@ -178,11 +178,26 @@ func (l *Launcher) tick(ctx context.Context, log *slog.Logger) {
 	}
 }
 
+// loadTables returns every user table the launcher should consider for
+// autovacuum/analyze. l.Cat may be a wrapper (e.g. *catalog.SearchPathCatalog,
+// which scopes lookups to a connection's database) rather than the underlying
+// *catalog.InMemory. A bare `l.Cat.(*catalog.InMemory)` assertion silently
+// fails on such a wrapper and no-ops autovacuum entirely; instead peel the
+// Unwrap() chain until the concrete InMemory catalog is reached — the same
+// idiom used in internal/server/dispatch.go and internal/planner/planner.go.
 func (l *Launcher) loadTables() []*catalog.Table {
-	if c, ok := l.Cat.(*catalog.InMemory); ok {
-		return c.AllTables()
+	type unwrapper interface{ Unwrap() catalog.Catalog }
+	base := l.Cat
+	for {
+		if c, ok := base.(*catalog.InMemory); ok {
+			return c.AllTables()
+		}
+		if u, ok := base.(unwrapper); ok {
+			base = u.Unwrap()
+		} else {
+			return nil
+		}
 	}
-	return nil
 }
 
 // autovacuumFreezeMaxAge is the XID age at which autovacuum is forced for

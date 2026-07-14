@@ -230,3 +230,71 @@ func (s *SubtransSLRU) ScanParents() (map[storage.TransactionID]storage.Transact
 	}
 	return out, nil
 }
+
+// SubtransPagePrecedes reports whether SLRU page1 logically precedes page2 in
+// the wraparound-aware XID page space, analogous to CLOGPagePrecedes but
+// scaled to pg_subtrans's XIDs-per-page (subtransXactsPerPage instead of
+// clogXactsPerPage). Mirrors the page-comparison semantics SimpleLruTruncate
+// relies on (postgres/src/backend/access/transam/subtrans.c /
+// SlruPagePrecedesUnitTests) — see CLOGPagePrecedes for the shared reasoning.
+func SubtransPagePrecedes(page1, page2 int64) bool {
+	xid1 := storage.TransactionID(uint64(page1)*uint64(subtransXactsPerPage)) + FirstNormalTransactionID + 1
+	xid2 := storage.TransactionID(uint64(page2)*uint64(subtransXactsPerPage)) + FirstNormalTransactionID + 1
+	return txnPrecedes(xid1, xid2) &&
+		txnPrecedes(xid1, xid2+subtransXactsPerPage-1)
+}
+
+// TruncateBefore unlinks pg_subtrans/ segment files whose highest page
+// strictly precedes the SLRU page containing oldestXact (wraparound-aware via
+// SubtransPagePrecedes). The segment straddling oldestXact's page (and all
+// newer segments) is kept. Idempotent and safe to call repeatedly with the
+// same or an older XID.
+//
+// Mirrors PG subtrans.c:TruncateSUBTRANS(oldestXact), with one deliberate
+// difference: upstream never WAL-logs this truncation because pg_subtrans is
+// disposable across a crash (StartupSUBTRANS just zeroes the active page on
+// restart). goopg persists pg_subtrans across a restart (gap G5, see
+// SubxactMap's doc comment) by design, but the truncation itself still needs
+// no WAL record: a crash between removing segments here simply leaves a few
+// extra, already-truncatable segment files on disk, retried at the next
+// checkpoint — never a correctness hazard, since a caller must never consult
+// a parent link for an XID below the horizon its own snapshot logic already
+// treats as long-since resolved (see SubxactMap.Truncate's doc comment).
+func (s *SubtransSLRU) TruncateBefore(oldestXact storage.TransactionID) error {
+	if oldestXact < FirstNormalTransactionID {
+		return nil // never truncate the bootstrap/frozen range
+	}
+	cutoffPage := int64(uint64(oldestXact) / uint64(subtransXactsPerPage))
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	entries, err := os.ReadDir(s.dir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("subtrans slru: readdir %q: %w", s.dir, err)
+	}
+	const pagesPerSeg = int64(subtransPagesPerSegment)
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || len(name) != 4 {
+			continue
+		}
+		segNo, ok := parseSLRUSegName(name)
+		if !ok {
+			continue
+		}
+		// The highest page held by this segment.
+		lastPageOfSeg := segNo*pagesPerSeg + (pagesPerSeg - 1)
+		// Removable iff the segment's last page strictly precedes the cutoff
+		// page — i.e. the entire segment is older than oldestXact's page.
+		if SubtransPagePrecedes(lastPageOfSeg, cutoffPage) {
+			if err := os.Remove(filepath.Join(s.dir, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("subtrans slru: remove %q: %w", name, err)
+			}
+		}
+	}
+	return nil
+}

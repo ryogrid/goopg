@@ -445,6 +445,51 @@ func TestPgIndexesView(t *testing.T) {
 	}
 }
 
+// TestPgIndexIndclassIndcollation pins the M0122-0007 follow-up fix:
+// pg_index.indclass/indcollation must resolve an index's explicit
+// ColOpClasses/ColCollations (a `CREATE INDEX ... (col opclass COLLATE
+// coll)` column spec) rather than always rendering the column type's
+// default opclass and an all-zero collation vector.
+func TestPgIndexIndclassIndcollation(t *testing.T) {
+	c := NewInMemory()
+	tbl, err := c.CreateTable(parser.ObjectName{Name: "docs"}, []Column{
+		{Name: "id", Type: Type{Name: "int4"}},
+		{Name: "body", Type: Type{Name: "text"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	idx, err := c.CreateIndex(parser.ObjectName{Name: "docs_body_idx"}, tbl, []string{"id", "body"}, false, "btree", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// id gets no explicit opclass/collation (default-type fallback);
+	// body is explicitly `text_pattern_ops COLLATE "C"`.
+	idx.ColOpClasses = []string{"", "text_pattern_ops"}
+	idx.ColCollations = []string{"", "C"}
+
+	view, ok := c.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_index"})
+	if !ok {
+		t.Fatal("LookupTable(pg_catalog.pg_index) failed")
+	}
+	var row []string
+	for _, r := range view.VirtualRows() {
+		if r[0] == strconv.FormatUint(uint64(idx.OID), 10) {
+			row = r
+		}
+	}
+	if row == nil {
+		t.Fatalf("no pg_index row for index oid=%d", idx.OID)
+	}
+	// column order: ... indkey(15) indcollation(16) indclass(17) ...
+	if got, want := row[17], "1978 4217"; got != want {
+		t.Errorf("indclass=%q want %q (int4_ops default, explicit text_pattern_ops)", got, want)
+	}
+	if got, want := row[16], "0 950"; got != want {
+		t.Errorf("indcollation=%q want %q (id not collatable, body COLLATE \"C\")", got, want)
+	}
+}
+
 // TestSystemCatalogOIDConstants verifies the fixed OIDs match upstream's
 // values so ODBC/JDBC metadata probes that look up by numeric OID see the
 // expected numbers.
@@ -574,6 +619,120 @@ func TestPgSettingsEnableGUCsCompleteAndSorted(t *testing.T) {
 		if got[i] != want[i] {
 			t.Errorf("enable_* GUC[%d] = %q, want %q", i, got[i], want[i])
 		}
+	}
+}
+
+// TestPgSettingsPlannerTuningGUCs pins the GEQO family + other planner-tuning
+// GUCs (QUERY_TUNING_GEQO / QUERY_TUNING_OTHER) in the pg_settings virtual
+// table. They are registered in internal/config/defaults.go (so SET/SHOW work)
+// but pg_settings is a separately hand-maintained literal list, so a real-PG
+// script issuing `SELECT * FROM pg_settings WHERE name = 'geqo_threshold'`
+// would find nothing until these rows exist too. M0122-0007 follow-up.
+func TestPgSettingsPlannerTuningGUCs(t *testing.T) {
+	c := NewInMemory()
+	tbl, ok := c.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_settings"})
+	if !ok || tbl.VirtualRows == nil {
+		t.Fatal("pg_settings virtual table not registered")
+	}
+	byName := map[string][]string{}
+	for _, row := range tbl.VirtualRows() {
+		byName[row[0]] = row
+	}
+	// name -> {setting(1), category(3), vartype(7), boot_val(12)} spot-checks.
+	// Columns per the pg_settings table definition; setting == boot_val at
+	// default source.
+	want := []struct {
+		name, setting, category, vartype string
+	}{
+		{"geqo", "on", "Query Tuning / Genetic Query Optimizer", "bool"},
+		{"geqo_threshold", "12", "Query Tuning / Genetic Query Optimizer", "integer"},
+		{"geqo_effort", "5", "Query Tuning / Genetic Query Optimizer", "integer"},
+		{"geqo_pool_size", "0", "Query Tuning / Genetic Query Optimizer", "integer"},
+		{"geqo_generations", "0", "Query Tuning / Genetic Query Optimizer", "integer"},
+		{"geqo_selection_bias", "2", "Query Tuning / Genetic Query Optimizer", "real"},
+		{"geqo_seed", "0", "Query Tuning / Genetic Query Optimizer", "real"},
+		{"constraint_exclusion", "partition", "Query Tuning / Other Planner Options", "enum"},
+		{"cursor_tuple_fraction", "0.1", "Query Tuning / Other Planner Options", "real"},
+		{"recursive_worktable_factor", "10", "Query Tuning / Other Planner Options", "real"},
+	}
+	for _, w := range want {
+		row, ok := byName[w.name]
+		if !ok {
+			t.Errorf("pg_settings missing GUC %q", w.name)
+			continue
+		}
+		if row[1] != w.setting {
+			t.Errorf("%s: setting = %q, want %q", w.name, row[1], w.setting)
+		}
+		if row[3] != w.category {
+			t.Errorf("%s: category = %q, want %q", w.name, row[3], w.category)
+		}
+		if row[7] != w.vartype {
+			t.Errorf("%s: vartype = %q, want %q", w.name, row[7], w.vartype)
+		}
+		if row[12] != w.setting {
+			t.Errorf("%s: boot_val = %q, want %q (== setting at default source)", w.name, row[12], w.setting)
+		}
+		if row[8] != "default" {
+			t.Errorf("%s: source = %q, want %q", w.name, row[8], "default")
+		}
+	}
+	// constraint_exclusion is the only enum here; its enumvals must render the
+	// PG `{partition,on,off}` set (pg_settings.enumvals is column 11).
+	if row := byName["constraint_exclusion"]; row != nil && row[11] != "{partition,on,off}" {
+		t.Errorf("constraint_exclusion: enumvals = %q, want %q", row[11], "{partition,on,off}")
+	}
+}
+
+// TestPgSettingsObjectDefaultGUCs pins the three object-creation default GUCs
+// (default_table_access_method / default_tablespace / default_toast_compression)
+// in the pg_settings virtual view. pg_dump/pg_restore emit `SET
+// default_tablespace`/`default_table_access_method` before every CREATE TABLE,
+// and pg_settings-reading tooling expects the rows present with PG's byte-exact
+// category/vartype/boot_val. M0122-0007 follow-up.
+func TestPgSettingsObjectDefaultGUCs(t *testing.T) {
+	c := NewInMemory()
+	tbl, ok := c.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_settings"})
+	if !ok || tbl.VirtualRows == nil {
+		t.Fatal("pg_settings virtual table not registered")
+	}
+	byName := map[string][]string{}
+	for _, row := range tbl.VirtualRows() {
+		byName[row[0]] = row
+	}
+	want := []struct {
+		name, setting, category, vartype string
+	}{
+		{"default_table_access_method", "heap", "Client Connection Defaults / Statement Behavior", "string"},
+		{"default_tablespace", "", "Client Connection Defaults / Statement Behavior", "string"},
+		{"default_toast_compression", "pglz", "Client Connection Defaults / Statement Behavior", "enum"},
+	}
+	for _, w := range want {
+		row, ok := byName[w.name]
+		if !ok {
+			t.Errorf("pg_settings missing GUC %q", w.name)
+			continue
+		}
+		if row[1] != w.setting {
+			t.Errorf("%s: setting = %q, want %q", w.name, row[1], w.setting)
+		}
+		if row[3] != w.category {
+			t.Errorf("%s: category = %q, want %q", w.name, row[3], w.category)
+		}
+		if row[7] != w.vartype {
+			t.Errorf("%s: vartype = %q, want %q", w.name, row[7], w.vartype)
+		}
+		if row[12] != w.setting {
+			t.Errorf("%s: boot_val = %q, want %q (== setting at default source)", w.name, row[12], w.setting)
+		}
+		if row[8] != "default" {
+			t.Errorf("%s: source = %q, want %q", w.name, row[8], "default")
+		}
+	}
+	// default_toast_compression is the only enum here; its enumvals must render
+	// the PG `{pglz,lz4}` set (--with-lz4 reference build; column 11).
+	if row := byName["default_toast_compression"]; row != nil && row[11] != "{pglz,lz4}" {
+		t.Errorf("default_toast_compression: enumvals = %q, want %q", row[11], "{pglz,lz4}")
 	}
 }
 

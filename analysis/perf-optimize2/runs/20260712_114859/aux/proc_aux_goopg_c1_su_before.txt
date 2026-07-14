@@ -1,0 +1,9 @@
+ts=1783831432.944141163
+stat: 1743 1295 0 0
+rchar: 36541946308
+wchar: 63389
+syscr: 4664
+syscw: 143
+read_bytes: 0
+write_bytes: 77824
+cancelled_write_bytes: 8192

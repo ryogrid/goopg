@@ -78,6 +78,16 @@ type joinOp struct {
 	lazyVirtualOut    *VirtualSlot
 	lazyOuterOnlySlot *MaterializedSlot
 
+	// M0122-0011: NullAware (NOT IN) anti-join build-side state,
+	// computed once in openLazyHashJoin's build loop. Real NOT IN
+	// three-valued-NULL semantics only depend on whether the
+	// subquery produced ANY row and whether ANY of its keys was
+	// NULL — not on the row values themselves — so a single pair of
+	// flags (checked before the per-probe-row hash lookup in
+	// nextLazy) is enough; see the Join.NullAware doc comment.
+	antiBuildRows     int  // total right-side rows seen during build
+	antiBuildHasNull  bool // any right-side row's join key was NULL
+
 	// M0100-0010: ctid captured per left-row during eager NL drain so
 	// lockRowsOp can stamp tuple locks after the scan is closed.
 	leftCTIDs     []joinRowCTID
@@ -403,6 +413,8 @@ func (o *joinOp) openLazyHashJoin(ctx *Context) error {
 	rightWidth := len(o.right.Schema())
 	o.lazyLW = leftWidth
 	o.lazyRW = rightWidth
+	o.antiBuildRows = 0
+	o.antiBuildHasNull = false
 	budget := ctx.WorkMem
 	if budget <= 0 {
 		budget = 512 * 1024 * 1024 // default 512 MiB
@@ -510,7 +522,15 @@ func (o *joinOp) openLazyHashJoin(ctx *Context) error {
 		copy(keyRow[leftWidth:], r)
 		key, ok, err := o.evalHashKey(o.plan.RightKey, keyRow)
 		if err != nil { return err }
-		if !ok { continue }
+		if o.plan.NullAware {
+			o.antiBuildRows++
+		}
+		if !ok {
+			if o.plan.NullAware {
+				o.antiBuildHasNull = true
+			}
+			continue
+		}
 		if o.lazyHash == nil { o.lazyHash = make(map[string][]Row) }
 		o.lazyHash[key] = append(o.lazyHash[key], r)
 	}
@@ -866,6 +886,31 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 			return nil, &ExecError{Code: "57014", Message: "canceling statement due to user request"}
 		}
 	}
+	// M0122-0011: `x NOT IN (subquery)` three-valued-NULL semantics
+	// collapse to one of two constants, independent of x, whenever
+	// the subquery side is empty or contains a NULL — real per-row
+	// hash probing would give the wrong answer in both cases (see
+	// the Join.NullAware doc comment), so short-circuit instead:
+	//   - subquery produced zero rows: `x NOT IN ()` is TRUE for
+	//     every x (even NULL x) — emit every probe row unconditionally.
+	//   - subquery produced a NULL key: `x NOT IN (...)` is
+	//     NULL/false for every x — emit nothing.
+	if o.plan.Type == planner.JoinTypeAnti && o.plan.NullAware {
+		if o.antiBuildHasNull {
+			return nil, EOF
+		}
+		if o.antiBuildRows == 0 {
+			probeSlot, err := o.lazyProbe.Next()
+			if err == EOF {
+				return nil, EOF
+			}
+			if err != nil {
+				return nil, err
+			}
+			o.lazyOuterOnlySlot.row = slotRow(probeSlot)
+			return o.lazyOuterOnlySlot, nil
+		}
+	}
 	for {
 		// Continue serving matches from current probe row. Apply
 		// the full join Predicate per emitted row — hash matching
@@ -959,6 +1004,16 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 		//   - Semi: skip the probe row (no match).
 		//   - Anti: keep the probe row (matches PostgreSQL
 		//     `NOT EXISTS` semantics — equality cannot be true).
+		//
+		// M0122-0011: NullAware Anti (NOT IN) is the one exception —
+		// a NULL outer/probe value means `x IN (non-empty subquery)`
+		// evaluates to NULL, so `NOT IN` is NULL too and the row is
+		// excluded, not kept. The build-empty/build-has-NULL cases
+		// were already short-circuited above this loop, so reaching
+		// here means the subquery is non-empty and NULL-free.
+		if !ok && o.plan.Type == planner.JoinTypeAnti && o.plan.NullAware {
+			continue
+		}
 		//
 		// M0071-0009: hash matches are necessary but not
 		// sufficient — the planner may have lifted residual
@@ -2968,11 +3023,13 @@ func datumKey(d Datum) string {
 		b = strconv.AppendInt(b, d.TimeValue().UnixNano(), 10)
 		return string(b)
 	case KindInterval:
-		var buf [32]byte
+		var buf [48]byte
 		b := append(buf[:0], 'v', ':')
 		b = strconv.AppendInt(b, int64(d.IntervalMonthsValue()), 10)
 		b = append(b, ':')
 		b = strconv.AppendInt(b, int64(d.IntervalDaysValue()), 10)
+		b = append(b, ':')
+		b = strconv.AppendInt(b, d.IntervalMicrosValue(), 10)
 		return string(b)
 	}
 	return fmt.Sprintf("k:%d", d.Kind)

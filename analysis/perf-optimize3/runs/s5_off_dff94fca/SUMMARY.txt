@@ -1,0 +1,17 @@
+RUN_ID=s5_off_dff94fca  scale=100 c=50 T=120
+--- goopg_S ---
+latency average = 0.538 ms
+latency stddev = 2.440 ms
+tps = 92808.727914 (without initial connection time)
+--- goopg_N ---
+latency average = 18.597 ms
+latency stddev = 9.888 ms
+tps = 2688.516257 (without initial connection time)
+--- pg_S ---
+latency average = 0.254 ms
+latency stddev = 1.426 ms
+tps = 196308.962182 (without initial connection time)
+--- pg_N ---
+latency average = 3.164 ms
+latency stddev = 0.954 ms
+tps = 15796.215228 (without initial connection time)

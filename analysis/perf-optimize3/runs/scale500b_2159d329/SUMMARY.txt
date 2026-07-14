@@ -1,0 +1,17 @@
+RUN_ID=scale500b_2159d329  scale=500 c=50 T=120
+--- goopg_S ---
+latency average = 0.585 ms
+latency stddev = 2.591 ms
+tps = 85324.295879 (without initial connection time)
+--- goopg_N ---
+latency average = 7.541 ms
+latency stddev = 11.943 ms
+tps = 6629.864485 (without initial connection time)
+--- pg_S ---
+latency average = 0.310 ms
+latency stddev = 1.138 ms
+tps = 160866.702774 (without initial connection time)
+--- pg_N ---
+latency average = 3.938 ms
+latency stddev = 9.901 ms
+tps = 12694.028966 (without initial connection time)

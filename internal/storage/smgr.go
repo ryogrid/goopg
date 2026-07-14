@@ -6,7 +6,10 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
+
+	"github.com/goopg/goopg/internal/config"
 )
 
 // Manager is the storage manager. It owns one open file per loaded
@@ -45,6 +48,17 @@ type AIOSubmitOp struct {
 	// path) the engine surfaces through pg_aios.target_desc.
 	// Empty leaves the column blank.
 	Target string
+	// OnComplete, if set, is called exactly once when this op's
+	// I/O actually finishes — on the engine's completion path,
+	// independent of whether/when the caller invokes the
+	// returned AIOHandle's Wait. Manager.PrefetchBlock and
+	// Manager.WriteBlockAIO set this to release the per-(rel,
+	// block) latch relFile.lockBlock acquired before Submit, so
+	// a concurrent synchronous readBlock/writeBlock (or another
+	// AIO op) on the SAME block waits for the real completion,
+	// not just until the caller gets around to Wait. See
+	// docs/design/0009-0006-aio-io-uring.md.
+	OnComplete func()
 }
 
 // AIODirection mirrors aio.Direction without taking the import.
@@ -201,7 +215,8 @@ func (m *Manager) PrefetchBlock(rel RelFileNode, blk BlockNumber, buf []byte) (A
 		// Synchronous fallback: run the read inline and hand
 		// back a pre-completed handle. Keeps callers'
 		// Submit/Wait code path identical regardless of
-		// whether the engine is attached.
+		// whether the engine is attached. readBlock takes its
+		// own per-block latch, so no explicit lockBlock here.
 		err := f.readBlock(blk, buf)
 		var n int
 		if err == nil {
@@ -209,11 +224,19 @@ func (m *Manager) PrefetchBlock(rel RelFileNode, blk BlockNumber, buf []byte) (A
 		}
 		return preCompletedHandle{n: n, err: err}, nil
 	}
+	// The AIO engine's raw-fd path (methodIOUring) bypasses
+	// f.mu entirely, so lockBlock is this op's ONLY
+	// serialization against a concurrent synchronous
+	// readBlock/writeBlock or another AIO op on the same block.
+	// Released by OnComplete when the read actually finishes —
+	// not merely when the caller gets around to Wait.
+	unlock := f.lockBlock(blk)
 	return eng.Submit(AIOSubmitOp{
-		File:   f,
-		Buffer: buf,
-		Offset: off,
-		Target: f.path,
+		File:       f,
+		Buffer:     buf,
+		Offset:     off,
+		Target:     f.path,
+		OnComplete: unlock,
 	}), nil
 }
 
@@ -257,6 +280,8 @@ func (m *Manager) WriteBlockAIO(rel RelFileNode, blk BlockNumber, buf []byte) (A
 	eng := m.aio
 	m.mu.Unlock()
 	if eng == nil {
+		// writeBlock takes its own per-block latch, so no
+		// explicit lockBlock here.
 		err := f.writeBlock(blk, buf)
 		var n int
 		if err == nil {
@@ -264,12 +289,18 @@ func (m *Manager) WriteBlockAIO(rel RelFileNode, blk BlockNumber, buf []byte) (A
 		}
 		return preCompletedHandle{n: n, err: err}, nil
 	}
+	// See PrefetchBlock's comment: lockBlock is this op's ONLY
+	// serialization against a concurrent synchronous access or
+	// another AIO op on the same block, since the engine's
+	// raw-fd path bypasses f.mu entirely.
+	unlock := f.lockBlock(blk)
 	return eng.Submit(AIOSubmitOp{
-		File:      f,
-		Buffer:    buf,
-		Offset:    off,
-		Direction: AIODirWrite,
-		Target:    f.path,
+		File:       f,
+		Buffer:     buf,
+		Offset:     off,
+		Direction:  AIODirWrite,
+		Target:     f.path,
+		OnComplete: unlock,
 	}), nil
 }
 
@@ -418,7 +449,7 @@ func (m *Manager) Exists(rel RelFileNode) bool {
 // can build the upstream-verbatim `could not open file "%s"` message when a
 // fork is found missing (the pg_amcheck heap file-removal corruption scenario).
 func (m *Manager) RelPath(rel RelFileNode) string {
-	base := sharedOrPerDBRelDir(rel.DBOid)
+	base := relDir(rel)
 	switch rel.Fork {
 	case MainFork:
 		return base + "/" + fmt.Sprint(rel.RelOid)
@@ -497,6 +528,25 @@ func (m *Manager) DropRelation(rel RelFileNode) error {
 	return nil
 }
 
+// CloseRelation closes rel's cached open file handle (if any) WITHOUT
+// removing the underlying file — unlike DropRelation, which does both. Used
+// by ALTER TABLE/INDEX ... SET TABLESPACE's physical relocation (M0122-0007):
+// once a relation's file has been copied to its new tablespace-scoped path
+// and the catalog durably points there, the OLD RelFileNode's cached handle
+// must be forgotten so a subsequent access under the (already-evicted, per
+// Pool.FlushRel+InvalidateRel) old tag can't accidentally reopen/reuse it;
+// the actual old file removal is a separate best-effort cleanup step the
+// caller performs itself (os.Remove), since a failure to clean up an orphan
+// is harmless but closing the wrong handle is not.
+func (m *Manager) CloseRelation(rel RelFileNode) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if f, ok := m.files[rel]; ok {
+		_ = f.f.Close()
+		delete(m.files, rel)
+	}
+}
+
 // TruncateRelation truncates rel's backing file to zero blocks. The
 // caller is responsible for invalidating buffer-pool slots that hold
 // pages of rel before calling this.
@@ -558,8 +608,24 @@ func sharedOrPerDBRelDir(dbOid uint32) string {
 	return "base/" + fmt.Sprint(dbOid)
 }
 
+// relDir returns the directory (forward-slash-joined, relative to the data
+// dir) a RelFileNode's files live under. TblOid==0 (pg_default/pg_global —
+// see catalog.Table.Tablespace's "0 means default" convention) keeps the
+// pre-existing base/<dbOid> (or global/) layout. A non-zero TblOid routes
+// through pg_tblspc/<TblOid>/<version dir>/<dbOid>, mirroring upstream's
+// relpath() tablespace branch and the directory execCreateTablespace already
+// creates (internal/executor/operators_ddl.go). M0122-0007 tablespace
+// physical relocation.
+func relDir(rel RelFileNode) string {
+	if rel.TblOid == 0 {
+		return sharedOrPerDBRelDir(rel.DBOid)
+	}
+	return "pg_tblspc/" + strconv.FormatUint(uint64(rel.TblOid), 10) + "/" +
+		config.TablespaceVersionDirectory + "/" + fmt.Sprint(rel.DBOid)
+}
+
 func (m *Manager) relPath(rel RelFileNode) string {
-	base := filepath.Join(m.cfg.DataDir, sharedOrPerDBRelDir(rel.DBOid))
+	base := filepath.Join(m.cfg.DataDir, relDir(rel))
 	switch rel.Fork {
 	case MainFork:
 		return filepath.Join(base, fmt.Sprint(rel.RelOid))
@@ -635,6 +701,51 @@ type relFile struct {
 	checksums      bool
 	ignoreChecksum bool
 	onChecksumFail func(rel RelFileNode, blk BlockNumber)
+
+	// blockMu guards blockBusy, the per-(rel,block) in-flight
+	// registry that serializes an AIO op (which bypasses mu
+	// entirely on methodIOUring's raw-fd path — see
+	// docs/design/0009-0006-aio-io-uring.md) against a
+	// concurrent synchronous readBlock/writeBlock, or another
+	// AIO op, on the SAME block. Deliberately separate from mu
+	// (which still serializes the whole file's synchronous ops
+	// among themselves) so cross-block AIO parallelism is never
+	// reduced to file-wide serialization.
+	blockMu   sync.Mutex
+	blockBusy map[BlockNumber]chan struct{}
+}
+
+// lockBlock blocks until no other operation (synchronous or AIO)
+// is registered against blk on this relFile, then registers blk
+// as busy and returns a release func the caller MUST call exactly
+// once to unblock any waiters. readBlock/writeBlock hold it for
+// their whole body; Manager.PrefetchBlock/WriteBlockAIO hold it
+// from Submit until the AIOSubmitOp's OnComplete fires (the AIO
+// op's real completion, not merely the caller's Wait).
+func (r *relFile) lockBlock(blk BlockNumber) func() {
+	for {
+		r.blockMu.Lock()
+		ch, busy := r.blockBusy[blk]
+		if !busy {
+			done := make(chan struct{})
+			if r.blockBusy == nil {
+				r.blockBusy = make(map[BlockNumber]chan struct{})
+			}
+			r.blockBusy[blk] = done
+			r.blockMu.Unlock()
+			var once sync.Once
+			return func() {
+				once.Do(func() {
+					r.blockMu.Lock()
+					delete(r.blockBusy, blk)
+					r.blockMu.Unlock()
+					close(done)
+				})
+			}
+		}
+		r.blockMu.Unlock()
+		<-ch
+	}
 }
 
 // ReadAt is the engine-facing offset-shaped read. The relFile
@@ -675,6 +786,35 @@ func (r *relFile) WriteAt(p []byte, off int64) (int, error) {
 	return r.f.WriteAt(p, off)
 }
 
+// PrepareWrite implements aio.ChecksumFile (structurally — storage
+// deliberately does not import internal/aio, see the AIOEngine
+// comment above). The io_uring method's raw-fd write path submits
+// straight to the kernel by file descriptor, bypassing WriteAt
+// entirely; without this hook a checksummed cluster would write
+// blocks through io_uring with a stale/garbage pd_checksum that
+// every later checksum-verifying read (including the ordinary
+// synchronous ReadAt path) would then reject as corrupt. Mirrors
+// WriteAt's own off%BlockSize-aligned, full-block-length gate.
+func (r *relFile) PrepareWrite(buf []byte, off int64) []byte {
+	if r.checksums && len(buf) == BlockSize && off%BlockSize == 0 {
+		return r.checksummedForWrite(BlockNumber(off/BlockSize), buf)
+	}
+	return buf
+}
+
+// VerifyRead implements aio.ChecksumFile, the read-side twin of
+// PrepareWrite: the io_uring method's raw-fd read path bypasses
+// ReadAt entirely, so without this hook a checksummed cluster
+// would silently skip verification (and OnChecksumFailure
+// reporting) for every read issued that way. Mirrors ReadAt's own
+// off%BlockSize-aligned, full-block-length gate.
+func (r *relFile) VerifyRead(buf []byte, off int64) error {
+	if r.checksums && len(buf) == BlockSize && off%BlockSize == 0 {
+		return r.verifyOnRead(BlockNumber(off/BlockSize), buf)
+	}
+	return nil
+}
+
 // Fd exposes the underlying *os.File's kernel descriptor so an
 // AIO method that talks to the kernel directly (notably
 // io_uring) can submit ops by fd. The mutex above is the
@@ -684,6 +824,8 @@ func (r *relFile) WriteAt(p []byte, off int64) (int, error) {
 func (r *relFile) Fd() uintptr { return r.f.Fd() }
 
 func (r *relFile) readBlock(blk BlockNumber, buf []byte) error {
+	unlock := r.lockBlock(blk)
+	defer unlock()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if blk >= r.nblocks {
@@ -702,6 +844,8 @@ func (r *relFile) readBlock(blk BlockNumber, buf []byte) error {
 }
 
 func (r *relFile) writeBlock(blk BlockNumber, buf []byte) error {
+	unlock := r.lockBlock(blk)
+	defer unlock()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if blk >= r.nblocks {

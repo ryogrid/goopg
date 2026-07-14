@@ -276,35 +276,48 @@ func TestPreallocationCounters(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer w.Close()
+		// eagerWG.Wait pins down the eager next-segment lookahead
+		// follow-up (M0007): openSegment now also kicks off a
+		// background preallocation of segNo+1 as soon as segNo opens
+		// for real use, so counts settle one segment ahead of what a
+		// pre-eager-lookahead reader would expect. Waiting here makes
+		// the assertions deterministic instead of racing the
+		// background goroutine (it happened to always lose that race
+		// in practice, but nothing guarantees that).
 		if _, _, err := w.Append([]byte("short")); err != nil {
 			t.Fatal(err)
 		}
-		if got := w.SegmentsPreallocated(); got != 1 {
-			t.Errorf("SegmentsPreallocated=%d want 1 after first segment", got)
+		w.stateRef.eagerWG.Wait()
+		if got := w.SegmentsPreallocated(); got != 2 {
+			t.Errorf("SegmentsPreallocated=%d want 2 after first segment (segment 0 itself + eager segment 1)", got)
 		}
-		if got := w.PreallocatedBytes(); got != segSize {
-			t.Errorf("PreallocatedBytes=%d want %d after first segment", got, segSize)
+		if got := w.PreallocatedBytes(); got != 2*segSize {
+			t.Errorf("PreallocatedBytes=%d want %d after first segment", got, 2*segSize)
 		}
 		// Re-opening the same (already preallocated) segment must not
 		// double-count: openSegment's wasNew branch only fires on
-		// first-time creation.
+		// first-time creation, and the cached-file fast path skips
+		// the eager-lookahead trigger too (no re-trigger for segment 1).
 		if _, _, err := w.Append([]byte("more")); err != nil {
 			t.Fatal(err)
 		}
-		if got := w.SegmentsPreallocated(); got != 1 {
-			t.Errorf("SegmentsPreallocated=%d want 1 still (no re-preallocation)", got)
+		w.stateRef.eagerWG.Wait()
+		if got := w.SegmentsPreallocated(); got != 2 {
+			t.Errorf("SegmentsPreallocated=%d want 2 still (no re-preallocation)", got)
 		}
-		// Force a rollover into segment 1 with a big payload; its
-		// first write must bump the counters again.
+		// Force a rollover into segment 1 (already eagerly preallocated
+		// above, so this doesn't bump the counter itself) with a big
+		// payload; opening it for real use eagerly kicks off segment 2.
 		big := make([]byte, segSize)
 		if _, _, err := w.Append(big); err != nil {
 			t.Fatal(err)
 		}
-		if got := w.SegmentsPreallocated(); got != 2 {
-			t.Errorf("SegmentsPreallocated=%d want 2 after rollover", got)
+		w.stateRef.eagerWG.Wait()
+		if got := w.SegmentsPreallocated(); got != 3 {
+			t.Errorf("SegmentsPreallocated=%d want 3 after rollover (segment 1 was already eager; segment 2 now eagerly preallocated too)", got)
 		}
-		if got := w.PreallocatedBytes(); got != 2*segSize {
-			t.Errorf("PreallocatedBytes=%d want %d after rollover", got, 2*segSize)
+		if got := w.PreallocatedBytes(); got != 3*segSize {
+			t.Errorf("PreallocatedBytes=%d want %d after rollover", got, 3*segSize)
 		}
 	})
 }

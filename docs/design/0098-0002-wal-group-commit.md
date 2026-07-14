@@ -1,6 +1,12 @@
 # Design: WAL Group Commit (M0098-0002)
 
-**Status**: accepted  
+**Status**: superseded (2026-07-12) by
+[`docs/design/wal-backend-flush/`](wal-backend-flush/) — the queue +
+dedicated-writer-goroutine group commit described here was replaced by
+PostgreSQL-parity backend-driven flush (each committing backend performs its own
+write+fdatasync under the WAL write lock; group commit is emergent). The
+`state.loop` writer goroutine, `flushGroup` queue, and `handleGroupFlush` were
+deleted in slice 6 of that bundle.  
 **Milestone**: M0098-0002 — WAL group commit  
 **Expected gain**: 8–15× TPS for Simple Update; 5–10× for Standard
 

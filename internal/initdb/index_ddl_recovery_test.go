@@ -272,6 +272,53 @@ func TestCreateIndexPredicateAndIncludeColumnsSurviveCheckpointedRestart(t *test
 	}
 }
 
+// TestCreateIndexOpclassAndCollationSurviveCheckpointedRestart pins the
+// M0122-0006 follow-up 3 fix: a checkpointed restart (graceful Close, not a
+// crash) previously reverted an index's declared opclass/collation to the
+// column type's plain default, because DecodePGIndexPhysicalRow never
+// decoded indclass/indcollation and loadUserIndexesFromHeap always passed
+// nil for ColOpClasses/ColCollations. The WAL-replay crash-recovery path was
+// never affected — wal.CreateIndexPayload already carried the name strings
+// directly — so this test forces the heap-scan recovery path via a graceful
+// Close, mirroring TestCreateIndexPredicateAndIncludeColumnsSurviveCheckpointedRestart.
+func TestCreateIndexOpclassAndCollationSurviveCheckpointedRestart(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	if err := Init(Options{DataDir: dir}); err != nil {
+		t.Fatal(err)
+	}
+
+	rt1, err := Open(OpenOptions{DataDir: dir, PoolSlots: 64})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runDDL(t, rt1, "CREATE TABLE ext4 (a int4, body text, note varchar(40))")
+	runDDL(t, rt1, `CREATE INDEX ext4_idx ON ext4 (body text_pattern_ops, note COLLATE "C" varchar_pattern_ops)`)
+
+	// Graceful shutdown: Runtime.Close performs a synchronous checkpoint
+	// (M0089-0002), flushing the pg_index heap page — recovery on the next
+	// Open is won by loadUserIndexesFromHeap, not WAL replay.
+	if err := rt1.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	rt2, err := Open(OpenOptions{DataDir: dir, PoolSlots: 64})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt2.Close()
+
+	idx, ok := rt2.Catalog.LookupIndex(parser.ObjectName{Name: "ext4_idx"})
+	if !ok {
+		t.Fatal("ext4_idx not found after restart — heap-driven index recovery failed")
+	}
+	if len(idx.ColOpClasses) != 2 || idx.ColOpClasses[0] != "text_pattern_ops" || idx.ColOpClasses[1] != "varchar_pattern_ops" {
+		t.Errorf("recovered ColOpClasses = %v, want [text_pattern_ops varchar_pattern_ops]", idx.ColOpClasses)
+	}
+	if len(idx.ColCollations) != 2 || idx.ColCollations[0] != "" || idx.ColCollations[1] != "C" {
+		t.Errorf("recovered ColCollations = %v, want [\"\" C]", idx.ColCollations)
+	}
+}
+
 // TestDropIndexSurvivesRestartViaWAL pins the symmetric DROP
 // path: a CREATE INDEX followed by DROP INDEX must NOT
 // resurrect the index from WAL on restart. (M0079-0001.)

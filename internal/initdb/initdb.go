@@ -315,17 +315,37 @@ type Options struct {
 	Registry *config.Registry
 }
 
-// Init lays out the data directory according to opts.
-// createPerDatabaseScaffolding creates base/<dbOID>/ and writes
+// CreatePerDatabaseScaffolding creates base/<dbOID>/ and writes
 // base/<dbOID>/PG_VERSION so upstream PG ValidatePgVersion passes.
-// Must be called for every database OID seeded in pg_database.
-func createPerDatabaseScaffolding(dataDir string, dbOID uint32) error {
+// Called for every database OID seeded in pg_database at Init time, and
+// again by CREATE DATABASE (internal/server) and its WAL-replay recovery
+// path (M0122-0007 physical-storage-isolation slice 2) for a newly
+// allocated dboid. Idempotent — os.MkdirAll/os.WriteFile both tolerate an
+// already-existing directory/file, so replaying the same CREATE DATABASE
+// record twice (or re-running after a crash between mkdir and the WAL
+// append that makes it durable) is always safe.
+func CreatePerDatabaseScaffolding(dataDir string, dbOID uint32) error {
 	dbDir := filepath.Join(dataDir, "base", strconv.FormatUint(uint64(dbOID), 10))
 	if err := os.MkdirAll(dbDir, 0o700); err != nil {
 		return fmt.Errorf("create base/%d: %w", dbOID, err)
 	}
 	if err := os.WriteFile(filepath.Join(dbDir, "PG_VERSION"), []byte(CatalogVersion+"\n"), 0o600); err != nil {
 		return fmt.Errorf("write base/%d/PG_VERSION: %w", dbOID, err)
+	}
+	return nil
+}
+
+// RemovePerDatabaseScaffolding removes base/<dbOID>/ (the symmetric
+// counterpart to CreatePerDatabaseScaffolding), called by DROP DATABASE
+// (internal/server) and its WAL-replay recovery path once the drop is
+// durable (M0122-0007 physical-storage-isolation slice 3). A missing
+// directory is not an error — os.RemoveAll is a no-op in that case, which
+// matters for replay: a crash between the removal and the DROP DATABASE
+// WAL record becoming durable must not turn a replay into a hard failure.
+func RemovePerDatabaseScaffolding(dataDir string, dbOID uint32) error {
+	dbDir := filepath.Join(dataDir, "base", strconv.FormatUint(uint64(dbOID), 10))
+	if err := os.RemoveAll(dbDir); err != nil {
+		return fmt.Errorf("remove base/%d: %w", dbOID, err)
 	}
 	return nil
 }
@@ -718,7 +738,7 @@ func Init(opts Options) error {
 	// Each needs base/<dboid>/ and base/<dboid>/PG_VERSION so PG's
 	// ValidatePgVersion passes at standby startup.
 	for _, dbOID := range []uint32{1, 4, 5} {
-		if err := createPerDatabaseScaffolding(abs, dbOID); err != nil {
+		if err := CreatePerDatabaseScaffolding(abs, dbOID); err != nil {
 			return fmt.Errorf("goopg init: %w", err)
 		}
 	}

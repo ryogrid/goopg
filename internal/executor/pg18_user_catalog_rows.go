@@ -481,7 +481,7 @@ func buildUserPGClassRow(cat catalog.Catalog, tbl *catalog.Table) Row {
 		NewIntDatum(bootstrapSuperuserOID),                         // relowner
 		NewIntDatum(pgHeapAccessMethodOID),                         // relam
 		NewIntDatum(relfilenode),                                   // relfilenode
-		NewIntDatum(0),                                             // reltablespace (default per-db tablespace)
+		NewIntDatum(int64(tbl.Tablespace)),                         // reltablespace (0 = default; explicit CREATE TABLE ... TABLESPACE otherwise, M0122-0007)
 		NewIntDatum(0),                                             // relpages
 		NewIntDatum(0),                                             // reltuples (float4 here; stored 0 == 0.0)
 		NewIntDatum(0),                                             // relallvisible
@@ -544,7 +544,7 @@ func buildUserPGClassRowForIndex(cat catalog.Catalog, idx *catalog.Index) Row {
 		NewIntDatum(bootstrapSuperuserOID),    // relowner
 		NewIntDatum(pgBTreeAccessMethodOID),   // relam
 		NewIntDatum(int64(idx.OID)),           // relfilenode
-		NewIntDatum(0),                        // reltablespace
+		NewIntDatum(int64(idx.Tablespace)),    // reltablespace (0 = default; explicit CREATE/ALTER INDEX ... TABLESPACE otherwise, M0122-0007)
 		NewIntDatum(0),                        // relpages
 		NewIntDatum(0),                        // reltuples
 		NewIntDatum(0),                        // relallvisible
@@ -1055,7 +1055,7 @@ func pgIndexColumnsPG18() []catalog.Column {
 // buildUserPGIndexRow constructs the 21-column PG18-canonical pg_index row
 // for a user-defined index. Column names are mapped to 1-based attnums via
 // the index's parent table column list.
-func buildUserPGIndexRow(idx *catalog.Index) Row {
+func buildUserPGIndexRow(cat catalog.Catalog, idx *catalog.Index) Row {
 	nKey := len(idx.Columns)
 	nInclude := len(idx.IncludeColumns)
 	natts := int64(nKey + nInclude)
@@ -1072,6 +1072,17 @@ func buildUserPGIndexRow(idx *catalog.Index) Row {
 		}
 		return 0
 	}
+	colTypeName := func(colName string) string {
+		if idx.Table == nil {
+			return ""
+		}
+		for _, col := range idx.Table.Columns {
+			if col.Name == colName {
+				return col.Type.Name
+			}
+		}
+		return ""
+	}
 	// indkey: key columns first, then INCLUDE columns (M0122-0006 follow-up
 	// 2 of 2) — mirrors real PG's ExecutorGetIndexAttrBitmap layout. Without
 	// appending the INCLUDE attnums here, a checkpointed restart lost every
@@ -1087,10 +1098,27 @@ func buildUserPGIndexRow(idx *catalog.Index) Row {
 		attnums = append(attnums, colAttnum(colName))
 	}
 	// indcollation/indclass cover only the key columns in real PG (INCLUDE
-	// columns carry no opclass/collation). Real per-column OID resolution
-	// (idx.ColOpClasses/ColCollations by name) remains deferred — see
-	// .ralph/deferral_ledger.md's 2026-07-08 M0122-0006 row.
-	zeros32 := make([]uint32, nKey)
+	// columns carry no opclass/collation). Per-column OID resolution goes
+	// through the same catalog.Catalog resolvers the live pg_index
+	// VirtualRows renderer uses (internal/catalog/catalog.go,
+	// ResolveIndexColumnOpclassOID/ResolveIndexColumnCollationOID), so a
+	// checkpointed restart or a real PG standby's direct heap scan sees the
+	// same values a live SQL query against pg_index would. M0122-0007
+	// follow-up (previously always zero, ignoring ColOpClasses/ColCollations).
+	opclassMethodOID := catalog.AccessMethodOIDByName(idx.Method)
+	indclassOIDs := make([]uint32, nKey)
+	indcollationOIDs := make([]uint32, nKey)
+	for i, colName := range idx.Columns {
+		var explicitClass, explicitCollation string
+		if i < len(idx.ColOpClasses) {
+			explicitClass = idx.ColOpClasses[i]
+		}
+		if i < len(idx.ColCollations) {
+			explicitCollation = idx.ColCollations[i]
+		}
+		indclassOIDs[i] = cat.ResolveIndexColumnOpclassOID(explicitClass, colTypeName(colName), opclassMethodOID)
+		indcollationOIDs[i] = cat.ResolveIndexColumnCollationOID(explicitCollation)
+	}
 
 	// indoption: per-key ASC/DESC + NULLS FIRST/LAST bitmask, mirroring
 	// upstream's INDOPTION_DESC (0x1) / INDOPTION_NULLS_FIRST (0x2). Lost
@@ -1120,28 +1148,39 @@ func buildUserPGIndexRow(idx *catalog.Index) Row {
 		indpred = NewStringDatum(idx.PredicateString)
 	}
 
+	// indexprs: deparsed expression text for expression key columns, mirroring
+	// the live virtual twin PGIndexRowsForDBOid (both share catalog.IndexExprsText).
+	// NULL for a plain (non-expression) index. The heap decoder
+	// DecodePGIndexPhysicalRow disambiguates indexprs from indpred via the tuple
+	// null bitmap, so populating this no longer corrupts a partial index's
+	// indpred on restart (was M0122-0006 follow-up; unimplemented_feat #135).
+	indexprs := NullDatum
+	if exprsText, ok := catalog.IndexExprsText(idx); ok {
+		indexprs = NewStringDatum(exprsText)
+	}
+
 	return Row{
-		NewIntDatum(int64(idx.OID)),               // indexrelid
-		NewIntDatum(int64(tableOIDForIndex(idx))), // indrelid
-		NewIntDatum(natts),                        // indnatts
-		NewIntDatum(nkeyatts),                     // indnkeyatts
-		NewBoolDatum(idx.Unique),                  // indisunique
-		NewBoolDatum(idx.NullsNotDistinct),        // indnullsnotdistinct (DU-002 slice 134)
-		NewBoolDatum(idx.Primary),                 // indisprimary
-		NewBoolDatum(false),                       // indisexclusion
-		NewBoolDatum(true),                        // indimmediate
-		NewBoolDatum(idx.IsClustered),             // indisclustered (DU-002 slice 320)
-		NewBoolDatum(true),                        // indisvalid
-		NewBoolDatum(false),                       // indcheckxmin
-		NewBoolDatum(true),                        // indisready
-		NewBoolDatum(true),                        // indislive
-		NewBoolDatum(idx.IsReplicaIdentity),       // indisreplident (DU-002 slice 306)
-		NewBytesDatum(pgInt2VectorBytes(attnums)), // indkey
-		NewBytesDatum(pgOIDVectorBytes(zeros32)),  // indcollation
-		NewBytesDatum(pgOIDVectorBytes(zeros32)),  // indclass
-		NewBytesDatum(pgInt2VectorBytes(indoption)), // indoption
-		NullDatum, // indexprs — goopg has no expression-index support (Index.Columns holds only plain column names), so this is always NULL
-		indpred,   // indpred
+		NewIntDatum(int64(idx.OID)),                       // indexrelid
+		NewIntDatum(int64(tableOIDForIndex(idx))),         // indrelid
+		NewIntDatum(natts),                                // indnatts
+		NewIntDatum(nkeyatts),                             // indnkeyatts
+		NewBoolDatum(idx.Unique),                          // indisunique
+		NewBoolDatum(idx.NullsNotDistinct),                // indnullsnotdistinct (DU-002 slice 134)
+		NewBoolDatum(idx.Primary),                         // indisprimary
+		NewBoolDatum(false),                               // indisexclusion
+		NewBoolDatum(true),                                // indimmediate
+		NewBoolDatum(idx.IsClustered),                     // indisclustered (DU-002 slice 320)
+		NewBoolDatum(true),                                // indisvalid
+		NewBoolDatum(false),                               // indcheckxmin
+		NewBoolDatum(true),                                // indisready
+		NewBoolDatum(true),                                // indislive
+		NewBoolDatum(idx.IsReplicaIdentity),               // indisreplident (DU-002 slice 306)
+		NewBytesDatum(pgInt2VectorBytes(attnums)),         // indkey
+		NewBytesDatum(pgOIDVectorBytes(indcollationOIDs)), // indcollation
+		NewBytesDatum(pgOIDVectorBytes(indclassOIDs)),     // indclass
+		NewBytesDatum(pgInt2VectorBytes(indoption)),       // indoption
+		indexprs, // indexprs — expr text for expression indexes, else NULL
+		indpred,  // indpred
 	}
 }
 

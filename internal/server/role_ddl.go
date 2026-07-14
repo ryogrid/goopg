@@ -71,7 +71,7 @@ func (s *Server) tryHandleRoleDDL(sql string, dbName string, resolveCurrent curr
 		// NOLOGIN (postgres/src/backend/commands/user.c CreateRole).
 		// Explicit LOGIN/NOLOGIN below overrides.
 		attrs := catalog.RoleAttrs{CanLogin: strings.HasPrefix(norm, "create user "), ConnLimit: -1}
-		applyRoleAttrOptions(sql, norm, &attrs)
+		applyRoleAttrOptions(sql, norm, &attrs, resolveCurrent)
 		s.registerRole(name)
 		// Also register in catalog so executor-level DROP ROLE IF EXISTS can check.
 		if s.cfg.Catalog != nil {
@@ -120,7 +120,7 @@ func (s *Server) tryHandleRoleDDL(sql string, dbName string, resolveCurrent curr
 				attrs = cur
 			}
 		}
-		applyRoleAttrOptions(sql, norm, &attrs)
+		applyRoleAttrOptions(sql, norm, &attrs, resolveCurrent)
 		if isInMem {
 			im.SetRoleAttrs(name, attrs)
 		}
@@ -267,7 +267,7 @@ func isReservedRoleName(name string) bool {
 // IN ROLE/ADMIN/ROLE/USER/SYSID (membership + the legacy numeric-OID clause)
 // remain unrecognised and ignored, matching the handler's historical
 // accept-and-ignore behaviour for options outside RoleAttrs' scope.
-func applyRoleAttrOptions(sql, norm string, attrs *catalog.RoleAttrs) {
+func applyRoleAttrOptions(sql, norm string, attrs *catalog.RoleAttrs, resolveCurrent currentGUCResolver) {
 	if strings.Contains(norm, " nosuperuser") {
 		attrs.Superuser = false
 	} else if strings.Contains(norm, " superuser") {
@@ -317,7 +317,7 @@ func applyRoleAttrOptions(sql, norm string, attrs *catalog.RoleAttrs) {
 			attrs.Secret = pw
 		default: // plaintext — shadow into a SCRAM verifier like PG's
 			// encrypt_password under password_encryption='scram-sha-256'.
-			sec, err := auth.NewSCRAMSecret(pw)
+			sec, err := auth.NewSCRAMSecretWithIterations(pw, resolveScramIterations(resolveCurrent))
 			if err != nil {
 				return
 			}
@@ -325,6 +325,28 @@ func applyRoleAttrOptions(sql, norm string, attrs *catalog.RoleAttrs) {
 			attrs.Secret = sec.String()
 		}
 	}
+}
+
+// resolveScramIterations reads the calling session's live scram_iterations
+// GUC (postgres/src/backend/commands/user.c CreateRole/AlterRole read the
+// same setting when hashing a plaintext PASSWORD) so SET scram_iterations =
+// N actually changes newly-derived verifiers' PBKDF2 cost, matching
+// upstream. Falls back to auth's own default whenever no session/GUC is
+// available or the stored value doesn't parse (auth.NewSCRAMSecretWithIterations
+// applies the same non-positive fallback, so 0 here is safe).
+func resolveScramIterations(resolveCurrent currentGUCResolver) int {
+	if resolveCurrent == nil {
+		return 0
+	}
+	val, ok := resolveCurrent("scram_iterations")
+	if !ok {
+		return 0
+	}
+	n, err := strconv.Atoi(val)
+	if err != nil {
+		return 0
+	}
+	return n
 }
 
 type rolePasswordKind int

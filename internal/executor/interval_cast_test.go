@@ -82,10 +82,12 @@ func TestIntervalCastFromString(t *testing.T) {
 }
 
 // TestIntervalCastFromStringInvalidSyntax pins the 22007 error PostgreSQL's
-// interval_in raises for a string that isn't a valid interval body — v0
-// deliberately only accepts the single "<n> <unit>" shape, so anything else
-// (unsupported unit, multi-component strings, garbage) must error instead of
-// silently passing the raw string through unparsed.
+// interval_in raises for a string that isn't a valid interval body. The cast
+// path now accepts multi-field bodies, HH:MM:SS times (unimplemented_feat
+// #5(b)), and a trailing unitless number defaulting to seconds (#5(d-i)), so
+// only genuinely malformed bodies (unsupported unit, garbage, a non-final
+// number with no unit) must still error instead of silently passing the raw
+// string through unparsed.
 func TestIntervalCastFromStringInvalidSyntax(t *testing.T) {
 	ctx, _, cleanup := newDDLFixture(t)
 	defer cleanup()
@@ -100,8 +102,30 @@ func TestIntervalCastFromStringInvalidSyntax(t *testing.T) {
 	cases := []string{
 		"SELECT 'garbage'::interval FROM t",
 		"SELECT '1 fortnight'::interval FROM t",
-		"SELECT '1 year 2 months'::interval FROM t",
-		"SELECT '01:02:03'::interval FROM t",
+		"SELECT '1 year 2 fortnights'::interval FROM t",
+		"SELECT 'day month'::interval FROM t",
+		// A trailing unitless number defaults to seconds (#5(d-i)), but a
+		// non-final bare number is the ambiguous type-carry case PG rejects,
+		// and a bare number after a time word / seconds unit collides on the
+		// SECOND field mask. All three error in PostgreSQL 18.3.
+		"SELECT '1 2 days'::interval FROM t",
+		"SELECT '1 day 05:00:00 5'::interval FROM t",
+		"SELECT '5 5'::interval FROM t",
+		// Year-month hyphen field bounds (PG DecodeInterval DTK_NUMBER hyphen
+		// branch): the month part must be 0 ≤ m < 12 with nothing trailing.
+		"SELECT '1-12'::interval FROM t",  // month == MONTHS_PER_YEAR (out of range)
+		"SELECT '1-13'::interval FROM t",  // month > MONTHS_PER_YEAR
+		"SELECT '1--2'::interval FROM t",  // negative month part
+		"SELECT '1-2-3'::interval FROM t", // trailing "-3" after the month part
+		"SELECT '1-2x'::interval FROM t",  // trailing non-digit after the month part
+		// quarter/qtr and the timezone tokens appear in PG's deltatktbl but have
+		// no case in DecodeInterval's per-unit switch, so they raise
+		// DTERR_BAD_FORMAT (22007) rather than decoding (unimplemented_feat
+		// #5(d-ii)); goopg's canonicalIntervalUnit must reject them too.
+		"SELECT '1 qtr'::interval FROM t",
+		"SELECT '1 quarter'::interval FROM t",
+		"SELECT '1 tz'::interval FROM t",
+		"SELECT '1 timezone'::interval FROM t",
 	}
 	for _, sql := range cases {
 		t.Run(sql, func(t *testing.T) {

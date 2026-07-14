@@ -128,7 +128,7 @@ func TestSetStatisticsTargetProjection(t *testing.T) {
 	c.RegisterStatistics("public", "s", relOID)
 
 	stxRow := func() []string {
-		rows := c.tables["pg_catalog.pg_statistic_ext"].VirtualRows()
+		rows := c.ns(DefaultDBOid).tables["pg_catalog.pg_statistic_ext"].VirtualRows()
 		if len(rows) != 1 {
 			t.Fatalf("VirtualRows: got %d rows want 1", len(rows))
 		}

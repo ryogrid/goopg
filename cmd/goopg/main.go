@@ -319,8 +319,10 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	}
 	if v := os.Getenv("GOMEMLIMIT"); v != "" {
 		// Go runtime already reads GOMEMLIMIT at startup, but log it
-		// so operators know it was applied.
-		cur := debug.SetMemoryLimit(debug.SetMemoryLimit(1<<63 - 1))
+		// so operators know it was applied. A negative argument reads the
+		// currently-set limit without changing it (the previous double-swap
+		// logged the temporary max-int sentinel, not the real limit).
+		cur := debug.SetMemoryLimit(-1)
 		logger.Info("GOMEMLIMIT applied", "bytes", cur)
 	}
 
@@ -416,6 +418,10 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		walSenderMemBuf := int64(intGUC(registry, "wal_sender_memory_buffer", 16<<20))
 		walBuffers := int64(intGUC(registry, "wal_buffers", 16<<20))
 		walSyncMethod := stringGUC(registry, "wal_sync_method", "fdatasync")
+		// min_wal_size/max_wal_size are stored in MB (matching upstream);
+		// wal.Config.MinWALSize/MaxWALSize want bytes.
+		walMinSizeBytes := int64(intGUC(registry, "min_wal_size", 80)) * 1024 * 1024
+		walMaxSizeBytes := int64(intGUC(registry, "max_wal_size", 1024)) * 1024 * 1024
 		walWriterDelayMS := intGUC(registry, "wal_writer_delay", 200)
 		bgwriterDelayMS := intGUC(registry, "bgwriter_delay", 200)
 		bgwriterMaxPages := intGUC(registry, "bgwriter_lru_maxpages", 100)
@@ -442,7 +448,12 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			WALSenderMemoryBuffer: walSenderMemBuf,
 			WALBuffers:            walBuffers,
 			WALSyncMethod:         walSyncMethod,
+			WALMinSize:            walMinSizeBytes,
+			WALMaxSize:            walMaxSizeBytes,
+			CommitDelayUs:         int64(intGUC(registry, "commit_delay", 0)),
+			CommitSiblings:        intGUC(registry, "commit_siblings", 5),
 			WalWriterDelay:        time.Duration(walWriterDelayMS) * time.Millisecond,
+			WalWriterFlushAfter:   int64(intGUC(registry, "wal_writer_flush_after", 1048576)),
 			BgwriterDelay:         time.Duration(bgwriterDelayMS) * time.Millisecond,
 			BgwriterMaxPages:      bgwriterMaxPages,
 			CheckpointFlushAfter:  checkpointFlushAfter,
@@ -707,6 +718,17 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 				Writer: rt.WAL,
 				Slots:  rt.Slots,
 				Logger: logger,
+				// M0122-0009 follow-up: let RemoveOldSegmentsWithEstimate's
+				// XLOGfileslop-style sizing grow past the min_wal_size
+				// floor under sustained write volume (capped at
+				// max_wal_size, wired into rt.WAL's Config above via
+				// WALMaxSize).
+				CheckPointDistanceEstimateFn: rt.Checkpointer.CheckPointDistanceEstimate,
+			}
+			if v, ok := registry.Get("checkpoint_completion_target"); ok {
+				if f, err := strconv.ParseFloat(v.Display(), 64); err == nil {
+					retainer.CompletionTarget = f
+				}
 			}
 			if v, ok := registry.Get("max_slot_wal_keep_size"); ok {
 				// Stored in MB (matching upstream guc_tables.c). -1

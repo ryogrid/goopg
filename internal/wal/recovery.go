@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/goopg/goopg/internal/access/btree"
+	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/control"
 	"github.com/goopg/goopg/internal/storage"
 )
@@ -749,10 +750,78 @@ const (
 	//   kind(1) | ownerOID(4) | oid(4)
 	RecordKindAlterFunctionOwner byte = 121
 
+	// RecordKindAlterFunctionConfig records the post-mutation snapshot of a
+	// routine's pg_proc.proconfig array after an `ALTER FUNCTION/PROCEDURE/
+	// ROUTINE ... SET name = value / RESET name / RESET ALL` clause (DU-002
+	// proconfig follow-up to M0097-0150). Like RecordKindAlterFunctionFlags,
+	// this logs the whole resulting array rather than the individual clause
+	// so replay is a straight overwrite, not order-dependent op replay.
+	// EncodeAlterFunctionConfig/DecodeAlterFunctionConfig.
+	RecordKindAlterFunctionConfig byte = 123
+
 	// RecordKindAlterFunctionSetSchema records an `ALTER FUNCTION/PROCEDURE/
 	// ROUTINE name(args) SET SCHEMA newschema` event (M0097-0150). Format:
 	//   kind(1) | oid(4) | newSchemaLen(2) | newSchema(newSchemaLen bytes)
 	RecordKindAlterFunctionSetSchema byte = 122
+
+	// RecordKindCreateTablespace records a `CREATE TABLESPACE name [OWNER
+	// owner] LOCATION 'location'` event (M0122-0007 tablespace-registry
+	// restart-durability follow-up). goopg's tablespace registry
+	// (catalog.InMemory.tablespaces) is a pure in-memory map with no backing
+	// heap relation, so the physical redo path is a no-op; the recovery
+	// driver in internal/initdb/tablespace_ddl_recovery.go re-registers the
+	// tablespace (with its original OID) after physical replay. Mirrors
+	// RecordKindCreateSchema. Format:
+	//   kind(1) | oid(4) | nameLen(2)+name | ownerLen(2)+owner |
+	//   locationLen(2)+location.
+	RecordKindCreateTablespace byte = 124
+
+	// RecordKindDropTablespace records a `DROP TABLESPACE name` event.
+	// Counterpart to RecordKindCreateTablespace; same no-op physical redo
+	// path. Format: kind(1) | nameLen(2) | name(nameLen bytes).
+	RecordKindDropTablespace byte = 125
+
+	// RecordKindCreateForeignServer records a `CREATE SERVER name [TYPE
+	// 'type'] [VERSION 'version'] FOREIGN DATA WRAPPER fdwname [OPTIONS
+	// (...)]` event (M0122-0007 foreign-server registry restart-durability
+	// follow-up). goopg's foreign-server registry
+	// (catalog.InMemory.foreignServers) is a pure in-memory map with no
+	// backing heap relation, so the physical redo path is a no-op; the
+	// recovery driver in internal/initdb/foreignserver_ddl_recovery.go
+	// re-registers the server (with its original OID) after physical
+	// replay. Mirrors RecordKindCreateTablespace. Owner is deliberately not
+	// carried: nothing in the codebase sets ForeignServer.Owner away from
+	// its zero value yet (no `ALTER SERVER ... OWNER TO`), so there is
+	// nothing to persist. Format:
+	//   kind(1) | oid(4) | nameLen(2)+name | fdwNameLen(2)+fdwName |
+	//   srvTypeLen(2)+srvType | srvVersionLen(2)+srvVersion |
+	//   optionsCount(2) | (optLen(2)+opt)*.
+	RecordKindCreateForeignServer byte = 126
+
+	// RecordKindDropForeignServer records a `DROP SERVER name` event.
+	// Counterpart to RecordKindCreateForeignServer; same no-op physical redo
+	// path. Format: kind(1) | nameLen(2) | name(nameLen bytes).
+	RecordKindDropForeignServer byte = 127
+
+	// RecordKindCreateUserMapping records a `CREATE USER MAPPING FOR user
+	// SERVER server [OPTIONS (...)]` event (M0122-0007 foreign-server
+	// registry restart-durability follow-up — the user-mapping resume point
+	// named in that milestone's ledger row). goopg's user-mapping registry
+	// (catalog.InMemory.userMappings) is a pure in-memory map keyed by
+	// "<user>\x00<server>" with no backing heap relation, so the physical
+	// redo path is a no-op; the recovery driver in
+	// internal/initdb/usermapping_ddl_recovery.go re-registers the mapping
+	// (with its original OID) after physical replay. Mirrors
+	// RecordKindCreateForeignServer. Format:
+	//   kind(1) | oid(4) | userLen(2)+user | serverLen(2)+server |
+	//   optionsCount(2) | (optLen(2)+opt)*.
+	RecordKindCreateUserMapping byte = 128
+
+	// RecordKindDropUserMapping records a `DROP USER MAPPING FOR user SERVER
+	// server` event. Counterpart to RecordKindCreateUserMapping; same no-op
+	// physical redo path. Format: kind(1) | userLen(2)+user |
+	// serverLen(2)+server.
+	RecordKindDropUserMapping byte = 129
 
 	// RecordKindSequenceState records the FULL state of one sequence
 	// (definition + current counter) so sequences — including the implicit
@@ -1367,34 +1436,51 @@ const (
 )
 
 // EncodeCreateDatabase encodes a CREATE DATABASE event (M0054-0001).
-// Format: kind(1) | nameLen(2) | name(nameLen bytes).
-func EncodeCreateDatabase(name string) []byte {
+// Format: kind(1) | nameLen(2) | name(nameLen bytes) | owner(4, datdba OID,
+// M0122-0007) | oid(4, real pg_database.oid, M0122-0007
+// physical-storage-isolation slice 1).
+func EncodeCreateDatabase(name string, owner, oid uint32) []byte {
 	if len(name) > 0xFFFF {
 		// goopg's identifier length cap is far below 64 KiB; truncating
 		// here is defensive — this branch is unreachable under normal
 		// CREATE DATABASE syntax.
 		name = name[:0xFFFF]
 	}
-	out := make([]byte, 3+len(name))
+	out := make([]byte, 3+len(name)+4+4)
 	out[0] = RecordKindCreateDatabase
 	binary.LittleEndian.PutUint16(out[1:3], uint16(len(name)))
 	copy(out[3:], name)
+	binary.LittleEndian.PutUint32(out[3+len(name):], owner)
+	binary.LittleEndian.PutUint32(out[3+len(name)+4:], oid)
 	return out
 }
 
-// DecodeCreateDatabase decodes a RecordKindCreateDatabase payload.
-func DecodeCreateDatabase(payload []byte) (name string, err error) {
+// DecodeCreateDatabase decodes a RecordKindCreateDatabase payload. owner
+// defaults to catalog.BootstrapSuperuserOID when the payload predates the
+// M0122-0007 owner suffix (no trailing 4 bytes) — keeps replay of a WAL
+// stream written before this change working. oid defaults to 0 (catalog's
+// DatabaseOid "no override" sentinel) when the payload predates the
+// M0122-0007 physical-storage-isolation slice-1 oid suffix.
+func DecodeCreateDatabase(payload []byte) (name string, owner uint32, oid uint32, err error) {
 	if len(payload) < 3 {
-		return "", fmt.Errorf("wal: create-database payload too short (%d bytes)", len(payload))
+		return "", 0, 0, fmt.Errorf("wal: create-database payload too short (%d bytes)", len(payload))
 	}
 	if payload[0] != RecordKindCreateDatabase {
-		return "", fmt.Errorf("wal: record kind %d is not create-database", payload[0])
+		return "", 0, 0, fmt.Errorf("wal: record kind %d is not create-database", payload[0])
 	}
 	nameLen := int(binary.LittleEndian.Uint16(payload[1:3]))
 	if len(payload) < 3+nameLen {
-		return "", fmt.Errorf("wal: create-database payload truncated (need %d bytes)", 3+nameLen)
+		return "", 0, 0, fmt.Errorf("wal: create-database payload truncated (need %d bytes)", 3+nameLen)
 	}
-	return string(payload[3 : 3+nameLen]), nil
+	name = string(payload[3 : 3+nameLen])
+	owner = catalog.BootstrapSuperuserOID
+	if len(payload) >= 3+nameLen+4 {
+		owner = binary.LittleEndian.Uint32(payload[3+nameLen : 3+nameLen+4])
+	}
+	if len(payload) >= 3+nameLen+4+4 {
+		oid = binary.LittleEndian.Uint32(payload[3+nameLen+4 : 3+nameLen+4+4])
+	}
+	return name, owner, oid, nil
 }
 
 // EncodeDropDatabase encodes a DROP DATABASE event (M0054-0001).
@@ -1444,6 +1530,7 @@ type SequenceStatePayload struct {
 	OwnedBy      string // "table.column" for implicit/OWNED BY sequences, else ""
 	ColSpelling  string // serial spelling ("bigserial", ...) when backing a SERIAL column
 	IdentityKind byte   // 0=none, 1=GENERATED BY DEFAULT, 2=GENERATED ALWAYS
+	DBOid        uint32 // owning database oid (M0122-0007 4e); 0 on a pre-4e record, see DecodeSequenceState
 }
 
 // EncodeSequenceState encodes a RecordKindSequenceState record.
@@ -1477,6 +1564,12 @@ func EncodeSequenceState(p SequenceStatePayload) []byte {
 	writeStr16(p.DataType)
 	writeStr16(p.OwnedBy)
 	writeStr16(p.ColSpelling)
+	// DBOid is appended as a trailing 4-byte field (M0122-0007 4e) so a
+	// pre-existing WAL record with no trailer still decodes — see
+	// DecodeSequenceState's short-read handling.
+	var oidBuf [4]byte
+	binary.LittleEndian.PutUint32(oidBuf[:], p.DBOid)
+	buf.Write(oidBuf[:])
 	return buf.Bytes()
 }
 
@@ -1524,6 +1617,12 @@ func DecodeSequenceState(payload []byte) (SequenceStatePayload, error) {
 	}
 	if p.ColSpelling, err = readStr16(); err != nil {
 		return p, err
+	}
+	// DBOid is 0 (DefaultDBOid via NamespaceDBOid) for a pre-4e payload that
+	// predates the trailing dbOid field.
+	if len(payload) >= off+4 {
+		p.DBOid = binary.LittleEndian.Uint32(payload[off : off+4])
+		off += 4
 	}
 	return p, nil
 }
@@ -3247,31 +3346,41 @@ func DecodeDropAmProcMember(payload []byte) (familyOID, leftType, rightType, pro
 }
 
 // EncodeDropSequence encodes a RecordKindDropSequence record.
-// Format identical to EncodeDropDatabase: kind(1) | nameLen(2) | name.
-func EncodeDropSequence(name string) []byte {
+// Format identical to EncodeDropDatabase: kind(1) | nameLen(2) | name, plus a
+// trailing 4-byte dbOid (M0122-0007 4e) appended after the name so a
+// pre-existing WAL record with no trailer still decodes — see
+// DecodeDropSequence's short-read handling.
+func EncodeDropSequence(name string, dbOid uint32) []byte {
 	if len(name) > 0xFFFF {
 		name = name[:0xFFFF]
 	}
-	out := make([]byte, 3+len(name))
+	out := make([]byte, 3+len(name)+4)
 	out[0] = RecordKindDropSequence
 	binary.LittleEndian.PutUint16(out[1:3], uint16(len(name)))
 	copy(out[3:], name)
+	binary.LittleEndian.PutUint32(out[3+len(name):], dbOid)
 	return out
 }
 
-// DecodeDropSequence decodes a RecordKindDropSequence payload.
-func DecodeDropSequence(payload []byte) (name string, err error) {
+// DecodeDropSequence decodes a RecordKindDropSequence payload. dbOid is 0
+// (DefaultDBOid via NamespaceDBOid) for a pre-4e payload that predates the
+// trailing dbOid field.
+func DecodeDropSequence(payload []byte) (name string, dbOid uint32, err error) {
 	if len(payload) < 3 {
-		return "", fmt.Errorf("wal: drop-sequence payload too short (%d bytes)", len(payload))
+		return "", 0, fmt.Errorf("wal: drop-sequence payload too short (%d bytes)", len(payload))
 	}
 	if payload[0] != RecordKindDropSequence {
-		return "", fmt.Errorf("wal: record kind %d is not drop-sequence", payload[0])
+		return "", 0, fmt.Errorf("wal: record kind %d is not drop-sequence", payload[0])
 	}
 	nameLen := int(binary.LittleEndian.Uint16(payload[1:3]))
 	if len(payload) < 3+nameLen {
-		return "", fmt.Errorf("wal: drop-sequence payload truncated (need %d bytes)", 3+nameLen)
+		return "", 0, fmt.Errorf("wal: drop-sequence payload truncated (need %d bytes)", 3+nameLen)
 	}
-	return string(payload[3 : 3+nameLen]), nil
+	name = string(payload[3 : 3+nameLen])
+	if off := 3 + nameLen; len(payload) >= off+4 {
+		dbOid = binary.LittleEndian.Uint32(payload[off : off+4])
+	}
+	return name, dbOid, nil
 }
 
 // EncodeCreateSchema encodes a CREATE SCHEMA event (M0110-0003 schema
@@ -3332,6 +3441,410 @@ func DecodeDropSchema(payload []byte) (name string, err error) {
 		return "", fmt.Errorf("wal: drop-schema payload truncated (need %d bytes)", 3+nameLen)
 	}
 	return string(payload[3 : 3+nameLen]), nil
+}
+
+// EncodeCreateTablespace encodes a CREATE TABLESPACE event (M0122-0007
+// tablespace-registry restart-durability follow-up). The OID is carried so
+// recovery re-registers the tablespace with the same identifier the live
+// server assigned.
+// Format: kind(1) | oid(4) | nameLen(2)+name | ownerLen(2)+owner |
+//
+//	locationLen(2)+location.
+func EncodeCreateTablespace(name, owner, location string, oid uint32) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	if len(owner) > 0xFFFF {
+		owner = owner[:0xFFFF]
+	}
+	if len(location) > 0xFFFF {
+		location = location[:0xFFFF]
+	}
+	out := make([]byte, 11+len(name)+len(owner)+len(location))
+	out[0] = RecordKindCreateTablespace
+	binary.LittleEndian.PutUint32(out[1:5], oid)
+	off := 5
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(name)))
+	off += 2
+	copy(out[off:off+len(name)], name)
+	off += len(name)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(owner)))
+	off += 2
+	copy(out[off:off+len(owner)], owner)
+	off += len(owner)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(location)))
+	off += 2
+	copy(out[off:off+len(location)], location)
+	return out
+}
+
+// DecodeCreateTablespace decodes a RecordKindCreateTablespace payload.
+func DecodeCreateTablespace(payload []byte) (name, owner, location string, oid uint32, err error) {
+	if len(payload) < 7 {
+		return "", "", "", 0, fmt.Errorf("wal: create-tablespace payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindCreateTablespace {
+		return "", "", "", 0, fmt.Errorf("wal: record kind %d is not create-tablespace", payload[0])
+	}
+	oid = binary.LittleEndian.Uint32(payload[1:5])
+	off := 5
+	readStr := func() (string, error) {
+		if len(payload) < off+2 {
+			return "", fmt.Errorf("wal: create-tablespace payload truncated at length prefix (offset %d)", off)
+		}
+		l := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+		off += 2
+		if len(payload) < off+l {
+			return "", fmt.Errorf("wal: create-tablespace payload truncated (need %d bytes)", off+l)
+		}
+		s := string(payload[off : off+l])
+		off += l
+		return s, nil
+	}
+	if name, err = readStr(); err != nil {
+		return "", "", "", 0, err
+	}
+	if owner, err = readStr(); err != nil {
+		return "", "", "", 0, err
+	}
+	if location, err = readStr(); err != nil {
+		return "", "", "", 0, err
+	}
+	return name, owner, location, oid, nil
+}
+
+// EncodeDropTablespace encodes a DROP TABLESPACE event.
+// Format: kind(1) | nameLen(2) | name(nameLen bytes).
+func EncodeDropTablespace(name string) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	out := make([]byte, 3+len(name))
+	out[0] = RecordKindDropTablespace
+	binary.LittleEndian.PutUint16(out[1:3], uint16(len(name)))
+	copy(out[3:], name)
+	return out
+}
+
+// DecodeDropTablespace decodes a RecordKindDropTablespace payload.
+func DecodeDropTablespace(payload []byte) (name string, err error) {
+	if len(payload) < 3 {
+		return "", fmt.Errorf("wal: drop-tablespace payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindDropTablespace {
+		return "", fmt.Errorf("wal: record kind %d is not drop-tablespace", payload[0])
+	}
+	nameLen := int(binary.LittleEndian.Uint16(payload[1:3]))
+	if len(payload) < 3+nameLen {
+		return "", fmt.Errorf("wal: drop-tablespace payload truncated (need %d bytes)", 3+nameLen)
+	}
+	return string(payload[3 : 3+nameLen]), nil
+}
+
+// EncodeCreateForeignServer encodes a CREATE SERVER event (M0122-0007
+// foreign-server registry restart-durability follow-up). Format: kind(1) |
+// oid(4) | nameLen(2)+name | fdwNameLen(2)+fdwName | srvTypeLen(2)+srvType |
+// srvVersionLen(2)+srvVersion | optionsCount(2) | (optLen(2)+opt)* | dbOid(4).
+// dbOid is a trailing-appended field (M0122-0007 4e follow-up 36, mirroring
+// EncodeDropSequence's dbOid trailer) so a pre-follow-up-36 payload still
+// decodes: DecodeCreateForeignServer returns dbOid 0 (DefaultDBOid via
+// NamespaceDBOid) when the trailer is absent.
+func EncodeCreateForeignServer(name, fdwName, srvType, srvVersion string, options []string, oid uint32, dbOid uint32) []byte {
+	clip := func(s string) string {
+		if len(s) > 0xFFFF {
+			return s[:0xFFFF]
+		}
+		return s
+	}
+	name, fdwName, srvType, srvVersion = clip(name), clip(fdwName), clip(srvType), clip(srvVersion)
+	if len(options) > 0xFFFF {
+		options = options[:0xFFFF]
+	}
+	size := 4 + 2 + len(name) + 2 + len(fdwName) + 2 + len(srvType) + 2 + len(srvVersion) + 2
+	for _, opt := range options {
+		if len(opt) > 0xFFFF {
+			opt = opt[:0xFFFF]
+		}
+		size += 2 + len(opt)
+	}
+	size += 4 // trailing dbOid
+	out := make([]byte, 1+size)
+	out[0] = RecordKindCreateForeignServer
+	binary.LittleEndian.PutUint32(out[1:5], oid)
+	off := 5
+	writeStr := func(s string) {
+		binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(s)))
+		off += 2
+		copy(out[off:off+len(s)], s)
+		off += len(s)
+	}
+	writeStr(name)
+	writeStr(fdwName)
+	writeStr(srvType)
+	writeStr(srvVersion)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(options)))
+	off += 2
+	for _, opt := range options {
+		if len(opt) > 0xFFFF {
+			opt = opt[:0xFFFF]
+		}
+		writeStr(opt)
+	}
+	binary.LittleEndian.PutUint32(out[off:off+4], dbOid)
+	off += 4
+	return out[:off]
+}
+
+// DecodeCreateForeignServer decodes a RecordKindCreateForeignServer payload.
+// dbOid is 0 (DefaultDBOid via NamespaceDBOid) for a pre-follow-up-36
+// payload that predates the trailing dbOid field.
+func DecodeCreateForeignServer(payload []byte) (name, fdwName, srvType, srvVersion string, options []string, oid uint32, dbOid uint32, err error) {
+	if len(payload) < 5 {
+		return "", "", "", "", nil, 0, 0, fmt.Errorf("wal: create-foreign-server payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindCreateForeignServer {
+		return "", "", "", "", nil, 0, 0, fmt.Errorf("wal: record kind %d is not create-foreign-server", payload[0])
+	}
+	oid = binary.LittleEndian.Uint32(payload[1:5])
+	off := 5
+	readStr := func() (string, error) {
+		if len(payload) < off+2 {
+			return "", fmt.Errorf("wal: create-foreign-server payload truncated at length prefix (offset %d)", off)
+		}
+		l := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+		off += 2
+		if len(payload) < off+l {
+			return "", fmt.Errorf("wal: create-foreign-server payload truncated (need %d bytes)", off+l)
+		}
+		s := string(payload[off : off+l])
+		off += l
+		return s, nil
+	}
+	if name, err = readStr(); err != nil {
+		return "", "", "", "", nil, 0, 0, err
+	}
+	if fdwName, err = readStr(); err != nil {
+		return "", "", "", "", nil, 0, 0, err
+	}
+	if srvType, err = readStr(); err != nil {
+		return "", "", "", "", nil, 0, 0, err
+	}
+	if srvVersion, err = readStr(); err != nil {
+		return "", "", "", "", nil, 0, 0, err
+	}
+	if len(payload) < off+2 {
+		return "", "", "", "", nil, 0, 0, fmt.Errorf("wal: create-foreign-server payload truncated at options count (offset %d)", off)
+	}
+	optCount := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	if optCount > 0 {
+		options = make([]string, 0, optCount)
+		for i := 0; i < optCount; i++ {
+			opt, oerr := readStr()
+			if oerr != nil {
+				return "", "", "", "", nil, 0, 0, oerr
+			}
+			options = append(options, opt)
+		}
+	}
+	if len(payload) >= off+4 {
+		dbOid = binary.LittleEndian.Uint32(payload[off : off+4])
+	}
+	return name, fdwName, srvType, srvVersion, options, oid, dbOid, nil
+}
+
+// EncodeDropForeignServer encodes a DROP SERVER event.
+// Format: kind(1) | nameLen(2) | name(nameLen bytes) | dbOid(4). dbOid is a
+// trailing-appended field (M0122-0007 4e follow-up 36, mirroring
+// EncodeDropSequence's dbOid trailer).
+func EncodeDropForeignServer(name string, dbOid uint32) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	out := make([]byte, 3+len(name)+4)
+	out[0] = RecordKindDropForeignServer
+	binary.LittleEndian.PutUint16(out[1:3], uint16(len(name)))
+	copy(out[3:], name)
+	binary.LittleEndian.PutUint32(out[3+len(name):], dbOid)
+	return out
+}
+
+// DecodeDropForeignServer decodes a RecordKindDropForeignServer payload.
+// dbOid is 0 (DefaultDBOid via NamespaceDBOid) for a pre-follow-up-36
+// payload that predates the trailing dbOid field.
+func DecodeDropForeignServer(payload []byte) (name string, dbOid uint32, err error) {
+	if len(payload) < 3 {
+		return "", 0, fmt.Errorf("wal: drop-foreign-server payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindDropForeignServer {
+		return "", 0, fmt.Errorf("wal: record kind %d is not drop-foreign-server", payload[0])
+	}
+	nameLen := int(binary.LittleEndian.Uint16(payload[1:3]))
+	if len(payload) < 3+nameLen {
+		return "", 0, fmt.Errorf("wal: drop-foreign-server payload truncated (need %d bytes)", 3+nameLen)
+	}
+	name = string(payload[3 : 3+nameLen])
+	if off := 3 + nameLen; len(payload) >= off+4 {
+		dbOid = binary.LittleEndian.Uint32(payload[off : off+4])
+	}
+	return name, dbOid, nil
+}
+
+// EncodeCreateUserMapping encodes a CREATE USER MAPPING event (M0122-0007
+// user-mapping registry restart-durability follow-up). Format: kind(1) |
+// oid(4) | userLen(2)+user | serverLen(2)+server | optionsCount(2) |
+// (optLen(2)+opt)* | dbOid(4). dbOid is a trailing-appended field (M0122-0007
+// 4e follow-up 37, mirroring EncodeCreateForeignServer's dbOid trailer) so a
+// pre-follow-up-37 payload still decodes: DecodeCreateUserMapping returns
+// dbOid 0 (DefaultDBOid via NamespaceDBOid) when the trailer is absent.
+func EncodeCreateUserMapping(user, server string, options []string, oid uint32, dbOid uint32) []byte {
+	clip := func(s string) string {
+		if len(s) > 0xFFFF {
+			return s[:0xFFFF]
+		}
+		return s
+	}
+	user, server = clip(user), clip(server)
+	if len(options) > 0xFFFF {
+		options = options[:0xFFFF]
+	}
+	size := 4 + 2 + len(user) + 2 + len(server) + 2
+	for _, opt := range options {
+		if len(opt) > 0xFFFF {
+			opt = opt[:0xFFFF]
+		}
+		size += 2 + len(opt)
+	}
+	size += 4 // trailing dbOid
+	out := make([]byte, 1+size)
+	out[0] = RecordKindCreateUserMapping
+	binary.LittleEndian.PutUint32(out[1:5], oid)
+	off := 5
+	writeStr := func(s string) {
+		binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(s)))
+		off += 2
+		copy(out[off:off+len(s)], s)
+		off += len(s)
+	}
+	writeStr(user)
+	writeStr(server)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(options)))
+	off += 2
+	for _, opt := range options {
+		if len(opt) > 0xFFFF {
+			opt = opt[:0xFFFF]
+		}
+		writeStr(opt)
+	}
+	binary.LittleEndian.PutUint32(out[off:off+4], dbOid)
+	off += 4
+	return out[:off]
+}
+
+// DecodeCreateUserMapping decodes a RecordKindCreateUserMapping payload.
+// dbOid is 0 (DefaultDBOid via NamespaceDBOid) for a pre-follow-up-37
+// payload that predates the trailing dbOid field.
+func DecodeCreateUserMapping(payload []byte) (user, server string, options []string, oid uint32, dbOid uint32, err error) {
+	if len(payload) < 5 {
+		return "", "", nil, 0, 0, fmt.Errorf("wal: create-user-mapping payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindCreateUserMapping {
+		return "", "", nil, 0, 0, fmt.Errorf("wal: record kind %d is not create-user-mapping", payload[0])
+	}
+	oid = binary.LittleEndian.Uint32(payload[1:5])
+	off := 5
+	readStr := func() (string, error) {
+		if len(payload) < off+2 {
+			return "", fmt.Errorf("wal: create-user-mapping payload truncated at length prefix (offset %d)", off)
+		}
+		l := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+		off += 2
+		if len(payload) < off+l {
+			return "", fmt.Errorf("wal: create-user-mapping payload truncated (need %d bytes)", off+l)
+		}
+		s := string(payload[off : off+l])
+		off += l
+		return s, nil
+	}
+	if user, err = readStr(); err != nil {
+		return "", "", nil, 0, 0, err
+	}
+	if server, err = readStr(); err != nil {
+		return "", "", nil, 0, 0, err
+	}
+	if len(payload) < off+2 {
+		return "", "", nil, 0, 0, fmt.Errorf("wal: create-user-mapping payload truncated at options count (offset %d)", off)
+	}
+	optCount := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	if optCount > 0 {
+		options = make([]string, 0, optCount)
+		for i := 0; i < optCount; i++ {
+			opt, oerr := readStr()
+			if oerr != nil {
+				return "", "", nil, 0, 0, oerr
+			}
+			options = append(options, opt)
+		}
+	}
+	if len(payload) >= off+4 {
+		dbOid = binary.LittleEndian.Uint32(payload[off : off+4])
+	}
+	return user, server, options, oid, dbOid, nil
+}
+
+// EncodeDropUserMapping encodes a DROP USER MAPPING event. Format: kind(1) |
+// userLen(2)+user | serverLen(2)+server | dbOid(4). dbOid is a
+// trailing-appended field (M0122-0007 4e follow-up 37, mirroring
+// EncodeDropForeignServer's dbOid trailer).
+func EncodeDropUserMapping(user, server string, dbOid uint32) []byte {
+	if len(user) > 0xFFFF {
+		user = user[:0xFFFF]
+	}
+	if len(server) > 0xFFFF {
+		server = server[:0xFFFF]
+	}
+	out := make([]byte, 5+len(user)+len(server)+4)
+	out[0] = RecordKindDropUserMapping
+	binary.LittleEndian.PutUint16(out[1:3], uint16(len(user)))
+	copy(out[3:3+len(user)], user)
+	off := 3 + len(user)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(server)))
+	off += 2
+	copy(out[off:off+len(server)], server)
+	off += len(server)
+	binary.LittleEndian.PutUint32(out[off:off+4], dbOid)
+	off += 4
+	return out[:off]
+}
+
+// DecodeDropUserMapping decodes a RecordKindDropUserMapping payload. dbOid
+// is 0 (DefaultDBOid via NamespaceDBOid) for a pre-follow-up-37 payload that
+// predates the trailing dbOid field.
+func DecodeDropUserMapping(payload []byte) (user, server string, dbOid uint32, err error) {
+	if len(payload) < 3 {
+		return "", "", 0, fmt.Errorf("wal: drop-user-mapping payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindDropUserMapping {
+		return "", "", 0, fmt.Errorf("wal: record kind %d is not drop-user-mapping", payload[0])
+	}
+	userLen := int(binary.LittleEndian.Uint16(payload[1:3]))
+	if len(payload) < 3+userLen+2 {
+		return "", "", 0, fmt.Errorf("wal: drop-user-mapping payload truncated (need %d bytes)", 3+userLen+2)
+	}
+	user = string(payload[3 : 3+userLen])
+	off := 3 + userLen
+	serverLen := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	if len(payload) < off+serverLen {
+		return "", "", 0, fmt.Errorf("wal: drop-user-mapping payload truncated (need %d bytes)", off+serverLen)
+	}
+	server = string(payload[off : off+serverLen])
+	off += serverLen
+	if len(payload) >= off+4 {
+		dbOid = binary.LittleEndian.Uint32(payload[off : off+4])
+	}
+	return user, server, dbOid, nil
 }
 
 // EncodeCreateTransform encodes a CREATE TRANSFORM event (M0119-0004 restart
@@ -5348,8 +5861,12 @@ func DecodeAlterPublicationOwner(payload []byte) (name string, ownerOID uint32, 
 // restart-persistence follow-up to M0119-0004, loop #67 ledger resume
 // point). The OID is carried so recovery re-registers the subscription
 // identically to the live server. Format documented at the
-// RecordKindCreateSubscription constant.
-func EncodeCreateSubscription(name, conninfo, slotName string, publications []string, oid, ownerOID uint32, enabled bool) []byte {
+// RecordKindCreateSubscription constant. dbOid is appended as a trailing
+// 4-byte field (M0122-0007 4d-ii-part-2b item 1) so a pre-existing WAL
+// file with no trailer still decodes — DecodeCreateSubscription treats a
+// short read of just that trailer as dbOid 0 (DefaultDBOid via
+// NamespaceDBOid), matching the pre-item-1 single-database default.
+func EncodeCreateSubscription(name, conninfo, slotName string, publications []string, oid, ownerOID uint32, enabled bool, dbOid uint32) []byte {
 	strs := []string{name, conninfo, slotName}
 	for i, s := range strs {
 		if len(s) > 0xFFFF {
@@ -5364,6 +5881,7 @@ func EncodeCreateSubscription(name, conninfo, slotName string, publications []st
 		}
 		total += 2 + len(p)
 	}
+	total += 4
 	out := make([]byte, total)
 	out[0] = RecordKindCreateSubscription
 	binary.LittleEndian.PutUint32(out[1:5], oid)
@@ -5389,16 +5907,20 @@ func EncodeCreateSubscription(name, conninfo, slotName string, publications []st
 		}
 		writeStr(p)
 	}
+	binary.LittleEndian.PutUint32(out[off:off+4], dbOid)
+	off += 4
 	return out
 }
 
 // DecodeCreateSubscription decodes a RecordKindCreateSubscription payload.
-func DecodeCreateSubscription(payload []byte) (name, conninfo, slotName string, publications []string, oid, ownerOID uint32, enabled bool, err error) {
+// dbOid is 0 (DefaultDBOid via NamespaceDBOid) for a pre-item-1 payload
+// that predates the trailing dbOid field.
+func DecodeCreateSubscription(payload []byte) (name, conninfo, slotName string, publications []string, oid, ownerOID uint32, enabled bool, dbOid uint32, err error) {
 	if len(payload) < 10 {
-		return "", "", "", nil, 0, 0, false, fmt.Errorf("wal: create-subscription payload too short (%d bytes)", len(payload))
+		return "", "", "", nil, 0, 0, false, 0, fmt.Errorf("wal: create-subscription payload too short (%d bytes)", len(payload))
 	}
 	if payload[0] != RecordKindCreateSubscription {
-		return "", "", "", nil, 0, 0, false, fmt.Errorf("wal: record kind %d is not create-subscription", payload[0])
+		return "", "", "", nil, 0, 0, false, 0, fmt.Errorf("wal: record kind %d is not create-subscription", payload[0])
 	}
 	oid = binary.LittleEndian.Uint32(payload[1:5])
 	ownerOID = binary.LittleEndian.Uint32(payload[5:9])
@@ -5418,16 +5940,16 @@ func DecodeCreateSubscription(payload []byte) (name, conninfo, slotName string, 
 		return s, nil
 	}
 	if name, err = readStr(); err != nil {
-		return "", "", "", nil, 0, 0, false, err
+		return "", "", "", nil, 0, 0, false, 0, err
 	}
 	if conninfo, err = readStr(); err != nil {
-		return "", "", "", nil, 0, 0, false, err
+		return "", "", "", nil, 0, 0, false, 0, err
 	}
 	if slotName, err = readStr(); err != nil {
-		return "", "", "", nil, 0, 0, false, err
+		return "", "", "", nil, 0, 0, false, 0, err
 	}
 	if len(payload) < off+2 {
-		return "", "", "", nil, 0, 0, false, fmt.Errorf("wal: create-subscription payload truncated (need %d bytes)", off+2)
+		return "", "", "", nil, 0, 0, false, 0, fmt.Errorf("wal: create-subscription payload truncated (need %d bytes)", off+2)
 	}
 	pubCount := int(binary.LittleEndian.Uint16(payload[off : off+2]))
 	off += 2
@@ -5435,11 +5957,15 @@ func DecodeCreateSubscription(payload []byte) (name, conninfo, slotName string, 
 	for i := 0; i < pubCount; i++ {
 		s, serr := readStr()
 		if serr != nil {
-			return "", "", "", nil, 0, 0, false, serr
+			return "", "", "", nil, 0, 0, false, 0, serr
 		}
 		publications = append(publications, s)
 	}
-	return name, conninfo, slotName, publications, oid, ownerOID, enabled, nil
+	if len(payload) >= off+4 {
+		dbOid = binary.LittleEndian.Uint32(payload[off : off+4])
+		off += 4
+	}
+	return name, conninfo, slotName, publications, oid, ownerOID, enabled, dbOid, nil
 }
 
 // EncodeDropSubscription encodes a DROP SUBSCRIPTION event (DU-002
@@ -5784,6 +6310,13 @@ type CreateFunctionPayload struct {
 	BeginAtomic     bool
 	IsReturnForm    bool
 	KindChar        string
+	// Config is pg_proc.proconfig ("name=value" entries set via CREATE
+	// FUNCTION's SET clause). Encoded as an optional trailing extension
+	// block, omitted entirely when empty for byte-identical output vs.
+	// pre-existing records with no SET clause (same pattern as
+	// CreateIndexPayload's predicate/INCLUDE-column extension block).
+	// DU-002 proconfig follow-up to M0097-0150.
+	Config []string
 }
 
 // EncodeCreateFunction encodes a CREATE [OR REPLACE] FUNCTION/PROCEDURE
@@ -5888,6 +6421,21 @@ func EncodeCreateFunction(p CreateFunctionPayload) []byte {
 		}
 		buf.WriteByte(mode)
 		writeWALStr16(a.Default)
+	}
+	// Optional Config extension block (DU-002 proconfig follow-up), omitted
+	// entirely when empty — byte-identical to a pre-Config record for the
+	// (overwhelmingly common) case of no SET clause.
+	if len(p.Config) > 0 {
+		cfg := p.Config
+		if len(cfg) > 0xFFFF {
+			cfg = cfg[:0xFFFF]
+		}
+		var cfgCount [2]byte
+		binary.LittleEndian.PutUint16(cfgCount[:], uint16(len(cfg)))
+		buf.Write(cfgCount[:])
+		for _, c := range cfg {
+			writeWALStr16(c)
+		}
 	}
 	return buf.Bytes()
 }
@@ -6018,6 +6566,24 @@ func DecodeCreateFunction(payload []byte) (CreateFunctionPayload, error) {
 			return CreateFunctionPayload{}, err
 		}
 		p.Args = append(p.Args, a)
+	}
+	// Optional Config extension block (DU-002 proconfig follow-up). Absent
+	// entirely for a pre-existing record with no SET clause — backward
+	// compatible, mirrors CreateIndexPayload's extension-block pattern.
+	if off < len(payload) {
+		if len(payload) < off+2 {
+			return CreateFunctionPayload{}, fmt.Errorf("wal: create-function payload truncated (need %d bytes)", off+2)
+		}
+		cfgCount := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+		off += 2
+		p.Config = make([]string, 0, cfgCount)
+		for i := 0; i < cfgCount; i++ {
+			s, err := readStr16()
+			if err != nil {
+				return CreateFunctionPayload{}, err
+			}
+			p.Config = append(p.Config, s)
+		}
 	}
 	return p, nil
 }
@@ -6180,6 +6746,63 @@ func DecodeAlterFunctionSetSchema(payload []byte) (oid uint32, newSchema string,
 	return oid, string(payload[7 : 7+schemaLen]), nil
 }
 
+// EncodeAlterFunctionConfig encodes the post-mutation snapshot of a
+// routine's pg_proc.proconfig array after an ALTER FUNCTION/PROCEDURE/
+// ROUTINE ... SET/RESET clause (DU-002 proconfig follow-up to M0097-0150).
+// Format documented at the RecordKindAlterFunctionConfig constant:
+//
+//	kind(1) | oid(4) | count(2) | [entryLen(2) | entry(entryLen bytes)]*count
+func EncodeAlterFunctionConfig(oid uint32, config []string) []byte {
+	var buf bytes.Buffer
+	buf.WriteByte(RecordKindAlterFunctionConfig)
+	var oidBuf [4]byte
+	binary.LittleEndian.PutUint32(oidBuf[:], oid)
+	buf.Write(oidBuf[:])
+	if len(config) > 0xFFFF {
+		config = config[:0xFFFF]
+	}
+	var countBuf [2]byte
+	binary.LittleEndian.PutUint16(countBuf[:], uint16(len(config)))
+	buf.Write(countBuf[:])
+	for _, entry := range config {
+		if len(entry) > 0xFFFF {
+			entry = entry[:0xFFFF]
+		}
+		var l [2]byte
+		binary.LittleEndian.PutUint16(l[:], uint16(len(entry)))
+		buf.Write(l[:])
+		buf.WriteString(entry)
+	}
+	return buf.Bytes()
+}
+
+// DecodeAlterFunctionConfig decodes a RecordKindAlterFunctionConfig payload.
+func DecodeAlterFunctionConfig(payload []byte) (oid uint32, config []string, err error) {
+	if len(payload) < 7 {
+		return 0, nil, fmt.Errorf("wal: alter-function-config payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindAlterFunctionConfig {
+		return 0, nil, fmt.Errorf("wal: record kind %d is not alter-function-config", payload[0])
+	}
+	oid = binary.LittleEndian.Uint32(payload[1:5])
+	count := int(binary.LittleEndian.Uint16(payload[5:7]))
+	off := 7
+	config = make([]string, 0, count)
+	for i := 0; i < count; i++ {
+		if len(payload) < off+2 {
+			return 0, nil, fmt.Errorf("wal: alter-function-config payload truncated (need %d bytes)", off+2)
+		}
+		l := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+		off += 2
+		if len(payload) < off+l {
+			return 0, nil, fmt.Errorf("wal: alter-function-config payload truncated (need %d bytes)", off+l)
+		}
+		config = append(config, string(payload[off:off+l]))
+		off += l
+	}
+	return oid, config, nil
+}
+
 // CreateIndexPayload carries the metadata needed to fully
 // reconstruct a btree index in the in-memory catalog during
 // recovery. Order of fields mirrors `catalog.Index`'s exported
@@ -6218,6 +6841,11 @@ type CreateIndexPayload struct {
 	Fillfactor       int
 	DeduplicateItems *bool
 	NullsNotDistinct bool
+	// Tablespace carries pg_class.reltablespace (0 = database default) so a
+	// CREATE INDEX ... TABLESPACE / ALTER INDEX ... SET TABLESPACE survives an
+	// uncheckpointed crash restart replayed purely from WAL. M0122-0007
+	// tablespace-restart-durability follow-up.
+	Tablespace uint32
 }
 
 // EncodeCreateIndex encodes a CREATE INDEX event (M0079-0001).
@@ -6288,6 +6916,7 @@ const (
 	ciExtHasOpClasses     = 1 << 3
 	ciExtHasCollations    = 1 << 4
 	ciExtNullsNotDistinct = 1 << 5
+	ciExtHasTablespace    = 1 << 6
 )
 
 // hasCreateIndexExtension reports whether p carries any of the M0122-0006
@@ -6296,7 +6925,7 @@ const (
 // by this follow-up.
 func hasCreateIndexExtension(p CreateIndexPayload) bool {
 	if p.HasPredicate || len(p.IncludeColumns) > 0 || p.Fillfactor != 0 ||
-		p.DeduplicateItems != nil || p.NullsNotDistinct {
+		p.DeduplicateItems != nil || p.NullsNotDistinct || p.Tablespace != 0 {
 		return true
 	}
 	for _, s := range p.ColOpClasses {
@@ -6333,6 +6962,9 @@ func encodeCreateIndexExtension(p CreateIndexPayload) []byte {
 	}
 	if p.NullsNotDistinct {
 		flags |= ciExtNullsNotDistinct
+	}
+	if p.Tablespace != 0 {
+		flags |= ciExtHasTablespace
 	}
 	numCols := len(p.Columns)
 	hasOpClasses := false
@@ -6374,6 +7006,9 @@ func encodeCreateIndexExtension(p CreateIndexPayload) []byte {
 			size += 2 + len(stringAt(p.ColCollations, i))
 		}
 	}
+	if p.Tablespace != 0 {
+		size += 4
+	}
 
 	out := make([]byte, size)
 	off := 0
@@ -6408,6 +7043,10 @@ func encodeCreateIndexExtension(p CreateIndexPayload) []byte {
 			off += 2
 			off += copy(out[off:], c)
 		}
+	}
+	if p.Tablespace != 0 {
+		binary.LittleEndian.PutUint32(out[off:off+4], p.Tablespace)
+		off += 4
 	}
 	return out
 }
@@ -6496,6 +7135,13 @@ func decodeCreateIndexExtension(payload []byte, off *int, numCols int, p *Create
 		p.DeduplicateItems = &v
 	}
 	p.NullsNotDistinct = flags&ciExtNullsNotDistinct != 0
+	if flags&ciExtHasTablespace != 0 {
+		if len(payload) < *off+4 {
+			return fmt.Errorf("wal: create-index payload truncated in tablespace")
+		}
+		p.Tablespace = binary.LittleEndian.Uint32(payload[*off : *off+4])
+		*off += 4
+	}
 	return nil
 }
 
@@ -8236,6 +8882,33 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 		// records after physical replay and re-applies them to the
 		// catalog's schema registry.
 		return false, nil
+	case RecordKindCreateTablespace, RecordKindDropTablespace:
+		// CREATE/DROP TABLESPACE records (M0122-0007 tablespace-registry
+		// restart-durability follow-up) carry only pg_tablespace registry
+		// metadata; goopg's tablespace registry has no backing heap
+		// relation, so the physical replay path has nothing to do. The
+		// recovery driver in internal/initdb/tablespace_ddl_recovery.go
+		// scans the WAL for these records after physical replay and
+		// re-applies them to the catalog's tablespace registry.
+		return false, nil
+	case RecordKindCreateForeignServer, RecordKindDropForeignServer:
+		// CREATE/DROP SERVER records (M0122-0007 foreign-server registry
+		// restart-durability follow-up) carry only pg_foreign_server
+		// registry metadata; goopg's foreign-server registry has no backing
+		// heap relation, so the physical replay path has nothing to do. The
+		// recovery driver in internal/initdb/foreignserver_ddl_recovery.go
+		// scans the WAL for these records after physical replay and
+		// re-applies them to the catalog's foreign-server registry.
+		return false, nil
+	case RecordKindCreateUserMapping, RecordKindDropUserMapping:
+		// CREATE/DROP USER MAPPING records (M0122-0007 user-mapping
+		// restart-durability follow-up) carry only pg_user_mapping registry
+		// metadata; goopg's user-mapping registry has no backing heap
+		// relation, so the physical replay path has nothing to do. The
+		// recovery driver in internal/initdb/usermapping_ddl_recovery.go
+		// scans the WAL for these records after physical replay and
+		// re-applies them to the catalog's user-mapping registry.
+		return false, nil
 	case RecordKindCreateTransform, RecordKindDropTransform:
 		// CREATE/DROP TRANSFORM records (M0119-0004 restart persistence)
 		// carry only pg_transform metadata; goopg has no per-transform file
@@ -9578,20 +10251,47 @@ func replayPageImage(mgr *storage.Manager, payload []byte) error {
 	return writeBlockOrExtend(mgr, rel, blk, page)
 }
 
-// replayStart returns the index of the LAST checkpoint record in
-// records plus its EndLSN. Crash recovery should replay records
-// starting from this index: everything before the checkpoint was
-// already flushed to disk by the checkpoint operation.
+// replayStart returns the replay start index plus the last checkpoint
+// record's EndLSN. Crash recovery replays from the last checkpoint's REDO
+// position — NOT from the checkpoint record itself (C2-S3 review MUST-FIX):
+// the checkpoint's dirty-page/CLOG flush phase runs BEFORE its record is
+// appended, so records in the (redo, checkpoint-record] window cover state
+// the flush may not have captured (a commit acked during the flush phase
+// leaves its CLOG lane dirty in memory with its record before the
+// checkpoint record — anchoring at the record skipped it and the startup
+// implicit-abort sweep then stamped the ACKED commit aborted). Mirrors PG:
+// InitWalRecovery starts redo at checkPoint.redo. Replaying the extra
+// (redo, record] span is idempotent — pages carry pd_lsn guards and CLOG
+// stamps are terminal-state writes.
+//
+// The redo pointer is decoded from the PG-compat 88-byte CheckPoint payload
+// (offset 0, 0-based LSN); legacy 1-byte checkpoint records carry no redo
+// and keep the historical record-anchored behavior.
 //
 // If no checkpoint is found, returns (0, 0) — replay all records
 // from the beginning (correct for fresh clusters or early startup).
 func replayStart(records []Record) (int, uint64) {
-	startIdx := 0
+	ckptIdx := -1
 	var checkpointLSN uint64
 	for i, r := range records {
 		if isCheckpointRecord(r) {
-			startIdx = i // start FROM this checkpoint (inclusive)
+			ckptIdx = i
 			checkpointLSN = r.EndLSN
+		}
+	}
+	if ckptIdx < 0 {
+		return 0, 0
+	}
+	startIdx := ckptIdx
+	if p := records[ckptIdx].Payload; len(p) == 88 {
+		redo0 := binary.LittleEndian.Uint64(p[0:8])
+		// Walk back to the first record whose span ends beyond redo.
+		// Record LSNs are 1-based absolute positions; redo0 is 0-based
+		// (EncodeCheckpointCompat), so EndLSN > redo0+? — comparing
+		// EndLSN (1-based) > redo0 (0-based position) errs toward
+		// replaying one extra byte-adjacent record, which is idempotent.
+		for startIdx > 0 && records[startIdx-1].EndLSN > redo0 {
+			startIdx--
 		}
 	}
 	return startIdx, checkpointLSN

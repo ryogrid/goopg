@@ -25,8 +25,9 @@ import (
 // databaseRegistryRecovery is the catalog-side surface this recovery
 // pass needs. `*catalog.InMemory` satisfies it.
 type databaseRegistryRecovery interface {
-	RegisterDatabaseDuringRecovery(name string)
+	RegisterDatabaseDuringRecovery(name string, owner, oid uint32)
 	UnregisterDatabaseDuringRecovery(name string)
+	DatabaseOid(name string) uint32
 }
 
 // replayDatabaseDDLRecords reads every WAL record under walDir and
@@ -34,7 +35,20 @@ type databaseRegistryRecovery interface {
 // walDir means "freshly initdb'd cluster" and is treated as a no-op.
 // The catalog argument may be nil (some embedded test setups), in
 // which case the function returns nil without doing any I/O.
-func replayDatabaseDDLRecords(walDir string, cat catalog.Catalog) error {
+//
+// dataDir, when non-empty, re-creates base/<oid>/ (+ PG_VERSION) for every
+// replayed CREATE DATABASE record (M0122-0007 physical-storage-isolation
+// slice 2) — CreatePerDatabaseScaffolding is idempotent, so this is safe
+// whether or not the directory already survived the crash. DROP DATABASE
+// replay likewise removes base/<oid> (slice 3) — the oid is looked up from
+// the registry immediately before UnregisterDatabaseDuringRecovery, since
+// the DropDatabase WAL record itself only carries the database name (the
+// same way the live databaseDDLDrop handler must read the oid before
+// calling catalog.DropDatabase, which forgets the name->oid mapping).
+// RemovePerDatabaseScaffolding is idempotent (os.RemoveAll on an
+// already-missing directory is a no-op), so replaying the same DROP twice
+// or after the live server already removed the directory is always safe.
+func replayDatabaseDDLRecords(walDir string, cat catalog.Catalog, dataDir string) error {
 	if cat == nil {
 		return nil
 	}
@@ -62,17 +76,28 @@ func replayDatabaseDDLRecords(walDir string, cat catalog.Catalog) error {
 		}
 		switch rec.Payload[0] {
 		case wal.RecordKindCreateDatabase:
-			name, derr := wal.DecodeCreateDatabase(rec.Payload)
+			name, owner, oid, derr := wal.DecodeCreateDatabase(rec.Payload)
 			if derr != nil {
 				return fmt.Errorf("decode create-database at lsn %d: %w", rec.StartLSN, derr)
 			}
-			reg.RegisterDatabaseDuringRecovery(name)
+			reg.RegisterDatabaseDuringRecovery(name, owner, oid)
+			if dataDir != "" && oid != 0 {
+				if err := CreatePerDatabaseScaffolding(dataDir, oid); err != nil {
+					return fmt.Errorf("recreate base/%d for %q at lsn %d: %w", oid, name, rec.StartLSN, err)
+				}
+			}
 		case wal.RecordKindDropDatabase:
 			name, derr := wal.DecodeDropDatabase(rec.Payload)
 			if derr != nil {
 				return fmt.Errorf("decode drop-database at lsn %d: %w", rec.StartLSN, derr)
 			}
+			oid := reg.DatabaseOid(name)
 			reg.UnregisterDatabaseDuringRecovery(name)
+			if dataDir != "" && oid != 0 {
+				if err := RemovePerDatabaseScaffolding(dataDir, oid); err != nil {
+					return fmt.Errorf("remove base/%d for %q at lsn %d: %w", oid, name, rec.StartLSN, err)
+				}
+			}
 		}
 	}
 	return nil

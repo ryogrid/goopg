@@ -88,7 +88,7 @@ func TestPgConversionVirtualRows(t *testing.T) {
 		t.Error("expected duplicate-conversion error, got nil")
 	}
 
-	tbl := c.tables["pg_catalog.pg_conversion"]
+	tbl := c.ns(DefaultDBOid).tables["pg_catalog.pg_conversion"]
 	if tbl == nil || tbl.VirtualRows == nil {
 		t.Fatal("pg_conversion virtual table missing")
 	}
@@ -155,7 +155,7 @@ func TestPgConversionVirtualRowsFuncOID(t *testing.T) {
 	if _, err := c.CreateConversion(uc, "public"); err != nil {
 		t.Fatalf("CreateConversion: %v", err)
 	}
-	tbl := c.tables["pg_catalog.pg_conversion"]
+	tbl := c.ns(DefaultDBOid).tables["pg_catalog.pg_conversion"]
 	row := tbl.VirtualRows()[0]
 	if row[6] != "public.myconv_func" {
 		t.Errorf("conproc = %q, want public.myconv_func (resolved via FuncOID)", row[6])

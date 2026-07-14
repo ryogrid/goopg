@@ -175,6 +175,27 @@ func (p *parser) parseCreateFunctionTail(pos int, orReplace bool) (Stmt, error) 
 			stmt.Body = "SELECT " + strings.Join(bodyToks, " ")
 			stmt.IsReturnForm = true
 			sawAs = true
+		// SET name {TO|=} value | SET name FROM CURRENT — real PG's
+		// FunctionSetResetClause, part of common_func_opt_item (shared with
+		// ALTER FUNCTION's identical clause, ddl.go). Captured into
+		// stmt.ConfigOps for pg_proc.proconfig instead of raising a syntax
+		// error — SET always lexes as the real keyword KwSet (never
+		// TokenIdent), so this could never have been reached via
+		// isFunctionAttribute()'s TokenIdent-only "set" case below, exactly
+		// like the ALTER FUNCTION bug fixed in M0097-0150 (DU-002 follow-up).
+		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwSet:
+			p.advance() // consume SET
+			op, ok, err := p.parseFunctionConfigSetClause()
+			if err != nil {
+				return nil, err
+			}
+			if ok {
+				stmt.ConfigOps = append(stmt.ConfigOps, op)
+			}
+		// RESET name | RESET ALL — the other half of FunctionSetResetClause.
+		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwReset:
+			p.advance() // consume RESET
+			stmt.ConfigOps = append(stmt.ConfigOps, p.parseFunctionConfigResetClause())
 		case p.isFunctionAttribute():
 			cur := p.cur()
 			// Capture known attributes before consuming them.
@@ -914,6 +935,67 @@ func (p *parser) consumeFunctionAttribute() {
 	default:
 		p.advance()
 	}
+}
+
+// parseFunctionConfigSetClause parses the generic configuration-parameter
+// `SET name {TO|=} value[, value...]` / `SET name FROM CURRENT` clause shared
+// by CREATE FUNCTION/PROCEDURE (common_func_opt_item) and ALTER FUNCTION/
+// PROCEDURE/ROUTINE (alterfunc_opt_list, ddl.go) — NOT ALTER FUNCTION's
+// separate top-level `SET SCHEMA` rule, which callers must check for first.
+// Caller has already consumed the SET keyword. Mirrors gram.y's var_name
+// {TO|=} var_value | var_name FROM CURRENT grammar order: the config name is
+// always parsed BEFORE the TO/=/FROM-CURRENT form. Returns ok=false for
+// `FROM CURRENT` / `TO DEFAULT` (goopg has no per-session GUC snapshot to
+// capture at CREATE/ALTER time, so both collapse to "leave unset" rather
+// than a distinguishable stored value — a documented simplification, see
+// docs/design/0015-0002-pg-proc-catalog-and-routine-registry.md), true with
+// a populated FunctionConfigOp otherwise.
+func (p *parser) parseFunctionConfigSetClause() (FunctionConfigOp, bool, error) {
+	if p.cur().Kind != TokenIdent && p.cur().Kind != TokenQuotedIdent && p.cur().Kind != TokenKeyword {
+		return FunctionConfigOp{}, false, p.errAtCur("expected configuration parameter name after SET")
+	}
+	name := identText(p.cur())
+	p.advance()
+	if (p.cur().Kind == TokenSymbol || p.cur().Kind == TokenOperator) && p.cur().Value == "=" {
+		p.advance()
+	} else {
+		p.acceptKeyword(KwTo)
+	}
+	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwFrom {
+		p.advance() // FROM
+		p.acceptIdentKeyword("current")
+		return FunctionConfigOp{}, false, nil
+	}
+	// DEFAULT lexes as the reserved keyword KwDefault (TokenKeyword), never
+	// TokenIdent — acceptIdentKeyword("default") would never match it, the
+	// same keyword/ident lexing mismatch as SET/FROM/ALL elsewhere in this
+	// file. Must be checked before parseSetValueAtoms, which would otherwise
+	// happily consume the bare keyword as if "default" were a literal value.
+	if p.acceptKeyword(KwDefault) {
+		return FunctionConfigOp{}, false, nil
+	}
+	if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
+		return FunctionConfigOp{}, false, nil
+	}
+	values, err := p.parseSetValueAtoms()
+	if err != nil {
+		return FunctionConfigOp{}, false, err
+	}
+	return FunctionConfigOp{Name: name, Value: strings.Join(values, ",")}, true, nil
+}
+
+// parseFunctionConfigResetClause parses `RESET name` / `RESET ALL`, the
+// other half of FunctionSetResetClause. Caller has already consumed RESET.
+func (p *parser) parseFunctionConfigResetClause() FunctionConfigOp {
+	// ALL lexes as the reserved keyword KwAll (TokenKeyword), never
+	// TokenIdent — acceptIdentKeyword("all") would never match it, the same
+	// keyword/ident lexing mismatch as SET/FROM above.
+	if p.acceptKeyword(KwAll) {
+		return FunctionConfigOp{ResetAll: true}
+	}
+	name := identText(p.cur())
+	p.advance()
+	return FunctionConfigOp{Reset: true, Name: name}
 }
 
 // parseDropProcedureTail picks up after DROP PROCEDURE and returns

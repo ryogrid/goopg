@@ -111,8 +111,10 @@ func TestPartitionChildUsingBeforeWith(t *testing.T) {
 // child may carry a trailing TABLESPACE clause (after FOR VALUES, any WITH, and
 // ON COMMIT), exactly like the non-partition CREATE TABLE path. The parser
 // previously stopped before TABLESPACE, leaving it unconsumed so the statement
-// failed with a syntax error. The name is accepted and discarded (goopg's
-// storage manager does not honour tablespaces), so the parse must simply succeed.
+// failed with a syntax error. As of M0122-0007 the name is captured on
+// CreateTableStmt.Tablespace (the executor resolves and stores it); this test
+// only pins that the parse succeeds, see create_tablespace_test.go for the
+// captured-name assertion.
 func TestPartitionChildTablespaceClause(t *testing.T) {
 	sql := `CREATE TABLE leaf PARTITION OF parent FOR VALUES IN (1) TABLESPACE pg_default`
 	stmts, err := Parse(sql)

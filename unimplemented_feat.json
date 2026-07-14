@@ -34,7 +34,7 @@
    "feature": "Implement signal-based configuration refresh (SIGHUP-style) for the reload command so configuration changes take effect without restarting the server.",
    "task_id": null,
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "v0 server-side handler is a no-op until per-GUC SIGHUP-style refresh wires up"
    ],
@@ -49,13 +49,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open 2026-07-07: cmd/goopg/main.go:1181 runReload prints 'configuration reload signalled (v0 no-op)'; server-side internal/server/server.go:634-637 OnReload callback logs 'reload requested (v0 no-op)' and returns nil. Control-socket RELOAD plumbing (internal/control/control.go:286-293) is fully wired end-to-end, but the callback itself does no GUC re-read/config-file re-parse. Old line citation (main.go:1171) was stale from file drift; substance unchanged."
+   "code_audit": "RESOLVED 2026-07-11 (verify-before-implement; landed 2026-07-08 commit e146b321 'fix(M0122-0007): SIGHUP/goopg-reload actually reloads postgresql.conf'). The audit below described the 2026-07-07 state, which was superseded one day later. Current state: cmd/goopg/main.go runReload sends RELOAD over the control socket; server.go OnReload calls s.reloadConfig() (server.go:699), which re-parses cfg.ConfigPath via config.ParseConfigFile and applies each entry through Registry.ApplyReloadEntries (internal/config/guc.go:522) -- that rejects ContextInternal/ContextPostmaster params with the exact upstream 'cannot be changed [without restarting]' warnings, canonicalizes each value, updates the live GUC, and fires invokeOnChange hooks so subsystems observe the new value. A SIGHUP handler is wired to the same reloadConfig path (server.go:685). Prior confirmed-open 2026-07-07 note (now stale): cmd/goopg/main.go:1181 runReload printed 'configuration reload signalled (v0 no-op)'; OnReload logged 'reload requested (v0 no-op)'."
   },
   {
    "feature": "Implement the restart command for goopg ctl control socket (currently a documented stub).",
    "task_id": null,
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "restart: documented stub since v0 runs in the foreground"
    ],
@@ -70,7 +70,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: cmd/goopg/main.go:1138 explicit not yet implemented message"
+   "code_audit": "RESOLVED 2026-07-11 (verify-before-implement; landed commit b01eae13 'fix(M0122-0007): implement `goopg restart` (was a hard stub)'). cmd/goopg/main.go runRestart -> runRestartWithStarter (main.go:1179) reads -D's postmaster.pid, and if a live instance owns it sends STOP (or STOPIMMEDIATE for -mode immediate) over the control socket, polls ProcessAlive until the pid exits (bounded by -t, default 30s), inherits the stopped instance's listen address when -listen was omitted, then hands off to runStart with the same -D/-config/-hba -- i.e. the foreground 'stop then start' an operator would run by hand (v0 has no postmaster fork, so restart cannot daemonize a replacement, matching pg_ctl restart's behavior only in-foreground). A stale/absent postmaster.pid is treated as 'nothing to stop'. Tests: cmd/goopg/main_test.go TestRunRestartWithStarter (injects a fake starter; covers no-pidfile, stale-pidfile, and live-stop paths). The old line citation main.go:1138 now points into runStop, not a stub."
   },
   {
    "feature": "Implement tablespace support for directing table and index storage to different physical locations.",
@@ -91,7 +91,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/executor/operators_ddl.go:280 rejects external tablespaces as unsupported"
+   "code_audit": "PARTIAL (2026-07-09, M0122-0007 physical-relocation follow-up): in-place tablespaces (CREATE TABLESPACE ... LOCATION '' with allow_in_place_tablespaces on) now genuinely direct table/index storage — storage.RelFileNode gained TblOid, Manager.relPath/RelPath route through pg_tblspc/<TblOid>/..., and ALTER TABLE/INDEX ... SET TABLESPACE physically copies the relation's file there (see .ralph/fix_plan.md M0122-0007 and docs/design/0095-0003-in-place-tablespace.md's \"Physical relocation\" section). internal/executor/operators_ddl.go's external (absolute-path) tablespace rejection is UNCHANGED and remains intentional, not a gap: goopg has no cross-filesystem relocation mechanism and upstream's own in-place-tablespace feature (this same LOCATION='' form) exists specifically for the dev/test use case goopg targets."
   },
   {
    "feature": "Implement multi-database support so a single server instance can manage multiple independent databases.",
@@ -160,7 +160,7 @@
    "feature": "Timestamp-timestamp interval arithmetic (subtracting timestamps produces intervals)",
    "task_id": null,
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "Out of scope (deferred): EXTRACT (its own grammar), timestamp-timestamp interval, sub-day units, multi-field intervals"
    ],
@@ -175,13 +175,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open 2026-07-07: internal/executor/expr.go:1359-1366 (evalBinary, OpAdd/OpSub case) still routes only KindTime+KindInterval through addTimeInterval; comment explicitly states 'timestamp - timestamp (returns interval upstream; scope-deferred until the type system)' — no KindTime-KindTime path exists anywhere in expr.go (only the unrelated equality helper at line 6495 compares KindTime==KindTime for `=`). timestamp1 - timestamp2 still falls through to the integer-arithmetic path and errors. No test exercises timestamp-timestamp interval subtraction."
+   "code_audit": "RESOLVED 2026-07-11: timestamp - timestamp now yields an interval. evalBinary (internal/executor/expr.go) gained a KindTime-KindTime OpSub branch -> subTimeTime, which computes the microsecond delta and justifies it into whole 24h days (mirrors timestamp_mi + interval_justify_hours); interval +/- interval -> addIntervalInterval was added alongside. The KindInterval carrier now packs sub-day microseconds in the reserved Hi word (Datum.IntervalMicrosValue / NewIntervalDatumFull, internal/executor/datum.go); formatInterval was rewritten to mirror EncodeInterval INTSTYLE_POSTGRES including the [-|+]HH:MM:SS[.ffffff] time component (verified byte-for-byte against real PostgreSQL 18.3). Analyzer (internal/analyzer/analyzer.go) now types timestamp/time/date subtraction as interval (was 42725 'operator is not unique') and interval +/- interval as interval. Spill/group-key/interval-compare paths extended to carry micros. Tests: internal/executor/interval_subday_test.go. Deferred (see deferral_ledger.md): sub-day interval *literal* syntax (item 'Sub-day interval units', a parser change) and date-date -> integer (goopg models DATE as timestamp, so date-date yields interval not upstream's int4 day count)."
   },
   {
    "feature": "Sub-day interval units (hours, minutes, seconds, milliseconds) for interval arithmetic",
    "task_id": null,
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "Out of scope (deferred): EXTRACT (its own grammar), timestamp-timestamp interval, sub-day units, multi-field intervals"
    ],
@@ -196,7 +196,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open 2026-07-07: internal/parser/select.go:3009-3016 (Form 1, trailing-unit interval '<N>' <unit>) and :3089-3092 (splitEmbeddedInterval, Form 2 interval '<N> <unit>') both switch only on day/days, month/months, year/years — no hour/minute/second/millisecond/microsecond cases exist in internal/parser (grep for hour|minute|millisecond|microsecond in parser/*.go hits only a comment at expr.go:119-121 noting 'sub-second fields wait'). internal/executor's KindInterval carrier (datum.go:28-37) also only packs months+days, explicitly 'drops sub-day precision.' Both parser and storage layer remain day-granularity only."
+   "code_audit": "RESOLVED 2026-07-11 (parser half): sub-day interval *literals* are now accepted end-to-end. The four unit switches (internal/parser/select.go Form 1 trailing-unit and splitEmbeddedInterval Form 2; internal/executor/expr.go evalIntervalLit and parseIntervalCastString) gained hour/minute/second/millisecond (+plural) cases converting the magnitude to microseconds via NewIntervalDatumFull, using new usecsPerHour/Minute/Second/Milli consts. So interval '2 hours', interval '90 minutes', interval '2' hour, '3 hours'::interval, and CAST('15 minutes' AS interval) all parse; arithmetic composes them with day/hour parts (interval '1 day' + interval '2 hours' -> '1 day 02:00:00'). Rendering rides the already-PG-verified formatInterval time component. Tests: internal/executor/interval_subday_test.go TestSubDayIntervalLiterals. Follow-ups since RESOLVED (all landed): fractional magnitudes (2026-07-11), multi-field / HH:MM:SS literals (2026-07-11, hoisted the interval-body math into internal/parser/interval.go ParseIntervalBody), the coarse units week/decade/century/millennium/microsecond incl. dec/cent/mil/us/usec abbreviations (2026-07-11, canonicalIntervalUnit + IntervalUnitToParts; tests TestWeekDecadeCenturyIntervals), and the bare-number default-unit d-i (2026-07-11, a unitless field defaults to seconds: interval '5' -> 00:00:05, interval '1 day 5' -> 1 day 00:00:05; ParseIntervalBody accepts a unitless number only as the final field with the SECOND slot free, reproducing PG DecodeInterval's right-to-left tmask&fmask collision rule so interval '1 2 days'/'5 5'/'1 day 05:00:00 5' still error; tests TestTrailingBareNumberDefaultsToSeconds), and the SQL year-month hyphen field (2026-07-11, interval '1-2' -> 1 year 2 months: a <int>-<int> token decodes to years*12 +/- months via new parser.parseYearMonthField, mirroring PG DecodeInterval's DTK_NUMBER hyphen branch type=DTK_MONTH; leading '-' flips both year and month sign so '-1-2' -> -14 months; month part bounded 0<=m<12 with nothing trailing so '1-12'/'1-13'/'1--2'/'1-2-3'/'1-2x' error; composes with other fields incl. trailing bare-seconds '1-2 3' -> 1 year 2 mons 00:00:03; tests TestYearMonthHyphenIntervals), and the single-letter unit forms d-ii (2026-07-11, y/c/w/d/h/m/s added to canonicalIntervalUnit from PG's deltatktbl; in an interval literal m is unambiguously MINUTE not month -- DecodeInterval decodes the unit via DecodeUnits->deltatktbl regardless of neighbouring fields, so there is no positional ambiguity: interval '1 m' -> 00:01:00 and interval '1 y 2 m' -> 1 year 00:02:00; quarter/qtr and the timezone tokens (tz/timezone) appear in deltatktbl but have no case in DecodeInterval's per-unit switch so PG raises DTERR_BAD_FORMAT 22007 and goopg intentionally rejects them too; tests TestWeekDecadeCenturyIntervals + TestIntervalCastFromStringInvalidSyntax), and the glued <magnitude><unit> forms plus field-mask collisions d-iii (2026-07-11, interval '2h30m'/'1.5h'/'1y2mon3d'/'-5h'/'1day' now parse: ParseIntervalBody pre-expands each whitespace field via expandIntervalFields/splitAlphaNumRuns, reproducing PG ParseDateTime's digit<->letter field split incl. the datetktbl gobble rule -- a multi-letter unit glued before a digit is accepted only when the letters form an absolute datetktbl token (d/h/m/s/y/mon/dec) so '1d2h'/'1mon2d'/'1dec2d' parse but '1day2h'/'1w2d'/'1min2sec' error; and the DecodeInterval tmask&fmask collision check is now modelled by an intervalFieldMask so repeated fields error -- '1h2h', '1 mon 2 mons', '1-2 3 mons', a unit colliding with a HH:MM:SS time word '1h 05:00:00', and fractional-second-vs-ms '1.5 sec 200 ms' all raise 22007; tests TestGluedIntervalLiterals), and the ISO-8601 duration bodies d-iii-rest (2026-07-11, interval 'P1Y2M3DT4H5M6S'/'PT1H30M'/'P1.5D' plus the alternative format extended 'P0002-06-07T01:30:00' and basic packed 'P00020607T013000' now parse: ParseIntervalBody was split into decodeIntervalFields (the free-form decoder) + a new decodeISO8601Interval fallback tried ONLY when the free-form decoder fails, exactly PG interval_in's 'if bad format, try ISO8601 style' ordering; decodeISO8601Interval line-ports DecodeISO8601Interval as a datepart/havefield state machine over P<date>T<time> -- Y/M/W/D before T, H/M/S after so M is months before T but minutes after -- and every designator + extended-alternative field routes through the shared IntervalUnitToParts so the two decoders cannot drift, only the 8-digit/6-digit basic packed formats use inline math; new scanISONumberPrefix/parseISO8601Number/iso8601IntegerWidth/clampISOInterval mirror PG's ParseISO8601Number/ISO8601IntegerWidth/itmin2interval; tests TestISO8601IntervalLiterals), and the year-month tokenizer quirks '1-' and '1-2.5' (2026-07-11: interval '1-' -> 1 year and interval '1-2.5' -> 1 year 2 mons 00:00:00.5. PG's ParseDateTime lexer reads '1-2.5' as a DTK_DATE field '1-2' then a fresh DTK_NUMBER field '.5', so the fraction decodes as seconds; new splitYearMonthFraction in expandIntervalFields peels a '.'-led run off an UNSIGNED <digits>-<digits?> field and feeds the remainder back through splitAlphaNumRuns so '1-2.5day' splits again into .5+day -> +12:00:00. A SIGNED field ('-1-2.5','+1-2.5') is lexed whole as PG's DTK_TZ token whose years-months branch rejects the .5 tail, so goopg leaves it whole and errors too. parseYearMonthField now treats an empty month tail as 0 months ('1-'/'-1-' are bare years, PG strtoint on the empty tail = 0); tests TestYearMonthHyphenIntervals +22 accepts/8 rejects). STILL DEFERRED (see deferral_ledger.md): (d-iii-rest) full interval typmod grammar (HOUR TO MINUTE ranges, SECOND(p) precision, Form-1 trailing-word column-alias fall-through); interval +/- infinity; and a bare unit-word glued to a year-month field (interval '1-2h' -> PG 1 year 2 mons with the 'h' absorbed as a no-op since the year-month forces DTK_MONTH; goopg errors)."
   },
   {
    "feature": "SASLprep string normalization, channel binding support, and scram_iterations GUC configuration for SCRAM-SHA-256.",
@@ -212,12 +212,13 @@
     "d6acfaca76f41c41dfebe700bbc10fa0438905bf"
    ],
    "resolution_check": {
-    "ledger": "no-match",
+    "ledger": "open",
     "fix_plan": "no-match",
     "later_commits": "superseded-by-code-audit"
    },
+   "code_audit": "narrowed 2026-07-12: two of the three bundled sub-features are already fully implemented and wired. SASLprep: internal/auth/saslprep.go + saslprep_tables.go is a straight port of postgres/src/common/saslprep.c (RFC 4013), applied at both scramBuildSecret call sites (scram.go:88 password->secret, scram.go:180 verify) via saslPrepOrOriginal. scram_iterations GUC: registered (config/defaults.go:184, BootVal 4096) and honored on the live password-set path -- role_ddl.go:320 NewSCRAMSecretWithIterations(resolveScramIterations(...)) reads the calling session's live GUC, so SET scram_iterations=N changes PBKDF2 cost of newly-set passwords. Also hardened the SCRAM exchange this loop: handleClientFinal now verifies the c= gs2-cbind-flag echoes the SAME flag sent in client-first ('n'->\"n,,\", 'y'->\"y,,\"), matching auth-scram.c read_client_final_message:211 (was accepting either spelling -- a downgrade-tamper gap). Still-open residual: channel binding PROPER (SCRAM-SHA-256-PLUS / tls-server-end-point) is architecturally blocked -- goopg has no TLS; server.go:1211 transparently REJECTS SSLRequest, so no channel-binding data exists to bind. Unblocks only when TLS termination lands. See deferral_ledger.md.",
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/auth/scram.go:45,75,150 scramDefaultIterations hardcoded (scram_iterations GUC registered in internal/config/defaults.go:184 but never consulted); scram.go:279-289 channel binding explicitly rejected; no SASLprep anywhere — GUC registration is cosmetic only"
+   "code_audit": "partially-resolved 2026-07-08: scram_iterations GUC is now consulted — auth.NewSCRAMSecretWithIterations (internal/auth/scram.go) + role_ddl.go's resolveScramIterations read the live session GUC for CREATE/ALTER ROLE PASSWORD (fix_plan.md M0122-0008, docs/design/root-0021-role-auth-persistence.md). SASLprep (RFC 4013) also landed 2026-07-08: internal/auth/saslprep.go ports pg_saslprep byte-for-byte (mechanically-extracted tables in saslprep_tables.go, NFKC via golang.org/x/text/unicode/norm), wired into NewSCRAMSecretWithIterations/VerifySCRAMSecretFromPassword, differential-tested against a real libpq client (TestE2E_SASLPrepMatchesRealLibpqClient); see docs/design/0049-0003-scram-sha-256.md §3.1. Still confirmed-open: scram.go:279-289 channel binding explicitly rejected"
   },
   {
    "feature": "Lehman/Yao crab-walk concurrency control for B-tree index operations",
@@ -349,8 +350,8 @@
   {
    "feature": "Per-slot catalog-xmin retention hook in vacuum and pruning operations",
    "task_id": null,
-   "resume_point": null,
-   "status": "open",
+   "resume_point": "RESOLVED 2026-07-12: OldestXmin folds in wal.Slots.MinCatalogXmin via mvcc.Manager.SetCatalogXminSource (wired in initdb.Open); producer API Slots.AdvanceCatalogXmin added. Deferred: decoder->AdvanceCatalogXmin wiring + data-vs-catalog horizon split (see deferral_ledger.md 2026-07-12).",
+   "status": "resolved",
    "evidence": [
     "the per-slot catalog-xmin retention hook in vacuum / pruning remain deferred"
    ],
@@ -476,9 +477,9 @@
   },
   {
    "feature": "Eager next-segment lookahead for WAL preallocation optimization.",
-   "task_id": "M0007",
+   "task_id": "M0122-0009",
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "eager next-segment lookahead ... remain deferred"
    ],
@@ -493,7 +494,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "PARTIAL: WAL segment preallocation of the current segment on first open is implemented (internal/wal/writer.go:1896-1961, wal_init_zero GUC), landed via docs/design/0007-0001-wal-segment-preallocation.md. Still missing: eager next-segment lookahead (pre-creating segment N+1 in the background before the write head reaches it) — state.openSegment (writer.go:1896) only preallocates synchronously when a segment is first needed."
+   "code_audit": "RESOLVED 2026-07-09: state.openSegment now calls the new state.eagerPreallocSegment(segNo+1) (internal/wal/writer.go) right after handling segNo, spawning a background goroutine (temp-file + os.Link-no-clobber, mirroring upstream XLogFileInit) that zero-fills and durably links segNo+1 into place before the writer's write head ever reaches it. state.eagerWG lets close() wait for any in-flight job. Also fixed a new correctness hazard this exposed: detectWritePos (writer.go) previously trusted every non-last segment as fully-used by file size alone, which a crash-time all-zero eager phantom segment above the genuinely-active one would silently defeat (overshooting writePos to the wrong segment's end) — now walks backward trimming any full-size, entirely-empty trailing segment before applying the existing last-segment scan. Tests: TestDetectWritePos_IgnoresEagerPhantomFutureSegment (internal/wal/writer_detect_test.go, confirmed non-vacuous by reverting the trim loop), TestPreallocationCounters updated for the new one-segment-ahead counts. See docs/design/0007-0001-wal-segment-preallocation.md 'Follow-up (2026-07-09)'."
   },
   {
    "feature": "Counters for WAL preallocation metrics and monitoring.",
@@ -625,7 +626,7 @@
    "feature": "KindDate carrier type for proper date-specific BETWEEN codec semantics",
    "task_id": "m0003",
    "resume_point": "0003-0013",
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "KindDate carrier"
    ],
@@ -635,18 +636,18 @@
     "64c0eeb2f3d6b970c94eac81575c9249a1f2c23e"
    ],
    "resolution_check": {
-    "ledger": "no-match",
+    "ledger": "match",
     "fix_plan": "no-match",
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open 2026-07-07: no KindDate carrier exists — internal/executor/datum.go:21-64 DatumKind enum lists KindNull/KindBool/KindInt/KindString/KindBytes/KindTime/KindInterval/KindNumeric/KindToastPointer/KindEnum only; date and timestamp values both still share KindTime. Repo-wide grep for KindDate hits only docs/design/0003-0013-between-operator.md:104-106 (which still lists it under 'Out of scope (deferred)') and backlog/tooling artifacts — zero hits in any .go source file. Gap is unaddressed."
+   "code_audit": "RESOLVED 2026-07-12 (m0003): goopg carries date-ness on the shared KindTime datum via the flagDate bit (internal/executor/datum.go), not a distinct DatumKind — functionally equivalent for the date-specific codec/rendering semantics this item tracked. The concrete gap was that decodePhysicalPGValueMctx's `date` case (internal/executor/codec.go) returned a flagless NewTimeDatum, so a storage-decoded date rendered via Datum.Format() as the full timestamp shape (2001-02-16 00:00:00.000000) instead of the date shape a literal produces; text casts, string concat, and array/composite element rendering were affected (the wire path in server/dispatch.go was already correct because it re-derives date formatting from the column type). Fixed: new NewDateDatum constructor sets flagDate; the decode `date` case now uses it. BETWEEN over dates already worked (compareDatum/datumKey are flag-agnostic). Test: internal/executor/codec_date_test.go TestDateDecodeCarriesDateFlag. Design: docs/design/0003-0013-between-operator.md Follow-up section. A dedicated KindDate enum value is deliberately not introduced (flagDate is the carrier)."
   },
   {
    "feature": "Implement window frame clause semantics for ROWS, RANGE, GROUPS frame modes and frame exclusion options.",
    "task_id": "M0020",
    "resume_point": "implement frame clause execution logic",
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "Frame clauses (ROWS / RANGE / GROUPS / frame-exclusion) parse but error explicitly with 'frame clauses are not supported in v0'"
    ],
@@ -661,7 +662,7 @@
     "later_commits": "confirmed-open-code-audit: select.go:3439 frame clauses rejected by parser"
    },
    "confidence": "high",
-   "code_audit": "partially-resolved 2026-07-07 (re-verified, no change since M0122-0004): ROWS frame mode remains the only implemented frame unit — internal/analyzer/analyzer.go:1570-1571 still hard-rejects RANGE/GROUPS with 0A000 ('RANGE and GROUPS window frame units are not supported in v0; only ROWS is implemented'). ROWS-frame tests still pass at HEAD: TestCompatWindowExplicitRowsFrameSliding, TestCompatWindowExplicitFrameExcludeCurrentRow, TestCompatWindowExplicitFrameExcludeGroupAndTies, TestCompatWindowFrameNegativeOffsetRejected all PASS (go test ./internal/executor/ -run 'TestCompatWindowExplicit...'). RANGE/GROUPS peer-comparison / group-counting bounds still unimplemented — core gap remains OPEN. Design: docs/design/0020-0001-window-parser-and-ast.md Follow-up section; see .ralph/deferral_ledger.md."
+   "code_audit": "partially-resolved 2026-07-09: GROUPS frame mode now implemented end-to-end (internal/analyzer/analyzer.go's validateWindowFrame requires an ORDER BY column for GROUPS per parse_clause.c; internal/executor/operators_window.go's frameBoundsGroups performs the ROWS-mode arithmetic on peer-group indices instead of row indices) — TestCompatWindowExplicitGroupsFrameSliding/TestCompatWindowGroupsUnboundedPrecedingCumulative PASS, both cross-checked against a real PostgreSQL 18.3 instance. RANGE frame mode remains rejected with 0A000 (analyzer.go's validateWindowFrame default case) — its offset PRECEDING/FOLLOWING bounds need a per-ORDER-BY-column type-aware +/-/< operator lookup that GROUPS' plain integer peer-group counting didn't require. Design: docs/design/0020-0001-window-parser-and-ast.md 'Follow-up: GROUPS window frame mode' section; see .ralph/deferral_ledger.md (2026-07-09 row). RESOLVED 2026-07-11 (M0122-0004): RANGE value-offset bounds (RANGE BETWEEN n PRECEDING AND m FOLLOWING) now implemented via internal/executor/operators_window.go's frameBoundsRange (PostgreSQL in_range semantics reusing evalBinary/compareDatum), analyzer requires exactly one ORDER BY column (42P20). All three frame modes (ROWS/RANGE/GROUPS) + exclusion are now complete; cross-checked byte-for-byte vs PG 18.3. See docs/design/0122-0004-range-offset-window-frame.md."
   },
   {
    "feature": "Support window function references by name using OVER window_name syntax and WINDOW clause definitions.",
@@ -842,7 +843,7 @@
    "feature": "Window function frame clauses and named windows are not yet implemented.",
    "task_id": "M0020",
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "Frame clauses and named windows remain deferred"
    ],
@@ -857,7 +858,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "partially-resolved 2026-07-07 (re-verified, no change since 2026-07-05): named windows and ROWS frame clause remain landed and working — TestCompatWindowNamedWindowClause PASSes (parser supports WINDOW w AS (...), internal/parser/select.go), plus the ROWS-frame test set (TestCompatWindowExplicitRowsFrameSliding, TestCompatWindowExplicitFrameExcludeCurrentRow/GroupAndTies) all PASS. RANGE/GROUPS frame modes are still the sole open item: internal/analyzer/analyzer.go:1570-1571 rejects them with 0A000. No RANGE/GROUPS implementation found anywhere in internal/executor or internal/analyzer. Verdict unchanged from the 2026-07-05 audit — still OPEN on RANGE/GROUPS. All 11 standard PostgreSQL window functions are implemented under the default frame (see prior audit history); design: docs/design/0020-0001-window-parser-and-ast.md Follow-up sections."
+   "code_audit": "partially-resolved 2026-07-09: named windows, ROWS frame clause, and now GROUPS frame clause are all landed and working — TestCompatWindowNamedWindowClause, the ROWS-frame test set, and the new TestCompatWindowExplicitGroupsFrameSliding/TestCompatWindowGroupsUnboundedPrecedingCumulative (internal/executor/window_compat_test.go) all PASS, cross-checked against a real PostgreSQL 18.3 instance. RANGE frame mode is now the sole open item: internal/analyzer/analyzer.go's validateWindowFrame default case rejects it with 0A000 (needs a per-ORDER-BY-column type-aware +/-/< operator lookup GROUPS' integer peer-group counting didn't require). All 11 standard PostgreSQL window functions are implemented under the default frame (see prior audit history); design: docs/design/0020-0001-window-parser-and-ast.md Follow-up sections. RESOLVED 2026-07-11 (M0122-0004): the last frame-clause gap, RANGE value-offset bounds, now lands via frameBoundsRange (internal/executor/operators_window.go) — all frame modes and named windows complete; see docs/design/0122-0004-range-offset-window-frame.md."
   },
   {
    "feature": "Implement full Borrow-semantics architectural rewrite for comprehensive allocation optimization (current stage only addresses specific call sites without the architectural change).",
@@ -1239,9 +1240,9 @@
   },
   {
    "feature": "SASLprep pre-processing for SASL authentication username normalization",
-   "task_id": null,
+   "task_id": "M0122-0008",
    "resume_point": "see maybe_not_completed_tasks.md for deferred details",
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "Tasks include deferred features such as: Authentication: SASLprep"
    ],
@@ -1256,7 +1257,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/auth/exchange.go:151-243 + scram.go:149-160 pass username/password raw with zero SASLprep/stringprep normalization anywhere in repo; docs/design/root-0003-authentication.md:232-235 self-documents SASLprep not applied in v0"
+   "code_audit": "resolved 2026-07-08: internal/auth/saslprep.go ports pg_saslprep (postgres/src/common/saslprep.c, RFC 4013) byte-for-byte, including its exact prohibited-output/bidi-check quirk (checked against mapped-but-pre-NFKC codepoints); internal/auth/saslprep_tables.go holds the six Unicode range tables, mechanically extracted from the C source (not hand-transcribed). NFKC via new golang.org/x/text dependency. Wired into NewSCRAMSecretWithIterations/VerifySCRAMSecretFromPassword (internal/auth/scram.go), each falling back to the raw password on SASLprep failure like upstream. Tests: TestPGSASLPrepRFC4013Examples/TestSCRAMSecretNormalizesEquivalentUnicodeForms (internal/auth) + a differential e2e test against a real libpq client, TestE2E_SASLPrepMatchesRealLibpqClient (internal/testport), since lib/pq's own Go SCRAM client does no SASLprep at all. Design: docs/design/0049-0003-scram-sha-256.md §3.1. Note: this leaves usernames still unprepped (only passwords are SASLprepped, matching upstream — pg_saslprep is only ever called on passwords in auth-scram.c, never on the SASL 'authzid'/username, so the original feature-title framing ('username normalization') was itself imprecise)."
   },
   {
    "feature": "Channel binding support for SASL authentication to validate client-server channel integrity",
@@ -1453,7 +1454,7 @@
    "feature": "Anti-semi-join optimization for NOT IN subqueries not implemented; planner rejects negated IN conditions",
    "task_id": "M0069-0005",
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "in.Negated=true (NOT IN) is rejected — anti-semi-join semantics out of scope"
    ],
@@ -1468,13 +1469,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open 2026-07-08: internal/planner/unnest.go:1200 (isUnnestableNonCorrelatedIn) still hard-rejects negated IN — 'if in.Negated { return false }', comment 'NOT IN requires anti-semi-join semantics which are out of scope for M0069-0005'; git log --all --grep=anti-semi/AntiJoin finds no later commit converting NOT IN to an AntiJoin plan. Unchanged since ebb267d6"
+   "code_audit": "RESOLVED 2026-07-09 (M0122-0011, this loop): non-correlated `x NOT IN (subquery)` now unnests to a NullAware JoinTypeAnti hash join (internal/planner/unnest.go's isUnnestableNonCorrelatedIn/unnestNonCorrelatedInExpr, new Join.NullAware field in internal/planner/plan.go). The executor (internal/executor/operators_join_agg.go) gives NullAware Anti joins NOT IN's three-valued-NULL semantics instead of the plain NOT-EXISTS-shaped Anti join a naive relax would have produced: a NULL anywhere in the subquery's build side poisons the whole predicate to empty output, an empty subquery emits every outer row unconditionally (including NULL outer values), and otherwise a NULL outer/probe value is excluded rather than kept. See docs/design/0040-0001-subquery-caching-and-unnest.md's new Follow-up section and the deferral ledger for the still-open correlated-NOT-IN gap this loop deliberately left untouched."
   },
   {
    "feature": "Non-trivial expressions on IN-subquery LHS not optimized to SemiJoin; falls back to runtime cache path",
    "task_id": "M0069-0005",
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "in.Operand must be a ColumnRef — non-trivial expressions on the LHS keep the runtime cache path"
    ],
@@ -1489,7 +1490,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open 2026-07-08: internal/planner/unnest.go:1203 (same isUnnestableNonCorrelatedIn function) unchanged — 'if _, ok := in.Operand.(*ColumnRef); !ok { return false }'; no commit relaxes this to accept arbitrary expressions (BinaryExpr, FuncCall, etc.) as IN-subquery LHS. Still restricted to plain ColumnRef"
+   "code_audit": "RESOLVED 2026-07-09 (M0122-0011 follow-up, this loop): isUnnestableNonCorrelatedIn (internal/planner/unnest.go) no longer requires in.Operand to be a *ColumnRef — the guard now only checks in.Plan is non-nil with a single output column. unnestNonCorrelatedInExpr builds the Semi/Anti join's LeftKey directly from in.Operand (dropped the ColumnRef-field-copy reconstruction) since Join.LeftKey/RightKey are already general Expr and the hash-join executor evaluates them via evalExpr (internal/executor/operators_join_agg.go's evalHashKey), so `f(x) IN (subquery)` / `a+b IN (subquery)` now unnest identically to a bare-column LHS. Tests: internal/planner/not_in_unnest_test.go:TestUnnestNonCorrelatedIn_NonColumnRefOperand (new); internal/planner/unnest_test.go:TestRecursiveUnnestInsideNonUnnestableIN updated to force non-unnestability via a non-equijoin correlation instead of a non-ColumnRef operand, since operand shape alone no longer blocks unnesting. Confirmed non-vacuous via git stash. Design: docs/design/0040-0001-subquery-caching-and-unnest.md new Follow-up section."
   },
   {
    "feature": "Schema-vs-runtime layout mismatch in walker implementation causes incorrect results; blocks multiple optimization attempts",
@@ -1957,7 +1958,7 @@
    "feature": "The loadTables function uses a type assertion for InMemory catalog and silently no-ops when called with other catalog implementations",
    "task_id": "M0087",
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "loadTables uses a *catalog.InMemory type assertion and silently no-ops on any other catalog implementation"
    ],
@@ -1972,7 +1973,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: launcher.go:181-186 silently returns nil for non-InMemory catalogs"
+   "code_audit": "RESOLVED 2026-07-11: autovacuum/launcher.go loadTables now peels the Unwrap() chain (the same idiom as internal/server/dispatch.go / internal/planner/planner.go) instead of a bare *catalog.InMemory assertion, so a wrapper catalog such as *catalog.SearchPathCatalog reaches the underlying InMemory and its AllTables() instead of silently no-opping autovacuum. Regression test TestLoadTablesPeelsWrappedCatalog in internal/autovacuum/launcher_test.go."
   },
   {
    "feature": "DEFAULT clause in column definitions is skipped during parsing; default values are not stored or applied to new rows",
@@ -2144,13 +2145,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "RESOLVED 2026-07-08 (M0122 follow-up): expr.go's pg_get_serial_sequence() now uses the real OWNED-BY dependency (FindSequenceOwnedBy/catalog.Column.OwnedBy tracking already maintained by SERIAL/IDENTITY column registration and explicit ALTER SEQUENCE ... OWNED BY) instead of fabricating \"table_col_seq\" by convention. Returns NULL for a column that owns no sequence, and follows a renamed sequence correctly. Tests: TestPgGetSerialSequenceSerialColumn/NonSerialColumnReturnsNull/FollowsRename/IdentityColumn in internal/executor/operators_pg_get_serial_sequence_test.go."
+   "code_audit": "RESOLVED 2026-07-08 (M0122 follow-up): expr.go's pg_get_serial_sequence() now uses the real OWNED-BY dependency (FindSequenceOwnedBy/catalog.Column.OwnedBy tracking already maintained by SERIAL/IDENTITY column registration and explicit ALTER SEQUENCE ... OWNED BY) instead of fabricating \"table_col_seq\" by convention. Returns NULL for a column that owns no sequence, and follows a renamed sequence correctly. Tests: TestPgGetSerialSequenceSerialColumn/NonSerialColumnReturnsNull/FollowsRename/IdentityColumn in internal/executor/operators_pg_get_serial_sequence_test.go. FOLLOW-UP 2026-07-08 (same day, later loop): closed the narrower residual this row's own resolution left open — an explicit CREATE/ALTER SEQUENCE ... OWNED BY schema.table.column is now normalized to the bare table.column form via bareOwnedByTableColumn (operators_ddl.go) before being stored, so FindSequenceOwnedBy's bare-form lookup no longer misses it. Tests: TestPgGetSerialSequenceExplicitSchemaQualifiedOwnedBy/AlterSequenceSchemaQualifiedOwnedBy. See deferral_ledger.md's 2026-07-08 row for a newly-discovered, still-open seqRegistry global-scoping gap this surfaced (separate, larger, not fixed here)."
   },
   {
    "feature": "isfinite() function is not implemented (goopg v0 has no infinity values to check).",
    "task_id": "m0097-0004",
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "isfinite(x): stub"
    ],
@@ -2165,7 +2166,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/executor/expr.go:5017 — isfinite() is a stub that always returns TRUE for non-NULL input"
+   "code_audit": "RESOLVED 2026-07-11 (unimplemented_feat #5(d-iv) follow-up): once the interval (NOBEGIN/NOEND) and timestamp/date (KindTime INT64-extreme) ±infinity sentinels landed, evalIsFinite (internal/executor/expr.go) was upgraded from the v0 always-TRUE stub to a line-port of PG's date_finite/timestamp_finite/interval_finite (postgres/src/backend/utils/adt/{date,timestamp}.c): returns FALSE when d.IsTimestampNotFinite() || d.IsIntervalNotFinite(), TRUE for any other finite value, NULL still propagates (strict). isfinite() is now correct for every value goopg can produce; the only remaining gaps are the separate ability to CONSTRUCT an infinite timestamp/date from a typed literal (timestamp 'infinity' input parsing + wire codec) and timestamp-minus-timestamp with an infinite operand — both tracked on the timestamp-infinity carrier row in deferral_ledger.md, neither an isfinite defect. Tests: internal/executor/isfinite_test.go TestIsFiniteInfinity (8 cases, all cross-checked vs live PG 18.3 socket /tmp:5599) + TestIsFiniteNullPropagates. Design: docs/design/0003-0006-date-interval-arithmetic.md new Follow-up."
   },
   {
    "feature": "justify_hours(), justify_days(), and justify_interval() functions are stubs that return input unchanged.",
@@ -2186,7 +2187,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/executor/expr.go:5030 — justify_hours/days/interval return input unchanged (stub)"
+   "code_audit": "RESOLVED 2026-07-11: all three functions now mirror interval_justify_hours/interval_justify_days/interval_justify_interval (postgres/src/backend/utils/adt/timestamp.c) byte-for-byte. justify_days was already folding whole 30-day chunks of days into months (M0097-0004), but justify_hours/justify_interval were no-ops because the v0 KindInterval carrier had no sub-day field. Now that the carrier packs sub-day microseconds (Datum.IntervalMicrosValue, added 2026-07-11), evalJustify (internal/executor/expr.go) dispatches all three: justify_hours folds whole 24h chunks of the micros field into days (justifyIntervalHours); justify_interval does the full three-field normalization incl. pre-justify + cross-field sign equalization (justifyIntervalFull), with int32 day/month overflow raising 22008 'interval out of range' (errIntervalRange, addDayS32) like PG's pg_add_s32_overflow. Verified live vs PostgreSQL 18.3: justify_hours('27 hours')='1 day 03:00:00', justify_interval('1 mon -1 hours')='29 days 23:00:00', justify_interval('29 days 25 hours')='1 mon 01:00:00'. Tests: internal/executor/interval_justify_test.go TestJustifyIntervalFunctions (+12 sub-day rows)."
   },
   {
    "feature": "Add pg_stat_io walsummarizer backend_type rows to track WAL summarizer process statistics.",
@@ -2669,7 +2670,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: enable_parallel_hash/hash_mem_multiplier/from_collapse_limit/parallel_leader_participation registered internal/config/defaults.go:785-823 + pg_settings catalog.go:9945-9988; zero references in internal/planner (the only cost/plan package) — pure accepted-and-ignored stubs"
+   "code_audit": "registration substantially advanced 2026-07-12 (M0122-0007): the named GUCs (enable_parallel_hash/hash_mem_multiplier/from_collapse_limit/parallel_leader_participation) plus the full enable_* toggle family were already registered; this loop added the remaining commonly-issued planner-tuning GUCs — the 7-member GEQO family (geqo/geqo_threshold/geqo_effort/geqo_pool_size/geqo_generations/geqo_selection_bias/geqo_seed) and the three QUERY_TUNING_OTHER reals (constraint_exclusion/cursor_tuple_fraction/recursive_worktable_factor), all in internal/config/defaults.go with guc_tables.c-faithful contexts/bounds/boot values (tests: geqo_guc_stubs_test.go). Follow-up same day surfaced all ten in pg_catalog.pg_settings (pgSettings.VirtualRows in internal/catalog/catalog.go, previously a hand-curated subset that omitted them, so SELECT * FROM pg_settings WHERE name='geqo_threshold' returned nothing while SHOW worked) with byte-for-byte guc_tables.c metadata (test: TestPgSettingsPlannerTuningGUCs). Kept open because the SECOND half — 'may not affect actual behavior' — is intentionally deferred: goopg's planner is rule/cost-based and reads none of these (zero references in internal/planner), so SET/SHOW succeed but the plan is unchanged. That behavioral no-op matches the pre-existing enable_* stubs and is recorded in the deferral ledger as a deliberate scope boundary, not a bug."
   },
   {
    "feature": "I/O statistics tracking not implemented; pg_stat_io virtual table always returns empty rows.",
@@ -2717,7 +2718,7 @@
    "feature": "GUC stubs for jit, compute_query_id, and plan_cache_mode registered but not fully configured or functional.",
    "task_id": "M0097-0073",
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "GUC stubs added"
    ],
@@ -2728,11 +2729,11 @@
    ],
    "resolution_check": {
     "ledger": "no-match",
-    "fix_plan": "no-match",
+    "fix_plan": "checked",
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: jit/compute_query_id/plan_cache_mode are compat stubs only (internal/config/defaults.go:288-310, comment 'Compatibility stubs for GUCs checked by pg_regress tests'), no functional consumers found repo-wide"
+   "code_audit": "RESOLVED 2026-07-08 (M0122-0007 planner/jit GUC stubs): all 9 upstream jit_* GUCs now registered (internal/config/defaults.go), matching guc_tables.c contexts/bounds/boot values; compute_query_id/plan_cache_mode were already complete. 'Not fully configured' (missing jit_optimize_above_cost/jit_inline_above_cost/jit_debugging_support/jit_dump_bitcode/jit_expressions/jit_profiling_support/jit_tuple_deforming/jit_provider) is fixed. 'Not functional' (no actual JIT compilation) is intentionally out of scope and matches real PostgreSQL built without --with-llvm, which accepts the same SET/SHOW but never JIT-compiles either — not a genuine compatibility gap."
   },
   {
    "feature": "LANGUAGE C functions are accepted with only stub implementations that do not actually compile or execute C code",
@@ -2759,7 +2760,7 @@
    "feature": "pg_collation_for() function returns hardcoded 'default' string; collation tracking throughout catalog and query execution is not implemented",
    "task_id": "M0097-0035",
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "pg_collation_for() stub: returns \"default\" (no collation tracking in v0)"
    ],
@@ -2774,7 +2775,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/executor/expr.go:6249-6253 - hardcoded POSIX; no collation-aware execution"
+   "code_audit": "resolved 2026-07-11 (M0122-0005 + this loop): the audit's cited line numbers are stale (6249-6253 is now interval-cast code). pg_collation_for is a full plan-time fold, not a hardcoded stub — planner.foldPgCollationFor (internal/planner/planner.go) mirrors postgres/src/backend/utils/adt/misc.c pg_collation_for: NULL for a bare untyped literal (UNKNOWNOID), the stated collation for an explicit `expr COLLATE name`, per-type typcollation defaults ('default' for text/varchar/bpchar, 'C' for name, element-following for arrays, domain-base-following), and 42804 for non-collatable types (executor.evalFuncCall pg_collation_for path is the runtime fallback). This loop closed the one residual the code comment flagged: a bare column reference whose base-table column carries an explicit column-level COLLATE clause now reports that collation via resolveContext.explicitColumnCollationName (reads catalog.Column.Collation through the in-scope rangeBinding) instead of the type default. Tests: internal/planner/pg_collation_for_test.go (9 fold cases incl. 4 column-COLLATE), internal/executor/pg_collation_for_test.go. Still deferred (M0122-0005 ledger): a general assign_expr_collations pass so a COMPUTED expression over a collated column (not the plain column ref) derives the right collation."
   },
   {
    "feature": "ALTER FUNCTION/PROCEDURE OWNER TO / RENAME TO / SET SCHEMA enforcement (currently no-op)",
@@ -2842,7 +2843,7 @@
    "feature": "REINDEX INDEX/TABLE command is unimplemented; operates as a no-op stub.",
    "task_id": null,
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "no-op rebuild (v0 stub)"
    ],
@@ -2857,13 +2858,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/executor/operators_reindex.go:6 - Physical reindex is no-op; validation works"
+   "code_audit": "RESOLVED 2026-07-10: stale, superseded by commit b9a1e1fb (M0122-0007) — plain REINDEX INDEX/TABLE/SCHEMA physically rebuild via CREATE INDEX's bulk-build path, and REINDEX ... CONCURRENTLY physically rebuilds via shadow-file build-then-swap (internal/executor/operators_reindex.go: rebuildIndex/rebuildIndexConcurrently/rebuildTableIndexesConcurrently). Only non-btree access methods stay catalog-only. Verified via TestReindexIndexPhysicallyRebuilds/TestReindexTablePhysicallyRebuildsAllIndexes/TestReindexSchemaPhysicallyRebuildsAllTables/TestReindexIndexConcurrentlyPhysicallyRebuilds/TestReindexTableConcurrentlyPhysicallyRebuildsAllIndexes (internal/executor/reindex_physical_rebuild_test.go), all PASS. Design doc docs/design/0122-0007-reindex-physical-rebuild.md documents this landed; its own file-header doc comment was itself stale (said CONCURRENTLY \"remains a catalog-only no-op\") and has been corrected in the same loop. Remaining gap is the documented Deferral-section single-scan-without-revalidation limitation, not a stub. internal/executor/operators_reindex.go:6 - Physical reindex is no-op; validation works"
   },
   {
    "feature": "pg_get_expr() function is stubbed to return empty string; does not reconstruct constraint or index expressions.",
    "task_id": null,
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "pg_get_expr stub (→ \"\")"
    ],
@@ -2873,12 +2874,12 @@
     "a910cc325cacea137e68081a5d41b8976f016368"
    ],
    "resolution_check": {
-    "ledger": "open",
+    "ledger": "resolved",
     "fix_plan": "no-match",
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/executor/expr.go:7663 pg_get_expr passes through pre-formatted strings only"
+   "code_audit": "RESOLVED 2026-07-12: pg_get_expr pass-through is architecturally correct for goopg (all populated pg_node_tree columns adbin/conbin/relpartbound store pre-formatted deparsed SQL text, not serialized node trees), and both the live and heap-persisted pg_index renderers now populate indexprs/indpred correctly. Timeline: (1) fixed the live pg_index renderer catalog.InMemory.PGIndexRowsForDBOid (hardcoded indexprs/indpred to \"\" instead of VirtualNull/PredicateString); (2) live-path expression-index indexprs populated via shared catalog.IndexExprsText (byte-matched to PG 18.3); (3) 2026-07-12 closed the last heap slice — DecodePGIndexPhysicalRow(data,bitmap) is now null-bitmap-aware (probes bits 19/20 to disambiguate the two trailing nullable pg_node_tree varlenas), buildUserPGIndexRow emits IndexExprsText, and internal/initdb/open.go passes ht.Bitmap; backward-compatible (legacy rows always carried a bitmap since indexprs was always NULL). Test TestBuildUserPGIndexRowExprPredNullBitmapRoundTrip covers all four combos. Separately tracked (NOT a pg_get_expr gap): initdb heap-scan recovery loadUserIndexesFromHeap still rebuilds expression indexes via WAL replay, not from the recovered IndExprs text — see deferral_ledger.md 2026-07-12 row."
   },
   {
    "feature": "MVCC/attribute tier of verify_heapam (multi-version visibility and per-column consistency checks) remains deferred beyond Tier 1 page-structure checks.",
@@ -3101,7 +3102,7 @@
    "feature": "Index column ordering (ASC/DESC/NULLS FIRST/NULLS LAST) is not persisted to disk; ordering is lost across server restart despite faithful dumps within a session",
    "task_id": "DU-002",
    "resume_point": "Persist indoption bits to on-disk pg_index heap to enable cross-restart index ordering preservation",
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "indoption bits are not persisted to the on-disk pg_index heap, so ordering is lost across a restart"
    ],
@@ -3116,13 +3117,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: initdb/index_ddl_recovery.go:4 - indoption not persisted to disk across restarts"
+   "code_audit": "RESOLVED 2026-07-11 (verify-before-implement; landed 2026-07-08 across M0122-0006 commits 945f48b4/8069f66d/c699e083, design docs/design/0122-0006-index-column-order-restart-persistence.md). Per-key ASC/DESC + NULLS FIRST/LAST ordering now survives both a checkpointed and an uncheckpointed (crash) restart. Three gaps closed: (1) live pg_index.indoption is rendered from catalog.Index.ColDescending/ColNullsFirst instead of buildZeroVec; (2) the heap-persisted pg_index shadow row (buildUserPGIndexRow) carries the real indoption int2vector and catalog.DecodePGIndexPhysicalRow decodes it (internal/catalog/codec.go IndOption, decoded on checkpointed restart); (3) the CREATE INDEX WAL record itself now serializes ColDescending/ColNullsFirst as two trailing per-column byte blocks (internal/wal/recovery.go:6826/6894/7195) and RegisterIndexDuringRecovery threads them back into the rebuilt catalog.Index (internal/initdb/index_ddl_recovery.go:41/98), so a true kill -9 with no intervening checkpoint replays the ordering. Tests: internal/wal/index_ddl_test.go, internal/initdb/index_ddl_recovery_test.go, internal/catalog/index_def_order_test.go."
   },
   {
    "feature": "Per-function SET configuration parameters are not tracked; all functions report NULL for the proconfig column.",
    "task_id": "DU-002",
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "goopg tracks no per-function SET clauses"
    ],
@@ -3137,7 +3138,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: CREATE FUNCTION SET clause parsed-then-discarded (internal/parser/function.go:898-909, comment 'SET guc TO value — skip to end of clause'); proconfig hardcoded NULL at every emission site (internal/initdb/pg_proc_view.go:220,307,409,450,493; initdb.go:2625)"
+   "code_audit": "RESOLVED 2026-07-08 (M0122-0007): both root causes fixed. (1) CREATE FUNCTION's SET clause was NOT merely parsed-then-discarded as this entry claimed — SET lexes as the reserved keyword KwSet, never the TokenIdent isFunctionAttribute()'s old \"set\" case checked for, so it was a hard SYNTAX ERROR (the exact same bug M0097-0150 fixed for ALTER FUNCTION earlier the same day), reproduced live via a throwaway parser probe before fixing. New top-level `case p.cur().Keyword == KwSet/KwReset` in parseCreateFunctionTail's attribute loop (internal/parser/function.go) plus shared parseFunctionConfigSetClause/parseFunctionConfigResetClause helpers (also now used by ALTER FUNCTION's identical clause, internal/parser/ddl.go) populate parser.CreateFunctionStmt.ConfigOps/AlterFunctionStmt.ConfigOps ([]FunctionConfigOp). (2) New catalog.Routine.Config []string (pg_proc.proconfig shape) + catalog.ApplyFunctionConfigOps applies SET/RESET/RESET ALL in statement order; wired into execCreateFunction and execAlterFunction (internal/executor/operators_ddl.go, combinable with VOLATILE/STRICT/etc in one ALTER FUNCTION statement per real gram.y's alterfunc_opt_list). pg_proc.proconfig now renders catalog.RoutineConfigArrayLiteral(r.Config) for user routines (internal/initdb/pg_proc_view.go:409) instead of a hardcoded \"\" — the sibling builtinProcs/BuiltinProcs/aggregate rows (307/450/493) correctly stay NULL (never has a SET clause). Restart-durable via a new optional Config extension block on CreateFunctionPayload and a new RecordKindAlterFunctionConfig=123 WAL record (whole-array snapshot replay, mirroring RecordKindAlterFunctionFlags) — internal/wal/recovery.go, replayed in internal/initdb/function_ddl_recovery.go. Deliberately still dump-fidelity only (no runtime push/pop of these GUC values around the routine's own execution — goopg has no per-call GUC scoping mechanism yet), matching this codebase's established pattern for several other proconfig-adjacent features (n_distinct, TOAST compression, extended-statistics target); see the ledger row filed the same day. Tests: internal/parser/alter_function_owner_schema_test.go (TestParseCreateFunctionSetClause, TestParseAlterFunctionGenericSetReset extended, TestParseAlterFunctionSetSchemaDistinctFromConfigSet), internal/catalog/routines_test.go (TestApplyFunctionConfigOps, TestReplaceConfigByOIDDuringRecovery), internal/executor/operators_function_test.go (TestExecCreateFunctionSetClausePopulatesConfig, TestExecAlterFunctionSetResetConfig), internal/wal/function_ddl_test.go (TestEncodeDecodeAlterFunctionConfigRoundTrip, TestEncodeCreateFunctionOmitsConfigExtensionWhenEmpty), internal/initdb/pg_proc_view_test.go (TestPgProcViewProconfigRendersUserRoutineConfig), internal/initdb/function_ddl_recovery_test.go (extended TestFunctionDDLRecoveryReplaysCreate/ReplaysAlterAfterCreate) — all confirmed non-vacuous via a scoped `git stash` of every implementation file (tests fail to COMPILE without the new types/fields, the strongest form of non-vacuousness). Design: docs/design/0015-0002-pg-proc-catalog-and-routine-registry.md new Follow-up section (2026-07-08, M0122-0007). Gates: go build/vet ./... clean; go test ./internal/parser/... ./internal/catalog/... ./internal/executor/... (minus one confirmed pre-existing, HEAD-reproducible, unrelated hang in TestSeqScanFiresPrefetchesAcrossBlocks — see ledger) ./internal/wal/... ./internal/initdb/... PASS; scripts/tpch-spotcheck.sh PASS (Q12=2/Q13=33); RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh PASS (0 failed, all 3 workloads)."
   },
   {
    "feature": "ALTER TABLE … ALTER COLUMN RESET (…) is not implemented and is treated as a no-op; per-column options can be set but not cleared",
@@ -3164,7 +3165,7 @@
    "feature": "Per-column n_distinct planner hints are stored in attoptions for dump compatibility but are not used by the query planner for optimization",
    "task_id": "M0110-0001",
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "goopg does not act on n_distinct planner hints"
    ],
@@ -3179,13 +3180,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/executor/operators_ddl.go:7564 n_distinct stored dump-fidelity only"
+   "code_audit": "RESOLVED 2026-07-12: the n_distinct attribute option (catalog.Column.Options) is now consumed by the planner. New columnNDistinctOverride (internal/executor/operators_analyze.go) applies it at ANALYZE time (mirroring analyze.c:571-581) so the planner's existing columnNDistinctForChild reader (internal/planner/cardinality.go) transparently uses it for eq-selectivity (1/NDistinct) and join cardinality: positive v => absolute distinct count, v in [-1,0) => |v|*RowCount fraction (clamped to -1, floored at 1), 0/unset/n_distinct_inherited/other/malformed => no-op. Tests: TestColumnNDistinctOverride, TestAnalyzeRespectsNDistinctOption. Design: docs/design/0006-0006-n-distinct-attoption-override.md. Deferred (ledger 2026-07-12): NDistinct is stored as an absolute int64 so the negative fraction is resolved at ANALYZE time against the then-current RowCount, not re-resolved against reltuples at plan time like PG's get_variable_numdistinct; diverges only for tables that resize between ANALYZE and query."
   },
   {
    "feature": "SET STATISTICS column option is only supported in ALTER TABLE but not in CREATE TABLE; statistics targets cannot be specified when creating a table",
    "task_id": "M0110-0001",
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "No CREATE TABLE threading (SET STATISTICS is ALTER-only)"
    ],
@@ -3200,13 +3201,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/parser/ddl.go:3815 SET STATISTICS not in parseColumnDef"
+   "code_audit": "RESOLVED 2026-07-09 (M0122-0007, verify-before-implement): not a real gap — real PostgreSQL's own grammar (postgres/src/backend/parser/gram.y ColConstraintElem, columnDef) has no inline per-column SET STATISTICS form at all; column statistics targets are settable only via ALTER TABLE ... ALTER COLUMN ... SET STATISTICS (gram.y:2482-2496) or ALTER STATISTICS ... SET STATISTICS for extended statistics objects (gram.y:4770-4786). goopg's existing ALTER TABLE support already matches upstream's only valid syntax; there is nothing to add to CREATE TABLE."
   },
   {
    "feature": "TOAST compression functionality is not implemented. Compression metadata round-trips through pg_dump for schema fidelity, but actual data compression is not performed.",
    "task_id": "DU-002 slice 183",
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "Dump-fidelity only: goopg does not TOAST/compress."
    ],
@@ -3221,7 +3222,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/executor/operators_ddl.go:7335 TOAST compression dump-fidelity only"
+   "code_audit": "RESOLVED 2026-07-12 (M0122, docs/design/0046-0008-toast-compress-on-write.md): out-of-line TOAST values are now PGLZ-compressed on write. internal/executor/toast.go ToastLargeColumnsIfNeeded compresses a compressible over-threshold value via pglz.BuildCompressedVarlena and keeps it only when strictly smaller than raw (mirrors toast_compress_datum's VARSIZE(tmp) < VARSIZE(value)); STORAGE EXTERNAL columns skip compression. toastStore's num_chunks-word high bit (toastCompressedFlag=1<<31) flags a compressed blob; DetoastValue runs it through pglz.DecodeInlineCompressed. Legacy 12-byte pointers decode unchanged. Still deferred (see .ralph/deferral_ledger.md 2026-07-12 row): inline-compression-stays-inline, STORAGE PLAIN/MAIN toast-decision semantics, and LZ4."
   },
   {
    "feature": "Autovacuum functionality is not implemented; autovacuum_vacuum_scale_factor values are stored and dumped for compatibility but do not trigger automatic vacuuming",
@@ -3248,7 +3249,7 @@
    "feature": "COLLATE and USING clauses in ALTER TYPE … ALTER ATTRIBUTE are accepted by the parser but their effects are ignored during execution",
    "task_id": "M0110-0001",
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "COLLATE/USING accepted but ignored"
    ],
@@ -3263,7 +3264,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/parser/ddl.go:8432 USING stub-consumed in ALTER TYPE"
+   "code_audit": "resolved 2026-07-10 (M0122-0022): COLLATE is applied, not ignored — parser captures it into AlterAttrCollation (internal/parser/ddl.go:9733), and both executor paths copy it onto the composite field (single-subcommand execAlterType, internal/executor/operators_ddl.go:18776; multi-subcommand execAlterTypeAttrCmds, operators_ddl.go:18990), from where buildUserPGAttributeRowForCompositeField (pg18_user_catalog_rows.go) writes attcollation for pg_dump round-trip. USING is not part of this statement's real PG grammar at all (postgres/src/backend/parser/gram.y: `ALTER ATTRIBUTE ColId opt_set_data TYPE_P Typename opt_collate_clause opt_drop_behavior` — only COLLATE and CASCADE|RESTRICT), so there is nothing to \"ignore\" for it; the original entry's USING claim was inapplicable. Verified end-to-end (both single- and multi-subcommand forms, plus the COLLATE-reset-on-retype case) by new test TestAlterTypeAlterAttributeCollateApplied (internal/executor/alter_type_attribute_collate_test.go)."
   },
   {
    "feature": "Write-Ahead Logging (WAL) for MultiXact operations, enabling creation, modification, and deletion of MultiXact records to be logged and recovered after crashes.",
@@ -3313,7 +3314,7 @@
    "feature": "VIEW WITH CHECK OPTION is not enforced on INSERT/UPDATE operations; WITH (check_option=...) reloption form is parsed but ignored; restart persistence is in-memory only, not persisted.",
    "task_id": "DU-002",
    "resume_point": "slice 365",
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "Deferred (ledger): CHECK OPTION enforcement on INSERT/UPDATE through the view; the `WITH (check_option=...)` reloption form before AS + security_barrier/security_invoker stay parsed-and-ignored; restart persistence (in-memory only)."
    ],
@@ -3328,7 +3329,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "PARTIALLY RESOLVED 2026-07-04 (M0119-0004/M0122-0004): enforcement now lands `44000` on INSERT/UPDATE violation (`internal/executor/operators_fk.go:checkViewCheckOption`, design `docs/design/root-0025-updatable-views.md`); `WITH (security_barrier=...)`/`WITH (security_invoker=...)` reloption forms parse (`internal/parser/ddl.go` slices 366/367); `WITH (check_option=...)` reloption form now also parses (this loop, same file). Only remaining sub-item: restart persistence is still in-memory-only as of this entry's last audit — re-check `internal/initdb/open.go`'s `loadUserTablesFromHeap`/`ApplyTableReloptions` before re-flagging, a concurrent M0119-0004 loop was mid-flight on exactly that gap when this entry was last audited."
+   "code_audit": "RESOLVED 2026-07-10 (M0122-0021, this loop): the remaining sub-item flagged in the prior audit (restart persistence for check_option) is already fixed and covered end-to-end — buildUserPGClassRow (internal/executor/pg18_user_catalog_rows.go:462-474) encodes a view's security_barrier/security_invoker/check_option reloptions into the heap-persisted pg_class row via catalog.TableReloptionsElements, and loadUserTablesFromHeapForDB (internal/initdb/open.go:2709) decodes them back via catalog.ApplyTableReloptions (case \"check_option\" at internal/catalog/catalog.go:15314) on every restart. Confirmed via the pre-existing dedicated test TestTableAndViewReloptionsSurviveRestart (internal/initdb/view_ddl_recovery_test.go, landed 2026-07-05 commit 8107a8de as part of the index-reloptions follow-up chain, PASS at current HEAD) which creates a view WITH LOCAL CHECK OPTION, restarts the runtime, and asserts view.CheckOption == \"local\" survives. Combined with the enforcement (checkViewCheckOption, 44000 on violation) and parsing already confirmed by the prior PARTIALLY RESOLVED audit, every sub-item of this entry is now closed; no further gap remains."
   },
   {
    "feature": "HANDLER and VALIDATOR function references in CREATE FOREIGN DATA WRAPPER",
@@ -3355,7 +3356,7 @@
    "feature": "Persistent storage of server definitions (currently in-memory only)",
    "task_id": "DU-002-378",
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "servers in-memory only"
    ],
@@ -3365,18 +3366,18 @@
     "d792e1ab67bef7ad5b5b3d00ac3f5433f3334295"
    ],
    "resolution_check": {
-    "ledger": "open",
-    "fix_plan": "no-match",
+    "ledger": "resolved",
+    "fix_plan": "M0122-0007",
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/catalog/catalog.go:11697 foreign servers stored in-memory only"
+   "code_audit": "RESOLVED (2026-07-09, M0122-0007 foreign-server registry restart-durability follow-up): catalog.InMemory.foreignServers now survives a restart via wal.RecordKindCreateForeignServer/RecordKindDropForeignServer (126/127) + internal/initdb/foreignserver_ddl_recovery.go's replayForeignServerDDLRecords, mirroring the tablespace registry's identical fix. Live-verified via a real goopg stop/start: CREATE SERVER's row survives restart and DROP SERVER on it then succeeds."
   },
   {
    "feature": "Persistent storage of server definitions (currently in-memory only)",
    "task_id": "DU-002-376",
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "servers in-memory only"
    ],
@@ -3386,18 +3387,18 @@
     "46e70c8517917257e9032ba12fbf0403c2bcdd23"
    ],
    "resolution_check": {
-    "ledger": "open",
-    "fix_plan": "no-match",
+    "ledger": "resolved",
+    "fix_plan": "M0122-0007",
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/catalog/catalog.go:11697 foreign servers stored in-memory only"
+   "code_audit": "RESOLVED (2026-07-09, M0122-0007 foreign-server registry restart-durability follow-up): catalog.InMemory.foreignServers now survives a restart via wal.RecordKindCreateForeignServer/RecordKindDropForeignServer (126/127) + internal/initdb/foreignserver_ddl_recovery.go's replayForeignServerDDLRecords, mirroring the tablespace registry's identical fix. Live-verified via a real goopg stop/start: CREATE SERVER's row survives restart and DROP SERVER on it then succeeds."
   },
   {
    "feature": "Per-column optional type specification in CREATE TABLE OF syntax (col WITH OPTIONS form)",
    "task_id": "DU-002-374",
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "per-column `OF type (col WITH OPTIONS ...)` form rejected"
    ],
@@ -3407,12 +3408,12 @@
     "cc080cb37153f936fcf0b6430fc4182749f01fd5"
    ],
    "resolution_check": {
-    "ledger": "open",
-    "fix_plan": "no-match",
+    "ledger": "resolved",
+    "fix_plan": "M0122-0024",
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/parser/ddl.go:2713 comment explicitly states not yet supported"
+   "code_audit": "RESOLVED (2026-07-10, M0122-0024): `CREATE TABLE name OF type_name (col WITH OPTIONS column_constraint [...])` now parses each entry into CreateTableStmt.OfTypeColumnOptions (internal/parser/ddl.go, reusing the newly-extracted parseColumnConstraintList shared with a normal typed column def) and the executor merges them onto the composite-derived ColumnDef before the normal column-build path runs (internal/executor/operators_ddl.go execCreateTable), so NOT NULL/DEFAULT/CHECK/etc. are genuinely enforced, not silently dropped. A table_constraint entry in the same paren list (PRIMARY KEY/UNIQUE/CHECK/FOREIGN KEY at table level, also grammar-legal per gram.y TypedTableElement) was rejected with a clear parse error rather than supported at that time — tracked as a narrower remaining gap in the deferral ledger, not silently reopened. FOLLOW-UP RESOLVED (2026-07-10, same day, M0122-0024 deferral-ledger resume): the table_constraint half is now also implemented, via a shared parser.parseTableConstraintElement helper extracted from the ordinary CREATE TABLE column-list dispatch and reused by both call sites — PRIMARY KEY/UNIQUE/CHECK/EXCLUDE/FOREIGN KEY/CONSTRAINT entries now interleave freely with column WITH OPTIONS entries in the OF type_name list, matching PG's own mixed doc example; no executor change was needed since the constraint fields feed the same enforcement path regardless of OfType."
   },
   {
    "feature": "Typed table support for composite types in non-public schemas",
@@ -3504,7 +3505,7 @@
    "feature": "WITH OPTIONS clause in column definitions implemented as no-op; column-level options are not processed or applied",
    "task_id": null,
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "WITH OPTIONS no-op"
    ],
@@ -3514,18 +3515,18 @@
     "bb65e7d5a78330870b6dadca427d9b6a8bb28b71"
    ],
    "resolution_check": {
-    "ledger": "no-match",
-    "fix_plan": "no-match",
+    "ledger": "resolved",
+    "fix_plan": "M0122-0024",
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "medium",
-   "code_audit": "unclear: WITH OPTIONS in ColumnDef definition unclear if consumed"
+   "code_audit": "RESOLVED (2026-07-10, M0122-0024): the WITH OPTIONS form this entry describes is specifically the `CREATE TABLE ... OF type_name (col WITH OPTIONS constraint)` typed-table column list (same underlying gap as the sibling entry above); it now parses into CreateTableStmt.OfTypeColumnOptions and the executor applies each override (NOT NULL/DEFAULT/CHECK/...) to the composite-derived column before catalog build, verified with TestCreateTableOfTypeWithOptionsAppliesConstraints (23502 NOT NULL enforcement + DEFAULT application) in internal/executor/create_table_of_type_options_test.go."
   },
   {
    "feature": "goopg does not emit a blank data row for 0-column SELECT results; PostgreSQL outputs one that goopg omits.",
    "task_id": "m0097",
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "goopg does not currently emit"
    ],
@@ -3539,8 +3540,8 @@
     "fix_plan": "no-match",
     "later_commits": "superseded-by-code-audit"
    },
-   "confidence": "medium",
-   "code_audit": "unclear: Zero-column SELECT path not traced in protocol"
+   "confidence": "high",
+   "code_audit": "RESOLVED 2026-07-11: traced to a sibling-path divergence. The simple-query path (internal/server/dispatch.go, `if schema != nil` guards) already emitted RowDescription-with-0-fields + one zero-column DataRow per source row for `SELECT FROM t`/`SELECT;`. The EXTENDED-protocol path dropped them: executeExtendedQueryViaExecutor (internal/server/dispatch_extended.go) gated both res.Fields construction and per-row res.Rows population on `len(schema) > 0`, so a non-nil zero-length schema (a zero-column read) built no rows and the command tag read `SELECT 0`; and Describe (describeViaPlanner/handleDescribeFrame, internal/server/extended.go) collapsed `len(schema)==0` to NoData instead of RowDescription-with-0-fields. Fix: gate all four sites on `schema != nil` / `schema == nil` (nil = write/DDL/txn = NoData; non-nil-empty = zero-column read = RowDescription 0 fields). Verified vs PG 18.3 (`SELECT FROM t` over 3 rows returns 3 rows via `\\bind \\g`). Tests: internal/server/extended_zero_column_test.go (TestExtendedZeroColumnSelectEmitsRows, TestExtendedZeroColumnSelectWithFilter)."
   },
   {
    "feature": "Resolve subscriber apply stall issue during logical replication",
@@ -3651,7 +3652,7 @@
    "feature": "EXCLUDE USING constraints bypass btree type validation for non-compatible types (box, point); stored as catalog-only without enforcing physical index.",
    "task_id": null,
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "createExclusionIndexStub bypasses btree type-validation (box/point columns not btree-compatible); catalog-entry-only"
    ],
@@ -3666,13 +3667,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "medium",
-   "code_audit": "unclear: EXCLUDE USING btree validation bypass logic not found in constraint enforcement"
+   "code_audit": "RESOLVED (M0122-0023, 2026-07-10): re-scoped and closed the real gap. The btree \"=\" case was already fully type-validated (createExclusionIndexStub routes it through createBTreeIndex, which enforces isSupportedBTreeKeyType) before this loop. The genuine bypass was the \"&&\" (GiST overlap) case: checkExclusionConstraintsForInsert/checkGistOverlapExclusion (operators_storage.go:7212-7328) only understands box literals, but createExclusionIndexStub accepted \"&&\" on ANY column type with zero validation, so a non-box column silently got a constraint that could never actually fire (parseBoxText fails closed, no error, no enforcement, ever). createExclusionIndexStub now rejects \"&&\" on a non-box column at DDL time with 42704 \"data type %s has no default operator class for access method %q\", mirroring PostgreSQL's real indexcmds.c ResolveOpClass rejection. Regression coverage added in internal/executor/exclusion_constraint_test.go (TestExclusionConstraintGistOverlapFires, TestExclusionConstraintGistOverlapRejectsUnsupportedType) — the box/box overlap enforcement path itself was previously completely untested despite existing since 2026-06-08. Remaining scope (real GiST access method, point/circle/polygon overlap types, opclass resolution beyond box) is out of bounds for this loop and tracked separately (unimplemented_feat.json #118 GIST index support)."
   },
   {
    "feature": "Duplicate-source error handling in merge cross-partition routing is not fully implemented.",
    "task_id": "M0100-0007",
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "deferred duplicate-source error"
    ],
@@ -3687,7 +3688,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "medium",
-   "code_audit": "unclear: Duplicate-source error handling in merge cross-partition routing not found"
+   "code_audit": "RESOLVED (verified 2026-07-11, M0122-0004): duplicate-source detection is fully implemented and works across partition routing. internal/executor/operators_merge.go marks mods[].hasDuplicate when a second source row matches an already-matched target during the (per-partition-child) scan, and raises SQLSTATE 21000 'MERGE command cannot affect row a second time' AFTER applying the first modification (matching PG src/backend/executor/nodeModifyTable.c ExecMergeMatched). Confirmed via end-to-end probes for: non-partitioned UPDATE, non-partitioned DELETE, single-partition UPDATE, and the specific cross-partition-MOVE case (first source row's UPDATE relocates the row from ptgt1 to ptgt2, second matching source row still trips the guard). This loop also added PG's errhint 'Ensure that not more than one source row matches any one target row.' (previously omitted) and regression tests internal/executor/merge_dup_source_test.go (TestMergeDupSource{UpdateNonPartitioned,DeleteNonPartitioned,UpdateWithinOnePartition,CrossPartitionMove}) — the behavior had zero prior test coverage."
   },
   {
    "feature": "Server-side enforcement of character encoding constraints during cluster bootstrap and runtime",
@@ -3778,7 +3779,7 @@
    "feature": "pg_subtrans truncation (cleanup of subtransaction ancestry records) is deferred.",
    "task_id": "M0117-0003",
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "no pg_subtrans truncation yet"
    ],
@@ -3790,10 +3791,10 @@
    "resolution_check": {
     "ledger": "no-match",
     "fix_plan": "no-match",
-    "later_commits": "superseded-by-code-audit"
+    "later_commits": "resolved-by-M0122-0009"
    },
-   "confidence": "medium",
-   "code_audit": "unclear: pg_subtrans files exist but truncation deferred status not verified"
+   "confidence": "high",
+   "code_audit": "RESOLVED (2026-07-12 code audit) by M0122-0009 (commit 41e119b8). pg_subtrans truncation is fully implemented and wired end-to-end: (1) internal/mvcc/subxact_slru.go SubtransSLRU.TruncateBefore unlinks segment files whose highest page wraparound-precedes the cutoff (SubtransPagePrecedes); (2) internal/mvcc/subxact_visibility.go SubxactMap.Truncate drops in-memory parent/abort entries older than the horizon and cascades to the SLRU; (3) internal/initdb/open.go:1628 TruncateSubtransFn computes the same conservative min(datfrozenxid, OldestXmin) horizon as TruncateCLOGFn and calls subxactMap.Truncate; (4) internal/wal/checkpointer.go:665 invokes TruncateSubtransFn post-checkpoint (after the checkpoint marker is durable), mirroring TruncateCLOGFn ordering. Tests: mvcc/subxact_truncate_test.go, wal/checkpointer_test.go TestCheckpointerCallsTruncateSubtransFn + TestCheckpointerTruncateSubtransFnErrorIsNonFatal. Matches PG subtrans.c:TruncateSUBTRANS (checkpoint-driven; goopg's horizon is at-least-as-conservative as GetOldestTransactionIdConsideredRunning)."
   },
   {
    "feature": "Domain CHECK predicates still use legacy wrap instead of new fully-parenthesizing renderer.",

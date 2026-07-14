@@ -1,0 +1,38 @@
+pgbench (18.3)
+starting vacuum...end.
+progress: 30.0 s, 184631.2 tps, lat 0.269 ms stddev 0.387, 0 failed
+progress: 60.0 s, 183677.4 tps, lat 0.271 ms stddev 0.887, 0 failed
+progress: 90.0 s, 184347.0 tps, lat 0.270 ms stddev 0.690, 0 failed
+progress: 120.0 s, 185303.0 tps, lat 0.269 ms stddev 0.369, 0 failed
+progress: 150.0 s, 186597.4 tps, lat 0.267 ms stddev 0.434, 0 failed
+progress: 180.0 s, 189281.2 tps, lat 0.263 ms stddev 0.784, 0 failed
+progress: 210.0 s, 182882.8 tps, lat 0.272 ms stddev 0.767, 0 failed
+progress: 240.0 s, 183239.9 tps, lat 0.272 ms stddev 0.431, 0 failed
+progress: 270.0 s, 186927.5 tps, lat 0.266 ms stddev 0.571, 0 failed
+progress: 300.0 s, 186207.4 tps, lat 0.267 ms stddev 0.990, 0 failed
+progress: 330.0 s, 186572.2 tps, lat 0.267 ms stddev 0.360, 0 failed
+progress: 360.0 s, 185281.5 tps, lat 0.269 ms stddev 0.518, 0 failed
+progress: 390.0 s, 186998.2 tps, lat 0.266 ms stddev 1.220, 0 failed
+progress: 420.0 s, 186806.5 tps, lat 0.267 ms stddev 1.138, 0 failed
+progress: 450.0 s, 179635.9 tps, lat 0.277 ms stddev 0.424, 0 failed
+progress: 480.0 s, 182618.2 tps, lat 0.272 ms stddev 0.422, 0 failed
+progress: 510.0 s, 183483.6 tps, lat 0.271 ms stddev 3.018, 0 failed
+progress: 540.0 s, 184024.9 tps, lat 0.271 ms stddev 1.707, 0 failed
+progress: 570.0 s, 184549.5 tps, lat 0.270 ms stddev 0.738, 0 failed
+progress: 600.0 s, 188875.7 tps, lat 0.263 ms stddev 0.425, 0 failed
+transaction type: <builtin: select only>
+scaling factor: 100
+query mode: simple
+number of clients: 50
+number of threads: 50
+maximum number of tries: 1
+duration: 600 s
+number of transactions actually processed: 111059913
+number of failed transactions: 0 (0.000%)
+latency average = 0.269 ms
+latency stddev = 1.016 ms
+initial connection time = 37.583 ms
+tps = 185094.330551 (without initial connection time)
+statement latencies in milliseconds and failures:
+         0.000           0 \set aid random(1, 100000 * :scale)
+         0.276           0 SELECT abalance FROM pgbench_accounts WHERE aid = :aid;

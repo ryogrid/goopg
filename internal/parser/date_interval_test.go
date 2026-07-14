@@ -18,28 +18,56 @@ func TestParseDateLiteral(t *testing.T) {
 	}
 }
 
-// TestParseIntervalLiteral pins the unit normalisation
-// (plurals collapse to singular) for the three units TPC-H uses.
+// TestParseIntervalLiteral pins the trailing typmod-field form: only the
+// SINGULAR field keywords are grammar keywords, so `interval '90' day`
+// carries a Qualified typmod (Unit=day). A plural (`days`) is NOT a keyword —
+// PostgreSQL parses it as a column alias on the bare interval literal
+// (`interval '90' days` = 00:00:05 AS days), so the parsed Expr is a bare
+// (PreComputed, seconds-default) IntervalLit and the ResTarget carries the
+// alias. Matches live PG 18.3 (unimplemented_feat #5(d-iv)).
 func TestParseIntervalLiteral(t *testing.T) {
-	cases := []struct {
+	singular := []struct {
 		sql, wantUnit string
 	}{
 		{"SELECT interval '90' day FROM t", "day"},
-		{"SELECT interval '90' days FROM t", "day"},
 		{"SELECT interval '3' month FROM t", "month"},
-		{"SELECT interval '3' months FROM t", "month"},
 		{"SELECT interval '1' year FROM t", "year"},
-		{"SELECT interval '1' years FROM t", "year"},
+		{"SELECT interval '5' hour FROM t", "hour"},
+		{"SELECT interval '5' minute FROM t", "minute"},
+		{"SELECT interval '5' second FROM t", "second"},
 	}
-	for _, tc := range cases {
+	for _, tc := range singular {
 		stmts, err := Parse(tc.sql)
 		if err != nil {
 			t.Errorf("Parse(%q): %v", tc.sql, err)
 			continue
 		}
 		iv := stmts[0].(*SelectStmt).Targets[0].Expr.(*IntervalLit)
-		if iv.Unit != tc.wantUnit {
-			t.Errorf("%q: unit=%q want %q", tc.sql, iv.Unit, tc.wantUnit)
+		if !iv.Qualified || iv.Unit != tc.wantUnit {
+			t.Errorf("%q: qualified=%v unit=%q want qualified unit %q", tc.sql, iv.Qualified, iv.Unit, tc.wantUnit)
+		}
+	}
+	// Plurals / abbreviations are column aliases, not typmod fields.
+	plural := []struct{ sql, wantAlias string }{
+		{"SELECT interval '90' days FROM t", "days"},
+		{"SELECT interval '3' months FROM t", "months"},
+		{"SELECT interval '1' years FROM t", "years"},
+		{"SELECT interval '5' min FROM t", "min"},
+		{"SELECT interval '5' millisecond FROM t", "millisecond"},
+	}
+	for _, tc := range plural {
+		stmts, err := Parse(tc.sql)
+		if err != nil {
+			t.Errorf("Parse(%q): %v", tc.sql, err)
+			continue
+		}
+		rt := stmts[0].(*SelectStmt).Targets[0]
+		if rt.Alias != tc.wantAlias {
+			t.Errorf("%q: alias=%q want %q", tc.sql, rt.Alias, tc.wantAlias)
+		}
+		iv, ok := rt.Expr.(*IntervalLit)
+		if !ok || iv.Qualified {
+			t.Errorf("%q: expr=%T qualified=%v — want a bare (unqualified) IntervalLit", tc.sql, rt.Expr, ok && iv.Qualified)
 		}
 	}
 }

@@ -22,7 +22,10 @@ package testport
 // makes for ordinary insert/update WAL.
 
 import (
+	"errors"
 	"fmt"
+	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -31,7 +34,37 @@ import (
 	"github.com/goopg/goopg/internal/testutil/util"
 )
 
+// segmentIsAllZero reports whether the WAL segment file at path contains
+// only zero bytes — the signature of a preallocated, never-written segment
+// (see the skip rationale in the round-trip loop). Read errors are treated
+// as "not all-zero" so the caller still feeds the segment to pg_waldump and
+// surfaces any real problem.
+func segmentIsAllZero(t *testing.T, path string) bool {
+	t.Helper()
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer func() { _ = f.Close() }()
+	buf := make([]byte, 1<<16)
+	for {
+		n, rerr := f.Read(buf)
+		for _, b := range buf[:n] {
+			if b != 0 {
+				return false
+			}
+		}
+		if errors.Is(rerr, io.EOF) {
+			return true // scanned the whole file, every byte was zero
+		}
+		if rerr != nil {
+			return false // unexpected read error: let pg_waldump surface it
+		}
+	}
+}
+
 func TestPort_PgWaldumpVacuumPruneRoundtrip(t *testing.T) {
+	skipUnlessCanonicalWAL(t) // perf-optimize3-dash S4: canonical rmgr content (WD-004 deferred)
 	waldump := findPGWaldumpBin(t)
 	psqlBin := clientToolBin(t, "psql")
 	if psqlBin == "" {
@@ -103,6 +136,24 @@ func TestPort_PgWaldumpVacuumPruneRoundtrip(t *testing.T) {
 
 	sawPruneRecordForRelation := false
 	for i, seg := range segs {
+		// Skip an all-zero, never-written segment. With wal_init_zero=on
+		// (goopg's default, mirroring upstream) the writer eagerly
+		// preallocates the NEXT segment as a full-size zero-filled file
+		// the moment the current one opens — so after a tiny workload the
+		// trailing 000000010000000000000002 is a legitimate all-zero
+		// phantom that persists across a clean shutdown, exactly as it
+		// does in real PostgreSQL (XLogFileInit zero-fills; the long page
+		// header is only written when the segment first becomes the insert
+		// target). pg_waldump reads the segment size from that long page
+		// header's xlp_seg_size, so pointed at an all-zero segment it
+		// fatally reports `invalid WAL segment size ... (0 bytes)`. That
+		// is expected for a preallocated tail (real pg_waldump errors the
+		// same way) and carries no records, so it is not a structural
+		// decode problem and must not fail the round-trip.
+		if segmentIsAllZero(t, filepath.Join(walDir, seg)) {
+			t.Logf("segment %d/%d (%s): all-zero preallocated tail, skipping", i+1, len(segs), seg)
+			continue
+		}
 		res, _ := util.RunCommand(util.CommandSpec{
 			Name:    waldump,
 			Args:    []string{"--rmgr=Heap2", "-p", walDir, seg},

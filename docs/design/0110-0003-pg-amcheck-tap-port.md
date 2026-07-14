@@ -885,3 +885,69 @@ PASS (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.s
 PASS (0 failed, all 3 workloads). **M0119-0006's datconnlimit cluster (both
 the `-2` invalid-database sentinel and positive-limit throttling) now has no
 known open residuals.**
+
+## Follow-up (2026-07-08): `005_opclass_damage.pl` UPDATE-path prerequisite — `pg_amproc` Virtual-UPDATE support
+
+`005_opclass_damage.pl`'s corruption-injection step is a single-column
+statement:
+
+```sql
+UPDATE pg_catalog.pg_amproc
+    SET amproc = 'int4_desc_cmp'::regproc
+    WHERE amproc = 'int4_asc_cmp'::regproc
+```
+
+Like `pg_database` (see the "Former deferred residual" section above),
+`pg_amproc` is a `Virtual` catalog table (`internal/catalog/catalog.go`,
+backed by `c.amProcMembers`/`ListAmProcMembers`) with no physical heap for the
+generic UPDATE executor to scan/rewrite — so this statement previously
+affected 0 rows silently. Added a second Virtual-UPDATE path, mirroring
+`nextVirtualPgDatabase`:
+
+- `catalog.InMemory.SetAmProcMemberProc(oid, newProcOID uint32) bool`
+  (catalog.go) rewrites the matched `AmProcMember`'s `ProcOID` in place, keyed
+  by the row's own `oid` (pg_amproc's natural per-row key) rather than
+  re-deriving family/lefttype/righttype/procnum.
+- `updateOp.nextVirtualPgAmproc()` (`internal/executor/operators_storage.go`)
+  — same read-from-`VirtualRows()`/evaluate-`o.pred`+`o.plan.Set`/persist
+  shape as `nextVirtualPgDatabase`; only the `amproc` column is writable (any
+  other SET column errors `0A000`, matching the pg_database precedent's
+  "refuse rather than silently discard" stance). Routing in `updateOp.Next()`
+  widened from a single `tbl.Name == "pg_database"` check to a `switch` over
+  both Virtual table names.
+
+**Adjacent bug found and fixed while building the test for this**: casting a
+builtin (non-`CREATE FUNCTION`) proc name to `regproc`/`regprocedure` (e.g.
+`'int4eq'::regproc`) unconditionally raised `42883 function "int4eq" does not
+exist`, because `expr.go`'s `CastExpr` regproc branch only consulted
+`ctx.Catalog.Routines()` (user-created functions) — `resolveOpClassFunction`
+(the resolver `CREATE OPERATOR CLASS ... AS FUNCTION` already uses) has a
+second fallback tier, `catalog.LookupBuiltinProc`, that the cast path lacked
+entirely. Added the same fallback to the regproc/regprocedure cast, so a bare
+builtin name now resolves like real PG instead of erroring — this is exactly
+the shape upstream `005_opclass_damage.pl`'s own comparator-function names
+need once they're curated into `builtinProcsByName`.
+
+**Still deferred (this is a prerequisite, not the full fix)**: even with both
+of the above, corrupting `pg_amproc.amproc` remains unobservable by
+`pg_amcheck` today — `internal/access/btree` has exactly one comparator
+(`CompareKeys`, a hardcoded encoded-key-byte comparator) with zero references
+to `amproc`/opclass OID lookup, so no index-AM code path ever dispatches
+through a per-index `FUNCTION 1` support proc. Making `005_opclass_damage.pl`
+pass end-to-end needs that comparator-dispatch wiring — a materially larger,
+separate index-AM architecture change, not a single-loop slice. See the
+2026-07-08 deferral ledger row for the resume point.
+
+**Tests**: `TestUpdatePgAmprocRewritesAmprocColumn`/
+`TestUpdatePgAmprocRejectsOtherColumns`
+(`internal/executor/pg_amproc_update_test.go`), using the same
+`CREATE OPERATOR`/`FAMILY`/`CLASS` fixture as
+`TestCreateOperatorClassMembersPopulateAmopAmproc`. Confirmed non-vacuous via
+`git stash` on `catalog.go`/`operators_storage.go`/`expr.go`: the UPDATE
+silently no-ops (falls through to the physical-heap path, 0 rows affected)
+and the reject-other-columns case returns no error at all, matching the
+`pg_database` precedent's own failure signature. Gates: `go build ./...`
+clean; `go test ./internal/executor/... ./internal/catalog/... ./internal/planner/...`
+PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+`RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0 failed,
+all 3 workloads).

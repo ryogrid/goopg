@@ -124,3 +124,37 @@ func xactStampAndAdvance(clog *mvcc.CLog, txnMgr *mvcc.Manager, xid storage.Tran
 	}
 	txnMgr.SetNextXID(xid + 1)
 }
+
+// walHasXactRecords reports whether the WAL under walDir contains at least
+// one transaction commit/abort record (native or canonical). Used by
+// initdb.Open to disambiguate CLog.IsEmpty()==true (C2-S3 review MUST-FIX):
+// post-cut, commit-path CLOG stamps are memory-only, so a crashed cluster
+// that never reached its first checkpoint has an all-zero pg_xact on disk —
+// indistinguishable, by lanes alone, from a genuinely-fresh or
+// pre-M0030-0007 cluster. Routing such a cluster into the
+// InitializeAsCommitted upgrade branch would resurrect crashed in-flight
+// transactions as committed; the presence of ANY xact record proves txn
+// history and forces the crash-recovery sweep branch instead. Runs under
+// the recovery ReadAll memoization, so the decode is shared with the replay
+// passes.
+func walHasXactRecords(walDir string) (bool, error) {
+	if _, err := os.Stat(walDir); os.IsNotExist(err) {
+		return false, nil
+	}
+	records, err := wal.ReadAll(walDir, 0)
+	if err != nil {
+		return false, err
+	}
+	for _, r := range records {
+		if len(r.Payload) >= 5 {
+			switch r.Payload[0] {
+			case wal.RecordKindXactCommit, wal.RecordKindXactCommitInval, wal.RecordKindXactAbort:
+				return true, nil
+			}
+		}
+		if r.XLog != nil && r.XLog.Header.Rmid == wal.RmgrXact && r.XLog.Header.XID != 0 {
+			return true, nil
+		}
+	}
+	return false, nil
+}

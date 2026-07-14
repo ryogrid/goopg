@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -25,13 +26,16 @@ type pacedFlusher interface {
 	FlushAllPaced(pacer func(progress float64) error) error
 }
 
-// epochResetter is implemented by *storage.Pool so the
-// checkpointer can clear the per-page "FPI emitted this epoch"
-// flag after a successful checkpoint. Optional — checkpointers
-// constructed in tests with a flusher that doesn't satisfy this
-// interface keep working.
-type epochResetter interface {
-	ResetCheckpointEpoch()
+// redoPublisher is implemented by *storage.Pool so the checkpointer can
+// publish the redo pointer at checkpoint START (before the buffer flush) —
+// PG CreateCheckPoint order. Publication is the FPI epoch boundary: the
+// pool's per-record pd_lsn<=redo test keys on it, replacing the old
+// post-checkpoint ResetCheckpointEpoch sweep whose reset-after-redo-sample
+// ordering left an image-less replay window (perf-optimize3-dash/03).
+// Optional — checkpointers constructed in tests with a flusher that doesn't
+// satisfy this interface keep working.
+type redoPublisher interface {
+	PublishRedoBarrier(sample func() uint64) uint64
 }
 
 // dataFileSyncer is implemented by anything that can fdatasync every
@@ -135,6 +139,18 @@ type CheckpointerConfig struct {
 	// are logged as warnings and do not fail the checkpoint. G1.
 	TruncateCLOGFn func() error
 
+	// TruncateSubtransFn, when non-nil, is called at the end of each
+	// successful checkpoint AFTER the checkpoint marker is durable, alongside
+	// TruncateCLOGFn, to truncate pg_subtrans (both the in-memory subxact map
+	// and its on-disk SLRU mirror) up to the same conservative horizon
+	// (M0122-0009). Without this, a long-lived cluster's subxact parent-link
+	// tracking grows without bound. The callee is responsible for computing a
+	// conservative horizon (never above any live snapshot's xmin); no WAL
+	// record is emitted (matches upstream — pg_subtrans truncation is not
+	// WAL-logged). Errors are logged as warnings and do not fail the
+	// checkpoint, same treatment as TruncateCLOGFn.
+	TruncateSubtransFn func() error
+
 	// FlushCLOGFn, when non-nil, is called during the dirty-page flush phase
 	// of every checkpoint (timed, volume-triggered, or on-demand) — in the
 	// same phase as, and before, the primary buffer-pool flush's redo LSN is
@@ -204,6 +220,13 @@ type Checkpointer struct {
 	lastCheckpointLSN     atomic.Uint64
 	lastCheckpointRedoLSN atomic.Uint64
 
+	// distMu guards priorRedoLSN/checkPointDistanceEstimate. Checkpoints
+	// are infrequent (seconds-to-minutes apart) so a plain mutex — rather
+	// than lock-free float CAS — is fine here.
+	distMu                     sync.Mutex
+	priorRedoLSN               uint64
+	checkPointDistanceEstimate float64
+
 	// Aggregate counters surfaced through pg_stat_checkpointer.
 	// Mirror the upstream PG 18 view's counter shape:
 	// num_timed     — timer-driven cycles
@@ -262,6 +285,42 @@ func (c *Checkpointer) LastCheckpointLSN() uint64 {
 // pg_control update path (M0102-0007).
 func (c *Checkpointer) LastCheckpointRedoLSN() uint64 {
 	return c.lastCheckpointRedoLSN.Load()
+}
+
+// updateCheckPointDistanceEstimate mirrors upstream's
+// UpdateCheckPointDistanceEstimate (xlog.c): a moving average of the WAL
+// bytes generated between successive checkpoints' redo LSNs, consulted by
+// SlotAwareRetainer to size WAL-segment recycling (XLOGfileslop, M0122-0009
+// follow-up). The average declines slowly when a cycle used less WAL than
+// estimated, but jumps immediately when a cycle used more — biased toward
+// the peak load rather than a plain average, so a bursty workload isn't
+// underestimated right after a quiet period. The very first checkpoint
+// (priorRedoLSN still 0) has nothing to compare against and leaves the
+// estimate at its zero value.
+func (c *Checkpointer) updateCheckPointDistanceEstimate(redoLSN uint64) {
+	c.distMu.Lock()
+	defer c.distMu.Unlock()
+	prior := c.priorRedoLSN
+	c.priorRedoLSN = redoLSN
+	if prior == 0 || redoLSN <= prior {
+		return
+	}
+	nbytes := float64(redoLSN - prior)
+	if c.checkPointDistanceEstimate < nbytes {
+		c.checkPointDistanceEstimate = nbytes
+	} else {
+		c.checkPointDistanceEstimate = 0.90*c.checkPointDistanceEstimate + 0.10*nbytes
+	}
+}
+
+// CheckPointDistanceEstimate returns the current moving-average estimate
+// (bytes) of inter-checkpoint WAL volume. Exported so SlotAwareRetainer can
+// size WAL-segment recycling; 0 before the second checkpoint of a run
+// completes (no distance to measure yet).
+func (c *Checkpointer) CheckPointDistanceEstimate() float64 {
+	c.distMu.Lock()
+	defer c.distMu.Unlock()
+	return c.checkPointDistanceEstimate
 }
 
 // CheckpointRedoLSN is the executor.Checkpointer interface method.
@@ -421,6 +480,41 @@ func (c *Checkpointer) runCheckpoint(ctx context.Context, spread, shutdown bool)
 	c.cfg.Logger.Info("checkpoint start", "type", checkpointType)
 	pacer := c.buildPacer(ctx, spread, start)
 
+	// perf-optimize3-dash/03: compute AND PUBLISH the redo pointer BEFORE
+	// the buffer flush (PG CreateCheckPoint order). The published pointer is
+	// the FPI-epoch boundary for the pool's pd_lsn<=redo image test; the
+	// flush below then trivially covers everything <= redo, and every page's
+	// first post-redo modification carries a fresh image — closing the
+	// image-less replay window the old post-record epoch reset left open.
+	computeRedo := func() uint64 {
+		pos := int64(0)
+		if vr, ok := c.wal.(volumeReporter); ok {
+			pos = int64(vr.WrittenLSN())
+		}
+		segSize := c.cfg.SegmentSize
+		if segSize <= 0 {
+			segSize = DefaultSegmentSize
+		}
+		leading := 0
+		if pos%XLOGBlockSize == 0 {
+			leading = SizeOfXLogShortPHD
+			if segSize > 0 && pos%segSize == 0 {
+				leading = SizeOfXLogLongPHD
+			}
+		}
+		return uint64(pos + int64(leading))
+	}
+	var redoLSN0 uint64
+	if rp, ok := c.flusher.(redoPublisher); ok {
+		// The barrier waits out every in-flight FPI-decision->append critical
+		// section BEFORE sampling the frontier, so no record decided against
+		// the old redo can land at an LSN >= the new redo (PG's
+		// fpw_lsn-under-insert-locks analog; adversarial review F1).
+		redoLSN0 = rp.PublishRedoBarrier(computeRedo)
+	} else {
+		redoLSN0 = computeRedo()
+	}
+
 	flushStart := time.Now()
 	if err := c.flushDirty(pacer); err != nil {
 		return fmt.Errorf("flush dirty pages: %w", err)
@@ -446,25 +540,15 @@ func (c *Checkpointer) runCheckpoint(ctx context.Context, spread, shutdown bool)
 		}
 	}
 	c.writeTimeMs.Add(time.Since(flushStart).Milliseconds())
-	// M0102-0007: pre-compute the 0-based redo LSN so the
-	// PG-compatible checkpoint record carries the correct
-	// checkPoint.redo — PG's xlogreader validates it.
-	pos := int64(uint64(0))
-	if vr, ok := c.wal.(volumeReporter); ok {
-		pos = int64(vr.WrittenLSN())
-	}
-	segSize := c.cfg.SegmentSize
-	if segSize <= 0 {
-		segSize = DefaultSegmentSize
-	}
-	leading := 0
-	if pos%XLOGBlockSize == 0 {
-		leading = SizeOfXLogShortPHD
-		if segSize > 0 && pos%segSize == 0 {
-			leading = SizeOfXLogLongPHD
-		}
-	}
-	redoLSN0 := uint64(pos + int64(leading))
+	// M0102-0007: redoLSN0 (computed and published above, BEFORE the flush)
+	// is what the PG-compatible checkpoint record carries — PG's xlogreader
+	// validates it.
+	// M0122-0009 follow-up: feed this cycle's redo distance into the
+	// moving-average estimate SlotAwareRetainer consults for
+	// XLOGfileslop-style WAL-segment recycling. Must run before the
+	// retainer call below (via c.retainer.Retain) so the estimate it reads
+	// already reflects this cycle.
+	c.updateCheckPointDistanceEstimate(redoLSN0)
 	// M0106-0010 batched-47: sample nextXid from the mvcc manager
 	// BEFORE appending the checkpoint record so the on-wire CheckPoint
 	// payload carries the live value. The standby reads nextXid out of
@@ -498,9 +582,15 @@ func (c *Checkpointer) runCheckpoint(ctx context.Context, spread, shutdown bool)
 	if err := c.wal.FlushUpTo(endLSN); err != nil {
 		return fmt.Errorf("flush checkpoint marker up to lsn %d: %w", endLSN, err)
 	}
-	// M0102-0007: store REDO LSN (start of checkpoint record) for
-	// BASE_BACKUP so pg_control carries a valid redo point.
-	c.lastCheckpointRedoLSN.Store(startLSN)
+	// M0102-0007 / C2-S3 (review MUST-FIX): store the checkpoint's REDO
+	// pointer — the position published at checkpoint START — not the
+	// checkpoint record's own start. Records in the (redo, record] window
+	// cover state the dirty-page/CLOG flush phase may not have captured
+	// (a commit acked mid-flush leaves only its WAL record), so BASE_BACKUP
+	// streams and recovery must begin at redo, exactly like PG's
+	// checkPoint.redo. Stored 1-based (internal convention; redoLSN0 is
+	// 0-based).
+	c.lastCheckpointRedoLSN.Store(redoLSN0 + 1)
 	c.lastCheckpointLSN.Store(endLSN)
 	// Update pg_control on disk so pg_controldata and standbys see the
 	// current checkpoint location. Mirrors CreateCheckPoint (post-flush)
@@ -566,12 +656,10 @@ func (c *Checkpointer) runCheckpoint(ctx context.Context, spread, shutdown bool)
 	} else {
 		c.numRequested.Add(1)
 	}
-	// Open a new full-page-image epoch: the next mutation of each
-	// page must emit a fresh FPI so crash recovery from this
-	// checkpoint can replay it on a torn page.
-	if er, ok := c.flusher.(epochResetter); ok {
-		er.ResetCheckpointEpoch()
-	}
+	// NOTE (perf-optimize3-dash/03): the FPI epoch boundary is the redo
+	// publication at checkpoint START above — there is no post-record epoch
+	// reset any more (the old ResetCheckpointEpoch sweep here raced writers
+	// between the redo sample and the sweep, leaving image-less records).
 	// Slot-aware WAL retention: prune segments that are no longer
 	// needed by either crash recovery (everything below this
 	// checkpoint LSN is now redo-redundant) or any live
@@ -579,7 +667,12 @@ func (c *Checkpointer) runCheckpoint(ctx context.Context, spread, shutdown bool)
 	// fail the checkpoint — the marker is already durable, and
 	// retention is best-effort.
 	if c.retainer != nil {
-		if err := c.retainer.Retain(endLSN); err != nil {
+		// C2-S3 (review MUST-FIX): retain from the REDO pointer, not the
+		// checkpoint record — recycling the (redo, record] window would
+		// destroy commit records whose CLOG lanes exist only in memory,
+		// making the redo-anchored replay (wal.replayStart) unable to
+		// reconstruct an acked commit after a crash.
+		if err := c.retainer.Retain(redoLSN0 + 1); err != nil {
 			c.cfg.Logger.Warn("wal retention failed", "err", err)
 		}
 	}
@@ -596,6 +689,13 @@ func (c *Checkpointer) runCheckpoint(ctx context.Context, spread, shutdown bool)
 	if c.cfg.TruncateCLOGFn != nil {
 		if err := c.cfg.TruncateCLOGFn(); err != nil {
 			c.cfg.Logger.Warn("post-checkpoint clog truncation failed", "err", err)
+		}
+	}
+	// M0122-0009: durable-ordered pg_subtrans truncation, same ordering
+	// rationale as TruncateCLOGFn above.
+	if c.cfg.TruncateSubtransFn != nil {
+		if err := c.cfg.TruncateSubtransFn(); err != nil {
+			c.cfg.Logger.Warn("post-checkpoint subtrans truncation failed", "err", err)
 		}
 	}
 	// M0057-0001: log checkpoint complete so benchmark runs can see

@@ -482,6 +482,14 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 		if err != nil {
 			return Datum{}, err
 		}
+		// `CAST(x AS interval <qualifier>)` / `x::interval <qualifier>` with an
+		// interval typmod (a field qualifier and/or SECOND precision): the low
+		// field changes the bare-magnitude default unit during parsing, so it
+		// cannot be applied as a post-hoc truncation of an already-parsed value.
+		// unimplemented_feat #5(d-iv).
+		if x.Typmod != 0 && strings.EqualFold(x.TargetType, "interval") {
+			return applyIntervalCastTypmod(v, x.Typmod, x.Pos())
+		}
 		// `::regclass` is catalog-aware in both directions:
 		//   - `<oid>::regclass` renders as the relation name (PG's regclassout)
 		//   - `<text>::regclass` resolves the relation name to its numeric OID
@@ -500,6 +508,15 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 					if len(candidates) > 0 {
 						return NewIntDatum(int64(candidates[0].OID)), nil
 					}
+				}
+				// Not a user-created CREATE FUNCTION routine — fall back to the
+				// curated builtin pg_proc table (the same two-tier lookup
+				// resolveOpClassFunction uses for CREATE OPERATOR CLASS's own
+				// FUNCTION clause), so `'int4eq'::regproc` resolves like real PG
+				// instead of erroring on any bare builtin name. M0119-0006
+				// (005_opclass_damage UPDATE-path prerequisite).
+				if bp, found := catalog.LookupBuiltinProc(name); found {
+					return NewIntDatum(int64(bp.OID)), nil
 				}
 				return NullDatum, &ExecError{Code: "42883", Pos: x.Pos(), Message: fmt.Sprintf("function %q does not exist", funcName)}
 			}
@@ -709,6 +726,16 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 			}
 		}
 		if strings.EqualFold(x.TargetType, "regclass") && ctx != nil && ctx.Catalog != nil {
+			// Scope every lookup below to the connection's own database
+			// namespace — mirrors every other per-dbOid site (e.g.
+			// operators_fk.go, operators_sequence.go). Without this, both cast
+			// directions silently resolved against DefaultDBOid only,
+			// regardless of which database the connection was actually on: an
+			// `<oid>::regclass` for a table in a distinct CREATE DATABASE'd
+			// dbOid rendered the bare numeric OID instead of the relation
+			// name, and `'name'::regclass` couldn't find that table's OID at
+			// all. M0122-0007 4e follow-up 33.
+			connDBOid := catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)
 			switch v.Kind {
 			case KindInt:
 				// InvalidOid (0) renders as "-", matching PG's regclassout
@@ -721,19 +748,19 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 					return NewStringDatum("-"), nil
 				}
 				if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
-					if tbl, found := im.LookupTableByOID(uint32(v.Int)); found && tbl != nil {
+					if tbl, found := im.LookupTableByOID(uint32(v.Int), connDBOid); found && tbl != nil {
 						return NewStringDatum(tbl.Name), nil
 					}
 					// Synthetic TOAST relation OIDs (parent OID + 100M) live only in
 					// the virtual pg_class builder, not c.tables, so reconstruct the
 					// schema-qualified pg_toast.pg_toast_<oid> name PG's regclassout
 					// would emit. M0118-0008 TOAST-exposure slice 2 (0118-0084).
-					if name, found := im.ToastRelName(uint32(v.Int)); found {
+					if name, found := im.ToastRelName(uint32(v.Int), connDBOid); found {
 						return NewStringDatum(name), nil
 					}
 				}
 				// Also resolve index OIDs to index names. M0097-0023.
-				for _, idx := range ctx.Catalog.AllIndexes() {
+				for _, idx := range ctx.Catalog.AllIndexes(connDBOid) {
 					if idx.OID == uint32(v.Int) {
 						return NewStringDatum(idx.Name), nil
 					}
@@ -741,12 +768,12 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 			case KindString:
 				schema, rel := splitQualifiedTable(v.StringValue())
 				objName := parser.ObjectName{Schema: schema, Name: rel}
-				if tbl, found := ctx.Catalog.LookupTable(objName); found && tbl != nil {
+				if tbl, found := ctx.Catalog.LookupTable(objName, connDBOid); found && tbl != nil {
 					return NewIntDatum(int64(tbl.OID)), nil
 				}
 				// Also resolve index names: 'idx_name'::regclass returns the index OID.
 				if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
-					if idx, found := im.LookupIndex(objName); found && idx != nil {
+					if idx, found := im.LookupIndex(objName, connDBOid); found && idx != nil {
 						return NewIntDatum(int64(idx.OID)), nil
 					}
 				}
@@ -1153,6 +1180,9 @@ func evalUnary(op parser.OpCode, d Datum, pos int) (Datum, error) {
 				return newBigNumericInCtx(mctx.Perm(), neg, d.Scale), nil
 			}
 			return Datum{Kind: KindNumeric, Int: -d.Int, Scale: d.Scale}, nil
+		case KindInterval:
+			// Unary interval negation (interval_um). (unimplemented_feat #5(d-iv))
+			return negateInterval(d, pos)
 		default:
 			return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: "operator unary - requires integer or numeric"}
 		}
@@ -1365,10 +1395,23 @@ func evalBinary(op parser.OpCode, left, right Datum, pos int) (Datum, error) {
 		// timestamp - timestamp (returns interval upstream;
 		// scope-deferred until the type system).
 		if left.Kind == KindTime && right.Kind == KindInterval {
-			return addTimeInterval(left, right, op == parser.OpSub), nil
+			return addTimeInterval(left, right, op == parser.OpSub, pos)
 		}
 		if op == parser.OpAdd && left.Kind == KindInterval && right.Kind == KindTime {
-			return addTimeInterval(right, left, false), nil
+			return addTimeInterval(right, left, false, pos)
+		}
+		// timestamp − timestamp → interval; date − date → integer days.
+		// Mirrors upstream timestamp_mi / date_mi (timestamp.c / date.c):
+		// the microsecond difference is justified into whole 24h days
+		// (interval_justify_hours), while a pure date pair yields an int4
+		// day count instead of an interval.
+		if op == parser.OpSub && left.Kind == KindTime && right.Kind == KindTime {
+			return subTimeTime(left, right, pos)
+		}
+		// interval ± interval → interval (component-wise), matching
+		// interval_pl / interval_mi.
+		if left.Kind == KindInterval && right.Kind == KindInterval {
+			return addIntervalInterval(left, right, op == parser.OpSub, pos)
 		}
 		// NUMERIC ± NUMERIC, NUMERIC ± INT, INT ± NUMERIC: promote
 		// the int side to KindNumeric{scale=0} and reuse the same
@@ -1862,14 +1905,244 @@ func evalPOSIXRegex(s, pattern string, caseInsensitive bool) (bool, error) {
 // applied via time.AddDate (which carries year/month overflow
 // the way upstream PG does for `timestamp + interval '1 month'`);
 // days are added via the same call.
-func addTimeInterval(t, iv Datum, subtract bool) Datum {
+// addTimeInterval implements `timestamp + interval` (and, with subtract, the
+// `timestamp - interval` form that upstream routes through timestamp_mi_interval
+// → interval_um_internal → timestamp_pl_interval). It line-ports
+// timestamp_pl_interval's ±infinity handling (postgres/src/backend/utils/adt/
+// timestamp.c:3107): a ±infinity interval forces the result to the same-signed
+// infinite timestamp, EXCEPT "infinity − infinity", which has no NaN analogue
+// for the timestamp type and errors; a finite interval added to an already
+// infinite timestamp passes the timestamp through unchanged.
+// (unimplemented_feat #5(d-iv))
+func addTimeInterval(t, iv Datum, subtract bool, pos int) (Datum, error) {
+	// timestamp_mi_interval negates the span first (interval_um_internal swaps
+	// the ±infinity sentinels), so fold subtract into the sentinel test.
+	spanNoBegin := iv.IsIntervalNoBegin() // interval == -infinity
+	spanNoEnd := iv.IsIntervalNoEnd()     // interval == +infinity
+	if subtract {
+		spanNoBegin, spanNoEnd = spanNoEnd, spanNoBegin
+	}
+	if spanNoBegin { // span is -infinity
+		if t.IsTimestampPosInf() {
+			return NullDatum, timestampOutOfRange(pos)
+		}
+		return NewTimestampInfinity(false), nil
+	}
+	if spanNoEnd { // span is +infinity
+		if t.IsTimestampNegInf() {
+			return NullDatum, timestampOutOfRange(pos)
+		}
+		return NewTimestampInfinity(true), nil
+	}
+	// Span is finite: an already-infinite timestamp passes through unchanged
+	// (TIMESTAMP_NOT_FINITE(timestamp) branch).
+	if t.IsTimestampNotFinite() {
+		return t, nil
+	}
 	months := int(iv.IntervalMonthsValue())
 	days := int(iv.IntervalDaysValue())
+	micros := iv.IntervalMicrosValue()
 	if subtract {
 		months = -months
 		days = -days
+		micros = -micros
 	}
-	return NewTimeDatum(t.TimeValue().AddDate(0, months, days))
+	res := t.TimeValue().AddDate(0, months, days)
+	if micros != 0 {
+		res = res.Add(time.Duration(micros) * time.Microsecond)
+	}
+	return NewTimeDatum(res), nil
+}
+
+// timestampOutOfRange is PG's error for a non-representable timestamp result
+// (here: "infinity − infinity", which the timestamp type cannot express since
+// it has no NaN). Mirrors ereport(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE,
+// "timestamp out of range").
+func timestampOutOfRange(pos int) error {
+	return &ExecError{Code: "22008", Pos: pos, Message: "timestamp out of range"}
+}
+
+// usecsPerDay is the microsecond count in a 24-hour day, used by the
+// interval time-component helpers below (matches USECS_PER_DAY upstream).
+const usecsPerDay = 24 * 60 * 60 * 1_000_000
+
+// Sub-day interval unit magnitudes in microseconds, used when lowering
+// sub-day interval literals (`interval '2 hours'` etc.) to the KindInterval
+// micros carrier. Mirror USECS_PER_HOUR/MINUTE/SEC upstream
+// (postgres/src/include/datatype/timestamp.h).
+const (
+	usecsPerHour   = 3600 * 1_000_000
+	usecsPerMinute = 60 * 1_000_000
+	usecsPerSecond = 1_000_000
+	usecsPerMilli  = 1_000
+)
+
+// subTimeTime implements `timestamp − timestamp` → interval, mirroring
+// upstream timestamp_mi: the microsecond delta is justified into whole 24h
+// days via interval_justify_hours. goopg represents DATE internally as a
+// timestamp, so date − date also flows through here and yields an interval
+// (e.g. "9 days") rather than upstream date_mi's integer day count — a
+// documented divergence deferred to the type system (deferral_ledger.md).
+//
+// ±infinity operands follow timestamp_mi's infinity block exactly: any
+// "infinity − same-signed infinity" is an error (the interval type has no
+// NaN), while a single infinite operand yields the correspondingly-signed
+// infinite interval. -inf−x = -inf, +inf−x = +inf, x−(-inf) = +inf,
+// x−(+inf) = -inf. (unimplemented_feat #5(d-iv))
+func subTimeTime(left, right Datum, pos int) (Datum, error) {
+	if left.IsTimestampNotFinite() || right.IsTimestampNotFinite() {
+		switch {
+		case left.IsTimestampNegInf():
+			if right.IsTimestampNegInf() {
+				return Datum{}, intervalOutOfRange(pos)
+			}
+			return NewIntervalInfinity(false), nil
+		case left.IsTimestampPosInf():
+			if right.IsTimestampPosInf() {
+				return Datum{}, intervalOutOfRange(pos)
+			}
+			return NewIntervalInfinity(true), nil
+		case right.IsTimestampNegInf(): // left finite − (−inf) = +inf
+			return NewIntervalInfinity(true), nil
+		default: // right.IsTimestampPosInf(): left finite − (+inf) = −inf
+			return NewIntervalInfinity(false), nil
+		}
+	}
+	diff := left.TimeValue().Sub(right.TimeValue()) // time.Duration (ns)
+	micros := int64(diff / time.Microsecond)
+	days := micros / usecsPerDay
+	micros -= days * usecsPerDay
+	return NewIntervalDatumFull(0, int32(days), micros), nil
+}
+
+// intervalOutOfRange is PG's error for a non-representable interval result
+// (overflow, or an "infinity − infinity" that has no NaN equivalent).
+// Mirrors ereport(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE, "interval out of range").
+func intervalOutOfRange(pos int) error {
+	return &ExecError{Code: "22008", Pos: pos, Message: "interval out of range"}
+}
+
+// finiteIntervalArith adds (or subtracts, when subtract) two FINITE intervals
+// field-by-field, erroring on int32/int64 field overflow OR on a result that
+// lands on a ±infinity sentinel — matching finite_interval_pl / finite_interval_mi
+// (both guard with INTERVAL_NOT_FINITE(result)). (unimplemented_feat #5(d-iv))
+func finiteIntervalArith(left, right Datum, subtract bool, pos int) (Datum, error) {
+	sign := int64(1)
+	if subtract {
+		sign = -1
+	}
+	months := int64(left.IntervalMonthsValue()) + sign*int64(right.IntervalMonthsValue())
+	days := int64(left.IntervalDaysValue()) + sign*int64(right.IntervalDaysValue())
+	// time is int64; detect true 64-bit add/sub overflow (same guards as arithmetic()).
+	lt, rt := left.IntervalMicrosValue(), right.IntervalMicrosValue()
+	var micros int64
+	if subtract {
+		micros = lt - rt
+		if (lt^rt)&(lt^micros) < 0 {
+			return Datum{}, intervalOutOfRange(pos)
+		}
+	} else {
+		micros = lt + rt
+		if (lt^micros)&(rt^micros) < 0 {
+			return Datum{}, intervalOutOfRange(pos)
+		}
+	}
+	if months > math.MaxInt32 || months < math.MinInt32 ||
+		days > math.MaxInt32 || days < math.MinInt32 {
+		return Datum{}, intervalOutOfRange(pos)
+	}
+	res := NewIntervalDatumFull(int32(months), int32(days), micros)
+	if res.IsIntervalNotFinite() {
+		// Finite arithmetic must never synthesise a ±infinity sentinel.
+		return Datum{}, intervalOutOfRange(pos)
+	}
+	return res, nil
+}
+
+// intervalInfinityRank maps an interval to its ordering rank against the
+// ±infinity sentinels: −1 for −infinity, +1 for +infinity, 0 for any finite
+// interval. Used only to order the sentinels exactly in compareDatums.
+func intervalInfinityRank(d Datum) int {
+	switch {
+	case d.IsIntervalNoBegin():
+		return -1
+	case d.IsIntervalNoEnd():
+		return 1
+	default:
+		return 0
+	}
+}
+
+// addIntervalInterval implements `interval ± interval`, combining the
+// month/day/microsecond fields independently (interval_pl / interval_mi).
+// ±infinity operands short-circuit exactly as upstream: like-signed infinities
+// pass through, but any "infinity − infinity" (interval has no NaN) errors.
+func addIntervalInterval(left, right Datum, subtract bool, pos int) (Datum, error) {
+	if !subtract {
+		// interval_pl
+		switch {
+		case left.IsIntervalNoBegin():
+			if right.IsIntervalNoEnd() {
+				return Datum{}, intervalOutOfRange(pos)
+			}
+			return NewIntervalInfinity(false), nil
+		case left.IsIntervalNoEnd():
+			if right.IsIntervalNoBegin() {
+				return Datum{}, intervalOutOfRange(pos)
+			}
+			return NewIntervalInfinity(true), nil
+		case right.IsIntervalNotFinite():
+			return right, nil
+		}
+		return finiteIntervalArith(left, right, false, pos)
+	}
+	// interval_mi
+	switch {
+	case left.IsIntervalNoBegin():
+		if right.IsIntervalNoBegin() {
+			return Datum{}, intervalOutOfRange(pos)
+		}
+		return NewIntervalInfinity(false), nil
+	case left.IsIntervalNoEnd():
+		if right.IsIntervalNoEnd() {
+			return Datum{}, intervalOutOfRange(pos)
+		}
+		return NewIntervalInfinity(true), nil
+	case right.IsIntervalNoBegin():
+		return NewIntervalInfinity(true), nil
+	case right.IsIntervalNoEnd():
+		return NewIntervalInfinity(false), nil
+	}
+	return finiteIntervalArith(left, right, true, pos)
+}
+
+// negateInterval implements unary `- interval` (interval_um / interval_um_internal,
+// postgres/src/backend/utils/adt/timestamp.c:3444): the ±infinity sentinels swap
+// (NOBEGIN↔NOEND) and every finite field is negated with an overflow guard, also
+// erroring if the negation lands exactly on a ±infinity sentinel.
+// (unimplemented_feat #5(d-iv))
+func negateInterval(d Datum, pos int) (Datum, error) {
+	switch {
+	case d.IsIntervalNoBegin():
+		// -(-infinity) = +infinity (INTERVAL_NOBEGIN -> INTERVAL_NOEND)
+		return NewIntervalInfinity(true), nil
+	case d.IsIntervalNoEnd():
+		// -(+infinity) = -infinity (INTERVAL_NOEND -> INTERVAL_NOBEGIN)
+		return NewIntervalInfinity(false), nil
+	}
+	months := d.IntervalMonthsValue()
+	days := d.IntervalDaysValue()
+	micros := d.IntervalMicrosValue()
+	// pg_sub_s64/s32_overflow(0, x): 0-x overflows only when x is the signed min.
+	if micros == math.MinInt64 || months == math.MinInt32 || days == math.MinInt32 {
+		return Datum{}, intervalOutOfRange(pos)
+	}
+	res := NewIntervalDatumFull(-months, -days, -micros)
+	if res.IsIntervalNotFinite() {
+		// Negating a finite interval must never synthesise a ±infinity sentinel.
+		return Datum{}, intervalOutOfRange(pos)
+	}
+	return res, nil
 }
 
 func arithmetic(op parser.OpCode, a, b int64, pos int) (Datum, error) {
@@ -2309,17 +2582,41 @@ func compareDatum(a, b Datum, pos int) (int, error) {
 		}
 		return 0, nil
 	case KindInterval:
+		// ±infinity sentinels order exactly: −infinity precedes and +infinity
+		// follows every finite interval (and each other), matching
+		// interval_cmp_internal's non-finite short-circuit. Must run before the
+		// lossy day-widening below, whose int64 sum is not exact at the extremes.
+		if a.IsIntervalNotFinite() || b.IsIntervalNotFinite() {
+			ra := intervalInfinityRank(a)
+			rb := intervalInfinityRank(b)
+			switch {
+			case ra < rb:
+				return -1, nil
+			case ra > rb:
+				return 1, nil
+			default:
+				return 0, nil
+			}
+		}
 		// Mirrors PostgreSQL's interval_cmp_value (timestamp.c): months are
-		// widened to days at a fixed 30-day rate, then combined with the day
-		// field into a single linear day count. v0's interval has no
-		// sub-day/time component (always 0), so the microsecond widening
-		// upstream does on top of this is a no-op here. M0122-0004.
-		at := int64(a.IntervalMonthsValue())*30 + int64(a.IntervalDaysValue())
-		bt := int64(b.IntervalMonthsValue())*30 + int64(b.IntervalDaysValue())
+		// widened to days at a fixed 30-day rate and combined with the day
+		// field plus the whole-day part of the microsecond component into a
+		// single day count; the sub-day microsecond remainder breaks ties.
+		// Decomposing this way (rather than multiplying days back up to
+		// microseconds) keeps the comparison inside int64 for the ranges
+		// goopg produces. M0122-0004 / timestamp − timestamp subtraction.
+		aDays := int64(a.IntervalMonthsValue())*30 + int64(a.IntervalDaysValue()) + a.IntervalMicrosValue()/usecsPerDay
+		bDays := int64(b.IntervalMonthsValue())*30 + int64(b.IntervalDaysValue()) + b.IntervalMicrosValue()/usecsPerDay
+		aFrac := a.IntervalMicrosValue() % usecsPerDay
+		bFrac := b.IntervalMicrosValue() % usecsPerDay
 		switch {
-		case at < bt:
+		case aDays < bDays:
 			return -1, nil
-		case at > bt:
+		case aDays > bDays:
+			return 1, nil
+		case aFrac < bFrac:
+			return -1, nil
+		case aFrac > bFrac:
 			return 1, nil
 		}
 		return 0, nil
@@ -2506,6 +2803,12 @@ func evalTypedStringLit(x *planner.TypedStringLit) (Datum, error) {
 		return Datum{Kind: KindInt, Int: int64(n)}, nil
 
 	case "date":
+		// PG's 'infinity' / '-infinity' spellings have no finite time.Time and
+		// map to the DATEVAL_NOEND / DATEVAL_NOBEGIN sentinel; intercept before
+		// the layout parse (not time-cached). (unimplemented_feat #5(d-iv))
+		if inf, ok := parseDateInfinityLiteral(x.Value); ok {
+			return inf, nil
+		}
 		t, err := time.Parse("2006-01-02", x.Value)
 		if err != nil {
 			return Datum{}, &ExecError{Code: "22007", Pos: x.Pos(), Message: fmt.Sprintf("invalid date %q: %v", x.Value, err)}
@@ -2539,6 +2842,14 @@ func evalTypedStringLit(x *planner.TypedStringLit) (Datum, error) {
 		// receipt-report specs (which book rooms on the half-hour with
 		// `TIMESTAMP WITH TIME ZONE '2010-04-01 10:00'`) fail their
 		// setup INSERT with `invalid timestamp` (22007).
+		//
+		// PG's special 'infinity' / '-infinity' spellings have no finite
+		// time.Time and so are intercepted before the layout loop; the
+		// ±infinity sentinel is not time-cached (detection is a trivial
+		// string compare). (unimplemented_feat #5(d-iv))
+		if inf, ok := parseTimestampInfinityLiteral(x.Value); ok {
+			return inf, nil
+		}
 		layouts := []string{
 			"2006-01-02 15:04:05.999999-07",
 			"2006-01-02 15:04:05-07",
@@ -3090,6 +3401,10 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 		// Cast to date: truncate KindTime to midnight UTC, parse strings as dates. M0097-0004.
 		if d.Kind == KindString {
 			s := d.StringValue()
+			// 'infinity' / '-infinity' → DATEVAL_NOEND / NOBEGIN (#5(d-iv)).
+			if inf, ok := parseDateInfinityLiteral(s); ok {
+				return inf, nil
+			}
 			if t, err := parseCopyTimestamp(s); err == nil {
 				t2 := t.UTC()
 				return NewTimeDatum(time.Date(t2.Year(), t2.Month(), t2.Day(), 0, 0, 0, 0, time.UTC)), nil
@@ -3098,6 +3413,11 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 				Message: fmt.Sprintf("invalid input syntax for type date: %q", s)}
 		}
 		if d.Kind == KindTime {
+			// A ±infinity timestamp/date sentinel casts to the same-signed date
+			// infinity (PG timestamp2date / date passthrough). (#5(d-iv))
+			if d.IsTimestampNotFinite() {
+				return NewDateInfinity(d.IsTimestampPosInf()), nil
+			}
 			t := d.TimeValue().UTC()
 			return NewTimeDatum(time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)), nil
 		}
@@ -3135,6 +3455,10 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 	case "timestamp", "timestamptz":
 		// Cast to timestamp: parse strings, keep KindTime as-is. M0097-0004.
 		if d.Kind == KindString {
+			// 'infinity' / '-infinity' have no finite time.Time (#5(d-iv)).
+			if inf, ok := parseTimestampInfinityLiteral(d.StringValue()); ok {
+				return inf, nil
+			}
 			ts, err := parseCopyTimestamp(d.StringValue())
 			if err != nil {
 				return Datum{}, &ExecError{Code: "22007", Pos: pos,
@@ -3145,22 +3469,25 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 		return d, nil
 	case "interval":
 		// Cast to interval: parse the v0-supported "<n> <unit>" string shape
-		// (unit ∈ day(s)/month(s)/year(s)), mirroring the `INTERVAL '<n>
-		// <unit>'` typed-literal grammar (evalIntervalLit/splitEmbeddedInterval)
-		// so `'<n> <unit>'::interval` and `CAST('<n> <unit>' AS interval)`
-		// accept exactly the same strings instead of silently passing the
-		// string through unparsed. Multi-component/sub-day interval strings
-		// remain a documented v0 scope limit. M0122-0004.
+		// (unit ∈ day(s)/month(s)/year(s) or the sub-day
+		// hour(s)/minute(s)/second(s)/millisecond(s)), mirroring the
+		// `INTERVAL '<n> <unit>'` typed-literal grammar
+		// (evalIntervalLit/splitEmbeddedInterval) so `'<n> <unit>'::interval`
+		// and `CAST('<n> <unit>' AS interval)` accept exactly the same
+		// strings instead of silently passing the string through unparsed.
+		// Multi-component interval strings (`1 day 05:00:00`) and fractional
+		// magnitudes remain a documented v0 scope limit. M0122-0004;
+		// sub-day units unimplemented_feat #5.
 		if d.Kind == KindInterval {
 			return d, nil
 		}
 		if d.Kind == KindString {
-			months, days, ok := parseIntervalCastString(d.StringValue())
+			months, days, micros, ok := parseIntervalCastString(d.StringValue())
 			if !ok {
 				return Datum{}, &ExecError{Code: "22007", Pos: pos,
 					Message: fmt.Sprintf("invalid input syntax for type interval: %q", d.StringValue())}
 			}
-			return NewIntervalDatum(months, days), nil
+			return NewIntervalDatumFull(months, days, micros), nil
 		}
 		return Datum{}, &ExecError{Code: "22P02", Pos: pos, Message: "cannot cast to interval"}
 	case "tid":
@@ -3820,6 +4147,32 @@ func newNumericFromFloat(f float64) Datum {
 	return newNumeric(m, int(scale))
 }
 
+// int64DivFastToNumeric reproduces PostgreSQL's int64_div_fast_to_numeric
+// (postgres/src/backend/utils/adt/numeric.c:4423): it renders val / 10^log10
+// as a NUMERIC whose *display scale* is exactly log10 (log10<0 → scale 0), so
+// trailing zeros are preserved. EXTRACT (the numeric-returning spelling) uses
+// this for its fractional-second fields — PG prints `EXTRACT(SECOND FROM
+// INTERVAL '5 seconds')` as `5.000000` (scale 6), not `5`. This is distinct
+// from date_part (the float8-returning spelling, retnumeric=false), which
+// strips trailing zeros via newNumericFromFloat.
+func int64DivFastToNumeric(val int64, log10 int) Datum {
+	scale := log10
+	if scale < 0 {
+		scale = 0
+	}
+	return Datum{Kind: KindNumeric, Int: val, Scale: int16(scale)}
+}
+
+// timeOfDayMicros returns t's wall-clock time-of-day (hour/minute/second and
+// fractional microseconds) expressed as microseconds since midnight, ignoring
+// the date component. Used by EXTRACT(EPOCH …)/date_part('epoch', …) for the
+// time / timetz source types, whose epoch is a seconds-of-day quantity rather
+// than a full Unix epoch.
+func timeOfDayMicros(t time.Time) int64 {
+	return (int64(t.Hour())*3600+int64(t.Minute())*60+int64(t.Second()))*1_000_000 +
+		int64(t.Nanosecond())/1000
+}
+
 // evalExtract implements `EXTRACT(field FROM source)` for the
 // timestamp-component fields TPC-H Q7/Q8/Q9 use (year), plus
 // the obvious neighbours (month, day, hour, minute, dow, doy,
@@ -3832,6 +4185,12 @@ func evalExtract(x *planner.ExtractExpr, row Row, ctx *Context) (Datum, error) {
 	}
 	if src.IsNull() {
 		return NullDatum, nil
+	}
+	if src.Kind == KindInterval {
+		// EXTRACT(field FROM interval) has its own field taxonomy and
+		// broken-down representation (interval_part_common). M0097 follow-up.
+		// EXTRACT returns numeric (retnumeric=true) → scale-preserved.
+		return evalExtractInterval(src, x.Field, x.Pos(), true)
 	}
 	if src.Kind != KindTime {
 		// Try to parse a string as timestamp (planner may assign
@@ -3853,18 +4212,38 @@ func evalExtract(x *planner.ExtractExpr, row Row, ctx *Context) (Datum, error) {
 	isTimeOnly := srcType == "time" || srcType == "timetz"
 	switch field {
 	case "second", "seconds":
-		f := float64(u.Second()) + float64(u.Nanosecond())/1e9
-		return newNumericFromFloat(f), nil
+		// EXTRACT returns numeric: (tm_sec*1e6 + fsec) / 1e6 at scale 6
+		// (timestamp_part / interval_part_common, retnumeric=true), so PG
+		// prints `40.500000` not `40.5`.
+		usec := int64(u.Second())*1_000_000 + int64(u.Nanosecond())/1000
+		return int64DivFastToNumeric(usec, 6), nil
 	case "milliseconds", "millisecond":
-		f := float64(u.Second())*1000 + float64(u.Nanosecond())/1_000_000.0
-		return newNumericFromFloat(f), nil
+		usec := int64(u.Second())*1_000_000 + int64(u.Nanosecond())/1000
+		return int64DivFastToNumeric(usec, 3), nil
 	case "epoch":
-		localSecs := float64(u.Hour()*3600+u.Minute()*60+u.Second()) + float64(u.Nanosecond())/1e9
-		if srcType == "timetz" {
-			// timetz epoch = UTC seconds-of-day = local_time - offset
-			return newNumericFromFloat(localSecs - float64(src.TimeTZOffsetSecs())), nil
+		// EXTRACT returns numeric (retnumeric=true), so the display scale is
+		// preserved. PG's epoch is source-type dependent (timestamp_part /
+		// timetz_part / extract_date, all in .../adt/*.c):
+		//   timestamp/timestamptz → full Unix epoch, µs/1e6 at scale 6
+		//     (982355920.500000);
+		//   time                  → seconds-of-day at scale 6 (74320.500000);
+		//   timetz                → local seconds-of-day − offset at scale 6
+		//     (offset east-positive; stored Int is the local wall-clock as UTC
+		//      nanos, so u's time-of-day is the local time);
+		//   date                  → integer seconds since the Unix epoch at
+		//     scale 0 (982281600, no fractional part).
+		switch {
+		case srcType == "timetz":
+			epochMicros := timeOfDayMicros(u) - int64(src.TimeTZOffsetSecs())*1_000_000
+			return int64DivFastToNumeric(epochMicros, 6), nil
+		case srcType == "time":
+			return int64DivFastToNumeric(timeOfDayMicros(u), 6), nil
+		case srcType == "date" || src.Flags&flagDate != 0:
+			return int64DivFastToNumeric(u.Unix(), 0), nil
+		default: // timestamp / timestamptz
+			epochMicros := u.Unix()*1_000_000 + int64(u.Nanosecond())/1000
+			return int64DivFastToNumeric(epochMicros, 6), nil
 		}
-		return newNumericFromFloat(localSecs), nil
 	case "timezone", "timezone_hour", "timezone_minute":
 		if srcType == "time" {
 			return Datum{}, &ExecError{Code: "22023", Pos: x.Pos(),
@@ -3916,6 +4295,154 @@ func evalExtract(x *planner.ExtractExpr, row Row, ctx *Context) (Datum, error) {
 		return Datum{}, err
 	}
 	return Datum{Kind: KindInt, Int: n}, nil
+}
+
+// evalExtractInterval implements EXTRACT(field FROM interval), a line-port of
+// interval_part_common (postgres/src/backend/utils/adt/timestamp.c:6098). PG
+// breaks the interval into a pg_itm via interval2itm with NO justification —
+// year=month/12, mon=month%12, mday=day — and hour/min/sec/usec are carved from
+// the raw micros (time) field, so hour may exceed 24 and day is taken verbatim.
+// Integer-valued fields return int8; second/millisecond return numeric (fsec is
+// fractional); epoch returns numeric via the DAYS_PER_YEAR/MONTH weighting.
+// The ±infinity sentinels follow NonFiniteIntervalPart: monotonically-increasing
+// units yield ±Infinity (numeric), oscillating units yield NULL, and any other
+// unit raises the same error the finite path would.
+func evalExtractInterval(src Datum, field string, pos int, retnumeric bool) (Datum, error) {
+	f := strings.ToLower(strings.TrimSpace(field))
+
+	// ±infinity sentinel handling (INTERVAL_NOT_FINITE → NonFiniteIntervalPart).
+	if src.IsIntervalNotFinite() {
+		switch f {
+		case "microsecond", "microseconds", "millisecond", "milliseconds",
+			"second", "seconds", "minute", "minutes", "week", "weeks",
+			"month", "months", "quarter":
+			// Oscillating units → 0.0, which PG maps to a NULL result.
+			return NullDatum, nil
+		case "hour", "hours", "day", "days", "year", "years",
+			"decade", "decades", "century", "centuries",
+			"millennium", "millenniums", "millennia", "epoch":
+			// Monotonically-increasing units → ±Infinity (numeric).
+			if src.IsIntervalNoBegin() {
+				return NewStringDatum("-Infinity"), nil
+			}
+			return NewStringDatum("Infinity"), nil
+		default:
+			return intervalUnitError(f, pos)
+		}
+	}
+
+	months := src.IntervalMonthsValue()
+	days := src.IntervalDaysValue()
+	micros := src.IntervalMicrosValue()
+
+	// interval2itm: broken-down fields (no justification).
+	tmYear := int64(months) / 12
+	tmMon := int64(months) % 12
+	tmMday := int64(days)
+	t := micros
+	tmHour := t / usecsPerHour
+	t -= tmHour * usecsPerHour
+	tmMin := t / usecsPerMinute
+	t -= tmMin * usecsPerMinute
+	tmSec := t / usecsPerSecond
+	t -= tmSec * usecsPerSecond
+	tmUsec := t
+
+	switch f {
+	case "microsecond", "microseconds":
+		return Datum{Kind: KindInt, Int: tmSec*1_000_000 + tmUsec}, nil
+	case "millisecond", "milliseconds":
+		if retnumeric {
+			// EXTRACT: (tm_sec*1e6 + usec) / 1e3 at scale 3.
+			return int64DivFastToNumeric(tmSec*1_000_000+tmUsec, 3), nil
+		}
+		return newNumericFromFloat(float64(tmSec)*1000.0 + float64(tmUsec)/1000.0), nil
+	case "second", "seconds":
+		if retnumeric {
+			// EXTRACT: (tm_sec*1e6 + usec) / 1e6 at scale 6.
+			return int64DivFastToNumeric(tmSec*1_000_000+tmUsec, 6), nil
+		}
+		return newNumericFromFloat(float64(tmSec) + float64(tmUsec)/1_000_000.0), nil
+	case "minute", "minutes":
+		return Datum{Kind: KindInt, Int: tmMin}, nil
+	case "hour", "hours":
+		return Datum{Kind: KindInt, Int: tmHour}, nil
+	case "day", "days":
+		return Datum{Kind: KindInt, Int: tmMday}, nil
+	case "week", "weeks":
+		return Datum{Kind: KindInt, Int: tmMday / 7}, nil
+	case "month", "months":
+		return Datum{Kind: KindInt, Int: tmMon}, nil
+	case "quarter":
+		// Work from interval->month directly so a negative interval yields the
+		// negated field of its sign-reversed value (interval_part_common).
+		var q int64
+		if months >= 0 {
+			q = (tmMon / 3) + 1
+		} else {
+			q = -(((-int64(months) % 12) / 3) + 1)
+		}
+		return Datum{Kind: KindInt, Int: q}, nil
+	case "year", "years":
+		return Datum{Kind: KindInt, Int: tmYear}, nil
+	case "decade", "decades":
+		return Datum{Kind: KindInt, Int: tmYear / 10}, nil
+	case "century", "centuries":
+		return Datum{Kind: KindInt, Int: tmYear / 100}, nil
+	case "millennium", "millenniums", "millennia":
+		return Datum{Kind: KindInt, Int: tmYear / 1000}, nil
+	case "epoch":
+		// DAYS_PER_YEAR=365.25, DAYS_PER_MONTH=30, SECS_PER_DAY=86400.
+		if retnumeric {
+			// EXTRACT: integer arithmetic per interval_part_common — multiply
+			// by 4 and divide by 4 so the fractional DAYS_PER_YEAR (365.25)
+			// stays exact: 4*365.25=1461, 4*30=120, SECS_PER_DAY/4=21600.
+			// secs_from_day_month always fits int64, but its product with 1e6
+			// overflows around 10^9 days (~1.07e8 days for a whole-day interval,
+			// or fewer via the months arm). PG guards that with
+			// pg_mul/pg_add_s64_overflow and, on overflow, redoes the sum in
+			// numeric (interval_part_common); we mirror both paths so huge
+			// intervals return the correct value instead of a silent int64 wrap.
+			// result = (secs_from_day_month*1e6 + micros) / 1e6 at scale 6.
+			m := int64(months)
+			secsFromDayMonth := (1461*(m/12) + 120*(m%12) + 4*int64(days)) * 21600
+			if v, ok := mulInt64Overflow(secsFromDayMonth, 1_000_000); ok {
+				if val, ok := addInt64Overflow(v, micros); ok {
+					return int64DivFastToNumeric(val, 6), nil
+				}
+			}
+			// Overflow fallback: numeric_add(int64_div_fast_to_numeric(time,6),
+			// int64_to_numeric(secs_from_day_month)) — the whole-seconds term is
+			// scale 0, the time term scale 6, so the sum lands at scale 6 exactly
+			// like the fast path but backed by big.Int.
+			return numericAdd(int64DivFastToNumeric(micros, 6), numericFromInt(secsFromDayMonth))
+		}
+		result := float64(micros) / 1_000_000.0
+		result += 365.25 * 86400.0 * float64(int64(months)/12)
+		result += 30.0 * 86400.0 * float64(int64(months)%12)
+		result += 86400.0 * float64(days)
+		return newNumericFromFloat(result), nil
+	default:
+		return intervalUnitError(f, pos)
+	}
+}
+
+// intervalUnitError reproduces interval_part_common's two error taxonomies:
+// a unit that PG's DecodeUnits recognizes but does not support for interval
+// raises 0A000 (feature not supported); a wholly unknown unit raises 22023
+// (invalid parameter value / not recognized).
+func intervalUnitError(field string, pos int) (Datum, error) {
+	knownUnsupported := map[string]bool{
+		"dow": true, "isodow": true, "doy": true, "isoyear": true,
+		"julian": true, "timezone": true, "timezone_hour": true,
+		"timezone_minute": true,
+	}
+	if knownUnsupported[field] {
+		return Datum{}, &ExecError{Code: "0A000", Pos: pos,
+			Message: fmt.Sprintf("unit %q not supported for type interval", field)}
+	}
+	return Datum{}, &ExecError{Code: "22023", Pos: pos,
+		Message: fmt.Sprintf("unit %q not recognized for type interval", field)}
 }
 
 // extractTimestampField returns the integer value of a named
@@ -4008,6 +4535,12 @@ func evalDatePart(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	if fieldArg.Kind != KindString {
 		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "date_part first argument must be text"}
 	}
+	if src.Kind == KindInterval {
+		// date_part('field', interval) is the function spelling of
+		// EXTRACT(field FROM interval); share the same line-port. M0097 follow-up.
+		// date_part returns float8 (retnumeric=false) → trailing zeros stripped.
+		return evalExtractInterval(src, fieldArg.StringValue(), x.Pos(), false)
+	}
 	if src.Kind != KindTime {
 		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "date_part second argument must be timestamp/date"}
 	}
@@ -4022,13 +4555,18 @@ func evalDatePart(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		f := float64(u.Second())*1000 + float64(u.Nanosecond())/1_000_000.0
 		return newNumericFromFloat(f), nil
 	case "epoch":
-		f := float64(u.Hour()*3600+u.Minute()*60+u.Second()) + float64(u.Nanosecond())/1e9
-		// For timetz datums, epoch = UTC seconds-of-day = local_time - offset.
-		// Scale stores timezone offset in minutes east of UTC.
+		// date_part returns float8 (retnumeric=false) → trailing zeros stripped.
+		// timetz carries its offset in Scale (minutes east of UTC): its epoch is
+		// local seconds-of-day − offset. Every other KindTime source (time,
+		// timestamp, timestamptz, date) has Scale 0 and uses the full Unix epoch;
+		// for a `time` value (always stored on 1970-01-01) the full Unix epoch
+		// equals its seconds-of-day, so the uniform formula is correct there too.
 		if src.Scale != 0 {
-			f -= float64(src.TimeTZOffsetSecs())
+			f := float64(timeOfDayMicros(u))/1e6 - float64(src.TimeTZOffsetSecs())
+			return newNumericFromFloat(f), nil
 		}
-		return newNumericFromFloat(f), nil
+		epochMicros := u.Unix()*1_000_000 + int64(u.Nanosecond())/1000
+		return newNumericFromFloat(float64(epochMicros)/1e6), nil
 	}
 	n, err := extractTimestampField(field, u, x.Pos())
 	if err != nil {
@@ -4963,7 +5501,7 @@ func buildConstraintDefString(idx *catalog.Index) string {
 // DEFERRABLE clause are appended; MATCH SIMPLE (the default) is omitted, as PG
 // does. A trailing ` NOT VALID` is appended for an unvalidated FK
 // (convalidated='f'). DU-002 slices 51, 307.
-func buildForeignKeyDefString(im *catalog.InMemory, fk catalog.ForeignKey) string {
+func buildForeignKeyDefString(im *catalog.InMemory, fk catalog.ForeignKey, dbOid ...uint32) string {
 	var refTbl *catalog.Table
 	for _, t := range im.AllTables() {
 		if t.Virtual || t.OID == 0 {
@@ -4984,7 +5522,7 @@ func buildForeignKeyDefString(im *catalog.InMemory, fk catalog.ForeignKey) strin
 		refName = refTbl.Name
 		if len(refCols) == 0 {
 			// Default to the referenced table's primary-key columns.
-			for _, idx := range im.IndexesOnTable(refTbl) {
+			for _, idx := range im.IndexesOnTable(refTbl, dbOid...) {
 				if idx.Primary {
 					refCols = idx.Columns
 					break
@@ -5312,8 +5850,6 @@ func evalMakeTime(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	return NewTimeDatum(t), nil
 }
 
-// evalIsFinite stubs isfinite(date/timestamp/interval). goopg v0 does not
-// store infinity values, so always returns TRUE for non-NULL input. M0097-0004.
 // regexpFirstMatchArray computes the text[] datum for the FIRST match of re
 // against s, mirroring PostgreSQL's regexp_match/regexp_matches element
 // semantics (postgres/src/backend/utils/adt/regexp.c setup_regexp_matches):
@@ -5399,6 +5935,15 @@ func evalRegexpMatchesSRF(sD, patD, flagsD Datum) []Datum {
 	return regexpAllMatchesArrays(re, sD.StringValue(), strings.Contains(flags, "g"))
 }
 
+// evalIsFinite implements isfinite(date/timestamp/timestamptz/interval),
+// line-porting PG's date_finite / timestamp_finite / interval_finite
+// (postgres/src/backend/utils/adt/{date,timestamp}.c): the result is FALSE
+// only for a ±infinity sentinel (DATE_NOT_FINITE / TIMESTAMP_NOT_FINITE /
+// INTERVAL_NOT_FINITE), TRUE for every other finite value. goopg carries the
+// timestamp/date ±infinity sentinels on KindTime (INT64 extremes, flagDate-
+// agnostic) and the interval sentinels on KindInterval (unimplemented_feat
+// #5(d-iv)), so both must be checked. NULL input propagates to NULL (isfinite
+// is strict — no NotStrict marker on its pg_proc OIDs; see isfinite_test.go).
 func evalIsFinite(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	if len(x.Args) != 1 {
 		return NullDatum, nil
@@ -5407,21 +5952,26 @@ func evalIsFinite(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	if err != nil || d.IsNull() {
 		return NullDatum, nil
 	}
+	if d.IsTimestampNotFinite() || d.IsIntervalNotFinite() {
+		return NewBoolDatum(false), nil
+	}
 	return NewBoolDatum(true), nil
 }
 
-// evalJustifyInterval implements justify_days()/justify_interval(): move
-// whole 30-day chunks out of the day field into the month field, mirroring
-// interval_justify_days/interval_justify_interval
-// (postgres/src/backend/utils/adt/timestamp.c). PG's justify_interval also
-// folds in interval_justify_hours (moving whole 24h chunks of the *time*
-// field into days) first, but goopg's v0 KindInterval Datum has no sub-day
-// field at all — it is always exactly zero — so that step is a no-op here
-// and justify_interval collapses to plain justify_days. justify_hours()
-// itself is therefore always the identity for goopg and is dispatched
-// straight to evalExpr by its caller instead of through this helper.
-// M0097-0004.
-func evalJustifyInterval(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
+// errIntervalRange is the SQLSTATE 22008 error PG raises
+// (ERRCODE_DATETIME_VALUE_OUT_OF_RANGE, "interval out of range") when a justify
+// step's day/month field overflows int32.
+var errIntervalRange = &ExecError{Code: "22008", Message: "interval out of range"}
+
+// evalJustify implements justify_hours()/justify_days()/justify_interval(),
+// mirroring interval_justify_hours/interval_justify_days/
+// interval_justify_interval (postgres/src/backend/utils/adt/timestamp.c). All
+// three normalize a KindInterval's month/day/time (sub-day micros) fields into
+// customary bounds. Since the interval carrier gained a real sub-day micros
+// field (Datum.IntervalMicrosValue, populated by timestamp − timestamp and by
+// sub-day literals), justify_hours is no longer the identity: it folds whole
+// 24h chunks of the time field into days. M0097-0004 (extended 2026-07-11).
+func evalJustify(name string, x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	if len(x.Args) != 1 {
 		return NullDatum, nil
 	}
@@ -5429,17 +5979,111 @@ func evalJustifyInterval(x *planner.FuncCall, row Row, ctx *Context) (Datum, err
 	if err != nil || d.IsNull() || d.Kind != KindInterval {
 		return d, err
 	}
-	months, days := justifyIntervalDays(d.IntervalMonthsValue(), d.IntervalDaysValue())
-	return NewIntervalDatum(months, days), nil
+	months, days, micros := d.IntervalMonthsValue(), d.IntervalDaysValue(), d.IntervalMicrosValue()
+	switch name {
+	case "justify_hours":
+		months, days, micros, err = justifyIntervalHours(months, days, micros)
+	case "justify_days":
+		// justify_days leaves the time field untouched; only rebalance
+		// whole 30-day chunks of days into months.
+		months, days = justifyIntervalDays(months, days)
+	default: // justify_interval
+		months, days, micros, err = justifyIntervalFull(months, days, micros)
+	}
+	if err != nil {
+		return Datum{}, err
+	}
+	return NewIntervalDatumFull(months, days, micros), nil
 }
 
-// justifyIntervalDays is the pure month/day rebalancing core shared by
-// justify_days()/justify_interval() (evalJustifyInterval above): move whole
-// 30-day chunks out of days into months, then equalize the sign of both
-// fields — mirrors interval_justify_days/interval_justify_interval
-// (postgres/src/backend/utils/adt/timestamp.c) exactly since goopg's v0
-// interval has no time field for interval_justify_interval's extra step to
-// act on.
+// addDayS32 adds an int64 whole-day count (derived from the micros field) to
+// the int32 day field, mirroring PG's pg_add_s32_overflow guard: a large time
+// field can yield a whole-day count outside int32 range.
+func addDayS32(day int32, whole int64) (int32, bool) {
+	s := int64(day) + whole
+	if s < math.MinInt32 || s > math.MaxInt32 {
+		return 0, false
+	}
+	return int32(s), true
+}
+
+// justifyIntervalHours mirrors interval_justify_hours: move whole 24h chunks of
+// the time (micros) field into the day field, then equalize the sign of day and
+// time. months is passed through unchanged.
+func justifyIntervalHours(months, days int32, micros int64) (int32, int32, int64, error) {
+	wholeday := micros / usecsPerDay // TMODULO: truncates toward zero
+	micros -= wholeday * usecsPerDay
+	nd, ok := addDayS32(days, wholeday)
+	if !ok {
+		return 0, 0, 0, errIntervalRange
+	}
+	days = nd
+	if days > 0 && micros < 0 {
+		micros += usecsPerDay
+		days--
+	} else if days < 0 && micros > 0 {
+		micros -= usecsPerDay
+		days++
+	}
+	return months, days, micros, nil
+}
+
+// justifyIntervalFull mirrors interval_justify_interval: bring the time field
+// within [0,24h) and the day field within [0,30d), then make the sign of all
+// three fields equal. Pre-justifies days when day and time share a sign to
+// avoid a spurious overflow, matching upstream exactly.
+func justifyIntervalFull(months, days int32, micros int64) (int32, int32, int64, error) {
+	// Pre-justify days if it might prevent overflow (day and time same sign).
+	if (days > 0 && micros > 0) || (days < 0 && micros < 0) {
+		wholemonth := days / 30
+		days -= wholemonth * 30
+		nm, ok := addDayS32(months, int64(wholemonth))
+		if !ok {
+			return 0, 0, 0, errIntervalRange
+		}
+		months = nm
+	}
+	// Fold whole 24h chunks of time into days.
+	wholeday := micros / usecsPerDay
+	micros -= wholeday * usecsPerDay
+	nd, ok := addDayS32(days, wholeday)
+	if !ok {
+		return 0, 0, 0, errIntervalRange
+	}
+	days = nd
+	// Fold whole 30-day chunks of days into months.
+	wholemonth := days / 30
+	days -= wholemonth * 30
+	nm, ok := addDayS32(months, int64(wholemonth))
+	if !ok {
+		return 0, 0, 0, errIntervalRange
+	}
+	months = nm
+	// Equalize the sign of month against day/time.
+	if months > 0 && (days < 0 || (days == 0 && micros < 0)) {
+		days += 30
+		months--
+	} else if months < 0 && (days > 0 || (days == 0 && micros > 0)) {
+		days -= 30
+		months++
+	}
+	// Equalize the sign of day against time.
+	if days > 0 && micros < 0 {
+		micros += usecsPerDay
+		days--
+	} else if days < 0 && micros > 0 {
+		micros -= usecsPerDay
+		days++
+	}
+	return months, days, micros, nil
+}
+
+// justifyIntervalDays is the pure month/day rebalancing core of justify_days()
+// (evalJustify above): move whole 30-day chunks out of days into months, then
+// equalize the sign of both fields — mirrors interval_justify_days
+// (postgres/src/backend/utils/adt/timestamp.c). justify_days leaves the time
+// (sub-day micros) field untouched; the full three-field normalization lives in
+// justifyIntervalFull.
 func justifyIntervalDays(months, days int32) (int32, int32) {
 	wholeMonths := days / 30
 	days -= wholeMonths * 30
@@ -5492,30 +6136,15 @@ func evalDateBin(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 // parseIntervalCastString parses a runtime interval-cast string (the
 // `::interval` / `CAST(... AS interval)` path, as opposed to the
 // parse-time `INTERVAL '...'` typed-literal syntax handled by
-// splitEmbeddedInterval/evalIntervalLit). Accepts the same "<n> <unit>"
-// shape (unit day(s)/month(s)/year(s), case-insensitive) since that is
-// the only interval grammar v0 supports; anything else fails so the
-// caller can raise 22007 rather than silently pass the string through.
-// M0122-0004.
-func parseIntervalCastString(s string) (months, days int32, ok bool) {
-	parts := strings.Fields(strings.TrimSpace(s))
-	if len(parts) != 2 {
-		return 0, 0, false
-	}
-	n, err := strconv.ParseInt(parts[0], 10, 32)
-	if err != nil {
-		return 0, 0, false
-	}
-	switch strings.ToLower(strings.TrimSuffix(parts[1], "s")) {
-	case "day":
-		return 0, int32(n), true
-	case "month":
-		return int32(n), 0, true
-	case "year":
-		return int32(n) * 12, 0, true
-	default:
-		return 0, 0, false
-	}
+// splitEmbeddedInterval/evalIntervalLit). It delegates to the parser
+// package's ParseIntervalBody so the cast path and the typed-literal path —
+// sibling paths that must not diverge — share exactly one interval-body
+// tokenizer (single-field "<n> <unit>", multi-field, and HH:MM:SS times).
+// Anything ParseIntervalBody rejects fails here too so the caller can raise
+// 22007 rather than silently pass the string through.
+// M0122-0004; sub-day units unimplemented_feat #5; multi-field #5(b).
+func parseIntervalCastString(s string) (months, days int32, micros int64, ok bool) {
+	return parser.ParseIntervalBody(s)
 }
 
 // evalIntervalLit parses the integer body of an `interval 'N' unit`
@@ -5526,28 +6155,179 @@ func parseIntervalCastString(s string) (months, days int32, ok bool) {
 // repeated evaluations in a hot loop skip the
 // `strconv.ParseInt` cost.
 func evalIntervalLit(x *planner.IntervalLit) (Datum, error) {
-	var n int32
 	if x.CacheValid {
-		n = x.CachedN
-	} else {
-		parsed, err := strconv.ParseInt(x.Value, 10, 32)
-		if err != nil {
+		return NewIntervalDatumFull(x.CachedMonths, x.CachedDays, x.CachedMicros), nil
+	}
+	// Multi-field / HH:MM:SS bodies (`interval '1 day 05:00:00'`) are decoded
+	// once by the parser (unimplemented_feat #5(b)) and carried pre-computed;
+	// the trailing-unit typmod truncation never applies to these embedded
+	// forms, so use the components directly.
+	if x.PreComputed {
+		x.CachedMonths, x.CachedDays, x.CachedMicros = x.PreMonths, x.PreDays, x.PreMicros
+		x.CacheValid = true
+		return NewIntervalDatumFull(x.PreMonths, x.PreDays, x.PreMicros), nil
+	}
+	// interval 'infinity' / '-infinity' / '+infinity' (unimplemented_feat
+	// #5(d-iv)): a whole-body infinity token maps to PG's INTERVAL_NOBEGIN /
+	// INTERVAL_NOEND sentinel and pre-empts the numeric / qualified paths — any
+	// trailing typmod qualifier (`interval 'infinity' hour to minute`) is ignored
+	// and must NOT drive truncIntervalToUnit, so it is recognised before both.
+	if mo, d, mu, isInf := parser.IntervalInfinitySentinel(x.Value); isInf {
+		x.CachedMonths, x.CachedDays, x.CachedMicros = mo, d, mu
+		x.CacheValid = true
+		return NewIntervalDatumFull(mo, d, mu), nil
+	}
+	var months, days int32
+	var micros int64
+	if val, fval, magOK := parser.ParseIntervalMagnitude(x.Value); magOK {
+		var ok bool
+		months, days, micros, ok = parser.IntervalUnitToParts(val, fval, x.Unit)
+		if !ok {
+			return Datum{}, &ExecError{Code: "0A000", Pos: x.Pos(), Message: fmt.Sprintf("interval unit %q is not supported in v0", x.Unit)}
+		}
+	} else if x.Qualified {
+		// Complex body under a range/typmod qualifier
+		// (`interval '1 day 5' hour to minute`): the body is not a single bare
+		// magnitude, so decode the whole multi-field body up front. A trailing
+		// unitless number resolves via the qualifier's low field (x.Unit) —
+		// PostgreSQL's DecodeInterval `switch (range)` picks the same default
+		// field (datetime.c). AdjustIntervalForTypmod's range truncation is then
+		// applied below exactly as for the bare-magnitude case.
+		// unimplemented_feat #5(d-iv) complex-body-under-range.
+		var ok bool
+		months, days, micros, ok = parser.ParseIntervalBodyWithDefault(x.Value, x.Unit)
+		if !ok {
 			return Datum{}, &ExecError{Code: "22007", Pos: x.Pos(), Message: fmt.Sprintf("invalid interval count %q", x.Value)}
 		}
-		n = int32(parsed)
-		x.CachedN = n
-		x.CacheValid = true
+	} else {
+		return Datum{}, &ExecError{Code: "22007", Pos: x.Pos(), Message: fmt.Sprintf("invalid interval count %q", x.Value)}
 	}
-	switch x.Unit {
-	case "day":
-		return NewIntervalDatum(0, n), nil
-	case "month":
-		return NewIntervalDatum(n, 0), nil
-	case "year":
-		return NewIntervalDatum(n*12, 0), nil
+	// Form 1 `interval 'N' <unit>`: the trailing unit is an SQL typmod
+	// field that truncates the value to that field's granularity. For a range
+	// (`hour to minute`) x.Unit is already the low field (the parser collapses
+	// the range to it), and a SECOND(p) qualifier additionally rounds the
+	// fractional seconds — both mirror AdjustIntervalForTypmod.
+	if x.Qualified {
+		months, days, micros = truncIntervalToUnit(months, days, micros, x.Unit)
+		if x.HasPrec {
+			micros = roundIntervalMicrosToPrec(micros, x.Prec)
+		}
+	}
+	x.CachedMonths, x.CachedDays, x.CachedMicros = months, days, micros
+	x.CacheValid = true
+	return NewIntervalDatumFull(months, days, micros), nil
+}
+
+// applyIntervalCastTypmod evaluates a `CAST(x AS interval <qualifier>)` /
+// `x::interval <qualifier>` whose target type carries an interval typmod (a
+// field qualifier and/or SECOND precision, packed by the parser's
+// packIntervalCastTypmod). Unlike a bare interval cast, the low field changes
+// the DEFAULT UNIT a bare-magnitude body is interpreted in — PG's interval_in
+// receives the typmod and DecodeInterval's `switch (range)` picks that field
+// (`'90'::interval minute` = 90 minutes = 01:30:00, not 90 seconds) — after
+// which AdjustIntervalForTypmod truncates to the field's granularity and rounds
+// the fractional seconds to the precision. This mirrors the typed-literal path
+// evalIntervalLit takes for `interval '90' minute`. An already-typed interval
+// operand (`some_interval::interval minute`) is only truncated/rounded, never
+// reinterpreted. unimplemented_feat #5(d-iv).
+func applyIntervalCastTypmod(v Datum, typmod int64, pos int) (Datum, error) {
+	if v.IsNull() {
+		return NullDatum, nil
+	}
+	lowField, hasPrec, prec := parser.DecodeIntervalCastTypmod(typmod)
+	// Precision-only typmod (`interval(2)`) has no low field, so a bare
+	// magnitude still defaults to seconds (the typmod-free interval default).
+	unit := lowField
+	if unit == "" {
+		unit = "second"
+	}
+	var months, days int32
+	var micros int64
+	switch v.Kind {
+	case KindInterval:
+		months, days, micros = v.IntervalMonthsValue(), v.IntervalDaysValue(), v.IntervalMicrosValue()
+	case KindString:
+		s := v.StringValue()
+		// interval 'infinity' / '-infinity' carries through unchanged (the
+		// typmod is ignored), mirroring evalIntervalLit's infinity pre-emption.
+		if mo, d, mu, isInf := parser.IntervalInfinitySentinel(s); isInf {
+			return NewIntervalDatumFull(mo, d, mu), nil
+		}
+		if val, fval, magOK := parser.ParseIntervalMagnitude(s); magOK {
+			var ok bool
+			months, days, micros, ok = parser.IntervalUnitToParts(val, fval, unit)
+			if !ok {
+				return Datum{}, &ExecError{Code: "22007", Pos: pos,
+					Message: fmt.Sprintf("invalid input syntax for type interval: %q", s)}
+			}
+		} else if mo, d, mu, ok := parser.ParseIntervalBodyWithDefault(s, unit); ok {
+			months, days, micros = mo, d, mu
+		} else {
+			return Datum{}, &ExecError{Code: "22007", Pos: pos,
+				Message: fmt.Sprintf("invalid input syntax for type interval: %q", s)}
+		}
 	default:
-		return Datum{}, &ExecError{Code: "0A000", Pos: x.Pos(), Message: fmt.Sprintf("interval unit %q is not supported in v0", x.Unit)}
+		return Datum{}, &ExecError{Code: "22P02", Pos: pos, Message: "cannot cast to interval"}
 	}
+	if lowField != "" {
+		months, days, micros = truncIntervalToUnit(months, days, micros, lowField)
+	}
+	if hasPrec {
+		micros = roundIntervalMicrosToPrec(micros, prec)
+	}
+	return NewIntervalDatumFull(months, days, micros), nil
+}
+
+// truncIntervalToUnit applies SQL interval typmod truncation for the
+// trailing-qualifier form `interval 'N' <unit>`: the qualifier restricts
+// the interval to that field's granularity, discarding (toward zero) every
+// component below it — mirroring PostgreSQL's AdjustIntervalForTypmod
+// (postgres/src/backend/utils/adt/timestamp.c). e.g. `interval '1.5' hour`
+// = 01:00:00 (the 30 minutes below HOUR are dropped), whereas the
+// typmod-free `interval '1.5 hours'` keeps them (01:30:00). Integer-valued
+// literals are unaffected (nothing below the field to drop). Go's truncated
+// integer division gives the toward-zero behavior PG uses for negatives.
+func truncIntervalToUnit(months, days int32, micros int64, unit string) (int32, int32, int64) {
+	switch unit {
+	case "year":
+		return (months / 12) * 12, 0, 0
+	case "month":
+		return months, 0, 0
+	case "day":
+		return months, days, 0
+	case "hour":
+		return months, days, (micros / usecsPerHour) * usecsPerHour
+	case "minute":
+		return months, days, (micros / usecsPerMinute) * usecsPerMinute
+	default:
+		// "second" (and any non-standard unit): no sub-field to drop.
+		return months, days, micros
+	}
+}
+
+// intervalPrecScales[p] = 10^(6-p) microseconds: the quantum a SECOND(p) typmod
+// rounds the interval time field to. Mirrors IntervalScales in PostgreSQL's
+// AdjustIntervalForTypmod (postgres/src/backend/utils/adt/timestamp.c).
+var intervalPrecScales = [7]int64{1000000, 100000, 10000, 1000, 100, 10, 1}
+
+// roundIntervalMicrosToPrec rounds the time (micros) field of an interval to a
+// fractional-seconds precision p (0..6 digits), mirroring the precision arm of
+// PostgreSQL's AdjustIntervalForTypmod: round-half-away-from-zero to 10^(6-p)
+// microseconds (`interval '1.23456789' second(2)` → 00:00:01.23,
+// `interval '1.999999' second(2)` → 00:00:02). p==6 (full precision) is a
+// no-op. Go's truncated `%` matches C for the negative-time branch.
+func roundIntervalMicrosToPrec(micros int64, p int) int64 {
+	if p < 0 || p >= 6 {
+		return micros
+	}
+	scale := intervalPrecScales[p]
+	offset := scale / 2 // == IntervalOffsets[p]
+	if micros >= 0 {
+		micros += offset
+	} else {
+		micros -= offset
+	}
+	return micros - micros%scale
 }
 
 // evalInExpr evaluates `expr [NOT] IN (subquery | val_list)`.
@@ -6758,15 +7538,8 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		return evalMakeTime(x, row, ctx)
 	case "isfinite":
 		return evalIsFinite(x, row, ctx)
-	case "justify_hours":
-		// goopg's KindInterval Datum has no sub-day field, so there is
-		// never anything to move from time into day — always identity.
-		if len(x.Args) != 1 {
-			return NullDatum, nil
-		}
-		return evalExpr(x.Args[0], row, ctx)
-	case "justify_days", "justify_interval":
-		return evalJustifyInterval(x, row, ctx)
+	case "justify_hours", "justify_days", "justify_interval":
+		return evalJustify(name, x, row, ctx)
 	case "date_bin":
 		return evalDateBin(x, row, ctx)
 	case "set_config":
@@ -7541,9 +8314,17 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 				_, err := parseTimeString(v)
 				return NewBoolDatum(err == nil), nil
 			case "date":
+				// 'infinity' / '-infinity' are valid date input (#5(d-iv)).
+				if _, ok := parseDateInfinityLiteral(v); ok {
+					return NewBoolDatum(true), nil
+				}
 				_, err := time.Parse("2006-01-02", v)
 				return NewBoolDatum(err == nil), nil
 			case "timestamp", "timestamptz":
+				// 'infinity' / '-infinity' are valid timestamp input (#5(d-iv)).
+				if _, ok := parseTimestampInfinityLiteral(v); ok {
+					return NewBoolDatum(true), nil
+				}
 				_, err := parseCopyTimestamp(v)
 				return NewBoolDatum(err == nil), nil
 			default:
@@ -7583,7 +8364,11 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 				return NullDatum, ivErr
 			}
 			if iv.Kind == KindInterval {
-				ts := addTimeInterval(NewTimeDatum(ctx.Now), iv, false).TimeValue()
+				shifted, aerr := addTimeInterval(NewTimeDatum(ctx.Now), iv, false, x.Pos())
+				if aerr != nil {
+					return NullDatum, aerr
+				}
+				ts := shifted.TimeValue()
 				uuidV7Ns = ts.UnixNano()
 			} else {
 				uuidV7Ns = uuidV7RealTimeNs()
@@ -7859,12 +8644,12 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			if i := strings.LastIndex(tblArg, "."); i >= 0 {
 				bareTbl = tblArg[i+1:]
 			}
-			seqName := FindSequenceOwnedBy(bareTbl + "." + colName)
+			seqName := FindSequenceOwnedBy(bareTbl+"."+colName, ctxSeqDBOid(ctx))
 			if seqName == "" {
 				return NullDatum, nil
 			}
 			schema := "public"
-			if s := LookupSequence(seqName); s != nil && s.schema != "" {
+			if s := LookupSequence(seqName, ctxSeqDBOid(ctx)); s != nil && s.schema != "" {
 				schema = s.schema
 			}
 			return NewStringDatum(pgQuoteIdent(schema) + "." + pgQuoteIdent(seqName)), nil
@@ -8058,7 +8843,7 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 					if fk.OID == 0 || fk.OID != targetOID {
 						continue
 					}
-					return NewStringDatum(buildForeignKeyDefString(im, fk)), nil
+					return NewStringDatum(buildForeignKeyDefString(im, fk, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid))), nil
 				}
 			}
 			// Domain CHECK constraints (contype='c', keyed on contypid). pg_dump's
@@ -8721,7 +9506,9 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		if name == "regclass" && v.Kind == KindString && ctx != nil && ctx.Catalog != nil {
 			s := v.StringValue()
 			schema, rel := splitQualifiedTable(s)
-			tbl, ok := ctx.Catalog.LookupTable(parser.ObjectName{Schema: schema, Name: rel})
+			// Scoped to the connection's own dbOid — see the CastExpr
+			// regclass arm's identical fix (M0122-0007 4e follow-up 33).
+			tbl, ok := ctx.Catalog.LookupTable(parser.ObjectName{Schema: schema, Name: rel}, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid))
 			if ok && tbl != nil {
 				return NewIntDatum(int64(tbl.OID)), nil
 			}
@@ -10670,7 +11457,7 @@ func evalCurrtid2(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	}
 
 	// Sequence: in-memory only; treat TID as always valid. M0097-0038.
-	if LookupSequence(relname) != nil {
+	if LookupSequence(relname, ctxSeqDBOid(ctx)) != nil {
 		return NewStringDatum(fmt.Sprintf("(%d,%d)", block, offset)), nil
 	}
 

@@ -112,6 +112,25 @@ func TestBaseBackupWireProtocolFraming(t *testing.T) {
 
 	// Drain everything up to ReadyForQuery.
 	frames := readUntilReadyForQuery(t, r)
+
+	// perf-optimize3-dash S4: under the native-only default the backup is
+	// preceded by the S3b WARN NoticeResponse (real PG cannot replay this
+	// WAL). Pin its presence, then strip notices — PG clients accept a
+	// NoticeResponse at any point, so the structural framing below is
+	// defined over the non-notice frames.
+	var notices int
+	structural := frames[:0:0]
+	for _, f := range frames {
+		if f.Type == protocol.MsgNoticeResponse {
+			notices++
+			continue
+		}
+		structural = append(structural, f)
+	}
+	if notices == 0 {
+		t.Fatal("missing native-only BASE_BACKUP WARN NoticeResponse (S3b) under the S4 default")
+	}
+	frames = structural
 	if len(frames) < 10 {
 		t.Fatalf("frame count = %d, want at least 10 (types=%s)",
 			len(frames), replicationFrameTypes(frames))

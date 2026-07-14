@@ -1,6 +1,10 @@
 # Design: WAL Group Commit Batching Policy (M0099-0003)
 
-**Status**: draft  
+**Status**: superseded (2026-07-12) by
+[`docs/design/wal-backend-flush/`](wal-backend-flush/) — the hardcoded
+1000 µs / 5-sibling batching delay on the writer loop was replaced by the real
+`commit_delay` / `commit_siblings` GUCs (PG defaults 0 / 5), applied as a
+holder-only sleep on the backend flush path.  
 **Milestone**: M0099-0003  
 **Filed**: 2026-05-12
 

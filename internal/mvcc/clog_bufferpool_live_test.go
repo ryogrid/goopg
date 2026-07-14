@@ -49,7 +49,11 @@ func TestCLOGPoolIsLiveStore(t *testing.T) {
 		}
 	}
 
-	// HighestKnownXID scans the SLRU for the maximum terminal lane.
+	// HighestKnownXID scans the on-disk SLRU for the maximum terminal lane.
+	// C2-S3: materialize the lanes on disk first (flush point).
+	if err := c.FlushAll(); err != nil {
+		t.Fatalf("FlushAll: %v", err)
+	}
 	wantHigh := storage.TransactionID(clogXactsPerSegment) + 7
 	if got := c.HighestKnownXID(); got != wantHigh {
 		t.Errorf("HighestKnownXID = %d, want %d", got, wantHigh)
@@ -61,6 +65,11 @@ func TestCLOGPoolIsLiveStore(t *testing.T) {
 	}
 
 	// Full production recovery reopen reconstructs everything from the SLRU.
+	// C2-S3: flush before the reopen — the live store persists at flush
+	// points, not per commit.
+	if err := c.FlushAll(); err != nil {
+		t.Fatalf("FlushAll: %v", err)
+	}
 	reopened, err := OpenCLog(flatPath)
 	if err != nil {
 		t.Fatalf("re-OpenCLog: %v", err)

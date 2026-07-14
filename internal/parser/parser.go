@@ -2515,8 +2515,25 @@ func (p *parser) parsePrepare() (Stmt, error) {
 			on, terr := p.parseTypeNameAfterCast()
 			if terr != nil {
 				paramTypes = append(paramTypes, "unknown")
+				// parseTypeNameAfterCast fails WITHOUT consuming the
+				// offending token; skip it or this loop never advances
+				// (observed: PREPARE f(regclass[]) spun here allocating
+				// "unknown" entries until OOM).
+				if !(p.cur().Kind == TokenSymbol && (p.cur().Value == ")" || p.cur().Value == ",")) {
+					p.advance()
+				}
 			} else {
-				paramTypes = append(paramTypes, on.Name)
+				tn := on.Name
+				// Array suffix: type[] (or type[][]…) — same handling as
+				// the CAST type-name path (select.go).
+				for p.cur().Kind == TokenSymbol && p.cur().Value == "[" {
+					p.advance()
+					if p.cur().Kind == TokenSymbol && p.cur().Value == "]" {
+						p.advance()
+					}
+					tn += "[]"
+				}
+				paramTypes = append(paramTypes, tn)
 			}
 			if p.cur().Kind == TokenSymbol && p.cur().Value == "," {
 				p.advance()

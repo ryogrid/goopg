@@ -99,25 +99,26 @@ func TestEncodeDecodeCreateSubscriptionRoundTrip(t *testing.T) {
 		publications             []string
 		oid, ownerOID            uint32
 		enabled                  bool
+		dbOid                    uint32
 	}{
-		{"mysub", "host=localhost dbname=foo", "mysub", []string{"pub1"}, 16384, 10, true},
-		{"multisub", "host=other", "customslot", []string{"pub1", "pub2"}, 16385, 16400, false},
-		{"日本語サブ", "host=localhost", "日本語スロット", []string{"日本語パブ"}, 4294967295, 16400, true}, // multi-byte UTF-8, max OID
+		{"mysub", "host=localhost dbname=foo", "mysub", []string{"pub1"}, 16384, 10, true, 0},
+		{"multisub", "host=other", "customslot", []string{"pub1", "pub2"}, 16385, 16400, false, 16401},
+		{"日本語サブ", "host=localhost", "日本語スロット", []string{"日本語パブ"}, 4294967295, 16400, true, 4294967294}, // multi-byte UTF-8, max OID
 	}
 	for _, c := range cases {
-		raw := EncodeCreateSubscription(c.name, c.conninfo, c.slotName, c.publications, c.oid, c.ownerOID, c.enabled)
+		raw := EncodeCreateSubscription(c.name, c.conninfo, c.slotName, c.publications, c.oid, c.ownerOID, c.enabled, c.dbOid)
 		if raw[0] != RecordKindCreateSubscription {
 			t.Errorf("%q: kind byte = %d, want %d", c.name, raw[0], RecordKindCreateSubscription)
 			continue
 		}
-		gotName, gotConninfo, gotSlotName, gotPubs, gotOID, gotOwnerOID, gotEnabled, err := DecodeCreateSubscription(raw)
+		gotName, gotConninfo, gotSlotName, gotPubs, gotOID, gotOwnerOID, gotEnabled, gotDBOid, err := DecodeCreateSubscription(raw)
 		if err != nil {
 			t.Errorf("%q: decode err: %v", c.name, err)
 			continue
 		}
 		if gotName != c.name || gotConninfo != c.conninfo || gotSlotName != c.slotName ||
-			gotOID != c.oid || gotOwnerOID != c.ownerOID || gotEnabled != c.enabled {
-			t.Errorf("%q: decoded (%q, %q, %q, %d, %d, %v)", c.name, gotName, gotConninfo, gotSlotName, gotOID, gotOwnerOID, gotEnabled)
+			gotOID != c.oid || gotOwnerOID != c.ownerOID || gotEnabled != c.enabled || gotDBOid != c.dbOid {
+			t.Errorf("%q: decoded (%q, %q, %q, %d, %d, %v, %d)", c.name, gotName, gotConninfo, gotSlotName, gotOID, gotOwnerOID, gotEnabled, gotDBOid)
 		}
 		if !reflect.DeepEqual(gotPubs, c.publications) {
 			t.Errorf("%q: publications = %v, want %v", c.name, gotPubs, c.publications)
@@ -186,7 +187,7 @@ func TestDecodePubSubRejectsWrongKindAndTruncatedPayload(t *testing.T) {
 	if _, _, err := DecodeAlterPublicationOwner(bogus); err == nil {
 		t.Error("DecodeAlterPublicationOwner: expected error on wrong kind")
 	}
-	if _, _, _, _, _, _, _, err := DecodeCreateSubscription(bogus); err == nil {
+	if _, _, _, _, _, _, _, _, err := DecodeCreateSubscription(bogus); err == nil {
 		t.Error("DecodeCreateSubscription: expected error on wrong kind")
 	}
 	if _, err := DecodeDropSubscription(bogus); err == nil {
@@ -214,7 +215,7 @@ func TestDecodePubSubRejectsWrongKindAndTruncatedPayload(t *testing.T) {
 			return err
 		}},
 		{"CreateSubscription", []byte{RecordKindCreateSubscription, 0, 0, 0, 0}, func(p []byte) error {
-			_, _, _, _, _, _, _, err := DecodeCreateSubscription(p)
+			_, _, _, _, _, _, _, _, err := DecodeCreateSubscription(p)
 			return err
 		}},
 		{"DropSubscription", []byte{RecordKindDropSubscription, 10, 0}, func(p []byte) error {

@@ -1,5 +1,9 @@
 # 0101-0002 — WAL pg_waldump Validation Test
 
+> **perf-optimize3-dash S4 note (2026-07-13)**: W-001 structural parity remains
+> pass-required under the native-only default; the rmgr CONTENT tests
+> (WD-003/WD-004) assert-skip unless GOOPG_WAL_CANONICAL=on (deferral ledger).
+
 **Status:** accepted
 **Date:** 2026-05-13
 **Milestone:** M0101-0003

@@ -1,5 +1,8 @@
 # 0110-0002 — pg_waldump TAP test port (001_basic CLI tier)
 
+> **perf-optimize3-dash S4 note (2026-07-13)**: WD-003/WD-004 are deferred
+> (assert-skip) under the native-only WAL default; resume = GOOPG_WAL_CANONICAL=on + C1.
+
 Status: accepted (partial)
 Milestone: M0110-0002
 Date: 2026-06-13
@@ -316,3 +319,41 @@ Gates: `go build ./...`/`go vet ./...` clean; `gofmt -l` clean on the new
 test file; `TestPort_PgWaldumpVacuumPruneRoundtrip` PASS ×3 (no flake, run
 through `scripts/goopg-test-run.sh`); `go run ./cmd/gen-oracle-port-status`
 regenerated `postgres-oracle-port-status.md` from the CSV.
+
+## 2026-07-11 (loop #29): eager-preallocation all-zero segment breaks the round-trip (M-NIGHTLY AI-20260711-011536-003)
+
+The nightly flagged `TestPort_PgWaldumpVacuumPruneRoundtrip` as a regression:
+`pg_waldump --rmgr=Heap2` reported the structural error `invalid WAL segment
+size in WAL file "000000010000000000000002" (0 bytes)` on the *trailing*
+segment, even though segment 1 decoded the `PRUNE_VACUUM_SCAN` record cleanly.
+
+**Root cause — not a WAL-format bug.** The M0122-0009 eager next-segment
+preallocation (`internal/wal/writer.go` `eagerPreallocSegment` /
+`eagerPreallocWorker`, landed `ff27f01d` 2026-07-09) zero-fills the *next*
+segment (`…002`, a full 16 MiB of zeros) the moment segment 1 opens for real
+use, and that phantom persists across a clean shutdown — exactly as real
+PostgreSQL's `XLogFileInit` does under `wal_init_zero=on` (the default). Both
+on-disk segments are the full 16 MiB (confirmed by `os.Stat`); `…002` is simply
+entirely zeros because it was never written. `pg_waldump` derives the WAL
+segment size from the long-page-header field `xlp_seg_size`, which the writer
+only stamps when a segment first becomes the insert target — so on an all-zero
+preallocated segment that field is 0 and pg_waldump fatally aborts with
+"invalid WAL segment size (0 bytes)". **Real pg_waldump errors identically** on
+an all-zero preallocated segment; goopg's bytes are PG-faithful.
+
+**Fix (test fidelity only, no production change).** Skip all-zero preallocated
+segments before feeding them to pg_waldump, via a new `segmentIsAllZero` helper
+in `pgwaldump_vacuum_prune_test.go`. Such a segment carries no records, so
+skipping loses no coverage. The identical latent bug in the sibling W-001
+`TestPort_WALPgWaldumpCompat` (`wal_pg_waldump_test.go`) — which was simply not
+run in tonight's partial `NIGHTLY_STAGES` batch — was fixed in the same loop
+(sibling-path rule). `pgwaldump_savefullpage_test.go` only treats "incorrect
+prev-link" as fatal, so it was already tolerant and needed no change.
+
+The two other nightly items (`TestPort_IsolationTimeouts`,
+`TestPort_IsolationTuplelockUpgradeNoDeadlock`) are co-load timing flakes, not
+regressions — both PASS 3/3 standalone at HEAD; the isolation runner decides
+blocking purely by a 300 ms timeout (no `pg_locks` probe), so nightly CPU
+contention can spuriously trip them.
+
+Gates: `go vet ./internal/testport/` clean; `TestPort_PgWaldump*` + W-001 PASS.

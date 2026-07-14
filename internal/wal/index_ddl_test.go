@@ -145,6 +145,14 @@ func TestEncodeCreateIndexExtensionRoundTrip(t *testing.T) {
 				DeduplicateItems: &dedupOn,
 			},
 		},
+		{
+			name: "tablespace only",
+			p: CreateIndexPayload{
+				OID: 9, TableOID: 10, Name: "ts_idx", Method: "btree",
+				Columns:    []string{"a"},
+				Tablespace: 16391,
+			},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -196,6 +204,9 @@ func TestEncodeCreateIndexExtensionRoundTrip(t *testing.T) {
 			}
 			if got.NullsNotDistinct != tc.p.NullsNotDistinct {
 				t.Errorf("NullsNotDistinct = %v, want %v", got.NullsNotDistinct, tc.p.NullsNotDistinct)
+			}
+			if got.Tablespace != tc.p.Tablespace {
+				t.Errorf("Tablespace = %d, want %d", got.Tablespace, tc.p.Tablespace)
 			}
 		})
 	}
@@ -282,7 +293,7 @@ func TestDecodeCreateIndexBackwardCompatOrderBlocksOnlyNoExtension(t *testing.T)
 		t.Fatalf("DecodeCreateIndex(gen1 payload): %v", err)
 	}
 	if got.HasPredicate || got.PredicateString != "" || len(got.IncludeColumns) != 0 ||
-		got.Fillfactor != 0 || got.DeduplicateItems != nil || got.NullsNotDistinct {
+		got.Fillfactor != 0 || got.DeduplicateItems != nil || got.NullsNotDistinct || got.Tablespace != 0 {
 		t.Errorf("gen1 payload must decode with every follow-up field at its zero value, got %+v", got)
 	}
 	if !got.ColDescending[0] || !got.ColNullsFirst[0] {

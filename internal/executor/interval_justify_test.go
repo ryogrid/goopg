@@ -32,6 +32,24 @@ func TestJustifyIntervalFunctions(t *testing.T) {
 		{"SELECT justify_hours(interval '35 days') FROM t", "35 days"},
 		{"SELECT justify_interval(interval '35 days') FROM t", "1 mon 5 days"},
 		{"SELECT justify_interval(interval '-35 days') FROM t", "-1 mons -5 days"},
+		// Sub-day (time) folding — enabled once the KindInterval carrier gained
+		// a real micros field (2026-07-11). justify_hours moves whole 24h chunks
+		// of the time field into days; justify_interval does both steps and
+		// equalizes the sign across all three fields. Expected values verified
+		// live against real PostgreSQL 18.3 (postgres/local_install, port 5599).
+		{"SELECT justify_hours(interval '27 hours') FROM t", "1 day 03:00:00"},
+		{"SELECT justify_hours(interval '49 hours') FROM t", "2 days 01:00:00"},
+		{"SELECT justify_hours(interval '1 day 25 hours') FROM t", "2 days 01:00:00"},
+		{"SELECT justify_hours(interval '-27 hours') FROM t", "-1 days -03:00:00"},
+		{"SELECT justify_hours(interval '2 days -1 hours') FROM t", "1 day 23:00:00"},
+		{"SELECT justify_hours(interval '1 mon 100 hours') FROM t", "1 mon 4 days 04:00:00"},
+		{"SELECT justify_days(interval '35 days 5 hours') FROM t", "1 mon 5 days 05:00:00"},
+		{"SELECT justify_interval(interval '1 mon 33 days 27 hours') FROM t", "2 mons 4 days 03:00:00"},
+		{"SELECT justify_interval(interval '35 days 25 hours') FROM t", "1 mon 6 days 01:00:00"},
+		{"SELECT justify_interval(interval '1 mon -1 hours') FROM t", "29 days 23:00:00"},
+		{"SELECT justify_interval(interval '29 days 25 hours') FROM t", "1 mon 01:00:00"},
+		{"SELECT justify_interval(interval '27 hours') FROM t", "1 day 03:00:00"},
+		{"SELECT justify_interval(interval '-35 days -25 hours') FROM t", "-1 mons -6 days -01:00:00"},
 	}
 	for _, c := range cases {
 		t.Run(c.sql, func(t *testing.T) {

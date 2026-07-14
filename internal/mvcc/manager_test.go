@@ -756,3 +756,124 @@ func TestDetachToDedicatedSlotRejectsSerializable(t *testing.T) {
 	}
 	_ = m.Rollback(tx)
 }
+
+// TestOldestXminFoldsCatalogXminSource pins the retention consumer: once a
+// catalog_xmin source is installed (server wires it to
+// wal.Slots.MinCatalogXmin), OldestXmin holds the global pruning/truncation
+// horizon back to the oldest catalog_xmin pinned by a logical slot, but never
+// advances it forward past the natural horizon. This is what stops heap
+// pruning / VACUUM / CLOG truncation from reclaiming catalog tuple versions an
+// in-flight logical decoder still needs.
+func TestOldestXminFoldsCatalogXminSource(t *testing.T) {
+	m := NewManager()
+	// Advance nextXID so the natural (no-txn) horizon is well above the first
+	// normal XID, giving room for a lower catalog_xmin to floor it.
+	for i := 0; i < 100; i++ {
+		m.xidgen.Allocate()
+	}
+	base := m.OldestXmin()
+	if base == 0 {
+		t.Fatalf("baseline OldestXmin = 0, expected the running nextXID")
+	}
+
+	// A source pinning an OLDER xid floors the horizon.
+	older := uint64(base) - 40
+	m.SetCatalogXminSource(func() uint64 { return older })
+	if got := m.OldestXmin(); uint64(got) != older {
+		t.Fatalf("OldestXmin with older catalog_xmin = %d, want %d", got, older)
+	}
+
+	// A source pinning a NEWER xid must not advance the horizon forward
+	// (retention only ever holds back, never reclaims more).
+	m.SetCatalogXminSource(func() uint64 { return uint64(base) + 40 })
+	if got := m.OldestXmin(); got != base {
+		t.Fatalf("OldestXmin with newer catalog_xmin = %d, want unchanged %d", got, base)
+	}
+
+	// A source returning 0 (no slot pinning) is a no-op.
+	m.SetCatalogXminSource(func() uint64 { return 0 })
+	if got := m.OldestXmin(); got != base {
+		t.Fatalf("OldestXmin with zero catalog_xmin = %d, want %d", got, base)
+	}
+
+	// Clearing the source restores the pure in-memory behaviour.
+	m.SetCatalogXminSource(nil)
+	if got := m.OldestXmin(); got != base {
+		t.Fatalf("OldestXmin after clearing source = %d, want %d", got, base)
+	}
+}
+
+// TestCommit_XactMarkerErrorFailsCommitAndStaysInProgress is the C2-S3
+// fault-injection anchor for the sync-commit flush contract: since the cut,
+// EVERY flush error on the sync path (including wal.ErrLSNNotWritten, which
+// the xact-marker logger used to swallow) is returned from the hook, and
+// Commit must (a) surface the error — the client is never acked — and
+// (b) leave the transaction in-progress so no reader observes it committed.
+// Crash safety follows: an un-acked, in-progress txn is blanket-aborted by
+// MarkUnknownAsAborted on restart, with no durable commit record to
+// resurrect it.
+func TestCommit_XactMarkerErrorFailsCommitAndStaysInProgress(t *testing.T) {
+	m := NewManager()
+	injected := errors.New("injected: sync commit flush: LSN not written")
+	m.SetXactMarkerLogger(func(_ storage.TransactionID, kind XactMarker, waitLocalFlush bool) error {
+		if kind == XactCommit && waitLocalFlush {
+			return injected
+		}
+		return nil
+	})
+	tx, _ := m.Begin(IsolationReadCommitted)
+	// Materialize a real XID so the hook fires (read-only commits skip it).
+	xid, err := m.AssignXID(tx)
+	if err != nil {
+		t.Fatalf("AssignXID: %v", err)
+	}
+	err = m.Commit(tx)
+	if err == nil {
+		t.Fatal("Commit succeeded despite a failing sync-commit flush — the client would be acked for a non-durable commit")
+	}
+	if !errors.Is(err, injected) {
+		t.Fatalf("Commit error = %v, want the injected flush error surfaced", err)
+	}
+	// The txn must still be in-progress for snapshots (finish propagates the
+	// hook error BEFORE the active-set removal).
+	if !m.IsXIDActive(xid) {
+		t.Fatalf("xid %d no longer active after a failed sync-commit flush — it must stay in-progress", xid)
+	}
+}
+
+// TestConnSlotChurnDoesNotClobberLiveSlots pins the AcquireConnSlot fix:
+// the historical (pid-1)%ConnSlotCount assignment wrapped after
+// ConnSlotCount cumulative connections and handed a LIVE session's slot to
+// a new connection (soak finding: "mvcc: unknown transaction" storms once
+// a 5 conn/s sampler pushed the counter past ~1000 at ~180s). Churning
+// far more acquire/release cycles than the array size must never touch a
+// held slot.
+func TestConnSlotChurnDoesNotClobberLiveSlots(t *testing.T) {
+	m := NewManager()
+	held, err := m.AcquireConnSlot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := m.Begin(IsolationReadCommitted, held)
+	if err != nil {
+		t.Fatalf("Begin(at %d): %v", held, err)
+	}
+	for i := 0; i < 5*DefaultProcArraySize; i++ {
+		p, err := m.AcquireConnSlot()
+		if err != nil {
+			t.Fatalf("churn acquire %d: %v", i, err)
+		}
+		if p == held {
+			t.Fatalf("churn handed out the HELD slot %d at cycle %d", held, i)
+		}
+		m.ReleaseConnSlot(p)
+	}
+	// The long-lived session's transaction is still intact.
+	if _, err := m.SnapshotFor(tx); err != nil {
+		t.Fatalf("held session's txn lost after churn: %v", err)
+	}
+	if err := m.Commit(tx); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	m.ReleaseConnSlot(held)
+}

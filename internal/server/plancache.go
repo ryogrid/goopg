@@ -5,9 +5,16 @@ package server
 // Architecture:
 //   - 16 shards, each holding an RWMutex + map[string]planner.Node.
 //   - Max 32 entries per shard = 512 total entries.
-//   - Key: normalizeCompatSQL(sql) — lowercase, whitespace-collapsed,
-//     trailing-semicolon stripped. This matches across sessions sending
-//     the same SQL even with minor whitespace differences.
+//   - Key: planCacheKey(sql, dbOid) — normalizeCompatSQL(sql) (lowercase,
+//     whitespace-collapsed, trailing-semicolon stripped) prefixed with the
+//     querying connection's effective table/index namespace oid
+//     (catalog.NamespaceDBOid). This matches across sessions sending the
+//     same SQL even with minor whitespace differences, AND across
+//     connections that read the same namespace (e.g. two "postgres"
+//     connections) — but NOT across connections whose LookupTable/LookupIndex
+//     calls resolve against different namespaces (M0122-0007 slice 4c):
+//     a plan embeds resolved *catalog.Table/*catalog.Index pointers, so a
+//     plan cached for one namespace must never satisfy a lookup from another.
 //   - DDL invalidation: Invalidate() clears all shards atomically.
 //     Called after every DDL statement so stale schema references are
 //     never executed.

@@ -109,6 +109,16 @@ type Manager struct {
 	// both pg_internal.init files at commit time.
 	relcacheInvalPending atomic.Bool
 
+	// catalogXminSource, when installed, returns the smallest catalog_xmin
+	// pinned by any active logical replication slot (0 = nothing pinned).
+	// OldestXmin folds it into the global pruning/truncation horizon so the
+	// heap-prune, VACUUM and CLOG-truncation paths never reclaim catalog (or,
+	// conservatively in v0, any permanent-relation) tuple versions a logical
+	// decoder may still need. Installed once during startup wiring
+	// (initdb.Open) via SetCatalogXminSource; nil keeps the pure in-memory v0
+	// behaviour. Read lock-free via atomic.Pointer on the hot prune path.
+	catalogXminSource atomic.Pointer[func() uint64]
+
 	// WaitForXID uses waitMu + commitCond only.
 	waitMu     sync.Mutex
 	commitCond *sync.Cond
@@ -117,6 +127,9 @@ type Manager struct {
 	// not supply an explicit procNum. Auto-assigned slots are never recycled
 	// within a Manager lifetime, so the counter wraps modulo procArray size.
 	autoProcNum atomic.Int32
+
+	// connSlotCursor rotates AcquireConnSlot's scan start (see its doc).
+	connSlotCursor atomic.Int32
 
 	// Cold path: SSI + predicate locks share ssiMu.
 	ssiMu          sync.Mutex
@@ -196,6 +209,21 @@ func (m *Manager) SetCLog(c *CLog) {
 	m.abortedMu.Lock()
 	m.clog = c
 	m.abortedMu.Unlock()
+}
+
+// SetCatalogXminSource installs (or, with nil, clears) the hook OldestXmin
+// consults to hold the global pruning/truncation horizon back to the oldest
+// catalog_xmin pinned by any active logical replication slot. The server wires
+// this to wal.Slots.MinCatalogXmin during startup so heap pruning, VACUUM and
+// CLOG truncation never reclaim catalog tuple versions a logical decoder can
+// still need. fn must be non-blocking (it runs on the prune hot path); a nil fn
+// or a fn returning 0 leaves the horizon unchanged.
+func (m *Manager) SetCatalogXminSource(fn func() uint64) {
+	if fn == nil {
+		m.catalogXminSource.Store(nil)
+		return
+	}
+	m.catalogXminSource.Store(&fn)
 }
 
 // xidWarnAge is how many XIDs before uint32 overflow to emit a warning.
@@ -438,6 +466,47 @@ func (m *Manager) SnapshotFor(tx Transaction) (Snapshot, error) {
 	}
 }
 
+// AcquireConnSlot claims a free connection proc slot for the lifetime of
+// one client connection and returns its procNum; ReleaseConnSlot frees it
+// at disconnect. Connection-level ownership (connHeld) is DISTINCT from
+// per-transaction occupancy (inTxn): an idle connection holds its slot
+// between transactions.
+//
+// This replaces the historical `(pid-1) % ConnSlotCount` assignment in the
+// server, which WRAPPED once cumulative connections exceeded the slot
+// count and handed a live long-running session's slot to a brand-new
+// connection — the new session's Begin then clobbered the victim's
+// in-flight transaction ("mvcc: unknown transaction" storms ~180 s into
+// any run with ~5 conn/s churn, found by the C3-S5 soak's wait-event
+// sampler). Slot 0 stays reserved for explicit-procNum callers.
+func (m *Manager) AcquireConnSlot() (int32, error) {
+	sz := min(ConnSlotCount, len(m.procArray.slots))
+	// Round-robin from a rotating cursor rather than lowest-free: always
+	// reusing the just-freed slot puts a brand-new connection on a
+	// procNum whose previous owner's peripheral state (activity registry,
+	// per-backend undo bookkeeping) may still be draining — the temporal
+	// spacing the old modulo scheme provided implicitly. The cursor keeps
+	// that spacing while still never handing out a HELD slot.
+	start := m.connSlotCursor.Add(1)
+	for off := int32(0); off < int32(sz-1); off++ {
+		i := 1 + (start+off)%int32(sz-1)
+		if m.procArray.slots[i].connHeld.CompareAndSwap(0, 1) {
+			return i, nil
+		}
+	}
+	return 0, fmt.Errorf("mvcc: no free connection slots (max %d concurrent connections)", sz-1)
+}
+
+// ReleaseConnSlot returns a connection's slot to the free pool. The caller
+// must have finished/rolled back any open transaction first (connection
+// teardown does).
+func (m *Manager) ReleaseConnSlot(procNum int32) {
+	if procNum <= 0 || int(procNum) >= len(m.procArray.slots) {
+		return
+	}
+	m.procArray.slots[procNum].connHeld.Store(0)
+}
+
 // Commit marks tx committed and removes it from the active set.
 // The XactMarkerLogger hook (when installed) is invoked with
 // kind=XactCommit before the active-set removal so a hook failure
@@ -596,6 +665,20 @@ func (m *Manager) OldestXmin() storage.TransactionID {
 		}
 		if xmin := s.xmin.Load(); xmin != ^uint64(0) && storage.TransactionID(xmin) < result {
 			result = storage.TransactionID(xmin)
+		}
+	}
+	// Hold the horizon back to the oldest catalog_xmin pinned by any active
+	// logical replication slot (0 = nothing pinned). A logical decoder rebuilds
+	// historic catalog snapshots from tuple versions at/after this xid; letting
+	// the prune/VACUUM/CLOG-truncation horizon advance past it would reclaim
+	// catalog rows out from under an in-flight decode. Upstream tracks a separate
+	// data vs catalog horizon (only catalog + user_catalog relations are held by
+	// catalog_xmin); v0 conservatively floors the single global horizon, which
+	// over-retains dead tuples on ordinary permanent tables while a slot lags but
+	// is never unsafe. See docs/design/0008-0001-logical-decoding-pipeline.md.
+	if src := m.catalogXminSource.Load(); src != nil {
+		if cx := (*src)(); cx != 0 && storage.TransactionID(cx) < result {
+			result = storage.TransactionID(cx)
 		}
 	}
 	return result

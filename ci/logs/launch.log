@@ -4,3 +4,32 @@
 2026-07-07T03:52:53+09:00 [RUN]	end status_rc=2 (0 pass / 2 fail / 3 inconclusive) — see summary.md
 2026-07-08T06:43:34+09:00 [RUN]	start run_id=20260708-064334 sha=2e435e91 dirty=12 stages=preflight,units,race,testport,pgbench,tpch,summary
 2026-07-08T06:43:42+09:00 [RUN]	S1 lanes start (L: units,race | H: testport,pgbench — filtered by NIGHTLY_STAGES)
+2026-07-08T09:47:45+09:00 [RUN]	S1 barrier reached
+2026-07-08T10:21:33+09:00 [RUN]	end status_rc=2 (0 pass / 2 fail / 3 inconclusive) — see summary.md
+2026-07-09T01:03:37+09:00 [RUN]	start run_id=20260709-010336 sha=b9a1e1fb dirty=6 stages=preflight,units,race,testport,pgbench,tpch,summary
+2026-07-09T01:03:45+09:00 [RUN]	S1 lanes start (L: units,race | H: testport,pgbench — filtered by NIGHTLY_STAGES)
+2026-07-09T03:48:12+09:00 [RUN]	S1 barrier reached
+2026-07-09T04:24:26+09:00 [RUN]	end status_rc=2 (0 pass / 2 fail / 3 inconclusive) — see summary.md
+2026-07-09T04:26:12+09:00 [RUN]	log-push: committed + pushed batch logs to origin/align-data-structure-with-pg
+2026-07-10T01:15:14+09:00 [RUN]	start run_id=20260710-011513 sha=f85d1756 dirty=6 stages=preflight,units,race,testport,pgbench,tpch,summary
+2026-07-10T01:15:19+09:00 [RUN]	preflight failed — skipping S1/S2, going straight to summary
+2026-07-10T01:15:19+09:00 [RUN]	end status_rc=2 (0 pass / 2 fail / 3 inconclusive) — see summary.md
+2026-07-10T01:15:39+09:00 [RUN]	log-push: committed + pushed batch logs to origin/align-data-structure-with-pg
+2026-07-11T01:15:36+09:00 [RUN]	start run_id=20260711-011536 sha=fda418cf dirty=9 stages=preflight,units,race,testport,pgbench,tpch,summary
+2026-07-11T01:15:36+09:00 [RUN]	S1 lanes start (L: units,race | H: testport,pgbench — filtered by NIGHTLY_STAGES)
+2026-07-11T05:24:36+09:00 [RUN]	S1 barrier reached
+2026-07-11T05:58:02+09:00 [RUN]	end status_rc=2 (0 pass / 2 fail / 3 inconclusive) — see summary.md
+2026-07-11T05:59:51+09:00 [RUN]	log-push: committed + pushed batch logs to origin/align-data-structure-with-pg
+2026-07-12T02:05:30+09:00 [RUN]	start run_id=20260712-020530 sha=401e6212 dirty=8 stages=preflight,units,race,testport,pgbench,tpch,summary
+2026-07-12T02:05:41+09:00 [RUN]	S1 lanes start (L: units,race | H: testport,pgbench — filtered by NIGHTLY_STAGES)
+2026-07-12T04:56:53+09:00 [RUN]	S1 barrier reached
+2026-07-12T05:29:20+09:00 [RUN]	end status_rc=2 (0 pass / 2 fail / 3 inconclusive) — see summary.md
+2026-07-12T05:30:58+09:00 [RUN]	log-push: committed + pushed batch logs to origin/align-data-structure-with-pg
+2026-07-13T01:05:34+09:00 [RUN]	start run_id=20260713-010534 sha=e453e3f2 dirty=15 stages=preflight,units,race,testport,pgbench,tpch,summary
+2026-07-13T01:05:44+09:00 [RUN]	S1 lanes start (L: units,race | H: testport,pgbench — filtered by NIGHTLY_STAGES)
+2026-07-13T03:56:19+09:00 [RUN]	S1 barrier reached
+2026-07-13T04:29:12+09:00 [RUN]	end status_rc=2 (0 pass / 2 fail / 3 inconclusive) — see summary.md
+2026-07-13T04:30:57+09:00 [RUN]	log-push: committed + pushed batch logs to origin/wal-system-pgnize
+
+2026-07-14T01:16:53+09:00 [RUN]	start run_id=20260714-011651 sha=d8a4ed6e dirty=6 stages=preflight,units,race,testport,pgbench,tpch,summary
+2026-07-14T01:17:06+09:00 [RUN]	S1 lanes start (L: units,race | H: testport,pgbench — filtered by NIGHTLY_STAGES)

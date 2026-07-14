@@ -104,6 +104,20 @@ func NewApplyWorker(cat catalog.Catalog, pool *storage.Pool, txnMgr *mvcc.Manage
 	}
 }
 
+// dbOid returns the subscription's own database oid so sequence-registry
+// calls (autoGenerateSerialValues, applyDefaultsForMissing's nextval())
+// resolve the subscribing database's own sequences instead of always
+// DefaultDBOid's — mirrors w.cat's SearchPathCatalog wrapping
+// (server.applyWorkerCatalog, M0122-0007 4d-ii-part-2b item 1). w.cat is
+// always a *catalog.SearchPathCatalog (every construction site routes
+// through applyWorkerCatalog); the type assertion is defensive only.
+func (w *ApplyWorker) dbOid() uint32 {
+	if spc, ok := w.cat.(*catalog.SearchPathCatalog); ok {
+		return catalog.NamespaceDBOid(spc.DBOid)
+	}
+	return catalog.DefaultDBOid
+}
+
 // SetSubscriptionContext binds the worker to a subscription's
 // tablesync state in the supplied PubSub registry. With both
 // arguments non-zero, the apply path consults
@@ -269,7 +283,7 @@ func (w *ApplyWorker) applyInsert(m *wal.DecodedMessage) error {
 	// stay NullDatum (matches PG's behaviour when NOT NULL is absent;
 	// a NOT NULL column without DEFAULT will fail the heap write).
 	// M0103-0007 rung 13 — see docs/design/0103-0036.
-	applyDefaultsForMissing(r.local.Columns, row, missing)
+	applyDefaultsForMissing(r.local.Columns, row, missing, w.dbOid())
 
 	// writeHeapRow expects a Context carrying Pool / Tx. Build
 	// a minimal one — the apply worker doesn't have a session

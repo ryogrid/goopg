@@ -33,7 +33,7 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 	// catalog-backed DROP entirely — see dispatchSimpleQueryViaExecutor's
 	// identical pre-parse check (dispatch.go) for the full explanation.
 	if kind, _ := classifyDatabaseDDL(query); kind == databaseDDLDrop {
-		if res, qerr, handled := s.tryHandleDatabaseOrRoleDDLExtended(query, dbName, sess); handled {
+		if res, qerr, handled := s.tryHandleDatabaseOrRoleDDLExtended(query, dbName, connTx.NonSuperuserRole, sess); handled {
 			return res, qerr
 		}
 	}
@@ -43,7 +43,7 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 		// parser grammar (same string-prefix wire-dispatch bypass the
 		// simple-query path uses in dispatchSimpleQueryViaExecutor) — try
 		// that bypass here too before surfacing a syntax error. M0119-0004.
-		if res, qerr, handled := s.tryHandleDatabaseOrRoleDDLExtended(query, dbName, sess); handled {
+		if res, qerr, handled := s.tryHandleDatabaseOrRoleDDLExtended(query, dbName, connTx.NonSuperuserRole, sess); handled {
 			return res, qerr
 		}
 		if res, qerr, handled := s.tryCompatNoopExtended(query); handled {
@@ -80,13 +80,16 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 	// The same parameterized query is shared across all 100 pgbench
 	// connections — one planning call serves them all.
 	var node planner.Node
+	// Resolved directly from dbName (not an executor.Context field) since
+	// ectx doesn't exist yet at this point in the request. M0122-0007 slice 4c.
+	connDBOid := resolveConnDBOid(s.cfg.Catalog, dbName)
 	if s.pc != nil && !sessionTempInheritanceActive(s.cfg.Catalog) && !partitionDetachPending(s.cfg.Catalog) && !inheritanceChangePending(s.cfg.Catalog) {
-		key := normalizeCompatSQL(query)
+		key := planCacheKey(query, connDBOid)
 		if cached, ok := s.pc.Get(key); ok {
 			node = cached
 		} else {
 			var perr error
-			node, perr = planner.Plan(stmt, sessionPlanCatalog(sess, s.cfg.Catalog))
+			node, perr = planner.Plan(stmt, sessionPlanCatalog(sess, s.cfg.Catalog, connDBOid))
 			if perr != nil {
 				code, msg := planErrorFields(perr)
 				return nil, &extendedQueryError{Code: code, Message: msg}
@@ -97,7 +100,7 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 		}
 	} else {
 		var perr error
-		node, perr = planner.Plan(stmt, sessionPlanCatalog(sess, s.cfg.Catalog))
+		node, perr = planner.Plan(stmt, sessionPlanCatalog(sess, s.cfg.Catalog, connDBOid))
 		if perr != nil {
 			code, msg := planErrorFields(perr)
 			return nil, &extendedQueryError{Code: code, Message: msg}
@@ -262,7 +265,14 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 
 	schema := node.Output()
 	res := &extendedQueryResult{}
-	if len(schema) > 0 {
+	// A read-shaped plan reports a non-nil schema; writers (Insert/Update/
+	// Delete/DDL/Transaction) report nil. A zero-column read (e.g.
+	// `SELECT FROM t`, `SELECT;`) reports a non-nil zero-length schema and
+	// MUST still emit one DataRow per source row per PostgreSQL — so gate on
+	// `schema != nil`, NOT `len(schema) > 0` (which silently dropped every
+	// zero-column row here while the simple-query path emitted them). Mirrors
+	// dispatch.go's `if schema != nil` guard.
+	if schema != nil {
 		res.Fields = make([]protocol.FieldDescription, len(schema))
 		for i, sc := range schema {
 			res.Fields[i] = protocol.FieldDescription{
@@ -285,7 +295,7 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 			_ = op.Close()
 			return nil, &extendedQueryError{Code: execErrCode(err), Message: execErrMsg(err)}
 		}
-		if len(schema) > 0 {
+		if schema != nil {
 			row := slot.Row()
 			cells := make([][]byte, len(row))
 			for i, d := range row {
@@ -352,7 +362,7 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 //
 // Returns handled=false when query is not a DDL form this bypass
 // recognises, so the caller falls through to its normal syntax-error path.
-func (s *Server) tryHandleDatabaseOrRoleDDLExtended(query, dbName string, sess *config.SessionRegistry) (*extendedQueryResult, *extendedQueryError, bool) {
+func (s *Server) tryHandleDatabaseOrRoleDDLExtended(query, dbName, actingRole string, sess *config.SessionRegistry) (*extendedQueryResult, *extendedQueryError, bool) {
 	resolveCurrentGUC := currentGUCResolver(func(name string) (string, bool) {
 		if sess == nil {
 			return "", false
@@ -360,7 +370,7 @@ func (s *Server) tryHandleDatabaseOrRoleDDLExtended(query, dbName string, sess *
 		_, eff, ok := sess.GetDisplay(name)
 		return eff, ok
 	})
-	if handled, notice, herr := s.tryHandleDatabaseDDL(query, dbName, resolveCurrentGUC); handled {
+	if handled, notice, herr := s.tryHandleDatabaseDDL(query, dbName, actingRole, resolveCurrentGUC); handled {
 		if herr != nil {
 			return nil, &extendedQueryError{Code: databaseDDLErrorSQLState(herr), Message: herr.Error()}, true
 		}

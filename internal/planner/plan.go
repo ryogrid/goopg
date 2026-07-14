@@ -167,9 +167,37 @@ type IntervalLit struct {
 	Value string
 	Unit  string
 
-	// Cached parsed N from `Value`. CacheValid signals populated.
-	CacheValid bool
-	CachedN    int32
+	// Qualified marks the trailing-qualifier form `interval 'N' <unit>`
+	// (an SQL interval typmod field that truncates below its granularity);
+	// see internal/executor/expr.go evalIntervalLit / truncIntervalToUnit.
+	Qualified bool
+
+	// HasPrec/Prec carry an explicit fractional-seconds precision from a
+	// SECOND(p) typmod field; the executor rounds the micros to 10^(6-p) after
+	// the range truncation (see evalIntervalLit). unimplemented_feat #5(d-iv).
+	HasPrec bool
+	Prec    int
+
+	// PreComputed marks a multi-field / HH:MM:SS embedded body
+	// (`interval '1 day 05:00:00'`, `interval '1 year 2 mons 3 days'`) that
+	// the parser already decoded via parser.ParseIntervalBody
+	// (unimplemented_feat #5(b)). When set, PreMonths/PreDays/PreMicros hold
+	// the final components and Value/Unit/Qualified are unused.
+	PreComputed bool
+	PreMonths   int32
+	PreDays     int32
+	PreMicros   int64
+
+	// Cached parsed interval components from `Value`+`Unit`.
+	// CacheValid signals populated. Widened from a single int32 count
+	// (M0066-0002) to the full months/days/micros triple so fractional
+	// magnitudes (`interval '1.5 hours'`) — whose spill into smaller
+	// units cannot be represented by one integer count — are also
+	// cached (see internal/executor/expr.go evalIntervalLit).
+	CacheValid   bool
+	CachedMonths int32
+	CachedDays   int32
+	CachedMicros int64
 }
 
 func (e *IntervalLit) Pos() int { return e.pos }
@@ -720,7 +748,19 @@ type Join struct {
 	// left row as the lateral outer slot (BindLateralOuter contract)
 	// instead of materialising both sides up front.
 	Lateral bool
-	schema  Schema
+	// NullAware marks a JoinTypeAnti built from unnesting a
+	// non-correlated `x NOT IN (subquery)` (M0122-0011). Plain Anti
+	// join semantics (used for NOT EXISTS) keep a probe row whenever
+	// no hash match is found, including when the probe key is NULL —
+	// correct for NOT EXISTS, but not for NOT IN's three-valued
+	// semantics: a NULL anywhere in the subquery's output poisons
+	// the whole predicate to NULL/false for every outer row unless
+	// the subquery is empty, and a NULL outer value never matches
+	// (excluded) unless the subquery is empty. The executor's
+	// nextLazy/openLazyHashJoin special-case this flag instead of
+	// reusing the NOT-EXISTS-shaped default.
+	NullAware bool
+	schema    Schema
 }
 
 func (n *Join) Pos() int       { return n.pos }
@@ -820,12 +860,13 @@ type WindowAgg struct {
 	PartitionBy []Expr
 	OrderBy     []SortKey
 	Funcs       []WindowFunc
-	// Frame is the resolved ROWS window frame clause shared by every
+	// Frame is the resolved window frame clause shared by every
 	// func in this node (nil when no explicit frame clause was
 	// written — the executor's default frame applies). The analyzer
-	// already rejected RANGE/GROUPS and validated bound ordering, so
-	// by the time a Frame reaches the planner it is always ROWS-mode
-	// and well-formed (M0122-0004 frame-clause slice).
+	// already validated bound ordering and restricted RANGE to
+	// UNBOUNDED/CURRENT ROW bounds (RANGE value offsets rejected), so
+	// by the time a Frame reaches the planner it is a well-formed
+	// ROWS/GROUPS/RANGE frame (M0122-0004 frame-clause slice).
 	Frame  *WindowFrame
 	schema Schema
 }
@@ -838,6 +879,7 @@ type WindowAgg struct {
 // than duplicating them, matching the existing convention of BinaryOp/
 // UnaryOp.Op reusing parser.OpCode.
 type WindowFrame struct {
+	Mode        parser.FrameMode // FrameModeRows/Groups, or Range with UNBOUNDED/CURRENT ROW bounds only (RANGE value offsets rejected by the analyzer)
 	StartKind   parser.FrameBoundKind
 	StartOffset Expr // non-nil only for FrameBoundOffsetPreceding/Following
 	EndKind     parser.FrameBoundKind

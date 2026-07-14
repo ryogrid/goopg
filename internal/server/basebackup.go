@@ -167,6 +167,26 @@ func (s *Server) replyBaseBackup(ctx context.Context, w *protocol.FrameWriter, a
 			fmt.Sprintf("BASE_BACKUP: unsupported manifest checksum type %q", opts.ManifestChecksums))
 	}
 
+	// perf-optimize3-dash S3b (README R3): under native-only WAL
+	// (EmitCanonical off) the data copy below still works — for goopg
+	// consumers — but a REAL PostgreSQL standby bootstrapped from it would
+	// restore the files and then fail (or silently no-op) replaying the
+	// native-only WAL stream, a delayed and confusing failure. WARN rather
+	// than refuse: goopg->goopg cloning and pg_basebackup-based goopg
+	// backups remain first-class.
+	if s.cfg.WAL != nil && !s.cfg.WAL.CanonicalEnabled() {
+		const msg = "BASE_BACKUP: WAL stream is native-only (GOOPG_WAL_CANONICAL=off); " +
+			"a PostgreSQL standby bootstrapped from this backup cannot replay subsequent WAL " +
+			"(goopg->goopg cloning is unaffected) — see .ralph/deferral_ledger.md perf-optimize3-dash"
+		s.cfg.Logger.Warn(msg)
+		_ = w.WriteNoticeResponse([]protocol.ErrorField{
+			{Code: protocol.FieldSeverity, Value: "WARNING"},
+			{Code: protocol.FieldSeverityNonLocal, Value: "WARNING"},
+			{Code: protocol.FieldSQLState, Value: "01000"},
+			{Code: protocol.FieldMessage, Value: msg},
+		})
+	}
+
 	// Force a synchronous IMMEDIATE checkpoint so the start-LSN we
 	// report names a record whose redo image is on disk. Upstream's
 	// `do_pg_backup_start` does the same: a non-spread checkpoint is

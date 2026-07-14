@@ -1,0 +1,4 @@
+pgbench_history|0|0
+pgbench_tellers|0|0
+pgbench_accounts|1491525|797227
+pgbench_branches|0|0

@@ -23,6 +23,22 @@ import (
 //  6. Asserts the committed rows are all present.
 //  7. Asserts no ERROR appears in the log on startup.
 func TestKillKillRecovery(t *testing.T) {
+	runKillKillRecovery(t)
+}
+
+// TestKillKillRecoveryNativeOnly re-runs the SIGKILL matrix with canonical
+// WAL emission off (perf-optimize3-dash S3a): the native record family +
+// the pd_lsn<=publishedRedo image machinery are then the sole recovery
+// cover — the load-bearing configuration for the S4 default flip. The env
+// reaches the goopg subprocess because cluster.Start's exec.Command
+// inherits the parent environment.
+func TestKillKillRecoveryNativeOnly(t *testing.T) {
+	t.Setenv("GOOPG_WAL_CANONICAL", "off")
+	runKillKillRecovery(t)
+}
+
+func runKillKillRecovery(t *testing.T) {
+	t.Helper()
 	if testing.Short() {
 		t.Skip("skipping crash-recovery test in short mode")
 	}
@@ -99,7 +115,6 @@ func TestKillKillRecovery(t *testing.T) {
 
 	_ = c.Stop(ShutdownImmediate)
 }
-
 
 // TestKillReleasesListenerPort (M0106-0010 batched-55) pins the contract
 // that Cluster.Kill() actually takes down the goopg server process —

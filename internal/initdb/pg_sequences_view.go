@@ -1,9 +1,6 @@
 package initdb
 
 import (
-	"fmt"
-	"sort"
-
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/executor"
 )
@@ -29,35 +26,17 @@ func registerPgSequencesView(cat *catalog.InMemory) error {
 			{Name: "last_value", Type: catalog.Type{Name: "int8"}, Ordinal: 10},
 		},
 	}
+	// Fallback path only: behaves exactly as before, always DefaultDBOid.
+	// The connecting session's own dbOid is resolved directly by
+	// internal/executor/operators.go's valuesOp.Open (tbl.Name ==
+	// "pg_sequences" branch), which calls executor.PGSequencesRows with the
+	// connection's own dbOid instead of falling through to this closure —
+	// mirrors the pg_stat_slru/pg_stat_io direct-call pattern (no
+	// catalog.InMemory indirection needed since sequence state already
+	// lives in this package). M0122-0007 4e follow-up 35 (deferred by
+	// follow-up 34).
 	tbl.VirtualRows = func() [][]string {
-		infos := executor.AllSequenceInfos()
-		sort.Slice(infos, func(i, j int) bool {
-			if infos[i].Schema != infos[j].Schema {
-				return infos[i].Schema < infos[j].Schema
-			}
-			return infos[i].Name < infos[j].Name
-		})
-		rows := make([][]string, len(infos))
-		for i, seq := range infos {
-			base := []string{
-				seq.Schema,
-				seq.Name,
-				"", // sequenceowner — not tracked
-				seq.DataType,
-				fmt.Sprintf("%d", seq.Start),
-				fmt.Sprintf("%d", seq.Min),
-				fmt.Sprintf("%d", seq.Max),
-				fmt.Sprintf("%d", seq.Increment),
-				boolText(seq.Cycle),
-				"1", // cache_size — not tracked, default 1
-			}
-			if seq.Called {
-				// Append last_value; omitting it leaves last_value as NULL.
-				base = append(base, fmt.Sprintf("%d", seq.LastValue))
-			}
-			rows[i] = base
-		}
-		return rows
+		return executor.PGSequencesRows(catalog.DefaultDBOid)
 	}
 	return cat.RegisterVirtualTable(tbl)
 }

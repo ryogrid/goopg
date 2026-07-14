@@ -113,7 +113,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 	// DATABASE need no such pre-check because the parser has no grammar for
 	// them at all (parser.Parse always fails, hitting the bypass below).
 	if kind, _ := classifyDatabaseDDL(sql); kind == databaseDDLDrop {
-		if handled, err := s.handleDatabaseDDLBypass(sql, connTx.DBName, resolveCurrentGUC, w); handled {
+		if handled, err := s.handleDatabaseDDLBypass(sql, connTx.DBName, connTx.NonSuperuserRole, resolveCurrentGUC, w); handled {
 			return err
 		}
 	}
@@ -130,7 +130,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		// it, and (b) emit a WAL record so the registration survives a
 		// crash. Other commands fall through to the wire-protocol no-op
 		// tag handler.
-		if handled, err := s.handleDatabaseDDLBypass(sql, connTx.DBName, resolveCurrentGUC, w); handled {
+		if handled, err := s.handleDatabaseDDLBypass(sql, connTx.DBName, connTx.NonSuperuserRole, resolveCurrentGUC, w); handled {
 			return err
 		}
 		// A multi-statement batch whose FIRST statement is CREATE/DROP ROLE
@@ -413,7 +413,14 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		}
 		// Set PlanCatalog to a search-path-aware wrapper so DDL executor can
 		// use it when calling planner.Plan for internal validation. M0097-0022.
-		ectx.PlanCatalog = sessionPlanCatalog(sess, s.cfg.Catalog)
+		// Resolved directly from connTx.DBName (not ectx.CurrentDatabaseOid)
+		// since wireExtensionRows hasn't stamped it yet at this point in the
+		// request. M0122-0007 slice 4c.
+		var connDBName string
+		if connTx != nil {
+			connDBName = connTx.DBName
+		}
+		ectx.PlanCatalog = sessionPlanCatalog(sess, s.cfg.Catalog, resolveConnDBOid(s.cfg.Catalog, connDBName))
 	}
 	// Match advisorySessionIDFromContext's preference order: the per-connection
 	// AdvisorySessionIdentity (SessionRegistry) is the stable advisory owner, so
@@ -668,7 +675,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 				}
 				// Infer result column types and undeclared parameter types by planning/walking.
 				if ectx.Catalog != nil {
-					if plan, planErr := planner.Plan(ps.Query, sessionPlanCatalog(sess, ectx.Catalog)); planErr == nil {
+					if plan, planErr := planner.Plan(ps.Query, sessionPlanCatalog(sess, ectx.Catalog, ectx.CurrentDatabaseOid)); planErr == nil {
 						schema := plan.Output()
 						if len(schema) > 0 {
 							resultTypes := make([]string, len(schema))
@@ -841,11 +848,24 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		// Use ectx.Tx.Isolation (not the outer tx) so execBegin's
 		// promotion of the implicit RC tx to an explicit RR tx is visible.
 		if ectx.Tx.Isolation == mvcc.IsolationReadCommitted {
-			snap2, err := s.cfg.TxnMgr.SnapshotFor(tx)
-			if err != nil {
-				return s.writeQueryError(w, sqlstate.SystemError, err.Error())
+			// The pre-loop SnapshotFor(tx) already captured a fresh RC snapshot
+			// (and CAS-lowered the proc-array xmin) into ectx.Snap for this
+			// Query message. For the FIRST statement, reuse it instead of
+			// re-capturing — the two would be taken microseconds apart with no
+			// intervening commit visible to this backend, so it is the same RC
+			// command-start snapshot; this removes the redundant second capture
+			// on the single-statement autocommit hot path (pgbench -S,
+			// perf-optimize3-dash/08 doc 05). Later statements (i>0) still
+			// refresh per-statement for RC freshness. (i>0 also covers the
+			// case where an in-loop BEGIN promoted the tx; the pre-loop snap
+			// only ever belongs to statement 0, before any promotion.)
+			if i > 0 {
+				snap2, err := s.cfg.TxnMgr.SnapshotFor(tx)
+				if err != nil {
+					return s.writeQueryError(w, sqlstate.SystemError, err.Error())
+				}
+				ectx.Snap = snap2
 			}
-			ectx.Snap = snap2
 		} else if stmtTakesSnapshot(stmt) {
 			// RR/SSI: pin the transaction's snapshot at the FIRST snapshot-taking
 			// batched statement after a `BEGIN ISOLATION LEVEL …` that shares its
@@ -909,12 +929,12 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		var precached planner.Node
 		var cacheKey string
 		if s.pc != nil && len(stmts) == 1 && !disablePlanCache && !isNotifyStmt(stmt) && !isTwoPhaseStmt(stmt) && !sessionTempInheritanceActive(s.cfg.Catalog) && !partitionDetachPending(s.cfg.Catalog) && !inheritanceChangePending(s.cfg.Catalog) {
-			cacheKey = normalizeCompatSQL(sql)
+			cacheKey = planCacheKey(sql, ectx.CurrentDatabaseOid)
 			if cached, ok := s.pc.Get(cacheKey); ok {
 				precached = cached
 			} else {
 				// Cache miss: plan now so we can store it.
-				freshNode, perr := planner.Plan(stmt, sessionPlanCatalog(sess, s.cfg.Catalog))
+				freshNode, perr := planner.Plan(stmt, sessionPlanCatalog(sess, s.cfg.Catalog, ectx.CurrentDatabaseOid))
 				if perr != nil {
 					code, msg := planErrorFields(perr)
 					return s.writeQueryError(w, code, msg, planErrorHintFields(perr)...)
@@ -1023,7 +1043,14 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		}
 		executor.ReleaseAdvisoryTransactionLocks(advisoryReleaseTarget)
 		commit = true
-		maybeForceGCAfterCommit()
+		// Forced GC only helps after a transaction that actually wrote (a
+		// read-only SELECT produces no retained heap worth a GC round). Gate
+		// on the write-XID predicate so pgbench -S never pays even the atomic
+		// counter add (perf-optimize3-dash/08 doc 10). Use ectx.Tx.XID, the
+		// Context's in-place-updated copy, not the stale outer tx.
+		if ectx.DidWrite() {
+			maybeForceGCAfterCommit()
+		}
 		// NOTIFY becomes visible to listeners at the notifying transaction's
 		// commit; publish the buffer accumulated by this autocommit batch.
 		// M0118-0009.
@@ -1252,14 +1279,20 @@ func inheritanceChangePending(base catalog.Catalog) bool {
 // sessionPlanCatalog returns a search-path-aware catalog wrapper for use when
 // calling planner.Plan. The wrapper re-reads search_path dynamically so that
 // SET search_path changes take effect on the next statement. When sess is nil
-// the base catalog is returned unchanged. M0097-0022.
-func sessionPlanCatalog(sess *config.SessionRegistry, base catalog.Catalog) catalog.Catalog {
+// the base catalog is returned unchanged. dbOid is the querying connection's
+// real database oid (resolveConnDBOid/ectx.CurrentDatabaseOid); it seeds
+// SearchPathCatalog.DBOid so LookupTable/LookupIndex key off the connection's
+// own namespace (M0122-0007 slice 4c, design 0122-0018). Pass 0 for
+// connection-less/embedded callers — effectiveDBOid falls back to
+// DefaultDBOid. M0097-0022.
+func sessionPlanCatalog(sess *config.SessionRegistry, base catalog.Catalog, dbOid uint32) catalog.Catalog {
 	if sess == nil {
 		return base
 	}
 	wrapped := catalog.WithSearchPath(base, func() []string {
 		return searchPathSchemas(sess)
 	})
+	wrapped.DBOid = dbOid
 	// Carry the session's temp-relation ownership token so the planner drops
 	// other-session temp inheritance children during expansion. Must match
 	// executor.sessionTempOwner: "s"+UniqueID(). Design 0118-0036 (inherit-temp).
@@ -1274,6 +1307,27 @@ func sessionPlanCatalog(sess *config.SessionRegistry, base catalog.Catalog) cata
 		wrapped.DisableSeqScan = true
 	}
 	return wrapped
+}
+
+// resolveConnDBOid resolves dbName to its real, physical pg_database.oid via
+// cat's databaseOidResolver, returning 0 (SearchPathCatalog.effectiveDBOid's
+// "use DefaultDBOid" sentinel) when dbName is empty or unresolvable — the
+// same fallback wireExtensionRows leaves ectx.CurrentDatabaseOid at. Exists
+// because the single-statement and cross-session plan-cache paths
+// (dispatch.go's cache-miss branch, executeExtendedQueryViaExecutor) build
+// their PlanCatalog before wireExtensionRows stamps ectx.CurrentDatabaseOid —
+// this resolves the same oid directly from the connection's dbName instead.
+// M0122-0007 slice 4c.
+func resolveConnDBOid(cat catalog.Catalog, dbName string) uint32 {
+	if dbName == "" {
+		return 0
+	}
+	if dr, ok := cat.(databaseOidResolver); ok {
+		if oid, ok := dr.ResolveDatabaseOid(dbName); ok {
+			return oid
+		}
+	}
+	return 0
 }
 
 // ctxPlanCatalog is like sessionPlanCatalog but reads search_path from an
@@ -1291,6 +1345,10 @@ func ctxPlanCatalog(ctx *executor.Context, base catalog.Catalog) catalog.Catalog
 		}
 		return parseSearchPathSchemas(sp)
 	})
+	// Seed the connection's real database oid so LookupTable/LookupIndex key
+	// off its own namespace (M0122-0007 slice 4c). Zero (no live connection)
+	// falls back to DefaultDBOid via effectiveDBOid.
+	wrapped.DBOid = ctx.CurrentDatabaseOid
 	// Carry the session temp-owner token (matches executor.sessionTempOwner) so
 	// the planner applies the RELATION_IS_OTHER_TEMP exclusion. Design 0118-0036.
 	if s, ok := ctx.AdvisorySessionIdentity.(interface{ UniqueID() uint64 }); ok && s != nil {
@@ -1508,6 +1566,18 @@ func normalizeCompatSQL(sql string) string {
 	// Lowercasing string literals would cause 'A' and 'a' to map to the
 	// same plan-cache key, returning the wrong cached plan. M0097-0003.
 	return normalizeSQLPreservingLiterals(s)
+}
+
+// planCacheKey builds the cross-session plan cache key: normalizeCompatSQL's
+// text form prefixed with the querying connection's effective table/index
+// namespace oid (catalog.NamespaceDBOid(connDBOid)). Without the oid prefix,
+// a plan cached while resolving names against one database's namespace could
+// be replayed for a connection reading a different one — the cache is a
+// single server-wide map shared by every connection (M0122-0007 slice 4c;
+// see plancache.go's doc comment). Two connections whose NamespaceDBOid
+// agrees (e.g. both "postgres") intentionally still share one entry.
+func planCacheKey(sql string, connDBOid uint32) string {
+	return strconv.FormatUint(uint64(catalog.NamespaceDBOid(connDBOid)), 10) + "\x00" + normalizeCompatSQL(sql)
 }
 
 // normalizeSQLPreservingLiterals lowercases SQL outside string literals
@@ -1898,15 +1968,249 @@ type extensionLister interface {
 	ExtensionRowsForDB(db string) [][]string
 }
 
+// databaseOidResolver is implemented by catalogs that can resolve a database
+// name to its real, physical pg_database.oid (catalog.InMemory). M0122-0007
+// physical-storage-isolation slice 4a.
+type databaseOidResolver interface {
+	ResolveDatabaseOid(name string) (uint32, bool)
+}
+
 // wireExtensionRows installs the per-database pg_extension view on ectx so an
 // extension installed in one database is invisible in another (PostgreSQL's
-// pg_extension is per-database; goopg shares one in-memory catalog). Used by
-// both the simple- and extended-query executor paths. M0110-0003 (gap #7c).
+// pg_extension is per-database; goopg shares one in-memory catalog). Also
+// resolves and stamps ectx.CurrentDatabaseOid (M0122-0007 slice 4a plumbing —
+// not yet consumed by any lookup site). Used by both the simple- and
+// extended-query executor paths. M0110-0003 (gap #7c).
 func (s *Server) wireExtensionRows(ectx *executor.Context, dbName string) {
 	ectx.CurrentDatabase = dbName
 	if el, ok := s.cfg.Catalog.(extensionLister); ok {
 		ectx.ExtensionRows = func() [][]string { return el.ExtensionRowsForDB(dbName) }
 	}
+	if dr, ok := s.cfg.Catalog.(databaseOidResolver); ok {
+		if oid, ok := dr.ResolveDatabaseOid(dbName); ok {
+			ectx.CurrentDatabaseOid = oid
+		}
+	}
+	// pg_class must reflect the connecting database's own tables/indexes, not
+	// always DefaultDBOid's (M0122-0007 4e). Captures ectx.CurrentDatabaseOid
+	// by reference so this stays correct even though it's stamped above in
+	// this same call (ResolveDatabaseOid failing leaves it at its prior/zero
+	// value, which NamespaceDBOid maps back to DefaultDBOid — unchanged
+	// legacy behavior for embedded/test contexts with no real connection).
+	if pc, ok := s.cfg.Catalog.(pgClassRowLister); ok {
+		ectx.PgClassRows = func() [][]string {
+			return pc.PGClassRowsForDBOid(catalog.NamespaceDBOid(ectx.CurrentDatabaseOid))
+		}
+	}
+	// pg_indexes / pg_tables must likewise reflect the connecting database's
+	// own indexes/tables, not always DefaultDBOid's. Mirrors the pg_class
+	// wiring above. M0122-0007 4e follow-up 24.
+	if pi, ok := s.cfg.Catalog.(pgIndexesRowLister); ok {
+		ectx.PgIndexesRows = func() [][]string {
+			return pi.PGIndexesRowsForDBOid(catalog.NamespaceDBOid(ectx.CurrentDatabaseOid))
+		}
+	}
+	if pt, ok := s.cfg.Catalog.(pgTablesRowLister); ok {
+		ectx.PgTablesRows = func() [][]string {
+			return pt.PGTablesRowsForDBOid(catalog.NamespaceDBOid(ectx.CurrentDatabaseOid))
+		}
+	}
+	// pg_constraint must likewise reflect the connecting database's own
+	// tables'/indexes' constraints, not always DefaultDBOid's. Mirrors the
+	// pg_class wiring above. M0122-0007 4e follow-up 25.
+	if pc, ok := s.cfg.Catalog.(pgConstraintRowLister); ok {
+		ectx.PgConstraintRows = func() [][]string {
+			return pc.PGConstraintRowsForDBOid(catalog.NamespaceDBOid(ectx.CurrentDatabaseOid))
+		}
+	}
+	// pg_index must likewise reflect the connecting database's own indexes,
+	// not always DefaultDBOid's. Mirrors the pg_constraint wiring above.
+	// M0122-0007 4e follow-up 26.
+	if pix, ok := s.cfg.Catalog.(pgIndexRowLister); ok {
+		ectx.PgIndexRows = func() [][]string {
+			return pix.PGIndexRowsForDBOid(catalog.NamespaceDBOid(ectx.CurrentDatabaseOid))
+		}
+	}
+	// pg_attrdef / pg_depend must likewise reflect the connecting database's
+	// own column defaults / dependency rows, not always DefaultDBOid's.
+	// Mirrors the pg_index wiring above. Both close over the SAME
+	// NamespaceDBOid(ectx.CurrentDatabaseOid) call so pg_depend's
+	// attrdef→sequence rows stay in oid-numbering lockstep with pg_attrdef's
+	// own rows (PGAttrdefRowsForDBOid's doc comment). M0122-0007 4e
+	// follow-up 27.
+	if pad, ok := s.cfg.Catalog.(pgAttrdefRowLister); ok {
+		ectx.PgAttrdefRows = func() [][]string {
+			return pad.PGAttrdefRowsForDBOid(catalog.NamespaceDBOid(ectx.CurrentDatabaseOid))
+		}
+	}
+	if pd, ok := s.cfg.Catalog.(pgDependRowLister); ok {
+		ectx.PgDependRows = func() [][]string {
+			return pd.PGDependRowsForDBOid(catalog.NamespaceDBOid(ectx.CurrentDatabaseOid))
+		}
+	}
+	// pg_inherits must likewise reflect the connecting database's own
+	// inheritance/partition parent-child rows, not always DefaultDBOid's.
+	// Mirrors the pg_depend wiring above. M0122-0007 4e follow-up 28.
+	if pih, ok := s.cfg.Catalog.(pgInheritsRowLister); ok {
+		ectx.PgInheritsRows = func() [][]string {
+			return pih.PGInheritsRowsForDBOid(catalog.NamespaceDBOid(ectx.CurrentDatabaseOid))
+		}
+	}
+	// pg_policy must likewise reflect the connecting database's own tables'
+	// row-level-security policies, not always DefaultDBOid's. Mirrors the
+	// pg_inherits wiring above. M0122-0007 4e follow-up 29.
+	if pp, ok := s.cfg.Catalog.(pgPolicyRowLister); ok {
+		ectx.PgPolicyRows = func() [][]string {
+			return pp.PGPolicyRowsForDBOid(catalog.NamespaceDBOid(ectx.CurrentDatabaseOid))
+		}
+	}
+	// pg_trigger must likewise reflect the connecting database's own tables'
+	// triggers, not always DefaultDBOid's. Mirrors the pg_policy wiring
+	// above. M0122-0007 4e follow-up 30.
+	if pt, ok := s.cfg.Catalog.(pgTriggerRowLister); ok {
+		ectx.PgTriggerRows = func() [][]string {
+			return pt.PGTriggerRowsForDBOid(catalog.NamespaceDBOid(ectx.CurrentDatabaseOid))
+		}
+	}
+	// pg_rewrite must likewise reflect the connecting database's own tables'
+	// CREATE RULE DO-NOTHING rules, not always DefaultDBOid's. Mirrors the
+	// pg_trigger wiring above. M0122-0007 4e follow-up 31.
+	if pr, ok := s.cfg.Catalog.(pgRewriteRowLister); ok {
+		ectx.PgRewriteRows = func() [][]string {
+			return pr.PGRewriteRowsForDBOid(catalog.NamespaceDBOid(ectx.CurrentDatabaseOid))
+		}
+	}
+	// pg_foreign_table must likewise reflect the connecting database's own
+	// foreign tables, not always DefaultDBOid's. Mirrors the pg_rewrite
+	// wiring above. M0122-0007 4e follow-up 32.
+	if pf, ok := s.cfg.Catalog.(pgForeignTableRowLister); ok {
+		ectx.PgForeignTableRows = func() [][]string {
+			return pf.PGForeignTableRowsForDBOid(catalog.NamespaceDBOid(ectx.CurrentDatabaseOid))
+		}
+	}
+	// pg_sequence must likewise reflect the connecting database's own
+	// sequences, not always DefaultDBOid's. Mirrors the pg_foreign_table
+	// wiring above. M0122-0007 4e follow-up 34.
+	if ps, ok := s.cfg.Catalog.(pgSequenceRowLister); ok {
+		ectx.PgSequenceRows = func() [][]string {
+			return ps.PGSequenceRowsForDBOid(catalog.NamespaceDBOid(ectx.CurrentDatabaseOid))
+		}
+	}
+	// pg_foreign_server must likewise reflect the connecting database's own
+	// CREATE SERVER'd servers, not always DefaultDBOid's. Mirrors the
+	// pg_sequence wiring above. M0122-0007 4e follow-up 36.
+	if pfs, ok := s.cfg.Catalog.(pgForeignServerRowLister); ok {
+		ectx.PgForeignServerRows = func() [][]string {
+			return pfs.PGForeignServerRowsForDBOid(catalog.NamespaceDBOid(ectx.CurrentDatabaseOid))
+		}
+	}
+	// pg_user_mappings must likewise reflect the connecting database's own
+	// CREATE USER MAPPING'd mappings, not always DefaultDBOid's. Mirrors the
+	// pg_foreign_server wiring above. M0122-0007 4e follow-up 37.
+	if pum, ok := s.cfg.Catalog.(pgUserMappingsRowLister); ok {
+		ectx.PgUserMappingsRows = func() [][]string {
+			return pum.PGUserMappingsRowsForDBOid(catalog.NamespaceDBOid(ectx.CurrentDatabaseOid))
+		}
+	}
+}
+
+// pgClassRowLister is implemented by catalog.InMemory to expose a
+// per-database pg_class row-set (M0122-0007 4e), mirroring extensionLister
+// above.
+type pgClassRowLister interface {
+	PGClassRowsForDBOid(dbOid uint32) [][]string
+}
+
+// pgIndexesRowLister / pgTablesRowLister are implemented by catalog.InMemory
+// to expose per-database pg_indexes / pg_tables row-sets, mirroring
+// pgClassRowLister above. M0122-0007 4e follow-up 24.
+type pgIndexesRowLister interface {
+	PGIndexesRowsForDBOid(dbOid uint32) [][]string
+}
+
+type pgTablesRowLister interface {
+	PGTablesRowsForDBOid(dbOid uint32) [][]string
+}
+
+// pgConstraintRowLister is implemented by catalog.InMemory to expose a
+// per-database pg_constraint row-set, mirroring pgClassRowLister above.
+// M0122-0007 4e follow-up 25.
+type pgConstraintRowLister interface {
+	PGConstraintRowsForDBOid(dbOid uint32) [][]string
+}
+
+// pgIndexRowLister is implemented by catalog.InMemory to expose a
+// per-database pg_index row-set, mirroring pgConstraintRowLister above.
+// M0122-0007 4e follow-up 26.
+type pgIndexRowLister interface {
+	PGIndexRowsForDBOid(dbOid uint32) [][]string
+}
+
+// pgAttrdefRowLister / pgDependRowLister are implemented by catalog.InMemory
+// to expose per-database pg_attrdef / pg_depend row-sets, mirroring
+// pgIndexRowLister above. M0122-0007 4e follow-up 27.
+type pgAttrdefRowLister interface {
+	PGAttrdefRowsForDBOid(dbOid uint32) [][]string
+}
+
+type pgDependRowLister interface {
+	PGDependRowsForDBOid(dbOid uint32) [][]string
+}
+
+// pgInheritsRowLister is implemented by catalog.InMemory to expose a
+// per-database pg_inherits row-set, mirroring pgDependRowLister above.
+// M0122-0007 4e follow-up 28.
+type pgInheritsRowLister interface {
+	PGInheritsRowsForDBOid(dbOid uint32) [][]string
+}
+
+// pgPolicyRowLister is implemented by catalog.InMemory to expose a
+// per-database pg_policy row-set, mirroring pgInheritsRowLister above.
+// M0122-0007 4e follow-up 29.
+type pgPolicyRowLister interface {
+	PGPolicyRowsForDBOid(dbOid uint32) [][]string
+}
+
+// pgTriggerRowLister is implemented by catalog.InMemory to expose a
+// per-database pg_trigger row-set, mirroring pgPolicyRowLister above.
+// M0122-0007 4e follow-up 30.
+type pgTriggerRowLister interface {
+	PGTriggerRowsForDBOid(dbOid uint32) [][]string
+}
+
+// pgRewriteRowLister is implemented by catalog.InMemory to expose a
+// per-database pg_rewrite row-set, mirroring pgTriggerRowLister above.
+// M0122-0007 4e follow-up 31.
+type pgRewriteRowLister interface {
+	PGRewriteRowsForDBOid(dbOid uint32) [][]string
+}
+
+// pgForeignTableRowLister is implemented by catalog.InMemory to expose a
+// per-database pg_foreign_table row-set, mirroring pgRewriteRowLister above.
+// M0122-0007 4e follow-up 32.
+type pgForeignTableRowLister interface {
+	PGForeignTableRowsForDBOid(dbOid uint32) [][]string
+}
+
+// pgSequenceRowLister is implemented by catalog.InMemory to expose a
+// per-database pg_sequence row-set, mirroring pgForeignTableRowLister above.
+// M0122-0007 4e follow-up 34.
+type pgSequenceRowLister interface {
+	PGSequenceRowsForDBOid(dbOid uint32) [][]string
+}
+
+// pgForeignServerRowLister is implemented by catalog.InMemory to expose a
+// per-database pg_foreign_server row-set, mirroring pgSequenceRowLister
+// above. M0122-0007 4e follow-up 36.
+type pgForeignServerRowLister interface {
+	PGForeignServerRowsForDBOid(dbOid uint32) [][]string
+}
+
+// pgUserMappingsRowLister is implemented by catalog.InMemory to expose a
+// per-database pg_user_mappings row-set, mirroring pgForeignServerRowLister
+// above. M0122-0007 4e follow-up 37.
+type pgUserMappingsRowLister interface {
+	PGUserMappingsRowsForDBOid(dbOid uint32) [][]string
 }
 
 func undoEnumDDLForRollback(connTx *connTxState, cat catalog.Catalog) {

@@ -1,6 +1,7 @@
 package initdb
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -401,5 +402,61 @@ func TestStatSubscriptionRendersRegisteredSubscribers(t *testing.T) {
 	subs.Unregister(tablesync)
 	if rows := tbl.VirtualRows(); len(rows) != 0 {
 		t.Errorf("after unregister: rows=%d want 0", len(rows))
+	}
+}
+
+// TestStatSubscriptionStatsRendersPerSubscription confirms
+// pg_stat_subscription_stats emits one row per subscription in the
+// catalog.PubSub registry (NOT per apply worker), reporting the
+// subscription's oid + name and all-zero error/conflict counters with a
+// NULL stats_reset — matching a real PG 18.3 subscription that has never
+// hit an apply/sync error, conflict, or reset.
+func TestStatSubscriptionStatsRendersPerSubscription(t *testing.T) {
+	cat := catalog.NewInMemory()
+	ps := catalog.NewPubSub()
+	if err := registerStatSubscriptionStatsView(cat, ps); err != nil {
+		t.Fatal(err)
+	}
+	tbl, ok := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_stat_subscription_stats"})
+	if !ok {
+		t.Fatal("pg_stat_subscription_stats not registered")
+	}
+	// Empty registry → zero rows (upstream: pg_subscription drives the join).
+	if got := tbl.VirtualRows(); len(got) != 0 {
+		t.Fatalf("empty registry must yield 0 rows, got %d", len(got))
+	}
+
+	sub, err := ps.CreateSubscription("sub_stats", "host=remote dbname=app", []string{"p1"}, "", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rows := tbl.VirtualRows()
+	if len(rows) != 1 {
+		t.Fatalf("rows=%d want 1", len(rows))
+	}
+	row := rows[0]
+	// Columns: subid, subname, apply_error_count, sync_error_count,
+	// confl_insert_exists, confl_update_origin_differs, confl_update_exists,
+	// confl_update_missing, confl_delete_origin_differs, confl_delete_missing,
+	// confl_multiple_unique_conflicts, stats_reset.
+	if len(row) != 12 {
+		t.Fatalf("cols=%d want 12", len(row))
+	}
+	if want := fmt.Sprintf("%d", sub.OID); row[0] != want {
+		t.Errorf("subid=%q want %q", row[0], want)
+	}
+	if row[1] != "sub_stats" {
+		t.Errorf("subname=%q want sub_stats", row[1])
+	}
+	// Every counter (apply/sync errors + seven conflict types) is a faithful 0.
+	for i := 2; i <= 10; i++ {
+		if row[i] != "0" {
+			t.Errorf("counter col %d = %q want 0", i, row[i])
+		}
+	}
+	// stats_reset is NULL (empty string) until a cumulative-stats reset lands.
+	if row[11] != "" {
+		t.Errorf("stats_reset=%q want empty (NULL)", row[11])
 	}
 }

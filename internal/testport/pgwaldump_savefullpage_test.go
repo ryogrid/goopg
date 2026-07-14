@@ -86,6 +86,7 @@ var saveFullpageFileRE = regexp.MustCompile(
 // TestPort_PgWaldump002SaveFullpage ports
 // postgres/src/bin/pg_waldump/t/002_save_fullpage.pl (M0110-0002).
 func TestPort_PgWaldump002SaveFullpage(t *testing.T) {
+	skipUnlessCanonicalWAL(t) // perf-optimize3-dash S4: canonical rmgr content (WD-003 deferred)
 	waldump := findPGWaldumpBin(t)
 	psqlBin := clientToolBin(t, "psql")
 	if psqlBin == "" {

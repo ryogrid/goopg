@@ -132,6 +132,101 @@ func TestSCRAMExchangeSuccess(t *testing.T) {
 	}
 }
 
+// TestSCRAMExchangeRejectsChannelBindingFlagMismatch verifies goopg
+// matches auth-scram.c's read_client_final_message: when no channel
+// binding is in use, the c= attribute in client-final MUST echo the SAME
+// gs2-cbind-flag the client sent in client-first ("biws"/"n,," for flag
+// 'n', "eSws"/"y,," for flag 'y'). A client that sent 'n' but replays a
+// "y,," c= (a tampered flag) must be rejected with the channel-binding
+// error BEFORE the proof check.
+func TestSCRAMExchangeRejectsChannelBindingFlagMismatch(t *testing.T) {
+	secret, err := NewSCRAMSecret("hunter2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := NewSCRAMServer("alice", secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Client-first sends gs2-cbind-flag 'n'.
+	if _, _, err := srv.Step([]byte("n,,n=alice,r=ABCDEFGH")); err != nil {
+		t.Fatalf("step1: %v", err)
+	}
+	// Client-final echoes "y,," instead of the "n,," it originally sent.
+	combined := "ABCDEFGH" + srv.serverNonce
+	bogus := base64.StdEncoding.EncodeToString(make([]byte, scramKeyLen))
+	mismatchedC := base64.StdEncoding.EncodeToString([]byte("y,,"))
+	clientFinal := "c=" + mismatchedC + ",r=" + combined + ",p=" + bogus
+	_, _, err = srv.Step([]byte(clientFinal))
+	if err == nil {
+		t.Fatal("expected channel-binding rejection, got nil")
+	}
+	if !strings.Contains(err.Error(), "channel-binding") {
+		t.Fatalf("got %q, want a channel-binding attribute error", err)
+	}
+	// It must be caught by the c= check, not the proof check.
+	if _, ok := err.(ErrInvalidPassword); ok {
+		t.Fatalf("flag mismatch leaked to the proof check (got ErrInvalidPassword) instead of failing at c=")
+	}
+}
+
+// TestSCRAMExchangeAcceptsYFlag verifies the legitimate 'y' gs2-cbind-flag
+// path (client supports binding, server offered no PLUS mechanism) still
+// completes a full handshake — i.e. tying c= to the original flag did not
+// break the valid non-'n' case.
+func TestSCRAMExchangeAcceptsYFlag(t *testing.T) {
+	const username, password = "alice", "hunter2"
+	secret, err := NewSCRAMSecret(password)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := NewSCRAMServer(username, secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	clientNonce := "rOprNGfwEbeRWgbNEkqO"
+	clientFirstBare := "n=" + username + ",r=" + clientNonce
+	clientFirst := "y,," + clientFirstBare // gs2-cbind-flag 'y'
+
+	serverFirstBytes, done, err := srv.Step([]byte(clientFirst))
+	if err != nil || done {
+		t.Fatalf("Step1: err=%v done=%v", err, done)
+	}
+	serverFirst := string(serverFirstBytes)
+	attrs, err := parseSCRAMAttrs(serverFirst)
+	if err != nil {
+		t.Fatalf("parse server-first: %v", err)
+	}
+	combinedNonce := attrs["r"]
+	salt, _ := base64.StdEncoding.DecodeString(attrs["s"])
+	iter := 0
+	for _, c := range attrs["i"] {
+		iter = iter*10 + int(c-'0')
+	}
+
+	saltedPassword := pbkdf2HMACSHA256([]byte(password), salt, iter, scramKeyLen)
+	clientKey := hmacSHA256(saltedPassword, []byte("Client Key"))
+	storedKey := sha256Sum(clientKey)
+	gs2Header := base64.StdEncoding.EncodeToString([]byte("y,,")) // MUST echo 'y'
+	clientFinalWithoutProof := "c=" + gs2Header + ",r=" + combinedNonce
+	authMessage := clientFirstBare + "," + serverFirst + "," + clientFinalWithoutProof
+	clientSignature := hmacSHA256(storedKey, []byte(authMessage))
+	clientProof := xor(clientKey, clientSignature)
+	clientFinal := clientFinalWithoutProof + ",p=" + base64.StdEncoding.EncodeToString(clientProof)
+
+	serverFinal, done, err := srv.Step([]byte(clientFinal))
+	if err != nil {
+		t.Fatalf("Step2: %v", err)
+	}
+	if !done {
+		t.Fatal("Step2: done=false")
+	}
+	if !strings.HasPrefix(string(serverFinal), "v=") {
+		t.Fatalf("server-final missing v=: %s", serverFinal)
+	}
+}
+
 // TestSCRAMExchangeRejectsBadProof: a wrong client proof yields
 // ErrInvalidPassword from Step.
 func TestSCRAMExchangeRejectsBadProof(t *testing.T) {

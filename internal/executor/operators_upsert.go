@@ -210,7 +210,7 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 		for _, tgtIdx := range o.plan.ColumnIndex {
 			upsertMissing[tgtIdx] = false
 		}
-		applyDefaultsForMissing(parentCols, inserted, upsertMissing)
+		applyDefaultsForMissing(parentCols, inserted, upsertMissing, ctxSeqDBOid(o.ctx))
 		autoGenerateSerialValues(o.ctx, o.plan.Table.Name, parentCols, inserted, upsertMissing)
 		// Clear the speculative-insert index-key cache so a later source row
 		// that conflicts directly (no speculative insert) cannot wrongly reuse
@@ -604,7 +604,7 @@ func (o *upsertOp) resolveLeafArbiter(leaf *catalog.Table) *catalog.Index {
 	if parentIdx == nil || o.ctx.Catalog == nil {
 		return nil
 	}
-	for _, idx := range o.ctx.Catalog.IndexesOnTable(leaf) {
+	for _, idx := range o.ctx.Catalog.IndexesOnTable(leaf, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 		if parentIdx.Primary && !idx.Primary {
 			continue
 		}
@@ -1146,7 +1146,7 @@ func (o *upsertOp) onConflictUpdateTouchesKeyColumn() bool {
 	if len(setCols) == 0 {
 		return false
 	}
-	for _, idx := range o.ctx.Catalog.IndexesOnTable(tbl) {
+	for _, idx := range o.ctx.Catalog.IndexesOnTable(tbl, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 		if idx == nil || (!idx.Unique && !idx.Primary) {
 			continue
 		}
@@ -1190,7 +1190,7 @@ func (o *upsertOp) maintainNonArbiterIndexesCapture(tbl *catalog.Table, cols []c
 		return nil
 	}
 	captured := make(map[uint32][]byte)
-	for _, idx := range o.ctx.Catalog.IndexesOnTable(tbl) {
+	for _, idx := range o.ctx.Catalog.IndexesOnTable(tbl, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 		if skipOID != 0 && idx.OID == skipOID {
 			continue
 		}
@@ -1224,7 +1224,7 @@ func (o *upsertOp) maintainNonArbiterIndexesForUpdate(tbl *catalog.Table, cols [
 	if o.ctx.Catalog == nil || o.ctx.Pool == nil {
 		return
 	}
-	for _, idx := range o.ctx.Catalog.IndexesOnTable(tbl) {
+	for _, idx := range o.ctx.Catalog.IndexesOnTable(tbl, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 		if skipOID != 0 && idx.OID == skipOID {
 			continue
 		}

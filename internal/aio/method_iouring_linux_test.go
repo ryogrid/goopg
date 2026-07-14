@@ -7,8 +7,10 @@
 package aio
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 )
 
@@ -130,5 +132,128 @@ func TestEngineIOUringParallel(t *testing.T) {
 		if got[0] != byte(i) || got[1] != byte(i>>8) || got[2] != 0xCA || got[3] != 0xFE {
 			t.Errorf("block %d corrupt: %v", i, got)
 		}
+	}
+}
+
+// checksumFile wraps *os.File with a trivial last-byte-XOR
+// "checksum" and counts PrepareWrite/VerifyRead calls, so tests
+// can prove the io_uring raw-fd path (fdHaver) actually invokes
+// the ChecksumFile hooks instead of silently bypassing them —
+// which is exactly what storage.relFile needs when data-page
+// checksums are enabled (see ChecksumFile's doc comment in
+// aio.go).
+type checksumFile struct {
+	*os.File
+	prepareCalls atomic.Int32
+	verifyCalls  atomic.Int32
+}
+
+func xorChecksum(payload []byte) byte {
+	var c byte
+	for _, b := range payload {
+		c ^= b
+	}
+	return c
+}
+
+func (f *checksumFile) PrepareWrite(buf []byte, off int64) []byte {
+	f.prepareCalls.Add(1)
+	out := make([]byte, len(buf))
+	copy(out, buf)
+	if len(out) > 0 {
+		out[len(out)-1] = xorChecksum(out[:len(out)-1])
+	}
+	return out
+}
+
+func (f *checksumFile) VerifyRead(buf []byte, off int64) error {
+	f.verifyCalls.Add(1)
+	if len(buf) == 0 {
+		return nil
+	}
+	if buf[len(buf)-1] != xorChecksum(buf[:len(buf)-1]) {
+		return errors.New("checksum mismatch")
+	}
+	return nil
+}
+
+// TestEngineIOUringChecksumFileHooks confirms the io_uring
+// method's raw-fd submission calls PrepareWrite before handing
+// bytes to the kernel for a write, and VerifyRead after a
+// completed read — the two hooks storage.relFile relies on since
+// this path bypasses File.WriteAt/ReadAt (and their inline
+// checksum stamping/verification) entirely. Without this wiring,
+// a checksummed cluster running io_method=io_uring would persist
+// stale checksums on every AIO write and skip verification on
+// every AIO read.
+func TestEngineIOUringChecksumFileHooks(t *testing.T) {
+	e, err := NewEngine(EngineConfig{Method: MethodIOUring, MaxConcurrency: 8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	if e.Method() != MethodIOUring {
+		t.Skipf("io_uring unsupported on this host (engine.Method=%q)", e.Method())
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "iouring_cksum.dat")
+	osf, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer osf.Close()
+	if err := osf.Truncate(16); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+	cf := &checksumFile{File: osf}
+
+	// Payload leaves buf's last byte zero; PrepareWrite's copy
+	// stamps the real checksum there, so comparing the on-disk
+	// last byte against a raw read (bypassing ChecksumFile)
+	// proves the *stamped* bytes were what actually got written,
+	// not the caller's untouched buf.
+	buf := make([]byte, 16)
+	copy(buf, "hello io_uring")
+	wh := e.Submit(Op{File: cf, Buffer: buf, Offset: 0, Direction: DirWrite})
+	if r := wh.Wait(); r.Err != nil || r.N != len(buf) {
+		t.Fatalf("write Wait=%+v want N=%d nil", r, len(buf))
+	}
+	if got := cf.prepareCalls.Load(); got != 1 {
+		t.Errorf("PrepareWrite calls=%d want 1", got)
+	}
+	if buf[15] != 0 {
+		t.Fatalf("test invariant broken: buf mutated by PrepareWrite (must return a copy): %v", buf)
+	}
+
+	raw := make([]byte, 16)
+	if _, err := osf.ReadAt(raw, 0); err != nil {
+		t.Fatalf("raw ReadAt: %v", err)
+	}
+	if raw[15] != xorChecksum(raw[:15]) {
+		t.Fatalf("stamped checksum not persisted to disk: %v", raw)
+	}
+
+	got := make([]byte, 16)
+	rh := e.Submit(Op{File: cf, Buffer: got, Offset: 0, Direction: DirRead})
+	if r := rh.Wait(); r.Err != nil || r.N != len(got) {
+		t.Fatalf("read Wait=%+v want N=%d nil", r, len(got))
+	}
+	if got := cf.verifyCalls.Load(); got != 1 {
+		t.Errorf("VerifyRead calls=%d want 1", got)
+	}
+
+	// Corrupt the on-disk bytes directly (bypassing ChecksumFile,
+	// mimicking on-disk bit rot) and confirm the next io_uring
+	// read surfaces VerifyRead's mismatch as the Result's error.
+	corrupt := append([]byte(nil), raw...)
+	corrupt[0] ^= 0xFF
+	if _, err := osf.WriteAt(corrupt, 0); err != nil {
+		t.Fatalf("corrupt WriteAt: %v", err)
+	}
+	got2 := make([]byte, 16)
+	rh2 := e.Submit(Op{File: cf, Buffer: got2, Offset: 0, Direction: DirRead})
+	if r := rh2.Wait(); r.Err == nil {
+		t.Error("read of corrupted block: want a checksum-verification error, got nil")
 	}
 }

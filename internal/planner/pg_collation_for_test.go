@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // TestPgCollationForFolds verifies pg_collation_for(expr) is folded at plan
@@ -14,6 +15,16 @@ import (
 func TestPgCollationForFolds(t *testing.T) {
 	cat := pgbenchCatalog(t)
 	if _, err := cat.(*catalog.InMemory).RegisterDomain("text_domain", catalog.Type{Name: "text"}, false); err != nil {
+		t.Fatal(err)
+	}
+	// A table with explicit column-level COLLATE clauses so pg_collation_for(col)
+	// can report the column's declared collation rather than the type default.
+	if _, err := cat.(*catalog.InMemory).CreateTable(parser.ObjectName{Name: "collated_tbl"}, []catalog.Column{
+		{Name: "c_plain", Type: catalog.Type{Name: "text"}},
+		{Name: "c_ub", Type: catalog.Type{Name: "text"}, Collation: "ucs_basic"},
+		{Name: "c_c", Type: catalog.Type{Name: "text"}, Collation: "C"},
+		{Name: "n", Type: catalog.Type{Name: "int4"}},
+	}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -33,6 +44,12 @@ func TestPgCollationForFolds(t *testing.T) {
 		{name: "array of text is collatable like its element", sql: `SELECT pg_collation_for('{a,b}'::text[])`, wantValue: "default"},
 		{name: "array of name follows name's C collation", sql: `SELECT pg_collation_for(ARRAY['a','b']::name[])`, wantValue: "C"},
 		{name: "array of non-collatable element type errors 42804", sql: `SELECT pg_collation_for('{1,2}'::int4[])`, wantErr: "42804"},
+		// Column-level explicit COLLATE clauses are reflected verbatim (quoted
+		// per generate_collation_name) instead of the text default.
+		{name: "column with explicit lowercase COLLATE is bare", sql: `SELECT pg_collation_for(c_ub) FROM collated_tbl`, wantValue: "ucs_basic"},
+		{name: "column with explicit COLLATE C is quoted", sql: `SELECT pg_collation_for(c_c) FROM collated_tbl`, wantValue: `"C"`},
+		{name: "collatable column without explicit COLLATE is default", sql: `SELECT pg_collation_for(c_plain) FROM collated_tbl`, wantValue: "default"},
+		{name: "qualified column with explicit COLLATE", sql: `SELECT pg_collation_for(collated_tbl.c_ub) FROM collated_tbl`, wantValue: "ucs_basic"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

@@ -191,3 +191,66 @@ func TestChecksumNewPageSkipped(t *testing.T) {
 		t.Fatalf("new page got pd_checksum=%#x, want 0", MustHeader(out).Checksum())
 	}
 }
+
+// TestChecksumRelFilePrepareWriteVerifyRead exercises relFile's
+// PrepareWrite/VerifyRead directly. These implement
+// aio.ChecksumFile (structurally — storage does not import
+// internal/aio) so the io_uring AIO method's raw-fd submission
+// path (which bypasses WriteAt/ReadAt and their inline checksum
+// stamping/verification entirely) still gets the same checksum
+// semantics as the synchronous path. A regression here would let
+// io_method=io_uring persist stale checksums or skip verification
+// while every other Manager entry point stayed correct — see
+// storage/aio-relfile-mu-bypass in .ralph/fix_plan.md.
+func TestChecksumRelFilePrepareWriteVerifyRead(t *testing.T) {
+	dir := t.TempDir()
+	mgr := NewManager(ManagerConfig{DataDir: dir, ChecksumsEnabled: true})
+	defer mgr.Close()
+
+	rel := RelFileNode{DBOid: 1, RelOid: 106, Fork: MainFork}
+	page := makeDataPage(0x7C)
+	blk, err := mgr.Extend(rel, page)
+	if err != nil {
+		t.Fatalf("Extend: %v", err)
+	}
+	f, err := mgr.relFile(rel)
+	if err != nil {
+		t.Fatalf("relFile: %v", err)
+	}
+	off := int64(blk) * BlockSize
+
+	before := MustHeader(page).Checksum()
+	stamped := f.PrepareWrite(page, off)
+	if got := MustHeader(page).Checksum(); got != before {
+		t.Fatalf("PrepareWrite mutated caller buffer: %#x -> %#x", before, got)
+	}
+	if !VerifyPage(stamped, blk) {
+		t.Fatal("PrepareWrite's stamped copy does not verify against VerifyPage")
+	}
+	if err := f.VerifyRead(stamped, off); err != nil {
+		t.Fatalf("VerifyRead rejected a correctly-stamped page: %v", err)
+	}
+
+	corrupt := append([]byte(nil), stamped...)
+	corrupt[0] ^= 0xFF
+	var cerr *ChecksumError
+	if err := f.VerifyRead(corrupt, off); !errors.As(err, &cerr) {
+		t.Fatalf("VerifyRead on a corrupted page: got %v, want *ChecksumError", err)
+	} else if cerr.Block != blk {
+		t.Fatalf("ChecksumError.Block = %d, want %d", cerr.Block, blk)
+	}
+
+	// Misaligned offset / non-block-sized buffer: both must be
+	// passed through untouched, mirroring WriteAt/ReadAt's own
+	// off%BlockSize-aligned, full-block-length gate.
+	short := make([]byte, BlockSize/2)
+	if got := f.PrepareWrite(short, off); &got[0] != &short[0] {
+		t.Error("PrepareWrite on a non-block-sized buffer should return it unchanged, got a different slice")
+	}
+	if err := f.VerifyRead(short, off); err != nil {
+		t.Errorf("VerifyRead on a non-block-sized buffer should no-op, got %v", err)
+	}
+	if err := f.VerifyRead(stamped, off+1); err != nil {
+		t.Errorf("VerifyRead on a misaligned offset should no-op, got %v", err)
+	}
+}

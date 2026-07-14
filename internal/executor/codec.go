@@ -10,6 +10,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/mctx"
+	"github.com/goopg/goopg/internal/pglz"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -387,38 +388,66 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 		return buf[:], nil
 	case "timestamp", "timestamptz":
 		if d.Kind == KindString {
-			t, err := parseCopyTimestamp(d.StringValue())
-			if err != nil {
-				return nil, &ExecError{Code: "22007", Pos: 0, Message: fmt.Sprintf("invalid input syntax for type timestamp: %q", d.StringValue())}
+			// 'infinity' / '-infinity' have no finite time.Time (#5(d-iv)).
+			if inf, ok := parseTimestampInfinityLiteral(d.StringValue()); ok {
+				d = inf
+			} else {
+				t, err := parseCopyTimestamp(d.StringValue())
+				if err != nil {
+					return nil, &ExecError{Code: "22007", Pos: 0, Message: fmt.Sprintf("invalid input syntax for type timestamp: %q", d.StringValue())}
+				}
+				d = NewTimeDatum(t.UTC())
 			}
-			d = NewTimeDatum(t.UTC())
 		}
 		if d.Kind != KindTime {
 			return nil, fmt.Errorf("expected time, got kind %d", d.Kind)
 		}
-		t := d.TimeValue()
-		// PG epoch: 2000-01-01 UTC, in microseconds
-		// goopg stores UnixNano internally; we encode PG-compatible
-		// microseconds since PG epoch.
-		micros := t.UnixMicro() - pgEpochUnixMicros
+		// PG epoch: 2000-01-01 UTC, in microseconds. goopg stores UnixNano
+		// internally; we encode PG-compatible microseconds since the PG epoch.
+		// The ±infinity sentinels serialise to PG's DT_NOEND / DT_NOBEGIN wire
+		// value = PG_INT64_MAX / PG_INT64_MIN micros (timestamp_send). (#5(d-iv))
+		var micros int64
+		switch {
+		case d.IsTimestampPosInf():
+			micros = math.MaxInt64
+		case d.IsTimestampNegInf():
+			micros = math.MinInt64
+		default:
+			micros = d.TimeValue().UnixMicro() - pgEpochUnixMicros
+		}
 		var buf [8]byte
 		binary.LittleEndian.PutUint64(buf[:], uint64(micros))
 		return buf[:], nil
 	case "date":
 		if d.Kind == KindString {
-			t, err := parseCopyTimestamp(d.StringValue())
-			if err != nil {
-				return nil, &ExecError{Code: "22007", Pos: 0, Message: fmt.Sprintf("invalid input syntax for type date: %q", d.StringValue())}
+			// 'infinity' / '-infinity' have no finite time.Time (#5(d-iv)).
+			if inf, ok := parseDateInfinityLiteral(d.StringValue()); ok {
+				d = inf
+			} else {
+				t, err := parseCopyTimestamp(d.StringValue())
+				if err != nil {
+					return nil, &ExecError{Code: "22007", Pos: 0, Message: fmt.Sprintf("invalid input syntax for type date: %q", d.StringValue())}
+				}
+				d = NewTimeDatum(t.UTC())
 			}
-			d = NewTimeDatum(t.UTC())
 		}
 		if d.Kind != KindTime {
 			return nil, fmt.Errorf("expected time, got kind %d", d.Kind)
 		}
-		// PG date: days since 2000-01-01 (Julian-style)
-		t := d.TimeValue()
-		micros := t.UnixMicro() - pgEpochUnixMicros
-		days := int32(micros / (24 * 3600 * 1000000))
+		// PG date: days since 2000-01-01 (Julian-style). The ±infinity sentinels
+		// serialise to PG's DATEVAL_NOEND / DATEVAL_NOBEGIN wire value =
+		// PG_INT32_MAX / PG_INT32_MIN days (date_send). (#5(d-iv))
+		var days int32
+		switch {
+		case d.IsTimestampPosInf():
+			days = math.MaxInt32
+		case d.IsTimestampNegInf():
+			days = math.MinInt32
+		default:
+			t := d.TimeValue()
+			micros := t.UnixMicro() - pgEpochUnixMicros
+			days = int32(micros / (24 * 3600 * 1000000))
+		}
 		var buf [4]byte
 		binary.LittleEndian.PutUint32(buf[:], uint32(days))
 		return buf[:], nil
@@ -1092,6 +1121,15 @@ func decodePhysicalPGValueMctx(t catalog.Type, data []byte, sctx *mctx.Context) 
 			return Datum{}, 0, fmt.Errorf("truncated timestamp")
 		}
 		micros := int64(binary.LittleEndian.Uint64(data[:8]))
+		// PG's DT_NOEND / DT_NOBEGIN sentinels (PG_INT64_MAX / PG_INT64_MIN
+		// micros) decode to the ±infinity KindTime carrier; adding the epoch
+		// offset would overflow, so intercept first. (unimplemented_feat #5(d-iv))
+		switch micros {
+		case math.MaxInt64:
+			return NewTimestampInfinity(true), 8, nil
+		case math.MinInt64:
+			return NewTimestampInfinity(false), 8, nil
+		}
 		return NewTimeDatum(time.UnixMicro(micros + pgEpochUnixMicros).UTC()), 8, nil
 	case "date":
 		// encodeValuePG stores 4-byte LE days since the PG epoch. M0111-0004.
@@ -1099,8 +1137,22 @@ func decodePhysicalPGValueMctx(t catalog.Type, data []byte, sctx *mctx.Context) 
 			return Datum{}, 0, fmt.Errorf("truncated date")
 		}
 		days := int32(binary.LittleEndian.Uint32(data[:4]))
+		// PG's DATEVAL_NOEND / DATEVAL_NOBEGIN sentinels (PG_INT32_MAX /
+		// PG_INT32_MIN days) decode to the ±infinity DATE carrier; the epoch
+		// arithmetic below would overflow, so intercept first. (#5(d-iv))
+		switch days {
+		case math.MaxInt32:
+			return NewDateInfinity(true), 4, nil
+		case math.MinInt32:
+			return NewDateInfinity(false), 4, nil
+		}
 		micros := int64(days)*24*3600*1000000 + pgEpochUnixMicros
-		return NewTimeDatum(time.UnixMicro(micros).UTC()), 4, nil
+		// Tag as DATE (flagDate) so a storage-decoded date renders identically
+		// to a date literal in type-agnostic paths (Datum.Format(): text casts,
+		// string concat, array/composite element rendering). The wire path
+		// (server dispatch) re-derives date formatting from the column type and
+		// is unaffected. M0003 / 0003-0013 KindDate carrier gap.
+		return NewDateDatum(time.UnixMicro(micros).UTC()), 4, nil
 	case "time":
 		if len(data) < 8 {
 			return Datum{}, 0, fmt.Errorf("truncated time")
@@ -1313,7 +1365,9 @@ func decodePhysicalPGVarlena(data []byte) ([]byte, int, error) {
 		return nil, 0, fmt.Errorf("truncated 4-byte varlena header")
 	}
 	if header&0x03 == 0x02 {
-		return nil, 0, fmt.Errorf("compressed varlena not supported")
+		// VARATT_IS_4B_C: inline PGLZ-compressed varlena. Decompress to the
+		// original payload (mirrors wal.pgoDecodePhysicalVarlena).
+		return pglz.DecodeInlineCompressed(data)
 	}
 	total := int(binary.LittleEndian.Uint32(data[:4]) >> 2)
 	if total < 4 || total > len(data) {

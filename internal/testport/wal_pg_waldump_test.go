@@ -86,6 +86,20 @@ CHECKPOINT;
 	t.Logf("found %d WAL segment(s); running pg_waldump", len(segs))
 
 	for i, seg := range segs {
+		// Skip an all-zero, never-written segment. With wal_init_zero=on
+		// (goopg's default) the writer eagerly preallocates the NEXT
+		// segment as a full-size zero-filled file when the current one
+		// opens, so a trailing all-zero phantom persists across a clean
+		// shutdown, exactly as in real PostgreSQL. pg_waldump reads the
+		// segment size from the long page header's xlp_seg_size; on an
+		// all-zero segment that field is 0 and it fatally reports
+		// `invalid WAL segment size ... (0 bytes)`. That is expected for a
+		// preallocated tail (real pg_waldump errors identically) and
+		// carries no records, so it must not fail the round-trip.
+		if segmentIsAllZero(t, filepath.Join(walDir, seg)) {
+			t.Logf("segment %d/%d (%s): all-zero preallocated tail, skipping", i+1, len(segs), seg)
+			continue
+		}
 		res, _ := util.RunCommand(util.CommandSpec{
 			Name:    waldump,
 			Args:    []string{"--quiet", "-p", walDir, seg},

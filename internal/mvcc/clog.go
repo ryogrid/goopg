@@ -57,19 +57,6 @@ type CLog struct {
 	// completes; nil during recovery so replay does not re-append. nil-safe.
 	truncateLogger func(oldestXid storage.TransactionID) error
 
-	// --- M0117-0005: incremental flush + group commit (gap G7) ---
-
-	// flushMu is the single serialisation point for durable writes to the SLRU.
-	// The group-commit leader (clog_groupcommit.go) holds it while applying a
-	// batch; EnablePGSLRUMirror holds it while promoting the pool so a
-	// concurrent leader cannot interleave with the promotion.
-	flushMu sync.Mutex
-
-	// groupHead is the head of the lock-free group-commit stack (Treiber stack),
-	// mirroring PG's ProcGlobal->clogGroupFirst. Zero value (nil) means the
-	// group is empty. See clog_groupcommit.go.
-	groupHead atomic.Pointer[clogGroupNode]
-
 	// --- M0117-0006: SLRU buffer pool is the sole in-memory store (Part B/C) ---
 
 	// pool is the bounded LRU page cache (clog_bufferpool.go) that IS the CLOG
@@ -505,7 +492,7 @@ func (c *CLog) setStatusWithLSN(xid storage.TransactionID, status TxnStatus, lsn
 	}
 	// Write the 2-bit lane (clear-then-set, PG-faithful) into the resident
 	// page. An idempotent lane (already at this terminal value) skips the
-	// group-commit round-trip below entirely.
+	// dirty-mark bookkeeping below entirely.
 	changed, err := p.setStatusWithLSN(xid, status, lsn)
 	if err != nil {
 		return err
@@ -513,27 +500,19 @@ func (c *CLog) setStatusWithLSN(xid storage.TransactionID, status TxnStatus, lsn
 	if !changed {
 		return nil
 	}
-	if lsn != 0 {
-		// Async commit (M0117-0007 Part B continuation, gap G8 latency
-		// reduction): p.setStatusWithLSN above already marked the page dirty
-		// and raised its async-commit group LSN, which is enough for
-		// GetStatus (in-memory) to observe the new status right away. Skip
-		// the group-commit leader's eager durable write-back
-		// (applyGroupBatchLocked → pool.flushDirty, a synchronous fsync round
-		// trip) that a *synchronous* commit needs to return a durability
-		// guarantee to its caller — an async commit makes no such promise.
-		// The page's actual write-back is deferred to whichever happens
-		// first: a later synchronous commit's group-commit flush (which
-		// drains every currently-dirty page, not just its own), LRU
-		// eviction (pinPageLocked already barrier-guards a dirty victim), or
-		// the checkpointer's FlushAll (see CLog.FlushAll, registered as a
-		// wal.DirtyPageFlusher so a dirty async-committed page is never left
-		// unbounded between checkpoints). This is the change that removes
-		// the fsync round trip from a synchronous_commit=off commit's
-		// critical path.
-		return nil
-	}
-	return c.groupUpdate(xid, status)
+	// C2-S4: NO stamp performs an eager durable write-back any more —
+	// p.setStatusWithLSN above marked the page dirty (and, for lsn != 0,
+	// raised its group LSN so the SLRU write barrier flushes the WAL first),
+	// which is all GetStatus needs. The page reaches disk at whichever
+	// flush point comes first: LRU eviction (pinPageLocked barrier-guards a
+	// dirty victim) or the checkpointer's FlushAll (registered as a
+	// wal.DirtyPageFlusher, so residency is bounded by checkpoint_timeout).
+	// Startup replayCLogFromWAL reconstructs anything lost in a crash from
+	// the durable commit/abort records (C2-S3). This mirrors PG exactly:
+	// TransactionIdSetPageStatus sets bits under the bank lock with zero
+	// I/O. The M0117-0005 group-commit machinery that amortized the old
+	// eager fsync was deleted with it (C2 design D4).
+	return nil
 }
 
 // FlushAll writes every dirty resident CLOG page back to its segment file,
@@ -603,11 +582,12 @@ func (c *CLog) EnablePGSLRUMirror(dir string) error {
 	// banks/flat-file staging step or backfill round-trip. It lazily faults
 	// pages in directly from dir on first read (already exercised by
 	// TestCLOGBufferPoolLRUEviction/RoundTripAllLanes), so there is no separate
-	// load step to run before it exists. flushMu serialises the promotion
-	// against any in-flight group-commit leader.
-	c.flushMu.Lock()
+	// load step to run before it exists. (The flushMu that used to bracket
+	// this store guarded the M0117-0005 group-commit leader, deleted in
+	// C2-S4; production calls EnablePGSLRUMirror exactly once at startup,
+	// before the server accepts connections, and pool is an
+	// atomic.Pointer.)
 	c.pool.Store(newCLOGBufferPool(dir, EffectiveCLOGBuffers(c.clogBuffers, 0)))
-	c.flushMu.Unlock()
 	return nil
 }
 

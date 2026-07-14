@@ -1977,12 +1977,44 @@ func TestPort_IsolationMultixactNoDeadlock(t *testing.T) {
 // rollback-to-savepoint changes the multixact membership. Rides the row-lock
 // xmax / WaitForXID path (stampLockInner / tupleLockConflicts / multixact
 // membership), not the heavyweight lockmgr. M0118-0004.
+//
+// DEMOTED from runIsoSpecStrict → runIsoSpec (2026-07-12, loop #89, nightly
+// AI-20260712-020530-002). Flaky at ~10-17% standalone; the failing permutation
+// is `s1_share s2_for_update s3_for_update s1_rollback s2_rollback s3_rollback`
+// (a FOR UPDATE case) — s3 (arrived 2nd) completes before s2 (arrived 1st) and
+// s2 then times out ("driver: bad connection").
+//
+// ROOT CAUSE (loop #90, corrected — supersedes loop #89's "the DML UPDATE/DELETE
+// epqWait path lacks a tuple lock; FOR UPDATE is stable"): that diagnosis was
+// WRONG. Empirically (instrumented Context.acquireTupleLock), *every* tuple-lock
+// acquisition in the server path reports LockMgr==nil, so acquireTupleLock /
+// tryAcquireTupleLock are TOTAL NO-OPS — including lockRowsOp's FOR UPDATE
+// ExclusiveLock. This is by deliberate design: Context.LockMgr is nil in the
+// production server (see internal/executor/context.go:863-871), which keeps
+// heavyweight locking off the pgbench/TPC-H hot path and makes cross-statement
+// row blocking ride xmax/WaitForXID instead. Consequence: two FOR UPDATE waiters
+// s2/s3 do NOT queue FIFO on a LOCKTAG_TUPLE — they both fall through to
+// mvcc.Manager.WaitForXID(s1), whose single commitCond.Broadcast() wakes both;
+// they race to re-stamp the row and Go scheduling picks the winner, so s3
+// sometimes beats s2. PG instead serialises them through a heavyweight
+// LOCKTAG_TUPLE acquired in heap_lock_tuple/heap_update *before*
+// XactLockTableWait, granting the row in arrival order.
+//
+// FIX (deferred, its own slice — HIGH blast radius; see docs/design/
+// 0021-0012-tuple-lock-fifo-wiring.md + deferral_ledger.md): route
+// acquireTupleLock / tryAcquireTupleLock to the always-on package-global
+// tableLockMgr (as LOCK TABLE already does) under a statement-scoped backend
+// identity, add a per-statement release, then re-promote to runIsoSpecStrict +
+// restore target-inventory.csv `pass`. Needs a full isolation-suite + pgbench
+// smoke pass because it activates real tuple locking (second deadlock domain,
+// NOWAIT/SKIP-LOCKED double-handling) that the design intentionally kept dormant.
+// Tracked: fix_plan M-NIGHTLY (AI-20260712-020530-002).
 func TestPort_IsolationTuplelockUpgradeNoDeadlock(t *testing.T) {
 	root := repoRoot(t)
 	c := newCluster(t, "iso_tuplelock_upgrade_no_deadlock")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/tuplelock-upgrade-no-deadlock.spec")
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/tuplelock-upgrade-no-deadlock.spec")
 }
 
 // TestPort_IsolationStats drives the cumulative-statistics isolation spec

@@ -349,6 +349,16 @@ func (c *Cluster) WaitForStatus(want int, timeout time.Duration) error {
 	return fmt.Errorf("wait for status=%d: got status=%d (%s)", want, code, msg)
 }
 
+// libpqEnv returns the LD_LIBRARY_PATH override needed for the in-tree
+// psql/pgbench binaries (postgres/local_install/bin) to resolve symbols
+// against their own bundled libpq rather than an incompatible system
+// libpq.so first on the dynamic linker's search path (e.g. a pre-pipeline-
+// mode libpq missing PQsendPipelineSync, which fails with a "symbol lookup
+// error" the first time it's lazily bound rather than at process start).
+func (c *Cluster) libpqEnv() string {
+	return "LD_LIBRARY_PATH=" + filepath.Join(c.repoRoot, "postgres", "local_install", "lib")
+}
+
 // PSQL runs a foreground psql command against this cluster.
 func (c *Cluster) PSQL(args ...string) (util.CommandResult, error) {
 	host, port, err := splitHostPort(c.listenAddr)
@@ -361,7 +371,27 @@ func (c *Cluster) PSQL(args ...string) (util.CommandResult, error) {
 		Name:    c.psqlPath,
 		Args:    base,
 		Dir:     c.repoRoot,
-		Env:     []string{"PGPASSWORD="},
+		Env:     []string{"PGPASSWORD=", c.libpqEnv()},
+		Timeout: 30 * time.Second,
+	})
+}
+
+// PSQLWithPassword runs psql like PSQL, but with a caller-supplied
+// PGPASSWORD instead of the default empty one — for exercising
+// password-based auth methods (SCRAM/MD5) end-to-end against a real libpq
+// client rather than lib/pq's Go reimplementation.
+func (c *Cluster) PSQLWithPassword(password string, args ...string) (util.CommandResult, error) {
+	host, port, err := splitHostPort(c.listenAddr)
+	if err != nil {
+		return util.CommandResult{}, err
+	}
+	base := []string{"-h", host, "-p", port, "-U", c.user, "-d", c.database}
+	base = append(base, args...)
+	return util.RunCommand(util.CommandSpec{
+		Name:    c.psqlPath,
+		Args:    base,
+		Dir:     c.repoRoot,
+		Env:     []string{"PGPASSWORD=" + password, c.libpqEnv()},
 		Timeout: 30 * time.Second,
 	})
 }
@@ -378,7 +408,7 @@ func (c *Cluster) PGbench(args ...string) (util.CommandResult, error) {
 		Name:    c.pgbenchPath,
 		Args:    base,
 		Dir:     c.repoRoot,
-		Env:     []string{"PGPASSWORD="},
+		Env:     []string{"PGPASSWORD=", c.libpqEnv()},
 		Timeout: 120 * time.Second,
 	})
 }
@@ -393,7 +423,7 @@ func (c *Cluster) StartPSQL(args []string, stdin string) (*BackgroundPSQL, error
 	base = append(base, args...)
 	cmd := exec.Command(c.psqlPath, base...)
 	cmd.Dir = c.repoRoot
-	cmd.Env = append(os.Environ(), "PGPASSWORD=")
+	cmd.Env = append(os.Environ(), "PGPASSWORD=", c.libpqEnv())
 	if stdin != "" {
 		cmd.Stdin = strings.NewReader(stdin)
 	}

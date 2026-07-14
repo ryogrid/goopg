@@ -1,0 +1,14 @@
+RUN_ID=s5c3_s1accept_bdaa325a  scale=100 c=50 T=600 qmode=prepared
+git_head=901390b9
+--- goopg_N pgbench ---
+number of transactions actually processed: 4233627
+latency average = 7.085 ms
+tps = 7056.039837 (without initial connection time)
+--- pkey before ---
+pgbench_accounts_pkey|166526976
+pgbench_branches_pkey|16384
+pgbench_tellers_pkey|40960
+--- pkey after  ---
+pgbench_accounts_pkey|333365248
+pgbench_branches_pkey|16384
+pgbench_tellers_pkey|40960

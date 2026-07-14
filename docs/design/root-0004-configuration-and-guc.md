@@ -340,3 +340,159 @@ showed the `max_connections` restart-required warning and
 `ContextPostmaster` GUCs (e.g. re-binding on a changed `port`) is not
 attempted — matching upstream, those still require a full process
 restart; goopg's reload only reports them.
+
+## Completing the `jit_*` GUC stub family (2026-07-08, M0122-0007)
+
+M0097-0073 registered three JIT-adjacent compatibility stubs (`jit`,
+`jit_above_cost`, `compute_query_id`, `plan_cache_mode`) so scripts
+written against real PostgreSQL don't fail with "unrecognized
+configuration parameter", but upstream's `guc_tables.c` defines nine
+`jit_*` GUCs total — six were still missing:
+`jit_optimize_above_cost`/`jit_inline_above_cost` (real, alongside the
+existing `jit_above_cost`) and `jit_debugging_support`/
+`jit_dump_bitcode`/`jit_expressions`/`jit_profiling_support`/
+`jit_tuple_deforming`/`jit_provider`. All eight now registered in
+`internal/config/defaults.go`, with boot values, `Type`, and
+`Context` copied directly from `guc_tables.c` (`jit_debugging_support`/
+`jit_profiling_support` are `PGC_SU_BACKEND` → `ContextSuBackend`;
+`jit_dump_bitcode` is `PGC_SUSET` → `ContextSuset`; `jit_provider` is
+`PGC_POSTMASTER` → `ContextPostmaster`; the rest are `PGC_USERSET` →
+`ContextUserset`). goopg has no JIT compiler at all — not even a
+consulted-but-inert code path — so, like their three siblings, these
+remain pure enumeration/SET-acceptance stubs with no runtime effect.
+Choosing `ContextSuBackend` for the two `SU_BACKEND` GUCs is
+functionally meaningful despite the "just a stub" framing:
+`SessionRegistry.Set` already rejects any `Context < ContextSuset`
+with `"parameter ... cannot be changed now"`, so `SET
+jit_debugging_support = on` correctly fails the same way it does
+against real PostgreSQL (`SU_BACKEND` GUCs are only settable at
+backend start, never via `SET`), without any new enforcement code.
+`postgresql.conf.sample` gained matching commented-out entries (this
+codebase's `TestSampleConfigCoversRegistry` requires every non-
+`FlagDisallowInFile` registry GUC to appear there, unlike upstream's
+own sample file which omits `GUC_NOT_IN_SAMPLE` entries — a
+deliberate goopg-local stricter convention, not a bug in the test).
+Tests: `TestJitGUCFamilyStubs` (table-driven over all 8, asserting
+boot value/type/context and `SET`-acceptance matching real PG's
+context rules), `TestJitCostGUCsAcceptNegativeOneSentinel` (the two
+new cost GUCs accept upstream's `-1`-disables sentinel and reject
+values below it), both `internal/config/jit_guc_stubs_test.go`
+(confirmed non-vacuous via `git stash` on `defaults.go` +
+`postgresql.conf.sample`). Gates: `go build ./...`/`go vet ./...`
+clean; `go test ./internal/config/...` PASS;
+`go test ./internal/executor/... ./internal/initdb/...` PASS (minus
+the pre-existing, unrelated `TestSeqScanFiresPrefetchesAcrossBlocks`
+hang tracked in the deferral ledger); `scripts/tpch-spotcheck.sh` PASS
+(Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+scripts/ralph-precommit-test.sh` PASS (0 failed txns, all 3
+workloads).
+
+## Follow-up: GEQO + remaining planner-tuning GUC stubs (2026-07-12, M0122-0007)
+
+Registered the last commonly-issued planner-tuning GUCs that were still
+missing from the registry, so a script written against real PostgreSQL
+never trips `unrecognized configuration parameter` on them:
+
+- **GEQO family (`QUERY_TUNING_GEQO`)** — `geqo`, `geqo_threshold`,
+  `geqo_effort`, `geqo_pool_size`, `geqo_generations`,
+  `geqo_selection_bias`, `geqo_seed`.
+- **`QUERY_TUNING_OTHER`** — `constraint_exclusion` (enum
+  `{partition,on,off}`, default `partition`), `cursor_tuple_fraction`
+  (real, 0.1), `recursive_worktable_factor` (real, 10).
+
+All ten are `PGC_USERSET` / `GUC_EXPLAIN` in upstream. Names, boot
+values, types, and numeric bounds mirror
+`postgres/src/backend/utils/misc/guc_tables.c` (GEQO bounds from
+`optimizer/geqo.h`, `cursor_tuple_fraction` from `planmain.h`,
+`recursive_worktable_factor` from `cost.h`). Boot values use the form
+real-PG `SHOW` returns (`geqo_selection_bias` → `2`,
+`recursive_worktable_factor` → `10`, `geqo_seed` → `0`), which the
+matching `postgresql.conf.sample` entries also use so
+`TestSampleConfigCoversRegistry` (sample default must equal registry
+`BootVal`) is satisfied.
+
+These are **accepted-and-ignored** stubs: goopg's planner is
+rule/cost-based and reads none of them, so `SET`/`SHOW` succeed but the
+chosen plan is unchanged — identical to the pre-existing `enable_*`
+toggles. The behavioral no-op (real PG's planner *does* honour these) is
+recorded in the deferral ledger as a deliberate scope boundary.
+
+### `pg_settings` surfacing (2026-07-12, M0122-0007 follow-up)
+
+The initial GEQO landing deferred one half: `pg_catalog.pg_settings` is a
+*separately* hand-curated literal list in
+`internal/catalog/catalog.go` (`pgSettings.VirtualRows`), **not** derived
+from the config registry, so `SHOW geqo_threshold` worked while
+`SELECT * FROM pg_settings WHERE name = 'geqo_threshold'` returned nothing.
+A real-PG-authored monitoring/ORM query reading `pg_settings` would have
+missed every one. This follow-up adds all ten rows (seven
+`QUERY_TUNING_GEQO` + three `QUERY_TUNING_OTHER`) to that list, with
+`name`/`setting`/`category`/`vartype`/`min_val`/`max_val`/`enumvals`/
+`boot_val` byte-for-byte from
+`postgres/src/backend/utils/misc/guc_tables.c` (category strings
+`Query Tuning / Genetic Query Optimizer` and
+`Query Tuning / Other Planner Options`, `short_desc`/`extra_desc` from the
+same `gettext_noop` literals; `constraint_exclusion`'s enumvals render
+`{partition,on,off}`). The list is re-sorted by name after append, so the
+existing sysviews name-sort contract holds. Remaining deferral: the
+*behavioral* no-op (the planner still ignores every value) is unchanged
+and the `pg_settings` list is still not registry-derived (only the GUCs a
+regress/tooling query needs are hand-added).
+
+Tests: `TestGeqoAndPlannerTuningGUCStubs` (boot value/type/USERSET
+context/`SET`-acceptance for all ten) and `TestGeqoTuningGUCBoundsEnforced`
+(out-of-range/invalid-enum `SET` rejected, in-range accepted), both
+`internal/config/geqo_guc_stubs_test.go`; plus
+`TestPgSettingsPlannerTuningGUCs`
+(`internal/catalog/catalog_test.go`) pinning the ten new `pg_settings`
+rows' `setting`/`category`/`vartype`/`boot_val`/`source`/enumvals. Gates:
+`go build ./...`/`go vet ./internal/config/... ./internal/catalog/...`
+clean; `go test ./internal/config/... ./internal/catalog/...` PASS.
+
+## Follow-up: object-creation default GUC stubs (2026-07-12, M0122-0007)
+
+`pg_dump`/`pg_restore` emit a fixed SET preamble before every `CREATE TABLE`
+section:
+
+```
+SET default_tablespace = '';
+SET default_table_access_method = heap;
+```
+
+plus `SET default_toast_compression = 'pglz';` when a column carries a
+non-default compression method. None of these three GUCs
+(`CLIENT_CONN_STATEMENT`, all `PGC_USERSET` in
+`postgres/src/backend/utils/misc/guc_tables.c`) were registered in goopg, so
+replaying a real-PG dump aborted at the first such line with
+`unrecognized configuration parameter`. Registered them as accepted stubs in
+`internal/config/defaults.go` and surfaced them in the hand-curated
+`pg_settings` list (`internal/catalog/catalog.go`), plus
+`internal/config/postgresql.conf.sample` (the `TestSampleConfigCoversRegistry`
+invariant requires every registered GUC there):
+
+- **`default_table_access_method`** — string, boot `heap`
+  (`DEFAULT_TABLE_ACCESS_METHOD`, `access/tableam.h`).
+- **`default_tablespace`** — string, boot `''`.
+- **`default_toast_compression`** — enum `{pglz,lz4}`, boot `pglz`
+  (`TOAST_PGLZ_COMPRESSION`, `access/toast_compression.h`); the `lz4` option
+  matches the reference PG 18.3 `--with-lz4` build and goopg's existing
+  column-level `COMPRESSION lz4` support.
+
+**Behavioral scope (deferred, ledgered):** these are compatibility stubs.
+goopg only implements the `heap` access method, has no real tablespaces, and
+chooses a column's TOAST compression from its own built-in default rather than
+consulting `default_toast_compression`. So a `SET` to the boot value is a true
+no-op and a non-default value is accepted and ignored — the same
+accepted-and-ignored contract as the `enable_*`/GEQO planner stubs. The enum
+*domain* is still enforced (`SET default_toast_compression = 'zstd'` errors),
+matching upstream. Verified end-to-end against the real `cmd/goopg` binary over
+the wire: the three pg_dump-preamble `SET`s all succeed, `SHOW` and
+`pg_settings` report them, `SET ... = 'lz4'` moves the value, and the invalid
+`'zstd'` is rejected.
+
+Tests: `TestObjectDefaultGUCStubs` + `TestObjectDefaultGUCValuesAccepted`
+(`internal/config/object_default_guc_stubs_test.go`);
+`TestPgSettingsObjectDefaultGUCs` (`internal/catalog/catalog_test.go`);
+`TestSampleConfigCoversRegistry` (unchanged, now covers the three new names).
+Gates: `go build ./...` clean; `go test ./internal/config/...
+./internal/catalog/...` PASS; live server SET/SHOW/pg_settings smoke.

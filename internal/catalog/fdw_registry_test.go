@@ -14,7 +14,7 @@ func TestForeignDataWrapperRegistry(t *testing.T) {
 	c := NewInMemory()
 
 	// Empty registry → view is empty (mirrors a fresh server).
-	if rows := c.tables["pg_catalog.pg_foreign_data_wrapper"].VirtualRows(); len(rows) != 0 {
+	if rows := c.ns(DefaultDBOid).tables["pg_catalog.pg_foreign_data_wrapper"].VirtualRows(); len(rows) != 0 {
 		t.Fatalf("empty FDW registry: pg_foreign_data_wrapper has %d rows, want 0", len(rows))
 	}
 
@@ -44,7 +44,7 @@ func TestForeignDataWrapperRegistry(t *testing.T) {
 	// The virtual view exposes the getForeignDataWrappers columns: handler and
 	// validator are 0 (regproc 0 → '-'), acl/options are NULL (empty), owner is
 	// the bootstrap superuser (10).
-	rows := c.tables["pg_catalog.pg_foreign_data_wrapper"].VirtualRows()
+	rows := c.ns(DefaultDBOid).tables["pg_catalog.pg_foreign_data_wrapper"].VirtualRows()
 	if len(rows) != 2 {
 		t.Fatalf("pg_foreign_data_wrapper has %d rows, want 2", len(rows))
 	}
@@ -68,7 +68,7 @@ func TestForeignDataWrapperRegistry(t *testing.T) {
 	if c.DropForeignDataWrapper("myfdw") {
 		t.Fatalf("DropForeignDataWrapper(myfdw) second call returned true")
 	}
-	if rows := c.tables["pg_catalog.pg_foreign_data_wrapper"].VirtualRows(); len(rows) != 1 {
+	if rows := c.ns(DefaultDBOid).tables["pg_catalog.pg_foreign_data_wrapper"].VirtualRows(); len(rows) != 1 {
 		t.Fatalf("after drop: pg_foreign_data_wrapper has %d rows, want 1", len(rows))
 	}
 }
@@ -83,7 +83,7 @@ func TestForeignServerRegistry(t *testing.T) {
 	c := NewInMemory()
 
 	// Empty registry → view is empty (mirrors a fresh server).
-	if rows := c.tables["pg_catalog.pg_foreign_server"].VirtualRows(); len(rows) != 0 {
+	if rows := c.ns(DefaultDBOid).tables["pg_catalog.pg_foreign_server"].VirtualRows(); len(rows) != 0 {
 		t.Fatalf("empty server registry: pg_foreign_server has %d rows, want 0", len(rows))
 	}
 
@@ -111,7 +111,7 @@ func TestForeignServerRegistry(t *testing.T) {
 	// The virtual view exposes the getForeignServers columns: srvfdw resolves to
 	// the FDW OID, srvtype/srvversion/srvacl/srvoptions are NULL (empty), owner is
 	// the bootstrap superuser (10).
-	rows := c.tables["pg_catalog.pg_foreign_server"].VirtualRows()
+	rows := c.ns(DefaultDBOid).tables["pg_catalog.pg_foreign_server"].VirtualRows()
 	if len(rows) != 2 {
 		t.Fatalf("pg_foreign_server has %d rows, want 2", len(rows))
 	}
@@ -144,7 +144,7 @@ func TestForeignServerRegistry(t *testing.T) {
 	// ("{name=value,…}") that pg_dump's pg_options_to_table(srvoptions) expands.
 	// DU-002 slice 378.
 	c.RegisterForeignServer("opt_srv", "goopg_fdw", "", "", []string{"host=localhost", "dbname=mydb"})
-	optView := c.tables["pg_catalog.pg_foreign_server"].VirtualRows()
+	optView := c.ns(DefaultDBOid).tables["pg_catalog.pg_foreign_server"].VirtualRows()
 	var optRow []string
 	for _, r := range optView {
 		if r[1] == "opt_srv" {
@@ -176,7 +176,7 @@ func TestForeignServerRegistry(t *testing.T) {
 	// so pg_dump's dumpForeignServer re-emits the TYPE 'x' / VERSION 'y' clauses.
 	// DU-002 slice 381.
 	c.RegisterForeignServer("tv_srv", "goopg_fdw", "oracle", "12.2", nil)
-	tvView := c.tables["pg_catalog.pg_foreign_server"].VirtualRows()
+	tvView := c.ns(DefaultDBOid).tables["pg_catalog.pg_foreign_server"].VirtualRows()
 	var tvRow []string
 	for _, r := range tvView {
 		if r[1] == "tv_srv" {
@@ -193,7 +193,7 @@ func TestForeignServerRegistry(t *testing.T) {
 	// nil/empty re-register leaves TYPE/VERSION intact; non-empty refreshes them.
 	c.RegisterForeignServer("tv_srv", "goopg_fdw", "", "", nil)
 	c.RegisterForeignServer("tv_srv", "goopg_fdw", "mysql", "8.0", nil)
-	tvView = c.tables["pg_catalog.pg_foreign_server"].VirtualRows()
+	tvView = c.ns(DefaultDBOid).tables["pg_catalog.pg_foreign_server"].VirtualRows()
 	for _, r := range tvView {
 		if r[1] == "tv_srv" {
 			if r[4] != "mysql" || r[5] != "8.0" {
@@ -210,9 +210,60 @@ func TestForeignServerRegistry(t *testing.T) {
 	if c.DropForeignServer("srv1") {
 		t.Fatalf("DropForeignServer(srv1) second call returned true")
 	}
-	if rows := c.tables["pg_catalog.pg_foreign_server"].VirtualRows(); len(rows) != 1 {
+	if rows := c.ns(DefaultDBOid).tables["pg_catalog.pg_foreign_server"].VirtualRows(); len(rows) != 1 {
 		t.Fatalf("after drop: pg_foreign_server has %d rows, want 1", len(rows))
 	}
+}
+
+// TestRegisterForeignServerDuringRecoveryPreservesOID pins the M0122-0007
+// foreign-server registry restart-durability follow-up: replaying a CREATE
+// SERVER WAL record must re-populate the registry with the EXACT OID the
+// pre-restart server assigned, not a freshly minted one — otherwise a
+// dependent user mapping's srvid (resolved once at CREATE USER MAPPING time)
+// would silently point at the wrong row after a restart.
+func TestRegisterForeignServerDuringRecoveryPreservesOID(t *testing.T) {
+	c := NewInMemory()
+	const wantOID = uint32(40777)
+
+	c.RegisterForeignServerDuringRecovery("recovered_srv", "postgres_fdw", "prod", "9.1",
+		[]string{"host=localhost"}, wantOID)
+
+	if got := c.ForeignServerOID("recovered_srv"); got != wantOID {
+		t.Fatalf("ForeignServerOID(recovered_srv) = %d, want %d (OID not preserved)", got, wantOID)
+	}
+	list := c.ListForeignServers()
+	if len(list) != 1 {
+		t.Fatalf("ListForeignServers = %+v, want exactly 1 entry", list)
+	}
+	if list[0].FdwName != "postgres_fdw" || list[0].Type != "prod" || list[0].Version != "9.1" ||
+		len(list[0].Options) != 1 || list[0].Options[0] != "host=localhost" {
+		t.Fatalf("recovered server fields = %+v, want fdw=postgres_fdw type=prod version=9.1 options=[host=localhost]", list[0])
+	}
+
+	// A subsequent fresh (non-recovery) registration must not collide with
+	// the replayed OID — nextOID must have been bumped past it.
+	fresh := c.RegisterForeignServer("fresh_srv", "postgres_fdw", "", "", nil)
+	if fresh.OID <= wantOID {
+		t.Fatalf("fresh RegisterForeignServer minted OID %d, want > recovered OID %d (nextOID not bumped)", fresh.OID, wantOID)
+	}
+}
+
+// TestUnregisterForeignServerDuringRecoveryRemovesEntry is the DROP
+// counterpart.
+func TestUnregisterForeignServerDuringRecoveryRemovesEntry(t *testing.T) {
+	c := NewInMemory()
+	c.RegisterForeignServerDuringRecovery("gone_srv", "postgres_fdw", "", "", nil, 40778)
+	if got := c.ForeignServerOID("gone_srv"); got == 0 {
+		t.Fatalf("setup: ForeignServerOID(gone_srv) = 0, want registered")
+	}
+
+	c.UnregisterForeignServerDuringRecovery("gone_srv")
+
+	if got := c.ForeignServerOID("gone_srv"); got != 0 {
+		t.Fatalf("after UnregisterForeignServerDuringRecovery, ForeignServerOID(gone_srv) = %d, want 0", got)
+	}
+	// Idempotent: unregistering an already-gone name must not panic or error.
+	c.UnregisterForeignServerDuringRecovery("gone_srv")
 }
 
 // TestUserMappingRegistry verifies the user-mapping registry and the
@@ -224,7 +275,7 @@ func TestUserMappingRegistry(t *testing.T) {
 
 	// The view exists and is empty on a fresh server (this is the exit-0 guard:
 	// pg_dump queries pg_user_mappings for every foreign server).
-	umView, ok := c.tables["pg_catalog.pg_user_mappings"]
+	umView, ok := c.ns(DefaultDBOid).tables["pg_catalog.pg_user_mappings"]
 	if !ok {
 		t.Fatalf("pg_user_mappings virtual view is not registered")
 	}

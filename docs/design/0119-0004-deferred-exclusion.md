@@ -149,3 +149,19 @@ commit-time deferral (architecturally entangled — goopg's extended protocol is
 auto-commit-per-statement). With this loop **all four deferrable constraint kinds
 — FK, UNIQUE/PK, UNIQUE NULLS NOT DISTINCT, and EXCLUDE — honour
 `DEFERRABLE INITIALLY DEFERRED` and `SET CONSTRAINTS` at COMMIT.**
+
+### M0122-0023 addendum (2026-07-10): DDL-time type check for `WITH &&`
+
+`checkGistOverlapExclusion` (the `WITH &&` immediate-check branch this doc
+already describes, and `recheckDeferredExclusionOverlap` above) only ever
+understands `box` values. Before this loop, `createExclusionIndexStub`
+(`operators_ddl.go`) accepted `EXCLUDE USING gist (col WITH &&)` on **any**
+column type with no validation at all — a non-box column silently got a
+catalog-registered constraint whose overlap check could never fire (the box
+parse just fails closed on every INSERT, immediate or deferred). It now
+rejects a non-`box` column at CREATE time with `42704` ("data type %s has no
+default operator class for access method %q"), matching PostgreSQL's real
+`indexcmds.c ResolveOpClass` rejection. `WITH =` was unaffected — it was
+already fully type-validated via `createBTreeIndex`. Non-`box` overlap types
+(point/circle/polygon) remain out of scope (`unimplemented_feat.json` #118,
+GiST access method).

@@ -1,5 +1,9 @@
 # 0102-0006 — PostgreSQL Physical WAL Replay on goopg Standby (Stage 1)
 
+> **perf-optimize3-dash S4 note (2026-07-13)**: canonical record CONTENT emission
+> (the records this doc teaches real PG to replay) is gated OFF by default
+> (EmitCanonical / GOOPG_WAL_CANONICAL); goopg→real-PG replay is deferred.
+
 **Status:** draft
 **Date:** 2026-05-15
 **Milestone:** M0102-0006

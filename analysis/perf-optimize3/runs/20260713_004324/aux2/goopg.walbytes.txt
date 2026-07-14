@@ -1,0 +1,4 @@
+drain_bytes_before=0 after=2460934744 delta=2460934744
+number of transactions actually processed: 74566
+latency average = 40.210 ms
+tps = 1243.464271 (without initial connection time)

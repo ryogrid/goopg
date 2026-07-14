@@ -696,6 +696,14 @@ func (r *recordingExecAIOEngine) Submit(op storage.AIOSubmitOp) storage.AIOHandl
 	default:
 		n, err = op.File.ReadAt(op.Buffer, op.Offset)
 	}
+	// Real engines call OnComplete on the completion path
+	// regardless of Wait timing (see AIOSubmitOp.OnComplete);
+	// PrefetchBlock/WriteBlockAIO rely on it to release relFile's
+	// per-block latch (lockBlock). Skipping this wedges the latch
+	// forever the next time anything touches the same block.
+	if op.OnComplete != nil {
+		op.OnComplete()
+	}
 	return execAIOHandle{n: n, err: err}
 }
 

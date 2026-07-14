@@ -193,6 +193,17 @@ func IsHeapTupleXmaxMulti(infomask uint16) bool {
 // this — an all-locker multi never reaches the hook.
 var ResolveMultiUpdater func(xmax TransactionID) (updater TransactionID, hasUpdater bool, resolved bool)
 
+// XidCommitted, when non-nil, reports whether xid COMMITTED (false for
+// aborted, unknown, or in-progress). Installed by initdb.Open from the
+// CLOG (same injection pattern as ResolveMultiUpdater — storage cannot
+// import mvcc). Consulted by TupleDeadToAll (C3-S3 blocker fix B): an
+// ABORTED deleter's xmax stamp survives on the tuple and the oldestXmin
+// horizon advances past the aborted xid freely, so without the commit
+// check prune/VACUUM/the index kill oracle could reclaim a LIVE row (PG's
+// HeapTupleSatisfiesVacuum checks TransactionIdDidCommit). nil (tests,
+// bootstrap) => conservatively NOT dead.
+var XidCommitted func(xid TransactionID) bool
+
 // MovedPartitionsOffsetNumber is the special t_ctid.ip_posid value
 // PostgreSQL stamps on a tuple whose UPDATE moved the row to a
 // different partition (the old version's CTID can't point to the new
@@ -1493,6 +1504,92 @@ func PageGetItemRawNoCopy(p Page, slot uint16) ([]byte, error) {
 		return nil, fmt.Errorf("%w: slot=%d off=%d len=%d", ErrCorruptTuple, slot, off, ln)
 	}
 	return p[off : off+ln], nil
+}
+
+// PageItemIsDead reports whether slot's line pointer carries ItemIDDead
+// (C3: btree LP_DEAD on-access cleanup — hint that the referenced heap
+// tuple is dead to all snapshots). slot is 1-based.
+func PageItemIsDead(p Page, slot uint16) (bool, error) {
+	if slot == 0 {
+		return false, ErrInvalidSlot
+	}
+	count, err := PageLinePointerCount(p)
+	if err != nil {
+		return false, err
+	}
+	idx := int(slot) - 1
+	if idx < 0 || idx >= count {
+		return false, ErrInvalidSlot
+	}
+	item, err := readItemID(p, idx)
+	if err != nil {
+		return false, err
+	}
+	return item.Flags == ItemIDDead, nil
+}
+
+// PageSetItemIDDead flips slot's line pointer to ItemIDDead IN PLACE:
+// offset and length are preserved, so the item bytes remain valid for
+// binary-search ordering until a purge compacts the page (PG keeps
+// LP_DEAD index tuples' storage the same way). The caller must hold the
+// page's exclusive latch; the mark is an UNLOGGED hint (C3 design D2) and
+// the caller must NOT bump pd_lsn for it (D7 — the deferred-mark re-verify
+// keys on the captured page LSN). Btree callers must only mark LEAF
+// entries (C3-S1 review: internal-page structural walks index by
+// first/live item and would corrupt structure on a marked downlink; the
+// S3 marking entry point asserts IsLeaf). slot is 1-based.
+func PageSetItemIDDead(p Page, slot uint16) error {
+	if slot == 0 {
+		return ErrInvalidSlot
+	}
+	count, err := PageLinePointerCount(p)
+	if err != nil {
+		return err
+	}
+	idx := int(slot) - 1
+	if idx < 0 || idx >= count {
+		return ErrInvalidSlot
+	}
+	item, err := readItemID(p, idx)
+	if err != nil {
+		return err
+	}
+	if item.Flags != ItemIDNormal && item.Flags != ItemIDDead {
+		return fmt.Errorf("%w: slot=%d flags=%d", ErrUnsupportedItem, slot, item.Flags)
+	}
+	item.Flags = ItemIDDead
+	return writeItemID(p, idx, item)
+}
+
+// PageGetItemRawAllowDead is PageGetItemRaw except it also reads
+// ItemIDDead slots (a Dead btree item keeps valid key bytes for ordering
+// until a purge removes it — binary-search probes need them). Callers
+// that must not RETURN dead entries check PageItemIsDead separately.
+func PageGetItemRawAllowDead(p Page, slot uint16) ([]byte, error) {
+	if slot == 0 {
+		return nil, ErrInvalidSlot
+	}
+	count, err := PageLinePointerCount(p)
+	if err != nil {
+		return nil, err
+	}
+	idx := int(slot) - 1
+	if idx < 0 || idx >= count {
+		return nil, ErrInvalidSlot
+	}
+	item, err := readItemID(p, idx)
+	if err != nil {
+		return nil, err
+	}
+	if item.Flags != ItemIDNormal && item.Flags != ItemIDDead {
+		return nil, fmt.Errorf("%w: slot=%d flags=%d", ErrUnsupportedItem, slot, item.Flags)
+	}
+	off := int(item.Offset)
+	ln := int(item.Length)
+	if off < 0 || ln < 0 || off+ln > len(p) {
+		return nil, fmt.Errorf("%w: slot=%d off=%d len=%d", ErrCorruptTuple, slot, off, ln)
+	}
+	return append([]byte(nil), p[off:off+ln]...), nil
 }
 
 func readItemID(p Page, idx int) (ItemID, error) {

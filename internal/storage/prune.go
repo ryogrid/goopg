@@ -73,6 +73,48 @@ func PageVacuumPrune(p Page, oldestXmin TransactionID) (PruneResult, int, error)
 	return pagePruneCore(p, oldestXmin)
 }
 
+// TupleDeadToAll reports whether hdr's tuple is dead to EVERY current and
+// future snapshot: xmax set, not lock-only, and the effective updater xid
+// is below the oldestXmin horizon. Extracted from pagePruneCore's isDead
+// closure (C3-S2) so the executor's index-scan kill-list oracle and the
+// prune/VACUUM paths share ONE predicate (design D6: on-access index
+// deletion must be a strict subset of what VACUUM may reclaim;
+// sibling-paths-must-agree).
+//
+// For an updater-bearing multixact xmax, hdr.Xmax is a MultiXactId, not a
+// transaction id; comparing it to the oldestXmin horizon would be a
+// category error (it could spuriously mark a live, only-locked row dead).
+// Resolve the updater member and test that xid instead. A multi with no
+// updater (only lockers) is not a delete, and an unresolvable multi is
+// conservatively NOT dead — never claim dead what we cannot prove dead.
+func TupleDeadToAll(hdr HeapTupleHeader, oldestXmin TransactionID) bool {
+	if hdr.Xmax == InvalidTransactionID {
+		return false
+	}
+	if IsHeapTupleLockOnly(hdr.Infomask) {
+		return false
+	}
+	effXmax := hdr.Xmax
+	if IsHeapTupleXmaxMulti(hdr.Infomask) {
+		if ResolveMultiUpdater == nil {
+			return false
+		}
+		upd, hasUpdater, resolved := ResolveMultiUpdater(hdr.Xmax)
+		if !resolved || !hasUpdater {
+			return false
+		}
+		effXmax = upd
+	}
+	if effXmax >= oldestXmin {
+		return false
+	}
+	// C3-S3 blocker fix B: the deleter must have COMMITTED. An aborted
+	// deleter's stamp survives physically; reclaiming its tuple would
+	// destroy a live row. nil hook (unit tests without a server) is
+	// conservative: nothing is provably dead.
+	return XidCommitted != nil && XidCommitted(effXmax)
+}
+
 // pagePruneCore is the shared dead-tuple reclamation kernel behind both
 // PagePruneOpt (opportunistic, gated on pd_prune_xid) and PageVacuumPrune
 // (VACUUM, unconditional). It builds the multixact/HOT-aware dead set,
@@ -83,31 +125,7 @@ func pagePruneCore(p Page, oldestXmin TransactionID) (PruneResult, int, error) {
 	var result PruneResult
 
 	isDead := func(hdr HeapTupleHeader) bool {
-		if hdr.Xmax == InvalidTransactionID {
-			return false
-		}
-		if IsHeapTupleLockOnly(hdr.Infomask) {
-			return false
-		}
-		// For an updater-bearing multixact xmax, hdr.Xmax is a MultiXactId, not
-		// a transaction id; comparing it to the oldestXmin horizon would be a
-		// category error (it could spuriously mark a live, only-locked row dead
-		// and prune it). Resolve the updater member and test that xid instead. A
-		// multi with no updater (only lockers) is not a delete, and an
-		// unresolvable multi is conservatively NOT dead — never prune a tuple we
-		// cannot prove dead.
-		effXmax := hdr.Xmax
-		if IsHeapTupleXmaxMulti(hdr.Infomask) {
-			if ResolveMultiUpdater == nil {
-				return false
-			}
-			upd, hasUpdater, resolved := ResolveMultiUpdater(hdr.Xmax)
-			if !resolved || !hasUpdater {
-				return false
-			}
-			effXmax = upd
-		}
-		return effXmax < oldestXmin
+		return TupleDeadToAll(hdr, oldestXmin)
 	}
 
 	count, err := PageLinePointerCount(p)

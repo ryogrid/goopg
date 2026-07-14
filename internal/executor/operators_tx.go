@@ -293,15 +293,24 @@ func (o *transactionOp) clearPgClassRowMarks(tx mvcc.Transaction) {
 // substrate is available — stamping xmax on the pg_class/pg_attribute rows so
 // the startup loader's xmax==0 filter skips them after a crash+restart.
 func rollbackDDLCreate(ctx *Context, entry DDLUndoEntry) {
+	dbOid := catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)
+	relDBOid := catalog.DefaultDBOid
+	if !entry.IsIndex && dbOid != catalog.DefaultDBOid {
+		// A distinct-dbOid connection's table files live under its own
+		// base/<dbOid> directory (catalog.InMemory.RelFileNode routes by
+		// Table.DBOid) — drop the file where it was actually created.
+		// M0122-0007 4e follow-up 39.
+		relDBOid = dbOid
+	}
 	rel := storage.RelFileNode{
-		DBOid:  catalog.DefaultDBOid,
+		DBOid:  relDBOid,
 		RelOid: entry.RelOID,
 		Fork:   storage.MainFork,
 	}
 	if entry.IsIndex {
-		_ = ctx.Catalog.DropIndex(entry.Name)
+		_ = ctx.Catalog.DropIndex(entry.Name, dbOid)
 	} else {
-		_ = ctx.Catalog.DropTable(entry.Name)
+		_ = ctx.Catalog.DropTable(entry.Name, dbOid)
 	}
 	if ctx.Pool != nil {
 		ctx.Pool.InvalidateRel(rel)
@@ -310,10 +319,15 @@ func rollbackDDLCreate(ctx *Context, entry DDLUndoEntry) {
 	// Stamp xmax on the pg_class / pg_attribute rows so that after a
 	// crash+restart the heap loader's xmax==0 filter skips them. Without this,
 	// WAL replay restores the HeapInsert records and the table reappears.
-	// Stamp in all catalog DBOids (DefaultDBOid + mirror DBOID) so
-	// loadUserTablesFromHeap (which reads from cat.DBOID()) also sees xmax.
+	// A table's rows follow tableCatalogDBOids (a distinct database's rows
+	// live only in its own catalog heap, follow-up 39); index rows stay on
+	// the DefaultDBOid+mirror pair (index writes are still pinned there).
 	if catalogHeapSyncAvailable(ctx) && ctx.Tx.XID != storage.InvalidTransactionID {
-		for _, dbOid := range catalogDBOids(ctx) {
+		stampOids := tableCatalogDBOids(ctx)
+		if entry.IsIndex {
+			stampOids = catalogDBOids(ctx)
+		}
+		for _, dbOid := range stampOids {
 			deleteCatalogRowsForOID(ctx, dbOid, entry.RelOID, ctx.Tx.XID)
 		}
 	}
@@ -337,16 +351,17 @@ func ProcessRollbackUndos(ctx *Context, sess *BasicSession) {
 		}
 	}
 	for _, sr := range sess.TakePendingSeqRestores() {
-		SetSequenceCurrentValue(sr.Name, sr.OldCurr)
+		SetSequenceCurrentValue(sr.Name, sr.OldCurr, sr.DBOid)
 	}
 	// Restore catalog entries for any DROP TABLEs that happened inside savepoints.
 	// On full ROLLBACK these are all being undone (the top-level transaction aborts).
 	// M0097-0023.
 	if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+		dbOid := catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)
 		for _, drop := range sess.TakePendingDDLDrops() {
-			im.RegisterTable(drop.Table)
+			im.RegisterTable(drop.Table, dbOid)
 			for _, idx := range drop.Indexes {
-				im.RestoreIndex(idx)
+				im.RestoreIndex(idx, dbOid)
 			}
 		}
 	}
@@ -521,10 +536,11 @@ func (o *transactionOp) execRollbackTo() error {
 	// M0097-0023.
 	newDepth := sess.SavepointDepth()
 	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+		dbOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
 		for _, drop := range sess.RollbackDDLDropsToDepth(newDepth) {
-			im.RegisterTable(drop.Table)
+			im.RegisterTable(drop.Table, dbOid)
 			for _, idx := range drop.Indexes {
-				im.RestoreIndex(idx)
+				im.RestoreIndex(idx, dbOid)
 			}
 		}
 	}

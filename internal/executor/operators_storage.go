@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -1888,7 +1889,7 @@ func (o *insertOp) Next() (TupleSlot, error) {
 		// runs, mirroring upstream ExecInitStoredGenerated/ExecComputeStoredGenerated
 		// ordering. The same helper rung 13 uses on the apply path applies
 		// here: missing[i]=true for every column NOT in plan.ColumnIndex.
-		applyDefaultsForMissing(cols, row, insertMissing)
+		applyDefaultsForMissing(cols, row, insertMissing, ctxSeqDBOid(o.ctx))
 
 		// Auto-generate values for SERIAL / BIGSERIAL / SMALLSERIAL columns
 		// and GENERATED [ALWAYS|BY DEFAULT] AS IDENTITY columns.
@@ -2785,7 +2786,7 @@ func idxRowHasConcurrentXmax(ctx *Context, rel storage.RelFileNode, blk storage.
 }
 
 func hotUpdateEligible(plan *planner.Update, ctx *Context) bool {
-	indexes := ctx.Catalog.IndexesOnTable(plan.Table)
+	indexes := ctx.Catalog.IndexesOnTable(plan.Table, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid))
 	for _, idx := range indexes {
 		for _, idxCol := range idx.Columns {
 			for i, set := range plan.Set {
@@ -3651,6 +3652,89 @@ func (o *updateOp) nextVirtualPgDatabase() (TupleSlot, error) {
 	return nil, EOF
 }
 
+// nextVirtualPgAmproc implements `UPDATE pg_amproc SET amproc = ... WHERE
+// ...` against the Virtual (no physical heap) pg_amproc table — the same
+// "read from VirtualRows(), evaluate o.pred/o.plan.Set, persist through a
+// dedicated InMemory mutator" shape as nextVirtualPgDatabase above. This is
+// the exact statement pg_amcheck's upstream 005_opclass_damage.pl uses to
+// inject corruption (`UPDATE pg_catalog.pg_amproc SET amproc =
+// 'int4_desc_cmp'::regproc WHERE amproc = 'int4_asc_cmp'::regproc`); only
+// the `amproc` column is writable, persisted via
+// catalog.InMemory.SetAmProcMemberProc keyed by the matched row's own oid.
+// M0119-0006 (005_opclass_damage UPDATE-path prerequisite — the btree AM
+// still has no per-index comparator dispatch to make a corrupted amproc
+// observable, a separate, larger gap tracked in the deferral ledger).
+func (o *updateOp) nextVirtualPgAmproc() (TupleSlot, error) {
+	tbl := o.plan.Table
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil, &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: "pg_amproc UPDATE requires an InMemory catalog"}
+	}
+	oidOrd, amprocOrd := -1, -1
+	for i, c := range tbl.Columns {
+		switch {
+		case strings.EqualFold(c.Name, "oid"):
+			oidOrd = i
+		case strings.EqualFold(c.Name, "amproc"):
+			amprocOrd = i
+		}
+	}
+	for i, setExpr := range o.plan.Set {
+		if setExpr != nil && i != amprocOrd {
+			colName := "?"
+			if i < len(tbl.Columns) {
+				colName = tbl.Columns[i].Name
+			}
+			return nil, &ExecError{Code: "0A000", Pos: o.plan.Pos(),
+				Message: fmt.Sprintf("UPDATE pg_amproc is only supported for the amproc column (got %q)", colName)}
+		}
+	}
+	for _, rawRow := range tbl.VirtualRows() {
+		row := make(Row, len(tbl.Columns))
+		for j := range tbl.Columns {
+			cell := ""
+			if j < len(rawRow) {
+				cell = rawRow[j]
+			}
+			v, err := evalExpr(planner.TypedVirtualCell(o.plan.Pos(), cell, tbl.Columns[j].Type.Name), nil, o.ctx)
+			if err != nil {
+				return nil, err
+			}
+			row[j] = v
+		}
+		if o.pred != nil {
+			v, err := evalExpr(o.pred, row, o.ctx)
+			if err != nil {
+				return nil, err
+			}
+			if v.IsNull() || v.Kind != KindBool || !v.BoolValue() {
+				continue
+			}
+		}
+		o.rowsAffected++
+		if amprocOrd >= 0 && o.plan.Set[amprocOrd] != nil {
+			newVal, err := evalExpr(o.plan.Set[amprocOrd], row, o.ctx)
+			if err != nil {
+				return nil, err
+			}
+			if newVal.IsNull() {
+				return nil, &ExecError{Code: "23502", Pos: o.plan.Pos(),
+					Message: "null value in column \"amproc\" violates not-null constraint"}
+			}
+			oid := uint32(0)
+			if oidOrd >= 0 && oidOrd < len(rawRow) {
+				if n, err := strconv.ParseUint(rawRow[oidOrd], 10, 32); err == nil {
+					oid = uint32(n)
+				}
+			}
+			im.SetAmProcMemberProc(oid, uint32(newVal.Int))
+			row[amprocOrd] = newVal
+		}
+		o.appendUpdateRetRow(row)
+	}
+	return nil, EOF
+}
+
 // updateViaIndex uses the B-tree to find the tuple to update (O(log n))
 // instead of scanning all pages. Falls back to the path in Next() when
 // no IndexScan is available.
@@ -4229,8 +4313,13 @@ func (o *updateOp) Next() (TupleSlot, error) {
 	// specifically (not every Virtual table) to keep this a narrow,
 	// low-blast-radius addition. M-NIGHTLY AI-20260707-000712-004 follow-up
 	// / AC-002 residual #1 (`UPDATE pg_database SET datconnlimit = ...`).
-	if tbl := o.plan.Table; tbl.Virtual && tbl.Schema == "pg_catalog" && tbl.Name == "pg_database" {
-		return o.nextVirtualPgDatabase()
+	if tbl := o.plan.Table; tbl.Virtual && tbl.Schema == "pg_catalog" {
+		switch tbl.Name {
+		case "pg_database":
+			return o.nextVirtualPgDatabase()
+		case "pg_amproc":
+			return o.nextVirtualPgAmproc()
+		}
 	}
 	// M0093: UPDATE is unconditionally a write — materialise the
 	// transaction's XID before the scan so foreignLockOnly /
@@ -6586,7 +6675,7 @@ func maintainUniqueIndexesForInsert(ctx *Context, tbl *catalog.Table, cols []cat
 	if ctx.Catalog == nil || ctx.Pool == nil {
 		return
 	}
-	for _, idx := range ctx.Catalog.IndexesOnTable(tbl) {
+	for _, idx := range ctx.Catalog.IndexesOnTable(tbl, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)) {
 		idxRel := ctx.Catalog.IndexRelFileNode(idx)
 		tree, err := btree.Open(ctx.Pool, idxRel)
 		if err != nil {
@@ -6956,7 +7045,7 @@ func checkUniqueIndexesForInsert(ctx *Context, tbl *catalog.Table, cols []catalo
 		return nil
 	}
 	rel := ctx.Catalog.RelFileNode(tbl)
-	for _, idx := range ctx.Catalog.IndexesOnTable(tbl) {
+	for _, idx := range ctx.Catalog.IndexesOnTable(tbl, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)) {
 		if !idx.Unique && !idx.Primary {
 			continue
 		}
@@ -7066,7 +7155,7 @@ func checkUniqueIndexesForUpdate(ctx *Context, tbl *catalog.Table, cols []catalo
 		return nil
 	}
 	rel := ctx.Catalog.RelFileNode(tbl)
-	for _, idx := range ctx.Catalog.IndexesOnTable(tbl) {
+	for _, idx := range ctx.Catalog.IndexesOnTable(tbl, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)) {
 		if !idx.Unique && !idx.Primary {
 			continue
 		}
@@ -7129,7 +7218,7 @@ func checkExclusionConstraintsForInsert(ctx *Context, tbl *catalog.Table, cols [
 		return nil
 	}
 	rel := ctx.Catalog.RelFileNode(tbl)
-	for _, idx := range ctx.Catalog.IndexesOnTable(tbl) {
+	for _, idx := range ctx.Catalog.IndexesOnTable(tbl, catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)) {
 		if !idx.IsExclusion {
 			continue
 		}

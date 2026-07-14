@@ -343,3 +343,271 @@ on an independently-generated SF1 dataset (`bench/tpch/runtime/pgdata`)
   changes which code path handles the outer IN, not yet isolated. It
   is kept as an end-state assertion guarding future regressions of
   this shape, not as the bug's original repro.
+
+## Follow-up (2026-07-09, M0122-0011): `NOT IN` → NullAware anti-join
+
+`isUnnestableNonCorrelatedIn` (`internal/planner/unnest.go`) previously
+hard-rejected `in.Negated` — the doc comment said NOT IN "requires
+anti-semi-join semantics which are out of scope for M0069-0005", so
+`x NOT IN (non-correlated subquery)` always fell back to the slower
+per-row runtime-cache execution path
+(`unimplemented_feat.json` M0069-0005, `code_audit` reconfirmed open
+as recently as 2026-07-08).
+
+**The relax is not just dropping the guard.** The existing `Anti`
+join (already used for correlated `NOT EXISTS`/`NOT IN` unnesting,
+`unnestInExpr`'s `if in.Negated { joinType = JoinTypeAnti }`) is
+built for NOT EXISTS semantics: "keep the probe row iff no hash
+match is found", with a NULL probe key documented as "never matches
+→ keep" (`internal/executor/operators_join_agg.go`'s `nextLazy`,
+the M0061-0001 comment block). That is correct for NOT EXISTS
+(existence doesn't care about NULL comparability) but wrong for NOT
+IN's three-valued-NULL semantics:
+
+- if the subquery produces **any** NULL in the compared column,
+  `x NOT IN (subquery)` is NULL (excluded) for **every** outer row —
+  even ones whose `x` matches no subquery value — because
+  `x = NULL` is always NULL/unknown, and `IN` is `OR`-composed
+  across every comparison;
+- if the subquery is genuinely **empty**, `x NOT IN ()` is TRUE for
+  every outer row, **including** a NULL `x` (the reverse case: an
+  empty `OR` chain is FALSE, so `NOT (...)` is TRUE regardless of
+  `x`'s nullness);
+- otherwise (non-empty, NULL-free subquery), a NULL `x` itself makes
+  `x NOT IN (subquery)` NULL (excluded) — the opposite of the plain
+  Anti join's "NULL probe key never matches → keep" rule.
+
+A naive relax (drop the `Negated` guard, always emit `JoinTypeAnti`)
+would have reused the NOT-EXISTS-shaped rule for all three cases and
+silently returned extra rows whenever the subquery or outer value
+contained a NULL — exactly the "silent row-count regression" failure
+mode `.ralph/PROMPT.md`'s hard-won rules warn about, and worse than
+the pre-existing runtime-cache fallback it would have replaced.
+
+**Fix:** new `Join.NullAware bool` field (`internal/planner/plan.go`),
+set by `unnestNonCorrelatedInExpr` only when `in.Negated`. The
+executor's `openLazyHashJoin` build loop (the right/build side is
+always the subquery for `JoinTypeAnti`; `BuildLeft` is forced false
+for Semi/Anti) tracks two scalars while `NullAware` is set —
+`antiBuildRows` (total build-side rows seen) and `antiBuildHasNull`
+(any build-side row's join key was NULL) — no per-row bookkeeping
+needed since NOT IN's degenerate cases only depend on these two
+aggregates, not on which values matched. `nextLazy` checks them
+before the normal per-probe-row hash lookup:
+
+- `antiBuildHasNull`: return `EOF` immediately (empty result, for
+  every outer row);
+- `antiBuildRows == 0`: pass every probe row through unconditionally
+  via `lazyOuterOnlySlot` (no hash lookup, so a NULL `x` is emitted
+  too);
+- otherwise: normal Anti-join probing, except a NULL probe key
+  (`ok == false` from `evalHashKey`) now `continue`s (excluded)
+  instead of falling through to "keep".
+
+**Deliberately out of scope — the CORRELATED `NOT IN` path
+(`unnestInExpr`'s `if in.Negated { joinType = JoinTypeAnti }`,
+reachable today for shapes like
+`x NOT IN (SELECT y FROM t WHERE t.corr = outer.corr)`) was found to
+have the same class of gap** (it does not set `NullAware`, so it
+still uses the NOT-EXISTS-shaped rule) **but was not touched this
+loop.** Fixing it correctly is materially larger: the "subquery is
+empty" / "subquery has a NULL" facts have to be tracked **per
+correlation-key group**, not once globally, since a correlated
+subquery conceptually re-runs per outer row — the single pair of
+build-side flags this fix uses is only sound for the non-correlated
+case's single global build. See the deferral ledger for the resume
+point.
+
+**Tests:** `internal/planner/not_in_unnest_test.go`
+(`TestUnnestNonCorrelatedNotIn` — NOT IN unnests to
+`JoinTypeAnti`+`NullAware`; `TestUnnestNonCorrelatedIn_NotNullAware`
+— plain IN stays `NullAware=false`); `internal/executor/
+not_in_unnest_test.go` (`TestNotInUnnest_NormalCase`,
+`_SubqueryNullPoisonsAllRows`, `_EmptySubqueryReturnsAllRows`,
+`_NullProbeExcluded` — all four cross-checked against the three-
+valued-NULL rules above). Confirmed non-vacuous via `git stash` on
+the three implementation files: the planner test fails to compile
+(`NullAware` doesn't exist) and the executor's
+`_EmptySubqueryReturnsAllRows` case fails (drops the NULL-`x` row,
+2 rows instead of 3) — incidentally proving the **pre-existing**
+runtime-cache fallback path itself mishandled that one edge case
+(NULL outer value + empty subquery), a latent bug this fix also
+happens to close for the queries it now unnests.
+
+**Verification against real data:** TPC-H Q16 (`ps_suppkey NOT IN
+(SELECT s_suppkey FROM supplier WHERE s_comment LIKE
+'%Customer%Complaints%')`) still returns the current dataset's
+correct row count (18192, matching the load-dependent baseline
+already on file in `ci/logs/action-items.md`'s non-blocking notices)
+— though a live EXPLAIN showed Q16's specific join shape does not
+actually route through the new unnest path (the `InExpr` still
+appears as a residual filter conjunct there; not yet root-caused —
+possibly join-order/NLI-conversion interaction specific to the real
+schema's indexes, unreproduced by an equivalent synthetic two-table
+probe). Not a regression either way: Q16 simply keeps using the
+pre-existing, still-correct runtime-cache path. `scripts/
+tpch-spotcheck.sh` (Q12=2/Q13=33) and `RALPH_PRECOMMIT_SCOPE=smoke
+scripts/ralph-precommit-test.sh` (0 failed, all 3 pgbench workloads)
+both PASS.
+
+## Follow-up (2026-07-09, M0122-0011 follow-up): non-ColumnRef LHS operand
+
+`isUnnestableNonCorrelatedIn` (`internal/planner/unnest.go`) also
+hard-required `in.Operand` to be a bare `*ColumnRef` — `f(x) IN
+(subquery)` or `a + b IN (subquery)` always fell back to the slower
+runtime-cache path, even when the inner plan was otherwise trivially
+unnestable (`unimplemented_feat.json`'s M0069-0005 entry,
+reconfirmed open as recently as 2026-07-08).
+
+**Why the restriction wasn't load-bearing.** `Join.LeftKey`/`RightKey`
+are already typed as general `Expr`, not `*ColumnRef` — the hash-join
+executor's `evalHashKey` (`internal/executor/operators_join_agg.go`)
+evaluates them with the ordinary `evalExpr`, the same evaluator used
+for any predicate. `planInExpr` (`internal/planner/planner.go`)
+already fully resolves `in.Operand` via `resolveExpr` in the outer
+scope regardless of its shape — the ColumnRef requirement was never
+protecting a real invariant, just an artifact of
+`unnestNonCorrelatedInExpr` reconstructing a fresh `*ColumnRef` by
+copying `Index`/`Name`/`Type`/`SourceTableIdx` off the operand instead
+of using the operand expression directly.
+
+**Fix:** `isUnnestableNonCorrelatedIn` now only checks `in.Operand !=
+nil`, `in.Plan != nil`, and a single-column inner output.
+`unnestNonCorrelatedInExpr` builds `outerKey := in.Operand` directly
+instead of the field-copy reconstruction — `LeftKey`/`RightKey` accept
+it as-is.
+
+**Tests:** `internal/planner/not_in_unnest_test.go`'s new
+`TestUnnestNonCorrelatedIn_NonColumnRefOperand` (`x + 1 IN (subquery)`
+unnests to `JoinTypeSemi`/`JoinAlgoHash` with a `*BinaryOp` `LeftKey`,
+not a `*ColumnRef`). `internal/planner/unnest_test.go`'s
+`TestRecursiveUnnestInsideNonUnnestableIN` — which relied on a
+non-ColumnRef operand (`a_id + 1`) to keep its outer IN deliberately
+non-unnestable while pinning the unrelated M0040-0004 recursive-unnest
+invariant — was updated to force non-unnestability via a non-equijoin
+correlation (`b_val > a_id`) instead, since operand shape alone no
+longer blocks unnesting. Confirmed non-vacuous via `git stash` on
+`unnest.go` alone (new test fails: `InExpr survived unnesting`).
+Gates: `go build ./...` clean; `go test ./internal/planner/...
+./internal/executor/... ./internal/analyzer/...` PASS;
+`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+`RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+failed transactions, all 3 pgbench workloads).
+
+## Follow-up (2026-07-09, M0122-0011 follow-up #2): correlated-IN unnest ignored the IN operand — real correctness bug, not just the flagged NullAware gap
+
+Resuming the previous follow-up's deliberately-deferred item ("the
+CORRELATED NOT IN path has the same NOT-EXISTS-shaped Anti-join gap")
+found a bigger, pre-existing bug than the NullAware framing assumed:
+`unnestInExpr`'s correlated branch (§4, `internal/planner/unnest.go`)
+never looks at `in.Operand` at all. It builds the join's
+`(LeftKey, RightKey)` purely from `params[0]` — the single correlation
+equijoin pair pulled out of the subquery's own WHERE clause
+(`collectUnnestParams`) — and drops the correlation predicate itself
+from the cloned inner plan (`clonePlanReplacingOuter` substitutes the
+`OuterColumnRef` with `SubCol`, folding e.g. `z = outer.w` into the
+tautology `z = z`). This is only sound when the correlation happens to
+*identify exactly* the value the IN is testing. Whenever the
+correlation column differs from the IN operand and/or from the
+subquery's own SELECT column, the produced join silently tests a
+different predicate than the original SQL:
+
+```sql
+-- x IN (SELECT y FROM t2 WHERE z = t1.w)
+-- pre-fix unnest built: Join(t1, t2, on t1.w = t2.y)
+-- i.e. "does a t2 row have y = w", discarding both `z = w`
+-- (folded to a no-op) and the actual `x = y` comparison.
+```
+
+This affects plain (non-negated) correlated `IN` too, not only `NOT
+IN` — a materially bigger scope than the previous follow-up's framing
+("needs per-correlation-group NULL/emptiness tracking"). A live,
+demonstrable false-positive: `ci_outer(x,w)` = `(1,5),(2,99)`,
+`ci_inner(y,z)` = `(5,777)` — real PostgreSQL semantics say `x IN
+(SELECT y FROM ci_inner WHERE z = ci_outer.w)` returns zero rows for
+every `ci_outer` row (no `ci_inner` row has `z` matching `5` or `99`),
+but the pre-fix planner wrongly returned `x=1` (`w=5` incidentally
+equals `ci_inner.y=5`).
+
+**Fix, and why it also closes the NullAware gap for free.** Added
+`correlatedInOperandSafeToUnnest(in, params)` (`internal/planner/
+unnest.go`), gating `canUnnestInExprDepth`'s correlated branch. It
+requires exactly one correlation pair, and BOTH:
+
+1. `in.Operand` is structurally the same column as the correlation's
+   outer-scope side (`params[0].OuterRef`) — same `Index`/
+   `SourceTableIdx`/`Name` (both are populated from the same
+   scope-resolution numbering, confirmed empirically: an unrelated
+   outer column has a different `Index`/`Name` even when
+   `SourceTableIdx` coincides).
+2. The subquery's sole projected expression (`in.Plan.(*Project)
+   .Targets[0]`) is structurally the same column as the correlation's
+   subquery-scope side (`params[0].SubCol`) — otherwise folding the
+   correlation predicate to a tautology silently discards a real
+   filter.
+
+When both hold, the correlation predicate **is** `SELECT-column =
+in.Operand`, so every row that survives it has a non-NULL projected
+value exactly equal to `in.Operand` (an equality predicate can't be
+satisfied by NULL) — the subquery's per-outer-row result is therefore
+either empty or exactly `{in.Operand}`, never containing a NULL or a
+mismatched value. That is precisely the condition under which a plain
+(non-NullAware) Anti join already implements NOT IN's three-valued
+semantics correctly (empty → keep, matched-non-NULL → exclude), so
+the previously-flagged "correlated NOT IN needs per-group NullAware
+tracking" turns out to be moot for every case this mechanism is
+actually allowed to unnest post-fix — the real bug was the missing
+operand/select-column identity check, not missing NullAware
+plumbing. Any correlated IN/NOT IN that doesn't satisfy both
+conditions now correctly falls back to the pre-existing (always
+correct) runtime per-row evaluation path — a performance-only
+regression for such shapes, never a correctness one.
+
+**Tests:** `internal/planner/correlated_in_unnest_test.go` — two
+positive cases (self-referencing correlation still unnests to
+`JoinTypeSemi`/`JoinTypeAnti`) and two negative cases (operand ≠
+correlation column; correlation column ≠ selected column — both must
+leave the `InExpr` in place, unnested). `internal/executor/
+correlated_in_unnest_test.go` — end-to-end row-count proof using the
+`ci_outer`/`ci_inner` data above (`TestCorrelatedIn_
+OperandMismatchNotCorrelationColumn`) plus the safe self-referencing
+case (`TestCorrelatedIn_SelfReferencingStillUnnests`). Confirmed
+non-vacuous via `git stash` on `unnest.go` alone: both negative
+planner tests fail (`InExpr was unnested despite ...`) and the
+executor test's false-positive row reappears (`got 1 rows, want 0`).
+Gates: `go build ./...` clean; `go test ./internal/planner/...
+./internal/executor/... ./internal/analyzer/...` PASS;
+`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+`RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+failed transactions, all 3 pgbench workloads).
+
+## Follow-up (2026-07-09, M0122-0011 follow-up #3): Q16's "non-triggering unnest" could not be reproduced — closed as refuted
+
+The `NOT IN` follow-up above deferred one item: a live EXPLAIN against a
+running server showed TPC-H Q16's `InExpr` surviving as a residual
+filter instead of unnesting to the new `NullAware` Anti join, even
+though a synthetic two-table-join probe with the same shape unnested
+correctly. Re-investigating with the item's own resume point — plan
+Q16 against a schema mirroring the real HammerDB-equivalent one (PK
+btree indexes on `part`/`partsupp`/`supplier` plus SF1-magnitude
+`TableStats.RowCount`, matching `index_utilisation_test.go`'s
+`hammerdbPKs`) — the Anti join unnest fires correctly. Going further:
+it also fires against a bare `tpch.Catalog()` with no indexes or
+stats at all (throwaway probe, reverted), and every commit across the
+whole M0122-0011 chain (`be47cc93` through `ef323e88`) plans Q16 the
+same correct way. No planner revision was found where Q16 fails to
+unnest.
+
+**Conclusion:** the original observation was most likely a
+stale/un-rebuilt `cmd/goopg` binary at observation time, not a
+planner defect — there is no live bug here to fix. Landed
+`internal/planner/q16_unnest_test.go`
+(`TestPlanQ16NotInUnnestsWithRealSchema`) as a permanent regression
+guard pinning the now-confirmed-correct behavior against a realistic
+schema, so a genuine future regression is caught immediately instead
+of requiring another multi-loop investigation. If a future
+nightly/live run again shows Q16's `InExpr` surviving as a residual
+filter, suspect a stale binary first before re-opening planner-side
+investigation. Gates: `go build ./...` clean; `go test
+./internal/planner/...` PASS; `scripts/tpch-spotcheck.sh` PASS
+(Q12=2/Q13=33).

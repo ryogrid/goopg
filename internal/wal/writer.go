@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -12,47 +13,26 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/goopg/goopg/internal/activity"
+	"github.com/goopg/goopg/internal/gls"
 	"github.com/goopg/goopg/internal/stats"
+
+	"github.com/goopg/goopg/internal/storage"
 )
 
-// groupFlushReq represents a single caller's flush request in the
-// group-commit queue. M0098-0002.
-type groupFlushReq struct {
-	lsn  uint64
-	done chan struct{} // closed by writer goroutine when flush is complete
-	err  error         // set before done is closed
-}
-
-// flushGroup holds the shared queue and signal channel for WAL group
-// commit (M0098-0002). Multiple concurrent FlushUpTo callers append
-// their requests and the writer goroutine drains the entire batch in
-// one fdatasync.
-type flushGroup struct {
-	mu     sync.Mutex
-	queue  []*groupFlushReq
-	signal chan struct{} // capacity-1 channel; non-blocking send triggers writer
-}
+// flushErr wraps a flush error for atomic publication in Writer.stickyErr.
+type flushErr struct{ err error }
 
 const (
 	// DefaultSegmentSize matches PostgreSQL's default WAL segment size.
 	DefaultSegmentSize int64 = 16 * 1024 * 1024
-
-	// commitDelayUs is the number of microseconds handleGroupFlush sleeps
-	// after the initial drain to accumulate more concurrent FlushUpTo callers
-	// into the same fdatasync batch. Mirrors PostgreSQL's commit_delay GUC.
-	// Re-enabled after the state.append Path A race was fixed (M0099).
-	commitDelayUs = 1000
-
-	// commitSiblings is the minimum number of concurrent waiters required
-	// before applying the commitDelayUs sleep. Below this threshold we flush
-	// immediately to avoid adding latency to low-concurrency workloads.
-	commitSiblings = 5
 )
 
 var (
-	ErrClosed        = errors.New("wal: writer closed")
-	ErrLSNNotWritten = errors.New("wal: requested LSN is beyond written WAL")
+	ErrClosed = errors.New("wal: writer closed")
+	// ErrLSNNotWritten aliases storage.ErrWALAccountingLag so the buffer
+	// pool's flush paths can errors.Is-match it without importing wal
+	// (C3-S3 hint-barrier fix); same identity, same message.
+	ErrLSNNotWritten = storage.ErrWALAccountingLag
 	// ErrEmptyPayload guards the EOS sentinel: a zero
 	// (len=0, crc=0) header is reserved as "no record here yet"
 	// in preallocated segments. See
@@ -81,6 +61,21 @@ var (
 type Config struct {
 	WALDir      string
 	SegmentSize int64
+
+	// CommitDelayUs / CommitSiblings are the backend-driven flush GUCs
+	// (docs/design/wal-backend-flush/). CommitDelayUs is PostgreSQL's
+	// commit_delay in microseconds (BootVal 0 = no delay); the flush holder
+	// sleeps this long, holding the WAL write lock, only when at least
+	// CommitSiblings other flushers are in flight, to widen the batch.
+	// CommitSiblings is commit_siblings (BootVal 5). Zero values are treated
+	// as the PG defaults (0 / 5) by NewWriter.
+	CommitDelayUs  int64
+	CommitSiblings int
+
+	// WalWriterFlushAfter is wal_writer_flush_after in bytes (BootVal 1MB): the
+	// background walwriter's fsync-throttle threshold. Zero disables the throttle
+	// (always flush). See Writer.BackgroundWrite.
+	WalWriterFlushAfter int64
 
 	// Preallocate, when true, zero-fills new segment files to
 	// SegmentSize and fsyncs them at creation time so subsequent
@@ -133,6 +128,18 @@ type Config struct {
 	// docs/design/0014-0001-xlog-page-and-segment-layout-compat.md.
 	PageHeaders bool
 
+	// EmitCanonical controls whether the server emits the canonical
+	// (PG-format, real-standby-replayable) WAL record family alongside the
+	// native family (analysis/perf-optimize3-dash/01 §3.1). It is CONTENT
+	// gating only — PageHeaders (the frame format above) stays independent
+	// and ON in production. The wal package itself never emits canonical
+	// records; this flag is carried here so initdb/open.go's emission choke
+	// points and the BASE_BACKUP guard read one source of truth via
+	// Writer.CanonicalEnabled(). Not a GUC: no PostgreSQL equivalent exists
+	// (0108-0001 sample-template discipline); the operator override is the
+	// GOOPG_WAL_CANONICAL env var, resolved by initdb.Open.
+	EmitCanonical bool
+
 	// SystemID is the cluster's pg_control system identifier,
 	// stamped into every long-form page header's xlp_sysid for
 	// pg_waldump cross-check. Caller (cmd/goopg start) plumbs the
@@ -144,13 +151,6 @@ type Config struct {
 	// initial timeline a fresh cluster starts on. Only consulted
 	// when PageHeaders=true.
 	TimelineID uint32
-
-	// OnLoopStart / OnLoopEnd are optional hooks called at the
-	// beginning and end of the WAL state-loop goroutine, so the
-	// caller can register/deregister the WAL writer goroutine in
-	// the activity registry via RegisterCurrentGoroutine.
-	OnLoopStart func()
-	OnLoopEnd   func()
 
 	// OnWALWrite is an optional hook called before each WAL page
 	// write in the state loop.  Set by initdb.Open so the activity
@@ -175,6 +175,28 @@ type Config struct {
 	// internal/aio's io_method=io_uring precedent. See
 	// docs/design/0007-0002-fdatasync-commit-path.md.
 	SyncMethod string
+
+	// MinWALSize mirrors upstream's `min_wal_size` GUC (bytes). It sets
+	// the floor on how many WAL segments RemoveOldSegments keeps around
+	// as pre-zeroed spares by renaming obsolete segments into fresh
+	// future slots (recycle-by-rename) instead of unlinking them —
+	// avoiding the create+zero-fill+directory-fsync cost a later
+	// openSegment would otherwise pay for a brand-new file. <= 0 (the
+	// default) disables recycling entirely: every obsolete segment is
+	// unlinked, matching pre-M0122-0009 behaviour. See
+	// docs/design/0122-0009-wal-segment-recycling.md.
+	MinWALSize int64
+
+	// MaxWALSize mirrors upstream's `max_wal_size` GUC (bytes): the
+	// ceiling upstream's XLOGfileslop formula caps recycling at, so a
+	// bursty CheckPointDistanceEstimate can never grow the recycled-spare
+	// count past this bound. Only consulted by
+	// RemoveOldSegmentsWithEstimate (RemoveOldSegments itself never
+	// exceeds MinWALSize, so the ceiling has nothing to clamp there).
+	// <= 0 (the default) disables the ceiling. See
+	// docs/design/0122-0009-wal-segment-recycling.md's "max_wal_size
+	// ceiling + CheckPointDistanceEstimate" follow-up.
+	MaxWALSize int64
 }
 
 // AIOEngine is the wal-side seam onto an AIO engine. Mirrors
@@ -235,55 +257,44 @@ func (c *Config) withDefaults() {
 	}
 }
 
-type opKind int
-
-const (
-	opAppend opKind = iota
-	opAppendRaw
-	opFlush
-	opRecycle
-	opClose
-	// opWALBufStat is a read-only op the M0013-0003 observability
-	// surface uses to snapshot walBuf cap + resident under the
-	// writer goroutine's serialisation (avoids racing append /
-	// drain). The snapshot lands in result.walBufStat.
-	opWALBufStat
-)
-
-type op struct {
-	kind    opKind
-	payload []byte
-	lsn     uint64
-	resp    chan result
-}
-
-type walBufStatSnapshot struct {
-	cap      int64
-	resident int64
-}
-
-type result struct {
-	startLSN   uint64
-	endLSN     uint64
-	removed    int
-	walBufStat walBufStatSnapshot
-	err        error
-}
-
-// Writer serializes all WAL writes through one internal goroutine.
+// Writer coordinates WAL writes. Committing backends perform their own
+// write+fdatasync under the WAL write lock (writeMu), the background walwriter
+// pre-writes via BackgroundWrite, and the slow-append/recycle paths run directly
+// in the caller's goroutine — there is no dedicated writer goroutine (the old
+// state.loop was retired in slice 6 of docs/design/wal-backend-flush/).
 //
 // LSN is represented as a 1-based byte position in the WAL stream:
 // the first byte written has LSN 1, and the zero value means
 // "no WAL record assigned".
 type Writer struct {
-	ops  chan op
-	done chan struct{}
+	// done is closed exactly once by Close to wake parked flush waiters and
+	// reject new appends. closeOnce/closeErr make Close idempotent.
+	done      chan struct{}
+	closeOnce sync.Once
+	closeErr  error
 
 	// writeLSNAtomic mirrors state.writeLSN so external observers
 	// (notably the checkpointer's max_wal_size trigger) can read
 	// the current write position without serialising through the
 	// op channel.
 	writeLSNAtomic atomic.Uint64
+
+	// flushedLSNAtomic mirrors state.flushedLSN — the highest LSN whose
+	// bytes have been fdatasync'd to the segment files. Published by the
+	// writer goroutine AFTER each sync barrier so a reader that observes
+	// lsn <= flushedLSNAtomic knows lsn is durable. FlushUpTo reads it to
+	// skip the group-flush queue entirely when the target is already
+	// durable — the goopg analog of PG's `record <= LogwrtResult.Flush`
+	// fast exit in XLogFlush (analysis/perf-optimize2, fix-03).
+	flushedLSNAtomic atomic.Uint64
+
+	// drainedLSNAtomic mirrors state.drainedLSN — the highest LSN whose bytes
+	// have been drained from the ring to the segment files (pwritten to the OS
+	// cache, not necessarily fdatasync'd). This is the goopg analog of PG's
+	// logWriteResult; the background walwriter reads it to decide whether a
+	// pre-write round has anything to do (docs/design/wal-backend-flush/, 03/04).
+	// Invariant: writeLSNAtomic >= drainedLSNAtomic >= flushedLSNAtomic.
+	drainedLSNAtomic atomic.Uint64
 
 	// subscribers receive a non-blocking wake-up after every
 	// successful Append. Used by RecordIterator (and walsender
@@ -301,6 +312,23 @@ type Writer struct {
 	// through the writer's loop. nil when
 	memRing *MemRing
 
+	// --- backend-driven flush (docs/design/wal-backend-flush/, slice 3) ---
+	// writeMuOf reaches the state's WAL write lock; flushWaiters counts
+	// in-flight FlushUpTo callers (the commit_siblings gate); commitDelayUs /
+	// commitSiblings snapshot the GUCs; stickyErr lets losing committers
+	// return a flush error without re-acquiring the lock (stampede guard).
+	flushWaiters   atomic.Int32
+	commitDelayUs  atomic.Int64
+	commitSiblings atomic.Int32
+	stickyErr      atomic.Pointer[flushErr]
+
+	// walWriterFlushAfter is wal_writer_flush_after (bytes; BootVal 1MB): the
+	// background walwriter fsync-throttle threshold. Stored for BackgroundWrite;
+	// it only gates a skip once async-LSN early wakeups land (a timer tick always
+	// satisfies PG's "≥ wal_writer_delay since last flush" rule and therefore
+	// flushes) — see BackgroundWrite (docs/design/wal-backend-flush/ 03 §3.4).
+	walWriterFlushAfter atomic.Int64
+
 	// stateRef is a reference to the state struct, needed by
 	// Writer.Append to call encodeAndBuffer directly (M0026
 	// concurrent append path).
@@ -315,6 +343,11 @@ type Writer struct {
 	// decide whether to skip page-header bytes when streaming
 	// records. Static for the Writer's lifetime.
 	pageHeaders bool
+	// emitCanonical mirrors Config.EmitCanonical (single source of truth
+	// for the canonical-family emission choke points and the BASE_BACKUP
+	// guard — analysis/perf-optimize3-dash/01 §3.1). Static for the
+	// Writer's lifetime.
+	emitCanonical bool
 	// segmentSize mirrors Config.SegmentSize so iterators can
 	// distinguish a long-form (segment-boundary) page header
 	// from a short-form one without having to thread cfg in.
@@ -347,11 +380,6 @@ type Writer struct {
 	// code can balance every WaitEventStart with a WaitEventEnd.
 	// (M0058-0006.)
 	OnWALSyncDone func()
-
-	// fg is the group-commit queue. FlushUpTo appends to fg.queue
-	// and signals fg.signal; the writer goroutine drains the entire
-	// batch in one fdatasync. M0098-0002.
-	fg *flushGroup
 
 	// sharedFsyncTimeNanos accumulates real wall-clock time spent inside
 	// FlushUpTo's fdatasync wait, backing pg_stat_io's (client backend,
@@ -390,6 +418,27 @@ type state struct {
 	// stored after each successful append. The Writer reads it
 	// without locking.
 	writeLSNMirror *atomic.Uint64
+
+	// flushedLSNMirror, when non-nil, gets flushedLSN stored after each
+	// sync barrier (in flushUpTo, after the fdatasync loop). The Writer
+	// reads it in FlushUpTo for the pre-enqueue already-flushed fast exit.
+	flushedLSNMirror *atomic.Uint64
+
+	// drainedLSNMirror, when non-nil, gets drainedLSN stored after Stage 1 of
+	// xlogWrite (bytes pwritten to segment files). The Writer / walwriter read
+	// it via drainedLSNAtomic. Single-writer-at-a-time (the WAL-write-lock
+	// holder), so a plain Store is safe.
+	drainedLSNMirror *atomic.Uint64
+
+	// writeMu is the WAL write lock (PG WALWriteLock analog): it serialises all
+	// segment write+fdatasync and the files/dirty maps across the backend flush
+	// holders (docs/design/wal-backend-flush/ 03 §3.1). In slice 3 the flush
+	// holder additionally takes appendMu.Lock around its drain (order
+	// appendMu→writeMu at the append sites; writeMu→appendMu at the flusher),
+	// which quiesces in-flight appenders — the WaitXLogInsertionsToFinish
+	// analog — so the loop-side append/recycle paths need not each take writeMu
+	// until slice 7 moves the drain off appendMu.
+	writeMu *walWriteLock
 
 	// onAppend, when non-nil, is invoked after every successful
 	// append to wake subscribers (RecordIterators, walsender
@@ -439,12 +488,6 @@ type state struct {
 	sysID      uint64
 	tli        uint32
 
-	// onLoopStart / onLoopEnd are optional hooks called at the
-	// beginning and end of the state-loop goroutine, respectively.
-	// Set by NewWriter from the Writer's OnLoopStart / OnLoopEnd.
-	onLoopStart func()
-	onLoopEnd   func()
-
 	// onWALWrite is an optional hook called before each WAL page
 	// write in writeAt. Set by NewWriter from the Writer's OnWALWrite.
 	onWALWrite func()
@@ -456,8 +499,12 @@ type state struct {
 	// nil before NewWriter completes; nil-safe across all core methods.
 	core *stripeWriterCore
 
-	// fg is the group-commit flush queue, shared with Writer. M0098-0002.
-	fg *flushGroup
+	// eagerMu guards eagerInFlight; eagerWG lets close() wait for any
+	// background eager-preallocation goroutines to finish before the
+	// writer's files map is torn down. See eagerPreallocSegment.
+	eagerMu       sync.Mutex
+	eagerInFlight map[uint64]struct{}
+	eagerWG       sync.WaitGroup
 }
 
 // walBufferCounters holds the lifetime drain counters that
@@ -525,26 +572,23 @@ func NewWriter(cfg Config) (*Writer, error) {
 
 	bufCounters := &walBufferCounters{}
 	st.walBufferCounters = bufCounters
-	fg := &flushGroup{
-		signal: make(chan struct{}, 1),
-	}
 	w := &Writer{
-		ops:               make(chan op),
 		done:              make(chan struct{}),
 		memRing:           st.memRing,
 		stateRef:          st,
 		walBufferCounters: bufCounters,
 		pageHeaders:       cfg.PageHeaders,
+		emitCanonical:     cfg.EmitCanonical,
 		segmentSize:       cfg.SegmentSize,
-		fg:                fg,
 	}
 	w.writeLSNAtomic.Store(uint64(st.writePos))
 	st.writeLSNMirror = &w.writeLSNAtomic
+	w.flushedLSNAtomic.Store(st.flushedLSN)
+	st.flushedLSNMirror = &w.flushedLSNAtomic
+	w.drainedLSNAtomic.Store(st.drainedLSN)
+	st.drainedLSNMirror = &w.drainedLSNAtomic
 	st.onAppend = w.notifyAppend
-	st.onLoopStart = cfg.OnLoopStart
-	st.onLoopEnd = cfg.OnLoopEnd
 	st.onWALWrite = cfg.OnWALWrite
-	st.fg = fg
 	w.core = newStripeWriterCore(
 		uint64(cfg.SegmentSize),
 		uint64(st.writePos),
@@ -553,9 +597,31 @@ func NewWriter(cfg Config) (*Writer, error) {
 		st.memRing,
 	)
 	st.core = w.core // share core pointer so state.append can call AppendXLogPayload
-	go st.loop(w.ops, w.done)
+	st.writeMu = newWALWriteLock()
+	// Snapshot the backend-flush GUCs (PG defaults 0 / 5 when unset).
+	w.commitDelayUs.Store(cfg.CommitDelayUs)
+	sib := int32(cfg.CommitSiblings)
+	if sib <= 0 {
+		sib = 5
+	}
+	w.commitSiblings.Store(sib)
+	w.walWriterFlushAfter.Store(cfg.WalWriterFlushAfter)
 	return w, nil
 }
+
+// SetCommitDelayUs / SetCommitSiblings live-update the backend-flush GUCs
+// (SIGHUP). commit_delay is in microseconds (0 = no delay); commit_siblings
+// clamps to at least 1.
+func (w *Writer) SetCommitDelayUs(us int64) { w.commitDelayUs.Store(us) }
+func (w *Writer) SetCommitSiblings(n int) {
+	if n < 1 {
+		n = 1
+	}
+	w.commitSiblings.Store(int32(n))
+}
+
+// SetWalWriterFlushAfter live-updates wal_writer_flush_after (bytes; SIGHUP).
+func (w *Writer) SetWalWriterFlushAfter(bytes int64) { w.walWriterFlushAfter.Store(bytes) }
 
 // PageHeadersEnabled reports whether the writer is emitting
 // PG-compatible XLOG page headers (M0014-0001 step 2). Returns the
@@ -564,6 +630,11 @@ func NewWriter(cfg Config) (*Writer, error) {
 // it knows whether the on-disk segments contain interleaved page
 // headers it must skip.
 func (w *Writer) PageHeadersEnabled() bool { return w.pageHeaders }
+
+// CanonicalEnabled reports whether the server should emit the canonical
+// (PG-format) WAL record family. Content gating only; the frame format is
+// PageHeadersEnabled. See Config.EmitCanonical.
+func (w *Writer) CanonicalEnabled() bool { return w.emitCanonical }
 
 // Format returns the active on-disk WAL format the writer is
 // emitting. Mirrors the Config.PageHeaders flag the writer was
@@ -590,24 +661,25 @@ func (w *Writer) MemRing() *MemRing { return w.memRing }
 // the writer's lifetime. Surfaced as
 // `wal_buffers_capacity_bytes` in pg_stat_wal_io (M0013-0003).
 func (w *Writer) WALBuffersCapacity() int64 {
-	resp := make(chan result, 1)
-	if err := w.send(op{kind: opWALBufStat, resp: resp}); err != nil {
+	// cap is fixed at construction (immutable); read it directly rather than
+	// round-tripping through the writer goroutine (slice 5).
+	if w.stateRef == nil || w.stateRef.walBuf == nil {
 		return 0
 	}
-	return (<-resp).walBufStat.cap
+	return w.stateRef.walBuf.cap
 }
 
 // WALBuffersBytesResident returns the live byte count currently
 // held in the in-memory WAL buffer (i.e. not yet drained to a
 // segment file). Surfaced as `wal_buffers_bytes_resident` in
-// pg_stat_wal_io. Reads serialise on the writer goroutine to
-// avoid racing with append/drain.
+// pg_stat_wal_io. resident() reads the ring's head/tail atomics, so it is
+// safe to sample directly from any goroutine (slice 5) — an occasionally
+// slightly-stale count is acceptable for observability.
 func (w *Writer) WALBuffersBytesResident() int64 {
-	resp := make(chan result, 1)
-	if err := w.send(op{kind: opWALBufStat, resp: resp}); err != nil {
+	if w.stateRef == nil || w.stateRef.walBuf == nil {
 		return 0
 	}
-	return (<-resp).walBufStat.resident
+	return w.stateRef.walBuf.resident()
 }
 
 // WALBuffersOverflowDrainBytes returns the lifetime total bytes
@@ -781,16 +853,29 @@ func (w *Writer) Append(payload []byte) (uint64, uint64, error) {
 		}
 	}
 
-	// Slow path: no WAL buffer, or buffer overflow — fall back
-	// to the state-loop goroutine (legacy serialised path).
-	resp := make(chan result, 1)
-	buf := make([]byte, len(payload))
-	copy(buf, payload)
-	if err := w.send(op{kind: opAppend, payload: buf, resp: resp}); err != nil {
-		return 0, 0, err
+	// Slow path: no WAL buffer, or buffer overflow. Run the append directly in
+	// the caller's goroutine (slice 5): the slow-append leaves serialise on
+	// writeMu (slice 3), so the dedicated writer goroutine is no longer needed
+	// to order writePos mutations, and concurrent slow appends serialise on the
+	// lock exactly as they did on the single loop. append encodes synchronously
+	// into the ring/segment, so payload need not outlive the call. The
+	// best-effort closed-check preserves send()'s ErrClosed-on-shutdown; the
+	// real append/close ordering is the caller's lifecycle contract (Close after
+	// appenders quiesce), the same discipline the fast path already relies on.
+	st := w.stateRef
+	if st == nil {
+		return 0, 0, ErrClosed
 	}
-	r := <-resp
-	return r.startLSN, r.endLSN, r.err
+	select {
+	case <-w.done:
+		return 0, 0, ErrClosed
+	default:
+	}
+	start, end, err := st.append(payload)
+	if err == nil && st.onAppend != nil {
+		st.onAppend()
+	}
+	return start, end, err
 }
 
 // AppendRaw writes an already-encoded WAL byte stream verbatim.
@@ -803,14 +888,22 @@ func (w *Writer) AppendRaw(stream []byte) (uint64, uint64, error) {
 	if len(stream) == 0 {
 		return 0, 0, ErrEmptyPayload
 	}
-	resp := make(chan result, 1)
-	buf := make([]byte, len(stream))
-	copy(buf, stream)
-	if err := w.send(op{kind: opAppendRaw, payload: buf, resp: resp}); err != nil {
-		return 0, 0, err
+	// Direct call (slice 5): appendRaw serialises on writeMu; the physical
+	// walreceiver is the sole caller and is single-threaded per writer.
+	st := w.stateRef
+	if st == nil {
+		return 0, 0, ErrClosed
 	}
-	r := <-resp
-	return r.startLSN, r.endLSN, r.err
+	select {
+	case <-w.done:
+		return 0, 0, ErrClosed
+	default:
+	}
+	start, end, err := st.appendRaw(stream)
+	if err == nil && st.onAppend != nil {
+		st.onAppend()
+	}
+	return start, end, err
 }
 
 // FlushUpTo persists WAL bytes up to lsn with fdatasync semantics.
@@ -820,79 +913,292 @@ func (w *Writer) FlushUpTo(lsn uint64) error {
 	if lsn == 0 {
 		return nil
 	}
+	// Pre-enqueue fast exit (fix-03): if lsn is already durable — the
+	// background walwriter (FlushUpTo(WrittenLSN()) every WalWriterDelay) or
+	// a prior group-flush already synced past it — skip the flush queue and
+	// the channel round-trip entirely. Mirrors PG XLogFlush's
+	// `record <= LogwrtResult.Flush` early return. flushedLSNAtomic is
+	// published only after the fdatasync loop, so any lsn that passes this
+	// check is genuinely durable; a stale (too-low) read merely falls
+	// through to the normal queue path. No sync occurs, so the WalSync
+	// wait-event hooks are intentionally not fired.
+	if lsn <= w.flushedLSNAtomic.Load() {
+		return nil
+	}
 	if w.OnWALSync != nil {
 		w.OnWALSync()
 	}
 	if w.OnWALSyncDone != nil {
 		defer w.OnWALSyncDone()
 	}
-	req := &groupFlushReq{lsn: lsn, done: make(chan struct{})}
-	w.fg.mu.Lock()
-	w.fg.queue = append(w.fg.queue, req)
-	w.fg.mu.Unlock()
-	// Signal writer goroutine. Non-blocking: if signal is already
-	// pending the writer will pick up our request on the next drain.
-	select {
-	case w.fg.signal <- struct{}{}:
-	default:
-	}
-	// Wait for the writer to complete our flush (or the writer to close).
-	select {
-	case <-req.done:
-		return req.err
-	case <-w.done:
-		return ErrClosed
+	return w.flushUpToBackend(lsn)
+}
+
+// flushUpToBackend is the PG-parity backend-driven flush (slice 3): the calling
+// goroutine performs its own write+fdatasync under the WAL write lock; group
+// commit is emergent — the holder flushes the aggregate written frontier, and
+// losers, woken on release, re-check the durable LSN and usually return with
+// zero I/O (docs/design/wal-backend-flush/ 03 §3.3).
+func (w *Writer) flushUpToBackend(lsn uint64) error {
+	w.flushWaiters.Add(1)
+	defer w.flushWaiters.Add(-1)
+	st := w.stateRef
+	// Compute a published contiguous frontier ≥ lsn BEFORE taking the write
+	// lock (PG's WaitXLogInsertionsToFinish-before-WALWriteLock discipline): a
+	// stripe insert for an LSN below ours may still be in flight, holding the
+	// contiguous tail back below lsn, so we must let it publish first. Done
+	// outside writeMu so the flusher never blocks fast-path appends (RLock)
+	// while draining — that is what keeps commits batching (04 §4.4).
+	frontier := st.waitInsertionsToFinish(lsn)
+	for {
+		if lsn <= w.flushedLSNAtomic.Load() {
+			return nil // covered by another holder's flush
+		}
+		held, err := st.writeMu.acquireOrWait(w.done)
+		if err != nil {
+			return err // ErrClosed
+		}
+		if !held {
+			// Woken without holding: recheck durability, then the sticky
+			// error (a failing disk) so we return without re-acquiring the
+			// lock and hammering the device.
+			if lsn <= w.flushedLSNAtomic.Load() {
+				return nil
+			}
+			if fe := w.stickyErr.Load(); fe != nil {
+				return fe.err
+			}
+			continue
+		}
+		return w.flushAsHolder(lsn, frontier)
 	}
 }
 
-// RemoveOldSegments unlinks any WAL segment file whose contents end
+// flushAsHolder runs the holder section under writeMu ONLY (never appendMu, so
+// fast-path RLock appenders keep running during the fsync — the drain is safe
+// against them via the atomic ring, and writeMu guarantees a single drainer).
+// The deferred release is mandatory: goopg recovers backend-goroutine panics
+// per connection, so a bare unlock would leak writeMu forever on any panic in
+// xlogWrite, permanently wedging every commit (04 §4.7).
+func (w *Writer) flushAsHolder(lsn, frontier uint64) (err error) {
+	st := w.stateRef
+	defer st.writeMu.release()
+	if lsn <= st.flushedLSN {
+		return nil // covered under the lock
+	}
+	if d := w.commitDelayUs.Load(); d > 0 && w.flushWaiters.Load() >= w.commitSiblings.Load() {
+		// Holder-only sleep, holding the write lock, to widen the batch
+		// (PG commit_delay; BootVal 0 → never sleeps).
+		time.Sleep(time.Duration(d) * time.Microsecond)
+	}
+	// Widen the frontier with records published since we computed it — no
+	// waiting (publish-only), the group-commit batching step.
+	if t := st.publishedFrontier(); t > frontier {
+		frontier = t
+	}
+	err = st.xlogWrite(writeRqst{write: frontier, flush: frontier})
+	if err != nil {
+		w.stickyErr.Store(&flushErr{err: err})
+		return err
+	}
+	w.stickyErr.Store(nil)
+	if lsn > st.flushedLSN {
+		// The caller asked to flush beyond what was ever written.
+		return fmt.Errorf("%w: have %d, need %d", ErrLSNNotWritten, st.flushedLSN, lsn)
+	}
+	return nil
+}
+
+// BackgroundWrite is the background walwriter's periodic pre-write+flush, the
+// goopg analog of PostgreSQL's XLogBackgroundFlush (walwriter.c). It runs on the
+// dedicated walwriter goroutine every wal_writer_delay and is NOT a group-commit
+// participant: it takes the WAL write lock with a plain blocking lock() (PG's
+// walwriter does a plain LWLockAcquire, not AcquireOrWait), drains the published
+// frontier and fdatasyncs it, so buffered WAL reaches disk even when no backend
+// is committing.
+//
+// It flushes the full published contiguous frontier each tick (write == flush).
+// PostgreSQL's walwriter throttles fsyncs via wal_writer_flush_after and page-
+// rounds its writes, doing a write-only (no fsync) tick when little has
+// accumulated; that only fires on an async-LSN early wakeup, because a plain
+// timer tick always satisfies the "≥ wal_writer_delay since the last flush"
+// rule and therefore flushes. goopg has no async-LSN early-wakeup latch yet, so
+// every tick is a timer tick and we flush the whole frontier — matching the
+// prior FlushUpTo(WrittenLSN()) durability (async commits are durable within one
+// wal_writer_delay) while now going through the plain-lock backend-flush path.
+// The wal_writer_flush_after / page-rounding / write-only split activate once
+// the early-wakeup latch lands (deferred; see the deferral ledger).
+func (w *Writer) BackgroundWrite() error {
+	st := w.stateRef
+	frontier := st.publishedFrontier()
+	if frontier == 0 || frontier <= w.flushedLSNAtomic.Load() {
+		return nil // nothing new to make durable
+	}
+	if w.OnWALSync != nil {
+		w.OnWALSync()
+	}
+	if w.OnWALSyncDone != nil {
+		defer w.OnWALSyncDone()
+	}
+	return w.backgroundFlushLocked(frontier)
+}
+
+// backgroundFlushLocked takes writeMu with a plain blocking lock (no group-
+// commit tri-state — the walwriter is a background pre-writer, not a committer)
+// and flushes up to at least frontier. The deferred release is panic-safe:
+// leaking writeMu would wedge every commit (04 §4.7).
+func (w *Writer) backgroundFlushLocked(frontier uint64) (err error) {
+	st := w.stateRef
+	st.writeMu.lock()
+	defer st.writeMu.release()
+	select {
+	case <-w.done:
+		return nil // Close won the lock and tore down the files; do not touch them
+	default:
+	}
+	if frontier <= st.flushedLSN {
+		return nil // a committer flushed past us while we waited for the lock
+	}
+	// Widen with anything published since we sampled the frontier (publish-only,
+	// no waiting) so a late-arriving record rides this same fsync.
+	if t := st.publishedFrontier(); t > frontier {
+		frontier = t
+	}
+	err = st.xlogWrite(writeRqst{write: frontier, flush: frontier})
+	if err != nil {
+		w.stickyErr.Store(&flushErr{err: err})
+		return err
+	}
+	w.stickyErr.Store(nil)
+	return nil
+}
+
+// publishedFrontier returns the current published contiguous WAL frontier
+// (the highest LSN whose bytes are all safely in the ring/segments), without
+// waiting. In pageHeaders mode it is the stripe core's PublishUpTo result; in
+// legacy mode appends complete atomically under appendMu, so it is
+// writeLSNMirror.
+func (s *state) publishedFrontier() uint64 {
+	if !s.pageHeaders {
+		if s.writeLSNMirror != nil {
+			return s.writeLSNMirror.Load()
+		}
+		return 0
+	}
+	curr, _ := s.core.Load()
+	return uint64(s.core.PublishUpTo(int64(curr)))
+}
+
+// waitInsertionsToFinish spins until the published contiguous frontier reaches
+// lsn (the goopg WaitXLogInsertionsToFinish analog). It is called BEFORE
+// acquiring writeMu. The in-flight window is a bounded stripe memcpy, so a
+// yield-spin with escalation suffices. Legacy mode has no stripe in-flight
+// window (appends publish atomically under appendMu), so it returns the written
+// frontier immediately.
+func (s *state) waitInsertionsToFinish(lsn uint64) uint64 {
+	if !s.pageHeaders {
+		if s.writeLSNMirror != nil {
+			if m := s.writeLSNMirror.Load(); m >= lsn {
+				return m
+			}
+		}
+		return lsn
+	}
+	for i := 0; ; i++ {
+		if f := s.publishedFrontier(); f >= lsn {
+			return f
+		}
+		if i < 64 {
+			runtime.Gosched()
+		} else {
+			time.Sleep(10 * time.Microsecond)
+		}
+	}
+}
+
+// RemoveOldSegments retires any WAL segment file whose contents end
 // strictly before the segment that contains keepLSN. The segment
 // containing keepLSN — and every segment after it — is preserved, so
 // the caller can pass `min(checkpointLSN, min(slot.RestartLSN))` and
 // be sure no record needed for crash recovery or for an attached
 // standby is removed.
 //
+// Up to `ceil(Config.MinWALSize/SegmentSize)` of the newest obsolete
+// segments are recycled (zero-filled and renamed into fresh future
+// segment slots) rather than unlinked, so a later openSegment for
+// that slot skips its own create+zero-fill+directory-fsync. The rest
+// are unlinked as before. Config.MinWALSize <= 0 disables recycling
+// (every obsolete segment is unlinked, the pre-M0122-0009 behaviour).
+//
 // keepLSN == 0 is a no-op (no records have been written yet).
 //
-// The op runs on the writer's serialised loop so it cannot race with
-// an in-flight Append or Flush. Open file handles for removed segments
-// are closed before the unlink and dropped from the writer's cache so
-// subsequent writes never re-touch a deleted file.
+// removeOldSegments takes writeMu so it cannot race an in-flight backend
+// flush or slow append. Open file handles for retired segments are closed
+// before the unlink/rename and dropped from the writer's cache so subsequent
+// writes never re-touch the old file.
 //
-// Returns the number of segment files that were removed.
-func (w *Writer) RemoveOldSegments(keepLSN uint64) (int, error) {
+// Returns the number of segment files unlinked and the number recycled.
+func (w *Writer) RemoveOldSegments(keepLSN uint64) (removed, recycled int, err error) {
+	return w.sendRemoveOldSegments(keepLSN, 0, 0)
+}
+
+// RemoveOldSegmentsWithEstimate is RemoveOldSegments extended with the two
+// remaining inputs to upstream's XLOGfileslop formula (xlog.c):
+// distanceEstimateBytes (CheckPointDistanceEstimate — the moving average of
+// inter-checkpoint WAL volume) and completionTarget
+// (checkpoint_completion_target). Together with Config.MinWALSize/MaxWALSize
+// they size how many of the newest obsolete segments are recycled, growing
+// past the MinWALSize floor under sustained write volume but never past the
+// MaxWALSize ceiling. Passing 0 for both reproduces RemoveOldSegments'
+// MinWALSize-only floor exactly. See
+// docs/design/0122-0009-wal-segment-recycling.md.
+func (w *Writer) RemoveOldSegmentsWithEstimate(keepLSN uint64, distanceEstimateBytes, completionTarget float64) (removed, recycled int, err error) {
+	return w.sendRemoveOldSegments(keepLSN, distanceEstimateBytes, completionTarget)
+}
+
+func (w *Writer) sendRemoveOldSegments(keepLSN uint64, distanceEstimateBytes, completionTarget float64) (removed, recycled int, err error) {
 	if keepLSN == 0 {
-		return 0, nil
+		return 0, 0, nil
 	}
-	resp := make(chan result, 1)
-	if err := w.send(op{kind: opRecycle, lsn: keepLSN, resp: resp}); err != nil {
-		return 0, err
+	// Direct call (slice 5): removeOldSegments takes writeMu, serialising its
+	// files/dirty mutations against the backend flush holder and slow appends
+	// (slice 3); the dedicated writer goroutine is no longer needed. Recycle is
+	// checkpoint-driven and the checkpointer is quiesced before Close.
+	st := w.stateRef
+	if st == nil {
+		return 0, 0, ErrClosed
 	}
-	r := <-resp
-	return r.removed, r.err
+	select {
+	case <-w.done:
+		return 0, 0, ErrClosed
+	default:
+	}
+	return st.removeOldSegments(keepLSN, distanceEstimateBytes, completionTarget)
 }
 
 // Close flushes dirty segments, closes files, and stops the worker.
+// Close flushes any remaining WAL, closes the segment files, and wakes every
+// parked flush waiter. It is idempotent (safe to call more than once) and must
+// be called only after all appenders have quiesced — the caller's lifecycle
+// contract, unchanged from when a single writer goroutine owned teardown.
 func (w *Writer) Close() error {
-	resp := make(chan result, 1)
-	if err := w.send(op{kind: opClose, resp: resp}); err != nil {
-		if errors.Is(err, ErrClosed) {
-			return nil
+	w.closeOnce.Do(func() {
+		st := w.stateRef
+		// Signal closed first so any flush waiter parked in acquireOrWait wakes
+		// with ErrClosed and new appends short-circuit.
+		close(w.done)
+		if st == nil {
+			return
 		}
-		return err
-	}
-	r := <-resp
-	<-w.done
-	return r.err
-}
-
-func (w *Writer) send(req op) error {
-	select {
-	case <-w.done:
-		return ErrClosed
-	case w.ops <- req:
-		return nil
-	}
+		// Serialise the final flush + file teardown against any in-flight
+		// holder (a backend flusher or a racing walwriter tick) via the WAL
+		// write lock; BackgroundWrite re-checks done under the lock and bails,
+		// so whoever loses the lock never touches torn-down files.
+		st.writeMu.lock()
+		w.closeErr = st.close()
+		st.writeMu.release()
+	})
+	return w.closeErr
 }
 
 func loadState(cfg Config) (*state, error) {
@@ -998,6 +1304,46 @@ func detectWritePos(walDir string, segSize int64, pageHeaders bool) (int64, uint
 	// Gap detection (missing segment in the retained range) is still
 	// done correctly by comparing consecutive entries.
 	firstSegNo := segNos[0]
+
+	// M0007 eager-lookahead follow-up: state.eagerPreallocSegment can
+	// leave a fully zero-filled "future" segment on disk beyond the
+	// segment that actually holds the last real record — it
+	// preallocates segNo+1 (to full SegmentSize, entirely zero) as
+	// soon as segNo is opened for real use, so a crash/restart before
+	// the writer ever reaches segNo+1 leaves that file sitting there,
+	// completely untouched. Blindly trusting the single
+	// highest-numbered file as "the last, possibly-partial segment"
+	// (this function's pre-eager-lookahead rule) would then scan that
+	// all-zero file and silently treat the genuinely-active segment
+	// below it as "fully used" via the non-last size-only fast path,
+	// overshooting writePos to the very end of that segment instead
+	// of its true last record.
+	//
+	// Only a segment whose on-disk size equals the full configured
+	// SegmentSize can possibly be such a phantom — a real "not yet
+	// written" segment in legacy (non-preallocated) mode is always
+	// short (0 or partial bytes, handled correctly by the untouched
+	// scan-the-literal-last-segment logic below already). So: drop
+	// the highest segNo from consideration when it is both full-size
+	// AND scans as entirely empty (0 bytes used before the first EOS
+	// sentinel), and repeat on the segment below it, until a segment
+	// fails that test (real content, or short/legacy) or only one
+	// segment remains. At most one such phantom can exist at a time
+	// in practice (eager lookahead only ever preallocates a single
+	// segment ahead of the one currently in real use), but the loop
+	// tolerates more defensively.
+	lastIdx := len(segNos) - 1
+	for lastIdx > 0 && segSizes[segNos[lastIdx]] == segSize {
+		usedBytes, _, scanErr := scanLastSegmentEnd(walDir, segNos[lastIdx], segSizes[segNos[lastIdx]], segSize, pageHeaders)
+		if scanErr != nil {
+			return 0, 0, scanErr
+		}
+		if usedBytes != 0 {
+			break
+		}
+		lastIdx--
+	}
+	segNos = segNos[:lastIdx+1]
 
 	// Start writePos at the absolute LSN of the first retained segment
 	// so the result is an absolute byte offset, not one relative to
@@ -1158,129 +1504,6 @@ func scanLastSegmentEnd(walDir string, segNo uint64, segSize int64, cfgSegSize i
 	return int64(off), lastRecPtr, nil
 }
 
-func (s *state) loop(ops <-chan op, done chan<- struct{}) {
-	// Pin this goroutine to its OS thread to eliminate migration
-	// overhead on the fdatasync hot path. M0098-0002.
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-	if s.onLoopStart != nil {
-		s.onLoopStart()
-	}
-	if s.onLoopEnd != nil {
-		defer s.onLoopEnd()
-	}
-	defer close(done)
-	// flushSig is s.fg.signal; using a local avoids a nil-check on
-	// every select iteration when fg is absent (tests that build a
-	// state without a Writer use fg=nil).
-	var flushSig <-chan struct{}
-	if s.fg != nil {
-		flushSig = s.fg.signal
-	}
-	for {
-		select {
-		case req, ok := <-ops:
-			if !ok {
-				return
-			}
-			switch req.kind {
-			case opAppend:
-				start, end, err := s.append(req.payload)
-				req.resp <- result{startLSN: start, endLSN: end, err: err}
-				if err == nil && s.onAppend != nil {
-					s.onAppend()
-				}
-			case opAppendRaw:
-				start, end, err := s.appendRaw(req.payload)
-				req.resp <- result{startLSN: start, endLSN: end, err: err}
-				if err == nil && s.onAppend != nil {
-					s.onAppend()
-				}
-			case opFlush:
-				// Legacy path kept for backward compatibility.
-				// New code routes through flushSig via FlushUpTo.
-				req.resp <- result{err: s.flushUpTo(req.lsn)}
-			case opRecycle:
-				n, err := s.removeOldSegments(req.lsn)
-				req.resp <- result{removed: n, err: err}
-			case opClose:
-				// Drain any pending group-flush requests before closing.
-				s.handleGroupFlush()
-				err := s.close()
-				req.resp <- result{err: err}
-				return
-			case opWALBufStat:
-				snap := walBufStatSnapshot{}
-				if s.walBuf != nil {
-					snap.cap = s.walBuf.cap
-					snap.resident = s.walBuf.resident()
-				}
-				req.resp <- result{walBufStat: snap}
-			default:
-				req.resp <- result{err: fmt.Errorf("wal: unknown operation %d", req.kind)}
-			}
-		case _, ok := <-flushSig:
-			if !ok {
-				return
-			}
-			s.handleGroupFlush()
-		}
-	}
-}
-
-// handleGroupFlush drains the entire pending flush queue, issues one
-// fdatasync for the maximum LSN requested, then notifies all waiters.
-// Called only from the writer goroutine. M0098-0002.
-//
-// M0099-0003: when commitSiblings or more concurrent waiters are already
-// in the queue, sleep commitDelayUs microseconds before flushing so that
-// additional FlushUpTo callers can arrive and be served by the same
-// fdatasync. This mirrors PostgreSQL's commit_delay / commit_siblings
-// semantics and increases the average batch size under high concurrency.
-func (s *state) handleGroupFlush() {
-	if s.fg == nil {
-		return
-	}
-	s.fg.mu.Lock()
-	queue := s.fg.queue
-	s.fg.queue = nil
-	s.fg.mu.Unlock()
-	if len(queue) == 0 {
-		return
-	}
-	// Batching delay (M0099-0003, re-enabled after Path A race fix M0099):
-	// if commitSiblings or more concurrent waiters are queued, sleep
-	// commitDelayUs so additional callers can arrive and be served by the
-	// same fdatasync. The sleep runs on the OS-thread-pinned writer goroutine
-	// (runtime.LockOSThread, M0098-0002). The state.append Path A race that
-	// previously caused stale writePos under concurrency is now fixed.
-	if commitDelayUs > 0 && len(queue) >= commitSiblings {
-		time.Sleep(commitDelayUs * time.Microsecond)
-		s.fg.mu.Lock()
-		extra := s.fg.queue
-		s.fg.queue = nil
-		s.fg.mu.Unlock()
-		if len(extra) > 0 {
-			queue = append(queue, extra...)
-		}
-	}
-	// Find the highest LSN across all requests; one flush satisfies all.
-	var maxLSN uint64
-	for _, req := range queue {
-		if req.lsn > maxLSN {
-			maxLSN = req.lsn
-		}
-	}
-	err := s.flushUpTo(maxLSN)
-	// Notify all callers. req.err is set before close(req.done) so the
-	// caller's read of req.err after <-req.done is race-free (close is
-	// a happens-before barrier in Go).
-	for _, req := range queue {
-		req.err = err
-		close(req.done)
-	}
-}
-
 func (s *state) append(payload []byte) (uint64, uint64, error) {
 	// PG-compat (pageHeaders) path: use stripe B (core.AppendXLogPayload)
 	// for Path B, and the old encode path for Path A (direct disk write).
@@ -1289,6 +1512,14 @@ func (s *state) append(payload []byte) (uint64, uint64, error) {
 	}
 
 	// Non-pageHeaders (legacy binary format): original encodeRecord path.
+	// This slow append drains the ring and mutates files/dirty/head, so it
+	// takes writeMu to serialise against the backend flush holder (which is
+	// writeMu-only, slice 3). Order: writeMu → appendMu (the flusher takes
+	// writeMu only, fast-path tryAppend takes appendMu.RLock only, so no
+	// cycle). The hot fast path (tryAppend) never reaches here.
+	s.writeMu.lock()
+	defer s.writeMu.release()
+
 	record := encodeRecord(payload)
 	realRecLen := len(record)
 
@@ -1363,6 +1594,12 @@ func (s *state) append(payload []byte) (uint64, uint64, error) {
 //
 // Called exclusively when s.pageHeaders == true.
 func (s *state) appendPGCompat(payload []byte) (uint64, uint64, error) {
+	// Slow (loop) append path: drains the ring and mutates files/dirty/head, so
+	// it takes writeMu to serialise against the backend flush holder (slice 3).
+	// Order: writeMu → appendMu. The hot fast path (tryAppend) never reaches here.
+	s.writeMu.lock()
+	defer s.writeMu.release()
+
 	// Conservative emitted size: paddedLen + max page-header overhead
 	// (40-byte long PHD at a segment boundary + 24-byte contrecord header).
 	_, paddedLen := predictXLogRecordLen(payload)
@@ -1519,6 +1756,11 @@ func (s *state) appendRaw(stream []byte) (uint64, uint64, error) {
 	if len(stream) == 0 {
 		return 0, 0, ErrEmptyPayload
 	}
+	// Walreceiver (standby) append: drains + resets the ring and mutates
+	// files/dirty, so it takes writeMu to serialise against the backend flush
+	// holder (slice 3). Order: writeMu → appendMu.
+	s.writeMu.lock()
+	defer s.writeMu.release()
 
 	if s.walBuf == nil || !s.walBuf.canHold(len(stream)) {
 		s.appendMu.Lock()
@@ -1758,16 +2000,30 @@ func (s *state) drainBufferBytes(n int64, reason drainReason) error {
 	return nil
 }
 
-// stripeNum returns the caller's process number for stripe selection in
-// core.AppendXLogPayload. Falls back to 0 for goroutines that are not
-// registered in the activity registry (initdb, checkpointer, walreceiver,
-// tests) — they all land on stripe 0, which is always valid.
+// stripeNum returns the caller's backend process number for stripe
+// selection in core.AppendXLogPayload. It reads a goroutine-local id set
+// once per connection (gls.SetBackendID at backend startup) instead of
+// deriving the id via runtime.Stack.
+//
+// Falls back to 0 for goroutines that have no backend id (initdb,
+// checkpointer, walwriter/state.loop, walreceiver, tests) — they land on
+// stripe 0, which is always valid AND is a required invariant: the
+// state.loop slow path (appendPGCompat) runs on the unregistered writer
+// goroutine and its cross-segment pad bookkeeping in insertPosTracker
+// assumes stripe 0. Delivering the exact procNum (not, e.g., a per-P
+// index) preserves today's behavior precisely: registered backends keep
+// their stable per-backend stripe and unregistered goroutines keep 0.
+//
+// The previous implementation obtained the same procNum via
+// activity.LookupCurrentGoroutine(), which called runtime.Stack on EVERY
+// WAL append — 57% of server CPU under pgbench simple-update (see
+// analysis/perf-optimize2, fix-01). gls.BackendID is a pointer load +
+// tiny label scan, allocation-free.
 func (s *state) stripeNum() int32 {
-	_, procNum, ok := activity.LookupCurrentGoroutine()
-	if !ok {
-		return 0
+	if id, ok := gls.BackendID(); ok {
+		return id
 	}
-	return procNum
+	return 0
 }
 
 // drainBufferUpTo drains every byte from walBuf.head through (but
@@ -1795,33 +2051,66 @@ func (s *state) doSync(f *os.File) error {
 	return dataSync(f)
 }
 
-func (s *state) flushUpTo(lsn uint64) error {
-	if lsn == 0 {
+// writeRqst describes a WAL write/flush request, the goopg analog of
+// PostgreSQL's XLogwrtRqst. `flush == 0` means "write ring bytes to the segment
+// files (OS cache) only, do NOT fdatasync" — the walwriter pre-write and the
+// ring-overflow-drain path (PG's AdvanceXLInsertBuffer eviction, WriteRqst.Flush
+// == 0). A committer always passes flush == write. See
+// docs/design/wal-backend-flush/ 03 §3.2 / 04 §4.5.
+type writeRqst struct {
+	write uint64 // drain ring bytes up to here into segment files (pwrite)
+	flush uint64 // additionally fdatasync segments up to here; 0 = write-only
+}
+
+// xlogWrite is the goopg analog of PostgreSQL's XLogWrite: Stage 1 drains
+// buffered WAL bytes ≤ rq.write from the ring to segment files ("written to the
+// OS cache", published via drainedLSNAtomic = PG logWriteResult); Stage 2, only
+// when rq.flush > 0, fdatasyncs the dirty segments ≤ rq.flush ("durable",
+// published via flushedLSNAtomic = PG logFlushResult, AFTER the sync).
+//
+// Today it is called only by the writer goroutine with rq.write == rq.flush, so
+// it is behavior-identical to the pre-slice-2 flushUpTo. In the backend-driven
+// model (slice 3+) the caller holds the WAL write lock and passes a widened
+// frontier; the walwriter (slice 4) and the overflow drain pass rq.flush == 0.
+func (s *state) xlogWrite(rq writeRqst) error {
+	if rq.write == 0 {
 		return nil
 	}
-	// Use writeLSNMirror (atomic) so LSNs written by concurrent
-	// tryAppend goroutines under RLock are visible here without holding appendMu.
+	// Bound rq.write against the written frontier. Use writeLSNMirror (atomic)
+	// so LSNs written by concurrent tryAppend goroutines under RLock are visible
+	// here without holding appendMu.
 	writtenLSN := s.writeLSN
 	if s.writeLSNMirror != nil {
 		if m := s.writeLSNMirror.Load(); m > writtenLSN {
 			writtenLSN = m
 		}
 	}
-	if lsn > writtenLSN {
-		return fmt.Errorf("%w: have %d, need %d", ErrLSNNotWritten, writtenLSN, lsn)
+	if rq.write > writtenLSN {
+		return fmt.Errorf("%w: have %d, need %d", ErrLSNNotWritten, writtenLSN, rq.write)
 	}
-	if lsn <= s.flushedLSN {
+
+	// --- Stage 1: drain ring bytes ≤ rq.write to segment files (pwrite) ---
+	// (M0013-0001) No-op when walBuf is nil or already drained past rq.write.
+	if rq.write > s.drainedLSN {
+		if err := s.drainBufferUpTo(rq.write); err != nil {
+			return err
+		}
+	}
+	// Publish the OS-cache write frontier (PG logWriteResult). Single writer at
+	// a time (writer goroutine today; the write-lock holder in slice 3+).
+	if s.drainedLSNMirror != nil {
+		s.drainedLSNMirror.Store(s.drainedLSN)
+	}
+
+	// --- Stage 2: fdatasync dirty segments ≤ rq.flush (skipped when write-only) ---
+	if rq.flush == 0 {
+		return nil
+	}
+	if rq.flush <= s.flushedLSN {
 		return nil
 	}
 
-	// Stage 1 (M0013-0001): drain walBuf bytes ≤ lsn to segment
-	// files so Stage 2's dataSync covers every byte the caller
-	// asked for. No-op when walBuf is nil or already drained.
-	if err := s.drainBufferUpTo(lsn); err != nil {
-		return err
-	}
-
-	targetSeg := segmentForLSN(lsn, s.cfg.SegmentSize)
+	targetSeg := segmentForLSN(rq.flush, s.cfg.SegmentSize)
 	dirty := make([]uint64, 0, len(s.dirty))
 	for seg := range s.dirty {
 		if seg <= targetSeg {
@@ -1848,49 +2137,97 @@ func (s *state) flushUpTo(lsn uint64) error {
 		delete(s.dirty, seg)
 	}
 
-	s.flushedLSN = lsn
-	// M0057-0001: LOG each WAL flush so benchmark runs show WAL writer activity.
+	s.flushedLSN = rq.flush
+	// Publish the durable LSN AFTER the fdatasync loop above so FlushUpTo's
+	// pre-enqueue fast exit only ever observes a genuinely durable value
+	// (analysis/perf-optimize2, fix-03).
+	if s.flushedLSNMirror != nil {
+		s.flushedLSNMirror.Store(rq.flush)
+	}
+	// M0057-0001: log each WAL flush so benchmark runs show WAL writer
+	// activity. Demoted to Debug (fix-03): at c=50 simple-update this fired
+	// ~143×/s on the commit critical path while committers waited on the
+	// flush-done channel — a per-barrier structured-log formatting cost.
 	l := s.cfg.Logger
 	if l == nil {
 		l = slog.Default()
 	}
-	l.Info("walwriter flush", "lsn", lsn, "segments_fsynced", len(dirty))
+	l.Debug("walwriter flush", "lsn", rq.flush, "segments_fsynced", len(dirty))
 	return nil
 }
 
-// removeOldSegments unlinks every segment whose final byte sits
-// strictly before the segment containing keepLSN. Runs on the loop
-// goroutine so it serialises with append/flush and won't race with
-// openSegment.
+// flushUpTo persists WAL bytes up to lsn with fdatasync semantics (write ==
+// flush). Thin wrapper over xlogWrite retained for the current writer-goroutine
+// caller; the lsn == 0 and already-flushed fast paths preserve the pre-slice-2
+// semantics exactly.
+func (s *state) flushUpTo(lsn uint64) error {
+	if lsn == 0 {
+		return nil
+	}
+	if lsn <= s.flushedLSN {
+		return nil
+	}
+	return s.xlogWrite(writeRqst{write: lsn, flush: lsn})
+}
+
+// removeOldSegments retires every segment whose final byte sits
+// strictly before the segment containing keepLSN, either by
+// unlinking it or — for up to `computeSpareSegments(...)` of the
+// newest obsolete segments — recycling it into a fresh future
+// segment slot. Runs on the loop goroutine so it serialises with
+// append/flush and won't race with openSegment.
+//
+// distanceEstimateBytes/completionTarget are the two extra
+// XLOGfileslop inputs RemoveOldSegmentsWithEstimate threads through;
+// RemoveOldSegments passes 0 for both, which computeSpareSegments
+// reduces to the original `ceil(Config.MinWALSize/SegmentSize)` floor
+// exactly (see computeSpareSegments).
 //
 // Behaviour notes:
 //   - The segment that contains keepLSN is preserved (the standby /
 //     recovery still needs to read records inside it).
-//   - Open file handles for removed segments are closed and dropped
+//   - Open file handles for retired segments are closed and dropped
 //     from s.files so a subsequent writeAt that somehow targets a
 //     stale segment number reopens fresh (it shouldn't — keepLSN
-//     guarantees we only delete fully-superseded segments — but the
+//     guarantees we only retire fully-superseded segments — but the
 //     defensive close keeps the invariant explicit).
-//   - dirty flags for removed segments are dropped: the bytes were
+//   - dirty flags for retired segments are dropped: the bytes were
 //     superseded, no fdatasync owes them anymore.
 //   - Missing files are silently skipped so a partially-cleaned
 //     directory (e.g. a manual rm during testing) doesn't wedge the
 //     loop.
-func (s *state) removeOldSegments(keepLSN uint64) (int, error) {
+//   - Recycling targets the lowest-numbered free segment slot at or
+//     after keepSeg (mirrors upstream InstallXLogFileSegment's
+//     find_free scan), so it never clobbers a segment that already
+//     exists. The recycled file is zero-filled after the rename —
+//     unlike upstream, which leaves the old content in place — because
+//     decodeRecord's graceful-EOS heuristic (docs/design/0007-0001-wal-segment-preallocation.md)
+//     distinguishes "end of valid WAL" from "corruption" by checking
+//     whether the bytes past a bad/absent record are all zero. A
+//     recycled segment's leftover content is a real, well-formed
+//     record from its previous life (valid CRC and all), so leaving
+//     it in place would let recovery misread stale history as live
+//     WAL. See docs/design/0122-0009-wal-segment-recycling.md.
+func (s *state) removeOldSegments(keepLSN uint64, distanceEstimateBytes, completionTarget float64) (removed, recycled int, err error) {
 	if keepLSN == 0 {
-		return 0, nil
+		return 0, 0, nil
 	}
 	keepSeg := segmentForLSN(keepLSN, s.cfg.SegmentSize)
 	if keepSeg == 0 {
-		return 0, nil
+		return 0, 0, nil
 	}
 
 	entries, err := os.ReadDir(s.cfg.WALDir)
 	if err != nil {
-		return 0, fmt.Errorf("wal: list %s: %w", s.cfg.WALDir, err)
+		return 0, 0, fmt.Errorf("wal: list %s: %w", s.cfg.WALDir, err)
 	}
 
-	removed := 0
+	type staleSeg struct {
+		segNo uint64
+		name  string
+	}
+	existing := make(map[uint64]bool, len(entries))
+	var stale []staleSeg
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
@@ -1899,24 +2236,146 @@ func (s *state) removeOldSegments(keepLSN uint64) (int, error) {
 		if !ok {
 			continue
 		}
-		if segNo >= keepSeg {
+		existing[segNo] = true
+		if segNo < keepSeg {
+			stale = append(stale, staleSeg{segNo, e.Name()})
+		}
+	}
+
+	spares := computeSpareSegments(s.cfg.MinWALSize, s.cfg.MaxWALSize, s.cfg.SegmentSize, distanceEstimateBytes, completionTarget)
+
+	// Recycle the newest obsolete segments first (mirrors upstream's
+	// RemoveOldXlogFiles, which walks toward the retention cutoff from
+	// the current end of WAL).
+	sort.Slice(stale, func(i, j int) bool { return stale[i].segNo > stale[j].segNo })
+
+	// Serialise the s.files / s.dirty map mutations below against the backend
+	// flush holder, which iterates s.dirty and opens s.files under writeMu
+	// during xlogWrite (docs/design/wal-backend-flush/ slice 3). Without this,
+	// a concurrent recycle and flush race the maps → fatal concurrent map
+	// access. Recycle is checkpoint-rare, so holding writeMu across the (slow)
+	// file rename/remove I/O here is acceptable; slice 7 may narrow it.
+	s.writeMu.lock()
+	defer s.writeMu.release()
+
+	nextTarget := keepSeg
+	anyRecycled := false
+	for _, o := range stale {
+		if f, open := s.files[o.segNo]; open {
+			_ = f.Close()
+			delete(s.files, o.segNo)
+		}
+		delete(s.dirty, o.segNo)
+		oldPath := filepath.Join(s.cfg.WALDir, o.name)
+
+		if recycled < spares {
+			for existing[nextTarget] {
+				nextTarget++
+			}
+			newPath := filepath.Join(s.cfg.WALDir, formatSegmentName(nextTarget))
+			if rerr := recycleSegmentFile(oldPath, newPath, s.cfg.SegmentSize); rerr != nil {
+				if errors.Is(rerr, os.ErrNotExist) {
+					continue
+				}
+				return removed, recycled, rerr
+			}
+			delete(existing, o.segNo)
+			existing[nextTarget] = true
+			nextTarget++
+			recycled++
+			anyRecycled = true
 			continue
 		}
-		if f, open := s.files[segNo]; open {
-			_ = f.Close()
-			delete(s.files, segNo)
-		}
-		delete(s.dirty, segNo)
-		path := filepath.Join(s.cfg.WALDir, e.Name())
-		if err := os.Remove(path); err != nil {
-			if errors.Is(err, os.ErrNotExist) {
+
+		if rerr := os.Remove(oldPath); rerr != nil {
+			if errors.Is(rerr, os.ErrNotExist) {
 				continue
 			}
-			return removed, fmt.Errorf("wal: remove %s: %w", path, err)
+			return removed, recycled, fmt.Errorf("wal: remove %s: %w", oldPath, rerr)
 		}
 		removed++
 	}
-	return removed, nil
+
+	if anyRecycled {
+		// Directory fsync makes the renamed dirents durable, mirroring
+		// openSegment's post-creation fsync for brand-new segments.
+		if dir, derr := os.Open(s.cfg.WALDir); derr == nil {
+			_ = dir.Sync()
+			_ = dir.Close()
+		}
+	}
+	return removed, recycled, nil
+}
+
+// computeSpareSegments decides how many of the newest obsolete WAL
+// segments removeOldSegments should recycle (vs. unlink), mirroring
+// upstream's XLOGfileslop (postgres/src/backend/access/transam/xlog.c).
+// Unlike upstream — which computes absolute minSegNo/maxSegNo/recycleSegNo
+// bounds from an absolute LSN — this works entirely in segment counts
+// relative to the retention keep-segment, which is behaviourally
+// equivalent (both ultimately bound "how many segments past the keep
+// point to keep as spares") without needing goopg's 1-based LSN encoding
+// to line up bit-for-bit with upstream's 0-based XLogSegNo arithmetic.
+//
+//   - minWALSize/maxWALSize mirror min_wal_size/max_wal_size (bytes).
+//     maxWALSize <= 0 disables the ceiling (matches the pre-existing,
+//     MinWALSize-only behaviour when distanceEstimateBytes is also 0).
+//   - distanceEstimateBytes mirrors CheckPointDistanceEstimate: the
+//     exponential moving average of inter-checkpoint WAL volume
+//     (Checkpointer.CheckPointDistanceEstimate). 0 (no estimate yet,
+//     e.g. before the first checkpoint cycle completes) contributes
+//     nothing beyond the MinWALSize floor.
+//   - completionTarget mirrors checkpoint_completion_target, applied via
+//     the same "(1 + target) * distance, then +10% for good measure"
+//     fudge factor XLOGfileslop uses.
+//
+// Passing distanceEstimateBytes=0, completionTarget=0 reproduces the
+// original `ceil(minWALSize/segmentSize)` floor exactly — the sole
+// behaviour RemoveOldSegments (and every test written against it) pins.
+func computeSpareSegments(minWALSize, maxWALSize, segmentSize int64, distanceEstimateBytes, completionTarget float64) int {
+	if segmentSize <= 0 {
+		return 0
+	}
+	spares := ceilSegs(minWALSize, segmentSize)
+
+	distance := (1.0 + completionTarget) * distanceEstimateBytes
+	distance *= 1.10 // upstream: "add 10% for good measure"
+	if distSegs := ceilSegs(int64(math.Ceil(distance)), segmentSize); distSegs > spares {
+		spares = distSegs
+	}
+
+	if maxWALSize > 0 {
+		if maxSegs := ceilSegs(maxWALSize, segmentSize); spares > maxSegs {
+			spares = maxSegs
+		}
+	}
+	return spares
+}
+
+// ceilSegs returns ceil(n/segmentSize) as an int, or 0 when n or
+// segmentSize is non-positive (mirrors the "<= 0 disables this" convention
+// MinWALSize/MaxWALSize already use elsewhere in this file).
+func ceilSegs(n, segmentSize int64) int {
+	if n <= 0 || segmentSize <= 0 {
+		return 0
+	}
+	return int((n + segmentSize - 1) / segmentSize)
+}
+
+// recycleSegmentFile renames an obsolete WAL segment into a fresh
+// future segment slot and zero-fills it. See removeOldSegments for
+// why the zero-fill (absent from upstream's equivalent
+// InstallXLogFileSegment) is required here.
+func recycleSegmentFile(oldPath, newPath string, size int64) error {
+	if err := os.Rename(oldPath, newPath); err != nil {
+		return fmt.Errorf("wal: recycle rename %s -> %s: %w", oldPath, newPath, err)
+	}
+	f, err := os.OpenFile(newPath, os.O_RDWR, 0o600)
+	if err != nil {
+		return fmt.Errorf("wal: recycle open %s: %w", newPath, err)
+	}
+	defer f.Close()
+	return preallocateSegment(f, size)
 }
 
 func (s *state) writeAt(pos int64, buf []byte) error {
@@ -2011,7 +2470,88 @@ func (s *state) openSegment(segNo uint64) (*os.File, error) {
 	}
 
 	s.files[segNo] = f
+	// Eager next-segment lookahead (M0007 follow-up): kick off
+	// background preallocation of segNo+1 now, so that by the time
+	// the write head rolls over, openSegment(segNo+1) finds the file
+	// already zero-filled instead of paying preallocateSegment's cost
+	// synchronously on the commit path. Best-effort and idempotent —
+	// see eagerPreallocSegment.
+	s.eagerPreallocSegment(segNo + 1)
 	return f, nil
+}
+
+// eagerPreallocSegment preallocates segNo's file in the background,
+// if Config.Preallocate is enabled and no copy of the file exists or
+// is already being built. A later synchronous openSegment(segNo)
+// simply finds the file already in place (via os.Stat) and skips its
+// own zero-fill — so this is a pure latency optimization, never a
+// correctness dependency: if the background job is slow, aborts, or
+// loses a race, the synchronous path still preallocates segNo itself
+// exactly as it always has.
+func (s *state) eagerPreallocSegment(segNo uint64) {
+	if !s.cfg.Preallocate {
+		return
+	}
+	finalPath := filepath.Join(s.cfg.WALDir, formatSegmentName(segNo))
+	if _, err := os.Stat(finalPath); err == nil {
+		return
+	}
+
+	s.eagerMu.Lock()
+	if s.eagerInFlight == nil {
+		s.eagerInFlight = make(map[uint64]struct{})
+	}
+	if _, already := s.eagerInFlight[segNo]; already {
+		s.eagerMu.Unlock()
+		return
+	}
+	s.eagerInFlight[segNo] = struct{}{}
+	s.eagerMu.Unlock()
+
+	s.eagerWG.Go(func() {
+		defer func() {
+			s.eagerMu.Lock()
+			delete(s.eagerInFlight, segNo)
+			s.eagerMu.Unlock()
+		}()
+		s.eagerPreallocWorker(finalPath)
+	})
+}
+
+// eagerPreallocWorker zero-fills a fresh temp file and durably links
+// it into finalPath — mirroring upstream XLogFileInit's
+// create-as-temp-then-link-no-clobber pattern (xlog.c) — so a
+// concurrent synchronous openSegment for the same segment number can
+// never observe (or race against) a partially zero-filled file at the
+// real segment path. os.Link failing with "already exists" means the
+// synchronous path (or another eager attempt) won the race; that is
+// the expected, harmless outcome, not an error.
+func (s *state) eagerPreallocWorker(finalPath string) {
+	tmpPath := fmt.Sprintf("%s.eager%d.tmp", finalPath, os.Getpid())
+	tf, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o600)
+	if err != nil {
+		return
+	}
+	defer os.Remove(tmpPath)
+
+	if err := preallocateSegment(tf, s.cfg.SegmentSize); err != nil {
+		_ = tf.Close()
+		return
+	}
+	_ = tf.Close()
+
+	if err := os.Link(tmpPath, finalPath); err != nil {
+		return
+	}
+
+	if s.walBufferCounters != nil {
+		s.walBufferCounters.segmentsPreallocated.Add(1)
+		s.walBufferCounters.preallocatedBytes.Add(s.cfg.SegmentSize)
+	}
+	if dir, derr := os.Open(s.cfg.WALDir); derr == nil {
+		_ = dir.Sync()
+		_ = dir.Close()
+	}
 }
 
 // preallocateSegment zero-fills f to size and fsyncs it. Mirrors
@@ -2067,6 +2607,21 @@ func (s *state) close() error {
 			firstErr = err
 		}
 	}
+
+	// Wait for any eager next-segment preallocation goroutines to
+	// finish before tearing down s.files — they only ever touch their
+	// own temp file + one os.Link into the WAL dir, never s.files
+	// itself, but waiting here keeps the writer's shutdown
+	// deterministic (no goroutine outliving Close, no stray temp file
+	// left behind by an abandoned worker). This MUST run after
+	// flushUpTo, not before: with Config.WALBuffers > 0, buffered
+	// bytes not yet drained to any segment file mean flushUpTo above
+	// can be the very first caller of openSegment for some segment,
+	// which itself triggers a brand-new eager job for the segment
+	// after it — a Wait() only at the top of this function would
+	// finish before that job even starts.
+	s.eagerWG.Wait()
+
 	for _, f := range s.files {
 		if err := f.Close(); err != nil && firstErr == nil {
 			firstErr = err

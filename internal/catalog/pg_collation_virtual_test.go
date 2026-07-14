@@ -8,7 +8,7 @@ import "testing"
 // collation-OID joins) depend on these resolving by OID and name.
 func TestPgCollationVirtualRows(t *testing.T) {
 	c := NewInMemory()
-	tbl, ok := c.tables["pg_catalog.pg_collation"]
+	tbl, ok := c.ns(DefaultDBOid).tables["pg_catalog.pg_collation"]
 	if !ok {
 		t.Fatal("pg_catalog.pg_collation not registered")
 	}

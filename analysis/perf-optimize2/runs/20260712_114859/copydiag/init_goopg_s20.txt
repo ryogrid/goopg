@@ -1,0 +1,32 @@
+dropping old tables...
+NOTICE:  table "pgbench_accounts" does not exist, skipping
+NOTICE:  table "pgbench_branches" does not exist, skipping
+NOTICE:  table "pgbench_history" does not exist, skipping
+NOTICE:  table "pgbench_tellers" does not exist, skipping
+creating tables...
+generating data (client-side)...
+100000 of 2000000 tuples (5%) of pgbench_accounts done (elapsed 0.01 s, remaining 0.11 s)
+200000 of 2000000 tuples (10%) of pgbench_accounts done (elapsed 0.02 s, remaining 0.19 s)
+300000 of 2000000 tuples (15%) of pgbench_accounts done (elapsed 6.67 s, remaining 37.81 s)
+400000 of 2000000 tuples (20%) of pgbench_accounts done (elapsed 10.38 s, remaining 41.52 s)
+500000 of 2000000 tuples (25%) of pgbench_accounts done (elapsed 16.33 s, remaining 48.99 s)
+600000 of 2000000 tuples (30%) of pgbench_accounts done (elapsed 23.60 s, remaining 55.07 s)
+700000 of 2000000 tuples (35%) of pgbench_accounts done (elapsed 27.03 s, remaining 50.19 s)
+800000 of 2000000 tuples (40%) of pgbench_accounts done (elapsed 30.45 s, remaining 45.68 s)
+900000 of 2000000 tuples (45%) of pgbench_accounts done (elapsed 34.08 s, remaining 41.65 s)
+1000000 of 2000000 tuples (50%) of pgbench_accounts done (elapsed 37.59 s, remaining 37.59 s)
+1100000 of 2000000 tuples (55%) of pgbench_accounts done (elapsed 44.76 s, remaining 36.63 s)
+1200000 of 2000000 tuples (60%) of pgbench_accounts done (elapsed 48.12 s, remaining 32.08 s)
+1300000 of 2000000 tuples (65%) of pgbench_accounts done (elapsed 51.47 s, remaining 27.72 s)
+1400000 of 2000000 tuples (70%) of pgbench_accounts done (elapsed 58.31 s, remaining 24.99 s)
+1500000 of 2000000 tuples (75%) of pgbench_accounts done (elapsed 61.80 s, remaining 20.60 s)
+1600000 of 2000000 tuples (80%) of pgbench_accounts done (elapsed 64.97 s, remaining 16.24 s)
+1700000 of 2000000 tuples (85%) of pgbench_accounts done (elapsed 71.31 s, remaining 12.58 s)
+1800000 of 2000000 tuples (90%) of pgbench_accounts done (elapsed 74.48 s, remaining 8.28 s) 
+1900000 of 2000000 tuples (95%) of pgbench_accounts done (elapsed 77.70 s, remaining 4.09 s)
+2000000 of 2000000 tuples (100%) of pgbench_accounts done (elapsed 83.96 s, remaining 0.00 s)
+vacuuming...
+creating primary keys...
+done in 93.17 s (drop tables 0.00 s, create tables 0.04 s, client-side generate 91.34 s, vacuum 0.46 s, primary keys 1.32 s).
+bench_rc=0
+walwriter_flush_lines=688

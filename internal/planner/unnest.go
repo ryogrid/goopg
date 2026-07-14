@@ -1121,6 +1121,59 @@ func findInExprInExpr(e Expr) *InExpr {
 	return nil
 }
 
+// correlatedInOperandSafeToUnnest verifies that the single
+// correlation pair unnestInExpr will use as the join key actually
+// encodes the original `in.Operand IN (subquery)` predicate, not
+// merely "a correlated row exists".
+//
+// unnestInExpr always builds the join's (LeftKey, RightKey) from
+// params[0] (the correlation equijoin pair pulled out of the
+// subquery's own WHERE clause) — it never looks at in.Operand or at
+// what the subquery actually SELECTs. That substitution is sound
+// only when:
+//
+//  1. the correlation's outer-scope side (params[0].OuterRef) is the
+//     SAME column as in.Operand. Otherwise the join checks "does a
+//     row exist whose correlation column matches some unrelated outer
+//     column" instead of "is in.Operand among the selected values" —
+//     a different predicate, silently wrong for both IN and NOT IN.
+//  2. the correlation's subquery-scope side (params[0].SubCol) is the
+//     SAME column the subquery projects. clonePlanReplacingOuter
+//     folds the correlation predicate into a tautology inside the
+//     cloned inner plan (relying on the join key to reinstate it); if
+//     the subquery selects a different column, that fold silently
+//     discards the correlation as a real filter.
+//
+// When both hold, every row that survives the correlation predicate
+// necessarily has a projected value equal to in.Operand and never
+// NULL (the equality correlation can't be satisfied by a NULL) — so
+// even a NOT IN Anti join is correct here without per-correlation-
+// group NullAware tracking (unlike the general correlated NOT IN
+// case, which still needs that — M0122-0011 deferral ledger).
+func correlatedInOperandSafeToUnnest(in *InExpr, params []unnestParam) bool {
+	if len(params) != 1 {
+		return false
+	}
+	operand, ok := in.Operand.(*ColumnRef)
+	if !ok {
+		return false
+	}
+	outerRef := params[0].OuterRef
+	if operand.Index != outerRef.Index || operand.SourceTableIdx != outerRef.SourceTableIdx || operand.Name != outerRef.Name {
+		return false
+	}
+	proj, ok := in.Plan.(*Project)
+	if !ok || len(proj.Targets) != 1 {
+		return false
+	}
+	selected, ok := proj.Targets[0].(*ColumnRef)
+	if !ok {
+		return false
+	}
+	subCol := params[0].SubCol
+	return selected.Index == subCol.Index && selected.SourceTableIdx == subCol.SourceTableIdx && selected.Name == subCol.Name
+}
+
 // canUnnestInExpr checks whether an IN (subquery) is a candidate
 // for unnesting into a semi-join.  The inner plan must have a
 // correlation predicate of the shape `inner_col = outer_ref`
@@ -1170,6 +1223,17 @@ func canUnnestInExprDepth(in *InExpr, depth int) bool {
 	if params == nil || len(params) == 0 {
 		return false
 	}
+	// unnestInExpr always keys the resulting join on the correlation
+	// pair (params[0]), never on in.Operand directly — that only
+	// encodes the same predicate as the original `operand IN
+	// (subquery)` when the correlation identifies exactly the value
+	// being tested. See correlatedInOperandSafeToUnnest's doc comment
+	// for the two required conditions and why a mismatch would
+	// silently change the query's meaning, not just miss an
+	// optimization.
+	if !correlatedInOperandSafeToUnnest(in, params) {
+		return false
+	}
 	// M0062-0004: nested IN subqueries are now accepted *if* each
 	// is itself unnestable. The pre-fix blanket reject blocked
 	// Q20's depth-2 IN. The recursive `unnestSubqueriesInPlan`
@@ -1191,16 +1255,26 @@ func canUnnestInExprDepth(in *InExpr, depth int) bool {
 }
 
 // isUnnestableNonCorrelatedIn checks the structural preconditions
-// for unnesting a non-correlated IN: the LHS is a ColumnRef, the
-// IN is not negated (NOT IN requires anti-semi-join semantics
-// which are out of scope for M0069-0005), and the inner plan has
-// exactly one output column. Without these the SemiJoin
-// rewriting would mis-shape the join.
+// for unnesting a non-correlated IN: the inner plan has exactly one
+// output column. Without this the Semi/Anti-join rewriting would
+// mis-shape the join.
+//
+// M0122-0011: NOT IN is now unnestable too (previously rejected —
+// "NOT IN requires anti-semi-join semantics which are out of scope
+// for M0069-0005"). unnestNonCorrelatedInExpr builds a
+// JoinTypeAnti with NullAware=true, which the executor gives
+// NOT IN's three-valued-NULL semantics instead of the plain
+// NOT-EXISTS-shaped Anti join.
+//
+// M0122-0011 follow-up: the LHS operand no longer has to be a bare
+// ColumnRef. Join.LeftKey/RightKey are general Expr and the hash-join
+// executor evaluates them with evalExpr (operators_join_agg.go's
+// evalHashKey), so `f(x) IN (subquery)` or `a+b IN (subquery)` unnest
+// exactly like `x IN (subquery)` — the operand is already fully
+// resolved in the outer scope by planInExpr's resolveExpr call, same
+// as any other outer-scope expression.
 func isUnnestableNonCorrelatedIn(in *InExpr) bool {
-	if in.Negated {
-		return false
-	}
-	if _, ok := in.Operand.(*ColumnRef); !ok {
+	if in.Operand == nil {
 		return false
 	}
 	if in.Plan == nil {
@@ -1345,8 +1419,7 @@ func unnestNonCorrelatedInExpr(in *InExpr, outer Node) (Node, error) {
 	if !isUnnestableNonCorrelatedIn(in) {
 		return nil, nil
 	}
-	outerCol, ok := in.Operand.(*ColumnRef)
-	if !ok {
+	if in.Operand == nil {
 		return nil, nil
 	}
 	innerPlan := in.Plan
@@ -1395,15 +1468,11 @@ func unnestNonCorrelatedInExpr(in *InExpr, outer Node) (Node, error) {
 	// Re-index inner key into the merged (outer ++ inner) coord.
 	innerKey.Index = outerWidth
 
-	// outer key references its column in outerChild's coord —
-	// preserved as-is.
-	outerKey := &ColumnRef{
-		pos:            outerCol.Pos(),
-		Index:          outerCol.Index,
-		Name:           outerCol.Name,
-		Type:           outerCol.Type,
-		SourceTableIdx: outerCol.SourceTableIdx,
-	}
+	// The outer key is the IN's left operand itself, already
+	// resolved against outerChild's coord by planInExpr — no
+	// ColumnRef reconstruction needed since LeftKey/RightKey accept
+	// any Expr (see isUnnestableNonCorrelatedIn's doc comment).
+	outerKey := in.Operand
 
 	// M0069-0005: drop the IN conjunct from the filter — the
 	// join encodes the equality via (LeftKey, RightKey) and the
@@ -1435,17 +1504,29 @@ func unnestNonCorrelatedInExpr(in *InExpr, outer Node) (Node, error) {
 	// the outer width). The executor's JoinTypeSemi already emits
 	// just the probe row; preserving the outer schema here keeps
 	// every upstream column index valid.
+	//
+	// M0122-0011: `x NOT IN (subquery)` uses JoinTypeAnti with
+	// NullAware=true instead — the executor gives it NOT IN's
+	// three-valued-NULL semantics (a NULL anywhere in the subquery
+	// output, or in x itself, generally excludes the row — see the
+	// NullAware doc comment on the Join struct) rather than the
+	// plain NOT-EXISTS-shaped Anti join.
 	semiPred := &BinaryOp{pos: in.Pos(), Op: parser.OpEq, Left: outerKey, Right: innerKey}
 	_ = innerWidth
+	joinType := JoinTypeSemi
+	if in.Negated {
+		joinType = JoinTypeAnti
+	}
 	join := &Join{
 		pos:       in.Pos(),
-		Type:      JoinTypeSemi,
+		Type:      joinType,
 		Algo:      JoinAlgoHash,
 		Left:      outerChild,
 		Right:     innerPlan,
 		Predicate: semiPred,
 		LeftKey:   outerKey,
 		RightKey:  innerKey,
+		NullAware: in.Negated,
 		schema:    append(Schema(nil), outerChild.Output()...),
 	}
 	filter.Child = join

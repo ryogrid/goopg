@@ -16,8 +16,9 @@ type Record struct {
 	XLog     *XLogDecodedRecord
 }
 
-// ReadAll decodes every record found under walDir across ordered
-// segments. It is intended for recovery and unit tests.
+// readAllUncached decodes every record found under walDir across ordered
+// segments. It is the implementation behind ReadAll; the exported ReadAll
+// (recovery_cache.go) adds a startup-recovery memoization layer.
 //
 // Auto-detects the on-disk format via DetectWALFormat: page-emitted
 // segments (WALFormatPGCompat) are walked with page-header skipping
@@ -25,7 +26,7 @@ type Record struct {
 // pre-M0014 zero-record-header EOS sentinel. The caller does not
 // need to know which format is in use — the same call site handles
 // both during the M0014 rollout window.
-func ReadAll(walDir string, segmentSize int64) ([]Record, error) {
+func readAllUncached(walDir string, segmentSize int64) ([]Record, error) {
 	if segmentSize <= 0 {
 		segmentSize = DefaultSegmentSize
 	}

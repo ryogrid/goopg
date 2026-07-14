@@ -1,5 +1,9 @@
 # M0106-0010 batched-36 — PG client backend SEGFAULTs reading user-table heap pages
 
+> **perf-optimize3-dash S4 note (2026-07-13)**: the canonical heap-record wiring
+> described here is gated off by default (EmitCanonical / GOOPG_WAL_CANONICAL);
+> the tuple-format encoders remain live for the on-resume canonical path.
+
 ## Status
 
 PARTIAL (loop 3, 2026-05-19) — heap-tuple MAXALIGN bug identified and

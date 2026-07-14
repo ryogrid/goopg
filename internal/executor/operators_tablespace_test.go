@@ -149,6 +149,69 @@ func TestCreateTablespaceExternalLocation(t *testing.T) {
 	}
 }
 
+// TestDropTablespaceRejectsWhenTableStillReferencesIt guards the M0122-0007
+// physical-relocation safety fix: since CREATE TABLE/ALTER ... SET
+// TABLESPACE now place a table's real data file under pg_tblspc/<oid>/...,
+// DROP TABLESPACE must refuse (55000, mirroring upstream's "tablespace %q is
+// not empty") rather than os.RemoveAll the directory out from under a live
+// table — before this guard existed, that call would have destroyed real
+// user data instead of merely leaving a harmless dangling registry entry
+// (the old, catalog-metadata-only behavior's worst case).
+func TestDropTablespaceRejectsWhenTableStillReferencesIt(t *testing.T) {
+	ctx, _, cleanup := tablespaceFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLESPACE ts1 LOCATION ''"); err != nil {
+		t.Fatalf("CREATE TABLESPACE: %v", err)
+	}
+	if err := runDDL(t, ctx, "CREATE TABLE t1 (a int) TABLESPACE ts1"); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+
+	err := runDDL(t, ctx, "DROP TABLESPACE ts1")
+	if got := execErrCode(err); got != "55000" {
+		t.Fatalf("DROP TABLESPACE with a live table: want 55000, got %q (%v)", got, err)
+	}
+	// The tablespace registry entry and directory must both survive the
+	// rejected DROP.
+	if _, ok := ctx.Catalog.LookupTablespaceOID("ts1"); !ok {
+		t.Fatal("ts1 should still be registered after a rejected DROP")
+	}
+	if ents := tblspcEntries(t, ctx); len(ents) != 1 {
+		t.Fatalf("expected pg_tblspc entry to survive rejected DROP, got %v", ents)
+	}
+
+	// Once the table is moved back to the default tablespace, DROP succeeds.
+	if err := runDDL(t, ctx, "ALTER TABLE t1 SET TABLESPACE pg_default"); err != nil {
+		t.Fatalf("ALTER TABLE SET TABLESPACE pg_default: %v", err)
+	}
+	if err := runDDL(t, ctx, "DROP TABLESPACE ts1"); err != nil {
+		t.Fatalf("DROP TABLESPACE after table moved out: %v", err)
+	}
+}
+
+// TestDropTablespaceRejectsWhenIndexStillReferencesIt mirrors the table
+// case for an index.
+func TestDropTablespaceRejectsWhenIndexStillReferencesIt(t *testing.T) {
+	ctx, _, cleanup := tablespaceFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLESPACE ts1 LOCATION ''"); err != nil {
+		t.Fatalf("CREATE TABLESPACE: %v", err)
+	}
+	if err := runDDL(t, ctx, "CREATE TABLE t1 (a int)"); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	if err := runDDL(t, ctx, "CREATE INDEX idx1 ON t1 (a) TABLESPACE ts1"); err != nil {
+		t.Fatalf("CREATE INDEX ... TABLESPACE ts1: %v", err)
+	}
+
+	err := runDDL(t, ctx, "DROP TABLESPACE ts1")
+	if got := execErrCode(err); got != "55000" {
+		t.Fatalf("DROP TABLESPACE with a live index: want 55000, got %q (%v)", got, err)
+	}
+}
+
 // TestCreateTablespaceQuoteInLocation — a single quote in the location errors
 // 42602, mirroring PG's CREATE-DATABASE-safety check.
 func TestCreateTablespaceQuoteInLocation(t *testing.T) {

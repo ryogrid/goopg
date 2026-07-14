@@ -161,7 +161,8 @@ func TestPubSubDDLRecoveryReplaysCreateSubscription(t *testing.T) {
 	}
 	const wantOID = uint32(40630)
 	const wantOwnerOID = uint32(16403)
-	if _, _, werr := rt1.WAL.Append(wal.EncodeCreateSubscription("mysub", "host=localhost dbname=foo", "myslot", []string{"mypub"}, wantOID, wantOwnerOID, true)); werr != nil {
+	const wantDBOid = uint32(16401)
+	if _, _, werr := rt1.WAL.Append(wal.EncodeCreateSubscription("mysub", "host=localhost dbname=foo", "myslot", []string{"mypub"}, wantOID, wantOwnerOID, true, wantDBOid)); werr != nil {
 		_ = rt1.Close()
 		t.Fatalf("WAL.Append create-subscription: %v", werr)
 	}
@@ -183,8 +184,8 @@ func TestPubSubDDLRecoveryReplaysCreateSubscription(t *testing.T) {
 	if !ok {
 		t.Fatalf("after WAL replay, subscription \"mysub\" not found; registry = %+v", rt2.PubSub.Subscriptions())
 	}
-	if sub.OID != wantOID || sub.Owner != wantOwnerOID || sub.Conninfo != "host=localhost dbname=foo" || sub.SlotName != "myslot" || !sub.Enabled {
-		t.Errorf("after WAL replay, subscription = %+v, want OID=%d Owner=%d Conninfo=... SlotName=myslot Enabled=true", sub, wantOID, wantOwnerOID)
+	if sub.OID != wantOID || sub.Owner != wantOwnerOID || sub.Conninfo != "host=localhost dbname=foo" || sub.SlotName != "myslot" || !sub.Enabled || sub.DBOid != wantDBOid {
+		t.Errorf("after WAL replay, subscription = %+v, want OID=%d Owner=%d Conninfo=... SlotName=myslot Enabled=true DBOid=%d", sub, wantOID, wantOwnerOID, wantDBOid)
 	}
 	if len(sub.Publications) != 1 || sub.Publications[0] != "mypub" {
 		t.Errorf("after WAL replay, subscription.Publications = %v, want [mypub]", sub.Publications)
@@ -203,7 +204,7 @@ func TestPubSubDDLRecoveryReplaysDropSubscriptionAfterCreate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first Open: %v", err)
 	}
-	if _, _, werr := rt1.WAL.Append(wal.EncodeCreateSubscription("mysub", "host=localhost", "mysub", []string{"mypub"}, 40640, 10, true)); werr != nil {
+	if _, _, werr := rt1.WAL.Append(wal.EncodeCreateSubscription("mysub", "host=localhost", "mysub", []string{"mypub"}, 40640, 10, true, 0)); werr != nil {
 		_ = rt1.Close()
 		t.Fatalf("WAL.Append create: %v", werr)
 	}
@@ -245,7 +246,7 @@ func TestPubSubDDLRecoveryReplaysAlterSubscriptionOwnerAfterCreate(t *testing.T)
 	}
 	const wantOID = uint32(40650)
 	const wantOwnerOID = uint32(16404)
-	if _, _, werr := rt1.WAL.Append(wal.EncodeCreateSubscription("mysub", "host=localhost", "mysub", nil, wantOID, 10, true)); werr != nil {
+	if _, _, werr := rt1.WAL.Append(wal.EncodeCreateSubscription("mysub", "host=localhost", "mysub", nil, wantOID, 10, true, 0)); werr != nil {
 		_ = rt1.Close()
 		t.Fatalf("WAL.Append create: %v", werr)
 	}

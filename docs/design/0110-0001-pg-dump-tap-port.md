@@ -9146,6 +9146,62 @@ round-tripped data row `7\tseven`). Verified byte-identical vs real pg_dump 18.3
 rejected, not supported. A typed table `OF` a composite in a non-`public` schema isn't covered (composite registry is bare-name).
 `pg_class.reltype` (the table's own rowtype) stays 0, as for every other goopg table.
 
+**Addendum (M0122-0024, 2026-07-10): the per-column `WITH OPTIONS` half is now implemented.** The "explicitly rejected, deferred" note
+above covered the *entire* `( … )` list after `OF type_name`; that list actually splits into two independent PG grammar productions
+(`gram.y`'s `TypedTableElement: columnOptions | TableConstraint`), and only the column-level half is landed here:
+
+- **Parser**: the per-column constraint suffix of `parseColumnDef` (NOT NULL/DEFAULT/CHECK/UNIQUE/PRIMARY KEY/REFERENCES/COLLATE/...)
+  was extracted into a new shared `parseColumnConstraintList(col *ColumnDef) error`, reused by both a normal typed column definition and
+  the new `OF type_name (...)` list parsing. Each `column_name WITH OPTIONS column_constraint [...]` entry parses via the shared helper
+  into a new `CreateTableStmt.OfTypeColumnOptions []ColumnDef` field (`Name` set, `Type` left zero since WITH OPTIONS cannot redeclare a
+  type). A bare `table_constraint` entry in the same list (`PRIMARY KEY`/`UNIQUE`/`CHECK`/`FOREIGN KEY`/`CONSTRAINT` at table level — the
+  other half of the same grammar rule, and legal to interleave with `column_name WITH OPTIONS` entries in real PostgreSQL) is still
+  explicitly rejected with a clear parse error, not silently dropped — this narrower remainder is tracked in the deferral ledger
+  (M0122-0024 row) rather than the whole feature.
+- **Executor**: `execCreateTable` merges each `OfTypeColumnOptions` entry onto the matching composite-derived `ColumnDef` by name
+  (case-insensitive) before `s.Columns = derived` runs, so NOT NULL/DEFAULT/CHECK ride through the exact same column-build/constraint
+  machinery an explicit column already uses — no separate enforcement path was needed. An override naming a column absent from the
+  composite type raises `42703` ("column %q does not exist"), matching PostgreSQL's real rejection in `MergeAttributes`
+  (`postgres/src/backend/commands/tablecmds.c:2589-2605` — the check is deferred there, not in `transformOfType`, because typed-table
+  columns are placed first in the merged attribute list).
+
+Covered by `TestCreateTableOfTypeColumnWithOptions`/`TestCreateTableOfTypeEmptyColumnList`/`TestCreateTableOfTypeTableConstraintRejected`/
+`TestCreateTableOfTypeUnknownColumnRequiresWithOptions` (`internal/parser/create_table_of_type_test.go`) and
+`TestCreateTableOfTypeWithOptionsAppliesConstraints`/`TestCreateTableOfTypeWithOptionsUnknownColumn`
+(`internal/executor/create_table_of_type_options_test.go`).
+
+**Addendum 2 (M0122-0024 follow-up, 2026-07-10): the `table_constraint` half is now implemented too — the whole grammar
+rule is landed.** The prior addendum's "narrower remainder" (PRIMARY KEY/UNIQUE/CHECK/EXCLUDE/FOREIGN KEY/CONSTRAINT at
+table level, interleavable with `column WITH OPTIONS` entries) is no longer rejected.
+
+- **Parser**: the ordinary CREATE TABLE column list's ~330-line inline table-constraint dispatch (the `if p.cur() ==
+  KwPrimary { … } else if KwUnique { … } else if KwCheck { … } else if "exclude" { … } else if KwForeign { … } else if
+  KwConstraint { … }` chain inside `parseCreateTableTail`'s per-element loop) was extracted verbatim into a new shared
+  `parseTableConstraintElement(stmt *CreateTableStmt) (matched bool, err error)` — a mechanical transform (dedent one
+  level, `return nil, err` → `return false, err`, chain wrapped with a trailing `else { return false, nil }` /
+  `return true, nil`), verified behavior-preserving by running the full `internal/parser` suite unchanged before wiring
+  in the second call site. The ordinary CREATE TABLE loop now calls it first and falls through to LIKE/column-definition
+  parsing only when `matched == false`. The `OF type_name (...)` list loop (previously: reject outright on seeing
+  PRIMARY/UNIQUE/CHECK/FOREIGN/CONSTRAINT) now calls the same helper first, falling through to the `column_name WITH
+  OPTIONS ...` parse only when it returns `matched == false` — so both grammar halves are interleavable in any order,
+  matching real PostgreSQL (`gram.y:3809-3812`'s `TypedTableElement: columnOptions | TableConstraint`, no ordering
+  constraint) and its own canonical doc example (`employees OF employee_type (PRIMARY KEY (name), salary WITH OPTIONS
+  DEFAULT 1000)`).
+- **Executor**: no new code needed — confirmed by inspection that `execCreateTable`'s downstream table-constraint-building
+  logic (PRIMARY KEY → unique index, `TableChecks`/`TableUniques`/`TableForeignKeys`/`NamedConstraints` loops) reads
+  `stmt.PrimaryKey`/etc. unconditionally, never gated on `s.OfType == nil`, so a constraint parsed into those same fields
+  from the OF-type-name list rides the identical enforcement path an ordinary CREATE TABLE constraint already uses.
+- Superseded the now-inaccurate `TestCreateTableOfTypeTableConstraintRejected` with
+  `TestCreateTableOfTypeTableConstraintAccepted` (PRIMARY KEY/CHECK/UNIQUE/named-CONSTRAINT each parse into the right
+  stmt field) and `TestCreateTableOfTypeMixedColumnAndTableConstraint` (PG's own mixed doc example) in
+  `internal/parser/create_table_of_type_test.go`; new
+  `TestCreateTableOfTypeTableConstraintMixedWithColumnOptions` (`internal/executor/create_table_of_type_options_test.go`)
+  is a real E2E check that the mixed-form PRIMARY KEY actually enforces uniqueness (23505 on a duplicate insert) while
+  the interleaved DEFAULT still applies.
+- Gates: `go build ./...`/`go vet ./...` clean; `go test -count=1 ./internal/parser/...`/`./internal/executor/...` full
+  packages PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+  bash scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 pgbench workloads).
+
 ### Slice 375 — **`CREATE FOREIGN DATA WRAPPER <name>`** round-trip (PRODUCTION fix)
 
 goopg accepted `CREATE FOREIGN DATA WRAPPER` (parsed as a `CompatNoopStmt` so `DROP` could later succeed) but tracked it only in the
@@ -15494,3 +15550,201 @@ Gates: `go build ./...` clean; `go test -count=1 ./internal/parser/...
 PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2, Q13=33);
 `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh` PASS
 (0 failed transactions, all 3 workloads).
+
+## Follow-up (2026-07-09, M0122-0007): foreign-server registry restart durability
+
+**Gap** (`unimplemented_feat.json` DU-002-376/DU-002-378, `status: open`,
+`code_audit: confirmed-open: internal/catalog/catalog.go:11697 foreign
+servers stored in-memory only`): `catalog.InMemory.foreignServers` (slice
+376 above) is a pure in-memory map with zero WAL persistence. `CREATE SERVER`
+mints a stable OID via `RegisterForeignServer` and the server round-trips
+through `pg_dump`/`pg_foreign_server` while the process stays up, but a
+restart silently drops every registered server — `pg_foreign_server` reports
+zero rows, `DROP SERVER`/`CREATE USER MAPPING ... SERVER x` on the
+now-vanished name fails "does not exist", and any dependent user mapping
+(`c.userMappings`, keyed by `"<user>\x00<server>"`) becomes an orphan whose
+`srvid` no longer resolves. This mirrors the exact gap the tablespace
+registry had until the 2026-07-09 follow-up in
+`docs/design/0095-0003-in-place-tablespace.md` (`RecordKindCreateTablespace`/
+`RecordKindDropTablespace`, 124/125) — same fix shape, different registry.
+
+**Scope**: `CREATE SERVER` / `DROP SERVER` (with or without `CASCADE` from
+`DROP FOREIGN DATA WRAPPER ... CASCADE`) only. `CREATE USER MAPPING`
+persistence is a separate, not-yet-filed gap (the mapping registry has no
+WAL wiring either) — deliberately left out of this slice's blast radius;
+noting it in the ledger as a distinct follow-up rather than folding it in
+here, since a mapping's restart durability is only useful once its
+referenced server also survives a restart, but not vice versa.
+
+**Correctness fix required (found in design review, before this section's
+original draft):** `DROP SERVER`'s existence gate and the `DROP FOREIGN DATA
+WRAPPER ... CASCADE` per-server discovery loop do **not** consult
+`foreignServers` today — they gate on the separate, non-durable
+`compatObjects["server"]`/`compatObjects["fdw-server"]` bookkeeping
+(`internal/executor/operators_ddl.go` ~line 14911-14988). Persisting only
+`foreignServers` (as the rest of this section describes) without also
+repointing these two call sites would leave a real post-restart bug: a
+pre-restart `CREATE SERVER` correctly reappears in `pg_foreign_server`, but
+`DROP SERVER` on it then fails "does not exist" (the compat-object entry
+didn't survive the restart even though the durable registry did), and `DROP
+FOREIGN DATA WRAPPER ... CASCADE` silently fails to cascade-drop it while
+still reporting success. Fix: repoint both call sites at `foreignServers`
+directly instead of adding a second, parallel persistence path for
+`compatObjects` — `COMMENT ON SERVER` (line ~16941-16946) already uses
+`ForeignServerOID` as its own existence check, so this makes the "server"
+object type consistent across all three of its call sites instead of
+introducing a fourth pattern:
+- `DROP SERVER` (line 14911-14918): gate success on `im.DropForeignServer(name)`'s
+  bool return instead of `im.DropCompatObject("server", name)`'s (still call
+  `DropCompatObject` too, best-effort, so no stale entry lingers if one
+  exists from before this fix).
+- CASCADE loop (line 14969-14983): discover candidate servers by scanning
+  `im.ListForeignServers()` and filtering `srv.FdwName == fdwName`, instead
+  of prefix-matching `ListCompatObjects("fdw-server")` entries.
+
+**Fix, mirroring `replayTablespaceDDLRecords` exactly:**
+- Two new WAL record kinds, `wal.RecordKindCreateForeignServer`/
+  `RecordKindDropForeignServer` (126/127, next free after tablespace's
+  124/125). Format: `kind(1) | oid(4) | nameLen(2)+name |
+  fdwNameLen(2)+fdwName | srvTypeLen(2)+srvType | srvVersionLen(2)+srvVersion
+  | optionsCount(2) | (optLen(2)+opt)*` for CREATE. `Owner` is deliberately
+  NOT in the wire format: nothing in the codebase ever sets
+  `ForeignServer.Owner` away from its zero value today (no `OWNER TO`
+  support for servers), so there is nothing meaningful to persist yet — a
+  future loop adding server ownership must extend this record, not assume
+  it round-trips already. Every other field is carried, options serialized
+  as repeated length-prefixed strings (mirroring how `EncodeCreateTSDict`
+  already serializes a string slice elsewhere in this file); `kind(1) |
+  nameLen(2)+name` for DROP.
+  `internal/wal/recovery.go`'s physical-replay dispatch switch gains a
+  `case RecordKindCreateForeignServer, RecordKindDropForeignServer: return
+  false, nil` arm (no physical page state — same as the tablespace/schema
+  arms immediately above it).
+- `catalog.InMemory.RegisterForeignServerDuringRecovery(name, fdwName,
+  srvType, srvVersion string, options []string, oid uint32)` /
+  `UnregisterForeignServerDuringRecovery(name string)`
+  (`internal/catalog/catalog.go`), mirroring
+  `RegisterTablespaceDuringRecovery`/`UnregisterTablespaceDuringRecovery`
+  byte-for-byte: re-populate `c.foreignServers[name]` with the *original*
+  OID (not a freshly allocated one) and bump `c.nextOID` past it if needed.
+- New `internal/initdb/foreignserver_ddl_recovery.go`,
+  `replayForeignServerDDLRecords(walDir string, cat catalog.Catalog) error`
+  — line-for-line the same shape as `replayTablespaceDDLRecords` (missing
+  walDir → nil; catalog not exposing the recovery interface → nil;
+  `wal.ReadAll` + `wal.IsGoopgNativeRecord` guard + switch on
+  `rec.Payload[0]`). Wired into `internal/initdb/open.go` right after the
+  existing `replayTablespaceDDLRecords(...)` call.
+- `execCompatCreate`'s `case "server":` branch
+  (`internal/executor/operators_ddl.go`, the `im.RegisterForeignServer(...)`
+  call site) appends `o.ctx.WAL.Append(wal.EncodeCreateForeignServer(...))`
+  right after the in-memory registration, guarded by `o.ctx.WAL != nil`
+  (matches every other DDL WAL-emit site in this file). The plain `DROP
+  SERVER` site (`im.DropForeignServer(s.Names[0].String())`) and the `DROP
+  FOREIGN DATA WRAPPER ... CASCADE` per-server drop loop
+  (`im.DropForeignServer(serverName)`) both append
+  `wal.EncodeDropForeignServer(name)` the same way `DROP ACCESS METHOD`/`DROP
+  EVENT TRIGGER` already do.
+
+**Tests**: WAL encode/decode round-trip
+(`internal/wal/recovery_test.go`), a catalog-level
+`TestRegisterForeignServerDuringRecoveryPreservesOID`/
+`TestUnregisterForeignServerDuringRecoveryRemovesEntry`
+(`internal/catalog/catalog_test.go`), a `replayForeignServerDDLRecords`
+recovery-driver test mirroring `tablespace_ddl_recovery_test.go`
+(`internal/initdb/foreignserver_ddl_recovery_test.go`), and an
+executor-level `TestCreateDropServerEmitsWAL`-style test asserting the WAL
+append happens (`internal/executor`). Confirm non-vacuous via `git stash`
+on the catalog/initdb files alone.
+
+**Still open**: `CREATE USER MAPPING` restart durability (separate gap,
+noted above); positive `datconnlimit`-style live-connection accounting is
+unrelated and already tracked elsewhere.
+
+Gates: `go build ./...` clean; `go test ./internal/wal/... ./internal/catalog/...
+./internal/initdb/... ./internal/executor/...` PASS; `scripts/tpch-spotcheck.sh`
+PASS (Q12=2, Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+scripts/ralph-precommit-test.sh` PASS (0 failed transactions, all 3 workloads).
+
+## Follow-up (2026-07-09, M0122-0007, same day): user-mapping registry restart durability
+
+**Gap** (resume point named in the foreign-server follow-up section above,
+"Still open"): `catalog.InMemory.userMappings` (keyed by
+`"<user>\x00<server>"`) was, like `foreignServers` before the previous
+section's fix, a pure in-memory map with zero WAL persistence. `CREATE USER
+MAPPING FOR <user> SERVER <server>` minted a stable OID via
+`RegisterUserMapping` and the mapping round-tripped through
+`pg_user_mappings` while the process stayed up, but a restart silently
+dropped every registered mapping — even though its referenced server now
+survives a restart (previous section), the mapping itself did not.
+
+**Scope**: `CREATE USER MAPPING` / `DROP USER MAPPING` only. Unlike the
+foreign-server follow-up, no design-review correctness gap was found here:
+`DROP USER MAPPING`'s existence gate (`internal/executor/operators_ddl.go`
+~line 14969, `im.DropUserMapping(user, server)`) already consulted the
+`userMappings` registry directly, never the non-durable `compatObjects`
+bookkeeping, so there was nothing to repoint.
+
+**Fix, mirroring the foreign-server follow-up exactly:**
+- Two new WAL record kinds, `wal.RecordKindCreateUserMapping`/
+  `RecordKindDropUserMapping` (128/129, next free after foreign-server's
+  126/127). Format: `kind(1) | oid(4) | userLen(2)+user |
+  serverLen(2)+server | optionsCount(2) | (optLen(2)+opt)*` for CREATE;
+  `kind(1) | userLen(2)+user | serverLen(2)+server` for DROP.
+  `internal/wal/recovery.go`'s physical-replay dispatch switch gains a
+  `case RecordKindCreateUserMapping, RecordKindDropUserMapping: return
+  false, nil` arm (no physical page state — same as the foreign-server arm
+  immediately above it).
+- `catalog.InMemory.RegisterUserMappingDuringRecovery(user, server string,
+  options []string, oid uint32)` / `UnregisterUserMappingDuringRecovery(user,
+  server string)` (`internal/catalog/catalog.go`), mirroring
+  `RegisterForeignServerDuringRecovery`/`UnregisterForeignServerDuringRecovery`
+  byte-for-byte: re-populate `c.userMappings[userMappingKey(user, server)]`
+  with the *original* OID (not a freshly allocated one) and bump
+  `c.nextOID` past it if needed.
+- New `internal/initdb/usermapping_ddl_recovery.go`,
+  `replayUserMappingDDLRecords(walDir string, cat catalog.Catalog) error` —
+  line-for-line the same shape as `replayForeignServerDDLRecords`. Wired
+  into `internal/initdb/open.go` right after the existing
+  `replayForeignServerDDLRecords(...)` call (after, not before, so a
+  recovered mapping's referenced server already exists by the time the
+  mapping is re-registered — though nothing in the mapping registry itself
+  actually validates the server reference today).
+- `execCompatCreate`'s `case "user mapping":` branch
+  (`internal/executor/operators_ddl.go`, the `im.RegisterUserMapping(...)`
+  call site) appends `o.ctx.WAL.Append(wal.EncodeCreateUserMapping(...))`
+  right after the in-memory registration, guarded by `o.ctx.WAL != nil`. The
+  `DROP USER MAPPING` site appends `wal.EncodeDropUserMapping(user, server)`
+  the same way.
+
+**Tests**: WAL encode/decode round-trip
+(`internal/wal/user_mapping_ddl_test.go`), catalog-level
+`TestRegisterUserMappingDuringRecoveryPreservesOID`/
+`TestUnregisterUserMappingDuringRecoveryRemovesEntry`
+(`internal/catalog/user_mapping_recovery_test.go`), and a
+`replayUserMappingDDLRecords` recovery-driver test mirroring
+`foreignserver_ddl_recovery_test.go`
+(`internal/initdb/usermapping_ddl_recovery_test.go`, full `Init`+`Open`+
+restart+`Open` cycle). No executor-level WAL-emission test was added — unlike
+the foreign-server follow-up, there was no pre-existing correctness bug at
+the executor call sites to pin with a `git stash`-confirmed regression test,
+so the initdb integration test (which exercises the real WAL-append +
+replay path end to end) is the test that would fail pre-fix. Live-verified
+against a real `cmd/goopg` binary: `CREATE FOREIGN DATA WRAPPER` + `CREATE
+SERVER ... OPTIONS (host 'remote')` + `CREATE USER MAPPING FOR postgres
+SERVER test_srv OPTIONS (user 'remoteuser', password 'secret')`, then two
+consecutive `goopg stop`/`start` cycles: after the first restart
+`pg_user_mappings` still lists the mapping with the same `umid`/`srvid`
+OIDs and `umoptions`; `DROP USER MAPPING FOR postgres SERVER test_srv`
+succeeds and `pg_user_mappings` goes back to zero rows; after a *second*
+restart it is still zero rows (the drop itself is durable, not just the
+create).
+
+**Still open**: nothing further identified for `CREATE`/`DROP USER MAPPING`
+restart durability — this closes the resume point left by the previous
+section. `ALTER USER MAPPING` (option changes) does not exist in the parser
+yet and is out of scope here.
+
+Gates: `go build ./...` clean; `go test ./internal/wal/... ./internal/catalog/...
+./internal/initdb/... ./internal/executor/...` PASS; `scripts/tpch-spotcheck.sh`
+PASS (Q12=2, Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+scripts/ralph-precommit-test.sh` PASS (0 failed transactions, all 3 workloads).

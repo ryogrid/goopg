@@ -277,6 +277,50 @@ func TestPgProcViewProconfig(t *testing.T) {
 	}
 }
 
+// TestPgProcViewProconfigRendersUserRoutineConfig pins the DU-002 proconfig
+// follow-up to M0097-0150: a user-defined routine that went through CREATE
+// FUNCTION's SET clause / ALTER FUNCTION ... SET now renders its
+// Routine.Config as a real pg_proc.proconfig text[] literal — previously
+// this column was unconditionally NULL for every row, so pg_dump's dumpFunc
+// never emitted a `SET name = value` line for any function. Built-in
+// stubs/aggregates still render NULL (they can never carry a Config).
+func TestPgProcViewProconfigRendersUserRoutineConfig(t *testing.T) {
+	cat := catalog.NewInMemory()
+	if err := registerPgProcView(cat); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cat.Routines().Create(&catalog.Routine{
+		Schema:     "public",
+		Name:       "f",
+		ReturnType: catalog.Type{Name: "int"},
+		Language:   "sql",
+		Body:       "SELECT 1",
+		Config:     []string{"search_path=app,public", "work_mem=64MB"},
+	}, false); err != nil {
+		t.Fatal(err)
+	}
+	tbl, _ := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_proc"})
+	rows := tbl.VirtualRows()
+	const proconfig = 17
+	// The first element embeds a comma (its own SET-value var_list), so
+	// array_out quotes it (quoteArrayElement) to keep it from being split on
+	// the array delimiter; the second has no metacharacters and stays bare.
+	want := `{"search_path=app,public",work_mem=64MB}`
+	found := false
+	for i := range rows {
+		if rows[i][1] != "f" {
+			continue
+		}
+		found = true
+		if rows[i][proconfig] != want {
+			t.Errorf("row %q proconfig = %q, want %q", rows[i][1], rows[i][proconfig], want)
+		}
+	}
+	if !found {
+		t.Fatal("routine f not found in pg_proc rows")
+	}
+}
+
 // TestPgProcViewProcost pins the procost column (DU-002 slice 37):
 // built-in stubs (internal language) cost 1; a user routine's cost is
 // derived from its language — 1 for internal/C, 100 for all others.

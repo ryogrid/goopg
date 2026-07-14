@@ -1,0 +1,5 @@
+# Large binary artifacts are kept on disk but not committed:
+# - goopg.bin (29 MB): sha256 recorded in runs/*/env.txt and 00-methodology.md
+# - *.trace.out (23 MB): go execution trace; regenerate via pprof_collect.sh
+runs/*/goopg.bin
+runs/*/profiles/*.trace.out

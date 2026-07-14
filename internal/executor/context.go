@@ -456,12 +456,119 @@ type Context struct {
 	// pg_extension. Empty in embedded/test contexts. M0110-0003 (AC-002 gap #7c).
 	CurrentDatabase string
 
+	// CurrentDatabaseOid is the REAL, physical pg_database.oid resolved for
+	// CurrentDatabase via catalog.(*InMemory).ResolveDatabaseOid — the same
+	// oid that keys on-disk storage/ACLs, NOT pg_database's displayed oid
+	// column (which shows "postgres" as a legacy 16384 placeholder for
+	// compat, see ResolveDatabaseOid's doc comment). Zero if CurrentDatabase
+	// is empty or unresolvable (embedded/test contexts, or a database name
+	// the catalog doesn't recognize). This is plumbing only today — no
+	// lookup site yet keys off it, since catalog.InMemory's table/index
+	// namespace is still one shared, process-wide map regardless of which
+	// database a connection is bound to (M0122-0007 physical-storage-
+	// isolation slice 4; see docs/design/0122-0018-per-database-catalog-namespace.md).
+	CurrentDatabaseOid uint32
+
 	// ExtensionRows, when non-nil, is called by the valuesOp that backs
 	// pg_extension to return the rows visible in CurrentDatabase. pg_extension is
 	// per-database in PostgreSQL but goopg shares one in-memory catalog, so the
 	// server wires this to catalog.ExtensionRowsForDB(CurrentDatabase) to filter
 	// the global registry per connecting database. M0110-0003 (AC-002 gap #7c).
 	ExtensionRows func() [][]string
+
+	// PgClassRows, when non-nil, is called by the valuesOp that backs pg_class
+	// to return the rows visible to this connection: CurrentDatabaseOid's own
+	// tables/indexes rather than always DefaultDBOid's (catalog.InMemory's
+	// PGClassRowsForDBOid, mirroring ExtensionRows above). Wired by the server
+	// to close over CurrentDatabaseOid. M0122-0007 4e.
+	PgClassRows func() [][]string
+
+	// PgIndexesRows / PgTablesRows mirror PgClassRows above for the pg_indexes
+	// and pg_tables views: each lists CurrentDatabaseOid's own tables/indexes
+	// rather than always DefaultDBOid's (catalog.InMemory's
+	// PGIndexesRowsForDBOid / PGTablesRowsForDBOid). Wired by the server to
+	// close over CurrentDatabaseOid. M0122-0007 4e follow-up 24.
+	PgIndexesRows func() [][]string
+	PgTablesRows  func() [][]string
+
+	// PgConstraintRows mirrors PgClassRows above for the pg_constraint table:
+	// it lists CurrentDatabaseOid's own tables'/indexes' constraints rather
+	// than always DefaultDBOid's (catalog.InMemory's
+	// PGConstraintRowsForDBOid). Wired by the server to close over
+	// CurrentDatabaseOid. M0122-0007 4e follow-up 25.
+	PgConstraintRows func() [][]string
+
+	// PgIndexRows mirrors PgConstraintRows above for the pg_index catalog
+	// table: it lists CurrentDatabaseOid's own indexes rather than always
+	// DefaultDBOid's (catalog.InMemory's PGIndexRowsForDBOid). Wired by the
+	// server to close over CurrentDatabaseOid. M0122-0007 4e follow-up 26.
+	PgIndexRows func() [][]string
+
+	// PgAttrdefRows / PgDependRows mirror PgIndexRows above for the pg_attrdef
+	// and pg_depend catalog tables: each lists CurrentDatabaseOid's own column
+	// defaults / dependency rows rather than always DefaultDBOid's
+	// (catalog.InMemory's PGAttrdefRowsForDBOid / PGDependRowsForDBOid). Both
+	// must be wired with the SAME dbOid so their oid numbering stays in
+	// lockstep (see PGAttrdefRowsForDBOid's doc comment). Wired by the server
+	// to close over CurrentDatabaseOid. M0122-0007 4e follow-up 27.
+	PgAttrdefRows func() [][]string
+	PgDependRows  func() [][]string
+
+	// PgInheritsRows mirrors PgIndexRows above for the pg_inherits catalog
+	// table: it lists CurrentDatabaseOid's own inheritance/partition
+	// parent-child rows rather than always DefaultDBOid's (catalog.InMemory's
+	// PGInheritsRowsForDBOid). Wired by the server to close over
+	// CurrentDatabaseOid. M0122-0007 4e follow-up 28.
+	PgInheritsRows func() [][]string
+
+	// PgPolicyRows mirrors PgInheritsRows above for the pg_policy catalog
+	// table: it lists CurrentDatabaseOid's own tables' row-level-security
+	// policies rather than always DefaultDBOid's (catalog.InMemory's
+	// PGPolicyRowsForDBOid). Wired by the server to close over
+	// CurrentDatabaseOid. M0122-0007 4e follow-up 29.
+	PgPolicyRows func() [][]string
+
+	// PgTriggerRows mirrors PgPolicyRows above for the pg_trigger catalog
+	// table: it lists CurrentDatabaseOid's own tables' triggers rather than
+	// always DefaultDBOid's (catalog.InMemory's PGTriggerRowsForDBOid). Wired
+	// by the server to close over CurrentDatabaseOid. M0122-0007 4e
+	// follow-up 30.
+	PgTriggerRows func() [][]string
+
+	// PgRewriteRows mirrors PgTriggerRows above for the pg_rewrite catalog
+	// table: it lists CurrentDatabaseOid's own tables' CREATE RULE DO-NOTHING
+	// rules rather than always DefaultDBOid's (catalog.InMemory's
+	// PGRewriteRowsForDBOid). Wired by the server to close over
+	// CurrentDatabaseOid. M0122-0007 4e follow-up 31.
+	PgRewriteRows func() [][]string
+
+	// PgForeignTableRows mirrors PgRewriteRows above for the pg_foreign_table
+	// catalog table: it lists CurrentDatabaseOid's own foreign tables rather
+	// than always DefaultDBOid's (catalog.InMemory's
+	// PGForeignTableRowsForDBOid). Wired by the server to close over
+	// CurrentDatabaseOid. M0122-0007 4e follow-up 32.
+	PgForeignTableRows func() [][]string
+
+	// PgSequenceRows mirrors PgForeignTableRows above for the pg_sequence
+	// catalog table: it lists CurrentDatabaseOid's own sequences rather than
+	// always DefaultDBOid's (catalog.InMemory's PGSequenceRowsForDBOid).
+	// Wired by the server to close over CurrentDatabaseOid. M0122-0007 4e
+	// follow-up 34.
+	PgSequenceRows func() [][]string
+
+	// PgForeignServerRows mirrors PgForeignTableRows above for the
+	// pg_foreign_server catalog table: it lists CurrentDatabaseOid's own
+	// CREATE SERVER'd servers rather than always DefaultDBOid's
+	// (catalog.InMemory's PGForeignServerRowsForDBOid). Wired by the server
+	// to close over CurrentDatabaseOid. M0122-0007 4e follow-up 36.
+	PgForeignServerRows func() [][]string
+
+	// PgUserMappingsRows mirrors PgForeignServerRows above for the
+	// pg_user_mappings catalog table: it lists CurrentDatabaseOid's own
+	// CREATE USER MAPPING'd mappings rather than always DefaultDBOid's
+	// (catalog.InMemory's PGUserMappingsRowsForDBOid). Wired by the server
+	// to close over CurrentDatabaseOid. M0122-0007 4e follow-up 37.
+	PgUserMappingsRows func() [][]string
 
 	// NonSuperuserRole, when non-empty, means the session is currently running
 	// under a non-superuser role (set via SET SESSION AUTHORIZATION). Privilege
@@ -884,7 +991,7 @@ func (c *Context) acquireScanIndexReadLocksTxn(tbl *catalog.Table) error {
 	if tbl == nil || c.Catalog == nil {
 		return nil
 	}
-	for _, idx := range c.Catalog.IndexesOnTable(tbl) {
+	for _, idx := range c.Catalog.IndexesOnTable(tbl, catalog.NamespaceDBOid(c.CurrentDatabaseOid)) {
 		if idx == nil {
 			continue
 		}
@@ -1238,6 +1345,18 @@ func (c *Context) MaterializeWriterXID() error {
 		sess.OnTopLevelXIDAssigned(xid)
 	}
 	return nil
+}
+
+// DidWrite reports whether this transaction has been assigned a real XID —
+// i.e. some write-path operation called MaterializeWriterXID. A read-only
+// transaction keeps XID == storage.InvalidTransactionID (M0093 lazy XID
+// allocation), so this is the cheap "did this transaction produce
+// garbage/durable work" predicate. Used to gate post-commit forced GC to
+// writing transactions (a read-only SELECT produces no retained heap worth
+// forcing a GC for). Read c.Tx.XID (the Context's in-place-updated copy),
+// never a stale outer snapshot of the Transaction value.
+func (c *Context) DidWrite() bool {
+	return c.Tx.XID != storage.InvalidTransactionID
 }
 
 // EnumRenameEntry records one ALTER TYPE … RENAME TO operation for transactional rollback.

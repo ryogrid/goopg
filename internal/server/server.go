@@ -55,6 +55,7 @@ import (
 	"github.com/goopg/goopg/internal/config"
 	"github.com/goopg/goopg/internal/control"
 	"github.com/goopg/goopg/internal/executor"
+	"github.com/goopg/goopg/internal/gls"
 	"github.com/goopg/goopg/internal/lockmgr"
 	"github.com/goopg/goopg/internal/mctx"
 	"github.com/goopg/goopg/internal/multixact"
@@ -922,7 +923,23 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 	// can call WaitEventStart(procNum, ...) atomically instead of acquiring
 	// the old Registry.mu on every wire frame.
 	pidStr := activity.PID(pid)
-	procNum := int32((pid - 1) % uint32(mvcc.ConnSlotCount))
+	// Connection-lifetime proc slot (replaces the historical pid-modulo
+	// assignment that WRAPPED past ConnSlotCount cumulative connections
+	// and clobbered live sessions' slots — see mvcc.AcquireConnSlot).
+	var procNum int32
+	if s.cfg.TxnMgr != nil {
+		var slotErr error
+		procNum, slotErr = s.cfg.TxnMgr.AcquireConnSlot()
+		if slotErr != nil {
+			s.cfg.Logger.Warn("connection rejected: proc slots exhausted", "err", slotErr)
+			return
+		}
+		defer s.cfg.TxnMgr.ReleaseConnSlot(procNum)
+	} else {
+		// Manager-less unit harnesses: the historical modulo assignment is
+		// safe there (single short-lived connections, no churn).
+		procNum = int32((pid - 1) % uint32(mvcc.ConnSlotCount))
+	}
 	reg := s.cfg.Activity
 	if reg != nil {
 		clientAddr := raw.RemoteAddr().String()
@@ -947,6 +964,11 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 		// Hot-path client-I/O closures (below) capture procNum directly
 		// and do not touch the goroutine map.
 		activity.SetCurrentGoroutine(reg, procNum)
+		// Stamp the same procNum as a goroutine-local id so the WAL insert
+		// path (wal.state.stripeNum) can pick this backend's stripe with a
+		// cheap label read instead of runtime.Stack (analysis/perf-optimize2,
+		// fix-01). Inherited by any helper goroutines this backend spawns.
+		gls.SetBackendID(procNum)
 	}
 	defer func() {
 		if reg != nil {
@@ -1079,7 +1101,7 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 		return
 	}
 
-	s.runPostStartupLoop(connCtx, cancelEntry, r, w, sess, logger, isReplication, app, params["database"], sessCtx, pid)
+	s.runPostStartupLoop(connCtx, cancelEntry, r, w, sess, logger, isReplication, app, params["database"], sessCtx, pid, procNum)
 }
 
 // isReplicationStartupParam interprets the StartupMessage `replication`
@@ -1327,12 +1349,13 @@ func (s *Server) cleanupSessionTempObjects(sess *config.SessionRegistry) {
 	im.DropTempNamespace(owner)
 }
 
-func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, r *protocol.FrameReader, w *protocol.FrameWriter, sess *config.SessionRegistry, logger *slog.Logger, isReplication bool, appName, dbName string, sessCtx *mctx.Context, pid uint32) {
+func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, r *protocol.FrameReader, w *protocol.FrameWriter, sess *config.SessionRegistry, logger *slog.Logger, isReplication bool, appName, dbName string, sessCtx *mctx.Context, pid uint32, procNum int32) {
 	extended := newExtendedState()
-	// Assign a ProcArray slot for this backend (M0107-0004). The slot is
-	// reused across all transactions on this connection; Begin clears and
-	// re-initialises it on each new transaction.
-	procNum := int32((pid - 1) % uint32(mvcc.ConnSlotCount))
+	// procNum is the connection-lifetime ProcArray slot acquired by
+	// serveConn via mvcc.AcquireConnSlot (M0107-0004; the slot is reused
+	// across all transactions on this connection; Begin clears and
+	// re-initialises it per transaction, and serveConn releases it at
+	// disconnect).
 	extended.ProcNum = procNum                                                                   // thread through to executeExtendedQueryViaExecutor
 	extended.DBName = dbName                                                                     // scopes pg_extension per database (M0110-0003 gap #7c)
 	connTx := &connTxState{SessCtx: sessCtx, ProcNum: procNum, DBName: dbName, AdvisoryID: sess} // per-connection explicit transaction state (M0096-0005); DBName scopes pg_extension (M0110-0003 gap #7c); AdvisoryID = stable advisory-lock owner identity (M0118-0003)

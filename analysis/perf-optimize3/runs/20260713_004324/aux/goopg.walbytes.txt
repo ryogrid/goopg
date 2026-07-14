@@ -1,0 +1,4 @@
+lsn0= lsn1= wal_bytes_delta=
+number of transactions actually processed: 134947
+latency average = 22.231 ms
+tps = 2249.065051 (without initial connection time)

@@ -25,15 +25,16 @@ const (
 	KindString
 	KindBytes
 	KindTime
-	// KindInterval is goopg's v0 interval-arithmetic carrier.
-	// Mirrors upstream's months-days-microseconds shape but
-	// drops sub-day precision (TPC-H literals are integer
-	// counts of days/months/years). v0 packs months and days
-	// into the int64 inline payload (months in the high half,
-	// days in the low half) — see (Datum).IntervalMonthsValue
-	// / IntervalDaysValue. Sub-day arithmetic waits on the
-	// type system; see
-	// docs/design/0003-0006-date-interval-arithmetic.md.
+	// KindInterval is goopg's interval-arithmetic carrier,
+	// mirroring upstream's months-days-microseconds shape. Months
+	// and days pack into the int64 inline payload (months in the
+	// high half, days in the low half) — see
+	// (Datum).IntervalMonthsValue / IntervalDaysValue. The sub-day
+	// microsecond component rides in the reserved Hi word
+	// (IntervalMicrosValue); it is populated by timestamp −
+	// timestamp subtraction and zero for month/day-only literals.
+	// Sub-day interval *literal* syntax is still parser-deferred;
+	// see docs/design/0003-0006-date-interval-arithmetic.md.
 	KindInterval
 	// KindNumeric is goopg's v0 NUMERIC/DECIMAL carrier. v0
 	// stores the value as `mantissa * 10^-scale` where mantissa
@@ -94,7 +95,7 @@ const (
 //	KindBytes        — same encoding as KindString.
 //	KindTime         — Int = Unix nanoseconds (UTC).
 //	KindInterval     — Int = (int64(months)<<32)|(int64(days)&0xFFFFFFFF);
-//	                   v0 rejects sub-day precision.
+//	                   Hi = sub-day microseconds (0 for month/day-only).
 //	KindNumeric      — Flags&flagBigNumeric=0: Int = int64 fast-path mantissa.
 //	                   Flags&flagBigNumeric≠0: ArenaID+Int=(off<<32|len) encode
 //	                   sign+BE-magnitude bytes in mctx. Scale = digits after '.'.
@@ -110,7 +111,7 @@ type Datum struct {
 	_pad0   [2]byte        // 2B @ 6 (alignment pad before Int)
 	Int     int64          // 8B @ 8
 	Buf     []byte         // 24B @ 16 (nil when arena-backed)
-	Hi      uint64         // 8B @ 40 (reserved; future UUID-hi / interval micros)
+	Hi      uint64         // 8B @ 40 (KindInterval sub-day micros; else reserved/UUID-hi)
 	// Total: 48 B. GC-traced fields: Buf (nil for arena-backed rows → 0 scans).
 }
 
@@ -187,6 +188,89 @@ func (d Datum) IntervalMonthsValue() int32 {
 // Encoded as the low 32 bits of Int with signed semantics.
 func (d Datum) IntervalDaysValue() int32 {
 	return int32(d.Int)
+}
+
+// IntervalMicrosValue extracts the sub-day (time) component of
+// KindInterval, in microseconds, mirroring upstream's Interval.time
+// field. Stored in the reserved Hi word (int64 semantics). Zero for
+// intervals built from month/day-only literals, so existing callers
+// that never populate it observe no change. Populated by
+// timestamp − timestamp subtraction (see evalBinary in expr.go).
+func (d Datum) IntervalMicrosValue() int64 {
+	return int64(d.Hi)
+}
+
+// IsIntervalNoEnd / IsIntervalNoBegin report whether a KindInterval Datum
+// carries PostgreSQL's +infinity / -infinity sentinel (INTERVAL_NOEND /
+// INTERVAL_NOBEGIN, all three fields at their signed extreme;
+// postgres/src/include/datatype/timestamp.h). IsIntervalNotFinite is the union.
+// (unimplemented_feat #5(d-iv))
+func (d Datum) IsIntervalNoEnd() bool {
+	return d.Kind == KindInterval && d.IntervalMonthsValue() == math.MaxInt32 &&
+		d.IntervalDaysValue() == math.MaxInt32 && d.IntervalMicrosValue() == math.MaxInt64
+}
+
+func (d Datum) IsIntervalNoBegin() bool {
+	return d.Kind == KindInterval && d.IntervalMonthsValue() == math.MinInt32 &&
+		d.IntervalDaysValue() == math.MinInt32 && d.IntervalMicrosValue() == math.MinInt64
+}
+
+func (d Datum) IsIntervalNotFinite() bool {
+	return d.IsIntervalNoEnd() || d.IsIntervalNoBegin()
+}
+
+// NewIntervalInfinity constructs the +infinity (positive) or -infinity
+// KindInterval sentinel Datum.
+func NewIntervalInfinity(positive bool) Datum {
+	if positive {
+		return NewIntervalDatumFull(math.MaxInt32, math.MaxInt32, math.MaxInt64)
+	}
+	return NewIntervalDatumFull(math.MinInt32, math.MinInt32, math.MinInt64)
+}
+
+// IsTimestampPosInf / IsTimestampNegInf report whether a KindTime Datum
+// carries PostgreSQL's +infinity / -infinity timestamp sentinel. Upstream
+// (postgres/src/include/datatype/timestamp.h) uses TIMESTAMP_END/BEGIN =
+// PG_INT64_MAX/MIN in its micros-since-2000 domain; goopg stores KindTime as
+// Unix nanoseconds, so the same INT64 extremes are used as sentinels — a real
+// timestamp saturates ~year 2262, far below MaxInt64 ns, so they never collide.
+// IsTimestampNotFinite is the union. (unimplemented_feat #5(d-iv))
+func (d Datum) IsTimestampPosInf() bool {
+	return d.Kind == KindTime && d.Int == math.MaxInt64
+}
+
+func (d Datum) IsTimestampNegInf() bool {
+	return d.Kind == KindTime && d.Int == math.MinInt64
+}
+
+func (d Datum) IsTimestampNotFinite() bool {
+	return d.IsTimestampPosInf() || d.IsTimestampNegInf()
+}
+
+// NewTimestampInfinity constructs the +infinity (positive) or -infinity
+// KindTime sentinel Datum. Rendered as 'infinity' / '-infinity' by Format /
+// AppendValueText, which intercept the sentinel before the normal time shape.
+func NewTimestampInfinity(positive bool) Datum {
+	if positive {
+		return Datum{Kind: KindTime, Int: math.MaxInt64}
+	}
+	return Datum{Kind: KindTime, Int: math.MinInt64}
+}
+
+// NewDateInfinity constructs the +infinity / -infinity DATE sentinel. The date
+// type shares the KindTime INT64-extremes carrier with timestamp — Format /
+// AppendValueText (both intercept Int==MaxInt64/MinInt64 before the flagDate
+// shape), IsTimestampNotFinite (Kind/Int only), and compareDatum (KindTime by
+// Int) are all already sentinel-aware, so no per-domain internal value is
+// needed. flagDate is set to keep the datum tagged as a date (matching ordinary
+// date datums). On the wire the sentinel serialises to PG's DATEVAL_NOEND /
+// DATEVAL_NOBEGIN = PG_INT32_MAX / PG_INT32_MIN days (date_send,
+// postgres/src/include/utils/date.h); see codec.go. (unimplemented_feat #5(d-iv))
+func NewDateInfinity(positive bool) Datum {
+	if positive {
+		return Datum{Kind: KindTime, Int: math.MaxInt64, Flags: flagDate}
+	}
+	return Datum{Kind: KindTime, Int: math.MinInt64, Flags: flagDate}
 }
 
 // NumericMantissaValue is the int64 fast-path mantissa of KindNumeric
@@ -353,6 +437,16 @@ func NewTimeDatum(t time.Time) Datum {
 	return Datum{Kind: KindTime, Int: t.UTC().UnixNano()}
 }
 
+// NewDateDatum constructs a KindTime Datum tagged as a DATE (flagDate set).
+// Date and timestamp values share the KindTime carrier, so the flag is what
+// distinguishes them for type-agnostic rendering: Datum.Format() emits the
+// date-only shape ("MM-DD-YYYY", M0097-0063) for a flagged datum and the full
+// timestamp shape otherwise. Use this at every date-producing site (literals,
+// casts, on-disk decode) so a date is indistinguishable regardless of origin.
+func NewDateDatum(t time.Time) Datum {
+	return Datum{Kind: KindTime, Int: t.UTC().UnixNano(), Flags: flagDate}
+}
+
 // NewTimeTZDatum constructs a KindTime Datum for a timetz column.
 // The local time is stored as nanoseconds since 1970-01-01 00:00:00 UTC.
 // offsetSecs is the timezone offset east of UTC in seconds (e.g., PDT = -25200).
@@ -369,11 +463,25 @@ func (d Datum) TimeTZOffsetSecs() int {
 }
 
 // NewIntervalDatum constructs a KindInterval Datum from
-// month/day components. Sub-day grain is rejected at parse time.
+// month/day components (no sub-day/time grain). Thin wrapper over
+// NewIntervalDatumFull with micros=0 — the common literal path.
 func NewIntervalDatum(months, days int32) Datum {
+	return NewIntervalDatumFull(months, days, 0)
+}
+
+// NewIntervalDatumFull constructs a KindInterval Datum carrying the
+// full month/day/microsecond triple. Months+days pack into Int
+// exactly as before (high/low 32 bits); the sub-day microsecond
+// component rides in the reserved Hi word — mirroring upstream's
+// months/days/microseconds Interval representation
+// (postgres/src/include/datatype/timestamp.h). Used by
+// timestamp − timestamp subtraction, which yields an interval with a
+// time component (see docs/design/0003-0006-date-interval-arithmetic.md).
+func NewIntervalDatumFull(months, days int32, micros int64) Datum {
 	return Datum{
 		Kind: KindInterval,
 		Int:  (int64(months) << 32) | (int64(days) & 0xFFFFFFFF),
+		Hi:   uint64(micros),
 	}
 }
 
@@ -460,6 +568,12 @@ func (d Datum) AppendValueText(dst []byte) []byte {
 		}
 		return append(dst, d.Buf...)
 	case KindTime:
+		if d.Int == math.MaxInt64 {
+			return append(dst, "infinity"...)
+		}
+		if d.Int == math.MinInt64 {
+			return append(dst, "-infinity"...)
+		}
 		return d.TimeValue().AppendFormat(dst, "2006-01-02 15:04:05.000000")
 	}
 	// Fallback for KindInterval / KindNumeric / unknown kinds.
@@ -532,13 +646,21 @@ func (d Datum) Format() string {
 		// Display the label (Buf), not the sort order (Int).
 		return string(d.Buf)
 	case KindTime:
+		// ±infinity timestamp/date sentinel renders identically to upstream
+		// EncodeSpecialTimestamp / EncodeSpecialDate regardless of flagDate.
+		if d.Int == math.MaxInt64 {
+			return "infinity"
+		}
+		if d.Int == math.MinInt64 {
+			return "-infinity"
+		}
 		if d.Flags&flagDate != 0 {
 			// DATE type: render as Postgres MDY style "MM-DD-YYYY". M0097-0063.
 			return d.TimeValue().Format("01-02-2006")
 		}
 		return d.TimeValue().Format("2006-01-02 15:04:05.000000")
 	case KindInterval:
-		return formatInterval(d.IntervalMonthsValue(), d.IntervalDaysValue())
+		return formatInterval(d.IntervalMonthsValue(), d.IntervalDaysValue(), d.IntervalMicrosValue())
 	case KindNumeric:
 		if d.Flags&flagBigNumeric != 0 {
 			return formatNumericBig(d.NumericBigValue(), d.Scale)
@@ -548,45 +670,97 @@ func (d Datum) Format() string {
 	return fmt.Sprintf("?datum kind=%d?", d.Kind)
 }
 
-// formatInterval renders (months, days) the way upstream PG's
-// interval_out does under the default 'postgres' IntervalStyle:
-// months split into years + remainder months, each nonzero
-// year/mon/day component printed as "<n> <unit>" (singular unit
-// text iff n == 1 exactly; -1 still takes the plural form, matching
-// EncodeInterval), space-separated, sign carried per-component. A
-// fully-zero interval prints "00:00:00" (v0 has no time component,
-// but PG always renders the zero interval this way). Verified
-// byte-for-byte against real PostgreSQL 18.3 (see
-// docs/design/0003-0006-date-interval-arithmetic.md).
-func formatInterval(months, days int32) string {
-	years := months / 12
+// formatInterval renders (months, days, micros) the way upstream PG's
+// EncodeInterval does under the default 'postgres' IntervalStyle
+// (INTSTYLE_POSTGRES, postgres/src/backend/utils/adt/datetime.c): months
+// split into years + remainder months, each nonzero year/mon/day
+// component printed as "<n> <unit>" (plural unless n == 1 exactly),
+// space-separated, with per-field sign carrying (a nonzero field forces a
+// leading "+" on the *next* positive field — PG's `is_before` quirk). The
+// sub-day component is rendered as "[-|+]HH:MM:SS[.ffffff]" (hours may
+// exceed 24; fractional seconds trimmed of trailing zeros) and is emitted
+// whenever any time field is nonzero OR the whole interval is zero (so the
+// zero interval prints "00:00:00"). Verified byte-for-byte against real
+// PostgreSQL 18.3 (see docs/design/0003-0006-date-interval-arithmetic.md).
+func formatInterval(months, days int32, micros int64) string {
+	// interval ±infinity: PG's INTERVAL_NOEND / INTERVAL_NOBEGIN sentinel (all
+	// fields at their signed extreme) prints as the bare word, no field
+	// decomposition. unimplemented_feat #5(d-iv).
+	if months == math.MaxInt32 && days == math.MaxInt32 && micros == math.MaxInt64 {
+		return "infinity"
+	}
+	if months == math.MinInt32 && days == math.MinInt32 && micros == math.MinInt64 {
+		return "-infinity"
+	}
+	const usecsPerHour = 3600 * 1_000_000
+	const usecsPerMin = 60 * 1_000_000
+	const usecsPerSec = 1_000_000
+
+	year := months / 12
 	remMonths := months % 12
-	var parts []string
-	if years != 0 {
-		unit := "years"
-		if years == 1 {
-			unit = "year"
+
+	// Decompose the signed microsecond total; Go's truncated integer
+	// division gives every field the same sign as micros, matching
+	// PG's struct pg_itm layout.
+	hour := micros / usecsPerHour
+	rem := micros % usecsPerHour
+	minute := rem / usecsPerMin
+	rem = rem % usecsPerMin
+	sec := rem / usecsPerSec
+	fsec := rem % usecsPerSec
+
+	var sb strings.Builder
+	isZero := true
+	isBefore := false
+	addPart := func(val int64, unit string) {
+		if val == 0 {
+			return
 		}
-		parts = append(parts, fmt.Sprintf("%d %s", years, unit))
-	}
-	if remMonths != 0 {
-		unit := "mons"
-		if remMonths == 1 {
-			unit = "mon"
+		if !isZero {
+			sb.WriteByte(' ')
 		}
-		parts = append(parts, fmt.Sprintf("%d %s", remMonths, unit))
-	}
-	if days != 0 {
-		unit := "days"
-		if days == 1 {
-			unit = "day"
+		if isBefore && val > 0 {
+			sb.WriteByte('+')
 		}
-		parts = append(parts, fmt.Sprintf("%d %s", days, unit))
+		sb.WriteString(strconv.FormatInt(val, 10))
+		sb.WriteByte(' ')
+		sb.WriteString(unit)
+		if val != 1 {
+			sb.WriteByte('s')
+		}
+		isBefore = val < 0
+		isZero = false
 	}
-	if len(parts) == 0 {
-		return "00:00:00"
+	addPart(int64(year), "year")
+	// PG spells the month unit "mon" (not "month") for backward compat.
+	addPart(int64(remMonths), "mon")
+	addPart(int64(days), "day")
+
+	if isZero || hour != 0 || minute != 0 || sec != 0 || fsec != 0 {
+		minus := hour < 0 || minute < 0 || sec < 0 || fsec < 0
+		if !isZero {
+			sb.WriteByte(' ')
+		}
+		if minus {
+			sb.WriteByte('-')
+		} else if isBefore {
+			sb.WriteByte('+')
+		}
+		fmt.Fprintf(&sb, "%02d:%02d:%02d", absInt64(hour), absInt64(minute), absInt64(sec))
+		if fsec != 0 {
+			frac := strings.TrimRight(fmt.Sprintf("%06d", absInt64(fsec)), "0")
+			sb.WriteByte('.')
+			sb.WriteString(frac)
+		}
 	}
-	return strings.Join(parts, " ")
+	return sb.String()
+}
+
+func absInt64(v int64) int64 {
+	if v < 0 {
+		return -v
+	}
+	return v
 }
 
 // formatNumeric renders mantissa * 10^-scale as the decimal string

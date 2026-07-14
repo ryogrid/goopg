@@ -325,14 +325,30 @@ func TestVerifyBtreeItemOrder_ItemOrderViolation(t *testing.T) {
 	}
 }
 
-// Equal adjacent keys violate the strict-less item-order invariant: goopg dedups
-// equal keys into a single posting item, so two physical slots can never share a
-// separator key on a healthy page.
-func TestVerifyBtreeItemOrder_DuplicateKeysViolation(t *testing.T) {
+// Equal adjacent keys are NOT an item-order violation: goopg's insert/split
+// path (btree.CompareKeys, used everywhere the engine orders items) has no
+// TID tiebreak, and dedupConsolidate's posting-list promotion never runs
+// outside BulkCreate (.ralph/deferral_ledger.md 2026-07-07), so a healthy
+// page routinely carries several plain line pointers sharing one key — e.g.
+// every non-HOT UPDATE leaves the old index entry in place until VACUUM.
+// (Was TestVerifyBtreeItemOrder_DuplicateKeysViolation — the strict-less
+// assumption this test used to encode was itself the bug behind the
+// AI-20260708-064334-001 nightly false-positive corruption report; see
+// .ralph/deferral_ledger.md 2026-07-08.)
+func TestVerifyBtreeItemOrder_DuplicateKeysAllowed(t *testing.T) {
 	p := makeItemsPage(t, btree.BTLeaf, 0, 5, nil, k(1), k(2), k(2))
+	if rs := VerifyBtreeItemOrder(p, 4, "ix"); len(rs) != 0 {
+		t.Fatalf("duplicate keys: want no findings, got %+v", rs)
+	}
+}
+
+// A genuine decrease among duplicate-key runs (not just a tie) is still a
+// violation.
+func TestVerifyBtreeItemOrder_DecreaseAfterDuplicateViolation(t *testing.T) {
+	p := makeItemsPage(t, btree.BTLeaf, 0, 5, nil, k(2), k(2), k(1))
 	rs := VerifyBtreeItemOrder(p, 4, "ix")
 	if len(rs) != 1 || rs[0].Msg != `item order invariant violated for index "ix"` {
-		t.Fatalf("duplicate keys: want single item-order finding, got %+v", rs)
+		t.Fatalf("decrease after duplicate: want single item-order finding, got %+v", rs)
 	}
 }
 

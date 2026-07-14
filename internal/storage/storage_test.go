@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 type recordingWAL struct {
@@ -354,6 +355,78 @@ func TestPoolFlushAllClearsDirty(t *testing.T) {
 	}
 }
 
+// TestPoolFlushRelWritesOnlyTargetRelationAndKeepsSlotsCached verifies
+// FlushRel (M0122-0007's prerequisite for tablespace physical relocation)
+// writes only the named relation's dirty pages, leaves an unrelated
+// relation's dirty page untouched, and — unlike InvalidateRel — keeps the
+// flushed slot cached and valid (just no longer dirty) rather than evicting
+// it.
+func TestPoolFlushRelWritesOnlyTargetRelationAndKeepsSlotsCached(t *testing.T) {
+	dir := t.TempDir()
+	mgr := NewManager(ManagerConfig{DataDir: dir})
+	defer mgr.Close()
+	pool, err := NewPool(mgr, PoolConfig{Slots: 8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+
+	relA := RelFileNode{DBOid: 1, RelOid: 400, Fork: MainFork}
+	relB := RelFileNode{DBOid: 1, RelOid: 401, Fork: MainFork}
+
+	sA, _, err := pool.PinNew(relA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sA.Page()[200] = 0xAA
+	pool.MarkDirty(sA)
+	pool.Unpin(sA)
+
+	sB, _, err := pool.PinNew(relB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sB.Page()[200] = 0xBB
+	pool.MarkDirty(sB)
+	pool.Unpin(sB)
+
+	if err := pool.FlushRel(relA); err != nil {
+		t.Fatal(err)
+	}
+
+	// relA's dirty bit is clear, but its slot is still cached (valid).
+	tagA := BufferTag{Rel: relA, Block: 0}
+	if idx, _ := pool.bm.Lookup(tagA); idx < 0 {
+		t.Fatal("relA's slot was evicted by FlushRel — should stay cached")
+	} else if pool.slots[idx].isDirty() {
+		t.Error("relA's slot still dirty after FlushRel")
+	}
+
+	// relA's byte reached disk.
+	gotA := make(Page, BlockSize)
+	if err := mgr.ReadBlock(relA, 0, gotA); err != nil {
+		t.Fatal(err)
+	}
+	if gotA[200] != 0xAA {
+		t.Errorf("relA smgr read byte[200] = %#x, want 0xAA", gotA[200])
+	}
+
+	// relB was never flushed: still dirty in the buffer pool, and its byte
+	// never reached disk (mgr.Exists is false, or a fresh read shows a zero
+	// page — either way, NOT 0xBB).
+	if idxB, _ := pool.bm.Lookup(BufferTag{Rel: relB, Block: 0}); idxB < 0 {
+		t.Fatal("relB's slot unexpectedly evicted")
+	} else if !pool.slots[idxB].isDirty() {
+		t.Error("relB's slot unexpectedly clean — FlushRel(relA) must not touch relB")
+	}
+	if mgr.Exists(relB) {
+		gotB := make(Page, BlockSize)
+		if err := mgr.ReadBlock(relB, 0, gotB); err == nil && gotB[200] == 0xBB {
+			t.Error("relB's dirty byte reached disk — FlushRel(relA) must not flush relB")
+		}
+	}
+}
+
 func TestPoolEvictionFlushesWALBeforeData(t *testing.T) {
 	dir := t.TempDir()
 	mgr := NewManager(ManagerConfig{DataDir: dir})
@@ -399,10 +472,11 @@ func TestPoolEvictionFlushesWALBeforeData(t *testing.T) {
 	}
 }
 
-// TestPoolFPIEmittedOncePerEpoch pins the restored FPI contract:
-// MarkDirty emits at most one full-page-image per slot per
-// checkpoint epoch. ResetCheckpointEpoch re-arms emission for the
-// next mutation.
+// TestPoolFPIEmittedOncePerEpoch pins the FPI contract under the
+// published-redo test (perf-optimize3-dash/03 option (b)): MarkDirty emits at
+// most one full-page-image per page per redo epoch (pd_lsn <= publishedRedo
+// gates emission), and publishing a NEW redo pointer above the page's pd_lsn
+// re-arms emission for the next mutation.
 func TestPoolFPIEmittedOncePerEpoch(t *testing.T) {
 	dir := t.TempDir()
 	mgr := NewManager(ManagerConfig{DataDir: dir})
@@ -440,8 +514,9 @@ func TestPoolFPIEmittedOncePerEpoch(t *testing.T) {
 		t.Fatalf("emitted=%d FPIs across 3 mutations in one epoch, want 1", emitted)
 	}
 
-	// ResetCheckpointEpoch re-arms the first-dirty emission.
-	pool.ResetCheckpointEpoch()
+	// Publishing a redo pointer at/above the page's pd_lsn re-arms the
+	// first-touch emission (the checkpointer does this at checkpoint start).
+	pool.PublishRedoRecPtr(200)
 	s, err = pool.Pin(BufferTag{Rel: rel, Block: 0})
 	if err != nil {
 		t.Fatal(err)
@@ -493,7 +568,6 @@ func TestPoolFPISkippedWhenDisabled(t *testing.T) {
 		t.Fatalf("FPI callback called %d times when full_page_writes=off", calls)
 	}
 }
-
 
 // TestMarkDirtyLogicalChangeEmitsLogicalAndFPIOnFirstDirty pins the
 // design 0103-0018 contract: heap mutation paths emit the logical
@@ -745,6 +819,15 @@ func (r *recordingAIOEngine) Submit(op AIOSubmitOp) AIOHandle {
 		n, err = op.File.WriteAt(op.Buffer, op.Offset)
 	default:
 		n, err = op.File.ReadAt(op.Buffer, op.Offset)
+	}
+	// Real engines call OnComplete on the completion path
+	// regardless of Wait timing (see AIOSubmitOp.OnComplete);
+	// this fake completes inline, so it must honor the same
+	// contract or PrefetchBlock/WriteBlockAIO's per-block latch
+	// would never release, deadlocking any test that touches the
+	// same block again.
+	if op.OnComplete != nil {
+		op.OnComplete()
 	}
 	return recordingAIOHandle{n: n, err: err}
 }
@@ -1389,7 +1472,6 @@ func TestPinNewEmitsSmgrCreateOnFirstBlock(t *testing.T) {
 	}
 }
 
-
 func TestExtendRelationBatchAppendsContiguousBlocks(t *testing.T) {
 	dir := t.TempDir()
 	mgr := NewManager(ManagerConfig{DataDir: dir})
@@ -1562,7 +1644,6 @@ func TestExtendRelationBatchRejectsNonPositiveN(t *testing.T) {
 	}
 }
 
-
 // TestSlotPinCountUnmappedTag verifies SlotPinCount returns 0 when the
 // tag is not currently mapped (never pinned, or already evicted).
 func TestSlotPinCountUnmappedTag(t *testing.T) {
@@ -1719,4 +1800,122 @@ func TestSlotPinCountIsolatesByTag(t *testing.T) {
 	pool.Unpin(s0b)
 	pool.Unpin(s0c)
 	pool.Unpin(s1a)
+}
+
+// gatedAIOEngine is a fake AIOEngine whose Submit performs the
+// real I/O immediately (so the bytes land on disk right away,
+// matching real engines) but defers calling OnComplete until the
+// test closes hold — simulating an AIO op that is still
+// "in-flight" from the storage layer's perspective even though
+// the underlying I/O already finished. This lets a test assert,
+// deterministically (no timing races), that
+// Manager.WriteBlockAIO/PrefetchBlock hold relFile's per-block
+// latch until OnComplete fires, not merely until Submit returns.
+type gatedAIOEngine struct {
+	hold chan struct{}
+}
+
+func (g *gatedAIOEngine) Submit(op AIOSubmitOp) AIOHandle {
+	var n int
+	var err error
+	switch op.Direction {
+	case AIODirWrite:
+		n, err = op.File.WriteAt(op.Buffer, op.Offset)
+	default:
+		n, err = op.File.ReadAt(op.Buffer, op.Offset)
+	}
+	go func() {
+		<-g.hold
+		if op.OnComplete != nil {
+			op.OnComplete()
+		}
+	}()
+	return recordingAIOHandle{n: n, err: err}
+}
+
+// TestBlockLatchSerializesAIOAgainstSync is the regression guard
+// for the storage/aio-relfile-mu-bypass task
+// (.ralph/fix_plan.md): relFile.lockBlock must be the ONE
+// serialization point between an AIO op (which bypasses relFile.mu
+// entirely on methodIOUring's raw-fd path) and a concurrent
+// synchronous read/write to the SAME block, while leaving
+// different blocks fully independent. Uses gatedAIOEngine to
+// control exactly when the AIO op's completion (and therefore the
+// latch release) happens, so the assertions below are
+// deterministic rather than relying on a race actually manifesting.
+func TestBlockLatchSerializesAIOAgainstSync(t *testing.T) {
+	dir := t.TempDir()
+	mgr := NewManager(ManagerConfig{DataDir: dir})
+	defer mgr.Close()
+	rel := RelFileNode{DBOid: 1, RelOid: 17300, Fork: MainFork}
+
+	page := make(Page, BlockSize)
+	if err := InitPage(page); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.Extend(rel, page); err != nil { // block 0
+		t.Fatal(err)
+	}
+	if _, err := mgr.Extend(rel, page); err != nil { // block 1
+		t.Fatal(err)
+	}
+
+	eng := &gatedAIOEngine{hold: make(chan struct{})}
+	mgr.SetAIO(eng)
+
+	// Start an AIO write to block 0. Submit returns immediately
+	// (gatedAIOEngine performs the write inline) but OnComplete —
+	// and therefore the release of relFile's block-0 latch — is
+	// blocked on eng.hold.
+	aioBuf := make(Page, BlockSize)
+	copy(aioBuf, page)
+	h, err := mgr.WriteBlockAIO(rel, 0, aioBuf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.Wait(); err != nil {
+		t.Fatalf("AIO write Wait: %v", err)
+	}
+
+	// A concurrent synchronous write to the SAME block (0) must
+	// block until the AIO op's OnComplete fires.
+	syncDone := make(chan error, 1)
+	go func() {
+		syncDone <- mgr.WriteBlock(rel, 0, page)
+	}()
+
+	select {
+	case err := <-syncDone:
+		t.Fatalf("WriteBlock(blk=0) returned (err=%v) before the in-flight AIO op completed — same-block serialization is broken", err)
+	case <-time.After(100 * time.Millisecond):
+		// Expected: still blocked on relFile's block-0 latch.
+	}
+
+	// A synchronous write to a DIFFERENT block (1) must NOT be
+	// blocked by block 0's outstanding AIO op — cross-block
+	// parallelism must survive this fix.
+	otherDone := make(chan error, 1)
+	go func() {
+		otherDone <- mgr.WriteBlock(rel, 1, page)
+	}()
+	select {
+	case err := <-otherDone:
+		if err != nil {
+			t.Fatalf("WriteBlock(blk=1) err=%v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("WriteBlock(blk=1) blocked — per-block latch regressed into a whole-file lock")
+	}
+
+	// Release the AIO op's completion. The synchronous block-0
+	// write must now unblock promptly.
+	close(eng.hold)
+	select {
+	case err := <-syncDone:
+		if err != nil {
+			t.Fatalf("WriteBlock(blk=0) err=%v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("WriteBlock(blk=0) never unblocked after the AIO op's OnComplete fired")
+	}
 }

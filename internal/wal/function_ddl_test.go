@@ -55,6 +55,15 @@ func TestEncodeDecodeCreateFunctionRoundTrip(t *testing.T) {
 			Language:       "sql", Body: "select '日本語'",
 			Volatile: "s", KindChar: "f",
 		},
+		{
+			// CREATE FUNCTION ... SET clause(s) (DU-002 proconfig follow-up
+			// to M0097-0150): the optional trailing Config extension block.
+			OID: 16387, Schema: "public", Name: "withconfig",
+			ReturnTypeName: "integer",
+			Language:       "sql", Body: "select 1",
+			Volatile: "v", KindChar: "f",
+			Config: []string{"search_path=app,public", "work_mem=64MB"},
+		},
 	}
 	for i, c := range cases {
 		raw := EncodeCreateFunction(c)
@@ -226,6 +235,82 @@ func TestEncodeDecodeAlterFunctionSetSchemaRoundTrip(t *testing.T) {
 	}
 }
 
+// TestEncodeDecodeAlterFunctionConfigRoundTrip is the SET/RESET proconfig
+// counterpart (DU-002 follow-up to M0097-0150): the whole post-mutation
+// Config snapshot round-trips, including the RESET ALL / never-set case
+// (nil/empty).
+func TestEncodeDecodeAlterFunctionConfigRoundTrip(t *testing.T) {
+	cases := []struct {
+		oid    uint32
+		config []string
+	}{
+		{16384, []string{"search_path=app,public"}},
+		{16385, []string{"search_path=app", "work_mem=64MB"}},
+		{16386, nil}, // RESET ALL leaves an empty array
+		{4294967295, []string{"日本語=値"}},
+	}
+	for _, c := range cases {
+		raw := EncodeAlterFunctionConfig(c.oid, c.config)
+		if raw[0] != RecordKindAlterFunctionConfig {
+			t.Errorf("oid %d: kind byte = %d, want %d", c.oid, raw[0], RecordKindAlterFunctionConfig)
+			continue
+		}
+		gotOID, gotConfig, err := DecodeAlterFunctionConfig(raw)
+		if err != nil {
+			t.Errorf("oid %d: decode err: %v", c.oid, err)
+			continue
+		}
+		if gotOID != c.oid {
+			t.Errorf("oid %d: decoded oid = %d", c.oid, gotOID)
+		}
+		if len(gotConfig) != len(c.config) {
+			t.Fatalf("oid %d: decoded config = %#v, want %#v", c.oid, gotConfig, c.config)
+		}
+		for i := range gotConfig {
+			if gotConfig[i] != c.config[i] {
+				t.Errorf("oid %d: config[%d] = %q, want %q", c.oid, i, gotConfig[i], c.config[i])
+			}
+		}
+	}
+}
+
+// TestEncodeCreateFunctionOmitsConfigExtensionWhenEmpty pins that an empty
+// Config produces byte-identical output to a payload that never carried the
+// field at all — the same backward-compatibility contract
+// CreateIndexPayload's predicate/INCLUDE-column extension block already
+// established (DU-002 follow-up to M0097-0150).
+func TestEncodeCreateFunctionOmitsConfigExtensionWhenEmpty(t *testing.T) {
+	base := CreateFunctionPayload{OID: 1, Name: "x", KindChar: "f"}
+	withNilConfig := base
+	withNilConfig.Config = nil
+	withEmptyConfig := base
+	withEmptyConfig.Config = []string{}
+	rawNil := EncodeCreateFunction(withNilConfig)
+	rawEmpty := EncodeCreateFunction(withEmptyConfig)
+	if !bytesEqual(rawNil, rawEmpty) {
+		t.Fatalf("nil vs empty Config produced different bytes: %v vs %v", rawNil, rawEmpty)
+	}
+	got, err := DecodeCreateFunction(rawNil)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(got.Config) != 0 {
+		t.Errorf("decoded Config = %#v, want empty", got.Config)
+	}
+}
+
+func bytesEqual(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // TestDecodeFunctionRejectsWrongKindAndTruncatedPayload guards the
 // decoders against a mismatched kind byte and a corrupt/truncated on-disk
 // record, for every function record kind.
@@ -249,6 +334,9 @@ func TestDecodeFunctionRejectsWrongKindAndTruncatedPayload(t *testing.T) {
 	}
 	if _, _, err := DecodeAlterFunctionSetSchema(bogus); err == nil {
 		t.Error("DecodeAlterFunctionSetSchema: expected error on wrong kind")
+	}
+	if _, _, err := DecodeAlterFunctionConfig(bogus); err == nil {
+		t.Error("DecodeAlterFunctionConfig: expected error on wrong kind")
 	}
 
 	truncCases := []struct {
@@ -278,6 +366,10 @@ func TestDecodeFunctionRejectsWrongKindAndTruncatedPayload(t *testing.T) {
 		}},
 		{"AlterFunctionSetSchema", []byte{RecordKindAlterFunctionSetSchema, 10, 0}, func(p []byte) error {
 			_, _, err := DecodeAlterFunctionSetSchema(p)
+			return err
+		}},
+		{"AlterFunctionConfig", []byte{RecordKindAlterFunctionConfig, 0, 0, 0, 0, 1}, func(p []byte) error {
+			_, _, err := DecodeAlterFunctionConfig(p)
 			return err
 		}},
 	}

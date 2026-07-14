@@ -1,9 +1,6 @@
 package initdb
 
 import (
-	"fmt"
-	"sort"
-
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/executor"
 )
@@ -31,50 +28,13 @@ func registerInformationSchemaSequencesView(cat *catalog.InMemory) error {
 			{Name: "cycle_option", Type: catalog.Type{Name: "text"}, Ordinal: 11},
 		},
 	}
+	// Fallback path only — see registerPgSequencesView's matching comment in
+	// pg_sequences_view.go. internal/executor/operators.go's valuesOp.Open
+	// resolves the connecting session's own dbOid directly (tbl.Name ==
+	// "sequences" branch) instead of falling through to this closure.
+	// M0122-0007 4e follow-up 35 (deferred by follow-up 34).
 	tbl.VirtualRows = func() [][]string {
-		infos := executor.AllSequenceInfos()
-		sort.Slice(infos, func(i, j int) bool {
-			if infos[i].Schema != infos[j].Schema {
-				return infos[i].Schema < infos[j].Schema
-			}
-			return infos[i].Name < infos[j].Name
-		})
-		rows := make([][]string, len(infos))
-		for i, seq := range infos {
-			dt, prec := seqDataTypePrecision(seq.DataType)
-			cycleOpt := "NO"
-			if seq.Cycle {
-				cycleOpt = "YES"
-			}
-			rows[i] = []string{
-				"postgres", // sequence_catalog = current database
-				seq.Schema,
-				seq.Name,
-				dt,
-				fmt.Sprintf("%d", prec),
-				"2", // numeric_precision_radix — always binary
-				"0", // numeric_scale — always 0 for integer types
-				fmt.Sprintf("%d", seq.Start),
-				fmt.Sprintf("%d", seq.Min),
-				fmt.Sprintf("%d", seq.Max),
-				fmt.Sprintf("%d", seq.Increment),
-				cycleOpt,
-			}
-		}
-		return rows
+		return executor.InformationSchemaSequencesRows(catalog.DefaultDBOid)
 	}
 	return cat.RegisterVirtualTable(tbl)
-}
-
-// seqDataTypePrecision maps a sequence data type name to the canonical
-// PostgreSQL type name and its numeric_precision value.
-func seqDataTypePrecision(dt string) (typeName string, precision int) {
-	switch dt {
-	case "smallint", "int2":
-		return "smallint", 16
-	case "integer", "int4", "int":
-		return "integer", 32
-	default: // bigint / int8 (default)
-		return "bigint", 64
-	}
 }

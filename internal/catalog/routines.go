@@ -60,6 +60,16 @@ type Routine struct {
 	// bootstrap superuser" — see OwnerOrDefault. M0097-0150.
 	Owner uint32
 
+	// Config is pg_proc.proconfig: a list of "name=value" per-function GUC
+	// overrides set via CREATE FUNCTION's SET clause or ALTER FUNCTION/
+	// PROCEDURE/ROUTINE ... SET/RESET, in insertion order (mirrors
+	// InMemory's role/database-level roleSettings shape). nil renders as SQL
+	// NULL (matches upstream: a routine that never had a SET clause has no
+	// proconfig row at all). Dump-fidelity only — goopg does not push/pop
+	// these values around the routine's own execution (no per-call GUC
+	// scoping exists yet); see docs/design/0122-0007-function-set-config.md.
+	Config []string
+
 	// Dependency tracking populated at CREATE FUNCTION time for information_schema views.
 	SequenceDeps    []RoutineSeqDep   // sequences referenced via nextval/currval
 	RoutineCallOIDs []uint32          // OIDs of routines called in body/defaults
@@ -738,6 +748,74 @@ func (rs *Routines) SetOwnerByOIDDuringRecovery(oid, ownerOID uint32) {
 	for _, r := range rs.byKey {
 		if r.OID == oid {
 			r.Owner = ownerOID
+			return
+		}
+	}
+}
+
+// routineConfigName extracts the GUC name from a "name=value" pg_proc.
+// proconfig-shaped entry, mirroring catalog.go's dbRoleSettingConfigName for
+// the analogous pg_db_role_setting.setconfig entries.
+func routineConfigName(entry string) string {
+	if eq := strings.IndexByte(entry, '='); eq >= 0 {
+		return entry[:eq]
+	}
+	return ""
+}
+
+// ApplyFunctionConfigOps applies a sequence of CREATE/ALTER FUNCTION SET/
+// RESET clauses (in statement order, as parsed by parser.
+// parseFunctionConfigSetClause/parseFunctionConfigResetClause) to cfg,
+// returning the updated array. A SET upserts (replaces an existing
+// same-name entry case-insensitively, else appends); RESET removes the
+// named entry if present; RESET ALL clears everything. Used both to build a
+// fresh routine's initial Config (execCreateFunction — cfg starts nil) and
+// to mutate an already-registered routine's Config in place
+// (execAlterFunction passes r.Config directly; Routine field mutation here
+// is unsynchronized, matching every other ALTER FUNCTION attribute write in
+// that function, e.g. `r.Volatile = *s.Volatile`). DU-002 proconfig
+// follow-up to M0097-0150.
+func ApplyFunctionConfigOps(cfg []string, ops []parser.FunctionConfigOp) []string {
+	for _, op := range ops {
+		switch {
+		case op.ResetAll:
+			cfg = nil
+		case op.Reset:
+			for i, e := range cfg {
+				if strings.EqualFold(routineConfigName(e), op.Name) {
+					cfg = append(cfg[:i], cfg[i+1:]...)
+					break
+				}
+			}
+		default:
+			entry := op.Name + "=" + op.Value
+			found := false
+			for i, e := range cfg {
+				if strings.EqualFold(routineConfigName(e), op.Name) {
+					cfg[i] = entry
+					found = true
+					break
+				}
+			}
+			if !found {
+				cfg = append(cfg, entry)
+			}
+		}
+	}
+	return cfg
+}
+
+// ReplaceConfigByOIDDuringRecovery overwrites oid's entire Config array with
+// cfg (a full post-mutation snapshot, not a diff — mirrors
+// SetFlagsByOIDDuringRecovery's whole-state-replay shape) during WAL replay
+// of a RecordKindAlterFunctionConfig record. A missing OID is a silent no-op,
+// matching every other *ByOIDDuringRecovery method in this file.
+func (rs *Routines) ReplaceConfigByOIDDuringRecovery(oid uint32, cfg []string) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	for _, r := range rs.byKey {
+		if r.OID == oid {
+			r.Config = append([]string(nil), cfg...)
 			return
 		}
 	}

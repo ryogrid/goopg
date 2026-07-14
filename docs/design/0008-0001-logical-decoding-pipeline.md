@@ -128,20 +128,39 @@ are picked up by exactly the same code path because they share the
 inhibits checkpointer-driven recycling exactly the same way a
 physical slot does. No new retention code is needed in this slice.
 
-### Catalog xmin retention — explicit deferral
+### Catalog xmin retention — hook landed (2026-07-12)
 
 A logical slot's `CatalogXmin` is the oldest xact whose catalog row
 versions the decoder may still need to reconstruct historic
 snapshots. Upstream's vacuum and pruning paths consult this so they
 don't reclaim catalog tuples a logical slot can still see.
 
-v0's vacuum / pruning paths consult only the global `oldestXmin`
-horizon — they don't yet honour per-slot `catalog_xmin`. This
-**is a correctness gap** for logical replication of tables whose
-schemas can change while a slot is active; it's tracked under
-`0008-0001-followup` and addressed in a sibling loop. The slot
-field is persisted now so the surface is in place when the vacuum
-hook lands.
+**The retention hook is now wired.** `wal.Slots.MinCatalogXmin()`
+aggregates the smallest non-zero `catalog_xmin` across
+non-invalidated slots (physical slots and freshly created logical
+slots have `catalog_xmin==0` and are skipped). `initdb.Open`
+installs it on the transaction manager via
+`mvcc.Manager.SetCatalogXminSource`, and `OldestXmin()` — the single
+global horizon consulted by both heap-prune paths
+(opportunistic + VACUUM), the index-only-scan prune, and CLOG/SLRU
+truncation — folds it in: the horizon is floored to the oldest
+pinned `catalog_xmin`, never advanced forward past the natural
+horizon. Producer side: `wal.Slots.AdvanceCatalogXmin(name, xid)` is
+the monotonic setter (mirrors upstream's
+`LogicalIncreaseXminForSlot`) the decoding pipeline calls to reserve
+and then advance a slot's `catalog_xmin`; the value is persisted so
+the horizon survives a restart before the decoder reconnects.
+
+**Still deferred** (tracked in `deferral_ledger.md`, 2026-07-12):
+(a) wiring the reorder-buffer/decoder confirm path to actually call
+`AdvanceCatalogXmin` (reserve at `CREATE_REPLICATION_SLOT ...
+LOGICAL`, advance on `LogicalConfirmReceivedLocation`) — until that
+lands, `catalog_xmin` stays 0 and the hook is inert in production;
+(b) upstream's separate *data* vs *catalog* horizon — only catalog
+and user-catalog relations are held by `catalog_xmin` there, whereas
+v0 conservatively floors the one global horizon, over-retaining dead
+tuples on ordinary permanent tables while a slot lags (safe, never
+unsafe).
 
 ### Pipeline architecture
 

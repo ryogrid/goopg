@@ -195,6 +195,46 @@ func TestPlanUpsertDoNothingNoTargetUsesExpressionUniqueIndex(t *testing.T) {
 	}
 }
 
+// TestPlanUpsertDoNothingNoTargetFindsArbiterUnderDistinctDBOid covers
+// M0122-0007 4d-ii-part-2b item 1: catalog.SearchPathCatalog previously had
+// no IndexesOnTable override, so it silently promoted straight to the
+// embedded InMemory.IndexesOnTable with no dbOid argument (always resolving
+// DefaultDBOid) regardless of SearchPathCatalog.DBOid. The planner's bare
+// `ON CONFLICT DO NOTHING` (no explicit target) resolves its arbiter via
+// resolveDefaultDoNothingArbiter, which calls cat.IndexesOnTable(tbl) on
+// exactly this kind of catalog.Catalog interface value — on a connection
+// bound to a genuinely distinct dbOid this always found zero indexes, so
+// ArbiterIndex stayed nil and the DO NOTHING conflict probe never ran.
+func TestPlanUpsertDoNothingNoTargetFindsArbiterUnderDistinctDBOid(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+	const otherDBOid = 5252
+	ctx.CurrentDatabaseOid = otherDBOid
+	if err := runDDL(t, ctx, "CREATE TABLE items2 (id int4 PRIMARY KEY, label text)"); err != nil {
+		t.Fatal(err)
+	}
+	stmts, err := parser.Parse("INSERT INTO items2 VALUES (1, 'v1') ON CONFLICT DO NOTHING")
+	if err != nil {
+		t.Fatal(err)
+	}
+	planCat := catalog.WithSearchPath(ctx.Catalog, nil)
+	planCat.DBOid = otherDBOid
+	node, err := planner.Plan(stmts[0], planCat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ins, ok := node.(*planner.Insert)
+	if !ok {
+		t.Fatalf("node = %T, want *planner.Insert", node)
+	}
+	if ins.OnConflict == nil || ins.OnConflict.ArbiterIndex == nil {
+		t.Fatalf("OnConflict arbiter missing under distinct dbOid: %+v — SearchPathCatalog.IndexesOnTable is not routing to the connection's own dbOid namespace", ins.OnConflict)
+	}
+	if ins.OnConflict.ArbiterIndex.Name != "items2_pkey" {
+		t.Fatalf("ArbiterIndex = %q, want items2_pkey", ins.OnConflict.ArbiterIndex.Name)
+	}
+}
+
 // TestUpsertDoUpdateMixingExistingAndExcluded — the SET expression
 // references both the target's column (bare `label`) and
 // `excluded.label`. Pins the planner-side merged 2N row layout:

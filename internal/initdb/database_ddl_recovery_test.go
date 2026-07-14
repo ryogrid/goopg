@@ -1,6 +1,7 @@
 package initdb
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -25,7 +26,7 @@ func TestDatabaseDDLRecoveryReplaysCreate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first Open: %v", err)
 	}
-	if _, _, werr := rt1.WAL.Append(wal.EncodeCreateDatabase("tpch")); werr != nil {
+	if _, _, werr := rt1.WAL.Append(wal.EncodeCreateDatabase("tpch", catalog.BootstrapSuperuserOID, 16401)); werr != nil {
 		_ = rt1.Close()
 		t.Fatalf("WAL.Append create-database: %v", werr)
 	}
@@ -55,6 +56,55 @@ func TestDatabaseDDLRecoveryReplaysCreate(t *testing.T) {
 	if !cat.HasDatabase("tpch") {
 		t.Errorf("after WAL replay, HasDatabase(tpch) = false; databases = %v", cat.ListDatabases())
 	}
+	// M0122-0007 physical-storage-isolation slice 2: replay must also
+	// (re-)create base/<oid>/PG_VERSION for the recovered database.
+	if _, err := os.Stat(filepath.Join(dir, "base", "16401", "PG_VERSION")); err != nil {
+		t.Errorf("base/16401/PG_VERSION missing after replay: %v", err)
+	}
+}
+
+// TestDatabaseDDLRecoveryRecreatesMissingDatabaseDirectory confirms that
+// replay recreates base/<oid> even if it was somehow lost between the
+// pre-crash CREATE DATABASE and the post-crash Open (e.g. the mkdir never
+// reached disk before a power loss) — CreatePerDatabaseScaffolding is
+// idempotent, so replay always re-derives the directory from the durable
+// WAL record rather than assuming it survived.
+func TestDatabaseDDLRecoveryRecreatesMissingDatabaseDirectory(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	if err := Init(Options{DataDir: dir}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	rt1, err := Open(OpenOptions{DataDir: dir, PoolSlots: 4})
+	if err != nil {
+		t.Fatalf("first Open: %v", err)
+	}
+	if _, _, werr := rt1.WAL.Append(wal.EncodeCreateDatabase("tpch2", catalog.BootstrapSuperuserOID, 16403)); werr != nil {
+		_ = rt1.Close()
+		t.Fatalf("WAL.Append create-database: %v", werr)
+	}
+	if ferr := rt1.WAL.FlushUpTo(rt1.WAL.WrittenLSN()); ferr != nil {
+		_ = rt1.Close()
+		t.Fatalf("FlushUpTo: %v", ferr)
+	}
+	if err := rt1.Close(); err != nil {
+		t.Fatalf("first Close: %v", err)
+	}
+
+	dbDir := filepath.Join(dir, "base", "16403")
+	if err := os.RemoveAll(dbDir); err != nil {
+		t.Fatalf("simulate lost directory: %v", err)
+	}
+
+	rt2, err := Open(OpenOptions{DataDir: dir, PoolSlots: 4})
+	if err != nil {
+		t.Fatalf("second Open: %v", err)
+	}
+	defer rt2.Close()
+
+	if _, err := os.Stat(filepath.Join(dbDir, "PG_VERSION")); err != nil {
+		t.Errorf("base/16403/PG_VERSION not recreated by replay: %v", err)
+	}
 }
 
 // TestDatabaseDDLRecoveryReplaysDropAfterCreate confirms that a
@@ -70,7 +120,7 @@ func TestDatabaseDDLRecoveryReplaysDropAfterCreate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first Open: %v", err)
 	}
-	if _, _, werr := rt1.WAL.Append(wal.EncodeCreateDatabase("scratch")); werr != nil {
+	if _, _, werr := rt1.WAL.Append(wal.EncodeCreateDatabase("scratch", catalog.BootstrapSuperuserOID, 16402)); werr != nil {
 		_ = rt1.Close()
 		t.Fatalf("WAL.Append create: %v", werr)
 	}
@@ -99,6 +149,13 @@ func TestDatabaseDDLRecoveryReplaysDropAfterCreate(t *testing.T) {
 	if !cat.HasDatabase("postgres") {
 		t.Error("seed postgres database should still be present")
 	}
+	// M0122-0007 physical-storage-isolation slice 3: replaying the CREATE
+	// then the DROP in the same pass must leave no base/16402 behind —
+	// the directory the CREATE record's replay produced must be removed
+	// again by the DROP record's replay, not orphaned.
+	if _, err := os.Stat(filepath.Join(dir, "base", "16402")); !os.IsNotExist(err) {
+		t.Errorf("base/16402 present after CREATE+DROP replay: err=%v", err)
+	}
 }
 
 // TestReplayDatabaseDDLRecordsHandlesMissingWalDir verifies the
@@ -106,7 +163,7 @@ func TestDatabaseDDLRecoveryReplaysDropAfterCreate(t *testing.T) {
 // directory (e.g. brand new initdb).
 func TestReplayDatabaseDDLRecordsHandlesMissingWalDir(t *testing.T) {
 	cat := catalog.NewInMemory()
-	if err := replayDatabaseDDLRecords(filepath.Join(t.TempDir(), "nonexistent"), cat); err != nil {
+	if err := replayDatabaseDDLRecords(filepath.Join(t.TempDir(), "nonexistent"), cat, ""); err != nil {
 		t.Fatalf("replay against missing dir: %v", err)
 	}
 	if !cat.HasDatabase("postgres") {

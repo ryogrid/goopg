@@ -341,3 +341,95 @@ func TestAnalyzeSetStatisticsZeroDisablesColumn(t *testing.T) {
 		t.Errorf("id NDistinct=%d want 10", got)
 	}
 }
+
+// TestColumnNDistinctOverride pins the value-parsing contract of the
+// `n_distinct` attribute option, mirroring upstream's stadistinct convention
+// (postgres/src/backend/utils/adt/selfuncs.c get_variable_numdistinct): a
+// positive value is an absolute distinct count, a value in [-1, 0) is a
+// fraction of the row count, 0/unset/other options are no-ops, and an
+// out-of-range negative value is clamped to -1.
+func TestColumnNDistinctOverride(t *testing.T) {
+	const rows = 1000
+	cases := []struct {
+		name    string
+		options []string
+		wantND  int64
+		wantOK  bool
+	}{
+		{"absolute", []string{"n_distinct=5"}, 5, true},
+		{"absolute-rounds", []string{"n_distinct=7.6"}, 8, true},
+		{"fraction-half", []string{"n_distinct=-0.5"}, 500, true},
+		{"fraction-all-distinct", []string{"n_distinct=-1"}, 1000, true},
+		{"fraction-tiny-floors-at-one", []string{"n_distinct=-0.0000001"}, 1, true},
+		{"below-range-clamps-to-minus-one", []string{"n_distinct=-2"}, 1000, true},
+		{"zero-is-no-op", []string{"n_distinct=0"}, 0, false},
+		{"unset", nil, 0, false},
+		{"other-option-ignored", []string{"foo=3"}, 0, false},
+		{"case-insensitive-key", []string{"N_Distinct=5"}, 5, true},
+		{"inherited-flavor-not-honored", []string{"n_distinct_inherited=5"}, 0, false},
+		{"malformed-value-is-no-op", []string{"n_distinct=abc"}, 0, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			col := &catalog.Column{Options: tc.options}
+			nd, ok := columnNDistinctOverride(col, rows)
+			if ok != tc.wantOK || nd != tc.wantND {
+				t.Errorf("columnNDistinctOverride(%v)=(%d,%v) want (%d,%v)", tc.options, nd, ok, tc.wantND, tc.wantOK)
+			}
+		})
+	}
+}
+
+// TestAnalyzeRespectsNDistinctOption pins that a per-column `n_distinct`
+// attribute option (set via `ALTER TABLE ... ALTER COLUMN ... SET (n_distinct
+// = <v>)`, stored on catalog.Column.Options) overrides the ANALYZE-computed
+// NDistinct that the planner later consults, mirroring upstream's override in
+// do_analyze_rel (postgres/src/backend/commands/analyze.c:571-581). Column 0
+// carries an absolute override, column 1 has none and keeps its real sampled
+// value.
+func TestAnalyzeRespectsNDistinctOption(t *testing.T) {
+	ctx, cat, cleanup := newStorageFixture(t)
+	defer cleanup()
+	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
+
+	// SET (n_distinct = 5) on column 0 ("id"), which is otherwise fully
+	// unique (1000 distinct ids). Column 1 ("label") is a single value.
+	tbl.Columns[0].Options = []string{"n_distinct=5"}
+
+	rows := make([][]planner.Expr, 1000)
+	for i := 0; i < 1000; i++ {
+		rows[i] = []planner.Expr{
+			&planner.IntegerConst{Value: int64(i + 1)}, // 1..1000, unique
+			&planner.StringConst{Value: "x"},
+		}
+	}
+	insertPlan := &planner.Insert{Table: tbl, Source: &planner.Values{Rows: rows}, ColumnIndex: []int{0, 1}}
+	op, err := Build(insertPlan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := op.Open(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := op.Next(); err != EOF {
+		t.Fatalf("Insert.Next: %v", err)
+	}
+	_ = op.Close()
+	if err := ctx.TxnMgr.Commit(ctx.Tx); err != nil {
+		t.Fatal(err)
+	}
+
+	stats, err := analyzeRelationWith(ctx.Pool, ctx.TxnMgr, ctx.Catalog, tbl, upstreamDefaultStatsTarget, rand.New(rand.NewSource(42)), ctx.MultiXact)
+	if err != nil {
+		t.Fatalf("analyzeRelationWith: %v", err)
+	}
+
+	// Column 0's NDistinct is the manual override (5), not the sampled ~1000.
+	if got := stats.Columns[0].NDistinct; got != 5 {
+		t.Errorf("id NDistinct=%d want 5 (n_distinct=5 override)", got)
+	}
+	// Column 1 (no override, single value) still reflects the sample.
+	if got := stats.Columns[1].NDistinct; got != 1 {
+		t.Errorf("label NDistinct=%d want 1", got)
+	}
+}
