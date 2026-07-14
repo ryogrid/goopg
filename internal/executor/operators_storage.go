@@ -1822,6 +1822,51 @@ func (o *insertOp) Close() error {
 // RETURNING (M0100-0005) the inserted rows are accumulated in o.retRows
 // and streamed out on subsequent calls. Without RETURNING the wire layer
 // issues `INSERT N`.
+// coerceRowForConstraintChecks coerces row[i] to its declared column type in
+// place wherever include(i) is true, mirroring PostgreSQL's assignment-cast
+// semantics (transformAssignedExpr) so downstream FK/CHECK/domain/NOT-NULL
+// constraint checks — and their DETAIL-message rendering — see a properly
+// typed value instead of the raw literal Datum a VALUES/SET expression
+// produced. Catches smallint/int4 out-of-range and bigint overflow, and
+// turns a still-KindString date/timestamp/timestamptz/numeric literal into
+// its typed Datum. Skips NULL values and array-typed columns (an array
+// column's value is a "{...}" text literal, not a scalar — coercing it to
+// the element type would misparse it; M0118-0002). Shared by insertOp.Next
+// and every UPDATE new-row construction site (updateViaIndex, updateOp.Next,
+// updateWithFrom — main path and EPQ retry); pattern_sibling_paths_must_agree.
+func coerceRowForConstraintChecks(cols []catalog.Column, row Row, include func(i int) bool, ctx *Context, pos int) error {
+	for i, col := range cols {
+		if i >= len(row) || !include(i) || row[i].IsNull() || col.Type.IsArray {
+			continue
+		}
+		var coerced Datum
+		var cerr error
+		switch strings.ToLower(col.Type.Name) {
+		case "int2", "smallint", "smallserial", "serial2":
+			coerced, cerr = evalCast(row[i], "int2", pos, ctx)
+		case "int4", "integer", "int", "serial", "serial4":
+			coerced, cerr = evalCast(row[i], "int4", pos, ctx)
+		case "int8", "bigint", "bigserial", "serial8":
+			coerced, cerr = evalCast(row[i], "int8", pos, ctx)
+		case "date":
+			coerced, cerr = evalCast(row[i], "date", pos, ctx)
+		case "timestamp":
+			coerced, cerr = evalCast(row[i], "timestamp", pos, ctx)
+		case "timestamptz":
+			coerced, cerr = evalCast(row[i], "timestamptz", pos, ctx)
+		case "numeric", "decimal":
+			coerced, cerr = evalCast(row[i], "numeric", pos, ctx)
+		default:
+			continue
+		}
+		if cerr != nil {
+			return cerr
+		}
+		row[i] = coerced
+	}
+	return nil
+}
+
 func (o *insertOp) Next() (TupleSlot, error) {
 	if o.done {
 		if len(o.plan.Returning) > 0 && o.retIdx < len(o.retRows) {
@@ -1909,43 +1954,11 @@ func (o *insertOp) Next() (TupleSlot, error) {
 		// violation DETAIL messages render it the same way SELECT/COPY/CAST
 		// output does (fkValsForDetail's DateStyle fix otherwise still saw
 		// the raw un-coerced literal on the INSERT path; M-NIGHTLY
-		// 2026-07-15 follow-up).
-		for i, col := range cols {
-			if insertMissing[i] || row[i].IsNull() {
-				continue
-			}
-			// An array-typed column (e.g. `p int4[]`) carries Type.Name="int4"
-			// but Type.IsArray=true; its value is the array text literal "{1}"
-			// produced by array_construct, NOT a scalar. Coercing it to the
-			// element type would parse "{1}" as an int4 and raise 22P02
-			// (invalid input syntax). Leave array values untouched. M0118-0002.
-			if col.Type.IsArray {
-				continue
-			}
-			var coerced Datum
-			var cerr error
-			switch strings.ToLower(col.Type.Name) {
-			case "int2", "smallint", "smallserial", "serial2":
-				coerced, cerr = evalCast(row[i], "int2", o.plan.Pos(), o.ctx)
-			case "int4", "integer", "int", "serial", "serial4":
-				coerced, cerr = evalCast(row[i], "int4", o.plan.Pos(), o.ctx)
-			case "int8", "bigint", "bigserial", "serial8":
-				coerced, cerr = evalCast(row[i], "int8", o.plan.Pos(), o.ctx)
-			case "date":
-				coerced, cerr = evalCast(row[i], "date", o.plan.Pos(), o.ctx)
-			case "timestamp":
-				coerced, cerr = evalCast(row[i], "timestamp", o.plan.Pos(), o.ctx)
-			case "timestamptz":
-				coerced, cerr = evalCast(row[i], "timestamptz", o.plan.Pos(), o.ctx)
-			case "numeric", "decimal":
-				coerced, cerr = evalCast(row[i], "numeric", o.plan.Pos(), o.ctx)
-			default:
-				continue
-			}
-			if cerr != nil {
-				return nil, cerr
-			}
-			row[i] = coerced
+		// 2026-07-15 follow-up). Shared with every UPDATE new-row
+		// construction site via coerceRowForConstraintChecks
+		// (pattern_sibling_paths_must_agree).
+		if err := coerceRowForConstraintChecks(cols, row, func(i int) bool { return !insertMissing[i] }, o.ctx, o.plan.Pos()); err != nil {
+			return nil, err
 		}
 
 		// BEFORE INSERT triggers (M0096-0012).
@@ -3788,6 +3801,10 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 	}
 	pending := make([]pendingUpdate, 0, 1) // pre-alloc for common 1-row match
 	heapRel := rel
+	// M-NIGHTLY 2026-07-15 UPDATE-side follow-up: only columns this
+	// statement's SET clause actually touches need coercion — an untouched
+	// column's value came straight from storage and is already typed.
+	setCol := func(i int) bool { return i < len(o.plan.Set) && o.plan.Set[i] != nil }
 
 	hiBytes := keyBytes
 	if len(ix.Index.Columns) > 1 {
@@ -3850,6 +3867,13 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 				return false, err
 			}
 			newRow[i] = v
+		}
+		// M-NIGHTLY 2026-07-15 UPDATE-side follow-up: coerce freshly-SET
+		// literal values to their declared column type — the same step
+		// insertOp.Next already applies to VALUES-clause literals — before
+		// FK/CHECK/domain/NOT-NULL constraint checks run below.
+		if err := coerceRowForConstraintChecks(cols, newRow, setCol, o.ctx, o.plan.Pos()); err != nil {
+			return false, err
 		}
 		// Recompute GENERATED ALWAYS AS … STORED columns after SET. M0096-0008.
 		_ = computeGeneratedColumns(cols, newRow)
@@ -4078,6 +4102,9 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 						} else {
 							pu.newRow[i] = baseRow[i]
 						}
+					}
+					if err := coerceRowForConstraintChecks(cols, pu.newRow, setCol, o.ctx, o.plan.Pos()); err != nil {
+						return nil, err
 					}
 					_ = computeGeneratedColumns(cols, pu.newRow)
 					pu.blk = newBlk
@@ -4399,6 +4426,10 @@ func (o *updateOp) Next() (TupleSlot, error) {
 		beforeFired    bool           // BEFORE trigger already fired in Phase 1 (M0100-0011)
 	}
 	pending := make([]pendingUpdate, 0, 1)
+	// M-NIGHTLY 2026-07-15 UPDATE-side follow-up: only columns this
+	// statement's SET clause actually touches need coercion — an untouched
+	// column's value came straight from storage and is already typed.
+	setCol := func(i int) bool { return i < len(o.plan.Set) && o.plan.Set[i] != nil }
 
 	for _, scanTbl := range updateScanTables {
 		scanRel := o.ctx.Catalog.RelFileNode(scanTbl)
@@ -4449,6 +4480,9 @@ func (o *updateOp) Next() (TupleSlot, error) {
 						parentNewRow[pi] = evalRow[pi]
 					}
 				}
+				if err := coerceRowForConstraintChecks(cols, parentNewRow, setCol, o.ctx, o.plan.Pos()); err != nil {
+					return err
+				}
 				newRow = remapParentRowToChild(parentNewRow, row, cols, captureCols)
 			} else {
 				nCols := len(captureCols)
@@ -4466,6 +4500,9 @@ func (o *updateOp) Next() (TupleSlot, error) {
 							newRow[i] = row[i]
 						}
 					}
+				}
+				if err := coerceRowForConstraintChecks(captureCols, newRow, setCol, o.ctx, o.plan.Pos()); err != nil {
+					return err
 				}
 				// scanTbl==tbl or a partition child: PG requires a partition's
 				// columns to exactly mirror the partitioned table's layout (only
@@ -4597,6 +4634,9 @@ func (o *updateOp) Next() (TupleSlot, error) {
 								newRow[i] = baseRow[i]
 							}
 						}
+					}
+					if err := coerceRowForConstraintChecks(captureCols, newRow, setCol, o.ctx, o.plan.Pos()); err != nil {
+						return err
 					}
 					_ = computeGeneratedColumns(captureCols, newRow)
 					oldRow = cloneRow(baseRow)
@@ -4826,6 +4866,9 @@ func (o *updateOp) Next() (TupleSlot, error) {
 								pu.newRow[i] = baseRow[i]
 							}
 						}
+					}
+					if err := coerceRowForConstraintChecks(puCols, pu.newRow, setCol, o.ctx, o.plan.Pos()); err != nil {
+						return nil, err
 					}
 					_ = computeGeneratedColumns(puCols, pu.newRow)
 					// M0100-0005aa: refresh OLD with the EPQ-refetched row so any
@@ -5699,6 +5742,10 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 	var pending []pendingUpdate
 	tgtColCount := len(tgtCols)
 	needFromForReturning := len(o.plan.Returning) > 0
+	// M-NIGHTLY 2026-07-15 UPDATE-side follow-up: only columns this
+	// statement's SET clause actually touches need coercion — an untouched
+	// column's value came straight from storage and is already typed.
+	setCol := func(i int) bool { return i < len(o.plan.Set) && o.plan.Set[i] != nil }
 
 	// Collect inheritance children and partition children for the FROM target scan.
 	// Partition children share the parent's column ordinals (no remapping), but may
@@ -5774,6 +5821,9 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 						} else if i < len(tgtRow) {
 							parentNewRow[i] = tgtRow[i]
 						}
+					}
+					if err := coerceRowForConstraintChecks(tgtCols, parentNewRow, setCol, o.ctx, o.plan.Pos()); err != nil {
+						return err
 					}
 					// For inheritance children, map back to child column order for writing.
 					var actualNewRow Row
@@ -6018,6 +6068,9 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 					} else if i < len(epqRow) {
 						parentNewRow[i] = epqRow[i]
 					}
+				}
+				if err := coerceRowForConstraintChecks(tgtCols, parentNewRow, setCol, o.ctx, o.plan.Pos()); err != nil {
+					return nil, err
 				}
 				// Re-route to partition if partition key changed. M0100-0010.
 				epqWriteRel := puSrcRel

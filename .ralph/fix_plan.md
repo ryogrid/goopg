@@ -3625,6 +3625,35 @@ survey the deferral ledger for a fresh open (`status = -`) row.
       flagDate fix); `RALPH_PRECOMMIT_SCOPE=smoke bash
       scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 workloads,
       re-run after the flagDate fix).
+- [x] **M-NIGHTLY (run 20260714-011651 follow-up) — UPDATE-side date/
+      timestamp/timestamptz/numeric + int-range literal coercion fixed.**
+      Picked up the previous item's resume point. Factored `insertOp.Next`'s
+      coercion switch into a shared `coerceRowForConstraintChecks(cols, row,
+      include, ctx, pos)` helper (`operators_storage.go`) — INSERT calls it
+      with `include = !insertMissing[i]` (behavior-preserving refactor).
+      Wired the same helper into every UPDATE new-row construction site,
+      gated on `include = o.plan.Set[i] != nil` (only freshly-SET columns
+      get re-coerced): `updateViaIndex` (main + EPQ retry), `updateOp.Next`'s
+      SeqScan path (inherit-child + non-inherit branches of its Phase-1
+      collect loop, plus a *second* EPQ-retry rebind in its separate Phase-2
+      write loop that the resume point's line-number guess had missed), and
+      `updateWithFrom` (main + EPQ retry) — 7 UPDATE call sites total, not
+      the 3 originally estimated. New tests
+      (`update_fk_datestyle_coerce_test.go`):
+      `TestUpdateCoercesDateLiteralBeforeFKCheck` (indexed-PK UPDATE, so it
+      specifically exercises `updateViaIndex`; non-vacuous via `git stash`),
+      `TestUpdateCoercesNumericLiteralBeforeCheckConstraint` (same
+      non-vacuousness check), `TestUpdateCoercesInt4RangeOverflow`
+      (regression guard — this one already passed pre-fix since the heap
+      encoder independently range-checks fixed-width int4 at write time).
+      Design doc `docs/design/0097-0151-datestyle-partial-set-merge.md`
+      "Follow-up (2026-07-15): UPDATE-side literal coercion" section; README
+      index row updated. Deferral-ledger row flipped `resolved` + new row
+      recorded. Gates: `go build ./...`/`go vet ./...` clean (repo-wide);
+      `go test -count=1 ./internal/executor/...` PASS (full package, no
+      regressions); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh`
+      PASS (0 failed, all 3 workloads).
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 

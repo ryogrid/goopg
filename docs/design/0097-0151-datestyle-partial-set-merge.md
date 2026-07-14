@@ -532,3 +532,67 @@ violation and an invalid numeric literal on a `numeric` column both still
 raise the correct `23514`/`22P02` codes; an `int4[]` array column round-
 trips unaffected (confirms the pre-existing `col.Type.IsArray` guard still
 protects array columns from this widened coercion switch).
+
+## Follow-up (2026-07-15): UPDATE-side literal coercion (resume-point option (a))
+
+Picked up the previous section's resume point, choosing option (a): a shared
+`coerceRowForConstraintChecks(cols []catalog.Column, row Row, include func(i
+int) bool, ctx *Context, pos int) error` helper (`operators_storage.go`,
+placed just above `insertOp.Next`) now holds the exact coercion switch
+`insertOp.Next` used to inline (int2/int4/int8 range-check +
+date/timestamp/timestamptz/numeric literal typing), parameterized by an
+`include(i)` predicate so callers control *which* columns get re-coerced.
+`insertOp.Next` calls it with `include = !insertMissing[i]` (unchanged
+behavior — a byte-for-byte refactor, not a behavior change, verified by the
+existing INSERT tests still passing unmodified).
+
+Every UPDATE new-row construction site now calls the same helper immediately
+after its per-row SET-evaluation loop (before `computeGeneratedColumns`),
+with `include = o.plan.Set[i] != nil` — i.e. only columns this statement's
+own `SET` clause actually assigns get re-coerced; an untouched column's
+value came straight from storage and is already correctly typed, so
+re-running it through `evalCast` would be redundant work (and, for a
+domain/enum type without a well-defined self-cast, could even be *wrong*).
+Each of `updateViaIndex`, `updateOp.Next` (its SeqScan main loop — both the
+non-inheritance-child and the inheritance-child-remap branches — plus its
+*two* separate EPQ-retry rebinds, one in the Phase-1 collect loop and one in
+the Phase-2 write loop discovered while auditing this function; the resume
+point's own line-number guess only counted one), and `updateWithFrom` (main
+path + EPQ retry) picked up its own `setCol := func(i int) bool { ... }`
+closure defined once per operator invocation (not re-allocated per row) and
+now calls `coerceRowForConstraintChecks` right after building
+`newRow`/`parentNewRow`/`pu.newRow`, in whichever column-ordinal space that
+site's own row is in (`cols` for the inheritance-child branch's
+parent-space row, `captureCols`/`puCols` for the base-table/partition-child
+row, `tgtCols` for `updateWithFrom`) — matching the same ordinal space the
+`o.plan.Set` slice is already keyed against at that call site, so no new
+remapping logic was needed. This closes both halves of the deferral-ledger
+gap in one pass: the DateStyle-rendering gap (an UPDATE-triggered FK/CHECK
+violation on a DATE/TIMESTAMP/NUMERIC column now renders its DETAIL line the
+same way INSERT does) and the pre-existing, non-DateStyle int2/int4/int8
+range-check gap UPDATE never had at all.
+
+New tests (`update_fk_datestyle_coerce_test.go`):
+`TestUpdateCoercesDateLiteralBeforeFKCheck` (mirrors
+`TestInsertCoercesDateLiteralBeforeFKCheck`, but via an indexed-PK `UPDATE`
+so it exercises `updateViaIndex` specifically — confirmed non-vacuous via
+`git stash`, fails with the un-reformatted literal on the pre-fix tree),
+`TestUpdateCoercesNumericLiteralBeforeCheckConstraint` (same non-vacuousness
+check), and `TestUpdateCoercesInt4RangeOverflow` — the last one turned out
+to *already* pass on the pre-fix tree (the heap encoder independently
+range-checks a fixed-width `int4` column at write time, so the "silent
+overflow" the ledger worried about doesn't reproduce that way), kept anyway
+as a regression guard that both layers keep agreeing after this change.
+
+Gates: `go build ./...` clean; `go vet ./...` clean (repo-wide, not just
+`internal/executor`); `go test -count=1 ./internal/executor/...` PASS (full
+package, no regressions); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+`RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh` PASS (0
+failed transactions, all 3 pgbench workloads).
+
+Deferral-ledger row for this gap flipped to `resolved`; no new gap opened by
+this loop (both resume-point options from the prior row were considered —
+plan-time CAST-wrapping (b) was passed over in favor of the runtime
+coercion (a) specifically to keep byte-for-byte behavioral parity with the
+already-shipped, already-tested INSERT path rather than introduce a second,
+differently-shaped fix for the same underlying problem).
