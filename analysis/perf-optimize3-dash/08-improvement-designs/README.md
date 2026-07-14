@@ -1,8 +1,22 @@
 # perf-optimize3-dash / 08 — Improvement design bundle
 
 date: 2026-07-14 · designs against goopg `a640d2b0` (branch `wal-system-pgnize`)
-· status: **design only** (implementation not started) · PostgreSQL 18.3 oracle
-(`postgres/local_install`)
+· PostgreSQL 18.3 oracle (`postgres/local_install`)
+
+## Landing status (2026-07-14 incremental run)
+
+| doc | status | commit |
+|---|---|---|
+| 10 force-GC gate | **LANDED** (full) | `cf2b4770` |
+| 05 BEGIN snapshot reuse | **PARTIAL** (RC first-stmt reuse; rest deferred) | `df8dc421` |
+| 09, 07, 01, 02, 03, 04, 06, 08, 12 | **DEFERRED** — large multi-slice redesigns; land each in a focused session with its full gate set (see `.ralph/deferral_ledger.md`) | — |
+| 11 protocol corking | **N/A** — bufio already coalesces reply frames into one flush per message; the 3-syscall premise is false | — |
+
+The two landed measures were the safely-gateable wins in a single autonomous
+pass; the deferred measures' *value-bearing* slices carry correctness risk
+(transaction semantics, lock/WAL/buffer-pool concurrency, LP_DEAD marking) that
+warrants dedicated verification budgets, and their foundation slices are inert.
+Each doc below remains the authoritative implementation spec.
 
 Detailed, implementation-ready designs for every improvement measure ranked in
 the post-landing analyses [`../06-post-landing-analysis/`](../06-post-landing-analysis/)
