@@ -3817,6 +3817,44 @@ survey the deferral ledger for a fresh open (`status = -`) row.
       battery 0 `--- FAIL` (was 3 FAIL); `scripts/tpch-spotcheck.sh` PASS
       (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
       bash scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 workloads).
+- [x] **M-NIGHTLY (run 20260715-010036 triage) — `internal/wal` nightly
+      failure root-caused and fixed (resume point from the row above).**
+      `AI-...-005 units/internal/wal` was not a bare 33-minute timeout kill
+      like its 3 siblings — the nightly log recorded a real 5.4s test
+      **failure**, `TestStripeAppendConcurrentDrainConsistency: drain
+      goroutine never ran`. Reproduced it reliably (10/10) via synthetic host
+      CPU contention (`for i in $(seq 1 20); do yes >/dev/null & done` on a
+      16-core box) against the FULL `internal/wal` package suite — matches
+      `ci/batch/run-nightly.sh`'s Lane L running `units` concurrently with
+      `race`. Root cause: the test's busy-loop drain goroutine can genuinely
+      never get scheduled before `wg.Wait()`+`close(done)` under contention —
+      a test-structure flaw, not a `stripeAppend`/`publishVisibility` bug.
+      Fixed with a `ready` channel closed after the drain goroutine's first
+      iteration; producers now start only after it fires, guaranteeing at
+      least one scheduled run while the concurrent-drain exercise continues
+      unchanged afterward. While reproducing under the same load, ALSO found
+      a second, previously undocumented flake: `TestDrainSafetyStress`'s
+      `checkInvariant` read `writeLSNAtomic`/`drainedLSNAtomic`/
+      `flushedLSNAtomic` as three independent non-atomic `Load()`s in
+      write-first order, letting a concurrent drain advance `drainedLSNAtomic`
+      past an already-stale captured `write` value (`dr>wr` by ~565k bytes
+      under contention). Fixed by reordering to flush→drain→write, exploiting
+      that all three fields are monotonically non-decreasing in production
+      (CAS-max `storeMaxLSN`; `xlogWrite`'s `rq.write > writtenLSN` guard) so
+      reading `write` last always reflects what the earlier reads saw. Both
+      fixes are test-only (`internal/wal/stripe_append_test.go`,
+      `internal/wal/drain_safety_stress_test.go`); no production code changed.
+      Design doc
+      `docs/design/0107-0011-wal-drain-invariant-test-scheduling-artifact.md`
+      + README index. Deferral ledger: 1 resolved row (this fix) + narrowed
+      the still-open row (`cmd/goopg`/`internal/amcheck`/`internal/mvcc` only,
+      `internal/wal` removed). Gates: `go build ./...`/`go vet
+      ./internal/wal/` clean; both fixed tests 10/10 PASS under the identical
+      contention setup that reproduced the pre-fix failures; `go test -race
+      -count=1 ./internal/wal/...` clean; `go test ./internal/wal/...
+      ./internal/mvcc/...` clean (quiet host); `scripts/tpch-spotcheck.sh`
+      PASS (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke bash
+      scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 workloads).
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 
