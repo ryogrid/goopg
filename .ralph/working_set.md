@@ -1,44 +1,46 @@
 (idle — nothing in flight)
 
-Last completed: M-NIGHTLY DateStyle follow-up — UPDATE-side date/timestamp/
-timestamptz/numeric + int-range literal coercion. Factored insertOp.Next's
-coercion switch into a shared `coerceRowForConstraintChecks(cols, row,
-include, ctx, pos)` helper (`internal/executor/operators_storage.go`) and
-wired it into all 7 UPDATE new-row construction sites (updateViaIndex
-main+EPQ; updateOp.Next's SeqScan inherit/non-inherit branches + its
-Phase-1 EPQ rebind + a second, previously-undiscovered Phase-2-write-loop
-EPQ rebind; updateWithFrom main+EPQ), gated on `o.plan.Set[i] != nil` so
-only freshly-SET columns get re-coerced. New tests:
-TestUpdateCoercesDateLiteralBeforeFKCheck,
-TestUpdateCoercesNumericLiteralBeforeCheckConstraint,
-TestUpdateCoercesInt4RangeOverflow
-(internal/executor/update_fk_datestyle_coerce_test.go); non-vacuousness
-confirmed via git stash. Design doc
+Last completed (commit 95d19f61): M-NIGHTLY DateStyle follow-up — `||`
+(string concatenation) now honors the session `datestyle` GUC. Added a
+`ctx *Context` trailing param to `evalBinary` (internal/executor/expr.go),
+threaded through all call sites (evalExprSlot, evalInExpr's ANY/ALL loop,
+evalFastExpr pass a live ctx; evalBinaryBatch/windowOp.inRange pass nil —
+OpConcat unreachable from those; ~15 test callers pass nil). New reusable
+`formatDatumDateStyle(d, ctx)` helper (next to formatTimeDatumDateStyle/
+dateStyleFromCtx) dispatches KindTime through the DateStyle-aware path,
+falls back to d.Format() otherwise; wired into OpConcat's `ls`/`rs`
+computation. New tests internal/executor/concat_datestyle_test.go
+(TestConcatHonorsDateStyle, TestConcatNilCtxDefaultsISO); non-vacuousness
+confirmed via temporary revert-and-rerun (not git stash, since stashing
+just expr.go alone broke the build against the updated test-file call
+sites — reverted the two formatDatumDateStyle→Format() lines in place
+instead). Live psql verification (port 5541, cleaned up) across
+ISO/SQL/Postgres/German x MDY/DMY for both `'prefix' || date_col` and
+`timestamp_col || 'suffix'`. Design doc
 docs/design/0097-0151-datestyle-partial-set-merge.md "Follow-up
-(2026-07-15): UPDATE-side literal coercion" section + README index updated.
-Deferral ledger row flipped resolved + new row appended. fix_plan.md
-updated. Gates: go build/go vet (repo-wide) clean; go test -count=1
-./internal/executor/... PASS; scripts/tpch-spotcheck.sh PASS (Q12=2/Q13=33);
-RALPH_PRECOMMIT_SCOPE=smoke ralph-precommit-test.sh PASS (0 failed, all 3
-workloads). make ralph-state-guard: auto-repaired a stale
-running/completed mismatch, then OK.
+(2026-07-15): || (string concatenation) DateStyle-awareness" + README
+index updated. Deferral ledger row appended (open, resume point below).
+fix_plan.md M-NIGHTLY task appended. Gates: go build/go vet (repo-wide)
+clean; go test -count=1 ./internal/executor/... PASS; tpch-spotcheck.sh
+PASS (Q12=2/Q13=33); RALPH_PRECOMMIT_SCOPE=smoke ralph-precommit-test.sh
+— first invocation hit the known transient 1-failed-txn TPC-B flake
+(0.010%, unrelated to this change per ledger row 777's precedent), retry
+PASS (0 failed, all 3 workloads) confirmed the flake before committing.
+make ralph-state-guard: auto-repaired a stale running/completed mismatch
+(same pattern as last loop), then OK.
 
-This closes both halves of the M-NIGHTLY DateStyle-literal-coercion gap
-(INSERT done in the prior loop, UPDATE done this loop).
+Next DateStyle-adjacent slice (open per the ledger tail, not started):
+`operators_join_agg.go`'s `array_to_string`/array-literal-building
+FuncCall arms (~lines 1846, 1849, 1867, 1939, 1943, 1949, 3347, 3368)
+call `.Format()`/`arg.Format()` per array element — audit `ctx`
+reachability the same way this loop did for `evalBinary`, then swap in
+`formatDatumDateStyle(elem, ctx)`. After that: `to_char`'s generic
+fallback, plpgsql RAISE/string-building (plpgsql_runtime.go), EXPLAIN,
+operators_analyze.go bound-rendering — then TIMESTAMPTZ's missing
+session-timezone-aware conversion/offset, then pgoutput.go's DateStyle
+gap (all still fully open, unchanged from prior rows).
 
-Next natural DateStyle slice (still open per the ledger tail, not started):
-the `Datum.Format()`/`AppendValueText()` ~20-call-site audit (to_char
-fallback, plpgsql RAISE, EXPLAIN, error messages, operators_analyze.go
-bound-rendering, array_to_string/||), TIMESTAMPTZ timezone-aware
-conversion, and pgoutput.go's DateStyle gap.
-
-In-flight: none. Not yet committed — pending git commit with pathspec
-(internal/executor/operators_storage.go,
-internal/executor/update_fk_datestyle_coerce_test.go,
-.ralph/deferral_ledger.md, .ralph/fix_plan.md,
-docs/design/0097-0151-datestyle-partial-set-merge.md, docs/design/README.md,
-.ralph/progress.json, .ralph/working_set.md) — several unrelated stray
-files (analysis/perf-optimize3/runs/*, weekly_loc.csv/png, ci/logs/*.log,
-analysis/tpch-explain-baseline.md, untracked postgres/ content) are present
-in the tree from other processes and were deliberately excluded from this
-commit.
+In-flight: none. All work committed (95d19f61); tree clean of my changes.
+Stray untracked/modified files present from other processes (weekly_loc.*,
+analysis/perf-optimize3/runs/*, ci/logs/*.log, analysis/tpch-explain-
+baseline.md, untracked postgres/) were left untouched, same as prior loop.
