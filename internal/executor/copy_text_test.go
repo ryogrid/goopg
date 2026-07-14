@@ -104,6 +104,40 @@ func TestEncodeCopyTextRowDate(t *testing.T) {
 	}
 }
 
+
+// TestEncodeCopyTextRowTimestamp covers the sibling gap to
+// TestEncodeCopyTextRowDate: datumToCopyText's "timestamp"/"timestamptz"
+// case was hardcoded to ISO regardless of the caller's DateStyle (style,
+// order) pair, so `SET datestyle` had zero effect on COPY output for
+// timestamp columns even though it already worked for DATE. Matches
+// PostgreSQL's EncodeDateTime with print_tz=false (goopg has no
+// session-timezone conversion/offset for timestamptz yet).
+func TestEncodeCopyTextRowTimestamp(t *testing.T) {
+	cols := []catalog.Column{{Name: "ts", Type: catalog.Type{Name: "timestamp"}}}
+	when := time.Date(2026, time.July, 14, 9, 5, 3, 0, time.UTC)
+	row := Row{NewTimeDatum(when)}
+
+	cases := []struct {
+		style, order, want string
+	}{
+		{"ISO", "MDY", "2026-07-14 09:05:03.000000\n"},
+		{"SQL", "MDY", "07/14/2026 09:05:03.000000\n"},
+		{"SQL", "DMY", "14/07/2026 09:05:03.000000\n"},
+		{"Postgres", "MDY", "Tue Jul 14 09:05:03.000000 2026\n"},
+		{"Postgres", "DMY", "Tue 14 Jul 09:05:03.000000 2026\n"},
+		{"German", "DMY", "14.07.2026 09:05:03.000000\n"},
+	}
+	for _, tc := range cases {
+		got, err := EncodeCopyTextRow(nil, row, cols, tc.style, tc.order)
+		if err != nil {
+			t.Fatalf("style=%s order=%s: %v", tc.style, tc.order, err)
+		}
+		if string(got) != tc.want {
+			t.Errorf("style=%s order=%s: got %q, want %q", tc.style, tc.order, got, tc.want)
+		}
+	}
+}
+
 // TestDecodeCopyTextRowPgbenchShape is the round-trip companion to
 // the encode test — exactly what pgbench's COPY data looks like.
 func TestDecodeCopyTextRowPgbenchShape(t *testing.T) {

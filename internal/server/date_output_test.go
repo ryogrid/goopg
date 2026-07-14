@@ -49,6 +49,48 @@ func TestAppendTypedCellTextDateHonorsDateStyle(t *testing.T) {
 	}
 }
 
+
+// TestAppendTypedCellTextTimestampHonorsDateStyle is the sibling of
+// TestAppendTypedCellTextDateHonorsDateStyle: appendTypedCellText had no
+// "timestamp"/"timestamptz" case at all (fell through to the default,
+// hardcoded-ISO AppendValueText), so `SET datestyle` had zero effect on
+// SELECT results for timestamp columns. No session-timezone conversion or
+// offset for timestamptz yet — a separate deferred gap, unchanged by this
+// fix (matches the type's pre-existing behavior).
+func TestAppendTypedCellTextTimestampHonorsDateStyle(t *testing.T) {
+	srv := New(Config{
+		Logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Catalog: catalog.NewInMemory(),
+	})
+	when := time.Date(2026, time.July, 14, 9, 5, 3, 0, time.UTC)
+	d := executor.NewTimeDatum(when)
+
+	for _, typeName := range []string{"timestamp", "timestamptz"} {
+		tsType := catalog.Type{Name: typeName}
+		tests := []struct {
+			name       string
+			getSetting func(name string) (string, bool)
+			want       string
+		}{
+			{"nil session falls back to ISO/MDY", nil, "2026-07-14 09:05:03.000000"},
+			{"ISO, MDY", constSetting("ISO, MDY"), "2026-07-14 09:05:03.000000"},
+			{"SQL, MDY", constSetting("SQL, MDY"), "07/14/2026 09:05:03.000000"},
+			{"SQL, DMY", constSetting("SQL, DMY"), "14/07/2026 09:05:03.000000"},
+			{"Postgres, MDY", constSetting("Postgres, MDY"), "Tue Jul 14 09:05:03.000000 2026"},
+			{"Postgres, DMY", constSetting("Postgres, DMY"), "Tue 14 Jul 09:05:03.000000 2026"},
+			{"German, DMY", constSetting("German, DMY"), "14.07.2026 09:05:03.000000"},
+		}
+		for _, tt := range tests {
+			t.Run(typeName+"/"+tt.name, func(t *testing.T) {
+				got := string(srv.appendTypedCellText(nil, d, tsType, tt.getSetting))
+				if got != tt.want {
+					t.Errorf("appendTypedCellText(%s, %s) = %q, want %q", typeName, tt.name, got, tt.want)
+				}
+			})
+		}
+	}
+}
+
 func constSetting(v string) func(name string) (string, bool) {
 	return func(name string) (string, bool) {
 		if name == "datestyle" {

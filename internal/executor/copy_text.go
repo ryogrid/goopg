@@ -269,10 +269,15 @@ func datumToCopyText(t catalog.Type, d Datum, dateStyle, dateOrder string) (stri
 		}
 		return config.FormatDate(d.TimeValue(), dateStyle, dateOrder), nil
 	case "timestamp", "timestamptz":
+		// DateStyle-aware, mirroring the "date" case above and dispatch.go's
+		// appendTypedCellText. No session-timezone-aware conversion/offset for
+		// timestamptz yet (separate deferred gap, matches this column's
+		// pre-existing behavior). M-NIGHTLY (run 20260714-011651) DateStyle
+		// output-rendering follow-up.
 		if d.Kind != KindTime {
 			return "", fmt.Errorf("expected time datum, got kind %d", d.Kind)
 		}
-		return d.TimeValue().UTC().Format("2006-01-02 15:04:05.000000"), nil
+		return config.FormatTimestamp(d.TimeValue().UTC(), dateStyle, dateOrder), nil
 	default:
 		switch d.Kind {
 		case KindString:

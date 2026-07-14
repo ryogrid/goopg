@@ -137,3 +137,34 @@ func FormatDate(t time.Time, style, order string) string {
 		return t.Format("2006-01-02")
 	}
 }
+
+
+// FormatTimestamp renders a TIMESTAMP/TIMESTAMPTZ value's text according to
+// the given DateStyle (style, order) pair, matching PostgreSQL's
+// EncodeDateTime (postgres/src/backend/utils/adt/datetime.c) with
+// print_tz=false — goopg has no session-timezone-aware conversion or offset
+// rendering for TIMESTAMPTZ yet (a separate, larger deferred gap; see the
+// deferral ledger), so both types render their stored instant identically to
+// plain TIMESTAMP, same as before this DateStyle fix. Fractional seconds are
+// always shown to 6 digits (not PG's trim-trailing-zeros behavior), matching
+// the existing AppendValueText ISO formatting this replaces for these two
+// type names, to avoid introducing a second, independent divergence in the
+// same loop.
+func FormatTimestamp(t time.Time, style, order string) string {
+	switch style {
+	case "SQL":
+		if order == "DMY" {
+			return t.Format("02/01/2006 15:04:05.000000")
+		}
+		return t.Format("01/02/2006 15:04:05.000000")
+	case "Postgres":
+		if order == "DMY" {
+			return t.Format("Mon 02 Jan 15:04:05.000000 2006")
+		}
+		return t.Format("Mon Jan 02 15:04:05.000000 2006")
+	case "German":
+		return t.Format("02.01.2006 15:04:05.000000")
+	default:
+		return t.Format("2006-01-02 15:04:05.000000")
+	}
+}

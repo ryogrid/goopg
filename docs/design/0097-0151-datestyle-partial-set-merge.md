@@ -181,3 +181,74 @@ second, independent bug where its `"date"` case reuses the full
 - `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33).
 - `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh` PASS (0
   failed, all 3 pgbench workloads).
+
+## Follow-up (2026-07-15): TIMESTAMP/TIMESTAMPTZ DateStyle output
+
+Picked up the "DATE-only" resume point from the follow-up above: TIMESTAMP
+and TIMESTAMPTZ output rendering was still entirely ISO-hardcoded (`SET
+datestyle` had no effect on either), the same class of bug the DATE fix
+closed. Added `config.FormatTimestamp(t, style, order)`
+(`internal/config/datestyle.go`) mirroring PostgreSQL's `EncodeDateTime`
+(`postgres/src/backend/utils/adt/datetime.c`) with `print_tz=false`: ISO →
+`YYYY-MM-DD HH:MM:SS.ffffff`; SQL → `MM/DD/YYYY HH:MM:SS.ffffff` (or DD/MM
+for DMY); Postgres → `Dow Mon DD HH:MM:SS.ffffff YYYY` (or `Dow DD Mon ...`
+for DMY, using the 3-letter day/month abbreviations `EncodeDateTime` derives
+from its `days[]`/`months[]` tables); German → `DD.MM.YYYY HH:MM:SS.ffffff`.
+
+Wired into the same two call sites the DATE fix touched:
+`internal/server/dispatch.go`'s `appendTypedCellText` gained a
+`"timestamp", "timestamptz"` case (previously absent — both fell through to
+the default, hardcoded-ISO `AppendValueText` branch); and
+`internal/executor/copy_text.go`'s `datumToCopyText` `"timestamp",
+"timestamptz"` case (which already existed but ignored its `dateStyle,
+dateOrder` parameters entirely) now calls `config.FormatTimestamp`.
+
+**Deliberately scoped out this loop**, matching the type's pre-existing
+behavior so nothing regresses:
+
+- **No session-timezone-aware conversion or offset for TIMESTAMPTZ.** Real
+  PostgreSQL converts a stored UTC instant to the session's `TimeZone` GUC
+  and appends an offset (e.g. `+00`) for TIMESTAMPTZ specifically (`print_tz
+  =true` in `EncodeDateTime`). goopg has no such conversion anywhere today —
+  TIMESTAMPTZ has always rendered identically to TIMESTAMP (raw stored UTC
+  instant, no offset). This fix keeps that invariant; the timezone-plumbing
+  gap is separate, larger, and unrelated to DateStyle.
+- **Fractional seconds are always 6 digits, not PG's trim-trailing-zeros
+  behavior** (`AppendSeconds` in `datetime.c` strips trailing zero fraction
+  digits). This matches the exact fixed-`.000000` shape the code being
+  replaced already produced, so the DateStyle fix doesn't also introduce an
+  unrelated formatting change in the same loop.
+- `Datum.Format()`/`AppendValueText()`'s ~20-call-site DateStyle-unawareness
+  (CAST/to_char/plpgsql/EXPLAIN/error-message paths) and `pgoutput.go`'s gap
+  remain open, as recorded in the prior follow-up — TIMESTAMP joins DATE as
+  a second type now diverging between the fixed SELECT/COPY paths and these
+  still-ISO-only paths.
+
+### Verification (2026-07-15 follow-up)
+
+- New `internal/executor/copy_text_test.go` `TestEncodeCopyTextRowTimestamp`:
+  4 styles × 2 orders through `EncodeCopyTextRow`.
+- New `internal/server/date_output_test.go`
+  `TestAppendTypedCellTextTimestampHonorsDateStyle`: same matrix through
+  `appendTypedCellText`, for both `timestamp` and `timestamptz` type names,
+  plus the nil-`getSetting` fallback case.
+- Live end-to-end against a real `cmd/goopg` binary via `psql` (isolated data
+  dir/port, cleaned up after): `SELECT t, tz FROM tsdt` for a
+  `2026-07-14 09:05:03` value under `ISO` →
+  `2026-07-14 09:05:03.000000`; `SQL, MDY` → `07/14/2026 09:05:03.000000`;
+  `SQL, DMY` → `14/07/2026 09:05:03.000000`; `Postgres, MDY` →
+  `Tue Jul 14 09:05:03.000000 2026`; `Postgres, DMY` →
+  `Tue 14 Jul 09:05:03.000000 2026`; `German` →
+  `14.07.2026 09:05:03.000000` — identical for both columns (confirming
+  TIMESTAMPTZ's no-offset behavior is unchanged). `COPY tsdt TO STDOUT`
+  (text and CSV) under `ISO`/`Postgres, MDY` emit the same styled text.
+- `go build ./...` clean; `go vet` clean (`internal/config`,
+  `internal/executor`, `internal/server`); `go test
+  ./internal/config/... ./internal/executor/... ./internal/server/...` PASS
+  (full packages, no regressions).
+- `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33).
+- `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh`: first
+  run showed 1 transient failed TPC-B transaction (0.009%, unrelated schema
+  — TPC-B has no date/timestamp columns); two immediate re-runs both PASS (0
+  failed, all 3 workloads), confirming the flake was unrelated to this
+  change.

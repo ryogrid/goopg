@@ -2953,6 +2953,24 @@ func (s *Server) appendTypedCellText(dst []byte, d executor.Datum, typ catalog.T
 			return append(dst, config.FormatDate(d.TimeValue(), style, order)...)
 		}
 		return d.AppendValueText(dst)
+	case "timestamp", "timestamptz":
+		// Timestamp columns render per the session's DateStyle GUC (style x
+		// order), matching PostgreSQL's EncodeDateTime with print_tz=false.
+		// Previously hardcoded ISO regardless of `SET datestyle`. No
+		// session-timezone-aware conversion/offset for timestamptz yet
+		// (separate deferred gap — matches this column's pre-existing
+		// behavior, unchanged by this fix). M-NIGHTLY (run 20260714-011651)
+		// DateStyle output-rendering follow-up.
+		if d.Kind == executor.KindTime {
+			style, order := "ISO", "MDY"
+			if getSetting != nil {
+				if v, ok := getSetting("datestyle"); ok {
+					style, order = config.ParseDateStyleValue(v)
+				}
+			}
+			return append(dst, config.FormatTimestamp(d.TimeValue(), style, order)...)
+		}
+		return d.AppendValueText(dst)
 	case "time":
 		// Time columns display as HH:MM:SS[.ffffff] with column precision. M0097-0004.
 		if d.Kind == executor.KindTime {
