@@ -948,7 +948,15 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 			clientAddr = taddr.IP.String()
 			clientPort = fmt.Sprintf("%d", taddr.Port)
 		}
-		reg.Register(&activity.Backend{
+		// RegisterAt (not Register): procNum here is the SAME TxnMgr conn-slot
+		// value used below for WaitEventStart/UpdateState/PIDForProcNum on this
+		// connection's hot path. Register's own PID-hash slot is an independent
+		// index space — using it here would make every later per-statement
+		// UpdateState call land on the wrong slot, freezing pg_stat_activity's
+		// state/query columns at their initial Register-time values for the
+		// backend's entire lifetime (found via the partition-drop-index-locking
+		// isolation spec: s.query always blank, s.state always "active").
+		reg.RegisterAt(procNum, &activity.Backend{
 			PID:             pidStr,
 			DatName:         params["database"],
 			UserName:        user,

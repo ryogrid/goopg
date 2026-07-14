@@ -3779,6 +3779,44 @@ survey the deferral ledger for a fresh open (`status = -`) row.
       `go build ./...`/`go vet ./...` clean (repo-wide); `go test -count=1
       ./internal/executor/...` PASS (full package, no regressions);
       `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33).
+- [x] **M-NIGHTLY triage — run 20260715-010036 (sha 751b82178025, 11 AI items).**
+      Triaged all 11: `AI-...-001..005` (units-suite timeouts:
+      `cmd/goopg`/`internal/amcheck`/`internal/initdb`/`internal/mvcc`/
+      `internal/wal`), `AI-...-006..008` (isolation-spec regressions:
+      `TestPort_IsolationDetachPartitionConcurrently4`,
+      `TestPort_IsolationInsertConflictSpecconflict`,
+      `TestPort_IsolationPartitionDropIndexLocking`), `AI-...-009..011`
+      (`regress/errors`/`portals_p2`/`select`, all baseline `pass`, all fixed
+      by name in yesterday's follow-up loops). **Fixed AI-006/007/008**: all
+      three isolation regressions shared ONE root cause —
+      `ActivityRegistry.Register(b)`'s PID-hash slot
+      (`procNumForPID(b.PID)`) silently diverged from `connTx.ProcNum`
+      (`TxnMgr.AcquireConnSlot()`, an unrelated MVCC proc-array slot), the
+      identifier every dynamic call (`UpdateState`/`WaitEventStart`/
+      `PIDForProcNum`) is keyed off — so `pg_stat_activity.state`/`query`
+      froze at their `Register()`-time defaults for a connection's whole
+      lifetime, a wiring gap around 0118-0073's still-correct idle-retention
+      fix. New `ActivityRegistry.RegisterAt(procNum, b)` (mirrors
+      `RegisterBackground`); `Register(b)` delegates to it; the one
+      production call site (`internal/server/server.go`) now calls
+      `RegisterAt(procNum, …)` reusing its already-computed
+      `TxnMgr.AcquireConnSlot()` value. Verified live via a manually started
+      server + raw `psql` (query/state now update correctly mid-statement and
+      on idle). **Investigated AI-001..005/009..011, found non-reproducing**
+      (deferral ledger row, open): `internal/initdb` reran clean in ~4 min
+      (nightly log showed a 33-min timeout kill with a near-empty goroutine
+      dump — starvation signature, not a hang); `errors`/`portals_p2`/
+      `select` all PASS individually. `cmd/goopg`/`amcheck`/`mvcc`/`wal` not
+      re-run to their full 33+ min timeout this loop (time-boxed) — resume
+      point in the ledger row. Design doc
+      `docs/design/0118-0141-activity-procnum-identity-space-conflation.md` +
+      README index. Deferral ledger: 1 resolved row (the fix) + 1 open row
+      (the unconfirmed units/wal timeouts). Gates: `go build ./...` clean;
+      `go test` PASS across `internal/activity`/`internal/server`/
+      `internal/executor`/`internal/initdb`; full `TestPort_Isolation*`
+      battery 0 `--- FAIL` (was 3 FAIL); `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+      bash scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 workloads).
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 

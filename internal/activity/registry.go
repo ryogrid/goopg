@@ -230,8 +230,26 @@ func (r *ActivityRegistry) ReleaseBackground(idx int, pid string) {
 
 // Register adds a backend entry.  procNum is derived from the numeric PID.
 // Replaces the old Registry.Register(*Backend) method.
+//
+// Callers that already hold a stable per-connection procNum (e.g. the
+// server's TxnMgr.AcquireConnSlot() slot, which is also used for
+// WaitEventStart/UpdateState/PIDForProcNum on the hot path) MUST use
+// RegisterAt with that same procNum instead — Register's PID-hash slot is a
+// second, independent index space, and every dynamic UpdateState /
+// WaitEventStart call keyed off the connection's real procNum would silently
+// land on the wrong slot (or an unregistered one) otherwise, freezing
+// pg_stat_activity.state/query at their Register-time defaults. Kept for
+// callers with no independent procNum of their own (most existing tests).
 func (r *ActivityRegistry) Register(b *Backend) {
-	procNum := r.procNumForPID(b.PID)
+	r.RegisterAt(r.procNumForPID(b.PID), b)
+}
+
+// RegisterAt adds a backend entry at an explicit procNum, chosen by the
+// caller (e.g. the server's TxnMgr.AcquireConnSlot() connection-lifetime
+// slot). Every later UpdateState/WaitEventStart/WaitEventEnd/PIDForProcNum
+// call for this connection must use that SAME procNum — see Register's doc
+// comment for why the two index spaces must not diverge.
+func (r *ActivityRegistry) RegisterAt(procNum int32, b *Backend) {
 	cold := coldFromBackend(b)
 	r.acquire(procNum, cold)
 	r.pidMu.Lock()
