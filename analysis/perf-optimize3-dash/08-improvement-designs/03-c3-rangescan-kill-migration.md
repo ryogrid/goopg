@@ -1,9 +1,19 @@
 # 08-03 — C3 residual: migrate the UPDATE-probe RangeScan to LP_DEAD kill collection
 
-status: design (verified) · date: 2026-07-14 · base: `635cc590` · gates: G-race
-(`./internal/access/btree/`, `./internal/executor/`), G-crash, G-waldump,
-G-tpch, G-perf → [README](README.md)
+status: **PARTIAL** (S1 landed `bdaa325a`; S2 deferred) · date: 2026-07-14 ·
+base: `635cc590` · gates: G-race (`./internal/access/btree/`,
+`./internal/executor/`), G-crash, G-waldump, G-tpch, G-perf → [README](README.md)
 
+> **Landed 2026-07-14 (S1, `bdaa325a`):** `updateViaIndex` now collects LP_DEAD
+> kills for the dead-pointing index entries its probe skips (both `!found`
+> branches), flushed via `tree.KillItems` after the scan drains — the residual
+> pkey-doubling driver. New `TestUpdateProbeCollectsLPDeadKill` (verified to fail
+> without the flush). Gates: G-race (btree 23 s, executor), full executor suite,
+> G-tpch (Q12=2/Q13=33), G-crash (initdb, wal, `TestKillKillRecovery`) — all
+> green. **S2 deferred** (the constraint/conflict probes act on live tuples only,
+> §9 O-C3M-1; `indexOnlyScanOp` is a clean read-path follow-on) — see
+> `.ralph/deferral_ledger.md`. S3 perf-acceptance soak: see §8.
+>
 > **Verification note (2026-07-14):** this doc was rewritten after a three-pass
 > code map (btree kill mechanism · every RangeScan caller · the UPDATE probe)
 > corrected the original framing. The kill target is **not** the tuple the
@@ -146,7 +156,7 @@ Concretely:
 
 | # | slice | content | gates |
 |---|---|---|---|
-| S1 | UPDATE-probe kills | `RangeScan`→`RangeScanWithPos` in `updateViaIndex`; collect a kill in each `!found` branch via `heapChainDeadToAll` under `OldestXmin`; flush `tree.KillItems` after the scan. Add a targeted probe-kill test. | G-race, G-crash, G-tpch |
+| S1 | UPDATE-probe kills — **LANDED `bdaa325a`** | `RangeScan`→`RangeScanWithPos` in `updateViaIndex`; collect a kill in each `!found` branch via `heapChainDeadToAll` under `OldestXmin`; flush `tree.KillItems` after the scan. `TestUpdateProbeCollectsLPDeadKill`. | G-race, G-crash, G-tpch ✓ |
 | S2 | *deferred* — other callers | The 9 non-index-scan RangeScan callers are constraint/conflict probes (upsert arbiter, unique/exclusion checks, deferred rechecks) that act on **live** tuples only (§10); `indexOnlyScanOp` is a clean read-path follow-on but not part of the measured residual. Deferred with a ledger line. | — |
 | S3 | perf acceptance | 600 s soak at scale 100 + a scale-500 `-N`: pkey growth per txn should approach 0; the scale-500 miss rate should improve. | G-perf |
 

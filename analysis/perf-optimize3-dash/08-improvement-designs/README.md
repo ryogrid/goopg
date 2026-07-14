@@ -9,7 +9,8 @@ date: 2026-07-14 · designs against goopg `a640d2b0` (branch `wal-system-pgnize`
 |---|---|---|
 | 10 force-GC gate | **LANDED** (full) | `cf2b4770` |
 | 05 BEGIN snapshot reuse | **PARTIAL** (RC first-stmt reuse; rest deferred) | `df8dc421` |
-| 09, 07, 01, 02, 03, 04, 06, 08, 12 | **DEFERRED** — large multi-slice redesigns; land each in a focused session with its full gate set (see `.ralph/deferral_ledger.md`) | — |
+| 03 C3 RangeScan kill migration | **PARTIAL** (S1 UPDATE-probe kills landed; S2 deferred) | `bdaa325a` |
+| 09, 07, 01, 02, 04, 06, 08, 12 | **DEFERRED** — large multi-slice redesigns; land each in a focused session with its full gate set (see `.ralph/deferral_ledger.md`) | — |
 | 11 protocol corking | **N/A** — bufio already coalesces reply frames into one flush per message; the 3-syscall premise is false | — |
 
 The two landed measures were the safely-gateable wins in a single autonomous
