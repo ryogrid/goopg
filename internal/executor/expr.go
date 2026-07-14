@@ -3447,7 +3447,7 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 			}
 			if t, err := parseCopyTimestamp(s); err == nil {
 				t2 := t.UTC()
-				return NewTimeDatum(time.Date(t2.Year(), t2.Month(), t2.Day(), 0, 0, 0, 0, time.UTC)), nil
+				return NewDateDatum(time.Date(t2.Year(), t2.Month(), t2.Day(), 0, 0, 0, 0, time.UTC)), nil
 			}
 			return Datum{}, &ExecError{Code: "22007", Pos: pos,
 				Message: fmt.Sprintf("invalid input syntax for type date: %q", s)}
@@ -3459,7 +3459,7 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 				return NewDateInfinity(d.IsTimestampPosInf()), nil
 			}
 			t := d.TimeValue().UTC()
-			return NewTimeDatum(time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)), nil
+			return NewDateDatum(time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)), nil
 		}
 		return d, nil
 	case "time":

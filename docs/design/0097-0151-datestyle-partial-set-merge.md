@@ -450,3 +450,85 @@ Gates: `go build ./...` clean; `go vet ./...` clean; `go test -count=1
 ./internal/executor/...` PASS (full package, no regressions);
 `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
 bash scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 workloads).
+
+## Follow-up (2026-07-15): INSERT-side literal coercion (`insertOp.Next`)
+
+Picked up the previous section's resume point directly: extended
+`operators_storage.go`'s `insertOp.Next` "Integer range enforcement" switch
+(renamed in-place to "Type coercion", ~line 1903) to also coerce `date`,
+`timestamp`, `timestamptz`, and `numeric`/`decimal` columns via
+`evalCast(row[i], typeName, pos, ctx)` — the exact pattern already used for
+`int2`/`int4`/`int8`. This runs before BEFORE-INSERT triggers, NOT NULL, and
+CHECK/domain/FK constraint checks, so all of them now see a properly typed
+value instead of the raw VALUES-clause literal text for these 4 additional
+type families. Because this coercion loop is shared with the `INSERT ...
+ON CONFLICT` upsert candidate-row path (`autoGenerateSerialValues`'s
+neighboring comment already documents this sharing — root-0020), the same
+fix also covers upsert's INSERT-branch candidate row for free; no separate
+`upsertOp` change was needed for that half.
+
+**Sibling bug found and fixed by the same live-verification pass
+([[pattern_sibling_paths_must_agree]]):** live `psql` testing showed the new
+INSERT-side FK DETAIL line correctly picked up German DateStyle ordering
+(`15.07.2026`) but with a spurious `00:00:00` time-of-day suffix — i.e. it
+was rendering as a TIMESTAMP, not a DATE. Root cause: `evalCast`'s `"date"`
+case (`expr.go` ~3440-3463) built its result via `NewTimeDatum(...)`
+instead of `NewDateDatum(...)` in both branches (string-source and
+`KindTime`-source), leaving `flagDate` unset. `datum.go`'s `NewDateDatum`
+doc comment is explicit that this flag must be set "at every date-producing
+site" so type-agnostic renderers (`Datum.Format()`, and now
+`fkValsForDetail`'s `formatTimeDatumDateStyle`) can distinguish a DATE from
+a TIMESTAMP sharing the same `KindTime` carrier — `codec.go`'s
+`DecodeValuePG` `"date"` case already follows this convention on the
+storage-decode side. Ordinary `SELECT '...'::date` output was unaffected
+by this bug because the SELECT-output dispatch path derives DATE-vs-
+TIMESTAMP formatting from the column/expression's declared type, not from
+the Datum's own flag — `fkValsForDetail` is one of the few call sites that
+*only* has the bare `[]Datum` slice (no column-type context) and must rely
+on the flag, which is exactly why the bug was invisible until this loop's
+`evalCast`-driven INSERT-path fix started feeding it fresh, evalCast-
+produced Datums. Fixed by switching both branches to `NewDateDatum`.
+
+New tests: `TestEvalCastToDateSetsFlagDate` (`cast_datestyle_test.go`,
+string- and `KindTime`-source), `TestInsertCoercesDateLiteralBeforeFKCheck`
+and `TestInsertCoercesNumericLiteralBeforeCheckConstraint`
+(`insert_fk_datestyle_coerce_test.go`, full parse→plan→exec integration via
+the `newVMFixture`/`runDDL` harness, asserting both the German-DateStyle
+DETAIL rendering and the absence of the spurious time suffix).
+
+**Still open (deferred, not fixed this loop):** `UPDATE ... SET`'s new-row
+construction has the same un-coerced-literal gap as INSERT did, and it is
+*not* shared with this fix — `updateOp` builds `newRow[i]` straight from
+`evalExpr(o.plan.Set[i], row, o.ctx)` (see `updateViaIndex`'s per-row
+callback ~operators_storage.go:3833, the seq-scan path in `updateOp.Next`
+~4448/4579, and `updateWithFrom` ~4808/6062-ish) with no column-type-aware
+coercion step at all, for *any* type (not just date/timestamp/numeric — the
+integer range-check gap from the original DateStyle bullet is present in
+UPDATE too, pre-existing and wider than DateStyle). Confirmed live: `SET
+datestyle='German'; UPDATE parent SET d = d WHERE ...` was not probed this
+loop, but by the same code-reading logic a `CHECK`/FK-violating `UPDATE ...
+SET d = '<literal>'` would hit the identical un-coerced-Datum problem
+`assertParentExists` had, since `recheckChildFKs`/the CHECK-constraint call
+in `updateViaIndex` (~operators_storage.go:3904) run directly against
+`pu.newRow`. Resume point: audit whether to (a) factor the INSERT coercion
+switch into a shared `coerceRowForConstraintChecks(cols, row, ctx, pos)`
+helper and call it from both `insertOp.Next` and every `updateOp` new-row
+construction site listed above, or (b) special-case just the SET-expression
+evaluation to wrap bare literal SET targets in an implicit CAST at plan
+time (`applyUpdateAssign`, `planner.go` ~8352-8361) — the latter would also
+fix the pre-existing (non-DateStyle) integer range-check gap in one shot.
+Deferral-ledger row appended below.
+
+Gates: `go build ./...` clean; `go vet ./internal/executor/...` clean; `go
+test -count=1 ./internal/executor/...` PASS (full package, no regressions);
+`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33, re-run after the flagDate
+fix); `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh`
+PASS (0 failed, all 3 workloads, re-run after the flagDate fix). Live
+`psql` verification: DATE and TIMESTAMP INSERT-side FK violations under
+`SET datestyle='German'` both render correctly
+(`Key (d)=(15.07.2026) is not present...`,
+`Key (t)=(15.07.2026 11:00:00) is not present...`); a CHECK-constraint
+violation and an invalid numeric literal on a `numeric` column both still
+raise the correct `23514`/`22P02` codes; an `int4[]` array column round-
+trips unaffected (confirms the pre-existing `col.Type.IsArray` guard still
+protects array columns from this widened coercion switch).

@@ -1900,9 +1900,16 @@ func (o *insertOp) Next() (TupleSlot, error) {
 		// Shared with the upsert (INSERT ... ON CONFLICT) sibling path (root-0020).
 		autoGenerateSerialValues(o.ctx, o.plan.Table.Name, cols, row, insertMissing)
 
-		// Integer range enforcement: coerce explicitly-provided int values to
-		// the column's declared type (catches smallint/int4 out-of-range and
-		// bigint overflow from over-wide numeric literals).
+		// Type coercion: coerce explicitly-provided literal values to the
+		// column's declared type before FK/CHECK/domain/NOT-NULL constraint
+		// checks run below. Catches smallint/int4 out-of-range and bigint
+		// overflow from over-wide numeric literals (integer cases), and — as
+		// important — turns a still-KindString DATE/TIMESTAMP/TIMESTAMPTZ/
+		// NUMERIC literal into its typed Datum so downstream constraint-
+		// violation DETAIL messages render it the same way SELECT/COPY/CAST
+		// output does (fkValsForDetail's DateStyle fix otherwise still saw
+		// the raw un-coerced literal on the INSERT path; M-NIGHTLY
+		// 2026-07-15 follow-up).
 		for i, col := range cols {
 			if insertMissing[i] || row[i].IsNull() {
 				continue
@@ -1924,6 +1931,14 @@ func (o *insertOp) Next() (TupleSlot, error) {
 				coerced, cerr = evalCast(row[i], "int4", o.plan.Pos(), o.ctx)
 			case "int8", "bigint", "bigserial", "serial8":
 				coerced, cerr = evalCast(row[i], "int8", o.plan.Pos(), o.ctx)
+			case "date":
+				coerced, cerr = evalCast(row[i], "date", o.plan.Pos(), o.ctx)
+			case "timestamp":
+				coerced, cerr = evalCast(row[i], "timestamp", o.plan.Pos(), o.ctx)
+			case "timestamptz":
+				coerced, cerr = evalCast(row[i], "timestamptz", o.plan.Pos(), o.ctx)
+			case "numeric", "decimal":
+				coerced, cerr = evalCast(row[i], "numeric", o.plan.Pos(), o.ctx)
 			default:
 				continue
 			}

@@ -3579,6 +3579,52 @@ survey the deferral ledger for a fresh open (`status = -`) row.
       no regressions); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
       `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh`
       PASS (0 failed, all 3 workloads).
+- [x] **M-NIGHTLY (run 20260714-011651 follow-up) — INSERT-side date/
+      timestamp/timestamptz/numeric literal coercion fixed.** Picked up the
+      previous item's resume point directly. Extended `operators_storage.go`'s
+      `insertOp.Next` coercion switch (~line 1903, previously `int2`/`int4`/
+      `int8` only) to also cover `date`/`timestamp`/`timestamptz`/`numeric`/
+      `decimal` via the same `evalCast(row[i], typeName, pos, ctx)` pattern —
+      FK/CHECK/domain/NOT-NULL constraint checks during INSERT now see a
+      properly typed value instead of the raw VALUES-clause literal. Shared
+      for free with the `INSERT ... ON CONFLICT` upsert candidate-row path
+      (same coercion block, root-0020). **Sibling bug found and fixed by the
+      same live-verification pass** (`pattern_sibling_paths_must_agree`):
+      `evalCast`'s `"date"` case (`expr.go`) built its result via
+      `NewTimeDatum` instead of `NewDateDatum` in both branches, leaving
+      `flagDate` unset — this made the newly-coerced FK DETAIL rendering show
+      a spurious `00:00:00` time suffix (rendered as a timestamp, not a date)
+      until fixed; switched both branches to `NewDateDatum` per its own doc
+      comment ("Use this at every date-producing site"). New tests:
+      `TestEvalCastToDateSetsFlagDate` (`cast_datestyle_test.go`),
+      `TestInsertCoercesDateLiteralBeforeFKCheck` +
+      `TestInsertCoercesNumericLiteralBeforeCheckConstraint`
+      (`insert_fk_datestyle_coerce_test.go`, full parse→plan→exec integration
+      via `newVMFixture`/`runDDL`). Live `psql` verification (isolated data
+      dir, port 5540): DATE and TIMESTAMP INSERT-side FK violations under
+      `SET datestyle='German'` both render correctly and date-only (no time
+      suffix); CHECK-constraint violation (`23514`) and invalid numeric
+      literal (`22P02`) on a `numeric` column still raise correctly; `int4[]`
+      array column unaffected (`col.Type.IsArray` guard still applies).
+      **New gap discovered by the same audit (deferred, NOT fixed this
+      loop):** `UPDATE ... SET`'s new-row construction has the identical
+      un-coerced-literal problem across 3 separate call sites
+      (`updateViaIndex`, `updateOp.Next`'s seq-scan path, `updateWithFrom`),
+      and it's wider than DateStyle — UPDATE never had the original
+      int2/int4/int8 range-check coercion either. Deferral-ledger row
+      appended (2026-07-15) with resume point: factor the INSERT coercion
+      switch into a shared helper called from all 3 UPDATE sites, or wrap
+      bare-literal SET RHS in an implicit CAST at plan time
+      (`planner.go`'s `applyUpdateAssign`, ~8352-8361). Design doc follow-up:
+      `docs/design/0097-0151-datestyle-partial-set-merge.md` "Follow-up
+      (2026-07-15): INSERT-side literal coercion (`insertOp.Next`)" section;
+      README index row updated. Gates: `go build ./...`/`go vet
+      ./internal/executor/...` clean; `go test -count=1
+      ./internal/executor/...` PASS (full package, no regressions);
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33, re-run after the
+      flagDate fix); `RALPH_PRECOMMIT_SCOPE=smoke bash
+      scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 workloads,
+      re-run after the flagDate fix).
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 

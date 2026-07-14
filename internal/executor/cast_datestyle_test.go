@@ -63,3 +63,35 @@ func TestEvalCastTimeToTextNilCtxDefaultsISO(t *testing.T) {
 		t.Errorf("evalCast(text) with nil ctx = %q, want %q", got.StringValue(), want)
 	}
 }
+
+// TestEvalCastToDateSetsFlagDate pins a sibling bug uncovered while wiring
+// insertOp's literal coercion (2026-07-15): evalCast's "date" case built its
+// result via NewTimeDatum, which leaves flagDate unset, instead of
+// NewDateDatum ("Use this at every date-producing site", datum.go). Every
+// other date-producing site (storage decode, date literals) sets flagDate so
+// type-agnostic renderers (Datum.Format(), fkValsForDetail's
+// formatTimeDatumDateStyle) can tell a DATE apart from a TIMESTAMP sharing
+// the same KindTime carrier. Without the flag, a freshly-cast date datum
+// rendered with a spurious "00:00:00" time-of-day suffix wherever a
+// downstream consumer branches on d.Flags&flagDate instead of separately
+// tracked column-type context.
+func TestEvalCastToDateSetsFlagDate(t *testing.T) {
+	// String source (e.g. an INSERT literal coerced via evalCast(..., "date", ...)).
+	got, err := evalCast(NewStringDatum("2026-07-15"), "date", 0, nil)
+	if err != nil {
+		t.Fatalf("evalCast(date) from string: unexpected error: %v", err)
+	}
+	if got.Flags&flagDate == 0 {
+		t.Errorf("evalCast(date) from string did not set flagDate; Format()=%q", got.Format())
+	}
+
+	// KindTime (timestamp) source, e.g. `some_timestamp_col::date`.
+	when := time.Date(2026, 7, 15, 14, 30, 0, 0, time.UTC)
+	got2, err := evalCast(NewTimeDatum(when), "date", 0, nil)
+	if err != nil {
+		t.Fatalf("evalCast(date) from timestamp: unexpected error: %v", err)
+	}
+	if got2.Flags&flagDate == 0 {
+		t.Errorf("evalCast(date) from timestamp did not set flagDate; Format()=%q", got2.Format())
+	}
+}
