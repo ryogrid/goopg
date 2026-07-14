@@ -752,3 +752,80 @@ failed transactions, all 3 pgbench workloads).
 TIMESTAMPTZ's missing session-timezone-aware conversion/offset and
 `pgoutput.go`'s DateStyle-plumbing gap remain open too, unchanged from the
 prior rows.
+
+## Follow-up (2026-07-15): ANALYZE's MCV/histogram-bound rendering (`operators_analyze.go`)
+
+Picked up the `operators_analyze.go` bound-rendering resume point from the
+row above (the other named candidate, `to_char`'s generic fallback, was
+audited first and found to be a non-issue: `evalToChar`'s `KindTime` branch
+always renders through an explicit user-supplied format string
+(`pgToCharToGoFormat(fmtStr)` → `time.Format`), never through `Datum.Format()`
+— `to_char(date/timestamp, fmt)` output is determined entirely by the format
+string's own tokens, not by the session `DateStyle` GUC, so there is no gap
+there and no code change was needed).
+
+`computeColumnStats` (the per-column NDistinct/NullFrac/MCV/Histogram
+computation ANALYZE runs over its reservoir sample) called `Datum.Format()`
+directly at its two DATE/TIMESTAMP-affecting sites: the MCV entry's
+`Value` string and each histogram-boundary string — both hardcoded to
+ISO/Postgres-MDY regardless of the session's `datestyle` GUC in effect when
+`ANALYZE` ran, diverging from `pg_stats.most_common_vals` /
+`pg_stats.histogram_bounds`'s real-PG behavior of honoring the *querying*
+session's DateStyle.
+
+**Important caveat (recorded in the deferral ledger, not fully closed):**
+real PostgreSQL stores `pg_statistic`'s `stavaluesN`/`stanumbersN` in
+*binary* (`anyarray`) form and only renders them to text at `pg_stats`
+SELECT time, using the *querying* session's DateStyle — which can differ
+from the DateStyle in effect when `ANALYZE` ran. goopg's `catalog.ColumnStats`
+stores `MCV[].Value`/`Histogram` as pre-rendered `string`s computed once at
+ANALYZE time, so this fix only makes the rendering honor DateStyle *at
+ANALYZE time* — a session that runs `ANALYZE` under `ISO` and then queries
+`pg_stats` under `German, DMY` will still see ISO-formatted bounds. Fixing
+that fully requires storing typed values (or re-deriving type info at
+`pg_stats`-scan time) instead of baked-in strings — out of scope for this
+slice; see the ledger row for the resume point.
+
+### Fix
+
+- `analyzeRelationWith` (and `computeColumnStats`) gained a new `dsCtx
+  *Context` parameter, threaded from `analyzeRelationCtx`'s live `ctx`
+  (the real `ANALYZE` execution path) or `nil` from the test-only
+  `analyzeRelation` wrapper (no session reachable — same nil-ctx-defaults-ISO
+  convention as every prior follow-up in this doc).
+- `computeColumnStats`'s two `.Format()` call sites — the MCV entry's
+  `buckets[i].val.Format()` and the histogram boundary's
+  `expanded[idx].Format()` — swapped for `formatDatumDateStyle(d, dsCtx)`.
+
+### Verification (2026-07-15 ANALYZE follow-up)
+
+New tests `internal/executor/analyze_datestyle_test.go`:
+`TestAnalyzeMCVHistogramHonorDateStyle` (full parse→plan→exec `ANALYZE` via
+`newVMFixture`/`runDDL`, `SET`-equivalent `ctx.GetSetting` override to
+`German, DMY`; seeds 5 duplicate + 5 distinct DATE values so
+`computeColumnStats`'s `mcvFreqMargin=1.25` admission rule yields exactly 1
+MCV entry and a 5-value histogram; asserts `tbl.Stats.Columns[1].MCV[0].Value`
+and `.Histogram` all render `dd.mm.yyyy`); `TestAnalyzeMCVHistogramNilCtxDefaultsISO`
+(direct `analyzeRelation` call, no session Context → ISO default unchanged).
+Confirmed non-vacuous: stashing just `operators_analyze.go`'s changes makes
+the test file (now calling the 8-arg `analyzeRelationWith`) fail to compile,
+proving the tests are bound to the new code path, not a coincidental pass.
+
+Live `psql` verification (ephemeral `cmd/goopg` binary, port 5541, cleaned
+up): `CREATE TABLE`, seed 5+5 DATE rows, `SET datestyle = 'German, DMY'`,
+`ANALYZE`, then `SELECT most_common_vals, histogram_bounds FROM pg_stats
+WHERE tablename=... AND attname='d'` returned
+`{05.01.2026}` / `{01.02.2026,02.02.2026,03.02.2026,04.02.2026,05.02.2026}`.
+
+Gates: `go build ./...`/`go vet ./...` clean (repo-wide); `go test -count=1
+./internal/executor/...` PASS (full package, no regressions);
+`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+`RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh` PASS (0
+failed transactions, all 3 pgbench workloads).
+
+**Still open** (deferral-ledger row appended): the binary-storage/
+query-time-rendering gap noted above; plpgsql `RAISE`/string-building in
+`plpgsql_runtime.go`; EXPLAIN; other error-message formatting sites;
+TIMESTAMPTZ's missing session-timezone-aware conversion/offset;
+`pgoutput.go`'s DateStyle-plumbing gap — all remain open, unchanged from the
+prior rows' scope notes.

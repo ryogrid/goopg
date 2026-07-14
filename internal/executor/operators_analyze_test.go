@@ -116,7 +116,7 @@ func seedRowsAndAnalyze(t *testing.T, n int, makeRow func(i int) []planner.Expr,
 	if target <= 0 {
 		target = upstreamDefaultStatsTarget
 	}
-	stats, err := analyzeRelationWith(ctx.Pool, ctx.TxnMgr, ctx.Catalog, tbl, target, rand.New(rand.NewSource(42)), ctx.MultiXact)
+	stats, err := analyzeRelationWith(ctx.Pool, ctx.TxnMgr, ctx.Catalog, tbl, target, rand.New(rand.NewSource(42)), ctx.MultiXact, ctx)
 	if err != nil {
 		t.Fatalf("analyzeRelationWith: %v", err)
 	}
@@ -275,7 +275,7 @@ func TestAnalyzeRespectsPerColumnStatTarget(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	stats, err := analyzeRelationWith(ctx.Pool, ctx.TxnMgr, ctx.Catalog, tbl, upstreamDefaultStatsTarget, rand.New(rand.NewSource(42)), ctx.MultiXact)
+	stats, err := analyzeRelationWith(ctx.Pool, ctx.TxnMgr, ctx.Catalog, tbl, upstreamDefaultStatsTarget, rand.New(rand.NewSource(42)), ctx.MultiXact, ctx)
 	if err != nil {
 		t.Fatalf("analyzeRelationWith: %v", err)
 	}
@@ -329,7 +329,7 @@ func TestAnalyzeSetStatisticsZeroDisablesColumn(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	stats, err := analyzeRelationWith(ctx.Pool, ctx.TxnMgr, ctx.Catalog, tbl, upstreamDefaultStatsTarget, rand.New(rand.NewSource(42)), ctx.MultiXact)
+	stats, err := analyzeRelationWith(ctx.Pool, ctx.TxnMgr, ctx.Catalog, tbl, upstreamDefaultStatsTarget, rand.New(rand.NewSource(42)), ctx.MultiXact, ctx)
 	if err != nil {
 		t.Fatalf("analyzeRelationWith: %v", err)
 	}
@@ -419,7 +419,7 @@ func TestAnalyzeRespectsNDistinctOption(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	stats, err := analyzeRelationWith(ctx.Pool, ctx.TxnMgr, ctx.Catalog, tbl, upstreamDefaultStatsTarget, rand.New(rand.NewSource(42)), ctx.MultiXact)
+	stats, err := analyzeRelationWith(ctx.Pool, ctx.TxnMgr, ctx.Catalog, tbl, upstreamDefaultStatsTarget, rand.New(rand.NewSource(42)), ctx.MultiXact, ctx)
 	if err != nil {
 		t.Fatalf("analyzeRelationWith: %v", err)
 	}

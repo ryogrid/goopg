@@ -3715,6 +3715,38 @@ survey the deferral ledger for a fresh open (`status = -`) row.
       `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
       `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh`
       PASS (0 failed, all 3 workloads).
+  - [x] **M-NIGHTLY (run 20260714-011651 follow-up) — ANALYZE's MCV/
+      histogram-bound DateStyle-awareness fixed; `to_char` generic fallback
+      audited (non-issue).** Resume point from the `array_agg` fix above.
+      Audited `to_char` first: `evalToChar`'s `KindTime` branch always
+      renders via an explicit user-supplied format string
+      (`pgToCharToGoFormat` → `time.Format`), never `Datum.Format()`, so
+      DateStyle never applies there — confirmed non-issue, no code change.
+      Then fixed `operators_analyze.go`'s `computeColumnStats`: its 2
+      DATE/TIMESTAMP-affecting `.Format()` sites (MCV entry `Value`,
+      histogram-boundary strings) were hardcoded ISO/Postgres-MDY.
+      Threaded a new `dsCtx *Context` param through
+      `analyzeRelationWith`/`computeColumnStats` (live `ctx` from
+      `analyzeRelationCtx`'s real ANALYZE path; `nil` from the test-only
+      `analyzeRelation` wrapper) and swapped both sites for
+      `formatDatumDateStyle(d, dsCtx)`. New tests
+      `internal/executor/analyze_datestyle_test.go`
+      (`TestAnalyzeMCVHistogramHonorDateStyle`,
+      `TestAnalyzeMCVHistogramNilCtxDefaultsISO`); non-vacuousness confirmed
+      via `git stash` on `operators_analyze.go` alone (test file's 8-arg
+      call no longer compiles). Live `psql` verification (port 5541,
+      cleaned up): German DMY `ANALYZE` → `pg_stats.most_common_vals`/
+      `histogram_bounds` render `dd.mm.yyyy`. Design doc
+      `docs/design/0097-0151-datestyle-partial-set-merge.md` "Follow-up
+      (2026-07-15): ANALYZE's MCV/histogram-bound rendering" + README
+      index updated. Deferral ledger row appended (open — goopg bakes the
+      rendering in at ANALYZE time rather than storing binary values and
+      re-rendering at `pg_stats`-SELECT time like real PG; resume: plpgsql
+      RAISE/EXPLAIN next). Gates: `go build ./...`/`go vet ./...` clean
+      (repo-wide); `go test -count=1 ./internal/executor/...` PASS (full
+      package, no regressions); `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke bash
+      scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 workloads).
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 
