@@ -273,6 +273,15 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		if s.cfg.LockMgr != nil {
 			s.cfg.LockMgr.ReleaseAll(backendID)
 		}
+		// Drop any tuple-level (row) locks this statement took on the
+		// always-on tableLockMgr under the per-statement backend id. In the
+		// production server (LockMgr==nil) FOR UPDATE / FOR SHARE route their
+		// tuple locks here so concurrent waiters on the same row acquire in
+		// FIFO arrival order; releasing at statement end hands the "wait until
+		// the holder's txn ends" duty back to the persisted xmax (design
+		// 0021-0012). Disjoint from LOCK TABLE, which holds under the
+		// transaction-scoped TxnLockBackendID.
+		executor.ReleaseTupleLocks(backendID)
 	}()
 	snap, err := s.cfg.TxnMgr.SnapshotFor(tx)
 	if err != nil {

@@ -1,6 +1,6 @@
 # 0021-0012 — Tuple-lock FIFO wiring (row-lock waiter fairness)
 
-Status: **draft** (diagnosis + design; implementation deferred)
+Status: **landed** (loop #91, 2026-07-14 — see "Implementation" below)
 
 Milestone: M-NIGHTLY (AI-20260712-020530-002) → tuple-level locking (0021 family)
 
@@ -140,11 +140,89 @@ intentionally kept dormant — touches the whole isolation surface:
 3. `scripts/tpch-spotcheck.sh` (Q12=2/Q13=35) + the pgbench CI-parity smoke —
    no hot-path regression.
 
+## Implementation (loop #91, 2026-07-14)
+
+The landed implementation refines the "Proposed fix" above in two ways the
+original sketch didn't anticipate, both discovered while porting
+`heap_lock_tuple`/`heap_update` more faithfully:
+
+1. **Lazy acquire, not up-front acquire.** The proposed fix's `acquireTupleLock`
+   swap alone would make *every* row-lock/DML request touch the tag, including
+   non-conflicting ones — that reintroduces a deadlock in exactly the case
+   `TestForShareCompatibleMultipleHolders` / `tuplelock-upgrade-no-deadlock`'s
+   perm 9 exercises (an upgrade queueing behind a waiter parked on our own held
+   lock). Upstream only calls `heap_acquire_tuplock` right before it sleeps
+   (`XactLockTableWait`/`MultiXactIdWait`), so the port does the same: the tag
+   is taken lazily at the three "about to sleep" sites in `stampLockInner`
+   (lock-only-conflict, multixact-wait, xid-wait) and once in the DML
+   write-path's `waitForConflictingRowLock` — never in `lockRowsOp.stampLock`'s
+   up-front dispatch, never in `updateOp.updateViaIndex`'s pre-read, never in
+   `scanMatching`'s per-row dispatch loop (all three had their old up-front
+   acquires removed).
+2. **Four-mode `tupleLockHwMode`, not coarse RowShare/Exclusive.** Ported
+   upstream's `tupleLockExtraInfo[].hwlock` column verbatim
+   (`AccessShareLock`/`RowShareLock`/`ExclusiveLock`/`AccessExclusiveLock` for
+   KeyShare/Share/NoKeyUpdate/Update respectively) instead of collapsing FOR
+   KEY SHARE and FOR SHARE to the same `RowShareLock` — the coarse mapping
+   would make a FOR KEY SHARE wrongly queue behind an unrelated no-key UPDATE
+   holder (`AccessShareLock` doesn't conflict with `ExclusiveLock`; the
+   collapsed `RowShareLock` would). This directly addresses the "Key-share
+   compatibility" blast-radius risk called out below.
+
+`selfIsLockMember` (read path, `lockRowsOp`) / `selfRowLockMember` (write path)
+port upstream's `current_is_member` — skip the tag when this backend (or any
+of its subxacts) already holds a membership on the tuple, matching
+`heap_update`/`heap_lock_tuple`'s `if (!current_is_member)` guard.
+
+Touched: `internal/executor/context.go` (`acquireTupleLock` routes to
+`tableLockMgr` under `c.BackendID` when `c.LockMgr == nil`; `tryAcquireTupleLock`
+folded into the same `tupleLockManager()` selector), `operators_lockrows.go`
+(`stampLock` no longer acquires up-front; `acquireTupleLockForWait` added at
+the three sleep sites; `tupleLockHwMode`, `selfIsLockMember`), `operators_storage.go`
+(`updateViaIndex`/`scanMatching` up-front acquires removed; `waitForConflictingRowLock`
+acquires lazily; `selfRowLockMember` added; `foreignLockOnly`/`lockedByForeign`
+deleted as dead code), `internal/lockmgr/lockmgr.go` (`UseConfiguredTimeout`
+exported sentinel), `internal/server/dispatch.go` (`executor.ReleaseTupleLocks`
+wired into the Query-message defer, alongside the existing
+`s.cfg.LockMgr.ReleaseAll`).
+
+Two sibling unit tests asserted the old "always acquire up-front" semantics via
+`lm.Waiters(...)` polling and would hang under the new lazy-acquire model
+(the second locker becomes the tag's immediate HOLDER, never a waiter, since
+the first locker never touched the tag) — fixed to poll `lm.Holders(...)[id]`
+instead: `TestUpdateViaIndexScanBlocksOnForeignTupleLock`,
+`TestForShareCompatibleMultipleHolders` (the latter also lost its invalid
+"2 holders after 2 compatible FOR SHAREs" assertion — neither takes the tag
+when uncontended).
+
+## Validation results (loop #91)
+
+1. `TestPort_IsolationTuplelockUpgradeNoDeadlock` looped 20× standalone via
+   `runIsoSpecStrict` — **zero flakes** (was ~10-17%). Re-promoted from
+   `runIsoSpec`.
+2. Full isolation suite (`go test -run TestPort_Isolation ./internal/testport/`,
+   121 specs) — clean except three failures confirmed **pre-existing and
+   unrelated** (identical failure on HEAD without this change, verified via
+   `git stash`): `insert-conflict-specconflict` (pg_stat_activity join
+   formatting), `detach-partition-concurrently-4` (statement-cancellation
+   gap), `partition-drop-index-locking` (pg_locks `query` column not
+   populated).
+3. `go test -race` on the touched packages + `make race-gate` (44 packages) —
+   clean except one pre-existing flaky timing test in the untouched
+   `internal/wal` package (passes standalone/under `-count=3`; only flakes
+   under `race-gate`'s full-suite CPU contention).
+4. `scripts/tpch-spotcheck.sh` — Q12=2/Q13=33 PASS.
+5. `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` (pgbench
+   CI-parity smoke: standard/-N/-S) — 0 failed transactions across all three
+   workloads, no hot-path regression.
+
+`docs/test-port/postgres-oracle-target-inventory.csv` row 612 flipped
+`defer`→`pass`; regenerated the `.md` (isolation pass 119→120, defer 1→0).
+
 ## Resume point
 
-`internal/executor/context.go`: `acquireTupleLock` (line ~783) &
-`tryAcquireTupleLock` (line ~810) — swap `c.LockMgr` → `tableLockMgr` under
-`c.BackendID`; add a per-statement `tableLockMgr.ReleaseAll(c.BackendID)` hook
-(dispatch.go Query-message end, alongside the existing txn-end
-`s.cfg.LockMgr.ReleaseAll`). Keep `acquireRelLock` on `c.LockMgr`. See the
-deferral-ledger row dated 2026-07-12.
+Landed. If future isolation-suite runs surface new flakiness in this area,
+start from `internal/executor/operators_lockrows.go`'s `acquireTupleLockForWait`
+call sites and `internal/executor/operators_storage.go`'s
+`waitForConflictingRowLock` — those are the only places the tag is now
+acquired. See the deferral-ledger rows dated 2026-07-12 and 2026-07-14.

@@ -861,46 +861,22 @@ func (o *lockRowsOp) stampLock(rel storage.RelFileNode, ptr storage.ItemPointer)
 	if err := o.ctx.MaterializeWriterXID(); err != nil {
 		return storage.ItemPointer{}, false, false, err
 	}
-	// Acquire the tuple-level lock first so a concurrent UPDATE
-	// that races with us can't slip through between the xmax
-	// stamp and the lock registration. The wait policy decides how
-	// contention is handled: NOWAIT fails fast with 55P03, mirroring
-	// heapam.c's "could not obtain lock on row in relation \"%s\""
-	// (relation-qualified, ERRCODE_LOCK_NOT_AVAILABLE); the default
-	// blocks until the conflicting holder releases. The lockmgr tuple
-	// tag is the cross-session gate — a concurrent FOR UPDATE holder
-	// makes TryAcquire return ErrLockNotAvailable. M0118-0003.
-	switch o.waitPolicy {
-	case planner.LockWaitNoWait:
-		if err := o.ctx.tryAcquireTupleLock(rel, ptr, o.tupleLockMode()); err != nil {
-			if ee, ok := err.(*ExecError); ok && ee.Code == "55P03" {
-				return storage.ItemPointer{}, false, false, &ExecError{
-					Code:    "55P03",
-					Pos:     o.plan.Pos(),
-					Message: fmt.Sprintf(`could not obtain lock on row in relation "%s"`, o.lockRelName),
-				}
-			}
-			return storage.ItemPointer{}, false, false, err
-		}
-	case planner.LockWaitSkipLocked:
-		// SKIP LOCKED: try the tuple lock once. If a concurrent session holds
-		// it (it is mid-statement on this row), skip the row silently rather
-		// than blocking — mirrors heap_lock_tuple returning HeapTupleWouldBlock
-		// under LockWaitSkip. Cross-statement conflicts are detected later from
-		// the persisted lock-only xmax in stampLockInner (goopg's lockmgr tuple
-		// lock is statement-scoped, so a committed-but-active holder's lock has
-		// already been released here but its heap xmax persists). M0118-0003.
-		if err := o.ctx.tryAcquireTupleLock(rel, ptr, o.tupleLockMode()); err != nil {
-			if ee, ok := err.(*ExecError); ok && ee.Code == "55P03" {
-				return storage.ItemPointer{}, false, true, nil // epqSkipped: drop contended row
-			}
-			return storage.ItemPointer{}, false, false, err
-		}
-	default:
-		if err := o.ctx.acquireTupleLock(rel, ptr, o.tupleLockMode()); err != nil {
-			return storage.ItemPointer{}, false, false, err
-		}
-	}
+	// NO up-front tuple-tag acquire here. heap_lock_tuple takes the
+	// heavyweight LOCKTAG_TUPLE only when it is about to SLEEP on a
+	// conflicting holder (heap_acquire_tuplock right before
+	// XactLockTableWait / MultiXactIdWait) — a request that does not
+	// conflict with the tuple's current xmax must NEVER touch the tuple
+	// tag, or it queues behind an unrelated waiter that is parked holding
+	// it (tuplelock-upgrade-no-deadlock: s3's FOR KEY SHARE must complete
+	// at once while s2's FOR UPDATE waits on s1 holding the tag).
+	// stampLockInner therefore acquires the tag at its wait sites, via
+	// acquireTupleLockForWait. NOWAIT / SKIP LOCKED never sleep, so they
+	// never take the tag either — their fail-fast/skip arms fire off the
+	// persisted-xmax conflict alone, which is the same observable outcome
+	// as upstream's ConditionalLockTupleTagged/ConditionalXactLockTableWait
+	// pair. Check-then-stamp atomicity needs no tag: it is guaranteed by
+	// the page latch held across stampLockInner's conflict check and
+	// stamp. Design 0021-0012.
 	return o.stampLockInner(rel, ptr, 0)
 }
 
@@ -1059,6 +1035,14 @@ func (o *lockRowsOp) stampLockInner(rel storage.RelFileNode, ptr storage.ItemPoi
 					Message: fmt.Sprintf(`could not obtain lock on row in relation "%s"`, o.lockRelName),
 				}
 			}
+			// About to sleep on conflicting members: take the tuple tag first
+			// so concurrent waiters wake in arrival order (heap_acquire_tuplock
+			// before MultiXactIdWait). Skipped when we are already a member of
+			// the multi — an upgrader queueing behind a waiter that is itself
+			// waiting on our held lock would deadlock (design 0021-0012).
+			if err := o.acquireTupleLockForWait(rel, ptr, tup.Header); err != nil {
+				return storage.ItemPointer{}, false, false, err
+			}
 			qctx := o.ctx.Ctx
 			if qctx == nil {
 				qctx = context.Background()
@@ -1096,6 +1080,13 @@ func (o *lockRowsOp) stampLockInner(rel storage.RelFileNode, ptr storage.ItemPoi
 					Pos:     o.plan.Pos(),
 					Message: fmt.Sprintf(`could not obtain lock on row in relation "%s"`, o.lockRelName),
 				}
+			}
+			// About to sleep on the in-progress updater: take the tuple tag
+			// first (heap_acquire_tuplock before XactLockTableWait) so waiters
+			// wake in arrival order; skipped when we already hold a lock
+			// membership on this tuple (design 0021-0012).
+			if err := o.acquireTupleLockForWait(rel, ptr, tup.Header); err != nil {
+				return storage.ItemPointer{}, false, false, err
 			}
 			qctx := o.ctx.Ctx
 			if qctx == nil {
@@ -1151,10 +1142,9 @@ func (o *lockRowsOp) stampLockInner(rel storage.RelFileNode, ptr storage.ItemPoi
 			// Chain-tail sentinel — deleted row, no live successor.
 			return storage.ItemPointer{}, false, true, nil // epqSkipped
 		}
-		// Acquire lockmgr lock on the successor before reading it.
-		if err := o.ctx.acquireTupleLock(rel, next, o.tupleLockMode()); err != nil {
-			return storage.ItemPointer{}, false, false, err
-		}
+		// No tuple-tag acquire on the successor here: the recursive
+		// stampLockInner takes the tag itself iff it must wait on a
+		// conflicting holder of the successor version (design 0021-0012).
 		succ, _, succEPQSkipped, err := o.stampLockInner(rel, next, depth+1)
 		if err != nil {
 			return storage.ItemPointer{}, false, false, err
@@ -1232,6 +1222,18 @@ func (o *lockRowsOp) stampLockInner(rel storage.RelFileNode, ptr storage.ItemPoi
 				// sub-lock holder returns as soon as ROLLBACK TO SAVEPOINT marks
 				// that subxid aborted (xidActiveWithSubxact + the MarkSubxactAborted
 				// broadcast), so the retry sees the reverted (weaker) membership.
+				//
+				// About to sleep: take the tuple tag first so concurrent waiters
+				// on this row wake in ARRIVAL order — a single WaitForXID
+				// broadcast wakes every waiter at once, and without the tag the
+				// re-stamp race is decided by Go scheduling (the historical
+				// TuplelockUpgradeNoDeadlock flake). Skipped when we are already
+				// a lock member (upgrade): queueing behind a waiter that is
+				// itself waiting on our held lock would deadlock, exactly
+				// heap_lock_tuple's skip_tuple_lock case (design 0021-0012).
+				if err := o.acquireTupleLockForWait(rel, ptr, tup.Header); err != nil {
+					return storage.ItemPointer{}, false, false, err
+				}
 				qctx := o.ctx.Ctx
 				if qctx == nil {
 					qctx = context.Background()
@@ -1462,19 +1464,78 @@ func (o *lockRowsOp) refetchRow(rel storage.RelFileNode, ptr storage.ItemPointer
 }
 
 // tupleLockMode picks the lockmgr Mode used for the tuple-tag
-// acquire based on the SELECT FOR clause's strength (M0021 step
-// 4). FOR SHARE → RowShareLock so multiple shared holders
-// coexist on the same tuple tag; FOR UPDATE → ExclusiveLock so
-// a single writer blocks every other holder. Mirrors upstream's
-// `tuple_lock_extended` mode mapping at the lockmgr level
-// without needing MultiXact infrastructure for v0 — the
-// lockmgr's existing conflict matrix already supplies the
-// multi-holder semantics.
+// acquire based on the SELECT FOR clause's four-way strength — the
+// hwlock column of upstream's tupleLockExtraInfo (see tupleLockHwMode).
 func (o *lockRowsOp) tupleLockMode() lockmgr.Mode {
-	if o.lockStrength == storage.HeapXmaxShrLock || o.lockStrength == storage.HeapXmaxKeyShrLock {
+	return tupleLockHwMode(o.lockMemberStatus())
+}
+
+// tupleLockHwMode is the verbatim port of upstream's
+// tupleLockExtraInfo[].hwlock column (heapam.c): the heavyweight lockmgr
+// mode a row-lock/DML request of the given multixact status acquires on
+// the LOCKTAG_TUPLE while it sleeps on a conflicting holder. The exact
+// column matters: AccessShareLock does NOT conflict with ExclusiveLock,
+// so a FOR KEY SHARE never queues on the tuple tag behind a plain
+// (no-key) UPDATE / FOR NO KEY UPDATE holder — collapsing the two shared
+// strengths to RowShareLock made exactly that pairing block and time out
+// (tuplelock-upgrade-no-deadlock, design 0021-0012).
+func tupleLockHwMode(req multixact.Status) lockmgr.Mode {
+	switch req {
+	case multixact.StatusForKeyShare:
+		return lockmgr.AccessShareLock
+	case multixact.StatusForShare:
 		return lockmgr.RowShareLock
+	case multixact.StatusForNoKeyUpdate, multixact.StatusNoKeyUpdate:
+		return lockmgr.ExclusiveLock
+	default: // StatusForUpdate, StatusUpdate (DELETE / key-changing UPDATE)
+		return lockmgr.AccessExclusiveLock
 	}
-	return lockmgr.ExclusiveLock
+}
+
+// selfIsLockMember reports whether this backend (top-level xact or any of
+// its subxacts) already holds a row-lock or updater membership on the
+// tuple — upstream's `current_is_member` out-param of
+// DoesMultiXactIdConflict, plus the single-xmax self case. A waiter that
+// is already a member must NOT take the heavyweight tuple tag before
+// sleeping (heap_lock_tuple's skip_tuple_lock; heap_update/heap_delete's
+// `if (!current_is_member) heap_acquire_tuplock(...)`): a pure waiter
+// parked on the tag is waiting for OUR held lock to be released, so
+// queueing behind it would deadlock — the exact scenario
+// tuplelock-upgrade-no-deadlock exists to pin. Design 0021-0012.
+func (o *lockRowsOp) selfIsLockMember(hdr storage.HeapTupleHeader) bool {
+	if hdr.Xmax == storage.InvalidTransactionID {
+		return false
+	}
+	if storage.IsHeapTupleXmaxMulti(hdr.Infomask) {
+		if o.ctx.MultiXact == nil {
+			return false
+		}
+		members, ok := o.ctx.MultiXact.Members(multixact.MultiXactId(hdr.Xmax))
+		if !ok {
+			return false
+		}
+		for _, m := range members {
+			if o.isSelfXID(m.Xid) {
+				return true
+			}
+		}
+		return false
+	}
+	return o.isSelfXID(hdr.Xmax)
+}
+
+// acquireTupleLockForWait takes the heavyweight tuple tag right before
+// this op sleeps on a conflicting holder — upstream's heap_acquire_tuplock
+// placement — so concurrent waiters on the same row are granted in FIFO
+// arrival order when the holder ends. No-op when this backend is already
+// a lock member on the tuple (upgrade; see selfIsLockMember). The tag is
+// held until statement end (dispatch.go's executor.ReleaseTupleLocks),
+// long enough for the winner to re-stamp before the next waiter re-probes.
+func (o *lockRowsOp) acquireTupleLockForWait(rel storage.RelFileNode, ptr storage.ItemPointer, hdr storage.HeapTupleHeader) error {
+	if o.selfIsLockMember(hdr) {
+		return nil
+	}
+	return o.ctx.acquireTupleLock(rel, ptr, o.tupleLockMode())
 }
 
 // tupleLockConflicts reports whether a newly requested row-lock strength

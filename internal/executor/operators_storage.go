@@ -3792,25 +3792,12 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 		if !found {
 			return true, nil
 		}
-		// Check for foreign tuple lock (M0021 step 2b) on the live version.
-		if foreignLockOnly(tuple.Header, o.ctx.Tx.XID) {
-			livePtr := storage.ItemPointer{Block: ptr.Block, Offset: actualSlot}
-			if err := o.ctx.acquireTupleLock(rel, livePtr, lockmgr.ExclusiveLock); err != nil {
-				return false, err
-			}
-			// Re-read after lock released — follow chain again.
-			slot2, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: heapRel, Block: ptr.Block})
-			if err != nil {
-				return false, err
-			}
-			slot2.RLock()
-			tuple, actualSlot, found = followHOTChain(slot2.Page(), ptr.Offset, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.MultiXact)
-			slot2.RUnlock()
-			o.ctx.Pool.Unpin(slot2)
-			if !found {
-				return true, nil
-			}
-		}
+		// No tuple-tag acquire on a foreign lock-only holder here: the
+		// write path sleeps (and takes the tag, FIFO, member-skip) in
+		// waitForConflictingRowLock, which the caller runs before the
+		// stamp — acquiring up front on a possibly NON-conflicting held
+		// lock would queue behind an unrelated parked waiter (design
+		// 0021-0012).
 		var decRow Row
 		decRow, err = make(Row, len(cols)), nil
 		decNatts := int(tuple.Header.Infomask2 & 0x07FF)
@@ -4322,7 +4309,7 @@ func (o *updateOp) Next() (TupleSlot, error) {
 		}
 	}
 	// M0093: UPDATE is unconditionally a write — materialise the
-	// transaction's XID before the scan so foreignLockOnly /
+	// transaction's XID before the scan so selfRowLockMember /
 	// isConcurrentlyUpdated / tuple-lock acquisition see the real
 	// XID (zero would cause false-negative race detection and
 	// would mis-classify our own locks as foreign).
@@ -6334,24 +6321,6 @@ func (o *deleteOp) deleteWithUsing() (TupleSlot, error) {
 	return nil, EOF
 }
 
-// foreignLockOnly reports whether `h` indicates the tuple is
-// currently row-locked by another live transaction (M0021
-// tuple-level locking step 2b). The xmax field carries the
-// locker's xid; the HeapXmaxLockOnly infomask bit distinguishes
-// a lock from a real delete. We wait on the lockmgr's
-// transaction-scoped tuple tag — when the locker commits /
-// aborts, ReleaseAll drops the tuple-tag holder and the waiting
-// UPDATE / DELETE wakes up.
-func foreignLockOnly(h storage.HeapTupleHeader, currentXID storage.TransactionID) bool {
-	if h.Xmax == storage.InvalidTransactionID {
-		return false
-	}
-	if h.Xmax == currentXID {
-		return false
-	}
-	return storage.IsHeapTupleLockOnly(h.Infomask)
-}
-
 // scanMatching sequentially scans `rel`, decoding every visible tuple, applying
 // `pred`, and invoking `fn` for each match. statOID is the catalog OID of the
 // relation for cumulative relation-stats accounting (0 = do not count, used by
@@ -6387,9 +6356,8 @@ func scanMatching(ctx *Context, rel storage.RelFileNode, statOID uint32, cols []
 		// per-row interleaving of WHERE side-effects (RAISE NOTICE) and
 		// callbacks (BEFORE triggers), matching PG's per-row scan semantics.
 		type visibleTuple struct {
-			slot     uint16
-			row      Row
-			lockedBy storage.TransactionID
+			slot uint16
+			row  Row
 		}
 		var visible []visibleTuple
 		scanRow := make(Row, len(cols))
@@ -6448,9 +6416,8 @@ func scanMatching(ctx *Context, rel storage.RelFileNode, statOID uint32, cols []
 			rowCopy := make(Row, len(cols))
 			copy(rowCopy, scanRow)
 			visible = append(visible, visibleTuple{
-				slot:     slot,
-				row:      rowCopy,
-				lockedBy: lockedByForeign(tuple.Header, ctx.Tx.XID),
+				slot: slot,
+				row:  rowCopy,
 			})
 		}
 		s.RUnlock()
@@ -6476,18 +6443,15 @@ func scanMatching(ctx *Context, rel storage.RelFileNode, statOID uint32, cols []
 					continue
 				}
 			}
-			// M0021 step 2b: if the tuple is row-locked by
-			// another live xact (HEAP_XMAX_LOCK_ONLY +
-			// xmax != ours), block on the locker's tuple-tag
-			// in the lockmgr. ReleaseAll on the locker's
-			// commit/abort wakes us up; we then proceed
-			// with the UPDATE / DELETE atomic stamp.
-			if vt.lockedBy != storage.InvalidTransactionID {
-				ptr := storage.ItemPointer{Block: blk, Offset: vt.slot}
-				if err := ctx.acquireTupleLock(rel, ptr, lockmgr.ExclusiveLock); err != nil {
-					return err
-				}
-			}
+			// No tuple-tag acquire on a foreign lock-only holder here
+			// (formerly M0021 step 2b): blocking on a conflicting row
+			// lock — including the FIFO tuple-tag acquire, with the
+			// current-is-member skip — is waitForConflictingRowLock's
+			// job, run by the UPDATE/DELETE callback before it stamps.
+			// Acquiring up front regardless of conflict would queue a
+			// non-conflicting write (e.g. a no-key UPDATE over a FOR
+			// KEY SHARE holder) behind an unrelated parked waiter
+			// holding the tag (design 0021-0012).
 			if err := fn(blk, vt.slot, vt.row); err != nil {
 				return err
 			}
@@ -6498,19 +6462,6 @@ func scanMatching(ctx *Context, rel storage.RelFileNode, statOID uint32, cols []
 	// M0118-0009 (`stats`, rung 6; design 0118-0128).
 	recordRelScan(ctx, statOID, examined)
 	return nil
-}
-
-// lockedByForeign returns the locking xid when `h` indicates the
-// tuple is row-locked by another live xact (HEAP_XMAX_LOCK_ONLY
-// + xmax != currentXID); InvalidTransactionID otherwise.
-// Capturing this at scan time and using the captured value at
-// the per-row dispatch loop avoids re-reading the page after
-// we've released its RLock.
-func lockedByForeign(h storage.HeapTupleHeader, currentXID storage.TransactionID) storage.TransactionID {
-	if foreignLockOnly(h, currentXID) {
-		return h.Xmax
-	}
-	return storage.InvalidTransactionID
 }
 
 // conflictingRowLockHolders returns the still-active foreign transactions that
@@ -6576,6 +6527,46 @@ func conflictingRowLockHolders(ctx *Context, h storage.HeapTupleHeader, reqStatu
 	return nil
 }
 
+// selfRowLockMember is the write-path twin of lockRowsOp.selfIsLockMember:
+// upstream's `current_is_member` — whether this backend (top-level xact or
+// any of its subxacts) already holds a lock/updater membership on the
+// tuple. Used to skip the pre-sleep tuple-tag acquire, which would
+// otherwise deadlock an upgrader behind a waiter parked on our own held
+// lock (heap_update/heap_delete's `if (!current_is_member)`). 0021-0012.
+func selfRowLockMember(ctx *Context, h storage.HeapTupleHeader) bool {
+	isSelf := func(xid storage.TransactionID) bool {
+		if xid == storage.InvalidTransactionID {
+			return false
+		}
+		if xid == ctx.Tx.XID {
+			return true
+		}
+		if ctx.TxnMgr == nil {
+			return false
+		}
+		return ctx.TxnMgr.TopLevelXid(xid) == ctx.TxnMgr.TopLevelXid(ctx.Tx.XID)
+	}
+	if h.Xmax == storage.InvalidTransactionID {
+		return false
+	}
+	if storage.IsHeapTupleXmaxMulti(h.Infomask) {
+		if ctx.MultiXact == nil {
+			return false
+		}
+		members, ok := ctx.MultiXact.Members(multixact.MultiXactId(h.Xmax))
+		if !ok {
+			return false
+		}
+		for _, m := range members {
+			if isSelf(m.Xid) {
+				return true
+			}
+		}
+		return false
+	}
+	return isSelf(h.Xmax)
+}
+
 // waitForConflictingRowLock blocks the current write until no still-active
 // foreign transaction holds a conflicting row lock on (rel,blk,slot). It is the
 // write-path counterpart to the lock-only wait branch in stampLockInner: a row
@@ -6587,6 +6578,7 @@ func conflictingRowLockHolders(ctx *Context, h storage.HeapTupleHeader, reqStatu
 // Each holder is waited on via epqWait, which registers a wait-for-graph edge,
 // so a lock cycle surfaces as a 40001 deadlock rather than hanging.
 func waitForConflictingRowLock(ctx *Context, rel storage.RelFileNode, blk storage.BlockNumber, slot uint16, reqStatus multixact.Status, pos int) error {
+	tupleTagged := false
 	for {
 		s, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
 		if err != nil {
@@ -6595,13 +6587,34 @@ func waitForConflictingRowLock(ctx *Context, rel storage.RelFileNode, blk storag
 		s.RLock()
 		tup, gerr := storage.PageGetHeapTuple(s.Page(), slot)
 		var holders []storage.TransactionID
+		selfMember := false
 		if gerr == nil {
 			holders = conflictingRowLockHolders(ctx, tup.Header, reqStatus)
+			if len(holders) > 0 {
+				selfMember = selfRowLockMember(ctx, tup.Header)
+			}
 		}
 		s.RUnlock()
 		ctx.Pool.Unpin(s)
 		if len(holders) == 0 {
 			return nil
+		}
+		// About to sleep on a conflicting holder: take the heavyweight tuple
+		// tag first — heap_update/heap_delete's heap_acquire_tuplock before
+		// MultiXactIdWait/XactLockTableWait — so concurrent waiters on this
+		// row are granted in FIFO arrival order when the holder ends, instead
+		// of racing on the WaitForXID broadcast. Skipped when this backend is
+		// already a lock member on the tuple (upstream's
+		// `if (!current_is_member)` guard): a parked waiter on the tag is
+		// waiting for OUR held lock, so queueing behind it would deadlock
+		// (tuplelock-upgrade-no-deadlock s3_delete after s3_keyshare).
+		// Released at statement end (executor.ReleaseTupleLocks). 0021-0012.
+		if !tupleTagged && !selfMember {
+			ptr := storage.ItemPointer{Block: blk, Offset: slot}
+			if err := ctx.acquireTupleLock(rel, ptr, tupleLockHwMode(reqStatus)); err != nil {
+				return err
+			}
+			tupleTagged = true
 		}
 		for _, hx := range holders {
 			if dl, terr := epqWait(ctx, hx); terr != nil {
