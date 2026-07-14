@@ -2025,7 +2025,7 @@ type Catalog interface {
 	// LookupDomain finds a user-defined domain type by name (case-insensitive).
 	// Exposed on the interface so the catalog-row builders can resolve a domain
 	// column's type name to its pg_type OID. DU-002 slice 90.
-	LookupDomain(name string) (*Domain, bool)
+	LookupDomain(name string, dbOid ...uint32) (*Domain, bool)
 	// LookupDomainByOID finds a user-defined domain type by its pg_type OID, used
 	// by format_type to render a domain column's declared type. DU-002 slice 90.
 	LookupDomainByOID(oid uint32) (*Domain, bool)
@@ -2897,6 +2897,15 @@ type Domain struct {
 	// 0 means "unset, defaults to the bootstrap superuser" — see
 	// OwnerOrDefault. M0122-0005 (domain follow-up).
 	Owner uint32
+	// DBOid is the real physical database oid this domain was CREATE DOMAIN'd
+	// under (mirrors UserCollation.DBOid). The registry key folds this in
+	// (domainKey) so two distinct databases may each CREATE DOMAIN a
+	// same-named domain without colliding. Defaults to DefaultDBOid for every
+	// call site that does not pass an explicit dbOid, including WAL replay
+	// (domain restart-persistence is not yet dbOid-aware — see the matching
+	// deferral ledger row). M0122-0007 4e follow-up (DU-002 round-trip probe
+	// unblock).
+	DBOid uint32
 }
 
 // OwnerOrDefault returns d.Owner, falling back to the bootstrap superuser OID
@@ -3424,6 +3433,13 @@ func resolveDBOid(dbOid []uint32) uint32 {
 		return dbOid[0]
 	}
 	return DefaultDBOid
+}
+
+// domainKey builds the c.domains registry key, folding dbOid into the
+// case-insensitive name so two distinct databases may each register a
+// same-named domain without colliding. M0122-0007 4e follow-up.
+func domainKey(dbOid uint32, name string) string {
+	return strconv.FormatUint(uint64(dbOid), 10) + "\x00" + strings.ToLower(name)
 }
 
 // NewInMemory returns a catalog seeded with the v0 pg_catalog
@@ -20863,11 +20879,12 @@ func (c *InMemory) DropCompositeType(name string) error {
 
 // RegisterDomain creates a new domain type. Returns an error if name already
 // exists. M0097-0017.
-func (c *InMemory) RegisterDomain(name string, base Type, notNull bool) (*Domain, error) {
+func (c *InMemory) RegisterDomain(name string, base Type, notNull bool, dbOid ...uint32) (*Domain, error) {
 	k := strings.ToLower(name)
+	oid := resolveDBOid(dbOid)
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if _, exists := c.domains[k]; exists {
+	if _, exists := c.domains[domainKey(oid, k)]; exists {
 		return nil, fmt.Errorf("type %q already exists", name)
 	}
 	// PostgreSQL allocates two OIDs per domain: the domain type itself, then its
@@ -20880,9 +20897,10 @@ func (c *InMemory) RegisterDomain(name string, base Type, notNull bool) (*Domain
 		ArrayOID: c.nextOID + 1,
 		Base:     base,
 		NotNull:  notNull,
+		DBOid:    oid,
 	}
 	c.nextOID += 2
-	c.domains[k] = d
+	c.domains[domainKey(oid, k)] = d
 	return d, nil
 }
 
@@ -20898,7 +20916,12 @@ func (c *InMemory) RegisterDomainDuringRecovery(d *Domain) {
 		c.domains = make(map[string]*Domain)
 	}
 	out := *d
-	c.domains[strings.ToLower(d.Name)] = &out
+	// WAL replay does not yet carry a dbOid for domain records (see the
+	// DBOid field's doc comment) — every replayed domain lands under
+	// DefaultDBOid, matching every other not-yet-migrated write path's
+	// restart behavior.
+	out.DBOid = DefaultDBOid
+	c.domains[domainKey(DefaultDBOid, d.Name)] = &out
 	c.advanceNextOIDLocked(d.OID)
 	c.advanceNextOIDLocked(d.ArrayOID)
 	for _, chk := range d.Checks {
@@ -20915,7 +20938,7 @@ func (c *InMemory) RegisterDomainDuringRecovery(d *Domain) {
 func (c *InMemory) DropDomainDuringRecovery(name string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	delete(c.domains, strings.ToLower(name))
+	delete(c.domains, domainKey(DefaultDBOid, name))
 }
 
 // AddDomainCheck appends a CHECK constraint to a domain and allocates its
@@ -20964,8 +20987,8 @@ func (c *InMemory) addDomainCheckLocked(d *Domain, name, expr string, inValues [
 // validation (real PG's `!skip_validation` scan of every table column typed
 // with this domain) is not performed — see deferral ledger. M0122-0005 domain
 // follow-up (ADD CONSTRAINT).
-func (c *InMemory) AddDomainConstraint(domainName, name, expr string, inValues []string) error {
-	k := strings.ToLower(domainName)
+func (c *InMemory) AddDomainConstraint(domainName, name, expr string, inValues []string, dbOid ...uint32) error {
+	k := domainKey(resolveDBOid(dbOid), domainName)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	d, ok := c.domains[k]
@@ -20986,8 +21009,8 @@ func (c *InMemory) AddDomainConstraint(domainName, name, expr string, inValues [
 // own ifExists convention (goopg's catalog layer has no per-command NOTICE
 // channel to emit real PG's "skipping" notice through instead). M0122-0005
 // domain follow-up (DROP CONSTRAINT).
-func (c *InMemory) DropDomainConstraint(domainName, constrName string, ifExists bool) error {
-	k := strings.ToLower(domainName)
+func (c *InMemory) DropDomainConstraint(domainName, constrName string, ifExists bool, dbOid ...uint32) error {
+	k := domainKey(resolveDBOid(dbOid), domainName)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	d, ok := c.domains[k]
@@ -21018,12 +21041,23 @@ func (c *InMemory) domainCheckNameTaken(d *Domain, name string) bool {
 }
 
 // LookupDomain finds a domain by name (case-insensitive). M0097-0017.
-func (c *InMemory) LookupDomain(name string) (*Domain, bool) {
-	k := strings.ToLower(name)
+func (c *InMemory) LookupDomain(name string, dbOid ...uint32) (*Domain, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	d, ok := c.domains[k]
-	return d, ok
+	if len(dbOid) > 0 {
+		d, ok := c.domains[domainKey(dbOid[0], name)]
+		return d, ok
+	}
+	// No dbOid supplied: preserve the legacy global-name lookup for read call
+	// sites not yet threaded through a connection's dbOid (see the deferral
+	// ledger row for this loop) — falls back to a scan since the registry key
+	// now folds dbOid in. Ambiguous only when two databases register the same
+	// domain name, previously impossible since the registry had no isolation
+	// at all. M0122-0007 4e follow-up.
+	if d := c.lookupDomainByNameLocked(strings.ToLower(name)); d != nil {
+		return d, true
+	}
+	return nil, false
 }
 
 // AllDomains returns a snapshot slice of every registered domain. Used by
@@ -21070,9 +21104,10 @@ func (c *InMemory) LookupDomainByArrayOID(oid uint32) (*Domain, bool) {
 // RenameDomain renames a domain from oldName to newName, mirroring
 // RenameRangeType/RenameCompositeType/RenameEnum. M0122-0005 (domain
 // follow-up).
-func (c *InMemory) RenameDomain(oldName, newName string) error {
-	ok := strings.ToLower(oldName)
-	nk := strings.ToLower(newName)
+func (c *InMemory) RenameDomain(oldName, newName string, dbOid ...uint32) error {
+	oid := resolveDBOid(dbOid)
+	ok := domainKey(oid, oldName)
+	nk := domainKey(oid, newName)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	d, found := c.domains[ok]
@@ -21083,7 +21118,7 @@ func (c *InMemory) RenameDomain(oldName, newName string) error {
 		return fmt.Errorf("type %q already exists", newName)
 	}
 	delete(c.domains, ok)
-	d.Name = nk
+	d.Name = strings.ToLower(newName)
 	c.domains[nk] = d
 	return nil
 }
@@ -21095,8 +21130,8 @@ func (c *InMemory) RenameDomain(oldName, newName string) error {
 // oldName isn't found (also covers an unknown domain), "constraint %q for
 // domain %s already exists" when newName collides with another CHECK already
 // on the same domain. M0122-0005 domain follow-up (RENAME CONSTRAINT).
-func (c *InMemory) RenameDomainConstraint(domainName, oldName, newName string) error {
-	k := strings.ToLower(domainName)
+func (c *InMemory) RenameDomainConstraint(domainName, oldName, newName string, dbOid ...uint32) error {
+	k := domainKey(resolveDBOid(dbOid), domainName)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	d, ok := c.domains[k]
@@ -21128,8 +21163,8 @@ func (c *InMemory) RenameDomainConstraint(domainName, oldName, newName string) e
 // Returns false if no such domain is registered. Mirrors
 // SetRangeTypeOwner/SetCompositeTypeOwner/SetEnumOwner. M0122-0005 (domain
 // follow-up).
-func (c *InMemory) SetDomainOwner(name string, ownerOID uint32) bool {
-	k := strings.ToLower(name)
+func (c *InMemory) SetDomainOwner(name string, ownerOID uint32, dbOid ...uint32) bool {
+	k := domainKey(resolveDBOid(dbOid), name)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	d, ok := c.domains[k]
@@ -21145,8 +21180,8 @@ func (c *InMemory) SetDomainOwner(name string, ownerOID uint32) bool {
 // the latter passing a nil expr), mirroring AlterDomainDefault. Returns false
 // if no such domain is registered. M0122-0005 domain follow-up (SET/DROP
 // DEFAULT).
-func (c *InMemory) SetDomainDefault(name string, expr parser.Expr) bool {
-	k := strings.ToLower(name)
+func (c *InMemory) SetDomainDefault(name string, expr parser.Expr, dbOid ...uint32) bool {
+	k := domainKey(resolveDBOid(dbOid), name)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	d, ok := c.domains[k]
@@ -21165,8 +21200,8 @@ func (c *InMemory) SetDomainDefault(name string, expr parser.Expr) bool {
 // Constraint's cross-table walk) — the same simplification goopg's
 // ALTER TABLE ... SET NOT NULL already makes for plain columns. M0122-0005
 // domain follow-up (SET/DROP NOT NULL).
-func (c *InMemory) SetDomainNotNull(name string, notNull bool) bool {
-	k := strings.ToLower(name)
+func (c *InMemory) SetDomainNotNull(name string, notNull bool, dbOid ...uint32) bool {
+	k := domainKey(resolveDBOid(dbOid), name)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	d, ok := c.domains[k]
@@ -21571,11 +21606,13 @@ func formatExprForAttrdef(e parser.Expr) string {
 // DropDomain removes a domain. Returns (names, nil) on success where names are
 // tables dropped via CASCADE. Returns (blockingTables, "dependent objects") when
 // cascade=false and dependents exist. M0097-0023.
-func (c *InMemory) DropDomain(name string, ifExists bool, cascade bool) ([]string, error) {
-	k := strings.ToLower(name)
+func (c *InMemory) DropDomain(name string, ifExists bool, cascade bool, dbOid ...uint32) ([]string, error) {
+	oid := resolveDBOid(dbOid)
+	nameKey := strings.ToLower(name)
+	regKey := domainKey(oid, name)
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if _, ok := c.domains[k]; !ok {
+	if _, ok := c.domains[regKey]; !ok {
 		if ifExists {
 			return nil, nil
 		}
@@ -21583,12 +21620,12 @@ func (c *InMemory) DropDomain(name string, ifExists bool, cascade bool) ([]strin
 	}
 	// Find tables that use this domain as a column type.
 	var dependentTables []string
-	for _, tbl := range c.ns(DefaultDBOid).tables {
+	for _, tbl := range c.ns(oid).tables {
 		if tbl.Virtual {
 			continue
 		}
 		for _, col := range tbl.Columns {
-			if strings.ToLower(col.Type.Name) == k || strings.ToLower(col.DeclaredTypeName) == k {
+			if strings.ToLower(col.Type.Name) == nameKey || strings.ToLower(col.DeclaredTypeName) == nameKey {
 				dependentTables = append(dependentTables, tbl.Name)
 				break
 			}
@@ -21602,15 +21639,15 @@ func (c *InMemory) DropDomain(name string, ifExists bool, cascade bool) ([]strin
 	var dropped []string
 	if cascade {
 		for _, tblName := range dependentTables {
-			for tableKey, tbl := range c.ns(DefaultDBOid).tables {
+			for tableKey, tbl := range c.ns(oid).tables {
 				if strings.EqualFold(tbl.Name, tblName) {
 					dropped = append(dropped, tblName)
 					tblOID := tbl.OID
-					delete(c.ns(DefaultDBOid).tables, tableKey)
+					delete(c.ns(oid).tables, tableKey)
 					// Remove indexes on this table.
-					for idxOID, idx := range c.ns(DefaultDBOid).indexes {
+					for idxOID, idx := range c.ns(oid).indexes {
 						if idx.Table != nil && idx.Table.OID == tblOID {
-							delete(c.ns(DefaultDBOid).indexes, idxOID)
+							delete(c.ns(oid).indexes, idxOID)
 						}
 					}
 					break
@@ -21618,7 +21655,7 @@ func (c *InMemory) DropDomain(name string, ifExists bool, cascade bool) ([]strin
 			}
 		}
 	}
-	delete(c.domains, k)
+	delete(c.domains, regKey)
 	return dropped, nil
 }
 
@@ -21630,8 +21667,13 @@ func (c *InMemory) ResolveColumnType(typeName string) string {
 	k := strings.ToLower(typeName)
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	// Check domain: resolve to base type.
-	if d, ok := c.domains[k]; ok {
+	// Check domain: resolve to base type. No dbOid context is available to
+	// this function's callers (execCreateTable/canonicalTypeClass are not yet
+	// threaded through a connection's dbOid — see the deferral ledger row for
+	// this loop), so fall back to a global by-name scan, matching
+	// LookupDomain's own no-dbOid fallback and this function's
+	// pre-cross-database-isolation behavior. M0122-0007 4e follow-up.
+	if d := c.lookupDomainByNameLocked(k); d != nil {
 		baseName := strings.ToLower(d.Base.Name)
 		// Recurse (without lock reacquire — use direct map lookup).
 		return c.resolveColumnTypeLocked(baseName)
@@ -21645,10 +21687,23 @@ func (c *InMemory) ResolveColumnType(typeName string) string {
 // resolveColumnTypeLocked is the lock-free recursive helper for ResolveColumnType.
 func (c *InMemory) resolveColumnTypeLocked(typeName string) string {
 	k := strings.ToLower(typeName)
-	if d, ok := c.domains[k]; ok {
+	if d := c.lookupDomainByNameLocked(k); d != nil {
 		return c.resolveColumnTypeLocked(strings.ToLower(d.Base.Name))
 	}
 	return typeName
+}
+
+// lookupDomainByNameLocked scans c.domains for the first entry whose Name
+// matches lowerName (already lowercased), ignoring dbOid. Used by read paths
+// that have no dbOid context available (see LookupDomain/ResolveColumnType's
+// doc comments). Caller holds c.mu (read or write). M0122-0007 4e follow-up.
+func (c *InMemory) lookupDomainByNameLocked(lowerName string) *Domain {
+	for _, d := range c.domains {
+		if d.Name == lowerName {
+			return d
+		}
+	}
+	return nil
 }
 
 // SearchPathCatalog wraps a Catalog and applies a dynamically-fetched

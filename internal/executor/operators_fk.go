@@ -1757,7 +1757,7 @@ func checkDomainConstraintsForRow(ctx *Context, cols []catalog.Column, row Row) 
 		if col.DeclaredTypeName == "" || i >= len(row) {
 			continue
 		}
-		dom, isDomain := im.LookupDomain(col.DeclaredTypeName)
+		dom, isDomain := im.LookupDomain(col.DeclaredTypeName, ctx.CurrentDatabaseOid)
 		if !isDomain {
 			continue
 		}

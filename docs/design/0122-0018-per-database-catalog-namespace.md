@@ -2130,6 +2130,82 @@ all 3 workloads; first attempt hit 1 transient pgbench failure — 0.009%,
 11,364 txns, unrelated to this loop's catalog/executor diff — retry passed
 clean).
 
+**`catalog.domains` cross-database isolation — LANDED (2026-07-15, follow-up
+beyond the collations item above, next candidate the DU-002 probe surfaced).**
+Motivation: after the collations fix, `TestPort_PgDumpConnectionSetup`'s
+round-trip restore moved on to `CREATE DOMAIN public.b_in AS bigint ...`
+erroring `type "b_in" already exists` — `catalog.InMemory.domains` was one
+flat, dbOid-less `map[string]*Domain` keyed purely by lowercase name (not even
+namespace-scoped, unlike `userCollations`). Unlike `userCollations`/
+`ForeignServer`/`UserMapping` (already slices, just needed a DBOid filter
+field), `domains` is a genuine `map[string]*Domain`, so the fix folds dbOid
+into the registry key itself: new `domainKey(dbOid, name) string` (`"<dbOid>\
+x00<lower-name>"`), and `catalog.Domain` gained a `DBOid uint32` field.
+`RegisterDomain`/`DropDomain`/`RenameDomain`/`SetDomainOwner`/
+`SetDomainDefault`/`SetDomainNotNull`/`AddDomainConstraint`/
+`DropDomainConstraint`/`RenameDomainConstraint` each gained a trailing
+`dbOid ...uint32` (variadic, `resolveDBOid` default unchanged for every
+pre-existing call site including all catalog-package tests). All 9 write call
+sites in `internal/executor/operators_ddl.go`
+(`execCreateDomain`/`execAlterDomain`/`execDropDomain`/`execCommentOn`'s
+domain branch) thread `o.ctx.CurrentDatabaseOid`. `DropDomain`'s own
+dependent-table scan also switched its 3 internal `c.ns(DefaultDBOid)` calls
+to `c.ns(oid)` (the resolved dbOid) — a contained correctness fix in the same
+function, otherwise CASCADE-dropping a domain in a non-default database would
+have scanned/cascaded against the wrong database's tables.
+`catalog.Catalog.LookupDomain` (interface method) also gained a variadic
+`dbOid`; its 2 cheapest, highest-value read call sites were threaded too
+(`internal/executor/expr.go`'s CHECK-on-CAST enforcement and
+`internal/executor/operators_fk.go`'s `checkDomainConstraintsForRow`, both
+already had `ctx.CurrentDatabaseOid` in scope). **Deliberately NOT done (scope
+kept bounded — domains have a much wider read-path surface than collations:
+CAST evaluation, FK/CHECK enforcement, `pg_attribute` row building, plus no
+prior namespace scoping at all):** WAL restart-persistence
+(`RegisterDomainDuringRecovery`/`DropDomainDuringRecovery`/
+`wal.CreateDomainPayload`) still carries no dbOid and stamps every replayed
+domain `DefaultDBOid`, mirroring the collations gap exactly. ~7 remaining
+`LookupDomain` read call sites (`expr.go`'s `userTypeOIDForName`,
+`operators_ddl.go`'s `resolveUserTypeOID`, `pg18_user_catalog_rows.go`'s
+`buildUserPGAttributeRow`/`buildUserPGAttributeRowForCompositeField`,
+`planner.go`'s `foldPgCollationFor`) and `ResolveColumnType`/
+`resolveColumnTypeLocked` (used by `execCreateTable` and
+`operators_storage.go`'s `canonicalTypeClass`) are not dbOid-threaded — a new
+shared `lookupDomainByNameLocked` helper (global by-name scan, first match)
+preserves their exact pre-isolation behavior instead of silently breaking
+(the first implementation attempt did break them — see the gate-failure note
+below — because switching the map key format alone, without this fallback,
+made every un-threaded direct `c.domains[k]` access miss). `execDropDomain`'s
+pg_type heap-row deletion (`deleteTypeFromCatalogHeap`) still hardcodes
+`catalog.DefaultDBOid`, pre-existing and mirroring `execDropType`, untouched.
+Confirmed via `TestPort_PgDumpConnectionSetup`: the round-trip's failure
+point moved from `type "b_in" already exists` to an unrelated parser gap
+(`CREATE DOMAIN public.f8_in AS double precision` — multi-word base type name
+not accepted by the grammar at that position), a different mechanism than
+this per-database-catalog-namespace epic — the next probe blocker is a
+parser fix, not another sibling-map audit. New
+`TestCreateDomainCrossDatabaseIsolation`
+(`internal/catalog/create_domain_test.go`), mirroring
+`TestCreateCollationCrossDatabaseIsolation`. **Gate-failure note (verify
+before reusing this map-key-folding pattern on another sibling map):** the
+first implementation pass changed only `RegisterDomain`/`LookupDomain`/etc. to
+the new composite key and left `ResolveColumnType`/`resolveColumnTypeLocked`
+using the old plain-name key — this silently broke domain column type
+resolution (`TestEnumDomainSmoke`, `TestDomainColumnNotNullEnforced`,
+`TestDomainColumnGenericCheckEnforced`, `TestDomainColumnInCheckEnforced` all
+failed with real, non-obvious symptoms like "column has type X but expression
+has type int8") until every direct `c.domains[k]` access in the package was
+audited and switched to either `domainKey` or the new
+`lookupDomainByNameLocked` fallback. Any future sibling-map key-format change
+must `grep -n 'c\.<map>\['` for the whole file before declaring done. Gates:
+`go build ./...`/`go vet ./...` clean; `go test ./internal/catalog/...
+./internal/executor/... ./internal/planner/...` PASS (`internal/initdb`
+232s, `internal/planner` clean); `go test -short` full repo (excl. testport,
+per policy) PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+`RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0 failed,
+all 3 workloads; first attempt hit 1 transient pgbench failure — 0.007%,
+14,582 txns, unrelated to this loop's catalog/executor diff — retry passed
+clean).
+
 ## Recommended order and stopping points
 
 4a (landed) → 4b-i (landed) → 4b-ii (landed) → 4c (landed) → 4d-i (landed) →
@@ -2193,13 +2269,21 @@ verification pass; a future loop should file it against
   sync with the postgres/template0/template1 special cases today).
 - The `postgres`/`template1` dbOid dual-mirror migration strategy for 4d —
   flagged, not designed; needs its own investigation once 4d is reached.
-- Any of the remaining ~19 sibling per-name maps on `InMemory` beyond
-  `tables`/`indexes`/`byTable`/`foreignServers`/`userMappings`/`userCollations`
-  (conversions, aggregates, operator classes, etc.) — genuinely out of scope
+- Any of the remaining ~18 sibling per-name maps on `InMemory` beyond
+  `tables`/`indexes`/`byTable`/`foreignServers`/`userMappings`/
+  `userCollations`/`domains` (enums, composite types, range types,
+  conversions, aggregates, operator classes, etc.) — genuinely out of scope
   for "per-database catalog namespace" as motivated by the
   template-copy/dump-restore use cases; each would need its own audit for
   whether PG actually scopes it per-database (most do) before being folded
-  into this epic. `userCollations` itself was folded in 2026-07-15 (see its
-  section above) once the DU-002 round-trip probe surfaced it as the specific
-  next-in-line collision; the probe's failure point has since moved to a
-  `CREATE TYPE` collision, the natural next candidate for this same audit.
+  into this epic. `userCollations` was folded in 2026-07-15 (see its section
+  above) once the DU-002 round-trip probe surfaced it as the specific
+  next-in-line collision; `domains` was folded the same day once the probe
+  moved on to it (see its own section above) — the probe's failure point has
+  since moved past catalog isolation entirely to a `CREATE DOMAIN ... AS
+  double precision` parser gap, a different mechanism than this epic.
+  `enumTypes`/`compositeTypes`/`rangeTypes` share `domains`'s exact
+  `map[string]*T` shape (same key-folding pattern would apply) but were not
+  audited this loop — the DU-002 probe no longer points at them since it is
+  now blocked on the parser gap instead, so their priority is unclear until
+  that parser fix lands and the probe can run further.

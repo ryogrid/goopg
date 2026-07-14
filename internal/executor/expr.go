@@ -861,7 +861,7 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 		// admit the value. DU-002 slice 385 (multi-CHECK).
 		if ctx != nil && ctx.Catalog != nil {
 			if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
-				if dom, isDomain := im.LookupDomain(x.TargetType); isDomain {
+				if dom, isDomain := im.LookupDomain(x.TargetType, ctx.CurrentDatabaseOid); isDomain {
 					// Get the string label of the value being cast. Format()
 					// (not StringValue(), which only extracts KindString's Buf
 					// payload) renders every Kind's canonical text form, e.g.

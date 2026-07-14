@@ -4004,7 +4004,7 @@ survey the deferral ledger for a fresh open (`status = -`) row.
       failure out of 11,761 txns — 0.009%, unrelated to this loop's
       docs/ledger-only diff — retry passed clean, 0 failed across all 3
       workloads).
-- [ ] **M0122-0007 4e follow-up — `catalog.UserCollation` cross-database
+- [x] **M0122-0007 4e follow-up — `catalog.UserCollation` cross-database
       isolation (M-NIGHTLY queue empty this loop; picked up the "M0110/M0119
       work order" Current Priority banner's next candidate).** Ran
       `TestPort_PgDumpConnectionSetup`'s soft DU-002 round-trip probe to find
@@ -4045,6 +4045,65 @@ survey the deferral ledger for a fresh open (`status = -`) row.
       to this loop's catalog/executor diff — retry passed clean). Next
       candidate: the `CREATE TYPE`/pg_type collision the probe now hits, per
       this same audit pattern.
+- [x] **M0122-0007 4e follow-up — `catalog.domains` cross-database isolation
+      (resume point from the item above: the DU-002 probe's failure point
+      moved to `type "b_in" already exists`, a `CREATE DOMAIN` collision).**
+      Unlike `userCollations`/`ForeignServer`/`UserMapping` (already slices,
+      just needed a DBOid filter field), `catalog.InMemory.domains` is a
+      genuine `map[string]*Domain` keyed purely by lowercase name (no
+      namespace scoping at all) — so the fix folds dbOid into the registry
+      key itself via a new `domainKey(dbOid, name) string` helper.
+      `catalog.Domain` gained a `DBOid uint32` field;
+      `RegisterDomain`/`DropDomain`/`RenameDomain`/`SetDomainOwner`/
+      `SetDomainDefault`/`SetDomainNotNull`/`AddDomainConstraint`/
+      `DropDomainConstraint`/`RenameDomainConstraint` each gained a trailing
+      `dbOid ...uint32` param (variadic, defaults to `DefaultDBOid` — every
+      pre-existing call site, including all catalog-package tests, unchanged);
+      `catalog.Catalog.LookupDomain` (interface method) too. All 9 write call
+      sites in `internal/executor/operators_ddl.go`
+      (`execCreateDomain`/`execAlterDomain`/`execDropDomain`/`execCommentOn`'s
+      domain branch) thread `o.ctx.CurrentDatabaseOid`; `DropDomain`'s own
+      3 internal `c.ns(DefaultDBOid)` dependent-table-scan calls also switched
+      to `c.ns(oid)` (contained correctness fix, same function). 2 cheap,
+      high-value `LookupDomain` read call sites with `ctx` already in scope
+      also threaded (`internal/executor/expr.go`'s CHECK-on-CAST enforcement,
+      `internal/executor/operators_fk.go`'s `checkDomainConstraintsForRow`).
+      **Deliberately scoped out (ledger row, resume points recorded):** WAL
+      restart-persistence still hardcodes `DefaultDBOid` (mirrors the
+      collations gap); ~7 remaining `LookupDomain` read call sites
+      (`userTypeOIDForName`, `resolveUserTypeOID`, `buildUserPGAttributeRow`,
+      `buildUserPGAttributeRowForCompositeField`, `foldPgCollationFor`) and
+      `ResolveColumnType`/`resolveColumnTypeLocked` (used by `execCreateTable`/
+      `canonicalTypeClass`) stay on a new global-by-name-scan fallback
+      (`lookupDomainByNameLocked`) rather than being threaded — domains have a
+      much wider read-path surface than collations (CAST evaluation, FK/CHECK
+      enforcement, `pg_attribute` row building) so full threading risked scope
+      explosion or an unsafe partial thread; `execDropDomain`'s
+      `deleteTypeFromCatalogHeap` call still hardcodes `catalog.DefaultDBOid`
+      (pre-existing, mirrors `execDropType`). **Gate-failure lesson recorded
+      in the design doc:** the first implementation pass changed the map key
+      format but missed `ResolveColumnType`/`resolveColumnTypeLocked`'s direct
+      `c.domains[k]` accesses, silently breaking domain column type
+      resolution (4 test failures with non-obvious symptoms) until every
+      direct map access in the file was audited. Confirmed fixed via the
+      guard: the round-trip's failure point moved past the domain collision to
+      an unrelated parser gap (`CREATE DOMAIN public.f8_in AS double
+      precision` — multi-word base type name not accepted by the grammar at
+      that position), a different mechanism than this per-database-catalog-
+      namespace epic. New `TestCreateDomainCrossDatabaseIsolation`
+      (`internal/catalog/create_domain_test.go`). Design doc
+      `docs/design/0122-0018-per-database-catalog-namespace.md`'s new
+      "`catalog.domains` cross-database isolation" section (+ updated
+      "Deferred / explicitly out of scope" list) and README index. Gates:
+      `go build ./...`/`go vet ./...` clean; `go test ./internal/catalog/...
+      ./internal/executor/... ./internal/planner/...` PASS; `go test -short`
+      full repo (excl. testport, per policy) PASS; `scripts/tpch-spotcheck.sh`
+      PASS (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke bash
+      scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 workloads; first
+      attempt hit 1 transient pgbench failure — 0.007%, 14,582 txns, unrelated
+      to this loop's catalog/executor diff — retry passed clean). Next
+      candidate: the `CREATE DOMAIN ... AS double precision` parser gap the
+      probe now hits — a grammar fix, not another sibling-map audit.
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 

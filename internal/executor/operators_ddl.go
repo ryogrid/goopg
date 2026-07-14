@@ -17406,7 +17406,7 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 		// Domains live in pg_type (typtype='d', classoid 1247). pg_dump picks the
 		// DOMAIN keyword from typtype; the stored pg_description row is
 		// keyword-agnostic. DU-002 slice 146.
-		dom, ok := im.LookupDomain(s.ObjName.Name)
+		dom, ok := im.LookupDomain(s.ObjName.Name, o.ctx.CurrentDatabaseOid)
 		if !ok {
 			return &ExecError{Code: "42704", Pos: s.Pos(),
 				Message: fmt.Sprintf("type %q does not exist", s.ObjName.String())}
@@ -19160,7 +19160,7 @@ func (o *ddlOp) execCreateDomain(s *parser.CreateDomainStmt) error {
 		return nil
 	}
 	baseType := catalog.Type{Name: s.BaseType, Args: s.BaseTypeArgs}
-	d, err := cat.RegisterDomain(s.Name, baseType, s.NotNull)
+	d, err := cat.RegisterDomain(s.Name, baseType, s.NotNull, o.ctx.CurrentDatabaseOid)
 	if err != nil {
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 	}
@@ -19245,9 +19245,10 @@ func (o *ddlOp) execAlterDomain(s *parser.AlterDomainStmt) error {
 	if !ok {
 		return nil
 	}
+	dbOid := o.ctx.CurrentDatabaseOid
 	switch s.Action {
 	case "rename":
-		if err := cat.RenameDomain(s.Name, s.NewName); err != nil {
+		if err := cat.RenameDomain(s.Name, s.NewName, dbOid); err != nil {
 			return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 		}
 		return nil
@@ -19260,12 +19261,12 @@ func (o *ddlOp) execAlterDomain(s *parser.AlterDomainStmt) error {
 			}
 			ownerOID = oid
 		}
-		if !cat.SetDomainOwner(s.Name, ownerOID) {
+		if !cat.SetDomainOwner(s.Name, ownerOID, dbOid) {
 			return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("type %q does not exist", s.Name)}
 		}
 		return nil
 	case "renameconstraint":
-		if err := cat.RenameDomainConstraint(s.Name, s.ConstraintName, s.NewConstraintName); err != nil {
+		if err := cat.RenameDomainConstraint(s.Name, s.ConstraintName, s.NewConstraintName, dbOid); err != nil {
 			code := "42704" // ERRCODE_UNDEFINED_OBJECT — missing domain/constraint, matches real PG
 			if strings.Contains(err.Error(), "already exists") {
 				code = "42710" // ERRCODE_DUPLICATE_OBJECT, matches real PG
@@ -19274,7 +19275,7 @@ func (o *ddlOp) execAlterDomain(s *parser.AlterDomainStmt) error {
 		}
 		return nil
 	case "addconstraint":
-		d, found := cat.LookupDomain(s.Name)
+		d, found := cat.LookupDomain(s.Name, dbOid)
 		if !found {
 			return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("type %q does not exist", s.Name)}
 		}
@@ -19284,7 +19285,7 @@ func (o *ddlOp) execAlterDomain(s *parser.AlterDomainStmt) error {
 			// DOMAIN's CHECK (VALUE IN (...)) shortcut form.
 			expr = domainInValuesCheckExpr(d.Base.Name, s.CheckInValues, cat)
 		}
-		if err := cat.AddDomainConstraint(s.Name, s.ConstraintName, expr, s.CheckInValues); err != nil {
+		if err := cat.AddDomainConstraint(s.Name, s.ConstraintName, expr, s.CheckInValues, dbOid); err != nil {
 			code := "42704" // ERRCODE_UNDEFINED_OBJECT — missing domain, matches real PG's typenameTypeId
 			if strings.Contains(err.Error(), "already exists") {
 				code = "42710" // ERRCODE_DUPLICATE_OBJECT, matches real PG's domainAddCheckConstraint
@@ -19293,17 +19294,17 @@ func (o *ddlOp) execAlterDomain(s *parser.AlterDomainStmt) error {
 		}
 		return nil
 	case "dropconstraint":
-		if err := cat.DropDomainConstraint(s.Name, s.ConstraintName, s.IfExists); err != nil {
+		if err := cat.DropDomainConstraint(s.Name, s.ConstraintName, s.IfExists, dbOid); err != nil {
 			return &ExecError{Code: "42704", Pos: s.Pos(), Message: err.Error()} // ERRCODE_UNDEFINED_OBJECT, matches real PG
 		}
 		return nil
 	case "setdefault":
-		if !cat.SetDomainDefault(s.Name, s.DefaultExpr) {
+		if !cat.SetDomainDefault(s.Name, s.DefaultExpr, dbOid) {
 			return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("type %q does not exist", s.Name)}
 		}
 		return nil
 	case "dropdefault":
-		if !cat.SetDomainDefault(s.Name, nil) {
+		if !cat.SetDomainDefault(s.Name, nil, dbOid) {
 			return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("type %q does not exist", s.Name)}
 		}
 		return nil
@@ -19312,12 +19313,12 @@ func (o *ddlOp) execAlterDomain(s *parser.AlterDomainStmt) error {
 		// scan existing table columns of this domain type for already-present
 		// NULL values (validateDomainNotNullConstraint's cross-table walk);
 		// see SetDomainNotNull's doc comment. M0122-0005 domain follow-up.
-		if !cat.SetDomainNotNull(s.Name, true) {
+		if !cat.SetDomainNotNull(s.Name, true, dbOid) {
 			return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("type %q does not exist", s.Name)}
 		}
 		return nil
 	case "dropnotnull":
-		if !cat.SetDomainNotNull(s.Name, false) {
+		if !cat.SetDomainNotNull(s.Name, false, dbOid) {
 			return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("type %q does not exist", s.Name)}
 		}
 		return nil
@@ -19660,7 +19661,7 @@ func (o *ddlOp) execDropDomain(s *parser.DropDomainStmt) error {
 		}
 		// Stamp the pg_type heap row's xmax before the in-memory delete (need the
 		// OID while the domain still exists), mirroring execDropType. DU-002 slice 90.
-		if d, ok := cat.LookupDomain(name.Name); ok && catalogHeapSyncAvailable(o.ctx) {
+		if d, ok := cat.LookupDomain(name.Name, o.ctx.CurrentDatabaseOid); ok && catalogHeapSyncAvailable(o.ctx) {
 			if o.ctx.MaterializeWriterXID() == nil {
 				deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, d.OID, o.ctx.Tx.XID)
 				// Also stamp the auto-generated array type row. DU-002 slice 251.
@@ -19671,7 +19672,7 @@ func (o *ddlOp) execDropDomain(s *parser.DropDomainStmt) error {
 			}
 		}
 		// names = dropped tables (CASCADE) or blocking tables (RESTRICT).
-		names, err := cat.DropDomain(name.Name, false, s.Cascade)
+		names, err := cat.DropDomain(name.Name, false, s.Cascade, o.ctx.CurrentDatabaseOid)
 		if err == nil {
 			if o.ctx.WAL != nil {
 				if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropDomain(name.Name)); werr != nil {
