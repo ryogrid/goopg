@@ -19,7 +19,7 @@ func TestEvalCastCharTruncatesToFirstByte(t *testing.T) {
 		{"hello world", "h"},
 	}
 	for _, c := range cases {
-		got, err := evalCast(NewStringDatum(c.in), "char", 0)
+		got, err := evalCast(NewStringDatum(c.in), "char", 0, nil)
 		if err != nil {
 			t.Fatalf("evalCast(%q, \"char\") unexpected error: %v", c.in, err)
 		}

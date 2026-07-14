@@ -19964,7 +19964,7 @@ func (o *ddlOp) execAlterColumnType(tbl *catalog.Table, act parser.AlterTableAct
 			}
 			// Convert the changed column to the new type.
 			if colIdx < len(row) {
-				if converted, cErr := evalCast(row[colIdx], newCatalogType.Name, act.Pos()); cErr == nil {
+				if converted, cErr := evalCast(row[colIdx], newCatalogType.Name, act.Pos(), o.ctx); cErr == nil {
 					row[colIdx] = converted
 				}
 			}

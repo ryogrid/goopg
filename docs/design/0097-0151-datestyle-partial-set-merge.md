@@ -301,3 +301,87 @@ Gates: `go build ./...` clean; `go vet` clean (`internal/config`,
 (full packages, no regressions); `scripts/tpch-spotcheck.sh` PASS
 (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke bash
 scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 workloads).
+
+## Follow-up (2026-07-15): `CAST`-to-text DateStyle-awareness (`evalCast`)
+
+Picked up the "investigate call-site reachability first" resume point from
+the ledger row above item (b) — the ~20-call-site `Datum.Format()`/
+`AppendValueText()` DateStyle-unawareness. Rather than touch those two
+Datum methods directly (still deferred — see below), this slice targets the
+single highest-traffic, most PG-visible divergence: `x::text`,
+`CAST(x AS text)`, and the `text(x)`/`varchar(x)` function-call cast forms.
+Before this fix `evalCast`'s `KindTime` branch under `case "text", "varchar",
+"bpchar", "char"` (`internal/executor/expr.go`) called `d.Format()`
+unconditionally, which hardcodes ISO for TIMESTAMP/TIMESTAMPTZ and
+Postgres-style MDY for DATE (M0097-0063) regardless of `SET datestyle` — so
+`SELECT ts::text` under `SET datestyle='SQL, DMY'` disagreed with plain
+`SELECT ts` (already fixed by the two 2026-07-14/07-15 follow-ups above).
+
+**Reachability finding:** `evalCast(d, targetType, pos)` had no `*Context`
+parameter at all, and is called from only 6 production call sites — far
+fewer than the ~20-site `Format()`/`AppendValueText()` figure, because most
+of those 20 sites don't route through a type-declared CAST. Of the 6,
+4 already had a `ctx`/`o.ctx` in scope at the call site (`expr.go`'s two
+`Cast`-AST-node and type-function-call evaluation sites; `operators_ddl.go`'s
+`ALTER COLUMN TYPE` row-rewrite path via `o.ctx`; `operators_project_set.go`'s
+`unnest(...)::type` element-cast path via `ctx`) and 2 did not
+(`operators_from_unnest.go`'s `coerceUnnestElem`, which by its own doc
+comment only ever coerces the numeric/oid/bool family, never date/time;
+`operators_storage.go`'s int2/int4/int8 INSERT-coercion switch, which never
+reaches the `KindTime` branch). Added a `ctx *Context` parameter to both
+`evalCast` and `evalCastTyped`, threading the real `ctx`/`o.ctx` at the 4
+reachable sites and `nil` at the 2 unreachable ones (nil falls back to
+ISO/MDY, matching the pre-existing hardcoded behavior there — zero
+observable change for those 2 sites).
+
+New `dateStyleFromCtx(ctx *Context) (style, order string)` helper
+(`internal/executor/expr.go`) mirrors the same `ctx.GetSetting("datestyle")`
++ `config.ParseDateStyleValue` resolution `dispatch.go`'s
+`appendTypedCellText` already performs, defaulting ISO/MDY when `ctx` is nil
+or the GUC is unset — kept identical across all three call sites
+([[pattern_sibling_paths_must_agree]]). New `formatTimeDatumForCast(d Datum,
+style, order string) string` mirrors `Datum.Format()`'s `KindTime` branching
+(±infinity sentinels, then `flagDate` to distinguish DATE from TIMESTAMP/
+TIMESTAMPTZ) but dispatches through `config.FormatDate`/`config.FormatTimestamp`
+with the resolved style/order instead of `Format()`'s hardcoded layouts —
+this incidentally also fixes the CAST path's DATE branch, which inherited
+`Format()`'s Postgres-style-MDY-only hardcoding even under ISO/SQL/German.
+The pre-existing `isTimeOnlyValue` short-circuit (TIME cast to text) is
+untouched — TIME/TIMETZ have no DateStyle dependency.
+
+Tests: `internal/executor/cast_datestyle_test.go`
+`TestEvalCastTimeToTextHonorsDateStyle` (DATE × 4 styles, TIMESTAMP × 3
+styles, table-driven against a `ctx.GetSetting`-stubbed `*Context`);
+`TestEvalCastTimeToTextNilCtxDefaultsISO` (nil-ctx fallback, pinning the
+2 unreachable call sites' unchanged behavior). Updated the two existing
+direct `evalCast`/`evalCastTyped` test callers
+(`char_oid18_truncation_test.go`, `tid_cast_test.go`) to pass `nil` for the
+new parameter — pre-existing non-time assertions unchanged.
+
+Live `psql` verification against a real `cmd/goopg` binary (isolated data
+dir, port 5536, cleaned up after): a `dsx(id int, d date, ts timestamp,
+tz timestamptz)` table with one populated row and one all-NULL row;
+`SELECT d::text, ts::text, tz::text` under `ISO, MDY` → `2026-07-14` /
+`2026-07-14 09:05:03` / `2026-07-14 09:05:03`; `SQL, DMY` → `14/07/2026` /
+`14/07/2026 09:05:03` / same; `Postgres, DMY` → `14-07-2026` / `Tue 14 Jul
+09:05:03 2026` / same; `German` → `14.07.2026` / `14.07.2026 09:05:03`;
+`CAST(d AS text)`/`CAST(ts AS text)` and `text(d)`/`text(ts)` (function-call
+cast form) both agree with the `::text` form under `German`; the all-NULL
+row's `d::text, ts::text` correctly render empty (NULL passthrough,
+untouched by this fix — `evalCast` returns `NullDatum` before reaching the
+`KindTime` branch).
+
+Still entirely unimplemented: `Datum.Format()`/`AppendValueText()` remain
+DateStyle-unaware at their ~20 direct call sites (`to_char`'s fallback
+formatting, plpgsql `RAISE`/string concatenation, `EXPLAIN`, error messages,
+`operators_fk.go`/`operators_analyze.go`'s bound-rendering, array-element
+`Format()` in `expr.go`'s `array_to_string`/`||`, etc.) — those still emit
+fixed-ISO-style TIMESTAMP / hardcoded-Postgres-MDY DATE text regardless of
+`SET datestyle`, now diverging from the CAST/SELECT/COPY paths on the
+DateStyle-style axis. TIMESTAMPTZ's missing timezone-aware conversion/offset
+and `pgoutput.go`'s gap remain open, as recorded in the prior follow-ups.
+
+Gates: `go build ./...` clean; `go vet ./...` clean; `go test
+./internal/executor/...` PASS (full package, no regressions);
+`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+bash scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 workloads).

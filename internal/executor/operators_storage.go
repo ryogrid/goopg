@@ -1919,11 +1919,11 @@ func (o *insertOp) Next() (TupleSlot, error) {
 			var cerr error
 			switch strings.ToLower(col.Type.Name) {
 			case "int2", "smallint", "smallserial", "serial2":
-				coerced, cerr = evalCast(row[i], "int2", o.plan.Pos())
+				coerced, cerr = evalCast(row[i], "int2", o.plan.Pos(), o.ctx)
 			case "int4", "integer", "int", "serial", "serial4":
-				coerced, cerr = evalCast(row[i], "int4", o.plan.Pos())
+				coerced, cerr = evalCast(row[i], "int4", o.plan.Pos(), o.ctx)
 			case "int8", "bigint", "bigserial", "serial8":
-				coerced, cerr = evalCast(row[i], "int8", o.plan.Pos())
+				coerced, cerr = evalCast(row[i], "int8", o.plan.Pos(), o.ctx)
 			default:
 				continue
 			}

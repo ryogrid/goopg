@@ -23,6 +23,7 @@ import (
 	"unsafe"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/config"
 	"github.com/goopg/goopg/internal/mctx"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
@@ -851,7 +852,7 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 		if castTargetType == "char" && x.Typmod > 0 {
 			castTargetType = "bpchar"
 		}
-		result, err := evalCastTyped(v, castTargetType, x.SourceType, x.Pos())
+		result, err := evalCastTyped(v, castTargetType, x.SourceType, x.Pos(), ctx)
 		if err != nil {
 			return Datum{}, err
 		}
@@ -3028,9 +3029,9 @@ func roundNumericToScale(d Datum, scale int16) Datum {
 	return d
 }
 
-func evalCastTyped(d Datum, targetType, sourceType string, pos int) (Datum, error) {
+func evalCastTyped(d Datum, targetType, sourceType string, pos int, ctx *Context) (Datum, error) {
 	if sourceType == "" {
-		return evalCast(d, targetType, pos)
+		return evalCast(d, targetType, pos, ctx)
 	}
 	// For float8/float4 → integer casts, override the default (away-from-zero)
 	// rounding inside evalCast to use banker's rounding instead.
@@ -3071,14 +3072,51 @@ func evalCastTyped(d Datum, targetType, sourceType string, pos int) (Datum, erro
 			return Datum{Kind: KindInt, Int: n}, nil
 		}
 	}
-	return evalCast(d, targetType, pos)
+	return evalCast(d, targetType, pos, ctx)
+}
+
+// dateStyleFromCtx resolves the session's DateStyle GUC (style, order) via
+// ctx.GetSetting, defaulting to ISO/MDY (PostgreSQL's boot default) when ctx
+// is nil, has no GetSetting wired, or the GUC is unset. Mirrors the same
+// resolution dispatch.go's appendTypedCellText performs for SELECT output, so
+// CAST-to-text agrees with the SELECT-output path (pattern_sibling_paths_must_agree).
+func dateStyleFromCtx(ctx *Context) (style, order string) {
+	style, order = "ISO", "MDY"
+	if ctx != nil && ctx.GetSetting != nil {
+		if v, ok := ctx.GetSetting("datestyle"); ok {
+			style, order = config.ParseDateStyleValue(v)
+		}
+	}
+	return style, order
+}
+
+// formatTimeDatumForCast renders a non-time-only KindTime datum for a CAST to
+// text/varchar/bpchar/char, honoring the session DateStyle GUC. Mirrors
+// Datum.Format()'s ±infinity and flagDate branching, but dispatches DATE vs
+// TIMESTAMP/TIMESTAMPTZ through config.FormatDate/FormatTimestamp instead of
+// Format()'s hardcoded Postgres-MDY-only / fixed-ISO layouts, so `x::text`
+// agrees with SELECT/COPY output on the DateStyle GUC axis.
+func formatTimeDatumForCast(d Datum, style, order string) string {
+	if d.Int == math.MaxInt64 {
+		return "infinity"
+	}
+	if d.Int == math.MinInt64 {
+		return "-infinity"
+	}
+	if d.Flags&flagDate != 0 {
+		return config.FormatDate(d.TimeValue(), style, order)
+	}
+	return config.FormatTimestamp(d.TimeValue(), style, order)
 }
 
 // evalCast coerces datum d to the declared SQL type name.
 // Handles: string→bool, bool→text, int→text, int→int2 (range check),
 // string→int2/4/8 (via parseIntegerInput). Pass-through for unknown types.
-// M0097-0003.
-func evalCast(d Datum, targetType string, pos int) (Datum, error) {
+// ctx supplies session-GUC reachability (currently: DateStyle for
+// timestamp/date → text casts); pass nil where no session context is
+// available (behavior falls back to ISO/MDY, matching the pre-existing
+// hardcoded default). M0097-0003.
+func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) {
 	if d.IsNull() {
 		return NullDatum, nil
 	}
@@ -3251,7 +3289,8 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 			if isTimeOnlyValue(d.TimeValue()) {
 				return NewStringDatum(string(appendTimeOnlyValueText(nil, d.TimeValue()))), nil
 			}
-			return NewStringDatum(d.Format()), nil
+			style, order := dateStyleFromCtx(ctx)
+			return NewStringDatum(formatTimeDatumForCast(d, style, order)), nil
 		case KindEnum:
 			// Cast enum to text: return the label string (loses sort order). M0097-enum.
 			return NewStringDatum(string(d.Buf)), nil
@@ -11290,7 +11329,7 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			if v.IsNull() {
 				return NullDatum, nil
 			}
-			return evalCast(v, typeName, x.Pos())
+			return evalCast(v, typeName, x.Pos(), ctx)
 		}
 	}
 
