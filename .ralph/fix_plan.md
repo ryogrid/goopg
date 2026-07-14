@@ -3347,6 +3347,62 @@ survey the deferral ledger for a fresh open (`status = -`) row.
       (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
       bash scripts/ralph-precommit-test.sh` PASS (0 failed, all 3
       workloads).
+- [x] **M-NIGHTLY (run 20260714-011651 follow-up) — fixed the regress-harness
+      `PGDATESTYLE`/`PGTZ`/`PGOPTIONS` env-var gap (the prior loop's option
+      (a)), and along the way found + fixed the real underlying product bug
+      it depended on.** Added the 3 env vars to
+      `ClusterRegressExecutor.psqlEnv()` (`internal/testport/
+      regress_suite_test.go`), matching real `pg_regress`
+      (`postgres/src/test/regress/pg_regress.c:783-800`:
+      `PGTZ=America/Los_Angeles`, `PGDATESTYLE=Postgres, MDY`,
+      `PGOPTIONS=-c intervalstyle=postgres_verbose`). Verifying this actually
+      took effect surfaced a much larger gap: goopg's `handleStartup`
+      (`internal/server/server.go`) only ever consumed `user`/`database`/
+      `application_name`/`replication` from the StartupMessage parameter bag
+      and silently dropped every other key — including `datestyle`/
+      `timezone` (which libpq's `fe-connect.c` `EnvironmentOptions` table
+      folds `PGDATESTYLE`/`PGTZ` into) and `options` (`PGOPTIONS`'s `-c
+      name=value` tokens). Real PostgreSQL's `ProcessStartupPacket`
+      (`backend_startup.c` ~770-790) treats every non-special startup key as
+      a generic GUC name=value pair and separately parses `options`'s `-c`
+      tokens the same way — so goopg was not a protocol gap specific to the
+      test harness, it affects EVERY real client that relies on
+      `PGDATESTYLE`/`PGTZ`/`PGOPTIONS` env vars or an `options=` libpq
+      connstring parameter (a standard, common client-side mechanism, not
+      pg_regress-specific). Fixed by applying every non-special startup key
+      via `sess.Set` and adding a `parsePGOptions` helper to parse `options`'s
+      `-c name=value` tokens, both in `internal/server/server.go`
+      immediately after the existing application_name/session_authorization/
+      is_superuser echo block. New test
+      `TestStartupPacketAppliesGenericGUCs` (`internal/server/
+      server_test.go`) sends `datestyle`/`timezone`/`options` in the startup
+      packet and asserts the `DateStyle`/`TimeZone`/`IntervalStyle`
+      ParameterStatus values reflect them. **Verified no regression:**
+      re-ran all 41 suites currently marked `pass` in
+      `docs/test-port/regress-diff-baseline.csv` individually (fresh cluster
+      each, matching the prior loop's isolation methodology) — all 41 still
+      PASS after the env-var + startup-GUC fix (a real risk since PGTZ now
+      changes the session's actual TimeZone from the boot default). Spot-
+      checked `guc` via `GOOPG_REGRESS_DIFF_DIR`: the previously-first-line
+      `SHOW datestyle` mismatch (`ISO, MDY` vs PG's `Postgres, MDY` default)
+      is now gone, confirming the fix reaches the session's actual GUC
+      state; `guc` still does not flip to `pass` overall — the suite's
+      remaining diffs are the already-known, separately-scoped DateStyle
+      multi-format timestamp output gap (goopg always emits ISO-style
+      regardless of the DateStyle GUC's style word) and `SET datestyle`'s
+      partial-value-merge semantics (`SET datestyle='SQL'` should preserve
+      the existing MDY/DMY/YMD order component; goopg's `SHOW datestyle`
+      drops it, e.g. `SQL, YMD` → bare `SQL`) — both already tracked in the
+      2026-07-14 "corrected quick suite classification" ledger row, not
+      fixed here. Deferral-ledger row appended (resolved fix + open
+      resume). Gates: `go build ./...` clean; `go vet` clean
+      (`internal/server`, `internal/testport`); `go test
+      ./internal/server/...` PASS (full package, incl. new test); `go test
+      ./internal/config/...` PASS; 41/41 individually-rerun `pass`-baseline
+      regress suites PASS (no regression); `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+      bash scripts/ralph-precommit-test.sh` PASS (0 failed, all 3
+      workloads).
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 

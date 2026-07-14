@@ -148,6 +148,67 @@ func TestStartupHandshake(t *testing.T) {
 	}
 }
 
+// TestStartupPacketAppliesGenericGUCs covers the ProcessStartupPacket
+// contract (postgres/src/backend/tcop/backend_startup.c ~line 770-790):
+// any startup-packet key besides user/database/application_name/replication
+// is a generic GUC name=value pair, and the "options" key holds
+// PGOPTIONS-style `-c name=value` tokens applied the same way. This is the
+// actual wire-level mechanism libpq uses for PGDATESTYLE/PGTZ (folded to
+// plain "datestyle"/"timezone" keys by fe-connect.c's EnvironmentOptions
+// table) and PGOPTIONS/`options=` connstrings. Before this test's fix,
+// goopg's handleStartup only echoed application_name/session_authorization/
+// is_superuser and silently dropped every other startup-packet key.
+func TestStartupPacketAppliesGenericGUCs(t *testing.T) {
+	addr, stop := startTestServer(t)
+	defer stop()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+
+	writeStartupPacket(t, conn, map[string]string{
+		"user":      "postgres",
+		"database":  "postgres",
+		"datestyle": "Postgres, MDY",
+		"timezone":  "America/Los_Angeles",
+		"options":   "-c intervalstyle=postgres_verbose",
+	})
+
+	r := protocol.NewFrameReader(conn)
+	f, err := r.ReadFrame()
+	if err != nil || f.Type != protocol.MsgAuthentication {
+		t.Fatalf("read AuthenticationOk: frame=%v err=%v", f, err)
+	}
+
+	wantVals := map[string]string{
+		"DateStyle":     "Postgres, MDY",
+		"TimeZone":      "America/Los_Angeles",
+		"IntervalStyle": "postgres_verbose",
+	}
+	seen := map[string]string{}
+	for {
+		f, err = r.ReadFrame()
+		if err != nil {
+			t.Fatalf("read ParameterStatus: %v", err)
+		}
+		if f.Type != protocol.MsgParameterStatus {
+			break
+		}
+		key, val := splitParamStatus(t, f.Payload)
+		if _, ok := wantVals[key]; ok {
+			seen[key] = val
+		}
+	}
+	for key, want := range wantVals {
+		if got := seen[key]; got != want {
+			t.Errorf("ParameterStatus[%q] = %q, want %q", key, got, want)
+		}
+	}
+}
+
 // TestSSLRequestRejectedThenStartup verifies the SSLRequest -> 'N' -> resend
 // startup flow. libpq does this by default unless sslmode=disable.
 func TestSSLRequestRejectedThenStartup(t *testing.T) {
