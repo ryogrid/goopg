@@ -2885,7 +2885,12 @@ func evalRaiseMsg(rawMsg string, frame *plpgsqlFrame, ctx *Context) string {
 			}
 			argVals = append(argVals, RegtypeName(cat, uint32(val.Int), !regObjectSchemaVisible(ctx, "public")))
 		} else {
-			argVals = append(argVals, val.Format())
+			// DATE/TIMESTAMP/TIMESTAMPTZ args must render per the session's
+			// datestyle GUC (M-NIGHTLY DateStyle follow-up), matching every
+			// other already-fixed output path (ANALYZE MCV/histogram, CAST,
+			// array_agg/string_agg). formatDatumDateStyle falls back to
+			// Format() for every other Kind.
+			argVals = append(argVals, formatDatumDateStyle(val, ctx))
 		}
 	}
 

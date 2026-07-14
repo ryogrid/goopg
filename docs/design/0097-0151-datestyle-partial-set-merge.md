@@ -829,3 +829,95 @@ query-time-rendering gap noted above; plpgsql `RAISE`/string-building in
 TIMESTAMPTZ's missing session-timezone-aware conversion/offset;
 `pgoutput.go`'s DateStyle-plumbing gap — all remain open, unchanged from the
 prior rows' scope notes.
+
+## Follow-up (2026-07-15): plpgsql `RAISE` %-argument DateStyle-awareness
+
+Picked up the `plpgsql_runtime.go` `RAISE`/string-building resume point named
+by the row above. `evalRaiseMsg` evaluates each `%`-format argument in a
+`RAISE`/`RAISE EXCEPTION ... '%', arg` statement and previously rendered every
+non-regtype argument via `val.Format()` directly — hardcoding ISO/Postgres-MDY
+for a DATE/TIMESTAMP/TIMESTAMPTZ argument regardless of the session's `SET
+datestyle`, the same bug class as every prior row in this document.
+
+### Fix
+
+`evalRaiseMsg` already carries a live `ctx *Context` parameter (it can only be
+reached from an executing PL/pgSQL statement, which always has a session
+context), so the fix is the same one-line swap as every prior slice: the
+`else` branch's `argVals = append(argVals, val.Format())` became `argVals =
+append(argVals, formatDatumDateStyle(val, ctx))`. No signature changes were
+needed anywhere in the call chain.
+
+### Sibling sites audited and left unchanged (different bug family)
+
+`plpgsql_runtime.go` has two other `.Format()`-family call sites that build
+SQL literal text for **dynamic-SQL re-parsing**, not for display:
+`datumToSQLLiteral` (used by `substituteTriggerRefs` and
+`substitutePlpgsqlFrameVarsInSQL` to splice a plpgsql variable's value into an
+`EXECUTE`d SQL string) and `plpgsqlFormatDynArg` (used for `EXECUTE ... USING`
+placeholder substitution). For these, ISO-format output is actually the
+*safer* choice — the resulting literal gets re-parsed by the same session,
+and ISO date/timestamp literals parse unambiguously regardless of the
+session's `DateStyle` *input* order, whereas emitting e.g. `05.01.2026`
+un-quoted-and-untyped into a substituted SQL string would be genuinely
+ambiguous. These are intentionally left on `Format()`.
+
+### New sibling bug discovered (deferred, not fixed this slice)
+
+While writing the regression test, a `declare d date := '2026-01-05';`
+default rendered as `05.01.2026 00:00:00` — a spurious time-of-day tail —
+instead of a bare date. Root cause: `coerceDatumToType`'s `isTimeTypeName`
+branch (`plpgsql_runtime.go`) coerces a string literal for *any* time-family
+declared type (`date`, `timestamp`, `timestamptz`) through a single
+`tryParseStringAs(KindTime, v.StringValue())` call, which always mints a
+full timestamp-shaped `Datum` with no `flagDate` set — the same
+`NewDateDatum`-vs-`NewTimeDatum` bug class the `evalCast` "date" case had
+before the 2026-07-15 FK-DETAIL follow-up fixed it (see the "INSERT-side
+literal coercion" section above), except `coerceDatumToType` was never
+audited/fixed alongside it. This only affects declare/assign-from-string-literal
+for a `date`-typed plpgsql variable; a value read from a real DATE column via
+`SELECT ... INTO` is unaffected, since `bindSelectIntoRow`/
+`bindRecordRowComposite` copy the already-correctly-typed storage `Datum`
+straight into the frame without going through this coercion path — which is
+exactly how this slice's regression tests source their DATE value, sidestepping
+the sibling bug rather than depending on it. Recorded in the deferral ledger
+with a resume point (branch on `tn == "date"` in `coerceDatumToType` and use a
+date-only parse, mirroring the earlier `evalCast` fix).
+
+### Also discovered, not fixed (same architecture gap as ANALYZE's binary-storage note above)
+
+plpgsql's composite/record and array variables all store their runtime value
+as a **pre-rendered `Format()` string** with no later re-render hook — the
+same "bake the DateStyle rendering in at write time" architecture gap already
+noted for `pg_stats`/ANALYZE above, just for a different piece of state:
+`rowToCompositeText` (trigger OLD/NEW composite text), `bindRecordRowComposite`
+(a `record`-typed `SELECT INTO` target's composite string), `updateCompositeField`
+(`rec.field := value` composite-field assignment), and the `ArrayAssignStmt`
+case's `elems[sub-1] = newVal.Format()` (`x[idx] := value` array-element
+assignment) are all instances of this. None were touched this slice — each
+would need the same typed-storage-plus-re-render redesign the ANALYZE note
+called for, which is a materially larger unit of work than a single-call-site
+swap.
+
+### Verification (2026-07-15 RAISE follow-up)
+
+New tests `internal/executor/plpgsql_raise_datestyle_test.go`:
+`TestRaiseMsgHonorsDateStyle` (a plpgsql function selects a DATE column into a
+variable via `SELECT ... INTO`, then `RAISE EXCEPTION` with it as a `%`
+argument under `German, DMY`; asserts the `ExecError.Message` renders
+`dd.mm.yyyy`) and `TestRaiseMsgDefaultsISOWithNoDateStyleGUC` (same shape, no
+`datestyle` GUC reachable → ISO default unchanged). Confirmed non-vacuous via
+`git stash` on just `plpgsql_runtime.go`'s change: the pre-fix message reads
+`bad date: 01-05-2026` — neither the requested German rendering nor even the
+ISO default, since `Format()`'s hardcoded layout is Postgres-MDY
+(`mm-dd-yyyy`), not ISO.
+
+Gates: `go build ./...`/`go vet ./...` clean (repo-wide); `go test -count=1
+./internal/executor/...` PASS (full package, no regressions);
+`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33).
+
+**Still open** (deferral-ledger row appended): the `coerceDatumToType`
+date-vs-timestamp sibling bug and the composite/array bake-in family noted
+above; EXPLAIN and other error-message formatting sites; TIMESTAMPTZ's
+missing session-timezone-aware conversion/offset; `pgoutput.go`'s
+DateStyle-plumbing gap — all remain open.

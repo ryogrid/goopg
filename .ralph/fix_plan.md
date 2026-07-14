@@ -3747,6 +3747,38 @@ survey the deferral ledger for a fresh open (`status = -`) row.
       package, no regressions); `scripts/tpch-spotcheck.sh` PASS
       (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke bash
       scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 workloads).
+  - [x] **M-NIGHTLY (run 20260714-011651 follow-up) — plpgsql `RAISE`
+      %-argument DateStyle-awareness fixed.** Resume point from the ANALYZE
+      fix above. `evalRaiseMsg` (`plpgsql_runtime.go`) called `val.Format()`
+      directly on each evaluated `%`-argument; swapped for
+      `formatDatumDateStyle(val, ctx)` (`ctx` was already a parameter, no
+      signature changes needed). Audited the file's other 2 `.Format()`
+      sites (`datumToSQLLiteral`, `plpgsqlFormatDynArg`) and confirmed they
+      build SQL-literal text for dynamic-SQL re-parsing (`EXECUTE`/
+      trigger-ref substitution) where ISO is the safer unambiguous choice,
+      not a display bug — left unchanged. New tests
+      `internal/executor/plpgsql_raise_datestyle_test.go`
+      (`TestRaiseMsgHonorsDateStyle`, `TestRaiseMsgDefaultsISOWithNoDateStyleGUC`);
+      both source the DATE value via `SELECT ... INTO` from a real table
+      column to sidestep a sibling bug found while writing the test (see
+      below). Confirmed non-vacuous via `git stash` on `plpgsql_runtime.go`
+      alone (pre-fix message: `bad date: 01-05-2026`, Format()'s hardcoded
+      Postgres-MDY layout, not even ISO). Design doc
+      `docs/design/0097-0151-datestyle-partial-set-merge.md` "Follow-up
+      (2026-07-15): plpgsql RAISE %-argument DateStyle-awareness" + README
+      index updated. Deferral ledger row appended (open — 2 new discovered
+      gaps: `coerceDatumToType`'s `isTimeTypeName` branch mints a
+      timestamp-shaped, no-`flagDate` `Datum` for a string-literal
+      `date`-typed declare/assign, the same bug class `evalCast`'s "date"
+      case had before its earlier fix, never ported to this sibling; and
+      plpgsql composite/record/array variables — `rowToCompositeText`,
+      `bindRecordRowComposite`, `updateCompositeField`, `ArrayAssignStmt`'s
+      array-element assignment — all bake a pre-rendered `Format()` string
+      into the variable with no re-render hook, same architecture gap as
+      ANALYZE's binary-storage note. EXPLAIN still unaudited). Gates:
+      `go build ./...`/`go vet ./...` clean (repo-wide); `go test -count=1
+      ./internal/executor/...` PASS (full package, no regressions);
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33).
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 
