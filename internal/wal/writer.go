@@ -15,6 +15,8 @@ import (
 
 	"github.com/goopg/goopg/internal/gls"
 	"github.com/goopg/goopg/internal/stats"
+
+	"github.com/goopg/goopg/internal/storage"
 )
 
 // flushErr wraps a flush error for atomic publication in Writer.stickyErr.
@@ -26,8 +28,11 @@ const (
 )
 
 var (
-	ErrClosed        = errors.New("wal: writer closed")
-	ErrLSNNotWritten = errors.New("wal: requested LSN is beyond written WAL")
+	ErrClosed = errors.New("wal: writer closed")
+	// ErrLSNNotWritten aliases storage.ErrWALAccountingLag so the buffer
+	// pool's flush paths can errors.Is-match it without importing wal
+	// (C3-S3 hint-barrier fix); same identity, same message.
+	ErrLSNNotWritten = storage.ErrWALAccountingLag
 	// ErrEmptyPayload guards the EOS sentinel: a zero
 	// (len=0, crc=0) header is reserved as "no record here yet"
 	// in preallocated segments. See

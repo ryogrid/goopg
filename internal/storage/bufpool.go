@@ -10,6 +10,8 @@ import (
 
 	"github.com/goopg/goopg/internal/runtimeshim"
 	"github.com/goopg/goopg/internal/stats"
+	"runtime"
+	"time"
 )
 
 // Slot state bit layout (single 64-bit atomic word):
@@ -794,6 +796,33 @@ func (p *Pool) LogHeapLock() LogHeapLockFunc { return p.logHeapLock }
 
 // LogHeapVacuum returns the configured heap-vacuum change-record hook.
 func (p *Pool) LogHeapVacuum() LogHeapVacuumFunc { return p.logHeapVacuum }
+
+// ErrWALAccountingLag is the storage-visible identity of the WAL writer's
+// "requested LSN is beyond written WAL" sentinel (wal.ErrLSNNotWritten
+// aliases it — wal imports storage, not vice versa). It signals a
+// TRANSIENT position-accounting lag (an Append has returned but the
+// writer's written-position mirror has not caught up, M0099 Path A) — a
+// hint flush barrier captured from the WrittenLSN frontier can race it.
+// Flush paths RETRY on it; treating it as fatal aborted eviction victims
+// under scale-500 buffer pressure (C3-S3 hint-barrier regression).
+var ErrWALAccountingLag = errors.New("wal: requested LSN is beyond written WAL")
+
+// flushWALWithRetry drives p.wal.FlushUpTo(lsn), retrying the transient
+// accounting-lag sentinel (bounded spin then micro-sleeps, mirroring the
+// sync-commit path's loop in initdb.Open). Any other error is returned.
+func (p *Pool) flushWALWithRetry(lsn uint64) error {
+	for attempt := 0; ; attempt++ {
+		err := p.wal.FlushUpTo(lsn)
+		if err == nil || !errors.Is(err, ErrWALAccountingLag) {
+			return err
+		}
+		if attempt < 100 {
+			runtime.Gosched()
+		} else {
+			time.Sleep(200 * time.Microsecond)
+		}
+	}
+}
 
 // HasWALFrontier reports whether the hint flush-barrier source is wired
 // (see hintFlushBarrier) — a precondition for LP_DEAD marking.
@@ -2284,7 +2313,7 @@ func (p *Pool) flushBatch(slots []*Slot, tags []BufferTag) error {
 		flushTo = b // hint marks' premises must be durable first
 	}
 	if p.wal != nil && flushTo != 0 {
-		if err := p.wal.FlushUpTo(flushTo); err != nil {
+		if err := p.flushWALWithRetry(flushTo); err != nil {
 			return fmt.Errorf("flush wal up to %d: %w", flushTo, err)
 		}
 	}
@@ -2357,7 +2386,7 @@ func (p *Pool) flushSlot(tag BufferTag, page Page) error {
 			flushTo = b // hint marks' premises must be durable first
 		}
 		if flushTo != 0 {
-			if err := p.wal.FlushUpTo(flushTo); err != nil {
+			if err := p.flushWALWithRetry(flushTo); err != nil {
 				return fmt.Errorf("flush wal up to %d: %w", flushTo, err)
 			}
 		}
