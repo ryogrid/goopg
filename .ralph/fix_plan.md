@@ -3931,25 +3931,48 @@ survey the deferral ledger for a fresh open (`status = -`) row.
       (0 failed, all 3 workloads, via the pre-commit hook). Design doc
       `docs/design/root-0027-nightly-classifier-per-package-resource-kill.md`
       + README index.
-- [ ] **M-NIGHTLY `race/internal/access/btree`** — race suite failed in
-      package `github.com/goopg/goopg/internal/access/btree` (AI-20260715-
-      010036-004 post-reclassification; never previously surfaced — see the
-      row above). repro: `go test -race -timeout 15m
-      ./internal/access/btree/`; evidence: `ci/logs/20260715-010036/race/
-      go-test.log` (block starts ~line 404, ~3239s elapsed, no `signal:
-      killed` in its own block — an ambiguous SIGQUIT-timeout signature, not a
-      confirmed pure resource-kill; genuinely worth investigating given this
-      package's history of real concurrency bugs, e.g. the M0110-0007 split
-      prev-link bug). Not investigated this loop (time-boxed after the
-      classifier fix); resume by re-running standalone + under the same
-      concurrent-load repro technique used for the row above.
-- [ ] **M-NIGHTLY `race/internal/amcheck`** — race suite failed in package
-      `github.com/goopg/goopg/internal/amcheck` (AI-20260715-010036-005
-      post-reclassification; never previously surfaced — see the row above).
-      repro: `go test -race -timeout 15m ./internal/amcheck/`; evidence:
-      `ci/logs/20260715-010036/race/go-test.log` (block starts ~line 2676,
-      ~3237s elapsed, no `signal: killed` in its own block — same ambiguous
-      signature as the row above). Not investigated this loop.
+- [x] **M-NIGHTLY `race/internal/access/btree` + `race/internal/amcheck` —
+      root-caused and fixed (both AI-20260715-010036-004/-005).** Both pass
+      standalone (`btree` 23s, `amcheck` 148s) but reliably reproduced their
+      nightly `-timeout` SIGQUIT under the exact nightly cgroup config
+      (`GOOPG_MEM_HIGH=6G MEM_MAX=8G MEM_SWAP_MAX=0 GOMEMLIMIT=5GiB
+      GOFLAGS=-p=4`, `scripts/goopg-test-run.sh`) — both hung inside
+      `internal/amcheck`'s `TestVerifyBtreeEngineSilentOnRealConcurrentContended`
+      (200K inserts/64 writers/64-slot pool), never completing even with a
+      25-minute per-test timeout. Root cause: this test's
+      `buildRealTreeConcurrent` helper
+      (`internal/amcheck/verify_nbtree_realtree_test.go`) still had all 6 of
+      the (long-RESOLVED) M-NIGHTLY AI-20260708-064334-001 investigation's
+      temporary debug-tracing flags permanently enabled
+      (`DebugTraceInserts`/`DebugVerifyFastPathInserts`/`DebugTraceFlushes`/
+      `DebugTraceReloads`/`DebugTraceContentMu`/`DebugTraceBufmap`, plus
+      `pool.DebugValidateCleanEvictions`/`DebugTraceSlotEvents`) — each
+      funnels every pin/unpin/insert of 64 concurrently racing goroutines
+      through shared mutex-guarded logs (full page decodes + serialized
+      map/slice appends), harmless standalone but, combined with `-race`
+      overhead and the nightly's memory/CPU-contended 4-package co-load,
+      serialized this stress test so badly it blew past any reasonable
+      per-package timeout. `internal/access/btree`'s own hang was pure
+      collateral CPU starvation from sharing the box with amcheck's runaway
+      test. Fix: removed all 8 flags/hooks from `buildRealTreeConcurrent`
+      plus the now-permanently-inert `bt.FastPathViolations()`
+      diagnostic-log block. Standalone: the test itself 172.65s→7.05s (24x),
+      full `internal/amcheck` package 148s→11.4s (13x). Re-verified under the
+      exact nightly cgroup config that originally reproduced the hang: both
+      packages now PASS cleanly (`btree` 23.8s, `amcheck` 11.8s). Gates: `go
+      build ./...`/`go vet` clean; `go test`
+      (plain + `-race`) PASS for both packages; `scripts/tpch-spotcheck.sh`
+      PASS (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke bash
+      scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 workloads).
+      Design doc
+      `docs/design/root-0028-amcheck-realtree-stress-debug-instrumentation-cleanup.md`
+      + README index. Deferral ledger row added (the now-unused
+      `Debug*`/`Record*` machinery in `btree.go`/`bufpool.go` was left in
+      place, zero-cost when unset, matching the codebase's existing pattern
+      for resolved investigations — a broader dead-code removal is optional
+      follow-up, not required). `internal/initdb`/`internal/mvcc`'s
+      still-open ambiguous-SIGQUIT `units`-lane items remain open, see the
+      row above.
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 

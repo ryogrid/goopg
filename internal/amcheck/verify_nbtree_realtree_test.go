@@ -333,12 +333,23 @@ func buildRealTreeConcurrent(t *testing.T, n, writers, poolSlots int, keyRange i
 	if err != nil {
 		t.Fatalf("NewPool: %v", err)
 	}
-	// M-NIGHTLY investigation aid (AI-20260708-064334-001): catch a
-	// "clean" eviction that's about to discard unflushed content
-	// red-handed, with byte-level detail, instead of only detecting the
-	// resulting loss after the fact via the leaf-entry diff below.
-	pool.DebugValidateCleanEvictions = true
-	pool.DebugTraceSlotEvents = true
+	// The M-NIGHTLY AI-20260708-064334-001 investigation that motivated
+	// this harness's original battery of Debug*/On* hooks (insert/fast-path/
+	// flush/reload/contentMu/bufmap tracing) is RESOLVED — root cause was
+	// storage.bufmap.Insert stopping at the first tombstone instead of
+	// scanning to a true-empty terminator (see storage/bufmap.go's Insert
+	// doc comment), with permanent regression coverage in
+	// TestBufmapInsertSkipsPastTombstoneToExistingKey
+	// (internal/storage/bufmap_test.go). Those hooks funneled every pin/
+	// unpin/insert of this test's 200K inserts across 64 writers through a
+	// handful of shared, mutex-guarded logs; left enabled after the
+	// investigation closed, they serialized this stress test so heavily
+	// under `-race` that it could exceed 30 minutes under nightly CI's
+	// memory/CPU-contended concurrent-package load (never a real product
+	// hang — see .ralph/deferral_ledger.md's 2026-07-15 row). Removed now
+	// that they no longer serve an open investigation; this harness's own
+	// amcheck-driven structural verification below remains the correctness
+	// gate.
 	rel := storage.RelFileNode{DBOid: 1, RelOid: 9200, Fork: storage.MainFork}
 	bt, err := btree.Create(pool, rel)
 	if err != nil {
@@ -346,54 +357,6 @@ func buildRealTreeConcurrent(t *testing.T, n, writers, poolSlots int, keyRange i
 		_ = mgr.Close()
 		t.Fatalf("btree.Create: %v", err)
 	}
-	// M-NIGHTLY investigation aid (AI-20260708-064334-001, 5th loop): record
-	// every insertItemSorted call (block+slot a key actually landed at) so a
-	// lost entry can be cross-referenced against its own write history, not
-	// just its absence from the final leaf walk.
-	bt.DebugTraceInserts = true
-	// M-NIGHTLY investigation aid (AI-20260708-064334-001, 7th loop): the
-	// 6th loop's RewriteLogEvent instrumentation proved the loss is NOT in
-	// the split/dedup-rewrite path -- some missing entries are touched
-	// only by plain fast-path insertItemSorted calls afterward. Verify
-	// every fast-path call's pre/post pageItems() survivor set directly.
-	bt.DebugVerifyFastPathInserts = true
-	// M-NIGHTLY investigation aid (AI-20260708-064334-001, 8th loop): the
-	// 7th loop isolated the loss window to an unpin/re-pin gap on the same
-	// block -- the only remaining not-yet-instrumented mechanism in that
-	// gap is a dirty-page flush (evictVictim's wasDirty branch ->
-	// flushSlot). Capture the exact bytes each flush writes to disk so
-	// they can be cross-referenced against the last known-good insert/
-	// rewrite/fast-path snapshot for the same block.
-	bt.DebugTraceFlushes = true
-	pool.OnFlushSnapshot = bt.RecordFlushSnapshot
-	// M-NIGHTLY investigation aid (AI-20260708-064334-001, 9th loop): the
-	// 8th loop proved the dirty-flush WRITE side always faithfully writes
-	// whatever bytes are in memory (18/18) -- the only remaining
-	// uninstrumented step in the eviction cycle is the READ side. Capture
-	// the exact bytes every disk reload serves so they can be
-	// cross-referenced against the immediately preceding flush snapshot
-	// for the same block.
-	bt.DebugTraceReloads = true
-	pool.OnBlockReload = bt.RecordReloadSnapshot
-	// M-NIGHTLY investigation aid (AI-20260708-064334-001, 11th loop): the
-	// 8th/9th loops proved the flush write side and reload read side both
-	// faithfully move whatever bytes exist, and the 10th loop's syscall-
-	// level IO trace cleared the entire storage/smgr layer -- the loss is
-	// a genuine in-memory content bug. Bracket every pinW/unpinW hold (the
-	// SOLE choke point every mutation passes through) with a before/after
-	// pageItems() snapshot to catch which specific hold silently drops an
-	// already-inserted entry.
-	bt.DebugTraceContentMu = true
-	// M-NIGHTLY investigation aid (AI-20260708-064334-001, 14th loop): 13
-	// prior loops of live instrumentation and hand-tracing never directly
-	// instrumented bufmap.Insert/Delete themselves -- every loop only
-	// inferred bufmap's single-owner correctness by reading the code. Log
-	// every mutation (in bufmap's own true lock order, see DebugTraceBufmap's
-	// doc comment) so a lost entry's block can be checked for two different
-	// slots simultaneously believing they own the same tag.
-	bt.DebugTraceBufmap = true
-	pool.OnBufmapInsert = bt.RecordBufmapInsert
-	pool.OnBufmapDelete = bt.RecordBufmapDelete
 
 	var wg sync.WaitGroup
 	var failed atomic.Bool
@@ -799,23 +762,6 @@ func TestVerifyBtreeEngineSilentOnRealConcurrentContended(t *testing.T) {
 		hit, read, dirtied, written, pool.DirtyVictimRate())
 	if got != n {
 		t.Fatalf("inserted %d, want %d", got, n)
-	}
-
-	// M-NIGHTLY investigation aid (AI-20260708-064334-001, 7th loop): any
-	// fast-path insertItemSorted call whose pre/post pageItems() survivor
-	// sets disagree is a direct, localized capture of the loss mechanism
-	// -- dump every one unconditionally before the leaf-entry diff below.
-	if violations := bt.FastPathViolations(); len(violations) > 0 {
-		t.Logf("FAST-PATH VIOLATIONS: %d recorded", len(violations))
-		for _, v := range violations {
-			t.Logf("  violation seq=%d blk=%d site=%s inserted=%s preCount=%d postCount=%d",
-				v.Seq, v.Block, v.Site, v.Inserted, v.PreCount, v.PostCount)
-			for _, m := range v.Missing {
-				t.Logf("    missing: %s", m)
-			}
-		}
-	} else {
-		t.Logf("FAST-PATH VIOLATIONS: none recorded (fast-path insertItemSorted calls all preserved pre-existing entries)")
 	}
 
 	// M-NIGHTLY investigation aid (AI-20260708-064334-001): diff the
