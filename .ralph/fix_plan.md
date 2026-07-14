@@ -3455,6 +3455,69 @@ survey the deferral ledger for a fresh open (`status = -`) row.
       PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
       `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh`
       PASS (0 failed, all 3 workloads).
+- [x] **M-NIGHTLY (run 20260714-011651 follow-up) — DATE-only DateStyle
+      output rendering + fixed a `COPY <date-column> TO` hard-error.** Picked
+      up the DateStyle output-rendering resume point from the item directly
+      above, scoped to DATE only (TIMESTAMP/TIMESTAMPTZ deferred — PG's
+      `Postgres` style needs day-of-week/month-name/year-reorder logic
+      `EncodeDateOnly` doesn't have, a separate larger unit of work). Added
+      exported `config.ParseDateStyleValue` (was package-private
+      `parseDateStyleValue`) and a new `config.FormatDate(t, style, order)`
+      helper (`internal/config/datestyle.go`) mirroring PostgreSQL's
+      `EncodeDateOnly` (`postgres/src/backend/utils/adt/datetime.c`): ISO
+      (any order) → `YYYY-MM-DD`; SQL → `MM/DD/YYYY` or `DD/MM/YYYY`;
+      Postgres → `MM-DD-YYYY` or `DD-MM-YYYY`; German → always `DD.MM.YYYY`.
+      **Two independent bugs fixed:** (1) `internal/server/dispatch.go`'s
+      `appendTypedCellText` — the live SELECT-output path shared by both the
+      simple- and extended-query protocols — had a `"date"` case hardcoded
+      to ISO regardless of the session's `datestyle` GUC, so `SET
+      datestyle='SQL'` (or Postgres/German) correctly updated `SHOW
+      datestyle` but had **zero effect on actual SELECT results**. Fixed by
+      calling the already-in-scope `getSetting("datestyle")` parameter (nil-
+      guarded, falls back to ISO/MDY) and rendering via the new
+      `config.FormatDate`. (2) `internal/executor/copy_text.go`'s
+      `datumToCopyText` had **no `"date"` case at all** — a `date`-typed
+      column fell through the type-name switch into the `default:` branch's
+      `d.Kind` switch (only handles String/Bytes/Int/Bool/Numeric, not
+      `KindTime`), so **`COPY <table> TO` (text or CSV format) hard-errored
+      outright on any table with a `date` column** — a more severe bug than
+      the DateStyle mismatch, discovered while tracing the 4 candidate
+      output call sites rather than anticipated by the original ledger row.
+      Fixed by adding the missing case, also DateStyle-aware.
+      `EncodeCopyTextRow`/`EncodeCopyCsvRow` (the latter shares
+      `datumToCopyText`) gained trailing `dateStyle, dateOrder string`
+      parameters; `RunCopyTo` (`internal/executor/copy.go`) resolves them
+      once via `ctx.GetSetting("datestyle")` (nil-guarded, falls back to
+      `"ISO","MDY"`). New tests: `internal/executor/copy_text_test.go`
+      `TestEncodeCopyTextRowDate` (4 styles × 2 orders through
+      `EncodeCopyTextRow`, previously unencoable — hard error);
+      `internal/server/date_output_test.go`
+      `TestAppendTypedCellTextDateHonorsDateStyle` (same matrix through
+      `appendTypedCellText`, plus a nil-`getSetting` fallback case). Live
+      end-to-end verification against a real `cmd/goopg` binary via `psql`
+      (isolated data dir/port, `tmp/dateverify-data` on 127.0.0.1:5533,
+      cleaned up after): `CREATE TABLE dtest(id int, d date)` +
+      `INSERT`/`NULL`; `SELECT d FROM dtest` under `SET
+      datestyle='SQL'`→`07/14/2026`, `'Postgres, DMY'`→`14-07-2026`,
+      `'German'`→`14.07.2026`; `COPY dtest TO STDOUT`
+      (text)/`WITH(FORMAT csv)` under `ISO` — previously an outright error —
+      now correctly emit `2026-07-14`/`\N` and `2026-07-14`/`` (empty CSV
+      NULL) respectively. Design doc follow-up appended to
+      `docs/design/0097-0151-datestyle-partial-set-merge.md` ("Follow-up
+      (2026-07-14)" section; README index row already pointed at this doc,
+      unchanged). Deferral-ledger row appended: TIMESTAMP/TIMESTAMPTZ
+      DateStyle output, `Datum.Format()`/`AppendValueText()`'s ~20-call-site
+      DateStyle-unawareness (CAST/to_char/plpgsql/EXPLAIN/error-message
+      paths — a live sibling-path divergence from the two fixes landed this
+      loop), and `pgoutput.go`'s DateStyle-plumbing gap + its independent
+      date-uses-timestamp-layout bug all remain open. Gates: `go build
+      ./...` clean; `go vet` clean (`internal/config`, `internal/executor`,
+      `internal/server`); `go test
+      ./internal/config/... ./internal/executor/... ./internal/server/...`
+      PASS (full packages, no regressions); `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+      bash scripts/ralph-precommit-test.sh` PASS (0 failed, all 3
+      workloads).
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 

@@ -113,3 +113,71 @@ transaction currently persists until the next `SET`/`RESET` in this session,
 whereas real PostgreSQL scopes it to only the current implicit
 single-statement transaction (visible in the same `guc` regress diff via
 `vacuum_cost_delay`, not touched by this change).
+
+## Follow-up (2026-07-14) — DATE output-rendering, scoped to DATE only
+
+Picked up the "still open" item above for the DATE type specifically (TIMESTAMP/
+TIMESTAMPTZ deferred — see the ledger row below; PostgreSQL's `Postgres` style
+adds day-of-week/month-name formatting for timestamps that DATE's
+`EncodeDateOnly` doesn't have, a separate, larger unit of work).
+
+**Two independent bugs found and fixed**, both surfaced while tracing the four
+call sites that render a DATE datum to text
+(`postgres/src/backend/utils/adt/datetime.c`'s `EncodeDateOnly` is the
+oracle):
+
+1. **`internal/server/dispatch.go`'s `appendTypedCellText`** (the live
+   `SELECT`-output path for both the simple- and extended-query protocols) had
+   a `"date"` case hardcoded to `"2006-01-02"` (ISO) — `SET datestyle = 'SQL'`
+   (or `Postgres`/`German`) correctly updated `SHOW datestyle` but had zero
+   effect on `SELECT` results. Fixed by parsing the case's already-available
+   `getSetting("datestyle")` value via the newly-exported
+   `config.ParseDateStyleValue` and rendering with a new
+   `config.FormatDate(t, style, order)` helper that mirrors `EncodeDateOnly`'s
+   `SQL`/`Postgres`/`German`/`ISO` × `MDY`/`DMY` matrix (German is always
+   `DD.MM.YYYY` regardless of order, matching upstream).
+2. **`internal/executor/copy_text.go`'s `datumToCopyText`** had no `"date"`
+   case at all — a bare `date`-typed column fell through the type-name switch
+   into the `default:` branch's `d.Kind` switch, which only handles
+   `String/Bytes/Int/Bool/Numeric`, not `KindTime` — so **`COPY <table> TO`
+   (text or CSV format) hard-errored on any table with a `date` column**, a
+   more severe bug than the DateStyle mismatch (found while tracing the
+   output call sites, not something the original ledger row anticipated).
+   Fixed by adding the missing case, also DateStyle-aware. Both
+   `EncodeCopyTextRow` and `EncodeCopyCsvRow` (the latter reuses
+   `datumToCopyText`) gained trailing `dateStyle, dateOrder string`
+   parameters; `RunCopyTo` (`internal/executor/copy.go`) resolves them once
+   from `ctx.GetSetting("datestyle")` (falling back to `"ISO", "MDY"` when
+   `GetSetting` is nil, e.g. a bare `NewContext()`).
+
+**Deliberately left untouched this loop** (see the deferral-ledger row):
+`internal/executor/datum.go`'s `Datum.Format()`/`AppendValueText()` (used by
+~20 call sites across `CAST`/`to_char`/`plpgsql`/EXPLAIN/error-message
+formatting, not just DATE columns — a much larger blast radius requiring
+either a new parameter threaded through every caller or a package-level
+"current session" accessor) and `internal/wal/pgoutput.go`'s logical-
+replication text encoding (has zero session/GUC access today; also has a
+second, independent bug where its `"date"` case reuses the full
+`"2006-01-02 15:04:05.000000"` timestamp layout instead of a date-only one).
+
+### Verification
+
+- New `internal/executor/copy_text_test.go` `TestEncodeCopyTextRowDate`: all
+  4 styles × both orders round-trip through `EncodeCopyTextRow` to PG's exact
+  text (previously this construction wasn't even encodable — hard error).
+- New `internal/server/date_output_test.go`
+  `TestAppendTypedCellTextDateHonorsDateStyle`: same style/order matrix
+  through `appendTypedCellText`, plus a nil-`getSetting` case confirming the
+  ISO/MDY boot-default fallback.
+- Live end-to-end against a real `cmd/goopg` binary via `psql`: `SELECT d FROM
+  dtest` after `SET datestyle='SQL'` → `07/14/2026`; `'Postgres, DMY'` →
+  `14-07-2026`; `'German'` → `14.07.2026`; `COPY dtest TO STDOUT` (text and
+  CSV) — previously an outright error — now emits `2026-07-14` /
+  `2026-07-14` correctly under `ISO`.
+- `go build ./...` clean; `go vet` clean on `internal/config`,
+  `internal/executor`, `internal/server`; `go test
+  ./internal/config/... ./internal/executor/... ./internal/server/...` all
+  PASS (full packages, no regressions).
+- `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33).
+- `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh` PASS (0
+  failed, all 3 pgbench workloads).

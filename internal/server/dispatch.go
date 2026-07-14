@@ -2938,9 +2938,19 @@ func (s *Server) appendTypedCellText(dst []byte, d executor.Datum, typ catalog.T
 		// (codec.go), so just emit the stored value without re-padding.
 		return d.AppendValueText(dst)
 	case "date":
-		// Date columns display as YYYY-MM-DD. M0097-0004.
+		// Date columns render per the session's DateStyle GUC (style x
+		// order), matching PostgreSQL's date_out/EncodeDateOnly. Previously
+		// hardcoded ISO regardless of `SET datestyle`. M0097-0004,
+		// M-NIGHTLY (run 20260714-011651) DateStyle output-rendering
+		// follow-up.
 		if d.Kind == executor.KindTime {
-			return d.TimeValue().AppendFormat(dst, "2006-01-02")
+			style, order := "ISO", "MDY"
+			if getSetting != nil {
+				if v, ok := getSetting("datestyle"); ok {
+					style, order = config.ParseDateStyleValue(v)
+				}
+			}
+			return append(dst, config.FormatDate(d.TimeValue(), style, order)...)
 		}
 		return d.AppendValueText(dst)
 	case "time":

@@ -28,7 +28,7 @@ func TestEncodeCopyTextRowPgbenchShape(t *testing.T) {
 		{Kind: KindInt, Int: 0},
 		NewStringDatum(""),
 	}
-	got, err := EncodeCopyTextRow(nil, row, cols)
+	got, err := EncodeCopyTextRow(nil, row, cols, "ISO", "MDY")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -44,7 +44,7 @@ func TestEncodeCopyTextRowPgbenchShape(t *testing.T) {
 func TestEncodeCopyTextRowEscaping(t *testing.T) {
 	cols := []catalog.Column{{Name: "s", Type: catalog.Type{Name: "text"}}}
 	row := Row{NewStringDatum("a\\b\nc\rd\te")}
-	got, err := EncodeCopyTextRow(nil, row, cols)
+	got, err := EncodeCopyTextRow(nil, row, cols, "ISO", "MDY")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,12 +62,45 @@ func TestEncodeCopyTextRowNullSentinel(t *testing.T) {
 		{Name: "b", Type: catalog.Type{Name: "text"}},
 	}
 	row := Row{NullDatum, NewStringDatum("x")}
-	got, err := EncodeCopyTextRow(nil, row, cols)
+	got, err := EncodeCopyTextRow(nil, row, cols, "ISO", "MDY")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if string(got) != "\\N\tx\n" {
 		t.Errorf("got %q, want %q", got, "\\N\tx\n")
+	}
+}
+
+// TestEncodeCopyTextRowDate covers the DATE column gap where
+// datumToCopyText had no "date" case at all: it fell through to the
+// KindTime gap in the default branch and hard-errored `COPY <table> TO`
+// for any table with a date column. Also verifies DATE output honors
+// the caller's DateStyle (style, order) pair, matching PostgreSQL's
+// date_out.
+func TestEncodeCopyTextRowDate(t *testing.T) {
+	cols := []catalog.Column{{Name: "d", Type: catalog.Type{Name: "date"}}}
+	day := time.Date(2026, time.July, 14, 0, 0, 0, 0, time.UTC)
+	row := Row{NewDateDatum(day)}
+
+	cases := []struct {
+		style, order, want string
+	}{
+		{"ISO", "MDY", "2026-07-14\n"},
+		{"ISO", "DMY", "2026-07-14\n"},
+		{"SQL", "MDY", "07/14/2026\n"},
+		{"SQL", "DMY", "14/07/2026\n"},
+		{"Postgres", "MDY", "07-14-2026\n"},
+		{"Postgres", "DMY", "14-07-2026\n"},
+		{"German", "DMY", "14.07.2026\n"},
+	}
+	for _, tc := range cases {
+		got, err := EncodeCopyTextRow(nil, row, cols, tc.style, tc.order)
+		if err != nil {
+			t.Fatalf("style=%s order=%s: %v", tc.style, tc.order, err)
+		}
+		if string(got) != tc.want {
+			t.Errorf("style=%s order=%s: got %q, want %q", tc.style, tc.order, got, tc.want)
+		}
 	}
 }
 
@@ -169,7 +202,7 @@ func TestRoundTripBoolAndTimestamp(t *testing.T) {
 		NewBoolDatum(true),
 		NewTimeDatum(now),
 	}
-	enc, err := EncodeCopyTextRow(nil, row, cols)
+	enc, err := EncodeCopyTextRow(nil, row, cols, "ISO", "MDY")
 	if err != nil {
 		t.Fatal(err)
 	}

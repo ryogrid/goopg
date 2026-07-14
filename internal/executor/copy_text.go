@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/config"
 )
 
 // COPY TEXT format (the default for `COPY ... TO/FROM STDOUT/STDIN`):
@@ -24,8 +25,11 @@ import (
 // emits one row per CopyData frame.
 
 // EncodeCopyTextRow appends one COPY-text-formatted row to dst,
-// including the trailing newline.
-func EncodeCopyTextRow(dst []byte, row Row, cols []catalog.Column) ([]byte, error) {
+// including the trailing newline. dateStyle/dateOrder select the DATE
+// column rendering (PostgreSQL's DateStyle GUC style/order components,
+// e.g. "ISO"/"MDY" — see config.ParseDateStyleValue); pass "ISO", "MDY"
+// for the boot default.
+func EncodeCopyTextRow(dst []byte, row Row, cols []catalog.Column, dateStyle, dateOrder string) ([]byte, error) {
 	if len(row) != len(cols) {
 		return nil, fmt.Errorf("EncodeCopyTextRow: %d cols vs %d datums", len(cols), len(row))
 	}
@@ -38,7 +42,7 @@ func EncodeCopyTextRow(dst []byte, row Row, cols []catalog.Column) ([]byte, erro
 			dst = append(dst, '\\', 'N')
 			continue
 		}
-		s, err := datumToCopyText(c.Type, d)
+		s, err := datumToCopyText(c.Type, d, dateStyle, dateOrder)
 		if err != nil {
 			return nil, err
 		}
@@ -240,7 +244,7 @@ func appendCopyTextEscaped(dst []byte, s string) []byte {
 
 // datumToCopyText renders a non-null Datum into the byte string
 // COPY TEXT expects, before per-byte escaping.
-func datumToCopyText(t catalog.Type, d Datum) (string, error) {
+func datumToCopyText(t catalog.Type, d Datum, dateStyle, dateOrder string) (string, error) {
 	switch t.Name {
 	case "int4", "integer", "int", "int8", "bigint":
 		if d.Kind != KindInt {
@@ -255,6 +259,15 @@ func datumToCopyText(t catalog.Type, d Datum) (string, error) {
 			return "t", nil
 		}
 		return "f", nil
+	case "date":
+		// Previously unhandled: a DATE column fell through to the KindTime
+		// gap in the default branch below and made `COPY <table> TO/FROM`
+		// hard-error on any table with a date column. M-NIGHTLY (run
+		// 20260714-011651) DateStyle output-rendering follow-up.
+		if d.Kind != KindTime {
+			return "", fmt.Errorf("expected time datum for date, got kind %d", d.Kind)
+		}
+		return config.FormatDate(d.TimeValue(), dateStyle, dateOrder), nil
 	case "timestamp", "timestamptz":
 		if d.Kind != KindTime {
 			return "", fmt.Errorf("expected time datum, got kind %d", d.Kind)

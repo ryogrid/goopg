@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"strings"
+	"time"
 )
 
 // mergeDateStyle implements PostgreSQL's check_datestyle GUC check hook
@@ -19,7 +20,7 @@ import (
 // matching upstream's ok=false path. Returns the canonical "<Style>, <Order>"
 // form guc_tables.c's assign_datestyle stores.
 func mergeDateStyle(current, bootVal, newValue string) (string, error) {
-	style, order := parseDateStyleValue(current)
+	style, order := ParseDateStyleValue(current)
 	haveStyle, haveOrder := false, false
 
 	for raw := range strings.SplitSeq(newValue, ",") {
@@ -67,7 +68,7 @@ func mergeDateStyle(current, bootVal, newValue string) (string, error) {
 			}
 			order, haveOrder = "MDY", true
 		case strings.EqualFold(tok, "DEFAULT"):
-			defStyle, defOrder := parseDateStyleValue(bootVal)
+			defStyle, defOrder := ParseDateStyleValue(bootVal)
 			if !haveStyle {
 				style = defStyle
 			}
@@ -81,11 +82,13 @@ func mergeDateStyle(current, bootVal, newValue string) (string, error) {
 	return style + ", " + order, nil
 }
 
-// parseDateStyleValue extracts the (style, order) pair from an already
+// ParseDateStyleValue extracts the (style, order) pair from an already
 // well-formed "<Style>, <Order>" DateStyle string (the only shape
 // mergeDateStyle ever writes). Falls back to ISO/MDY for a component the
 // string doesn't mention, so a malformed or partial `current` never panics.
-func parseDateStyleValue(s string) (style, order string) {
+// Exported for output formatters (executor/server/COPY) that need to render
+// a value according to the session's effective DateStyle.
+func ParseDateStyleValue(s string) (style, order string) {
 	style, order = "ISO", "MDY"
 	for raw := range strings.SplitSeq(s, ",") {
 		tok := strings.TrimSpace(raw)
@@ -107,4 +110,30 @@ func parseDateStyleValue(s string) (style, order string) {
 		}
 	}
 	return style, order
+}
+
+// FormatDate renders a DATE value's calendar part as text according to the
+// given DateStyle (style, order) pair, matching PostgreSQL's EncodeDateOnly
+// (postgres/src/backend/utils/adt/datetime.c). ISO output is order-
+// independent; German is always DD.MM.YYYY regardless of order (mergeDateStyle
+// already forces order=DMY when style=German is set, but FormatDate doesn't
+// depend on that invariant). Unrecognized style falls back to ISO, matching
+// ParseDateStyleValue's own default.
+func FormatDate(t time.Time, style, order string) string {
+	switch style {
+	case "SQL":
+		if order == "DMY" {
+			return t.Format("02/01/2006")
+		}
+		return t.Format("01/02/2006")
+	case "Postgres":
+		if order == "DMY" {
+			return t.Format("02-01-2006")
+		}
+		return t.Format("01-02-2006")
+	case "German":
+		return t.Format("02.01.2006")
+	default:
+		return t.Format("2006-01-02")
+	}
 }
