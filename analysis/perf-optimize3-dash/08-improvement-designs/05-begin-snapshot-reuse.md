@@ -1,7 +1,25 @@
 # 08-05 — Lazy first-statement snapshot for single-statement transactions
 
-status: design · date: 2026-07-14 · base: `a640d2b0` · gates: G-race, G-tpch,
-D-002 isolation, G-perf → [README](README.md)
+status: **PARTIAL** (S1 landed; pre-loop/BEGIN capture elimination deferred) ·
+date: 2026-07-14 · base: `a640d2b0` · gates: G-race, G-tpch, D-002 isolation,
+G-perf → [README](README.md)
+
+> **Landed 2026-07-14 (bounded, provably-safe subset):** in the RC per-statement
+> branch of `server/dispatch.go`, the FIRST statement now **reuses the pre-loop
+> snapshot** (`SnapshotFor(tx)` already taken for the Query message) instead of
+> re-capturing — removing the redundant second `captureSnapshot` on the single-
+> statement autocommit hot path (pgbench `-S`). Semantics identical (same RC
+> command-start snapshot, microseconds apart, no intervening commit). Gates:
+> server suite, isolation D-002 (`ReadWriteUnique1-4`, `FkSnapshot`,
+> `ReadOnlyAnomaly1-3`), mvcc RC/RR timing, tpch-spotcheck Q12=2/Q13=33 — all green.
+>
+> **Deferred (ledgered):** eliminating the pre-loop `dispatch.go` capture entirely
+> and the RC eager-BEGIN capture at `operators_tx.go` (the `-N` BEGIN-latency
+> half). These require proving `ectx.Snap` is never read before the in-loop
+> capture across *every* statement type (utility/RR-non-data), and untangling the
+> pre-loop / `execBegin` / in-loop interaction incl. the stale-`tx`-after-promotion
+> inconsistency — deeper multi-session verification than this run's gate battery
+> covers. See `.ralph/deferral_ledger.md`.
 
 ## 1. Problem and numbers
 
@@ -16,11 +34,19 @@ lone statement, and a `BEGIN` with no following data statement pays nothing.
 ## 2. Current-code map (verified at `a640d2b0`)
 
 - **`Manager.captureSnapshot()`** — `internal/mvcc/manager.go:1321`: builds the
-  MVCC snapshot (active-xid scan). Called per statement / per transaction start.
-- The `-N` transaction's `BEGIN` (simple protocol) drives transaction setup that
-  includes an eager snapshot; each subsequent statement in a read-committed
-  transaction also re-captures (correct for RC — each statement sees a fresh
-  snapshot).
+  MVCC snapshot (active-xid scan), reached only via `Manager.SnapshotFor`
+  (`manager.go:406`, the sole primitive): RC re-captures per call, RR/SSI pins
+  `firstSnap` on the first call.
+- **Correction (verified at HEAD):** `Manager.Begin` (`manager.go:249`) does
+  **not** capture a snapshot — transaction-start is already snapshot-free at the
+  MVCC layer. The eager capture lives in the **dispatch layer**: a pre-loop
+  `SnapshotFor(tx)` per Query message (`server/dispatch.go`, stored into
+  `ectx.Snap`), then a per-statement in-loop capture (RC refreshes each
+  statement; RR/SSI pins the first data statement via `stmtTakesSnapshot`,
+  `notify.go`). The RC eager-BEGIN capture in `execBegin` (`operators_tx.go`) is
+  a third, redundant one (its own comment notes RC "is refreshed per-statement
+  anyway"). So the redundancy the design targets is the **pre-loop + in-loop
+  double capture per autocommit statement**, not a `Begin`-time capture.
 
 ## 3. PostgreSQL reference
 

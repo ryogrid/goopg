@@ -848,11 +848,24 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		// Use ectx.Tx.Isolation (not the outer tx) so execBegin's
 		// promotion of the implicit RC tx to an explicit RR tx is visible.
 		if ectx.Tx.Isolation == mvcc.IsolationReadCommitted {
-			snap2, err := s.cfg.TxnMgr.SnapshotFor(tx)
-			if err != nil {
-				return s.writeQueryError(w, sqlstate.SystemError, err.Error())
+			// The pre-loop SnapshotFor(tx) already captured a fresh RC snapshot
+			// (and CAS-lowered the proc-array xmin) into ectx.Snap for this
+			// Query message. For the FIRST statement, reuse it instead of
+			// re-capturing — the two would be taken microseconds apart with no
+			// intervening commit visible to this backend, so it is the same RC
+			// command-start snapshot; this removes the redundant second capture
+			// on the single-statement autocommit hot path (pgbench -S,
+			// perf-optimize3-dash/08 doc 05). Later statements (i>0) still
+			// refresh per-statement for RC freshness. (i>0 also covers the
+			// case where an in-loop BEGIN promoted the tx; the pre-loop snap
+			// only ever belongs to statement 0, before any promotion.)
+			if i > 0 {
+				snap2, err := s.cfg.TxnMgr.SnapshotFor(tx)
+				if err != nil {
+					return s.writeQueryError(w, sqlstate.SystemError, err.Error())
+				}
+				ectx.Snap = snap2
 			}
-			ectx.Snap = snap2
 		} else if stmtTakesSnapshot(stmt) {
 			// RR/SSI: pin the transaction's snapshot at the FIRST snapshot-taking
 			// batched statement after a `BEGIN ISOLATION LEVEL …` that shares its
