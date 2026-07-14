@@ -112,6 +112,36 @@ def looks_resource_killed(log_text):
     return bool(re.search(r"signal: killed|Killed\b|exit status 137", log_text))
 
 
+PKG_LINE_RE = re.compile(r"^(ok|FAIL|\?)\s+(\S+)")
+
+
+def split_go_test_pkg_blocks(log_text):
+    """Split a `go test` (non -v) log into per-package (pkg, status, block_text).
+
+    Each block accumulates every line since the previous package-summary line
+    up to and including its own ("ok"/"FAIL"/"?") summary line, so a kill
+    signature or assertion dump is attributed to the package that produced it
+    — not the whole multi-package log. Without this, one package's genuine
+    `--- FAIL` anywhere in a ~40-package combined log (e.g. a real assertion
+    failure in an unrelated package) masks the resource-kill signature on
+    every OTHER package that was purely SIGKILLed/timed-out by the shared
+    cgroup memory cap in the same run, misclassifying them as regressions
+    (observed 2026-07-15: `internal/wal`'s one real `--- FAIL` caused
+    `cmd/goopg`/`internal/amcheck`/`internal/mvcc` — all pure resource kills
+    under nightly's `-p=4`/`GOMEMLIMIT=5GiB`/`MemoryMax=8G` — to be reported
+    as regressions for multiple consecutive nightly runs).
+    """
+    blocks = []
+    buf = []
+    for line in log_text.splitlines():
+        buf.append(line)
+        m = PKG_LINE_RE.match(line)
+        if m:
+            blocks.append((m.group(2), m.group(1), "\n".join(buf)))
+            buf = []
+    return blocks
+
+
 # -------------------------------------------------------------------- tpch csv
 def parse_timings(path):
     rows = []
@@ -182,17 +212,30 @@ def analyze(run_dir, repo_root, run_id):
         if not st.startswith("fail"):
             continue
         log = read_file(os.path.join(run_dir, stage, "go-test.log"))
-        if looks_resource_killed(log) and "--- FAIL" not in log:
-            it.resource_kills.append({"stage": stage, "evidence": ev(f"{stage}/go-test.log")})
+        fail_blocks = [(pkg, text) for pkg, status, text in split_go_test_pkg_blocks(log) if status == "FAIL"]
+        if not fail_blocks:
+            # No attributable per-package FAIL summary line at all (e.g. the
+            # whole run died before any package finished) — fall back to the
+            # coarse whole-log signal.
+            if looks_resource_killed(log):
+                it.resource_kills.append({"stage": stage, "evidence": ev(f"{stage}/go-test.log")})
+            else:
+                it.add_regression(
+                    f"{stage}/suite",
+                    f"{stage} suite failed with no parseable per-package cause",
+                    f"see {stage} stage command in ci/batch/stages/stage-{stage}.sh",
+                    ev(f"{stage}/go-test.log"),
+                )
             continue
-        _, _, failed_pkgs = parse_go_test(log)
-        pkgs = failed_pkgs[:10] or ["(suite)"]
-        for pkg in pkgs:
-            rel = pkg.split("github.com/goopg/goopg/")[-1] if pkg != "(suite)" else ""
+        for pkg, text in fail_blocks[:10]:
+            rel = pkg.split("github.com/goopg/goopg/")[-1]
+            if looks_resource_killed(text) and "--- FAIL" not in text:
+                it.resource_kills.append({"stage": stage, "pkg": rel, "evidence": ev(f"{stage}/go-test.log")})
+                continue
             it.add_regression(
-                f"{stage}/{rel or 'suite'}",
-                f"{stage} suite failed" + (f" in package {pkg}" if rel else ""),
-                repro_tpl.format(pkg=rel) if rel else f"see {stage} stage command in ci/batch/stages/stage-{stage}.sh",
+                f"{stage}/{rel}",
+                f"{stage} suite failed in package {pkg}",
+                repro_tpl.format(pkg=rel),
                 ev(f"{stage}/go-test.log"),
             )
 
@@ -585,7 +628,7 @@ def main():
     for title, rows, render in (
         ("Promotable", it.promotable, lambda r: f"- {r['case_id']} PASSED ({r['test']}) — consider promotion (ci/design/02 §D)"),
         ("Known-fails hit", it.known_fails, lambda r: f"- {r['subject']} ({r.get('case_id','')})"),
-        ("Resource kills", it.resource_kills, lambda r: f"- stage {r['stage']} — check cgroup OOM via dmesg/journalctl (design 03 §C); {r['evidence']}"),
+        ("Resource kills", it.resource_kills, lambda r: f"- stage {r['stage']}{(' pkg=' + r['pkg']) if r.get('pkg') else ''} — check cgroup OOM via dmesg/journalctl (design 03 §C); {r['evidence']}"),
         ("Notes", it.notes, lambda r: f"- {r}"),
     ):
         if rows:

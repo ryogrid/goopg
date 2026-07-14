@@ -1,75 +1,68 @@
 (idle — nothing in flight)
 
-Last completed (commit f4154dfc): M-NIGHTLY triage — run 20260715-010036
-(sha 751b82178025, 11 AI items). Fixed AI-006/007/008 (isolation
-regressions); investigated AI-001..005/009..011 (units timeouts + regress
-mismatches), found non-reproducing locally.
+Last completed (about to commit): M-NIGHTLY (run 20260715-010036 triage) —
+root-caused + fixed the `cmd/goopg`/`internal/amcheck` "units-timeout"
+mystery left open by the last 2 loops. It was a classifier bug in
+`ci/batch/lib/summarize.py`, NOT a product hang.
 
-Root cause fixed: `ActivityRegistry.Register(b)` (internal/activity/
-registry.go) assigned a backend's slot via `procNumForPID(b.PID)` (a PID
-hash), but every dynamic call (`UpdateState`/`WaitEventStart`/`WaitEventEnd`/
-`PIDForProcNum`) is keyed off `connTx.ProcNum` (internal/server/server.go,
-from `TxnMgr.AcquireConnSlot()` — an unrelated MVCC proc-array slot,
-introduced historically to fix a separate PID-wraparound clobbering bug).
-The two index spaces silently diverged for most connections, freezing
-pg_stat_activity.state/query at their Register()-time defaults for a
-connection's ENTIRE lifetime — reproduced live via a manually started
-server + raw psql (query blank even for the backend's OWN currently-
-executing statement). New `ActivityRegistry.RegisterAt(procNum, b)` (mirrors
-`RegisterBackground`); `Register(b)` now delegates to
-`RegisterAt(procNumForPID(b.PID), b)`; the one production call site
-(server.go:951 area) now calls `RegisterAt(procNum, ...)` reusing the
-already-computed TxnMgr.AcquireConnSlot() value. This fixed ALL THREE
-regressed isolation specs (partition-drop-index-locking,
-insert-conflict-specconflict, detach-partition-concurrently-4) with one
-2-line change — no unit test existed that exercised the REAL server
-Register() call path (0118-0073's own test called UpdateState directly with
-a hand-picked procNum, proving the primitive but not the wiring).
+Reproduced the whole `units` package set failing identically (`cmd/goopg`/
+`internal/amcheck`/`internal/initdb`/`internal/mvcc`) in 16.5 minutes under
+the EXACT nightly cgroup config (`GOOPG_MEM_HIGH=6G MEM_MAX=8G
+MEM_SWAP_MAX=0 GOMEMLIMIT=5GiB GOFLAGS=-p=4`, matching
+`ci/batch/stages/stage-units.sh`) — confirms genuine multi-package resource
+contention, not per-package flakiness (`initdb` was already proven clean
+standalone). `cmd/goopg`/`internal/amcheck` die via a bare `signal: killed`
+(unambiguous cgroup/OOM per `ci/design/03` §C). Root cause:
+`summarize.py`'s existing `looks_resource_killed(log) and "--- FAIL" not in
+log` rule ran over the WHOLE combined ~40-package log instead of
+per-package — `internal/wal`'s one genuine `--- FAIL` that night (already
+fixed by an earlier loop today) flipped the guard for the whole `units`
+stage, misreporting the 2 pure resource-kills as regressions. Same bug,
+inverted, silently swallowed `race/internal/access/btree`/
+`race/internal/amcheck` (real, NEVER-before-surfaced `-race` failures) into
+one uninformative whole-stage notice on every prior night.
 
-Design doc `docs/design/0118-0141-activity-procnum-identity-space-
-conflation.md` + README index. Deferral ledger: 1 resolved row (this fix) +
-1 open row (see below). fix_plan.md M-NIGHTLY task appended.
+Fix: `split_go_test_pkg_blocks()` in `ci/batch/lib/summarize.py` — splits a
+`go test` log into per-package blocks on `ok`/`FAIL`/`?` lines; the
+units/race classification loop now runs resource-kill-vs-regression
+per-block. New `ci/batch/lib/test_summarize.py` (stdlib unittest, 4 tests,
+all PASS) using a synthetic fixture modeled on the real log, PLUS
+cross-checked directly against the real
+`ci/logs/20260715-010036/units+race/go-test.log`. Regenerated
+`ci/logs/action-items.md` from the real historical logs (kept — correctly
+reflects the fixed classifier); reverted an incidental duplicate append this
+produced in `ci/logs/history.jsonl` (git checkout — append-only file, must
+not gain a phantom entry from a manual verification run).
 
-Gates: go build ./... clean; go test PASS across internal/activity,
-internal/server, internal/executor, internal/initdb (~4min, not 33min —
-see below); full `go test -run 'TestPort_Isolation' ./internal/testport/
--v` battery: 0 `--- FAIL` lines (was 3 FAIL last night); the 3 specific
-specs individually PASS; tpch-spotcheck.sh PASS (Q12=2/Q13=33);
-RALPH_PRECOMMIT_SCOPE=smoke ralph-precommit-test.sh PASS (0 failed, all 3
-workloads, ran automatically via pre-commit hook on `git commit`).
-make ralph-state-guard: auto-repaired the same recurring stale
-running/completed mismatch as prior loops, then OK.
+fix_plan.md: 1 new [x] M-NIGHTLY entry (the fix) + 2 new [ ] M-NIGHTLY tasks
+(`race/internal/access/btree`, `race/internal/amcheck` — brand new findings,
+NOT investigated this loop, time-boxed). Deferral ledger: 1 new `resolved`
+row (this fix) narrowing the `internal/initdb`/`internal/mvcc` still-open
+row + noting the 2 new race items. Design doc
+`docs/design/root-0027-nightly-classifier-per-package-resource-kill.md` +
+README index.
 
-STILL OPEN — deferral ledger row, next loop candidate if no higher-priority
-M-NIGHTLY item exists: the nightly run's other 8 action items
-(AI-...-001..005: units-suite timeouts in cmd/goopg, internal/amcheck,
-internal/initdb, internal/mvcc, internal/wal — each ran to a 33-minute
-per-package go test timeout and was SIGQUIT-killed with a near-empty
-goroutine dump, consistent with host CPU starvation during the nightly
-window rather than a real hang; AI-...-009..011: regress/errors,
-portals_p2, select — all baseline `pass`, all individually PASS when rerun
-locally this loop). internal/initdb reran clean in ~4 minutes this loop
-(not 33) and the 3 regress cases all pass standalone — strong evidence for
-"environmental, not a code regression," but cmd/goopg, internal/amcheck,
-internal/mvcc, internal/wal were NOT rerun to their full 33+ minute timeout
-this loop (time-boxed after the procNum fix + its gates). Next step if
-picked up: `go test -timeout 40m ./cmd/goopg/ ./internal/amcheck/
-./internal/mvcc/ ./internal/wal/` on a quiet host (no concurrent nightly
-batch / perf-optimize3 runs), diff against
-ci/logs/20260715-010036/units/go-test.log; if it reproduces, capture the
-FULL goroutine dump (tonight's was truncated to one line) for a real
-hang diagnosis instead of assuming contention again.
+Next step: pick the highest-priority M-NIGHTLY item — likely
+`race/internal/access/btree` (real concurrency-bug history, e.g. M0110-0007)
+or `race/internal/amcheck`, neither ever investigated. Repro:
+`go test -race -timeout 15m ./internal/access/btree/` (and `./internal/amcheck/`)
+standalone first; if clean, use the SAME concurrent-load repro technique
+this loop validated (full package set through `scripts/goopg-test-run.sh`
+with the nightly's exact env) to try to force it, capturing a FULL
+(non-truncated) goroutine dump if it hangs. `internal/initdb`/`internal/mvcc`
+(units) remain open too — same repro technique applies.
 
-Also check at next loop start: `grep run: ci/logs/action-items.md` — if a
-newer nightly batch has regenerated it (this loop's mtime was
-2026-07-15T03:15:09+09:00, run 20260715-010036), triage any new `## AI-`
-items into M-NIGHTLY tasks BEFORE picking either the units/wal
-investigation above or any other milestone's work (preemption rule applies
-at task-selection time; this loop's own task was already finished so the
-check is clean for the next loop).
+Gates run: `python3 ci/batch/lib/test_summarize.py -v` 4/4 PASS; `python3 -m
+py_compile ci/batch/lib/summarize.py` clean; `scripts/tpch-spotcheck.sh`
+PASS (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke bash
+scripts/ralph-precommit-test.sh` PASS (exit 0, 0 failed both workloads);
+`make ralph-state-guard` — found+auto-repaired 1 stale status/progress
+inconsistency (previous loop's clean-exit marker), consistent after repair.
 
-In-flight: none. All work committed (f4154dfc) and pushed. Tree clean of my
-changes. Stray untracked/modified files present from other processes
-(weekly_loc.*, analysis/perf-optimize3/runs/*, ci/logs/*.log,
-analysis/tpch-explain-baseline.md, untracked postgres/) were left untouched,
-same as prior loops.
+In-flight: none. About to `git add`/`git commit` (pathspec-scoped to my own
+files — `.ralph/{deferral_ledger,fix_plan,working_set}.md`,
+`ci/batch/lib/{summarize.py,test_summarize.py}`, `ci/logs/action-items.md`,
+`docs/design/{README.md,root-0027-*.md}`) then push. Untouched foreign/stray
+files present (`analysis/tpch-explain-baseline.md`, `ci/logs/launch.log`,
+`postgres` submodule dirty, `weekly_loc.*`, `analysis/perf-optimize3/runs/*`)
+— same as every prior loop, left alone.
