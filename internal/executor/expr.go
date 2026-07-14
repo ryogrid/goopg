@@ -5872,20 +5872,20 @@ func regexpFirstMatchArray(re *regexp.Regexp, s string) Datum {
 // FindAllStringSubmatchIndex. Shared by regexpFirstMatchArray (single match)
 // and regexpAllMatchesArrays (SRF, one call per match).
 func regexpMatchArrayDatum(re *regexp.Regexp, s string, idx []int) Datum {
-	var elems []string
 	if re.NumSubexp() == 0 {
-		elems = []string{s[idx[0]:idx[1]]}
-	} else {
-		for i := 1; i <= re.NumSubexp(); i++ {
-			lo, hi := idx[2*i], idx[2*i+1]
-			if lo < 0 {
-				elems = append(elems, "NULL")
-			} else {
-				elems = append(elems, s[lo:hi])
-			}
+		return NewStringDatum(formatTextArray([]string{s[idx[0]:idx[1]]}))
+	}
+	elems := make([]string, re.NumSubexp())
+	nulls := make([]bool, re.NumSubexp())
+	for i := 1; i <= re.NumSubexp(); i++ {
+		lo, hi := idx[2*i], idx[2*i+1]
+		if lo < 0 {
+			nulls[i-1] = true
+		} else {
+			elems[i-1] = s[lo:hi]
 		}
 	}
-	return NewStringDatum("{" + strings.Join(elems, ",") + "}")
+	return NewStringDatum(formatTextArrayWithNulls(elems, nulls))
 }
 
 // regexpAllMatchesArrays mirrors regexp_matches(string, pattern, 'g')'s SRF

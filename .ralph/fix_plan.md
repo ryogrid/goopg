@@ -3294,6 +3294,59 @@ survey the deferral ledger for a fresh open (`status = -`) row.
       `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
       `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh`
       PASS (0 failed, all 3 workloads).
+- [x] **M-NIGHTLY (run 20260714-011651 follow-up) — fixed `regexp_match`/
+      `regexp_matches` array-literal quoting; corrected the "quick suite"
+      classification for the remaining resume-list names.** Picked up the
+      next name from the prior loop's resume plan (`regex`, sub-0.2s
+      runtime). `regexpMatchArrayDatum` (`internal/executor/expr.go`) built
+      its `{elem1,elem2}` array literal with a bare `strings.Join`, so an
+      empty-string match rendered as `{}` (indistinguishable from a
+      zero-element array) instead of PostgreSQL's `{""}`, and any matched
+      text containing a comma/brace would silently corrupt the element
+      count on read-back. Fixed by delegating to the existing, already-
+      tested `formatTextArrayWithNulls` helper (used elsewhere in the same
+      file) instead of a second hand-rolled quoter — mirrors PG's
+      `array_out` `needquote` rule
+      (`postgres/src/backend/utils/adt/arrayfuncs.c` ~line 1130). Tests:
+      `internal/executor/regexp_match_test.go` +2 cases (empty-pattern
+      match, comma-containing match). Design doc follow-up appended to
+      `docs/design/0122-0002-pg-relation-size-real-sizes.md` + README
+      index. **Does not flip `regress/regex` to `pass`** — the suite's
+      remaining failures are backreference (`\1` in-pattern) and lookaround
+      (`(?<=...)`/`(?=...)`) constructs Go's RE2-based `regexp` package
+      cannot express at all (needs a different regex engine).
+      **Investigated and corrected the resume plan's "quick suite"
+      heuristic**: the other 5 untried names (`expressions`, `equivclass`,
+      `guc`, `random`, `explain`) were flagged "quick" based on sub-0.2s
+      regress-test *runtime*, which is NOT a valid proxy for fix
+      complexity — it only measures how fast the SQL script hits its first
+      divergence. Diffed all 5 against live HEAD via
+      `GOOPG_REGRESS_DIFF_DIR`: every one requires a substantial,
+      multi-loop feature (real geometric point/box types + static IN-list
+      operator-existence checking; user-defined operator classes/RESTRICT
+      selectivity; DateStyle multi-format output + partial-GUC-value merge
+      semantics; PG-exact PRNG algorithm + NUMERIC-scale-preserving
+      `random(min,max)`; EXPLAIN XML/YAML format fidelity). Full
+      per-suite root-cause breakdown in the deferral ledger (below).
+      **Separately discovered (not fixed, orthogonal):** the regress test
+      harness (`internal/testport/regress_suite_test.go`'s
+      `ClusterRegressExecutor.psqlEnv()`) never sets `PGDATESTYLE`/`PGTZ`/
+      `PGOPTIONS=-c intervalstyle=postgres_verbose`, the exact three
+      environment settings real `pg_regress` forces for every regress
+      connection (`postgres/src/test/regress/pg_regress.c:783-800`) — this
+      is why `guc`'s very first `SHOW datestyle` (no `SET` yet) already
+      mismatches. Fixing it needs its own dedicated loop (add the env
+      vars, then re-run all 90 individually flagged suites fresh to
+      re-verify `docs/test-port/regress-diff-baseline.csv`, since the
+      change may shift actual output for any date/time/timezone-touching
+      suite) — too large a blast radius to fold into this triage loop.
+      Deferral-ledger rows appended (one resolved for the landed fix, one
+      open for the corrected classification + env-var gap). Gates:
+      `go build ./...` clean; `go test ./internal/executor/...` PASS (full
+      package, no regressions); `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+      bash scripts/ralph-precommit-test.sh` PASS (0 failed, all 3
+      workloads).
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 
