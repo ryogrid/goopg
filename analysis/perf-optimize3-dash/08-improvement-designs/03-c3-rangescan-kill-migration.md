@@ -1,18 +1,35 @@
 # 08-03 — C3 residual: migrate the UPDATE-probe RangeScan to LP_DEAD kill collection
 
-status: **PARTIAL** (S1 landed `bdaa325a`; S2 deferred) · date: 2026-07-14 ·
-base: `635cc590` · gates: G-race (`./internal/access/btree/`,
-`./internal/executor/`), G-crash, G-waldump, G-tpch, G-perf → [README](README.md)
+status: **ABANDONED** — S1 implemented (`bdaa325a`), verified, and **reverted**
+(`4998c81b`) after the perf-acceptance gate failed (regression). · date:
+2026-07-14 · base: `635cc590` → [README](README.md)
 
-> **Landed 2026-07-14 (S1, `bdaa325a`):** `updateViaIndex` now collects LP_DEAD
-> kills for the dead-pointing index entries its probe skips (both `!found`
-> branches), flushed via `tree.KillItems` after the scan drains — the residual
-> pkey-doubling driver. New `TestUpdateProbeCollectsLPDeadKill` (verified to fail
-> without the flush). Gates: G-race (btree 23 s, executor), full executor suite,
-> G-tpch (Q12=2/Q13=33), G-crash (initdb, wal, `TestKillKillRecovery`) — all
-> green. **S2 deferred** (the constraint/conflict probes act on live tuples only,
-> §9 O-C3M-1; `indexOnlyScanOp` is a clean read-path follow-on) — see
-> `.ralph/deferral_ledger.md`. S3 perf-acceptance soak: see §8.
+> **⛔ ABANDONED 2026-07-14 — the approach is a regression; do not re-land as
+> designed.** S1 was implemented (functionally correct: unit test + G-race +
+> G-tpch + G-crash all green) but the S3 perf-acceptance measurement (§8) showed
+> it delivers **no benefit** on the target benchmark and a **severe regression**
+> on a re-probe-heavy workload:
+> - **scale-100 uniform pgbench `-N`, 600 s soak:** pkey doubled *identically* to
+>   the un-migrated baseline (166.5 MB → 333.4 MB, byte-for-byte same final size)
+>   — zero benefit. Uniform `-N` updates each `aid` ~0.4× over 10 M rows, so the
+>   dead-pointing entries created by first (non-HOT) updates are almost never
+>   **re-probed** before their leaf splits; on-probe kills rarely fire.
+> - **re-probe-heavy A/B (1000 hot keys, `c=1` deterministic, heap = negative
+>   control at 109 % → runs comparable):** the migrated pkey grew **+24.5 MB** vs
+>   the baseline **+1.3 MB** — an **~18× regression**. Marking dead *duplicate*
+>   index entries `LP_DEAD` **defeats the btree dedup consolidation** that packs
+>   duplicate hot-key TIDs into compact posting lists. LP_DEAD-marking and dedup
+>   are *competing* space strategies; for the duplicate-heavy churn an UPDATE
+>   probe produces, dedup wins and the kills break it. Throughput was neutral
+>   (14766 vs 14882 tps).
+>
+> **Why the read path (`indexScanOp`, landed C3) is unaffected:** read scans do
+> not churn duplicate keys the way UPDATE probes on hot rows do, so dedup vs
+> LP_DEAD never compete there. The migration to the UPDATE probe is where it
+> backfires — inherent to the design. Closing the residual needs a *different*
+> mechanism (a dedup-aware no-space purge, or a background btree vacuum), not
+> on-probe kill collection. Run dirs: `analysis/perf-optimize3/runs/
+> s5c3_s1accept_bdaa325a/` (soak) and `.../s5c3_s1_hotkey_ab/` (A/B).
 >
 > **Verification note (2026-07-14):** this doc was rewritten after a three-pass
 > code map (btree kill mechanism · every RangeScan caller · the UPDATE probe)
@@ -156,7 +173,7 @@ Concretely:
 
 | # | slice | content | gates |
 |---|---|---|---|
-| S1 | UPDATE-probe kills — **LANDED `bdaa325a`** | `RangeScan`→`RangeScanWithPos` in `updateViaIndex`; collect a kill in each `!found` branch via `heapChainDeadToAll` under `OldestXmin`; flush `tree.KillItems` after the scan. `TestUpdateProbeCollectsLPDeadKill`. | G-race, G-crash, G-tpch ✓ |
+| S1 | UPDATE-probe kills — **REVERTED `4998c81b`** (regression, §8) | `RangeScan`→`RangeScanWithPos` in `updateViaIndex`; collect a kill in each `!found` branch via `heapChainDeadToAll` under `OldestXmin`; flush `tree.KillItems` after the scan. Functionally correct (all gates green) but failed G-perf. | G-race, G-crash, G-tpch ✓ / **G-perf ✗** |
 | S2 | *deferred* — other callers | The 9 non-index-scan RangeScan callers are constraint/conflict probes (upsert arbiter, unique/exclusion checks, deferred rechecks) that act on **live** tuples only (§10); `indexOnlyScanOp` is a clean read-path follow-on but not part of the measured residual. Deferred with a ledger line. | — |
 | S3 | perf acceptance | 600 s soak at scale 100 + a scale-500 `-N`: pkey growth per txn should approach 0; the scale-500 miss rate should improve. | G-perf |
 
@@ -171,13 +188,35 @@ Concretely:
 | crash recovery | `Crash\|Recovery\|Durability` + `TestKillKillRecovery` | S1 |
 | TPC-H spotcheck (Q12/Q13 canonical) | `scripts/tpch-spotcheck.sh` | S1 |
 
-## 8. Performance verification
+## 8. Performance verification — **measured, FAILED (S1 reverted)**
 
-600 s `-N` soak at scale 100 (the metric C3 exists for): the pkey file should not
-double after warm-up; per-txn growth → ~0 (from 43.6 B/txn). Scale-500 `-N`
-re-run: the +832 MB/120 s doubling should not recur, and the miss rate (07's
-`pinSlow` reload wait) should drop. Record the run dir + commit hash in
-`analysis/`. The growth-flattening is the acceptance signal (doc §1 evidence).
+The acceptance criterion was "the pkey should not double; per-txn growth → ~0."
+The measurement **falsified** the design:
+
+| workload | baseline (un-migrated `635cc590`) | migrated `bdaa325a` | verdict |
+|---|---|---|---|
+| scale-100 uniform `-N`, 600 s soak | pkey 166.5 MB → 333.4 MB (2.00×) | 166.5 MB → 333.4 MB (2.00×, **byte-identical**) | **no benefit** |
+| 1000 hot keys, `c=1` det., ~72.6 k txns | pkey **+1.3 MB**; heap +2.9 MB | pkey **+24.5 MB**; heap +3.1 MB | **~18× regression** |
+
+- The `c=1` hot-key run controls for variance via the **heap** (which an
+  index-only change cannot affect): heap matched at 109 %, so the runs are
+  comparable and the pkey divergence is attributable to S1. (The initial `c=50`
+  A/B was discarded — its heap negative control diverged 2.3×, i.e. too noisy.)
+- **Root cause:** marking dead *duplicate* index entries `LP_DEAD` removes them
+  from the dedup-consolidation candidate set, and the no-space purge's
+  posting-list packing of duplicate hot-key TIDs — baseline's primary space saver
+  — no longer applies, so leaves split instead of consolidating. LP_DEAD-marking
+  and dedup are **competing** strategies; for duplicate-heavy UPDATE-probe churn,
+  dedup is strictly better.
+- **Uniform `-N` null result:** each `aid` is updated ~0.4× (4.2 M txns over 10 M
+  rows), so a dead-pointing entry is created by a first non-HOT update and almost
+  never re-probed before its leaf splits — the on-probe kill has nothing to fire
+  on. C3's whole premise (on-*access* cleanup) needs repeated access to the same
+  key, which this workload does not provide.
+
+**Conclusion:** the doc-03 approach is abandoned. A dedup-aware no-space purge
+(consolidate first, mark `LP_DEAD` only entries that cannot dedup) or a background
+btree vacuum would be needed to actually reduce the residual — see §9.
 
 ## 9. Open questions
 
