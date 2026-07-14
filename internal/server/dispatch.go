@@ -2121,6 +2121,15 @@ func (s *Server) wireExtensionRows(ectx *executor.Context, dbName string) {
 			return pum.PGUserMappingsRowsForDBOid(catalog.NamespaceDBOid(ectx.CurrentDatabaseOid))
 		}
 	}
+	// pg_collation must likewise reflect the connecting database's own
+	// CREATE COLLATION'd collations, not always DefaultDBOid's. Mirrors the
+	// pg_user_mappings wiring above. M0122-0007 4e follow-up (DU-002
+	// round-trip probe unblock).
+	if pc, ok := s.cfg.Catalog.(pgCollationRowLister); ok {
+		ectx.PgCollationRows = func() [][]string {
+			return pc.PGCollationRowsForDBOid(catalog.NamespaceDBOid(ectx.CurrentDatabaseOid))
+		}
+	}
 }
 
 // pgClassRowLister is implemented by catalog.InMemory to expose a
@@ -2220,6 +2229,13 @@ type pgForeignServerRowLister interface {
 // above. M0122-0007 4e follow-up 37.
 type pgUserMappingsRowLister interface {
 	PGUserMappingsRowsForDBOid(dbOid uint32) [][]string
+}
+
+// pgCollationRowLister is implemented by catalog.InMemory to expose a
+// per-database pg_collation row-set, mirroring pgUserMappingsRowLister
+// above. M0122-0007 4e follow-up (DU-002 round-trip probe unblock).
+type pgCollationRowLister interface {
+	PGCollationRowsForDBOid(dbOid uint32) [][]string
 }
 
 func undoEnumDDLForRollback(connTx *connTxState, cat catalog.Catalog) {

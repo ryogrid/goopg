@@ -570,6 +570,14 @@ type Context struct {
 	// to close over CurrentDatabaseOid. M0122-0007 4e follow-up 37.
 	PgUserMappingsRows func() [][]string
 
+	// PgCollationRows mirrors PgForeignServerRows above for the pg_collation
+	// catalog table: it lists CurrentDatabaseOid's own CREATE COLLATION'd
+	// collations (plus the shared BKI-pinned builtins) rather than always
+	// DefaultDBOid's (catalog.InMemory's PGCollationRowsForDBOid). Wired by
+	// the server to close over CurrentDatabaseOid. M0122-0007 4e follow-up
+	// (DU-002 round-trip probe unblock).
+	PgCollationRows func() [][]string
+
 	// NonSuperuserRole, when non-empty, means the session is currently running
 	// under a non-superuser role (set via SET SESSION AUTHORIZATION). Privilege
 	// checks that require superuser (e.g. LEAKPROOF function attribute) must

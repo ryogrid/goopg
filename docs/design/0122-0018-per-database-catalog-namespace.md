@@ -2071,6 +2071,65 @@ disciplines directly rather than introducing a third one.
   `pg_statistic_ext`/`information_schema.routines` registry redesign
   (pre-existing, unrelated to TEMPLATE).
 
+**`pg_collation`/`UserCollation` cross-database isolation — LANDED (2026-07-15,
+follow-up beyond 4e, picked up from the "Deferred / explicitly out of scope"
+list's collations item below).** Motivation: `TestPort_PgDumpConnectionSetup`'s
+DU-002 dump+restore round-trip probe (`internal/testport/
+pgdump_connsetup_test.go`) restores a captured dump into a brand-new, empty
+database in the same cluster — the very first schema-level object in the
+fixture is `CREATE COLLATION public.builtin_coll (provider = builtin, locale =
+'C')`, which errored `collation "builtin_coll" already exists` because
+`catalog.InMemory.userCollations` was one flat, dbOid-less
+`[]*UserCollation`. Mirrors follow-up 36/37's `ForeignServer`/`UserMapping`
+shape exactly (same-shape sibling maps, not the `tables`/`indexes` namespace
+struct): `catalog.UserCollation` gained a `DBOid uint32` field;
+`CreateCollation`/`DropCollation`/`RenameCollation`/`SetCollationOwner`/
+`SetCollationSchema`/`CollationAttrsByName` each gained a trailing
+`dbOid ...uint32` parameter (variadic, `resolveDBOid` defaults to
+`DefaultDBOid` — every pre-existing call site, including all of
+`create_collation_test.go`, keeps its old behavior unchanged). New
+`catalog.InMemory.ListUserCollationsForDBOid`/`PGCollationRowsForDBOid`
+(mirrors `PGForeignServerRowsForDBOid`); a new
+`executor.Context.PgCollationRows` field is wired the same way as every other
+per-connection row-lister (`internal/server/dispatch.go`'s
+`pgCollationRowLister` interface + wiring next to `pgUserMappingsRowLister`),
+and a `pg_collation` branch was added to `internal/executor/operators.go` next
+to the `pg_user_mappings` one. All 8 `execCreateCollation`/`execAlterCollation`/
+DROP COLLATION/COMMENT ON COLLATION call sites in
+`internal/executor/operators_ddl.go` now thread
+`catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)` through to the registry
+calls. **Deliberately NOT done (scope kept bounded, unlike follow-up 36/37):**
+no WAL-record format change — `wal.EncodeCreateCollation`/`DecodeCreateCollation`
+and the sibling rename/owner/set-schema records still carry no dbOid, so
+`CreateCollationDuringRecovery` (`internal/initdb/collation_ddl_recovery.go`)
+now explicitly stamps every replayed collation `DBOid = DefaultDBOid` — a
+restart still restores every database's collations into DefaultDBOid's
+namespace, matching "every write path still persists under DefaultDBOid until
+migrated" (4c's dual-mirror convention above). This is an accepted, recorded
+residual (deferral ledger row), not silently dropped: a genuinely distinct
+database's collations do not yet survive a restart under their own namespace.
+Also left unscoped: `UserCollationOIDByName` (used to shadow a column's
+`attcollation`) still searches all databases by bare name — a same-named
+custom collation in two different databases could resolve the wrong OID for
+this one reverse-lookup path; narrow, pre-existing-shaped edge case, not
+exercised by the DU-002 fixture, recorded in the ledger rather than fixed
+here. Confirmed via `TestPort_PgDumpConnectionSetup`: the round-trip restore's
+failure point moved from `collation "builtin_coll" already exists` to a
+different, later object (`type "b_in" already exists"`) — the next unscoped
+sibling map in the same "Deferred / explicitly out of scope" list, a future
+loop's own follow-up. New `TestCreateCollationCrossDatabaseIsolation`
+(`internal/catalog/create_collation_test.go`): two distinct dbOids each
+`CREATE COLLATION public.builtin_coll` without colliding, a genuine
+same-database duplicate still errors, each database's `pg_collation` view
+sees only its own row (+ the 7 shared builtins), and dropping one database's
+copy leaves the other's intact. Gates: `go build ./...`/`go vet ./...` clean;
+`go test ./internal/catalog/... ./internal/executor/... ./internal/server/...
+./internal/initdb/...` PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+`RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0 failed,
+all 3 workloads; first attempt hit 1 transient pgbench failure — 0.009%,
+11,364 txns, unrelated to this loop's catalog/executor diff — retry passed
+clean).
+
 ## Recommended order and stopping points
 
 4a (landed) → 4b-i (landed) → 4b-ii (landed) → 4c (landed) → 4d-i (landed) →
@@ -2134,9 +2193,13 @@ verification pass; a future loop should file it against
   sync with the postgres/template0/template1 special cases today).
 - The `postgres`/`template1` dbOid dual-mirror migration strategy for 4d —
   flagged, not designed; needs its own investigation once 4d is reached.
-- Any of the ~20 sibling per-name maps on `InMemory` beyond
-  `tables`/`indexes`/`byTable` (collations, conversions, aggregates,
-  operator classes, etc.) — genuinely out of scope for "per-database
-  catalog namespace" as motivated by the template-copy/dump-restore use
-  cases; each would need its own audit for whether PG actually scopes it
-  per-database (most do) before being folded into this epic.
+- Any of the remaining ~19 sibling per-name maps on `InMemory` beyond
+  `tables`/`indexes`/`byTable`/`foreignServers`/`userMappings`/`userCollations`
+  (conversions, aggregates, operator classes, etc.) — genuinely out of scope
+  for "per-database catalog namespace" as motivated by the
+  template-copy/dump-restore use cases; each would need its own audit for
+  whether PG actually scopes it per-database (most do) before being folded
+  into this epic. `userCollations` itself was folded in 2026-07-15 (see its
+  section above) once the DU-002 round-trip probe surfaced it as the specific
+  next-in-line collision; the probe's failure point has since moved to a
+  `CREATE TYPE` collision, the natural next candidate for this same audit.

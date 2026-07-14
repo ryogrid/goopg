@@ -627,6 +627,7 @@ func (o *ddlOp) execCreateCollation(s *parser.CreateCollationStmt) error {
 	if !ok {
 		return nil
 	}
+	dbOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
 	schema := s.Name.Schema
 	if schema == "" {
 		schema = "public"
@@ -639,7 +640,7 @@ func (o *ddlOp) execCreateCollation(s *parser.CreateCollationStmt) error {
 	}
 	if s.FromName.Name != "" {
 		// CREATE COLLATION new FROM existing — copy the source's attributes.
-		src, found := im.CollationAttrsByName(s.FromName.Name)
+		src, found := im.CollationAttrsByName(s.FromName.Name, dbOid)
 		if !found {
 			return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("collation %q for current database encoding does not exist", s.FromName.Name)}
 		}
@@ -699,7 +700,7 @@ func (o *ddlOp) execCreateCollation(s *parser.CreateCollationStmt) error {
 			uc.Rules = s.Rules
 		}
 	}
-	if _, err := im.CreateCollation(uc, schema, s.IfNotExists); err != nil {
+	if _, err := im.CreateCollation(uc, schema, s.IfNotExists, dbOid); err != nil {
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 	}
 	// DU-002 restart-persistence follow-up (M0119-0004): goopg has no
@@ -738,6 +739,7 @@ func (o *ddlOp) execAlterCollation(s *parser.AlterCollationStmt) error {
 	if !ok {
 		return nil
 	}
+	dbOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
 	schema := s.Name.Schema
 	if schema == "" {
 		schema = "public"
@@ -751,7 +753,7 @@ func (o *ddlOp) execAlterCollation(s *parser.AlterCollationStmt) error {
 	}
 	switch s.Action {
 	case "rename":
-		if err := im.RenameCollation(s.Name.Name, schema, s.NewName); err != nil {
+		if err := im.RenameCollation(s.Name.Name, schema, s.NewName, dbOid); err != nil {
 			return notFound()
 		}
 		if o.ctx.WAL != nil {
@@ -769,7 +771,7 @@ func (o *ddlOp) execAlterCollation(s *parser.AlterCollationStmt) error {
 			}
 			ownerOID = oid
 		}
-		if !im.SetCollationOwner(s.Name.Name, schema, ownerOID) {
+		if !im.SetCollationOwner(s.Name.Name, schema, ownerOID, dbOid) {
 			return notFound()
 		}
 		if o.ctx.WAL != nil {
@@ -783,7 +785,7 @@ func (o *ddlOp) execAlterCollation(s *parser.AlterCollationStmt) error {
 		if newSchema == "" {
 			newSchema = "public"
 		}
-		if !im.SetCollationSchema(s.Name.Name, schema, newSchema) {
+		if !im.SetCollationSchema(s.Name.Name, schema, newSchema, dbOid) {
 			return notFound()
 		}
 		if o.ctx.WAL != nil {
@@ -793,7 +795,7 @@ func (o *ddlOp) execAlterCollation(s *parser.AlterCollationStmt) error {
 		}
 		return nil
 	case "refresh":
-		if _, found := im.CollationAttrsByName(s.Name.Name); !found {
+		if _, found := im.CollationAttrsByName(s.Name.Name, dbOid); !found {
 			return notFound()
 		}
 		o.ctx.AddNotice(fmt.Sprintf("version has not changed for collation %q", s.Name.Name))
@@ -14842,7 +14844,7 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 			if schema == "" {
 				schema = "public"
 			}
-			if imOK && im.DropCollation(name.Name, schema) {
+			if imOK && im.DropCollation(name.Name, schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 				// DU-002 restart-persistence follow-up: mirror the DROP
 				// CAST/TRANSFORM/CONVERSION WAL emission so the drop
 				// survives a restart too.
@@ -17479,7 +17481,7 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 		// A COMMENT on a built-in raises real PG's own "for encoding" wording
 		// (get_collation_oid, namespace.c) — goopg is always UTF8. DU-002
 		// slice 390.
-		uc, ok := im.CollationAttrsByName(s.ObjName.Name)
+		uc, ok := im.CollationAttrsByName(s.ObjName.Name, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		if !ok || uc.OID == 0 {
 			return &ExecError{Code: "42704", Pos: s.Pos(),
 				Message: fmt.Sprintf("collation %q for encoding %q does not exist", s.ObjName.String(), "UTF8")}

@@ -4004,6 +4004,47 @@ survey the deferral ledger for a fresh open (`status = -`) row.
       failure out of 11,761 txns — 0.009%, unrelated to this loop's
       docs/ledger-only diff — retry passed clean, 0 failed across all 3
       workloads).
+- [ ] **M0122-0007 4e follow-up — `catalog.UserCollation` cross-database
+      isolation (M-NIGHTLY queue empty this loop; picked up the "M0110/M0119
+      work order" Current Priority banner's next candidate).** Ran
+      `TestPort_PgDumpConnectionSetup`'s soft DU-002 round-trip probe to find
+      the current per-database-catalog-isolation blocker: restoring a dump
+      into a fresh database failed `collation "builtin_coll" already exists`,
+      because `catalog.InMemory.userCollations` was one flat, dbOid-less
+      `[]*UserCollation` — the same collision shape `ForeignServer`/
+      `UserMapping` already fixed via M0122-0007 4e follow-up 36/37. Applied
+      the identical pattern: `UserCollation` gained a `DBOid uint32` field;
+      `CreateCollation`/`DropCollation`/`RenameCollation`/`SetCollationOwner`/
+      `SetCollationSchema`/`CollationAttrsByName` each gained a trailing
+      `dbOid ...uint32` param (variadic, defaults to `DefaultDBOid` — every
+      pre-existing call site unchanged); new
+      `ListUserCollationsForDBOid`/`PGCollationRowsForDBOid`; new
+      `executor.Context.PgCollationRows` wired through
+      `internal/server/dispatch.go`'s `pgCollationRowLister` +
+      `internal/executor/operators.go`'s `pg_collation` dispatch branch; all 8
+      `CREATE/ALTER/DROP/COMMENT ON COLLATION` call sites in
+      `internal/executor/operators_ddl.go` thread
+      `catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)`. Confirmed fixed via
+      the guard: the round-trip's failure point moved past the collation
+      collision to a later, different object (`type "b_in" already exists`).
+      **Deliberately scoped out (ledger row, resume points recorded):** WAL
+      restart-persistence for collations still hardcodes `DefaultDBOid` (no
+      WAL-record format change this loop); `UserCollationOIDByName`
+      (attcollation shadowing) still searches all databases by bare name,
+      unscoped. New `TestCreateCollationCrossDatabaseIsolation`
+      (`internal/catalog/create_collation_test.go`). Design doc
+      `docs/design/0122-0018-per-database-catalog-namespace.md`'s new
+      "`pg_collation`/`UserCollation` cross-database isolation" section (+
+      updated "Deferred / explicitly out of scope" list) and README index.
+      Gates: `go build ./...`/`go vet ./...` clean; `go test
+      ./internal/catalog/... ./internal/executor/... ./internal/server/...
+      ./internal/initdb/...` PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke bash
+      scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 workloads; first
+      attempt hit 1 transient pgbench failure — 0.009%, 11,364 txns, unrelated
+      to this loop's catalog/executor diff — retry passed clean). Next
+      candidate: the `CREATE TYPE`/pg_type collision the probe now hits, per
+      this same audit pattern.
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 

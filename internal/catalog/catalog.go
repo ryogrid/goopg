@@ -3091,6 +3091,16 @@ type UserCollation struct {
 	Locale        string // colllocale (builtin/icu locale); "" → NULL
 	Rules         string // collicurules (ICU tailoring rules, icu only); "" → NULL
 	Deterministic bool   // collisdeterministic
+	// DBOid is the real physical database oid this collation was CREATE
+	// COLLATION'd under (mirrors catalog.ForeignServer.DBOid). Registry
+	// entries are matched by (DBOid, NamespaceOID, Name), so two distinct
+	// databases may each CREATE COLLATION a same-named collation without
+	// colliding. Defaults to DefaultDBOid for every call site that does not
+	// pass an explicit dbOid (resolveDBOid's convention), including WAL
+	// replay (collation restart-persistence is not yet dbOid-aware — see the
+	// matching deferral ledger row). M0122-0007 4e follow-up (DU-002 round-trip
+	// probe unblock).
+	DBOid uint32
 }
 
 // UserConversion records a CREATE [DEFAULT] CONVERSION so pg_dump's
@@ -9331,60 +9341,7 @@ func (c *InMemory) registerSystemTables() {
 	// skips them. collcollate/collctype carry libc-locale rows; colllocale
 	// carries builtin/ICU rows; unset fields are NULL (""). collisdeterministic
 	// is true for every BKI row; collicurules is NULL for all. DU-002 slice 187.
-	pgCollation.VirtualRows = func() [][]string {
-		// cols: oid, collname, collnamespace, collowner, collprovider,
-		//       collisdeterministic, collencoding, collcollate, collctype,
-		//       colllocale, collicurules, collversion
-		rows := [][]string{
-			{"100", "default", "11", "10", "d", "t", "-1", "", "", "", "", ""},
-			{"950", "C", "11", "10", "c", "t", "-1", "C", "C", "", "", ""},
-			{"951", "POSIX", "11", "10", "c", "t", "-1", "POSIX", "POSIX", "", "", ""},
-			{"962", "ucs_basic", "11", "10", "b", "t", "6", "", "", "C", "", "1"},
-			{"963", "unicode", "11", "10", "i", "t", "-1", "", "", "und", "", ""},
-			{"811", "pg_c_utf8", "11", "10", "b", "t", "6", "", "", "C.UTF-8", "", "1"},
-			{"6411", "pg_unicode_fast", "11", "10", "b", "t", "6", "", "", "PG_UNICODE_FAST", "", "1"},
-		}
-		// Append user collations (CREATE COLLATION). These carry a user
-		// namespace (e.g. public=2200) so pg_dump's getCollations selects them
-		// for dump while the BKI-pinned pg_catalog rows above are skipped.
-		// M0119-0004.
-		c.mu.RLock()
-		defer c.mu.RUnlock()
-		for _, uc := range c.userCollations {
-			det := "t"
-			if !uc.Deterministic {
-				det = "f"
-			}
-			// Per-provider NULLs: libc carries collcollate/collctype and leaves
-			// colllocale NULL; builtin/icu carry colllocale and leave
-			// collcollate/collctype NULL (matching pg_collation, and what
-			// dumpCollation's per-provider branches expect). An empty text cell
-			// must surface SQL NULL — not '' — or dumpCollation's ICU branch
-			// emits a spurious `rules = ''` and warns "invalid collation". The
-			// VirtualNull sentinel forces a NULL through TypedVirtualCell.
-			nz := func(s string) string {
-				if s == "" {
-					return VirtualNull
-				}
-				return s
-			}
-			rows = append(rows, []string{
-				strconv.FormatUint(uint64(uc.OID), 10),
-				uc.Name,
-				strconv.FormatUint(uint64(uc.NamespaceOID), 10),
-				strconv.FormatUint(uint64(uc.Owner), 10),
-				string(uc.Provider),
-				det,
-				strconv.Itoa(uc.Encoding),
-				nz(uc.Collate),
-				nz(uc.Ctype),
-				nz(uc.Locale),
-				nz(uc.Rules), // collicurules: ICU tailoring rules; "" → NULL
-				VirtualNull,  // collversion: NULL → recomputed on restore
-			})
-		}
-		return rows
-	}
+	pgCollation.VirtualRows = func() [][]string { return c.PGCollationRowsForDBOid(DefaultDBOid) }
 	c.ns(DefaultDBOid).tables["pg_catalog.pg_collation"] = pgCollation
 
 	// pg_policy — stores row-level security policies (OID 3256). goopg does NOT
@@ -12416,15 +12373,16 @@ func (c *InMemory) ExtensionOID(name string) uint32 {
 // surfaced as an extra virtual pg_collation row. Returns the new OID, or 0 with
 // an error if a same-named collation already exists in the same namespace and
 // ifNotExists is false. M0119-0004.
-func (c *InMemory) CreateCollation(uc *UserCollation, schema string, ifNotExists bool) (uint32, error) {
+func (c *InMemory) CreateCollation(uc *UserCollation, schema string, ifNotExists bool, dbOid ...uint32) (uint32, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	oid := resolveDBOid(dbOid)
 	nsOID := c.schemas[strings.ToLower(schema)]
 	if nsOID == 0 {
 		nsOID = c.schemas["public"]
 	}
 	for _, existing := range c.userCollations {
-		if existing.NamespaceOID == nsOID && strings.EqualFold(existing.Name, uc.Name) {
+		if existing.DBOid == oid && existing.NamespaceOID == nsOID && strings.EqualFold(existing.Name, uc.Name) {
 			if ifNotExists {
 				return existing.OID, nil
 			}
@@ -12433,6 +12391,7 @@ func (c *InMemory) CreateCollation(uc *UserCollation, schema string, ifNotExists
 	}
 	uc.OID = c.allocOIDLocked()
 	uc.NamespaceOID = nsOID
+	uc.DBOid = oid
 	c.userCollations = append(c.userCollations, uc)
 	return uc.OID, nil
 }
@@ -12443,15 +12402,16 @@ func (c *InMemory) CreateCollation(uc *UserCollation, schema string, ifNotExists
 // collations are never registered in userCollations, so a DROP COLLATION on
 // one of them always returns false (mirrors PG, which also refuses to drop a
 // pinned pg_collation row). M0119-0004.
-func (c *InMemory) DropCollation(name, schema string) bool {
+func (c *InMemory) DropCollation(name, schema string, dbOid ...uint32) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	oid := resolveDBOid(dbOid)
 	nsOID := c.schemas[strings.ToLower(schema)]
 	if nsOID == 0 {
 		nsOID = c.schemas["public"]
 	}
 	for i, uc := range c.userCollations {
-		if uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, name) {
+		if uc.DBOid == oid && uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, name) {
 			c.userCollations = append(c.userCollations[:i], c.userCollations[i+1:]...)
 			return true
 		}
@@ -12466,20 +12426,24 @@ func (c *InMemory) DropCollation(name, schema string) bool {
 // collation named newName already exists in the same namespace. `schema`
 // resolves like CreateCollation (unknown → public). M0119-0004 (DU-002,
 // loop #50 ledger follow-up).
-func (c *InMemory) RenameCollation(name, schema, newName string) error {
+func (c *InMemory) RenameCollation(name, schema, newName string, dbOid ...uint32) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	oid := resolveDBOid(dbOid)
 	nsOID := c.schemas[strings.ToLower(schema)]
 	if nsOID == 0 {
 		nsOID = c.schemas["public"]
 	}
 	var target *UserCollation
 	for _, uc := range c.userCollations {
-		if uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, name) {
+		if uc.DBOid != oid || uc.NamespaceOID != nsOID {
+			continue
+		}
+		if strings.EqualFold(uc.Name, name) {
 			target = uc
 			continue
 		}
-		if uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, newName) {
+		if strings.EqualFold(uc.Name, newName) {
 			return fmt.Errorf("collation %q already exists", newName)
 		}
 	}
@@ -12494,15 +12458,16 @@ func (c *InMemory) RenameCollation(name, schema, newName string) error {
 // the given bare name in the given schema. Returns false if no such collation
 // is registered (mirrors RenameCollation/DropCollation). M0119-0004 (DU-002,
 // loop #50 ledger follow-up).
-func (c *InMemory) SetCollationOwner(name, schema string, ownerOID uint32) bool {
+func (c *InMemory) SetCollationOwner(name, schema string, ownerOID uint32, dbOid ...uint32) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	oid := resolveDBOid(dbOid)
 	nsOID := c.schemas[strings.ToLower(schema)]
 	if nsOID == 0 {
 		nsOID = c.schemas["public"]
 	}
 	for _, uc := range c.userCollations {
-		if uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, name) {
+		if uc.DBOid == oid && uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, name) {
 			uc.Owner = ownerOID
 			return true
 		}
@@ -12515,9 +12480,10 @@ func (c *InMemory) SetCollationOwner(name, schema string, ownerOID uint32) bool 
 // their namespace OID the same way SetCollationOwner/RenameCollation do
 // (unknown → public). Returns false if no such collation is registered.
 // DU-002 slice 442.
-func (c *InMemory) SetCollationSchema(name, schema, newSchema string) bool {
+func (c *InMemory) SetCollationSchema(name, schema, newSchema string, dbOid ...uint32) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	oid := resolveDBOid(dbOid)
 	nsOID := c.schemas[strings.ToLower(schema)]
 	if nsOID == 0 {
 		nsOID = c.schemas["public"]
@@ -12527,7 +12493,7 @@ func (c *InMemory) SetCollationSchema(name, schema, newSchema string) bool {
 		newNsOID = c.schemas["public"]
 	}
 	for _, uc := range c.userCollations {
-		if uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, name) {
+		if uc.DBOid == oid && uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, name) {
 			uc.NamespaceOID = newNsOID
 			return true
 		}
@@ -12551,6 +12517,11 @@ func (c *InMemory) CreateCollationDuringRecovery(uc *UserCollation, schema strin
 		nsOID = c.schemas["public"]
 	}
 	uc.NamespaceOID = nsOID
+	// WAL replay does not yet carry a dbOid for collation records (see the
+	// DBOid field's doc comment) — every replayed collation lands under
+	// DefaultDBOid, matching every other not-yet-migrated write path's
+	// restart behavior.
+	uc.DBOid = DefaultDBOid
 	for i, existing := range c.userCollations {
 		if existing.OID == uc.OID {
 			c.userCollations[i] = uc
@@ -13443,7 +13414,7 @@ func (c *InMemory) SetTSConfigSchemaDuringRecovery(name, schema, newSchema strin
 // searching the built-in collations and then user-created ones. Used by
 // `CREATE COLLATION new FROM existing` to copy the source's attributes. Returns
 // false if no collation by that name is known. M0119-0004.
-func (c *InMemory) CollationAttrsByName(name string) (*UserCollation, bool) {
+func (c *InMemory) CollationAttrsByName(name string, dbOid ...uint32) (*UserCollation, bool) {
 	// Built-in collations (mirror the 7 BKI rows surfaced in pg_collation):
 	// name → {provider, encoding, collate, ctype, locale}.
 	type bi struct {
@@ -13471,8 +13442,9 @@ func (c *InMemory) CollationAttrsByName(name string) (*UserCollation, bool) {
 	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	oid := resolveDBOid(dbOid)
 	for _, uc := range c.userCollations {
-		if strings.EqualFold(uc.Name, name) {
+		if uc.DBOid == oid && strings.EqualFold(uc.Name, name) {
 			cp := *uc
 			return &cp, true
 		}
@@ -13511,6 +13483,90 @@ func (c *InMemory) ListUserCollations() []*UserCollation {
 	out := make([]*UserCollation, len(c.userCollations))
 	copy(out, c.userCollations)
 	return out
+}
+
+// ListUserCollationsForDBOid returns dbOid's own user-created collations, in
+// creation order. Unlike ListUserCollations (unfiltered — kept for the
+// OID-keyed ResolveIndexColumnCollationName reverse lookup, where a
+// globally-unique OID never needs a dbOid to disambiguate), this scopes to
+// one database so pg_dump's getCollations sees only the connecting database's
+// own collations. Mirrors ListForeignServers. M0122-0007 4e follow-up (DU-002
+// round-trip probe unblock).
+func (c *InMemory) ListUserCollationsForDBOid(dbOid uint32) []*UserCollation {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(c.userCollations) == 0 {
+		return nil
+	}
+	out := make([]*UserCollation, 0, len(c.userCollations))
+	for _, uc := range c.userCollations {
+		if uc.DBOid == dbOid {
+			out = append(out, uc)
+		}
+	}
+	return out
+}
+
+// PGCollationRowsForDBOid builds the pg_collation catalog row-set for dbOid's
+// own registered user collations, appended after the 7 BKI-pinned builtin
+// rows every database shares. Mirrors PGForeignServerRowsForDBOid's
+// per-connection dbOid scoping: registerSystemTables's VirtualRows calls this
+// with DefaultDBOid so every existing caller (server dispatch without a
+// per-connection PgCollationRows wire-up, every test) sees byte-identical
+// behavior; a per-connection dbOid is wired in via executor.Context.
+// PgCollationRows (internal/server/dispatch.go's wireExtensionRows).
+// M0122-0007 4e follow-up (DU-002 round-trip probe unblock).
+func (c *InMemory) PGCollationRowsForDBOid(dbOid uint32) [][]string {
+	// cols: oid, collname, collnamespace, collowner, collprovider,
+	//       collisdeterministic, collencoding, collcollate, collctype,
+	//       colllocale, collicurules, collversion
+	rows := [][]string{
+		{"100", "default", "11", "10", "d", "t", "-1", "", "", "", "", ""},
+		{"950", "C", "11", "10", "c", "t", "-1", "C", "C", "", "", ""},
+		{"951", "POSIX", "11", "10", "c", "t", "-1", "POSIX", "POSIX", "", "", ""},
+		{"962", "ucs_basic", "11", "10", "b", "t", "6", "", "", "C", "", "1"},
+		{"963", "unicode", "11", "10", "i", "t", "-1", "", "", "und", "", ""},
+		{"811", "pg_c_utf8", "11", "10", "b", "t", "6", "", "", "C.UTF-8", "", "1"},
+		{"6411", "pg_unicode_fast", "11", "10", "b", "t", "6", "", "", "PG_UNICODE_FAST", "", "1"},
+	}
+	// Append dbOid's own user collations (CREATE COLLATION). These carry a
+	// user namespace (e.g. public=2200) so pg_dump's getCollations selects
+	// them for dump while the BKI-pinned pg_catalog rows above are skipped.
+	// M0119-0004; dbOid scoping: M0122-0007 4e follow-up.
+	for _, uc := range c.ListUserCollationsForDBOid(dbOid) {
+		det := "t"
+		if !uc.Deterministic {
+			det = "f"
+		}
+		// Per-provider NULLs: libc carries collcollate/collctype and leaves
+		// colllocale NULL; builtin/icu carry colllocale and leave
+		// collcollate/collctype NULL (matching pg_collation, and what
+		// dumpCollation's per-provider branches expect). An empty text cell
+		// must surface SQL NULL — not '' — or dumpCollation's ICU branch
+		// emits a spurious `rules = ''` and warns "invalid collation". The
+		// VirtualNull sentinel forces a NULL through TypedVirtualCell.
+		nz := func(s string) string {
+			if s == "" {
+				return VirtualNull
+			}
+			return s
+		}
+		rows = append(rows, []string{
+			strconv.FormatUint(uint64(uc.OID), 10),
+			uc.Name,
+			strconv.FormatUint(uint64(uc.NamespaceOID), 10),
+			strconv.FormatUint(uint64(uc.Owner), 10),
+			string(uc.Provider),
+			det,
+			strconv.Itoa(uc.Encoding),
+			nz(uc.Collate),
+			nz(uc.Ctype),
+			nz(uc.Locale),
+			nz(uc.Rules), // collicurules: ICU tailoring rules; "" → NULL
+			VirtualNull,  // collversion: NULL → recomputed on restore
+		})
+	}
+	return rows
 }
 
 // tablespaceVirtualRows is the VirtualRows callback for the pg_tablespace view.
