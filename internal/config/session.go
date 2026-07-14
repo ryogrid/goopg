@@ -136,7 +136,8 @@ func (s *SessionRegistry) Set(name, value string, isLocal bool) error {
 		// Postmaster / SigHup / Internal contexts cannot be SET.
 		return fmt.Errorf("parameter %q cannot be changed now", v.Name)
 	}
-	canon, err := v.canonicalize(value)
+	_, current, _ := s.Get(name)
+	canon, err := v.canonicalizeFrom(current, value)
 	if err != nil {
 		return err
 	}
@@ -183,7 +184,8 @@ func (s *SessionRegistry) SetInternal(name, value string) error {
 	if !ok {
 		return fmt.Errorf("unrecognized configuration parameter %q", name)
 	}
-	canon, err := v.canonicalize(value)
+	_, current, _ := s.Get(name)
+	canon, err := v.canonicalizeFrom(current, value)
 	if err != nil {
 		return err
 	}

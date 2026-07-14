@@ -3403,6 +3403,58 @@ survey the deferral ledger for a fresh open (`status = -`) row.
       (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
       bash scripts/ralph-precommit-test.sh` PASS (0 failed, all 3
       workloads).
+- [x] **M-NIGHTLY follow-up (2026-07-14) — `DateStyle` partial-`SET` merge
+      semantics fixed** (item (2) from the row directly above). `DateStyle`
+      was a plain `TypeString` GUC with zero parsing: `SET datestyle = 'SQL'`
+      stored the bare literal `"SQL"` (losing the order component entirely),
+      and conflicting (`'ISO, SQL'`) or unrecognized (`'bogus'`) specs were
+      silently accepted instead of rejected. Ported PostgreSQL's
+      `check_datestyle` (`postgres/src/backend/commands/variable.c`)
+      token-for-token into new `internal/config/datestyle.go`
+      (`mergeDateStyle`/`parseDateStyleValue`): each comma-separated token in
+      a `SET` sets either the style (ISO/SQL/Postgres/German) or the order
+      (YMD/DMY/MDY), starting from the *current* effective value so an
+      unspecified component survives; `GERMAN` implies `DMY` unless the same
+      SET also names an order; `DEFAULT` recursively resolves against the
+      boot value; a second conflicting token or an unrecognized keyword is
+      rejected. `Variable.canonicalize` (`internal/config/guc.go`) now
+      delegates to a new `canonicalizeFrom(current, value)` that
+      special-cases `DateStyle` before falling through to the unchanged
+      by-`Type` switch for every other GUC (byte-for-byte identical
+      behavior for the rest of the GUC table — verified via full
+      `internal/config`/`internal/server`/`internal/executor` suites).
+      `SessionRegistry.Set`/`SetInternal` (`internal/config/session.go`) now
+      fetch the session's *effective* current value via `s.Get(name)` before
+      merging, not the shared global `*Variable`'s stale `v.Value` — needed
+      so a second partial `SET datestyle` in the same session merges against
+      the session's own prior override, not the global default. New
+      `internal/config/datestyle_test.go` (6 cases: partial-set order
+      preservation, GERMAN→DMY, conflict rejection, unrecognized-keyword
+      rejection, DEFAULT-token merge, boot-value round-trip). Live
+      end-to-end verification against a real `cmd/goopg` binary via `psql`:
+      `SET datestyle='SQL'` → `SHOW datestyle`=`SQL, MDY`; subsequent
+      `SET datestyle='DMY'` → `SQL, DMY` (order-only SET correctly kept the
+      just-set style); `SET datestyle='ISO, SQL'` →
+      `ERROR: conflicting "datestyle" specifications`;
+      `SET datestyle='nonsense'` → `ERROR: unrecognized key word: "nonsense"`.
+      Design: `docs/design/0097-0151-datestyle-partial-set-merge.md` +
+      README index row. Deferral-ledger row appended (resolved this item;
+      the much larger, separately-scoped DateStyle multi-format
+      timestamp/date *output rendering* gap — goopg's formatters
+      hard-code one literal layout regardless of the GUC, across
+      `internal/executor/datum.go`, `internal/server/dispatch.go`,
+      `internal/executor/copy_text.go`, `internal/wal/pgoutput.go` — remains
+      open and unimplemented; a latent sibling-path divergence was also
+      spotted between datum.go's DATE `Format()` [MDY] and dispatch.go's
+      `date` case in `appendTypedCellText` [ISO] for the same DATE kind,
+      not yet confirmed to matter since dispatch.go is the live SELECT-output
+      path). `guc`/`date`/`timestamp`/`timestamptz`/`horology` regress
+      suites remain `fail` — this fix alone does not flip them; only the
+      GUC-merge correctness bug is closed. Gates: `go build ./...` clean;
+      `go test ./internal/config/... ./internal/server/... ./internal/executor/...`
+      PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh`
+      PASS (0 failed, all 3 workloads).
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 
