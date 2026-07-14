@@ -111,7 +111,8 @@ func TestEncodeCopyTextRowDate(t *testing.T) {
 // order) pair, so `SET datestyle` had zero effect on COPY output for
 // timestamp columns even though it already worked for DATE. Matches
 // PostgreSQL's EncodeDateTime with print_tz=false (goopg has no
-// session-timezone conversion/offset for timestamptz yet).
+// session-timezone conversion/offset for timestamptz yet). A zero fsec
+// omits the fractional part entirely, matching PostgreSQL's AppendSeconds.
 func TestEncodeCopyTextRowTimestamp(t *testing.T) {
 	cols := []catalog.Column{{Name: "ts", Type: catalog.Type{Name: "timestamp"}}}
 	when := time.Date(2026, time.July, 14, 9, 5, 3, 0, time.UTC)
@@ -120,12 +121,12 @@ func TestEncodeCopyTextRowTimestamp(t *testing.T) {
 	cases := []struct {
 		style, order, want string
 	}{
-		{"ISO", "MDY", "2026-07-14 09:05:03.000000\n"},
-		{"SQL", "MDY", "07/14/2026 09:05:03.000000\n"},
-		{"SQL", "DMY", "14/07/2026 09:05:03.000000\n"},
-		{"Postgres", "MDY", "Tue Jul 14 09:05:03.000000 2026\n"},
-		{"Postgres", "DMY", "Tue 14 Jul 09:05:03.000000 2026\n"},
-		{"German", "DMY", "14.07.2026 09:05:03.000000\n"},
+		{"ISO", "MDY", "2026-07-14 09:05:03\n"},
+		{"SQL", "MDY", "07/14/2026 09:05:03\n"},
+		{"SQL", "DMY", "14/07/2026 09:05:03\n"},
+		{"Postgres", "MDY", "Tue Jul 14 09:05:03 2026\n"},
+		{"Postgres", "DMY", "Tue 14 Jul 09:05:03 2026\n"},
+		{"German", "DMY", "14.07.2026 09:05:03\n"},
 	}
 	for _, tc := range cases {
 		got, err := EncodeCopyTextRow(nil, row, cols, tc.style, tc.order)
@@ -134,6 +135,34 @@ func TestEncodeCopyTextRowTimestamp(t *testing.T) {
 		}
 		if string(got) != tc.want {
 			t.Errorf("style=%s order=%s: got %q, want %q", tc.style, tc.order, got, tc.want)
+		}
+	}
+}
+
+// TestEncodeCopyTextRowTimestampFractionalSecondsTrimmed covers PostgreSQL's
+// AppendSeconds trim-trailing-zeros behavior: a non-zero fsec renders only
+// its significant microsecond digits, not a fixed 6-digit field.
+func TestEncodeCopyTextRowTimestampFractionalSecondsTrimmed(t *testing.T) {
+	cols := []catalog.Column{{Name: "ts", Type: catalog.Type{Name: "timestamp"}}}
+
+	cases := []struct {
+		name string
+		ns   int
+		want string
+	}{
+		{"half second", 500_000_000, "2026-07-14 09:05:03.5\n"},
+		{"trailing zeros trimmed", 120_000_000, "2026-07-14 09:05:03.12\n"},
+		{"full microsecond precision", 123_456_000, "2026-07-14 09:05:03.123456\n"},
+	}
+	for _, tc := range cases {
+		when := time.Date(2026, time.July, 14, 9, 5, 3, tc.ns, time.UTC)
+		row := Row{NewTimeDatum(when)}
+		got, err := EncodeCopyTextRow(nil, row, cols, "ISO", "MDY")
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if string(got) != tc.want {
+			t.Errorf("%s: got %q, want %q", tc.name, got, tc.want)
 		}
 	}
 }

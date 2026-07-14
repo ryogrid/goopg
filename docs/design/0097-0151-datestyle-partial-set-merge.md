@@ -213,11 +213,10 @@ behavior so nothing regresses:
   TIMESTAMPTZ has always rendered identically to TIMESTAMP (raw stored UTC
   instant, no offset). This fix keeps that invariant; the timezone-plumbing
   gap is separate, larger, and unrelated to DateStyle.
-- **Fractional seconds are always 6 digits, not PG's trim-trailing-zeros
-  behavior** (`AppendSeconds` in `datetime.c` strips trailing zero fraction
-  digits). This matches the exact fixed-`.000000` shape the code being
-  replaced already produced, so the DateStyle fix doesn't also introduce an
-  unrelated formatting change in the same loop.
+- **Fractional seconds were originally always 6 digits, not PG's
+  trim-trailing-zeros behavior** (`AppendSeconds` in `datetime.c` strips
+  trailing zero fraction digits, and omits the decimal point entirely for a
+  zero fsec) — fixed in the 2026-07-15 fractional-seconds follow-up below.
 - `Datum.Format()`/`AppendValueText()`'s ~20-call-site DateStyle-unawareness
   (CAST/to_char/plpgsql/EXPLAIN/error-message paths) and `pgoutput.go`'s gap
   remain open, as recorded in the prior follow-up — TIMESTAMP joins DATE as
@@ -252,3 +251,53 @@ behavior so nothing regresses:
   — TPC-B has no date/timestamp columns); two immediate re-runs both PASS (0
   failed, all 3 workloads), confirming the flake was unrelated to this
   change.
+
+### Follow-up (2026-07-15, fractional seconds) — `config.FormatTimestamp`
+trim-trailing-zeros
+
+Picked up the "Fractional seconds are always 6 digits" scope-out from the
+row directly above. Added `fracSecondsSuffix(t time.Time) string`
+(`internal/config/datestyle.go`) mirroring PostgreSQL's `AppendSeconds`
+(`postgres/src/backend/utils/adt/datetime.c:458`): a zero fsec returns `""`
+(no decimal point at all), a non-zero fsec returns `.` followed by only its
+significant microsecond digits (goopg stores microsecond resolution,
+matching `AppendTimestampSeconds`'s `MAX_TIMESTAMP_PRECISION=6` ceiling).
+`FormatTimestamp` now formats the date+`HH:MM:SS` portion via
+`time.Format` (fixed layouts with the `.000000` suffix removed) and appends
+`fracSecondsSuffix` — same trim-then-append pattern
+`appendTimeText`/`appendTimeOnlyValueText` already use for TIME/TIMETZ, so
+all four now agree ([[pattern_sibling_paths_must_agree]]). `FormatDate` is
+unaffected (DATE has no time-of-day component).
+
+Both call sites wired to `config.FormatTimestamp` in the row above
+(`internal/server/dispatch.go`'s `appendTypedCellText`,
+`internal/executor/copy_text.go`'s `datumToCopyText`) picked up the fix for
+free — no call-site changes needed.
+
+Tests: `internal/config/datestyle_test.go`
+`TestFormatTimestampFractionalSeconds` (zero/half-second/trailing-zeros/
+full-microsecond cases against `FormatTimestamp` directly); updated the two
+existing whole-second fixtures (`TestEncodeCopyTextRowTimestamp`,
+`TestAppendTypedCellTextTimestampHonorsDateStyle`) to expect no `.000000`
+suffix, and added `TestEncodeCopyTextRowTimestampFractionalSecondsTrimmed`
+for the COPY path. Live `psql` verification against a real `cmd/goopg`
+binary (isolated data dir, port 5535, cleaned up after): 3 rows
+(`09:05:03`, `09:05:03.5`, `09:05:03.123456`) under `ISO, MDY` render as
+`2026-07-14 09:05:03` / `...09:05:03.5` / `...09:05:03.123456` (previously
+all three padded to `.000000`/`.500000`/`.123456`); `Postgres, DMY` renders
+the same three fsec shapes with the day/month/year reordering; `COPY ...
+TO STDOUT` matches the SELECT output.
+
+Still open, unchanged by this loop: `Datum.Format()`/`AppendValueText()`'s
+~20-call-site DateStyle-unawareness (also still hardcoded to fixed-6-digit
+fractional seconds — a live sibling-path divergence from the two fixed call
+sites, now on two axes instead of one), TIMESTAMPTZ's missing
+timezone-aware conversion/offset, and `pgoutput.go`'s gap — all as recorded
+in the prior follow-up.
+
+Gates: `go build ./...` clean; `go vet` clean (`internal/config`,
+`internal/executor`, `internal/server`); `go test
+./internal/config/... ./internal/executor/... ./internal/server/...` PASS
+(full packages, no regressions); `scripts/tpch-spotcheck.sh` PASS
+(Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke bash
+scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 workloads).

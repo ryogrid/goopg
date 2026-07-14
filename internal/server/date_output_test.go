@@ -72,13 +72,13 @@ func TestAppendTypedCellTextTimestampHonorsDateStyle(t *testing.T) {
 			getSetting func(name string) (string, bool)
 			want       string
 		}{
-			{"nil session falls back to ISO/MDY", nil, "2026-07-14 09:05:03.000000"},
-			{"ISO, MDY", constSetting("ISO, MDY"), "2026-07-14 09:05:03.000000"},
-			{"SQL, MDY", constSetting("SQL, MDY"), "07/14/2026 09:05:03.000000"},
-			{"SQL, DMY", constSetting("SQL, DMY"), "14/07/2026 09:05:03.000000"},
-			{"Postgres, MDY", constSetting("Postgres, MDY"), "Tue Jul 14 09:05:03.000000 2026"},
-			{"Postgres, DMY", constSetting("Postgres, DMY"), "Tue 14 Jul 09:05:03.000000 2026"},
-			{"German, DMY", constSetting("German, DMY"), "14.07.2026 09:05:03.000000"},
+			{"nil session falls back to ISO/MDY", nil, "2026-07-14 09:05:03"},
+			{"ISO, MDY", constSetting("ISO, MDY"), "2026-07-14 09:05:03"},
+			{"SQL, MDY", constSetting("SQL, MDY"), "07/14/2026 09:05:03"},
+			{"SQL, DMY", constSetting("SQL, DMY"), "14/07/2026 09:05:03"},
+			{"Postgres, MDY", constSetting("Postgres, MDY"), "Tue Jul 14 09:05:03 2026"},
+			{"Postgres, DMY", constSetting("Postgres, DMY"), "Tue 14 Jul 09:05:03 2026"},
+			{"German, DMY", constSetting("German, DMY"), "14.07.2026 09:05:03"},
 		}
 		for _, tt := range tests {
 			t.Run(typeName+"/"+tt.name, func(t *testing.T) {

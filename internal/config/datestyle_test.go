@@ -1,6 +1,34 @@
 package config
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
+
+// TestFormatTimestampFractionalSeconds matches PostgreSQL's AppendSeconds
+// (postgres/src/backend/utils/adt/datetime.c): a zero fsec omits the
+// decimal point entirely, and a non-zero fsec is trimmed of trailing zeros
+// rather than always padded to 6 digits.
+func TestFormatTimestampFractionalSeconds(t *testing.T) {
+	base := time.Date(2026, time.July, 14, 9, 5, 3, 0, time.UTC)
+	cases := []struct {
+		name string
+		ns   int
+		want string
+	}{
+		{"zero fsec omits dot", 0, "2026-07-14 09:05:03"},
+		{"half second", 500_000_000, "2026-07-14 09:05:03.5"},
+		{"trailing zeros trimmed", 120_000_000, "2026-07-14 09:05:03.12"},
+		{"full microsecond precision", 123_456_000, "2026-07-14 09:05:03.123456"},
+	}
+	for _, tc := range cases {
+		when := time.Date(base.Year(), base.Month(), base.Day(), base.Hour(), base.Minute(), base.Second(), tc.ns, time.UTC)
+		got := FormatTimestamp(when, "ISO", "MDY")
+		if got != tc.want {
+			t.Errorf("%s: FormatTimestamp() = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
 
 // TestDateStylePartialSetPreservesOrder mirrors PostgreSQL's
 // check_datestyle behavior (postgres/src/backend/commands/variable.c):

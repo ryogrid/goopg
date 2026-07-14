@@ -139,6 +139,34 @@ func FormatDate(t time.Time, style, order string) string {
 }
 
 
+// fracSecondsSuffix renders t's sub-second component as a leading-dot suffix
+// (e.g. ".5", ".000123"), trimmed of trailing zeros, or "" when there is no
+// fractional part — matching PostgreSQL's AppendSeconds
+// (postgres/src/backend/utils/adt/datetime.c), which omits the decimal point
+// entirely for a zero fsec and otherwise prints only the significant digits.
+// goopg stores microsecond resolution, matching AppendTimestampSeconds's
+// MAX_TIMESTAMP_PRECISION=6 ceiling.
+func fracSecondsSuffix(t time.Time) string {
+	ns := t.Nanosecond()
+	if ns == 0 {
+		return ""
+	}
+	micro := ns / 1000
+	var frac [6]byte
+	for i := 5; i >= 0; i-- {
+		frac[i] = byte('0' + micro%10)
+		micro /= 10
+	}
+	end := len(frac)
+	for end > 0 && frac[end-1] == '0' {
+		end--
+	}
+	if end == 0 {
+		return ""
+	}
+	return "." + string(frac[:end])
+}
+
 // FormatTimestamp renders a TIMESTAMP/TIMESTAMPTZ value's text according to
 // the given DateStyle (style, order) pair, matching PostgreSQL's
 // EncodeDateTime (postgres/src/backend/utils/adt/datetime.c) with
@@ -146,25 +174,25 @@ func FormatDate(t time.Time, style, order string) string {
 // rendering for TIMESTAMPTZ yet (a separate, larger deferred gap; see the
 // deferral ledger), so both types render their stored instant identically to
 // plain TIMESTAMP, same as before this DateStyle fix. Fractional seconds are
-// always shown to 6 digits (not PG's trim-trailing-zeros behavior), matching
-// the existing AppendValueText ISO formatting this replaces for these two
-// type names, to avoid introducing a second, independent divergence in the
-// same loop.
+// trimmed of trailing zeros (and omitted entirely when zero) via
+// fracSecondsSuffix, matching PostgreSQL's AppendSeconds rather than always
+// padding to 6 digits.
 func FormatTimestamp(t time.Time, style, order string) string {
+	frac := fracSecondsSuffix(t)
 	switch style {
 	case "SQL":
 		if order == "DMY" {
-			return t.Format("02/01/2006 15:04:05.000000")
+			return t.Format("02/01/2006 15:04:05") + frac
 		}
-		return t.Format("01/02/2006 15:04:05.000000")
+		return t.Format("01/02/2006 15:04:05") + frac
 	case "Postgres":
 		if order == "DMY" {
-			return t.Format("Mon 02 Jan 15:04:05.000000 2006")
+			return t.Format("Mon 02 Jan 15:04:05") + frac + t.Format(" 2006")
 		}
-		return t.Format("Mon Jan 02 15:04:05.000000 2006")
+		return t.Format("Mon Jan 02 15:04:05") + frac + t.Format(" 2006")
 	case "German":
-		return t.Format("02.01.2006 15:04:05.000000")
+		return t.Format("02.01.2006 15:04:05") + frac
 	default:
-		return t.Format("2006-01-02 15:04:05.000000")
+		return t.Format("2006-01-02 15:04:05") + frac
 	}
 }
