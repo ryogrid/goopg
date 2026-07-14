@@ -43,7 +43,7 @@ func evalBinaryBatch(op parser.OpCode, left, right, out []Datum) error {
 	// expression at plan time.
 	const pos = 0
 	for i := 0; i < n; i++ {
-		v, err := evalBinary(op, left[i], right[i], pos)
+		v, err := evalBinary(op, left[i], right[i], pos, nil)
 		if err != nil {
 			return err
 		}

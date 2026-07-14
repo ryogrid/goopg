@@ -71,7 +71,7 @@ func TestMatchSQLLike(t *testing.T) {
 func TestEvalLikeAcceptsKindBytes(t *testing.T) {
 	left := NewBytesDatum([]byte("forest green slate"))
 	right := NewStringDatum("%green%")
-	got, err := evalBinary(parser.OpLike, left, right, 0)
+	got, err := evalBinary(parser.OpLike, left, right, 0, nil)
 	if err != nil {
 		t.Fatalf("LIKE on KindBytes left: unexpected error %v", err)
 	}
@@ -81,7 +81,7 @@ func TestEvalLikeAcceptsKindBytes(t *testing.T) {
 
 	// Both-sides-bytes also works (defensive symmetry).
 	right2 := NewBytesDatum([]byte("%green%"))
-	got2, err := evalBinary(parser.OpNotLike, left, right2, 0)
+	got2, err := evalBinary(parser.OpNotLike, left, right2, 0, nil)
 	if err != nil {
 		t.Fatalf("NOT LIKE on KindBytes both: %v", err)
 	}
@@ -96,7 +96,7 @@ func TestEvalLikeAcceptsKindBytes(t *testing.T) {
 func TestEvalLikeKindReportedInError(t *testing.T) {
 	left := Datum{Kind: KindInt, Int: 42}
 	right := NewStringDatum("%foo%")
-	_, err := evalBinary(parser.OpLike, left, right, 0)
+	_, err := evalBinary(parser.OpLike, left, right, 0, nil)
 	if err == nil {
 		t.Fatalf("LIKE on KindInt: expected error, got nil")
 	}

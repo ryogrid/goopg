@@ -25,7 +25,7 @@ func TestEvalBinaryBatchEquivalencePerRowEq(t *testing.T) {
 	// Per-row baseline.
 	expected := make([]Datum, n)
 	for i := 0; i < n; i++ {
-		v, err := evalBinary(parser.OpEq, left[i], right[i], 0)
+		v, err := evalBinary(parser.OpEq, left[i], right[i], 0, nil)
 		if err != nil {
 			t.Fatalf("per-row[%d]: %v", i, err)
 		}
@@ -58,7 +58,7 @@ func TestEvalBinaryBatchEquivalencePerRowAdd(t *testing.T) {
 	}
 	expected := make([]Datum, n)
 	for i := 0; i < n; i++ {
-		v, err := evalBinary(parser.OpAdd, left[i], right[i], 0)
+		v, err := evalBinary(parser.OpAdd, left[i], right[i], 0, nil)
 		if err != nil {
 			t.Fatalf("per-row[%d]: %v", i, err)
 		}

@@ -267,7 +267,7 @@ func evalFastExpr(exprs exprTreeSlab, idx int32, slot SlotView, ctx *Context) (D
 				return res, nil
 			}
 		}
-		result, err := evalBinary(op, left, right, 0)
+		result, err := evalBinary(op, left, right, 0, ctx)
 		if err != nil {
 			return Datum{}, err
 		}

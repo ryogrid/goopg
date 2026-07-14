@@ -1051,7 +1051,7 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 			}
 		}
 	normalBinaryOp:
-		result, err := evalBinary(x.Op, left, right, x.Pos())
+		result, err := evalBinary(x.Op, left, right, x.Pos(), ctx)
 		if err != nil {
 			return Datum{}, err
 		}
@@ -1375,7 +1375,7 @@ func evalPgLSNBinary(op parser.OpCode, left, right Datum, pos int) (Datum, bool,
 // evalBinary handles arithmetic, comparison, and boolean operators.
 // SQL three-valued logic: NULL operand on most operators yields NULL;
 // AND/OR follow Kleene's rules.
-func evalBinary(op parser.OpCode, left, right Datum, pos int) (Datum, error) {
+func evalBinary(op parser.OpCode, left, right Datum, pos int, ctx *Context) (Datum, error) {
 	if op.IsBoolean() {
 		switch op {
 		case parser.OpAnd:
@@ -1490,9 +1490,11 @@ func evalBinary(op parser.OpCode, left, right Datum, pos int) (Datum, error) {
 		// Array concatenation: if both operands look like PostgreSQL arrays
 		// ({v1,v2,...}), merge their elements rather than text-concat.
 		// Also handles array || element and element || array (append/prepend).
-		// M0097-0065.
-		ls := left.Format()
-		rs := right.Format()
+		// M0097-0065. Non-array text rendering honors the session DateStyle
+		// GUC for DATE/TIMESTAMP/TIMESTAMPTZ operands (formatDatumDateStyle),
+		// matching the already-fixed SELECT/COPY/CAST output paths.
+		ls := formatDatumDateStyle(left, ctx)
+		rs := formatDatumDateStyle(right, ctx)
 		lsIsArr := len(ls) >= 2 && ls[0] == '{' && ls[len(ls)-1] == '}'
 		rsIsArr := len(rs) >= 2 && rs[0] == '{' && rs[len(rs)-1] == '}'
 		if lsIsArr && rsIsArr {
@@ -3108,6 +3110,19 @@ func formatTimeDatumDateStyle(d Datum, style, order string) string {
 		return config.FormatDate(d.TimeValue(), style, order)
 	}
 	return config.FormatTimestamp(d.TimeValue(), style, order)
+}
+
+// formatDatumDateStyle is Datum.Format() with DateStyle-aware KindTime
+// rendering: a DATE/TIMESTAMP/TIMESTAMPTZ datum honors the session's
+// datestyle GUC (via ctx), every other Kind falls back to Format()
+// unchanged. Pass nil ctx where no session is reachable (defaults to
+// ISO/MDY, matching Format()'s pre-existing hardcoded behavior).
+func formatDatumDateStyle(d Datum, ctx *Context) string {
+	if d.Kind != KindTime {
+		return d.Format()
+	}
+	style, order := dateStyleFromCtx(ctx)
+	return formatTimeDatumDateStyle(d, style, order)
 }
 
 // evalCast coerces datum d to the declared SQL type name.
@@ -6415,7 +6430,7 @@ func evalInExpr(x *planner.InExpr, slot SlotView, ctx *Context) (Datum, error) {
 			if v.IsNull() {
 				continue
 			}
-			res, err := evalBinary(x.AnyOp, operand, v, 0)
+			res, err := evalBinary(x.AnyOp, operand, v, 0, ctx)
 			if err != nil {
 				return Datum{}, err
 			}
@@ -6433,7 +6448,7 @@ func evalInExpr(x *planner.InExpr, slot SlotView, ctx *Context) (Datum, error) {
 			if v.IsNull() {
 				continue
 			}
-			res, err := evalBinary(x.AnyOp, operand, v, 0)
+			res, err := evalBinary(x.AnyOp, operand, v, 0, ctx)
 			if err != nil {
 				return Datum{}, err
 			}

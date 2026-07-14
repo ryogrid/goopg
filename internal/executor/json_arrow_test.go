@@ -51,7 +51,7 @@ func TestJSONArrowOperators(t *testing.T) {
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got, err := evalBinary(c.op, c.left, c.right, 0)
+			got, err := evalBinary(c.op, c.left, c.right, 0, nil)
 			if err != nil {
 				t.Fatalf("evalBinary: %v", err)
 			}
@@ -73,7 +73,7 @@ func TestJSONArrowOperators(t *testing.T) {
 
 // TestJSONArrowInvalidJSON pins the 22P02 error for a non-JSON left operand.
 func TestJSONArrowInvalidJSON(t *testing.T) {
-	_, err := evalBinary(parser.OpJSONGet, NewStringDatum("not json"), NewStringDatum("a"), 0)
+	_, err := evalBinary(parser.OpJSONGet, NewStringDatum("not json"), NewStringDatum("a"), 0, nil)
 	if err == nil {
 		t.Fatal("expected error for invalid json, got nil")
 	}
@@ -87,15 +87,15 @@ func TestJSONArrowInvalidJSON(t *testing.T) {
 // j -> 0 -> 'Plan' -> 'Heap Fetches' navigates an array-of-objects to a scalar.
 func TestJSONArrowChained(t *testing.T) {
 	j := `[{"Plan": {"Heap Fetches": 2}}]`
-	step1, err := evalBinary(parser.OpJSONGet, NewStringDatum(j), NewIntDatum(0), 0)
+	step1, err := evalBinary(parser.OpJSONGet, NewStringDatum(j), NewIntDatum(0), 0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	step2, err := evalBinary(parser.OpJSONGet, step1, NewStringDatum("Plan"), 0)
+	step2, err := evalBinary(parser.OpJSONGet, step1, NewStringDatum("Plan"), 0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	step3, err := evalBinary(parser.OpJSONGet, step2, NewStringDatum("Heap Fetches"), 0)
+	step3, err := evalBinary(parser.OpJSONGet, step2, NewStringDatum("Heap Fetches"), 0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

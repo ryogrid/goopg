@@ -596,3 +596,77 @@ plan-time CAST-wrapping (b) was passed over in favor of the runtime
 coercion (a) specifically to keep byte-for-byte behavioral parity with the
 already-shipped, already-tested INSERT path rather than introduce a second,
 differently-shaped fix for the same underlying problem).
+
+## Follow-up (2026-07-15): `||` (string concatenation) DateStyle-awareness
+
+Picked up the "audit the ~20 `Format()`/`AppendValueText()` call sites for
+`ctx` reachability" resume point, this time targeting `evalBinary`'s
+`parser.OpConcat` case (`internal/executor/expr.go`) — the array-concat
+detection logic and the plain two-operand text-concat fallback both called
+`left.Format()`/`right.Format()` directly, so `'as of ' || some_date_col`
+or `some_timestamp_col || ' end'` always rendered ISO/Postgres-MDY
+regardless of `SET datestyle`, diverging from the already-fixed
+SELECT/COPY/CAST-to-text/FK-DETAIL paths.
+
+`evalBinary` had no `*Context` parameter at all (unlike `evalCast`/
+`fkValsForDetail`, which already carry one). Added `ctx *Context` as a new
+trailing parameter and threaded it through every call site: the two
+production sites with a live session in scope (`evalExprSlot`'s main binary-
+op dispatch, `evalInExpr`'s `ANY`/`ALL` per-element loop) pass their `ctx`;
+`evalFastExpr`'s fast-path dispatch can also reach `OpConcat` and has `ctx`
+in scope, so it passes it too. Two call sites that can never reach
+`OpConcat` with a `KindTime` operand pass `nil` — `evalBinaryBatch`
+(vectorised batch eval — `canVectoriseBinary` excludes `OpConcat`, so this
+call can never actually execute the changed branch) and `windowOp.inRange`
+(only ever invoked with `OpAdd`/`OpSub` for frame-bound arithmetic) pass
+`nil` since no session is reachable there and the branch is unreachable
+from those call sites regardless. All ~15 test-only callers (`like_test.go`,
+`json_arrow_test.go`, `point_geom_test.go`, `expr_batch_test.go`,
+`executor_test.go`) now pass `nil`, matching the existing `evalCast` test
+convention.
+
+New helper `formatDatumDateStyle(d Datum, ctx *Context) string` (next to
+`formatTimeDatumDateStyle`/`dateStyleFromCtx`): a `Format()`-compatible
+wrapper that dispatches a `KindTime` datum through
+`dateStyleFromCtx`+`formatTimeDatumDateStyle` and falls through to
+`d.Format()` unchanged for every other `Kind` — this is the reusable
+"Format() but DateStyle-aware for time values" primitive the prior row's
+resume note anticipated wanting (`FormatWithDateStyle`-shaped), scoped
+narrowly to `||` rather than replacing `Format()` itself, since the full
+~20-call-site fan-out remains its own multi-loop project (see Still Open
+below). `evalBinary`'s `OpConcat` case now calls
+`formatDatumDateStyle(left, ctx)`/`formatDatumDateStyle(right, ctx)` instead
+of `left.Format()`/`right.Format()` for both the array-literal-detection
+prefix/suffix check and the final text-concat result — array concatenation
+itself is unaffected since no PG array literal renders through the
+`KindTime` branch.
+
+New tests (`internal/executor/concat_datestyle_test.go`):
+`TestConcatHonorsDateStyle` (`prefix || date` and `timestamp || suffix`
+across ISO/SQL/Postgres/German × MDY/DMY, mirroring the CAST-to-text test's
+matrix shape), `TestConcatNilCtxDefaultsISO` (nil-ctx callers unchanged,
+same convention as `TestEvalCastTimeToTextNilCtxDefaultsISO`). Confirmed
+non-vacuous by temporarily reverting the two `formatDatumDateStyle` calls
+back to `left.Format()`/`right.Format()` and re-running
+`TestConcatHonorsDateStyle` — all 7 cases fail with the un-reformatted
+literal, as expected, before restoring the fix. Live `psql` verification
+(port 5541): `'d=' || d` and `ts || ' end'` on a `DATE`/`TIMESTAMP` column
+under `SET datestyle` ISO/`SQL, DMY`/`Postgres, DMY`/`German` all agree
+byte-for-byte with the SELECT-output path's own rendering of the same
+columns.
+
+Gates: `go build ./...`/`go vet ./...` clean (repo-wide); `go test -count=1
+./internal/executor/...` PASS (full package, no regressions);
+`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+`RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh` PASS (0
+failed transactions, all 3 pgbench workloads).
+
+**Still open** (deferral-ledger row appended): `Datum.Format()`/
+`AppendValueText()`'s remaining ~19 direct call sites (`array_to_string`'s
+array-element rendering in `operators_join_agg.go`, `to_char`'s generic
+fallback, plpgsql `RAISE`/string-building in `plpgsql_runtime.go`, EXPLAIN,
+other error-message formatting, `operators_analyze.go` bound-rendering)
+remain DateStyle-unaware — still fixed-ISO TIMESTAMP / hardcoded-Postgres-
+MDY DATE regardless of `SET datestyle`. TIMESTAMPTZ's missing session-
+timezone-aware conversion/offset and `pgoutput.go`'s DateStyle-plumbing gap
+remain open too, unchanged from the prior rows.

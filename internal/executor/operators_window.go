@@ -902,7 +902,7 @@ func (o *windowOp) inRange(val, base, offset Datum, sub, less bool) (bool, error
 			op = parser.OpSub
 		}
 		var err error
-		sum, err = evalBinary(op, base, offset, o.rangePos())
+		sum, err = evalBinary(op, base, offset, o.rangePos(), nil)
 		if err != nil {
 			return false, err
 		}

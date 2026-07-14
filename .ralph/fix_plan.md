@@ -3654,6 +3654,34 @@ survey the deferral ledger for a fresh open (`status = -`) row.
       regressions); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
       `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh`
       PASS (0 failed, all 3 workloads).
+- [x] **M-NIGHTLY (run 20260714-011651 follow-up) — `||` (string
+      concatenation) DateStyle-awareness fixed.** Next slice in the
+      `evalCast`/`fkValsForDetail`/INSERT/UPDATE-coercion resume chain.
+      `evalBinary`'s `parser.OpConcat` case (`internal/executor/expr.go`)
+      called `left.Format()`/`right.Format()` directly, so
+      `'prefix' || date_col` / `timestamp_col || 'suffix'` always rendered
+      ISO/Postgres-MDY regardless of `SET datestyle`. Added a `ctx *Context`
+      trailing parameter to `evalBinary` (previously had none) and threaded
+      it through all production call sites (`evalExprSlot`, `evalInExpr`'s
+      ANY/ALL loop, `evalFastExpr`) plus `nil` for the 2 sites that can
+      never reach `OpConcat` with a `KindTime` operand
+      (`evalBinaryBatch`/`windowOp.inRange`) and all ~15 test-only callers.
+      New reusable `formatDatumDateStyle(d, ctx)` helper
+      (Format()-compatible, DateStyle-aware for `KindTime`). New tests
+      `internal/executor/concat_datestyle_test.go`
+      (`TestConcatHonorsDateStyle`, `TestConcatNilCtxDefaultsISO`);
+      non-vacuousness confirmed via a temporary revert-and-rerun. Live
+      `psql` verification (port 5541) across ISO/SQL/Postgres/German ×
+      MDY/DMY. Design doc `docs/design/0097-0151-datestyle-partial-set-merge.md`
+      "Follow-up (2026-07-15): \|\| (string concatenation) DateStyle-awareness"
+      section; README index row updated. Deferral-ledger row appended
+      (resume point: `operators_join_agg.go`'s `array_to_string` element
+      rendering is the natural next slice). Gates: `go build ./...`/
+      `go vet ./...` clean (repo-wide); `go test -count=1
+      ./internal/executor/...` PASS (full package, no regressions);
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh`
+      PASS (0 failed, all 3 workloads).
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 
