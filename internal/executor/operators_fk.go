@@ -400,7 +400,7 @@ func fkDeleteAncestorPass(ctx *Context, im *catalog.InMemory, leafTbl *catalog.T
 				Message: fmt.Sprintf("update or delete on table %q violates foreign key constraint %q on table %q",
 					leafTbl.Name, cname, ref.Child.Name),
 				Detail: fmt.Sprintf("Key (%s)=(%s) is still referenced from table %q.",
-					strings.Join(refCols, ", "), fkValsForDetail(vals), ref.Child.Name),
+					strings.Join(refCols, ", "), fkValsForDetail(ctx, vals), ref.Child.Name),
 			}
 		}
 		child = parent
@@ -610,7 +610,7 @@ func assertParentExists(ctx *Context, fkOwnerTbl *catalog.Table, reportTbl *cata
 			Message: fmt.Sprintf("insert or update on table %q violates foreign key constraint %q",
 				reportName, fkConstraintName(fkOwnerTbl, fk)),
 			Detail: fmt.Sprintf("Key (%s)=(%s) is not present in table %q.",
-				strings.Join(fk.Columns, ", "), fkValsForDetail(vals), fk.RefTable),
+				strings.Join(fk.Columns, ", "), fkValsForDetail(ctx, vals), fk.RefTable),
 		}
 	}
 	return nil
@@ -709,7 +709,8 @@ func checkFKColumnTypeCompatibility(ctx *Context, childTbl *catalog.Table, fk ca
 
 // fkValsForDetail renders FK column values for the PostgreSQL-style DETAIL
 // line `Key (col)=(val) is not present in table "<parent>".`
-func fkValsForDetail(vals []Datum) string {
+func fkValsForDetail(ctx *Context, vals []Datum) string {
+	style, order := dateStyleFromCtx(ctx)
 	var sb strings.Builder
 	for i, v := range vals {
 		if i > 0 {
@@ -717,6 +718,10 @@ func fkValsForDetail(vals []Datum) string {
 		}
 		if v.IsNull() {
 			sb.WriteString("null")
+			continue
+		}
+		if v.Kind == KindTime {
+			sb.WriteString(formatTimeDatumDateStyle(v, style, order))
 			continue
 		}
 		sb.WriteString(v.Format())
@@ -748,7 +753,7 @@ func assertNoChildRows(ctx *Context, childTbl *catalog.Table, fk catalog.Foreign
 			Message: fmt.Sprintf("update or delete on table %q violates foreign key constraint %q on table %q",
 				fk.RefTable, constraintName, childTbl.Name),
 			Detail: fmt.Sprintf("Key (%s)=(%s) is still referenced from table %q.",
-				strings.Join(refCols, ", "), fkValsForDetail(vals), childTbl.Name),
+				strings.Join(refCols, ", "), fkValsForDetail(ctx, vals), childTbl.Name),
 		}
 	}
 	return nil
@@ -1046,7 +1051,7 @@ func detachPartitionFKRefCheck(ctx *Context, parentTbl, childTbl *catalog.Table)
 				Message: fmt.Sprintf("removing partition %q violates foreign key constraint %q",
 					childTbl.Name, cname),
 				Detail: fmt.Sprintf("Key (%s)=(%s) is still referenced from table %q.",
-					strings.Join(fk.Columns, ", "), fkValsForDetail(violating), fkTbl.Name),
+					strings.Join(fk.Columns, ", "), fkValsForDetail(ctx, violating), fkTbl.Name),
 			}
 		}
 	}

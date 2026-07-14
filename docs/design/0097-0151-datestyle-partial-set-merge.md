@@ -385,3 +385,68 @@ Gates: `go build ./...` clean; `go vet ./...` clean; `go test
 ./internal/executor/...` PASS (full package, no regressions);
 `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
 bash scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 workloads).
+
+## Follow-up (2026-07-15): FK violation `DETAIL` line DateStyle-awareness
+
+Picked up the "audit the ~20 `Format()`/`AppendValueText()` call sites for
+`ctx` reachability" resume point, targeting `operators_fk.go`'s
+`fkValsForDetail(vals []Datum) string` — the helper that renders the
+`Key (col)=(val) is not present in table "X".` /
+`Key (col)=(val) is still referenced from table "Y".` DETAIL line PostgreSQL
+attaches to every `23503` foreign-key-violation error. Before this fix it
+called `v.Format()` unconditionally, which hardcodes ISO for TIMESTAMP and
+Postgres-style MDY for DATE regardless of `SET datestyle`.
+
+Renamed the CAST follow-up's `formatTimeDatumForCast` helper to
+`formatTimeDatumDateStyle` (it was never actually CAST-specific — just the
+name implied it) and reused it directly rather than growing a parallel
+helper, per [[pattern_sibling_paths_must_agree]]. `fkValsForDetail` gained a
+`ctx *Context` parameter; all 4 production call sites
+(`assertParentExists` ×2 via `checkFKInsert`/`enforceFKOnDelete`'s reverse
+check, `assertNoChildRows`, `detachPartitionFKRefCheck`) already had `ctx`
+in scope, so no call site is left passing `nil`. New
+`TestFKValsForDetailHonorsDateStyle` (`operators_fk_test.go`) pins German
+style DATE rendering plus the nil-ctx ISO/MDY fallback.
+
+**Live-verification finding — a real, deeper, separate gap discovered by
+this probe (not fixed here):** live `psql` testing against a real
+`cmd/goopg` binary showed the fix works correctly for the DELETE/UPDATE
+parent-side check (`assertNoChildRows`) and the partition-detach check
+(`detachPartitionFKRefCheck`) — both operate on `Datum`s decoded from an
+already-stored heap row, which carry a proper `KindTime`/`flagDate`-tagged
+value (confirmed via a temporary debug probe: `Kind=5 Flags=2`), so
+`SET datestyle='German'; DELETE FROM parent WHERE d = '2026-07-14'` now
+correctly renders `DETAIL: Key (d)=(14.07.2026) is still referenced from
+table "child".`
+
+But the INSERT-side check (`assertParentExists` via `checkFKInsert`) does
+**not** benefit: the same live probe showed `vals[0].Kind=3` (`KindString`)
+there, i.e. the row value is still the raw VALUES-clause literal text, not
+yet coerced to `KindTime`. `operators_storage.go`'s `insertOp.Next` only
+explicitly coerces `int2`/`int4`/`int8` columns before the FK/CHECK/domain
+constraint checks run (the "Integer range enforcement" block, ~line 1900);
+DATE/TIMESTAMP/TIMESTAMPTZ (and NUMERIC) columns are left as whatever `Kind`
+the source expression produced, and only become properly typed later, at
+storage encode. So `INSERT INTO child VALUES ('2026-01-02')` under
+`SET datestyle='German'` still renders `DETAIL: Key (d)=(2026-01-02) is not
+present...` — the raw literal, unreformatted — because `fkValsForDetail`'s
+`v.Kind == KindTime` branch never fires; it silently falls through to
+`v.Format()` on the KindString, which happens to just echo the literal back
+verbatim. Since the literal a user types is usually already close to
+DateStyle-consistent this is easy to miss in casual testing, but it means
+CHECK constraints, domain CHECK/NOT NULL, and FK checks all evaluate against
+un-coerced DATE/TIMESTAMP/NUMERIC literals during INSERT — a correctness gap
+wider than DateStyle alone (e.g. a CHECK constraint comparing a date column
+against another date could behave differently pre- vs post-coercion for
+edge cases like `'today'`/`'now'` special values). Deferral-ledger row
+appended with the resume point: extend `insertOp.Next`'s existing
+int2/int4/int8 coercion loop to also cover `date`/`timestamp`/`timestamptz`
+(and audit `numeric`) via the same `evalCast(row[i], typeName, pos, ctx)`
+pattern already used for the integer types — this is INSERT-path-only;
+UPDATE's coercion (if any) and the `updateOp`/`upsertOp` siblings need the
+same audit per [[pattern_sibling_paths_must_agree]].
+
+Gates: `go build ./...` clean; `go vet ./...` clean; `go test -count=1
+./internal/executor/...` PASS (full package, no regressions);
+`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+bash scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 workloads).

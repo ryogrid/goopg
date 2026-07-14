@@ -3518,6 +3518,67 @@ survey the deferral ledger for a fresh open (`status = -`) row.
       (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
       bash scripts/ralph-precommit-test.sh` PASS (0 failed, all 3
       workloads).
+- [x] **M-NIGHTLY (run 20260714-011651 follow-up) — `evalCast`'s CAST-to-text
+      DateStyle-awareness fixed** (commit `751b8217`, landed a prior loop but
+      missing its fix_plan entry — recorded here for continuity). `x::text`/
+      `CAST(x AS text)`/`text(x)` on a DATE/TIMESTAMP/TIMESTAMPTZ value now
+      honors `SET datestyle` via a new `ctx *Context` param threaded through
+      `evalCast`/`evalCastTyped` plus `dateStyleFromCtx`/
+      `formatTimeDatumForCast` helpers (`internal/executor/expr.go`). Full
+      details/gates in the deferral ledger row dated 2026-07-15 and
+      `docs/design/0097-0151-datestyle-partial-set-merge.md`'s "Follow-up
+      (2026-07-15): `CAST`-to-text DateStyle-awareness" section.
+- [x] **M-NIGHTLY (run 20260714-011651 follow-up) — FK-violation `DETAIL`
+      line DateStyle-awareness (`fkValsForDetail`) fixed.** Picked up the
+      "audit the ~20 `Format()`/`AppendValueText()` call sites" resume point.
+      `operators_fk.go`'s `fkValsForDetail(vals []Datum) string` — renders
+      the `Key (col)=(val) is not present in table "X".` / `...is still
+      referenced from table "Y".` DETAIL line on every `23503` FK-violation
+      error — called `v.Format()` unconditionally (fixed ISO / hardcoded
+      Postgres-MDY-only), diverging from the already-fixed SELECT/COPY/CAST
+      output paths. Renamed the CAST follow-up's `formatTimeDatumForCast` to
+      `formatTimeDatumDateStyle` (it was never actually CAST-specific) and
+      reused it directly (`pattern_sibling_paths_must_agree`) rather than
+      growing a parallel helper. Added a `ctx *Context` param to
+      `fkValsForDetail`; all 4 production call sites (`assertParentExists`
+      ×2, `assertNoChildRows`, `detachPartitionFKRefCheck`) already had `ctx`
+      in scope, so every call site is now DateStyle-aware (none fall back to
+      the nil-ctx ISO/MDY default). New
+      `TestFKValsForDetailHonorsDateStyle` (`operators_fk_test.go`; German
+      style DATE rendering + nil-ctx ISO/MDY fallback); updated the 3
+      pre-existing direct `fkValsForDetail` test callers to pass `nil`/`ctx`.
+      Live `psql` verification against a real `cmd/goopg` binary (isolated
+      data dir, port 5539) confirmed the fix works correctly for the
+      DELETE/UPDATE-parent-side check and the partition-detach check (
+      `SET datestyle='German'; DELETE FROM parent WHERE d='2026-07-14'` →
+      `DETAIL: Key (d)=(14.07.2026) is still referenced from table
+      "child".`, correctly reformatted) — both operate on `Datum`s decoded
+      from an already-stored heap row (confirmed `Kind=5`/`KindTime`,
+      `flagDate` set via a temporary debug probe, reverted before commit).
+      **New gap discovered by the same live probe (deferred, NOT fixed this
+      loop):** the INSERT-side check (`assertParentExists` via
+      `checkFKInsert`) does not benefit — a fresh `INSERT` violating the FK
+      under `SET datestyle='German'` still renders the DETAIL line with the
+      raw, un-reformatted literal, because `operators_storage.go`'s
+      `insertOp.Next` only explicitly coerces `int2`/`int4`/`int8` columns
+      before FK/CHECK/domain constraint checks run — DATE/TIMESTAMP/
+      TIMESTAMPTZ/NUMERIC columns stay `KindString` (the raw literal) at
+      constraint-check time and only become properly typed later, at
+      storage encode. This is wider than DateStyle: CHECK/domain/FK checks
+      during INSERT currently evaluate un-coerced literal Datums for those
+      types. Deferral-ledger row appended (2026-07-15,
+      `fkValsForDetail` FK-violation DETAIL DateStyle-awareness fixed) with
+      resume point: extend `insertOp.Next`'s coercion `switch` (~line 1900)
+      to cover `date`/`timestamp`/`timestamptz` (and audit `numeric`) via
+      the same `evalCast` pattern already used for the integer cases; audit
+      `updateOp`/upsert siblings for the same gap. Design doc follow-up:
+      `docs/design/0097-0151-datestyle-partial-set-merge.md` "Follow-up
+      (2026-07-15): FK violation `DETAIL` line DateStyle-awareness" section;
+      README index row updated. Gates: `go build ./...`/`go vet ./...`
+      clean; `go test -count=1 ./internal/executor/...` PASS (full package,
+      no regressions); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh`
+      PASS (0 failed, all 3 workloads).
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 

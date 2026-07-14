@@ -3090,13 +3090,14 @@ func dateStyleFromCtx(ctx *Context) (style, order string) {
 	return style, order
 }
 
-// formatTimeDatumForCast renders a non-time-only KindTime datum for a CAST to
-// text/varchar/bpchar/char, honoring the session DateStyle GUC. Mirrors
-// Datum.Format()'s ±infinity and flagDate branching, but dispatches DATE vs
-// TIMESTAMP/TIMESTAMPTZ through config.FormatDate/FormatTimestamp instead of
-// Format()'s hardcoded Postgres-MDY-only / fixed-ISO layouts, so `x::text`
-// agrees with SELECT/COPY output on the DateStyle GUC axis.
-func formatTimeDatumForCast(d Datum, style, order string) string {
+// formatTimeDatumDateStyle renders a non-time-only KindTime datum as text,
+// honoring the session DateStyle GUC. Mirrors Datum.Format()'s ±infinity and
+// flagDate branching, but dispatches DATE vs TIMESTAMP/TIMESTAMPTZ through
+// config.FormatDate/FormatTimestamp instead of Format()'s hardcoded
+// Postgres-MDY-only / fixed-ISO layouts, so callers (CAST-to-text, FK
+// violation DETAIL messages, ...) agree with SELECT/COPY output on the
+// DateStyle GUC axis.
+func formatTimeDatumDateStyle(d Datum, style, order string) string {
 	if d.Int == math.MaxInt64 {
 		return "infinity"
 	}
@@ -3290,7 +3291,7 @@ func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) 
 				return NewStringDatum(string(appendTimeOnlyValueText(nil, d.TimeValue()))), nil
 			}
 			style, order := dateStyleFromCtx(ctx)
-			return NewStringDatum(formatTimeDatumForCast(d, style, order)), nil
+			return NewStringDatum(formatTimeDatumDateStyle(d, style, order)), nil
 		case KindEnum:
 			// Cast enum to text: return the label string (loses sort order). M0097-enum.
 			return NewStringDatum(string(d.Buf)), nil

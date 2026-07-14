@@ -3,6 +3,7 @@ package executor
 import (
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
 )
@@ -39,7 +40,7 @@ func TestFKConstraintNameNilTable(t *testing.T) {
 // same shape PG uses in `Key (col)=(val) is not present in table "X".`
 func TestFKValsForDetailFormatsInts(t *testing.T) {
 	vals := []Datum{NewIntDatum(2)}
-	got := fkValsForDetail(vals)
+	got := fkValsForDetail(nil, vals)
 	if got != "2" {
 		t.Fatalf("fkValsForDetail([2]) = %q, want %q", got, "2")
 	}
@@ -47,10 +48,37 @@ func TestFKValsForDetailFormatsInts(t *testing.T) {
 
 func TestFKValsForDetailFormatsMixedTypes(t *testing.T) {
 	vals := []Datum{NewIntDatum(7), NewStringDatum("hello"), NullDatum}
-	got := fkValsForDetail(vals)
+	got := fkValsForDetail(nil, vals)
 	want := "7, hello, null"
 	if got != want {
 		t.Fatalf("fkValsForDetail = %q, want %q", got, want)
+	}
+}
+
+// TestFKValsForDetailHonorsDateStyle pins the M-NIGHTLY DateStyle follow-up:
+// a FK violation's `Key (col)=(val) is not present in table "X".` DETAIL line
+// must render a DATE/TIMESTAMP column value through the session's `datestyle`
+// GUC exactly like the SELECT/COPY output and CAST-to-text paths already do,
+// instead of always calling Datum.Format() (fixed ISO / hardcoded
+// Postgres-MDY-only), so the DETAIL text agrees with what the client
+// otherwise sees the value rendered as.
+func TestFKValsForDetailHonorsDateStyle(t *testing.T) {
+	when := time.Date(2026, 7, 14, 9, 5, 3, 0, time.UTC)
+	ctx := &Context{GetSetting: func(name string) (string, bool) {
+		if name == "datestyle" {
+			return "German", true
+		}
+		return "", false
+	}}
+	got := fkValsForDetail(ctx, []Datum{NewDateDatum(when)})
+	if want := "14.07.2026"; got != want {
+		t.Fatalf("fkValsForDetail(German) = %q, want %q", got, want)
+	}
+	// A nil ctx (no session GUC reachable) falls back to ISO/MDY, matching
+	// evalCast's nil-ctx behavior.
+	got = fkValsForDetail(nil, []Datum{NewDateDatum(when)})
+	if want := "2026-07-14"; got != want {
+		t.Fatalf("fkValsForDetail(nil ctx) = %q, want %q", got, want)
 	}
 }
 
@@ -72,7 +100,7 @@ func TestFKViolationMessageMatchesPGShape(t *testing.T) {
 		t.Fatalf("message = %q,\nwant       %q", msg, wantMsg)
 	}
 	detail := fmt.Sprintf("Key (%s)=(%s) is not present in table %q.",
-		"a", fkValsForDetail([]Datum{NewIntDatum(2)}), fk.RefTable)
+		"a", fkValsForDetail(nil, []Datum{NewIntDatum(2)}), fk.RefTable)
 	wantDetail := `Key (a)=(2) is not present in table "pk_noparted".`
 	if detail != wantDetail {
 		t.Fatalf("detail = %q,\nwant      %q", detail, wantDetail)
