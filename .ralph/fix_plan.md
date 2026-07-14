@@ -3182,6 +3182,72 @@ survey the deferral ledger for a fresh open (`status = -`) row.
       (90 fresh `go test -run 'TestPort_RegressSuite/^(name)$'` invocations,
       each against a clean cluster) — no separate regression suite needed
       since no executor/planner/storage code was touched.
+- [x] **M-NIGHTLY (run 20260714-011651 follow-up) — fixed the 3 confirmed
+      regress hangs (`inherit`, `returning`, `with`): a self-deadlock in
+      `updateOp.updateWithFrom`'s non-HOT write path.** Root-caused by
+      minimal-repro bisection (built a standalone debug server, bisected
+      `with.sql` by prefix line count down to a 9-line repro, then added
+      temporary `Slot.Lock/Unlock` call-site tracing gated by
+      `GOOPG_DEBUG_SLOT_LOCK=1` — removed before commit) plus 2 `SIGQUIT`
+      goroutine dumps (Go's default SIGQUIT handler isn't overridden, so it
+      dumps all stacks and exits — no code change needed to get one).
+      Minimal repro: `WITH rcte AS (SELECT sum(id) AS totalid FROM parent)
+      UPDATE parent SET id = id + totalid FROM rcte;` where `parent` has an
+      inheritance child with rows. **Root cause**
+      (`internal/executor/operators_storage.go`, `updateWithFrom`'s Step-3
+      "!used" non-HOT branch, ~line 5905-6021): for a pending-update row
+      sourced from an inheritance child (`puSrcRel != rel` — the HOT path
+      is gated on `puSrcRel == rel` so child rows always take this branch),
+      the code `Pin`+`Lock`s the block once to read `oldTup`, then — only
+      when `isConcurrentlyUpdated(...)` was **true** — unlocked before the
+      EPQ wait/recheck. When it was **false** (the ordinary, non-conflicting
+      case on every single-statement UPDATE, i.e. always in this repro),
+      there was no `else`: execution fell straight through to an
+      *unconditional* second `Pin`+`Lock` on the very same block to do the
+      actual xmax-stamp + write — deadlocking the connection's own
+      goroutine against the lock it was still holding from the first
+      `Lock()`. Every UPDATE…FROM/DELETE…USING statement whose target has
+      an inheritance child with a matching row hit this **every time**
+      (100% reproducible, not a race) — it just happened to have gone
+      undetected because the earlier hang triage only logged
+      "context-timeout" without diagnosing further. **Fix:** added the
+      missing `else { s.Unlock(); o.ctx.Pool.Unpin(s) }` so the pre-EPQ
+      lock is always released before the unconditional re-Pin+re-Lock
+      (mirrors the release the `isConcurrentlyUpdated==true` branch already
+      had). **Bonus fix found via the same repro while checking result
+      correctness post-fix:** `updateWithFrom`'s (and the DELETE…USING
+      sibling's) per-row dedup `seen` map was keyed by bare `[2]uint64{blk,
+      slot}` with no relation component — since every table numbers its own
+      blocks from 0, a parent row and an inheritance-child row can share
+      the same `(blk, slot)` pair and the second one is silently `continue`d
+      as "already updated by an earlier FROM match", **dropping real rows**
+      (verified before the fix: only 2 of 5 rows in a
+      parent+child1+child2 repro were actually updated). Fixed by widening
+      the key to a new shared `rowDedupKey{tag storage.BufferTag, slot
+      uint16}` type (BufferTag already carries the full `RelFileNode`) in
+      both `updateWithFrom` and the DELETE…USING victim-collection loop
+      (sibling-path rule — same bug pattern, same fix). Added
+      `TestUpdateFromSelfReferentialAggregateInheritedTarget`
+      (`internal/executor/update_from_inherit_self_ref_test.go`) covering
+      both: it exercises the exact deadlocking code path (would hang the
+      test process forever pre-fix, hard-failing via `go test -timeout`
+      instead of a silent pass) and asserts all 3 rows (parent + 2
+      inheritance children) land on the correct summed value, catching the
+      dedup-key regression too. Verified: all 3 previously-hanging regress
+      cases now complete in seconds instead of hitting the 120s timeout
+      (`inherit` 2.04s, `returning` 0.15s, `with` 7.04s — all still `SKIP`
+      on pre-existing, unrelated output-normalization mismatches, tracked
+      in the 84-mismatch bucket from the prior bullet; no baseline CSV
+      change needed since they still don't PASS). Gates: `go build ./...`
+      clean; `go vet ./internal/executor/... ./internal/storage/...` clean;
+      `go test ./internal/executor/...` PASS; `go test ./internal/storage/...`
+      PASS; new regression test PASS;
+      `go test -v -run 'TestPort_RegressSuite/^(inherit|returning|with)$'
+      ./internal/testport/` PASS (no hang); `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+      bash scripts/ralph-precommit-test.sh` PASS (0 failed, all 3
+      workloads). No deferral-ledger row — both defects are fully fixed,
+      no remaining gap.
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 

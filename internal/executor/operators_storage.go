@@ -5640,6 +5640,15 @@ func collectNodeRows(node planner.Node, ctx *Context) ([]Row, error) {
 	return rows, nil
 }
 
+// rowDedupKey identifies a physical row across a possibly multi-relation
+// scan (target table + inheritance children): a bare (block, slot) pair
+// collides across relations since every table numbers its own blocks from
+// 0. Shared by updateWithFrom and deleteViaUsing's inheritance fan-out.
+type rowDedupKey struct {
+	tag  storage.BufferTag
+	slot uint16
+}
+
 // updateWithFrom implements UPDATE … FROM by collecting all FROM-table rows
 // into memory, then doing a nested-loop cross-product against each target
 // table row, applying o.plan.FromPred to find matching combinations, and
@@ -5832,7 +5841,7 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 		updReqStatusFrom = multixact.StatusUpdate
 	}
 	fksToRecheckFrom := o.childFKsToRecheck()
-	seen := make(map[[2]uint64]bool)
+	seen := make(map[rowDedupKey]bool)
 	for _, pu := range pending {
 		puSrcRel := pu.srcRel
 		if puSrcRel == (storage.RelFileNode{}) {
@@ -5846,7 +5855,12 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 		if puCols == nil {
 			puCols = tgtCols
 		}
-		key := [2]uint64{uint64(pu.blk), uint64(pu.slot)}
+		// Keyed by (relation, block, slot) — NOT just (block, slot): distinct
+		// inheritance-child relations each number their own blocks from 0, so
+		// two different tables' rows can share the same (blk, slot) pair. A
+		// bare (blk, slot) key falsely treats a child table's row as "already
+		// updated by an earlier FROM match" and silently skips it.
+		key := rowDedupKey{tag: storage.BufferTag{Rel: puSrcRel, Block: pu.blk}, slot: pu.slot}
 		if seen[key] {
 			continue // already updated by an earlier FROM match
 		}
@@ -6012,6 +6026,17 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 				pu.slot = newSlot
 				puRel = epqWriteRel
 				puCols = epqWriteCols
+			} else {
+				// No concurrent modification: the Pin+Lock taken above still
+				// targets the right (block, slot) and must be released before
+				// the unconditional re-Pin+Lock below re-acquires it — without
+				// this, the re-Lock deadlocks against the lock this same
+				// goroutine is still holding (M-NIGHTLY with-regress hang;
+				// only reachable when puSrcRel != rel, i.e. a row sourced from
+				// an inheritance child, since same-rel rows take the HOT path
+				// above and never reach here).
+				s.Unlock()
+				o.ctx.Pool.Unpin(s)
 			}
 			var oldTupleBytes []byte
 			s, err = o.ctx.Pool.Pin(storage.BufferTag{Rel: puSrcRel, Block: pu.blk})
@@ -6150,7 +6175,7 @@ func (o *deleteOp) deleteWithUsing() (TupleSlot, error) {
 		usingPortion Row // joined USING-table columns for RETURNING; nil when RETURNING absent
 	}
 	var victims []victim
-	seen := make(map[[2]uint64]bool)
+	seen := make(map[rowDedupKey]bool)
 
 	// Collect inheritance children for the USING target scan. M0097-0078.
 	type usingScanTarget struct {
@@ -6176,7 +6201,10 @@ func (o *deleteOp) deleteWithUsing() (TupleSlot, error) {
 	for _, ust := range usingScanTargets {
 		ust := ust // capture
 		if err := scanMatching(o.ctx, ust.rel, 0, ust.cols, nil, func(blk storage.BlockNumber, slot uint16, rawRow Row) error {
-			key := [2]uint64{uint64(blk), uint64(slot)}
+			// Keyed by (relation, block, slot) — see rowDedupKey: a bare
+			// (blk, slot) key collides across different inheritance-child
+			// relations and silently drops victims from the DELETE.
+			key := rowDedupKey{tag: storage.BufferTag{Rel: ust.rel, Block: blk}, slot: slot}
 			if seen[key] {
 				return nil
 			}
