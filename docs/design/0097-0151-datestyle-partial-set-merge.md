@@ -670,3 +670,85 @@ remain DateStyle-unaware — still fixed-ISO TIMESTAMP / hardcoded-Postgres-
 MDY DATE regardless of `SET datestyle`. TIMESTAMPTZ's missing session-
 timezone-aware conversion/offset and `pgoutput.go`'s DateStyle-plumbing gap
 remain open too, unchanged from the prior rows.
+
+## Follow-up (2026-07-15): `array_agg`/`string_agg`/`percentile_disc` DateStyle-awareness
+
+Picked up the exact resume point named by the `||` follow-up above:
+`operators_join_agg.go`'s aggregate-element `Format()` call sites
+(`~lines 1846, 1849, 1867, 1939, 1943, 1949, 3347, 3368`). Fixed all 8:
+
+- `applyAgg`'s `string_agg` case — the delimiter (`dv.Format()`) and the
+  main value (`arg.Format()`).
+- `applyAgg`'s `array_agg` case — the per-row element string
+  (`arg.Format()`) accumulated into `st.arrayElems`.
+- `applyAgg`'s variadic user-defined-aggregate arg-bundling loop (the
+  `VARIADIC anyarray` sfunc-call path) — `arg.Format()`/`a2.Format()`/
+  `ev.Format()` for the first arg, `Arg2`, and each `ExtraArgs` element.
+- `finishWithinGroupAgg`'s `percentile_disc` — both the 2D-array form
+  (`percentile_disc(array[...]) WITHIN GROUP`) and the 1D-array form's
+  per-element `d.Format()`.
+
+All 8 sites now call `formatDatumDateStyle(d, ctx)`, reusing the `||` fix's
+helper unchanged — no new formatting logic needed. `applyAgg` is a method on
+`*aggregateOp`, which already carries a `ctx *Context` field (`o.ctx`, set in
+`Open`), so its 6 sites needed no signature change, just swapping the
+receiver-field access in for the bare `.Format()` call.
+`finishWithinGroupAgg(st aggRuntime, call planner.AggregateCall, ctx
+*Context)` already took `ctx` as a parameter (added by an earlier
+`WITHIN GROUP` slice, unrelated to DateStyle), so its 2 sites were a pure
+one-line swap too.
+
+**`array_to_string` itself needed no change.** Read closely
+(`internal/executor/expr.go`'s `"array_to_string"` case): it operates on an
+already-textified array literal via `parseTextArray(arrDatum.StringValue())`
+— it splits an existing `{elem1,elem2,...}` string, it never touches a raw
+element `Datum`. The actual DateStyle-unaware rendering the `||` follow-up's
+resume note flagged happens upstream, at whatever produced that array
+literal text in the first place — for a `SELECT array_to_string(array_agg(d),
+', ')` query, that's `array_agg`'s own element-formatting step, which this
+loop's fix now covers. A literal `ARRAY[...]` constructor
+(`parser.ArrayConstructorExpr`) is a separate code path (`expr.go`'s
+`evalExpr` doesn't have one; it's only handled in DDL-default-value,
+partition-bound, upsert-arbiter, and plpgsql contexts — `operators_ddl.go`,
+`operators_ddl_partition.go`, `operators_upsert.go`, `plpgsql_runtime.go`,
+`planner.go`'s constant-folding) and was surveyed but is out of scope here:
+those are constant-folding/default-expression contexts evaluated once at
+DDL/plan time, not query-time `SELECT`-output rendering, so they don't share
+this bug's user-visible symptom (a live session's `SET datestyle` affecting
+live query output).
+
+New tests (`internal/executor/agg_array_datestyle_test.go`):
+`TestArrayAggStringAggHonorDateStyle` — a full parse→plan→exec integration
+test (via `newVMFixture`/`runDDL`/`runQuery`, matching the INSERT/UPDATE
+follow-ups' test style rather than the CAST/`||` follow-ups' direct-function-
+call style, since `applyAgg` needs a live `aggregateOp` with populated
+`o.ctx` rather than being callable standalone) exercising `string_agg(d::text,
+... ORDER BY id)` and `array_agg(d ORDER BY id)` together under `German, DMY`
+datestyle against a 2-row DATE table; `TestArrayAggStringAggNilCtxDefaultsISO`
+(no session GUC → ISO default, matching `Format()`'s pre-existing hardcoded
+behavior, same convention as the CAST/`||` follow-ups' nil-ctx tests).
+Confirmed non-vacuous via `git stash push -- internal/executor/operators_join_agg.go`
+and re-running: `array_agg` renders `{07-14-2026,07-15-2026}` (Postgres-MDY
+default) instead of the expected `{14.07.2026,15.07.2026}` pre-fix.
+
+Live `psql` verification (port 5541, ephemeral data dir, cleaned up)
+against a real `cmd/goopg` binary: `string_agg(d::text, ', ' ORDER BY id)`,
+`array_agg(d ORDER BY id)`, `array_agg(ts ORDER BY id)`, and
+`percentile_disc(0.5) WITHIN GROUP (ORDER BY ts)` all correctly reformat
+across `ISO, MDY` / `German, DMY` / `SQL, DMY` / `Postgres, MDY`, matching
+the SELECT-output path's own per-column rendering.
+
+Gates: `go build ./...`/`go vet ./...` clean (repo-wide); `go test -count=1
+./internal/executor/...` PASS (full package, no regressions);
+`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+`RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh` PASS (0
+failed transactions, all 3 pgbench workloads).
+
+**Still open** (deferral-ledger row appended): `Datum.Format()`/
+`AppendValueText()`'s remaining direct call sites — `to_char`'s generic
+(non-format-string) fallback, plpgsql `RAISE`/string-building in
+`plpgsql_runtime.go`, EXPLAIN, other error-message formatting,
+`operators_analyze.go` bound-rendering — remain DateStyle-unaware.
+TIMESTAMPTZ's missing session-timezone-aware conversion/offset and
+`pgoutput.go`'s DateStyle-plumbing gap remain open too, unchanged from the
+prior rows.

@@ -3682,6 +3682,39 @@ survey the deferral ledger for a fresh open (`status = -`) row.
       `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
       `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh`
       PASS (0 failed, all 3 workloads).
+- [x] **M-NIGHTLY (run 20260714-011651 follow-up) — `array_agg`/
+      `string_agg`/variadic-UDA-bundling/`percentile_disc` DateStyle-
+      awareness fixed.** Resume point from the `||` fix above:
+      `operators_join_agg.go`'s 8 aggregate-element `.Format()` call sites
+      (`applyAgg`'s `string_agg` delimiter+value, `array_agg`'s per-row
+      element, the variadic user-defined-aggregate arg-bundling loop ×3,
+      `finishWithinGroupAgg`'s `percentile_disc` 2D+1D array rendering)
+      swapped for `formatDatumDateStyle(d, ctx)`, reusing the `||` fix's
+      helper unchanged (`o.ctx` already in scope on `*aggregateOp`; `ctx`
+      already a param on `finishWithinGroupAgg`). Confirmed `array_to_string`
+      itself needs no change — it re-joins an already-textified array
+      literal (`parseTextArray`), never touching a raw element `Datum`;
+      the actual gap was upstream at `array_agg`'s element-formatting step,
+      now fixed. `ARRAY[...]` constructor sites surveyed and out of scope
+      (constant-folding/default-expression contexts, not query-time SELECT
+      output). New tests
+      `internal/executor/agg_array_datestyle_test.go`
+      (`TestArrayAggStringAggHonorDateStyle`, full parse→plan→exec
+      integration; `TestArrayAggStringAggNilCtxDefaultsISO`);
+      non-vacuousness confirmed via `git stash` on `operators_join_agg.go`
+      alone. Live `psql` verification (port 5541, cleaned up) across
+      ISO/German/SQL-DMY/Postgres-MDY for `string_agg`, `array_agg` (DATE
+      and TIMESTAMP), and `percentile_disc(...) WITHIN GROUP`. Design doc
+      `docs/design/0097-0151-datestyle-partial-set-merge.md` "Follow-up
+      (2026-07-15): array_agg/string_agg/percentile_disc DateStyle-
+      awareness" + README index updated. Deferral ledger row appended
+      (open, resume point: `to_char` generic fallback +
+      `operators_analyze.go` bound-rendering next). Gates: `go build
+      ./...`/`go vet ./...` clean (repo-wide); `go test -count=1
+      ./internal/executor/...` PASS (full package, no regressions);
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh`
+      PASS (0 failed, all 3 workloads).
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 
