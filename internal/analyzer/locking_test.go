@@ -48,6 +48,18 @@ func TestAnalyzeForUpdateRejectsGroupBy(t *testing.T) {
 		"0A000")
 }
 
+// TestAnalyzeForUpdateRejectsGroupingSets — GROUPING SETS/ROLLUP/CUBE
+// grouping is the same aggregation hazard as plain GROUP BY, even when
+// the flattened GroupBy expression list is empty (e.g. the degenerate
+// `GROUPING SETS (())` form used by regress' errors.sql) — GroupBy
+// being empty must not bypass the check. M-NIGHTLY regress/errors.
+func TestAnalyzeForUpdateRejectsGroupingSets(t *testing.T) {
+	cat := analyzerCatalog(t)
+	expectAnalyzeCode(t, cat,
+		"SELECT null FROM pgbench_accounts GROUP BY GROUPING SETS (()) FOR UPDATE",
+		"0A000")
+}
+
 // TestAnalyzeForUpdateRejectsHaving — same aggregation guard for
 // the HAVING side.
 func TestAnalyzeForUpdateRejectsHaving(t *testing.T) {

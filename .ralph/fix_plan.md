@@ -3248,6 +3248,52 @@ survey the deferral ledger for a fresh open (`status = -`) row.
       bash scripts/ralph-precommit-test.sh` PASS (0 failed, all 3
       workloads). No deferral-ledger row — both defects are fully fixed,
       no remaining gap.
+- [x] **M-NIGHTLY (run 20260714-011651 follow-up) — fixed `regress/errors`
+      (first pick from the 84-mismatch resume plan's "quick suites"
+      list).** Root-caused two independent bugs, both surfaced by
+      `errors.sql`: (1) `internal/parser/function.go`'s CREATE FUNCTION
+      AS-clause parser unconditionally rejected the two-item `AS
+      'objfile', 'linksymbol'` form with a hardcoded `only one AS item
+      needed for language "sql"` error, regardless of the eventual
+      LANGUAGE. Upstream's `interpret_AS_clause` (`functioncmds.c`) only
+      rejects the two-item form for non-C languages — `LANGUAGE C`
+      *requires* exactly two items (obj file + link symbol). This broke
+      `test_setup.sql` itself: `CREATE FUNCTION binary_coercible(oid,
+      oid) ... AS :'regresslib', 'binary_coercible' LANGUAGE C ...` (AS
+      before LANGUAGE) failed to parse, so every regress case's shared
+      fixture load was silently missing this (and sibling) C-stub
+      function definitions. Fix: defer the two-item validation to the
+      clause loop's exit (LANGUAGE can appear before or after AS in the
+      grammar) and only reject when the final resolved language isn't
+      "c" (confirmed via PG source: `internal`/`sql`/others all take
+      exactly one AS item, only C takes two). (2)
+      `internal/analyzer/analyzer.go`'s `analyzeLockingClauses` rejected
+      `SELECT ... GROUP BY ... FOR UPDATE` via `len(s.GroupBy) > 0`, but
+      `errors.sql`'s `select null from pg_database group by grouping
+      sets (()) for update;` uses the degenerate empty-set `GROUPING SETS
+      (())` form, which the parser flattens to a zero-length `s.GroupBy`
+      (while `s.GroupingSets` stays non-nil) — the check silently missed
+      it, letting the query execute (3 rows) instead of raising the
+      required `0A000`. Fix: `len(s.GroupBy) > 0 || s.GroupingSets !=
+      nil`. Added `TestParseCreateFunctionLanguageCTwoItemAS` +
+      `TestParseCreateFunctionNonCTwoItemASRejected`
+      (`internal/parser/function_test.go`) and
+      `TestAnalyzeForUpdateRejectsGroupingSets`
+      (`internal/analyzer/locking_test.go`). Flipped
+      `docs/test-port/regress-diff-baseline.csv`'s `errors` row
+      `fail`→`pass`. Spot-checked the other named "quick suite"
+      candidates (`expressions`, `equivclass`, `explain`, `guc`, `regex`,
+      `random`) — all still genuinely diverge on unrelated normalization
+      gaps; left untouched (ONE-task-per-loop scope). Deferral-ledger row
+      appended (resolved) recording the still-open 83-suite bucket +
+      `aggregates` LATERAL bug and naming the next suite to pick. Gates:
+      `go build ./...` clean; `go vet`/`go test` on `internal/parser`,
+      `internal/analyzer`, `internal/executor` all green;
+      `go test -v -run 'TestPort_RegressSuite/^errors$'
+      ./internal/testport/` PASS (was SKIP/deferred);
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh`
+      PASS (0 failed, all 3 workloads).
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 

@@ -15,7 +15,7 @@ delete,0,pass
 drop_if_exists,0,fail
 enum,0,pass
 equivclass,0,fail
-errors,0,fail
+errors,0,pass
 expressions,0,fail
 functional_deps,0,pass
 hash_index,0,fail
