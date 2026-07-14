@@ -3778,7 +3778,13 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 	if len(ix.Index.Columns) > 1 {
 		hiBytes = appendCompositeUpperPadding(keyBytes)
 	}
-	err = tree.RangeScan(keyBytes, hiBytes, func(_ []byte, ptr storage.ItemPointer) (bool, error) {
+	// C3 residual (08 doc 03): collect LP_DEAD kills for index entries whose
+	// HOT chain is dead-to-all — the entries this probe SKIPS (followHOTChain
+	// !found), not the update target (which is live at probe time). Mirrors
+	// indexScanOp.Next()'s !found collector; flushed via tree.KillItems once
+	// the scan drains. nil until the first kill, so no alloc on the hot path.
+	var killList []btree.KillItem
+	err = tree.RangeScanWithPos(keyBytes, hiBytes, func(_ []byte, ptr storage.ItemPointer, pos btree.ScanPos) (bool, error) {
 		slot, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: heapRel, Block: ptr.Block})
 		if err != nil {
 			return false, err
@@ -3787,11 +3793,22 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 		// Follow the HOT chain: the index pointer may be stale (pointing
 		// to an earlier version whose CTID leads to the live version).
 		tuple, actualSlot, found := followHOTChain(slot.Page(), ptr.Offset, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.MultiXact)
-		slot.RUnlock()
-		o.ctx.Pool.Unpin(slot)
 		if !found {
+			// This entry's HOT chain is invisible to us. Upgrade to
+			// dead-to-ALL under the OldestXmin horizon (the same oracle
+			// prune/VACUUM and indexScanOp use) and, if it holds, record an
+			// LP_DEAD kill. followHOTChain copies the tuple, but
+			// heapChainDeadToAll reads slot.Page() directly — so we keep the
+			// page RLocked/pinned until after the check, then release.
+			if o.ctx.TxnMgr != nil && heapChainDeadToAll(slot.Page(), ptr.Offset, o.ctx.TxnMgr.OldestXmin()) {
+				killList = append(killList, btree.KillItem{Pos: pos, Ptr: ptr})
+			}
+			slot.RUnlock()
+			o.ctx.Pool.Unpin(slot)
 			return true, nil
 		}
+		slot.RUnlock()
+		o.ctx.Pool.Unpin(slot)
 		// Check for foreign tuple lock (M0021 step 2b) on the live version.
 		if foreignLockOnly(tuple.Header, o.ctx.Tx.XID) {
 			livePtr := storage.ItemPointer{Block: ptr.Block, Offset: actualSlot}
@@ -3805,11 +3822,19 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 			}
 			slot2.RLock()
 			tuple, actualSlot, found = followHOTChain(slot2.Page(), ptr.Offset, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.MultiXact)
-			slot2.RUnlock()
-			o.ctx.Pool.Unpin(slot2)
 			if !found {
+				// Same C3 residual kill as the primary branch (D4). In practice
+				// the tuple-lock wait released the leaf latch, so KillItems' D7
+				// re-verify usually drops this — harmless, kept for symmetry.
+				if o.ctx.TxnMgr != nil && heapChainDeadToAll(slot2.Page(), ptr.Offset, o.ctx.TxnMgr.OldestXmin()) {
+					killList = append(killList, btree.KillItem{Pos: pos, Ptr: ptr})
+				}
+				slot2.RUnlock()
+				o.ctx.Pool.Unpin(slot2)
 				return true, nil
 			}
+			slot2.RUnlock()
+			o.ctx.Pool.Unpin(slot2)
 		}
 		var decRow Row
 		decRow, err = make(Row, len(cols)), nil
@@ -3866,6 +3891,13 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 		})
 		return true, nil
 	})
+	// C3 residual: apply the LP_DEAD kills collected above (best-effort;
+	// single-leaf exclusive-latched pass, page-LSN re-verified, unlogged
+	// MarkDirtyHint). The kills are proven dead-to-all independent of this
+	// update's outcome, so apply them even on a scan error.
+	if len(killList) > 0 {
+		tree.KillItems(killList)
+	}
 	if err != nil {
 		return nil, err
 	}
