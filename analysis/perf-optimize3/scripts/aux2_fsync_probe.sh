@@ -29,6 +29,7 @@ export GOMEMLIMIT="${GOMEMLIMIT:-18GiB}"
 GOOPG_PORT=5533
 PG_PORT=5534
 DUR=60
+QMODE="${QMODE:-prepared}"   # pgbench -M mode: prepared (default) | simple | extended
 CLIENTS=50
 
 mkdir -p "$AUX_DIR"
@@ -44,7 +45,7 @@ nohup strace -f -c -e trace=fdatasync,fsync -o "$AUX_DIR/goopg.strace.txt" \
 wait_for "$GOOPG_PORT" || { echo "goopg did not start"; exit 1; }
 
 D0=$(q "$GOOPG_PORT" "SELECT wal_buffers_flush_drain_bytes::int8 + wal_buffers_overflow_drain_bytes::int8 FROM pg_stat_wal_io")
-"$PG_BIN_DIR/pgbench" -h 127.0.0.1 -p "$GOOPG_PORT" -U postgres -c $CLIENTS -j $CLIENTS -T $DUR -N postgres > "$AUX_DIR/goopg_N.pgbench.txt" 2>&1
+"$PG_BIN_DIR/pgbench" -h 127.0.0.1 -p "$GOOPG_PORT" -U postgres -c $CLIENTS -j $CLIENTS -T $DUR -M "$QMODE" -N postgres > "$AUX_DIR/goopg_N.pgbench.txt" 2>&1
 D1=$(q "$GOOPG_PORT" "SELECT wal_buffers_flush_drain_bytes::int8 + wal_buffers_overflow_drain_bytes::int8 FROM pg_stat_wal_io")
 {
   echo "drain_bytes_before=$D0 after=$D1 delta=$((D1-D0))"
@@ -63,7 +64,7 @@ wait_for "$PG_PORT" || { echo "PG did not start"; exit 1; }
 
 LSN0=$(q "$PG_PORT" "SELECT pg_current_wal_lsn()")
 F0=$(q "$PG_PORT" "SELECT coalesce(sum(fsyncs),0)||' '||coalesce(sum(writes),0) FROM pg_stat_io WHERE object='wal'")
-"$PG_BIN_DIR/pgbench" -h 127.0.0.1 -p "$PG_PORT" -U postgres -c $CLIENTS -j $CLIENTS -T $DUR -N postgres > "$AUX_DIR/pg_N.pgbench.txt" 2>&1
+"$PG_BIN_DIR/pgbench" -h 127.0.0.1 -p "$PG_PORT" -U postgres -c $CLIENTS -j $CLIENTS -T $DUR -M "$QMODE" -N postgres > "$AUX_DIR/pg_N.pgbench.txt" 2>&1
 LSN1=$(q "$PG_PORT" "SELECT pg_current_wal_lsn()")
 F1=$(q "$PG_PORT" "SELECT coalesce(sum(fsyncs),0)||' '||coalesce(sum(writes),0) FROM pg_stat_io WHERE object='wal'")
 DELTA=$(q "$PG_PORT" "SELECT pg_wal_lsn_diff('$LSN1'::pg_lsn, '$LSN0'::pg_lsn)")

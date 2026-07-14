@@ -1,8 +1,15 @@
 # C5 — Pipelined commit groups (sketch)
 
-status: sketch · date: 2026-07-13 · base: `e453e3f2` · **gate: measure the
+status: sketch → **PROMOTED** · date: 2026-07-13 · base: `e453e3f2` · **gate: measure the
 residual serialization AFTER C1 + C2 land — do not design further before
 that.**
+
+> **Promotion note (2026-07-14):** the decision gate below is satisfied (06/07
+> block profiles show 59–66 % of `-N` block delay under
+> `walWriteLock.acquireOrWait`). Idea item 2 (drain/fsync split) is now a full
+> design at
+> [`../../perf-optimize3-dash/08-improvement-designs/01-c5-drain-fsync-split.md`](../../perf-optimize3-dash/08-improvement-designs/01-c5-drain-fsync-split.md).
+> Idea item 1 (CLOG staging overlap) remains obsoleted by C2.
 
 ## Signal
 

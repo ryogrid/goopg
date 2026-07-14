@@ -1,0 +1,25 @@
+pgbench (18.3)
+starting vacuum...end.
+progress: 30.0 s, 79669.9 tps, lat 0.626 ms stddev 1.377, 0 failed
+progress: 60.0 s, 86168.1 tps, lat 0.579 ms stddev 1.431, 0 failed
+progress: 90.0 s, 84141.2 tps, lat 0.593 ms stddev 1.443, 0 failed
+pgbench: error: client 24 script 0 aborted in command 1 query 0: ERROR:  mvcc: unknown transaction
+pgbench: error: client 35 script 0 aborted in command 1 query 0: ERROR:  mvcc: unknown transaction
+pgbench: error: client 48 script 0 aborted in command 1 query 0: ERROR:  mvcc: unknown transaction
+transaction type: <builtin: select only>
+scaling factor: 100
+query mode: prepared
+number of clients: 50
+number of threads: 50
+maximum number of tries: 1
+duration: 120 s
+number of transactions actually processed: 10168345
+number of failed transactions: 0 (0.000%)
+latency average = 0.584 ms
+latency stddev = 1.396 ms
+initial connection time = 6.510 ms
+tps = 84739.422076 (without initial connection time)
+statement latencies in milliseconds and failures:
+         0.001           0 \set aid random(1, 100000 * :scale)
+         0.597           0 SELECT abalance FROM pgbench_accounts WHERE aid = :aid;
+pgbench: error: Run was aborted; the above results are incomplete.

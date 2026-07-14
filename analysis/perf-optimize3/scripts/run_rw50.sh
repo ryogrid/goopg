@@ -38,6 +38,7 @@ PG_PORT=5534
 PPROF_PORT=6160
 
 SCALE="${SCALE:-100}"
+QMODE="${QMODE:-prepared}"   # pgbench -M mode: prepared (default) | simple | extended
 DURATION="${DURATION:-120}"
 CLIENTS=50
 
@@ -126,9 +127,9 @@ run_workload() {
     ) >> "$LOG_FILE" 2>&1 &
   fi
 
-  log "pgbench $flags c=$CLIENTS T=$DURATION ($tag)"
+  log "pgbench $flags -M $QMODE c=$CLIENTS T=$DURATION ($tag)"
   "$PG_BIN_DIR/pgbench" -h 127.0.0.1 -p "$port" -U postgres \
-      -c "$CLIENTS" -j "$CLIENTS" -T "$DURATION" -P 30 -r $flags postgres \
+      -c "$CLIENTS" -j "$CLIENTS" -T "$DURATION" -P 30 -r -M "$QMODE" $flags postgres \
       > "$RUN_DIR/${tag}.pgbench.txt" 2>&1 || log "WARN pgbench $tag nonzero exit"
 
   rm -f "$DATA_ROOT/${tag}.sampling"; wait "$SAMP" 2>/dev/null || true

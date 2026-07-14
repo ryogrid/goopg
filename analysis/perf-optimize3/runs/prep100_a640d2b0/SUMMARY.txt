@@ -1,0 +1,17 @@
+RUN_ID=prep100_a640d2b0  scale=100 c=50 T=120
+--- goopg_S ---
+latency average = 0.584 ms
+latency stddev = 1.396 ms
+tps = 84739.422076 (without initial connection time)
+--- goopg_N ---
+latency average = 7.407 ms
+latency stddev = 4.857 ms
+tps = 6748.977705 (without initial connection time)
+--- pg_S ---
+latency average = 0.176 ms
+latency stddev = 2.313 ms
+tps = 281941.282859 (without initial connection time)
+--- pg_N ---
+latency average = 3.220 ms
+latency stddev = 0.951 ms
+tps = 15522.211644 (without initial connection time)
