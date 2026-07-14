@@ -1,7 +1,14 @@
 # 08-10 — Gate maybeForceGCAfterCommit to write transactions
 
-status: design · date: 2026-07-14 · base: `a640d2b0` · gates: G-race, G-perf →
+status: **LANDED** (S1) · date: 2026-07-14 · base: `a640d2b0` · gates: G-race, G-perf →
 [README](README.md)
+
+> **Landed 2026-07-14:** `Context.DidWrite()` (`executor/context.go`, XID-assigned
+> predicate) gates the autocommit forced-GC call (`server/dispatch.go`, the only
+> read-only hot path pgbench `-S` exercises); explicit-COMMIT and COPY sites left
+> unconditional (they write, and the outer txn's XID isn't cheaply available at
+> the explicit-COMMIT site). Test `TestContextDidWrite`. Gates: executor+server
+> suites green, tpch-spotcheck Q12=2/Q13=33.
 
 ## 1. Problem and numbers
 

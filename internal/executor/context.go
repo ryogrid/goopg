@@ -1347,6 +1347,18 @@ func (c *Context) MaterializeWriterXID() error {
 	return nil
 }
 
+// DidWrite reports whether this transaction has been assigned a real XID —
+// i.e. some write-path operation called MaterializeWriterXID. A read-only
+// transaction keeps XID == storage.InvalidTransactionID (M0093 lazy XID
+// allocation), so this is the cheap "did this transaction produce
+// garbage/durable work" predicate. Used to gate post-commit forced GC to
+// writing transactions (a read-only SELECT produces no retained heap worth
+// forcing a GC for). Read c.Tx.XID (the Context's in-place-updated copy),
+// never a stale outer snapshot of the Transaction value.
+func (c *Context) DidWrite() bool {
+	return c.Tx.XID != storage.InvalidTransactionID
+}
+
 // EnumRenameEntry records one ALTER TYPE … RENAME TO operation for transactional rollback.
 // OldName and NewName are lowercase. M0097-0022.
 type EnumRenameEntry struct{ OldName, NewName string }

@@ -1030,7 +1030,14 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		}
 		executor.ReleaseAdvisoryTransactionLocks(advisoryReleaseTarget)
 		commit = true
-		maybeForceGCAfterCommit()
+		// Forced GC only helps after a transaction that actually wrote (a
+		// read-only SELECT produces no retained heap worth a GC round). Gate
+		// on the write-XID predicate so pgbench -S never pays even the atomic
+		// counter add (perf-optimize3-dash/08 doc 10). Use ectx.Tx.XID, the
+		// Context's in-place-updated copy, not the stale outer tx.
+		if ectx.DidWrite() {
+			maybeForceGCAfterCommit()
+		}
 		// NOTIFY becomes visible to listeners at the notifying transaction's
 		// commit; publish the buffer accumulated by this autocommit batch.
 		// M0118-0009.
