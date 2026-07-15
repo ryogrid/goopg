@@ -207,85 +207,6 @@ func unwrapXLogMainData(data []byte) ([]byte, error) {
 	}
 }
 
-// recordKindToRmgrInfo maps a native RecordKind byte (payload[0]) to the
-// PG-compatible (xl_rmid, xl_info) pair per doc 04 §3
-// (docs/design/wal-native-pg-format/04-remove-canonical-and-pg-rmgr-dispatch.md).
-// Kinds with a real PG analog (§3.1) get their real PG rmgr/opcode.
-// BtreeSplit resolves to the L variant (XLOG_BTREE_SPLIT_L) — goopg emits
-// one RecordKindBtreeSplit for both split directions, so §2.2 picks a
-// single representative opcode rather than inspecting the body. Every
-// other kind (§3.2 — goopg-private catalog/DDL, no PG record type) gets
-// the shared custom resource manager RmgrGoopgCatalog; the RecordKind byte
-// remains the authoritative discriminator inside the custom handler since
-// §3.2's ~110 kinds outnumber xl_info's 16 opcode slots.
-//
-// Checkpoint (RecordKindCheckpoint) has no case here: its 88-byte PG
-// CheckPoint-struct payload carries no RecordKind tag byte at all, and
-// classifyXLogRecord's length check (§3.1: "already classified by 88-byte
-// length") takes priority before this table would ever be consulted for
-// it. Segment-pad NOOP records bypass classifyXLogRecord entirely
-// (segment_pad.go stamps RmgrXLog/XLOG_NOOP directly), so they have no
-// case here either.
-//
-// NOT YET WIRED into classifyXLogRecord — see doc 04 §5.4 and
-// .ralph/deferral_ledger.md. Landing this table's output live requires a
-// coupled internal/wal/recovery.go dispatch rework (§4) in the same
-// change: ApplyRecord's existing `Rmid != RmgrXLog || Info !=
-// xlogInfoDefault` early-return (recovery.go, gates replay into
-// replayDecodedXLogRecord) assumes every native record classifies as
-// RmgrXLog/0xF0 and must be replaced with a goopg-owned-rmgr check;
-// RecordKindPageImage in particular collides with real PG's RM_XLOG/
-// XLOG_FPI opcode, so replayDecodedXLogRecord's RmgrXLog arm needs a new
-// XLOG_FPI case delegating to replayPageImage or the image-restore
-// mutation is silently dropped on recovery (R1-critical, doc §8).
-func recordKindToRmgrInfo(kind byte) (Rmgr, uint8) {
-	switch kind {
-	case RecordKindPageImage:
-		return RmgrXLog, xlogXLogFPI
-	case RecordKindBtreeSplit:
-		return RmgrBtree, xlogBtreeSplitL
-	case RecordKindHeapInsert:
-		return RmgrHeap, xlogHeapInsert
-	case RecordKindBtreeInsert:
-		return RmgrBtree, xlogBtreeInsertLeaf
-	case RecordKindHeapDelete:
-		return RmgrHeap, xlogHeapDelete
-	case RecordKindHeapVacuum:
-		return RmgrHeap2, xlogHeap2PruneVacuumScan
-	case RecordKindXactCommit:
-		return RmgrXact, xlogXactCommit
-	case RecordKindXactAbort:
-		return RmgrXact, xlogXactAbort
-	case RecordKindHeapLock:
-		return RmgrHeap, xlogHeapLock
-	case RecordKindSmgrCreate:
-		return RmgrStorage, xlogSmgrCreate
-	case RecordKindHeapHotUpdate:
-		return RmgrHeap, xlogHeapHotUpdate
-	case RecordKindHeapPruneOpt:
-		return RmgrHeap2, xlogHeap2PruneOnAccess
-	case RecordKindBtreeVacuum:
-		return RmgrBtree, xlogBtreeVacuum
-	case RecordKindBtreeUnlinkPage:
-		return RmgrBtree, xlogBtreeUnlinkPage
-	case RecordKindBtreeNewRoot:
-		return RmgrBtree, xlogBtreeNewRoot
-	case RecordKindBtreeMarkPageHalfDead:
-		return RmgrBtree, xlogBtreeMarkPageHalfDead
-	case RecordKindHeapFreeze:
-		return RmgrHeap2, xlogHeap2PruneVacuumClean
-	case RecordKindXactCommitInval:
-		// §3.3: XactCommit and XactCommitInval share one PG opcode; the
-		// rmgr handler discriminates on the body's RecordKind byte.
-		return RmgrXact, xlogXactCommit
-	case RecordKindClogTruncate:
-		return RmgrCLOG, xlogClogTruncate
-	default:
-		// §3.2: goopg-private catalog/DDL records with no PG analog.
-		return RmgrGoopgCatalog, 0
-	}
-}
-
 func classifyXLogRecord(payload []byte) (Rmgr, uint8, uint32) {
 	if len(payload) == 0 {
 		return RmgrXLog, xlogInfoDefault, 0
@@ -305,14 +226,16 @@ func classifyXLogRecord(payload []byte) (Rmgr, uint8, uint32) {
 		// the server as ready.
 		return RmgrXLog, xlogCheckpointShutdown, 0
 	}
-	// Classify by the goopg RecordKind (payload[0]) to a PG-compatible
-	// (xl_rmid, xl_info): records with a PG analog carry the real rmgr +
-	// opcode; goopg-private records carry the custom RmgrGoopgCatalog.
-	// This replaces the historical RM_XLOG/0xF0 "skip-me" tag so goopg
-	// emits ordinary-PG-shaped headers. goopg's own recovery re-keys on
-	// payload[0] inside each rmgr arm (see ApplyRecord).
-	// xl_xid stays 0 here — native bodies carry their own xid, which
-	// goopg recovery reads directly.
+	// doc 04 §3/§5.4: dispatch on the real PG-compatible (xl_rmid, xl_info)
+	// pair for this RecordKind — a real PG analog (RmgrHeap/RmgrBtree/…)
+	// when one exists, else goopg's custom RmgrGoopgCatalog rmgr (§3.2).
+	// Previously every native record classified as RmgrXLog/0xF0
+	// (M0105-0007's blanket catch-all); recovery.go's §4 dispatch rework
+	// (isGoopgOwnedRmgr) landed in the same change to keep goopg's own
+	// crash recovery routing to the native payload[0] switch for every
+	// rmgr returned here. xid stays 0 — the real xid (when one exists)
+	// lives in the payload body, not the XLogRecord header, for native
+	// records (see stream_replayer.go's replayedXactInfo).
 	rmgr, info := recordKindToRmgrInfo(payload[0])
 	return rmgr, info, 0
 }

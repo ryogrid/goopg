@@ -20,7 +20,7 @@ func TestEmittedRecordKindsClassifyPGCompatible(t *testing.T) {
 		{"HeapLock", RecordKindHeapLock, RmgrHeap, xlogHeapLock},
 		{"HeapPruneOpt", RecordKindHeapPruneOpt, RmgrHeap2, xlogHeap2PruneOnAccess},
 		{"HeapVacuum", RecordKindHeapVacuum, RmgrHeap2, xlogHeap2PruneVacuumScan},
-		{"HeapFreeze", RecordKindHeapFreeze, RmgrHeap2, xlogHeap2PruneVacuumCleanp},
+		{"HeapFreeze", RecordKindHeapFreeze, RmgrHeap2, xlogHeap2PruneVacuumClean},
 		{"BtreeInsert", RecordKindBtreeInsert, RmgrBtree, xlogBtreeInsertLeaf},
 		{"BtreeSplit", RecordKindBtreeSplit, RmgrBtree, xlogBtreeSplitL},
 		{"BtreeVacuum", RecordKindBtreeVacuum, RmgrBtree, xlogBtreeVacuum},
@@ -32,7 +32,7 @@ func TestEmittedRecordKindsClassifyPGCompatible(t *testing.T) {
 		{"XactAbort", RecordKindXactAbort, RmgrXact, xlogXactAbort},
 		{"SmgrCreate", RecordKindSmgrCreate, RmgrStorage, xlogSmgrCreate},
 		{"ClogTruncate", RecordKindClogTruncate, RmgrCLOG, xlogClogTruncate},
-		{"PageImage", RecordKindPageImage, RmgrXLog, xlogFPI},
+		{"PageImage", RecordKindPageImage, RmgrXLog, xlogXLogFPI},
 		// A goopg-private catalog/DDL record → custom rmgr, body-keyed.
 		{"CreateDatabase(private)", RecordKindCreateDatabase, RmgrGoopgCatalog, 0},
 		{"CreateSchema(private)", RecordKindCreateSchema, RmgrGoopgCatalog, 0},

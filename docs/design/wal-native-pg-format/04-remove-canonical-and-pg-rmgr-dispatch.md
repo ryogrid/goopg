@@ -305,10 +305,41 @@ case RmgrXLog:
   failed, all 3 workloads).
   ~~`internal/wal/format.go`: `recordKindToRmgrInfo` mapping table + rewrite
   `classifyXLogRecord` to use it; retire `xlogInfoDefault` as the catch-all.~~
-- **Found while building the table above (resolves before wiring, not yet
-  applied):** wiring `recordKindToRmgrInfo` into `classifyXLogRecord` alone
-  — without the §4 recovery rework in the *same* change — breaks goopg's own
-  crash recovery immediately, confirmed by tracing three concrete paths:
+- **Landed 2026-07-15 (this bullet's trace + the §4 dispatch rework below,
+  in one atomic commit, per R1):** `classifyXLogRecord`'s native-record
+  catch-all now calls `recordKindToRmgrInfo`; all 5 coupling points traced
+  below were fixed in `recovery.go` in the same change, plus a 6th one this
+  trace missed — `IsGoopgNativeRecord` (used by ~20
+  `internal/initdb/*_ddl_recovery.go` restart scanners to gate trusting
+  `Payload[0]`) still checked only the legacy `RmgrXLog+xlogInfoDefault`
+  catch-all; after wiring, catalog/DDL records classify to
+  `RmgrGoopgCatalog` instead, so every scanner would have silently stopped
+  re-populating the catalog registry from WAL after a restart. Fixed by
+  delegating to the same `isGoopgOwnedRmgr` (plus the legacy 0xF0 catch-all
+  for old data dirs). Also fixed `internal/initdb/emit_canonical_switch_test.go`'s
+  `countCanonicalRecords`, whose "rmid≠RmgrXLog ⇒ canonical" detection
+  heuristic went stale the moment native records started classifying into
+  real per-kind rmgrs; the correct signal is `len(r.Payload)==0` (a
+  canonical envelope's inner body never round-trips back through
+  `classifyXLogRecord` to its own header, so `Payload` stays nil regardless
+  of whether it carries an FPI block ref — ruling out a `len(Blocks)>0`
+  heuristic, since the canonical xact-commit/abort markers carry none).
+  Gates: full G-crash + `TestKillKillRecovery` before/after (per R1), full
+  `./internal/initdb/...` + `./internal/wal/...` + `testutil/{cluster,
+  pgcluster,pubsubcluster,replcluster}`, `tpch-spotcheck.sh`, and
+  `RALPH_PRECOMMIT_SCOPE=smoke ralph-precommit-test.sh` all green. Two
+  deferrals recorded in `.ralph/deferral_ledger.md` (2026-07-15 row): the
+  optional legacy `RM_XLOG/0xF0` backward-compat arm in `ApplyRecord` (§4's
+  own "recommended, not required" note) and real external block-carrying
+  `XLOG_FPI` restore (out of scope per §6). The stale
+  `TestRecordKindToRmgrInfoNotYetWired` test (designed to break the day
+  this landed) was deleted and replaced with
+  `TestClassifyXLogRecordWiredToRecordKindToRmgrInfo`.
+
+  Original trace (kept for the record) — wiring `recordKindToRmgrInfo` into
+  `classifyXLogRecord` alone, without the §4 recovery rework in the *same*
+  change, would have broken goopg's own crash recovery immediately,
+  confirmed by tracing three concrete paths:
   1. `ApplyRecord`'s existing gate (`ApplyRecord`, `ApplyRecord` calls this
      "M0106-0011" comment) — `if r.XLog.Header.Rmid != RmgrXLog ||
      r.XLog.Header.Info != xlogInfoDefault { return
@@ -357,15 +388,25 @@ case RmgrXLog:
      hasn't been removed yet, and several active call sites (§5.2) still
      depend on FPI replay for canonical btree-split/index-insert records.
      Revisit only after §5.1-5.3 lands.
-- `internal/wal/recovery.go`: apply the §4 dispatch rework per the 5 points
-  above — add `isGoopgOwnedRmgr`, patch `ApplyRecord`'s rmid gate, add the
-  `RmgrGoopgCatalog` no-op case and the `RmgrXLog`/`XLOG_FPI` case to
-  `replayDecodedXLogRecord`, leave the FPI `RmgrHeap`/`RmgrBtree` arms
+- **Landed 2026-07-15:** `internal/wal/recovery.go` gained the §4 dispatch
+  rework per the 5 points above (plus the `IsGoopgNativeRecord` 6th point
+  noted above) — `isGoopgOwnedRmgr`, `ApplyRecord`'s rewritten rmid gate,
+  the `RmgrGoopgCatalog` no-op case and the `RmgrXLog`/`XLOG_FPI` case
+  (guarded on `len(r.Payload)==0` to no-op rather than error on a genuine
+  external block-carrying FPI) in `replayDecodedXLogRecord`; the FPI
+  `RmgrHeap`/`RmgrBtree` arms were left untouched as directed.
+  ~~`internal/wal/recovery.go`: apply the §4 dispatch rework per the 5
+  points above — add `isGoopgOwnedRmgr`, patch `ApplyRecord`'s rmid gate,
+  add the `RmgrGoopgCatalog` no-op case and the `RmgrXLog`/`XLOG_FPI` case
+  to `replayDecodedXLogRecord`, leave the FPI `RmgrHeap`/`RmgrBtree` arms
   untouched. Land together with the `classifyXLogRecord` wiring above in one
   atomic change (not split across loops) — full G-crash (`go test -run
   'Crash|Recovery|Durability' ./internal/initdb/ ./internal/wal/` +
-  `TestKillKillRecovery`) before/after, per §8 R1.
-- `internal/wal/stream_replayer.go:159` (`replayedXactInfo`): mostly
+  `TestKillKillRecovery`) before/after, per §8 R1.~~
+- **Landed 2026-07-15:** `internal/wal/stream_replayer.go`'s
+  `replayedXactInfo` gained a `case RecordKindXactCommitInval:` beside
+  `RecordKindXactCommit` (same `DecodeXactMarker` call).
+  ~~`internal/wal/stream_replayer.go:159` (`replayedXactInfo`): mostly
   unaffected — its primary path already keys on `rec.Payload[0]` (populated
   regardless of rmid per point 2 above), so `RecordKindXactCommit`/`Abort`
   need no change. Only gap: add a `case RecordKindXactCommitInval:` beside
@@ -376,7 +417,7 @@ case RmgrXLog:
   gap — the real xid lives only in the payload body, decoded via
   `DecodeXactMarker`), so the fallback would silently report xid 0 for every
   replayed `XactCommitInval` without this fix. Update to the new
-  rmid scheme; also recognize `XactCommitInval(32)` on the `RmgrXact` path.
+  rmid scheme; also recognize `XactCommitInval(32)` on the `RmgrXact` path.~~
 
 ## 6. Test / CI / nightly impact (expected-fail handling)
 

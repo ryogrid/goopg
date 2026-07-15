@@ -67,10 +67,13 @@ func TestDecodeRecordXLogRejectsBadMainDataTag(t *testing.T) {
 }
 
 func TestEncodeRecordXLogClassifiesXactCommitXID(t *testing.T) {
-	// goopg now emits ordinary-PG-shaped headers: an XactCommit record
-	// classifies as RM_XACT / XLOG_XACT_COMMIT (not the old RM_XLOG/0xF0
-	// skip-tag). The XID stays 0 in the header — the native body carries
-	// its own xid, which goopg recovery reads directly.
+	// doc 04 §3.1/§5.4: goopg-internal records (non-canonical) are now
+	// classified via recordKindToRmgrInfo into their real PG-compatible
+	// (rmid, info) — RecordKindXactCommit maps to RmgrXact/xlogXactCommit,
+	// not the old blanket RmgrXLog/xlogInfoDefault catch-all (M0105-0007,
+	// superseded). XID is still 0 in the header for non-canonical records;
+	// canonical records (0xFE prefix) carry the full XID for
+	// logical-replication consumers.
 	payload := EncodeXactCommit(4242)
 	enc, _, err := encodeRecordXLog(payload, 0)
 	if err != nil {

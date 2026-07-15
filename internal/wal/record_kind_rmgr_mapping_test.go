@@ -69,22 +69,20 @@ func TestRecordKindToRmgrInfoCustomDefault(t *testing.T) {
 	}
 }
 
-// TestRecordKindToRmgrInfoNotYetWired documents the current transitional
-// state (doc 04 §5.4): recordKindToRmgrInfo exists and is fully tested,
-// but classifyXLogRecord does not call it yet — wiring it in requires the
-// coupled internal/wal/recovery.go dispatch rework (§4) landing in the
-// same change (R1-critical, doc §8). Until then, classifyXLogRecord must
-// keep returning the RmgrXLog/xlogInfoDefault catch-all for every native
-// kind, even ones recordKindToRmgrInfo would now map differently. This
-// test intentionally breaks (delete it, not "fix" it) the day
-// classifyXLogRecord is rewired.
-func TestRecordKindToRmgrInfoNotYetWired(t *testing.T) {
-	for _, kind := range []byte{RecordKindHeapInsert, RecordKindXactCommit, RecordKindPageImage} {
+// TestClassifyXLogRecordWiredToRecordKindToRmgrInfo pins doc 04 §5.4's
+// wiring: classifyXLogRecord's native-record catch-all now delegates to
+// recordKindToRmgrInfo instead of the old blanket RmgrXLog/xlogInfoDefault
+// (M0105-0007, superseded) for every kind.
+func TestClassifyXLogRecordWiredToRecordKindToRmgrInfo(t *testing.T) {
+	for _, kind := range []byte{
+		RecordKindHeapInsert, RecordKindXactCommit, RecordKindPageImage,
+		RecordKindCreateTransform, RecordKindRenameIndex,
+	} {
+		wantRmgr, wantInfo := recordKindToRmgrInfo(kind)
 		rmgr, info, xid := classifyXLogRecord([]byte{kind})
-		if rmgr != RmgrXLog || info != xlogInfoDefault || xid != 0 {
-			t.Errorf("classifyXLogRecord([%d]) = (%d, 0x%02x, %d), want unwired catch-all (RmgrXLog, 0xF0, 0) — "+
-				"if this fails, recordKindToRmgrInfo has been wired in; delete this test and update doc 04 §5.4",
-				kind, rmgr, info, xid)
+		if rmgr != wantRmgr || info != wantInfo || xid != 0 {
+			t.Errorf("classifyXLogRecord([%d]) = (%d, 0x%02x, %d), want (%d, 0x%02x, 0) from recordKindToRmgrInfo",
+				kind, rmgr, info, xid, wantRmgr, wantInfo)
 		}
 	}
 }

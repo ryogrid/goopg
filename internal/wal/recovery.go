@@ -8681,6 +8681,25 @@ func ExportedReplayStart(records []Record) (int, uint64) {
 	return replayStart(records)
 }
 
+// isGoopgOwnedRmgr reports whether rmid is one of the resource managers
+// classifyXLogRecord/recordKindToRmgrInfo (doc 04 §3) assigns to a native
+// goopg RecordKind — either a real PG analog (Heap/Heap2/Btree/Xact/Storage/
+// CLOG) or goopg's private custom rmgr (GoopgCatalog, §3.2). A record
+// classified into any of these still carries its goopg RecordKind tag at
+// Payload[0] (nativeHeaderMatchesMainData, pg_xlog_decode.go, populates it
+// symmetrically regardless of rmid) and can be dispatched through the
+// native payload[0] switch. RmgrXLog is deliberately excluded: it is PG's
+// own rmgr (checkpoints, XLOG_FPI, parameter-change) plus the legacy
+// pre-doc-04 0xF0 catch-all, neither of which is "goopg-owned" in this sense.
+func isGoopgOwnedRmgr(rmid Rmgr) bool {
+	switch rmid {
+	case RmgrHeap, RmgrHeap2, RmgrBtree, RmgrXact, RmgrStorage, RmgrCLOG, RmgrGoopgCatalog:
+		return true
+	default:
+		return false
+	}
+}
+
 // IsGoopgNativeRecord reports whether r.Payload[0] is a trustworthy goopg
 // RecordKind tag byte that a caller may safely switch on. A record whose XLog
 // header does NOT match the (xl_rmid, xl_info) recordKindToRmgrInfo assigns to
@@ -9235,10 +9254,43 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 		return false, errors.New("wal: empty decoded xlog record")
 	}
 	switch xlog.Header.Rmid {
+	case RmgrGoopgCatalog:
+		// doc 04 §5.4 point 3: catalog/DDL RecordKinds with no PG analog
+		// (§3.2 default) fall through nativeApplyRecordKindKnown's
+		// allow-list gate in ApplyRecord (they carry no physical page
+		// state, e.g. RecordKindCreateTransform) and land here. They are
+		// intentionally a no-op: the recovery driver in
+		// internal/initdb/*_ddl_recovery.go re-scans the raw WAL and
+		// re-applies them to the catalog directly (see
+		// wal.IsGoopgNativeRecord / isGoopgOwnedRmgr, which those scanners
+		// rely on to trust r.Payload[0] for this same rmgr).
+		return false, nil
 	case RmgrXLog:
 		switch xlog.Header.Info & XLRRmgrInfoMask {
 		case xlogXLogParameterChange:
 			return replayXLogParameterChange(mgr, xlog)
+		case xlogXLogFPI:
+			// doc 04 §5.4 point 4: a native (no block-refs) RecordKindPageImage
+			// record now classifies as RmgrXLog/XLOG_FPI (§3.1) instead of the
+			// old RmgrXLog/0xF0 catch-all, so it routes here instead of
+			// ApplyRecord's payload[0] switch. r.Payload is still populated
+			// (nativeHeaderMatchesMainData, pg_xlog_decode.go, recomputes
+			// classifyXLogRecord symmetrically at decode time for any
+			// no-block-refs record) — replay it exactly as ApplyRecord's own
+			// RecordKindPageImage case would have.
+			if len(r.Payload) == 0 {
+				// A genuine external XLOG_FPI (real block-ref-carried full
+				// page image, e.g. from actual PG WAL) has no goopg
+				// RecordKindPageImage payload to decode — that path is
+				// out of scope for this slice (real-PG-WAL consumption is
+				// expected-fail, doc 04 §6); keep the previous no-op
+				// behavior rather than erroring on an empty payload.
+				return false, nil
+			}
+			if err := replayPageImage(mgr, r.Payload); err != nil {
+				return false, err
+			}
+			return true, nil
 		default:
 			// Other RmgrXLog opcodes (checkpoint, noop, switch, …) need no
 			// physical replay action on the standby.

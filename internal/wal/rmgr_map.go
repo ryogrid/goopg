@@ -17,34 +17,10 @@ package wal
 // tools will misparse the analog records' bodies — that is expected and
 // out of scope here. goopg↔goopg recovery keys on this same mapping.
 // See docs/design/wal-native-pg-format/04-remove-canonical-and-pg-rmgr-dispatch.md.
-const (
-	// RM_HEAP opcodes (xl_info & 0x70). xlogHeapInsert/Delete/HotUpdate
-	// are already defined in pg_xlog_decode.go.
-	xlogHeapLock uint8 = 0x60 // XLOG_HEAP_LOCK
-
-	// RM_HEAP2 opcodes.
-	xlogHeap2PruneOnAccess     uint8 = 0x10 // XLOG_HEAP2_PRUNE_ON_ACCESS
-	xlogHeap2PruneVacuumScan   uint8 = 0x20 // XLOG_HEAP2_PRUNE_VACUUM_SCAN
-	xlogHeap2PruneVacuumCleanp uint8 = 0x30 // XLOG_HEAP2_PRUNE_VACUUM_CLEANUP
-
-	// RM_BTREE opcodes.
-	xlogBtreeInsertLeaf       uint8 = 0x00 // XLOG_BTREE_INSERT_LEAF
-	xlogBtreeSplitL           uint8 = 0x30 // XLOG_BTREE_SPLIT_L
-	xlogBtreeVacuum           uint8 = 0xC0 // XLOG_BTREE_VACUUM
-	xlogBtreeUnlinkPage       uint8 = 0x80 // XLOG_BTREE_UNLINK_PAGE
-	xlogBtreeNewRoot          uint8 = 0xA0 // XLOG_BTREE_NEWROOT
-	xlogBtreeMarkPageHalfDead uint8 = 0xB0 // XLOG_BTREE_MARK_PAGE_HALFDEAD
-
-	// RM_SMGR opcode.
-	xlogSmgrCreate uint8 = 0x10 // XLOG_SMGR_CREATE
-
-	// RM_CLOG opcode.
-	xlogClogTruncate uint8 = 0x10 // CLOG_TRUNCATE
-
-	// RM_XLOG opcode for full-page images (XLOG_FPI). Checkpoints
-	// (0x00/0x10) are classified separately by the 88-byte branch.
-	xlogFPI uint8 = 0xB0 // XLOG_FPI
-)
+//
+// The opcode constants themselves (xlogHeapLock, xlogHeap2Prune*,
+// xlogBtree*, xlogSmgrCreate, xlogClogTruncate, xlogXLogFPI, ...) live in
+// pg_xlog_decode.go, shared with the decode path.
 
 // recordKindToRmgrInfo maps a goopg RecordKind byte (payload[0]) to the
 // PG-compatible (xl_rmid, xl_info) it is emitted with. Records with no
@@ -72,7 +48,7 @@ func recordKindToRmgrInfo(kind byte) (Rmgr, uint8) {
 	case RecordKindHeapVacuum:
 		return RmgrHeap2, xlogHeap2PruneVacuumScan
 	case RecordKindHeapFreeze:
-		return RmgrHeap2, xlogHeap2PruneVacuumCleanp
+		return RmgrHeap2, xlogHeap2PruneVacuumClean
 	// Btree (RM_BTREE)
 	case RecordKindBtreeInsert:
 		return RmgrBtree, xlogBtreeInsertLeaf
@@ -100,7 +76,7 @@ func recordKindToRmgrInfo(kind byte) (Rmgr, uint8) {
 		return RmgrCLOG, xlogClogTruncate
 	// XLOG full-page image
 	case RecordKindPageImage:
-		return RmgrXLog, xlogFPI
+		return RmgrXLog, xlogXLogFPI
 	default:
 		// goopg-private catalog/DDL records: custom rmgr, body-keyed.
 		return RmgrGoopgCatalog, 0
