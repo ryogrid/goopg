@@ -9505,7 +9505,18 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 		}
 	case RmgrXact:
 		switch xlog.Header.Info & xlogXactOpMask {
-		case xlogXactCommit, xlogXactAbort:
+		case xlogXactCommit:
+			// CLOG commit-stamping is done by the initdb xact-recovery pass, not
+			// here (physical replay is a page-wise no-op for xact markers). But a
+			// commit carrying relcache invalidations (XLOG_XACT_HAS_INFO + xinfo
+			// HAS_INVALS) must unlink the standby's pg_internal.init files before
+			// the transaction's heap writes become visible — the A6 replacement
+			// for the native RecordKindXactCommitInval redo path.
+			if xactCommitCarriesInvals(xlog.Header.Info, xlog.MainData) {
+				_ = ProcessCommittedInvalidationMessages(mgr.DataDir(), defaultRecoveryDBOid)
+			}
+			return false, nil
+		case xlogXactAbort:
 			return false, nil
 		default:
 			return false, unsupportedDecodedXLogRecord(r)

@@ -250,3 +250,63 @@ func EncodeBtreeInsertPG(rel storage.RelFileNode, blk storage.BlockNumber, offnu
 	}
 	return framePGAssembled(RmgrBtree, xlogBtreeInsertLeaf, 0, body), nil
 }
+
+const (
+	// xlogXactHasInfo is PG's XLOG_XACT_HAS_INFO — an xl_info bit above the
+	// op-mask signalling that the xl_xact_commit/abort body carries an xinfo
+	// word + xinfo-gated chunks after the fixed xact_time.
+	xlogXactHasInfo uint8 = 0x80
+	// xactXinfoHasInvals is PG's XACT_XINFO_HAS_INVALS (an xl_xact_xinfo bit):
+	// the commit carries shared-invalidation messages (goopg uses it as the
+	// relcache-init-file invalidation signal; the message array is empty).
+	xactXinfoHasInvals uint32 = 1 << 3
+	// minSizeOfXactCommit is PG's fixed xl_xact_commit prefix: xact_time (s8).
+	minSizeOfXactCommit = 8
+)
+
+// EncodeXactCommitPG builds a PostgreSQL xl_xact_commit record, framed for the
+// assembled path. The committing xid is carried in the record header (xl_xid),
+// not the body. The body is xact_time (s8, always 0 — goopg has no commit
+// timestamp). When hasInvals is set (the transaction changed a nailed catalog),
+// XLOG_XACT_HAS_INFO + xinfo{HAS_INVALS} + an empty invals array (nmsgs=0) are
+// appended, so standby replay unlinks the relcache init files (the old
+// RecordKindXactCommitInval signal). No block references; opcode = XLOG_XACT_COMMIT.
+func EncodeXactCommitPG(xid storage.TransactionID, hasInvals bool) ([]byte, error) {
+	info := xlogXactCommit
+	var mainData []byte
+	if hasInvals {
+		info |= xlogXactHasInfo
+		mainData = make([]byte, minSizeOfXactCommit+8) // xact_time(8) + xinfo(4) + nmsgs(4)
+		binary.LittleEndian.PutUint32(mainData[8:12], xactXinfoHasInvals)
+		// mainData[12:16] = nmsgs = 0 (goopg carries no message array).
+	} else {
+		mainData = make([]byte, minSizeOfXactCommit) // xact_time = 0
+	}
+	body, err := assembleXLogRecord(mainData, nil)
+	if err != nil {
+		return nil, err
+	}
+	return framePGAssembled(RmgrXact, info, uint32(xid), body), nil
+}
+
+// EncodeXactAbortPG builds a PostgreSQL xl_xact_abort record (xact_time s8 = 0,
+// no chunks). The aborting xid is carried in the header (xl_xid); opcode =
+// XLOG_XACT_ABORT.
+func EncodeXactAbortPG(xid storage.TransactionID) ([]byte, error) {
+	mainData := make([]byte, minSizeOfXactCommit) // xact_time = 0
+	body, err := assembleXLogRecord(mainData, nil)
+	if err != nil {
+		return nil, err
+	}
+	return framePGAssembled(RmgrXact, xlogXactAbort, uint32(xid), body), nil
+}
+
+// xactCommitCarriesInvals reports whether a decoded xl_xact_commit body signals
+// relcache invalidations (XLOG_XACT_HAS_INFO + xinfo HAS_INVALS).
+func xactCommitCarriesInvals(info uint8, mainData []byte) bool {
+	if info&xlogXactHasInfo == 0 || len(mainData) < minSizeOfXactCommit+4 {
+		return false
+	}
+	xinfo := binary.LittleEndian.Uint32(mainData[minSizeOfXactCommit : minSizeOfXactCommit+4])
+	return xinfo&xactXinfoHasInvals != 0
+}
