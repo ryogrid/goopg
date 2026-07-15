@@ -171,9 +171,7 @@ func cmpKeyNameOid(a, b []byte) int {
 // insertCanonicalSysBtreeLeaf inserts indexTuple into the leaf-root page of
 // the system btree at sysBtreeRootBlock. Existing entries are compared via
 // cmp on the key bytes (offset sysIndexTupleHoff..) to find the sorted
-// insert position. The updated page is then captured as a full-page image
-// and emitted as an XLOG_BTREE_INSERT_LEAF canonical WAL record (when
-// ctx.LogCanonical != nil).
+// insert position.
 //
 // Pre-condition: the index file exists and has at least
 // sysBtreeRootBlock+1 blocks (true for initdb-bootstrapped clusters; tests

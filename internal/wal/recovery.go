@@ -9326,9 +9326,8 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 			// (HasImage+ImageApply on every referenced block). Restore each
 			// block from its FPI; tuple-level main-data parsing is not needed
 			// because the FPI already captures the post-mutation page state.
-			// xlogHeapInplace (M0117-0008 Part B) carries the same
-			// datfrozenxid-advanced pg_database page PgCanonicalHeapInplace
-			// wrote on the primary.
+			// xlogHeapInplace (M0117-0008 Part B) carries a
+			// datfrozenxid-advanced pg_database page image.
 			if err := replayDecodedXLogHeapFPIBlocks(mgr, r, xlog); err != nil {
 				return false, err
 			}
@@ -9337,11 +9336,14 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 			return false, unsupportedDecodedXLogRecord(r)
 		}
 	case RmgrBtree:
-		// Canonical XLOG_BTREE_INSERT_LEAF (M0106-0010 batched-36 loop 9):
-		// emitted from `internal/executor/sys_catalog_index_insert.go` with
-		// a full-page image of the updated leaf-root page on every record.
-		// The FPI carries the entire post-insert page so no main-data
-		// parsing of the IndexTuple is required for replay.
+		// XLOG_BTREE_INSERT_LEAF with a full-page image of the updated
+		// leaf-root page on every record. The FPI carries the entire
+		// post-insert page so no main-data parsing of the IndexTuple is
+		// required for replay. No current emitter produces a block-ref
+		// FPI record on this rmgr (the doc 04 §5.1-5.3 canonical-family
+		// removal deleted the only call sites that did); kept as the
+		// correct redo path for when the native→PG content rewrite
+		// (docs/design/wal-native-pg-format/) adds real FPI emission here.
 		if err := replayDecodedXLogHeapFPIBlocks(mgr, r, xlog); err != nil {
 			return false, err
 		}
@@ -9354,8 +9356,8 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 // replayDecodedXLogHeapFPIBlocks restores all block references that carry a
 // full-page image with ImageApply set. Used for XLOG_HEAP_DELETE,
 // XLOG_HEAP_UPDATE, and XLOG_HEAP_HOT_UPDATE records emitted with FPI on
-// every modified block (canonical mode). The FPI already encodes the complete
-// post-mutation page state, so no tuple-level main-data parsing is required.
+// every modified block. The FPI already encodes the complete post-mutation
+// page state, so no tuple-level main-data parsing is required.
 func replayDecodedXLogHeapFPIBlocks(mgr *storage.Manager, r Record, xlog *XLogDecodedRecord) error {
 	for i, block := range xlog.Blocks {
 		if !block.HasImage || !block.ImageApply {

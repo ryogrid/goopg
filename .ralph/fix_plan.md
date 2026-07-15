@@ -11144,6 +11144,64 @@ mirroring M0119's ledger `status` column.
       (`go test -run 'Crash|Recovery|Durability' ./internal/initdb/
       ./internal/wal/` + `TestKillKillRecovery`) before/after per §8 R1.
 
+- [x] **Doc 04 §5.4 atomic classify+recovery dispatch rework landed
+      (2026-07-15, commit 347c3b08).** Wired `recordKindToRmgrInfo` into
+      `classifyXLogRecord`'s native-record catch-all and landed all 6
+      recovery.go coupling-point fixes in the same commit: `isGoopgOwnedRmgr`
+      helper, `ApplyRecord`'s rewritten rmid gate, `replayDecodedXLogRecord`'s
+      `RmgrGoopgCatalog` no-op case + `RmgrXLog`/`XLOG_FPI` case, the FPI
+      `RmgrHeap`/`RmgrBtree` arms left untouched as directed,
+      `IsGoopgNativeRecord` fixed to delegate to `isGoopgOwnedRmgr` (a 6th
+      coupling point the prior loop's trace missed — ~20
+      `internal/initdb/*_ddl_recovery.go` restart scanners would otherwise
+      have silently stopped re-populating the catalog registry after a
+      restart), and `stream_replayer.go`'s `replayedXactInfo` gained the
+      `XactCommitInval` case. Full G-crash + `TestKillKillRecovery` +
+      `./internal/initdb/...`/`./internal/wal/...` all green before/after;
+      `tpch-spotcheck.sh` + `ralph-precommit-test.sh` smoke PASS. Doc 04 §5.4
+      updated in the same commit; two deliberate deferrals recorded in the
+      ledger (optional legacy `RM_XLOG/0xF0` backward-compat arm; real
+      external block-carrying XLOG_FPI restore).
+
+- [x] **Doc 04 §5.1-5.3 + §6 landed (2026-07-15) — canonical WAL family +
+      `GOOPG_WAL_CANONICAL` knob + native skip-tag fully removed.** The
+      three user-requested removals: (1) deleted `internal/catalog/canonical.go`
+      + `internal/wal/parameter_change.go` (relocating `GUCParameters`/
+      `DefaultGUCParameters` into `checkpointer.go` first) + every
+      `LogCanonical`/`PgCanonical*` call site across executor/initdb/server/
+      vacuum (`writeHeapRowCanonical` now just delegates to
+      `writeHeapRowReturningPG`, keeping its ~20 catalog-heap-sync callers
+      unchanged); (2) deleted `emitCanonicalDefault`/`wal.Config.EmitCanonical`/
+      `Writer.CanonicalEnabled()` + the startup/BASE_BACKUP warnings; (3)
+      deleted the `payload[0]==0xFE` branches in `wrapXLogMainData`/
+      `classifyXLogRecord` + the mirrored branch in `predictXLogRecordLen`
+      (caught 2 failing subtests in the keystone predictor-vs-encoder parity
+      test, fixed by deleting the now-invalid canonical test cases) +
+      `RecordKindCanonical`. Deleted 10 pure-canonical files; converted the 4
+      `skipUnlessCanonicalWAL`-gated tests to unconditional `t.Skip`; removed
+      the now-redundant `TestKillKillRecoveryNativeOnly` and the nightly
+      `GOOPG_WAL_CANONICAL=on` lane from `ci/batch/stages/stage-testport.sh`.
+      **Deviation from doc 04 §6's prediction:** `TestPort_WALPgWaldumpCompat`
+      (W-001) and `TestPGWaldumpParsesEmittedWAL` were expected to become
+      structurally-failing once real rmids sit over native bodies, but both
+      still PASS (verified by direct re-run) — neither validates per-rmgr
+      body content deeply enough to catch the mismatch — so the CSV
+      `port→defer` flip was deliberately not applied. Gates: `go build
+      ./...`/`go vet ./...` clean repo-wide; grep-audit shows no
+      `LogCanonical`/`PgCanonical`/`RecordKindCanonical`/`GOOPG_WAL_CANONICAL`/
+      `EmitCanonical`/`CanonicalEnabled` outside historical/comment text (all
+      cleaned) except the retained `xlogInfoDefault` legacy-decode arm;
+      `./internal/wal/...` full green; `./internal/executor/...`/
+      `./internal/vacuum/...`/`./internal/initdb/...`/`./internal/server/...`
+      green. Design doc 04 marked landed (§2-§6 complete; only the
+      out-of-scope record body/content rewrite remains);
+      `docs/design/README.md` updated. Deferral ledger row appended
+      (supersedes the 2026-07-13 perf-optimize3-dash S4 rows 756/757, whose
+      "resume via GOOPG_WAL_CANONICAL=on" path no longer exists). **This
+      closes the WAL native→PG-format rework epic's dispatch/removal scope
+      in full** — the only remaining item is the separately-scoped record
+      body/content rewrite (docs 01/03), not yet started.
+
 - [ ] **Nightly whole-suite regression batch — implementation** (~6). Design is
       DONE and committed: `analysis/tests-overview-260706/` (test-landscape
       snapshot) → `ci/design/` (6-doc architecture: S0 preflight → S1 two

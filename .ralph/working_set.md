@@ -1,68 +1,73 @@
-Loop #35 landed doc 04 §5.4's THIRD additive slice: `internal/wal/format.go`
-gained `recordKindToRmgrInfo(kind byte) (Rmgr, uint8)` — the full §3.1
-PG-analog mapping table + §3.2 custom-rmgr default, unit-tested against
-every doc row (`internal/wal/record_kind_rmgr_mapping_test.go`). Needed
-opcode consts added to `pg_xlog_decode.go` (`xlogHeapLock`/
-`xlogBtreeInsertLeaf`/`SplitL`/`SplitR`/`UnlinkPage`/`NewRoot`/
-`MarkPageHalfDead`/`Vacuum`/`xlogSmgrCreate`/`xlogXLogFPI`/
-`xlogClogTruncate`), confirmed against PG 18.3 source. Deliberately NOT
-wired into `classifyXLogRecord` — the working-set baton from loop #34
-assumed that was next, but tracing it found it CANNOT land alone (would
-break goopg's own crash recovery). Full findings recorded in doc 04 §5.4
-(4th bullet, 5 numbered points) and mirrored in the ledger row appended
-this loop:
-1. `ApplyRecord`'s rmid gate (`recovery.go`, "M0106-0011" comment) assumes
-   every native record classifies `RmgrXLog`/`0xF0` — must become
-   `!isGoopgOwnedRmgr(Rmid)` (new helper: Heap/Heap2/Btree/Xact/Storage/
-   CLOG/GoopgCatalog).
-2. Decode side is unaffected FOR FREE — `nativeHeaderMatchesMainData`
-   (`pg_xlog_decode.go:241-247`) already recomputes `classifyXLogRecord`
-   symmetrically at decode time, so `r.Payload` still populates correctly
-   for every no-block native record once classify's output changes.
-3. `replayDecodedXLogRecord`'s `default:` arm HARD-ERRORS (aborts
-   recovery, not silent) for ~80 catalog/DDL kinds not in
-   `nativeApplyRecordKindKnown`'s allow-list, once they get
-   `Rmid=RmgrGoopgCatalog` — needs one new `case RmgrGoopgCatalog: return
-   false, nil`.
-4. `RecordKindPageImage` → `RmgrXLog`/`XLOG_FPI` (§3.1) genuinely collides
-   with real PG semantics: would route to `replayDecodedXLogRecord`'s
-   `RmgrXLog` default (`return false, nil`), SILENTLY dropping a real
-   page-image restore that `replayPageImage` currently performs — the R1
-   failure mode materializing concretely. Needs a new `case xlogXLogFPI:`
-   arm delegating to `replayPageImage(mgr, r.Payload)`.
-5. Canonical (0xFE) FPI arms (`RmgrHeap`/`RmgrBtree` in
-   `replayDecodedXLogRecord`) must stay UNTOUCHED this slice — they're
-   reached via the empty-payload gate regardless of rmid, and canonical
-   emission (§5.1-5.3) hasn't been removed yet (active call sites still
-   depend on FPI replay). Do NOT "replace" them yet as the original §4
-   draft pseudocode suggested.
+(idle — nothing in flight)
 
-Also found (documented, left untouched): a STALE, uncommitted worktree at
-`.claude/worktrees/wal-canonical-removal/` (branch
-`wal-canonical-removal`, HEAD `e9884a60` — before the additive-first
-slices landed) attempting the OPPOSITE (subtractive-first: deletes
-canonical.go outright) ordering. Orphaned, not referenced anywhere in
-fix_plan/ledger — do not resume/merge as-is. Full note in doc 04 §8 R3.
+Loop #37 landed doc 04 §5.1-5.3 + §6 in full (the WAL native→PG-format
+rework's canonical-family/knob/skip-tag REMOVAL — the last unimplemented
+part of doc 04, following loop #36's §5.4 atomic classify+recovery dispatch
+landing). This closes the epic's dispatch/removal scope entirely; only the
+separately-scoped record body/content rewrite (docs 01/03) remains, not
+started.
 
-Next step for the WAL epic: implement the ONE atomic change — `internal/
-wal/format.go`'s `classifyXLogRecord` rewrite (call `recordKindToRmgrInfo`)
-+ `internal/wal/recovery.go`'s §4 dispatch rework (the 5 points above) +
-`internal/wal/stream_replayer.go:159`'s `replayedXactInfo` (add a
-`RecordKindXactCommitInval` case) — ALL IN ONE COMMIT, not split across
-loops (splitting leaves HEAD's crash recovery broken in between). Read
-doc 04 §5.4 (4th/5th bullets) for the exact per-point fix before starting.
-Gate: full G-crash (`go test -run 'Crash|Recovery|Durability'
-./internal/initdb/ ./internal/wal/` + `TestKillKillRecovery`) BEFORE
-touching anything (establish the pre-change baseline) AND after, per §8
-R1. When done, delete `TestRecordKindToRmgrInfoNotYetWired`
-(`internal/wal/record_kind_rmgr_mapping_test.go`) — it's designed to fail
-the moment wiring lands.
+Summary of what landed (one commit):
+1. Deleted `internal/catalog/canonical.go` + `internal/wal/parameter_change.go`
+   (relocated `GUCParameters`/`DefaultGUCParameters` into `checkpointer.go`
+   first) + 10 pure-canonical test files.
+2. Unwired every `LogCanonical`/`PgCanonical*` call site across
+   executor/initdb/server/vacuum. `writeHeapRowCanonical` now just delegates
+   to `writeHeapRowReturningPG` (its ~20 catalog-heap-sync callers unchanged).
+3. Removed the `GOOPG_WAL_CANONICAL` knob (`emitCanonicalDefault`,
+   `wal.Config.EmitCanonical`, `Writer.CanonicalEnabled()`, the startup/
+   BASE_BACKUP warnings).
+4. Removed the `payload[0]==0xFE` branches in `wrapXLogMainData`/
+   `classifyXLogRecord` (format.go) + the mirrored branch in
+   `predictXLogRecordLen` (this one had a live keystone-test dependency —
+   `TestPredictXLogRecordLenMatchesEncodeRecordXLog`'s `canonical_minimal`/
+   `canonical_medium` subtests failed until the mirror was fixed too; deleted
+   `TestPredictXLogRecordLenCanonicalShortCircuitsFirstByte` outright) +
+   `RecordKindCanonical`.
+5. Converted 4 `skipUnlessCanonicalWAL`-gated tests to unconditional
+   `t.Skip` (doc §6); removed the now-redundant `TestKillKillRecoveryNativeOnly`
+   and 3 now-inert `t.Setenv("GOOPG_WAL_CANONICAL",...)` calls; removed the
+   nightly canonical-on lane from `ci/batch/stages/stage-testport.sh`; fixed
+   `TestBaseBackupWireProtocolFraming` (asserted a NoticeResponse this loop
+   removed).
 
-Gates run this loop: `go build ./...`, `go vet ./...` clean; `go test`
-and `go test -race ./internal/wal/...` full-package green; verified
-`recordKindToRmgrInfo` inert (no non-test caller, grepped); `make
-ralph-state-guard` clean; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
-`RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh` PASS
-(0 failed, all 3 workloads).
+Empirical deviation from doc §6's own prediction (recorded in the ledger,
+not silently dropped): `TestPort_WALPgWaldumpCompat` (W-001) and
+`TestPGWaldumpParsesEmittedWAL` were expected to become structurally-failing
+once real rmids sit over native bodies — verified by direct re-run that
+BOTH STILL PASS (pg_waldump's basic record walk doesn't validate per-rmgr
+body content deeply enough to catch the mismatch). The port-status CSV
+`port→defer` flip doc §6 specified was therefore deliberately NOT applied.
+
+Gates run this loop (all green): `go build ./...`/`go vet ./...` clean
+repo-wide; grep-audit clean (no `LogCanonical`/`PgCanonical`/
+`RecordKindCanonical`/`GOOPG_WAL_CANONICAL`/`EmitCanonical`/
+`CanonicalEnabled` outside the retained `xlogInfoDefault` legacy-decode arm);
+G-crash (`go test -run 'Crash|Recovery|Durability' ./internal/initdb/
+./internal/wal/'` + `TestKillKillRecovery`); goopg↔goopg E2E
+(`TestE2E_NativeOnlyReplicationAndPromotion`,
+`TestE2E_StandbyAttachRetainsUpstreamRowsAfterRestart`); G-race on
+`./internal/wal/ ./internal/executor/ ./internal/catalog/`; full
+`./internal/vacuum/... ./internal/server/... ./internal/initdb/...` (217s)
+`./internal/testport/...` (1031s, whole package, no -run filter) all green;
+`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+bash scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 workloads);
+`make ralph-state-guard` clean (one auto-repaired stale-progress-marker
+inconsistency, expected/benign, same pattern as loop #36).
+
+Doc 04 marked landed (§2-§6 complete). `docs/design/README.md` updated.
+`.ralph/deferral_ledger.md` gained a resolved-style row (status `-` per
+ledger convention — M0119 flips status) that supersedes the 2026-07-13
+perf-optimize3-dash S4 rows 756/757 (their "resume via
+GOOPG_WAL_CANONICAL=on" path no longer exists).
+
+Next step: no WAL-epic item left in fix_plan.md's dispatch/removal scope.
+If picking up the epic again, start the record body/content rewrite from
+`docs/design/wal-native-pg-format/01-emitted-wal-record-inventory.md` +
+`03-pg183-wal-record-schemas.md` (already-landed blueprints) — this is a
+large, separately-scoped epic, not a quick follow-up. Otherwise select the
+next fix_plan.md priority (e.g. the Nightly whole-suite regression batch
+implementation item, currently the next unchecked entry after the WAL
+section).
 
 In-flight: none.

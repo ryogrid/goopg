@@ -7830,10 +7830,8 @@ func writeHeapRowReturning(ctx *Context, rel storage.RelFileNode, cols []catalog
 		return ptr, err
 	}
 
-	// Always emit the native RecordKindHeapInsert WAL record so the logical
+	// Emits the native RecordKindHeapInsert WAL record so the logical
 	// decoder sees the change.
-	// PG physical standbys skip the native record; goopg's classifier skips
-	// the canonical one. Both coexist safely in the WAL stream.
 	logHeap := ctx.Pool.LogHeapInsert()
 	tryAppendToBlock := func(blk storage.BlockNumber) (bool, error) {
 		slot, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
@@ -8272,12 +8270,8 @@ func markHeapDeleteDirtyAndClearVM(
 	lineSlot uint16, xmax storage.TransactionID,
 	oldTuple []byte,
 ) error {
-	// Always emit the native RecordKindHeapDelete WAL record so the logical
+	// Emits the native RecordKindHeapDelete WAL record so the logical
 	// decoder (classifier.go) sees the change for pgoutput/logical replication.
-	// PG physical
-	// standbys safely skip the native record (classifyXLogRecord routes it via
-	// RmgrXLog/0xF0) and apply the canonical FPI; goopg's classifier skips the
-	// canonical record and processes the native one.
 	if err := markHeapDeleteDirty(ctx.Pool, slot, rel, blk, lineSlot, xmax, oldTuple); err != nil {
 		return err
 	}
@@ -8286,4 +8280,3 @@ func markHeapDeleteDirtyAndClearVM(
 	}
 	return nil
 }
-

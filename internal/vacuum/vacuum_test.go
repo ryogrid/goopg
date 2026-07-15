@@ -271,7 +271,9 @@ func TestVacuumWithOptionsEmitsCanonicalPruneRecord(t *testing.T) {
 // TestVacuumWithOptionsNilLogCanonicalIsNoop verifies the default
 // (LogCanonical unset) VacuumOptions zero value keeps VacuumWithOptions's
 // pre-M0119-0005 behaviour unchanged — no panic, no extra WAL.
-func TestVacuumWithOptionsNilLogCanonicalIsNoop(t *testing.T) {
+// TestVacuumWithOptionsDefaultReclaims verifies the default VacuumOptions
+// zero value reclaims dead tuples as expected.
+func TestVacuumWithOptionsDefaultReclaims(t *testing.T) {
 	pool, _, rel, cleanup := newRel(t)
 	defer cleanup()
 

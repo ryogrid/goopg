@@ -21,8 +21,7 @@ package executor
 //   - collectAllLeafTuples: descend leftmost then follow btpo_next across
 //     every leaf, returning data tuples (high keys are skipped).
 //   - rebuildSysBtreeWithNewEntry: union existing tuples with the new tuple,
-//     run a fresh bulk-build layout, overwrite pages 0..N-1 in place, and
-//     emit one canonical FPI WAL record per touched page.
+//     run a fresh bulk-build layout, and overwrite pages 0..N-1 in place.
 //   - buildBulkSysBtreeLayout: in-package mirror of
 //     `internal/initdb/btree_index_bootstrap.go::pgBuildBtreeBulkLoadSized`,
 //     duplicated because executor → initdb would form an import cycle.
@@ -294,9 +293,7 @@ func buildBulkSysBtreeLayout(sortedTuples [][]byte, tupleSize int, nkeyatts uint
 // rebuildSysBtreeWithNewEntry is the fallback when an in-place leaf insert
 // returns ErrNoSpaceInPage on a multi-level tree. It re-collects every data
 // tuple in the index, merges the new tuple in sorted order, runs the bulk-
-// build layout, overwrites pages 0..N-1 in place via the buffer pool, and
-// emits one canonical XLOG_BTREE_INSERT_LEAF WAL record per touched page so
-// a PG18 standby can apply each page from FPI.
+// build layout, and overwrites pages 0..N-1 in place via the buffer pool.
 //
 // If the new layout has fewer pages than the existing on-disk relation, the
 // trailing pages remain on disk but are unreachable from the (rewritten)
@@ -356,7 +353,6 @@ func rebuildSysBtreeWithNewEntry(ctx *Context, indexOID uint32, rel storage.RelF
 		src := imageBytes[blk*storage.BlockSize : (blk+1)*storage.BlockSize]
 		copy(slot.Page(), src)
 		ctx.Pool.MarkDirty(slot)
-
 		slot.Unlock()
 		ctx.Pool.Unpin(slot)
 	}
@@ -364,9 +360,9 @@ func rebuildSysBtreeWithNewEntry(ctx *Context, indexOID uint32, rel storage.RelF
 }
 
 // insertIntoExistingLeaf inserts indexTuple into the leaf page at leafBlk,
-// preserving the leaf's existing high-key (slot 1 on non-rightmost leaves)
-// and emitting a canonical FPI WAL record. Returns ErrNoSpaceInPage on
-// overflow so the caller can fall back to a full rebuild.
+// preserving the leaf's existing high-key (slot 1 on non-rightmost leaves).
+// Returns ErrNoSpaceInPage on overflow so the caller can fall back to a full
+// rebuild.
 func insertIntoExistingLeaf(ctx *Context, indexOID uint32, rel storage.RelFileNode, leafBlk storage.BlockNumber, indexTuple []byte, cmp keyCompareFn) error {
 	slot, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: leafBlk})
 	if err != nil {
@@ -409,7 +405,6 @@ func insertIntoExistingLeaf(ctx *Context, indexOID uint32, rel storage.RelFileNo
 		return err
 	}
 	ctx.Pool.MarkDirty(slot)
-
 	slot.Unlock()
 	ctx.Pool.Unpin(slot)
 	_ = indexOID // retained for log/error context if needed in the future.

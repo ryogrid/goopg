@@ -16,13 +16,7 @@ package executor
 // into two leaves (block 1 = left half, freshly-extended block = right half)
 // and promote a new internal root (another freshly-extended block) above
 // them. Update the metapage at block 0 to point at the new root with
-// `btm_level=1`. Emit four PG-canonical FPI WAL records — one per modified
-// block — so a PG18 standby restores all four pages from FPI on replay.
-//
-// The split uses FPI (full-page image) for every modified block, so PG's
-// btree_xlog_insert returns BLK_RESTORED on each redo call and the per-tuple
-// logic never runs. This sidesteps having to emit a proper XLOG_BTREE_SPLIT_L
-// record with the correct per-tuple metadata.
+// `btm_level=1`.
 //
 // The page-build helpers below duplicate `internal/initdb/btree_index_bootstrap.go`
 // — duplicated because `executor` cannot import `initdb` (cycle).
@@ -279,8 +273,6 @@ func mergeSortedSlice(existing [][]byte, newTuple []byte, cmp keyCompareFn) ([][
 //   - Block 1 is rewritten as a leaf-only page (left half of split).
 //   - Two new blocks are appended to the relfile: right leaf + new internal root.
 //   - Block 0 (metapage) is rewritten to point at the new root, level=1.
-//   - Four canonical XLOG_BTREE_INSERT_LEAF FPI WAL records are emitted (one
-//     per modified block) so PG18 standby restores all pages from FPI.
 //
 // On return, leafSlot is still locked and pinned. The caller is responsible
 // for unlocking/unpinning it.

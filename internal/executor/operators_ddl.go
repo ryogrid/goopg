@@ -10388,8 +10388,8 @@ func (o *ddlOp) backfillBTree(tree *btree.BTree, tbl *catalog.Table, cols []*cat
 				scanRow = make(Row, len(tbl.Columns))
 			}
 			// Use the format-agnostic decoder (handles both goopg and PG
-			// physical format) so rows written via COPY with LogCanonical
-			// wired (EncodeRowPG) are correctly decoded.
+			// physical format) so rows written via COPY in PG physical
+			// format (EncodeRowPG) are correctly decoded.
 			storedNatts := int(tuple.Header.Infomask2 & 0x07FF)
 			if err := DecodeRowIntoMctxPGTuple(scanRow, tbl.Columns, tuple.Data, tuple.Bitmap, storedNatts, sctxDDL); err != nil {
 				continue

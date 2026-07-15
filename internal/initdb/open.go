@@ -949,16 +949,6 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		if err != nil {
 			return err
 		}
-		// M0106-0010 batched-46: also emit a PG-canonical XLOG_XACT_COMMIT /
-		// XLOG_XACT_ABORT record so a PG18 standby's `xact_redo_commit` (or
-		// `xact_redo_abort`) advances `latestObservedXid`, stamps pg_xact via
-		// `TransactionIdAsyncCommitTree`, and updates `KnownAssignedXids`.
-		// Without this, only basebackup-snapshot XIDs are visible on the standby
-		// and any commit after basebackup is invisible until the next basebackup
-		// cycle. Gated on PageHeaders mode — legacy (test) clusters skip the
-		// canonical record because their walWriter is not in PG-wire format.
-		// The flush waits for the canonical end LSN below so both records land
-		// before the client acknowledges commit (synchronous_commit = on).
 		// Synchronous commit (M0042-0003): flush the commit WAL record to
 		// disk before returning to the client so the transaction is durable
 		// across a server crash. Mirrors upstream's synchronous_commit = on
@@ -2139,7 +2129,6 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, fmt.Errorf("goopg: standby signal: %w", err)
 	}
 
-	// M0106-0010 batched-32: build the canonical WAL callback only when the
 	rt := &Runtime{
 		StorageMgr:     mgr,
 		Pool:           pool,

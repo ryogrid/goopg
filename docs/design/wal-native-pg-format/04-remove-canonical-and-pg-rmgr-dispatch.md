@@ -2,7 +2,7 @@
 
 | Field  | Value                                                        |
 | ------ | ------------------------------------------------------------ |
-| Status | draft — **agent-reviewed** vs code/PG-source 2026-07-15 (2 blockers + 1 major + 5 minor found and folded in: header-decode guard for custom rmid, native-`replayX` routing, `ClogTruncate`→`RM_CLOG`) |
+| Status | **§2-§6 landed 2026-07-15** — classify+recovery dispatch rework (§3/§4/§5.4) and the canonical/knob/skip-tag removal (§5.1-§5.3, §6) are complete; only the record body/content rewrite (§1 non-goals, docs 01/03) remains |
 | Date   | 2026-07-15                                                   |
 | Branch | `wal-system-pgnize`                                           |
 | Oracle | PostgreSQL 18.3 — tree under [`postgres/`](../../../postgres/) |
@@ -216,6 +216,20 @@ case RmgrXLog:
   `0xF0`. PG-frame decode is retained regardless.
 
 ## 5. Removal inventory (canonical + knob)
+
+> **Landed 2026-07-15 (§5.1-§5.3 + §6, one commit):** every item below landed
+> as specified — files deleted, call sites unwired (with `writeHeapRowCanonical`
+> kept as a thin `writeHeapRowReturningPG` delegate so its ~20 catalog-heap-sync
+> callers needed no change), knob removed, and the §6 test/CI impact applied
+> (4 tests converted to unconditional `t.Skip`, `TestKillKillRecoveryNativeOnly`
+> removed as now-redundant, the nightly canonical-on lane removed from
+> `ci/batch/stages/stage-testport.sh`). One deviation from §6's prediction:
+> `TestPort_WALPgWaldumpCompat` (W-001) and `TestPGWaldumpParsesEmittedWAL`
+> were expected to become structurally-failing but **both still pass** —
+> neither validates per-rmgr body content deeply enough to catch the
+> native-body-under-real-rmid mismatch — so the CSV `port→defer` flip was
+> deliberately not applied (see `.ralph/deferral_ledger.md` 2026-07-15 row).
+> Details below are the original removal spec, kept as historical record.
 
 ### 5.1 Fully-removed files
 - `internal/catalog/canonical.go` (all `PgCanonical*`/`BuildCanonical*`,

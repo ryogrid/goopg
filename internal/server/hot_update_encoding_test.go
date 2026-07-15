@@ -13,11 +13,11 @@ import (
 // _ keeps fmt import if unused
 var _ = fmt.Sprintf
 
-// TestHOTUpdateEncodingConsistency verifies that rows remain correctly readable
-// after HOT updates in PG-canonical WAL mode (M0107 HOT-update encoding parity
-// fix).  Before the fix, tryApplyHOTUpdate always used EncodeRow (goopg format)
-// while writeHeapRowReturning used EncodeRowPG (PG format) when LogCanonical !=
-// nil.  The mixed encoding caused decodeGoopgRowIntoMctx to occasionally
+// TestHOTUpdateEncodingConsistency verifies that rows remain correctly
+// readable after HOT updates (M0107 HOT-update encoding parity fix). Before
+// the fix, tryApplyHOTUpdate always used EncodeRow (goopg format) while
+// writeHeapRowReturning used EncodeRowPG (PG format) for PG physical-format
+// rows. The mixed encoding caused decodeGoopgRowIntoMctx to occasionally
 // "succeed" on PG-encoded rows with wrong values (silent data corruption),
 // surfacing as wrong abalance values or "truncated 4-byte varlena header" errors
 // during pgbench runs at c=100 SU.
