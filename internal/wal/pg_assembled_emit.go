@@ -174,3 +174,56 @@ func EncodeHeapDeletePG(rel storage.RelFileNode, blk storage.BlockNumber, lineSl
 	}
 	return framePGAssembled(RmgrHeap, xlogHeapDelete, uint32(xmax), body), nil
 }
+
+// heapHeaderPlusData splits a marshaled HeapTuple into the block-0 payload PG
+// carries for insert/update: xl_heap_header (t_infomask2, t_infomask, t_hoff)
+// followed by the tuple bytes past the fixed 23-byte header (null bitmap +
+// padding + column data), verbatim.
+func heapHeaderPlusData(tuple []byte) []byte {
+	out := make([]byte, 0, sizeOfXLogHeapHeaderData+len(tuple)-storage.SizeOfHeapTupleHeaderData)
+	out = append(out, tuple[18:22]...) // t_infomask2 (2) + t_infomask (2)
+	out = append(out, tuple[22])       // t_hoff
+	out = append(out, tuple[storage.SizeOfHeapTupleHeaderData:]...)
+	return out
+}
+
+// sizeOfXLogHeapUpdateData is PG's SizeOfHeapUpdate: old_xmax(4) + old_offnum(2)
+// + old_infobits_set(1) + flags(1) + new_xmax(4) + new_offnum(2).
+const sizeOfXLogHeapUpdateData = 14
+
+// xlhUpdateContainsNewTuple is PG's XLH_UPDATE_CONTAINS_NEW_TUPLE (heapam_xlog.h):
+// block 0 carries the new tuple's data.
+const xlhUpdateContainsNewTuple uint8 = 0x10
+
+// EncodeHeapHotUpdatePG builds a PostgreSQL xl_heap_update record for one HOT
+// (same-page) update, framed for the assembled-record Append path. Main data is
+// xl_heap_update{old_xmax, old_offnum, old_infobits_set=0, flags=CONTAINS_NEW_TUPLE,
+// new_xmax=0, new_offnum}; block 0 references the (shared) page and carries the
+// new tuple as xl_heap_header + tuple bytes past the fixed header. The new tuple
+// already carries HEAP_ONLY_TUPLE in its infomask. Prefix/suffix compression is
+// skipped (PREFIX/SUFFIX_FROM_OLD unset). opcode = XLOG_HEAP_HOT_UPDATE (0x40);
+// xl_xid = xmax (the updating xact).
+//
+// A HOT update touches only one page, so there is no block 1. Replay places the
+// new tuple at new_offnum on block 0 and stamps the old tuple (old_offnum) with
+// old_xmax + t_ctid->new + HEAP_HOT_UPDATED (replayDecodedXLogHeapUpdate).
+func EncodeHeapHotUpdatePG(rel storage.RelFileNode, blk storage.BlockNumber, oldSlot, newSlot uint16, xmax storage.TransactionID, newTuple []byte) ([]byte, error) {
+	if len(newTuple) < storage.SizeOfHeapTupleHeaderData {
+		return nil, fmt.Errorf("wal: heap-hot-update new tuple %d bytes < fixed header %d", len(newTuple), storage.SizeOfHeapTupleHeaderData)
+	}
+	mainData := make([]byte, sizeOfXLogHeapUpdateData)
+	binary.LittleEndian.PutUint32(mainData[0:4], uint32(xmax)) // old_xmax
+	binary.LittleEndian.PutUint16(mainData[4:6], oldSlot)      // old_offnum
+	mainData[6] = 0                                            // old_infobits_set
+	mainData[7] = xlhUpdateContainsNewTuple                    // flags
+	// new_xmax [8:12] stays 0 (the new tuple is not deleted).
+	binary.LittleEndian.PutUint16(mainData[12:14], newSlot) // new_offnum
+
+	body, err := assembleXLogRecord(mainData, []BlockRef{{
+		ID: 0, Rel: rel, Block: blk, Data: heapHeaderPlusData(newTuple),
+	}})
+	if err != nil {
+		return nil, err
+	}
+	return framePGAssembled(RmgrHeap, xlogHeapHotUpdate, uint32(xmax), body), nil
+}
