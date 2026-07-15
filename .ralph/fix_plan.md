@@ -4256,6 +4256,55 @@ survey the deferral ledger for a fresh open (`status = -`) row.
       TYPE ... AS RANGE`) is **not** dbOid-scoped at all (no `DBOid` field,
       no dbOid-taking methods) — recorded as the next real candidate in the
       deferral ledger rather than assumed already done.
+- [x] **M0122-0007 4e follow-up — `catalog.RangeType` (`CREATE TYPE ... AS
+      RANGE`) cross-database isolation (resume point (4) from the composite
+      item above; closes the last unaudited object kind in this series).**
+      `RangeType` had no dbOid scoping at all — no `DBOid` field, and
+      `RegisterRangeType`/`RenameRangeType`/`SetRangeTypeOwner`/
+      `DropRangeType`/`LookupRangeType` took no dbOid parameter whatsoever,
+      unlike `domains`/`userCollations`/`enumTypes`/`compositeTypes`, which
+      at least had a bare-name-keyed map before their fixes. Applied the
+      identical `compositeKey`/`compositeTypes` pattern: `RangeType` gained a
+      `DBOid uint32` field; new `rangeKey(dbOid, name)` (mirrors
+      `compositeKey`/`enumKey`/`domainKey`) folds dbOid into `c.rangeTypes`'s
+      registry key. `RegisterRangeType`/`RenameRangeType`/
+      `SetRangeTypeOwner`/`DropRangeType` each gained a trailing variadic
+      `dbOid ...uint32`; `LookupRangeType` (also on the `catalog.Catalog`
+      interface) gained the variadic `dbOid`, falling back to a global
+      by-name scan (`lookupRangeTypeByNameLocked`, mirrors
+      `lookupCompositeTypeByNameLocked`) when omitted. Every range-type
+      write-path call site in `internal/executor/operators_ddl.go`
+      (`execCreateType`'s `AS RANGE` branch, `execAlterType`'s RENAME TO/
+      OWNER TO range-dispatch guards, `execDropType`'s range branch) threads
+      `o.ctx.CurrentDatabaseOid`. Grepped `internal/executor/operators_tx.go`
+      and `internal/server/dispatch.go` up front for a range-type
+      ROLLBACK-undo sibling before running any tests (this series' own
+      lesson) and confirmed there is none — `CREATE TYPE ... AS RANGE` has no
+      rollback-undo tracking at all today, a pre-existing gap orthogonal to
+      this fix. `RegisterRangeTypeDuringRecovery` now explicitly stamps
+      `DBOid = DefaultDBOid` and keys via `rangeKey(DefaultDBOid, rt.Name)`,
+      matching `RegisterDomainDuringRecovery`'s identical pattern (WAL replay
+      still carries no dbOid for range-type records, so every replayed range
+      type lands under `DefaultDBOid` — recorded as the still-open resume
+      point (1), same as domains/enums/composites).
+      `RenameRangeTypeDuringRecovery`/`SetRangeTypeOwnerDuringRecovery`/
+      `DropRangeTypeDuringRecovery` needed no change (they delegate to the
+      now-variadic live functions with no dbOid argument, defaulting to
+      `DefaultDBOid`). New `TestCreateRangeTypeCrossDatabaseIsolation`
+      (`internal/catalog/create_range_type_test.go`), mirroring
+      `TestCreateCompositeTypeCrossDatabaseIsolation`. Design doc
+      `docs/design/0097-0017-0001-enum-domain-types.md`'s new "Follow-up
+      (2026-07-15, fourth loop)" section + README index row updated. Gates:
+      `go build ./...`/`go vet ./...` clean (repo-wide); `go test -count=1
+      ./internal/catalog/... ./internal/executor/... ./internal/server/...
+      ./internal/planner/... ./internal/initdb/... ./internal/wal/...` PASS;
+      `go test -short` full repo (excl. testport, per policy) PASS, 0 FAIL
+      (51 packages, `internal/initdb`=240s the long pole);
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh` PASS
+      (0 failed, all 3 workloads). This closes the M0122-0007 4e type-
+      isolation audit's sibling-map sweep: domains, userCollations,
+      enumTypes, compositeTypes, and rangeTypes are all now dbOid-isolated.
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 

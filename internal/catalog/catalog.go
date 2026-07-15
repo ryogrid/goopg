@@ -2052,7 +2052,7 @@ type Catalog interface {
 	// Exposed on the interface so the catalog-row builders can resolve a range
 	// (or multirange) column's declared type name to its pg_type OID, mirroring
 	// LookupEnum/LookupCompositeType. DU-002 slice 429 follow-up.
-	LookupRangeType(name string) (*RangeType, bool)
+	LookupRangeType(name string, dbOid ...uint32) (*RangeType, bool)
 	// LookupRangeTypeByMultirangeName finds a user-defined range type by its
 	// auto-generated multirange type's name (case-insensitive) — a column can be
 	// declared directly with the multirange name (e.g. `mymultirange`), not only
@@ -3048,6 +3048,13 @@ type RangeType struct {
 	// OwnerOrDefault. M0122-0005 (range-type follow-up to the enum/composite
 	// ALTER TYPE OWNER TO/RENAME TO work).
 	Owner uint32
+	// DBOid is the database this range type belongs to, so two distinct
+	// databases may each register a same-named range type without colliding.
+	// 0 (never set) only for range types replayed from a pre-4e WAL record
+	// with no dbOid trailer; see RegisterRangeTypeDuringRecovery. Mirrors
+	// EnumType.DBOid / CompositeType.DBOid / Domain.DBOid. M0122-0007 4e
+	// follow-up.
+	DBOid uint32
 }
 
 // OwnerOrDefault returns rt.Owner, falling back to the bootstrap superuser OID
@@ -3470,6 +3477,14 @@ func enumKey(dbOid uint32, name string) string {
 // name so two distinct databases may each register a same-named composite
 // type without colliding. Mirrors domainKey/enumKey. M0122-0007 4e follow-up.
 func compositeKey(dbOid uint32, name string) string {
+	return strconv.FormatUint(uint64(dbOid), 10) + "\x00" + strings.ToLower(name)
+}
+
+// rangeKey builds the c.rangeTypes registry key, folding dbOid into the
+// case-insensitive name so two distinct databases may each register a
+// same-named range type without colliding. Mirrors domainKey/enumKey/
+// compositeKey. M0122-0007 4e follow-up.
+func rangeKey(dbOid uint32, name string) string {
 	return strconv.FormatUint(uint64(dbOid), 10) + "\x00" + strings.ToLower(name)
 }
 
@@ -19959,9 +19974,11 @@ func (c *InMemory) SetCompositeTypeOwner(name string, ownerOID uint32, dbOid ...
 // auto-generated multirange name is left untouched (it is a distinct pg_type
 // row with its own name, unaffected by renaming the range type itself, mirroring
 // real PostgreSQL). M0122-0005 (range-type follow-up).
-func (c *InMemory) RenameRangeType(oldName, newName string) error {
-	ok := strings.ToLower(oldName)
-	nk := strings.ToLower(newName)
+func (c *InMemory) RenameRangeType(oldName, newName string, dbOid ...uint32) error {
+	oid := resolveDBOid(dbOid)
+	ok := rangeKey(oid, oldName)
+	nk := rangeKey(oid, newName)
+	lowerNewName := strings.ToLower(newName)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	rt, found := c.rangeTypes[ok]
@@ -19972,7 +19989,7 @@ func (c *InMemory) RenameRangeType(oldName, newName string) error {
 		return fmt.Errorf("type %q already exists", newName)
 	}
 	delete(c.rangeTypes, ok)
-	rt.Name = nk
+	rt.Name = lowerNewName
 	c.rangeTypes[nk] = rt
 	return nil
 }
@@ -19980,8 +19997,8 @@ func (c *InMemory) RenameRangeType(oldName, newName string) error {
 // SetRangeTypeOwner records the typowner role OID for an existing range type.
 // Returns false if no such range type is registered. Mirrors
 // SetCompositeTypeOwner/SetEnumOwner. M0122-0005 (range-type follow-up).
-func (c *InMemory) SetRangeTypeOwner(name string, ownerOID uint32) bool {
-	k := strings.ToLower(name)
+func (c *InMemory) SetRangeTypeOwner(name string, ownerOID uint32, dbOid ...uint32) bool {
+	k := rangeKey(resolveDBOid(dbOid), name)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	rt, ok := c.rangeTypes[k]
@@ -20736,7 +20753,7 @@ func (c *InMemory) resolveRangeCollation(subtypeOID uint32, collationName string
 // `collation` option values; empty means "use PG's default resolution".
 // Returns a *RangeTypeOptionError (carrying PG's own SQLSTATE) if any option
 // fails to resolve. M0110-0001.
-func (c *InMemory) RegisterRangeType(name, subtypeName, explicitMultirangeName, opclassName, collationName string) (*RangeType, error) {
+func (c *InMemory) RegisterRangeType(name, subtypeName, explicitMultirangeName, opclassName, collationName string, dbOid ...uint32) (*RangeType, error) {
 	subtypeOID := TypeNameToOID(subtypeName)
 	opclassOID, rerr := c.resolveRangeOpclass(subtypeName, subtypeOID, opclassName)
 	if rerr != nil {
@@ -20746,6 +20763,7 @@ func (c *InMemory) RegisterRangeType(name, subtypeName, explicitMultirangeName, 
 	if rerr != nil {
 		return nil, rerr
 	}
+	oid := resolveDBOid(dbOid)
 	k := strings.ToLower(name)
 	mrName := strings.ToLower(explicitMultirangeName)
 	if mrName == "" {
@@ -20753,7 +20771,7 @@ func (c *InMemory) RegisterRangeType(name, subtypeName, explicitMultirangeName, 
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	rt, exists := c.rangeTypes[k]
+	rt, exists := c.rangeTypes[rangeKey(oid, k)]
 	if !exists {
 		rt = &RangeType{
 			Name:               k,
@@ -20761,9 +20779,10 @@ func (c *InMemory) RegisterRangeType(name, subtypeName, explicitMultirangeName, 
 			ArrayOID:           c.nextOID + 1,
 			MultirangeOID:      c.nextOID + 2,
 			MultirangeArrayOID: c.nextOID + 3,
+			DBOid:              oid,
 		}
 		c.nextOID += 4
-		c.rangeTypes[k] = rt
+		c.rangeTypes[rangeKey(oid, k)] = rt
 	}
 	rt.SubtypeName = subtypeName
 	rt.OpclassOID = opclassOID
@@ -20772,13 +20791,38 @@ func (c *InMemory) RegisterRangeType(name, subtypeName, explicitMultirangeName, 
 	return rt, nil
 }
 
-// LookupRangeType finds a user-defined range type by name (case-insensitive).
-// M0110-0001.
-func (c *InMemory) LookupRangeType(name string) (*RangeType, bool) {
+// LookupRangeType finds a user-defined range type by name (case-insensitive),
+// scoped to dbOid when supplied. M0110-0001.
+func (c *InMemory) LookupRangeType(name string, dbOid ...uint32) (*RangeType, bool) {
+	k := strings.ToLower(name)
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	rt, ok := c.rangeTypes[strings.ToLower(name)]
-	return rt, ok
+	if len(dbOid) > 0 {
+		rt, ok := c.rangeTypes[rangeKey(dbOid[0], k)]
+		return rt, ok
+	}
+	// No dbOid supplied: preserve the legacy global-name lookup for read call
+	// sites not yet threaded through a connection's dbOid, falling back to a
+	// scan since the registry key now folds dbOid in. Mirrors LookupEnum's/
+	// LookupDomain's identical fallback. M0122-0007 4e follow-up.
+	if rt := c.lookupRangeTypeByNameLocked(k); rt != nil {
+		return rt, true
+	}
+	return nil, false
+}
+
+// lookupRangeTypeByNameLocked scans c.rangeTypes for the first entry whose
+// Name matches lowerName (already lowercased), ignoring dbOid. Used by read
+// paths that have no dbOid context available (see LookupRangeType's doc
+// comment). Caller holds c.mu (read or write). Mirrors
+// lookupEnumByNameLocked/lookupDomainByNameLocked. M0122-0007 4e follow-up.
+func (c *InMemory) lookupRangeTypeByNameLocked(lowerName string) *RangeType {
+	for _, rt := range c.rangeTypes {
+		if rt.Name == lowerName {
+			return rt
+		}
+	}
+	return nil
 }
 
 // LookupRangeTypeByMultirangeName finds a user-defined range type by its
@@ -20871,8 +20915,8 @@ func (c *InMemory) ListRangeTypes() []*RangeType {
 
 // DropRangeType removes a range type. Returns an error if not found.
 // M0110-0001.
-func (c *InMemory) DropRangeType(name string) error {
-	k := strings.ToLower(name)
+func (c *InMemory) DropRangeType(name string, dbOid ...uint32) error {
+	k := rangeKey(resolveDBOid(dbOid), name)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if _, ok := c.rangeTypes[k]; !ok {
@@ -20899,7 +20943,12 @@ func (c *InMemory) RegisterRangeTypeDuringRecovery(rt *RangeType) {
 		c.rangeTypes = make(map[string]*RangeType)
 	}
 	out := *rt
-	c.rangeTypes[rt.Name] = &out
+	// WAL replay does not yet carry a dbOid for range-type records (see the
+	// DBOid field's doc comment) — every replayed range type lands under
+	// DefaultDBOid, matching every other not-yet-migrated write path's
+	// restart behavior (domains/collations/enums/composites).
+	out.DBOid = DefaultDBOid
+	c.rangeTypes[rangeKey(DefaultDBOid, rt.Name)] = &out
 	c.advanceNextOIDLocked(rt.OID)
 	c.advanceNextOIDLocked(rt.ArrayOID)
 	c.advanceNextOIDLocked(rt.MultirangeOID)

@@ -18574,7 +18574,7 @@ func (o *ddlOp) execCreateType(s *parser.CreateTypeStmt) error {
 		// round-trips through pg_dump instead of vanishing as a bare name-only
 		// stub. DU-002 (M0110-0001).
 		if s.IsRange {
-			rt, err := cat.RegisterRangeType(s.Name, s.RangeSubtype, s.RangeMultirangeName, s.RangeOpclassName, s.RangeCollationName)
+			rt, err := cat.RegisterRangeType(s.Name, s.RangeSubtype, s.RangeMultirangeName, s.RangeOpclassName, s.RangeCollationName, o.ctx.CurrentDatabaseOid)
 			if err != nil {
 				// RegisterRangeType reports option-resolution failures (missing
 				// default/named opclass, datatype mismatch, unsupported/missing
@@ -18873,8 +18873,8 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 			}
 			return nil
 		}
-		if _, ok := cat.LookupRangeType(s.Name); ok {
-			if err := cat.RenameRangeType(s.Name, s.RenameTo); err != nil {
+		if _, ok := cat.LookupRangeType(s.Name, o.ctx.CurrentDatabaseOid); ok {
+			if err := cat.RenameRangeType(s.Name, s.RenameTo, o.ctx.CurrentDatabaseOid); err != nil {
 				return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 			}
 			// M0122-0005 restart-persistence follow-up (deferral ledger
@@ -18923,8 +18923,8 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 			cat.SetCompositeTypeOwner(s.Name, ownerOID, o.ctx.CurrentDatabaseOid)
 			return nil
 		}
-		if _, ok := cat.LookupRangeType(s.Name); ok {
-			cat.SetRangeTypeOwner(s.Name, ownerOID)
+		if _, ok := cat.LookupRangeType(s.Name, o.ctx.CurrentDatabaseOid); ok {
+			cat.SetRangeTypeOwner(s.Name, ownerOID, o.ctx.CurrentDatabaseOid)
 			// M0122-0005 restart-persistence follow-up (deferral ledger
 			// 2026-07-06 row, resume point (1)): mirrors
 			// execAlterCollation's OWNER TO WAL logging so a range-type
@@ -19123,7 +19123,7 @@ func (o *ddlOp) execDropType(s *parser.DropTypeStmt) error {
 		// Stamp the range type's pg_type rows (the range + its auto-generated
 		// multirange) before the in-memory delete, mirroring the enum/composite
 		// branches above. DU-002 (M0110-0001).
-		if rt, ok := cat.LookupRangeType(n); ok && catalogHeapSyncAvailable(o.ctx) {
+		if rt, ok := cat.LookupRangeType(n, o.ctx.CurrentDatabaseOid); ok && catalogHeapSyncAvailable(o.ctx) {
 			if o.ctx.MaterializeWriterXID() == nil {
 				deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, rt.OID, o.ctx.Tx.XID)
 				deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, rt.ArrayOID, o.ctx.Tx.XID)
@@ -19132,7 +19132,7 @@ func (o *ddlOp) execDropType(s *parser.DropTypeStmt) error {
 				_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.TypeRelationId)
 			}
 		}
-		rangeErr := cat.DropRangeType(n)
+		rangeErr := cat.DropRangeType(n, o.ctx.CurrentDatabaseOid)
 		if rangeErr == nil {
 			// DU-002 restart-persistence follow-up (M0110-0001, DU-002
 			// slice 429 ledger resume point, sub-item (c)): mirrors DROP

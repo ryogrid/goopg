@@ -296,6 +296,75 @@ New `TestCreateCompositeTypeCrossDatabaseIsolation`
 (`internal/catalog/create_composite_type_test.go`), mirroring
 `TestCreateEnumCrossDatabaseIsolation`/`TestCreateDomainCrossDatabaseIsolation`.
 
+## Follow-up (2026-07-15, fourth loop): range types gain per-database isolation
+
+Resume point (4) from the composite-type follow-up above: auditing that loop
+found `catalog.InMemory.rangeTypes` (backing `CREATE TYPE ... AS RANGE
+(subtype = ...)`) had **no** dbOid scoping at all — no `DBOid` field on
+`RangeType`, and `RegisterRangeType`/`RenameRangeType`/`SetRangeTypeOwner`/
+`DropRangeType`/`LookupRangeType` took no dbOid parameter whatsoever, unlike
+`domains`/`userCollations`/`enumTypes`/`compositeTypes`, which at least had a
+bare-name-keyed map before their respective fixes. Range types were exposed
+to the identical bare-name cross-database collision this whole M0122-0007 4e
+series has been closing.
+
+Fix mirrors the `compositeTypes`/`compositeKey` pattern exactly: `RangeType`
+gained a `DBOid uint32` field; a new `rangeKey(dbOid, name) string` helper
+(`internal/catalog/catalog.go`, next to `domainKey`/`enumKey`/`compositeKey`)
+folds dbOid into the `c.rangeTypes` registry key.
+`RegisterRangeType`/`RenameRangeType`/`SetRangeTypeOwner`/`DropRangeType`
+each gained a trailing variadic `dbOid ...uint32` (omitting it resolves to
+`DefaultDBOid` via `resolveDBOid`, so every pre-existing call site — including
+the whole `internal/catalog/range_type_opclass_test.go` suite and
+`internal/executor/user_type_oid_name_test.go`/`pg18_user_catalog_rows_test.go`
+— stays behavior-preserving). `LookupRangeType` (on the `Catalog` interface
+too) also gained the variadic `dbOid`; when omitted it falls back to a global
+by-name scan (`lookupRangeTypeByNameLocked`, mirrors
+`lookupCompositeTypeByNameLocked`/`lookupEnumByNameLocked`) for the 3
+remaining read-only call sites not yet threaded through a connection's dbOid
+(`internal/executor/expr.go`, `pg18_user_catalog_rows.go` ×2) — same bounded
+scope as the composite follow-up's identical deferral. The 5 `LookupRangeTypeBy*`
+helpers (`ByMultirangeName`/`ByOID`/`ByMultirangeOID`/`ByArrayOID`/
+`ByMultirangeArrayOID`) scan `c.rangeTypes`'s *values*, not its key, so they
+needed no change — they already return whichever database's row matches the
+OID/name being searched, an existing (not newly introduced) cross-database
+surface tracked by resume point (3) below, matching `ListRangeTypes`'s
+identical pre-existing shape.
+
+All range-type write-path call sites in `internal/executor/operators_ddl.go`
+thread `o.ctx.CurrentDatabaseOid`: `execCreateType`'s `AS RANGE (...)` branch
+(`RegisterRangeType`), `execAlterType`'s `RENAME TO`/`OWNER TO` range-dispatch
+guards (both the `LookupRangeType` guard and the `RenameRangeType`/
+`SetRangeTypeOwner` call), and `execDropType`'s range branch (both the
+`LookupRangeType` heap-stamp guard and the `DropRangeType` call itself).
+Grepped `internal/executor/operators_tx.go` and `internal/server/dispatch.go`
+up front for a range-type ROLLBACK-undo sibling before running any tests
+(this series' own lesson from the enum/composite follow-ups) and confirmed
+there is none — `CREATE TYPE ... AS RANGE` has no rollback-undo tracking at
+all today (a pre-existing gap unrelated to this fix, orthogonal to
+per-database isolation).
+
+`RegisterRangeTypeDuringRecovery` now explicitly stamps `DBOid =
+DefaultDBOid` and keys the recovered entry via `rangeKey(DefaultDBOid,
+rt.Name)`, matching `RegisterDomainDuringRecovery`'s identical pattern — WAL
+replay does not yet carry a dbOid for range-type records, so every replayed
+range type lands under `DefaultDBOid` (resume point (1) below).
+`RenameRangeTypeDuringRecovery`/`SetRangeTypeOwnerDuringRecovery`/
+`DropRangeTypeDuringRecovery` needed no change: they delegate to the now-
+variadic live functions with no dbOid argument, which already resolves to
+`DefaultDBOid` via `resolveDBOid`'s empty-variadic fallback.
+
+New `TestCreateRangeTypeCrossDatabaseIsolation`
+(`internal/catalog/create_range_type_test.go`), mirroring
+`TestCreateCompositeTypeCrossDatabaseIsolation`/`TestCreateEnumCrossDatabaseIsolation`/
+`TestCreateDomainCrossDatabaseIsolation`. This closes the last open resume
+point from the composite-type follow-up — domains, userCollations,
+enumTypes, compositeTypes, and rangeTypes are now all isolated by dbOid.
+Remaining open items (WAL restart-persistence for all five object kinds; the
+read-only `Lookup*` call-site fan-out; `pg_enum`/`ListRangeTypes`-style
+virtual-view dbOid scoping) are recorded in the deferral ledger, matching
+every prior row in this series.
+
 Still deferred (ledgered, same shape as the enum/domain gaps): WAL
 restart-persistence for composite types is not dbOid-aware; the
 `PGClassRowsForDBOid`/`PGConstraintRowsForDBOid` virtual builders iterate
