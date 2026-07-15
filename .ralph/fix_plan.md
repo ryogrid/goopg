@@ -4798,6 +4798,59 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       ./internal/initdb/...` PASS; `go test -run
       TestPort_PgDumpConnectionSetup ./internal/testport/` PASS (soft probe,
       confirms forward progress via `t.Logf`).
+- [x] **M0122-0007 4e follow-up — `catalog.PGDependRowsForDBOid` missing
+      opclass→opfamily `pg_depend` edge (DU-002 round-trip probe unblock,
+      resumes the previous bullet's recorded next step).** Restoring `CREATE
+      OPERATOR CLASS public.op_class_empty FOR TYPE bigint USING btree FAMILY
+      public.op_family AS STORAGE bigint` before `CREATE OPERATOR FAMILY
+      public.op_family USING btree` had run failed `operator family
+      "op_family" does not exist for access method "btree"`, because a
+      member-less (`STORAGE`-only, no `ADD OPERATOR`/`ADD FUNCTION`) operator
+      class got zero `pg_depend` rows against its owning family —
+      `PGDependRowsForDBOid`'s opclass-related rows were all keyed off
+      `c.amOpMembers`/`c.amProcMembers` (AS-list members only). Fix: added an
+      unconditional per-`UserOperatorClass` row (`classid=2616` pg_opclass,
+      `objid=<class OID>`, `refclassid=2753` pg_opfamily,
+      `refobjid=<class.FamilyOID>`, `deptype='a'`) filtered by `oc.DBOid ==
+      dbOid`, mirroring PostgreSQL's `opclasscmds.c` `DefineOpClass` (verified
+      live against `postgres/src/backend/commands/opclasscmds.c:731-735`:
+      `recordDependencyOn(&myself, &referenced, DEPENDENCY_AUTO)` against the
+      opfamily, unconditional regardless of members — deptype is `'a'`
+      (AUTO), NOT `'n'`; the working-set note that carried this resume point
+      guessed NORMAL from memory, corrected here against the live source).
+      Confirmed via a live re-run of `TestPort_PgDumpConnectionSetup`: the
+      DU-002 probe's failure point moved past the family/class ordering
+      collision entirely, to a NEW, unrelated blocker — `conversion
+      "aliasconv" already exists` (see the new bullet immediately below).
+      Gates: `go build ./...`/`go vet ./...` clean; `go test
+      ./internal/catalog/...` PASS; `go test -short $(go list ./... | grep -v
+      /internal/testport)` (full repo, short mode) 0 FAIL; `go test -run
+      TestPort_PgDumpConnectionSetup ./internal/testport/` PASS (soft probe,
+      confirms forward progress via `t.Logf`); `RALPH_PRECOMMIT_SCOPE=smoke
+      bash scripts/ralph-precommit-test.sh` PASS.
+- [ ] **M0122-0007 4e follow-up — `catalog.userConversions` cross-database
+      isolation (DU-002 round-trip probe unblock, next resume point).** The
+      DU-002 probe's blocker (see the bullet immediately above) now moves to
+      `conversion "aliasconv" already exists` when restoring into a fresh
+      second database — `UserConversion` (catalog.go ~line 3141) has no
+      `DBOid` field at all and `c.userConversions` (catalog.go ~line 2325) is
+      one flat, server-wide `[]*UserConversion` slice, so a `CREATE
+      CONVERSION public.aliasconv ...` in the restore-target database
+      collides with the source database's own same-named conversion. This is
+      the exact same collision shape the M0122-0007 4e series already fixed
+      for `AccessMethod`/`Domain`/`UserCollation`/`enumTypes`/
+      `compositeTypes`/`RangeType`/`UserOperatorFamily`/`UserOperatorClass` —
+      apply the identical pattern: add `DBOid uint32` to `UserConversion`,
+      fold a leading dbOid into conversion lookups (name+namespace is the
+      natural key, mirroring `userOpFamilyKey`), thread a trailing variadic
+      `dbOid ...uint32` through the register/lookup/drop trio, and update all
+      call sites in `internal/executor` (grep for `RegisterUserConversion`/
+      `LookupUserConversion` first) plus the WAL-recovery registration path
+      (normalize to `DefaultDBOid`, mirroring
+      `RegisterUserOperatorFamilyDuringRecovery`). Verify via
+      `TestPort_PgDumpConnectionSetup`'s DU-002 soft probe — expect the
+      blocker to advance past `aliasconv` to whatever flat-registry object
+      the dump restores next.
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002). `002_save_fullpage`
       (WD-003) + live `pg_waldump --rmgr=Heap2` round-trip DONE. **Still open:** only
       `001_basic.pl`'s server-dependent tier (per-rmgr/relation/block filtering) —

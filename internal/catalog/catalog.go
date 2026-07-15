@@ -13932,6 +13932,39 @@ func (c *InMemory) PGDependRowsForDBOid(dbOid uint32) [][]string {
 			classOrFamilyDeptype,
 		})
 	}
+
+	// CREATE OPERATOR CLASS itself (independent of AS-list members): an
+	// unconditional AUTO ('a') dependency from the opclass to its owning
+	// opfamily. PostgreSQL's DefineOpClass (opclasscmds.c) always records
+	// this edge — "/* dependency on opfamily */
+	// recordDependencyOn(&myself, &referenced, DEPENDENCY_AUTO);" —
+	// regardless of whether the class has any ADD OPERATOR/ADD FUNCTION
+	// members (verified live against postgres/src/backend/commands/
+	// opclasscmds.c:731-735; deptype is 'a', NOT 'n' — pg_dump's
+	// getDependencies query only excludes 'p'/'e', so 'a' orders the same
+	// as 'n' for restore purposes, but byte-matching upstream still
+	// matters for anyone diffing pg_depend directly). Without this row, a
+	// member-less (STORAGE-only) opclass has no pg_depend row against its
+	// family at all, so pg_dump's topological sort (driven entirely by
+	// pg_depend) can emit the CLASS before the FAMILY on restore, breaking
+	// "operator family ... does not exist for access method ..." — the
+	// DU-002 / M0122-0007 4e follow-up ordering bug found via a live
+	// pg_dump/psql round-trip of a member-less opclass.
+	for _, oc := range c.userOperatorClasses {
+		if oc.DBOid != dbOid || oc.FamilyOID == 0 {
+			continue
+		}
+		rows = append(rows, []string{
+			"2616", // 0: classid    = pg_opclass
+			strconv.FormatUint(uint64(oc.OID), 10), // 1: objid = opclass OID
+			"0",    // 2: objsubid
+			"2753", // 3: refclassid = pg_opfamily
+			strconv.FormatUint(uint64(oc.FamilyOID), 10), // 4: refobjid = owning family OID
+			"0", // 5: refobjsubid
+			"a", // 6: deptype = AUTO
+		})
+	}
+
 	return rows
 }
 

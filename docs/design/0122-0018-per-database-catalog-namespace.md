@@ -1,6 +1,6 @@
 # Per-database catalog namespace (M0122-0007 slice 4)
 
-Status: accepted (sub-slices 4a, 4b-i, 4b-ii, 4c, 4d-i, 4d-ii-part-1, and 4d-ii-part-2a landed; 4d-ii-part-2b items 1, 2, and 3 all fully landed; 4e's FK-target-resolution, sequence-ownership, and view-constraint-dependency items all landed; `CREATE DATABASE ... TEMPLATE` bounded validation landed 2026-07-10; the pg_class-under-fresh-database gap (name resolution generically, row enumeration for pg_class specifically) landed 2026-07-10, and the pg_indexes/pg_tables, pg_constraint, pg_index, pg_attrdef/pg_depend, pg_inherits, pg_policy, pg_trigger, pg_rewrite, pg_foreign_table, and pg_sequence row-content follow-ups landed the same day, plus the `oid::regclass`/`'name'::regclass` cast-direction dbOid-scoping gap (follow-up 33) — 2 sibling virtual-table builders (pg_statistic_ext, information_schema.routines/parameters/routine_*_usage) plus pg_sequences/information_schema.sequences (follow-up 34's narrowed remainder) plus the c.foreignServers registry-dbOid-key gap (follow-up 36, landed) and its same-shape c.userMappings sibling (follow-up 37, landed 2026-07-10); follow-up 37's own CURRENT_USER/SESSION_USER/CURRENT_ROLE/USER role-spec resolution discovery closed same-day (follow-up 38); restart durability for user tables created under a distinct-dbOid database — per-database pg_class/pg_attribute heap routing + startup reload into the owning namespace — landed same-day (follow-up 39); the real `CREATE DATABASE ... TEMPLATE` relation-copy mechanism itself landed 2026-07-10 for its bounded plain-table case (follow-up 40), extended the same day to also cover sequences (follow-up 41), plain views (follow-up 42), and materialized views (follow-up 43, including a real `execCreateMatView`/`execRefreshMatView` dbOid-scoping bugfix found along the way) — index/typed-table TEMPLATE copying remains deferred, see "Remaining 4e work" below; the `catalog.Routines` registry (follow-up 44, 2026-07-15), the `catalog.accessMethods` registry (follow-up 45, 2026-07-15), and the `catalog.userOperatorFamilies`/`userOperatorClasses` registries (follow-up 46, 2026-07-15) all landed cross-database isolation, unblocking the DU-002 probe past the function/procedure, access-method, and operator-family/-class collision points respectively — the probe is now blocked on a pg_depend dependency-ordering gap for member-less operator classes, see the "Operator family / operator class registry" section below)
+Status: accepted (sub-slices 4a, 4b-i, 4b-ii, 4c, 4d-i, 4d-ii-part-1, and 4d-ii-part-2a landed; 4d-ii-part-2b items 1, 2, and 3 all fully landed; 4e's FK-target-resolution, sequence-ownership, and view-constraint-dependency items all landed; `CREATE DATABASE ... TEMPLATE` bounded validation landed 2026-07-10; the pg_class-under-fresh-database gap (name resolution generically, row enumeration for pg_class specifically) landed 2026-07-10, and the pg_indexes/pg_tables, pg_constraint, pg_index, pg_attrdef/pg_depend, pg_inherits, pg_policy, pg_trigger, pg_rewrite, pg_foreign_table, and pg_sequence row-content follow-ups landed the same day, plus the `oid::regclass`/`'name'::regclass` cast-direction dbOid-scoping gap (follow-up 33) — 2 sibling virtual-table builders (pg_statistic_ext, information_schema.routines/parameters/routine_*_usage) plus pg_sequences/information_schema.sequences (follow-up 34's narrowed remainder) plus the c.foreignServers registry-dbOid-key gap (follow-up 36, landed) and its same-shape c.userMappings sibling (follow-up 37, landed 2026-07-10); follow-up 37's own CURRENT_USER/SESSION_USER/CURRENT_ROLE/USER role-spec resolution discovery closed same-day (follow-up 38); restart durability for user tables created under a distinct-dbOid database — per-database pg_class/pg_attribute heap routing + startup reload into the owning namespace — landed same-day (follow-up 39); the real `CREATE DATABASE ... TEMPLATE` relation-copy mechanism itself landed 2026-07-10 for its bounded plain-table case (follow-up 40), extended the same day to also cover sequences (follow-up 41), plain views (follow-up 42), and materialized views (follow-up 43, including a real `execCreateMatView`/`execRefreshMatView` dbOid-scoping bugfix found along the way) — index/typed-table TEMPLATE copying remains deferred, see "Remaining 4e work" below; the `catalog.Routines` registry (follow-up 44, 2026-07-15), the `catalog.accessMethods` registry (follow-up 45, 2026-07-15), and the `catalog.userOperatorFamilies`/`userOperatorClasses` registries (follow-up 46, 2026-07-15) all landed cross-database isolation, unblocking the DU-002 probe past the function/procedure, access-method, and operator-family/-class collision points respectively — the pg_depend dependency-ordering gap for member-less operator classes also landed same-day (follow-up 47, see the "PGDependRowsForDBOid opclass to opfamily pg_depend edge" section below) — the probe is now blocked on `catalog.userConversions` cross-database isolation, the next flat dbOid-less registry in the audit sequence)
 Date: 2026-07-10
 Supersedes: none — extends the "Still open" note in
 `0122-0017-database-ddl-drop-guards.md` and the deferral-ledger rows dated
@@ -2558,6 +2558,44 @@ Gates: `go build ./...`/`go vet ./...` clean; `go test
 ./internal/initdb/...` PASS; `go test -v -run '^TestPort_PgDumpConnectionSetup$'
 ./internal/testport/` PASS (soft-log confirms the advance past
 `op_family_loose` to the new pg_depend-ordering blocker).
+
+### `PGDependRowsForDBOid` opclass→opfamily `pg_depend` edge — LANDED (2026-07-15)
+
+Closes this section's own recorded resume point: a member-less (`STORAGE`-only,
+no `ADD OPERATOR`/`ADD FUNCTION`) operator class had zero `pg_depend` rows
+against its owning family, because every opclass-related row
+`PGDependRowsForDBOid` emitted was keyed off `c.amOpMembers`/`c.amProcMembers`
+(AS-list members only, `catalog.go` ~line 13840+) — there was no row for the
+opclass↔opfamily relationship itself.
+
+Added an unconditional row per `c.userOperatorClasses` entry filtered to
+`oc.DBOid == dbOid && oc.FamilyOID != 0`: `classid=2616` (pg_opclass),
+`objid=<class OID>`, `refclassid=2753` (pg_opfamily),
+`refobjid=<class.FamilyOID>`, `objsubid`/`refobjsubid=0`, `deptype='a'`
+(AUTO — verified live against `postgres/src/backend/commands/opclasscmds.c`
+`DefineOpClass`, lines 731-735: `/* dependency on opfamily */
+recordDependencyOn(&myself, &referenced, DEPENDENCY_AUTO)`, unconditional
+regardless of members; note this is `'a'`, not `'n'`, correcting the prior
+section's memory-derived guess of NORMAL — harmless for restore-ordering
+either way since `pg_dump.c`'s `getDependencies` query only excludes
+`deptype='p'`/`'e'`, but byte-matching upstream matters for anyone diffing
+`pg_depend` directly).
+
+Confirmed via the DU-002 probe: the round-trip's failure point moved past the
+family/class ordering collision entirely to a NEW, unrelated blocker —
+`conversion "aliasconv" already exists`, because `UserConversion` has no
+`DBOid` field and `c.userConversions` is one flat, server-wide slice — the
+next registry in the M0122-0007 4e audit sequence. See the 2026-07-15
+deferral-ledger row (task-id `M0122-0007 4e follow-up
+(catalog.PGDependRowsForDBOid missing opclass→opfamily pg_depend edge)`) for
+the resume point.
+
+Gates: `go build ./...`/`go vet ./...` clean; `go test ./internal/catalog/...`
+PASS; `go test -short $(go list ./... | grep -v /internal/testport)` (full
+repo, short mode) 0 FAIL; `go test -v -run
+'^TestPort_PgDumpConnectionSetup$' ./internal/testport/` PASS (soft-log
+confirms the advance); `RALPH_PRECOMMIT_SCOPE=smoke bash
+scripts/ralph-precommit-test.sh` PASS.
 
 ## Deferred / explicitly out of scope
 
