@@ -272,8 +272,16 @@ case RmgrXLog:
   **accept the custom range in `DecodeXLogRecordHeader` (`:189-191`)** — the
   `Rmid > MaxKnownRmgr(=11)` reject (`:68`) currently blocks 128 (and 3/8). Allow
   the new rmids / the `128..255` custom range.~~
-- `internal/wal/pg_xlog_decode.go`: add HEAP2 opcode consts
-  (`0x10/0x20/0x30`) and any others used by the mapping.
+- **Landed 2026-07-15:** `internal/wal/pg_xlog_decode.go`: added
+  `xlogHeap2PruneOnAccess=0x10`, `xlogHeap2PruneVacuumScan=0x20`,
+  `xlogHeap2PruneVacuumClean=0x30` (RM_HEAP2_ID opcodes, confirmed against
+  `postgres/src/include/access/heapam_xlog.h:60-62`) — the 3 opcodes §3's
+  mapping table cites. Verified inert (no other reference to the new names
+  in the tree). No other HEAP2 opcodes needed by the mapping (REWRITE/
+  VISIBLE/MULTI_INSERT/LOCK_UPDATED/NEW_CID are not used by any RecordKind
+  row in §3).
+  ~~`internal/wal/pg_xlog_decode.go`: add HEAP2 opcode consts
+  (`0x10/0x20/0x30`) and any others used by the mapping.~~
 - `internal/wal/format.go`: `recordKindToRmgrInfo` mapping table + rewrite
   `classifyXLogRecord` to use it; retire `xlogInfoDefault` as the catch-all.
 - `internal/wal/recovery.go`: the §4 dispatch rework — `replayDecodedXLogRecord`

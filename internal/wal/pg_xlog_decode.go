@@ -35,6 +35,13 @@ const (
 	// replayed on the standby to update pg_control's GUC echo section.
 	xlogXLogParameterChange uint8 = 0x60
 
+	// RM_HEAP2_ID (rmid 9) opcodes (heapam_xlog.h:59-66). Used by
+	// recordKindToRmgrInfo (doc 04 §3) to map HeapVacuum/HeapPruneOpt/
+	// HeapFreeze onto distinct real-PG HEAP2 prune-record subtypes.
+	xlogHeap2PruneOnAccess    uint8 = 0x10 // XLOG_HEAP2_PRUNE_ON_ACCESS
+	xlogHeap2PruneVacuumScan  uint8 = 0x20 // XLOG_HEAP2_PRUNE_VACUUM_SCAN
+	xlogHeap2PruneVacuumClean uint8 = 0x30 // XLOG_HEAP2_PRUNE_VACUUM_CLEANUP
+
 	bkpBlockForkMask byte = 0x0F
 	bkpBlockHasImage byte = 0x10
 	bkpBlockHasData  byte = 0x20

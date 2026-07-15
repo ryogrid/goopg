@@ -11080,6 +11080,30 @@ mirroring M0119's ledger `status` column.
       remains a separate, larger, dedicated-loop task — do not start it
       opportunistically alongside a §5.4 slice.
 
+- [x] **Doc 04 §5.4 second additive slice landed —
+      `internal/wal/pg_xlog_decode.go`.** Added `xlogHeap2PruneOnAccess=0x10`,
+      `xlogHeap2PruneVacuumScan=0x20`, `xlogHeap2PruneVacuumClean=0x30`
+      (RM_HEAP2_ID opcodes, confirmed against
+      `postgres/src/include/access/heapam_xlog.h:60-62`) — these are the 3
+      HEAP2 opcodes doc §3's mapping table cites for `HeapVacuum`/
+      `HeapPruneOpt`/`HeapFreeze` (`RmgrHeap2=9` already existed in
+      `xlog_record.go`, unchanged this loop). Verified inert: grepped, no
+      other reference to the new const names anywhere in the tree — pure
+      unused-const addition, no behavior change on any currently-emitted or
+      currently-decoded record. Gates: `go build ./...` clean (unused-const
+      is an info-level diagnostic for package-level consts, not a build
+      error — matches the pre-existing `slotOffPersistency`-class pattern in
+      `slots_pg.go`); `go vet ./internal/wal/...` clean; `go test
+      ./internal/wal/...` full-package green. **Next step** (doc §5.4, third
+      bullet): `internal/wal/format.go` — build the `recordKindToRmgrInfo`
+      mapping table (doc §3's full RecordKind→(rmid,info) table) and rewrite
+      `classifyXLogRecord` to use it, retiring `xlogInfoDefault` as the
+      catch-all. This is the first slice that changes what gets *emitted*
+      (no longer purely additive) — read doc §3 in full before starting, and
+      keep `recovery.go`'s dispatch rework (doc §4, R1 "land last,
+      incrementally") as a separate follow-on loop, not bundled with the
+      mapping-table change.
+
 - [ ] **Nightly whole-suite regression batch — implementation** (~6). Design is
       DONE and committed: `analysis/tests-overview-260706/` (test-landscape
       snapshot) → `ci/design/` (6-doc architecture: S0 preflight → S1 two
