@@ -369,7 +369,20 @@ func (rs *Routines) SetFlagsByOIDDuringRecovery(oid uint32, volatile string, sec
 // resolveDBOid convention) so pre-existing callers that don't pass one keep
 // resolving against DefaultDBOid unchanged. M0119-0004 DU-002 follow-up.
 func (rs *Routines) Lookup(name parser.ObjectName, argTypes []Type, dbOid ...uint32) (*Routine, bool) {
-	stub := &Routine{Name: name.Name, ArgTypes: argTypes}
+	return rs.LookupWithArgModes(name, argTypes, nil, dbOid...)
+}
+
+// LookupWithArgModes is Lookup's twin for callers holding the parsed
+// parameter modes (ALTER/DROP FUNCTION, COMMENT ON FUNCTION). Those
+// statements resolve by the same identity-argument list PG's
+// pg_get_function_identity_arguments emits, which still carries OUT
+// parameters (ruleutils.c print_function_arguments only omits TABLE-mode
+// args from identity output, not OUT) — so the lookup stub needs argModes
+// populated for Routine.Signature() to correctly exclude them from the
+// match, exactly like pg_proc.proargtypes does. Passing nil argModes
+// reproduces Lookup's plain behavior (every arg treated as IN).
+func (rs *Routines) LookupWithArgModes(name parser.ObjectName, argTypes []Type, argModes []string, dbOid ...uint32) (*Routine, bool) {
+	stub := &Routine{Name: name.Name, ArgTypes: argTypes, ArgModes: argModes}
 	sig := stub.Signature()
 	db := resolveDBOid(dbOid)
 	rs.mu.RLock()
@@ -589,7 +602,16 @@ func (rs *Routines) ResolveByName(name parser.ObjectName, dbOid ...uint32) (*Rou
 // (M0118-0009 `stats`). Returns ErrRoutineNotFound when the signature doesn't
 // resolve. When schema is empty, searches public then all schemas.
 func (rs *Routines) ResolveBySig(name parser.ObjectName, argTypes []Type, dbOid ...uint32) (*Routine, error) {
-	stub := &Routine{Name: name.Name, ArgTypes: argTypes}
+	return rs.ResolveBySigWithArgModes(name, argTypes, nil, dbOid...)
+}
+
+// ResolveBySigWithArgModes is ResolveBySig's twin for callers holding the
+// parsed parameter modes — see LookupWithArgModes for why DROP FUNCTION's
+// deferred/autocommit removal paths need this (DROP FUNCTION on a routine
+// with OUT parameters, given the identity-argument list including OUT,
+// per PG's LookupFuncWithArgs).
+func (rs *Routines) ResolveBySigWithArgModes(name parser.ObjectName, argTypes []Type, argModes []string, dbOid ...uint32) (*Routine, error) {
+	stub := &Routine{Name: name.Name, ArgTypes: argTypes, ArgModes: argModes}
 	signature := stub.Signature()
 	schema := name.Schema
 	db := resolveDBOid(dbOid)

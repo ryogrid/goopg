@@ -4577,6 +4577,38 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
       `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh`
       PASS (0 failed, all 3 workloads, confirmed twice).
+      **2026-07-15 slice (OUT-parameter ALTER/DROP/COMMENT FUNCTION
+      signature-matching bug — FIXED, resume point (5) from the slice
+      above):** `execAlterFunction`/`execDropFunction` (pre-check + CASCADE
+      target + deferred/autocommit `ResolveBySig`)/`execCommentOn`'s
+      "function" case/`execCreateFunction`'s `ErrRoutineKindChange` DETAIL
+      lookup all rebuilt an `argTypes`-only stub (no `ArgModes`) before
+      calling `Lookup`/`ResolveBySig`, so `Routine.Signature()` treated
+      every arg as IN and couldn't exclude OUT params like the stored
+      routine's real signature does — confirmed against upstream
+      `ruleutils.c print_function_arguments`/`parse_func.c
+      LookupFuncWithArgs` that ALTER/DROP/COMMENT restatements legitimately
+      carry the full IN+OUT arg list (pg_get_function_identity_arguments
+      still prints OUT params) while the *lookup* itself is input-only
+      (matches `Signature()`'s existing OUT-exclusion contract). Added
+      `catalog.Routines.LookupWithArgModes`/`ResolveBySigWithArgModes`
+      (`Lookup`/`ResolveBySig` now thin wrappers delegating with `nil`
+      argModes — zero blast radius for the ~20 existing non-OUT-param
+      callers) plus `internal/executor/operators_call.go`'s
+      `funcArgModes([]parser.FunctionArg) []string` helper, wired at all 6
+      rebuilt-stub call sites in `operators_ddl.go`. Also fixed the DROP
+      SCHEMA CASCADE routine-collection loop's `rs.Drop(name, r.ArgTypes,
+      dropDBOid)` (same bug shape, error silently swallowed via `_ =`) by
+      switching to `rs.DropRoutine(r)` (r is already the live routine, no
+      stub rebuild needed). Confirmed via the DU-002 probe: advanced past
+      `procedure proc_out(integer, integer) does not exist` to a NEW,
+      unrelated bug (`function sum_variadic(integer) does not exist` on a
+      VARIADIC-array function restore — root-caused, not fixed; full trace
+      + resume point in the 2026-07-15 ledger row). Gates: `go build
+      ./...`/`go vet ./...` clean repo-wide; `go test ./internal/catalog/...
+      ./internal/executor/...` PASS; `go test -v -run
+      '^TestPort_PgDumpConnectionSetup$' ./internal/testport/` PASS
+      (soft-log confirms the advance).
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002). `002_save_fullpage`
       (WD-003) + live `pg_waldump --rmgr=Heap2` round-trip DONE. **Still open:** only
       `001_basic.pl`'s server-dependent tier (per-rmgr/relation/block filtering) —

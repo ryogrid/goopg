@@ -2319,6 +2319,61 @@ still unfiltered by dbOid — same class as `pg_enum`'s un-scoped
 `VirtualRows`. `DropRoutinesReferencingTypes` (temp-table-cleanup cascade)
 was left dbOid-oblivious as a lower-priority edge case.
 
+#### OUT-parameter ALTER/DROP/COMMENT FUNCTION signature-matching fix — LANDED (2026-07-15)
+
+Closed the OUT-parameter signature-matching defect this section's
+"Confirmed via the DU-002 probe" paragraph flagged. `execAlterFunction`,
+`execDropFunction` (the is-a-function pre-check, the CASCADE target lookup,
+and the deferred/autocommit `ResolveBySig` removal path), `execCommentOn`'s
+"function" case, and `execCreateFunction`'s `ErrRoutineKindChange` DETAIL
+lookup all rebuilt an `argTypes`-only stub (no `ArgModes`) before calling
+`Lookup`/`ResolveBySig`, so `Routine.Signature()` — whose OUT-exclusion logic
+requires `ArgModes` to be populated — treated every argument as IN and
+could not filter OUT params the way the stored routine's real signature
+does.
+
+Verified against upstream before picking a fix direction: PG's
+`ruleutils.c print_function_arguments` (called by
+`pg_get_function_identity_arguments` with `print_table_args=false`) only
+omits TABLE-mode args from the identity-argument text — OUT-mode args are
+still printed with an `OUT ` prefix — so an ALTER/DROP/COMMENT restatement
+built from a real pg_dump run legitimately carries the routine's full
+IN+OUT argument list. But `parse_func.c`'s `LookupFuncWithArgs` primary
+lookup path (`objargs`) filters to input-only argument types before
+matching — i.e. the *search* signature still excludes OUT, exactly
+matching `Routine.Signature()`'s existing contract. This confirmed the fix
+is "populate ArgModes so Signature() can do its existing OUT-exclusion
+correctly" rather than switching to a `LookupDropCandidates`-style
+full-arg-list matcher (which would have made ALTER/DROP require the exact
+OUT types too, diverging from PG's traditional input-only resolution).
+
+`catalog.Routines` gained `LookupWithArgModes`/`ResolveBySigWithArgModes` —
+`Lookup`/`ResolveBySig` are now thin wrappers delegating with `nil`
+argModes, so the ~20 pre-existing non-OUT-param callers (CAST/transform-func
+resolution, every `*_test.go` call site) are untouched. New
+`internal/executor/operators_call.go` `funcArgModes([]parser.FunctionArg)
+[]string` helper (mirrors the per-arg mode switch CREATE FUNCTION/PROCEDURE
+already use) wired at all 6 rebuilt-stub call sites in `operators_ddl.go`.
+Also fixed the DROP SCHEMA CASCADE routine-collection loop's
+`rs.Drop(name, r.ArgTypes, dropDBOid)` (same bug shape, its error silently
+swallowed via `_ =`) by switching to `rs.DropRoutine(r)` — `r` is already
+the live, fully-populated `*Routine`, so its own `Signature()` needs no
+rebuilt stub.
+
+Confirmed via the DU-002 probe: advanced past `procedure proc_out(integer,
+integer) does not exist` to a NEW, unrelated bug —
+`function sum_variadic(integer) does not exist` restoring a VARIADIC-array
+function (`CREATE FUNCTION sum_variadic(VARIADIC arr integer[])`). Traced,
+not fixed: real PG stores a VARIADIC parameter's `proargtypes` entry as the
+parsed type OID as written (the ARRAY type, e.g. `_int4`/`integer[]`, not
+the element type — `functioncmds.c:261,306-309`), and `format_type_be`
+auto-renders the `[]` suffix for an array OID, so
+`pg_get_function_identity_arguments` round-trips `VARIADIC arr integer[]`
+symmetrically. goopg's error drops the `[]` somewhere in that path — see
+the 2026-07-15 deferral-ledger row (task-id `M0119-0004 (DU-002 round-trip
+probe, OUT-parameter ALTER/DROP/COMMENT FUNCTION signature-matching fix
+...)`) for the full trace and resume point.
+
 ## Deferred / explicitly out of scope
 
 - Unifying `ResolveDatabaseOid`'s switch with the `pg_database` `VirtualRows`

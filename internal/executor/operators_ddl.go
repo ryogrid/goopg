@@ -11509,7 +11509,7 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 			for i, a := range s.Args {
 				argTypes[i] = catalog.Type{Name: strings.ToLower(a.Type.Name)}
 			}
-			if existing, ok := rs.Lookup(s.Name, argTypes, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); ok && existing != nil && existing.IsProcedure {
+			if existing, ok := rs.LookupWithArgModes(s.Name, argTypes, funcArgModes(s.Args), catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); ok && existing != nil && existing.IsProcedure {
 				detail = fmt.Sprintf("%q is a procedure.", s.Name.Name)
 			}
 			return &ExecError{Code: "42P13", Pos: s.Pos(),
@@ -11954,13 +11954,14 @@ func (o *ddlOp) execAlterFunction(s *parser.AlterFunctionStmt) error {
 	for _, a := range s.Args {
 		argTypes = append(argTypes, catalog.Type{Name: strings.ToLower(a.Type.Name)})
 	}
+	argModes := funcArgModes(s.Args)
 	dbOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
 	var routines []*catalog.Routine
 	if s.Args == nil {
 		// No arg list: update all overloads
 		routines = rs.LookupByName(s.Name, dbOid)
 	} else {
-		r, ok := rs.Lookup(s.Name, argTypes, dbOid)
+		r, ok := rs.LookupWithArgModes(s.Name, argTypes, argModes, dbOid)
 		if ok && r != nil {
 			routines = []*catalog.Routine{r}
 		}
@@ -12432,7 +12433,7 @@ func (o *ddlOp) execDropFunction(s *parser.DropFunctionStmt) error {
 		for i, a := range s.Args {
 			argTypes[i] = catalog.Type{Name: strings.ToLower(a.Type.Name)}
 		}
-		if found, ok := rs.Lookup(s.Name, argTypes, dbOid); ok && found != nil && found.IsProcedure {
+		if found, ok := rs.LookupWithArgModes(s.Name, argTypes, funcArgModes(s.Args), dbOid); ok && found != nil && found.IsProcedure {
 			// "X(type) is not a function" — matches PG error for DROP FUNCTION on a procedure.
 			argListStr := routineArgListStr(argTypes)
 			if s.IfExists {
@@ -12453,7 +12454,7 @@ func (o *ddlOp) execDropFunction(s *parser.DropFunctionStmt) error {
 			for i, a := range s.Args {
 				argTypes[i] = catalog.Type{Name: strings.ToLower(a.Type.Name)}
 			}
-			if target, ok := rs.Lookup(s.Name, argTypes, dbOid); ok && target != nil {
+			if target, ok := rs.LookupWithArgModes(s.Name, argTypes, funcArgModes(s.Args), dbOid); ok && target != nil {
 				targets = []*catalog.Routine{target}
 			}
 		} else {
@@ -12526,6 +12527,7 @@ func (o *ddlOp) execDropFunction(s *parser.DropFunctionStmt) error {
 	// Build the argument-type list once (used by both the immediate and the
 	// deferred paths).
 	var argTypes []catalog.Type
+	var argModes []string
 	if s.Args != nil {
 		argTypes = make([]catalog.Type, len(s.Args))
 		for i, a := range s.Args {
@@ -12534,6 +12536,7 @@ func (o *ddlOp) execDropFunction(s *parser.DropFunctionStmt) error {
 				Args: append([]int64(nil), a.Type.Args...),
 			}
 		}
+		argModes = funcArgModes(s.Args)
 	}
 
 	// Inside an explicit transaction, DROP FUNCTION removal is deferred to
@@ -12550,7 +12553,7 @@ func (o *ddlOp) execDropFunction(s *parser.DropFunctionStmt) error {
 		if s.Args == nil {
 			target, err = rs.ResolveByName(s.Name, dbOid)
 		} else {
-			target, err = rs.ResolveBySig(s.Name, argTypes, dbOid)
+			target, err = rs.ResolveBySigWithArgModes(s.Name, argTypes, argModes, dbOid)
 		}
 		if err == nil {
 			bsess.AddDeferredRoutineDrop(DeferredRoutineDrop{
@@ -12569,7 +12572,7 @@ func (o *ddlOp) execDropFunction(s *parser.DropFunctionStmt) error {
 		if s.Args == nil {
 			target, err = rs.ResolveByName(s.Name, dbOid)
 		} else {
-			target, err = rs.ResolveBySig(s.Name, argTypes, dbOid)
+			target, err = rs.ResolveBySigWithArgModes(s.Name, argTypes, argModes, dbOid)
 		}
 		if err == nil {
 			if err = rs.DropRoutine(target); err == nil {
@@ -14570,7 +14573,11 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 							// Build canonical arg list for NOTICE.
 							argStr := r.Name + "(" + buildFunctionArgsList(r) + ")"
 							droppedRoutines = append(droppedRoutines, argStr)
-							_ = rs.Drop(parser.ObjectName{Schema: r.Schema, Name: r.Name}, r.ArgTypes, dropDBOid)
+							// DropRoutine matches by r's own OID-keyed signature (r.ArgModes
+							// already populated), avoiding the OUT-param signature mismatch a
+							// rebuilt Drop(name, r.ArgTypes, ...) stub would hit (no ArgModes
+							// carried through that call) — see funcArgModes/LookupWithArgModes.
+							_ = rs.DropRoutine(r)
 						}
 					}
 					sort.Strings(droppedRoutines)
@@ -17613,7 +17620,7 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 		for i, a := range s.Args {
 			argTypes[i] = catalog.Type{Name: strings.ToLower(a.Type.Name)}
 		}
-		r, ok := rs.Lookup(s.ObjName, argTypes, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+		r, ok := rs.LookupWithArgModes(s.ObjName, argTypes, funcArgModes(s.Args), catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		if !ok || r == nil {
 			return &ExecError{Code: "42883", Pos: s.Pos(),
 				Message: fmt.Sprintf("function %s does not exist", commentOnFuncSig(s))}

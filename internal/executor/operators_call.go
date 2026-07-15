@@ -637,6 +637,32 @@ func routineArgListStr(argTypes []catalog.Type) string {
 	return "(" + strings.Join(parts, ", ") + ")"
 }
 
+// funcArgModes converts a parsed function/procedure argument list into the
+// parallel "i"/"o"/"b"/"v" mode strings catalog.Routine.ArgModes expects
+// (mirrors the per-arg switch CREATE FUNCTION/PROCEDURE use when building a
+// new routine). ALTER/DROP FUNCTION and COMMENT ON FUNCTION resolve existing
+// routines by the same identity-argument list PG's
+// pg_get_function_identity_arguments emits — which still carries OUT
+// parameters — so a Lookup/ResolveBySig stub needs modes populated for
+// Routine.Signature() to exclude them from the match the way
+// pg_proc.proargtypes does.
+func funcArgModes(args []parser.FunctionArg) []string {
+	modes := make([]string, len(args))
+	for i, a := range args {
+		switch a.Mode {
+		case parser.FuncArgOut:
+			modes[i] = "o"
+		case parser.FuncArgInout:
+			modes[i] = "b"
+		case parser.FuncArgVariadic:
+			modes[i] = "v"
+		default:
+			modes[i] = "i"
+		}
+	}
+	return modes
+}
+
 // isKnownBuiltinFunction returns true if name is a known built-in SQL function
 // (not a user-defined routine). Used to detect "random() is not a procedure"
 // cases where the function exists in the built-in registry but not in the
