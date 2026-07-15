@@ -9528,8 +9528,17 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 				return false, err
 			}
 			return true, nil
-		case xlogHeapDelete, xlogHeapUpdate, xlogHeapHotUpdate, xlogHeapInplace:
-			// All four record types are emitted with full-page images
+		case xlogHeapDelete:
+			// A3: goopg emits xl_heap_delete with block-0 main-data (xmax +
+			// offnum), no FPI — replay stamps xmax at the slot. A real-PG
+			// delete carrying a full-page image is restored via the FPI branch
+			// inside replayDecodedXLogHeapDelete.
+			if err := replayDecodedXLogHeapDelete(mgr, r, xlog); err != nil {
+				return false, err
+			}
+			return true, nil
+		case xlogHeapUpdate, xlogHeapHotUpdate, xlogHeapInplace:
+			// These record types are emitted with full-page images
 			// (HasImage+ImageApply on every referenced block). Restore each
 			// block from its FPI; tuple-level main-data parsing is not needed
 			// because the FPI already captures the post-mutation page state.
@@ -9775,6 +9784,62 @@ func decodeXLogHeapInsertTuple(block XLogBlockRef, xid storage.TransactionID, of
 	out[22] = block.Data[4]                                                        // t_hoff
 	copy(out[storage.SizeOfHeapTupleHeaderData:], dataPortion)
 	return out, nil
+}
+
+// decodeXLogHeapDeleteMainData parses the fixed xl_heap_delete struct from a
+// PG-format heap-delete record's main data (xmax, offnum, infobits_set, flags).
+// Any old-tuple bytes past the struct (XLH_DELETE_CONTAINS_OLD_TUPLE) are for
+// logical decoding and are not needed by redo.
+func decodeXLogHeapDeleteMainData(mainData []byte) (xmax uint32, offnum uint16, infobits, flags uint8, err error) {
+	if len(mainData) < sizeOfXLogHeapDeleteData {
+		return 0, 0, 0, 0, fmt.Errorf("wal: invalid xlog heap-delete main-data len %d (want >= %d)", len(mainData), sizeOfXLogHeapDeleteData)
+	}
+	xmax = binary.LittleEndian.Uint32(mainData[0:4])
+	offnum = binary.LittleEndian.Uint16(mainData[4:6])
+	infobits = mainData[6]
+	flags = mainData[7]
+	return xmax, offnum, infobits, flags, nil
+}
+
+// replayDecodedXLogHeapDelete applies a PG-format xl_heap_delete: stamp the
+// deleted tuple's xmax at offnum on block 0's page. Mirrors the native
+// replayHeapDelete (PageSetHeapTupleXmax), so goopg↔goopg replay is identical;
+// a full-page image on the block (real-PG WAL) is restored instead. Idempotent
+// via pd_lsn.
+func replayDecodedXLogHeapDelete(mgr *storage.Manager, r Record, xlog *XLogDecodedRecord) error {
+	block, ok := xlogBlockRefByID(xlog, 0)
+	if !ok {
+		return fmt.Errorf("wal: xlog heap-delete missing block 0")
+	}
+	if block.HasImage && block.ImageApply {
+		return restoreDecodedXLogBlockImage(mgr, block, storage.LSN(r.EndLSN))
+	}
+	xmax, offnum, _, _, err := decodeXLogHeapDeleteMainData(xlog.MainData)
+	if err != nil {
+		return err
+	}
+	nblocks, err := mgr.NBlocks(block.Rel)
+	if err != nil {
+		return err
+	}
+	if block.Block >= nblocks {
+		return fmt.Errorf("wal: xlog heap-delete: block %d does not exist (nblocks=%d)", block.Block, nblocks)
+	}
+	page := make(storage.Page, storage.BlockSize)
+	if err := mgr.ReadBlock(block.Rel, block.Block, page); err != nil {
+		return err
+	}
+	if storage.IsNew(page) {
+		return fmt.Errorf("wal: xlog heap-delete: block %d is uninitialised", block.Block)
+	}
+	if storage.MustHeader(page).LSN() >= storage.LSN(r.EndLSN) {
+		return nil // already applied
+	}
+	if err := storage.PageSetHeapTupleXmax(page, offnum, storage.TransactionID(xmax)); err != nil {
+		return fmt.Errorf("wal: xlog heap-delete apply: %w", err)
+	}
+	storage.MustHeader(page).SetLSN(storage.LSN(r.EndLSN))
+	return mgr.WriteBlock(block.Rel, block.Block, page)
 }
 
 // ReplayFromDir reads records from <dataDir>/pg_wal and replays them.

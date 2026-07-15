@@ -121,3 +121,10 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
   `heap_insert_pg_classify_test.go`. Every INSERT now writes a PostgreSQL `xl_heap_insert`. **Gates:** wal
   unit+`-race`, executor, initdb crash-recovery (237s), e2e native-replication+promotion / physical /
   logical — all green. **A2 DONE.** Next record: A3 HeapDelete (same pattern, no t_ctid landmine).
+- 2026-07-16: **A3a landed** (dormant). Unlike HeapInsert, **no** decoded delete replay existed → built it:
+  `EncodeHeapDeletePG` (main-data `xl_heap_delete{xmax,offnum,infobits=0,flags}` + optional old tuple as
+  `xl_heap_header`+data for logical; block-0 page ref; xl_xid=xmax), `decodeXLogHeapDeleteMainData`,
+  `replayDecodedXLogHeapDelete` (reuses `PageSetHeapTupleXmax` = native parity; FPI fallback). Split the
+  decoded dispatch so `xlogHeapDelete` gets the new handler (update/hotupdate/inplace stay FPI-only).
+  `heap_delete_pg_test.go`: insert→delete replay stamps xmax (xmin/data intact) + old-tuple carried. Gates:
+  build/vet/test/-race ./internal/wal/.

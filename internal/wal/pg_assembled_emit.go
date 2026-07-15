@@ -132,3 +132,45 @@ func EncodeHeapInsertPG(rel storage.RelFileNode, blk storage.BlockNumber, lineSl
 	}
 	return framePGAssembled(RmgrHeap, xlogHeapInsert, xid, body), nil
 }
+
+// sizeOfXLogHeapDeleteData is PG's SizeOfHeapDelete: xmax(4) + offnum(2) +
+// infobits_set(1) + flags(1).
+const sizeOfXLogHeapDeleteData = 8
+
+// xlhDeleteContainsOldTuple is PG's XLH_DELETE_CONTAINS_OLD_TUPLE
+// (heapam_xlog.h): main data carries the pre-delete tuple after xl_heap_delete.
+const xlhDeleteContainsOldTuple uint8 = 0x02
+
+// EncodeHeapDeletePG builds a PostgreSQL xl_heap_delete record for one heap
+// deletion (an xmax stamp on the deleted tuple), framed for the assembled-record
+// Append path. Main data is xl_heap_delete{xmax, offnum, infobits_set, flags};
+// block 0 references the tuple's page (no block data). When oldTuple is non-nil
+// (logical replication needs the pre-delete row), the old tuple is appended to
+// main data as xl_heap_header{t_infomask2, t_infomask, t_hoff} + the tuple bytes
+// past the fixed header, and XLH_DELETE_CONTAINS_OLD_TUPLE is set — mirroring
+// PG's log_heap_delete.
+//
+// infobits_set is 0: goopg stamps a plain deleter xmax (no HEAP_KEYS_UPDATED, no
+// lock bits), and replay reproduces it with PageSetHeapTupleXmax, matching the
+// native replay. xl_xid = xmax (the deleting xact).
+func EncodeHeapDeletePG(rel storage.RelFileNode, blk storage.BlockNumber, lineSlot uint16, xmax storage.TransactionID, oldTuple []byte) ([]byte, error) {
+	mainData := make([]byte, sizeOfXLogHeapDeleteData)
+	binary.LittleEndian.PutUint32(mainData[0:4], uint32(xmax))
+	binary.LittleEndian.PutUint16(mainData[4:6], lineSlot)
+	mainData[6] = 0 // infobits_set
+
+	var flags uint8
+	if len(oldTuple) >= storage.SizeOfHeapTupleHeaderData {
+		flags |= xlhDeleteContainsOldTuple
+		mainData = append(mainData, oldTuple[18:22]...) // t_infomask2 + t_infomask
+		mainData = append(mainData, oldTuple[22])       // t_hoff
+		mainData = append(mainData, oldTuple[storage.SizeOfHeapTupleHeaderData:]...)
+	}
+	mainData[7] = flags
+
+	body, err := assembleXLogRecord(mainData, []BlockRef{{ID: 0, Rel: rel, Block: blk}})
+	if err != nil {
+		return nil, err
+	}
+	return framePGAssembled(RmgrHeap, xlogHeapDelete, uint32(xmax), body), nil
+}
