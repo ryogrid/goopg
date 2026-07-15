@@ -1,86 +1,88 @@
-Task: M0122-0007 4e follow-up — `catalog.enumTypes` (`CREATE TYPE ... AS
-ENUM`) gains per-database cross-database isolation, resuming the exact next
-candidate the prior loop's ledger row named. COMPLETE, gates all green,
-about to commit.
+Task: M0122-0007 4e follow-up — `catalog.compositeTypes` (`CREATE TYPE ... AS
+(...)`) gains per-database isolation, closing the composite-type slice of the
+prior loop's resume point (last unaudited sibling map: domains, enumTypes
+already done). COMPLETE, gates all green, committed (f08ba8d9).
 
-Files: internal/catalog/catalog.go (EnumType.DBOid field; new enumKey/
-lookupEnumByNameLocked helpers next to domainKey/lookupDomainByNameLocked;
-RegisterEnum/RenameEnum/RenameEnumValue/SetEnumOwner/AddEnumValue/
-AddEnumValueResult/RemoveEnumValue/DropEnum/LookupEnum all gained a
-trailing variadic dbOid; Catalog interface's LookupEnum signature updated
-to match); internal/executor/operators_ddl.go (7 write-path call sites
-thread o.ctx.CurrentDatabaseOid: execCreateType/execAlterType's RENAME
-VALUE/RENAME TO/OWNER TO/ADD VALUE/execDropType's enum branch);
-internal/executor/operators_tx.go (undoEnumDDLFromContext's 3 calls thread
-ctx.CurrentDatabaseOid); internal/server/dispatch.go +server.go +
-twophase.go (SIBLING undo path `undoEnumDDLForRollback` — found by test
-failure, NOT threaded by the executor-package fix alone — gained a dbOid
-param, threaded from 7 call sites total: 5 in dispatch.go use in-scope
-ctx.CurrentDatabaseOid, twophase.go's abortForPrepareSSIFailure too,
-server.go's connection-teardown path has no ctx so resolves via the
-pre-existing resolveConnDBOid(cat, connTx.DBName) helper); new
-internal/catalog/create_enum_test.go (TestCreateEnumCrossDatabaseIsolation,
-mirrors TestCreateDomainCrossDatabaseIsolation); docs/design/
-0097-0017-0001-enum-domain-types.md (new "Follow-up (2026-07-15, later
-loop)" section incl. the sibling-path bug writeup) + docs/design/README.md
-(row updated); .ralph/deferral_ledger.md (new row); .ralph/fix_plan.md (new
-[x] entry).
+Files: internal/catalog/catalog.go (CompositeType.DBOid field; new
+compositeKey/lookupCompositeTypeByNameLocked helpers next to enumKey/
+lookupEnumByNameLocked; RegisterCompositeType/RegisterCompositeTypeWithFields/
+RenameCompositeType/SetCompositeTypeOwner/DropCompositeType/HasCompositeType/
+LookupCompositeType/LookupCompositeTypeFields all gained a trailing variadic
+dbOid; Catalog interface's LookupCompositeType/LookupCompositeTypeFields
+signatures updated to match); internal/executor/operators_ddl.go (18
+write-path call sites thread o.ctx.CurrentDatabaseOid: execCreateType's
+composite branch, execAlterType's ADD/RENAME/DROP/ALTER ATTRIBUTE/RENAME TO/
+OWNER TO branches, execAlterTypeAttrCmds, execDropType's composite branch);
+internal/executor/operators_tx.go (undoEnumDDLFromContext's DropCompositeType
+call threads ctx.CurrentDatabaseOid — grepped for this sibling PROACTIVELY
+this loop, before running any tests, unlike the enum loop which found it via
+test failure); internal/server/dispatch.go (undoEnumDDLForRollback's
+DropCompositeType call threads its existing dbOid param, same proactive
+grep); internal/executor/operators_tx_composite_test.go (fixed pre-existing
+test: bare &Context{} had no CurrentDatabaseOid set while its
+RegisterCompositeTypeWithFields calls implicitly resolved to DefaultDBOid —
+a test-fixture inconsistency exposed by the new real dbOid plumbing, not a
+product bug; fixed by setting ctx.CurrentDatabaseOid: catalog.DefaultDBOid
+and passing catalog.DefaultDBOid explicitly to Register/Lookup calls in both
+test funcs); new internal/catalog/create_composite_type_test.go
+(TestCreateCompositeTypeCrossDatabaseIsolation, mirrors
+TestCreateEnumCrossDatabaseIsolation); docs/design/
+0097-0017-0001-enum-domain-types.md (new "Follow-up (2026-07-15, third
+loop)" section) + docs/design/README.md (row updated); .ralph/
+deferral_ledger.md (new row, incl. the RangeType finding below) + .ralph/
+fix_plan.md (new [x] entry).
 
-Key symbols: catalog.enumKey, catalog.lookupEnumByNameLocked,
-catalog.InMemory.RegisterEnum/LookupEnum/DropEnum, executor.
-undoEnumDDLFromContext, server.undoEnumDDLForRollback, server.
-resolveConnDBOid.
+Key symbols: catalog.compositeKey, catalog.lookupCompositeTypeByNameLocked,
+catalog.InMemory.RegisterCompositeTypeWithFields/LookupCompositeType/
+DropCompositeType, executor.undoEnumDDLFromContext,
+server.undoEnumDDLForRollback.
 
-Hypothesis/Findings: M-NIGHTLY queue empty this loop (ci/logs/action-
-items.md run 20260715-010036, all 11 items already [x] in fix_plan.md —
-confirmed via grep). Resumed exactly where working_set left off: audit
-catalog's enum registry for the DBOid-less collision the DU-002 probe hit
-(`type "gtype" already exists`). Confirmed `c.enumTypes` was the same
-bare-name-keyed map shape `domains`/`userCollations` had before their
-fixes; applied the identical domainKey/lookupDomainByNameLocked pattern.
-**Caught a real regression before committing**: threading only the
-executor package's `undoEnumDDLFromContext` broke
-`TestSimpleQueryMidBatchBeginUndoesEarlierAutocommitCreateType`/`...AddValue`
-in internal/server — dispatch.go has a SECOND, independent copy of the same
-undo logic (`undoEnumDDLForRollback`) for the simple-query ROLLBACK/failed-
-COMMIT/SSI-abort/two-phase-abort/teardown paths, which still called
-Remove/Rename/DropEnum with no dbOid (silently defaulting to DefaultDBOid),
-mismatching the raw — possibly 0 in embedded/test contexts —
-ctx.CurrentDatabaseOid used at CREATE time. This is exactly the
-`pattern_sibling_paths_must_agree` memory's failure mode; fixed by threading
-dbOid through the second path too (grep for ALL call sites of the mutator
-methods, not just the ones in the package you're already editing, is the
-generalizable lesson). Full local suite (all packages, all 3 gates) is
-clean after the fix.
+Hypothesis/Findings: Applied the sibling-path lesson from the enum loop
+proactively — grepped operators_tx.go/dispatch.go for the second undo copy
+BEFORE running tests, so no server-package regression this time. Still
+caught one regression via the full targeted test run: operators_tx_composite_test.go's
+bare Context{} had CurrentDatabaseOid=0 while RegisterCompositeTypeWithFields
+(no dbOid arg) resolved to DefaultDBOid=1 — mismatch once the real dbOid
+started flowing through undo. Fixed the test, not the product path (no real
+Context ever has a literal 0 CurrentDatabaseOid). **Important finding while
+auditing scope**: catalog.RangeType (CREATE TYPE ... AS RANGE) has NO DBOid
+field and NO dbOid-taking methods at all (RegisterRangeType/RenameRangeType/
+SetRangeTypeOwner/DropRangeType all lack the parameter) — confirmed by
+direct grep, NOT assumed. This is the real next candidate in this series,
+recorded in the deferral ledger (resume point 4) rather than incorrectly
+assumed already fixed.
 
-Next step: composite types (`c.compositeTypes`/`compositeTypeNames`,
-`internal/catalog/catalog.go`) are very likely the next same-shaped
-DBOid-less collision — the last unaudited sibling map in this M0122-0007 4e
-series (domains, userCollations, and now enums are done). Audit
-`RegisterCompositeType`/`RegisterCompositeTypeWithFields`/
-`RenameCompositeType`/`SetCompositeTypeOwner`/`DropCompositeType`'s map
-shape first, then apply the domainKey/enumKey pattern; remember to grep
-internal/server/dispatch.go for a possible sibling undo/rollback path too
-(PendingCreatedComposites already exists in both undoEnumDDLFromContext and
-undoEnumDDLForRollback's composite-drop steps — check those too if
-composite types get their own dbOid threading).
+Next step: `catalog.RangeType` cross-database isolation — audit
+RegisterRangeType/LookupRangeType/RenameRangeType/SetRangeTypeOwner/
+DropRangeType's map shape in internal/catalog/catalog.go (search
+`RegisterRangeType`), apply the identical DBOid-field + rangeKey(dbOid,name)
+pattern (mirrors compositeKey/enumKey/domainKey exactly), thread dbOid
+through execCreateType's RANGE branch/execAlterType's range-type RENAME TO/
+OWNER TO branches/execDropType's range branch in operators_ddl.go. Grep
+operators_tx.go + server/dispatch.go for a range-type ROLLBACK-undo sibling
+UP FRONT (before running tests) — apply this loop's own lesson, don't wait
+for a test failure to discover it. After range types, the domains/enums/
+composites WAL-restart-persistence gap (deferral ledger resume points (1)
+across all three rows) and the ~15-40 remaining read-only Lookup call sites
+per type (resume point (2)) are the next tier of work in this series.
 
 Gates run (all PASS this loop): go build ./...; go vet ./... (whole repo);
-go test ./internal/catalog/... ./internal/executor/... ./internal/server/...
-./internal/planner/... (clean, incl. new TestCreateEnumCrossDatabaseIsolation
-and the 2 previously-broken-then-fixed server tests); go test -short full
-repo excl. testport (all packages, 0 FAIL); go test -v -run
-'^TestPort_PgDumpConnectionSetup$' ./internal/testport/ PASS (probe moved to
-a new `DEFAULT 'na'::character varying` CAST-target parser gap, logged not
-failed); scripts/tpch-spotcheck.sh PASS (Q12=2/Q13=33);
-RALPH_PRECOMMIT_SCOPE=smoke ralph-precommit-test.sh PASS clean (0 failed, 3
-workloads); make ralph-state-guard — auto-repaired 1 stale marker (previous
-loop's clean-exit progress.json), consistent after.
+go test -count=1 ./internal/catalog/... ./internal/executor/...
+./internal/server/... ./internal/planner/... (clean, incl. new
+TestCreateCompositeTypeCrossDatabaseIsolation and the 2 fixed
+operators_tx_composite_test.go tests); go test -short full repo excl.
+testport (51 packages, 0 FAIL, internal/initdb=237s the long pole);
+scripts/tpch-spotcheck.sh PASS (Q12=2/Q13=33); RALPH_PRECOMMIT_SCOPE=smoke
+ralph-precommit-test.sh — 1 transient "current transaction is aborted"
+pgbench flake on first run (unrelated to this change: TPC-B touches
+accounts/branches/tellers, no DDL types), confirmed as a flake via a clean
+retry (0 failed, 3 workloads) before proceeding; pre-commit hook's own
+pgbench-smoke gate PASSED on the actual commit. make ralph-state-guard —
+clean, no repair needed this loop.
 
-In-flight: none — task complete; commit (pathspec-scoped, per the concurrent-
-loop-commit rule) + pre-commit hook's own pgbench smoke + push are the only
-remaining mechanical steps. Untouched foreign/stray files present at loop
-start and still present (analysis/tpch-explain-baseline.md, ci/logs/
-launch.log, postgres submodule dirty, weekly_loc.*, analysis/perf-optimize3/
-runs/*, kaitai-struct-dash*.txt) — same as every prior loop, left alone (not
-part of this loop's diff).
+In-flight: none — task complete, committed (f08ba8d9), pushed step not yet
+done (push is a separate explicit action, not part of this loop's gates).
+Untouched foreign/stray files present at loop start and still present
+(analysis/tpch-explain-baseline.md, ci/logs/launch.log, postgres submodule
+dirty, weekly_loc.*, analysis/perf-optimize3/runs/*, kaitai-struct-dash*.txt)
+— same as every prior loop, left alone (not part of this loop's diff).
