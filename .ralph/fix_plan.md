@@ -11055,6 +11055,31 @@ mirroring M0119's ledger `status` column.
       family. Gates: none required (docs-only change, no code touched);
       `make ralph-state-guard` run per every loop's closing requirement.
 
+- [x] **Doc 04 §5.4 first additive slice landed —
+      `internal/wal/xlog_record.go`.** Added `RmgrCLOG=3`,
+      `RmgrGoopgCustomBase=128`, `RmgrGoopgCatalog=128` consts (doc §3.1/§3.2
+      mapping); widened `DecodeXLogRecordHeader`'s reject condition from
+      `Rmid > MaxKnownRmgr` to `Rmid > MaxKnownRmgr && Rmid <
+      RmgrGoopgCustomBase` so the BLOCKER the doc flagged (128/3/8 rejected)
+      is cleared — a rmid of 99 (between 11 and 128) is still correctly
+      rejected (existing `TestDecodeRejectsUnknownRmgr` unchanged/still
+      green). Added `TestDecodeAcceptsGoopgCustomRmgrRange` pinning
+      128/RmgrGoopgCatalog/255 accepted and 127 still rejected. Verified
+      inert: nothing in the tree emits `Rmid=3` or `Rmid>=128` yet (only
+      producer of `Rmgr` values outside `xlog_record.go` is
+      `format.go:228`'s payload-derived classification, unrelated to header
+      decode), so this is a pure widen-the-guard change with no behavior
+      change on any currently-emitted record. Gates: `go build ./...` +
+      `go vet ./internal/wal/...` clean; `go test ./internal/wal/...` and
+      `go test -race ./internal/wal/...` full-package green. **Next step**
+      (doc §5.4, second bullet): `internal/wal/pg_xlog_decode.go` — add the
+      HEAP2 opcode consts (`xlogHeap2PruneOnAccess=0x10` /
+      `_VacuumScan=0x20` / `_VacuumCleanup=0x30`, cited from doc 03 §5),
+      still additive/inert (no dispatch rewrite yet). The `classifyXLogRecord`
+      / `recovery.go` dispatch rework (doc §4, R1 "land last, incrementally")
+      remains a separate, larger, dedicated-loop task — do not start it
+      opportunistically alongside a §5.4 slice.
+
 - [ ] **Nightly whole-suite regression batch — implementation** (~6). Design is
       DONE and committed: `analysis/tests-overview-260706/` (test-landscape
       snapshot) → `ci/design/` (6-doc architecture: S0 preflight → S1 two

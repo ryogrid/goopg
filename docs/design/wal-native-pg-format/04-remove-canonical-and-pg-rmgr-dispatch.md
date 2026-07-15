@@ -262,10 +262,16 @@ case RmgrXLog:
   No GUC / `postgresql.conf.sample` entry exists (confirmed).
 
 ### 5.4 Additive edits (the PG-dispatch rework)
-- `internal/wal/xlog_record.go`: add `RmgrCLOG=3`, `RmgrGoopgCatalog=128`;
+- **Landed 2026-07-15:** `internal/wal/xlog_record.go`: added `RmgrCLOG=3`,
+  `RmgrGoopgCustomBase=128`, `RmgrGoopgCatalog=128`; `DecodeXLogRecordHeader`
+  now accepts the `128..255` custom range (`Rmid > MaxKnownRmgr && Rmid <
+  RmgrGoopgCustomBase` is the new reject condition, was `Rmid >
+  MaxKnownRmgr`). Verified inert — nothing yet emits `Rmid=3` or `Rmid>=128`.
+  `TestDecodeAcceptsGoopgCustomRmgrRange` pins the new boundary.
+  ~~`internal/wal/xlog_record.go`: add `RmgrCLOG=3`, `RmgrGoopgCatalog=128`;
   **accept the custom range in `DecodeXLogRecordHeader` (`:189-191`)** — the
   `Rmid > MaxKnownRmgr(=11)` reject (`:68`) currently blocks 128 (and 3/8). Allow
-  the new rmids / the `128..255` custom range.
+  the new rmids / the `128..255` custom range.~~
 - `internal/wal/pg_xlog_decode.go`: add HEAP2 opcode consts
   (`0x10/0x20/0x30`) and any others used by the mapping.
 - `internal/wal/format.go`: `recordKindToRmgrInfo` mapping table + rewrite
