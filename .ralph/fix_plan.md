@@ -4735,6 +4735,69 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       (full repo, short mode) 0 FAIL; `scripts/tpch-spotcheck.sh` PASS
       (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke bash
       scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 workloads).
+- [x] **M0122-0007 4e follow-up — `catalog.userOperatorFamilies`/
+      `userOperatorClasses` cross-database isolation (DU-002 round-trip probe
+      unblock).** The DU-002 probe's blocker moved past AccessMethod to
+      `operator 1(bigint,bigint) already exists in operator family
+      "op_family_loose"` — restoring `CREATE OPERATOR FAMILY public.
+      op_family_loose USING btree` + a following `ALTER OPERATOR FAMILY ...
+      ADD OPERATOR 1 ...` into a fresh second database collided with the
+      source database's own copy, because `UserOperatorFamily`/
+      `UserOperatorClass` shared one flat, dbOid-less registry (the same
+      collision shape `AccessMethod`/`Domain`/`UserCollation`/... already
+      fixed). Applied the identical pattern: both structs gained a `DBOid
+      uint32` field; `userOpFamilyKey`/`userOpClassKey` fold in a leading
+      `dbOid` (mirrors `accessMethodKey`, no case-folding change);
+      `RegisterUserOperatorFamily`/`LookupUserOperatorFamily`/
+      `DropUserOperatorFamily` and the operator-class trio gained a trailing
+      variadic `dbOid ...uint32`; `RegisterUserOperatorFamilyDuringRecovery`/
+      `RegisterUserOperatorClassDuringRecovery` normalize a zero `DBOid` to
+      `DefaultDBOid` (WAL carries no dbOid). Threaded through all 9 live
+      `internal/executor/operators_ddl.go` call sites (`execDropCompat`'s
+      family+class branches, `execCompatNoop`'s bare `CREATE OPERATOR
+      FAMILY`, `execCreateOpClass`'s explicit-FAMILY lookup + implicit-family
+      registration + `RegisterUserOperatorClass` call,
+      `execAlterOpFamilyAdd`/`execAlterOpFamilyDrop`,
+      `registerOpClassMembers`'s sort-family lookup) via
+      `catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)`. New
+      `internal/catalog/create_operator_family_class_dbscope_test.go`
+      (`TestOperatorFamilyAndClassCrossDatabaseIsolation`).
+      **Recovery note:** the code fix (catalog.go/operators_ddl.go) was
+      implemented and DU-002-probe-verified in an earlier loop, but was
+      committed by a concurrent interactive session under an unrelated
+      commit message (`728457d9 "tool: add fixing table on markdown tool"`,
+      bundled with an unrelated markdown-table-repair tool) with no test
+      coverage or fix_plan/ledger/design-doc bookkeeping — this loop found
+      the code already on `wal-format-mod`'s tip (confirmed byte-identical
+      via `git show 728457d9:internal/catalog/catalog.go` diffed against
+      HEAD) after that session's `git pull --rebase` (which had left the
+      main tree mid-rebase with unresolved conflicts in
+      `internal/wal/xlog_record.go` for part of this loop's duration —
+      deliberately left untouched, not resolved/aborted, since it belonged
+      to that other session) completed on its own between this loop's
+      earlier and later checks. This loop adds the missing test, ledger row,
+      and design-doc section for the code that was already present.
+      Confirmed via the DU-002 probe: the round-trip's failure point moved
+      past `op_family_loose`'s collision to a NEW, unrelated bug — restoring
+      `CREATE OPERATOR CLASS public.op_class_empty FOR TYPE bigint USING
+      btree FAMILY public.op_family AS STORAGE bigint` before `CREATE
+      OPERATOR FAMILY public.op_family USING btree` has run, because a
+      family-less-member (`STORAGE`-only, no `ADD OPERATOR/FUNCTION`)
+      operator class gets no `pg_depend` row against its owning family, so
+      real pg_dump's dependency-based topological sort has no edge to force
+      family-before-class ordering (recorded in the ledger, not yet fixed —
+      likely `internal/catalog/catalog.go`'s `PGDependRowsForDBOid` needs an
+      unconditional NORMAL dependency row per operator class on its family,
+      mirroring PostgreSQL's own `opclasscmds.c` `DefineOpClass`, which
+      records `recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL)`
+      against the family OID unconditionally, not just for members). Design
+      doc `docs/design/0122-0018-per-database-catalog-namespace.md` new
+      "Operator family / operator class registry" section + status line +
+      README index row. Gates: `go build ./...`/`go vet ./...` clean; `go
+      test ./internal/catalog/... ./internal/executor/... ./internal/wal/...
+      ./internal/initdb/...` PASS; `go test -run
+      TestPort_PgDumpConnectionSetup ./internal/testport/` PASS (soft probe,
+      confirms forward progress via `t.Logf`).
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002). `002_save_fullpage`
       (WD-003) + live `pg_waldump --rmgr=Heap2` round-trip DONE. **Still open:** only
       `001_basic.pl`'s server-dependent tier (per-rmgr/relation/block filtering) —
