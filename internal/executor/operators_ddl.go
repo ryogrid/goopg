@@ -15272,7 +15272,7 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 				// dropped conversion stops round-tripping through pg_dump
 				// (DU-002 slice 399); harmless for the other object types.
 				if objType == "conversion" {
-					if im.DropConversion(s.Names[0].Name, s.Names[0].Schema) && o.ctx.WAL != nil {
+					if im.DropConversion(s.Names[0].Name, s.Names[0].Schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) && o.ctx.WAL != nil {
 						// DU-002 restart-persistence follow-up: mirror the
 						// DROP CAST/TRANSFORM WAL emission so the drop
 						// survives a restart too.
@@ -16394,7 +16394,7 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 			FuncOID:     convFunc.OID,
 			Default:     s.ConvDefault,
 		}
-		if _, err := im.CreateConversion(uc, schema); err != nil {
+		if _, err := im.CreateConversion(uc, schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); err != nil {
 			return &ExecError{Code: "42710", Message: err.Error()}
 		}
 		// DU-002 restart-persistence follow-up (M0119-0004): goopg has no

@@ -2131,6 +2131,15 @@ func (s *Server) wireExtensionRows(ectx *executor.Context, dbName string) {
 			return pc.PGCollationRowsForDBOid(catalog.NamespaceDBOid(ectx.CurrentDatabaseOid))
 		}
 	}
+	// pg_conversion must likewise reflect the connecting database's own
+	// CREATE [DEFAULT] CONVERSION'd conversions, not always DefaultDBOid's.
+	// Mirrors the pg_collation wiring above. M0122-0007 4e follow-up
+	// (DU-002 round-trip probe unblock).
+	if pcv, ok := s.cfg.Catalog.(pgConversionRowLister); ok {
+		ectx.PgConversionRows = func() [][]string {
+			return pcv.PGConversionRowsForDBOid(catalog.NamespaceDBOid(ectx.CurrentDatabaseOid))
+		}
+	}
 }
 
 // pgClassRowLister is implemented by catalog.InMemory to expose a
@@ -2237,6 +2246,13 @@ type pgUserMappingsRowLister interface {
 // above. M0122-0007 4e follow-up (DU-002 round-trip probe unblock).
 type pgCollationRowLister interface {
 	PGCollationRowsForDBOid(dbOid uint32) [][]string
+}
+
+// pgConversionRowLister is implemented by catalog.InMemory to expose a
+// per-database pg_conversion row-set, mirroring pgCollationRowLister above.
+// M0122-0007 4e follow-up (DU-002 round-trip probe unblock).
+type pgConversionRowLister interface {
+	PGConversionRowsForDBOid(dbOid uint32) [][]string
 }
 
 func undoEnumDDLForRollback(connTx *connTxState, cat catalog.Catalog, dbOid uint32) {

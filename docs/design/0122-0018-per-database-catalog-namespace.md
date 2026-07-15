@@ -1,6 +1,6 @@
 # Per-database catalog namespace (M0122-0007 slice 4)
 
-Status: accepted (sub-slices 4a, 4b-i, 4b-ii, 4c, 4d-i, 4d-ii-part-1, and 4d-ii-part-2a landed; 4d-ii-part-2b items 1, 2, and 3 all fully landed; 4e's FK-target-resolution, sequence-ownership, and view-constraint-dependency items all landed; `CREATE DATABASE ... TEMPLATE` bounded validation landed 2026-07-10; the pg_class-under-fresh-database gap (name resolution generically, row enumeration for pg_class specifically) landed 2026-07-10, and the pg_indexes/pg_tables, pg_constraint, pg_index, pg_attrdef/pg_depend, pg_inherits, pg_policy, pg_trigger, pg_rewrite, pg_foreign_table, and pg_sequence row-content follow-ups landed the same day, plus the `oid::regclass`/`'name'::regclass` cast-direction dbOid-scoping gap (follow-up 33) — 2 sibling virtual-table builders (pg_statistic_ext, information_schema.routines/parameters/routine_*_usage) plus pg_sequences/information_schema.sequences (follow-up 34's narrowed remainder) plus the c.foreignServers registry-dbOid-key gap (follow-up 36, landed) and its same-shape c.userMappings sibling (follow-up 37, landed 2026-07-10); follow-up 37's own CURRENT_USER/SESSION_USER/CURRENT_ROLE/USER role-spec resolution discovery closed same-day (follow-up 38); restart durability for user tables created under a distinct-dbOid database — per-database pg_class/pg_attribute heap routing + startup reload into the owning namespace — landed same-day (follow-up 39); the real `CREATE DATABASE ... TEMPLATE` relation-copy mechanism itself landed 2026-07-10 for its bounded plain-table case (follow-up 40), extended the same day to also cover sequences (follow-up 41), plain views (follow-up 42), and materialized views (follow-up 43, including a real `execCreateMatView`/`execRefreshMatView` dbOid-scoping bugfix found along the way) — index/typed-table TEMPLATE copying remains deferred, see "Remaining 4e work" below; the `catalog.Routines` registry (follow-up 44, 2026-07-15), the `catalog.accessMethods` registry (follow-up 45, 2026-07-15), and the `catalog.userOperatorFamilies`/`userOperatorClasses` registries (follow-up 46, 2026-07-15) all landed cross-database isolation, unblocking the DU-002 probe past the function/procedure, access-method, and operator-family/-class collision points respectively — the pg_depend dependency-ordering gap for member-less operator classes also landed same-day (follow-up 47, see the "PGDependRowsForDBOid opclass to opfamily pg_depend edge" section below) — the probe is now blocked on `catalog.userConversions` cross-database isolation, the next flat dbOid-less registry in the audit sequence)
+Status: accepted (sub-slices 4a, 4b-i, 4b-ii, 4c, 4d-i, 4d-ii-part-1, and 4d-ii-part-2a landed; 4d-ii-part-2b items 1, 2, and 3 all fully landed; 4e's FK-target-resolution, sequence-ownership, and view-constraint-dependency items all landed; `CREATE DATABASE ... TEMPLATE` bounded validation landed 2026-07-10; the pg_class-under-fresh-database gap (name resolution generically, row enumeration for pg_class specifically) landed 2026-07-10, and the pg_indexes/pg_tables, pg_constraint, pg_index, pg_attrdef/pg_depend, pg_inherits, pg_policy, pg_trigger, pg_rewrite, pg_foreign_table, and pg_sequence row-content follow-ups landed the same day, plus the `oid::regclass`/`'name'::regclass` cast-direction dbOid-scoping gap (follow-up 33) — 2 sibling virtual-table builders (pg_statistic_ext, information_schema.routines/parameters/routine_*_usage) plus pg_sequences/information_schema.sequences (follow-up 34's narrowed remainder) plus the c.foreignServers registry-dbOid-key gap (follow-up 36, landed) and its same-shape c.userMappings sibling (follow-up 37, landed 2026-07-10); follow-up 37's own CURRENT_USER/SESSION_USER/CURRENT_ROLE/USER role-spec resolution discovery closed same-day (follow-up 38); restart durability for user tables created under a distinct-dbOid database — per-database pg_class/pg_attribute heap routing + startup reload into the owning namespace — landed same-day (follow-up 39); the real `CREATE DATABASE ... TEMPLATE` relation-copy mechanism itself landed 2026-07-10 for its bounded plain-table case (follow-up 40), extended the same day to also cover sequences (follow-up 41), plain views (follow-up 42), and materialized views (follow-up 43, including a real `execCreateMatView`/`execRefreshMatView` dbOid-scoping bugfix found along the way) — index/typed-table TEMPLATE copying remains deferred, see "Remaining 4e work" below; the `catalog.Routines` registry (follow-up 44, 2026-07-15), the `catalog.accessMethods` registry (follow-up 45, 2026-07-15), and the `catalog.userOperatorFamilies`/`userOperatorClasses` registries (follow-up 46, 2026-07-15) all landed cross-database isolation, unblocking the DU-002 probe past the function/procedure, access-method, and operator-family/-class collision points respectively — the pg_depend dependency-ordering gap for member-less operator classes also landed same-day (follow-up 47, see the "PGDependRowsForDBOid opclass to opfamily pg_depend edge" section below); the `catalog.userConversions` registry (follow-up 48, 2026-07-15, see the "Conversion registry (catalog.InMemory.userConversions) dbOid scoping" section below) also landed cross-database isolation, unblocking the DU-002 probe past the conversion-name collision point — the probe is now blocked on a parser gap (`ALTER CONVERSION ... OWNER TO` not a recognized `ALTER` production), the first non-catalog-scoping blocker in this audit sequence)
 Date: 2026-07-10
 Supersedes: none — extends the "Still open" note in
 `0122-0017-database-ddl-drop-guards.md` and the deferral-ledger rows dated
@@ -2596,6 +2596,65 @@ repo, short mode) 0 FAIL; `go test -v -run
 '^TestPort_PgDumpConnectionSetup$' ./internal/testport/` PASS (soft-log
 confirms the advance); `RALPH_PRECOMMIT_SCOPE=smoke bash
 scripts/ralph-precommit-test.sh` PASS.
+
+### Conversion registry (`catalog.InMemory.userConversions`) dbOid scoping — LANDED (2026-07-15)
+
+Closes this section's own recorded resume point: `UserConversion` had no
+`DBOid` field, and `c.userConversions` was one flat, server-wide
+`[]*UserConversion` slice, so a `CREATE CONVERSION public.aliasconv ...`
+restoring into a fresh second database collided with the source database's
+own same-named conversion (`conversion "aliasconv" already exists`).
+
+Applied the identical M0122-0007 4e pattern, mirroring `UserCollation` (same
+slice-of-pointers-with-a-`DBOid`-field shape — `userConversions` stayed a
+slice, unlike the map-keyed registries such as `userOperatorClasses`):
+
+- `UserConversion.DBOid uint32` added.
+- `CreateConversion`/`DropConversion` gained a trailing variadic
+  `dbOid ...uint32` (via `resolveDBOid`), filtering/stamping `DBOid`
+  alongside the existing `NamespaceOID` check.
+- `CreateConversionDuringRecovery` stamps `uc.DBOid = DefaultDBOid` (WAL
+  replay carries no dbOid yet, matching every sibling recovery path's
+  documented convention). `DropConversionDuringRecovery` needed no change —
+  it delegates to `DropConversion(name, schema)` with no dbOid argument,
+  which now correctly resolves to `DefaultDBOid` via the same convention.
+- New `ListUserConversionsForDBOid(dbOid)` (mirrors
+  `ListUserCollationsForDBOid`) and `PGConversionRowsForDBOid(dbOid)` (mirrors
+  `PGCollationRowsForDBOid`, minus a BKI-pinned-builtins prefix — pg_conversion's
+  ~130 built-ins all live in `pg_catalog` and are filtered out at pg_dump
+  dump-out time, unlike pg_collation's 7 dumpable builtin rows) replace the
+  old unfiltered `ListUserConversions()`-backed `pgConversion.VirtualRows`
+  closure.
+- Per-connection wiring added end-to-end, mirroring the pg_collation wiring:
+  `executor.Context.PgConversionRows func() [][]string` (context.go), a
+  `pg_conversion`-named branch in `operators.go`'s virtual-row materializer
+  (the single site serving both the simple and extended query protocols,
+  since both share the same `ectx`), and `dispatch.go`'s
+  `pgConversionRowLister` interface + `wireExtensionRows` wiring.
+- Threaded `catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)` through both
+  live `operators_ddl.go` call sites (`CREATE CONVERSION`, `DROP
+  CONVERSION`).
+- New `internal/catalog/create_conversion_dbscope_test.go`
+  (`TestCreateConversionCrossDatabaseIsolation`, mirrors
+  `TestCreateCollationCrossDatabaseIsolation`).
+
+Confirmed via the DU-002 probe: the round-trip's failure point moved past
+`conversion "aliasconv" already exists` entirely to a NEW, unrelated
+blocker — a parser gap, not a catalog-scoping gap: `ALTER CONVERSION
+public.aliasconv OWNER TO postgres;` fails `syntax error at or near
+"expected keyword table (got conversion)"` — `CONVERSION` is not a
+recognized `ALTER <objtype>` keyword in the parser's grammar. See the
+2026-07-15 deferral-ledger row (task-id `M0122-0007 4e follow-up
+(catalog.userConversions cross-database isolation)`) for the resume point.
+
+Gates: `go build ./...`/`go vet ./...` clean; `go test
+./internal/catalog/... ./internal/initdb/... ./internal/executor/...
+./internal/server/... ./internal/wal/...` PASS; `go test -short $(go list
+./... | grep -v /internal/testport)` (full repo, short mode) 0 FAIL; `go test
+-v -run '^TestPort_PgDumpConnectionSetup$' ./internal/testport/` PASS
+(soft-log confirms the advance to the ALTER CONVERSION blocker);
+`RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh` PASS
+twice (0 failed, all 3 workloads both times).
 
 ## Deferred / explicitly out of scope
 

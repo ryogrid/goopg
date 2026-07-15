@@ -3166,6 +3166,16 @@ type UserConversion struct {
 	// deferral).
 	FuncOID uint32
 	Default bool // condefault (CREATE DEFAULT CONVERSION)
+	// DBOid is the real physical database oid this conversion was CREATE
+	// CONVERSION'd under (mirrors catalog.UserCollation.DBOid). Registry
+	// entries are matched by (DBOid, NamespaceOID, Name), so two distinct
+	// databases may each CREATE CONVERSION a same-named conversion without
+	// colliding. Defaults to DefaultDBOid for every call site that does not
+	// pass an explicit dbOid (resolveDBOid's convention), including WAL
+	// replay (conversion restart-persistence is not yet dbOid-aware — see the
+	// matching deferral ledger row). M0122-0007 4e follow-up (DU-002 round-trip
+	// probe unblock).
+	DBOid uint32
 }
 
 // BuiltinTSTemplateOID maps the fixed real-PG OIDs (pg_ts_template.dat) of the
@@ -10569,46 +10579,12 @@ func (c *InMemory) registerSystemTables() {
 	// pg_enc integer IDs (dumpConversion wraps them in pg_encoding_to_char), and
 	// conproc renders the schema-qualified function name (pg_dump's empty
 	// search_path qualifies the regproc). DU-002 slice 399.
-	pgConversion.VirtualRows = func() [][]string {
-		convs := c.ListUserConversions()
-		if len(convs) == 0 {
-			return nil
-		}
-		out := make([][]string, 0, len(convs))
-		for _, cv := range convs {
-			condefault := "f"
-			if cv.Default {
-				condefault = "t"
-			}
-			conproc := cv.ProcName
-			if cv.ProcSchema != "" {
-				conproc = cv.ProcSchema + "." + cv.ProcName
-			}
-			// Prefer a live FuncOID->pg_proc lookup over the as-written text so a
-			// RENAME on the conversion function after CREATE CONVERSION still
-			// dumps correctly (mirrors regproc output semantics; conproc is a
-			// real OID reference in PG, not captured text). DU-002 slice 403.
-			if cv.FuncOID != 0 && c.routines != nil {
-				if r := c.routines.LookupByOID(cv.FuncOID); r != nil {
-					conproc = r.Name
-					if r.Schema != "" {
-						conproc = r.Schema + "." + r.Name
-					}
-				}
-			}
-			out = append(out, []string{
-				strconv.FormatUint(uint64(cv.OID), 10),          // oid
-				cv.Name,                                          // conname
-				strconv.FormatUint(uint64(cv.NamespaceOID), 10), // connamespace
-				strconv.FormatUint(uint64(cv.Owner), 10),        // conowner
-				strconv.FormatInt(int64(cv.ForEncoding), 10),    // conforencoding
-				strconv.FormatInt(int64(cv.ToEncoding), 10),     // contoencoding
-				conproc,                                          // conproc (regproc text)
-				condefault,                                       // condefault
-			})
-		}
-		return out
-	}
+	// dbOid scoping: M0122-0007 4e follow-up (DU-002 round-trip probe
+	// unblock). registerSystemTables always scopes to DefaultDBOid; a
+	// per-connection dbOid is wired in via executor.Context.PgConversionRows
+	// (internal/server/dispatch.go's wireExtensionRows), mirroring
+	// pg_collation.
+	pgConversion.VirtualRows = func() [][]string { return c.PGConversionRowsForDBOid(DefaultDBOid) }
 	c.ns(DefaultDBOid).tables["pg_catalog.pg_conversion"] = pgConversion
 
 	// pg_range — range-type catalog (OID 3541). After getConversions, pg_dump's
@@ -12648,37 +12624,46 @@ func (c *InMemory) SetCollationSchemaDuringRecovery(name, schema, newSchema stri
 // unknown schema resolves to the public namespace OID. The conversion is keyed
 // by its OID and surfaced as an extra virtual pg_conversion row. Returns the new
 // OID, or 0 with an error if a same-named conversion already exists in the same
-// namespace (PG enforces a unique (conname, connamespace)). DU-002 slice 399.
-func (c *InMemory) CreateConversion(uc *UserConversion, schema string) (uint32, error) {
+// (dbOid, namespace) (PG enforces a unique (conname, connamespace) per
+// database). dbOid is variadic (resolveDBOid's convention, defaulting to
+// DefaultDBOid) so two distinct databases may each CREATE CONVERSION a
+// same-named conversion without colliding — mirrors CreateCollation.
+// DU-002 slice 399; dbOid scoping: M0122-0007 4e follow-up.
+func (c *InMemory) CreateConversion(uc *UserConversion, schema string, dbOid ...uint32) (uint32, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	oid := resolveDBOid(dbOid)
 	nsOID := c.schemas[strings.ToLower(schema)]
 	if nsOID == 0 {
 		nsOID = c.schemas["public"]
 	}
 	for _, existing := range c.userConversions {
-		if existing.NamespaceOID == nsOID && strings.EqualFold(existing.Name, uc.Name) {
+		if existing.DBOid == oid && existing.NamespaceOID == nsOID && strings.EqualFold(existing.Name, uc.Name) {
 			return 0, fmt.Errorf("conversion %q already exists", uc.Name)
 		}
 	}
 	uc.OID = c.allocOIDLocked()
 	uc.NamespaceOID = nsOID
+	uc.DBOid = oid
 	c.userConversions = append(c.userConversions, uc)
 	return uc.OID, nil
 }
 
 // DropConversion removes the user-created conversion with the given bare name in
 // the given schema from the registry. Returns true if one was found and removed.
-// `schema` resolves like CreateConversion (unknown → public). DU-002 slice 399.
-func (c *InMemory) DropConversion(name, schema string) bool {
+// `schema` resolves like CreateConversion (unknown → public). dbOid is variadic,
+// defaulting to DefaultDBOid, mirroring DropCollation. DU-002 slice 399; dbOid
+// scoping: M0122-0007 4e follow-up.
+func (c *InMemory) DropConversion(name, schema string, dbOid ...uint32) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	oid := resolveDBOid(dbOid)
 	nsOID := c.schemas[strings.ToLower(schema)]
 	if nsOID == 0 {
 		nsOID = c.schemas["public"]
 	}
 	for i, uc := range c.userConversions {
-		if uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, name) {
+		if uc.DBOid == oid && uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, name) {
 			c.userConversions = append(c.userConversions[:i], c.userConversions[i+1:]...)
 			return true
 		}
@@ -12702,6 +12687,11 @@ func (c *InMemory) CreateConversionDuringRecovery(uc *UserConversion, schema str
 		nsOID = c.schemas["public"]
 	}
 	uc.NamespaceOID = nsOID
+	// WAL replay does not yet carry a dbOid for conversion records (see the
+	// DBOid field's doc comment) — every replayed conversion lands under
+	// DefaultDBOid, matching every other not-yet-migrated write path's
+	// restart behavior (mirrors CreateCollationDuringRecovery).
+	uc.DBOid = DefaultDBOid
 	for i, existing := range c.userConversions {
 		if existing.OID == uc.OID {
 			c.userConversions[i] = uc
@@ -12737,6 +12727,77 @@ func (c *InMemory) ListUserConversions() []*UserConversion {
 	}
 	out := make([]*UserConversion, len(c.userConversions))
 	copy(out, c.userConversions)
+	return out
+}
+
+// ListUserConversionsForDBOid returns dbOid's own user-created conversions, in
+// creation order. Unlike ListUserConversions (unfiltered), this scopes to one
+// database so pg_dump's getConversions sees only the connecting database's own
+// conversions. Mirrors ListUserCollationsForDBOid. M0122-0007 4e follow-up
+// (DU-002 round-trip probe unblock).
+func (c *InMemory) ListUserConversionsForDBOid(dbOid uint32) []*UserConversion {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(c.userConversions) == 0 {
+		return nil
+	}
+	out := make([]*UserConversion, 0, len(c.userConversions))
+	for _, uc := range c.userConversions {
+		if uc.DBOid == dbOid {
+			out = append(out, uc)
+		}
+	}
+	return out
+}
+
+// PGConversionRowsForDBOid builds the pg_conversion catalog row-set for
+// dbOid's own registered user conversions (built-in conversions all live in
+// pg_catalog and are filtered out at pg_dump dump-out time, so there is no
+// BKI-pinned row-set to prepend here, unlike PGCollationRowsForDBOid).
+// registerSystemTables's VirtualRows calls this with DefaultDBOid so every
+// existing caller (server dispatch without a per-connection PgConversionRows
+// wire-up, every test) sees byte-identical behavior; a per-connection dbOid
+// is wired in via executor.Context.PgConversionRows (internal/server/
+// dispatch.go's wireExtensionRows). Mirrors PGCollationRowsForDBOid.
+// M0122-0007 4e follow-up (DU-002 round-trip probe unblock).
+func (c *InMemory) PGConversionRowsForDBOid(dbOid uint32) [][]string {
+	convs := c.ListUserConversionsForDBOid(dbOid)
+	if len(convs) == 0 {
+		return nil
+	}
+	out := make([][]string, 0, len(convs))
+	for _, cv := range convs {
+		condefault := "f"
+		if cv.Default {
+			condefault = "t"
+		}
+		conproc := cv.ProcName
+		if cv.ProcSchema != "" {
+			conproc = cv.ProcSchema + "." + cv.ProcName
+		}
+		// Prefer a live FuncOID->pg_proc lookup over the as-written text so a
+		// RENAME on the conversion function after CREATE CONVERSION still
+		// dumps correctly (mirrors regproc output semantics; conproc is a
+		// real OID reference in PG, not captured text). DU-002 slice 403.
+		if cv.FuncOID != 0 && c.routines != nil {
+			if r := c.routines.LookupByOID(cv.FuncOID); r != nil {
+				conproc = r.Name
+				if r.Schema != "" {
+					conproc = r.Schema + "." + r.Name
+				}
+			}
+		}
+		out = append(out, []string{
+			strconv.FormatUint(uint64(cv.OID), 10),          // oid
+			cv.Name,                                          // conname
+			strconv.FormatUint(uint64(cv.NamespaceOID), 10), // connamespace
+			strconv.FormatUint(uint64(cv.Owner), 10),        // conowner
+			strconv.FormatInt(int64(cv.ForEncoding), 10),    // conforencoding
+			strconv.FormatInt(int64(cv.ToEncoding), 10),     // contoencoding
+			conproc,                                          // conproc (regproc text)
+			condefault,                                       // condefault
+		})
+	}
 	return out
 }
 

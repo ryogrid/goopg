@@ -4828,26 +4828,55 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       TestPort_PgDumpConnectionSetup ./internal/testport/` PASS (soft probe,
       confirms forward progress via `t.Logf`); `RALPH_PRECOMMIT_SCOPE=smoke
       bash scripts/ralph-precommit-test.sh` PASS.
-- [ ] **M0122-0007 4e follow-up — `catalog.userConversions` cross-database
-      isolation (DU-002 round-trip probe unblock, next resume point).** The
-      DU-002 probe's blocker (see the bullet immediately above) now moves to
-      `conversion "aliasconv" already exists` when restoring into a fresh
-      second database — `UserConversion` (catalog.go ~line 3141) has no
-      `DBOid` field at all and `c.userConversions` (catalog.go ~line 2325) is
-      one flat, server-wide `[]*UserConversion` slice, so a `CREATE
-      CONVERSION public.aliasconv ...` in the restore-target database
-      collides with the source database's own same-named conversion. This is
-      the exact same collision shape the M0122-0007 4e series already fixed
-      for `AccessMethod`/`Domain`/`UserCollation`/`enumTypes`/
-      `compositeTypes`/`RangeType`/`UserOperatorFamily`/`UserOperatorClass` —
-      apply the identical pattern: add `DBOid uint32` to `UserConversion`,
-      fold a leading dbOid into conversion lookups (name+namespace is the
-      natural key, mirroring `userOpFamilyKey`), thread a trailing variadic
-      `dbOid ...uint32` through the register/lookup/drop trio, and update all
-      call sites in `internal/executor` (grep for `RegisterUserConversion`/
-      `LookupUserConversion` first) plus the WAL-recovery registration path
-      (normalize to `DefaultDBOid`, mirroring
-      `RegisterUserOperatorFamilyDuringRecovery`). Verify via
+- [x] **M0122-0007 4e follow-up — `catalog.userConversions` cross-database
+      isolation (DU-002 round-trip probe unblock).** Applied the identical
+      M0122-0007 4e pattern to `UserConversion`, mirroring `UserCollation`
+      (slice-of-pointers + `DBOid` field, not a map): added
+      `UserConversion.DBOid uint32`; `CreateConversion`/`DropConversion`
+      gained a trailing variadic `dbOid ...uint32`; `CreateConversionDuringRecovery`
+      stamps `DefaultDBOid` (WAL replay carries no dbOid yet). New
+      `ListUserConversionsForDBOid`/`PGConversionRowsForDBOid` (mirror the
+      collation pair) replace the old unfiltered `ListUserConversions()`-backed
+      `pgConversion.VirtualRows` closure. Per-connection wiring added
+      end-to-end: `executor.Context.PgConversionRows`, a `pg_conversion`
+      branch in `operators.go`'s virtual-row materializer, and
+      `dispatch.go`'s `pgConversionRowLister` + `wireExtensionRows` wiring
+      (mirrors `pgCollationRowLister`). Threaded
+      `catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)` through both
+      `operators_ddl.go` call sites (CREATE/DROP CONVERSION). New
+      `internal/catalog/create_conversion_dbscope_test.go`
+      (`TestCreateConversionCrossDatabaseIsolation`). Confirmed via a live
+      re-run of `TestPort_PgDumpConnectionSetup`: the DU-002 probe's failure
+      point moved past `conversion "aliasconv" already exists` entirely to a
+      NEW, unrelated blocker — a parser gap, `ALTER CONVERSION ... OWNER TO`
+      is not a recognized `ALTER` production (see the new bullet immediately
+      below and the matching deferral-ledger row). Gates: `go build ./...`/
+      `go vet ./...` clean; `go test ./internal/catalog/... ./internal/initdb/...
+      ./internal/executor/... ./internal/server/... ./internal/wal/...` PASS;
+      `go test -short $(go list ./... | grep -v /internal/testport)` (full
+      repo, short mode) 0 FAIL; `go test -v -run
+      '^TestPort_PgDumpConnectionSetup$' ./internal/testport/` PASS (soft
+      probe, confirms forward progress); `RALPH_PRECOMMIT_SCOPE=smoke bash
+      scripts/ralph-precommit-test.sh` PASS twice (0 failed, all 3 workloads
+      both times).
+- [ ] **M0122-0007 4e follow-up — parser gap: `ALTER CONVERSION <name> OWNER
+      TO <role>` not a recognized `ALTER` production (DU-002 round-trip probe
+      unblock, next resume point).** The DU-002 probe's blocker (see the
+      bullet immediately above) now moves to a parser error —
+      `ALTER CONVERSION public.aliasconv OWNER TO postgres;` fails `syntax
+      error at or near "expected keyword table (got conversion)"` — a
+      materially different mechanism (parser grammar coverage, not catalog
+      per-database key collision) from every prior bullet in this series.
+      Grep the parser's `ALTER FUNCTION`/`ALTER COLLATION` OWNER-TO
+      productions as the sibling precedent (both parse today, since the probe
+      reached this far), add an `ALTER CONVERSION <name> OWNER TO <role>`
+      production (check pg_dump's `dumpConversion` in
+      `postgres/src/bin/pg_dump/pg_dump.c` for which other ALTER forms it
+      emits — RENAME TO / SET SCHEMA — before broadening scope), then wire
+      the executor side: `catalog.InMemory` needs
+      `SetConversionOwner`/`RenameConversion`/`SetConversionSchema` mirroring
+      the `UserCollation` trio (`SetCollationOwner`/`RenameCollation`/
+      `SetCollationSchema`, catalog.go ~12493-12573). Verify via
       `TestPort_PgDumpConnectionSetup`'s DU-002 soft probe — expect the
       blocker to advance past `aliasconv` to whatever flat-registry object
       the dump restores next.
