@@ -107,6 +107,12 @@ type connTxState struct {
 	// tx.  On ROLLBACK, created composite types are dropped.
 	// map[name(lowercase)]=true.  DU-002 slice 244.
 	PendingCreatedComposites map[string]bool
+	// PendingCreatedRangeTypes tracks CREATE TYPE … AS RANGE within the
+	// current tx.  On ROLLBACK, created range types are dropped.  Mirrors
+	// PendingCreatedComposites — range types had no undo tracking at all
+	// until this field was added.  map[name(lowercase)]=true.  M0122-0007 4e
+	// follow-up (fifth loop).
+	PendingCreatedRangeTypes map[string]bool
 	// NonSuperuserRole is set when SET SESSION AUTHORIZATION is called with a
 	// non-default role name. While non-empty, privilege checks that require
 	// superuser (e.g. LEAKPROOF function attribute) are rejected. Cleared by
@@ -468,6 +474,7 @@ func (c *connTxState) End() {
 	c.PendingEnumRenames = nil
 	c.PendingCreatedEnums = nil
 	c.PendingCreatedComposites = nil
+	c.PendingCreatedRangeTypes = nil
 	// Restore a pending SET LOCAL ROLE / SET LOCAL SESSION AUTHORIZATION to
 	// its pre-transaction value on both COMMIT and ROLLBACK — see
 	// SnapshotLocalRoleIfNeeded. Mirrors PendingEnumValues et al.: cleared
@@ -548,6 +555,7 @@ func (c *connTxState) DetachPrepared(gid string, newTx mvcc.Transaction) *connTx
 		PendingEnumRenames:       c.PendingEnumRenames,
 		PendingCreatedEnums:      c.PendingCreatedEnums,
 		PendingCreatedComposites: c.PendingCreatedComposites,
+		PendingCreatedRangeTypes: c.PendingCreatedRangeTypes,
 		pendingNotify:            c.pendingNotify,
 	}
 	// Reset the live connection to free/auto-commit, keeping the per-connection
@@ -561,6 +569,7 @@ func (c *connTxState) DetachPrepared(gid string, newTx mvcc.Transaction) *connTx
 	c.PendingEnumRenames = nil
 	c.PendingCreatedEnums = nil
 	c.PendingCreatedComposites = nil
+	c.PendingCreatedRangeTypes = nil
 	c.pendingNotify = nil
 	return p
 }

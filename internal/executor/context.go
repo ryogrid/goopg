@@ -327,6 +327,13 @@ type Context struct {
 	// PendingCreatedEnums).  map[compositeTypeName(lowercase)]=true.
 	// DU-002 slice 244.
 	PendingCreatedComposites map[string]bool
+	// PendingCreatedRangeTypes tracks range types created via CREATE TYPE …
+	// AS RANGE within the current explicit transaction.  On ROLLBACK,
+	// created types are dropped from the catalog so they do not outlive the
+	// aborted transaction (mirrors PendingCreatedComposites; range types had
+	// no undo tracking at all until this field was added).
+	// map[rangeTypeName(lowercase)]=true.  M0122-0007 4e follow-up.
+	PendingCreatedRangeTypes map[string]bool
 
 	// WAL exposes the cluster's WAL writer so execCommit can read the
 	// WrittenLSN after a local flush to bound the SyncRep wait. nil

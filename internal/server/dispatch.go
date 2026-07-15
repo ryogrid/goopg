@@ -335,6 +335,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		ectx.PendingEnumRenames = connTx.PendingEnumRenames
 		ectx.PendingCreatedEnums = connTx.PendingCreatedEnums
 		ectx.PendingCreatedComposites = connTx.PendingCreatedComposites
+		ectx.PendingCreatedRangeTypes = connTx.PendingCreatedRangeTypes
 		// Wire session-authorization role tracking so LEAKPROOF privilege checks
 		// work after SET SESSION AUTHORIZATION regress_unpriv_user.
 		ectx.NonSuperuserRole = connTx.NonSuperuserRole
@@ -1025,6 +1026,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 			connTx.PendingEnumRenames = ectx.PendingEnumRenames
 			connTx.PendingCreatedEnums = ectx.PendingCreatedEnums
 			connTx.PendingCreatedComposites = ectx.PendingCreatedComposites
+			connTx.PendingCreatedRangeTypes = ectx.PendingCreatedRangeTypes
 		}
 		// Keep the savepoint-aware NOTIFY buffer in sync with the just-executed
 		// savepoint command so a later ROLLBACK TO SAVEPOINT discards the
@@ -2275,6 +2277,12 @@ func undoEnumDDLForRollback(connTx *connTxState, cat catalog.Catalog, dbOid uint
 	for name := range connTx.PendingCreatedComposites {
 		_ = inm.DropCompositeType(name, dbOid)
 	}
+	// Step 5: Drop range types created via CREATE TYPE … AS RANGE in this
+	// transaction.  Mirrors undoEnumDDLFromContext step 5.  M0122-0007 4e
+	// follow-up (fifth loop).
+	for name := range connTx.PendingCreatedRangeTypes {
+		_ = inm.DropRangeType(name, dbOid)
+	}
 }
 
 // autoCommitPtr, if non-nil, is set to false when a BEGIN starts an
@@ -2414,6 +2422,7 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 					ctx.PendingEnumRenames = nil
 					ctx.PendingCreatedEnums = nil
 					ctx.PendingCreatedComposites = nil
+					ctx.PendingCreatedRangeTypes = nil
 					return w.WriteCommandComplete("ROLLBACK")
 				}
 				explicitTx := connTx.Tx()
@@ -2454,6 +2463,7 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 						ctx.PendingEnumRenames = nil
 						ctx.PendingCreatedEnums = nil
 						ctx.PendingCreatedComposites = nil
+						ctx.PendingCreatedRangeTypes = nil
 						code := sqlstate.ForeignKeyViolation
 						var fields []protocol.ErrorField
 						if ee, ok := deferErr.(*executor.ExecError); ok {
@@ -2489,6 +2499,7 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 						ctx.PendingEnumRenames = nil
 						ctx.PendingCreatedEnums = nil
 						ctx.PendingCreatedComposites = nil
+						ctx.PendingCreatedRangeTypes = nil
 						// Primary message is the bare upstream errmsg; the reason
 						// code rides in DETAIL (predicate.c parity). isolationtester
 						// and psql print only the errmsg line.
@@ -2533,6 +2544,7 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 					ctx.PendingEnumRenames = nil
 					ctx.PendingCreatedEnums = nil
 					ctx.PendingCreatedComposites = nil
+					ctx.PendingCreatedRangeTypes = nil
 					return s.writeQueryError(w, sqlstate.SystemError, err.Error())
 				}
 				// Publish NOTIFYs buffered by this explicit transaction now that it
@@ -2548,6 +2560,7 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 				ctx.PendingEnumRenames = nil
 				ctx.PendingCreatedEnums = nil
 				ctx.PendingCreatedComposites = nil
+				ctx.PendingCreatedRangeTypes = nil
 				maybeForceGCAfterCommit()
 				// Leave *autoCommitPtr = false so the caller does NOT attempt
 				// a second TxnMgr.Commit on the already-committed transaction.
@@ -2578,6 +2591,7 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 				ctx.PendingEnumRenames = nil
 				ctx.PendingCreatedEnums = nil
 				ctx.PendingCreatedComposites = nil
+				ctx.PendingCreatedRangeTypes = nil
 				// Leave *autoCommitPtr = false to avoid a second rollback attempt.
 			} else {
 				// ROLLBACK outside an explicit transaction: emit warning.

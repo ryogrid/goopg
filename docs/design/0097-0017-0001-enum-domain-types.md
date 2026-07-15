@@ -375,3 +375,59 @@ for all three type kinds, not newly introduced by this fix. The ~15
 remaining read-only `LookupCompositeType`/`LookupCompositeTypeFields` call
 sites are not dbOid-threaded, matching the enum follow-up's identical
 resume-point scope.
+
+## Follow-up (2026-07-15, fifth loop): range-type ROLLBACK-undo tracking
+
+The fourth loop above (range-type per-database isolation) grepped
+`operators_tx.go`/`dispatch.go` for a range-type ROLLBACK-undo sibling and
+confirmed there was none: `CREATE TYPE ... AS RANGE` had no rollback-undo
+tracking at all, unlike enums (`PendingCreatedEnums`) and composite types
+(`PendingCreatedComposites`), which both drop their in-transaction creations
+on ROLLBACK via `undoEnumDDLFromContext`. This left a real correctness gap —
+`BEGIN; CREATE TYPE ival AS RANGE (subtype = int4); ROLLBACK;` left `ival`
+registered in the catalog after the abort, unlike its enum/composite
+siblings.
+
+Fixed by mirroring `PendingCreatedComposites` exactly: a new
+`Context.PendingCreatedRangeTypes map[string]bool` field
+(`internal/executor/context.go`); `execCreateType`'s `AS RANGE` branch now
+records `strings.ToLower(s.Name)` into it when
+`o.ctx.Session.TracksDDLUndo()` (`internal/executor/operators_ddl.go`, same
+guard as the composite/enum branches — covers both an explicit transaction
+and a message-scoped autocommit batch per root-0024); `undoEnumDDLFromContext`
+gained a Step 5 that calls `inm.DropRangeType(name, ctx.CurrentDatabaseOid)`
+for every name in the set, run alongside (not instead of) Step 4's composite
+drop (`internal/executor/operators_tx.go`); `execCommit` clears the new field
+to nil alongside its enum/composite siblings so a later statement's abort
+doesn't see stale entries.
+
+This series has repeatedly burned a loop by forgetting that `internal/executor`'s
+`undoEnumDDLFromContext` (driven by `execRollback`) is only ONE of two
+independent undo paths — `internal/server/dispatch.go`'s
+`undoEnumDDLForRollback` is a structurally identical but separately
+maintained twin that reverses `connTxState`'s `Pending*` fields for the
+simple-query/autocommit dispatch path (`pattern_sibling_paths_must_agree`).
+Grepping confirmed `PendingCreatedComposites` is wired through `connTxState`
+(`internal/server/conn_tx.go`: struct field + both reset sites in `End()`/
+`DetachPrepared` + the `DetachPrepared` copy) and `dispatch.go` (the
+ectx↔connTx write-back pair in `executeOneSimpleStmt`, `undoEnumDDLForRollback`'s
+own Step 4, and 6 separate `ctx.PendingCreatedComposites = nil` reset sites
+across the ROLLBACK/COMMIT-failure branches) and `twophase.go` (2 reset sites
++ the prepared-xact-holder retarget in `execFinalizePrepared`). All of these
+gained a `PendingCreatedRangeTypes` counterpart in this same loop — the fix
+would have been incomplete (silently working only for `BEGIN;
+ROLLBACK;`-style explicit transactions through the extended-query path, not
+simple-query autocommit batches or 2PC) without this twin.
+
+Scope note: like composite types (and unlike enums), range types get no
+`ALTER TYPE ... RENAME TO` undo tracking — `execAlterType`'s range-dispatch
+RENAME TO branch does not push onto `PendingCreatedRangeTypes` or an
+equivalent rename-undo list, matching the pre-existing composite-type
+behavior exactly (composite types have no `PendingCompositeRenames`
+analogue either). This is a deliberate mirror of the composite-type gap, not
+a new independent one; it stays open per the same resume-point convention if
+someone later wires `ALTER TYPE ... AS (...)` rename-undo for composites.
+
+New `internal/executor/operators_tx_range_type_test.go`
+(`TestUndoRangeTypeDDLOnRollback`/`TestUndoRangeTypeDDLCaseInsensitive`),
+mirroring `operators_tx_composite_test.go`'s two tests exactly.

@@ -202,6 +202,7 @@ func (s *Server) execPrepareTransaction(w *protocol.FrameWriter, ctx *executor.C
 		ctx.PendingEnumRenames = nil
 		ctx.PendingCreatedEnums = nil
 		ctx.PendingCreatedComposites = nil
+		ctx.PendingCreatedRangeTypes = nil
 	}
 	// Leave *autoCommitPtr = false: the originating transaction now lives on its
 	// dedicated slot (owned by the registry), so the dispatch end must NOT commit
@@ -232,6 +233,7 @@ func (s *Server) abortForPrepareSSIFailure(w *protocol.FrameWriter, ctx *executo
 		ctx.PendingEnumRenames = nil
 		ctx.PendingCreatedEnums = nil
 		ctx.PendingCreatedComposites = nil
+		ctx.PendingCreatedRangeTypes = nil
 	}
 	var ssiFields []protocol.ErrorField
 	if sfe, ok := ssiErr.(*mvcc.SerializationFailureError); ok {
@@ -285,6 +287,7 @@ func (s *Server) execFinalizePrepared(w *protocol.FrameWriter, ctx *executor.Con
 	ctx.PendingEnumRenames = px.PendingEnumRenames
 	ctx.PendingCreatedEnums = px.PendingCreatedEnums
 	ctx.PendingCreatedComposites = px.PendingCreatedComposites
+	ctx.PendingCreatedRangeTypes = px.PendingCreatedRangeTypes
 	ctx.TxnLockBackendID = px.LockBackendID
 	// The parked holder owns its own session/lock lifecycle via px.End() inside
 	// the canonical finalise path; the originating connection's SET LOCAL scope

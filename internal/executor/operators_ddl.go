@@ -18589,6 +18589,15 @@ func (o *ddlOp) execCreateType(s *parser.CreateTypeStmt) error {
 			}
 			rt.Owner = o.currentDDLOwnerOID()
 			syncRangeTypeToCatalogHeap(o.ctx, rt)
+			// Track range type creation so ROLLBACK can drop it (mirrors the
+			// composite-type branch above; range types previously had no
+			// undo tracking at all). M0122-0007 4e follow-up.
+			if o.ctx.Session != nil && o.ctx.Session.TracksDDLUndo() {
+				if o.ctx.PendingCreatedRangeTypes == nil {
+					o.ctx.PendingCreatedRangeTypes = make(map[string]bool)
+				}
+				o.ctx.PendingCreatedRangeTypes[strings.ToLower(s.Name)] = true
+			}
 			// DU-002 restart-persistence follow-up (M0110-0001, DU-002 slice
 			// 429 ledger resume point, sub-item (c)): mirrors CREATE ACCESS
 			// METHOD.

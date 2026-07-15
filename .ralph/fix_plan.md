@@ -4305,6 +4305,53 @@ survey the deferral ledger for a fresh open (`status = -`) row.
       (0 failed, all 3 workloads). This closes the M0122-0007 4e type-
       isolation audit's sibling-map sweep: domains, userCollations,
       enumTypes, compositeTypes, and rangeTypes are all now dbOid-isolated.
+- [x] **M0122-0007 4e follow-up — range-type ROLLBACK-undo tracking (resume
+      point (4) from the range-type isolation item above; closes it).**
+      `CREATE TYPE ... AS RANGE` had NO rollback-undo tracking at all — a
+      real correctness gap: `BEGIN; CREATE TYPE ival AS RANGE (subtype =
+      int4); ROLLBACK;` left `ival` registered in the catalog after the
+      abort, unlike its enum (`PendingCreatedEnums`) and composite
+      (`PendingCreatedComposites`) siblings which both drop their
+      in-transaction creations via `undoEnumDDLFromContext`. Fixed by
+      mirroring `PendingCreatedComposites` exactly: new
+      `Context.PendingCreatedRangeTypes map[string]bool`
+      (`internal/executor/context.go`); `execCreateType`'s `AS RANGE` branch
+      records the created name when `o.ctx.Session.TracksDDLUndo()`
+      (`internal/executor/operators_ddl.go`); `undoEnumDDLFromContext` gained
+      a Step 5 dropping every pending range type via
+      `DropRangeType(name, ctx.CurrentDatabaseOid)`
+      (`internal/executor/operators_tx.go`); `execCommit` clears the field
+      alongside its siblings. Also fixed the independent twin path in
+      `internal/server` — found by this series' own "grep before touching"
+      discipline, not initially planned for: `connTxState` gained the same
+      field (`conn_tx.go`: struct decl + `End()`/`DetachPrepared` reset +
+      copy sites); `dispatch.go`'s ectx↔connTx write-back pair in
+      `executeOneSimpleStmt`, `undoEnumDDLForRollback`'s new Step 5, and 6
+      `ctx.PendingCreatedComposites = nil`-adjacent reset sites across
+      ROLLBACK/COMMIT-failure branches; `twophase.go`'s 2 reset sites plus
+      the prepared-xact-holder retarget in `execFinalizePrepared` — without
+      this twin the fix would have silently worked only for the
+      extended-query explicit-transaction path, not simple-query autocommit
+      batches or 2PC (`pattern_sibling_paths_must_agree`). New
+      `internal/executor/operators_tx_range_type_test.go`
+      (`TestUndoRangeTypeDDLOnRollback`/`TestUndoRangeTypeDDLCaseInsensitive`),
+      mirroring `operators_tx_composite_test.go`. Scope note: `ALTER TYPE ...
+      RENAME TO` still has no rename-undo tracking for range types (nor for
+      composite types — a pre-existing, deliberate scope match, not a new
+      gap); recorded in the deferral ledger. Design doc
+      `docs/design/0097-0017-0001-enum-domain-types.md`'s new "Follow-up
+      (2026-07-15, fifth loop)" section + README index row updated. Gates:
+      `go build ./...`/`go vet ./...` clean (repo-wide); `go test -count=1
+      ./internal/catalog/... ./internal/executor/... ./internal/server/...
+      ./internal/planner/... ./internal/initdb/... ./internal/wal/...` PASS;
+      `go test -short` full repo (excl. testport) — 2 unrelated flaky
+      failures on first pass (`internal/wal`'s
+      `TestReserveEmittedAndPublishConcurrentChainAndStripePublishConsistent`,
+      `internal/stats`'s `TestCounter_PerShardWriteDistribution`, both
+      timing/scheduling-sensitive and untouched by this diff), both PASS
+      clean in isolated re-runs (3x for the stats one); `scripts/tpch-
+      spotcheck.sh` PASS (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke bash
+      scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 workloads).
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 

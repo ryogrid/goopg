@@ -384,6 +384,7 @@ func (o *transactionOp) clearCtxTransaction() {
 	o.ctx.PendingEnumRenames = nil
 	o.ctx.PendingCreatedEnums = nil
 	o.ctx.PendingCreatedComposites = nil
+	o.ctx.PendingCreatedRangeTypes = nil
 }
 
 // UndoEnumDDLOnAbort reverses enum/composite-type DDL (CREATE TYPE ... AS
@@ -436,6 +437,16 @@ func undoEnumDDLFromContext(ctx *Context) {
 	// what makes the aborted composite disappear.  DU-002 slice 244.
 	for name := range ctx.PendingCreatedComposites {
 		_ = inm.DropCompositeType(name, ctx.CurrentDatabaseOid)
+	}
+	// Step 5: Drop range types created via CREATE TYPE … AS RANGE in this
+	// transaction. Their pg_type heap row (typtype='r', plus the
+	// auto-generated multirange typtype='m') carries the aborting XID
+	// (MVCC-invisible post-rollback); removing the in-memory registration is
+	// what makes the aborted range type disappear from LookupRangeType and
+	// the virtual pg_class builder. Range types had no rollback-undo
+	// tracking at all until this step was added. M0122-0007 4e follow-up.
+	for name := range ctx.PendingCreatedRangeTypes {
+		_ = inm.DropRangeType(name, ctx.CurrentDatabaseOid)
 	}
 }
 
