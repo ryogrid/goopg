@@ -4588,42 +4588,7 @@ func (p *parser) parseColumnType() (ColumnType, error) {
 		ct.Schema = ct.Name
 		ct.Name = identText(second)
 	} else {
-		// Handle multi-word type names: double precision, character varying,
-		// timestamp/time with/without time zone, bit varying, etc.
-		switch strings.ToLower(ct.Name) {
-		case "double":
-			if p.acceptIdentKeyword("precision") {
-				ct.Name = "float8"
-			}
-		case "character":
-			if p.acceptIdentKeyword("varying") {
-				ct.Name = "varchar"
-			}
-		case "bit":
-			if p.acceptIdentKeyword("varying") {
-				ct.Name = "varbit"
-			}
-		case "timestamp":
-			if p.acceptKeyword(KwWith) {
-				p.acceptIdentKeyword("time")
-				p.acceptIdentKeyword("zone")
-				ct.Name = "timestamptz"
-			} else if p.acceptIdentKeyword("without") {
-				p.acceptIdentKeyword("time")
-				p.acceptIdentKeyword("zone")
-				ct.Name = "timestamp"
-			}
-		case "time":
-			if p.acceptKeyword(KwWith) {
-				p.acceptIdentKeyword("time")
-				p.acceptIdentKeyword("zone")
-				ct.Name = "timetz"
-			} else if p.acceptIdentKeyword("without") {
-				p.acceptIdentKeyword("time")
-				p.acceptIdentKeyword("zone")
-				ct.Name = "time"
-			}
-		}
+		ct.Name = p.parseMultiWordTypeName(ct.Name)
 	}
 	if p.acceptSymbol("(") {
 		for {
@@ -4649,28 +4614,7 @@ func (p *parser) parseColumnType() (ColumnType, error) {
 	// Handle "time(N) with/without time zone" and "timestamp(N) with/without time zone"
 	// where the timezone qualifier follows the typmod parentheses.
 	if len(ct.Args) > 0 {
-		switch strings.ToLower(ct.Name) {
-		case "time":
-			if p.acceptKeyword(KwWith) {
-				p.acceptIdentKeyword("time")
-				p.acceptIdentKeyword("zone")
-				ct.Name = "timetz"
-			} else if p.acceptIdentKeyword("without") {
-				p.acceptIdentKeyword("time")
-				p.acceptIdentKeyword("zone")
-				ct.Name = "time"
-			}
-		case "timestamp":
-			if p.acceptKeyword(KwWith) {
-				p.acceptIdentKeyword("time")
-				p.acceptIdentKeyword("zone")
-				ct.Name = "timestamptz"
-			} else if p.acceptIdentKeyword("without") {
-				p.acceptIdentKeyword("time")
-				p.acceptIdentKeyword("zone")
-				ct.Name = "timestamp"
-			}
-		}
+		ct.Name = p.parseTimeZoneQualifierAfterArgs(ct.Name)
 	}
 	if first.Kind != TokenQuotedIdent && strings.EqualFold(ct.Name, "char") && len(ct.Args) == 0 {
 		ct.Args = []int64{1}
@@ -4683,6 +4627,83 @@ func (p *parser) parseColumnType() (ColumnType, error) {
 		ct.IsArray = true
 	}
 	return ct, nil
+}
+
+// parseMultiWordTypeName consumes the trailing keywords of a multi-word
+// built-in type name (double precision, character varying, bit varying,
+// timestamp/time [with|without time zone]) that follows an already-parsed
+// leading identifier, returning the canonical short type name. If nothing
+// matches, leading is returned unchanged and no tokens are consumed. Shared
+// by parseColumnType (CREATE TABLE column types) and parseCreateDomain
+// (CREATE DOMAIN's AS base_type clause) so both accept the same spellings
+// pg_dump emits.
+func (p *parser) parseMultiWordTypeName(leading string) string {
+	switch strings.ToLower(leading) {
+	case "double":
+		if p.acceptIdentKeyword("precision") {
+			return "float8"
+		}
+	case "character":
+		if p.acceptIdentKeyword("varying") {
+			return "varchar"
+		}
+	case "bit":
+		if p.acceptIdentKeyword("varying") {
+			return "varbit"
+		}
+	case "timestamp":
+		if p.acceptKeyword(KwWith) {
+			p.acceptIdentKeyword("time")
+			p.acceptIdentKeyword("zone")
+			return "timestamptz"
+		} else if p.acceptIdentKeyword("without") {
+			p.acceptIdentKeyword("time")
+			p.acceptIdentKeyword("zone")
+			return "timestamp"
+		}
+	case "time":
+		if p.acceptKeyword(KwWith) {
+			p.acceptIdentKeyword("time")
+			p.acceptIdentKeyword("zone")
+			return "timetz"
+		} else if p.acceptIdentKeyword("without") {
+			p.acceptIdentKeyword("time")
+			p.acceptIdentKeyword("zone")
+			return "time"
+		}
+	}
+	return leading
+}
+
+// parseTimeZoneQualifierAfterArgs consumes an optional WITH/WITHOUT TIME ZONE
+// qualifier that follows the typmod parens, for "time(N) with/without time
+// zone" / "timestamp(N) with/without time zone" (the qualifier trails the
+// parens rather than the bare type name in this form). Shared by
+// parseColumnType and parseCreateDomain.
+func (p *parser) parseTimeZoneQualifierAfterArgs(name string) string {
+	switch strings.ToLower(name) {
+	case "time":
+		if p.acceptKeyword(KwWith) {
+			p.acceptIdentKeyword("time")
+			p.acceptIdentKeyword("zone")
+			return "timetz"
+		} else if p.acceptIdentKeyword("without") {
+			p.acceptIdentKeyword("time")
+			p.acceptIdentKeyword("zone")
+			return "time"
+		}
+	case "timestamp":
+		if p.acceptKeyword(KwWith) {
+			p.acceptIdentKeyword("time")
+			p.acceptIdentKeyword("zone")
+			return "timestamptz"
+		} else if p.acceptIdentKeyword("without") {
+			p.acceptIdentKeyword("time")
+			p.acceptIdentKeyword("zone")
+			return "timestamp"
+		}
+	}
+	return name
 }
 
 // parseFKAction reads the referential action keyword from the current
@@ -9920,7 +9941,10 @@ func (p *parser) parseCreateDomain(pos int) (Stmt, error) {
 	stmt := &CreateDomainStmt{pos: pos, Name: name.Name, Schema: name.Schema}
 	// Optional AS.
 	_ = p.acceptKeyword(KwAs)
-	// Base type name (may be schema-qualified).
+	// Base type name (may be schema-qualified, or a multi-word built-in type
+	// like "double precision"/"character varying"/"timestamp with time zone" —
+	// mirrors parseColumnType's CREATE TABLE column-type grammar so CREATE
+	// DOMAIN's AS clause accepts the same type spellings pg_dump emits).
 	baseTypeName, err := p.parseObjectName()
 	if err != nil {
 		return nil, err
@@ -9928,6 +9952,8 @@ func (p *parser) parseCreateDomain(pos int) (Stmt, error) {
 	stmt.BaseType = baseTypeName.Name
 	if baseTypeName.Schema != "" {
 		stmt.BaseType = baseTypeName.Schema + "." + baseTypeName.Name
+	} else {
+		stmt.BaseType = p.parseMultiWordTypeName(stmt.BaseType)
 	}
 	// Capture optional type-modifier arguments like (20) or (10,2) so the
 	// domain's base type round-trips through pg_dump with its declared length/
@@ -9955,6 +9981,11 @@ func (p *parser) parseCreateDomain(pos int) (Stmt, error) {
 			}
 			break
 		}
+	}
+	// Handle "time(N) with/without time zone" and "timestamp(N) with/without
+	// time zone" where the timezone qualifier follows the typmod parens.
+	if len(stmt.BaseTypeArgs) > 0 {
+		stmt.BaseType = p.parseTimeZoneQualifierAfterArgs(stmt.BaseType)
 	}
 	// Accept array notation: int[], text[], etc. Append [] to the base type
 	// name and skip any dimension expressions like [N]. M0097-0065.

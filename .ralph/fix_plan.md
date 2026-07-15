@@ -4104,6 +4104,47 @@ survey the deferral ledger for a fresh open (`status = -`) row.
       to this loop's catalog/executor diff — retry passed clean). Next
       candidate: the `CREATE DOMAIN ... AS double precision` parser gap the
       probe now hits — a grammar fix, not another sibling-map audit.
+- [x] **M0122-0007 4e follow-up — `CREATE DOMAIN`'s `AS` base_type now accepts
+      multi-word built-in type names (resume point from the item above: the
+      DU-002 probe hit a parser syntax error on `CREATE DOMAIN public.f8_in AS
+      double precision`).** `parseCreateDomain` used bare `parseObjectName()`
+      for the base type, which only handles `schema.name` — it never consumed
+      the trailing keywords of PG's multi-word type spellings. `parseColumnType`
+      (CREATE TABLE's column-type grammar) already had this logic
+      (`double precision`→`float8`, `character/bit varying`→`varchar`/
+      `varbit`, `timestamp`/`time [with|without time zone]`, plus the
+      typmod-trailing `time(N) with time zone` form), so it was factored into
+      two shared helpers — `parser.parseMultiWordTypeName` (pre-typmod-args
+      keywords) and `parser.parseTimeZoneQualifierAfterArgs` (post-typmod-args
+      `time(N)`/`timestamp(N) with/without time zone`) — and `parseCreateDomain`
+      now calls both (only when the base type isn't schema-qualified, mirroring
+      `parseColumnType`'s own schema-qualified branch). `parseColumnType`'s own
+      behavior is unchanged. New tests: 8 multi-word cases appended to
+      `TestM0097_0017_EnumDomainParsing` + new
+      `TestCreateDomainMultiWordBaseType` asserting `BaseType`/`BaseTypeArgs`
+      for each form incl. an array suffix (`internal/parser/m0097_0017_test.go`).
+      Confirmed via the DU-002 probe: it now parses the `double precision`
+      domain and moves past it to a *different*, already-logged-as-expected
+      failure (`type "gtype" already exists` — a `CREATE TYPE` cross-database
+      catalog-isolation gap, same collision class as the domains/userCollations
+      fixes above but for `CREATE TYPE`'s user-defined-type registry; not
+      investigated this loop, recorded as the next candidate in the ledger).
+      Design doc `docs/design/0097-0017-0001-enum-domain-types.md`'s new
+      "Follow-up (2026-07-15)" section + README index row updated (this is a
+      parser-grammar fix, a different mechanism from the
+      per-database-catalog-namespace epic in doc 0122-0018, so it landed in
+      the original CREATE DOMAIN grammar doc instead). Gates: `go build
+      ./...`/`go vet ./...` clean; `go test ./internal/parser/...
+      ./internal/catalog/... ./internal/executor/... ./internal/wal/...
+      ./internal/initdb/...` PASS; `go test -short` full repo (excl. testport,
+      52 packages) PASS, 0 FAIL; `go test -v -run
+      '^TestPort_PgDumpConnectionSetup$' ./internal/testport/` PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh` PASS
+      (0 failed, all 3 workloads). Next candidate: `catalog.InMemory`'s
+      user-defined-type registry (`CREATE TYPE ... AS ENUM`/`AS (...)`) likely
+      needs the same DBOid-fold-into-key treatment as `domains`/
+      `userCollations` — audit its map shape first.
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 

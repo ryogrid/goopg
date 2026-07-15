@@ -103,3 +103,44 @@ datum. If the type name is a known domain, recurse with the base type.
 | `internal/planner/planner.go` | Route new stmt types through DDL |
 | `internal/executor/operators_ddl.go` | execCreateType, execAlterType, execDropType, execCreateDomain, execDropDomain |
 | `internal/executor/expr.go` | enum cast fallback in evalTypedStringLit; enum_first, enum_last, enum_range stubs |
+
+## Follow-up (2026-07-15): `AS` base_type accepts multi-word type names
+
+`parseCreateDomain`'s base-type parsing used bare `parseObjectName()`, which
+only handles `schema.name` — it never consumed the trailing keywords of PG's
+multi-word built-in type names, so `CREATE DOMAIN ... AS double precision`
+failed with a parser syntax error (surfaced by the DU-002 pg_dump round-trip
+probe, `TestPort_PgDumpConnectionSetup`, once the M0122-0007 4e catalog
+cross-database isolation fixes for domains cleared the collision that
+previously masked this gap).
+
+`parseColumnType` (CREATE TABLE's column-type grammar) already handled
+`double precision`, `character varying`, `bit varying`, and
+`timestamp`/`time [with|without time zone]` (including the `time(N) with
+time zone` form, where the qualifier trails the typmod parens). That switch
+logic was factored out into two shared helpers so `parseCreateDomain` reuses
+it instead of duplicating it:
+
+- `parser.parseMultiWordTypeName(leading string) string` — the pre-typmod-args
+  keyword switch (`double precision`, `character/bit varying`,
+  `timestamp/time with/without time zone`).
+- `parser.parseTimeZoneQualifierAfterArgs(name string) string` — the
+  post-typmod-args `time(N)`/`timestamp(N) with/without time zone` case.
+
+`parseCreateDomain` calls `parseMultiWordTypeName` after `parseObjectName`
+(only when the base type wasn't schema-qualified, mirroring
+`parseColumnType`'s own schema-qualified branch) and
+`parseTimeZoneQualifierAfterArgs` after its typmod-args loop, before the
+existing array-notation handling. `parseColumnType`'s own behavior is
+unchanged — same switch logic, just relocated into the shared helpers.
+
+Tests: 8 new multi-word cases appended to `TestM0097_0017_EnumDomainParsing`
+plus `TestCreateDomainMultiWordBaseType` (asserts `BaseType`/`BaseTypeArgs`
+for each multi-word form, including an array suffix) in
+`internal/parser/m0097_0017_test.go`.
+
+This is a parser-grammar fix, not a catalog cross-database isolation fix —
+a different mechanism from the M0122-0007 4e series in
+`docs/design/0122-0018-per-database-catalog-namespace.md`. See
+`.ralph/deferral_ledger.md` (2026-07-15 row) for the next DU-002 probe
+blocker this unblocked (`CREATE TYPE` cross-database isolation).
