@@ -69,7 +69,12 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
   full isolation (485s) + regress (288s). **Non-HOT update DEFERRED**: it already emits a PG-format
   Delete+Insert pair (A2/A3), not a single `xl_heap_update` — single-record conversion is an executor
   restructure, left as a parity gap (`RecordKindHeapUpdate`=27 is dead code).
-- [ ] **A5** BtreeInsert flip — `xl_btree_insert{offnum}` + blk0 `IndexTupleData`.
+- [x] **A5** BtreeInsert flip — **LANDED**. `xl_btree_insert{offnum=0}` + blk0 IndexTuple (as block data).
+  Built decoded `replayDecodedXLogBtreeInsert` (reuses `btree.ApplyInsertRecord` = re-insert by key = native
+  parity; FPI fallback); RmgrBtree dispatch now switches on opcode (INSERT_LEAF → new handler, split/newroot/…
+  stay FPI). Live: `logBtreeInsert`→`EncodeBtreeInsertPG`. No classifier (index changes aren't logical
+  user-data). **Gates:** wal+`-race`, executor, initdb crash-recovery (227s), e2e native/physical/logical
+  repl, full isolation + regress. offnum=0 is a documented PG-standby parity gap (goopg replays by key).
 - [ ] **A6** XactCommit / CommitInval flip — `xl_xact_commit{xact_time}` + xinfo/invals/subxact chunks.
 - [ ] **A2–A6 cross-cutting**: FPI↔logical unification (doc 01 §5); `predictXLogRecordLen` assembled-length
   fix; audit record-count / LSN-delta consumers (stream replayer, recovery-pass WAL-decode memoization,
@@ -152,3 +157,9 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
   now writes a PG `xl_heap_update`. Gates all green (wal+race, executor, server, initdb 228s, e2e ×3,
   isolation 485s, regress 288s). Non-HOT single-record conversion deferred (already PG-format Delete+Insert).
   **Next: A5 BtreeInsert.**
+- 2026-07-16: **A5 landed — BtreeInsert flip is LIVE.** A5a (encoder + `replayDecodedXLogBtreeInsert` via
+  `btree.ApplyInsertRecord`, RmgrBtree opcode switch, dormant) + A5b (`logBtreeInsert`→`EncodeBtreeInsertPG`).
+  Every leaf index insert now writes a PG `xl_btree_insert`. Gates all green (wal+race, executor, initdb
+  crash-recovery 227s, e2e ×3, full isolation + regress — fresh `-count=1`). **A5 DONE.** offnum=0 parity gap
+  documented. **Part-A hot set (A2–A6 minus XactCommit) done; remaining: A6 XactCommit, A7 heap2, A8 btree
+  structural, A9 smgr/clog/FPI/legacy-frame; then Part B.**

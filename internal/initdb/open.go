@@ -452,7 +452,14 @@ func Open(opts OpenOptions) (*Runtime, error) {
 
 	// Logical btree non-split insert change record.
 	logBtreeInsert := func(rel storage.RelFileNode, blk storage.BlockNumber, item []byte) (storage.LSN, error) {
-		payload := wal.EncodeBtreeInsert(rel, blk, item)
+		// A5: emit a PostgreSQL xl_btree_insert (INSERT_LEAF) record with the
+		// IndexTuple as block-0 data instead of the goopg-native body. offnum=0
+		// (goopg replay re-inserts by key). Recovery routes it to
+		// replayDecodedXLogBtreeInsert.
+		payload, err := wal.EncodeBtreeInsertPG(rel, blk, 0, item)
+		if err != nil {
+			return 0, err
+		}
 		_, end, err := walWriter.Append(payload)
 		if err != nil {
 			return 0, err
