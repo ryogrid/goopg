@@ -227,3 +227,26 @@ func EncodeHeapHotUpdatePG(rel storage.RelFileNode, blk storage.BlockNumber, old
 	}
 	return framePGAssembled(RmgrHeap, xlogHeapHotUpdate, uint32(xmax), body), nil
 }
+
+// sizeOfXLogBtreeInsertData is PG's SizeOfBtreeInsert: offnum(2).
+const sizeOfXLogBtreeInsertData = 2
+
+// EncodeBtreeInsertPG builds a PostgreSQL xl_btree_insert record for one leaf
+// index-tuple insertion (XLOG_BTREE_INSERT_LEAF), framed for the assembled path.
+// Main data is xl_btree_insert{offnum}; block 0 carries the new IndexTuple as
+// block data. goopg replay re-inserts the tuple by key (btree.ApplyInsertRecord)
+// and does not need offnum, so the emit path passes 0 — a documented parity gap
+// (a real-PG standby would need the true leaf offset). xl_xid = 0 (btree index
+// changes are not logical user-data events).
+func EncodeBtreeInsertPG(rel storage.RelFileNode, blk storage.BlockNumber, offnum uint16, item []byte) ([]byte, error) {
+	if len(item) == 0 {
+		return nil, fmt.Errorf("wal: btree-insert item is empty")
+	}
+	mainData := make([]byte, sizeOfXLogBtreeInsertData)
+	binary.LittleEndian.PutUint16(mainData[0:2], offnum)
+	body, err := assembleXLogRecord(mainData, []BlockRef{{ID: 0, Rel: rel, Block: blk, Data: item}})
+	if err != nil {
+		return nil, err
+	}
+	return framePGAssembled(RmgrBtree, xlogBtreeInsertLeaf, 0, body), nil
+}

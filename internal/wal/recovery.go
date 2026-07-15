@@ -9559,18 +9559,25 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 			return false, unsupportedDecodedXLogRecord(r)
 		}
 	case RmgrBtree:
-		// XLOG_BTREE_INSERT_LEAF with a full-page image of the updated
-		// leaf-root page on every record. The FPI carries the entire
-		// post-insert page so no main-data parsing of the IndexTuple is
-		// required for replay. No current emitter produces a block-ref
-		// FPI record on this rmgr (the doc 04 §5.1-5.3 canonical-family
-		// removal deleted the only call sites that did); kept as the
-		// correct redo path for when the native→PG content rewrite
-		// (docs/design/wal-native-pg-format/) adds real FPI emission here.
-		if err := replayDecodedXLogHeapFPIBlocks(mgr, r, xlog); err != nil {
-			return false, err
+		switch xlog.Header.Info & XLRRmgrInfoMask {
+		case xlogBtreeInsertLeaf:
+			// A5: goopg emits xl_btree_insert with the IndexTuple as block-0
+			// data, no FPI — replay re-inserts by key. A real-PG leaf insert
+			// carrying a full-page image is restored via the FPI branch inside
+			// replayDecodedXLogBtreeInsert.
+			if err := replayDecodedXLogBtreeInsert(mgr, r, xlog); err != nil {
+				return false, err
+			}
+			return true, nil
+		default:
+			// Other btree records (split / newroot / vacuum / unlink / …) are
+			// not flipped yet and are emitted with full-page images; restore
+			// each block from its FPI.
+			if err := replayDecodedXLogHeapFPIBlocks(mgr, r, xlog); err != nil {
+				return false, err
+			}
+			return true, nil
 		}
-		return true, nil
 	default:
 		return false, unsupportedDecodedXLogRecord(r)
 	}
@@ -9934,6 +9941,42 @@ func replayDecodedXLogHeapUpdate(mgr *storage.Manager, r Record, xlog *XLogDecod
 	}
 	if err := storage.PageStampHotOldTuple(page, oldOffnum, storage.TransactionID(oldXmax), block.Block, gotSlot); err != nil {
 		return fmt.Errorf("wal: xlog heap-update stamp old tuple: %w", err)
+	}
+	storage.MustHeader(page).SetLSN(storage.LSN(r.EndLSN))
+	return mgr.WriteBlock(block.Rel, block.Block, page)
+}
+
+// replayDecodedXLogBtreeInsert applies a PG-format xl_btree_insert: insert the
+// IndexTuple carried in block 0's data into the leaf page. Mirrors the native
+// replayBtreeInsert (btree.ApplyInsertRecord re-inserts by key), so goopg↔goopg
+// replay is identical; a full-page image is restored instead. Idempotent via pd_lsn.
+func replayDecodedXLogBtreeInsert(mgr *storage.Manager, r Record, xlog *XLogDecodedRecord) error {
+	block, ok := xlogBlockRefByID(xlog, 0)
+	if !ok {
+		return fmt.Errorf("wal: xlog btree-insert missing block 0")
+	}
+	if block.HasImage && block.ImageApply {
+		return restoreDecodedXLogBlockImage(mgr, block, storage.LSN(r.EndLSN))
+	}
+	nblocks, err := mgr.NBlocks(block.Rel)
+	if err != nil {
+		return err
+	}
+	if block.Block >= nblocks {
+		return fmt.Errorf("wal: xlog btree-insert: block %d does not exist (nblocks=%d)", block.Block, nblocks)
+	}
+	page := make(storage.Page, storage.BlockSize)
+	if err := mgr.ReadBlock(block.Rel, block.Block, page); err != nil {
+		return err
+	}
+	if storage.IsNew(page) {
+		return fmt.Errorf("wal: xlog btree-insert: block %d is uninitialised", block.Block)
+	}
+	if storage.MustHeader(page).LSN() >= storage.LSN(r.EndLSN) {
+		return nil // already applied
+	}
+	if err := btree.ApplyInsertRecord(page, block.Data); err != nil {
+		return fmt.Errorf("wal: xlog btree-insert apply: %w", err)
 	}
 	storage.MustHeader(page).SetLSN(storage.LSN(r.EndLSN))
 	return mgr.WriteBlock(block.Rel, block.Block, page)
