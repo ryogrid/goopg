@@ -161,6 +161,17 @@ func classifyDecodedXLog(d *Decoder, r Record) error {
 		return nil
 	}
 	h := r.XLog.Header
+	if h.Rmid == RmgrXact {
+		// A6: PG xl_xact_commit / xl_xact_abort carry the xid in the header
+		// (xl_xid) and no block ref. Drive the reorder buffer by xact boundary.
+		switch h.Info & xlogXactOpMask {
+		case xlogXactCommit:
+			return d.ApplyCommit(storage.TransactionID(h.XID), r.EndLSN)
+		case xlogXactAbort:
+			d.ApplyAbort(storage.TransactionID(h.XID))
+		}
+		return nil
+	}
 	if h.Rmid != RmgrHeap {
 		return nil
 	}

@@ -935,6 +935,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		commitStampMu.RLock()
 		defer commitStampMu.RUnlock()
 		var payload []byte
+		var perr error
 		switch kind {
 		case mvcc.XactCommit:
 			// If the transaction wrote to a nailed catalog relation (pg_class,
@@ -944,7 +945,8 @@ func Open(opts OpenOptions) (*Runtime, error) {
 			// AtEOXact_Inval → RelationCacheInitFilePreInvalidate sequence.
 			// M0106-0010 batched-31.
 			if txnMgr.TakeRelcacheInvalPending() {
-				payload = wal.EncodeXactCommitInval(xid)
+				// A6: PG xl_xact_commit with HAS_INVALS (xid in the header).
+				payload, perr = wal.EncodeXactCommitPG(xid, true)
 				_ = catalog.WithRelCacheInitLock(func() error {
 					if err := catalog.RelcacheInitFileUnlink(abs, catalog.DefaultDBOid); err != nil {
 						return err
@@ -962,12 +964,15 @@ func Open(opts OpenOptions) (*Runtime, error) {
 					return bootstrapRelcacheInitFiles(abs)
 				})
 			} else {
-				payload = wal.EncodeXactCommit(xid)
+				payload, perr = wal.EncodeXactCommitPG(xid, false)
 			}
 		case mvcc.XactAbort:
-			payload = wal.EncodeXactAbort(xid)
+			payload, perr = wal.EncodeXactAbortPG(xid)
 		default:
 			return fmt.Errorf("goopg: unknown xact marker %v", kind)
+		}
+		if perr != nil {
+			return perr
 		}
 		_, endLSN, err := walWriter.Append(payload)
 		if err != nil {

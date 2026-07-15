@@ -75,7 +75,16 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
   stay FPI). Live: `logBtreeInsert`→`EncodeBtreeInsertPG`. No classifier (index changes aren't logical
   user-data). **Gates:** wal+`-race`, executor, initdb crash-recovery (227s), e2e native/physical/logical
   repl, full isolation + regress. offnum=0 is a documented PG-standby parity gap (goopg replays by key).
-- [ ] **A6** XactCommit / CommitInval flip — `xl_xact_commit{xact_time}` + xinfo/invals/subxact chunks.
+- [x] **A6** XactCommit / Abort / CommitInval flip — **LANDED**. `xl_xact_commit`/`xl_xact_abort`
+  (xact_time=0; **xid in the header xl_xid**, not the body). CommitInval → HAS_INFO + xinfo{HAS_INVALS} +
+  empty invals array; decoded RmgrXact replay unlinks standby init files on HAS_INVALS (replaces native
+  RecordKindXactCommitInval redo). No block ref → routes to decoded path (header.XID≠0 vs classifyXLogRecord's
+  0). Most consumers were already header-ready (initdb xact-recovery CLOG stamp, stream_replayer); the one gap
+  was `classifyDecodedXLog` (added RmgrXact branch → ApplyCommit/ApplyAbort by xl_xid). Fixed
+  `wal_durability_test.go` (header-based commit detection). **Gates:** wal+`-race`(*), initdb crash-recovery
+  (commit visibility), executor, server, e2e ×3, isolation+regress. *(-race: full-package flake in the
+  pre-existing `TestDrainSafetyStress` WAL-drain concurrency test — passes isolated 3/3; A6 adds no
+  concurrency.)* Deferred: xact_time, real subxact/inval arrays (not available at the commit emitter).
 - [ ] **A2–A6 cross-cutting**: FPI↔logical unification (doc 01 §5); `predictXLogRecordLen` assembled-length
   fix; audit record-count / LSN-delta consumers (stream replayer, recovery-pass WAL-decode memoization,
   FPI-count test assertions).
@@ -161,5 +170,10 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
   `btree.ApplyInsertRecord`, RmgrBtree opcode switch, dormant) + A5b (`logBtreeInsert`→`EncodeBtreeInsertPG`).
   Every leaf index insert now writes a PG `xl_btree_insert`. Gates all green (wal+race, executor, initdb
   crash-recovery 227s, e2e ×3, full isolation + regress — fresh `-count=1`). **A5 DONE.** offnum=0 parity gap
-  documented. **Part-A hot set (A2–A6 minus XactCommit) done; remaining: A6 XactCommit, A7 heap2, A8 btree
-  structural, A9 smgr/clog/FPI/legacy-frame; then Part B.**
+  documented.
+- 2026-07-16: **A6 landed — Xact commit/abort flip is LIVE.** A6a (EncodeXactCommitPG/AbortPG, xid→header,
+  HAS_INVALS redo, dormant) + A6b (wire SetXactMarkerLogger hook, classifyDecodedXLog RmgrXact branch,
+  header-based `wal_durability_test`). Key insight: the xid moves body→header (xl_xid), but 3 of 4 consumers
+  were already header-ready — only the logical-decoder classifier needed the RmgrXact branch. Every COMMIT/
+  ABORT now writes a PG `xl_xact_commit`/`xl_xact_abort`. **A6 DONE.** **Part-A hot set (A2–A6) COMPLETE;
+  remaining: A7 heap2, A8 btree structural, A9 smgr/clog/FPI/legacy-frame; then Part B.**
