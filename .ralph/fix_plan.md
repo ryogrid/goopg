@@ -4488,6 +4488,50 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       `TestPort_IsolationEvalPlanQual`/`TestPort_IsolationEvalPlanQualTrigger` PASS;
       `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0 failed,
       all 3 workloads).
+      **2026-07-15 slice (parser-level, not catalog-level — FIXED, resume point
+      from the M0122-0007 4e cross-database type-isolation series' closure):**
+      the DU-002 probe advanced from `collation "builtin_coll" already exists`
+      (fixed by that series) to a NEW blocker:
+      `CREATE DOMAIN ... DEFAULT 'na'::character varying;` failed a parser
+      syntax error (`expected ';' or end of input (got varying)`) — a genuine
+      SQL-engine gap, not catalog-isolation. Root cause:
+      `parseTypeNameAfterCast` (`internal/parser/select.go`), the shared
+      type-name parser for both `x::typename` and `CAST(x AS typename)`,
+      consumed only a single identifier/keyword and never called the existing
+      `parseMultiWordTypeName` helper (`internal/parser/ddl.go`) that
+      `parseColumnType`/`parseCreateDomain`'s `AS` clause already use — so
+      multi-word built-in type names (`character varying`, `double precision`,
+      `bit varying`, `timestamp/time [with|without time zone]`) failed as CAST
+      targets even though they already worked as column/domain base types.
+      Fixed by calling `p.parseMultiWordTypeName(first)` in the
+      non-schema-qualified branch of `parseTypeNameAfterCast`, which both CAST
+      entry points (`parseCastTail`/`parseCastFuncExpr`) funnel through. New
+      `TestParseCastMultiWordTypeName`/`TestParseCastSchemaQualifiedNotMultiWord`
+      (`internal/parser/cast_test.go`, 10 cases). Guard now advances past this
+      gap to the next blocker: `CREATE FUNCTION public.add_calcdef(integer)`
+      restore into a second database fails `function already exists with the
+      same argument types` — the same cross-database catalog-collision shape
+      the M0122-0007 4e series already fixed 5 times for
+      domains/collations/enums/composites/ranges, not yet applied to
+      function/routine registration (deferral ledger row, open — next DU-002
+      resume point). Also deferred: `time(N)`/`timestamp(N)` CAST targets with
+      BOTH an explicit typmod AND a trailing timezone qualifier
+      (`x::timestamp(3) with time zone`) are not yet routed through
+      `parseTimeZoneQualifierAfterArgs` the way `parseCreateDomain`'s
+      post-typmod handling is — untested, likely still fails, but pg_dump's
+      own DEFAULT-expression rendering doesn't hit it (deferral ledger row).
+      Gates: `go build ./...`/`go vet ./...` clean repo-wide; `go test
+      ./internal/parser/...` PASS (new + existing cast tests); `go test -short`
+      full repo excl. testport (51 packages) PASS, 0 FAIL; `go test -run
+      'TestParseCast|TestPort_PgDumpConnectionSetup|TestPort_RegressSuite'
+      ./internal/parser/... ./internal/testport/...` PASS (confirms no
+      regression in the regress-port suite, which exercises CAST syntax
+      broadly); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh` PASS
+      (0 failed, all 3 workloads; first attempt hit 1 transient pgbench
+      failure out of 11,210 txns — 0.009%, matches the previously-documented
+      unrelated flake pattern — retry passed clean, 0 failed across all 3
+      workloads).
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002). `002_save_fullpage`
       (WD-003) + live `pg_waldump --rmgr=Heap2` round-trip DONE. **Still open:** only
       `001_basic.pl`'s server-dependent tier (per-rmgr/relation/block filtering) —
