@@ -4650,6 +4650,54 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       PASS (1 transient unrelated abort under concurrent TPC-B load on run 1
       of 3, zero code-path overlap with this change; runs 2/3 both clean,
       confirmed pre-existing flake).
+- [x] **M0119-0004 (DU-002 follow-up) — VARIADIC function call-site
+      argument collapsing FIXED** (resume point: the "also newly discovered"
+      note in the slice above). `SELECT sum_variadic(1, 2, 3)` against
+      `CREATE FUNCTION sum_variadic(VARIADIC arr integer[]) ...` failed
+      `function ... does not exist` — a materially different mechanism from
+      the sibling ALTER/DROP/COMMENT signature fix above (call resolution,
+      not DDL identity resolution). Root cause:
+      `resolveRoutineOverload` (`internal/executor/plpgsql_runtime.go`, the
+      sole call-resolution path for `evalStoredRoutineFuncCall`, used by
+      every expression-context user-defined-function invocation) required
+      an exact `len(c.ArgTypes) == len(args)` match with zero VARIADIC
+      awareness — unlike `internal/executor/operators_call.go`'s
+      `callOp.Open` (the `CALL <procedure>(...)` statement path), which
+      already implements VARIADIC-aware count matching + array bundling
+      (M0097-0022); `CALL` and a `SELECT`-invoked function resolve through
+      two entirely separate code paths, and only `CALL` had ever received
+      VARIADIC support. Fix: new `callArgTypesForCandidate` (accepts any
+      `n >= variadicPos` argument count when the routine's last parameter
+      mode is `"v"`, type-checking excess positions against the VARIADIC
+      parameter's element type — its declared array type name with the
+      trailing `"[]"` stripped, since `Routine.ArgTypes[i].Name` bakes the
+      array suffix directly into the string per the sibling fix's storage
+      convention) and `bundleVariadicArgs` (collapses the trailing
+      arguments into one array-valued `Datum` via the existing
+      `buildArrayDatum` helper before dispatch, since every dispatch path —
+      `executeSQLRoutine`, `executePLpgSQLRoutine` — binds `args[i]` to
+      `r.ArgTypes[i]` by direct index with no VARIADIC awareness of its
+      own). Also hardened `evalStoredRoutineFuncCall`'s "use CALL, not
+      SELECT" error-message branch with an `i < len(r.ArgTypes)` index
+      guard, since this change is the first way that branch can be reached
+      with `len(x.Args) > len(r.ArgTypes)`. New
+      `internal/executor/variadic_call_test.go`:
+      `TestVariadicFunctionCallCollapsesArgs` (0/1/3/5-argument calls
+      through a `LANGUAGE plpgsql` VARIADIC function, including the
+      zero-argument `NULL` case matching real PG's
+      `array_length('{}'::int[], 1)` semantics) and
+      `TestVariadicFunctionCallSQLLanguage` (same collapsing behavior
+      through the sibling `LANGUAGE sql` dispatch path). Design doc
+      `docs/design/0119-0004-variadic-call-argument-collapsing.md` + README
+      index (`0119-0004dc`). This closes the last open item from the
+      2026-07-15 VARIADIC-array deferral-ledger row; new ledger row records
+      the resolution. Gates: `go build ./...`/`go vet ./...` clean
+      repo-wide; `go test ./internal/executor/... ./internal/catalog/...
+      ./internal/parser/...` PASS; `go test -short $(go list ./... | grep -v
+      /internal/testport)` (full repo, short mode) 0 FAIL;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh`
+      PASS (0 failed, all 3 workloads).
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002). `002_save_fullpage`
       (WD-003) + live `pg_waldump --rmgr=Heap2` round-trip DONE. **Still open:** only
       `001_basic.pl`'s server-dependent tier (per-rmgr/relation/block filtering) —
