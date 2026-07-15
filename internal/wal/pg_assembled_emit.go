@@ -393,3 +393,36 @@ func EncodeHeapFreezePG(rel storage.RelFileNode, blk storage.BlockNumber, frozen
 	}
 	return framePGAssembled(RmgrHeap2, xlogHeap2PruneVacuumClean, 0, body), nil
 }
+
+// EncodeBtreeSplitPG builds a PostgreSQL RM_BTREE split record (XLOG_BTREE_SPLIT_L
+// opcode) carrying the post-split left, right, and (non-rightmost) sibling pages
+// as full-page images. goopg's split record already holds the exact final page
+// bytes, so this reuses the A0 FPI encoder rather than reconstructing PG's
+// incremental xl_btree_split main-data: block 0 = left (mutated in place), block
+// 1 = right (WILL_INIT — a new block), block 2 = the left sibling's right-link
+// update (non-rightmost only). Every block carries BKPIMAGE_APPLY, so replay
+// (replayDecodedXLogHeapFPIBlocks via the RmgrBtree default arm) restores the
+// images — identical to the native replayBtreeSplit and PG's BLK_RESTORED redo.
+// The right block extends when it does not yet exist. No main-data is carried
+// (the images are authoritative — a documented deviation from PG's incremental
+// xl_btree_split); xl_xid = 0.
+func EncodeBtreeSplitPG(rel storage.RelFileNode, leftBlk, rightBlk storage.BlockNumber, leftPage, rightPage storage.Page, sibBlk storage.BlockNumber, sibPage storage.Page) ([]byte, error) {
+	if len(leftPage) != storage.BlockSize || len(rightPage) != storage.BlockSize {
+		return nil, fmt.Errorf("wal: btree-split left/right page must be %d bytes", storage.BlockSize)
+	}
+	blocks := []BlockRef{
+		{ID: 0, Rel: rel, Block: leftBlk, Image: &FullPageImage{Page: leftPage, Apply: true}},
+		{ID: 1, Rel: rel, Block: rightBlk, SameRel: true, WillInit: true, Image: &FullPageImage{Page: rightPage, Apply: true}},
+	}
+	if sibBlk != storage.InvalidBlockNumber {
+		if len(sibPage) != storage.BlockSize {
+			return nil, fmt.Errorf("wal: btree-split sibling page must be %d bytes", storage.BlockSize)
+		}
+		blocks = append(blocks, BlockRef{ID: 2, Rel: rel, Block: sibBlk, SameRel: true, Image: &FullPageImage{Page: sibPage, Apply: true}})
+	}
+	body, err := assembleXLogRecord(nil, blocks)
+	if err != nil {
+		return nil, err
+	}
+	return framePGAssembled(RmgrBtree, xlogBtreeSplitL, 0, body), nil
+}

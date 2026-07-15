@@ -421,7 +421,10 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// docs/design/0002-0002-btree-concurrency.md). Same import-cycle
 	// dodge as logFPI.
 	logBtreeSplit := func(rel storage.RelFileNode, leftBlk, rightBlk storage.BlockNumber, leftPage, rightPage storage.Page, sibBlk storage.BlockNumber, sibPage storage.Page) (storage.LSN, error) {
-		payload, err := wal.EncodeBtreeSplit(rel, leftBlk, rightBlk, leftPage, rightPage, sibBlk, sibPage)
+		// A8: emit a PG RM_BTREE split record carrying the post-split pages as
+		// full-page images instead of the goopg-native body. Recovery restores
+		// the images via the RmgrBtree default (FPI) arm.
+		payload, err := wal.EncodeBtreeSplitPG(rel, leftBlk, rightBlk, leftPage, rightPage, sibBlk, sibPage)
 		if err != nil {
 			return 0, err
 		}

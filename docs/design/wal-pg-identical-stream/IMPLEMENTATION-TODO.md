@@ -96,7 +96,19 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
   (non-logical). **Gates:** wal round-trip+replay, executor, vacuum, initdb crash-recovery, e2e ×3, isolation
   + regress. Parity gaps: no conflict horizon; freeze frzflags/infomask=0 (goopg freezes via xmin→FrozenXID,
   not PG's infomask bit — a real-PG-standby freeze representation gap).
-- [ ] **A8** btree structural — Split, NewRoot, Vacuum, UnlinkPage(36B), MarkPageHalfDead.
+- [~] **A8** btree structural — **Split LANDED**; NewRoot/Vacuum deferred, UnlinkPage stays incremental, MarkHalfDead dormant.
+  - [x] **A8-split** — `EncodeBtreeSplitPG` (RM_BTREE/SPLIT_L) carries post-split left/right/sib pages as
+    apply-FPIs; reuses A0 FPI encoder + existing RmgrBtree default→`replayDecodedXLogHeapFPIBlocks` (no new
+    replay). Emit closure already had the pages (no signature change). Gates: wal round-trip+FPI-replay,
+    executor, access/btree, initdb crash-recovery (220s), e2e ×3, isolation (479s) + regress (289s).
+  - [ ] **A8-vacuum / A8-newroot** — FPI-feasible but need the post-op page threaded through their emit
+    closures (currently pass items); NewRoot also needs the metapage FPI. Deferred → deferral ledger.
+  - [ ] **A8-unlinkpage** — keep incremental (pages unmutated at emit; sibling links re-derived at apply for
+    cross-connection concurrency — an FPI snapshot would be stale). Needs PG's real `xl_btree_unlink_page`
+    incremental main-data, not FPI. Deferred → deferral ledger.
+  - **A8-markhalfdead** — dormant (no production emit site). No flip needed.
+  > Note: btree structural records already replay correctly for goopg↔goopg via their native bodies; the flip
+  > is for PG-parseability / real-PG-standby. FPI-based records carry no incremental main-data (PG deviation).
 - [ ] **A9** smgr/clog/standalone-FPI/checkpoint-opcode/xact chunks; retire legacy native frame
   (`encodeRecord`/`decodeRecord`).
 - [ ] **A-gate** Phase-A exit: `pg_waldump` structural+rmgr green for all §A records; goopg↔goopg standby +
@@ -118,6 +130,16 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
   `information_schema` parity vs PG 18.3; crash-after-DDL recovery via generic reload; re-init data dir.
 
 ---
+
+## Log (A8 partial — split landed)
+- 2026-07-16: **A8-split landed — BtreeSplit flip is LIVE (FPI-based).** `EncodeBtreeSplitPG` emits a PG
+  RM_BTREE SPLIT_L record carrying the post-split left/right/sib pages as apply-FPIs; the existing RmgrBtree
+  default arm (`replayDecodedXLogHeapFPIBlocks`) restores them (no new replay code). The emit closure already
+  received the pages, so no signature change. Gates all green (executor, access/btree, initdb crash-recovery
+  220s, e2e ×3, isolation 479s, regress 289s). **Deferred (in deferral ledger):** A8-vacuum + A8-newroot
+  (FPI-feasible but need the post-op page threaded through the emit closures); A8-unlinkpage (keep incremental
+  — concurrency-critical apply-time relink re-derivation, needs PG's real xl_btree_unlink_page main-data);
+  A8-markhalfdead (dormant). **Next: finish A8 (vacuum/newroot/unlinkpage), then A9, then Part B.**
 
 ## Log (A7 complete)
 - 2026-07-16: **A7-freeze landed — HeapFreeze flip is LIVE.** `EncodeHeapFreezePG` (xl_heap_prune,
