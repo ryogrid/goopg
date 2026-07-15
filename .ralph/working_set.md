@@ -1,73 +1,93 @@
-(idle — nothing in flight)
+Task: M0119-0004 (DU-002 pg_dump round-trip slice-by-slice advance). Fixed
+`catalog.Routines` (function/procedure registry) cross-database collision —
+the M0122-0007 4e series' last unaudited registry (after domains/
+userCollations/enumTypes/compositeTypes/rangeTypes). Commit pending (see
+"In-flight" below — same unresolved git-push blocker as loop #38, not
+touched this loop).
 
-Loop #37 landed doc 04 §5.1-5.3 + §6 in full (the WAL native→PG-format
-rework's canonical-family/knob/skip-tag REMOVAL — the last unimplemented
-part of doc 04, following loop #36's §5.4 atomic classify+recovery dispatch
-landing). This closes the epic's dispatch/removal scope entirely; only the
-separately-scoped record body/content rewrite (docs 01/03) remains, not
-started.
+Files touched:
+- `internal/catalog/routines.go` — `Routine` gained `DBOid uint32`; registry
+  key folds it via `routineDBPrefix(dbOid)+schema.name(sig)` (mirrors
+  `domainKey`/`enumKey`/`compositeKey`/`rangeKey`). `Create`/
+  `CreateDuringRecovery` normalize DBOid==0 to `DefaultDBOid`.
+  `Lookup`/`LookupByName`/`Drop`/`DropByName`/`ResolveByName`/`ResolveBySig`/
+  `LookupDropCandidates` gained trailing variadic `dbOid ...uint32`.
+  `DropRoutine`/`RenameRoutine`/`SetSchema` unchanged signature (read
+  `r.DBOid` directly — they already receive a registry-sourced `*Routine`).
+- `internal/executor/operators_ddl.go` — threaded
+  `catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)` through every
+  CREATE/ALTER/DROP FUNCTION/PROCEDURE + COMMENT ON FUNCTION + DROP SCHEMA
+  CASCADE routine-collection call site (`execCreateFunction`,
+  `execCreateProcedure`, `execAlterFunction`, `execDropFunction`,
+  `execDropProcedure`, `execCommentOn`'s function case, the DROP SCHEMA
+  CASCADE loop). All `ddlOp` methods — no signature-cascading helpers
+  needed touching.
+- `internal/catalog/routines_dbid_isolation_test.go` — new
+  `TestRoutinesCrossDatabaseIsolation` (mirrors
+  `TestCreateDomainCrossDatabaseIsolation`).
+- `.ralph/deferral_ledger.md` — new open row: full landed/deferred/resume
+  breakdown, including the NEW proc_out OUT-parameter signature-matching
+  bug the DU-002 probe advanced to (see Next step).
+- `docs/design/0122-0018-per-database-catalog-namespace.md` +
+  `docs/design/README.md` — new "Routine/function registry dbOid scoping"
+  section + index row update.
+- `.ralph/fix_plan.md` — M0119-0004 slice entry appended.
 
-Summary of what landed (one commit):
-1. Deleted `internal/catalog/canonical.go` + `internal/wal/parameter_change.go`
-   (relocated `GUCParameters`/`DefaultGUCParameters` into `checkpointer.go`
-   first) + 10 pure-canonical test files.
-2. Unwired every `LogCanonical`/`PgCanonical*` call site across
-   executor/initdb/server/vacuum. `writeHeapRowCanonical` now just delegates
-   to `writeHeapRowReturningPG` (its ~20 catalog-heap-sync callers unchanged).
-3. Removed the `GOOPG_WAL_CANONICAL` knob (`emitCanonicalDefault`,
-   `wal.Config.EmitCanonical`, `Writer.CanonicalEnabled()`, the startup/
-   BASE_BACKUP warnings).
-4. Removed the `payload[0]==0xFE` branches in `wrapXLogMainData`/
-   `classifyXLogRecord` (format.go) + the mirrored branch in
-   `predictXLogRecordLen` (this one had a live keystone-test dependency —
-   `TestPredictXLogRecordLenMatchesEncodeRecordXLog`'s `canonical_minimal`/
-   `canonical_medium` subtests failed until the mirror was fixed too; deleted
-   `TestPredictXLogRecordLenCanonicalShortCircuitsFirstByte` outright) +
-   `RecordKindCanonical`.
-5. Converted 4 `skipUnlessCanonicalWAL`-gated tests to unconditional
-   `t.Skip` (doc §6); removed the now-redundant `TestKillKillRecoveryNativeOnly`
-   and 3 now-inert `t.Setenv("GOOPG_WAL_CANONICAL",...)` calls; removed the
-   nightly canonical-on lane from `ci/batch/stages/stage-testport.sh`; fixed
-   `TestBaseBackupWireProtocolFraming` (asserted a NoticeResponse this loop
-   removed).
+Key symbols: `catalog.Routines`/`Routine.DBOid`/`routineDBPrefix`/
+`routineKey`/`nameKey` (routines.go); `execCreateFunction`/
+`execCreateProcedure`/`execAlterFunction`/`execDropFunction`/
+`execDropProcedure`/`execCommentOn` (operators_ddl.go); guard test
+`TestPort_PgDumpConnectionSetup` (DU-002 probe, soft t.Logf not hard-fail).
 
-Empirical deviation from doc §6's own prediction (recorded in the ledger,
-not silently dropped): `TestPort_WALPgWaldumpCompat` (W-001) and
-`TestPGWaldumpParsesEmittedWAL` were expected to become structurally-failing
-once real rmids sit over native bodies — verified by direct re-run that
-BOTH STILL PASS (pg_waldump's basic record walk doesn't validate per-rmgr
-body content deeply enough to catch the mismatch). The port-status CSV
-`port→defer` flip doc §6 specified was therefore deliberately NOT applied.
+Next step: DU-002 probe now fails restoring an ALTER/COMMENT-shaped
+statement against `proc_out(a integer, OUT b integer)`:
+`ERROR: procedure proc_out(integer, integer) does not exist`. Root cause
+(traced, not fixed): `execAlterFunction`'s `argTypes` stub
+(`internal/executor/operators_ddl.go`) is built from `s.Args` without
+populating `ArgModes`, so `catalog.Routine.Signature()` (which excludes OUT
+params, matching `pg_proc.proargtypes`) computes `"(integer,integer)"` for
+the ALTER's full IN+OUT arg list against the stored routine's real
+OUT-excluding signature `"(integer)"` — mismatch, lookup fails. Fix options
+(pick one): (a) populate `ArgModes` in every ALTER/DROP/COMMENT arg-type
+stub from `s.Args[i].Mode` before calling `Lookup`/`ResolveBySig`, or (b)
+switch those call sites to a full-arg-list matcher like
+`LookupDropCandidates` (already handles OUT-param full-arg matching
+correctly) instead of `Signature()`-based lookup. Repro: `go test -v -run
+'^TestPort_PgDumpConnectionSetup$' ./internal/testport/` (soft-log, not a
+hard failure) or minimal SQL: `CREATE PROCEDURE p(a int, OUT b int)
+LANGUAGE sql AS $$...$$; ALTER PROCEDURE p(int, int) OWNER TO x;`.
+Also still open (lower priority, see ledger row): the 5 signature-cascading
+DDL-support helpers (access-method/FDW-handler/FDW-validator/
+event-trigger/conversion func resolution) and cross-file read sites
+(grant_ddl.go, plpgsql_runtime.go, expr.go, planner.go, etc.) are not
+dbOid-threaded; `Routines.List()`'s pg_proc-view row-scoping is deferred.
 
 Gates run this loop (all green): `go build ./...`/`go vet ./...` clean
-repo-wide; grep-audit clean (no `LogCanonical`/`PgCanonical`/
-`RecordKindCanonical`/`GOOPG_WAL_CANONICAL`/`EmitCanonical`/
-`CanonicalEnabled` outside the retained `xlogInfoDefault` legacy-decode arm);
-G-crash (`go test -run 'Crash|Recovery|Durability' ./internal/initdb/
-./internal/wal/'` + `TestKillKillRecovery`); goopg↔goopg E2E
-(`TestE2E_NativeOnlyReplicationAndPromotion`,
-`TestE2E_StandbyAttachRetainsUpstreamRowsAfterRestart`); G-race on
-`./internal/wal/ ./internal/executor/ ./internal/catalog/`; full
-`./internal/vacuum/... ./internal/server/... ./internal/initdb/...` (217s)
-`./internal/testport/...` (1031s, whole package, no -run filter) all green;
+repo-wide; `go test ./internal/catalog/... ./internal/executor/...` PASS
+(incl. new `TestRoutinesCrossDatabaseIsolation`); `go test -short $(go list
+./... | grep -v /internal/testport)` (full repo, short mode, 51 pkgs) PASS
+0 FAIL; `go test -v -run '^TestPort_PgDumpConnectionSetup$'
+./internal/testport/` PASS (soft-log confirms advance to the new blocker);
 `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
-bash scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 workloads);
-`make ralph-state-guard` clean (one auto-repaired stale-progress-marker
-inconsistency, expected/benign, same pattern as loop #36).
+bash scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 workloads,
+confirmed twice — no flake this loop); `make ralph-state-guard` clean (one
+auto-repaired stale-progress-marker, same benign pattern as loops
+#36/#37/#38).
 
-Doc 04 marked landed (§2-§6 complete). `docs/design/README.md` updated.
-`.ralph/deferral_ledger.md` gained a resolved-style row (status `-` per
-ledger convention — M0119 flips status) that supersedes the 2026-07-13
-perf-optimize3-dash S4 rows 756/757 (their "resume via
-GOOPG_WAL_CANONICAL=on" path no longer exists).
+M-NIGHTLY: `ci/logs/action-items.md`'s current run (20260715-010036, sha
+751b82178025, 11 AI items) remains fully triaged/closed (confirmed again
+this loop via `grep -n "20260715-010036" .ralph/fix_plan.md` — all 11
+items have `[x]` entries). No new nightly items to add this loop.
 
-Next step: no WAL-epic item left in fix_plan.md's dispatch/removal scope.
-If picking up the epic again, start the record body/content rewrite from
-`docs/design/wal-native-pg-format/01-emitted-wal-record-inventory.md` +
-`03-pg183-wal-record-schemas.md` (already-landed blueprints) — this is a
-large, separately-scoped epic, not a quick follow-up. Otherwise select the
-next fix_plan.md priority (e.g. the Nightly whole-suite regression batch
-implementation item, currently the next unchecked entry after the WAL
-section).
-
-In-flight: none.
+In-flight: **git push still BLOCKED — same unresolved human-decision item
+loop #38 flagged, NOT touched this loop.** Local `wal-format-mod` remains
+`ahead N, behind 2` of `origin/wal-format-mod` (peer's WAL-removal PR #53
+already merged upstream; local branch carries 6 redundant WAL-removal
+commits `5e4f57af`..`280da2fd` never pushed anywhere, confirmed safe to
+drop via rebase). This loop's new commit (routine registry dbOid fix, see
+below) is genuinely new, non-duplicate work — disjoint files from every WAL
+commit — but was made LOCALLY ONLY, same as loop #38's `2f50766b`. **Do NOT
+attempt to auto-resolve the push conflict** — loop #38's working_set (still
+readable via `git log`/prior context) already spelled out 3 resolution
+options for the user; wait for explicit human direction before any rebase/
+force-push on this branch.

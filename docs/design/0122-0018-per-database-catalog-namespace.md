@@ -2262,6 +2262,63 @@ verification pass; a future loop should file it against
 `internal/activity/registry.go` directly (M0119-0006, which added
 `CountByDatName`) rather than this design doc.
 
+### Routine/function registry (`catalog.Routines`) dbOid scoping — LANDED (2026-07-15)
+
+Closes the M0119-0004 DU-002 working-set resume point ("the same collision
+shape the M0122-0007 4e series already fixed 5x for type registries ...
+not yet applied to function/routine registration"). `catalog.Routine`
+gained a `DBOid uint32` field; the `Routines` registry's `byKey`/`byName`
+maps re-key from `schema.name(sig)` to
+`routineDBPrefix(dbOid)+schema.name(sig)` (`routineDBPrefix` = `"<dbOid>\x00"`,
+mirroring `domainKey`/`enumKey`/`compositeKey`/`rangeKey` exactly) so a
+same-named `CREATE FUNCTION`/`CREATE PROCEDURE` in two distinct databases no
+longer collides. `Create`/`CreateDuringRecovery` normalize a zero `DBOid` to
+`DefaultDBOid` (the caller-sets-the-field convention, simpler than a
+parameter since `Create` already takes a fully-constructed `*Routine`);
+`Lookup`/`LookupByName`/`Drop`/`DropByName`/`ResolveByName`/`ResolveBySig`/
+`LookupDropCandidates` gained a trailing variadic `dbOid ...uint32`
+(resolved via the existing package-level `resolveDBOid`); `DropRoutine`/
+`RenameRoutine`/`SetSchema` needed no signature change since they already
+receive a `*Routine` sourced from the registry and read `r.DBOid` directly.
+
+Threaded through every DDL call site in `internal/executor/operators_ddl.go`
+reachable from CREATE FUNCTION/CREATE PROCEDURE/ALTER FUNCTION/ALTER
+ROUTINE/DROP FUNCTION/DROP PROCEDURE/COMMENT ON FUNCTION/DROP SCHEMA
+CASCADE's routine-collection loop — all `ddlOp` methods with `o.ctx` already
+in scope, a purely mechanical set (unlike the enum/composite follow-ups'
+`collectAllViewTransitiveDeps`-shaped signature-cascade exceptions; none
+existed here). New `internal/catalog/routines_dbid_isolation_test.go`
+(`TestRoutinesCrossDatabaseIsolation`), mirroring
+`TestCreateDomainCrossDatabaseIsolation`.
+
+Confirmed via the DU-002 probe (`TestPort_PgDumpConnectionSetup`): the
+round-trip's failure point moved past `function already exists with the
+same argument types` to a NEW, unrelated bug — `procedure proc_out(integer,
+integer) does not exist` on an ALTER/COMMENT-shaped restore statement,
+root-caused to `execAlterFunction`'s arg-type stub never populating
+`ArgModes`, so `Signature()` (which excludes OUT params, matching
+`pg_proc.proargtypes`) mismatches the stored routine's own OUT-excluding
+signature. This is a pre-existing OUT-parameter signature-matching defect,
+orthogonal to dbOid scoping — see the 2026-07-15 deferral-ledger row (task-id
+`M0122-0007 4e follow-up (catalog.Routines cross-database isolation ...)`)
+for the full resume point.
+
+**Deliberately still un-dbOid'd (deferred, see the same ledger row):**
+5 signature-cascading DDL-support helpers with no `ctx` in scope
+(`resolveAccessMethodHandlerFunc`, `resolveFDWHandlerFunc`,
+`resolveFDWValidatorFunc`, `resolveEventTriggerFunc`,
+`resolveConversionFunc`), every call site in `internal/server/grant_ddl.go`
+(GRANT/REVOKE ON FUNCTION), `plpgsql_runtime.go`, `operators_call.go`,
+`expr.go`, `operators_trigger.go`, `operators_join_agg.go`,
+`internal/planner/planner.go`, `pg18_user_catalog_rows.go`, and the
+remaining CREATE OPERATOR/CAST/AGGREGATE-finalfunc resolution sites in
+`operators_ddl.go` — same "mechanical vs. signature-cascading" split
+precedent as 4d-ii-part-1/part-2b. `Routines.List()` (backing `pg_proc`/
+`information_schema.routines`, `internal/initdb/pg_proc_view.go:319`) is
+still unfiltered by dbOid — same class as `pg_enum`'s un-scoped
+`VirtualRows`. `DropRoutinesReferencingTypes` (temp-table-cleanup cascade)
+was left dbOid-oblivious as a lower-priority edge case.
+
 ## Deferred / explicitly out of scope
 
 - Unifying `ResolveDatabaseOid`'s switch with the `pg_database` `VirtualRows`

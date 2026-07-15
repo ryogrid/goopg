@@ -4532,6 +4532,51 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       failure out of 11,210 txns — 0.009%, matches the previously-documented
       unrelated flake pattern — retry passed clean, 0 failed across all 3
       workloads).
+      **2026-07-15 slice (catalog-level, `catalog.Routines` cross-database
+      collision — FIXED, resume point from the CAST multi-word-type-name
+      slice above):** the DU-002 probe advanced from
+      `CREATE FUNCTION public.add_calcdef(integer)` restoring into a second
+      database with `function already exists with the same argument types`
+      to a NEW blocker. Root cause: `catalog.Routines` (the function/
+      procedure registry) had no dbOid concept at all — every routine shared
+      one flat `schema.name(sig)` key process-wide, the same collision shape
+      the M0122-0007 4e series already fixed for domains/userCollations/
+      enumTypes/compositeTypes/rangeTypes. Fixed by giving `catalog.Routine`
+      a `DBOid uint32` field and folding it into the registry key
+      (`routineDBPrefix(dbOid)+schema.name(sig)`, mirroring `domainKey`/
+      `enumKey`/`compositeKey`/`rangeKey`); `Lookup`/`LookupByName`/`Drop`/
+      `DropByName`/`ResolveByName`/`ResolveBySig`/`LookupDropCandidates`
+      gained a trailing variadic `dbOid ...uint32`; `DropRoutine`/
+      `RenameRoutine`/`SetSchema` needed no signature change (they already
+      take a `*Routine` and read `r.DBOid` directly). Threaded
+      `catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)` through every
+      CREATE/ALTER/DROP FUNCTION/PROCEDURE + COMMENT ON FUNCTION + DROP
+      SCHEMA CASCADE call site in `operators_ddl.go` (all `ddlOp` methods,
+      purely mechanical, no signature-cascading helpers needed touching).
+      New `internal/catalog/routines_dbid_isolation_test.go`
+      (`TestRoutinesCrossDatabaseIsolation`). Guard now advances past the
+      collision to a NEW, unrelated bug: `procedure proc_out(integer,
+      integer) does not exist` on an ALTER/COMMENT-shaped restore statement —
+      root-caused (not fixed) to `execAlterFunction`'s arg-type stub never
+      populating `ArgModes`, so `Signature()` (OUT-excluding) mismatches the
+      stored routine's own OUT-excluding signature against the ALTER
+      statement's full IN+OUT arg list. Deliberately deferred (see the
+      2026-07-15 ledger row): 5 signature-cascading DDL-support helpers
+      (access-method/FDW-handler/FDW-validator/event-trigger/conversion
+      function resolution) with no `ctx` in scope, every cross-file read
+      call site (`grant_ddl.go`, `plpgsql_runtime.go`, `operators_call.go`,
+      `expr.go`, `operators_trigger.go`, `operators_join_agg.go`,
+      `planner.go`, `pg18_user_catalog_rows.go`), `Routines.List()`'s
+      pg_proc/information_schema.routines row-scoping, and
+      `DropRoutinesReferencingTypes`'s temp-cleanup cascade. Gates: `go
+      build ./...`/`go vet ./...` clean repo-wide; `go test
+      ./internal/catalog/... ./internal/executor/...` PASS; `go test -short
+      $(go list ./... | grep -v /internal/testport)` (full repo, short mode)
+      PASS 0 FAIL; `go test -v -run '^TestPort_PgDumpConnectionSetup$'
+      ./internal/testport/` PASS (soft-log advances to the new blocker);
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh`
+      PASS (0 failed, all 3 workloads, confirmed twice).
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002). `002_save_fullpage`
       (WD-003) + live `pg_waldump --rmgr=Heap2` round-trip DONE. **Still open:** only
       `001_basic.pl`'s server-dependent tier (per-rmgr/relation/block filtering) —
