@@ -703,8 +703,10 @@ type LogBtreeMarkPageHalfDeadFunc func(rel RelFileNode, leafBlk BlockNumber, fla
 // LogHeapFreezeFunc emits the M0080-0001 heap-freeze redo record.
 type LogHeapFreezeFunc func(rel RelFileNode, blk BlockNumber, frozenSlots []uint16) (LSN, error)
 
-// LogHeapHotUpdateFunc emits one atomic HOT-update redo record.
-type LogHeapHotUpdateFunc func(rel RelFileNode, blk BlockNumber, oldSlot uint16, xmax TransactionID, tupleBytes []byte) (LSN, error)
+// LogHeapHotUpdateFunc emits one atomic HOT-update redo record. newSlot is the
+// line-pointer slot the new tuple version landed at (PG's xl_heap_update
+// new_offnum).
+type LogHeapHotUpdateFunc func(rel RelFileNode, blk BlockNumber, oldSlot, newSlot uint16, xmax TransactionID, tupleBytes []byte) (LSN, error)
 
 // LogHeapPruneOptFunc emits one opportunistic page-pruning redo record.
 type LogHeapPruneOptFunc func(rel RelFileNode, blk BlockNumber, redirects [][2]uint16, unused []uint16) (LSN, error)

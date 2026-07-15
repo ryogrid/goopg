@@ -210,6 +210,26 @@ func classifyDecodedXLog(d *Decoder, r Record) error {
 			LineSlot: offnum,
 			OldTuple: oldTuple,
 		})
+	case xlogHeapHotUpdate:
+		_, oldOffnum, _, _, _, newOffnum, err := decodeXLogHeapUpdateMainData(r.XLog.MainData)
+		if err != nil {
+			return err
+		}
+		xid := storage.TransactionID(h.XID)
+		tuple, err := decodeXLogHeapInsertTuple(block, xid, newOffnum)
+		if err != nil {
+			return err
+		}
+		d.ApplyChange(xid, Change{
+			Kind:     ChangeUpdate,
+			LSN:      r.EndLSN,
+			Rel:      block.Rel,
+			Block:    block.Block,
+			LineSlot: oldOffnum,
+			NewTuple: tuple,
+			// OldTuple empty — HOT update under REPLICA IDENTITY DEFAULT, matching
+			// the native RecordKindHeapHotUpdate classifier path.
+		})
 	}
 	return nil
 }

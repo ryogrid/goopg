@@ -60,7 +60,15 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
   classifier decoded delete-path (reconstructs old tuple). **Gates:** wal+`-race`, executor, initdb
   crash-recovery (234s), e2e native/physical/logical repl, **full isolation + regress**. infobits_set=0 (no
   HEAP_KEYS_UPDATED — native delta) and ALL_VISIBLE_CLEARED not set = known PG-standby parity gaps.
-- [ ] **A4** HeapHotUpdate flip — `xl_heap_update` + 2 block refs; route real non-HOT updates here.
+- [x] **A4** HeapHotUpdate flip — **LANDED (HOT path)**. `xl_heap_update` (HOT opcode 0x40): main-data
+  {old_xmax,old_offnum,old_infobits=0,flags=CONTAINS_NEW_TUPLE,new_xmax=0,new_offnum} + block-0 new tuple
+  (same page; no block 1; prefix/suffix skipped). Built decoded `replayDecodedXLogHeapUpdate`
+  (PageAddHeapTuple new + PageStampHotOldTuple old). Threaded `new_offnum` from the executor; extended the
+  A2-pre self-`t_ctid` stamp to `markHeapHotUpdateDirty` (HOT new version). classifier decoded update-path.
+  **Gates:** wal+`-race`, executor, server, initdb crash-recovery (228s), e2e native/physical/logical repl,
+  full isolation (485s) + regress (288s). **Non-HOT update DEFERRED**: it already emits a PG-format
+  Delete+Insert pair (A2/A3), not a single `xl_heap_update` — single-record conversion is an executor
+  restructure, left as a parity gap (`RecordKindHeapUpdate`=27 is dead code).
 - [ ] **A5** BtreeInsert flip — `xl_btree_insert{offnum}` + blk0 `IndexTupleData`.
 - [ ] **A6** XactCommit / CommitInval flip — `xl_xact_commit{xact_time}` + xinfo/invals/subxact chunks.
 - [ ] **A2–A6 cross-cutting**: FPI↔logical unification (doc 01 §5); `predictXLogRecordLen` assembled-length
@@ -138,3 +146,9 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
   + `heap_delete_pg_classify_test.go`. Every DELETE now writes a PostgreSQL `xl_heap_delete`. **Gates all green:**
   wal+`-race`, executor, initdb crash-recovery (234s), e2e native/physical/logical replication, **full isolation
   + full regress**. **A3 DONE.** Next: A5 BtreeInsert or A4 HeapHotUpdate (update needs 2 block refs + t_ctid chain).
+- 2026-07-16: **A4 landed (HOT path).** A4a (encoder+decoded replay, dormant) + A4b (live wiring). Threaded
+  `new_offnum` (bufpool `LogHeapHotUpdateFunc` + open.go closure + markHeapHotUpdateDirty + tryApplyHOTUpdate);
+  self-`t_ctid` stamp extended to the HOT new version; classifier decoded HOT-update path. Every HOT UPDATE
+  now writes a PG `xl_heap_update`. Gates all green (wal+race, executor, server, initdb 228s, e2e ×3,
+  isolation 485s, regress 288s). Non-HOT single-record conversion deferred (already PG-format Delete+Insert).
+  **Next: A5 BtreeInsert.**

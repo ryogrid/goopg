@@ -2856,9 +2856,18 @@ func markHeapPruneOptDirty(
 func markHeapHotUpdateDirty(
 	pool *storage.Pool, slot *storage.Slot,
 	rel storage.RelFileNode, blk storage.BlockNumber,
-	oldLineSlot uint16, xmax storage.TransactionID,
+	oldLineSlot, newLineSlot uint16, xmax storage.TransactionID,
 	tupleBytes []byte,
 ) error {
+	// Adopt PG's self-pointing t_ctid for the HOT new version (the chain tail),
+	// matching what replay reconstructs (xl_heap_update carries no new t_ctid).
+	// A2-pre made fresh inserts self-pointing; HOT new versions go through this
+	// path, not markHeapInsertDirty, so stamp here too. isChainTailCTID treats
+	// self identically to the legacy {Invalid,0}. Caller holds slot.Lock and has
+	// already PageAddHeapTuple'd the new version at newLineSlot.
+	if err := storage.PageSetHeapTupleCtid(slot.Page(), newLineSlot, storage.ItemPointer{Block: blk, Offset: newLineSlot}); err != nil {
+		return err
+	}
 	logHot := pool.LogHeapHotUpdate()
 	if logHot == nil {
 		pool.MarkDirty(slot)
@@ -2867,7 +2876,7 @@ func markHeapHotUpdateDirty(
 	// MarkDirtyLogicalChange — see markHeapInsertDirty for the
 	// rationale.
 	return pool.MarkDirtyLogicalChange(slot, func() (storage.LSN, error) {
-		return logHot(rel, blk, oldLineSlot, xmax, tupleBytes)
+		return logHot(rel, blk, oldLineSlot, newLineSlot, xmax, tupleBytes)
 	})
 }
 
@@ -3418,7 +3427,7 @@ func tryApplyHOTUpdate(
 		return false, stampErr
 	}
 
-	derr := markHeapHotUpdateDirty(ctx.Pool, s, rel, blk, oldSlot, effectiveWriterXID(ctx), tupleBytes)
+	derr := markHeapHotUpdateDirty(ctx.Pool, s, rel, blk, oldSlot, newSlot, effectiveWriterXID(ctx), tupleBytes)
 	s.Unlock()
 	ctx.Pool.Unpin(s)
 	if derr == nil && ctx.InDMLCTE && ctx.CTEWriteFence != nil {
