@@ -310,3 +310,52 @@ func xactCommitCarriesInvals(info uint8, mainData []byte) bool {
 	xinfo := binary.LittleEndian.Uint32(mainData[minSizeOfXactCommit : minSizeOfXactCommit+4])
 	return xinfo&xactXinfoHasInvals != 0
 }
+
+// xl_heap_prune flags (heapam_xlog.h XLHP_*), set in the record's second
+// main-data byte and gating the block-0 sub-records in flag order.
+const (
+	xlhpHasConflictHorizon uint8 = 1 << 3 // XLHP_HAS_CONFLICT_HORIZON (snapshot horizon in main data)
+	xlhpHasFreezePlans     uint8 = 1 << 4 // XLHP_HAS_FREEZE_PLANS
+	xlhpHasRedirections    uint8 = 1 << 5 // XLHP_HAS_REDIRECTIONS
+	xlhpHasDeadItems       uint8 = 1 << 6 // XLHP_HAS_DEAD_ITEMS
+	xlhpHasNowUnusedItems  uint8 = 1 << 7 // XLHP_HAS_NOW_UNUSED_ITEMS
+)
+
+// sizeOfXLogHeapPruneData is PG's SizeOfHeapPrune: reason(1) + flags(1). A
+// snapshot_conflict_horizon (u4) follows when XLHP_HAS_CONFLICT_HORIZON is set;
+// goopg does not persist a horizon, so it is omitted.
+const sizeOfXLogHeapPruneData = 2
+
+// EncodeHeapPruneOptPG builds a PostgreSQL xl_heap_prune record for one page
+// prune (opportunistic or VACUUM-scan). Main data is {reason=0, flags}; block 0
+// carries the redirection pairs (XLHP_HAS_REDIRECTIONS: ntargets + u2[2*n], each
+// pair = old-slot, target-slot, matching goopg's [2]uint16 redirects exactly)
+// followed by the now-unused slots (XLHP_HAS_NOW_UNUSED_ITEMS: ntargets + u2[n]).
+// goopg reclaims LP_DEAD items directly, so there is no XLHP_HAS_DEAD_ITEMS.
+// opcode = XLOG_HEAP2_PRUNE_ON_ACCESS; xl_xid = 0 (pruning is not transactional
+// user-data).
+func EncodeHeapPruneOptPG(rel storage.RelFileNode, blk storage.BlockNumber, redirects [][2]uint16, unused []uint16) ([]byte, error) {
+	var flags uint8
+	var blockData []byte
+	if len(redirects) > 0 {
+		flags |= xlhpHasRedirections
+		blockData = binary.LittleEndian.AppendUint16(blockData, uint16(len(redirects)))
+		for _, r := range redirects {
+			blockData = binary.LittleEndian.AppendUint16(blockData, r[0])
+			blockData = binary.LittleEndian.AppendUint16(blockData, r[1])
+		}
+	}
+	if len(unused) > 0 {
+		flags |= xlhpHasNowUnusedItems
+		blockData = binary.LittleEndian.AppendUint16(blockData, uint16(len(unused)))
+		for _, u := range unused {
+			blockData = binary.LittleEndian.AppendUint16(blockData, u)
+		}
+	}
+	mainData := []byte{0, flags} // reason = 0, flags
+	body, err := assembleXLogRecord(mainData, []BlockRef{{ID: 0, Rel: rel, Block: blk, Data: blockData}})
+	if err != nil {
+		return nil, err
+	}
+	return framePGAssembled(RmgrHeap2, xlogHeap2PruneOnAccess, 0, body), nil
+}

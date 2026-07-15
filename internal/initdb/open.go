@@ -582,7 +582,13 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// the freed slot list so replay can deterministically reclaim the
 	// same dead slots without re-running the isDead predicate.
 	logHeapPruneOpt := func(rel storage.RelFileNode, blk storage.BlockNumber, redirects [][2]uint16, unused []uint16) (storage.LSN, error) {
-		payload := wal.EncodeHeapPruneOpt(rel, blk, redirects, unused)
+		// A7: emit a PostgreSQL xl_heap_prune (RM_HEAP2) record with the redirect
+		// + now-unused sub-records instead of the goopg-native body. Recovery
+		// routes it to replayDecodedXLogHeapPrune.
+		payload, err := wal.EncodeHeapPruneOptPG(rel, blk, redirects, unused)
+		if err != nil {
+			return 0, err
+		}
 		_, end, err := walWriter.Append(payload)
 		if err != nil {
 			return 0, err

@@ -112,6 +112,15 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
 
 ---
 
+## Log (A7 in progress)
+- 2026-07-16: **A7-prune landed — HeapPruneOpt flip is LIVE.** `EncodeHeapPruneOptPG` (xl_heap_prune,
+  RM_HEAP2/PRUNE_ON_ACCESS; block-0 XLHP_HAS_REDIRECTIONS pairs + XLHP_HAS_NOW_UNUSED_ITEMS); built the
+  composite `decodeXLogHeapPrune` (handles freeze plans too, for A7-freeze) + `replayDecodedXLogHeapPrune`
+  (PageSetItemIDRedirect + VacuumHeapPageBySlots + PageFreezeBySlots) + `case RmgrHeap2` dispatch (opcode
+  switch). Wired `logHeapPruneOpt` (covers opportunistic + VACUUM prune). Gates: wal+build, executor, vacuum,
+  initdb crash-recovery (221s), e2e ×3. **A7-vacuum:** SKIPPED — `RecordKindHeapVacuum` is dormant (no runtime
+  producer; VACUUM emits HeapPruneOpt). **A7-freeze next.** No conflict-horizon persisted (parity gap).
+
 ## Log
 - 2026-07-15: Phase 0 complete (Ralph paused, WIP stashed `8d8a32da`, tracker created). Implementing on
   branch `wal-pg-stream-impl` off `344470fe`. Starting A0.

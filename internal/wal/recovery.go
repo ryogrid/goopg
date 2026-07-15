@@ -9569,6 +9569,20 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 		default:
 			return false, unsupportedDecodedXLogRecord(r)
 		}
+	case RmgrHeap2:
+		switch xlog.Header.Info & XLRRmgrInfoMask {
+		case xlogHeap2PruneOnAccess, xlogHeap2PruneVacuumScan, xlogHeap2PruneVacuumClean:
+			// A7: goopg's opportunistic prune / VACUUM prune / freeze all emit
+			// xl_heap_prune (block-0 sub-records: redirects, now-unused, freeze
+			// plans). Replay applies them to the page; a real-PG record carrying
+			// a full-page image is restored via the FPI branch.
+			if err := replayDecodedXLogHeapPrune(mgr, r, xlog); err != nil {
+				return false, err
+			}
+			return true, nil
+		default:
+			return false, unsupportedDecodedXLogRecord(r)
+		}
 	case RmgrBtree:
 		switch xlog.Header.Info & XLRRmgrInfoMask {
 		case xlogBtreeInsertLeaf:
@@ -9988,6 +10002,162 @@ func replayDecodedXLogBtreeInsert(mgr *storage.Manager, r Record, xlog *XLogDeco
 	}
 	if err := btree.ApplyInsertRecord(page, block.Data); err != nil {
 		return fmt.Errorf("wal: xlog btree-insert apply: %w", err)
+	}
+	storage.MustHeader(page).SetLSN(storage.LSN(r.EndLSN))
+	return mgr.WriteBlock(block.Rel, block.Block, page)
+}
+
+// sizeOfXLHPFreezePlan is one xlhp_freeze_plan: xmax(4) + t_infomask2(2) +
+// t_infomask(2) + frzflags(1) + ntuples(2).
+const sizeOfXLHPFreezePlan = 11
+
+// decodeXLogHeapPrune parses a PG xl_heap_prune record's main data + block-0
+// sub-records into goopg's page-mutation inputs: the HOT redirect pairs, the
+// now-unused (reclaimed) slots, and the frozen slots (from the freeze plans'
+// trailing offset array). Sub-records appear in flag order — freeze plans,
+// redirections, dead items (skipped; goopg has none), now-unused — with the
+// freeze offset array trailing after all of them.
+func decodeXLogHeapPrune(mainData, blockData []byte) (redirects [][2]uint16, unused, frozenSlots []uint16, err error) {
+	if len(mainData) < sizeOfXLogHeapPruneData {
+		return nil, nil, nil, fmt.Errorf("wal: invalid xlog heap-prune main-data len %d (want >= %d)", len(mainData), sizeOfXLogHeapPruneData)
+	}
+	flags := mainData[1]
+	off := 0
+	read16 := func() (uint16, error) {
+		if off+2 > len(blockData) {
+			return 0, fmt.Errorf("wal: truncated xlog heap-prune block data at %d", off)
+		}
+		v := binary.LittleEndian.Uint16(blockData[off : off+2])
+		off += 2
+		return v, nil
+	}
+
+	nFreezeTuples := 0
+	if flags&xlhpHasFreezePlans != 0 {
+		nplans, e := read16()
+		if e != nil {
+			return nil, nil, nil, e
+		}
+		if _, e = read16(); e != nil { // pad2
+			return nil, nil, nil, e
+		}
+		for i := 0; i < int(nplans); i++ {
+			if off+sizeOfXLHPFreezePlan > len(blockData) {
+				return nil, nil, nil, fmt.Errorf("wal: truncated xlog heap-prune freeze plan")
+			}
+			ntuples := binary.LittleEndian.Uint16(blockData[off+9 : off+11])
+			nFreezeTuples += int(ntuples)
+			off += sizeOfXLHPFreezePlan
+		}
+	}
+	if flags&xlhpHasRedirections != 0 {
+		n, e := read16()
+		if e != nil {
+			return nil, nil, nil, e
+		}
+		redirects = make([][2]uint16, n)
+		for i := range redirects {
+			a, e := read16()
+			if e != nil {
+				return nil, nil, nil, e
+			}
+			b, e := read16()
+			if e != nil {
+				return nil, nil, nil, e
+			}
+			redirects[i] = [2]uint16{a, b}
+		}
+	}
+	if flags&xlhpHasDeadItems != 0 {
+		n, e := read16()
+		if e != nil {
+			return nil, nil, nil, e
+		}
+		for i := 0; i < int(n); i++ { // goopg reclaims directly — nothing to do with LP_DEAD
+			if _, e := read16(); e != nil {
+				return nil, nil, nil, e
+			}
+		}
+	}
+	if flags&xlhpHasNowUnusedItems != 0 {
+		n, e := read16()
+		if e != nil {
+			return nil, nil, nil, e
+		}
+		unused = make([]uint16, n)
+		for i := range unused {
+			v, e := read16()
+			if e != nil {
+				return nil, nil, nil, e
+			}
+			unused[i] = v
+		}
+	}
+	if nFreezeTuples > 0 {
+		frozenSlots = make([]uint16, nFreezeTuples)
+		for i := range frozenSlots {
+			v, e := read16()
+			if e != nil {
+				return nil, nil, nil, e
+			}
+			frozenSlots[i] = v
+		}
+	}
+	return redirects, unused, frozenSlots, nil
+}
+
+// replayDecodedXLogHeapPrune applies a PG xl_heap_prune to block 0's page:
+// freeze the frozen slots, set the HOT redirect line pointers, and compact away
+// the now-unused slots. Mirrors the native replayHeapPruneOpt / replayHeapFreeze
+// (goopg emits prune and freeze as separate xl_heap_prune records, so each has
+// only one kind of sub-record), so goopg↔goopg replay is identical; a full-page
+// image is restored instead. Idempotent via pd_lsn.
+func replayDecodedXLogHeapPrune(mgr *storage.Manager, r Record, xlog *XLogDecodedRecord) error {
+	block, ok := xlogBlockRefByID(xlog, 0)
+	if !ok {
+		return fmt.Errorf("wal: xlog heap-prune missing block 0")
+	}
+	if block.HasImage && block.ImageApply {
+		return restoreDecodedXLogBlockImage(mgr, block, storage.LSN(r.EndLSN))
+	}
+	redirects, unused, frozenSlots, err := decodeXLogHeapPrune(xlog.MainData, block.Data)
+	if err != nil {
+		return err
+	}
+	nblocks, err := mgr.NBlocks(block.Rel)
+	if err != nil {
+		return err
+	}
+	if block.Block >= nblocks {
+		return fmt.Errorf("wal: xlog heap-prune: block %d does not exist (nblocks=%d)", block.Block, nblocks)
+	}
+	page := make(storage.Page, storage.BlockSize)
+	if err := mgr.ReadBlock(block.Rel, block.Block, page); err != nil {
+		return err
+	}
+	if storage.IsNew(page) {
+		return fmt.Errorf("wal: xlog heap-prune: block %d is uninitialised", block.Block)
+	}
+	if storage.MustHeader(page).LSN() >= storage.LSN(r.EndLSN) {
+		return nil // already applied
+	}
+	if len(frozenSlots) > 0 {
+		if err := storage.PageFreezeBySlots(page, frozenSlots); err != nil {
+			return fmt.Errorf("wal: xlog heap-prune freeze: %w", err)
+		}
+	}
+	for _, rd := range redirects {
+		if err := storage.PageSetItemIDRedirect(page, rd[0], rd[1]); err != nil {
+			return fmt.Errorf("wal: xlog heap-prune redirect: %w", err)
+		}
+	}
+	if len(unused) > 0 {
+		if _, err := storage.VacuumHeapPageBySlots(page, unused); err != nil {
+			return fmt.Errorf("wal: xlog heap-prune compact: %w", err)
+		}
+	}
+	if len(redirects) > 0 || len(unused) > 0 {
+		storage.MustHeader(page).SetPruneXID(0)
 	}
 	storage.MustHeader(page).SetLSN(storage.LSN(r.EndLSN))
 	return mgr.WriteBlock(block.Rel, block.Block, page)
