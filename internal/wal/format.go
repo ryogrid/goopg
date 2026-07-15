@@ -155,13 +155,6 @@ func maxAlignXLog(n int) int {
 }
 
 func wrapXLogMainData(payload []byte) []byte {
-	// M0106-0010 batched-32: RecordKindCanonical (0xFE) payloads carry an
-	// already-formatted PG XLogRecord body (block references + main data)
-	// starting at byte 7 (after the 7-byte canonical envelope header).
-	// Return it verbatim — no xlrBlockIDDataShort wrapping needed.
-	if len(payload) >= 7 && payload[0] == 0xFE {
-		return payload[7:]
-	}
 	if len(payload) <= 0xFF {
 		out := make([]byte, 2+len(payload))
 		out[0] = xlrBlockIDDataShort
@@ -218,15 +211,6 @@ func classifyXLogRecord(payload []byte) (Rmgr, uint8, uint32) {
 	if len(payload) == 0 {
 		return RmgrXLog, xlogInfoDefault, 0
 	}
-	// M0106-0010 batched-32: RecordKindCanonical (0xFE) carries a PG-canonical
-	// WAL record body (block references + main data) that a PG18 standby can replay.
-	// The canonical envelope header embeds the target rmgr/info/xid so the
-	// XLogRecord header is produced with the correct resource-manager fields.
-	// See catalog/canonical.go for the encoding; format.go is updated in lock-step.
-	if len(payload) >= 7 && payload[0] == 0xFE {
-		xid := binary.LittleEndian.Uint32(payload[3:7])
-		return Rmgr(payload[1]), payload[2], xid
-	}
 	// M0102-0007: PG-compatible checkpoint record (88-byte CheckPoint struct).
 	// Goopg's record-kind byte (0x02=RecordKindCheckpoint) would map to an
 	// implausible redo LSN (<256 bytes), so this path takes priority over the
@@ -242,16 +226,16 @@ func classifyXLogRecord(payload []byte) (Rmgr, uint8, uint32) {
 		// the server as ready.
 		return RmgrXLog, xlogCheckpointShutdown, 0
 	}
-	// M0105-0007: route ALL goopg-internal records through RmgrXLog
-	// with an unknown info byte (0xF0) so PG's xlog_redo safely skips
-	// them during recovery. PG's resource-manager dispatch only
-	// recognizes RmgrXLog with known info values; unknown values fall
-	// through without action. Previously records used RmgrHeap /
-	// RmgrBtree / RmgrXact which caused PG to attempt decoding the
-	// goopg-internal payload as a PG record, resulting in a segfault.
-	// Goopg's own recovery is unaffected — it reads the payload data
-	// directly and dispatches on the record-kind byte.
-	return RmgrXLog, xlogInfoDefault, 0
+	// Classify by the goopg RecordKind (payload[0]) to a PG-compatible
+	// (xl_rmid, xl_info): records with a PG analog carry the real rmgr +
+	// opcode; goopg-private records carry the custom RmgrGoopgCatalog.
+	// This replaces the historical RM_XLOG/0xF0 "skip-me" tag so goopg
+	// emits ordinary-PG-shaped headers. goopg's own recovery re-keys on
+	// payload[0] inside each rmgr arm (see ApplyRecord).
+	// xl_xid stays 0 here — native bodies carry their own xid, which
+	// goopg recovery reads directly.
+	rmgr, info := recordKindToRmgrInfo(payload[0])
+	return rmgr, info, 0
 }
 
 // encodeRecordXLog returns the on-disk XLogRecord stream

@@ -24,37 +24,6 @@ import (
 	"github.com/goopg/goopg/internal/wal"
 )
 
-// pgEpoch2000 is PG's TimestampTz origin: 2000-01-01 00:00:00 UTC.
-// pgTimestampNowUsec returns the current wall-clock time as a
-// TimestampTz (microseconds since pgEpoch2000). Used by the
-// PG-canonical XLOG_XACT_COMMIT/ABORT emit path (M0106-0010 batched-46).
-var pgEpoch2000 = time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
-
-func pgTimestampNowUsec() int64 { return time.Since(pgEpoch2000).Microseconds() }
-
-// emitCanonicalDefault resolves whether this server emits the canonical
-// (PG-format, real-standby-replayable) WAL record family, from the
-// GOOPG_WAL_CANONICAL environment variable (perf-optimize3-dash/01 §3.1).
-// Read at Open() time — not only in cmd/goopg — so in-process test suites
-// flip modes with t.Setenv. Not a GUC: no PostgreSQL equivalent exists and
-// the postgresql.conf.sample template stays PG-parity (0108-0001).
-//
-//	GOOPG_WAL_CANONICAL=on|1|true   -> emit canonical records (the resume
-//	                                   path: re-enable + land C1)
-//	GOOPG_WAL_CANONICAL=off|0|false -> native-only stream
-//	unset                           -> default OFF (native-only; slice S4)
-func emitCanonicalDefault() bool {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("GOOPG_WAL_CANONICAL"))) {
-	case "on", "1", "true":
-		return true
-	case "off", "0", "false":
-		return false
-	}
-	// Slice S4 (perf-optimize3-dash): native-only is the production default.
-	// Real-PG-standby compatibility is deferred — see the deferral ledger.
-	return false
-}
-
 // Runtime is the bundle of long-lived handles a running goopg
 // server needs to drive table-touching statements: a storage
 // Manager + Pool, an MVCC manager, and an in-memory catalog. Each
@@ -71,13 +40,8 @@ type Runtime struct {
 	FSM *storage.FSM
 	// VM is the in-memory visibility map (M0046-0004). VACUUM sets the
 	// ALL_VISIBLE bit; index-only scans check it to skip heap fetches.
-	VM  *storage.VisibilityMap
-	WAL *wal.Writer
-	// LogCanonical is the callback for emitting PG-canonical WAL records
-	// (XLOG_HEAP_INSERT, XLOG_BTREE_INSERT_LEAF) from DDL paths so a PG18
-	// standby can replay catalog mutations. Non-nil only when PageHeaders=true.
-	// M0106-0010 batched-32.
-	LogCanonical catalog.LogCanonicalFunc
+	VM           *storage.VisibilityMap
+	WAL          *wal.Writer
 	Checkpointer *wal.Checkpointer
 	Slots        *wal.Slots
 	// SyncRep is the synchronous-replication wait primitive
@@ -420,13 +384,8 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		// can parse the WAL segments. SystemID is embedded in every page
 		// header for cross-segment consistency checking.
 		PageHeaders: true,
-		// Canonical-family content gating (analysis/perf-optimize3-dash/01):
-		// resolved from GOOPG_WAL_CANONICAL at every Open() so in-process
-		// test suites can flip modes with t.Setenv. Default OFF since slice
-		// S4 (native-only WAL; real-PG-standby compat deferred).
-		EmitCanonical: emitCanonicalDefault(),
-		SystemID:      systemID,
-		TimelineID:    tli,
+		SystemID:    systemID,
+		TimelineID:  tli,
 		// M0107-0005: closure-captures walProcNum (int32) for the atomic
 		// hot path; no goroutine map lookup and no mutex.
 		OnWALWrite: func() {
@@ -443,16 +402,6 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: wal: %w", err)
 	}
-	if !walWriter.CanonicalEnabled() {
-		// perf-optimize3-dash S4: an already-attached real-PG standby would
-		// keep streaming but silently apply nothing from a native-only
-		// primary (PG's xlog_redo no-ops unknown RmgrXLog info bits), so
-		// announce the family at startup where the BASE_BACKUP clone-time
-		// WARN cannot reach.
-		slog.Info("WAL canonical emission disabled (native-only stream); " +
-			"real-PG standbys cannot replay this WAL — set GOOPG_WAL_CANONICAL=on to re-enable")
-	}
-
 	// Bridge the buffer pool's FPI hook to the WAL writer.
 	// storage cannot import wal (wal imports storage), so we
 	// adapt via a closure here.
@@ -1010,28 +959,6 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		// canonical record because their walWriter is not in PG-wire format.
 		// The flush waits for the canonical end LSN below so both records land
 		// before the client acknowledges commit (synchronous_commit = on).
-		// Additionally gated on CanonicalEnabled (perf-optimize3-dash S1):
-		// canonical content off => native-only stream, endLSN stays at the
-		// native commit record.
-		if walWriter.PageHeadersEnabled() && walWriter.CanonicalEnabled() {
-			xactTime := pgTimestampNowUsec()
-			switch kind {
-			case mvcc.XactCommit:
-				canonPayload := catalog.BuildCanonicalXactCommitPayload(uint32(xid), xactTime)
-				_, canonEnd, err := walWriter.Append(canonPayload)
-				if err != nil {
-					return err
-				}
-				if canonEnd > endLSN {
-					endLSN = canonEnd
-				}
-			case mvcc.XactAbort:
-				canonPayload := catalog.BuildCanonicalXactAbortPayload(uint32(xid), xactTime)
-				if _, _, err := walWriter.Append(canonPayload); err != nil {
-					return err
-				}
-			}
-		}
 		// Synchronous commit (M0042-0003): flush the commit WAL record to
 		// disk before returning to the client so the transaction is durable
 		// across a server crash. Mirrors upstream's synchronous_commit = on
@@ -2213,41 +2140,12 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	}
 
 	// M0106-0010 batched-32: build the canonical WAL callback only when the
-	// writer is in PG-compat PageHeaders mode so canonical records can be read
-	// by PG18 standbys. In legacy mode (tests, no standby), LogCanonical stays
-	// nil and DDL paths skip the canonical record emission.
-	// Additionally gated on CanonicalEnabled (perf-optimize3-dash S1): with
-	// the switch off, LogCanonical stays nil and every canonical emitter
-	// (heap/btree/vacuum/DDL) no-ops on its existing nil guard.
-	var logCanonical catalog.LogCanonicalFunc
-	if walWriter != nil && walWriter.PageHeadersEnabled() && walWriter.CanonicalEnabled() {
-		logCanonical = func(payload []byte) (uint64, error) {
-			_, end, err := walWriter.Append(payload)
-			return end, err
-		}
-	}
-
-	// M0106-0010 batched-33: emit XLOG_PARAMETER_CHANGE and update pg_control
-	// GUC echo fields so the first PG standby that attaches sees consistent
-	// values in its pg_control copy. Mirrors PG's XLogReportParameters call
-	// from postmaster startup (xlog.c:8147). Only runs in PageHeaders mode;
-	// silently skipped when walWriter is nil or dataDir is empty (tests).
-	if walWriter != nil && walWriter.PageHeadersEnabled() && abs != "" {
-		if err := wal.ReportParameters(abs, walWriter, defaultGUC); err != nil {
-			_ = pool.Close()
-			_ = walWriter.Close()
-			_ = mgr.Close()
-			return nil, fmt.Errorf("goopg: ReportParameters: %w", err)
-		}
-	}
-
 	rt := &Runtime{
 		StorageMgr:     mgr,
 		Pool:           pool,
 		TxnMgr:         txnMgr,
 		Catalog:        cat,
 		WAL:            walWriter,
-		LogCanonical:   logCanonical,
 		Checkpointer:   cp,
 		Slots:          slotsReg,
 		SyncRep:        syncRep,

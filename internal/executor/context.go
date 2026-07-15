@@ -388,12 +388,6 @@ type Context struct {
 	// (root-0021; the recurring sibling-path trap). Set by dispatch.
 	OnRoleDropped func(name string)
 
-	// LogCanonical, when non-nil, emits a PG-canonical WAL record (XLOG_HEAP_INSERT,
-	// XLOG_BTREE_INSERT_LEAF, …) so a vanilla PG18 standby can replay catalog DDL
-	// mutations. Set only when the WAL writer is in PageHeaders mode (PG-compat WAL);
-	// nil in tests and legacy-WAL configurations. M0106-0010 batched-32.
-	LogCanonical catalog.LogCanonicalFunc
-
 	// Promote, when non-nil, is invoked by pg_promote() to trigger the
 	// standby-to-primary promotion sequence. nil means the server is not
 	// a standby (or pg_promote is not yet wired) — pg_promote() returns

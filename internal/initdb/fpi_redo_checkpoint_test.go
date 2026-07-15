@@ -23,7 +23,6 @@ import (
 // storage.TestFPIRedoPublicationClosesWindow (image-count assertions that
 // FAIL under the old fpiSinceCheckpoint design).
 func TestCatalogSurvivesCheckpointCrossingNativeOnly(t *testing.T) {
-	t.Setenv("GOOPG_WAL_CANONICAL", "off")
 	dir := filepath.Join(t.TempDir(), "data")
 	if err := Init(Options{DataDir: dir}); err != nil {
 		t.Fatal(err)

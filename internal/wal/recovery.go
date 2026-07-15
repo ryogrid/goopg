@@ -1373,19 +1373,6 @@ const (
 	// Format: kind(1) | nameLen(2) | name(nameLen bytes).
 	RecordKindDropDomain byte = 120
 
-	// RecordKindCanonical wraps a PG-canonical XLogRecord body (block
-	// references + main data) so a PG18 standby can replay catalog heap and
-	// btree insertions that goopg performs during DDL. The 7-byte envelope
-	// header carries the rmgr/info/xid for the XLogRecord; the body follows.
-	// When the WAL writer is in PageHeaders mode, classifyXLogRecord (format.go)
-	// extracts these fields and wrapXLogMainData passes the body through
-	// unchanged, producing a correct PG-canonical XLogRecord on disk.
-	// Goopg's own crash recovery replays these records via replayDecodedXLogRecord
-	// (since nativeApplyRecordKindKnown returns false for this byte), which
-	// uses the FPI in the block reference to restore the catalog page.
-	// M0106-0010 batched-32.
-	RecordKindCanonical byte = 0xFE
-
 	// defaultRecoveryDBOid is the database OID used by
 	// ProcessCommittedInvalidationMessages when unlinking the per-database
 	// pg_internal.init. Matches catalog.DefaultDBOid = 1 (v0 single-database
@@ -8695,10 +8682,10 @@ func ExportedReplayStart(records []Record) (int, uint64) {
 }
 
 // IsGoopgNativeRecord reports whether r.Payload[0] is a trustworthy goopg
-// RecordKind tag byte that a caller may safely switch on. A record with a
-// non-nil XLog that did NOT classify as RmgrXLog+xlogInfoDefault is a
-// structurally real PG-native record (e.g. an XLOG_CHECKPOINT_SHUTDOWN) whose
-// MainData is raw PG struct bytes with no goopg kind tag at all — Payload[0]
+// RecordKind tag byte that a caller may safely switch on. A record whose XLog
+// header does NOT match the (xl_rmid, xl_info) recordKindToRmgrInfo assigns to
+// Payload[0] is a structurally real PG record (e.g. an XLOG_CHECKPOINT_SHUTDOWN)
+// whose MainData is raw PG struct bytes with no goopg kind tag at all — Payload[0]
 // in that case is arbitrary data (e.g. a checkpoint's redo-LSN low byte) that
 // can coincidentally collide with a real RecordKind constant, exactly the
 // M0106-0011 collision ApplyRecord below guards against. The catalog-only
@@ -8707,10 +8694,27 @@ func ExportedReplayStart(records []Record) (int, uint64) {
 // walk the same `wal.ReadAll` records and switch on Payload[0]; they must
 // call this before trusting the byte. DU-002 restart-persistence follow-up.
 func IsGoopgNativeRecord(r Record) bool {
+	return headerMatchesEmittedKind(r)
+}
+
+// headerMatchesEmittedKind reports whether r's XLog header carries exactly the
+// (xl_rmid, xl_info) that recordKindToRmgrInfo assigns to payload[0] — i.e. r is
+// a record goopg emitted, as opposed to a structured PG record (e.g. an 88-byte
+// XLOG_CHECKPOINT_SHUTDOWN) whose arbitrary payload[0] byte can collide with a
+// RecordKind constant. This replaces the historical RM_XLOG/0xF0 skip-tag test
+// now that goopg classifies each record with its real PG-compatible (rmid,info)
+// (see recordKindToRmgrInfo / classifyXLogRecord). The partition is identical to
+// the old test: every goopg-emitted non-checkpoint record matches; structured PG
+// records (checkpoint) do not.
+func headerMatchesEmittedKind(r Record) bool {
 	if r.XLog == nil {
 		return true
 	}
-	return r.XLog.Header.Rmid == RmgrXLog && r.XLog.Header.Info == xlogInfoDefault
+	if len(r.Payload) == 0 {
+		return false
+	}
+	wantRmid, wantInfo := recordKindToRmgrInfo(r.Payload[0])
+	return r.XLog.Header.Rmid == wantRmid && r.XLog.Header.Info == wantInfo
 }
 
 // ApplyRecord applies a single decoded WAL record to storage. It is
@@ -8735,14 +8739,15 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 		if !nativeApplyRecordKindKnown(r.Payload[0]) {
 			return replayDecodedXLogRecord(mgr, r)
 		}
-		// (M0106-0011) The classifier identified this record as a
-		// structured PG-canonical record (e.g., an 88-byte
+		// (M0106-0011) A structured PG record (e.g. an 88-byte
 		// XLOG_CHECKPOINT_SHUTDOWN whose redo-LSN low byte happened to
-		// collide with a goopg native RecordKind). Native goopg
-		// records always classify with `xlogInfoDefault` (0xF0); any
-		// other Info value means the structured PG classification
-		// must win over the payload[0] byte-collision.
-		if r.XLog.Header.Rmid != RmgrXLog || r.XLog.Header.Info != xlogInfoDefault {
+		// collide with a goopg RecordKind) carries a header that does
+		// NOT match the (rmid,info) recordKindToRmgrInfo assigns to
+		// payload[0]; route it to the decoded path. A goopg-emitted
+		// record's header matches its kind, so it falls through to the
+		// native payload[0] switch below (the real replayX functions),
+		// never the FPI-only decoded arms.
+		if !headerMatchesEmittedKind(r) {
 			return replayDecodedXLogRecord(mgr, r)
 		}
 	}
@@ -9146,14 +9151,6 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 		// neither — so the in-memory catalog state is reconstructed by
 		// `internal/initdb.replayIndexDDLRecords` after physical replay
 		// finishes.
-		return false, nil
-	case RecordKindCanonical:
-		// PG-canonical catalog WAL record (M0106-0010 batched-32).
-		// When r.XLog != nil (PageHeaders mode), nativeApplyRecordKindKnown
-		// returns false for this byte and the record is replayed via
-		// replayDecodedXLogRecord using the FPI in the block reference.
-		// In legacy mode (PageHeaders=false), canonical records are never
-		// emitted, so this case is a safety no-op.
 		return false, nil
 	case RecordKindXactAssignment, RecordKindXactRollbackTo, RecordKindXactSubAbort:
 		// Subxact markers (M0050-0003) — physical page recovery is

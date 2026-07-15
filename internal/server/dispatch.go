@@ -495,7 +495,6 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		ectx.ProcNum = connTx.ProcNum
 	}
 	ectx.WAL = s.cfg.WAL
-	ectx.LogCanonical = s.cfg.LogCanonical
 	ectx.SyncRep = s.cfg.SyncRep
 	ectx.SyncCommitMode = sessionSyncCommitMode(sess)
 	ectx.AsyncCommit = sessionAsyncCommit(sess)

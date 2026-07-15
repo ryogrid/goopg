@@ -53,19 +53,27 @@ const (
 	RmgrXLog    Rmgr = 0 // RM_XLOG_ID — checkpoints, EOL markers, switch
 	RmgrXact    Rmgr = 1 // RM_XACT_ID — commit / abort
 	RmgrStorage Rmgr = 2 // RM_SMGR_ID — relation create / truncate
-	// 3..7 reserved (CLOG, Database, Tablespace, MultiXact, RelMap).
+	RmgrCLOG    Rmgr = 3 // RM_CLOG_ID — clog zeropage / truncate
+	// 4..7 reserved (Database, Tablespace, MultiXact, RelMap).
 	RmgrStandby Rmgr = 8  // RM_STANDBY_ID — RUNNING_XACTS snapshot markers
 	RmgrHeap2   Rmgr = 9  // RM_HEAP2_ID   — heap multi-insert / vacuum
 	RmgrHeap    Rmgr = 10 // RM_HEAP_ID    — heap insert / delete / update
 	RmgrBtree   Rmgr = 11 // RM_BTREE_ID   — btree insert / split
 
-	// MaxKnownRmgr bounds the IDs goopg defines symbolic names for
-	// in this slice. Values higher than this aren't *invalid* (a
-	// future producer may define new ones), but the decoder
-	// returns ErrInvalidRecordHeader so unknown rmgrs surface as
-	// a typed branch — useful for "this WAL was emitted by a
-	// newer version" detection.
+	// MaxKnownRmgr bounds the real-PG IDs goopg defines symbolic
+	// names for in this slice. Values in (MaxKnownRmgr, RmgrGoopgCatalog)
+	// are rejected by the decoder as a typed "emitted by a newer
+	// version" branch.
 	MaxKnownRmgr Rmgr = RmgrBtree
+
+	// RmgrGoopgCatalog is goopg's custom resource manager for the
+	// goopg-private catalog/DDL records that have no PostgreSQL WAL
+	// analog. It lives in PG's reserved custom range (RM_MIN_CUSTOM_ID
+	// = 128), so a stock PG safely *skips* these records instead of
+	// mis-redoing a non-PG body. Records classified here are
+	// discriminated by the RecordKind byte at payload[0]. See
+	// docs/design/wal-native-pg-format/04-*.
+	RmgrGoopgCatalog Rmgr = 128 // RM_MIN_CUSTOM_ID
 )
 
 // ErrInvalidRecordHeader is the typed sentinel a decoder returns
@@ -186,7 +194,7 @@ func DecodeXLogRecordHeader(src []byte) (XLogRecord, error) {
 	if src[18] != 0 || src[19] != 0 {
 		return h, fmt.Errorf("%w: padding bytes nonzero (0x%02x 0x%02x)", ErrInvalidRecordHeader, src[18], src[19])
 	}
-	if h.Rmid > MaxKnownRmgr {
+	if h.Rmid > MaxKnownRmgr && h.Rmid < RmgrGoopgCatalog {
 		return h, fmt.Errorf("%w: unknown rmid=%d", ErrInvalidRecordHeader, h.Rmid)
 	}
 	frameworkBits := h.Info & XLRInfoMask

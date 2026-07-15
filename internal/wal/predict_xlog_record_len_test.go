@@ -14,7 +14,6 @@ func TestPredictXLogRecordLenMatchesEncodeRecordXLog(t *testing.T) {
 	//   - 0xFF / 0x100: short→long block-ID wrapping switchover
 	//   - small odd lengths to exercise MAXALIGN padding (4-byte aligned
 	//     records become 8-byte aligned via maxAlignXLog)
-	//   - canonical 0xFE envelope (M0106-0010 batched-32 hot path)
 	cases := []struct {
 		name    string
 		payload []byte
@@ -29,8 +28,6 @@ func TestPredictXLogRecordLenMatchesEncodeRecordXLog(t *testing.T) {
 		{"long_min_0x100", bytes.Repeat([]byte{0xCD}, 0x100)},
 		{"long_512", bytes.Repeat([]byte{0xCD}, 512)},
 		{"long_8192", bytes.Repeat([]byte{0xCD}, 8192)},
-		{"canonical_minimal", append([]byte{0xFE}, bytes.Repeat([]byte{0x11}, 32)...)},
-		{"canonical_medium", append([]byte{0xFE}, bytes.Repeat([]byte{0x22}, 512)...)},
 	}
 
 	for _, tc := range cases {
@@ -63,39 +60,6 @@ func TestPredictXLogRecordLenPaddedIsMaxAlignOfReal(t *testing.T) {
 			t.Errorf("payload size=%d: paddedLen=%d, want maxAlignXLog(%d)=%d",
 				size, padded, real, want)
 		}
-	}
-}
-
-// TestPredictXLogRecordLenCanonicalShortCircuitsFirstByte exercises the
-// 0xFE canonical envelope branch: payload[0] == 0xFE with len >= 7 means
-// bytes [7:] are already a wrapped record body. A payload that starts with
-// 0xFE but is only 6 bytes long falls through to the short-wrap branch
-// (the canonical envelope requires the 7-byte header).
-func TestPredictXLogRecordLenCanonicalShortCircuitsFirstByte(t *testing.T) {
-	// Canonical: 0xFE + 6-byte header + body of length N → wrappedLen = N
-	canonical := append([]byte{0xFE, 1, 2, 3, 4, 5, 6}, bytes.Repeat([]byte{0xAA}, 17)...)
-	realCanonical, _ := predictXLogRecordLen(canonical)
-
-	// Same payload length, but first byte isn't 0xFE → short-wrap branch
-	// (2-byte chunk header + payload).
-	shortWrap := append([]byte{0x42, 1, 2, 3, 4, 5, 6}, bytes.Repeat([]byte{0xAA}, 17)...)
-	realShortWrap, _ := predictXLogRecordLen(shortWrap)
-
-	// Canonical wrappedLen = 17; short-wrap wrappedLen = 2 + 24 = 26.
-	// Difference = 26 - 17 = 9.
-	if delta := realShortWrap - realCanonical; delta != 9 {
-		t.Errorf("expected short-wrap to be 9 bytes larger than canonical, got delta=%d "+
-			"(canonical=%d, shortWrap=%d)", delta, realCanonical, realShortWrap)
-	}
-
-	// 6-byte payload starting with 0xFE: NOT canonical (len < 7) →
-	// short-wrap branch.
-	tooShort := []byte{0xFE, 1, 2, 3, 4, 5}
-	realTooShort, _ := predictXLogRecordLen(tooShort)
-	wantTooShort := xlogRecordHeaderSize + 2 + len(tooShort)
-	if realTooShort != wantTooShort {
-		t.Errorf("0xFE prefix with len<7: realRecLen=%d, want %d (short-wrap branch)",
-			realTooShort, wantTooShort)
 	}
 }
 

@@ -10,7 +10,6 @@ package vacuum
 import (
 	"errors"
 
-	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/multixact"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/storage"
@@ -50,14 +49,6 @@ type VacuumOptions struct {
 	// relations so a concurrent session's older snapshot does not pin reclamation
 	// of temp-table rows it cannot see (horizons.spec, M0118-0009).
 	Horizon storage.TransactionID
-	// LogCanonical, when non-nil, emits a PG-canonical XLOG_HEAP2_PRUNE_VACUUM_SCAN
-	// record (catalog.PgCanonicalHeapPrune) alongside goopg's native
-	// LogHeapPruneOpt record for every page with reclaimed tuples, so a real
-	// PG18 standby (or pg_waldump) sees WAL activity for VACUUM-driven
-	// pruning — previously VACUUM emitted only goopg's native record kind,
-	// making any page whose sole WAL activity was pruning invisible to
-	// pg_waldump in every mode (M0119-0005).
-	LogCanonical catalog.LogCanonicalFunc
 }
 
 // VacuumWithOptions is the full-featured Vacuum entry point. All optional
@@ -160,23 +151,6 @@ func vacuumCore(pool *storage.Pool, mgr *mvcc.Manager, rel storage.RelFileNode,
 				}
 			} else {
 				pool.MarkDirty(slot)
-			}
-			if opts.LogCanonical != nil {
-				// InvalidTransactionID (0): VACUUM has no live user transaction
-				// of its own to stamp, and a standby restores the whole page
-				// from the FPI without consulting the record's xl_xid.
-				pageCopy := make(storage.Page, storage.BlockSize)
-				copy(pageCopy, page)
-				endLSN, cerr := catalog.PgCanonicalHeapPrune(rel, blk, pageCopy, 0, false, opts.LogCanonical)
-				if cerr != nil {
-					slot.Unlock()
-					pool.Unpin(slot)
-					return stats, cerr
-				}
-				if endLSN != 0 {
-					storage.MustHeader(slot.Page()).SetLSN(storage.LSN(endLSN))
-					pool.MarkDirty(slot)
-				}
 			}
 			pageDirty = true
 			stats.Dead += reclaimed

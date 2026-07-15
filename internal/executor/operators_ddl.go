@@ -13430,44 +13430,14 @@ func syncIndexToCatalogHeap(ctx *Context, idx *catalog.Index) error {
 	return nil
 }
 
-// writeHeapRowCanonical writes a heap row to a catalog relation and, when
-// ctx.LogCanonical is set, emits a PG-canonical XLOG_HEAP_INSERT WAL record
-// (with full-page image) so a vanilla PG18 standby can replay the catalog
-// insertion. The FPI approach ensures the standby can restore the page without
-// parsing heap-tuple internals. M0106-0010 batched-32.
+// writeHeapRowCanonical writes a heap row to a catalog relation in the PG
+// physical tuple format (writeHeapRowReturningPG). It formerly also emitted a
+// PG-canonical XLOG_HEAP_INSERT FPI for real-PG-standby replay; that canonical
+// WAL path was removed with the native→PG (rmid,info) dispatch change (see
+// docs/design/wal-native-pg-format/04-*). The name is retained to avoid
+// churning ~24 call sites.
 func writeHeapRowCanonical(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, row Row) (storage.ItemPointer, error) {
-	ptr, err := writeHeapRowReturningPG(ctx, rel, cols, row)
-	if err != nil {
-		return ptr, err
-	}
-	if ctx.LogCanonical == nil || ctx.Pool == nil {
-		return ptr, nil
-	}
-	// Re-pin the page to capture a stable FPI after the insert.
-	slot, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: ptr.Block})
-	if err != nil {
-		return ptr, fmt.Errorf("canonical WAL pin: %w", err)
-	}
-	page := make(storage.Page, storage.BlockSize)
-	slot.Lock()
-	copy(page, slot.Page())
-	xid := uint32(ctx.Tx.XID)
-	endLSN, emitErr := catalog.PgCanonicalHeapInsert(rel, ptr.Block, page, ptr.Offset, xid, ctx.LogCanonical)
-	if emitErr == nil && endLSN != 0 {
-		// M0106-0010 batched-42 H1: stamp pd_lsn so a PG18 standby's recovery
-		// can detect "already applied" via the lsn comparison in
-		// XLogReadBufferForRedo (xlogutils.c). Without this, the basebackup
-		// snapshot's pd_lsn=0 page is unconditionally clobbered by the WAL
-		// FPI on every replay pass.
-		storage.MustHeader(slot.Page()).SetLSN(storage.LSN(endLSN))
-		ctx.Pool.MarkDirty(slot)
-	}
-	slot.Unlock()
-	ctx.Pool.Unpin(slot)
-	if emitErr != nil {
-		return ptr, emitErr
-	}
-	return ptr, nil
+	return writeHeapRowReturningPG(ctx, rel, cols, row)
 }
 
 // execCreateTrigger registers a trigger on a table. M0096-0012.

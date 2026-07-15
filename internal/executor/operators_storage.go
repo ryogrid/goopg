@@ -2100,9 +2100,6 @@ func (o *insertOp) Next() (TupleSlot, error) {
 			if werr != nil {
 				return nil, werr
 			}
-			if ierr := emitCanonicalHeapInsert(o.ctx, targetRel, ptr); ierr != nil {
-				return nil, ierr
-			}
 			// M0104-0007 / M0118-0001: SSI write-path hook on the newly
 			// inserted tuple's (block, slot). Conflict-in installs an rw-edge
 			// against any SERIALIZABLE reader that holds a covering predicate
@@ -2151,9 +2148,6 @@ func (o *insertOp) Next() (TupleSlot, error) {
 		ptr, werr := writeHeapRowReturning(o.ctx, targetRel, cols, row)
 		if werr != nil {
 			return nil, werr
-		}
-		if ierr := emitCanonicalHeapInsert(o.ctx, targetRel, ptr); ierr != nil {
-			return nil, ierr
 		}
 		// M0104-0007 / M0118-0001: SSI write-path hook for the non-partitioned
 		// insert path; aborts in place (40001) on a committed-pivot structure.
@@ -3352,11 +3346,6 @@ func tryApplyHOTUpdate(
 				// Emit WAL for the prune BEFORE the HOT-insert WAL so replay
 				// restores space first.
 				if pderr := markHeapPruneOptDirty(ctx.Pool, s, rel, blk, result); pderr == nil {
-					if cerr := emitCanonicalHeapPruneLocked(ctx, s, rel, blk, uint32(effectiveWriterXID(ctx)), true); cerr != nil {
-						s.Unlock()
-						ctx.Pool.Unpin(s)
-						return false, cerr
-					}
 					newSlot, addErr = storage.PageAddHeapTuple(s.Page(), tup)
 				}
 			}
@@ -3428,9 +3417,6 @@ func tryApplyHOTUpdate(
 	derr := markHeapHotUpdateDirty(ctx.Pool, s, rel, blk, oldSlot, effectiveWriterXID(ctx), tupleBytes)
 	s.Unlock()
 	ctx.Pool.Unpin(s)
-	if derr == nil {
-		derr = emitCanonicalHeapHotUpdate(ctx, rel, blk, newSlot)
-	}
 	if derr == nil && ctx.InDMLCTE && ctx.CTEWriteFence != nil {
 		newItemPtr := storage.ItemPointer{Block: blk, Offset: newSlot}
 		oldItemPtr := storage.ItemPointer{Block: blk, Offset: oldSlot}
@@ -4281,15 +4267,6 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 						o.ctx.Pool.Unpin(s2)
 					}
 				}
-				// Emit canonical WAL for this UPDATE.
-				if o.ctx.LogCanonical != nil {
-					if derr := emitCanonicalHeapDelete(o.ctx, rel, pu.blk, pu.slot); derr != nil {
-						return nil, derr
-					}
-					if ierr := emitCanonicalHeapInsert(o.ctx, targetWriteRel, newPtr); ierr != nil {
-						return nil, ierr
-					}
-				}
 				break
 			}
 		}
@@ -5024,16 +5001,6 @@ func (o *updateOp) Next() (TupleSlot, error) {
 						return nil, cerr
 					}
 				}
-				// Emit canonical WAL for this UPDATE: DELETE of old page
-				// (post xmax+ctid stamp) then INSERT of new page.
-				if o.ctx.LogCanonical != nil {
-					if derr := emitCanonicalHeapDelete(o.ctx, puRel, pu.blk, pu.slot); derr != nil {
-						return nil, derr
-					}
-					if ierr := emitCanonicalHeapInsert(o.ctx, targetWriteRel, newPtr); ierr != nil {
-						return nil, ierr
-					}
-				}
 				break // success — exit epq retry loop
 			} // end epq retry loop
 		} // end if !used
@@ -5630,9 +5597,6 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 			if derr != nil {
 				return nil, derr
 			}
-			if cerr := emitCanonicalHeapDelete(o.ctx, victimRel, v.blk, v.slot); cerr != nil {
-				return nil, cerr
-			}
 			break // success — exit epq retry loop
 		} // end epq retry loop
 		if !epqSkipDel {
@@ -6171,14 +6135,6 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 					return nil, cerr
 				}
 			}
-			if o.ctx.LogCanonical != nil {
-				if derr := emitCanonicalHeapDelete(o.ctx, puSrcRel, pu.blk, pu.slot); derr != nil {
-					return nil, derr
-				}
-				if ierr := emitCanonicalHeapInsert(o.ctx, puRel, newPtr); ierr != nil {
-					return nil, ierr
-				}
-			}
 		}
 		if serr := ssiRecordTupleWrite(o.ctx, puSrcRel, pu.blk, pu.slot); serr != nil {
 			return nil, serr
@@ -6392,9 +6348,6 @@ func (o *deleteOp) deleteWithUsing() (TupleSlot, error) {
 		o.ctx.Pool.Unpin(s)
 		if derr != nil {
 			return nil, derr
-		}
-		if cerr := emitCanonicalHeapDelete(o.ctx, vRel, v.blk, v.slot); cerr != nil {
-			return nil, cerr
 		}
 		if serr := ssiRecordTupleWrite(o.ctx, vRel, v.blk, v.slot); serr != nil {
 			return nil, serr
@@ -7799,11 +7752,8 @@ func isLiveForUniqueCheck(ctx *Context, xmin, xmax storage.TransactionID) bool {
 // page in a checkpoint epoch emit a small logical record instead
 // of a full FPI. See docs/design/0002-0003-redo-records.md.
 func writeHeapRow(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, row Row) error {
-	ptr, err := writeHeapRowReturning(ctx, rel, cols, row)
-	if err != nil {
-		return err
-	}
-	return emitCanonicalHeapInsert(ctx, rel, ptr)
+	_, err := writeHeapRowReturning(ctx, rel, cols, row)
+	return err
 }
 
 // writeHeapRowReturning is writeHeapRow's variant that surfaces the
@@ -7881,8 +7831,7 @@ func writeHeapRowReturning(ctx *Context, rel storage.RelFileNode, cols []catalog
 	}
 
 	// Always emit the native RecordKindHeapInsert WAL record so the logical
-	// decoder sees the change. When ctx.LogCanonical != nil, the caller also
-	// emits a canonical XLOG_HEAP_INSERT (FPI) via emitCanonicalHeapInsert.
+	// decoder sees the change.
 	// PG physical standbys skip the native record; goopg's classifier skips
 	// the canonical one. Both coexist safely in the WAL stream.
 	logHeap := ctx.Pool.LogHeapInsert()
@@ -8124,9 +8073,6 @@ func writeHeapRowReturningPG(ctx *Context, rel storage.RelFileNode, cols []catal
 	}
 
 	logHeap := ctx.Pool.LogHeapInsert()
-	if ctx.LogCanonical != nil {
-		logHeap = nil
-	}
 	tryAppendToBlock := func(blk storage.BlockNumber) (bool, error) {
 		slot, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
 		if err != nil {
@@ -8328,8 +8274,7 @@ func markHeapDeleteDirtyAndClearVM(
 ) error {
 	// Always emit the native RecordKindHeapDelete WAL record so the logical
 	// decoder (classifier.go) sees the change for pgoutput/logical replication.
-	// When ctx.LogCanonical != nil, the caller additionally emits a canonical
-	// XLOG_HEAP_DELETE record (FPI) after unpinning the slot. PG physical
+	// PG physical
 	// standbys safely skip the native record (classifyXLogRecord routes it via
 	// RmgrXLog/0xF0) and apply the canonical FPI; goopg's classifier skips the
 	// canonical record and processes the native one.
@@ -8342,114 +8287,3 @@ func markHeapDeleteDirtyAndClearVM(
 	return nil
 }
 
-// emitCanonicalHeapInsert emits a PG-canonical XLOG_HEAP_INSERT record with
-// a full-page image for the page at ptr. Called by insertOp and updateOp
-// (for the new-tuple page) after writeHeapRowReturning, when ctx.LogCanonical
-// is non-nil. The page is re-pinned to capture its post-insert state.
-func emitCanonicalHeapInsert(ctx *Context, rel storage.RelFileNode, ptr storage.ItemPointer) error {
-	if ctx.LogCanonical == nil || ctx.Pool == nil {
-		return nil
-	}
-	slot, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: ptr.Block})
-	if err != nil {
-		return fmt.Errorf("canonical WAL pin insert: %w", err)
-	}
-	page := make(storage.Page, storage.BlockSize)
-	slot.Lock()
-	copy(page, slot.Page())
-	endLSN, emitErr := catalog.PgCanonicalHeapInsert(rel, ptr.Block, page, ptr.Offset,
-		uint32(ctx.Tx.XID), ctx.LogCanonical)
-	if emitErr == nil && endLSN != 0 {
-		storage.MustHeader(slot.Page()).SetLSN(storage.LSN(endLSN))
-		ctx.Pool.MarkDirty(slot)
-	}
-	slot.Unlock()
-	ctx.Pool.Unpin(slot)
-	return emitErr
-}
-
-// emitCanonicalHeapHotUpdate emits a PG-canonical XLOG_HEAP_INPLACE record
-// with a full-page image for the page at (rel, blk), after a HOT update has
-// stamped the old tuple's xmax and inserted the new tuple in place on the
-// same page (tryApplyHOTUpdate, after markHeapHotUpdateDirty). Only called
-// when ctx.LogCanonical is non-nil. A vanilla PG18 standby (or
-// pg_waldump --save-fullpage) restores the whole page from this FPI rather
-// than re-deriving the HOT chain link — mirrors PgCanonicalHeapInplace's use
-// for the datfrozenxid in-place update (M0117-0008 Part B).
-func emitCanonicalHeapHotUpdate(ctx *Context, rel storage.RelFileNode, blk storage.BlockNumber, newSlot uint16) error {
-	if ctx.LogCanonical == nil || ctx.Pool == nil {
-		return nil
-	}
-	s, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
-	if err != nil {
-		return fmt.Errorf("canonical WAL pin hot update: %w", err)
-	}
-	page := make(storage.Page, storage.BlockSize)
-	s.Lock()
-	copy(page, s.Page())
-	endLSN, emitErr := catalog.PgCanonicalHeapInplace(rel, blk, page, newSlot, uint32(ctx.Tx.XID), ctx.LogCanonical)
-	if emitErr == nil && endLSN != 0 {
-		storage.MustHeader(s.Page()).SetLSN(storage.LSN(endLSN))
-		ctx.Pool.MarkDirty(s)
-	}
-	s.Unlock()
-	ctx.Pool.Unpin(s)
-	return emitErr
-}
-
-// emitCanonicalHeapPruneLocked emits a PG-canonical XLOG_HEAP2_PRUNE_* record
-// with a full-page image for the page held by the already-pinned-and-locked
-// slot s, capturing its CURRENT (post-prune) contents. Unlike the sibling
-// emitCanonicalHeap* helpers, this one does NOT re-Pin/Lock: it is called
-// from inside tryApplyHOTUpdate's page-full opportunistic-prune fallback
-// while the page's content lock is still held (re-locking the same slot
-// would deadlock), immediately after markHeapPruneOptDirty so the FPI
-// reflects the pruned-but-not-yet-re-added state. Only called when
-// ctx.LogCanonical is non-nil. xid is InvalidTransactionID (0) for a
-// VACUUM-driven prune (vacuumCore has no live transaction of its own to
-// stamp) and the current transaction's xid for an in-transaction
-// opportunistic prune — inert either way, since a standby restores the
-// whole page from the FPI without consulting the record's xl_xid.
-func emitCanonicalHeapPruneLocked(ctx *Context, s *storage.Slot, rel storage.RelFileNode, blk storage.BlockNumber, xid uint32, onAccess bool) error {
-	if ctx.LogCanonical == nil {
-		return nil
-	}
-	page := make(storage.Page, storage.BlockSize)
-	copy(page, s.Page())
-	endLSN, emitErr := catalog.PgCanonicalHeapPrune(rel, blk, page, xid, onAccess, ctx.LogCanonical)
-	if emitErr == nil && endLSN != 0 {
-		storage.MustHeader(s.Page()).SetLSN(storage.LSN(endLSN))
-		if ctx.Pool != nil {
-			ctx.Pool.MarkDirty(s)
-		}
-	}
-	return emitErr
-}
-
-// emitCanonicalHeapDelete emits a PG-canonical XLOG_HEAP_DELETE record with
-// a full-page image for the page at (rel, blk). Called by deleteOp and
-// updateOp (for the old-tuple/xmax-stamp page) after
-// markHeapDeleteDirtyAndClearVM and the slot is unpinned, when
-// ctx.LogCanonical is non-nil. The page is re-pinned to capture its
-// post-xmax-stamp state.
-func emitCanonicalHeapDelete(ctx *Context, rel storage.RelFileNode, blk storage.BlockNumber, slot uint16) error {
-	if ctx.LogCanonical == nil || ctx.Pool == nil {
-		return nil
-	}
-	s, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
-	if err != nil {
-		return fmt.Errorf("canonical WAL pin delete: %w", err)
-	}
-	page := make(storage.Page, storage.BlockSize)
-	s.Lock()
-	copy(page, s.Page())
-	xid := uint32(ctx.Tx.XID)
-	endLSN, emitErr := catalog.PgCanonicalHeapDelete(rel, blk, page, slot, xid, xid, ctx.LogCanonical)
-	if emitErr == nil && endLSN != 0 {
-		storage.MustHeader(s.Page()).SetLSN(storage.LSN(endLSN))
-		ctx.Pool.MarkDirty(s)
-	}
-	s.Unlock()
-	ctx.Pool.Unpin(s)
-	return emitErr
-}

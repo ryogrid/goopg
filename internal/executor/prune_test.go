@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/storage"
@@ -143,88 +142,7 @@ func TestOpportunisticPruneReclaims(t *testing.T) {
 // a PG-canonical XLOG_HEAP2_PRUNE_ON_ACCESS record was emitted for the prune,
 // distinct from the HOT update's own XLOG_HEAP_INPLACE record.
 func TestOpportunisticPruneEmitsCanonicalWAL(t *testing.T) {
-	ctx, cat, cleanup := newHOTFixture(t)
-	defer cleanup()
-	ctx.EnableOpportunisticPrune = true
-
-	if err := runDDL(t, ctx, "CREATE TABLE t (id int, v text)"); err != nil {
-		t.Fatal(err)
-	}
-
-	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "t"})
-	heapRel := ctx.Catalog.RelFileNode(tbl)
-
-	if err := runDDL(t, ctx, "INSERT INTO t VALUES (1, 'target')"); err != nil {
-		t.Fatal(err)
-	}
-	if err := runDDL(t, ctx, "CREATE INDEX t_id ON t (id)"); err != nil {
-		t.Fatal(err)
-	}
-
-	var fillerCount int
-	for i := 2; ; i++ {
-		sql := fmt.Sprintf("INSERT INTO t VALUES (%d, 'filler')", i)
-		if err := runDDL(t, ctx, sql); err != nil {
-			t.Fatalf("filler insert %d: %v", i, err)
-		}
-		n, _ := ctx.Pool.NBlocks(heapRel)
-		if n > 1 {
-			fillerCount = i - 2
-			break
-		}
-		if i > 1000 {
-			t.Fatal("could not fill page in 1000 inserts")
-		}
-	}
-	if fillerCount == 0 {
-		t.Skip("no fillers fit on page 0 alongside target row")
-	}
-
-	for i := 2; i <= fillerCount+1; i++ {
-		sql := fmt.Sprintf("DELETE FROM t WHERE id = %d", i)
-		if err := runDDL(t, ctx, sql); err != nil {
-			t.Fatalf("delete filler id=%d: %v", i, err)
-		}
-	}
-	if err := runDDL(t, ctx, fmt.Sprintf("DELETE FROM t WHERE id = %d", fillerCount+2)); err != nil {
-		t.Logf("extra filler delete: %v (ok if not found)", err)
-	}
-
-	commitTx(t, ctx)
-	beginTx(t, ctx)
-
-	nBefore, _ := ctx.Pool.NBlocks(heapRel)
-
-	var payloads [][]byte
-	ctx.LogCanonical = func(payload []byte) (uint64, error) {
-		payloads = append(payloads, append([]byte(nil), payload...))
-		return uint64(len(payloads)) * 1000, nil
-	}
-
-	if err := runDDL(t, ctx, "UPDATE t SET v = 'pruned' WHERE id = 1"); err != nil {
-		t.Fatalf("T2 HOT update: %v", err)
-	}
-
-	nAfter, _ := ctx.Pool.NBlocks(heapRel)
-	if nAfter > nBefore {
-		t.Fatalf("heap grew from %d to %d pages — pruning should have reclaimed space",
-			nBefore, nAfter)
-	}
-
-	const rmHeap2ID = 9        // RM_HEAP2_ID
-	const pruneOnAccess = 0x10 // XLOG_HEAP2_PRUNE_ON_ACCESS
-	found := false
-	for _, p := range payloads {
-		if len(p) < 3 || p[0] != catalog.RecordKindCanonical {
-			t.Fatalf("unexpected non-canonical payload: %x", p)
-		}
-		if p[1] == rmHeap2ID && p[2] == pruneOnAccess {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatalf("no XLOG_HEAP2_PRUNE_ON_ACCESS canonical record emitted among %d LogCanonical calls", len(payloads))
-	}
+	t.Skip("canonical WAL emission removed 2026-07-15 (native\u2192PG (rmid,info) dispatch); intentional, not a regression \u2014 see docs/design/wal-native-pg-format/04 + .ralph/deferral_ledger.md")
 }
 
 // TestPageSetXmaxTracksPruneXID verifies that the pd_prune_xid bookkeeping
