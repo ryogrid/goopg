@@ -32,6 +32,14 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
   (Dropped the doc's illustrative `xid` param — it's a header field, threaded in A1 — and the
   caller-set `ForkFlags`/hole fields — derived from block contents / page header instead.)
 - [ ] **A1** `xl_xid` threading through `Append`/`appendPGCompat`/`encodeRecordXLog`; stamp live xid at emit sites.
+  > ⚠️ **Not standalone-additive (found 2026-07-15).** `nativeHeaderMatchesMainData` (`pg_xlog_decode.go:276`)
+  > gates the native-replay fast-path on `header.XID == classifyXLogRecord(...)`, which returns **0**.
+  > Stamping a *real* xid into the header while a record body is still native fails that check →
+  > `decoded.Payload` goes nil → the record routes to FPI-only `replayDecodedXLogRecord` → silent recovery
+  > corruption. So xid can only be stamped for records *already flipped* to PG bodies (blocks>0 bypasses the
+  > fast-path). **⇒ Fold A1 into A2** (do the xid-stamp per record as it flips). The API plumbing exists
+  > across **145 `.Append(` call sites** — thread it, but pass the live xid only from flipped emit sites; all
+  > others keep 0 until they flip. Retire `nativeHeaderMatchesMainData` when the last native record is gone.
 - [ ] **A2** HeapInsert flip — `xl_heap_insert{offnum,flags}` + blk0 `xl_heap_header`+tuple; FPI first-touch. (doc 01 §6)
 - [ ] **A3** HeapDelete flip — `xl_heap_delete{xmax,offnum,infobits_set,flags}`.
 - [ ] **A4** HeapHotUpdate flip — `xl_heap_update` + 2 block refs; route real non-HOT updates here.
@@ -67,5 +75,8 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
 ## Log
 - 2026-07-15: Phase 0 complete (Ralph paused, WIP stashed `8d8a32da`, tracker created). Implementing on
   branch `wal-pg-stream-impl` off `344470fe`. Starting A0.
-- 2026-07-15: **A0 landed** — `internal/wal/xlog_assemble.go` (+`_test.go`). 6 round-trip cases green;
-  full `internal/wal` suite + `-race` green; `go build ./...` green. Next: A1 (xl_xid threading).
+- 2026-07-15: **A0 landed** (commit `83c04364`) — `internal/wal/xlog_assemble.go` (+`_test.go`). 6
+  round-trip cases green; full `internal/wal` suite + `-race` green; `go build ./...` green.
+- 2026-07-15: Found A1 is **not** standalone-additive (see A1 ⚠️ note); folded into A2. Session boundary
+  taken at A0 (clean committed keystone). **Next session: A2** (HeapInsert flip incl. per-record xid stamp,
+  replay dispatch, FPI/logical unification) — its own focused session with full crash-recovery gates.
