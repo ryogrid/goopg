@@ -9755,33 +9755,26 @@ func decodeXLogHeapInsertTuple(block XLogBlockRef, xid storage.TransactionID, of
 	if len(block.Data) < sizeOfXLogHeapHeaderData {
 		return nil, fmt.Errorf("wal: invalid xlog heap-insert block-data len %d (want >= %d)", len(block.Data), sizeOfXLogHeapHeaderData)
 	}
-	hoff := block.Data[4]
-	tupleData := append([]byte(nil), block.Data[sizeOfXLogHeapHeaderData:]...)
-	prefixLen := int(hoff) - storage.SizeOfHeapTupleHeaderData
-	if prefixLen > 0 {
-		if prefixLen > len(tupleData) {
-			return nil, fmt.Errorf("wal: xlog heap-insert tuple prefix len %d exceeds payload len %d", prefixLen, len(tupleData))
-		}
-		for _, b := range tupleData[:prefixLen] {
-			if b != 0 {
-				return nil, fmt.Errorf("wal: xlog heap-insert tuple prefix len %d not yet supported", prefixLen)
-			}
-		}
-		tupleData = tupleData[prefixLen:]
-	}
-	tuple := storage.HeapTuple{
-		Header: storage.HeapTupleHeader{
-			Xmin:      xid,
-			Xmax:      storage.InvalidTransactionID,
-			Xvac:      storage.InvalidTransactionID,
-			CTID:      storage.ItemPointer{Block: block.Block, Offset: offnum},
-			Infomask2: binary.LittleEndian.Uint16(block.Data[0:2]),
-			Infomask:  binary.LittleEndian.Uint16(block.Data[2:4]),
-			Hoff:      hoff,
-		},
-		Data: tupleData,
-	}
-	return tuple.MarshalBinary()
+	// PG's xl_heap_insert block-0 data is xl_heap_header (t_infomask2,
+	// t_infomask, t_hoff) followed by the tuple bytes past the fixed 23-byte
+	// header — the null bitmap + alignment + column data — verbatim. Rebuild the
+	// marshaled tuple by reconstructing the fixed header (t_xmin from the record;
+	// a fresh insert is not deleted and self-points t_ctid at (block, offnum),
+	// which A2-pre made the primary store too) and concatenating that data
+	// verbatim. Verbatim concatenation preserves the null bitmap; the previous
+	// prefix-stripping reconstruction only handled bitmap-less tuples (and
+	// rejected a non-zero bitmap outright).
+	dataPortion := block.Data[sizeOfXLogHeapHeaderData:]
+	out := make([]byte, storage.SizeOfHeapTupleHeaderData+len(dataPortion))
+	binary.LittleEndian.PutUint32(out[0:4], uint32(xid))                           // t_xmin
+	binary.LittleEndian.PutUint32(out[4:8], uint32(storage.InvalidTransactionID))  // t_xmax
+	binary.LittleEndian.PutUint32(out[8:12], uint32(storage.InvalidTransactionID)) // t_field3 (xvac)
+	binary.LittleEndian.PutUint32(out[12:16], uint32(block.Block))                 // t_ctid.block (self)
+	binary.LittleEndian.PutUint16(out[16:18], offnum)                              // t_ctid.offset (self)
+	copy(out[18:22], block.Data[0:4])                                              // t_infomask2 + t_infomask
+	out[22] = block.Data[4]                                                        // t_hoff
+	copy(out[storage.SizeOfHeapTupleHeaderData:], dataPortion)
+	return out, nil
 }
 
 // ReplayFromDir reads records from <dataDir>/pg_wal and replays them.

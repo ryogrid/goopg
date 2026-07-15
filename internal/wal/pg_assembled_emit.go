@@ -3,6 +3,8 @@ package wal
 import (
 	"encoding/binary"
 	"fmt"
+
+	"github.com/goopg/goopg/internal/storage"
 )
 
 // pg_assembled_emit.go carries PG-format records (built by assembleXLogRecord)
@@ -81,4 +83,52 @@ func encodeAssembledXLog(body []byte, rmid Rmgr, info uint8, xid uint32, prev ui
 	}
 	copy(out[xlogRecordHeaderSize:realLen], body)
 	return out, realLen, nil
+}
+
+// xlhInsertContainsNewTuple is PG's XLH_INSERT_CONTAINS_NEW_TUPLE
+// (heapam_xlog.h): block 0 carries the inserted tuple's data.
+const xlhInsertContainsNewTuple uint8 = 0x08
+
+// EncodeHeapInsertPG builds a PostgreSQL xl_heap_insert record for one heap
+// tuple insertion, framed for the assembled-record Append path
+// (framePGAssembled). It is the PG-format replacement for the goopg-native
+// EncodeHeapInsert. `tuple` is the fully marshaled HeapTuple
+// (storage.HeapTuple.MarshalBinary): a fixed 23-byte header, then the null
+// bitmap + alignment + column data. The record carries:
+//   - main data: xl_heap_insert{offnum uint16 = lineSlot, flags uint8}
+//   - block 0 (HAS_DATA): xl_heap_header{t_infomask2, t_infomask, t_hoff} + the
+//     tuple bytes past the fixed header (tuple[SizeOfHeapTupleHeaderData:]),
+//     verbatim (bitmap + padding + data).
+//
+// The owning xid is the tuple's xmin (tuple[0:4]) and is stamped into the
+// XLogRecord header (xl_xid); replay reconstructs the fixed header from it and
+// self-points t_ctid at (blk, lineSlot) — which A2-pre made the primary store
+// too, so stored page == replay. No FPI is attached here; the first-touch
+// full-page image is still emitted as a separate record by
+// MarkDirtyLogicalChange (FPI/logical unification is a later step).
+func EncodeHeapInsertPG(rel storage.RelFileNode, blk storage.BlockNumber, lineSlot uint16, tuple []byte) ([]byte, error) {
+	if len(tuple) < storage.SizeOfHeapTupleHeaderData {
+		return nil, fmt.Errorf("wal: heap-insert tuple %d bytes < fixed header %d", len(tuple), storage.SizeOfHeapTupleHeaderData)
+	}
+	xid := binary.LittleEndian.Uint32(tuple[0:4]) // t_xmin
+
+	// xl_heap_header (sizeOfXLogHeapHeaderData=5): t_infomask2, t_infomask,
+	// t_hoff — the tuple's fixed-header offsets [18:20]/[20:22]/[22] — then the
+	// tuple bytes past the fixed header, verbatim.
+	blockData := make([]byte, 0, sizeOfXLogHeapHeaderData+len(tuple)-storage.SizeOfHeapTupleHeaderData)
+	blockData = append(blockData, tuple[18:22]...)  // t_infomask2 (2) + t_infomask (2)
+	blockData = append(blockData, tuple[22])        // t_hoff
+	blockData = append(blockData, tuple[storage.SizeOfHeapTupleHeaderData:]...)
+
+	mainData := make([]byte, sizeOfXLogHeapInsertData)
+	binary.LittleEndian.PutUint16(mainData[0:2], lineSlot) // offnum
+	mainData[2] = xlhInsertContainsNewTuple                // flags
+
+	body, err := assembleXLogRecord(mainData, []BlockRef{{
+		ID: 0, Rel: rel, Block: blk, Data: blockData,
+	}})
+	if err != nil {
+		return nil, err
+	}
+	return framePGAssembled(RmgrHeap, xlogHeapInsert, xid, body), nil
 }
