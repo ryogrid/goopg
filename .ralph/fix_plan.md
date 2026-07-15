@@ -11104,6 +11104,46 @@ mirroring M0119's ledger `status` column.
       incrementally") as a separate follow-on loop, not bundled with the
       mapping-table change.
 
+- [x] **Doc 04 §5.4 third additive slice landed —
+      `internal/wal/format.go`'s `recordKindToRmgrInfo` mapping table.**
+      Full §3.1 table (every PG-analog `RecordKind` → real PG `(rmid,
+      info)`, confirmed against `postgres/src/include/access/
+      {heapam_xlog,nbtxlog}.h`, `catalog/{storage_xlog,pg_control}.h`,
+      `access/clog.h`) + the §3.2 default fallback (every goopg-private
+      catalog/DDL kind → `RmgrGoopgCatalog`). Needed opcode consts added to
+      `pg_xlog_decode.go` (`xlogHeapLock`/`xlogBtreeInsertLeaf`/`SplitL`/
+      `SplitR`/`UnlinkPage`/`NewRoot`/`MarkPageHalfDead`/`Vacuum`/
+      `xlogSmgrCreate`/`xlogXLogFPI`/`xlogClogTruncate`).
+      `TestRecordKindToRmgrInfoAnalogTable`/`…CustomDefault` pin every §3.1
+      row + the §3.2 fallback (`internal/wal/record_kind_rmgr_mapping_test.go`).
+      **Deliberately NOT wired into `classifyXLogRecord` this loop** —
+      tracing the wiring uncovered that it cannot land alone: `ApplyRecord`'s
+      existing rmid gate, a `RmgrGoopgCatalog` no-op case
+      `replayDecodedXLogRecord` is missing, and a genuine
+      `RecordKindPageImage`/`XLOG_FPI` collision (would silently no-op real
+      page-image replay) all have to change in the *same* commit as the
+      classify rewrite or goopg's own crash recovery breaks — full findings
+      + the concrete fix for each (5 points) recorded in doc 04 §5.4 (4th
+      bullet) so the next loop implements the atomic classify+recovery
+      change directly instead of re-deriving it.
+      `TestRecordKindToRmgrInfoNotYetWired` pins the current transitional
+      state and is designed to fail (delete it, don't "fix" it) the day the
+      wiring lands. Also found and documented (not touched): a stale,
+      uncommitted, pre-additive-first worktree at
+      `.claude/worktrees/wal-canonical-removal/` — doc 04 §8 R3 has the full
+      note; left alone pending a human decision. Gates: `go build ./...`/`go
+      vet ./...` clean; verified inert (`recordKindToRmgrInfo` has no
+      non-test caller); `go test`/`go test -race ./internal/wal/...`
+      full-package green; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh`
+      PASS (0 failed, all 3 workloads). **Next step:** the atomic
+      `classifyXLogRecord` rewrite + `internal/wal/recovery.go` §4 dispatch
+      rework (doc 04 §5.4 4th/5th bullets — `isGoopgOwnedRmgr` gate,
+      `RmgrGoopgCatalog`/`XLOG_FPI` cases, `stream_replayer.go`
+      `XactCommitInval` case) as ONE change, with full G-crash
+      (`go test -run 'Crash|Recovery|Durability' ./internal/initdb/
+      ./internal/wal/` + `TestKillKillRecovery`) before/after per §8 R1.
+
 - [ ] **Nightly whole-suite regression batch — implementation** (~6). Design is
       DONE and committed: `analysis/tests-overview-260706/` (test-landscape
       snapshot) → `ci/design/` (6-doc architecture: S0 preflight → S1 two

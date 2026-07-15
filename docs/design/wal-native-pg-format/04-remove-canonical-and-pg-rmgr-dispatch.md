@@ -282,15 +282,100 @@ case RmgrXLog:
   row in §3).
   ~~`internal/wal/pg_xlog_decode.go`: add HEAP2 opcode consts
   (`0x10/0x20/0x30`) and any others used by the mapping.~~
-- `internal/wal/format.go`: `recordKindToRmgrInfo` mapping table + rewrite
-  `classifyXLogRecord` to use it; retire `xlogInfoDefault` as the catch-all.
-- `internal/wal/recovery.go`: the §4 dispatch rework — `replayDecodedXLogRecord`
-  rmgr arms delegate to the native `replayX` functions (reuse the `:8756+`
-  payload[0] switch); replace the FPI-only `RmgrHeap`/`RmgrBtree` arms
-  (`:9268-9299`); retire the `0xF0`/allow-list routing gates (`:8735/8745`,
-  list `:9191`) as routing, keeping the empty-payload guard (`:8732`) and the
-  optional legacy `0xF0` arm.
-- `internal/wal/stream_replayer.go:159` (`replayedXactInfo`): update to the new
+- **Landed 2026-07-15:** `internal/wal/format.go`: `recordKindToRmgrInfo(kind
+  byte) (Rmgr, uint8)` — the full §3.1 table (every PG-analog `RecordKind`)
+  plus the §3.2 default (`RmgrGoopgCatalog`, info 0) for every other kind.
+  Needed opcode consts added to `internal/wal/pg_xlog_decode.go`
+  (`xlogHeapLock=0x60`, `xlogBtreeInsertLeaf=0x00`/`SplitL=0x30`/`SplitR=0x40`
+  (R unused, goopg has one `BtreeSplit` kind — kept for completeness)/
+  `UnlinkPage=0x80`/`NewRoot=0xA0`/`MarkPageHalfDead=0xB0`/`Vacuum=0xC0`,
+  `xlogSmgrCreate=0x10`, `xlogXLogFPI=0xB0`, `xlogClogTruncate=0x10` —
+  confirmed against `postgres/src/include/access/{heapam_xlog,nbtxlog}.h`,
+  `catalog/{storage_xlog,pg_control}.h`, `access/clog.h`).
+  `TestRecordKindToRmgrInfoAnalogTable`/`…CustomDefault` pin every §3.1 row +
+  the §3.2 fallback. **Not yet wired into `classifyXLogRecord`** — see the
+  next bullet's "found while building this" notes; `classifyXLogRecord`
+  still returns the old `RmgrXLog`/`xlogInfoDefault` catch-all
+  (`TestRecordKindToRmgrInfoNotYetWired` pins this and is designed to break,
+  loudly, the day the wiring lands — delete it then). Verified inert
+  (`recordKindToRmgrInfo` has no non-test caller); `go build ./...`/`go vet
+  ./...` clean; `go test`/`go test -race ./internal/wal/...` full-package
+  green; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+  `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh` PASS (0
+  failed, all 3 workloads).
+  ~~`internal/wal/format.go`: `recordKindToRmgrInfo` mapping table + rewrite
+  `classifyXLogRecord` to use it; retire `xlogInfoDefault` as the catch-all.~~
+- **Found while building the table above (resolves before wiring, not yet
+  applied):** wiring `recordKindToRmgrInfo` into `classifyXLogRecord` alone
+  — without the §4 recovery rework in the *same* change — breaks goopg's own
+  crash recovery immediately, confirmed by tracing three concrete paths:
+  1. `ApplyRecord`'s existing gate (`ApplyRecord`, `ApplyRecord` calls this
+     "M0106-0011" comment) — `if r.XLog.Header.Rmid != RmgrXLog ||
+     r.XLog.Header.Info != xlogInfoDefault { return
+     replayDecodedXLogRecord(mgr, r) }` — assumes every native record
+     classifies `RmgrXLog`/`0xF0`. Once real per-kind rmids are live, this
+     must become `if !isGoopgOwnedRmgr(r.XLog.Header.Rmid) { return
+     replayDecodedXLogRecord(mgr, r) }` (`isGoopgOwnedRmgr` = new helper:
+     `RmgrHeap`/`RmgrHeap2`/`RmgrBtree`/`RmgrXact`/`RmgrStorage`/`RmgrCLOG`/
+     `RmgrGoopgCatalog`).
+  2. `decodeRecordXLogDetailed`'s `nativeHeaderMatchesMainData`
+     (`pg_xlog_decode.go:241-247`) already calls `classifyXLogRecord`
+     symmetrically at decode time to decide whether to populate
+     `decoded.Payload` from `xlogRecord.MainData` — so **no decode-side
+     change is needed**: every no-block-refs native record (all of them,
+     today) still round-trips its payload correctly once classify's output
+     changes, because encode and decode call the same function. This was
+     the biggest open question going in and it resolves for free.
+  3. `replayDecodedXLogRecord`'s `default: return false,
+     unsupportedDecodedXLogRecord(r)` arm would **error out** (not silently
+     drop — worse, it aborts recovery) for any of the ~80 catalog/DDL
+     `RecordKind`s not in `nativeApplyRecordKindKnown`'s allow-list (e.g.
+     `RecordKindCreateTransform`), since those hit `ApplyRecord`'s
+     `!nativeApplyRecordKindKnown` gate *before* the rmid gate and land
+     here with `Rmid=RmgrGoopgCatalog`. Needs one new blanket case: `case
+     RmgrGoopgCatalog: return false, nil` (matches every one of
+     `ApplyRecord`'s own no-op cases for these kinds — the recovery driver
+     in `internal/initdb/*_ddl_recovery.go` re-applies them separately).
+  4. **`RecordKindPageImage` genuinely collides with real PG semantics** —
+     it maps to `RmgrXLog`/`XLOG_FPI` (§3.1), so with only fix (1) above it
+     would route to `replayDecodedXLogRecord`'s `RmgrXLog` arm, whose
+     `default: return false, nil` (post parameter-change) would **silently
+     no-op** a real page-image restore that `replayPageImage(mgr,
+     r.Payload)` currently performs via the native switch — this is the R1
+     "silently dropped" failure mode materializing concretely, not
+     hypothetically. Needs a new `case xlogXLogFPI:` arm under `RmgrXLog`
+     in `replayDecodedXLogRecord` delegating to `replayPageImage(mgr,
+     r.Payload)` (payload is populated per point 2 above — no blocks).
+  5. Canonical (`0xFE`) FPI records are unaffected by any of the above: they
+     always carry block refs, so `nativeHeaderMatchesMainData`'s
+     `len(xlogRecord.Blocks)==0` guard leaves `decoded.Payload` nil for
+     them regardless of rmid, and they hit `ApplyRecord`'s *first* gate
+     (`len(r.Payload)==0`) before the rmid check ever runs. The existing
+     `RmgrHeap`/`RmgrBtree` FPI arms (`recovery.go:9268-9289`) **must stay
+     exactly as-is** for this slice — do **not** "replace" them as the
+     original §4 draft pseudocode suggested; canonical emission (§5.1-5.3)
+     hasn't been removed yet, and several active call sites (§5.2) still
+     depend on FPI replay for canonical btree-split/index-insert records.
+     Revisit only after §5.1-5.3 lands.
+- `internal/wal/recovery.go`: apply the §4 dispatch rework per the 5 points
+  above — add `isGoopgOwnedRmgr`, patch `ApplyRecord`'s rmid gate, add the
+  `RmgrGoopgCatalog` no-op case and the `RmgrXLog`/`XLOG_FPI` case to
+  `replayDecodedXLogRecord`, leave the FPI `RmgrHeap`/`RmgrBtree` arms
+  untouched. Land together with the `classifyXLogRecord` wiring above in one
+  atomic change (not split across loops) — full G-crash (`go test -run
+  'Crash|Recovery|Durability' ./internal/initdb/ ./internal/wal/` +
+  `TestKillKillRecovery`) before/after, per §8 R1.
+- `internal/wal/stream_replayer.go:159` (`replayedXactInfo`): mostly
+  unaffected — its primary path already keys on `rec.Payload[0]` (populated
+  regardless of rmid per point 2 above), so `RecordKindXactCommit`/`Abort`
+  need no change. Only gap: add a `case RecordKindXactCommitInval:` beside
+  the existing `XactCommit`/`XactAbort` cases (same `DecodeXactMarker` call)
+  — today it falls through to the `Rmid==RmgrXact` fallback, which reads
+  `rec.XLog.Header.XID`, and `classifyXLogRecord`/`encodeRecordXLog` still
+  hard-code `xid=0` for every non-canonical record (a separate, pre-existing
+  gap — the real xid lives only in the payload body, decoded via
+  `DecodeXactMarker`), so the fallback would silently report xid 0 for every
+  replayed `XactCommitInval` without this fix. Update to the new
   rmid scheme; also recognize `XactCommitInval(32)` on the `RmgrXact` path.
 
 ## 6. Test / CI / nightly impact (expected-fail handling)
@@ -341,7 +426,19 @@ port-status CSV `port→defer`, ledger rows):
 - **R2:** custom-rmgr opcode/id allocation for the ~110 no-analog kinds — the body
   `RecordKind` byte stays authoritative; document the allocation.
 - **R3:** Ralph-loop concurrency on the same files — pause the loop or use a
-  worktree before code edits.
+  worktree before code edits. **Found 2026-07-15:** a stale, uncommitted
+  worktree at `.claude/worktrees/wal-canonical-removal/` (branch
+  `wal-canonical-removal`) is checked out at `e9884a60` — this repo's HEAD
+  *before* the two "additive-first" slices (`1e275ea6`/`67117f9a`) landed —
+  and stages the **opposite** ordering: it deletes `canonical.go`/its tests
+  outright (subtractive-first) rather than following the additive-first
+  sequencing this doc's §5.4 has used since. It predates the additive-first
+  decision and was never referenced from `fix_plan.md`/the deferral ledger,
+  so it is orphaned WIP from an earlier abandoned attempt, not active work —
+  do **not** resume or merge it as-is; its removal ordering has to be
+  re-derived against the current (later, more detailed) §3/§4/§5 content
+  before any of it is reusable. Left untouched (not deleted) pending a
+  human decision on whether to salvage or discard it.
 - **R4:** old pgcompat data dirs (all `RM_XLOG/0xF0`) — fresh clusters assumed;
   retain the legacy decode arm (§4) as a cheap safety net or require re-init.
 - **R5:** dropping `XLOG_PARAMETER_CHANGE` removes the `pg_control` GUC echo — verify

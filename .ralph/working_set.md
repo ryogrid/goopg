@@ -1,50 +1,68 @@
-Loop #34 landed doc 04 §5.4's SECOND additive slice (still not the whole
-rework): `internal/wal/pg_xlog_decode.go` gained `xlogHeap2PruneOnAccess=0x10`
-/ `xlogHeap2PruneVacuumScan=0x20` / `xlogHeap2PruneVacuumClean=0x30`
-(RM_HEAP2_ID opcodes, confirmed against
-`postgres/src/include/access/heapam_xlog.h:60-62`) — these are exactly the 3
-opcodes doc §3.1's mapping table cites for `HeapVacuum`/`HeapPruneOpt`/
-`HeapFreeze`; no other HEAP2 opcode is referenced anywhere in §3, so none
-else were added. Verified inert (grepped: no other reference to the new
-const names in the tree). Gates: `go build ./...` clean (info-level
-unused-const diagnostic only, same class as pre-existing `slotOffPersistency`
-in `slots_pg.go`), `go vet ./internal/wal/...` clean, `go test
-./internal/wal/...` and `go test -race ./internal/wal/...` full-package
-green. Ledger row appended (deferral_ledger.md, WAL doc-04 §5.4 second
-slice); fix_plan.md WAL section updated with a new `[x]` bullet + explicit
-next-step; design doc 04 §5.4 second bullet marked "Landed 2026-07-15"
-inline (old bullet struck through, kept for history).
+Loop #35 landed doc 04 §5.4's THIRD additive slice: `internal/wal/format.go`
+gained `recordKindToRmgrInfo(kind byte) (Rmgr, uint8)` — the full §3.1
+PG-analog mapping table + §3.2 custom-rmgr default, unit-tested against
+every doc row (`internal/wal/record_kind_rmgr_mapping_test.go`). Needed
+opcode consts added to `pg_xlog_decode.go` (`xlogHeapLock`/
+`xlogBtreeInsertLeaf`/`SplitL`/`SplitR`/`UnlinkPage`/`NewRoot`/
+`MarkPageHalfDead`/`Vacuum`/`xlogSmgrCreate`/`xlogXLogFPI`/
+`xlogClogTruncate`), confirmed against PG 18.3 source. Deliberately NOT
+wired into `classifyXLogRecord` — the working-set baton from loop #34
+assumed that was next, but tracing it found it CANNOT land alone (would
+break goopg's own crash recovery). Full findings recorded in doc 04 §5.4
+(4th bullet, 5 numbered points) and mirrored in the ledger row appended
+this loop:
+1. `ApplyRecord`'s rmid gate (`recovery.go`, "M0106-0011" comment) assumes
+   every native record classifies `RmgrXLog`/`0xF0` — must become
+   `!isGoopgOwnedRmgr(Rmid)` (new helper: Heap/Heap2/Btree/Xact/Storage/
+   CLOG/GoopgCatalog).
+2. Decode side is unaffected FOR FREE — `nativeHeaderMatchesMainData`
+   (`pg_xlog_decode.go:241-247`) already recomputes `classifyXLogRecord`
+   symmetrically at decode time, so `r.Payload` still populates correctly
+   for every no-block native record once classify's output changes.
+3. `replayDecodedXLogRecord`'s `default:` arm HARD-ERRORS (aborts
+   recovery, not silent) for ~80 catalog/DDL kinds not in
+   `nativeApplyRecordKindKnown`'s allow-list, once they get
+   `Rmid=RmgrGoopgCatalog` — needs one new `case RmgrGoopgCatalog: return
+   false, nil`.
+4. `RecordKindPageImage` → `RmgrXLog`/`XLOG_FPI` (§3.1) genuinely collides
+   with real PG semantics: would route to `replayDecodedXLogRecord`'s
+   `RmgrXLog` default (`return false, nil`), SILENTLY dropping a real
+   page-image restore that `replayPageImage` currently performs — the R1
+   failure mode materializing concretely. Needs a new `case xlogXLogFPI:`
+   arm delegating to `replayPageImage(mgr, r.Payload)`.
+5. Canonical (0xFE) FPI arms (`RmgrHeap`/`RmgrBtree` in
+   `replayDecodedXLogRecord`) must stay UNTOUCHED this slice — they're
+   reached via the empty-payload gate regardless of rmid, and canonical
+   emission (§5.1-5.3) hasn't been removed yet (active call sites still
+   depend on FPI replay). Do NOT "replace" them yet as the original §4
+   draft pseudocode suggested.
 
-Next step for the WAL epic: `internal/wal/format.go` — build the
-`recordKindToRmgrInfo` mapping table (doc §3's FULL table, every
-`RecordKind`→`(rmid,info)` row, both §3.1 PG-analog and §3.2 custom-rmgr)
-and rewrite `classifyXLogRecord` to use it, retiring `xlogInfoDefault` as
-the catch-all. Read doc §3 in full before starting — this is the first
-slice that changes what gets *emitted* (no longer purely additive/inert
-like the two consts-only slices this loop and last). AFTER that:
-`internal/wal/recovery.go`'s `replayDecodedXLogRecord` dispatch rework
-(doc §4) — this remains the actual risk (R1 critical: land last,
-incrementally, full G-crash before/after; native heap/btree bodies must
-reach the native `replayX` functions, not the FPI-only decoded arms, or
-mutations silently drop on recovery). See
-`docs/design/wal-native-pg-format/04-remove-canonical-and-pg-rmgr-dispatch.md`
-§3/§4/§5/§8 for the complete staged plan.
+Also found (documented, left untouched): a STALE, uncommitted worktree at
+`.claude/worktrees/wal-canonical-removal/` (branch
+`wal-canonical-removal`, HEAD `e9884a60` — before the additive-first
+slices landed) attempting the OPPOSITE (subtractive-first: deletes
+canonical.go outright) ordering. Orphaned, not referenced anywhere in
+fix_plan/ledger — do not resume/merge as-is. Full note in doc 04 §8 R3.
 
-Concurrent peer loop note (R3 in the doc, carried forward — re-check at
-next loop start): checked `ps aux`/git log this loop, no collision
-observed; the tree still carries unrelated uncommitted noise from other
-processes (`.ralph/progress.json`'s own state-guard repair — fine, part of
-this loop's own gate; `analysis/tpch-explain-baseline.md`, `ci/logs/
-launch.log` modified but NOT touched by this loop; untracked `postgres`,
-`analysis/perf-optimize3/runs/...`, `kaitai-struct-dash*.txt`,
-`weekly_loc.csv`/`.png` — all pre-existing, unrelated, left untouched).
-Commit will use explicit pathspec covering only this loop's files, per
-`ralph_concurrent_commit_pathspec_required` pattern.
+Next step for the WAL epic: implement the ONE atomic change — `internal/
+wal/format.go`'s `classifyXLogRecord` rewrite (call `recordKindToRmgrInfo`)
++ `internal/wal/recovery.go`'s §4 dispatch rework (the 5 points above) +
+`internal/wal/stream_replayer.go:159`'s `replayedXactInfo` (add a
+`RecordKindXactCommitInval` case) — ALL IN ONE COMMIT, not split across
+loops (splitting leaves HEAD's crash recovery broken in between). Read
+doc 04 §5.4 (4th/5th bullets) for the exact per-point fix before starting.
+Gate: full G-crash (`go test -run 'Crash|Recovery|Durability'
+./internal/initdb/ ./internal/wal/` + `TestKillKillRecovery`) BEFORE
+touching anything (establish the pre-change baseline) AND after, per §8
+R1. When done, delete `TestRecordKindToRmgrInfoNotYetWired`
+(`internal/wal/record_kind_rmgr_mapping_test.go`) — it's designed to fail
+the moment wiring lands.
 
-Gates run this loop: `go build ./...`, `go vet ./internal/wal/...`,
-`go test ./internal/wal/...`, `go test -race ./internal/wal/...` all PASS;
-`make ralph-state-guard` found + auto-repaired the same recurring stale
-progress.json "completed" marker (clean-exit artifact from a prior loop),
-re-verified consistent after repair.
+Gates run this loop: `go build ./...`, `go vet ./...` clean; `go test`
+and `go test -race ./internal/wal/...` full-package green; verified
+`recordKindToRmgrInfo` inert (no non-test caller, grepped); `make
+ralph-state-guard` clean; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+`RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh` PASS
+(0 failed, all 3 workloads).
 
 In-flight: none.

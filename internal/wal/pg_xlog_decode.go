@@ -42,6 +42,36 @@ const (
 	xlogHeap2PruneVacuumScan  uint8 = 0x20 // XLOG_HEAP2_PRUNE_VACUUM_SCAN
 	xlogHeap2PruneVacuumClean uint8 = 0x30 // XLOG_HEAP2_PRUNE_VACUUM_CLEANUP
 
+	// XLOG_HEAP_LOCK (heapam_xlog.h:39), shares RM_HEAP_ID's opmask
+	// with xlogHeap{Insert,Delete,Update,HotUpdate,Inplace}. Used by
+	// recordKindToRmgrInfo (doc 04 §3.1) to map HeapLock.
+	xlogHeapLock uint8 = 0x60
+
+	// RM_BTREE_ID (rmid 11) opcodes (nbtxlog.h:27-39). Used by
+	// recordKindToRmgrInfo (doc 04 §3.1) to map
+	// BtreeInsert/BtreeSplit/BtreeVacuum/BtreeUnlinkPage/BtreeNewRoot/
+	// BtreeMarkPageHalfDead onto their real-PG opcodes.
+	xlogBtreeInsertLeaf       uint8 = 0x00 // XLOG_BTREE_INSERT_LEAF
+	xlogBtreeSplitL           uint8 = 0x30 // XLOG_BTREE_SPLIT_L
+	xlogBtreeSplitR           uint8 = 0x40 // XLOG_BTREE_SPLIT_R
+	xlogBtreeUnlinkPage       uint8 = 0x80 // XLOG_BTREE_UNLINK_PAGE
+	xlogBtreeNewRoot          uint8 = 0xA0 // XLOG_BTREE_NEWROOT
+	xlogBtreeMarkPageHalfDead uint8 = 0xB0 // XLOG_BTREE_MARK_PAGE_HALFDEAD
+	xlogBtreeVacuum           uint8 = 0xC0 // XLOG_BTREE_VACUUM
+
+	// XLOG_SMGR_CREATE (storage_xlog.h:30). Used by recordKindToRmgrInfo
+	// (doc 04 §3.1) to map SmgrCreate onto RM_SMGR_ID.
+	xlogSmgrCreate uint8 = 0x10
+
+	// XLOG_FPI (pg_control.h:79), RM_XLOG_ID's full-page-image opcode.
+	// Used by recordKindToRmgrInfo (doc 04 §3.1) to map PageImage.
+	xlogXLogFPI uint8 = 0xB0
+
+	// CLOG_TRUNCATE (clog.h:56), RM_CLOG_ID's (only non-zeropage)
+	// opcode. Used by recordKindToRmgrInfo (doc 04 §3.1) to map
+	// ClogTruncate.
+	xlogClogTruncate uint8 = 0x10
+
 	bkpBlockForkMask byte = 0x0F
 	bkpBlockHasImage byte = 0x10
 	bkpBlockHasData  byte = 0x20
