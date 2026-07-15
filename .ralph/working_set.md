@@ -1,89 +1,99 @@
-(idle — nothing in flight)
+Loop #48 landed and committed (`fix(parser): add ALTER CONVERSION RENAME/OWNER/SET
+SCHEMA support (M0122-0007 4e follow-up)`), resuming exactly the next-step
+pointer loop #47 left behind.
 
-Loop #47 landed and committed (`91302a1d fix(catalog): add DBOid scoping to
-userConversions (M0122-0007 4e)`), resuming exactly the next-step pointer
-loop #46 left behind.
+**Task:** M0122-0007 4e follow-up — the parser gap loop #47 root-caused:
+`ALTER CONVERSION <name> OWNER TO <role>` was not a recognized `ALTER`
+production at all (parser fell through to a table-only production), the
+first non-catalog-scoping blocker the DU-002 round-trip probe
+(`TestPort_PgDumpConnectionSetup`) had hit in this whole audit series.
 
-**Task:** M0122-0007 4e follow-up — `catalog.userConversions` cross-database
-isolation (DU-002 round-trip probe unblock). `UserConversion` had no `DBOid`
-field and `c.userConversions` was one flat, server-wide `[]*UserConversion`
-slice, so `CREATE CONVERSION public.aliasconv ...` restoring into a fresh
-second database collided with the source database's own same-named
-conversion (`conversion "aliasconv" already exists`).
+**Fix (full ALTER CONVERSION support, not just OWNER TO):**
+- `AlterConversionStmt` AST node (internal/parser/ast.go) + `parseAlter()`
+  grammar branch (internal/parser/ddl.go, right after the `ALTER COLLATION`
+  branch), mirroring `AlterCollationStmt` minus REFRESH VERSION. Modelled
+  RENAME TO / OWNER TO / SET SCHEMA (confirmed against
+  postgres/src/backend/parser/gram.y's 3 `ALTER CONVERSION_P` productions),
+  not just the probe's OWNER TO form.
+- Catalog: `RenameConversion`/`SetConversionOwner`/`SetConversionSchema` +
+  `*DuringRecovery` counterparts (internal/catalog/catalog.go, right after
+  `DropConversionDuringRecovery`, ~line 12719 onward), mirroring the
+  `RenameCollation`/`SetCollationOwner`/`SetCollationSchema` trio.
+- Executor: `execAlterConversion` (internal/executor/operators_ddl.go, right
+  after `execAlterCollation`) + `*parser.AlterConversionStmt` case in the DDL
+  dispatch switch (~line 172).
+- WAL: 3 new record kinds `RecordKindAlterConversionRename`/`Owner`/
+  `SetSchema` = 130/131/132 (internal/wal/recovery.go) + Encode/Decode pairs
+  + `internal/initdb/conversion_ddl_recovery.go` replay wiring (mirrors
+  `collation_ddl_recovery.go`) + physical-replay no-op classification case
+  (default-case fallthrough in `recordKindToRmgrInfo`, no explicit entry
+  needed).
+- **Two extra wiring sites the collation-precedent grep missed, only
+  surfaced by a `Plan()` test failure** ("unsupported statement type
+  *parser.AlterConversionStmt"): `internal/planner/planner.go`'s
+  DDL-passthrough type list (~line 155, added `*parser.AlterConversionStmt`
+  next to `*parser.AlterCollationStmt`) and `internal/server/dispatch.go`'s
+  command-tag switch (~line 2854, added a case returning "ALTER
+  CONVERSION"). **Lesson for the next new-statement-type wiring job:** a DDL
+  statement type needs registration at 4 sites, not 2 — parser+executor,
+  catalog, planner's passthrough list, AND dispatch's tag-lookup switch.
+- New tests: internal/parser/alter_conversion_test.go (rename/owner/
+  setschema parse shapes incl. the probe's exact
+  `ALTER CONVERSION public.aliasconv OWNER TO postgres` SQL),
+  internal/executor/alter_conversion_test.go (mirrors
+  alter_collation_test.go's rename/owner/setschema/IfExists/42704 coverage,
+  using a local `conversionByName` helper since catalog has no
+  `ConversionAttrsByName` analog to `CollationAttrsByName`).
 
-**Fix:** applied the identical M0122-0007 4e pattern, mirroring
-`UserCollation` byte-for-byte (slice-of-pointers + `DBOid` field, NOT a map
-— unlike `userOperatorClasses`): `UserConversion.DBOid uint32` added;
-`CreateConversion`/`DropConversion` gained a trailing variadic
-`dbOid ...uint32` (via `resolveDBOid`); `CreateConversionDuringRecovery`
-stamps `DefaultDBOid` (WAL replay carries no dbOid yet). New
-`ListUserConversionsForDBOid`/`PGConversionRowsForDBOid` (mirror the
-collation pair — no BKI-builtins prefix since all ~130 pg_conversion
-built-ins are pg_catalog-scoped and dump-filtered) replace the old
-unfiltered `ListUserConversions()`-backed `pgConversion.VirtualRows`
-closure. Per-connection wiring added end-to-end:
-`executor.Context.PgConversionRows` (context.go), a `pg_conversion` branch in
-`operators.go`'s virtual-row materializer (single site serving both simple +
-extended protocols via the shared `ectx`), `dispatch.go`'s
-`pgConversionRowLister` + `wireExtensionRows` wiring. Threaded
-`catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)` through both
-`operators_ddl.go` call sites (CREATE/DROP CONVERSION).
+**Files touched:** internal/parser/ast.go (AlterConversionStmt),
+internal/parser/ddl.go (parseAlter branch),
+internal/parser/alter_conversion_test.go (new),
+internal/catalog/catalog.go (Rename/SetOwner/SetSchema trio + recovery
+counterparts), internal/executor/operators_ddl.go (execAlterConversion +
+dispatch case), internal/executor/alter_conversion_test.go (new),
+internal/wal/recovery.go (3 record kinds + encode/decode),
+internal/initdb/conversion_ddl_recovery.go (replay wiring),
+internal/planner/planner.go (passthrough list),
+internal/server/dispatch.go (command-tag switch), .ralph/fix_plan.md
+(closed the ALTER CONVERSION bullet, added the new ts-dict bullet),
+.ralph/deferral_ledger.md (2 new rows: resolved landing + fresh open
+ts-dict row), docs/design/0122-0018-per-database-catalog-namespace.md (new
+"ALTER CONVERSION grammar..." section), docs/design/README.md (surgical
+Python string-replace on the single-line 0122-0018 row — do NOT use Edit on
+that row, it's one 70KB+ line; verify line count stays 921 after the
+replace).
 
-**Files touched:** `internal/catalog/catalog.go` (UserConversion struct +
-CreateConversion/DropConversion/CreateConversionDuringRecovery/
-ListUserConversionsForDBOid/PGConversionRowsForDBOid, ~lines 3142-3178 and
-12645-12820ish), `internal/catalog/create_conversion_dbscope_test.go` (new,
-`TestCreateConversionCrossDatabaseIsolation`), `internal/executor/context.go`
-(`PgConversionRows` field), `internal/executor/operators.go` (pg_conversion
-branch in the virtual-row materializer switch), `internal/executor/
-operators_ddl.go` (2 call sites: CREATE CONVERSION ~line 16397, DROP
-CONVERSION ~line 15275), `internal/server/dispatch.go`
-(`pgConversionRowLister` interface + `wireExtensionRows` wiring),
-`.ralph/fix_plan.md` (closed the userConversions bullet, added the new
-ALTER-CONVERSION-parser-gap bullet), `.ralph/deferral_ledger.md` (resolved
-row + fresh open row), `docs/design/0122-0018-per-database-catalog-namespace.md`
-(new "Conversion registry ... dbOid scoping" section + status line),
-`docs/design/README.md` (surgical Python string-replace on the single-line
-0122-0018 row — do NOT use the Edit tool on that row, it is one 70KB+ line;
-grep the row's tail near a unique recent keyword first, verify line count
-stays 922 after the replace).
+**Confirmed via a LIVE re-run of `TestPort_PgDumpConnectionSetup`**: the
+DU-002 probe's failure point moved past `aliasconv`'s `ALTER CONVERSION ...
+OWNER TO` entirely to a NEW blocker — the same cross-database
+catalog-key-collision shape this whole series keeps finding, now hitting
+text search dictionaries: `text search dictionary "simple_dict" already
+exists` restoring into the fresh `dumprestore_du002` database.
 
-**Confirmed via a LIVE re-run of `TestPort_PgDumpConnectionSetup`** (not doc
-archaeology): the DU-002 probe's failure point moved past `conversion
-"aliasconv" already exists` entirely to a NEW blocker — the FIRST
-non-catalog-scoping blocker in this whole M0122-0007 4e audit sequence:
-`ALTER CONVERSION public.aliasconv OWNER TO postgres;` fails `syntax error
-at or near "expected keyword table (got conversion)"`. `CONVERSION` is not a
-recognized `ALTER <objtype>` keyword in the parser's grammar (the error
-message's "expected keyword table" phrasing suggests the parser fell through
-to a table-only `ALTER` production).
+**Next resume point:** apply the identical M0122-0007 4e dbOid-scoping
+pattern to `catalog.UserTSDict`/`InMemory.CreateTSDict` (added in the
+2026-07-06 pg_dump-slice-437 ledger row — that row's own deferred column
+already flagged "no WAL/recovery persistence" as a separate, still-open gap;
+this loop's blocker is the *scoping* gap, independent of that one). Grep
+`CreateTSDict`/`ListUserTSDicts`/`UserTSDict` in catalog.go (neighbors of
+`CreateConversion`/`ListUserConversionsForDBOid`) for the exact current
+shape (map vs slice — check before assuming). Add: `DBOid uint32` field,
+trailing variadic `dbOid ...uint32` on Create/Drop via `resolveDBOid`, a
+`ListUserTSDictsForDBOid`/`PGTSDictRowsForDBOid`-shaped lister mirroring
+`ListUserConversionsForDBOid`/`PGConversionRowsForDBOid`, per-connection
+wiring through `executor.Context`/`operators.go`'s virtual-row
+materializer/`dispatch.go`'s `wireExtensionRows` (mirrors the `pg_conversion`
+wiring 2 loops ago). Verify via `go test -v -run
+'^TestPort_PgDumpConnectionSetup$' ./internal/testport/` (soft `t.Logf`
+probe) — expect the blocker to advance past `simple_dict`.
 
-**Next DU-002 resume point (root-caused by the probe's error text, not yet
-fixed):** this is a parser-grammar gap, not a catalog dbOid-scoping gap —
-materially different mechanism from every M0122-0007 4e follow-up so far.
-Grep the parser's `ALTER FUNCTION`/`ALTER COLLATION` OWNER-TO productions
-(both parse today, since the probe reached this far past them) as the
-sibling precedent for where to add an `ALTER CONVERSION <name> OWNER TO
-<role>` production. Check pg_dump's `dumpConversion` in
-`postgres/src/bin/pg_dump/pg_dump.c` for which other ALTER forms it actually
-emits (RENAME TO / SET SCHEMA likely alongside OWNER TO) before broadening
-scope beyond what the probe needs. Once parsed, wire the executor side:
-`catalog.InMemory` needs `SetConversionOwner`/`RenameConversion`/
-`SetConversionSchema` mirroring the `UserCollation` trio this loop's own fix
-established as precedent (`SetCollationOwner`/`RenameCollation`/
-`SetCollationSchema`, catalog.go ~12493-12573 — same file, same section,
-easy to find). Verify via `go test -v -run '^TestPort_PgDumpConnectionSetup$'
-./internal/testport/` (soft `t.Logf` probe — check the log line for the new
-blocker after the fix; expect it to advance past `aliasconv`'s ALTER
-statement to whatever the dump restores next).
-
-**Key symbols:** `internal/parser`'s `ALTER` statement grammar (exact file
-not yet located this loop — grep `ALTER COLLATION` or `ParseAlterCollation`-
-shaped function names as the entry point), `catalog.InMemory.SetCollationOwner`/
-`RenameCollation`/`SetCollationSchema` (catalog.go, the precedent trio to
-mirror for conversions), `internal/executor/operators_ddl.go`'s `ALTER
-...OWNER TO` dispatch switch (wherever COLLATION's case lives — that's where
-a new CONVERSION case needs to be added once the parser accepts it).
+**Key symbols:** `catalog.InMemory.CreateTSDict` (catalog.go, exact line not
+yet located this loop — grep it fresh, don't trust a stale line number),
+`ListUserConversionsForDBOid`/`PGConversionRowsForDBOid` (catalog.go
+~12847-12900, the precedent pair to mirror), `executor.Context` (context.go,
+where `PgConversionRows` lives — a `PgTSDictRows` sibling field goes here),
+`dispatch.go`'s `wireExtensionRows` (where `pgConversionRowLister` is wired
+— a `pgTSDictRowLister` sibling goes here).
 
 Housekeeping: same pre-existing untracked scratch content noted by prior
 loops (`postgres` submodule placeholder, `Markdown_Table_Repair_Design_Doc.md`,
@@ -92,25 +102,21 @@ loops (`postgres` submodule placeholder, `Markdown_Table_Repair_Design_Doc.md`,
 — all left untouched, not part of this loop's commit.
 
 Gates run this loop (all green): `go build ./...`/`go vet ./...` clean; `go
-test ./internal/catalog/... ./internal/initdb/... ./internal/executor/...
-./internal/server/... ./internal/wal/...` PASS; `go test -short $(go list
-./... | grep -v /internal/testport)` (full repo, short mode) 0 FAIL
-(includes `internal/initdb` ~222s — clean); `go test -v -run
+test ./internal/parser/... ./internal/catalog/... ./internal/wal/...
+./internal/initdb/... ./internal/executor/... ./internal/planner/...
+./internal/server/...` PASS (initdb ~223s, included); `go test -v -run
 '^TestPort_PgDumpConnectionSetup$' ./internal/testport/` PASS (soft-log
-confirms advance to the ALTER CONVERSION blocker); `RALPH_PRECOMMIT_SCOPE=smoke
-bash scripts/ralph-precommit-test.sh` PASS twice (once standalone, once via
-the pre-commit git hook on the actual commit — 0 failed, all 3 pgbench
-workloads both times); `make ralph-state-guard` — found+auto-repaired the
-same stale `progress.json` "completed"/loop-47-vs-running mismatch pattern
-prior loops have hit (previous loop's clean-exit marker, not a real
-project-completion state), then reported consistent.
-`scripts/tpch-spotcheck.sh` NOT run this loop (executor/planner untouched —
-only virtual-catalog registry/row-emission code changed, no query
-plan/row-count-affecting code path); a future executor/planner-adjacent loop
-should still run it per Hard-won Rule #1.
+confirms advance to the ts_dict blocker); `RALPH_PRECOMMIT_SCOPE=smoke bash
+scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 pgbench workloads);
+`make ralph-state-guard` — found+auto-repaired the same stale
+`progress.json` "completed"/loop-48-vs-running mismatch pattern prior loops
+have hit, then reported consistent.
+`scripts/tpch-spotcheck.sh` NOT run this loop (parser/catalog/executor
+changes are DDL-only — ALTER CONVERSION grammar/registry, no
+query-plan/row-count-affecting code path touched); a future
+executor/planner-adjacent loop touching SELECT/DML should still run it per
+Hard-won Rule #1.
 
-In-flight: none. git push status: `wal-format-mod` is ahead of
-`origin/wal-format-mod` by 4 commits (`91302a1d` this loop's + the 3
-pre-existing ones noted by loop #46's handoff: `e9245a0c`, `d33222d6`,
-`9c2ab21d`). Not pushed — push requires explicit human direction per this
-repo's standing git-safety protocol.
+In-flight: none. git push status: not yet checked this loop — check ahead-
+count and push status before deciding whether to push (repo's standing
+git-safety protocol requires explicit human direction to push).

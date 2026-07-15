@@ -31,6 +31,9 @@ import (
 type conversionRegistryRecovery interface {
 	CreateConversionDuringRecovery(uc *catalog.UserConversion, schema string)
 	DropConversionDuringRecovery(name, schema string)
+	RenameConversionDuringRecovery(name, schema, newName string)
+	SetConversionOwnerDuringRecovery(name, schema string, ownerOID uint32)
+	SetConversionSchemaDuringRecovery(name, schema, newSchema string)
 }
 
 // replayConversionDDLRecords reads every WAL record under walDir and applies
@@ -96,6 +99,24 @@ func replayConversionDDLRecords(walDir string, cat catalog.Catalog) error {
 				return fmt.Errorf("decode drop-conversion at lsn %d: %w", rec.StartLSN, derr)
 			}
 			reg.DropConversionDuringRecovery(name, schema)
+		case wal.RecordKindAlterConversionRename:
+			name, schema, newName, derr := wal.DecodeAlterConversionRename(rec.Payload)
+			if derr != nil {
+				return fmt.Errorf("decode alter-conversion-rename at lsn %d: %w", rec.StartLSN, derr)
+			}
+			reg.RenameConversionDuringRecovery(name, schema, newName)
+		case wal.RecordKindAlterConversionOwner:
+			name, schema, ownerOID, derr := wal.DecodeAlterConversionOwner(rec.Payload)
+			if derr != nil {
+				return fmt.Errorf("decode alter-conversion-owner at lsn %d: %w", rec.StartLSN, derr)
+			}
+			reg.SetConversionOwnerDuringRecovery(name, schema, ownerOID)
+		case wal.RecordKindAlterConversionSetSchema:
+			name, schema, newSchema, derr := wal.DecodeAlterConversionSetSchema(rec.Payload)
+			if derr != nil {
+				return fmt.Errorf("decode alter-conversion-set-schema at lsn %d: %w", rec.StartLSN, derr)
+			}
+			reg.SetConversionSchemaDuringRecovery(name, schema, newSchema)
 		}
 	}
 	return nil

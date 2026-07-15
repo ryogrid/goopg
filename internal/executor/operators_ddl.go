@@ -169,6 +169,8 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 		return nil, o.execAlterAggregateOwner(s)
 	case *parser.AlterCollationStmt:
 		return nil, o.execAlterCollation(s)
+	case *parser.AlterConversionStmt:
+		return nil, o.execAlterConversion(s)
 	case *parser.AlterOperatorSetStmt:
 		return nil, o.execAlterOperatorSet(s)
 	case *parser.CreateOpClassStmt:
@@ -802,6 +804,79 @@ func (o *ddlOp) execAlterCollation(s *parser.AlterCollationStmt) error {
 		return nil
 	default:
 		// Unmodelled ALTER COLLATION form — no-op.
+		return nil
+	}
+}
+
+// execAlterConversion handles ALTER CONVERSION RENAME TO / OWNER TO / SET
+// SCHEMA, mirroring execAlterCollation byte-for-byte (minus REFRESH VERSION,
+// which is collation-specific). pg_dump's dumpConversion only ever emits the
+// OWNER TO form for conversions (via the generic archive-owner mechanism),
+// so that is the form the DU-002 round-trip probe actually exercises; RENAME
+// TO / SET SCHEMA are wired for full grammar fidelity. M0122-0007 4e
+// follow-up.
+func (o *ddlOp) execAlterConversion(s *parser.AlterConversionStmt) error {
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil
+	}
+	dbOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
+	schema := s.Name.Schema
+	if schema == "" {
+		schema = "public"
+	}
+	notFound := func() error {
+		if s.IfExists {
+			o.ctx.AddNotice(fmt.Sprintf("conversion %q does not exist, skipping", s.Name.Name))
+			return nil
+		}
+		return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("conversion %q does not exist", s.Name.Name)}
+	}
+	switch s.Action {
+	case "rename":
+		if err := im.RenameConversion(s.Name.Name, schema, s.NewName, dbOid); err != nil {
+			return notFound()
+		}
+		if o.ctx.WAL != nil {
+			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterConversionRename(s.Name.Name, schema, s.NewName)); werr != nil {
+				return fmt.Errorf("wal alter-conversion-rename: %w", werr)
+			}
+		}
+		return nil
+	case "owner":
+		ownerOID := uint32(10) // bootstrap superuser, mirrors CreateConversion's default owner
+		if !strings.EqualFold(s.NewOwner, "current_user") {
+			oid, found := im.RoleOID(s.NewOwner)
+			if !found {
+				return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("role %q does not exist", s.NewOwner)}
+			}
+			ownerOID = oid
+		}
+		if !im.SetConversionOwner(s.Name.Name, schema, ownerOID, dbOid) {
+			return notFound()
+		}
+		if o.ctx.WAL != nil {
+			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterConversionOwner(s.Name.Name, schema, ownerOID)); werr != nil {
+				return fmt.Errorf("wal alter-conversion-owner: %w", werr)
+			}
+		}
+		return nil
+	case "setschema":
+		newSchema := s.NewSchema
+		if newSchema == "" {
+			newSchema = "public"
+		}
+		if !im.SetConversionSchema(s.Name.Name, schema, newSchema, dbOid) {
+			return notFound()
+		}
+		if o.ctx.WAL != nil {
+			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterConversionSetSchema(s.Name.Name, schema, newSchema)); werr != nil {
+				return fmt.Errorf("wal alter-conversion-set-schema: %w", werr)
+			}
+		}
+		return nil
+	default:
+		// Unmodelled ALTER CONVERSION form — no-op.
 		return nil
 	}
 }

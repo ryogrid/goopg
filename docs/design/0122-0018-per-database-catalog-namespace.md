@@ -2656,6 +2656,67 @@ Gates: `go build ./...`/`go vet ./...` clean; `go test
 `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh` PASS
 twice (0 failed, all 3 workloads both times).
 
+### `ALTER CONVERSION` grammar + catalog/executor/WAL support — LANDED (2026-07-15)
+
+Closes the parser-gap resume point the section above recorded: `CONVERSION`
+was not a recognized `ALTER <objtype>` keyword at all — `ALTER CONVERSION
+public.aliasconv OWNER TO postgres;` (the exact statement pg_dump's
+`dumpConversion` emits via its generic archive-owner mechanism, and the
+DU-002 probe's actual blocker) failed a parser syntax error before ever
+reaching the catalog layer.
+
+- New `AlterConversionStmt` AST node (`internal/parser/ast.go`) and its
+  `parseAlter()` grammar branch (`internal/parser/ddl.go`, immediately after
+  the `ALTER COLLATION` branch), mirroring `AlterCollationStmt` byte-for-byte
+  minus `REFRESH VERSION` (collation-only). Confirmed against
+  `postgres/src/backend/parser/gram.y`'s three `ALTER CONVERSION_P`
+  productions (`RENAME TO` / `SET SCHEMA` / `OWNER TO`) — all three were
+  modelled, not just `OWNER TO`, for full grammar parity even though
+  `dumpConversion` itself only ever emits the `OWNER TO` form.
+- Catalog: `RenameConversion`/`SetConversionOwner`/`SetConversionSchema` +
+  `*DuringRecovery` counterparts (`internal/catalog/catalog.go`, right after
+  `DropConversionDuringRecovery`), mirroring the `UserCollation` trio
+  (`RenameCollation`/`SetCollationOwner`/`SetCollationSchema`) this same
+  design doc's own resume-point note pointed at.
+- Executor: `execAlterConversion` (`internal/executor/operators_ddl.go`,
+  right after `execAlterCollation`) + a `*parser.AlterConversionStmt` case in
+  the DDL dispatch switch.
+- WAL durability: 3 new record kinds `RecordKindAlterConversionRename` (130)
+  / `RecordKindAlterConversionOwner` (131) / `RecordKindAlterConversionSetSchema`
+  (132) + Encode/Decode pairs (`internal/wal/recovery.go`) +
+  `internal/initdb/conversion_ddl_recovery.go` replay wiring (mirrors
+  `collation_ddl_recovery.go`) + the physical-replay no-op classification
+  case in `recordKindToRmgrInfo`'s neighbor switch (default-case fallthrough
+  to `RmgrGoopgCatalog` — no explicit registration needed there).
+- Two wiring sites the collation precedent didn't surface until `Plan()`
+  actually failed on the new statement type: `internal/planner/planner.go`'s
+  DDL-passthrough type list and `internal/server/dispatch.go`'s command-tag
+  switch both needed a `*parser.AlterConversionStmt` case — a new DDL
+  statement type is wired at 4 sites (parser/executor, catalog, planner,
+  dispatch's tag lookup), not the 2 an `AlterCollationStmt` grep alone
+  suggests.
+- New tests: `internal/parser/alter_conversion_test.go` (rename/owner/
+  setschema parse shapes, including the probe's exact `ALTER CONVERSION
+  public.aliasconv OWNER TO postgres` SQL) and
+  `internal/executor/alter_conversion_test.go` (mirrors
+  `alter_collation_test.go`'s rename/owner/setschema/IfExists/42704
+  coverage).
+
+Confirmed via the DU-002 probe: the round-trip's failure point moved past
+`aliasconv`'s `ALTER CONVERSION ... OWNER TO` entirely to a NEW, unrelated
+blocker — a cross-database catalog-key-collision, the same shape this
+document's own sub-slices have fixed repeatedly for other registries, now
+hitting text search dictionaries: `text search dictionary "simple_dict"
+already exists` restoring into the fresh `dumprestore_du002` database. See
+the 2026-07-15 deferral-ledger row (task-id `M0122-0007 4e follow-up (parser
+gap: ALTER CONVERSION <name> OWNER TO <role>)`) for the resume point.
+
+Gates: `go build ./...`/`go vet ./...` clean; `go test ./internal/parser/...
+./internal/catalog/... ./internal/wal/... ./internal/initdb/...
+./internal/executor/... ./internal/planner/... ./internal/server/...` PASS;
+`go test -v -run '^TestPort_PgDumpConnectionSetup$' ./internal/testport/`
+PASS (soft-log confirms the advance).
+
 ## Deferred / explicitly out of scope
 
 - Unifying `ResolveDatabaseOid`'s switch with the `pg_database` `VirtualRows`

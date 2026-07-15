@@ -1733,6 +1733,30 @@ type AlterCollationStmt struct {
 func (s *AlterCollationStmt) Pos() int  { return s.pos }
 func (s *AlterCollationStmt) stmtNode() {}
 
+// AlterConversionStmt — `ALTER CONVERSION [IF EXISTS] name RENAME TO
+// newname`, `... OWNER TO {newowner | CURRENT_USER | SESSION_USER |
+// CURRENT_ROLE}`, or `... SET SCHEMA newschema`. Action is one of
+// "rename"/"owner"/"setschema"; any other trailing form parses with
+// Action == "" and is a no-op, mirroring AlterCollationStmt's unmodelled-form
+// handling so the statement never fails to parse. pg_dump's dumpConversion
+// only ever emits the OWNER TO form (via the generic archive-owner
+// mechanism, not a dedicated ALTER statement in dumpConversion itself); RENAME
+// TO / SET SCHEMA are modelled for full grammar fidelity even though pg_dump
+// does not emit them for conversions today. M0122-0007 4e follow-up (DU-002
+// round-trip probe unblock).
+type AlterConversionStmt struct {
+	pos       int
+	Name      ObjectName
+	IfExists  bool
+	Action    string // "rename" | "owner" | "setschema" | "" (unmodelled, no-op)
+	NewName   string // for Action == "rename"
+	NewOwner  string // for Action == "owner"; "current_user" sentinel like ALTER TABLE
+	NewSchema string // for Action == "setschema"
+}
+
+func (s *AlterConversionStmt) Pos() int  { return s.pos }
+func (s *AlterConversionStmt) stmtNode() {}
+
 // CreateTablespaceStmt — `CREATE TABLESPACE name [OWNER role] LOCATION 'dir' [WITH (opts)]`.
 // goopg supports only the developer/regression-test in-place form (empty LOCATION
 // with allow_in_place_tablespaces on), which creates pg_tblspc/<oid> as a real

@@ -7205,6 +7205,70 @@ func (p *parser) parseAlter() (Stmt, error) {
 		}
 		return stmt, nil
 	}
+	// ALTER CONVERSION [IF EXISTS] name RENAME TO newname | OWNER TO role |
+	// SET SCHEMA newschema. Mirrors ALTER COLLATION above (minus REFRESH
+	// VERSION, which is collation-specific). M0122-0007 4e follow-up (DU-002
+	// round-trip probe unblock).
+	if p.acceptIdentKeyword("conversion") {
+		stmt := &AlterConversionStmt{pos: t.Pos}
+		if p.acceptKeyword(KwIf) {
+			if _, err := p.expectKeyword(KwExists); err != nil {
+				return nil, err
+			}
+			stmt.IfExists = true
+		}
+		name, err := p.parseObjectName()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Name = name
+		switch {
+		case p.acceptIdentKeyword("rename"):
+			if _, err := p.expectKeyword(KwTo); err != nil {
+				return nil, err
+			}
+			newNameTok, err := p.parseIdent()
+			if err != nil {
+				return nil, err
+			}
+			stmt.Action = "rename"
+			stmt.NewName = identText(newNameTok)
+		case p.acceptIdentKeyword("owner"):
+			if _, err := p.expectKeyword(KwTo); err != nil {
+				return nil, err
+			}
+			stmt.Action = "owner"
+			// CURRENT_USER / SESSION_USER / CURRENT_ROLE resolve to the bootstrap
+			// superuser sentinel, mirroring ALTER COLLATION … OWNER TO.
+			if p.acceptIdentKeyword("current_user") ||
+				p.acceptIdentKeyword("session_user") ||
+				p.acceptIdentKeyword("current_role") {
+				stmt.NewOwner = "current_user"
+			} else if tok, err := p.parseIdent(); err == nil {
+				stmt.NewOwner = identText(tok)
+			} else {
+				stmt.NewOwner = "current_user"
+			}
+		case (p.cur().Kind == TokenKeyword && p.cur().Keyword == KwSet || p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "set")) &&
+			p.peek(1).Kind == TokenIdent && strings.EqualFold(p.peek(1).Value, "schema"):
+			// SET SCHEMA newschema, mirroring ALTER COLLATION's slice-442 case.
+			p.advance() // SET
+			p.advance() // SCHEMA
+			schemaTok := p.cur()
+			p.advance()
+			stmt.Action = "setschema"
+			stmt.NewSchema = identText(schemaTok)
+		default:
+			// Unmodelled form — consume as a no-op.
+			for p.cur().Kind != TokenEOF {
+				if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
+					break
+				}
+				p.advance()
+			}
+		}
+		return stmt, nil
+	}
 	// ALTER INDEX name ALTER COLUMN col SET (options) — emit the action so
 	// the executor can raise the appropriate error. M0097-0023.
 	if p.acceptKeyword(KwIndex) {

@@ -823,6 +823,35 @@ const (
 	// serverLen(2)+server.
 	RecordKindDropUserMapping byte = 129
 
+	// RecordKindAlterConversionRename records an `ALTER CONVERSION name
+	// RENAME TO newname` event, mirroring RecordKindAlterCollationRename.
+	// Same no-op physical redo path — only the in-memory conversion
+	// registry's name changes. M0122-0007 4e follow-up (DU-002 round-trip
+	// probe unblock).
+	// Format:
+	//   kind(1) | nameLen(2) | name(nameLen bytes) | schemaLen(2) |
+	//   schema(schemaLen bytes) | newNameLen(2) | newName(newNameLen bytes)
+	RecordKindAlterConversionRename byte = 130
+
+	// RecordKindAlterConversionOwner records an `ALTER CONVERSION name OWNER
+	// TO role` event, mirroring RecordKindAlterCollationOwner. Same no-op
+	// physical redo path — only pg_conversion.conowner metadata changes.
+	// M0122-0007 4e follow-up (DU-002 round-trip probe unblock).
+	// Format:
+	//   kind(1) | ownerOID(4) | nameLen(2) | name(nameLen bytes) |
+	//   schemaLen(2) | schema(schemaLen bytes)
+	RecordKindAlterConversionOwner byte = 131
+
+	// RecordKindAlterConversionSetSchema records an `ALTER CONVERSION name
+	// SET SCHEMA newschema` move, mirroring RecordKindAlterCollationSetSchema.
+	// Same no-op physical redo path — only pg_conversion.connamespace
+	// metadata changes. M0122-0007 4e follow-up (DU-002 round-trip probe
+	// unblock).
+	// Format:
+	//   kind(1) | nameLen(2) | name(nameLen bytes) | schemaLen(2) |
+	//   schema(schemaLen bytes) | newSchemaLen(2) | newSchema(newSchemaLen bytes)
+	RecordKindAlterConversionSetSchema byte = 132
+
 	// RecordKindSequenceState records the FULL state of one sequence
 	// (definition + current counter) so sequences — including the implicit
 	// sequences backing SERIAL/IDENTITY columns — survive a restart. goopg's
@@ -5446,6 +5475,184 @@ func DecodeAlterCollationOwner(payload []byte) (name, schema string, ownerOID ui
 	return name, schema, ownerOID, nil
 }
 
+// EncodeAlterConversionRename encodes an ALTER CONVERSION ... RENAME TO
+// event, mirroring EncodeAlterCollationRename. M0122-0007 4e follow-up
+// (DU-002 round-trip probe unblock). Format: kind(1) | nameLen(2) |
+// name(nameLen bytes) | schemaLen(2) | schema(schemaLen bytes) |
+// newNameLen(2) | newName(newNameLen bytes).
+func EncodeAlterConversionRename(name, schema, newName string) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	if len(schema) > 0xFFFF {
+		schema = schema[:0xFFFF]
+	}
+	if len(newName) > 0xFFFF {
+		newName = newName[:0xFFFF]
+	}
+	out := make([]byte, 7+len(name)+len(schema)+len(newName))
+	out[0] = RecordKindAlterConversionRename
+	binary.LittleEndian.PutUint16(out[1:3], uint16(len(name)))
+	off := 3
+	copy(out[off:], name)
+	off += len(name)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(schema)))
+	off += 2
+	copy(out[off:], schema)
+	off += len(schema)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(newName)))
+	off += 2
+	copy(out[off:], newName)
+	return out
+}
+
+// DecodeAlterConversionRename decodes a RecordKindAlterConversionRename
+// payload.
+func DecodeAlterConversionRename(payload []byte) (name, schema, newName string, err error) {
+	if len(payload) < 7 {
+		return "", "", "", fmt.Errorf("wal: alter-conversion-rename payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindAlterConversionRename {
+		return "", "", "", fmt.Errorf("wal: record kind %d is not alter-conversion-rename", payload[0])
+	}
+	nameLen := int(binary.LittleEndian.Uint16(payload[1:3]))
+	off := 3
+	if len(payload) < off+nameLen+2 {
+		return "", "", "", fmt.Errorf("wal: alter-conversion-rename payload truncated (need %d bytes)", off+nameLen+2)
+	}
+	name = string(payload[off : off+nameLen])
+	off += nameLen
+	schemaLen := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	if len(payload) < off+schemaLen+2 {
+		return "", "", "", fmt.Errorf("wal: alter-conversion-rename payload truncated (need %d bytes)", off+schemaLen+2)
+	}
+	schema = string(payload[off : off+schemaLen])
+	off += schemaLen
+	newNameLen := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	if len(payload) < off+newNameLen {
+		return "", "", "", fmt.Errorf("wal: alter-conversion-rename payload truncated (need %d bytes)", off+newNameLen)
+	}
+	newName = string(payload[off : off+newNameLen])
+	return name, schema, newName, nil
+}
+
+// EncodeAlterConversionSetSchema encodes an ALTER CONVERSION ... SET SCHEMA
+// event, mirroring EncodeAlterCollationSetSchema. M0122-0007 4e follow-up
+// (DU-002 round-trip probe unblock). Format: kind(1) | nameLen(2) |
+// name(nameLen bytes) | schemaLen(2) | schema(schemaLen bytes) |
+// newSchemaLen(2) | newSchema(newSchemaLen bytes).
+func EncodeAlterConversionSetSchema(name, schema, newSchema string) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	if len(schema) > 0xFFFF {
+		schema = schema[:0xFFFF]
+	}
+	if len(newSchema) > 0xFFFF {
+		newSchema = newSchema[:0xFFFF]
+	}
+	out := make([]byte, 7+len(name)+len(schema)+len(newSchema))
+	out[0] = RecordKindAlterConversionSetSchema
+	binary.LittleEndian.PutUint16(out[1:3], uint16(len(name)))
+	off := 3
+	copy(out[off:], name)
+	off += len(name)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(schema)))
+	off += 2
+	copy(out[off:], schema)
+	off += len(schema)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(newSchema)))
+	off += 2
+	copy(out[off:], newSchema)
+	return out
+}
+
+// DecodeAlterConversionSetSchema decodes a RecordKindAlterConversionSetSchema
+// payload.
+func DecodeAlterConversionSetSchema(payload []byte) (name, schema, newSchema string, err error) {
+	if len(payload) < 7 {
+		return "", "", "", fmt.Errorf("wal: alter-conversion-set-schema payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindAlterConversionSetSchema {
+		return "", "", "", fmt.Errorf("wal: record kind %d is not alter-conversion-set-schema", payload[0])
+	}
+	nameLen := int(binary.LittleEndian.Uint16(payload[1:3]))
+	off := 3
+	if len(payload) < off+nameLen+2 {
+		return "", "", "", fmt.Errorf("wal: alter-conversion-set-schema payload truncated (need %d bytes)", off+nameLen+2)
+	}
+	name = string(payload[off : off+nameLen])
+	off += nameLen
+	schemaLen := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	if len(payload) < off+schemaLen+2 {
+		return "", "", "", fmt.Errorf("wal: alter-conversion-set-schema payload truncated (need %d bytes)", off+schemaLen+2)
+	}
+	schema = string(payload[off : off+schemaLen])
+	off += schemaLen
+	newSchemaLen := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	if len(payload) < off+newSchemaLen {
+		return "", "", "", fmt.Errorf("wal: alter-conversion-set-schema payload truncated (need %d bytes)", off+newSchemaLen)
+	}
+	newSchema = string(payload[off : off+newSchemaLen])
+	return name, schema, newSchema, nil
+}
+
+// EncodeAlterConversionOwner encodes an ALTER CONVERSION ... OWNER TO event,
+// mirroring EncodeAlterCollationOwner. M0122-0007 4e follow-up (DU-002
+// round-trip probe unblock). Format: kind(1) | ownerOID(4) | nameLen(2) |
+// name(nameLen bytes) | schemaLen(2) | schema(schemaLen bytes).
+func EncodeAlterConversionOwner(name, schema string, ownerOID uint32) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	if len(schema) > 0xFFFF {
+		schema = schema[:0xFFFF]
+	}
+	out := make([]byte, 9+len(name)+len(schema))
+	out[0] = RecordKindAlterConversionOwner
+	binary.LittleEndian.PutUint32(out[1:5], ownerOID)
+	off := 5
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(name)))
+	off += 2
+	copy(out[off:], name)
+	off += len(name)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(schema)))
+	off += 2
+	copy(out[off:], schema)
+	return out
+}
+
+// DecodeAlterConversionOwner decodes a RecordKindAlterConversionOwner
+// payload.
+func DecodeAlterConversionOwner(payload []byte) (name, schema string, ownerOID uint32, err error) {
+	if len(payload) < 9 {
+		return "", "", 0, fmt.Errorf("wal: alter-conversion-owner payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindAlterConversionOwner {
+		return "", "", 0, fmt.Errorf("wal: record kind %d is not alter-conversion-owner", payload[0])
+	}
+	ownerOID = binary.LittleEndian.Uint32(payload[1:5])
+	off := 5
+	nameLen := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	if len(payload) < off+nameLen+2 {
+		return "", "", 0, fmt.Errorf("wal: alter-conversion-owner payload truncated (need %d bytes)", off+nameLen+2)
+	}
+	name = string(payload[off : off+nameLen])
+	off += nameLen
+	schemaLen := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	if len(payload) < off+schemaLen {
+		return "", "", 0, fmt.Errorf("wal: alter-conversion-owner payload truncated (need %d bytes)", off+schemaLen)
+	}
+	schema = string(payload[off : off+schemaLen])
+	return name, schema, ownerOID, nil
+}
+
 // EncodeCreateAggregate encodes a CREATE AGGREGATE event (DU-002
 // restart-persistence follow-up to M0119-0004, slice 405 resume point (c)).
 // The OID is carried so recovery re-registers the aggregate identically to
@@ -8991,14 +9198,14 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 		// internal/initdb/view_ddl_recovery.go re-parses the query after
 		// loadUserTablesFromHeap.
 		return false, nil
-	case RecordKindCreateConversion, RecordKindDropConversion:
-		// CREATE/DROP CONVERSION records (DU-002 restart-persistence
-		// follow-up) carry only pg_conversion metadata; goopg has no
-		// per-conversion file namespace, so the physical replay path has
-		// nothing to do. The recovery driver in
-		// internal/initdb/conversion_ddl_recovery.go scans the WAL for
-		// these records after physical replay and re-applies them to the
-		// catalog's conversion registry.
+	case RecordKindCreateConversion, RecordKindDropConversion, RecordKindAlterConversionRename, RecordKindAlterConversionOwner, RecordKindAlterConversionSetSchema:
+		// CREATE/DROP/ALTER CONVERSION records (DU-002 restart-persistence
+		// follow-up; ALTER added M0122-0007 4e follow-up) carry only
+		// pg_conversion metadata; goopg has no per-conversion file
+		// namespace, so the physical replay path has nothing to do. The
+		// recovery driver in internal/initdb/conversion_ddl_recovery.go
+		// scans the WAL for these records after physical replay and
+		// re-applies them to the catalog's conversion registry.
 		return false, nil
 	case RecordKindCreateTSDict, RecordKindDropTSDict, RecordKindCreateTSConfig, RecordKindAddTSConfigMapping, RecordKindDropTSConfig,
 		RecordKindDropTSConfigMapping, RecordKindRenameTSConfig, RecordKindSetTSConfigSchema, RecordKindReplaceTSConfigMappingDict,

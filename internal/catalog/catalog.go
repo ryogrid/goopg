@@ -12717,6 +12717,115 @@ func (c *InMemory) DropConversionDuringRecovery(name, schema string) {
 	c.DropConversion(name, schema)
 }
 
+// RenameConversion renames a user-created conversion with the given bare name
+// in the given schema to newName. Returns an error if the source conversion
+// does not exist (not found in userConversions — built-in conversions are
+// never registered there, mirroring DropConversion's refusal to touch them)
+// or a conversion named newName already exists in the same namespace.
+// `schema` resolves like CreateConversion (unknown → public). Mirrors
+// RenameCollation. M0122-0007 4e follow-up (DU-002 ALTER CONVERSION unblock).
+func (c *InMemory) RenameConversion(name, schema, newName string, dbOid ...uint32) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	oid := resolveDBOid(dbOid)
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	var target *UserConversion
+	for _, uc := range c.userConversions {
+		if uc.DBOid != oid || uc.NamespaceOID != nsOID {
+			continue
+		}
+		if strings.EqualFold(uc.Name, name) {
+			target = uc
+			continue
+		}
+		if strings.EqualFold(uc.Name, newName) {
+			return fmt.Errorf("conversion %q already exists", newName)
+		}
+	}
+	if target == nil {
+		return fmt.Errorf("conversion %q does not exist", name)
+	}
+	target.Name = newName
+	return nil
+}
+
+// SetConversionOwner sets the owning role OID of a user-created conversion
+// with the given bare name in the given schema. Returns false if no such
+// conversion is registered (mirrors RenameConversion/DropConversion). Mirrors
+// SetCollationOwner. M0122-0007 4e follow-up (DU-002 ALTER CONVERSION
+// unblock).
+func (c *InMemory) SetConversionOwner(name, schema string, ownerOID uint32, dbOid ...uint32) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	oid := resolveDBOid(dbOid)
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	for _, uc := range c.userConversions {
+		if uc.DBOid == oid && uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, name) {
+			uc.Owner = ownerOID
+			return true
+		}
+	}
+	return false
+}
+
+// SetConversionSchema moves a user-created conversion with the given bare
+// name from `schema` into `newSchema` (SET SCHEMA), resolving both schema
+// names to their namespace OID the same way SetConversionOwner/
+// RenameConversion do (unknown → public). Returns false if no such
+// conversion is registered. Mirrors SetCollationSchema. M0122-0007 4e
+// follow-up (DU-002 ALTER CONVERSION unblock).
+func (c *InMemory) SetConversionSchema(name, schema, newSchema string, dbOid ...uint32) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	oid := resolveDBOid(dbOid)
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	newNsOID := c.schemas[strings.ToLower(newSchema)]
+	if newNsOID == 0 {
+		newNsOID = c.schemas["public"]
+	}
+	for _, uc := range c.userConversions {
+		if uc.DBOid == oid && uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, name) {
+			uc.NamespaceOID = newNsOID
+			return true
+		}
+	}
+	return false
+}
+
+// RenameConversionDuringRecovery is the discard-result recovery counterpart
+// to RenameConversion, mirroring DropConversionDuringRecovery. A rename
+// record can only be replayed after its conversion's CREATE CONVERSION
+// record (WAL is scanned in order), so a not-found error here is not
+// expected in practice, but replay must not abort on it — the same "don't
+// care if it was still there" tolerance DropConversionDuringRecovery
+// documents. Mirrors RenameCollationDuringRecovery.
+func (c *InMemory) RenameConversionDuringRecovery(name, schema, newName string) {
+	_ = c.RenameConversion(name, schema, newName)
+}
+
+// SetConversionOwnerDuringRecovery is the discard-result recovery
+// counterpart to SetConversionOwner, mirroring
+// SetCollationOwnerDuringRecovery.
+func (c *InMemory) SetConversionOwnerDuringRecovery(name, schema string, ownerOID uint32) {
+	c.SetConversionOwner(name, schema, ownerOID)
+}
+
+// SetConversionSchemaDuringRecovery is the discard-result recovery
+// counterpart to SetConversionSchema, mirroring
+// SetCollationSchemaDuringRecovery.
+func (c *InMemory) SetConversionSchemaDuringRecovery(name, schema, newSchema string) {
+	c.SetConversionSchema(name, schema, newSchema)
+}
+
 // ListUserConversions returns the user-created conversions in creation order.
 // DU-002 slice 399.
 func (c *InMemory) ListUserConversions() []*UserConversion {

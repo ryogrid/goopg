@@ -4859,27 +4859,53 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       probe, confirms forward progress); `RALPH_PRECOMMIT_SCOPE=smoke bash
       scripts/ralph-precommit-test.sh` PASS twice (0 failed, all 3 workloads
       both times).
-- [ ] **M0122-0007 4e follow-up — parser gap: `ALTER CONVERSION <name> OWNER
+- [x] **M0122-0007 4e follow-up — parser gap: `ALTER CONVERSION <name> OWNER
       TO <role>` not a recognized `ALTER` production (DU-002 round-trip probe
-      unblock, next resume point).** The DU-002 probe's blocker (see the
-      bullet immediately above) now moves to a parser error —
-      `ALTER CONVERSION public.aliasconv OWNER TO postgres;` fails `syntax
-      error at or near "expected keyword table (got conversion)"` — a
-      materially different mechanism (parser grammar coverage, not catalog
-      per-database key collision) from every prior bullet in this series.
-      Grep the parser's `ALTER FUNCTION`/`ALTER COLLATION` OWNER-TO
-      productions as the sibling precedent (both parse today, since the probe
-      reached this far), add an `ALTER CONVERSION <name> OWNER TO <role>`
-      production (check pg_dump's `dumpConversion` in
-      `postgres/src/bin/pg_dump/pg_dump.c` for which other ALTER forms it
-      emits — RENAME TO / SET SCHEMA — before broadening scope), then wire
-      the executor side: `catalog.InMemory` needs
-      `SetConversionOwner`/`RenameConversion`/`SetConversionSchema` mirroring
-      the `UserCollation` trio (`SetCollationOwner`/`RenameCollation`/
-      `SetCollationSchema`, catalog.go ~12493-12573). Verify via
-      `TestPort_PgDumpConnectionSetup`'s DU-002 soft probe — expect the
-      blocker to advance past `aliasconv` to whatever flat-registry object
-      the dump restores next.
+      unblock).** Fixed: added an `AlterConversionStmt` AST node
+      (internal/parser/ast.go, mirrors `AlterCollationStmt` minus REFRESH
+      VERSION) and its `parseAlter()` grammar branch
+      (internal/parser/ddl.go, right after the `ALTER COLLATION` branch)
+      supporting `RENAME TO` / `OWNER TO {role|CURRENT_USER|SESSION_USER|
+      CURRENT_ROLE}` / `SET SCHEMA` (confirmed against
+      `postgres/src/backend/parser/gram.y`'s three `ALTER CONVERSION_P`
+      productions). Catalog side: `RenameConversion`/`SetConversionOwner`/
+      `SetConversionSchema` + their `*DuringRecovery` counterparts
+      (internal/catalog/catalog.go ~12720-12831), mirroring the
+      `UserCollation` trio byte-for-byte. Executor:
+      `execAlterConversion` (internal/executor/operators_ddl.go, right after
+      `execAlterCollation`) + a `*parser.AlterConversionStmt` case in the DDL
+      dispatch switch. WAL durability: 3 new record kinds
+      (`RecordKindAlterConversionRename/Owner/SetSchema` = 130/131/132) +
+      Encode/Decode pairs (internal/wal/recovery.go) +
+      `internal/initdb/conversion_ddl_recovery.go` replay wiring (mirrors
+      `collation_ddl_recovery.go`) + the physical-replay no-op classification
+      case in `recordKindToRmgrInfo`'s neighbor switch. Also needed (missed by
+      the collation precedent grep alone, caught by the resulting `Plan()`
+      test failure): `internal/planner/planner.go`'s DDL-passthrough type list
+      and `internal/server/dispatch.go`'s command-tag switch both needed a
+      `*parser.AlterConversionStmt` case too — a statement type is not fully
+      wired until all three sites (parser/executor AND planner AND dispatch's
+      tag lookup) know about it. New tests:
+      `internal/parser/alter_conversion_test.go` (rename/owner/setschema
+      parse shapes, including the probe's exact
+      `ALTER CONVERSION public.aliasconv OWNER TO postgres` SQL) and
+      `internal/executor/alter_conversion_test.go` (mirrors
+      `alter_collation_test.go`'s rename/owner/setschema/IfExists/42704
+      coverage). **Confirmed via a LIVE re-run of
+      `TestPort_PgDumpConnectionSetup`:** the DU-002 probe's failure point
+      moved past `aliasconv`'s `ALTER CONVERSION ... OWNER TO` entirely to a
+      NEW blocker — `text search dictionary "simple_dict" already exists` —
+      the same cross-database catalog-key-collision shape the
+      `userCollations`/`userConversions` bullets above already fixed, now
+      hitting the text-search dictionary registry. Next resume point: grep
+      `catalog.InMemory`'s ts-dictionary registry (`tsDicts` or similar —
+      check `CreateTSDict`/`ListTSDict*` neighbors of
+      `CreateConversion`/`ListUserConversionsForDBOid` in catalog.go) for a
+      missing `DBOid` field/scoping, apply the identical M0122-0007 4e
+      pattern (dbOid-scoped struct field + variadic `dbOid ...uint32` on
+      Create/Drop + a `*ForDBOid` lister + per-connection wiring through
+      `executor.Context`/`dispatch.go`'s `wireExtensionRows`), verify via the
+      same `TestPort_PgDumpConnectionSetup` soft probe.
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002). `002_save_fullpage`
       (WD-003) + live `pg_waldump --rmgr=Heap2` round-trip DONE. **Still open:** only
       `001_basic.pl`'s server-dependent tier (per-rmgr/relation/block filtering) —

@@ -2853,6 +2853,8 @@ func ddlTag(stmt parser.Stmt) string {
 		return "CREATE COLLATION"
 	case *parser.AlterCollationStmt:
 		return "ALTER COLLATION"
+	case *parser.AlterConversionStmt:
+		return "ALTER CONVERSION"
 	case *parser.AlterTSConfigStmt:
 		return "ALTER TEXT SEARCH CONFIGURATION"
 	case *parser.AlterTSDictStmt:
