@@ -180,6 +180,7 @@ Root node: `Projection`
 |---|-----------|-------|-------|
 | 1 | Seq Scan | partsupp | — |
 | 2 | Index Scan | part | part_pk |
+| 3 | Seq Scan | supplier | — |
 
 ### Q17
 
@@ -258,5 +259,5 @@ for an M0054-0003 sub-task investigation.
 | part | Q20, Q9 | Q14, Q16, Q17, Q19, Q2, Q8 |
 | partsupp | Q11, Q16, Q20 | Q2, Q9 |
 | region | Q2, Q5, Q8 | — |
-| supplier | Q11, Q15b, Q2, Q20, Q21, Q9 | Q5, Q7, Q8 |
+| supplier | Q11, Q15b, Q16, Q2, Q20, Q21, Q9 | Q5, Q7, Q8 |
 

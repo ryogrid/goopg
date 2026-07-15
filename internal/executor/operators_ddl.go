@@ -14914,8 +14914,9 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 						famSchema = "public"
 					}
 					famMethodOID := catalog.AccessMethodOIDByName(method)
-					if fam, found := im.LookupUserOperatorFamily(famSchema, name.Name, famMethodOID); found {
-						im.DropUserOperatorFamily(famSchema, name.Name, famMethodOID)
+					dbOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
+					if fam, found := im.LookupUserOperatorFamily(famSchema, name.Name, famMethodOID, dbOid); found {
+						im.DropUserOperatorFamily(famSchema, name.Name, famMethodOID, dbOid)
 						if o.ctx.WAL != nil {
 							if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropOperatorFamily(fam.OID)); werr != nil {
 								return fmt.Errorf("wal drop-operator-family: %w", werr)
@@ -14936,8 +14937,9 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 							classSchema = "public"
 						}
 						classMethodOID := catalog.AccessMethodOIDByName(method)
-						oc, ocFound := im.LookupUserOperatorClass(classSchema, name.Name, classMethodOID)
-						im.DropUserOperatorClass(classSchema, name.Name, classMethodOID)
+						classDBOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
+						oc, ocFound := im.LookupUserOperatorClass(classSchema, name.Name, classMethodOID, classDBOid)
+						im.DropUserOperatorClass(classSchema, name.Name, classMethodOID, classDBOid)
 						// DU-002 restart-persistence follow-up
 						// (M0119-0004/M0110-0001, closing the loop #65/#66
 						// ledger row's "still open" item (1)): mirrors DROP
@@ -16236,7 +16238,7 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		if nsOID == 0 {
 			nsOID = o.ctx.Catalog.SchemaOID("public")
 		}
-		fam := im.RegisterUserOperatorFamily(schema, s.ObjName.Name, nsOID, methodOID, 0)
+		fam := im.RegisterUserOperatorFamily(schema, s.ObjName.Name, nsOID, methodOID, 0, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		// DU-002 restart-persistence follow-up (M0119-0004/M0110-0001,
 		// closing the loop #65/#66 ledger row's "still open" item (1)):
 		// mirrors CREATE OPERATOR's own WAL append so the family survives a
@@ -18127,6 +18129,7 @@ func (o *ddlOp) execCreateOpClass(s *parser.CreateOpClassStmt) error {
 		nsOID = o.ctx.Catalog.SchemaOID("public")
 	}
 	inTypeOID := catalog.TypeNameToOID(s.ForType)
+	dbOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
 
 	var famOID uint32
 	if s.FamilyName != "" {
@@ -18134,7 +18137,7 @@ func (o *ddlOp) execCreateOpClass(s *parser.CreateOpClassStmt) error {
 		if famSchema == "" {
 			famSchema = "public"
 		}
-		fam, found := im.LookupUserOperatorFamily(famSchema, s.FamilyName, methodOID)
+		fam, found := im.LookupUserOperatorFamily(famSchema, s.FamilyName, methodOID, dbOid)
 		if !found {
 			return &ExecError{Code: "42704", Pos: s.Pos(),
 				Message: fmt.Sprintf("operator family %q does not exist for access method %q", s.FamilyName, s.Method)}
@@ -18146,7 +18149,7 @@ func (o *ddlOp) execCreateOpClass(s *parser.CreateOpClassStmt) error {
 		// RegisterUserOperatorFamily default it, mirroring CREATE OPERATOR
 		// FAMILY's own registration (goopg does not track a per-session
 		// creating role for these compat objects).
-		fam := im.RegisterUserOperatorFamily(schema, s.Name, nsOID, methodOID, 0)
+		fam := im.RegisterUserOperatorFamily(schema, s.Name, nsOID, methodOID, 0, dbOid)
 		famOID = fam.OID
 		// DU-002 restart-persistence follow-up (M0119-0004/M0110-0001):
 		// mirrors CREATE OPERATOR FAMILY's own WAL append (execCompatNoop's
@@ -18176,7 +18179,7 @@ func (o *ddlOp) execCreateOpClass(s *parser.CreateOpClassStmt) error {
 			keyTypeOID = 0
 		}
 	}
-	oc := im.RegisterUserOperatorClass(schema, s.Name, nsOID, 0, methodOID, famOID, inTypeOID, s.IsDefault, keyTypeOID)
+	oc := im.RegisterUserOperatorClass(schema, s.Name, nsOID, 0, methodOID, famOID, inTypeOID, s.IsDefault, keyTypeOID, dbOid)
 	// DU-002 restart-persistence follow-up (M0119-0004/M0110-0001, closing
 	// the loop #65/#66 ledger row's "still open" item (1)): mirrors CREATE
 	// OPERATOR's own WAL append so the class survives a restart. The
@@ -18223,7 +18226,7 @@ func (o *ddlOp) execAlterOpFamilyAdd(s *parser.AlterOpFamilyAddStmt) error {
 	if schema == "" {
 		schema = "public"
 	}
-	fam, found := im.LookupUserOperatorFamily(schema, s.Name, methodOID)
+	fam, found := im.LookupUserOperatorFamily(schema, s.Name, methodOID, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 	if !found {
 		return &ExecError{Code: "42704", Pos: s.Pos(),
 			Message: fmt.Sprintf("operator family %q does not exist for access method %q", s.Name, s.Method)}
@@ -18257,7 +18260,7 @@ func (o *ddlOp) execAlterOpFamilyDrop(s *parser.AlterOpFamilyDropStmt) error {
 	if schema == "" {
 		schema = "public"
 	}
-	fam, found := im.LookupUserOperatorFamily(schema, s.Name, methodOID)
+	fam, found := im.LookupUserOperatorFamily(schema, s.Name, methodOID, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 	if !found {
 		return &ExecError{Code: "42704", Pos: s.Pos(),
 			Message: fmt.Sprintf("operator family %q does not exist for access method %q", s.Name, s.Method)}
@@ -18381,7 +18384,7 @@ func (o *ddlOp) registerOpClassMembers(im *catalog.InMemory, members []parser.Op
 				sortFamSchema = "public"
 			}
 			btreeOID := catalog.AccessMethodOIDByName("btree")
-			fam, found := im.LookupUserOperatorFamily(sortFamSchema, m.SortFamilyName, btreeOID)
+			fam, found := im.LookupUserOperatorFamily(sortFamSchema, m.SortFamilyName, btreeOID, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 			if !found {
 				return &ExecError{Code: "42704", Pos: pos,
 					Message: fmt.Sprintf("operator family %q does not exist for access method \"btree\"", m.SortFamilyName)}

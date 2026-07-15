@@ -17536,6 +17536,9 @@ type UserOperatorFamily struct {
 	// OPERATOR FAMILY has no OWNER clause of its own, and goopg's DDL surface
 	// does not track a per-session creating role).
 	Owner uint32
+	// DBOid is the owning database's dbOid (per-database catalog namespace,
+	// M0122-0007 4e follow-up — mirrors AccessMethod.DBOid).
+	DBOid uint32
 }
 
 // OwnerOrDefault mirrors UserOperator.OwnerOrDefault. DU-002 (M0119-0004).
@@ -17558,25 +17561,30 @@ func (f *UserOperatorFamily) NamespaceOIDOrDefault() uint32 {
 // userOpFamilyKey builds the operator-family registry's lookup key. PG scopes
 // opfamily-name uniqueness per (namespace, access method), so the same family
 // name may be reused across access methods (the key includes the method OID,
-// not just schema+name).
-func userOpFamilyKey(schema, name string, method uint32) string {
+// not just schema+name). dbOid is folded in (mirrors accessMethodKey) so two
+// distinct databases may each register a same-named family without
+// colliding. M0122-0007 4e follow-up.
+func userOpFamilyKey(dbOid uint32, schema, name string, method uint32) string {
 	if schema == "" {
 		schema = "public"
 	}
-	return strings.ToLower(schema) + "." + strings.ToLower(name) + "/" + strconv.FormatUint(uint64(method), 10)
+	return strconv.FormatUint(uint64(dbOid), 10) + "\x00" + strings.ToLower(schema) + "." + strings.ToLower(name) + "/" + strconv.FormatUint(uint64(method), 10)
 }
 
 // RegisterUserOperatorFamily records a user-defined operator family,
 // allocating a stable OID on first sight. Idempotent: re-registering the same
-// (schema, name, method) key refreshes namespace/owner but keeps the OID.
-// DU-002 (M0119-0004).
-func (c *InMemory) RegisterUserOperatorFamily(schema, name string, namespaceOID, method, owner uint32) *UserOperatorFamily {
+// (schema, name, method) key refreshes namespace/owner but keeps the OID. The
+// trailing variadic dbOid follows the domainKey/enumKey/.../AccessMethod
+// convention (M0122-0007 4e) so a same-named family in two distinct
+// databases does not collide. DU-002 (M0119-0004).
+func (c *InMemory) RegisterUserOperatorFamily(schema, name string, namespaceOID, method, owner uint32, dbOid ...uint32) *UserOperatorFamily {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	resolved := resolveDBOid(dbOid)
 	if c.userOperatorFamilies == nil {
 		c.userOperatorFamilies = make(map[string]*UserOperatorFamily)
 	}
-	key := userOpFamilyKey(schema, name, method)
+	key := userOpFamilyKey(resolved, schema, name, method)
 	if f, ok := c.userOperatorFamilies[key]; ok {
 		if namespaceOID != 0 {
 			f.NamespaceOID = namespaceOID
@@ -17588,7 +17596,7 @@ func (c *InMemory) RegisterUserOperatorFamily(schema, name string, namespaceOID,
 	}
 	f := &UserOperatorFamily{
 		OID: c.allocOIDLocked(), Name: name, NamespaceOID: namespaceOID,
-		Method: method, Owner: owner,
+		Method: method, Owner: owner, DBOid: resolved,
 	}
 	c.userOperatorFamilies[key] = f
 	return f
@@ -17616,7 +17624,12 @@ func (c *InMemory) RegisterUserOperatorFamilyDuringRecovery(f *UserOperatorFamil
 	}
 	out := *f
 	out.NamespaceOID = nsOID
-	key := userOpFamilyKey(schema, f.Name, f.Method)
+	// WAL record carries no dbOid — startup recovery is still single-database
+	// (mirrors RegisterAccessMethodDuringRecovery). M0122-0007 4e follow-up.
+	if out.DBOid == 0 {
+		out.DBOid = DefaultDBOid
+	}
+	key := userOpFamilyKey(out.DBOid, schema, f.Name, f.Method)
 	c.userOperatorFamilies[key] = &out
 	c.advanceNextOIDLocked(f.OID)
 }
@@ -17624,14 +17637,15 @@ func (c *InMemory) RegisterUserOperatorFamilyDuringRecovery(f *UserOperatorFamil
 // DropUserOperatorFamily removes a user-defined operator family from the
 // registry, along with any pg_amop/pg_amproc member rows attributed to it
 // (mirrors DropUserOperatorClass's own member purge). Returns true if one
-// was found and removed. DU-002 (M0119-0004).
-func (c *InMemory) DropUserOperatorFamily(schema, name string, method uint32) bool {
+// was found and removed. The trailing variadic dbOid mirrors
+// RegisterUserOperatorFamily. DU-002 (M0119-0004).
+func (c *InMemory) DropUserOperatorFamily(schema, name string, method uint32, dbOid ...uint32) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.userOperatorFamilies == nil {
 		return false
 	}
-	key := userOpFamilyKey(schema, name, method)
+	key := userOpFamilyKey(resolveDBOid(dbOid), schema, name, method)
 	fam, ok := c.userOperatorFamilies[key]
 	if !ok {
 		return false
@@ -17702,11 +17716,12 @@ func (c *InMemory) ListUserOperatorFamilies() []*UserOperatorFamily {
 
 // LookupUserOperatorFamily finds a previously-registered operator family by
 // its identity (schema, name, method). Used by CREATE OPERATOR CLASS to
-// resolve an explicit `FAMILY family_name` clause. DU-002 (M0119-0004).
-func (c *InMemory) LookupUserOperatorFamily(schema, name string, method uint32) (*UserOperatorFamily, bool) {
+// resolve an explicit `FAMILY family_name` clause. The trailing variadic
+// dbOid mirrors RegisterUserOperatorFamily. DU-002 (M0119-0004).
+func (c *InMemory) LookupUserOperatorFamily(schema, name string, method uint32, dbOid ...uint32) (*UserOperatorFamily, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	f, ok := c.userOperatorFamilies[userOpFamilyKey(schema, name, method)]
+	f, ok := c.userOperatorFamilies[userOpFamilyKey(resolveDBOid(dbOid), schema, name, method)]
 	return f, ok
 }
 
@@ -17734,6 +17749,9 @@ type UserOperatorClass struct {
 	InTypeOID  uint32 // pg_opclass.opcintype
 	IsDefault  bool   // pg_opclass.opcdefault
 	KeyTypeOID uint32 // pg_opclass.opckeytype — 0 (InvalidOid, dumps as "-") when no STORAGE clause was given
+	// DBOid is the owning database's dbOid (per-database catalog namespace,
+	// M0122-0007 4e follow-up — mirrors AccessMethod.DBOid).
+	DBOid uint32
 }
 
 // OwnerOrDefault mirrors UserOperatorFamily.OwnerOrDefault. DU-002 (M0119-0004).
@@ -17755,25 +17773,29 @@ func (oc *UserOperatorClass) NamespaceOIDOrDefault() uint32 {
 
 // userOpClassKey builds the operator-class registry's lookup key, mirroring
 // userOpFamilyKey (PG scopes opclass-name uniqueness per namespace+access
-// method too).
-func userOpClassKey(schema, name string, method uint32) string {
+// method too). dbOid is folded in for the same per-database-isolation reason.
+// M0122-0007 4e follow-up.
+func userOpClassKey(dbOid uint32, schema, name string, method uint32) string {
 	if schema == "" {
 		schema = "public"
 	}
-	return strings.ToLower(schema) + "." + strings.ToLower(name) + "/" + strconv.FormatUint(uint64(method), 10)
+	return strconv.FormatUint(uint64(dbOid), 10) + "\x00" + strings.ToLower(schema) + "." + strings.ToLower(name) + "/" + strconv.FormatUint(uint64(method), 10)
 }
 
 // RegisterUserOperatorClass records a user-defined operator class, allocating
 // a stable OID on first sight. Idempotent: re-registering the same (schema,
-// name, method) key refreshes the mutable attributes but keeps the OID.
-// DU-002 (M0119-0004).
-func (c *InMemory) RegisterUserOperatorClass(schema, name string, namespaceOID, owner, method, familyOID, inTypeOID uint32, isDefault bool, keyTypeOID uint32) *UserOperatorClass {
+// name, method) key refreshes the mutable attributes but keeps the OID. The
+// trailing variadic dbOid follows the domainKey/enumKey/.../AccessMethod
+// convention (M0122-0007 4e) so a same-named class in two distinct databases
+// does not collide. DU-002 (M0119-0004).
+func (c *InMemory) RegisterUserOperatorClass(schema, name string, namespaceOID, owner, method, familyOID, inTypeOID uint32, isDefault bool, keyTypeOID uint32, dbOid ...uint32) *UserOperatorClass {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	resolved := resolveDBOid(dbOid)
 	if c.userOperatorClasses == nil {
 		c.userOperatorClasses = make(map[string]*UserOperatorClass)
 	}
-	key := userOpClassKey(schema, name, method)
+	key := userOpClassKey(resolved, schema, name, method)
 	if oc, ok := c.userOperatorClasses[key]; ok {
 		if namespaceOID != 0 {
 			oc.NamespaceOID = namespaceOID
@@ -17790,6 +17812,7 @@ func (c *InMemory) RegisterUserOperatorClass(schema, name string, namespaceOID, 
 	oc := &UserOperatorClass{
 		OID: c.allocOIDLocked(), Name: name, NamespaceOID: namespaceOID, Owner: owner,
 		Method: method, FamilyOID: familyOID, InTypeOID: inTypeOID, IsDefault: isDefault, KeyTypeOID: keyTypeOID,
+		DBOid: resolved,
 	}
 	c.userOperatorClasses[key] = oc
 	return oc
@@ -17820,7 +17843,12 @@ func (c *InMemory) RegisterUserOperatorClassDuringRecovery(oc *UserOperatorClass
 	}
 	out := *oc
 	out.NamespaceOID = nsOID
-	key := userOpClassKey(schema, oc.Name, oc.Method)
+	// WAL record carries no dbOid — startup recovery is still single-database
+	// (mirrors RegisterAccessMethodDuringRecovery). M0122-0007 4e follow-up.
+	if out.DBOid == 0 {
+		out.DBOid = DefaultDBOid
+	}
+	key := userOpClassKey(out.DBOid, schema, oc.Name, oc.Method)
 	c.userOperatorClasses[key] = &out
 	if c.opClassSchemas == nil {
 		c.opClassSchemas = make(map[string]string)
@@ -17835,23 +17863,23 @@ func (c *InMemory) RegisterUserOperatorClassDuringRecovery(oc *UserOperatorClass
 // removal can be WAL-logged by OID (mirroring DROP OPERATOR's own
 // look-up-then-drop-by-OID shape). DU-002 restart-persistence follow-up
 // (M0119-0004/M0110-0001).
-func (c *InMemory) LookupUserOperatorClass(schema, name string, method uint32) (*UserOperatorClass, bool) {
+func (c *InMemory) LookupUserOperatorClass(schema, name string, method uint32, dbOid ...uint32) (*UserOperatorClass, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	oc, ok := c.userOperatorClasses[userOpClassKey(schema, name, method)]
+	oc, ok := c.userOperatorClasses[userOpClassKey(resolveDBOid(dbOid), schema, name, method)]
 	return oc, ok
 }
 
 // DropUserOperatorClass removes a user-defined operator class from the
 // registry, along with any pg_amop/pg_amproc member rows attributed to it
 // (slice 411). Returns true if one was found and removed. DU-002 (M0119-0004).
-func (c *InMemory) DropUserOperatorClass(schema, name string, method uint32) bool {
+func (c *InMemory) DropUserOperatorClass(schema, name string, method uint32, dbOid ...uint32) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.userOperatorClasses == nil {
 		return false
 	}
-	key := userOpClassKey(schema, name, method)
+	key := userOpClassKey(resolveDBOid(dbOid), schema, name, method)
 	oc, ok := c.userOperatorClasses[key]
 	if !ok {
 		return false
