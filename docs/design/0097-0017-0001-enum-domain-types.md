@@ -225,3 +225,84 @@ iterates `c.enumTypes` without dbOid scoping, so `SELECT * FROM pg_enum`
 still surfaces every database's enum labels regardless of which database
 is querying (pre-existing, not newly introduced — the registry itself had
 no isolation before this fix either).
+
+## Follow-up (2026-07-15, third loop): composite types gain per-database isolation
+
+The last unaudited sibling map in the M0122-0007 4e series:
+`catalog.InMemory.compositeTypes`/`compositeTypeNames`/`compositeTypeFields`
+(backing `CREATE TYPE ... AS (col type, …)`) were all keyed by bare
+case-insensitive name only — the identical collision class already fixed for
+`domains`, `userCollations`, and `enumTypes`
+(`docs/design/0122-0018-per-database-catalog-namespace.md`).
+
+Fix mirrors the `enumTypes`/`enumKey` pattern exactly: `CompositeType` gained
+a `DBOid uint32` field; a new `compositeKey(dbOid, name) string` helper
+(`internal/catalog/catalog.go`, next to `domainKey`/`enumKey`) folds dbOid
+into all three composite registry keys.
+`RegisterCompositeType`/`RegisterCompositeTypeWithFields`/
+`RenameCompositeType`/`SetCompositeTypeOwner`/`DropCompositeType`/
+`HasCompositeType` each gained a trailing variadic `dbOid ...uint32`
+(omitting it resolves to `DefaultDBOid`, so every pre-existing call site
+stays behavior-preserving — `RegisterCompositeType`/`RegisterCompositeTypeWithFields`
+never errored on a same-name re-registration to begin with, unlike
+`RegisterEnum`, so there is no analogous "duplicate silently permitted
+cross-database" regression risk to guard against here).
+`LookupCompositeType`/`LookupCompositeTypeFields` also gained the variadic
+`dbOid` (added to the `Catalog` interface too) — when omitted they fall back
+to a global by-name scan (`lookupCompositeTypeByNameLocked`, mirrors
+`lookupEnumByNameLocked`/`lookupDomainByNameLocked`) for the ~15 read-only
+call sites not yet threaded through a connection's dbOid (`expr.go`,
+`pg18_user_catalog_rows.go`, `plpgsql_runtime.go`, `operators_fk.go`-adjacent
+paths) — same bounded scope as the enum follow-up's identical deferral.
+
+All composite write-path call sites in `internal/executor/operators_ddl.go`
+thread `o.ctx.CurrentDatabaseOid`: `execCreateType`'s `CREATE TYPE ... AS
+(...)` (both the with-fields and name-only-registration branches),
+`execAlterType`'s `ADD`/`RENAME`/`DROP`/`ALTER ATTRIBUTE` single-subcommand
+branches, its `RENAME TO`/`OWNER TO` composite-dispatch guards,
+`execAlterTypeAttrCmds`'s multi-subcommand form, and `execDropType`'s
+composite branch (both the `LookupCompositeType` heap-stamp guard and the
+`DropCompositeType` call itself).
+
+Applied the sibling-path lesson from the enum follow-up proactively this
+time instead of discovering it via test failure: grepped
+`internal/executor/operators_tx.go` and `internal/server/dispatch.go` up
+front for the second, independent undo copy
+(`undoEnumDDLFromContext`/`undoEnumDDLForRollback`) before running any
+tests, and threaded `ctx.CurrentDatabaseOid`/`dbOid` through both
+`PendingCreatedComposites` drop loops in the same edit pass as the executor
+write paths. `undoEnumDDLForRollback` already accepted a `dbOid` parameter
+from the enum fix, so only its call to `DropCompositeType` needed the
+argument added.
+
+This still surfaced one genuine regression, caught by the full targeted
+test run rather than by the proactive grep: the pre-existing
+`internal/executor/operators_tx_composite_test.go` built a bare
+`&Context{Catalog: cat, PendingCreatedComposites: ...}` with no
+`CurrentDatabaseOid` set (zero value `0`), while its
+`RegisterCompositeTypeWithFields` calls omitted `dbOid` entirely (resolving
+to `DefaultDBOid`, i.e. `1`, via `resolveDBOid`'s empty-variadic fallback) —
+so once `undoEnumDDLFromContext` started passing the real (zero) `ctx.
+CurrentDatabaseOid` to `DropCompositeType`, the drop looked in the `0`
+bucket while the registration lived in the `1` bucket, silently failing to
+undo. This is not a product bug — no real connection context resolves to a
+literal `0` `CurrentDatabaseOid` — but a test-fixture inconsistency exposed
+by making the dbOid plumbing real; fixed by setting `ctx.CurrentDatabaseOid:
+catalog.DefaultDBOid` and passing `catalog.DefaultDBOid` to the `Register`/
+`Lookup` calls in both test functions, matching how a real `Context` is
+populated.
+
+New `TestCreateCompositeTypeCrossDatabaseIsolation`
+(`internal/catalog/create_composite_type_test.go`), mirroring
+`TestCreateEnumCrossDatabaseIsolation`/`TestCreateDomainCrossDatabaseIsolation`.
+
+Still deferred (ledgered, same shape as the enum/domain gaps): WAL
+restart-persistence for composite types is not dbOid-aware; the
+`PGClassRowsForDBOid`/`PGConstraintRowsForDBOid` virtual builders iterate
+`c.compositeTypes`/`c.domains` without dbOid scoping, so the implicit
+`pg_class`/`pg_attribute` rows for a composite type (and a domain's CHECK
+constraints) surface regardless of which database is querying — pre-existing
+for all three type kinds, not newly introduced by this fix. The ~15
+remaining read-only `LookupCompositeType`/`LookupCompositeTypeFields` call
+sites are not dbOid-threaded, matching the enum follow-up's identical
+resume-point scope.

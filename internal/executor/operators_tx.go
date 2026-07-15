@@ -435,7 +435,7 @@ func undoEnumDDLFromContext(ctx *Context) {
 	// iterates the in-memory registry, so removing the registration below is
 	// what makes the aborted composite disappear.  DU-002 slice 244.
 	for name := range ctx.PendingCreatedComposites {
-		_ = inm.DropCompositeType(name)
+		_ = inm.DropCompositeType(name, ctx.CurrentDatabaseOid)
 	}
 }
 

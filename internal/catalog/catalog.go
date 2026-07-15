@@ -2002,7 +2002,7 @@ type Catalog interface {
 	// LookupCompositeTypeFields returns the ordered field list for a composite
 	// type registered via RegisterCompositeTypeWithFields. Returns nil if the
 	// type has no field metadata. M0097-composite.
-	LookupCompositeTypeFields(name string) []CompositeField
+	LookupCompositeTypeFields(name string, dbOid ...uint32) []CompositeField
 	// AllocOID atomically allocates and returns a fresh catalog OID from the
 	// running counter. Used to give catalog objects a stable identity when no
 	// dedicated creation method exists — e.g. named CHECK constraints that must
@@ -2038,7 +2038,7 @@ type Catalog interface {
 	// by name (case-insensitive), or nil. Exposed on the interface so the
 	// catalog-row builders can re-resolve a composite field whose declared type
 	// is itself a user-defined composite type. DU-002 slice 249.
-	LookupCompositeType(name string) *CompositeType
+	LookupCompositeType(name string, dbOid ...uint32) *CompositeType
 	// LookupCompositeTypeByOID finds a user-defined composite type by its pg_type
 	// OID, used by format_type to render a nested-composite column's declared
 	// type as its schema-qualified name. DU-002 slice 249.
@@ -2274,14 +2274,18 @@ type InMemory struct {
 	domains map[string]*Domain
 	// compositeTypeNames tracks names of composite/range/base types created via
 	// CREATE TYPE ... AS (...). Since we don't implement composite type evaluation,
-	// we only track the name so DROP TYPE can succeed silently. M0097-0064.
+	// we only track the name so DROP TYPE can succeed silently. M0097-0064. Keyed
+	// by compositeKey (folds in dbOid, mirrors enumTypes/domains). M0122-0007 4e
+	// follow-up.
 	compositeTypeNames map[string]bool
 	// compositeTypeFields stores the ordered field list for composite types so
 	// that PL/pgSQL can perform field access and assignment. M0097-composite.
+	// Keyed by compositeKey. M0122-0007 4e follow-up.
 	compositeTypeFields map[string][]CompositeField
 	// compositeTypes holds OID-bearing metadata for composite types created via
 	// CREATE TYPE ... AS (...), so a pg_type heap row (typtype='c') can be
-	// synthesized for pg_dump / catalog parity. DU-002 slice 242.
+	// synthesized for pg_dump / catalog parity. DU-002 slice 242. Keyed by
+	// compositeKey. M0122-0007 4e follow-up.
 	compositeTypes map[string]*CompositeType
 	// rangeTypes holds user-defined range types created via
 	// CREATE TYPE ... AS RANGE (subtype = ..., ...), keyed by lower-case name,
@@ -3003,6 +3007,12 @@ type CompositeType struct {
 	// 0 means "unset, defaults to the bootstrap superuser" — see
 	// OwnerOrDefault. M0122-0005 (m0097-0017 follow-up).
 	Owner uint32
+	// DBOid is the database this composite type was CREATE TYPE'd under,
+	// folded into the c.compositeTypes/compositeTypeNames/compositeTypeFields
+	// registry keys via compositeKey so two databases may each register a
+	// same-named composite type without colliding. Mirrors EnumType.DBOid/
+	// Domain.DBOid. M0122-0007 4e follow-up.
+	DBOid uint32
 }
 
 // OwnerOrDefault returns ct.Owner, falling back to the bootstrap superuser OID
@@ -3452,6 +3462,14 @@ func domainKey(dbOid uint32, name string) string {
 // same-named enum without colliding. Mirrors domainKey. M0122-0007 4e
 // follow-up.
 func enumKey(dbOid uint32, name string) string {
+	return strconv.FormatUint(uint64(dbOid), 10) + "\x00" + strings.ToLower(name)
+}
+
+// compositeKey builds the c.compositeTypes/compositeTypeNames/
+// compositeTypeFields registry key, folding dbOid into the case-insensitive
+// name so two distinct databases may each register a same-named composite
+// type without colliding. Mirrors domainKey/enumKey. M0122-0007 4e follow-up.
+func compositeKey(dbOid uint32, name string) string {
 	return strconv.FormatUint(uint64(dbOid), 10) + "\x00" + strings.ToLower(name)
 }
 
@@ -19894,9 +19912,11 @@ func (c *InMemory) SetEnumOwner(name string, ownerOID uint32, dbOid ...uint32) b
 // RENAME TO previously always called RenameEnum regardless of the target
 // type's kind, so renaming a composite type raised a spurious "type does not
 // exist" (42710) instead of renaming it.
-func (c *InMemory) RenameCompositeType(oldName, newName string) error {
-	ok := strings.ToLower(oldName)
-	nk := strings.ToLower(newName)
+func (c *InMemory) RenameCompositeType(oldName, newName string, dbOid ...uint32) error {
+	oid := resolveDBOid(dbOid)
+	ok := compositeKey(oid, oldName)
+	nk := compositeKey(oid, newName)
+	lowerNewName := strings.ToLower(newName)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	ct, found := c.compositeTypes[ok]
@@ -19909,7 +19929,7 @@ func (c *InMemory) RenameCompositeType(oldName, newName string) error {
 	delete(c.compositeTypes, ok)
 	delete(c.compositeTypeNames, ok)
 	delete(c.compositeTypeFields, ok)
-	ct.Name = nk
+	ct.Name = lowerNewName
 	c.compositeTypes[nk] = ct
 	c.compositeTypeNames[nk] = true
 	c.compositeTypeFields[nk] = ct.Fields
@@ -19919,8 +19939,8 @@ func (c *InMemory) RenameCompositeType(oldName, newName string) error {
 // SetCompositeTypeOwner records the typowner role OID for an existing
 // composite type. Returns false if no such composite type is registered.
 // Mirrors SetEnumOwner. M0122-0005 (m0097-0017 follow-up).
-func (c *InMemory) SetCompositeTypeOwner(name string, ownerOID uint32) bool {
-	k := strings.ToLower(name)
+func (c *InMemory) SetCompositeTypeOwner(name string, ownerOID uint32, dbOid ...uint32) bool {
+	k := compositeKey(resolveDBOid(dbOid), name)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	ct, ok := c.compositeTypes[k]
@@ -20122,8 +20142,9 @@ func (c *InMemory) DropEnum(name string, cascade bool, dbOid ...uint32) error {
 // DROP TYPE can succeed. We don't model composite type internals in v0;
 // tracking the name is enough for DROP TYPE to avoid a false-positive error.
 // M0097-0064.
-func (c *InMemory) RegisterCompositeType(name string) {
-	k := strings.ToLower(name)
+func (c *InMemory) RegisterCompositeType(name string, dbOid ...uint32) {
+	oid := resolveDBOid(dbOid)
+	k := compositeKey(oid, name)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.compositeTypeNames[k] = true
@@ -20131,8 +20152,10 @@ func (c *InMemory) RegisterCompositeType(name string) {
 
 // RegisterCompositeTypeWithFields records a composite type together with its
 // ordered field list, enabling PL/pgSQL field access/assignment. M0097-composite.
-func (c *InMemory) RegisterCompositeTypeWithFields(name string, fields []CompositeField) *CompositeType {
-	k := strings.ToLower(name)
+func (c *InMemory) RegisterCompositeTypeWithFields(name string, fields []CompositeField, dbOid ...uint32) *CompositeType {
+	oid := resolveDBOid(dbOid)
+	lowerName := strings.ToLower(name)
+	k := compositeKey(oid, lowerName)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.compositeTypeNames[k] = true
@@ -20145,7 +20168,7 @@ func (c *InMemory) RegisterCompositeTypeWithFields(name string, fields []Composi
 	// pg_attribute. DU-002 slice 242 (type+array), slice 243 (relation).
 	ct, ok := c.compositeTypes[k]
 	if !ok {
-		ct = &CompositeType{Name: k, OID: c.nextOID, ArrayOID: c.nextOID + 1, RelOID: c.nextOID + 2}
+		ct = &CompositeType{Name: lowerName, OID: c.nextOID, ArrayOID: c.nextOID + 1, RelOID: c.nextOID + 2, DBOid: oid}
 		c.nextOID += 3
 		c.compositeTypes[k] = ct
 	}
@@ -20155,11 +20178,32 @@ func (c *InMemory) RegisterCompositeTypeWithFields(name string, fields []Composi
 
 // LookupCompositeType returns the OID-bearing metadata for a composite type, or
 // nil if no such type exists. DU-002 slice 242.
-func (c *InMemory) LookupCompositeType(name string) *CompositeType {
-	k := strings.ToLower(name)
+func (c *InMemory) LookupCompositeType(name string, dbOid ...uint32) *CompositeType {
+	lowerName := strings.ToLower(name)
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.compositeTypes[k]
+	if len(dbOid) > 0 {
+		return c.compositeTypes[compositeKey(dbOid[0], lowerName)]
+	}
+	// No dbOid supplied: preserve the legacy global-name lookup for read call
+	// sites not yet threaded through a connection's dbOid, falling back to a
+	// scan since the registry key now folds dbOid in. Mirrors LookupEnum's
+	// identical fallback. M0122-0007 4e follow-up.
+	return c.lookupCompositeTypeByNameLocked(lowerName)
+}
+
+// lookupCompositeTypeByNameLocked scans c.compositeTypes for the first entry
+// whose Name matches lowerName (already lowercased), ignoring dbOid. Used by
+// read paths that have no dbOid context available (see LookupCompositeType's
+// doc comment). Caller holds c.mu (read or write). Mirrors
+// lookupEnumByNameLocked/lookupDomainByNameLocked. M0122-0007 4e follow-up.
+func (c *InMemory) lookupCompositeTypeByNameLocked(lowerName string) *CompositeType {
+	for _, ct := range c.compositeTypes {
+		if ct.Name == lowerName {
+			return ct
+		}
+	}
+	return nil
 }
 
 // LookupCompositeTypeByOID finds a composite type by its pg_type OID. Used by
@@ -20887,16 +20931,26 @@ func (c *InMemory) DropRangeTypeDuringRecovery(name string) {
 
 // LookupCompositeTypeFields returns the ordered field list for a composite type,
 // or nil if the type is not known or has no field metadata. M0097-composite.
-func (c *InMemory) LookupCompositeTypeFields(name string) []CompositeField {
-	k := strings.ToLower(name)
+func (c *InMemory) LookupCompositeTypeFields(name string, dbOid ...uint32) []CompositeField {
+	lowerName := strings.ToLower(name)
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.compositeTypeFields[k]
+	if len(dbOid) > 0 {
+		return c.compositeTypeFields[compositeKey(dbOid[0], lowerName)]
+	}
+	// No dbOid supplied: fall back to the dbOid-agnostic composite lookup so
+	// existing callers keep working unchanged. Mirrors LookupCompositeType's
+	// identical fallback. M0122-0007 4e follow-up.
+	if ct := c.lookupCompositeTypeByNameLocked(lowerName); ct != nil {
+		return ct.Fields
+	}
+	return nil
 }
 
 // HasCompositeType reports whether the given name refers to a composite type.
-func (c *InMemory) HasCompositeType(name string) bool {
-	k := strings.ToLower(name)
+func (c *InMemory) HasCompositeType(name string, dbOid ...uint32) bool {
+	oid := resolveDBOid(dbOid)
+	k := compositeKey(oid, name)
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.compositeTypeNames[k]
@@ -20904,8 +20958,9 @@ func (c *InMemory) HasCompositeType(name string) bool {
 
 // DropCompositeType removes a composite type name. Returns an error if not
 // found. M0097-0064.
-func (c *InMemory) DropCompositeType(name string) error {
-	k := strings.ToLower(name)
+func (c *InMemory) DropCompositeType(name string, dbOid ...uint32) error {
+	oid := resolveDBOid(dbOid)
+	k := compositeKey(oid, name)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if !c.compositeTypeNames[k] {

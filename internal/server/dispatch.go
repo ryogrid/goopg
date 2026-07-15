@@ -2273,7 +2273,7 @@ func undoEnumDDLForRollback(connTx *connTxState, cat catalog.Catalog, dbOid uint
 	// Step 4: Drop composite types created via CREATE TYPE … AS (...) in this
 	// transaction.  Mirrors undoEnumDDLFromContext step 4.  DU-002 slice 244.
 	for name := range connTx.PendingCreatedComposites {
-		_ = inm.DropCompositeType(name)
+		_ = inm.DropCompositeType(name, dbOid)
 	}
 }
 

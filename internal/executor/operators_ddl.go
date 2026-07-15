@@ -18614,7 +18614,7 @@ func (o *ddlOp) execCreateType(s *parser.CreateTypeStmt) error {
 			for i, f := range s.CompositeFields {
 				fields[i] = catalog.CompositeField{Name: f.Name, ColType: f.ColType, Collation: f.Collation}
 			}
-			ct := cat.RegisterCompositeTypeWithFields(s.Name, fields)
+			ct := cat.RegisterCompositeTypeWithFields(s.Name, fields, o.ctx.CurrentDatabaseOid)
 			ct.Owner = o.currentDDLOwnerOID()
 			// Write pg_type heap rows (typtype='c' + its `_name` array) so the
 			// composite type is visible to pg_dump's getTypes and catalog
@@ -18634,8 +18634,8 @@ func (o *ddlOp) execCreateType(s *parser.CreateTypeStmt) error {
 				o.ctx.PendingCreatedComposites[strings.ToLower(s.Name)] = true
 			}
 		} else {
-			cat.RegisterCompositeType(s.Name)
-			if ct := cat.LookupCompositeType(s.Name); ct != nil {
+			cat.RegisterCompositeType(s.Name, o.ctx.CurrentDatabaseOid)
+			if ct := cat.LookupCompositeType(s.Name, o.ctx.CurrentDatabaseOid); ct != nil {
 				ct.Owner = o.currentDDLOwnerOID()
 			}
 		}
@@ -18682,7 +18682,7 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 	// the existing heap rows and re-sync the full row set with the appended
 	// field — there is no in-place pg_attribute update / relnatts bump path.
 	if s.AddAttrName != "" {
-		ct := cat.LookupCompositeType(s.Name)
+		ct := cat.LookupCompositeType(s.Name, o.ctx.CurrentDatabaseOid)
 		if ct == nil {
 			return &ExecError{Code: "42704", Pos: s.Pos(),
 				Message: fmt.Sprintf("type %q does not exist", s.Name)}
@@ -18711,7 +18711,7 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 			_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.RelationRelationId)
 			_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.AttributeRelationId)
 		}
-		ct2 := cat.RegisterCompositeTypeWithFields(s.Name, newFields)
+		ct2 := cat.RegisterCompositeTypeWithFields(s.Name, newFields, o.ctx.CurrentDatabaseOid)
 		syncCompositeTypeToCatalogHeap(o.ctx, ct2)
 		return nil
 	}
@@ -18721,7 +18721,7 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 	// across re-registration, so stamp xmax on the existing heap rows and
 	// re-sync the field set with the renamed attribute.
 	if s.RenameAttrOld != "" {
-		ct := cat.LookupCompositeType(s.Name)
+		ct := cat.LookupCompositeType(s.Name, o.ctx.CurrentDatabaseOid)
 		if ct == nil {
 			return &ExecError{Code: "42704", Pos: s.Pos(),
 				Message: fmt.Sprintf("type %q does not exist", s.Name)}
@@ -18751,7 +18751,7 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 			_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.RelationRelationId)
 			_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.AttributeRelationId)
 		}
-		ct2 := cat.RegisterCompositeTypeWithFields(s.Name, newFields)
+		ct2 := cat.RegisterCompositeTypeWithFields(s.Name, newFields, o.ctx.CurrentDatabaseOid)
 		syncCompositeTypeToCatalogHeap(o.ctx, ct2)
 		return nil
 	}
@@ -18761,7 +18761,7 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 	// stable across re-registration, so stamp xmax on the existing heap rows and
 	// re-sync the field set without the dropped attribute.
 	if s.DropAttrName != "" {
-		ct := cat.LookupCompositeType(s.Name)
+		ct := cat.LookupCompositeType(s.Name, o.ctx.CurrentDatabaseOid)
 		if ct == nil {
 			return &ExecError{Code: "42704", Pos: s.Pos(),
 				Message: fmt.Sprintf("type %q does not exist", s.Name)}
@@ -18794,7 +18794,7 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 			_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.RelationRelationId)
 			_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.AttributeRelationId)
 		}
-		ct2 := cat.RegisterCompositeTypeWithFields(s.Name, newFields)
+		ct2 := cat.RegisterCompositeTypeWithFields(s.Name, newFields, o.ctx.CurrentDatabaseOid)
 		syncCompositeTypeToCatalogHeap(o.ctx, ct2)
 		return nil
 	}
@@ -18806,7 +18806,7 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 	// re-typed attribute (syncCompositeTypeToCatalogHeap re-resolves ColType to
 	// atttypid/atttypmod, so a typmod like numeric(12,3) survives intact).
 	if s.AlterAttrName != "" {
-		ct := cat.LookupCompositeType(s.Name)
+		ct := cat.LookupCompositeType(s.Name, o.ctx.CurrentDatabaseOid)
 		if ct == nil {
 			return &ExecError{Code: "42704", Pos: s.Pos(),
 				Message: fmt.Sprintf("type %q does not exist", s.Name)}
@@ -18841,7 +18841,7 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 			_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.RelationRelationId)
 			_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.AttributeRelationId)
 		}
-		ct2 := cat.RegisterCompositeTypeWithFields(s.Name, newFields)
+		ct2 := cat.RegisterCompositeTypeWithFields(s.Name, newFields, o.ctx.CurrentDatabaseOid)
 		syncCompositeTypeToCatalogHeap(o.ctx, ct2)
 		return nil
 	}
@@ -18867,8 +18867,8 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 	// (42710) for `ALTER TYPE <composite> RENAME TO ...`. M0122-0005
 	// (m0097-0017 follow-up).
 	if s.RenameTo != "" {
-		if cat.LookupCompositeType(s.Name) != nil {
-			if err := cat.RenameCompositeType(s.Name, s.RenameTo); err != nil {
+		if cat.LookupCompositeType(s.Name, o.ctx.CurrentDatabaseOid) != nil {
+			if err := cat.RenameCompositeType(s.Name, s.RenameTo, o.ctx.CurrentDatabaseOid); err != nil {
 				return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 			}
 			return nil
@@ -18919,8 +18919,8 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 			}
 			ownerOID = oid
 		}
-		if cat.LookupCompositeType(s.Name) != nil {
-			cat.SetCompositeTypeOwner(s.Name, ownerOID)
+		if cat.LookupCompositeType(s.Name, o.ctx.CurrentDatabaseOid) != nil {
+			cat.SetCompositeTypeOwner(s.Name, ownerOID, o.ctx.CurrentDatabaseOid)
 			return nil
 		}
 		if _, ok := cat.LookupRangeType(s.Name); ok {
@@ -18995,7 +18995,7 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 // the result of its predecessors (e.g. ADD a, then ALTER a TYPE …). DU-002
 // slice 260 (multi-subcommand ALTER TYPE).
 func (o *ddlOp) execAlterTypeAttrCmds(cat *catalog.InMemory, s *parser.AlterTypeStmt) error {
-	ct := cat.LookupCompositeType(s.Name)
+	ct := cat.LookupCompositeType(s.Name, o.ctx.CurrentDatabaseOid)
 	if ct == nil {
 		return &ExecError{Code: "42704", Pos: s.Pos(),
 			Message: fmt.Sprintf("type %q does not exist", s.Name)}
@@ -19067,7 +19067,7 @@ func (o *ddlOp) execAlterTypeAttrCmds(cat *catalog.InMemory, s *parser.AlterType
 		_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.RelationRelationId)
 		_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.AttributeRelationId)
 	}
-	ct2 := cat.RegisterCompositeTypeWithFields(s.Name, fields)
+	ct2 := cat.RegisterCompositeTypeWithFields(s.Name, fields, o.ctx.CurrentDatabaseOid)
 	syncCompositeTypeToCatalogHeap(o.ctx, ct2)
 	return nil
 }
@@ -19103,7 +19103,7 @@ func (o *ddlOp) execDropType(s *parser.DropTypeStmt) error {
 		// Stamp the composite type's pg_type rows (the type + its `_name` array)
 		// before the in-memory delete, so the OID is still resolvable. DU-002
 		// slice 242 — mirrors the enum branch above.
-		if ct := cat.LookupCompositeType(n); ct != nil && catalogHeapSyncAvailable(o.ctx) {
+		if ct := cat.LookupCompositeType(n, o.ctx.CurrentDatabaseOid); ct != nil && catalogHeapSyncAvailable(o.ctx) {
 			if o.ctx.MaterializeWriterXID() == nil {
 				deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, ct.OID, o.ctx.Tx.XID)
 				deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, ct.ArrayOID, o.ctx.Tx.XID)
@@ -19116,7 +19116,7 @@ func (o *ddlOp) execDropType(s *parser.DropTypeStmt) error {
 				_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.AttributeRelationId)
 			}
 		}
-		compErr := cat.DropCompositeType(n)
+		compErr := cat.DropCompositeType(n, o.ctx.CurrentDatabaseOid)
 		if compErr == nil {
 			continue // successfully dropped as composite type
 		}

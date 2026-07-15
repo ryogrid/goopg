@@ -4203,6 +4203,60 @@ survey the deferral ledger for a fresh open (`status = -`) row.
       `compositeTypeNames`) are very likely the same still-unscoped
       collision shape — the last unaudited sibling map in this series.
 
+- [x] **M0122-0007 4e follow-up — `catalog.compositeTypes` (`CREATE TYPE
+      ... AS (...)`) cross-database isolation (resume point from the item
+      above — the last unaudited sibling map in this series).**
+      `catalog.InMemory.compositeTypes`/`compositeTypeNames`/
+      `compositeTypeFields` were three flat, dbOid-less maps keyed by bare
+      case-insensitive name — the same collision shape `domains`/
+      `userCollations`/`enumTypes` already fixed. Applied the identical
+      pattern: `CompositeType` gained a `DBOid uint32` field; new
+      `compositeKey(dbOid, name)` (mirrors `enumKey`/`domainKey`) folds
+      dbOid into all three registry keys. `RegisterCompositeType`/
+      `RegisterCompositeTypeWithFields`/`RenameCompositeType`/
+      `SetCompositeTypeOwner`/`DropCompositeType`/`HasCompositeType` each
+      gained a trailing variadic `dbOid ...uint32`; `LookupCompositeType`/
+      `LookupCompositeTypeFields` (also on the `catalog.Catalog` interface)
+      gained the variadic `dbOid`, falling back to a global by-name scan
+      (`lookupCompositeTypeByNameLocked`, mirrors `lookupEnumByNameLocked`)
+      when omitted. Every composite write-path call site in
+      `internal/executor/operators_ddl.go` (`execCreateType`'s composite
+      branch, `execAlterType`'s ADD/RENAME/DROP/ALTER ATTRIBUTE/RENAME TO/
+      OWNER TO branches, `execAlterTypeAttrCmds`'s multi-subcommand form,
+      `execDropType`'s composite branch) threads `o.ctx.CurrentDatabaseOid`.
+      **Applied the enum follow-up's sibling-path lesson proactively this
+      time:** grepped `internal/executor/operators_tx.go` and
+      `internal/server/dispatch.go` up front for the second, independent
+      ROLLBACK-undo copy (`undoEnumDDLFromContext`/`undoEnumDDLForRollback`)
+      before running any tests, and threaded both `PendingCreatedComposites`
+      drop calls in the same edit pass — `undoEnumDDLForRollback` already
+      took a `dbOid` param from the enum fix, so only its
+      `DropCompositeType` call needed the argument added. This still caught
+      one genuine regression via the full targeted test run: the
+      pre-existing `internal/executor/operators_tx_composite_test.go` built
+      a bare `&Context{}` with no `CurrentDatabaseOid` set (zero value),
+      while its `RegisterCompositeTypeWithFields` calls omitted `dbOid`
+      (resolving to `DefaultDBOid` via the empty-variadic fallback) — a
+      test-fixture inconsistency, not a product bug, fixed by setting
+      `ctx.CurrentDatabaseOid: catalog.DefaultDBOid` and passing
+      `catalog.DefaultDBOid` explicitly in both test functions. New
+      `TestCreateCompositeTypeCrossDatabaseIsolation`
+      (`internal/catalog/create_composite_type_test.go`), mirroring
+      `TestCreateEnumCrossDatabaseIsolation`. Design doc
+      `docs/design/0097-0017-0001-enum-domain-types.md`'s new "Follow-up
+      (2026-07-15, third loop)" section + README index row updated. Gates:
+      `go build ./...`/`go vet ./...` clean; `go test -count=1
+      ./internal/catalog/... ./internal/executor/... ./internal/server/...
+      ./internal/planner/...` PASS; `go test -short` full repo (excl.
+      testport, per policy) PASS, 0 FAIL; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke bash
+      scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 workloads,
+      after one confirmed-flaky retry unrelated to this change). While
+      auditing this loop's scope, confirmed `catalog.RangeType` (`CREATE
+      TYPE ... AS RANGE`) is **not** dbOid-scoped at all (no `DBOid` field,
+      no dbOid-taking methods) — recorded as the next real candidate in the
+      deferral ledger rather than assumed already done.
+
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 
 M0117 (CLOG ↔ PostgreSQL subsystem alignment), M0118 (Upstream Isolation Spec
