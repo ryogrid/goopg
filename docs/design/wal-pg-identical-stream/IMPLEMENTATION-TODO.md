@@ -40,7 +40,7 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
   > fast-path). **⇒ Fold A1 into A2** (do the xid-stamp per record as it flips). The API plumbing exists
   > across **145 `.Append(` call sites** — thread it, but pass the live xid only from flipped emit sites; all
   > others keep 0 until they flip. Retire `nativeHeaderMatchesMainData` when the last native record is gone.
-- [ ] **A2-pre** t_ctid convention change (**prerequisite**, found 2026-07-15): PG `xl_heap_insert` carries no
+- [x] **A2-pre** t_ctid convention change (**prerequisite**, found 2026-07-15): PG `xl_heap_insert` carries no
   t_ctid; replay reconstructs self-pointing `{block,offnum}`. But goopg stores `{InvalidBlockNumber,0}` for
   fresh inserts and MVCC sites read that (`isChainTailCTID` handles both; `operators_fk.go:46`,
   `operators_lockrows.go:1967`, `operators_storage.go:255` epqSerializationErr, prune/visibility check
@@ -99,3 +99,9 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
 - 2026-07-16: **A2a landed** — `internal/wal/pg_assembled_emit.go` (envelope + non-wrapping `encodeAssembledXLog`)
   + branches in `encodeRecordXLog`/`predictXLogRecordLen` + `pg_assembled_emit_test.go` (3 cases). Additive
   (wired to nothing). Gates green: build/vet/test/-race ./internal/wal/. Next: A2-pre (CTID), then A2b/c.
+- 2026-07-16: **A2-pre landed** (audit-mapped, agent-verified). Stamp self-`t_ctid` in `markHeapInsertDirty`
+  (page via existing `PageSetHeapTupleCtid` + `tupleBytes[12:18]` for redo consistency); swap the 4
+  `Block==InvalidBlockNumber`-only delete-detectors (`operators_storage.go:259/4051/4581/4803`) to
+  `isChainTailCTID`. New `insert_self_ctid_test.go` (plain + NULL rows self-pointing). **Gates all green:**
+  storage + executor unit + `-race`; **full isolation 121/121**; **full regress ok**. (Isolation/regress need
+  the `postgres` submodule — symlinked the worktree's empty `postgres/` to the main tree's REL_18_3 checkout.)

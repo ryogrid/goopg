@@ -2,6 +2,7 @@ package executor
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"strconv"
@@ -252,7 +253,10 @@ func epqSerializationErr(ctx *Context, rel storage.RelFileNode, blk storage.Bloc
 	if sp, perr := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk}); perr == nil {
 		sp.RLock()
 		if ot, gerr := storage.PageGetHeapTuple(sp.Page(), slot); gerr == nil {
-			if ot.Header.CTID.Block == storage.InvalidBlockNumber {
+			// A never-updated row is a chain tail — self-pointing t_ctid (PG
+			// convention) or the legacy {Invalid,0} sentinel; DELETE leaves
+			// t_ctid untouched. A real successor t_ctid means UPDATE.
+			if isChainTailCTID(ot.Header.CTID, blk, slot) {
 				errMsg = "could not serialize access due to concurrent delete"
 			}
 		}
@@ -4042,9 +4046,9 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 							sp.RLock()
 							if ot, gerr := storage.PageGetHeapTuple(sp.Page(), pu.slot); gerr == nil {
 								ctid := ot.Header.CTID
-								// goopg initial CTID is {InvalidBlockNumber,0}; stampOldCtid
-								// only runs on UPDATE. So InvalidBlockNumber means deleted.
-								if ctid.Block == storage.InvalidBlockNumber {
+								// A never-updated row is a chain tail (self-pointing t_ctid or the
+								// legacy {Invalid,0} sentinel); a real successor t_ctid means UPDATE.
+								if isChainTailCTID(ctid, pu.blk, pu.slot) {
 									errMsg = "could not serialize access due to concurrent delete"
 								}
 							}
@@ -4567,14 +4571,14 @@ func (o *updateOp) Next() (TupleSlot, error) {
 					}
 					// Concurrent tx committed (visible=false via fresh RC snapshot).
 					if o.ctx.Tx.Isolation != mvcc.IsolationReadCommitted {
-						// Distinguish update vs delete: goopg initial CTID is
-						// {InvalidBlockNumber,0}; stampOldCtid only runs on UPDATE.
+						// Distinguish update vs delete: chain-tail t_ctid (self or
+						// {Invalid,0}) means never-updated; a successor means UPDATE.
 						errMsg := "could not serialize access due to concurrent update"
 						if sp, perr := o.ctx.Pool.Pin(storage.BufferTag{Rel: captureRel, Block: writeBlk}); perr == nil {
 							sp.RLock()
 							if ot, gerr := storage.PageGetHeapTuple(sp.Page(), writeSlot); gerr == nil {
 								ctid := ot.Header.CTID
-								if ctid.Block == storage.InvalidBlockNumber {
+								if isChainTailCTID(ctid, writeBlk, writeSlot) {
 									errMsg = "could not serialize access due to concurrent delete"
 								}
 							}
@@ -4789,14 +4793,14 @@ func (o *updateOp) Next() (TupleSlot, error) {
 					}
 					// Concurrent tx committed — row was updated or deleted.
 					if o.ctx.Tx.Isolation != mvcc.IsolationReadCommitted {
-						// Distinguish UPDATE vs DELETE: goopg initial CTID is
-						// {InvalidBlockNumber,0}; stampOldCtid only runs on UPDATE.
+						// Distinguish UPDATE vs DELETE: chain-tail t_ctid (self or
+						// {Invalid,0}) means never-updated; a successor means UPDATE.
 						errMsg := "could not serialize access due to concurrent update"
 						if sp, perr := o.ctx.Pool.Pin(storage.BufferTag{Rel: puRel, Block: pu.blk}); perr == nil {
 							sp.RLock()
 							if ot, gerr := storage.PageGetHeapTuple(sp.Page(), pu.slot); gerr == nil {
 								ctid := ot.Header.CTID
-								if ctid.Block == storage.InvalidBlockNumber {
+								if isChainTailCTID(ctid, pu.blk, pu.slot) {
 									errMsg = "could not serialize access due to concurrent delete"
 								}
 							}
@@ -8223,6 +8227,25 @@ func markHeapInsertDirty(
 	rel storage.RelFileNode, blk storage.BlockNumber,
 	lineSlot uint16, tupleBytes []byte,
 ) error {
+	// Adopt PostgreSQL's self-pointing t_ctid for a freshly inserted tuple:
+	// stamp {blk, lineSlot} in place of goopg's legacy {InvalidBlockNumber, 0}
+	// sentinel. The slot's line pointer is assigned by the caller's
+	// PageAddHeapTuple, so blk/lineSlot are only known here (post-append) —
+	// this is the single choke point every fresh-insert path funnels through.
+	// Both the stored page AND tupleBytes are stamped: goopg's native
+	// RecordKindHeapInsert carries the whole tuple verbatim, so redo must
+	// reconstruct the same self-pointing t_ctid (and the FPI captured below by
+	// MarkDirtyLogicalChange must see it too). isChainTailCTID treats a
+	// self-pointing t_ctid identically to the old sentinel. Caller holds slot.Lock.
+	self := storage.ItemPointer{Block: blk, Offset: lineSlot}
+	if err := storage.PageSetHeapTupleCtid(slot.Page(), lineSlot, self); err != nil {
+		return err
+	}
+	if len(tupleBytes) >= 18 {
+		binary.LittleEndian.PutUint32(tupleBytes[12:16], uint32(blk))
+		binary.LittleEndian.PutUint16(tupleBytes[16:18], lineSlot)
+	}
+
 	if logHeap == nil {
 		pool.MarkDirty(slot)
 		return nil
