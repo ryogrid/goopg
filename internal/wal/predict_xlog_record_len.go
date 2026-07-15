@@ -48,6 +48,14 @@ func predictXLogRecordLen(payload []byte) (realRecLen, paddedLen int) {
 		return 0, 0
 	}
 
+	// Pre-assembled PG record: encodeRecordXLog emits its body verbatim (no
+	// wrapXLogMainData chunk), so the length is header + body. Mirror
+	// encodeAssembledXLog's byte arithmetic. See pg_assembled_emit.go.
+	if _, _, _, body, ok := unframePGAssembled(payload); ok {
+		realRecLen = xlogRecordHeaderSize + len(body)
+		return realRecLen, maxAlignXLog(realRecLen)
+	}
+
 	// Mirror of wrapXLogMainData: returns the byte count of the wrapped
 	// main-data section. The short/long block-ID branches match PG's
 	// xlrBlockIDDataShort / xlrBlockIDDataLong wrapping.

@@ -40,7 +40,17 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
   > fast-path). **⇒ Fold A1 into A2** (do the xid-stamp per record as it flips). The API plumbing exists
   > across **145 `.Append(` call sites** — thread it, but pass the live xid only from flipped emit sites; all
   > others keep 0 until they flip. Retire `nativeHeaderMatchesMainData` when the last native record is gone.
-- [ ] **A2** HeapInsert flip — `xl_heap_insert{offnum,flags}` + blk0 `xl_heap_header`+tuple; FPI first-touch. (doc 01 §6)
+- [ ] **A2-pre** t_ctid convention change (**prerequisite**, found 2026-07-15): PG `xl_heap_insert` carries no
+  t_ctid; replay reconstructs self-pointing `{block,offnum}`. But goopg stores `{InvalidBlockNumber,0}` for
+  fresh inserts and MVCC sites read that (`isChainTailCTID` handles both; `operators_fk.go:46`,
+  `operators_lockrows.go:1967`, `operators_storage.go:255` epqSerializationErr, prune/visibility check
+  `{Invalid,0}` specifically). Adopt PG self-pointing t_ctid on the insert path (stamp `{blk,lineSlot}` after
+  `PageAddHeapTuple`) + route all convention consumers through a shared "no-successor = {Invalid,0} OR self"
+  predicate. Gate: **full regress + `internal/testport` isolation + -race** (MVCC blast radius). Landed
+  independently before the WAL flip. *(User-chosen 2026-07-15: do the full change now.)*
+- [ ] **A2** HeapInsert flip (rides on A2-pre) — `xl_heap_insert{offnum,flags}` + blk0 `xl_heap_header`+tuple;
+  also fix `decodeXLogHeapInsertTuple` to reconstruct via verbatim concat (null-bitmap-safe, not prefix-strip).
+  Machinery: envelope + non-wrapping append (A2a) → encode flip (A2b) → classifier decoded-path + retire native (A2c). (doc 01 §6)
 - [ ] **A3** HeapDelete flip — `xl_heap_delete{xmax,offnum,infobits_set,flags}`.
 - [ ] **A4** HeapHotUpdate flip — `xl_heap_update` + 2 block refs; route real non-HOT updates here.
 - [ ] **A5** BtreeInsert flip — `xl_btree_insert{offnum}` + blk0 `IndexTupleData`.
@@ -80,3 +90,12 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
 - 2026-07-15: Found A1 is **not** standalone-additive (see A1 ⚠️ note); folded into A2. Session boundary
   taken at A0 (clean committed keystone). **Next session: A2** (HeapInsert flip incl. per-record xid stamp,
   replay dispatch, FPI/logical unification) — its own focused session with full crash-recovery gates.
+- 2026-07-16: A2 investigation (agent-mapped emit path). Findings: HeapInsert emit = native `EncodeHeapInsert`
+  → `Append`→`wrapXLogMainData`; a separate conditional FPI follows (post-insert page) via
+  `MarkDirtyLogicalChange` — so a **minimal flip keeps that FPI** (no unification needed yet). Routing to the
+  already-built `replayDecodedXLogHeapInsert` is automatic (`r.Payload==nil` when a block ref is present).
+  **`classifier.go` must be taught the decoded form** (it gates on native `r.Payload`).
+- 2026-07-16: **Discovered the t_ctid-convention dependency** (see A2-pre) → user chose the full CTID change.
+- 2026-07-16: **A2a landed** — `internal/wal/pg_assembled_emit.go` (envelope + non-wrapping `encodeAssembledXLog`)
+  + branches in `encodeRecordXLog`/`predictXLogRecordLen` + `pg_assembled_emit_test.go` (3 cases). Additive
+  (wired to nothing). Gates green: build/vet/test/-race ./internal/wal/. Next: A2-pre (CTID), then A2b/c.

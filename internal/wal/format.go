@@ -247,6 +247,13 @@ func classifyXLogRecord(payload []byte) (Rmgr, uint8, uint32) {
 // by emitWithPageHeaders to compute xlp_rem_len for cross-page
 // records (pad bytes are not counted in xlp_rem_len upstream).
 func encodeRecordXLog(payload []byte, prev uint64) ([]byte, int, error) {
+	// Pre-assembled PG record (block refs + FPI + main-data chunk already built
+	// by assembleXLogRecord): emit its body verbatim under the carried
+	// (rmid, info, xid) header — never re-wrap or re-classify. See
+	// pg_assembled_emit.go.
+	if rmid, info, xid, body, ok := unframePGAssembled(payload); ok {
+		return encodeAssembledXLog(body, rmid, info, xid, prev)
+	}
 	wrapped := wrapXLogMainData(payload)
 	rmgr, info, xid := classifyXLogRecord(payload)
 	realLen := xlogRecordHeaderSize + len(wrapped)
