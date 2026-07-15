@@ -663,6 +663,19 @@ func funcArgModes(args []parser.FunctionArg) []string {
 	return modes
 }
 
+// routineArgTypeName renders a parsed argument type the same way
+// execCreateFunction/execCreateProcedure build catalog.Routine.ArgTypes[i].Name:
+// the array suffix is baked into the string (Signature() compares Name only,
+// it does not consult catalog.Type.IsArray), so an ALTER/DROP/COMMENT lookup
+// must reproduce that exact string to match a stored array-typed signature.
+func routineArgTypeName(t parser.ColumnType) string {
+	name := strings.ToLower(t.Name)
+	if t.IsArray {
+		name += "[]"
+	}
+	return name
+}
+
 // isKnownBuiltinFunction returns true if name is a known built-in SQL function
 // (not a user-defined routine). Used to detect "random() is not a procedure"
 // cases where the function exists in the built-in registry but not in the

@@ -2374,6 +2374,65 @@ the 2026-07-15 deferral-ledger row (task-id `M0119-0004 (DU-002 round-trip
 probe, OUT-parameter ALTER/DROP/COMMENT FUNCTION signature-matching fix
 ...)`) for the full trace and resume point.
 
+#### VARIADIC-array ALTER/DROP/COMMENT FUNCTION signature-matching fix — LANDED (2026-07-15)
+
+Closed the VARIADIC-array defect the section above traced but did not fix.
+The trace's hypothesis (a parser/storage/render bug dropping `[]` for a
+VARIADIC parameter specifically) was wrong: a live probe against a running
+server showed `pg_get_function_identity_arguments('sum_variadic'::regproc)`
+already returned `VARIADIC arr integer[]` correctly both before and after
+this fix — CREATE FUNCTION storage and the dump-side renderer were never
+broken.
+
+The actual root cause was the same lookup-stub-rebuild shape as the
+OUT-parameter fix above, just carried by a different field.
+`execCreateFunction`/`execCreateProcedure` build `Routine.ArgTypes[i].Name`
+by baking the `[]` array suffix directly into the string (`typName :=
+strings.ToLower(a.Type.Name); if a.Type.IsArray { typName += "[]" }`).
+`Routine.Signature()` (`internal/catalog/routines.go:132`) reads only
+`t.Name` — it never consults `catalog.Type.IsArray` at all — so an
+array-typed argument's entire signature identity lives in the `Name`
+string's suffix. But every ALTER/DROP/COMMENT rebuilt-stub call site
+(the OUT-parameter fix's 6, plus a 7th inside `execDropFunction`'s actual
+deferred/autocommit resolve path that the OUT-parameter fix's single-line
+grep pattern missed because it spans multiple lines with a separate `Args:`
+field) built `catalog.Type{Name: strings.ToLower(a.Type.Name)}` with no `[]`
+appended, so any array-typed ALTER/DROP/COMMENT argument — VARIADIC or a
+plain `integer[]` parameter — computed a signature key that could never
+match a stored array-typed routine.
+
+Added `internal/executor/operators_call.go`'s `routineArgTypeName(t
+parser.ColumnType) string` as the single source of truth for the
+"`[]`-baked-into-`Name`" convention, wired at all 7 rebuilt-stub sites plus
+refactored `execCreateFunction`/`execCreateProcedure`'s own inline duplicate
+of the same 4-line suffix-append logic to call it too — one place now owns
+the convention instead of 9 independent copies. Verified live against a
+running server: `ALTER FUNCTION sum_variadic(VARIADIC integer[]) OWNER TO
+postgres`, `COMMENT ON FUNCTION sum_variadic(VARIADIC integer[]) IS '...'`,
+and `DROP FUNCTION sum_variadic(VARIADIC integer[])` all now succeed
+(previously all three failed `function sum_variadic(integer) does not
+exist` — note the missing `[]` in the error, the tell that confirmed the
+diagnosis).
+
+Confirmed via the DU-002 probe: the round-trip's failure point moved past
+the VARIADIC-array blocker entirely to the ALREADY-DOCUMENTED,
+milestone-scale per-database catalog-namespace gap this design doc's own
+"Confirmed via the DU-002 probe" section (2026-07-06) and the test's inline
+comment (`pgdump_connsetup_test.go:11800-11820`) already describe — this
+run's specific symptom is `access method "goopg_am" already exists`, not a
+new bug, just the next thing the known gap blocks now that the
+function/routine signature-matching sub-series (dbOid-scoping →
+OUT-parameter → VARIADIC-array) is exhausted. Also newly discovered while
+manually probing the fix (not exercised by the DU-002 test itself, which
+only needs DDL to round-trip, not a live CALL): `sum_variadic(1,2,3)`
+fails `function sum_variadic does not exist` — VARIADIC call-site
+argument matching (collapsing N trailing positional args into one array
+parameter, mirroring `parse_func.c`'s `func_match_argtypes`/
+`func_get_detail` VARIADIC handling) was never implemented. That is a
+distinct, materially larger feature (call resolution, not DDL identity
+resolution) recorded as a fresh forward reference in the 2026-07-15 ledger
+row rather than folded into this fix.
+
 ## Deferred / explicitly out of scope
 
 - Unifying `ResolveDatabaseOid`'s switch with the `pg_database` `VirtualRows`

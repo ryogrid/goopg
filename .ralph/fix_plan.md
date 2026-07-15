@@ -4609,6 +4609,47 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       ./internal/executor/...` PASS; `go test -v -run
       '^TestPort_PgDumpConnectionSetup$' ./internal/testport/` PASS
       (soft-log confirms the advance).
+      **2026-07-15 slice (VARIADIC-array ALTER/DROP/COMMENT FUNCTION
+      signature-matching bug — FIXED, resume point from the slice above):**
+      NOT a parser/storage/render bug — `pg_get_function_identity_arguments`
+      already returned `VARIADIC arr integer[]` correctly before this fix.
+      Root cause: `execCreateFunction`/`execCreateProcedure` bake the `[]`
+      array suffix directly into `Routine.ArgTypes[i].Name` (e.g.
+      `"integer[]"`) rather than via `catalog.Type.IsArray`, which
+      `Routine.Signature()` never reads at all — but all 7 ALTER/DROP/COMMENT
+      rebuilt-stub call sites (the prior slice's 6, plus a 7th inside
+      `execDropFunction`'s actual deferred/autocommit resolve path missed by
+      that slice's single-line grep because it spans multiple lines with an
+      `Args:` field) built `catalog.Type{Name: strings.ToLower(a.Type.Name)}`
+      with no `[]` suffix, so an array-typed ALTER/DROP/COMMENT argument
+      could never match the stored signature. Added
+      `internal/executor/operators_call.go`'s `routineArgTypeName(t
+      parser.ColumnType) string` as the single source of truth for the
+      "`[]`-baked-into-Name" convention, wired at all 7 sites plus
+      `execCreateFunction`/`execCreateProcedure`'s own inline duplicate.
+      Verified live: `ALTER FUNCTION sum_variadic(VARIADIC integer[]) OWNER
+      TO postgres`, `COMMENT ON FUNCTION sum_variadic(VARIADIC integer[])
+      IS '...'`, `DROP FUNCTION sum_variadic(VARIADIC integer[])` all now
+      succeed. DU-002 probe now advances past the VARIADIC-array blocker
+      entirely to the ALREADY-DOCUMENTED per-database catalog-namespace gap
+      (2026-07-06 ledger row + the test's own inline comment,
+      `pgdump_connsetup_test.go:11800-11820`) — a milestone-scale rewrite,
+      not a further bounded per-statement fix; DU-002's function/routine
+      signature-matching sub-series is now exhausted. Also newly discovered
+      (recorded in ledger, not fixed): `sum_variadic(1,2,3)` CALL fails
+      `function sum_variadic does not exist` — VARIADIC call-site N-args
+      collapse-to-array matching was never implemented (a distinct, larger
+      feature from DDL identity resolution). Gates: `go build ./...`/`go vet
+      ./...` clean repo-wide; `go test ./internal/catalog/...
+      ./internal/executor/... ./internal/parser/...` PASS; `go test -short
+      $(go list ./... | grep -v /internal/testport)` (full repo, short mode)
+      PASS 0 FAIL; `go test -v -run '^TestPort_PgDumpConnectionSetup$'
+      ./internal/testport/` PASS (soft-log confirms the advance to the known
+      cross-database gap); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh`
+      PASS (1 transient unrelated abort under concurrent TPC-B load on run 1
+      of 3, zero code-path overlap with this change; runs 2/3 both clean,
+      confirmed pre-existing flake).
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002). `002_save_fullpage`
       (WD-003) + live `pg_waldump --rmgr=Heap2` round-trip DONE. **Still open:** only
       `001_basic.pl`'s server-dependent tier (per-rmgr/relation/block filtering) —

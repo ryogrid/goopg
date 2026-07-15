@@ -11389,12 +11389,8 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 	argModes := make([]string, len(s.Args))
 	argDefaults := make([]string, len(s.Args))
 	for i, a := range s.Args {
-		typName := strings.ToLower(a.Type.Name)
-		if a.Type.IsArray {
-			typName += "[]"
-		}
 		argTypes[i] = catalog.Type{
-			Name: typName,
+			Name: routineArgTypeName(a.Type),
 			Args: append([]int64(nil), a.Type.Args...),
 		}
 		argNames[i] = a.Name
@@ -11507,7 +11503,7 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 			detail := fmt.Sprintf("%q is a function.", s.Name.Name)
 			argTypes := make([]catalog.Type, len(s.Args))
 			for i, a := range s.Args {
-				argTypes[i] = catalog.Type{Name: strings.ToLower(a.Type.Name)}
+				argTypes[i] = catalog.Type{Name: routineArgTypeName(a.Type)}
 			}
 			if existing, ok := rs.LookupWithArgModes(s.Name, argTypes, funcArgModes(s.Args), catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); ok && existing != nil && existing.IsProcedure {
 				detail = fmt.Sprintf("%q is a procedure.", s.Name.Name)
@@ -11952,7 +11948,7 @@ func (o *ddlOp) execAlterFunction(s *parser.AlterFunctionStmt) error {
 	}
 	var argTypes []catalog.Type
 	for _, a := range s.Args {
-		argTypes = append(argTypes, catalog.Type{Name: strings.ToLower(a.Type.Name)})
+		argTypes = append(argTypes, catalog.Type{Name: routineArgTypeName(a.Type)})
 	}
 	argModes := funcArgModes(s.Args)
 	dbOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
@@ -12149,12 +12145,8 @@ func (o *ddlOp) execCreateProcedure(s *parser.CreateProcedureStmt) error {
 		if a.Default != nil && (a.Mode == parser.FuncArgIn || a.Mode == 0) {
 			defaultSeen = true
 		}
-		typName := strings.ToLower(a.Type.Name)
-		if a.Type.IsArray {
-			typName += "[]"
-		}
 		argTypes[i] = catalog.Type{
-			Name: typName,
+			Name: routineArgTypeName(a.Type),
 			Args: append([]int64(nil), a.Type.Args...),
 		}
 		argNames[i] = a.Name
@@ -12431,7 +12423,7 @@ func (o *ddlOp) execDropFunction(s *parser.DropFunctionStmt) error {
 	if s.Args != nil {
 		argTypes := make([]catalog.Type, len(s.Args))
 		for i, a := range s.Args {
-			argTypes[i] = catalog.Type{Name: strings.ToLower(a.Type.Name)}
+			argTypes[i] = catalog.Type{Name: routineArgTypeName(a.Type)}
 		}
 		if found, ok := rs.LookupWithArgModes(s.Name, argTypes, funcArgModes(s.Args), dbOid); ok && found != nil && found.IsProcedure {
 			// "X(type) is not a function" — matches PG error for DROP FUNCTION on a procedure.
@@ -12452,7 +12444,7 @@ func (o *ddlOp) execDropFunction(s *parser.DropFunctionStmt) error {
 		if s.Args != nil {
 			argTypes := make([]catalog.Type, len(s.Args))
 			for i, a := range s.Args {
-				argTypes[i] = catalog.Type{Name: strings.ToLower(a.Type.Name)}
+				argTypes[i] = catalog.Type{Name: routineArgTypeName(a.Type)}
 			}
 			if target, ok := rs.LookupWithArgModes(s.Name, argTypes, funcArgModes(s.Args), dbOid); ok && target != nil {
 				targets = []*catalog.Routine{target}
@@ -12509,7 +12501,7 @@ func (o *ddlOp) execDropFunction(s *parser.DropFunctionStmt) error {
 			if len(depTables) > 0 {
 				argTypes := make([]catalog.Type, len(s.Args))
 				for i, a := range s.Args {
-					argTypes[i] = catalog.Type{Name: strings.ToLower(a.Type.Name)}
+					argTypes[i] = catalog.Type{Name: routineArgTypeName(a.Type)}
 				}
 				funcSig := s.Name.Name + routineArgListStr(argTypes)
 				details := make([]string, len(depTables))
@@ -12532,7 +12524,7 @@ func (o *ddlOp) execDropFunction(s *parser.DropFunctionStmt) error {
 		argTypes = make([]catalog.Type, len(s.Args))
 		for i, a := range s.Args {
 			argTypes[i] = catalog.Type{
-				Name: strings.ToLower(a.Type.Name),
+				Name: routineArgTypeName(a.Type),
 				Args: append([]int64(nil), a.Type.Args...),
 			}
 		}
@@ -17618,7 +17610,7 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 		}
 		argTypes := make([]catalog.Type, len(s.Args))
 		for i, a := range s.Args {
-			argTypes[i] = catalog.Type{Name: strings.ToLower(a.Type.Name)}
+			argTypes[i] = catalog.Type{Name: routineArgTypeName(a.Type)}
 		}
 		r, ok := rs.LookupWithArgModes(s.ObjName, argTypes, funcArgModes(s.Args), catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		if !ok || r == nil {
