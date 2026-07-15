@@ -11025,7 +11025,35 @@ mirroring M0119's ledger `status` column.
 > compression, autovacuum, FDW/HANDLER stub, GIST, LANGUAGE C) fold into the
 > nearest cluster by the triage.
 
-## Infra (non-milestone; does not gate M0122 PG-compat work)
+## WAL native → PG-format rework (design bundle `docs/design/wal-native-pg-format/`)
+
+- [x] **Doc 04 landed + indexed — "Remove canonical WAL + knob + skip-tag;
+      dispatch on PG-compatible (xl_rmid, xl_info)".** Found already fully
+      written and staged (uncommitted) at loop start — 21 KB, "agent-reviewed
+      vs code/PG-source 2026-07-15 (2 blockers + 1 major + 5 minor found and
+      folded in)". Unlike docs 01-03 in the same bundle (reference-only, no
+      code change), doc 04 is an **actionable implementation plan**: remove
+      the `0xFE` canonical record family + `GOOPG_WAL_CANONICAL` knob + the
+      `RM_XLOG`/`0xF0` skip-tag, replace classify/recovery dispatch with a
+      real PG-style `(rmgr, opcode)` table (§3 mapping, §4 dispatch rework,
+      §5 removal inventory file-by-file). Explicitly out of scope: record
+      *body* content stays native (the 01/03 content rewrite is separate).
+      This loop's task was scoped to landing the plan, not implementing it —
+      a multi-file, high-blast-radius WAL/recovery change needs its own
+      dedicated loop(s) per the doc's own risk guidance ("R1 critical: land
+      §4 last, incrementally; full G-crash before/after"). Indexed doc 04 in
+      the bundle's own `README.md` (Documents table + intro) and added the
+      whole bundle to the main `docs/design/README.md` Design Bundles list
+      (was missing entirely — docs 01-03 were committed
+      `15375589` but never indexed there). **Next step for a future loop:**
+      start with the lowest-risk additive changes first (§5.4: add
+      `RmgrCLOG=3`/`RmgrGoopgCatalog=128` consts, widen
+      `DecodeXLogRecordHeader`'s `Rmid > MaxKnownRmgr` guard to accept the
+      custom range — currently rejects 128/3/8, a BLOCKER the doc flags),
+      verified inert (nothing emits those rmids yet) before touching
+      `classifyXLogRecord`/`recovery.go` dispatch or deleting the canonical
+      family. Gates: none required (docs-only change, no code touched);
+      `make ralph-state-guard` run per every loop's closing requirement.
 
 - [ ] **Nightly whole-suite regression batch — implementation** (~6). Design is
       DONE and committed: `analysis/tests-overview-260706/` (test-landscape

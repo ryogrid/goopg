@@ -48,9 +48,11 @@ must produce.
 | [01](01-emitted-wal-record-inventory.md) | Emitted WAL record inventory | Every record kind goopg **currently emits** (disk + network), grouped by PG-analog / goopg-private / canonical / pgoutput, with emit-site citations. |
 | [02](02-wal-schema-dsl-spec.md) | WAL schema DSL spec | A kaitai-struct–inspired DSL for describing WAL record byte layouts, plus the WAL-specific extensions kaitai lacks. The notation doc 03 is written in. |
 | [03](03-pg183-wal-record-schemas.md) | PG 18.3 WAL record schemas | The PG 18.3 target byte layout for each in-scope record kind, written in the doc-02 DSL, each field cited to `postgres/src/...`, with a per-record "native vs PG delta" note. |
+| [04](04-remove-canonical-and-pg-rmgr-dispatch.md) | Remove canonical WAL + knob + skip-tag; dispatch on PG-compatible (xl_rmid, xl_info) | **Actionable implementation plan** (not reference-only like 01-03): removes the `0xFE` canonical record family, the `GOOPG_WAL_CANONICAL` knob, and the `RM_XLOG`/`0xF0` skip-tag, replacing classification and recovery dispatch with a real PG-style `(rmgr, opcode)` table. Record *body* content stays native (the 01/03 content rewrite is explicitly out of scope here) — this doc only removes the goopg-special scaffolding around the already-PG-faithful frame. Agent-reviewed against code + PG source 2026-07-15 (2 blockers + 1 major + 5 minor folded in). |
 
-Read them in order: 01 scopes *what* must change, 02 defines *how the target is
-written down*, 03 is *the target itself*.
+Read 01-03 in order: 01 scopes *what* must change, 02 defines *how the target is
+written down*, 03 is *the target itself*. Doc 04 is a separate, actionable
+removal/rework plan that can land ahead of the 01/03 content rewrite.
 
 ## Scope note
 
