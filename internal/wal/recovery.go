@@ -9801,6 +9801,24 @@ func decodeXLogHeapDeleteMainData(mainData []byte) (xmax uint32, offnum uint16, 
 	return xmax, offnum, infobits, flags, nil
 }
 
+// reconstructMarshaledTupleFromHeader rebuilds a marshaled HeapTuple from a
+// PG xl_heap_header (t_infomask2, t_infomask, t_hoff) + the tuple bytes past the
+// fixed header — the form the old key/tuple rides in for heap-delete/update. The
+// fixed-header transaction fields (xmin/xmax/xvac/ctid) are left zero: this is
+// consumed only by logical decoding, which reads column values (via t_infomask +
+// t_hoff), not the header xacts.
+func reconstructMarshaledTupleFromHeader(headerAndData []byte) ([]byte, error) {
+	if len(headerAndData) < sizeOfXLogHeapHeaderData {
+		return nil, fmt.Errorf("wal: old-tuple header %d bytes < %d", len(headerAndData), sizeOfXLogHeapHeaderData)
+	}
+	data := headerAndData[sizeOfXLogHeapHeaderData:]
+	out := make([]byte, storage.SizeOfHeapTupleHeaderData+len(data))
+	copy(out[18:22], headerAndData[0:4]) // t_infomask2 + t_infomask
+	out[22] = headerAndData[4]           // t_hoff
+	copy(out[storage.SizeOfHeapTupleHeaderData:], data)
+	return out, nil
+}
+
 // replayDecodedXLogHeapDelete applies a PG-format xl_heap_delete: stamp the
 // deleted tuple's xmax at offnum on block 0's page. Mirrors the native
 // replayHeapDelete (PageSetHeapTupleXmax), so goopg↔goopg replay is identical;

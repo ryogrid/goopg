@@ -54,7 +54,12 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
   `EncodeHeapInsert`/`replayHeapInsert`/ApplyRecord case left as dead fallback (retire later). **Gates all
   green:** wal unit+`-race`, executor, **initdb crash-recovery**, e2e **native replication+promotion**,
   **physical**, **logical** (classifier). Separate FPI kept (unification deferred). (doc 01 §5/§6)
-- [ ] **A3** HeapDelete flip — `xl_heap_delete{xmax,offnum,infobits_set,flags}`.
+- [x] **A3** HeapDelete flip — **LANDED**. `xl_heap_delete{xmax,offnum,infobits_set=0,flags}` + block-0 page
+  ref + optional old tuple (logical). Built the net-new decoded replay (`replayDecodedXLogHeapDelete` reuses
+  `PageSetHeapTupleXmax` = native parity; split the FPI-only dispatch). Live: `logHeapDelete`→`EncodeHeapDeletePG`;
+  classifier decoded delete-path (reconstructs old tuple). **Gates:** wal+`-race`, executor, initdb
+  crash-recovery (234s), e2e native/physical/logical repl, **full isolation + regress**. infobits_set=0 (no
+  HEAP_KEYS_UPDATED — native delta) and ALL_VISIBLE_CLEARED not set = known PG-standby parity gaps.
 - [ ] **A4** HeapHotUpdate flip — `xl_heap_update` + 2 block refs; route real non-HOT updates here.
 - [ ] **A5** BtreeInsert flip — `xl_btree_insert{offnum}` + blk0 `IndexTupleData`.
 - [ ] **A6** XactCommit / CommitInval flip — `xl_xact_commit{xact_time}` + xinfo/invals/subxact chunks.
@@ -128,3 +133,8 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
   decoded dispatch so `xlogHeapDelete` gets the new handler (update/hotupdate/inplace stay FPI-only).
   `heap_delete_pg_test.go`: insert→delete replay stamps xmax (xmin/data intact) + old-tuple carried. Gates:
   build/vet/test/-race ./internal/wal/.
+- 2026-07-16: **A3b landed — HeapDelete flip is LIVE.** `logHeapDelete`→`EncodeHeapDeletePG` (open.go);
+  `classifyDecodedXLog` gained the delete branch (reconstructs old tuple via `reconstructMarshaledTupleFromHeader`)
+  + `heap_delete_pg_classify_test.go`. Every DELETE now writes a PostgreSQL `xl_heap_delete`. **Gates all green:**
+  wal+`-race`, executor, initdb crash-recovery (234s), e2e native/physical/logical replication, **full isolation
+  + full regress**. **A3 DONE.** Next: A5 BtreeInsert or A4 HeapHotUpdate (update needs 2 block refs + t_ctid chain).

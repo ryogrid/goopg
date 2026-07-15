@@ -161,11 +161,15 @@ func classifyDecodedXLog(d *Decoder, r Record) error {
 		return nil
 	}
 	h := r.XLog.Header
-	if h.Rmid == RmgrHeap && h.Info&xlogHeapOpMask == xlogHeapInsert {
-		block, ok := xlogBlockRefByID(r.XLog, 0)
-		if !ok {
-			return nil
-		}
+	if h.Rmid != RmgrHeap {
+		return nil
+	}
+	block, ok := xlogBlockRefByID(r.XLog, 0)
+	if !ok {
+		return nil
+	}
+	switch h.Info & xlogHeapOpMask {
+	case xlogHeapInsert:
 		offnum, err := decodeXLogHeapInsertMainData(r.XLog.MainData)
 		if err != nil {
 			return err
@@ -182,6 +186,29 @@ func classifyDecodedXLog(d *Decoder, r Record) error {
 			Block:    block.Block,
 			LineSlot: offnum,
 			NewTuple: tuple,
+		})
+	case xlogHeapDelete:
+		xmax, offnum, _, flags, err := decodeXLogHeapDeleteMainData(r.XLog.MainData)
+		if err != nil {
+			return err
+		}
+		if storage.TransactionID(xmax) == storage.InvalidTransactionID {
+			return nil
+		}
+		var oldTuple []byte
+		if flags&xlhDeleteContainsOldTuple != 0 && len(r.XLog.MainData) > sizeOfXLogHeapDeleteData {
+			oldTuple, err = reconstructMarshaledTupleFromHeader(r.XLog.MainData[sizeOfXLogHeapDeleteData:])
+			if err != nil {
+				return err
+			}
+		}
+		d.ApplyChange(storage.TransactionID(xmax), Change{
+			Kind:     ChangeDelete,
+			LSN:      r.EndLSN,
+			Rel:      block.Rel,
+			Block:    block.Block,
+			LineSlot: offnum,
+			OldTuple: oldTuple,
 		})
 	}
 	return nil

@@ -464,7 +464,12 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// oldTuple carries the pre-delete heap-tuple bytes for logical
 	// replication; nil when the caller doesn't need logical decoding.
 	logHeapDelete := func(rel storage.RelFileNode, blk storage.BlockNumber, lineSlot uint16, xmax storage.TransactionID, oldTuple []byte) (storage.LSN, error) {
-		payload := wal.EncodeHeapDelete(rel, blk, lineSlot, xmax, oldTuple)
+		// A3: emit a PostgreSQL xl_heap_delete record (block ref + xmax/offnum
+		// main-data, old tuple for logical) instead of the goopg-native body.
+		payload, err := wal.EncodeHeapDeletePG(rel, blk, lineSlot, xmax, oldTuple)
+		if err != nil {
+			return 0, err
+		}
 		_, end, err := walWriter.Append(payload)
 		if err != nil {
 			return 0, err
