@@ -559,7 +559,13 @@ func Open(opts OpenOptions) (*Runtime, error) {
 
 	// M0080-0001: heap-freeze logical record.
 	logHeapFreeze := func(rel storage.RelFileNode, blk storage.BlockNumber, frozenSlots []uint16) (storage.LSN, error) {
-		payload := wal.EncodeHeapFreeze(rel, blk, frozenSlots)
+		// A7: emit a PostgreSQL xl_heap_prune (RM_HEAP2) record with a single
+		// freeze plan covering all frozen slots. Recovery routes it to
+		// replayDecodedXLogHeapPrune (PageFreezeBySlots).
+		payload, err := wal.EncodeHeapFreezePG(rel, blk, frozenSlots)
+		if err != nil {
+			return 0, err
+		}
 		_, end, err := walWriter.Append(payload)
 		if err != nil {
 			return 0, err

@@ -359,3 +359,37 @@ func EncodeHeapPruneOptPG(rel storage.RelFileNode, blk storage.BlockNumber, redi
 	}
 	return framePGAssembled(RmgrHeap2, xlogHeap2PruneOnAccess, 0, body), nil
 }
+
+// EncodeHeapFreezePG builds a PostgreSQL xl_heap_prune record for one page's
+// tuple freeze. goopg freezes uniformly (rewrites each frozen tuple's xmin to
+// FrozenTransactionId — no per-tuple xmax/infomask variation), so a single
+// xlhp_freeze_plan covers all frozen slots: {xmax=0, t_infomask2=0, t_infomask=0,
+// frzflags=0, ntuples=len(frozenSlots)} followed by the trailing offset array =
+// frozenSlots. XLHP_HAS_FREEZE_PLANS; opcode XLOG_HEAP2_PRUNE_VACUUM_CLEANUP.
+// Replay applies it via PageFreezeBySlots (goopg's xmin-rewrite freeze; a real-PG
+// standby's infomask-bit freeze is a separate representation — a documented gap).
+func EncodeHeapFreezePG(rel storage.RelFileNode, blk storage.BlockNumber, frozenSlots []uint16) ([]byte, error) {
+	if len(frozenSlots) == 0 {
+		return nil, fmt.Errorf("wal: heap-freeze with no frozen slots")
+	}
+	var blockData []byte
+	blockData = binary.LittleEndian.AppendUint16(blockData, 1) // nplans
+	blockData = binary.LittleEndian.AppendUint16(blockData, 0) // pad2
+	// one xlhp_freeze_plan (sizeOfXLHPFreezePlan = 11): xmax, infomask2, infomask, frzflags, ntuples.
+	blockData = binary.LittleEndian.AppendUint32(blockData, 0)                        // xmax
+	blockData = binary.LittleEndian.AppendUint16(blockData, 0)                        // t_infomask2
+	blockData = binary.LittleEndian.AppendUint16(blockData, 0)                        // t_infomask
+	blockData = append(blockData, 0)                                                 // frzflags
+	blockData = binary.LittleEndian.AppendUint16(blockData, uint16(len(frozenSlots))) // ntuples
+	// trailing offset array = the frozen slots.
+	for _, s := range frozenSlots {
+		blockData = binary.LittleEndian.AppendUint16(blockData, s)
+	}
+
+	mainData := []byte{0, xlhpHasFreezePlans} // reason = 0, flags
+	body, err := assembleXLogRecord(mainData, []BlockRef{{ID: 0, Rel: rel, Block: blk, Data: blockData}})
+	if err != nil {
+		return nil, err
+	}
+	return framePGAssembled(RmgrHeap2, xlogHeap2PruneVacuumClean, 0, body), nil
+}

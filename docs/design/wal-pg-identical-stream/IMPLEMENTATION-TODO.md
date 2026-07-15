@@ -88,7 +88,14 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
 - [ ] **A2–A6 cross-cutting**: FPI↔logical unification (doc 01 §5); `predictXLogRecordLen` assembled-length
   fix; audit record-count / LSN-delta consumers (stream replayer, recovery-pass WAL-decode memoization,
   FPI-count test assertions).
-- [ ] **A7** heap2 composite — fold HeapPruneOpt/HeapVacuum/HeapFreeze into `xl_heap_prune` (`XLHP_*`).
+- [x] **A7** heap2 composite — **LANDED**. HeapPruneOpt + HeapFreeze → PG `xl_heap_prune` (RM_HEAP2).
+  Prune (PRUNE_ON_ACCESS): XLHP_HAS_REDIRECTIONS + XLHP_HAS_NOW_UNUSED_ITEMS. Freeze (VACUUM_CLEANUP):
+  XLHP_HAS_FREEZE_PLANS (one plan + offset array = frozen slots). Shared composite `decodeXLogHeapPrune` +
+  `replayDecodedXLogHeapPrune` (PageSetItemIDRedirect / VacuumHeapPageBySlots / PageFreezeBySlots) + `case
+  RmgrHeap2` dispatch. **HeapVacuum SKIPPED** (dormant — no runtime producer). Not classifier-relevant
+  (non-logical). **Gates:** wal round-trip+replay, executor, vacuum, initdb crash-recovery, e2e ×3, isolation
+  + regress. Parity gaps: no conflict horizon; freeze frzflags/infomask=0 (goopg freezes via xmin→FrozenXID,
+  not PG's infomask bit — a real-PG-standby freeze representation gap).
 - [ ] **A8** btree structural — Split, NewRoot, Vacuum, UnlinkPage(36B), MarkPageHalfDead.
 - [ ] **A9** smgr/clog/standalone-FPI/checkpoint-opcode/xact chunks; retire legacy native frame
   (`encodeRecord`/`decodeRecord`).
@@ -112,7 +119,13 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
 
 ---
 
-## Log (A7 in progress)
+## Log (A7 complete)
+- 2026-07-16: **A7-freeze landed — HeapFreeze flip is LIVE.** `EncodeHeapFreezePG` (xl_heap_prune,
+  VACUUM_CLEANUP; one XLHP_HAS_FREEZE_PLANS plan + offset array = frozen slots). Reuses the A7-prune composite
+  decoder/replay (PageFreezeBySlots). Wired `logHeapFreeze`. `heap_freeze_pg_test.go`: decode round-trip +
+  insert→freeze replay (xmin→FrozenTransactionID). **A7 DONE** (prune + freeze; vacuum dormant).
+  **Next: A8 btree structural, A9 smgr/clog/FPI/legacy-frame; then Part B.**
+
 - 2026-07-16: **A7-prune landed — HeapPruneOpt flip is LIVE.** `EncodeHeapPruneOptPG` (xl_heap_prune,
   RM_HEAP2/PRUNE_ON_ACCESS; block-0 XLHP_HAS_REDIRECTIONS pairs + XLHP_HAS_NOW_UNUSED_ITEMS); built the
   composite `decodeXLogHeapPrune` (handles freeze plans too, for A7-freeze) + `replayDecodedXLogHeapPrune`
