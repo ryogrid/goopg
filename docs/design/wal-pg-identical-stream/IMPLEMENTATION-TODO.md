@@ -48,9 +48,12 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
   `PageAddHeapTuple`) + route all convention consumers through a shared "no-successor = {Invalid,0} OR self"
   predicate. Gate: **full regress + `internal/testport` isolation + -race** (MVCC blast radius). Landed
   independently before the WAL flip. *(User-chosen 2026-07-15: do the full change now.)*
-- [ ] **A2** HeapInsert flip (rides on A2-pre) — `xl_heap_insert{offnum,flags}` + blk0 `xl_heap_header`+tuple;
-  also fix `decodeXLogHeapInsertTuple` to reconstruct via verbatim concat (null-bitmap-safe, not prefix-strip).
-  Machinery: envelope + non-wrapping append (A2a) → encode flip (A2b) → classifier decoded-path + retire native (A2c). (doc 01 §6)
+- [x] **A2** HeapInsert flip (rides on A2-pre) — **LANDED**. `xl_heap_insert{offnum,flags}` + blk0
+  `xl_heap_header`+tuple, xl_xid=t_xmin. Null-safe `decodeXLogHeapInsertTuple` (verbatim concat). Live wiring:
+  `logHeapInsert`→`EncodeHeapInsertPG` (open.go); `classifier.go` decoded-path (`classifyDecodedXLog`). Native
+  `EncodeHeapInsert`/`replayHeapInsert`/ApplyRecord case left as dead fallback (retire later). **Gates all
+  green:** wal unit+`-race`, executor, **initdb crash-recovery**, e2e **native replication+promotion**,
+  **physical**, **logical** (classifier). Separate FPI kept (unification deferred). (doc 01 §5/§6)
 - [ ] **A3** HeapDelete flip — `xl_heap_delete{xmax,offnum,infobits_set,flags}`.
 - [ ] **A4** HeapHotUpdate flip — `xl_heap_update` + 2 block refs; route real non-HOT updates here.
 - [ ] **A5** BtreeInsert flip — `xl_btree_insert{offnum}` + blk0 `IndexTupleData`.
@@ -113,3 +116,8 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
   build/vet/test/-race ./internal/wal/. **Remaining A2c** (final, live-stream): wire the `logHeapInsert`
   closure (open.go) to `EncodeHeapInsertPG` + non-wrapping Append, teach `classifier.go` the decoded form,
   gate on G-crash + goopg↔goopg.
+- 2026-07-16: **A2c landed — HeapInsert flip is LIVE.** `logHeapInsert` (open.go) now emits
+  `EncodeHeapInsertPG`; `classifier.go` gained `classifyDecodedXLog` (routes the PG record by xl_xid) +
+  `heap_insert_pg_classify_test.go`. Every INSERT now writes a PostgreSQL `xl_heap_insert`. **Gates:** wal
+  unit+`-race`, executor, initdb crash-recovery (237s), e2e native-replication+promotion / physical /
+  logical — all green. **A2 DONE.** Next record: A3 HeapDelete (same pattern, no t_ctid landmine).

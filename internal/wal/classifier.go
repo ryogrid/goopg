@@ -33,8 +33,15 @@ import (
 // caller (typically a long-lived classifier loop) decides
 // whether to disconnect the slot or keep going.
 func Classify(d *Decoder, r Record) error {
-	if d == nil || len(r.Payload) == 0 {
+	if d == nil {
 		return nil
+	}
+	if len(r.Payload) == 0 {
+		// PG-format records (a block ref is present, so parseXLogRecordData
+		// leaves Payload nil) dispatch on the decoded XLog header. HeapInsert is
+		// the first record flipped to PG form (A2); other PG-format records
+		// (checkpoint, FPI, …) are not user-data changes and skip.
+		return classifyDecodedXLog(d, r)
 	}
 	switch r.Payload[0] {
 	case RecordKindHeapInsert:
@@ -141,6 +148,42 @@ func Classify(d *Decoder, r Record) error {
 	// Other kinds (HeapVacuum, BtreeInsert, BtreeSplit,
 	// PageImage, Checkpoint) aren't user-data transactional
 	// events — skip silently so the decoder loop stays simple.
+	return nil
+}
+
+// classifyDecodedXLog dispatches a PG-format record (no native Payload) into the
+// decoder using its decoded XLog header + block refs. Currently only heap-insert
+// is flipped to PG form; the inserting xid is the record header's xl_xid (== the
+// tuple's t_xmin), and the tuple is reconstructed from block 0 exactly as
+// recovery does. Other rmgrs / opcodes are not user-data changes and skip.
+func classifyDecodedXLog(d *Decoder, r Record) error {
+	if r.XLog == nil {
+		return nil
+	}
+	h := r.XLog.Header
+	if h.Rmid == RmgrHeap && h.Info&xlogHeapOpMask == xlogHeapInsert {
+		block, ok := xlogBlockRefByID(r.XLog, 0)
+		if !ok {
+			return nil
+		}
+		offnum, err := decodeXLogHeapInsertMainData(r.XLog.MainData)
+		if err != nil {
+			return err
+		}
+		xid := storage.TransactionID(h.XID)
+		tuple, err := decodeXLogHeapInsertTuple(block, xid, offnum)
+		if err != nil {
+			return err
+		}
+		d.ApplyChange(xid, Change{
+			Kind:     ChangeInsert,
+			LSN:      r.EndLSN,
+			Rel:      block.Rel,
+			Block:    block.Block,
+			LineSlot: offnum,
+			NewTuple: tuple,
+		})
+	}
 	return nil
 }
 

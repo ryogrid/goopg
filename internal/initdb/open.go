@@ -435,7 +435,14 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// Logical heap-insert change record (M0002 redo-records —
 	// see docs/design/0002-0003-redo-records.md).
 	logHeapInsert := func(rel storage.RelFileNode, blk storage.BlockNumber, lineSlot uint16, tuple []byte) (storage.LSN, error) {
-		payload := wal.EncodeHeapInsert(rel, blk, lineSlot, tuple)
+		// A2: emit a PostgreSQL xl_heap_insert record (block ref + xl_heap_header
+		// + tuple, xl_xid = t_xmin) instead of the goopg-native body. Recovery
+		// routes it to replayDecodedXLogHeapInsert (the decoded path) since it
+		// carries a block ref. See docs/design/wal-pg-identical-stream/01.
+		payload, err := wal.EncodeHeapInsertPG(rel, blk, lineSlot, tuple)
+		if err != nil {
+			return 0, err
+		}
 		_, end, err := walWriter.Append(payload)
 		if err != nil {
 			return 0, err
