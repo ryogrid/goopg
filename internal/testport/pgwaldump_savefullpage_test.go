@@ -86,7 +86,7 @@ var saveFullpageFileRE = regexp.MustCompile(
 // TestPort_PgWaldump002SaveFullpage ports
 // postgres/src/bin/pg_waldump/t/002_save_fullpage.pl (M0110-0002).
 func TestPort_PgWaldump002SaveFullpage(t *testing.T) {
-	skipUnlessCanonicalWAL(t) // perf-optimize3-dash S4: canonical rmgr content (WD-003 deferred)
+	t.Skip("PG-tool WAL compat removed 2026-07-15 (canonical/knob/skip-tag removed; native->PG (rmid,info) dispatch); intentional, not a regression - resumes after native->PG content rewrite. See docs/design/wal-native-pg-format/04 + .ralph/deferral_ledger.md")
 	waldump := findPGWaldumpBin(t)
 	psqlBin := clientToolBin(t, "psql")
 	if psqlBin == "" {

@@ -49,13 +49,10 @@ func predictXLogRecordLen(payload []byte) (realRecLen, paddedLen int) {
 	}
 
 	// Mirror of wrapXLogMainData: returns the byte count of the wrapped
-	// main-data section. The 0xFE canonical envelope branch is the
-	// M0106-0010 batched-32 hot path; the short/long block-ID branches
-	// match PG's xlrBlockIDDataShort / xlrBlockIDDataLong wrapping.
+	// main-data section. The short/long block-ID branches match PG's
+	// xlrBlockIDDataShort / xlrBlockIDDataLong wrapping.
 	var wrappedLen int
 	switch {
-	case len(payload) >= 7 && payload[0] == 0xFE:
-		wrappedLen = len(payload) - 7
 	case len(payload) <= 0xFF:
 		wrappedLen = 2 + len(payload)
 	default:

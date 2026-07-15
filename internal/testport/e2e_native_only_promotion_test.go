@@ -20,7 +20,6 @@ func TestE2E_NativeOnlyReplicationAndPromotion(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping replication test in short mode")
 	}
-	t.Setenv("GOOPG_WAL_CANONICAL", "off")
 
 	baseDir := t.TempDir()
 	rc, err := replcluster.New("e2e_native_promote", replcluster.Options{

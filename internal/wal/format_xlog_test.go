@@ -67,10 +67,10 @@ func TestDecodeRecordXLogRejectsBadMainDataTag(t *testing.T) {
 }
 
 func TestEncodeRecordXLogClassifiesXactCommitXID(t *testing.T) {
-	// Goopg-internal records (non-canonical) are routed through RmgrXLog
-	// with xlogInfoDefault so PG's xlog_redo skips them safely (M0105-0007).
-	// XID is 0 in the header for non-canonical records; canonical records
-	// (0xFE prefix) carry the full XID for logical-replication consumers.
+	// goopg now emits ordinary-PG-shaped headers: an XactCommit record
+	// classifies as RM_XACT / XLOG_XACT_COMMIT (not the old RM_XLOG/0xF0
+	// skip-tag). The XID stays 0 in the header — the native body carries
+	// its own xid, which goopg recovery reads directly.
 	payload := EncodeXactCommit(4242)
 	enc, _, err := encodeRecordXLog(payload, 0)
 	if err != nil {
@@ -80,10 +80,13 @@ func TestEncodeRecordXLogClassifiesXactCommitXID(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if h.Rmid != RmgrXLog {
-		t.Fatalf("rmid = %d, want %d (RmgrXLog)", h.Rmid, RmgrXLog)
+	if h.Rmid != RmgrXact {
+		t.Fatalf("rmid = %d, want %d (RmgrXact)", h.Rmid, RmgrXact)
+	}
+	if h.Info != xlogXactCommit {
+		t.Fatalf("info = 0x%02x, want 0x%02x (XLOG_XACT_COMMIT)", h.Info, xlogXactCommit)
 	}
 	if h.XID != 0 {
-		t.Fatalf("xid = %d, want 0 (non-canonical records carry no XID)", h.XID)
+		t.Fatalf("xid = %d, want 0 (native body carries the xid)", h.XID)
 	}
 }

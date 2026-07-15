@@ -29,7 +29,7 @@ func TestE2E_FailoverGoopgToPG(t *testing.T) {
 	if testing.Short() || os.Getenv("GOOPG_SKIP_M0102_E2E") != "" {
 		t.Skip("skipping heterogeneous failover e2e (short mode or GOOPG_SKIP_M0102_E2E set)")
 	}
-	skipUnlessCanonicalWAL(t) // perf-optimize3-dash S4: real-PG consumer
+	t.Skip("PG-tool WAL compat removed 2026-07-15 (canonical/knob/skip-tag removed; native->PG (rmid,info) dispatch); intentional, not a regression - resumes after native->PG content rewrite. See docs/design/wal-native-pg-format/04 + .ralph/deferral_ledger.md")
 
 	repo := repoRoot(t)
 	binDir := filepath.Join(repo, "postgres", "local_install", "bin")

@@ -33,7 +33,6 @@ func TestKillKillRecovery(t *testing.T) {
 // reaches the goopg subprocess because cluster.Start's exec.Command
 // inherits the parent environment.
 func TestKillKillRecoveryNativeOnly(t *testing.T) {
-	t.Setenv("GOOPG_WAL_CANONICAL", "off")
 	runKillKillRecovery(t)
 }
 
