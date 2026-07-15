@@ -2238,7 +2238,7 @@ type pgCollationRowLister interface {
 	PGCollationRowsForDBOid(dbOid uint32) [][]string
 }
 
-func undoEnumDDLForRollback(connTx *connTxState, cat catalog.Catalog) {
+func undoEnumDDLForRollback(connTx *connTxState, cat catalog.Catalog, dbOid uint32) {
 	if connTx == nil {
 		return
 	}
@@ -2250,7 +2250,7 @@ func undoEnumDDLForRollback(connTx *connTxState, cat catalog.Catalog) {
 	// Do before undo-renames so type names are still at current (renamed) values.
 	for typeName, labels := range connTx.PendingEnumValues {
 		for label := range labels {
-			inm.RemoveEnumValue(typeName, label)
+			inm.RemoveEnumValue(typeName, label, dbOid)
 		}
 	}
 	// Step 2: Undo renames in reverse order; track name changes in created-set.
@@ -2260,7 +2260,7 @@ func undoEnumDDLForRollback(connTx *connTxState, cat catalog.Catalog) {
 	}
 	for i := len(connTx.PendingEnumRenames) - 1; i >= 0; i-- {
 		r := connTx.PendingEnumRenames[i]
-		_ = inm.RenameEnum(r.NewName, r.OldName)
+		_ = inm.RenameEnum(r.NewName, r.OldName, dbOid)
 		if created[r.NewName] {
 			delete(created, r.NewName)
 			created[r.OldName] = true
@@ -2268,7 +2268,7 @@ func undoEnumDDLForRollback(connTx *connTxState, cat catalog.Catalog) {
 	}
 	// Step 3: Drop types created in this transaction (now at original names).
 	for name := range created {
-		_ = inm.DropEnum(name, false)
+		_ = inm.DropEnum(name, false, dbOid)
 	}
 	// Step 4: Drop composite types created via CREATE TYPE … AS (...) in this
 	// transaction.  Mirrors undoEnumDDLFromContext step 4.  DU-002 slice 244.
@@ -2405,7 +2405,7 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 				if connTx.IsFailed() {
 					// COMMIT in a failed transaction block → ROLLBACK (PG semantics).
 					_ = s.cfg.TxnMgr.Rollback(connTx.Tx())
-					undoEnumDDLForRollback(connTx, s.cfg.Catalog)
+					undoEnumDDLForRollback(connTx, s.cfg.Catalog, ctx.CurrentDatabaseOid)
 					connTx.End()
 					if ctx.EndLocalTransaction != nil {
 						ctx.EndLocalTransaction()
@@ -2445,7 +2445,7 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 					}
 					if deferErr != nil {
 						_ = s.cfg.TxnMgr.Rollback(explicitTx)
-						undoEnumDDLForRollback(connTx, s.cfg.Catalog)
+						undoEnumDDLForRollback(connTx, s.cfg.Catalog, ctx.CurrentDatabaseOid)
 						connTx.End()
 						if ctx.EndLocalTransaction != nil {
 							ctx.EndLocalTransaction()
@@ -2480,7 +2480,7 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 					if ssiErr := s.cfg.TxnMgr.PreCommitCheckForSerializationFailure(explicitTx.Handle); ssiErr != nil {
 						// SSI failure: rollback.
 						_ = s.cfg.TxnMgr.Rollback(explicitTx)
-						undoEnumDDLForRollback(connTx, s.cfg.Catalog)
+						undoEnumDDLForRollback(connTx, s.cfg.Catalog, ctx.CurrentDatabaseOid)
 						connTx.End()
 						if ctx.EndLocalTransaction != nil {
 							ctx.EndLocalTransaction()
@@ -2524,7 +2524,7 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 					executor.ApplyDeferredRoutineDrops(ctx, sess)
 				}
 				if err := ctx.CommitTransaction(explicitTx); err != nil {
-					undoEnumDDLForRollback(connTx, s.cfg.Catalog)
+					undoEnumDDLForRollback(connTx, s.cfg.Catalog, ctx.CurrentDatabaseOid)
 					connTx.End()
 					if ctx.EndLocalTransaction != nil {
 						ctx.EndLocalTransaction()
@@ -2569,7 +2569,7 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 					executor.ProcessRollbackUndos(ctx, sess)
 				}
 				_ = s.cfg.TxnMgr.Rollback(connTx.Tx())
-				undoEnumDDLForRollback(connTx, s.cfg.Catalog)
+				undoEnumDDLForRollback(connTx, s.cfg.Catalog, ctx.CurrentDatabaseOid)
 				connTx.End()
 				if ctx.EndLocalTransaction != nil {
 					ctx.EndLocalTransaction()

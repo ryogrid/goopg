@@ -1,69 +1,86 @@
-Task: M0122-0007 4e follow-up — `CREATE DOMAIN`'s `AS` base_type now accepts
-multi-word built-in type names (fix_plan.md, appended right after the
-`domains` cross-database follow-up which the prior loop landed, both directly
-before "## Archived — complete (completed_fix_plan_009.md)"). COMPLETE and
-committed (pending push — see Gates run).
+Task: M0122-0007 4e follow-up — `catalog.enumTypes` (`CREATE TYPE ... AS
+ENUM`) gains per-database cross-database isolation, resuming the exact next
+candidate the prior loop's ledger row named. COMPLETE, gates all green,
+about to commit.
 
-Files: internal/parser/ddl.go (factored the CREATE-TABLE-only multi-word-
-typename switch out of parseColumnType into two shared helpers —
-parseMultiWordTypeName pre-typmod-args, parseTimeZoneQualifierAfterArgs
-post-typmod-args — and wired both into parseCreateDomain's base-type parsing;
-parseColumnType's own behavior unchanged, just relocated); internal/parser/
-m0097_0017_test.go (8 new multi-word cases in TestM0097_0017_EnumDomainParsing
-+ new TestCreateDomainMultiWordBaseType asserting BaseType/BaseTypeArgs);
-docs/design/0097-0017-0001-enum-domain-types.md (new "Follow-up (2026-07-15)"
-section) + docs/design/README.md (row updated); .ralph/deferral_ledger.md (new
-row); .ralph/fix_plan.md (new [x] entry).
+Files: internal/catalog/catalog.go (EnumType.DBOid field; new enumKey/
+lookupEnumByNameLocked helpers next to domainKey/lookupDomainByNameLocked;
+RegisterEnum/RenameEnum/RenameEnumValue/SetEnumOwner/AddEnumValue/
+AddEnumValueResult/RemoveEnumValue/DropEnum/LookupEnum all gained a
+trailing variadic dbOid; Catalog interface's LookupEnum signature updated
+to match); internal/executor/operators_ddl.go (7 write-path call sites
+thread o.ctx.CurrentDatabaseOid: execCreateType/execAlterType's RENAME
+VALUE/RENAME TO/OWNER TO/ADD VALUE/execDropType's enum branch);
+internal/executor/operators_tx.go (undoEnumDDLFromContext's 3 calls thread
+ctx.CurrentDatabaseOid); internal/server/dispatch.go +server.go +
+twophase.go (SIBLING undo path `undoEnumDDLForRollback` — found by test
+failure, NOT threaded by the executor-package fix alone — gained a dbOid
+param, threaded from 7 call sites total: 5 in dispatch.go use in-scope
+ctx.CurrentDatabaseOid, twophase.go's abortForPrepareSSIFailure too,
+server.go's connection-teardown path has no ctx so resolves via the
+pre-existing resolveConnDBOid(cat, connTx.DBName) helper); new
+internal/catalog/create_enum_test.go (TestCreateEnumCrossDatabaseIsolation,
+mirrors TestCreateDomainCrossDatabaseIsolation); docs/design/
+0097-0017-0001-enum-domain-types.md (new "Follow-up (2026-07-15, later
+loop)" section incl. the sibling-path bug writeup) + docs/design/README.md
+(row updated); .ralph/deferral_ledger.md (new row); .ralph/fix_plan.md (new
+[x] entry).
 
-Key symbols: parser.parseMultiWordTypeName, parser.
-parseTimeZoneQualifierAfterArgs, parser.parseCreateDomain, parser.
-parseColumnType.
+Key symbols: catalog.enumKey, catalog.lookupEnumByNameLocked,
+catalog.InMemory.RegisterEnum/LookupEnum/DropEnum, executor.
+undoEnumDDLFromContext, server.undoEnumDDLForRollback, server.
+resolveConnDBOid.
 
-Hypothesis/Findings: M-NIGHTLY queue empty this loop (ci/logs/action-items.md
-run 20260715-010036, all 11 items already [x] in fix_plan.md — confirmed via
-grep, matches what the prior loop also found). Resumed exactly where
-working_set left off: the DU-002 probe (TestPort_PgDumpConnectionSetup) was
-blocked on `CREATE DOMAIN public.f8_in AS double precision` failing with a
-parser syntax error. Root cause: parseCreateDomain used bare
-parseObjectName() for the base type (schema.name only), never calling the
-multi-word-typename switch that parseColumnType (CREATE TABLE) already had.
-Fix was a pure refactor-and-reuse: extracted parseColumnType's switch logic
-into 2 shared helpers, called them from parseCreateDomain too. No new
-behavior in parseColumnType itself — verified via full local suite (0
-regressions).
-**Probe moved further, confirms the fix**: TestPort_PgDumpConnectionSetup now
-PASSES (parses the double-precision domain fine) and logs a *different*,
-already-expected failure via t.Logf (not a test failure): `type "gtype"
-already exists` — a CREATE TYPE cross-database catalog-isolation collision,
-the same collision class as the domains/userCollations fixes from the last 2
-loops but for CREATE TYPE's user-defined-type registry (not investigated this
-loop — parser grammar and catalog dbOid-threading are different mechanisms,
-kept as separate bounded loops per the deferral ledger's stated policy).
+Hypothesis/Findings: M-NIGHTLY queue empty this loop (ci/logs/action-
+items.md run 20260715-010036, all 11 items already [x] in fix_plan.md —
+confirmed via grep). Resumed exactly where working_set left off: audit
+catalog's enum registry for the DBOid-less collision the DU-002 probe hit
+(`type "gtype" already exists`). Confirmed `c.enumTypes` was the same
+bare-name-keyed map shape `domains`/`userCollations` had before their
+fixes; applied the identical domainKey/lookupDomainByNameLocked pattern.
+**Caught a real regression before committing**: threading only the
+executor package's `undoEnumDDLFromContext` broke
+`TestSimpleQueryMidBatchBeginUndoesEarlierAutocommitCreateType`/`...AddValue`
+in internal/server — dispatch.go has a SECOND, independent copy of the same
+undo logic (`undoEnumDDLForRollback`) for the simple-query ROLLBACK/failed-
+COMMIT/SSI-abort/two-phase-abort/teardown paths, which still called
+Remove/Rename/DropEnum with no dbOid (silently defaulting to DefaultDBOid),
+mismatching the raw — possibly 0 in embedded/test contexts —
+ctx.CurrentDatabaseOid used at CREATE time. This is exactly the
+`pattern_sibling_paths_must_agree` memory's failure mode; fixed by threading
+dbOid through the second path too (grep for ALL call sites of the mutator
+methods, not just the ones in the package you're already editing, is the
+generalizable lesson). Full local suite (all packages, all 3 gates) is
+clean after the fix.
 
-Next step: A future loop should audit catalog.InMemory's CREATE TYPE /
-user-defined-type registry (composite types + enums, likely a
-map[string]*EnumType or similar keyed by bare name — same shape domains/
-userCollations had before their fixes) for the same DBOid-less collision, then
-apply the exact domainKey/lookupDomainByNameLocked pattern from the domains
-fix (see .ralph/deferral_ledger.md 2026-07-15 rows for full detail + resume
-points). Re-run `go test -v -run '^TestPort_PgDumpConnectionSetup$'
-./internal/testport/` after to confirm the probe moves further (or fully
-passes) once CREATE TYPE is fixed.
+Next step: composite types (`c.compositeTypes`/`compositeTypeNames`,
+`internal/catalog/catalog.go`) are very likely the next same-shaped
+DBOid-less collision — the last unaudited sibling map in this M0122-0007 4e
+series (domains, userCollations, and now enums are done). Audit
+`RegisterCompositeType`/`RegisterCompositeTypeWithFields`/
+`RenameCompositeType`/`SetCompositeTypeOwner`/`DropCompositeType`'s map
+shape first, then apply the domainKey/enumKey pattern; remember to grep
+internal/server/dispatch.go for a possible sibling undo/rollback path too
+(PendingCreatedComposites already exists in both undoEnumDDLFromContext and
+undoEnumDDLForRollback's composite-drop steps — check those too if
+composite types get their own dbOid threading).
 
 Gates run (all PASS this loop): go build ./...; go vet ./... (whole repo);
-go test ./internal/parser/... ./internal/catalog/... ./internal/executor/...
-./internal/wal/... ./internal/initdb/... (clean); go test -short full repo
-excl. testport (52 packages, 0 FAIL, incl. internal/initdb 242s clean);
-go test -v -run '^TestPort_PgDumpConnectionSetup$' ./internal/testport/ PASS
-(probe moved to the gtype blocker, logged not failed); scripts/tpch-
-spotcheck.sh PASS (Q12=2/Q13=33); RALPH_PRECOMMIT_SCOPE=smoke
-ralph-precommit-test.sh PASS clean on first try (0 failed, 3 workloads);
-make ralph-state-guard — auto-repaired 1 stale marker (previous loop's
-clean-exit progress.json), consistent after.
+go test ./internal/catalog/... ./internal/executor/... ./internal/server/...
+./internal/planner/... (clean, incl. new TestCreateEnumCrossDatabaseIsolation
+and the 2 previously-broken-then-fixed server tests); go test -short full
+repo excl. testport (all packages, 0 FAIL); go test -v -run
+'^TestPort_PgDumpConnectionSetup$' ./internal/testport/ PASS (probe moved to
+a new `DEFAULT 'na'::character varying` CAST-target parser gap, logged not
+failed); scripts/tpch-spotcheck.sh PASS (Q12=2/Q13=33);
+RALPH_PRECOMMIT_SCOPE=smoke ralph-precommit-test.sh PASS clean (0 failed, 3
+workloads); make ralph-state-guard — auto-repaired 1 stale marker (previous
+loop's clean-exit progress.json), consistent after.
 
-In-flight: none — task complete; commit + pre-commit hook's own pgbench smoke
-+ push are the only remaining mechanical step (about to run). Untouched
-foreign/stray files present at loop start and still present (analysis/tpch-
-explain-baseline.md, ci/logs/launch.log, postgres submodule dirty,
-weekly_loc.*, analysis/perf-optimize3/runs/*, kaitai-struct-dash*.txt) — same
-as every prior loop, left alone (not part of this loop's diff).
+In-flight: none — task complete; commit (pathspec-scoped, per the concurrent-
+loop-commit rule) + pre-commit hook's own pgbench smoke + push are the only
+remaining mechanical steps. Untouched foreign/stray files present at loop
+start and still present (analysis/tpch-explain-baseline.md, ci/logs/
+launch.log, postgres submodule dirty, weekly_loc.*, analysis/perf-optimize3/
+runs/*, kaitai-struct-dash*.txt) — same as every prior loop, left alone (not
+part of this loop's diff).

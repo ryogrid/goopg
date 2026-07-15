@@ -18641,7 +18641,7 @@ func (o *ddlOp) execCreateType(s *parser.CreateTypeStmt) error {
 		}
 		return nil
 	}
-	et, err := cat.RegisterEnum(s.Name, s.EnumValues)
+	et, err := cat.RegisterEnum(s.Name, s.EnumValues, o.ctx.CurrentDatabaseOid)
 	if err != nil {
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 	}
@@ -18847,7 +18847,7 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 	}
 	// RENAME VALUE 'old' TO 'new' — M0097-0022.
 	if s.RenameOldValue != "" {
-		err := cat.RenameEnumValue(s.Name, s.RenameOldValue, s.RenameNewValue)
+		err := cat.RenameEnumValue(s.Name, s.RenameOldValue, s.RenameNewValue, o.ctx.CurrentDatabaseOid)
 		if err == nil {
 			return nil
 		}
@@ -18888,7 +18888,7 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 			}
 			return nil
 		}
-		err := cat.RenameEnum(s.Name, s.RenameTo)
+		err := cat.RenameEnum(s.Name, s.RenameTo, o.ctx.CurrentDatabaseOid)
 		if err != nil {
 			return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 		}
@@ -18936,7 +18936,7 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 			}
 			return nil
 		}
-		if !cat.SetEnumOwner(s.Name, ownerOID) {
+		if !cat.SetEnumOwner(s.Name, ownerOID, o.ctx.CurrentDatabaseOid) {
 			return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("type %q does not exist", s.Name)}
 		}
 		return nil
@@ -18944,7 +18944,7 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 	if s.AddValue == "" {
 		return nil // unmodelled ALTER TYPE variant — no-op
 	}
-	skipped, err := cat.AddEnumValueResult(s.Name, s.AddValue, s.IfNotExists, s.Before, s.After)
+	skipped, err := cat.AddEnumValueResult(s.Name, s.AddValue, s.IfNotExists, s.Before, s.After, o.ctx.CurrentDatabaseOid)
 	if err == nil {
 		if skipped {
 			// IF NOT EXISTS with existing label: emit NOTICE, continue.
@@ -19087,7 +19087,7 @@ func (o *ddlOp) execDropType(s *parser.DropTypeStmt) error {
 		// MaterializeWriterXID ensures a real non-zero XID is used; DROP TYPE
 		// does not call writeHeapRowReturningPG so the XID would otherwise
 		// remain InvalidTransactionID (0), which is a no-op stamp. M0097-0022.
-		if et, ok := cat.LookupEnum(n); ok && catalogHeapSyncAvailable(o.ctx) {
+		if et, ok := cat.LookupEnum(n, o.ctx.CurrentDatabaseOid); ok && catalogHeapSyncAvailable(o.ctx) {
 			if o.ctx.MaterializeWriterXID() == nil {
 				deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, et.OID, o.ctx.Tx.XID)
 				// Also stamp the auto-generated array type row (`_name`). DU-002 slice 89.
@@ -19096,7 +19096,7 @@ func (o *ddlOp) execDropType(s *parser.DropTypeStmt) error {
 				_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.TypeRelationId)
 			}
 		}
-		enumErr := cat.DropEnum(n, s.Cascade)
+		enumErr := cat.DropEnum(n, s.Cascade, o.ctx.CurrentDatabaseOid)
 		if enumErr == nil {
 			continue // successfully dropped as enum
 		}

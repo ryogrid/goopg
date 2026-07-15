@@ -222,7 +222,7 @@ func (s *Server) abortForPrepareSSIFailure(w *protocol.FrameWriter, ctx *executo
 	// M0118-0009 (`stats`, rung 7): discard the failed transaction's staged
 	// relation-stat counters via abort math (this path bypasses execRollback).
 	executor.AbortRelStats(ctx)
-	undoEnumDDLForRollback(connTx, s.cfg.Catalog)
+	undoEnumDDLForRollback(connTx, s.cfg.Catalog, ctx.CurrentDatabaseOid)
 	connTx.End()
 	if ctx != nil && ctx.EndLocalTransaction != nil {
 		ctx.EndLocalTransaction()

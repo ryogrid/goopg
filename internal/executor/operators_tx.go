@@ -407,7 +407,7 @@ func undoEnumDDLFromContext(ctx *Context) {
 	// Do this before undoing renames so type names are still at current (renamed) values.
 	for typeName, labels := range ctx.PendingEnumValues {
 		for label := range labels {
-			inm.RemoveEnumValue(typeName, label)
+			inm.RemoveEnumValue(typeName, label, ctx.CurrentDatabaseOid)
 		}
 	}
 	// Step 2: Undo renames in reverse order.  Also reverse their effect on the
@@ -419,7 +419,7 @@ func undoEnumDDLFromContext(ctx *Context) {
 	}
 	for i := len(ctx.PendingEnumRenames) - 1; i >= 0; i-- {
 		r := ctx.PendingEnumRenames[i]
-		_ = inm.RenameEnum(r.NewName, r.OldName)
+		_ = inm.RenameEnum(r.NewName, r.OldName, ctx.CurrentDatabaseOid)
 		if created[r.NewName] {
 			delete(created, r.NewName)
 			created[r.OldName] = true
@@ -427,7 +427,7 @@ func undoEnumDDLFromContext(ctx *Context) {
 	}
 	// Step 3: Drop types created in this transaction (now at original names).
 	for name := range created {
-		_ = inm.DropEnum(name, false)
+		_ = inm.DropEnum(name, false, ctx.CurrentDatabaseOid)
 	}
 	// Step 4: Drop composite types created via CREATE TYPE … AS (...) in this
 	// transaction.  Their pg_type/pg_attribute heap rows carry the aborting

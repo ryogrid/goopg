@@ -2014,7 +2014,7 @@ type Catalog interface {
 	// LookupEnum finds a user-defined enum type by name (case-insensitive).
 	// Exposed on the interface so the catalog-row builders can resolve an enum
 	// column's type name to its pg_type OID. DU-002 slice 88.
-	LookupEnum(name string) (*EnumType, bool)
+	LookupEnum(name string, dbOid ...uint32) (*EnumType, bool)
 	// LookupEnumByOID finds a user-defined enum type by its pg_type OID, used by
 	// format_type to render an enum column's declared type. DU-002 slice 88.
 	LookupEnumByOID(oid uint32) (*EnumType, bool)
@@ -2850,6 +2850,11 @@ type EnumType struct {
 	// 0 means "unset, defaults to the bootstrap superuser" — see
 	// OwnerOrDefault. M0122-0005 (m0097-0017 follow-up).
 	Owner uint32
+	// DBOid is the database this enum was created in, folded into the
+	// c.enumTypes registry key via enumKey so two databases may each register
+	// a same-named enum without colliding. Mirrors Domain.DBOid. M0122-0007
+	// 4e follow-up.
+	DBOid uint32
 }
 
 // OwnerOrDefault returns et.Owner, falling back to the bootstrap superuser OID
@@ -3439,6 +3444,14 @@ func resolveDBOid(dbOid []uint32) uint32 {
 // case-insensitive name so two distinct databases may each register a
 // same-named domain without colliding. M0122-0007 4e follow-up.
 func domainKey(dbOid uint32, name string) string {
+	return strconv.FormatUint(uint64(dbOid), 10) + "\x00" + strings.ToLower(name)
+}
+
+// enumKey builds the c.enumTypes registry key, folding dbOid into the
+// case-insensitive name so two distinct databases may each register a
+// same-named enum without colliding. Mirrors domainKey. M0122-0007 4e
+// follow-up.
+func enumKey(dbOid uint32, name string) string {
 	return strconv.FormatUint(uint64(dbOid), 10) + "\x00" + strings.ToLower(name)
 }
 
@@ -19694,11 +19707,12 @@ func (c *InMemory) FindFKsReferencingTable(tableName string) []FKRef {
 
 // RegisterEnum creates a new enum type. Returns an error if the name already
 // exists. M0097-0017.
-func (c *InMemory) RegisterEnum(name string, values []string) (*EnumType, error) {
+func (c *InMemory) RegisterEnum(name string, values []string, dbOid ...uint32) (*EnumType, error) {
 	k := strings.ToLower(name)
+	oid := resolveDBOid(dbOid)
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if _, exists := c.enumTypes[k]; exists {
+	if _, exists := c.enumTypes[enumKey(oid, k)]; exists {
 		return nil, fmt.Errorf("type %q already exists", name)
 	}
 	evs := make([]EnumValue, len(values))
@@ -19714,19 +19728,46 @@ func (c *InMemory) RegisterEnum(name string, values []string) (*EnumType, error)
 		OID:      c.nextOID,
 		ArrayOID: c.nextOID + 1,
 		Values:   evs,
+		DBOid:    oid,
 	}
 	c.nextOID += 2
-	c.enumTypes[k] = et
+	c.enumTypes[enumKey(oid, k)] = et
 	return et, nil
 }
 
-// LookupEnum finds an enum type by name (case-insensitive). M0097-0017.
-func (c *InMemory) LookupEnum(name string) (*EnumType, bool) {
+// LookupEnum finds an enum type by name (case-insensitive), scoped to dbOid
+// when supplied. M0097-0017.
+func (c *InMemory) LookupEnum(name string, dbOid ...uint32) (*EnumType, bool) {
 	k := strings.ToLower(name)
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	et, ok := c.enumTypes[k]
-	return et, ok
+	if len(dbOid) > 0 {
+		et, ok := c.enumTypes[enumKey(dbOid[0], k)]
+		return et, ok
+	}
+	// No dbOid supplied: preserve the legacy global-name lookup for read call
+	// sites not yet threaded through a connection's dbOid (see the deferral
+	// ledger row for this loop), falling back to a scan since the registry
+	// key now folds dbOid in. Mirrors LookupDomain's identical fallback.
+	// M0122-0007 4e follow-up.
+	if et := c.lookupEnumByNameLocked(k); et != nil {
+		return et, true
+	}
+	return nil, false
+}
+
+// lookupEnumByNameLocked scans c.enumTypes for the first entry whose Name
+// matches lowerName (already lowercased), ignoring dbOid. Used by read paths
+// that have no dbOid context available (see LookupEnum's doc comment).
+// Caller holds c.mu (read or write). Mirrors lookupDomainByNameLocked.
+// M0122-0007 4e follow-up.
+func (c *InMemory) lookupEnumByNameLocked(lowerName string) *EnumType {
+	for _, et := range c.enumTypes {
+		if et.Name == lowerName {
+			return et
+		}
+	}
+	return nil
 }
 
 // LookupEnumByOID finds an enum type by its pg_type OID. DU-002 slice 88
@@ -19786,8 +19827,8 @@ func (e *EnumLabelAlreadyExists) Error() string {
 // RenameEnumValue renames an existing enum label to a new label.
 // Returns EnumLabelNotFound if oldLabel does not exist, EnumLabelAlreadyExists if newLabel
 // already exists. M0097-0022.
-func (c *InMemory) RenameEnumValue(typeName, oldLabel, newLabel string) error {
-	k := strings.ToLower(typeName)
+func (c *InMemory) RenameEnumValue(typeName, oldLabel, newLabel string, dbOid ...uint32) error {
+	k := enumKey(resolveDBOid(dbOid), typeName)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	et, ok := c.enumTypes[k]
@@ -19814,9 +19855,10 @@ func (c *InMemory) RenameEnumValue(typeName, oldLabel, newLabel string) error {
 }
 
 // RenameEnum renames an enum type from oldName to newName. M0097-enum-rename.
-func (c *InMemory) RenameEnum(oldName, newName string) error {
-	ok := strings.ToLower(oldName)
-	nk := strings.ToLower(newName)
+func (c *InMemory) RenameEnum(oldName, newName string, dbOid ...uint32) error {
+	oid := resolveDBOid(dbOid)
+	ok := enumKey(oid, oldName)
+	nk := enumKey(oid, newName)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	et, found := c.enumTypes[ok]
@@ -19827,7 +19869,7 @@ func (c *InMemory) RenameEnum(oldName, newName string) error {
 		return fmt.Errorf("type %q already exists", newName)
 	}
 	delete(c.enumTypes, ok)
-	et.Name = nk
+	et.Name = strings.ToLower(newName)
 	c.enumTypes[nk] = et
 	return nil
 }
@@ -19835,8 +19877,8 @@ func (c *InMemory) RenameEnum(oldName, newName string) error {
 // SetEnumOwner records the typowner role OID for an existing enum type.
 // Returns false if no such enum is registered. Mirrors SetCollationOwner.
 // M0122-0005 (m0097-0017 follow-up).
-func (c *InMemory) SetEnumOwner(name string, ownerOID uint32) bool {
-	k := strings.ToLower(name)
+func (c *InMemory) SetEnumOwner(name string, ownerOID uint32, dbOid ...uint32) bool {
+	k := enumKey(resolveDBOid(dbOid), name)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	et, ok := c.enumTypes[k]
@@ -19936,8 +19978,8 @@ func (c *InMemory) SetRangeTypeOwner(name string, ownerOID uint32) bool {
 //
 // To distinguish the "skipped duplicate" case (for NOTICE emission), use
 // AddEnumValueResult which returns a skipped bool. M0097-0017.
-func (c *InMemory) AddEnumValue(name, value string, ifNotExists bool, before, after string) error {
-	_, err := c.AddEnumValueResult(name, value, ifNotExists, before, after)
+func (c *InMemory) AddEnumValue(name, value string, ifNotExists bool, before, after string, dbOid ...uint32) error {
+	_, err := c.AddEnumValueResult(name, value, ifNotExists, before, after, dbOid...)
 	return err
 }
 
@@ -19953,12 +19995,12 @@ func renumberEnumValues(et *EnumType) {
 	}
 }
 
-func (c *InMemory) AddEnumValueResult(name, value string, ifNotExists bool, before, after string) (skipped bool, err error) {
+func (c *InMemory) AddEnumValueResult(name, value string, ifNotExists bool, before, after string, dbOid ...uint32) (skipped bool, err error) {
 	// PostgreSQL limits enum labels to 63 bytes (NAMEDATALEN-1). M0097-0063.
 	if len(value) > 63 {
 		return false, &EnumLabelTooLong{Label: value}
 	}
-	k := strings.ToLower(name)
+	k := enumKey(resolveDBOid(dbOid), name)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	et, ok := c.enumTypes[k]
@@ -20047,8 +20089,8 @@ func (c *InMemory) AddEnumValueResult(name, value string, ifNotExists bool, befo
 
 // RemoveEnumValue removes a label from an existing enum type.
 // Used to roll back ALTER TYPE … ADD VALUE on transaction ROLLBACK. M0097-0022.
-func (c *InMemory) RemoveEnumValue(typeName, label string) {
-	k := strings.ToLower(typeName)
+func (c *InMemory) RemoveEnumValue(typeName, label string, dbOid ...uint32) {
+	k := enumKey(resolveDBOid(dbOid), typeName)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	et, found := c.enumTypes[k]
@@ -20065,8 +20107,8 @@ func (c *InMemory) RemoveEnumValue(typeName, label string) {
 
 // DropEnum removes an enum type. cascade=true is accepted (stub — does not
 // remove dependent columns). Returns an error if not found. M0097-0017.
-func (c *InMemory) DropEnum(name string, cascade bool) error {
-	k := strings.ToLower(name)
+func (c *InMemory) DropEnum(name string, cascade bool, dbOid ...uint32) error {
+	k := enumKey(resolveDBOid(dbOid), name)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if _, ok := c.enumTypes[k]; !ok {

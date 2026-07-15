@@ -1372,7 +1372,7 @@ func (s *Server) rollbackOpenTxnOnTeardown(connTx *connTxState, logger *slog.Log
 	}
 	_ = s.cfg.TxnMgr.Rollback(connTx.Tx())
 	if s.cfg.Catalog != nil {
-		undoEnumDDLForRollback(connTx, s.cfg.Catalog)
+		undoEnumDDLForRollback(connTx, s.cfg.Catalog, resolveConnDBOid(s.cfg.Catalog, connTx.DBName))
 	}
 	connTx.End()
 	if logger != nil {

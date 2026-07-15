@@ -4145,6 +4145,63 @@ survey the deferral ledger for a fresh open (`status = -`) row.
       user-defined-type registry (`CREATE TYPE ... AS ENUM`/`AS (...)`) likely
       needs the same DBOid-fold-into-key treatment as `domains`/
       `userCollations` — audit its map shape first.
+- [x] **M0122-0007 4e follow-up — `catalog.enumTypes` (`CREATE TYPE ... AS
+      ENUM`) cross-database isolation (resume point from the item above).**
+      `catalog.InMemory.enumTypes` was one flat, dbOid-less
+      `map[string]*EnumType` keyed by bare case-insensitive name — the same
+      collision shape `domains`/`userCollations` already fixed. Applied the
+      identical pattern: `EnumType` gained a `DBOid uint32` field; new
+      `enumKey(dbOid, name)` (mirrors `domainKey`) folds dbOid into the
+      `c.enumTypes` registry key. `RegisterEnum`/`RenameEnum`/
+      `RenameEnumValue`/`SetEnumOwner`/`AddEnumValue`/`AddEnumValueResult`/
+      `RemoveEnumValue`/`DropEnum` each gained a trailing variadic
+      `dbOid ...uint32`; `LookupEnum` (also on the `catalog.Catalog`
+      interface) gained the variadic `dbOid`, falling back to a global
+      by-name scan (`lookupEnumByNameLocked`, mirrors
+      `lookupDomainByNameLocked`) when omitted. All 7 write-path call sites
+      in `internal/executor/operators_ddl.go` and the 3 ROLLBACK-undo call
+      sites in `internal/executor/operators_tx.go`
+      (`undoEnumDDLFromContext`) thread `ctx.CurrentDatabaseOid`.
+      **Sibling-path catch:** `internal/server/dispatch.go` has a second,
+      independent copy of the same rollback-undo logic
+      (`undoEnumDDLForRollback`, called from the simple-query dispatch
+      path's explicit ROLLBACK/failed-COMMIT/SSI-abort/two-phase-abort/
+      connection-teardown branches — 7 call sites across
+      `dispatch.go`/`server.go`/`twophase.go`) that was NOT threaded by the
+      `executor`-package fix alone; this surfaced immediately as two real
+      test failures
+      (`TestSimpleQueryMidBatchBeginUndoesEarlierAutocommitCreateType`/
+      `...AddValue`) — the enum survived its own ROLLBACK because the drop
+      resolved to `DefaultDBOid` while the create used the connection's raw
+      (possibly `0` in embedded/test contexts) `ctx.CurrentDatabaseOid`.
+      Fixed by adding a `dbOid uint32` param to `undoEnumDDLForRollback` and
+      threading it: 5 `dispatch.go` sites + `twophase.go`'s
+      `abortForPrepareSSIFailure` use their in-scope
+      `ctx.CurrentDatabaseOid`; `server.go`'s connection-teardown path (no
+      `ctx` in scope) resolves it via the pre-existing `resolveConnDBOid`
+      helper from `connTx.DBName` (the same resolution
+      `wireExtensionRows` uses to stamp `ctx.CurrentDatabaseOid`
+      originally, so both paths agree). New
+      `TestCreateEnumCrossDatabaseIsolation`
+      (`internal/catalog/create_enum_test.go`), mirroring
+      `TestCreateDomainCrossDatabaseIsolation`. Confirmed via the DU-002
+      probe: the round-trip's failure point moved past `type "gtype" already
+      exists` to an unrelated parser gap (`DEFAULT 'na'::character varying`
+      — a multi-word type name as a CAST target inside a DEFAULT expression,
+      a different grammar production from the `AS`-clause base-type fix two
+      items above). Design doc
+      `docs/design/0097-0017-0001-enum-domain-types.md`'s new "Follow-up
+      (2026-07-15, later loop)" section + README index row updated. Gates:
+      `go build ./...`/`go vet ./...` clean; `go test ./internal/catalog/...
+      ./internal/executor/... ./internal/server/... ./internal/planner/...`
+      PASS; `go test -short` full repo (excl. testport, per policy) PASS, 0
+      FAIL; `go test -v -run '^TestPort_PgDumpConnectionSetup$'
+      ./internal/testport/` PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke bash
+      scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 workloads).
+      Next candidate: composite types (`c.compositeTypes`/
+      `compositeTypeNames`) are very likely the same still-unscoped
+      collision shape — the last unaudited sibling map in this series.
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 

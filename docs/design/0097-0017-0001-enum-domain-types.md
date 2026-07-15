@@ -144,3 +144,84 @@ a different mechanism from the M0122-0007 4e series in
 `docs/design/0122-0018-per-database-catalog-namespace.md`. See
 `.ralph/deferral_ledger.md` (2026-07-15 row) for the next DU-002 probe
 blocker this unblocked (`CREATE TYPE` cross-database isolation).
+
+## Follow-up (2026-07-15, later loop): enum types gain per-database isolation
+
+`catalog.InMemory.enumTypes` (backing `CREATE TYPE ... AS ENUM`) was keyed
+by bare case-insensitive name only, so two distinct databases could not each
+register a same-named enum — the exact collision class the M0122-0007 4e
+series already fixed for `domains` and `userCollations`
+(`docs/design/0122-0018-per-database-catalog-namespace.md`). The DU-002
+round-trip probe (`TestPort_PgDumpConnectionSetup`) surfaced this as `type
+"gtype" already exists` once the prior two follow-ups in this doc cleared
+the domain collision and the domain-grammar gap ahead of it.
+
+Fix mirrors the `domains`/`domainKey` pattern exactly: `EnumType` gained a
+`DBOid uint32` field; a new `enumKey(dbOid, name) string` helper
+(`internal/catalog/catalog.go`, next to `domainKey`) folds dbOid into the
+`c.enumTypes` registry key. `RegisterEnum`/`RenameEnum`/`RenameEnumValue`/
+`SetEnumOwner`/`AddEnumValue`/`AddEnumValueResult`/`RemoveEnumValue`/
+`DropEnum` each gained a trailing variadic `dbOid ...uint32` (omitting it
+resolves to `DefaultDBOid` via `resolveDBOid`, so every pre-existing call
+site stays behavior-preserving). `LookupEnum` also gained the variadic
+`dbOid` (added to the `Catalog` interface too) — when omitted it falls back
+to a global by-name scan (`lookupEnumByNameLocked`, mirrors
+`lookupDomainByNameLocked`) for read call sites not yet threaded through a
+connection's dbOid.
+
+All 7 write-path call sites in `internal/executor/operators_ddl.go`
+(`execCreateType`'s `CREATE TYPE ... AS ENUM`, `execAlterType`'s RENAME
+VALUE/RENAME TO/OWNER TO/ADD VALUE, `execDropType`'s enum branch) and the 3
+ROLLBACK-undo call sites in `internal/executor/operators_tx.go`
+(`undoEnumDDLFromContext`'s `RemoveEnumValue`/`RenameEnum`/`DropEnum`) thread
+`ctx.CurrentDatabaseOid`.
+
+`internal/server/dispatch.go` has a **second, independent** copy of the same
+undo logic — `undoEnumDDLForRollback(connTx, cat)`, called from the
+simple-query dispatch path's explicit `ROLLBACK`/failed-`COMMIT`/SSI-abort/
+two-phase-abort/connection-teardown branches (5+2 call sites across
+`dispatch.go`/`server.go`/`twophase.go`) — a sibling of
+`undoEnumDDLFromContext` that mirrors it step-for-step but operates on
+`connTx.Pending*` directly rather than `ctx.Pending*`
+(`pattern_sibling_paths_must_agree`). Threading only the `executor` package's
+copy left this one still calling `RemoveEnumValue`/`RenameEnum`/`DropEnum`
+with no dbOid — which resolves to `DefaultDBOid` via `resolveDBOid`'s
+empty-variadic fallback, silently mismatching the `RegisterEnum` call's raw
+(possibly `0`, not `1`) `ctx.CurrentDatabaseOid` in embedded/test contexts
+with no real per-connection database resolution. This surfaced immediately
+as two real test failures
+(`TestSimpleQueryMidBatchBeginUndoesEarlierAutocommitCreateType`/
+`...AddValue` in `internal/server/dispatch_batch_atomicity_test.go`) — the
+enum survived its own `ROLLBACK` because the drop looked in the wrong
+dbOid bucket. Fixed by adding a `dbOid uint32` parameter to
+`undoEnumDDLForRollback` and threading it from each call site: the 5
+`dispatch.go` sites already have a `ctx *executor.Context` in scope
+(`ctx.CurrentDatabaseOid`); `twophase.go`'s `abortForPrepareSSIFailure` does
+too; `server.go`'s connection-teardown path has no `ctx`, so it resolves the
+dbOid directly from `connTx.DBName` via the pre-existing `resolveConnDBOid`
+helper (the same resolution `wireExtensionRows` uses to stamp
+`ctx.CurrentDatabaseOid` in the first place, so the two paths agree).
+
+The ~20 remaining read-only `LookupEnum` call
+sites (CAST/type-declaration/attribute-row-building paths in `expr.go`,
+`operators_fk.go`, `operators_index.go`, `operators_indexonly.go`,
+`operators_pg_input_error_info.go`, `operators_storage.go`,
+`pg18_user_catalog_rows.go`, `planner.go`, plus a few more in
+`operators_ddl.go`) are **not** dbOid-threaded — same bounded scope as the
+`domains` follow-up's resume point (2), left for a future loop.
+
+New `TestCreateEnumCrossDatabaseIsolation`
+(`internal/catalog/create_enum_test.go`), mirroring
+`TestCreateDomainCrossDatabaseIsolation`. Confirmed via the DU-002 probe:
+the round-trip's failure point moved past `type "gtype" already exists` to
+an unrelated parser gap (`DEFAULT 'na'::character varying` — a multi-word
+type name as a CAST target, not as a column/domain base-type declaration —
+a different grammar production from the one this doc's prior follow-up
+fixed).
+
+Still deferred (ledgered): WAL restart-persistence for enums is not
+dbOid-aware (mirrors the domains/collations gap); `pg_enum`'s `VirtualRows`
+iterates `c.enumTypes` without dbOid scoping, so `SELECT * FROM pg_enum`
+still surfaces every database's enum labels regardless of which database
+is querying (pre-existing, not newly introduced — the registry itself had
+no isolation before this fix either).
