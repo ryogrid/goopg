@@ -4698,6 +4698,43 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
       `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh`
       PASS (0 failed, all 3 workloads).
+- [x] **M0122-0007 4e follow-up — `catalog.accessMethods` cross-database
+      isolation (DU-002 round-trip probe unblock).** Ground-truthed the DU-002
+      probe (`TestPort_PgDumpConnectionSetup`, re-run directly since the last
+      recorded doc/working_set state was stale) to find the current blocker:
+      restoring `CREATE ACCESS METHOD goopg_am ...` into a fresh second
+      database failed `access method "goopg_am" already exists`, because
+      `catalog.InMemory.accessMethods` was one flat, dbOid-less
+      `map[string]*AccessMethod` — the same collision shape `ForeignServer`/
+      `UserMapping`/`UserCollation`/`Domain`/`Routines` already fixed via the
+      M0122-0007 4e series. Applied the identical pattern: `AccessMethod`
+      gained a `DBOid uint32` field; new `accessMethodKey(dbOid, name)`
+      (mirrors `domainKey`/`enumKey`/`compositeKey`/`rangeKey`, no
+      case-folding since the pre-existing code never lowercased AM names);
+      `RegisterAccessMethod`/`DropAccessMethod`/`UserAccessMethodOID` gained a
+      trailing variadic `dbOid ...uint32`; `RegisterAccessMethodDuringRecovery`
+      normalizes a zero `DBOid` to `DefaultDBOid` (WAL record carries no
+      dbOid, startup recovery still single-database). Threaded through all 3
+      live `internal/executor/operators_ddl.go` call sites
+      (`execCreateAccessMethod`, `DROP ACCESS METHOD`, `execCommentOn`'s
+      "access method" case) — all mechanical `ddlOp`-method sites, no
+      signature-cascade exceptions. New
+      `internal/catalog/create_access_method_test.go`
+      (`TestAccessMethodCrossDatabaseIsolation`). Confirmed via the DU-002
+      probe: the round-trip's failure point moved past `access method
+      "goopg_am" already exists` to a NEW, unrelated bug — `operator
+      1(bigint,bigint) already exists in operator family "op_family_loose"` —
+      the operator-family/operator-class registry is the next flat,
+      dbOid-less registry in line (recorded in the ledger, not yet located/
+      fixed). Design doc `docs/design/0122-0018-per-database-catalog-namespace.md`
+      new "Access method registry ... dbOid scoping" section + status line +
+      README index row. Gates: `go build ./...`/`go vet
+      ./internal/catalog/... ./internal/executor/...` clean; `go test
+      ./internal/executor/... ./internal/catalog/... ./internal/parser/...`
+      PASS; `go test -short $(go list ./... | grep -v /internal/testport)`
+      (full repo, short mode) 0 FAIL; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke bash
+      scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 workloads).
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002). `002_save_fullpage`
       (WD-003) + live `pg_waldump --rmgr=Heap2` round-trip DONE. **Still open:** only
       `001_basic.pl`'s server-dependent tier (per-rmgr/relation/block filtering) —

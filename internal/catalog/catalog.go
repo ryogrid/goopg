@@ -3488,6 +3488,15 @@ func rangeKey(dbOid uint32, name string) string {
 	return strconv.FormatUint(uint64(dbOid), 10) + "\x00" + strings.ToLower(name)
 }
 
+// accessMethodKey builds the c.accessMethods registry key, folding dbOid into
+// the name (verbatim, no case-folding — matches RegisterAccessMethod's
+// pre-existing case-sensitive behavior) so two distinct databases may each
+// register a same-named access method without colliding. Mirrors
+// domainKey/enumKey/compositeKey/rangeKey. M0122-0007 4e follow-up.
+func accessMethodKey(dbOid uint32, name string) string {
+	return strconv.FormatUint(uint64(dbOid), 10) + "\x00" + name
+}
+
 // NewInMemory returns a catalog seeded with the v0 pg_catalog
 // virtual views.
 
@@ -16026,40 +16035,48 @@ type AccessMethod struct {
 	OID        uint32 // pg_am.oid (assigned from the catalog OID counter)
 	AMType     string // pg_am.amtype: "i" (INDEX) or "t" (TABLE)
 	HandlerOID uint32 // pg_am.amhandler — FK to pg_proc
+	DBOid      uint32 // owning database's dbOid (per-database catalog namespace, M0122-0007 4e follow-up)
 }
 
 // RegisterAccessMethod records a user-defined access method. Returns an error
 // if the name collides with a built-in AM (pg_am's static 7 rows) or an
-// already-registered user AM — mirrors PostgreSQL's own duplicate-name check
-// in CreateAccessMethod (amcmds.c), which errors before this ever reaches the
-// catalog. DU-002 (M0119-0004).
-func (c *InMemory) RegisterAccessMethod(name, amType string, handlerOID uint32) (*AccessMethod, error) {
+// already-registered user AM in the same database — mirrors PostgreSQL's own
+// duplicate-name check in CreateAccessMethod (amcmds.c), which errors before
+// this ever reaches the catalog. The trailing variadic dbOid follows the
+// domainKey/enumKey/compositeKey/rangeKey/Routines convention (M0122-0007 4e)
+// so a same-named access method in two distinct databases does not collide.
+// DU-002 (M0119-0004).
+func (c *InMemory) RegisterAccessMethod(name, amType string, handlerOID uint32, dbOid ...uint32) (*AccessMethod, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if AccessMethodOIDByName(name) != 0 {
 		return nil, fmt.Errorf("access method %q already exists", name)
 	}
+	resolved := resolveDBOid(dbOid)
 	if c.accessMethods == nil {
 		c.accessMethods = make(map[string]*AccessMethod)
 	}
-	if _, ok := c.accessMethods[name]; ok {
+	k := accessMethodKey(resolved, name)
+	if _, ok := c.accessMethods[k]; ok {
 		return nil, fmt.Errorf("access method %q already exists", name)
 	}
-	am := &AccessMethod{Name: name, OID: c.allocOIDLocked(), AMType: amType, HandlerOID: handlerOID}
-	c.accessMethods[name] = am
+	am := &AccessMethod{Name: name, OID: c.allocOIDLocked(), AMType: amType, HandlerOID: handlerOID, DBOid: resolved}
+	c.accessMethods[k] = am
 	return am, nil
 }
 
 // DropAccessMethod removes a user-defined access method from the registry.
-// Returns true if found. DU-002 (M0119-0004).
-func (c *InMemory) DropAccessMethod(name string) bool {
+// Returns true if found. The trailing variadic dbOid mirrors
+// RegisterAccessMethod. DU-002 (M0119-0004).
+func (c *InMemory) DropAccessMethod(name string, dbOid ...uint32) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.accessMethods == nil {
 		return false
 	}
-	if _, ok := c.accessMethods[name]; ok {
-		delete(c.accessMethods, name)
+	k := accessMethodKey(resolveDBOid(dbOid), name)
+	if _, ok := c.accessMethods[k]; ok {
+		delete(c.accessMethods, k)
 		return true
 	}
 	return false
@@ -16067,6 +16084,15 @@ func (c *InMemory) DropAccessMethod(name string) bool {
 
 // ListAccessMethods returns all registered user-defined access methods
 // sorted by name. DU-002 (M0119-0004).
+//
+// Deliberately still un-dbOid'd (deferred, M0122-0007 4e follow-up, same
+// class as Routines.List()/pg_enum's un-scoped VirtualRows): the sole caller
+// (pg_am's VirtualRows closure, a bare func() with no per-connection dbOid in
+// scope) cannot supply a real dbOid yet, so this returns every database's
+// access methods unfiltered. Harmless today (every existing test creates at
+// most one AM, always under DefaultDBOid); a future loop wiring
+// per-connection dbOid into virtual-table row builders should filter this by
+// the querying connection's dbOid.
 func (c *InMemory) ListAccessMethods() []*AccessMethod {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -16085,12 +16111,12 @@ func (c *InMemory) ListAccessMethods() []*AccessMethod {
 // method, or 0 if no such AM is registered (including the 7 built-ins, which
 // are not tracked in this map — see AccessMethodOIDByName for those). Used by
 // COMMENT ON ACCESS METHOD to resolve the pg_am.oid to key the pg_description
-// row on, mirroring ForeignServerOID/ForeignDataWrapperOID/ExtensionOID.
-// DU-002 slice 434.
-func (c *InMemory) UserAccessMethodOID(name string) uint32 {
+// row on, mirroring ForeignServerOID/ForeignDataWrapperOID/ExtensionOID. The
+// trailing variadic dbOid mirrors RegisterAccessMethod. DU-002 slice 434.
+func (c *InMemory) UserAccessMethodOID(name string, dbOid ...uint32) uint32 {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	if am, ok := c.accessMethods[name]; ok {
+	if am, ok := c.accessMethods[accessMethodKey(resolveDBOid(dbOid), name)]; ok {
 		return am.OID
 	}
 	return 0
@@ -16106,22 +16132,34 @@ func (c *InMemory) UserAccessMethodOID(name string) uint32 {
 // partial-then-full replay). Mirrors catalog.InMemory.
 // RegisterEventTriggerDuringRecovery. DU-002 restart-persistence follow-up
 // (M0119-0004, DU-002 slice 426 ledger resume point).
+//
+// am.DBOid is normalized to DefaultDBOid when zero (the WAL record carries no
+// dbOid today — startup recovery is still single-database, same precedent as
+// Routine's Create/CreateDuringRecovery normalization, M0122-0007 4e
+// follow-up).
 func (c *InMemory) RegisterAccessMethodDuringRecovery(am *AccessMethod) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.accessMethods == nil {
 		c.accessMethods = make(map[string]*AccessMethod)
 	}
+	dbOid := am.DBOid
+	if dbOid == 0 {
+		dbOid = DefaultDBOid
+	}
 	out := *am
-	c.accessMethods[am.Name] = &out
+	out.DBOid = dbOid
+	c.accessMethods[accessMethodKey(dbOid, am.Name)] = &out
 	c.advanceNextOIDLocked(am.OID)
 }
 
 // DropAccessMethodDuringRecovery is the idempotent counterpart used for
 // replaying RecordKindDropAccessMethod. Identical to DropAccessMethod but
 // discards the found/not-found result — replay does not care whether the
-// access method was still present. DU-002 restart-persistence follow-up
-// (M0119-0004, DU-002 slice 426 ledger resume point).
+// access method was still present. Defaults to DefaultDBOid, same
+// single-database-recovery precedent as RegisterAccessMethodDuringRecovery.
+// DU-002 restart-persistence follow-up (M0119-0004, DU-002 slice 426 ledger
+// resume point).
 func (c *InMemory) DropAccessMethodDuringRecovery(name string) {
 	_ = c.DropAccessMethod(name)
 }

@@ -1227,7 +1227,7 @@ func (o *ddlOp) execCreateAccessMethod(s *parser.CreateAccessMethodStmt) error {
 	if !ok {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "CREATE ACCESS METHOD requires the in-memory catalog"}
 	}
-	am, err := im.RegisterAccessMethod(s.Name, s.AMType, handlerOID)
+	am, err := im.RegisterAccessMethod(s.Name, s.AMType, handlerOID, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 	if err != nil {
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 	}
@@ -15354,7 +15354,7 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 			// through pg_dump.
 			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
 				name := s.Names[0].String()
-				if im.DropAccessMethod(name) {
+				if im.DropAccessMethod(name, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 					// DU-002 restart-persistence follow-up (M0119-0004,
 					// DU-002 slice 426 ledger resume point): mirrors DROP
 					// EVENT TRIGGER.
@@ -17407,7 +17407,7 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 		// "does not exist" error real PG would (pg_dump never dumps their
 		// comments either, since it never dumps the built-ins themselves).
 		// DU-002 slice 434.
-		oid := im.UserAccessMethodOID(s.ObjName.Name)
+		oid := im.UserAccessMethodOID(s.ObjName.Name, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		if oid == 0 {
 			return &ExecError{Code: "42704", Pos: s.Pos(),
 				Message: fmt.Sprintf("access method %q does not exist", s.ObjName.Name)}

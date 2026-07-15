@@ -1,6 +1,6 @@
 # Per-database catalog namespace (M0122-0007 slice 4)
 
-Status: accepted (sub-slices 4a, 4b-i, 4b-ii, 4c, 4d-i, 4d-ii-part-1, and 4d-ii-part-2a landed; 4d-ii-part-2b items 1, 2, and 3 all fully landed; 4e's FK-target-resolution, sequence-ownership, and view-constraint-dependency items all landed; `CREATE DATABASE ... TEMPLATE` bounded validation landed 2026-07-10; the pg_class-under-fresh-database gap (name resolution generically, row enumeration for pg_class specifically) landed 2026-07-10, and the pg_indexes/pg_tables, pg_constraint, pg_index, pg_attrdef/pg_depend, pg_inherits, pg_policy, pg_trigger, pg_rewrite, pg_foreign_table, and pg_sequence row-content follow-ups landed the same day, plus the `oid::regclass`/`'name'::regclass` cast-direction dbOid-scoping gap (follow-up 33) — 2 sibling virtual-table builders (pg_statistic_ext, information_schema.routines/parameters/routine_*_usage) plus pg_sequences/information_schema.sequences (follow-up 34's narrowed remainder) plus the c.foreignServers registry-dbOid-key gap (follow-up 36, landed) and its same-shape c.userMappings sibling (follow-up 37, landed 2026-07-10); follow-up 37's own CURRENT_USER/SESSION_USER/CURRENT_ROLE/USER role-spec resolution discovery closed same-day (follow-up 38); restart durability for user tables created under a distinct-dbOid database — per-database pg_class/pg_attribute heap routing + startup reload into the owning namespace — landed same-day (follow-up 39); the real `CREATE DATABASE ... TEMPLATE` relation-copy mechanism itself landed 2026-07-10 for its bounded plain-table case (follow-up 40), extended the same day to also cover sequences (follow-up 41), plain views (follow-up 42), and materialized views (follow-up 43, including a real `execCreateMatView`/`execRefreshMatView` dbOid-scoping bugfix found along the way) — index/typed-table TEMPLATE copying remains deferred, see "Remaining 4e work" below)
+Status: accepted (sub-slices 4a, 4b-i, 4b-ii, 4c, 4d-i, 4d-ii-part-1, and 4d-ii-part-2a landed; 4d-ii-part-2b items 1, 2, and 3 all fully landed; 4e's FK-target-resolution, sequence-ownership, and view-constraint-dependency items all landed; `CREATE DATABASE ... TEMPLATE` bounded validation landed 2026-07-10; the pg_class-under-fresh-database gap (name resolution generically, row enumeration for pg_class specifically) landed 2026-07-10, and the pg_indexes/pg_tables, pg_constraint, pg_index, pg_attrdef/pg_depend, pg_inherits, pg_policy, pg_trigger, pg_rewrite, pg_foreign_table, and pg_sequence row-content follow-ups landed the same day, plus the `oid::regclass`/`'name'::regclass` cast-direction dbOid-scoping gap (follow-up 33) — 2 sibling virtual-table builders (pg_statistic_ext, information_schema.routines/parameters/routine_*_usage) plus pg_sequences/information_schema.sequences (follow-up 34's narrowed remainder) plus the c.foreignServers registry-dbOid-key gap (follow-up 36, landed) and its same-shape c.userMappings sibling (follow-up 37, landed 2026-07-10); follow-up 37's own CURRENT_USER/SESSION_USER/CURRENT_ROLE/USER role-spec resolution discovery closed same-day (follow-up 38); restart durability for user tables created under a distinct-dbOid database — per-database pg_class/pg_attribute heap routing + startup reload into the owning namespace — landed same-day (follow-up 39); the real `CREATE DATABASE ... TEMPLATE` relation-copy mechanism itself landed 2026-07-10 for its bounded plain-table case (follow-up 40), extended the same day to also cover sequences (follow-up 41), plain views (follow-up 42), and materialized views (follow-up 43, including a real `execCreateMatView`/`execRefreshMatView` dbOid-scoping bugfix found along the way) — index/typed-table TEMPLATE copying remains deferred, see "Remaining 4e work" below; the `catalog.Routines` registry (follow-up 44, 2026-07-15) and the `catalog.accessMethods` registry (follow-up 45, 2026-07-15) both landed cross-database isolation, unblocking the DU-002 probe past the function/procedure and access-method collision points respectively — the probe is now blocked on the operator-family registry, see the `accessMethods` section below)
 Date: 2026-07-10
 Supersedes: none — extends the "Still open" note in
 `0122-0017-database-ddl-drop-guards.md` and the deferral-ledger rows dated
@@ -2432,6 +2432,68 @@ parameter, mirroring `parse_func.c`'s `func_match_argtypes`/
 distinct, materially larger feature (call resolution, not DDL identity
 resolution) recorded as a fresh forward reference in the 2026-07-15 ledger
 row rather than folded into this fix.
+
+### Access method registry (`catalog.InMemory.accessMethods`) dbOid scoping — LANDED (2026-07-15)
+
+Closes the M0119-0004 DU-002 round-trip probe's next-in-line blocker after the
+Routines/OUT-parameter/VARIADIC-array sub-series above was exhausted: the
+probe's failure moved from `function`/`procedure` errors to `ERROR:  access
+method "goopg_am" already exists` when restoring `CREATE ACCESS METHOD
+goopg_am TYPE INDEX HANDLER goopg_am_handler` into a fresh second database.
+Ground-truthed by re-running `TestPort_PgDumpConnectionSetup` directly rather
+than trusting the last-recorded probe state in this doc (which predates the
+2026-07-15 VARIADIC call-site-collapsing fix, `.ralph/working_set.md`'s own
+resume-point note about `c.schemas` turned out to be stale once re-verified
+against a live run — `c.schemas` was never actually the next blocker, since
+`public` pre-exists in every database and the dump never re-issues `CREATE
+SCHEMA public`).
+
+`catalog.AccessMethod` gained a `DBOid uint32` field; the `accessMethods`
+registry's map key changed from bare `name` to a new `accessMethodKey(dbOid,
+name)` (`"<dbOid>\x00<name>"`, mirroring `domainKey`/`enumKey`/
+`compositeKey`/`rangeKey` exactly, but WITHOUT their `strings.ToLower` —
+`RegisterAccessMethod` never case-folded the name before this fix, so folding
+it now would have been an unrelated behavior change). `RegisterAccessMethod`/
+`DropAccessMethod`/`UserAccessMethodOID` gained a trailing variadic `dbOid
+...uint32` (resolved via the existing package-level `resolveDBOid`).
+`RegisterAccessMethodDuringRecovery` normalizes a zero `am.DBOid` to
+`DefaultDBOid` (the WAL record carries no dbOid today — startup recovery is
+still single-database, same precedent as `Routine`'s
+`Create`/`CreateDuringRecovery` normalization); `DropAccessMethodDuringRecovery`
+keeps defaulting to `DefaultDBOid` for the same reason.
+
+Threaded through all 3 live call sites in `internal/executor/operators_ddl.go`
+— `execCreateAccessMethod`, the `DROP ACCESS METHOD` branch, and
+`execCommentOn`'s "access method" case — all `ddlOp` methods with `o.ctx`
+already in scope, a purely mechanical set (no signature-cascade exceptions,
+unlike the enum/composite/view-dependency follow-ups). New
+`internal/catalog/create_access_method_test.go`
+(`TestAccessMethodCrossDatabaseIsolation`), mirroring
+`TestCreateDomainCrossDatabaseIsolation`/`TestRoutinesCrossDatabaseIsolation`.
+
+**Deliberately still un-dbOid'd (deferred):** `ListAccessMethods()` — its sole
+caller (`pg_am`'s `VirtualRows` closure, a bare `func() [][]string` with no
+per-connection dbOid in scope) cannot supply a real dbOid yet, so it still
+returns every database's access methods unfiltered. Same class of gap as
+`Routines.List()`/`pg_enum`'s un-scoped `VirtualRows`, harmless today since no
+existing test creates more than one access method across distinct databases
+in the same process lifetime.
+
+Confirmed via the DU-002 probe (`TestPort_PgDumpConnectionSetup`): the
+round-trip's failure point moved past `access method "goopg_am" already
+exists` to a NEW, unrelated bug — `operator 1(bigint,bigint) already exists in
+operator family "op_family_loose"` — the operator-family registry (CREATE
+OPERATOR FAMILY / CREATE OPERATOR CLASS) is the next flat, dbOid-less
+registry in line. See the 2026-07-15 deferral-ledger row (task-id
+`M0122-0007 4e follow-up (catalog.accessMethods cross-database isolation)`)
+for the resume point.
+
+Gates: `go build ./...`/`go vet ./internal/catalog/... ./internal/executor/...`
+clean; `go test ./internal/executor/... ./internal/catalog/...
+./internal/parser/...` PASS; `go test -short $(go list ./... | grep -v
+/internal/testport)` (full repo, short mode) 0 FAIL; `scripts/tpch-spotcheck.sh`
+PASS (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke bash
+scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 workloads).
 
 ## Deferred / explicitly out of scope
 
