@@ -186,11 +186,24 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
   A9-INIT_PAGE (above). Byte-for-byte segment diff vs PG for a pgbench run remains a manual/tooling follow-up
   (no automated WAL byte-diff exists), but structural parse + real-PG replay both pass.
 
-## Phase B — Catalog heap journaling (doc 02, after Phase A)
-- [ ] **B0** Enabler: generalize `loadUserTablesFromHeap`→per-catalog reload; wire catalog `XLOG_HEAP_UPDATE`;
-  bootstrap base-catalog indexes in every DB; net-new `pg_filenode.map` writer + `XLOG_RELMAP_UPDATE` encoder.
-- [ ] **B1** pg_namespace · pg_proc · pg_sequence (heap-write + index maint + write-through cache + generic
-  heap-scan reload; delete bespoke RecordKind + `*_ddl_recovery.go` scanner + `VirtualRows` builder).
+## Phase B — Catalog heap journaling (doc 02; detailed designs 02a–02d)
+- [ ] **B0** Enabler (doc 02a) — four slices, each landed + gated separately:
+  - [ ] **B0.1** generic per-catalog heap-reload framework (`catalogReloadDesc` + `reloadCatalogHeaps` in new
+    `internal/initdb/catalog_heap_reload.go`, factored from `loadUserTablesFromHeapForDB` preserving the
+    clog/basebackup visibility rules verbatim; pg_class+pg_attribute become the first two descriptors —
+    pure refactor, zero behavior change). Gate: unit + crash-recovery + FULL regress.
+  - [ ] **B0.2** catalog `XLOG_HEAP_UPDATE` emit (`updateHeapRowCanonicalPG` + TID-carrying write-through
+    cache contract; proven on one pg_class ALTER re-sync path). Gate: full + pg_waldump Heap/UPDATE on
+    1259 + e2e failover + re-init.
+  - [ ] **B0.3** per-DB catalog index bootstrap at CREATE DATABASE + lift the DefaultDBOid index skip
+    (operators_ddl.go:13185-13215). Gate: full + multi-DB regress + re-init.
+  - [ ] **B0.4** `pg_filenode.map` writer + `XLOG_RELMAP_UPDATE` encoder/replay — DEFERRABLE past B1
+    (steady-state DML on mapped catalogs emits no relmap record); design normative in 02a §5.
+- [ ] **B1** (doc 02c) pg_namespace → pg_proc → pg_sequence, one catalog per landing per the 02b recipe:
+  - [ ] **B1.1 pg_namespace** — kinds 34/35/100/101 + schema_ddl_recovery.go + wal/schema_alter_ddl.go die.
+  - [ ] **B1.2 pg_proc** — CreateFunction/DropFunction/alter-function kinds + function_ddl_recovery.go die.
+  - [ ] **B1.3 pg_sequence (catalog row only)** — definition moves to heap; counter state stays on kind 65.
+  - [ ] **B1.3b** (optional / ledger) `XLOG_SEQ_LOG` flip for the sequence-relation counter page.
 - [ ] **B2** type/operator families (pg_type/enum/range, pg_operator, pg_opclass/opfamily/amop/amproc,
   pg_cast, pg_conversion, pg_collation, pg_aggregate).
 - [ ] **B3** extension/config (pg_ts_*, pg_transform, pg_event_trigger, pg_publication*/subscription*,

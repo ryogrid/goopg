@@ -66,6 +66,10 @@ requires, rather than papering over it.
 | --- | ----- | ----- |
 | [01](01-record-content-parity.md) | Record content parity (Section A) | Rewrite heap/heap2/btree/xact/smgr/clog/xlog bodies to PG byte layouts; the block-reference + FPI encoder; the atomic encode↔replay flip; `xl_xid`; FPI/logical unification. |
 | [02](02-catalog-heap-journaling.md) | Catalog heap journaling (Section B) | Eliminate the ~110 bespoke catalog records by journaling catalog DDL as PG-style heap ops on real `pg_catalog` relations. The catalog-storage rewrite. |
+| [02a](02a-phase-b0-enablers.md) | Phase-B0 enablers (detailed design) | The four shared enablers: generic per-catalog heap reload, catalog `XLOG_HEAP_UPDATE` emit, per-DB catalog index bootstrap, `pg_filenode.map` + `XLOG_RELMAP_UPDATE` (deferrable). |
+| [02b](02b-catalog-conversion-recipe.md) | Per-catalog conversion recipe (normative) | The reusable seven-step checklist, read-model matrix, gate list, and transition rules every B1–B4 conversion follows. |
+| [02c](02c-phase-b1-application.md) | Phase-B1 application | pg_namespace / pg_proc / pg_sequence specifics; the pg_sequence catalog-row-only scope decision. |
+| [02d](02d-phase-b2-b5-overview.md) | Phase-B2–B5 overview | Application tables + risk deltas for the remaining groups; shared `global/` catalogs; RmgrGoopgCatalog retirement; ledger index. |
 
 Cross-cutting concerns (performance, verification, risk) are covered at the end of
 each doc where they apply, and summarized in §"Program-level view" below.
