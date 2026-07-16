@@ -8835,6 +8835,18 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 		default:
 			return false, unsupportedDecodedXLogRecord(r)
 		}
+	case RmgrRelMap:
+		switch xlog.Header.Info & XLRRmgrInfoMask {
+		case xlogRelmapUpdate:
+			// B0.4: rewrite the target pg_filenode.map from the record's
+			// image (CRC-verified; whole-file replace = idempotent).
+			if err := replayDecodedXLogRelmapUpdate(mgr.DataDir(), xlog.MainData); err != nil {
+				return false, err
+			}
+			return true, nil
+		default:
+			return false, unsupportedDecodedXLogRecord(r)
+		}
 	case RmgrStandby:
 		switch xlog.Header.Info & XLRRmgrInfoMask {
 		case xlogStandbyRunningXacts:

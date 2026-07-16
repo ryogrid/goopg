@@ -22,7 +22,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"hash/crc32"
 	"log"
 	"math"
 	"os"
@@ -38,6 +37,7 @@ import (
 	"github.com/goopg/goopg/internal/executor"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/storage"
+	"github.com/goopg/goopg/internal/wal"
 )
 
 // systemIdentifierFile is the path (relative to the data directory) where
@@ -6348,27 +6348,14 @@ func defaultPostgresqlAutoConf() []byte {
 }
 
 func makeRelMapFile(mappings [][2]uint32) []byte {
-	// RelMapFile layout (PG src/backend/utils/cache/relmapper.c):
-	//   int32 magic (4 bytes) = RELMAPPER_FILEMAGIC (0x592717)
-	//   int32 num_mappings (4 bytes)
-	//   RelMapping mappings[64] (512 bytes, 8 bytes each: Oid + RelFileNumber)
-	//   pg_crc32c crc (4 bytes) at offset 520
-	const (
-		relFileSize   = 524
-		relMagic      = 0x592717
-		relCRCCOffset = 520
-	)
-	out := make([]byte, relFileSize)
-	binary.LittleEndian.PutUint32(out[0:4], relMagic)
-	binary.LittleEndian.PutUint32(out[4:8], uint32(len(mappings)))
+	// B0.4: one encoder for bootstrap AND WAL paths — wal.EncodeRelMapFile
+	// is the normative RelMapFile renderer (relmapper.c layout); this
+	// wrapper only adapts the historical [][2]uint32 call shape.
+	ms := make([]wal.RelMapping, len(mappings))
 	for i, m := range mappings {
-		off := 8 + i*8
-		binary.LittleEndian.PutUint32(out[off:off+4], m[0])
-		binary.LittleEndian.PutUint32(out[off+4:off+8], m[1])
+		ms[i] = wal.RelMapping{Oid: m[0], FileNumber: m[1]}
 	}
-	crc := crc32.Checksum(out[:relCRCCOffset], crcCastagnoliTable)
-	binary.LittleEndian.PutUint32(out[relCRCCOffset:], crc)
-	return out
+	return wal.EncodeRelMapFile(ms)
 }
 
 func defaultRelMapFile() []byte {

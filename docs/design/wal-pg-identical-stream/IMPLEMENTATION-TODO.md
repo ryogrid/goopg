@@ -221,8 +221,15 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
     dirs still no-op gracefully via the missing-block-1 bail. Pinned by image-copy/idempotency/heal unit
     tests + the existing multi-DB restart suite. Gate: initdb 235s, executor/server/catalog, regress 292s,
     isolation, e2e failover — green.
-  - [ ] **B0.4** `pg_filenode.map` writer + `XLOG_RELMAP_UPDATE` encoder/replay — DEFERRABLE past B1
-    (steady-state DML on mapped catalogs emits no relmap record); design normative in 02a §5.
+  - [x] **B0.4** LANDED (implemented after B1 per user directive 2026-07-16). `internal/wal/relmap.go`:
+    `EncodeRelMapFile` (524-byte RelMapFile, magic 0x592717 + CRC32C — now THE single encoder; initdb's
+    makeRelMapFile delegates), `ValidateRelMapFile`, `EncodeRelmapUpdatePG` (RM_RELMAP=7, opcode 0x00,
+    xl_relmap_update{dbid,tsid,nbytes,image}), decoded replay arm = CRC-verified atomic file rewrite
+    (goopg hardening over upstream's length-only check). Emit: CREATE DATABASE journals the new DB's map
+    (upstream WAL_LOG RelationMapCopy analog) — a PG standby reconstructs base/<db>/pg_filenode.map from
+    WAL. Round-trip + replay + corruption tests; record added to the real-pg_waldump structural gate.
+    Gate: wal (+race — one pre-existing stripe-flake retried green), initdb 227s, server/executor,
+    multi-DB + durability suites, pg_waldump, e2e failover — green.
 - [ ] **B1** (doc 02c) pg_namespace → pg_proc → pg_sequence, one catalog per landing per the 02b recipe:
   - [x] **B1.1 pg_namespace** — LANDED, the exemplar conversion. Schema DDL journals REAL pg_namespace
     heap rows: CREATE = heap INSERT + 2684/2685 index entries; RENAME/OWNER = non-HOT xl_heap_update

@@ -105,11 +105,17 @@ func TestPGWaldumpParsesEmittedWAL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// B0.4: XLOG_RELMAP_UPDATE (RM_RELMAP) must decode structurally.
+	relmapPayload, err := EncodeRelmapUpdatePG(1, 1663, EncodeRelMapFile([]RelMapping{{Oid: 1259, FileNumber: 1259}}))
+	if err != nil {
+		t.Fatal(err)
+	}
 	records := [][]byte{
 		EncodeCheckpoint(),
 		EncodeHeapInsert(rel, 0, 1, tupBytes),
 		EncodeHeapDelete(rel, 0, 1, storage.TransactionID(42), nil),
 		updPayload,
+		relmapPayload,
 		EncodeXactCommit(storage.TransactionID(42)),
 		pagePayload,
 	}
