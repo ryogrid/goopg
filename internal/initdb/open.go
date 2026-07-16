@@ -1629,7 +1629,15 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// record need not block; the next checkpoint/flush persists it.
 	if walWriter != nil {
 		clog.SetTruncateLogger(func(oldestXid storage.TransactionID) error {
-			payload := wal.EncodeClogTruncate(oldestXid)
+			// A9: emit a PG RM_CLOG xl_clog_truncate record (pageno/oldestXact/
+			// oldestXactDb) instead of the goopg-native body. datoid stopgap = 0
+			// (goopg's redo uses only pageno+oldestXact; threading the real oldest
+			// datfrozenxid db is a follow-up — see deferral ledger). Recovery
+			// re-applies the truncation via replayCLogFromWAL's PG-format branch.
+			payload, err := wal.EncodeClogTruncatePG(oldestXid, 0)
+			if err != nil {
+				return err
+			}
 			_, endLSN, err := walWriter.Append(payload)
 			if err != nil {
 				return err

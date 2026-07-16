@@ -29,6 +29,8 @@ const (
 	XlogXactAbort  = xlogXactAbort
 	// XlogXactOpMask masks the opcode bits from XLogRecord.Info for RmgrXact.
 	XlogXactOpMask = xlogXactOpMask
+	// XlogClogTruncate is exported for the initdb clog-recovery scan (A9).
+	XlogClogTruncate = xlogClogTruncate
 	xlogStandbyRunningXacts uint8 = 0x10
 	// xlogXLogParameterChange is the xl_info opcode for XLOG_PARAMETER_CHANGE
 	// (pg_control.h:74). Emitted by the primary when GUC echo fields change;
@@ -273,7 +275,37 @@ func nativeHeaderMatchesMainData(header XLogRecord, mainData []byte) bool {
 		return false
 	}
 	rmid, info, xid := classifyXLogRecord(mainData)
-	return header.Rmid == rmid && header.Info == info && header.XID == xid
+	if header.Rmid != rmid || header.Info != info || header.XID != xid {
+		return false
+	}
+	// A9: a genuine native record's main-data has the fixed on-wire size
+	// registered for its RecordKind. A PG-format record built via
+	// framePGAssembled whose body happens to classify to the same
+	// (rmid, info, xid=0) — e.g. an xl_clog_truncate / xl_smgr_create whose
+	// leading byte collides with a native RecordKind — has a different length,
+	// so reject it here and let it route to the decoded replay path instead of
+	// the native payload[0] switch. (smgr-create additionally carries a real
+	// xid so it already fails the check above; this guard covers the xid=0
+	// clog-truncate case and is belt-and-suspenders for a bootstrap smgr-create
+	// in a colliding tablespace.)
+	if size, ok := nativeFixedRecordSize(mainData[0]); ok && len(mainData) != size {
+		return false
+	}
+	return true
+}
+
+// nativeFixedRecordSize returns the fixed on-wire body size of a native record
+// for the RecordKinds whose PG-format twin is a same-classified main-data-only
+// record (A9 collision disambiguation). Only these kinds need the guard; every
+// other RecordKind keeps the length-agnostic classify match.
+func nativeFixedRecordSize(kind byte) (int, bool) {
+	switch kind {
+	case RecordKindSmgrCreate:
+		return smgrRecordSize, true
+	case RecordKindClogTruncate:
+		return xactRecordSize, true
+	}
+	return 0, false
 }
 
 func decodeXLogBlockRefHeader(src []byte, lastRel storage.RelFileNode, haveRel bool) (xlogBlockMeta, int, storage.RelFileNode, bool, error) {

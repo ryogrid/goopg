@@ -528,3 +528,43 @@ func EncodeSmgrCreatePG(rel storage.RelFileNode, xid storage.TransactionID) ([]b
 	}
 	return framePGAssembled(RmgrStorage, xlogSmgrCreate, uint32(xid), body), nil
 }
+
+// clogXactsPerPage is PostgreSQL's CLOG_XACTS_PER_PAGE: 2 status bits per xact →
+// 4 xacts per byte → BLCKSZ*4 per CLOG page. Used to derive xl_clog_truncate's
+// pageno from the oldest surviving xid (matches mvcc.clogXactsPerPage).
+const clogXactsPerPage = storage.BlockSize * 4
+
+// EncodeClogTruncatePG builds a PostgreSQL RM_CLOG truncation record
+// (CLOG_TRUNCATE opcode) with an `xl_clog_truncate` main-data body
+// (pageno int64, oldestXact TransactionId, oldestXactDb Oid — 16 bytes) and no
+// block ref, mirroring PG's WriteTruncateXlogRec. The header xl_xid is 0 (PG's
+// clog truncation is a maintenance op with no current transaction), so routing
+// to the decoded replay path relies on the native-size guard in
+// nativeHeaderMatchesMainData (a native RecordKindClogTruncate body is 5 bytes,
+// this is 16) rather than an xid mismatch. Physical replay is a no-op; the
+// truncation is re-applied by the initdb clog-recovery scan (replayCLogFromWAL).
+func EncodeClogTruncatePG(oldestXid storage.TransactionID, oldestXactDb uint32) ([]byte, error) {
+	pageno := int64(uint64(oldestXid) / uint64(clogXactsPerPage))
+	mainData := make([]byte, 0, 16)
+	mainData = binary.LittleEndian.AppendUint64(mainData, uint64(pageno))
+	mainData = binary.LittleEndian.AppendUint32(mainData, uint32(oldestXid))
+	mainData = binary.LittleEndian.AppendUint32(mainData, oldestXactDb)
+	body, err := assembleXLogRecord(mainData, nil)
+	if err != nil {
+		return nil, err
+	}
+	return framePGAssembled(RmgrCLOG, xlogClogTruncate, 0, body), nil
+}
+
+// DecodeXLogClogTruncate parses a PG xl_clog_truncate main-data body into its
+// three fields. Used by the initdb clog-recovery scan to re-apply the truncation.
+func DecodeXLogClogTruncate(mainData []byte) (pageno int64, oldestXact storage.TransactionID, oldestXactDb uint32, err error) {
+	if len(mainData) < 16 {
+		err = fmt.Errorf("wal: xl_clog_truncate main-data len %d (want 16)", len(mainData))
+		return
+	}
+	pageno = int64(binary.LittleEndian.Uint64(mainData[0:8]))
+	oldestXact = storage.TransactionID(binary.LittleEndian.Uint32(mainData[8:12]))
+	oldestXactDb = binary.LittleEndian.Uint32(mainData[12:16])
+	return
+}

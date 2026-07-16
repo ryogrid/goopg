@@ -9547,6 +9547,17 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 		default:
 			return false, unsupportedDecodedXLogRecord(r)
 		}
+	case RmgrCLOG:
+		switch xlog.Header.Info & XLRRmgrInfoMask {
+		case xlogClogTruncate:
+			// A9: goopg's clog truncation is now a PG xl_clog_truncate. Physical
+			// replay is a page-wise no-op (matching the native RecordKindClogTruncate
+			// case); the actual CLOG truncation is re-applied by the initdb
+			// clog-recovery scan (replayCLogFromWAL), which decodes the PG body.
+			return false, nil
+		default:
+			return false, unsupportedDecodedXLogRecord(r)
+		}
 	case RmgrHeap:
 		switch xlog.Header.Info & xlogHeapOpMask {
 		case xlogHeapInsert:
