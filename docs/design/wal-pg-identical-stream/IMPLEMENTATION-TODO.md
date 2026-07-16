@@ -120,8 +120,36 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
     opaque flags). No flip needed.
   > Note: btree structural records already replay correctly for goopg↔goopg via their native bodies; the flip
   > is for PG-parseability / real-PG-standby. FPI-based records carry no incremental main-data (PG deviation).
-- [ ] **A9** smgr/clog/standalone-FPI/checkpoint-opcode/xact chunks; retire legacy native frame
-  (`encodeRecord`/`decodeRecord`).
+- [~] **A9** smgr/clog/standalone-FPI/checkpoint-opcode/xact chunks; retire legacy native frame — **FPI LANDED**;
+  rest deferred (each has a specific complexity, per below).
+  - [x] **A9-fpi** — standalone first-touch FPI (`Pool.maybeEmitFPI`) → PG `RM_XLOG`/`XLOG_FPI` via
+    `EncodePageImagePG` (block-0 apply-image, hole removed). Replay routes the empty-payload case to
+    `replayDecodedXLogHeapFPIBlocks` (the arm previously NO-OPed it — fixed together). `predictXLogRecordLen`
+    assembled branch already reserves the shrunken size. Native `EncodePageImage` kept as dead fallback.
+    Gates: crash-recovery (218s), e2e ×3, isolation (real, 26s), regress (280s).
+  - [ ] **A9-smgr-create / A9-clog-truncate** — DEFERRED (routing robustness). Both are main-data-only PG
+    records (`xl_smgr_create`=RelFileLocator+forkNum; `xl_clog_truncate`=pageno/oldestXact/oldestXactDb) with
+    xl_xid=0. A main-data-only record routes to the decoded replay path only when
+    `nativeHeaderMatchesMainData` is FALSE — but `classifyXLogRecord` reads main-data[0] as a RecordKind, and
+    if the RelFileLocator's first byte (a tablespace-OID low byte) equals `RecordKindSmgrCreate`(11) /
+    `RecordKindClogTruncate`(33) it collides → misroutes to the native `payload[0]` switch → silent corruption.
+    goopg DOES use non-default tablespaces (`table.Tablespace`), so the collision is reachable. Resume: stamp
+    the **real xid** in the header (PG-faithful — PG's smgr/clog records carry one; a non-zero header xid
+    guarantees decoded routing, exactly how A6 xact records route). Needs plumbing the xid to the emit sites
+    (`Pool.PinNew`→`logSmgrCreate`; the clog-truncate emitter) — storage layer is not xid-aware today.
+    Alternative: teach `nativeHeaderMatchesMainData` to also require the native fixed-size for the kind
+    (10 bytes for SmgrCreate vs 16 for `xl_smgr_create`). → deferral ledger.
+  - [ ] **A9-checkpoint-opcode** — DEFERRED (hot-standby entanglement). Body is already the 88-byte PG
+    `CheckPoint`; the gap is that `classifyXLogRecord` tags it by `len==88`→SHUTDOWN and never emits ONLINE.
+    Changing this is risky: the shutdown opcode is load-bearing for `PMSIGNAL_BEGIN_HOT_STANDBY` readiness
+    (format.go:222). Resume: route via `framePGAssembled(RmgrXLog, online|shutdown)`, plumb the kind +
+    `oldestActiveXid` from the checkpointer, drop the `len==88` hack, re-verify hot-standby bring-up.
+  - [ ] **A9-xact-inval-fold** — retire standalone `RecordKindXactCommitInval` by emitting invals as A6's
+    `HAS_INVALS` chunk on `xl_xact_commit` (mechanism exists: `xactCommitCarriesInvals`). Touches the commit
+    path — do carefully. → follow-up.
+  - [ ] **A9-legacy-frame-retire** — delete `encodeRecord`/`decodeRecord` (IEEE-CRC frame, `format.go:109`)
+    once `PageHeaders` is unconditional (already `true` in prod; legacy path only serves `PageHeaders=false`
+    test clusters). Large mechanical change across writer/reader/iterator + `reader_torn_tail_test.go`. Do LAST.
 - [ ] **A-gate** Phase-A exit: `pg_waldump` structural+rmgr green for all §A records; goopg↔goopg standby +
   G-crash green; real PG 18 standby replays goopg WAL (`TestE2E_FailoverGoopgToPG`); byte-diff a segment vs PG.
 
@@ -141,6 +169,19 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
   `information_schema` parity vs PG 18.3; crash-after-DDL recovery via generic reload; re-init data dir.
 
 ---
+
+## Log (A9 — standalone FPI landed)
+- 2026-07-16: **A9-fpi landed — goopg's hot first-touch FPI is now a real PG `RM_XLOG`/`XLOG_FPI` record.**
+  `EncodePageImagePG` emits the page as a block-0 apply-image (A0 encoder; free-space hole removed → smaller
+  than the native 8 KiB body). The `xlogXLogFPI` decoded arm now routes the empty-payload (block-ref) case to
+  `replayDecodedXLogHeapFPIBlocks` — it previously NO-OPed that shape, so leaving it would have silently
+  dropped every FPI on replay; the replay fix lands with the emit flip. Full gate suite (this is the hottest
+  WAL path): crash-recovery 218s, e2e ×3, isolation 26s (now real coverage after the harness fix), regress
+  280s — all green. **Rest of A9 deferred with resume points (see checklist + deferral ledger):** smgr-create
+  / clog-truncate need a real header xid for robust decoded-path routing (main-data-only, tablespace-OID
+  collision risk); checkpoint-opcode is hot-standby-entangled; xact-inval-fold + legacy-frame-retire are
+  follow-ups. **Note:** also fixed `TestPort_IsolationSuite`'s false-green (parent-defer vs t.Parallel) this
+  session, so the isolation gate now gives real coverage.
 
 ## Log (A8 — vacuum + newroot landed)
 - 2026-07-16: **A8-vacuum + A8-newroot landed — the remaining FPI-flippable btree structural records are now
