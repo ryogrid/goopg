@@ -120,8 +120,8 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
     opaque flags). No flip needed.
   > Note: btree structural records already replay correctly for goopg↔goopg via their native bodies; the flip
   > is for PG-parseability / real-PG-standby. FPI-based records carry no incremental main-data (PG deviation).
-- [~] **A9** smgr/clog/standalone-FPI/checkpoint-opcode/xact chunks; retire legacy native frame — **ALL LANDED
-  except checkpoint-opcode (deferred, hot-standby entanglement — the one remaining A9 item)**.
+- [x] **A9** smgr/clog/standalone-FPI/checkpoint-opcode/xact chunks; retire legacy native frame — **COMPLETE**
+  (checkpoint-opcode was the last item; landed 115121c7).
   - [x] **A9-fpi** — standalone first-touch FPI (`Pool.maybeEmitFPI`) → PG `RM_XLOG`/`XLOG_FPI` via
     `EncodePageImagePG` (block-0 apply-image, hole removed). Replay routes the empty-payload case to
     `replayDecodedXLogHeapFPIBlocks` (the arm previously NO-OPed it — fixed together). `predictXLogRecordLen`
@@ -146,11 +146,17 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
     PG-format branch (`DecodeXLogClogTruncate`) that re-applies the idempotent truncation. `oldestXactDb`
     stamped 0 (datoid threading through `SetTruncateLogger` is a follow-up — goopg redo uses only
     pageno+oldestXact). Gates: crash-recovery (217s), e2e ×3, isolation, regress (278s).
-  - [ ] **A9-checkpoint-opcode** — DEFERRED (hot-standby entanglement). Body is already the 88-byte PG
-    `CheckPoint`; the gap is that `classifyXLogRecord` tags it by `len==88`→SHUTDOWN and never emits ONLINE.
-    Changing this is risky: the shutdown opcode is load-bearing for `PMSIGNAL_BEGIN_HOT_STANDBY` readiness
-    (format.go:222). Resume: route via `framePGAssembled(RmgrXLog, online|shutdown)`, plumb the kind +
-    `oldestActiveXid` from the checkpointer, drop the `len==88` hack, re-verify hot-standby bring-up.
+  - [x] **A9-checkpoint-opcode** — LANDED (115121c7). Checkpoints route via
+    `framePGAssembled(RmgrXLog, online|shutdown)` (`EncodeCheckpointPG`); the `len==88` classify hack is
+    deleted. The hot-standby entanglement resolved PG-faithfully instead of being dodged: an ONLINE
+    checkpoint emits the full upstream chain — `XLOG_CHECKPOINT_REDO` at the redo point (appended INSIDE
+    the FPI redo barrier so redo==marker-start is atomic; PG17+ recovery demands this record at
+    `CheckPoint.redo`), then `XLOG_RUNNING_XACTS` (new `RunningXactsFn` ← mvcc snapshot; conservative
+    subxid_overflow under load, exact when idle), then the checkpoint record with real `oldestActiveXid`
+    (0 on shutdown, like PG). BASE_BACKUP fallout: backup_label CHECKPOINT LOCATION + pg_control CheckPoint
+    now carry the checkpoint RECORD's start (`LastCheckpointRecordLSN`), no longer == redo. Read side
+    header-driven (`isCheckpointRecord`/`replayStart` read `XLog.MainData`). Real-PG failover 5s (was 228s
+    of retries). Gates: wal+race, crash-recovery, pg_waldump ×2, isolation, regress, e2e ×7 GREEN.
   - [x] **A9-xact-inval-fold** — LANDED (d02f7d91). Standalone `RecordKindXactCommitInval` (byte 32) deleted;
     invals ride A6's `HAS_INVALS` chunk on `xl_xact_commit` (`xactCommitCarriesInvals` was already the live
     path — the standalone record was dead weight). Native replay case, `DecodeXactMarker` arm, native-kind-set
@@ -196,6 +202,22 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
   `information_schema` parity vs PG 18.3; crash-after-DDL recovery via generic reload; re-init data dir.
 
 ---
+
+## Log (A9 — checkpoint-opcode landed; A9 COMPLETE, Part A record work done)
+- 2026-07-16: **A9-checkpoint-opcode landed (115121c7) — A9 is complete.** The "deferred: hot-standby
+  entanglement" turned out to have a clean PG-faithful resolution: emit what PG emits. Three findings worth
+  keeping: (1) PG17+ recovery **validates the record at CheckPoint.redo is XLOG_CHECKPOINT_REDO** whenever
+  redo < the checkpoint record — an ONLINE flip without that marker fails `unexpected record type found at
+  redo point`; goopg appends the marker inside `PublishRedoBarrier`'s critical section so the marker start
+  IS the redo (lock order fpiPublishMu→WAL-stripe matches the FPI sections; a no-block-ref record makes no
+  FPI decision → no deadlock). (2) The standby locates the checkpoint via backup_label CHECKPOINT LOCATION /
+  pg_control CheckPoint — those must name the checkpoint RECORD's start, which is no longer the redo point
+  (`invalid resource manager ID in checkpoint record` otherwise). (3) A hot-standby needs
+  `XLOG_RUNNING_XACTS` after an online checkpoint to reach STANDBY_SNAPSHOT_READY — wired from the mvcc
+  snapshot (InProgress = top-level xids; Xmin/Xmax-1 map onto oldestRunningXid/latestCompletedXid).
+  Bonus: the failover e2e dropped 228s→5s (the standby had been retry-looping on the old always-SHUTDOWN
+  chain's basebackup edge cases). Remaining Part-A followups (btree INIT analog, byte-diff tooling,
+  clog-truncate datoid) are unchanged.
 
 ## Log (A9 — legacy frame retired; A9 complete except checkpoint-opcode)
 - 2026-07-16: **A9-legacy-frame-retire landed (81d850bc)** — goopg WAL now has exactly ONE on-disk format:
