@@ -476,3 +476,24 @@ func EncodeBtreeNewRootPG(rel storage.RelFileNode, rootBlk storage.BlockNumber, 
 	}
 	return framePGAssembled(RmgrBtree, xlogBtreeNewRoot, 0, body), nil
 }
+
+// EncodePageImagePG builds a PostgreSQL RM_XLOG standalone full-page-image record
+// (XLOG_FPI opcode) carrying the page as a block-0 apply-FPI. goopg's first-touch
+// FPI anchor (storage.Pool.maybeEmitFPI) captures the exact page bytes, so this
+// reuses the A0 FPI encoder: the free-space hole [pd_lower:pd_upper] is removed on
+// the wire (matching PG with wal_compression=off), so the record is smaller than
+// the native EncodePageImage's full 8 KiB body. BKPIMAGE_APPLY makes replay
+// (replayDecodedXLogHeapFPIBlocks via the RmgrXLog/XLOG_FPI decoded arm) restore
+// the image and stamp pd_lsn to the record LSN — identical to the native
+// replayPageImage and to PG's XLOG_FPI redo. No main-data is carried; xl_xid = 0.
+func EncodePageImagePG(rel storage.RelFileNode, blk storage.BlockNumber, page storage.Page) ([]byte, error) {
+	if len(page) != storage.BlockSize {
+		return nil, fmt.Errorf("wal: page image must be %d bytes", storage.BlockSize)
+	}
+	blocks := []BlockRef{{ID: 0, Rel: rel, Block: blk, Image: &FullPageImage{Page: page, Apply: true}}}
+	body, err := assembleXLogRecord(nil, blocks)
+	if err != nil {
+		return nil, err
+	}
+	return framePGAssembled(RmgrXLog, xlogXLogFPI, 0, body), nil
+}

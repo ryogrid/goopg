@@ -406,7 +406,11 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// storage cannot import wal (wal imports storage), so we
 	// adapt via a closure here.
 	logFPI := func(rel storage.RelFileNode, blk storage.BlockNumber, page storage.Page) (storage.LSN, error) {
-		payload, err := wal.EncodePageImage(rel, blk, page)
+		// A9: emit a PG RM_XLOG standalone full-page-image record (XLOG_FPI) with
+		// the page as a block-0 apply-image (hole removed) instead of the
+		// goopg-native full-page body. Recovery restores it via the RmgrXLog
+		// XLOG_FPI decoded arm (replayDecodedXLogHeapFPIBlocks).
+		payload, err := wal.EncodePageImagePG(rel, blk, page)
 		if err != nil {
 			return 0, err
 		}

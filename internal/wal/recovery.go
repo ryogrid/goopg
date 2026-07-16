@@ -9477,22 +9477,20 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 		case xlogXLogParameterChange:
 			return replayXLogParameterChange(mgr, xlog)
 		case xlogXLogFPI:
-			// doc 04 §5.4 point 4: a native (no block-refs) RecordKindPageImage
-			// record now classifies as RmgrXLog/XLOG_FPI (§3.1) instead of the
-			// old RmgrXLog/0xF0 catch-all, so it routes here instead of
-			// ApplyRecord's payload[0] switch. r.Payload is still populated
-			// (nativeHeaderMatchesMainData, pg_xlog_decode.go, recomputes
-			// classifyXLogRecord symmetrically at decode time for any
-			// no-block-refs record) — replay it exactly as ApplyRecord's own
-			// RecordKindPageImage case would have.
+			// A9: goopg's standalone first-touch FPI (Pool.maybeEmitFPI) is now
+			// emitted as a real PG XLOG_FPI carrying the page as a block-0
+			// apply-image (EncodePageImagePG) — an empty native Payload. Restore
+			// it via the shared FPI-block replay (identical to the A8 btree FPI
+			// flips), which reconstructs the hole and stamps pd_lsn to the record
+			// LSN. A native (no-block-refs) RecordKindPageImage record still keeps
+			// its populated Payload — recomputed symmetrically at decode time by
+			// nativeHeaderMatchesMainData — and replays via replayPageImage (dead
+			// fallback once the emit path is fully flipped).
 			if len(r.Payload) == 0 {
-				// A genuine external XLOG_FPI (real block-ref-carried full
-				// page image, e.g. from actual PG WAL) has no goopg
-				// RecordKindPageImage payload to decode — that path is
-				// out of scope for this slice (real-PG-WAL consumption is
-				// expected-fail, doc 04 §6); keep the previous no-op
-				// behavior rather than erroring on an empty payload.
-				return false, nil
+				if err := replayDecodedXLogHeapFPIBlocks(mgr, r, xlog); err != nil {
+					return false, err
+				}
+				return true, nil
 			}
 			if err := replayPageImage(mgr, r.Payload); err != nil {
 				return false, err
