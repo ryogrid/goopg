@@ -35,7 +35,6 @@ func TestRecordKindToRmgrInfoAnalogTable(t *testing.T) {
 		{"BtreeNewRoot", RecordKindBtreeNewRoot, RmgrBtree, 0xA0},                   // XLOG_BTREE_NEWROOT
 		{"BtreeMarkPageHalfDead", RecordKindBtreeMarkPageHalfDead, RmgrBtree, 0xB0}, // XLOG_BTREE_MARK_PAGE_HALFDEAD
 		{"HeapFreeze", RecordKindHeapFreeze, RmgrHeap2, 0x30},                       // XLOG_HEAP2_PRUNE_VACUUM_CLEANUP
-		{"XactCommitInval", RecordKindXactCommitInval, RmgrXact, 0x00},              // XLOG_XACT_COMMIT (§3.3 body-discriminated)
 		{"ClogTruncate", RecordKindClogTruncate, RmgrCLOG, 0x10},                    // CLOG_TRUNCATE
 	}
 	for _, tc := range cases {

@@ -28,7 +28,6 @@ func TestEmittedRecordKindsClassifyPGCompatible(t *testing.T) {
 		{"BtreeNewRoot", RecordKindBtreeNewRoot, RmgrBtree, xlogBtreeNewRoot},
 		{"BtreeMarkPageHalfDead", RecordKindBtreeMarkPageHalfDead, RmgrBtree, xlogBtreeMarkPageHalfDead},
 		{"XactCommit", RecordKindXactCommit, RmgrXact, xlogXactCommit},
-		{"XactCommitInval", RecordKindXactCommitInval, RmgrXact, xlogXactCommit},
 		{"XactAbort", RecordKindXactAbort, RmgrXact, xlogXactAbort},
 		{"SmgrCreate", RecordKindSmgrCreate, RmgrStorage, xlogSmgrCreate},
 		{"ClogTruncate", RecordKindClogTruncate, RmgrCLOG, xlogClogTruncate},

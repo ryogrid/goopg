@@ -1604,8 +1604,8 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	}
 
 	// M0106-0011 follow-up (b): regenerate pg_internal.init files after
-	// WAL recovery completes. Crash recovery replays
-	// RecordKindXactCommitInval records which UNLINK the init files
+	// WAL recovery completes. Crash recovery replays commit records
+	// carrying the HAS_INVALS chunk, which UNLINK the init files
 	// (mirrors PG's standby-side redo) but does not regenerate them.
 	// Without this, PG standbys that attach via pg_basebackup after a
 	// crash restart would find missing init files until the first DDL

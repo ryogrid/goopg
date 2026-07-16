@@ -390,15 +390,10 @@ const (
 	//   numHeapTuples(8) | lastCleanupNumDeletedTuples(8)
 	RecordKindBtreeMetaCleanup byte = 31
 
-	// RecordKindXactCommitInval is a commit record that additionally signals
-	// relcache-init-file invalidation (M0106-0010 batched-31). Emitted when a
-	// committed transaction wrote to a nailed catalog relation (pg_class,
-	// pg_attribute, pg_proc, or pg_type). On the standby, the replay path
-	// calls ProcessCommittedInvalidationMessages to unlink both
-	// pg_internal.init files so the next backend recreates them. Format is
-	// identical to RecordKindXactCommit: "kind(1) | xid(4)" = 5 bytes; the
-	// invalidation is implicit in the kind byte rather than encoded as a flag.
-	RecordKindXactCommitInval byte = 32
+	// (RecordKindXactCommitInval, formerly byte 32, was retired in A9: relcache
+	// invalidations are carried as the HAS_INVALS chunk on the PG xl_xact_commit
+	// record — see EncodeXactCommitPG / xactCommitCarriesInvals — so the standalone
+	// native record is no longer emitted. Value 32 is left unassigned.)
 
 	// RecordKindClogTruncate logs a CLOG (pg_xact) truncation: the oldest
 	// XID whose commit status is still retained. Emitted by
@@ -7578,17 +7573,6 @@ func EncodeXactAbort(xid storage.TransactionID) []byte {
 	return out
 }
 
-// EncodeXactCommitInval returns a 5-byte commit-with-relcache-invalidation
-// WAL payload. It is used instead of EncodeXactCommit when the committing
-// transaction wrote to a nailed catalog relation. On the standby, the replay
-// path calls ProcessCommittedInvalidationMessages before delivering the commit.
-func EncodeXactCommitInval(xid storage.TransactionID) []byte {
-	out := make([]byte, xactRecordSize)
-	out[0] = RecordKindXactCommitInval
-	binary.LittleEndian.PutUint32(out[1:5], uint32(xid))
-	return out
-}
-
 // EncodeClogTruncate encodes a CLOG_TRUNCATE record carrying oldestXid — the
 // oldest XID whose commit status is still retained after the truncation.
 // Wire format: "kind(1) | oldestXid(4)" = 5 bytes. Mirrors PG's
@@ -7644,7 +7628,7 @@ func DecodeXactMarker(payload []byte) (storage.TransactionID, error) {
 		return 0, fmt.Errorf("wal: invalid xact-marker payload len %d (want %d)", len(payload), xactRecordSize)
 	}
 	switch payload[0] {
-	case RecordKindXactCommit, RecordKindXactAbort, RecordKindXactCommitInval:
+	case RecordKindXactCommit, RecordKindXactAbort:
 		// valid xact-marker kinds
 	default:
 		return 0, fmt.Errorf("wal: record kind %d is not an xact marker", payload[0])
@@ -9075,18 +9059,6 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 		// drive its reorder buffer. See
 		// docs/design/0008-0001-logical-decoding-pipeline.md.
 		return false, nil
-	case RecordKindXactCommitInval:
-		// Commit with relcache-init-file invalidation (M0106-0010
-		// batched-31). Mirrors ProcessCommittedInvalidationMessages
-		// in PG's inval.c standby-side redo path: unlink both
-		// pg_internal.init files before the transaction's heap writes
-		// become visible so no backend reads stale nailed-rel
-		// descriptors from cache. ENOENT is silently ignored.
-		// Physical replay of the heap/btree changes was already done
-		// by the earlier RecordKindHeapInsert/Update records in the
-		// same transaction; this record carries no additional data.
-		_ = ProcessCommittedInvalidationMessages(mgr.DataDir(), defaultRecoveryDBOid)
-		return false, nil
 	case RecordKindClogTruncate:
 		// CLOG truncation marker (G9). Physical page recovery is a no-op: the
 		// clog (pg_xact) is a write-behind cache whose authoritative state is
@@ -9433,7 +9405,6 @@ func nativeApplyRecordKindKnown(kind byte) bool {
 		RecordKindCheckpoint,
 		RecordKindXactCommit,
 		RecordKindXactAbort,
-		RecordKindXactCommitInval,
 		RecordKindClogTruncate,
 		RecordKindCreateDatabase,
 		RecordKindDropDatabase,

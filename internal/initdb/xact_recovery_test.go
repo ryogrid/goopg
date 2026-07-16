@@ -1,7 +1,6 @@
 package initdb
 
 import (
-	"encoding/binary"
 	"path/filepath"
 	"testing"
 
@@ -84,43 +83,9 @@ func TestReplayCLogFromWAL_NativeAbort(t *testing.T) {
 	}
 }
 
-// TestReplayCLogFromWAL_CommitInvalAlsoStamps verifies that a
-// RecordKindXactCommitInval record is treated as a commit.
-func TestReplayCLogFromWAL_CommitInvalAlsoStamps(t *testing.T) {
-	dir := t.TempDir()
-	walDir := filepath.Join(dir, "pg_wal")
-
-	clog, err := mvcc.OpenCLog(filepath.Join(dir, "pg_xact"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := clog.EnablePGSLRUMirror(filepath.Join(dir, "pg_xact_slru")); err != nil {
-		t.Fatal(err)
-	}
-	txnMgr := mvcc.NewManager()
-
-	w, err := wal.NewWriter(wal.Config{WALDir: walDir, PageHeaders: false})
-	if err != nil {
-		t.Fatal(err)
-	}
-	xid := storage.TransactionID(9)
-	// Build a CommitInval payload manually (same 5-byte format).
-	payload := make([]byte, wal.XactRecordSize)
-	payload[0] = wal.RecordKindXactCommitInval
-	binary.LittleEndian.PutUint32(payload[1:5], uint32(xid))
-	if _, _, err := w.Append(payload); err != nil {
-		t.Fatalf("Append commitInval: %v", err)
-	}
-	_ = w.Close()
-
-	if err := replayCLogFromWAL(walDir, clog, txnMgr); err != nil {
-		t.Fatalf("replayCLogFromWAL: %v", err)
-	}
-
-	if got := clog.GetStatus(xid); got != mvcc.TxnStatusCommitted {
-		t.Errorf("XID %d (CommitInval): got %v want TxnStatusCommitted", xid, got)
-	}
-}
+// (TestReplayCLogFromWAL_CommitInvalAlsoStamps was removed in A9 — the standalone
+// RecordKindXactCommitInval is retired; a PG xl_xact_commit with the HAS_INVALS
+// chunk stamps the commit via the RmgrXact scanner branch, already covered.)
 
 // TestReplayCLogFromWAL_RecoversUnflushedAsyncCommit pins the correctness
 // invariant M0117-0007 Part B's lazy async-commit write-back (mvcc.CLog.

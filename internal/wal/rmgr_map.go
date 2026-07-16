@@ -62,9 +62,8 @@ func recordKindToRmgrInfo(kind byte) (Rmgr, uint8) {
 		return RmgrBtree, xlogBtreeNewRoot
 	case RecordKindBtreeMarkPageHalfDead:
 		return RmgrBtree, xlogBtreeMarkPageHalfDead
-	// Xact (RM_XACT) — Commit and CommitInval share XLOG_XACT_COMMIT;
-	// recovery re-keys on payload[0].
-	case RecordKindXactCommit, RecordKindXactCommitInval:
+	// Xact (RM_XACT) — Commit maps to XLOG_XACT_COMMIT.
+	case RecordKindXactCommit:
 		return RmgrXact, xlogXactCommit
 	case RecordKindXactAbort:
 		return RmgrXact, xlogXactAbort
