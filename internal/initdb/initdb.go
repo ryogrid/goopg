@@ -332,6 +332,83 @@ func CreatePerDatabaseScaffolding(dataDir string, dbOID uint32) error {
 	if err := os.WriteFile(filepath.Join(dbDir, "PG_VERSION"), []byte(CatalogVersion+"\n"), 0o600); err != nil {
 		return fmt.Errorf("write base/%d/PG_VERSION: %w", dbOID, err)
 	}
+	// B0.3 (doc 02a §4): a CREATE DATABASE database gets the full pristine
+	// bootstrap catalog image — every catalog heap + btree + pg_filenode.map
+	// initdb built — instead of empty lazily-created files. Copied from
+	// template0's directory (base/4), which never receives runtime writes,
+	// NOT from the named template: goopg clones template user tables under
+	// fresh OIDs (copyTemplateTables), so the named template's pg_class heap
+	// would carry rows for relations that don't exist in the new database.
+	// (PG copies everything from the named template because its clones keep
+	// their OIDs — a documented goopg deviation.) The three system databases
+	// are populated by initdb itself and skip this.
+	switch dbOID {
+	case catalog.DefaultDBOid, template0DbOid, catalog.PostgresDBOid:
+		return nil
+	}
+	return copyBootstrapCatalogImage(dataDir, dbOID)
+}
+
+// template0DbOid is template0's pg_database OID (initdb seeds 1=template1,
+// 4=template0, 5=postgres).
+const template0DbOid uint32 = 4
+
+// copyBootstrapCatalogImage copies every regular file from base/4
+// (template0's pristine bootstrap catalog image) into base/<dbOID>/,
+// skipping files that already exist — which makes it idempotent for the
+// two callers that share it via CreatePerDatabaseScaffolding: the CREATE
+// DATABASE server path and its WAL-replay recovery (a replay over a live
+// database directory must never clobber post-create catalog writes).
+// Each file is written via write-temp + fsync + rename so a crash cannot
+// leave a torn catalog file that a later replay would skip as "exists".
+// A missing base/4 (a pre-B0.3 data dir) is a silent no-op — such
+// clusters keep the historical lazy-file behavior.
+func copyBootstrapCatalogImage(dataDir string, dbOID uint32) error {
+	srcDir := filepath.Join(dataDir, "base", strconv.FormatUint(uint64(template0DbOid), 10))
+	dstDir := filepath.Join(dataDir, "base", strconv.FormatUint(uint64(dbOID), 10))
+	entries, err := os.ReadDir(srcDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("read template0 image: %w", err)
+	}
+	for _, e := range entries {
+		if e.IsDir() || e.Name() == "PG_VERSION" {
+			continue
+		}
+		dst := filepath.Join(dstDir, e.Name())
+		if _, err := os.Stat(dst); err == nil {
+			continue // already present — replay over a live dir
+		}
+		data, err := os.ReadFile(filepath.Join(srcDir, e.Name()))
+		if err != nil {
+			return fmt.Errorf("read template0 %s: %w", e.Name(), err)
+		}
+		tmp := dst + ".tmp"
+		f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+		if err != nil {
+			return fmt.Errorf("create %s: %w", tmp, err)
+		}
+		if _, err := f.Write(data); err != nil {
+			_ = f.Close()
+			return fmt.Errorf("write %s: %w", tmp, err)
+		}
+		if err := f.Sync(); err != nil {
+			_ = f.Close()
+			return fmt.Errorf("fsync %s: %w", tmp, err)
+		}
+		if err := f.Close(); err != nil {
+			return err
+		}
+		if err := os.Rename(tmp, dst); err != nil {
+			return fmt.Errorf("rename %s: %w", tmp, err)
+		}
+	}
+	if d, err := os.Open(dstDir); err == nil {
+		_ = d.Sync()
+		_ = d.Close()
+	}
 	return nil
 }
 

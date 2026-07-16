@@ -33,7 +33,6 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -177,8 +176,12 @@ func cmpKeyNameOid(a, b []byte) int {
 // sysBtreeRootBlock+1 blocks (true for initdb-bootstrapped clusters; tests
 // must pre-populate via the helpers in sys_catalog_index_insert_test.go).
 func insertCanonicalSysBtreeLeaf(ctx *Context, indexOID uint32, indexTuple []byte, cmp keyCompareFn) error {
+	// B0.3: route to the SAME database's index files as the catalog heap
+	// write (tableCatalogHeapDBOid) — a distinct-dbOid database now has its
+	// own bootstrapped catalog btrees (copyBootstrapCatalogImage), so its
+	// entries land beside its heap rows instead of being skipped.
 	rel := storage.RelFileNode{
-		DBOid:  catalog.DefaultDBOid,
+		DBOid:  tableCatalogHeapDBOid(ctx),
 		RelOid: indexOID,
 		Fork:   storage.MainFork,
 	}

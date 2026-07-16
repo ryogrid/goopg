@@ -13183,20 +13183,18 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 		return fmt.Errorf("pg_class: %w", err)
 	}
 	relnamespace := namespaceOIDForSchema(ctx.Catalog, tbl.Schema)
-	// The sys-btree catalog index entries stay DefaultDBOid-only: a distinct
-	// database has no bootstrapped catalog btree files, and inserting its TIDs
-	// into DefaultDBOid's btrees would plant entries pointing at tuples that
-	// live in a DIFFERENT heap file. The startup loader scans heap blocks
-	// directly and never consults these indexes (they serve pg_dump's
-	// server-side index scans + an attaching PG standby, both of which read
-	// the DefaultDBOid/postgres catalogs). See the follow-up-39 ledger row.
-	if heapDBOid == catalog.DefaultDBOid {
-		if err := insertPgClassOidIndexEntry(ctx, tbl.OID, classTID); err != nil {
-			return fmt.Errorf("pg_class_oid_index: %w", err)
-		}
-		if err := insertPgClassRelnameNspIndexEntry(ctx, tbl.Name, relnamespace, classTID); err != nil {
-			return fmt.Errorf("pg_class_relname_nsp_index: %w", err)
-		}
+	// B0.3 (doc 02a §4): index entries route to the SAME database as the
+	// heap rows — insertCanonicalSysBtreeLeaf resolves the dbOid via
+	// tableCatalogHeapDBOid, and a distinct-dbOid database has its own
+	// bootstrapped catalog btrees (copyBootstrapCatalogImage at CREATE
+	// DATABASE). The historical DefaultDBOid-only skip (follow-up-39) is
+	// lifted; pre-B0.3 databases without index files still no-op gracefully
+	// inside the inserter (missing-block-1 bail).
+	if err := insertPgClassOidIndexEntry(ctx, tbl.OID, classTID); err != nil {
+		return fmt.Errorf("pg_class_oid_index: %w", err)
+	}
+	if err := insertPgClassRelnameNspIndexEntry(ctx, tbl.Name, relnamespace, classTID); err != nil {
+		return fmt.Errorf("pg_class_relname_nsp_index: %w", err)
 	}
 
 	attrRel := storage.RelFileNode{
@@ -13209,10 +13207,8 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 		if err != nil {
 			return fmt.Errorf("pg_attribute col %q: %w", col.Name, err)
 		}
-		if heapDBOid != catalog.DefaultDBOid {
-			continue // see the sys-btree comment above
-		}
-		// attnum is the 1-based ordinal of the column in PG18.
+		// attnum is the 1-based ordinal of the column in PG18. B0.3: routed
+		// per-DB like the pg_class entries above (skip lifted).
 		if err := insertPgAttributeRelidAttnumIndexEntry(ctx, tbl.OID, int16(col.Ordinal+1), attrTID); err != nil {
 			return fmt.Errorf("pg_attribute_relid_attnum_index col %q: %w", col.Name, err)
 		}

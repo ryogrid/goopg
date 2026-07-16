@@ -210,8 +210,17 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
     executor units, wal -race, initdb crash recovery (235s), e2e failover — green.
     NOTE: first real caller + the TID-carrying cache land with B1.1 pg_namespace (no emit site exists
     until a catalog converts; the helper is additive and unused in production this landing).
-  - [ ] **B0.3** per-DB catalog index bootstrap at CREATE DATABASE + lift the DefaultDBOid index skip
-    (operators_ddl.go:13185-13215). Gate: full + multi-DB regress + re-init.
+  - [x] **B0.3** LANDED — per-DB catalog heap+index bootstrap at CREATE DATABASE + index-skip lift.
+    `CreatePerDatabaseScaffolding` (server CREATE DATABASE + WAL-replay recovery share it) now copies
+    template0's pristine bootstrap catalog image (`copyBootstrapCatalogImage`: base/4 → base/<newDb>,
+    copy-if-missing per file for replay idempotency, write-temp+fsync+rename against torn copies; system
+    DBs + pre-B0.3 dirs no-op). Source is base/4 NOT the named template — goopg clones template user
+    tables under fresh OIDs, so the named template's pg_class heap would carry phantom rows (documented
+    PG deviation). `insertCanonicalSysBtreeLeaf` routes by `tableCatalogHeapDBOid` (same dbOid as the
+    heap write); the syncTableToCatalogHeap DefaultDBOid-only skips (follow-up-39) are lifted — pre-B0.3
+    dirs still no-op gracefully via the missing-block-1 bail. Pinned by image-copy/idempotency/heal unit
+    tests + the existing multi-DB restart suite. Gate: initdb 235s, executor/server/catalog, regress 292s,
+    isolation, e2e failover — green.
   - [ ] **B0.4** `pg_filenode.map` writer + `XLOG_RELMAP_UPDATE` encoder/replay — DEFERRABLE past B1
     (steady-state DML on mapped catalogs emits no relmap record); design normative in 02a §5.
 - [ ] **B1** (doc 02c) pg_namespace → pg_proc → pg_sequence, one catalog per landing per the 02b recipe:
