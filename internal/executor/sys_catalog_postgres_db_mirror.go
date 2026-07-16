@@ -121,9 +121,9 @@ func mirrorCatalogRelToPostgresDB(ctx *Context, relOID uint32) error {
 // strict subset) from DBOid=1 to DBOid=5.
 func mirrorTouchedCatalogsToPostgresDB(ctx *Context) error {
 	mirroredOIDs := []uint32{
-		catalog.RelationRelationId,     // 1259 pg_class
-		catalog.AttributeRelationId,    // 1249 pg_attribute
-		catalog.IndexRelationId,        // 2610 pg_index — syncIndexToCatalogHeap's
+		catalog.RelationRelationId,  // 1259 pg_class
+		catalog.AttributeRelationId, // 1249 pg_attribute
+		catalog.IndexRelationId,     // 2610 pg_index — syncIndexToCatalogHeap's
 		// pg_index row was never mirrored here, so loadUserIndexesFromHeap's Pass
 		// 2 heap scan (which reads from cat.DBOID(), almost always PostgresDBOid
 		// in real usage — see detectCatalogDBOID) never found a live pg_index row
@@ -141,9 +141,11 @@ func mirrorTouchedCatalogsToPostgresDB(ctx *Context) error {
 		pgNamespaceRelOID,          // 2615 pg_namespace
 		pgNamespaceNspnameIndexOID, // 2684
 		pgNamespaceOidIndexOID,     // 2685
-		// B1.2: pg_proc heap (indexes 2690/2691 stay bootstrap-static this
-		// phase — no runtime maintenance yet, see sys_pg_proc.go header).
-		pgProcRelOID, // 1255
+		// B1.2: pg_proc heap; B2-prep added runtime maintenance of both
+		// indexes (descent path), so they must mirror alongside the heap.
+		pgProcRelOID,                 // 1255
+		pgProcOidIndexOID,            // 2690
+		pgProcPronameArgsNspIndexOID, // 2691
 	}
 	for _, oid := range mirroredOIDs {
 		if err := mirrorCatalogRelToPostgresDB(ctx, oid); err != nil {

@@ -185,6 +185,15 @@ func runFailoverGoopgToPG(t *testing.T, repo, pgBasebackupBin, psqlBin string, m
 		"SELECT count(*) FROM public.bench_log WHERE client = -999",
 		1, 30*time.Second)
 
+	// B2-prep: a runtime CREATE FUNCTION flows to the standby as pg_proc
+	// heap + 2690/2691 index page writes; the post-failover assertion below
+	// proves PG resolves it by name (FuncnameGetCandidates → 2691) and
+	// executes it (PROCOID → 2690, prosrc).
+	if err := runSQLSimple(t, primary,
+		"CREATE FUNCTION public.b2prep_double(int) RETURNS int LANGUAGE sql AS 'SELECT $1 * 2'"); err != nil {
+		t.Fatalf("create function on goopg primary: %v", err)
+	}
+
 	dsn := fmt.Sprintf("host=%s port=%s user=%s dbname=%s sslmode=disable",
 		"127.0.0.1", mustGoopgPort(primary.ListenAddr()), "postgres", "postgres")
 	workCtx, workCancel := context.WithCancel(context.Background())
@@ -299,6 +308,13 @@ func runFailoverGoopgToPG(t *testing.T, repo, pgBasebackupBin, psqlBin string, m
 	if got := pgScalar(t, standby,
 		"SELECT src FROM public.bench_log WHERE client = -1"); got != "post" {
 		t.Fatalf("post-failover row src=%q want post", got)
+	}
+
+	// B2-prep: the goopg-created function must be resolvable and executable
+	// on the promoted PG (pg_proc row + both runtime-maintained indexes).
+	if got := pgScalar(t, standby,
+		"SELECT public.b2prep_double(21)"); got != "42" {
+		t.Fatalf("post-failover function call = %q, want 42", got)
 	}
 }
 

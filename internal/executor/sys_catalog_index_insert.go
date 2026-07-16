@@ -201,6 +201,110 @@ const (
 	pgNamespaceOidIndexOID     = 2685
 )
 
+// pg_proc index OIDs (postgres/src/include/catalog/pg_proc.h). B2-prep.
+const (
+	pgProcOidIndexOID            = 2690
+	pgProcPronameArgsNspIndexOID = 2691
+)
+
+// sysIndexVarMask is INDEX_VAR_MASK (postgres/src/include/access/itup.h:74):
+// set on every IndexTuple whose data contains a varlena attribute
+// (pg_proc_proname_args_nsp_index carries proargtypes = oidvector).
+const sysIndexVarMask uint16 = 0x4000
+
+// buildIndexTupleProcNameArgsNsp builds the variable-length IndexTuple for
+// pg_proc_proname_args_nsp_index (2691): NameData proname (64 B, NUL-padded),
+// oidvector proargtypes (24+4n B, via pgProcOidVectorBytes — the same encoder
+// the pg_proc heap row uses), oid pronamespace (4 B), MAXALIGN'd. Twin of
+// initdb's pgBuildIndexTupleProcKey
+// (pg_proc_proname_args_nsp_index_bootstrap.go) — the two must agree
+// byte-for-byte because runtime entries land beside bootstrap entries.
+func buildIndexTupleProcNameArgsNsp(heapBlk uint32, heapOff uint16, proname string, argTypeOIDs []uint32, pronamespace uint32) []byte {
+	const (
+		hoff        = sysIndexTupleHoff
+		nameDataLen = 64
+	)
+	oidVec := pgProcOidVectorBytes(argTypeOIDs)
+	rawSize := hoff + nameDataLen + len(oidVec) + 4
+	aligned := (rawSize + 7) &^ 7
+	out := make([]byte, aligned)
+	le := binary.LittleEndian
+	le.PutUint16(out[0:2], uint16(heapBlk>>16))
+	le.PutUint16(out[2:4], uint16(heapBlk&0xFFFF))
+	le.PutUint16(out[4:6], heapOff)
+	le.PutUint16(out[6:8], (uint16(aligned)&sysIndexSizeMask)|sysIndexVarMask)
+	n := len(proname)
+	if n > nameDataLen {
+		n = nameDataLen
+	}
+	copy(out[hoff:hoff+n], proname[:n])
+	off := hoff + nameDataLen
+	copy(out[off:off+len(oidVec)], oidVec)
+	off += len(oidVec)
+	le.PutUint32(out[off:off+4], pronamespace)
+	return out
+}
+
+// cmpKeyProcNameArgsNsp compares (NameData[64], oidvector, oid) keys with
+// PG's semantics: proname byte-compare (name_cmp), then oidvector by length
+// then elementwise (btoidvectorcmp, postgres/src/backend/utils/adt/oid.c),
+// then pronamespace. The oidvector's dim1 sits 16 bytes into its 24-byte
+// array header; elements follow the header.
+func cmpKeyProcNameArgsNsp(a, b []byte) int {
+	const (
+		nameDataLen = 64
+		vecDimOff   = nameDataLen + 16
+		vecElemsOff = nameDataLen + 24
+	)
+	if c := bytes.Compare(a[:nameDataLen], b[:nameDataLen]); c != 0 {
+		return c
+	}
+	le := binary.LittleEndian
+	la := le.Uint32(a[vecDimOff : vecDimOff+4])
+	lb := le.Uint32(b[vecDimOff : vecDimOff+4])
+	if la != lb {
+		if la < lb {
+			return -1
+		}
+		return 1
+	}
+	for k := uint32(0); k < la; k++ {
+		ea := le.Uint32(a[vecElemsOff+4*k:])
+		eb := le.Uint32(b[vecElemsOff+4*k:])
+		if ea != eb {
+			if ea < eb {
+				return -1
+			}
+			return 1
+		}
+	}
+	na := le.Uint32(a[vecElemsOff+4*la:])
+	nb := le.Uint32(b[vecElemsOff+4*lb:])
+	if na != nb {
+		if na < nb {
+			return -1
+		}
+		return 1
+	}
+	return 0
+}
+
+// insertPgProcOidIndexEntry inserts an entry into pg_proc_oid_index (2690)
+// for (oid → heap TID). B2-prep: the bootstrap tree is multi-level (3397
+// builtin rows), so this always rides the descent path.
+func insertPgProcOidIndexEntry(ctx *Context, oid uint32, tid storage.ItemPointer) error {
+	tup := buildIndexTupleOidKey(uint32(tid.Block), tid.Offset, oid)
+	return insertCanonicalSysBtreeLeaf(ctx, pgProcOidIndexOID, tup, cmpKeyUint32)
+}
+
+// insertPgProcPronameArgsNspIndexEntry inserts an entry into
+// pg_proc_proname_args_nsp_index (2691) for ((proname, proargtypes,
+// pronamespace) → heap TID).
+func insertPgProcPronameArgsNspIndexEntry(ctx *Context, proname string, argTypeOIDs []uint32, pronamespace uint32, tid storage.ItemPointer) error {
+	tup := buildIndexTupleProcNameArgsNsp(uint32(tid.Block), tid.Offset, proname, argTypeOIDs, pronamespace)
+	return insertCanonicalSysBtreeLeaf(ctx, pgProcPronameArgsNspIndexOID, tup, cmpKeyProcNameArgsNsp)
+}
+
 // insertPgNamespaceNspnameIndexEntry inserts an entry into
 // pg_namespace_nspname_index (2684) for (nspname → heap TID). B1.1.
 func insertPgNamespaceNspnameIndexEntry(ctx *Context, nspname string, tid storage.ItemPointer) error {

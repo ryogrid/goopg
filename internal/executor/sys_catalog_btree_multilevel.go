@@ -182,7 +182,11 @@ func collectAllLeafTuples(ctx *Context, rel storage.RelFileNode, rootBlk uint32,
 				ctx.Pool.Unpin(slot)
 				return nil, fmt.Errorf("read slot %d of leaf blk %d: %w", i, cur, err)
 			}
-			if len(raw) != meta.tupleSize {
+			if meta.variable {
+				if len(raw) <= sysIndexTupleHoff {
+					continue
+				}
+			} else if len(raw) != meta.tupleSize {
 				continue
 			}
 			buf := make([]byte, len(raw))
@@ -290,6 +294,127 @@ func buildBulkSysBtreeLayout(sortedTuples [][]byte, tupleSize int, nkeyatts uint
 	return out, nil
 }
 
+// buildBulkSysBtreeLayoutVariable is the variable-tuple-size twin of
+// buildBulkSysBtreeLayout, mirroring
+// `internal/initdb/pg_proc_proname_args_nsp_index_bootstrap.go::pgBuildBtreeBulkLoadVariable`
+// (duplicated because executor → initdb would form an import cycle). Every
+// non-rightmost leaf reserves worst-case (largest-tuple) P_HIKEY space so
+// packing is monotonic; the internal level must fit a single root page
+// (~75 variable downlinks — far above any catalog btree we rebuild).
+func buildBulkSysBtreeLayoutVariable(sortedTuples [][]byte, nkeyatts uint16) ([]byte, error) {
+	const pageHeader = storage.SizeOfPageHeaderData
+	leafPayload := storage.BlockSize - pageHeader - sizeOfBTPageOpaque
+
+	totalNeeded := 0
+	maxTupleSize := 0
+	for i, t := range sortedTuples {
+		if len(t)%8 != 0 {
+			return nil, fmt.Errorf("bulk layout (variable): tuple %d not MAXALIGN'd: len=%d", i, len(t))
+		}
+		totalNeeded += len(t) + 4
+		if len(t) > maxTupleSize {
+			maxTupleSize = len(t)
+		}
+	}
+	if totalNeeded <= leafPayload {
+		// Single leaf-root: meta(0) + leaf-root(1).
+		leaf, err := buildSysBtreeLeafPage(sortedTuples, nil, pNoneBlock, pNoneBlock, true)
+		if err != nil {
+			return nil, fmt.Errorf("bulk layout (variable): leaf-root: %w", err)
+		}
+		meta := make([]byte, storage.BlockSize)
+		if err := writeSysBtreeMetapageInPlace(meta, 1, 0); err != nil {
+			return nil, fmt.Errorf("bulk layout (variable): meta: %w", err)
+		}
+		out := make([]byte, 0, 2*storage.BlockSize)
+		out = append(out, meta...)
+		out = append(out, leaf...)
+		return out, nil
+	}
+
+	hikeyReservation := maxTupleSize + 4
+	var leafGroups [][][]byte
+	pos := 0
+	for pos < len(sortedTuples) {
+		remaining := 0
+		for i := pos; i < len(sortedTuples); i++ {
+			remaining += len(sortedTuples[i]) + 4
+		}
+		if remaining <= leafPayload {
+			leafGroups = append(leafGroups, sortedTuples[pos:])
+			break
+		}
+		budget := leafPayload - hikeyReservation
+		used := 0
+		end := pos
+		for end < len(sortedTuples) {
+			slot := len(sortedTuples[end]) + 4
+			if used+slot > budget {
+				break
+			}
+			used += slot
+			end++
+		}
+		if end == pos {
+			return nil, fmt.Errorf("bulk layout (variable): tuple %d (size=%d) does not fit on a leaf (budget=%d)",
+				pos, len(sortedTuples[pos]), budget)
+		}
+		leafGroups = append(leafGroups, sortedTuples[pos:end])
+		pos = end
+	}
+	nLeaves := len(leafGroups)
+
+	leaves := make([][]byte, nLeaves)
+	for li, group := range leafGroups {
+		isRightmost := li == nLeaves-1
+		prev := uint32(pNoneBlock)
+		next := uint32(pNoneBlock)
+		if li > 0 {
+			prev = uint32(li)
+		}
+		if !isRightmost {
+			next = uint32(li + 2)
+		}
+		var highKey []byte
+		if !isRightmost {
+			highKey = buildSysBtreeLeafHighKey(leafGroups[li+1][0], nkeyatts)
+		}
+		page, err := buildSysBtreeLeafPage(group, highKey, prev, next, false)
+		if err != nil {
+			return nil, fmt.Errorf("bulk layout (variable): leaf %d: %w", li, err)
+		}
+		leaves[li] = page
+	}
+
+	downlinks := make([][]byte, nLeaves)
+	downlinks[0] = buildSysBtreeMinusInfDownlink(1)
+	rootNeeded := len(downlinks[0]) + 4
+	for li := 1; li < nLeaves; li++ {
+		downlinks[li] = buildSysBtreeInternalDownlink(leafGroups[li][0], uint32(li+1), nkeyatts)
+		rootNeeded += len(downlinks[li]) + 4
+	}
+	if rootNeeded > leafPayload {
+		return nil, fmt.Errorf("bulk layout (variable): %d downlinks (%d bytes) exceed single internal root capacity (%d)",
+			len(downlinks), rootNeeded, leafPayload)
+	}
+	root, err := buildSysBtreeInternalRootPage(downlinks)
+	if err != nil {
+		return nil, fmt.Errorf("bulk layout (variable): internal root: %w", err)
+	}
+	rootBlock := uint32(nLeaves + 1)
+	meta := make([]byte, storage.BlockSize)
+	if err := writeSysBtreeMetapageInPlace(meta, rootBlock, 1); err != nil {
+		return nil, fmt.Errorf("bulk layout (variable): meta (multi): %w", err)
+	}
+	out := make([]byte, 0, (nLeaves+2)*storage.BlockSize)
+	out = append(out, meta...)
+	for _, leaf := range leaves {
+		out = append(out, leaf...)
+	}
+	out = append(out, root...)
+	return out, nil
+}
+
 // rebuildSysBtreeWithNewEntry is the fallback when an in-place leaf insert
 // returns ErrNoSpaceInPage on a multi-level tree. It re-collects every data
 // tuple in the index, merges the new tuple in sorted order, runs the bulk-
@@ -304,7 +429,11 @@ func rebuildSysBtreeWithNewEntry(ctx *Context, indexOID uint32, rel storage.RelF
 	if !ok {
 		return fmt.Errorf("rebuild: unsupported OID %d", indexOID)
 	}
-	if len(newTuple) != keyMeta.tupleSize {
+	if keyMeta.variable {
+		if len(newTuple) <= sysIndexTupleHoff || len(newTuple)%8 != 0 {
+			return fmt.Errorf("rebuild: variable newTuple size %d invalid", len(newTuple))
+		}
+	} else if len(newTuple) != keyMeta.tupleSize {
 		return fmt.Errorf("rebuild: newTuple size %d, want %d", len(newTuple), keyMeta.tupleSize)
 	}
 	rootBlk, level, err := readSysBtreeMeta(ctx, rel)
@@ -316,7 +445,12 @@ func rebuildSysBtreeWithNewEntry(ctx *Context, indexOID uint32, rel storage.RelF
 		return fmt.Errorf("rebuild: collect leaves: %w", err)
 	}
 	merged, _ := mergeSortedSlice(existing, newTuple, cmp)
-	imageBytes, err := buildBulkSysBtreeLayout(merged, keyMeta.tupleSize, keyMeta.nkeyatts)
+	var imageBytes []byte
+	if keyMeta.variable {
+		imageBytes, err = buildBulkSysBtreeLayoutVariable(merged, keyMeta.nkeyatts)
+	} else {
+		imageBytes, err = buildBulkSysBtreeLayout(merged, keyMeta.tupleSize, keyMeta.nkeyatts)
+	}
 	if err != nil {
 		return fmt.Errorf("rebuild: bulk-build: %w", err)
 	}

@@ -7,10 +7,12 @@ package executor
 // the write-through cache and carries each routine's live heap TID.
 //
 // Index maintenance for pg_proc_oid_index(2690) / pg_proc_proname_args_nsp_
-// index(2691) is NOT performed at runtime this phase: both are multi-level
-// btrees (3397 bootstrap entries) and goopg has no descent-aware catalog
-// btree insert yet — exactly today's behavior (the bootstrap indexes never
-// carried user functions either). Ledgered as a follow-up.
+// index(2691) runs at every heap write (B2-prep): both bootstrap trees are
+// multi-level (3397 entries), so entries ride the descent path in
+// sys_catalog_btree_multilevel.go; 2691 is the first variable-length key
+// (proargtypes oidvector). Non-HOT updates insert fresh entries at the new
+// TID — old entries point at dead heap versions, exactly PG's convention
+// (reaped by vacuum, never updated in place).
 
 import (
 	"encoding/binary"
@@ -149,7 +151,13 @@ func buildPGProcRow(cat catalog.Catalog, r *catalog.Routine) Row {
 			nargDefaults++
 		}
 	}
-	argNames := NewStringDatum("")
+	// Absent nullable columns are genuinely NULL (pg_class builder
+	// convention, pg18_user_catalog_rows.go): PG branches on attisnull for
+	// these — a non-NULL empty text varlena in prosqlbody would send every
+	// SQL-function call on a real PG standby into stringToNode(""), and an
+	// empty non-array value in proargnames/proallargtypes would corrupt
+	// array deconstruction in FuncnameGetCandidates.
+	argNames := NullDatum
 	if len(r.ArgNames) > 0 {
 		hasName := false
 		for _, n := range r.ArgNames {
@@ -162,41 +170,41 @@ func buildPGProcRow(cat catalog.Catalog, r *catalog.Routine) Row {
 			argNames = NewBytesDatum(pgTextArrayBytes(r.ArgNames))
 		}
 	}
-	proconfig := NewStringDatum("")
+	proconfig := NullDatum
 	if len(r.Config) > 0 {
 		proconfig = NewBytesDatum(pgTextArrayBytes(r.Config))
 	}
 	return Row{
-		NewIntDatum(int64(r.OID)),                                // 1  oid
-		NewStringDatum(r.Name),                                   // 2  proname
-		NewIntDatum(int64(namespaceOIDForSchema(cat, r.Schema))), // 3  pronamespace
-		NewIntDatum(int64(r.OwnerOrDefault())),                   // 4  proowner
-		NewIntDatum(pgProcLangOID(r.Language)),                   // 5  prolang
-		NewIntDatum(cost),                                        // 6  procost
-		NewIntDatum(rows),                                        // 7  prorows
-		NewIntDatum(0),                                           // 8  provariadic
-		NewIntDatum(0),                                           // 9  prosupport
-		NewStringDatum(kind),                                     // 10 prokind
-		NewBoolDatum(r.SecurityDefiner),                          // 11 prosecdef
-		NewBoolDatum(r.Leakproof),                                // 12 proleakproof
-		NewBoolDatum(r.Strict),                                   // 13 proisstrict
-		NewBoolDatum(r.ReturnsSet),                               // 14 proretset
-		NewStringDatum(vol),                                      // 15 provolatile
-		NewStringDatum(par),                                      // 16 proparallel
-		NewIntDatum(int64(len(r.ArgTypes))),                      // 17 pronargs
-		NewIntDatum(int64(nargDefaults)),                         // 18 pronargdefaults
+		NewIntDatum(int64(r.OID)),                                    // 1  oid
+		NewStringDatum(r.Name),                                       // 2  proname
+		NewIntDatum(int64(namespaceOIDForSchema(cat, r.Schema))),     // 3  pronamespace
+		NewIntDatum(int64(r.OwnerOrDefault())),                       // 4  proowner
+		NewIntDatum(pgProcLangOID(r.Language)),                       // 5  prolang
+		NewIntDatum(cost),                                            // 6  procost
+		NewIntDatum(rows),                                            // 7  prorows
+		NewIntDatum(0),                                               // 8  provariadic
+		NewIntDatum(0),                                               // 9  prosupport
+		NewStringDatum(kind),                                         // 10 prokind
+		NewBoolDatum(r.SecurityDefiner),                              // 11 prosecdef
+		NewBoolDatum(r.Leakproof),                                    // 12 proleakproof
+		NewBoolDatum(r.Strict),                                       // 13 proisstrict
+		NewBoolDatum(r.ReturnsSet),                                   // 14 proretset
+		NewStringDatum(vol),                                          // 15 provolatile
+		NewStringDatum(par),                                          // 16 proparallel
+		NewIntDatum(int64(len(r.ArgTypes))),                          // 17 pronargs
+		NewIntDatum(int64(nargDefaults)),                             // 18 pronargdefaults
 		NewIntDatum(int64(catalog.TypeNameToOID(r.ReturnType.Name))), // 19 prorettype
 		NewBytesDatum(pgProcOidVectorBytes(argOIDs)),                 // 20 proargtypes
-		NewStringDatum(""),      // 21 proallargtypes (OUT-arg metadata: follow-up)
-		NewStringDatum(""),      // 22 proargmodes (follow-up with 21)
-		argNames,                // 23 proargnames
-		argMetaDatum(r),         // 24 proargdefaults (see pgProcArgMetaJSON)
-		NewStringDatum(""),      // 25 protrftypes
-		NewStringDatum(r.Body),  // 26 prosrc
-		NewStringDatum(""),      // 27 probin
-		NewStringDatum(""),      // 28 prosqlbody
-		proconfig,               // 29 proconfig
-		NewStringDatum(""),      // 30 proacl
+		NullDatum,              // 21 proallargtypes (OUT-arg metadata: follow-up)
+		NullDatum,              // 22 proargmodes (follow-up with 21)
+		argNames,               // 23 proargnames
+		argMetaDatum(r),        // 24 proargdefaults (see pgProcArgMetaJSON)
+		NullDatum,              // 25 protrftypes
+		NewStringDatum(r.Body), // 26 prosrc
+		NullDatum,              // 27 probin
+		NullDatum,              // 28 prosqlbody (NULL ⇒ PG executes prosrc)
+		proconfig,              // 29 proconfig
+		NullDatum,              // 30 proacl (NULL ⇒ owner + PUBLIC EXECUTE default)
 	}
 }
 
@@ -274,6 +282,9 @@ func syncRoutineToCatalogHeap(ctx *Context, r *catalog.Routine) error {
 			return fmt.Errorf("pg_proc update: %w", err)
 		}
 		rs.SetHeapTID(r.OID, catalog.SchemaHeapTID{Block: uint32(newTID.Block), Offset: newTID.Offset})
+		if err := insertPgProcIndexEntries(ctx, r, newTID); err != nil {
+			return err
+		}
 		return mirrorProcCatalogFiles(ctx)
 	}
 	tid, err := writeHeapRowCanonical(ctx, pgProcRel(ctx), PGProcColumnsPG18(), row)
@@ -281,7 +292,29 @@ func syncRoutineToCatalogHeap(ctx *Context, r *catalog.Routine) error {
 		return fmt.Errorf("pg_proc: %w", err)
 	}
 	rs.SetHeapTID(r.OID, catalog.SchemaHeapTID{Block: uint32(tid.Block), Offset: tid.Offset})
+	if err := insertPgProcIndexEntries(ctx, r, tid); err != nil {
+		return err
+	}
 	return mirrorProcCatalogFiles(ctx)
+}
+
+// insertPgProcIndexEntries adds the (oid) and (proname, proargtypes,
+// pronamespace) entries for a freshly written pg_proc heap row version.
+// Key derivation mirrors buildPGProcRow so index keys and heap columns
+// always agree.
+func insertPgProcIndexEntries(ctx *Context, r *catalog.Routine, tid storage.ItemPointer) error {
+	if err := insertPgProcOidIndexEntry(ctx, r.OID, tid); err != nil {
+		return fmt.Errorf("pg_proc_oid_index: %w", err)
+	}
+	argOIDs := make([]uint32, len(r.ArgTypes))
+	for i, t := range r.ArgTypes {
+		argOIDs[i] = catalog.TypeNameToOID(t.Name)
+	}
+	nsp := namespaceOIDForSchema(ctx.Catalog, r.Schema)
+	if err := insertPgProcPronameArgsNspIndexEntry(ctx, r.Name, argOIDs, nsp, tid); err != nil {
+		return fmt.Errorf("pg_proc_proname_args_nsp_index: %w", err)
+	}
+	return nil
 }
 
 // updateRoutineCatalogHeapRow journals every ALTER FUNCTION variant

@@ -267,6 +267,19 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
     TestPort_SequenceCatalogRowSurvivesRestart (post-restart ALTER updates in place). Gate: all units,
     initdb 227s, regress 298s, isolation, durability ×4, e2e failover — green.
   - [ ] **B1.3b** (optional / ledger) `XLOG_SEQ_LOG` flip for the sequence-relation counter page.
+- [x] **B2-prep** descent-aware catalog-btree insert — LANDED. The multi-level machinery
+  (readSysBtreeMeta/descendSysBtreeToLeaf/insertIntoExistingLeaf/rebuildSysBtreeWithNewEntry,
+  M0106-0010 batched-41) already existed; the real gaps were (1) `keyMetaForSysBtree` registration —
+  2684/2685 were MISSING too (latent B1.1 split-path hole), now registered alongside 2690/2691 —
+  and (2) variable-length IndexTuple support (2691's proargtypes oidvector): `btreeIndexKeyMeta.variable`
+  + variable-tolerant collect/split/rebuild + `buildBulkSysBtreeLayoutVariable` (executor twin of
+  initdb's pgBuildBtreeBulkLoadVariable). pg_proc DDL now maintains BOTH indexes at every heap write
+  (fresh entries at the new TID on updates, PG-style; old entries die with their heap versions);
+  mirror set += 2690/2691. Fixed latent B1.2 hazard the new e2e gate would have exposed:
+  buildPGProcRow stuffed NON-NULL empty strings into prosqlbody/proallargtypes/proargmodes/
+  protrftypes/probin/proconfig/proacl — PG branches on attisnull (stringToNode("") on every SQL
+  function call); now genuinely NULL (pg_class builder convention). e2e failover extended: goopg
+  CREATE FUNCTION over WAL → promoted PG resolves by name (2691) AND executes it (2690 + prosrc).
 - [ ] **B2** type/operator families (pg_type/enum/range, pg_operator, pg_opclass/opfamily/amop/amproc,
   pg_cast, pg_conversion, pg_collation, pg_aggregate).
 - [ ] **B3** extension/config (pg_ts_*, pg_transform, pg_event_trigger, pg_publication*/subscription*,

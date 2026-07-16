@@ -47,8 +47,12 @@ const (
 // btreeIndexKeyMeta describes the on-disk key layout of a system btree
 // covered by the runtime split path.
 type btreeIndexKeyMeta struct {
-	tupleSize int    // total IndexTuple size in bytes (e.g. 16 or 80)
+	tupleSize int    // total IndexTuple size in bytes (e.g. 16 or 80); 0 when variable
 	nkeyatts  uint16 // number of key attributes (1 for oid, 2 for name+oid or oid+int2)
+	variable  bool   // true when tuples are variable-length (varlena key column,
+	// e.g. pg_proc_proname_args_nsp_index's oidvector) — the rebuild
+	// fallback then uses the variable-size bulk layout instead of the
+	// fixed-tupleSize one
 }
 
 // keyMetaForSysBtree returns the on-disk layout of the supported runtime-
@@ -62,6 +66,17 @@ func keyMetaForSysBtree(indexOID uint32) (btreeIndexKeyMeta, bool) {
 		return btreeIndexKeyMeta{tupleSize: 80, nkeyatts: 2}, true
 	case pgAttributeRelidAttnumIndexOID:
 		return btreeIndexKeyMeta{tupleSize: 16, nkeyatts: 2}, true
+	case pgNamespaceNspnameIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 72, nkeyatts: 1}, true
+	case pgNamespaceOidIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 16, nkeyatts: 1}, true
+	// B2-prep: pg_proc's two bootstrap indexes are multi-level (3397
+	// entries) so runtime maintenance rides the descent path; 2691 is the
+	// first variable-length key (proargtypes oidvector).
+	case pgProcOidIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 16, nkeyatts: 1}, true
+	case pgProcPronameArgsNspIndexOID:
+		return btreeIndexKeyMeta{nkeyatts: 3, variable: true}, true
 	default:
 		return btreeIndexKeyMeta{}, false
 	}
@@ -288,7 +303,12 @@ func splitLeafRootAndInsert(
 	if !ok {
 		return fmt.Errorf("split: unsupported system btree OID %d", indexOID)
 	}
-	if len(indexTuple) != meta.tupleSize {
+	if meta.variable {
+		if len(indexTuple) <= sysIndexTupleHoff || len(indexTuple)%8 != 0 {
+			return fmt.Errorf("split: variable tuple size %d invalid for index %d",
+				len(indexTuple), indexOID)
+		}
+	} else if len(indexTuple) != meta.tupleSize {
 		return fmt.Errorf("split: tuple size %d does not match index %d expectation %d",
 			len(indexTuple), indexOID, meta.tupleSize)
 	}
@@ -307,7 +327,11 @@ func splitLeafRootAndInsert(
 		if err != nil {
 			return fmt.Errorf("split: read item %d: %w", i, err)
 		}
-		if len(raw) != meta.tupleSize {
+		if meta.variable {
+			if len(raw) <= sysIndexTupleHoff {
+				return fmt.Errorf("split: existing item %d size=%d too small", i, len(raw))
+			}
+		} else if len(raw) != meta.tupleSize {
 			return fmt.Errorf("split: existing item %d size=%d, want %d", i, len(raw), meta.tupleSize)
 		}
 		buf := make([]byte, len(raw))
