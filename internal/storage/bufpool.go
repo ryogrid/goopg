@@ -660,8 +660,10 @@ type WALFlusher interface {
 // InvalidBlockNumber and sibPage is nil.
 type LogBtreeSplitFunc func(rel RelFileNode, leftBlk, rightBlk BlockNumber, leftPage, rightPage Page, sibBlk BlockNumber, sibPage Page) (LSN, error)
 
-// LogHeapInsertFunc emits one logical heap-insert redo record.
-type LogHeapInsertFunc func(rel RelFileNode, blk BlockNumber, lineSlot uint16, tuple []byte) (LSN, error)
+// LogHeapInsertFunc emits one logical heap-insert redo record. initPage marks
+// the first tuple on a freshly-initialised page (XLOG_HEAP_INIT_PAGE) so a
+// heterogeneous PG standby PageInit's the page before applying (A9).
+type LogHeapInsertFunc func(rel RelFileNode, blk BlockNumber, lineSlot uint16, tuple []byte, initPage bool) (LSN, error)
 
 // LogBtreeInsertFunc emits one logical B-tree non-split insert redo record.
 type LogBtreeInsertFunc func(rel RelFileNode, blk BlockNumber, item []byte) (LSN, error)

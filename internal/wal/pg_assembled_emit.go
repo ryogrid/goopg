@@ -103,10 +103,19 @@ const xlhInsertContainsNewTuple uint8 = 0x08
 // The owning xid is the tuple's xmin (tuple[0:4]) and is stamped into the
 // XLogRecord header (xl_xid); replay reconstructs the fixed header from it and
 // self-points t_ctid at (blk, lineSlot) — which A2-pre made the primary store
-// too, so stored page == replay. No FPI is attached here; the first-touch
-// full-page image is still emitted as a separate record by
-// MarkDirtyLogicalChange (FPI/logical unification is a later step).
-func EncodeHeapInsertPG(rel storage.RelFileNode, blk storage.BlockNumber, lineSlot uint16, tuple []byte) ([]byte, error) {
+// too, so stored page == replay.
+//
+// initPage marks this as the FIRST tuple on a freshly-initialised page: the info
+// byte gets XLOG_HEAP_INIT_PAGE (0x80) and block 0 is REGBUF_WILL_INIT. This is
+// mandatory for heterogeneous PG-standby replay — PG's heap redo then PageInit's
+// the (possibly not-yet-extended) page before applying the tuple, instead of
+// treating a missing page as a "reference to an invalid page" and PANICking. It
+// matches PG's own first-insert-on-a-new-page behaviour. goopg's own replay
+// masks the opcode with xlogHeapOpMask (0x70), so the 0x80 flag is ignored there
+// and the tuple still applies to the smgr-create-extended page. The redundant
+// trailing first-touch XLOG_FPI (still emitted by MarkDirtyLogicalChange) then
+// harmlessly restores the same post-insert page image.
+func EncodeHeapInsertPG(rel storage.RelFileNode, blk storage.BlockNumber, lineSlot uint16, tuple []byte, initPage bool) ([]byte, error) {
 	if len(tuple) < storage.SizeOfHeapTupleHeaderData {
 		return nil, fmt.Errorf("wal: heap-insert tuple %d bytes < fixed header %d", len(tuple), storage.SizeOfHeapTupleHeaderData)
 	}
@@ -125,12 +134,16 @@ func EncodeHeapInsertPG(rel storage.RelFileNode, blk storage.BlockNumber, lineSl
 	mainData[2] = xlhInsertContainsNewTuple                // flags
 
 	body, err := assembleXLogRecord(mainData, []BlockRef{{
-		ID: 0, Rel: rel, Block: blk, Data: blockData,
+		ID: 0, Rel: rel, Block: blk, Data: blockData, WillInit: initPage,
 	}})
 	if err != nil {
 		return nil, err
 	}
-	return framePGAssembled(RmgrHeap, xlogHeapInsert, xid, body), nil
+	info := xlogHeapInsert
+	if initPage {
+		info |= xlogHeapInit
+	}
+	return framePGAssembled(RmgrHeap, info, xid, body), nil
 }
 
 // sizeOfXLogHeapDeleteData is PG's SizeOfHeapDelete: xmax(4) + offnum(2) +

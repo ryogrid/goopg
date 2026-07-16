@@ -167,7 +167,7 @@ func TestToastChunkInsertsAreIndividuallyWALLogged(t *testing.T) {
 		blk storage.BlockNumber
 	}
 	var inserts []insertRec
-	logHeapInsert := func(rel storage.RelFileNode, blk storage.BlockNumber, lineSlot uint16, tuple []byte) (storage.LSN, error) {
+	logHeapInsert := func(rel storage.RelFileNode, blk storage.BlockNumber, lineSlot uint16, tuple []byte, _ bool) (storage.LSN, error) {
 		inserts = append(inserts, insertRec{rel: rel, blk: blk})
 		return storage.LSN(len(inserts)), nil
 	}

@@ -8259,6 +8259,16 @@ func markHeapInsertDirty(
 		pool.MarkDirty(slot)
 		return nil
 	}
+	// A9: XLOG_HEAP_INIT_PAGE — when this tuple is the FIRST on the page (the
+	// page has exactly one line pointer after the insert), mark the record so a
+	// heterogeneous PG standby PageInit's the (possibly not-yet-extended) page
+	// before applying, instead of PANICking with "reference to an invalid page".
+	// Mirrors PG's own first-insert-on-a-new-page behaviour; harmless for goopg's
+	// own replay (opcode is masked by 0x70).
+	initPage := false
+	if cnt, cerr := storage.PageLinePointerCount(slot.Page()); cerr == nil && cnt == 1 {
+		initPage = true
+	}
 	// MarkDirtyLogicalChange (not MarkDirtyChangeRecord): the logical
 	// HeapInsert record MUST always be emitted so the M0008 logical
 	// decoder sees the per-row change. MarkDirtyChangeRecord would
@@ -8266,7 +8276,7 @@ func markHeapInsertDirty(
 	// of a bare PageImage — fine for redo, fatal for logical
 	// replication. See docs/design/0103-0018-heap-fpi-and-logical-record-coexistence.md.
 	return pool.MarkDirtyLogicalChange(slot, func() (storage.LSN, error) {
-		return logHeap(rel, blk, lineSlot, tupleBytes)
+		return logHeap(rel, blk, lineSlot, tupleBytes, initPage)
 	})
 }
 

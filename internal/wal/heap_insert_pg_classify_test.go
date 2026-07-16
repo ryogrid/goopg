@@ -24,7 +24,7 @@ func TestClassifyPGHeapInsertRoutesByXlXid(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	framed, err := EncodeHeapInsertPG(rel, 5, 1, tuple)
+	framed, err := EncodeHeapInsertPG(rel, 5, 1, tuple, false)
 	if err != nil {
 		t.Fatal(err)
 	}

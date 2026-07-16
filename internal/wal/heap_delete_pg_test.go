@@ -39,7 +39,7 @@ func TestApplyRecordReplaysPGHeapDelete(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	insertFramed, err := EncodeHeapInsertPG(rel, 0, 1, tupleBytes)
+	insertFramed, err := EncodeHeapInsertPG(rel, 0, 1, tupleBytes, false)
 	if err != nil {
 		t.Fatal(err)
 	}

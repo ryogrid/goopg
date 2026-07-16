@@ -24,7 +24,7 @@ func TestApplyRecordReplaysPGHeapHotUpdate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	insertFramed, err := EncodeHeapInsertPG(rel, 0, 1, oldBytes)
+	insertFramed, err := EncodeHeapInsertPG(rel, 0, 1, oldBytes, false)
 	if err != nil {
 		t.Fatal(err)
 	}

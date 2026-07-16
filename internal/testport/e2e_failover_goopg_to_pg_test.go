@@ -29,18 +29,14 @@ func TestE2E_FailoverGoopgToPG(t *testing.T) {
 	if testing.Short() || os.Getenv("GOOPG_SKIP_M0102_E2E") != "" {
 		t.Skip("skipping heterogeneous failover e2e (short mode or GOOPG_SKIP_M0102_E2E set)")
 	}
-	// A9 Phase-A gate finding (2026-07-16): pg_waldump now STRUCTURALLY parses
-	// goopg WAL (TestPort_WALPgWaldumpCompat / TestPGWaldumpParsesEmittedWAL pass),
-	// but a real PG18 standby PANICs during redo: "WAL contains references to
-	// invalid pages" at a Heap/INSERT for a fresh page (page N of a new relation
-	// does not exist). Root cause: goopg emits the first-touch full-page image as
-	// a SEPARATE XLOG_FPI record AFTER the mutation record (MarkDirtyLogicalChange,
-	// bufpool.go), so PG replays the insert against a not-yet-created page. The
-	// PG-faithful fix is FPI<->logical unification (doc 01 §5): carry the
-	// first-touch FPI as block 0 of the mutation record itself so redo restores
-	// the image and skips the incremental. Substantial hot-path work — tracked in
-	// the deferral ledger. Re-enable once the FPI fold lands.
-	t.Skip("A9: real-PG-standby replay blocked on FPI<->logical unification (doc 01 §5) — separate first-touch XLOG_FPI is emitted after the mutation record, so PG hits 'references to invalid pages'. See deferral ledger 2026-07-16.")
+	// A9 Phase-A exit gate (2026-07-16): RE-ENABLED. A real PG18 standby now
+	// fully replays goopg WAL in both modes. The prior "WAL contains references
+	// to invalid pages" PANIC (a Heap/INSERT for a fresh page whose page 0 the
+	// standby had not created) was fixed by emitting XLOG_HEAP_INIT_PAGE +
+	// REGBUF_WILL_INIT on the first insert into an empty page (operators_storage.go
+	// markHeapInsertDirty + wal.EncodeHeapInsertPG) — PG then PageInit's the page
+	// during redo, exactly as it does for its own first-insert-on-a-new-page,
+	// instead of treating the missing page as invalid.
 
 	repo := repoRoot(t)
 	binDir := filepath.Join(repo, "postgres", "local_install", "bin")

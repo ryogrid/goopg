@@ -57,7 +57,7 @@ func TestEncodeHeapFreezePGRoundTripAndReplay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	insFramed, err := EncodeHeapInsertPG(rel, 0, 1, tupBytes)
+	insFramed, err := EncodeHeapInsertPG(rel, 0, 1, tupBytes, false)
 	if err != nil {
 		t.Fatal(err)
 	}

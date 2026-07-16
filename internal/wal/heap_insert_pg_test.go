@@ -38,7 +38,7 @@ func TestEncodeHeapInsertPGRoundTrip(t *testing.T) {
 				t.Fatalf("MarshalBinary: %v", err)
 			}
 
-			framed, err := EncodeHeapInsertPG(rel, blk, offnum, want)
+			framed, err := EncodeHeapInsertPG(rel, blk, offnum, want, false)
 			if err != nil {
 				t.Fatalf("EncodeHeapInsertPG: %v", err)
 			}
