@@ -68,11 +68,6 @@ func lsnToRecPtr(lsn uint64) string {
 }
 
 func TestPGWaldumpParsesEmittedWAL(t *testing.T) {
-	t.Skip("PG-tool WAL compat intentionally removed 2026-07-15 — not a regression. " +
-		"goopg now emits real PG (xl_rmid,xl_info) headers over still-native record " +
-		"bodies (docs/design/wal-native-pg-format/04), so pg_waldump can no longer " +
-		"structurally parse goopg WAL. Re-enable after the native->PG content rewrite. " +
-		"See .ralph/deferral_ledger.md.")
 	waldump := findPGWaldump(t)
 
 	dataDir := t.TempDir()

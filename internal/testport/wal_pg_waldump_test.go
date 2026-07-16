@@ -33,11 +33,6 @@ import (
 // TestPort_WALPgWaldumpCompat verifies that goopg's WAL segments are
 // readable by pg_waldump. M0101-0003.
 func TestPort_WALPgWaldumpCompat(t *testing.T) {
-	t.Skip("PG-tool WAL compat intentionally removed 2026-07-15 — not a regression. " +
-		"goopg now emits real PG (xl_rmid,xl_info) headers over still-native record " +
-		"bodies (docs/design/wal-native-pg-format/04), so pg_waldump can no longer " +
-		"structurally parse goopg WAL. Re-enable after the native->PG content rewrite " +
-		"(docs 01/03). See .ralph/deferral_ledger.md.")
 	waldump := findPGWaldumpBin(t)
 
 	c := newCluster(t, "wal_pg_waldump")

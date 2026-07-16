@@ -29,7 +29,18 @@ func TestE2E_FailoverGoopgToPG(t *testing.T) {
 	if testing.Short() || os.Getenv("GOOPG_SKIP_M0102_E2E") != "" {
 		t.Skip("skipping heterogeneous failover e2e (short mode or GOOPG_SKIP_M0102_E2E set)")
 	}
-	t.Skip("PG-tool WAL compat removed 2026-07-15 (canonical/knob/skip-tag removed; native->PG (rmid,info) dispatch); intentional, not a regression - resumes after native->PG content rewrite. See docs/design/wal-native-pg-format/04 + .ralph/deferral_ledger.md")
+	// A9 Phase-A gate finding (2026-07-16): pg_waldump now STRUCTURALLY parses
+	// goopg WAL (TestPort_WALPgWaldumpCompat / TestPGWaldumpParsesEmittedWAL pass),
+	// but a real PG18 standby PANICs during redo: "WAL contains references to
+	// invalid pages" at a Heap/INSERT for a fresh page (page N of a new relation
+	// does not exist). Root cause: goopg emits the first-touch full-page image as
+	// a SEPARATE XLOG_FPI record AFTER the mutation record (MarkDirtyLogicalChange,
+	// bufpool.go), so PG replays the insert against a not-yet-created page. The
+	// PG-faithful fix is FPI<->logical unification (doc 01 §5): carry the
+	// first-touch FPI as block 0 of the mutation record itself so redo restores
+	// the image and skips the incremental. Substantial hot-path work — tracked in
+	// the deferral ledger. Re-enable once the FPI fold lands.
+	t.Skip("A9: real-PG-standby replay blocked on FPI<->logical unification (doc 01 §5) — separate first-touch XLOG_FPI is emitted after the mutation record, so PG hits 'references to invalid pages'. See deferral ledger 2026-07-16.")
 
 	repo := repoRoot(t)
 	binDir := filepath.Join(repo, "postgres", "local_install", "bin")
