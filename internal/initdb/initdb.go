@@ -1821,6 +1821,7 @@ func bootstrapPostgresDatabase(dataDir string, encodingID int32, locale localeSe
 		2661, // pg_cast_source_target_index (Step 3ac)
 		2662, 2663,
 		2665, // pg_constraint_conrelid_contypid_conname_index (batched-48)
+		2666, // pg_constraint_contypid_index (B2.1b — domain-constraint typcache scans)
 		2667,
 		2668, // pg_conversion_default_index (Step 3ah)
 		2669, // pg_conversion_name_nsp_index (Step 3aj)
@@ -1961,6 +1962,7 @@ func bootstrapPostgresDatabase(dataDir string, encodingID int32, locale localeSe
 		2661, // pg_cast_source_target_index (Step 3ac)
 		2662, 2663,
 		2665, // pg_constraint_conrelid_contypid_conname_index (batched-48)
+		2666, // pg_constraint_contypid_index (B2.1b — domain-constraint typcache scans)
 		2667,
 		2668, // pg_conversion_default_index (Step 3ah)
 		2669, // pg_conversion_name_nsp_index (Step 3aj)
@@ -2054,6 +2056,7 @@ func bootstrapPostgresDatabase(dataDir string, encodingID int32, locale localeSe
 		2661, // pg_cast_source_target_index (Step 3ac)
 		2662, 2663,
 		2665, // pg_constraint_conrelid_contypid_conname_index (batched-48)
+		2666, // pg_constraint_contypid_index (B2.1b — domain-constraint typcache scans)
 		2667,
 		2668, // pg_conversion_default_index (Step 3ah)
 		2669, // pg_conversion_name_nsp_index (Step 3aj)
@@ -4767,6 +4770,10 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		// 3=tgparentid, 4=tgname. Index = btree(tgrelid, tgname).
 		entry(2701, 2620, []int16{2, 4}, []uint32{oidOps, nameOps}, []uint32{0, cCollation}, true, false), // pg_trigger_tgrelid_tgname_index
 		entry(2667, 2606, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                          // pg_constraint_oid_index
+		// B2.1b: PG's domain typcache (GetDomainConstraints) scans this index;
+		// without the pg_index row + file placeholder a standby raises
+		// "could not open relation with OID 2666" on ANY domain-typed cast.
+		entry(2666, 2606, []int16{10}, []uint32{oidOps}, []uint32{0}, false, false), // pg_constraint_contypid_index
 		// M0106-0010 batched-48: pg_constraint_conrelid_contypid_conname_index
 		// (OID 2665, ConstraintRelidTypidNameIndexId). pg_constraint attnums
 		// (pg_constraint.h): 2=conname (name), 9=conrelid (oid),

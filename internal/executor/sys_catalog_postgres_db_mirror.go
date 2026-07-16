@@ -31,6 +31,7 @@ package executor
 // (user-table data file in `base/5/<relfilenode>`) is a follow-up loop.
 
 import (
+	"bytes"
 	"fmt"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -108,8 +109,21 @@ func mirrorCatalogRelToPostgresDB(ctx *Context, relOID uint32) error {
 			dstSlot = s
 		}
 		dstSlot.Lock()
+		// Skip identical blocks: the mirror walks EVERY block of every
+		// mirrored catalog on every DDL, but only the 1-2 pages the DDL
+		// touched actually differ. Copying + force-FPI'ing unchanged pages
+		// (B2.1b standby fix) multiplied WAL by the catalog's block count
+		// per statement and made the regress suite crawl.
+		if bytes.Equal(dstSlot.Page(), pageBytes) {
+			dstSlot.Unlock()
+			ctx.Pool.Unpin(dstSlot)
+			continue
+		}
 		copy(dstSlot.Page(), pageBytes)
-		ctx.Pool.MarkDirty(dstSlot)
+		// MarkDirtyForceFPI (not MarkDirty): the standby reads base/5, and
+		// maybeEmitFPI's once-per-checkpoint suppression would swallow a
+		// second change to the same mirrored page (B2.1b).
+		ctx.Pool.MarkDirtyForceFPI(dstSlot)
 		dstSlot.Unlock()
 		ctx.Pool.Unpin(dstSlot)
 	}

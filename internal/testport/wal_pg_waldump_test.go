@@ -61,6 +61,9 @@ ALTER SCHEMA waldump_s1 RENAME TO waldump_s2;
 CREATE FUNCTION waldump_add(a int, b int) RETURNS int LANGUAGE sql AS 'SELECT a + b';
 CREATE SEQUENCE waldump_seq INCREMENT 3;
 ALTER SEQUENCE waldump_seq MAXVALUE 500;
+CREATE DOMAIN waldump_dom AS text CHECK (VALUE IN ('a', 'b'));
+ALTER DOMAIN waldump_dom SET DEFAULT 'a';
+DROP DOMAIN waldump_dom;
 DROP SCHEMA waldump_s2;
 ` + buildInsertSQL(100) + `
 CHECKPOINT;

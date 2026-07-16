@@ -486,7 +486,7 @@ func rebuildSysBtreeWithNewEntry(ctx *Context, indexOID uint32, rel storage.RelF
 		slot.Lock()
 		src := imageBytes[blk*storage.BlockSize : (blk+1)*storage.BlockSize]
 		copy(slot.Page(), src)
-		ctx.Pool.MarkDirty(slot)
+		ctx.Pool.MarkDirtyForceFPI(slot)
 		slot.Unlock()
 		ctx.Pool.Unpin(slot)
 	}
@@ -538,7 +538,7 @@ func insertIntoExistingLeaf(ctx *Context, indexOID uint32, rel storage.RelFileNo
 		ctx.Pool.Unpin(slot)
 		return err
 	}
-	ctx.Pool.MarkDirty(slot)
+	ctx.Pool.MarkDirtyForceFPI(slot)
 	slot.Unlock()
 	ctx.Pool.Unpin(slot)
 	_ = indexOID // retained for log/error context if needed in the future.

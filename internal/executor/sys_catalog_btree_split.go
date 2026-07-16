@@ -411,10 +411,10 @@ func splitLeafRootAndInsert(
 		return fmt.Errorf("split: write metapage: %w", err)
 	}
 
-	ctx.Pool.MarkDirty(leafSlot)
-	ctx.Pool.MarkDirty(rightSlot)
-	ctx.Pool.MarkDirty(rootSlot)
-	ctx.Pool.MarkDirty(metaSlot)
+	ctx.Pool.MarkDirtyForceFPI(leafSlot)
+	ctx.Pool.MarkDirtyForceFPI(rightSlot)
+	ctx.Pool.MarkDirtyForceFPI(rootSlot)
+	ctx.Pool.MarkDirtyForceFPI(metaSlot)
 
 	metaSlot.Unlock()
 	ctx.Pool.Unpin(metaSlot)

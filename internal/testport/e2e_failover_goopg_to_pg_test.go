@@ -206,6 +206,13 @@ func runFailoverGoopgToPG(t *testing.T, repo, pgBasebackupBin, psqlBin string, m
 		"CREATE TYPE public.b2prep_mood AS ENUM ('sad', 'happy')"); err != nil {
 		t.Fatalf("create enum type on goopg primary: %v", err)
 	}
+	// B2.1b: CREATE DOMAIN now journals as pg_type + pg_constraint heap
+	// inserts (kinds 119/120 retired — the bespoke record FATAL'd the
+	// standby with "resource manager with ID 128 not registered").
+	if err := runSQLSimple(t, primary,
+		"CREATE DOMAIN public.b2prep_dom AS int"); err != nil {
+		t.Fatalf("create domain on goopg primary: %v", err)
+	}
 
 	dsn := fmt.Sprintf("host=%s port=%s user=%s dbname=%s sslmode=disable",
 		"127.0.0.1", mustGoopgPort(primary.ListenAddr()), "postgres", "postgres")
@@ -336,6 +343,12 @@ func runFailoverGoopgToPG(t *testing.T, repo, pgBasebackupBin, psqlBin string, m
 	if got := pgScalar(t, standby,
 		"SELECT 'public.b2prep_mood'::regtype::text"); got != "b2prep_mood" {
 		t.Fatalf("post-failover enum type resolution = %q, want b2prep_mood", got)
+	}
+	// B2.1b: the goopg-created domain must be resolvable AND usable in a
+	// cast on the promoted PG (pg_type heap row + typbasetype resolution).
+	if got := pgScalar(t, standby,
+		"SELECT 42::public.b2prep_dom"); got != "42" {
+		t.Fatalf("post-failover domain cast = %q, want 42", got)
 	}
 }
 

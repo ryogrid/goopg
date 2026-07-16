@@ -300,10 +300,26 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
     streamed WAL hard-kills a real PG standby (`FATAL: resource manager with ID 128 not
     registered`, unrecoverable startup loop) — sequences (65/66), ranges (81/82/117/118), domains
     (119/120) are live landmines for mixed replication until B1.3b/B2.1b/B2.1c land.
-  - [ ] **B2.1b domains** — retire kinds 119/120 + domain_ddl_recovery.go; registry reload from
-    the pg_type heap (JSON metadata for CHECKs/defaults, pg_proc pattern); ALTER DOMAIN becomes
-    a durable non-HOT heap UPDATE (today NOT durable at all); Domain HeapTID plumbing; e2e domain
-    cast assertion (prepared in the B2.1a attempt, blocked on kind 119).
+  - [x] **B2.1b domains** — LANDED. Kinds 119/120 + codecs + dispatch arm + domain_ddl_recovery.go
+    DELETED. NO JSON sidecar needed: the domain reconstructs fully physically — skeleton from its
+    pg_type row (typtypmod→Base.Args via `pgTypeArgsFromTypmod`, the decode twin of pgAttTypmod;
+    typdefaultbin raw SQL → ParseExpr, the pre-existing deviation), CHECKs from NEW narrow
+    pg_constraint heap rows (28-col PG18 builder in sys_pg_constraint.go; contype='c',
+    contypid=domain; conbin=raw expr text; the pg_constraint VIEW stays virtual — pg_class
+    precedent; NO index maintenance, 2664-2667 stay empty → ledgered). InValues (the ONLY thing
+    runtime enforcement reads, expr.go:871) re-derive from conbin's synthesized
+    `VALUE = ANY (ARRAY[...])` text (`domainInValuesFromConbin`). ALTER DOMAIN all 7 arms now
+    durable (were NOT durable at all): pg_type mutations = non-HOT xl_heap_update via the new
+    generic TypeHeapTID cache (catalog.SetTypeHeapTID, seeded by every type-row write AND the
+    reload for ALL user pg_type rows); constraint mutations = pg_constraint INSERT/DELETE.
+    **Bug found by the new test**: RegisterDomainDuringRecovery force-keyed DefaultDBOid(1) while
+    sessions look up under their resolved DB OID (postgres=5) — post-restart CHECK enforcement
+    was silently DISABLED (pre-existing in the WAL-scanner era, never caught because no test
+    asserted post-restart enforcement); reload now keys cat.DBOID(). Known non-goal pinned in the
+    test: goopg never applies domain DEFAULTs at INSERT time (verified pre-restart too — separate
+    pre-existing gap). e2e: CREATE DOMAIN streams as pure heap records; promoted PG casts
+    42::public.b2prep_dom. New TestPort_DomainSurvivesRestart (CHECK enforcement + RENAME +
+    SET DEFAULT across restart); pg_waldump workload += domain create/alter/drop.
   - [ ] **B2.1c ranges** — retire kinds 81/82/117/118 + range_type_ddl_recovery.go; same pattern;
     plus real pg_range heap row + 3542/2228 entries.
   - [ ] **B2.1d enum labels** — pg_enum heap rows + 3502/3503/3534 entries; enum registry reload

@@ -10,10 +10,12 @@ package initdb
 import (
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/executor"
 	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -304,6 +306,193 @@ func runCatalogReloads(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.C
 				warn(d.Name, err)
 			}
 		}
+	}
+	return nil
+}
+
+// pgTypeArgsFromTypmod is the decode twin of executor's pgAttTypmod
+// (pg18_user_catalog_rows.go): reconstruct a base type's argument list from
+// the stored typtypmod so a reloaded domain's Base.Args round-trips
+// (numeric(10,2), varchar(32), bit(8), ...). -1 (or anything non-positive
+// for the VARHDRSZ families) means "no args".
+func pgTypeArgsFromTypmod(baseOID uint32, typmod int64) []int64 {
+	switch baseOID {
+	case 1700: // numeric: ((precision<<16) | scale) + VARHDRSZ
+		if typmod < 4 {
+			return nil
+		}
+		raw := typmod - 4
+		precision := (raw >> 16) & 0xffff
+		scale := raw & 0xffff
+		if scale != 0 {
+			return []int64{precision, scale}
+		}
+		return []int64{precision}
+	case 1042, 1043: // char(n) / varchar(n): n + VARHDRSZ
+		if typmod < 4 {
+			return nil
+		}
+		return []int64{typmod - 4}
+	case 1560, 1562: // bit(n) / varbit(n): raw length
+		if typmod <= 0 {
+			return nil
+		}
+		return []int64{typmod}
+	}
+	return nil
+}
+
+// domainInValuesFromConbin re-derives a DomainCheck's InValues fast-path
+// list from the synthesized ScalarArrayOpExpr text goopg stores in conbin —
+// `VALUE = ANY (ARRAY['a'::text, 'b'::text])` and the varchar variant
+// `(VALUE)::text = ANY ((ARRAY[...])::text[])` (see
+// domainInValuesCheckExpr, operators_ddl.go). Returns nil for any other
+// CHECK shape (general expressions carry no membership list). Runtime
+// enforcement reads ONLY InValues (expr.go:871), so this restoration is
+// load-bearing, not cosmetic.
+func domainInValuesFromConbin(conbin string) []string {
+	start := strings.Index(conbin, "ARRAY[")
+	if start < 0 || !strings.Contains(conbin, "= ANY") {
+		return nil
+	}
+	rest := conbin[start+len("ARRAY["):]
+	end := strings.IndexByte(rest, ']')
+	if end < 0 {
+		return nil
+	}
+	var out []string
+	for _, part := range strings.Split(rest[:end], ",") {
+		v := strings.TrimSpace(part)
+		// Strip a trailing ::type cast (everything from the first "::").
+		if i := strings.Index(v, "::"); i >= 0 {
+			v = v[:i]
+		}
+		v = strings.TrimSuffix(strings.TrimPrefix(v, "("), ")")
+		// Unquote 'literal' (single quotes; embedded '' unescapes).
+		if len(v) >= 2 && v[0] == '\'' && v[len(v)-1] == '\'' {
+			v = strings.ReplaceAll(v[1:len(v)-1], "''", "'")
+		}
+		if v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// reloadUserDomainsFromHeap is B2.1b's domain reload — the generic heap-scan
+// replacement for the retired replayDomainDDLRecords scanner (RecordKinds
+// 119/120). The domain skeleton comes from its pg_type row (typtype='d',
+// oid >= FirstUserOID); its CHECK constraints come from the pg_constraint
+// heap rows keyed by contypid. Every user pg_type row's TID (domains AND
+// their array peers — also enum/range/composite rows) is seeded into the
+// TypeHeapTID cache so ALTER-driven non-HOT updates find the live version.
+func reloadUserDomainsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+	typeCols := executor.PGTypeColumnsPG18()
+	type typeRow struct {
+		decoded executor.Row
+		tid     storage.ItemPointer
+	}
+	rel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: catalog.TypeRelationId, Fork: storage.MainFork}
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_type",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			decoded := make(executor.Row, len(typeCols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, typeCols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			if uint32(decoded[0].Int) < catalog.FirstUserOID {
+				return nil, false, errSkipBuiltinRow
+			}
+			return typeRow{decoded: decoded, tid: tid}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+
+	// Constraint rows grouped by contypid (col 9), decoded up front so each
+	// domain picks up its CHECKs in one pass.
+	conCols := executor.PGConstraintColumnsPG18()
+	type conRow struct {
+		oid   uint32
+		typid uint32
+		name  string
+		expr  string
+	}
+	conRel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 2606, Fork: storage.MainFork}
+	conRaw, err := scanCatalogHeapRows(mgr, conRel, clog, "pg_constraint",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			decoded := make(executor.Row, len(conCols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, conCols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			typid := uint32(decoded[9].Int)
+			if typid < catalog.FirstUserOID {
+				return nil, false, errSkipBuiltinRow
+			}
+			return conRow{
+				oid:   uint32(decoded[0].Int),
+				typid: typid,
+				name:  decoded[1].StringValue(),
+				expr:  decoded[27].StringValue(),
+			}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+	checksByDomain := make(map[uint32][]catalog.DomainCheck)
+	for _, raw := range conRaw {
+		c := raw.(conRow)
+		checksByDomain[c.typid] = append(checksByDomain[c.typid], catalog.DomainCheck{
+			Name:     c.name,
+			Expr:     c.expr,
+			OID:      c.oid,
+			InValues: domainInValuesFromConbin(c.expr),
+		})
+	}
+
+	for _, raw := range rows {
+		tr := raw.(typeRow)
+		d := tr.decoded
+		oid := uint32(d[0].Int)
+		// Seed the TID cache for EVERY user pg_type row (domains, arrays,
+		// enums, ranges, composites) — ALTER updates need the live TID.
+		cat.SetTypeHeapTID(oid, catalog.SchemaHeapTID{Block: uint32(tr.tid.Block), Offset: tr.tid.Offset})
+		if d[6].StringValue() != "d" { // typtype
+			continue
+		}
+		baseOID := uint32(d[25].Int) // typbasetype
+		baseName := "text"           // TypeNameToOID's own fallback
+		if e, ok := pgTypeCanonical(baseOID); ok {
+			baseName = e.Name
+		}
+		dom := &catalog.Domain{
+			Name: d[1].StringValue(),
+			OID:  oid,
+			// Key under the scanned DB's OID — the OID a live session
+			// resolves for LookupDomain (see RegisterDomainDuringRecovery).
+			DBOid:    cat.DBOID(),
+			ArrayOID: uint32(d[14].Int), // typarray
+			Base: catalog.Type{
+				Name: baseName,
+				Args: pgTypeArgsFromTypmod(baseOID, d[26].Int), // typtypmod
+			},
+			BaseOID: baseOID,
+			// BaseIsEnum stays false: the enum registry is not yet
+			// heap-durable (B2.1d), so an enum-based domain's base is
+			// already gone post-restart — matches prior behavior.
+			NotNull: d[24].BoolValue(), // typnotnull
+			Owner:   uint32(d[3].Int),  // typowner
+			Checks:  checksByDomain[oid],
+		}
+		if bin := d[29].StringValue(); bin != "" { // typdefaultbin
+			if expr, perr := parser.ParseExpr(bin); perr == nil {
+				dom.Default = expr
+			}
+			// A deparse/reparse gap degrades to no DEFAULT rather than
+			// failing startup (ported from replayDomainDDLRecords).
+		}
+		cat.RegisterDomainDuringRecovery(dom)
 	}
 	return nil
 }

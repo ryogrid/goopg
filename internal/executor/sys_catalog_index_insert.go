@@ -459,7 +459,7 @@ func allocateEmptySysBtreeLeafRoot(ctx *Context, indexOID uint32, rel storage.Re
 		return fmt.Errorf("build empty leaf-root: %w", err)
 	}
 	copy(leafSlot.Page(), emptyLeaf)
-	ctx.Pool.MarkDirty(leafSlot)
+	ctx.Pool.MarkDirtyForceFPI(leafSlot)
 	leafSlot.Unlock()
 	ctx.Pool.Unpin(leafSlot)
 
@@ -468,7 +468,7 @@ func allocateEmptySysBtreeLeafRoot(ctx *Context, indexOID uint32, rel storage.Re
 		ctx.Pool.Unpin(metaSlot)
 		return fmt.Errorf("write metapage: %w", err)
 	}
-	ctx.Pool.MarkDirty(metaSlot)
+	ctx.Pool.MarkDirtyForceFPI(metaSlot)
 	metaSlot.Unlock()
 	ctx.Pool.Unpin(metaSlot)
 	_ = indexOID
@@ -532,7 +532,7 @@ func insertIntoSingleLeafRoot(ctx *Context, indexOID uint32, rel storage.RelFile
 		return fmt.Errorf("insert sys btree %d slot %d: %w", indexOID, insertSlot, err)
 	}
 
-	ctx.Pool.MarkDirty(slot)
+	ctx.Pool.MarkDirtyForceFPI(slot)
 
 	slot.Unlock()
 	ctx.Pool.Unpin(slot)

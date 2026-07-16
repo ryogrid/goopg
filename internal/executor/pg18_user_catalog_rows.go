@@ -2015,6 +2015,7 @@ func buildUserPGTypeRowForDomain(d *catalog.Domain) Row {
 		typcategory = 'E'
 	}
 	typmod := pgAttTypmod(baseOID, d.Base.Args)
+	domIn, domOut, domRecv, domSend := pgTypeIOProcsForOID(baseOID)
 	typdefaultbin := NullDatum
 	if bin := d.DefaultBin(); bin != "" {
 		typdefaultbin = NewStringDatum(bin)
@@ -2035,10 +2036,10 @@ func buildUserPGTypeRowForDomain(d *catalog.Domain) Row {
 		NewIntDatum(0),                                 // typsubscript
 		NewIntDatum(0),                                 // typelem
 		NewIntDatum(int64(d.ArrayOID)),                 // typarray (auto-generated `_name` array type, slice 251)
-		NewIntDatum(0),                                 // typinput
-		NewIntDatum(0),                                 // typoutput
-		NewIntDatum(0),                                 // typreceive
-		NewIntDatum(0),                                 // typsend
+		NewIntDatum(domIn),                             // typinput (base type's — DefineDomain copies them; B2.1b)
+		NewIntDatum(domOut),                            // typoutput (PG's getTypeOutputInfo reads the DOMAIN row directly)
+		NewIntDatum(domRecv),                           // typreceive
+		NewIntDatum(domSend),                           // typsend
 		NewIntDatum(0),                                 // typmodin
 		NewIntDatum(0),                                 // typmodout
 		NewIntDatum(0),                                 // typanalyze

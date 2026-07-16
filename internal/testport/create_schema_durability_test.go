@@ -227,3 +227,82 @@ func TestPort_SequenceCatalogRowSurvivesRestart(t *testing.T) {
 		t.Fatalf("post-alter seqincrement = %q, want 5", got)
 	}
 }
+
+// TestPort_DomainSurvivesRestart pins B2.1b's domain heap journaling:
+// CREATE DOMAIN (with CHECK + DEFAULT + NOT NULL) reloads from its pg_type +
+// pg_constraint heap rows — replacing the retired kind-119/120 WAL scanner —
+// and ALTER DOMAIN mutations (previously NOT durable at all) survive via
+// non-HOT pg_type heap updates.
+func TestPort_DomainSurvivesRestart(t *testing.T) {
+	c, err := cluster.New("domain-durability", cluster.Options{
+		RepoRoot:     repoRoot(t),
+		DataDir:      filepath.Join(t.TempDir(), "data"),
+		StartupWait:  20 * time.Second,
+		ShutdownWait: 20 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+
+	if err := runSQLSimple(t, c,
+		"CREATE DOMAIN b21_color AS text CHECK (VALUE IN ('red', 'green', 'blue'))"); err != nil {
+		t.Fatalf("CREATE DOMAIN: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE DOMAIN b21_old AS int"); err != nil {
+		t.Fatalf("CREATE DOMAIN b21_old: %v", err)
+	}
+	// ALTER durability (all-new in B2.1b — these previously vanished on restart).
+	if err := runSQLSimple(t, c, "ALTER DOMAIN b21_old RENAME TO b21_renamed"); err != nil {
+		t.Fatalf("ALTER DOMAIN RENAME: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER DOMAIN b21_renamed SET DEFAULT 7"); err != nil {
+		t.Fatalf("ALTER DOMAIN SET DEFAULT: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE DOMAIN b21_gone AS int"); err != nil {
+		t.Fatalf("CREATE DOMAIN b21_gone: %v", err)
+	}
+	if err := runSQLSimple(t, c, "DROP DOMAIN b21_gone"); err != nil {
+		t.Fatalf("DROP DOMAIN: %v", err)
+	}
+	// Sanity: the CHECK must enforce BEFORE the restart, or the post-restart
+	// assertion below tests nothing.
+	if err := runSQLSimple(t, c, "SELECT 'mauve'::b21_color"); err == nil {
+		t.Fatal("pre-restart invalid domain cast succeeded — CHECK not enforced at all")
+	}
+
+	if err := c.Stop(cluster.ShutdownFast); err != nil {
+		t.Fatalf("stop cluster: %v", err)
+	}
+	if err := c.Start(); err != nil {
+		t.Fatalf("restart cluster: %v", err)
+	}
+
+	// CHECK (VALUE IN ...) must still ENFORCE post-restart (InValues are
+	// re-derived from the pg_constraint row's conbin text).
+	if got := queryScalar(t, c, "SELECT 'red'::b21_color"); got != "red" {
+		t.Fatalf("post-restart valid domain cast = %q, want red", got)
+	}
+	if err := runSQLSimple(t, c, "SELECT 'mauve'::b21_color"); err == nil {
+		t.Fatal("post-restart invalid domain cast succeeded — CHECK constraint not reloaded")
+	}
+	// The rename + SET DEFAULT survive: the renamed domain resolves, and the
+	// heap-backed pg_type row carries the default. (INSERT-time application
+	// of domain defaults is a separate, pre-existing goopg gap — verified
+	// absent even without a restart — so the durability probe reads the
+	// catalog row, not an inserted value.)
+	if got := queryScalar(t, c, "SELECT 5::b21_renamed"); got != "5" {
+		t.Fatalf("post-restart renamed domain cast = %q, want 5 (RENAME not durable)", got)
+	}
+	if got := queryScalar(t, c,
+		"SELECT typdefaultbin FROM pg_type WHERE typname = 'b21_renamed'"); got != "7" {
+		t.Fatalf("post-restart typdefaultbin = %q, want 7 (SET DEFAULT not durable)", got)
+	}
+	if got := queryScalar(t, c, "SELECT count(*) FROM pg_type WHERE typname = 'b21_gone'"); got != "0" {
+		t.Fatalf("post-restart dropped domain pg_type count = %q, want 0", got)
+	}
+	if got := queryScalar(t, c, "SELECT count(*) FROM pg_type WHERE typname = 'b21_old'"); got != "0" {
+		t.Fatalf("post-restart old-name pg_type count = %q, want 0 (rename left stale row)", got)
+	}
+}

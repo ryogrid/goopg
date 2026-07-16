@@ -2063,11 +2063,17 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// row: "domains have no restart persistence at all"): restore CREATE/DROP
 	// DOMAIN objects from the WAL. Like range types, domains are keyed by a
 	// plain name string, so order relative to schema replay does not matter.
-	if err := replayDomainDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
-		_ = pool.Close()
-		_ = walWriter.Close()
-		_ = mgr.Close()
-		return nil, fmt.Errorf("goopg: domain DDL replay: %w", err)
+	// B2.1b: domains reload from the pg_type + pg_constraint HEAPS (generic
+	// scan, doc 02a §2) — replaced replayDomainDDLRecords' bespoke WAL scan
+	// (RecordKinds 119/120, retired). Also seeds the TypeHeapTID cache for
+	// every user pg_type row.
+	if cat != nil {
+		if err := reloadUserDomainsFromHeap(mgr, cat, clog); err != nil {
+			_ = pool.Close()
+			_ = walWriter.Close()
+			_ = mgr.Close()
+			return nil, fmt.Errorf("goopg: domain heap reload: %w", err)
+		}
 	}
 
 	// DU-002 restart-persistence follow-up (M0119-0004/M0110-0001,

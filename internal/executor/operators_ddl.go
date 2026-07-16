@@ -12840,9 +12840,19 @@ func writeTypeHeapRowWithIndexes(ctx *Context, row Row) error {
 	if err != nil {
 		return err
 	}
+	return finishTypeHeapRowWrite(ctx, row, tid)
+}
+
+// finishTypeHeapRowWrite records the row's live TID in the catalog cache
+// (B2.1b) and maintains both pg_type indexes for a freshly written row
+// version. Shared by the INSERT funnel and the non-HOT UPDATE path.
+func finishTypeHeapRowWrite(ctx *Context, row Row, tid storage.ItemPointer) error {
 	oid := uint32(row[0].Int)
 	typname := row[1].StringValue()
 	typnamespace := uint32(row[2].Int)
+	if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+		im.SetTypeHeapTID(oid, catalog.SchemaHeapTID{Block: uint32(tid.Block), Offset: tid.Offset})
+	}
 	if err := insertPgTypeOidIndexEntry(ctx, oid, tid); err != nil {
 		return fmt.Errorf("pg_type_oid_index: %w", err)
 	}
@@ -12850,6 +12860,33 @@ func writeTypeHeapRowWithIndexes(ctx *Context, row Row) error {
 		return fmt.Errorf("pg_type_typname_nsp_index: %w", err)
 	}
 	return nil
+}
+
+// updateTypeHeapRowWithIndexes journals an ALTER-driven pg_type row change
+// as a PG-canonical non-HOT heap UPDATE of the row version at the cached
+// TID, inserting fresh index entries at the new TID (B2.1b). Falls back to
+// a plain INSERT when no TID is cached (pre-conversion data dir).
+func updateTypeHeapRowWithIndexes(ctx *Context, row Row) error {
+	oid := uint32(row[0].Int)
+	im, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return writeTypeHeapRowWithIndexes(ctx, row)
+	}
+	tid, ok := im.TypeHeapTID(oid)
+	if !ok {
+		return writeTypeHeapRowWithIndexes(ctx, row)
+	}
+	typeRel := storage.RelFileNode{
+		DBOid:  catalog.DefaultDBOid,
+		RelOid: catalog.TypeRelationId,
+		Fork:   storage.MainFork,
+	}
+	oldTID := storage.ItemPointer{Block: storage.BlockNumber(tid.Block), Offset: tid.Offset}
+	newTID, err := updateHeapRowCanonicalPG(ctx, typeRel, pgTypeColumnsPG18(), oldTID, row)
+	if err != nil {
+		return fmt.Errorf("pg_type update: %w", err)
+	}
+	return finishTypeHeapRowWrite(ctx, row, newTID)
 }
 
 // mirrorTypeCatalogFiles propagates the pg_type heap + both indexes to the
@@ -12993,6 +13030,10 @@ func deleteTypeFromCatalogHeap(ctx *Context, dbOid uint32, typeOID uint32, xmax 
 		// Column 0 of pgTypeColumnsPG18 is oid (4-byte LE uint32) at offset 0.
 		return binary.LittleEndian.Uint32(data[0:4]) == typeOID
 	})
+	// B2.1b: the row version at the cached TID is dead now.
+	if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+		im.DeleteTypeHeapTID(typeOID)
+	}
 }
 
 // catalogHeapSyncAvailable returns true when the M0030-0001 system catalog
@@ -19250,34 +19291,21 @@ func (o *ddlOp) execCreateDomain(s *parser.CreateDomainStmt) error {
 	// domain and a column of the domain type round-trips as its declared type.
 	// DU-002 slice 90.
 	syncDomainTypeToCatalogHeap(o.ctx, d)
-	// M0122-0005 restart-persistence follow-up (deferral ledger 2026-07-06
-	// row: "domains have no restart persistence at all"): snapshot the full
-	// domain definition (base type, NOT NULL, DEFAULT, CHECKs, owner) so a
-	// restarted server rediscovers it, mirroring CREATE TYPE ... AS RANGE.
-	if o.ctx.WAL != nil {
-		checks := make([]wal.DomainCheckPayload, 0, len(d.Checks))
-		for _, c := range d.Checks {
-			checks = append(checks, wal.DomainCheckPayload{
-				OID:      c.OID,
-				Name:     c.Name,
-				Expr:     c.Expr,
-				InValues: c.InValues,
-			})
+	// B2.1b (docs/design/wal-pg-identical-stream/02d §1): each CHECK journals
+	// as a real pg_constraint heap row — the WAL stream carries ordinary
+	// XLOG_HEAP_INSERTs and the startup reload reconstructs the domain from
+	// the pg_type + pg_constraint heaps. This replaced the bespoke
+	// CreateDomain record (kind 119, retired — it FATAL'd any attached real
+	// PG standby with "resource manager with ID 128 not registered").
+	if catalogHeapSyncAvailable(o.ctx) {
+		wrote := false
+		for _, chk := range d.Checks {
+			if writeDomainCheckConstraintRow(o.ctx, d, chk) == nil {
+				wrote = true
+			}
 		}
-		if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateDomain(wal.CreateDomainPayload{
-			Name:       d.Name,
-			OID:        d.OID,
-			ArrayOID:   d.ArrayOID,
-			BaseName:   d.Base.Name,
-			BaseArgs:   d.Base.Args,
-			BaseOID:    d.BaseOID,
-			BaseIsEnum: d.BaseIsEnum,
-			NotNull:    d.NotNull,
-			Owner:      d.Owner,
-			DefaultSQL: catalog.FormatExprForAttrdef(d.Default),
-			Checks:     checks,
-		})); werr != nil {
-			return fmt.Errorf("wal create-domain: %w", werr)
+		if wrote {
+			mirrorConstraintCatalogFiles(o.ctx)
 		}
 	}
 	return nil
@@ -19301,6 +19329,7 @@ func (o *ddlOp) execAlterDomain(s *parser.AlterDomainStmt) error {
 		if err := cat.RenameDomain(s.Name, s.NewName, dbOid); err != nil {
 			return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 		}
+		o.resyncDomainHeapAfterAlter(cat, s.NewName, dbOid)
 		return nil
 	case "owner":
 		ownerOID := uint32(10) // bootstrap superuser, mirrors execAlterSchema/execAlterType's default
@@ -19314,6 +19343,7 @@ func (o *ddlOp) execAlterDomain(s *parser.AlterDomainStmt) error {
 		if !cat.SetDomainOwner(s.Name, ownerOID, dbOid) {
 			return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("type %q does not exist", s.Name)}
 		}
+		o.resyncDomainHeapAfterAlter(cat, s.Name, dbOid)
 		return nil
 	case "renameconstraint":
 		if err := cat.RenameDomainConstraint(s.Name, s.ConstraintName, s.NewConstraintName, dbOid); err != nil {
@@ -19323,6 +19353,9 @@ func (o *ddlOp) execAlterDomain(s *parser.AlterDomainStmt) error {
 			}
 			return &ExecError{Code: code, Pos: s.Pos(), Message: err.Error()}
 		}
+		// B2.1b: re-journal the renamed constraint row (delete + insert —
+		// the OID is stable, only conname changed).
+		o.resyncDomainConstraintRow(cat, s.Name, s.NewConstraintName, dbOid)
 		return nil
 	case "addconstraint":
 		d, found := cat.LookupDomain(s.Name, dbOid)
@@ -19342,21 +19375,52 @@ func (o *ddlOp) execAlterDomain(s *parser.AlterDomainStmt) error {
 			}
 			return &ExecError{Code: code, Pos: s.Pos(), Message: err.Error()}
 		}
+		// B2.1b: journal the new constraint as a pg_constraint heap INSERT.
+		if dd, ok := cat.LookupDomain(s.Name, dbOid); ok && catalogHeapSyncAvailable(o.ctx) && len(dd.Checks) > 0 {
+			chk := dd.Checks[len(dd.Checks)-1]
+			if s.ConstraintName != "" {
+				for _, c := range dd.Checks {
+					if c.Name == s.ConstraintName {
+						chk = c
+						break
+					}
+				}
+			}
+			if writeDomainCheckConstraintRow(o.ctx, dd, chk) == nil {
+				mirrorConstraintCatalogFiles(o.ctx)
+			}
+		}
 		return nil
 	case "dropconstraint":
+		// Capture the constraint's OID before the registry drop (B2.1b).
+		var dropConOID uint32
+		if dd, ok := cat.LookupDomain(s.Name, dbOid); ok {
+			for _, c := range dd.Checks {
+				if c.Name == s.ConstraintName {
+					dropConOID = c.OID
+					break
+				}
+			}
+		}
 		if err := cat.DropDomainConstraint(s.Name, s.ConstraintName, s.IfExists, dbOid); err != nil {
 			return &ExecError{Code: "42704", Pos: s.Pos(), Message: err.Error()} // ERRCODE_UNDEFINED_OBJECT, matches real PG
+		}
+		if dropConOID != 0 && catalogHeapSyncAvailable(o.ctx) && o.ctx.MaterializeWriterXID() == nil {
+			deleteConstraintRowByOID(o.ctx, dropConOID, o.ctx.Tx.XID)
+			mirrorConstraintCatalogFiles(o.ctx)
 		}
 		return nil
 	case "setdefault":
 		if !cat.SetDomainDefault(s.Name, s.DefaultExpr, dbOid) {
 			return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("type %q does not exist", s.Name)}
 		}
+		o.resyncDomainHeapAfterAlter(cat, s.Name, dbOid)
 		return nil
 	case "dropdefault":
 		if !cat.SetDomainDefault(s.Name, nil, dbOid) {
 			return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("type %q does not exist", s.Name)}
 		}
+		o.resyncDomainHeapAfterAlter(cat, s.Name, dbOid)
 		return nil
 	case "setnotnull":
 		// SET NOT NULL — unlike real PG's AlterDomainNotNull, this does not
@@ -19366,14 +19430,64 @@ func (o *ddlOp) execAlterDomain(s *parser.AlterDomainStmt) error {
 		if !cat.SetDomainNotNull(s.Name, true, dbOid) {
 			return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("type %q does not exist", s.Name)}
 		}
+		o.resyncDomainHeapAfterAlter(cat, s.Name, dbOid)
 		return nil
 	case "dropnotnull":
 		if !cat.SetDomainNotNull(s.Name, false, dbOid) {
 			return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("type %q does not exist", s.Name)}
 		}
+		o.resyncDomainHeapAfterAlter(cat, s.Name, dbOid)
 		return nil
 	}
 	return nil
+}
+
+// resyncDomainHeapAfterAlter journals a successful ALTER DOMAIN mutation as
+// PG-shaped catalog heap traffic (B2.1b): non-HOT xl_heap_update of the
+// domain's pg_type row + its array peer via the TID cache. Best-effort like
+// syncDomainTypeToCatalogHeap (a failed sync must not fail the DDL — the
+// registry mutation already succeeded).
+func (o *ddlOp) resyncDomainHeapAfterAlter(cat *catalog.InMemory, name string, dbOid uint32) {
+	if !catalogHeapSyncAvailable(o.ctx) {
+		return
+	}
+	d, ok := cat.LookupDomain(name, dbOid)
+	if !ok {
+		return
+	}
+	if err := updateTypeHeapRowWithIndexes(o.ctx, buildUserPGTypeRowForDomain(d)); err != nil {
+		return
+	}
+	if err := updateTypeHeapRowWithIndexes(o.ctx, buildUserPGTypeRowForDomainArray(d)); err != nil {
+		return
+	}
+	mirrorTypeCatalogFiles(o.ctx)
+}
+
+// resyncDomainConstraintRow re-journals one domain CHECK's pg_constraint row
+// after a rename (delete the old version + insert the new — the constraint
+// OID is stable, only conname changed). B2.1b.
+func (o *ddlOp) resyncDomainConstraintRow(cat *catalog.InMemory, domainName, constraintName string, dbOid uint32) {
+	if !catalogHeapSyncAvailable(o.ctx) {
+		return
+	}
+	d, ok := cat.LookupDomain(domainName, dbOid)
+	if !ok {
+		return
+	}
+	for _, chk := range d.Checks {
+		if chk.Name != constraintName {
+			continue
+		}
+		if o.ctx.MaterializeWriterXID() != nil {
+			return
+		}
+		deleteConstraintRowByOID(o.ctx, chk.OID, o.ctx.Tx.XID)
+		if writeDomainCheckConstraintRow(o.ctx, d, chk) == nil {
+			mirrorConstraintCatalogFiles(o.ctx)
+		}
+		return
+	}
 }
 
 // domainInValuesCheckExpr renders a `CHECK (VALUE IN (...))` domain constraint as
@@ -19718,17 +19832,19 @@ func (o *ddlOp) execDropDomain(s *parser.DropDomainStmt) error {
 				if d.ArrayOID != 0 {
 					deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, d.ArrayOID, o.ctx.Tx.XID)
 				}
-				_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.TypeRelationId)
+				// B2.1b: the domain's pg_constraint rows die with it.
+				for _, chk := range d.Checks {
+					deleteConstraintRowByOID(o.ctx, chk.OID, o.ctx.Tx.XID)
+				}
+				mirrorTypeCatalogFiles(o.ctx)
+				mirrorConstraintCatalogFiles(o.ctx)
 			}
 		}
 		// names = dropped tables (CASCADE) or blocking tables (RESTRICT).
+		// B2.1b: no bespoke WAL record — the heap deletes above ARE the
+		// journal (kind 120 retired).
 		names, err := cat.DropDomain(name.Name, false, s.Cascade, o.ctx.CurrentDatabaseOid)
 		if err == nil {
-			if o.ctx.WAL != nil {
-				if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropDomain(name.Name)); werr != nil {
-					return fmt.Errorf("wal drop-domain: %w", werr)
-				}
-			}
 			for _, tblName := range names {
 				o.ctx.AddNotice(fmt.Sprintf("drop cascades to table %s", tblName))
 			}

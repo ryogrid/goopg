@@ -2355,6 +2355,12 @@ type InMemory struct {
 	// reload scan, refreshed by every ALTER's heap UPDATE, deleted with the
 	// schema. updateHeapRowCanonicalPG needs it to stamp the old version.
 	schemaHeapTIDs map[string]SchemaHeapTID
+	// typeHeapTIDs maps a pg_type row's OID (domain/enum/range/composite +
+	// their array peers) → that row's LIVE pg_type heap TID (B2.1b, same
+	// §3.3 contract as schemaHeapTIDs). Seeded by every
+	// writeTypeHeapRowWithIndexes INSERT and by the startup reload scan,
+	// refreshed by ALTER heap UPDATEs, deleted with the type row.
+	typeHeapTIDs map[uint32]SchemaHeapTID
 
 	// tempNamespaces maps a session's temp-owner token ("s<id>", see
 	// executor.sessionTempOwner) → the OID of that session's temporary
@@ -12167,6 +12173,32 @@ func (c *InMemory) SchemaHeapTID(name string) (SchemaHeapTID, bool) {
 	return tid, ok
 }
 
+// TypeHeapTID returns the live pg_type heap-row TID for the type row with
+// the given OID (B2.1b TID-carrying cache).
+func (c *InMemory) TypeHeapTID(oid uint32) (SchemaHeapTID, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	tid, ok := c.typeHeapTIDs[oid]
+	return tid, ok
+}
+
+// SetTypeHeapTID records/refreshes the live pg_type heap TID for oid.
+func (c *InMemory) SetTypeHeapTID(oid uint32, tid SchemaHeapTID) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.typeHeapTIDs == nil {
+		c.typeHeapTIDs = make(map[uint32]SchemaHeapTID)
+	}
+	c.typeHeapTIDs[oid] = tid
+}
+
+// DeleteTypeHeapTID drops the TID entry (DROP TYPE/DOMAIN).
+func (c *InMemory) DeleteTypeHeapTID(oid uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.typeHeapTIDs, oid)
+}
+
 // SetSchemaHeapTID records/refreshes the live pg_namespace heap TID for name.
 func (c *InMemory) SetSchemaHeapTID(name string, tid SchemaHeapTID) {
 	c.mu.Lock()
@@ -21374,10 +21406,11 @@ func (c *InMemory) RegisterDomain(name string, base Type, notNull bool, dbOid ..
 }
 
 // RegisterDomainDuringRecovery re-registers a domain (including every CHECK
-// constraint) reconstructed from a RecordKindCreateDomain WAL record,
-// preserving its original OID/ArrayOID/CHECK OIDs and advancing nextOID past
-// them so subsequent allocations don't collide. Mirrors
-// RegisterRangeTypeDuringRecovery. M0122-0005 restart-persistence follow-up.
+// constraint) reconstructed at startup from its pg_type + pg_constraint heap
+// rows (B2.1b, reloadUserDomainsFromHeap — formerly from the retired
+// RecordKindCreateDomain WAL record), preserving its original
+// OID/ArrayOID/CHECK OIDs and advancing nextOID past them so subsequent
+// allocations don't collide. Mirrors RegisterRangeTypeDuringRecovery.
 func (c *InMemory) RegisterDomainDuringRecovery(d *Domain) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -21385,12 +21418,16 @@ func (c *InMemory) RegisterDomainDuringRecovery(d *Domain) {
 		c.domains = make(map[string]*Domain)
 	}
 	out := *d
-	// WAL replay does not yet carry a dbOid for domain records (see the
-	// DBOid field's doc comment) — every replayed domain lands under
-	// DefaultDBOid, matching every other not-yet-migrated write path's
-	// restart behavior.
-	out.DBOid = DefaultDBOid
-	c.domains[domainKey(DefaultDBOid, d.Name)] = &out
+	// B2.1b: the heap reload passes the scanned database's OID in d.DBOid
+	// (cat.DBOID(), the same OID a live session resolves for its lookups —
+	// the old forced-DefaultDBOid keying made every reloaded domain
+	// invisible to LookupDomain(name, 5) and silently disabled post-restart
+	// CHECK enforcement). Zero falls back to DefaultDBOid for legacy
+	// callers.
+	if out.DBOid == 0 {
+		out.DBOid = DefaultDBOid
+	}
+	c.domains[domainKey(out.DBOid, d.Name)] = &out
 	c.advanceNextOIDLocked(d.OID)
 	c.advanceNextOIDLocked(d.ArrayOID)
 	for _, chk := range d.Checks {
