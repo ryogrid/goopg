@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | draft — pending agent review |
+| Status | draft — **agent-reviewed 2026-07-16**, two lenses (PG-fidelity vs ./postgres; goopg-integration vs code): 4 blocker + 10 major + 8 minor findings, ALL folded in with inline `(review …)` tags |
 | Date | 2026-07-16 |
 | Scope | The four B0 enablers every catalog conversion depends on: (1) generic per-catalog heap-scan reload, (2) catalog `XLOG_HEAP_UPDATE` emit, (3) per-DB catalog index bootstrap, (4) `pg_filenode.map` writer + `XLOG_RELMAP_UPDATE` |
 | Target | PostgreSQL 18.3 catalog-DML journaling and recovery (`postgres/src/backend/catalog/indexing.c`, `postgres/src/backend/utils/cache/relmapper.c`) |
@@ -35,71 +35,129 @@ New file `internal/initdb/catalog_heap_reload.go`:
 ```go
 // catalogReloadDesc describes how one base catalog's heap is scanned at
 // startup and re-applied to the in-memory registry. One descriptor per
-// converted catalog; loadUserTablesFromHeapForDB becomes the pg_class +
-// pg_attribute pair of descriptors.
+// converted catalog.
 type catalogReloadDesc struct {
     Name   string // "pg_namespace" — log/error labels only
     RelOid uint32 // 2615
     Shared bool   // true → heap lives in global/<oid> (B4); false → base/<dbOid>/<oid>
     Order  int    // explicit total order within a reload pass; see §2.4
+    Fatal  bool   // scan error aborts startup (schema/table precedent) vs warn-and-continue
+                  // (statistics/index precedent, open.go:1479-1488) (review MAJOR-4)
 
-    // Decode converts one visible PG-canonical heap tuple into a typed row.
-    // Header-driven (t_hoff, null bitmap) — never assumes a fixed layout.
-    Decode func(ht storage.HeapTuple) (any, error)
+    // Decode converts one live heap tuple into a typed row. Header-driven
+    // (t_hoff, null bitmap); receives the layout verdict (canonical vs
+    // legacy) the visibility filter already computed (§2.3).
+    Decode func(ht storage.HeapTuple, canonical bool) (any, error)
 
-    // Apply re-registers the row into the in-memory catalog. nsDBOid keeps
-    // the loadUserTablesFromHeapForDB per-DB registration semantics.
-    Apply func(cat *catalog.InMemory, nsDBOid uint32, row any) error
+    // ApplyBatch re-registers all rows of this catalog at once. Batch —
+    // not row-at-a-time — because the exemplar itself needs a join
+    // (pg_class rows + their pg_attribute columns registered together);
+    // single-row catalogs just loop (review MAJOR-4).
+    ApplyBatch func(cat *catalog.InMemory, nsDBOid uint32, rows []any) error
 }
 
 // reloadCatalogHeaps runs every descriptor (sorted by Order) against
 // base/<heapDBOid>/ (or global/ for Shared descs), applying rows into the
-// namespace selected by nsDBOid. It is the single generic replacement for
-// the 26 bespoke *_ddl_recovery.go scanners.
+// namespace selected by nsDBOid. It is the generic replacement for the 26
+// bespoke *_ddl_recovery.go scanners.
 func reloadCatalogHeaps(mgr *storage.Manager, cat *catalog.InMemory,
     clog *mvcc.CLog, heapDBOid, nsDBOid uint32, descs []catalogReloadDesc) error
 ```
 
-### 2.3 The shared scan loop — visibility rules preserved verbatim
+**B0.1 is *behavior-preserving*, not blindly "run everything"** (review MAJOR-4):
+the M0114 catalog-cache fast path (`open.go:1344-1370` — a cache hit skips the
+pg_class/pg_attribute scan entirely and `writeCatalogCache` runs after a
+successful scan) is kept by letting the pg_class/pg_attribute descriptor pair
+sit behind the same cache check; and the pg_class+pg_attribute two-pass join
+(collect class rows → build attrByRelOID → register once per table with
+columns, reloptions re-decode, DBOid stamping) lives inside their shared
+ApplyBatch, exactly as today.
+
+**Write-side / reload-side dbOid routing (review BLOCKER-3 — load-bearing).**
+Today catalog heap WRITES go to `catalog.NamespaceDBOid(ctx.CurrentDatabaseOid)`
+which maps the postgres DB to DefaultDBOid (`operators_ddl.go:13052`), while
+startup RELOAD scans `cat.DBOID()` — which `detectCatalogDBOID`
+(`open.go:2924-2958`) resolves to the **postgres DB's OID** on any real cluster.
+The two are glued by `mirrorTouchedCatalogsToPostgresDB`
+(`sys_catalog_postgres_db_mirror.go:122-143`): a non-WAL-logged block copy of a
+HARDCODED six-relfile set (1259, 1249, 2610, 2662, 2663, 2659). A converted
+catalog whose relfile is not in that set writes rows recovery never reads —
+user objects silently vanish on restart. Until B5 retires the shim, **every
+conversion must add its heap (and index) relfiles to the mirror set** (recipe
+02b step 2 makes this mandatory), and the reload descriptor scans the SAME
+dbOid the mirror populates. The mirror copy is not WAL-logged; the WAL stream
+carries the DefaultDBOid pages, which is what a PG standby replays — the e2e
+gate therefore asserts objects in the DB the WAL wrote, and full stream-parity
+for the postgres-DB copies is explicitly a B5 (mirror-retirement) outcome.
+
+### 2.3 The shared scan loop — the ACTUAL visibility rules (review BLOCKER-4)
 
 The loop factored out of `loadUserTablesFromHeapForDB` is: `mgr.NBlocks` →
-`ReadBlock` → `PageLinePointerCount` → `PageGetHeapTuple` per slot, then a
-tuple-visibility filter before `Decode`. The filter is the part that MUST be
-carried over byte-for-byte (it encodes two subtle recovery facts,
-`open.go:2754-2771`):
+`ReadBlock` → `PageLinePointerCount` → `PageGetHeapTuple` per slot, then the
+liveness filter. What the code actually implements (an earlier draft of this
+section paraphrased it wrongly — the rules below are transcribed from
+`open.go:2724-2771` and are normative):
 
-1. **CLOG-backed xmin/xmax test** — a row is live iff xmin committed and xmax is
-   0 / aborted, consulted against the recovered CLOG (not the in-memory arrays,
-   which are empty at startup).
-2. **Basebackup out-of-range-xmin pass-through + aborted-only filter** — rows
-   whose xmin lies beyond the recovered CLOG horizon (a basebackup shipped from a
-   primary whose clog is ahead) are treated as live unless explicitly aborted.
-   Dropping this rule silently empties catalogs on a standby bootstrap.
+1. **Any non-zero xmax kills the row** (`open.go:2727`) — unconditionally, even
+   if the deleting xact aborted. Correct today because catalog mutations are
+   delete+reinsert (an aborted DDL's reinserted row also dies by rule 2, and
+   the delete's xmax stamping is not rolled back). **B0.2 changes this
+   calculus**: once catalog UPDATEs stamp xmax on superseded versions, the rule
+   keeps working (old versions must die), but an ABORTED update would kill the
+   only live version — the framework therefore upgrades rule 1 to
+   "xmax committed or in the recovered-CLOG unknown window → dead; xmax
+   aborted → live", and a unit test pins the aborted-update case.
+2. **Aborted xmin kills the row** — for ALL layouts.
+3. **Legacy-layout rows additionally require committed xmin**
+   (`open.go:2769`); PG18-canonical rows deliberately do NOT (the
+   basebackup out-of-range-xmin pass-through: a canonical row whose xmin lies
+   beyond the recovered CLOG horizon is live unless explicitly aborted —
+   dropping this empties catalogs on standby bootstrap). The
+   canonical-vs-legacy verdict comes from which decode succeeded, so the
+   filter is decode-entangled, not a pre-Decode gate — the framework runs
+   decode-then-filter exactly like today, and `Decode` receives the layout
+   verdict. Post-conversion catalogs are all-canonical, so their safety against
+   crashed in-progress DDL rests on the xact-recovery pass backfilling aborts
+   into the CLOG before the reload runs — the pass ordering pins it
+   (review MINOR-8).
 
-Both rules live in ONE function used by every descriptor; a unit test pins them
-with a synthetic page (committed/aborted/in-progress/out-of-range xmin rows).
+Today three inline variants of this filter exist (pg_class scan, pg_attribute
+scan, and the clog-committed branch); B0.1 unifies them behind one function
+with the pg_attribute variant's laxer committed-branch behavior preserved via
+the layout flag. A synthetic-page unit test pins every row class
+(committed/aborted/in-progress/out-of-range xmin × zero/committed/aborted
+xmax × canonical/legacy).
 
 ### 2.4 Ordering (risk R5 made explicit)
 
 Today the recovery-pass order is hand-wired by call sequence in
-`internal/initdb/open.go:1233-1547` (schema scanner at :1233 runs before table
-loads at :1364/:1445; sequences/defaults at :1498-1547 run after). The framework
-replaces comment-enforced order with `Order` constants and a table in this doc
-that every descriptor must cite:
+`internal/initdb/open.go` — and it extends well past the table loads: schema
+:1233, tablespace :1245 (must precede table loads — reltablespace resolution),
+foreign-server :1256 before user-mapping :1266, conversions/collations/ts-*
+:1297-1330, aggregates :1337 (writes pg_proc registry rows BEFORE table loads),
+tables :1364, databases :1421 (gates the per-DB loop :1439-1451 — pg_database
+converts only in B4 yet orders every per-DB descriptor run), index-DDL replay
+:1501, sequences :1508-1520, defaults :1526, matviews/views :1537/:1548, roles
+:1559-1574, event triggers :1975, **functions :1992**, domains :2038
+(review MAJOR-5 — an earlier draft's table missed most of these and even
+reversed pg_proc vs pg_sequence relative to today's sequence).
 
-| Order | Catalog | Must precede | Why |
-|---|---|---|---|
-| 10 | pg_namespace | everything below | schema OID → name map needed to register any schema-qualified object |
-| 20 | pg_class | pg_attribute, pg_proc, pg_sequence | relation OIDs referenced everywhere |
-| 30 | pg_attribute | (paired with pg_class) | column defs complete table registration |
-| 40 | pg_proc | pg_aggregate (B2) | functions before objects that reference them |
-| 50 | pg_sequence | — | needs pg_class rows for seqrelid |
-| 90 | (B2+ catalogs slot in between as they convert) | | each conversion adds its row here |
+The framework's rule is therefore: **Order constants are DERIVED from today's
+call sequence, one constant per existing pass**, and a conversion inherits its
+catalog's existing slot — it never invents a new relative position. The full
+table (maintained in `catalog_heap_reload.go` beside the constants, seeded from
+the list above) is the normative order; the doc table below shows only the B1
+slice of it:
+
+| Order (slot) | Pass | Notes |
+|---|---|---|
+| = schema pass (:1233) | pg_namespace descriptor | before tablespace/table/… as today |
+| = table pass (:1364/:1445) | pg_class+pg_attribute descriptor pair | behind the M0114 cache check |
+| = sequence pass (:1508) | pg_sequence descriptor | after index replay :1501, as today |
+| = function pass (:1992) | pg_proc descriptor | LATE — after sequences/views/roles, exactly where replayFunctionDDLRecords runs today; the aggregate pass (:1337) keeps writing its pg_proc registry rows earlier during the B1–B2 window |
 
 During the transition window a converted catalog's descriptor and the remaining
-bespoke scanners coexist; the descriptor list and the scanner call sequence in
-`open.go` are interleaved by the same ordering constants so relative order never
-changes as catalogs migrate.
+bespoke scanners coexist, interleaved by these slot constants.
 
 ### 2.5 Bootstrap-row policy
 
@@ -168,8 +226,12 @@ record only has to bring the page bytes back.
 
 An UPDATE needs the current row's TID. Contract: **every converted catalog's
 write-through cache stores `{row, TID}`**, seeded by the INSERT return value
-(pg_class precedent: `classTID` at `operators_ddl.go:13181`) and refreshed by
-each UPDATE's returned TID; the reload scan re-seeds TIDs at startup. Key-scan
+and refreshed by each UPDATE's returned TID; the reload scan re-seeds TIDs at
+startup. This is NET-NEW machinery (review MAJOR-6): today's `classTID`
+(`operators_ddl.go:13181`) is consumed by the two pg_class index inserts and
+discarded — no registry keeps a TID, which is exactly why today's ALTER paths
+resort to delete-all-rows + full re-sync. R-B0-3's live-version check on
+`updateHeapRowCanonicalPG` is the safety net for a missed refresh. Key-scan
 re-location is rejected as the default (a per-DDL heap scan, and a second code
 path to keep in sync).
 
@@ -183,19 +245,33 @@ replays it.
 ## 4. B0.3 — per-DB catalog index bootstrap at CREATE DATABASE
 
 Today only DefaultDBOid has catalog btree files; `syncTableToCatalogHeap` skips
-index maintenance entirely for other DBs (`operators_ddl.go:13185-13215`), and
-`CREATE DATABASE` creates catalog heaps but no indexes. PG creates a full catalog
-(heaps + indexes) in every database by copying the template.
+index maintenance entirely for other DBs (`operators_ddl.go:13185-13215`). And
+the gap is deeper than indexes (review MAJOR-7): goopg's `CREATE DATABASE`
+(server-side only — `internal/server/database_ddl.go`; the SQL parser has no
+executor arm for it) creates just `base/<oid>/PG_VERSION`
+(`createDatabasePhysicalDirectory`, :698-717); `copyTemplateTables` copies USER
+relation files and re-syncs pg_class/pg_attribute rows, while other catalog
+heap files materialize lazily via smgr O_CREATE — a new DB has **no
+pg_namespace/pg_proc heap and no bootstrap rows at all** (no pg_catalog/public
+rows, no builtin procs). PG creates a full catalog (heaps + indexes) per
+database by copying the template.
 
-Change:
-1. `CREATE DATABASE` (template-clone path in `internal/server/database_ddl.go` /
-   its executor arm) bulk-builds every base-catalog btree present in the template
-   into `base/<newDbOid>/`, reusing `pgBuildBtreeLeafRootPage` /
-   `pgBuildBtreeBulkLoad` (`internal/initdb/btree_index_bootstrap.go:149/:226`)
-   over the just-copied heap contents.
-2. The DefaultDBOid guard in `syncTableToCatalogHeap` is removed; runtime index
+Change (two parts, heaps first):
+1. **Per-DB catalog-heap bootstrap**: `CREATE DATABASE` copies the template's
+   base-catalog HEAP files (initdb-populated bootstrap rows included) into
+   `base/<newDbOid>/` — the PG-shaped file copy — instead of leaving them to
+   lazy O_CREATE.
+2. **Per-DB catalog-index build**: over the copied heaps, build every
+   base-catalog btree. Note the tooling reality (review MAJOR-7):
+   `pgBuildBtreeBulkLoad` (`btree_index_bootstrap.go:226`) handles only fixed
+   16-byte key tuples; name-keyed indexes (2684 nspname, 2663 relname_nsp) have
+   dedicated bootstrappers (`initdb.go:1744`). The clone path reuses whichever
+   initdb bootstrapper built each index — or, simpler and byte-equivalent,
+   copies the template's index FILES along with the heaps (PG's approach);
+   the design picks **file copy** for both heaps and indexes.
+3. The DefaultDBOid guard in `syncTableToCatalogHeap` is removed; runtime index
    inserts route to `base/<ctx.dbOid>/<indexOid>` unconditionally.
-3. The startup loader keeps scanning heaps directly (indexes are for PG-tool
+4. The startup loader keeps scanning heaps directly (indexes are for PG-tool
    parity and future syscache use, not the loader), so index corruption cannot
    break recovery.
 
@@ -217,19 +293,29 @@ RelMapFile = {
 }                        -- 4 + 4 + 64*8 + 4 = 524 bytes, little-endian
 ```
 
-Written atomically (write temp + rename, `write_relmap_file`). The WAL record is
+The struct is written raw — the file is host-endian (LE on all goopg targets;
+PG defines no byte order for it) (review MINOR-3). Written atomically (write
+temp + rename, `write_relmap_file`). The WAL record is
 `xl_relmap_update{ Oid dbid; Oid tsid; int32 nbytes; char data[]; }`
 (`postgres/src/include/utils/relmapper.h:27-33`, opcode `XLOG_RELMAP_UPDATE =
-0x00`, RM_RELMAP_ID) where `data` is the entire new RelMapFile image; redo
-(`relmap_redo`) CRC-checks and rewrites the target file.
+0x00`, RM_RELMAP_ID = **7**, `postgres/src/include/access/rmgrlist.h:35`) where
+`data` is the entire new RelMapFile image; redo (`relmap_redo`) length-checks
+the image and rewrites the file, RECOMPUTING the CRC — the WAL image's CRC is
+never verified at redo in PG (only `read_relmap_file` verifies)
+(review MINOR-2).
 
 ### 5.2 goopg design
 
 - New `internal/wal/relmap.go`: `EncodeRelMapFile(mappings)` (layout above, CRC32C
   via the existing Castagnoli table), `EncodeRelmapUpdatePG(dbid, tsid, image)`
-  via `framePGAssembled(RmgrRelMap, 0x00, xid, body)` (add `RmgrRelMap = 15` to
-  the rmgr table), decoded-replay arm = CRC-verify + rewrite
-  `base/<dbid>/pg_filenode.map` (or `global/` when dbid=0).
+  via `framePGAssembled(RmgrRelMap, 0x00, xid, body)` — `RmgrRelMap Rmgr = 7`
+  (`RM_RELMAP_ID`, `postgres/src/include/access/rmgrlist.h:35`; goopg's
+  `internal/wal/xlog_record.go` already reserves 4..7 for
+  Database/Tablespace/MultiXact/RelMap) (review BLOCKER-1: an earlier draft said
+  15, which is RM_SEQ_ID — a real standby would have misrouted the record to
+  seq_redo). Decoded-replay arm = length-check + rewrite
+  `base/<dbid>/pg_filenode.map` (or `global/` when dbid=0), recomputing the CRC
+  as PG does; goopg may additionally verify the image CRC as a local hardening.
 - `internal/initdb/initdb.go`'s three ad-hoc map writers (:136, :1862, :2060)
   unify onto `EncodeRelMapFile` so bootstrap and WAL paths share one encoder.
 - Runtime consumption: none initially — goopg's relfile names are OID-keyed and
@@ -239,11 +325,22 @@ Written atomically (write temp + rename, `write_relmap_file`). The WAL record is
 ### 5.3 When it is actually needed — and the deferral
 
 Steady-state INSERT/UPDATE/DELETE on a mapped catalog emits **no** relmap record
-(doc 02 §4.2.1); only relfilenode-changing operations (VACUUM FULL / CLUSTER /
-TRUNCATE of a mapped catalog — none of which goopg performs on catalogs today)
-and `CREATE DATABASE` file-copy bootstrap fidelity require it. **No B1 catalog
-depends on it** (pg_namespace and pg_sequence are unmapped; pg_proc is mapped
-but only sees DML). B0.4 is therefore implemented last or deferred with a
+(doc 02 §4.2.1); relmap is emitted only by relfilenode-changing operations
+(VACUUM FULL / CLUSTER / TRUNCATE / REINDEX of a mapped catalog or its indexes —
+`RelationMapUpdateMap` call sites via `swap_relation_files`,
+`postgres/src/backend/commands/cluster.c:1181`, and
+`RelationSetNewRelfilenumber`, `relcache.c:3702` — none of which goopg performs
+on catalogs today) and by **CREATE DATABASE under the default WAL_LOG strategy**
+(`CREATEDB_WAL_LOG`, `postgres/src/backend/commands/dbcommands.c:741`), whose
+`RelationMapCopy` writes the new DB's map WITH a WAL record
+(`write_relmap_file(..., write_wal=true)`, `relmapper.c:312`); the FILE_COPY
+strategy emits none (the map rides the directory copy) (review MAJOR-1 — an
+earlier draft had this inverted). goopg's CREATE DATABASE clone is
+file-copy-shaped, so its current behavior maps to FILE_COPY and needs no relmap
+record; the WAL_LOG-fidelity question becomes due only when a real PG standby
+must construct a goopg-created database from WAL alone. **No B1 catalog depends
+on B0.4** (pg_namespace and pg_sequence are unmapped; pg_proc is mapped but only
+sees DML). B0.4 is therefore implemented last or deferred with a
 deferral-ledger row; this section stays the normative design either way.
 
 ## 6. Write-through cache contract (normative)

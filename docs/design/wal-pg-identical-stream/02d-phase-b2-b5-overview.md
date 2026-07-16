@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | draft — pending agent review |
+| Status | draft — **agent-reviewed 2026-07-16**, two lenses (PG-fidelity vs ./postgres; goopg-integration vs code): 4 blocker + 10 major + 8 minor findings, ALL folded in with inline `(review …)` tags |
 | Date | 2026-07-16 |
 | Scope | Application tables + risk deltas for the remaining conversion groups. Every conversion follows [02b](02b-catalog-conversion-recipe.md) verbatim; this doc only records what differs per group. Deliberately thin — it gains detail as each group starts. |
 | Parent | [02-catalog-heap-journaling.md](02-catalog-heap-journaling.md) §8.3–§8.5, §7 |
@@ -13,7 +13,7 @@
 |---|---|---|---|---|
 | pg_type (non-composite rows) | catalog/pg_type.h | 2703 oid, 2704 typname+nsp | CREATE TYPE/DOMAIN | CreateDomain, CreateRangeType(type half), enum/range creators' type rows |
 | pg_enum | catalog/pg_enum.h | 3502 oid, 3503 typid+label, 3534 typid+sortorder | CREATE TYPE AS ENUM, ALTER TYPE ADD VALUE | CreateEnumType group |
-| pg_range | catalog/pg_range.h | 3542 rngtypid | CREATE TYPE AS RANGE | CreateRangeType(range half) |
+| pg_range | catalog/pg_range.h | 3542 rngtypid (pkey), 2228 rngmultitypid (review MAJOR-2) | CREATE TYPE AS RANGE | CreateRangeType(range half) |
 | pg_operator | catalog/pg_operator.h | 2688 oid, 2689 name+args+nsp | CREATE OPERATOR | CreateOperator |
 | pg_opclass / pg_opfamily / pg_amop / pg_amproc | catalog/pg_opclass.h etc. | per header | CREATE OPERATOR CLASS/FAMILY | CreateOperatorClass, CreateAmOpMember, … |
 | pg_cast | catalog/pg_cast.h | 2660 oid, 2661 src+tgt | CREATE CAST | CreateCast |
@@ -36,6 +36,7 @@ begins with a catalog whose read model needs no swap.
 | pg_event_trigger | low-traffic → true heap-read candidate |
 | pg_publication / pg_publication_rel / pg_publication_namespace / pg_subscription / pg_subscription_rel | pubsub_ddl_recovery.go dies; pg_subscription is SHARED (moves to B4 if global/ is not ready) |
 | pg_statistic_ext (+ _data) | statistics_ddl_recovery.go dies |
+| pg_foreign_data_wrapper / pg_foreign_server / pg_user_mapping | per-database catalogs (no `BKI_SHARED_RELATION` in their headers — review BLOCKER-2: an earlier draft misplaced them in B4's shared set); foreignserver/usermapping recovery files die |
 | pg_constraint / pg_attrdef / pg_depend | **pg_depend arrives here** — unblocks the B1 ledger rows (sequence OWNED BY, schema-owner dependencies). Highest-fanout catalog of the group. |
 
 **Risk delta**: pg_depend rows are written by nearly every DDL — its conversion
@@ -44,8 +45,11 @@ B3 with its own sub-plan.
 
 ## 3. B4 — shared catalogs (`global/`)
 
-pg_database, pg_authid, pg_auth_members, pg_tablespace, pg_foreign_data_wrapper,
-pg_foreign_server, pg_user_mapping (+ pg_subscription if deferred from B3).
+pg_database, pg_authid, pg_auth_members, pg_tablespace, pg_db_role_setting
+(the ALTER DATABASE/ROLE SET records' target — §3b) (+ pg_subscription if
+deferred from B3). The PG18 shared set is defined by `BKI_SHARED_RELATION` in
+the catalog headers; the foreign-data trio is NOT in it and converts in B3 as
+ordinary per-database catalogs (review BLOCKER-2).
 
 - Heap writes target `global/<oid>` (`RelFileLocator{spc=pg_global, db=0}`);
   `catalogReloadDesc.Shared=true` scans `global/` once, not per-DB.
@@ -59,17 +63,38 @@ pg_foreign_server, pg_user_mapping (+ pg_subscription if deferred from B3).
 - The postgres-DB mirror shim (`sys_catalog_postgres_db_mirror.go`) is retired
   once every shared catalog is heap-backed (doc 02 §6).
 
+## 3b. Unassigned bespoke records — group them or B5 never closes (review MAJOR-11)
+
+The B1–B4 tables above do not cover every bespoke catalog record; the following
+are explicitly assigned here so B5's precondition is reachable:
+
+| Records | Catalog | Assigned to |
+|---|---|---|
+| CreateMatView(102) / CreateView(103) | pg_rewrite analog (emitted from syncTableToCatalogHeap itself) | B2 (with pg_class-adjacent work) |
+| CreateAccessMethod(70) / DropAccessMethod(71) | pg_am | B3 |
+| CreateIndex(20) / DropIndex(21) / RenameIndex(94) | pg_index (heap-written already; records kept "as fallback", open.go:1500) | B2 — retire the fallback once pg_index reload is descriptor-based |
+| ColumnDefaults(69) | pg_attrdef | B3 (named explicitly) |
+| ALTER DATABASE/ROLE SET config records | **pg_db_role_setting** (shared; replayed at open.go:1458/1469) | B4 (added to the shared list) |
+| pg_language / pg_description / pg_init_privs rows (doc 02 §5) | | B3 |
+
 ## 4. B5 — retirement
 
-Preconditions: B1–B4 complete, no bespoke catalog record emitted anywhere.
+Preconditions: B1–B4 complete (including §3b), no bespoke catalog record
+emitted anywhere.
 
 1. Delete `RmgrGoopgCatalog = 128` and the `default:` arm's remaining catalog
    kinds from `internal/wal/rmgr_map.go` + `recovery.go`.
-2. Retire `IsGoopgNativeRecord`'s catalog-record uses (the guard exists for
-   scanners; the last scanner died in B4).
+2. Retire `IsGoopgNativeRecord`'s CATALOG-record uses. Note its full blast
+   radius (review MINOR-2): it also gates ApplyRecord's native dispatch
+   (`recovery.go:8972`, via headerMatchesEmittedKind/isGoopgOwnedRmgr) — it
+   survives B5 for as long as ANY native record exists (kind-65/66 counters if
+   B1.3b was ledgered, plus non-catalog natives), and only its catalog arm
+   retires here.
 3. Final gates: grep-zero on every retired symbol; full suite; `pg_waldump`
    whole-stream decode shows ONLY real PG rmgrs; real-PG-standby e2e with a DDL
-   workload covering every group.
+   workload covering every group. The postgres-DB mirror shim retires here,
+   which is also what makes the WAL stream authoritative for every DB's
+   catalog files (02a §2.2).
 
 ## 5. Deferral-ledger index (rows created by Phase B)
 

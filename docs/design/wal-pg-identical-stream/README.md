@@ -140,3 +140,10 @@ cleanly, and a real PG 18 standby replays goopg's WAL.
 - **Data-dir format break**: record bodies and catalog storage change on disk —
   existing data dirs must be re-initialized (fresh clusters), as with the perf-optimize3
   native-only default and doc 04. This is acceptable and documented.
+
+## Review log (Phase-B detail docs 02a–02d)
+
+| date | reviewer lens | outcome |
+|------|---------------|---------|
+| 2026-07-16 | PG fidelity (adversarial, vs `./postgres` sources) | 2 BLOCKER (RelMap rmgr id 7 not 15; foreign-data trio is per-DB, not shared) + 2 MAJOR (CREATE DATABASE WAL_LOG strategy DOES emit relmap; pg_range second index 2228) + 4 MINOR — all folded with inline `(review …)` tags |
+| 2026-07-16 | goopg integration (adversarial, vs code) | 2 BLOCKER (write-dbOid vs reload-dbOid routing through the postgres-DB mirror; the reload visibility rules as actually implemented) + 8 MAJOR (TID cache is net-new; M0114 cache fast path + batch-apply API; full recovery-pass ordering; CREATE DATABASE creates no catalog heaps; pg_proc kind inventory; DropSequence(66)/name-keying; global schema registry vs per-DB heap; unassigned records blocking B5) + 4 MINOR — all folded |

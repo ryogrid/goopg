@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | draft — pending agent review |
+| Status | draft — **agent-reviewed 2026-07-16**, two lenses (PG-fidelity vs ./postgres; goopg-integration vs code): 4 blocker + 10 major + 8 minor findings, ALL folded in with inline `(review …)` tags |
 | Date | 2026-07-16 |
 | Scope | Applies the [02b recipe](02b-catalog-conversion-recipe.md) to the three B1 catalogs. Thin by design: only per-catalog inputs, scope decisions, and risk deltas live here. |
 | Target | PostgreSQL 18.3 headers cited per section |
@@ -19,8 +19,15 @@ Conversion order: **pg_namespace → pg_proc → pg_sequence** (pg_proc rows car
   machinery (the `default_acl` / relacl precedent).
 - **Indexes** (same header): `pg_namespace_nspname_index` **2684**
   (unique, `nspname name_ops`), `pg_namespace_oid_index` **2685** (pkey,
-  `oid oid_ops`). Both bootstrapped in DefaultDBOid today
-  (`relcache_init.go`); non-default DBs need B0.3.
+  `oid oid_ops`). Both bootstrapped in DefaultDBOid today by dedicated
+  bootstrappers in `internal/initdb/initdb.go` (:1744 names 2684/2685
+  explicitly; `relcache_init.go` holds only the nailed descriptor)
+  (review MINOR-1); non-default DBs need B0.3.
+- **TOAST**: `DECLARE_TOAST(pg_namespace, 4163, 4164)` (same header) — an
+  nspacl exceeding the inline varlena limit would need it. Deferred with a
+  ledger row: goopg ACL lists stay far below the threshold; the conversion
+  errors loudly (not silently truncates) if a row would need TOAST
+  (review MINOR-4).
 - **DDLs → journal shape**:
   | DDL | PG shape | goopg emit site today |
   |---|---|---|
@@ -36,11 +43,29 @@ Conversion order: **pg_namespace → pg_proc → pg_sequence** (pg_proc rows car
 - **Read model**: write-through — the existing schema registry
   (`RegisterSchema`/rename/owner mutators) gains a TID map; the `VirtualRows`
   builder re-points at it. Never heap-read (schema resolution is hot).
-- **Reload**: descriptor Order=10 (02a §2.4); user schemas only
-  (`oid >= FirstUserOID`); builtin schemas (pg_catalog, public,
+- **Global registry vs per-DB heap (review MAJOR-9)**: goopg's schema registry
+  is cluster-global (`RegisterSchema(name)` takes no dbOid,
+  `catalog.go:12146`), while pg_namespace is per-database. B1 resolution:
+  writes route through the SAME `NamespaceDBOid` mapping every catalog write
+  uses today (so a schema created on any connection lands in DefaultDBOid's
+  2615 + the postgres-DB mirror, matching where recovery scans); the reload
+  descriptor scans that one heap and applies into the global registry. TRUE
+  per-DB pg_namespace rows (a schema existing in one DB only) become possible
+  only after B0.3's per-DB heaps + a dbOid-aware registry — recorded as a
+  ledger row, NOT a B1 deliverable; goopg's observable schema semantics are
+  unchanged.
+- **Reload**: descriptor at the schema pass's slot (02a §2.4); user schemas
+  only (`oid >= FirstUserOID`); builtin schemas (pg_catalog, public,
   information_schema) stay compiled-in + initdb heap rows.
+- **Gate caveat (review MAJOR-10)**: ALTER SCHEMA RENAME today also emits
+  DropSequence+SequenceState pairs for every sequence owned by the schema
+  (`operators_ddl.go:17886-17892` — sequence records are name-keyed). The
+  pg_waldump shape "RENAME = HEAP_UPDATE + 2 index inserts" is asserted on a
+  schema WITHOUT sequences; schemas with sequences additionally show the
+  kind-65/66 records until B1.3b.
 - **Residuals (ledger)**: pg_depend row for schema→owner dependency (B3);
-  commit-record invalidation content unchanged (Part-A scope).
+  per-DB pg_namespace rows (above); commit-record invalidation content
+  unchanged (Part-A scope).
 - **Blast radius**: ~12–16 files; the risky surface is regress-wide schema
   resolution if the reload mis-registers builtins — bounded by the
   FirstUserOID policy.
@@ -55,19 +80,33 @@ Conversion order: **pg_namespace → pg_proc → pg_sequence** (pg_proc rows car
 - **Indexes**: `pg_proc_oid_index` **2690** (pkey), `pg_proc_proname_args_nsp_index`
   **2691** (unique: proname, proargtypes, pronamespace).
 - **DDLs**: CREATE FUNCTION/PROCEDURE (INSERT; `CREATE OR REPLACE` over an
-  existing function is an UPDATE — PG parity), DROP FUNCTION (DELETE), ALTER
-  FUNCTION rename/owner/set-schema (UPDATEs; rename + set-schema are non-HOT —
-  2691 keys change). Bespoke kinds that die: `RecordKindCreateFunction`(716-area
-  const), `RecordKindDropFunction`, the ALTER-function variants (kind 122 group)
-  + `function_ddl_recovery.go`.
+  existing function is an UPDATE — PG parity; goopg preserves the OID on
+  replace, pinned by `TestRoutinesCreateOrReplacePreservesOID`), DROP FUNCTION
+  (DELETE), ALTER FUNCTION rename/owner/set-schema (UPDATEs; rename +
+  set-schema are non-HOT — 2691 keys change), **ALTER FUNCTION flags
+  (volatility/strictness/security) and SET/RESET config (proconfig)** — both
+  plain UPDATEs (review MAJOR-3: an earlier draft omitted these two). Bespoke
+  kinds that die (actual constants, `internal/wal/recovery.go`):
+  CreateFunction=61, DropFunction=62, AlterFunctionRename=63,
+  AlterFunctionFlags=64, AlterFunctionOwner=121, AlterFunctionSetSchema=122,
+  AlterFunctionConfig=123 + `function_ddl_recovery.go`.
+- **Transition wrinkle (review MAJOR-3)**: CREATE AGGREGATE also writes pg_proc
+  registry rows via the bespoke CreateAggregate group (converts in B2, scanner
+  at `open.go:1337`). During the B1–B2 window the pg_proc HEAP lacks aggregate
+  rows while the registry has them — acceptable (the heap is not yet the only
+  source), but the pg_proc reload must tolerate registry entries it did not
+  create, and the B2 conversion closes the gap.
 - **Mapped-catalog note**: pg_proc is in PG's relmapper nailed set; steady-state
   DML emits no relmap record, so this conversion does NOT need B0.4 (02a §5.3).
 - **Read model**: write-through function registry (name resolution on every
   call — never heap-read). Builtin rows (~3k, initdb-populated) stay
   compiled-in; reload applies user procs only (`oid >= FirstUserOID`).
-- **Risk delta**: prosrc/proacl are varlena-heavy — first conversion likely to
-  hit tuples near TOAST thresholds; assert the longest regress-suite function
-  body stays under the inline limit or add the TOAST note to the ledger.
+- **TOAST**: `DECLARE_TOAST(pg_proc, 2836, 2837)` (pg_proc.h:138) — prosrc is
+  varlena-heavy and IS the first realistic TOAST candidate in Phase B
+  (review MINOR-4).
+- **Risk delta**: assert the longest regress-suite function body stays under
+  the inline limit; if any prosrc would need TOAST, error loudly and add the
+  catalog-TOAST ledger row before proceeding.
 
 ## 3. pg_sequence — catalog row ONLY (normative scope decision)
 
@@ -100,16 +139,28 @@ full-state `RecordKindSequenceState`(65) record emitted from
   requires the RM_SEQ `XLOG_SEQ_LOG` emit + the 1-tuple sequence-relation page
   format (a Part-A-style record flip, staged as **B1.3b** if budget allows,
   else ledgered).
+- **`RecordKindDropSequence`(66) survives too** (review MAJOR-10): goopg's
+  counter records are NAME-keyed (`seqKey(name, dbOid)`; renames emit
+  DropSequence(old)+SequenceState(new) pairs, ≥9 emit sites incl. DROP TABLE
+  cascade and ALTER SCHEMA RENAME, `operators_ddl.go:17886-17892`), so while
+  any name-keyed kind-65 record exists, kind 66 is what stops replay
+  resurrecting dropped/renamed sequences. Both kinds retire together in B1.3b,
+  where the counter moves to the seqrelid-keyed sequence relation page and
+  name-keying disappears. B1's heap DELETE removes the pg_sequence ROW; the
+  kind-66 emit stays beside it.
 - SERIAL/identity ownership: `attidentity` migrates into the pg_attribute heap
   row (column exists in the PG18 25-col layout); `OWNED BY` needs pg_depend →
   **B3**.
 - Kind 65's payload therefore SHRINKS (definitional fields no longer read at
-  recovery) but the constant survives B1; the deletion completes in B1.3b + B3.
+  recovery) but both constants survive B1; deletion completes in B1.3b + B3.
 
-**Risk delta**: recovery must apply pg_sequence rows BEFORE replaying kind-65
-counter records (the descriptor order + the existing sequence recovery pass at
-`open.go:1498+` already run in that order — pin it with a crash test:
-CREATE SEQUENCE; nextval ×N; crash; restart; nextval must not repeat).
+**Risk delta**: recovery must apply pg_sequence rows BEFORE replaying kind-65/66
+counter records (the descriptor slots at the sequence pass, `open.go:1508-1520`,
+after index replay at :1501 — pin it with a crash test: CREATE SEQUENCE;
+nextval ×N; crash; restart; nextval must not repeat). Name-keyed counter
+records bind to heap-reloaded definitions by sequence name at that point in
+the pass order; a rename's Drop+State pair keeps the binding correct across
+renames exactly as today.
 
 ## 4. Gate deltas (on top of 02b §4)
 

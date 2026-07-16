@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | draft — pending agent review |
+| Status | draft — **agent-reviewed 2026-07-16**, two lenses (PG-fidelity vs ./postgres; goopg-integration vs code): 4 blocker + 10 major + 8 minor findings, ALL folded in with inline `(review …)` tags |
 | Date | 2026-07-16 |
 | Scope | The reusable checklist every B1–B4 catalog conversion follows. One catalog per landing; no half-states. |
 | Target | PostgreSQL 18.3 (`postgres/src/include/catalog/pg_<name>.h`, `postgres/src/backend/catalog/indexing.c`) |
@@ -44,6 +44,13 @@ For catalog `pg_<name>`:
    - DROP → heap DELETE (stamp xmax; index entries untouched).
    The in-memory registry mutation stays exactly where it is today and becomes
    the write-through cache (02a §6), extended to carry the row TID.
+   **Mandatory until B5**: add the catalog's heap AND index relfiles to
+   `mirrorTouchedCatalogsToPostgresDB`'s set
+   (`sys_catalog_postgres_db_mirror.go:122-143`) — writes land in
+   DefaultDBOid's files but startup reload scans the postgres DB's copies;
+   a relfile missing from the mirror set means objects that vanish on restart
+   (review BLOCKER-3; pg_index was silently broken this way once already, per
+   the mirror file's own comment).
 3. **Index-insert helpers** — one helper per index in the
    `sys_catalog_index_insert.go` pattern, keyed per the header's `btree(...)`
    spec, routing to `base/<ctx.dbOid>/` (needs B0.3) or `global/`.
