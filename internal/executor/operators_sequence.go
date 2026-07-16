@@ -466,6 +466,11 @@ func WALLogSequenceState(ctx *Context, name string) {
 		// registry). The sequence still works for the life of the process.
 		return
 	}
+	// B1.3 (doc 02c §3): the DEFINITION additionally journals as a real
+	// pg_sequence heap row (INSERT/UPDATE via the fingerprint-gated upsert;
+	// counter-only snapshots skip). The kind-65 record above still carries
+	// the counter + definition for goopg's own replay until B1.3b.
+	syncSequenceDefinitionToCatalogHeap(ctx, name, p)
 }
 
 

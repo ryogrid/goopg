@@ -249,7 +249,16 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
     columns. New TestPort_FunctionSurvivesRestart (create/replace/alter/drop across restart).
     Gate: initdb 230s, server, regress 278s, isolation, durability ×3, pg_waldump + e2e failover —
     green; grep-zero.
-  - [ ] **B1.3 pg_sequence (catalog row only)** — definition moves to heap; counter state stays on kind 65.
+  - [x] **B1.3 pg_sequence (catalog row only)** — LANDED. The DEFINITION journals as a real
+    Form_pg_sequence heap row in base/<db>/2224 + index 5002 entry: CREATE = INSERT, ALTER = non-HOT
+    xl_heap_update (fingerprint-gated inside WALLogSequenceState so counter-only snapshots — setval,
+    TRUNCATE RESTART pre-logs — skip, PG parity), all 9 DropSequence emit sites paired with a heap
+    DELETE. TID cache = seqKey-keyed map with definition fingerprint; startup TID reseed
+    (reloadSequenceHeapTIDs) after the kind-65 replay. Kinds 65/66 SURVIVE per the 02c scope decision
+    (counter + goopg replay source until B1.3b). pg_waldump workload extended with schema/function/
+    sequence DDL (real pg_waldump parses all B1 records). New
+    TestPort_SequenceCatalogRowSurvivesRestart (post-restart ALTER updates in place). Gate: all units,
+    initdb 227s, regress 298s, isolation, durability ×4, e2e failover — green.
   - [ ] **B1.3b** (optional / ledger) `XLOG_SEQ_LOG` flip for the sequence-relation counter page.
 - [ ] **B2** type/operator families (pg_type/enum/range, pg_operator, pg_opclass/opfamily/amop/amproc,
   pg_cast, pg_conversion, pg_collation, pg_aggregate).

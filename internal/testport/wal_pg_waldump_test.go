@@ -51,8 +51,17 @@ func TestPort_WALPgWaldumpCompat(t *testing.T) {
 	libDir := filepath.Join(root, "postgres", "local_install", "lib")
 	psqlEnv := []string{"PGPASSWORD=", "LD_LIBRARY_PATH=" + libDir}
 
+	// B1: schema/function/sequence DDL now journals as real catalog heap
+	// records (pg_namespace/pg_proc/pg_sequence INSERT/UPDATE/DELETE) —
+	// include one of each so real pg_waldump structurally validates them.
 	workload := `
 CREATE TABLE wal_test (id serial primary key, val text);
+CREATE SCHEMA waldump_s1;
+ALTER SCHEMA waldump_s1 RENAME TO waldump_s2;
+CREATE FUNCTION waldump_add(a int, b int) RETURNS int LANGUAGE sql AS 'SELECT a + b';
+CREATE SEQUENCE waldump_seq INCREMENT 3;
+ALTER SEQUENCE waldump_seq MAXVALUE 500;
+DROP SCHEMA waldump_s2;
 ` + buildInsertSQL(100) + `
 CHECKPOINT;
 `

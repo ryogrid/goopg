@@ -184,3 +184,46 @@ func TestPort_FunctionSurvivesRestart(t *testing.T) {
 		t.Fatalf("post-restart b12_add pg_proc count = %q, want 1 (OR REPLACE must not duplicate)", got)
 	}
 }
+
+// TestPort_SequenceCatalogRowSurvivesRestart pins B1.3: CREATE/ALTER
+// SEQUENCE journal real pg_sequence heap rows (definition), and the row
+// updates in place after a restart (TID reseed) instead of duplicating.
+func TestPort_SequenceCatalogRowSurvivesRestart(t *testing.T) {
+	c, err := cluster.New("sequence-catalog-durability", cluster.Options{
+		RepoRoot:     repoRoot(t),
+		DataDir:      filepath.Join(t.TempDir(), "data"),
+		StartupWait:  20 * time.Second,
+		ShutdownWait: 20 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+
+	if err := runSQLSimple(t, c, "CREATE SEQUENCE b13_seq INCREMENT 2 MAXVALUE 1000"); err != nil {
+		t.Fatalf("CREATE SEQUENCE: %v", err)
+	}
+	if got := queryScalar(t, c, "SELECT seqincrement FROM pg_sequence WHERE seqrelid = 'b13_seq'::regclass"); got != "2" {
+		t.Fatalf("pre-restart seqincrement = %q, want 2", got)
+	}
+
+	if err := c.Stop(cluster.ShutdownFast); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	if err := c.Start(); err != nil {
+		t.Fatalf("restart: %v", err)
+	}
+
+	// Post-restart ALTER must UPDATE the reseeded row in place, not insert
+	// a duplicate.
+	if err := runSQLSimple(t, c, "ALTER SEQUENCE b13_seq INCREMENT 5"); err != nil {
+		t.Fatalf("ALTER SEQUENCE: %v", err)
+	}
+	if got := queryScalar(t, c, "SELECT count(*) FROM pg_sequence WHERE seqrelid = 'b13_seq'::regclass"); got != "1" {
+		t.Fatalf("post-alter pg_sequence row count = %q, want 1 (duplicate row = TID reseed broken)", got)
+	}
+	if got := queryScalar(t, c, "SELECT seqincrement FROM pg_sequence WHERE seqrelid = 'b13_seq'::regclass"); got != "5" {
+		t.Fatalf("post-alter seqincrement = %q, want 5", got)
+	}
+}

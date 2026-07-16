@@ -1532,6 +1532,17 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: sequence DDL replay: %w", err)
 	}
+	// B1.3: seed the pg_sequence heap-row TID cache from the heap so a
+	// post-restart ALTER SEQUENCE updates its row in place instead of
+	// inserting a duplicate. Runs AFTER the kind-65 replay above (which is
+	// still the definition/counter source of truth until B1.3b) — the heap
+	// rows are the PG-parity surface.
+	if err := reloadSequenceHeapTIDs(mgr, cat, clog); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: pg_sequence TID reload: %w", err)
+	}
 
 	// Column DEFAULT persistence (root-0020 follow-up): re-parse the DEFAULT
 	// expression snapshots emitted by syncTableToCatalogHeap onto the

@@ -243,6 +243,50 @@ func reloadUserRoutinesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clo
 // errSkipBuiltinRow marks reload rows filtered by policy (decode-level skip).
 var errSkipBuiltinRow = fmt.Errorf("catalog reload: builtin row skipped")
 
+// reloadSequenceHeapTIDs is B1.3's pg_sequence TID seeding: for each live
+// pg_sequence heap row, reverse-map seqrelid to the (already kind-65-
+// restored) sequence and record the row's TID + definition fingerprint so
+// post-restart ALTERs update in place. Rows whose seqrelid no longer
+// resolves (dropped sequence's stale row on a pre-B1.3 dir) are skipped.
+func reloadSequenceHeapTIDs(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+	type seqRow struct {
+		seqrelid uint32
+		tid      storage.ItemPointer
+	}
+	rel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 2224, Fork: storage.MainFork}
+	cols := executor.PGSequenceColumnsPG18()
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_sequence",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			decoded := make(executor.Row, len(cols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, cols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			return seqRow{seqrelid: uint32(decoded[0].Int), tid: tid}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+	for _, raw := range rows {
+		sr := raw.(seqRow)
+		tbl, dbOid, ok := cat.LookupTableByOIDAllDBs(sr.seqrelid)
+		if !ok || tbl == nil || !tbl.IsSequence {
+			continue
+		}
+		name := tbl.Name
+		if tbl.Schema != "" && tbl.Schema != "public" {
+			name = tbl.Schema + "." + tbl.Name
+		}
+		p, ok := executor.SnapshotSequenceState(name, dbOid)
+		if !ok {
+			continue
+		}
+		executor.SeedSequenceHeapTID(name, dbOid, sr.seqrelid,
+			catalog.SchemaHeapTID{Block: uint32(sr.tid.Block), Offset: sr.tid.Offset}, p)
+	}
+	return nil
+}
+
 // runCatalogReloads executes every descriptor in Slot order. Non-Fatal
 // descriptor errors are returned in aggregate form by the caller's logging
 // convention; Fatal ones abort immediately.
