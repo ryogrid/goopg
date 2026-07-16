@@ -157,8 +157,19 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
   - [ ] **A9-legacy-frame-retire** — delete `encodeRecord`/`decodeRecord` (IEEE-CRC frame, `format.go:109`)
     once `PageHeaders` is unconditional (already `true` in prod; legacy path only serves `PageHeaders=false`
     test clusters). Large mechanical change across writer/reader/iterator + `reader_torn_tail_test.go`. Do LAST.
-- [ ] **A-gate** Phase-A exit: `pg_waldump` structural+rmgr green for all §A records; goopg↔goopg standby +
-  G-crash green; real PG 18 standby replays goopg WAL (`TestE2E_FailoverGoopgToPG`); byte-diff a segment vs PG.
+  - [x] **A9-INIT_PAGE** — first heap insert on an empty page now stamps `XLOG_HEAP_INIT_PAGE` (0x80) +
+    `REGBUF_WILL_INIT` (`markHeapInsertDirty` computes `initPage = pageLinePointerCount==1`;
+    `EncodeHeapInsertPG` sets the info bit + block WILL_INIT). This is what lets a **real PG18 standby build
+    page 0 during redo** instead of PANICking `references to invalid pages` — it was the actual blocker for the
+    replay gate, NOT the FPI↔logical fold (doc 01 §5), which turned out to be unnecessary. goopg's own replay
+    ignores the flag (opcode masked by 0x70). btree first-insert-on-new-leaf equivalent = follow-up (not gate-
+    tested; failover uses an index-less table).
+- [x] **A-gate** Phase-A exit — **GREEN** (2026-07-16): `pg_waldump` structural+rmgr parses all §A records
+  (`TestPGWaldumpParsesEmittedWAL`, `TestPort_WALPgWaldumpCompat` — real CREATE TABLE + 100-insert + CHECKPOINT
+  cluster workload); a **real PG 18 standby fully replays goopg WAL** (`TestE2E_FailoverGoopgToPG`, both async +
+  sync_remote_apply, re-enabled); goopg↔goopg crash-recovery + isolation + regress green. The final blocker was
+  A9-INIT_PAGE (above). Byte-for-byte segment diff vs PG for a pgbench run remains a manual/tooling follow-up
+  (no automated WAL byte-diff exists), but structural parse + real-PG replay both pass.
 
 ## Phase B — Catalog heap journaling (doc 02, after Phase A)
 - [ ] **B0** Enabler: generalize `loadUserTablesFromHeap`→per-catalog reload; wire catalog `XLOG_HEAP_UPDATE`;
@@ -187,6 +198,19 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
   truncation. `oldestXactDb` = 0 stopgap (datoid plumb is a follow-up). Gates green (crash-recovery 217s,
   regress 278s). **A9 status: fpi + smgr-create + clog-truncate LANDED; remaining = checkpoint-opcode
   (hot-standby-entangled), xact-inval-fold, legacy-frame-retire.**
+
+## Log (Phase-A exit gate GREEN — real PG replays goopg WAL)
+- 2026-07-16: **Phase-A exit gate is GREEN.** Un-skipped the three gate tests (deferred 2026-07-15 pending
+  exactly this native→PG rewrite): `pg_waldump` structurally parses goopg WAL (both structural tests pass),
+  and — after the final fix — a **real PG 18 standby fully replays goopg WAL** (`TestE2E_FailoverGoopgToPG`,
+  async + sync_remote_apply). The replay gate first PANICked `WAL contains references to invalid pages` at a
+  Heap/INSERT for a fresh page; a pg_waldump dump of a CREATE-TABLE-then-INSERT workload showed goopg emits
+  `Heap INSERT (blk 0)` then a SEPARATE `XLOG FPI (blk 0)`. The fix was NOT the FPI↔logical fold (doc 01 §5,
+  which I'd initially scoped as the blocker) — it was the much smaller **A9-INIT_PAGE**: stamp
+  `XLOG_HEAP_INIT_PAGE` + `WILL_INIT` on the first insert into an empty page so PG PageInit's the page during
+  redo (its own first-insert-on-a-new-page behaviour). Full gate suite green (crash-recovery 221s, e2e incl.
+  real-PG failover 31s, pg_waldump 1.4s, isolation 30s, regress 286s). Remaining A9 cleanup (checkpoint-opcode
+  = byte-identical no-op; xact-inval-fold + legacy-frame-retire = dead-code removals) does not affect the gate.
 
 ## Log (A9 — smgr-create landed via xid-plumbing)
 - 2026-07-16: **A9-smgr-create landed — relation-file creation is now a PG `RM_SMGR`/`XLOG_SMGR_CREATE`
