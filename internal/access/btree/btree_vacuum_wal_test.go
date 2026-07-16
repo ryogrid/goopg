@@ -8,33 +8,32 @@ import (
 )
 
 // captureLogBtreeVacuum is a `LogBtreeVacuumFunc` that records
-// every emission so a test can assert on the kept-items
-// projection without spinning up a real WAL writer.
+// every emission so a test can assert on the post-vacuum page
+// (A8: the record carries the mutated page as an FPI, so the
+// projection is derived from the page) without spinning up a
+// real WAL writer.
 type captureLogBtreeVacuum struct {
-	mu       sync.Mutex
-	emitted  []capturedVacuumEmission
-	nextLSN  uint64
+	mu      sync.Mutex
+	emitted []capturedVacuumEmission
+	nextLSN uint64
 }
 
 type capturedVacuumEmission struct {
-	rel      storage.RelFileNode
-	blk      storage.BlockNumber
-	keptCopy [][]byte
-	flags    uint16
+	rel       storage.RelFileNode
+	blk       storage.BlockNumber
+	keptCount int
+	flags     uint16
 }
 
-func (c *captureLogBtreeVacuum) emit(rel storage.RelFileNode, blk storage.BlockNumber, kept [][]byte, flags uint16) (storage.LSN, error) {
+func (c *captureLogBtreeVacuum) emit(rel storage.RelFileNode, blk storage.BlockNumber, page storage.Page) (storage.LSN, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	dup := make([][]byte, len(kept))
-	for i, it := range kept {
-		dup[i] = append([]byte(nil), it...)
-	}
+	count, _ := storage.PageLinePointerCount(page)
 	c.emitted = append(c.emitted, capturedVacuumEmission{
-		rel:      rel,
-		blk:      blk,
-		keptCopy: dup,
-		flags:    flags,
+		rel:       rel,
+		blk:       blk,
+		keptCount: int(count),
+		flags:     readOpaque(page).Flags,
 	})
 	c.nextLSN += uint64(64)
 	return storage.LSN(c.nextLSN), nil
@@ -110,8 +109,8 @@ func TestVacuumIndexPagesEmitsLogicalRecord(t *testing.T) {
 		// Each emission must list at least one kept item OR
 		// have BTHalfDead/BTDeleted flags (page emptied).
 		const halfDead = uint16(BTDeleted | BTHalfDead)
-		if len(e.keptCopy) == 0 && e.flags&halfDead == 0 {
-			t.Errorf("emission[%d]: empty kept-items list without BTHalfDead/BTDeleted flags (got flags=%#x)", i, e.flags)
+		if e.keptCount == 0 && e.flags&halfDead == 0 {
+			t.Errorf("emission[%d]: empty post-vacuum page without BTHalfDead/BTDeleted flags (got flags=%#x)", i, e.flags)
 		}
 	}
 }
@@ -146,9 +145,8 @@ func TestVacuumIndexPagesEmitsUnlinkRecord(t *testing.T) {
 		unlinkEmissions = append(unlinkEmissions, unlinkCap{rel: rel, req: req})
 		return storage.LSN(1234), nil
 	}
-	logNewRoot := func(rel storage.RelFileNode, rootBlk storage.BlockNumber, level uint32, items [][]byte) (storage.LSN, error) {
-		// Recycle into the unlink emission slot for cleanliness; we
-		// don't need to track new-root events for this test.
+	logNewRoot := func(rel storage.RelFileNode, rootBlk storage.BlockNumber, rootPage storage.Page, metaBlk storage.BlockNumber, metaPage storage.Page) (storage.LSN, error) {
+		// We don't need to track new-root events for this test.
 		return storage.LSN(1234), nil
 	}
 	logMarkHalfDead := func(rel storage.RelFileNode, leafBlk storage.BlockNumber, flagsAfter uint16) (storage.LSN, error) {

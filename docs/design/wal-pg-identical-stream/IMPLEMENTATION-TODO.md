@@ -96,17 +96,28 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
   (non-logical). **Gates:** wal round-trip+replay, executor, vacuum, initdb crash-recovery, e2e ×3, isolation
   + regress. Parity gaps: no conflict horizon; freeze frzflags/infomask=0 (goopg freezes via xmin→FrozenXID,
   not PG's infomask bit — a real-PG-standby freeze representation gap).
-- [~] **A8** btree structural — **Split LANDED**; NewRoot/Vacuum deferred, UnlinkPage stays incremental, MarkHalfDead dormant.
+- [~] **A8** btree structural — **Split + Vacuum + NewRoot LANDED (FPI)**; UnlinkPage stays incremental (by
+  design), MarkHalfDead dormant. All FPI-flippable records now PG-format; only UnlinkPage remains native.
   - [x] **A8-split** — `EncodeBtreeSplitPG` (RM_BTREE/SPLIT_L) carries post-split left/right/sib pages as
     apply-FPIs; reuses A0 FPI encoder + existing RmgrBtree default→`replayDecodedXLogHeapFPIBlocks` (no new
     replay). Emit closure already had the pages (no signature change). Gates: wal round-trip+FPI-replay,
     executor, access/btree, initdb crash-recovery (220s), e2e ×3, isolation (479s) + regress (289s).
-  - [ ] **A8-vacuum / A8-newroot** — FPI-feasible but need the post-op page threaded through their emit
-    closures (currently pass items); NewRoot also needs the metapage FPI. Deferred → deferral ledger.
-  - [ ] **A8-unlinkpage** — keep incremental (pages unmutated at emit; sibling links re-derived at apply for
-    cross-connection concurrency — an FPI snapshot would be stale). Needs PG's real `xl_btree_unlink_page`
-    incremental main-data, not FPI. Deferred → deferral ledger.
-  - **A8-markhalfdead** — dormant (no production emit site). No flip needed.
+  - [x] **A8-vacuum** — `EncodeBtreeVacuumPG` (RM_BTREE/VACUUM 0xC0) carries the post-vacuum leaf as a
+    block-0 apply-FPI. `LogBtreeVacuumFunc` narrowed `(rel, blk, kept, flags)`→`(rel, blk, page)`; both emit
+    sites (`btree_vacuum.go`, `btree.go` dedup-recovery) pass `slot.Page()`. No new replay (RmgrBtree default
+    arm). Native `EncodeBtreeVacuum`/`replayBtreeVacuum` kept as dead fallback.
+  - [x] **A8-newroot** — `EncodeBtreeNewRootPG` (RM_BTREE/NEWROOT 0xA0) carries the new root (block 0,
+    WILL_INIT) and the updated metapage (block 2) as apply-FPIs. `LogBtreeNewRootFunc` `(rel, rootBlk, level,
+    items)`→`(rel, rootBlk, rootPage, metaBlk, metaPage)`; both emit sites now update the metapage in memory
+    under `splitMu` BEFORE emit so its bytes ride the same record (retired `updateRootMetaWithLSN`). Metapage
+    FPI is hole-safe (meta struct at [24:48] sits below pd_lower=48). No new replay.
+  - [ ] **A8-unlinkpage** — DELIBERATELY kept native/incremental (not a deferral of convenience): at emit the
+    sibling pages are unmutated and their btpo_prev/btpo_next are re-derived at apply under a fresh pin to
+    survive a concurrent split on another connection's `*BTree` for the same rel (splitMu is per-instance). An
+    emit-time FPI snapshot would be stale and stomp a racing relink. A PG-format flip must emit PG's real
+    incremental `xl_btree_unlink_page` main-data (link patches), a distinct effort → deferral ledger.
+  - **A8-markhalfdead** — dormant (no production emit site; the half-dead transition rides the vacuum record's
+    opaque flags). No flip needed.
   > Note: btree structural records already replay correctly for goopg↔goopg via their native bodies; the flip
   > is for PG-parseability / real-PG-standby. FPI-based records carry no incremental main-data (PG deviation).
 - [ ] **A9** smgr/clog/standalone-FPI/checkpoint-opcode/xact chunks; retire legacy native frame
@@ -130,6 +141,20 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
   `information_schema` parity vs PG 18.3; crash-after-DDL recovery via generic reload; re-init data dir.
 
 ---
+
+## Log (A8 — vacuum + newroot landed)
+- 2026-07-16: **A8-vacuum + A8-newroot landed — the remaining FPI-flippable btree structural records are now
+  PG-format.** `EncodeBtreeVacuumPG` (RM_BTREE/VACUUM) carries the post-vacuum leaf as a block-0 apply-FPI;
+  `EncodeBtreeNewRootPG` (RM_BTREE/NEWROOT) carries the new root (block 0, WILL_INIT) + updated metapage
+  (block 2) as apply-FPIs. Both reuse the A0 encoder + the RmgrBtree default replay arm — zero new replay
+  code, exactly like split. `LogBtreeVacuumFunc`/`LogBtreeNewRootFunc` were narrowed to pass the mutated
+  page(s); newroot now updates the metapage in memory under `splitMu` before emit (retiring
+  `updateRootMetaWithLSN`), co-holding root+meta race-free (each newroot holds its private root then the
+  shared metapage — no lock cycle). Metapage FPI is hole-safe (meta struct below pd_lower). Test mocks in
+  `btree_vacuum_wal_test.go` + `lpdead_kill_test.go` migrated from kept-items to page/`PageItemKeys`. New
+  `internal/wal/btree_vacuum_newroot_pg_test.go` round-trips both. **UnlinkPage stays native by design**
+  (concurrent-split relink re-derivation); MarkHalfDead dormant. **A8 is functionally complete — only
+  UnlinkPage remains non-PG-format, with a documented reason. Next: A9, then Part B.**
 
 ## Log (A8 partial — split landed)
 - 2026-07-16: **A8-split landed — BtreeSplit flip is LIVE (FPI-based).** `EncodeBtreeSplitPG` emits a PG

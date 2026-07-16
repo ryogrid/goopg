@@ -673,8 +673,10 @@ type LogHeapLockFunc func(rel RelFileNode, blk BlockNumber, lineSlot uint16, xma
 // LogHeapVacuumFunc emits one logical heap-vacuum (page prune) redo record.
 type LogHeapVacuumFunc func(rel RelFileNode, blk BlockNumber, deadSlots []uint16) (LSN, error)
 
-// LogBtreeVacuumFunc emits one logical btree-vacuum redo record.
-type LogBtreeVacuumFunc func(rel RelFileNode, blk BlockNumber, keptItems [][]byte, opaqueFlags uint16) (LSN, error)
+// LogBtreeVacuumFunc emits one btree-vacuum redo record. A8: the record now
+// carries the post-vacuum page as a full-page image (see wal.EncodeBtreeVacuumPG),
+// so the caller passes the mutated page rather than the kept-items projection.
+type LogBtreeVacuumFunc func(rel RelFileNode, blk BlockNumber, page Page) (LSN, error)
 
 // BtreeUnlinkPageRequest collects the 4-page mutation control info.
 type BtreeUnlinkPageRequest struct {
@@ -694,8 +696,11 @@ type BtreeUnlinkPageRequest struct {
 // LogBtreeUnlinkPageFunc emits the M0079-0003 atomic page-deletion redo record.
 type LogBtreeUnlinkPageFunc func(rel RelFileNode, req BtreeUnlinkPageRequest) (LSN, error)
 
-// LogBtreeNewRootFunc emits the M0079-0003 root-replacement record.
-type LogBtreeNewRootFunc func(rel RelFileNode, rootBlk BlockNumber, level uint32, items [][]byte) (LSN, error)
+// LogBtreeNewRootFunc emits the root-replacement record. A8: the record now
+// carries the new root page (backup block 0) and the updated metapage (backup
+// block 2) as full-page images (see wal.EncodeBtreeNewRootPG), so the caller
+// passes both mutated pages rather than the (rootBlk, level, items) projection.
+type LogBtreeNewRootFunc func(rel RelFileNode, rootBlk BlockNumber, rootPage Page, metaBlk BlockNumber, metaPage Page) (LSN, error)
 
 // LogBtreeMarkPageHalfDeadFunc emits the M0079-0003 leaf-only half-dead transition record.
 type LogBtreeMarkPageHalfDeadFunc func(rel RelFileNode, leafBlk BlockNumber, flagsAfter uint16) (LSN, error)

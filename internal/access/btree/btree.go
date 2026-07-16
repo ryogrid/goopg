@@ -1718,26 +1718,6 @@ func (bt *BTree) updateRootMeta(root storage.BlockNumber, level uint32) error {
 	return nil
 }
 
-// updateRootMetaWithLSN is the M0079-0004 variant used after a
-// `RecordKindBtreeNewRoot` emission. The metapage's pd_lsn is
-// stamped to the newroot record's end LSN so per-page replay
-// idempotency remains intact.
-func (bt *BTree) updateRootMetaWithLSN(root storage.BlockNumber, level uint32, lsn storage.LSN) error {
-	slot, err := bt.pinW(MetaBlock)
-	if err != nil {
-		return err
-	}
-	m := parseMeta(slot.Page())
-	m.Root = root
-	m.Level = level
-	m.FastRoot = root
-	m.FastLevel = level
-	writeMeta(slot.Page(), m)
-	bt.pool.MarkDirtyWithLSNLocked(slot, lsn)
-	bt.unpinW(slot)
-	return nil
-}
-
 // pageItems lists every item on a page in slot order.
 // pageItemsWithDead is pageItems WITHOUT the ItemIDDead skip: it returns
 // every item (posting lists expanded) plus a parallel dead flag per
@@ -2367,13 +2347,10 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 			writeOpaque(slot.Page(), opAfter)
 		}
 		if logVac := bt.pool.LogBtreeVacuum(); logVac != nil {
-			keptRaw := make([][]byte, 0, len(allItems))
-			for _, x := range allItems {
-				keptRaw = append(keptRaw, x.marshal())
-			}
-			flagsAfter := readOpaque(slot.Page()).Flags
+			// A8: the record carries the post-vacuum page as a full-page image,
+			// so pass the mutated page rather than the kept-items projection.
 			if err := bt.pool.MarkDirtyChangeRecord(slot, func() (storage.LSN, error) {
-				return logVac(bt.rel, blk, keptRaw, flagsAfter)
+				return logVac(bt.rel, blk, slot.Page())
 			}); err != nil {
 				bt.unpinW(slot)
 				return err
@@ -2755,22 +2732,41 @@ func (bt *BTree) createNewRoot(leftBlk, rightBlk storage.BlockNumber, rightKey [
 	insertItemSorted(rootSlot.Page(), leftItem)
 	insertItemSorted(rootSlot.Page(), rightItem)
 
-	// M0079-0004: emit a single LogBtreeNewRoot record covering
-	// both the new root's content + the metapage update.
-	// Falls back to the legacy per-page FPI path when no hook
-	// is wired (test harnesses without a WAL writer).
+	// M0079-0004 / A8: emit a single PG RM_BTREE new-root record covering
+	// both the new root page (backup block 0) and the updated metapage
+	// (backup block 2) as full-page images. The metapage is mutated in
+	// memory HERE — before the emit — so its post-op bytes ride the same
+	// record; both pages' pd_lsn is then stamped to the record LSN (per-page
+	// replay idempotency). Both slots are held under splitMu (this path's
+	// structural-writer serialisation), so co-locking the metapage with the
+	// new root is race-free. Falls back to the legacy per-page FPI path when
+	// no hook is wired (test harnesses).
 	if emitter := bt.pool.LogBtreeNewRoot(); emitter != nil {
-		items := [][]byte{leftItem.marshal(), rightItem.marshal()}
-		lsn, err := emitter(bt.rel, rootBlk, level, items)
+		metaSlot, err := bt.pinW(MetaBlock)
 		if err != nil {
 			rootSlot.Unlock()
 			bt.pool.Unpin(rootSlot)
 			return err
 		}
+		m := parseMeta(metaSlot.Page())
+		m.Root = rootBlk
+		m.Level = level
+		m.FastRoot = rootBlk
+		m.FastLevel = level
+		writeMeta(metaSlot.Page(), m)
+		lsn, err := emitter(bt.rel, rootBlk, rootSlot.Page(), MetaBlock, metaSlot.Page())
+		if err != nil {
+			bt.unpinW(metaSlot)
+			rootSlot.Unlock()
+			bt.pool.Unpin(rootSlot)
+			return err
+		}
 		bt.pool.MarkDirtyWithLSNLocked(rootSlot, lsn)
+		bt.pool.MarkDirtyWithLSNLocked(metaSlot, lsn)
+		bt.unpinW(metaSlot)
 		rootSlot.Unlock()
 		bt.pool.Unpin(rootSlot)
-		return bt.updateRootMetaWithLSN(rootBlk, level, lsn)
+		return nil
 	}
 	if err := bt.markDirtyWithPageRecord(rootSlot, rootBlk); err != nil {
 		rootSlot.Unlock()

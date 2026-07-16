@@ -27,7 +27,7 @@ func newTestTreeWAL(t *testing.T) (*BTree, *storage.Pool, func()) {
 		LogPageImage: func(_ storage.RelFileNode, _ storage.BlockNumber, _ storage.Page) (storage.LSN, error) {
 			return next(), nil
 		},
-		LogBtreeVacuum: func(_ storage.RelFileNode, _ storage.BlockNumber, _ [][]byte, _ uint16) (storage.LSN, error) {
+		LogBtreeVacuum: func(_ storage.RelFileNode, _ storage.BlockNumber, _ storage.Page) (storage.LSN, error) {
 			return next(), nil
 		},
 		WALFrontier: func() uint64 { return uint64(lsn) },
@@ -184,8 +184,7 @@ func TestNoSpaceRewritePurgesDeadItems(t *testing.T) {
 	defer mgr.Close()
 	var lsn storage.LSN = 100
 	next := func() storage.LSN { lsn += 8; return lsn }
-	var lastKept [][]byte
-	var lastFlags uint16
+	var lastPage storage.Page
 	var vacCalls int
 	pool, err := storage.NewPool(mgr, storage.PoolConfig{
 		Slots:          64,
@@ -193,10 +192,9 @@ func TestNoSpaceRewritePurgesDeadItems(t *testing.T) {
 		LogPageImage: func(_ storage.RelFileNode, _ storage.BlockNumber, _ storage.Page) (storage.LSN, error) {
 			return next(), nil
 		},
-		LogBtreeVacuum: func(_ storage.RelFileNode, _ storage.BlockNumber, kept [][]byte, flags uint16) (storage.LSN, error) {
+		LogBtreeVacuum: func(_ storage.RelFileNode, _ storage.BlockNumber, page storage.Page) (storage.LSN, error) {
 			vacCalls++
-			lastKept = kept
-			lastFlags = flags
+			lastPage = append(storage.Page(nil), page...)
 			return next(), nil
 		},
 		WALFrontier: func() uint64 { return uint64(lsn) },
@@ -262,48 +260,27 @@ func TestNoSpaceRewritePurgesDeadItems(t *testing.T) {
 	if vacCalls == 0 {
 		t.Fatal("no-space rewrite did not emit the kept-items record (purge unlogged or split taken — S3 blocker-A regression)")
 	}
-	// The kept-items record must exclude the dead key's item.
+	// A8: the record now carries the post-vacuum page as a full-page image
+	// (what crash-replay restores verbatim). It must exclude the dead key.
 	deadKey := wide(2)
-	for _, raw := range lastKept {
-		it, perr := parseItem(raw)
-		if perr != nil {
-			t.Fatalf("kept-items entry unparseable (format drift): %v", perr)
-		}
-		if CompareKeys(it.key, deadKey) == 0 {
-			t.Fatal("kept-items record still carries the dead entry — purge not logged")
+	keys, err := PageItemKeys(lastPage)
+	if err != nil {
+		t.Fatalf("post-vacuum page keys unreadable (format drift): %v", err)
+	}
+	for _, k := range keys {
+		if CompareKeys(k, deadKey) == 0 {
+			t.Fatal("post-vacuum page image still carries the dead entry — purge not logged")
 		}
 	}
 	// Total survivor accounting: i+1 inserted, minus the dead one, plus
 	// the incoming key — dedup cannot legally shrink further (no dups).
-	if want := i + 1; len(lastKept) != want {
-		t.Fatalf("kept-items carries %d entries, want %d (a LIVE item was dropped)", len(lastKept), want)
+	if want := i + 1; len(keys) != want {
+		t.Fatalf("post-vacuum page carries %d entries, want %d (a LIVE item was dropped)", len(keys), want)
 	}
 	// And the live neighbors + the new key survive.
 	for _, k := range [][]byte{wide(0), wide(1), wide(3), wide(1000)} {
 		if _, ok, err := bt.Search(k); err != nil || !ok {
 			t.Fatalf("live key lost across the purge rewrite (ok=%v err=%v)", ok, err)
-		}
-	}
-
-	// Crash-replay closure (review SHOULD-FIX 2): the kept set must
-	// reconstruct a fresh page via the SAME replay entry production uses.
-	fresh := make(storage.Page, storage.BlockSize)
-	if err := storage.InitPage(fresh); err != nil {
-		t.Fatal(err)
-	}
-	if err := ReplayVacuumPage(fresh, lastKept, lastFlags); err != nil {
-		t.Fatalf("ReplayVacuumPage on the dedup-path kept set: %v", err)
-	}
-	keys, err := PageItemKeys(fresh)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(keys) != i+1 {
-		t.Fatalf("replayed page has %d items, want %d", len(keys), i+1)
-	}
-	for _, k := range keys {
-		if CompareKeys(k, deadKey) == 0 {
-			t.Fatal("replayed page resurrected the dead entry")
 		}
 	}
 }

@@ -426,3 +426,53 @@ func EncodeBtreeSplitPG(rel storage.RelFileNode, leftBlk, rightBlk storage.Block
 	}
 	return framePGAssembled(RmgrBtree, xlogBtreeSplitL, 0, body), nil
 }
+
+// EncodeBtreeVacuumPG builds a PostgreSQL RM_BTREE vacuum record
+// (XLOG_BTREE_VACUUM opcode) carrying the post-vacuum leaf page as a full-page
+// image (backup block 0). goopg's vacuum pass already holds the exact final page
+// bytes (dead items removed, opaque flags updated), so this reuses the A0 FPI
+// encoder rather than reconstructing PG's incremental xl_btree_vacuum main-data
+// (ndeleted/nupdated + offset arrays). BKPIMAGE_APPLY makes replay
+// (replayDecodedXLogHeapFPIBlocks via the RmgrBtree default arm) restore the
+// image, identical to the native replayBtreeVacuum and PG's BLK_RESTORED redo.
+// No main-data is carried (the image is authoritative — a documented deviation
+// from PG's incremental xl_btree_vacuum); xl_xid = 0.
+func EncodeBtreeVacuumPG(rel storage.RelFileNode, blk storage.BlockNumber, page storage.Page) ([]byte, error) {
+	if len(page) != storage.BlockSize {
+		return nil, fmt.Errorf("wal: btree-vacuum page must be %d bytes", storage.BlockSize)
+	}
+	blocks := []BlockRef{{ID: 0, Rel: rel, Block: blk, Image: &FullPageImage{Page: page, Apply: true}}}
+	body, err := assembleXLogRecord(nil, blocks)
+	if err != nil {
+		return nil, err
+	}
+	return framePGAssembled(RmgrBtree, xlogBtreeVacuum, 0, body), nil
+}
+
+// EncodeBtreeNewRootPG builds a PostgreSQL RM_BTREE new-root record
+// (XLOG_BTREE_NEWROOT opcode) carrying the freshly-built root page (backup block
+// 0, WILL_INIT — a new block) and the updated metapage (backup block 2, matching
+// PG's block numbering; block 1 = left child is unused because goopg does not
+// mutate the old root during root replacement). Both ride as full-page images:
+// goopg's createNewRoot holds the exact final bytes for both pages, so this
+// reuses the A0 FPI encoder rather than reconstructing PG's xl_btree_newroot
+// main-data (rootblk + level, which PG's redo uses to rebuild the metapage).
+// BKPIMAGE_APPLY makes replay restore both images via the RmgrBtree default arm
+// — matching native replayBtreeNewRoot (which reconstructs the metapage from
+// rootblk/level) and PG's BLK_RESTORED redo. No main-data is carried (the images
+// are authoritative — a documented deviation from PG's incremental
+// xl_btree_newroot); xl_xid = 0.
+func EncodeBtreeNewRootPG(rel storage.RelFileNode, rootBlk storage.BlockNumber, rootPage storage.Page, metaBlk storage.BlockNumber, metaPage storage.Page) ([]byte, error) {
+	if len(rootPage) != storage.BlockSize || len(metaPage) != storage.BlockSize {
+		return nil, fmt.Errorf("wal: btree-newroot root/meta page must be %d bytes", storage.BlockSize)
+	}
+	blocks := []BlockRef{
+		{ID: 0, Rel: rel, Block: rootBlk, WillInit: true, Image: &FullPageImage{Page: rootPage, Apply: true}},
+		{ID: 2, Rel: rel, Block: metaBlk, SameRel: true, Image: &FullPageImage{Page: metaPage, Apply: true}},
+	}
+	body, err := assembleXLogRecord(nil, blocks)
+	if err != nil {
+		return nil, err
+	}
+	return framePGAssembled(RmgrBtree, xlogBtreeNewRoot, 0, body), nil
+}

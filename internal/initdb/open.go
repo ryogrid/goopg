@@ -502,8 +502,14 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// `btree.VacuumIndexPages` so per-page vacuum cost is
 	// proportional to surviving items rather than 8 KiB of
 	// page bytes.
-	logBtreeVacuum := func(rel storage.RelFileNode, blk storage.BlockNumber, keptItems [][]byte, opaqueFlags uint16) (storage.LSN, error) {
-		payload := wal.EncodeBtreeVacuum(rel, blk, keptItems, opaqueFlags)
+	logBtreeVacuum := func(rel storage.RelFileNode, blk storage.BlockNumber, page storage.Page) (storage.LSN, error) {
+		// A8: emit a PG RM_BTREE vacuum record carrying the post-vacuum page as a
+		// full-page image instead of the goopg-native kept-items body. Recovery
+		// restores the image via the RmgrBtree default (FPI) arm.
+		payload, err := wal.EncodeBtreeVacuumPG(rel, blk, page)
+		if err != nil {
+			return 0, err
+		}
 		_, end, err := walWriter.Append(payload)
 		if err != nil {
 			return 0, err
@@ -534,13 +540,15 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		}
 		return storage.LSN(end), nil
 	}
-	logBtreeNewRoot := func(rel storage.RelFileNode, rootBlk storage.BlockNumber, level uint32, items [][]byte) (storage.LSN, error) {
-		payload := wal.EncodeBtreeNewRoot(wal.BtreeNewRootPayload{
-			Rel:     rel,
-			RootBlk: rootBlk,
-			Level:   level,
-			Items:   items,
-		})
+	logBtreeNewRoot := func(rel storage.RelFileNode, rootBlk storage.BlockNumber, rootPage storage.Page, metaBlk storage.BlockNumber, metaPage storage.Page) (storage.LSN, error) {
+		// A8: emit a PG RM_BTREE new-root record carrying the new root page
+		// (backup block 0) and the updated metapage (backup block 2) as full-page
+		// images instead of the goopg-native (rootBlk, level, items) body.
+		// Recovery restores both images via the RmgrBtree default (FPI) arm.
+		payload, err := wal.EncodeBtreeNewRootPG(rel, rootBlk, rootPage, metaBlk, metaPage)
+		if err != nil {
+			return 0, err
+		}
 		_, end, err := walWriter.Append(payload)
 		if err != nil {
 			return 0, err
