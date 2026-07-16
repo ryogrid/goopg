@@ -497,3 +497,34 @@ func EncodePageImagePG(rel storage.RelFileNode, blk storage.BlockNumber, page st
 	}
 	return framePGAssembled(RmgrXLog, xlogXLogFPI, 0, body), nil
 }
+
+// EncodeSmgrCreatePG builds a PostgreSQL RM_SMGR relation-file-creation record
+// (XLOG_SMGR_CREATE opcode) with an `xl_smgr_create` main-data body
+// (RelFileLocator{spcOid,dbOid,relNumber} + ForkNumber, 16 bytes) and no block
+// ref — mirroring PG's log_smgrcreate. The default tablespace (goopg's TblOid=0)
+// encodes as pgDefaultTableSpaceOID (1663), matching the A0 assembler's
+// RelFileLocator convention. The record carries the creating transaction's xid
+// in the header (PG stamps it via XLogInsert): this is both PG-faithful and what
+// makes the record route to the decoded replay path — a main-data-only record
+// reaches replayDecodedXLogRecord only when nativeHeaderMatchesMainData is false,
+// and a non-zero header xid mismatches classifyXLogRecord's always-zero xid.
+// (Bootstrap creates legitimately pass xid=0; those relations live in
+// pg_default/pg_global whose spcOid low byte is not a native RecordKind, so they
+// still route correctly.) Replay: the RmgrStorage/XLOG_SMGR_CREATE decoded arm
+// decodes the body and calls applySmgrCreate — identical to native replaySmgrCreate.
+func EncodeSmgrCreatePG(rel storage.RelFileNode, xid storage.TransactionID) ([]byte, error) {
+	spc := rel.TblOid
+	if spc == 0 {
+		spc = pgDefaultTableSpaceOID
+	}
+	mainData := make([]byte, 0, 16)
+	mainData = binary.LittleEndian.AppendUint32(mainData, spc)
+	mainData = binary.LittleEndian.AppendUint32(mainData, rel.DBOid)
+	mainData = binary.LittleEndian.AppendUint32(mainData, rel.RelOid)
+	mainData = binary.LittleEndian.AppendUint32(mainData, uint32(rel.Fork))
+	body, err := assembleXLogRecord(mainData, nil)
+	if err != nil {
+		return nil, err
+	}
+	return framePGAssembled(RmgrStorage, xlogSmgrCreate, uint32(xid), body), nil
+}

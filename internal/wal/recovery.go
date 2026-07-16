@@ -9530,6 +9530,23 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 		default:
 			return false, unsupportedDecodedXLogRecord(r)
 		}
+	case RmgrStorage:
+		switch xlog.Header.Info & XLRRmgrInfoMask {
+		case xlogSmgrCreate:
+			// A9: goopg's relation-file creation is now a PG xl_smgr_create
+			// (RelFileLocator + forkNum main-data, no block ref); recreate the
+			// relfile's first block, identical to native replaySmgrCreate.
+			rel, err := decodeXLogSmgrCreate(xlog.MainData)
+			if err != nil {
+				return false, err
+			}
+			if err := applySmgrCreate(mgr, rel); err != nil {
+				return false, err
+			}
+			return true, nil
+		default:
+			return false, unsupportedDecodedXLogRecord(r)
+		}
 	case RmgrHeap:
 		switch xlog.Header.Info & xlogHeapOpMask {
 		case xlogHeapInsert:
@@ -10994,6 +11011,35 @@ func replaySmgrCreate(mgr *storage.Manager, payload []byte) error {
 	if err != nil {
 		return err
 	}
+	return applySmgrCreate(mgr, rel)
+}
+
+// decodeXLogSmgrCreate parses a PG xl_smgr_create main-data body
+// (RelFileLocator{spcOid,dbOid,relNumber} + ForkNumber, 16 bytes) into a goopg
+// RelFileNode. The default-tablespace spcOid (pgDefaultTableSpaceOID) is mapped
+// back to goopg's TblOid=0 convention so the decoded rel matches the on-disk
+// relation the emitter used (EncodeSmgrCreatePG encodes 0 → pgDefaultTableSpaceOID).
+func decodeXLogSmgrCreate(mainData []byte) (storage.RelFileNode, error) {
+	if len(mainData) < 16 {
+		return storage.RelFileNode{}, fmt.Errorf("wal: xl_smgr_create main-data len %d (want 16)", len(mainData))
+	}
+	rel := storage.RelFileNode{
+		TblOid: binary.LittleEndian.Uint32(mainData[0:4]),
+		DBOid:  binary.LittleEndian.Uint32(mainData[4:8]),
+		RelOid: binary.LittleEndian.Uint32(mainData[8:12]),
+		Fork:   storage.ForkNumber(binary.LittleEndian.Uint32(mainData[12:16])),
+	}
+	if rel.TblOid == pgDefaultTableSpaceOID {
+		rel.TblOid = 0
+	}
+	return rel, nil
+}
+
+// applySmgrCreate ensures the relation file identified by rel has at least one
+// initialised block (idempotent: a no-op if the file already has blocks).
+// Shared by the native replaySmgrCreate and the A9 decoded
+// RmgrStorage/XLOG_SMGR_CREATE arm.
+func applySmgrCreate(mgr *storage.Manager, rel storage.RelFileNode) error {
 	n, err := mgr.NBlocks(rel)
 	if err != nil {
 		return fmt.Errorf("wal: smgr-create replay NBlocks: %w", err)

@@ -49,8 +49,8 @@ const extendBatchSize = 8
 // Replaces the single-page PinNew tail in writeHeapRowReturning /
 // writeHeapRowReturningPG so each extend event leaves seven fresh
 // candidates for the next inserter wave.
-func batchExtendAndRegisterFSM(pool *storage.Pool, fsm *storage.FSM, rel storage.RelFileNode) (storage.BlockNumber, error) {
-	first, err := pool.ExtendRelationBatch(rel, extendBatchSize)
+func batchExtendAndRegisterFSM(pool *storage.Pool, fsm *storage.FSM, rel storage.RelFileNode, createXID storage.TransactionID) (storage.BlockNumber, error) {
+	first, err := pool.ExtendRelationBatchWithXID(rel, extendBatchSize, createXID)
 	if err != nil {
 		return 0, err
 	}

@@ -10233,7 +10233,7 @@ func (o *ddlOp) bulkBuildBTreeWithPredicate(idxRel storage.RelFileNode, tbl *cat
 	if err != nil {
 		return err
 	}
-	_, err = btree.BulkCreate(o.ctx.Pool, idxRel, entries)
+	_, err = btree.BulkCreateWithXID(o.ctx.Pool, idxRel, entries, o.ctx.Tx.XID)
 	if err != nil {
 		return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
 	}
@@ -11351,7 +11351,7 @@ func (o *ddlOp) truncateTableAndPartitions(tbl *catalog.Table, pos int, only boo
 		// have no entries to clear. (Btrees track their
 		// own free space inline.) Pair the FSM/VM cleanup
 		// only with the heap rel above.
-		if _, err := btree.Create(o.ctx.Pool, idxRel); err != nil {
+		if _, err := btree.CreateWithXID(o.ctx.Pool, idxRel, o.ctx.Tx.XID); err != nil {
 			return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
 		}
 	}
@@ -19923,7 +19923,7 @@ func (o *ddlOp) execAlterDropColumn(tbl *catalog.Table, act parser.AlterTableAct
 		idxRel := o.ctx.Catalog.IndexRelFileNode(idx)
 		o.ctx.Pool.InvalidateRel(idxRel)
 		_ = o.ctx.Pool.Manager().TruncateRelation(idxRel)
-		_, _ = btree.Create(o.ctx.Pool, idxRel)
+		_, _ = btree.CreateWithXID(o.ctx.Pool, idxRel, o.ctx.Tx.XID)
 	}
 
 	// Phase 4: re-insert all rows with the new column layout and rebuild indexes.
@@ -20060,7 +20060,7 @@ func (o *ddlOp) execAlterColumnType(tbl *catalog.Table, act parser.AlterTableAct
 		idxRel := o.ctx.Catalog.IndexRelFileNode(idx)
 		o.ctx.Pool.InvalidateRel(idxRel)
 		_ = o.ctx.Pool.Manager().TruncateRelation(idxRel)
-		_, _ = btree.Create(o.ctx.Pool, idxRel)
+		_, _ = btree.CreateWithXID(o.ctx.Pool, idxRel, o.ctx.Tx.XID)
 	}
 
 	// Phase 4: re-insert all rows with the new encoding.

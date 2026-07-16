@@ -1471,6 +1471,10 @@ type Options struct {
 	// LogSplit, when non-nil, is invoked on every page split to
 	// emit one atomic BtreeSplit WAL record covering both pages.
 	LogSplit LogSplitFunc
+	// CreateXID is the creating transaction's xid, stamped onto the
+	// block-0 smgr-create WAL record when the index relfile is created
+	// (A9). Zero for non-transactional/bootstrap builds.
+	CreateXID storage.TransactionID
 }
 
 // Open returns a handle to an existing B-tree on rel. Validates the
@@ -1502,6 +1506,13 @@ func Create(pool *storage.Pool, rel storage.RelFileNode) (*BTree, error) {
 	return CreateWithOptions(pool, rel, Options{LogSplit: adaptPoolLogSplit(pool)})
 }
 
+// CreateWithXID is Create with the creating transaction's xid stamped onto the
+// index relfile's smgr-create WAL record (A9). Callers in a DDL transaction
+// (CREATE INDEX) pass ctx.Tx.XID.
+func CreateWithXID(pool *storage.Pool, rel storage.RelFileNode, xid storage.TransactionID) (*BTree, error) {
+	return CreateWithOptions(pool, rel, Options{LogSplit: adaptPoolLogSplit(pool), CreateXID: xid})
+}
+
 // adaptPoolLogSplit returns the pool's split-WAL hook in btree's
 // LogSplitFunc shape, or nil when no hook is wired (tests etc.).
 func adaptPoolLogSplit(pool *storage.Pool) LogSplitFunc {
@@ -1526,8 +1537,9 @@ func CreateWithOptions(pool *storage.Pool, rel storage.RelFileNode, opts Options
 	}
 	pool.InvalidateRel(rel)
 
-	// Block 0: metapage.
-	metaSlot, metaBlk, err := pool.PinNew(rel)
+	// Block 0: metapage. A9: this creates the index relfile — pass the
+	// creating xid so its smgr-create WAL record is PG-faithful.
+	metaSlot, metaBlk, err := pool.PinNewWithXID(rel, opts.CreateXID)
 	if err != nil {
 		return nil, err
 	}

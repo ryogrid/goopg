@@ -34,6 +34,13 @@ func BulkCreate(pool *storage.Pool, rel storage.RelFileNode, entries []BulkEntry
 	return BulkCreateWithOptions(pool, rel, entries, Options{LogSplit: adaptPoolLogSplit(pool)})
 }
 
+// BulkCreateWithXID is BulkCreate with the creating transaction's xid stamped
+// onto the index relfile's smgr-create WAL record (A9). CREATE INDEX passes
+// ctx.Tx.XID.
+func BulkCreateWithXID(pool *storage.Pool, rel storage.RelFileNode, entries []BulkEntry, xid storage.TransactionID) (*BTree, error) {
+	return BulkCreateWithOptions(pool, rel, entries, Options{LogSplit: adaptPoolLogSplit(pool), CreateXID: xid})
+}
+
 // BulkCreateNoDedup builds a B-tree without posting-list deduplication.
 // All entries are stored as individual items even when keys repeat.
 // Used in tests and benchmarks to measure the space savings from dedup.
@@ -139,8 +146,9 @@ func BulkCreateWithOptions(pool *storage.Pool, rel storage.RelFileNode, entries 
 	}
 	pool.InvalidateRel(rel)
 
-	// Block 0: metapage (identical layout to Create).
-	metaSlot, metaBlk, err := pool.PinNew(rel)
+	// Block 0: metapage (identical layout to Create). A9: this creates the
+	// index relfile — pass the creating xid for its smgr-create WAL record.
+	metaSlot, metaBlk, err := pool.PinNewWithXID(rel, opts.CreateXID)
 	if err != nil {
 		return nil, fmt.Errorf("btree bulk: alloc metapage: %w", err)
 	}

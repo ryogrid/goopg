@@ -136,8 +136,10 @@ type Pool struct {
 	logHeapHotUpdate LogHeapHotUpdateFunc
 	// logHeapPruneOpt emits an opportunistic page-pruning WAL record.
 	logHeapPruneOpt LogHeapPruneOptFunc
-	// logSmgrCreate emits a relation-file creation WAL record.
-	logSmgrCreate func(rel RelFileNode) error
+	// logSmgrCreate emits a relation-file creation WAL record. A9: carries the
+	// creating transaction's xid (0 for bootstrap/non-transactional creates) so
+	// the PG xl_smgr_create record is byte-faithful and routes to decoded replay.
+	logSmgrCreate func(rel RelFileNode, xid TransactionID) error
 	// logChangeRecord emits a pre-encoded change record.
 	logChangeRecord func(payload []byte) (LSN, error)
 	// fullPageWrites gates FPI emission.
@@ -638,7 +640,7 @@ type PoolConfig struct {
 	LogHeapFreeze            LogHeapFreezeFunc
 	LogHeapHotUpdate         LogHeapHotUpdateFunc
 	LogHeapPruneOpt          LogHeapPruneOptFunc
-	LogSmgrCreate            func(rel RelFileNode) error
+	LogSmgrCreate            func(rel RelFileNode, xid TransactionID) error
 	LogChangeRecord          func(payload []byte) (LSN, error)
 
 	// Logger receives FPI emission failures. nil means slog.Default().
@@ -1533,7 +1535,21 @@ func (p *Pool) DumpEventsForTag(tag BufferTag) []string {
 
 // PinNew pins the next-after-end block of rel for writing without
 // reading from disk. Returns the block number the slot represents.
+// The smgr-create WAL record (emitted when this creates block 0) carries
+// xid=0; transactional relfile creation should use PinNewWithXID so the
+// record is PG-faithful and routes to decoded replay (A9).
 func (p *Pool) PinNew(rel RelFileNode) (*Slot, BlockNumber, error) {
+	return p.pinNewXID(rel, InvalidTransactionID)
+}
+
+// PinNewWithXID is PinNew with the creating transaction's xid stamped onto the
+// block-0 smgr-create WAL record. Callers that create a fresh relfile inside a
+// transaction (heap/index/TOAST creation) pass ctx.Tx.XID here.
+func (p *Pool) PinNewWithXID(rel RelFileNode, createXID TransactionID) (*Slot, BlockNumber, error) {
+	return p.pinNewXID(rel, createXID)
+}
+
+func (p *Pool) pinNewXID(rel RelFileNode, createXID TransactionID) (*Slot, BlockNumber, error) {
 	p.pinMu.Lock()
 
 	victimIdx, wasDirty, oldTag, err := p.claimVictim()
@@ -1578,7 +1594,7 @@ func (p *Pool) PinNew(rel RelFileNode) (*Slot, BlockNumber, error) {
 
 	// Emit SmgrCreate WAL record on first block creation.
 	if blk == 0 && p.logSmgrCreate != nil {
-		if emitErr := p.logSmgrCreate(rel); emitErr != nil {
+		if emitErr := p.logSmgrCreate(rel, createXID); emitErr != nil {
 			p.logger.Error("SmgrCreate WAL emission failed", "rel", rel, "err", emitErr)
 		}
 	}
@@ -1632,6 +1648,12 @@ func (p *Pool) PinNew(rel RelFileNode) (*Slot, BlockNumber, error) {
 // the executor consumer (`selectInsertPage`) lands after the third
 // foundation (`Pool.SlotPinCount`, blocked on M0107-0006).
 func (p *Pool) ExtendRelationBatch(rel RelFileNode, n int) (BlockNumber, error) {
+	return p.ExtendRelationBatchWithXID(rel, n, InvalidTransactionID)
+}
+
+// ExtendRelationBatchWithXID is ExtendRelationBatch with the creating
+// transaction's xid stamped onto the block-0 smgr-create WAL record (A9).
+func (p *Pool) ExtendRelationBatchWithXID(rel RelFileNode, n int, createXID TransactionID) (BlockNumber, error) {
 	if n <= 0 {
 		return InvalidBlockNumber, fmt.Errorf("ExtendRelationBatch: n=%d must be > 0", n)
 	}
@@ -1646,7 +1668,7 @@ func (p *Pool) ExtendRelationBatch(rel RelFileNode, n int) (BlockNumber, error) 
 		return InvalidBlockNumber, err
 	}
 	if first == 0 && p.logSmgrCreate != nil {
-		if emitErr := p.logSmgrCreate(rel); emitErr != nil {
+		if emitErr := p.logSmgrCreate(rel, createXID); emitErr != nil {
 			p.logger.Error("SmgrCreate WAL emission failed",
 				"rel", rel, "err", emitErr)
 		}

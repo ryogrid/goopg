@@ -637,9 +637,15 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// Relation-file creation WAL record (M0030-0002). Emitted by
 	// Pool.PinNew when it creates block 0 of a new relfile so crash
 	// recovery can recreate the file before replaying data pages.
-	logSmgrCreate := func(rel storage.RelFileNode) error {
-		payload := wal.EncodeSmgrCreate(rel)
-		_, _, err := walWriter.Append(payload)
+	logSmgrCreate := func(rel storage.RelFileNode, xid storage.TransactionID) error {
+		// A9: emit a PG RM_SMGR xl_smgr_create record (RelFileLocator+forkNum
+		// main-data, creating xid in the header) instead of the goopg-native
+		// body. Recovery routes it to the RmgrStorage/XLOG_SMGR_CREATE decoded arm.
+		payload, err := wal.EncodeSmgrCreatePG(rel, xid)
+		if err != nil {
+			return err
+		}
+		_, _, err = walWriter.Append(payload)
 		return err
 	}
 

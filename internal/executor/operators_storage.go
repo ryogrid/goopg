@@ -7979,7 +7979,7 @@ func writeHeapRowReturning(ctx *Context, rel storage.RelFileNode, cols []catalog
 		// — [[0107-0007g]]). One disk-side syscall covers the burst
 		// instead of one per stripe; the extras prime the cross-stripe
 		// FSM re-check above.
-		firstBlk, err := batchExtendAndRegisterFSM(ctx.Pool, ctx.FSM, rel)
+		firstBlk, err := batchExtendAndRegisterFSM(ctx.Pool, ctx.FSM, rel, ctx.Tx.XID)
 		if err != nil {
 			return ptr, err
 		}
@@ -8002,7 +8002,7 @@ func writeHeapRowReturning(ctx *Context, rel storage.RelFileNode, cols []catalog
 	// in-memory before we ever touch the disk for content) and adds
 	// only one page, matching the test-fixture invariant that a single
 	// INSERT into a fresh relation grows it by exactly one page.
-	slot, blk, err := ctx.Pool.PinNew(rel)
+	slot, blk, err := ctx.Pool.PinNewWithXID(rel, ctx.Tx.XID)
 	if err != nil {
 		return ptr, err
 	}
@@ -8184,7 +8184,7 @@ func writeHeapRowReturningPG(ctx *Context, rel storage.RelFileNode, cols []catal
 	}
 
 	if contended {
-		firstBlk, err := batchExtendAndRegisterFSM(ctx.Pool, ctx.FSM, rel)
+		firstBlk, err := batchExtendAndRegisterFSM(ctx.Pool, ctx.FSM, rel, ctx.Tx.XID)
 		if err != nil {
 			return ptr, err
 		}
@@ -8198,7 +8198,7 @@ func writeHeapRowReturningPG(ctx *Context, rel storage.RelFileNode, cols []catal
 		return ptr, &ExecError{Code: "XX000", Message: "freshly batch-extended page did not accept tuple"}
 	}
 
-	slot, blk, err := ctx.Pool.PinNew(rel)
+	slot, blk, err := ctx.Pool.PinNewWithXID(rel, ctx.Tx.XID)
 	if err != nil {
 		return ptr, err
 	}

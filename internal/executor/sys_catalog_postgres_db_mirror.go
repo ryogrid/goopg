@@ -90,7 +90,7 @@ func mirrorCatalogRelToPostgresDB(ctx *Context, relOID uint32) error {
 			// allocates the next sequential block, so this only works
 			// when we're appending in order (which we are because we
 			// iterate blk from 0 ascending).
-			s, newBlk, err := ctx.Pool.PinNew(dstRel)
+			s, newBlk, err := ctx.Pool.PinNewWithXID(dstRel, ctx.Tx.XID)
 			if err != nil {
 				return fmt.Errorf("mirror catalog %d: extend dst at blk %d: %w", relOID, blk, err)
 			}
