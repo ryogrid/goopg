@@ -13010,7 +13010,14 @@ func syncRangeTypeToCatalogHeap(ctx *Context, rt *catalog.RangeType) {
 	if err := writeTypeHeapRowWithIndexes(ctx, buildUserPGTypeRowForMultirangeArray(rt)); err != nil {
 		return
 	}
+	// B2.1c: the pg_range row + 3542/2228 entries make the range ↔
+	// multirange linkage physically reconstructable at reload (and
+	// PG-resolvable via the RANGETYPE/MULTIRANGETYPE syscaches).
+	if err := writeRangeCatalogRow(ctx, rt); err != nil {
+		return
+	}
 	mirrorTypeCatalogFiles(ctx)
+	mirrorRangeCatalogFiles(ctx)
 }
 
 // deleteTypeFromCatalogHeap stamps xmax on the pg_type row for typeOID.
@@ -18680,14 +18687,9 @@ func (o *ddlOp) execCreateType(s *parser.CreateTypeStmt) error {
 				}
 				o.ctx.PendingCreatedRangeTypes[strings.ToLower(s.Name)] = true
 			}
-			// DU-002 restart-persistence follow-up (M0110-0001, DU-002 slice
-			// 429 ledger resume point, sub-item (c)): mirrors CREATE ACCESS
-			// METHOD.
-			if o.ctx.WAL != nil {
-				if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateRangeType(rt.Name, rt.SubtypeName, rt.MultirangeName, rt.OID, rt.ArrayOID, rt.MultirangeOID, rt.MultirangeArrayOID, rt.OpclassOID, rt.CollationOID, rt.Owner)); werr != nil {
-					return fmt.Errorf("wal create-range-type: %w", werr)
-				}
-			}
+			// B2.1c: no bespoke WAL record — the pg_type + pg_range heap
+			// inserts (syncRangeTypeToCatalogHeap above) ARE the journal
+			// (kind 81 retired); reload = reloadUserRangeTypesFromHeap.
 			return nil
 		}
 		// Composite / base types — register the name so DROP TYPE can
@@ -18968,15 +18970,9 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 			if err := cat.RenameRangeType(s.Name, s.RenameTo, o.ctx.CurrentDatabaseOid); err != nil {
 				return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 			}
-			// M0122-0005 restart-persistence follow-up (deferral ledger
-			// 2026-07-06 row, resume point (1)): mirrors execAlterCollation's
-			// RENAME TO WAL logging so a range-type rename survives a
-			// restart.
-			if o.ctx.WAL != nil {
-				if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterRangeTypeRename(s.Name, s.RenameTo)); werr != nil {
-					return fmt.Errorf("wal alter-range-type-rename: %w", werr)
-				}
-			}
+			// B2.1c: the rename journals as non-HOT pg_type heap updates of
+			// all four rows (kind 117 retired).
+			o.resyncRangeHeapAfterAlter(cat, s.RenameTo)
 			return nil
 		}
 		err := cat.RenameEnum(s.Name, s.RenameTo, o.ctx.CurrentDatabaseOid)
@@ -19016,15 +19012,9 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 		}
 		if _, ok := cat.LookupRangeType(s.Name, o.ctx.CurrentDatabaseOid); ok {
 			cat.SetRangeTypeOwner(s.Name, ownerOID, o.ctx.CurrentDatabaseOid)
-			// M0122-0005 restart-persistence follow-up (deferral ledger
-			// 2026-07-06 row, resume point (1)): mirrors
-			// execAlterCollation's OWNER TO WAL logging so a range-type
-			// owner change survives a restart.
-			if o.ctx.WAL != nil {
-				if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterRangeTypeOwner(s.Name, ownerOID)); werr != nil {
-					return fmt.Errorf("wal alter-range-type-owner: %w", werr)
-				}
-			}
+			// B2.1c: the owner change journals as non-HOT pg_type heap
+			// updates (kind 118 retired).
+			o.resyncRangeHeapAfterAlter(cat, s.Name)
 			return nil
 		}
 		if !cat.SetEnumOwner(s.Name, ownerOID, o.ctx.CurrentDatabaseOid) {
@@ -19220,19 +19210,16 @@ func (o *ddlOp) execDropType(s *parser.DropTypeStmt) error {
 				deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, rt.ArrayOID, o.ctx.Tx.XID)
 				deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, rt.MultirangeOID, o.ctx.Tx.XID)
 				deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, rt.MultirangeArrayOID, o.ctx.Tx.XID)
-				_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.TypeRelationId)
+				// B2.1c: the pg_range row dies with the type.
+				deleteRangeCatalogRow(o.ctx, rt.OID, o.ctx.Tx.XID)
+				mirrorTypeCatalogFiles(o.ctx)
+				mirrorRangeCatalogFiles(o.ctx)
 			}
 		}
+		// B2.1c: no bespoke WAL record — the heap deletes above ARE the
+		// journal (kind 82 retired).
 		rangeErr := cat.DropRangeType(n, o.ctx.CurrentDatabaseOid)
 		if rangeErr == nil {
-			// DU-002 restart-persistence follow-up (M0110-0001, DU-002
-			// slice 429 ledger resume point, sub-item (c)): mirrors DROP
-			// ACCESS METHOD.
-			if o.ctx.WAL != nil {
-				if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropRangeType(n)); werr != nil {
-					return fmt.Errorf("wal drop-range-type: %w", werr)
-				}
-			}
 			continue // successfully dropped as range type
 		}
 		// Neither enum, composite, nor range — report error or IF EXISTS notice.
@@ -19459,6 +19446,34 @@ func (o *ddlOp) resyncDomainHeapAfterAlter(cat *catalog.InMemory, name string, d
 		return
 	}
 	if err := updateTypeHeapRowWithIndexes(o.ctx, buildUserPGTypeRowForDomainArray(d)); err != nil {
+		return
+	}
+	mirrorTypeCatalogFiles(o.ctx)
+}
+
+// resyncRangeHeapAfterAlter journals a successful ALTER TYPE (range
+// rename/owner) as non-HOT pg_type heap updates of all four rows via the
+// TID cache (B2.1c). Best-effort like syncRangeTypeToCatalogHeap. The
+// pg_range row is immutable under rename/owner (all-OID columns), so only
+// the pg_type rows re-journal.
+func (o *ddlOp) resyncRangeHeapAfterAlter(cat *catalog.InMemory, name string) {
+	if !catalogHeapSyncAvailable(o.ctx) {
+		return
+	}
+	rt, ok := cat.LookupRangeType(name, o.ctx.CurrentDatabaseOid)
+	if !ok {
+		return
+	}
+	if err := updateTypeHeapRowWithIndexes(o.ctx, buildUserPGTypeRowForRange(rt)); err != nil {
+		return
+	}
+	if err := updateTypeHeapRowWithIndexes(o.ctx, buildUserPGTypeRowForRangeArray(rt)); err != nil {
+		return
+	}
+	if err := updateTypeHeapRowWithIndexes(o.ctx, buildUserPGTypeRowForMultirange(rt)); err != nil {
+		return
+	}
+	if err := updateTypeHeapRowWithIndexes(o.ctx, buildUserPGTypeRowForMultirangeArray(rt)); err != nil {
 		return
 	}
 	mirrorTypeCatalogFiles(o.ctx)

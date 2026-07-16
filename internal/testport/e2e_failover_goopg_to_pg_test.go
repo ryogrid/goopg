@@ -213,6 +213,12 @@ func runFailoverGoopgToPG(t *testing.T, repo, pgBasebackupBin, psqlBin string, m
 		"CREATE DOMAIN public.b2prep_dom AS int"); err != nil {
 		t.Fatalf("create domain on goopg primary: %v", err)
 	}
+	// B2.1c: CREATE TYPE AS RANGE journals pg_type + pg_range heap inserts
+	// (kinds 81/82/117/118 retired).
+	if err := runSQLSimple(t, primary,
+		"CREATE TYPE public.b2prep_rng AS RANGE (subtype = int4)"); err != nil {
+		t.Fatalf("create range type on goopg primary: %v", err)
+	}
 
 	dsn := fmt.Sprintf("host=%s port=%s user=%s dbname=%s sslmode=disable",
 		"127.0.0.1", mustGoopgPort(primary.ListenAddr()), "postgres", "postgres")
@@ -349,6 +355,12 @@ func runFailoverGoopgToPG(t *testing.T, repo, pgBasebackupBin, psqlBin string, m
 	if got := pgScalar(t, standby,
 		"SELECT 42::public.b2prep_dom"); got != "42" {
 		t.Fatalf("post-failover domain cast = %q, want 42", got)
+	}
+	// B2.1c: the goopg-created range type must be usable on the promoted PG
+	// (pg_type rows + pg_range row via RANGETYPE syscache → 3542).
+	if got := pgScalar(t, standby,
+		"SELECT '[1,5)'::public.b2prep_rng::text"); got != "[1,5)" {
+		t.Fatalf("post-failover range cast = %q, want [1,5)", got)
 	}
 }
 

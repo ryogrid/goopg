@@ -64,6 +64,9 @@ ALTER SEQUENCE waldump_seq MAXVALUE 500;
 CREATE DOMAIN waldump_dom AS text CHECK (VALUE IN ('a', 'b'));
 ALTER DOMAIN waldump_dom SET DEFAULT 'a';
 DROP DOMAIN waldump_dom;
+CREATE TYPE waldump_rng AS RANGE (subtype = int4);
+ALTER TYPE waldump_rng RENAME TO waldump_rng2;
+DROP TYPE waldump_rng2;
 DROP SCHEMA waldump_s2;
 ` + buildInsertSQL(100) + `
 CHECKPOINT;

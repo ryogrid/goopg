@@ -1454,10 +1454,10 @@ func buildUserPGTypeRowForEnum(et *catalog.EnumType) Row {
 		NewIntDatum(0),                                 // typsubscript
 		NewIntDatum(0),                                 // typelem
 		NewIntDatum(int64(et.ArrayOID)),                // typarray (auto-generated `_name` array type; DU-002 slice 89)
-		NewIntDatum(0),                                 // typinput
-		NewIntDatum(0),                                 // typoutput
-		NewIntDatum(0),                                 // typreceive
-		NewIntDatum(0),                                 // typsend
+		NewIntDatum(3506),                              // typinput (enum_in/out/recv/send; B2.1c)
+		NewIntDatum(3507),                              // typoutput
+		NewIntDatum(3532),                              // typreceive
+		NewIntDatum(3533),                              // typsend
 		NewIntDatum(0),                                 // typmodin
 		NewIntDatum(0),                                 // typmodout
 		NewIntDatum(0),                                 // typanalyze
@@ -1501,10 +1501,10 @@ func buildUserPGTypeRowForEnumArray(et *catalog.EnumType) Row {
 		NewIntDatum(0),                                 // typsubscript
 		NewIntDatum(int64(et.OID)),                     // typelem = the enum element type
 		NewIntDatum(0),                                 // typarray
-		NewIntDatum(0),                                 // typinput
-		NewIntDatum(0),                                 // typoutput
-		NewIntDatum(0),                                 // typreceive
-		NewIntDatum(0),                                 // typsend
+		NewIntDatum(750),                               // typinput (array_in/out/recv/send; B2.1c)
+		NewIntDatum(751),                               // typoutput
+		NewIntDatum(2400),                              // typreceive
+		NewIntDatum(2401),                              // typsend
 		NewIntDatum(0),                                 // typmodin
 		NewIntDatum(0),                                 // typmodout
 		NewIntDatum(0),                                 // typanalyze
@@ -1545,10 +1545,10 @@ func buildUserPGTypeRowForComposite(ct *catalog.CompositeType) Row {
 		NewIntDatum(0),                                 // typsubscript
 		NewIntDatum(0),                                 // typelem
 		NewIntDatum(int64(ct.ArrayOID)),                // typarray (auto-generated `_name` array type)
-		NewIntDatum(0),                                 // typinput
-		NewIntDatum(0),                                 // typoutput
-		NewIntDatum(0),                                 // typreceive
-		NewIntDatum(0),                                 // typsend
+		NewIntDatum(2290),                              // typinput (record_in/out/recv/send; B2.1c)
+		NewIntDatum(2291),                              // typoutput
+		NewIntDatum(2402),                              // typreceive
+		NewIntDatum(2403),                              // typsend
 		NewIntDatum(0),                                 // typmodin
 		NewIntDatum(0),                                 // typmodout
 		NewIntDatum(0),                                 // typanalyze
@@ -1585,10 +1585,10 @@ func buildUserPGTypeRowForCompositeArray(ct *catalog.CompositeType) Row {
 		NewIntDatum(0),                                 // typsubscript
 		NewIntDatum(int64(ct.OID)),                     // typelem = the composite element type
 		NewIntDatum(0),                                 // typarray
-		NewIntDatum(0),                                 // typinput
-		NewIntDatum(0),                                 // typoutput
-		NewIntDatum(0),                                 // typreceive
-		NewIntDatum(0),                                 // typsend
+		NewIntDatum(750),                               // typinput (array_in/out/recv/send; B2.1c)
+		NewIntDatum(751),                               // typoutput
+		NewIntDatum(2400),                              // typreceive
+		NewIntDatum(2401),                              // typsend
 		NewIntDatum(0),                                 // typmodin
 		NewIntDatum(0),                                 // typmodout
 		NewIntDatum(0),                                 // typanalyze
@@ -2091,10 +2091,10 @@ func buildUserPGTypeRowForDomainArray(d *catalog.Domain) Row {
 		NewIntDatum(0),                                 // typsubscript
 		NewIntDatum(int64(d.OID)),                      // typelem = the domain element type
 		NewIntDatum(0),                                 // typarray
-		NewIntDatum(0),                                 // typinput
-		NewIntDatum(0),                                 // typoutput
-		NewIntDatum(0),                                 // typreceive
-		NewIntDatum(0),                                 // typsend
+		NewIntDatum(750),                               // typinput (array_in/out/recv/send; B2.1c)
+		NewIntDatum(751),                               // typoutput
+		NewIntDatum(2400),                              // typreceive
+		NewIntDatum(2401),                              // typsend
 		NewIntDatum(0),                                 // typmodin
 		NewIntDatum(0),                                 // typmodout
 		NewIntDatum(0),                                 // typanalyze
@@ -2130,34 +2130,34 @@ func buildUserPGTypeRowForRange(rt *catalog.RangeType) Row {
 		NewStringDatum(rt.Name),                        // typname
 		NewIntDatum(int64(catalog.PublicNamespaceOID)), // typnamespace
 		NewIntDatum(int64(rt.OwnerOrDefault())),        // typowner
-		NewIntDatum(-1),                                 // typlen (always varlena)
-		NewBoolDatum(false),                             // typbyval
-		NewStringDatum("r"),                             // typtype = 'r' (range)
-		NewStringDatum("R"),                             // typcategory = TYPCATEGORY_RANGE
-		NewBoolDatum(false),                             // typispreferred
-		NewBoolDatum(true),                              // typisdefined
-		NewStringDatum(","),                             // typdelim
-		NewIntDatum(0),                                  // typrelid
-		NewIntDatum(0),                                  // typsubscript
-		NewIntDatum(0),                                  // typelem
-		NewIntDatum(int64(rt.ArrayOID)),                 // typarray (auto-generated `_name` array type)
-		NewIntDatum(0),                                  // typinput
-		NewIntDatum(0),                                  // typoutput
-		NewIntDatum(0),                                  // typreceive
-		NewIntDatum(0),                                  // typsend
-		NewIntDatum(0),                                  // typmodin
-		NewIntDatum(0),                                  // typmodout
-		NewIntDatum(0),                                  // typanalyze
-		NewStringDatum(string(align)),                   // typalign
-		NewStringDatum("x"),                             // typstorage = 'x' (extended)
-		NewBoolDatum(false),                             // typnotnull
-		NewIntDatum(0),                                  // typbasetype
-		NewIntDatum(-1),                                 // typtypmod
-		NewIntDatum(0),                                  // typndims
-		NewIntDatum(0),                                  // typcollation (ranges never have one)
-		NullDatum,                                       // typdefaultbin
-		NullDatum,                                       // typdefault
-		NullDatum,                                       // typacl
+		NewIntDatum(-1),                                // typlen (always varlena)
+		NewBoolDatum(false),                            // typbyval
+		NewStringDatum("r"),                            // typtype = 'r' (range)
+		NewStringDatum("R"),                            // typcategory = TYPCATEGORY_RANGE
+		NewBoolDatum(false),                            // typispreferred
+		NewBoolDatum(true),                             // typisdefined
+		NewStringDatum(","),                            // typdelim
+		NewIntDatum(0),                                 // typrelid
+		NewIntDatum(0),                                 // typsubscript
+		NewIntDatum(0),                                 // typelem
+		NewIntDatum(int64(rt.ArrayOID)),                // typarray (auto-generated `_name` array type)
+		NewIntDatum(3834),                              // typinput (range_in/out/recv/send; B2.1c)
+		NewIntDatum(3835),                              // typoutput
+		NewIntDatum(3836),                              // typreceive
+		NewIntDatum(3837),                              // typsend
+		NewIntDatum(0),                                 // typmodin
+		NewIntDatum(0),                                 // typmodout
+		NewIntDatum(0),                                 // typanalyze
+		NewStringDatum(string(align)),                  // typalign
+		NewStringDatum("x"),                            // typstorage = 'x' (extended)
+		NewBoolDatum(false),                            // typnotnull
+		NewIntDatum(0),                                 // typbasetype
+		NewIntDatum(-1),                                // typtypmod
+		NewIntDatum(0),                                 // typndims
+		NewIntDatum(0),                                 // typcollation (ranges never have one)
+		NullDatum,                                      // typdefaultbin
+		NullDatum,                                      // typdefault
+		NullDatum,                                      // typacl
 	}
 }
 
@@ -2178,34 +2178,34 @@ func buildUserPGTypeRowForMultirange(rt *catalog.RangeType) Row {
 		NewStringDatum(rt.MultirangeName),              // typname
 		NewIntDatum(int64(catalog.PublicNamespaceOID)), // typnamespace
 		NewIntDatum(int64(rt.OwnerOrDefault())),        // typowner
-		NewIntDatum(-1),                                 // typlen (always varlena)
-		NewBoolDatum(false),                             // typbyval
-		NewStringDatum("m"),                             // typtype = 'm' (multirange)
-		NewStringDatum("R"),                             // typcategory = TYPCATEGORY_RANGE
-		NewBoolDatum(false),                             // typispreferred
-		NewBoolDatum(true),                              // typisdefined
-		NewStringDatum(","),                             // typdelim
-		NewIntDatum(0),                                  // typrelid
-		NewIntDatum(0),                                  // typsubscript
-		NewIntDatum(0),                                  // typelem
-		NewIntDatum(int64(rt.MultirangeArrayOID)),       // typarray (auto-generated `_name` array type)
-		NewIntDatum(0),                                  // typinput
-		NewIntDatum(0),                                  // typoutput
-		NewIntDatum(0),                                  // typreceive
-		NewIntDatum(0),                                  // typsend
-		NewIntDatum(0),                                  // typmodin
-		NewIntDatum(0),                                  // typmodout
-		NewIntDatum(0),                                  // typanalyze
-		NewStringDatum(string(align)),                   // typalign
-		NewStringDatum("x"),                             // typstorage = 'x' (extended)
-		NewBoolDatum(false),                             // typnotnull
-		NewIntDatum(0),                                  // typbasetype
-		NewIntDatum(-1),                                 // typtypmod
-		NewIntDatum(0),                                  // typndims
-		NewIntDatum(0),                                  // typcollation
-		NullDatum,                                       // typdefaultbin
-		NullDatum,                                       // typdefault
-		NullDatum,                                       // typacl
+		NewIntDatum(-1),                                // typlen (always varlena)
+		NewBoolDatum(false),                            // typbyval
+		NewStringDatum("m"),                            // typtype = 'm' (multirange)
+		NewStringDatum("R"),                            // typcategory = TYPCATEGORY_RANGE
+		NewBoolDatum(false),                            // typispreferred
+		NewBoolDatum(true),                             // typisdefined
+		NewStringDatum(","),                            // typdelim
+		NewIntDatum(0),                                 // typrelid
+		NewIntDatum(0),                                 // typsubscript
+		NewIntDatum(0),                                 // typelem
+		NewIntDatum(int64(rt.MultirangeArrayOID)),      // typarray (auto-generated `_name` array type)
+		NewIntDatum(4231),                              // typinput (multirange_in/out/recv/send; B2.1c)
+		NewIntDatum(4232),                              // typoutput
+		NewIntDatum(4233),                              // typreceive
+		NewIntDatum(4234),                              // typsend
+		NewIntDatum(0),                                 // typmodin
+		NewIntDatum(0),                                 // typmodout
+		NewIntDatum(0),                                 // typanalyze
+		NewStringDatum(string(align)),                  // typalign
+		NewStringDatum("x"),                            // typstorage = 'x' (extended)
+		NewBoolDatum(false),                            // typnotnull
+		NewIntDatum(0),                                 // typbasetype
+		NewIntDatum(-1),                                // typtypmod
+		NewIntDatum(0),                                 // typndims
+		NewIntDatum(0),                                 // typcollation
+		NullDatum,                                      // typdefaultbin
+		NullDatum,                                      // typdefault
+		NullDatum,                                      // typacl
 	}
 }
 
@@ -2225,34 +2225,34 @@ func buildUserPGTypeRowForRangeArray(rt *catalog.RangeType) Row {
 		NewStringDatum("_" + rt.Name),                  // typname (array type name)
 		NewIntDatum(int64(catalog.PublicNamespaceOID)), // typnamespace = public
 		NewIntDatum(int64(rt.OwnerOrDefault())),        // typowner
-		NewIntDatum(-1),                                 // typlen (varlena array)
-		NewBoolDatum(false),                             // typbyval
-		NewStringDatum("b"),                             // typtype = 'b' (base)
-		NewStringDatum("A"),                             // typcategory = TYPCATEGORY_ARRAY
-		NewBoolDatum(false),                             // typispreferred
-		NewBoolDatum(true),                              // typisdefined
-		NewStringDatum(","),                             // typdelim
-		NewIntDatum(0),                                  // typrelid
-		NewIntDatum(0),                                  // typsubscript
-		NewIntDatum(int64(rt.OID)),                      // typelem = the range element type
-		NewIntDatum(0),                                  // typarray
-		NewIntDatum(0),                                  // typinput
-		NewIntDatum(0),                                  // typoutput
-		NewIntDatum(0),                                  // typreceive
-		NewIntDatum(0),                                  // typsend
-		NewIntDatum(0),                                  // typmodin
-		NewIntDatum(0),                                  // typmodout
-		NewIntDatum(0),                                  // typanalyze
-		NewStringDatum(string(align)),                   // typalign (matches the range element's alignment)
-		NewStringDatum("x"),                             // typstorage = 'x' (extended)
-		NewBoolDatum(false),                             // typnotnull
-		NewIntDatum(0),                                  // typbasetype
-		NewIntDatum(-1),                                 // typtypmod
-		NewIntDatum(0),                                  // typndims
-		NewIntDatum(0),                                  // typcollation
-		NullDatum,                                       // typdefaultbin
-		NullDatum,                                       // typdefault
-		NullDatum,                                       // typacl
+		NewIntDatum(-1),                                // typlen (varlena array)
+		NewBoolDatum(false),                            // typbyval
+		NewStringDatum("b"),                            // typtype = 'b' (base)
+		NewStringDatum("A"),                            // typcategory = TYPCATEGORY_ARRAY
+		NewBoolDatum(false),                            // typispreferred
+		NewBoolDatum(true),                             // typisdefined
+		NewStringDatum(","),                            // typdelim
+		NewIntDatum(0),                                 // typrelid
+		NewIntDatum(0),                                 // typsubscript
+		NewIntDatum(int64(rt.OID)),                     // typelem = the range element type
+		NewIntDatum(0),                                 // typarray
+		NewIntDatum(750),                               // typinput (array_in/out/recv/send; B2.1c)
+		NewIntDatum(751),                               // typoutput
+		NewIntDatum(2400),                              // typreceive
+		NewIntDatum(2401),                              // typsend
+		NewIntDatum(0),                                 // typmodin
+		NewIntDatum(0),                                 // typmodout
+		NewIntDatum(0),                                 // typanalyze
+		NewStringDatum(string(align)),                  // typalign (matches the range element's alignment)
+		NewStringDatum("x"),                            // typstorage = 'x' (extended)
+		NewBoolDatum(false),                            // typnotnull
+		NewIntDatum(0),                                 // typbasetype
+		NewIntDatum(-1),                                // typtypmod
+		NewIntDatum(0),                                 // typndims
+		NewIntDatum(0),                                 // typcollation
+		NullDatum,                                      // typdefaultbin
+		NullDatum,                                      // typdefault
+		NullDatum,                                      // typacl
 	}
 }
 
@@ -2271,34 +2271,34 @@ func buildUserPGTypeRowForMultirangeArray(rt *catalog.RangeType) Row {
 		NewStringDatum("_" + rt.MultirangeName),        // typname (array type name)
 		NewIntDatum(int64(catalog.PublicNamespaceOID)), // typnamespace = public
 		NewIntDatum(int64(rt.OwnerOrDefault())),        // typowner
-		NewIntDatum(-1),                                 // typlen (varlena array)
-		NewBoolDatum(false),                             // typbyval
-		NewStringDatum("b"),                             // typtype = 'b' (base)
-		NewStringDatum("A"),                             // typcategory = TYPCATEGORY_ARRAY
-		NewBoolDatum(false),                             // typispreferred
-		NewBoolDatum(true),                              // typisdefined
-		NewStringDatum(","),                             // typdelim
-		NewIntDatum(0),                                  // typrelid
-		NewIntDatum(0),                                  // typsubscript
-		NewIntDatum(int64(rt.MultirangeOID)),            // typelem = the multirange element type
-		NewIntDatum(0),                                  // typarray
-		NewIntDatum(0),                                  // typinput
-		NewIntDatum(0),                                  // typoutput
-		NewIntDatum(0),                                  // typreceive
-		NewIntDatum(0),                                  // typsend
-		NewIntDatum(0),                                  // typmodin
-		NewIntDatum(0),                                  // typmodout
-		NewIntDatum(0),                                  // typanalyze
-		NewStringDatum(string(align)),                   // typalign (matches the multirange element's alignment)
-		NewStringDatum("x"),                             // typstorage = 'x' (extended)
-		NewBoolDatum(false),                             // typnotnull
-		NewIntDatum(0),                                  // typbasetype
-		NewIntDatum(-1),                                 // typtypmod
-		NewIntDatum(0),                                  // typndims
-		NewIntDatum(0),                                  // typcollation
-		NullDatum,                                       // typdefaultbin
-		NullDatum,                                       // typdefault
-		NullDatum,                                       // typacl
+		NewIntDatum(-1),                                // typlen (varlena array)
+		NewBoolDatum(false),                            // typbyval
+		NewStringDatum("b"),                            // typtype = 'b' (base)
+		NewStringDatum("A"),                            // typcategory = TYPCATEGORY_ARRAY
+		NewBoolDatum(false),                            // typispreferred
+		NewBoolDatum(true),                             // typisdefined
+		NewStringDatum(","),                            // typdelim
+		NewIntDatum(0),                                 // typrelid
+		NewIntDatum(0),                                 // typsubscript
+		NewIntDatum(int64(rt.MultirangeOID)),           // typelem = the multirange element type
+		NewIntDatum(0),                                 // typarray
+		NewIntDatum(750),                               // typinput (array_in/out/recv/send; B2.1c)
+		NewIntDatum(751),                               // typoutput
+		NewIntDatum(2400),                              // typreceive
+		NewIntDatum(2401),                              // typsend
+		NewIntDatum(0),                                 // typmodin
+		NewIntDatum(0),                                 // typmodout
+		NewIntDatum(0),                                 // typanalyze
+		NewStringDatum(string(align)),                  // typalign (matches the multirange element's alignment)
+		NewStringDatum("x"),                            // typstorage = 'x' (extended)
+		NewBoolDatum(false),                            // typnotnull
+		NewIntDatum(0),                                 // typbasetype
+		NewIntDatum(-1),                                // typtypmod
+		NewIntDatum(0),                                 // typndims
+		NewIntDatum(0),                                 // typcollation
+		NullDatum,                                      // typdefaultbin
+		NullDatum,                                      // typdefault
+		NullDatum,                                      // typacl
 	}
 }
 

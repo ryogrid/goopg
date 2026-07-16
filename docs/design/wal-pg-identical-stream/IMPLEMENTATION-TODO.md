@@ -320,8 +320,19 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
     pre-existing gap). e2e: CREATE DOMAIN streams as pure heap records; promoted PG casts
     42::public.b2prep_dom. New TestPort_DomainSurvivesRestart (CHECK enforcement + RENAME +
     SET DEFAULT across restart); pg_waldump workload += domain create/alter/drop.
-  - [ ] **B2.1c ranges** — retire kinds 81/82/117/118 + range_type_ddl_recovery.go; same pattern;
-    plus real pg_range heap row + 3542/2228 entries.
+  - [x] **B2.1c ranges** — LANDED. Kinds 81/82/117/118 + codecs + dispatch arm +
+    range_type_ddl_recovery.go DELETED. CREATE TYPE AS RANGE journals the 4 pg_type rows (existing)
+    + a NEW pg_range heap row (sys_pg_range.go, 7-col Form_pg_range, keyed rngtypid — no oid col)
+    with 3542/2228 index entries; DROP stamps it; ALTER RENAME/OWNER = non-HOT pg_type updates of
+    all four rows via the TypeHeapTID cache (resyncRangeHeapAfterAlter). Reload
+    (reloadUserRangeTypesFromHeap) is fully physical: the pg_range row carries the linkage
+    (subtype/multirange/opclass/collation), joined with the range + multirange pg_type rows
+    (names/array peers/owner); subtype name via pgTypeCanonical. RegisterRangeTypeDuringRecovery
+    got the same DBOid-keying fix as domains. ALL nine type builders now carry real I/O proc OIDs
+    (enum_in 3506-, record_in 2290-, range_in 3834-, multirange_in 4231-, array_in 750- —
+    pg_proc.dat-verified). e2e failover: goopg CREATE TYPE AS RANGE → promoted PG executes
+    '[1,5)'::public.b2prep_rng (RANGETYPE syscache → runtime 3542 entry → pg_range row).
+    New TestPort_RangeTypeSurvivesRestart; waldump workload += range create/rename/drop.
   - [ ] **B2.1d enum labels** — pg_enum heap rows + 3502/3503/3534 entries; enum registry reload
     (TODAY enums have NO restart durability at all — labels live only in memory); ALTER TYPE ADD
     VALUE becomes a real pg_enum INSERT.

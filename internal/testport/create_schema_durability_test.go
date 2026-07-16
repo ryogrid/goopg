@@ -306,3 +306,58 @@ func TestPort_DomainSurvivesRestart(t *testing.T) {
 		t.Fatalf("post-restart old-name pg_type count = %q, want 0 (rename left stale row)", got)
 	}
 }
+
+// TestPort_RangeTypeSurvivesRestart pins B2.1c's range-type heap journaling:
+// CREATE TYPE AS RANGE reloads from its pg_range + pg_type heap rows —
+// replacing the retired kind-81/82/117/118 WAL scanner — and ALTER TYPE
+// RENAME/OWNER survive via non-HOT pg_type heap updates.
+func TestPort_RangeTypeSurvivesRestart(t *testing.T) {
+	c, err := cluster.New("range-durability", cluster.Options{
+		RepoRoot:     repoRoot(t),
+		DataDir:      filepath.Join(t.TempDir(), "data"),
+		StartupWait:  20 * time.Second,
+		ShutdownWait: 20 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+
+	if err := runSQLSimple(t, c, "CREATE TYPE b21c_r AS RANGE (subtype = int4)"); err != nil {
+		t.Fatalf("CREATE TYPE AS RANGE: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TYPE b21c_old AS RANGE (subtype = int8)"); err != nil {
+		t.Fatalf("CREATE TYPE AS RANGE b21c_old: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER TYPE b21c_old RENAME TO b21c_renamed"); err != nil {
+		t.Fatalf("ALTER TYPE RENAME: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TYPE b21c_gone AS RANGE (subtype = date)"); err != nil {
+		t.Fatalf("CREATE TYPE AS RANGE b21c_gone: %v", err)
+	}
+	if err := runSQLSimple(t, c, "DROP TYPE b21c_gone"); err != nil {
+		t.Fatalf("DROP TYPE: %v", err)
+	}
+
+	if err := c.Stop(cluster.ShutdownFast); err != nil {
+		t.Fatalf("stop cluster: %v", err)
+	}
+	if err := c.Start(); err != nil {
+		t.Fatalf("restart cluster: %v", err)
+	}
+
+	// The range type + its multirange linkage must be usable post-restart.
+	if got := queryScalar(t, c, "SELECT '[1,5)'::b21c_r::text"); got != "[1,5)" {
+		t.Fatalf("post-restart range cast = %q, want [1,5)", got)
+	}
+	if got := queryScalar(t, c, "SELECT '[10,20)'::b21c_renamed::text"); got != "[10,20)" {
+		t.Fatalf("post-restart renamed range cast = %q, want [10,20) (RENAME not durable)", got)
+	}
+	if got := queryScalar(t, c, "SELECT count(*) FROM pg_type WHERE typname = 'b21c_gone'"); got != "0" {
+		t.Fatalf("post-restart dropped range pg_type count = %q, want 0", got)
+	}
+	if got := queryScalar(t, c, "SELECT count(*) FROM pg_range r JOIN pg_type t ON t.oid = r.rngtypid WHERE t.typname = 'b21c_r'"); got != "1" {
+		t.Fatalf("post-restart pg_range row count = %q, want 1", got)
+	}
+}

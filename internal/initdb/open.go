@@ -2052,11 +2052,16 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// RANGE objects from the WAL. Like access methods, range types are keyed
 	// by a plain name string, so order relative to schema replay does not
 	// matter.
-	if err := replayRangeTypeDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
-		_ = pool.Close()
-		_ = walWriter.Close()
-		_ = mgr.Close()
-		return nil, fmt.Errorf("goopg: range type DDL replay: %w", err)
+	// B2.1c: range types reload from the pg_range + pg_type HEAPS (generic
+	// scan, doc 02a §2) — replaced replayRangeTypeDDLRecords' bespoke WAL
+	// scan (RecordKinds 81/82/117/118, retired).
+	if cat != nil {
+		if err := reloadUserRangeTypesFromHeap(mgr, cat, clog); err != nil {
+			_ = pool.Close()
+			_ = walWriter.Close()
+			_ = mgr.Close()
+			return nil, fmt.Errorf("goopg: range type heap reload: %w", err)
+		}
 	}
 
 	// M0122-0005 restart-persistence follow-up (deferral ledger 2026-07-06

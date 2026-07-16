@@ -21298,12 +21298,14 @@ func (c *InMemory) RegisterRangeTypeDuringRecovery(rt *RangeType) {
 		c.rangeTypes = make(map[string]*RangeType)
 	}
 	out := *rt
-	// WAL replay does not yet carry a dbOid for range-type records (see the
-	// DBOid field's doc comment) — every replayed range type lands under
-	// DefaultDBOid, matching every other not-yet-migrated write path's
-	// restart behavior (domains/collations/enums/composites).
-	out.DBOid = DefaultDBOid
-	c.rangeTypes[rangeKey(DefaultDBOid, rt.Name)] = &out
+	// B2.1c: the heap reload passes the scanned database's OID in rt.DBOid
+	// (cat.DBOID() — the OID a live session resolves for LookupRangeType;
+	// see RegisterDomainDuringRecovery's identical fix). Zero falls back to
+	// DefaultDBOid for legacy callers.
+	if out.DBOid == 0 {
+		out.DBOid = DefaultDBOid
+	}
+	c.rangeTypes[rangeKey(out.DBOid, rt.Name)] = &out
 	c.advanceNextOIDLocked(rt.OID)
 	c.advanceNextOIDLocked(rt.ArrayOID)
 	c.advanceNextOIDLocked(rt.MultirangeOID)
@@ -21325,7 +21327,8 @@ func (c *InMemory) SetRangeTypeOwnerDuringRecovery(name string, ownerOID uint32)
 }
 
 // DropRangeTypeDuringRecovery is the idempotent counterpart used for
-// replaying RecordKindDropRangeType. Identical to DropRangeType but discards
+// the startup heap reload (B2.1c — formerly the retired RecordKindDropRangeType
+// replay). Identical to DropRangeType but discards
 // the found/not-found result — replay does not care whether the range type
 // was still present. DU-002 restart-persistence follow-up (M0110-0001,
 // DU-002 slice 429 ledger resume point, sub-item (c)).

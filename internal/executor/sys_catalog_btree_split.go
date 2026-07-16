@@ -83,6 +83,12 @@ func keyMetaForSysBtree(indexOID uint32) (btreeIndexKeyMeta, bool) {
 		return btreeIndexKeyMeta{tupleSize: 16, nkeyatts: 1}, true
 	case pgTypeTypnameNspIndexOID:
 		return btreeIndexKeyMeta{tupleSize: 80, nkeyatts: 2}, true
+	// B2.1c: pg_range — both bootstrap as populated leaf-roots (6 builtin
+	// range rows each).
+	case pgRangeRngtypidIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 16, nkeyatts: 1}, true
+	case pgRangeRngmultitypidIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 16, nkeyatts: 1}, true
 	default:
 		return btreeIndexKeyMeta{}, false
 	}

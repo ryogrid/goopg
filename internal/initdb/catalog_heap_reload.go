@@ -496,3 +496,101 @@ func reloadUserDomainsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog
 	}
 	return nil
 }
+
+// reloadUserRangeTypesFromHeap is B2.1c's range-type reload — the generic
+// heap-scan replacement for the retired replayRangeTypeDDLRecords scanner
+// (RecordKinds 81/82/117/118). The registry entry reconstructs fully
+// physically: the pg_range row (rngtypid >= FirstUserOID) carries the
+// linkage (subtype, multirange, opclass, collation); the range and
+// multirange pg_type rows carry names/array peers/owner; the subtype name
+// resolves via pgTypeCanonical.
+func reloadUserRangeTypesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+	rangeCols := executor.PGRangeColumnsPG18()
+	type rangeRow struct {
+		typid, subtype, multitypid, collation, subopc uint32
+	}
+	rel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 3541, Fork: storage.MainFork}
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_range",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			decoded := make(executor.Row, len(rangeCols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, rangeCols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			if uint32(decoded[0].Int) < catalog.FirstUserOID {
+				return nil, false, errSkipBuiltinRow
+			}
+			return rangeRow{
+				typid:      uint32(decoded[0].Int),
+				subtype:    uint32(decoded[1].Int),
+				multitypid: uint32(decoded[2].Int),
+				collation:  uint32(decoded[3].Int),
+				subopc:     uint32(decoded[4].Int),
+			}, false, nil
+		})
+	if err != nil || len(rows) == 0 {
+		return err
+	}
+
+	// One pg_type pass collecting the user rows the linkage needs
+	// (names, array peers, owner).
+	typeCols := executor.PGTypeColumnsPG18()
+	type typeInfo struct {
+		name     string
+		arrayOID uint32
+		owner    uint32
+	}
+	typeRel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: catalog.TypeRelationId, Fork: storage.MainFork}
+	typeRows, err := scanCatalogHeapRows(mgr, typeRel, clog, "pg_type",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			decoded := make(executor.Row, len(typeCols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, typeCols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			oid := uint32(decoded[0].Int)
+			if oid < catalog.FirstUserOID {
+				return nil, false, errSkipBuiltinRow
+			}
+			return [2]any{oid, typeInfo{
+				name:     decoded[1].StringValue(),
+				arrayOID: uint32(decoded[14].Int),
+				owner:    uint32(decoded[3].Int),
+			}}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+	types := make(map[uint32]typeInfo, len(typeRows))
+	for _, raw := range typeRows {
+		pair := raw.([2]any)
+		types[pair[0].(uint32)] = pair[1].(typeInfo)
+	}
+
+	for _, raw := range rows {
+		rr := raw.(rangeRow)
+		rangeT, ok := types[rr.typid]
+		if !ok {
+			continue // pg_type row dead (dropped range) — skip
+		}
+		multiT := types[rr.multitypid]
+		subtypeName := "text"
+		if e, ok := pgTypeCanonical(rr.subtype); ok {
+			subtypeName = e.Name
+		}
+		cat.RegisterRangeTypeDuringRecovery(&catalog.RangeType{
+			Name:               rangeT.name,
+			OID:                rr.typid,
+			DBOid:              cat.DBOID(),
+			ArrayOID:           rangeT.arrayOID,
+			SubtypeName:        subtypeName,
+			OpclassOID:         rr.subopc,
+			CollationOID:       rr.collation,
+			MultirangeOID:      rr.multitypid,
+			MultirangeArrayOID: multiT.arrayOID,
+			MultirangeName:     multiT.name,
+			Owner:              rangeT.owner,
+		})
+	}
+	return nil
+}
