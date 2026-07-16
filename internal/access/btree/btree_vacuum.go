@@ -99,14 +99,12 @@ func (bt *BTree) VacuumIndexPages(deadTIDs []storage.ItemPointer) (int, error) {
 		var justEmptied *emptyLeafInfo
 		if len(kept) < len(items) {
 			resetPageItems(slot.Page())
-			keptRaw := make([][]byte, 0, len(kept))
 			for _, it := range kept {
 				raw := it.marshal()
 				if _, err := storage.PageAddItemRaw(slot.Page(), raw); err != nil {
 					bt.unpinW(slot)
 					return totalRemoved, err
 				}
-				keptRaw = append(keptRaw, raw)
 			}
 			if len(kept) == 0 {
 				// M0055-0005-followup-two-phase-del: PHASE 1 mark.
@@ -141,9 +139,10 @@ func (bt *BTree) VacuumIndexPages(deadTIDs []storage.ItemPointer) (int, error) {
 				writeOpaque(slot.Page(), opAfter)
 			}
 			if logVac := bt.pool.LogBtreeVacuum(); logVac != nil {
-				flagsAfter := readOpaque(slot.Page()).Flags
+				// A8: the record carries the post-vacuum page as a full-page
+				// image, so pass the mutated page rather than the kept items.
 				if err := bt.pool.MarkDirtyChangeRecord(slot, func() (storage.LSN, error) {
-					return logVac(bt.rel, cur, keptRaw, flagsAfter)
+					return logVac(bt.rel, cur, slot.Page())
 				}); err != nil {
 					bt.unpinW(slot)
 					return totalRemoved, err
@@ -1253,18 +1252,37 @@ func (bt *BTree) resetToEmptyRoot() error {
 		Flags: BTLeaf | BTRoot,
 	})
 
-	// M0079-0004: emit a single LogBtreeNewRoot record covering
-	// both the empty-leaf-root content (no items) + metapage
-	// update. Falls back to per-page FPI when the hook is unset.
+	// M0079-0004 / A8: emit a single PG RM_BTREE new-root record covering
+	// both the empty-leaf-root page (backup block 0) and the updated metapage
+	// (backup block 2) as full-page images. The metapage is mutated in memory
+	// HERE — before the emit — so its post-op bytes ride the same record; both
+	// pages' pd_lsn is then stamped to the record LSN. Each newroot holds its
+	// own private root slot then the shared metapage, so co-locking is
+	// deadlock-free even across connections. Falls back to per-page FPI when
+	// the hook is unset.
 	if emitter := bt.pool.LogBtreeNewRoot(); emitter != nil {
-		lsn, err := emitter(bt.rel, rootBlk, 0, nil)
+		metaSlot, err := bt.pinW(MetaBlock)
 		if err != nil {
 			bt.unpinW(rootSlot)
 			return err
 		}
+		m := parseMeta(metaSlot.Page())
+		m.Root = rootBlk
+		m.Level = 0
+		m.FastRoot = rootBlk
+		m.FastLevel = 0
+		writeMeta(metaSlot.Page(), m)
+		lsn, err := emitter(bt.rel, rootBlk, rootSlot.Page(), MetaBlock, metaSlot.Page())
+		if err != nil {
+			bt.unpinW(metaSlot)
+			bt.unpinW(rootSlot)
+			return err
+		}
 		bt.pool.MarkDirtyWithLSNLocked(rootSlot, lsn)
+		bt.pool.MarkDirtyWithLSNLocked(metaSlot, lsn)
+		bt.unpinW(metaSlot)
 		bt.unpinW(rootSlot)
-		return bt.updateRootMetaWithLSN(rootBlk, 0, lsn)
+		return nil
 	}
 	if err := bt.markDirtyWithPageRecord(rootSlot, rootBlk); err != nil {
 		bt.unpinW(rootSlot)

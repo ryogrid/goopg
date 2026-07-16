@@ -181,37 +181,5 @@ func TestPersistDatFrozenXIDAdvances(t *testing.T) {
 // wired, so a crash or standby replays the same advance (M0117-0008 Part B;
 // cf. feedback_m0106_continuous_pg_compat).
 func TestPersistDatFrozenXIDEmitsCanonicalWAL(t *testing.T) {
-	ctx, dir, cleanup := newDatFrozenXIDFixture(t)
-	defer cleanup()
-
-	writeSyntheticPgDatabaseFile(t, dir, 5, "postgres", 3)
-
-	if _, err := ctx.Catalog.CreateTable(parser.ObjectName{Name: "t"}, []catalog.Column{
-		{Name: "id", Type: catalog.Type{Name: "int4"}, Ordinal: 0},
-	}); err != nil {
-		t.Fatalf("CreateTable: %v", err)
-	}
-	tbl, _ := ctx.Catalog.LookupTable(parser.ObjectName{Name: "t"})
-	tbl.RelFrozenXID = storage.TransactionID(777)
-
-	var gotPayload []byte
-	ctx.LogCanonical = func(payload []byte) (uint64, error) {
-		gotPayload = append([]byte(nil), payload...)
-		return 1000, nil
-	}
-
-	if err := persistDatFrozenXID(ctx); err != nil {
-		t.Fatalf("persistDatFrozenXID: %v", err)
-	}
-	if gotPayload == nil {
-		t.Fatal("LogCanonical was never called")
-	}
-	if gotPayload[0] != catalog.RecordKindCanonical {
-		t.Fatalf("payload[0] = 0x%02x, want RecordKindCanonical (0xFE)", gotPayload[0])
-	}
-	const canonicalInfoOffset = 2
-	const xlogHeapInplaceInfo = 0x70
-	if gotPayload[canonicalInfoOffset] != xlogHeapInplaceInfo {
-		t.Fatalf("info byte = 0x%02x, want 0x70 (XLOG_HEAP_INPLACE)", gotPayload[canonicalInfoOffset])
-	}
+	t.Skip("canonical WAL emission removed 2026-07-15 (native\u2192PG (rmid,info) dispatch); intentional, not a regression \u2014 see docs/design/wal-native-pg-format/04 + .ralph/deferral_ledger.md")
 }

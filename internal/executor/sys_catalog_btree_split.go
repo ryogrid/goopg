@@ -16,13 +16,7 @@ package executor
 // into two leaves (block 1 = left half, freshly-extended block = right half)
 // and promote a new internal root (another freshly-extended block) above
 // them. Update the metapage at block 0 to point at the new root with
-// `btm_level=1`. Emit four PG-canonical FPI WAL records — one per modified
-// block — so a PG18 standby restores all four pages from FPI on replay.
-//
-// The split uses FPI (full-page image) for every modified block, so PG's
-// btree_xlog_insert returns BLK_RESTORED on each redo call and the per-tuple
-// logic never runs. This sidesteps having to emit a proper XLOG_BTREE_SPLIT_L
-// record with the correct per-tuple metadata.
+// `btm_level=1`.
 //
 // The page-build helpers below duplicate `internal/initdb/btree_index_bootstrap.go`
 // — duplicated because `executor` cannot import `initdb` (cycle).
@@ -32,7 +26,6 @@ import (
 	"fmt"
 	"math"
 
-	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -280,8 +273,6 @@ func mergeSortedSlice(existing [][]byte, newTuple []byte, cmp keyCompareFn) ([][
 //   - Block 1 is rewritten as a leaf-only page (left half of split).
 //   - Two new blocks are appended to the relfile: right leaf + new internal root.
 //   - Block 0 (metapage) is rewritten to point at the new root, level=1.
-//   - Four canonical XLOG_BTREE_INSERT_LEAF FPI WAL records are emitted (one
-//     per modified block) so PG18 standby restores all pages from FPI.
 //
 // On return, leafSlot is still locked and pinned. The caller is responsible
 // for unlocking/unpinning it.
@@ -390,62 +381,10 @@ func splitLeafRootAndInsert(
 		return fmt.Errorf("split: write metapage: %w", err)
 	}
 
-	// Snapshot pages for WAL FPI before marking dirty (the FPI must reflect
-	// the exact bytes installed above).
-	leftCopy := make(storage.Page, storage.BlockSize)
-	rightCopy := make(storage.Page, storage.BlockSize)
-	rootCopy := make(storage.Page, storage.BlockSize)
-	metaCopy := make(storage.Page, storage.BlockSize)
-	copy(leftCopy, leafSlot.Page())
-	copy(rightCopy, rightSlot.Page())
-	copy(rootCopy, rootSlot.Page())
-	copy(metaCopy, metaSlot.Page())
-
 	ctx.Pool.MarkDirty(leafSlot)
 	ctx.Pool.MarkDirty(rightSlot)
 	ctx.Pool.MarkDirty(rootSlot)
 	ctx.Pool.MarkDirty(metaSlot)
-
-	if ctx.LogCanonical != nil {
-		xid := uint32(ctx.Tx.XID)
-		// Children first, then internal root, then metapage. Each record
-		// carries a FPI of the new page state. M0106-0010 batched-42 H1:
-		// stamp pd_lsn on each page from the returned end-LSN so the PG18
-		// standby's recovery can skip already-applied FPIs (xlogutils.c
-		// XLogReadBufferForRedo lsn comparison).
-		leftLSN, err := catalog.PgCanonicalBtreeInsert(rel, sysBtreeRootBlock, leftCopy, 1, xid, ctx.LogCanonical)
-		if err != nil {
-			releaseSplitSlots(ctx, metaSlot, rootSlot, rightSlot)
-			return fmt.Errorf("split: WAL left leaf: %w", err)
-		}
-		if leftLSN != 0 {
-			storage.MustHeader(leafSlot.Page()).SetLSN(storage.LSN(leftLSN))
-		}
-		rightLSN, err := catalog.PgCanonicalBtreeInsert(rel, rightBlk, rightCopy, 1, xid, ctx.LogCanonical)
-		if err != nil {
-			releaseSplitSlots(ctx, metaSlot, rootSlot, rightSlot)
-			return fmt.Errorf("split: WAL right leaf: %w", err)
-		}
-		if rightLSN != 0 {
-			storage.MustHeader(rightSlot.Page()).SetLSN(storage.LSN(rightLSN))
-		}
-		rootLSN, err := catalog.PgCanonicalBtreeInsert(rel, rootBlk, rootCopy, 1, xid, ctx.LogCanonical)
-		if err != nil {
-			releaseSplitSlots(ctx, metaSlot, rootSlot, rightSlot)
-			return fmt.Errorf("split: WAL new root: %w", err)
-		}
-		if rootLSN != 0 {
-			storage.MustHeader(rootSlot.Page()).SetLSN(storage.LSN(rootLSN))
-		}
-		metaLSN, err := catalog.PgCanonicalBtreeInsert(rel, 0, metaCopy, 1, xid, ctx.LogCanonical)
-		if err != nil {
-			releaseSplitSlots(ctx, metaSlot, rootSlot, rightSlot)
-			return fmt.Errorf("split: WAL metapage: %w", err)
-		}
-		if metaLSN != 0 {
-			storage.MustHeader(metaSlot.Page()).SetLSN(storage.LSN(metaLSN))
-		}
-	}
 
 	metaSlot.Unlock()
 	ctx.Pool.Unpin(metaSlot)

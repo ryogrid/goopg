@@ -982,13 +982,13 @@ func PageSetHeapTupleXmax(p Page, slot uint16, xmax TransactionID) error {
 	// were set (the pre-M0021 case).
 	infomask := binary.LittleEndian.Uint16(p[off+20 : off+22])
 	// Clear lock-only bits AND HeapXmaxInvalid so isConcurrentlyUpdated
-	// sees a real delete/update stamp. HeapXmaxInvalid is set by canonical-WAL
-	// inserts (writeHeapRowReturningPG / writeHeapRowReturning when
-	// ctx.LogCanonical != nil) to signal "xmax is not a deleter" on fresh rows.
-	// Failing to clear it here causes isConcurrentlyUpdated to return false
-	// for any tuple written via the canonical path, silently skipping the EPQ
-	// wait loop on concurrent DELETE/UPDATE. Mirrors PG's heap_update /
-	// heap_delete which clear HEAP_XMAX_INVALID before re-stamping xmax.
+	// sees a real delete/update stamp. HeapXmaxInvalid is set by PG
+	// physical-format inserts (writeHeapRowReturningPG) to signal "xmax is
+	// not a deleter" on fresh rows. Failing to clear it here causes
+	// isConcurrentlyUpdated to return false for any tuple written via that
+	// path, silently skipping the EPQ wait loop on concurrent
+	// DELETE/UPDATE. Mirrors PG's heap_update / heap_delete which clear
+	// HEAP_XMAX_INVALID before re-stamping xmax.
 	infomask &^= HeapXmaxLockOnly | HeapXmaxLockMask | HeapXmaxInvalid | HeapXmaxIsMulti
 	binary.LittleEndian.PutUint16(p[off+20:off+22], infomask)
 	// Advance pd_prune_xid so opportunistic pruning knows when

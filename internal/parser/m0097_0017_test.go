@@ -24,12 +24,62 @@ func TestM0097_0017_EnumDomainParsing(t *testing.T) {
 		`DROP DOMAIN domaindroptest`,
 		`DROP DOMAIN domaindroptest CASCADE`,
 		`DROP DOMAIN domaindroptest RESTRICT`,
+		// Multi-word base type names, DU-002 (CREATE DOMAIN's AS clause must
+		// accept the same spellings CREATE TABLE columns and pg_dump do).
+		`CREATE DOMAIN d_float8 AS double precision`,
+		`CREATE DOMAIN d_varchar AS character varying(20)`,
+		`CREATE DOMAIN d_varbit AS bit varying(8)`,
+		`CREATE DOMAIN d_tstz AS timestamp with time zone`,
+		`CREATE DOMAIN d_ts AS timestamp without time zone`,
+		`CREATE DOMAIN d_timetz AS time with time zone`,
+		`CREATE DOMAIN d_time_p AS time(3) with time zone`,
+		`CREATE DOMAIN d_char_array AS character varying(20)[]`,
 	}
 	for _, sql := range tests {
 		t.Run(sql[:min(60, len(sql))], func(t *testing.T) {
 			_, err := parser.Parse(sql)
 			if err != nil {
 				t.Errorf("Parse(%q) error: %v", sql, err)
+			}
+		})
+	}
+}
+
+// TestCreateDomainMultiWordBaseType covers the CREATE DOMAIN AS clause's
+// handling of multi-word built-in type names, verifying the base type name
+// (and typmod args, where applicable) resolve the same way CREATE TABLE's
+// column-type grammar does (parseColumnType / parseMultiWordTypeName /
+// parseTimeZoneQualifierAfterArgs are shared between the two).
+func TestCreateDomainMultiWordBaseType(t *testing.T) {
+	tests := []struct {
+		sql          string
+		wantBaseType string
+		wantArgs     []int64
+	}{
+		{`CREATE DOMAIN d1 AS double precision`, "float8", nil},
+		{`CREATE DOMAIN d2 AS character varying(20)`, "varchar", []int64{20}},
+		{`CREATE DOMAIN d3 AS bit varying(8)`, "varbit", []int64{8}},
+		{`CREATE DOMAIN d4 AS timestamp with time zone`, "timestamptz", nil},
+		{`CREATE DOMAIN d5 AS timestamp without time zone`, "timestamp", nil},
+		{`CREATE DOMAIN d6 AS time with time zone`, "timetz", nil},
+		{`CREATE DOMAIN d7 AS time(3) with time zone`, "timetz", []int64{3}},
+		{`CREATE DOMAIN d8 AS character varying(20)[]`, "varchar[]", []int64{20}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.sql, func(t *testing.T) {
+			stmt, err := parser.Parse(tt.sql)
+			if err != nil {
+				t.Fatalf("Parse(%q) error: %v", tt.sql, err)
+			}
+			cd, ok := stmt[0].(*parser.CreateDomainStmt)
+			if !ok {
+				t.Fatalf("Parse(%q) = %T, want *CreateDomainStmt", tt.sql, stmt[0])
+			}
+			if cd.BaseType != tt.wantBaseType {
+				t.Errorf("Parse(%q).BaseType = %q, want %q", tt.sql, cd.BaseType, tt.wantBaseType)
+			}
+			if len(cd.BaseTypeArgs) != len(tt.wantArgs) {
+				t.Errorf("Parse(%q).BaseTypeArgs = %v, want %v", tt.sql, cd.BaseTypeArgs, tt.wantArgs)
 			}
 		})
 	}

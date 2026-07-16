@@ -280,8 +280,13 @@ func evalStoredRoutineFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datu
 		for i, a := range x.Args {
 			if _, isStr := a.(*planner.StringConst); isStr {
 				argTypeNames[i] = "unknown"
-			} else {
+			} else if i < len(r.ArgTypes) {
 				argTypeNames[i] = r.ArgTypes[i].Name
+			} else {
+				// Positions beyond the declared parameter list only occur
+				// when the trailing parameter is VARIADIC; every excess
+				// caller argument shares that parameter's declared type.
+				argTypeNames[i] = r.ArgTypes[len(r.ArgTypes)-1].Name
 			}
 		}
 		return NullDatum, &ExecError{
@@ -291,6 +296,7 @@ func evalStoredRoutineFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datu
 			Hint:    "To call a procedure, use CALL.",
 		}
 	}
+	args = bundleVariadicArgs(r.ArgModes, args)
 	return executeStoredRoutine(r, args, ctx, x.Pos())
 }
 
@@ -799,10 +805,11 @@ func resolveRoutineOverload(rs *catalog.Routines, name parser.ObjectName, args [
 	candidates := rs.LookupByName(name)
 	matches := make([]*catalog.Routine, 0, 1)
 	for _, c := range candidates {
-		if len(c.ArgTypes) != len(args) {
+		callArgTypes, ok := callArgTypesForCandidate(c, len(args))
+		if !ok {
 			continue
 		}
-		if !routineArgsCompatible(c.ArgTypes, args) {
+		if !routineArgsCompatible(callArgTypes, args) {
 			continue
 		}
 		matches = append(matches, c)
@@ -843,6 +850,58 @@ func resolveRoutineOverload(rs *catalog.Routines, name parser.ObjectName, args [
 		}
 		return nil, &ExecError{Code: "42725", Pos: pos, Message: fmt.Sprintf("function %s is not unique", sig)}
 	}
+}
+
+// callArgTypesForCandidate returns the per-position parameter types to
+// type-check a call of n positional arguments against candidate c, or false
+// if n cannot possibly match c's signature. A trailing VARIADIC parameter
+// (PostgreSQL requires it to be the last parameter) accepts zero or more
+// call-site arguments of its element type — each later collapsed into one
+// array value by bundleVariadicArgs — mirroring parse_func.c's
+// func_match_argtypes VARIADIC handling.
+func callArgTypesForCandidate(c *catalog.Routine, n int) ([]catalog.Type, bool) {
+	variadicPos := -1
+	for i, mode := range c.ArgModes {
+		if mode == "v" {
+			variadicPos = i
+		}
+	}
+	if variadicPos < 0 {
+		if len(c.ArgTypes) != n {
+			return nil, false
+		}
+		return c.ArgTypes, true
+	}
+	if n < variadicPos {
+		return nil, false
+	}
+	elemType := catalog.Type{Name: strings.TrimSuffix(strings.ToLower(c.ArgTypes[variadicPos].Name), "[]")}
+	types := make([]catalog.Type, n)
+	copy(types, c.ArgTypes[:variadicPos])
+	for i := variadicPos; i < n; i++ {
+		types[i] = elemType
+	}
+	return types, true
+}
+
+// bundleVariadicArgs collapses the positional arguments landing on and
+// after a VARIADIC parameter into a single array-typed argument, matching
+// PostgreSQL's variadic calling convention: the caller's trailing arguments
+// always wrap into one array value regardless of exact count (including the
+// zero- or one-argument cases). No-op when the routine has no VARIADIC
+// parameter, or the routine's declared VARIADIC position is beyond the
+// caller-supplied arguments.
+func bundleVariadicArgs(argModes []string, args []Datum) []Datum {
+	for vi, mode := range argModes {
+		if mode != "v" || vi > len(args) {
+			continue
+		}
+		bundled := make([]Datum, 0, vi+1)
+		bundled = append(bundled, args[:vi]...)
+		bundled = append(bundled, buildArrayDatum(args[vi:]))
+		return bundled
+	}
+	return args
 }
 
 func routineArgsCompatible(argTypes []catalog.Type, args []Datum) bool {
@@ -2885,7 +2944,12 @@ func evalRaiseMsg(rawMsg string, frame *plpgsqlFrame, ctx *Context) string {
 			}
 			argVals = append(argVals, RegtypeName(cat, uint32(val.Int), !regObjectSchemaVisible(ctx, "public")))
 		} else {
-			argVals = append(argVals, val.Format())
+			// DATE/TIMESTAMP/TIMESTAMPTZ args must render per the session's
+			// datestyle GUC (M-NIGHTLY DateStyle follow-up), matching every
+			// other already-fixed output path (ANALYZE MCV/histogram, CAST,
+			// array_agg/string_agg). formatDatumDateStyle falls back to
+			// Format() for every other Kind.
+			argVals = append(argVals, formatDatumDateStyle(val, ctx))
 		}
 	}
 

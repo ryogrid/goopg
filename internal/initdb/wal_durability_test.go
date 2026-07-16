@@ -134,7 +134,11 @@ func TestWalCommitRecordOnDisk(t *testing.T) {
 
 	found := false
 	for _, r := range records {
-		if len(r.Payload) > 0 && r.Payload[0] == wal.RecordKindXactCommit {
+		// A6: the commit is a PG xl_xact_commit — no native Payload; the opcode
+		// is in the record header (xl_rmid = RM_XACT, xl_info = XLOG_XACT_COMMIT),
+		// and the committing xid is xl_xid.
+		if r.XLog != nil && r.XLog.Header.Rmid == wal.RmgrXact &&
+			(r.XLog.Header.Info&wal.XlogXactOpMask) == wal.XlogXactCommit {
 			found = true
 			break
 		}

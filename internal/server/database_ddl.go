@@ -1116,7 +1116,6 @@ func (s *Server) syncCopiedTableCatalogHeap(newOid uint32, tbl *catalog.Table) e
 	ectx.Tx = tx
 	ectx.Snap = snap
 	ectx.WAL = s.cfg.WAL
-	ectx.LogCanonical = s.cfg.LogCanonical
 	if err := executor.SyncTableToCatalogHeap(ectx, tbl); err != nil {
 		return err
 	}

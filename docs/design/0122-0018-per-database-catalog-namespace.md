@@ -1,6 +1,6 @@
 # Per-database catalog namespace (M0122-0007 slice 4)
 
-Status: accepted (sub-slices 4a, 4b-i, 4b-ii, 4c, 4d-i, 4d-ii-part-1, and 4d-ii-part-2a landed; 4d-ii-part-2b items 1, 2, and 3 all fully landed; 4e's FK-target-resolution, sequence-ownership, and view-constraint-dependency items all landed; `CREATE DATABASE ... TEMPLATE` bounded validation landed 2026-07-10; the pg_class-under-fresh-database gap (name resolution generically, row enumeration for pg_class specifically) landed 2026-07-10, and the pg_indexes/pg_tables, pg_constraint, pg_index, pg_attrdef/pg_depend, pg_inherits, pg_policy, pg_trigger, pg_rewrite, pg_foreign_table, and pg_sequence row-content follow-ups landed the same day, plus the `oid::regclass`/`'name'::regclass` cast-direction dbOid-scoping gap (follow-up 33) — 2 sibling virtual-table builders (pg_statistic_ext, information_schema.routines/parameters/routine_*_usage) plus pg_sequences/information_schema.sequences (follow-up 34's narrowed remainder) plus the c.foreignServers registry-dbOid-key gap (follow-up 36, landed) and its same-shape c.userMappings sibling (follow-up 37, landed 2026-07-10); follow-up 37's own CURRENT_USER/SESSION_USER/CURRENT_ROLE/USER role-spec resolution discovery closed same-day (follow-up 38); restart durability for user tables created under a distinct-dbOid database — per-database pg_class/pg_attribute heap routing + startup reload into the owning namespace — landed same-day (follow-up 39); the real `CREATE DATABASE ... TEMPLATE` relation-copy mechanism itself landed 2026-07-10 for its bounded plain-table case (follow-up 40), extended the same day to also cover sequences (follow-up 41), plain views (follow-up 42), and materialized views (follow-up 43, including a real `execCreateMatView`/`execRefreshMatView` dbOid-scoping bugfix found along the way) — index/typed-table TEMPLATE copying remains deferred, see "Remaining 4e work" below)
+Status: accepted (sub-slices 4a, 4b-i, 4b-ii, 4c, 4d-i, 4d-ii-part-1, and 4d-ii-part-2a landed; 4d-ii-part-2b items 1, 2, and 3 all fully landed; 4e's FK-target-resolution, sequence-ownership, and view-constraint-dependency items all landed; `CREATE DATABASE ... TEMPLATE` bounded validation landed 2026-07-10; the pg_class-under-fresh-database gap (name resolution generically, row enumeration for pg_class specifically) landed 2026-07-10, and the pg_indexes/pg_tables, pg_constraint, pg_index, pg_attrdef/pg_depend, pg_inherits, pg_policy, pg_trigger, pg_rewrite, pg_foreign_table, and pg_sequence row-content follow-ups landed the same day, plus the `oid::regclass`/`'name'::regclass` cast-direction dbOid-scoping gap (follow-up 33) — 2 sibling virtual-table builders (pg_statistic_ext, information_schema.routines/parameters/routine_*_usage) plus pg_sequences/information_schema.sequences (follow-up 34's narrowed remainder) plus the c.foreignServers registry-dbOid-key gap (follow-up 36, landed) and its same-shape c.userMappings sibling (follow-up 37, landed 2026-07-10); follow-up 37's own CURRENT_USER/SESSION_USER/CURRENT_ROLE/USER role-spec resolution discovery closed same-day (follow-up 38); restart durability for user tables created under a distinct-dbOid database — per-database pg_class/pg_attribute heap routing + startup reload into the owning namespace — landed same-day (follow-up 39); the real `CREATE DATABASE ... TEMPLATE` relation-copy mechanism itself landed 2026-07-10 for its bounded plain-table case (follow-up 40), extended the same day to also cover sequences (follow-up 41), plain views (follow-up 42), and materialized views (follow-up 43, including a real `execCreateMatView`/`execRefreshMatView` dbOid-scoping bugfix found along the way) — index/typed-table TEMPLATE copying remains deferred, see "Remaining 4e work" below; the `catalog.Routines` registry (follow-up 44, 2026-07-15), the `catalog.accessMethods` registry (follow-up 45, 2026-07-15), and the `catalog.userOperatorFamilies`/`userOperatorClasses` registries (follow-up 46, 2026-07-15) all landed cross-database isolation, unblocking the DU-002 probe past the function/procedure, access-method, and operator-family/-class collision points respectively — the pg_depend dependency-ordering gap for member-less operator classes also landed same-day (follow-up 47, see the "PGDependRowsForDBOid opclass to opfamily pg_depend edge" section below); the `catalog.userConversions` registry (follow-up 48, 2026-07-15, see the "Conversion registry (catalog.InMemory.userConversions) dbOid scoping" section below) also landed cross-database isolation, unblocking the DU-002 probe past the conversion-name collision point — the probe is now blocked on a parser gap (`ALTER CONVERSION ... OWNER TO` not a recognized `ALTER` production), the first non-catalog-scoping blocker in this audit sequence)
 Date: 2026-07-10
 Supersedes: none — extends the "Still open" note in
 `0122-0017-database-ddl-drop-guards.md` and the deferral-ledger rows dated
@@ -2071,6 +2071,141 @@ disciplines directly rather than introducing a third one.
   `pg_statistic_ext`/`information_schema.routines` registry redesign
   (pre-existing, unrelated to TEMPLATE).
 
+**`pg_collation`/`UserCollation` cross-database isolation — LANDED (2026-07-15,
+follow-up beyond 4e, picked up from the "Deferred / explicitly out of scope"
+list's collations item below).** Motivation: `TestPort_PgDumpConnectionSetup`'s
+DU-002 dump+restore round-trip probe (`internal/testport/
+pgdump_connsetup_test.go`) restores a captured dump into a brand-new, empty
+database in the same cluster — the very first schema-level object in the
+fixture is `CREATE COLLATION public.builtin_coll (provider = builtin, locale =
+'C')`, which errored `collation "builtin_coll" already exists` because
+`catalog.InMemory.userCollations` was one flat, dbOid-less
+`[]*UserCollation`. Mirrors follow-up 36/37's `ForeignServer`/`UserMapping`
+shape exactly (same-shape sibling maps, not the `tables`/`indexes` namespace
+struct): `catalog.UserCollation` gained a `DBOid uint32` field;
+`CreateCollation`/`DropCollation`/`RenameCollation`/`SetCollationOwner`/
+`SetCollationSchema`/`CollationAttrsByName` each gained a trailing
+`dbOid ...uint32` parameter (variadic, `resolveDBOid` defaults to
+`DefaultDBOid` — every pre-existing call site, including all of
+`create_collation_test.go`, keeps its old behavior unchanged). New
+`catalog.InMemory.ListUserCollationsForDBOid`/`PGCollationRowsForDBOid`
+(mirrors `PGForeignServerRowsForDBOid`); a new
+`executor.Context.PgCollationRows` field is wired the same way as every other
+per-connection row-lister (`internal/server/dispatch.go`'s
+`pgCollationRowLister` interface + wiring next to `pgUserMappingsRowLister`),
+and a `pg_collation` branch was added to `internal/executor/operators.go` next
+to the `pg_user_mappings` one. All 8 `execCreateCollation`/`execAlterCollation`/
+DROP COLLATION/COMMENT ON COLLATION call sites in
+`internal/executor/operators_ddl.go` now thread
+`catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)` through to the registry
+calls. **Deliberately NOT done (scope kept bounded, unlike follow-up 36/37):**
+no WAL-record format change — `wal.EncodeCreateCollation`/`DecodeCreateCollation`
+and the sibling rename/owner/set-schema records still carry no dbOid, so
+`CreateCollationDuringRecovery` (`internal/initdb/collation_ddl_recovery.go`)
+now explicitly stamps every replayed collation `DBOid = DefaultDBOid` — a
+restart still restores every database's collations into DefaultDBOid's
+namespace, matching "every write path still persists under DefaultDBOid until
+migrated" (4c's dual-mirror convention above). This is an accepted, recorded
+residual (deferral ledger row), not silently dropped: a genuinely distinct
+database's collations do not yet survive a restart under their own namespace.
+Also left unscoped: `UserCollationOIDByName` (used to shadow a column's
+`attcollation`) still searches all databases by bare name — a same-named
+custom collation in two different databases could resolve the wrong OID for
+this one reverse-lookup path; narrow, pre-existing-shaped edge case, not
+exercised by the DU-002 fixture, recorded in the ledger rather than fixed
+here. Confirmed via `TestPort_PgDumpConnectionSetup`: the round-trip restore's
+failure point moved from `collation "builtin_coll" already exists` to a
+different, later object (`type "b_in" already exists"`) — the next unscoped
+sibling map in the same "Deferred / explicitly out of scope" list, a future
+loop's own follow-up. New `TestCreateCollationCrossDatabaseIsolation`
+(`internal/catalog/create_collation_test.go`): two distinct dbOids each
+`CREATE COLLATION public.builtin_coll` without colliding, a genuine
+same-database duplicate still errors, each database's `pg_collation` view
+sees only its own row (+ the 7 shared builtins), and dropping one database's
+copy leaves the other's intact. Gates: `go build ./...`/`go vet ./...` clean;
+`go test ./internal/catalog/... ./internal/executor/... ./internal/server/...
+./internal/initdb/...` PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+`RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0 failed,
+all 3 workloads; first attempt hit 1 transient pgbench failure — 0.009%,
+11,364 txns, unrelated to this loop's catalog/executor diff — retry passed
+clean).
+
+**`catalog.domains` cross-database isolation — LANDED (2026-07-15, follow-up
+beyond the collations item above, next candidate the DU-002 probe surfaced).**
+Motivation: after the collations fix, `TestPort_PgDumpConnectionSetup`'s
+round-trip restore moved on to `CREATE DOMAIN public.b_in AS bigint ...`
+erroring `type "b_in" already exists` — `catalog.InMemory.domains` was one
+flat, dbOid-less `map[string]*Domain` keyed purely by lowercase name (not even
+namespace-scoped, unlike `userCollations`). Unlike `userCollations`/
+`ForeignServer`/`UserMapping` (already slices, just needed a DBOid filter
+field), `domains` is a genuine `map[string]*Domain`, so the fix folds dbOid
+into the registry key itself: new `domainKey(dbOid, name) string` (`"<dbOid>\
+x00<lower-name>"`), and `catalog.Domain` gained a `DBOid uint32` field.
+`RegisterDomain`/`DropDomain`/`RenameDomain`/`SetDomainOwner`/
+`SetDomainDefault`/`SetDomainNotNull`/`AddDomainConstraint`/
+`DropDomainConstraint`/`RenameDomainConstraint` each gained a trailing
+`dbOid ...uint32` (variadic, `resolveDBOid` default unchanged for every
+pre-existing call site including all catalog-package tests). All 9 write call
+sites in `internal/executor/operators_ddl.go`
+(`execCreateDomain`/`execAlterDomain`/`execDropDomain`/`execCommentOn`'s
+domain branch) thread `o.ctx.CurrentDatabaseOid`. `DropDomain`'s own
+dependent-table scan also switched its 3 internal `c.ns(DefaultDBOid)` calls
+to `c.ns(oid)` (the resolved dbOid) — a contained correctness fix in the same
+function, otherwise CASCADE-dropping a domain in a non-default database would
+have scanned/cascaded against the wrong database's tables.
+`catalog.Catalog.LookupDomain` (interface method) also gained a variadic
+`dbOid`; its 2 cheapest, highest-value read call sites were threaded too
+(`internal/executor/expr.go`'s CHECK-on-CAST enforcement and
+`internal/executor/operators_fk.go`'s `checkDomainConstraintsForRow`, both
+already had `ctx.CurrentDatabaseOid` in scope). **Deliberately NOT done (scope
+kept bounded — domains have a much wider read-path surface than collations:
+CAST evaluation, FK/CHECK enforcement, `pg_attribute` row building, plus no
+prior namespace scoping at all):** WAL restart-persistence
+(`RegisterDomainDuringRecovery`/`DropDomainDuringRecovery`/
+`wal.CreateDomainPayload`) still carries no dbOid and stamps every replayed
+domain `DefaultDBOid`, mirroring the collations gap exactly. ~7 remaining
+`LookupDomain` read call sites (`expr.go`'s `userTypeOIDForName`,
+`operators_ddl.go`'s `resolveUserTypeOID`, `pg18_user_catalog_rows.go`'s
+`buildUserPGAttributeRow`/`buildUserPGAttributeRowForCompositeField`,
+`planner.go`'s `foldPgCollationFor`) and `ResolveColumnType`/
+`resolveColumnTypeLocked` (used by `execCreateTable` and
+`operators_storage.go`'s `canonicalTypeClass`) are not dbOid-threaded — a new
+shared `lookupDomainByNameLocked` helper (global by-name scan, first match)
+preserves their exact pre-isolation behavior instead of silently breaking
+(the first implementation attempt did break them — see the gate-failure note
+below — because switching the map key format alone, without this fallback,
+made every un-threaded direct `c.domains[k]` access miss). `execDropDomain`'s
+pg_type heap-row deletion (`deleteTypeFromCatalogHeap`) still hardcodes
+`catalog.DefaultDBOid`, pre-existing and mirroring `execDropType`, untouched.
+Confirmed via `TestPort_PgDumpConnectionSetup`: the round-trip's failure
+point moved from `type "b_in" already exists` to an unrelated parser gap
+(`CREATE DOMAIN public.f8_in AS double precision` — multi-word base type name
+not accepted by the grammar at that position), a different mechanism than
+this per-database-catalog-namespace epic — the next probe blocker is a
+parser fix, not another sibling-map audit. New
+`TestCreateDomainCrossDatabaseIsolation`
+(`internal/catalog/create_domain_test.go`), mirroring
+`TestCreateCollationCrossDatabaseIsolation`. **Gate-failure note (verify
+before reusing this map-key-folding pattern on another sibling map):** the
+first implementation pass changed only `RegisterDomain`/`LookupDomain`/etc. to
+the new composite key and left `ResolveColumnType`/`resolveColumnTypeLocked`
+using the old plain-name key — this silently broke domain column type
+resolution (`TestEnumDomainSmoke`, `TestDomainColumnNotNullEnforced`,
+`TestDomainColumnGenericCheckEnforced`, `TestDomainColumnInCheckEnforced` all
+failed with real, non-obvious symptoms like "column has type X but expression
+has type int8") until every direct `c.domains[k]` access in the package was
+audited and switched to either `domainKey` or the new
+`lookupDomainByNameLocked` fallback. Any future sibling-map key-format change
+must `grep -n 'c\.<map>\['` for the whole file before declaring done. Gates:
+`go build ./...`/`go vet ./...` clean; `go test ./internal/catalog/...
+./internal/executor/... ./internal/planner/...` PASS (`internal/initdb`
+232s, `internal/planner` clean); `go test -short` full repo (excl. testport,
+per policy) PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+`RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0 failed,
+all 3 workloads; first attempt hit 1 transient pgbench failure — 0.007%,
+14,582 txns, unrelated to this loop's catalog/executor diff — retry passed
+clean).
+
 ## Recommended order and stopping points
 
 4a (landed) → 4b-i (landed) → 4b-ii (landed) → 4c (landed) → 4d-i (landed) →
@@ -2127,6 +2262,461 @@ verification pass; a future loop should file it against
 `internal/activity/registry.go` directly (M0119-0006, which added
 `CountByDatName`) rather than this design doc.
 
+### Routine/function registry (`catalog.Routines`) dbOid scoping — LANDED (2026-07-15)
+
+Closes the M0119-0004 DU-002 working-set resume point ("the same collision
+shape the M0122-0007 4e series already fixed 5x for type registries ...
+not yet applied to function/routine registration"). `catalog.Routine`
+gained a `DBOid uint32` field; the `Routines` registry's `byKey`/`byName`
+maps re-key from `schema.name(sig)` to
+`routineDBPrefix(dbOid)+schema.name(sig)` (`routineDBPrefix` = `"<dbOid>\x00"`,
+mirroring `domainKey`/`enumKey`/`compositeKey`/`rangeKey` exactly) so a
+same-named `CREATE FUNCTION`/`CREATE PROCEDURE` in two distinct databases no
+longer collides. `Create`/`CreateDuringRecovery` normalize a zero `DBOid` to
+`DefaultDBOid` (the caller-sets-the-field convention, simpler than a
+parameter since `Create` already takes a fully-constructed `*Routine`);
+`Lookup`/`LookupByName`/`Drop`/`DropByName`/`ResolveByName`/`ResolveBySig`/
+`LookupDropCandidates` gained a trailing variadic `dbOid ...uint32`
+(resolved via the existing package-level `resolveDBOid`); `DropRoutine`/
+`RenameRoutine`/`SetSchema` needed no signature change since they already
+receive a `*Routine` sourced from the registry and read `r.DBOid` directly.
+
+Threaded through every DDL call site in `internal/executor/operators_ddl.go`
+reachable from CREATE FUNCTION/CREATE PROCEDURE/ALTER FUNCTION/ALTER
+ROUTINE/DROP FUNCTION/DROP PROCEDURE/COMMENT ON FUNCTION/DROP SCHEMA
+CASCADE's routine-collection loop — all `ddlOp` methods with `o.ctx` already
+in scope, a purely mechanical set (unlike the enum/composite follow-ups'
+`collectAllViewTransitiveDeps`-shaped signature-cascade exceptions; none
+existed here). New `internal/catalog/routines_dbid_isolation_test.go`
+(`TestRoutinesCrossDatabaseIsolation`), mirroring
+`TestCreateDomainCrossDatabaseIsolation`.
+
+Confirmed via the DU-002 probe (`TestPort_PgDumpConnectionSetup`): the
+round-trip's failure point moved past `function already exists with the
+same argument types` to a NEW, unrelated bug — `procedure proc_out(integer,
+integer) does not exist` on an ALTER/COMMENT-shaped restore statement,
+root-caused to `execAlterFunction`'s arg-type stub never populating
+`ArgModes`, so `Signature()` (which excludes OUT params, matching
+`pg_proc.proargtypes`) mismatches the stored routine's own OUT-excluding
+signature. This is a pre-existing OUT-parameter signature-matching defect,
+orthogonal to dbOid scoping — see the 2026-07-15 deferral-ledger row (task-id
+`M0122-0007 4e follow-up (catalog.Routines cross-database isolation ...)`)
+for the full resume point.
+
+**Deliberately still un-dbOid'd (deferred, see the same ledger row):**
+5 signature-cascading DDL-support helpers with no `ctx` in scope
+(`resolveAccessMethodHandlerFunc`, `resolveFDWHandlerFunc`,
+`resolveFDWValidatorFunc`, `resolveEventTriggerFunc`,
+`resolveConversionFunc`), every call site in `internal/server/grant_ddl.go`
+(GRANT/REVOKE ON FUNCTION), `plpgsql_runtime.go`, `operators_call.go`,
+`expr.go`, `operators_trigger.go`, `operators_join_agg.go`,
+`internal/planner/planner.go`, `pg18_user_catalog_rows.go`, and the
+remaining CREATE OPERATOR/CAST/AGGREGATE-finalfunc resolution sites in
+`operators_ddl.go` — same "mechanical vs. signature-cascading" split
+precedent as 4d-ii-part-1/part-2b. `Routines.List()` (backing `pg_proc`/
+`information_schema.routines`, `internal/initdb/pg_proc_view.go:319`) is
+still unfiltered by dbOid — same class as `pg_enum`'s un-scoped
+`VirtualRows`. `DropRoutinesReferencingTypes` (temp-table-cleanup cascade)
+was left dbOid-oblivious as a lower-priority edge case.
+
+#### OUT-parameter ALTER/DROP/COMMENT FUNCTION signature-matching fix — LANDED (2026-07-15)
+
+Closed the OUT-parameter signature-matching defect this section's
+"Confirmed via the DU-002 probe" paragraph flagged. `execAlterFunction`,
+`execDropFunction` (the is-a-function pre-check, the CASCADE target lookup,
+and the deferred/autocommit `ResolveBySig` removal path), `execCommentOn`'s
+"function" case, and `execCreateFunction`'s `ErrRoutineKindChange` DETAIL
+lookup all rebuilt an `argTypes`-only stub (no `ArgModes`) before calling
+`Lookup`/`ResolveBySig`, so `Routine.Signature()` — whose OUT-exclusion logic
+requires `ArgModes` to be populated — treated every argument as IN and
+could not filter OUT params the way the stored routine's real signature
+does.
+
+Verified against upstream before picking a fix direction: PG's
+`ruleutils.c print_function_arguments` (called by
+`pg_get_function_identity_arguments` with `print_table_args=false`) only
+omits TABLE-mode args from the identity-argument text — OUT-mode args are
+still printed with an `OUT ` prefix — so an ALTER/DROP/COMMENT restatement
+built from a real pg_dump run legitimately carries the routine's full
+IN+OUT argument list. But `parse_func.c`'s `LookupFuncWithArgs` primary
+lookup path (`objargs`) filters to input-only argument types before
+matching — i.e. the *search* signature still excludes OUT, exactly
+matching `Routine.Signature()`'s existing contract. This confirmed the fix
+is "populate ArgModes so Signature() can do its existing OUT-exclusion
+correctly" rather than switching to a `LookupDropCandidates`-style
+full-arg-list matcher (which would have made ALTER/DROP require the exact
+OUT types too, diverging from PG's traditional input-only resolution).
+
+`catalog.Routines` gained `LookupWithArgModes`/`ResolveBySigWithArgModes` —
+`Lookup`/`ResolveBySig` are now thin wrappers delegating with `nil`
+argModes, so the ~20 pre-existing non-OUT-param callers (CAST/transform-func
+resolution, every `*_test.go` call site) are untouched. New
+`internal/executor/operators_call.go` `funcArgModes([]parser.FunctionArg)
+[]string` helper (mirrors the per-arg mode switch CREATE FUNCTION/PROCEDURE
+already use) wired at all 6 rebuilt-stub call sites in `operators_ddl.go`.
+Also fixed the DROP SCHEMA CASCADE routine-collection loop's
+`rs.Drop(name, r.ArgTypes, dropDBOid)` (same bug shape, its error silently
+swallowed via `_ =`) by switching to `rs.DropRoutine(r)` — `r` is already
+the live, fully-populated `*Routine`, so its own `Signature()` needs no
+rebuilt stub.
+
+Confirmed via the DU-002 probe: advanced past `procedure proc_out(integer,
+integer) does not exist` to a NEW, unrelated bug —
+`function sum_variadic(integer) does not exist` restoring a VARIADIC-array
+function (`CREATE FUNCTION sum_variadic(VARIADIC arr integer[])`). Traced,
+not fixed: real PG stores a VARIADIC parameter's `proargtypes` entry as the
+parsed type OID as written (the ARRAY type, e.g. `_int4`/`integer[]`, not
+the element type — `functioncmds.c:261,306-309`), and `format_type_be`
+auto-renders the `[]` suffix for an array OID, so
+`pg_get_function_identity_arguments` round-trips `VARIADIC arr integer[]`
+symmetrically. goopg's error drops the `[]` somewhere in that path — see
+the 2026-07-15 deferral-ledger row (task-id `M0119-0004 (DU-002 round-trip
+probe, OUT-parameter ALTER/DROP/COMMENT FUNCTION signature-matching fix
+...)`) for the full trace and resume point.
+
+#### VARIADIC-array ALTER/DROP/COMMENT FUNCTION signature-matching fix — LANDED (2026-07-15)
+
+Closed the VARIADIC-array defect the section above traced but did not fix.
+The trace's hypothesis (a parser/storage/render bug dropping `[]` for a
+VARIADIC parameter specifically) was wrong: a live probe against a running
+server showed `pg_get_function_identity_arguments('sum_variadic'::regproc)`
+already returned `VARIADIC arr integer[]` correctly both before and after
+this fix — CREATE FUNCTION storage and the dump-side renderer were never
+broken.
+
+The actual root cause was the same lookup-stub-rebuild shape as the
+OUT-parameter fix above, just carried by a different field.
+`execCreateFunction`/`execCreateProcedure` build `Routine.ArgTypes[i].Name`
+by baking the `[]` array suffix directly into the string (`typName :=
+strings.ToLower(a.Type.Name); if a.Type.IsArray { typName += "[]" }`).
+`Routine.Signature()` (`internal/catalog/routines.go:132`) reads only
+`t.Name` — it never consults `catalog.Type.IsArray` at all — so an
+array-typed argument's entire signature identity lives in the `Name`
+string's suffix. But every ALTER/DROP/COMMENT rebuilt-stub call site
+(the OUT-parameter fix's 6, plus a 7th inside `execDropFunction`'s actual
+deferred/autocommit resolve path that the OUT-parameter fix's single-line
+grep pattern missed because it spans multiple lines with a separate `Args:`
+field) built `catalog.Type{Name: strings.ToLower(a.Type.Name)}` with no `[]`
+appended, so any array-typed ALTER/DROP/COMMENT argument — VARIADIC or a
+plain `integer[]` parameter — computed a signature key that could never
+match a stored array-typed routine.
+
+Added `internal/executor/operators_call.go`'s `routineArgTypeName(t
+parser.ColumnType) string` as the single source of truth for the
+"`[]`-baked-into-`Name`" convention, wired at all 7 rebuilt-stub sites plus
+refactored `execCreateFunction`/`execCreateProcedure`'s own inline duplicate
+of the same 4-line suffix-append logic to call it too — one place now owns
+the convention instead of 9 independent copies. Verified live against a
+running server: `ALTER FUNCTION sum_variadic(VARIADIC integer[]) OWNER TO
+postgres`, `COMMENT ON FUNCTION sum_variadic(VARIADIC integer[]) IS '...'`,
+and `DROP FUNCTION sum_variadic(VARIADIC integer[])` all now succeed
+(previously all three failed `function sum_variadic(integer) does not
+exist` — note the missing `[]` in the error, the tell that confirmed the
+diagnosis).
+
+Confirmed via the DU-002 probe: the round-trip's failure point moved past
+the VARIADIC-array blocker entirely to the ALREADY-DOCUMENTED,
+milestone-scale per-database catalog-namespace gap this design doc's own
+"Confirmed via the DU-002 probe" section (2026-07-06) and the test's inline
+comment (`pgdump_connsetup_test.go:11800-11820`) already describe — this
+run's specific symptom is `access method "goopg_am" already exists`, not a
+new bug, just the next thing the known gap blocks now that the
+function/routine signature-matching sub-series (dbOid-scoping →
+OUT-parameter → VARIADIC-array) is exhausted. Also newly discovered while
+manually probing the fix (not exercised by the DU-002 test itself, which
+only needs DDL to round-trip, not a live CALL): `sum_variadic(1,2,3)`
+fails `function sum_variadic does not exist` — VARIADIC call-site
+argument matching (collapsing N trailing positional args into one array
+parameter, mirroring `parse_func.c`'s `func_match_argtypes`/
+`func_get_detail` VARIADIC handling) was never implemented. That is a
+distinct, materially larger feature (call resolution, not DDL identity
+resolution) recorded as a fresh forward reference in the 2026-07-15 ledger
+row rather than folded into this fix.
+
+### Access method registry (`catalog.InMemory.accessMethods`) dbOid scoping — LANDED (2026-07-15)
+
+Closes the M0119-0004 DU-002 round-trip probe's next-in-line blocker after the
+Routines/OUT-parameter/VARIADIC-array sub-series above was exhausted: the
+probe's failure moved from `function`/`procedure` errors to `ERROR:  access
+method "goopg_am" already exists` when restoring `CREATE ACCESS METHOD
+goopg_am TYPE INDEX HANDLER goopg_am_handler` into a fresh second database.
+Ground-truthed by re-running `TestPort_PgDumpConnectionSetup` directly rather
+than trusting the last-recorded probe state in this doc (which predates the
+2026-07-15 VARIADIC call-site-collapsing fix, `.ralph/working_set.md`'s own
+resume-point note about `c.schemas` turned out to be stale once re-verified
+against a live run — `c.schemas` was never actually the next blocker, since
+`public` pre-exists in every database and the dump never re-issues `CREATE
+SCHEMA public`).
+
+`catalog.AccessMethod` gained a `DBOid uint32` field; the `accessMethods`
+registry's map key changed from bare `name` to a new `accessMethodKey(dbOid,
+name)` (`"<dbOid>\x00<name>"`, mirroring `domainKey`/`enumKey`/
+`compositeKey`/`rangeKey` exactly, but WITHOUT their `strings.ToLower` —
+`RegisterAccessMethod` never case-folded the name before this fix, so folding
+it now would have been an unrelated behavior change). `RegisterAccessMethod`/
+`DropAccessMethod`/`UserAccessMethodOID` gained a trailing variadic `dbOid
+...uint32` (resolved via the existing package-level `resolveDBOid`).
+`RegisterAccessMethodDuringRecovery` normalizes a zero `am.DBOid` to
+`DefaultDBOid` (the WAL record carries no dbOid today — startup recovery is
+still single-database, same precedent as `Routine`'s
+`Create`/`CreateDuringRecovery` normalization); `DropAccessMethodDuringRecovery`
+keeps defaulting to `DefaultDBOid` for the same reason.
+
+Threaded through all 3 live call sites in `internal/executor/operators_ddl.go`
+— `execCreateAccessMethod`, the `DROP ACCESS METHOD` branch, and
+`execCommentOn`'s "access method" case — all `ddlOp` methods with `o.ctx`
+already in scope, a purely mechanical set (no signature-cascade exceptions,
+unlike the enum/composite/view-dependency follow-ups). New
+`internal/catalog/create_access_method_test.go`
+(`TestAccessMethodCrossDatabaseIsolation`), mirroring
+`TestCreateDomainCrossDatabaseIsolation`/`TestRoutinesCrossDatabaseIsolation`.
+
+**Deliberately still un-dbOid'd (deferred):** `ListAccessMethods()` — its sole
+caller (`pg_am`'s `VirtualRows` closure, a bare `func() [][]string` with no
+per-connection dbOid in scope) cannot supply a real dbOid yet, so it still
+returns every database's access methods unfiltered. Same class of gap as
+`Routines.List()`/`pg_enum`'s un-scoped `VirtualRows`, harmless today since no
+existing test creates more than one access method across distinct databases
+in the same process lifetime.
+
+Confirmed via the DU-002 probe (`TestPort_PgDumpConnectionSetup`): the
+round-trip's failure point moved past `access method "goopg_am" already
+exists` to a NEW, unrelated bug — `operator 1(bigint,bigint) already exists in
+operator family "op_family_loose"` — the operator-family registry (CREATE
+OPERATOR FAMILY / CREATE OPERATOR CLASS) is the next flat, dbOid-less
+registry in line. See the 2026-07-15 deferral-ledger row (task-id
+`M0122-0007 4e follow-up (catalog.accessMethods cross-database isolation)`)
+for the resume point.
+
+Gates: `go build ./...`/`go vet ./internal/catalog/... ./internal/executor/...`
+clean; `go test ./internal/executor/... ./internal/catalog/...
+./internal/parser/...` PASS; `go test -short $(go list ./... | grep -v
+/internal/testport)` (full repo, short mode) 0 FAIL; `scripts/tpch-spotcheck.sh`
+PASS (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke bash
+scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 workloads).
+
+### Operator family / operator class registry (`catalog.InMemory.userOperatorFamilies`/`userOperatorClasses`) dbOid scoping — LANDED (2026-07-15)
+
+Closes the DU-002 round-trip probe's next-in-line blocker after the
+`accessMethods` section above: the probe's failure moved from `access method
+"goopg_am" already exists` to `ERROR:  operator 1(bigint,bigint) already
+exists in operator family "op_family_loose"` when restoring an `ALTER
+OPERATOR FAMILY public.op_family_loose USING btree ADD OPERATOR 1 ...`
+statement into a fresh second database — `UserOperatorFamily`/
+`UserOperatorClass` were each one flat, dbOid-less registry.
+
+`UserOperatorFamily`/`UserOperatorClass` both gained a `DBOid uint32` field;
+`userOpFamilyKey`/`userOpClassKey` gained a leading `dbOid uint32` parameter
+folded into the key (`"<dbOid>\x00<schema>.<name>/<method>"`, mirroring
+`accessMethodKey`). `RegisterUserOperatorFamily`/`LookupUserOperatorFamily`/
+`DropUserOperatorFamily` and the operator-class trio
+(`RegisterUserOperatorClass`/`LookupUserOperatorClass`/
+`DropUserOperatorClass`) each gained a trailing variadic `dbOid ...uint32`
+resolved via `resolveDBOid`.
+`RegisterUserOperatorFamilyDuringRecovery`/`RegisterUserOperatorClassDuringRecovery`
+normalize a zero `DBOid` to `DefaultDBOid` (WAL carries no dbOid — startup
+recovery is still single-database, same precedent as `AccessMethod`).
+
+Threaded through all 9 live call sites in `internal/executor/operators_ddl.go`
+via `catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)`: `execDropCompat`'s
+family and class DROP branches, `execCompatNoop`'s bare `CREATE OPERATOR
+FAMILY`, `execCreateOpClass`'s explicit-`FAMILY`-clause lookup + its
+implicit-family registration + its own `RegisterUserOperatorClass` call,
+`execAlterOpFamilyAdd`/`execAlterOpFamilyDrop`, and
+`registerOpClassMembers`'s sort-family lookup. All mechanical `ddlOp`-method
+sites, no signature-cascade exceptions. New
+`internal/catalog/create_operator_family_class_dbscope_test.go`
+(`TestOperatorFamilyAndClassCrossDatabaseIsolation`), mirroring
+`TestAccessMethodCrossDatabaseIsolation`.
+
+**Recovery note:** the code fix (catalog.go/operators_ddl.go) was originally
+implemented and DU-002-probe-verified in an earlier loop, but was committed
+by a concurrent interactive session under an unrelated commit message
+(`728457d9 "tool: add fixing table on markdown tool"`, bundled with an
+unrelated markdown-table-repair tool addition) with no test coverage or
+fix_plan/ledger/design-doc bookkeeping. This loop found the code already
+present at `wal-format-mod`'s tip once that other session's `git pull
+--rebase` (which had left the tree mid-rebase with unresolved conflicts in
+`internal/wal/xlog_record.go` for part of this loop — deliberately left
+untouched) completed on its own, and supplies the missing test/ledger/
+design-doc bookkeeping for code that was already shipped. See the
+2026-07-15 deferral-ledger row for the full account.
+
+Confirmed via the DU-002 probe: the round-trip's failure point moved past the
+`op_family_loose` collision to a NEW, unrelated bug — restoring `CREATE
+OPERATOR CLASS public.op_class_empty ... FAMILY public.op_family AS STORAGE
+bigint` before `CREATE OPERATOR FAMILY public.op_family USING btree` has run,
+because a member-less operator class gets no `pg_depend` row against its
+owning family (`PGDependRowsForDBOid` only emits per-member rows), so real
+pg_dump's dependency-based topological sort has no edge to force
+family-before-class restore ordering. See the 2026-07-15 deferral-ledger row
+(task-id `M0122-0007 4e follow-up (catalog.userOperatorFamilies/
+userOperatorClasses cross-database isolation)`) for the resume point.
+
+Gates: `go build ./...`/`go vet ./...` clean; `go test
+./internal/catalog/... ./internal/executor/... ./internal/wal/...
+./internal/initdb/...` PASS; `go test -v -run '^TestPort_PgDumpConnectionSetup$'
+./internal/testport/` PASS (soft-log confirms the advance past
+`op_family_loose` to the new pg_depend-ordering blocker).
+
+### `PGDependRowsForDBOid` opclass→opfamily `pg_depend` edge — LANDED (2026-07-15)
+
+Closes this section's own recorded resume point: a member-less (`STORAGE`-only,
+no `ADD OPERATOR`/`ADD FUNCTION`) operator class had zero `pg_depend` rows
+against its owning family, because every opclass-related row
+`PGDependRowsForDBOid` emitted was keyed off `c.amOpMembers`/`c.amProcMembers`
+(AS-list members only, `catalog.go` ~line 13840+) — there was no row for the
+opclass↔opfamily relationship itself.
+
+Added an unconditional row per `c.userOperatorClasses` entry filtered to
+`oc.DBOid == dbOid && oc.FamilyOID != 0`: `classid=2616` (pg_opclass),
+`objid=<class OID>`, `refclassid=2753` (pg_opfamily),
+`refobjid=<class.FamilyOID>`, `objsubid`/`refobjsubid=0`, `deptype='a'`
+(AUTO — verified live against `postgres/src/backend/commands/opclasscmds.c`
+`DefineOpClass`, lines 731-735: `/* dependency on opfamily */
+recordDependencyOn(&myself, &referenced, DEPENDENCY_AUTO)`, unconditional
+regardless of members; note this is `'a'`, not `'n'`, correcting the prior
+section's memory-derived guess of NORMAL — harmless for restore-ordering
+either way since `pg_dump.c`'s `getDependencies` query only excludes
+`deptype='p'`/`'e'`, but byte-matching upstream matters for anyone diffing
+`pg_depend` directly).
+
+Confirmed via the DU-002 probe: the round-trip's failure point moved past the
+family/class ordering collision entirely to a NEW, unrelated blocker —
+`conversion "aliasconv" already exists`, because `UserConversion` has no
+`DBOid` field and `c.userConversions` is one flat, server-wide slice — the
+next registry in the M0122-0007 4e audit sequence. See the 2026-07-15
+deferral-ledger row (task-id `M0122-0007 4e follow-up
+(catalog.PGDependRowsForDBOid missing opclass→opfamily pg_depend edge)`) for
+the resume point.
+
+Gates: `go build ./...`/`go vet ./...` clean; `go test ./internal/catalog/...`
+PASS; `go test -short $(go list ./... | grep -v /internal/testport)` (full
+repo, short mode) 0 FAIL; `go test -v -run
+'^TestPort_PgDumpConnectionSetup$' ./internal/testport/` PASS (soft-log
+confirms the advance); `RALPH_PRECOMMIT_SCOPE=smoke bash
+scripts/ralph-precommit-test.sh` PASS.
+
+### Conversion registry (`catalog.InMemory.userConversions`) dbOid scoping — LANDED (2026-07-15)
+
+Closes this section's own recorded resume point: `UserConversion` had no
+`DBOid` field, and `c.userConversions` was one flat, server-wide
+`[]*UserConversion` slice, so a `CREATE CONVERSION public.aliasconv ...`
+restoring into a fresh second database collided with the source database's
+own same-named conversion (`conversion "aliasconv" already exists`).
+
+Applied the identical M0122-0007 4e pattern, mirroring `UserCollation` (same
+slice-of-pointers-with-a-`DBOid`-field shape — `userConversions` stayed a
+slice, unlike the map-keyed registries such as `userOperatorClasses`):
+
+- `UserConversion.DBOid uint32` added.
+- `CreateConversion`/`DropConversion` gained a trailing variadic
+  `dbOid ...uint32` (via `resolveDBOid`), filtering/stamping `DBOid`
+  alongside the existing `NamespaceOID` check.
+- `CreateConversionDuringRecovery` stamps `uc.DBOid = DefaultDBOid` (WAL
+  replay carries no dbOid yet, matching every sibling recovery path's
+  documented convention). `DropConversionDuringRecovery` needed no change —
+  it delegates to `DropConversion(name, schema)` with no dbOid argument,
+  which now correctly resolves to `DefaultDBOid` via the same convention.
+- New `ListUserConversionsForDBOid(dbOid)` (mirrors
+  `ListUserCollationsForDBOid`) and `PGConversionRowsForDBOid(dbOid)` (mirrors
+  `PGCollationRowsForDBOid`, minus a BKI-pinned-builtins prefix — pg_conversion's
+  ~130 built-ins all live in `pg_catalog` and are filtered out at pg_dump
+  dump-out time, unlike pg_collation's 7 dumpable builtin rows) replace the
+  old unfiltered `ListUserConversions()`-backed `pgConversion.VirtualRows`
+  closure.
+- Per-connection wiring added end-to-end, mirroring the pg_collation wiring:
+  `executor.Context.PgConversionRows func() [][]string` (context.go), a
+  `pg_conversion`-named branch in `operators.go`'s virtual-row materializer
+  (the single site serving both the simple and extended query protocols,
+  since both share the same `ectx`), and `dispatch.go`'s
+  `pgConversionRowLister` interface + `wireExtensionRows` wiring.
+- Threaded `catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)` through both
+  live `operators_ddl.go` call sites (`CREATE CONVERSION`, `DROP
+  CONVERSION`).
+- New `internal/catalog/create_conversion_dbscope_test.go`
+  (`TestCreateConversionCrossDatabaseIsolation`, mirrors
+  `TestCreateCollationCrossDatabaseIsolation`).
+
+Confirmed via the DU-002 probe: the round-trip's failure point moved past
+`conversion "aliasconv" already exists` entirely to a NEW, unrelated
+blocker — a parser gap, not a catalog-scoping gap: `ALTER CONVERSION
+public.aliasconv OWNER TO postgres;` fails `syntax error at or near
+"expected keyword table (got conversion)"` — `CONVERSION` is not a
+recognized `ALTER <objtype>` keyword in the parser's grammar. See the
+2026-07-15 deferral-ledger row (task-id `M0122-0007 4e follow-up
+(catalog.userConversions cross-database isolation)`) for the resume point.
+
+Gates: `go build ./...`/`go vet ./...` clean; `go test
+./internal/catalog/... ./internal/initdb/... ./internal/executor/...
+./internal/server/... ./internal/wal/...` PASS; `go test -short $(go list
+./... | grep -v /internal/testport)` (full repo, short mode) 0 FAIL; `go test
+-v -run '^TestPort_PgDumpConnectionSetup$' ./internal/testport/` PASS
+(soft-log confirms the advance to the ALTER CONVERSION blocker);
+`RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh` PASS
+twice (0 failed, all 3 workloads both times).
+
+### `ALTER CONVERSION` grammar + catalog/executor/WAL support — LANDED (2026-07-15)
+
+Closes the parser-gap resume point the section above recorded: `CONVERSION`
+was not a recognized `ALTER <objtype>` keyword at all — `ALTER CONVERSION
+public.aliasconv OWNER TO postgres;` (the exact statement pg_dump's
+`dumpConversion` emits via its generic archive-owner mechanism, and the
+DU-002 probe's actual blocker) failed a parser syntax error before ever
+reaching the catalog layer.
+
+- New `AlterConversionStmt` AST node (`internal/parser/ast.go`) and its
+  `parseAlter()` grammar branch (`internal/parser/ddl.go`, immediately after
+  the `ALTER COLLATION` branch), mirroring `AlterCollationStmt` byte-for-byte
+  minus `REFRESH VERSION` (collation-only). Confirmed against
+  `postgres/src/backend/parser/gram.y`'s three `ALTER CONVERSION_P`
+  productions (`RENAME TO` / `SET SCHEMA` / `OWNER TO`) — all three were
+  modelled, not just `OWNER TO`, for full grammar parity even though
+  `dumpConversion` itself only ever emits the `OWNER TO` form.
+- Catalog: `RenameConversion`/`SetConversionOwner`/`SetConversionSchema` +
+  `*DuringRecovery` counterparts (`internal/catalog/catalog.go`, right after
+  `DropConversionDuringRecovery`), mirroring the `UserCollation` trio
+  (`RenameCollation`/`SetCollationOwner`/`SetCollationSchema`) this same
+  design doc's own resume-point note pointed at.
+- Executor: `execAlterConversion` (`internal/executor/operators_ddl.go`,
+  right after `execAlterCollation`) + a `*parser.AlterConversionStmt` case in
+  the DDL dispatch switch.
+- WAL durability: 3 new record kinds `RecordKindAlterConversionRename` (130)
+  / `RecordKindAlterConversionOwner` (131) / `RecordKindAlterConversionSetSchema`
+  (132) + Encode/Decode pairs (`internal/wal/recovery.go`) +
+  `internal/initdb/conversion_ddl_recovery.go` replay wiring (mirrors
+  `collation_ddl_recovery.go`) + the physical-replay no-op classification
+  case in `recordKindToRmgrInfo`'s neighbor switch (default-case fallthrough
+  to `RmgrGoopgCatalog` — no explicit registration needed there).
+- Two wiring sites the collation precedent didn't surface until `Plan()`
+  actually failed on the new statement type: `internal/planner/planner.go`'s
+  DDL-passthrough type list and `internal/server/dispatch.go`'s command-tag
+  switch both needed a `*parser.AlterConversionStmt` case — a new DDL
+  statement type is wired at 4 sites (parser/executor, catalog, planner,
+  dispatch's tag lookup), not the 2 an `AlterCollationStmt` grep alone
+  suggests.
+- New tests: `internal/parser/alter_conversion_test.go` (rename/owner/
+  setschema parse shapes, including the probe's exact `ALTER CONVERSION
+  public.aliasconv OWNER TO postgres` SQL) and
+  `internal/executor/alter_conversion_test.go` (mirrors
+  `alter_collation_test.go`'s rename/owner/setschema/IfExists/42704
+  coverage).
+
+Confirmed via the DU-002 probe: the round-trip's failure point moved past
+`aliasconv`'s `ALTER CONVERSION ... OWNER TO` entirely to a NEW, unrelated
+blocker — a cross-database catalog-key-collision, the same shape this
+document's own sub-slices have fixed repeatedly for other registries, now
+hitting text search dictionaries: `text search dictionary "simple_dict"
+already exists` restoring into the fresh `dumprestore_du002` database. See
+the 2026-07-15 deferral-ledger row (task-id `M0122-0007 4e follow-up (parser
+gap: ALTER CONVERSION <name> OWNER TO <role>)`) for the resume point.
+
+Gates: `go build ./...`/`go vet ./...` clean; `go test ./internal/parser/...
+./internal/catalog/... ./internal/wal/... ./internal/initdb/...
+./internal/executor/... ./internal/planner/... ./internal/server/...` PASS;
+`go test -v -run '^TestPort_PgDumpConnectionSetup$' ./internal/testport/`
+PASS (soft-log confirms the advance).
+
 ## Deferred / explicitly out of scope
 
 - Unifying `ResolveDatabaseOid`'s switch with the `pg_database` `VirtualRows`
@@ -2134,9 +2724,21 @@ verification pass; a future loop should file it against
   sync with the postgres/template0/template1 special cases today).
 - The `postgres`/`template1` dbOid dual-mirror migration strategy for 4d —
   flagged, not designed; needs its own investigation once 4d is reached.
-- Any of the ~20 sibling per-name maps on `InMemory` beyond
-  `tables`/`indexes`/`byTable` (collations, conversions, aggregates,
-  operator classes, etc.) — genuinely out of scope for "per-database
-  catalog namespace" as motivated by the template-copy/dump-restore use
-  cases; each would need its own audit for whether PG actually scopes it
-  per-database (most do) before being folded into this epic.
+- Any of the remaining ~18 sibling per-name maps on `InMemory` beyond
+  `tables`/`indexes`/`byTable`/`foreignServers`/`userMappings`/
+  `userCollations`/`domains` (enums, composite types, range types,
+  conversions, aggregates, operator classes, etc.) — genuinely out of scope
+  for "per-database catalog namespace" as motivated by the
+  template-copy/dump-restore use cases; each would need its own audit for
+  whether PG actually scopes it per-database (most do) before being folded
+  into this epic. `userCollations` was folded in 2026-07-15 (see its section
+  above) once the DU-002 round-trip probe surfaced it as the specific
+  next-in-line collision; `domains` was folded the same day once the probe
+  moved on to it (see its own section above) — the probe's failure point has
+  since moved past catalog isolation entirely to a `CREATE DOMAIN ... AS
+  double precision` parser gap, a different mechanism than this epic.
+  `enumTypes`/`compositeTypes`/`rangeTypes` share `domains`'s exact
+  `map[string]*T` shape (same key-folding pattern would apply) but were not
+  audited this loop — the DU-002 probe no longer points at them since it is
+  now blocked on the parser gap instead, so their priority is unclear until
+  that parser fix lands and the probe can run further.

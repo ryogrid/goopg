@@ -443,26 +443,35 @@ func TestUpdateBlocksOnForeignTupleLock(t *testing.T) {
 	for time.Now().Before(deadline) {
 		// seedItems inserts 3 rows on block 0. id=1 is the first
 		// row, slot 1 — encoded as Block=1, Offset=2 by
-		// tupleLockTag's +1 shift.
-		w := lm.Waiters(lockmgr.LockTag{DB: rel.DBOid, Rel: rel.RelOid, Block: 1, Offset: 2})
-		if len(w) > 0 {
+		// tupleLockTag's +1 shift. Session 1's uncontended FOR UPDATE
+		// takes NO tuple tag (heap_lock_tuple only acquires it before
+		// sleeping); it is session 2's UPDATE that grabs the tag as
+		// HOLDER right before parking on session 1's xact — the
+		// pre-sleep heap_acquire_tuplock analogue (design 0021-0012).
+		h := lm.Holders(lockmgr.LockTag{DB: rel.DBOid, Rel: rel.RelOid, Block: 1, Offset: 2})
+		if h[2] != 0 {
 			registered = true
 			break
 		}
 		time.Sleep(time.Millisecond)
 	}
 	if !registered {
-		lm.ReleaseAll(1)
+		if err := ctx.TxnMgr.Rollback(s1tx); err != nil {
+			t.Errorf("rollback session 1: %v", err)
+		}
 		<-done
-		t.Fatal("session 2 did not register as a tuple-tag waiter within 2s")
+		t.Fatal("session 2 did not take the tuple tag before its conflict wait within 2s")
 	}
 
-	// Release session 1's statement-scoped lockmgr lock AND end its
-	// transaction. Cross-statement row-lock blocking now rides the locker's
-	// transaction (M0118-0003 write-path half): the conflicting UPDATE waits on
-	// session 1's xact via WaitForXID, so a bare lockmgr release no longer
-	// unblocks it — the holder must commit or abort to release the row lock.
-	lm.ReleaseAll(1)
+	// The UPDATE must still be parked on session 1's XACT (the tuple tag
+	// only sequences waiters; "wait until the holder's txn ends" rides the
+	// persisted lock-only xmax via epqWait). Ending session 1's transaction
+	// is what unblocks it.
+	select {
+	case err := <-done:
+		t.Fatalf("UPDATE completed before the locker's txn ended: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
 	if err := ctx.TxnMgr.Rollback(s1tx); err != nil {
 		t.Fatalf("rollback session 1: %v", err)
 	}
@@ -624,22 +633,35 @@ func TestUpdateViaIndexScanBlocksOnForeignTupleLock(t *testing.T) {
 	deadline := time.Now().Add(2 * time.Second)
 	registered := false
 	for time.Now().Before(deadline) {
-		w := lm.Waiters(lockmgr.LockTag{DB: rel.DBOid, Rel: rel.RelOid, Block: 1, Offset: 2})
-		if len(w) > 0 {
+		// Session 1's uncontended FOR UPDATE takes NO tuple tag
+		// (heap_lock_tuple only acquires it before sleeping); it is
+		// session 2's UPDATE that grabs the tag as HOLDER right before
+		// parking on session 1's xact — the pre-sleep
+		// heap_acquire_tuplock analogue (design 0021-0012).
+		h := lm.Holders(lockmgr.LockTag{DB: rel.DBOid, Rel: rel.RelOid, Block: 1, Offset: 2})
+		if h[2] != 0 {
 			registered = true
 			break
 		}
 		time.Sleep(time.Millisecond)
 	}
 	if !registered {
-		lm.ReleaseAll(1)
+		if err := ctx.TxnMgr.Rollback(s1tx); err != nil {
+			t.Errorf("rollback session 1: %v", err)
+		}
 		<-done
-		t.Fatal("session 2 did not register as a tuple-tag waiter via the IndexScan-driven UPDATE path")
+		t.Fatal("session 2 did not take the tuple tag via the IndexScan-driven UPDATE path within 2s")
 	}
-	// Release the lockmgr lock AND end session 1's transaction: the
-	// cross-statement write-path wait (M0118-0003) blocks on the locker's
-	// transaction, so the holder must commit/abort to release the row lock.
-	lm.ReleaseAll(1)
+
+	// The UPDATE must still be parked on session 1's XACT (the tuple tag
+	// only sequences waiters; "wait until the holder's txn ends" rides the
+	// persisted lock-only xmax via epqWait). Ending session 1's transaction
+	// is what unblocks it.
+	select {
+	case err := <-done:
+		t.Fatalf("UPDATE completed before the locker's txn ended: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
 	if err := ctx.TxnMgr.Rollback(s1tx); err != nil {
 		t.Fatalf("rollback session 1: %v", err)
 	}
@@ -704,14 +726,15 @@ func TestForShareCompatibleMultipleHolders(t *testing.T) {
 		t.Fatalf("session-2 FOR SHARE (must be compatible): %v", err)
 	}
 
-	// Both sessions hold the tuple tag; verify the tag has 2
-	// holders (RowShareLock from each backend).
+	// Neither FOR SHARE takes the heavyweight tuple tag: a request that
+	// does not conflict with the tuple's current xmax/multixact never
+	// touches the tag (design 0021-0012) — session 2's FOR SHARE is
+	// compatible with session 1's multixact membership (StatusForShare vs
+	// StatusForShare), so it never sleeps. The multi-holder property this
+	// test pins is instead verified below by the fact that neither call
+	// blocked, plus session 3's UPDATE waiting for BOTH to release.
 	rel := ctx.Catalog.RelFileNode(tbl)
 	tag := lockmgr.LockTag{DB: rel.DBOid, Rel: rel.RelOid, Block: 1, Offset: 2}
-	holders := lm.Holders(tag)
-	if len(holders) != 2 {
-		t.Fatalf("Holders=%d, want 2 (both FOR SHARE sessions)", len(holders))
-	}
 
 	// A third session attempting UPDATE on the same row must
 	// block until BOTH FOR SHARE holders release.
@@ -747,28 +770,34 @@ func TestForShareCompatibleMultipleHolders(t *testing.T) {
 		done <- nil
 	}()
 
-	// Wait briefly for session 3 to register as a waiter.
+	// Wait briefly for session 3 to take the tuple tag as HOLDER right
+	// before it sleeps on the conflicting FOR SHARE holders (neither s1
+	// nor s2 ever took the tag, so session 3 is granted immediately —
+	// design 0021-0012; see the two sibling BlocksOnForeignTupleLock tests).
 	deadline := time.Now().Add(2 * time.Second)
 	registered := false
 	for time.Now().Before(deadline) {
-		if len(lm.Waiters(tag)) >= 1 {
+		if lm.Holders(tag)[3] != 0 {
 			registered = true
 			break
 		}
 		time.Sleep(time.Millisecond)
 	}
 	if !registered {
-		lm.ReleaseAll(1)
-		lm.ReleaseAll(2)
+		if err := ctx.TxnMgr.Rollback(s1tx); err != nil {
+			t.Errorf("rollback session 1: %v", err)
+		}
+		if err := ctx.TxnMgr.Rollback(s2tx); err != nil {
+			t.Errorf("rollback session 2: %v", err)
+		}
 		<-done
-		t.Fatal("session 3 UPDATE did not register as waiter")
+		t.Fatal("session 3 UPDATE did not take the tuple tag before its conflict wait")
 	}
 
 	// End session 1's transaction (statement-scoped lockmgr release + abort);
 	// session 3 must still be blocked because session 2 still holds the FOR
 	// SHARE row lock. The write-path wait (M0118-0003) keys off active holders,
 	// so the holder's transaction — not a bare lockmgr release — is the gate.
-	lm.ReleaseAll(1)
 	if err := ctx.TxnMgr.Rollback(s1tx); err != nil {
 		t.Fatalf("rollback session 1: %v", err)
 	}

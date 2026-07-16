@@ -115,7 +115,7 @@ func coerceUnnestElem(d Datum, typeName string) Datum {
 	if d.IsNull() || !unnestElemNeedsTyping(typeName) {
 		return d
 	}
-	if c, err := evalCast(d, typeName, 0); err == nil {
+	if c, err := evalCast(d, typeName, 0, nil); err == nil {
 		return c
 	}
 	return d

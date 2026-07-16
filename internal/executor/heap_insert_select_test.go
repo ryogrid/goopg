@@ -239,7 +239,7 @@ func newBatchExtendFixture(t *testing.T) (*storage.Manager, *storage.Pool, *stor
 func TestBatchExtendAndRegisterFSMAppendsAndRegistersExtras(t *testing.T) {
 	mgr, pool, fsm, rel := newBatchExtendFixture(t)
 
-	first, err := batchExtendAndRegisterFSM(pool, fsm, rel)
+	first, err := batchExtendAndRegisterFSM(pool, fsm, rel, storage.InvalidTransactionID)
 	if err != nil {
 		t.Fatalf("batchExtendAndRegisterFSM: %v", err)
 	}
@@ -294,7 +294,7 @@ func TestBatchExtendAndRegisterFSMAppendsAndRegistersExtras(t *testing.T) {
 func TestBatchExtendAndRegisterFSMNilFSM(t *testing.T) {
 	mgr, pool, _, rel := newBatchExtendFixture(t)
 
-	first, err := batchExtendAndRegisterFSM(pool, nil, rel)
+	first, err := batchExtendAndRegisterFSM(pool, nil, rel, storage.InvalidTransactionID)
 	if err != nil {
 		t.Fatalf("batchExtendAndRegisterFSM(nil FSM): %v", err)
 	}
@@ -314,10 +314,10 @@ func TestBatchExtendAndRegisterFSMNilFSM(t *testing.T) {
 func TestBatchExtendAndRegisterFSMSecondCallContinuesAndRegisters(t *testing.T) {
 	mgr, pool, fsm, rel := newBatchExtendFixture(t)
 
-	if _, err := batchExtendAndRegisterFSM(pool, fsm, rel); err != nil {
+	if _, err := batchExtendAndRegisterFSM(pool, fsm, rel, storage.InvalidTransactionID); err != nil {
 		t.Fatalf("first batch: %v", err)
 	}
-	second, err := batchExtendAndRegisterFSM(pool, fsm, rel)
+	second, err := batchExtendAndRegisterFSM(pool, fsm, rel, storage.InvalidTransactionID)
 	if err != nil {
 		t.Fatalf("second batch: %v", err)
 	}

@@ -264,6 +264,57 @@ Item 1 (`WITH ORDINALITY AS t(m, n)` explicit dual-column naming) was
 already fixed by a separate, later loop — see the M0122-0004 ledger row
 (`TestAnalyzeWithOrdinalityNamedColumn`) — and is unrelated to this fix.
 
+## Follow-up: `regexp_match`/`regexp_matches` array-literal quoting (2026-07-14, M-NIGHTLY regress/regex triage)
+
+`regexpMatchArrayDatum` (`internal/executor/expr.go`, shared by the scalar
+path and the SRF expansions above) built its `{elem1,elem2,...}` array
+literal by directly `strings.Join`-ing the raw matched substrings, with only
+a hardcoded literal `"NULL"` string for a non-participating capture group.
+This diverges from PostgreSQL's `array_out` element-quoting contract
+(`postgres/src/backend/utils/adt/arrayfuncs.c`, the `needquote` computation
+around line 1130): an element must be double-quoted (with `"`/`\`
+backslash-escaped inside) when it is the empty string, case-insensitively
+equals the literal `NULL`, or contains `"`, `\`, `{`, `}`, the delimiter
+comma, or whitespace — otherwise a `{}` two-character output is
+indistinguishable between "empty array" and "one element that is the empty
+string", and any matched text containing a comma or brace corrupts the
+element count on read-back.
+
+Found while triaging the nightly `regress/regex` suite's byte-diff against
+upstream `regex.out`: `select regexp_match('abc', '')` (empty pattern —
+matches the empty string at position 0) rendered as `{}` instead of PG's
+`{""}`, and the multi-group backreference cases lower in the same file hit
+the same bug whenever a group matched an empty string
+(`{ll,mmmfff,}` vs PG's `{ll,mmmfff,""}`).
+
+**Fix:** `regexpMatchArrayDatum` now builds parallel `elems []string` /
+`nulls []bool` slices and delegates to the already-existing, already-tested
+`formatTextArrayWithNulls` helper (`internal/executor/expr.go`) — the same
+quoting logic other array-producing sites in this codebase already share —
+instead of hand-rolling a second, incomplete quoting implementation
+(`pattern_sibling_paths_must_agree`-adjacent: one correct quoter existed,
+a second call site just wasn't using it). No new quoting logic was written.
+
+Verified against the live regress diff: the two previously-wrong lines now
+byte-match PG exactly (`{""}` for the empty-pattern case; `{ll,mmmfff,""}`
+/ `{"",llmmmfff,""}` for the backreference-with-empty-group cases). This
+does **not** flip `regress/regex` to `pass` — the suite's dominant failures
+are PCRE-only backreference/lookaround constructs (`(?<=...)`,
+`\1`-in-pattern) that Go's `regexp` package (RE2) cannot support at all
+without swapping the regex engine, a separate and much larger gap tracked
+in `.ralph/deferral_ledger.md`.
+
+Tests: `internal/executor/regexp_match_test.go` gained
+`empty pattern match yields a one-element array with an empty string` and
+`matched text containing a comma is quoted` (the latter guards the
+previously-silent element-count corruption for any match containing the
+array delimiter, not just the empty-pattern case regress happened to hit).
+
+Gates: `go build ./...` clean; `go test ./internal/executor/...` PASS (full
+package, no regressions); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+`RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh` PASS (0
+failed, all 3 workloads).
+
 ## Deferred / out of scope
 
 - The `fork` argument's `fsm`/`vm`/`init` cases are wired through correctly

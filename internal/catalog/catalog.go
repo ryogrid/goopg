@@ -2002,7 +2002,7 @@ type Catalog interface {
 	// LookupCompositeTypeFields returns the ordered field list for a composite
 	// type registered via RegisterCompositeTypeWithFields. Returns nil if the
 	// type has no field metadata. M0097-composite.
-	LookupCompositeTypeFields(name string) []CompositeField
+	LookupCompositeTypeFields(name string, dbOid ...uint32) []CompositeField
 	// AllocOID atomically allocates and returns a fresh catalog OID from the
 	// running counter. Used to give catalog objects a stable identity when no
 	// dedicated creation method exists — e.g. named CHECK constraints that must
@@ -2014,7 +2014,7 @@ type Catalog interface {
 	// LookupEnum finds a user-defined enum type by name (case-insensitive).
 	// Exposed on the interface so the catalog-row builders can resolve an enum
 	// column's type name to its pg_type OID. DU-002 slice 88.
-	LookupEnum(name string) (*EnumType, bool)
+	LookupEnum(name string, dbOid ...uint32) (*EnumType, bool)
 	// LookupEnumByOID finds a user-defined enum type by its pg_type OID, used by
 	// format_type to render an enum column's declared type. DU-002 slice 88.
 	LookupEnumByOID(oid uint32) (*EnumType, bool)
@@ -2025,7 +2025,7 @@ type Catalog interface {
 	// LookupDomain finds a user-defined domain type by name (case-insensitive).
 	// Exposed on the interface so the catalog-row builders can resolve a domain
 	// column's type name to its pg_type OID. DU-002 slice 90.
-	LookupDomain(name string) (*Domain, bool)
+	LookupDomain(name string, dbOid ...uint32) (*Domain, bool)
 	// LookupDomainByOID finds a user-defined domain type by its pg_type OID, used
 	// by format_type to render a domain column's declared type. DU-002 slice 90.
 	LookupDomainByOID(oid uint32) (*Domain, bool)
@@ -2038,7 +2038,7 @@ type Catalog interface {
 	// by name (case-insensitive), or nil. Exposed on the interface so the
 	// catalog-row builders can re-resolve a composite field whose declared type
 	// is itself a user-defined composite type. DU-002 slice 249.
-	LookupCompositeType(name string) *CompositeType
+	LookupCompositeType(name string, dbOid ...uint32) *CompositeType
 	// LookupCompositeTypeByOID finds a user-defined composite type by its pg_type
 	// OID, used by format_type to render a nested-composite column's declared
 	// type as its schema-qualified name. DU-002 slice 249.
@@ -2052,7 +2052,7 @@ type Catalog interface {
 	// Exposed on the interface so the catalog-row builders can resolve a range
 	// (or multirange) column's declared type name to its pg_type OID, mirroring
 	// LookupEnum/LookupCompositeType. DU-002 slice 429 follow-up.
-	LookupRangeType(name string) (*RangeType, bool)
+	LookupRangeType(name string, dbOid ...uint32) (*RangeType, bool)
 	// LookupRangeTypeByMultirangeName finds a user-defined range type by its
 	// auto-generated multirange type's name (case-insensitive) — a column can be
 	// declared directly with the multirange name (e.g. `mymultirange`), not only
@@ -2274,14 +2274,18 @@ type InMemory struct {
 	domains map[string]*Domain
 	// compositeTypeNames tracks names of composite/range/base types created via
 	// CREATE TYPE ... AS (...). Since we don't implement composite type evaluation,
-	// we only track the name so DROP TYPE can succeed silently. M0097-0064.
+	// we only track the name so DROP TYPE can succeed silently. M0097-0064. Keyed
+	// by compositeKey (folds in dbOid, mirrors enumTypes/domains). M0122-0007 4e
+	// follow-up.
 	compositeTypeNames map[string]bool
 	// compositeTypeFields stores the ordered field list for composite types so
 	// that PL/pgSQL can perform field access and assignment. M0097-composite.
+	// Keyed by compositeKey. M0122-0007 4e follow-up.
 	compositeTypeFields map[string][]CompositeField
 	// compositeTypes holds OID-bearing metadata for composite types created via
 	// CREATE TYPE ... AS (...), so a pg_type heap row (typtype='c') can be
-	// synthesized for pg_dump / catalog parity. DU-002 slice 242.
+	// synthesized for pg_dump / catalog parity. DU-002 slice 242. Keyed by
+	// compositeKey. M0122-0007 4e follow-up.
 	compositeTypes map[string]*CompositeType
 	// rangeTypes holds user-defined range types created via
 	// CREATE TYPE ... AS RANGE (subtype = ..., ...), keyed by lower-case name,
@@ -2850,6 +2854,11 @@ type EnumType struct {
 	// 0 means "unset, defaults to the bootstrap superuser" — see
 	// OwnerOrDefault. M0122-0005 (m0097-0017 follow-up).
 	Owner uint32
+	// DBOid is the database this enum was created in, folded into the
+	// c.enumTypes registry key via enumKey so two databases may each register
+	// a same-named enum without colliding. Mirrors Domain.DBOid. M0122-0007
+	// 4e follow-up.
+	DBOid uint32
 }
 
 // OwnerOrDefault returns et.Owner, falling back to the bootstrap superuser OID
@@ -2897,6 +2906,15 @@ type Domain struct {
 	// 0 means "unset, defaults to the bootstrap superuser" — see
 	// OwnerOrDefault. M0122-0005 (domain follow-up).
 	Owner uint32
+	// DBOid is the real physical database oid this domain was CREATE DOMAIN'd
+	// under (mirrors UserCollation.DBOid). The registry key folds this in
+	// (domainKey) so two distinct databases may each CREATE DOMAIN a
+	// same-named domain without colliding. Defaults to DefaultDBOid for every
+	// call site that does not pass an explicit dbOid, including WAL replay
+	// (domain restart-persistence is not yet dbOid-aware — see the matching
+	// deferral ledger row). M0122-0007 4e follow-up (DU-002 round-trip probe
+	// unblock).
+	DBOid uint32
 }
 
 // OwnerOrDefault returns d.Owner, falling back to the bootstrap superuser OID
@@ -2989,6 +3007,12 @@ type CompositeType struct {
 	// 0 means "unset, defaults to the bootstrap superuser" — see
 	// OwnerOrDefault. M0122-0005 (m0097-0017 follow-up).
 	Owner uint32
+	// DBOid is the database this composite type was CREATE TYPE'd under,
+	// folded into the c.compositeTypes/compositeTypeNames/compositeTypeFields
+	// registry keys via compositeKey so two databases may each register a
+	// same-named composite type without colliding. Mirrors EnumType.DBOid/
+	// Domain.DBOid. M0122-0007 4e follow-up.
+	DBOid uint32
 }
 
 // OwnerOrDefault returns ct.Owner, falling back to the bootstrap superuser OID
@@ -3024,6 +3048,13 @@ type RangeType struct {
 	// OwnerOrDefault. M0122-0005 (range-type follow-up to the enum/composite
 	// ALTER TYPE OWNER TO/RENAME TO work).
 	Owner uint32
+	// DBOid is the database this range type belongs to, so two distinct
+	// databases may each register a same-named range type without colliding.
+	// 0 (never set) only for range types replayed from a pre-4e WAL record
+	// with no dbOid trailer; see RegisterRangeTypeDuringRecovery. Mirrors
+	// EnumType.DBOid / CompositeType.DBOid / Domain.DBOid. M0122-0007 4e
+	// follow-up.
+	DBOid uint32
 }
 
 // OwnerOrDefault returns rt.Owner, falling back to the bootstrap superuser OID
@@ -3091,6 +3122,16 @@ type UserCollation struct {
 	Locale        string // colllocale (builtin/icu locale); "" → NULL
 	Rules         string // collicurules (ICU tailoring rules, icu only); "" → NULL
 	Deterministic bool   // collisdeterministic
+	// DBOid is the real physical database oid this collation was CREATE
+	// COLLATION'd under (mirrors catalog.ForeignServer.DBOid). Registry
+	// entries are matched by (DBOid, NamespaceOID, Name), so two distinct
+	// databases may each CREATE COLLATION a same-named collation without
+	// colliding. Defaults to DefaultDBOid for every call site that does not
+	// pass an explicit dbOid (resolveDBOid's convention), including WAL
+	// replay (collation restart-persistence is not yet dbOid-aware — see the
+	// matching deferral ledger row). M0122-0007 4e follow-up (DU-002 round-trip
+	// probe unblock).
+	DBOid uint32
 }
 
 // UserConversion records a CREATE [DEFAULT] CONVERSION so pg_dump's
@@ -3125,6 +3166,16 @@ type UserConversion struct {
 	// deferral).
 	FuncOID uint32
 	Default bool // condefault (CREATE DEFAULT CONVERSION)
+	// DBOid is the real physical database oid this conversion was CREATE
+	// CONVERSION'd under (mirrors catalog.UserCollation.DBOid). Registry
+	// entries are matched by (DBOid, NamespaceOID, Name), so two distinct
+	// databases may each CREATE CONVERSION a same-named conversion without
+	// colliding. Defaults to DefaultDBOid for every call site that does not
+	// pass an explicit dbOid (resolveDBOid's convention), including WAL
+	// replay (conversion restart-persistence is not yet dbOid-aware — see the
+	// matching deferral ledger row). M0122-0007 4e follow-up (DU-002 round-trip
+	// probe unblock).
+	DBOid uint32
 }
 
 // BuiltinTSTemplateOID maps the fixed real-PG OIDs (pg_ts_template.dat) of the
@@ -3414,6 +3465,46 @@ func resolveDBOid(dbOid []uint32) uint32 {
 		return dbOid[0]
 	}
 	return DefaultDBOid
+}
+
+// domainKey builds the c.domains registry key, folding dbOid into the
+// case-insensitive name so two distinct databases may each register a
+// same-named domain without colliding. M0122-0007 4e follow-up.
+func domainKey(dbOid uint32, name string) string {
+	return strconv.FormatUint(uint64(dbOid), 10) + "\x00" + strings.ToLower(name)
+}
+
+// enumKey builds the c.enumTypes registry key, folding dbOid into the
+// case-insensitive name so two distinct databases may each register a
+// same-named enum without colliding. Mirrors domainKey. M0122-0007 4e
+// follow-up.
+func enumKey(dbOid uint32, name string) string {
+	return strconv.FormatUint(uint64(dbOid), 10) + "\x00" + strings.ToLower(name)
+}
+
+// compositeKey builds the c.compositeTypes/compositeTypeNames/
+// compositeTypeFields registry key, folding dbOid into the case-insensitive
+// name so two distinct databases may each register a same-named composite
+// type without colliding. Mirrors domainKey/enumKey. M0122-0007 4e follow-up.
+func compositeKey(dbOid uint32, name string) string {
+	return strconv.FormatUint(uint64(dbOid), 10) + "\x00" + strings.ToLower(name)
+}
+
+// rangeKey builds the c.rangeTypes registry key, folding dbOid into the
+// case-insensitive name so two distinct databases may each register a
+// same-named range type without colliding. Mirrors domainKey/enumKey/
+// compositeKey. M0122-0007 4e follow-up.
+func rangeKey(dbOid uint32, name string) string {
+	return strconv.FormatUint(uint64(dbOid), 10) + "\x00" + strings.ToLower(name)
+}
+
+// accessMethodKey builds the c.accessMethods registry key, folding dbOid into
+// the name (verbatim, no case-folding — matches RegisterAccessMethod's
+// pre-existing case-sensitive behavior) so two distinct databases may each
+// register a same-named access method without colliding. Mirrors
+// domainKey/enumKey/compositeKey/rangeKey. M0122-0007 4e follow-up.
+func accessMethodKey(dbOid uint32, name string) string {
+	return strconv.FormatUint(uint64(dbOid), 10) + "\x00" + name
 }
 
 // NewInMemory returns a catalog seeded with the v0 pg_catalog
@@ -9331,60 +9422,7 @@ func (c *InMemory) registerSystemTables() {
 	// skips them. collcollate/collctype carry libc-locale rows; colllocale
 	// carries builtin/ICU rows; unset fields are NULL (""). collisdeterministic
 	// is true for every BKI row; collicurules is NULL for all. DU-002 slice 187.
-	pgCollation.VirtualRows = func() [][]string {
-		// cols: oid, collname, collnamespace, collowner, collprovider,
-		//       collisdeterministic, collencoding, collcollate, collctype,
-		//       colllocale, collicurules, collversion
-		rows := [][]string{
-			{"100", "default", "11", "10", "d", "t", "-1", "", "", "", "", ""},
-			{"950", "C", "11", "10", "c", "t", "-1", "C", "C", "", "", ""},
-			{"951", "POSIX", "11", "10", "c", "t", "-1", "POSIX", "POSIX", "", "", ""},
-			{"962", "ucs_basic", "11", "10", "b", "t", "6", "", "", "C", "", "1"},
-			{"963", "unicode", "11", "10", "i", "t", "-1", "", "", "und", "", ""},
-			{"811", "pg_c_utf8", "11", "10", "b", "t", "6", "", "", "C.UTF-8", "", "1"},
-			{"6411", "pg_unicode_fast", "11", "10", "b", "t", "6", "", "", "PG_UNICODE_FAST", "", "1"},
-		}
-		// Append user collations (CREATE COLLATION). These carry a user
-		// namespace (e.g. public=2200) so pg_dump's getCollations selects them
-		// for dump while the BKI-pinned pg_catalog rows above are skipped.
-		// M0119-0004.
-		c.mu.RLock()
-		defer c.mu.RUnlock()
-		for _, uc := range c.userCollations {
-			det := "t"
-			if !uc.Deterministic {
-				det = "f"
-			}
-			// Per-provider NULLs: libc carries collcollate/collctype and leaves
-			// colllocale NULL; builtin/icu carry colllocale and leave
-			// collcollate/collctype NULL (matching pg_collation, and what
-			// dumpCollation's per-provider branches expect). An empty text cell
-			// must surface SQL NULL — not '' — or dumpCollation's ICU branch
-			// emits a spurious `rules = ''` and warns "invalid collation". The
-			// VirtualNull sentinel forces a NULL through TypedVirtualCell.
-			nz := func(s string) string {
-				if s == "" {
-					return VirtualNull
-				}
-				return s
-			}
-			rows = append(rows, []string{
-				strconv.FormatUint(uint64(uc.OID), 10),
-				uc.Name,
-				strconv.FormatUint(uint64(uc.NamespaceOID), 10),
-				strconv.FormatUint(uint64(uc.Owner), 10),
-				string(uc.Provider),
-				det,
-				strconv.Itoa(uc.Encoding),
-				nz(uc.Collate),
-				nz(uc.Ctype),
-				nz(uc.Locale),
-				nz(uc.Rules), // collicurules: ICU tailoring rules; "" → NULL
-				VirtualNull,  // collversion: NULL → recomputed on restore
-			})
-		}
-		return rows
-	}
+	pgCollation.VirtualRows = func() [][]string { return c.PGCollationRowsForDBOid(DefaultDBOid) }
 	c.ns(DefaultDBOid).tables["pg_catalog.pg_collation"] = pgCollation
 
 	// pg_policy — stores row-level security policies (OID 3256). goopg does NOT
@@ -10541,46 +10579,12 @@ func (c *InMemory) registerSystemTables() {
 	// pg_enc integer IDs (dumpConversion wraps them in pg_encoding_to_char), and
 	// conproc renders the schema-qualified function name (pg_dump's empty
 	// search_path qualifies the regproc). DU-002 slice 399.
-	pgConversion.VirtualRows = func() [][]string {
-		convs := c.ListUserConversions()
-		if len(convs) == 0 {
-			return nil
-		}
-		out := make([][]string, 0, len(convs))
-		for _, cv := range convs {
-			condefault := "f"
-			if cv.Default {
-				condefault = "t"
-			}
-			conproc := cv.ProcName
-			if cv.ProcSchema != "" {
-				conproc = cv.ProcSchema + "." + cv.ProcName
-			}
-			// Prefer a live FuncOID->pg_proc lookup over the as-written text so a
-			// RENAME on the conversion function after CREATE CONVERSION still
-			// dumps correctly (mirrors regproc output semantics; conproc is a
-			// real OID reference in PG, not captured text). DU-002 slice 403.
-			if cv.FuncOID != 0 && c.routines != nil {
-				if r := c.routines.LookupByOID(cv.FuncOID); r != nil {
-					conproc = r.Name
-					if r.Schema != "" {
-						conproc = r.Schema + "." + r.Name
-					}
-				}
-			}
-			out = append(out, []string{
-				strconv.FormatUint(uint64(cv.OID), 10),          // oid
-				cv.Name,                                          // conname
-				strconv.FormatUint(uint64(cv.NamespaceOID), 10), // connamespace
-				strconv.FormatUint(uint64(cv.Owner), 10),        // conowner
-				strconv.FormatInt(int64(cv.ForEncoding), 10),    // conforencoding
-				strconv.FormatInt(int64(cv.ToEncoding), 10),     // contoencoding
-				conproc,                                          // conproc (regproc text)
-				condefault,                                       // condefault
-			})
-		}
-		return out
-	}
+	// dbOid scoping: M0122-0007 4e follow-up (DU-002 round-trip probe
+	// unblock). registerSystemTables always scopes to DefaultDBOid; a
+	// per-connection dbOid is wired in via executor.Context.PgConversionRows
+	// (internal/server/dispatch.go's wireExtensionRows), mirroring
+	// pg_collation.
+	pgConversion.VirtualRows = func() [][]string { return c.PGConversionRowsForDBOid(DefaultDBOid) }
 	c.ns(DefaultDBOid).tables["pg_catalog.pg_conversion"] = pgConversion
 
 	// pg_range — range-type catalog (OID 3541). After getConversions, pg_dump's
@@ -12416,15 +12420,16 @@ func (c *InMemory) ExtensionOID(name string) uint32 {
 // surfaced as an extra virtual pg_collation row. Returns the new OID, or 0 with
 // an error if a same-named collation already exists in the same namespace and
 // ifNotExists is false. M0119-0004.
-func (c *InMemory) CreateCollation(uc *UserCollation, schema string, ifNotExists bool) (uint32, error) {
+func (c *InMemory) CreateCollation(uc *UserCollation, schema string, ifNotExists bool, dbOid ...uint32) (uint32, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	oid := resolveDBOid(dbOid)
 	nsOID := c.schemas[strings.ToLower(schema)]
 	if nsOID == 0 {
 		nsOID = c.schemas["public"]
 	}
 	for _, existing := range c.userCollations {
-		if existing.NamespaceOID == nsOID && strings.EqualFold(existing.Name, uc.Name) {
+		if existing.DBOid == oid && existing.NamespaceOID == nsOID && strings.EqualFold(existing.Name, uc.Name) {
 			if ifNotExists {
 				return existing.OID, nil
 			}
@@ -12433,6 +12438,7 @@ func (c *InMemory) CreateCollation(uc *UserCollation, schema string, ifNotExists
 	}
 	uc.OID = c.allocOIDLocked()
 	uc.NamespaceOID = nsOID
+	uc.DBOid = oid
 	c.userCollations = append(c.userCollations, uc)
 	return uc.OID, nil
 }
@@ -12443,15 +12449,16 @@ func (c *InMemory) CreateCollation(uc *UserCollation, schema string, ifNotExists
 // collations are never registered in userCollations, so a DROP COLLATION on
 // one of them always returns false (mirrors PG, which also refuses to drop a
 // pinned pg_collation row). M0119-0004.
-func (c *InMemory) DropCollation(name, schema string) bool {
+func (c *InMemory) DropCollation(name, schema string, dbOid ...uint32) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	oid := resolveDBOid(dbOid)
 	nsOID := c.schemas[strings.ToLower(schema)]
 	if nsOID == 0 {
 		nsOID = c.schemas["public"]
 	}
 	for i, uc := range c.userCollations {
-		if uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, name) {
+		if uc.DBOid == oid && uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, name) {
 			c.userCollations = append(c.userCollations[:i], c.userCollations[i+1:]...)
 			return true
 		}
@@ -12466,20 +12473,24 @@ func (c *InMemory) DropCollation(name, schema string) bool {
 // collation named newName already exists in the same namespace. `schema`
 // resolves like CreateCollation (unknown → public). M0119-0004 (DU-002,
 // loop #50 ledger follow-up).
-func (c *InMemory) RenameCollation(name, schema, newName string) error {
+func (c *InMemory) RenameCollation(name, schema, newName string, dbOid ...uint32) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	oid := resolveDBOid(dbOid)
 	nsOID := c.schemas[strings.ToLower(schema)]
 	if nsOID == 0 {
 		nsOID = c.schemas["public"]
 	}
 	var target *UserCollation
 	for _, uc := range c.userCollations {
-		if uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, name) {
+		if uc.DBOid != oid || uc.NamespaceOID != nsOID {
+			continue
+		}
+		if strings.EqualFold(uc.Name, name) {
 			target = uc
 			continue
 		}
-		if uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, newName) {
+		if strings.EqualFold(uc.Name, newName) {
 			return fmt.Errorf("collation %q already exists", newName)
 		}
 	}
@@ -12494,15 +12505,16 @@ func (c *InMemory) RenameCollation(name, schema, newName string) error {
 // the given bare name in the given schema. Returns false if no such collation
 // is registered (mirrors RenameCollation/DropCollation). M0119-0004 (DU-002,
 // loop #50 ledger follow-up).
-func (c *InMemory) SetCollationOwner(name, schema string, ownerOID uint32) bool {
+func (c *InMemory) SetCollationOwner(name, schema string, ownerOID uint32, dbOid ...uint32) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	oid := resolveDBOid(dbOid)
 	nsOID := c.schemas[strings.ToLower(schema)]
 	if nsOID == 0 {
 		nsOID = c.schemas["public"]
 	}
 	for _, uc := range c.userCollations {
-		if uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, name) {
+		if uc.DBOid == oid && uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, name) {
 			uc.Owner = ownerOID
 			return true
 		}
@@ -12515,9 +12527,10 @@ func (c *InMemory) SetCollationOwner(name, schema string, ownerOID uint32) bool 
 // their namespace OID the same way SetCollationOwner/RenameCollation do
 // (unknown → public). Returns false if no such collation is registered.
 // DU-002 slice 442.
-func (c *InMemory) SetCollationSchema(name, schema, newSchema string) bool {
+func (c *InMemory) SetCollationSchema(name, schema, newSchema string, dbOid ...uint32) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	oid := resolveDBOid(dbOid)
 	nsOID := c.schemas[strings.ToLower(schema)]
 	if nsOID == 0 {
 		nsOID = c.schemas["public"]
@@ -12527,7 +12540,7 @@ func (c *InMemory) SetCollationSchema(name, schema, newSchema string) bool {
 		newNsOID = c.schemas["public"]
 	}
 	for _, uc := range c.userCollations {
-		if uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, name) {
+		if uc.DBOid == oid && uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, name) {
 			uc.NamespaceOID = newNsOID
 			return true
 		}
@@ -12551,6 +12564,11 @@ func (c *InMemory) CreateCollationDuringRecovery(uc *UserCollation, schema strin
 		nsOID = c.schemas["public"]
 	}
 	uc.NamespaceOID = nsOID
+	// WAL replay does not yet carry a dbOid for collation records (see the
+	// DBOid field's doc comment) — every replayed collation lands under
+	// DefaultDBOid, matching every other not-yet-migrated write path's
+	// restart behavior.
+	uc.DBOid = DefaultDBOid
 	for i, existing := range c.userCollations {
 		if existing.OID == uc.OID {
 			c.userCollations[i] = uc
@@ -12606,37 +12624,46 @@ func (c *InMemory) SetCollationSchemaDuringRecovery(name, schema, newSchema stri
 // unknown schema resolves to the public namespace OID. The conversion is keyed
 // by its OID and surfaced as an extra virtual pg_conversion row. Returns the new
 // OID, or 0 with an error if a same-named conversion already exists in the same
-// namespace (PG enforces a unique (conname, connamespace)). DU-002 slice 399.
-func (c *InMemory) CreateConversion(uc *UserConversion, schema string) (uint32, error) {
+// (dbOid, namespace) (PG enforces a unique (conname, connamespace) per
+// database). dbOid is variadic (resolveDBOid's convention, defaulting to
+// DefaultDBOid) so two distinct databases may each CREATE CONVERSION a
+// same-named conversion without colliding — mirrors CreateCollation.
+// DU-002 slice 399; dbOid scoping: M0122-0007 4e follow-up.
+func (c *InMemory) CreateConversion(uc *UserConversion, schema string, dbOid ...uint32) (uint32, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	oid := resolveDBOid(dbOid)
 	nsOID := c.schemas[strings.ToLower(schema)]
 	if nsOID == 0 {
 		nsOID = c.schemas["public"]
 	}
 	for _, existing := range c.userConversions {
-		if existing.NamespaceOID == nsOID && strings.EqualFold(existing.Name, uc.Name) {
+		if existing.DBOid == oid && existing.NamespaceOID == nsOID && strings.EqualFold(existing.Name, uc.Name) {
 			return 0, fmt.Errorf("conversion %q already exists", uc.Name)
 		}
 	}
 	uc.OID = c.allocOIDLocked()
 	uc.NamespaceOID = nsOID
+	uc.DBOid = oid
 	c.userConversions = append(c.userConversions, uc)
 	return uc.OID, nil
 }
 
 // DropConversion removes the user-created conversion with the given bare name in
 // the given schema from the registry. Returns true if one was found and removed.
-// `schema` resolves like CreateConversion (unknown → public). DU-002 slice 399.
-func (c *InMemory) DropConversion(name, schema string) bool {
+// `schema` resolves like CreateConversion (unknown → public). dbOid is variadic,
+// defaulting to DefaultDBOid, mirroring DropCollation. DU-002 slice 399; dbOid
+// scoping: M0122-0007 4e follow-up.
+func (c *InMemory) DropConversion(name, schema string, dbOid ...uint32) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	oid := resolveDBOid(dbOid)
 	nsOID := c.schemas[strings.ToLower(schema)]
 	if nsOID == 0 {
 		nsOID = c.schemas["public"]
 	}
 	for i, uc := range c.userConversions {
-		if uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, name) {
+		if uc.DBOid == oid && uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, name) {
 			c.userConversions = append(c.userConversions[:i], c.userConversions[i+1:]...)
 			return true
 		}
@@ -12660,6 +12687,11 @@ func (c *InMemory) CreateConversionDuringRecovery(uc *UserConversion, schema str
 		nsOID = c.schemas["public"]
 	}
 	uc.NamespaceOID = nsOID
+	// WAL replay does not yet carry a dbOid for conversion records (see the
+	// DBOid field's doc comment) — every replayed conversion lands under
+	// DefaultDBOid, matching every other not-yet-migrated write path's
+	// restart behavior (mirrors CreateCollationDuringRecovery).
+	uc.DBOid = DefaultDBOid
 	for i, existing := range c.userConversions {
 		if existing.OID == uc.OID {
 			c.userConversions[i] = uc
@@ -12685,6 +12717,115 @@ func (c *InMemory) DropConversionDuringRecovery(name, schema string) {
 	c.DropConversion(name, schema)
 }
 
+// RenameConversion renames a user-created conversion with the given bare name
+// in the given schema to newName. Returns an error if the source conversion
+// does not exist (not found in userConversions — built-in conversions are
+// never registered there, mirroring DropConversion's refusal to touch them)
+// or a conversion named newName already exists in the same namespace.
+// `schema` resolves like CreateConversion (unknown → public). Mirrors
+// RenameCollation. M0122-0007 4e follow-up (DU-002 ALTER CONVERSION unblock).
+func (c *InMemory) RenameConversion(name, schema, newName string, dbOid ...uint32) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	oid := resolveDBOid(dbOid)
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	var target *UserConversion
+	for _, uc := range c.userConversions {
+		if uc.DBOid != oid || uc.NamespaceOID != nsOID {
+			continue
+		}
+		if strings.EqualFold(uc.Name, name) {
+			target = uc
+			continue
+		}
+		if strings.EqualFold(uc.Name, newName) {
+			return fmt.Errorf("conversion %q already exists", newName)
+		}
+	}
+	if target == nil {
+		return fmt.Errorf("conversion %q does not exist", name)
+	}
+	target.Name = newName
+	return nil
+}
+
+// SetConversionOwner sets the owning role OID of a user-created conversion
+// with the given bare name in the given schema. Returns false if no such
+// conversion is registered (mirrors RenameConversion/DropConversion). Mirrors
+// SetCollationOwner. M0122-0007 4e follow-up (DU-002 ALTER CONVERSION
+// unblock).
+func (c *InMemory) SetConversionOwner(name, schema string, ownerOID uint32, dbOid ...uint32) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	oid := resolveDBOid(dbOid)
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	for _, uc := range c.userConversions {
+		if uc.DBOid == oid && uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, name) {
+			uc.Owner = ownerOID
+			return true
+		}
+	}
+	return false
+}
+
+// SetConversionSchema moves a user-created conversion with the given bare
+// name from `schema` into `newSchema` (SET SCHEMA), resolving both schema
+// names to their namespace OID the same way SetConversionOwner/
+// RenameConversion do (unknown → public). Returns false if no such
+// conversion is registered. Mirrors SetCollationSchema. M0122-0007 4e
+// follow-up (DU-002 ALTER CONVERSION unblock).
+func (c *InMemory) SetConversionSchema(name, schema, newSchema string, dbOid ...uint32) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	oid := resolveDBOid(dbOid)
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	newNsOID := c.schemas[strings.ToLower(newSchema)]
+	if newNsOID == 0 {
+		newNsOID = c.schemas["public"]
+	}
+	for _, uc := range c.userConversions {
+		if uc.DBOid == oid && uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, name) {
+			uc.NamespaceOID = newNsOID
+			return true
+		}
+	}
+	return false
+}
+
+// RenameConversionDuringRecovery is the discard-result recovery counterpart
+// to RenameConversion, mirroring DropConversionDuringRecovery. A rename
+// record can only be replayed after its conversion's CREATE CONVERSION
+// record (WAL is scanned in order), so a not-found error here is not
+// expected in practice, but replay must not abort on it — the same "don't
+// care if it was still there" tolerance DropConversionDuringRecovery
+// documents. Mirrors RenameCollationDuringRecovery.
+func (c *InMemory) RenameConversionDuringRecovery(name, schema, newName string) {
+	_ = c.RenameConversion(name, schema, newName)
+}
+
+// SetConversionOwnerDuringRecovery is the discard-result recovery
+// counterpart to SetConversionOwner, mirroring
+// SetCollationOwnerDuringRecovery.
+func (c *InMemory) SetConversionOwnerDuringRecovery(name, schema string, ownerOID uint32) {
+	c.SetConversionOwner(name, schema, ownerOID)
+}
+
+// SetConversionSchemaDuringRecovery is the discard-result recovery
+// counterpart to SetConversionSchema, mirroring
+// SetCollationSchemaDuringRecovery.
+func (c *InMemory) SetConversionSchemaDuringRecovery(name, schema, newSchema string) {
+	c.SetConversionSchema(name, schema, newSchema)
+}
+
 // ListUserConversions returns the user-created conversions in creation order.
 // DU-002 slice 399.
 func (c *InMemory) ListUserConversions() []*UserConversion {
@@ -12695,6 +12836,77 @@ func (c *InMemory) ListUserConversions() []*UserConversion {
 	}
 	out := make([]*UserConversion, len(c.userConversions))
 	copy(out, c.userConversions)
+	return out
+}
+
+// ListUserConversionsForDBOid returns dbOid's own user-created conversions, in
+// creation order. Unlike ListUserConversions (unfiltered), this scopes to one
+// database so pg_dump's getConversions sees only the connecting database's own
+// conversions. Mirrors ListUserCollationsForDBOid. M0122-0007 4e follow-up
+// (DU-002 round-trip probe unblock).
+func (c *InMemory) ListUserConversionsForDBOid(dbOid uint32) []*UserConversion {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(c.userConversions) == 0 {
+		return nil
+	}
+	out := make([]*UserConversion, 0, len(c.userConversions))
+	for _, uc := range c.userConversions {
+		if uc.DBOid == dbOid {
+			out = append(out, uc)
+		}
+	}
+	return out
+}
+
+// PGConversionRowsForDBOid builds the pg_conversion catalog row-set for
+// dbOid's own registered user conversions (built-in conversions all live in
+// pg_catalog and are filtered out at pg_dump dump-out time, so there is no
+// BKI-pinned row-set to prepend here, unlike PGCollationRowsForDBOid).
+// registerSystemTables's VirtualRows calls this with DefaultDBOid so every
+// existing caller (server dispatch without a per-connection PgConversionRows
+// wire-up, every test) sees byte-identical behavior; a per-connection dbOid
+// is wired in via executor.Context.PgConversionRows (internal/server/
+// dispatch.go's wireExtensionRows). Mirrors PGCollationRowsForDBOid.
+// M0122-0007 4e follow-up (DU-002 round-trip probe unblock).
+func (c *InMemory) PGConversionRowsForDBOid(dbOid uint32) [][]string {
+	convs := c.ListUserConversionsForDBOid(dbOid)
+	if len(convs) == 0 {
+		return nil
+	}
+	out := make([][]string, 0, len(convs))
+	for _, cv := range convs {
+		condefault := "f"
+		if cv.Default {
+			condefault = "t"
+		}
+		conproc := cv.ProcName
+		if cv.ProcSchema != "" {
+			conproc = cv.ProcSchema + "." + cv.ProcName
+		}
+		// Prefer a live FuncOID->pg_proc lookup over the as-written text so a
+		// RENAME on the conversion function after CREATE CONVERSION still
+		// dumps correctly (mirrors regproc output semantics; conproc is a
+		// real OID reference in PG, not captured text). DU-002 slice 403.
+		if cv.FuncOID != 0 && c.routines != nil {
+			if r := c.routines.LookupByOID(cv.FuncOID); r != nil {
+				conproc = r.Name
+				if r.Schema != "" {
+					conproc = r.Schema + "." + r.Name
+				}
+			}
+		}
+		out = append(out, []string{
+			strconv.FormatUint(uint64(cv.OID), 10),          // oid
+			cv.Name,                                          // conname
+			strconv.FormatUint(uint64(cv.NamespaceOID), 10), // connamespace
+			strconv.FormatUint(uint64(cv.Owner), 10),        // conowner
+			strconv.FormatInt(int64(cv.ForEncoding), 10),    // conforencoding
+			strconv.FormatInt(int64(cv.ToEncoding), 10),     // contoencoding
+			conproc,                                          // conproc (regproc text)
+			condefault,                                       // condefault
+		})
+	}
 	return out
 }
 
@@ -13443,7 +13655,7 @@ func (c *InMemory) SetTSConfigSchemaDuringRecovery(name, schema, newSchema strin
 // searching the built-in collations and then user-created ones. Used by
 // `CREATE COLLATION new FROM existing` to copy the source's attributes. Returns
 // false if no collation by that name is known. M0119-0004.
-func (c *InMemory) CollationAttrsByName(name string) (*UserCollation, bool) {
+func (c *InMemory) CollationAttrsByName(name string, dbOid ...uint32) (*UserCollation, bool) {
 	// Built-in collations (mirror the 7 BKI rows surfaced in pg_collation):
 	// name → {provider, encoding, collate, ctype, locale}.
 	type bi struct {
@@ -13471,8 +13683,9 @@ func (c *InMemory) CollationAttrsByName(name string) (*UserCollation, bool) {
 	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	oid := resolveDBOid(dbOid)
 	for _, uc := range c.userCollations {
-		if strings.EqualFold(uc.Name, name) {
+		if uc.DBOid == oid && strings.EqualFold(uc.Name, name) {
 			cp := *uc
 			return &cp, true
 		}
@@ -13511,6 +13724,90 @@ func (c *InMemory) ListUserCollations() []*UserCollation {
 	out := make([]*UserCollation, len(c.userCollations))
 	copy(out, c.userCollations)
 	return out
+}
+
+// ListUserCollationsForDBOid returns dbOid's own user-created collations, in
+// creation order. Unlike ListUserCollations (unfiltered — kept for the
+// OID-keyed ResolveIndexColumnCollationName reverse lookup, where a
+// globally-unique OID never needs a dbOid to disambiguate), this scopes to
+// one database so pg_dump's getCollations sees only the connecting database's
+// own collations. Mirrors ListForeignServers. M0122-0007 4e follow-up (DU-002
+// round-trip probe unblock).
+func (c *InMemory) ListUserCollationsForDBOid(dbOid uint32) []*UserCollation {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(c.userCollations) == 0 {
+		return nil
+	}
+	out := make([]*UserCollation, 0, len(c.userCollations))
+	for _, uc := range c.userCollations {
+		if uc.DBOid == dbOid {
+			out = append(out, uc)
+		}
+	}
+	return out
+}
+
+// PGCollationRowsForDBOid builds the pg_collation catalog row-set for dbOid's
+// own registered user collations, appended after the 7 BKI-pinned builtin
+// rows every database shares. Mirrors PGForeignServerRowsForDBOid's
+// per-connection dbOid scoping: registerSystemTables's VirtualRows calls this
+// with DefaultDBOid so every existing caller (server dispatch without a
+// per-connection PgCollationRows wire-up, every test) sees byte-identical
+// behavior; a per-connection dbOid is wired in via executor.Context.
+// PgCollationRows (internal/server/dispatch.go's wireExtensionRows).
+// M0122-0007 4e follow-up (DU-002 round-trip probe unblock).
+func (c *InMemory) PGCollationRowsForDBOid(dbOid uint32) [][]string {
+	// cols: oid, collname, collnamespace, collowner, collprovider,
+	//       collisdeterministic, collencoding, collcollate, collctype,
+	//       colllocale, collicurules, collversion
+	rows := [][]string{
+		{"100", "default", "11", "10", "d", "t", "-1", "", "", "", "", ""},
+		{"950", "C", "11", "10", "c", "t", "-1", "C", "C", "", "", ""},
+		{"951", "POSIX", "11", "10", "c", "t", "-1", "POSIX", "POSIX", "", "", ""},
+		{"962", "ucs_basic", "11", "10", "b", "t", "6", "", "", "C", "", "1"},
+		{"963", "unicode", "11", "10", "i", "t", "-1", "", "", "und", "", ""},
+		{"811", "pg_c_utf8", "11", "10", "b", "t", "6", "", "", "C.UTF-8", "", "1"},
+		{"6411", "pg_unicode_fast", "11", "10", "b", "t", "6", "", "", "PG_UNICODE_FAST", "", "1"},
+	}
+	// Append dbOid's own user collations (CREATE COLLATION). These carry a
+	// user namespace (e.g. public=2200) so pg_dump's getCollations selects
+	// them for dump while the BKI-pinned pg_catalog rows above are skipped.
+	// M0119-0004; dbOid scoping: M0122-0007 4e follow-up.
+	for _, uc := range c.ListUserCollationsForDBOid(dbOid) {
+		det := "t"
+		if !uc.Deterministic {
+			det = "f"
+		}
+		// Per-provider NULLs: libc carries collcollate/collctype and leaves
+		// colllocale NULL; builtin/icu carry colllocale and leave
+		// collcollate/collctype NULL (matching pg_collation, and what
+		// dumpCollation's per-provider branches expect). An empty text cell
+		// must surface SQL NULL — not '' — or dumpCollation's ICU branch
+		// emits a spurious `rules = ''` and warns "invalid collation". The
+		// VirtualNull sentinel forces a NULL through TypedVirtualCell.
+		nz := func(s string) string {
+			if s == "" {
+				return VirtualNull
+			}
+			return s
+		}
+		rows = append(rows, []string{
+			strconv.FormatUint(uint64(uc.OID), 10),
+			uc.Name,
+			strconv.FormatUint(uint64(uc.NamespaceOID), 10),
+			strconv.FormatUint(uint64(uc.Owner), 10),
+			string(uc.Provider),
+			det,
+			strconv.Itoa(uc.Encoding),
+			nz(uc.Collate),
+			nz(uc.Ctype),
+			nz(uc.Locale),
+			nz(uc.Rules), // collicurules: ICU tailoring rules; "" → NULL
+			VirtualNull,  // collversion: NULL → recomputed on restore
+		})
+	}
+	return rows
 }
 
 // tablespaceVirtualRows is the VirtualRows callback for the pg_tablespace view.
@@ -13805,6 +14102,39 @@ func (c *InMemory) PGDependRowsForDBOid(dbOid uint32) [][]string {
 			classOrFamilyDeptype,
 		})
 	}
+
+	// CREATE OPERATOR CLASS itself (independent of AS-list members): an
+	// unconditional AUTO ('a') dependency from the opclass to its owning
+	// opfamily. PostgreSQL's DefineOpClass (opclasscmds.c) always records
+	// this edge — "/* dependency on opfamily */
+	// recordDependencyOn(&myself, &referenced, DEPENDENCY_AUTO);" —
+	// regardless of whether the class has any ADD OPERATOR/ADD FUNCTION
+	// members (verified live against postgres/src/backend/commands/
+	// opclasscmds.c:731-735; deptype is 'a', NOT 'n' — pg_dump's
+	// getDependencies query only excludes 'p'/'e', so 'a' orders the same
+	// as 'n' for restore purposes, but byte-matching upstream still
+	// matters for anyone diffing pg_depend directly). Without this row, a
+	// member-less (STORAGE-only) opclass has no pg_depend row against its
+	// family at all, so pg_dump's topological sort (driven entirely by
+	// pg_depend) can emit the CLASS before the FAMILY on restore, breaking
+	// "operator family ... does not exist for access method ..." — the
+	// DU-002 / M0122-0007 4e follow-up ordering bug found via a live
+	// pg_dump/psql round-trip of a member-less opclass.
+	for _, oc := range c.userOperatorClasses {
+		if oc.DBOid != dbOid || oc.FamilyOID == 0 {
+			continue
+		}
+		rows = append(rows, []string{
+			"2616", // 0: classid    = pg_opclass
+			strconv.FormatUint(uint64(oc.OID), 10), // 1: objid = opclass OID
+			"0",    // 2: objsubid
+			"2753", // 3: refclassid = pg_opfamily
+			strconv.FormatUint(uint64(oc.FamilyOID), 10), // 4: refobjid = owning family OID
+			"0", // 5: refobjsubid
+			"a", // 6: deptype = AUTO
+		})
+	}
+
 	return rows
 }
 
@@ -15908,40 +16238,48 @@ type AccessMethod struct {
 	OID        uint32 // pg_am.oid (assigned from the catalog OID counter)
 	AMType     string // pg_am.amtype: "i" (INDEX) or "t" (TABLE)
 	HandlerOID uint32 // pg_am.amhandler — FK to pg_proc
+	DBOid      uint32 // owning database's dbOid (per-database catalog namespace, M0122-0007 4e follow-up)
 }
 
 // RegisterAccessMethod records a user-defined access method. Returns an error
 // if the name collides with a built-in AM (pg_am's static 7 rows) or an
-// already-registered user AM — mirrors PostgreSQL's own duplicate-name check
-// in CreateAccessMethod (amcmds.c), which errors before this ever reaches the
-// catalog. DU-002 (M0119-0004).
-func (c *InMemory) RegisterAccessMethod(name, amType string, handlerOID uint32) (*AccessMethod, error) {
+// already-registered user AM in the same database — mirrors PostgreSQL's own
+// duplicate-name check in CreateAccessMethod (amcmds.c), which errors before
+// this ever reaches the catalog. The trailing variadic dbOid follows the
+// domainKey/enumKey/compositeKey/rangeKey/Routines convention (M0122-0007 4e)
+// so a same-named access method in two distinct databases does not collide.
+// DU-002 (M0119-0004).
+func (c *InMemory) RegisterAccessMethod(name, amType string, handlerOID uint32, dbOid ...uint32) (*AccessMethod, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if AccessMethodOIDByName(name) != 0 {
 		return nil, fmt.Errorf("access method %q already exists", name)
 	}
+	resolved := resolveDBOid(dbOid)
 	if c.accessMethods == nil {
 		c.accessMethods = make(map[string]*AccessMethod)
 	}
-	if _, ok := c.accessMethods[name]; ok {
+	k := accessMethodKey(resolved, name)
+	if _, ok := c.accessMethods[k]; ok {
 		return nil, fmt.Errorf("access method %q already exists", name)
 	}
-	am := &AccessMethod{Name: name, OID: c.allocOIDLocked(), AMType: amType, HandlerOID: handlerOID}
-	c.accessMethods[name] = am
+	am := &AccessMethod{Name: name, OID: c.allocOIDLocked(), AMType: amType, HandlerOID: handlerOID, DBOid: resolved}
+	c.accessMethods[k] = am
 	return am, nil
 }
 
 // DropAccessMethod removes a user-defined access method from the registry.
-// Returns true if found. DU-002 (M0119-0004).
-func (c *InMemory) DropAccessMethod(name string) bool {
+// Returns true if found. The trailing variadic dbOid mirrors
+// RegisterAccessMethod. DU-002 (M0119-0004).
+func (c *InMemory) DropAccessMethod(name string, dbOid ...uint32) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.accessMethods == nil {
 		return false
 	}
-	if _, ok := c.accessMethods[name]; ok {
-		delete(c.accessMethods, name)
+	k := accessMethodKey(resolveDBOid(dbOid), name)
+	if _, ok := c.accessMethods[k]; ok {
+		delete(c.accessMethods, k)
 		return true
 	}
 	return false
@@ -15949,6 +16287,15 @@ func (c *InMemory) DropAccessMethod(name string) bool {
 
 // ListAccessMethods returns all registered user-defined access methods
 // sorted by name. DU-002 (M0119-0004).
+//
+// Deliberately still un-dbOid'd (deferred, M0122-0007 4e follow-up, same
+// class as Routines.List()/pg_enum's un-scoped VirtualRows): the sole caller
+// (pg_am's VirtualRows closure, a bare func() with no per-connection dbOid in
+// scope) cannot supply a real dbOid yet, so this returns every database's
+// access methods unfiltered. Harmless today (every existing test creates at
+// most one AM, always under DefaultDBOid); a future loop wiring
+// per-connection dbOid into virtual-table row builders should filter this by
+// the querying connection's dbOid.
 func (c *InMemory) ListAccessMethods() []*AccessMethod {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -15967,12 +16314,12 @@ func (c *InMemory) ListAccessMethods() []*AccessMethod {
 // method, or 0 if no such AM is registered (including the 7 built-ins, which
 // are not tracked in this map — see AccessMethodOIDByName for those). Used by
 // COMMENT ON ACCESS METHOD to resolve the pg_am.oid to key the pg_description
-// row on, mirroring ForeignServerOID/ForeignDataWrapperOID/ExtensionOID.
-// DU-002 slice 434.
-func (c *InMemory) UserAccessMethodOID(name string) uint32 {
+// row on, mirroring ForeignServerOID/ForeignDataWrapperOID/ExtensionOID. The
+// trailing variadic dbOid mirrors RegisterAccessMethod. DU-002 slice 434.
+func (c *InMemory) UserAccessMethodOID(name string, dbOid ...uint32) uint32 {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	if am, ok := c.accessMethods[name]; ok {
+	if am, ok := c.accessMethods[accessMethodKey(resolveDBOid(dbOid), name)]; ok {
 		return am.OID
 	}
 	return 0
@@ -15988,22 +16335,34 @@ func (c *InMemory) UserAccessMethodOID(name string) uint32 {
 // partial-then-full replay). Mirrors catalog.InMemory.
 // RegisterEventTriggerDuringRecovery. DU-002 restart-persistence follow-up
 // (M0119-0004, DU-002 slice 426 ledger resume point).
+//
+// am.DBOid is normalized to DefaultDBOid when zero (the WAL record carries no
+// dbOid today — startup recovery is still single-database, same precedent as
+// Routine's Create/CreateDuringRecovery normalization, M0122-0007 4e
+// follow-up).
 func (c *InMemory) RegisterAccessMethodDuringRecovery(am *AccessMethod) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.accessMethods == nil {
 		c.accessMethods = make(map[string]*AccessMethod)
 	}
+	dbOid := am.DBOid
+	if dbOid == 0 {
+		dbOid = DefaultDBOid
+	}
 	out := *am
-	c.accessMethods[am.Name] = &out
+	out.DBOid = dbOid
+	c.accessMethods[accessMethodKey(dbOid, am.Name)] = &out
 	c.advanceNextOIDLocked(am.OID)
 }
 
 // DropAccessMethodDuringRecovery is the idempotent counterpart used for
 // replaying RecordKindDropAccessMethod. Identical to DropAccessMethod but
 // discards the found/not-found result — replay does not care whether the
-// access method was still present. DU-002 restart-persistence follow-up
-// (M0119-0004, DU-002 slice 426 ledger resume point).
+// access method was still present. Defaults to DefaultDBOid, same
+// single-database-recovery precedent as RegisterAccessMethodDuringRecovery.
+// DU-002 restart-persistence follow-up (M0119-0004, DU-002 slice 426 ledger
+// resume point).
 func (c *InMemory) DropAccessMethodDuringRecovery(name string) {
 	_ = c.DropAccessMethod(name)
 }
@@ -17380,6 +17739,9 @@ type UserOperatorFamily struct {
 	// OPERATOR FAMILY has no OWNER clause of its own, and goopg's DDL surface
 	// does not track a per-session creating role).
 	Owner uint32
+	// DBOid is the owning database's dbOid (per-database catalog namespace,
+	// M0122-0007 4e follow-up — mirrors AccessMethod.DBOid).
+	DBOid uint32
 }
 
 // OwnerOrDefault mirrors UserOperator.OwnerOrDefault. DU-002 (M0119-0004).
@@ -17402,25 +17764,30 @@ func (f *UserOperatorFamily) NamespaceOIDOrDefault() uint32 {
 // userOpFamilyKey builds the operator-family registry's lookup key. PG scopes
 // opfamily-name uniqueness per (namespace, access method), so the same family
 // name may be reused across access methods (the key includes the method OID,
-// not just schema+name).
-func userOpFamilyKey(schema, name string, method uint32) string {
+// not just schema+name). dbOid is folded in (mirrors accessMethodKey) so two
+// distinct databases may each register a same-named family without
+// colliding. M0122-0007 4e follow-up.
+func userOpFamilyKey(dbOid uint32, schema, name string, method uint32) string {
 	if schema == "" {
 		schema = "public"
 	}
-	return strings.ToLower(schema) + "." + strings.ToLower(name) + "/" + strconv.FormatUint(uint64(method), 10)
+	return strconv.FormatUint(uint64(dbOid), 10) + "\x00" + strings.ToLower(schema) + "." + strings.ToLower(name) + "/" + strconv.FormatUint(uint64(method), 10)
 }
 
 // RegisterUserOperatorFamily records a user-defined operator family,
 // allocating a stable OID on first sight. Idempotent: re-registering the same
-// (schema, name, method) key refreshes namespace/owner but keeps the OID.
-// DU-002 (M0119-0004).
-func (c *InMemory) RegisterUserOperatorFamily(schema, name string, namespaceOID, method, owner uint32) *UserOperatorFamily {
+// (schema, name, method) key refreshes namespace/owner but keeps the OID. The
+// trailing variadic dbOid follows the domainKey/enumKey/.../AccessMethod
+// convention (M0122-0007 4e) so a same-named family in two distinct
+// databases does not collide. DU-002 (M0119-0004).
+func (c *InMemory) RegisterUserOperatorFamily(schema, name string, namespaceOID, method, owner uint32, dbOid ...uint32) *UserOperatorFamily {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	resolved := resolveDBOid(dbOid)
 	if c.userOperatorFamilies == nil {
 		c.userOperatorFamilies = make(map[string]*UserOperatorFamily)
 	}
-	key := userOpFamilyKey(schema, name, method)
+	key := userOpFamilyKey(resolved, schema, name, method)
 	if f, ok := c.userOperatorFamilies[key]; ok {
 		if namespaceOID != 0 {
 			f.NamespaceOID = namespaceOID
@@ -17432,7 +17799,7 @@ func (c *InMemory) RegisterUserOperatorFamily(schema, name string, namespaceOID,
 	}
 	f := &UserOperatorFamily{
 		OID: c.allocOIDLocked(), Name: name, NamespaceOID: namespaceOID,
-		Method: method, Owner: owner,
+		Method: method, Owner: owner, DBOid: resolved,
 	}
 	c.userOperatorFamilies[key] = f
 	return f
@@ -17460,7 +17827,12 @@ func (c *InMemory) RegisterUserOperatorFamilyDuringRecovery(f *UserOperatorFamil
 	}
 	out := *f
 	out.NamespaceOID = nsOID
-	key := userOpFamilyKey(schema, f.Name, f.Method)
+	// WAL record carries no dbOid — startup recovery is still single-database
+	// (mirrors RegisterAccessMethodDuringRecovery). M0122-0007 4e follow-up.
+	if out.DBOid == 0 {
+		out.DBOid = DefaultDBOid
+	}
+	key := userOpFamilyKey(out.DBOid, schema, f.Name, f.Method)
 	c.userOperatorFamilies[key] = &out
 	c.advanceNextOIDLocked(f.OID)
 }
@@ -17468,14 +17840,15 @@ func (c *InMemory) RegisterUserOperatorFamilyDuringRecovery(f *UserOperatorFamil
 // DropUserOperatorFamily removes a user-defined operator family from the
 // registry, along with any pg_amop/pg_amproc member rows attributed to it
 // (mirrors DropUserOperatorClass's own member purge). Returns true if one
-// was found and removed. DU-002 (M0119-0004).
-func (c *InMemory) DropUserOperatorFamily(schema, name string, method uint32) bool {
+// was found and removed. The trailing variadic dbOid mirrors
+// RegisterUserOperatorFamily. DU-002 (M0119-0004).
+func (c *InMemory) DropUserOperatorFamily(schema, name string, method uint32, dbOid ...uint32) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.userOperatorFamilies == nil {
 		return false
 	}
-	key := userOpFamilyKey(schema, name, method)
+	key := userOpFamilyKey(resolveDBOid(dbOid), schema, name, method)
 	fam, ok := c.userOperatorFamilies[key]
 	if !ok {
 		return false
@@ -17546,11 +17919,12 @@ func (c *InMemory) ListUserOperatorFamilies() []*UserOperatorFamily {
 
 // LookupUserOperatorFamily finds a previously-registered operator family by
 // its identity (schema, name, method). Used by CREATE OPERATOR CLASS to
-// resolve an explicit `FAMILY family_name` clause. DU-002 (M0119-0004).
-func (c *InMemory) LookupUserOperatorFamily(schema, name string, method uint32) (*UserOperatorFamily, bool) {
+// resolve an explicit `FAMILY family_name` clause. The trailing variadic
+// dbOid mirrors RegisterUserOperatorFamily. DU-002 (M0119-0004).
+func (c *InMemory) LookupUserOperatorFamily(schema, name string, method uint32, dbOid ...uint32) (*UserOperatorFamily, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	f, ok := c.userOperatorFamilies[userOpFamilyKey(schema, name, method)]
+	f, ok := c.userOperatorFamilies[userOpFamilyKey(resolveDBOid(dbOid), schema, name, method)]
 	return f, ok
 }
 
@@ -17578,6 +17952,9 @@ type UserOperatorClass struct {
 	InTypeOID  uint32 // pg_opclass.opcintype
 	IsDefault  bool   // pg_opclass.opcdefault
 	KeyTypeOID uint32 // pg_opclass.opckeytype — 0 (InvalidOid, dumps as "-") when no STORAGE clause was given
+	// DBOid is the owning database's dbOid (per-database catalog namespace,
+	// M0122-0007 4e follow-up — mirrors AccessMethod.DBOid).
+	DBOid uint32
 }
 
 // OwnerOrDefault mirrors UserOperatorFamily.OwnerOrDefault. DU-002 (M0119-0004).
@@ -17599,25 +17976,29 @@ func (oc *UserOperatorClass) NamespaceOIDOrDefault() uint32 {
 
 // userOpClassKey builds the operator-class registry's lookup key, mirroring
 // userOpFamilyKey (PG scopes opclass-name uniqueness per namespace+access
-// method too).
-func userOpClassKey(schema, name string, method uint32) string {
+// method too). dbOid is folded in for the same per-database-isolation reason.
+// M0122-0007 4e follow-up.
+func userOpClassKey(dbOid uint32, schema, name string, method uint32) string {
 	if schema == "" {
 		schema = "public"
 	}
-	return strings.ToLower(schema) + "." + strings.ToLower(name) + "/" + strconv.FormatUint(uint64(method), 10)
+	return strconv.FormatUint(uint64(dbOid), 10) + "\x00" + strings.ToLower(schema) + "." + strings.ToLower(name) + "/" + strconv.FormatUint(uint64(method), 10)
 }
 
 // RegisterUserOperatorClass records a user-defined operator class, allocating
 // a stable OID on first sight. Idempotent: re-registering the same (schema,
-// name, method) key refreshes the mutable attributes but keeps the OID.
-// DU-002 (M0119-0004).
-func (c *InMemory) RegisterUserOperatorClass(schema, name string, namespaceOID, owner, method, familyOID, inTypeOID uint32, isDefault bool, keyTypeOID uint32) *UserOperatorClass {
+// name, method) key refreshes the mutable attributes but keeps the OID. The
+// trailing variadic dbOid follows the domainKey/enumKey/.../AccessMethod
+// convention (M0122-0007 4e) so a same-named class in two distinct databases
+// does not collide. DU-002 (M0119-0004).
+func (c *InMemory) RegisterUserOperatorClass(schema, name string, namespaceOID, owner, method, familyOID, inTypeOID uint32, isDefault bool, keyTypeOID uint32, dbOid ...uint32) *UserOperatorClass {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	resolved := resolveDBOid(dbOid)
 	if c.userOperatorClasses == nil {
 		c.userOperatorClasses = make(map[string]*UserOperatorClass)
 	}
-	key := userOpClassKey(schema, name, method)
+	key := userOpClassKey(resolved, schema, name, method)
 	if oc, ok := c.userOperatorClasses[key]; ok {
 		if namespaceOID != 0 {
 			oc.NamespaceOID = namespaceOID
@@ -17634,6 +18015,7 @@ func (c *InMemory) RegisterUserOperatorClass(schema, name string, namespaceOID, 
 	oc := &UserOperatorClass{
 		OID: c.allocOIDLocked(), Name: name, NamespaceOID: namespaceOID, Owner: owner,
 		Method: method, FamilyOID: familyOID, InTypeOID: inTypeOID, IsDefault: isDefault, KeyTypeOID: keyTypeOID,
+		DBOid: resolved,
 	}
 	c.userOperatorClasses[key] = oc
 	return oc
@@ -17664,7 +18046,12 @@ func (c *InMemory) RegisterUserOperatorClassDuringRecovery(oc *UserOperatorClass
 	}
 	out := *oc
 	out.NamespaceOID = nsOID
-	key := userOpClassKey(schema, oc.Name, oc.Method)
+	// WAL record carries no dbOid — startup recovery is still single-database
+	// (mirrors RegisterAccessMethodDuringRecovery). M0122-0007 4e follow-up.
+	if out.DBOid == 0 {
+		out.DBOid = DefaultDBOid
+	}
+	key := userOpClassKey(out.DBOid, schema, oc.Name, oc.Method)
 	c.userOperatorClasses[key] = &out
 	if c.opClassSchemas == nil {
 		c.opClassSchemas = make(map[string]string)
@@ -17679,23 +18066,23 @@ func (c *InMemory) RegisterUserOperatorClassDuringRecovery(oc *UserOperatorClass
 // removal can be WAL-logged by OID (mirroring DROP OPERATOR's own
 // look-up-then-drop-by-OID shape). DU-002 restart-persistence follow-up
 // (M0119-0004/M0110-0001).
-func (c *InMemory) LookupUserOperatorClass(schema, name string, method uint32) (*UserOperatorClass, bool) {
+func (c *InMemory) LookupUserOperatorClass(schema, name string, method uint32, dbOid ...uint32) (*UserOperatorClass, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	oc, ok := c.userOperatorClasses[userOpClassKey(schema, name, method)]
+	oc, ok := c.userOperatorClasses[userOpClassKey(resolveDBOid(dbOid), schema, name, method)]
 	return oc, ok
 }
 
 // DropUserOperatorClass removes a user-defined operator class from the
 // registry, along with any pg_amop/pg_amproc member rows attributed to it
 // (slice 411). Returns true if one was found and removed. DU-002 (M0119-0004).
-func (c *InMemory) DropUserOperatorClass(schema, name string, method uint32) bool {
+func (c *InMemory) DropUserOperatorClass(schema, name string, method uint32, dbOid ...uint32) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.userOperatorClasses == nil {
 		return false
 	}
-	key := userOpClassKey(schema, name, method)
+	key := userOpClassKey(resolveDBOid(dbOid), schema, name, method)
 	oc, ok := c.userOperatorClasses[key]
 	if !ok {
 		return false
@@ -19622,11 +20009,12 @@ func (c *InMemory) FindFKsReferencingTable(tableName string) []FKRef {
 
 // RegisterEnum creates a new enum type. Returns an error if the name already
 // exists. M0097-0017.
-func (c *InMemory) RegisterEnum(name string, values []string) (*EnumType, error) {
+func (c *InMemory) RegisterEnum(name string, values []string, dbOid ...uint32) (*EnumType, error) {
 	k := strings.ToLower(name)
+	oid := resolveDBOid(dbOid)
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if _, exists := c.enumTypes[k]; exists {
+	if _, exists := c.enumTypes[enumKey(oid, k)]; exists {
 		return nil, fmt.Errorf("type %q already exists", name)
 	}
 	evs := make([]EnumValue, len(values))
@@ -19642,19 +20030,46 @@ func (c *InMemory) RegisterEnum(name string, values []string) (*EnumType, error)
 		OID:      c.nextOID,
 		ArrayOID: c.nextOID + 1,
 		Values:   evs,
+		DBOid:    oid,
 	}
 	c.nextOID += 2
-	c.enumTypes[k] = et
+	c.enumTypes[enumKey(oid, k)] = et
 	return et, nil
 }
 
-// LookupEnum finds an enum type by name (case-insensitive). M0097-0017.
-func (c *InMemory) LookupEnum(name string) (*EnumType, bool) {
+// LookupEnum finds an enum type by name (case-insensitive), scoped to dbOid
+// when supplied. M0097-0017.
+func (c *InMemory) LookupEnum(name string, dbOid ...uint32) (*EnumType, bool) {
 	k := strings.ToLower(name)
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	et, ok := c.enumTypes[k]
-	return et, ok
+	if len(dbOid) > 0 {
+		et, ok := c.enumTypes[enumKey(dbOid[0], k)]
+		return et, ok
+	}
+	// No dbOid supplied: preserve the legacy global-name lookup for read call
+	// sites not yet threaded through a connection's dbOid (see the deferral
+	// ledger row for this loop), falling back to a scan since the registry
+	// key now folds dbOid in. Mirrors LookupDomain's identical fallback.
+	// M0122-0007 4e follow-up.
+	if et := c.lookupEnumByNameLocked(k); et != nil {
+		return et, true
+	}
+	return nil, false
+}
+
+// lookupEnumByNameLocked scans c.enumTypes for the first entry whose Name
+// matches lowerName (already lowercased), ignoring dbOid. Used by read paths
+// that have no dbOid context available (see LookupEnum's doc comment).
+// Caller holds c.mu (read or write). Mirrors lookupDomainByNameLocked.
+// M0122-0007 4e follow-up.
+func (c *InMemory) lookupEnumByNameLocked(lowerName string) *EnumType {
+	for _, et := range c.enumTypes {
+		if et.Name == lowerName {
+			return et
+		}
+	}
+	return nil
 }
 
 // LookupEnumByOID finds an enum type by its pg_type OID. DU-002 slice 88
@@ -19714,8 +20129,8 @@ func (e *EnumLabelAlreadyExists) Error() string {
 // RenameEnumValue renames an existing enum label to a new label.
 // Returns EnumLabelNotFound if oldLabel does not exist, EnumLabelAlreadyExists if newLabel
 // already exists. M0097-0022.
-func (c *InMemory) RenameEnumValue(typeName, oldLabel, newLabel string) error {
-	k := strings.ToLower(typeName)
+func (c *InMemory) RenameEnumValue(typeName, oldLabel, newLabel string, dbOid ...uint32) error {
+	k := enumKey(resolveDBOid(dbOid), typeName)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	et, ok := c.enumTypes[k]
@@ -19742,9 +20157,10 @@ func (c *InMemory) RenameEnumValue(typeName, oldLabel, newLabel string) error {
 }
 
 // RenameEnum renames an enum type from oldName to newName. M0097-enum-rename.
-func (c *InMemory) RenameEnum(oldName, newName string) error {
-	ok := strings.ToLower(oldName)
-	nk := strings.ToLower(newName)
+func (c *InMemory) RenameEnum(oldName, newName string, dbOid ...uint32) error {
+	oid := resolveDBOid(dbOid)
+	ok := enumKey(oid, oldName)
+	nk := enumKey(oid, newName)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	et, found := c.enumTypes[ok]
@@ -19755,7 +20171,7 @@ func (c *InMemory) RenameEnum(oldName, newName string) error {
 		return fmt.Errorf("type %q already exists", newName)
 	}
 	delete(c.enumTypes, ok)
-	et.Name = nk
+	et.Name = strings.ToLower(newName)
 	c.enumTypes[nk] = et
 	return nil
 }
@@ -19763,8 +20179,8 @@ func (c *InMemory) RenameEnum(oldName, newName string) error {
 // SetEnumOwner records the typowner role OID for an existing enum type.
 // Returns false if no such enum is registered. Mirrors SetCollationOwner.
 // M0122-0005 (m0097-0017 follow-up).
-func (c *InMemory) SetEnumOwner(name string, ownerOID uint32) bool {
-	k := strings.ToLower(name)
+func (c *InMemory) SetEnumOwner(name string, ownerOID uint32, dbOid ...uint32) bool {
+	k := enumKey(resolveDBOid(dbOid), name)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	et, ok := c.enumTypes[k]
@@ -19780,9 +20196,11 @@ func (c *InMemory) SetEnumOwner(name string, ownerOID uint32) bool {
 // RENAME TO previously always called RenameEnum regardless of the target
 // type's kind, so renaming a composite type raised a spurious "type does not
 // exist" (42710) instead of renaming it.
-func (c *InMemory) RenameCompositeType(oldName, newName string) error {
-	ok := strings.ToLower(oldName)
-	nk := strings.ToLower(newName)
+func (c *InMemory) RenameCompositeType(oldName, newName string, dbOid ...uint32) error {
+	oid := resolveDBOid(dbOid)
+	ok := compositeKey(oid, oldName)
+	nk := compositeKey(oid, newName)
+	lowerNewName := strings.ToLower(newName)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	ct, found := c.compositeTypes[ok]
@@ -19795,7 +20213,7 @@ func (c *InMemory) RenameCompositeType(oldName, newName string) error {
 	delete(c.compositeTypes, ok)
 	delete(c.compositeTypeNames, ok)
 	delete(c.compositeTypeFields, ok)
-	ct.Name = nk
+	ct.Name = lowerNewName
 	c.compositeTypes[nk] = ct
 	c.compositeTypeNames[nk] = true
 	c.compositeTypeFields[nk] = ct.Fields
@@ -19805,8 +20223,8 @@ func (c *InMemory) RenameCompositeType(oldName, newName string) error {
 // SetCompositeTypeOwner records the typowner role OID for an existing
 // composite type. Returns false if no such composite type is registered.
 // Mirrors SetEnumOwner. M0122-0005 (m0097-0017 follow-up).
-func (c *InMemory) SetCompositeTypeOwner(name string, ownerOID uint32) bool {
-	k := strings.ToLower(name)
+func (c *InMemory) SetCompositeTypeOwner(name string, ownerOID uint32, dbOid ...uint32) bool {
+	k := compositeKey(resolveDBOid(dbOid), name)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	ct, ok := c.compositeTypes[k]
@@ -19825,9 +20243,11 @@ func (c *InMemory) SetCompositeTypeOwner(name string, ownerOID uint32) bool {
 // auto-generated multirange name is left untouched (it is a distinct pg_type
 // row with its own name, unaffected by renaming the range type itself, mirroring
 // real PostgreSQL). M0122-0005 (range-type follow-up).
-func (c *InMemory) RenameRangeType(oldName, newName string) error {
-	ok := strings.ToLower(oldName)
-	nk := strings.ToLower(newName)
+func (c *InMemory) RenameRangeType(oldName, newName string, dbOid ...uint32) error {
+	oid := resolveDBOid(dbOid)
+	ok := rangeKey(oid, oldName)
+	nk := rangeKey(oid, newName)
+	lowerNewName := strings.ToLower(newName)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	rt, found := c.rangeTypes[ok]
@@ -19838,7 +20258,7 @@ func (c *InMemory) RenameRangeType(oldName, newName string) error {
 		return fmt.Errorf("type %q already exists", newName)
 	}
 	delete(c.rangeTypes, ok)
-	rt.Name = nk
+	rt.Name = lowerNewName
 	c.rangeTypes[nk] = rt
 	return nil
 }
@@ -19846,8 +20266,8 @@ func (c *InMemory) RenameRangeType(oldName, newName string) error {
 // SetRangeTypeOwner records the typowner role OID for an existing range type.
 // Returns false if no such range type is registered. Mirrors
 // SetCompositeTypeOwner/SetEnumOwner. M0122-0005 (range-type follow-up).
-func (c *InMemory) SetRangeTypeOwner(name string, ownerOID uint32) bool {
-	k := strings.ToLower(name)
+func (c *InMemory) SetRangeTypeOwner(name string, ownerOID uint32, dbOid ...uint32) bool {
+	k := rangeKey(resolveDBOid(dbOid), name)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	rt, ok := c.rangeTypes[k]
@@ -19864,8 +20284,8 @@ func (c *InMemory) SetRangeTypeOwner(name string, ownerOID uint32) bool {
 //
 // To distinguish the "skipped duplicate" case (for NOTICE emission), use
 // AddEnumValueResult which returns a skipped bool. M0097-0017.
-func (c *InMemory) AddEnumValue(name, value string, ifNotExists bool, before, after string) error {
-	_, err := c.AddEnumValueResult(name, value, ifNotExists, before, after)
+func (c *InMemory) AddEnumValue(name, value string, ifNotExists bool, before, after string, dbOid ...uint32) error {
+	_, err := c.AddEnumValueResult(name, value, ifNotExists, before, after, dbOid...)
 	return err
 }
 
@@ -19881,12 +20301,12 @@ func renumberEnumValues(et *EnumType) {
 	}
 }
 
-func (c *InMemory) AddEnumValueResult(name, value string, ifNotExists bool, before, after string) (skipped bool, err error) {
+func (c *InMemory) AddEnumValueResult(name, value string, ifNotExists bool, before, after string, dbOid ...uint32) (skipped bool, err error) {
 	// PostgreSQL limits enum labels to 63 bytes (NAMEDATALEN-1). M0097-0063.
 	if len(value) > 63 {
 		return false, &EnumLabelTooLong{Label: value}
 	}
-	k := strings.ToLower(name)
+	k := enumKey(resolveDBOid(dbOid), name)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	et, ok := c.enumTypes[k]
@@ -19975,8 +20395,8 @@ func (c *InMemory) AddEnumValueResult(name, value string, ifNotExists bool, befo
 
 // RemoveEnumValue removes a label from an existing enum type.
 // Used to roll back ALTER TYPE … ADD VALUE on transaction ROLLBACK. M0097-0022.
-func (c *InMemory) RemoveEnumValue(typeName, label string) {
-	k := strings.ToLower(typeName)
+func (c *InMemory) RemoveEnumValue(typeName, label string, dbOid ...uint32) {
+	k := enumKey(resolveDBOid(dbOid), typeName)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	et, found := c.enumTypes[k]
@@ -19993,8 +20413,8 @@ func (c *InMemory) RemoveEnumValue(typeName, label string) {
 
 // DropEnum removes an enum type. cascade=true is accepted (stub — does not
 // remove dependent columns). Returns an error if not found. M0097-0017.
-func (c *InMemory) DropEnum(name string, cascade bool) error {
-	k := strings.ToLower(name)
+func (c *InMemory) DropEnum(name string, cascade bool, dbOid ...uint32) error {
+	k := enumKey(resolveDBOid(dbOid), name)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if _, ok := c.enumTypes[k]; !ok {
@@ -20008,8 +20428,9 @@ func (c *InMemory) DropEnum(name string, cascade bool) error {
 // DROP TYPE can succeed. We don't model composite type internals in v0;
 // tracking the name is enough for DROP TYPE to avoid a false-positive error.
 // M0097-0064.
-func (c *InMemory) RegisterCompositeType(name string) {
-	k := strings.ToLower(name)
+func (c *InMemory) RegisterCompositeType(name string, dbOid ...uint32) {
+	oid := resolveDBOid(dbOid)
+	k := compositeKey(oid, name)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.compositeTypeNames[k] = true
@@ -20017,8 +20438,10 @@ func (c *InMemory) RegisterCompositeType(name string) {
 
 // RegisterCompositeTypeWithFields records a composite type together with its
 // ordered field list, enabling PL/pgSQL field access/assignment. M0097-composite.
-func (c *InMemory) RegisterCompositeTypeWithFields(name string, fields []CompositeField) *CompositeType {
-	k := strings.ToLower(name)
+func (c *InMemory) RegisterCompositeTypeWithFields(name string, fields []CompositeField, dbOid ...uint32) *CompositeType {
+	oid := resolveDBOid(dbOid)
+	lowerName := strings.ToLower(name)
+	k := compositeKey(oid, lowerName)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.compositeTypeNames[k] = true
@@ -20031,7 +20454,7 @@ func (c *InMemory) RegisterCompositeTypeWithFields(name string, fields []Composi
 	// pg_attribute. DU-002 slice 242 (type+array), slice 243 (relation).
 	ct, ok := c.compositeTypes[k]
 	if !ok {
-		ct = &CompositeType{Name: k, OID: c.nextOID, ArrayOID: c.nextOID + 1, RelOID: c.nextOID + 2}
+		ct = &CompositeType{Name: lowerName, OID: c.nextOID, ArrayOID: c.nextOID + 1, RelOID: c.nextOID + 2, DBOid: oid}
 		c.nextOID += 3
 		c.compositeTypes[k] = ct
 	}
@@ -20041,11 +20464,32 @@ func (c *InMemory) RegisterCompositeTypeWithFields(name string, fields []Composi
 
 // LookupCompositeType returns the OID-bearing metadata for a composite type, or
 // nil if no such type exists. DU-002 slice 242.
-func (c *InMemory) LookupCompositeType(name string) *CompositeType {
-	k := strings.ToLower(name)
+func (c *InMemory) LookupCompositeType(name string, dbOid ...uint32) *CompositeType {
+	lowerName := strings.ToLower(name)
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.compositeTypes[k]
+	if len(dbOid) > 0 {
+		return c.compositeTypes[compositeKey(dbOid[0], lowerName)]
+	}
+	// No dbOid supplied: preserve the legacy global-name lookup for read call
+	// sites not yet threaded through a connection's dbOid, falling back to a
+	// scan since the registry key now folds dbOid in. Mirrors LookupEnum's
+	// identical fallback. M0122-0007 4e follow-up.
+	return c.lookupCompositeTypeByNameLocked(lowerName)
+}
+
+// lookupCompositeTypeByNameLocked scans c.compositeTypes for the first entry
+// whose Name matches lowerName (already lowercased), ignoring dbOid. Used by
+// read paths that have no dbOid context available (see LookupCompositeType's
+// doc comment). Caller holds c.mu (read or write). Mirrors
+// lookupEnumByNameLocked/lookupDomainByNameLocked. M0122-0007 4e follow-up.
+func (c *InMemory) lookupCompositeTypeByNameLocked(lowerName string) *CompositeType {
+	for _, ct := range c.compositeTypes {
+		if ct.Name == lowerName {
+			return ct
+		}
+	}
+	return nil
 }
 
 // LookupCompositeTypeByOID finds a composite type by its pg_type OID. Used by
@@ -20578,7 +21022,7 @@ func (c *InMemory) resolveRangeCollation(subtypeOID uint32, collationName string
 // `collation` option values; empty means "use PG's default resolution".
 // Returns a *RangeTypeOptionError (carrying PG's own SQLSTATE) if any option
 // fails to resolve. M0110-0001.
-func (c *InMemory) RegisterRangeType(name, subtypeName, explicitMultirangeName, opclassName, collationName string) (*RangeType, error) {
+func (c *InMemory) RegisterRangeType(name, subtypeName, explicitMultirangeName, opclassName, collationName string, dbOid ...uint32) (*RangeType, error) {
 	subtypeOID := TypeNameToOID(subtypeName)
 	opclassOID, rerr := c.resolveRangeOpclass(subtypeName, subtypeOID, opclassName)
 	if rerr != nil {
@@ -20588,6 +21032,7 @@ func (c *InMemory) RegisterRangeType(name, subtypeName, explicitMultirangeName, 
 	if rerr != nil {
 		return nil, rerr
 	}
+	oid := resolveDBOid(dbOid)
 	k := strings.ToLower(name)
 	mrName := strings.ToLower(explicitMultirangeName)
 	if mrName == "" {
@@ -20595,7 +21040,7 @@ func (c *InMemory) RegisterRangeType(name, subtypeName, explicitMultirangeName, 
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	rt, exists := c.rangeTypes[k]
+	rt, exists := c.rangeTypes[rangeKey(oid, k)]
 	if !exists {
 		rt = &RangeType{
 			Name:               k,
@@ -20603,9 +21048,10 @@ func (c *InMemory) RegisterRangeType(name, subtypeName, explicitMultirangeName, 
 			ArrayOID:           c.nextOID + 1,
 			MultirangeOID:      c.nextOID + 2,
 			MultirangeArrayOID: c.nextOID + 3,
+			DBOid:              oid,
 		}
 		c.nextOID += 4
-		c.rangeTypes[k] = rt
+		c.rangeTypes[rangeKey(oid, k)] = rt
 	}
 	rt.SubtypeName = subtypeName
 	rt.OpclassOID = opclassOID
@@ -20614,13 +21060,38 @@ func (c *InMemory) RegisterRangeType(name, subtypeName, explicitMultirangeName, 
 	return rt, nil
 }
 
-// LookupRangeType finds a user-defined range type by name (case-insensitive).
-// M0110-0001.
-func (c *InMemory) LookupRangeType(name string) (*RangeType, bool) {
+// LookupRangeType finds a user-defined range type by name (case-insensitive),
+// scoped to dbOid when supplied. M0110-0001.
+func (c *InMemory) LookupRangeType(name string, dbOid ...uint32) (*RangeType, bool) {
+	k := strings.ToLower(name)
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	rt, ok := c.rangeTypes[strings.ToLower(name)]
-	return rt, ok
+	if len(dbOid) > 0 {
+		rt, ok := c.rangeTypes[rangeKey(dbOid[0], k)]
+		return rt, ok
+	}
+	// No dbOid supplied: preserve the legacy global-name lookup for read call
+	// sites not yet threaded through a connection's dbOid, falling back to a
+	// scan since the registry key now folds dbOid in. Mirrors LookupEnum's/
+	// LookupDomain's identical fallback. M0122-0007 4e follow-up.
+	if rt := c.lookupRangeTypeByNameLocked(k); rt != nil {
+		return rt, true
+	}
+	return nil, false
+}
+
+// lookupRangeTypeByNameLocked scans c.rangeTypes for the first entry whose
+// Name matches lowerName (already lowercased), ignoring dbOid. Used by read
+// paths that have no dbOid context available (see LookupRangeType's doc
+// comment). Caller holds c.mu (read or write). Mirrors
+// lookupEnumByNameLocked/lookupDomainByNameLocked. M0122-0007 4e follow-up.
+func (c *InMemory) lookupRangeTypeByNameLocked(lowerName string) *RangeType {
+	for _, rt := range c.rangeTypes {
+		if rt.Name == lowerName {
+			return rt
+		}
+	}
+	return nil
 }
 
 // LookupRangeTypeByMultirangeName finds a user-defined range type by its
@@ -20713,8 +21184,8 @@ func (c *InMemory) ListRangeTypes() []*RangeType {
 
 // DropRangeType removes a range type. Returns an error if not found.
 // M0110-0001.
-func (c *InMemory) DropRangeType(name string) error {
-	k := strings.ToLower(name)
+func (c *InMemory) DropRangeType(name string, dbOid ...uint32) error {
+	k := rangeKey(resolveDBOid(dbOid), name)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if _, ok := c.rangeTypes[k]; !ok {
@@ -20741,7 +21212,12 @@ func (c *InMemory) RegisterRangeTypeDuringRecovery(rt *RangeType) {
 		c.rangeTypes = make(map[string]*RangeType)
 	}
 	out := *rt
-	c.rangeTypes[rt.Name] = &out
+	// WAL replay does not yet carry a dbOid for range-type records (see the
+	// DBOid field's doc comment) — every replayed range type lands under
+	// DefaultDBOid, matching every other not-yet-migrated write path's
+	// restart behavior (domains/collations/enums/composites).
+	out.DBOid = DefaultDBOid
+	c.rangeTypes[rangeKey(DefaultDBOid, rt.Name)] = &out
 	c.advanceNextOIDLocked(rt.OID)
 	c.advanceNextOIDLocked(rt.ArrayOID)
 	c.advanceNextOIDLocked(rt.MultirangeOID)
@@ -20773,16 +21249,26 @@ func (c *InMemory) DropRangeTypeDuringRecovery(name string) {
 
 // LookupCompositeTypeFields returns the ordered field list for a composite type,
 // or nil if the type is not known or has no field metadata. M0097-composite.
-func (c *InMemory) LookupCompositeTypeFields(name string) []CompositeField {
-	k := strings.ToLower(name)
+func (c *InMemory) LookupCompositeTypeFields(name string, dbOid ...uint32) []CompositeField {
+	lowerName := strings.ToLower(name)
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.compositeTypeFields[k]
+	if len(dbOid) > 0 {
+		return c.compositeTypeFields[compositeKey(dbOid[0], lowerName)]
+	}
+	// No dbOid supplied: fall back to the dbOid-agnostic composite lookup so
+	// existing callers keep working unchanged. Mirrors LookupCompositeType's
+	// identical fallback. M0122-0007 4e follow-up.
+	if ct := c.lookupCompositeTypeByNameLocked(lowerName); ct != nil {
+		return ct.Fields
+	}
+	return nil
 }
 
 // HasCompositeType reports whether the given name refers to a composite type.
-func (c *InMemory) HasCompositeType(name string) bool {
-	k := strings.ToLower(name)
+func (c *InMemory) HasCompositeType(name string, dbOid ...uint32) bool {
+	oid := resolveDBOid(dbOid)
+	k := compositeKey(oid, name)
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.compositeTypeNames[k]
@@ -20790,8 +21276,9 @@ func (c *InMemory) HasCompositeType(name string) bool {
 
 // DropCompositeType removes a composite type name. Returns an error if not
 // found. M0097-0064.
-func (c *InMemory) DropCompositeType(name string) error {
-	k := strings.ToLower(name)
+func (c *InMemory) DropCompositeType(name string, dbOid ...uint32) error {
+	oid := resolveDBOid(dbOid)
+	k := compositeKey(oid, name)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if !c.compositeTypeNames[k] {
@@ -20807,11 +21294,12 @@ func (c *InMemory) DropCompositeType(name string) error {
 
 // RegisterDomain creates a new domain type. Returns an error if name already
 // exists. M0097-0017.
-func (c *InMemory) RegisterDomain(name string, base Type, notNull bool) (*Domain, error) {
+func (c *InMemory) RegisterDomain(name string, base Type, notNull bool, dbOid ...uint32) (*Domain, error) {
 	k := strings.ToLower(name)
+	oid := resolveDBOid(dbOid)
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if _, exists := c.domains[k]; exists {
+	if _, exists := c.domains[domainKey(oid, k)]; exists {
 		return nil, fmt.Errorf("type %q already exists", name)
 	}
 	// PostgreSQL allocates two OIDs per domain: the domain type itself, then its
@@ -20824,9 +21312,10 @@ func (c *InMemory) RegisterDomain(name string, base Type, notNull bool) (*Domain
 		ArrayOID: c.nextOID + 1,
 		Base:     base,
 		NotNull:  notNull,
+		DBOid:    oid,
 	}
 	c.nextOID += 2
-	c.domains[k] = d
+	c.domains[domainKey(oid, k)] = d
 	return d, nil
 }
 
@@ -20842,7 +21331,12 @@ func (c *InMemory) RegisterDomainDuringRecovery(d *Domain) {
 		c.domains = make(map[string]*Domain)
 	}
 	out := *d
-	c.domains[strings.ToLower(d.Name)] = &out
+	// WAL replay does not yet carry a dbOid for domain records (see the
+	// DBOid field's doc comment) — every replayed domain lands under
+	// DefaultDBOid, matching every other not-yet-migrated write path's
+	// restart behavior.
+	out.DBOid = DefaultDBOid
+	c.domains[domainKey(DefaultDBOid, d.Name)] = &out
 	c.advanceNextOIDLocked(d.OID)
 	c.advanceNextOIDLocked(d.ArrayOID)
 	for _, chk := range d.Checks {
@@ -20859,7 +21353,7 @@ func (c *InMemory) RegisterDomainDuringRecovery(d *Domain) {
 func (c *InMemory) DropDomainDuringRecovery(name string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	delete(c.domains, strings.ToLower(name))
+	delete(c.domains, domainKey(DefaultDBOid, name))
 }
 
 // AddDomainCheck appends a CHECK constraint to a domain and allocates its
@@ -20908,8 +21402,8 @@ func (c *InMemory) addDomainCheckLocked(d *Domain, name, expr string, inValues [
 // validation (real PG's `!skip_validation` scan of every table column typed
 // with this domain) is not performed — see deferral ledger. M0122-0005 domain
 // follow-up (ADD CONSTRAINT).
-func (c *InMemory) AddDomainConstraint(domainName, name, expr string, inValues []string) error {
-	k := strings.ToLower(domainName)
+func (c *InMemory) AddDomainConstraint(domainName, name, expr string, inValues []string, dbOid ...uint32) error {
+	k := domainKey(resolveDBOid(dbOid), domainName)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	d, ok := c.domains[k]
@@ -20930,8 +21424,8 @@ func (c *InMemory) AddDomainConstraint(domainName, name, expr string, inValues [
 // own ifExists convention (goopg's catalog layer has no per-command NOTICE
 // channel to emit real PG's "skipping" notice through instead). M0122-0005
 // domain follow-up (DROP CONSTRAINT).
-func (c *InMemory) DropDomainConstraint(domainName, constrName string, ifExists bool) error {
-	k := strings.ToLower(domainName)
+func (c *InMemory) DropDomainConstraint(domainName, constrName string, ifExists bool, dbOid ...uint32) error {
+	k := domainKey(resolveDBOid(dbOid), domainName)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	d, ok := c.domains[k]
@@ -20962,12 +21456,23 @@ func (c *InMemory) domainCheckNameTaken(d *Domain, name string) bool {
 }
 
 // LookupDomain finds a domain by name (case-insensitive). M0097-0017.
-func (c *InMemory) LookupDomain(name string) (*Domain, bool) {
-	k := strings.ToLower(name)
+func (c *InMemory) LookupDomain(name string, dbOid ...uint32) (*Domain, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	d, ok := c.domains[k]
-	return d, ok
+	if len(dbOid) > 0 {
+		d, ok := c.domains[domainKey(dbOid[0], name)]
+		return d, ok
+	}
+	// No dbOid supplied: preserve the legacy global-name lookup for read call
+	// sites not yet threaded through a connection's dbOid (see the deferral
+	// ledger row for this loop) — falls back to a scan since the registry key
+	// now folds dbOid in. Ambiguous only when two databases register the same
+	// domain name, previously impossible since the registry had no isolation
+	// at all. M0122-0007 4e follow-up.
+	if d := c.lookupDomainByNameLocked(strings.ToLower(name)); d != nil {
+		return d, true
+	}
+	return nil, false
 }
 
 // AllDomains returns a snapshot slice of every registered domain. Used by
@@ -21014,9 +21519,10 @@ func (c *InMemory) LookupDomainByArrayOID(oid uint32) (*Domain, bool) {
 // RenameDomain renames a domain from oldName to newName, mirroring
 // RenameRangeType/RenameCompositeType/RenameEnum. M0122-0005 (domain
 // follow-up).
-func (c *InMemory) RenameDomain(oldName, newName string) error {
-	ok := strings.ToLower(oldName)
-	nk := strings.ToLower(newName)
+func (c *InMemory) RenameDomain(oldName, newName string, dbOid ...uint32) error {
+	oid := resolveDBOid(dbOid)
+	ok := domainKey(oid, oldName)
+	nk := domainKey(oid, newName)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	d, found := c.domains[ok]
@@ -21027,7 +21533,7 @@ func (c *InMemory) RenameDomain(oldName, newName string) error {
 		return fmt.Errorf("type %q already exists", newName)
 	}
 	delete(c.domains, ok)
-	d.Name = nk
+	d.Name = strings.ToLower(newName)
 	c.domains[nk] = d
 	return nil
 }
@@ -21039,8 +21545,8 @@ func (c *InMemory) RenameDomain(oldName, newName string) error {
 // oldName isn't found (also covers an unknown domain), "constraint %q for
 // domain %s already exists" when newName collides with another CHECK already
 // on the same domain. M0122-0005 domain follow-up (RENAME CONSTRAINT).
-func (c *InMemory) RenameDomainConstraint(domainName, oldName, newName string) error {
-	k := strings.ToLower(domainName)
+func (c *InMemory) RenameDomainConstraint(domainName, oldName, newName string, dbOid ...uint32) error {
+	k := domainKey(resolveDBOid(dbOid), domainName)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	d, ok := c.domains[k]
@@ -21072,8 +21578,8 @@ func (c *InMemory) RenameDomainConstraint(domainName, oldName, newName string) e
 // Returns false if no such domain is registered. Mirrors
 // SetRangeTypeOwner/SetCompositeTypeOwner/SetEnumOwner. M0122-0005 (domain
 // follow-up).
-func (c *InMemory) SetDomainOwner(name string, ownerOID uint32) bool {
-	k := strings.ToLower(name)
+func (c *InMemory) SetDomainOwner(name string, ownerOID uint32, dbOid ...uint32) bool {
+	k := domainKey(resolveDBOid(dbOid), name)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	d, ok := c.domains[k]
@@ -21089,8 +21595,8 @@ func (c *InMemory) SetDomainOwner(name string, ownerOID uint32) bool {
 // the latter passing a nil expr), mirroring AlterDomainDefault. Returns false
 // if no such domain is registered. M0122-0005 domain follow-up (SET/DROP
 // DEFAULT).
-func (c *InMemory) SetDomainDefault(name string, expr parser.Expr) bool {
-	k := strings.ToLower(name)
+func (c *InMemory) SetDomainDefault(name string, expr parser.Expr, dbOid ...uint32) bool {
+	k := domainKey(resolveDBOid(dbOid), name)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	d, ok := c.domains[k]
@@ -21109,8 +21615,8 @@ func (c *InMemory) SetDomainDefault(name string, expr parser.Expr) bool {
 // Constraint's cross-table walk) — the same simplification goopg's
 // ALTER TABLE ... SET NOT NULL already makes for plain columns. M0122-0005
 // domain follow-up (SET/DROP NOT NULL).
-func (c *InMemory) SetDomainNotNull(name string, notNull bool) bool {
-	k := strings.ToLower(name)
+func (c *InMemory) SetDomainNotNull(name string, notNull bool, dbOid ...uint32) bool {
+	k := domainKey(resolveDBOid(dbOid), name)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	d, ok := c.domains[k]
@@ -21515,11 +22021,13 @@ func formatExprForAttrdef(e parser.Expr) string {
 // DropDomain removes a domain. Returns (names, nil) on success where names are
 // tables dropped via CASCADE. Returns (blockingTables, "dependent objects") when
 // cascade=false and dependents exist. M0097-0023.
-func (c *InMemory) DropDomain(name string, ifExists bool, cascade bool) ([]string, error) {
-	k := strings.ToLower(name)
+func (c *InMemory) DropDomain(name string, ifExists bool, cascade bool, dbOid ...uint32) ([]string, error) {
+	oid := resolveDBOid(dbOid)
+	nameKey := strings.ToLower(name)
+	regKey := domainKey(oid, name)
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if _, ok := c.domains[k]; !ok {
+	if _, ok := c.domains[regKey]; !ok {
 		if ifExists {
 			return nil, nil
 		}
@@ -21527,12 +22035,12 @@ func (c *InMemory) DropDomain(name string, ifExists bool, cascade bool) ([]strin
 	}
 	// Find tables that use this domain as a column type.
 	var dependentTables []string
-	for _, tbl := range c.ns(DefaultDBOid).tables {
+	for _, tbl := range c.ns(oid).tables {
 		if tbl.Virtual {
 			continue
 		}
 		for _, col := range tbl.Columns {
-			if strings.ToLower(col.Type.Name) == k || strings.ToLower(col.DeclaredTypeName) == k {
+			if strings.ToLower(col.Type.Name) == nameKey || strings.ToLower(col.DeclaredTypeName) == nameKey {
 				dependentTables = append(dependentTables, tbl.Name)
 				break
 			}
@@ -21546,15 +22054,15 @@ func (c *InMemory) DropDomain(name string, ifExists bool, cascade bool) ([]strin
 	var dropped []string
 	if cascade {
 		for _, tblName := range dependentTables {
-			for tableKey, tbl := range c.ns(DefaultDBOid).tables {
+			for tableKey, tbl := range c.ns(oid).tables {
 				if strings.EqualFold(tbl.Name, tblName) {
 					dropped = append(dropped, tblName)
 					tblOID := tbl.OID
-					delete(c.ns(DefaultDBOid).tables, tableKey)
+					delete(c.ns(oid).tables, tableKey)
 					// Remove indexes on this table.
-					for idxOID, idx := range c.ns(DefaultDBOid).indexes {
+					for idxOID, idx := range c.ns(oid).indexes {
 						if idx.Table != nil && idx.Table.OID == tblOID {
-							delete(c.ns(DefaultDBOid).indexes, idxOID)
+							delete(c.ns(oid).indexes, idxOID)
 						}
 					}
 					break
@@ -21562,7 +22070,7 @@ func (c *InMemory) DropDomain(name string, ifExists bool, cascade bool) ([]strin
 			}
 		}
 	}
-	delete(c.domains, k)
+	delete(c.domains, regKey)
 	return dropped, nil
 }
 
@@ -21574,8 +22082,13 @@ func (c *InMemory) ResolveColumnType(typeName string) string {
 	k := strings.ToLower(typeName)
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	// Check domain: resolve to base type.
-	if d, ok := c.domains[k]; ok {
+	// Check domain: resolve to base type. No dbOid context is available to
+	// this function's callers (execCreateTable/canonicalTypeClass are not yet
+	// threaded through a connection's dbOid — see the deferral ledger row for
+	// this loop), so fall back to a global by-name scan, matching
+	// LookupDomain's own no-dbOid fallback and this function's
+	// pre-cross-database-isolation behavior. M0122-0007 4e follow-up.
+	if d := c.lookupDomainByNameLocked(k); d != nil {
 		baseName := strings.ToLower(d.Base.Name)
 		// Recurse (without lock reacquire — use direct map lookup).
 		return c.resolveColumnTypeLocked(baseName)
@@ -21589,10 +22102,23 @@ func (c *InMemory) ResolveColumnType(typeName string) string {
 // resolveColumnTypeLocked is the lock-free recursive helper for ResolveColumnType.
 func (c *InMemory) resolveColumnTypeLocked(typeName string) string {
 	k := strings.ToLower(typeName)
-	if d, ok := c.domains[k]; ok {
+	if d := c.lookupDomainByNameLocked(k); d != nil {
 		return c.resolveColumnTypeLocked(strings.ToLower(d.Base.Name))
 	}
 	return typeName
+}
+
+// lookupDomainByNameLocked scans c.domains for the first entry whose Name
+// matches lowerName (already lowercased), ignoring dbOid. Used by read paths
+// that have no dbOid context available (see LookupDomain/ResolveColumnType's
+// doc comments). Caller holds c.mu (read or write). M0122-0007 4e follow-up.
+func (c *InMemory) lookupDomainByNameLocked(lowerName string) *Domain {
+	for _, d := range c.domains {
+		if d.Name == lowerName {
+			return d
+		}
+	}
+	return nil
 }
 
 // SearchPathCatalog wraps a Catalog and applies a dynamically-fetched

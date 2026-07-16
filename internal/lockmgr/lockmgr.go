@@ -400,6 +400,12 @@ func (lm *LockManager) AcquireWithTimeout(ctx context.Context, b BackendID, t Lo
 // back to the manager-wide deadlockTimeout field (read under lm.mu).
 const useConfiguredTimeout time.Duration = -1
 
+// UseConfiguredTimeout is the exported form of the useConfiguredTimeout
+// sentinel, for callers of AcquireWithTimeout that want the manager-wide
+// deadlock_timeout rather than a per-call value (e.g. the executor's tuple
+// lock helper on its test-path manager).
+const UseConfiguredTimeout = useConfiguredTimeout
+
 func (lm *LockManager) acquire(ctx context.Context, b BackendID, t LockTag, m Mode, timeout time.Duration) error {
 	if m <= NoLock || m > maxMode {
 		return fmt.Errorf("lockmgr: invalid mode %d", int(m))

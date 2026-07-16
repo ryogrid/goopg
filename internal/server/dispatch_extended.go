@@ -230,7 +230,6 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 	}
 	ectx.PubSub = s.cfg.PubSub
 	ectx.WAL = s.cfg.WAL
-	ectx.LogCanonical = s.cfg.LogCanonical
 	ectx.SyncRep = s.cfg.SyncRep
 	ectx.SyncCommitMode = sessionSyncCommitMode(sess)
 	ectx.AsyncCommit = sessionAsyncCommit(sess)

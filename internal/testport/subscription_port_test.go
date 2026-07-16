@@ -335,7 +335,9 @@ func subDrive(t *testing.T, snap *wal.CatalogSnapshot, w *executor.ApplyWorker, 
 func subTuple1(t *testing.T, v int) []byte {
 	t.Helper()
 	body := logicalRepEncodeBody([]any{v}, []string{"int4"})
-	tup, err := storage.NewHeapTuple(1, 0, body).MarshalBinary()
+	ht := storage.NewHeapTuple(1, 0, body)
+	ht.Header.SetNatts(1)
+	tup, err := ht.MarshalBinary()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -346,7 +348,9 @@ func subTuple1(t *testing.T, v int) []byte {
 func subTuple2(t *testing.T, v1, v2 int) []byte {
 	t.Helper()
 	body := logicalRepEncodeBody([]any{v1, v2}, []string{"int4", "int4"})
-	tup, err := storage.NewHeapTuple(1, 0, body).MarshalBinary()
+	ht := storage.NewHeapTuple(1, 0, body)
+	ht.Header.SetNatts(2)
+	tup, err := ht.MarshalBinary()
 	if err != nil {
 		t.Fatal(err)
 	}

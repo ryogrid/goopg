@@ -175,7 +175,7 @@ func (o *projectSetOp) openSelectSrfMode(ctx *Context) error {
 				for _, d := range elems {
 					if !d.IsNull() && uc.CastType != "" {
 						// Apply element-level cast when unnest(...)::type syntax used. M0097-0035.
-						if cd, cerr := evalCastTyped(d, uc.CastType, "", 0); cerr == nil {
+						if cd, cerr := evalCastTyped(d, uc.CastType, "", 0, ctx); cerr == nil {
 							d = cd
 						}
 					}

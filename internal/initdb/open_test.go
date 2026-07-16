@@ -240,25 +240,18 @@ func TestOpenWiresXactMarkerHook(t *testing.T) {
 	}
 	var sawCommit, sawAbort bool
 	for _, r := range recs {
-		if len(r.Payload) == 0 {
+		// A6: commit/abort are PG xl_xact_commit / xl_xact_abort — no native
+		// Payload; the opcode is in the header and the xid is xl_xid.
+		if r.XLog == nil || r.XLog.Header.Rmid != wal.RmgrXact {
 			continue
 		}
-		switch r.Payload[0] {
-		case wal.RecordKindXactCommit:
-			xid, err := wal.DecodeXactMarker(r.Payload)
-			if err != nil {
-				t.Errorf("decode commit: %v", err)
-				continue
-			}
+		xid := storage.TransactionID(r.XLog.Header.XID)
+		switch r.XLog.Header.Info & wal.XlogXactOpMask {
+		case wal.XlogXactCommit:
 			if xid == tx.XID {
 				sawCommit = true
 			}
-		case wal.RecordKindXactAbort:
-			xid, err := wal.DecodeXactMarker(r.Payload)
-			if err != nil {
-				t.Errorf("decode abort: %v", err)
-				continue
-			}
+		case wal.XlogXactAbort:
 			if xid == tx2.XID {
 				sawAbort = true
 			}

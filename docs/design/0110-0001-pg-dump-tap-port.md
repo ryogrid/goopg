@@ -15748,3 +15748,74 @@ Gates: `go build ./...` clean; `go test ./internal/wal/... ./internal/catalog/..
 ./internal/initdb/... ./internal/executor/...` PASS; `scripts/tpch-spotcheck.sh`
 PASS (Q12=2, Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
 scripts/ralph-precommit-test.sh` PASS (0 failed transactions, all 3 workloads).
+
+## Follow-up (2026-07-15, M0119-0004): CAST-target multi-word type names (DU-002, resume point from the M0122-0007 4e cross-database type-isolation series' closure)
+
+**Gap**: the `TestPort_PgDumpConnectionSetup` DU-002 round-trip probe advanced
+past the collation/domain/enum/composite/range cross-database collision fixes
+(M0122-0007 4e series, closed the prior loop) to a NEW blocker — a genuine
+SQL-engine parser gap, not catalog isolation. The restored dump contained
+`CREATE DOMAIN ... AS character varying(20) DEFAULT 'na'::character varying;`
+and failed a syntax error at `varying` in the `DEFAULT` expression's CAST:
+`'na'::character varying`. The domain's own `AS character varying(20)` base
+type parsed fine (an earlier DU-002 slice, ~95, already taught
+`parseCreateDomain`'s `AS` clause to accept multi-word built-in type names);
+only the CAST *target* position choked.
+
+**Root cause**: `parseTypeNameAfterCast` (`internal/parser/select.go`) is the
+one shared type-name parser both CAST entry points funnel through —
+`parseCastTail` for `expr::typename` and `parseCastFuncExpr` for
+`CAST(expr AS typename)`. It consumed exactly one identifier/keyword token
+(via `consumeTypeIdent`), optionally followed by a `.`-qualified second word
+for `schema.type`, and returned immediately — never calling the existing
+`parseMultiWordTypeName` helper (`internal/parser/ddl.go`) that
+`parseColumnType` (CREATE TABLE column types) and `parseCreateDomain`'s `AS`
+clause already share. So `character`/`double`/`bit`/`timestamp`/`time`
+resolved as the *whole* type name, leaving the trailing
+`varying`/`precision`/`with|without time zone` keyword as an unconsumed,
+unexpected token — a syntax error one token later.
+
+**Fix**: `parseTypeNameAfterCast`'s non-schema-qualified branch now calls
+`p.parseMultiWordTypeName(first)` before returning, exactly mirroring
+`parseCreateDomain`'s `stmt.BaseType = p.parseMultiWordTypeName(stmt.BaseType)`
+call. Because both `parseCastTail` and `parseCastFuncExpr` route through this
+one function, the fix covers `::typename` and `CAST(... AS typename)`
+simultaneously. The schema-qualified branch (`schema.type`) returns before
+this call, so `pg_catalog.regclass`-style casts are unaffected (pinned by a
+new `TestParseCastSchemaQualifiedNotMultiWord`).
+
+**Tests**: `TestParseCastMultiWordTypeName`
+(`internal/parser/cast_test.go`) — 8 subtests covering `::character varying`
+(bare and with typmod), `::double precision`, `::bit varying`, `::timestamp
+with/without time zone`, and the `CAST(... AS ...)` form for two of the same
+type names. `TestParseCastSchemaQualifiedNotMultiWord` guards the
+schema-qualified non-regression noted above.
+
+**Still open** (deferral ledger, both `-`/open):
+1. `time(N)`/`timestamp(N)` CAST targets combining an explicit typmod *and* a
+   trailing timezone qualifier (`x::timestamp(3) with time zone`) are not yet
+   routed through `parseTimeZoneQualifierAfterArgs` the way
+   `parseCreateDomain`'s post-typmod-parens handling
+   (`ddl.go:9987-9989`) already is for the `AS`-clause position — untested,
+   likely still fails syntactically. Not hit by this loop's DU-002 slice
+   because `pg_dump`'s own DEFAULT-expression rendering casts are always
+   typmod-less (`format_type(consttype, -1)`).
+2. The DU-002 probe now advances to a genuinely new, unrelated blocker:
+   restoring `CREATE FUNCTION public.add_calcdef(integer)` into a second
+   database fails `function already exists with the same argument types` —
+   the same cross-database catalog-collision shape the M0122-0007 4e series
+   fixed five times over (domains, user collations, enum types, composite
+   types, range types) for type registries, now needed for the
+   function/routine registry. Next DU-002 resume point.
+
+Gates: `go build ./...`/`go vet ./...` clean repo-wide; `go test
+./internal/parser/...` PASS; `go test -short` full repo excluding
+`internal/testport` (51 packages, per policy) PASS, 0 FAIL; `go test -run
+'TestParseCast|TestPort_PgDumpConnectionSetup|TestPort_RegressSuite'
+./internal/parser/... ./internal/testport/...` PASS (confirms the shared
+CAST-parsing path change doesn't regress the regress-port suite, which
+exercises `::type` casts broadly); `scripts/tpch-spotcheck.sh` PASS
+(Q12=2, Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh`
+PASS (0 failed, all 3 workloads; first attempt hit 1 transient failure out of
+11,210 pgbench txns — 0.009%, an already-documented unrelated flake pattern —
+clean retry, 0 failed across all 3 workloads).

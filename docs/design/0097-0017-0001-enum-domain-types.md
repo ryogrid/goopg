@@ -103,3 +103,331 @@ datum. If the type name is a known domain, recurse with the base type.
 | `internal/planner/planner.go` | Route new stmt types through DDL |
 | `internal/executor/operators_ddl.go` | execCreateType, execAlterType, execDropType, execCreateDomain, execDropDomain |
 | `internal/executor/expr.go` | enum cast fallback in evalTypedStringLit; enum_first, enum_last, enum_range stubs |
+
+## Follow-up (2026-07-15): `AS` base_type accepts multi-word type names
+
+`parseCreateDomain`'s base-type parsing used bare `parseObjectName()`, which
+only handles `schema.name` — it never consumed the trailing keywords of PG's
+multi-word built-in type names, so `CREATE DOMAIN ... AS double precision`
+failed with a parser syntax error (surfaced by the DU-002 pg_dump round-trip
+probe, `TestPort_PgDumpConnectionSetup`, once the M0122-0007 4e catalog
+cross-database isolation fixes for domains cleared the collision that
+previously masked this gap).
+
+`parseColumnType` (CREATE TABLE's column-type grammar) already handled
+`double precision`, `character varying`, `bit varying`, and
+`timestamp`/`time [with|without time zone]` (including the `time(N) with
+time zone` form, where the qualifier trails the typmod parens). That switch
+logic was factored out into two shared helpers so `parseCreateDomain` reuses
+it instead of duplicating it:
+
+- `parser.parseMultiWordTypeName(leading string) string` — the pre-typmod-args
+  keyword switch (`double precision`, `character/bit varying`,
+  `timestamp/time with/without time zone`).
+- `parser.parseTimeZoneQualifierAfterArgs(name string) string` — the
+  post-typmod-args `time(N)`/`timestamp(N) with/without time zone` case.
+
+`parseCreateDomain` calls `parseMultiWordTypeName` after `parseObjectName`
+(only when the base type wasn't schema-qualified, mirroring
+`parseColumnType`'s own schema-qualified branch) and
+`parseTimeZoneQualifierAfterArgs` after its typmod-args loop, before the
+existing array-notation handling. `parseColumnType`'s own behavior is
+unchanged — same switch logic, just relocated into the shared helpers.
+
+Tests: 8 new multi-word cases appended to `TestM0097_0017_EnumDomainParsing`
+plus `TestCreateDomainMultiWordBaseType` (asserts `BaseType`/`BaseTypeArgs`
+for each multi-word form, including an array suffix) in
+`internal/parser/m0097_0017_test.go`.
+
+This is a parser-grammar fix, not a catalog cross-database isolation fix —
+a different mechanism from the M0122-0007 4e series in
+`docs/design/0122-0018-per-database-catalog-namespace.md`. See
+`.ralph/deferral_ledger.md` (2026-07-15 row) for the next DU-002 probe
+blocker this unblocked (`CREATE TYPE` cross-database isolation).
+
+## Follow-up (2026-07-15, later loop): enum types gain per-database isolation
+
+`catalog.InMemory.enumTypes` (backing `CREATE TYPE ... AS ENUM`) was keyed
+by bare case-insensitive name only, so two distinct databases could not each
+register a same-named enum — the exact collision class the M0122-0007 4e
+series already fixed for `domains` and `userCollations`
+(`docs/design/0122-0018-per-database-catalog-namespace.md`). The DU-002
+round-trip probe (`TestPort_PgDumpConnectionSetup`) surfaced this as `type
+"gtype" already exists` once the prior two follow-ups in this doc cleared
+the domain collision and the domain-grammar gap ahead of it.
+
+Fix mirrors the `domains`/`domainKey` pattern exactly: `EnumType` gained a
+`DBOid uint32` field; a new `enumKey(dbOid, name) string` helper
+(`internal/catalog/catalog.go`, next to `domainKey`) folds dbOid into the
+`c.enumTypes` registry key. `RegisterEnum`/`RenameEnum`/`RenameEnumValue`/
+`SetEnumOwner`/`AddEnumValue`/`AddEnumValueResult`/`RemoveEnumValue`/
+`DropEnum` each gained a trailing variadic `dbOid ...uint32` (omitting it
+resolves to `DefaultDBOid` via `resolveDBOid`, so every pre-existing call
+site stays behavior-preserving). `LookupEnum` also gained the variadic
+`dbOid` (added to the `Catalog` interface too) — when omitted it falls back
+to a global by-name scan (`lookupEnumByNameLocked`, mirrors
+`lookupDomainByNameLocked`) for read call sites not yet threaded through a
+connection's dbOid.
+
+All 7 write-path call sites in `internal/executor/operators_ddl.go`
+(`execCreateType`'s `CREATE TYPE ... AS ENUM`, `execAlterType`'s RENAME
+VALUE/RENAME TO/OWNER TO/ADD VALUE, `execDropType`'s enum branch) and the 3
+ROLLBACK-undo call sites in `internal/executor/operators_tx.go`
+(`undoEnumDDLFromContext`'s `RemoveEnumValue`/`RenameEnum`/`DropEnum`) thread
+`ctx.CurrentDatabaseOid`.
+
+`internal/server/dispatch.go` has a **second, independent** copy of the same
+undo logic — `undoEnumDDLForRollback(connTx, cat)`, called from the
+simple-query dispatch path's explicit `ROLLBACK`/failed-`COMMIT`/SSI-abort/
+two-phase-abort/connection-teardown branches (5+2 call sites across
+`dispatch.go`/`server.go`/`twophase.go`) — a sibling of
+`undoEnumDDLFromContext` that mirrors it step-for-step but operates on
+`connTx.Pending*` directly rather than `ctx.Pending*`
+(`pattern_sibling_paths_must_agree`). Threading only the `executor` package's
+copy left this one still calling `RemoveEnumValue`/`RenameEnum`/`DropEnum`
+with no dbOid — which resolves to `DefaultDBOid` via `resolveDBOid`'s
+empty-variadic fallback, silently mismatching the `RegisterEnum` call's raw
+(possibly `0`, not `1`) `ctx.CurrentDatabaseOid` in embedded/test contexts
+with no real per-connection database resolution. This surfaced immediately
+as two real test failures
+(`TestSimpleQueryMidBatchBeginUndoesEarlierAutocommitCreateType`/
+`...AddValue` in `internal/server/dispatch_batch_atomicity_test.go`) — the
+enum survived its own `ROLLBACK` because the drop looked in the wrong
+dbOid bucket. Fixed by adding a `dbOid uint32` parameter to
+`undoEnumDDLForRollback` and threading it from each call site: the 5
+`dispatch.go` sites already have a `ctx *executor.Context` in scope
+(`ctx.CurrentDatabaseOid`); `twophase.go`'s `abortForPrepareSSIFailure` does
+too; `server.go`'s connection-teardown path has no `ctx`, so it resolves the
+dbOid directly from `connTx.DBName` via the pre-existing `resolveConnDBOid`
+helper (the same resolution `wireExtensionRows` uses to stamp
+`ctx.CurrentDatabaseOid` in the first place, so the two paths agree).
+
+The ~20 remaining read-only `LookupEnum` call
+sites (CAST/type-declaration/attribute-row-building paths in `expr.go`,
+`operators_fk.go`, `operators_index.go`, `operators_indexonly.go`,
+`operators_pg_input_error_info.go`, `operators_storage.go`,
+`pg18_user_catalog_rows.go`, `planner.go`, plus a few more in
+`operators_ddl.go`) are **not** dbOid-threaded — same bounded scope as the
+`domains` follow-up's resume point (2), left for a future loop.
+
+New `TestCreateEnumCrossDatabaseIsolation`
+(`internal/catalog/create_enum_test.go`), mirroring
+`TestCreateDomainCrossDatabaseIsolation`. Confirmed via the DU-002 probe:
+the round-trip's failure point moved past `type "gtype" already exists` to
+an unrelated parser gap (`DEFAULT 'na'::character varying` — a multi-word
+type name as a CAST target, not as a column/domain base-type declaration —
+a different grammar production from the one this doc's prior follow-up
+fixed).
+
+Still deferred (ledgered): WAL restart-persistence for enums is not
+dbOid-aware (mirrors the domains/collations gap); `pg_enum`'s `VirtualRows`
+iterates `c.enumTypes` without dbOid scoping, so `SELECT * FROM pg_enum`
+still surfaces every database's enum labels regardless of which database
+is querying (pre-existing, not newly introduced — the registry itself had
+no isolation before this fix either).
+
+## Follow-up (2026-07-15, third loop): composite types gain per-database isolation
+
+The last unaudited sibling map in the M0122-0007 4e series:
+`catalog.InMemory.compositeTypes`/`compositeTypeNames`/`compositeTypeFields`
+(backing `CREATE TYPE ... AS (col type, …)`) were all keyed by bare
+case-insensitive name only — the identical collision class already fixed for
+`domains`, `userCollations`, and `enumTypes`
+(`docs/design/0122-0018-per-database-catalog-namespace.md`).
+
+Fix mirrors the `enumTypes`/`enumKey` pattern exactly: `CompositeType` gained
+a `DBOid uint32` field; a new `compositeKey(dbOid, name) string` helper
+(`internal/catalog/catalog.go`, next to `domainKey`/`enumKey`) folds dbOid
+into all three composite registry keys.
+`RegisterCompositeType`/`RegisterCompositeTypeWithFields`/
+`RenameCompositeType`/`SetCompositeTypeOwner`/`DropCompositeType`/
+`HasCompositeType` each gained a trailing variadic `dbOid ...uint32`
+(omitting it resolves to `DefaultDBOid`, so every pre-existing call site
+stays behavior-preserving — `RegisterCompositeType`/`RegisterCompositeTypeWithFields`
+never errored on a same-name re-registration to begin with, unlike
+`RegisterEnum`, so there is no analogous "duplicate silently permitted
+cross-database" regression risk to guard against here).
+`LookupCompositeType`/`LookupCompositeTypeFields` also gained the variadic
+`dbOid` (added to the `Catalog` interface too) — when omitted they fall back
+to a global by-name scan (`lookupCompositeTypeByNameLocked`, mirrors
+`lookupEnumByNameLocked`/`lookupDomainByNameLocked`) for the ~15 read-only
+call sites not yet threaded through a connection's dbOid (`expr.go`,
+`pg18_user_catalog_rows.go`, `plpgsql_runtime.go`, `operators_fk.go`-adjacent
+paths) — same bounded scope as the enum follow-up's identical deferral.
+
+All composite write-path call sites in `internal/executor/operators_ddl.go`
+thread `o.ctx.CurrentDatabaseOid`: `execCreateType`'s `CREATE TYPE ... AS
+(...)` (both the with-fields and name-only-registration branches),
+`execAlterType`'s `ADD`/`RENAME`/`DROP`/`ALTER ATTRIBUTE` single-subcommand
+branches, its `RENAME TO`/`OWNER TO` composite-dispatch guards,
+`execAlterTypeAttrCmds`'s multi-subcommand form, and `execDropType`'s
+composite branch (both the `LookupCompositeType` heap-stamp guard and the
+`DropCompositeType` call itself).
+
+Applied the sibling-path lesson from the enum follow-up proactively this
+time instead of discovering it via test failure: grepped
+`internal/executor/operators_tx.go` and `internal/server/dispatch.go` up
+front for the second, independent undo copy
+(`undoEnumDDLFromContext`/`undoEnumDDLForRollback`) before running any
+tests, and threaded `ctx.CurrentDatabaseOid`/`dbOid` through both
+`PendingCreatedComposites` drop loops in the same edit pass as the executor
+write paths. `undoEnumDDLForRollback` already accepted a `dbOid` parameter
+from the enum fix, so only its call to `DropCompositeType` needed the
+argument added.
+
+This still surfaced one genuine regression, caught by the full targeted
+test run rather than by the proactive grep: the pre-existing
+`internal/executor/operators_tx_composite_test.go` built a bare
+`&Context{Catalog: cat, PendingCreatedComposites: ...}` with no
+`CurrentDatabaseOid` set (zero value `0`), while its
+`RegisterCompositeTypeWithFields` calls omitted `dbOid` entirely (resolving
+to `DefaultDBOid`, i.e. `1`, via `resolveDBOid`'s empty-variadic fallback) —
+so once `undoEnumDDLFromContext` started passing the real (zero) `ctx.
+CurrentDatabaseOid` to `DropCompositeType`, the drop looked in the `0`
+bucket while the registration lived in the `1` bucket, silently failing to
+undo. This is not a product bug — no real connection context resolves to a
+literal `0` `CurrentDatabaseOid` — but a test-fixture inconsistency exposed
+by making the dbOid plumbing real; fixed by setting `ctx.CurrentDatabaseOid:
+catalog.DefaultDBOid` and passing `catalog.DefaultDBOid` to the `Register`/
+`Lookup` calls in both test functions, matching how a real `Context` is
+populated.
+
+New `TestCreateCompositeTypeCrossDatabaseIsolation`
+(`internal/catalog/create_composite_type_test.go`), mirroring
+`TestCreateEnumCrossDatabaseIsolation`/`TestCreateDomainCrossDatabaseIsolation`.
+
+## Follow-up (2026-07-15, fourth loop): range types gain per-database isolation
+
+Resume point (4) from the composite-type follow-up above: auditing that loop
+found `catalog.InMemory.rangeTypes` (backing `CREATE TYPE ... AS RANGE
+(subtype = ...)`) had **no** dbOid scoping at all — no `DBOid` field on
+`RangeType`, and `RegisterRangeType`/`RenameRangeType`/`SetRangeTypeOwner`/
+`DropRangeType`/`LookupRangeType` took no dbOid parameter whatsoever, unlike
+`domains`/`userCollations`/`enumTypes`/`compositeTypes`, which at least had a
+bare-name-keyed map before their respective fixes. Range types were exposed
+to the identical bare-name cross-database collision this whole M0122-0007 4e
+series has been closing.
+
+Fix mirrors the `compositeTypes`/`compositeKey` pattern exactly: `RangeType`
+gained a `DBOid uint32` field; a new `rangeKey(dbOid, name) string` helper
+(`internal/catalog/catalog.go`, next to `domainKey`/`enumKey`/`compositeKey`)
+folds dbOid into the `c.rangeTypes` registry key.
+`RegisterRangeType`/`RenameRangeType`/`SetRangeTypeOwner`/`DropRangeType`
+each gained a trailing variadic `dbOid ...uint32` (omitting it resolves to
+`DefaultDBOid` via `resolveDBOid`, so every pre-existing call site — including
+the whole `internal/catalog/range_type_opclass_test.go` suite and
+`internal/executor/user_type_oid_name_test.go`/`pg18_user_catalog_rows_test.go`
+— stays behavior-preserving). `LookupRangeType` (on the `Catalog` interface
+too) also gained the variadic `dbOid`; when omitted it falls back to a global
+by-name scan (`lookupRangeTypeByNameLocked`, mirrors
+`lookupCompositeTypeByNameLocked`/`lookupEnumByNameLocked`) for the 3
+remaining read-only call sites not yet threaded through a connection's dbOid
+(`internal/executor/expr.go`, `pg18_user_catalog_rows.go` ×2) — same bounded
+scope as the composite follow-up's identical deferral. The 5 `LookupRangeTypeBy*`
+helpers (`ByMultirangeName`/`ByOID`/`ByMultirangeOID`/`ByArrayOID`/
+`ByMultirangeArrayOID`) scan `c.rangeTypes`'s *values*, not its key, so they
+needed no change — they already return whichever database's row matches the
+OID/name being searched, an existing (not newly introduced) cross-database
+surface tracked by resume point (3) below, matching `ListRangeTypes`'s
+identical pre-existing shape.
+
+All range-type write-path call sites in `internal/executor/operators_ddl.go`
+thread `o.ctx.CurrentDatabaseOid`: `execCreateType`'s `AS RANGE (...)` branch
+(`RegisterRangeType`), `execAlterType`'s `RENAME TO`/`OWNER TO` range-dispatch
+guards (both the `LookupRangeType` guard and the `RenameRangeType`/
+`SetRangeTypeOwner` call), and `execDropType`'s range branch (both the
+`LookupRangeType` heap-stamp guard and the `DropRangeType` call itself).
+Grepped `internal/executor/operators_tx.go` and `internal/server/dispatch.go`
+up front for a range-type ROLLBACK-undo sibling before running any tests
+(this series' own lesson from the enum/composite follow-ups) and confirmed
+there is none — `CREATE TYPE ... AS RANGE` has no rollback-undo tracking at
+all today (a pre-existing gap unrelated to this fix, orthogonal to
+per-database isolation).
+
+`RegisterRangeTypeDuringRecovery` now explicitly stamps `DBOid =
+DefaultDBOid` and keys the recovered entry via `rangeKey(DefaultDBOid,
+rt.Name)`, matching `RegisterDomainDuringRecovery`'s identical pattern — WAL
+replay does not yet carry a dbOid for range-type records, so every replayed
+range type lands under `DefaultDBOid` (resume point (1) below).
+`RenameRangeTypeDuringRecovery`/`SetRangeTypeOwnerDuringRecovery`/
+`DropRangeTypeDuringRecovery` needed no change: they delegate to the now-
+variadic live functions with no dbOid argument, which already resolves to
+`DefaultDBOid` via `resolveDBOid`'s empty-variadic fallback.
+
+New `TestCreateRangeTypeCrossDatabaseIsolation`
+(`internal/catalog/create_range_type_test.go`), mirroring
+`TestCreateCompositeTypeCrossDatabaseIsolation`/`TestCreateEnumCrossDatabaseIsolation`/
+`TestCreateDomainCrossDatabaseIsolation`. This closes the last open resume
+point from the composite-type follow-up — domains, userCollations,
+enumTypes, compositeTypes, and rangeTypes are now all isolated by dbOid.
+Remaining open items (WAL restart-persistence for all five object kinds; the
+read-only `Lookup*` call-site fan-out; `pg_enum`/`ListRangeTypes`-style
+virtual-view dbOid scoping) are recorded in the deferral ledger, matching
+every prior row in this series.
+
+Still deferred (ledgered, same shape as the enum/domain gaps): WAL
+restart-persistence for composite types is not dbOid-aware; the
+`PGClassRowsForDBOid`/`PGConstraintRowsForDBOid` virtual builders iterate
+`c.compositeTypes`/`c.domains` without dbOid scoping, so the implicit
+`pg_class`/`pg_attribute` rows for a composite type (and a domain's CHECK
+constraints) surface regardless of which database is querying — pre-existing
+for all three type kinds, not newly introduced by this fix. The ~15
+remaining read-only `LookupCompositeType`/`LookupCompositeTypeFields` call
+sites are not dbOid-threaded, matching the enum follow-up's identical
+resume-point scope.
+
+## Follow-up (2026-07-15, fifth loop): range-type ROLLBACK-undo tracking
+
+The fourth loop above (range-type per-database isolation) grepped
+`operators_tx.go`/`dispatch.go` for a range-type ROLLBACK-undo sibling and
+confirmed there was none: `CREATE TYPE ... AS RANGE` had no rollback-undo
+tracking at all, unlike enums (`PendingCreatedEnums`) and composite types
+(`PendingCreatedComposites`), which both drop their in-transaction creations
+on ROLLBACK via `undoEnumDDLFromContext`. This left a real correctness gap —
+`BEGIN; CREATE TYPE ival AS RANGE (subtype = int4); ROLLBACK;` left `ival`
+registered in the catalog after the abort, unlike its enum/composite
+siblings.
+
+Fixed by mirroring `PendingCreatedComposites` exactly: a new
+`Context.PendingCreatedRangeTypes map[string]bool` field
+(`internal/executor/context.go`); `execCreateType`'s `AS RANGE` branch now
+records `strings.ToLower(s.Name)` into it when
+`o.ctx.Session.TracksDDLUndo()` (`internal/executor/operators_ddl.go`, same
+guard as the composite/enum branches — covers both an explicit transaction
+and a message-scoped autocommit batch per root-0024); `undoEnumDDLFromContext`
+gained a Step 5 that calls `inm.DropRangeType(name, ctx.CurrentDatabaseOid)`
+for every name in the set, run alongside (not instead of) Step 4's composite
+drop (`internal/executor/operators_tx.go`); `execCommit` clears the new field
+to nil alongside its enum/composite siblings so a later statement's abort
+doesn't see stale entries.
+
+This series has repeatedly burned a loop by forgetting that `internal/executor`'s
+`undoEnumDDLFromContext` (driven by `execRollback`) is only ONE of two
+independent undo paths — `internal/server/dispatch.go`'s
+`undoEnumDDLForRollback` is a structurally identical but separately
+maintained twin that reverses `connTxState`'s `Pending*` fields for the
+simple-query/autocommit dispatch path (`pattern_sibling_paths_must_agree`).
+Grepping confirmed `PendingCreatedComposites` is wired through `connTxState`
+(`internal/server/conn_tx.go`: struct field + both reset sites in `End()`/
+`DetachPrepared` + the `DetachPrepared` copy) and `dispatch.go` (the
+ectx↔connTx write-back pair in `executeOneSimpleStmt`, `undoEnumDDLForRollback`'s
+own Step 4, and 6 separate `ctx.PendingCreatedComposites = nil` reset sites
+across the ROLLBACK/COMMIT-failure branches) and `twophase.go` (2 reset sites
++ the prepared-xact-holder retarget in `execFinalizePrepared`). All of these
+gained a `PendingCreatedRangeTypes` counterpart in this same loop — the fix
+would have been incomplete (silently working only for `BEGIN;
+ROLLBACK;`-style explicit transactions through the extended-query path, not
+simple-query autocommit batches or 2PC) without this twin.
+
+Scope note: like composite types (and unlike enums), range types get no
+`ALTER TYPE ... RENAME TO` undo tracking — `execAlterType`'s range-dispatch
+RENAME TO branch does not push onto `PendingCreatedRangeTypes` or an
+equivalent rename-undo list, matching the pre-existing composite-type
+behavior exactly (composite types have no `PendingCompositeRenames`
+analogue either). This is a deliberate mirror of the composite-type gap, not
+a new independent one; it stays open per the same resume-point convention if
+someone later wires `ALTER TYPE ... AS (...)` rename-undo for composites.
+
+New `internal/executor/operators_tx_range_type_test.go`
+(`TestUndoRangeTypeDDLOnRollback`/`TestUndoRangeTypeDDLCaseInsensitive`),
+mirroring `operators_tx_composite_test.go`'s two tests exactly.

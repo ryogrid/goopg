@@ -128,18 +128,6 @@ type Config struct {
 	// docs/design/0014-0001-xlog-page-and-segment-layout-compat.md.
 	PageHeaders bool
 
-	// EmitCanonical controls whether the server emits the canonical
-	// (PG-format, real-standby-replayable) WAL record family alongside the
-	// native family (analysis/perf-optimize3-dash/01 §3.1). It is CONTENT
-	// gating only — PageHeaders (the frame format above) stays independent
-	// and ON in production. The wal package itself never emits canonical
-	// records; this flag is carried here so initdb/open.go's emission choke
-	// points and the BASE_BACKUP guard read one source of truth via
-	// Writer.CanonicalEnabled(). Not a GUC: no PostgreSQL equivalent exists
-	// (0108-0001 sample-template discipline); the operator override is the
-	// GOOPG_WAL_CANONICAL env var, resolved by initdb.Open.
-	EmitCanonical bool
-
 	// SystemID is the cluster's pg_control system identifier,
 	// stamped into every long-form page header's xlp_sysid for
 	// pg_waldump cross-check. Caller (cmd/goopg start) plumbs the
@@ -343,11 +331,6 @@ type Writer struct {
 	// decide whether to skip page-header bytes when streaming
 	// records. Static for the Writer's lifetime.
 	pageHeaders bool
-	// emitCanonical mirrors Config.EmitCanonical (single source of truth
-	// for the canonical-family emission choke points and the BASE_BACKUP
-	// guard — analysis/perf-optimize3-dash/01 §3.1). Static for the
-	// Writer's lifetime.
-	emitCanonical bool
 	// segmentSize mirrors Config.SegmentSize so iterators can
 	// distinguish a long-form (segment-boundary) page header
 	// from a short-form one without having to thread cfg in.
@@ -578,7 +561,6 @@ func NewWriter(cfg Config) (*Writer, error) {
 		stateRef:          st,
 		walBufferCounters: bufCounters,
 		pageHeaders:       cfg.PageHeaders,
-		emitCanonical:     cfg.EmitCanonical,
 		segmentSize:       cfg.SegmentSize,
 	}
 	w.writeLSNAtomic.Store(uint64(st.writePos))
@@ -630,11 +612,6 @@ func (w *Writer) SetWalWriterFlushAfter(bytes int64) { w.walWriterFlushAfter.Sto
 // it knows whether the on-disk segments contain interleaved page
 // headers it must skip.
 func (w *Writer) PageHeadersEnabled() bool { return w.pageHeaders }
-
-// CanonicalEnabled reports whether the server should emit the canonical
-// (PG-format) WAL record family. Content gating only; the frame format is
-// PageHeadersEnabled. See Config.EmitCanonical.
-func (w *Writer) CanonicalEnabled() bool { return w.emitCanonical }
 
 // Format returns the active on-disk WAL format the writer is
 // emitting. Mirrors the Config.PageHeaders flag the writer was

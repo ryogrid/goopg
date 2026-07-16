@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/config"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
 )
@@ -59,6 +60,12 @@ func RunCopyTo(ctx *Context, plan *planner.Copy, emit func([]byte) error) (count
 	if !binary {
 		format = copyToFormatFromOptions(plan.Options)
 	}
+	dateStyle, dateOrder := "ISO", "MDY"
+	if ctx.GetSetting != nil {
+		if v, ok := ctx.GetSetting("datestyle"); ok {
+			dateStyle, dateOrder = config.ParseDateStyleValue(v)
+		}
+	}
 
 	src, cols, projection, buildErr := buildCopySource(plan)
 	if buildErr != nil {
@@ -105,9 +112,9 @@ func RunCopyTo(ctx *Context, plan *planner.Copy, emit func([]byte) error) (count
 		case binary:
 			buf, encErr = AppendCopyBinaryRow(buf, row, cols)
 		case format.csv:
-			buf, encErr = EncodeCopyCsvRow(buf, row, cols, format)
+			buf, encErr = EncodeCopyCsvRow(buf, row, cols, format, dateStyle, dateOrder)
 		default:
-			buf, encErr = EncodeCopyTextRow(buf, row, cols)
+			buf, encErr = EncodeCopyTextRow(buf, row, cols, dateStyle, dateOrder)
 		}
 		if encErr != nil {
 			return count, binary, encErr

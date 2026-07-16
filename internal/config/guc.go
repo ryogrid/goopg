@@ -123,8 +123,23 @@ type Variable struct {
 }
 
 // canonicalize normalises an incoming string value into the form we
-// store. Returns (canonical, error).
+// store, merging against v.Value as the current-value baseline. Returns
+// (canonical, error). Correct for every call site except
+// SessionRegistry.Set/SetInternal, where a session/transaction-scoped
+// override can diverge from the global v.Value — those use
+// canonicalizeFrom with the session's actual effective value instead.
 func (v *Variable) canonicalize(value string) (string, error) {
+	return v.canonicalizeFrom(v.Value, value)
+}
+
+// canonicalizeFrom is canonicalize with an explicit current-value
+// baseline. DateStyle is the only GUC whose canonical form depends on it
+// (a partial spec like "SET datestyle = 'SQL'" must keep the existing
+// order component — see mergeDateStyle); every other type ignores current.
+func (v *Variable) canonicalizeFrom(current, value string) (string, error) {
+	if strings.EqualFold(v.Name, "DateStyle") {
+		return mergeDateStyle(current, v.BootVal, value)
+	}
 	switch v.Type {
 	case TypeBool:
 		b, ok := parseBoolish(value)

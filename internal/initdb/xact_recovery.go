@@ -88,6 +88,17 @@ func replayCLogFromWAL(walDir string, clog *mvcc.CLog, txnMgr *mvcc.Manager) err
 			xid := storage.TransactionID(r.XLog.Header.XID)
 			isCommit := (r.XLog.Header.Info & wal.XlogXactOpMask) == wal.XlogXactCommit
 			xactStampAndAdvance(clog, txnMgr, xid, isCommit)
+			continue
+		}
+		// A9: PG-format clog truncation (RM_CLOG / CLOG_TRUNCATE). Decode the
+		// xl_clog_truncate body and re-apply the (idempotent) truncation — the
+		// PG-format twin of the native RecordKindClogTruncate branch above.
+		if r.XLog != nil && r.XLog.Header.Rmid == wal.RmgrCLOG &&
+			(r.XLog.Header.Info&wal.XLRRmgrInfoMask) == wal.XlogClogTruncate {
+			_, oldestXact, _, derr := wal.DecodeXLogClogTruncate(r.XLog.MainData)
+			if derr == nil {
+				replayClogTruncate(clog, oldestXact)
+			}
 		}
 	}
 	return nil

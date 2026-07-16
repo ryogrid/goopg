@@ -11,16 +11,12 @@ import (
 
 // TestE2E_NativeOnlyReplicationAndPromotion is perf-optimize3-dash S3b
 // (doc 04 §4a): goopg→goopg physical replication, standby catch-up, and
-// PROMOTION under native-only WAL (GOOPG_WAL_CANONICAL=off). Physical
-// replication is family-agnostic (the walreceiver copies raw bytes via
-// AppendRaw), so everything must work with zero canonical records in the
-// stream. The env reaches both goopg subprocesses via the inherited
-// environment.
+// PROMOTION over the native WAL record family. Physical replication is
+// family-agnostic (the walreceiver copies raw bytes via AppendRaw).
 func TestE2E_NativeOnlyReplicationAndPromotion(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping replication test in short mode")
 	}
-	t.Setenv("GOOPG_WAL_CANONICAL", "off")
 
 	baseDir := t.TempDir()
 	rc, err := replcluster.New("e2e_native_promote", replcluster.Options{

@@ -233,12 +233,6 @@ type Config struct {
 	// live row per active sender. nil makes registration a no-op.
 	WalSenders *wal.Senders
 
-	// LogCanonical, when non-nil, emits PG-canonical WAL records for
-	// catalog DDL (XLOG_HEAP_INSERT, XLOG_BTREE_INSERT_LEAF) so a vanilla
-	// PG18 standby can replay them. Wired by cmd/goopg from Runtime.LogCanonical
-	// when PageHeaders mode is active. M0106-0010 batched-32.
-	LogCanonical catalog.LogCanonicalFunc
-
 	// WAL exposes the WAL writer's WrittenLSN() so IDENTIFY_SYSTEM
 	// can report a current xlogpos. nil → IDENTIFY_SYSTEM reports
 	// xlogpos=0/0 (acceptable for tests that don't care about the
@@ -948,7 +942,15 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 			clientAddr = taddr.IP.String()
 			clientPort = fmt.Sprintf("%d", taddr.Port)
 		}
-		reg.Register(&activity.Backend{
+		// RegisterAt (not Register): procNum here is the SAME TxnMgr conn-slot
+		// value used below for WaitEventStart/UpdateState/PIDForProcNum on this
+		// connection's hot path. Register's own PID-hash slot is an independent
+		// index space — using it here would make every later per-statement
+		// UpdateState call land on the wrong slot, freezing pg_stat_activity's
+		// state/query columns at their initial Register-time values for the
+		// backend's entire lifetime (found via the partition-drop-index-locking
+		// isolation spec: s.query always blank, s.state always "active").
+		reg.RegisterAt(procNum, &activity.Backend{
 			PID:             pidStr,
 			DatName:         params["database"],
 			UserName:        user,
@@ -1069,6 +1071,32 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 		_ = sess.SetInternal("is_superuser", "on")
 	}
 
+	// Apply generic startup-packet GUC settings. PostgreSQL's
+	// ProcessStartupPacket (backend_startup.c ~line 770-790) treats every
+	// startup-packet key other than user/database/options/replication/_pq_.*
+	// as a GUC name=value pair (port->guc_options), and separately parses the
+	// "options" key's PGOPTIONS-style `-c name=value` tokens the same way.
+	// This is the actual wire-level mechanism behind PGDATESTYLE/PGTZ/
+	// PGOPTIONS (libpq's fe-connect.c EnvironmentOptions table folds
+	// PGDATESTYLE/PGTZ into plain "datestyle"/"timezone" startup keys) and
+	// libpq connstrings like `options=-c search_path=foo`. goopg previously
+	// only echoed application_name/session_authorization/is_superuser from
+	// the startup packet and silently dropped every other key, so none of
+	// the above ever reached the backend's runtime GUC state.
+	for name, val := range params {
+		switch name {
+		case "user", "database", "application_name", "replication", "options":
+			continue
+		}
+		if strings.HasPrefix(name, "_pq_.") {
+			continue
+		}
+		_ = sess.Set(name, val, false)
+	}
+	for name, val := range parsePGOptions(params["options"]) {
+		_ = sess.Set(name, val, false)
+	}
+
 	// Now wire the per-session ParameterStatus emitter so subsequent
 	// SET application_name = 'X' (etc.) auto-emits.
 	sess.SetReportableHook(func(name, value string) {
@@ -1120,6 +1148,37 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 // that convention rather than introducing a separate one.
 func isSuperuserRoleName(roleName string) bool {
 	return strings.EqualFold(strings.TrimSpace(roleName), "postgres")
+}
+
+// parsePGOptions parses a PGOPTIONS-style command-line options string (the
+// startup packet's "options" key) into GUC name=value pairs, covering the
+// `-c name=value` form (attached, `-cname=value`, or split across two
+// whitespace-separated tokens) that PGOPTIONS/libpq's `options=` connstring
+// parameter and every real client actually emit. Unlike PostgreSQL's own
+// pg_split_opts (postmaster.c), this does not support shell-style quoting —
+// no goopg caller needs it, since values containing spaces would require
+// quoting the whole PGOPTIONS string anyway.
+func parsePGOptions(opts string) map[string]string {
+	result := map[string]string{}
+	fields := strings.Fields(opts)
+	for i := 0; i < len(fields); i++ {
+		f := fields[i]
+		if !strings.HasPrefix(f, "-c") {
+			continue
+		}
+		rest := f[len("-c"):]
+		if rest == "" {
+			if i+1 >= len(fields) {
+				continue
+			}
+			i++
+			rest = fields[i]
+		}
+		if eq := strings.IndexByte(rest, '='); eq > 0 {
+			result[rest[:eq]] = rest[eq+1:]
+		}
+	}
+	return result
 }
 
 func isReplicationStartupParam(v string) bool {
@@ -1307,7 +1366,7 @@ func (s *Server) rollbackOpenTxnOnTeardown(connTx *connTxState, logger *slog.Log
 	}
 	_ = s.cfg.TxnMgr.Rollback(connTx.Tx())
 	if s.cfg.Catalog != nil {
-		undoEnumDDLForRollback(connTx, s.cfg.Catalog)
+		undoEnumDDLForRollback(connTx, s.cfg.Catalog, resolveConnDBOid(s.cfg.Catalog, connTx.DBName))
 	}
 	connTx.End()
 	if logger != nil {

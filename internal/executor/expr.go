@@ -23,6 +23,7 @@ import (
 	"unsafe"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/config"
 	"github.com/goopg/goopg/internal/mctx"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
@@ -851,7 +852,7 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 		if castTargetType == "char" && x.Typmod > 0 {
 			castTargetType = "bpchar"
 		}
-		result, err := evalCastTyped(v, castTargetType, x.SourceType, x.Pos())
+		result, err := evalCastTyped(v, castTargetType, x.SourceType, x.Pos(), ctx)
 		if err != nil {
 			return Datum{}, err
 		}
@@ -860,7 +861,7 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 		// admit the value. DU-002 slice 385 (multi-CHECK).
 		if ctx != nil && ctx.Catalog != nil {
 			if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
-				if dom, isDomain := im.LookupDomain(x.TargetType); isDomain {
+				if dom, isDomain := im.LookupDomain(x.TargetType, ctx.CurrentDatabaseOid); isDomain {
 					// Get the string label of the value being cast. Format()
 					// (not StringValue(), which only extracts KindString's Buf
 					// payload) renders every Kind's canonical text form, e.g.
@@ -1050,7 +1051,7 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 			}
 		}
 	normalBinaryOp:
-		result, err := evalBinary(x.Op, left, right, x.Pos())
+		result, err := evalBinary(x.Op, left, right, x.Pos(), ctx)
 		if err != nil {
 			return Datum{}, err
 		}
@@ -1374,7 +1375,7 @@ func evalPgLSNBinary(op parser.OpCode, left, right Datum, pos int) (Datum, bool,
 // evalBinary handles arithmetic, comparison, and boolean operators.
 // SQL three-valued logic: NULL operand on most operators yields NULL;
 // AND/OR follow Kleene's rules.
-func evalBinary(op parser.OpCode, left, right Datum, pos int) (Datum, error) {
+func evalBinary(op parser.OpCode, left, right Datum, pos int, ctx *Context) (Datum, error) {
 	if op.IsBoolean() {
 		switch op {
 		case parser.OpAnd:
@@ -1489,9 +1490,11 @@ func evalBinary(op parser.OpCode, left, right Datum, pos int) (Datum, error) {
 		// Array concatenation: if both operands look like PostgreSQL arrays
 		// ({v1,v2,...}), merge their elements rather than text-concat.
 		// Also handles array || element and element || array (append/prepend).
-		// M0097-0065.
-		ls := left.Format()
-		rs := right.Format()
+		// M0097-0065. Non-array text rendering honors the session DateStyle
+		// GUC for DATE/TIMESTAMP/TIMESTAMPTZ operands (formatDatumDateStyle),
+		// matching the already-fixed SELECT/COPY/CAST output paths.
+		ls := formatDatumDateStyle(left, ctx)
+		rs := formatDatumDateStyle(right, ctx)
 		lsIsArr := len(ls) >= 2 && ls[0] == '{' && ls[len(ls)-1] == '}'
 		rsIsArr := len(rs) >= 2 && rs[0] == '{' && rs[len(rs)-1] == '}'
 		if lsIsArr && rsIsArr {
@@ -3028,9 +3031,9 @@ func roundNumericToScale(d Datum, scale int16) Datum {
 	return d
 }
 
-func evalCastTyped(d Datum, targetType, sourceType string, pos int) (Datum, error) {
+func evalCastTyped(d Datum, targetType, sourceType string, pos int, ctx *Context) (Datum, error) {
 	if sourceType == "" {
-		return evalCast(d, targetType, pos)
+		return evalCast(d, targetType, pos, ctx)
 	}
 	// For float8/float4 → integer casts, override the default (away-from-zero)
 	// rounding inside evalCast to use banker's rounding instead.
@@ -3071,14 +3074,65 @@ func evalCastTyped(d Datum, targetType, sourceType string, pos int) (Datum, erro
 			return Datum{Kind: KindInt, Int: n}, nil
 		}
 	}
-	return evalCast(d, targetType, pos)
+	return evalCast(d, targetType, pos, ctx)
+}
+
+// dateStyleFromCtx resolves the session's DateStyle GUC (style, order) via
+// ctx.GetSetting, defaulting to ISO/MDY (PostgreSQL's boot default) when ctx
+// is nil, has no GetSetting wired, or the GUC is unset. Mirrors the same
+// resolution dispatch.go's appendTypedCellText performs for SELECT output, so
+// CAST-to-text agrees with the SELECT-output path (pattern_sibling_paths_must_agree).
+func dateStyleFromCtx(ctx *Context) (style, order string) {
+	style, order = "ISO", "MDY"
+	if ctx != nil && ctx.GetSetting != nil {
+		if v, ok := ctx.GetSetting("datestyle"); ok {
+			style, order = config.ParseDateStyleValue(v)
+		}
+	}
+	return style, order
+}
+
+// formatTimeDatumDateStyle renders a non-time-only KindTime datum as text,
+// honoring the session DateStyle GUC. Mirrors Datum.Format()'s ±infinity and
+// flagDate branching, but dispatches DATE vs TIMESTAMP/TIMESTAMPTZ through
+// config.FormatDate/FormatTimestamp instead of Format()'s hardcoded
+// Postgres-MDY-only / fixed-ISO layouts, so callers (CAST-to-text, FK
+// violation DETAIL messages, ...) agree with SELECT/COPY output on the
+// DateStyle GUC axis.
+func formatTimeDatumDateStyle(d Datum, style, order string) string {
+	if d.Int == math.MaxInt64 {
+		return "infinity"
+	}
+	if d.Int == math.MinInt64 {
+		return "-infinity"
+	}
+	if d.Flags&flagDate != 0 {
+		return config.FormatDate(d.TimeValue(), style, order)
+	}
+	return config.FormatTimestamp(d.TimeValue(), style, order)
+}
+
+// formatDatumDateStyle is Datum.Format() with DateStyle-aware KindTime
+// rendering: a DATE/TIMESTAMP/TIMESTAMPTZ datum honors the session's
+// datestyle GUC (via ctx), every other Kind falls back to Format()
+// unchanged. Pass nil ctx where no session is reachable (defaults to
+// ISO/MDY, matching Format()'s pre-existing hardcoded behavior).
+func formatDatumDateStyle(d Datum, ctx *Context) string {
+	if d.Kind != KindTime {
+		return d.Format()
+	}
+	style, order := dateStyleFromCtx(ctx)
+	return formatTimeDatumDateStyle(d, style, order)
 }
 
 // evalCast coerces datum d to the declared SQL type name.
 // Handles: string→bool, bool→text, int→text, int→int2 (range check),
 // string→int2/4/8 (via parseIntegerInput). Pass-through for unknown types.
-// M0097-0003.
-func evalCast(d Datum, targetType string, pos int) (Datum, error) {
+// ctx supplies session-GUC reachability (currently: DateStyle for
+// timestamp/date → text casts); pass nil where no session context is
+// available (behavior falls back to ISO/MDY, matching the pre-existing
+// hardcoded default). M0097-0003.
+func evalCast(d Datum, targetType string, pos int, ctx *Context) (Datum, error) {
 	if d.IsNull() {
 		return NullDatum, nil
 	}
@@ -3251,7 +3305,8 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 			if isTimeOnlyValue(d.TimeValue()) {
 				return NewStringDatum(string(appendTimeOnlyValueText(nil, d.TimeValue()))), nil
 			}
-			return NewStringDatum(d.Format()), nil
+			style, order := dateStyleFromCtx(ctx)
+			return NewStringDatum(formatTimeDatumDateStyle(d, style, order)), nil
 		case KindEnum:
 			// Cast enum to text: return the label string (loses sort order). M0097-enum.
 			return NewStringDatum(string(d.Buf)), nil
@@ -3407,7 +3462,7 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 			}
 			if t, err := parseCopyTimestamp(s); err == nil {
 				t2 := t.UTC()
-				return NewTimeDatum(time.Date(t2.Year(), t2.Month(), t2.Day(), 0, 0, 0, 0, time.UTC)), nil
+				return NewDateDatum(time.Date(t2.Year(), t2.Month(), t2.Day(), 0, 0, 0, 0, time.UTC)), nil
 			}
 			return Datum{}, &ExecError{Code: "22007", Pos: pos,
 				Message: fmt.Sprintf("invalid input syntax for type date: %q", s)}
@@ -3419,7 +3474,7 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 				return NewDateInfinity(d.IsTimestampPosInf()), nil
 			}
 			t := d.TimeValue().UTC()
-			return NewTimeDatum(time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)), nil
+			return NewDateDatum(time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)), nil
 		}
 		return d, nil
 	case "time":
@@ -5872,20 +5927,20 @@ func regexpFirstMatchArray(re *regexp.Regexp, s string) Datum {
 // FindAllStringSubmatchIndex. Shared by regexpFirstMatchArray (single match)
 // and regexpAllMatchesArrays (SRF, one call per match).
 func regexpMatchArrayDatum(re *regexp.Regexp, s string, idx []int) Datum {
-	var elems []string
 	if re.NumSubexp() == 0 {
-		elems = []string{s[idx[0]:idx[1]]}
-	} else {
-		for i := 1; i <= re.NumSubexp(); i++ {
-			lo, hi := idx[2*i], idx[2*i+1]
-			if lo < 0 {
-				elems = append(elems, "NULL")
-			} else {
-				elems = append(elems, s[lo:hi])
-			}
+		return NewStringDatum(formatTextArray([]string{s[idx[0]:idx[1]]}))
+	}
+	elems := make([]string, re.NumSubexp())
+	nulls := make([]bool, re.NumSubexp())
+	for i := 1; i <= re.NumSubexp(); i++ {
+		lo, hi := idx[2*i], idx[2*i+1]
+		if lo < 0 {
+			nulls[i-1] = true
+		} else {
+			elems[i-1] = s[lo:hi]
 		}
 	}
-	return NewStringDatum("{" + strings.Join(elems, ",") + "}")
+	return NewStringDatum(formatTextArrayWithNulls(elems, nulls))
 }
 
 // regexpAllMatchesArrays mirrors regexp_matches(string, pattern, 'g')'s SRF
@@ -6375,7 +6430,7 @@ func evalInExpr(x *planner.InExpr, slot SlotView, ctx *Context) (Datum, error) {
 			if v.IsNull() {
 				continue
 			}
-			res, err := evalBinary(x.AnyOp, operand, v, 0)
+			res, err := evalBinary(x.AnyOp, operand, v, 0, ctx)
 			if err != nil {
 				return Datum{}, err
 			}
@@ -6393,7 +6448,7 @@ func evalInExpr(x *planner.InExpr, slot SlotView, ctx *Context) (Datum, error) {
 			if v.IsNull() {
 				continue
 			}
-			res, err := evalBinary(x.AnyOp, operand, v, 0)
+			res, err := evalBinary(x.AnyOp, operand, v, 0, ctx)
 			if err != nil {
 				return Datum{}, err
 			}
@@ -11290,7 +11345,7 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			if v.IsNull() {
 				return NullDatum, nil
 			}
-			return evalCast(v, typeName, x.Pos())
+			return evalCast(v, typeName, x.Pos(), ctx)
 		}
 	}
 

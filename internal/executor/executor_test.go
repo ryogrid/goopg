@@ -337,7 +337,7 @@ func TestExecBooleanThreeValuedLogic(t *testing.T) {
 		{"and-null-true", NullDatum, NewBoolDatum(true), parser.OpAnd, NullDatum},
 	}
 	for _, c := range cases {
-		got, err := evalBinary(c.op, c.a, c.b, 0)
+		got, err := evalBinary(c.op, c.a, c.b, 0, nil)
 		if err != nil {
 			t.Errorf("%s: %v", c.name, err)
 			continue

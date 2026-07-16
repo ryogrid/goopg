@@ -19,29 +19,19 @@ rc=0
 
 stop_scope goopg-nightly-testport
 
-# Canonical-WAL resume lane (perf-optimize3-dash S4): the real-PG-consumer
-# tests assert-skip under the native-only default, so the default run above no
-# longer exercises them. Re-run exactly those tests with GOOPG_WAL_CANONICAL=on
-# so the resume path (deferral ledger: perf-optimize3-dash) cannot rot
-# silently. Gates the stage like the main run.
-canon_rc=0
-( cd "${REPO_ROOT}" && \
-  GOOPG_WAL_CANONICAL=on \
-  GOOPG_CG_UNIT=goopg-nightly-testport GOOPG_MEM_HIGH=6G GOOPG_MEM_MAX=8G \
-  GOOPG_MEM_SWAP_MAX=0 GOMEMLIMIT=5GiB \
-      "${REPO_ROOT}/scripts/goopg-test-run.sh" \
-      go test -v -timeout 60m \
-      -run 'TestE2E_FailoverGoopgToPG|TestE2E_ChecksumStreamingGoopgToPG|TestPort_PgWaldump002SaveFullpage|TestPort_PgWaldumpVacuumPruneRoundtrip|TestPort_WALPgWaldumpCompat' \
-      ./internal/testport/ \
-) > "${RUN_DIR}/testport/go-test-canonical-on.log" 2>&1 || canon_rc=$?
-
-stop_scope goopg-nightly-testport
-if [[ ${rc} -eq 0 && ${canon_rc} -eq 0 ]]; then
-    progress "S1.H" "testport PASS (incl. canonical-on lane)"
+# NOTE: the former GOOPG_WAL_CANONICAL=on "canonical resume lane" was removed
+# when canonical WAL emission + the knob were deleted (docs/design/
+# wal-native-pg-format/04-remove-canonical-and-pg-rmgr-dispatch.md). The
+# real-PG-consumer tests it re-ran (TestE2E_FailoverGoopgToPG,
+# TestE2E_ChecksumStreamingGoopgToPG, TestPort_PgWaldump002SaveFullpage,
+# TestPort_PgWaldumpVacuumPruneRoundtrip, TestPort_WALPgWaldumpCompat) now
+# unconditionally t.Skip (see .ralph/deferral_ledger.md) until the native->PG
+# record-body content rewrite lands, so there is nothing to re-run.
+if [[ ${rc} -eq 0 ]]; then
+    progress "S1.H" "testport PASS"
     stage_status testport "pass"
 else
-    progress "S1.H" "testport FAIL (rc=${rc} canonical-on=${canon_rc}) — see testport/go-test*.log"
+    progress "S1.H" "testport FAIL (rc=${rc}) — see testport/go-test.log"
     stage_status testport "fail"
 fi
-[[ ${rc} -ne 0 ]] && exit ${rc}
-exit ${canon_rc}
+exit ${rc}

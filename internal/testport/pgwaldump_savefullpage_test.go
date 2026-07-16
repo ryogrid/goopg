@@ -52,16 +52,10 @@ package testport
 // CSV row: WD-003 (`port`/`pass_required=yes`; WD-002 narrowed to just the
 // still-deferred 001_basic.pl server tier). This test (TestPort_PgWaldump002SaveFullpage)
 // is a self-promoting reproduction: it drives the full --save-fullpage path and
-// asserts the extracted-file format + LSN ordering. Two blockers previously kept
-// it skipped: (1) xl_prev written as a 1-based LSN, so pg_waldump could not walk
-// the record chain — RESOLVED separately (prevRecPtr seeding fix); (2) HOT
-// updates (the update path this test's workload always takes on an unindexed
-// table) emitted only goopg's native opaque WAL record, never a PG-canonical
-// FPI — fixed this loop via emitCanonicalHeapHotUpdate
-// (internal/executor/operators_storage.go), which mirrors the existing
-// PgCanonicalHeapInplace path used for the datfrozenxid in-place update. The
-// 001_basic.pl server tier stays deferred separately (needs
-// hash/gin/gist/spgist/brin AMs).
+// asserts the extracted-file format + LSN ordering. Unconditionally skipped
+// since 2026-07-15 (doc 04 §5.1-5.3 canonical-family removal) — see the
+// t.Skip below and .ralph/deferral_ledger.md. The 001_basic.pl server tier
+// stays deferred separately (needs hash/gin/gist/spgist/brin AMs).
 
 import (
 	"encoding/binary"
@@ -86,7 +80,7 @@ var saveFullpageFileRE = regexp.MustCompile(
 // TestPort_PgWaldump002SaveFullpage ports
 // postgres/src/bin/pg_waldump/t/002_save_fullpage.pl (M0110-0002).
 func TestPort_PgWaldump002SaveFullpage(t *testing.T) {
-	skipUnlessCanonicalWAL(t) // perf-optimize3-dash S4: canonical rmgr content (WD-003 deferred)
+	t.Skip("PG-tool WAL compat removed 2026-07-15 (canonical/knob/skip-tag removed; native->PG (rmid,info) dispatch); intentional, not a regression - resumes after native->PG content rewrite. See docs/design/wal-native-pg-format/04 + .ralph/deferral_ledger.md")
 	waldump := findPGWaldumpBin(t)
 	psqlBin := clientToolBin(t, "psql")
 	if psqlBin == "" {

@@ -3033,6 +3033,1326 @@ survey the deferral ledger for a fresh open (`status = -`) row.
       row: nothing new was left unimplemented, this was pure stale-log
       triage.
 
+- [x] **M-NIGHTLY triage — run 20260714-011651 (sha d8a4ed6e, 96 AI items)** —
+      the nightly built at d8a4ed6e (00:33), which predates two same-day
+      fixes that landed by the time this loop ran (2159d329 WAL-accounting-
+      lag retry at 10:02, plus 18 other commits up to HEAD ef38217f). Triaged
+      all 96 items:
+      - `AI-096 pgbench/nightly` (`flush victim: ... wal: requested LSN is
+        beyond written WAL: have 2012952632, need 2012952728`) — **STALE**,
+        confirmed fixed by 2159d329 (landed 10:02, after the 00:33 nightly
+        sha). Re-ran the full nightly-parameter repro at HEAD
+        (`REPO_ROOT=$PWD RUN_DIR=$(mktemp -d) bash
+        ci/batch/stages/stage-pgbench.sh`, s=50 c=100 j=20 T=180x3): PASS,
+        0 failed txns, tps 6202/12019/109096. No code change needed.
+      - `AI-002 testport/TestE2E_FailoverPGtoGoopg` (subtest `sync_on`) and
+        `AI-005 testport/TestPort_TimeoutsRowLevel` (subtest `lock_timeout`)
+        — **STALE**, both PASS standalone at HEAD; matches the known
+        co-load-timing-flake pattern (`iso_runner_blocking_is_timing_only`,
+        `TestPort_TimeoutsRowLevel`'s 300ms lock_timeout/statement_timeout
+        race under nightly CPU contention). Not a regression.
+      - `AI-001 testport/TestDebugSpecconflictActualOutput` — **FIXED**:
+        this was a committed-by-mistake scratch probe
+        (`internal/testport/tmp_spec_debug_test.go`, added in 282174f6) that
+        dumps `insert-conflict-specconflict.spec`'s actual isolation-runner
+        output and unconditionally `t.Fatalf`s so a human could eyeball it —
+        it can never pass and has polluted every nightly run since it was
+        committed. Deleted the file; the real coverage for that spec lives
+        in `TestPort_IsolationInsertConflictSpecconflict`
+        (isolation_port_test.go:354, unaffected).
+      - `AI-003/AI-004 testport/TestPort_Subscription001RepChanges` /
+        `TestPort_Subscription004Sync` — **FIXED, real (reproduces
+        standalone).** Root cause: `subTuple1`/`subTuple2`
+        (subscription_port_test.go) build a synthetic wire-level heap tuple
+        via `storage.NewHeapTuple(xmin, xmax, body).MarshalBinary()` but
+        never call `.Header.SetNatts(len(cols))` first, so the encoded
+        tuple's `Infomask2` natts field stays 0. `wal.encodePgoTuple`
+        (pgoutput.go:299) derives `storedNatts` from that same
+        `Infomask2 & HeapNattsMask` field, and every column index `i` with
+        `i >= storedNatts` is treated as an ALTER-TABLE-added column and
+        forced NULL (pgoutput.go:312-315) — with `storedNatts=0` that's
+        every column, every INSERT — so the subscriber-side apply always
+        wrote an all-NULL tuple (confirmed via a throwaway probe test:
+        `nBlocks=1` but the written tuple had `Bitmap:[0] Data:[]`), and
+        `subScanInt2`'s int-column decode then produced 0 rows. The sibling
+        helper in `internal/executor/applyworker_test.go`
+        (`wrapAsHeapTuple`) already calls `tup.Header.SetNatts(natts)` —
+        this was a test-harness bug isolated to
+        `internal/testport/subscription_port_test.go`, not a product
+        regression (ApplyWorker's own package tests were always green).
+        Fix: added the missing `ht.Header.SetNatts(1)` /
+        `ht.Header.SetNatts(2)` calls to `subTuple1`/`subTuple2`. Verified:
+        `TestPort_Subscription001RepChanges` +
+        `TestPort_Subscription004Sync` + `TestPort_Subscription026Stats`
+        all PASS. No deferral-ledger row (fully fixed, no remaining gap).
+      - `AI-006..AI-095 regress/*` (90 items, all sharing the identical
+        `regress_suite_test.go:121: deferred: output mismatch;
+        normalization rules need extension` rationale, joined against
+        `docs/test-port/regress-diff-baseline.csv` — **NOT attempted this
+        loop, too large for one pass.** The baseline CSV was last refreshed
+        2026-06-10 (commit 4ff7033b), over a month before this nightly;
+        spot-checked 10 of the 90 flagged suites at HEAD
+        (`aggregates|with|join|numeric|create_table|truncate|update|insert|
+        select|subselect` via `go test -v -run
+        'TestPort_RegressSuite/(...)$' ./internal/testport/`): `select` and
+        `truncate` now PASS (stale — already fixed by one of the 19 commits
+        since the baseline's sha), the rest still genuinely diverge. Pulled
+        an actual diff for `aggregates`
+        (`GOOPG_REGRESS_DIFF_DIR=/tmp go test -run
+        'TestPort_RegressSuite/aggregates$' ./internal/testport/`): real
+        bugs, not just baseline drift — `ERROR: column ref f1/0 on nil
+        slot` and `ERROR: outer column ref s1/level=1 out of range
+        (depth=0)` (correlated-subquery/LATERAL evaluator gap) plus a
+        `lc_collate` "POSIX" vs "default" normalization gap and a missing
+        9-row result set. Deferral-ledger row appended below. **Resume
+        point:** this needs its own dedicated non-rushed loop (or a few):
+        (1) regenerate `docs/test-port/regress-diff-baseline.csv` from a
+        full clean run at HEAD so future nightlies report real deltas
+        instead of month-old drift noise, (2) triage the aggregates
+        LATERAL/correlated-subquery errors as a fresh M0097-style bug, (3)
+        re-classify each of the other 88 flagged suites the same way before
+        assuming they're all genuine regressions — do NOT attempt to fix
+        all 90 in one loop.
+      Gates this loop: `go build ./...`/`go vet` (testport, executor,
+      storage, wal packages) clean; `go test ./internal/executor/...` PASS
+      (full package); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh`
+      PASS (0 failed, both pgbench workloads); nightly-parameter pgbench
+      re-run PASS (0 failed txns, see AI-096 above).
+- [x] **M-NIGHTLY triage — run 20260714-011651 follow-up: regress/* 90-item
+      reclassification (resume-point item 1+3 from the bullet above)** —
+      picked up the deferred resume plan. Methodology finding first: a
+      combined `-run 'TestPort_RegressSuite/^(name1|name2|...)$'` batch of
+      all 90 flagged names (one `go test` process, shared cluster across
+      subtests, same as both the nightly and the prior loop's 10-case spot
+      check) is **not a reliable ground truth** — subtests mutate shared
+      fixture state and there is no per-case isolation/schema reset, so a
+      case's outcome depends on which other cases ran before it in the same
+      process. Proof: `select`/`truncate` SKIP (mismatch) inside the 90-case
+      batch but PASS when run alone; `transactions` hits the fixed 120s
+      per-subtest context timeout (`regress_suite_test.go`'s
+      `context.WithTimeout(...,120*time.Second)`) inside the batch but
+      finishes in 5.54s alone (contamination-induced hang, not a real bug).
+      Re-ran all 90 **individually** (fresh cluster per case, 150s-per-`go
+      test`-invocation loop) for a trustworthy baseline:
+      - **3 confirmed stale (nightly noise, now genuinely PASS at HEAD, no
+        baseline change needed — already `pass`):** `select`, `truncate`,
+        `portals_p2`.
+      - **3 confirmed genuine hangs** (still hit the 120s context timeout
+        standalone, no contamination): `inherit`, `returning`, `with`. These
+        are higher-priority than a plain output mismatch — a regress SQL
+        script that hangs the connection for 120s points at a real
+        deadlock/infinite-loop/blocked-wait bug, not just an unported
+        normalization rule. **Not triaged further this loop** — next loop
+        should pull a goroutine dump / `pg_stat_activity`-equivalent mid-hang
+        for each of the 3 to find the blocking site.
+      - **84 confirmed genuine output-mismatch divergences** (real, not
+        contamination, run in single-digit seconds to ~34s each):
+        `aggregates, alter_table, arrays, cluster, constraints, copy, copy2,
+        create_index, create_procedure, create_table, create_table_like,
+        create_view, date, domain, drop_if_exists, equivclass, errors,
+        explain, expressions, fast_default, float4, float8, foreign_key,
+        generated_stored, generated_virtual, groupingsets, guc, hash_index,
+        horology, identity, incremental_sort, indexing, insert,
+        insert_conflict, interval, join, join_hash, json, jsonb,
+        jsonb_jsonpath, jsonpath, lock, matview, merge, misc,
+        misc_functions, multirangetypes, mvcc, numeric, numeric_big,
+        partition_info, partition_join, partition_prune, plancache,
+        plpgsql, portals, prepared_xacts, random, rangetypes, regex,
+        reindex_catalog, rowtypes, rules, select_having, select_implicit,
+        select_views, sequence, strings, subselect, temp, tidrangescan,
+        tidscan, timestamp, timestamptz, transactions, triggers, tuplesort,
+        txid, updatable_views, update, uuid, vacuum, window, xid`.
+      Updated `docs/test-port/regress-diff-baseline.csv`: demoted these 87
+      (84 mismatches + 3 hangs) from `pass`→`fail` (surgical per-row edit,
+      verified via `git diff` — only the 87 target rows changed, byte-exact
+      elsewhere) so the nightly join in `ci/batch/lib/summarize.py` (which
+      only flags a case when `baseline.get(case)=="pass"`) stops re-reporting
+      these 87 chronic, already-known failures as "new regressions" every
+      night; `select`/`truncate`/`portals_p2` stay `pass` (still accurate).
+      **Not attempted this loop:** individually root-causing any of the 87
+      (each needs its own dedicated bug-triage loop, same as the `aggregates`
+      LATERAL/correlated-subquery finding from the prior bullet); when a case
+      is later fixed, flip its baseline row back to `pass` in the same loop
+      that lands the fix (or reclassify it explicitly to `port`/`pass_required`
+      if it graduates into `postgres-oracle-port-status.csv` per the
+      "Deferred suite unlock conditions" workflow). No product code changed
+      this loop — CSV + fix_plan/ledger only. Gates: `go build ./...` clean
+      (pre-check before the run); the isolated re-run *is* the verification
+      (90 fresh `go test -run 'TestPort_RegressSuite/^(name)$'` invocations,
+      each against a clean cluster) — no separate regression suite needed
+      since no executor/planner/storage code was touched.
+- [x] **M-NIGHTLY (run 20260714-011651 follow-up) — fixed the 3 confirmed
+      regress hangs (`inherit`, `returning`, `with`): a self-deadlock in
+      `updateOp.updateWithFrom`'s non-HOT write path.** Root-caused by
+      minimal-repro bisection (built a standalone debug server, bisected
+      `with.sql` by prefix line count down to a 9-line repro, then added
+      temporary `Slot.Lock/Unlock` call-site tracing gated by
+      `GOOPG_DEBUG_SLOT_LOCK=1` — removed before commit) plus 2 `SIGQUIT`
+      goroutine dumps (Go's default SIGQUIT handler isn't overridden, so it
+      dumps all stacks and exits — no code change needed to get one).
+      Minimal repro: `WITH rcte AS (SELECT sum(id) AS totalid FROM parent)
+      UPDATE parent SET id = id + totalid FROM rcte;` where `parent` has an
+      inheritance child with rows. **Root cause**
+      (`internal/executor/operators_storage.go`, `updateWithFrom`'s Step-3
+      "!used" non-HOT branch, ~line 5905-6021): for a pending-update row
+      sourced from an inheritance child (`puSrcRel != rel` — the HOT path
+      is gated on `puSrcRel == rel` so child rows always take this branch),
+      the code `Pin`+`Lock`s the block once to read `oldTup`, then — only
+      when `isConcurrentlyUpdated(...)` was **true** — unlocked before the
+      EPQ wait/recheck. When it was **false** (the ordinary, non-conflicting
+      case on every single-statement UPDATE, i.e. always in this repro),
+      there was no `else`: execution fell straight through to an
+      *unconditional* second `Pin`+`Lock` on the very same block to do the
+      actual xmax-stamp + write — deadlocking the connection's own
+      goroutine against the lock it was still holding from the first
+      `Lock()`. Every UPDATE…FROM/DELETE…USING statement whose target has
+      an inheritance child with a matching row hit this **every time**
+      (100% reproducible, not a race) — it just happened to have gone
+      undetected because the earlier hang triage only logged
+      "context-timeout" without diagnosing further. **Fix:** added the
+      missing `else { s.Unlock(); o.ctx.Pool.Unpin(s) }` so the pre-EPQ
+      lock is always released before the unconditional re-Pin+re-Lock
+      (mirrors the release the `isConcurrentlyUpdated==true` branch already
+      had). **Bonus fix found via the same repro while checking result
+      correctness post-fix:** `updateWithFrom`'s (and the DELETE…USING
+      sibling's) per-row dedup `seen` map was keyed by bare `[2]uint64{blk,
+      slot}` with no relation component — since every table numbers its own
+      blocks from 0, a parent row and an inheritance-child row can share
+      the same `(blk, slot)` pair and the second one is silently `continue`d
+      as "already updated by an earlier FROM match", **dropping real rows**
+      (verified before the fix: only 2 of 5 rows in a
+      parent+child1+child2 repro were actually updated). Fixed by widening
+      the key to a new shared `rowDedupKey{tag storage.BufferTag, slot
+      uint16}` type (BufferTag already carries the full `RelFileNode`) in
+      both `updateWithFrom` and the DELETE…USING victim-collection loop
+      (sibling-path rule — same bug pattern, same fix). Added
+      `TestUpdateFromSelfReferentialAggregateInheritedTarget`
+      (`internal/executor/update_from_inherit_self_ref_test.go`) covering
+      both: it exercises the exact deadlocking code path (would hang the
+      test process forever pre-fix, hard-failing via `go test -timeout`
+      instead of a silent pass) and asserts all 3 rows (parent + 2
+      inheritance children) land on the correct summed value, catching the
+      dedup-key regression too. Verified: all 3 previously-hanging regress
+      cases now complete in seconds instead of hitting the 120s timeout
+      (`inherit` 2.04s, `returning` 0.15s, `with` 7.04s — all still `SKIP`
+      on pre-existing, unrelated output-normalization mismatches, tracked
+      in the 84-mismatch bucket from the prior bullet; no baseline CSV
+      change needed since they still don't PASS). Gates: `go build ./...`
+      clean; `go vet ./internal/executor/... ./internal/storage/...` clean;
+      `go test ./internal/executor/...` PASS; `go test ./internal/storage/...`
+      PASS; new regression test PASS;
+      `go test -v -run 'TestPort_RegressSuite/^(inherit|returning|with)$'
+      ./internal/testport/` PASS (no hang); `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+      bash scripts/ralph-precommit-test.sh` PASS (0 failed, all 3
+      workloads). No deferral-ledger row — both defects are fully fixed,
+      no remaining gap.
+- [x] **M-NIGHTLY (run 20260714-011651 follow-up) — fixed `regress/errors`
+      (first pick from the 84-mismatch resume plan's "quick suites"
+      list).** Root-caused two independent bugs, both surfaced by
+      `errors.sql`: (1) `internal/parser/function.go`'s CREATE FUNCTION
+      AS-clause parser unconditionally rejected the two-item `AS
+      'objfile', 'linksymbol'` form with a hardcoded `only one AS item
+      needed for language "sql"` error, regardless of the eventual
+      LANGUAGE. Upstream's `interpret_AS_clause` (`functioncmds.c`) only
+      rejects the two-item form for non-C languages — `LANGUAGE C`
+      *requires* exactly two items (obj file + link symbol). This broke
+      `test_setup.sql` itself: `CREATE FUNCTION binary_coercible(oid,
+      oid) ... AS :'regresslib', 'binary_coercible' LANGUAGE C ...` (AS
+      before LANGUAGE) failed to parse, so every regress case's shared
+      fixture load was silently missing this (and sibling) C-stub
+      function definitions. Fix: defer the two-item validation to the
+      clause loop's exit (LANGUAGE can appear before or after AS in the
+      grammar) and only reject when the final resolved language isn't
+      "c" (confirmed via PG source: `internal`/`sql`/others all take
+      exactly one AS item, only C takes two). (2)
+      `internal/analyzer/analyzer.go`'s `analyzeLockingClauses` rejected
+      `SELECT ... GROUP BY ... FOR UPDATE` via `len(s.GroupBy) > 0`, but
+      `errors.sql`'s `select null from pg_database group by grouping
+      sets (()) for update;` uses the degenerate empty-set `GROUPING SETS
+      (())` form, which the parser flattens to a zero-length `s.GroupBy`
+      (while `s.GroupingSets` stays non-nil) — the check silently missed
+      it, letting the query execute (3 rows) instead of raising the
+      required `0A000`. Fix: `len(s.GroupBy) > 0 || s.GroupingSets !=
+      nil`. Added `TestParseCreateFunctionLanguageCTwoItemAS` +
+      `TestParseCreateFunctionNonCTwoItemASRejected`
+      (`internal/parser/function_test.go`) and
+      `TestAnalyzeForUpdateRejectsGroupingSets`
+      (`internal/analyzer/locking_test.go`). Flipped
+      `docs/test-port/regress-diff-baseline.csv`'s `errors` row
+      `fail`→`pass`. Spot-checked the other named "quick suite"
+      candidates (`expressions`, `equivclass`, `explain`, `guc`, `regex`,
+      `random`) — all still genuinely diverge on unrelated normalization
+      gaps; left untouched (ONE-task-per-loop scope). Deferral-ledger row
+      appended (resolved) recording the still-open 83-suite bucket +
+      `aggregates` LATERAL bug and naming the next suite to pick. Gates:
+      `go build ./...` clean; `go vet`/`go test` on `internal/parser`,
+      `internal/analyzer`, `internal/executor` all green;
+      `go test -v -run 'TestPort_RegressSuite/^errors$'
+      ./internal/testport/` PASS (was SKIP/deferred);
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh`
+      PASS (0 failed, all 3 workloads).
+- [x] **M-NIGHTLY (run 20260714-011651 follow-up) — fixed `regexp_match`/
+      `regexp_matches` array-literal quoting; corrected the "quick suite"
+      classification for the remaining resume-list names.** Picked up the
+      next name from the prior loop's resume plan (`regex`, sub-0.2s
+      runtime). `regexpMatchArrayDatum` (`internal/executor/expr.go`) built
+      its `{elem1,elem2}` array literal with a bare `strings.Join`, so an
+      empty-string match rendered as `{}` (indistinguishable from a
+      zero-element array) instead of PostgreSQL's `{""}`, and any matched
+      text containing a comma/brace would silently corrupt the element
+      count on read-back. Fixed by delegating to the existing, already-
+      tested `formatTextArrayWithNulls` helper (used elsewhere in the same
+      file) instead of a second hand-rolled quoter — mirrors PG's
+      `array_out` `needquote` rule
+      (`postgres/src/backend/utils/adt/arrayfuncs.c` ~line 1130). Tests:
+      `internal/executor/regexp_match_test.go` +2 cases (empty-pattern
+      match, comma-containing match). Design doc follow-up appended to
+      `docs/design/0122-0002-pg-relation-size-real-sizes.md` + README
+      index. **Does not flip `regress/regex` to `pass`** — the suite's
+      remaining failures are backreference (`\1` in-pattern) and lookaround
+      (`(?<=...)`/`(?=...)`) constructs Go's RE2-based `regexp` package
+      cannot express at all (needs a different regex engine).
+      **Investigated and corrected the resume plan's "quick suite"
+      heuristic**: the other 5 untried names (`expressions`, `equivclass`,
+      `guc`, `random`, `explain`) were flagged "quick" based on sub-0.2s
+      regress-test *runtime*, which is NOT a valid proxy for fix
+      complexity — it only measures how fast the SQL script hits its first
+      divergence. Diffed all 5 against live HEAD via
+      `GOOPG_REGRESS_DIFF_DIR`: every one requires a substantial,
+      multi-loop feature (real geometric point/box types + static IN-list
+      operator-existence checking; user-defined operator classes/RESTRICT
+      selectivity; DateStyle multi-format output + partial-GUC-value merge
+      semantics; PG-exact PRNG algorithm + NUMERIC-scale-preserving
+      `random(min,max)`; EXPLAIN XML/YAML format fidelity). Full
+      per-suite root-cause breakdown in the deferral ledger (below).
+      **Separately discovered (not fixed, orthogonal):** the regress test
+      harness (`internal/testport/regress_suite_test.go`'s
+      `ClusterRegressExecutor.psqlEnv()`) never sets `PGDATESTYLE`/`PGTZ`/
+      `PGOPTIONS=-c intervalstyle=postgres_verbose`, the exact three
+      environment settings real `pg_regress` forces for every regress
+      connection (`postgres/src/test/regress/pg_regress.c:783-800`) — this
+      is why `guc`'s very first `SHOW datestyle` (no `SET` yet) already
+      mismatches. Fixing it needs its own dedicated loop (add the env
+      vars, then re-run all 90 individually flagged suites fresh to
+      re-verify `docs/test-port/regress-diff-baseline.csv`, since the
+      change may shift actual output for any date/time/timezone-touching
+      suite) — too large a blast radius to fold into this triage loop.
+      Deferral-ledger rows appended (one resolved for the landed fix, one
+      open for the corrected classification + env-var gap). Gates:
+      `go build ./...` clean; `go test ./internal/executor/...` PASS (full
+      package, no regressions); `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+      bash scripts/ralph-precommit-test.sh` PASS (0 failed, all 3
+      workloads).
+- [x] **M-NIGHTLY (run 20260714-011651 follow-up) — fixed the regress-harness
+      `PGDATESTYLE`/`PGTZ`/`PGOPTIONS` env-var gap (the prior loop's option
+      (a)), and along the way found + fixed the real underlying product bug
+      it depended on.** Added the 3 env vars to
+      `ClusterRegressExecutor.psqlEnv()` (`internal/testport/
+      regress_suite_test.go`), matching real `pg_regress`
+      (`postgres/src/test/regress/pg_regress.c:783-800`:
+      `PGTZ=America/Los_Angeles`, `PGDATESTYLE=Postgres, MDY`,
+      `PGOPTIONS=-c intervalstyle=postgres_verbose`). Verifying this actually
+      took effect surfaced a much larger gap: goopg's `handleStartup`
+      (`internal/server/server.go`) only ever consumed `user`/`database`/
+      `application_name`/`replication` from the StartupMessage parameter bag
+      and silently dropped every other key — including `datestyle`/
+      `timezone` (which libpq's `fe-connect.c` `EnvironmentOptions` table
+      folds `PGDATESTYLE`/`PGTZ` into) and `options` (`PGOPTIONS`'s `-c
+      name=value` tokens). Real PostgreSQL's `ProcessStartupPacket`
+      (`backend_startup.c` ~770-790) treats every non-special startup key as
+      a generic GUC name=value pair and separately parses `options`'s `-c`
+      tokens the same way — so goopg was not a protocol gap specific to the
+      test harness, it affects EVERY real client that relies on
+      `PGDATESTYLE`/`PGTZ`/`PGOPTIONS` env vars or an `options=` libpq
+      connstring parameter (a standard, common client-side mechanism, not
+      pg_regress-specific). Fixed by applying every non-special startup key
+      via `sess.Set` and adding a `parsePGOptions` helper to parse `options`'s
+      `-c name=value` tokens, both in `internal/server/server.go`
+      immediately after the existing application_name/session_authorization/
+      is_superuser echo block. New test
+      `TestStartupPacketAppliesGenericGUCs` (`internal/server/
+      server_test.go`) sends `datestyle`/`timezone`/`options` in the startup
+      packet and asserts the `DateStyle`/`TimeZone`/`IntervalStyle`
+      ParameterStatus values reflect them. **Verified no regression:**
+      re-ran all 41 suites currently marked `pass` in
+      `docs/test-port/regress-diff-baseline.csv` individually (fresh cluster
+      each, matching the prior loop's isolation methodology) — all 41 still
+      PASS after the env-var + startup-GUC fix (a real risk since PGTZ now
+      changes the session's actual TimeZone from the boot default). Spot-
+      checked `guc` via `GOOPG_REGRESS_DIFF_DIR`: the previously-first-line
+      `SHOW datestyle` mismatch (`ISO, MDY` vs PG's `Postgres, MDY` default)
+      is now gone, confirming the fix reaches the session's actual GUC
+      state; `guc` still does not flip to `pass` overall — the suite's
+      remaining diffs are the already-known, separately-scoped DateStyle
+      multi-format timestamp output gap (goopg always emits ISO-style
+      regardless of the DateStyle GUC's style word) and `SET datestyle`'s
+      partial-value-merge semantics (`SET datestyle='SQL'` should preserve
+      the existing MDY/DMY/YMD order component; goopg's `SHOW datestyle`
+      drops it, e.g. `SQL, YMD` → bare `SQL`) — both already tracked in the
+      2026-07-14 "corrected quick suite classification" ledger row, not
+      fixed here. Deferral-ledger row appended (resolved fix + open
+      resume). Gates: `go build ./...` clean; `go vet` clean
+      (`internal/server`, `internal/testport`); `go test
+      ./internal/server/...` PASS (full package, incl. new test); `go test
+      ./internal/config/...` PASS; 41/41 individually-rerun `pass`-baseline
+      regress suites PASS (no regression); `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+      bash scripts/ralph-precommit-test.sh` PASS (0 failed, all 3
+      workloads).
+- [x] **M-NIGHTLY follow-up (2026-07-14) — `DateStyle` partial-`SET` merge
+      semantics fixed** (item (2) from the row directly above). `DateStyle`
+      was a plain `TypeString` GUC with zero parsing: `SET datestyle = 'SQL'`
+      stored the bare literal `"SQL"` (losing the order component entirely),
+      and conflicting (`'ISO, SQL'`) or unrecognized (`'bogus'`) specs were
+      silently accepted instead of rejected. Ported PostgreSQL's
+      `check_datestyle` (`postgres/src/backend/commands/variable.c`)
+      token-for-token into new `internal/config/datestyle.go`
+      (`mergeDateStyle`/`parseDateStyleValue`): each comma-separated token in
+      a `SET` sets either the style (ISO/SQL/Postgres/German) or the order
+      (YMD/DMY/MDY), starting from the *current* effective value so an
+      unspecified component survives; `GERMAN` implies `DMY` unless the same
+      SET also names an order; `DEFAULT` recursively resolves against the
+      boot value; a second conflicting token or an unrecognized keyword is
+      rejected. `Variable.canonicalize` (`internal/config/guc.go`) now
+      delegates to a new `canonicalizeFrom(current, value)` that
+      special-cases `DateStyle` before falling through to the unchanged
+      by-`Type` switch for every other GUC (byte-for-byte identical
+      behavior for the rest of the GUC table — verified via full
+      `internal/config`/`internal/server`/`internal/executor` suites).
+      `SessionRegistry.Set`/`SetInternal` (`internal/config/session.go`) now
+      fetch the session's *effective* current value via `s.Get(name)` before
+      merging, not the shared global `*Variable`'s stale `v.Value` — needed
+      so a second partial `SET datestyle` in the same session merges against
+      the session's own prior override, not the global default. New
+      `internal/config/datestyle_test.go` (6 cases: partial-set order
+      preservation, GERMAN→DMY, conflict rejection, unrecognized-keyword
+      rejection, DEFAULT-token merge, boot-value round-trip). Live
+      end-to-end verification against a real `cmd/goopg` binary via `psql`:
+      `SET datestyle='SQL'` → `SHOW datestyle`=`SQL, MDY`; subsequent
+      `SET datestyle='DMY'` → `SQL, DMY` (order-only SET correctly kept the
+      just-set style); `SET datestyle='ISO, SQL'` →
+      `ERROR: conflicting "datestyle" specifications`;
+      `SET datestyle='nonsense'` → `ERROR: unrecognized key word: "nonsense"`.
+      Design: `docs/design/0097-0151-datestyle-partial-set-merge.md` +
+      README index row. Deferral-ledger row appended (resolved this item;
+      the much larger, separately-scoped DateStyle multi-format
+      timestamp/date *output rendering* gap — goopg's formatters
+      hard-code one literal layout regardless of the GUC, across
+      `internal/executor/datum.go`, `internal/server/dispatch.go`,
+      `internal/executor/copy_text.go`, `internal/wal/pgoutput.go` — remains
+      open and unimplemented; a latent sibling-path divergence was also
+      spotted between datum.go's DATE `Format()` [MDY] and dispatch.go's
+      `date` case in `appendTypedCellText` [ISO] for the same DATE kind,
+      not yet confirmed to matter since dispatch.go is the live SELECT-output
+      path). `guc`/`date`/`timestamp`/`timestamptz`/`horology` regress
+      suites remain `fail` — this fix alone does not flip them; only the
+      GUC-merge correctness bug is closed. Gates: `go build ./...` clean;
+      `go test ./internal/config/... ./internal/server/... ./internal/executor/...`
+      PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh`
+      PASS (0 failed, all 3 workloads).
+- [x] **M-NIGHTLY (run 20260714-011651 follow-up) — DATE-only DateStyle
+      output rendering + fixed a `COPY <date-column> TO` hard-error.** Picked
+      up the DateStyle output-rendering resume point from the item directly
+      above, scoped to DATE only (TIMESTAMP/TIMESTAMPTZ deferred — PG's
+      `Postgres` style needs day-of-week/month-name/year-reorder logic
+      `EncodeDateOnly` doesn't have, a separate larger unit of work). Added
+      exported `config.ParseDateStyleValue` (was package-private
+      `parseDateStyleValue`) and a new `config.FormatDate(t, style, order)`
+      helper (`internal/config/datestyle.go`) mirroring PostgreSQL's
+      `EncodeDateOnly` (`postgres/src/backend/utils/adt/datetime.c`): ISO
+      (any order) → `YYYY-MM-DD`; SQL → `MM/DD/YYYY` or `DD/MM/YYYY`;
+      Postgres → `MM-DD-YYYY` or `DD-MM-YYYY`; German → always `DD.MM.YYYY`.
+      **Two independent bugs fixed:** (1) `internal/server/dispatch.go`'s
+      `appendTypedCellText` — the live SELECT-output path shared by both the
+      simple- and extended-query protocols — had a `"date"` case hardcoded
+      to ISO regardless of the session's `datestyle` GUC, so `SET
+      datestyle='SQL'` (or Postgres/German) correctly updated `SHOW
+      datestyle` but had **zero effect on actual SELECT results**. Fixed by
+      calling the already-in-scope `getSetting("datestyle")` parameter (nil-
+      guarded, falls back to ISO/MDY) and rendering via the new
+      `config.FormatDate`. (2) `internal/executor/copy_text.go`'s
+      `datumToCopyText` had **no `"date"` case at all** — a `date`-typed
+      column fell through the type-name switch into the `default:` branch's
+      `d.Kind` switch (only handles String/Bytes/Int/Bool/Numeric, not
+      `KindTime`), so **`COPY <table> TO` (text or CSV format) hard-errored
+      outright on any table with a `date` column** — a more severe bug than
+      the DateStyle mismatch, discovered while tracing the 4 candidate
+      output call sites rather than anticipated by the original ledger row.
+      Fixed by adding the missing case, also DateStyle-aware.
+      `EncodeCopyTextRow`/`EncodeCopyCsvRow` (the latter shares
+      `datumToCopyText`) gained trailing `dateStyle, dateOrder string`
+      parameters; `RunCopyTo` (`internal/executor/copy.go`) resolves them
+      once via `ctx.GetSetting("datestyle")` (nil-guarded, falls back to
+      `"ISO","MDY"`). New tests: `internal/executor/copy_text_test.go`
+      `TestEncodeCopyTextRowDate` (4 styles × 2 orders through
+      `EncodeCopyTextRow`, previously unencoable — hard error);
+      `internal/server/date_output_test.go`
+      `TestAppendTypedCellTextDateHonorsDateStyle` (same matrix through
+      `appendTypedCellText`, plus a nil-`getSetting` fallback case). Live
+      end-to-end verification against a real `cmd/goopg` binary via `psql`
+      (isolated data dir/port, `tmp/dateverify-data` on 127.0.0.1:5533,
+      cleaned up after): `CREATE TABLE dtest(id int, d date)` +
+      `INSERT`/`NULL`; `SELECT d FROM dtest` under `SET
+      datestyle='SQL'`→`07/14/2026`, `'Postgres, DMY'`→`14-07-2026`,
+      `'German'`→`14.07.2026`; `COPY dtest TO STDOUT`
+      (text)/`WITH(FORMAT csv)` under `ISO` — previously an outright error —
+      now correctly emit `2026-07-14`/`\N` and `2026-07-14`/`` (empty CSV
+      NULL) respectively. Design doc follow-up appended to
+      `docs/design/0097-0151-datestyle-partial-set-merge.md` ("Follow-up
+      (2026-07-14)" section; README index row already pointed at this doc,
+      unchanged). Deferral-ledger row appended: TIMESTAMP/TIMESTAMPTZ
+      DateStyle output, `Datum.Format()`/`AppendValueText()`'s ~20-call-site
+      DateStyle-unawareness (CAST/to_char/plpgsql/EXPLAIN/error-message
+      paths — a live sibling-path divergence from the two fixes landed this
+      loop), and `pgoutput.go`'s DateStyle-plumbing gap + its independent
+      date-uses-timestamp-layout bug all remain open. Gates: `go build
+      ./...` clean; `go vet` clean (`internal/config`, `internal/executor`,
+      `internal/server`); `go test
+      ./internal/config/... ./internal/executor/... ./internal/server/...`
+      PASS (full packages, no regressions); `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+      bash scripts/ralph-precommit-test.sh` PASS (0 failed, all 3
+      workloads).
+- [x] **M-NIGHTLY (run 20260714-011651 follow-up) — `evalCast`'s CAST-to-text
+      DateStyle-awareness fixed** (commit `751b8217`, landed a prior loop but
+      missing its fix_plan entry — recorded here for continuity). `x::text`/
+      `CAST(x AS text)`/`text(x)` on a DATE/TIMESTAMP/TIMESTAMPTZ value now
+      honors `SET datestyle` via a new `ctx *Context` param threaded through
+      `evalCast`/`evalCastTyped` plus `dateStyleFromCtx`/
+      `formatTimeDatumForCast` helpers (`internal/executor/expr.go`). Full
+      details/gates in the deferral ledger row dated 2026-07-15 and
+      `docs/design/0097-0151-datestyle-partial-set-merge.md`'s "Follow-up
+      (2026-07-15): `CAST`-to-text DateStyle-awareness" section.
+- [x] **M-NIGHTLY (run 20260714-011651 follow-up) — FK-violation `DETAIL`
+      line DateStyle-awareness (`fkValsForDetail`) fixed.** Picked up the
+      "audit the ~20 `Format()`/`AppendValueText()` call sites" resume point.
+      `operators_fk.go`'s `fkValsForDetail(vals []Datum) string` — renders
+      the `Key (col)=(val) is not present in table "X".` / `...is still
+      referenced from table "Y".` DETAIL line on every `23503` FK-violation
+      error — called `v.Format()` unconditionally (fixed ISO / hardcoded
+      Postgres-MDY-only), diverging from the already-fixed SELECT/COPY/CAST
+      output paths. Renamed the CAST follow-up's `formatTimeDatumForCast` to
+      `formatTimeDatumDateStyle` (it was never actually CAST-specific) and
+      reused it directly (`pattern_sibling_paths_must_agree`) rather than
+      growing a parallel helper. Added a `ctx *Context` param to
+      `fkValsForDetail`; all 4 production call sites (`assertParentExists`
+      ×2, `assertNoChildRows`, `detachPartitionFKRefCheck`) already had `ctx`
+      in scope, so every call site is now DateStyle-aware (none fall back to
+      the nil-ctx ISO/MDY default). New
+      `TestFKValsForDetailHonorsDateStyle` (`operators_fk_test.go`; German
+      style DATE rendering + nil-ctx ISO/MDY fallback); updated the 3
+      pre-existing direct `fkValsForDetail` test callers to pass `nil`/`ctx`.
+      Live `psql` verification against a real `cmd/goopg` binary (isolated
+      data dir, port 5539) confirmed the fix works correctly for the
+      DELETE/UPDATE-parent-side check and the partition-detach check (
+      `SET datestyle='German'; DELETE FROM parent WHERE d='2026-07-14'` →
+      `DETAIL: Key (d)=(14.07.2026) is still referenced from table
+      "child".`, correctly reformatted) — both operate on `Datum`s decoded
+      from an already-stored heap row (confirmed `Kind=5`/`KindTime`,
+      `flagDate` set via a temporary debug probe, reverted before commit).
+      **New gap discovered by the same live probe (deferred, NOT fixed this
+      loop):** the INSERT-side check (`assertParentExists` via
+      `checkFKInsert`) does not benefit — a fresh `INSERT` violating the FK
+      under `SET datestyle='German'` still renders the DETAIL line with the
+      raw, un-reformatted literal, because `operators_storage.go`'s
+      `insertOp.Next` only explicitly coerces `int2`/`int4`/`int8` columns
+      before FK/CHECK/domain constraint checks run — DATE/TIMESTAMP/
+      TIMESTAMPTZ/NUMERIC columns stay `KindString` (the raw literal) at
+      constraint-check time and only become properly typed later, at
+      storage encode. This is wider than DateStyle: CHECK/domain/FK checks
+      during INSERT currently evaluate un-coerced literal Datums for those
+      types. Deferral-ledger row appended (2026-07-15,
+      `fkValsForDetail` FK-violation DETAIL DateStyle-awareness fixed) with
+      resume point: extend `insertOp.Next`'s coercion `switch` (~line 1900)
+      to cover `date`/`timestamp`/`timestamptz` (and audit `numeric`) via
+      the same `evalCast` pattern already used for the integer cases; audit
+      `updateOp`/upsert siblings for the same gap. Design doc follow-up:
+      `docs/design/0097-0151-datestyle-partial-set-merge.md` "Follow-up
+      (2026-07-15): FK violation `DETAIL` line DateStyle-awareness" section;
+      README index row updated. Gates: `go build ./...`/`go vet ./...`
+      clean; `go test -count=1 ./internal/executor/...` PASS (full package,
+      no regressions); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh`
+      PASS (0 failed, all 3 workloads).
+- [x] **M-NIGHTLY (run 20260714-011651 follow-up) — INSERT-side date/
+      timestamp/timestamptz/numeric literal coercion fixed.** Picked up the
+      previous item's resume point directly. Extended `operators_storage.go`'s
+      `insertOp.Next` coercion switch (~line 1903, previously `int2`/`int4`/
+      `int8` only) to also cover `date`/`timestamp`/`timestamptz`/`numeric`/
+      `decimal` via the same `evalCast(row[i], typeName, pos, ctx)` pattern —
+      FK/CHECK/domain/NOT-NULL constraint checks during INSERT now see a
+      properly typed value instead of the raw VALUES-clause literal. Shared
+      for free with the `INSERT ... ON CONFLICT` upsert candidate-row path
+      (same coercion block, root-0020). **Sibling bug found and fixed by the
+      same live-verification pass** (`pattern_sibling_paths_must_agree`):
+      `evalCast`'s `"date"` case (`expr.go`) built its result via
+      `NewTimeDatum` instead of `NewDateDatum` in both branches, leaving
+      `flagDate` unset — this made the newly-coerced FK DETAIL rendering show
+      a spurious `00:00:00` time suffix (rendered as a timestamp, not a date)
+      until fixed; switched both branches to `NewDateDatum` per its own doc
+      comment ("Use this at every date-producing site"). New tests:
+      `TestEvalCastToDateSetsFlagDate` (`cast_datestyle_test.go`),
+      `TestInsertCoercesDateLiteralBeforeFKCheck` +
+      `TestInsertCoercesNumericLiteralBeforeCheckConstraint`
+      (`insert_fk_datestyle_coerce_test.go`, full parse→plan→exec integration
+      via `newVMFixture`/`runDDL`). Live `psql` verification (isolated data
+      dir, port 5540): DATE and TIMESTAMP INSERT-side FK violations under
+      `SET datestyle='German'` both render correctly and date-only (no time
+      suffix); CHECK-constraint violation (`23514`) and invalid numeric
+      literal (`22P02`) on a `numeric` column still raise correctly; `int4[]`
+      array column unaffected (`col.Type.IsArray` guard still applies).
+      **New gap discovered by the same audit (deferred, NOT fixed this
+      loop):** `UPDATE ... SET`'s new-row construction has the identical
+      un-coerced-literal problem across 3 separate call sites
+      (`updateViaIndex`, `updateOp.Next`'s seq-scan path, `updateWithFrom`),
+      and it's wider than DateStyle — UPDATE never had the original
+      int2/int4/int8 range-check coercion either. Deferral-ledger row
+      appended (2026-07-15) with resume point: factor the INSERT coercion
+      switch into a shared helper called from all 3 UPDATE sites, or wrap
+      bare-literal SET RHS in an implicit CAST at plan time
+      (`planner.go`'s `applyUpdateAssign`, ~8352-8361). Design doc follow-up:
+      `docs/design/0097-0151-datestyle-partial-set-merge.md` "Follow-up
+      (2026-07-15): INSERT-side literal coercion (`insertOp.Next`)" section;
+      README index row updated. Gates: `go build ./...`/`go vet
+      ./internal/executor/...` clean; `go test -count=1
+      ./internal/executor/...` PASS (full package, no regressions);
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33, re-run after the
+      flagDate fix); `RALPH_PRECOMMIT_SCOPE=smoke bash
+      scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 workloads,
+      re-run after the flagDate fix).
+- [x] **M-NIGHTLY (run 20260714-011651 follow-up) — UPDATE-side date/
+      timestamp/timestamptz/numeric + int-range literal coercion fixed.**
+      Picked up the previous item's resume point. Factored `insertOp.Next`'s
+      coercion switch into a shared `coerceRowForConstraintChecks(cols, row,
+      include, ctx, pos)` helper (`operators_storage.go`) — INSERT calls it
+      with `include = !insertMissing[i]` (behavior-preserving refactor).
+      Wired the same helper into every UPDATE new-row construction site,
+      gated on `include = o.plan.Set[i] != nil` (only freshly-SET columns
+      get re-coerced): `updateViaIndex` (main + EPQ retry), `updateOp.Next`'s
+      SeqScan path (inherit-child + non-inherit branches of its Phase-1
+      collect loop, plus a *second* EPQ-retry rebind in its separate Phase-2
+      write loop that the resume point's line-number guess had missed), and
+      `updateWithFrom` (main + EPQ retry) — 7 UPDATE call sites total, not
+      the 3 originally estimated. New tests
+      (`update_fk_datestyle_coerce_test.go`):
+      `TestUpdateCoercesDateLiteralBeforeFKCheck` (indexed-PK UPDATE, so it
+      specifically exercises `updateViaIndex`; non-vacuous via `git stash`),
+      `TestUpdateCoercesNumericLiteralBeforeCheckConstraint` (same
+      non-vacuousness check), `TestUpdateCoercesInt4RangeOverflow`
+      (regression guard — this one already passed pre-fix since the heap
+      encoder independently range-checks fixed-width int4 at write time).
+      Design doc `docs/design/0097-0151-datestyle-partial-set-merge.md`
+      "Follow-up (2026-07-15): UPDATE-side literal coercion" section; README
+      index row updated. Deferral-ledger row flipped `resolved` + new row
+      recorded. Gates: `go build ./...`/`go vet ./...` clean (repo-wide);
+      `go test -count=1 ./internal/executor/...` PASS (full package, no
+      regressions); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh`
+      PASS (0 failed, all 3 workloads).
+- [x] **M-NIGHTLY (run 20260714-011651 follow-up) — `||` (string
+      concatenation) DateStyle-awareness fixed.** Next slice in the
+      `evalCast`/`fkValsForDetail`/INSERT/UPDATE-coercion resume chain.
+      `evalBinary`'s `parser.OpConcat` case (`internal/executor/expr.go`)
+      called `left.Format()`/`right.Format()` directly, so
+      `'prefix' || date_col` / `timestamp_col || 'suffix'` always rendered
+      ISO/Postgres-MDY regardless of `SET datestyle`. Added a `ctx *Context`
+      trailing parameter to `evalBinary` (previously had none) and threaded
+      it through all production call sites (`evalExprSlot`, `evalInExpr`'s
+      ANY/ALL loop, `evalFastExpr`) plus `nil` for the 2 sites that can
+      never reach `OpConcat` with a `KindTime` operand
+      (`evalBinaryBatch`/`windowOp.inRange`) and all ~15 test-only callers.
+      New reusable `formatDatumDateStyle(d, ctx)` helper
+      (Format()-compatible, DateStyle-aware for `KindTime`). New tests
+      `internal/executor/concat_datestyle_test.go`
+      (`TestConcatHonorsDateStyle`, `TestConcatNilCtxDefaultsISO`);
+      non-vacuousness confirmed via a temporary revert-and-rerun. Live
+      `psql` verification (port 5541) across ISO/SQL/Postgres/German ×
+      MDY/DMY. Design doc `docs/design/0097-0151-datestyle-partial-set-merge.md`
+      "Follow-up (2026-07-15): \|\| (string concatenation) DateStyle-awareness"
+      section; README index row updated. Deferral-ledger row appended
+      (resume point: `operators_join_agg.go`'s `array_to_string` element
+      rendering is the natural next slice). Gates: `go build ./...`/
+      `go vet ./...` clean (repo-wide); `go test -count=1
+      ./internal/executor/...` PASS (full package, no regressions);
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh`
+      PASS (0 failed, all 3 workloads).
+- [x] **M-NIGHTLY (run 20260714-011651 follow-up) — `array_agg`/
+      `string_agg`/variadic-UDA-bundling/`percentile_disc` DateStyle-
+      awareness fixed.** Resume point from the `||` fix above:
+      `operators_join_agg.go`'s 8 aggregate-element `.Format()` call sites
+      (`applyAgg`'s `string_agg` delimiter+value, `array_agg`'s per-row
+      element, the variadic user-defined-aggregate arg-bundling loop ×3,
+      `finishWithinGroupAgg`'s `percentile_disc` 2D+1D array rendering)
+      swapped for `formatDatumDateStyle(d, ctx)`, reusing the `||` fix's
+      helper unchanged (`o.ctx` already in scope on `*aggregateOp`; `ctx`
+      already a param on `finishWithinGroupAgg`). Confirmed `array_to_string`
+      itself needs no change — it re-joins an already-textified array
+      literal (`parseTextArray`), never touching a raw element `Datum`;
+      the actual gap was upstream at `array_agg`'s element-formatting step,
+      now fixed. `ARRAY[...]` constructor sites surveyed and out of scope
+      (constant-folding/default-expression contexts, not query-time SELECT
+      output). New tests
+      `internal/executor/agg_array_datestyle_test.go`
+      (`TestArrayAggStringAggHonorDateStyle`, full parse→plan→exec
+      integration; `TestArrayAggStringAggNilCtxDefaultsISO`);
+      non-vacuousness confirmed via `git stash` on `operators_join_agg.go`
+      alone. Live `psql` verification (port 5541, cleaned up) across
+      ISO/German/SQL-DMY/Postgres-MDY for `string_agg`, `array_agg` (DATE
+      and TIMESTAMP), and `percentile_disc(...) WITHIN GROUP`. Design doc
+      `docs/design/0097-0151-datestyle-partial-set-merge.md` "Follow-up
+      (2026-07-15): array_agg/string_agg/percentile_disc DateStyle-
+      awareness" + README index updated. Deferral ledger row appended
+      (open, resume point: `to_char` generic fallback +
+      `operators_analyze.go` bound-rendering next). Gates: `go build
+      ./...`/`go vet ./...` clean (repo-wide); `go test -count=1
+      ./internal/executor/...` PASS (full package, no regressions);
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh`
+      PASS (0 failed, all 3 workloads).
+  - [x] **M-NIGHTLY (run 20260714-011651 follow-up) — ANALYZE's MCV/
+      histogram-bound DateStyle-awareness fixed; `to_char` generic fallback
+      audited (non-issue).** Resume point from the `array_agg` fix above.
+      Audited `to_char` first: `evalToChar`'s `KindTime` branch always
+      renders via an explicit user-supplied format string
+      (`pgToCharToGoFormat` → `time.Format`), never `Datum.Format()`, so
+      DateStyle never applies there — confirmed non-issue, no code change.
+      Then fixed `operators_analyze.go`'s `computeColumnStats`: its 2
+      DATE/TIMESTAMP-affecting `.Format()` sites (MCV entry `Value`,
+      histogram-boundary strings) were hardcoded ISO/Postgres-MDY.
+      Threaded a new `dsCtx *Context` param through
+      `analyzeRelationWith`/`computeColumnStats` (live `ctx` from
+      `analyzeRelationCtx`'s real ANALYZE path; `nil` from the test-only
+      `analyzeRelation` wrapper) and swapped both sites for
+      `formatDatumDateStyle(d, dsCtx)`. New tests
+      `internal/executor/analyze_datestyle_test.go`
+      (`TestAnalyzeMCVHistogramHonorDateStyle`,
+      `TestAnalyzeMCVHistogramNilCtxDefaultsISO`); non-vacuousness confirmed
+      via `git stash` on `operators_analyze.go` alone (test file's 8-arg
+      call no longer compiles). Live `psql` verification (port 5541,
+      cleaned up): German DMY `ANALYZE` → `pg_stats.most_common_vals`/
+      `histogram_bounds` render `dd.mm.yyyy`. Design doc
+      `docs/design/0097-0151-datestyle-partial-set-merge.md` "Follow-up
+      (2026-07-15): ANALYZE's MCV/histogram-bound rendering" + README
+      index updated. Deferral ledger row appended (open — goopg bakes the
+      rendering in at ANALYZE time rather than storing binary values and
+      re-rendering at `pg_stats`-SELECT time like real PG; resume: plpgsql
+      RAISE/EXPLAIN next). Gates: `go build ./...`/`go vet ./...` clean
+      (repo-wide); `go test -count=1 ./internal/executor/...` PASS (full
+      package, no regressions); `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke bash
+      scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 workloads).
+  - [x] **M-NIGHTLY (run 20260714-011651 follow-up) — plpgsql `RAISE`
+      %-argument DateStyle-awareness fixed.** Resume point from the ANALYZE
+      fix above. `evalRaiseMsg` (`plpgsql_runtime.go`) called `val.Format()`
+      directly on each evaluated `%`-argument; swapped for
+      `formatDatumDateStyle(val, ctx)` (`ctx` was already a parameter, no
+      signature changes needed). Audited the file's other 2 `.Format()`
+      sites (`datumToSQLLiteral`, `plpgsqlFormatDynArg`) and confirmed they
+      build SQL-literal text for dynamic-SQL re-parsing (`EXECUTE`/
+      trigger-ref substitution) where ISO is the safer unambiguous choice,
+      not a display bug — left unchanged. New tests
+      `internal/executor/plpgsql_raise_datestyle_test.go`
+      (`TestRaiseMsgHonorsDateStyle`, `TestRaiseMsgDefaultsISOWithNoDateStyleGUC`);
+      both source the DATE value via `SELECT ... INTO` from a real table
+      column to sidestep a sibling bug found while writing the test (see
+      below). Confirmed non-vacuous via `git stash` on `plpgsql_runtime.go`
+      alone (pre-fix message: `bad date: 01-05-2026`, Format()'s hardcoded
+      Postgres-MDY layout, not even ISO). Design doc
+      `docs/design/0097-0151-datestyle-partial-set-merge.md` "Follow-up
+      (2026-07-15): plpgsql RAISE %-argument DateStyle-awareness" + README
+      index updated. Deferral ledger row appended (open — 2 new discovered
+      gaps: `coerceDatumToType`'s `isTimeTypeName` branch mints a
+      timestamp-shaped, no-`flagDate` `Datum` for a string-literal
+      `date`-typed declare/assign, the same bug class `evalCast`'s "date"
+      case had before its earlier fix, never ported to this sibling; and
+      plpgsql composite/record/array variables — `rowToCompositeText`,
+      `bindRecordRowComposite`, `updateCompositeField`, `ArrayAssignStmt`'s
+      array-element assignment — all bake a pre-rendered `Format()` string
+      into the variable with no re-render hook, same architecture gap as
+      ANALYZE's binary-storage note. EXPLAIN still unaudited). Gates:
+      `go build ./...`/`go vet ./...` clean (repo-wide); `go test -count=1
+      ./internal/executor/...` PASS (full package, no regressions);
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33).
+- [x] **M-NIGHTLY triage — run 20260715-010036 (sha 751b82178025, 11 AI items).**
+      Triaged all 11: `AI-...-001..005` (units-suite timeouts:
+      `cmd/goopg`/`internal/amcheck`/`internal/initdb`/`internal/mvcc`/
+      `internal/wal`), `AI-...-006..008` (isolation-spec regressions:
+      `TestPort_IsolationDetachPartitionConcurrently4`,
+      `TestPort_IsolationInsertConflictSpecconflict`,
+      `TestPort_IsolationPartitionDropIndexLocking`), `AI-...-009..011`
+      (`regress/errors`/`portals_p2`/`select`, all baseline `pass`, all fixed
+      by name in yesterday's follow-up loops). **Fixed AI-006/007/008**: all
+      three isolation regressions shared ONE root cause —
+      `ActivityRegistry.Register(b)`'s PID-hash slot
+      (`procNumForPID(b.PID)`) silently diverged from `connTx.ProcNum`
+      (`TxnMgr.AcquireConnSlot()`, an unrelated MVCC proc-array slot), the
+      identifier every dynamic call (`UpdateState`/`WaitEventStart`/
+      `PIDForProcNum`) is keyed off — so `pg_stat_activity.state`/`query`
+      froze at their `Register()`-time defaults for a connection's whole
+      lifetime, a wiring gap around 0118-0073's still-correct idle-retention
+      fix. New `ActivityRegistry.RegisterAt(procNum, b)` (mirrors
+      `RegisterBackground`); `Register(b)` delegates to it; the one
+      production call site (`internal/server/server.go`) now calls
+      `RegisterAt(procNum, …)` reusing its already-computed
+      `TxnMgr.AcquireConnSlot()` value. Verified live via a manually started
+      server + raw `psql` (query/state now update correctly mid-statement and
+      on idle). **Investigated AI-001..005/009..011, found non-reproducing**
+      (deferral ledger row, open): `internal/initdb` reran clean in ~4 min
+      (nightly log showed a 33-min timeout kill with a near-empty goroutine
+      dump — starvation signature, not a hang); `errors`/`portals_p2`/
+      `select` all PASS individually. `cmd/goopg`/`amcheck`/`mvcc`/`wal` not
+      re-run to their full 33+ min timeout this loop (time-boxed) — resume
+      point in the ledger row. Design doc
+      `docs/design/0118-0141-activity-procnum-identity-space-conflation.md` +
+      README index. Deferral ledger: 1 resolved row (the fix) + 1 open row
+      (the unconfirmed units/wal timeouts). Gates: `go build ./...` clean;
+      `go test` PASS across `internal/activity`/`internal/server`/
+      `internal/executor`/`internal/initdb`; full `TestPort_Isolation*`
+      battery 0 `--- FAIL` (was 3 FAIL); `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+      bash scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 workloads).
+- [x] **M-NIGHTLY (run 20260715-010036 triage) — `internal/wal` nightly
+      failure root-caused and fixed (resume point from the row above).**
+      `AI-...-005 units/internal/wal` was not a bare 33-minute timeout kill
+      like its 3 siblings — the nightly log recorded a real 5.4s test
+      **failure**, `TestStripeAppendConcurrentDrainConsistency: drain
+      goroutine never ran`. Reproduced it reliably (10/10) via synthetic host
+      CPU contention (`for i in $(seq 1 20); do yes >/dev/null & done` on a
+      16-core box) against the FULL `internal/wal` package suite — matches
+      `ci/batch/run-nightly.sh`'s Lane L running `units` concurrently with
+      `race`. Root cause: the test's busy-loop drain goroutine can genuinely
+      never get scheduled before `wg.Wait()`+`close(done)` under contention —
+      a test-structure flaw, not a `stripeAppend`/`publishVisibility` bug.
+      Fixed with a `ready` channel closed after the drain goroutine's first
+      iteration; producers now start only after it fires, guaranteeing at
+      least one scheduled run while the concurrent-drain exercise continues
+      unchanged afterward. While reproducing under the same load, ALSO found
+      a second, previously undocumented flake: `TestDrainSafetyStress`'s
+      `checkInvariant` read `writeLSNAtomic`/`drainedLSNAtomic`/
+      `flushedLSNAtomic` as three independent non-atomic `Load()`s in
+      write-first order, letting a concurrent drain advance `drainedLSNAtomic`
+      past an already-stale captured `write` value (`dr>wr` by ~565k bytes
+      under contention). Fixed by reordering to flush→drain→write, exploiting
+      that all three fields are monotonically non-decreasing in production
+      (CAS-max `storeMaxLSN`; `xlogWrite`'s `rq.write > writtenLSN` guard) so
+      reading `write` last always reflects what the earlier reads saw. Both
+      fixes are test-only (`internal/wal/stripe_append_test.go`,
+      `internal/wal/drain_safety_stress_test.go`); no production code changed.
+      Design doc
+      `docs/design/0107-0011-wal-drain-invariant-test-scheduling-artifact.md`
+      + README index. Deferral ledger: 1 resolved row (this fix) + narrowed
+      the still-open row (`cmd/goopg`/`internal/amcheck`/`internal/mvcc` only,
+      `internal/wal` removed). Gates: `go build ./...`/`go vet
+      ./internal/wal/` clean; both fixed tests 10/10 PASS under the identical
+      contention setup that reproduced the pre-fix failures; `go test -race
+      -count=1 ./internal/wal/...` clean; `go test ./internal/wal/...
+      ./internal/mvcc/...` clean (quiet host); `scripts/tpch-spotcheck.sh`
+      PASS (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke bash
+      scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 workloads).
+- [x] **M-NIGHTLY (run 20260715-010036 triage) — root-caused + fixed the
+      `cmd/goopg`/`internal/amcheck` "units-timeout" mystery: it was a
+      classifier bug in `ci/batch/lib/summarize.py`, not a product hang.**
+      Resume point from the two rows above (`cmd/goopg`/`internal/amcheck`/
+      `internal/mvcc` unconfirmed since 2 prior loops). Confirmed via a real
+      reproduction: ran the FULL units package set through
+      `scripts/goopg-test-run.sh` with the EXACT nightly cgroup config
+      (`GOOPG_MEM_HIGH=6G`, `GOOPG_MEM_MAX=8G`, `GOOPG_MEM_SWAP_MAX=0`,
+      `GOMEMLIMIT=5GiB`, `GOFLAGS=-p=4`) — the same 4 packages
+      (`cmd/goopg`/`internal/amcheck`/`internal/initdb`/`internal/mvcc`) failed
+      identically in just 16.5 minutes (vs. the nightly's 33-minute timeout),
+      confirming genuine resource contention from running ~40 packages
+      concurrently under this memory cap, not a per-package flake — `initdb`
+      had already been proven clean standalone (loop before last), and now
+      reproduces ONLY under the concurrent/capped configuration. Comparing
+      signal types in both the original nightly log and this loop's repro log:
+      `cmd/goopg` and `internal/amcheck` die via a bare `signal: killed` (no
+      SIGQUIT goroutine dump at all, or a truncated one) — an unambiguous
+      cgroup/OOM-style kill, consistent with `ci/design/03-resources-and-
+      parallelism.md` §C's documented "resource-kill → inconclusive"
+      classification rule; `internal/initdb`/`internal/mvcc` instead show a
+      full SIGQUIT dump from Go's own `-timeout` mechanism with no
+      `signal: killed` text (a different, still-ambiguous signature the
+      classifier correctly leaves as an investigate-worthy regression).
+      **Root cause of the misclassification**: `summarize.py`'s
+      `looks_resource_killed(log) and "--- FAIL" not in log` check ran once
+      against the WHOLE combined ~40-package `units`/`race` log, not
+      per-package. Last night's `internal/wal` had one genuine
+      `--- FAIL: TestStripeAppendConcurrentDrainConsistency` (from the row
+      below — already fixed by a later loop the same night) anywhere in that
+      combined log flipped `"--- FAIL" not in log` to `False` for the ENTIRE
+      stage, so the classifier fell through and reported every `FAIL <pkg>`
+      line — including `cmd/goopg`/`internal/amcheck`'s pure resource kills —
+      as a "regression" AI item. **Same bug, opposite direction, also found in
+      the `race` lane**: the ORIGINAL nightly's `race` log had a `signal:
+      killed` (from `cmd/goopg`) and zero `--- FAIL` anywhere, so the whole
+      `race` stage's 3 failing packages (`cmd/goopg`, `internal/access/btree`,
+      `internal/amcheck` — all ~54 min, essentially simultaneous) were
+      swallowed into ONE generic informational "resource kill" notice,
+      silently hiding `internal/access/btree`'s and `internal/amcheck`'s race
+      failures from `action-items.md` entirely (never surfaced as AI items on
+      any prior night). Fixed by adding `split_go_test_pkg_blocks()`
+      (`ci/batch/lib/summarize.py`) — splits a `go test` (non `-v`) log into
+      per-package blocks on `ok`/`FAIL`/`?` summary lines — and reworking the
+      `units`/`race` classification loop to run `looks_resource_killed`/
+      `"--- FAIL"` per package block instead of once over the whole log; the
+      "Resource kills" summary render now also shows the attributed `pkg`.
+      New `ci/batch/lib/test_summarize.py` (stdlib `unittest`, no deps): a
+      synthetic fixture modeled on last night's real log (one real `--- FAIL`
+      package + two pure-`signal:-killed` packages) proves the two classes no
+      longer bleed into each other, plus a pure-resource-kill-only case;
+      cross-checked `split_go_test_pkg_blocks` against BOTH real logs
+      (`ci/logs/20260715-010036/units/go-test.log` and `race/go-test.log`) to
+      confirm the fix's effect on real data before committing. Regenerated
+      `ci/logs/action-items.md` by re-running the real `summarize.py` against
+      last night's already-captured logs (kept — this file is explicitly
+      "regenerated by every nightly batch run", now correctly reflects the
+      fixed classifier); reverted the accidental duplicate append this
+      produced in `ci/logs/history.jsonl` (git checkout — that file is
+      append-only per REAL nightly run, a manual verification invocation must
+      not add a phantom entry). **Newly surfaced, never-before-seen items**
+      (added as open M-NIGHTLY tasks below per the loop rule — NOT
+      investigated this loop, time-boxed): `race/internal/access/btree` and
+      `race/internal/amcheck` both FAIL under `-race` (~54 min each,
+      concurrently with `race/cmd/goopg`'s confirmed resource-kill) — the
+      classifier now correctly leaves them as regressions (their blocks don't
+      contain `signal: killed` individually, so the ambiguous-signature rule
+      applies) rather than silently swallowing them. Gates: `python3
+      ci/batch/lib/test_summarize.py -v` 4/4 PASS; `python3 -m py_compile
+      ci/batch/lib/summarize.py` clean; this is a CI-tooling-only change (no
+      Go/product code touched) but the pgbench smoke still ran per policy —
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh` PASS
+      (0 failed, all 3 workloads, via the pre-commit hook). Design doc
+      `docs/design/root-0027-nightly-classifier-per-package-resource-kill.md`
+      + README index.
+- [x] **M-NIGHTLY `race/internal/access/btree` + `race/internal/amcheck` —
+      root-caused and fixed (both AI-20260715-010036-004/-005).** Both pass
+      standalone (`btree` 23s, `amcheck` 148s) but reliably reproduced their
+      nightly `-timeout` SIGQUIT under the exact nightly cgroup config
+      (`GOOPG_MEM_HIGH=6G MEM_MAX=8G MEM_SWAP_MAX=0 GOMEMLIMIT=5GiB
+      GOFLAGS=-p=4`, `scripts/goopg-test-run.sh`) — both hung inside
+      `internal/amcheck`'s `TestVerifyBtreeEngineSilentOnRealConcurrentContended`
+      (200K inserts/64 writers/64-slot pool), never completing even with a
+      25-minute per-test timeout. Root cause: this test's
+      `buildRealTreeConcurrent` helper
+      (`internal/amcheck/verify_nbtree_realtree_test.go`) still had all 6 of
+      the (long-RESOLVED) M-NIGHTLY AI-20260708-064334-001 investigation's
+      temporary debug-tracing flags permanently enabled
+      (`DebugTraceInserts`/`DebugVerifyFastPathInserts`/`DebugTraceFlushes`/
+      `DebugTraceReloads`/`DebugTraceContentMu`/`DebugTraceBufmap`, plus
+      `pool.DebugValidateCleanEvictions`/`DebugTraceSlotEvents`) — each
+      funnels every pin/unpin/insert of 64 concurrently racing goroutines
+      through shared mutex-guarded logs (full page decodes + serialized
+      map/slice appends), harmless standalone but, combined with `-race`
+      overhead and the nightly's memory/CPU-contended 4-package co-load,
+      serialized this stress test so badly it blew past any reasonable
+      per-package timeout. `internal/access/btree`'s own hang was pure
+      collateral CPU starvation from sharing the box with amcheck's runaway
+      test. Fix: removed all 8 flags/hooks from `buildRealTreeConcurrent`
+      plus the now-permanently-inert `bt.FastPathViolations()`
+      diagnostic-log block. Standalone: the test itself 172.65s→7.05s (24x),
+      full `internal/amcheck` package 148s→11.4s (13x). Re-verified under the
+      exact nightly cgroup config that originally reproduced the hang: both
+      packages now PASS cleanly (`btree` 23.8s, `amcheck` 11.8s). Gates: `go
+      build ./...`/`go vet` clean; `go test`
+      (plain + `-race`) PASS for both packages; `scripts/tpch-spotcheck.sh`
+      PASS (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke bash
+      scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 workloads).
+      Design doc
+      `docs/design/root-0028-amcheck-realtree-stress-debug-instrumentation-cleanup.md`
+      + README index. Deferral ledger row added (the now-unused
+      `Debug*`/`Record*` machinery in `btree.go`/`bufpool.go` was left in
+      place, zero-cost when unset, matching the codebase's existing pattern
+      for resolved investigations — a broader dead-code removal is optional
+      follow-up, not required). `internal/initdb`/`internal/mvcc`'s
+      still-open ambiguous-SIGQUIT `units`-lane items remain open, see the
+      row above.
+- [x] **M-NIGHTLY (run 20260715-010036 triage) — `internal/initdb`/`internal/mvcc`
+      last-open items confirmed resolved (resume point from the item
+      above).** Re-ran the exact nightly `units`-lane repro
+      (`ci/batch/stages/stage-units.sh`'s own command: all 44 non-excluded
+      packages, `GOOPG_MEM_HIGH=6G MEM_MAX=8G MEM_SWAP_MAX=0 GOMEMLIMIT=5GiB
+      GOFLAGS=-p=4`, `scripts/goopg-test-run.sh`, `-timeout 30m`) now that the
+      `amcheck` debug-instrumentation fix above is in place — `internal/initdb`
+      (237.79s) and `internal/mvcc` (1.30s) both PASS cleanly, 0 `FAIL` across
+      the whole run, no `signal: killed`/SIGQUIT/panic anywhere in the log,
+      comfortable margin under the 30-minute nightly budget. Confirms (not
+      merely hypothesizes) that their `AI-20260715-010036-001`/`-002` nightly
+      timeouts were the same collateral resource-starvation class as
+      `cmd/goopg`/`amcheck`'s already-classified resource kills: `amcheck`
+      runs in the (non-`-race`) `units` lane too, as one of the same 44
+      concurrently-scheduled packages, and its pre-fix debug-tracing-bloated
+      stress test (172s standalone) was disproportionately eating the shared
+      6G/8G memory-capped `-p=4` co-load window `initdb`/`mvcc` shared. With
+      that hog removed, the whole lane now finishes with margin to spare. No
+      product code touched this loop. This closes the last open item from the
+      `20260715-010036` nightly triage thread — all 11 `AI-20260715-010036-*`
+      items now resolved. Design doc
+      `docs/design/root-0028-amcheck-realtree-stress-debug-instrumentation-cleanup.md`
+      "Follow-up (2026-07-15)" section + README index row updated. Deferral
+      ledger: new `resolved` row closing the still-open row above. Gates: full
+      44-package nightly-config repro run itself is the verification (0 FAIL);
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh` PASS
+      (0 failed, all 3 workloads; first attempt hit 1 transient pgbench
+      failure out of 11,761 txns — 0.009%, unrelated to this loop's
+      docs/ledger-only diff — retry passed clean, 0 failed across all 3
+      workloads).
+- [x] **M0122-0007 4e follow-up — `catalog.UserCollation` cross-database
+      isolation (M-NIGHTLY queue empty this loop; picked up the "M0110/M0119
+      work order" Current Priority banner's next candidate).** Ran
+      `TestPort_PgDumpConnectionSetup`'s soft DU-002 round-trip probe to find
+      the current per-database-catalog-isolation blocker: restoring a dump
+      into a fresh database failed `collation "builtin_coll" already exists`,
+      because `catalog.InMemory.userCollations` was one flat, dbOid-less
+      `[]*UserCollation` — the same collision shape `ForeignServer`/
+      `UserMapping` already fixed via M0122-0007 4e follow-up 36/37. Applied
+      the identical pattern: `UserCollation` gained a `DBOid uint32` field;
+      `CreateCollation`/`DropCollation`/`RenameCollation`/`SetCollationOwner`/
+      `SetCollationSchema`/`CollationAttrsByName` each gained a trailing
+      `dbOid ...uint32` param (variadic, defaults to `DefaultDBOid` — every
+      pre-existing call site unchanged); new
+      `ListUserCollationsForDBOid`/`PGCollationRowsForDBOid`; new
+      `executor.Context.PgCollationRows` wired through
+      `internal/server/dispatch.go`'s `pgCollationRowLister` +
+      `internal/executor/operators.go`'s `pg_collation` dispatch branch; all 8
+      `CREATE/ALTER/DROP/COMMENT ON COLLATION` call sites in
+      `internal/executor/operators_ddl.go` thread
+      `catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)`. Confirmed fixed via
+      the guard: the round-trip's failure point moved past the collation
+      collision to a later, different object (`type "b_in" already exists`).
+      **Deliberately scoped out (ledger row, resume points recorded):** WAL
+      restart-persistence for collations still hardcodes `DefaultDBOid` (no
+      WAL-record format change this loop); `UserCollationOIDByName`
+      (attcollation shadowing) still searches all databases by bare name,
+      unscoped. New `TestCreateCollationCrossDatabaseIsolation`
+      (`internal/catalog/create_collation_test.go`). Design doc
+      `docs/design/0122-0018-per-database-catalog-namespace.md`'s new
+      "`pg_collation`/`UserCollation` cross-database isolation" section (+
+      updated "Deferred / explicitly out of scope" list) and README index.
+      Gates: `go build ./...`/`go vet ./...` clean; `go test
+      ./internal/catalog/... ./internal/executor/... ./internal/server/...
+      ./internal/initdb/...` PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke bash
+      scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 workloads; first
+      attempt hit 1 transient pgbench failure — 0.009%, 11,364 txns, unrelated
+      to this loop's catalog/executor diff — retry passed clean). Next
+      candidate: the `CREATE TYPE`/pg_type collision the probe now hits, per
+      this same audit pattern.
+- [x] **M0122-0007 4e follow-up — `catalog.domains` cross-database isolation
+      (resume point from the item above: the DU-002 probe's failure point
+      moved to `type "b_in" already exists`, a `CREATE DOMAIN` collision).**
+      Unlike `userCollations`/`ForeignServer`/`UserMapping` (already slices,
+      just needed a DBOid filter field), `catalog.InMemory.domains` is a
+      genuine `map[string]*Domain` keyed purely by lowercase name (no
+      namespace scoping at all) — so the fix folds dbOid into the registry
+      key itself via a new `domainKey(dbOid, name) string` helper.
+      `catalog.Domain` gained a `DBOid uint32` field;
+      `RegisterDomain`/`DropDomain`/`RenameDomain`/`SetDomainOwner`/
+      `SetDomainDefault`/`SetDomainNotNull`/`AddDomainConstraint`/
+      `DropDomainConstraint`/`RenameDomainConstraint` each gained a trailing
+      `dbOid ...uint32` param (variadic, defaults to `DefaultDBOid` — every
+      pre-existing call site, including all catalog-package tests, unchanged);
+      `catalog.Catalog.LookupDomain` (interface method) too. All 9 write call
+      sites in `internal/executor/operators_ddl.go`
+      (`execCreateDomain`/`execAlterDomain`/`execDropDomain`/`execCommentOn`'s
+      domain branch) thread `o.ctx.CurrentDatabaseOid`; `DropDomain`'s own
+      3 internal `c.ns(DefaultDBOid)` dependent-table-scan calls also switched
+      to `c.ns(oid)` (contained correctness fix, same function). 2 cheap,
+      high-value `LookupDomain` read call sites with `ctx` already in scope
+      also threaded (`internal/executor/expr.go`'s CHECK-on-CAST enforcement,
+      `internal/executor/operators_fk.go`'s `checkDomainConstraintsForRow`).
+      **Deliberately scoped out (ledger row, resume points recorded):** WAL
+      restart-persistence still hardcodes `DefaultDBOid` (mirrors the
+      collations gap); ~7 remaining `LookupDomain` read call sites
+      (`userTypeOIDForName`, `resolveUserTypeOID`, `buildUserPGAttributeRow`,
+      `buildUserPGAttributeRowForCompositeField`, `foldPgCollationFor`) and
+      `ResolveColumnType`/`resolveColumnTypeLocked` (used by `execCreateTable`/
+      `canonicalTypeClass`) stay on a new global-by-name-scan fallback
+      (`lookupDomainByNameLocked`) rather than being threaded — domains have a
+      much wider read-path surface than collations (CAST evaluation, FK/CHECK
+      enforcement, `pg_attribute` row building) so full threading risked scope
+      explosion or an unsafe partial thread; `execDropDomain`'s
+      `deleteTypeFromCatalogHeap` call still hardcodes `catalog.DefaultDBOid`
+      (pre-existing, mirrors `execDropType`). **Gate-failure lesson recorded
+      in the design doc:** the first implementation pass changed the map key
+      format but missed `ResolveColumnType`/`resolveColumnTypeLocked`'s direct
+      `c.domains[k]` accesses, silently breaking domain column type
+      resolution (4 test failures with non-obvious symptoms) until every
+      direct map access in the file was audited. Confirmed fixed via the
+      guard: the round-trip's failure point moved past the domain collision to
+      an unrelated parser gap (`CREATE DOMAIN public.f8_in AS double
+      precision` — multi-word base type name not accepted by the grammar at
+      that position), a different mechanism than this per-database-catalog-
+      namespace epic. New `TestCreateDomainCrossDatabaseIsolation`
+      (`internal/catalog/create_domain_test.go`). Design doc
+      `docs/design/0122-0018-per-database-catalog-namespace.md`'s new
+      "`catalog.domains` cross-database isolation" section (+ updated
+      "Deferred / explicitly out of scope" list) and README index. Gates:
+      `go build ./...`/`go vet ./...` clean; `go test ./internal/catalog/...
+      ./internal/executor/... ./internal/planner/...` PASS; `go test -short`
+      full repo (excl. testport, per policy) PASS; `scripts/tpch-spotcheck.sh`
+      PASS (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke bash
+      scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 workloads; first
+      attempt hit 1 transient pgbench failure — 0.007%, 14,582 txns, unrelated
+      to this loop's catalog/executor diff — retry passed clean). Next
+      candidate: the `CREATE DOMAIN ... AS double precision` parser gap the
+      probe now hits — a grammar fix, not another sibling-map audit.
+- [x] **M0122-0007 4e follow-up — `CREATE DOMAIN`'s `AS` base_type now accepts
+      multi-word built-in type names (resume point from the item above: the
+      DU-002 probe hit a parser syntax error on `CREATE DOMAIN public.f8_in AS
+      double precision`).** `parseCreateDomain` used bare `parseObjectName()`
+      for the base type, which only handles `schema.name` — it never consumed
+      the trailing keywords of PG's multi-word type spellings. `parseColumnType`
+      (CREATE TABLE's column-type grammar) already had this logic
+      (`double precision`→`float8`, `character/bit varying`→`varchar`/
+      `varbit`, `timestamp`/`time [with|without time zone]`, plus the
+      typmod-trailing `time(N) with time zone` form), so it was factored into
+      two shared helpers — `parser.parseMultiWordTypeName` (pre-typmod-args
+      keywords) and `parser.parseTimeZoneQualifierAfterArgs` (post-typmod-args
+      `time(N)`/`timestamp(N) with/without time zone`) — and `parseCreateDomain`
+      now calls both (only when the base type isn't schema-qualified, mirroring
+      `parseColumnType`'s own schema-qualified branch). `parseColumnType`'s own
+      behavior is unchanged. New tests: 8 multi-word cases appended to
+      `TestM0097_0017_EnumDomainParsing` + new
+      `TestCreateDomainMultiWordBaseType` asserting `BaseType`/`BaseTypeArgs`
+      for each form incl. an array suffix (`internal/parser/m0097_0017_test.go`).
+      Confirmed via the DU-002 probe: it now parses the `double precision`
+      domain and moves past it to a *different*, already-logged-as-expected
+      failure (`type "gtype" already exists` — a `CREATE TYPE` cross-database
+      catalog-isolation gap, same collision class as the domains/userCollations
+      fixes above but for `CREATE TYPE`'s user-defined-type registry; not
+      investigated this loop, recorded as the next candidate in the ledger).
+      Design doc `docs/design/0097-0017-0001-enum-domain-types.md`'s new
+      "Follow-up (2026-07-15)" section + README index row updated (this is a
+      parser-grammar fix, a different mechanism from the
+      per-database-catalog-namespace epic in doc 0122-0018, so it landed in
+      the original CREATE DOMAIN grammar doc instead). Gates: `go build
+      ./...`/`go vet ./...` clean; `go test ./internal/parser/...
+      ./internal/catalog/... ./internal/executor/... ./internal/wal/...
+      ./internal/initdb/...` PASS; `go test -short` full repo (excl. testport,
+      52 packages) PASS, 0 FAIL; `go test -v -run
+      '^TestPort_PgDumpConnectionSetup$' ./internal/testport/` PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh` PASS
+      (0 failed, all 3 workloads). Next candidate: `catalog.InMemory`'s
+      user-defined-type registry (`CREATE TYPE ... AS ENUM`/`AS (...)`) likely
+      needs the same DBOid-fold-into-key treatment as `domains`/
+      `userCollations` — audit its map shape first.
+- [x] **M0122-0007 4e follow-up — `catalog.enumTypes` (`CREATE TYPE ... AS
+      ENUM`) cross-database isolation (resume point from the item above).**
+      `catalog.InMemory.enumTypes` was one flat, dbOid-less
+      `map[string]*EnumType` keyed by bare case-insensitive name — the same
+      collision shape `domains`/`userCollations` already fixed. Applied the
+      identical pattern: `EnumType` gained a `DBOid uint32` field; new
+      `enumKey(dbOid, name)` (mirrors `domainKey`) folds dbOid into the
+      `c.enumTypes` registry key. `RegisterEnum`/`RenameEnum`/
+      `RenameEnumValue`/`SetEnumOwner`/`AddEnumValue`/`AddEnumValueResult`/
+      `RemoveEnumValue`/`DropEnum` each gained a trailing variadic
+      `dbOid ...uint32`; `LookupEnum` (also on the `catalog.Catalog`
+      interface) gained the variadic `dbOid`, falling back to a global
+      by-name scan (`lookupEnumByNameLocked`, mirrors
+      `lookupDomainByNameLocked`) when omitted. All 7 write-path call sites
+      in `internal/executor/operators_ddl.go` and the 3 ROLLBACK-undo call
+      sites in `internal/executor/operators_tx.go`
+      (`undoEnumDDLFromContext`) thread `ctx.CurrentDatabaseOid`.
+      **Sibling-path catch:** `internal/server/dispatch.go` has a second,
+      independent copy of the same rollback-undo logic
+      (`undoEnumDDLForRollback`, called from the simple-query dispatch
+      path's explicit ROLLBACK/failed-COMMIT/SSI-abort/two-phase-abort/
+      connection-teardown branches — 7 call sites across
+      `dispatch.go`/`server.go`/`twophase.go`) that was NOT threaded by the
+      `executor`-package fix alone; this surfaced immediately as two real
+      test failures
+      (`TestSimpleQueryMidBatchBeginUndoesEarlierAutocommitCreateType`/
+      `...AddValue`) — the enum survived its own ROLLBACK because the drop
+      resolved to `DefaultDBOid` while the create used the connection's raw
+      (possibly `0` in embedded/test contexts) `ctx.CurrentDatabaseOid`.
+      Fixed by adding a `dbOid uint32` param to `undoEnumDDLForRollback` and
+      threading it: 5 `dispatch.go` sites + `twophase.go`'s
+      `abortForPrepareSSIFailure` use their in-scope
+      `ctx.CurrentDatabaseOid`; `server.go`'s connection-teardown path (no
+      `ctx` in scope) resolves it via the pre-existing `resolveConnDBOid`
+      helper from `connTx.DBName` (the same resolution
+      `wireExtensionRows` uses to stamp `ctx.CurrentDatabaseOid`
+      originally, so both paths agree). New
+      `TestCreateEnumCrossDatabaseIsolation`
+      (`internal/catalog/create_enum_test.go`), mirroring
+      `TestCreateDomainCrossDatabaseIsolation`. Confirmed via the DU-002
+      probe: the round-trip's failure point moved past `type "gtype" already
+      exists` to an unrelated parser gap (`DEFAULT 'na'::character varying`
+      — a multi-word type name as a CAST target inside a DEFAULT expression,
+      a different grammar production from the `AS`-clause base-type fix two
+      items above). Design doc
+      `docs/design/0097-0017-0001-enum-domain-types.md`'s new "Follow-up
+      (2026-07-15, later loop)" section + README index row updated. Gates:
+      `go build ./...`/`go vet ./...` clean; `go test ./internal/catalog/...
+      ./internal/executor/... ./internal/server/... ./internal/planner/...`
+      PASS; `go test -short` full repo (excl. testport, per policy) PASS, 0
+      FAIL; `go test -v -run '^TestPort_PgDumpConnectionSetup$'
+      ./internal/testport/` PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke bash
+      scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 workloads).
+      Next candidate: composite types (`c.compositeTypes`/
+      `compositeTypeNames`) are very likely the same still-unscoped
+      collision shape — the last unaudited sibling map in this series.
+
+- [x] **M0122-0007 4e follow-up — `catalog.compositeTypes` (`CREATE TYPE
+      ... AS (...)`) cross-database isolation (resume point from the item
+      above — the last unaudited sibling map in this series).**
+      `catalog.InMemory.compositeTypes`/`compositeTypeNames`/
+      `compositeTypeFields` were three flat, dbOid-less maps keyed by bare
+      case-insensitive name — the same collision shape `domains`/
+      `userCollations`/`enumTypes` already fixed. Applied the identical
+      pattern: `CompositeType` gained a `DBOid uint32` field; new
+      `compositeKey(dbOid, name)` (mirrors `enumKey`/`domainKey`) folds
+      dbOid into all three registry keys. `RegisterCompositeType`/
+      `RegisterCompositeTypeWithFields`/`RenameCompositeType`/
+      `SetCompositeTypeOwner`/`DropCompositeType`/`HasCompositeType` each
+      gained a trailing variadic `dbOid ...uint32`; `LookupCompositeType`/
+      `LookupCompositeTypeFields` (also on the `catalog.Catalog` interface)
+      gained the variadic `dbOid`, falling back to a global by-name scan
+      (`lookupCompositeTypeByNameLocked`, mirrors `lookupEnumByNameLocked`)
+      when omitted. Every composite write-path call site in
+      `internal/executor/operators_ddl.go` (`execCreateType`'s composite
+      branch, `execAlterType`'s ADD/RENAME/DROP/ALTER ATTRIBUTE/RENAME TO/
+      OWNER TO branches, `execAlterTypeAttrCmds`'s multi-subcommand form,
+      `execDropType`'s composite branch) threads `o.ctx.CurrentDatabaseOid`.
+      **Applied the enum follow-up's sibling-path lesson proactively this
+      time:** grepped `internal/executor/operators_tx.go` and
+      `internal/server/dispatch.go` up front for the second, independent
+      ROLLBACK-undo copy (`undoEnumDDLFromContext`/`undoEnumDDLForRollback`)
+      before running any tests, and threaded both `PendingCreatedComposites`
+      drop calls in the same edit pass — `undoEnumDDLForRollback` already
+      took a `dbOid` param from the enum fix, so only its
+      `DropCompositeType` call needed the argument added. This still caught
+      one genuine regression via the full targeted test run: the
+      pre-existing `internal/executor/operators_tx_composite_test.go` built
+      a bare `&Context{}` with no `CurrentDatabaseOid` set (zero value),
+      while its `RegisterCompositeTypeWithFields` calls omitted `dbOid`
+      (resolving to `DefaultDBOid` via the empty-variadic fallback) — a
+      test-fixture inconsistency, not a product bug, fixed by setting
+      `ctx.CurrentDatabaseOid: catalog.DefaultDBOid` and passing
+      `catalog.DefaultDBOid` explicitly in both test functions. New
+      `TestCreateCompositeTypeCrossDatabaseIsolation`
+      (`internal/catalog/create_composite_type_test.go`), mirroring
+      `TestCreateEnumCrossDatabaseIsolation`. Design doc
+      `docs/design/0097-0017-0001-enum-domain-types.md`'s new "Follow-up
+      (2026-07-15, third loop)" section + README index row updated. Gates:
+      `go build ./...`/`go vet ./...` clean; `go test -count=1
+      ./internal/catalog/... ./internal/executor/... ./internal/server/...
+      ./internal/planner/...` PASS; `go test -short` full repo (excl.
+      testport, per policy) PASS, 0 FAIL; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke bash
+      scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 workloads,
+      after one confirmed-flaky retry unrelated to this change). While
+      auditing this loop's scope, confirmed `catalog.RangeType` (`CREATE
+      TYPE ... AS RANGE`) is **not** dbOid-scoped at all (no `DBOid` field,
+      no dbOid-taking methods) — recorded as the next real candidate in the
+      deferral ledger rather than assumed already done.
+- [x] **M0122-0007 4e follow-up — `catalog.RangeType` (`CREATE TYPE ... AS
+      RANGE`) cross-database isolation (resume point (4) from the composite
+      item above; closes the last unaudited object kind in this series).**
+      `RangeType` had no dbOid scoping at all — no `DBOid` field, and
+      `RegisterRangeType`/`RenameRangeType`/`SetRangeTypeOwner`/
+      `DropRangeType`/`LookupRangeType` took no dbOid parameter whatsoever,
+      unlike `domains`/`userCollations`/`enumTypes`/`compositeTypes`, which
+      at least had a bare-name-keyed map before their fixes. Applied the
+      identical `compositeKey`/`compositeTypes` pattern: `RangeType` gained a
+      `DBOid uint32` field; new `rangeKey(dbOid, name)` (mirrors
+      `compositeKey`/`enumKey`/`domainKey`) folds dbOid into `c.rangeTypes`'s
+      registry key. `RegisterRangeType`/`RenameRangeType`/
+      `SetRangeTypeOwner`/`DropRangeType` each gained a trailing variadic
+      `dbOid ...uint32`; `LookupRangeType` (also on the `catalog.Catalog`
+      interface) gained the variadic `dbOid`, falling back to a global
+      by-name scan (`lookupRangeTypeByNameLocked`, mirrors
+      `lookupCompositeTypeByNameLocked`) when omitted. Every range-type
+      write-path call site in `internal/executor/operators_ddl.go`
+      (`execCreateType`'s `AS RANGE` branch, `execAlterType`'s RENAME TO/
+      OWNER TO range-dispatch guards, `execDropType`'s range branch) threads
+      `o.ctx.CurrentDatabaseOid`. Grepped `internal/executor/operators_tx.go`
+      and `internal/server/dispatch.go` up front for a range-type
+      ROLLBACK-undo sibling before running any tests (this series' own
+      lesson) and confirmed there is none — `CREATE TYPE ... AS RANGE` has no
+      rollback-undo tracking at all today, a pre-existing gap orthogonal to
+      this fix. `RegisterRangeTypeDuringRecovery` now explicitly stamps
+      `DBOid = DefaultDBOid` and keys via `rangeKey(DefaultDBOid, rt.Name)`,
+      matching `RegisterDomainDuringRecovery`'s identical pattern (WAL replay
+      still carries no dbOid for range-type records, so every replayed range
+      type lands under `DefaultDBOid` — recorded as the still-open resume
+      point (1), same as domains/enums/composites).
+      `RenameRangeTypeDuringRecovery`/`SetRangeTypeOwnerDuringRecovery`/
+      `DropRangeTypeDuringRecovery` needed no change (they delegate to the
+      now-variadic live functions with no dbOid argument, defaulting to
+      `DefaultDBOid`). New `TestCreateRangeTypeCrossDatabaseIsolation`
+      (`internal/catalog/create_range_type_test.go`), mirroring
+      `TestCreateCompositeTypeCrossDatabaseIsolation`. Design doc
+      `docs/design/0097-0017-0001-enum-domain-types.md`'s new "Follow-up
+      (2026-07-15, fourth loop)" section + README index row updated. Gates:
+      `go build ./...`/`go vet ./...` clean (repo-wide); `go test -count=1
+      ./internal/catalog/... ./internal/executor/... ./internal/server/...
+      ./internal/planner/... ./internal/initdb/... ./internal/wal/...` PASS;
+      `go test -short` full repo (excl. testport, per policy) PASS, 0 FAIL
+      (51 packages, `internal/initdb`=240s the long pole);
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh` PASS
+      (0 failed, all 3 workloads). This closes the M0122-0007 4e type-
+      isolation audit's sibling-map sweep: domains, userCollations,
+      enumTypes, compositeTypes, and rangeTypes are all now dbOid-isolated.
+- [x] **M0122-0007 4e follow-up — range-type ROLLBACK-undo tracking (resume
+      point (4) from the range-type isolation item above; closes it).**
+      `CREATE TYPE ... AS RANGE` had NO rollback-undo tracking at all — a
+      real correctness gap: `BEGIN; CREATE TYPE ival AS RANGE (subtype =
+      int4); ROLLBACK;` left `ival` registered in the catalog after the
+      abort, unlike its enum (`PendingCreatedEnums`) and composite
+      (`PendingCreatedComposites`) siblings which both drop their
+      in-transaction creations via `undoEnumDDLFromContext`. Fixed by
+      mirroring `PendingCreatedComposites` exactly: new
+      `Context.PendingCreatedRangeTypes map[string]bool`
+      (`internal/executor/context.go`); `execCreateType`'s `AS RANGE` branch
+      records the created name when `o.ctx.Session.TracksDDLUndo()`
+      (`internal/executor/operators_ddl.go`); `undoEnumDDLFromContext` gained
+      a Step 5 dropping every pending range type via
+      `DropRangeType(name, ctx.CurrentDatabaseOid)`
+      (`internal/executor/operators_tx.go`); `execCommit` clears the field
+      alongside its siblings. Also fixed the independent twin path in
+      `internal/server` — found by this series' own "grep before touching"
+      discipline, not initially planned for: `connTxState` gained the same
+      field (`conn_tx.go`: struct decl + `End()`/`DetachPrepared` reset +
+      copy sites); `dispatch.go`'s ectx↔connTx write-back pair in
+      `executeOneSimpleStmt`, `undoEnumDDLForRollback`'s new Step 5, and 6
+      `ctx.PendingCreatedComposites = nil`-adjacent reset sites across
+      ROLLBACK/COMMIT-failure branches; `twophase.go`'s 2 reset sites plus
+      the prepared-xact-holder retarget in `execFinalizePrepared` — without
+      this twin the fix would have silently worked only for the
+      extended-query explicit-transaction path, not simple-query autocommit
+      batches or 2PC (`pattern_sibling_paths_must_agree`). New
+      `internal/executor/operators_tx_range_type_test.go`
+      (`TestUndoRangeTypeDDLOnRollback`/`TestUndoRangeTypeDDLCaseInsensitive`),
+      mirroring `operators_tx_composite_test.go`. Scope note: `ALTER TYPE ...
+      RENAME TO` still has no rename-undo tracking for range types (nor for
+      composite types — a pre-existing, deliberate scope match, not a new
+      gap); recorded in the deferral ledger. Design doc
+      `docs/design/0097-0017-0001-enum-domain-types.md`'s new "Follow-up
+      (2026-07-15, fifth loop)" section + README index row updated. Gates:
+      `go build ./...`/`go vet ./...` clean (repo-wide); `go test -count=1
+      ./internal/catalog/... ./internal/executor/... ./internal/server/...
+      ./internal/planner/... ./internal/initdb/... ./internal/wal/...` PASS;
+      `go test -short` full repo (excl. testport) — 2 unrelated flaky
+      failures on first pass (`internal/wal`'s
+      `TestReserveEmittedAndPublishConcurrentChainAndStripePublishConsistent`,
+      `internal/stats`'s `TestCounter_PerShardWriteDistribution`, both
+      timing/scheduling-sensitive and untouched by this diff), both PASS
+      clean in isolated re-runs (3x for the stats one); `scripts/tpch-
+      spotcheck.sh` PASS (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke bash
+      scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 workloads).
+
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 
 M0117 (CLOG ↔ PostgreSQL subsystem alignment), M0118 (Upstream Isolation Spec
@@ -3168,6 +4488,424 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       `TestPort_IsolationEvalPlanQual`/`TestPort_IsolationEvalPlanQualTrigger` PASS;
       `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0 failed,
       all 3 workloads).
+      **2026-07-15 slice (parser-level, not catalog-level — FIXED, resume point
+      from the M0122-0007 4e cross-database type-isolation series' closure):**
+      the DU-002 probe advanced from `collation "builtin_coll" already exists`
+      (fixed by that series) to a NEW blocker:
+      `CREATE DOMAIN ... DEFAULT 'na'::character varying;` failed a parser
+      syntax error (`expected ';' or end of input (got varying)`) — a genuine
+      SQL-engine gap, not catalog-isolation. Root cause:
+      `parseTypeNameAfterCast` (`internal/parser/select.go`), the shared
+      type-name parser for both `x::typename` and `CAST(x AS typename)`,
+      consumed only a single identifier/keyword and never called the existing
+      `parseMultiWordTypeName` helper (`internal/parser/ddl.go`) that
+      `parseColumnType`/`parseCreateDomain`'s `AS` clause already use — so
+      multi-word built-in type names (`character varying`, `double precision`,
+      `bit varying`, `timestamp/time [with|without time zone]`) failed as CAST
+      targets even though they already worked as column/domain base types.
+      Fixed by calling `p.parseMultiWordTypeName(first)` in the
+      non-schema-qualified branch of `parseTypeNameAfterCast`, which both CAST
+      entry points (`parseCastTail`/`parseCastFuncExpr`) funnel through. New
+      `TestParseCastMultiWordTypeName`/`TestParseCastSchemaQualifiedNotMultiWord`
+      (`internal/parser/cast_test.go`, 10 cases). Guard now advances past this
+      gap to the next blocker: `CREATE FUNCTION public.add_calcdef(integer)`
+      restore into a second database fails `function already exists with the
+      same argument types` — the same cross-database catalog-collision shape
+      the M0122-0007 4e series already fixed 5 times for
+      domains/collations/enums/composites/ranges, not yet applied to
+      function/routine registration (deferral ledger row, open — next DU-002
+      resume point). Also deferred: `time(N)`/`timestamp(N)` CAST targets with
+      BOTH an explicit typmod AND a trailing timezone qualifier
+      (`x::timestamp(3) with time zone`) are not yet routed through
+      `parseTimeZoneQualifierAfterArgs` the way `parseCreateDomain`'s
+      post-typmod handling is — untested, likely still fails, but pg_dump's
+      own DEFAULT-expression rendering doesn't hit it (deferral ledger row).
+      Gates: `go build ./...`/`go vet ./...` clean repo-wide; `go test
+      ./internal/parser/...` PASS (new + existing cast tests); `go test -short`
+      full repo excl. testport (51 packages) PASS, 0 FAIL; `go test -run
+      'TestParseCast|TestPort_PgDumpConnectionSetup|TestPort_RegressSuite'
+      ./internal/parser/... ./internal/testport/...` PASS (confirms no
+      regression in the regress-port suite, which exercises CAST syntax
+      broadly); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh` PASS
+      (0 failed, all 3 workloads; first attempt hit 1 transient pgbench
+      failure out of 11,210 txns — 0.009%, matches the previously-documented
+      unrelated flake pattern — retry passed clean, 0 failed across all 3
+      workloads).
+      **2026-07-15 slice (catalog-level, `catalog.Routines` cross-database
+      collision — FIXED, resume point from the CAST multi-word-type-name
+      slice above):** the DU-002 probe advanced from
+      `CREATE FUNCTION public.add_calcdef(integer)` restoring into a second
+      database with `function already exists with the same argument types`
+      to a NEW blocker. Root cause: `catalog.Routines` (the function/
+      procedure registry) had no dbOid concept at all — every routine shared
+      one flat `schema.name(sig)` key process-wide, the same collision shape
+      the M0122-0007 4e series already fixed for domains/userCollations/
+      enumTypes/compositeTypes/rangeTypes. Fixed by giving `catalog.Routine`
+      a `DBOid uint32` field and folding it into the registry key
+      (`routineDBPrefix(dbOid)+schema.name(sig)`, mirroring `domainKey`/
+      `enumKey`/`compositeKey`/`rangeKey`); `Lookup`/`LookupByName`/`Drop`/
+      `DropByName`/`ResolveByName`/`ResolveBySig`/`LookupDropCandidates`
+      gained a trailing variadic `dbOid ...uint32`; `DropRoutine`/
+      `RenameRoutine`/`SetSchema` needed no signature change (they already
+      take a `*Routine` and read `r.DBOid` directly). Threaded
+      `catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)` through every
+      CREATE/ALTER/DROP FUNCTION/PROCEDURE + COMMENT ON FUNCTION + DROP
+      SCHEMA CASCADE call site in `operators_ddl.go` (all `ddlOp` methods,
+      purely mechanical, no signature-cascading helpers needed touching).
+      New `internal/catalog/routines_dbid_isolation_test.go`
+      (`TestRoutinesCrossDatabaseIsolation`). Guard now advances past the
+      collision to a NEW, unrelated bug: `procedure proc_out(integer,
+      integer) does not exist` on an ALTER/COMMENT-shaped restore statement —
+      root-caused (not fixed) to `execAlterFunction`'s arg-type stub never
+      populating `ArgModes`, so `Signature()` (OUT-excluding) mismatches the
+      stored routine's own OUT-excluding signature against the ALTER
+      statement's full IN+OUT arg list. Deliberately deferred (see the
+      2026-07-15 ledger row): 5 signature-cascading DDL-support helpers
+      (access-method/FDW-handler/FDW-validator/event-trigger/conversion
+      function resolution) with no `ctx` in scope, every cross-file read
+      call site (`grant_ddl.go`, `plpgsql_runtime.go`, `operators_call.go`,
+      `expr.go`, `operators_trigger.go`, `operators_join_agg.go`,
+      `planner.go`, `pg18_user_catalog_rows.go`), `Routines.List()`'s
+      pg_proc/information_schema.routines row-scoping, and
+      `DropRoutinesReferencingTypes`'s temp-cleanup cascade. Gates: `go
+      build ./...`/`go vet ./...` clean repo-wide; `go test
+      ./internal/catalog/... ./internal/executor/...` PASS; `go test -short
+      $(go list ./... | grep -v /internal/testport)` (full repo, short mode)
+      PASS 0 FAIL; `go test -v -run '^TestPort_PgDumpConnectionSetup$'
+      ./internal/testport/` PASS (soft-log advances to the new blocker);
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh`
+      PASS (0 failed, all 3 workloads, confirmed twice).
+      **2026-07-15 slice (OUT-parameter ALTER/DROP/COMMENT FUNCTION
+      signature-matching bug — FIXED, resume point (5) from the slice
+      above):** `execAlterFunction`/`execDropFunction` (pre-check + CASCADE
+      target + deferred/autocommit `ResolveBySig`)/`execCommentOn`'s
+      "function" case/`execCreateFunction`'s `ErrRoutineKindChange` DETAIL
+      lookup all rebuilt an `argTypes`-only stub (no `ArgModes`) before
+      calling `Lookup`/`ResolveBySig`, so `Routine.Signature()` treated
+      every arg as IN and couldn't exclude OUT params like the stored
+      routine's real signature does — confirmed against upstream
+      `ruleutils.c print_function_arguments`/`parse_func.c
+      LookupFuncWithArgs` that ALTER/DROP/COMMENT restatements legitimately
+      carry the full IN+OUT arg list (pg_get_function_identity_arguments
+      still prints OUT params) while the *lookup* itself is input-only
+      (matches `Signature()`'s existing OUT-exclusion contract). Added
+      `catalog.Routines.LookupWithArgModes`/`ResolveBySigWithArgModes`
+      (`Lookup`/`ResolveBySig` now thin wrappers delegating with `nil`
+      argModes — zero blast radius for the ~20 existing non-OUT-param
+      callers) plus `internal/executor/operators_call.go`'s
+      `funcArgModes([]parser.FunctionArg) []string` helper, wired at all 6
+      rebuilt-stub call sites in `operators_ddl.go`. Also fixed the DROP
+      SCHEMA CASCADE routine-collection loop's `rs.Drop(name, r.ArgTypes,
+      dropDBOid)` (same bug shape, error silently swallowed via `_ =`) by
+      switching to `rs.DropRoutine(r)` (r is already the live routine, no
+      stub rebuild needed). Confirmed via the DU-002 probe: advanced past
+      `procedure proc_out(integer, integer) does not exist` to a NEW,
+      unrelated bug (`function sum_variadic(integer) does not exist` on a
+      VARIADIC-array function restore — root-caused, not fixed; full trace
+      + resume point in the 2026-07-15 ledger row). Gates: `go build
+      ./...`/`go vet ./...` clean repo-wide; `go test ./internal/catalog/...
+      ./internal/executor/...` PASS; `go test -v -run
+      '^TestPort_PgDumpConnectionSetup$' ./internal/testport/` PASS
+      (soft-log confirms the advance).
+      **2026-07-15 slice (VARIADIC-array ALTER/DROP/COMMENT FUNCTION
+      signature-matching bug — FIXED, resume point from the slice above):**
+      NOT a parser/storage/render bug — `pg_get_function_identity_arguments`
+      already returned `VARIADIC arr integer[]` correctly before this fix.
+      Root cause: `execCreateFunction`/`execCreateProcedure` bake the `[]`
+      array suffix directly into `Routine.ArgTypes[i].Name` (e.g.
+      `"integer[]"`) rather than via `catalog.Type.IsArray`, which
+      `Routine.Signature()` never reads at all — but all 7 ALTER/DROP/COMMENT
+      rebuilt-stub call sites (the prior slice's 6, plus a 7th inside
+      `execDropFunction`'s actual deferred/autocommit resolve path missed by
+      that slice's single-line grep because it spans multiple lines with an
+      `Args:` field) built `catalog.Type{Name: strings.ToLower(a.Type.Name)}`
+      with no `[]` suffix, so an array-typed ALTER/DROP/COMMENT argument
+      could never match the stored signature. Added
+      `internal/executor/operators_call.go`'s `routineArgTypeName(t
+      parser.ColumnType) string` as the single source of truth for the
+      "`[]`-baked-into-Name" convention, wired at all 7 sites plus
+      `execCreateFunction`/`execCreateProcedure`'s own inline duplicate.
+      Verified live: `ALTER FUNCTION sum_variadic(VARIADIC integer[]) OWNER
+      TO postgres`, `COMMENT ON FUNCTION sum_variadic(VARIADIC integer[])
+      IS '...'`, `DROP FUNCTION sum_variadic(VARIADIC integer[])` all now
+      succeed. DU-002 probe now advances past the VARIADIC-array blocker
+      entirely to the ALREADY-DOCUMENTED per-database catalog-namespace gap
+      (2026-07-06 ledger row + the test's own inline comment,
+      `pgdump_connsetup_test.go:11800-11820`) — a milestone-scale rewrite,
+      not a further bounded per-statement fix; DU-002's function/routine
+      signature-matching sub-series is now exhausted. Also newly discovered
+      (recorded in ledger, not fixed): `sum_variadic(1,2,3)` CALL fails
+      `function sum_variadic does not exist` — VARIADIC call-site N-args
+      collapse-to-array matching was never implemented (a distinct, larger
+      feature from DDL identity resolution). Gates: `go build ./...`/`go vet
+      ./...` clean repo-wide; `go test ./internal/catalog/...
+      ./internal/executor/... ./internal/parser/...` PASS; `go test -short
+      $(go list ./... | grep -v /internal/testport)` (full repo, short mode)
+      PASS 0 FAIL; `go test -v -run '^TestPort_PgDumpConnectionSetup$'
+      ./internal/testport/` PASS (soft-log confirms the advance to the known
+      cross-database gap); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh`
+      PASS (1 transient unrelated abort under concurrent TPC-B load on run 1
+      of 3, zero code-path overlap with this change; runs 2/3 both clean,
+      confirmed pre-existing flake).
+- [x] **M0119-0004 (DU-002 follow-up) — VARIADIC function call-site
+      argument collapsing FIXED** (resume point: the "also newly discovered"
+      note in the slice above). `SELECT sum_variadic(1, 2, 3)` against
+      `CREATE FUNCTION sum_variadic(VARIADIC arr integer[]) ...` failed
+      `function ... does not exist` — a materially different mechanism from
+      the sibling ALTER/DROP/COMMENT signature fix above (call resolution,
+      not DDL identity resolution). Root cause:
+      `resolveRoutineOverload` (`internal/executor/plpgsql_runtime.go`, the
+      sole call-resolution path for `evalStoredRoutineFuncCall`, used by
+      every expression-context user-defined-function invocation) required
+      an exact `len(c.ArgTypes) == len(args)` match with zero VARIADIC
+      awareness — unlike `internal/executor/operators_call.go`'s
+      `callOp.Open` (the `CALL <procedure>(...)` statement path), which
+      already implements VARIADIC-aware count matching + array bundling
+      (M0097-0022); `CALL` and a `SELECT`-invoked function resolve through
+      two entirely separate code paths, and only `CALL` had ever received
+      VARIADIC support. Fix: new `callArgTypesForCandidate` (accepts any
+      `n >= variadicPos` argument count when the routine's last parameter
+      mode is `"v"`, type-checking excess positions against the VARIADIC
+      parameter's element type — its declared array type name with the
+      trailing `"[]"` stripped, since `Routine.ArgTypes[i].Name` bakes the
+      array suffix directly into the string per the sibling fix's storage
+      convention) and `bundleVariadicArgs` (collapses the trailing
+      arguments into one array-valued `Datum` via the existing
+      `buildArrayDatum` helper before dispatch, since every dispatch path —
+      `executeSQLRoutine`, `executePLpgSQLRoutine` — binds `args[i]` to
+      `r.ArgTypes[i]` by direct index with no VARIADIC awareness of its
+      own). Also hardened `evalStoredRoutineFuncCall`'s "use CALL, not
+      SELECT" error-message branch with an `i < len(r.ArgTypes)` index
+      guard, since this change is the first way that branch can be reached
+      with `len(x.Args) > len(r.ArgTypes)`. New
+      `internal/executor/variadic_call_test.go`:
+      `TestVariadicFunctionCallCollapsesArgs` (0/1/3/5-argument calls
+      through a `LANGUAGE plpgsql` VARIADIC function, including the
+      zero-argument `NULL` case matching real PG's
+      `array_length('{}'::int[], 1)` semantics) and
+      `TestVariadicFunctionCallSQLLanguage` (same collapsing behavior
+      through the sibling `LANGUAGE sql` dispatch path). Design doc
+      `docs/design/0119-0004-variadic-call-argument-collapsing.md` + README
+      index (`0119-0004dc`). This closes the last open item from the
+      2026-07-15 VARIADIC-array deferral-ledger row; new ledger row records
+      the resolution. Gates: `go build ./...`/`go vet ./...` clean
+      repo-wide; `go test ./internal/executor/... ./internal/catalog/...
+      ./internal/parser/...` PASS; `go test -short $(go list ./... | grep -v
+      /internal/testport)` (full repo, short mode) 0 FAIL;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh`
+      PASS (0 failed, all 3 workloads).
+- [x] **M0122-0007 4e follow-up — `catalog.accessMethods` cross-database
+      isolation (DU-002 round-trip probe unblock).** Ground-truthed the DU-002
+      probe (`TestPort_PgDumpConnectionSetup`, re-run directly since the last
+      recorded doc/working_set state was stale) to find the current blocker:
+      restoring `CREATE ACCESS METHOD goopg_am ...` into a fresh second
+      database failed `access method "goopg_am" already exists`, because
+      `catalog.InMemory.accessMethods` was one flat, dbOid-less
+      `map[string]*AccessMethod` — the same collision shape `ForeignServer`/
+      `UserMapping`/`UserCollation`/`Domain`/`Routines` already fixed via the
+      M0122-0007 4e series. Applied the identical pattern: `AccessMethod`
+      gained a `DBOid uint32` field; new `accessMethodKey(dbOid, name)`
+      (mirrors `domainKey`/`enumKey`/`compositeKey`/`rangeKey`, no
+      case-folding since the pre-existing code never lowercased AM names);
+      `RegisterAccessMethod`/`DropAccessMethod`/`UserAccessMethodOID` gained a
+      trailing variadic `dbOid ...uint32`; `RegisterAccessMethodDuringRecovery`
+      normalizes a zero `DBOid` to `DefaultDBOid` (WAL record carries no
+      dbOid, startup recovery still single-database). Threaded through all 3
+      live `internal/executor/operators_ddl.go` call sites
+      (`execCreateAccessMethod`, `DROP ACCESS METHOD`, `execCommentOn`'s
+      "access method" case) — all mechanical `ddlOp`-method sites, no
+      signature-cascade exceptions. New
+      `internal/catalog/create_access_method_test.go`
+      (`TestAccessMethodCrossDatabaseIsolation`). Confirmed via the DU-002
+      probe: the round-trip's failure point moved past `access method
+      "goopg_am" already exists` to a NEW, unrelated bug — `operator
+      1(bigint,bigint) already exists in operator family "op_family_loose"` —
+      the operator-family/operator-class registry is the next flat,
+      dbOid-less registry in line (recorded in the ledger, not yet located/
+      fixed). Design doc `docs/design/0122-0018-per-database-catalog-namespace.md`
+      new "Access method registry ... dbOid scoping" section + status line +
+      README index row. Gates: `go build ./...`/`go vet
+      ./internal/catalog/... ./internal/executor/...` clean; `go test
+      ./internal/executor/... ./internal/catalog/... ./internal/parser/...`
+      PASS; `go test -short $(go list ./... | grep -v /internal/testport)`
+      (full repo, short mode) 0 FAIL; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke bash
+      scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 workloads).
+- [x] **M0122-0007 4e follow-up — `catalog.userOperatorFamilies`/
+      `userOperatorClasses` cross-database isolation (DU-002 round-trip probe
+      unblock).** The DU-002 probe's blocker moved past AccessMethod to
+      `operator 1(bigint,bigint) already exists in operator family
+      "op_family_loose"` — restoring `CREATE OPERATOR FAMILY public.
+      op_family_loose USING btree` + a following `ALTER OPERATOR FAMILY ...
+      ADD OPERATOR 1 ...` into a fresh second database collided with the
+      source database's own copy, because `UserOperatorFamily`/
+      `UserOperatorClass` shared one flat, dbOid-less registry (the same
+      collision shape `AccessMethod`/`Domain`/`UserCollation`/... already
+      fixed). Applied the identical pattern: both structs gained a `DBOid
+      uint32` field; `userOpFamilyKey`/`userOpClassKey` fold in a leading
+      `dbOid` (mirrors `accessMethodKey`, no case-folding change);
+      `RegisterUserOperatorFamily`/`LookupUserOperatorFamily`/
+      `DropUserOperatorFamily` and the operator-class trio gained a trailing
+      variadic `dbOid ...uint32`; `RegisterUserOperatorFamilyDuringRecovery`/
+      `RegisterUserOperatorClassDuringRecovery` normalize a zero `DBOid` to
+      `DefaultDBOid` (WAL carries no dbOid). Threaded through all 9 live
+      `internal/executor/operators_ddl.go` call sites (`execDropCompat`'s
+      family+class branches, `execCompatNoop`'s bare `CREATE OPERATOR
+      FAMILY`, `execCreateOpClass`'s explicit-FAMILY lookup + implicit-family
+      registration + `RegisterUserOperatorClass` call,
+      `execAlterOpFamilyAdd`/`execAlterOpFamilyDrop`,
+      `registerOpClassMembers`'s sort-family lookup) via
+      `catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)`. New
+      `internal/catalog/create_operator_family_class_dbscope_test.go`
+      (`TestOperatorFamilyAndClassCrossDatabaseIsolation`).
+      **Recovery note:** the code fix (catalog.go/operators_ddl.go) was
+      implemented and DU-002-probe-verified in an earlier loop, but was
+      committed by a concurrent interactive session under an unrelated
+      commit message (`728457d9 "tool: add fixing table on markdown tool"`,
+      bundled with an unrelated markdown-table-repair tool) with no test
+      coverage or fix_plan/ledger/design-doc bookkeeping — this loop found
+      the code already on `wal-format-mod`'s tip (confirmed byte-identical
+      via `git show 728457d9:internal/catalog/catalog.go` diffed against
+      HEAD) after that session's `git pull --rebase` (which had left the
+      main tree mid-rebase with unresolved conflicts in
+      `internal/wal/xlog_record.go` for part of this loop's duration —
+      deliberately left untouched, not resolved/aborted, since it belonged
+      to that other session) completed on its own between this loop's
+      earlier and later checks. This loop adds the missing test, ledger row,
+      and design-doc section for the code that was already present.
+      Confirmed via the DU-002 probe: the round-trip's failure point moved
+      past `op_family_loose`'s collision to a NEW, unrelated bug — restoring
+      `CREATE OPERATOR CLASS public.op_class_empty FOR TYPE bigint USING
+      btree FAMILY public.op_family AS STORAGE bigint` before `CREATE
+      OPERATOR FAMILY public.op_family USING btree` has run, because a
+      family-less-member (`STORAGE`-only, no `ADD OPERATOR/FUNCTION`)
+      operator class gets no `pg_depend` row against its owning family, so
+      real pg_dump's dependency-based topological sort has no edge to force
+      family-before-class ordering (recorded in the ledger, not yet fixed —
+      likely `internal/catalog/catalog.go`'s `PGDependRowsForDBOid` needs an
+      unconditional NORMAL dependency row per operator class on its family,
+      mirroring PostgreSQL's own `opclasscmds.c` `DefineOpClass`, which
+      records `recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL)`
+      against the family OID unconditionally, not just for members). Design
+      doc `docs/design/0122-0018-per-database-catalog-namespace.md` new
+      "Operator family / operator class registry" section + status line +
+      README index row. Gates: `go build ./...`/`go vet ./...` clean; `go
+      test ./internal/catalog/... ./internal/executor/... ./internal/wal/...
+      ./internal/initdb/...` PASS; `go test -run
+      TestPort_PgDumpConnectionSetup ./internal/testport/` PASS (soft probe,
+      confirms forward progress via `t.Logf`).
+- [x] **M0122-0007 4e follow-up — `catalog.PGDependRowsForDBOid` missing
+      opclass→opfamily `pg_depend` edge (DU-002 round-trip probe unblock,
+      resumes the previous bullet's recorded next step).** Restoring `CREATE
+      OPERATOR CLASS public.op_class_empty FOR TYPE bigint USING btree FAMILY
+      public.op_family AS STORAGE bigint` before `CREATE OPERATOR FAMILY
+      public.op_family USING btree` had run failed `operator family
+      "op_family" does not exist for access method "btree"`, because a
+      member-less (`STORAGE`-only, no `ADD OPERATOR`/`ADD FUNCTION`) operator
+      class got zero `pg_depend` rows against its owning family —
+      `PGDependRowsForDBOid`'s opclass-related rows were all keyed off
+      `c.amOpMembers`/`c.amProcMembers` (AS-list members only). Fix: added an
+      unconditional per-`UserOperatorClass` row (`classid=2616` pg_opclass,
+      `objid=<class OID>`, `refclassid=2753` pg_opfamily,
+      `refobjid=<class.FamilyOID>`, `deptype='a'`) filtered by `oc.DBOid ==
+      dbOid`, mirroring PostgreSQL's `opclasscmds.c` `DefineOpClass` (verified
+      live against `postgres/src/backend/commands/opclasscmds.c:731-735`:
+      `recordDependencyOn(&myself, &referenced, DEPENDENCY_AUTO)` against the
+      opfamily, unconditional regardless of members — deptype is `'a'`
+      (AUTO), NOT `'n'`; the working-set note that carried this resume point
+      guessed NORMAL from memory, corrected here against the live source).
+      Confirmed via a live re-run of `TestPort_PgDumpConnectionSetup`: the
+      DU-002 probe's failure point moved past the family/class ordering
+      collision entirely, to a NEW, unrelated blocker — `conversion
+      "aliasconv" already exists` (see the new bullet immediately below).
+      Gates: `go build ./...`/`go vet ./...` clean; `go test
+      ./internal/catalog/...` PASS; `go test -short $(go list ./... | grep -v
+      /internal/testport)` (full repo, short mode) 0 FAIL; `go test -run
+      TestPort_PgDumpConnectionSetup ./internal/testport/` PASS (soft probe,
+      confirms forward progress via `t.Logf`); `RALPH_PRECOMMIT_SCOPE=smoke
+      bash scripts/ralph-precommit-test.sh` PASS.
+- [x] **M0122-0007 4e follow-up — `catalog.userConversions` cross-database
+      isolation (DU-002 round-trip probe unblock).** Applied the identical
+      M0122-0007 4e pattern to `UserConversion`, mirroring `UserCollation`
+      (slice-of-pointers + `DBOid` field, not a map): added
+      `UserConversion.DBOid uint32`; `CreateConversion`/`DropConversion`
+      gained a trailing variadic `dbOid ...uint32`; `CreateConversionDuringRecovery`
+      stamps `DefaultDBOid` (WAL replay carries no dbOid yet). New
+      `ListUserConversionsForDBOid`/`PGConversionRowsForDBOid` (mirror the
+      collation pair) replace the old unfiltered `ListUserConversions()`-backed
+      `pgConversion.VirtualRows` closure. Per-connection wiring added
+      end-to-end: `executor.Context.PgConversionRows`, a `pg_conversion`
+      branch in `operators.go`'s virtual-row materializer, and
+      `dispatch.go`'s `pgConversionRowLister` + `wireExtensionRows` wiring
+      (mirrors `pgCollationRowLister`). Threaded
+      `catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)` through both
+      `operators_ddl.go` call sites (CREATE/DROP CONVERSION). New
+      `internal/catalog/create_conversion_dbscope_test.go`
+      (`TestCreateConversionCrossDatabaseIsolation`). Confirmed via a live
+      re-run of `TestPort_PgDumpConnectionSetup`: the DU-002 probe's failure
+      point moved past `conversion "aliasconv" already exists` entirely to a
+      NEW, unrelated blocker — a parser gap, `ALTER CONVERSION ... OWNER TO`
+      is not a recognized `ALTER` production (see the new bullet immediately
+      below and the matching deferral-ledger row). Gates: `go build ./...`/
+      `go vet ./...` clean; `go test ./internal/catalog/... ./internal/initdb/...
+      ./internal/executor/... ./internal/server/... ./internal/wal/...` PASS;
+      `go test -short $(go list ./... | grep -v /internal/testport)` (full
+      repo, short mode) 0 FAIL; `go test -v -run
+      '^TestPort_PgDumpConnectionSetup$' ./internal/testport/` PASS (soft
+      probe, confirms forward progress); `RALPH_PRECOMMIT_SCOPE=smoke bash
+      scripts/ralph-precommit-test.sh` PASS twice (0 failed, all 3 workloads
+      both times).
+- [x] **M0122-0007 4e follow-up — parser gap: `ALTER CONVERSION <name> OWNER
+      TO <role>` not a recognized `ALTER` production (DU-002 round-trip probe
+      unblock).** Fixed: added an `AlterConversionStmt` AST node
+      (internal/parser/ast.go, mirrors `AlterCollationStmt` minus REFRESH
+      VERSION) and its `parseAlter()` grammar branch
+      (internal/parser/ddl.go, right after the `ALTER COLLATION` branch)
+      supporting `RENAME TO` / `OWNER TO {role|CURRENT_USER|SESSION_USER|
+      CURRENT_ROLE}` / `SET SCHEMA` (confirmed against
+      `postgres/src/backend/parser/gram.y`'s three `ALTER CONVERSION_P`
+      productions). Catalog side: `RenameConversion`/`SetConversionOwner`/
+      `SetConversionSchema` + their `*DuringRecovery` counterparts
+      (internal/catalog/catalog.go ~12720-12831), mirroring the
+      `UserCollation` trio byte-for-byte. Executor:
+      `execAlterConversion` (internal/executor/operators_ddl.go, right after
+      `execAlterCollation`) + a `*parser.AlterConversionStmt` case in the DDL
+      dispatch switch. WAL durability: 3 new record kinds
+      (`RecordKindAlterConversionRename/Owner/SetSchema` = 130/131/132) +
+      Encode/Decode pairs (internal/wal/recovery.go) +
+      `internal/initdb/conversion_ddl_recovery.go` replay wiring (mirrors
+      `collation_ddl_recovery.go`) + the physical-replay no-op classification
+      case in `recordKindToRmgrInfo`'s neighbor switch. Also needed (missed by
+      the collation precedent grep alone, caught by the resulting `Plan()`
+      test failure): `internal/planner/planner.go`'s DDL-passthrough type list
+      and `internal/server/dispatch.go`'s command-tag switch both needed a
+      `*parser.AlterConversionStmt` case too — a statement type is not fully
+      wired until all three sites (parser/executor AND planner AND dispatch's
+      tag lookup) know about it. New tests:
+      `internal/parser/alter_conversion_test.go` (rename/owner/setschema
+      parse shapes, including the probe's exact
+      `ALTER CONVERSION public.aliasconv OWNER TO postgres` SQL) and
+      `internal/executor/alter_conversion_test.go` (mirrors
+      `alter_collation_test.go`'s rename/owner/setschema/IfExists/42704
+      coverage). **Confirmed via a LIVE re-run of
+      `TestPort_PgDumpConnectionSetup`:** the DU-002 probe's failure point
+      moved past `aliasconv`'s `ALTER CONVERSION ... OWNER TO` entirely to a
+      NEW blocker — `text search dictionary "simple_dict" already exists` —
+      the same cross-database catalog-key-collision shape the
+      `userCollations`/`userConversions` bullets above already fixed, now
+      hitting the text-search dictionary registry. Next resume point: grep
+      `catalog.InMemory`'s ts-dictionary registry (`tsDicts` or similar —
+      check `CreateTSDict`/`ListTSDict*` neighbors of
+      `CreateConversion`/`ListUserConversionsForDBOid` in catalog.go) for a
+      missing `DBOid` field/scoping, apply the identical M0122-0007 4e
+      pattern (dbOid-scoped struct field + variadic `dbOid ...uint32` on
+      Create/Drop + a `*ForDBOid` lister + per-connection wiring through
+      `executor.Context`/`dispatch.go`'s `wireExtensionRows`), verify via the
+      same `TestPort_PgDumpConnectionSetup` soft probe.
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002). `002_save_fullpage`
       (WD-003) + live `pg_waldump --rmgr=Heap2` round-trip DONE. **Still open:** only
       `001_basic.pl`'s server-dependent tier (per-rmgr/relation/block filtering) —
@@ -9705,7 +11443,182 @@ mirroring M0119's ledger `status` column.
 > compression, autovacuum, FDW/HANDLER stub, GIST, LANGUAGE C) fold into the
 > nearest cluster by the triage.
 
-## Infra (non-milestone; does not gate M0122 PG-compat work)
+## WAL native → PG-format rework (design bundle `docs/design/wal-native-pg-format/`)
+
+- [x] **Doc 04 landed + indexed — "Remove canonical WAL + knob + skip-tag;
+      dispatch on PG-compatible (xl_rmid, xl_info)".** Found already fully
+      written and staged (uncommitted) at loop start — 21 KB, "agent-reviewed
+      vs code/PG-source 2026-07-15 (2 blockers + 1 major + 5 minor found and
+      folded in)". Unlike docs 01-03 in the same bundle (reference-only, no
+      code change), doc 04 is an **actionable implementation plan**: remove
+      the `0xFE` canonical record family + `GOOPG_WAL_CANONICAL` knob + the
+      `RM_XLOG`/`0xF0` skip-tag, replace classify/recovery dispatch with a
+      real PG-style `(rmgr, opcode)` table (§3 mapping, §4 dispatch rework,
+      §5 removal inventory file-by-file). Explicitly out of scope: record
+      *body* content stays native (the 01/03 content rewrite is separate).
+      This loop's task was scoped to landing the plan, not implementing it —
+      a multi-file, high-blast-radius WAL/recovery change needs its own
+      dedicated loop(s) per the doc's own risk guidance ("R1 critical: land
+      §4 last, incrementally; full G-crash before/after"). Indexed doc 04 in
+      the bundle's own `README.md` (Documents table + intro) and added the
+      whole bundle to the main `docs/design/README.md` Design Bundles list
+      (was missing entirely — docs 01-03 were committed
+      `15375589` but never indexed there). **Next step for a future loop:**
+      start with the lowest-risk additive changes first (§5.4: add
+      `RmgrCLOG=3`/`RmgrGoopgCatalog=128` consts, widen
+      `DecodeXLogRecordHeader`'s `Rmid > MaxKnownRmgr` guard to accept the
+      custom range — currently rejects 128/3/8, a BLOCKER the doc flags),
+      verified inert (nothing emits those rmids yet) before touching
+      `classifyXLogRecord`/`recovery.go` dispatch or deleting the canonical
+      family. Gates: none required (docs-only change, no code touched);
+      `make ralph-state-guard` run per every loop's closing requirement.
+
+- [x] **Doc 04 §5.4 first additive slice landed —
+      `internal/wal/xlog_record.go`.** Added `RmgrCLOG=3`,
+      `RmgrGoopgCustomBase=128`, `RmgrGoopgCatalog=128` consts (doc §3.1/§3.2
+      mapping); widened `DecodeXLogRecordHeader`'s reject condition from
+      `Rmid > MaxKnownRmgr` to `Rmid > MaxKnownRmgr && Rmid <
+      RmgrGoopgCustomBase` so the BLOCKER the doc flagged (128/3/8 rejected)
+      is cleared — a rmid of 99 (between 11 and 128) is still correctly
+      rejected (existing `TestDecodeRejectsUnknownRmgr` unchanged/still
+      green). Added `TestDecodeAcceptsGoopgCustomRmgrRange` pinning
+      128/RmgrGoopgCatalog/255 accepted and 127 still rejected. Verified
+      inert: nothing in the tree emits `Rmid=3` or `Rmid>=128` yet (only
+      producer of `Rmgr` values outside `xlog_record.go` is
+      `format.go:228`'s payload-derived classification, unrelated to header
+      decode), so this is a pure widen-the-guard change with no behavior
+      change on any currently-emitted record. Gates: `go build ./...` +
+      `go vet ./internal/wal/...` clean; `go test ./internal/wal/...` and
+      `go test -race ./internal/wal/...` full-package green. **Next step**
+      (doc §5.4, second bullet): `internal/wal/pg_xlog_decode.go` — add the
+      HEAP2 opcode consts (`xlogHeap2PruneOnAccess=0x10` /
+      `_VacuumScan=0x20` / `_VacuumCleanup=0x30`, cited from doc 03 §5),
+      still additive/inert (no dispatch rewrite yet). The `classifyXLogRecord`
+      / `recovery.go` dispatch rework (doc §4, R1 "land last, incrementally")
+      remains a separate, larger, dedicated-loop task — do not start it
+      opportunistically alongside a §5.4 slice.
+
+- [x] **Doc 04 §5.4 second additive slice landed —
+      `internal/wal/pg_xlog_decode.go`.** Added `xlogHeap2PruneOnAccess=0x10`,
+      `xlogHeap2PruneVacuumScan=0x20`, `xlogHeap2PruneVacuumClean=0x30`
+      (RM_HEAP2_ID opcodes, confirmed against
+      `postgres/src/include/access/heapam_xlog.h:60-62`) — these are the 3
+      HEAP2 opcodes doc §3's mapping table cites for `HeapVacuum`/
+      `HeapPruneOpt`/`HeapFreeze` (`RmgrHeap2=9` already existed in
+      `xlog_record.go`, unchanged this loop). Verified inert: grepped, no
+      other reference to the new const names anywhere in the tree — pure
+      unused-const addition, no behavior change on any currently-emitted or
+      currently-decoded record. Gates: `go build ./...` clean (unused-const
+      is an info-level diagnostic for package-level consts, not a build
+      error — matches the pre-existing `slotOffPersistency`-class pattern in
+      `slots_pg.go`); `go vet ./internal/wal/...` clean; `go test
+      ./internal/wal/...` full-package green. **Next step** (doc §5.4, third
+      bullet): `internal/wal/format.go` — build the `recordKindToRmgrInfo`
+      mapping table (doc §3's full RecordKind→(rmid,info) table) and rewrite
+      `classifyXLogRecord` to use it, retiring `xlogInfoDefault` as the
+      catch-all. This is the first slice that changes what gets *emitted*
+      (no longer purely additive) — read doc §3 in full before starting, and
+      keep `recovery.go`'s dispatch rework (doc §4, R1 "land last,
+      incrementally") as a separate follow-on loop, not bundled with the
+      mapping-table change.
+
+- [x] **Doc 04 §5.4 third additive slice landed —
+      `internal/wal/format.go`'s `recordKindToRmgrInfo` mapping table.**
+      Full §3.1 table (every PG-analog `RecordKind` → real PG `(rmid,
+      info)`, confirmed against `postgres/src/include/access/
+      {heapam_xlog,nbtxlog}.h`, `catalog/{storage_xlog,pg_control}.h`,
+      `access/clog.h`) + the §3.2 default fallback (every goopg-private
+      catalog/DDL kind → `RmgrGoopgCatalog`). Needed opcode consts added to
+      `pg_xlog_decode.go` (`xlogHeapLock`/`xlogBtreeInsertLeaf`/`SplitL`/
+      `SplitR`/`UnlinkPage`/`NewRoot`/`MarkPageHalfDead`/`Vacuum`/
+      `xlogSmgrCreate`/`xlogXLogFPI`/`xlogClogTruncate`).
+      `TestRecordKindToRmgrInfoAnalogTable`/`…CustomDefault` pin every §3.1
+      row + the §3.2 fallback (`internal/wal/record_kind_rmgr_mapping_test.go`).
+      **Deliberately NOT wired into `classifyXLogRecord` this loop** —
+      tracing the wiring uncovered that it cannot land alone: `ApplyRecord`'s
+      existing rmid gate, a `RmgrGoopgCatalog` no-op case
+      `replayDecodedXLogRecord` is missing, and a genuine
+      `RecordKindPageImage`/`XLOG_FPI` collision (would silently no-op real
+      page-image replay) all have to change in the *same* commit as the
+      classify rewrite or goopg's own crash recovery breaks — full findings
+      + the concrete fix for each (5 points) recorded in doc 04 §5.4 (4th
+      bullet) so the next loop implements the atomic classify+recovery
+      change directly instead of re-deriving it.
+      `TestRecordKindToRmgrInfoNotYetWired` pins the current transitional
+      state and is designed to fail (delete it, don't "fix" it) the day the
+      wiring lands. Also found and documented (not touched): a stale,
+      uncommitted, pre-additive-first worktree at
+      `.claude/worktrees/wal-canonical-removal/` — doc 04 §8 R3 has the full
+      note; left alone pending a human decision. Gates: `go build ./...`/`go
+      vet ./...` clean; verified inert (`recordKindToRmgrInfo` has no
+      non-test caller); `go test`/`go test -race ./internal/wal/...`
+      full-package green; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh`
+      PASS (0 failed, all 3 workloads). **Next step:** the atomic
+      `classifyXLogRecord` rewrite + `internal/wal/recovery.go` §4 dispatch
+      rework (doc 04 §5.4 4th/5th bullets — `isGoopgOwnedRmgr` gate,
+      `RmgrGoopgCatalog`/`XLOG_FPI` cases, `stream_replayer.go`
+      `XactCommitInval` case) as ONE change, with full G-crash
+      (`go test -run 'Crash|Recovery|Durability' ./internal/initdb/
+      ./internal/wal/` + `TestKillKillRecovery`) before/after per §8 R1.
+
+- [x] **Doc 04 §5.4 atomic classify+recovery dispatch rework landed
+      (2026-07-15, commit 347c3b08).** Wired `recordKindToRmgrInfo` into
+      `classifyXLogRecord`'s native-record catch-all and landed all 6
+      recovery.go coupling-point fixes in the same commit: `isGoopgOwnedRmgr`
+      helper, `ApplyRecord`'s rewritten rmid gate, `replayDecodedXLogRecord`'s
+      `RmgrGoopgCatalog` no-op case + `RmgrXLog`/`XLOG_FPI` case, the FPI
+      `RmgrHeap`/`RmgrBtree` arms left untouched as directed,
+      `IsGoopgNativeRecord` fixed to delegate to `isGoopgOwnedRmgr` (a 6th
+      coupling point the prior loop's trace missed — ~20
+      `internal/initdb/*_ddl_recovery.go` restart scanners would otherwise
+      have silently stopped re-populating the catalog registry after a
+      restart), and `stream_replayer.go`'s `replayedXactInfo` gained the
+      `XactCommitInval` case. Full G-crash + `TestKillKillRecovery` +
+      `./internal/initdb/...`/`./internal/wal/...` all green before/after;
+      `tpch-spotcheck.sh` + `ralph-precommit-test.sh` smoke PASS. Doc 04 §5.4
+      updated in the same commit; two deliberate deferrals recorded in the
+      ledger (optional legacy `RM_XLOG/0xF0` backward-compat arm; real
+      external block-carrying XLOG_FPI restore).
+
+- [x] **Doc 04 §5.1-5.3 + §6 landed (2026-07-15) — canonical WAL family +
+      `GOOPG_WAL_CANONICAL` knob + native skip-tag fully removed.** The
+      three user-requested removals: (1) deleted `internal/catalog/canonical.go`
+      + `internal/wal/parameter_change.go` (relocating `GUCParameters`/
+      `DefaultGUCParameters` into `checkpointer.go` first) + every
+      `LogCanonical`/`PgCanonical*` call site across executor/initdb/server/
+      vacuum (`writeHeapRowCanonical` now just delegates to
+      `writeHeapRowReturningPG`, keeping its ~20 catalog-heap-sync callers
+      unchanged); (2) deleted `emitCanonicalDefault`/`wal.Config.EmitCanonical`/
+      `Writer.CanonicalEnabled()` + the startup/BASE_BACKUP warnings; (3)
+      deleted the `payload[0]==0xFE` branches in `wrapXLogMainData`/
+      `classifyXLogRecord` + the mirrored branch in `predictXLogRecordLen`
+      (caught 2 failing subtests in the keystone predictor-vs-encoder parity
+      test, fixed by deleting the now-invalid canonical test cases) +
+      `RecordKindCanonical`. Deleted 10 pure-canonical files; converted the 4
+      `skipUnlessCanonicalWAL`-gated tests to unconditional `t.Skip`; removed
+      the now-redundant `TestKillKillRecoveryNativeOnly` and the nightly
+      `GOOPG_WAL_CANONICAL=on` lane from `ci/batch/stages/stage-testport.sh`.
+      **Deviation from doc 04 §6's prediction:** `TestPort_WALPgWaldumpCompat`
+      (W-001) and `TestPGWaldumpParsesEmittedWAL` were expected to become
+      structurally-failing once real rmids sit over native bodies, but both
+      still PASS (verified by direct re-run) — neither validates per-rmgr
+      body content deeply enough to catch the mismatch — so the CSV
+      `port→defer` flip was deliberately not applied. Gates: `go build
+      ./...`/`go vet ./...` clean repo-wide; grep-audit shows no
+      `LogCanonical`/`PgCanonical`/`RecordKindCanonical`/`GOOPG_WAL_CANONICAL`/
+      `EmitCanonical`/`CanonicalEnabled` outside historical/comment text (all
+      cleaned) except the retained `xlogInfoDefault` legacy-decode arm;
+      `./internal/wal/...` full green; `./internal/executor/...`/
+      `./internal/vacuum/...`/`./internal/initdb/...`/`./internal/server/...`
+      green. Design doc 04 marked landed (§2-§6 complete; only the
+      out-of-scope record body/content rewrite remains);
+      `docs/design/README.md` updated. Deferral ledger row appended
+      (supersedes the 2026-07-13 perf-optimize3-dash S4 rows 756/757, whose
+      "resume via GOOPG_WAL_CANONICAL=on" path no longer exists). **This
+      closes the WAL native→PG-format rework epic's dispatch/removal scope
+      in full** — the only remaining item is the separately-scoped record
+      body/content rewrite (docs 01/03), not yet started.
 
 - [ ] **Nightly whole-suite regression batch — implementation** (~6). Design is
       DONE and committed: `analysis/tests-overview-260706/` (test-landscape

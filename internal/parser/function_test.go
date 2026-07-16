@@ -221,6 +221,53 @@ func TestParseCreateFunctionTaggedDollarQuote(t *testing.T) {
 	}
 }
 
+// TestParseCreateFunctionLanguageCTwoItemAS pins upstream's
+// interpret_AS_clause: LANGUAGE C is the only language allowed to use
+// the two-item `AS 'objfile', 'linksymbol'` form (regress' own
+// test_setup.sql defines binary_coercible() this way, AS before
+// LANGUAGE) — every other language, including "internal", must reject
+// it with "only one AS item needed for language ...".
+func TestParseCreateFunctionLanguageCTwoItemAS(t *testing.T) {
+	srcs := []string{
+		`CREATE FUNCTION f(oid, oid) RETURNS bool AS 'some/path', 'f' LANGUAGE C STRICT STABLE`,
+		`CREATE FUNCTION f(oid, oid) RETURNS bool LANGUAGE C AS 'some/path', 'f'`,
+	}
+	for _, src := range srcs {
+		t.Run(src, func(t *testing.T) {
+			stmts, err := Parse(src)
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			cf := stmts[0].(*CreateFunctionStmt)
+			if cf.Language != "c" {
+				t.Errorf("Language = %q, want c", cf.Language)
+			}
+		})
+	}
+}
+
+// TestParseCreateFunctionNonCTwoItemASRejected guards the negative
+// side of the same rule: LANGUAGE sql/plpgsql/internal (or unspecified)
+// must reject a two-item AS clause.
+func TestParseCreateFunctionNonCTwoItemASRejected(t *testing.T) {
+	srcs := []string{
+		`CREATE FUNCTION f() RETURNS int AS 'a', 'b' LANGUAGE sql`,
+		`CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'a', 'b'`,
+		`CREATE FUNCTION f() RETURNS int AS 'a', 'b' LANGUAGE internal`,
+	}
+	for _, src := range srcs {
+		t.Run(src, func(t *testing.T) {
+			_, err := Parse(src)
+			if err == nil {
+				t.Fatalf("expected parse error for two-item AS on a non-C language")
+			}
+			if !strings.Contains(err.Error(), "only one AS item needed") {
+				t.Errorf("err = %v, want an 'only one AS item needed' diagnostic", err)
+			}
+		})
+	}
+}
+
 // TestParseCreateFunctionMissingBody guards the "AS $$body$$
 // required" rule: omitting AS surfaces a specific diagnostic.
 func TestParseCreateFunctionMissingBody(t *testing.T) {

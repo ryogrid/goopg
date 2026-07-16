@@ -49,6 +49,65 @@ func TestParseCastTypmod(t *testing.T) {
 	}
 }
 
+// TestParseCastMultiWordTypeName covers DU-002's `'na'::character varying`
+// gap: pg_dump emits multi-word built-in type names (character varying,
+// double precision, timestamp with/without time zone, bit varying) as CAST
+// targets in DEFAULT-expression dumps, e.g. `CREATE DOMAIN ... DEFAULT
+// 'na'::character varying`. parseTypeNameAfterCast previously consumed only
+// a single identifier, so the trailing keyword ("varying"/"precision"/…) was
+// left dangling and produced a syntax error; it now shares
+// parseMultiWordTypeName with parseColumnType/parseCreateDomain's AS-clause
+// (CREATE TABLE/CREATE DOMAIN column-type) paths.
+func TestParseCastMultiWordTypeName(t *testing.T) {
+	cases := []struct {
+		name     string
+		sql      string
+		wantType string
+	}{
+		{"character varying bare", `SELECT 'x'::character varying`, "varchar"},
+		{"character varying typmod", `SELECT 'x'::character varying(20)`, "varchar"},
+		{"double precision", `SELECT 1::double precision`, "float8"},
+		{"bit varying", `SELECT '1'::bit varying`, "varbit"},
+		{"timestamp with time zone", `SELECT now()::timestamp with time zone`, "timestamptz"},
+		{"timestamp without time zone", `SELECT now()::timestamp without time zone`, "timestamp"},
+		{"CAST double precision", `SELECT CAST(1 AS double precision)`, "float8"},
+		{"CAST character varying", `SELECT CAST('x' AS character varying)`, "varchar"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stmts, err := Parse(tc.sql)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cast, ok := stmts[0].(*SelectStmt).Targets[0].Expr.(*CastExpr)
+			if !ok {
+				t.Fatalf("target=%T want *CastExpr", stmts[0].(*SelectStmt).Targets[0].Expr)
+			}
+			if cast.Type.Name != tc.wantType {
+				t.Errorf("type=%q want %q", cast.Type.Name, tc.wantType)
+			}
+		})
+	}
+}
+
+// TestParseCastSchemaQualifiedNotMultiWord ensures the multi-word lookahead
+// added for TestParseCastMultiWordTypeName does not misfire on a
+// schema-qualified single-word type name (the `.`-branch returns before
+// parseMultiWordTypeName is consulted).
+func TestParseCastSchemaQualifiedNotMultiWord(t *testing.T) {
+	stmts, err := Parse(`SELECT 1::pg_catalog.int4`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cast, ok := stmts[0].(*SelectStmt).Targets[0].Expr.(*CastExpr)
+	if !ok {
+		t.Fatalf("target=%T want *CastExpr", stmts[0].(*SelectStmt).Targets[0].Expr)
+	}
+	if cast.Type.Schema != "pg_catalog" || cast.Type.Name != "int4" {
+		t.Errorf("cast.Type=%+v want pg_catalog.int4", cast.Type)
+	}
+}
+
 // TestParseCastChained: `expr::int8::text` should produce a
 // CastExpr whose Operand is itself a CastExpr.
 func TestParseCastChained(t *testing.T) {

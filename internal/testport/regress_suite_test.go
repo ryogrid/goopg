@@ -264,9 +264,22 @@ func (e *ClusterRegressExecutor) psqlArgs(extraArgs ...string) []string {
 // psqlEnv returns the environment slice for psql with LD_LIBRARY_PATH and
 // PG_ABS_SRCDIR set so the in-tree psql binary resolves libpq symbols and
 // data file paths (e.g. \getenv abs_srcdir PG_ABS_SRCDIR in hash_index.sql).
+//
+// It also mirrors the three environment settings real pg_regress forces on
+// every regress client connection (postgres/src/test/regress/pg_regress.c,
+// ~line 783-800: psql_start_test / initialize_environment) so goopg's output
+// is compared against the same baseline pg_regress itself uses, rather than
+// whatever ambient locale/timezone/datestyle the test-runner host happens to
+// have. Without these, cases whose very first statement is a bare "SHOW
+// datestyle"/"SHOW TimeZone" (e.g. guc.sql) diverge before any SET is issued.
 func (e *ClusterRegressExecutor) psqlEnv() []string {
 	prev := os.Getenv("LD_LIBRARY_PATH")
-	env := []string{"PGPASSWORD="}
+	env := []string{
+		"PGPASSWORD=",
+		"PGTZ=America/Los_Angeles",
+		"PGDATESTYLE=Postgres, MDY",
+		"PGOPTIONS=-c intervalstyle=postgres_verbose",
+	}
 	if e.LibDir != "" {
 		ldPath := e.LibDir
 		if prev != "" {

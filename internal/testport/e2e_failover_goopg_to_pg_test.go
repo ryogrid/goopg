@@ -29,7 +29,14 @@ func TestE2E_FailoverGoopgToPG(t *testing.T) {
 	if testing.Short() || os.Getenv("GOOPG_SKIP_M0102_E2E") != "" {
 		t.Skip("skipping heterogeneous failover e2e (short mode or GOOPG_SKIP_M0102_E2E set)")
 	}
-	skipUnlessCanonicalWAL(t) // perf-optimize3-dash S4: real-PG consumer
+	// A9 Phase-A exit gate (2026-07-16): RE-ENABLED. A real PG18 standby now
+	// fully replays goopg WAL in both modes. The prior "WAL contains references
+	// to invalid pages" PANIC (a Heap/INSERT for a fresh page whose page 0 the
+	// standby had not created) was fixed by emitting XLOG_HEAP_INIT_PAGE +
+	// REGBUF_WILL_INIT on the first insert into an empty page (operators_storage.go
+	// markHeapInsertDirty + wal.EncodeHeapInsertPG) — PG then PageInit's the page
+	// during redo, exactly as it does for its own first-insert-on-a-new-page,
+	// instead of treating the missing page as invalid.
 
 	repo := repoRoot(t)
 	binDir := filepath.Join(repo, "postgres", "local_install", "bin")

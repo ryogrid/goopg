@@ -11,12 +11,11 @@ import (
 )
 
 // TestCanonicalUserRowTupleBytesM0106_0010_36 pins the exact byte layout
-// of a canonical heap tuple produced for the bench_log E2E row
+// of a PG physical-format heap tuple produced for the bench_log E2E row
 // `INSERT INTO public.bench_log (client int, src text) VALUES (-999, 'bootstrap')`
-// the way it is written by writeHeapRowReturning when
-// ctx.LogCanonical != nil — i.e. EncodeRowPG + NullBitmapPG, then
-// NewHeapTuple, SetNatts(2), Infomask |= HEAP_XMAX_INVALID, then
-// MarshalBinary.
+// the way it is written by writeHeapRowReturningPG — i.e. EncodeRowPG +
+// NullBitmapPG, then NewHeapTuple, SetNatts(2), Infomask |=
+// HEAP_XMAX_INVALID, then MarshalBinary.
 //
 // The fixture below is what a vanilla PG18 standby must be able to
 // deform without segfaulting. M0106-0010 batched-36 documents that the

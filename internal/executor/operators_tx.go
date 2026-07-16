@@ -384,6 +384,7 @@ func (o *transactionOp) clearCtxTransaction() {
 	o.ctx.PendingEnumRenames = nil
 	o.ctx.PendingCreatedEnums = nil
 	o.ctx.PendingCreatedComposites = nil
+	o.ctx.PendingCreatedRangeTypes = nil
 }
 
 // UndoEnumDDLOnAbort reverses enum/composite-type DDL (CREATE TYPE ... AS
@@ -407,7 +408,7 @@ func undoEnumDDLFromContext(ctx *Context) {
 	// Do this before undoing renames so type names are still at current (renamed) values.
 	for typeName, labels := range ctx.PendingEnumValues {
 		for label := range labels {
-			inm.RemoveEnumValue(typeName, label)
+			inm.RemoveEnumValue(typeName, label, ctx.CurrentDatabaseOid)
 		}
 	}
 	// Step 2: Undo renames in reverse order.  Also reverse their effect on the
@@ -419,7 +420,7 @@ func undoEnumDDLFromContext(ctx *Context) {
 	}
 	for i := len(ctx.PendingEnumRenames) - 1; i >= 0; i-- {
 		r := ctx.PendingEnumRenames[i]
-		_ = inm.RenameEnum(r.NewName, r.OldName)
+		_ = inm.RenameEnum(r.NewName, r.OldName, ctx.CurrentDatabaseOid)
 		if created[r.NewName] {
 			delete(created, r.NewName)
 			created[r.OldName] = true
@@ -427,7 +428,7 @@ func undoEnumDDLFromContext(ctx *Context) {
 	}
 	// Step 3: Drop types created in this transaction (now at original names).
 	for name := range created {
-		_ = inm.DropEnum(name, false)
+		_ = inm.DropEnum(name, false, ctx.CurrentDatabaseOid)
 	}
 	// Step 4: Drop composite types created via CREATE TYPE … AS (...) in this
 	// transaction.  Their pg_type/pg_attribute heap rows carry the aborting
@@ -435,7 +436,17 @@ func undoEnumDDLFromContext(ctx *Context) {
 	// iterates the in-memory registry, so removing the registration below is
 	// what makes the aborted composite disappear.  DU-002 slice 244.
 	for name := range ctx.PendingCreatedComposites {
-		_ = inm.DropCompositeType(name)
+		_ = inm.DropCompositeType(name, ctx.CurrentDatabaseOid)
+	}
+	// Step 5: Drop range types created via CREATE TYPE … AS RANGE in this
+	// transaction. Their pg_type heap row (typtype='r', plus the
+	// auto-generated multirange typtype='m') carries the aborting XID
+	// (MVCC-invisible post-rollback); removing the in-memory registration is
+	// what makes the aborted range type disappear from LookupRangeType and
+	// the virtual pg_class builder. Range types had no rollback-undo
+	// tracking at all until this step was added. M0122-0007 4e follow-up.
+	for name := range ctx.PendingCreatedRangeTypes {
+		_ = inm.DropRangeType(name, ctx.CurrentDatabaseOid)
 	}
 }
 

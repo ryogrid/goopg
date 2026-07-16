@@ -71,10 +71,9 @@ func (o *vacuumOp) Next() (TupleSlot, error) {
 	}
 
 	opts := vacuum.VacuumOptions{
-		FSM:          o.ctx.FSM,
-		VM:           o.ctx.VM,
-		FreezeBelow:  freezeBelow,
-		LogCanonical: o.ctx.LogCanonical,
+		FSM:         o.ctx.FSM,
+		VM:          o.ctx.VM,
+		FreezeBelow: freezeBelow,
 	}
 
 	// SKIP_LOCKED governs the per-relation lock taken to begin vacuuming.

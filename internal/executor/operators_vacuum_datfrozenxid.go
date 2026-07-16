@@ -128,15 +128,6 @@ func updatePgDatabaseTupleOnPage(ctx *Context, slot *storage.Slot, blk storage.B
 		if rerr := storage.PageReplaceItemRaw(page, s, raw); rerr != nil {
 			return false, true, rerr
 		}
-		if ctx.LogCanonical != nil {
-			endLSN, lerr := catalog.PgCanonicalHeapInplace(rel, blk, page, s, uint32(ctx.Tx.XID), ctx.LogCanonical)
-			if lerr != nil {
-				return false, true, lerr
-			}
-			if endLSN != 0 {
-				storage.MustHeader(page).SetLSN(storage.LSN(endLSN))
-			}
-		}
 		ctx.Pool.MarkDirty(slot)
 		return true, true, nil
 	}

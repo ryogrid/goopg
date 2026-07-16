@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"net"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -45,36 +46,72 @@ func TestPort_IsolationSuite(t *testing.T) {
 	dsn := buildDSN(t, c)
 	runner := &framework.IsolationRunner{DSN: dsn}
 
-	passed, deferred := 0, 0
-	for _, specPath := range specs {
-		specPath := specPath
-		name := filepath.Base(specPath)
-		name = name[:len(name)-len(filepath.Ext(name))] // strip .spec
+	// The specs run as parallel subtests, but every one of them MUST complete
+	// before the deferred c.Stop() above tears the shared cluster down. A
+	// t.Parallel() subtest is paused until its PARENT test function returns —
+	// so registering the specs directly in this function would let the deferred
+	// Stop run FIRST, killing the cluster before any spec connects. Every spec
+	// then failed with "connection refused", took the deferred-skip arm below,
+	// and — since a SKIP counts as PASS — the whole suite went falsely green
+	// while validating nothing (proven by the ~170ms-then-shutdown trace in
+	// /tmp/goopg_cluster_debug/isolation_suite.log). Nesting the specs under a
+	// synchronous inner-group t.Run fixes the ordering: this call blocks until
+	// all of the group's parallel children finish, and only THEN does the parent
+	// return and the deferred Stop run. See deferral ledger 2026-07-16.
+	t.Run("specs", func(t *testing.T) {
+		for _, specPath := range specs {
+			specPath := specPath
+			name := filepath.Base(specPath)
+			name = name[:len(name)-len(filepath.Ext(name))] // strip .spec
 
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-			defer cancel()
+			t.Run(name, func(t *testing.T) {
+				t.Parallel()
+				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+				defer cancel()
 
-			result := runner.RunAndCompare(ctx, root, specPath)
-			switch result.Status {
-			case "pass":
-				// nothing to report
-			case "defer":
-				// Expected for most specs — goopg not yet fully compatible.
-				t.Logf("defer: %s", result.Diff)
-				t.Skip("deferred: output did not match expected")
-			case "excluded":
-				t.Skip("excluded by policy")
-			default:
-				t.Errorf("unknown status %q: %s", result.Status, result.Diff)
-			}
-		})
+				result := runner.RunAndCompare(ctx, root, specPath)
+				switch result.Status {
+				case "pass":
+					// nothing to report
+				case "defer":
+					// A cluster-connectivity failure must NOT masquerade as a
+					// deferred spec (deferred = skip = PASS) — that is exactly how
+					// a torn-down/dead cluster hid zero real coverage. Fail hard so
+					// an unreachable cluster can never turn the suite green again.
+					if isClusterUnreachable(result.Diff) {
+						t.Fatalf("cluster unreachable while running %s (not a spec mismatch): %s", name, result.Diff)
+					}
+					// Expected for most specs — goopg not yet fully compatible.
+					t.Logf("defer: %s", result.Diff)
+					t.Skip("deferred: output did not match expected")
+				case "excluded":
+					t.Skip("excluded by policy")
+				default:
+					t.Errorf("unknown status %q: %s", result.Status, result.Diff)
+				}
+			})
+		}
+	})
+}
 
-		// Track outside subtests so we can log a summary.
-		_ = passed
-		_ = deferred
+// isClusterUnreachable reports whether a RunAndCompare "defer" diff indicates the
+// goopg cluster was down/unreachable (a connection failure) rather than a genuine
+// spec output mismatch. Such a failure must fail the suite, not skip — a silently
+// torn-down cluster is how TestPort_IsolationSuite previously went falsely green.
+// The markers are TCP-dial / connection-establishment failures that never appear
+// in a legitimate isolation-output diff.
+func isClusterUnreachable(diff string) bool {
+	for _, marker := range []string{
+		"connection refused",
+		"dial tcp",
+		"no such host",
+		"connection reset by peer",
+	} {
+		if strings.Contains(diff, marker) {
+			return true
+		}
 	}
+	return false
 }
 
 // TestPort_IsolationReadWriteUnique is a focused test for the
@@ -1978,43 +2015,39 @@ func TestPort_IsolationMultixactNoDeadlock(t *testing.T) {
 // xmax / WaitForXID path (stampLockInner / tupleLockConflicts / multixact
 // membership), not the heavyweight lockmgr. M0118-0004.
 //
-// DEMOTED from runIsoSpecStrict → runIsoSpec (2026-07-12, loop #89, nightly
-// AI-20260712-020530-002). Flaky at ~10-17% standalone; the failing permutation
-// is `s1_share s2_for_update s3_for_update s1_rollback s2_rollback s3_rollback`
-// (a FOR UPDATE case) — s3 (arrived 2nd) completes before s2 (arrived 1st) and
-// s2 then times out ("driver: bad connection").
+// FIFO-fairness history (AI-20260712-020530-002): was flaky at ~10-17%
+// standalone and briefly DEMOTED to runIsoSpec (loop #89). The failing
+// permutation is `s1_share s2_for_update s3_for_update s1_rollback s2_rollback
+// s3_rollback` — s3 (arrived 2nd) completed before s2 (arrived 1st) and s2 then
+// timed out ("driver: bad connection").
 //
-// ROOT CAUSE (loop #90, corrected — supersedes loop #89's "the DML UPDATE/DELETE
-// epqWait path lacks a tuple lock; FOR UPDATE is stable"): that diagnosis was
-// WRONG. Empirically (instrumented Context.acquireTupleLock), *every* tuple-lock
-// acquisition in the server path reports LockMgr==nil, so acquireTupleLock /
-// tryAcquireTupleLock are TOTAL NO-OPS — including lockRowsOp's FOR UPDATE
-// ExclusiveLock. This is by deliberate design: Context.LockMgr is nil in the
-// production server (see internal/executor/context.go:863-871), which keeps
-// heavyweight locking off the pgbench/TPC-H hot path and makes cross-statement
-// row blocking ride xmax/WaitForXID instead. Consequence: two FOR UPDATE waiters
-// s2/s3 do NOT queue FIFO on a LOCKTAG_TUPLE — they both fall through to
+// ROOT CAUSE (loop #90): every tuple-lock acquisition in the production server
+// path reported LockMgr==nil, so acquireTupleLock / tryAcquireTupleLock were
+// TOTAL NO-OPS — including lockRowsOp's FOR UPDATE ExclusiveLock. Context.LockMgr
+// is nil in production by design (internal/executor/context.go), keeping
+// heavyweight locking off the pgbench/TPC-H hot path and making cross-statement
+// row blocking ride xmax/WaitForXID. Consequence: two FOR UPDATE waiters s2/s3
+// did NOT queue FIFO on a LOCKTAG_TUPLE — they both fell through to
 // mvcc.Manager.WaitForXID(s1), whose single commitCond.Broadcast() wakes both;
-// they race to re-stamp the row and Go scheduling picks the winner, so s3
-// sometimes beats s2. PG instead serialises them through a heavyweight
-// LOCKTAG_TUPLE acquired in heap_lock_tuple/heap_update *before*
-// XactLockTableWait, granting the row in arrival order.
+// they raced to re-stamp the row and Go scheduling picked the winner, so s3
+// sometimes beat s2. PG serialises them through a heavyweight LOCKTAG_TUPLE
+// acquired in heap_lock_tuple/heap_update *before* XactLockTableWait, granting
+// the row in arrival order.
 //
-// FIX (deferred, its own slice — HIGH blast radius; see docs/design/
-// 0021-0012-tuple-lock-fifo-wiring.md + deferral_ledger.md): route
-// acquireTupleLock / tryAcquireTupleLock to the always-on package-global
-// tableLockMgr (as LOCK TABLE already does) under a statement-scoped backend
-// identity, add a per-statement release, then re-promote to runIsoSpecStrict +
-// restore target-inventory.csv `pass`. Needs a full isolation-suite + pgbench
-// smoke pass because it activates real tuple locking (second deadlock domain,
-// NOWAIT/SKIP-LOCKED double-handling) that the design intentionally kept dormant.
-// Tracked: fix_plan M-NIGHTLY (AI-20260712-020530-002).
+// FIXED (loop #91, design docs/design/0021-0012-tuple-lock-fifo-wiring.md):
+// Context.acquireTupleLock / tryAcquireTupleLock now route to the always-on
+// package-global tableLockMgr (as LOCK TABLE already does) under the
+// per-statement BackendID when LockMgr==nil, with a matching per-statement
+// executor.ReleaseTupleLocks in dispatch.go's Query defer. FOR UPDATE / FOR
+// SHARE waiters therefore acquire the LOCKTAG_TUPLE in FIFO arrival order; the
+// persisted xmax still enforces "wait until the holder's txn ends". Re-promoted
+// to runIsoSpecStrict here. Tracked: fix_plan M-NIGHTLY (AI-20260712-020530-002).
 func TestPort_IsolationTuplelockUpgradeNoDeadlock(t *testing.T) {
 	root := repoRoot(t)
 	c := newCluster(t, "iso_tuplelock_upgrade_no_deadlock")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/tuplelock-upgrade-no-deadlock.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/tuplelock-upgrade-no-deadlock.spec")
 }
 
 // TestPort_IsolationStats drives the cumulative-statistics isolation spec

@@ -1843,10 +1843,10 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call planner.AggregateCall, slot 
 				break
 			}
 			if !dv.IsNull() {
-				delim = dv.Format()
+				delim = formatDatumDateStyle(dv, o.ctx)
 			}
 		}
-		sv := arg.Format()
+		sv := formatDatumDateStyle(arg, o.ctx)
 		if !st.hasValue {
 			st.strResult = sv
 			st.hasValue = true
@@ -1856,15 +1856,15 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call planner.AggregateCall, slot 
 	case "array_agg":
 		// array_agg(expr [ORDER BY sort_list]) — accumulate per-row elements.
 		// NULLs are included as array elements (PostgreSQL semantics).
-		// Elements are stored as their Format() string; finishAgg
-		// wraps them in PG's text-array literal syntax. Numeric kinds
-		// (int, numeric, oid) and string kinds (text, char, varchar)
-		// all round-trip through Format() identically to how a SELECT
-		// would print them.
+		// Elements are stored as their Format() string (DateStyle-aware for
+		// KindTime); finishAgg wraps them in PG's text-array literal syntax.
+		// Numeric kinds (int, numeric, oid) and string kinds (text, char,
+		// varchar) all round-trip through Format() identically to how a
+		// SELECT would print them.
 		elemStr := ""
 		isNull := arg.IsNull()
 		if !isNull {
-			elemStr = arg.Format()
+			elemStr = formatDatumDateStyle(arg, o.ctx)
 		}
 		st.arrayElems = append(st.arrayElems, elemStr)
 		st.arrayElemNull = append(st.arrayElemNull, isNull)
@@ -1936,17 +1936,17 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call planner.AggregateCall, slot 
 				// For variadic aggregates, bundle all input args into a single array
 				// (the sfunc expects state + VARIADIC anyarray). M0097-0117.
 				var elems []string
-				elems = append(elems, arg.Format())
+				elems = append(elems, formatDatumDateStyle(arg, o.ctx))
 				if call.Arg2 != nil {
 					a2, a2err := evalExprSlot(call.Arg2, slot, o.ctx)
 					if a2err == nil {
-						elems = append(elems, a2.Format())
+						elems = append(elems, formatDatumDateStyle(a2, o.ctx))
 					}
 				}
 				for _, ea := range call.ExtraArgs {
 					ev, everr := evalExprSlot(ea, slot, o.ctx)
 					if everr == nil {
-						elems = append(elems, ev.Format())
+						elems = append(elems, formatDatumDateStyle(ev, o.ctx))
 					}
 				}
 				sfuncArgs = append(sfuncArgs, NewStringDatum(formatTextArray(elems)))
@@ -3344,7 +3344,7 @@ func finishWithinGroupAgg(st aggRuntime, call planner.AggregateCall, ctx *Contex
 					if d.IsNull() {
 						result2D[r][c] = "NULL"
 					} else {
-						result2D[r][c] = d.Format()
+						result2D[r][c] = formatDatumDateStyle(d, ctx)
 					}
 				}
 			}
@@ -3365,7 +3365,7 @@ func finishWithinGroupAgg(st aggRuntime, call planner.AggregateCall, ctx *Contex
 				if d.IsNull() {
 					results[i] = "NULL"
 				} else {
-					results[i] = d.Format()
+					results[i] = formatDatumDateStyle(d, ctx)
 				}
 			}
 			return NewStringDatum(formatTextArray(results))

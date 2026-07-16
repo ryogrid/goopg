@@ -126,9 +126,22 @@ After reading the length-prefixed payload:
 
 The parsed startup parameters are returned as a `map[string]string`. We
 preserve the *first* occurrence of duplicate keys, matching upstream's
-behavior of treating the parameter list as an associative array. Unknown
-keys are passed through untouched and mostly ignored in v0; `user`,
-`database`, and `application_name` are read explicitly.
+behavior of treating the parameter list as an associative array. `user`,
+`database`, and `application_name` are read explicitly; every other key
+(except `_pq_.*`, reserved for protocol-level options) is applied as a
+generic GUC `name=value` pair via the session registry, mirroring upstream's
+`port->guc_options` handling in `ProcessStartupPacket`
+(`backend_startup.c` ~770-790). The `options` key additionally holds
+PGOPTIONS-style `-c name=value` tokens (`parsePGOptions`,
+`internal/server/server.go`), covering libpq's `options=` connstring
+parameter and the `PGOPTIONS` environment variable. This is also how
+`PGDATESTYLE`/`PGTZ` reach the backend: libpq's `fe-connect.c`
+`EnvironmentOptions` table folds those two env vars into plain
+`datestyle`/`timezone` startup keys before the packet is ever sent — there is
+no separate wire representation for them. **Follow-up (2026-07-14,
+M-NIGHTLY):** before this fix every non-special key was silently dropped,
+so any client depending on `PGDATESTYLE`/`PGTZ`/`PGOPTIONS`/`options=` saw
+those settings vanish with no error.
 
 ### ParameterStatus block
 

@@ -24,37 +24,6 @@ import (
 	"github.com/goopg/goopg/internal/wal"
 )
 
-// pgEpoch2000 is PG's TimestampTz origin: 2000-01-01 00:00:00 UTC.
-// pgTimestampNowUsec returns the current wall-clock time as a
-// TimestampTz (microseconds since pgEpoch2000). Used by the
-// PG-canonical XLOG_XACT_COMMIT/ABORT emit path (M0106-0010 batched-46).
-var pgEpoch2000 = time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
-
-func pgTimestampNowUsec() int64 { return time.Since(pgEpoch2000).Microseconds() }
-
-// emitCanonicalDefault resolves whether this server emits the canonical
-// (PG-format, real-standby-replayable) WAL record family, from the
-// GOOPG_WAL_CANONICAL environment variable (perf-optimize3-dash/01 §3.1).
-// Read at Open() time — not only in cmd/goopg — so in-process test suites
-// flip modes with t.Setenv. Not a GUC: no PostgreSQL equivalent exists and
-// the postgresql.conf.sample template stays PG-parity (0108-0001).
-//
-//	GOOPG_WAL_CANONICAL=on|1|true   -> emit canonical records (the resume
-//	                                   path: re-enable + land C1)
-//	GOOPG_WAL_CANONICAL=off|0|false -> native-only stream
-//	unset                           -> default OFF (native-only; slice S4)
-func emitCanonicalDefault() bool {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("GOOPG_WAL_CANONICAL"))) {
-	case "on", "1", "true":
-		return true
-	case "off", "0", "false":
-		return false
-	}
-	// Slice S4 (perf-optimize3-dash): native-only is the production default.
-	// Real-PG-standby compatibility is deferred — see the deferral ledger.
-	return false
-}
-
 // Runtime is the bundle of long-lived handles a running goopg
 // server needs to drive table-touching statements: a storage
 // Manager + Pool, an MVCC manager, and an in-memory catalog. Each
@@ -71,13 +40,8 @@ type Runtime struct {
 	FSM *storage.FSM
 	// VM is the in-memory visibility map (M0046-0004). VACUUM sets the
 	// ALL_VISIBLE bit; index-only scans check it to skip heap fetches.
-	VM  *storage.VisibilityMap
-	WAL *wal.Writer
-	// LogCanonical is the callback for emitting PG-canonical WAL records
-	// (XLOG_HEAP_INSERT, XLOG_BTREE_INSERT_LEAF) from DDL paths so a PG18
-	// standby can replay catalog mutations. Non-nil only when PageHeaders=true.
-	// M0106-0010 batched-32.
-	LogCanonical catalog.LogCanonicalFunc
+	VM           *storage.VisibilityMap
+	WAL          *wal.Writer
 	Checkpointer *wal.Checkpointer
 	Slots        *wal.Slots
 	// SyncRep is the synchronous-replication wait primitive
@@ -420,13 +384,8 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		// can parse the WAL segments. SystemID is embedded in every page
 		// header for cross-segment consistency checking.
 		PageHeaders: true,
-		// Canonical-family content gating (analysis/perf-optimize3-dash/01):
-		// resolved from GOOPG_WAL_CANONICAL at every Open() so in-process
-		// test suites can flip modes with t.Setenv. Default OFF since slice
-		// S4 (native-only WAL; real-PG-standby compat deferred).
-		EmitCanonical: emitCanonicalDefault(),
-		SystemID:      systemID,
-		TimelineID:    tli,
+		SystemID:    systemID,
+		TimelineID:  tli,
 		// M0107-0005: closure-captures walProcNum (int32) for the atomic
 		// hot path; no goroutine map lookup and no mutex.
 		OnWALWrite: func() {
@@ -443,21 +402,15 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: wal: %w", err)
 	}
-	if !walWriter.CanonicalEnabled() {
-		// perf-optimize3-dash S4: an already-attached real-PG standby would
-		// keep streaming but silently apply nothing from a native-only
-		// primary (PG's xlog_redo no-ops unknown RmgrXLog info bits), so
-		// announce the family at startup where the BASE_BACKUP clone-time
-		// WARN cannot reach.
-		slog.Info("WAL canonical emission disabled (native-only stream); " +
-			"real-PG standbys cannot replay this WAL — set GOOPG_WAL_CANONICAL=on to re-enable")
-	}
-
 	// Bridge the buffer pool's FPI hook to the WAL writer.
 	// storage cannot import wal (wal imports storage), so we
 	// adapt via a closure here.
 	logFPI := func(rel storage.RelFileNode, blk storage.BlockNumber, page storage.Page) (storage.LSN, error) {
-		payload, err := wal.EncodePageImage(rel, blk, page)
+		// A9: emit a PG RM_XLOG standalone full-page-image record (XLOG_FPI) with
+		// the page as a block-0 apply-image (hole removed) instead of the
+		// goopg-native full-page body. Recovery restores it via the RmgrXLog
+		// XLOG_FPI decoded arm (replayDecodedXLogHeapFPIBlocks).
+		payload, err := wal.EncodePageImagePG(rel, blk, page)
 		if err != nil {
 			return 0, err
 		}
@@ -472,7 +425,10 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// docs/design/0002-0002-btree-concurrency.md). Same import-cycle
 	// dodge as logFPI.
 	logBtreeSplit := func(rel storage.RelFileNode, leftBlk, rightBlk storage.BlockNumber, leftPage, rightPage storage.Page, sibBlk storage.BlockNumber, sibPage storage.Page) (storage.LSN, error) {
-		payload, err := wal.EncodeBtreeSplit(rel, leftBlk, rightBlk, leftPage, rightPage, sibBlk, sibPage)
+		// A8: emit a PG RM_BTREE split record carrying the post-split pages as
+		// full-page images instead of the goopg-native body. Recovery restores
+		// the images via the RmgrBtree default (FPI) arm.
+		payload, err := wal.EncodeBtreeSplitPG(rel, leftBlk, rightBlk, leftPage, rightPage, sibBlk, sibPage)
 		if err != nil {
 			return 0, err
 		}
@@ -485,8 +441,15 @@ func Open(opts OpenOptions) (*Runtime, error) {
 
 	// Logical heap-insert change record (M0002 redo-records —
 	// see docs/design/0002-0003-redo-records.md).
-	logHeapInsert := func(rel storage.RelFileNode, blk storage.BlockNumber, lineSlot uint16, tuple []byte) (storage.LSN, error) {
-		payload := wal.EncodeHeapInsert(rel, blk, lineSlot, tuple)
+	logHeapInsert := func(rel storage.RelFileNode, blk storage.BlockNumber, lineSlot uint16, tuple []byte, initPage bool) (storage.LSN, error) {
+		// A2: emit a PostgreSQL xl_heap_insert record (block ref + xl_heap_header
+		// + tuple, xl_xid = t_xmin) instead of the goopg-native body. Recovery
+		// routes it to replayDecodedXLogHeapInsert (the decoded path) since it
+		// carries a block ref. See docs/design/wal-pg-identical-stream/01.
+		payload, err := wal.EncodeHeapInsertPG(rel, blk, lineSlot, tuple, initPage)
+		if err != nil {
+			return 0, err
+		}
 		_, end, err := walWriter.Append(payload)
 		if err != nil {
 			return 0, err
@@ -496,7 +459,14 @@ func Open(opts OpenOptions) (*Runtime, error) {
 
 	// Logical btree non-split insert change record.
 	logBtreeInsert := func(rel storage.RelFileNode, blk storage.BlockNumber, item []byte) (storage.LSN, error) {
-		payload := wal.EncodeBtreeInsert(rel, blk, item)
+		// A5: emit a PostgreSQL xl_btree_insert (INSERT_LEAF) record with the
+		// IndexTuple as block-0 data instead of the goopg-native body. offnum=0
+		// (goopg replay re-inserts by key). Recovery routes it to
+		// replayDecodedXLogBtreeInsert.
+		payload, err := wal.EncodeBtreeInsertPG(rel, blk, 0, item)
+		if err != nil {
+			return 0, err
+		}
 		_, end, err := walWriter.Append(payload)
 		if err != nil {
 			return 0, err
@@ -508,7 +478,12 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// oldTuple carries the pre-delete heap-tuple bytes for logical
 	// replication; nil when the caller doesn't need logical decoding.
 	logHeapDelete := func(rel storage.RelFileNode, blk storage.BlockNumber, lineSlot uint16, xmax storage.TransactionID, oldTuple []byte) (storage.LSN, error) {
-		payload := wal.EncodeHeapDelete(rel, blk, lineSlot, xmax, oldTuple)
+		// A3: emit a PostgreSQL xl_heap_delete record (block ref + xmax/offnum
+		// main-data, old tuple for logical) instead of the goopg-native body.
+		payload, err := wal.EncodeHeapDeletePG(rel, blk, lineSlot, xmax, oldTuple)
+		if err != nil {
+			return 0, err
+		}
 		_, end, err := walWriter.Append(payload)
 		if err != nil {
 			return 0, err
@@ -531,8 +506,14 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// `btree.VacuumIndexPages` so per-page vacuum cost is
 	// proportional to surviving items rather than 8 KiB of
 	// page bytes.
-	logBtreeVacuum := func(rel storage.RelFileNode, blk storage.BlockNumber, keptItems [][]byte, opaqueFlags uint16) (storage.LSN, error) {
-		payload := wal.EncodeBtreeVacuum(rel, blk, keptItems, opaqueFlags)
+	logBtreeVacuum := func(rel storage.RelFileNode, blk storage.BlockNumber, page storage.Page) (storage.LSN, error) {
+		// A8: emit a PG RM_BTREE vacuum record carrying the post-vacuum page as a
+		// full-page image instead of the goopg-native kept-items body. Recovery
+		// restores the image via the RmgrBtree default (FPI) arm.
+		payload, err := wal.EncodeBtreeVacuumPG(rel, blk, page)
+		if err != nil {
+			return 0, err
+		}
 		_, end, err := walWriter.Append(payload)
 		if err != nil {
 			return 0, err
@@ -563,13 +544,15 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		}
 		return storage.LSN(end), nil
 	}
-	logBtreeNewRoot := func(rel storage.RelFileNode, rootBlk storage.BlockNumber, level uint32, items [][]byte) (storage.LSN, error) {
-		payload := wal.EncodeBtreeNewRoot(wal.BtreeNewRootPayload{
-			Rel:     rel,
-			RootBlk: rootBlk,
-			Level:   level,
-			Items:   items,
-		})
+	logBtreeNewRoot := func(rel storage.RelFileNode, rootBlk storage.BlockNumber, rootPage storage.Page, metaBlk storage.BlockNumber, metaPage storage.Page) (storage.LSN, error) {
+		// A8: emit a PG RM_BTREE new-root record carrying the new root page
+		// (backup block 0) and the updated metapage (backup block 2) as full-page
+		// images instead of the goopg-native (rootBlk, level, items) body.
+		// Recovery restores both images via the RmgrBtree default (FPI) arm.
+		payload, err := wal.EncodeBtreeNewRootPG(rel, rootBlk, rootPage, metaBlk, metaPage)
+		if err != nil {
+			return 0, err
+		}
 		_, end, err := walWriter.Append(payload)
 		if err != nil {
 			return 0, err
@@ -591,7 +574,13 @@ func Open(opts OpenOptions) (*Runtime, error) {
 
 	// M0080-0001: heap-freeze logical record.
 	logHeapFreeze := func(rel storage.RelFileNode, blk storage.BlockNumber, frozenSlots []uint16) (storage.LSN, error) {
-		payload := wal.EncodeHeapFreeze(rel, blk, frozenSlots)
+		// A7: emit a PostgreSQL xl_heap_prune (RM_HEAP2) record with a single
+		// freeze plan covering all frozen slots. Recovery routes it to
+		// replayDecodedXLogHeapPrune (PageFreezeBySlots).
+		payload, err := wal.EncodeHeapFreezePG(rel, blk, frozenSlots)
+		if err != nil {
+			return 0, err
+		}
 		_, end, err := walWriter.Append(payload)
 		if err != nil {
 			return 0, err
@@ -614,7 +603,13 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// the freed slot list so replay can deterministically reclaim the
 	// same dead slots without re-running the isDead predicate.
 	logHeapPruneOpt := func(rel storage.RelFileNode, blk storage.BlockNumber, redirects [][2]uint16, unused []uint16) (storage.LSN, error) {
-		payload := wal.EncodeHeapPruneOpt(rel, blk, redirects, unused)
+		// A7: emit a PostgreSQL xl_heap_prune (RM_HEAP2) record with the redirect
+		// + now-unused sub-records instead of the goopg-native body. Recovery
+		// routes it to replayDecodedXLogHeapPrune.
+		payload, err := wal.EncodeHeapPruneOptPG(rel, blk, redirects, unused)
+		if err != nil {
+			return 0, err
+		}
 		_, end, err := walWriter.Append(payload)
 		if err != nil {
 			return 0, err
@@ -625,8 +620,13 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// Atomic HOT-update change record (M0046-0001). Encodes the
 	// old-slot xmax stamp + new tuple bytes on the same page in one
 	// record so replay can reconstruct the HOT chain atomically.
-	logHeapHotUpdate := func(rel storage.RelFileNode, blk storage.BlockNumber, oldSlot uint16, xmax storage.TransactionID, tupleBytes []byte) (storage.LSN, error) {
-		payload := wal.EncodeHeapHotUpdate(rel, blk, oldSlot, xmax, tupleBytes)
+	logHeapHotUpdate := func(rel storage.RelFileNode, blk storage.BlockNumber, oldSlot, newSlot uint16, xmax storage.TransactionID, tupleBytes []byte) (storage.LSN, error) {
+		// A4: emit a PostgreSQL xl_heap_update (HOT opcode) record instead of the
+		// goopg-native body. Recovery routes it to replayDecodedXLogHeapUpdate.
+		payload, err := wal.EncodeHeapHotUpdatePG(rel, blk, oldSlot, newSlot, xmax, tupleBytes)
+		if err != nil {
+			return 0, err
+		}
 		_, end, err := walWriter.Append(payload)
 		if err != nil {
 			return 0, err
@@ -637,9 +637,15 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// Relation-file creation WAL record (M0030-0002). Emitted by
 	// Pool.PinNew when it creates block 0 of a new relfile so crash
 	// recovery can recreate the file before replaying data pages.
-	logSmgrCreate := func(rel storage.RelFileNode) error {
-		payload := wal.EncodeSmgrCreate(rel)
-		_, _, err := walWriter.Append(payload)
+	logSmgrCreate := func(rel storage.RelFileNode, xid storage.TransactionID) error {
+		// A9: emit a PG RM_SMGR xl_smgr_create record (RelFileLocator+forkNum
+		// main-data, creating xid in the header) instead of the goopg-native
+		// body. Recovery routes it to the RmgrStorage/XLOG_SMGR_CREATE decoded arm.
+		payload, err := wal.EncodeSmgrCreatePG(rel, xid)
+		if err != nil {
+			return err
+		}
+		_, _, err = walWriter.Append(payload)
 		return err
 	}
 
@@ -962,6 +968,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		commitStampMu.RLock()
 		defer commitStampMu.RUnlock()
 		var payload []byte
+		var perr error
 		switch kind {
 		case mvcc.XactCommit:
 			// If the transaction wrote to a nailed catalog relation (pg_class,
@@ -971,7 +978,8 @@ func Open(opts OpenOptions) (*Runtime, error) {
 			// AtEOXact_Inval → RelationCacheInitFilePreInvalidate sequence.
 			// M0106-0010 batched-31.
 			if txnMgr.TakeRelcacheInvalPending() {
-				payload = wal.EncodeXactCommitInval(xid)
+				// A6: PG xl_xact_commit with HAS_INVALS (xid in the header).
+				payload, perr = wal.EncodeXactCommitPG(xid, true)
 				_ = catalog.WithRelCacheInitLock(func() error {
 					if err := catalog.RelcacheInitFileUnlink(abs, catalog.DefaultDBOid); err != nil {
 						return err
@@ -989,48 +997,19 @@ func Open(opts OpenOptions) (*Runtime, error) {
 					return bootstrapRelcacheInitFiles(abs)
 				})
 			} else {
-				payload = wal.EncodeXactCommit(xid)
+				payload, perr = wal.EncodeXactCommitPG(xid, false)
 			}
 		case mvcc.XactAbort:
-			payload = wal.EncodeXactAbort(xid)
+			payload, perr = wal.EncodeXactAbortPG(xid)
 		default:
 			return fmt.Errorf("goopg: unknown xact marker %v", kind)
+		}
+		if perr != nil {
+			return perr
 		}
 		_, endLSN, err := walWriter.Append(payload)
 		if err != nil {
 			return err
-		}
-		// M0106-0010 batched-46: also emit a PG-canonical XLOG_XACT_COMMIT /
-		// XLOG_XACT_ABORT record so a PG18 standby's `xact_redo_commit` (or
-		// `xact_redo_abort`) advances `latestObservedXid`, stamps pg_xact via
-		// `TransactionIdAsyncCommitTree`, and updates `KnownAssignedXids`.
-		// Without this, only basebackup-snapshot XIDs are visible on the standby
-		// and any commit after basebackup is invisible until the next basebackup
-		// cycle. Gated on PageHeaders mode — legacy (test) clusters skip the
-		// canonical record because their walWriter is not in PG-wire format.
-		// The flush waits for the canonical end LSN below so both records land
-		// before the client acknowledges commit (synchronous_commit = on).
-		// Additionally gated on CanonicalEnabled (perf-optimize3-dash S1):
-		// canonical content off => native-only stream, endLSN stays at the
-		// native commit record.
-		if walWriter.PageHeadersEnabled() && walWriter.CanonicalEnabled() {
-			xactTime := pgTimestampNowUsec()
-			switch kind {
-			case mvcc.XactCommit:
-				canonPayload := catalog.BuildCanonicalXactCommitPayload(uint32(xid), xactTime)
-				_, canonEnd, err := walWriter.Append(canonPayload)
-				if err != nil {
-					return err
-				}
-				if canonEnd > endLSN {
-					endLSN = canonEnd
-				}
-			case mvcc.XactAbort:
-				canonPayload := catalog.BuildCanonicalXactAbortPayload(uint32(xid), xactTime)
-				if _, _, err := walWriter.Append(canonPayload); err != nil {
-					return err
-				}
-			}
 		}
 		// Synchronous commit (M0042-0003): flush the commit WAL record to
 		// disk before returning to the client so the transaction is durable
@@ -1650,7 +1629,15 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// record need not block; the next checkpoint/flush persists it.
 	if walWriter != nil {
 		clog.SetTruncateLogger(func(oldestXid storage.TransactionID) error {
-			payload := wal.EncodeClogTruncate(oldestXid)
+			// A9: emit a PG RM_CLOG xl_clog_truncate record (pageno/oldestXact/
+			// oldestXactDb) instead of the goopg-native body. datoid stopgap = 0
+			// (goopg's redo uses only pageno+oldestXact; threading the real oldest
+			// datfrozenxid db is a follow-up — see deferral ledger). Recovery
+			// re-applies the truncation via replayCLogFromWAL's PG-format branch.
+			payload, err := wal.EncodeClogTruncatePG(oldestXid, 0)
+			if err != nil {
+				return err
+			}
 			_, endLSN, err := walWriter.Append(payload)
 			if err != nil {
 				return err
@@ -2212,42 +2199,12 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, fmt.Errorf("goopg: standby signal: %w", err)
 	}
 
-	// M0106-0010 batched-32: build the canonical WAL callback only when the
-	// writer is in PG-compat PageHeaders mode so canonical records can be read
-	// by PG18 standbys. In legacy mode (tests, no standby), LogCanonical stays
-	// nil and DDL paths skip the canonical record emission.
-	// Additionally gated on CanonicalEnabled (perf-optimize3-dash S1): with
-	// the switch off, LogCanonical stays nil and every canonical emitter
-	// (heap/btree/vacuum/DDL) no-ops on its existing nil guard.
-	var logCanonical catalog.LogCanonicalFunc
-	if walWriter != nil && walWriter.PageHeadersEnabled() && walWriter.CanonicalEnabled() {
-		logCanonical = func(payload []byte) (uint64, error) {
-			_, end, err := walWriter.Append(payload)
-			return end, err
-		}
-	}
-
-	// M0106-0010 batched-33: emit XLOG_PARAMETER_CHANGE and update pg_control
-	// GUC echo fields so the first PG standby that attaches sees consistent
-	// values in its pg_control copy. Mirrors PG's XLogReportParameters call
-	// from postmaster startup (xlog.c:8147). Only runs in PageHeaders mode;
-	// silently skipped when walWriter is nil or dataDir is empty (tests).
-	if walWriter != nil && walWriter.PageHeadersEnabled() && abs != "" {
-		if err := wal.ReportParameters(abs, walWriter, defaultGUC); err != nil {
-			_ = pool.Close()
-			_ = walWriter.Close()
-			_ = mgr.Close()
-			return nil, fmt.Errorf("goopg: ReportParameters: %w", err)
-		}
-	}
-
 	rt := &Runtime{
 		StorageMgr:     mgr,
 		Pool:           pool,
 		TxnMgr:         txnMgr,
 		Catalog:        cat,
 		WAL:            walWriter,
-		LogCanonical:   logCanonical,
 		Checkpointer:   cp,
 		Slots:          slotsReg,
 		SyncRep:        syncRep,

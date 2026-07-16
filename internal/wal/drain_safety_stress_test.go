@@ -59,11 +59,20 @@ func TestDrainSafetyStress(t *testing.T) {
 	var invariantViolations atomic.Int64
 
 	checkInvariant := func() {
-		// Read the three atomics; a transient stale read is fine, but the
-		// published ordering must never invert.
-		wr := w.writeLSNAtomic.Load()
-		dr := w.drainedLSNAtomic.Load()
+		// Read the three atomics in increasing-monotonicity order (flushed,
+		// then drained, then write). All three fields are monotonically
+		// non-decreasing (writeLSNAtomic via CAS-max storeMaxLSN; drained/
+		// flushed only ever advance to a value bounded by an already-checked
+		// write frontier — see xlogWrite's `rq.write > writtenLSN` guard).
+		// Reading write FIRST (as this used to) lets a concurrent drain/flush
+		// advance drainedLSNAtomic/flushedLSNAtomic past the now-stale write
+		// value under scheduling delay, producing a false "violation" that is
+		// really just three independent atomics sampled at different instants
+		// — not a locking bug. Reading write LAST guarantees it reflects
+		// everything already visible to the earlier reads.
 		fl := w.flushedLSNAtomic.Load()
+		dr := w.drainedLSNAtomic.Load()
+		wr := w.writeLSNAtomic.Load()
 		if dr > wr || fl > dr {
 			invariantViolations.Add(1)
 			t.Errorf("LSN invariant violated: write=%d drained=%d flushed=%d", wr, dr, fl)

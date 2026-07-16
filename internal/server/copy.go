@@ -186,7 +186,6 @@ func (s *Server) dispatchCopyViaExecutor(ctx context.Context, w *protocol.FrameW
 	ectx.MultiXact = s.cfg.MultiXact
 	ectx.Tx = tx
 	ectx.Snap = snap
-	ectx.LogCanonical = s.cfg.LogCanonical
 	asyncCommit := sessionAsyncCommit(sess)
 	ectx.AsyncCommit = asyncCommit
 

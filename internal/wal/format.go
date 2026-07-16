@@ -155,13 +155,6 @@ func maxAlignXLog(n int) int {
 }
 
 func wrapXLogMainData(payload []byte) []byte {
-	// M0106-0010 batched-32: RecordKindCanonical (0xFE) payloads carry an
-	// already-formatted PG XLogRecord body (block references + main data)
-	// starting at byte 7 (after the 7-byte canonical envelope header).
-	// Return it verbatim — no xlrBlockIDDataShort wrapping needed.
-	if len(payload) >= 7 && payload[0] == 0xFE {
-		return payload[7:]
-	}
 	if len(payload) <= 0xFF {
 		out := make([]byte, 2+len(payload))
 		out[0] = xlrBlockIDDataShort
@@ -218,15 +211,6 @@ func classifyXLogRecord(payload []byte) (Rmgr, uint8, uint32) {
 	if len(payload) == 0 {
 		return RmgrXLog, xlogInfoDefault, 0
 	}
-	// M0106-0010 batched-32: RecordKindCanonical (0xFE) carries a PG-canonical
-	// WAL record body (block references + main data) that a PG18 standby can replay.
-	// The canonical envelope header embeds the target rmgr/info/xid so the
-	// XLogRecord header is produced with the correct resource-manager fields.
-	// See catalog/canonical.go for the encoding; format.go is updated in lock-step.
-	if len(payload) >= 7 && payload[0] == 0xFE {
-		xid := binary.LittleEndian.Uint32(payload[3:7])
-		return Rmgr(payload[1]), payload[2], xid
-	}
 	// M0102-0007: PG-compatible checkpoint record (88-byte CheckPoint struct).
 	// Goopg's record-kind byte (0x02=RecordKindCheckpoint) would map to an
 	// implausible redo LSN (<256 bytes), so this path takes priority over the
@@ -242,16 +226,18 @@ func classifyXLogRecord(payload []byte) (Rmgr, uint8, uint32) {
 		// the server as ready.
 		return RmgrXLog, xlogCheckpointShutdown, 0
 	}
-	// M0105-0007: route ALL goopg-internal records through RmgrXLog
-	// with an unknown info byte (0xF0) so PG's xlog_redo safely skips
-	// them during recovery. PG's resource-manager dispatch only
-	// recognizes RmgrXLog with known info values; unknown values fall
-	// through without action. Previously records used RmgrHeap /
-	// RmgrBtree / RmgrXact which caused PG to attempt decoding the
-	// goopg-internal payload as a PG record, resulting in a segfault.
-	// Goopg's own recovery is unaffected — it reads the payload data
-	// directly and dispatches on the record-kind byte.
-	return RmgrXLog, xlogInfoDefault, 0
+	// doc 04 §3/§5.4: dispatch on the real PG-compatible (xl_rmid, xl_info)
+	// pair for this RecordKind — a real PG analog (RmgrHeap/RmgrBtree/…)
+	// when one exists, else goopg's custom RmgrGoopgCatalog rmgr (§3.2).
+	// Previously every native record classified as RmgrXLog/0xF0
+	// (M0105-0007's blanket catch-all); recovery.go's §4 dispatch rework
+	// (isGoopgOwnedRmgr) landed in the same change to keep goopg's own
+	// crash recovery routing to the native payload[0] switch for every
+	// rmgr returned here. xid stays 0 — the real xid (when one exists)
+	// lives in the payload body, not the XLogRecord header, for native
+	// records (see stream_replayer.go's replayedXactInfo).
+	rmgr, info := recordKindToRmgrInfo(payload[0])
+	return rmgr, info, 0
 }
 
 // encodeRecordXLog returns the on-disk XLogRecord stream
@@ -261,6 +247,13 @@ func classifyXLogRecord(payload []byte) (Rmgr, uint8, uint32) {
 // by emitWithPageHeaders to compute xlp_rem_len for cross-page
 // records (pad bytes are not counted in xlp_rem_len upstream).
 func encodeRecordXLog(payload []byte, prev uint64) ([]byte, int, error) {
+	// Pre-assembled PG record (block refs + FPI + main-data chunk already built
+	// by assembleXLogRecord): emit its body verbatim under the carried
+	// (rmid, info, xid) header — never re-wrap or re-classify. See
+	// pg_assembled_emit.go.
+	if rmid, info, xid, body, ok := unframePGAssembled(payload); ok {
+		return encodeAssembledXLog(body, rmid, info, xid, prev)
+	}
 	wrapped := wrapXLogMainData(payload)
 	rmgr, info, xid := classifyXLogRecord(payload)
 	realLen := xlogRecordHeaderSize + len(wrapped)

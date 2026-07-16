@@ -2,6 +2,7 @@ package executor
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"strconv"
@@ -252,7 +253,10 @@ func epqSerializationErr(ctx *Context, rel storage.RelFileNode, blk storage.Bloc
 	if sp, perr := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk}); perr == nil {
 		sp.RLock()
 		if ot, gerr := storage.PageGetHeapTuple(sp.Page(), slot); gerr == nil {
-			if ot.Header.CTID.Block == storage.InvalidBlockNumber {
+			// A never-updated row is a chain tail — self-pointing t_ctid (PG
+			// convention) or the legacy {Invalid,0} sentinel; DELETE leaves
+			// t_ctid untouched. A real successor t_ctid means UPDATE.
+			if isChainTailCTID(ot.Header.CTID, blk, slot) {
 				errMsg = "could not serialize access due to concurrent delete"
 			}
 		}
@@ -1822,6 +1826,51 @@ func (o *insertOp) Close() error {
 // RETURNING (M0100-0005) the inserted rows are accumulated in o.retRows
 // and streamed out on subsequent calls. Without RETURNING the wire layer
 // issues `INSERT N`.
+// coerceRowForConstraintChecks coerces row[i] to its declared column type in
+// place wherever include(i) is true, mirroring PostgreSQL's assignment-cast
+// semantics (transformAssignedExpr) so downstream FK/CHECK/domain/NOT-NULL
+// constraint checks — and their DETAIL-message rendering — see a properly
+// typed value instead of the raw literal Datum a VALUES/SET expression
+// produced. Catches smallint/int4 out-of-range and bigint overflow, and
+// turns a still-KindString date/timestamp/timestamptz/numeric literal into
+// its typed Datum. Skips NULL values and array-typed columns (an array
+// column's value is a "{...}" text literal, not a scalar — coercing it to
+// the element type would misparse it; M0118-0002). Shared by insertOp.Next
+// and every UPDATE new-row construction site (updateViaIndex, updateOp.Next,
+// updateWithFrom — main path and EPQ retry); pattern_sibling_paths_must_agree.
+func coerceRowForConstraintChecks(cols []catalog.Column, row Row, include func(i int) bool, ctx *Context, pos int) error {
+	for i, col := range cols {
+		if i >= len(row) || !include(i) || row[i].IsNull() || col.Type.IsArray {
+			continue
+		}
+		var coerced Datum
+		var cerr error
+		switch strings.ToLower(col.Type.Name) {
+		case "int2", "smallint", "smallserial", "serial2":
+			coerced, cerr = evalCast(row[i], "int2", pos, ctx)
+		case "int4", "integer", "int", "serial", "serial4":
+			coerced, cerr = evalCast(row[i], "int4", pos, ctx)
+		case "int8", "bigint", "bigserial", "serial8":
+			coerced, cerr = evalCast(row[i], "int8", pos, ctx)
+		case "date":
+			coerced, cerr = evalCast(row[i], "date", pos, ctx)
+		case "timestamp":
+			coerced, cerr = evalCast(row[i], "timestamp", pos, ctx)
+		case "timestamptz":
+			coerced, cerr = evalCast(row[i], "timestamptz", pos, ctx)
+		case "numeric", "decimal":
+			coerced, cerr = evalCast(row[i], "numeric", pos, ctx)
+		default:
+			continue
+		}
+		if cerr != nil {
+			return cerr
+		}
+		row[i] = coerced
+	}
+	return nil
+}
+
 func (o *insertOp) Next() (TupleSlot, error) {
 	if o.done {
 		if len(o.plan.Returning) > 0 && o.retIdx < len(o.retRows) {
@@ -1900,37 +1949,20 @@ func (o *insertOp) Next() (TupleSlot, error) {
 		// Shared with the upsert (INSERT ... ON CONFLICT) sibling path (root-0020).
 		autoGenerateSerialValues(o.ctx, o.plan.Table.Name, cols, row, insertMissing)
 
-		// Integer range enforcement: coerce explicitly-provided int values to
-		// the column's declared type (catches smallint/int4 out-of-range and
-		// bigint overflow from over-wide numeric literals).
-		for i, col := range cols {
-			if insertMissing[i] || row[i].IsNull() {
-				continue
-			}
-			// An array-typed column (e.g. `p int4[]`) carries Type.Name="int4"
-			// but Type.IsArray=true; its value is the array text literal "{1}"
-			// produced by array_construct, NOT a scalar. Coercing it to the
-			// element type would parse "{1}" as an int4 and raise 22P02
-			// (invalid input syntax). Leave array values untouched. M0118-0002.
-			if col.Type.IsArray {
-				continue
-			}
-			var coerced Datum
-			var cerr error
-			switch strings.ToLower(col.Type.Name) {
-			case "int2", "smallint", "smallserial", "serial2":
-				coerced, cerr = evalCast(row[i], "int2", o.plan.Pos())
-			case "int4", "integer", "int", "serial", "serial4":
-				coerced, cerr = evalCast(row[i], "int4", o.plan.Pos())
-			case "int8", "bigint", "bigserial", "serial8":
-				coerced, cerr = evalCast(row[i], "int8", o.plan.Pos())
-			default:
-				continue
-			}
-			if cerr != nil {
-				return nil, cerr
-			}
-			row[i] = coerced
+		// Type coercion: coerce explicitly-provided literal values to the
+		// column's declared type before FK/CHECK/domain/NOT-NULL constraint
+		// checks run below. Catches smallint/int4 out-of-range and bigint
+		// overflow from over-wide numeric literals (integer cases), and — as
+		// important — turns a still-KindString DATE/TIMESTAMP/TIMESTAMPTZ/
+		// NUMERIC literal into its typed Datum so downstream constraint-
+		// violation DETAIL messages render it the same way SELECT/COPY/CAST
+		// output does (fkValsForDetail's DateStyle fix otherwise still saw
+		// the raw un-coerced literal on the INSERT path; M-NIGHTLY
+		// 2026-07-15 follow-up). Shared with every UPDATE new-row
+		// construction site via coerceRowForConstraintChecks
+		// (pattern_sibling_paths_must_agree).
+		if err := coerceRowForConstraintChecks(cols, row, func(i int) bool { return !insertMissing[i] }, o.ctx, o.plan.Pos()); err != nil {
+			return nil, err
 		}
 
 		// BEFORE INSERT triggers (M0096-0012).
@@ -2072,9 +2104,6 @@ func (o *insertOp) Next() (TupleSlot, error) {
 			if werr != nil {
 				return nil, werr
 			}
-			if ierr := emitCanonicalHeapInsert(o.ctx, targetRel, ptr); ierr != nil {
-				return nil, ierr
-			}
 			// M0104-0007 / M0118-0001: SSI write-path hook on the newly
 			// inserted tuple's (block, slot). Conflict-in installs an rw-edge
 			// against any SERIALIZABLE reader that holds a covering predicate
@@ -2123,9 +2152,6 @@ func (o *insertOp) Next() (TupleSlot, error) {
 		ptr, werr := writeHeapRowReturning(o.ctx, targetRel, cols, row)
 		if werr != nil {
 			return nil, werr
-		}
-		if ierr := emitCanonicalHeapInsert(o.ctx, targetRel, ptr); ierr != nil {
-			return nil, ierr
 		}
 		// M0104-0007 / M0118-0001: SSI write-path hook for the non-partitioned
 		// insert path; aborts in place (40001) on a committed-pivot structure.
@@ -2830,9 +2856,18 @@ func markHeapPruneOptDirty(
 func markHeapHotUpdateDirty(
 	pool *storage.Pool, slot *storage.Slot,
 	rel storage.RelFileNode, blk storage.BlockNumber,
-	oldLineSlot uint16, xmax storage.TransactionID,
+	oldLineSlot, newLineSlot uint16, xmax storage.TransactionID,
 	tupleBytes []byte,
 ) error {
+	// Adopt PG's self-pointing t_ctid for the HOT new version (the chain tail),
+	// matching what replay reconstructs (xl_heap_update carries no new t_ctid).
+	// A2-pre made fresh inserts self-pointing; HOT new versions go through this
+	// path, not markHeapInsertDirty, so stamp here too. isChainTailCTID treats
+	// self identically to the legacy {Invalid,0}. Caller holds slot.Lock and has
+	// already PageAddHeapTuple'd the new version at newLineSlot.
+	if err := storage.PageSetHeapTupleCtid(slot.Page(), newLineSlot, storage.ItemPointer{Block: blk, Offset: newLineSlot}); err != nil {
+		return err
+	}
 	logHot := pool.LogHeapHotUpdate()
 	if logHot == nil {
 		pool.MarkDirty(slot)
@@ -2841,7 +2876,7 @@ func markHeapHotUpdateDirty(
 	// MarkDirtyLogicalChange — see markHeapInsertDirty for the
 	// rationale.
 	return pool.MarkDirtyLogicalChange(slot, func() (storage.LSN, error) {
-		return logHot(rel, blk, oldLineSlot, xmax, tupleBytes)
+		return logHot(rel, blk, oldLineSlot, newLineSlot, xmax, tupleBytes)
 	})
 }
 
@@ -3324,11 +3359,6 @@ func tryApplyHOTUpdate(
 				// Emit WAL for the prune BEFORE the HOT-insert WAL so replay
 				// restores space first.
 				if pderr := markHeapPruneOptDirty(ctx.Pool, s, rel, blk, result); pderr == nil {
-					if cerr := emitCanonicalHeapPruneLocked(ctx, s, rel, blk, uint32(effectiveWriterXID(ctx)), true); cerr != nil {
-						s.Unlock()
-						ctx.Pool.Unpin(s)
-						return false, cerr
-					}
 					newSlot, addErr = storage.PageAddHeapTuple(s.Page(), tup)
 				}
 			}
@@ -3397,12 +3427,9 @@ func tryApplyHOTUpdate(
 		return false, stampErr
 	}
 
-	derr := markHeapHotUpdateDirty(ctx.Pool, s, rel, blk, oldSlot, effectiveWriterXID(ctx), tupleBytes)
+	derr := markHeapHotUpdateDirty(ctx.Pool, s, rel, blk, oldSlot, newSlot, effectiveWriterXID(ctx), tupleBytes)
 	s.Unlock()
 	ctx.Pool.Unpin(s)
-	if derr == nil {
-		derr = emitCanonicalHeapHotUpdate(ctx, rel, blk, newSlot)
-	}
 	if derr == nil && ctx.InDMLCTE && ctx.CTEWriteFence != nil {
 		newItemPtr := storage.ItemPointer{Block: blk, Offset: newSlot}
 		oldItemPtr := storage.ItemPointer{Block: blk, Offset: oldSlot}
@@ -3773,6 +3800,10 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 	}
 	pending := make([]pendingUpdate, 0, 1) // pre-alloc for common 1-row match
 	heapRel := rel
+	// M-NIGHTLY 2026-07-15 UPDATE-side follow-up: only columns this
+	// statement's SET clause actually touches need coercion — an untouched
+	// column's value came straight from storage and is already typed.
+	setCol := func(i int) bool { return i < len(o.plan.Set) && o.plan.Set[i] != nil }
 
 	hiBytes := keyBytes
 	if len(ix.Index.Columns) > 1 {
@@ -3792,25 +3823,12 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 		if !found {
 			return true, nil
 		}
-		// Check for foreign tuple lock (M0021 step 2b) on the live version.
-		if foreignLockOnly(tuple.Header, o.ctx.Tx.XID) {
-			livePtr := storage.ItemPointer{Block: ptr.Block, Offset: actualSlot}
-			if err := o.ctx.acquireTupleLock(rel, livePtr, lockmgr.ExclusiveLock); err != nil {
-				return false, err
-			}
-			// Re-read after lock released — follow chain again.
-			slot2, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: heapRel, Block: ptr.Block})
-			if err != nil {
-				return false, err
-			}
-			slot2.RLock()
-			tuple, actualSlot, found = followHOTChain(slot2.Page(), ptr.Offset, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.MultiXact)
-			slot2.RUnlock()
-			o.ctx.Pool.Unpin(slot2)
-			if !found {
-				return true, nil
-			}
-		}
+		// No tuple-tag acquire on a foreign lock-only holder here: the
+		// write path sleeps (and takes the tag, FIFO, member-skip) in
+		// waitForConflictingRowLock, which the caller runs before the
+		// stamp — acquiring up front on a possibly NON-conflicting held
+		// lock would queue behind an unrelated parked waiter (design
+		// 0021-0012).
 		var decRow Row
 		decRow, err = make(Row, len(cols)), nil
 		decNatts := int(tuple.Header.Infomask2 & 0x07FF)
@@ -3848,6 +3866,13 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 				return false, err
 			}
 			newRow[i] = v
+		}
+		// M-NIGHTLY 2026-07-15 UPDATE-side follow-up: coerce freshly-SET
+		// literal values to their declared column type — the same step
+		// insertOp.Next already applies to VALUES-clause literals — before
+		// FK/CHECK/domain/NOT-NULL constraint checks run below.
+		if err := coerceRowForConstraintChecks(cols, newRow, setCol, o.ctx, o.plan.Pos()); err != nil {
+			return false, err
 		}
 		// Recompute GENERATED ALWAYS AS … STORED columns after SET. M0096-0008.
 		_ = computeGeneratedColumns(cols, newRow)
@@ -4030,9 +4055,9 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 							sp.RLock()
 							if ot, gerr := storage.PageGetHeapTuple(sp.Page(), pu.slot); gerr == nil {
 								ctid := ot.Header.CTID
-								// goopg initial CTID is {InvalidBlockNumber,0}; stampOldCtid
-								// only runs on UPDATE. So InvalidBlockNumber means deleted.
-								if ctid.Block == storage.InvalidBlockNumber {
+								// A never-updated row is a chain tail (self-pointing t_ctid or the
+								// legacy {Invalid,0} sentinel); a real successor t_ctid means UPDATE.
+								if isChainTailCTID(ctid, pu.blk, pu.slot) {
 									errMsg = "could not serialize access due to concurrent delete"
 								}
 							}
@@ -4076,6 +4101,9 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 						} else {
 							pu.newRow[i] = baseRow[i]
 						}
+					}
+					if err := coerceRowForConstraintChecks(cols, pu.newRow, setCol, o.ctx, o.plan.Pos()); err != nil {
+						return nil, err
 					}
 					_ = computeGeneratedColumns(cols, pu.newRow)
 					pu.blk = newBlk
@@ -4252,15 +4280,6 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 						o.ctx.Pool.Unpin(s2)
 					}
 				}
-				// Emit canonical WAL for this UPDATE.
-				if o.ctx.LogCanonical != nil {
-					if derr := emitCanonicalHeapDelete(o.ctx, rel, pu.blk, pu.slot); derr != nil {
-						return nil, derr
-					}
-					if ierr := emitCanonicalHeapInsert(o.ctx, targetWriteRel, newPtr); ierr != nil {
-						return nil, ierr
-					}
-				}
 				break
 			}
 		}
@@ -4322,7 +4341,7 @@ func (o *updateOp) Next() (TupleSlot, error) {
 		}
 	}
 	// M0093: UPDATE is unconditionally a write — materialise the
-	// transaction's XID before the scan so foreignLockOnly /
+	// transaction's XID before the scan so selfRowLockMember /
 	// isConcurrentlyUpdated / tuple-lock acquisition see the real
 	// XID (zero would cause false-negative race detection and
 	// would mis-classify our own locks as foreign).
@@ -4397,6 +4416,10 @@ func (o *updateOp) Next() (TupleSlot, error) {
 		beforeFired    bool           // BEFORE trigger already fired in Phase 1 (M0100-0011)
 	}
 	pending := make([]pendingUpdate, 0, 1)
+	// M-NIGHTLY 2026-07-15 UPDATE-side follow-up: only columns this
+	// statement's SET clause actually touches need coercion — an untouched
+	// column's value came straight from storage and is already typed.
+	setCol := func(i int) bool { return i < len(o.plan.Set) && o.plan.Set[i] != nil }
 
 	for _, scanTbl := range updateScanTables {
 		scanRel := o.ctx.Catalog.RelFileNode(scanTbl)
@@ -4447,6 +4470,9 @@ func (o *updateOp) Next() (TupleSlot, error) {
 						parentNewRow[pi] = evalRow[pi]
 					}
 				}
+				if err := coerceRowForConstraintChecks(cols, parentNewRow, setCol, o.ctx, o.plan.Pos()); err != nil {
+					return err
+				}
 				newRow = remapParentRowToChild(parentNewRow, row, cols, captureCols)
 			} else {
 				nCols := len(captureCols)
@@ -4464,6 +4490,9 @@ func (o *updateOp) Next() (TupleSlot, error) {
 							newRow[i] = row[i]
 						}
 					}
+				}
+				if err := coerceRowForConstraintChecks(captureCols, newRow, setCol, o.ctx, o.plan.Pos()); err != nil {
+					return err
 				}
 				// scanTbl==tbl or a partition child: PG requires a partition's
 				// columns to exactly mirror the partitioned table's layout (only
@@ -4551,14 +4580,14 @@ func (o *updateOp) Next() (TupleSlot, error) {
 					}
 					// Concurrent tx committed (visible=false via fresh RC snapshot).
 					if o.ctx.Tx.Isolation != mvcc.IsolationReadCommitted {
-						// Distinguish update vs delete: goopg initial CTID is
-						// {InvalidBlockNumber,0}; stampOldCtid only runs on UPDATE.
+						// Distinguish update vs delete: chain-tail t_ctid (self or
+						// {Invalid,0}) means never-updated; a successor means UPDATE.
 						errMsg := "could not serialize access due to concurrent update"
 						if sp, perr := o.ctx.Pool.Pin(storage.BufferTag{Rel: captureRel, Block: writeBlk}); perr == nil {
 							sp.RLock()
 							if ot, gerr := storage.PageGetHeapTuple(sp.Page(), writeSlot); gerr == nil {
 								ctid := ot.Header.CTID
-								if ctid.Block == storage.InvalidBlockNumber {
+								if isChainTailCTID(ctid, writeBlk, writeSlot) {
 									errMsg = "could not serialize access due to concurrent delete"
 								}
 							}
@@ -4595,6 +4624,9 @@ func (o *updateOp) Next() (TupleSlot, error) {
 								newRow[i] = baseRow[i]
 							}
 						}
+					}
+					if err := coerceRowForConstraintChecks(captureCols, newRow, setCol, o.ctx, o.plan.Pos()); err != nil {
+						return err
 					}
 					_ = computeGeneratedColumns(captureCols, newRow)
 					oldRow = cloneRow(baseRow)
@@ -4770,14 +4802,14 @@ func (o *updateOp) Next() (TupleSlot, error) {
 					}
 					// Concurrent tx committed — row was updated or deleted.
 					if o.ctx.Tx.Isolation != mvcc.IsolationReadCommitted {
-						// Distinguish UPDATE vs DELETE: goopg initial CTID is
-						// {InvalidBlockNumber,0}; stampOldCtid only runs on UPDATE.
+						// Distinguish UPDATE vs DELETE: chain-tail t_ctid (self or
+						// {Invalid,0}) means never-updated; a successor means UPDATE.
 						errMsg := "could not serialize access due to concurrent update"
 						if sp, perr := o.ctx.Pool.Pin(storage.BufferTag{Rel: puRel, Block: pu.blk}); perr == nil {
 							sp.RLock()
 							if ot, gerr := storage.PageGetHeapTuple(sp.Page(), pu.slot); gerr == nil {
 								ctid := ot.Header.CTID
-								if ctid.Block == storage.InvalidBlockNumber {
+								if isChainTailCTID(ctid, pu.blk, pu.slot) {
 									errMsg = "could not serialize access due to concurrent delete"
 								}
 							}
@@ -4824,6 +4856,9 @@ func (o *updateOp) Next() (TupleSlot, error) {
 								pu.newRow[i] = baseRow[i]
 							}
 						}
+					}
+					if err := coerceRowForConstraintChecks(puCols, pu.newRow, setCol, o.ctx, o.plan.Pos()); err != nil {
+						return nil, err
 					}
 					_ = computeGeneratedColumns(puCols, pu.newRow)
 					// M0100-0005aa: refresh OLD with the EPQ-refetched row so any
@@ -4977,16 +5012,6 @@ func (o *updateOp) Next() (TupleSlot, error) {
 				if !isCrossPartitionMove {
 					if cerr := stampOldCtid(o.ctx, puRel, pu.blk, pu.slot, newPtr); cerr != nil {
 						return nil, cerr
-					}
-				}
-				// Emit canonical WAL for this UPDATE: DELETE of old page
-				// (post xmax+ctid stamp) then INSERT of new page.
-				if o.ctx.LogCanonical != nil {
-					if derr := emitCanonicalHeapDelete(o.ctx, puRel, pu.blk, pu.slot); derr != nil {
-						return nil, derr
-					}
-					if ierr := emitCanonicalHeapInsert(o.ctx, targetWriteRel, newPtr); ierr != nil {
-						return nil, ierr
 					}
 				}
 				break // success — exit epq retry loop
@@ -5585,9 +5610,6 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 			if derr != nil {
 				return nil, derr
 			}
-			if cerr := emitCanonicalHeapDelete(o.ctx, victimRel, v.blk, v.slot); cerr != nil {
-				return nil, cerr
-			}
 			break // success — exit epq retry loop
 		} // end epq retry loop
 		if !epqSkipDel {
@@ -5653,6 +5675,15 @@ func collectNodeRows(node planner.Node, ctx *Context) ([]Row, error) {
 	return rows, nil
 }
 
+// rowDedupKey identifies a physical row across a possibly multi-relation
+// scan (target table + inheritance children): a bare (block, slot) pair
+// collides across relations since every table numbers its own blocks from
+// 0. Shared by updateWithFrom and deleteViaUsing's inheritance fan-out.
+type rowDedupKey struct {
+	tag  storage.BufferTag
+	slot uint16
+}
+
 // updateWithFrom implements UPDATE … FROM by collecting all FROM-table rows
 // into memory, then doing a nested-loop cross-product against each target
 // table row, applying o.plan.FromPred to find matching combinations, and
@@ -5688,6 +5719,10 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 	var pending []pendingUpdate
 	tgtColCount := len(tgtCols)
 	needFromForReturning := len(o.plan.Returning) > 0
+	// M-NIGHTLY 2026-07-15 UPDATE-side follow-up: only columns this
+	// statement's SET clause actually touches need coercion — an untouched
+	// column's value came straight from storage and is already typed.
+	setCol := func(i int) bool { return i < len(o.plan.Set) && o.plan.Set[i] != nil }
 
 	// Collect inheritance children and partition children for the FROM target scan.
 	// Partition children share the parent's column ordinals (no remapping), but may
@@ -5763,6 +5798,9 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 						} else if i < len(tgtRow) {
 							parentNewRow[i] = tgtRow[i]
 						}
+					}
+					if err := coerceRowForConstraintChecks(tgtCols, parentNewRow, setCol, o.ctx, o.plan.Pos()); err != nil {
+						return err
 					}
 					// For inheritance children, map back to child column order for writing.
 					var actualNewRow Row
@@ -5845,7 +5883,7 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 		updReqStatusFrom = multixact.StatusUpdate
 	}
 	fksToRecheckFrom := o.childFKsToRecheck()
-	seen := make(map[[2]uint64]bool)
+	seen := make(map[rowDedupKey]bool)
 	for _, pu := range pending {
 		puSrcRel := pu.srcRel
 		if puSrcRel == (storage.RelFileNode{}) {
@@ -5859,7 +5897,12 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 		if puCols == nil {
 			puCols = tgtCols
 		}
-		key := [2]uint64{uint64(pu.blk), uint64(pu.slot)}
+		// Keyed by (relation, block, slot) — NOT just (block, slot): distinct
+		// inheritance-child relations each number their own blocks from 0, so
+		// two different tables' rows can share the same (blk, slot) pair. A
+		// bare (blk, slot) key falsely treats a child table's row as "already
+		// updated by an earlier FROM match" and silently skips it.
+		key := rowDedupKey{tag: storage.BufferTag{Rel: puSrcRel, Block: pu.blk}, slot: pu.slot}
 		if seen[key] {
 			continue // already updated by an earlier FROM match
 		}
@@ -6003,6 +6046,9 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 						parentNewRow[i] = epqRow[i]
 					}
 				}
+				if err := coerceRowForConstraintChecks(tgtCols, parentNewRow, setCol, o.ctx, o.plan.Pos()); err != nil {
+					return nil, err
+				}
 				// Re-route to partition if partition key changed. M0100-0010.
 				epqWriteRel := puSrcRel
 				epqWriteCols := puCols
@@ -6025,6 +6071,17 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 				pu.slot = newSlot
 				puRel = epqWriteRel
 				puCols = epqWriteCols
+			} else {
+				// No concurrent modification: the Pin+Lock taken above still
+				// targets the right (block, slot) and must be released before
+				// the unconditional re-Pin+Lock below re-acquires it — without
+				// this, the re-Lock deadlocks against the lock this same
+				// goroutine is still holding (M-NIGHTLY with-regress hang;
+				// only reachable when puSrcRel != rel, i.e. a row sourced from
+				// an inheritance child, since same-rel rows take the HOT path
+				// above and never reach here).
+				s.Unlock()
+				o.ctx.Pool.Unpin(s)
 			}
 			var oldTupleBytes []byte
 			s, err = o.ctx.Pool.Pin(storage.BufferTag{Rel: puSrcRel, Block: pu.blk})
@@ -6091,14 +6148,6 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 					return nil, cerr
 				}
 			}
-			if o.ctx.LogCanonical != nil {
-				if derr := emitCanonicalHeapDelete(o.ctx, puSrcRel, pu.blk, pu.slot); derr != nil {
-					return nil, derr
-				}
-				if ierr := emitCanonicalHeapInsert(o.ctx, puRel, newPtr); ierr != nil {
-					return nil, ierr
-				}
-			}
 		}
 		if serr := ssiRecordTupleWrite(o.ctx, puSrcRel, pu.blk, pu.slot); serr != nil {
 			return nil, serr
@@ -6163,7 +6212,7 @@ func (o *deleteOp) deleteWithUsing() (TupleSlot, error) {
 		usingPortion Row // joined USING-table columns for RETURNING; nil when RETURNING absent
 	}
 	var victims []victim
-	seen := make(map[[2]uint64]bool)
+	seen := make(map[rowDedupKey]bool)
 
 	// Collect inheritance children for the USING target scan. M0097-0078.
 	type usingScanTarget struct {
@@ -6189,7 +6238,10 @@ func (o *deleteOp) deleteWithUsing() (TupleSlot, error) {
 	for _, ust := range usingScanTargets {
 		ust := ust // capture
 		if err := scanMatching(o.ctx, ust.rel, 0, ust.cols, nil, func(blk storage.BlockNumber, slot uint16, rawRow Row) error {
-			key := [2]uint64{uint64(blk), uint64(slot)}
+			// Keyed by (relation, block, slot) — see rowDedupKey: a bare
+			// (blk, slot) key collides across different inheritance-child
+			// relations and silently drops victims from the DELETE.
+			key := rowDedupKey{tag: storage.BufferTag{Rel: ust.rel, Block: blk}, slot: slot}
 			if seen[key] {
 				return nil
 			}
@@ -6310,9 +6362,6 @@ func (o *deleteOp) deleteWithUsing() (TupleSlot, error) {
 		if derr != nil {
 			return nil, derr
 		}
-		if cerr := emitCanonicalHeapDelete(o.ctx, vRel, v.blk, v.slot); cerr != nil {
-			return nil, cerr
-		}
 		if serr := ssiRecordTupleWrite(o.ctx, vRel, v.blk, v.slot); serr != nil {
 			return nil, serr
 		}
@@ -6332,24 +6381,6 @@ func (o *deleteOp) deleteWithUsing() (TupleSlot, error) {
 		return SlotFromRow(o.plan.ReturningSchema, row), nil
 	}
 	return nil, EOF
-}
-
-// foreignLockOnly reports whether `h` indicates the tuple is
-// currently row-locked by another live transaction (M0021
-// tuple-level locking step 2b). The xmax field carries the
-// locker's xid; the HeapXmaxLockOnly infomask bit distinguishes
-// a lock from a real delete. We wait on the lockmgr's
-// transaction-scoped tuple tag — when the locker commits /
-// aborts, ReleaseAll drops the tuple-tag holder and the waiting
-// UPDATE / DELETE wakes up.
-func foreignLockOnly(h storage.HeapTupleHeader, currentXID storage.TransactionID) bool {
-	if h.Xmax == storage.InvalidTransactionID {
-		return false
-	}
-	if h.Xmax == currentXID {
-		return false
-	}
-	return storage.IsHeapTupleLockOnly(h.Infomask)
 }
 
 // scanMatching sequentially scans `rel`, decoding every visible tuple, applying
@@ -6387,9 +6418,8 @@ func scanMatching(ctx *Context, rel storage.RelFileNode, statOID uint32, cols []
 		// per-row interleaving of WHERE side-effects (RAISE NOTICE) and
 		// callbacks (BEFORE triggers), matching PG's per-row scan semantics.
 		type visibleTuple struct {
-			slot     uint16
-			row      Row
-			lockedBy storage.TransactionID
+			slot uint16
+			row  Row
 		}
 		var visible []visibleTuple
 		scanRow := make(Row, len(cols))
@@ -6448,9 +6478,8 @@ func scanMatching(ctx *Context, rel storage.RelFileNode, statOID uint32, cols []
 			rowCopy := make(Row, len(cols))
 			copy(rowCopy, scanRow)
 			visible = append(visible, visibleTuple{
-				slot:     slot,
-				row:      rowCopy,
-				lockedBy: lockedByForeign(tuple.Header, ctx.Tx.XID),
+				slot: slot,
+				row:  rowCopy,
 			})
 		}
 		s.RUnlock()
@@ -6476,18 +6505,15 @@ func scanMatching(ctx *Context, rel storage.RelFileNode, statOID uint32, cols []
 					continue
 				}
 			}
-			// M0021 step 2b: if the tuple is row-locked by
-			// another live xact (HEAP_XMAX_LOCK_ONLY +
-			// xmax != ours), block on the locker's tuple-tag
-			// in the lockmgr. ReleaseAll on the locker's
-			// commit/abort wakes us up; we then proceed
-			// with the UPDATE / DELETE atomic stamp.
-			if vt.lockedBy != storage.InvalidTransactionID {
-				ptr := storage.ItemPointer{Block: blk, Offset: vt.slot}
-				if err := ctx.acquireTupleLock(rel, ptr, lockmgr.ExclusiveLock); err != nil {
-					return err
-				}
-			}
+			// No tuple-tag acquire on a foreign lock-only holder here
+			// (formerly M0021 step 2b): blocking on a conflicting row
+			// lock — including the FIFO tuple-tag acquire, with the
+			// current-is-member skip — is waitForConflictingRowLock's
+			// job, run by the UPDATE/DELETE callback before it stamps.
+			// Acquiring up front regardless of conflict would queue a
+			// non-conflicting write (e.g. a no-key UPDATE over a FOR
+			// KEY SHARE holder) behind an unrelated parked waiter
+			// holding the tag (design 0021-0012).
 			if err := fn(blk, vt.slot, vt.row); err != nil {
 				return err
 			}
@@ -6498,19 +6524,6 @@ func scanMatching(ctx *Context, rel storage.RelFileNode, statOID uint32, cols []
 	// M0118-0009 (`stats`, rung 6; design 0118-0128).
 	recordRelScan(ctx, statOID, examined)
 	return nil
-}
-
-// lockedByForeign returns the locking xid when `h` indicates the
-// tuple is row-locked by another live xact (HEAP_XMAX_LOCK_ONLY
-// + xmax != currentXID); InvalidTransactionID otherwise.
-// Capturing this at scan time and using the captured value at
-// the per-row dispatch loop avoids re-reading the page after
-// we've released its RLock.
-func lockedByForeign(h storage.HeapTupleHeader, currentXID storage.TransactionID) storage.TransactionID {
-	if foreignLockOnly(h, currentXID) {
-		return h.Xmax
-	}
-	return storage.InvalidTransactionID
 }
 
 // conflictingRowLockHolders returns the still-active foreign transactions that
@@ -6576,6 +6589,46 @@ func conflictingRowLockHolders(ctx *Context, h storage.HeapTupleHeader, reqStatu
 	return nil
 }
 
+// selfRowLockMember is the write-path twin of lockRowsOp.selfIsLockMember:
+// upstream's `current_is_member` — whether this backend (top-level xact or
+// any of its subxacts) already holds a lock/updater membership on the
+// tuple. Used to skip the pre-sleep tuple-tag acquire, which would
+// otherwise deadlock an upgrader behind a waiter parked on our own held
+// lock (heap_update/heap_delete's `if (!current_is_member)`). 0021-0012.
+func selfRowLockMember(ctx *Context, h storage.HeapTupleHeader) bool {
+	isSelf := func(xid storage.TransactionID) bool {
+		if xid == storage.InvalidTransactionID {
+			return false
+		}
+		if xid == ctx.Tx.XID {
+			return true
+		}
+		if ctx.TxnMgr == nil {
+			return false
+		}
+		return ctx.TxnMgr.TopLevelXid(xid) == ctx.TxnMgr.TopLevelXid(ctx.Tx.XID)
+	}
+	if h.Xmax == storage.InvalidTransactionID {
+		return false
+	}
+	if storage.IsHeapTupleXmaxMulti(h.Infomask) {
+		if ctx.MultiXact == nil {
+			return false
+		}
+		members, ok := ctx.MultiXact.Members(multixact.MultiXactId(h.Xmax))
+		if !ok {
+			return false
+		}
+		for _, m := range members {
+			if isSelf(m.Xid) {
+				return true
+			}
+		}
+		return false
+	}
+	return isSelf(h.Xmax)
+}
+
 // waitForConflictingRowLock blocks the current write until no still-active
 // foreign transaction holds a conflicting row lock on (rel,blk,slot). It is the
 // write-path counterpart to the lock-only wait branch in stampLockInner: a row
@@ -6587,6 +6640,7 @@ func conflictingRowLockHolders(ctx *Context, h storage.HeapTupleHeader, reqStatu
 // Each holder is waited on via epqWait, which registers a wait-for-graph edge,
 // so a lock cycle surfaces as a 40001 deadlock rather than hanging.
 func waitForConflictingRowLock(ctx *Context, rel storage.RelFileNode, blk storage.BlockNumber, slot uint16, reqStatus multixact.Status, pos int) error {
+	tupleTagged := false
 	for {
 		s, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
 		if err != nil {
@@ -6595,13 +6649,34 @@ func waitForConflictingRowLock(ctx *Context, rel storage.RelFileNode, blk storag
 		s.RLock()
 		tup, gerr := storage.PageGetHeapTuple(s.Page(), slot)
 		var holders []storage.TransactionID
+		selfMember := false
 		if gerr == nil {
 			holders = conflictingRowLockHolders(ctx, tup.Header, reqStatus)
+			if len(holders) > 0 {
+				selfMember = selfRowLockMember(ctx, tup.Header)
+			}
 		}
 		s.RUnlock()
 		ctx.Pool.Unpin(s)
 		if len(holders) == 0 {
 			return nil
+		}
+		// About to sleep on a conflicting holder: take the heavyweight tuple
+		// tag first — heap_update/heap_delete's heap_acquire_tuplock before
+		// MultiXactIdWait/XactLockTableWait — so concurrent waiters on this
+		// row are granted in FIFO arrival order when the holder ends, instead
+		// of racing on the WaitForXID broadcast. Skipped when this backend is
+		// already a lock member on the tuple (upstream's
+		// `if (!current_is_member)` guard): a parked waiter on the tag is
+		// waiting for OUR held lock, so queueing behind it would deadlock
+		// (tuplelock-upgrade-no-deadlock s3_delete after s3_keyshare).
+		// Released at statement end (executor.ReleaseTupleLocks). 0021-0012.
+		if !tupleTagged && !selfMember {
+			ptr := storage.ItemPointer{Block: blk, Offset: slot}
+			if err := ctx.acquireTupleLock(rel, ptr, tupleLockHwMode(reqStatus)); err != nil {
+				return err
+			}
+			tupleTagged = true
 		}
 		for _, hx := range holders {
 			if dl, terr := epqWait(ctx, hx); terr != nil {
@@ -7690,11 +7765,8 @@ func isLiveForUniqueCheck(ctx *Context, xmin, xmax storage.TransactionID) bool {
 // page in a checkpoint epoch emit a small logical record instead
 // of a full FPI. See docs/design/0002-0003-redo-records.md.
 func writeHeapRow(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, row Row) error {
-	ptr, err := writeHeapRowReturning(ctx, rel, cols, row)
-	if err != nil {
-		return err
-	}
-	return emitCanonicalHeapInsert(ctx, rel, ptr)
+	_, err := writeHeapRowReturning(ctx, rel, cols, row)
+	return err
 }
 
 // writeHeapRowReturning is writeHeapRow's variant that surfaces the
@@ -7771,11 +7843,8 @@ func writeHeapRowReturning(ctx *Context, rel storage.RelFileNode, cols []catalog
 		return ptr, err
 	}
 
-	// Always emit the native RecordKindHeapInsert WAL record so the logical
-	// decoder sees the change. When ctx.LogCanonical != nil, the caller also
-	// emits a canonical XLOG_HEAP_INSERT (FPI) via emitCanonicalHeapInsert.
-	// PG physical standbys skip the native record; goopg's classifier skips
-	// the canonical one. Both coexist safely in the WAL stream.
+	// Emits the native RecordKindHeapInsert WAL record so the logical
+	// decoder sees the change.
 	logHeap := ctx.Pool.LogHeapInsert()
 	tryAppendToBlock := func(blk storage.BlockNumber) (bool, error) {
 		slot, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
@@ -7910,7 +7979,7 @@ func writeHeapRowReturning(ctx *Context, rel storage.RelFileNode, cols []catalog
 		// — [[0107-0007g]]). One disk-side syscall covers the burst
 		// instead of one per stripe; the extras prime the cross-stripe
 		// FSM re-check above.
-		firstBlk, err := batchExtendAndRegisterFSM(ctx.Pool, ctx.FSM, rel)
+		firstBlk, err := batchExtendAndRegisterFSM(ctx.Pool, ctx.FSM, rel, ctx.Tx.XID)
 		if err != nil {
 			return ptr, err
 		}
@@ -7933,7 +8002,7 @@ func writeHeapRowReturning(ctx *Context, rel storage.RelFileNode, cols []catalog
 	// in-memory before we ever touch the disk for content) and adds
 	// only one page, matching the test-fixture invariant that a single
 	// INSERT into a fresh relation grows it by exactly one page.
-	slot, blk, err := ctx.Pool.PinNew(rel)
+	slot, blk, err := ctx.Pool.PinNewWithXID(rel, ctx.Tx.XID)
 	if err != nil {
 		return ptr, err
 	}
@@ -8015,9 +8084,6 @@ func writeHeapRowReturningPG(ctx *Context, rel storage.RelFileNode, cols []catal
 	}
 
 	logHeap := ctx.Pool.LogHeapInsert()
-	if ctx.LogCanonical != nil {
-		logHeap = nil
-	}
 	tryAppendToBlock := func(blk storage.BlockNumber) (bool, error) {
 		slot, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
 		if err != nil {
@@ -8118,7 +8184,7 @@ func writeHeapRowReturningPG(ctx *Context, rel storage.RelFileNode, cols []catal
 	}
 
 	if contended {
-		firstBlk, err := batchExtendAndRegisterFSM(ctx.Pool, ctx.FSM, rel)
+		firstBlk, err := batchExtendAndRegisterFSM(ctx.Pool, ctx.FSM, rel, ctx.Tx.XID)
 		if err != nil {
 			return ptr, err
 		}
@@ -8132,7 +8198,7 @@ func writeHeapRowReturningPG(ctx *Context, rel storage.RelFileNode, cols []catal
 		return ptr, &ExecError{Code: "XX000", Message: "freshly batch-extended page did not accept tuple"}
 	}
 
-	slot, blk, err := ctx.Pool.PinNew(rel)
+	slot, blk, err := ctx.Pool.PinNewWithXID(rel, ctx.Tx.XID)
 	if err != nil {
 		return ptr, err
 	}
@@ -8170,9 +8236,38 @@ func markHeapInsertDirty(
 	rel storage.RelFileNode, blk storage.BlockNumber,
 	lineSlot uint16, tupleBytes []byte,
 ) error {
+	// Adopt PostgreSQL's self-pointing t_ctid for a freshly inserted tuple:
+	// stamp {blk, lineSlot} in place of goopg's legacy {InvalidBlockNumber, 0}
+	// sentinel. The slot's line pointer is assigned by the caller's
+	// PageAddHeapTuple, so blk/lineSlot are only known here (post-append) —
+	// this is the single choke point every fresh-insert path funnels through.
+	// Both the stored page AND tupleBytes are stamped: goopg's native
+	// RecordKindHeapInsert carries the whole tuple verbatim, so redo must
+	// reconstruct the same self-pointing t_ctid (and the FPI captured below by
+	// MarkDirtyLogicalChange must see it too). isChainTailCTID treats a
+	// self-pointing t_ctid identically to the old sentinel. Caller holds slot.Lock.
+	self := storage.ItemPointer{Block: blk, Offset: lineSlot}
+	if err := storage.PageSetHeapTupleCtid(slot.Page(), lineSlot, self); err != nil {
+		return err
+	}
+	if len(tupleBytes) >= 18 {
+		binary.LittleEndian.PutUint32(tupleBytes[12:16], uint32(blk))
+		binary.LittleEndian.PutUint16(tupleBytes[16:18], lineSlot)
+	}
+
 	if logHeap == nil {
 		pool.MarkDirty(slot)
 		return nil
+	}
+	// A9: XLOG_HEAP_INIT_PAGE — when this tuple is the FIRST on the page (the
+	// page has exactly one line pointer after the insert), mark the record so a
+	// heterogeneous PG standby PageInit's the (possibly not-yet-extended) page
+	// before applying, instead of PANICking with "reference to an invalid page".
+	// Mirrors PG's own first-insert-on-a-new-page behaviour; harmless for goopg's
+	// own replay (opcode is masked by 0x70).
+	initPage := false
+	if cnt, cerr := storage.PageLinePointerCount(slot.Page()); cerr == nil && cnt == 1 {
+		initPage = true
 	}
 	// MarkDirtyLogicalChange (not MarkDirtyChangeRecord): the logical
 	// HeapInsert record MUST always be emitted so the M0008 logical
@@ -8181,7 +8276,7 @@ func markHeapInsertDirty(
 	// of a bare PageImage — fine for redo, fatal for logical
 	// replication. See docs/design/0103-0018-heap-fpi-and-logical-record-coexistence.md.
 	return pool.MarkDirtyLogicalChange(slot, func() (storage.LSN, error) {
-		return logHeap(rel, blk, lineSlot, tupleBytes)
+		return logHeap(rel, blk, lineSlot, tupleBytes, initPage)
 	})
 }
 
@@ -8217,13 +8312,8 @@ func markHeapDeleteDirtyAndClearVM(
 	lineSlot uint16, xmax storage.TransactionID,
 	oldTuple []byte,
 ) error {
-	// Always emit the native RecordKindHeapDelete WAL record so the logical
+	// Emits the native RecordKindHeapDelete WAL record so the logical
 	// decoder (classifier.go) sees the change for pgoutput/logical replication.
-	// When ctx.LogCanonical != nil, the caller additionally emits a canonical
-	// XLOG_HEAP_DELETE record (FPI) after unpinning the slot. PG physical
-	// standbys safely skip the native record (classifyXLogRecord routes it via
-	// RmgrXLog/0xF0) and apply the canonical FPI; goopg's classifier skips the
-	// canonical record and processes the native one.
 	if err := markHeapDeleteDirty(ctx.Pool, slot, rel, blk, lineSlot, xmax, oldTuple); err != nil {
 		return err
 	}
@@ -8231,116 +8321,4 @@ func markHeapDeleteDirtyAndClearVM(
 		ctx.VM.ClearBlock(rel, blk)
 	}
 	return nil
-}
-
-// emitCanonicalHeapInsert emits a PG-canonical XLOG_HEAP_INSERT record with
-// a full-page image for the page at ptr. Called by insertOp and updateOp
-// (for the new-tuple page) after writeHeapRowReturning, when ctx.LogCanonical
-// is non-nil. The page is re-pinned to capture its post-insert state.
-func emitCanonicalHeapInsert(ctx *Context, rel storage.RelFileNode, ptr storage.ItemPointer) error {
-	if ctx.LogCanonical == nil || ctx.Pool == nil {
-		return nil
-	}
-	slot, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: ptr.Block})
-	if err != nil {
-		return fmt.Errorf("canonical WAL pin insert: %w", err)
-	}
-	page := make(storage.Page, storage.BlockSize)
-	slot.Lock()
-	copy(page, slot.Page())
-	endLSN, emitErr := catalog.PgCanonicalHeapInsert(rel, ptr.Block, page, ptr.Offset,
-		uint32(ctx.Tx.XID), ctx.LogCanonical)
-	if emitErr == nil && endLSN != 0 {
-		storage.MustHeader(slot.Page()).SetLSN(storage.LSN(endLSN))
-		ctx.Pool.MarkDirty(slot)
-	}
-	slot.Unlock()
-	ctx.Pool.Unpin(slot)
-	return emitErr
-}
-
-// emitCanonicalHeapHotUpdate emits a PG-canonical XLOG_HEAP_INPLACE record
-// with a full-page image for the page at (rel, blk), after a HOT update has
-// stamped the old tuple's xmax and inserted the new tuple in place on the
-// same page (tryApplyHOTUpdate, after markHeapHotUpdateDirty). Only called
-// when ctx.LogCanonical is non-nil. A vanilla PG18 standby (or
-// pg_waldump --save-fullpage) restores the whole page from this FPI rather
-// than re-deriving the HOT chain link — mirrors PgCanonicalHeapInplace's use
-// for the datfrozenxid in-place update (M0117-0008 Part B).
-func emitCanonicalHeapHotUpdate(ctx *Context, rel storage.RelFileNode, blk storage.BlockNumber, newSlot uint16) error {
-	if ctx.LogCanonical == nil || ctx.Pool == nil {
-		return nil
-	}
-	s, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
-	if err != nil {
-		return fmt.Errorf("canonical WAL pin hot update: %w", err)
-	}
-	page := make(storage.Page, storage.BlockSize)
-	s.Lock()
-	copy(page, s.Page())
-	endLSN, emitErr := catalog.PgCanonicalHeapInplace(rel, blk, page, newSlot, uint32(ctx.Tx.XID), ctx.LogCanonical)
-	if emitErr == nil && endLSN != 0 {
-		storage.MustHeader(s.Page()).SetLSN(storage.LSN(endLSN))
-		ctx.Pool.MarkDirty(s)
-	}
-	s.Unlock()
-	ctx.Pool.Unpin(s)
-	return emitErr
-}
-
-// emitCanonicalHeapPruneLocked emits a PG-canonical XLOG_HEAP2_PRUNE_* record
-// with a full-page image for the page held by the already-pinned-and-locked
-// slot s, capturing its CURRENT (post-prune) contents. Unlike the sibling
-// emitCanonicalHeap* helpers, this one does NOT re-Pin/Lock: it is called
-// from inside tryApplyHOTUpdate's page-full opportunistic-prune fallback
-// while the page's content lock is still held (re-locking the same slot
-// would deadlock), immediately after markHeapPruneOptDirty so the FPI
-// reflects the pruned-but-not-yet-re-added state. Only called when
-// ctx.LogCanonical is non-nil. xid is InvalidTransactionID (0) for a
-// VACUUM-driven prune (vacuumCore has no live transaction of its own to
-// stamp) and the current transaction's xid for an in-transaction
-// opportunistic prune — inert either way, since a standby restores the
-// whole page from the FPI without consulting the record's xl_xid.
-func emitCanonicalHeapPruneLocked(ctx *Context, s *storage.Slot, rel storage.RelFileNode, blk storage.BlockNumber, xid uint32, onAccess bool) error {
-	if ctx.LogCanonical == nil {
-		return nil
-	}
-	page := make(storage.Page, storage.BlockSize)
-	copy(page, s.Page())
-	endLSN, emitErr := catalog.PgCanonicalHeapPrune(rel, blk, page, xid, onAccess, ctx.LogCanonical)
-	if emitErr == nil && endLSN != 0 {
-		storage.MustHeader(s.Page()).SetLSN(storage.LSN(endLSN))
-		if ctx.Pool != nil {
-			ctx.Pool.MarkDirty(s)
-		}
-	}
-	return emitErr
-}
-
-// emitCanonicalHeapDelete emits a PG-canonical XLOG_HEAP_DELETE record with
-// a full-page image for the page at (rel, blk). Called by deleteOp and
-// updateOp (for the old-tuple/xmax-stamp page) after
-// markHeapDeleteDirtyAndClearVM and the slot is unpinned, when
-// ctx.LogCanonical is non-nil. The page is re-pinned to capture its
-// post-xmax-stamp state.
-func emitCanonicalHeapDelete(ctx *Context, rel storage.RelFileNode, blk storage.BlockNumber, slot uint16) error {
-	if ctx.LogCanonical == nil || ctx.Pool == nil {
-		return nil
-	}
-	s, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
-	if err != nil {
-		return fmt.Errorf("canonical WAL pin delete: %w", err)
-	}
-	page := make(storage.Page, storage.BlockSize)
-	s.Lock()
-	copy(page, s.Page())
-	xid := uint32(ctx.Tx.XID)
-	endLSN, emitErr := catalog.PgCanonicalHeapDelete(rel, blk, page, slot, xid, xid, ctx.LogCanonical)
-	if emitErr == nil && endLSN != 0 {
-		storage.MustHeader(s.Page()).SetLSN(storage.LSN(endLSN))
-		ctx.Pool.MarkDirty(s)
-	}
-	s.Unlock()
-	ctx.Pool.Unpin(s)
-	return emitErr
 }

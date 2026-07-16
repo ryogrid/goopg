@@ -110,6 +110,7 @@ func (p *parser) parseCreateFunctionTail(pos int, orReplace bool) (Stmt, error) 
 	// unrecognised token.
 	sawLanguage := false
 	sawAs := false
+	sawTwoItemAs := false
 	for {
 		switch {
 		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwLanguage:
@@ -134,13 +135,18 @@ func (p *parser) parseCreateFunctionTail(pos int, orReplace bool) (Stmt, error) 
 			}
 			stmt.Body = body
 			sawAs = true
-			// PG rejects AS 'body1', 'body2' (two quoted bodies).
+			// AS 'body1', 'body2' (two quoted items) is only valid for
+			// LANGUAGE C (obj file + link symbol) — upstream's
+			// interpret_AS_clause rejects it for every other language,
+			// including "internal" (functioncmds.c interpret_AS_clause).
+			// LANGUAGE can appear before or after AS, so the language
+			// check is deferred to the loop's exit below.
 			if p.cur().Kind == TokenSymbol && p.cur().Value == "," {
 				p.advance() // consume ","
 				if p.cur().Kind == TokenStringLit {
 					p.advance() // consume second body string
 				}
-				return nil, &SyntaxError{Raw: true, Message: `only one AS item needed for language "sql"`}
+				sawTwoItemAs = true
 			}
 		// PG14 SQL-standard function body: BEGIN ATOMIC ... END (without AS).
 		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwBegin:
@@ -288,6 +294,15 @@ func (p *parser) parseCreateFunctionTail(pos int, orReplace bool) (Stmt, error) 
 		default:
 			if !sawAs {
 				return nil, p.errAtCur("expected AS $$body$$ for CREATE FUNCTION")
+			}
+			if sawTwoItemAs {
+				lang := strings.ToLower(stmt.Language)
+				if lang != "c" {
+					if lang == "" {
+						lang = "sql"
+					}
+					return nil, &SyntaxError{Raw: true, Message: fmt.Sprintf("only one AS item needed for language %q", lang)}
+				}
 			}
 			return stmt, nil
 		}

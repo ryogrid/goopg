@@ -147,6 +147,38 @@ func TestDecodeRejectsUnknownRmgr(t *testing.T) {
 	}
 }
 
+// TestDecodeAcceptsGoopgCustomRmgrRange: rmids in PostgreSQL's
+// reserved custom-rmgr range (128..255, RmgrGoopgCustomBase) must
+// decode cleanly even though they exceed MaxKnownRmgr — this is the
+// range goopg-private catalog/DDL records dispatch under (04-remove-
+// canonical-and-pg-rmgr-dispatch.md §3.2/§5.4). A rmid just below the
+// range (127) must still be rejected as unknown.
+func TestDecodeAcceptsGoopgCustomRmgrRange(t *testing.T) {
+	for _, rmid := range []Rmgr{RmgrGoopgCustomBase, RmgrGoopgCatalog, 255} {
+		buf := make([]byte, SizeOfXLogRecord)
+		h := XLogRecord{TotLen: uint32(SizeOfXLogRecord), Rmid: rmid}
+		if err := EncodeXLogRecordHeader(buf, h, nil); err != nil {
+			t.Fatalf("Encode rmid=%d: %v", rmid, err)
+		}
+		got, err := DecodeXLogRecordHeader(buf)
+		if err != nil {
+			t.Errorf("Decode rmid=%d: unexpected error %v", rmid, err)
+		}
+		if got.Rmid != rmid {
+			t.Errorf("Decode rmid=%d: got Rmid=%d", rmid, got.Rmid)
+		}
+	}
+
+	buf := make([]byte, SizeOfXLogRecord)
+	h := XLogRecord{TotLen: uint32(SizeOfXLogRecord), Rmid: RmgrGoopgCustomBase - 1}
+	if err := EncodeXLogRecordHeader(buf, h, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DecodeXLogRecordHeader(buf); !errors.Is(err, ErrInvalidRecordHeader) {
+		t.Errorf("Decode rmid=127 err = %v, want ErrInvalidRecordHeader", err)
+	}
+}
+
 // TestDecodeTruncatedSrc: a too-short buffer must error rather than
 // reading past slice bounds.
 func TestDecodeTruncatedSrc(t *testing.T) {

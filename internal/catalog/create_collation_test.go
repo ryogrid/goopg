@@ -180,3 +180,57 @@ func TestDropCollation(t *testing.T) {
 		t.Error("DropCollation on a built-in collation reported true")
 	}
 }
+
+// TestCreateCollationCrossDatabaseIsolation verifies that CREATE COLLATION
+// under one database does not collide with a same-named, same-schema
+// collation already created under a different database — the specific gap
+// the DU-002 dump+restore round-trip probe (TestPort_PgDumpConnectionSetup)
+// hit: restoring a dump into a fresh database re-issues `CREATE COLLATION
+// public.builtin_coll ...`, which previously errored "already exists"
+// because every UserCollation shared one flat, dbOid-less registry. Mirrors
+// the ForeignServer/UserMapping cross-database isolation precedent.
+// M0122-0007 4e follow-up (DU-002 round-trip probe unblock).
+func TestCreateCollationCrossDatabaseIsolation(t *testing.T) {
+	c := NewInMemory()
+	const otherDB = uint32(99999)
+
+	first := &UserCollation{Name: "builtin_coll", Provider: 'b', Encoding: -1, Locale: "C", Deterministic: true}
+	if _, err := c.CreateCollation(first, "public", false, DefaultDBOid); err != nil {
+		t.Fatalf("CreateCollation under DefaultDBOid: %v", err)
+	}
+
+	// The exact same (schema, name) under a distinct database must NOT
+	// collide, unlike a genuine same-database duplicate.
+	second := &UserCollation{Name: "builtin_coll", Provider: 'b', Encoding: -1, Locale: "C", Deterministic: true}
+	if _, err := c.CreateCollation(second, "public", false, otherDB); err != nil {
+		t.Fatalf("CreateCollation under a distinct dbOid falsely collided: %v", err)
+	}
+
+	// A genuine same-database duplicate still errors (regression guard for
+	// the existing single-database behavior).
+	if _, err := c.CreateCollation(&UserCollation{Name: "builtin_coll", Provider: 'b'}, "public", false, DefaultDBOid); err == nil {
+		t.Error("same-database duplicate CreateCollation should still error")
+	}
+
+	// Each database's pg_collation view sees only its own row, plus the
+	// shared builtins.
+	rowsDefault := c.PGCollationRowsForDBOid(DefaultDBOid)
+	rowsOther := c.PGCollationRowsForDBOid(otherDB)
+	if len(rowsDefault) != 8 {
+		t.Errorf("PGCollationRowsForDBOid(DefaultDBOid) rows = %d, want 8 (7 builtin + 1 user)", len(rowsDefault))
+	}
+	if len(rowsOther) != 8 {
+		t.Errorf("PGCollationRowsForDBOid(otherDB) rows = %d, want 8 (7 builtin + 1 user)", len(rowsOther))
+	}
+
+	// Dropping under one database must not remove the other's row.
+	if !c.DropCollation("builtin_coll", "public", DefaultDBOid) {
+		t.Fatal("DropCollation(builtin_coll) under DefaultDBOid = false, want true")
+	}
+	if _, ok := c.CollationAttrsByName("builtin_coll", otherDB); !ok {
+		t.Error("otherDB's builtin_coll vanished after dropping DefaultDBOid's own copy")
+	}
+	if _, ok := c.CollationAttrsByName("builtin_coll", DefaultDBOid); ok {
+		t.Error("DefaultDBOid's builtin_coll still resolvable after DropCollation")
+	}
+}

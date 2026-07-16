@@ -59,7 +59,7 @@ func TestParseTidInput(t *testing.T) {
 // inputs are re-emitted in canonical unsigned form, invalid ones raise 22P02.
 func TestEvalCastTidNormalizesAndValidates(t *testing.T) {
 	// Valid: '(-1,0)' must normalise to the unsigned block representation.
-	got, err := evalCast(NewStringDatum("(-1,0)"), "tid", 0)
+	got, err := evalCast(NewStringDatum("(-1,0)"), "tid", 0, nil)
 	if err != nil {
 		t.Fatalf("evalCast('(-1,0)'::tid) unexpected error: %v", err)
 	}
@@ -68,7 +68,7 @@ func TestEvalCastTidNormalizesAndValidates(t *testing.T) {
 	}
 
 	// Invalid: block out of range must error with 22P02.
-	if _, err := evalCast(NewStringDatum("(4294967296,1)"), "tid", 0); err == nil {
+	if _, err := evalCast(NewStringDatum("(4294967296,1)"), "tid", 0, nil); err == nil {
 		t.Errorf("evalCast('(4294967296,1)'::tid) expected error, got nil")
 	} else if ee, ok := err.(*ExecError); !ok || ee.Code != "22P02" {
 		t.Errorf("evalCast('(4294967296,1)'::tid) error = %v, want 22P02 ExecError", err)

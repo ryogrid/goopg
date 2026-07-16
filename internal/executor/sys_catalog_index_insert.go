@@ -171,9 +171,7 @@ func cmpKeyNameOid(a, b []byte) int {
 // insertCanonicalSysBtreeLeaf inserts indexTuple into the leaf-root page of
 // the system btree at sysBtreeRootBlock. Existing entries are compared via
 // cmp on the key bytes (offset sysIndexTupleHoff..) to find the sorted
-// insert position. The updated page is then captured as a full-page image
-// and emitted as an XLOG_BTREE_INSERT_LEAF canonical WAL record (when
-// ctx.LogCanonical != nil).
+// insert position.
 //
 // Pre-condition: the index file exists and has at least
 // sysBtreeRootBlock+1 blocks (true for initdb-bootstrapped clusters; tests
@@ -289,26 +287,8 @@ func insertIntoSingleLeafRoot(ctx *Context, indexOID uint32, rel storage.RelFile
 		return fmt.Errorf("insert sys btree %d slot %d: %w", indexOID, insertSlot, err)
 	}
 
-	// Snapshot the updated page for the WAL FPI before unpinning.
-	pageCopy := make(storage.Page, storage.BlockSize)
-	copy(pageCopy, page)
-
 	ctx.Pool.MarkDirty(slot)
 
-	if ctx.LogCanonical != nil {
-		xid := uint32(ctx.Tx.XID)
-		endLSN, emitErr := catalog.PgCanonicalBtreeInsert(rel, sysBtreeRootBlock, pageCopy, insertSlot, xid, ctx.LogCanonical)
-		if emitErr != nil {
-			slot.Unlock()
-			ctx.Pool.Unpin(slot)
-			return fmt.Errorf("canonical WAL sys btree %d: %w", indexOID, emitErr)
-		}
-		if endLSN != 0 {
-			// M0106-0010 batched-42 H1: stamp pd_lsn from the FPI's
-			// end-LSN so PG18 recovery skips already-applied FPIs.
-			storage.MustHeader(slot.Page()).SetLSN(storage.LSN(endLSN))
-		}
-	}
 	slot.Unlock()
 	ctx.Pool.Unpin(slot)
 	return nil

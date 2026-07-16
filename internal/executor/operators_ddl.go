@@ -169,6 +169,8 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 		return nil, o.execAlterAggregateOwner(s)
 	case *parser.AlterCollationStmt:
 		return nil, o.execAlterCollation(s)
+	case *parser.AlterConversionStmt:
+		return nil, o.execAlterConversion(s)
 	case *parser.AlterOperatorSetStmt:
 		return nil, o.execAlterOperatorSet(s)
 	case *parser.CreateOpClassStmt:
@@ -627,6 +629,7 @@ func (o *ddlOp) execCreateCollation(s *parser.CreateCollationStmt) error {
 	if !ok {
 		return nil
 	}
+	dbOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
 	schema := s.Name.Schema
 	if schema == "" {
 		schema = "public"
@@ -639,7 +642,7 @@ func (o *ddlOp) execCreateCollation(s *parser.CreateCollationStmt) error {
 	}
 	if s.FromName.Name != "" {
 		// CREATE COLLATION new FROM existing — copy the source's attributes.
-		src, found := im.CollationAttrsByName(s.FromName.Name)
+		src, found := im.CollationAttrsByName(s.FromName.Name, dbOid)
 		if !found {
 			return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("collation %q for current database encoding does not exist", s.FromName.Name)}
 		}
@@ -699,7 +702,7 @@ func (o *ddlOp) execCreateCollation(s *parser.CreateCollationStmt) error {
 			uc.Rules = s.Rules
 		}
 	}
-	if _, err := im.CreateCollation(uc, schema, s.IfNotExists); err != nil {
+	if _, err := im.CreateCollation(uc, schema, s.IfNotExists, dbOid); err != nil {
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 	}
 	// DU-002 restart-persistence follow-up (M0119-0004): goopg has no
@@ -738,6 +741,7 @@ func (o *ddlOp) execAlterCollation(s *parser.AlterCollationStmt) error {
 	if !ok {
 		return nil
 	}
+	dbOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
 	schema := s.Name.Schema
 	if schema == "" {
 		schema = "public"
@@ -751,7 +755,7 @@ func (o *ddlOp) execAlterCollation(s *parser.AlterCollationStmt) error {
 	}
 	switch s.Action {
 	case "rename":
-		if err := im.RenameCollation(s.Name.Name, schema, s.NewName); err != nil {
+		if err := im.RenameCollation(s.Name.Name, schema, s.NewName, dbOid); err != nil {
 			return notFound()
 		}
 		if o.ctx.WAL != nil {
@@ -769,7 +773,7 @@ func (o *ddlOp) execAlterCollation(s *parser.AlterCollationStmt) error {
 			}
 			ownerOID = oid
 		}
-		if !im.SetCollationOwner(s.Name.Name, schema, ownerOID) {
+		if !im.SetCollationOwner(s.Name.Name, schema, ownerOID, dbOid) {
 			return notFound()
 		}
 		if o.ctx.WAL != nil {
@@ -783,7 +787,7 @@ func (o *ddlOp) execAlterCollation(s *parser.AlterCollationStmt) error {
 		if newSchema == "" {
 			newSchema = "public"
 		}
-		if !im.SetCollationSchema(s.Name.Name, schema, newSchema) {
+		if !im.SetCollationSchema(s.Name.Name, schema, newSchema, dbOid) {
 			return notFound()
 		}
 		if o.ctx.WAL != nil {
@@ -793,13 +797,86 @@ func (o *ddlOp) execAlterCollation(s *parser.AlterCollationStmt) error {
 		}
 		return nil
 	case "refresh":
-		if _, found := im.CollationAttrsByName(s.Name.Name); !found {
+		if _, found := im.CollationAttrsByName(s.Name.Name, dbOid); !found {
 			return notFound()
 		}
 		o.ctx.AddNotice(fmt.Sprintf("version has not changed for collation %q", s.Name.Name))
 		return nil
 	default:
 		// Unmodelled ALTER COLLATION form — no-op.
+		return nil
+	}
+}
+
+// execAlterConversion handles ALTER CONVERSION RENAME TO / OWNER TO / SET
+// SCHEMA, mirroring execAlterCollation byte-for-byte (minus REFRESH VERSION,
+// which is collation-specific). pg_dump's dumpConversion only ever emits the
+// OWNER TO form for conversions (via the generic archive-owner mechanism),
+// so that is the form the DU-002 round-trip probe actually exercises; RENAME
+// TO / SET SCHEMA are wired for full grammar fidelity. M0122-0007 4e
+// follow-up.
+func (o *ddlOp) execAlterConversion(s *parser.AlterConversionStmt) error {
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil
+	}
+	dbOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
+	schema := s.Name.Schema
+	if schema == "" {
+		schema = "public"
+	}
+	notFound := func() error {
+		if s.IfExists {
+			o.ctx.AddNotice(fmt.Sprintf("conversion %q does not exist, skipping", s.Name.Name))
+			return nil
+		}
+		return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("conversion %q does not exist", s.Name.Name)}
+	}
+	switch s.Action {
+	case "rename":
+		if err := im.RenameConversion(s.Name.Name, schema, s.NewName, dbOid); err != nil {
+			return notFound()
+		}
+		if o.ctx.WAL != nil {
+			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterConversionRename(s.Name.Name, schema, s.NewName)); werr != nil {
+				return fmt.Errorf("wal alter-conversion-rename: %w", werr)
+			}
+		}
+		return nil
+	case "owner":
+		ownerOID := uint32(10) // bootstrap superuser, mirrors CreateConversion's default owner
+		if !strings.EqualFold(s.NewOwner, "current_user") {
+			oid, found := im.RoleOID(s.NewOwner)
+			if !found {
+				return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("role %q does not exist", s.NewOwner)}
+			}
+			ownerOID = oid
+		}
+		if !im.SetConversionOwner(s.Name.Name, schema, ownerOID, dbOid) {
+			return notFound()
+		}
+		if o.ctx.WAL != nil {
+			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterConversionOwner(s.Name.Name, schema, ownerOID)); werr != nil {
+				return fmt.Errorf("wal alter-conversion-owner: %w", werr)
+			}
+		}
+		return nil
+	case "setschema":
+		newSchema := s.NewSchema
+		if newSchema == "" {
+			newSchema = "public"
+		}
+		if !im.SetConversionSchema(s.Name.Name, schema, newSchema, dbOid) {
+			return notFound()
+		}
+		if o.ctx.WAL != nil {
+			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterConversionSetSchema(s.Name.Name, schema, newSchema)); werr != nil {
+				return fmt.Errorf("wal alter-conversion-set-schema: %w", werr)
+			}
+		}
+		return nil
+	default:
+		// Unmodelled ALTER CONVERSION form — no-op.
 		return nil
 	}
 }
@@ -1225,7 +1302,7 @@ func (o *ddlOp) execCreateAccessMethod(s *parser.CreateAccessMethodStmt) error {
 	if !ok {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "CREATE ACCESS METHOD requires the in-memory catalog"}
 	}
-	am, err := im.RegisterAccessMethod(s.Name, s.AMType, handlerOID)
+	am, err := im.RegisterAccessMethod(s.Name, s.AMType, handlerOID, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 	if err != nil {
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 	}
@@ -10156,7 +10233,7 @@ func (o *ddlOp) bulkBuildBTreeWithPredicate(idxRel storage.RelFileNode, tbl *cat
 	if err != nil {
 		return err
 	}
-	_, err = btree.BulkCreate(o.ctx.Pool, idxRel, entries)
+	_, err = btree.BulkCreateWithXID(o.ctx.Pool, idxRel, entries, o.ctx.Tx.XID)
 	if err != nil {
 		return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
 	}
@@ -10386,8 +10463,8 @@ func (o *ddlOp) backfillBTree(tree *btree.BTree, tbl *catalog.Table, cols []*cat
 				scanRow = make(Row, len(tbl.Columns))
 			}
 			// Use the format-agnostic decoder (handles both goopg and PG
-			// physical format) so rows written via COPY with LogCanonical
-			// wired (EncodeRowPG) are correctly decoded.
+			// physical format) so rows written via COPY in PG physical
+			// format (EncodeRowPG) are correctly decoded.
 			storedNatts := int(tuple.Header.Infomask2 & 0x07FF)
 			if err := DecodeRowIntoMctxPGTuple(scanRow, tbl.Columns, tuple.Data, tuple.Bitmap, storedNatts, sctxDDL); err != nil {
 				continue
@@ -11274,7 +11351,7 @@ func (o *ddlOp) truncateTableAndPartitions(tbl *catalog.Table, pos int, only boo
 		// have no entries to clear. (Btrees track their
 		// own free space inline.) Pair the FSM/VM cleanup
 		// only with the heap rel above.
-		if _, err := btree.Create(o.ctx.Pool, idxRel); err != nil {
+		if _, err := btree.CreateWithXID(o.ctx.Pool, idxRel, o.ctx.Tx.XID); err != nil {
 			return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
 		}
 	}
@@ -11387,12 +11464,8 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 	argModes := make([]string, len(s.Args))
 	argDefaults := make([]string, len(s.Args))
 	for i, a := range s.Args {
-		typName := strings.ToLower(a.Type.Name)
-		if a.Type.IsArray {
-			typName += "[]"
-		}
 		argTypes[i] = catalog.Type{
-			Name: typName,
+			Name: routineArgTypeName(a.Type),
 			Args: append([]int64(nil), a.Type.Args...),
 		}
 		argNames[i] = a.Name
@@ -11444,6 +11517,7 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 		retTypeName += "[]"
 	}
 	r := &catalog.Routine{
+		DBOid:       catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid),
 		Schema:      schema,
 		Name:        s.Name.Name,
 		ArgNames:    argNames,
@@ -11504,9 +11578,9 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 			detail := fmt.Sprintf("%q is a function.", s.Name.Name)
 			argTypes := make([]catalog.Type, len(s.Args))
 			for i, a := range s.Args {
-				argTypes[i] = catalog.Type{Name: strings.ToLower(a.Type.Name)}
+				argTypes[i] = catalog.Type{Name: routineArgTypeName(a.Type)}
 			}
-			if existing, ok := rs.Lookup(s.Name, argTypes); ok && existing != nil && existing.IsProcedure {
+			if existing, ok := rs.LookupWithArgModes(s.Name, argTypes, funcArgModes(s.Args), catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); ok && existing != nil && existing.IsProcedure {
 				detail = fmt.Sprintf("%q is a procedure.", s.Name.Name)
 			}
 			return &ExecError{Code: "42P13", Pos: s.Pos(),
@@ -11949,14 +12023,16 @@ func (o *ddlOp) execAlterFunction(s *parser.AlterFunctionStmt) error {
 	}
 	var argTypes []catalog.Type
 	for _, a := range s.Args {
-		argTypes = append(argTypes, catalog.Type{Name: strings.ToLower(a.Type.Name)})
+		argTypes = append(argTypes, catalog.Type{Name: routineArgTypeName(a.Type)})
 	}
+	argModes := funcArgModes(s.Args)
+	dbOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
 	var routines []*catalog.Routine
 	if s.Args == nil {
 		// No arg list: update all overloads
-		routines = rs.LookupByName(s.Name)
+		routines = rs.LookupByName(s.Name, dbOid)
 	} else {
-		r, ok := rs.Lookup(s.Name, argTypes)
+		r, ok := rs.LookupWithArgModes(s.Name, argTypes, argModes, dbOid)
 		if ok && r != nil {
 			routines = []*catalog.Routine{r}
 		}
@@ -12144,12 +12220,8 @@ func (o *ddlOp) execCreateProcedure(s *parser.CreateProcedureStmt) error {
 		if a.Default != nil && (a.Mode == parser.FuncArgIn || a.Mode == 0) {
 			defaultSeen = true
 		}
-		typName := strings.ToLower(a.Type.Name)
-		if a.Type.IsArray {
-			typName += "[]"
-		}
 		argTypes[i] = catalog.Type{
-			Name: typName,
+			Name: routineArgTypeName(a.Type),
 			Args: append([]int64(nil), a.Type.Args...),
 		}
 		argNames[i] = a.Name
@@ -12192,7 +12264,7 @@ func (o *ddlOp) execCreateProcedure(s *parser.CreateProcedureStmt) error {
 					continue
 				}
 				// Look up any overload of the called procedure by name
-				callees := rs.LookupByName(call.Name)
+				callees := rs.LookupByName(call.Name, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 				for _, callee := range callees {
 					// Check if callee has any OUT or INOUT params
 					hasOutputArgs := false
@@ -12215,6 +12287,7 @@ func (o *ddlOp) execCreateProcedure(s *parser.CreateProcedureStmt) error {
 		}
 	}
 	r := &catalog.Routine{
+		DBOid:           catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid),
 		Schema:          procSchema,
 		Name:            s.Name.Name,
 		ArgNames:        argNames,
@@ -12271,10 +12344,11 @@ func (o *ddlOp) execDropProcedure(s *parser.DropProcedureStmt) error {
 	if rs == nil {
 		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: "DROP PROCEDURE requires routine registry"}
 	}
+	dbOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
 	// Verify the target exists and is a procedure BEFORE dropping.
 	var found *catalog.Routine
 	if s.Args == nil {
-		cands := rs.LookupByName(s.Name)
+		cands := rs.LookupByName(s.Name, dbOid)
 		if len(cands) == 1 {
 			found = cands[0]
 		} else if len(cands) > 1 {
@@ -12287,7 +12361,7 @@ func (o *ddlOp) execDropProcedure(s *parser.DropProcedureStmt) error {
 			}
 		}
 	} else {
-		cands := rs.LookupDropCandidates(s.Name, s.Args)
+		cands := rs.LookupDropCandidates(s.Name, s.Args, dbOid)
 		switch len(cands) {
 		case 0:
 			// not found — handled below
@@ -12345,7 +12419,7 @@ func (o *ddlOp) execDropProcedure(s *parser.DropProcedureStmt) error {
 	// autocommit path).
 	var err error
 	if s.Args == nil {
-		err = rs.DropByName(s.Name)
+		err = rs.DropByName(s.Name, dbOid)
 	} else {
 		// Use DropRoutine with the exact routine found by LookupDropCandidates
 		// to avoid signature-based ambiguity (OUT params excluded from Signature).
@@ -12418,14 +12492,15 @@ func (o *ddlOp) execDropFunction(s *parser.DropFunctionStmt) error {
 	if rs == nil {
 		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: "DROP FUNCTION requires routine registry"}
 	}
+	dbOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
 
 	// Pre-check: look up the routine to verify it is a function, not a procedure.
 	if s.Args != nil {
 		argTypes := make([]catalog.Type, len(s.Args))
 		for i, a := range s.Args {
-			argTypes[i] = catalog.Type{Name: strings.ToLower(a.Type.Name)}
+			argTypes[i] = catalog.Type{Name: routineArgTypeName(a.Type)}
 		}
-		if found, ok := rs.Lookup(s.Name, argTypes); ok && found != nil && found.IsProcedure {
+		if found, ok := rs.LookupWithArgModes(s.Name, argTypes, funcArgModes(s.Args), dbOid); ok && found != nil && found.IsProcedure {
 			// "X(type) is not a function" — matches PG error for DROP FUNCTION on a procedure.
 			argListStr := routineArgListStr(argTypes)
 			if s.IfExists {
@@ -12444,14 +12519,14 @@ func (o *ddlOp) execDropFunction(s *parser.DropFunctionStmt) error {
 		if s.Args != nil {
 			argTypes := make([]catalog.Type, len(s.Args))
 			for i, a := range s.Args {
-				argTypes[i] = catalog.Type{Name: strings.ToLower(a.Type.Name)}
+				argTypes[i] = catalog.Type{Name: routineArgTypeName(a.Type)}
 			}
-			if target, ok := rs.Lookup(s.Name, argTypes); ok && target != nil {
+			if target, ok := rs.LookupWithArgModes(s.Name, argTypes, funcArgModes(s.Args), dbOid); ok && target != nil {
 				targets = []*catalog.Routine{target}
 			}
 		} else {
 			// No arg list: find all overloads by name.
-			targets = rs.LookupByName(s.Name)
+			targets = rs.LookupByName(s.Name, dbOid)
 		}
 		var allDeps []*catalog.Routine
 		for _, target := range targets {
@@ -12501,7 +12576,7 @@ func (o *ddlOp) execDropFunction(s *parser.DropFunctionStmt) error {
 			if len(depTables) > 0 {
 				argTypes := make([]catalog.Type, len(s.Args))
 				for i, a := range s.Args {
-					argTypes[i] = catalog.Type{Name: strings.ToLower(a.Type.Name)}
+					argTypes[i] = catalog.Type{Name: routineArgTypeName(a.Type)}
 				}
 				funcSig := s.Name.Name + routineArgListStr(argTypes)
 				details := make([]string, len(depTables))
@@ -12519,14 +12594,16 @@ func (o *ddlOp) execDropFunction(s *parser.DropFunctionStmt) error {
 	// Build the argument-type list once (used by both the immediate and the
 	// deferred paths).
 	var argTypes []catalog.Type
+	var argModes []string
 	if s.Args != nil {
 		argTypes = make([]catalog.Type, len(s.Args))
 		for i, a := range s.Args {
 			argTypes[i] = catalog.Type{
-				Name: strings.ToLower(a.Type.Name),
+				Name: routineArgTypeName(a.Type),
 				Args: append([]int64(nil), a.Type.Args...),
 			}
 		}
+		argModes = funcArgModes(s.Args)
 	}
 
 	// Inside an explicit transaction, DROP FUNCTION removal is deferred to
@@ -12541,9 +12618,9 @@ func (o *ddlOp) execDropFunction(s *parser.DropFunctionStmt) error {
 	if bsess, ok := o.ctx.Session.(*BasicSession); ok && bsess.InExplicitTransaction() {
 		var target *catalog.Routine
 		if s.Args == nil {
-			target, err = rs.ResolveByName(s.Name)
+			target, err = rs.ResolveByName(s.Name, dbOid)
 		} else {
-			target, err = rs.ResolveBySig(s.Name, argTypes)
+			target, err = rs.ResolveBySigWithArgModes(s.Name, argTypes, argModes, dbOid)
 		}
 		if err == nil {
 			bsess.AddDeferredRoutineDrop(DeferredRoutineDrop{
@@ -12560,9 +12637,9 @@ func (o *ddlOp) execDropFunction(s *parser.DropFunctionStmt) error {
 		// ErrRoutineNotFound / ErrRoutineAmbiguous sentinels handled below.
 		var target *catalog.Routine
 		if s.Args == nil {
-			target, err = rs.ResolveByName(s.Name)
+			target, err = rs.ResolveByName(s.Name, dbOid)
 		} else {
-			target, err = rs.ResolveBySig(s.Name, argTypes)
+			target, err = rs.ResolveBySigWithArgModes(s.Name, argTypes, argModes, dbOid)
 		}
 		if err == nil {
 			if err = rs.DropRoutine(target); err == nil {
@@ -13428,44 +13505,14 @@ func syncIndexToCatalogHeap(ctx *Context, idx *catalog.Index) error {
 	return nil
 }
 
-// writeHeapRowCanonical writes a heap row to a catalog relation and, when
-// ctx.LogCanonical is set, emits a PG-canonical XLOG_HEAP_INSERT WAL record
-// (with full-page image) so a vanilla PG18 standby can replay the catalog
-// insertion. The FPI approach ensures the standby can restore the page without
-// parsing heap-tuple internals. M0106-0010 batched-32.
+// writeHeapRowCanonical writes a heap row to a catalog relation in the PG
+// physical tuple format (writeHeapRowReturningPG). It formerly also emitted a
+// PG-canonical XLOG_HEAP_INSERT FPI for real-PG-standby replay; that canonical
+// WAL path was removed with the native→PG (rmid,info) dispatch change (see
+// docs/design/wal-native-pg-format/04-*). The name is retained to avoid
+// churning ~24 call sites.
 func writeHeapRowCanonical(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, row Row) (storage.ItemPointer, error) {
-	ptr, err := writeHeapRowReturningPG(ctx, rel, cols, row)
-	if err != nil {
-		return ptr, err
-	}
-	if ctx.LogCanonical == nil || ctx.Pool == nil {
-		return ptr, nil
-	}
-	// Re-pin the page to capture a stable FPI after the insert.
-	slot, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: ptr.Block})
-	if err != nil {
-		return ptr, fmt.Errorf("canonical WAL pin: %w", err)
-	}
-	page := make(storage.Page, storage.BlockSize)
-	slot.Lock()
-	copy(page, slot.Page())
-	xid := uint32(ctx.Tx.XID)
-	endLSN, emitErr := catalog.PgCanonicalHeapInsert(rel, ptr.Block, page, ptr.Offset, xid, ctx.LogCanonical)
-	if emitErr == nil && endLSN != 0 {
-		// M0106-0010 batched-42 H1: stamp pd_lsn so a PG18 standby's recovery
-		// can detect "already applied" via the lsn comparison in
-		// XLogReadBufferForRedo (xlogutils.c). Without this, the basebackup
-		// snapshot's pd_lsn=0 page is unconditionally clobbered by the WAL
-		// FPI on every replay pass.
-		storage.MustHeader(slot.Page()).SetLSN(storage.LSN(endLSN))
-		ctx.Pool.MarkDirty(slot)
-	}
-	slot.Unlock()
-	ctx.Pool.Unpin(slot)
-	if emitErr != nil {
-		return ptr, emitErr
-	}
-	return ptr, nil
+	return writeHeapRowReturningPG(ctx, rel, cols, row)
 }
 
 // execCreateTrigger registers a trigger on a table. M0096-0012.
@@ -14587,12 +14634,17 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 				var droppedRoutines []string
 				rs := o.ctx.Catalog.Routines()
 				if rs != nil {
+					dropDBOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
 					for _, r := range rs.List() {
-						if strings.EqualFold(r.Schema, schemaName) {
+						if r.DBOid == dropDBOid && strings.EqualFold(r.Schema, schemaName) {
 							// Build canonical arg list for NOTICE.
 							argStr := r.Name + "(" + buildFunctionArgsList(r) + ")"
 							droppedRoutines = append(droppedRoutines, argStr)
-							_ = rs.Drop(parser.ObjectName{Schema: r.Schema, Name: r.Name}, r.ArgTypes)
+							// DropRoutine matches by r's own OID-keyed signature (r.ArgModes
+							// already populated), avoiding the OUT-param signature mismatch a
+							// rebuilt Drop(name, r.ArgTypes, ...) stub would hit (no ArgModes
+							// carried through that call) — see funcArgModes/LookupWithArgModes.
+							_ = rs.DropRoutine(r)
 						}
 					}
 					sort.Strings(droppedRoutines)
@@ -14842,7 +14894,7 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 			if schema == "" {
 				schema = "public"
 			}
-			if imOK && im.DropCollation(name.Name, schema) {
+			if imOK && im.DropCollation(name.Name, schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 				// DU-002 restart-persistence follow-up: mirror the DROP
 				// CAST/TRANSFORM/CONVERSION WAL emission so the drop
 				// survives a restart too.
@@ -14937,8 +14989,9 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 						famSchema = "public"
 					}
 					famMethodOID := catalog.AccessMethodOIDByName(method)
-					if fam, found := im.LookupUserOperatorFamily(famSchema, name.Name, famMethodOID); found {
-						im.DropUserOperatorFamily(famSchema, name.Name, famMethodOID)
+					dbOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
+					if fam, found := im.LookupUserOperatorFamily(famSchema, name.Name, famMethodOID, dbOid); found {
+						im.DropUserOperatorFamily(famSchema, name.Name, famMethodOID, dbOid)
 						if o.ctx.WAL != nil {
 							if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropOperatorFamily(fam.OID)); werr != nil {
 								return fmt.Errorf("wal drop-operator-family: %w", werr)
@@ -14959,8 +15012,9 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 							classSchema = "public"
 						}
 						classMethodOID := catalog.AccessMethodOIDByName(method)
-						oc, ocFound := im.LookupUserOperatorClass(classSchema, name.Name, classMethodOID)
-						im.DropUserOperatorClass(classSchema, name.Name, classMethodOID)
+						classDBOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
+						oc, ocFound := im.LookupUserOperatorClass(classSchema, name.Name, classMethodOID, classDBOid)
+						im.DropUserOperatorClass(classSchema, name.Name, classMethodOID, classDBOid)
 						// DU-002 restart-persistence follow-up
 						// (M0119-0004/M0110-0001, closing the loop #65/#66
 						// ledger row's "still open" item (1)): mirrors DROP
@@ -15293,7 +15347,7 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 				// dropped conversion stops round-tripping through pg_dump
 				// (DU-002 slice 399); harmless for the other object types.
 				if objType == "conversion" {
-					if im.DropConversion(s.Names[0].Name, s.Names[0].Schema) && o.ctx.WAL != nil {
+					if im.DropConversion(s.Names[0].Name, s.Names[0].Schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) && o.ctx.WAL != nil {
 						// DU-002 restart-persistence follow-up: mirror the
 						// DROP CAST/TRANSFORM WAL emission so the drop
 						// survives a restart too.
@@ -15377,7 +15431,7 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 			// through pg_dump.
 			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
 				name := s.Names[0].String()
-				if im.DropAccessMethod(name) {
+				if im.DropAccessMethod(name, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 					// DU-002 restart-persistence follow-up (M0119-0004,
 					// DU-002 slice 426 ledger resume point): mirrors DROP
 					// EVENT TRIGGER.
@@ -16259,7 +16313,7 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		if nsOID == 0 {
 			nsOID = o.ctx.Catalog.SchemaOID("public")
 		}
-		fam := im.RegisterUserOperatorFamily(schema, s.ObjName.Name, nsOID, methodOID, 0)
+		fam := im.RegisterUserOperatorFamily(schema, s.ObjName.Name, nsOID, methodOID, 0, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		// DU-002 restart-persistence follow-up (M0119-0004/M0110-0001,
 		// closing the loop #65/#66 ledger row's "still open" item (1)):
 		// mirrors CREATE OPERATOR's own WAL append so the family survives a
@@ -16415,7 +16469,7 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 			FuncOID:     convFunc.OID,
 			Default:     s.ConvDefault,
 		}
-		if _, err := im.CreateConversion(uc, schema); err != nil {
+		if _, err := im.CreateConversion(uc, schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); err != nil {
 			return &ExecError{Code: "42710", Message: err.Error()}
 		}
 		// DU-002 restart-persistence follow-up (M0119-0004): goopg has no
@@ -17404,7 +17458,7 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 		// Domains live in pg_type (typtype='d', classoid 1247). pg_dump picks the
 		// DOMAIN keyword from typtype; the stored pg_description row is
 		// keyword-agnostic. DU-002 slice 146.
-		dom, ok := im.LookupDomain(s.ObjName.Name)
+		dom, ok := im.LookupDomain(s.ObjName.Name, o.ctx.CurrentDatabaseOid)
 		if !ok {
 			return &ExecError{Code: "42704", Pos: s.Pos(),
 				Message: fmt.Sprintf("type %q does not exist", s.ObjName.String())}
@@ -17430,7 +17484,7 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 		// "does not exist" error real PG would (pg_dump never dumps their
 		// comments either, since it never dumps the built-ins themselves).
 		// DU-002 slice 434.
-		oid := im.UserAccessMethodOID(s.ObjName.Name)
+		oid := im.UserAccessMethodOID(s.ObjName.Name, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		if oid == 0 {
 			return &ExecError{Code: "42704", Pos: s.Pos(),
 				Message: fmt.Sprintf("access method %q does not exist", s.ObjName.Name)}
@@ -17479,7 +17533,7 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 		// A COMMENT on a built-in raises real PG's own "for encoding" wording
 		// (get_collation_oid, namespace.c) — goopg is always UTF8. DU-002
 		// slice 390.
-		uc, ok := im.CollationAttrsByName(s.ObjName.Name)
+		uc, ok := im.CollationAttrsByName(s.ObjName.Name, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		if !ok || uc.OID == 0 {
 			return &ExecError{Code: "42704", Pos: s.Pos(),
 				Message: fmt.Sprintf("collation %q for encoding %q does not exist", s.ObjName.String(), "UTF8")}
@@ -17633,9 +17687,9 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 		}
 		argTypes := make([]catalog.Type, len(s.Args))
 		for i, a := range s.Args {
-			argTypes[i] = catalog.Type{Name: strings.ToLower(a.Type.Name)}
+			argTypes[i] = catalog.Type{Name: routineArgTypeName(a.Type)}
 		}
-		r, ok := rs.Lookup(s.ObjName, argTypes)
+		r, ok := rs.LookupWithArgModes(s.ObjName, argTypes, funcArgModes(s.Args), catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		if !ok || r == nil {
 			return &ExecError{Code: "42883", Pos: s.Pos(),
 				Message: fmt.Sprintf("function %s does not exist", commentOnFuncSig(s))}
@@ -18150,6 +18204,7 @@ func (o *ddlOp) execCreateOpClass(s *parser.CreateOpClassStmt) error {
 		nsOID = o.ctx.Catalog.SchemaOID("public")
 	}
 	inTypeOID := catalog.TypeNameToOID(s.ForType)
+	dbOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
 
 	var famOID uint32
 	if s.FamilyName != "" {
@@ -18157,7 +18212,7 @@ func (o *ddlOp) execCreateOpClass(s *parser.CreateOpClassStmt) error {
 		if famSchema == "" {
 			famSchema = "public"
 		}
-		fam, found := im.LookupUserOperatorFamily(famSchema, s.FamilyName, methodOID)
+		fam, found := im.LookupUserOperatorFamily(famSchema, s.FamilyName, methodOID, dbOid)
 		if !found {
 			return &ExecError{Code: "42704", Pos: s.Pos(),
 				Message: fmt.Sprintf("operator family %q does not exist for access method %q", s.FamilyName, s.Method)}
@@ -18169,7 +18224,7 @@ func (o *ddlOp) execCreateOpClass(s *parser.CreateOpClassStmt) error {
 		// RegisterUserOperatorFamily default it, mirroring CREATE OPERATOR
 		// FAMILY's own registration (goopg does not track a per-session
 		// creating role for these compat objects).
-		fam := im.RegisterUserOperatorFamily(schema, s.Name, nsOID, methodOID, 0)
+		fam := im.RegisterUserOperatorFamily(schema, s.Name, nsOID, methodOID, 0, dbOid)
 		famOID = fam.OID
 		// DU-002 restart-persistence follow-up (M0119-0004/M0110-0001):
 		// mirrors CREATE OPERATOR FAMILY's own WAL append (execCompatNoop's
@@ -18199,7 +18254,7 @@ func (o *ddlOp) execCreateOpClass(s *parser.CreateOpClassStmt) error {
 			keyTypeOID = 0
 		}
 	}
-	oc := im.RegisterUserOperatorClass(schema, s.Name, nsOID, 0, methodOID, famOID, inTypeOID, s.IsDefault, keyTypeOID)
+	oc := im.RegisterUserOperatorClass(schema, s.Name, nsOID, 0, methodOID, famOID, inTypeOID, s.IsDefault, keyTypeOID, dbOid)
 	// DU-002 restart-persistence follow-up (M0119-0004/M0110-0001, closing
 	// the loop #65/#66 ledger row's "still open" item (1)): mirrors CREATE
 	// OPERATOR's own WAL append so the class survives a restart. The
@@ -18246,7 +18301,7 @@ func (o *ddlOp) execAlterOpFamilyAdd(s *parser.AlterOpFamilyAddStmt) error {
 	if schema == "" {
 		schema = "public"
 	}
-	fam, found := im.LookupUserOperatorFamily(schema, s.Name, methodOID)
+	fam, found := im.LookupUserOperatorFamily(schema, s.Name, methodOID, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 	if !found {
 		return &ExecError{Code: "42704", Pos: s.Pos(),
 			Message: fmt.Sprintf("operator family %q does not exist for access method %q", s.Name, s.Method)}
@@ -18280,7 +18335,7 @@ func (o *ddlOp) execAlterOpFamilyDrop(s *parser.AlterOpFamilyDropStmt) error {
 	if schema == "" {
 		schema = "public"
 	}
-	fam, found := im.LookupUserOperatorFamily(schema, s.Name, methodOID)
+	fam, found := im.LookupUserOperatorFamily(schema, s.Name, methodOID, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 	if !found {
 		return &ExecError{Code: "42704", Pos: s.Pos(),
 			Message: fmt.Sprintf("operator family %q does not exist for access method %q", s.Name, s.Method)}
@@ -18404,7 +18459,7 @@ func (o *ddlOp) registerOpClassMembers(im *catalog.InMemory, members []parser.Op
 				sortFamSchema = "public"
 			}
 			btreeOID := catalog.AccessMethodOIDByName("btree")
-			fam, found := im.LookupUserOperatorFamily(sortFamSchema, m.SortFamilyName, btreeOID)
+			fam, found := im.LookupUserOperatorFamily(sortFamSchema, m.SortFamilyName, btreeOID, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 			if !found {
 				return &ExecError{Code: "42704", Pos: pos,
 					Message: fmt.Sprintf("operator family %q does not exist for access method \"btree\"", m.SortFamilyName)}
@@ -18572,7 +18627,7 @@ func (o *ddlOp) execCreateType(s *parser.CreateTypeStmt) error {
 		// round-trips through pg_dump instead of vanishing as a bare name-only
 		// stub. DU-002 (M0110-0001).
 		if s.IsRange {
-			rt, err := cat.RegisterRangeType(s.Name, s.RangeSubtype, s.RangeMultirangeName, s.RangeOpclassName, s.RangeCollationName)
+			rt, err := cat.RegisterRangeType(s.Name, s.RangeSubtype, s.RangeMultirangeName, s.RangeOpclassName, s.RangeCollationName, o.ctx.CurrentDatabaseOid)
 			if err != nil {
 				// RegisterRangeType reports option-resolution failures (missing
 				// default/named opclass, datatype mismatch, unsupported/missing
@@ -18587,6 +18642,15 @@ func (o *ddlOp) execCreateType(s *parser.CreateTypeStmt) error {
 			}
 			rt.Owner = o.currentDDLOwnerOID()
 			syncRangeTypeToCatalogHeap(o.ctx, rt)
+			// Track range type creation so ROLLBACK can drop it (mirrors the
+			// composite-type branch above; range types previously had no
+			// undo tracking at all). M0122-0007 4e follow-up.
+			if o.ctx.Session != nil && o.ctx.Session.TracksDDLUndo() {
+				if o.ctx.PendingCreatedRangeTypes == nil {
+					o.ctx.PendingCreatedRangeTypes = make(map[string]bool)
+				}
+				o.ctx.PendingCreatedRangeTypes[strings.ToLower(s.Name)] = true
+			}
 			// DU-002 restart-persistence follow-up (M0110-0001, DU-002 slice
 			// 429 ledger resume point, sub-item (c)): mirrors CREATE ACCESS
 			// METHOD.
@@ -18612,7 +18676,7 @@ func (o *ddlOp) execCreateType(s *parser.CreateTypeStmt) error {
 			for i, f := range s.CompositeFields {
 				fields[i] = catalog.CompositeField{Name: f.Name, ColType: f.ColType, Collation: f.Collation}
 			}
-			ct := cat.RegisterCompositeTypeWithFields(s.Name, fields)
+			ct := cat.RegisterCompositeTypeWithFields(s.Name, fields, o.ctx.CurrentDatabaseOid)
 			ct.Owner = o.currentDDLOwnerOID()
 			// Write pg_type heap rows (typtype='c' + its `_name` array) so the
 			// composite type is visible to pg_dump's getTypes and catalog
@@ -18632,14 +18696,14 @@ func (o *ddlOp) execCreateType(s *parser.CreateTypeStmt) error {
 				o.ctx.PendingCreatedComposites[strings.ToLower(s.Name)] = true
 			}
 		} else {
-			cat.RegisterCompositeType(s.Name)
-			if ct := cat.LookupCompositeType(s.Name); ct != nil {
+			cat.RegisterCompositeType(s.Name, o.ctx.CurrentDatabaseOid)
+			if ct := cat.LookupCompositeType(s.Name, o.ctx.CurrentDatabaseOid); ct != nil {
 				ct.Owner = o.currentDDLOwnerOID()
 			}
 		}
 		return nil
 	}
-	et, err := cat.RegisterEnum(s.Name, s.EnumValues)
+	et, err := cat.RegisterEnum(s.Name, s.EnumValues, o.ctx.CurrentDatabaseOid)
 	if err != nil {
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 	}
@@ -18680,7 +18744,7 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 	// the existing heap rows and re-sync the full row set with the appended
 	// field — there is no in-place pg_attribute update / relnatts bump path.
 	if s.AddAttrName != "" {
-		ct := cat.LookupCompositeType(s.Name)
+		ct := cat.LookupCompositeType(s.Name, o.ctx.CurrentDatabaseOid)
 		if ct == nil {
 			return &ExecError{Code: "42704", Pos: s.Pos(),
 				Message: fmt.Sprintf("type %q does not exist", s.Name)}
@@ -18709,7 +18773,7 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 			_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.RelationRelationId)
 			_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.AttributeRelationId)
 		}
-		ct2 := cat.RegisterCompositeTypeWithFields(s.Name, newFields)
+		ct2 := cat.RegisterCompositeTypeWithFields(s.Name, newFields, o.ctx.CurrentDatabaseOid)
 		syncCompositeTypeToCatalogHeap(o.ctx, ct2)
 		return nil
 	}
@@ -18719,7 +18783,7 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 	// across re-registration, so stamp xmax on the existing heap rows and
 	// re-sync the field set with the renamed attribute.
 	if s.RenameAttrOld != "" {
-		ct := cat.LookupCompositeType(s.Name)
+		ct := cat.LookupCompositeType(s.Name, o.ctx.CurrentDatabaseOid)
 		if ct == nil {
 			return &ExecError{Code: "42704", Pos: s.Pos(),
 				Message: fmt.Sprintf("type %q does not exist", s.Name)}
@@ -18749,7 +18813,7 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 			_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.RelationRelationId)
 			_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.AttributeRelationId)
 		}
-		ct2 := cat.RegisterCompositeTypeWithFields(s.Name, newFields)
+		ct2 := cat.RegisterCompositeTypeWithFields(s.Name, newFields, o.ctx.CurrentDatabaseOid)
 		syncCompositeTypeToCatalogHeap(o.ctx, ct2)
 		return nil
 	}
@@ -18759,7 +18823,7 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 	// stable across re-registration, so stamp xmax on the existing heap rows and
 	// re-sync the field set without the dropped attribute.
 	if s.DropAttrName != "" {
-		ct := cat.LookupCompositeType(s.Name)
+		ct := cat.LookupCompositeType(s.Name, o.ctx.CurrentDatabaseOid)
 		if ct == nil {
 			return &ExecError{Code: "42704", Pos: s.Pos(),
 				Message: fmt.Sprintf("type %q does not exist", s.Name)}
@@ -18792,7 +18856,7 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 			_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.RelationRelationId)
 			_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.AttributeRelationId)
 		}
-		ct2 := cat.RegisterCompositeTypeWithFields(s.Name, newFields)
+		ct2 := cat.RegisterCompositeTypeWithFields(s.Name, newFields, o.ctx.CurrentDatabaseOid)
 		syncCompositeTypeToCatalogHeap(o.ctx, ct2)
 		return nil
 	}
@@ -18804,7 +18868,7 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 	// re-typed attribute (syncCompositeTypeToCatalogHeap re-resolves ColType to
 	// atttypid/atttypmod, so a typmod like numeric(12,3) survives intact).
 	if s.AlterAttrName != "" {
-		ct := cat.LookupCompositeType(s.Name)
+		ct := cat.LookupCompositeType(s.Name, o.ctx.CurrentDatabaseOid)
 		if ct == nil {
 			return &ExecError{Code: "42704", Pos: s.Pos(),
 				Message: fmt.Sprintf("type %q does not exist", s.Name)}
@@ -18839,13 +18903,13 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 			_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.RelationRelationId)
 			_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.AttributeRelationId)
 		}
-		ct2 := cat.RegisterCompositeTypeWithFields(s.Name, newFields)
+		ct2 := cat.RegisterCompositeTypeWithFields(s.Name, newFields, o.ctx.CurrentDatabaseOid)
 		syncCompositeTypeToCatalogHeap(o.ctx, ct2)
 		return nil
 	}
 	// RENAME VALUE 'old' TO 'new' — M0097-0022.
 	if s.RenameOldValue != "" {
-		err := cat.RenameEnumValue(s.Name, s.RenameOldValue, s.RenameNewValue)
+		err := cat.RenameEnumValue(s.Name, s.RenameOldValue, s.RenameNewValue, o.ctx.CurrentDatabaseOid)
 		if err == nil {
 			return nil
 		}
@@ -18865,14 +18929,14 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 	// (42710) for `ALTER TYPE <composite> RENAME TO ...`. M0122-0005
 	// (m0097-0017 follow-up).
 	if s.RenameTo != "" {
-		if cat.LookupCompositeType(s.Name) != nil {
-			if err := cat.RenameCompositeType(s.Name, s.RenameTo); err != nil {
+		if cat.LookupCompositeType(s.Name, o.ctx.CurrentDatabaseOid) != nil {
+			if err := cat.RenameCompositeType(s.Name, s.RenameTo, o.ctx.CurrentDatabaseOid); err != nil {
 				return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 			}
 			return nil
 		}
-		if _, ok := cat.LookupRangeType(s.Name); ok {
-			if err := cat.RenameRangeType(s.Name, s.RenameTo); err != nil {
+		if _, ok := cat.LookupRangeType(s.Name, o.ctx.CurrentDatabaseOid); ok {
+			if err := cat.RenameRangeType(s.Name, s.RenameTo, o.ctx.CurrentDatabaseOid); err != nil {
 				return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 			}
 			// M0122-0005 restart-persistence follow-up (deferral ledger
@@ -18886,7 +18950,7 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 			}
 			return nil
 		}
-		err := cat.RenameEnum(s.Name, s.RenameTo)
+		err := cat.RenameEnum(s.Name, s.RenameTo, o.ctx.CurrentDatabaseOid)
 		if err != nil {
 			return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 		}
@@ -18917,12 +18981,12 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 			}
 			ownerOID = oid
 		}
-		if cat.LookupCompositeType(s.Name) != nil {
-			cat.SetCompositeTypeOwner(s.Name, ownerOID)
+		if cat.LookupCompositeType(s.Name, o.ctx.CurrentDatabaseOid) != nil {
+			cat.SetCompositeTypeOwner(s.Name, ownerOID, o.ctx.CurrentDatabaseOid)
 			return nil
 		}
-		if _, ok := cat.LookupRangeType(s.Name); ok {
-			cat.SetRangeTypeOwner(s.Name, ownerOID)
+		if _, ok := cat.LookupRangeType(s.Name, o.ctx.CurrentDatabaseOid); ok {
+			cat.SetRangeTypeOwner(s.Name, ownerOID, o.ctx.CurrentDatabaseOid)
 			// M0122-0005 restart-persistence follow-up (deferral ledger
 			// 2026-07-06 row, resume point (1)): mirrors
 			// execAlterCollation's OWNER TO WAL logging so a range-type
@@ -18934,7 +18998,7 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 			}
 			return nil
 		}
-		if !cat.SetEnumOwner(s.Name, ownerOID) {
+		if !cat.SetEnumOwner(s.Name, ownerOID, o.ctx.CurrentDatabaseOid) {
 			return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("type %q does not exist", s.Name)}
 		}
 		return nil
@@ -18942,7 +19006,7 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 	if s.AddValue == "" {
 		return nil // unmodelled ALTER TYPE variant — no-op
 	}
-	skipped, err := cat.AddEnumValueResult(s.Name, s.AddValue, s.IfNotExists, s.Before, s.After)
+	skipped, err := cat.AddEnumValueResult(s.Name, s.AddValue, s.IfNotExists, s.Before, s.After, o.ctx.CurrentDatabaseOid)
 	if err == nil {
 		if skipped {
 			// IF NOT EXISTS with existing label: emit NOTICE, continue.
@@ -18993,7 +19057,7 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 // the result of its predecessors (e.g. ADD a, then ALTER a TYPE …). DU-002
 // slice 260 (multi-subcommand ALTER TYPE).
 func (o *ddlOp) execAlterTypeAttrCmds(cat *catalog.InMemory, s *parser.AlterTypeStmt) error {
-	ct := cat.LookupCompositeType(s.Name)
+	ct := cat.LookupCompositeType(s.Name, o.ctx.CurrentDatabaseOid)
 	if ct == nil {
 		return &ExecError{Code: "42704", Pos: s.Pos(),
 			Message: fmt.Sprintf("type %q does not exist", s.Name)}
@@ -19065,7 +19129,7 @@ func (o *ddlOp) execAlterTypeAttrCmds(cat *catalog.InMemory, s *parser.AlterType
 		_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.RelationRelationId)
 		_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.AttributeRelationId)
 	}
-	ct2 := cat.RegisterCompositeTypeWithFields(s.Name, fields)
+	ct2 := cat.RegisterCompositeTypeWithFields(s.Name, fields, o.ctx.CurrentDatabaseOid)
 	syncCompositeTypeToCatalogHeap(o.ctx, ct2)
 	return nil
 }
@@ -19085,7 +19149,7 @@ func (o *ddlOp) execDropType(s *parser.DropTypeStmt) error {
 		// MaterializeWriterXID ensures a real non-zero XID is used; DROP TYPE
 		// does not call writeHeapRowReturningPG so the XID would otherwise
 		// remain InvalidTransactionID (0), which is a no-op stamp. M0097-0022.
-		if et, ok := cat.LookupEnum(n); ok && catalogHeapSyncAvailable(o.ctx) {
+		if et, ok := cat.LookupEnum(n, o.ctx.CurrentDatabaseOid); ok && catalogHeapSyncAvailable(o.ctx) {
 			if o.ctx.MaterializeWriterXID() == nil {
 				deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, et.OID, o.ctx.Tx.XID)
 				// Also stamp the auto-generated array type row (`_name`). DU-002 slice 89.
@@ -19094,14 +19158,14 @@ func (o *ddlOp) execDropType(s *parser.DropTypeStmt) error {
 				_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.TypeRelationId)
 			}
 		}
-		enumErr := cat.DropEnum(n, s.Cascade)
+		enumErr := cat.DropEnum(n, s.Cascade, o.ctx.CurrentDatabaseOid)
 		if enumErr == nil {
 			continue // successfully dropped as enum
 		}
 		// Stamp the composite type's pg_type rows (the type + its `_name` array)
 		// before the in-memory delete, so the OID is still resolvable. DU-002
 		// slice 242 — mirrors the enum branch above.
-		if ct := cat.LookupCompositeType(n); ct != nil && catalogHeapSyncAvailable(o.ctx) {
+		if ct := cat.LookupCompositeType(n, o.ctx.CurrentDatabaseOid); ct != nil && catalogHeapSyncAvailable(o.ctx) {
 			if o.ctx.MaterializeWriterXID() == nil {
 				deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, ct.OID, o.ctx.Tx.XID)
 				deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, ct.ArrayOID, o.ctx.Tx.XID)
@@ -19114,14 +19178,14 @@ func (o *ddlOp) execDropType(s *parser.DropTypeStmt) error {
 				_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.AttributeRelationId)
 			}
 		}
-		compErr := cat.DropCompositeType(n)
+		compErr := cat.DropCompositeType(n, o.ctx.CurrentDatabaseOid)
 		if compErr == nil {
 			continue // successfully dropped as composite type
 		}
 		// Stamp the range type's pg_type rows (the range + its auto-generated
 		// multirange) before the in-memory delete, mirroring the enum/composite
 		// branches above. DU-002 (M0110-0001).
-		if rt, ok := cat.LookupRangeType(n); ok && catalogHeapSyncAvailable(o.ctx) {
+		if rt, ok := cat.LookupRangeType(n, o.ctx.CurrentDatabaseOid); ok && catalogHeapSyncAvailable(o.ctx) {
 			if o.ctx.MaterializeWriterXID() == nil {
 				deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, rt.OID, o.ctx.Tx.XID)
 				deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, rt.ArrayOID, o.ctx.Tx.XID)
@@ -19130,7 +19194,7 @@ func (o *ddlOp) execDropType(s *parser.DropTypeStmt) error {
 				_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.TypeRelationId)
 			}
 		}
-		rangeErr := cat.DropRangeType(n)
+		rangeErr := cat.DropRangeType(n, o.ctx.CurrentDatabaseOid)
 		if rangeErr == nil {
 			// DU-002 restart-persistence follow-up (M0110-0001, DU-002
 			// slice 429 ledger resume point, sub-item (c)): mirrors DROP
@@ -19158,7 +19222,7 @@ func (o *ddlOp) execCreateDomain(s *parser.CreateDomainStmt) error {
 		return nil
 	}
 	baseType := catalog.Type{Name: s.BaseType, Args: s.BaseTypeArgs}
-	d, err := cat.RegisterDomain(s.Name, baseType, s.NotNull)
+	d, err := cat.RegisterDomain(s.Name, baseType, s.NotNull, o.ctx.CurrentDatabaseOid)
 	if err != nil {
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 	}
@@ -19243,9 +19307,10 @@ func (o *ddlOp) execAlterDomain(s *parser.AlterDomainStmt) error {
 	if !ok {
 		return nil
 	}
+	dbOid := o.ctx.CurrentDatabaseOid
 	switch s.Action {
 	case "rename":
-		if err := cat.RenameDomain(s.Name, s.NewName); err != nil {
+		if err := cat.RenameDomain(s.Name, s.NewName, dbOid); err != nil {
 			return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 		}
 		return nil
@@ -19258,12 +19323,12 @@ func (o *ddlOp) execAlterDomain(s *parser.AlterDomainStmt) error {
 			}
 			ownerOID = oid
 		}
-		if !cat.SetDomainOwner(s.Name, ownerOID) {
+		if !cat.SetDomainOwner(s.Name, ownerOID, dbOid) {
 			return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("type %q does not exist", s.Name)}
 		}
 		return nil
 	case "renameconstraint":
-		if err := cat.RenameDomainConstraint(s.Name, s.ConstraintName, s.NewConstraintName); err != nil {
+		if err := cat.RenameDomainConstraint(s.Name, s.ConstraintName, s.NewConstraintName, dbOid); err != nil {
 			code := "42704" // ERRCODE_UNDEFINED_OBJECT — missing domain/constraint, matches real PG
 			if strings.Contains(err.Error(), "already exists") {
 				code = "42710" // ERRCODE_DUPLICATE_OBJECT, matches real PG
@@ -19272,7 +19337,7 @@ func (o *ddlOp) execAlterDomain(s *parser.AlterDomainStmt) error {
 		}
 		return nil
 	case "addconstraint":
-		d, found := cat.LookupDomain(s.Name)
+		d, found := cat.LookupDomain(s.Name, dbOid)
 		if !found {
 			return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("type %q does not exist", s.Name)}
 		}
@@ -19282,7 +19347,7 @@ func (o *ddlOp) execAlterDomain(s *parser.AlterDomainStmt) error {
 			// DOMAIN's CHECK (VALUE IN (...)) shortcut form.
 			expr = domainInValuesCheckExpr(d.Base.Name, s.CheckInValues, cat)
 		}
-		if err := cat.AddDomainConstraint(s.Name, s.ConstraintName, expr, s.CheckInValues); err != nil {
+		if err := cat.AddDomainConstraint(s.Name, s.ConstraintName, expr, s.CheckInValues, dbOid); err != nil {
 			code := "42704" // ERRCODE_UNDEFINED_OBJECT — missing domain, matches real PG's typenameTypeId
 			if strings.Contains(err.Error(), "already exists") {
 				code = "42710" // ERRCODE_DUPLICATE_OBJECT, matches real PG's domainAddCheckConstraint
@@ -19291,17 +19356,17 @@ func (o *ddlOp) execAlterDomain(s *parser.AlterDomainStmt) error {
 		}
 		return nil
 	case "dropconstraint":
-		if err := cat.DropDomainConstraint(s.Name, s.ConstraintName, s.IfExists); err != nil {
+		if err := cat.DropDomainConstraint(s.Name, s.ConstraintName, s.IfExists, dbOid); err != nil {
 			return &ExecError{Code: "42704", Pos: s.Pos(), Message: err.Error()} // ERRCODE_UNDEFINED_OBJECT, matches real PG
 		}
 		return nil
 	case "setdefault":
-		if !cat.SetDomainDefault(s.Name, s.DefaultExpr) {
+		if !cat.SetDomainDefault(s.Name, s.DefaultExpr, dbOid) {
 			return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("type %q does not exist", s.Name)}
 		}
 		return nil
 	case "dropdefault":
-		if !cat.SetDomainDefault(s.Name, nil) {
+		if !cat.SetDomainDefault(s.Name, nil, dbOid) {
 			return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("type %q does not exist", s.Name)}
 		}
 		return nil
@@ -19310,12 +19375,12 @@ func (o *ddlOp) execAlterDomain(s *parser.AlterDomainStmt) error {
 		// scan existing table columns of this domain type for already-present
 		// NULL values (validateDomainNotNullConstraint's cross-table walk);
 		// see SetDomainNotNull's doc comment. M0122-0005 domain follow-up.
-		if !cat.SetDomainNotNull(s.Name, true) {
+		if !cat.SetDomainNotNull(s.Name, true, dbOid) {
 			return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("type %q does not exist", s.Name)}
 		}
 		return nil
 	case "dropnotnull":
-		if !cat.SetDomainNotNull(s.Name, false) {
+		if !cat.SetDomainNotNull(s.Name, false, dbOid) {
 			return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("type %q does not exist", s.Name)}
 		}
 		return nil
@@ -19658,7 +19723,7 @@ func (o *ddlOp) execDropDomain(s *parser.DropDomainStmt) error {
 		}
 		// Stamp the pg_type heap row's xmax before the in-memory delete (need the
 		// OID while the domain still exists), mirroring execDropType. DU-002 slice 90.
-		if d, ok := cat.LookupDomain(name.Name); ok && catalogHeapSyncAvailable(o.ctx) {
+		if d, ok := cat.LookupDomain(name.Name, o.ctx.CurrentDatabaseOid); ok && catalogHeapSyncAvailable(o.ctx) {
 			if o.ctx.MaterializeWriterXID() == nil {
 				deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, d.OID, o.ctx.Tx.XID)
 				// Also stamp the auto-generated array type row. DU-002 slice 251.
@@ -19669,7 +19734,7 @@ func (o *ddlOp) execDropDomain(s *parser.DropDomainStmt) error {
 			}
 		}
 		// names = dropped tables (CASCADE) or blocking tables (RESTRICT).
-		names, err := cat.DropDomain(name.Name, false, s.Cascade)
+		names, err := cat.DropDomain(name.Name, false, s.Cascade, o.ctx.CurrentDatabaseOid)
 		if err == nil {
 			if o.ctx.WAL != nil {
 				if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropDomain(name.Name)); werr != nil {
@@ -19858,7 +19923,7 @@ func (o *ddlOp) execAlterDropColumn(tbl *catalog.Table, act parser.AlterTableAct
 		idxRel := o.ctx.Catalog.IndexRelFileNode(idx)
 		o.ctx.Pool.InvalidateRel(idxRel)
 		_ = o.ctx.Pool.Manager().TruncateRelation(idxRel)
-		_, _ = btree.Create(o.ctx.Pool, idxRel)
+		_, _ = btree.CreateWithXID(o.ctx.Pool, idxRel, o.ctx.Tx.XID)
 	}
 
 	// Phase 4: re-insert all rows with the new column layout and rebuild indexes.
@@ -19964,7 +20029,7 @@ func (o *ddlOp) execAlterColumnType(tbl *catalog.Table, act parser.AlterTableAct
 			}
 			// Convert the changed column to the new type.
 			if colIdx < len(row) {
-				if converted, cErr := evalCast(row[colIdx], newCatalogType.Name, act.Pos()); cErr == nil {
+				if converted, cErr := evalCast(row[colIdx], newCatalogType.Name, act.Pos(), o.ctx); cErr == nil {
 					row[colIdx] = converted
 				}
 			}
@@ -19995,7 +20060,7 @@ func (o *ddlOp) execAlterColumnType(tbl *catalog.Table, act parser.AlterTableAct
 		idxRel := o.ctx.Catalog.IndexRelFileNode(idx)
 		o.ctx.Pool.InvalidateRel(idxRel)
 		_ = o.ctx.Pool.Manager().TruncateRelation(idxRel)
-		_, _ = btree.Create(o.ctx.Pool, idxRel)
+		_, _ = btree.CreateWithXID(o.ctx.Pool, idxRel, o.ctx.Tx.XID)
 	}
 
 	// Phase 4: re-insert all rows with the new encoding.

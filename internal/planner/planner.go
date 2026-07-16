@@ -152,7 +152,7 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 		*parser.CreateAggregateStmt,
 		*parser.AlterAggregateRenameStmt, *parser.AlterAggregateOwnerStmt,
 		*parser.CreateExtensionStmt,
-		*parser.CreateCollationStmt, *parser.AlterCollationStmt,
+		*parser.CreateCollationStmt, *parser.AlterCollationStmt, *parser.AlterConversionStmt,
 		*parser.CreateTablespaceStmt, *parser.DropTablespaceStmt,
 		*parser.CreateOpClassStmt, *parser.AlterOperatorSetStmt, *parser.AlterOpFamilyAddStmt,
 		*parser.AlterOpFamilyDropStmt,

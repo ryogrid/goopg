@@ -84,6 +84,29 @@ func TestEvalRegexpMatch(t *testing.T) {
 			},
 			want: NullDatum,
 		},
+		{
+			// PostgreSQL quotes an empty-string element as "" to distinguish it
+			// from a zero-element array ({} vs {""}); a naive comma-join without
+			// quoting collapses the two. postgres/src/backend/utils/adt/regexp.c.
+			name: "empty pattern match yields a one-element array with an empty string",
+			fn:   "regexp_match",
+			args: []planner.Expr{
+				&planner.StringConst{Value: "abc"},
+				&planner.StringConst{Value: ""},
+			},
+			want: NewStringDatum(`{""}`),
+		},
+		{
+			// A matched element containing the array delimiter must be quoted so
+			// it isn't misread as two elements (arrayfuncs.c array_out needquote).
+			name: "matched text containing a comma is quoted",
+			fn:   "regexp_match",
+			args: []planner.Expr{
+				&planner.StringConst{Value: "a,b"},
+				&planner.StringConst{Value: ".*"},
+			},
+			want: NewStringDatum(`{"a,b"}`),
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

@@ -440,12 +440,14 @@ func TestStripeAppendConcurrentDrainConsistency(t *testing.T) {
 	total := int64(numProcs * recordsEach * recordSize)
 
 	done := make(chan struct{})
+	ready := make(chan struct{})
 	var drainHits atomic.Int64
 
 	// Drain-style goroutine continuously advances publication via
 	// publishVisibility — must never let the safe tail leak past an
 	// in-flight reservation (pre-reserve race closure validation).
 	go func() {
+		first := true
 		for {
 			select {
 			case <-done:
@@ -455,8 +457,19 @@ func TestStripeAppendConcurrentDrainConsistency(t *testing.T) {
 			curr, _ := posTracker.load()
 			publishVisibility(publisher, walBuf, memRing, insertTracker, int64(curr))
 			drainHits.Add(1)
+			if first {
+				// Signal readiness only once the goroutine has actually been
+				// scheduled and completed an iteration — under host CPU
+				// contention (nightly batch's parallel race/testport/pgbench
+				// lanes) this goroutine can otherwise starve entirely before
+				// wg.Wait() returns, making drainHits==0 a scheduling flake
+				// rather than a real drain-safety failure.
+				first = false
+				close(ready)
+			}
 		}
 	}()
+	<-ready
 
 	var wg sync.WaitGroup
 	for procNum := int32(0); procNum < numProcs; procNum++ {

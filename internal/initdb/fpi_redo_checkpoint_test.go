@@ -12,10 +12,8 @@ import (
 // dirtied in one redo epoch, a checkpoint publishing a new redo pointer, and
 // further catalog inserts AFTER publication — the post-publication inserts
 // must carry fresh images so replay from the new redo reconstructs them.
-// Runs native-only (GOOPG_WAL_CANONICAL=off): the canonical family's
-// unconditional images are absent, so the native pd_lsn<=redo machinery is
-// the only torn-page cover — exactly the load-bearing configuration
-// (README R1/R2 of the dash bundle).
+// The native pd_lsn<=redo machinery is the only torn-page cover — exactly
+// the load-bearing configuration (README R1/R2 of the dash bundle).
 //
 // NOTE (review SHOULD-3): this is an end-to-end SMOKE across a checkpoint
 // crossing, not the old-vs-new discriminator — rt1.Close() flushes cleanly,
@@ -23,7 +21,6 @@ import (
 // storage.TestFPIRedoPublicationClosesWindow (image-count assertions that
 // FAIL under the old fpiSinceCheckpoint design).
 func TestCatalogSurvivesCheckpointCrossingNativeOnly(t *testing.T) {
-	t.Setenv("GOOPG_WAL_CANONICAL", "off")
 	dir := filepath.Join(t.TempDir(), "data")
 	if err := Init(Options{DataDir: dir}); err != nil {
 		t.Fatal(err)

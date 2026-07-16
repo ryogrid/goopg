@@ -53,19 +53,29 @@ const (
 	RmgrXLog    Rmgr = 0 // RM_XLOG_ID — checkpoints, EOL markers, switch
 	RmgrXact    Rmgr = 1 // RM_XACT_ID — commit / abort
 	RmgrStorage Rmgr = 2 // RM_SMGR_ID — relation create / truncate
-	// 3..7 reserved (CLOG, Database, Tablespace, MultiXact, RelMap).
+	RmgrCLOG    Rmgr = 3 // RM_CLOG_ID — clog (pg_xact) truncation
+	// 4..7 reserved (Database, Tablespace, MultiXact, RelMap).
 	RmgrStandby Rmgr = 8  // RM_STANDBY_ID — RUNNING_XACTS snapshot markers
 	RmgrHeap2   Rmgr = 9  // RM_HEAP2_ID   — heap multi-insert / vacuum
 	RmgrHeap    Rmgr = 10 // RM_HEAP_ID    — heap insert / delete / update
 	RmgrBtree   Rmgr = 11 // RM_BTREE_ID   — btree insert / split
 
-	// MaxKnownRmgr bounds the IDs goopg defines symbolic names for
-	// in this slice. Values higher than this aren't *invalid* (a
-	// future producer may define new ones), but the decoder
-	// returns ErrInvalidRecordHeader so unknown rmgrs surface as
-	// a typed branch — useful for "this WAL was emitted by a
-	// newer version" detection.
+	// MaxKnownRmgr bounds the real-PG IDs goopg defines symbolic
+	// names for in this slice. Values in (MaxKnownRmgr, RmgrGoopgCatalog)
+	// are rejected by the decoder as a typed "emitted by a newer
+	// version" branch.
 	MaxKnownRmgr Rmgr = RmgrBtree
+
+	// RmgrGoopgCustomBase is the first ID in PostgreSQL's reserved
+	// custom-rmgr range (RM_MIN_CUSTOM_ID, upstream
+	// rmgr.h). goopg-private record kinds with no PG analog (catalog
+	// DDL, roles, etc. — docs/design/wal-native-pg-format/04-*.md
+	// §3.2) classify under this range; the per-record RecordKind
+	// byte in the payload remains the authoritative discriminator.
+	RmgrGoopgCustomBase Rmgr = 128
+	// RmgrGoopgCatalog is goopg's single custom resource manager for
+	// all private catalog/DDL record kinds (§3.2 of the doc above).
+	RmgrGoopgCatalog Rmgr = RmgrGoopgCustomBase
 )
 
 // ErrInvalidRecordHeader is the typed sentinel a decoder returns
@@ -168,8 +178,9 @@ func EncodeXLogRecordHeader(dst []byte, h XLogRecord, payload []byte) error {
 // Returns ErrInvalidRecordHeader on:
 //   - non-zero padding bytes (offsets 18..19) — upstream invariant
 //     and a useful corruption signal,
-//   - Rmid > MaxKnownRmgr — typed branch for "this WAL was emitted
-//     by a producer goopg doesn't know yet",
+//   - Rmid > MaxKnownRmgr and below RmgrGoopgCustomBase (128) — typed
+//     branch for "this WAL was emitted by a producer goopg doesn't
+//     know yet"; the 128..255 custom-rmgr range is always accepted,
 //   - undefined framework bits in xl_info.
 func DecodeXLogRecordHeader(src []byte) (XLogRecord, error) {
 	if len(src) < SizeOfXLogRecord {
@@ -186,7 +197,7 @@ func DecodeXLogRecordHeader(src []byte) (XLogRecord, error) {
 	if src[18] != 0 || src[19] != 0 {
 		return h, fmt.Errorf("%w: padding bytes nonzero (0x%02x 0x%02x)", ErrInvalidRecordHeader, src[18], src[19])
 	}
-	if h.Rmid > MaxKnownRmgr {
+	if h.Rmid > MaxKnownRmgr && h.Rmid < RmgrGoopgCustomBase {
 		return h, fmt.Errorf("%w: unknown rmid=%d", ErrInvalidRecordHeader, h.Rmid)
 	}
 	frameworkBits := h.Info & XLRInfoMask

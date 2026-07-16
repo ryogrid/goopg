@@ -1428,7 +1428,7 @@ func TestPinNewEmitsSmgrCreateOnFirstBlock(t *testing.T) {
 	var emitted []RelFileNode
 	pool, err := NewPool(mgr, PoolConfig{
 		Slots: 8,
-		LogSmgrCreate: func(r RelFileNode) error {
+		LogSmgrCreate: func(r RelFileNode, _ TransactionID) error {
 			emitted = append(emitted, r)
 			return nil
 		},
@@ -1533,7 +1533,7 @@ func TestExtendRelationBatchEmitsSmgrCreateOnceOnFirstBatch(t *testing.T) {
 	var emitted []RelFileNode
 	pool, err := NewPool(mgr, PoolConfig{
 		Slots: 8,
-		LogSmgrCreate: func(r RelFileNode) error {
+		LogSmgrCreate: func(r RelFileNode, _ TransactionID) error {
 			emitted = append(emitted, r)
 			return nil
 		},

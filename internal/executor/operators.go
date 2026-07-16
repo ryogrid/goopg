@@ -251,6 +251,18 @@ func (o *valuesOp) Open(ctx *Context) error {
 			// mirrors the pg_foreign_server branch above. M0122-0007 4e
 			// follow-up 37.
 			o.rows = rematerialiseVirtualRowsFromStrings(tbl, ctx.PgUserMappingsRows())
+		} else if tbl.Name == "pg_collation" && ctx != nil && ctx.PgCollationRows != nil {
+			// pg_collation must list the connecting database's own CREATE
+			// COLLATION'd collations, not always DefaultDBOid's — mirrors
+			// the pg_user_mappings branch above. M0122-0007 4e follow-up
+			// (DU-002 round-trip probe unblock).
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, ctx.PgCollationRows())
+		} else if tbl.Name == "pg_conversion" && ctx != nil && ctx.PgConversionRows != nil {
+			// pg_conversion must list the connecting database's own CREATE
+			// [DEFAULT] CONVERSION'd conversions, not always DefaultDBOid's
+			// — mirrors the pg_collation branch above. M0122-0007 4e
+			// follow-up (DU-002 round-trip probe unblock).
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, ctx.PgConversionRows())
 		} else if tbl.VirtualRows != nil {
 			o.rows = rematerialiseVirtualRows(o.plan)
 		}

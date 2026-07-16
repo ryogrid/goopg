@@ -238,7 +238,7 @@ func analyzeRelationCtx(ctx *Context, tbl *catalog.Table) (*catalog.TableStats, 
 	if seed == 0 {
 		seed = time.Now().UnixNano()
 	}
-	return analyzeRelationWith(ctx.Pool, ctx.TxnMgr, ctx.Catalog, tbl, target, rand.New(rand.NewSource(seed)), ctx.MultiXact)
+	return analyzeRelationWith(ctx.Pool, ctx.TxnMgr, ctx.Catalog, tbl, target, rand.New(rand.NewSource(seed)), ctx.MultiXact, ctx)
 }
 
 // analyzeRelation is kept as a thin wrapper for tests that don't
@@ -247,7 +247,7 @@ func analyzeRelationCtx(ctx *Context, tbl *catalog.Table) (*catalog.TableStats, 
 func analyzeRelation(pool *storage.Pool, mgr *mvcc.Manager, cat catalog.Catalog, tbl *catalog.Table) (*catalog.TableStats, error) {
 	// nil store: analyzeRelation is the test-only convenience wrapper with no
 	// executor.Context (hence no MultiXact) in scope. M0118-0003.
-	return analyzeRelationWith(pool, mgr, cat, tbl, upstreamDefaultStatsTarget, rand.New(rand.NewSource(time.Now().UnixNano())), nil)
+	return analyzeRelationWith(pool, mgr, cat, tbl, upstreamDefaultStatsTarget, rand.New(rand.NewSource(time.Now().UnixNano())), nil, nil)
 }
 
 // analyzeRelationWith walks every block of tbl under a fresh
@@ -255,7 +255,11 @@ func analyzeRelation(pool *storage.Pool, mgr *mvcc.Manager, cat catalog.Catalog,
 // reservoir-samples them with `targrows = target *
 // upstreamSampleMultiplier`, and computes per-table + per-column
 // statistics from the sample (RowCount and Pages remain exact).
-func analyzeRelationWith(pool *storage.Pool, mgr *mvcc.Manager, cat catalog.Catalog, tbl *catalog.Table, target int, rng *rand.Rand, mxs *multixact.Store) (*catalog.TableStats, error) {
+// dsCtx supplies session-GUC reachability for DateStyle-aware MCV/
+// histogram-bound rendering (formatDatumDateStyle); pass nil where no
+// session context is available (falls back to ISO/MDY, matching
+// Datum.Format()'s pre-existing hardcoded default).
+func analyzeRelationWith(pool *storage.Pool, mgr *mvcc.Manager, cat catalog.Catalog, tbl *catalog.Table, target int, rng *rand.Rand, mxs *multixact.Store, dsCtx *Context) (*catalog.TableStats, error) {
 	rel := cat.RelFileNode(tbl)
 
 	tx, err := mgr.Begin(mvcc.IsolationReadCommitted)
@@ -354,7 +358,7 @@ func analyzeRelationWith(pool *storage.Pool, mgr *mvcc.Manager, cat catalog.Cata
 		if !ok {
 			continue
 		}
-		stats.Columns[i] = computeColumnStats(reservoir, i, colTarget)
+		stats.Columns[i] = computeColumnStats(reservoir, i, colTarget, dsCtx)
 		// Honor a per-column `n_distinct` attribute option, mirroring
 		// upstream's override in compute_index_stats/do_analyze_rel
 		// (postgres/src/backend/commands/analyze.c:571-581): a manual
@@ -431,7 +435,7 @@ func columnStatsTarget(col *catalog.Column, tableTarget int) (target int, ok boo
 // / MCV / Histogram from the sample. Mirrors the bookkeeping in
 // upstream's `compute_scalar_stats` while staying within the v0
 // type set.
-func computeColumnStats(sample []Row, colIdx int, statsTarget int) catalog.ColumnStats {
+func computeColumnStats(sample []Row, colIdx int, statsTarget int, dsCtx *Context) catalog.ColumnStats {
 	stats := catalog.ColumnStats{}
 	if len(sample) == 0 {
 		return stats
@@ -525,7 +529,7 @@ func computeColumnStats(sample []Row, colIdx int, statsTarget int) catalog.Colum
 		stats.MCV = make([]catalog.MCVEntry, mcvCount)
 		for i := 0; i < mcvCount; i++ {
 			stats.MCV[i] = catalog.MCVEntry{
-				Value:     buckets[i].val.Format(),
+				Value:     formatDatumDateStyle(buckets[i].val, dsCtx),
 				Frequency: float64(buckets[i].count) / float64(len(sample)),
 			}
 		}
@@ -574,7 +578,7 @@ func computeColumnStats(sample []Row, colIdx int, statsTarget int) catalog.Colum
 	last := len(expanded) - 1
 	for i := 0; i <= bucketCount; i++ {
 		idx := i * last / bucketCount
-		bounds[i] = expanded[idx].Format()
+		bounds[i] = formatDatumDateStyle(expanded[idx], dsCtx)
 	}
 	// Drop adjacent duplicate boundaries; an equi-depth
 	// histogram with flat regions still emits ascending

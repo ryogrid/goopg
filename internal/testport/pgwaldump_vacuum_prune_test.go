@@ -8,12 +8,14 @@ package testport
 // XLOG_HEAP2_PRUNE_VACUUM_SCAN record's byte layout and emission via unit
 // tests only (internal/catalog, internal/vacuum, internal/executor), never a
 // live `pg_waldump --rmgr=Heap2` round-trip against a real VACUUM-pruned
-// page. This test drives that end-to-end: DELETE rows, run VACUUM (which
-// wires vacuum.VacuumOptions.LogCanonical — internal/vacuum/vacuum.go), stop
+// page. This test drives that end-to-end: DELETE rows, run VACUUM, stop
 // the cluster, and assert the upstream pg_waldump binary can walk the
 // resulting WAL and decode the record — no structural error, and the
 // `PRUNE_VACUUM_SCAN` identifier / this table's relation locator both appear
 // in its output.
+//
+// Unconditionally skipped since 2026-07-15 (doc 04 §5.1-5.3 canonical-family
+// removal) — see the t.Skip below and .ralph/deferral_ledger.md.
 //
 // This does NOT attempt a standby replay (that would need a second goopg
 // instance consuming WAL as a physical standby, out of scope here); it
@@ -64,7 +66,7 @@ func segmentIsAllZero(t *testing.T, path string) bool {
 }
 
 func TestPort_PgWaldumpVacuumPruneRoundtrip(t *testing.T) {
-	skipUnlessCanonicalWAL(t) // perf-optimize3-dash S4: canonical rmgr content (WD-004 deferred)
+	t.Skip("PG-tool WAL compat removed 2026-07-15 (canonical/knob/skip-tag removed; native->PG (rmid,info) dispatch); intentional, not a regression - resumes after native->PG content rewrite. See docs/design/wal-native-pg-format/04 + .ralph/deferral_ledger.md")
 	waldump := findPGWaldumpBin(t)
 	psqlBin := clientToolBin(t, "psql")
 	if psqlBin == "" {
@@ -186,8 +188,6 @@ func TestPort_PgWaldumpVacuumPruneRoundtrip(t *testing.T) {
 	}
 
 	if !sawPruneRecordForRelation {
-		t.Errorf("pg_waldump --rmgr=Heap2 found no PRUNE_VACUUM_SCAN record for %s — "+
-			"check catalog.PgCanonicalHeapPrune wiring in internal/vacuum/vacuum.go "+
-			"(VacuumOptions.LogCanonical) for a regression", blockRef)
+		t.Errorf("pg_waldump --rmgr=Heap2 found no PRUNE_VACUUM_SCAN record for %s", blockRef)
 	}
 }

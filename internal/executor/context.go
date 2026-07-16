@@ -327,6 +327,13 @@ type Context struct {
 	// PendingCreatedEnums).  map[compositeTypeName(lowercase)]=true.
 	// DU-002 slice 244.
 	PendingCreatedComposites map[string]bool
+	// PendingCreatedRangeTypes tracks range types created via CREATE TYPE …
+	// AS RANGE within the current explicit transaction.  On ROLLBACK,
+	// created types are dropped from the catalog so they do not outlive the
+	// aborted transaction (mirrors PendingCreatedComposites; range types had
+	// no undo tracking at all until this field was added).
+	// map[rangeTypeName(lowercase)]=true.  M0122-0007 4e follow-up.
+	PendingCreatedRangeTypes map[string]bool
 
 	// WAL exposes the cluster's WAL writer so execCommit can read the
 	// WrittenLSN after a local flush to bound the SyncRep wait. nil
@@ -380,12 +387,6 @@ type Context struct {
 	// so without this hook the two role-DDL paths silently diverge
 	// (root-0021; the recurring sibling-path trap). Set by dispatch.
 	OnRoleDropped func(name string)
-
-	// LogCanonical, when non-nil, emits a PG-canonical WAL record (XLOG_HEAP_INSERT,
-	// XLOG_BTREE_INSERT_LEAF, …) so a vanilla PG18 standby can replay catalog DDL
-	// mutations. Set only when the WAL writer is in PageHeaders mode (PG-compat WAL);
-	// nil in tests and legacy-WAL configurations. M0106-0010 batched-32.
-	LogCanonical catalog.LogCanonicalFunc
 
 	// Promote, when non-nil, is invoked by pg_promote() to trigger the
 	// standby-to-primary promotion sequence. nil means the server is not
@@ -569,6 +570,22 @@ type Context struct {
 	// (catalog.InMemory's PGUserMappingsRowsForDBOid). Wired by the server
 	// to close over CurrentDatabaseOid. M0122-0007 4e follow-up 37.
 	PgUserMappingsRows func() [][]string
+
+	// PgCollationRows mirrors PgForeignServerRows above for the pg_collation
+	// catalog table: it lists CurrentDatabaseOid's own CREATE COLLATION'd
+	// collations (plus the shared BKI-pinned builtins) rather than always
+	// DefaultDBOid's (catalog.InMemory's PGCollationRowsForDBOid). Wired by
+	// the server to close over CurrentDatabaseOid. M0122-0007 4e follow-up
+	// (DU-002 round-trip probe unblock).
+	PgCollationRows func() [][]string
+
+	// PgConversionRows mirrors PgCollationRows above for the pg_conversion
+	// catalog table: it lists CurrentDatabaseOid's own CREATE [DEFAULT]
+	// CONVERSION'd conversions rather than always DefaultDBOid's
+	// (catalog.InMemory's PGConversionRowsForDBOid). Wired by the server to
+	// close over CurrentDatabaseOid. M0122-0007 4e follow-up (DU-002
+	// round-trip probe unblock).
+	PgConversionRows func() [][]string
 
 	// NonSuperuserRole, when non-empty, means the session is currently running
 	// under a non-superuser role (set via SET SESSION AUTHORIZATION). Privilege
@@ -779,7 +796,8 @@ func (c *Context) acquireRelLock(rel storage.RelFileNode, mode lockmgr.Mode) err
 // locking and tuple-level locking don't accidentally block
 // each other. Same SQLSTATE mappings as acquireRelLock.
 func (c *Context) acquireTupleLock(rel storage.RelFileNode, ptr storage.ItemPointer, mode lockmgr.Mode) error {
-	if c.LockMgr == nil {
+	lm, backend, timeout := c.tupleLockManager()
+	if lm == nil {
 		return nil
 	}
 	lockCtx := context.Background()
@@ -787,7 +805,7 @@ func (c *Context) acquireTupleLock(rel storage.RelFileNode, ptr storage.ItemPoin
 		lockCtx = c.Ctx
 	}
 	tag := tupleLockTag(rel, ptr)
-	err := c.LockMgr.Acquire(lockCtx, c.BackendID, tag, mode)
+	err := lm.AcquireWithTimeout(lockCtx, backend, tag, mode, timeout)
 	if err == nil {
 		return nil
 	}
@@ -800,23 +818,33 @@ func (c *Context) acquireTupleLock(rel storage.RelFileNode, ptr storage.ItemPoin
 	return &ExecError{Code: "XX000", Message: err.Error()}
 }
 
-// tryAcquireTupleLock is the NOWAIT variant — surfaces
-// SQLSTATE 55P03 immediately on contention. Used by SELECT FOR
-// UPDATE NOWAIT and by UPDATE / DELETE on a tuple another xact
-// holds when the operator wants fail-fast semantics.
-func (c *Context) tryAcquireTupleLock(rel storage.RelFileNode, ptr storage.ItemPointer, mode lockmgr.Mode) error {
-	if c.LockMgr == nil {
-		return nil
+// tupleLockManager selects the lock manager and backend identity that
+// tuple-level (row) locks acquire on, plus whether tuple locking is active
+// at all (returns a nil manager when it should be a no-op).
+//
+//   - In tests, Context.LockMgr is a real per-context manager; use it under
+//     the per-statement BackendID exactly as before.
+//   - In the production server Context.LockMgr is nil by design (relation
+//     locking stays off the hot path — see the tableLockMgr comment). Route
+//     *tuple* locks to the always-on tableLockMgr under the per-statement
+//     BackendID so concurrent FOR UPDATE / FOR SHARE waiters on the same row
+//     acquire in FIFO arrival order (design 0021-0012). dispatch.go's
+//     per-statement ReleaseTupleLocks(backendID) drops them at Query-message
+//     end; the "wait until the holder's (sub)txn ends" half is still enforced
+//     by the persisted xmax via mvcc.WaitForXID, not this lock. A zero
+//     BackendID (e.g. the extended-protocol path, which never sets it) keeps
+//     tuple locking a no-op there, preserving the pre-existing
+//     xmax/WaitForXID-only behaviour with no lock leak.
+func (c *Context) tupleLockManager() (*lockmgr.LockManager, lockmgr.BackendID, time.Duration) {
+	if c.LockMgr != nil {
+		// Preserve the historical test-path timeout: the manager's own
+		// configured deadlock_timeout (lockmgr.useConfiguredTimeout sentinel).
+		return c.LockMgr, c.BackendID, lockmgr.UseConfiguredTimeout
 	}
-	tag := tupleLockTag(rel, ptr)
-	err := c.LockMgr.TryAcquire(c.BackendID, tag, mode)
-	if err == nil {
-		return nil
+	if c.BackendID == 0 {
+		return nil, 0, 0
 	}
-	if err == lockmgr.ErrLockNotAvailable {
-		return &ExecError{Code: "55P03", Message: "could not obtain lock on row"}
-	}
-	return &ExecError{Code: "XX000", Message: err.Error()}
+	return tableLockMgr, c.BackendID, c.deadlockTimeout()
 }
 
 // tupleLockTag synthesises a tuple-level LockTag from a
@@ -874,6 +902,23 @@ var tableLockMgr = lockmgr.New()
 // LOCK TABLE locks live exactly as long as the transaction that took
 // them. M0118-0003 (lock-nowait).
 func ReleaseTableLocks(b lockmgr.BackendID) {
+	if b == 0 {
+		return
+	}
+	tableLockMgr.ReleaseAll(b)
+}
+
+// ReleaseTupleLocks drops every tuple-level (row) lock the given
+// PER-STATEMENT backend identity took on the always-on tableLockMgr
+// (design 0021-0012). dispatch.go calls it from the Query-message defer,
+// alongside the per-statement Context.LockMgr.ReleaseAll, so a FOR UPDATE /
+// FOR SHARE tuple lock lives exactly as long as the statement that took it —
+// long enough to sequence concurrent waiters in FIFO arrival order, after
+// which the persisted xmax takes over the "wait until the holder's txn ends"
+// duty. It shares tableLockMgr with LOCK TABLE, but LOCK TABLE holds under the
+// disjoint TxnLockBackendID, so releasing the statement backend id here never
+// touches a LOCK TABLE holding.
+func ReleaseTupleLocks(b lockmgr.BackendID) {
 	if b == 0 {
 		return
 	}

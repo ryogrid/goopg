@@ -20,6 +20,7 @@ package catalog
 import (
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -75,6 +76,16 @@ type Routine struct {
 	RoutineCallOIDs []uint32          // OIDs of routines called in body/defaults
 	TableDeps       []RoutineTableRef // tables referenced in FROM clauses
 	ColumnDeps      []RoutineColRef   // columns referenced in SELECT/WHERE clauses
+
+	// DBOid is the database this routine was CREATE FUNCTION/PROCEDURE'd
+	// under (mirrors catalog.Domain.DBOid/EnumType.DBOid). The registry key
+	// folds this in (routineKey/nameKey) so two distinct databases may each
+	// register a same-named routine without colliding. Zero is normalized to
+	// DefaultDBOid by Create/CreateDuringRecovery, matching every other
+	// dbOid-scoped registry's convention. M0119-0004 DU-002 follow-up
+	// (M0122-0007 4e-shaped fix, mirrors follow-up 36/37's ForeignServer/
+	// UserMapping DBOid fields).
+	DBOid uint32
 }
 
 // OwnerOrDefault returns r.Owner, falling back to the bootstrap superuser OID
@@ -176,12 +187,18 @@ func NewRoutines() *Routines {
 	}
 }
 
-func routineKey(schema, name, signature string) string {
-	return schema + "." + name + signature
+// routineDBPrefix folds dbOid into a registry key, mirroring domainKey's
+// "<dbOid>\x00" prefix convention (M0119-0004 DU-002 follow-up).
+func routineDBPrefix(dbOid uint32) string {
+	return strconv.FormatUint(uint64(dbOid), 10) + "\x00"
 }
 
-func nameKey(schema, name string) string {
-	return schema + "." + name
+func routineKey(dbOid uint32, schema, name, signature string) string {
+	return routineDBPrefix(dbOid) + schema + "." + name + signature
+}
+
+func nameKey(dbOid uint32, schema, name string) string {
+	return routineDBPrefix(dbOid) + schema + "." + name
 }
 
 // Create registers a routine. With orReplace=false, returns
@@ -203,10 +220,13 @@ func (rs *Routines) Create(r *Routine, orReplace bool) (*Routine, error) {
 	clone := *r
 	clone.Schema = schema
 	clone.Language = strings.ToLower(clone.Language)
+	if clone.DBOid == 0 {
+		clone.DBOid = DefaultDBOid
+	}
 	signature := clone.Signature()
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
-	k := routineKey(schema, clone.Name, signature)
+	k := routineKey(clone.DBOid, schema, clone.Name, signature)
 	if existing, ok := rs.byKey[k]; ok {
 		if !orReplace {
 			return nil, fmt.Errorf("%w: %s%s", ErrRoutineExists, clone.QualifiedName(), signature)
@@ -227,7 +247,7 @@ func (rs *Routines) Create(r *Routine, orReplace bool) (*Routine, error) {
 	clone.OID = rs.nextOID
 	rs.nextOID++
 	rs.byKey[k] = &clone
-	nk := nameKey(schema, clone.Name)
+	nk := nameKey(clone.DBOid, schema, clone.Name)
 	rs.byName[nk] = append(rs.byName[nk], k)
 	return &clone, nil
 }
@@ -255,9 +275,14 @@ func (rs *Routines) CreateDuringRecovery(r *Routine) *Routine {
 	clone := *r
 	clone.Schema = schema
 	clone.Language = strings.ToLower(clone.Language)
-	k := routineKey(schema, clone.Name, clone.Signature())
+	// WAL payloads don't carry a dbOid yet (restart-persistence follow-up
+	// above) — recovery always replays into DefaultDBOid, matching the
+	// single-database replay convention CreateSequenceCatalogRelation
+	// documents for the same reason.
+	clone.DBOid = DefaultDBOid
+	k := routineKey(clone.DBOid, schema, clone.Name, clone.Signature())
 	if _, exists := rs.byKey[k]; !exists {
-		nk := nameKey(schema, clone.Name)
+		nk := nameKey(clone.DBOid, schema, clone.Name)
 		rs.byName[nk] = append(rs.byName[nk], k)
 	}
 	rs.byKey[k] = &clone
@@ -280,7 +305,7 @@ func (rs *Routines) DropByOIDDuringRecovery(oid uint32) {
 			continue
 		}
 		delete(rs.byKey, k)
-		nk := nameKey(r.Schema, r.Name)
+		nk := nameKey(r.DBOid, r.Schema, r.Name)
 		keys := rs.byName[nk]
 		for i, kk := range keys {
 			if kk == k {
@@ -340,22 +365,39 @@ func (rs *Routines) SetFlagsByOIDDuringRecovery(oid uint32, volatile string, sec
 // false. Stage A uses exact type-name match — the upstream coercion
 // rules arrive when the type system grows up.
 // When schema is empty, searches all schemas.
-func (rs *Routines) Lookup(name parser.ObjectName, argTypes []Type) (*Routine, bool) {
-	stub := &Routine{Name: name.Name, ArgTypes: argTypes}
+// dbOid is a trailing variadic parameter (mirrors catalog.InMemory's
+// resolveDBOid convention) so pre-existing callers that don't pass one keep
+// resolving against DefaultDBOid unchanged. M0119-0004 DU-002 follow-up.
+func (rs *Routines) Lookup(name parser.ObjectName, argTypes []Type, dbOid ...uint32) (*Routine, bool) {
+	return rs.LookupWithArgModes(name, argTypes, nil, dbOid...)
+}
+
+// LookupWithArgModes is Lookup's twin for callers holding the parsed
+// parameter modes (ALTER/DROP FUNCTION, COMMENT ON FUNCTION). Those
+// statements resolve by the same identity-argument list PG's
+// pg_get_function_identity_arguments emits, which still carries OUT
+// parameters (ruleutils.c print_function_arguments only omits TABLE-mode
+// args from identity output, not OUT) — so the lookup stub needs argModes
+// populated for Routine.Signature() to correctly exclude them from the
+// match, exactly like pg_proc.proargtypes does. Passing nil argModes
+// reproduces Lookup's plain behavior (every arg treated as IN).
+func (rs *Routines) LookupWithArgModes(name parser.ObjectName, argTypes []Type, argModes []string, dbOid ...uint32) (*Routine, bool) {
+	stub := &Routine{Name: name.Name, ArgTypes: argTypes, ArgModes: argModes}
 	sig := stub.Signature()
+	db := resolveDBOid(dbOid)
 	rs.mu.RLock()
 	defer rs.mu.RUnlock()
 	if name.Schema != "" {
-		r, ok := rs.byKey[routineKey(name.Schema, name.Name, sig)]
+		r, ok := rs.byKey[routineKey(db, name.Schema, name.Name, sig)]
 		return r, ok
 	}
 	// No schema: search all schemas. Try public first for compatibility,
 	// then others.
-	if r, ok := rs.byKey[routineKey("public", name.Name, sig)]; ok {
+	if r, ok := rs.byKey[routineKey(db, "public", name.Name, sig)]; ok {
 		return r, ok
 	}
 	for _, r := range rs.byKey {
-		if strings.EqualFold(r.Name, name.Name) && r.Signature() == sig {
+		if r.DBOid == db && strings.EqualFold(r.Name, name.Name) && r.Signature() == sig {
 			return r, true
 		}
 	}
@@ -364,11 +406,13 @@ func (rs *Routines) Lookup(name parser.ObjectName, argTypes []Type) (*Routine, b
 
 // LookupByName returns every overload of the given schema+name.
 // When schema is empty, searches all schemas (search-path style).
-func (rs *Routines) LookupByName(name parser.ObjectName) []*Routine {
+// dbOid is a trailing variadic parameter, mirroring Lookup.
+func (rs *Routines) LookupByName(name parser.ObjectName, dbOid ...uint32) []*Routine {
+	db := resolveDBOid(dbOid)
 	rs.mu.RLock()
 	defer rs.mu.RUnlock()
 	if name.Schema != "" {
-		keys := rs.byName[nameKey(name.Schema, name.Name)]
+		keys := rs.byName[nameKey(db, name.Schema, name.Name)]
 		out := make([]*Routine, 0, len(keys))
 		for _, k := range keys {
 			if r, ok := rs.byKey[k]; ok {
@@ -380,7 +424,7 @@ func (rs *Routines) LookupByName(name parser.ObjectName) []*Routine {
 	// No schema specified: collect matches from all schemas.
 	var out []*Routine
 	for _, r := range rs.byKey {
-		if strings.EqualFold(r.Name, name.Name) {
+		if r.DBOid == db && strings.EqualFold(r.Name, name.Name) {
 			out = append(out, r)
 		}
 	}
@@ -391,19 +435,20 @@ func (rs *Routines) LookupByName(name parser.ObjectName) []*Routine {
 // Returns ErrRoutineNotFound when the signature doesn't resolve;
 // the caller maps that to the SQL-level IF EXISTS contract.
 // When schema is empty, searches all schemas.
-func (rs *Routines) Drop(name parser.ObjectName, argTypes []Type) error {
+func (rs *Routines) Drop(name parser.ObjectName, argTypes []Type, dbOid ...uint32) error {
 	stub := &Routine{Name: name.Name, ArgTypes: argTypes}
 	signature := stub.Signature()
 	schema := name.Schema
+	db := resolveDBOid(dbOid)
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
 	// Resolve schema when not provided: try public first, then all schemas.
 	if schema == "" {
-		if _, ok := rs.byKey[routineKey("public", name.Name, signature)]; ok {
+		if _, ok := rs.byKey[routineKey(db, "public", name.Name, signature)]; ok {
 			schema = "public"
 		} else {
 			for _, r := range rs.byKey {
-				if strings.EqualFold(r.Name, name.Name) && r.Signature() == signature {
+				if r.DBOid == db && strings.EqualFold(r.Name, name.Name) && r.Signature() == signature {
 					schema = r.Schema
 					break
 				}
@@ -413,12 +458,12 @@ func (rs *Routines) Drop(name parser.ObjectName, argTypes []Type) error {
 			return fmt.Errorf("%w: %s%s", ErrRoutineNotFound, name.Name, signature)
 		}
 	}
-	k := routineKey(schema, name.Name, signature)
+	k := routineKey(db, schema, name.Name, signature)
 	if _, ok := rs.byKey[k]; !ok {
 		return fmt.Errorf("%w: %s.%s%s", ErrRoutineNotFound, schema, name.Name, signature)
 	}
 	delete(rs.byKey, k)
-	nk := nameKey(schema, name.Name)
+	nk := nameKey(db, schema, name.Name)
 	keys := rs.byName[nk]
 	for i, kk := range keys {
 		if kk == k {
@@ -437,17 +482,19 @@ func (rs *Routines) Drop(name parser.ObjectName, argTypes []Type) error {
 // ErrRoutineAmbiguous if more than one overload exists — the
 // caller surfaces the upstream "function name is not unique"
 // SQLSTATE 42725. When schema is empty, searches all schemas.
-func (rs *Routines) DropByName(name parser.ObjectName) error {
+func (rs *Routines) DropByName(name parser.ObjectName, dbOid ...uint32) error {
 	schema := name.Schema
+	db := resolveDBOid(dbOid)
+	prefix := routineDBPrefix(db)
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
 	// Resolve schema when not specified.
 	if schema == "" {
-		// Collect all matching keys across schemas.
+		// Collect all matching keys across schemas within this database.
 		var allKeys []string
 		for nk, keys := range rs.byName {
-			// nameKey = "schema.name"; check suffix
-			if strings.HasSuffix(nk, "."+strings.ToLower(name.Name)) {
+			// nameKey = "<dbOid>\x00schema.name"; check dbOid prefix + name suffix
+			if strings.HasPrefix(nk, prefix) && strings.HasSuffix(nk, "."+strings.ToLower(name.Name)) {
 				allKeys = append(allKeys, keys...)
 			}
 		}
@@ -459,7 +506,7 @@ func (rs *Routines) DropByName(name parser.ObjectName) error {
 			r := rs.byKey[k]
 			delete(rs.byKey, k)
 			if r != nil {
-				nk := nameKey(r.Schema, name.Name)
+				nk := nameKey(r.DBOid, r.Schema, name.Name)
 				delete(rs.byName, nk)
 			}
 			return nil
@@ -467,14 +514,14 @@ func (rs *Routines) DropByName(name parser.ObjectName) error {
 			return fmt.Errorf("%w: %s", ErrRoutineAmbiguous, name.Name)
 		}
 	}
-	keys := rs.byName[nameKey(schema, name.Name)]
+	keys := rs.byName[nameKey(db, schema, name.Name)]
 	switch len(keys) {
 	case 0:
 		return fmt.Errorf("%w: %s.%s", ErrRoutineNotFound, schema, name.Name)
 	case 1:
 		k := keys[0]
 		delete(rs.byKey, k)
-		delete(rs.byName, nameKey(schema, name.Name))
+		delete(rs.byName, nameKey(db, schema, name.Name))
 		return nil
 	default:
 		return fmt.Errorf("%w: %s.%s has %d overloads", ErrRoutineAmbiguous, schema, name.Name, len(keys))
@@ -492,12 +539,12 @@ func (rs *Routines) DropRoutine(r *Routine) error {
 		schema = "public"
 	}
 	sig := r.Signature()
-	k := routineKey(schema, r.Name, sig)
+	k := routineKey(r.DBOid, schema, r.Name, sig)
 	if _, ok := rs.byKey[k]; !ok {
 		return fmt.Errorf("%w: %s.%s%s", ErrRoutineNotFound, schema, r.Name, sig)
 	}
 	delete(rs.byKey, k)
-	nk := nameKey(schema, r.Name)
+	nk := nameKey(r.DBOid, schema, r.Name)
 	keys := rs.byName[nk]
 	for i, kk := range keys {
 		if kk == k {
@@ -517,14 +564,16 @@ func (rs *Routines) DropRoutine(r *Routine) error {
 // statement time but defer its registry removal to COMMIT. Returns the same
 // error contract as DropByName: ErrRoutineNotFound / ErrRoutineAmbiguous. When
 // schema is empty, searches all schemas.
-func (rs *Routines) ResolveByName(name parser.ObjectName) (*Routine, error) {
+func (rs *Routines) ResolveByName(name parser.ObjectName, dbOid ...uint32) (*Routine, error) {
 	schema := name.Schema
+	db := resolveDBOid(dbOid)
 	rs.mu.RLock()
 	defer rs.mu.RUnlock()
 	if schema == "" {
+		prefix := routineDBPrefix(db)
 		var allKeys []string
 		for nk, keys := range rs.byName {
-			if strings.HasSuffix(nk, "."+strings.ToLower(name.Name)) {
+			if strings.HasPrefix(nk, prefix) && strings.HasSuffix(nk, "."+strings.ToLower(name.Name)) {
 				allKeys = append(allKeys, keys...)
 			}
 		}
@@ -537,7 +586,7 @@ func (rs *Routines) ResolveByName(name parser.ObjectName) (*Routine, error) {
 			return nil, fmt.Errorf("%w: %s", ErrRoutineAmbiguous, name.Name)
 		}
 	}
-	keys := rs.byName[nameKey(schema, name.Name)]
+	keys := rs.byName[nameKey(db, schema, name.Name)]
 	switch len(keys) {
 	case 0:
 		return nil, fmt.Errorf("%w: %s.%s", ErrRoutineNotFound, schema, name.Name)
@@ -552,18 +601,28 @@ func (rs *Routines) ResolveByName(name parser.ObjectName) (*Routine, error) {
 // removing it — the read-only twin of Drop, used by deferred DROP FUNCTION
 // (M0118-0009 `stats`). Returns ErrRoutineNotFound when the signature doesn't
 // resolve. When schema is empty, searches public then all schemas.
-func (rs *Routines) ResolveBySig(name parser.ObjectName, argTypes []Type) (*Routine, error) {
-	stub := &Routine{Name: name.Name, ArgTypes: argTypes}
+func (rs *Routines) ResolveBySig(name parser.ObjectName, argTypes []Type, dbOid ...uint32) (*Routine, error) {
+	return rs.ResolveBySigWithArgModes(name, argTypes, nil, dbOid...)
+}
+
+// ResolveBySigWithArgModes is ResolveBySig's twin for callers holding the
+// parsed parameter modes — see LookupWithArgModes for why DROP FUNCTION's
+// deferred/autocommit removal paths need this (DROP FUNCTION on a routine
+// with OUT parameters, given the identity-argument list including OUT,
+// per PG's LookupFuncWithArgs).
+func (rs *Routines) ResolveBySigWithArgModes(name parser.ObjectName, argTypes []Type, argModes []string, dbOid ...uint32) (*Routine, error) {
+	stub := &Routine{Name: name.Name, ArgTypes: argTypes, ArgModes: argModes}
 	signature := stub.Signature()
 	schema := name.Schema
+	db := resolveDBOid(dbOid)
 	rs.mu.RLock()
 	defer rs.mu.RUnlock()
 	if schema == "" {
-		if _, ok := rs.byKey[routineKey("public", name.Name, signature)]; ok {
+		if _, ok := rs.byKey[routineKey(db, "public", name.Name, signature)]; ok {
 			schema = "public"
 		} else {
 			for _, r := range rs.byKey {
-				if strings.EqualFold(r.Name, name.Name) && r.Signature() == signature {
+				if r.DBOid == db && strings.EqualFold(r.Name, name.Name) && r.Signature() == signature {
 					schema = r.Schema
 					break
 				}
@@ -573,7 +632,7 @@ func (rs *Routines) ResolveBySig(name parser.ObjectName, argTypes []Type) (*Rout
 			return nil, fmt.Errorf("%w: %s%s", ErrRoutineNotFound, name.Name, signature)
 		}
 	}
-	r, ok := rs.byKey[routineKey(schema, name.Name, signature)]
+	r, ok := rs.byKey[routineKey(db, schema, name.Name, signature)]
 	if !ok {
 		return nil, fmt.Errorf("%w: %s.%s%s", ErrRoutineNotFound, schema, name.Name, signature)
 	}
@@ -627,7 +686,7 @@ func (rs *Routines) DropRoutinesReferencingTypes(typeNames []string) []*Routine 
 		if schema == "" {
 			schema = "public"
 		}
-		nk := nameKey(schema, r.Name)
+		nk := nameKey(r.DBOid, schema, r.Name)
 		keys := rs.byName[nk]
 		for i, kk := range keys {
 			if kk == k {
@@ -662,11 +721,11 @@ func (rs *Routines) LookupByOID(oid uint32) *Routine {
 func (rs *Routines) RenameRoutine(r *Routine, newName string) error {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
-	oldKey := routineKey(r.Schema, r.Name, r.Signature())
+	oldKey := routineKey(r.DBOid, r.Schema, r.Name, r.Signature())
 	if _, ok := rs.byKey[oldKey]; !ok {
 		return fmt.Errorf("routine %s.%s not found in registry", r.Schema, r.Name)
 	}
-	oldNK := nameKey(r.Schema, r.Name)
+	oldNK := nameKey(r.DBOid, r.Schema, r.Name)
 	// Remove old key from byKey and byName.
 	delete(rs.byKey, oldKey)
 	oldList := rs.byName[oldNK]
@@ -681,8 +740,8 @@ func (rs *Routines) RenameRoutine(r *Routine, newName string) error {
 	}
 	// Update the routine name.
 	r.Name = newName
-	newKey := routineKey(r.Schema, r.Name, r.Signature())
-	newNK := nameKey(r.Schema, newName)
+	newKey := routineKey(r.DBOid, r.Schema, r.Name, r.Signature())
+	newNK := nameKey(r.DBOid, r.Schema, newName)
 	// Insert under new key and name.
 	rs.byKey[newKey] = r
 	rs.byName[newNK] = append(rs.byName[newNK], newKey)
@@ -696,11 +755,11 @@ func (rs *Routines) RenameRoutine(r *Routine, newName string) error {
 func (rs *Routines) SetSchema(r *Routine, newSchema string) error {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
-	oldKey := routineKey(r.Schema, r.Name, r.Signature())
+	oldKey := routineKey(r.DBOid, r.Schema, r.Name, r.Signature())
 	if _, ok := rs.byKey[oldKey]; !ok {
 		return fmt.Errorf("routine %s.%s not found in registry", r.Schema, r.Name)
 	}
-	oldNK := nameKey(r.Schema, r.Name)
+	oldNK := nameKey(r.DBOid, r.Schema, r.Name)
 	delete(rs.byKey, oldKey)
 	oldList := rs.byName[oldNK]
 	for i, k := range oldList {
@@ -713,8 +772,8 @@ func (rs *Routines) SetSchema(r *Routine, newSchema string) error {
 		delete(rs.byName, oldNK)
 	}
 	r.Schema = newSchema
-	newKey := routineKey(r.Schema, r.Name, r.Signature())
-	newNK := nameKey(r.Schema, r.Name)
+	newKey := routineKey(r.DBOid, r.Schema, r.Name, r.Signature())
+	newNK := nameKey(r.DBOid, r.Schema, r.Name)
 	rs.byKey[newKey] = r
 	rs.byName[newNK] = append(rs.byName[newNK], newKey)
 	return nil
@@ -861,7 +920,8 @@ func normalizeDropType(t string) string {
 // full-arg-list matching (including OUT params). If args[i].ModeExplicit is
 // false, any param mode at position i matches. If ModeExplicit is true,
 // only matching modes are accepted.
-func (rs *Routines) LookupDropCandidates(name parser.ObjectName, args []parser.FunctionArg) []*Routine {
+func (rs *Routines) LookupDropCandidates(name parser.ObjectName, args []parser.FunctionArg, dbOid ...uint32) []*Routine {
+	db := resolveDBOid(dbOid)
 	dropTypes := make([]string, len(args))
 	for i, a := range args {
 		dropTypes[i] = normalizeDropType(a.Type.Name)
@@ -885,6 +945,9 @@ func (rs *Routines) LookupDropCandidates(name parser.ObjectName, args []parser.F
 
 	var cands []*Routine
 	for _, r := range rs.byKey {
+		if r.DBOid != db {
+			continue
+		}
 		// Name must match
 		if !strings.EqualFold(r.Name, name.Name) {
 			continue

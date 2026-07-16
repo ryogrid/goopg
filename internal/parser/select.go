@@ -2510,6 +2510,12 @@ func (p *parser) parseTypeNameAfterCast() (ObjectName, error) {
 		}
 		return ObjectName{Schema: first, Name: second}, nil
 	}
+	// Multi-word built-in type name (double precision, character varying,
+	// bit varying, timestamp/time [with|without time zone]) — same shared
+	// helper parseColumnType/parseCreateDomain use, so `x::character
+	// varying`/`CAST(x AS double precision)` accept the same spellings
+	// pg_dump emits for the AS-clause/column-type positions. DU-002.
+	first = p.parseMultiWordTypeName(first)
 	return ObjectName{Name: first}, nil
 }
 

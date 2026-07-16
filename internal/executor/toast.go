@@ -364,7 +364,7 @@ func writeHeapTupleToRel(ctx *Context, rel storage.RelFileNode, tuple storage.He
 			return nil
 		}
 	}
-	slot, blk, err := ctx.Pool.PinNew(rel)
+	slot, blk, err := ctx.Pool.PinNewWithXID(rel, ctx.Tx.XID)
 	if err != nil {
 		return err
 	}

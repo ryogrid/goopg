@@ -273,6 +273,15 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		if s.cfg.LockMgr != nil {
 			s.cfg.LockMgr.ReleaseAll(backendID)
 		}
+		// Drop any tuple-level (row) locks this statement took on the
+		// always-on tableLockMgr under the per-statement backend id. In the
+		// production server (LockMgr==nil) FOR UPDATE / FOR SHARE route their
+		// tuple locks here so concurrent waiters on the same row acquire in
+		// FIFO arrival order; releasing at statement end hands the "wait until
+		// the holder's txn ends" duty back to the persisted xmax (design
+		// 0021-0012). Disjoint from LOCK TABLE, which holds under the
+		// transaction-scoped TxnLockBackendID.
+		executor.ReleaseTupleLocks(backendID)
 	}()
 	snap, err := s.cfg.TxnMgr.SnapshotFor(tx)
 	if err != nil {
@@ -326,6 +335,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		ectx.PendingEnumRenames = connTx.PendingEnumRenames
 		ectx.PendingCreatedEnums = connTx.PendingCreatedEnums
 		ectx.PendingCreatedComposites = connTx.PendingCreatedComposites
+		ectx.PendingCreatedRangeTypes = connTx.PendingCreatedRangeTypes
 		// Wire session-authorization role tracking so LEAKPROOF privilege checks
 		// work after SET SESSION AUTHORIZATION regress_unpriv_user.
 		ectx.NonSuperuserRole = connTx.NonSuperuserRole
@@ -485,7 +495,6 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		ectx.ProcNum = connTx.ProcNum
 	}
 	ectx.WAL = s.cfg.WAL
-	ectx.LogCanonical = s.cfg.LogCanonical
 	ectx.SyncRep = s.cfg.SyncRep
 	ectx.SyncCommitMode = sessionSyncCommitMode(sess)
 	ectx.AsyncCommit = sessionAsyncCommit(sess)
@@ -1016,6 +1025,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 			connTx.PendingEnumRenames = ectx.PendingEnumRenames
 			connTx.PendingCreatedEnums = ectx.PendingCreatedEnums
 			connTx.PendingCreatedComposites = ectx.PendingCreatedComposites
+			connTx.PendingCreatedRangeTypes = ectx.PendingCreatedRangeTypes
 		}
 		// Keep the savepoint-aware NOTIFY buffer in sync with the just-executed
 		// savepoint command so a later ROLLBACK TO SAVEPOINT discards the
@@ -2112,6 +2122,24 @@ func (s *Server) wireExtensionRows(ectx *executor.Context, dbName string) {
 			return pum.PGUserMappingsRowsForDBOid(catalog.NamespaceDBOid(ectx.CurrentDatabaseOid))
 		}
 	}
+	// pg_collation must likewise reflect the connecting database's own
+	// CREATE COLLATION'd collations, not always DefaultDBOid's. Mirrors the
+	// pg_user_mappings wiring above. M0122-0007 4e follow-up (DU-002
+	// round-trip probe unblock).
+	if pc, ok := s.cfg.Catalog.(pgCollationRowLister); ok {
+		ectx.PgCollationRows = func() [][]string {
+			return pc.PGCollationRowsForDBOid(catalog.NamespaceDBOid(ectx.CurrentDatabaseOid))
+		}
+	}
+	// pg_conversion must likewise reflect the connecting database's own
+	// CREATE [DEFAULT] CONVERSION'd conversions, not always DefaultDBOid's.
+	// Mirrors the pg_collation wiring above. M0122-0007 4e follow-up
+	// (DU-002 round-trip probe unblock).
+	if pcv, ok := s.cfg.Catalog.(pgConversionRowLister); ok {
+		ectx.PgConversionRows = func() [][]string {
+			return pcv.PGConversionRowsForDBOid(catalog.NamespaceDBOid(ectx.CurrentDatabaseOid))
+		}
+	}
 }
 
 // pgClassRowLister is implemented by catalog.InMemory to expose a
@@ -2213,7 +2241,21 @@ type pgUserMappingsRowLister interface {
 	PGUserMappingsRowsForDBOid(dbOid uint32) [][]string
 }
 
-func undoEnumDDLForRollback(connTx *connTxState, cat catalog.Catalog) {
+// pgCollationRowLister is implemented by catalog.InMemory to expose a
+// per-database pg_collation row-set, mirroring pgUserMappingsRowLister
+// above. M0122-0007 4e follow-up (DU-002 round-trip probe unblock).
+type pgCollationRowLister interface {
+	PGCollationRowsForDBOid(dbOid uint32) [][]string
+}
+
+// pgConversionRowLister is implemented by catalog.InMemory to expose a
+// per-database pg_conversion row-set, mirroring pgCollationRowLister above.
+// M0122-0007 4e follow-up (DU-002 round-trip probe unblock).
+type pgConversionRowLister interface {
+	PGConversionRowsForDBOid(dbOid uint32) [][]string
+}
+
+func undoEnumDDLForRollback(connTx *connTxState, cat catalog.Catalog, dbOid uint32) {
 	if connTx == nil {
 		return
 	}
@@ -2225,7 +2267,7 @@ func undoEnumDDLForRollback(connTx *connTxState, cat catalog.Catalog) {
 	// Do before undo-renames so type names are still at current (renamed) values.
 	for typeName, labels := range connTx.PendingEnumValues {
 		for label := range labels {
-			inm.RemoveEnumValue(typeName, label)
+			inm.RemoveEnumValue(typeName, label, dbOid)
 		}
 	}
 	// Step 2: Undo renames in reverse order; track name changes in created-set.
@@ -2235,7 +2277,7 @@ func undoEnumDDLForRollback(connTx *connTxState, cat catalog.Catalog) {
 	}
 	for i := len(connTx.PendingEnumRenames) - 1; i >= 0; i-- {
 		r := connTx.PendingEnumRenames[i]
-		_ = inm.RenameEnum(r.NewName, r.OldName)
+		_ = inm.RenameEnum(r.NewName, r.OldName, dbOid)
 		if created[r.NewName] {
 			delete(created, r.NewName)
 			created[r.OldName] = true
@@ -2243,12 +2285,18 @@ func undoEnumDDLForRollback(connTx *connTxState, cat catalog.Catalog) {
 	}
 	// Step 3: Drop types created in this transaction (now at original names).
 	for name := range created {
-		_ = inm.DropEnum(name, false)
+		_ = inm.DropEnum(name, false, dbOid)
 	}
 	// Step 4: Drop composite types created via CREATE TYPE … AS (...) in this
 	// transaction.  Mirrors undoEnumDDLFromContext step 4.  DU-002 slice 244.
 	for name := range connTx.PendingCreatedComposites {
-		_ = inm.DropCompositeType(name)
+		_ = inm.DropCompositeType(name, dbOid)
+	}
+	// Step 5: Drop range types created via CREATE TYPE … AS RANGE in this
+	// transaction.  Mirrors undoEnumDDLFromContext step 5.  M0122-0007 4e
+	// follow-up (fifth loop).
+	for name := range connTx.PendingCreatedRangeTypes {
+		_ = inm.DropRangeType(name, dbOid)
 	}
 }
 
@@ -2380,7 +2428,7 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 				if connTx.IsFailed() {
 					// COMMIT in a failed transaction block → ROLLBACK (PG semantics).
 					_ = s.cfg.TxnMgr.Rollback(connTx.Tx())
-					undoEnumDDLForRollback(connTx, s.cfg.Catalog)
+					undoEnumDDLForRollback(connTx, s.cfg.Catalog, ctx.CurrentDatabaseOid)
 					connTx.End()
 					if ctx.EndLocalTransaction != nil {
 						ctx.EndLocalTransaction()
@@ -2389,6 +2437,7 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 					ctx.PendingEnumRenames = nil
 					ctx.PendingCreatedEnums = nil
 					ctx.PendingCreatedComposites = nil
+					ctx.PendingCreatedRangeTypes = nil
 					return w.WriteCommandComplete("ROLLBACK")
 				}
 				explicitTx := connTx.Tx()
@@ -2420,7 +2469,7 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 					}
 					if deferErr != nil {
 						_ = s.cfg.TxnMgr.Rollback(explicitTx)
-						undoEnumDDLForRollback(connTx, s.cfg.Catalog)
+						undoEnumDDLForRollback(connTx, s.cfg.Catalog, ctx.CurrentDatabaseOid)
 						connTx.End()
 						if ctx.EndLocalTransaction != nil {
 							ctx.EndLocalTransaction()
@@ -2429,6 +2478,7 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 						ctx.PendingEnumRenames = nil
 						ctx.PendingCreatedEnums = nil
 						ctx.PendingCreatedComposites = nil
+						ctx.PendingCreatedRangeTypes = nil
 						code := sqlstate.ForeignKeyViolation
 						var fields []protocol.ErrorField
 						if ee, ok := deferErr.(*executor.ExecError); ok {
@@ -2455,7 +2505,7 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 					if ssiErr := s.cfg.TxnMgr.PreCommitCheckForSerializationFailure(explicitTx.Handle); ssiErr != nil {
 						// SSI failure: rollback.
 						_ = s.cfg.TxnMgr.Rollback(explicitTx)
-						undoEnumDDLForRollback(connTx, s.cfg.Catalog)
+						undoEnumDDLForRollback(connTx, s.cfg.Catalog, ctx.CurrentDatabaseOid)
 						connTx.End()
 						if ctx.EndLocalTransaction != nil {
 							ctx.EndLocalTransaction()
@@ -2464,6 +2514,7 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 						ctx.PendingEnumRenames = nil
 						ctx.PendingCreatedEnums = nil
 						ctx.PendingCreatedComposites = nil
+						ctx.PendingCreatedRangeTypes = nil
 						// Primary message is the bare upstream errmsg; the reason
 						// code rides in DETAIL (predicate.c parity). isolationtester
 						// and psql print only the errmsg line.
@@ -2499,7 +2550,7 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 					executor.ApplyDeferredRoutineDrops(ctx, sess)
 				}
 				if err := ctx.CommitTransaction(explicitTx); err != nil {
-					undoEnumDDLForRollback(connTx, s.cfg.Catalog)
+					undoEnumDDLForRollback(connTx, s.cfg.Catalog, ctx.CurrentDatabaseOid)
 					connTx.End()
 					if ctx.EndLocalTransaction != nil {
 						ctx.EndLocalTransaction()
@@ -2508,6 +2559,7 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 					ctx.PendingEnumRenames = nil
 					ctx.PendingCreatedEnums = nil
 					ctx.PendingCreatedComposites = nil
+					ctx.PendingCreatedRangeTypes = nil
 					return s.writeQueryError(w, sqlstate.SystemError, err.Error())
 				}
 				// Publish NOTIFYs buffered by this explicit transaction now that it
@@ -2523,6 +2575,7 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 				ctx.PendingEnumRenames = nil
 				ctx.PendingCreatedEnums = nil
 				ctx.PendingCreatedComposites = nil
+				ctx.PendingCreatedRangeTypes = nil
 				maybeForceGCAfterCommit()
 				// Leave *autoCommitPtr = false so the caller does NOT attempt
 				// a second TxnMgr.Commit on the already-committed transaction.
@@ -2544,7 +2597,7 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 					executor.ProcessRollbackUndos(ctx, sess)
 				}
 				_ = s.cfg.TxnMgr.Rollback(connTx.Tx())
-				undoEnumDDLForRollback(connTx, s.cfg.Catalog)
+				undoEnumDDLForRollback(connTx, s.cfg.Catalog, ctx.CurrentDatabaseOid)
 				connTx.End()
 				if ctx.EndLocalTransaction != nil {
 					ctx.EndLocalTransaction()
@@ -2553,6 +2606,7 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 				ctx.PendingEnumRenames = nil
 				ctx.PendingCreatedEnums = nil
 				ctx.PendingCreatedComposites = nil
+				ctx.PendingCreatedRangeTypes = nil
 				// Leave *autoCommitPtr = false to avoid a second rollback attempt.
 			} else {
 				// ROLLBACK outside an explicit transaction: emit warning.
@@ -2799,6 +2853,8 @@ func ddlTag(stmt parser.Stmt) string {
 		return "CREATE COLLATION"
 	case *parser.AlterCollationStmt:
 		return "ALTER COLLATION"
+	case *parser.AlterConversionStmt:
+		return "ALTER CONVERSION"
 	case *parser.AlterTSConfigStmt:
 		return "ALTER TEXT SEARCH CONFIGURATION"
 	case *parser.AlterTSDictStmt:
@@ -2929,9 +2985,37 @@ func (s *Server) appendTypedCellText(dst []byte, d executor.Datum, typ catalog.T
 		// (codec.go), so just emit the stored value without re-padding.
 		return d.AppendValueText(dst)
 	case "date":
-		// Date columns display as YYYY-MM-DD. M0097-0004.
+		// Date columns render per the session's DateStyle GUC (style x
+		// order), matching PostgreSQL's date_out/EncodeDateOnly. Previously
+		// hardcoded ISO regardless of `SET datestyle`. M0097-0004,
+		// M-NIGHTLY (run 20260714-011651) DateStyle output-rendering
+		// follow-up.
 		if d.Kind == executor.KindTime {
-			return d.TimeValue().AppendFormat(dst, "2006-01-02")
+			style, order := "ISO", "MDY"
+			if getSetting != nil {
+				if v, ok := getSetting("datestyle"); ok {
+					style, order = config.ParseDateStyleValue(v)
+				}
+			}
+			return append(dst, config.FormatDate(d.TimeValue(), style, order)...)
+		}
+		return d.AppendValueText(dst)
+	case "timestamp", "timestamptz":
+		// Timestamp columns render per the session's DateStyle GUC (style x
+		// order), matching PostgreSQL's EncodeDateTime with print_tz=false.
+		// Previously hardcoded ISO regardless of `SET datestyle`. No
+		// session-timezone-aware conversion/offset for timestamptz yet
+		// (separate deferred gap — matches this column's pre-existing
+		// behavior, unchanged by this fix). M-NIGHTLY (run 20260714-011651)
+		// DateStyle output-rendering follow-up.
+		if d.Kind == executor.KindTime {
+			style, order := "ISO", "MDY"
+			if getSetting != nil {
+				if v, ok := getSetting("datestyle"); ok {
+					style, order = config.ParseDateStyleValue(v)
+				}
+			}
+			return append(dst, config.FormatTimestamp(d.TimeValue(), style, order)...)
 		}
 		return d.AppendValueText(dst)
 	case "time":

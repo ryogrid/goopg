@@ -19,25 +19,26 @@ func TestUndoCompositeDDLOnRollback(t *testing.T) {
 	// rollback undo must leave it alone.
 	cat.RegisterCompositeTypeWithFields("committed", []catalog.CompositeField{
 		{Name: "a", ColType: "int"},
-	})
+	}, catalog.DefaultDBOid)
 	// `intx` simulates CREATE TYPE … AS (...) issued inside the open
 	// transaction. The executor records it in PendingCreatedComposites.
 	cat.RegisterCompositeTypeWithFields("intx", []catalog.CompositeField{
 		{Name: "street", ColType: "text"},
 		{Name: "zip", ColType: "int"},
-	})
+	}, catalog.DefaultDBOid)
 
 	ctx := &Context{
 		Catalog:                  cat,
+		CurrentDatabaseOid:       catalog.DefaultDBOid,
 		PendingCreatedComposites: map[string]bool{"intx": true},
 	}
 
 	undoEnumDDLFromContext(ctx)
 
-	if got := cat.LookupCompositeType("intx"); got != nil {
+	if got := cat.LookupCompositeType("intx", catalog.DefaultDBOid); got != nil {
 		t.Errorf("ROLLBACK should have dropped composite type created in-tx; LookupCompositeType(intx)=%+v", got)
 	}
-	if got := cat.LookupCompositeType("committed"); got == nil {
+	if got := cat.LookupCompositeType("committed", catalog.DefaultDBOid); got == nil {
 		t.Error("ROLLBACK dropped a pre-existing composite type not created in this transaction")
 	}
 }
@@ -50,13 +51,14 @@ func TestUndoCompositeDDLCaseInsensitive(t *testing.T) {
 	cat := catalog.NewInMemory()
 	cat.RegisterCompositeTypeWithFields("Addr", []catalog.CompositeField{
 		{Name: "x", ColType: "int"},
-	})
+	}, catalog.DefaultDBOid)
 	ctx := &Context{
 		Catalog:                  cat,
+		CurrentDatabaseOid:       catalog.DefaultDBOid,
 		PendingCreatedComposites: map[string]bool{"addr": true},
 	}
 	undoEnumDDLFromContext(ctx)
-	if got := cat.LookupCompositeType("Addr"); got != nil {
+	if got := cat.LookupCompositeType("Addr", catalog.DefaultDBOid); got != nil {
 		t.Errorf("case-insensitive rollback drop failed; LookupCompositeType(Addr)=%+v", got)
 	}
 }
