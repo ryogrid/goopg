@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"net"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -45,36 +46,72 @@ func TestPort_IsolationSuite(t *testing.T) {
 	dsn := buildDSN(t, c)
 	runner := &framework.IsolationRunner{DSN: dsn}
 
-	passed, deferred := 0, 0
-	for _, specPath := range specs {
-		specPath := specPath
-		name := filepath.Base(specPath)
-		name = name[:len(name)-len(filepath.Ext(name))] // strip .spec
+	// The specs run as parallel subtests, but every one of them MUST complete
+	// before the deferred c.Stop() above tears the shared cluster down. A
+	// t.Parallel() subtest is paused until its PARENT test function returns —
+	// so registering the specs directly in this function would let the deferred
+	// Stop run FIRST, killing the cluster before any spec connects. Every spec
+	// then failed with "connection refused", took the deferred-skip arm below,
+	// and — since a SKIP counts as PASS — the whole suite went falsely green
+	// while validating nothing (proven by the ~170ms-then-shutdown trace in
+	// /tmp/goopg_cluster_debug/isolation_suite.log). Nesting the specs under a
+	// synchronous inner-group t.Run fixes the ordering: this call blocks until
+	// all of the group's parallel children finish, and only THEN does the parent
+	// return and the deferred Stop run. See deferral ledger 2026-07-16.
+	t.Run("specs", func(t *testing.T) {
+		for _, specPath := range specs {
+			specPath := specPath
+			name := filepath.Base(specPath)
+			name = name[:len(name)-len(filepath.Ext(name))] // strip .spec
 
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-			defer cancel()
+			t.Run(name, func(t *testing.T) {
+				t.Parallel()
+				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+				defer cancel()
 
-			result := runner.RunAndCompare(ctx, root, specPath)
-			switch result.Status {
-			case "pass":
-				// nothing to report
-			case "defer":
-				// Expected for most specs — goopg not yet fully compatible.
-				t.Logf("defer: %s", result.Diff)
-				t.Skip("deferred: output did not match expected")
-			case "excluded":
-				t.Skip("excluded by policy")
-			default:
-				t.Errorf("unknown status %q: %s", result.Status, result.Diff)
-			}
-		})
+				result := runner.RunAndCompare(ctx, root, specPath)
+				switch result.Status {
+				case "pass":
+					// nothing to report
+				case "defer":
+					// A cluster-connectivity failure must NOT masquerade as a
+					// deferred spec (deferred = skip = PASS) — that is exactly how
+					// a torn-down/dead cluster hid zero real coverage. Fail hard so
+					// an unreachable cluster can never turn the suite green again.
+					if isClusterUnreachable(result.Diff) {
+						t.Fatalf("cluster unreachable while running %s (not a spec mismatch): %s", name, result.Diff)
+					}
+					// Expected for most specs — goopg not yet fully compatible.
+					t.Logf("defer: %s", result.Diff)
+					t.Skip("deferred: output did not match expected")
+				case "excluded":
+					t.Skip("excluded by policy")
+				default:
+					t.Errorf("unknown status %q: %s", result.Status, result.Diff)
+				}
+			})
+		}
+	})
+}
 
-		// Track outside subtests so we can log a summary.
-		_ = passed
-		_ = deferred
+// isClusterUnreachable reports whether a RunAndCompare "defer" diff indicates the
+// goopg cluster was down/unreachable (a connection failure) rather than a genuine
+// spec output mismatch. Such a failure must fail the suite, not skip — a silently
+// torn-down cluster is how TestPort_IsolationSuite previously went falsely green.
+// The markers are TCP-dial / connection-establishment failures that never appear
+// in a legitimate isolation-output diff.
+func isClusterUnreachable(diff string) bool {
+	for _, marker := range []string{
+		"connection refused",
+		"dial tcp",
+		"no such host",
+		"connection reset by peer",
+	} {
+		if strings.Contains(diff, marker) {
+			return true
+		}
 	}
+	return false
 }
 
 // TestPort_IsolationReadWriteUnique is a focused test for the
