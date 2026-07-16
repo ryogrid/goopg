@@ -198,9 +198,18 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
     pass-3 join, M0114 cache fast path, and all call sites untouched — zero behavior change. Gate: initdb
     (241s incl. crash recovery) + executor + catalog + wal units, FULL regress (295s), isolation (22s),
     replication smoke — all green.
-  - [ ] **B0.2** catalog `XLOG_HEAP_UPDATE` emit (`updateHeapRowCanonicalPG` + TID-carrying write-through
-    cache contract; proven on one pg_class ALTER re-sync path). Gate: full + pg_waldump Heap/UPDATE on
-    1259 + e2e failover + re-init.
+  - [x] **B0.2** LANDED — non-HOT catalog `XLOG_HEAP_UPDATE` end-to-end machinery:
+    `EncodeHeapUpdatePG` (same-page single block-ref / cross-page block 0 new + block 1 old, upstream
+    log_heap_update shape), `replayDecodedXLogHeapUpdate` extended with the non-HOT arm
+    (`PageStampUpdatedOldTuple` — xmax + forward ctid, NO HOT bits; per-page pd_lsn idempotency for the
+    cross-page form; dispatch: tuple-carrying → logical, FPI-only → image restore),
+    `Pool.LogHeapUpdate` hook wired in open.go, and the producer `updateHeapRowCanonicalPG`
+    (verify-old-live per R-B0-3, same-page fast path, block-ordered two-page slow path,
+    `buildCatalogPGHeapTuple` factored shared with the INSERT twin). Pinned by same-page + cross-page
+    replay round-trip tests; the record is in the real-pg_waldump structural gate. Gate: storage/wal/
+    executor units, wal -race, initdb crash recovery (235s), e2e failover — green.
+    NOTE: first real caller + the TID-carrying cache land with B1.1 pg_namespace (no emit site exists
+    until a catalog converts; the helper is additive and unused in production this landing).
   - [ ] **B0.3** per-DB catalog index bootstrap at CREATE DATABASE + lift the DefaultDBOid index skip
     (operators_ddl.go:13185-13215). Gate: full + multi-DB regress + re-init.
   - [ ] **B0.4** `pg_filenode.map` writer + `XLOG_RELMAP_UPDATE` encoder/replay — DEFERRABLE past B1

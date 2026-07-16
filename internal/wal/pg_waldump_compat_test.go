@@ -100,10 +100,16 @@ func TestPGWaldumpParsesEmittedWAL(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// B0.2: the non-HOT catalog xl_heap_update must decode structurally too.
+	updPayload, err := EncodeHeapUpdatePG(rel, 0, 1, 0, 2, storage.TransactionID(43), tupBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
 	records := [][]byte{
 		EncodeCheckpoint(),
 		EncodeHeapInsert(rel, 0, 1, tupBytes),
 		EncodeHeapDelete(rel, 0, 1, storage.TransactionID(42), nil),
+		updPayload,
 		EncodeXactCommit(storage.TransactionID(42)),
 		pagePayload,
 	}

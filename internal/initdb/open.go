@@ -634,6 +634,22 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return storage.LSN(end), nil
 	}
 
+	// Atomic NON-HOT heap-update change record (B0.2, doc 02a §3): catalog
+	// ALTERs update their heap row in place — old-version xmax stamp +
+	// forward ctid + new version, one xl_heap_update record. Replay routes
+	// to replayDecodedXLogHeapUpdate(hot=false).
+	logHeapUpdate := func(rel storage.RelFileNode, oldBlk storage.BlockNumber, oldSlot uint16, newBlk storage.BlockNumber, newSlot uint16, xmax storage.TransactionID, tupleBytes []byte) (storage.LSN, error) {
+		payload, err := wal.EncodeHeapUpdatePG(rel, oldBlk, oldSlot, newBlk, newSlot, xmax, tupleBytes)
+		if err != nil {
+			return 0, err
+		}
+		_, end, err := walWriter.Append(payload)
+		if err != nil {
+			return 0, err
+		}
+		return storage.LSN(end), nil
+	}
+
 	// Relation-file creation WAL record (M0030-0002). Emitted by
 	// Pool.PinNew when it creates block 0 of a new relfile so crash
 	// recovery can recreate the file before replaying data pages.
@@ -680,6 +696,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		LogHeapFreeze:            logHeapFreeze,
 		LogHeapLock:              logHeapLock,
 		LogHeapHotUpdate:         logHeapHotUpdate,
+		LogHeapUpdate:            logHeapUpdate,
 		LogHeapPruneOpt:          logHeapPruneOpt,
 		LogSmgrCreate:            logSmgrCreate,
 		LogChangeRecord:          logChangeRecord,

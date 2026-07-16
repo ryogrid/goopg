@@ -9562,15 +9562,30 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 			// tuple + old/new offnums), no FPI — replay adds the new tuple and
 			// stamps the old. A real-PG HOT update carrying a full-page image is
 			// restored via the FPI branch inside replayDecodedXLogHeapUpdate.
-			if err := replayDecodedXLogHeapUpdate(mgr, r, xlog); err != nil {
+			if err := replayDecodedXLogHeapUpdate(mgr, r, xlog, true); err != nil {
 				return false, err
 			}
 			return true, nil
-		case xlogHeapUpdate, xlogHeapInplace:
-			// Non-HOT update (goopg emits this only as a real-PG record today —
-			// its own non-HOT path is Delete+Insert) and xlogHeapInplace
-			// (M0117-0008 Part B, datfrozenxid-advanced pg_database) are emitted
-			// with full-page images; restore each block from its FPI.
+		case xlogHeapUpdate:
+			// B0.2: goopg now emits non-HOT xl_heap_update for catalog ALTERs
+			// (EncodeHeapUpdatePG — block 0 new page + tuple, optional block 1
+			// old page). Tuple-carrying records replay logically (add new
+			// version + stamp old WITHOUT HOT bits); records with only FPIs
+			// (a real-PG update) restore the images.
+			if xlogHeapUpdateCarriesTuple(xlog) {
+				if err := replayDecodedXLogHeapUpdate(mgr, r, xlog, false); err != nil {
+					return false, err
+				}
+				return true, nil
+			}
+			if err := replayDecodedXLogHeapFPIBlocks(mgr, r, xlog); err != nil {
+				return false, err
+			}
+			return true, nil
+		case xlogHeapInplace:
+			// xlogHeapInplace (M0117-0008 Part B, datfrozenxid-advanced
+			// pg_database) is emitted with full-page images; restore each
+			// block from its FPI.
 			if err := replayDecodedXLogHeapFPIBlocks(mgr, r, xlog); err != nil {
 				return false, err
 			}
@@ -9929,7 +9944,19 @@ func decodeXLogHeapUpdateMainData(mainData []byte) (oldXmax uint32, oldOffnum ui
 // Mirrors the native replayHeapHotUpdate (PageAddHeapTuple + PageStampHotOldTuple),
 // so goopg↔goopg replay is identical; a full-page image is restored instead.
 // Idempotent via pd_lsn.
-func replayDecodedXLogHeapUpdate(mgr *storage.Manager, r Record, xlog *XLogDecodedRecord) error {
+// xlogHeapUpdateCarriesTuple reports whether block 0 carries the new tuple's
+// bytes (goopg's logical emit) rather than only full-page images (a real-PG
+// record). B0.2 dispatch helper.
+func xlogHeapUpdateCarriesTuple(xlog *XLogDecodedRecord) bool {
+	block, ok := xlogBlockRefByID(xlog, 0)
+	return ok && len(block.Data) > 0 && !(block.HasImage && block.ImageApply)
+}
+
+// replayDecodedXLogHeapUpdate applies a tuple-carrying xl_heap_update. hot
+// selects the old-tuple stamp: HOT (same-page chain link + HeapHotUpdated)
+// vs plain non-HOT (B0.2 catalog ALTERs — xmax + forward ctid, possibly
+// cross-page via block 1, no HOT bits).
+func replayDecodedXLogHeapUpdate(mgr *storage.Manager, r Record, xlog *XLogDecodedRecord, hot bool) error {
 	block, ok := xlogBlockRefByID(xlog, 0)
 	if !ok {
 		return fmt.Errorf("wal: xlog heap-update missing block 0")
@@ -9952,6 +9979,15 @@ func replayDecodedXLogHeapUpdate(mgr *storage.Manager, r Record, xlog *XLogDecod
 	if block.Block >= nblocks {
 		return fmt.Errorf("wal: xlog heap-update: block %d does not exist (nblocks=%d)", block.Block, nblocks)
 	}
+	// Old-tuple page: block 1 when the versions live on different pages
+	// (non-HOT cross-page form), else the shared block 0 page.
+	oldBlock := block
+	if ob, ok := xlogBlockRefByID(xlog, 1); ok {
+		if hot {
+			return fmt.Errorf("wal: xlog heap-hot-update with cross-page block 1")
+		}
+		oldBlock = ob
+	}
 	page := make(storage.Page, storage.BlockSize)
 	if err := mgr.ReadBlock(block.Rel, block.Block, page); err != nil {
 		return err
@@ -9959,25 +9995,58 @@ func replayDecodedXLogHeapUpdate(mgr *storage.Manager, r Record, xlog *XLogDecod
 	if storage.IsNew(page) {
 		return fmt.Errorf("wal: xlog heap-update: block %d is uninitialised", block.Block)
 	}
-	if storage.MustHeader(page).LSN() >= storage.LSN(r.EndLSN) {
-		return nil // already applied
+	samePage := oldBlock.Block == block.Block
+	stampOld := func(p storage.Page) error {
+		if hot {
+			return storage.PageStampHotOldTuple(p, oldOffnum, storage.TransactionID(oldXmax), block.Block, newOffnum)
+		}
+		return storage.PageStampUpdatedOldTuple(p, oldOffnum, storage.TransactionID(oldXmax), block.Block, newOffnum)
 	}
-	tup, err := storage.ParseHeapTuple(newTupleBytes)
-	if err != nil {
-		return fmt.Errorf("wal: xlog heap-update parse new tuple: %w", err)
+	if storage.MustHeader(page).LSN() < storage.LSN(r.EndLSN) {
+		tup, err := storage.ParseHeapTuple(newTupleBytes)
+		if err != nil {
+			return fmt.Errorf("wal: xlog heap-update parse new tuple: %w", err)
+		}
+		gotSlot, err := storage.PageAddHeapTuple(page, tup)
+		if err != nil {
+			return fmt.Errorf("wal: xlog heap-update add new tuple: %w", err)
+		}
+		if gotSlot != newOffnum {
+			return fmt.Errorf("wal: xlog heap-update new-slot drift: got %d, want %d", gotSlot, newOffnum)
+		}
+		if samePage {
+			if err := stampOld(page); err != nil {
+				return fmt.Errorf("wal: xlog heap-update stamp old tuple: %w", err)
+			}
+		}
+		storage.MustHeader(page).SetLSN(storage.LSN(r.EndLSN))
+		if err := mgr.WriteBlock(block.Rel, block.Block, page); err != nil {
+			return err
+		}
 	}
-	gotSlot, err := storage.PageAddHeapTuple(page, tup)
-	if err != nil {
-		return fmt.Errorf("wal: xlog heap-update add new tuple: %w", err)
+	if samePage {
+		return nil
 	}
-	if gotSlot != newOffnum {
-		return fmt.Errorf("wal: xlog heap-update new-slot drift: got %d, want %d", gotSlot, newOffnum)
+	// Cross-page: stamp the old version on its own page, with its own
+	// pd_lsn idempotency (mirrors PG's per-buffer redo).
+	if oldBlock.Block >= nblocks {
+		return fmt.Errorf("wal: xlog heap-update: old block %d does not exist (nblocks=%d)", oldBlock.Block, nblocks)
 	}
-	if err := storage.PageStampHotOldTuple(page, oldOffnum, storage.TransactionID(oldXmax), block.Block, gotSlot); err != nil {
+	oldPage := make(storage.Page, storage.BlockSize)
+	if err := mgr.ReadBlock(block.Rel, oldBlock.Block, oldPage); err != nil {
+		return err
+	}
+	if storage.IsNew(oldPage) {
+		return fmt.Errorf("wal: xlog heap-update: old block %d is uninitialised", oldBlock.Block)
+	}
+	if storage.MustHeader(oldPage).LSN() >= storage.LSN(r.EndLSN) {
+		return nil
+	}
+	if err := stampOld(oldPage); err != nil {
 		return fmt.Errorf("wal: xlog heap-update stamp old tuple: %w", err)
 	}
-	storage.MustHeader(page).SetLSN(storage.LSN(r.EndLSN))
-	return mgr.WriteBlock(block.Rel, block.Block, page)
+	storage.MustHeader(oldPage).SetLSN(storage.LSN(r.EndLSN))
+	return mgr.WriteBlock(block.Rel, oldBlock.Block, oldPage)
 }
 
 // replayDecodedXLogBtreeInsert applies a PG-format xl_btree_insert: insert the

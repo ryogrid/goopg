@@ -241,6 +241,42 @@ func EncodeHeapHotUpdatePG(rel storage.RelFileNode, blk storage.BlockNumber, old
 	return framePGAssembled(RmgrHeap, xlogHeapHotUpdate, uint32(xmax), body), nil
 }
 
+// EncodeHeapUpdatePG builds a PostgreSQL xl_heap_update record for one NON-HOT
+// heap update (XLOG_HEAP_UPDATE, 0x20) — B0.2's catalog-ALTER record (doc 02a
+// §3), shared with any future non-HOT user-table flip. Layout mirrors upstream
+// log_heap_update (heapam.c): main data is the same 14-byte xl_heap_update as
+// the HOT form; block 0 is the NEW tuple's page carrying xl_heap_header +
+// tuple bytes; when the old version lives on a DIFFERENT page, block 1
+// references it (no data). Same-page updates carry a single block 0, exactly
+// like PG. Prefix/suffix compression is not used. xl_xid = xmax (the updating
+// xact); replay stamps the old tuple WITHOUT HOT bits (the successor is
+// reached via indexes) and places the new version at new_offnum.
+func EncodeHeapUpdatePG(rel storage.RelFileNode, oldBlk storage.BlockNumber, oldSlot uint16,
+	newBlk storage.BlockNumber, newSlot uint16, xmax storage.TransactionID, newTuple []byte) ([]byte, error) {
+	if len(newTuple) < storage.SizeOfHeapTupleHeaderData {
+		return nil, fmt.Errorf("wal: heap-update new tuple %d bytes < fixed header %d", len(newTuple), storage.SizeOfHeapTupleHeaderData)
+	}
+	mainData := make([]byte, sizeOfXLogHeapUpdateData)
+	binary.LittleEndian.PutUint32(mainData[0:4], uint32(xmax)) // old_xmax
+	binary.LittleEndian.PutUint16(mainData[4:6], oldSlot)      // old_offnum
+	mainData[6] = 0                                            // old_infobits_set
+	mainData[7] = xlhUpdateContainsNewTuple                    // flags
+	// new_xmax [8:12] stays 0 (the new tuple is not deleted).
+	binary.LittleEndian.PutUint16(mainData[12:14], newSlot) // new_offnum
+
+	blocks := []BlockRef{{
+		ID: 0, Rel: rel, Block: newBlk, Data: heapHeaderPlusData(newTuple),
+	}}
+	if oldBlk != newBlk {
+		blocks = append(blocks, BlockRef{ID: 1, Rel: rel, Block: oldBlk})
+	}
+	body, err := assembleXLogRecord(mainData, blocks)
+	if err != nil {
+		return nil, err
+	}
+	return framePGAssembled(RmgrHeap, xlogHeapUpdate, uint32(xmax), body), nil
+}
+
 // sizeOfXLogBtreeInsertData is PG's SizeOfBtreeInsert: offnum(2).
 const sizeOfXLogBtreeInsertData = 2
 
