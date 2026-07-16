@@ -127,18 +127,21 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
     `replayDecodedXLogHeapFPIBlocks` (the arm previously NO-OPed it — fixed together). `predictXLogRecordLen`
     assembled branch already reserves the shrunken size. Native `EncodePageImage` kept as dead fallback.
     Gates: crash-recovery (218s), e2e ×3, isolation (real, 26s), regress (280s).
-  - [ ] **A9-smgr-create / A9-clog-truncate** — DEFERRED (routing robustness). Both are main-data-only PG
-    records (`xl_smgr_create`=RelFileLocator+forkNum; `xl_clog_truncate`=pageno/oldestXact/oldestXactDb) with
-    xl_xid=0. A main-data-only record routes to the decoded replay path only when
-    `nativeHeaderMatchesMainData` is FALSE — but `classifyXLogRecord` reads main-data[0] as a RecordKind, and
-    if the RelFileLocator's first byte (a tablespace-OID low byte) equals `RecordKindSmgrCreate`(11) /
-    `RecordKindClogTruncate`(33) it collides → misroutes to the native `payload[0]` switch → silent corruption.
-    goopg DOES use non-default tablespaces (`table.Tablespace`), so the collision is reachable. Resume: stamp
-    the **real xid** in the header (PG-faithful — PG's smgr/clog records carry one; a non-zero header xid
-    guarantees decoded routing, exactly how A6 xact records route). Needs plumbing the xid to the emit sites
-    (`Pool.PinNew`→`logSmgrCreate`; the clog-truncate emitter) — storage layer is not xid-aware today.
-    Alternative: teach `nativeHeaderMatchesMainData` to also require the native fixed-size for the kind
-    (10 bytes for SmgrCreate vs 16 for `xl_smgr_create`). → deferral ledger.
+  - [x] **A9-smgr-create** — LANDED. `EncodeSmgrCreatePG` (RM_SMGR/XLOG_SMGR_CREATE): 16-byte
+    RelFileLocator{spcOid,dbOid,relNumber}+ForkNumber main-data, no block ref, with the CREATING xid in the
+    header (PG stamps it via log_smgrcreate). The real xid is both PG-faithful and the routing guarantee — a
+    non-zero header xid mismatches `classifyXLogRecord`'s always-0 xid, so the record reaches the decoded path
+    regardless of the RelFileLocator's leading byte (test proves the tablespace-OID-16395 = 16384+11 collision
+    is resolved by the xid). New `RmgrStorage`/`XLOG_SMGR_CREATE` decoded arm → `applySmgrCreate` (shared with
+    native replay). xid plumbing: `Pool.PinNewWithXID`/`ExtendRelationBatchWithXID` (plain `PinNew` stays,
+    xid=0 for bootstrap/catalog in default tablespace = routing-safe); wired heap/TOAST/mirror + index build
+    (`btree.Options.CreateXID`, `BulkCreateWithXID`/`CreateWithXID`) to `ctx.Tx.XID`. Gates: crash-recovery
+    (230s), e2e ×3, isolation (real), regress (284s).
+  - [ ] **A9-clog-truncate** — remaining. PG's `xl_clog_truncate` (pageno int64 / oldestXact / oldestXactDb)
+    carries `xl_xid=0` (confirmed: clog.c `WriteTruncateXlogRec`), so the xid-routing trick does NOT apply —
+    it needs the size-check disambiguation instead (native `RecordKindClogTruncate` body = 5 bytes vs PG's 16).
+    Also widen the body + thread `oldestXactDb` (datoid) through `SetTruncateLogger`, and add a `RmgrCLOG`
+    decoded arm + initdb xact-recovery scanner update. → deferral ledger.
   - [ ] **A9-checkpoint-opcode** — DEFERRED (hot-standby entanglement). Body is already the 88-byte PG
     `CheckPoint`; the gap is that `classifyXLogRecord` tags it by `len==88`→SHUTDOWN and never emits ONLINE.
     Changing this is risky: the shutdown opcode is load-bearing for `PMSIGNAL_BEGIN_HOT_STANDBY` readiness
@@ -169,6 +172,20 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
   `information_schema` parity vs PG 18.3; crash-after-DDL recovery via generic reload; re-init data dir.
 
 ---
+
+## Log (A9 — smgr-create landed via xid-plumbing)
+- 2026-07-16: **A9-smgr-create landed — relation-file creation is now a PG `RM_SMGR`/`XLOG_SMGR_CREATE`
+  record carrying the creating transaction's xid.** The real xid (PG-faithful) is also the routing guarantee:
+  a main-data-only record only reaches the decoded replay path when `nativeHeaderMatchesMainData` is false,
+  and a non-zero header xid always mismatches `classifyXLogRecord`'s xid=0 — so it routes correctly no matter
+  what the RelFileLocator's leading byte is (resolving the tablespace-OID-≡-11 = `RecordKindSmgrCreate`
+  collision that xid=0 would misroute). Plumbed `ctx.Tx.XID` to every user-relation create via
+  `Pool.PinNewWithXID`/`ExtendRelationBatchWithXID` + btree `Options.CreateXID` (`BulkCreateWithXID`/
+  `CreateWithXID`); plain `PinNew` stays for bootstrap/catalog (xid=0, default tablespace, routing-safe). New
+  `RmgrStorage` decoded arm → `applySmgrCreate`. Gates: crash-recovery 230s, e2e ×3, isolation (real), regress
+  284s. FF to main needed the shared-stash dance (Ralph WIP overlapped `operators_ddl.go` — disjoint regions,
+  clean stash/FF/apply/drop). **Remaining A9: clog-truncate (needs size-check routing since PG uses xid=0),
+  checkpoint-opcode, xact-inval-fold, legacy-frame-retire.**
 
 ## Log (A9 — standalone FPI landed)
 - 2026-07-16: **A9-fpi landed — goopg's hot first-touch FPI is now a real PG `RM_XLOG`/`XLOG_FPI` record.**
