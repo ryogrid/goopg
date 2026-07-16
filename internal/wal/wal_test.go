@@ -22,8 +22,12 @@ func TestAppendFlushAndReadAll(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if start1 != 1 {
-		t.Fatalf("first record start LSN = %d, want 1", start1)
+	// A9: every writer is page-headered now, so the first record starts
+	// after the segment's 40-byte long page header (was LSN 1 under the
+	// retired legacy bare-record frame).
+	wantStart1 := uint64(pageHeaderSizeAt(0, 128)) + 1
+	if start1 != wantStart1 {
+		t.Fatalf("first record start LSN = %d, want %d", start1, wantStart1)
 	}
 	if start2 != end1+1 {
 		t.Fatalf("second record start LSN = %d, want %d", start2, end1+1)

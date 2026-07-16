@@ -26,7 +26,7 @@ func TestReplayCLogFromWAL_NativeCommit(t *testing.T) {
 
 	// Write a WAL segment with one commit record for XID=5.
 	xid := storage.TransactionID(5)
-	w, err := wal.NewWriter(wal.Config{WALDir: walDir, PageHeaders: false})
+	w, err := wal.NewWriter(wal.Config{WALDir: walDir, PageHeaders: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -63,7 +63,7 @@ func TestReplayCLogFromWAL_NativeAbort(t *testing.T) {
 	}
 	txnMgr := mvcc.NewManager()
 
-	w, err := wal.NewWriter(wal.Config{WALDir: walDir, PageHeaders: false})
+	w, err := wal.NewWriter(wal.Config{WALDir: walDir, PageHeaders: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,7 +141,7 @@ func TestReplayCLogFromWAL_RecoversUnflushedAsyncCommit(t *testing.T) {
 	// the client only waited for the local WAL flush, not the CLOG
 	// write-back) — write the matching commit record and replay it, exactly
 	// as initdb.Open's crash-recovery path does.
-	w, err := wal.NewWriter(wal.Config{WALDir: walDir, PageHeaders: false})
+	w, err := wal.NewWriter(wal.Config{WALDir: walDir, PageHeaders: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -222,7 +222,7 @@ func TestReplayCLogFromWAL_RecoversUnflushedSyncCommit(t *testing.T) {
 
 	// The WAL commit record IS durable (FlushUpTo before ack, fatal on error
 	// since C2-S3) — replay reconstructs the commit.
-	w, err := wal.NewWriter(wal.Config{WALDir: walDir, PageHeaders: false})
+	w, err := wal.NewWriter(wal.Config{WALDir: walDir, PageHeaders: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -273,7 +273,7 @@ func TestReplayCLogFromWAL_OverridesMarkUnknownAsAborted(t *testing.T) {
 
 	// Step 2: WAL replay overrides the acked commit back to Committed; the
 	// genuinely in-flight XID (no commit record) stays aborted.
-	w, err := wal.NewWriter(wal.Config{WALDir: walDir, PageHeaders: false})
+	w, err := wal.NewWriter(wal.Config{WALDir: walDir, PageHeaders: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -327,7 +327,7 @@ func TestReplayCLogFromWAL_RecoversUnflushedAbort(t *testing.T) {
 		t.Fatalf("aborted lane already on disk before replay — the C2-S3 cut regressed for aborts")
 	}
 
-	w, err := wal.NewWriter(wal.Config{WALDir: walDir, PageHeaders: false})
+	w, err := wal.NewWriter(wal.Config{WALDir: walDir, PageHeaders: true})
 	if err != nil {
 		t.Fatal(err)
 	}

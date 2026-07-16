@@ -222,8 +222,15 @@ func TestClose_WaitsForEagerJobTriggeredByItsOwnFlush(t *testing.T) {
 	// flushUpTo's drain opens BOTH segment 0 and segment 1 for the
 	// first time — each triggering its own fresh eager job (for
 	// segment 1 and segment 2 respectively) that has had zero chance
-	// to run before Close() is called.
-	big := make([]byte, segSize)
+	// to run before Close() is called. A9: the PG frame confines each
+	// record to one segment (no cross-segment contrecord; the reserve
+	// path pads to the boundary instead), so use two records that each
+	// fit in a segment but together overflow segment 0 — the second is
+	// relocated to segment 1.
+	big := make([]byte, 300)
+	if _, _, err := w.Append(big); err != nil {
+		t.Fatal(err)
+	}
 	if _, _, err := w.Append(big); err != nil {
 		t.Fatal(err)
 	}
