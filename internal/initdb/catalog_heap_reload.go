@@ -12,6 +12,7 @@ import (
 	"sort"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/executor"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/storage"
 )
@@ -54,7 +55,8 @@ func catalogRowLive(clog *mvcc.CLog, ht storage.HeapTuple, requireCommittedXmin 
 // scanCatalogHeapRows is the generic reload scan loop: walk every block of a
 // catalog heap, extract live tuples per catalogRowLive, and decode them.
 //
-// decode inspects the raw tuple and returns (row, requireCommittedXmin, err):
+// decode inspects the raw tuple (and its heap TID, for TID-carrying caches)
+// and returns (row, requireCommittedXmin, err):
 // requireCommittedXmin feeds rule 4 above — pg_class returns !physicalRow
 // (legacy-layout rows need a committed xmin), pg_attribute always returns
 // false (its scan never had the committed branch). A decode error skips the
@@ -65,7 +67,7 @@ func catalogRowLive(clog *mvcc.CLog, ht storage.HeapTuple, requireCommittedXmin 
 // fatal (the file exists but cannot be read); torn line-pointer counts skip
 // the block, matching the historical loops.
 func scanCatalogHeapRows(mgr *storage.Manager, rel storage.RelFileNode, clog *mvcc.CLog,
-	name string, decode func(ht storage.HeapTuple) (any, bool, error)) ([]any, error) {
+	name string, decode func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error)) ([]any, error) {
 	nBlocks, err := mgr.NBlocks(rel)
 	if err != nil || nBlocks == 0 {
 		return nil, nil
@@ -89,7 +91,7 @@ func scanCatalogHeapRows(mgr *storage.Manager, rel storage.RelFileNode, clog *mv
 				ht.Header.Xmax != storage.InvalidTransactionID {
 				continue
 			}
-			row, requireCommitted, derr := decode(ht)
+			row, requireCommitted, derr := decode(ht, storage.ItemPointer{Block: blk, Offset: slot})
 			if derr != nil {
 				continue
 			}
@@ -122,7 +124,7 @@ type catalogReloadDesc struct {
 // simpleCatalogReload builds a Reload for a single-heap catalog from the doc
 // 02a §2.2 Decode/ApplyBatch pair. shared=true scans global/<relOid> (B4).
 func simpleCatalogReload(relOid uint32, shared bool, name string,
-	decode func(ht storage.HeapTuple) (any, bool, error),
+	decode func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error),
 	applyBatch func(cat *catalog.InMemory, nsDBOid uint32, rows []any) error,
 ) func(*storage.Manager, *catalog.InMemory, *mvcc.CLog, uint32, uint32) error {
 	return func(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog, heapDBOid, nsDBOid uint32) error {
@@ -140,6 +142,55 @@ func simpleCatalogReload(relOid uint32, shared bool, name string,
 		}
 		return applyBatch(cat, nsDBOid, rows)
 	}
+}
+
+// reloadUserSchemasFromHeap is B1.1's pg_namespace reload — the generic
+// heap-scan replacement for the retired replaySchemaDDLRecords scanner
+// (RecordKinds 34/35/100/101). It scans base/<cat.DBOID()>/2615 for live
+// rows with oid >= FirstUserOID (builtin schemas stay compiled-in +
+// initdb-populated), re-registers each into the global schema registry with
+// its recovered OID and owner, and seeds the TID-carrying cache so a later
+// ALTER/DROP can locate the row (doc 02a §3.3). Dropped/renamed schemas
+// need no special handling: their old versions carry xmax and the liveness
+// filter skips them.
+func reloadUserSchemasFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+	type nsRow struct {
+		oid   uint32
+		name  string
+		owner uint32
+		tid   storage.ItemPointer
+	}
+	rel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 2615, Fork: storage.MainFork}
+	cols := executor.PGNamespaceColumnsPG18()
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_namespace",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			decoded := make(executor.Row, len(cols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, cols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			return nsRow{
+				oid:   uint32(decoded[0].Int),
+				name:  decoded[1].StringValue(),
+				owner: uint32(decoded[2].Int),
+				tid:   tid,
+			}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+	for _, r := range rows {
+		ns := r.(nsRow)
+		if ns.oid < catalog.FirstUserOID || ns.name == "" {
+			continue
+		}
+		cat.RegisterSchemaDuringRecovery(ns.name, ns.oid)
+		if ns.owner != 0 {
+			cat.SetSchemaOwnerDuringRecovery(ns.name, ns.owner)
+		}
+		cat.SetSchemaHeapTID(ns.name, catalog.SchemaHeapTID{Block: uint32(ns.tid.Block), Offset: ns.tid.Offset})
+	}
+	return nil
 }
 
 // runCatalogReloads executes every descriptor in Slot order. Non-Fatal

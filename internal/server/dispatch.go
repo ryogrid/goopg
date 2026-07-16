@@ -1539,19 +1539,23 @@ func (s *Server) registerCompatNoopSchema(sql string) error {
 		return nil
 	}
 	s.cfg.Catalog.RegisterSchema(schemaName)
-	// M0110-0003: persist so the schema survives a restart. This branch
-	// handles CREATE SCHEMA forms the parser rejects; the parsed
-	// CompatNoopStmt path emits the same record from execCompatNoop.
-	if s.cfg.WAL == nil {
-		return nil
-	}
+	// B1.1: persist via a real pg_namespace heap row (frozen-xid variant —
+	// this branch handles CREATE SCHEMA forms the parser rejects and runs
+	// without a live transaction). The parsed CompatNoopStmt path journals
+	// the same row from execCompatNoop under the statement's xid. Replaces
+	// the bespoke RecordKindCreateSchema record (M0110-0003, retired).
 	im, ok := s.cfg.Catalog.(*catalog.InMemory)
-	if !ok {
+	if !ok || s.cfg.Pool == nil {
 		return nil
 	}
-	oid := im.SchemaOID(schemaName)
-	_, _, err := s.cfg.WAL.Append(wal.EncodeCreateSchema(schemaName, oid))
-	return err
+	return executor.SyncCompatSchemaToCatalogHeap(s.cfg.Pool, im, s.currentDatabaseOidForCompat(), schemaName)
+}
+
+// currentDatabaseOidForCompat resolves the catalog-write database for the
+// parse-recovery compat paths (no session in scope): DefaultDBOid routing,
+// same as every catalog write from the postgres/default databases.
+func (s *Server) currentDatabaseOidForCompat() uint32 {
+	return catalog.DefaultDBOid
 }
 
 // schemaNameFromCreate extracts the schema name from a normalised CREATE SCHEMA statement.

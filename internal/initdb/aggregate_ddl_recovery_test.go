@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/executor"
 	"github.com/goopg/goopg/internal/wal"
 )
 
@@ -252,9 +253,14 @@ func TestAggregateDDLRecoveryReplaysNonPublicSchema(t *testing.T) {
 	}
 	const wantSchemaOID = uint32(40570)
 	const wantOID = uint32(40571)
-	if _, _, werr := rt1.WAL.Append(wal.EncodeCreateSchema("aggschema", wantSchemaOID)); werr != nil {
+	// B1.1: schemas persist as pg_namespace heap rows, not bespoke WAL
+	// records — seed the schema the way the runtime does (registry +
+	// heap row via the compat sync, which also mirrors to base/5).
+	imSeed := rt1.Catalog.(*catalog.InMemory)
+	imSeed.RegisterSchemaDuringRecovery("aggschema", wantSchemaOID)
+	if werr := executor.SyncCompatSchemaToCatalogHeap(rt1.Pool, imSeed, catalog.DefaultDBOid, "aggschema"); werr != nil {
 		_ = rt1.Close()
-		t.Fatalf("WAL.Append create-schema: %v", werr)
+		t.Fatalf("seed schema heap row: %v", werr)
 	}
 	if _, _, werr := rt1.WAL.Append(wal.EncodeCreateAggregate("schemedavg", "aggschema", "_avgstate", "avg_transfn", "avg_finalfn", "", "", "", []string{"int4"}, wantOID, true, false)); werr != nil {
 		_ = rt1.Close()

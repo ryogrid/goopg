@@ -167,6 +167,54 @@ func cmpKeyNameOid(a, b []byte) int {
 	return cmpKeyUint32(a[64:], b[64:])
 }
 
+// cmpKeyName compares single-NameData[64] keys (e.g. pg_namespace_nspname_index).
+func cmpKeyName(a, b []byte) int {
+	return bytes.Compare(a[:64], b[:64])
+}
+
+// buildIndexTupleNameKey builds a 72-byte IndexTuple keyed by a single
+// 64-byte NameData (NUL-padded) — matches initdb's
+// bootstrapPgNamespaceNspnameIndex tuples. B1.1.
+func buildIndexTupleNameKey(heapBlk uint32, heapOff uint16, name string) []byte {
+	const (
+		nameDataLen = 64
+		hoff        = sysIndexTupleHoff
+		size        = 72 // MAXALIGN(hoff + nameDataLen)
+	)
+	out := make([]byte, size)
+	le := binary.LittleEndian
+	le.PutUint16(out[0:2], uint16(heapBlk>>16))
+	le.PutUint16(out[2:4], uint16(heapBlk&0xFFFF))
+	le.PutUint16(out[4:6], heapOff)
+	le.PutUint16(out[6:8], uint16(size)&sysIndexSizeMask)
+	n := len(name)
+	if n > nameDataLen {
+		n = nameDataLen
+	}
+	copy(out[hoff:hoff+n], name[:n])
+	return out
+}
+
+// pg_namespace index OIDs (postgres/src/include/catalog/pg_namespace.h).
+const (
+	pgNamespaceNspnameIndexOID = 2684
+	pgNamespaceOidIndexOID     = 2685
+)
+
+// insertPgNamespaceNspnameIndexEntry inserts an entry into
+// pg_namespace_nspname_index (2684) for (nspname → heap TID). B1.1.
+func insertPgNamespaceNspnameIndexEntry(ctx *Context, nspname string, tid storage.ItemPointer) error {
+	tup := buildIndexTupleNameKey(uint32(tid.Block), tid.Offset, nspname)
+	return insertCanonicalSysBtreeLeaf(ctx, pgNamespaceNspnameIndexOID, tup, cmpKeyName)
+}
+
+// insertPgNamespaceOidIndexEntry inserts an entry into
+// pg_namespace_oid_index (2685) for (oid → heap TID). B1.1.
+func insertPgNamespaceOidIndexEntry(ctx *Context, oid uint32, tid storage.ItemPointer) error {
+	tup := buildIndexTupleOidKey(uint32(tid.Block), tid.Offset, oid)
+	return insertCanonicalSysBtreeLeaf(ctx, pgNamespaceOidIndexOID, tup, cmpKeyUint32)
+}
+
 // insertCanonicalSysBtreeLeaf inserts indexTuple into the leaf-root page of
 // the system btree at sysBtreeRootBlock. Existing entries are compared via
 // cmp on the key bytes (offset sysIndexTupleHoff..) to find the sorted

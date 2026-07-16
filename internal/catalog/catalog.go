@@ -2349,6 +2349,13 @@ type InMemory struct {
 	// matching pg_namespace.nspowner's previous hardcoded literal.
 	schemaOwners map[string]uint32
 
+	// schemaHeapTIDs maps lowercase schema name → the schema's LIVE
+	// pg_namespace heap-row TID (B1.1, doc 02a §3.3 TID-carrying cache
+	// contract): seeded by CREATE SCHEMA's heap INSERT and by the startup
+	// reload scan, refreshed by every ALTER's heap UPDATE, deleted with the
+	// schema. updateHeapRowCanonicalPG needs it to stamp the old version.
+	schemaHeapTIDs map[string]SchemaHeapTID
+
 	// tempNamespaces maps a session's temp-owner token ("s<id>", see
 	// executor.sessionTempOwner) → the OID of that session's temporary
 	// namespace (pg_temp_<id>). In PostgreSQL every backend that creates a
@@ -12140,6 +12147,53 @@ func (c *InMemory) SchemaNameForOID(oid uint32) string {
 		}
 	}
 	return ""
+}
+
+// SchemaHeapTID is a pg_namespace heap-row locator (block, line pointer) —
+// the catalog package's storage.ItemPointer analog, kept local to avoid an
+// import cycle. B1.1 TID-carrying cache (doc 02a §3.3).
+type SchemaHeapTID struct {
+	Block  uint32
+	Offset uint16
+}
+
+// SchemaHeapTID returns the live pg_namespace heap TID recorded for name,
+// with ok=false when none is known (builtin schemas before any ALTER, or a
+// pre-conversion data dir).
+func (c *InMemory) SchemaHeapTID(name string) (SchemaHeapTID, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	tid, ok := c.schemaHeapTIDs[strings.ToLower(name)]
+	return tid, ok
+}
+
+// SetSchemaHeapTID records/refreshes the live pg_namespace heap TID for name.
+func (c *InMemory) SetSchemaHeapTID(name string, tid SchemaHeapTID) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.schemaHeapTIDs == nil {
+		c.schemaHeapTIDs = make(map[string]SchemaHeapTID)
+	}
+	c.schemaHeapTIDs[strings.ToLower(name)] = tid
+}
+
+// DeleteSchemaHeapTID drops the TID entry (DROP SCHEMA).
+func (c *InMemory) DeleteSchemaHeapTID(name string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.schemaHeapTIDs, strings.ToLower(name))
+}
+
+// RenameSchemaHeapTID re-keys the TID entry (ALTER SCHEMA RENAME — the row
+// itself moved via heap UPDATE, so the caller passes the NEW tid too).
+func (c *InMemory) RenameSchemaHeapTID(oldName, newName string, tid SchemaHeapTID) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.schemaHeapTIDs == nil {
+		c.schemaHeapTIDs = make(map[string]SchemaHeapTID)
+	}
+	delete(c.schemaHeapTIDs, strings.ToLower(oldName))
+	c.schemaHeapTIDs[strings.ToLower(newName)] = tid
 }
 
 // RegisterSchema records a user-created schema. Called from execCreateSchema.

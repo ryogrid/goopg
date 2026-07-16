@@ -14615,16 +14615,16 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 					Message: fmt.Sprintf("schema %q does not exist", schemaName)}
 			}
 			// Schema is registered; unregister it.
-			o.ctx.Catalog.UnregisterSchema(schemaName)
-			// M0110-0003: persist the drop so it survives a restart (mirrors
-			// CREATE SCHEMA below / DROP DATABASE). Without this, a schema
-			// dropped at runtime would be re-registered by replaying its
-			// CREATE SCHEMA record on the next startup.
-			if o.ctx.WAL != nil {
-				if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropSchema(schemaName)); werr != nil {
-					return fmt.Errorf("wal drop-schema: %w", werr)
+			// B1.1: journal the drop as a pg_namespace heap DELETE
+			// (xl_heap_delete) BEFORE unregistering — the TID cache entry
+			// is needed to locate the row. Replaces the bespoke
+			// RecordKindDropSchema record (M0110-0003, retired).
+			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok && o.ctx.Pool != nil {
+				if err := deleteSchemaCatalogHeapRow(o.ctx, im, schemaName); err != nil {
+					return fmt.Errorf("drop-schema catalog heap: %w", err)
 				}
 			}
+			o.ctx.Catalog.UnregisterSchema(schemaName)
 			if s.Behavior == parser.DropCascade {
 				// Collect routines to drop for NOTICE detail.
 				var droppedRoutines []string
@@ -16397,15 +16397,18 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		// Register user-created schema so schema-qualified queries resolve correctly.
 		if s.ObjName.Name != "" {
 			im.RegisterSchema(s.ObjName.Name)
-			// M0110-0003: persist the schema so it survives a restart. goopg
-			// has no per-schema on-disk file namespace, so we record a WAL
-			// event the recovery driver replays into the schema registry
-			// (mirrors CREATE DATABASE, M0054-0001). The OID just assigned by
-			// RegisterSchema is carried so recovery restores the same OID.
-			if o.ctx.WAL != nil {
+			// B1.1 (doc 02c §1): persist the schema PG-style — a real
+			// pg_namespace heap INSERT + index entries (the WAL stream
+			// carries XLOG_HEAP_INSERT + 2× XLOG_BTREE_INSERT_LEAF, exactly
+			// PG's CREATE SCHEMA shape); recovery re-registers it via the
+			// generic heap reload. Replaces the bespoke
+			// RecordKindCreateSchema record (M0110-0003, retired).
+			if o.ctx.Pool != nil {
 				oid := im.SchemaOID(s.ObjName.Name)
-				if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateSchema(s.ObjName.Name, oid)); werr != nil {
-					return fmt.Errorf("wal create-schema: %w", werr)
+				owner := im.SchemaOwnerOID(s.ObjName.Name)
+				if err := syncSchemaToCatalogHeap(o.ctx, im, s.ObjName.Name, oid, owner); err != nil {
+					im.UnregisterSchema(s.ObjName.Name)
+					return fmt.Errorf("create-schema catalog heap: %w", err)
 				}
 			}
 		}
@@ -17866,9 +17869,14 @@ func (o *ddlOp) execAlterSchema(s *parser.AlterSchemaStmt) error {
 		if err != nil {
 			return &ExecError{Code: "3F000", Pos: s.Pos(), Message: err.Error()}
 		}
-		if o.ctx.WAL != nil {
-			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterSchemaRename(s.Name, s.NewName)); werr != nil {
-				return fmt.Errorf("wal alter-schema-rename: %w", werr)
+		// B1.1: journal the rename as a non-HOT pg_namespace heap UPDATE
+		// (xl_heap_update; nspname is indexed → fresh entries in BOTH
+		// indexes), replacing RecordKindAlterSchemaRename (retired).
+		if o.ctx.Pool != nil {
+			oid := im.SchemaOID(s.NewName)
+			owner := im.SchemaOwnerOID(s.NewName)
+			if err := updateSchemaCatalogHeapRow(o.ctx, im, s.Name, s.NewName, oid, owner); err != nil {
+				return fmt.Errorf("alter-schema-rename catalog heap: %w", err)
 			}
 		}
 		for _, tbl := range moved {
@@ -17915,9 +17923,12 @@ func (o *ddlOp) execAlterSchema(s *parser.AlterSchemaStmt) error {
 		if !im.SetSchemaOwner(s.Name, ownerOID) {
 			return &ExecError{Code: "3F000", Pos: s.Pos(), Message: fmt.Sprintf("schema %q does not exist", s.Name)}
 		}
-		if o.ctx.WAL != nil {
-			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterSchemaOwner(s.Name, ownerOID)); werr != nil {
-				return fmt.Errorf("wal alter-schema-owner: %w", werr)
+		// B1.1: journal the owner change as a pg_namespace heap UPDATE
+		// (xl_heap_update), replacing RecordKindAlterSchemaOwner (retired).
+		if o.ctx.Pool != nil {
+			oid := im.SchemaOID(s.Name)
+			if err := updateSchemaCatalogHeapRow(o.ctx, im, s.Name, s.Name, oid, ownerOID); err != nil {
+				return fmt.Errorf("alter-schema-owner catalog heap: %w", err)
 			}
 		}
 		return nil

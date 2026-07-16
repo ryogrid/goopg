@@ -1382,11 +1382,14 @@ func NewContext() *Context {
 // open savepoint), the session's cached tx.XID is updated too so
 // later savepoint AllocateSubXid calls see the real parent XID.
 func (c *Context) MaterializeWriterXID() error {
+	if c.Tx.XID != storage.InvalidTransactionID {
+		// Already materialized (or pre-stamped, e.g. the frozen-xid compat
+		// paths) — no manager needed. B1.1 moved this check ahead of the
+		// TxnMgr guard so pre-stamped contexts work without one.
+		return nil
+	}
 	if c.TxnMgr == nil {
 		return &ExecError{Code: "XX000", Message: "executor: no TxnMgr in context"}
-	}
-	if c.Tx.XID != storage.InvalidTransactionID {
-		return nil
 	}
 	xid, err := c.TxnMgr.AssignXID(c.Tx)
 	if err != nil {

@@ -224,7 +224,18 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
   - [ ] **B0.4** `pg_filenode.map` writer + `XLOG_RELMAP_UPDATE` encoder/replay — DEFERRABLE past B1
     (steady-state DML on mapped catalogs emits no relmap record); design normative in 02a §5.
 - [ ] **B1** (doc 02c) pg_namespace → pg_proc → pg_sequence, one catalog per landing per the 02b recipe:
-  - [ ] **B1.1 pg_namespace** — kinds 34/35/100/101 + schema_ddl_recovery.go + wal/schema_alter_ddl.go die.
+  - [x] **B1.1 pg_namespace** — LANDED, the exemplar conversion. Schema DDL journals REAL pg_namespace
+    heap rows: CREATE = heap INSERT + 2684/2685 index entries; RENAME/OWNER = non-HOT xl_heap_update
+    (B0.2 producer, first caller) + fresh index entries; DROP = xl_heap_delete (markHeapDeleteDirty).
+    TID-carrying cache landed on the schema registry (catalog.SchemaHeapTID + Set/Delete/Rename);
+    reload = reloadUserSchemasFromHeap (generic scan, oid ≥ FirstUserOID, seeds TIDs) replacing
+    replaySchemaDDLRecords at the same pass slot. Mirror set extended with 2615/2684/2685 (BLOCKER-3).
+    Parse-recovery CREATE SCHEMA fallback rides SyncCompatSchemaToCatalogHeap (frozen-xid variant;
+    MaterializeWriterXID reordered to accept pre-stamped xids). DELETED: kinds 34/35/100/101,
+    Encode/Decode ×4, schema_ddl_recovery.go, wal/schema_alter_ddl.go, dispatch no-op case,
+    native-kind-list entries, 3 wal test files; recovery-test schema seeds rewritten to the heap path;
+    new TestPort_AlterSchemaSurvivesRestart. Gate: all units, initdb 231s, regress 298s, isolation,
+    schema durability ×2, pg_waldump ×2, e2e failover — green; grep-zero confirmed.
   - [ ] **B1.2 pg_proc** — CreateFunction/DropFunction/alter-function kinds + function_ddl_recovery.go die.
   - [ ] **B1.3 pg_sequence (catalog row only)** — definition moves to heap; counter state stays on kind 65.
   - [ ] **B1.3b** (optional / ledger) `XLOG_SEQ_LOG` flip for the sequence-relation counter page.

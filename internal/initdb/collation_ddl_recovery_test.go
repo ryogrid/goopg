@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/executor"
 	"github.com/goopg/goopg/internal/wal"
 )
 
@@ -225,9 +226,14 @@ func TestCollationDDLRecoveryReplaysSetSchemaAfterCreate(t *testing.T) {
 	}
 	const wantOID = uint32(40530)
 	const wantSchemaOID = uint32(40531)
-	if _, _, werr := rt1.WAL.Append(wal.EncodeCreateSchema("otherschema", wantSchemaOID)); werr != nil {
+	// B1.1: schemas persist as pg_namespace heap rows, not bespoke WAL
+	// records — seed the schema the way the runtime does (registry +
+	// heap row via the compat sync, which also mirrors to base/5).
+	imSeed := rt1.Catalog.(*catalog.InMemory)
+	imSeed.RegisterSchemaDuringRecovery("otherschema", wantSchemaOID)
+	if werr := executor.SyncCompatSchemaToCatalogHeap(rt1.Pool, imSeed, catalog.DefaultDBOid, "otherschema"); werr != nil {
 		_ = rt1.Close()
-		t.Fatalf("WAL.Append create-schema: %v", werr)
+		t.Fatalf("seed schema heap row: %v", werr)
 	}
 	if _, _, werr := rt1.WAL.Append(wal.EncodeCreateCollation("mycoll", "public", "C", "C", "", "", wantOID, 10, -1, 'c', true)); werr != nil {
 		_ = rt1.Close()

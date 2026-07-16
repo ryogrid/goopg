@@ -1238,20 +1238,17 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// return paths, and an explicit End (below, after the last pass) frees the
 	// decoded records promptly.
 
-	// M0110-0003: restore user-created schemas (CREATE/DROP SCHEMA) from the
-	// WAL BEFORE loading user tables. goopg has no per-schema on-disk namespace,
-	// so the catalog's schema registry is reconstructed here from the WAL
-	// records (RecordKindCreateSchema/DropSchema). It must run before
-	// loadUserTablesFromHeap / loadUserIndexesFromHeap so those passes can
-	// reverse-map a recovered pg_class.relnamespace OID back to the schema name
-	// (cat.SchemaNameForOID) — otherwise a user-schema table would be reloaded
-	// under the wrong schema. Same WAL-replay mechanism as the database DDL
-	// replay below.
-	if err := replaySchemaDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+	// B1.1 (doc 02c §1): restore user-created schemas from the pg_namespace
+	// HEAP — the generic reload replacing the retired replaySchemaDDLRecords
+	// scanner (schema DDL now journals real heap rows; RecordKinds
+	// 34/35/100/101 are gone). Still runs BEFORE loadUserTablesFromHeap /
+	// loadUserIndexesFromHeap so those passes can reverse-map a recovered
+	// pg_class.relnamespace OID back to the schema name (cat.SchemaNameForOID).
+	if err := reloadUserSchemasFromHeap(mgr, cat, clog); err != nil {
 		_ = pool.Close()
 		_ = walWriter.Close()
 		_ = mgr.Close()
-		return nil, fmt.Errorf("goopg: schema DDL replay: %w", err)
+		return nil, fmt.Errorf("goopg: pg_namespace reload: %w", err)
 	}
 	// M0122-0007 tablespace-registry restart-durability follow-up: restore
 	// CREATE/DROP TABLESPACE entries (pg_tablespace) from the WAL the same
@@ -2726,7 +2723,7 @@ func loadUserTablesFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, cl
 
 	// Pass 1: collect user table rows from pg_class.
 	classRows, err := scanCatalogHeapRows(mgr, classRel, clog, "pg_class",
-		func(ht storage.HeapTuple) (any, bool, error) {
+		func(ht storage.HeapTuple, _ storage.ItemPointer) (any, bool, error) {
 			physicalRow := false
 			row, err := catalog.DecodePGClassRow(ht.Data)
 			if err != nil {
@@ -2779,7 +2776,7 @@ func loadUserTablesFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, cl
 		Fork:   storage.MainFork,
 	}
 	attrRows2, err := scanCatalogHeapRows(mgr, attrRel, clog, "pg_attribute",
-		func(ht storage.HeapTuple) (any, bool, error) {
+		func(ht storage.HeapTuple, _ storage.ItemPointer) (any, bool, error) {
 			row, err := catalog.DecodePGAttributeRow(ht.Data)
 			if err != nil {
 				row, err = catalog.DecodePGAttributePhysicalRow(ht.Data)

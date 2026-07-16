@@ -134,6 +134,13 @@ func mirrorTouchedCatalogsToPostgresDB(ctx *Context) error {
 		pgClassOidIndexOID,             // 2662
 		pgClassRelnameNspIndexOID,      // 2663
 		pgAttributeRelidAttnumIndexOID, // 2659
+		// B1.1 (doc 02a §2.2 review BLOCKER-3): pg_namespace converted to
+		// heap journaling — its heap + both indexes MUST be in this set or
+		// schemas written to base/1 vanish on restart (recovery reloads
+		// from the postgres DB's copies).
+		pgNamespaceRelOID,          // 2615 pg_namespace
+		pgNamespaceNspnameIndexOID, // 2684
+		pgNamespaceOidIndexOID,     // 2685
 	}
 	for _, oid := range mirroredOIDs {
 		if err := mirrorCatalogRelToPostgresDB(ctx, oid); err != nil {
