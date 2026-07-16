@@ -29,6 +29,10 @@ const (
 	// records so a PG standby can recognise them during recovery.
 	xlogCheckpointOnline   uint8 = 0x10 // XLOG_CHECKPOINT_ONLINE
 	xlogCheckpointShutdown uint8 = 0x00 // XLOG_CHECKPOINT_SHUTDOWN
+	// XLOG_CHECKPOINT_REDO (PG17+, pg_control.h): inserted AT the redo
+	// point of an online checkpoint — recovery validates the record found
+	// at CheckPoint.redo is exactly this when redo < the checkpoint record.
+	xlogCheckpointRedo uint8 = 0xE0
 )
 
 var (
@@ -136,21 +140,11 @@ func classifyXLogRecord(payload []byte) (Rmgr, uint8, uint32) {
 	if len(payload) == 0 {
 		return RmgrXLog, xlogInfoDefault, 0
 	}
-	// M0102-0007: PG-compatible checkpoint record (88-byte CheckPoint struct).
-	// Goopg's record-kind byte (0x02=RecordKindCheckpoint) would map to an
-	// implausible redo LSN (<256 bytes), so this path takes priority over the
-	// legacy kind-byte dispatch.
-	if len(payload) == 88 {
-		// M0105-0009: use XLOG_CHECKPOINT_SHUTDOWN (0x00) instead of
-		// ONLINE (0x10). PG's xlog_redo for shutdown checkpoints calls
-		// ProcArrayApplyRecoveryInfo() which constructs synthetic
-		// RunningTransactionsData and transitions standbyState to
-		// STANDBY_SNAPSHOT_READY. This enables CheckRecoveryConsistency
-		// to send PMSIGNAL_BEGIN_HOT_STANDBY, allowing the postmaster
-		// to enter PM_HOT_STANDBY. Without this, pg_ctl -w never sees
-		// the server as ready.
-		return RmgrXLog, xlogCheckpointShutdown, 0
-	}
+	// A9-checkpoint-opcode: the classify-by-len==88 checkpoint hack
+	// (M0102-0007/M0105-0009, which could only ever stamp SHUTDOWN) is
+	// retired — PG-compat checkpoints now carry their EXPLICIT opcode
+	// (online/shutdown) via the pre-assembled envelope (EncodeCheckpointPG),
+	// which short-circuits in encodeRecordXLog before classification.
 	// doc 04 §3/§5.4: dispatch on the real PG-compatible (xl_rmid, xl_info)
 	// pair for this RecordKind — a real PG analog (RmgrHeap/RmgrBtree/…)
 	// when one exists, else goopg's custom RmgrGoopgCatalog rmgr (§3.2).

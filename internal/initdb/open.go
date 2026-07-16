@@ -1724,6 +1724,23 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		// after the basebackup hid every user tuple created by goopg
 		// after initdb.
 		NextXIDFn: func() uint64 { return uint64(txnMgr.NextXID()) },
+		// A9-checkpoint-opcode: supply the live running-transaction snapshot
+		// for the XLOG_RUNNING_XACTS record emitted before every ONLINE
+		// checkpoint (and CheckPoint.oldestActiveXid). Snapshot semantics
+		// map 1:1 onto xl_running_xacts: InProgress = running top-level
+		// xids (sorted), Xmin = oldest running (nextXid when none),
+		// Xmax-1 = latestCompletedXid.
+		RunningXactsFn: func() ([]uint32, uint32, uint32) {
+			snap := txnMgr.FreshSnapshot()
+			var xids []uint32
+			if len(snap.InProgress) > 0 {
+				xids = make([]uint32, len(snap.InProgress))
+				for i, xid := range snap.InProgress {
+					xids[i] = uint32(xid)
+				}
+			}
+			return xids, uint32(snap.Xmin), uint32(snap.Xmax - 1)
+		},
 		// M0106-0013: wire the catalog's OID counter so each checkpoint
 		// embeds the live nextOid into pg_control and the WAL record.
 		// A crashed cluster can then recover nextOid from pg_control

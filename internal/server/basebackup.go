@@ -186,11 +186,22 @@ func (s *Server) replyBaseBackup(ctx context.Context, w *protocol.FrameWriter, a
 	// goopg uses 1-based LSNs internally; PG expects 0-based in
 	// pg_control and backup_label — subtract 1 for those artefacts.
 	redoLSN := uint64(0)
+	ckptRecLSN := uint64(0)
 	if s.cfg.Checkpointer != nil {
 		redoLSN = s.cfg.Checkpointer.CheckpointRedoLSN()
+		// A9-checkpoint-opcode: the checkpoint RECORD no longer sits at the
+		// redo point (an ONLINE checkpoint's record is preceded by
+		// XLOG_RUNNING_XACTS), so backup_label's CHECKPOINT LOCATION and
+		// pg_control's CheckPoint must name the record's own start — a PG
+		// standby reads the record AT that LSN and rejects anything that
+		// is not an RM_XLOG checkpoint.
+		ckptRecLSN = s.cfg.Checkpointer.LastCheckpointRecordLSN()
 	}
 	if redoLSN == 0 && s.cfg.WAL != nil {
 		redoLSN = s.cfg.WAL.WrittenLSN()
+	}
+	if ckptRecLSN == 0 {
+		ckptRecLSN = redoLSN
 	}
 
 	// startLSN is the WAL-range bookend pg_basebackup sends back as
@@ -205,9 +216,11 @@ func (s *Server) replyBaseBackup(ctx context.Context, w *protocol.FrameWriter, a
 	// global/pg_control carries a valid checkpoint — PostgreSQL
 	// standbys reject pg_control with a zero redo point.
 	baseLSN0 := uint64(0)
+	ckptLSN0 := uint64(0)
 	if redoLSN > 0 {
 		baseLSN0 = redoLSN - 1
-		_ = initdb.UpdateControlCheckpoint(s.cfg.DataDir, redoLSN)
+		ckptLSN0 = ckptRecLSN - 1
+		_ = initdb.UpdateControlCheckpoint(s.cfg.DataDir, redoLSN, ckptRecLSN)
 	}
 	startTLI, err := initdb.LoadOrCreateTimelineID(s.cfg.DataDir)
 	if err != nil {
@@ -284,7 +297,7 @@ func (s *Server) replyBaseBackup(ctx context.Context, w *protocol.FrameWriter, a
 		}
 	}
 
-	entries, err := emitBaseBackupTar(ctx, streamer, s.cfg.DataDir, opts.Label, baseLSN0, startTLI, segSize, mck, opts.IncludeWAL, walStartSeg, walEndSeg)
+	entries, err := emitBaseBackupTar(ctx, streamer, s.cfg.DataDir, opts.Label, baseLSN0, ckptLSN0, startTLI, segSize, mck, opts.IncludeWAL, walStartSeg, walEndSeg)
 	if err != nil {
 		return s.writeStreamingError(w, sqlstate.InternalError,
 			fmt.Sprintf("BASE_BACKUP: tar: %v", err))
@@ -596,7 +609,7 @@ type manifestEntry struct {
 // set (the BASE_BACKUP `WAL` option / `pg_basebackup -X fetch`), the in-range
 // segments [walStartSeg, walEndSeg] are appended to the still-open tar after
 // the data files, mirroring the basebackup.c:408-560 includewal block.
-func emitBaseBackupTar(ctx context.Context, out io.Writer, dataDir, label string, startLSN uint64, tli uint32, segSize int64, mck manifestChecksumKind, includeWAL bool, walStartSeg, walEndSeg uint64) ([]manifestEntry, error) {
+func emitBaseBackupTar(ctx context.Context, out io.Writer, dataDir, label string, startLSN, ckptLSN uint64, tli uint32, segSize int64, mck manifestChecksumKind, includeWAL bool, walStartSeg, walEndSeg uint64) ([]manifestEntry, error) {
 	tw := tar.NewWriter(out)
 
 	var manifest []manifestEntry
@@ -621,7 +634,7 @@ func emitBaseBackupTar(ctx context.Context, out io.Writer, dataDir, label string
 
 	// 1. backup_label (synthetic).
 	labelMTime := time.Now()
-	labelBytes := buildBackupLabel(label, startLSN, tli, segSize)
+	labelBytes := buildBackupLabel(label, startLSN, ckptLSN, tli, segSize)
 	if err := writeTarFile(tw, "backup_label", labelBytes, labelMTime); err != nil {
 		return nil, err
 	}
@@ -978,19 +991,25 @@ func writeTarDir(tw *tar.Writer, name string, mtime time.Time, mode os.FileMode)
 
 // buildBackupLabel constructs the synthetic backup_label file
 // contents per upstream `build_backup_content` in
-// postgres/src/backend/access/transam/xlogbackup.c. The CHECKPOINT
-// LOCATION equals the start LSN — goopg's checkpointer reports the
-// LSN of the redo point on completion, which is the start LSN we
-// just sampled.
-func buildBackupLabel(label string, startLSN uint64, tli uint32, segSize int64) []byte {
+// postgres/src/backend/access/transam/xlogbackup.c. START WAL
+// LOCATION is the checkpoint's redo point; CHECKPOINT LOCATION is the
+// checkpoint RECORD's start LSN — distinct since A9-checkpoint-opcode
+// (an ONLINE checkpoint's record is preceded by XLOG_RUNNING_XACTS,
+// so the record at redo is no longer the checkpoint; a PG standby
+// reads the record AT this LSN and fails with "invalid resource
+// manager ID in checkpoint record" if it finds anything else).
+func buildBackupLabel(label string, startLSN, ckptLSN uint64, tli uint32, segSize int64) []byte {
 	if label == "" {
 		label = "goopg base backup"
+	}
+	if ckptLSN == 0 {
+		ckptLSN = startLSN
 	}
 	segno := startLSN / uint64(segSize)
 	walFile := wal.XLogFileName(tli, segno, segSize)
 	var b bytes.Buffer
 	fmt.Fprintf(&b, "START WAL LOCATION: %s (file %s)\n", formatLSN(startLSN), walFile)
-	fmt.Fprintf(&b, "CHECKPOINT LOCATION: %s\n", formatLSN(startLSN))
+	fmt.Fprintf(&b, "CHECKPOINT LOCATION: %s\n", formatLSN(ckptLSN))
 	fmt.Fprintf(&b, "BACKUP METHOD: streamed\n")
 	fmt.Fprintf(&b, "BACKUP FROM: primary\n")
 	fmt.Fprintf(&b, "START TIME: %s\n", time.Now().UTC().Format("2006-01-02 15:04:05 MST"))

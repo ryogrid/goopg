@@ -1341,6 +1341,13 @@ func (c *Context) deadlockTimeout() time.Duration {
 type Checkpointer interface {
 	CheckpointNow() error
 	CheckpointRedoLSN() uint64
+	// LastCheckpointRecordLSN returns the start LSN (1-based) of the most
+	// recent checkpoint RECORD — distinct from the redo point since
+	// A9-checkpoint-opcode (an ONLINE checkpoint's record is preceded by
+	// XLOG_RUNNING_XACTS). BASE_BACKUP stamps it into backup_label's
+	// CHECKPOINT LOCATION and pg_control's CheckPoint. 0 when no
+	// checkpoint has completed yet.
+	LastCheckpointRecordLSN() uint64
 }
 
 // NewContext builds a Context with sensible defaults: a fresh

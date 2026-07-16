@@ -7658,6 +7658,18 @@ func EncodeCheckpoint() []byte {
 // actual start position exactly — PG's xlogreader validates
 // checkPoint.redo against ReadRecPtr.
 func EncodeCheckpointCompat(redoLSN0 uint64, tli uint32, nextXid uint64, nextOid uint32) []byte {
+	if nextXid < 3 {
+		nextXid = 3
+	}
+	return encodeCheckPointStruct(redoLSN0, tli, nextXid, nextOid, uint32(nextXid))
+}
+
+// encodeCheckPointStruct builds the raw 88-byte PG18 CheckPoint struct.
+// oldestActiveXid is parameterised (A9-checkpoint-opcode): PG stamps
+// InvalidTransactionId (0) on shutdown checkpoints and
+// GetOldestActiveTransactionId() on online ones (xlog.c CreateCheckPoint);
+// EncodeCheckpointCompat keeps its historical nextXid mirror.
+func encodeCheckPointStruct(redoLSN0 uint64, tli uint32, nextXid uint64, nextOid uint32, oldestActiveXid uint32) []byte {
 	// Encode a minimal PG18 CheckPoint struct (sizeof=88).
 	// Offsets verified against compiled PG18 binary (DWARF):
 	//   redo           XLogRecPtr  8  (offset 0)
@@ -7728,7 +7740,7 @@ func EncodeCheckpointCompat(redoLSN0 uint64, tli uint32, nextXid uint64, nextOid
 	// oldestActiveXid=80, sizeof(CheckPoint)=88.
 	le.PutUint32(payload[72:76], 3)               // oldestCommitTsXid
 	le.PutUint32(payload[76:80], 3)               // newestCommitTsXid
-	le.PutUint32(payload[80:84], uint32(nextXid)) // oldestActiveXid
+	le.PutUint32(payload[80:84], oldestActiveXid) // oldestActiveXid
 
 	return payload
 }
@@ -10917,7 +10929,7 @@ func replayStart(records []Record) (int, uint64) {
 		return 0, 0
 	}
 	startIdx := ckptIdx
-	if p := records[ckptIdx].Payload; len(p) == 88 {
+	if p := checkpointStructOf(records[ckptIdx]); len(p) == 88 {
 		redo0 := binary.LittleEndian.Uint64(p[0:8])
 		// Walk back to the first record whose span ends beyond redo.
 		// Record LSNs are 1-based absolute positions; redo0 is 0-based
@@ -10938,12 +10950,36 @@ func isCheckpointRecord(r Record) bool {
 	if len(r.Payload) == 1 && r.Payload[0] == RecordKindCheckpoint {
 		return true
 	}
-	// PG-compat checkpoint: 88-byte CheckPoint struct (EncodeCheckpointCompat).
-	// classifyXLogRecord uses the same size heuristic.
+	// Pre-A9 PG-compat checkpoint: 88-byte CheckPoint struct whose header was
+	// stamped by the retired classify-by-len==88 rule, so the read side
+	// re-matched it and populated Payload.
 	if len(r.Payload) == 88 {
 		return true
 	}
+	// A9-checkpoint-opcode: explicit-opcode checkpoint (EncodeCheckpointPG).
+	// Header-driven — the record routes to the decoded path (Payload nil,
+	// struct in XLog.MainData). This arm also recognises pre-A9 88-byte
+	// records once classify no longer re-matches them on read.
+	if r.XLog != nil && r.XLog.Header.Rmid == RmgrXLog && len(r.XLog.MainData) == 88 {
+		switch r.XLog.Header.Info & XLRRmgrInfoMask {
+		case xlogCheckpointShutdown, xlogCheckpointOnline:
+			return true
+		}
+	}
 	return false
+}
+
+// checkpointStructOf returns the 88-byte CheckPoint struct carried by a
+// checkpoint record, regardless of which era framed it (native-classified
+// Payload vs decoded-path XLog.MainData), or nil for the legacy 1-byte marker.
+func checkpointStructOf(r Record) []byte {
+	if len(r.Payload) == 88 {
+		return r.Payload
+	}
+	if r.XLog != nil && len(r.XLog.MainData) == 88 {
+		return r.XLog.MainData
+	}
+	return nil
 }
 
 // DiscoverLastCheckpointLSN scans the WAL directory for the most

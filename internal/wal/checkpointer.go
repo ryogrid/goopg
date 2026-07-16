@@ -200,11 +200,25 @@ type CheckpointerConfig struct {
 	FlushCLOGFn func() error
 
 	// PGCompatCheckpoints, when true, writes an 88-byte PG18 CheckPoint
-	// struct (EncodeCheckpointCompat) so PG standbys can parse the
-	// record. When false (default), the legacy 1-byte RecordKindCheckpoint
-	// marker is used. Set to true by initdb.Open; tests that do not need
-	// PG compatibility leave this false so legacy detection code works.
+	// struct with the EXPLICIT checkpoint opcode (EncodeCheckpointPG:
+	// XLOG_CHECKPOINT_SHUTDOWN for shutdown checkpoints, ONLINE otherwise —
+	// A9-checkpoint-opcode), preceding every ONLINE checkpoint with an
+	// XLOG_RUNNING_XACTS record (upstream LogStandbySnapshot, xlog.c:7243)
+	// so a hot-standby PG reaches STANDBY_SNAPSHOT_READY. When false
+	// (default), the legacy 1-byte RecordKindCheckpoint marker is used.
+	// Set to true by initdb.Open; tests that do not need PG compatibility
+	// leave this false so legacy detection code works.
 	PGCompatCheckpoints bool
+
+	// RunningXactsFn, when set alongside PGCompatCheckpoints, supplies the
+	// running-transaction snapshot stamped into the XLOG_RUNNING_XACTS
+	// record before an ONLINE checkpoint and into CheckPoint.oldestActiveXid:
+	// the running top-level xids, the oldest running xid (nextXid when none),
+	// and latestCompletedXid (nextXid-1 when idle). Wired to the mvcc
+	// manager's snapshot by initdb.Open. When nil, the checkpointer
+	// synthesises the idle-system values from NextXIDFn — correct for the
+	// bootstrap/immediate checkpoints that run with no user xact in flight.
+	RunningXactsFn func() (xids []uint32, oldestRunning, latestCompleted uint32)
 
 	// OnLoopStart/OnLoopEnd, when set, bracket Run's entire timer/volume
 	// loop (called once each, not per-checkpoint) so a caller can register
@@ -248,8 +262,9 @@ type Checkpointer struct {
 	// caller opts in by passing SetRetainer).
 	retainer Retainer
 
-	lastCheckpointLSN     atomic.Uint64
-	lastCheckpointRedoLSN atomic.Uint64
+	lastCheckpointLSN      atomic.Uint64
+	lastCheckpointRedoLSN  atomic.Uint64
+	lastCheckpointStartLSN atomic.Uint64
 
 	// distMu guards priorRedoLSN/checkPointDistanceEstimate. Checkpoints
 	// are infrequent (seconds-to-minutes apart) so a plain mutex — rather
@@ -310,12 +325,24 @@ func (c *Checkpointer) LastCheckpointLSN() uint64 {
 	return c.lastCheckpointLSN.Load()
 }
 
-// LastCheckpointRedoLSN returns the REDO LSN (start byte of the checkpoint
-// record) for the most recent successful checkpoint. This is the position
-// from which crash recovery must replay. Exported for BASE_BACKUP's
-// pg_control update path (M0102-0007).
+// LastCheckpointRedoLSN returns the REDO LSN for the most recent successful
+// checkpoint — the position published at checkpoint START, from which crash
+// recovery must replay. Exported for BASE_BACKUP's pg_control update path
+// (M0102-0007).
 func (c *Checkpointer) LastCheckpointRedoLSN() uint64 {
 	return c.lastCheckpointRedoLSN.Load()
+}
+
+// LastCheckpointRecordLSN returns the START LSN (1-based) of the most recent
+// checkpoint RECORD itself — the value backup_label's CHECKPOINT LOCATION and
+// pg_control's CheckPoint field must carry. A9-checkpoint-opcode made this
+// distinct from the redo point: an ONLINE checkpoint's record is preceded by
+// an XLOG_RUNNING_XACTS record (and, in general, by any records appended
+// after redo was captured), so a standby that looks for the checkpoint AT
+// redo finds the wrong record ("invalid resource manager ID in checkpoint
+// record"). Returns 0 if no checkpoint has completed yet.
+func (c *Checkpointer) LastCheckpointRecordLSN() uint64 {
+	return c.lastCheckpointStartLSN.Load()
 }
 
 // updateCheckPointDistanceEstimate mirrors upstream's
@@ -500,6 +527,21 @@ func (c *Checkpointer) CheckpointShutdown() error {
 // CHECKPOINT / CLI ctl / volume-triggered cycles set `spread=false`
 // and bump num_requested. write_time_ms accumulates the wall time
 // spent in flushDirty, matching upstream's checkpointer view.
+// runningXacts returns the running-transaction snapshot for the
+// XLOG_RUNNING_XACTS record and CheckPoint.oldestActiveXid. Falls back to
+// the idle-system synthesis (no xids, oldestRunning = nextXid,
+// latestCompleted = nextXid-1 — what PG's GetRunningTransactionData reports
+// with an empty procarray) when no RunningXactsFn is wired.
+func (c *Checkpointer) runningXacts(nextXid uint64) ([]uint32, uint32, uint32) {
+	if c.cfg.RunningXactsFn != nil {
+		return c.cfg.RunningXactsFn()
+	}
+	if nextXid < 3 {
+		nextXid = 3 // FirstNormalTransactionId floor, mirrors EncodeCheckpointPG
+	}
+	return nil, uint32(nextXid), uint32(nextXid - 1)
+}
+
 func (c *Checkpointer) runCheckpoint(ctx context.Context, spread, shutdown bool) error {
 	start := time.Now()
 	checkpointType := "requested"
@@ -535,15 +577,50 @@ func (c *Checkpointer) runCheckpoint(ctx context.Context, spread, shutdown bool)
 		}
 		return uint64(pos + int64(leading))
 	}
+	// A9-checkpoint-opcode: an ONLINE PG-compat checkpoint determines its redo
+	// point by INSERTING an XLOG_CHECKPOINT_REDO record — the record's start
+	// LSN becomes the redo pointer, exactly like upstream CreateCheckPoint
+	// (xlog.c:7087-7099). PG17+ recovery validates that the record found at
+	// CheckPoint.redo is this record whenever redo < the checkpoint record's
+	// own LSN. The append happens INSIDE the redo barrier's critical section:
+	// FPI-decision sections hold fpiPublishMu.RLock across decide->append, so
+	// with the write side held here no torn-page-relevant record can land
+	// between the sampled redo and the published one — appending the marker
+	// under the same lock makes "redo == marker start" atomic. Lock order is
+	// preserved (fpiPublishMu -> WAL stripe, the FPI sections' own order) and
+	// the marker itself makes no FPI decision, so no self-deadlock.
+	// Shutdown (and legacy) checkpoints keep the sampled-frontier redo: no
+	// WAL may be written between a shutdown checkpoint's redo and its record,
+	// so the record itself marks the redo point (upstream comment, xlog.c).
+	var redoAppendErr error
+	sampleRedo := computeRedo
+	if c.cfg.PGCompatCheckpoints && !shutdown {
+		sampleRedo = func() uint64 {
+			rec, err := EncodeCheckpointRedoPG()
+			if err != nil {
+				redoAppendErr = err
+				return computeRedo()
+			}
+			startLSN, _, err := c.wal.Append(rec)
+			if err != nil {
+				redoAppendErr = err
+				return computeRedo()
+			}
+			return startLSN - 1
+		}
+	}
 	var redoLSN0 uint64
 	if rp, ok := c.flusher.(redoPublisher); ok {
 		// The barrier waits out every in-flight FPI-decision->append critical
 		// section BEFORE sampling the frontier, so no record decided against
 		// the old redo can land at an LSN >= the new redo (PG's
 		// fpw_lsn-under-insert-locks analog; adversarial review F1).
-		redoLSN0 = rp.PublishRedoBarrier(computeRedo)
+		redoLSN0 = rp.PublishRedoBarrier(sampleRedo)
 	} else {
-		redoLSN0 = computeRedo()
+		redoLSN0 = sampleRedo()
+	}
+	if redoAppendErr != nil {
+		return fmt.Errorf("append checkpoint-redo record: %w", redoAppendErr)
 	}
 
 	flushStart := time.Now()
@@ -602,7 +679,32 @@ func (c *Checkpointer) runCheckpoint(ctx context.Context, spread, shutdown bool)
 	}
 	var checkpointPayload []byte
 	if c.cfg.PGCompatCheckpoints {
-		checkpointPayload = EncodeCheckpointCompat(redoLSN0, 1, nextXid, nextOid)
+		// A9-checkpoint-opcode: explicit ONLINE/SHUTDOWN opcode via the
+		// assembled-record path (the classify-by-len==88 hack is retired).
+		// An online checkpoint is preceded by XLOG_RUNNING_XACTS — upstream
+		// CreateCheckPoint calls LogStandbySnapshot() after CheckPointGuts
+		// and before inserting the checkpoint record (xlog.c:7243) — so a
+		// hot-standby PG recovering from this checkpoint's redo reaches
+		// STANDBY_SNAPSHOT_READY. Shutdown checkpoints skip it (recovery
+		// synthesises the running-xacts state on the wasShutdown path) and
+		// stamp oldestActiveXid = InvalidTransactionId, exactly like PG.
+		oldestActive := uint32(0)
+		if !shutdown {
+			xids, oldestRunning, latestCompleted := c.runningXacts(nextXid)
+			oldestActive = oldestRunning
+			rx, rerr := EncodeRunningXactsPG(uint32(max(nextXid, 3)), oldestRunning, latestCompleted, xids)
+			if rerr != nil {
+				return fmt.Errorf("encode running-xacts record: %w", rerr)
+			}
+			if _, _, err := c.wal.Append(rx); err != nil {
+				return fmt.Errorf("append running-xacts record: %w", err)
+			}
+		}
+		var cerr error
+		checkpointPayload, cerr = EncodeCheckpointPG(shutdown, redoLSN0, 1, nextXid, nextOid, oldestActive)
+		if cerr != nil {
+			return fmt.Errorf("encode checkpoint record: %w", cerr)
+		}
 	} else {
 		checkpointPayload = EncodeCheckpoint()
 	}
@@ -623,6 +725,7 @@ func (c *Checkpointer) runCheckpoint(ctx context.Context, spread, shutdown bool)
 	// 0-based).
 	c.lastCheckpointRedoLSN.Store(redoLSN0 + 1)
 	c.lastCheckpointLSN.Store(endLSN)
+	c.lastCheckpointStartLSN.Store(startLSN)
 	// Update pg_control on disk so pg_controldata and standbys see the
 	// current checkpoint location. Mirrors CreateCheckPoint (post-flush)
 	// in upstream's UpdateControlFile call (xlog.c:7306).
