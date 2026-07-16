@@ -193,6 +193,19 @@ func runFailoverGoopgToPG(t *testing.T, repo, pgBasebackupBin, psqlBin string, m
 		"CREATE FUNCTION public.b2prep_double(int) RETURNS int LANGUAGE sql AS 'SELECT $1 * 2'"); err != nil {
 		t.Fatalf("create function on goopg primary: %v", err)
 	}
+	// B2.1a: a runtime CREATE TYPE AS ENUM writes pg_type heap rows +
+	// 2703/2704 index entries (2704 is lazily rooted from its empty
+	// bootstrap placeholder) and emits ONLY heap-insert/FPI records — no
+	// goopg-private WAL. The post-failover regtype probe proves PG resolves
+	// the type by name (LookupTypeName → TYPENAMENSP → 2704) and reads the
+	// runtime pg_type row. (CREATE DOMAIN still emits the bespoke kind-119
+	// RmgrGoopgCatalog record, which a real PG standby FATALs on —
+	// "resource manager with ID 128 not registered" — so the domain
+	// assertion arrives with B2.1b, which retires that record.)
+	if err := runSQLSimple(t, primary,
+		"CREATE TYPE public.b2prep_mood AS ENUM ('sad', 'happy')"); err != nil {
+		t.Fatalf("create enum type on goopg primary: %v", err)
+	}
 
 	dsn := fmt.Sprintf("host=%s port=%s user=%s dbname=%s sslmode=disable",
 		"127.0.0.1", mustGoopgPort(primary.ListenAddr()), "postgres", "postgres")
@@ -315,6 +328,14 @@ func runFailoverGoopgToPG(t *testing.T, repo, pgBasebackupBin, psqlBin string, m
 	if got := pgScalar(t, standby,
 		"SELECT public.b2prep_double(21)"); got != "42" {
 		t.Fatalf("post-failover function call = %q, want 42", got)
+	}
+	// B2.1a: the goopg-created enum type must be resolvable by name on the
+	// promoted PG (pg_type row + 2703/2704 runtime index maintenance).
+	// regtype resolution never touches pg_enum labels (those arrive with
+	// the pg_enum heap conversion), so this isolates the pg_type surface.
+	if got := pgScalar(t, standby,
+		"SELECT 'public.b2prep_mood'::regtype::text"); got != "b2prep_mood" {
+		t.Fatalf("post-failover enum type resolution = %q, want b2prep_mood", got)
 	}
 }
 

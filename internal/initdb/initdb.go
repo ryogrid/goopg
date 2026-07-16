@@ -940,6 +940,14 @@ func Init(opts Options) error {
 	if err := bootstrapPgTypeOidIndex(abs, pgTypeTIDs); err != nil {
 		return fmt.Errorf("goopg init: pg_type_oid_index: %w", err)
 	}
+	// B2.1a: populate pg_type_typname_nsp_index (2704) so PG's
+	// LookupTypeName → SearchSysCache2(TYPENAMENSP, ...) resolves builtin
+	// AND runtime types by name. Left as an empty placeholder before, every
+	// named cast on a real PG standby (`SELECT 1::int4`, `::text`) failed
+	// with `type "..." does not exist`.
+	if err := bootstrapPgTypeTypnameNspIndex(abs, pgTypeTIDs); err != nil {
+		return fmt.Errorf("goopg init: pg_type_typname_nsp_index: %w", err)
+	}
 	// M0106-0010 step 2: write pg_am rows so PG's
 	// RelationInitIndexAccessInfo → SearchSysCache1(AMOID, ...) does
 	// not return NULL and PANIC when opening a critical index.

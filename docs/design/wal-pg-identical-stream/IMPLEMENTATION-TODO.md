@@ -282,6 +282,33 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
   CREATE FUNCTION over WAL → promoted PG resolves by name (2691) AND executes it (2690 + prosrc).
 - [ ] **B2** type/operator families (pg_type/enum/range, pg_operator, pg_opclass/opfamily/amop/amproc,
   pg_cast, pg_conversion, pg_collation, pg_aggregate).
+  - [x] **B2.1a pg_type index maintenance (2703/2704)** — LANDED. All ten pg_type row writes
+    (enum/composite/domain/range/multirange + arrays, ACL resync) funnel through
+    `writeTypeHeapRowWithIndexes`, which derives the index keys from the built row itself
+    (oid/typname/typnamespace = cols 0-2) and maintains 2703 (oid, 16B) + 2704 (name+nsp, 80B —
+    same shape as 2663). Two structural gaps closed along the way: (1) **empty-placeholder lazy
+    rooting** — 2704 shipped as a metapage-only placeholder that `insertCanonicalSysBtreeLeaf`
+    silently skipped (nBlocks≤1); now `allocateEmptySysBtreeLeafRoot` mirrors PG's `_bt_getroot`
+    write path (needed for pre-existing data dirs + any future placeholder index); (2) **2704
+    bootstrap population** — the empty placeholder meant a real PG standby could not resolve ANY
+    type by name (`SELECT 1::int4` → `type "int4" does not exist`; TYPENAMENSP probes 2704 for
+    builtins too); `bootstrapPgTypeTypnameNspIndex` now bulk-loads one entry per bootstrap heap
+    row (shared entry map with the heap writer). e2e failover: runtime `CREATE TYPE AS ENUM`
+    (heap-insert/FPI records ONLY — no bespoke WAL) resolves on the promoted PG via
+    `'public.b2prep_mood'::regtype::text` — exercising runtime AND bootstrap 2704 entries.
+    **Empirical pin from the failed first attempt**: a surviving RmgrGoopgCatalog(128) record in
+    streamed WAL hard-kills a real PG standby (`FATAL: resource manager with ID 128 not
+    registered`, unrecoverable startup loop) — sequences (65/66), ranges (81/82/117/118), domains
+    (119/120) are live landmines for mixed replication until B1.3b/B2.1b/B2.1c land.
+  - [ ] **B2.1b domains** — retire kinds 119/120 + domain_ddl_recovery.go; registry reload from
+    the pg_type heap (JSON metadata for CHECKs/defaults, pg_proc pattern); ALTER DOMAIN becomes
+    a durable non-HOT heap UPDATE (today NOT durable at all); Domain HeapTID plumbing; e2e domain
+    cast assertion (prepared in the B2.1a attempt, blocked on kind 119).
+  - [ ] **B2.1c ranges** — retire kinds 81/82/117/118 + range_type_ddl_recovery.go; same pattern;
+    plus real pg_range heap row + 3542/2228 entries.
+  - [ ] **B2.1d enum labels** — pg_enum heap rows + 3502/3503/3534 entries; enum registry reload
+    (TODAY enums have NO restart durability at all — labels live only in memory); ALTER TYPE ADD
+    VALUE becomes a real pg_enum INSERT.
 - [ ] **B3** extension/config (pg_ts_*, pg_transform, pg_event_trigger, pg_publication*/subscription*,
   pg_statistic_ext, pg_constraint/attrdef/depend).
 - [ ] **B4** shared catalogs in `global/` (pg_database, pg_authid/auth_members, pg_tablespace,

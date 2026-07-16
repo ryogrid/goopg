@@ -77,6 +77,12 @@ func keyMetaForSysBtree(indexOID uint32) (btreeIndexKeyMeta, bool) {
 		return btreeIndexKeyMeta{tupleSize: 16, nkeyatts: 1}, true
 	case pgProcPronameArgsNspIndexOID:
 		return btreeIndexKeyMeta{nkeyatts: 3, variable: true}, true
+	// B2.1a: pg_type — 2703 bootstraps as a populated leaf-root, 2704 as an
+	// empty metapage-only placeholder that the runtime lazily roots.
+	case pgTypeOidIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 16, nkeyatts: 1}, true
+	case pgTypeTypnameNspIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 80, nkeyatts: 2}, true
 	default:
 		return btreeIndexKeyMeta{}, false
 	}

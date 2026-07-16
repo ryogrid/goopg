@@ -329,13 +329,13 @@ func pgTypeRow(e pgTypeEntry) executor.Row {
 // (`invalid attalign value:`). Writing the canonical heap here makes
 // the SysCache lookup return a proper Form_pg_type pointer with
 // typalign at offset 128.
-func bootstrapPgTypeTuples(dataDir string) (map[uint32]heapTID, error) {
-	cols := pgTypeColDefs()
-
-	// Build a combined entry set: all PG18 base types + array peers from
-	// pgTypeAllEntries() (generated from pg_type.dat), plus any nailed-attr
-	// OIDs that fall back to pgTypeCanonical() (e.g. goopg-specific OIDs
-	// like 10028 _pg_statistic that are not in pg_type.dat).
+// pgTypeBootstrapEntryMap builds the combined bootstrap entry set: all PG18
+// base types + array peers from pgTypeAllEntries() (generated from
+// pg_type.dat), plus any nailed-attr OIDs that fall back to pgTypeCanonical()
+// (e.g. goopg-specific OIDs like 10028 _pg_statistic that are not in
+// pg_type.dat). Shared by the heap writer and both index bootstrappers so the
+// heap rows and index entries always cover the identical OID set.
+func pgTypeBootstrapEntryMap() map[uint32]pgTypeEntry {
 	allMap := make(map[uint32]pgTypeEntry)
 	for _, e := range pgTypeAllEntries() {
 		allMap[e.OID] = e
@@ -347,6 +347,13 @@ func bootstrapPgTypeTuples(dataDir string) (map[uint32]heapTID, error) {
 			}
 		}
 	}
+	return allMap
+}
+
+func bootstrapPgTypeTuples(dataDir string) (map[uint32]heapTID, error) {
+	cols := pgTypeColDefs()
+
+	allMap := pgTypeBootstrapEntryMap()
 
 	// Sort by OID for deterministic heap layout.
 	oids := make([]uint32, 0, len(allMap))

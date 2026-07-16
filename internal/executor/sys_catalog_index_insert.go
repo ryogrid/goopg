@@ -207,6 +207,31 @@ const (
 	pgProcPronameArgsNspIndexOID = 2691
 )
 
+// pg_type index OIDs (postgres/src/include/catalog/pg_type.h). B2.1a.
+const (
+	pgTypeOidIndexOID        = 2703
+	pgTypeTypnameNspIndexOID = 2704
+)
+
+// insertPgTypeOidIndexEntry inserts an entry into pg_type_oid_index (2703)
+// for (oid → heap TID). B2.1a: the bootstrap tree is a populated leaf-root
+// (bootstrapPgTypeOidIndex) that splits/descends via the B2-prep machinery.
+func insertPgTypeOidIndexEntry(ctx *Context, oid uint32, tid storage.ItemPointer) error {
+	tup := buildIndexTupleOidKey(uint32(tid.Block), tid.Offset, oid)
+	return insertCanonicalSysBtreeLeaf(ctx, pgTypeOidIndexOID, tup, cmpKeyUint32)
+}
+
+// insertPgTypeTypnameNspIndexEntry inserts an entry into
+// pg_type_typname_nsp_index (2704) for ((typname, typnamespace) → heap TID).
+// Same 80-byte name+oid key shape as pg_class_relname_nsp_index. The
+// bootstrap file is an EMPTY metapage-only placeholder (makeBtreeRootPage,
+// btm_root=P_NONE) — the first runtime insert lazily allocates the leaf-root
+// (PG's _bt_getroot write-path analog, see insertCanonicalSysBtreeLeaf).
+func insertPgTypeTypnameNspIndexEntry(ctx *Context, typname string, typnamespace uint32, tid storage.ItemPointer) error {
+	tup := buildIndexTupleNameOidKey(uint32(tid.Block), tid.Offset, typname, typnamespace)
+	return insertCanonicalSysBtreeLeaf(ctx, pgTypeTypnameNspIndexOID, tup, cmpKeyNameOid)
+}
+
 // sysIndexVarMask is INDEX_VAR_MASK (postgres/src/include/access/itup.h:74):
 // set on every IndexTuple whose data contains a varlena attribute
 // (pg_proc_proname_args_nsp_index carries proargtypes = oidvector).
@@ -348,8 +373,18 @@ func insertCanonicalSysBtreeLeaf(ctx *Context, indexOID uint32, indexTuple []byt
 	if err != nil {
 		return fmt.Errorf("nblocks sys btree %d: %w", indexOID, err)
 	}
-	if nBlocks <= sysBtreeRootBlock {
+	if nBlocks == 0 {
+		// No file at all — bootstrap never ran (in-memory test fixture).
 		return nil
+	}
+	if nBlocks == sysBtreeRootBlock {
+		// Metapage-only empty placeholder (initdb's makeBtreeRootPage,
+		// btm_root=P_NONE — e.g. pg_type_typname_nsp_index 2704): lazily
+		// allocate the leaf-root on first insert, mirroring PG's
+		// _bt_getroot write path. B2.1a.
+		if err := allocateEmptySysBtreeLeafRoot(ctx, indexOID, rel); err != nil {
+			return fmt.Errorf("lazy root sys btree %d: %w", indexOID, err)
+		}
 	}
 
 	// Read metapage to learn whether the index is a single leaf-root
@@ -382,6 +417,61 @@ func insertCanonicalSysBtreeLeaf(ctx *Context, indexOID uint32, indexTuple []byt
 		}
 		return fmt.Errorf("insert leaf blk %d sys btree %d: %w", leafBlk, indexOID, err)
 	}
+	return nil
+}
+
+// allocateEmptySysBtreeLeafRoot extends a metapage-only empty btree with an
+// empty BTP_LEAF|BTP_ROOT page at block 1 and points the metapage at it
+// (btm_root=1, btm_level=0). Only called when NBlocks==1; if the metapage
+// already names a root the file is inconsistent and the insert is aborted.
+func allocateEmptySysBtreeLeafRoot(ctx *Context, indexOID uint32, rel storage.RelFileNode) error {
+	metaSlot, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: 0})
+	if err != nil {
+		return fmt.Errorf("pin metapage: %w", err)
+	}
+	metaSlot.Lock()
+	le := binary.LittleEndian
+	base := storage.SizeOfPageHeaderData
+	if rootBlk := le.Uint32(metaSlot.Page()[base+8 : base+12]); rootBlk != 0 {
+		metaSlot.Unlock()
+		ctx.Pool.Unpin(metaSlot)
+		return fmt.Errorf("metapage names root %d but relation has no block %d", rootBlk, rootBlk)
+	}
+	leafSlot, leafBlk, err := ctx.Pool.PinNew(rel)
+	if err != nil {
+		metaSlot.Unlock()
+		ctx.Pool.Unpin(metaSlot)
+		return fmt.Errorf("extend leaf-root: %w", err)
+	}
+	if leafBlk != sysBtreeRootBlock {
+		ctx.Pool.Unpin(leafSlot)
+		metaSlot.Unlock()
+		ctx.Pool.Unpin(metaSlot)
+		return fmt.Errorf("extend produced block %d, want %d", leafBlk, sysBtreeRootBlock)
+	}
+	leafSlot.Lock()
+	emptyLeaf, err := buildSysBtreeLeafPage(nil, nil, pNoneBlock, pNoneBlock, true)
+	if err != nil {
+		leafSlot.Unlock()
+		ctx.Pool.Unpin(leafSlot)
+		metaSlot.Unlock()
+		ctx.Pool.Unpin(metaSlot)
+		return fmt.Errorf("build empty leaf-root: %w", err)
+	}
+	copy(leafSlot.Page(), emptyLeaf)
+	ctx.Pool.MarkDirty(leafSlot)
+	leafSlot.Unlock()
+	ctx.Pool.Unpin(leafSlot)
+
+	if err := writeSysBtreeMetapageInPlace(metaSlot.Page(), uint32(sysBtreeRootBlock), 0); err != nil {
+		metaSlot.Unlock()
+		ctx.Pool.Unpin(metaSlot)
+		return fmt.Errorf("write metapage: %w", err)
+	}
+	ctx.Pool.MarkDirty(metaSlot)
+	metaSlot.Unlock()
+	ctx.Pool.Unpin(metaSlot)
+	_ = indexOID
 	return nil
 }
 

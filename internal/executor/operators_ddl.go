@@ -12808,25 +12808,56 @@ func syncEnumTypeToCatalogHeap(ctx *Context, et *catalog.EnumType) {
 	if !catalogHeapSyncAvailable(ctx) {
 		return
 	}
-	typeRel := storage.RelFileNode{
-		DBOid:  catalog.DefaultDBOid,
-		RelOid: catalog.TypeRelationId,
-		Fork:   storage.MainFork,
-	}
-	if _, err := writeHeapRowCanonical(ctx, typeRel, pgTypeColumnsPG18(), buildUserPGTypeRowForEnum(et)); err != nil {
+	if err := writeTypeHeapRowWithIndexes(ctx, buildUserPGTypeRowForEnum(et)); err != nil {
 		return
 	}
 	// Also write the auto-generated array type (`_name`) so a `mood[]` column's
 	// atttypid joins to a real pg_type row — pg_dump's getTableAttrs passes the
 	// joined t.oid to format_type, and a missing row renders the column type
 	// blank. DU-002 slice 89.
-	if _, err := writeHeapRowCanonical(ctx, typeRel, pgTypeColumnsPG18(), buildUserPGTypeRowForEnumArray(et)); err != nil {
+	if err := writeTypeHeapRowWithIndexes(ctx, buildUserPGTypeRowForEnumArray(et)); err != nil {
 		return
 	}
 	// Mirror pg_type to the postgres database (DBOid=5) so sessions using
 	// the postgres db can find the new type row via SeqScan. This mirrors
 	// the pattern used by syncTableToCatalogHeap. M0097-0022.
+	mirrorTypeCatalogFiles(ctx)
+}
+
+// writeTypeHeapRowWithIndexes writes one pg_type heap row and maintains
+// pg_type_oid_index (2703) + pg_type_typname_nsp_index (2704) — B2.1a. The
+// index keys come from the built row itself (oid=col 0, typname=col 1,
+// typnamespace=col 2 of pgTypeColumnsPG18) so every buildUserPGTypeRowFor*
+// variant (enum/array/composite/domain/range/multirange) stays in sync with
+// its index entries by construction.
+func writeTypeHeapRowWithIndexes(ctx *Context, row Row) error {
+	typeRel := storage.RelFileNode{
+		DBOid:  catalog.DefaultDBOid,
+		RelOid: catalog.TypeRelationId,
+		Fork:   storage.MainFork,
+	}
+	tid, err := writeHeapRowCanonical(ctx, typeRel, pgTypeColumnsPG18(), row)
+	if err != nil {
+		return err
+	}
+	oid := uint32(row[0].Int)
+	typname := row[1].StringValue()
+	typnamespace := uint32(row[2].Int)
+	if err := insertPgTypeOidIndexEntry(ctx, oid, tid); err != nil {
+		return fmt.Errorf("pg_type_oid_index: %w", err)
+	}
+	if err := insertPgTypeTypnameNspIndexEntry(ctx, typname, typnamespace, tid); err != nil {
+		return fmt.Errorf("pg_type_typname_nsp_index: %w", err)
+	}
+	return nil
+}
+
+// mirrorTypeCatalogFiles propagates the pg_type heap + both indexes to the
+// postgres DB's copies (B2.1a: the indexes now change at runtime too).
+func mirrorTypeCatalogFiles(ctx *Context) {
 	_ = mirrorCatalogRelToPostgresDB(ctx, catalog.TypeRelationId)
+	_ = mirrorCatalogRelToPostgresDB(ctx, pgTypeOidIndexOID)
+	_ = mirrorCatalogRelToPostgresDB(ctx, pgTypeTypnameNspIndexOID)
 }
 
 // syncCompositeTypeToCatalogHeap writes the catalog rows for a composite type
@@ -12842,15 +12873,10 @@ func syncCompositeTypeToCatalogHeap(ctx *Context, ct *catalog.CompositeType) {
 	if ct == nil || !catalogHeapSyncAvailable(ctx) {
 		return
 	}
-	typeRel := storage.RelFileNode{
-		DBOid:  catalog.DefaultDBOid,
-		RelOid: catalog.TypeRelationId,
-		Fork:   storage.MainFork,
-	}
-	if _, err := writeHeapRowCanonical(ctx, typeRel, pgTypeColumnsPG18(), buildUserPGTypeRowForComposite(ct)); err != nil {
+	if err := writeTypeHeapRowWithIndexes(ctx, buildUserPGTypeRowForComposite(ct)); err != nil {
 		return
 	}
-	if _, err := writeHeapRowCanonical(ctx, typeRel, pgTypeColumnsPG18(), buildUserPGTypeRowForCompositeArray(ct)); err != nil {
+	if err := writeTypeHeapRowWithIndexes(ctx, buildUserPGTypeRowForCompositeArray(ct)); err != nil {
 		return
 	}
 
@@ -12896,7 +12922,7 @@ func syncCompositeTypeToCatalogHeap(ctx *Context, ct *catalog.CompositeType) {
 	if ctx.TxnMgr != nil {
 		ctx.TxnMgr.SetRelcacheInvalPending()
 	}
-	_ = mirrorCatalogRelToPostgresDB(ctx, catalog.TypeRelationId)
+	mirrorTypeCatalogFiles(ctx)
 	_ = mirrorCatalogRelToPostgresDB(ctx, catalog.RelationRelationId)
 	_ = mirrorCatalogRelToPostgresDB(ctx, catalog.AttributeRelationId)
 }
@@ -12909,22 +12935,17 @@ func syncDomainTypeToCatalogHeap(ctx *Context, d *catalog.Domain) {
 	if !catalogHeapSyncAvailable(ctx) {
 		return
 	}
-	typeRel := storage.RelFileNode{
-		DBOid:  catalog.DefaultDBOid,
-		RelOid: catalog.TypeRelationId,
-		Fork:   storage.MainFork,
-	}
-	if _, err := writeHeapRowCanonical(ctx, typeRel, pgTypeColumnsPG18(), buildUserPGTypeRowForDomain(d)); err != nil {
+	if err := writeTypeHeapRowWithIndexes(ctx, buildUserPGTypeRowForDomain(d)); err != nil {
 		return
 	}
 	// Also write the auto-generated array type (`_name`) so a `d[]` column's
 	// atttypid joins to a real pg_type row and pg_dump's format_type renders it
 	// as `public.d[]` rather than the base type's built-in array. DU-002 slice 251
 	// (mirrors syncEnumTypeToCatalogHeap's array-row write).
-	if _, err := writeHeapRowCanonical(ctx, typeRel, pgTypeColumnsPG18(), buildUserPGTypeRowForDomainArray(d)); err != nil {
+	if err := writeTypeHeapRowWithIndexes(ctx, buildUserPGTypeRowForDomainArray(d)); err != nil {
 		return
 	}
-	_ = mirrorCatalogRelToPostgresDB(ctx, catalog.TypeRelationId)
+	mirrorTypeCatalogFiles(ctx)
 }
 
 // syncRangeTypeToCatalogHeap writes the pg_type heap rows for a user-defined
@@ -12940,24 +12961,19 @@ func syncRangeTypeToCatalogHeap(ctx *Context, rt *catalog.RangeType) {
 	if !catalogHeapSyncAvailable(ctx) {
 		return
 	}
-	typeRel := storage.RelFileNode{
-		DBOid:  catalog.DefaultDBOid,
-		RelOid: catalog.TypeRelationId,
-		Fork:   storage.MainFork,
-	}
-	if _, err := writeHeapRowCanonical(ctx, typeRel, pgTypeColumnsPG18(), buildUserPGTypeRowForRange(rt)); err != nil {
+	if err := writeTypeHeapRowWithIndexes(ctx, buildUserPGTypeRowForRange(rt)); err != nil {
 		return
 	}
-	if _, err := writeHeapRowCanonical(ctx, typeRel, pgTypeColumnsPG18(), buildUserPGTypeRowForRangeArray(rt)); err != nil {
+	if err := writeTypeHeapRowWithIndexes(ctx, buildUserPGTypeRowForRangeArray(rt)); err != nil {
 		return
 	}
-	if _, err := writeHeapRowCanonical(ctx, typeRel, pgTypeColumnsPG18(), buildUserPGTypeRowForMultirange(rt)); err != nil {
+	if err := writeTypeHeapRowWithIndexes(ctx, buildUserPGTypeRowForMultirange(rt)); err != nil {
 		return
 	}
-	if _, err := writeHeapRowCanonical(ctx, typeRel, pgTypeColumnsPG18(), buildUserPGTypeRowForMultirangeArray(rt)); err != nil {
+	if err := writeTypeHeapRowWithIndexes(ctx, buildUserPGTypeRowForMultirangeArray(rt)); err != nil {
 		return
 	}
-	_ = mirrorCatalogRelToPostgresDB(ctx, catalog.TypeRelationId)
+	mirrorTypeCatalogFiles(ctx)
 }
 
 // deleteTypeFromCatalogHeap stamps xmax on the pg_type row for typeOID.
@@ -17185,15 +17201,10 @@ func (o *ddlOp) resyncTypeACLHeapRow(im *catalog.InMemory, oid uint32, kind user
 		return err
 	}
 	deleteTypeFromCatalogHeap(ctx, catalog.DefaultDBOid, oid, ctx.Tx.XID)
-	typeRel := storage.RelFileNode{
-		DBOid:  catalog.DefaultDBOid,
-		RelOid: catalog.TypeRelationId,
-		Fork:   storage.MainFork,
-	}
-	if _, err := writeHeapRowCanonical(ctx, typeRel, pgTypeColumnsPG18(), row); err != nil {
+	if err := writeTypeHeapRowWithIndexes(ctx, row); err != nil {
 		return err
 	}
-	_ = mirrorCatalogRelToPostgresDB(ctx, catalog.TypeRelationId)
+	mirrorTypeCatalogFiles(ctx)
 	return nil
 }
 

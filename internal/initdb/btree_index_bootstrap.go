@@ -1005,6 +1005,57 @@ func pgBuildIndexTupleNameOidKey(heapBlk uint32, heapOff uint16, name string, oi
 // is used by RangeVarGetRelid once criticalRelcachesBuilt=true. Without
 // populated leaf entries, every name-based pg_class lookup returns "relation
 // does not exist" even though the heap row exists.
+// bootstrapPgTypeTypnameNspIndex overwrites the empty btree placeholder at
+// base/{1,5}/2704 and global/2704 with a populated multi-leaf btree carrying
+// one (typname, typnamespace=11) IndexTuple per bootstrap pg_type heap row.
+// B2.1a: this index previously stayed an EMPTY placeholder, which made every
+// named-type lookup on a real PG standby fail — LookupTypeName resolves
+// builtins through SearchSysCache2(TYPENAMENSP, ...) too, so even
+// `SELECT 1::int4` / `::text` raised `type "text" does not exist`. The entry
+// set is pgTypeBootstrapEntryMap(), the exact OID set bootstrapPgTypeTuples
+// wrote to the heap (tids is keyed by that set).
+func bootstrapPgTypeTypnameNspIndex(dataDir string, tids map[uint32]heapTID) error {
+	type entry struct {
+		name string
+		blk  uint32
+		off  uint16
+	}
+	allMap := pgTypeBootstrapEntryMap()
+	entries := make([]entry, 0, len(allMap))
+	for oid, e := range allMap {
+		t, ok := tids[oid]
+		if !ok {
+			continue
+		}
+		entries = append(entries, entry{name: e.Name, blk: t.Block, off: t.Offset})
+	}
+	// Sort by typname (NameData byte comparison); all bootstrap types share
+	// typnamespace=11 (pg_catalog) so the name is the whole live key.
+	sort.Slice(entries, func(i, j int) bool { return entries[i].name < entries[j].name })
+
+	const nameOidTupleSize = 80 // MAXALIGN(8 + 64 + 4)
+	const nkeyatts = 2          // (typname, typnamespace)
+	tuples := make([][]byte, len(entries))
+	for i, e := range entries {
+		tuples[i] = pgBuildIndexTupleNameOidKey(e.blk, e.off, e.name, 11)
+	}
+	file, err := pgBuildBtreeBulkLoadSized(tuples, nameOidTupleSize, nkeyatts)
+	if err != nil {
+		return fmt.Errorf("pg_type_typname_nsp_index: %w", err)
+	}
+
+	for _, dir := range []string{
+		filepath.Join(dataDir, "base", "1"),
+		filepath.Join(dataDir, "base", "5"),
+		filepath.Join(dataDir, "global"),
+	} {
+		if err := os.WriteFile(filepath.Join(dir, "2704"), file, 0o600); err != nil {
+			return fmt.Errorf("write pg_type_typname_nsp_index in %s: %w", dir, err)
+		}
+	}
+	return nil
+}
+
 func bootstrapPgClassRelnameNspIndex(dataDir string, tids map[uint32]heapTID) error {
 	type entry struct {
 		name string
