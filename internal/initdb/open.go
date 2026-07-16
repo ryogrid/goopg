@@ -2690,49 +2690,32 @@ func loadUserTablesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *m
 // under CREATE DATABASE reloads into that database's namespace with its
 // data-file routing (Table.DBOid → base/<dbOid>/<relOid>) intact.
 func loadUserTablesFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog, heapDBOid, nsDBOid uint32) error {
+	// B0.1: both scan passes ride the generic catalog-heap reload loop
+	// (catalog_heap_reload.go) — the per-tuple walk, xmin/xmax liveness and
+	// the M0030-0007/M0106-0010 CLOG rules (aborted-xmin filter for every
+	// layout, basebackup out-of-range-xmin pass-through, committed-xmin
+	// requirement for legacy-layout pg_class rows only) now live in
+	// catalogRowLive/scanCatalogHeapRows. Behavior is unchanged; doc 02a
+	// §2.3 is the normative statement of the rules.
+	type recoveredPGClassRow struct {
+		row      catalog.PGClassRow
+		physical bool
+	}
 	classRel := storage.RelFileNode{
 		DBOid:  heapDBOid,
 		RelOid: catalog.RelationRelationId,
 		Fork:   storage.MainFork,
 	}
-	nClassBlocks, err := mgr.NBlocks(classRel)
-	if err != nil || nClassBlocks == 0 {
-		return nil // pg_class absent or empty — old cluster or fresh initdb
-	}
-
-	page := make(storage.Page, storage.BlockSize)
 
 	// Pass 1: collect user table rows from pg_class.
-	type recoveredPGClassRow struct {
-		row      catalog.PGClassRow
-		physical bool
-	}
-	var userTableRows []recoveredPGClassRow
-	for blk := storage.BlockNumber(0); blk < nClassBlocks; blk++ {
-		if err := mgr.ReadBlock(classRel, blk, page); err != nil {
-			return fmt.Errorf("loadUserTablesFromHeap: read pg_class blk %d: %w", blk, err)
-		}
-		count, err := storage.PageLinePointerCount(page)
-		if err != nil {
-			continue
-		}
-		for slot := uint16(1); slot <= uint16(count); slot++ {
-			ht, err := storage.PageGetHeapTuple(page, slot)
-			if err != nil {
-				continue
-			}
-			if ht.Header.Xmin == storage.InvalidTransactionID {
-				continue // not a real tuple
-			}
-			if ht.Header.Xmax != storage.InvalidTransactionID {
-				continue // deleted
-			}
+	classRows, err := scanCatalogHeapRows(mgr, classRel, clog, "pg_class",
+		func(ht storage.HeapTuple) (any, bool, error) {
 			physicalRow := false
 			row, err := catalog.DecodePGClassRow(ht.Data)
 			if err != nil {
 				row, err = catalog.DecodePGClassPhysicalRow(ht.Data)
 				if err != nil {
-					continue
+					return nil, false, err
 				}
 				physicalRow = true
 				// DecodePGClassPhysicalRow only covers the fixed-offset
@@ -2751,81 +2734,55 @@ func loadUserTablesFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, cl
 					}
 				}
 			}
-			// Skip rows from uncommitted or crashed goopg transactions
-			// (M0030-0007). PG basebackup tuples come from a consistent
-			// snapshot and carry xmin values from the upstream cluster
-			// that are out-of-range for our local clog (GetStatus returns
-			// TxnStatusUnknown) — those must not be filtered. But
-			// goopg-emitted rows in the PG18-canonical layout share the
-			// physical decoder path (post-M0106-0010 syncTableToCatalogHeap)
-			// and their xmin IS in our clog: if that xid is aborted (e.g.
-			// CREATE TABLE inside a rolled-back transaction), the row must
-			// be excluded regardless of layout. Applying the filter only
-			// for the explicit Aborted state keeps the basebackup
-			// pass-through intact while honoring local ROLLBACKs.
-			if clog != nil && clog.GetStatus(ht.Header.Xmin) == mvcc.TxnStatusAborted {
-				continue
-			}
-			if !physicalRow && clog != nil && clog.GetStatus(ht.Header.Xmin) != mvcc.TxnStatusCommitted {
-				continue
-			}
-			if (row.RelKind == "r" || row.RelKind == "m" || row.RelKind == "v") && row.OID >= catalog.FirstUserOID {
-				userTableRows = append(userTableRows, recoveredPGClassRow{row: row, physical: physicalRow})
-			}
+			// Legacy-layout rows require a locally-committed xmin
+			// (requireCommittedXmin = !physicalRow); PG18-canonical rows
+			// keep the basebackup pass-through.
+			return recoveredPGClassRow{row: row, physical: physicalRow}, !physicalRow, nil
+		})
+	if err != nil {
+		return fmt.Errorf("loadUserTablesFromHeap: %w", err)
+	}
+	var userTableRows []recoveredPGClassRow
+	for _, r := range classRows {
+		rec := r.(recoveredPGClassRow)
+		if (rec.row.RelKind == "r" || rec.row.RelKind == "m" || rec.row.RelKind == "v") && rec.row.OID >= catalog.FirstUserOID {
+			userTableRows = append(userTableRows, rec)
 		}
 	}
 	if len(userTableRows) == 0 {
 		return nil // no user tables in heap
 	}
 
-	// Pass 2: collect pg_attribute rows for user tables.
+	// Pass 2: collect pg_attribute rows for user tables. The pg_attribute
+	// scan never applies the committed-xmin branch (requireCommittedXmin
+	// always false) — see the pg_class decode comment for the rationale.
 	attrRel := storage.RelFileNode{
 		DBOid:  heapDBOid,
 		RelOid: catalog.AttributeRelationId,
 		Fork:   storage.MainFork,
 	}
-	nAttrBlocks, err := mgr.NBlocks(attrRel)
-	if err != nil || nAttrBlocks == 0 {
-		return nil // no attributes — can't reconstruct columns
-	}
-
-	attrByRelOID := map[uint32][]catalog.PGAttributeRow{}
-	for blk := storage.BlockNumber(0); blk < nAttrBlocks; blk++ {
-		if err := mgr.ReadBlock(attrRel, blk, page); err != nil {
-			return fmt.Errorf("loadUserTablesFromHeap: read pg_attribute blk %d: %w", blk, err)
-		}
-		count, err := storage.PageLinePointerCount(page)
-		if err != nil {
-			continue
-		}
-		for slot := uint16(1); slot <= uint16(count); slot++ {
-			ht, err := storage.PageGetHeapTuple(page, slot)
-			if err != nil {
-				continue
-			}
-			if ht.Header.Xmin == storage.InvalidTransactionID {
-				continue
-			}
-			if ht.Header.Xmax != storage.InvalidTransactionID {
-				continue
-			}
-			// Exclude rows from rolled-back goopg transactions. See the
-			// matching comment above the pg_class scan filter for why
-			// only the explicit Aborted state is checked here (basebackup
-			// pass-through hinges on xids unknown to the local clog).
-			if clog != nil && clog.GetStatus(ht.Header.Xmin) == mvcc.TxnStatusAborted {
-				continue
-			}
+	attrRows2, err := scanCatalogHeapRows(mgr, attrRel, clog, "pg_attribute",
+		func(ht storage.HeapTuple) (any, bool, error) {
 			row, err := catalog.DecodePGAttributeRow(ht.Data)
 			if err != nil {
 				row, err = catalog.DecodePGAttributePhysicalRow(ht.Data)
 				if err != nil {
-					continue
+					return nil, false, err
 				}
 			}
-			if !row.AttIsDropped && row.AttRelID >= catalog.FirstUserOID && row.AttNum > 0 {
-				attrByRelOID[row.AttRelID] = append(attrByRelOID[row.AttRelID], row)
-			}
+			return row, false, nil
+		})
+	if err != nil {
+		return fmt.Errorf("loadUserTablesFromHeap: %w", err)
+	}
+	if len(attrRows2) == 0 {
+		return nil // no attributes — can't reconstruct columns
+	}
+	attrByRelOID := map[uint32][]catalog.PGAttributeRow{}
+	for _, r := range attrRows2 {
+		row := r.(catalog.PGAttributeRow)
+		if !row.AttIsDropped && row.AttRelID >= catalog.FirstUserOID && row.AttNum > 0 {
+			attrByRelOID[row.AttRelID] = append(attrByRelOID[row.AttRelID], row)
 		}
 	}
 

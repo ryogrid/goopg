@@ -188,10 +188,16 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
 
 ## Phase B — Catalog heap journaling (doc 02; detailed designs 02a–02d)
 - [ ] **B0** Enabler (doc 02a) — four slices, each landed + gated separately:
-  - [ ] **B0.1** generic per-catalog heap-reload framework (`catalogReloadDesc` + `reloadCatalogHeaps` in new
-    `internal/initdb/catalog_heap_reload.go`, factored from `loadUserTablesFromHeapForDB` preserving the
-    clog/basebackup visibility rules verbatim; pg_class+pg_attribute become the first two descriptors —
-    pure refactor, zero behavior change). Gate: unit + crash-recovery + FULL regress.
+  - [x] **B0.1** LANDED — generic per-catalog heap-reload framework in new
+    `internal/initdb/catalog_heap_reload.go`: `catalogRowLive` (THE unified visibility filter, transcribed
+    rules incl. basebackup pass-through + legacy committed-xmin branch, pinned by a 9-case unit test),
+    `scanCatalogHeapRows` (generic block-walk + decode), `catalogReloadDesc`/`simpleCatalogReload`/
+    `runCatalogReloads` (Slot-ordered registry with Fatal/warn semantics, pinned by an order/fatality test).
+    `loadUserTablesFromHeapForDB`'s two scan passes re-expressed over `scanCatalogHeapRows` (decode returns
+    the requireCommittedXmin verdict: `!physicalRow` for pg_class, always-false for pg_attribute); the
+    pass-3 join, M0114 cache fast path, and all call sites untouched — zero behavior change. Gate: initdb
+    (241s incl. crash recovery) + executor + catalog + wal units, FULL regress (295s), isolation (22s),
+    replication smoke — all green.
   - [ ] **B0.2** catalog `XLOG_HEAP_UPDATE` emit (`updateHeapRowCanonicalPG` + TID-carrying write-through
     cache contract; proven on one pg_class ALTER re-sync path). Gate: full + pg_waldump Heap/UPDATE on
     1259 + e2e failover + re-init.
