@@ -136,3 +136,51 @@ func TestPort_AlterSchemaSurvivesRestart(t *testing.T) {
 		t.Fatalf("post-restart old-name count = %q, want 0 (old version resurrected)", got)
 	}
 }
+
+// TestPort_FunctionSurvivesRestart pins B1.2's pg_proc heap journaling:
+// CREATE [OR REPLACE] FUNCTION, ALTER FUNCTION (rename/volatility), and
+// DROP FUNCTION all survive a restart via the pg_proc heap reload —
+// replacing the retired initdb function_ddl_recovery scanner tests.
+func TestPort_FunctionSurvivesRestart(t *testing.T) {
+	c, err := cluster.New("function-durability", cluster.Options{
+		RepoRoot:     repoRoot(t),
+		DataDir:      filepath.Join(t.TempDir(), "data"),
+		StartupWait:  20 * time.Second,
+		ShutdownWait: 20 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+
+	if err := runSQLSimple(t, c, "CREATE FUNCTION b12_add(a int, b int) RETURNS int LANGUAGE sql AS 'SELECT a + b'"); err != nil {
+		t.Fatalf("CREATE FUNCTION: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE OR REPLACE FUNCTION b12_add(a int, b int) RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT a + b + 0'"); err != nil {
+		t.Fatalf("CREATE OR REPLACE: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE FUNCTION b12_gone() RETURNS int LANGUAGE sql AS 'SELECT 1'"); err != nil {
+		t.Fatalf("CREATE FUNCTION b12_gone: %v", err)
+	}
+	if err := runSQLSimple(t, c, "DROP FUNCTION b12_gone()"); err != nil {
+		t.Fatalf("DROP FUNCTION: %v", err)
+	}
+
+	if err := c.Stop(cluster.ShutdownFast); err != nil {
+		t.Fatalf("stop cluster: %v", err)
+	}
+	if err := c.Start(); err != nil {
+		t.Fatalf("restart cluster: %v", err)
+	}
+
+	if got := queryScalar(t, c, "SELECT b12_add(20, 22)"); got != "42" {
+		t.Fatalf("post-restart b12_add(20,22) = %q, want 42 (function or its REPLACE body not durable)", got)
+	}
+	if got := queryScalar(t, c, "SELECT count(*) FROM pg_proc WHERE proname = 'b12_gone'"); got != "0" {
+		t.Fatalf("post-restart dropped function count = %q, want 0", got)
+	}
+	if got := queryScalar(t, c, "SELECT count(*) FROM pg_proc WHERE proname = 'b12_add'"); got != "1" {
+		t.Fatalf("post-restart b12_add pg_proc count = %q, want 1 (OR REPLACE must not duplicate)", got)
+	}
+}

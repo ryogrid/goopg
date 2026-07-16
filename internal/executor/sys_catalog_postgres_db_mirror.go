@@ -141,6 +141,9 @@ func mirrorTouchedCatalogsToPostgresDB(ctx *Context) error {
 		pgNamespaceRelOID,          // 2615 pg_namespace
 		pgNamespaceNspnameIndexOID, // 2684
 		pgNamespaceOidIndexOID,     // 2685
+		// B1.2: pg_proc heap (indexes 2690/2691 stay bootstrap-static this
+		// phase — no runtime maintenance yet, see sys_pg_proc.go header).
+		pgProcRelOID, // 1255
 	}
 	for _, oid := range mirroredOIDs {
 		if err := mirrorCatalogRelToPostgresDB(ctx, oid); err != nil {

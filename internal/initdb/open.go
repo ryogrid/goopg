@@ -2003,11 +2003,14 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// restored event trigger's evtfoid can (in principle) be cross-checked
 	// against a restored routine, though neither replay path validates the
 	// other today.
-	if err := replayFunctionDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+	// B1.2 (doc 02c §2): routines reload from the pg_proc HEAP — the generic
+	// reload replacing the retired replayFunctionDDLRecords scanner
+	// (RecordKinds 61-64/121-123 are gone). Same pass slot as the scanner.
+	if err := reloadUserRoutinesFromHeap(mgr, cat, clog); err != nil {
 		_ = pool.Close()
 		_ = walWriter.Close()
 		_ = mgr.Close()
-		return nil, fmt.Errorf("goopg: function DDL replay: %w", err)
+		return nil, fmt.Errorf("goopg: pg_proc reload: %w", err)
 	}
 
 	// DU-002 restart-persistence follow-up (M0119-0004, DU-002 slice 426

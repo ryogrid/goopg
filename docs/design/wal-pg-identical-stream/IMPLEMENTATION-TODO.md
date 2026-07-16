@@ -236,7 +236,19 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
     native-kind-list entries, 3 wal test files; recovery-test schema seeds rewritten to the heap path;
     new TestPort_AlterSchemaSurvivesRestart. Gate: all units, initdb 231s, regress 298s, isolation,
     schema durability ×2, pg_waldump ×2, e2e failover — green; grep-zero confirmed.
-  - [ ] **B1.2 pg_proc** — CreateFunction/DropFunction/alter-function kinds + function_ddl_recovery.go die.
+  - [x] **B1.2 pg_proc** — LANDED. Function/procedure DDL journals REAL pg_proc heap rows (30-col
+    PG18-physical builder; CREATE = INSERT, OR-REPLACE + every ALTER variant = non-HOT xl_heap_update
+    of the total row, DROP = xl_heap_delete). Kinds 61-64/121-123 + codecs (recovery.go) +
+    function_ddl_recovery.go + function_ddl_test.go DELETED (no ApplyRecord/native-list/rmgr-map
+    changes needed — functions were fall-through no-ops). Routine metadata beyond the physical
+    columns rides a JSON blob in proargdefaults (PG reads that column only when pronargdefaults>0 —
+    no new PG-side deviation for default-less functions); reload = reloadUserRoutinesFromHeap.
+    TID cache = OID-keyed map on the Routines store. Mirror += 1255. RESIDUAL (ledger): runtime
+    maintenance of multi-level btrees 2690/2691 (needs catalog-btree descent insert; bootstrap
+    indexes never carried user functions — unchanged behavior); proallargtypes/proargmodes OUT-arg
+    columns. New TestPort_FunctionSurvivesRestart (create/replace/alter/drop across restart).
+    Gate: initdb 230s, server, regress 278s, isolation, durability ×3, pg_waldump + e2e failover —
+    green; grep-zero.
   - [ ] **B1.3 pg_sequence (catalog row only)** — definition moves to heap; counter state stays on kind 65.
   - [ ] **B1.3b** (optional / ledger) `XLOG_SEQ_LOG` flip for the sequence-relation counter page.
 - [ ] **B2** type/operator families (pg_type/enum/range, pg_operator, pg_opclass/opfamily/amop/amproc,

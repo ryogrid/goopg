@@ -193,6 +193,56 @@ func reloadUserSchemasFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog
 	return nil
 }
 
+// reloadUserRoutinesFromHeap is B1.2's pg_proc reload — the generic
+// heap-scan replacement for the retired replayFunctionDDLRecords scanner
+// (RecordKinds 61-64/121-123). Live rows with oid >= FirstUserOID carry the
+// full Routine metadata as JSON in proargdefaults (col 24, see
+// executor.DecodePGProcArgMeta) + the body in prosrc; builtins (the 3397
+// seed rows) stay compiled-in/seeded and are skipped by the OID filter.
+func reloadUserRoutinesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+	rs := cat.Routines()
+	if rs == nil {
+		return nil
+	}
+	type procRow struct {
+		r   *catalog.Routine
+		tid storage.ItemPointer
+	}
+	rel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 1255, Fork: storage.MainFork}
+	cols := executor.PGProcColumnsPG18()
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_proc",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			decoded := make(executor.Row, len(cols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, cols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			oid := uint32(decoded[0].Int)
+			if oid < catalog.FirstUserOID {
+				return nil, false, errSkipBuiltinRow
+			}
+			meta := decoded[23].StringValue() // proargdefaults: Routine JSON
+			body := decoded[25].StringValue() // prosrc
+			r, derr := executor.DecodePGProcArgMeta(meta, body)
+			if derr != nil {
+				return nil, false, derr
+			}
+			return procRow{r: r, tid: tid}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+	for _, raw := range rows {
+		pr := raw.(procRow)
+		rs.CreateDuringRecovery(pr.r)
+		rs.SetHeapTID(pr.r.OID, catalog.SchemaHeapTID{Block: uint32(pr.tid.Block), Offset: pr.tid.Offset})
+	}
+	return nil
+}
+
+// errSkipBuiltinRow marks reload rows filtered by policy (decode-level skip).
+var errSkipBuiltinRow = fmt.Errorf("catalog reload: builtin row skipped")
+
 // runCatalogReloads executes every descriptor in Slot order. Non-Fatal
 // descriptor errors are returned in aggregate form by the caller's logging
 // convention; Fatal ones abort immediately.

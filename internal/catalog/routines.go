@@ -153,6 +153,37 @@ type Routines struct {
 	byKey   map[string]*Routine // schema.name(argtypes) → routine
 	byName  map[string][]string // schema.name → list of overload keys
 	nextOID uint32
+
+	// heapTIDs maps routine OID → the routine's LIVE pg_proc heap-row TID
+	// (B1.2 TID-carrying cache, doc 02a §3.3): seeded by CREATE's heap
+	// INSERT and by the startup reload, refreshed by every ALTER's heap
+	// UPDATE, deleted with the routine.
+	heapTIDs map[uint32]SchemaHeapTID
+}
+
+// HeapTID returns the live pg_proc heap TID for the routine OID.
+func (rs *Routines) HeapTID(oid uint32) (SchemaHeapTID, bool) {
+	rs.mu.RLock()
+	defer rs.mu.RUnlock()
+	tid, ok := rs.heapTIDs[oid]
+	return tid, ok
+}
+
+// SetHeapTID records/refreshes the live pg_proc heap TID for oid.
+func (rs *Routines) SetHeapTID(oid uint32, tid SchemaHeapTID) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	if rs.heapTIDs == nil {
+		rs.heapTIDs = make(map[uint32]SchemaHeapTID)
+	}
+	rs.heapTIDs[oid] = tid
+}
+
+// DeleteHeapTID drops the TID entry (DROP FUNCTION).
+func (rs *Routines) DeleteHeapTID(oid uint32) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	delete(rs.heapTIDs, oid)
 }
 
 var (

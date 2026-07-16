@@ -6229,8 +6229,10 @@ func ApplyDeferredRoutineDrops(ctx *Context, sess *BasicSession) {
 				// without ever calling this — so logging here is inherently
 				// rollback-safe, unlike a log-at-statement-time approach
 				// would be for a deferred-to-commit drop.
-				if ctx.WAL != nil {
-					_, _, _ = ctx.WAL.Append(wal.EncodeDropFunction(d.Routine.OID))
+				if ctx.Pool != nil {
+					// B1.2: deferred-at-commit drop journals the pg_proc
+					// heap DELETE (bespoke record retired).
+					_ = deleteRoutineCatalogHeapRow(ctx, d.Routine.OID)
 				}
 			}
 		}
@@ -11358,52 +11360,6 @@ func (o *ddlOp) truncateTableAndPartitions(tbl *catalog.Table, pos int, only boo
 	return nil
 }
 
-// routineToCreateFunctionPayload converts a catalog.Routine into the WAL
-// wire format, shared by CREATE FUNCTION and CREATE PROCEDURE persistence.
-// Dependency-tracking fields (SequenceDeps/RoutineCallOIDs/TableDeps/
-// ColumnDeps) are intentionally NOT carried — see CreateFunctionPayload's
-// doc comment; the recovery driver recomputes them via ExtractRoutineDeps.
-func routineToCreateFunctionPayload(r *catalog.Routine) wal.CreateFunctionPayload {
-	args := make([]wal.FunctionArgPayload, len(r.ArgTypes))
-	for i, t := range r.ArgTypes {
-		a := wal.FunctionArgPayload{TypeName: t.Name, TypeArgs: t.Args}
-		if i < len(r.ArgNames) {
-			a.Name = r.ArgNames[i]
-		}
-		if i < len(r.ArgModes) {
-			a.Mode = r.ArgModes[i]
-		}
-		if i < len(r.ArgDefaults) {
-			a.Default = r.ArgDefaults[i]
-		}
-		args[i] = a
-	}
-	return wal.CreateFunctionPayload{
-		OID:             r.OID,
-		Schema:          r.Schema,
-		Name:            r.Name,
-		Args:            args,
-		ReturnTypeName:  r.ReturnType.Name,
-		ReturnTypeArgs:  r.ReturnType.Args,
-		ReturnsSet:      r.ReturnsSet,
-		ReturnsTable:    r.ReturnsTable,
-		Language:        r.Language,
-		Body:            r.Body,
-		Strict:          r.Strict,
-		Volatile:        r.Volatile,
-		Parallel:        r.Parallel,
-		Cost:            r.Cost,
-		Rows:            r.Rows,
-		SecurityDefiner: r.SecurityDefiner,
-		Leakproof:       r.Leakproof,
-		IsProcedure:     r.IsProcedure,
-		IsWindow:        r.IsWindow,
-		BeginAtomic:     r.BeginAtomic,
-		IsReturnForm:    r.IsReturnForm,
-		KindChar:        r.KindChar,
-		Config:          r.Config,
-	}
-}
 
 // walLogCreateRoutine WAL-logs a successful CREATE [OR REPLACE]
 // FUNCTION/PROCEDURE so it survives a restart (DU-002 restart-persistence
@@ -11412,11 +11368,14 @@ func routineToCreateFunctionPayload(r *catalog.Routine) wal.CreateFunctionPayloa
 // (Routines.Create always returns a non-nil routine on success, but a nil
 // WAL is common in embedded/test setups without a live WAL writer).
 func (o *ddlOp) walLogCreateRoutine(r *catalog.Routine) error {
-	if o.ctx.WAL == nil || r == nil {
+	// B1.2: journal the routine as a real pg_proc heap row (INSERT for a
+	// new OID, non-HOT xl_heap_update when OR REPLACE preserved it) —
+	// replaces the bespoke RecordKindCreateFunction record (retired).
+	if o.ctx.Pool == nil || r == nil {
 		return nil
 	}
-	if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateFunction(routineToCreateFunctionPayload(r))); werr != nil {
-		return fmt.Errorf("wal create-function: %w", werr)
+	if err := syncRoutineToCatalogHeap(o.ctx, r); err != nil {
+		return fmt.Errorf("create-function catalog heap: %w", err)
 	}
 	return nil
 }
@@ -11427,11 +11386,13 @@ func (o *ddlOp) walLogCreateRoutine(r *catalog.Routine) error {
 // removal, CASCADE-dependent drops, and (via ApplyDeferredRoutineDrops)
 // either statement's deferred-at-commit removal.
 func (o *ddlOp) walLogDropRoutine(oid uint32) error {
-	if o.ctx.WAL == nil {
+	// B1.2: journal the drop as a pg_proc heap DELETE (xl_heap_delete) —
+	// replaces the bespoke RecordKindDropFunction record (retired).
+	if o.ctx.Pool == nil {
 		return nil
 	}
-	if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropFunction(oid)); werr != nil {
-		return fmt.Errorf("wal drop-function: %w", werr)
+	if err := deleteRoutineCatalogHeapRow(o.ctx, oid); err != nil {
+		return fmt.Errorf("drop-function catalog heap: %w", err)
 	}
 	return nil
 }
@@ -12076,9 +12037,11 @@ func (o *ddlOp) execAlterFunction(s *parser.AlterFunctionStmt) error {
 			// resume point). No rollback-undo tracking exists for ALTER FUNCTION
 			// RENAME (same as ALTER EVENT TRIGGER RENAME), so logging immediately
 			// at mutation time is safe — matches the established precedent.
-			if o.ctx.WAL != nil {
-				if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterFunctionRename(oid, s.RenameTo)); werr != nil {
-					return fmt.Errorf("wal alter-function-rename: %w", werr)
+			_ = oid
+			// B1.2: journal via a pg_proc heap UPDATE of the mutated routine.
+			if o.ctx.Pool != nil {
+				if err := updateRoutineCatalogHeapRow(o.ctx, r); err != nil {
+					return fmt.Errorf("alter-function-rename catalog heap: %w", err)
 				}
 			}
 		}
@@ -12100,9 +12063,9 @@ func (o *ddlOp) execAlterFunction(s *parser.AlterFunctionStmt) error {
 		}
 		for _, r := range routines {
 			r.Owner = ownerOID
-			if o.ctx.WAL != nil {
-				if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterFunctionOwner(r.OID, ownerOID)); werr != nil {
-					return fmt.Errorf("wal alter-function-owner: %w", werr)
+			if o.ctx.Pool != nil {
+				if err := updateRoutineCatalogHeapRow(o.ctx, r); err != nil {
+					return fmt.Errorf("alter-function-owner catalog heap: %w", err)
 				}
 			}
 		}
@@ -12115,9 +12078,10 @@ func (o *ddlOp) execAlterFunction(s *parser.AlterFunctionStmt) error {
 			if err := rs.SetSchema(r, s.NewSchema); err != nil {
 				return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
 			}
-			if o.ctx.WAL != nil {
-				if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterFunctionSetSchema(oid, s.NewSchema)); werr != nil {
-					return fmt.Errorf("wal alter-function-set-schema: %w", werr)
+			_ = oid
+			if o.ctx.Pool != nil {
+				if err := updateRoutineCatalogHeapRow(o.ctx, r); err != nil {
+					return fmt.Errorf("alter-function-set-schema catalog heap: %w", err)
 				}
 			}
 		}
@@ -12154,14 +12118,11 @@ func (o *ddlOp) execAlterFunction(s *parser.AlterFunctionStmt) error {
 		// resume point): log the full post-mutation snapshot of the four
 		// mutable attributes, not just the clause(s) this statement touched —
 		// simpler to replay and always reflects the routine's actual state.
-		if o.ctx.WAL != nil {
-			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterFunctionFlags(r.OID, r.Volatile, r.SecurityDefiner, r.Leakproof, r.Strict)); werr != nil {
-				return fmt.Errorf("wal alter-function-flags: %w", werr)
-			}
-			if len(s.ConfigOps) > 0 {
-				if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterFunctionConfig(r.OID, r.Config)); werr != nil {
-					return fmt.Errorf("wal alter-function-config: %w", werr)
-				}
+		// B1.2: one pg_proc heap UPDATE carries the full post-mutation row
+		// (flags AND config together — the row rebuild is total by design).
+		if o.ctx.Pool != nil {
+			if err := updateRoutineCatalogHeapRow(o.ctx, r); err != nil {
+				return fmt.Errorf("alter-function catalog heap: %w", err)
 			}
 		}
 	}
