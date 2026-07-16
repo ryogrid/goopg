@@ -137,11 +137,15 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
     xid=0 for bootstrap/catalog in default tablespace = routing-safe); wired heap/TOAST/mirror + index build
     (`btree.Options.CreateXID`, `BulkCreateWithXID`/`CreateWithXID`) to `ctx.Tx.XID`. Gates: crash-recovery
     (230s), e2e ×3, isolation (real), regress (284s).
-  - [ ] **A9-clog-truncate** — remaining. PG's `xl_clog_truncate` (pageno int64 / oldestXact / oldestXactDb)
-    carries `xl_xid=0` (confirmed: clog.c `WriteTruncateXlogRec`), so the xid-routing trick does NOT apply —
-    it needs the size-check disambiguation instead (native `RecordKindClogTruncate` body = 5 bytes vs PG's 16).
-    Also widen the body + thread `oldestXactDb` (datoid) through `SetTruncateLogger`, and add a `RmgrCLOG`
-    decoded arm + initdb xact-recovery scanner update. → deferral ledger.
+  - [x] **A9-clog-truncate** — LANDED. `EncodeClogTruncatePG` (RM_CLOG/CLOG_TRUNCATE): 16-byte
+    `xl_clog_truncate{pageno,oldestXact,oldestXactDb}`, `xl_xid=0` (PG's `WriteTruncateXlogRec` carries none).
+    Since xid=0 can't drive routing, `nativeHeaderMatchesMainData` gained a **native-size guard**
+    (`nativeFixedRecordSize`): a same-classified main-data-only record whose length ≠ the native fixed size
+    (ClogTruncate=5, SmgrCreate=10) routes to the decoded path — resolving the pageno-byte-≡-33 collision
+    (test-proven). New `RmgrCLOG` decoded arm = physical no-op; the initdb `replayCLogFromWAL` scan got a
+    PG-format branch (`DecodeXLogClogTruncate`) that re-applies the idempotent truncation. `oldestXactDb`
+    stamped 0 (datoid threading through `SetTruncateLogger` is a follow-up — goopg redo uses only
+    pageno+oldestXact). Gates: crash-recovery (217s), e2e ×3, isolation, regress (278s).
   - [ ] **A9-checkpoint-opcode** — DEFERRED (hot-standby entanglement). Body is already the 88-byte PG
     `CheckPoint`; the gap is that `classifyXLogRecord` tags it by `len==88`→SHUTDOWN and never emits ONLINE.
     Changing this is risky: the shutdown opcode is load-bearing for `PMSIGNAL_BEGIN_HOT_STANDBY` readiness
@@ -172,6 +176,17 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
   `information_schema` parity vs PG 18.3; crash-after-DDL recovery via generic reload; re-init data dir.
 
 ---
+
+## Log (A9 — clog-truncate landed via native-size routing)
+- 2026-07-16: **A9-clog-truncate landed — CLOG truncation is now a PG `RM_CLOG`/`CLOG_TRUNCATE` record.**
+  PG's `xl_clog_truncate` carries `xl_xid=0`, so (unlike smgr-create) the xid can't disambiguate routing;
+  instead `nativeHeaderMatchesMainData` grew a `nativeFixedRecordSize` guard that rejects a same-classified
+  main-data-only record whose length differs from the native fixed size (ClogTruncate=5 vs PG's 16,
+  SmgrCreate=10 vs 16) — blast radius exactly those two kinds. New `RmgrCLOG` decoded arm (physical no-op) +
+  a PG-format branch in `replayCLogFromWAL` (initdb) that decodes the body and re-applies the idempotent
+  truncation. `oldestXactDb` = 0 stopgap (datoid plumb is a follow-up). Gates green (crash-recovery 217s,
+  regress 278s). **A9 status: fpi + smgr-create + clog-truncate LANDED; remaining = checkpoint-opcode
+  (hot-standby-entangled), xact-inval-fold, legacy-frame-retire.**
 
 ## Log (A9 — smgr-create landed via xid-plumbing)
 - 2026-07-16: **A9-smgr-create landed — relation-file creation is now a PG `RM_SMGR`/`XLOG_SMGR_CREATE`
