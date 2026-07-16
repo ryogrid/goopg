@@ -120,8 +120,8 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
     opaque flags). No flip needed.
   > Note: btree structural records already replay correctly for goopg↔goopg via their native bodies; the flip
   > is for PG-parseability / real-PG-standby. FPI-based records carry no incremental main-data (PG deviation).
-- [~] **A9** smgr/clog/standalone-FPI/checkpoint-opcode/xact chunks; retire legacy native frame — **FPI LANDED**;
-  rest deferred (each has a specific complexity, per below).
+- [~] **A9** smgr/clog/standalone-FPI/checkpoint-opcode/xact chunks; retire legacy native frame — **ALL LANDED
+  except checkpoint-opcode (deferred, hot-standby entanglement — the one remaining A9 item)**.
   - [x] **A9-fpi** — standalone first-touch FPI (`Pool.maybeEmitFPI`) → PG `RM_XLOG`/`XLOG_FPI` via
     `EncodePageImagePG` (block-0 apply-image, hole removed). Replay routes the empty-payload case to
     `replayDecodedXLogHeapFPIBlocks` (the arm previously NO-OPed it — fixed together). `predictXLogRecordLen`
@@ -151,12 +151,21 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
     Changing this is risky: the shutdown opcode is load-bearing for `PMSIGNAL_BEGIN_HOT_STANDBY` readiness
     (format.go:222). Resume: route via `framePGAssembled(RmgrXLog, online|shutdown)`, plumb the kind +
     `oldestActiveXid` from the checkpointer, drop the `len==88` hack, re-verify hot-standby bring-up.
-  - [ ] **A9-xact-inval-fold** — retire standalone `RecordKindXactCommitInval` by emitting invals as A6's
-    `HAS_INVALS` chunk on `xl_xact_commit` (mechanism exists: `xactCommitCarriesInvals`). Touches the commit
-    path — do carefully. → follow-up.
-  - [ ] **A9-legacy-frame-retire** — delete `encodeRecord`/`decodeRecord` (IEEE-CRC frame, `format.go:109`)
-    once `PageHeaders` is unconditional (already `true` in prod; legacy path only serves `PageHeaders=false`
-    test clusters). Large mechanical change across writer/reader/iterator + `reader_torn_tail_test.go`. Do LAST.
+  - [x] **A9-xact-inval-fold** — LANDED (d02f7d91). Standalone `RecordKindXactCommitInval` (byte 32) deleted;
+    invals ride A6's `HAS_INVALS` chunk on `xl_xact_commit` (`xactCommitCarriesInvals` was already the live
+    path — the standalone record was dead weight). Native replay case, `DecodeXactMarker` arm, native-kind-set
+    entry, initdb scanner arms and their tests all removed;
+    `TestApplyRecordXactCommitInvalUnlinksInitFiles` migrated to `EncodeXactCommitPG(xid, true)`.
+  - [x] **A9-legacy-frame-retire** — LANDED (81d850bc). `encodeRecord`/`decodeRecord` (IEEE-CRC 8-byte frame)
+    deleted; Config normalization forces `PageHeaders=true` (+`TimelineID=1` default) so every writer emits the
+    PG frame. Legacy dirs rejected by NewWriter (`ErrWALFormatMismatch`) and ReadAll — re-init required.
+    `waitInsertionsToFinish` gained a written-frontier guard (atomic `writeLSNMirror` only; a plain
+    `s.writeLSN` read raced appendPGCompat under `-race`) so `FlushUpTo(unwritten)` returns
+    `ErrLSNNotWritten` instead of spinning. Legacy-sized tests migrated: retention fills segments by observed
+    end-LSN (512-byte segs), discover-checkpoint uses page-aligned segs + stripe path (records never straddle
+    retained-segment starts), buffer round-trip reads decoded-path bodies from `XLog.MainData`
+    (payload[0]=11 ≡ SmgrCreate fails the native-size guard by design), format-mismatch seeds legacy bytes by
+    hand. Gates: wal unit+race, initdb crash-recovery, pg_waldump ×2, real-PG failover async+sync GREEN.
   - [x] **A9-INIT_PAGE** — first heap insert on an empty page now stamps `XLOG_HEAP_INIT_PAGE` (0x80) +
     `REGBUF_WILL_INIT` (`markHeapInsertDirty` computes `initPage = pageLinePointerCount==1`;
     `EncodeHeapInsertPG` sets the info bit + block WILL_INIT). This is what lets a **real PG18 standby build
@@ -187,6 +196,18 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
   `information_schema` parity vs PG 18.3; crash-after-DDL recovery via generic reload; re-init data dir.
 
 ---
+
+## Log (A9 — legacy frame retired; A9 complete except checkpoint-opcode)
+- 2026-07-16: **A9-legacy-frame-retire landed (81d850bc)** — goopg WAL now has exactly ONE on-disk format:
+  the PG-compat page-headered XLogRecord stream. −730/+256 lines. Two behavioural pins worth remembering:
+  (1) the stripe path confines each record to one segment (pads + relocates at boundaries) while the slow
+  path emits true cross-segment contrecords — post-retention reads therefore need stripe-path writers and
+  page-aligned segment sizes in tests; (2) the PG frame's conservative ring reservation is
+  2*(paddedLen+64), so WALBuffers caps below ~1 KiB force every append onto the direct-write bypass.
+  A `-race`-only regression was caught by the gate: the first version of the FlushUpTo unwritten-LSN guard
+  read `s.writeLSN` (state-loop-owned) — rewritten to consult only the atomic `writeLSNMirror`.
+  **A9 status: everything landed except checkpoint-opcode (deferred, hot-standby-entangled, byte-identical
+  no-op for the stream).**
 
 ## Log (A9 — clog-truncate landed via native-size routing)
 - 2026-07-16: **A9-clog-truncate landed — CLOG truncation is now a PG `RM_CLOG`/`CLOG_TRUNCATE` record.**
