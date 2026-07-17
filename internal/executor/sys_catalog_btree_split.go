@@ -83,6 +83,14 @@ func keyMetaForSysBtree(indexOID uint32) (btreeIndexKeyMeta, bool) {
 		return btreeIndexKeyMeta{tupleSize: 16, nkeyatts: 1}, true
 	case pgTypeTypnameNspIndexOID:
 		return btreeIndexKeyMeta{tupleSize: 80, nkeyatts: 2}, true
+	// B2.1d: pg_enum — all three bootstrap as empty metapage-only
+	// placeholders (no builtin enums); the runtime lazily roots them.
+	case pgEnumOidIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 16, nkeyatts: 1}, true
+	case pgEnumTypidLabelIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 80, nkeyatts: 2}, true
+	case pgEnumTypidSortOrderIndexID:
+		return btreeIndexKeyMeta{tupleSize: 16, nkeyatts: 2}, true
 	// B2.1c: pg_range — both bootstrap as populated leaf-roots (6 builtin
 	// range rows each).
 	case pgRangeRngtypidIndexOID:

@@ -361,3 +361,63 @@ func TestPort_RangeTypeSurvivesRestart(t *testing.T) {
 		t.Fatalf("post-restart pg_range row count = %q, want 1", got)
 	}
 }
+
+// TestPort_EnumSurvivesRestart pins B2.1d's pg_enum heap journaling: enums
+// previously had NO restart durability at all (labels lived only in the
+// in-memory registry). CREATE TYPE AS ENUM / ADD VALUE / RENAME VALUE all
+// reload from the pg_type + pg_enum heaps.
+func TestPort_EnumSurvivesRestart(t *testing.T) {
+	c, err := cluster.New("enum-durability", cluster.Options{
+		RepoRoot:     repoRoot(t),
+		DataDir:      filepath.Join(t.TempDir(), "data"),
+		StartupWait:  20 * time.Second,
+		ShutdownWait: 20 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+
+	if err := runSQLSimple(t, c, "CREATE TYPE b21d_mood AS ENUM ('sad', 'ok', 'happy')"); err != nil {
+		t.Fatalf("CREATE TYPE AS ENUM: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER TYPE b21d_mood ADD VALUE 'ecstatic' AFTER 'happy'"); err != nil {
+		t.Fatalf("ADD VALUE: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER TYPE b21d_mood RENAME VALUE 'ok' TO 'fine'"); err != nil {
+		t.Fatalf("RENAME VALUE: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TYPE b21d_gone AS ENUM ('x')"); err != nil {
+		t.Fatalf("CREATE b21d_gone: %v", err)
+	}
+	if err := runSQLSimple(t, c, "DROP TYPE b21d_gone"); err != nil {
+		t.Fatalf("DROP TYPE: %v", err)
+	}
+
+	if err := c.Stop(cluster.ShutdownFast); err != nil {
+		t.Fatalf("stop cluster: %v", err)
+	}
+	if err := c.Start(); err != nil {
+		t.Fatalf("restart cluster: %v", err)
+	}
+
+	if got := queryScalar(t, c, "SELECT 'happy'::b21d_mood"); got != "happy" {
+		t.Fatalf("post-restart enum cast = %q, want happy (enum not reloaded)", got)
+	}
+	if got := queryScalar(t, c, "SELECT 'ecstatic'::b21d_mood"); got != "ecstatic" {
+		t.Fatalf("post-restart added value = %q, want ecstatic (ADD VALUE not durable)", got)
+	}
+	if got := queryScalar(t, c, "SELECT 'fine'::b21d_mood"); got != "fine" {
+		t.Fatalf("post-restart renamed value = %q, want fine (RENAME VALUE not durable)", got)
+	}
+	if err := runSQLSimple(t, c, "SELECT 'ok'::b21d_mood"); err == nil {
+		t.Fatal("post-restart old label 'ok' still accepted (rename left stale row)")
+	}
+	if got := queryScalar(t, c, "SELECT count(*) FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid WHERE t.typname = 'b21d_mood'"); got != "4" {
+		t.Fatalf("post-restart pg_enum row count = %q, want 4", got)
+	}
+	if got := queryScalar(t, c, "SELECT count(*) FROM pg_type WHERE typname = 'b21d_gone'"); got != "0" {
+		t.Fatalf("post-restart dropped enum pg_type count = %q, want 0", got)
+	}
+}

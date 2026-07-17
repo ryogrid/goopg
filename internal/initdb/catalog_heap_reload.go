@@ -9,6 +9,7 @@ package initdb
 
 import (
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 
@@ -590,6 +591,91 @@ func reloadUserRangeTypesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, c
 			MultirangeArrayOID: multiT.arrayOID,
 			MultirangeName:     multiT.name,
 			Owner:              rangeT.owner,
+		})
+	}
+	return nil
+}
+
+// reloadUserEnumsFromHeap is B2.1d's enum reload — enums previously had NO
+// restart durability at all (labels lived only in the in-memory registry;
+// no WAL record, no scanner). The enum skeleton comes from its pg_type row
+// (typtype='e', oid >= FirstUserOID); its labels come from the pg_enum heap
+// rows grouped by enumtypid, ordered by enumsortorder.
+func reloadUserEnumsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+	enumCols := executor.PGEnumColumnsPG18()
+	type labelRow struct {
+		oid   uint32
+		typid uint32
+		sort  float64
+		label string
+	}
+	rel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 3501, Fork: storage.MainFork}
+	labels, err := scanCatalogHeapRows(mgr, rel, clog, "pg_enum",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			decoded := make(executor.Row, len(enumCols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, enumCols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			if uint32(decoded[0].Int) < catalog.FirstUserOID {
+				return nil, false, errSkipBuiltinRow
+			}
+			// enumsortorder rides the "xid" encode-hint: LE uint32 carrying
+			// IEEE-754 float32 bits (see executor.PGEnumColumnsPG18).
+			sort := float64(math.Float32frombits(uint32(decoded[2].Int)))
+			return labelRow{
+				oid:   uint32(decoded[0].Int),
+				typid: uint32(decoded[1].Int),
+				sort:  sort,
+				label: decoded[3].StringValue(),
+			}, false, nil
+		})
+	if err != nil || len(labels) == 0 {
+		return err
+	}
+	byType := make(map[uint32][]labelRow)
+	for _, raw := range labels {
+		lr := raw.(labelRow)
+		byType[lr.typid] = append(byType[lr.typid], lr)
+	}
+
+	typeCols := executor.PGTypeColumnsPG18()
+	typeRel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: catalog.TypeRelationId, Fork: storage.MainFork}
+	typeRows, err := scanCatalogHeapRows(mgr, typeRel, clog, "pg_type",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			decoded := make(executor.Row, len(typeCols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, typeCols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			oid := uint32(decoded[0].Int)
+			if oid < catalog.FirstUserOID || decoded[6].StringValue() != "e" {
+				return nil, false, errSkipBuiltinRow
+			}
+			return [4]any{oid, decoded[1].StringValue(), uint32(decoded[14].Int), uint32(decoded[3].Int)}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+	for _, raw := range typeRows {
+		tr := raw.([4]any)
+		oid := tr[0].(uint32)
+		lrs := byType[oid]
+		if len(lrs) == 0 {
+			continue
+		}
+		sort.Slice(lrs, func(i, j int) bool { return lrs[i].sort < lrs[j].sort })
+		values := make([]catalog.EnumValue, len(lrs))
+		for i, lr := range lrs {
+			values[i] = catalog.EnumValue{Label: lr.label, SortOrder: lr.sort, OID: lr.oid}
+		}
+		cat.RegisterEnumDuringRecovery(&catalog.EnumType{
+			Name:     tr[1].(string),
+			OID:      oid,
+			ArrayOID: tr[2].(uint32),
+			Values:   values,
+			Owner:    tr[3].(uint32),
+			DBOid:    cat.DBOID(),
 		})
 	}
 	return nil

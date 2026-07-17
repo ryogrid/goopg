@@ -333,9 +333,20 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
     pg_proc.dat-verified). e2e failover: goopg CREATE TYPE AS RANGE → promoted PG executes
     '[1,5)'::public.b2prep_rng (RANGETYPE syscache → runtime 3542 entry → pg_range row).
     New TestPort_RangeTypeSurvivesRestart; waldump workload += range create/rename/drop.
-  - [ ] **B2.1d enum labels** — pg_enum heap rows + 3502/3503/3534 entries; enum registry reload
-    (TODAY enums have NO restart durability at all — labels live only in memory); ALTER TYPE ADD
-    VALUE becomes a real pg_enum INSERT.
+  - [x] **B2.1d enum labels** — LANDED. Enums are restart-durable for the FIRST time. Every label
+    owns a real pg_enum heap row (sys_pg_enum.go) + entries in 3502/3503/3534 (all lazily rooted
+    from empty placeholders); EnumValue gained a persisted OID (the virtual pg_enum view now
+    renders real label OIDs instead of synthetic 20000+i). CREATE = one INSERT per label; ADD
+    VALUE = INSERT; RENAME VALUE = delete+insert (stable OID); enum RENAME/OWNER resync pg_type
+    via TypeHeapTID; DROP stamps all label rows. Reload = reloadUserEnumsFromHeap (pg_type
+    typtype='e' + pg_enum grouped by enumtypid, sorted by sortorder) + RegisterEnumDuringRecovery.
+    **enumsortorder encoding pin**: goopg's shared float4 encoder writes TEXT VARLENA
+    (M0111-0002), which shifted enumlabel under PG's attlen=4 TupleDesc (e2e read "ppy" for
+    "happy"; pg_proc's float4s only survive by pad-back-to-4 luck before 4-aligned columns) —
+    pg_enum encodes sortorder via the "xid" encode-hint carrying IEEE-754 float32 BITS =
+    byte-identical to a real PG float4 on disk. e2e failover: promoted PG casts
+    'happy'::public.b2prep_mood (enum_in → 3503 → goopg's runtime rows). New
+    TestPort_EnumSurvivesRestart (create/add/rename/drop across restart); waldump += enum DDL.
 - [ ] **B3** extension/config (pg_ts_*, pg_transform, pg_event_trigger, pg_publication*/subscription*,
   pg_statistic_ext, pg_constraint/attrdef/depend).
 - [ ] **B4** shared catalogs in `global/` (pg_database, pg_authid/auth_members, pg_tablespace,

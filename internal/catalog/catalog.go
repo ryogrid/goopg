@@ -2850,6 +2850,10 @@ type CommentRow struct {
 type EnumValue struct {
 	Label     string
 	SortOrder float64
+	// OID is this label's pg_enum row OID (B2.1d): allocated at CREATE TYPE
+	// AS ENUM / ADD VALUE, preserved across restart by the pg_enum heap
+	// reload. 0 only on registrations that predate the heap conversion.
+	OID uint32
 }
 
 // EnumType holds one user-defined enum type. M0097-0017.
@@ -8315,8 +8319,12 @@ func (c *InMemory) registerSystemTables() {
 		for _, name := range names {
 			et := c.enumTypes[name]
 			for _, ev := range et.Values {
+				rowOID := oid
+				if ev.OID != 0 { // B2.1d: labels carry real pg_enum row OIDs
+					rowOID = int(ev.OID)
+				}
 				rows = append(rows, []string{
-					fmt.Sprintf("%d", oid),
+					fmt.Sprintf("%d", rowOID),
 					fmt.Sprintf("%d", et.OID),
 					strconv.FormatFloat(ev.SortOrder, 'f', -1, 32),
 					ev.Label,
@@ -20119,8 +20127,36 @@ func (c *InMemory) RegisterEnum(name string, values []string, dbOid ...uint32) (
 		DBOid:    oid,
 	}
 	c.nextOID += 2
+	// B2.1d: every label owns a pg_enum row OID.
+	for i := range et.Values {
+		et.Values[i].OID = c.nextOID
+		c.nextOID++
+	}
 	c.enumTypes[enumKey(oid, k)] = et
 	return et, nil
+}
+
+// RegisterEnumDuringRecovery re-registers an enum reconstructed at startup
+// from its pg_type + pg_enum heap rows (B2.1d), preserving its original
+// OID/ArrayOID/label OIDs and advancing nextOID past them. Keys under
+// et.DBOid (the reload passes cat.DBOID() — see RegisterDomainDuringRecovery's
+// identical convention); zero falls back to DefaultDBOid.
+func (c *InMemory) RegisterEnumDuringRecovery(et *EnumType) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.enumTypes == nil {
+		c.enumTypes = make(map[string]*EnumType)
+	}
+	out := *et
+	if out.DBOid == 0 {
+		out.DBOid = DefaultDBOid
+	}
+	c.enumTypes[enumKey(out.DBOid, strings.ToLower(et.Name))] = &out
+	c.advanceNextOIDLocked(et.OID)
+	c.advanceNextOIDLocked(et.ArrayOID)
+	for _, ev := range et.Values {
+		c.advanceNextOIDLocked(ev.OID)
+	}
 }
 
 // LookupEnum finds an enum type by name (case-insensitive), scoped to dbOid
@@ -20428,7 +20464,7 @@ func (c *InMemory) AddEnumValueResult(name, value string, ifNotExists bool, befo
 					}
 					newSortOrder = float64(mid32)
 				}
-				newEV := EnumValue{Label: value, SortOrder: newSortOrder}
+				newEV := EnumValue{Label: value, SortOrder: newSortOrder, OID: c.allocOIDLocked()}
 				newVals := make([]EnumValue, 0, len(et.Values)+1)
 				newVals = append(newVals, et.Values[:i]...)
 				newVals = append(newVals, newEV)
@@ -20456,7 +20492,7 @@ func (c *InMemory) AddEnumValueResult(name, value string, ifNotExists bool, befo
 					}
 					newSortOrder = float64(mid32)
 				}
-				newEV := EnumValue{Label: value, SortOrder: newSortOrder}
+				newEV := EnumValue{Label: value, SortOrder: newSortOrder, OID: c.allocOIDLocked()}
 				newVals := make([]EnumValue, 0, len(et.Values)+1)
 				newVals = append(newVals, et.Values[:i+1]...)
 				newVals = append(newVals, newEV)
@@ -20474,7 +20510,7 @@ func (c *InMemory) AddEnumValueResult(name, value string, ifNotExists bool, befo
 		} else {
 			newSortOrder = et.Values[len(et.Values)-1].SortOrder + 1
 		}
-		et.Values = append(et.Values, EnumValue{Label: value, SortOrder: newSortOrder})
+		et.Values = append(et.Values, EnumValue{Label: value, SortOrder: newSortOrder, OID: c.allocOIDLocked()})
 	}
 	return false, nil
 }

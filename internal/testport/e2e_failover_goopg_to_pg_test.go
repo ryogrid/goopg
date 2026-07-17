@@ -350,6 +350,13 @@ func runFailoverGoopgToPG(t *testing.T, repo, pgBasebackupBin, psqlBin string, m
 		"SELECT 'public.b2prep_mood'::regtype::text"); got != "b2prep_mood" {
 		t.Fatalf("post-failover enum type resolution = %q, want b2prep_mood", got)
 	}
+	// B2.1d: enum VALUES are now real pg_enum heap rows — enum_in on the
+	// promoted PG resolves the label via 3503 (typid+label) from goopg's
+	// runtime-written rows.
+	if got := pgScalar(t, standby,
+		"SELECT 'happy'::public.b2prep_mood::text"); got != "happy" {
+		t.Fatalf("post-failover enum value cast = %q, want happy", got)
+	}
 	// B2.1b: the goopg-created domain must be resolvable AND usable in a
 	// cast on the promoted PG (pg_type heap row + typbasetype resolution).
 	if got := pgScalar(t, standby,

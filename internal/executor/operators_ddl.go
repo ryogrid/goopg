@@ -12818,10 +12818,19 @@ func syncEnumTypeToCatalogHeap(ctx *Context, et *catalog.EnumType) {
 	if err := writeTypeHeapRowWithIndexes(ctx, buildUserPGTypeRowForEnumArray(et)); err != nil {
 		return
 	}
+	// B2.1d: one pg_enum heap row per label (+ 3502/3503/3534 entries) —
+	// the labels' journal AND the reload's source (enums previously had no
+	// restart durability at all).
+	for _, ev := range et.Values {
+		if err := writeEnumLabelRow(ctx, et, ev); err != nil {
+			return
+		}
+	}
 	// Mirror pg_type to the postgres database (DBOid=5) so sessions using
 	// the postgres db can find the new type row via SeqScan. This mirrors
 	// the pattern used by syncTableToCatalogHeap. M0097-0022.
 	mirrorTypeCatalogFiles(ctx)
+	mirrorEnumCatalogFiles(ctx)
 }
 
 // writeTypeHeapRowWithIndexes writes one pg_type heap row and maintains
@@ -18942,6 +18951,22 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 	if s.RenameOldValue != "" {
 		err := cat.RenameEnumValue(s.Name, s.RenameOldValue, s.RenameNewValue, o.ctx.CurrentDatabaseOid)
 		if err == nil {
+			// B2.1d: re-journal the renamed label's pg_enum row (delete +
+			// insert — the label OID is stable, only enumlabel changed).
+			if et, ok := cat.LookupEnum(s.Name, o.ctx.CurrentDatabaseOid); ok && catalogHeapSyncAvailable(o.ctx) {
+				for _, ev := range et.Values {
+					if ev.Label != s.RenameNewValue {
+						continue
+					}
+					if o.ctx.MaterializeWriterXID() == nil {
+						deleteEnumLabelRowByOID(o.ctx, ev.OID, o.ctx.Tx.XID)
+						if writeEnumLabelRow(o.ctx, et, ev) == nil {
+							mirrorEnumCatalogFiles(o.ctx)
+						}
+					}
+					break
+				}
+			}
 			return nil
 		}
 		switch e := err.(type) {
@@ -18979,6 +19004,7 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 		if err != nil {
 			return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 		}
+		o.resyncEnumHeapAfterAlter(cat, s.RenameTo)
 		if o.ctx.Session != nil && o.ctx.Session.TracksDDLUndo() {
 			oldK := strings.ToLower(s.Name)
 			newK := strings.ToLower(s.RenameTo)
@@ -19020,6 +19046,7 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 		if !cat.SetEnumOwner(s.Name, ownerOID, o.ctx.CurrentDatabaseOid) {
 			return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("type %q does not exist", s.Name)}
 		}
+		o.resyncEnumHeapAfterAlter(cat, s.Name)
 		return nil
 	}
 	if s.AddValue == "" {
@@ -19027,6 +19054,19 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 	}
 	skipped, err := cat.AddEnumValueResult(s.Name, s.AddValue, s.IfNotExists, s.Before, s.After, o.ctx.CurrentDatabaseOid)
 	if err == nil {
+		// B2.1d: journal the new label as a pg_enum heap INSERT.
+		if !skipped && catalogHeapSyncAvailable(o.ctx) {
+			if et, ok := cat.LookupEnum(s.Name, o.ctx.CurrentDatabaseOid); ok {
+				for _, ev := range et.Values {
+					if ev.Label == s.AddValue {
+						if writeEnumLabelRow(o.ctx, et, ev) == nil {
+							mirrorEnumCatalogFiles(o.ctx)
+						}
+						break
+					}
+				}
+			}
+		}
 		if skipped {
 			// IF NOT EXISTS with existing label: emit NOTICE, continue.
 			o.ctx.AddNotice(fmt.Sprintf("enum label %q already exists, skipping", s.AddValue))
@@ -19173,8 +19213,12 @@ func (o *ddlOp) execDropType(s *parser.DropTypeStmt) error {
 				deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, et.OID, o.ctx.Tx.XID)
 				// Also stamp the auto-generated array type row (`_name`). DU-002 slice 89.
 				deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, et.ArrayOID, o.ctx.Tx.XID)
-				// Mirror pg_type to postgres db so the xmax stamp is visible via SeqScan.
-				_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.TypeRelationId)
+				// B2.1d: the enum's pg_enum label rows die with it.
+				deleteEnumLabelRowsByTypid(o.ctx, et.OID, o.ctx.Tx.XID)
+				// Mirror pg_type + pg_enum to postgres db so the xmax stamps
+				// are visible via SeqScan / the reload.
+				mirrorTypeCatalogFiles(o.ctx)
+				mirrorEnumCatalogFiles(o.ctx)
 			}
 		}
 		enumErr := cat.DropEnum(n, s.Cascade, o.ctx.CurrentDatabaseOid)
@@ -19474,6 +19518,27 @@ func (o *ddlOp) resyncRangeHeapAfterAlter(cat *catalog.InMemory, name string) {
 		return
 	}
 	if err := updateTypeHeapRowWithIndexes(o.ctx, buildUserPGTypeRowForMultirangeArray(rt)); err != nil {
+		return
+	}
+	mirrorTypeCatalogFiles(o.ctx)
+}
+
+// resyncEnumHeapAfterAlter journals a successful ALTER TYPE (enum
+// rename/owner) as non-HOT pg_type heap updates of the enum + array rows
+// via the TID cache (B2.1d). The pg_enum label rows are keyed by the stable
+// type OID and need no change. Best-effort like syncEnumTypeToCatalogHeap.
+func (o *ddlOp) resyncEnumHeapAfterAlter(cat *catalog.InMemory, name string) {
+	if !catalogHeapSyncAvailable(o.ctx) {
+		return
+	}
+	et, ok := cat.LookupEnum(name, o.ctx.CurrentDatabaseOid)
+	if !ok {
+		return
+	}
+	if err := updateTypeHeapRowWithIndexes(o.ctx, buildUserPGTypeRowForEnum(et)); err != nil {
+		return
+	}
+	if err := updateTypeHeapRowWithIndexes(o.ctx, buildUserPGTypeRowForEnumArray(et)); err != nil {
 		return
 	}
 	mirrorTypeCatalogFiles(o.ctx)

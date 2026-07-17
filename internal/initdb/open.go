@@ -2056,6 +2056,16 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// scan, doc 02a §2) — replaced replayRangeTypeDDLRecords' bespoke WAL
 	// scan (RecordKinds 81/82/117/118, retired).
 	if cat != nil {
+		// B2.1d: enums reload from the pg_type + pg_enum heaps — enums
+		// previously had NO restart durability at all. Runs BEFORE the
+		// domain reload so an enum-based domain could resolve its base in
+		// a future slice.
+		if err := reloadUserEnumsFromHeap(mgr, cat, clog); err != nil {
+			_ = pool.Close()
+			_ = walWriter.Close()
+			_ = mgr.Close()
+			return nil, fmt.Errorf("goopg: enum heap reload: %w", err)
+		}
 		if err := reloadUserRangeTypesFromHeap(mgr, cat, clog); err != nil {
 			_ = pool.Close()
 			_ = walWriter.Close()
