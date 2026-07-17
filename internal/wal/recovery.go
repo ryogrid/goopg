@@ -433,28 +433,6 @@ const (
 	//   kind(1) | typeLen(2) | type(typeLen bytes) | langLen(2) | lang(langLen bytes)
 	RecordKindDropTransform byte = 37
 
-	// RecordKindCreateCast records a `CREATE CAST (source AS target) ...`
-	// event so the catalog's in-memory cast registry (catalog.InMemory.casts,
-	// which backs the pg_cast virtual view) survives a restart. Like CREATE
-	// TRANSFORM, CREATE CAST is a catalog-only side effect with no
-	// per-object on-disk file namespace, so the physical redo path is a
-	// no-op (applyRecord returns (false, nil)); the recovery driver in
-	// internal/initdb/cast_ddl_recovery.go scans the WAL for these records
-	// after physical replay and re-registers each cast with its original
-	// OID. Mirrors RecordKindCreateTransform (M0119-0004). DU-002
-	// restart-persistence follow-up.
-	// Format:
-	//   kind(1) | oid(4) | funcOID(4) | context(1) | method(1) | sourceLen(2) | source(sourceLen bytes) | targetLen(2) | target(targetLen bytes)
-	RecordKindCreateCast byte = 38
-
-	// RecordKindDropCast records a `DROP CAST (source AS target)` event.
-	// Counterpart to RecordKindCreateCast; the recovery driver removes the
-	// (source, target) pair from the catalog instead of adding it. The
-	// OID/funcOID/context/method are not needed on drop.
-	// Format:
-	//   kind(1) | sourceLen(2) | source(sourceLen bytes) | targetLen(2) | target(targetLen bytes)
-	RecordKindDropCast byte = 39
-
 	// RecordKindCreateConversion records a `CREATE [DEFAULT] CONVERSION
 	// <name> FOR <src> TO <dest> FROM <func>` event so the catalog's
 	// in-memory conversion registry (catalog.InMemory.userConversions, which
@@ -467,7 +445,7 @@ const (
 	// its original OID. Unlike casts/transforms, a conversion is
 	// schema-scoped, so replay of this record must happen after schema
 	// replay (replaySchemaDDLRecords) has repopulated the schema OID map.
-	// Mirrors RecordKindCreateCast (M0119-0004). DU-002 restart-persistence
+	// Mirrors the retired RecordKindCreateCast (B2.2a). DU-002 restart-persistence
 	// follow-up.
 	// Format:
 	//   kind(1) | oid(4) | ownerOID(4) | funcOID(4) | forEncoding(4) | toEncoding(4) | defaultFlag(1) |
@@ -3191,122 +3169,6 @@ func DecodeDropTransform(payload []byte) (typeName, lang string, err error) {
 	}
 	lang = string(payload[off : off+langLen])
 	return typeName, lang, nil
-}
-
-// EncodeCreateCast encodes a CREATE CAST event (DU-002 restart-persistence
-// follow-up to M0119-0004). The OID and resolved function OID are carried so
-// recovery re-registers the cast identically to the live server. context and
-// method are each a single PG catalog char ('e'/'a'/'i' and 'b'/'i'/'f'
-// respectively) but are wire-encoded as length-prefixed strings for symmetry
-// with the rest of the record and to tolerate an empty value defensively.
-// Format: kind(1) | oid(4) | funcOID(4) | context(1) | method(1) |
-// sourceLen(2) | source(sourceLen bytes) | targetLen(2) | target(targetLen bytes).
-func EncodeCreateCast(source, target, context, method string, oid, funcOID uint32) []byte {
-	if len(source) > 0xFFFF {
-		source = source[:0xFFFF]
-	}
-	if len(target) > 0xFFFF {
-		target = target[:0xFFFF]
-	}
-	var contextByte, methodByte byte
-	if len(context) > 0 {
-		contextByte = context[0]
-	}
-	if len(method) > 0 {
-		methodByte = method[0]
-	}
-	out := make([]byte, 15+len(source)+len(target))
-	out[0] = RecordKindCreateCast
-	binary.LittleEndian.PutUint32(out[1:5], oid)
-	binary.LittleEndian.PutUint32(out[5:9], funcOID)
-	out[9] = contextByte
-	out[10] = methodByte
-	binary.LittleEndian.PutUint16(out[11:13], uint16(len(source)))
-	off := 13
-	copy(out[off:], source)
-	off += len(source)
-	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(target)))
-	off += 2
-	copy(out[off:], target)
-	return out
-}
-
-// DecodeCreateCast decodes a RecordKindCreateCast payload.
-func DecodeCreateCast(payload []byte) (source, target, context, method string, oid, funcOID uint32, err error) {
-	if len(payload) < 13 {
-		return "", "", "", "", 0, 0, fmt.Errorf("wal: create-cast payload too short (%d bytes)", len(payload))
-	}
-	if payload[0] != RecordKindCreateCast {
-		return "", "", "", "", 0, 0, fmt.Errorf("wal: record kind %d is not create-cast", payload[0])
-	}
-	oid = binary.LittleEndian.Uint32(payload[1:5])
-	funcOID = binary.LittleEndian.Uint32(payload[5:9])
-	if payload[9] != 0 {
-		context = string([]byte{payload[9]})
-	}
-	if payload[10] != 0 {
-		method = string([]byte{payload[10]})
-	}
-	sourceLen := int(binary.LittleEndian.Uint16(payload[11:13]))
-	off := 13
-	if len(payload) < off+sourceLen+2 {
-		return "", "", "", "", 0, 0, fmt.Errorf("wal: create-cast payload truncated (need %d bytes)", off+sourceLen+2)
-	}
-	source = string(payload[off : off+sourceLen])
-	off += sourceLen
-	targetLen := int(binary.LittleEndian.Uint16(payload[off : off+2]))
-	off += 2
-	if len(payload) < off+targetLen {
-		return "", "", "", "", 0, 0, fmt.Errorf("wal: create-cast payload truncated (need %d bytes)", off+targetLen)
-	}
-	target = string(payload[off : off+targetLen])
-	return source, target, context, method, oid, funcOID, nil
-}
-
-// EncodeDropCast encodes a DROP CAST event (DU-002 restart-persistence
-// follow-up to M0119-0004). Format: kind(1) | sourceLen(2) |
-// source(sourceLen bytes) | targetLen(2) | target(targetLen bytes).
-func EncodeDropCast(source, target string) []byte {
-	if len(source) > 0xFFFF {
-		source = source[:0xFFFF]
-	}
-	if len(target) > 0xFFFF {
-		target = target[:0xFFFF]
-	}
-	out := make([]byte, 5+len(source)+len(target))
-	out[0] = RecordKindDropCast
-	binary.LittleEndian.PutUint16(out[1:3], uint16(len(source)))
-	off := 3
-	copy(out[off:], source)
-	off += len(source)
-	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(target)))
-	off += 2
-	copy(out[off:], target)
-	return out
-}
-
-// DecodeDropCast decodes a RecordKindDropCast payload.
-func DecodeDropCast(payload []byte) (source, target string, err error) {
-	if len(payload) < 5 {
-		return "", "", fmt.Errorf("wal: drop-cast payload too short (%d bytes)", len(payload))
-	}
-	if payload[0] != RecordKindDropCast {
-		return "", "", fmt.Errorf("wal: record kind %d is not drop-cast", payload[0])
-	}
-	sourceLen := int(binary.LittleEndian.Uint16(payload[1:3]))
-	off := 3
-	if len(payload) < off+sourceLen+2 {
-		return "", "", fmt.Errorf("wal: drop-cast payload truncated (need %d bytes)", off+sourceLen+2)
-	}
-	source = string(payload[off : off+sourceLen])
-	off += sourceLen
-	targetLen := int(binary.LittleEndian.Uint16(payload[off : off+2]))
-	off += 2
-	if len(payload) < off+targetLen {
-		return "", "", fmt.Errorf("wal: drop-cast payload truncated (need %d bytes)", off+targetLen)
-	}
-	target = string(payload[off : off+targetLen])
-	return source, target, nil
 }
 
 // EncodeCreateConversion encodes a CREATE [DEFAULT] CONVERSION event (DU-002
@@ -7836,14 +7698,6 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 		// recovery driver in internal/initdb/transform_ddl_recovery.go scans
 		// the WAL for these records after physical replay and re-applies
 		// them to the catalog's transform registry.
-		return false, nil
-	case RecordKindCreateCast, RecordKindDropCast:
-		// CREATE/DROP CAST records (DU-002 restart-persistence follow-up)
-		// carry only pg_cast metadata; goopg has no per-cast file namespace,
-		// so the physical replay path has nothing to do. The recovery
-		// driver in internal/initdb/cast_ddl_recovery.go scans the WAL for
-		// these records after physical replay and re-applies them to the
-		// catalog's cast registry.
 		return false, nil
 	case RecordKindRoleState, RecordKindDropRole, RecordKindAlterRoleRename:
 		// Role state / removal / rename records (CREATE/ALTER/DROP ROLE

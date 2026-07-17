@@ -1297,12 +1297,6 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// (pg_cast) from the WAL the same way. Order relative to transform/schema
 	// replay does not matter — casts are keyed by (source type, target
 	// type), not by schema OID.
-	if err := replayCastDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
-		_ = pool.Close()
-		_ = walWriter.Close()
-		_ = mgr.Close()
-		return nil, fmt.Errorf("goopg: cast DDL replay: %w", err)
-	}
 	// DU-002 restart-persistence follow-up: restore CREATE/DROP CONVERSION
 	// objects (pg_conversion) from the WAL the same way. Unlike
 	// transforms/casts, a conversion is schema-scoped (keyed by namespace
@@ -2051,6 +2045,16 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// B2.1c: range types reload from the pg_range + pg_type HEAPS (generic
 	// scan, doc 02a §2) — replaced replayRangeTypeDDLRecords' bespoke WAL
 	// scan (RecordKinds 81/82/117/118, retired).
+	// B2.2a: casts reload from the pg_cast HEAP (generic scan) — replaced
+	// replayCastDDLRecords' bespoke WAL scan (kinds 38/39, retired).
+	if cat != nil {
+		if err := reloadUserCastsFromHeap(mgr, cat, clog); err != nil {
+			_ = pool.Close()
+			_ = walWriter.Close()
+			_ = mgr.Close()
+			return nil, fmt.Errorf("goopg: cast heap reload: %w", err)
+		}
+	}
 	if cat != nil {
 		// B2.1d: enums reload from the pg_type + pg_enum heaps — enums
 		// previously had NO restart durability at all. Runs BEFORE the
