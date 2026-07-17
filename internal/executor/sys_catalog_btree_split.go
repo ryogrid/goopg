@@ -112,6 +112,14 @@ func keyMetaForSysBtree(indexOID uint32) (btreeIndexKeyMeta, bool) {
 		return btreeIndexKeyMeta{tupleSize: 16, nkeyatts: 1}, true
 	case pgOperatorOprnameLRNIndexOID:
 		return btreeIndexKeyMeta{tupleSize: 88, nkeyatts: 4}, true
+	// B3.2: pg_event_trigger — both indexes ship as empty metapage-only
+	// placeholders (no builtin event triggers); the runtime lazily roots
+	// them. 3467 is a single 64-byte NameData key (evtname), like
+	// pg_namespace_nspname_index.
+	case pgEventTriggerOidIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 16, nkeyatts: 1}, true
+	case pgEventTriggerEvtnameIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 72, nkeyatts: 1}, true
 	// B3.1: pg_transform — both indexes ship as empty metapage-only
 	// placeholders (pg_transform.dat has no builtin rows); the runtime
 	// lazily roots them.

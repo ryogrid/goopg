@@ -466,6 +466,18 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
     TestPort_EnumSurvivesRestart (create/add/rename/drop across restart); waldump += enum DDL.
 - [ ] **B3** extension/config (pg_ts_*, pg_transform, pg_event_trigger, pg_publication*/subscription*,
   pg_statistic_ext, pg_constraint/attrdef/depend). **IN PROGRESS.**
+  - [x] **B3.2 pg_event_trigger (kinds 56-60 retired)** — LANDED. `sys_pg_event_trigger.go`:
+    7-col FormData_pg_event_trigger builder (six scalars + evttags text[] — the WHEN TAG filter,
+    declared `Type{Name:"text",IsArray:true}` so encode/decode are the symmetric generic array
+    path; NULL when no filter, matching event_trigger.c:307) + upsert/TID-cache (eventTriggerHeapTIDs
+    on InMemory — this catalog HAS ALTER surface: ENABLE/DISABLE→evtenabled, RENAME→evtname,
+    OWNER→evtowner, all canonical heap UPDATEs); DROP stamps xmax after MaterializeWriterXID.
+    Indexes 3467 (evtname, single 64-byte NameData key, {72,1}) + 3468 (oid) — both empty
+    placeholders → lazy-root. Reload decodes evttags to the canonical "{a,b}" text and splits it
+    via the new exported executor.ParseTextArrayLiteral (NULL/"{}" → nil Tags). Scanner
+    event_trigger_ddl_recovery.go(+test) + wal/event_trigger_ddl_test.go deleted; kinds 56-60 +
+    10 codecs + dispatch excised. TestPort_EventTriggerSurvivesRestart green (CREATE w/ WHEN TAG +
+    DISABLE + RENAME + DROP + evttags array round-trip); waldump += the full event-trigger DDL set.
   - [x] **B3.1 pg_transform (kinds 36/37 retired)** — LANDED. `sys_pg_transform.go`: 5-col
     FormData_pg_transform builder (all OIDs; trftype/trflang resolved from the registry's
     TypeName/Lang via TypeNameToOID/LanguageNameToOID) + heap INSERT with a pre-INSERT xmax

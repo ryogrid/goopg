@@ -1390,3 +1390,55 @@ func languageNameForOID(oid uint32) string {
 	}
 	return ""
 }
+
+// reloadUserEventTriggersFromHeap is B3.2's event-trigger reload — the
+// generic heap-scan replacement for the retired replayEventTriggerDDLRecords
+// scanner (RecordKinds 56-60). Six scalar columns map 1:1 onto EventTrigger;
+// the evttags text[] column decodes to the canonical "{a,b}" text, which
+// ParseTextArrayLiteral splits back to the registry's Tags slice (NULL → nil,
+// no WHEN TAG filter). Seeds the TID cache so a post-restart ALTER updates
+// the row in place.
+func reloadUserEventTriggersFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+	cols := executor.PGEventTriggerColumnsPG18()
+	type etRow struct {
+		et  catalog.EventTrigger
+		tid storage.ItemPointer
+	}
+	rel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 3466, Fork: storage.MainFork}
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_event_trigger",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			decoded := make(executor.Row, len(cols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, cols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			if uint32(decoded[0].Int) < catalog.FirstUserOID {
+				return nil, false, errSkipBuiltinRow
+			}
+			var tags []string
+			if lit := decoded[6].StringValue(); lit != "" && lit != "{}" {
+				tags = executor.ParseTextArrayLiteral(lit)
+			}
+			return etRow{
+				et: catalog.EventTrigger{
+					OID:     uint32(decoded[0].Int),
+					Name:    decoded[1].StringValue(),
+					Event:   decoded[2].StringValue(),
+					Owner:   uint32(decoded[3].Int),
+					FuncOID: uint32(decoded[4].Int),
+					Enabled: decoded[5].StringValue(),
+					Tags:    tags,
+				},
+				tid: tid,
+			}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+	for _, raw := range rows {
+		er := raw.(etRow)
+		cat.RegisterEventTriggerDuringRecovery(&er.et)
+		cat.SetEventTriggerHeapTID(er.et.OID, catalog.SchemaHeapTID{Block: uint32(er.tid.Block), Offset: er.tid.Offset})
+	}
+	return nil
+}

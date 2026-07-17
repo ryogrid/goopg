@@ -1983,15 +1983,15 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, err
 	}
 
-	// DU-002 restart-persistence follow-up (M0119-0004, loop #70 ledger
-	// resume point): restore CREATE/DROP/ALTER EVENT TRIGGER objects from
-	// the WAL. Like PubSub, event triggers are not schema-scoped, so order
-	// relative to schema replay above does not matter.
-	if err := replayEventTriggerDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+	// B3.2: event triggers reload from the pg_event_trigger HEAP (generic
+	// scan, doc 02a §2) — replaced replayEventTriggerDDLRecords' bespoke WAL
+	// scan (kinds 56-60, retired). Not schema-scoped, so order relative to
+	// schema replay does not matter.
+	if err := reloadUserEventTriggersFromHeap(mgr, cat, clog); err != nil {
 		_ = pool.Close()
 		_ = walWriter.Close()
 		_ = mgr.Close()
-		return nil, fmt.Errorf("goopg: event trigger DDL replay: %w", err)
+		return nil, fmt.Errorf("goopg: pg_event_trigger reload: %w", err)
 	}
 
 	// DU-002 restart-persistence follow-up (M0119-0004, loop #71 ledger

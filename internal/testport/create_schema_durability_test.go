@@ -835,3 +835,57 @@ func TestPort_TransformSurvivesRestart(t *testing.T) {
 		t.Fatalf("post-restart dropped transform count = %q, want 0", got)
 	}
 }
+
+// TestPort_EventTriggerSurvivesRestart pins B3.2's pg_event_trigger heap
+// journaling: CREATE EVENT TRIGGER (with a WHEN TAG filter → evttags text[]
+// array), ALTER ENABLE/DISABLE (evtenabled UPDATE), ALTER RENAME, and DROP
+// all survive a restart via the pg_event_trigger heap reload (kinds 56-60
+// retired).
+func TestPort_EventTriggerSurvivesRestart(t *testing.T) {
+	c, err := cluster.New("event-trigger-durability", cluster.Options{
+		RepoRoot:     repoRoot(t),
+		DataDir:      filepath.Join(t.TempDir(), "data"),
+		StartupWait:  20 * time.Second,
+		ShutdownWait: 20 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+
+	stmts := []string{
+		"CREATE FUNCTION b32_et_func() RETURNS event_trigger LANGUAGE plpgsql AS 'BEGIN END'",
+		"CREATE EVENT TRIGGER b32_et ON ddl_command_start WHEN TAG IN ('CREATE TABLE', 'ALTER TABLE') EXECUTE FUNCTION b32_et_func()",
+		"ALTER EVENT TRIGGER b32_et DISABLE",
+		"ALTER EVENT TRIGGER b32_et RENAME TO b32_et2",
+		"CREATE EVENT TRIGGER b32_gone ON sql_drop EXECUTE FUNCTION b32_et_func()",
+		"DROP EVENT TRIGGER b32_gone",
+	}
+	for _, s := range stmts {
+		if err := runSQLSimple(t, c, s); err != nil {
+			t.Fatalf("%s: %v", s, err)
+		}
+	}
+
+	if err := c.Stop(cluster.ShutdownFast); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	if err := c.Start(); err != nil {
+		t.Fatalf("restart: %v", err)
+	}
+
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_event_trigger WHERE evtname = 'b32_et2' AND evtevent = 'ddl_command_start' AND evtenabled = 'D'"); got != "1" {
+		t.Fatalf("post-restart renamed+disabled event trigger count = %q, want 1 (not reloaded / ALTER lost)", got)
+	}
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_event_trigger WHERE evtname IN ('b32_et', 'b32_gone')"); got != "0" {
+		t.Fatalf("post-restart stale event-trigger names count = %q, want 0", got)
+	}
+	// The WHEN TAG filter (evttags text[]) round-trips.
+	if got := queryScalar(t, c,
+		"SELECT array_length(evttags, 1) FROM pg_event_trigger WHERE evtname = 'b32_et2'"); got != "2" {
+		t.Fatalf("post-restart evttags length = %q, want 2 (WHEN TAG array lost)", got)
+	}
+}

@@ -12842,6 +12842,11 @@ func arrayElemsSubset(sub, super []string) bool {
 
 // parseTextArray parses a PostgreSQL text array literal {elem1,"elem2",...}
 // and returns its elements. Used for name[] cast. M0097-0003.
+// ParseTextArrayLiteral exposes parseTextArray for the initdb catalog
+// reloads (B3.2: pg_event_trigger.evttags decodes to the canonical
+// "{a,b}" text, which the reload splits back to element strings).
+func ParseTextArrayLiteral(s string) []string { return parseTextArray(s) }
+
 func parseTextArray(s string) []string {
 	if len(s) < 2 || s[0] != '{' || s[len(s)-1] != '}' {
 		return []string{s}
