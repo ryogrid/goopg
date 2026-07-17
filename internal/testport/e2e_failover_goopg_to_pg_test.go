@@ -193,6 +193,14 @@ func runFailoverGoopgToPG(t *testing.T, repo, pgBasebackupBin, psqlBin string, m
 		"CREATE FUNCTION public.b2prep_double(int) RETURNS int LANGUAGE sql AS 'SELECT $1 * 2'"); err != nil {
 		t.Fatalf("create function on goopg primary: %v", err)
 	}
+	// M0111-0002: a set-returning function pins the binary-float4 fix —
+	// prorows=1000 as the former 5-byte text varlena misaligned every
+	// pg_proc column after it (proargtypes!) under PG's attlen=4 TupleDesc,
+	// so PG could not resolve ANY goopg-created SRF by name.
+	if err := runSQLSimple(t, primary,
+		"CREATE FUNCTION public.b2prep_srf() RETURNS SETOF int LANGUAGE sql AS 'SELECT 7'"); err != nil {
+		t.Fatalf("create SRF on goopg primary: %v", err)
+	}
 	// B2.1a: a runtime CREATE TYPE AS ENUM writes pg_type heap rows +
 	// 2703/2704 index entries (2704 is lazily rooted from its empty
 	// bootstrap placeholder) and emits ONLY heap-insert/FPI records — no
@@ -385,6 +393,12 @@ func runFailoverGoopgToPG(t *testing.T, repo, pgBasebackupBin, psqlBin string, m
 	if got := pgScalar(t, standby,
 		"SELECT nextval('public.b2prep_seq')"); got != "93" {
 		t.Fatalf("post-failover nextval = %q, want 93", got)
+	}
+	// M0111-0002: the SRF resolves and executes on the promoted PG (binary
+	// prorows keeps proargtypes aligned).
+	if got := pgScalar(t, standby,
+		"SELECT * FROM public.b2prep_srf()"); got != "7" {
+		t.Fatalf("post-failover SRF call = %q, want 7", got)
 	}
 }
 

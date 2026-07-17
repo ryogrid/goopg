@@ -12,6 +12,7 @@ package executor
 import (
 	"encoding/binary"
 	"math"
+	"strconv"
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/storage"
@@ -32,14 +33,10 @@ func PGEnumColumnsPG18() []catalog.Column {
 	return []catalog.Column{
 		{Name: "oid", Type: catalog.Type{Name: "oid"}},
 		{Name: "enumtypid", Type: catalog.Type{Name: "oid"}},
-		// enumsortorder is float4 in PG. goopg's shared encoder writes
-		// "float4" as TEXT VARLENA (M0111-0002 deferral), which would shift
-		// every following column under PG's fixed attlen=4 TupleDesc (the
-		// e2e read enumlabel as "ppy"). Encode-hint "xid" instead: a fixed
-		// LE uint32 — we store the IEEE-754 float32 BITS, so on disk this
-		// is byte-identical to a real PG float4. The reload decodes the
-		// bits back via math.Float32frombits.
-		{Name: "enumsortorder", Type: catalog.Type{Name: "xid"}},
+		// enumsortorder: real binary float4 (M0111-0002 closed — the former
+		// xid-bits encode-hint produced byte-identical pages, so no
+		// migration is needed).
+		{Name: "enumsortorder", Type: catalog.Type{Name: "float4"}},
 		{Name: "enumlabel", Type: catalog.Type{Name: "name"}},
 	}
 }
@@ -47,10 +44,13 @@ func PGEnumColumnsPG18() []catalog.Column {
 // buildPGEnumRow builds one pg_enum row for (enum type, label).
 func buildPGEnumRow(et *catalog.EnumType, ev catalog.EnumValue) Row {
 	return Row{
-		NewIntDatum(int64(ev.OID)),                                  // 1 oid
-		NewIntDatum(int64(et.OID)),                                  // 2 enumtypid
-		NewIntDatum(int64(math.Float32bits(float32(ev.SortOrder)))), // 3 enumsortorder (float4 bits — see PGEnumColumnsPG18)
-		NewStringDatum(ev.Label),                                    // 4 enumlabel
+		NewIntDatum(int64(ev.OID)), // 1 oid
+		NewIntDatum(int64(et.OID)), // 2 enumtypid
+		// Full-precision text datum (newNumericFromFloat truncates at 6
+		// decimals; deep BEFORE/AFTER midpoints exceed that) — the float4
+		// encoder parses it back to IEEE bits.
+		NewStringDatum(strconv.FormatFloat(ev.SortOrder, 'g', -1, 32)), // 3 enumsortorder
+		NewStringDatum(ev.Label), // 4 enumlabel
 	}
 }
 

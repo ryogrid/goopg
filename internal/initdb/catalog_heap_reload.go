@@ -10,8 +10,8 @@ package initdb
 import (
 	"encoding/binary"
 	"fmt"
-	"math"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -727,9 +727,7 @@ func reloadUserEnumsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *
 			if uint32(decoded[0].Int) < catalog.FirstUserOID {
 				return nil, false, errSkipBuiltinRow
 			}
-			// enumsortorder rides the "xid" encode-hint: LE uint32 carrying
-			// IEEE-754 float32 bits (see executor.PGEnumColumnsPG18).
-			sort := float64(math.Float32frombits(uint32(decoded[2].Int)))
+			sort, _ := strconv.ParseFloat(decoded[2].Format(), 64)
 			return labelRow{
 				oid:   uint32(decoded[0].Int),
 				typid: uint32(decoded[1].Int),

@@ -14,94 +14,11 @@ import (
 	"github.com/goopg/goopg/internal/storage"
 )
 
-// PGFloatOut renders f exactly as PostgreSQL's float4out (bitSize==32) /
-// float8out (bitSize==64) would under the default extra_float_digits=1: the
-// shortest round-trip decimal (Ryu algorithm) combined with PG's
-// fixed-vs-scientific exponent thresholds. Go's strconv.FormatFloat(f,'g',-1,…)
-// produces the same shortest digits but switches to scientific notation at a
-// different (and type-independent) threshold than PostgreSQL, so values such as
-// 2233750 render as "2.23375e+06" instead of "2233750". This mirrors
-// postgres/src/common/{f2s,d2s}.c to_chars: fixed-point output when the display
-// exponent (position of the most-significant digit) is in [-4, sciExp) and
-// scientific output otherwise, where sciExp is 6 for float4 and 15 for float8.
-func PGFloatOut(f float64, bitSize int) string {
-	switch {
-	case math.IsNaN(f):
-		return "NaN"
-	case math.IsInf(f, 1):
-		return "Infinity"
-	case math.IsInf(f, -1):
-		return "-Infinity"
-	}
-
-	// fixed-point when the display exponent lies in [-4, sciExp).
-	sciExp := 15 // float8
-	if bitSize == 32 {
-		sciExp = 6 // float4
-	}
-
-	// Shortest round-trip scientific form: always "d[.ddd]e±NN" with a single
-	// leading digit, no trailing zeros, and an explicit exponent. From it we
-	// recover the significant digits and the display exponent.
-	sci := strconv.FormatFloat(math.Abs(f), 'e', -1, bitSize)
-	ePos := strings.IndexByte(sci, 'e')
-	mant := sci[:ePos]
-	exp, _ := strconv.Atoi(sci[ePos+1:])
-	digits := strings.Replace(mant, ".", "", 1)
-	olength := len(digits)
-
-	var b strings.Builder
-	if math.Signbit(f) {
-		// Preserve negative zero ("-0"), matching PostgreSQL.
-		b.WriteByte('-')
-	}
-
-	if exp >= -4 && exp < sciExp {
-		// Fixed-point. pointPos = number of digits before the decimal point.
-		pointPos := exp + 1
-		switch {
-		case pointPos <= 0:
-			// 0.000ddddd
-			b.WriteString("0.")
-			for i := 0; i < -pointPos; i++ {
-				b.WriteByte('0')
-			}
-			b.WriteString(digits)
-		case pointPos >= olength:
-			// ddddd000 (trailing zeros to reach the point)
-			b.WriteString(digits)
-			for i := 0; i < pointPos-olength; i++ {
-				b.WriteByte('0')
-			}
-		default:
-			// dddd.dddd
-			b.WriteString(digits[:pointPos])
-			b.WriteByte('.')
-			b.WriteString(digits[pointPos:])
-		}
-		return b.String()
-	}
-
-	// Scientific: d[.ddd]e±NN with the exponent zero-padded to >= 2 digits.
-	b.WriteByte(digits[0])
-	if olength > 1 {
-		b.WriteByte('.')
-		b.WriteString(digits[1:])
-	}
-	b.WriteByte('e')
-	if exp < 0 {
-		b.WriteByte('-')
-		exp = -exp
-	} else {
-		b.WriteByte('+')
-	}
-	es := strconv.Itoa(exp)
-	if len(es) < 2 {
-		b.WriteByte('0')
-	}
-	b.WriteString(es)
-	return b.String()
-}
+// PGFloatOut renders a float in PostgreSQL's float4out/float8out shortest
+// round-trip format. Relocated to catalog (M0111-0002) so wal's pgoutput
+// decoder shares the single implementation; this alias keeps the executor's
+// historical call sites unchanged.
+func PGFloatOut(f float64, bitSize int) string { return catalog.PGFloatOut(f, bitSize) }
 
 // EncodeRowPG encodes a row in PG-native physical tuple format
 // (M0105-0010). Used for catalog pages that PG must read directly,
@@ -533,59 +450,61 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 		}
 		return varlenaTextBytes(s), nil
 	case "float4", "real":
-		// goopg stores float4 as varlena text for v0 compatibility (same as
-		// goopg-format encodeValue).  PG binary float4 (4-byte IEEE 754 LE)
-		// is deferred until the decode path also supports binary float.
-		// M0111-0002.
-		var s string
+		// M0111-0002 CLOSED: PG-binary float4 (4-byte IEEE-754 LE), matching
+		// pgPhysicalTypeIsVarlena + the attlen=4 descriptors goopg has
+		// always written. The former text-varlena encoding misaligned every
+		// column AFTER a float on real-PG reads (SRF pg_proc rows; pg_enum's
+		// "ppy" corruption) — the descriptors said fixed, the bytes said
+		// varlena, and only padding luck hid it.
+		var f float64
 		switch d.Kind {
 		case KindInt:
-			s = strconv.FormatInt(d.Int, 10)
+			f = float64(d.Int)
 		case KindString, KindNumeric:
-			// Normalize float4 output to %g format (strips trailing zeros like PG).
 			var raw string
 			if d.Kind == KindNumeric {
 				raw = numericText(d)
 			} else {
 				raw = strings.TrimSpace(d.StringValue())
 			}
-			f, err := strconv.ParseFloat(raw, 32)
+			v, err := strconv.ParseFloat(raw, 32)
 			if err != nil {
 				return nil, &ExecError{Code: "22P02",
 					Message: fmt.Sprintf("invalid input syntax for type real: %q", raw)}
 			}
-			s = PGFloatOut(f, 32)
+			f = v
 		default:
 			return nil, fmt.Errorf("kind %d cannot encode as float4", d.Kind)
 		}
-		return varlenaTextBytes(s), nil
+		var buf4 [4]byte
+		binary.LittleEndian.PutUint32(buf4[:], math.Float32bits(float32(f)))
+		return buf4[:], nil
 	case "float8", "double precision", "double", "float":
-		// goopg stores float8 as varlena text for v0 compatibility (same as
-		// goopg-format encodeValue).  PG binary float8 (8-byte IEEE 754 LE)
-		// is deferred until the decode path also supports binary float.
-		// M0111-0002.
-		var s string
+		// M0111-0002 CLOSED: PG-binary float8 (8-byte IEEE-754 LE) — see the
+		// float4 arm above.
+		var f float64
 		switch d.Kind {
 		case KindInt:
-			s = strconv.FormatInt(d.Int, 10)
+			f = float64(d.Int)
 		case KindString, KindNumeric:
-			// Normalize float8 output to %g format (strips trailing zeros like PG).
 			var raw string
 			if d.Kind == KindNumeric {
 				raw = numericText(d)
 			} else {
 				raw = strings.TrimSpace(d.StringValue())
 			}
-			f, err := strconv.ParseFloat(raw, 64)
+			v, err := strconv.ParseFloat(raw, 64)
 			if err != nil {
 				return nil, &ExecError{Code: "22P02",
 					Message: fmt.Sprintf("invalid input syntax for type double precision: %q", raw)}
 			}
-			s = PGFloatOut(f, 64)
+			f = v
 		default:
 			return nil, fmt.Errorf("kind %d cannot encode as float8", d.Kind)
 		}
-		return varlenaTextBytes(s), nil
+		var buf8 [8]byte
+		binary.LittleEndian.PutUint64(buf8[:], math.Float64bits(f))
+		return buf8[:], nil
 	case "xid", "xid8":
 		// PG TransactionId: 4-byte unsigned LE
 		var v uint32
@@ -1222,28 +1141,22 @@ func decodePhysicalPGValueMctx(t catalog.Type, data []byte, sctx *mctx.Context) 
 			return newStringArenaDatum(sctx, moff, mlen), n, nil
 		}
 		return NewStringDatum(string(payload)), n, nil
-	case "float4", "real", "float8", "double precision", "double":
-		// goopg stores float4/float8 as varlena text for v0 compatibility.
-		// Decode the text payload back into KindNumeric (NaN/Inf fall back
-		// to KindString) so numeric ORDER BY and comparison behave
-		// correctly. Returning KindString here — as the shared text case
-		// used to — sorted float columns lexicographically; this mirrors
-		// the legacy decodeValue / arena decoders. M0111-0006: regression
-		// of the M0097-0003 KindNumeric decode, lost when M0111-0002
-		// switched float storage to varlena text in this PG-physical path.
-		payload, n, err := decodePhysicalPGVarlena(data)
-		if err != nil {
-			return Datum{}, 0, err
+	case "float4", "real":
+		// M0111-0002 CLOSED: fixed 4-byte IEEE-754 LE. Format via PGFloatOut
+		// (shortest round-trip — exactly the text the old varlena encoding
+		// stored) then reuse the numeric-parse tail, so downstream Datums
+		// are byte-identical to the pre-flip decode.
+		if len(data) < 4 {
+			return Datum{}, 0, fmt.Errorf("float4: short read")
 		}
-		text := string(payload)
-		if v, scale, ok := parseNumericFast(text); ok {
-			return Datum{Kind: KindNumeric, Int: v, Scale: scale}, n, nil
+		f4 := float64(math.Float32frombits(binary.LittleEndian.Uint32(data[:4])))
+		return floatTextDatum(PGFloatOut(f4, 32)), 4, nil
+	case "float8", "double precision", "double":
+		if len(data) < 8 {
+			return Datum{}, 0, fmt.Errorf("float8: short read")
 		}
-		if m, s, perr := parseNumeric(text); perr == nil {
-			return newNumeric(m, int(s)), n, nil
-		}
-		// NaN / Infinity / other non-decimal text falls back to string.
-		return NewStringDatum(text), n, nil
+		f8 := math.Float64frombits(binary.LittleEndian.Uint64(data[:8]))
+		return floatTextDatum(PGFloatOut(f8, 64)), 8, nil
 	case "uuid":
 		// goopg stores UUID as varlena-text (canonical lowercase-with-dashes
 		// format). Decode: read the varlena payload and return as KindString.
@@ -1593,4 +1506,17 @@ func encodeVarlen(b []byte) []byte {
 	binary.BigEndian.PutUint32(out[:4], uint32(len(b)))
 	copy(out[4:], b)
 	return out
+}
+
+// floatTextDatum converts a PGFloatOut rendering into the Datum shape the
+// pre-M0111-0002 varlena-text decode produced: KindNumeric for finite
+// values, KindString for NaN/Infinity.
+func floatTextDatum(text string) Datum {
+	if v, scale, ok := parseNumericFast(text); ok {
+		return Datum{Kind: KindNumeric, Int: v, Scale: scale}
+	}
+	if m, s, perr := parseNumeric(text); perr == nil {
+		return newNumeric(m, int(s))
+	}
+	return NewStringDatum(text)
 }

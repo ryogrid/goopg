@@ -22,6 +22,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
+	"strconv"
 	"strings"
 )
 
@@ -1844,4 +1845,93 @@ func OIDToTypeName(oid uint32) string {
 	default:
 		return "text"
 	}
+}
+
+// PGFloatOut renders f exactly as PostgreSQL's float4out (bitSize==32) /
+// float8out (bitSize==64) would under the default extra_float_digits=1: the
+// shortest round-trip decimal (Ryu algorithm) combined with PG's
+// fixed-vs-scientific exponent thresholds. Go's strconv.FormatFloat(f,'g',-1,…)
+// produces the same shortest digits but switches to scientific notation at a
+// different (and type-independent) threshold than PostgreSQL, so values such as
+// 2233750 render as "2.23375e+06" instead of "2233750". This mirrors
+// postgres/src/common/{f2s,d2s}.c to_chars: fixed-point output when the display
+// exponent (position of the most-significant digit) is in [-4, sciExp) and
+// scientific output otherwise, where sciExp is 6 for float4 and 15 for float8.
+func PGFloatOut(f float64, bitSize int) string {
+	switch {
+	case math.IsNaN(f):
+		return "NaN"
+	case math.IsInf(f, 1):
+		return "Infinity"
+	case math.IsInf(f, -1):
+		return "-Infinity"
+	}
+
+	// fixed-point when the display exponent lies in [-4, sciExp).
+	sciExp := 15 // float8
+	if bitSize == 32 {
+		sciExp = 6 // float4
+	}
+
+	// Shortest round-trip scientific form: always "d[.ddd]e±NN" with a single
+	// leading digit, no trailing zeros, and an explicit exponent. From it we
+	// recover the significant digits and the display exponent.
+	sci := strconv.FormatFloat(math.Abs(f), 'e', -1, bitSize)
+	ePos := strings.IndexByte(sci, 'e')
+	mant := sci[:ePos]
+	exp, _ := strconv.Atoi(sci[ePos+1:])
+	digits := strings.Replace(mant, ".", "", 1)
+	olength := len(digits)
+
+	var b strings.Builder
+	if math.Signbit(f) {
+		// Preserve negative zero ("-0"), matching PostgreSQL.
+		b.WriteByte('-')
+	}
+
+	if exp >= -4 && exp < sciExp {
+		// Fixed-point. pointPos = number of digits before the decimal point.
+		pointPos := exp + 1
+		switch {
+		case pointPos <= 0:
+			// 0.000ddddd
+			b.WriteString("0.")
+			for i := 0; i < -pointPos; i++ {
+				b.WriteByte('0')
+			}
+			b.WriteString(digits)
+		case pointPos >= olength:
+			// ddddd000 (trailing zeros to reach the point)
+			b.WriteString(digits)
+			for i := 0; i < pointPos-olength; i++ {
+				b.WriteByte('0')
+			}
+		default:
+			// dddd.dddd
+			b.WriteString(digits[:pointPos])
+			b.WriteByte('.')
+			b.WriteString(digits[pointPos:])
+		}
+		return b.String()
+	}
+
+	// Scientific: d[.ddd]e±NN with the exponent zero-padded to >= 2 digits.
+	b.WriteByte(digits[0])
+	if olength > 1 {
+		b.WriteByte('.')
+		b.WriteString(digits[1:])
+	}
+	b.WriteByte('e')
+	if exp < 0 {
+		b.WriteByte('-')
+		exp = -exp
+	} else {
+		b.WriteByte('+')
+	}
+	es := strconv.Itoa(exp)
+	if len(es) < 2 {
+		b.WriteByte('0')
+	}
+	b.WriteString(es)
+	return b.String()
 }
