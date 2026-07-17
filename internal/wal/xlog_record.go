@@ -54,17 +54,19 @@ const (
 	RmgrXact    Rmgr = 1 // RM_XACT_ID — commit / abort
 	RmgrStorage Rmgr = 2 // RM_SMGR_ID — relation create / truncate
 	RmgrCLOG    Rmgr = 3 // RM_CLOG_ID — clog (pg_xact) truncation
-	// 4..7 reserved (Database, Tablespace, MultiXact, RelMap).
+	// 4..6 reserved (Database, Tablespace, MultiXact).
+	RmgrRelMap  Rmgr = 7  // RM_RELMAP_ID — pg_filenode.map updates (B0.4)
 	RmgrStandby Rmgr = 8  // RM_STANDBY_ID — RUNNING_XACTS snapshot markers
 	RmgrHeap2   Rmgr = 9  // RM_HEAP2_ID   — heap multi-insert / vacuum
 	RmgrHeap    Rmgr = 10 // RM_HEAP_ID    — heap insert / delete / update
 	RmgrBtree   Rmgr = 11 // RM_BTREE_ID   — btree insert / split
+	RmgrSeq     Rmgr = 15 // RM_SEQ_ID     — sequence page rewrites (B1.3b)
 
 	// MaxKnownRmgr bounds the real-PG IDs goopg defines symbolic
 	// names for in this slice. Values in (MaxKnownRmgr, RmgrGoopgCatalog)
 	// are rejected by the decoder as a typed "emitted by a newer
 	// version" branch.
-	MaxKnownRmgr Rmgr = RmgrBtree
+	MaxKnownRmgr Rmgr = RmgrSeq
 
 	// RmgrGoopgCustomBase is the first ID in PostgreSQL's reserved
 	// custom-rmgr range (RM_MIN_CUSTOM_ID, upstream

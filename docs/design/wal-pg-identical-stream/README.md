@@ -66,6 +66,10 @@ requires, rather than papering over it.
 | --- | ----- | ----- |
 | [01](01-record-content-parity.md) | Record content parity (Section A) | Rewrite heap/heap2/btree/xact/smgr/clog/xlog bodies to PG byte layouts; the block-reference + FPI encoder; the atomic encode↔replay flip; `xl_xid`; FPI/logical unification. |
 | [02](02-catalog-heap-journaling.md) | Catalog heap journaling (Section B) | Eliminate the ~110 bespoke catalog records by journaling catalog DDL as PG-style heap ops on real `pg_catalog` relations. The catalog-storage rewrite. |
+| [02a](02a-phase-b0-enablers.md) | Phase-B0 enablers (detailed design) | The four shared enablers: generic per-catalog heap reload, catalog `XLOG_HEAP_UPDATE` emit, per-DB catalog index bootstrap, `pg_filenode.map` + `XLOG_RELMAP_UPDATE` (deferrable). |
+| [02b](02b-catalog-conversion-recipe.md) | Per-catalog conversion recipe (normative) | The reusable seven-step checklist, read-model matrix, gate list, and transition rules every B1–B4 conversion follows. |
+| [02c](02c-phase-b1-application.md) | Phase-B1 application | pg_namespace / pg_proc / pg_sequence specifics; the pg_sequence catalog-row-only scope decision. |
+| [02d](02d-phase-b2-b5-overview.md) | Phase-B2–B5 overview | Application tables + risk deltas for the remaining groups; shared `global/` catalogs; RmgrGoopgCatalog retirement; ledger index. |
 
 Cross-cutting concerns (performance, verification, risk) are covered at the end of
 each doc where they apply, and summarized in §"Program-level view" below.
@@ -136,3 +140,10 @@ cleanly, and a real PG 18 standby replays goopg's WAL.
 - **Data-dir format break**: record bodies and catalog storage change on disk —
   existing data dirs must be re-initialized (fresh clusters), as with the perf-optimize3
   native-only default and doc 04. This is acceptable and documented.
+
+## Review log (Phase-B detail docs 02a–02d)
+
+| date | reviewer lens | outcome |
+|------|---------------|---------|
+| 2026-07-16 | PG fidelity (adversarial, vs `./postgres` sources) | 2 BLOCKER (RelMap rmgr id 7 not 15; foreign-data trio is per-DB, not shared) + 2 MAJOR (CREATE DATABASE WAL_LOG strategy DOES emit relmap; pg_range second index 2228) + 4 MINOR — all folded with inline `(review …)` tags |
+| 2026-07-16 | goopg integration (adversarial, vs code) | 2 BLOCKER (write-dbOid vs reload-dbOid routing through the postgres-DB mirror; the reload visibility rules as actually implemented) + 8 MAJOR (TID cache is net-new; M0114 cache fast path + batch-apply API; full recovery-pass ordering; CREATE DATABASE creates no catalog heaps; pg_proc kind inventory; DropSequence(66)/name-keying; global schema registry vs per-DB heap; unassigned records blocking B5) + 4 MINOR — all folded |

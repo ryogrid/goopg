@@ -33,7 +33,6 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -168,6 +167,183 @@ func cmpKeyNameOid(a, b []byte) int {
 	return cmpKeyUint32(a[64:], b[64:])
 }
 
+// cmpKeyName compares single-NameData[64] keys (e.g. pg_namespace_nspname_index).
+func cmpKeyName(a, b []byte) int {
+	return bytes.Compare(a[:64], b[:64])
+}
+
+// buildIndexTupleNameKey builds a 72-byte IndexTuple keyed by a single
+// 64-byte NameData (NUL-padded) — matches initdb's
+// bootstrapPgNamespaceNspnameIndex tuples. B1.1.
+func buildIndexTupleNameKey(heapBlk uint32, heapOff uint16, name string) []byte {
+	const (
+		nameDataLen = 64
+		hoff        = sysIndexTupleHoff
+		size        = 72 // MAXALIGN(hoff + nameDataLen)
+	)
+	out := make([]byte, size)
+	le := binary.LittleEndian
+	le.PutUint16(out[0:2], uint16(heapBlk>>16))
+	le.PutUint16(out[2:4], uint16(heapBlk&0xFFFF))
+	le.PutUint16(out[4:6], heapOff)
+	le.PutUint16(out[6:8], uint16(size)&sysIndexSizeMask)
+	n := len(name)
+	if n > nameDataLen {
+		n = nameDataLen
+	}
+	copy(out[hoff:hoff+n], name[:n])
+	return out
+}
+
+// pg_namespace index OIDs (postgres/src/include/catalog/pg_namespace.h).
+const (
+	pgNamespaceNspnameIndexOID = 2684
+	pgNamespaceOidIndexOID     = 2685
+)
+
+// pg_proc index OIDs (postgres/src/include/catalog/pg_proc.h). B2-prep.
+const (
+	pgProcOidIndexOID            = 2690
+	pgProcPronameArgsNspIndexOID = 2691
+)
+
+// pg_type index OIDs (postgres/src/include/catalog/pg_type.h). B2.1a.
+const (
+	pgTypeOidIndexOID        = 2703
+	pgTypeTypnameNspIndexOID = 2704
+)
+
+// insertPgTypeOidIndexEntry inserts an entry into pg_type_oid_index (2703)
+// for (oid → heap TID). B2.1a: the bootstrap tree is a populated leaf-root
+// (bootstrapPgTypeOidIndex) that splits/descends via the B2-prep machinery.
+func insertPgTypeOidIndexEntry(ctx *Context, oid uint32, tid storage.ItemPointer) error {
+	tup := buildIndexTupleOidKey(uint32(tid.Block), tid.Offset, oid)
+	return insertCanonicalSysBtreeLeaf(ctx, pgTypeOidIndexOID, tup, cmpKeyUint32)
+}
+
+// insertPgTypeTypnameNspIndexEntry inserts an entry into
+// pg_type_typname_nsp_index (2704) for ((typname, typnamespace) → heap TID).
+// Same 80-byte name+oid key shape as pg_class_relname_nsp_index. The
+// bootstrap file is an EMPTY metapage-only placeholder (makeBtreeRootPage,
+// btm_root=P_NONE) — the first runtime insert lazily allocates the leaf-root
+// (PG's _bt_getroot write-path analog, see insertCanonicalSysBtreeLeaf).
+func insertPgTypeTypnameNspIndexEntry(ctx *Context, typname string, typnamespace uint32, tid storage.ItemPointer) error {
+	tup := buildIndexTupleNameOidKey(uint32(tid.Block), tid.Offset, typname, typnamespace)
+	return insertCanonicalSysBtreeLeaf(ctx, pgTypeTypnameNspIndexOID, tup, cmpKeyNameOid)
+}
+
+// sysIndexVarMask is INDEX_VAR_MASK (postgres/src/include/access/itup.h:74):
+// set on every IndexTuple whose data contains a varlena attribute
+// (pg_proc_proname_args_nsp_index carries proargtypes = oidvector).
+const sysIndexVarMask uint16 = 0x4000
+
+// buildIndexTupleProcNameArgsNsp builds the variable-length IndexTuple for
+// pg_proc_proname_args_nsp_index (2691): NameData proname (64 B, NUL-padded),
+// oidvector proargtypes (24+4n B, via pgProcOidVectorBytes — the same encoder
+// the pg_proc heap row uses), oid pronamespace (4 B), MAXALIGN'd. Twin of
+// initdb's pgBuildIndexTupleProcKey
+// (pg_proc_proname_args_nsp_index_bootstrap.go) — the two must agree
+// byte-for-byte because runtime entries land beside bootstrap entries.
+func buildIndexTupleProcNameArgsNsp(heapBlk uint32, heapOff uint16, proname string, argTypeOIDs []uint32, pronamespace uint32) []byte {
+	const (
+		hoff        = sysIndexTupleHoff
+		nameDataLen = 64
+	)
+	oidVec := pgProcOidVectorBytes(argTypeOIDs)
+	rawSize := hoff + nameDataLen + len(oidVec) + 4
+	aligned := (rawSize + 7) &^ 7
+	out := make([]byte, aligned)
+	le := binary.LittleEndian
+	le.PutUint16(out[0:2], uint16(heapBlk>>16))
+	le.PutUint16(out[2:4], uint16(heapBlk&0xFFFF))
+	le.PutUint16(out[4:6], heapOff)
+	le.PutUint16(out[6:8], (uint16(aligned)&sysIndexSizeMask)|sysIndexVarMask)
+	n := len(proname)
+	if n > nameDataLen {
+		n = nameDataLen
+	}
+	copy(out[hoff:hoff+n], proname[:n])
+	off := hoff + nameDataLen
+	copy(out[off:off+len(oidVec)], oidVec)
+	off += len(oidVec)
+	le.PutUint32(out[off:off+4], pronamespace)
+	return out
+}
+
+// cmpKeyProcNameArgsNsp compares (NameData[64], oidvector, oid) keys with
+// PG's semantics: proname byte-compare (name_cmp), then oidvector by length
+// then elementwise (btoidvectorcmp, postgres/src/backend/utils/adt/oid.c),
+// then pronamespace. The oidvector's dim1 sits 16 bytes into its 24-byte
+// array header; elements follow the header.
+func cmpKeyProcNameArgsNsp(a, b []byte) int {
+	const (
+		nameDataLen = 64
+		vecDimOff   = nameDataLen + 16
+		vecElemsOff = nameDataLen + 24
+	)
+	if c := bytes.Compare(a[:nameDataLen], b[:nameDataLen]); c != 0 {
+		return c
+	}
+	le := binary.LittleEndian
+	la := le.Uint32(a[vecDimOff : vecDimOff+4])
+	lb := le.Uint32(b[vecDimOff : vecDimOff+4])
+	if la != lb {
+		if la < lb {
+			return -1
+		}
+		return 1
+	}
+	for k := uint32(0); k < la; k++ {
+		ea := le.Uint32(a[vecElemsOff+4*k:])
+		eb := le.Uint32(b[vecElemsOff+4*k:])
+		if ea != eb {
+			if ea < eb {
+				return -1
+			}
+			return 1
+		}
+	}
+	na := le.Uint32(a[vecElemsOff+4*la:])
+	nb := le.Uint32(b[vecElemsOff+4*lb:])
+	if na != nb {
+		if na < nb {
+			return -1
+		}
+		return 1
+	}
+	return 0
+}
+
+// insertPgProcOidIndexEntry inserts an entry into pg_proc_oid_index (2690)
+// for (oid → heap TID). B2-prep: the bootstrap tree is multi-level (3397
+// builtin rows), so this always rides the descent path.
+func insertPgProcOidIndexEntry(ctx *Context, oid uint32, tid storage.ItemPointer) error {
+	tup := buildIndexTupleOidKey(uint32(tid.Block), tid.Offset, oid)
+	return insertCanonicalSysBtreeLeaf(ctx, pgProcOidIndexOID, tup, cmpKeyUint32)
+}
+
+// insertPgProcPronameArgsNspIndexEntry inserts an entry into
+// pg_proc_proname_args_nsp_index (2691) for ((proname, proargtypes,
+// pronamespace) → heap TID).
+func insertPgProcPronameArgsNspIndexEntry(ctx *Context, proname string, argTypeOIDs []uint32, pronamespace uint32, tid storage.ItemPointer) error {
+	tup := buildIndexTupleProcNameArgsNsp(uint32(tid.Block), tid.Offset, proname, argTypeOIDs, pronamespace)
+	return insertCanonicalSysBtreeLeaf(ctx, pgProcPronameArgsNspIndexOID, tup, cmpKeyProcNameArgsNsp)
+}
+
+// insertPgNamespaceNspnameIndexEntry inserts an entry into
+// pg_namespace_nspname_index (2684) for (nspname → heap TID). B1.1.
+func insertPgNamespaceNspnameIndexEntry(ctx *Context, nspname string, tid storage.ItemPointer) error {
+	tup := buildIndexTupleNameKey(uint32(tid.Block), tid.Offset, nspname)
+	return insertCanonicalSysBtreeLeaf(ctx, pgNamespaceNspnameIndexOID, tup, cmpKeyName)
+}
+
+// insertPgNamespaceOidIndexEntry inserts an entry into
+// pg_namespace_oid_index (2685) for (oid → heap TID). B1.1.
+func insertPgNamespaceOidIndexEntry(ctx *Context, oid uint32, tid storage.ItemPointer) error {
+	tup := buildIndexTupleOidKey(uint32(tid.Block), tid.Offset, oid)
+	return insertCanonicalSysBtreeLeaf(ctx, pgNamespaceOidIndexOID, tup, cmpKeyUint32)
+}
+
 // insertCanonicalSysBtreeLeaf inserts indexTuple into the leaf-root page of
 // the system btree at sysBtreeRootBlock. Existing entries are compared via
 // cmp on the key bytes (offset sysIndexTupleHoff..) to find the sorted
@@ -177,8 +353,12 @@ func cmpKeyNameOid(a, b []byte) int {
 // sysBtreeRootBlock+1 blocks (true for initdb-bootstrapped clusters; tests
 // must pre-populate via the helpers in sys_catalog_index_insert_test.go).
 func insertCanonicalSysBtreeLeaf(ctx *Context, indexOID uint32, indexTuple []byte, cmp keyCompareFn) error {
+	// B0.3: route to the SAME database's index files as the catalog heap
+	// write (tableCatalogHeapDBOid) — a distinct-dbOid database now has its
+	// own bootstrapped catalog btrees (copyBootstrapCatalogImage), so its
+	// entries land beside its heap rows instead of being skipped.
 	rel := storage.RelFileNode{
-		DBOid:  catalog.DefaultDBOid,
+		DBOid:  tableCatalogHeapDBOid(ctx),
 		RelOid: indexOID,
 		Fork:   storage.MainFork,
 	}
@@ -193,8 +373,18 @@ func insertCanonicalSysBtreeLeaf(ctx *Context, indexOID uint32, indexTuple []byt
 	if err != nil {
 		return fmt.Errorf("nblocks sys btree %d: %w", indexOID, err)
 	}
-	if nBlocks <= sysBtreeRootBlock {
+	if nBlocks == 0 {
+		// No file at all — bootstrap never ran (in-memory test fixture).
 		return nil
+	}
+	if nBlocks == sysBtreeRootBlock {
+		// Metapage-only empty placeholder (initdb's makeBtreeRootPage,
+		// btm_root=P_NONE — e.g. pg_type_typname_nsp_index 2704): lazily
+		// allocate the leaf-root on first insert, mirroring PG's
+		// _bt_getroot write path. B2.1a.
+		if err := allocateEmptySysBtreeLeafRoot(ctx, indexOID, rel); err != nil {
+			return fmt.Errorf("lazy root sys btree %d: %w", indexOID, err)
+		}
 	}
 
 	// Read metapage to learn whether the index is a single leaf-root
@@ -227,6 +417,61 @@ func insertCanonicalSysBtreeLeaf(ctx *Context, indexOID uint32, indexTuple []byt
 		}
 		return fmt.Errorf("insert leaf blk %d sys btree %d: %w", leafBlk, indexOID, err)
 	}
+	return nil
+}
+
+// allocateEmptySysBtreeLeafRoot extends a metapage-only empty btree with an
+// empty BTP_LEAF|BTP_ROOT page at block 1 and points the metapage at it
+// (btm_root=1, btm_level=0). Only called when NBlocks==1; if the metapage
+// already names a root the file is inconsistent and the insert is aborted.
+func allocateEmptySysBtreeLeafRoot(ctx *Context, indexOID uint32, rel storage.RelFileNode) error {
+	metaSlot, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: 0})
+	if err != nil {
+		return fmt.Errorf("pin metapage: %w", err)
+	}
+	metaSlot.Lock()
+	le := binary.LittleEndian
+	base := storage.SizeOfPageHeaderData
+	if rootBlk := le.Uint32(metaSlot.Page()[base+8 : base+12]); rootBlk != 0 {
+		metaSlot.Unlock()
+		ctx.Pool.Unpin(metaSlot)
+		return fmt.Errorf("metapage names root %d but relation has no block %d", rootBlk, rootBlk)
+	}
+	leafSlot, leafBlk, err := ctx.Pool.PinNew(rel)
+	if err != nil {
+		metaSlot.Unlock()
+		ctx.Pool.Unpin(metaSlot)
+		return fmt.Errorf("extend leaf-root: %w", err)
+	}
+	if leafBlk != sysBtreeRootBlock {
+		ctx.Pool.Unpin(leafSlot)
+		metaSlot.Unlock()
+		ctx.Pool.Unpin(metaSlot)
+		return fmt.Errorf("extend produced block %d, want %d", leafBlk, sysBtreeRootBlock)
+	}
+	leafSlot.Lock()
+	emptyLeaf, err := buildSysBtreeLeafPage(nil, nil, pNoneBlock, pNoneBlock, true)
+	if err != nil {
+		leafSlot.Unlock()
+		ctx.Pool.Unpin(leafSlot)
+		metaSlot.Unlock()
+		ctx.Pool.Unpin(metaSlot)
+		return fmt.Errorf("build empty leaf-root: %w", err)
+	}
+	copy(leafSlot.Page(), emptyLeaf)
+	ctx.Pool.MarkDirtyForceFPI(leafSlot)
+	leafSlot.Unlock()
+	ctx.Pool.Unpin(leafSlot)
+
+	if err := writeSysBtreeMetapageInPlace(metaSlot.Page(), uint32(sysBtreeRootBlock), 0); err != nil {
+		metaSlot.Unlock()
+		ctx.Pool.Unpin(metaSlot)
+		return fmt.Errorf("write metapage: %w", err)
+	}
+	ctx.Pool.MarkDirtyForceFPI(metaSlot)
+	metaSlot.Unlock()
+	ctx.Pool.Unpin(metaSlot)
+	_ = indexOID
 	return nil
 }
 
@@ -287,7 +532,7 @@ func insertIntoSingleLeafRoot(ctx *Context, indexOID uint32, rel storage.RelFile
 		return fmt.Errorf("insert sys btree %d slot %d: %w", indexOID, insertSlot, err)
 	}
 
-	ctx.Pool.MarkDirty(slot)
+	ctx.Pool.MarkDirtyForceFPI(slot)
 
 	slot.Unlock()
 	ctx.Pool.Unpin(slot)

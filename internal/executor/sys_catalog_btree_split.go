@@ -47,8 +47,12 @@ const (
 // btreeIndexKeyMeta describes the on-disk key layout of a system btree
 // covered by the runtime split path.
 type btreeIndexKeyMeta struct {
-	tupleSize int    // total IndexTuple size in bytes (e.g. 16 or 80)
+	tupleSize int    // total IndexTuple size in bytes (e.g. 16 or 80); 0 when variable
 	nkeyatts  uint16 // number of key attributes (1 for oid, 2 for name+oid or oid+int2)
+	variable  bool   // true when tuples are variable-length (varlena key column,
+	// e.g. pg_proc_proname_args_nsp_index's oidvector) — the rebuild
+	// fallback then uses the variable-size bulk layout instead of the
+	// fixed-tupleSize one
 }
 
 // keyMetaForSysBtree returns the on-disk layout of the supported runtime-
@@ -62,6 +66,52 @@ func keyMetaForSysBtree(indexOID uint32) (btreeIndexKeyMeta, bool) {
 		return btreeIndexKeyMeta{tupleSize: 80, nkeyatts: 2}, true
 	case pgAttributeRelidAttnumIndexOID:
 		return btreeIndexKeyMeta{tupleSize: 16, nkeyatts: 2}, true
+	case pgNamespaceNspnameIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 72, nkeyatts: 1}, true
+	case pgNamespaceOidIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 16, nkeyatts: 1}, true
+	// B2-prep: pg_proc's two bootstrap indexes are multi-level (3397
+	// entries) so runtime maintenance rides the descent path; 2691 is the
+	// first variable-length key (proargtypes oidvector).
+	case pgProcOidIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 16, nkeyatts: 1}, true
+	case pgProcPronameArgsNspIndexOID:
+		return btreeIndexKeyMeta{nkeyatts: 3, variable: true}, true
+	// B2.1a: pg_type — 2703 bootstraps as a populated leaf-root, 2704 as an
+	// empty metapage-only placeholder that the runtime lazily roots.
+	case pgTypeOidIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 16, nkeyatts: 1}, true
+	case pgTypeTypnameNspIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 80, nkeyatts: 2}, true
+	// B2.1d: pg_enum — all three bootstrap as empty metapage-only
+	// placeholders (no builtin enums); the runtime lazily roots them.
+	case pgEnumOidIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 16, nkeyatts: 1}, true
+	case pgEnumTypidLabelIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 80, nkeyatts: 2}, true
+	case pgEnumTypidSortOrderIndexID:
+		return btreeIndexKeyMeta{tupleSize: 16, nkeyatts: 2}, true
+	// B2.1c: pg_range — both bootstrap as populated leaf-roots (6 builtin
+	// range rows each).
+	case pgRangeRngtypidIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 16, nkeyatts: 1}, true
+	case pgRangeRngmultitypidIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 16, nkeyatts: 1}, true
+	// B2.2a: pg_cast — both bootstrap-populated leaf-roots.
+	case pgCastOidIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 16, nkeyatts: 1}, true
+	case pgCastSourceTargetIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 16, nkeyatts: 2}, true
+	// B2.2 slice 2: pg_aggregate_fnoid_index — bootstrap-populated leaf-root
+	// (161 BKI rows).
+	case pgAggregateFnoidIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 16, nkeyatts: 1}, true
+	// B2.2 slice 3: pg_operator — both bootstrap-populated (2689 is
+	// multi-page: ~800 BKI rows × 88B name+3-oid keys).
+	case pgOperatorOidIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 16, nkeyatts: 1}, true
+	case pgOperatorOprnameLRNIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 88, nkeyatts: 4}, true
 	default:
 		return btreeIndexKeyMeta{}, false
 	}
@@ -288,7 +338,12 @@ func splitLeafRootAndInsert(
 	if !ok {
 		return fmt.Errorf("split: unsupported system btree OID %d", indexOID)
 	}
-	if len(indexTuple) != meta.tupleSize {
+	if meta.variable {
+		if len(indexTuple) <= sysIndexTupleHoff || len(indexTuple)%8 != 0 {
+			return fmt.Errorf("split: variable tuple size %d invalid for index %d",
+				len(indexTuple), indexOID)
+		}
+	} else if len(indexTuple) != meta.tupleSize {
 		return fmt.Errorf("split: tuple size %d does not match index %d expectation %d",
 			len(indexTuple), indexOID, meta.tupleSize)
 	}
@@ -307,7 +362,11 @@ func splitLeafRootAndInsert(
 		if err != nil {
 			return fmt.Errorf("split: read item %d: %w", i, err)
 		}
-		if len(raw) != meta.tupleSize {
+		if meta.variable {
+			if len(raw) <= sysIndexTupleHoff {
+				return fmt.Errorf("split: existing item %d size=%d too small", i, len(raw))
+			}
+		} else if len(raw) != meta.tupleSize {
 			return fmt.Errorf("split: existing item %d size=%d, want %d", i, len(raw), meta.tupleSize)
 		}
 		buf := make([]byte, len(raw))
@@ -381,10 +440,10 @@ func splitLeafRootAndInsert(
 		return fmt.Errorf("split: write metapage: %w", err)
 	}
 
-	ctx.Pool.MarkDirty(leafSlot)
-	ctx.Pool.MarkDirty(rightSlot)
-	ctx.Pool.MarkDirty(rootSlot)
-	ctx.Pool.MarkDirty(metaSlot)
+	ctx.Pool.MarkDirtyForceFPI(leafSlot)
+	ctx.Pool.MarkDirtyForceFPI(rightSlot)
+	ctx.Pool.MarkDirtyForceFPI(rootSlot)
+	ctx.Pool.MarkDirtyForceFPI(metaSlot)
 
 	metaSlot.Unlock()
 	ctx.Pool.Unpin(metaSlot)

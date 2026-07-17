@@ -1,7 +1,6 @@
 package wal
 
 import (
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
@@ -66,49 +65,14 @@ func readAllUncached(walDir string, segmentSize int64) ([]Record, error) {
 	// CRC validates correctness; misclassification of a real
 	// page-emitted segment as legacy would surface as a CRC
 	// mismatch on the very first record.
-	if format, derr := DetectWALFormat(walDir); derr == nil && format == WALFormatPGCompat {
-		return readAllPageAware(stream, segmentSize, baseOffset)
+	// A9: the legacy IEEE-CRC frame is retired — goopg WAL is always the
+	// PG-compat page-headered stream, so ReadAll always walks it page-aware.
+	// A legacy data dir (written by a pre-A9 PageHeaders=false writer) is
+	// rejected explicitly; re-init is required (there is no in-place upgrade).
+	if format, derr := DetectWALFormat(walDir); derr == nil && format == WALFormatLegacy {
+		return nil, fmt.Errorf("wal: legacy WAL format in %s is unsupported (retired in A9) — re-init required", walDir)
 	}
-
-	var records []Record
-	off := 0
-	for off < len(stream) {
-		// The EOS sentinel (zero header) inside a preallocated
-		// segment's zero-fill tail terminates the record stream.
-		// See docs/design/0007-0001-wal-segment-preallocation.md.
-		if isZeroHeader(stream[off:]) {
-			break
-		}
-		payload, n, err := decodeRecord(stream[off:])
-		if err != nil {
-			// M0088-0001: graceful end-of-WAL detection. Either
-			// signal triggers EOS treatment (instead of fatal
-			// startup error):
-			//   (a) post-record-bytes are all zero (the torn-tail
-			//       signal — writer killed mid-record, preallocated
-			//       zero-fill tail extends to EOF), OR
-			//   (b) the corrupt offset is within one segment-size
-			//       of EOF (the pre-existing positional heuristic,
-			//       retained so post-retention edge cases keep
-			//       working).
-			// Real mid-stream corruption (CRC mismatch followed
-			// by a valid record's non-zero bytes far from EOF)
-			// still surfaces.
-			if afterCorruptIsZeroTail(stream, off) {
-				break
-			}
-			if int64(len(stream)-off) <= segmentSize {
-				break
-			}
-			return nil, fmt.Errorf("wal: decode at offset %d: %w", off, err)
-		}
-		start := baseOffset + uint64(off) + 1
-		end := start + uint64(n) - 1
-		records = append(records, Record{StartLSN: start, EndLSN: end, Payload: payload})
-		off += n
-	}
-
-	return records, nil
+	return readAllPageAware(stream, segmentSize, baseOffset)
 }
 
 // readAllPageAware walks a page-emitted WAL stream (M0014-0003):
@@ -208,35 +172,8 @@ func readAllPageAware(stream []byte, segSize int64, baseOffset uint64) ([]Record
 	return records, nil
 }
 
-// afterCorruptIsZeroTail reports whether the bytes after the
-// corrupt-record at `off` are entirely zero. The "after" point is the
-// record's CLAIMED end (off + header + payloadLen as read from the
-// corrupt record's own header). When the corrupt record's header is
-// itself partially garbage, this still works: a small claimed length
-// makes the check stricter (more zeros required), and an absurdly
-// large claimed length makes the check unreachable — both safe.
-// M0088-0001.
-func afterCorruptIsZeroTail(stream []byte, off int) bool {
-	if off+recordHeaderSize > len(stream) {
-		// Corrupt header is itself torn; the rest is the tail.
-		return isPreallocatedTail(stream[off:])
-	}
-	payloadLen := int(binary.LittleEndian.Uint32(stream[off : off+4]))
-	if payloadLen < 0 {
-		return false
-	}
-	claimedEnd := off + recordHeaderSize + payloadLen
-	if claimedEnd > len(stream) {
-		// Record extends past EOF — definitely torn. The tail
-		// bytes that did get written may be partial-payload
-		// non-zeros; the bytes past EOF aren't ours to inspect.
-		// Conservative: only declare torn if everything from the
-		// corrupt header start onward is zero. (Rare: most torn
-		// records leave a non-zero len field.)
-		return isPreallocatedTail(stream[off:])
-	}
-	return isPreallocatedTail(stream[claimedEnd:])
-}
+// (afterCorruptIsZeroTail was removed in A9 with the legacy ReadAll walk; the
+// PG-frame page-aware walk uses isPreallocatedTail directly.)
 
 // isPreallocatedTail reports whether b is entirely zero — the
 // preallocated zero-fill tail of a WAL segment. Scans in 64 KiB

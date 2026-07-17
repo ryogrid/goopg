@@ -51,8 +51,32 @@ func TestPort_WALPgWaldumpCompat(t *testing.T) {
 	libDir := filepath.Join(root, "postgres", "local_install", "lib")
 	psqlEnv := []string{"PGPASSWORD=", "LD_LIBRARY_PATH=" + libDir}
 
+	// B1: schema/function/sequence DDL now journals as real catalog heap
+	// records (pg_namespace/pg_proc/pg_sequence INSERT/UPDATE/DELETE) —
+	// include one of each so real pg_waldump structurally validates them.
 	workload := `
 CREATE TABLE wal_test (id serial primary key, val text);
+CREATE SCHEMA waldump_s1;
+ALTER SCHEMA waldump_s1 RENAME TO waldump_s2;
+CREATE FUNCTION waldump_add(a int, b int) RETURNS int LANGUAGE sql AS 'SELECT a + b';
+CREATE SEQUENCE waldump_seq INCREMENT 3;
+ALTER SEQUENCE waldump_seq MAXVALUE 500;
+CREATE DOMAIN waldump_dom AS text CHECK (VALUE IN ('a', 'b'));
+ALTER DOMAIN waldump_dom SET DEFAULT 'a';
+DROP DOMAIN waldump_dom;
+CREATE CAST (int4 AS bool) WITH INOUT;
+DROP CAST (int4 AS bool);
+CREATE AGGREGATE waldump_agg(int) (SFUNC = waldump_add, STYPE = int, INITCOND = '0');
+ALTER AGGREGATE waldump_agg(int) RENAME TO waldump_agg2;
+DROP AGGREGATE waldump_agg2(int);
+CREATE OPERATOR <+> (LEFTARG = int, RIGHTARG = int, FUNCTION = waldump_add, COMMUTATOR = OPERATOR(<+>));
+DROP OPERATOR <+> (int, int);
+CREATE TYPE waldump_mood AS ENUM ('a', 'b');
+ALTER TYPE waldump_mood ADD VALUE 'c';
+CREATE TYPE waldump_rng AS RANGE (subtype = int4);
+ALTER TYPE waldump_rng RENAME TO waldump_rng2;
+DROP TYPE waldump_rng2;
+DROP SCHEMA waldump_s2;
 ` + buildInsertSQL(100) + `
 CHECKPOINT;
 `

@@ -6097,11 +6097,11 @@ func (o *ddlOp) dropTableByRefImmediate(name parser.ObjectName, tbl *catalog.Tab
 	}
 	// Drop sequences that are owned by columns of this table (created via
 	// ALTER SEQUENCE ... OWNED BY table.col, or SERIAL column defaults).
-	// Restart persistence: log a removal record for every implicit sequence
-	// the table owned, so replay does not resurrect them after the DROP TABLE.
+	// B1.3b: kind-66 retired — the pg_sequence/pg_class heap deletes below
+	// ARE the journal for every implicit sequence the table owned.
 	for _, seqName := range DropSequencesOwnedByTable(tbl.Name, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 		if o.ctx.WAL != nil {
-			_, _, _ = o.ctx.WAL.Append(wal.EncodeDropSequence(seqName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)))
+			dropSequenceCatalogHeapRow(o.ctx, seqName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) // B1.3: pg_sequence heap row
 		}
 	}
 	// If this table was shadowing a permanent one, restore it. M0097-0003.
@@ -6229,8 +6229,10 @@ func ApplyDeferredRoutineDrops(ctx *Context, sess *BasicSession) {
 				// without ever calling this — so logging here is inherently
 				// rollback-safe, unlike a log-at-statement-time approach
 				// would be for a deferred-to-commit drop.
-				if ctx.WAL != nil {
-					_, _, _ = ctx.WAL.Append(wal.EncodeDropFunction(d.Routine.OID))
+				if ctx.Pool != nil {
+					// B1.2: deferred-at-commit drop journals the pg_proc
+					// heap DELETE (bespoke record retired).
+					_ = deleteRoutineCatalogHeapRow(ctx, d.Routine.OID)
 				}
 			}
 		}
@@ -7147,8 +7149,8 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			dbOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
 			if RenameSequence(oldFull, newFull, dbOid) || RenameSequence(oldBare, newFull, dbOid) {
 				if o.ctx.WAL != nil {
-					_, _, _ = o.ctx.WAL.Append(wal.EncodeDropSequence(strings.ToLower(strings.TrimSpace(oldFull)), dbOid))
-					_, _, _ = o.ctx.WAL.Append(wal.EncodeDropSequence(strings.ToLower(strings.TrimSpace(oldBare)), dbOid))
+					dropSequenceCatalogHeapRow(o.ctx, strings.ToLower(strings.TrimSpace(oldFull)), dbOid) // B1.3: pg_sequence heap row
+					dropSequenceCatalogHeapRow(o.ctx, strings.ToLower(strings.TrimSpace(oldBare)), dbOid) // B1.3: pg_sequence heap row
 				}
 				WALLogSequenceState(o.ctx, newFull)
 				capturedNewFull := newFull
@@ -7366,7 +7368,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					// Restart persistence: retire the old name and log the
 					// renamed sequence's state under the new one.
 					if o.ctx.WAL != nil {
-						_, _, _ = o.ctx.WAL.Append(wal.EncodeDropSequence(strings.ToLower(strings.TrimSpace(oldName)), dbOid))
+						dropSequenceCatalogHeapRow(o.ctx, strings.ToLower(strings.TrimSpace(oldName)), dbOid) // B1.3: pg_sequence heap row
 					}
 					WALLogSequenceState(o.ctx, newName)
 					return nil
@@ -8028,8 +8030,8 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				// sequence's state under the new one (both name forms — the
 				// registry may hold either the bare or qualified key).
 				if o.ctx.WAL != nil {
-					_, _, _ = o.ctx.WAL.Append(wal.EncodeDropSequence(strings.ToLower(strings.TrimSpace(oldFull)), seqDBOid))
-					_, _, _ = o.ctx.WAL.Append(wal.EncodeDropSequence(strings.ToLower(strings.TrimSpace(oldBare)), seqDBOid))
+					dropSequenceCatalogHeapRow(o.ctx, strings.ToLower(strings.TrimSpace(oldFull)), seqDBOid) // B1.3: pg_sequence heap row
+					dropSequenceCatalogHeapRow(o.ctx, strings.ToLower(strings.TrimSpace(oldBare)), seqDBOid) // B1.3: pg_sequence heap row
 				}
 				WALLogSequenceState(o.ctx, newFull)
 				// Regenerate the VirtualRows closure to reference the new registry key.
@@ -10426,7 +10428,7 @@ func (o *ddlOp) backfillBTree(tree *btree.BTree, tbl *catalog.Table, cols []*cat
 	}
 	seen := map[string]struct{}{}
 	var seenNull map[string]struct{} // null-bearing-row dedup for NULLS NOT DISTINCT
-	var scanRow Row // M0054-0005c: reusable decode buffer.
+	var scanRow Row                  // M0054-0005c: reusable decode buffer.
 	// M0074-0004 / M0107-0001: per-page mctx for varchar / char / text payloads.
 	// Resulting key is copied by caller (`seen[string(key)]` and `tree.Insert`),
 	// so Datums need not outlive the per-page Reset boundary.
@@ -11358,53 +11360,6 @@ func (o *ddlOp) truncateTableAndPartitions(tbl *catalog.Table, pos int, only boo
 	return nil
 }
 
-// routineToCreateFunctionPayload converts a catalog.Routine into the WAL
-// wire format, shared by CREATE FUNCTION and CREATE PROCEDURE persistence.
-// Dependency-tracking fields (SequenceDeps/RoutineCallOIDs/TableDeps/
-// ColumnDeps) are intentionally NOT carried — see CreateFunctionPayload's
-// doc comment; the recovery driver recomputes them via ExtractRoutineDeps.
-func routineToCreateFunctionPayload(r *catalog.Routine) wal.CreateFunctionPayload {
-	args := make([]wal.FunctionArgPayload, len(r.ArgTypes))
-	for i, t := range r.ArgTypes {
-		a := wal.FunctionArgPayload{TypeName: t.Name, TypeArgs: t.Args}
-		if i < len(r.ArgNames) {
-			a.Name = r.ArgNames[i]
-		}
-		if i < len(r.ArgModes) {
-			a.Mode = r.ArgModes[i]
-		}
-		if i < len(r.ArgDefaults) {
-			a.Default = r.ArgDefaults[i]
-		}
-		args[i] = a
-	}
-	return wal.CreateFunctionPayload{
-		OID:             r.OID,
-		Schema:          r.Schema,
-		Name:            r.Name,
-		Args:            args,
-		ReturnTypeName:  r.ReturnType.Name,
-		ReturnTypeArgs:  r.ReturnType.Args,
-		ReturnsSet:      r.ReturnsSet,
-		ReturnsTable:    r.ReturnsTable,
-		Language:        r.Language,
-		Body:            r.Body,
-		Strict:          r.Strict,
-		Volatile:        r.Volatile,
-		Parallel:        r.Parallel,
-		Cost:            r.Cost,
-		Rows:            r.Rows,
-		SecurityDefiner: r.SecurityDefiner,
-		Leakproof:       r.Leakproof,
-		IsProcedure:     r.IsProcedure,
-		IsWindow:        r.IsWindow,
-		BeginAtomic:     r.BeginAtomic,
-		IsReturnForm:    r.IsReturnForm,
-		KindChar:        r.KindChar,
-		Config:          r.Config,
-	}
-}
-
 // walLogCreateRoutine WAL-logs a successful CREATE [OR REPLACE]
 // FUNCTION/PROCEDURE so it survives a restart (DU-002 restart-persistence
 // follow-up to M0119-0004, loop #71 ledger resume point). Mirrors
@@ -11412,11 +11367,14 @@ func routineToCreateFunctionPayload(r *catalog.Routine) wal.CreateFunctionPayloa
 // (Routines.Create always returns a non-nil routine on success, but a nil
 // WAL is common in embedded/test setups without a live WAL writer).
 func (o *ddlOp) walLogCreateRoutine(r *catalog.Routine) error {
-	if o.ctx.WAL == nil || r == nil {
+	// B1.2: journal the routine as a real pg_proc heap row (INSERT for a
+	// new OID, non-HOT xl_heap_update when OR REPLACE preserved it) —
+	// replaces the bespoke RecordKindCreateFunction record (retired).
+	if o.ctx.Pool == nil || r == nil {
 		return nil
 	}
-	if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateFunction(routineToCreateFunctionPayload(r))); werr != nil {
-		return fmt.Errorf("wal create-function: %w", werr)
+	if err := syncRoutineToCatalogHeap(o.ctx, r); err != nil {
+		return fmt.Errorf("create-function catalog heap: %w", err)
 	}
 	return nil
 }
@@ -11427,11 +11385,13 @@ func (o *ddlOp) walLogCreateRoutine(r *catalog.Routine) error {
 // removal, CASCADE-dependent drops, and (via ApplyDeferredRoutineDrops)
 // either statement's deferred-at-commit removal.
 func (o *ddlOp) walLogDropRoutine(oid uint32) error {
-	if o.ctx.WAL == nil {
+	// B1.2: journal the drop as a pg_proc heap DELETE (xl_heap_delete) —
+	// replaces the bespoke RecordKindDropFunction record (retired).
+	if o.ctx.Pool == nil {
 		return nil
 	}
-	if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropFunction(oid)); werr != nil {
-		return fmt.Errorf("wal drop-function: %w", werr)
+	if err := deleteRoutineCatalogHeapRow(o.ctx, oid); err != nil {
+		return fmt.Errorf("drop-function catalog heap: %w", err)
 	}
 	return nil
 }
@@ -12076,9 +12036,11 @@ func (o *ddlOp) execAlterFunction(s *parser.AlterFunctionStmt) error {
 			// resume point). No rollback-undo tracking exists for ALTER FUNCTION
 			// RENAME (same as ALTER EVENT TRIGGER RENAME), so logging immediately
 			// at mutation time is safe — matches the established precedent.
-			if o.ctx.WAL != nil {
-				if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterFunctionRename(oid, s.RenameTo)); werr != nil {
-					return fmt.Errorf("wal alter-function-rename: %w", werr)
+			_ = oid
+			// B1.2: journal via a pg_proc heap UPDATE of the mutated routine.
+			if o.ctx.Pool != nil {
+				if err := updateRoutineCatalogHeapRow(o.ctx, r); err != nil {
+					return fmt.Errorf("alter-function-rename catalog heap: %w", err)
 				}
 			}
 		}
@@ -12100,9 +12062,9 @@ func (o *ddlOp) execAlterFunction(s *parser.AlterFunctionStmt) error {
 		}
 		for _, r := range routines {
 			r.Owner = ownerOID
-			if o.ctx.WAL != nil {
-				if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterFunctionOwner(r.OID, ownerOID)); werr != nil {
-					return fmt.Errorf("wal alter-function-owner: %w", werr)
+			if o.ctx.Pool != nil {
+				if err := updateRoutineCatalogHeapRow(o.ctx, r); err != nil {
+					return fmt.Errorf("alter-function-owner catalog heap: %w", err)
 				}
 			}
 		}
@@ -12115,9 +12077,10 @@ func (o *ddlOp) execAlterFunction(s *parser.AlterFunctionStmt) error {
 			if err := rs.SetSchema(r, s.NewSchema); err != nil {
 				return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
 			}
-			if o.ctx.WAL != nil {
-				if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterFunctionSetSchema(oid, s.NewSchema)); werr != nil {
-					return fmt.Errorf("wal alter-function-set-schema: %w", werr)
+			_ = oid
+			if o.ctx.Pool != nil {
+				if err := updateRoutineCatalogHeapRow(o.ctx, r); err != nil {
+					return fmt.Errorf("alter-function-set-schema catalog heap: %w", err)
 				}
 			}
 		}
@@ -12154,14 +12117,11 @@ func (o *ddlOp) execAlterFunction(s *parser.AlterFunctionStmt) error {
 		// resume point): log the full post-mutation snapshot of the four
 		// mutable attributes, not just the clause(s) this statement touched —
 		// simpler to replay and always reflects the routine's actual state.
-		if o.ctx.WAL != nil {
-			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterFunctionFlags(r.OID, r.Volatile, r.SecurityDefiner, r.Leakproof, r.Strict)); werr != nil {
-				return fmt.Errorf("wal alter-function-flags: %w", werr)
-			}
-			if len(s.ConfigOps) > 0 {
-				if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterFunctionConfig(r.OID, r.Config)); werr != nil {
-					return fmt.Errorf("wal alter-function-config: %w", werr)
-				}
+		// B1.2: one pg_proc heap UPDATE carries the full post-mutation row
+		// (flags AND config together — the row rebuild is total by design).
+		if o.ctx.Pool != nil {
+			if err := updateRoutineCatalogHeapRow(o.ctx, r); err != nil {
+				return fmt.Errorf("alter-function catalog heap: %w", err)
 			}
 		}
 	}
@@ -12817,49 +12777,106 @@ func deleteCatalogRowsForOID(ctx *Context, dbOid uint32, relOID uint32, xmax sto
 // `SELECT 1 FROM pg_type WHERE oid = enumtypid` return the expected rows.
 // Mirrors to DBOid=5 (postgres db) so the seqScan (which reads from the
 // session's DBOID) finds the row. M0097-0022 (enum → pg_type parity).
-// syncAggregateToCatalogHeap writes the pg_aggregate row for a CREATE
-// AGGREGATE (OID 2600), keyed by aggfnoid = agg.OID (the aggregate's own
-// pg_proc identity). pg_proc itself is a Virtual view (registerPgProcView
-// enumerates cat.ListUserAggregates() directly; no heap write needed there —
-// see internal/initdb/pg_proc_view.go). DU-002 slice 405.
-func syncAggregateToCatalogHeap(ctx *Context, agg *catalog.UserAggregate) {
-	if !catalogHeapSyncAvailable(ctx) {
-		return
-	}
-	aggRel := storage.RelFileNode{
-		DBOid:  catalog.DefaultDBOid,
-		RelOid: catalog.AggregateRelationId,
-		Fork:   storage.MainFork,
-	}
-	if _, err := writeHeapRowCanonical(ctx, aggRel, pgAggregateColumnsPG18(), buildUserPGAggregateRow(ctx, agg)); err != nil {
-		return
-	}
-	_ = mirrorCatalogRelToPostgresDB(ctx, catalog.AggregateRelationId)
-}
-
 func syncEnumTypeToCatalogHeap(ctx *Context, et *catalog.EnumType) {
 	if !catalogHeapSyncAvailable(ctx) {
 		return
 	}
-	typeRel := storage.RelFileNode{
-		DBOid:  catalog.DefaultDBOid,
-		RelOid: catalog.TypeRelationId,
-		Fork:   storage.MainFork,
-	}
-	if _, err := writeHeapRowCanonical(ctx, typeRel, pgTypeColumnsPG18(), buildUserPGTypeRowForEnum(et)); err != nil {
+	if err := writeTypeHeapRowWithIndexes(ctx, buildUserPGTypeRowForEnum(et)); err != nil {
 		return
 	}
 	// Also write the auto-generated array type (`_name`) so a `mood[]` column's
 	// atttypid joins to a real pg_type row — pg_dump's getTableAttrs passes the
 	// joined t.oid to format_type, and a missing row renders the column type
 	// blank. DU-002 slice 89.
-	if _, err := writeHeapRowCanonical(ctx, typeRel, pgTypeColumnsPG18(), buildUserPGTypeRowForEnumArray(et)); err != nil {
+	if err := writeTypeHeapRowWithIndexes(ctx, buildUserPGTypeRowForEnumArray(et)); err != nil {
 		return
+	}
+	// B2.1d: one pg_enum heap row per label (+ 3502/3503/3534 entries) —
+	// the labels' journal AND the reload's source (enums previously had no
+	// restart durability at all).
+	for _, ev := range et.Values {
+		if err := writeEnumLabelRow(ctx, et, ev); err != nil {
+			return
+		}
 	}
 	// Mirror pg_type to the postgres database (DBOid=5) so sessions using
 	// the postgres db can find the new type row via SeqScan. This mirrors
 	// the pattern used by syncTableToCatalogHeap. M0097-0022.
+	mirrorTypeCatalogFiles(ctx)
+	mirrorEnumCatalogFiles(ctx)
+}
+
+// writeTypeHeapRowWithIndexes writes one pg_type heap row and maintains
+// pg_type_oid_index (2703) + pg_type_typname_nsp_index (2704) — B2.1a. The
+// index keys come from the built row itself (oid=col 0, typname=col 1,
+// typnamespace=col 2 of pgTypeColumnsPG18) so every buildUserPGTypeRowFor*
+// variant (enum/array/composite/domain/range/multirange) stays in sync with
+// its index entries by construction.
+func writeTypeHeapRowWithIndexes(ctx *Context, row Row) error {
+	typeRel := storage.RelFileNode{
+		DBOid:  catalog.DefaultDBOid,
+		RelOid: catalog.TypeRelationId,
+		Fork:   storage.MainFork,
+	}
+	tid, err := writeHeapRowCanonical(ctx, typeRel, pgTypeColumnsPG18(), row)
+	if err != nil {
+		return err
+	}
+	return finishTypeHeapRowWrite(ctx, row, tid)
+}
+
+// finishTypeHeapRowWrite records the row's live TID in the catalog cache
+// (B2.1b) and maintains both pg_type indexes for a freshly written row
+// version. Shared by the INSERT funnel and the non-HOT UPDATE path.
+func finishTypeHeapRowWrite(ctx *Context, row Row, tid storage.ItemPointer) error {
+	oid := uint32(row[0].Int)
+	typname := row[1].StringValue()
+	typnamespace := uint32(row[2].Int)
+	if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+		im.SetTypeHeapTID(oid, catalog.SchemaHeapTID{Block: uint32(tid.Block), Offset: tid.Offset})
+	}
+	if err := insertPgTypeOidIndexEntry(ctx, oid, tid); err != nil {
+		return fmt.Errorf("pg_type_oid_index: %w", err)
+	}
+	if err := insertPgTypeTypnameNspIndexEntry(ctx, typname, typnamespace, tid); err != nil {
+		return fmt.Errorf("pg_type_typname_nsp_index: %w", err)
+	}
+	return nil
+}
+
+// updateTypeHeapRowWithIndexes journals an ALTER-driven pg_type row change
+// as a PG-canonical non-HOT heap UPDATE of the row version at the cached
+// TID, inserting fresh index entries at the new TID (B2.1b). Falls back to
+// a plain INSERT when no TID is cached (pre-conversion data dir).
+func updateTypeHeapRowWithIndexes(ctx *Context, row Row) error {
+	oid := uint32(row[0].Int)
+	im, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return writeTypeHeapRowWithIndexes(ctx, row)
+	}
+	tid, ok := im.TypeHeapTID(oid)
+	if !ok {
+		return writeTypeHeapRowWithIndexes(ctx, row)
+	}
+	typeRel := storage.RelFileNode{
+		DBOid:  catalog.DefaultDBOid,
+		RelOid: catalog.TypeRelationId,
+		Fork:   storage.MainFork,
+	}
+	oldTID := storage.ItemPointer{Block: storage.BlockNumber(tid.Block), Offset: tid.Offset}
+	newTID, err := updateHeapRowCanonicalPG(ctx, typeRel, pgTypeColumnsPG18(), oldTID, row)
+	if err != nil {
+		return fmt.Errorf("pg_type update: %w", err)
+	}
+	return finishTypeHeapRowWrite(ctx, row, newTID)
+}
+
+// mirrorTypeCatalogFiles propagates the pg_type heap + both indexes to the
+// postgres DB's copies (B2.1a: the indexes now change at runtime too).
+func mirrorTypeCatalogFiles(ctx *Context) {
 	_ = mirrorCatalogRelToPostgresDB(ctx, catalog.TypeRelationId)
+	_ = mirrorCatalogRelToPostgresDB(ctx, pgTypeOidIndexOID)
+	_ = mirrorCatalogRelToPostgresDB(ctx, pgTypeTypnameNspIndexOID)
 }
 
 // syncCompositeTypeToCatalogHeap writes the catalog rows for a composite type
@@ -12875,15 +12892,10 @@ func syncCompositeTypeToCatalogHeap(ctx *Context, ct *catalog.CompositeType) {
 	if ct == nil || !catalogHeapSyncAvailable(ctx) {
 		return
 	}
-	typeRel := storage.RelFileNode{
-		DBOid:  catalog.DefaultDBOid,
-		RelOid: catalog.TypeRelationId,
-		Fork:   storage.MainFork,
-	}
-	if _, err := writeHeapRowCanonical(ctx, typeRel, pgTypeColumnsPG18(), buildUserPGTypeRowForComposite(ct)); err != nil {
+	if err := writeTypeHeapRowWithIndexes(ctx, buildUserPGTypeRowForComposite(ct)); err != nil {
 		return
 	}
-	if _, err := writeHeapRowCanonical(ctx, typeRel, pgTypeColumnsPG18(), buildUserPGTypeRowForCompositeArray(ct)); err != nil {
+	if err := writeTypeHeapRowWithIndexes(ctx, buildUserPGTypeRowForCompositeArray(ct)); err != nil {
 		return
 	}
 
@@ -12929,7 +12941,7 @@ func syncCompositeTypeToCatalogHeap(ctx *Context, ct *catalog.CompositeType) {
 	if ctx.TxnMgr != nil {
 		ctx.TxnMgr.SetRelcacheInvalPending()
 	}
-	_ = mirrorCatalogRelToPostgresDB(ctx, catalog.TypeRelationId)
+	mirrorTypeCatalogFiles(ctx)
 	_ = mirrorCatalogRelToPostgresDB(ctx, catalog.RelationRelationId)
 	_ = mirrorCatalogRelToPostgresDB(ctx, catalog.AttributeRelationId)
 }
@@ -12942,22 +12954,17 @@ func syncDomainTypeToCatalogHeap(ctx *Context, d *catalog.Domain) {
 	if !catalogHeapSyncAvailable(ctx) {
 		return
 	}
-	typeRel := storage.RelFileNode{
-		DBOid:  catalog.DefaultDBOid,
-		RelOid: catalog.TypeRelationId,
-		Fork:   storage.MainFork,
-	}
-	if _, err := writeHeapRowCanonical(ctx, typeRel, pgTypeColumnsPG18(), buildUserPGTypeRowForDomain(d)); err != nil {
+	if err := writeTypeHeapRowWithIndexes(ctx, buildUserPGTypeRowForDomain(d)); err != nil {
 		return
 	}
 	// Also write the auto-generated array type (`_name`) so a `d[]` column's
 	// atttypid joins to a real pg_type row and pg_dump's format_type renders it
 	// as `public.d[]` rather than the base type's built-in array. DU-002 slice 251
 	// (mirrors syncEnumTypeToCatalogHeap's array-row write).
-	if _, err := writeHeapRowCanonical(ctx, typeRel, pgTypeColumnsPG18(), buildUserPGTypeRowForDomainArray(d)); err != nil {
+	if err := writeTypeHeapRowWithIndexes(ctx, buildUserPGTypeRowForDomainArray(d)); err != nil {
 		return
 	}
-	_ = mirrorCatalogRelToPostgresDB(ctx, catalog.TypeRelationId)
+	mirrorTypeCatalogFiles(ctx)
 }
 
 // syncRangeTypeToCatalogHeap writes the pg_type heap rows for a user-defined
@@ -12973,24 +12980,26 @@ func syncRangeTypeToCatalogHeap(ctx *Context, rt *catalog.RangeType) {
 	if !catalogHeapSyncAvailable(ctx) {
 		return
 	}
-	typeRel := storage.RelFileNode{
-		DBOid:  catalog.DefaultDBOid,
-		RelOid: catalog.TypeRelationId,
-		Fork:   storage.MainFork,
-	}
-	if _, err := writeHeapRowCanonical(ctx, typeRel, pgTypeColumnsPG18(), buildUserPGTypeRowForRange(rt)); err != nil {
+	if err := writeTypeHeapRowWithIndexes(ctx, buildUserPGTypeRowForRange(rt)); err != nil {
 		return
 	}
-	if _, err := writeHeapRowCanonical(ctx, typeRel, pgTypeColumnsPG18(), buildUserPGTypeRowForRangeArray(rt)); err != nil {
+	if err := writeTypeHeapRowWithIndexes(ctx, buildUserPGTypeRowForRangeArray(rt)); err != nil {
 		return
 	}
-	if _, err := writeHeapRowCanonical(ctx, typeRel, pgTypeColumnsPG18(), buildUserPGTypeRowForMultirange(rt)); err != nil {
+	if err := writeTypeHeapRowWithIndexes(ctx, buildUserPGTypeRowForMultirange(rt)); err != nil {
 		return
 	}
-	if _, err := writeHeapRowCanonical(ctx, typeRel, pgTypeColumnsPG18(), buildUserPGTypeRowForMultirangeArray(rt)); err != nil {
+	if err := writeTypeHeapRowWithIndexes(ctx, buildUserPGTypeRowForMultirangeArray(rt)); err != nil {
 		return
 	}
-	_ = mirrorCatalogRelToPostgresDB(ctx, catalog.TypeRelationId)
+	// B2.1c: the pg_range row + 3542/2228 entries make the range ↔
+	// multirange linkage physically reconstructable at reload (and
+	// PG-resolvable via the RANGETYPE/MULTIRANGETYPE syscaches).
+	if err := writeRangeCatalogRow(ctx, rt); err != nil {
+		return
+	}
+	mirrorTypeCatalogFiles(ctx)
+	mirrorRangeCatalogFiles(ctx)
 }
 
 // deleteTypeFromCatalogHeap stamps xmax on the pg_type row for typeOID.
@@ -13010,6 +13019,10 @@ func deleteTypeFromCatalogHeap(ctx *Context, dbOid uint32, typeOID uint32, xmax 
 		// Column 0 of pgTypeColumnsPG18 is oid (4-byte LE uint32) at offset 0.
 		return binary.LittleEndian.Uint32(data[0:4]) == typeOID
 	})
+	// B2.1b: the row version at the cached TID is dead now.
+	if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+		im.DeleteTypeHeapTID(typeOID)
+	}
 }
 
 // catalogHeapSyncAvailable returns true when the M0030-0001 system catalog
@@ -13183,20 +13196,18 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 		return fmt.Errorf("pg_class: %w", err)
 	}
 	relnamespace := namespaceOIDForSchema(ctx.Catalog, tbl.Schema)
-	// The sys-btree catalog index entries stay DefaultDBOid-only: a distinct
-	// database has no bootstrapped catalog btree files, and inserting its TIDs
-	// into DefaultDBOid's btrees would plant entries pointing at tuples that
-	// live in a DIFFERENT heap file. The startup loader scans heap blocks
-	// directly and never consults these indexes (they serve pg_dump's
-	// server-side index scans + an attaching PG standby, both of which read
-	// the DefaultDBOid/postgres catalogs). See the follow-up-39 ledger row.
-	if heapDBOid == catalog.DefaultDBOid {
-		if err := insertPgClassOidIndexEntry(ctx, tbl.OID, classTID); err != nil {
-			return fmt.Errorf("pg_class_oid_index: %w", err)
-		}
-		if err := insertPgClassRelnameNspIndexEntry(ctx, tbl.Name, relnamespace, classTID); err != nil {
-			return fmt.Errorf("pg_class_relname_nsp_index: %w", err)
-		}
+	// B0.3 (doc 02a §4): index entries route to the SAME database as the
+	// heap rows — insertCanonicalSysBtreeLeaf resolves the dbOid via
+	// tableCatalogHeapDBOid, and a distinct-dbOid database has its own
+	// bootstrapped catalog btrees (copyBootstrapCatalogImage at CREATE
+	// DATABASE). The historical DefaultDBOid-only skip (follow-up-39) is
+	// lifted; pre-B0.3 databases without index files still no-op gracefully
+	// inside the inserter (missing-block-1 bail).
+	if err := insertPgClassOidIndexEntry(ctx, tbl.OID, classTID); err != nil {
+		return fmt.Errorf("pg_class_oid_index: %w", err)
+	}
+	if err := insertPgClassRelnameNspIndexEntry(ctx, tbl.Name, relnamespace, classTID); err != nil {
+		return fmt.Errorf("pg_class_relname_nsp_index: %w", err)
 	}
 
 	attrRel := storage.RelFileNode{
@@ -13209,10 +13220,8 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 		if err != nil {
 			return fmt.Errorf("pg_attribute col %q: %w", col.Name, err)
 		}
-		if heapDBOid != catalog.DefaultDBOid {
-			continue // see the sys-btree comment above
-		}
-		// attnum is the 1-based ordinal of the column in PG18.
+		// attnum is the 1-based ordinal of the column in PG18. B0.3: routed
+		// per-DB like the pg_class entries above (skip lifted).
 		if err := insertPgAttributeRelidAttnumIndexEntry(ctx, tbl.OID, int16(col.Ordinal+1), attrTID); err != nil {
 			return fmt.Errorf("pg_attribute_relid_attnum_index col %q: %w", col.Name, err)
 		}
@@ -13967,6 +13976,12 @@ func (o *ddlOp) execCreateSequence(s *parser.CreateSequenceStmt) error {
 // identity sequence is discoverable by pg_dump. M0110-0001 (DU-002 slice 120).
 func (o *ddlOp) createSeqCatalogTable(seqObjName parser.ObjectName, name string) {
 	CreateSequenceCatalogRelation(o.ctx.Catalog, seqObjName, name, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+	// B1.3b: the sequence's pg_class row is the reload's ONLY source of its
+	// name/schema (the retired kind-65 carried them before). Write it like
+	// any relation; the sequence reload re-registers the virtual relation.
+	if seqTbl, ok := o.ctx.Catalog.LookupTable(seqObjName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); ok && seqTbl != nil {
+		syncTableToCatalogHeap(o.ctx, seqTbl)
+	}
 }
 
 // CreateSequenceCatalogRelation is the ddlOp-independent core of
@@ -14619,16 +14634,16 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 					Message: fmt.Sprintf("schema %q does not exist", schemaName)}
 			}
 			// Schema is registered; unregister it.
-			o.ctx.Catalog.UnregisterSchema(schemaName)
-			// M0110-0003: persist the drop so it survives a restart (mirrors
-			// CREATE SCHEMA below / DROP DATABASE). Without this, a schema
-			// dropped at runtime would be re-registered by replaying its
-			// CREATE SCHEMA record on the next startup.
-			if o.ctx.WAL != nil {
-				if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropSchema(schemaName)); werr != nil {
-					return fmt.Errorf("wal drop-schema: %w", werr)
+			// B1.1: journal the drop as a pg_namespace heap DELETE
+			// (xl_heap_delete) BEFORE unregistering — the TID cache entry
+			// is needed to locate the row. Replaces the bespoke
+			// RecordKindDropSchema record (M0110-0003, retired).
+			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok && o.ctx.Pool != nil {
+				if err := deleteSchemaCatalogHeapRow(o.ctx, im, schemaName); err != nil {
+					return fmt.Errorf("drop-schema catalog heap: %w", err)
 				}
 			}
+			o.ctx.Catalog.UnregisterSchema(schemaName)
 			if s.Behavior == parser.DropCascade {
 				// Collect routines to drop for NOTICE detail.
 				var droppedRoutines []string
@@ -14835,15 +14850,20 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 		// If goopg registered this user cast (CREATE CAST, DU-002 slice 395), drop
 		// it from the registry so it stops round-tripping through pg_dump. An
 		// unregistered cast falls through to the PG-style "does not exist" error.
-		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok && im.DropCast(fromType, toType) {
-			// DU-002 restart-persistence follow-up: mirror the DROP
-			// TRANSFORM WAL emission so the drop survives a restart too.
-			if o.ctx.WAL != nil {
-				if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropCast(fromType, toType)); werr != nil {
-					return fmt.Errorf("wal drop-cast: %w", werr)
-				}
+		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+			// B2.2a: capture the cast's OID before the registry drop, then
+			// stamp its pg_cast heap row (kind 39 retired).
+			var castOID uint32
+			if c := im.CastByTypes(fromType, toType); c != nil {
+				castOID = c.OID
 			}
-			return nil
+			if im.DropCast(fromType, toType) {
+				if castOID != 0 && catalogHeapSyncAvailable(o.ctx) && o.ctx.MaterializeWriterXID() == nil {
+					deleteCastCatalogRow(o.ctx, castOID, o.ctx.Tx.XID)
+					mirrorCastCatalogFiles(o.ctx)
+				}
+				return nil
+			}
 		}
 		msg := fmt.Sprintf("cast from type %s to type %s does not exist", fromCanon, toCanon)
 		if s.IfExists {
@@ -15094,7 +15114,7 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 			// Restart persistence: record the removal so startup replay does
 			// not resurrect the sequence. See RecordKindDropSequence.
 			if o.ctx.WAL != nil {
-				_, _, _ = o.ctx.WAL.Append(wal.EncodeDropSequence(strings.ToLower(strings.TrimSpace(name.String())), seqDBOid))
+				dropSequenceCatalogHeapRow(o.ctx, strings.ToLower(strings.TrimSpace(name.String())), seqDBOid) // B1.3: pg_sequence heap row
 			}
 			// Remove the virtual catalog entry created for SELECT * FROM seq_name. M0097-0024.
 			_ = o.ctx.Catalog.DropTable(name, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
@@ -15122,11 +15142,16 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 		// only, like RenameUserAggregate/LookupUserAggregateByName), so a
 		// name match drops regardless of the DROP statement's ArgTypes.
 		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+			// B2.2 slice 2: capture the OID before the registry drop, then
+			// stamp xmax on the pg_proc + pg_aggregate rows (kind 48
+			// retired).
+			var aggOID uint32
+			if agg, found := im.LookupUserAggregateByName(aggName.Name); found {
+				aggOID = agg.OID
+			}
 			if im.DropUserAggregate(aggName.Name) {
-				if o.ctx.WAL != nil {
-					if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropAggregate(aggName.Name)); werr != nil {
-						return fmt.Errorf("wal drop-aggregate: %w", werr)
-					}
+				if aggOID != 0 {
+					deleteAggregateCatalogRows(o.ctx, aggOID)
 				}
 				return nil
 			}
@@ -15310,15 +15335,9 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 				key := opName + "(" + leftCanon + "," + rightCanon + ")"
 				im.DropCompatObject("operator", key)
 				im.DropUserOperator(schema, opName, leftType, rightType)
-				// DU-002 restart-persistence follow-up (M0119-0004/M0110-0001,
-				// discovered while verifying the loop #64 CREATE TYPE ... AS
-				// RANGE opclass/collation follow-up — see ledger): mirrors
-				// CREATE OPERATOR's own WAL append.
-				if o.ctx.WAL != nil {
-					if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropOperator(existing.OID)); werr != nil {
-						return fmt.Errorf("wal drop-operator: %w", werr)
-					}
-				}
+				// B2.2 slice 3: stamp xmax on the operator's pg_operator
+				// heap row (kind 84 retired).
+				deleteOperatorCatalogRow(o.ctx, existing.OID)
 				return nil
 			}
 		}
@@ -16273,20 +16292,28 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 				}
 			}
 
-			// DU-002 restart-persistence follow-up (M0119-0004/M0110-0001,
-			// discovered while verifying the loop #64 CREATE TYPE ... AS
-			// RANGE opclass/collation follow-up — see ledger): mirrors
-			// CREATE TYPE ... AS RANGE's own WAL append. op's final state
-			// (post COMMUTATOR/NEGATOR back-patch) is what gets persisted,
-			// so a restart reproduces exactly what pg_operator showed the
-			// client before the crash.
-			if o.ctx.WAL != nil {
-				if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateOperator(wal.CreateOperatorPayload{
-					OID: op.OID, Schema: schema, Name: op.Name, LeftType: op.LeftType, RightType: op.RightType,
-					FuncOID: op.FuncOID, Owner: op.Owner, CommutatorOID: op.CommutatorOID, NegatorOID: op.NegatorOID,
-					RestrictOID: op.RestrictOID, JoinOID: op.JoinOID, CanMerge: op.CanMerge, CanHash: op.CanHash,
-				})); werr != nil {
-					return fmt.Errorf("wal create-operator: %w", werr)
+			// B2.2 slice 3 (doc 02d §1): journal op's FINAL state (post
+			// COMMUTATOR/NEGATOR back-patch) as a real pg_operator heap row
+			// + 2688/2689 entries (kind 83 retired). The upsert turns a
+			// shell fill-in into a canonical heap UPDATE at the cached TID
+			// (PG's OperatorUpd); the referenced commutator/negator — a
+			// shell just minted here, or an existing operator just
+			// back-patched — gets its own row upserted too.
+			if err := upsertOperatorCatalogRow(o.ctx, op); err != nil {
+				return fmt.Errorf("pg_operator journal: %w", err)
+			}
+			if hasCommutator && !selfCommutator {
+				if other := im.LookupUserOperatorByOID(commutatorOID); other != nil {
+					if err := upsertOperatorCatalogRow(o.ctx, other); err != nil {
+						return fmt.Errorf("pg_operator journal (commutator): %w", err)
+					}
+				}
+			}
+			if hasNegator {
+				if other := im.LookupUserOperatorByOID(negatorOID); other != nil {
+					if err := upsertOperatorCatalogRow(o.ctx, other); err != nil {
+						return fmt.Errorf("pg_operator journal (negator): %w", err)
+					}
 				}
 			}
 		}
@@ -16391,9 +16418,12 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 			// (internal/initdb/cast_ddl_recovery.go) replays into the cast
 			// registry on the next startup. Mirrors CREATE TRANSFORM
 			// (M0119-0004).
-			if o.ctx.WAL != nil {
-				if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateCast(cs.SourceType, cs.TargetType, cs.Context, cs.Method, cs.OID, cs.FuncOID)); werr != nil {
-					return fmt.Errorf("wal create-cast: %w", werr)
+			// B2.2a: the cast journals as a real pg_cast heap row + both
+			// index entries (kind 38 retired); the startup reload
+			// reconstructs the registry from the heap.
+			if catalogHeapSyncAvailable(o.ctx) {
+				if writeCastCatalogRow(o.ctx, cs) == nil {
+					mirrorCastCatalogFiles(o.ctx)
 				}
 			}
 		}
@@ -16401,15 +16431,18 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		// Register user-created schema so schema-qualified queries resolve correctly.
 		if s.ObjName.Name != "" {
 			im.RegisterSchema(s.ObjName.Name)
-			// M0110-0003: persist the schema so it survives a restart. goopg
-			// has no per-schema on-disk file namespace, so we record a WAL
-			// event the recovery driver replays into the schema registry
-			// (mirrors CREATE DATABASE, M0054-0001). The OID just assigned by
-			// RegisterSchema is carried so recovery restores the same OID.
-			if o.ctx.WAL != nil {
+			// B1.1 (doc 02c §1): persist the schema PG-style — a real
+			// pg_namespace heap INSERT + index entries (the WAL stream
+			// carries XLOG_HEAP_INSERT + 2× XLOG_BTREE_INSERT_LEAF, exactly
+			// PG's CREATE SCHEMA shape); recovery re-registers it via the
+			// generic heap reload. Replaces the bespoke
+			// RecordKindCreateSchema record (M0110-0003, retired).
+			if o.ctx.Pool != nil {
 				oid := im.SchemaOID(s.ObjName.Name)
-				if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateSchema(s.ObjName.Name, oid)); werr != nil {
-					return fmt.Errorf("wal create-schema: %w", werr)
+				owner := im.SchemaOwnerOID(s.ObjName.Name)
+				if err := syncSchemaToCatalogHeap(o.ctx, im, s.ObjName.Name, oid, owner); err != nil {
+					im.UnregisterSchema(s.ObjName.Name)
+					return fmt.Errorf("create-schema catalog heap: %w", err)
 				}
 			}
 		}
@@ -17218,15 +17251,10 @@ func (o *ddlOp) resyncTypeACLHeapRow(im *catalog.InMemory, oid uint32, kind user
 		return err
 	}
 	deleteTypeFromCatalogHeap(ctx, catalog.DefaultDBOid, oid, ctx.Tx.XID)
-	typeRel := storage.RelFileNode{
-		DBOid:  catalog.DefaultDBOid,
-		RelOid: catalog.TypeRelationId,
-		Fork:   storage.MainFork,
-	}
-	if _, err := writeHeapRowCanonical(ctx, typeRel, pgTypeColumnsPG18(), row); err != nil {
+	if err := writeTypeHeapRowWithIndexes(ctx, row); err != nil {
 		return err
 	}
-	_ = mirrorCatalogRelToPostgresDB(ctx, catalog.TypeRelationId)
+	mirrorTypeCatalogFiles(ctx)
 	return nil
 }
 
@@ -17870,9 +17898,14 @@ func (o *ddlOp) execAlterSchema(s *parser.AlterSchemaStmt) error {
 		if err != nil {
 			return &ExecError{Code: "3F000", Pos: s.Pos(), Message: err.Error()}
 		}
-		if o.ctx.WAL != nil {
-			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterSchemaRename(s.Name, s.NewName)); werr != nil {
-				return fmt.Errorf("wal alter-schema-rename: %w", werr)
+		// B1.1: journal the rename as a non-HOT pg_namespace heap UPDATE
+		// (xl_heap_update; nspname is indexed → fresh entries in BOTH
+		// indexes), replacing RecordKindAlterSchemaRename (retired).
+		if o.ctx.Pool != nil {
+			oid := im.SchemaOID(s.NewName)
+			owner := im.SchemaOwnerOID(s.NewName)
+			if err := updateSchemaCatalogHeapRow(o.ctx, im, s.Name, s.NewName, oid, owner); err != nil {
+				return fmt.Errorf("alter-schema-rename catalog heap: %w", err)
 			}
 		}
 		for _, tbl := range moved {
@@ -17884,8 +17917,8 @@ func (o *ddlOp) execAlterSchema(s *parser.AlterSchemaStmt) error {
 			seqDBOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
 			if RenameSequence(oldFull, newFull, seqDBOid) || RenameSequence(tbl.Name, newFull, seqDBOid) {
 				if o.ctx.WAL != nil {
-					_, _, _ = o.ctx.WAL.Append(wal.EncodeDropSequence(strings.ToLower(strings.TrimSpace(oldFull)), seqDBOid))
-					_, _, _ = o.ctx.WAL.Append(wal.EncodeDropSequence(strings.ToLower(strings.TrimSpace(tbl.Name)), seqDBOid))
+					dropSequenceCatalogHeapRow(o.ctx, strings.ToLower(strings.TrimSpace(oldFull)), seqDBOid)  // B1.3: pg_sequence heap row
+					dropSequenceCatalogHeapRow(o.ctx, strings.ToLower(strings.TrimSpace(tbl.Name)), seqDBOid) // B1.3: pg_sequence heap row
 				}
 				WALLogSequenceState(o.ctx, newFull)
 				capturedNewFull := newFull
@@ -17919,9 +17952,12 @@ func (o *ddlOp) execAlterSchema(s *parser.AlterSchemaStmt) error {
 		if !im.SetSchemaOwner(s.Name, ownerOID) {
 			return &ExecError{Code: "3F000", Pos: s.Pos(), Message: fmt.Sprintf("schema %q does not exist", s.Name)}
 		}
-		if o.ctx.WAL != nil {
-			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterSchemaOwner(s.Name, ownerOID)); werr != nil {
-				return fmt.Errorf("wal alter-schema-owner: %w", werr)
+		// B1.1: journal the owner change as a pg_namespace heap UPDATE
+		// (xl_heap_update), replacing RecordKindAlterSchemaOwner (retired).
+		if o.ctx.Pool != nil {
+			oid := im.SchemaOID(s.Name)
+			if err := updateSchemaCatalogHeapRow(o.ctx, im, s.Name, s.Name, oid, ownerOID); err != nil {
+				return fmt.Errorf("alter-schema-owner catalog heap: %w", err)
 			}
 		}
 		return nil
@@ -18090,17 +18126,12 @@ func (o *ddlOp) execCreateAggregate(s *parser.CreateAggregateStmt) error {
 	}
 	agg.NamespaceOID = nsOID
 	o.ctx.Catalog.RegisterUserAggregate(agg)
-	syncAggregateToCatalogHeap(o.ctx, agg)
-	// DU-002 restart-persistence follow-up (M0119-0004, slice 405 ledger
-	// resume point (c)): goopg has no per-aggregate on-disk file namespace,
-	// so record a WAL event the recovery driver
-	// (internal/initdb/aggregate_ddl_recovery.go) replays into the
-	// user-aggregate registry on the next startup. Mirrors CREATE
-	// CAST/TRANSFORM/CONVERSION/COLLATION.
-	if o.ctx.WAL != nil {
-		if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateAggregate(agg.Name, schema, agg.SType, agg.SFunc, agg.FinalFunc, agg.CombineFunc, agg.InitCond, agg.FinalFuncModify, agg.ArgTypes, agg.OID, agg.SFuncStrict, agg.Variadic)); werr != nil {
-			return fmt.Errorf("wal create-aggregate: %w", werr)
-		}
+	// B2.2 slice 2 (doc 02d §1): the aggregate journals PG-style — a
+	// prokind='a' pg_proc row (routine funnel: heap + 2690/2691) plus the
+	// pg_aggregate row with its 2650 entry; the startup reload joins both
+	// heaps (kind 46 retired, aggregate_ddl_recovery.go deleted).
+	if err := writeAggregateCatalogRows(o.ctx, agg, schema); err != nil {
+		return fmt.Errorf("pg_aggregate journal: %w", err)
 	}
 	return nil
 }
@@ -18117,13 +18148,10 @@ func (o *ddlOp) execAlterAggregateRename(s *parser.AlterAggregateRenameStmt) err
 		return &ExecError{Code: "42883", Pos: s.Pos(),
 			Message: fmt.Sprintf("aggregate %s does not exist", oldName)}
 	}
-	// DU-002 restart-persistence follow-up (M0119-0004, slice 405 ledger
-	// resume point (c)): mirrors execCreateAggregate's WAL emission so the
-	// rename survives a restart.
-	if o.ctx.WAL != nil {
-		if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterAggregateRename(oldName, newName)); werr != nil {
-			return fmt.Errorf("wal alter-aggregate-rename: %w", werr)
-		}
+	// B2.2 slice 2: the rename is a canonical pg_proc heap UPDATE of the
+	// aggregate's prokind='a' row (kind 47 retired).
+	if agg, ok := im.LookupUserAggregateByName(newName); ok {
+		updateAggregateProcRow(o.ctx, agg)
 	}
 	return nil
 }
@@ -18150,13 +18178,10 @@ func (o *ddlOp) execAlterAggregateOwner(s *parser.AlterAggregateOwnerStmt) error
 		return &ExecError{Code: "42883", Pos: s.Pos(),
 			Message: fmt.Sprintf("aggregate %s does not exist", name)}
 	}
-	// DU-002 restart-persistence follow-up (M0119-0004): mirrors
-	// execAlterAggregateRename's WAL emission so the ownership change
-	// survives a restart.
-	if o.ctx.WAL != nil {
-		if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterAggregateOwner(name, ownerOID)); werr != nil {
-			return fmt.Errorf("wal alter-aggregate-owner: %w", werr)
-		}
+	// B2.2 slice 2: the owner change is a canonical pg_proc heap UPDATE of
+	// the aggregate's prokind='a' row (kind 49 retired).
+	if agg, ok := im.LookupUserAggregateByName(name); ok {
+		updateAggregateProcRow(o.ctx, agg)
 	}
 	return nil
 }
@@ -18651,14 +18676,9 @@ func (o *ddlOp) execCreateType(s *parser.CreateTypeStmt) error {
 				}
 				o.ctx.PendingCreatedRangeTypes[strings.ToLower(s.Name)] = true
 			}
-			// DU-002 restart-persistence follow-up (M0110-0001, DU-002 slice
-			// 429 ledger resume point, sub-item (c)): mirrors CREATE ACCESS
-			// METHOD.
-			if o.ctx.WAL != nil {
-				if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateRangeType(rt.Name, rt.SubtypeName, rt.MultirangeName, rt.OID, rt.ArrayOID, rt.MultirangeOID, rt.MultirangeArrayOID, rt.OpclassOID, rt.CollationOID, rt.Owner)); werr != nil {
-					return fmt.Errorf("wal create-range-type: %w", werr)
-				}
-			}
+			// B2.1c: no bespoke WAL record — the pg_type + pg_range heap
+			// inserts (syncRangeTypeToCatalogHeap above) ARE the journal
+			// (kind 81 retired); reload = reloadUserRangeTypesFromHeap.
 			return nil
 		}
 		// Composite / base types — register the name so DROP TYPE can
@@ -18911,6 +18931,22 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 	if s.RenameOldValue != "" {
 		err := cat.RenameEnumValue(s.Name, s.RenameOldValue, s.RenameNewValue, o.ctx.CurrentDatabaseOid)
 		if err == nil {
+			// B2.1d: re-journal the renamed label's pg_enum row (delete +
+			// insert — the label OID is stable, only enumlabel changed).
+			if et, ok := cat.LookupEnum(s.Name, o.ctx.CurrentDatabaseOid); ok && catalogHeapSyncAvailable(o.ctx) {
+				for _, ev := range et.Values {
+					if ev.Label != s.RenameNewValue {
+						continue
+					}
+					if o.ctx.MaterializeWriterXID() == nil {
+						deleteEnumLabelRowByOID(o.ctx, ev.OID, o.ctx.Tx.XID)
+						if writeEnumLabelRow(o.ctx, et, ev) == nil {
+							mirrorEnumCatalogFiles(o.ctx)
+						}
+					}
+					break
+				}
+			}
 			return nil
 		}
 		switch e := err.(type) {
@@ -18939,21 +18975,16 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 			if err := cat.RenameRangeType(s.Name, s.RenameTo, o.ctx.CurrentDatabaseOid); err != nil {
 				return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 			}
-			// M0122-0005 restart-persistence follow-up (deferral ledger
-			// 2026-07-06 row, resume point (1)): mirrors execAlterCollation's
-			// RENAME TO WAL logging so a range-type rename survives a
-			// restart.
-			if o.ctx.WAL != nil {
-				if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterRangeTypeRename(s.Name, s.RenameTo)); werr != nil {
-					return fmt.Errorf("wal alter-range-type-rename: %w", werr)
-				}
-			}
+			// B2.1c: the rename journals as non-HOT pg_type heap updates of
+			// all four rows (kind 117 retired).
+			o.resyncRangeHeapAfterAlter(cat, s.RenameTo)
 			return nil
 		}
 		err := cat.RenameEnum(s.Name, s.RenameTo, o.ctx.CurrentDatabaseOid)
 		if err != nil {
 			return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 		}
+		o.resyncEnumHeapAfterAlter(cat, s.RenameTo)
 		if o.ctx.Session != nil && o.ctx.Session.TracksDDLUndo() {
 			oldK := strings.ToLower(s.Name)
 			newK := strings.ToLower(s.RenameTo)
@@ -18987,20 +19018,15 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 		}
 		if _, ok := cat.LookupRangeType(s.Name, o.ctx.CurrentDatabaseOid); ok {
 			cat.SetRangeTypeOwner(s.Name, ownerOID, o.ctx.CurrentDatabaseOid)
-			// M0122-0005 restart-persistence follow-up (deferral ledger
-			// 2026-07-06 row, resume point (1)): mirrors
-			// execAlterCollation's OWNER TO WAL logging so a range-type
-			// owner change survives a restart.
-			if o.ctx.WAL != nil {
-				if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterRangeTypeOwner(s.Name, ownerOID)); werr != nil {
-					return fmt.Errorf("wal alter-range-type-owner: %w", werr)
-				}
-			}
+			// B2.1c: the owner change journals as non-HOT pg_type heap
+			// updates (kind 118 retired).
+			o.resyncRangeHeapAfterAlter(cat, s.Name)
 			return nil
 		}
 		if !cat.SetEnumOwner(s.Name, ownerOID, o.ctx.CurrentDatabaseOid) {
 			return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("type %q does not exist", s.Name)}
 		}
+		o.resyncEnumHeapAfterAlter(cat, s.Name)
 		return nil
 	}
 	if s.AddValue == "" {
@@ -19008,6 +19034,19 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 	}
 	skipped, err := cat.AddEnumValueResult(s.Name, s.AddValue, s.IfNotExists, s.Before, s.After, o.ctx.CurrentDatabaseOid)
 	if err == nil {
+		// B2.1d: journal the new label as a pg_enum heap INSERT.
+		if !skipped && catalogHeapSyncAvailable(o.ctx) {
+			if et, ok := cat.LookupEnum(s.Name, o.ctx.CurrentDatabaseOid); ok {
+				for _, ev := range et.Values {
+					if ev.Label == s.AddValue {
+						if writeEnumLabelRow(o.ctx, et, ev) == nil {
+							mirrorEnumCatalogFiles(o.ctx)
+						}
+						break
+					}
+				}
+			}
+		}
 		if skipped {
 			// IF NOT EXISTS with existing label: emit NOTICE, continue.
 			o.ctx.AddNotice(fmt.Sprintf("enum label %q already exists, skipping", s.AddValue))
@@ -19154,8 +19193,12 @@ func (o *ddlOp) execDropType(s *parser.DropTypeStmt) error {
 				deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, et.OID, o.ctx.Tx.XID)
 				// Also stamp the auto-generated array type row (`_name`). DU-002 slice 89.
 				deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, et.ArrayOID, o.ctx.Tx.XID)
-				// Mirror pg_type to postgres db so the xmax stamp is visible via SeqScan.
-				_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.TypeRelationId)
+				// B2.1d: the enum's pg_enum label rows die with it.
+				deleteEnumLabelRowsByTypid(o.ctx, et.OID, o.ctx.Tx.XID)
+				// Mirror pg_type + pg_enum to postgres db so the xmax stamps
+				// are visible via SeqScan / the reload.
+				mirrorTypeCatalogFiles(o.ctx)
+				mirrorEnumCatalogFiles(o.ctx)
 			}
 		}
 		enumErr := cat.DropEnum(n, s.Cascade, o.ctx.CurrentDatabaseOid)
@@ -19191,19 +19234,16 @@ func (o *ddlOp) execDropType(s *parser.DropTypeStmt) error {
 				deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, rt.ArrayOID, o.ctx.Tx.XID)
 				deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, rt.MultirangeOID, o.ctx.Tx.XID)
 				deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, rt.MultirangeArrayOID, o.ctx.Tx.XID)
-				_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.TypeRelationId)
+				// B2.1c: the pg_range row dies with the type.
+				deleteRangeCatalogRow(o.ctx, rt.OID, o.ctx.Tx.XID)
+				mirrorTypeCatalogFiles(o.ctx)
+				mirrorRangeCatalogFiles(o.ctx)
 			}
 		}
+		// B2.1c: no bespoke WAL record — the heap deletes above ARE the
+		// journal (kind 82 retired).
 		rangeErr := cat.DropRangeType(n, o.ctx.CurrentDatabaseOid)
 		if rangeErr == nil {
-			// DU-002 restart-persistence follow-up (M0110-0001, DU-002
-			// slice 429 ledger resume point, sub-item (c)): mirrors DROP
-			// ACCESS METHOD.
-			if o.ctx.WAL != nil {
-				if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropRangeType(n)); werr != nil {
-					return fmt.Errorf("wal drop-range-type: %w", werr)
-				}
-			}
 			continue // successfully dropped as range type
 		}
 		// Neither enum, composite, nor range — report error or IF EXISTS notice.
@@ -19262,34 +19302,21 @@ func (o *ddlOp) execCreateDomain(s *parser.CreateDomainStmt) error {
 	// domain and a column of the domain type round-trips as its declared type.
 	// DU-002 slice 90.
 	syncDomainTypeToCatalogHeap(o.ctx, d)
-	// M0122-0005 restart-persistence follow-up (deferral ledger 2026-07-06
-	// row: "domains have no restart persistence at all"): snapshot the full
-	// domain definition (base type, NOT NULL, DEFAULT, CHECKs, owner) so a
-	// restarted server rediscovers it, mirroring CREATE TYPE ... AS RANGE.
-	if o.ctx.WAL != nil {
-		checks := make([]wal.DomainCheckPayload, 0, len(d.Checks))
-		for _, c := range d.Checks {
-			checks = append(checks, wal.DomainCheckPayload{
-				OID:      c.OID,
-				Name:     c.Name,
-				Expr:     c.Expr,
-				InValues: c.InValues,
-			})
+	// B2.1b (docs/design/wal-pg-identical-stream/02d §1): each CHECK journals
+	// as a real pg_constraint heap row — the WAL stream carries ordinary
+	// XLOG_HEAP_INSERTs and the startup reload reconstructs the domain from
+	// the pg_type + pg_constraint heaps. This replaced the bespoke
+	// CreateDomain record (kind 119, retired — it FATAL'd any attached real
+	// PG standby with "resource manager with ID 128 not registered").
+	if catalogHeapSyncAvailable(o.ctx) {
+		wrote := false
+		for _, chk := range d.Checks {
+			if writeDomainCheckConstraintRow(o.ctx, d, chk) == nil {
+				wrote = true
+			}
 		}
-		if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateDomain(wal.CreateDomainPayload{
-			Name:       d.Name,
-			OID:        d.OID,
-			ArrayOID:   d.ArrayOID,
-			BaseName:   d.Base.Name,
-			BaseArgs:   d.Base.Args,
-			BaseOID:    d.BaseOID,
-			BaseIsEnum: d.BaseIsEnum,
-			NotNull:    d.NotNull,
-			Owner:      d.Owner,
-			DefaultSQL: catalog.FormatExprForAttrdef(d.Default),
-			Checks:     checks,
-		})); werr != nil {
-			return fmt.Errorf("wal create-domain: %w", werr)
+		if wrote {
+			mirrorConstraintCatalogFiles(o.ctx)
 		}
 	}
 	return nil
@@ -19313,6 +19340,7 @@ func (o *ddlOp) execAlterDomain(s *parser.AlterDomainStmt) error {
 		if err := cat.RenameDomain(s.Name, s.NewName, dbOid); err != nil {
 			return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 		}
+		o.resyncDomainHeapAfterAlter(cat, s.NewName, dbOid)
 		return nil
 	case "owner":
 		ownerOID := uint32(10) // bootstrap superuser, mirrors execAlterSchema/execAlterType's default
@@ -19326,6 +19354,7 @@ func (o *ddlOp) execAlterDomain(s *parser.AlterDomainStmt) error {
 		if !cat.SetDomainOwner(s.Name, ownerOID, dbOid) {
 			return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("type %q does not exist", s.Name)}
 		}
+		o.resyncDomainHeapAfterAlter(cat, s.Name, dbOid)
 		return nil
 	case "renameconstraint":
 		if err := cat.RenameDomainConstraint(s.Name, s.ConstraintName, s.NewConstraintName, dbOid); err != nil {
@@ -19335,6 +19364,9 @@ func (o *ddlOp) execAlterDomain(s *parser.AlterDomainStmt) error {
 			}
 			return &ExecError{Code: code, Pos: s.Pos(), Message: err.Error()}
 		}
+		// B2.1b: re-journal the renamed constraint row (delete + insert —
+		// the OID is stable, only conname changed).
+		o.resyncDomainConstraintRow(cat, s.Name, s.NewConstraintName, dbOid)
 		return nil
 	case "addconstraint":
 		d, found := cat.LookupDomain(s.Name, dbOid)
@@ -19354,21 +19386,52 @@ func (o *ddlOp) execAlterDomain(s *parser.AlterDomainStmt) error {
 			}
 			return &ExecError{Code: code, Pos: s.Pos(), Message: err.Error()}
 		}
+		// B2.1b: journal the new constraint as a pg_constraint heap INSERT.
+		if dd, ok := cat.LookupDomain(s.Name, dbOid); ok && catalogHeapSyncAvailable(o.ctx) && len(dd.Checks) > 0 {
+			chk := dd.Checks[len(dd.Checks)-1]
+			if s.ConstraintName != "" {
+				for _, c := range dd.Checks {
+					if c.Name == s.ConstraintName {
+						chk = c
+						break
+					}
+				}
+			}
+			if writeDomainCheckConstraintRow(o.ctx, dd, chk) == nil {
+				mirrorConstraintCatalogFiles(o.ctx)
+			}
+		}
 		return nil
 	case "dropconstraint":
+		// Capture the constraint's OID before the registry drop (B2.1b).
+		var dropConOID uint32
+		if dd, ok := cat.LookupDomain(s.Name, dbOid); ok {
+			for _, c := range dd.Checks {
+				if c.Name == s.ConstraintName {
+					dropConOID = c.OID
+					break
+				}
+			}
+		}
 		if err := cat.DropDomainConstraint(s.Name, s.ConstraintName, s.IfExists, dbOid); err != nil {
 			return &ExecError{Code: "42704", Pos: s.Pos(), Message: err.Error()} // ERRCODE_UNDEFINED_OBJECT, matches real PG
+		}
+		if dropConOID != 0 && catalogHeapSyncAvailable(o.ctx) && o.ctx.MaterializeWriterXID() == nil {
+			deleteConstraintRowByOID(o.ctx, dropConOID, o.ctx.Tx.XID)
+			mirrorConstraintCatalogFiles(o.ctx)
 		}
 		return nil
 	case "setdefault":
 		if !cat.SetDomainDefault(s.Name, s.DefaultExpr, dbOid) {
 			return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("type %q does not exist", s.Name)}
 		}
+		o.resyncDomainHeapAfterAlter(cat, s.Name, dbOid)
 		return nil
 	case "dropdefault":
 		if !cat.SetDomainDefault(s.Name, nil, dbOid) {
 			return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("type %q does not exist", s.Name)}
 		}
+		o.resyncDomainHeapAfterAlter(cat, s.Name, dbOid)
 		return nil
 	case "setnotnull":
 		// SET NOT NULL — unlike real PG's AlterDomainNotNull, this does not
@@ -19378,14 +19441,113 @@ func (o *ddlOp) execAlterDomain(s *parser.AlterDomainStmt) error {
 		if !cat.SetDomainNotNull(s.Name, true, dbOid) {
 			return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("type %q does not exist", s.Name)}
 		}
+		o.resyncDomainHeapAfterAlter(cat, s.Name, dbOid)
 		return nil
 	case "dropnotnull":
 		if !cat.SetDomainNotNull(s.Name, false, dbOid) {
 			return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("type %q does not exist", s.Name)}
 		}
+		o.resyncDomainHeapAfterAlter(cat, s.Name, dbOid)
 		return nil
 	}
 	return nil
+}
+
+// resyncDomainHeapAfterAlter journals a successful ALTER DOMAIN mutation as
+// PG-shaped catalog heap traffic (B2.1b): non-HOT xl_heap_update of the
+// domain's pg_type row + its array peer via the TID cache. Best-effort like
+// syncDomainTypeToCatalogHeap (a failed sync must not fail the DDL — the
+// registry mutation already succeeded).
+func (o *ddlOp) resyncDomainHeapAfterAlter(cat *catalog.InMemory, name string, dbOid uint32) {
+	if !catalogHeapSyncAvailable(o.ctx) {
+		return
+	}
+	d, ok := cat.LookupDomain(name, dbOid)
+	if !ok {
+		return
+	}
+	if err := updateTypeHeapRowWithIndexes(o.ctx, buildUserPGTypeRowForDomain(d)); err != nil {
+		return
+	}
+	if err := updateTypeHeapRowWithIndexes(o.ctx, buildUserPGTypeRowForDomainArray(d)); err != nil {
+		return
+	}
+	mirrorTypeCatalogFiles(o.ctx)
+}
+
+// resyncRangeHeapAfterAlter journals a successful ALTER TYPE (range
+// rename/owner) as non-HOT pg_type heap updates of all four rows via the
+// TID cache (B2.1c). Best-effort like syncRangeTypeToCatalogHeap. The
+// pg_range row is immutable under rename/owner (all-OID columns), so only
+// the pg_type rows re-journal.
+func (o *ddlOp) resyncRangeHeapAfterAlter(cat *catalog.InMemory, name string) {
+	if !catalogHeapSyncAvailable(o.ctx) {
+		return
+	}
+	rt, ok := cat.LookupRangeType(name, o.ctx.CurrentDatabaseOid)
+	if !ok {
+		return
+	}
+	if err := updateTypeHeapRowWithIndexes(o.ctx, buildUserPGTypeRowForRange(rt)); err != nil {
+		return
+	}
+	if err := updateTypeHeapRowWithIndexes(o.ctx, buildUserPGTypeRowForRangeArray(rt)); err != nil {
+		return
+	}
+	if err := updateTypeHeapRowWithIndexes(o.ctx, buildUserPGTypeRowForMultirange(rt)); err != nil {
+		return
+	}
+	if err := updateTypeHeapRowWithIndexes(o.ctx, buildUserPGTypeRowForMultirangeArray(rt)); err != nil {
+		return
+	}
+	mirrorTypeCatalogFiles(o.ctx)
+}
+
+// resyncEnumHeapAfterAlter journals a successful ALTER TYPE (enum
+// rename/owner) as non-HOT pg_type heap updates of the enum + array rows
+// via the TID cache (B2.1d). The pg_enum label rows are keyed by the stable
+// type OID and need no change. Best-effort like syncEnumTypeToCatalogHeap.
+func (o *ddlOp) resyncEnumHeapAfterAlter(cat *catalog.InMemory, name string) {
+	if !catalogHeapSyncAvailable(o.ctx) {
+		return
+	}
+	et, ok := cat.LookupEnum(name, o.ctx.CurrentDatabaseOid)
+	if !ok {
+		return
+	}
+	if err := updateTypeHeapRowWithIndexes(o.ctx, buildUserPGTypeRowForEnum(et)); err != nil {
+		return
+	}
+	if err := updateTypeHeapRowWithIndexes(o.ctx, buildUserPGTypeRowForEnumArray(et)); err != nil {
+		return
+	}
+	mirrorTypeCatalogFiles(o.ctx)
+}
+
+// resyncDomainConstraintRow re-journals one domain CHECK's pg_constraint row
+// after a rename (delete the old version + insert the new — the constraint
+// OID is stable, only conname changed). B2.1b.
+func (o *ddlOp) resyncDomainConstraintRow(cat *catalog.InMemory, domainName, constraintName string, dbOid uint32) {
+	if !catalogHeapSyncAvailable(o.ctx) {
+		return
+	}
+	d, ok := cat.LookupDomain(domainName, dbOid)
+	if !ok {
+		return
+	}
+	for _, chk := range d.Checks {
+		if chk.Name != constraintName {
+			continue
+		}
+		if o.ctx.MaterializeWriterXID() != nil {
+			return
+		}
+		deleteConstraintRowByOID(o.ctx, chk.OID, o.ctx.Tx.XID)
+		if writeDomainCheckConstraintRow(o.ctx, d, chk) == nil {
+			mirrorConstraintCatalogFiles(o.ctx)
+		}
+		return
+	}
 }
 
 // domainInValuesCheckExpr renders a `CHECK (VALUE IN (...))` domain constraint as
@@ -19730,17 +19892,19 @@ func (o *ddlOp) execDropDomain(s *parser.DropDomainStmt) error {
 				if d.ArrayOID != 0 {
 					deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, d.ArrayOID, o.ctx.Tx.XID)
 				}
-				_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.TypeRelationId)
+				// B2.1b: the domain's pg_constraint rows die with it.
+				for _, chk := range d.Checks {
+					deleteConstraintRowByOID(o.ctx, chk.OID, o.ctx.Tx.XID)
+				}
+				mirrorTypeCatalogFiles(o.ctx)
+				mirrorConstraintCatalogFiles(o.ctx)
 			}
 		}
 		// names = dropped tables (CASCADE) or blocking tables (RESTRICT).
+		// B2.1b: no bespoke WAL record — the heap deletes above ARE the
+		// journal (kind 120 retired).
 		names, err := cat.DropDomain(name.Name, false, s.Cascade, o.ctx.CurrentDatabaseOid)
 		if err == nil {
-			if o.ctx.WAL != nil {
-				if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropDomain(name.Name)); werr != nil {
-					return fmt.Errorf("wal drop-domain: %w", werr)
-				}
-			}
 			for _, tblName := range names {
 				o.ctx.AddNotice(fmt.Sprintf("drop cascades to table %s", tblName))
 			}

@@ -241,6 +241,42 @@ func EncodeHeapHotUpdatePG(rel storage.RelFileNode, blk storage.BlockNumber, old
 	return framePGAssembled(RmgrHeap, xlogHeapHotUpdate, uint32(xmax), body), nil
 }
 
+// EncodeHeapUpdatePG builds a PostgreSQL xl_heap_update record for one NON-HOT
+// heap update (XLOG_HEAP_UPDATE, 0x20) — B0.2's catalog-ALTER record (doc 02a
+// §3), shared with any future non-HOT user-table flip. Layout mirrors upstream
+// log_heap_update (heapam.c): main data is the same 14-byte xl_heap_update as
+// the HOT form; block 0 is the NEW tuple's page carrying xl_heap_header +
+// tuple bytes; when the old version lives on a DIFFERENT page, block 1
+// references it (no data). Same-page updates carry a single block 0, exactly
+// like PG. Prefix/suffix compression is not used. xl_xid = xmax (the updating
+// xact); replay stamps the old tuple WITHOUT HOT bits (the successor is
+// reached via indexes) and places the new version at new_offnum.
+func EncodeHeapUpdatePG(rel storage.RelFileNode, oldBlk storage.BlockNumber, oldSlot uint16,
+	newBlk storage.BlockNumber, newSlot uint16, xmax storage.TransactionID, newTuple []byte) ([]byte, error) {
+	if len(newTuple) < storage.SizeOfHeapTupleHeaderData {
+		return nil, fmt.Errorf("wal: heap-update new tuple %d bytes < fixed header %d", len(newTuple), storage.SizeOfHeapTupleHeaderData)
+	}
+	mainData := make([]byte, sizeOfXLogHeapUpdateData)
+	binary.LittleEndian.PutUint32(mainData[0:4], uint32(xmax)) // old_xmax
+	binary.LittleEndian.PutUint16(mainData[4:6], oldSlot)      // old_offnum
+	mainData[6] = 0                                            // old_infobits_set
+	mainData[7] = xlhUpdateContainsNewTuple                    // flags
+	// new_xmax [8:12] stays 0 (the new tuple is not deleted).
+	binary.LittleEndian.PutUint16(mainData[12:14], newSlot) // new_offnum
+
+	blocks := []BlockRef{{
+		ID: 0, Rel: rel, Block: newBlk, Data: heapHeaderPlusData(newTuple),
+	}}
+	if oldBlk != newBlk {
+		blocks = append(blocks, BlockRef{ID: 1, Rel: rel, Block: oldBlk})
+	}
+	body, err := assembleXLogRecord(mainData, blocks)
+	if err != nil {
+		return nil, err
+	}
+	return framePGAssembled(RmgrHeap, xlogHeapUpdate, uint32(xmax), body), nil
+}
+
 // sizeOfXLogBtreeInsertData is PG's SizeOfBtreeInsert: offnum(2).
 const sizeOfXLogBtreeInsertData = 2
 
@@ -567,6 +603,94 @@ func EncodeClogTruncatePG(oldestXid storage.TransactionID, oldestXactDb uint32) 
 		return nil, err
 	}
 	return framePGAssembled(RmgrCLOG, xlogClogTruncate, 0, body), nil
+}
+
+// EncodeCheckpointPG builds a PostgreSQL RM_XLOG checkpoint record carrying the
+// 88-byte CheckPoint struct as main data, tagged with the EXPLICIT opcode —
+// XLOG_CHECKPOINT_SHUTDOWN (0x00) or XLOG_CHECKPOINT_ONLINE (0x10) — via the
+// assembled-record path (A9-checkpoint-opcode). This replaces classifyXLogRecord's
+// retired classify-by-len==88 hack, which could only ever stamp SHUTDOWN.
+//
+// oldestActiveXid follows upstream CreateCheckPoint (xlog.c): the caller passes
+// InvalidTransactionId (0) for a shutdown checkpoint — recovery derives the value
+// from PrescanPreparedTransactions on that path — and the oldest running xid
+// (nextXid when none) for an online one. An ONLINE checkpoint MUST be preceded by
+// an XLOG_RUNNING_XACTS record (EncodeRunningXactsPG) or a hot-standby PG never
+// reaches STANDBY_SNAPSHOT_READY; the checkpointer owns that pairing.
+//
+// Routing: the header xid is 0 and the main data is 88 bytes, but no RecordKind
+// maps to (RmgrXLog, 0x00|0x10) in recordKindToRmgrInfo, so
+// nativeHeaderMatchesMainData can never match — the record always reaches the
+// decoded replay path (a recognised no-op; checkpoint consumers are the
+// header-driven isCheckpointRecord/replayStart, not replay).
+func EncodeCheckpointPG(shutdown bool, redoLSN0 uint64, tli uint32, nextXid uint64, nextOid uint32, oldestActiveXid uint32) ([]byte, error) {
+	if nextXid < 3 {
+		nextXid = 3
+	}
+	mainData := encodeCheckPointStruct(redoLSN0, tli, nextXid, nextOid, oldestActiveXid)
+	body, err := assembleXLogRecord(mainData, nil)
+	if err != nil {
+		return nil, err
+	}
+	info := xlogCheckpointOnline
+	if shutdown {
+		info = xlogCheckpointShutdown
+	}
+	return framePGAssembled(RmgrXLog, info, 0, body), nil
+}
+
+// EncodeCheckpointRedoPG builds the PG17+ RM_XLOG XLOG_CHECKPOINT_REDO record
+// that marks the redo point of an ONLINE checkpoint (upstream CreateCheckPoint,
+// xlog.c:7099: "the LSN at which it starts becomes the new redo pointer").
+// Recovery reads the record at CheckPoint.redo and FATALs with "unexpected
+// record type found at redo point" unless it is exactly this. Main data is the
+// 4-byte wal_level (replica=1), included upstream for the WAL summarizer.
+// Shutdown checkpoints don't emit it — the checkpoint record itself marks redo.
+func EncodeCheckpointRedoPG() ([]byte, error) {
+	mainData := binary.LittleEndian.AppendUint32(make([]byte, 0, 4), 1) // wal_level=replica
+	body, err := assembleXLogRecord(mainData, nil)
+	if err != nil {
+		return nil, err
+	}
+	return framePGAssembled(RmgrXLog, xlogCheckpointRedo, 0, body), nil
+}
+
+// minSizeOfXlRunningXacts is offsetof(xl_running_xacts, xids) in PG18
+// (storage/standbydefs.h): xcnt(4) + subxcnt(4) + subxid_overflow(1+3 pad) +
+// nextXid(4) + oldestRunningXid(4) + latestCompletedXid(4).
+const minSizeOfXlRunningXacts = 24
+
+// EncodeRunningXactsPG builds a PostgreSQL RM_STANDBY XLOG_RUNNING_XACTS record
+// (upstream LogCurrentRunningXacts, storage/standby.c) — the running-transaction
+// snapshot a hot-standby PG needs to reach STANDBY_SNAPSHOT_READY after an
+// ONLINE checkpoint. xids are goopg's running TOP-LEVEL xids (mvcc snapshot
+// InProgress — one xid per proc slot; sub-xids live in pg_subtrans, never in
+// slots), so subxcnt is always 0. subxid_overflow is stamped true whenever any
+// xact is running: goopg cannot cheaply prove those xacts hold no live sub-xids,
+// and overflow=true is the PG-legal conservative encoding (the standby falls
+// back to pg_subtrans-era tracking until the snapshot xacts drain). An idle
+// snapshot (no xids) is exact: overflow=false, oldestRunning = nextXid,
+// latestCompleted = nextXid-1 — the standby becomes snapshot-ready immediately,
+// which is the pg_basebackup/failover fast path.
+func EncodeRunningXactsPG(nextXid, oldestRunning, latestCompleted uint32, xids []uint32) ([]byte, error) {
+	mainData := make([]byte, minSizeOfXlRunningXacts+4*len(xids))
+	le := binary.LittleEndian
+	le.PutUint32(mainData[0:4], uint32(len(xids))) // xcnt
+	le.PutUint32(mainData[4:8], 0)                 // subxcnt
+	if len(xids) > 0 {
+		mainData[8] = 1 // subxid_overflow (conservative; see doc comment)
+	}
+	le.PutUint32(mainData[12:16], nextXid)
+	le.PutUint32(mainData[16:20], oldestRunning)
+	le.PutUint32(mainData[20:24], latestCompleted)
+	for i, xid := range xids {
+		le.PutUint32(mainData[minSizeOfXlRunningXacts+4*i:], xid)
+	}
+	body, err := assembleXLogRecord(mainData, nil)
+	if err != nil {
+		return nil, err
+	}
+	return framePGAssembled(RmgrStandby, xlogStandbyRunningXacts, 0, body), nil
 }
 
 // DecodeXLogClogTruncate parses a PG xl_clog_truncate main-data body into its

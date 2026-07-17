@@ -105,8 +105,9 @@ type Manager struct {
 
 	// relcacheInvalPending is set by DDL that writes to nailed catalog
 	// relations (pg_class, pg_attribute, pg_proc, pg_type) so the
-	// xact-marker hook can emit RecordKindXactCommitInval and unlink
-	// both pg_internal.init files at commit time.
+	// xact-marker hook emits the commit record with the HAS_INVALS chunk
+	// (EncodeXactCommitPG(xid, true)) and unlinks both pg_internal.init
+	// files at commit time.
 	relcacheInvalPending atomic.Bool
 
 	// catalogXminSource, when installed, returns the smallest catalog_xmin

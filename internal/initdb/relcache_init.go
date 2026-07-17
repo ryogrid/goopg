@@ -723,6 +723,14 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// btree(conrelid oid_ops, contypid oid_ops, conname name_ops),
 	// indnatts=3, UNIQUE not PKEY.
 	{OID: 2665, Name: "pg_constraint_conrelid_contypid_conname_index"},
+	// B2.1b: pg_constraint_contypid_index (OID 2666, ConstraintTypidIndexId).
+	// PG's domain typcache (GetDomainConstraints, typcache.c) opens
+	// pg_constraint via this index on the FIRST use of any domain type —
+	// without a bootstrapped pg_class/pg_attribute/pg_index entry the
+	// standby raises "could not open relation with OID 2666" on every
+	// domain-typed cast (e.g. 42::public.b2prep_dom post-failover).
+	// btree(contypid oid_ops), indnatts=1, non-unique.
+	{OID: 2666, Name: "pg_constraint_contypid_index"},
 	{OID: 2688, Name: "pg_operator_oid_index"},
 	{OID: 2680, Name: "pg_inherits_relid_seqno_index"},
 	// M0106-0010 batched-36 loop 5: pg_namespace_nspname_index (OID 2684)

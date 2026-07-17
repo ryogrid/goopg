@@ -185,6 +185,60 @@ func runFailoverGoopgToPG(t *testing.T, repo, pgBasebackupBin, psqlBin string, m
 		"SELECT count(*) FROM public.bench_log WHERE client = -999",
 		1, 30*time.Second)
 
+	// B2-prep: a runtime CREATE FUNCTION flows to the standby as pg_proc
+	// heap + 2690/2691 index page writes; the post-failover assertion below
+	// proves PG resolves it by name (FuncnameGetCandidates → 2691) and
+	// executes it (PROCOID → 2690, prosrc).
+	if err := runSQLSimple(t, primary,
+		"CREATE FUNCTION public.b2prep_double(int) RETURNS int LANGUAGE sql AS 'SELECT $1 * 2'"); err != nil {
+		t.Fatalf("create function on goopg primary: %v", err)
+	}
+	// M0111-0002: a set-returning function pins the binary-float4 fix —
+	// prorows=1000 as the former 5-byte text varlena misaligned every
+	// pg_proc column after it (proargtypes!) under PG's attlen=4 TupleDesc,
+	// so PG could not resolve ANY goopg-created SRF by name.
+	if err := runSQLSimple(t, primary,
+		"CREATE FUNCTION public.b2prep_srf() RETURNS SETOF int LANGUAGE sql AS 'SELECT 7'"); err != nil {
+		t.Fatalf("create SRF on goopg primary: %v", err)
+	}
+	// B2.1a: a runtime CREATE TYPE AS ENUM writes pg_type heap rows +
+	// 2703/2704 index entries (2704 is lazily rooted from its empty
+	// bootstrap placeholder) and emits ONLY heap-insert/FPI records — no
+	// goopg-private WAL. The post-failover regtype probe proves PG resolves
+	// the type by name (LookupTypeName → TYPENAMENSP → 2704) and reads the
+	// runtime pg_type row. (CREATE DOMAIN still emits the bespoke kind-119
+	// RmgrGoopgCatalog record, which a real PG standby FATALs on —
+	// "resource manager with ID 128 not registered" — so the domain
+	// assertion arrives with B2.1b, which retires that record.)
+	if err := runSQLSimple(t, primary,
+		"CREATE TYPE public.b2prep_mood AS ENUM ('sad', 'happy')"); err != nil {
+		t.Fatalf("create enum type on goopg primary: %v", err)
+	}
+	// B2.1b: CREATE DOMAIN now journals as pg_type + pg_constraint heap
+	// inserts (kinds 119/120 retired — the bespoke record FATAL'd the
+	// standby with "resource manager with ID 128 not registered").
+	if err := runSQLSimple(t, primary,
+		"CREATE DOMAIN public.b2prep_dom AS int"); err != nil {
+		t.Fatalf("create domain on goopg primary: %v", err)
+	}
+	// B2.1c: CREATE TYPE AS RANGE journals pg_type + pg_range heap inserts
+	// (kinds 81/82/117/118 retired).
+	if err := runSQLSimple(t, primary,
+		"CREATE TYPE public.b2prep_rng AS RANGE (subtype = int4)"); err != nil {
+		t.Fatalf("create range type on goopg primary: %v", err)
+	}
+	// B1.3b: sequences journal as RM_SEQ XLOG_SEQ_LOG page rewrites (kinds
+	// 65/66 retired — previously ANY sequence DDL killed the standby with
+	// "resource manager with ID 128 not registered").
+	if err := runSQLSimple(t, primary,
+		"CREATE SEQUENCE public.b2prep_seq INCREMENT 3"); err != nil {
+		t.Fatalf("create sequence on goopg primary: %v", err)
+	}
+	if err := runSQLSimple(t, primary,
+		"SELECT setval('public.b2prep_seq', 90)"); err != nil {
+		t.Fatalf("setval on goopg primary: %v", err)
+	}
+
 	dsn := fmt.Sprintf("host=%s port=%s user=%s dbname=%s sslmode=disable",
 		"127.0.0.1", mustGoopgPort(primary.ListenAddr()), "postgres", "postgres")
 	workCtx, workCancel := context.WithCancel(context.Background())
@@ -299,6 +353,52 @@ func runFailoverGoopgToPG(t *testing.T, repo, pgBasebackupBin, psqlBin string, m
 	if got := pgScalar(t, standby,
 		"SELECT src FROM public.bench_log WHERE client = -1"); got != "post" {
 		t.Fatalf("post-failover row src=%q want post", got)
+	}
+
+	// B2-prep: the goopg-created function must be resolvable and executable
+	// on the promoted PG (pg_proc row + both runtime-maintained indexes).
+	if got := pgScalar(t, standby,
+		"SELECT public.b2prep_double(21)"); got != "42" {
+		t.Fatalf("post-failover function call = %q, want 42", got)
+	}
+	// B2.1a: the goopg-created enum type must be resolvable by name on the
+	// promoted PG (pg_type row + 2703/2704 runtime index maintenance).
+	// regtype resolution never touches pg_enum labels (those arrive with
+	// the pg_enum heap conversion), so this isolates the pg_type surface.
+	if got := pgScalar(t, standby,
+		"SELECT 'public.b2prep_mood'::regtype::text"); got != "b2prep_mood" {
+		t.Fatalf("post-failover enum type resolution = %q, want b2prep_mood", got)
+	}
+	// B2.1d: enum VALUES are now real pg_enum heap rows — enum_in on the
+	// promoted PG resolves the label via 3503 (typid+label) from goopg's
+	// runtime-written rows.
+	if got := pgScalar(t, standby,
+		"SELECT 'happy'::public.b2prep_mood::text"); got != "happy" {
+		t.Fatalf("post-failover enum value cast = %q, want happy", got)
+	}
+	// B2.1b: the goopg-created domain must be resolvable AND usable in a
+	// cast on the promoted PG (pg_type heap row + typbasetype resolution).
+	if got := pgScalar(t, standby,
+		"SELECT 42::public.b2prep_dom"); got != "42" {
+		t.Fatalf("post-failover domain cast = %q, want 42", got)
+	}
+	// B2.1c: the goopg-created range type must be usable on the promoted PG
+	// (pg_type rows + pg_range row via RANGETYPE syscache → 3542).
+	if got := pgScalar(t, standby,
+		"SELECT '[1,5)'::public.b2prep_rng::text"); got != "[1,5)" {
+		t.Fatalf("post-failover range cast = %q, want [1,5)", got)
+	}
+	// B1.3b: the promoted PG serves nextval from the goopg-written physical
+	// sequence page (setval'd to 90, increment 3 ⇒ 93).
+	if got := pgScalar(t, standby,
+		"SELECT nextval('public.b2prep_seq')"); got != "93" {
+		t.Fatalf("post-failover nextval = %q, want 93", got)
+	}
+	// M0111-0002: the SRF resolves and executes on the promoted PG (binary
+	// prorows keeps proargtypes aligned).
+	if got := pgScalar(t, standby,
+		"SELECT * FROM public.b2prep_srf()"); got != "7" {
+		t.Fatalf("post-failover SRF call = %q, want 7", got)
 	}
 }
 

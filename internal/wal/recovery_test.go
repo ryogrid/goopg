@@ -1026,45 +1026,10 @@ func TestReplaySmgrTruncateZerosRelfile(t *testing.T) {
 	}
 }
 
-// TestEncodeXactCommitInvalRoundTrip pins the on-wire shape of the
-// commit-with-relcache-invalidation record (M0106-0010 batched-31).
-func TestEncodeXactCommitInvalRoundTrip(t *testing.T) {
-	xid := storage.TransactionID(12345)
-	payload := EncodeXactCommitInval(xid)
-
-	if len(payload) != xactRecordSize {
-		t.Fatalf("EncodeXactCommitInval len = %d, want %d", len(payload), xactRecordSize)
-	}
-	if payload[0] != RecordKindXactCommitInval {
-		t.Errorf("kind byte = %d, want RecordKindXactCommitInval (%d)", payload[0], RecordKindXactCommitInval)
-	}
-	got, err := DecodeXactMarker(payload)
-	if err != nil {
-		t.Fatalf("DecodeXactMarker: %v", err)
-	}
-	if got != xid {
-		t.Errorf("decoded xid = %d, want %d", got, xid)
-	}
-}
-
-// TestDecodeXactMarkerAcceptsCommitInval confirms DecodeXactMarker treats
-// RecordKindXactCommitInval identically to RecordKindXactCommit.
-func TestDecodeXactMarkerAcceptsCommitInval(t *testing.T) {
-	xid := storage.TransactionID(999)
-	for _, payload := range [][]byte{
-		EncodeXactCommit(xid),
-		EncodeXactCommitInval(xid),
-		EncodeXactAbort(xid),
-	} {
-		got, err := DecodeXactMarker(payload)
-		if err != nil {
-			t.Errorf("DecodeXactMarker(kind=%d): %v", payload[0], err)
-		}
-		if got != xid {
-			t.Errorf("decoded xid = %d, want %d (kind=%d)", got, xid, payload[0])
-		}
-	}
-}
+// (TestEncodeXactCommitInvalRoundTrip / TestDecodeXactMarkerAcceptsCommitInval
+// were removed in A9 — RecordKindXactCommitInval is retired; invals now ride the
+// PG xl_xact_commit HAS_INVALS chunk. ProcessCommittedInvalidationMessages, the
+// live consumer of that chunk, is still covered by the tests below.)
 
 // TestProcessCommittedInvalidationMessagesUnlinksBothFiles verifies that
 // ProcessCommittedInvalidationMessages removes both pg_internal.init files
@@ -1135,8 +1100,23 @@ func TestApplyRecordXactCommitInvalUnlinksInitFiles(t *testing.T) {
 	defer mgr.Close()
 
 	xid := storage.TransactionID(42)
-	payload := EncodeXactCommitInval(xid)
-	applied, err := ApplyRecord(mgr, Record{Payload: payload})
+	// A9: invalidations now ride the HAS_INVALS chunk on the PG xl_xact_commit
+	// record (not the retired standalone RecordKindXactCommitInval). ApplyRecord's
+	// RmgrXact/XLOG_XACT_COMMIT decoded arm unlinks the init files when the chunk
+	// is present.
+	framed, err := EncodeXactCommitPG(xid, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, _, err := encodeRecordXLog(framed, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dec, err := decodeRecordXLogDetailed(rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	applied, err := ApplyRecord(mgr, Record{XLog: dec.XLog, Payload: dec.Payload})
 	if err != nil {
 		t.Fatalf("ApplyRecord: %v", err)
 	}

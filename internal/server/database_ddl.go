@@ -729,6 +729,30 @@ func (s *Server) createDatabasePhysicalDirectory(oid uint32) error {
 	return initdb.CreatePerDatabaseScaffolding(dataDir, oid)
 }
 
+// walLogRelmapForNewDatabase emits the XLOG_RELMAP_UPDATE record for a
+// just-created database's pg_filenode.map (B0.4, doc 02a §5): read the image
+// the template0 copy placed in base/<oid>/ and journal it verbatim with
+// tsid = pg_default (1663). Best-effort — see the call site.
+func (s *Server) walLogRelmapForNewDatabase(oid uint32) {
+	if s.cfg.WAL == nil || s.cfg.Pool == nil {
+		return
+	}
+	dataDir := s.cfg.Pool.Manager().DataDir()
+	if dataDir == "" {
+		return
+	}
+	image, err := os.ReadFile(filepath.Join(dataDir, "base", strconv.FormatUint(uint64(oid), 10), "pg_filenode.map"))
+	if err != nil {
+		return // pre-B0.3 dir without an image — nothing to journal
+	}
+	const pgDefaultTablespace = 1663
+	payload, err := wal.EncodeRelmapUpdatePG(oid, pgDefaultTablespace, image)
+	if err != nil {
+		return
+	}
+	_, _, _ = s.cfg.WAL.Append(payload)
+}
+
 // removeDatabasePhysicalDirectory best-effort removes base/<oid>. Two
 // callers: (1) CREATE DATABASE rollback when a later step (currently only
 // the WAL append in the databaseDDLCreate branch above) fails — keeps the
@@ -1231,6 +1255,14 @@ func (s *Server) tryHandleDatabaseDDL(sql string, liveDBName string, actingRole 
 			_ = cat.DropDatabase(name)
 			return true, "", err
 		}
+		// B0.4: journal the new database's pg_filenode.map as a real
+		// XLOG_RELMAP_UPDATE record (upstream WAL_LOG createdb's
+		// RelationMapCopy analog) so the map is reconstructible from WAL —
+		// goopg replay and a real PG standby both rewrite the file from the
+		// record. Best-effort: the FILE already exists via the image copy
+		// (FILE_COPY semantics), so a WAL-less/embedded setup loses only the
+		// stream-parity record, not the file.
+		s.walLogRelmapForNewDatabase(oid)
 		if len(tmplTables) > 0 {
 			// M0122-0007 4e (last item): copy the template's relation files +
 			// register fresh catalog.Table entries under the new dbOid BEFORE

@@ -140,11 +140,11 @@ func TestStatWALIOPreallocationCounters(t *testing.T) {
 }
 
 // TestStatWALIOFormatVersionColumn pins the M0014-0004 step-2
-// finalisation: the trailing format_version column reports
-// `legacy` for the default writer and `pgcompat` when
-// PageHeaders=true.
+// finalisation: the trailing format_version column reports the
+// writer's active format. A9: the legacy frame is retired, so the
+// default writer reports `pgcompat` too.
 func TestStatWALIOFormatVersionColumn(t *testing.T) {
-	t.Run("legacy", func(t *testing.T) {
+	t.Run("default_config", func(t *testing.T) {
 		w, err := wal.NewWriter(wal.Config{
 			WALDir:      filepath.Join(t.TempDir(), "pg_wal"),
 			SegmentSize: 4096,
@@ -160,8 +160,8 @@ func TestStatWALIOFormatVersionColumn(t *testing.T) {
 		tbl, _ := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_stat_wal_io"})
 		row := tbl.VirtualRows()[0]
 		got := row[len(row)-1]
-		if got != "legacy" {
-			t.Errorf("format_version=%q, want legacy", got)
+		if got != "pgcompat" {
+			t.Errorf("format_version=%q, want pgcompat", got)
 		}
 	})
 	t.Run("pgcompat", func(t *testing.T) {

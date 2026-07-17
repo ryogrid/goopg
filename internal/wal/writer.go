@@ -237,7 +237,12 @@ func (c *Config) withDefaults() {
 	if c.SegmentSize <= 0 {
 		c.SegmentSize = DefaultSegmentSize
 	}
-	if c.PageHeaders && c.TimelineID == 0 {
+	// A9: the legacy IEEE-CRC frame (encodeRecord/decodeRecord, PageHeaders=false)
+	// is retired — goopg always emits the PostgreSQL page-headered stream. Force
+	// the flag on regardless of the caller's value; the field is retained only to
+	// avoid churning ~40 Config literals.
+	c.PageHeaders = true
+	if c.TimelineID == 0 {
 		c.TimelineID = 1
 	}
 	if c.SyncMethod == "" {
@@ -619,10 +624,8 @@ func (w *Writer) PageHeadersEnabled() bool { return w.pageHeaders }
 // Surfaced for runtime observability (M0014 DoD #9 — WAL format
 // mode/version exposed at runtime).
 func (w *Writer) Format() WALFormatVersion {
-	if w.pageHeaders {
-		return WALFormatPGCompat
-	}
-	return WALFormatLegacy
+	// A9: legacy frame retired — always the PG-compat page-headered format.
+	return WALFormatPGCompat
 }
 
 // MemRing returns the in-memory WAL ring. nil when
@@ -1056,12 +1059,6 @@ func (w *Writer) backgroundFlushLocked(frontier uint64) (err error) {
 // legacy mode appends complete atomically under appendMu, so it is
 // writeLSNMirror.
 func (s *state) publishedFrontier() uint64 {
-	if !s.pageHeaders {
-		if s.writeLSNMirror != nil {
-			return s.writeLSNMirror.Load()
-		}
-		return 0
-	}
 	curr, _ := s.core.Load()
 	return uint64(s.core.PublishUpTo(int64(curr)))
 }
@@ -1073,13 +1070,19 @@ func (s *state) publishedFrontier() uint64 {
 // window (appends publish atomically under appendMu), so it returns the written
 // frontier immediately.
 func (s *state) waitInsertionsToFinish(lsn uint64) uint64 {
-	if !s.pageHeaders {
-		if s.writeLSNMirror != nil {
-			if m := s.writeLSNMirror.Load(); m >= lsn {
-				return m
-			}
+	// An lsn beyond the highest written (reserved) frontier can never become
+	// published — return immediately so the caller's ErrLSNNotWritten check
+	// fires instead of spinning forever. (A9: this replaces the retired
+	// legacy-frame early-return, and is what makes FlushUpTo(unwritten) reject
+	// rather than hang now that every writer is page-headered.) Only the
+	// atomic mirror is consulted — s.writeLSN is a state-loop-owned plain
+	// field and reading it here (before writeMu) would race appendPGCompat.
+	// NewWriter always wires the mirror; the nil check covers bare-state
+	// unit-test construction, which keeps the pre-guard spin behaviour.
+	if s.writeLSNMirror != nil {
+		if written := s.writeLSNMirror.Load(); lsn > written {
+			return written
 		}
-		return lsn
 	}
 	for i := 0; ; i++ {
 		if f := s.publishedFrontier(); f >= lsn {
@@ -1186,12 +1189,11 @@ func loadState(cfg Config) (*state, error) {
 	// signal" — both modes can claim the dir, and detectWritePos's
 	// later record-level scan will catch any deeper incompatibility.
 	detected, _ := DetectWALFormat(cfg.WALDir)
-	if detected == WALFormatLegacy && cfg.PageHeaders {
-		return nil, fmt.Errorf("%w: data dir contains %s WAL but PageHeaders=true requests pgcompat output",
-			ErrWALFormatMismatch, detected)
-	}
-	if detected == WALFormatPGCompat && !cfg.PageHeaders {
-		return nil, fmt.Errorf("%w: data dir contains %s WAL but PageHeaders=false requests legacy output",
+	if detected == WALFormatLegacy {
+		// A9: the legacy IEEE-CRC frame is retired — every writer emits the
+		// PG-compat page-headered stream. A pre-A9 legacy data dir cannot be
+		// appended to; re-init is required (there is no in-place upgrade).
+		return nil, fmt.Errorf("%w: data dir contains %s WAL (retired in A9) — re-init required",
 			ErrWALFormatMismatch, detected)
 	}
 	writePos, prevRecPtr, err := detectWritePos(cfg.WALDir, cfg.SegmentSize, cfg.PageHeaders)
@@ -1398,24 +1400,8 @@ func scanLastSegmentEnd(walDir string, segNo uint64, segSize int64, cfgSegSize i
 	if int64(len(data)) > segSize {
 		return 0, 0, fmt.Errorf("wal: segment %s too large: %d > %d", path, len(data), segSize)
 	}
-	if !pageHeaders {
-		off := 0
-		var lastRecPtr uint64
-		for off < len(data) {
-			if isZeroHeader(data[off:]) {
-				return int64(off), lastRecPtr, nil
-			}
-			lastRecPtr = uint64(int64(segNo)*cfgSegSize+int64(off)) + 1
-			_, n, err := decodeRecord(data[off:])
-			if err != nil {
-				// Corrupt record in the last segment —
-				// treat as EOS (unclean shutdown).
-				return int64(off), lastRecPtr, nil
-			}
-			off += n
-		}
-		return int64(off), lastRecPtr, nil
-	}
+	// A9: legacy (non-pageHeaders) scan removed — always the page-aware walk.
+	_ = pageHeaders
 
 	// Page-aware walk: at every page boundary skip the page
 	// header (or stop on an all-zero header — the preallocated
@@ -1482,85 +1468,9 @@ func scanLastSegmentEnd(walDir string, segNo uint64, segSize int64, cfgSegSize i
 }
 
 func (s *state) append(payload []byte) (uint64, uint64, error) {
-	// PG-compat (pageHeaders) path: use stripe B (core.AppendXLogPayload)
-	// for Path B, and the old encode path for Path A (direct disk write).
-	if s.pageHeaders {
-		return s.appendPGCompat(payload)
-	}
-
-	// Non-pageHeaders (legacy binary format): original encodeRecord path.
-	// This slow append drains the ring and mutates files/dirty/head, so it
-	// takes writeMu to serialise against the backend flush holder (which is
-	// writeMu-only, slice 3). Order: writeMu → appendMu (the flusher takes
-	// writeMu only, fast-path tryAppend takes appendMu.RLock only, so no
-	// cycle). The hot fast path (tryAppend) never reaches here.
-	s.writeMu.lock()
-	defer s.writeMu.release()
-
-	record := encodeRecord(payload)
-	realRecLen := len(record)
-
-	// Path A: WAL buffer disabled, OR record larger than the
-	// entire buffer. Bypass and write straight to disk.
-	if s.walBuf == nil || !s.walBuf.canHold(len(record)) {
-		s.appendMu.Lock()
-		if s.walBuf != nil && s.walBuf.resident() > 0 {
-			if err := s.drainBufferBytes(s.walBuf.resident(), drainReasonOverflow); err != nil {
-				s.appendMu.Unlock()
-				return 0, 0, err
-			}
-		}
-		writePos := s.writePos
-		start := uint64(writePos) + 1
-		s.writePos = writePos + int64(len(record))
-		end := uint64(s.writePos)
-		s.appendMu.Unlock()
-
-		if err := s.writeAt(writePos, record); err != nil {
-			s.appendMu.Lock()
-			if s.writePos == writePos+int64(len(record)) {
-				s.writePos = writePos
-			}
-			s.appendMu.Unlock()
-			return 0, 0, err
-		}
-
-		s.appendMu.Lock()
-		if s.walBuf != nil {
-			s.walBuf.reset(int64(end))
-		}
-		s.memRing.Append(writePos, record)
-		s.drainedLSN = end
-		s.writeLSN = end
-		if s.writeLSNMirror != nil {
-			s.writeLSNMirror.Store(end)
-		}
-		s.appendMu.Unlock()
-		return start, end, nil
-	}
-
-	// Path B: buffered append under appendMu.
-	s.appendMu.Lock()
-	defer s.appendMu.Unlock()
-
-	writePos := s.writePos
-	start := uint64(writePos) + 1
-
-	need := int64(realRecLen) - s.walBuf.free()
-	if need > 0 {
-		if err := s.drainBufferBytes(need, drainReasonOverflow); err != nil {
-			return 0, 0, err
-		}
-	}
-	s.walBuf.append(record)
-	s.memRing.Append(writePos, record)
-	s.writePos = writePos + int64(len(record))
-	end := uint64(s.writePos)
-	s.writeLSN = end
-	if s.writeLSNMirror != nil {
-		s.writeLSNMirror.Store(end)
-	}
-	return start, end, nil
+	// A9: the legacy IEEE-CRC frame is retired; PageHeaders is always true, so
+	// append always takes the PG-compat page-headered path.
+	return s.appendPGCompat(payload)
 }
 
 // appendPGCompat implements state.append for the PG-compat pageHeaders path
@@ -1897,40 +1807,10 @@ func (s *state) tryAppend(payload []byte) (start, end uint64, ok bool, err error
 		}
 		return start, end, true, nil
 	}
-
-	// Non-pageHeaders (legacy binary format): original path.
-	record := encodeRecord(payload)
-	realRecLen := len(record)
-
-	s.appendMu.Lock()
-	defer s.appendMu.Unlock()
-
-	writePos := s.writePos
-	start = uint64(writePos) + 1
-
-	// Path A: record larger than the buffer — can't handle without I/O.
-	if !s.walBuf.canHold(realRecLen) {
-		return 0, 0, false, nil
-	}
-
-	// Path B: buffered append.  If we'd overflow, fall back to the
-	// state loop (which will drain first).
-	if int64(realRecLen) > s.walBuf.free() {
-		return 0, 0, false, nil
-	}
-
-	s.walBuf.append(record)
-	s.memRing.Append(writePos, record)
-	s.writePos = writePos + int64(len(record))
-	end = uint64(s.writePos)
-	s.writeLSN = end
-	if s.writeLSNMirror != nil {
-		s.writeLSNMirror.Store(end)
-	}
-	if s.onAppend != nil {
-		s.onAppend()
-	}
-	return start, end, true, nil
+	// A9: legacy IEEE-CRC frame retired — s.pageHeaders is always true, so the
+	// PG-compat block above always returns. Anything reaching here would be a
+	// bug; the slow path (appendPGCompat) handles Path-A / oversized records.
+	return 0, 0, false, nil
 }
 
 // drainBufferBytes writes at least `n` bytes from walBuf's head to

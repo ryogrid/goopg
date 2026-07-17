@@ -148,9 +148,7 @@ func (sr *StreamReplayer) Run(ctx context.Context, iter *RecordIterator) error {
 func replayedXactInfo(rec Record) (storage.TransactionID, bool, bool) {
 	if len(rec.Payload) > 0 {
 		switch rec.Payload[0] {
-		case RecordKindXactCommit, RecordKindXactCommitInval:
-			// Both encode "kind(1)|xid(4)"; CommitInval additionally unlinks
-			// relcache init files but is a commit for visibility purposes.
+		case RecordKindXactCommit:
 			xid, err := DecodeXactMarker(rec.Payload)
 			return xid, true, err == nil
 		case RecordKindXactAbort:

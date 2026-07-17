@@ -22,7 +22,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"hash/crc32"
 	"log"
 	"math"
 	"os"
@@ -38,6 +37,7 @@ import (
 	"github.com/goopg/goopg/internal/executor"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/storage"
+	"github.com/goopg/goopg/internal/wal"
 )
 
 // systemIdentifierFile is the path (relative to the data directory) where
@@ -331,6 +331,83 @@ func CreatePerDatabaseScaffolding(dataDir string, dbOID uint32) error {
 	}
 	if err := os.WriteFile(filepath.Join(dbDir, "PG_VERSION"), []byte(CatalogVersion+"\n"), 0o600); err != nil {
 		return fmt.Errorf("write base/%d/PG_VERSION: %w", dbOID, err)
+	}
+	// B0.3 (doc 02a §4): a CREATE DATABASE database gets the full pristine
+	// bootstrap catalog image — every catalog heap + btree + pg_filenode.map
+	// initdb built — instead of empty lazily-created files. Copied from
+	// template0's directory (base/4), which never receives runtime writes,
+	// NOT from the named template: goopg clones template user tables under
+	// fresh OIDs (copyTemplateTables), so the named template's pg_class heap
+	// would carry rows for relations that don't exist in the new database.
+	// (PG copies everything from the named template because its clones keep
+	// their OIDs — a documented goopg deviation.) The three system databases
+	// are populated by initdb itself and skip this.
+	switch dbOID {
+	case catalog.DefaultDBOid, template0DbOid, catalog.PostgresDBOid:
+		return nil
+	}
+	return copyBootstrapCatalogImage(dataDir, dbOID)
+}
+
+// template0DbOid is template0's pg_database OID (initdb seeds 1=template1,
+// 4=template0, 5=postgres).
+const template0DbOid uint32 = 4
+
+// copyBootstrapCatalogImage copies every regular file from base/4
+// (template0's pristine bootstrap catalog image) into base/<dbOID>/,
+// skipping files that already exist — which makes it idempotent for the
+// two callers that share it via CreatePerDatabaseScaffolding: the CREATE
+// DATABASE server path and its WAL-replay recovery (a replay over a live
+// database directory must never clobber post-create catalog writes).
+// Each file is written via write-temp + fsync + rename so a crash cannot
+// leave a torn catalog file that a later replay would skip as "exists".
+// A missing base/4 (a pre-B0.3 data dir) is a silent no-op — such
+// clusters keep the historical lazy-file behavior.
+func copyBootstrapCatalogImage(dataDir string, dbOID uint32) error {
+	srcDir := filepath.Join(dataDir, "base", strconv.FormatUint(uint64(template0DbOid), 10))
+	dstDir := filepath.Join(dataDir, "base", strconv.FormatUint(uint64(dbOID), 10))
+	entries, err := os.ReadDir(srcDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("read template0 image: %w", err)
+	}
+	for _, e := range entries {
+		if e.IsDir() || e.Name() == "PG_VERSION" {
+			continue
+		}
+		dst := filepath.Join(dstDir, e.Name())
+		if _, err := os.Stat(dst); err == nil {
+			continue // already present — replay over a live dir
+		}
+		data, err := os.ReadFile(filepath.Join(srcDir, e.Name()))
+		if err != nil {
+			return fmt.Errorf("read template0 %s: %w", e.Name(), err)
+		}
+		tmp := dst + ".tmp"
+		f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+		if err != nil {
+			return fmt.Errorf("create %s: %w", tmp, err)
+		}
+		if _, err := f.Write(data); err != nil {
+			_ = f.Close()
+			return fmt.Errorf("write %s: %w", tmp, err)
+		}
+		if err := f.Sync(); err != nil {
+			_ = f.Close()
+			return fmt.Errorf("fsync %s: %w", tmp, err)
+		}
+		if err := f.Close(); err != nil {
+			return err
+		}
+		if err := os.Rename(tmp, dst); err != nil {
+			return fmt.Errorf("rename %s: %w", tmp, err)
+		}
+	}
+	if d, err := os.Open(dstDir); err == nil {
+		_ = d.Sync()
+		_ = d.Close()
 	}
 	return nil
 }
@@ -862,6 +939,14 @@ func Init(opts Options) error {
 	// at tupdesc.c:896 on the standby's first query.
 	if err := bootstrapPgTypeOidIndex(abs, pgTypeTIDs); err != nil {
 		return fmt.Errorf("goopg init: pg_type_oid_index: %w", err)
+	}
+	// B2.1a: populate pg_type_typname_nsp_index (2704) so PG's
+	// LookupTypeName → SearchSysCache2(TYPENAMENSP, ...) resolves builtin
+	// AND runtime types by name. Left as an empty placeholder before, every
+	// named cast on a real PG standby (`SELECT 1::int4`, `::text`) failed
+	// with `type "..." does not exist`.
+	if err := bootstrapPgTypeTypnameNspIndex(abs, pgTypeTIDs); err != nil {
+		return fmt.Errorf("goopg init: pg_type_typname_nsp_index: %w", err)
 	}
 	// M0106-0010 step 2: write pg_am rows so PG's
 	// RelationInitIndexAccessInfo → SearchSysCache1(AMOID, ...) does
@@ -1736,6 +1821,7 @@ func bootstrapPostgresDatabase(dataDir string, encodingID int32, locale localeSe
 		2661, // pg_cast_source_target_index (Step 3ac)
 		2662, 2663,
 		2665, // pg_constraint_conrelid_contypid_conname_index (batched-48)
+		2666, // pg_constraint_contypid_index (B2.1b — domain-constraint typcache scans)
 		2667,
 		2668, // pg_conversion_default_index (Step 3ah)
 		2669, // pg_conversion_name_nsp_index (Step 3aj)
@@ -1748,6 +1834,7 @@ func bootstrapPostgresDatabase(dataDir string, encodingID int32, locale localeSe
 		2690, 2691, // pg_proc_oid_index, pg_proc_proname_args_nsp_index
 		// 2692, 2693: dedicated bootstrappers (pg_rewrite_oid_index/pg_rewrite_rel_rulename_index)
 		2701, 2703,
+		5002, // pg_sequence_seqrelid_index (B1.3b: runtime inserts route to base/1; without this placeholder the file auto-created 0-byte and every insert silently skipped)
 		2754, // pg_opfamily_am_name_nsp_index (Step 3bn)
 		2755, // pg_opfamily_oid_index (Step 3bo)
 		2704, 3085, 3164,
@@ -1876,6 +1963,7 @@ func bootstrapPostgresDatabase(dataDir string, encodingID int32, locale localeSe
 		2661, // pg_cast_source_target_index (Step 3ac)
 		2662, 2663,
 		2665, // pg_constraint_conrelid_contypid_conname_index (batched-48)
+		2666, // pg_constraint_contypid_index (B2.1b — domain-constraint typcache scans)
 		2667,
 		2668, // pg_conversion_default_index (Step 3ah)
 		2669, // pg_conversion_name_nsp_index (Step 3aj)
@@ -1969,6 +2057,7 @@ func bootstrapPostgresDatabase(dataDir string, encodingID int32, locale localeSe
 		2661, // pg_cast_source_target_index (Step 3ac)
 		2662, 2663,
 		2665, // pg_constraint_conrelid_contypid_conname_index (batched-48)
+		2666, // pg_constraint_contypid_index (B2.1b — domain-constraint typcache scans)
 		2667,
 		2668, // pg_conversion_default_index (Step 3ah)
 		2669, // pg_conversion_name_nsp_index (Step 3aj)
@@ -4682,6 +4771,10 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		// 3=tgparentid, 4=tgname. Index = btree(tgrelid, tgname).
 		entry(2701, 2620, []int16{2, 4}, []uint32{oidOps, nameOps}, []uint32{0, cCollation}, true, false), // pg_trigger_tgrelid_tgname_index
 		entry(2667, 2606, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                          // pg_constraint_oid_index
+		// B2.1b: PG's domain typcache (GetDomainConstraints) scans this index;
+		// without the pg_index row + file placeholder a standby raises
+		// "could not open relation with OID 2666" on ANY domain-typed cast.
+		entry(2666, 2606, []int16{10}, []uint32{oidOps}, []uint32{0}, false, false), // pg_constraint_contypid_index
 		// M0106-0010 batched-48: pg_constraint_conrelid_contypid_conname_index
 		// (OID 2665, ConstraintRelidTypidNameIndexId). pg_constraint attnums
 		// (pg_constraint.h): 2=conname (name), 9=conrelid (oid),
@@ -6271,27 +6364,14 @@ func defaultPostgresqlAutoConf() []byte {
 }
 
 func makeRelMapFile(mappings [][2]uint32) []byte {
-	// RelMapFile layout (PG src/backend/utils/cache/relmapper.c):
-	//   int32 magic (4 bytes) = RELMAPPER_FILEMAGIC (0x592717)
-	//   int32 num_mappings (4 bytes)
-	//   RelMapping mappings[64] (512 bytes, 8 bytes each: Oid + RelFileNumber)
-	//   pg_crc32c crc (4 bytes) at offset 520
-	const (
-		relFileSize   = 524
-		relMagic      = 0x592717
-		relCRCCOffset = 520
-	)
-	out := make([]byte, relFileSize)
-	binary.LittleEndian.PutUint32(out[0:4], relMagic)
-	binary.LittleEndian.PutUint32(out[4:8], uint32(len(mappings)))
+	// B0.4: one encoder for bootstrap AND WAL paths — wal.EncodeRelMapFile
+	// is the normative RelMapFile renderer (relmapper.c layout); this
+	// wrapper only adapts the historical [][2]uint32 call shape.
+	ms := make([]wal.RelMapping, len(mappings))
 	for i, m := range mappings {
-		off := 8 + i*8
-		binary.LittleEndian.PutUint32(out[off:off+4], m[0])
-		binary.LittleEndian.PutUint32(out[off+4:off+8], m[1])
+		ms[i] = wal.RelMapping{Oid: m[0], FileNumber: m[1]}
 	}
-	crc := crc32.Checksum(out[:relCRCCOffset], crcCastagnoliTable)
-	binary.LittleEndian.PutUint32(out[relCRCCOffset:], crc)
-	return out
+	return wal.EncodeRelMapFile(ms)
 }
 
 func defaultRelMapFile() []byte {

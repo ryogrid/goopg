@@ -1333,6 +1333,48 @@ func PageStampHotOldTuple(p Page, oldSlot uint16, xmax TransactionID, blk BlockN
 	return nil
 }
 
+// PageStampUpdatedOldTuple is the NON-HOT sibling of PageStampHotOldTuple
+// (B0.2, doc 02a §3): stamps a plain heap UPDATE on the old-image tuple at
+// oldSlot — xmax, forward t_ctid to (blk, newSlot) which may live on a
+// DIFFERENT page, clear the xmax-invalid/lock bits — WITHOUT setting
+// HeapHotUpdated (the successor is reached via indexes, not a HOT chain).
+// Mirrors upstream heap_update's old-tuple treatment when an indexed column
+// changed. The caller holds the page's exclusive content lock.
+func PageStampUpdatedOldTuple(p Page, oldSlot uint16, xmax TransactionID, blk BlockNumber, newSlot uint16) error {
+	if oldSlot == 0 {
+		return ErrInvalidSlot
+	}
+	count, err := PageLinePointerCount(p)
+	if err != nil {
+		return err
+	}
+	idx := int(oldSlot) - 1
+	if idx < 0 || idx >= count {
+		return ErrInvalidSlot
+	}
+	item, err := readItemID(p, idx)
+	if err != nil {
+		return err
+	}
+	if item.Flags != ItemIDNormal {
+		return fmt.Errorf("%w: slot=%d flags=%d", ErrUnsupportedItem, oldSlot, item.Flags)
+	}
+	off := int(item.Offset)
+	if off+22 > len(p) {
+		return fmt.Errorf("%w: slot=%d off=%d", ErrCorruptTuple, oldSlot, off)
+	}
+	binary.LittleEndian.PutUint32(p[off+4:off+8], uint32(xmax))
+	binary.LittleEndian.PutUint32(p[off+12:off+16], uint32(blk))
+	binary.LittleEndian.PutUint16(p[off+16:off+18], newSlot)
+	infomask := binary.LittleEndian.Uint16(p[off+20 : off+22])
+	infomask &^= HeapXmaxLockOnly | HeapXmaxLockMask | HeapXmaxInvalid | HeapXmaxIsMulti
+	binary.LittleEndian.PutUint16(p[off+20:off+22], infomask)
+	if pruneXID := MustHeader(p).PruneXID(); xmax > TransactionID(pruneXID) {
+		MustHeader(p).SetPruneXID(uint32(xmax))
+	}
+	return nil
+}
+
 // PageStampHotOldTupleMulti is the MultiXact-bearing sibling of
 // PageStampHotOldTuple: it stamps a HOT-update on the old-image tuple at
 // oldSlot where the new xmax is a MultiXactId naming {updater + surviving

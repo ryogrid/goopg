@@ -134,6 +134,8 @@ type Pool struct {
 	logHeapFreeze LogHeapFreezeFunc
 	// logHeapHotUpdate emits an atomic HOT-update WAL record.
 	logHeapHotUpdate LogHeapHotUpdateFunc
+	// logHeapUpdate emits an atomic non-HOT heap-update WAL record (B0.2).
+	logHeapUpdate LogHeapUpdateFunc
 	// logHeapPruneOpt emits an opportunistic page-pruning WAL record.
 	logHeapPruneOpt LogHeapPruneOptFunc
 	// logSmgrCreate emits a relation-file creation WAL record. A9: carries the
@@ -639,6 +641,7 @@ type PoolConfig struct {
 	LogBtreeMarkPageHalfDead LogBtreeMarkPageHalfDeadFunc
 	LogHeapFreeze            LogHeapFreezeFunc
 	LogHeapHotUpdate         LogHeapHotUpdateFunc
+	LogHeapUpdate            LogHeapUpdateFunc
 	LogHeapPruneOpt          LogHeapPruneOptFunc
 	LogSmgrCreate            func(rel RelFileNode, xid TransactionID) error
 	LogChangeRecord          func(payload []byte) (LSN, error)
@@ -717,6 +720,11 @@ type LogHeapFreezeFunc func(rel RelFileNode, blk BlockNumber, frozenSlots []uint
 // new_offnum).
 type LogHeapHotUpdateFunc func(rel RelFileNode, blk BlockNumber, oldSlot, newSlot uint16, xmax TransactionID, tupleBytes []byte) (LSN, error)
 
+// LogHeapUpdateFunc emits one atomic NON-HOT heap-update redo record (B0.2,
+// catalog ALTERs): old version at (oldBlk, oldSlot) gets xmax + forward ctid,
+// new version lands at (newBlk, newSlot); oldBlk may equal newBlk.
+type LogHeapUpdateFunc func(rel RelFileNode, oldBlk BlockNumber, oldSlot uint16, newBlk BlockNumber, newSlot uint16, xmax TransactionID, tupleBytes []byte) (LSN, error)
+
 // LogHeapPruneOptFunc emits one opportunistic page-pruning redo record.
 type LogHeapPruneOptFunc func(rel RelFileNode, blk BlockNumber, redirects [][2]uint16, unused []uint16) (LSN, error)
 
@@ -753,6 +761,7 @@ func NewPool(mgr *Manager, cfg PoolConfig) (*Pool, error) {
 		logBtreeMarkPageHalfDead: cfg.LogBtreeMarkPageHalfDead,
 		logHeapFreeze:            cfg.LogHeapFreeze,
 		logHeapHotUpdate:         cfg.LogHeapHotUpdate,
+		logHeapUpdate:            cfg.LogHeapUpdate,
 		logHeapPruneOpt:          cfg.LogHeapPruneOpt,
 		logSmgrCreate:            cfg.LogSmgrCreate,
 		logChangeRecord:          cfg.LogChangeRecord,
@@ -858,6 +867,9 @@ func (p *Pool) LogHeapFreeze() LogHeapFreezeFunc { return p.logHeapFreeze }
 
 // LogHeapHotUpdate returns the configured HOT-update change-record hook.
 func (p *Pool) LogHeapHotUpdate() LogHeapHotUpdateFunc { return p.logHeapHotUpdate }
+
+// LogHeapUpdate returns the configured non-HOT heap-update change-record hook.
+func (p *Pool) LogHeapUpdate() LogHeapUpdateFunc { return p.logHeapUpdate }
 
 // LogHeapPruneOpt returns the configured opportunistic-pruning change-record hook.
 func (p *Pool) LogHeapPruneOpt() LogHeapPruneOptFunc { return p.logHeapPruneOpt }

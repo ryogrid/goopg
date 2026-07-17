@@ -53,28 +53,50 @@ func (s *syncBuffer) Write(p []byte) (int, error) {
 
 var _ context.Context // keep import live for future test additions
 
+// retentionTestSegSize is the segment size the retention tests use.
+// A9: the retired legacy frame let a 24-byte payload exactly fill a
+// 32-byte segment (8-byte header). The PG frame's smallest record is
+// larger than that whole segment (24-byte XLogRecord header + chunk
+// header + 8-byte alignment, plus page headers), so these tests use
+// 512-byte segments and fill them by observed end-LSN instead
+// (appendThroughSegment). A 24-byte payload emits 56 bytes — small
+// enough that every segment number the tests reason about is hit
+// exactly, with no overshoot past the target segment.
+const retentionTestSegSize = int64(512)
+
+// appendThroughSegment appends 24-byte records until the writer's end
+// LSN lands inside segment segNo (0-based), guaranteeing segment files
+// 0..segNo all exist and none beyond.
+func appendThroughSegment(t *testing.T, w *Writer, segSize int64, segNo uint64) {
+	t.Helper()
+	for i := 0; ; i++ {
+		payload := make([]byte, 24)
+		payload[0] = byte('a' + i%26)
+		_, end, err := w.Append(payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if end > uint64(segSize)*segNo {
+			return
+		}
+	}
+}
+
 // TestRemoveOldSegmentsKeepsContainingSegment confirms the writer
 // preserves the segment that contains the keep-LSN itself: a
 // caller passing the LSN of the latest checkpoint marker must not
 // have that marker's WAL deleted out from under recovery.
 func TestRemoveOldSegmentsKeepsContainingSegment(t *testing.T) {
 	walDir := filepath.Join(t.TempDir(), "pg_wal")
-	w, err := NewWriter(Config{WALDir: walDir, SegmentSize: 32})
+	const segSize = retentionTestSegSize
+	w, err := NewWriter(Config{WALDir: walDir, SegmentSize: segSize})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer w.Close()
 
-	// Write enough payload to span four segments. recordHeader is 8
-	// bytes, so a 24-byte payload makes one record exactly fill one
-	// segment (32-byte segment / 8+24).
-	for i := 0; i < 4; i++ {
-		payload := make([]byte, 24)
-		payload[0] = byte('a' + i)
-		if _, _, err := w.Append(payload); err != nil {
-			t.Fatal(err)
-		}
-	}
+	// Write enough records to span four segments.
+	appendThroughSegment(t, w, segSize, 3)
 
 	// Pre-condition: four segments exist.
 	if names := segmentNames(t, walDir); len(names) != 4 {
@@ -83,8 +105,8 @@ func TestRemoveOldSegmentsKeepsContainingSegment(t *testing.T) {
 
 	// Keep the LSN at the very first byte of the third segment
 	// (segNo=2, byte offset 0 inside the segment, 1-based LSN =
-	// 2*32 + 1 = 65). Segments 0 and 1 are obsolete; 2 and 3 stay.
-	keepLSN := uint64(2*32 + 1)
+	// 2*segSize + 1). Segments 0 and 1 are obsolete; 2 and 3 stay.
+	keepLSN := uint64(2*segSize + 1)
 	removed, _, err := w.RemoveOldSegments(keepLSN)
 	if err != nil {
 		t.Fatal(err)
@@ -107,7 +129,7 @@ func TestRemoveOldSegmentsKeepsContainingSegment(t *testing.T) {
 // no checkpoint) doesn't accidentally drop everything in pg_wal.
 func TestRemoveOldSegmentsZeroLSNIsNoop(t *testing.T) {
 	walDir := filepath.Join(t.TempDir(), "pg_wal")
-	w, err := NewWriter(Config{WALDir: walDir, SegmentSize: 32})
+	w, err := NewWriter(Config{WALDir: walDir, SegmentSize: retentionTestSegSize})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -169,21 +191,15 @@ func TestRemoveOldSegmentsClosesCachedHandle(t *testing.T) {
 // decodeRecord's graceful-EOS heuristic -- see removeOldSegments).
 func TestRemoveOldSegmentsRecyclesUpToMinWALSize(t *testing.T) {
 	walDir := filepath.Join(t.TempDir(), "pg_wal")
-	const segSize = 32
+	const segSize = retentionTestSegSize
 	w, err := NewWriter(Config{WALDir: walDir, SegmentSize: segSize, MinWALSize: 2 * segSize})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer w.Close()
 
-	// Fill segments 0..4 (5 segments, one 24-byte record each).
-	for i := 0; i < 5; i++ {
-		payload := make([]byte, 24)
-		payload[0] = byte('a' + i)
-		if _, _, err := w.Append(payload); err != nil {
-			t.Fatal(err)
-		}
-	}
+	// Fill segments 0..4 (5 segments).
+	appendThroughSegment(t, w, segSize, 4)
 	if names := segmentNames(t, walDir); len(names) != 5 {
 		t.Fatalf("pre-recycle segment count = %d (%v), want 5", len(names), names)
 	}
@@ -224,7 +240,7 @@ func TestRemoveOldSegmentsRecyclesUpToMinWALSize(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(data) != segSize {
+		if int64(len(data)) != segSize {
 			t.Fatalf("recycled segment %d size = %d, want %d", segNo, len(data), segSize)
 		}
 		for i, b := range data {
@@ -242,18 +258,14 @@ func TestRemoveOldSegmentsRecyclesUpToMinWALSize(t *testing.T) {
 // side either).
 func TestRemoveOldSegmentsRecycleCapExceedsObsoleteCount(t *testing.T) {
 	walDir := filepath.Join(t.TempDir(), "pg_wal")
-	const segSize = 32
+	const segSize = retentionTestSegSize
 	w, err := NewWriter(Config{WALDir: walDir, SegmentSize: segSize, MinWALSize: 10 * segSize})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer w.Close()
 
-	for i := 0; i < 3; i++ {
-		if _, _, err := w.Append(make([]byte, 24)); err != nil {
-			t.Fatal(err)
-		}
-	}
+	appendThroughSegment(t, w, segSize, 2)
 	keepLSN := uint64(2*segSize + 1)
 	removed, recycled, err := w.RemoveOldSegments(keepLSN)
 	if err != nil {
@@ -465,26 +477,23 @@ func TestSlotsInvalidateLaggingDisabled(t *testing.T) {
 // everything older.
 func TestSlotAwareRetainerPrunesBelowSlotHorizon(t *testing.T) {
 	walDir := filepath.Join(t.TempDir(), "pg_wal")
-	w, err := NewWriter(Config{WALDir: walDir, SegmentSize: 32})
+	const segSize = retentionTestSegSize
+	w, err := NewWriter(Config{WALDir: walDir, SegmentSize: segSize})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer w.Close()
-	for i := 0; i < 6; i++ {
-		if _, _, err := w.Append(make([]byte, 24)); err != nil {
-			t.Fatal(err)
-		}
-	}
+	appendThroughSegment(t, w, segSize, 5)
 
 	slots, err := OpenSlots(filepath.Dir(walDir))
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Slot anchored at the start of segment 1 (LSN 33). Even
-	// though the checkpoint marker says "everything below segment
-	// 5 is redo-redundant", retention must NOT delete segment 1
+	// Slot anchored at the start of segment 1. Even though the
+	// checkpoint marker says "everything below segment 5 is
+	// redo-redundant", retention must NOT delete segment 1
 	// because the slot still needs it.
-	if _, err := slots.Create("standby", SlotPhysical, 33); err != nil {
+	if _, err := slots.Create("standby", SlotPhysical, uint64(segSize+1)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -494,7 +503,7 @@ func TestSlotAwareRetainerPrunesBelowSlotHorizon(t *testing.T) {
 		MaxSlotKeepBytes: 0, // unlimited — slot keeps WAL forever
 	}
 	// "Checkpoint" sits inside segment 5.
-	if err := r.Retain(uint64(5*32 + 1)); err != nil {
+	if err := r.Retain(uint64(5*segSize + 1)); err != nil {
 		t.Fatal(err)
 	}
 	// Segment 0 is obsolete (slot starts at segment 1). Segments
@@ -521,21 +530,17 @@ func TestSlotAwareRetainerPrunesBelowSlotHorizon(t *testing.T) {
 // from the distance-estimate path.
 func TestSlotAwareRetainerUsesCheckPointDistanceEstimateFn(t *testing.T) {
 	walDir := filepath.Join(t.TempDir(), "pg_wal")
-	const segSize = 32
+	const segSize = retentionTestSegSize
 	w, err := NewWriter(Config{WALDir: walDir, SegmentSize: segSize})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer w.Close()
-	for i := 0; i < 5; i++ {
-		if _, _, err := w.Append(make([]byte, 24)); err != nil {
-			t.Fatal(err)
-		}
-	}
+	appendThroughSegment(t, w, segSize, 4)
 
 	r := &SlotAwareRetainer{
 		Writer:                       w,
-		CheckPointDistanceEstimateFn: func() float64 { return 10 * segSize },
+		CheckPointDistanceEstimateFn: func() float64 { return float64(10 * segSize) },
 	}
 	// Checkpoint sits at the start of segment 3 (0,1,2 obsolete).
 	if err := r.Retain(uint64(3*segSize + 1)); err != nil {
@@ -566,23 +571,21 @@ func TestSlotAwareRetainerUsesCheckPointDistanceEstimateFn(t *testing.T) {
 // log so the operator can act before invalidation.
 func TestSlotAwareRetainerEmitsLagWarning(t *testing.T) {
 	walDir := filepath.Join(t.TempDir(), "pg_wal")
-	w, err := NewWriter(Config{WALDir: walDir, SegmentSize: 32})
+	const segSize = retentionTestSegSize
+	w, err := NewWriter(Config{WALDir: walDir, SegmentSize: segSize})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer w.Close()
-	for i := 0; i < 4; i++ {
-		if _, _, err := w.Append(make([]byte, 24)); err != nil {
-			t.Fatal(err)
-		}
-	}
+	appendThroughSegment(t, w, segSize, 3)
 	slots, err := OpenSlots(filepath.Dir(walDir))
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Slot anchored at LSN 1; current write position is ~128.
-	// MaxSlotKeepBytes=200 → cap not exceeded, but
-	// LagWarnFraction*200 = 100, so lag > 100 should warn.
+	// Slot anchored at LSN 1; current write position is just past
+	// 3*segSize = 1536 (and < 1536+56). MaxSlotKeepBytes=3000 →
+	// cap not exceeded, but LagWarnFraction*3000 = 1500, so
+	// lag > 1500 should warn.
 	if _, err := slots.Create("warn_me", SlotPhysical, 1); err != nil {
 		t.Fatal(err)
 	}
@@ -591,13 +594,13 @@ func TestSlotAwareRetainerEmitsLagWarning(t *testing.T) {
 	r := &SlotAwareRetainer{
 		Writer:           w,
 		Slots:            slots,
-		MaxSlotKeepBytes: 200,
+		MaxSlotKeepBytes: 3000,
 		Logger:           logs.logger(),
 	}
-	if err := r.Retain(uint64(3*32 + 1)); err != nil {
+	if err := r.Retain(uint64(3*segSize + 1)); err != nil {
 		t.Fatal(err)
 	}
-	// Slot must NOT be invalidated (lag 127 < cap 200).
+	// Slot must NOT be invalidated (lag ~1590 < cap 3000).
 	got, _ := slots.Get("warn_me")
 	if got.Invalidated {
 		t.Fatal("slot invalidated; want lag-warning only")
@@ -621,24 +624,21 @@ func TestSlotAwareRetainerEmitsLagWarning(t *testing.T) {
 // then unlinks the segments the now-invalidated slot was holding.
 func TestSlotAwareRetainerInvalidatesAndPrunes(t *testing.T) {
 	walDir := filepath.Join(t.TempDir(), "pg_wal")
-	w, err := NewWriter(Config{WALDir: walDir, SegmentSize: 32})
+	const segSize = retentionTestSegSize
+	w, err := NewWriter(Config{WALDir: walDir, SegmentSize: segSize})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer w.Close()
-	for i := 0; i < 6; i++ {
-		if _, _, err := w.Append(make([]byte, 24)); err != nil {
-			t.Fatal(err)
-		}
-	}
+	appendThroughSegment(t, w, segSize, 5)
 
 	slots, err := OpenSlots(filepath.Dir(walDir))
 	if err != nil {
 		t.Fatal(err)
 	}
 	// Slot still anchored way back at LSN 1 (start of segment 0).
-	// Lag = WrittenLSN - 1 ≈ 6*32. With a 32-byte bound the slot
-	// is far past the cap and must be invalidated.
+	// Lag = WrittenLSN - 1 ≈ 5*segSize. With a 32-byte bound the
+	// slot is far past the cap and must be invalidated.
 	if _, err := slots.Create("laggy", SlotPhysical, 1); err != nil {
 		t.Fatal(err)
 	}
@@ -647,7 +647,7 @@ func TestSlotAwareRetainerInvalidatesAndPrunes(t *testing.T) {
 		Slots:            slots,
 		MaxSlotKeepBytes: 32,
 	}
-	if err := r.Retain(uint64(5*32 + 1)); err != nil {
+	if err := r.Retain(uint64(5*segSize + 1)); err != nil {
 		t.Fatal(err)
 	}
 	got, err := slots.Get("laggy")

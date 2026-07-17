@@ -219,7 +219,12 @@ func TestWALBufferCountersTrackDrains(t *testing.T) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	const cap = 256
+	// A9: the PG frame's conservative per-append ring reservation is
+	// 2*(paddedRecordLen+64) — a cap that small forces every append onto the
+	// direct-write bypass and the buffer never accumulates. 1 KiB is large
+	// enough that 50-byte payloads buffer, small enough that a burst of them
+	// still forces overflow drains.
+	const cap = 1024
 	w, err := NewWriter(Config{
 		WALDir:      dir,
 		SegmentSize: 1 << 20,
@@ -241,9 +246,10 @@ func TestWALBufferCountersTrackDrains(t *testing.T) {
 		t.Errorf("FlushDrainBytes initially %d, want 0", got)
 	}
 
-	// Force overflow drains: 8 × 50-byte payload exceeds 256-byte cap.
+	// Force overflow drains: 16 × 50-byte payload (≈80 emitted bytes each)
+	// exceeds the 1 KiB cap.
 	payload := bytes.Repeat([]byte{0xCC}, 50)
-	for i := 0; i < 8; i++ {
+	for i := 0; i < 16; i++ {
 		if _, _, err := w.Append(payload); err != nil {
 			t.Fatal(err)
 		}
@@ -321,8 +327,17 @@ func TestWALBufferReadAllRoundTrip(t *testing.T) {
 				t.Fatalf("got %d records, want %d", len(records), len(payloads))
 			}
 			for i, r := range records {
-				if !bytes.Equal(r.Payload, payloads[i]) {
-					t.Errorf("payload[%d]=%v want %v", i, r.Payload, payloads[i])
+				// A9: a payload whose leading byte collides with a
+				// natively-sized RecordKind (e.g. 11 = SmgrCreate) fails the
+				// native-size guard and routes to the decoded replay path —
+				// its body comes back in XLog.MainData with Payload nil.
+				// Either way the bytes must round-trip unchanged.
+				body := r.Payload
+				if body == nil && r.XLog != nil {
+					body = r.XLog.MainData
+				}
+				if !bytes.Equal(body, payloads[i]) {
+					t.Errorf("payload[%d]=%v want %v", i, body, payloads[i])
 				}
 			}
 		})

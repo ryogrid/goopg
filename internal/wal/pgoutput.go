@@ -27,6 +27,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math"
 	"strconv"
 	"time"
 
@@ -397,6 +398,19 @@ func pgoDecodePhysicalValue(t catalog.Type, data []byte) ([]byte, int, error) {
 			return nil, 0, fmt.Errorf("oid: short read")
 		}
 		return []byte(strconv.FormatUint(uint64(binary.LittleEndian.Uint32(data[:4])), 10)), 4, nil
+	case "float4", "real":
+		// M0111-0002: fixed 4-byte IEEE-754 LE (was varlena text).
+		if len(data) < 4 {
+			return nil, 0, fmt.Errorf("float4: short read")
+		}
+		f := float64(math.Float32frombits(binary.LittleEndian.Uint32(data[:4])))
+		return []byte(catalog.PGFloatOut(f, 32)), 4, nil
+	case "float8", "double precision", "double":
+		if len(data) < 8 {
+			return nil, 0, fmt.Errorf("float8: short read")
+		}
+		f := math.Float64frombits(binary.LittleEndian.Uint64(data[:8]))
+		return []byte(catalog.PGFloatOut(f, 64)), 8, nil
 	case "name":
 		if len(data) < 64 {
 			return nil, 0, fmt.Errorf("name: short read")

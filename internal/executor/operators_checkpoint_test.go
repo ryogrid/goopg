@@ -17,7 +17,8 @@ func (f *fakeCheckpointer) CheckpointNow() error {
 	return f.err
 }
 
-func (f *fakeCheckpointer) CheckpointRedoLSN() uint64 { return 0 }
+func (f *fakeCheckpointer) CheckpointRedoLSN() uint64       { return 0 }
+func (f *fakeCheckpointer) LastCheckpointRecordLSN() uint64 { return 0 }
 
 // TestExecCheckpointInvokesCheckpointer pins the success path:
 // the SQL CHECKPOINT verb routes through parser -> planner ->

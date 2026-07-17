@@ -459,15 +459,15 @@ func WALLogSequenceState(ctx *Context, name string) {
 	s.logHorizon = cur
 	s.hasLogged = true
 	s.mu.Unlock()
-	if _, _, err := ctx.WAL.Append(wal.EncodeSequenceState(p)); err != nil {
-		// Durability of the sequence definition is best-effort in the face of
-		// a failing WAL appender (matches the walLog* helpers' error surface —
-		// callers of this helper are DDL paths that have already mutated the
-		// registry). The sequence still works for the life of the process.
-		return
-	}
+	// B1.3b: the COUNTER journals as XLOG_SEQ_LOG — a rewrite of the
+	// sequence relation's single physical page (replacing the retired
+	// RecordKindSequenceState). Best-effort like the walLog* helpers.
+	WriteSequencePageAndLog(ctx, name, p.DBOid, p.Current, 0, p.Called)
+	// B1.3 (doc 02c §3): the DEFINITION journals as a real pg_sequence heap
+	// row (INSERT/UPDATE via the fingerprint-gated upsert; counter-only
+	// snapshots skip).
+	syncSequenceDefinitionToCatalogHeap(ctx, name, p)
 }
-
 
 // SnapshotSequenceState returns the sequence's exact live definitional state
 // (start/increment/bounds/cache/cycle/current counter/called flag/ownership
@@ -526,7 +526,9 @@ func (s *seqState) maybePreLogNextval(ctx *Context, v int64) {
 	s.logHorizon = horizon
 	s.hasLogged = true
 	s.mu.Unlock()
-	_, _, _ = ctx.WAL.Append(wal.EncodeSequenceState(p))
+	// B1.3b: the pre-log horizon rides XLOG_SEQ_LOG (crash restarts at the
+	// horizon, skipping ≤ SEQ_LOG_VALS values — PG-identical).
+	WriteSequencePageAndLog(ctx, p.Name, p.DBOid, p.Current, 0, p.Called)
 }
 
 // autoGenerateSerialValues fills nextval() values for SERIAL/BIGSERIAL/

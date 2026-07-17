@@ -131,14 +131,23 @@ func walLevelInt(reg *config.Registry) uint32 {
 // UpdateControlCheckpoint overwrites the checkpoint-related fields in the
 // on-disk pg_control file. Used by BASE_BACKUP after a forced checkpoint so
 // a PostgreSQL standby booted from the backup sees a valid REDO location.
-func UpdateControlCheckpoint(dataDir string, redoLSN uint64) error {
+func UpdateControlCheckpoint(dataDir string, redoLSN, ckptRecordLSN uint64) error {
 	// goopg uses 1-based LSNs internally; PG expects 0-based.
 	lsn0 := redoLSN - 1
+	// CheckPoint names the checkpoint RECORD's own start — since
+	// A9-checkpoint-opcode this is distinct from redo (an ONLINE
+	// checkpoint's record is preceded by XLOG_RUNNING_XACTS). Callers
+	// that predate that distinction pass 0 and keep the historical
+	// record-at-redo behaviour.
+	ckpt0 := lsn0
+	if ckptRecordLSN > 0 {
+		ckpt0 = ckptRecordLSN - 1
+	}
 	now := time.Now()
 	return control.UpdateControlFile(dataDir, func(cd *control.ControlFileData) {
 		cd.State = control.DBStateInProduction
 		cd.Time = now.Unix()
-		cd.CheckPoint = lsn0
+		cd.CheckPoint = ckpt0
 		cd.CheckPointCopyRedo = lsn0
 		cd.CheckPointCopyTime = now.Unix()
 		cd.CheckPointCopyThisTLI = 1

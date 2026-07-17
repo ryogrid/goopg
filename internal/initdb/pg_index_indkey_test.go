@@ -49,6 +49,7 @@ func TestPgIndexInitialEntriesIndkeyMatchesPG18(t *testing.T) {
 		2701: {2, 4},     // pg_trigger_tgrelid_tgname_index : btree(tgrelid, tgname)   ← Step 3n
 		2667: {1},        // pg_constraint_oid_index
 		2665: {9, 10, 2}, // pg_constraint_conrelid_contypid_conname_index : btree(conrelid, contypid, conname)  ← batched-48
+		2666: {10},       // pg_constraint_contypid_index : btree(contypid) non-unique ← B2.1b (domain typcache)
 		2688: {1},        // pg_operator_oid_index
 		2680: {1, 3},     // pg_inherits_relid_seqno_index : btree(inhrelid, inhseqno)
 		2684: {2},        // pg_namespace_nspname_index : btree(nspname name_ops)            ← Step 3t

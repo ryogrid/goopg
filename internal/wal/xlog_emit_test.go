@@ -446,37 +446,9 @@ func TestPageEmissionXLogPrevChain(t *testing.T) {
 	}
 }
 
-// TestPageEmissionLegacyDefaultUnchanged guards the rollout
-// invariant: with PageHeaders=false (the default) the writer's
-// on-disk shape is byte-identical to pre-M0014 output. We compare
-// against a writer constructed without the new flag.
-func TestPageEmissionLegacyDefaultUnchanged(t *testing.T) {
-	dirA := filepath.Join(t.TempDir(), "a")
-	dirB := filepath.Join(t.TempDir(), "b")
-	wA, err := NewWriter(Config{WALDir: dirA, SegmentSize: 128})
-	if err != nil {
-		t.Fatal(err)
-	}
-	wB, err := NewWriter(Config{WALDir: dirB, SegmentSize: 128, PageHeaders: false})
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, p := range [][]byte{[]byte("aa"), []byte("bbbb"), []byte("ccc")} {
-		if _, _, err := wA.Append(p); err != nil {
-			t.Fatal(err)
-		}
-		if _, _, err := wB.Append(p); err != nil {
-			t.Fatal(err)
-		}
-	}
-	wA.Close()
-	wB.Close()
-	a := mustReadSegment(t, dirA, 0)
-	b := mustReadSegment(t, dirB, 0)
-	if !bytes.Equal(a, b) {
-		t.Fatalf("legacy default produced different bytes:\n  PageHeaders=unset (zero-value): %x\n  PageHeaders=false explicit:    %x", a, b)
-	}
-}
+// (TestPageEmissionLegacyDefaultUnchanged was removed in A9 — it guarded the
+// legacy IEEE-CRC on-disk byte shape for PageHeaders=false, which is now retired;
+// the writer always emits the PG page-headered stream.)
 
 // TestExtractRecordBytesCapBoundedByWantBytes guards the M-NIGHTLY
 // AC-003 restart-timeout regression (deferral ledger 2026-07-07):

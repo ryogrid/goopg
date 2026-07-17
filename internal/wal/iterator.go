@@ -305,7 +305,8 @@ func (it *RecordIterator) NextRaw(ctx context.Context, maxBytes int) (RawChunk, 
 }
 
 func (it *RecordIterator) zeroPagePaddingAdvance(written int64) (int64, error) {
-	if !it.pageHeaders || it.pos >= written || it.pos%XLOGBlockSize == 0 {
+	// A9: it.pageHeaders is always true (legacy frame retired).
+	if it.pos >= written || it.pos%XLOGBlockSize == 0 {
 		return 0, nil
 	}
 	remain := XLOGBlockSize - int(it.pos%XLOGBlockSize)
@@ -396,30 +397,9 @@ func (it *RecordIterator) readOneAt(pos int64) (Record, int, error) {
 		endLSN := uint64(pos) + uint64(advance)
 		return Record{StartLSN: startLSN, EndLSN: endLSN, Payload: decoded.Payload, XLog: decoded.XLog}, advance, nil
 	}
-
-	header, _, err := it.readRecordBytesAt(pos, recordHeaderSize)
-	if err != nil {
-		return Record{}, 0, err
-	}
-	payloadLen := int(uint32(header[0]) | uint32(header[1])<<8 | uint32(header[2])<<16 | uint32(header[3])<<24)
-	if payloadLen < 0 {
-		return Record{}, 0, fmt.Errorf("%w: negative payload length %d", ErrCorruptRecord, payloadLen)
-	}
-	total := recordHeaderSize + payloadLen
-	body, advance, err := it.readRecordBytesAt(pos, total)
-	if err != nil {
-		return Record{}, 0, err
-	}
-	payload, n, err := decodeRecord(body)
-	if err != nil {
-		return Record{}, 0, err
-	}
-	if n != total {
-		return Record{}, 0, fmt.Errorf("wal: iterator size mismatch: %d vs %d", n, total)
-	}
-	startLSN := uint64(pos) + 1
-	endLSN := uint64(pos) + uint64(advance)
-	return Record{StartLSN: startLSN, EndLSN: endLSN, Payload: payload}, advance, nil
+	// A9: legacy IEEE-CRC frame retired — it.pageHeaders is always true, so the
+	// block above always returns. Unreachable.
+	return Record{}, 0, fmt.Errorf("wal: internal: readOneAt reached the retired legacy path")
 }
 
 // readRecordBytesAt reads `n` logical record bytes starting at
@@ -429,13 +409,8 @@ func (it *RecordIterator) readOneAt(pos int64) (Record, int, error) {
 // bytes, returning the number of physical stream bytes consumed
 // (record bytes + skipped page-header bytes) as `advance`.
 func (it *RecordIterator) readRecordBytesAt(pos int64, n int) ([]byte, int, error) {
-	if !it.pageHeaders {
-		out, err := it.readBytesAt(pos, n)
-		if err != nil {
-			return nil, 0, err
-		}
-		return out, n, nil
-	}
+	// A9: it.pageHeaders is always true (legacy frame retired) — always the
+	// page-aware read that steps over XLogPageHeader bytes.
 	out := make([]byte, 0, n)
 	advance := 0
 	for len(out) < n {

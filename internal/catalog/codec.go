@@ -22,6 +22,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
+	"strconv"
 	"strings"
 )
 
@@ -43,6 +44,7 @@ const (
 	pgAttributeOffTypID      = 68
 	pgAttributeOffNum        = 74
 	pgAttributeOffNotNull    = 86
+	pgAttributeOffIdentity   = 89
 	pgAttributeOffIsDropped  = 91
 )
 
@@ -577,12 +579,12 @@ func BaseOIDForArray(oid uint32) (uint32, bool) {
 // Only the subset of columns needed to reconstruct the in-memory
 // catalog state is stored; the full upstream shape is deferred.
 type PGClassRow struct {
-	OID            uint32 // oid
-	RelName        string // relname
-	RelNamespace   uint32 // relnamespace (schema OID)
-	RelKind        string // relkind: 'r'=table,'i'=index,'v'=view,'S'=seq
-	RelNAtts       int32  // relnatts
-	RelFileNode    uint32 // relfilenode (0 for virtual / view)
+	OID          uint32 // oid
+	RelName      string // relname
+	RelNamespace uint32 // relnamespace (schema OID)
+	RelKind      string // relkind: 'r'=table,'i'=index,'v'=view,'S'=seq
+	RelNAtts     int32  // relnatts
+	RelFileNode  uint32 // relfilenode (0 for virtual / view)
 	// RelTablespace holds pg_class.reltablespace (0 = database default).
 	// Only DecodePGClassPhysicalRow populates this (the fixed-offset
 	// PG18-canonical layout); the legacy simple encoding decoded by
@@ -609,6 +611,11 @@ type PGAttributeRow struct {
 	AttNum       int32  // attnum (1-based)
 	AttNotNull   bool   // attnotnull
 	AttIsDropped bool   // attisdropped
+	// AttIdentity is attidentity (0, 'a' ALWAYS, 'd' BY DEFAULT). Decoded
+	// only by the PG-physical DecodePGAttributeRow (B1.3b — the sequence
+	// reload restores IdentityColumn/IdentityAlways from it, replacing the
+	// retired kind-65 IdentityKind marker).
+	AttIdentity byte
 }
 
 // PGTypeRow is the v0 on-disk shape of one pg_type tuple.
@@ -948,6 +955,7 @@ func DecodePGAttributePhysicalRow(data []byte) (PGAttributeRow, error) {
 		AttNum:       attNum,
 		AttNotNull:   attNotNull,
 		AttIsDropped: attIsDropped,
+		AttIdentity:  data[pgAttributeOffIdentity],
 	}
 	if !r.AttIsDropped && r.AttTypID == 0 {
 		return r, fmt.Errorf("pg_attribute.atttypid: invalid 0")
@@ -1394,7 +1402,6 @@ func decodePGIndexOIDVector(data []byte, off int) ([]uint32, int, bool) {
 	return oids, pgIndexAlign4(off + needed), true
 }
 
-
 // PGStatisticRow holds the fields from pg_statistic needed for in-memory
 // planner statistics reconstruction.
 type PGStatisticRow struct {
@@ -1838,4 +1845,93 @@ func OIDToTypeName(oid uint32) string {
 	default:
 		return "text"
 	}
+}
+
+// PGFloatOut renders f exactly as PostgreSQL's float4out (bitSize==32) /
+// float8out (bitSize==64) would under the default extra_float_digits=1: the
+// shortest round-trip decimal (Ryu algorithm) combined with PG's
+// fixed-vs-scientific exponent thresholds. Go's strconv.FormatFloat(f,'g',-1,…)
+// produces the same shortest digits but switches to scientific notation at a
+// different (and type-independent) threshold than PostgreSQL, so values such as
+// 2233750 render as "2.23375e+06" instead of "2233750". This mirrors
+// postgres/src/common/{f2s,d2s}.c to_chars: fixed-point output when the display
+// exponent (position of the most-significant digit) is in [-4, sciExp) and
+// scientific output otherwise, where sciExp is 6 for float4 and 15 for float8.
+func PGFloatOut(f float64, bitSize int) string {
+	switch {
+	case math.IsNaN(f):
+		return "NaN"
+	case math.IsInf(f, 1):
+		return "Infinity"
+	case math.IsInf(f, -1):
+		return "-Infinity"
+	}
+
+	// fixed-point when the display exponent lies in [-4, sciExp).
+	sciExp := 15 // float8
+	if bitSize == 32 {
+		sciExp = 6 // float4
+	}
+
+	// Shortest round-trip scientific form: always "d[.ddd]e±NN" with a single
+	// leading digit, no trailing zeros, and an explicit exponent. From it we
+	// recover the significant digits and the display exponent.
+	sci := strconv.FormatFloat(math.Abs(f), 'e', -1, bitSize)
+	ePos := strings.IndexByte(sci, 'e')
+	mant := sci[:ePos]
+	exp, _ := strconv.Atoi(sci[ePos+1:])
+	digits := strings.Replace(mant, ".", "", 1)
+	olength := len(digits)
+
+	var b strings.Builder
+	if math.Signbit(f) {
+		// Preserve negative zero ("-0"), matching PostgreSQL.
+		b.WriteByte('-')
+	}
+
+	if exp >= -4 && exp < sciExp {
+		// Fixed-point. pointPos = number of digits before the decimal point.
+		pointPos := exp + 1
+		switch {
+		case pointPos <= 0:
+			// 0.000ddddd
+			b.WriteString("0.")
+			for i := 0; i < -pointPos; i++ {
+				b.WriteByte('0')
+			}
+			b.WriteString(digits)
+		case pointPos >= olength:
+			// ddddd000 (trailing zeros to reach the point)
+			b.WriteString(digits)
+			for i := 0; i < pointPos-olength; i++ {
+				b.WriteByte('0')
+			}
+		default:
+			// dddd.dddd
+			b.WriteString(digits[:pointPos])
+			b.WriteByte('.')
+			b.WriteString(digits[pointPos:])
+		}
+		return b.String()
+	}
+
+	// Scientific: d[.ddd]e±NN with the exponent zero-padded to >= 2 digits.
+	b.WriteByte(digits[0])
+	if olength > 1 {
+		b.WriteByte('.')
+		b.WriteString(digits[1:])
+	}
+	b.WriteByte('e')
+	if exp < 0 {
+		b.WriteByte('-')
+		exp = -exp
+	} else {
+		b.WriteByte('+')
+	}
+	es := strconv.Itoa(exp)
+	if len(es) < 2 {
+		b.WriteByte('0')
+	}
+	b.WriteString(es)
+	return b.String()
 }

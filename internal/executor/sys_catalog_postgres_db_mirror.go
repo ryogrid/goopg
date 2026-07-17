@@ -31,6 +31,7 @@ package executor
 // (user-table data file in `base/5/<relfilenode>`) is a follow-up loop.
 
 import (
+	"bytes"
 	"fmt"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -108,8 +109,21 @@ func mirrorCatalogRelToPostgresDB(ctx *Context, relOID uint32) error {
 			dstSlot = s
 		}
 		dstSlot.Lock()
+		// Skip identical blocks: the mirror walks EVERY block of every
+		// mirrored catalog on every DDL, but only the 1-2 pages the DDL
+		// touched actually differ. Copying + force-FPI'ing unchanged pages
+		// (B2.1b standby fix) multiplied WAL by the catalog's block count
+		// per statement and made the regress suite crawl.
+		if bytes.Equal(dstSlot.Page(), pageBytes) {
+			dstSlot.Unlock()
+			ctx.Pool.Unpin(dstSlot)
+			continue
+		}
 		copy(dstSlot.Page(), pageBytes)
-		ctx.Pool.MarkDirty(dstSlot)
+		// MarkDirtyForceFPI (not MarkDirty): the standby reads base/5, and
+		// maybeEmitFPI's once-per-checkpoint suppression would swallow a
+		// second change to the same mirrored page (B2.1b).
+		ctx.Pool.MarkDirtyForceFPI(dstSlot)
 		dstSlot.Unlock()
 		ctx.Pool.Unpin(dstSlot)
 	}
@@ -121,9 +135,9 @@ func mirrorCatalogRelToPostgresDB(ctx *Context, relOID uint32) error {
 // strict subset) from DBOid=1 to DBOid=5.
 func mirrorTouchedCatalogsToPostgresDB(ctx *Context) error {
 	mirroredOIDs := []uint32{
-		catalog.RelationRelationId,     // 1259 pg_class
-		catalog.AttributeRelationId,    // 1249 pg_attribute
-		catalog.IndexRelationId,        // 2610 pg_index — syncIndexToCatalogHeap's
+		catalog.RelationRelationId,  // 1259 pg_class
+		catalog.AttributeRelationId, // 1249 pg_attribute
+		catalog.IndexRelationId,     // 2610 pg_index — syncIndexToCatalogHeap's
 		// pg_index row was never mirrored here, so loadUserIndexesFromHeap's Pass
 		// 2 heap scan (which reads from cat.DBOID(), almost always PostgresDBOid
 		// in real usage — see detectCatalogDBOID) never found a live pg_index row
@@ -134,6 +148,24 @@ func mirrorTouchedCatalogsToPostgresDB(ctx *Context) error {
 		pgClassOidIndexOID,             // 2662
 		pgClassRelnameNspIndexOID,      // 2663
 		pgAttributeRelidAttnumIndexOID, // 2659
+		// B1.1 (doc 02a §2.2 review BLOCKER-3): pg_namespace converted to
+		// heap journaling — its heap + both indexes MUST be in this set or
+		// schemas written to base/1 vanish on restart (recovery reloads
+		// from the postgres DB's copies).
+		pgNamespaceRelOID,          // 2615 pg_namespace
+		pgNamespaceNspnameIndexOID, // 2684
+		pgNamespaceOidIndexOID,     // 2685
+		// B1.2: pg_proc heap; B2-prep added runtime maintenance of both
+		// indexes (descent path), so they must mirror alongside the heap.
+		pgProcRelOID,                 // 1255
+		pgProcOidIndexOID,            // 2690
+		pgProcPronameArgsNspIndexOID, // 2691
+		// B1.3b: the sequence reload reads pg_sequence + pg_depend from
+		// base/5 (cat.DBOID()) — without these the registry reload found
+		// ZERO rows (B1.3's TID reseed silently no-op'd the same way).
+		pgSequenceRelOID,           // 2224 pg_sequence
+		pgSequenceSeqrelidIndexOID, // 5002
+		pgDependRelOID,             // 2608 pg_depend (narrow OWNED-BY rows)
 	}
 	for _, oid := range mirroredOIDs {
 		if err := mirrorCatalogRelToPostgresDB(ctx, oid); err != nil {

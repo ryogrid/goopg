@@ -1341,6 +1341,13 @@ func (c *Context) deadlockTimeout() time.Duration {
 type Checkpointer interface {
 	CheckpointNow() error
 	CheckpointRedoLSN() uint64
+	// LastCheckpointRecordLSN returns the start LSN (1-based) of the most
+	// recent checkpoint RECORD — distinct from the redo point since
+	// A9-checkpoint-opcode (an ONLINE checkpoint's record is preceded by
+	// XLOG_RUNNING_XACTS). BASE_BACKUP stamps it into backup_label's
+	// CHECKPOINT LOCATION and pg_control's CheckPoint. 0 when no
+	// checkpoint has completed yet.
+	LastCheckpointRecordLSN() uint64
 }
 
 // NewContext builds a Context with sensible defaults: a fresh
@@ -1375,11 +1382,14 @@ func NewContext() *Context {
 // open savepoint), the session's cached tx.XID is updated too so
 // later savepoint AllocateSubXid calls see the real parent XID.
 func (c *Context) MaterializeWriterXID() error {
+	if c.Tx.XID != storage.InvalidTransactionID {
+		// Already materialized (or pre-stamped, e.g. the frozen-xid compat
+		// paths) — no manager needed. B1.1 moved this check ahead of the
+		// TxnMgr guard so pre-stamped contexts work without one.
+		return nil
+	}
 	if c.TxnMgr == nil {
 		return &ExecError{Code: "XX000", Message: "executor: no TxnMgr in context"}
-	}
-	if c.Tx.XID != storage.InvalidTransactionID {
-		return nil
 	}
 	xid, err := c.TxnMgr.AssignXID(c.Tx)
 	if err != nil {

@@ -2349,6 +2349,23 @@ type InMemory struct {
 	// matching pg_namespace.nspowner's previous hardcoded literal.
 	schemaOwners map[string]uint32
 
+	// schemaHeapTIDs maps lowercase schema name → the schema's LIVE
+	// pg_namespace heap-row TID (B1.1, doc 02a §3.3 TID-carrying cache
+	// contract): seeded by CREATE SCHEMA's heap INSERT and by the startup
+	// reload scan, refreshed by every ALTER's heap UPDATE, deleted with the
+	// schema. updateHeapRowCanonicalPG needs it to stamp the old version.
+	schemaHeapTIDs map[string]SchemaHeapTID
+	// typeHeapTIDs maps a pg_type row's OID (domain/enum/range/composite +
+	// their array peers) → that row's LIVE pg_type heap TID (B2.1b, same
+	// §3.3 contract as schemaHeapTIDs). Seeded by every
+	// writeTypeHeapRowWithIndexes INSERT and by the startup reload scan,
+	// refreshed by ALTER heap UPDATEs, deleted with the type row.
+	typeHeapTIDs map[uint32]SchemaHeapTID
+	// operatorHeapTIDs maps a pg_operator row's OID to its live heap TID —
+	// B2.2 slice 3's upsert cache (shell fill-in / COMMUTATOR-NEGATOR
+	// back-patch = canonical heap UPDATE at the cached TID).
+	operatorHeapTIDs map[uint32]SchemaHeapTID
+
 	// tempNamespaces maps a session's temp-owner token ("s<id>", see
 	// executor.sessionTempOwner) → the OID of that session's temporary
 	// namespace (pg_temp_<id>). In PostgreSQL every backend that creates a
@@ -2837,6 +2854,10 @@ type CommentRow struct {
 type EnumValue struct {
 	Label     string
 	SortOrder float64
+	// OID is this label's pg_enum row OID (B2.1d): allocated at CREATE TYPE
+	// AS ENUM / ADD VALUE, preserved across restart by the pg_enum heap
+	// reload. 0 only on registrations that predate the heap conversion.
+	OID uint32
 }
 
 // EnumType holds one user-defined enum type. M0097-0017.
@@ -8302,8 +8323,12 @@ func (c *InMemory) registerSystemTables() {
 		for _, name := range names {
 			et := c.enumTypes[name]
 			for _, ev := range et.Values {
+				rowOID := oid
+				if ev.OID != 0 { // B2.1d: labels carry real pg_enum row OIDs
+					rowOID = int(ev.OID)
+				}
 				rows = append(rows, []string{
-					fmt.Sprintf("%d", oid),
+					fmt.Sprintf("%d", rowOID),
 					fmt.Sprintf("%d", et.OID),
 					strconv.FormatFloat(ev.SortOrder, 'f', -1, 32),
 					ev.Label,
@@ -12140,6 +12165,105 @@ func (c *InMemory) SchemaNameForOID(oid uint32) string {
 		}
 	}
 	return ""
+}
+
+// SchemaHeapTID is a pg_namespace heap-row locator (block, line pointer) —
+// the catalog package's storage.ItemPointer analog, kept local to avoid an
+// import cycle. B1.1 TID-carrying cache (doc 02a §3.3).
+type SchemaHeapTID struct {
+	Block  uint32
+	Offset uint16
+}
+
+// SchemaHeapTID returns the live pg_namespace heap TID recorded for name,
+// with ok=false when none is known (builtin schemas before any ALTER, or a
+// pre-conversion data dir).
+func (c *InMemory) SchemaHeapTID(name string) (SchemaHeapTID, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	tid, ok := c.schemaHeapTIDs[strings.ToLower(name)]
+	return tid, ok
+}
+
+// TypeHeapTID returns the live pg_type heap-row TID for the type row with
+// the given OID (B2.1b TID-carrying cache).
+func (c *InMemory) TypeHeapTID(oid uint32) (SchemaHeapTID, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	tid, ok := c.typeHeapTIDs[oid]
+	return tid, ok
+}
+
+// SetTypeHeapTID records/refreshes the live pg_type heap TID for oid.
+func (c *InMemory) SetTypeHeapTID(oid uint32, tid SchemaHeapTID) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.typeHeapTIDs == nil {
+		c.typeHeapTIDs = make(map[uint32]SchemaHeapTID)
+	}
+	c.typeHeapTIDs[oid] = tid
+}
+
+// DeleteTypeHeapTID drops the TID entry (DROP TYPE/DOMAIN).
+func (c *InMemory) DeleteTypeHeapTID(oid uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.typeHeapTIDs, oid)
+}
+
+// OperatorHeapTID returns the live pg_operator heap TID for oid (B2.2
+// slice 3).
+func (c *InMemory) OperatorHeapTID(oid uint32) (SchemaHeapTID, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	tid, ok := c.operatorHeapTIDs[oid]
+	return tid, ok
+}
+
+// SetOperatorHeapTID records/refreshes the live pg_operator heap TID.
+func (c *InMemory) SetOperatorHeapTID(oid uint32, tid SchemaHeapTID) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.operatorHeapTIDs == nil {
+		c.operatorHeapTIDs = make(map[uint32]SchemaHeapTID)
+	}
+	c.operatorHeapTIDs[oid] = tid
+}
+
+// DropOperatorHeapTID drops the TID entry (DROP OPERATOR).
+func (c *InMemory) DropOperatorHeapTID(oid uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.operatorHeapTIDs, oid)
+}
+
+// SetSchemaHeapTID records/refreshes the live pg_namespace heap TID for name.
+func (c *InMemory) SetSchemaHeapTID(name string, tid SchemaHeapTID) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.schemaHeapTIDs == nil {
+		c.schemaHeapTIDs = make(map[string]SchemaHeapTID)
+	}
+	c.schemaHeapTIDs[strings.ToLower(name)] = tid
+}
+
+// DeleteSchemaHeapTID drops the TID entry (DROP SCHEMA).
+func (c *InMemory) DeleteSchemaHeapTID(name string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.schemaHeapTIDs, strings.ToLower(name))
+}
+
+// RenameSchemaHeapTID re-keys the TID entry (ALTER SCHEMA RENAME — the row
+// itself moved via heap UPDATE, so the caller passes the NEW tid too).
+func (c *InMemory) RenameSchemaHeapTID(oldName, newName string, tid SchemaHeapTID) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.schemaHeapTIDs == nil {
+		c.schemaHeapTIDs = make(map[string]SchemaHeapTID)
+	}
+	delete(c.schemaHeapTIDs, strings.ToLower(oldName))
+	c.schemaHeapTIDs[strings.ToLower(newName)] = tid
 }
 
 // RegisterSchema records a user-created schema. Called from execCreateSchema.
@@ -18602,6 +18726,18 @@ func LookupBuiltinProc(name string) (BuiltinProc, bool) {
 	return p, ok
 }
 
+// LookupBuiltinProcByOID is the OID→entry reversal of LookupBuiltinProc
+// (linear scan — the hand-curated set is small). B2.2 slice 3: pg_operator's
+// oprresult derives from the operator function's return type.
+func LookupBuiltinProcByOID(oid uint32) (BuiltinProc, bool) {
+	for _, p := range builtinProcsByName {
+		if p.OID == oid {
+			return p, true
+		}
+	}
+	return BuiltinProc{}, false
+}
+
 // BuiltinOperator holds a hand-curated built-in pg_operator.dat row — the
 // operator analogue of BuiltinProc. Only the handful of built-in operators
 // goopg's DU-002 pg_dump test fixtures actually reference are curated here
@@ -20033,8 +20169,36 @@ func (c *InMemory) RegisterEnum(name string, values []string, dbOid ...uint32) (
 		DBOid:    oid,
 	}
 	c.nextOID += 2
+	// B2.1d: every label owns a pg_enum row OID.
+	for i := range et.Values {
+		et.Values[i].OID = c.nextOID
+		c.nextOID++
+	}
 	c.enumTypes[enumKey(oid, k)] = et
 	return et, nil
+}
+
+// RegisterEnumDuringRecovery re-registers an enum reconstructed at startup
+// from its pg_type + pg_enum heap rows (B2.1d), preserving its original
+// OID/ArrayOID/label OIDs and advancing nextOID past them. Keys under
+// et.DBOid (the reload passes cat.DBOID() — see RegisterDomainDuringRecovery's
+// identical convention); zero falls back to DefaultDBOid.
+func (c *InMemory) RegisterEnumDuringRecovery(et *EnumType) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.enumTypes == nil {
+		c.enumTypes = make(map[string]*EnumType)
+	}
+	out := *et
+	if out.DBOid == 0 {
+		out.DBOid = DefaultDBOid
+	}
+	c.enumTypes[enumKey(out.DBOid, strings.ToLower(et.Name))] = &out
+	c.advanceNextOIDLocked(et.OID)
+	c.advanceNextOIDLocked(et.ArrayOID)
+	for _, ev := range et.Values {
+		c.advanceNextOIDLocked(ev.OID)
+	}
 }
 
 // LookupEnum finds an enum type by name (case-insensitive), scoped to dbOid
@@ -20342,7 +20506,7 @@ func (c *InMemory) AddEnumValueResult(name, value string, ifNotExists bool, befo
 					}
 					newSortOrder = float64(mid32)
 				}
-				newEV := EnumValue{Label: value, SortOrder: newSortOrder}
+				newEV := EnumValue{Label: value, SortOrder: newSortOrder, OID: c.allocOIDLocked()}
 				newVals := make([]EnumValue, 0, len(et.Values)+1)
 				newVals = append(newVals, et.Values[:i]...)
 				newVals = append(newVals, newEV)
@@ -20370,7 +20534,7 @@ func (c *InMemory) AddEnumValueResult(name, value string, ifNotExists bool, befo
 					}
 					newSortOrder = float64(mid32)
 				}
-				newEV := EnumValue{Label: value, SortOrder: newSortOrder}
+				newEV := EnumValue{Label: value, SortOrder: newSortOrder, OID: c.allocOIDLocked()}
 				newVals := make([]EnumValue, 0, len(et.Values)+1)
 				newVals = append(newVals, et.Values[:i+1]...)
 				newVals = append(newVals, newEV)
@@ -20388,7 +20552,7 @@ func (c *InMemory) AddEnumValueResult(name, value string, ifNotExists bool, befo
 		} else {
 			newSortOrder = et.Values[len(et.Values)-1].SortOrder + 1
 		}
-		et.Values = append(et.Values, EnumValue{Label: value, SortOrder: newSortOrder})
+		et.Values = append(et.Values, EnumValue{Label: value, SortOrder: newSortOrder, OID: c.allocOIDLocked()})
 	}
 	return false, nil
 }
@@ -21212,12 +21376,14 @@ func (c *InMemory) RegisterRangeTypeDuringRecovery(rt *RangeType) {
 		c.rangeTypes = make(map[string]*RangeType)
 	}
 	out := *rt
-	// WAL replay does not yet carry a dbOid for range-type records (see the
-	// DBOid field's doc comment) — every replayed range type lands under
-	// DefaultDBOid, matching every other not-yet-migrated write path's
-	// restart behavior (domains/collations/enums/composites).
-	out.DBOid = DefaultDBOid
-	c.rangeTypes[rangeKey(DefaultDBOid, rt.Name)] = &out
+	// B2.1c: the heap reload passes the scanned database's OID in rt.DBOid
+	// (cat.DBOID() — the OID a live session resolves for LookupRangeType;
+	// see RegisterDomainDuringRecovery's identical fix). Zero falls back to
+	// DefaultDBOid for legacy callers.
+	if out.DBOid == 0 {
+		out.DBOid = DefaultDBOid
+	}
+	c.rangeTypes[rangeKey(out.DBOid, rt.Name)] = &out
 	c.advanceNextOIDLocked(rt.OID)
 	c.advanceNextOIDLocked(rt.ArrayOID)
 	c.advanceNextOIDLocked(rt.MultirangeOID)
@@ -21239,7 +21405,8 @@ func (c *InMemory) SetRangeTypeOwnerDuringRecovery(name string, ownerOID uint32)
 }
 
 // DropRangeTypeDuringRecovery is the idempotent counterpart used for
-// replaying RecordKindDropRangeType. Identical to DropRangeType but discards
+// the startup heap reload (B2.1c — formerly the retired RecordKindDropRangeType
+// replay). Identical to DropRangeType but discards
 // the found/not-found result — replay does not care whether the range type
 // was still present. DU-002 restart-persistence follow-up (M0110-0001,
 // DU-002 slice 429 ledger resume point, sub-item (c)).
@@ -21320,10 +21487,11 @@ func (c *InMemory) RegisterDomain(name string, base Type, notNull bool, dbOid ..
 }
 
 // RegisterDomainDuringRecovery re-registers a domain (including every CHECK
-// constraint) reconstructed from a RecordKindCreateDomain WAL record,
-// preserving its original OID/ArrayOID/CHECK OIDs and advancing nextOID past
-// them so subsequent allocations don't collide. Mirrors
-// RegisterRangeTypeDuringRecovery. M0122-0005 restart-persistence follow-up.
+// constraint) reconstructed at startup from its pg_type + pg_constraint heap
+// rows (B2.1b, reloadUserDomainsFromHeap — formerly from the retired
+// RecordKindCreateDomain WAL record), preserving its original
+// OID/ArrayOID/CHECK OIDs and advancing nextOID past them so subsequent
+// allocations don't collide. Mirrors RegisterRangeTypeDuringRecovery.
 func (c *InMemory) RegisterDomainDuringRecovery(d *Domain) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -21331,12 +21499,16 @@ func (c *InMemory) RegisterDomainDuringRecovery(d *Domain) {
 		c.domains = make(map[string]*Domain)
 	}
 	out := *d
-	// WAL replay does not yet carry a dbOid for domain records (see the
-	// DBOid field's doc comment) — every replayed domain lands under
-	// DefaultDBOid, matching every other not-yet-migrated write path's
-	// restart behavior.
-	out.DBOid = DefaultDBOid
-	c.domains[domainKey(DefaultDBOid, d.Name)] = &out
+	// B2.1b: the heap reload passes the scanned database's OID in d.DBOid
+	// (cat.DBOID(), the same OID a live session resolves for its lookups —
+	// the old forced-DefaultDBOid keying made every reloaded domain
+	// invisible to LookupDomain(name, 5) and silently disabled post-restart
+	// CHECK enforcement). Zero falls back to DefaultDBOid for legacy
+	// callers.
+	if out.DBOid == 0 {
+		out.DBOid = DefaultDBOid
+	}
+	c.domains[domainKey(out.DBOid, d.Name)] = &out
 	c.advanceNextOIDLocked(d.OID)
 	c.advanceNextOIDLocked(d.ArrayOID)
 	for _, chk := range d.Checks {

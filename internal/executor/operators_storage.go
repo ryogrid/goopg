@@ -8042,43 +8042,7 @@ func writeHeapRowReturningPG(ctx *Context, rel storage.RelFileNode, cols []catal
 		return ptr, err
 	}
 
-	body, err := EncodeRowPG(cols, row)
-	if err != nil {
-		return ptr, &ExecError{Code: "XX000", Message: err.Error()}
-	}
-	bitmap := NullBitmapPG(row)
-	// xmin = effective writer XID (sub-XID inside an open savepoint) so a
-	// savepoint-inserted row disappears on ROLLBACK TO; no-op outside a
-	// savepoint. M0118-0009 — twin of writeHeapRowReturning above.
-	xmin := effectiveWriterXID(ctx)
-	var tuple storage.HeapTuple
-	if len(bitmap) > 0 {
-		tuple = storage.NewHeapTupleWithNulls(xmin, storage.InvalidTransactionID, bitmap, body)
-	} else {
-		tuple = storage.NewHeapTuple(xmin, storage.InvalidTransactionID, body)
-	}
-	// Set t_infomask2 natts so PG's heap_deform_tuple can locate each attribute.
-	// Set HEAP_XMAX_INVALID so PG's visibility code treats xmax as invalid
-	// without testing the XID. Both are required for correct PG-standby reads.
-	// M0106-0010 batched-36.
-	tuple.Header.SetNatts(len(cols))
-	tuple.Header.Infomask |= storage.HeapXmaxInvalid
-	// HEAP_HASVARWIDTH: mirrors PG's heap_fill_tuple — set when the
-	// tuple contains at least one non-null varlena value. PG18's
-	// nocachegetattr fast path (heaptuple.c:642 — `Assert(j > attnum)`)
-	// crashes if the bit is missing while the TupleDesc still
-	// considers the catalog to have varlena attrs on the prefix
-	// leading to the target attnum (e.g. relacl/reloptions/relpartbound
-	// on pg_class). M0106-0010 batched-49.
-	if pgRowHasVarWidth(cols, row) {
-		tuple.Header.Infomask |= storage.HeapHasVarWidth
-	}
-	// HEAP_HASEXTERNAL: PG's heap_deform_tuple needs this bit
-	// for TOAST-external columns. M0118-0131.
-	if pgRowHasExternal(cols, row) {
-		tuple.Header.Infomask |= storage.HeapHasExternal
-	}
-	tupleBytes, err := tuple.MarshalBinary()
+	tuple, tupleBytes, err := buildCatalogPGHeapTuple(ctx, cols, row)
 	if err != nil {
 		return ptr, err
 	}
@@ -8222,6 +8186,242 @@ func writeHeapRowReturningPG(ctx *Context, rel storage.RelFileNode, cols []catal
 		ptr = storage.ItemPointer{Block: blk, Offset: lineSlot}
 	}
 	return ptr, derr
+}
+
+// buildCatalogPGHeapTuple encodes one PG-canonical catalog heap tuple —
+// the shared body of writeHeapRowReturningPG (INSERT) and
+// updateHeapRowCanonicalPG (the new version of an UPDATE). Factored in
+// B0.2 so the two paths can never drift (sibling-path rule).
+func buildCatalogPGHeapTuple(ctx *Context, cols []catalog.Column, row Row) (storage.HeapTuple, []byte, error) {
+	var tuple storage.HeapTuple
+	body, err := EncodeRowPG(cols, row)
+	if err != nil {
+		return tuple, nil, &ExecError{Code: "XX000", Message: err.Error()}
+	}
+	bitmap := NullBitmapPG(row)
+	// xmin = effective writer XID (sub-XID inside an open savepoint) so a
+	// savepoint-inserted row disappears on ROLLBACK TO; no-op outside a
+	// savepoint. M0118-0009 — twin of writeHeapRowReturning.
+	xmin := effectiveWriterXID(ctx)
+	if len(bitmap) > 0 {
+		tuple = storage.NewHeapTupleWithNulls(xmin, storage.InvalidTransactionID, bitmap, body)
+	} else {
+		tuple = storage.NewHeapTuple(xmin, storage.InvalidTransactionID, body)
+	}
+	// Set t_infomask2 natts so PG's heap_deform_tuple can locate each attribute.
+	// Set HEAP_XMAX_INVALID so PG's visibility code treats xmax as invalid
+	// without testing the XID. Both are required for correct PG-standby reads.
+	// M0106-0010 batched-36.
+	tuple.Header.SetNatts(len(cols))
+	tuple.Header.Infomask |= storage.HeapXmaxInvalid
+	// HEAP_HASVARWIDTH: mirrors PG's heap_fill_tuple — set when the
+	// tuple contains at least one non-null varlena value. PG18's
+	// nocachegetattr fast path (heaptuple.c:642 — `Assert(j > attnum)`)
+	// crashes if the bit is missing while the TupleDesc still
+	// considers the catalog to have varlena attrs on the prefix
+	// leading to the target attnum (e.g. relacl/reloptions/relpartbound
+	// on pg_class). M0106-0010 batched-49.
+	if pgRowHasVarWidth(cols, row) {
+		tuple.Header.Infomask |= storage.HeapHasVarWidth
+	}
+	// HEAP_HASEXTERNAL: PG's heap_deform_tuple needs this bit
+	// for TOAST-external columns. M0118-0131.
+	if pgRowHasExternal(cols, row) {
+		tuple.Header.Infomask |= storage.HeapHasExternal
+	}
+	tupleBytes, err := tuple.MarshalBinary()
+	if err != nil {
+		return tuple, nil, err
+	}
+	return tuple, tupleBytes, nil
+}
+
+// updateHeapRowCanonicalPG performs a PG-faithful NON-HOT catalog heap UPDATE
+// (B0.2, doc 02a §3): verifies the old version at oldTID is live, writes the
+// new PG-canonical version (same page when it fits, else the last/new page),
+// stamps the old tuple with xmax + a forward t_ctid (no HOT bits), and emits
+// ONE xl_heap_update record covering both changes. Returns the new TID — the
+// caller's write-through cache must store it (TID-carrying cache contract).
+// Index maintenance is the CALLER's job: an update touching any indexed
+// column must insert fresh entries into every index on the catalog.
+//
+// Catalog DDL is serialized at the SQL layer, so no EPQ/concurrent-updater
+// handling is needed; a non-live old tuple is a stale-TID bug and errors
+// loudly (R-B0-3).
+func updateHeapRowCanonicalPG(ctx *Context, rel storage.RelFileNode, cols []catalog.Column,
+	oldTID storage.ItemPointer, newRow Row) (storage.ItemPointer, error) {
+	var newTID storage.ItemPointer
+	if err := ctx.MaterializeWriterXID(); err != nil {
+		return newTID, err
+	}
+	tuple, tupleBytes, err := buildCatalogPGHeapTuple(ctx, cols, newRow)
+	if err != nil {
+		return newTID, err
+	}
+	xmax := effectiveWriterXID(ctx)
+	logUpdate := ctx.Pool.LogHeapUpdate()
+
+	verifyOldLive := func(page storage.Page) error {
+		ht, err := storage.PageGetHeapTuple(page, oldTID.Offset)
+		if err != nil {
+			return &ExecError{Code: "XX000", Message: fmt.Sprintf("catalog update: stale TID (%d,%d): %v", oldTID.Block, oldTID.Offset, err)}
+		}
+		if ht.Header.Xmin == storage.InvalidTransactionID || ht.Header.Xmax != storage.InvalidTransactionID {
+			return &ExecError{Code: "XX000", Message: fmt.Sprintf("catalog update: TID (%d,%d) is not the live version", oldTID.Block, oldTID.Offset)}
+		}
+		return nil
+	}
+
+	// Fast path: the new version fits on the old version's page — one page,
+	// one lock, one record (PG's same-page non-HOT form: single block ref).
+	oldSlotBuf, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: oldTID.Block})
+	if err != nil {
+		return newTID, err
+	}
+	oldSlotBuf.Lock()
+	if err := verifyOldLive(oldSlotBuf.Page()); err != nil {
+		oldSlotBuf.Unlock()
+		ctx.Pool.Unpin(oldSlotBuf)
+		return newTID, err
+	}
+	if newSlot, aerr := storage.PageAddHeapTuple(oldSlotBuf.Page(), tuple); aerr == nil {
+		// Self-pointing t_ctid on the new version (chain tail) — what
+		// replay's decodeXLogHeapInsertTuple reconstructs at new_offnum.
+		if err := storage.PageSetHeapTupleCtid(oldSlotBuf.Page(), newSlot, storage.ItemPointer{Block: oldTID.Block, Offset: newSlot}); err != nil {
+			oldSlotBuf.Unlock()
+			ctx.Pool.Unpin(oldSlotBuf)
+			return newTID, err
+		}
+		if err := storage.PageStampUpdatedOldTuple(oldSlotBuf.Page(), oldTID.Offset, xmax, oldTID.Block, newSlot); err != nil {
+			oldSlotBuf.Unlock()
+			ctx.Pool.Unpin(oldSlotBuf)
+			return newTID, err
+		}
+		var derr error
+		if logUpdate == nil {
+			ctx.Pool.MarkDirty(oldSlotBuf)
+		} else {
+			derr = ctx.Pool.MarkDirtyLogicalChange(oldSlotBuf, func() (storage.LSN, error) {
+				return logUpdate(rel, oldTID.Block, oldTID.Offset, oldTID.Block, newSlot, xmax, tupleBytes)
+			})
+		}
+		if ctx.FSM != nil {
+			ctx.FSM.RecordFreeSpaceForPage(rel, oldTID.Block, oldSlotBuf.Page())
+		}
+		if ctx.VM != nil {
+			ctx.VM.ClearBlock(rel, oldTID.Block)
+		}
+		oldSlotBuf.Unlock()
+		ctx.Pool.Unpin(oldSlotBuf)
+		if derr != nil {
+			return newTID, derr
+		}
+		return storage.ItemPointer{Block: oldTID.Block, Offset: newSlot}, nil
+	} else if !errors.Is(aerr, storage.ErrNoSpaceInPage) {
+		oldSlotBuf.Unlock()
+		ctx.Pool.Unpin(oldSlotBuf)
+		return newTID, aerr
+	}
+	// Old page is full: release it and take the cross-page path — new
+	// version on the last (or a freshly extended) page, both pages locked
+	// in block order, old re-verified under lock, ONE record for both.
+	oldSlotBuf.Unlock()
+	ctx.Pool.Unpin(oldSlotBuf)
+
+	pinNewTarget := func() (*storage.Slot, storage.BlockNumber, error) {
+		nBlocks, err := ctx.Pool.NBlocks(rel)
+		if err != nil {
+			return nil, 0, err
+		}
+		if nBlocks > 0 && nBlocks-1 != oldTID.Block {
+			blk := nBlocks - 1
+			s, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
+			if err != nil {
+				return nil, 0, err
+			}
+			return s, blk, nil
+		}
+		s, blk, err := ctx.Pool.PinNewWithXID(rel, ctx.Tx.XID)
+		if err != nil {
+			return nil, 0, err
+		}
+		return s, blk, nil
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		newBuf, newBlk, err := pinNewTarget()
+		if err != nil {
+			return newTID, err
+		}
+		// Lock both pages in block order (upstream heap_update's deadlock
+		// avoidance); newBlk > oldTID.Block for append/extend targets, but
+		// keep the general rule.
+		oldBuf, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: oldTID.Block})
+		if err != nil {
+			ctx.Pool.Unpin(newBuf)
+			return newTID, err
+		}
+		if oldTID.Block < newBlk {
+			oldBuf.Lock()
+			newBuf.Lock()
+		} else {
+			newBuf.Lock()
+			oldBuf.Lock()
+		}
+		unlockBoth := func() {
+			newBuf.Unlock()
+			oldBuf.Unlock()
+			ctx.Pool.Unpin(newBuf)
+			ctx.Pool.Unpin(oldBuf)
+		}
+		if err := verifyOldLive(oldBuf.Page()); err != nil {
+			unlockBoth()
+			return newTID, err
+		}
+		if storage.IsNew(newBuf.Page()) {
+			if err := storage.InitPage(newBuf.Page()); err != nil {
+				unlockBoth()
+				return newTID, err
+			}
+		}
+		newSlot, aerr := storage.PageAddHeapTuple(newBuf.Page(), tuple)
+		if aerr != nil {
+			unlockBoth()
+			if errors.Is(aerr, storage.ErrNoSpaceInPage) {
+				continue // last block was full — extend on the retry
+			}
+			return newTID, aerr
+		}
+		if err := storage.PageSetHeapTupleCtid(newBuf.Page(), newSlot, storage.ItemPointer{Block: newBlk, Offset: newSlot}); err != nil {
+			unlockBoth()
+			return newTID, err
+		}
+		if err := storage.PageStampUpdatedOldTuple(oldBuf.Page(), oldTID.Offset, xmax, newBlk, newSlot); err != nil {
+			unlockBoth()
+			return newTID, err
+		}
+		var derr error
+		if logUpdate == nil {
+			ctx.Pool.MarkDirty(newBuf)
+		} else {
+			derr = ctx.Pool.MarkDirtyLogicalChange(newBuf, func() (storage.LSN, error) {
+				return logUpdate(rel, oldTID.Block, oldTID.Offset, newBlk, newSlot, xmax, tupleBytes)
+			})
+		}
+		ctx.Pool.MarkDirty(oldBuf)
+		if ctx.FSM != nil {
+			ctx.FSM.RecordFreeSpaceForPage(rel, newBlk, newBuf.Page())
+		}
+		if ctx.VM != nil {
+			ctx.VM.ClearBlock(rel, newBlk)
+			ctx.VM.ClearBlock(rel, oldTID.Block)
+		}
+		unlockBoth()
+		if derr != nil {
+			return newTID, derr
+		}
+		return storage.ItemPointer{Block: newBlk, Offset: newSlot}, nil
+	}
+	return newTID, &ExecError{Code: "XX000", Message: "catalog update: freshly extended page did not accept tuple"}
 }
 
 // markHeapInsertDirty centralises the choice between

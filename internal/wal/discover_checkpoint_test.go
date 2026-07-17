@@ -124,21 +124,30 @@ func TestDiscoverCheckpointFreshCluster(t *testing.T) {
 // segments remain. DiscoverLastCheckpointLSN must still find the
 // checkpoint in the retained segments.
 func TestDiscoverCheckpointAfterRetention(t *testing.T) {
-	// Use a very small segment size so segment 0 fills up quickly
-	// and additional segments are created.
-	const segSize = int64(32)
+	// A9: after retention the stream is read starting at the first
+	// remaining segment, so segment starts must fall on WAL page
+	// boundaries — the segment size has to be a multiple of
+	// XLOGBlockSize (as in production: 16 MiB / 8 KiB). One page per
+	// segment keeps the test small. WALBuffers routes appends through
+	// the stripe path, which relocates records at segment boundaries
+	// (production behaviour) instead of emitting cross-segment
+	// contrecords — so removing segment 0 leaves whole records behind.
+	const segSize = int64(XLOGBlockSize)
 	walDir := filepath.Join(t.TempDir(), "pg_wal")
-	w, err := NewWriter(Config{WALDir: walDir, SegmentSize: segSize})
+	w, err := NewWriter(Config{WALDir: walDir, SegmentSize: segSize, WALBuffers: 64 << 10})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// Write several records to force multiple segments.
-	// Each record is at least 8 bytes (header) + payload.
-	// With segSize=32, a single large record forces a new segment.
-	for i := 0; i < 8; i++ {
-		if _, _, err := w.Append([]byte("recordXX")); err != nil {
+	// Write records until segment 0 is full and the stream has
+	// entered segment 1.
+	for {
+		_, end, err := w.Append(make([]byte, 600))
+		if err != nil {
 			t.Fatal(err)
+		}
+		if end > uint64(segSize) {
+			break
 		}
 	}
 	// Checkpoint is written after filling segment 0 and beyond.

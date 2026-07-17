@@ -120,8 +120,8 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
     opaque flags). No flip needed.
   > Note: btree structural records already replay correctly for goopg↔goopg via their native bodies; the flip
   > is for PG-parseability / real-PG-standby. FPI-based records carry no incremental main-data (PG deviation).
-- [~] **A9** smgr/clog/standalone-FPI/checkpoint-opcode/xact chunks; retire legacy native frame — **FPI LANDED**;
-  rest deferred (each has a specific complexity, per below).
+- [x] **A9** smgr/clog/standalone-FPI/checkpoint-opcode/xact chunks; retire legacy native frame — **COMPLETE**
+  (checkpoint-opcode was the last item; landed 115121c7).
   - [x] **A9-fpi** — standalone first-touch FPI (`Pool.maybeEmitFPI`) → PG `RM_XLOG`/`XLOG_FPI` via
     `EncodePageImagePG` (block-0 apply-image, hole removed). Replay routes the empty-payload case to
     `replayDecodedXLogHeapFPIBlocks` (the arm previously NO-OPed it — fixed together). `predictXLogRecordLen`
@@ -146,17 +146,32 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
     PG-format branch (`DecodeXLogClogTruncate`) that re-applies the idempotent truncation. `oldestXactDb`
     stamped 0 (datoid threading through `SetTruncateLogger` is a follow-up — goopg redo uses only
     pageno+oldestXact). Gates: crash-recovery (217s), e2e ×3, isolation, regress (278s).
-  - [ ] **A9-checkpoint-opcode** — DEFERRED (hot-standby entanglement). Body is already the 88-byte PG
-    `CheckPoint`; the gap is that `classifyXLogRecord` tags it by `len==88`→SHUTDOWN and never emits ONLINE.
-    Changing this is risky: the shutdown opcode is load-bearing for `PMSIGNAL_BEGIN_HOT_STANDBY` readiness
-    (format.go:222). Resume: route via `framePGAssembled(RmgrXLog, online|shutdown)`, plumb the kind +
-    `oldestActiveXid` from the checkpointer, drop the `len==88` hack, re-verify hot-standby bring-up.
-  - [ ] **A9-xact-inval-fold** — retire standalone `RecordKindXactCommitInval` by emitting invals as A6's
-    `HAS_INVALS` chunk on `xl_xact_commit` (mechanism exists: `xactCommitCarriesInvals`). Touches the commit
-    path — do carefully. → follow-up.
-  - [ ] **A9-legacy-frame-retire** — delete `encodeRecord`/`decodeRecord` (IEEE-CRC frame, `format.go:109`)
-    once `PageHeaders` is unconditional (already `true` in prod; legacy path only serves `PageHeaders=false`
-    test clusters). Large mechanical change across writer/reader/iterator + `reader_torn_tail_test.go`. Do LAST.
+  - [x] **A9-checkpoint-opcode** — LANDED (115121c7). Checkpoints route via
+    `framePGAssembled(RmgrXLog, online|shutdown)` (`EncodeCheckpointPG`); the `len==88` classify hack is
+    deleted. The hot-standby entanglement resolved PG-faithfully instead of being dodged: an ONLINE
+    checkpoint emits the full upstream chain — `XLOG_CHECKPOINT_REDO` at the redo point (appended INSIDE
+    the FPI redo barrier so redo==marker-start is atomic; PG17+ recovery demands this record at
+    `CheckPoint.redo`), then `XLOG_RUNNING_XACTS` (new `RunningXactsFn` ← mvcc snapshot; conservative
+    subxid_overflow under load, exact when idle), then the checkpoint record with real `oldestActiveXid`
+    (0 on shutdown, like PG). BASE_BACKUP fallout: backup_label CHECKPOINT LOCATION + pg_control CheckPoint
+    now carry the checkpoint RECORD's start (`LastCheckpointRecordLSN`), no longer == redo. Read side
+    header-driven (`isCheckpointRecord`/`replayStart` read `XLog.MainData`). Real-PG failover 5s (was 228s
+    of retries). Gates: wal+race, crash-recovery, pg_waldump ×2, isolation, regress, e2e ×7 GREEN.
+  - [x] **A9-xact-inval-fold** — LANDED (d02f7d91). Standalone `RecordKindXactCommitInval` (byte 32) deleted;
+    invals ride A6's `HAS_INVALS` chunk on `xl_xact_commit` (`xactCommitCarriesInvals` was already the live
+    path — the standalone record was dead weight). Native replay case, `DecodeXactMarker` arm, native-kind-set
+    entry, initdb scanner arms and their tests all removed;
+    `TestApplyRecordXactCommitInvalUnlinksInitFiles` migrated to `EncodeXactCommitPG(xid, true)`.
+  - [x] **A9-legacy-frame-retire** — LANDED (81d850bc). `encodeRecord`/`decodeRecord` (IEEE-CRC 8-byte frame)
+    deleted; Config normalization forces `PageHeaders=true` (+`TimelineID=1` default) so every writer emits the
+    PG frame. Legacy dirs rejected by NewWriter (`ErrWALFormatMismatch`) and ReadAll — re-init required.
+    `waitInsertionsToFinish` gained a written-frontier guard (atomic `writeLSNMirror` only; a plain
+    `s.writeLSN` read raced appendPGCompat under `-race`) so `FlushUpTo(unwritten)` returns
+    `ErrLSNNotWritten` instead of spinning. Legacy-sized tests migrated: retention fills segments by observed
+    end-LSN (512-byte segs), discover-checkpoint uses page-aligned segs + stripe path (records never straddle
+    retained-segment starts), buffer round-trip reads decoded-path bodies from `XLog.MainData`
+    (payload[0]=11 ≡ SmgrCreate fails the native-size guard by design), format-mismatch seeds legacy bytes by
+    hand. Gates: wal unit+race, initdb crash-recovery, pg_waldump ×2, real-PG failover async+sync GREEN.
   - [x] **A9-INIT_PAGE** — first heap insert on an empty page now stamps `XLOG_HEAP_INIT_PAGE` (0x80) +
     `REGBUF_WILL_INIT` (`markHeapInsertDirty` computes `initPage = pageLinePointerCount==1`;
     `EncodeHeapInsertPG` sets the info bit + block WILL_INIT). This is what lets a **real PG18 standby build
@@ -171,13 +186,241 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
   A9-INIT_PAGE (above). Byte-for-byte segment diff vs PG for a pgbench run remains a manual/tooling follow-up
   (no automated WAL byte-diff exists), but structural parse + real-PG replay both pass.
 
-## Phase B — Catalog heap journaling (doc 02, after Phase A)
-- [ ] **B0** Enabler: generalize `loadUserTablesFromHeap`→per-catalog reload; wire catalog `XLOG_HEAP_UPDATE`;
-  bootstrap base-catalog indexes in every DB; net-new `pg_filenode.map` writer + `XLOG_RELMAP_UPDATE` encoder.
-- [ ] **B1** pg_namespace · pg_proc · pg_sequence (heap-write + index maint + write-through cache + generic
-  heap-scan reload; delete bespoke RecordKind + `*_ddl_recovery.go` scanner + `VirtualRows` builder).
-- [ ] **B2** type/operator families (pg_type/enum/range, pg_operator, pg_opclass/opfamily/amop/amproc,
-  pg_cast, pg_conversion, pg_collation, pg_aggregate).
+## Phase B — Catalog heap journaling (doc 02; detailed designs 02a–02d)
+- [ ] **B0** Enabler (doc 02a) — four slices, each landed + gated separately:
+  - [x] **B0.1** LANDED — generic per-catalog heap-reload framework in new
+    `internal/initdb/catalog_heap_reload.go`: `catalogRowLive` (THE unified visibility filter, transcribed
+    rules incl. basebackup pass-through + legacy committed-xmin branch, pinned by a 9-case unit test),
+    `scanCatalogHeapRows` (generic block-walk + decode), `catalogReloadDesc`/`simpleCatalogReload`/
+    `runCatalogReloads` (Slot-ordered registry with Fatal/warn semantics, pinned by an order/fatality test).
+    `loadUserTablesFromHeapForDB`'s two scan passes re-expressed over `scanCatalogHeapRows` (decode returns
+    the requireCommittedXmin verdict: `!physicalRow` for pg_class, always-false for pg_attribute); the
+    pass-3 join, M0114 cache fast path, and all call sites untouched — zero behavior change. Gate: initdb
+    (241s incl. crash recovery) + executor + catalog + wal units, FULL regress (295s), isolation (22s),
+    replication smoke — all green.
+  - [x] **B0.2** LANDED — non-HOT catalog `XLOG_HEAP_UPDATE` end-to-end machinery:
+    `EncodeHeapUpdatePG` (same-page single block-ref / cross-page block 0 new + block 1 old, upstream
+    log_heap_update shape), `replayDecodedXLogHeapUpdate` extended with the non-HOT arm
+    (`PageStampUpdatedOldTuple` — xmax + forward ctid, NO HOT bits; per-page pd_lsn idempotency for the
+    cross-page form; dispatch: tuple-carrying → logical, FPI-only → image restore),
+    `Pool.LogHeapUpdate` hook wired in open.go, and the producer `updateHeapRowCanonicalPG`
+    (verify-old-live per R-B0-3, same-page fast path, block-ordered two-page slow path,
+    `buildCatalogPGHeapTuple` factored shared with the INSERT twin). Pinned by same-page + cross-page
+    replay round-trip tests; the record is in the real-pg_waldump structural gate. Gate: storage/wal/
+    executor units, wal -race, initdb crash recovery (235s), e2e failover — green.
+    NOTE: first real caller + the TID-carrying cache land with B1.1 pg_namespace (no emit site exists
+    until a catalog converts; the helper is additive and unused in production this landing).
+  - [x] **B0.3** LANDED — per-DB catalog heap+index bootstrap at CREATE DATABASE + index-skip lift.
+    `CreatePerDatabaseScaffolding` (server CREATE DATABASE + WAL-replay recovery share it) now copies
+    template0's pristine bootstrap catalog image (`copyBootstrapCatalogImage`: base/4 → base/<newDb>,
+    copy-if-missing per file for replay idempotency, write-temp+fsync+rename against torn copies; system
+    DBs + pre-B0.3 dirs no-op). Source is base/4 NOT the named template — goopg clones template user
+    tables under fresh OIDs, so the named template's pg_class heap would carry phantom rows (documented
+    PG deviation). `insertCanonicalSysBtreeLeaf` routes by `tableCatalogHeapDBOid` (same dbOid as the
+    heap write); the syncTableToCatalogHeap DefaultDBOid-only skips (follow-up-39) are lifted — pre-B0.3
+    dirs still no-op gracefully via the missing-block-1 bail. Pinned by image-copy/idempotency/heal unit
+    tests + the existing multi-DB restart suite. Gate: initdb 235s, executor/server/catalog, regress 292s,
+    isolation, e2e failover — green.
+  - [x] **B0.4** LANDED (implemented after B1 per user directive 2026-07-16). `internal/wal/relmap.go`:
+    `EncodeRelMapFile` (524-byte RelMapFile, magic 0x592717 + CRC32C — now THE single encoder; initdb's
+    makeRelMapFile delegates), `ValidateRelMapFile`, `EncodeRelmapUpdatePG` (RM_RELMAP=7, opcode 0x00,
+    xl_relmap_update{dbid,tsid,nbytes,image}), decoded replay arm = CRC-verified atomic file rewrite
+    (goopg hardening over upstream's length-only check). Emit: CREATE DATABASE journals the new DB's map
+    (upstream WAL_LOG RelationMapCopy analog) — a PG standby reconstructs base/<db>/pg_filenode.map from
+    WAL. Round-trip + replay + corruption tests; record added to the real-pg_waldump structural gate.
+    Gate: wal (+race — one pre-existing stripe-flake retried green), initdb 227s, server/executor,
+    multi-DB + durability suites, pg_waldump, e2e failover — green.
+- [ ] **B1** (doc 02c) pg_namespace → pg_proc → pg_sequence, one catalog per landing per the 02b recipe:
+  - [x] **B1.1 pg_namespace** — LANDED, the exemplar conversion. Schema DDL journals REAL pg_namespace
+    heap rows: CREATE = heap INSERT + 2684/2685 index entries; RENAME/OWNER = non-HOT xl_heap_update
+    (B0.2 producer, first caller) + fresh index entries; DROP = xl_heap_delete (markHeapDeleteDirty).
+    TID-carrying cache landed on the schema registry (catalog.SchemaHeapTID + Set/Delete/Rename);
+    reload = reloadUserSchemasFromHeap (generic scan, oid ≥ FirstUserOID, seeds TIDs) replacing
+    replaySchemaDDLRecords at the same pass slot. Mirror set extended with 2615/2684/2685 (BLOCKER-3).
+    Parse-recovery CREATE SCHEMA fallback rides SyncCompatSchemaToCatalogHeap (frozen-xid variant;
+    MaterializeWriterXID reordered to accept pre-stamped xids). DELETED: kinds 34/35/100/101,
+    Encode/Decode ×4, schema_ddl_recovery.go, wal/schema_alter_ddl.go, dispatch no-op case,
+    native-kind-list entries, 3 wal test files; recovery-test schema seeds rewritten to the heap path;
+    new TestPort_AlterSchemaSurvivesRestart. Gate: all units, initdb 231s, regress 298s, isolation,
+    schema durability ×2, pg_waldump ×2, e2e failover — green; grep-zero confirmed.
+  - [x] **B1.2 pg_proc** — LANDED. Function/procedure DDL journals REAL pg_proc heap rows (30-col
+    PG18-physical builder; CREATE = INSERT, OR-REPLACE + every ALTER variant = non-HOT xl_heap_update
+    of the total row, DROP = xl_heap_delete). Kinds 61-64/121-123 + codecs (recovery.go) +
+    function_ddl_recovery.go + function_ddl_test.go DELETED (no ApplyRecord/native-list/rmgr-map
+    changes needed — functions were fall-through no-ops). Routine metadata beyond the physical
+    columns rides a JSON blob in proargdefaults (PG reads that column only when pronargdefaults>0 —
+    no new PG-side deviation for default-less functions); reload = reloadUserRoutinesFromHeap.
+    TID cache = OID-keyed map on the Routines store. Mirror += 1255. RESIDUAL (ledger): runtime
+    maintenance of multi-level btrees 2690/2691 (needs catalog-btree descent insert; bootstrap
+    indexes never carried user functions — unchanged behavior); proallargtypes/proargmodes OUT-arg
+    columns. New TestPort_FunctionSurvivesRestart (create/replace/alter/drop across restart).
+    Gate: initdb 230s, server, regress 278s, isolation, durability ×3, pg_waldump + e2e failover —
+    green; grep-zero.
+  - [x] **B1.3 pg_sequence (catalog row only)** — LANDED. The DEFINITION journals as a real
+    Form_pg_sequence heap row in base/<db>/2224 + index 5002 entry: CREATE = INSERT, ALTER = non-HOT
+    xl_heap_update (fingerprint-gated inside WALLogSequenceState so counter-only snapshots — setval,
+    TRUNCATE RESTART pre-logs — skip, PG parity), all 9 DropSequence emit sites paired with a heap
+    DELETE. TID cache = seqKey-keyed map with definition fingerprint; startup TID reseed
+    (reloadSequenceHeapTIDs) after the kind-65 replay. Kinds 65/66 SURVIVE per the 02c scope decision
+    (counter + goopg replay source until B1.3b). pg_waldump workload extended with schema/function/
+    sequence DDL (real pg_waldump parses all B1 records). New
+    TestPort_SequenceCatalogRowSurvivesRestart (post-restart ALTER updates in place). Gate: all units,
+    initdb 227s, regress 298s, isolation, durability ×4, e2e failover — green.
+  - [x] **B1.3b** — LANDED. `XLOG_SEQ_LOG` flip complete: kinds 65/66 retired —
+    **RmgrGoopgCatalog now emits ZERO records in the whole B1/B2.1 scope**. The sequence relation
+    is a REAL 1-page file at the USER-DATA location base/<session physical dbOid>/<seqrelid>
+    (page: SEQ_MAGIC 0x1717 special + one frozen {last_value,log_cnt,is_called} tuple placed by
+    hand — goopg's PageAddItemRaw ignores pd_special and clobbered the magic); counter changes
+    ride RM_SEQ(15) XLOG_SEQ_LOG (block-ref WILL_INIT + xl_seq_rec + raw tuple; replay rebuilds
+    the page — seq_redo-identical, no FPI, MarkDirtyChangeRecord). Definition reloads from the
+    FULL pg_sequence heap decode; counter from the page; OWNED BY from NEW narrow pg_depend
+    auto-rows (sys_pg_depend.go); identity from pg_attribute.attidentity (now decoded — offset
+    89); serial spelling derived. Sequences got REAL pg_class rows (relkind='S', **relam=0** —
+    relcache.c:1841 ASSERTS InvalidOid for sequences; views fixed to 0 too) and the table reload
+    accepts relkind 'S'. Mirror set += 2224/5002/2608 (the B1.3 TID reseed had silently read ZERO
+    rows — base/5 never had them); base/1 placeholder list += 5002 (was a 0-byte auto-created
+    file; inserts silently skipped). e2e failover: goopg CREATE SEQUENCE + setval(90) → promoted
+    real PG reads last_value=90 from the page and `nextval` returns 93 — PG natively continuing
+    goopg's sequence. Old data dirs need re-init (the kind-65 scanner is gone).
+- [x] **B2-prep** descent-aware catalog-btree insert — LANDED. The multi-level machinery
+  (readSysBtreeMeta/descendSysBtreeToLeaf/insertIntoExistingLeaf/rebuildSysBtreeWithNewEntry,
+  M0106-0010 batched-41) already existed; the real gaps were (1) `keyMetaForSysBtree` registration —
+  2684/2685 were MISSING too (latent B1.1 split-path hole), now registered alongside 2690/2691 —
+  and (2) variable-length IndexTuple support (2691's proargtypes oidvector): `btreeIndexKeyMeta.variable`
+  + variable-tolerant collect/split/rebuild + `buildBulkSysBtreeLayoutVariable` (executor twin of
+  initdb's pgBuildBtreeBulkLoadVariable). pg_proc DDL now maintains BOTH indexes at every heap write
+  (fresh entries at the new TID on updates, PG-style; old entries die with their heap versions);
+  mirror set += 2690/2691. Fixed latent B1.2 hazard the new e2e gate would have exposed:
+  buildPGProcRow stuffed NON-NULL empty strings into prosqlbody/proallargtypes/proargmodes/
+  protrftypes/probin/proconfig/proacl — PG branches on attisnull (stringToNode("") on every SQL
+  function call); now genuinely NULL (pg_class builder convention). e2e failover extended: goopg
+  CREATE FUNCTION over WAL → promoted PG resolves by name (2691) AND executes it (2690 + prosrc).
+- [ ] **B2** type/operator families — B2.1 (pg_type/enum/range/domain) COMPLETE below; **B2.2 staged
+  plan (survey 2026-07-17)**, one catalog per landing on the B2.1 template (heap rows + index entries
+  via descent machinery + physical reload + kind retirement + e2e probe where PG-side read exists):
+  1. **pg_cast** — DONE (B2.2a entry below; kinds 38/39 retired, scanner cast_ddl_recovery.go dead);
+  2. **pg_aggregate** — DONE (B2.2b entry below; kinds 46-49 retired, scanner
+     aggregate_ddl_recovery.go dead);
+  3. **pg_operator** — DONE (B2.2c entry below; kinds 83/84 retired, scanner
+     operator_ddl_recovery.go dead);
+  4. **pg_collation** (kinds 42-45/93) + **pg_conversion** (kinds 40/41/130-132) — BOTH registries'
+     *DuringRecovery still FORCE DefaultDBOid (catalog.go:12653/:12776 — the domain/range/enum bug
+     class, fix like RegisterDomainDuringRecovery); indexes populated (3085/3164, 2668-2670);
+  5. **opclass/opfamily/amop/amproc** (kinds 85-92; 9 emit sites; opfamily/opclass recovery already
+     DBOid-guarded; indexes: 2686/2653/2654 are EMPTY placeholders → lazy-root handles).
+  Remaining rmid-128 kinds AFTER B2.2: text-search 104-116, statistics 95-99 (wal/statistics_ddl.go),
+  access-method 70/71, transform 36/37, event-trigger 56-60, pub/sub 50-55, foreign-data 126-129,
+  role/db-config/tablespace/matview/view/index-rename 67-80/94/102-103/124-125 (B3/B4 scope).
+  - [x] **B2.2c pg_operator (kinds 83/84 retired)** — LANDED. `sys_pg_operator.go`: 15-col
+    FormData_pg_operator builder (oprresult resolved from oprcode via routines registry /
+    curated-builtin reversal, 0 for shells); `upsertOperatorCatalogRow` maps PG's two-pass
+    scheme (OperatorShellMake/OperatorUpd) onto INSERT-or-UPDATE at an operatorHeapTIDs cache
+    (new InMemory map + 3 methods); CREATE journals op's final state AND upserts the referenced
+    commutator/negator (shell just minted, or existing op just back-patched); DROP stamps xmax
+    (MaterializeWriterXID FIRST — an unmaterialized XID stamps xmax=0 silently; the same latent
+    bug was fixed in B2.2b's deleteAggregateCatalogRows). Indexes 2688 {16,1} + 2689 {88,4
+    name+3-oid, executor twin of pgBuildIndexTupleNameOidOidOidKey}. Reload = fully physical
+    pg_operator scan (only type names + schema name reverse; every proc/operator link is an OID
+    in the registry too); shells reload as shells. Scanner operator_ddl_recovery.go(+test) +
+    wal/operator_ddl_test.go deleted (operatorCatalog helper moved to the surviving opclass
+    scanner test); kinds 83/84 + CreateOperatorPayload codec + dispatch excised.
+    TestPort_OperatorSurvivesRestart (forward-COMMUTATOR shell + back-patch link + drop +
+    oprcode join) green. Residuals: user-operator EXECUTION is out of goopg scope (regress
+    create_operator excluded "v0"); expression lexer rejects #-bearing symbols.
+  - [x] **B2.2b pg_aggregate (kinds 46-49 retired)** — LANDED. `sys_pg_aggregate.go`: CREATE
+    AGGREGATE journals a synthesized prokind='a' pg_proc row through the B1.2 routine funnel
+    (heap + 2690/2691 + TID cache; field choices copied from the virtual pg_proc view: prolang=
+    internal/cost 1, prosrc=aggregate_dummy, provolatile='i', proisstrict=f, prorettype=finalfn's
+    rettype else stype) PLUS the pg_aggregate row (pre-existing DU-002 405 builder) now with
+    pg_aggregate_fnoid_index (2650) maintenance + mirrors. ALTER RENAME/OWNER = pg_proc heap
+    UPDATE via the funnel; DROP stamps xmax on BOTH rows. Reload = prokind='a' pg_proc scan;
+    the full UserAggregate rides Routine.Aggregate in the proargdefaults JSON meta (B1.2's
+    established channel) because the physical pg_aggregate columns store proc OIDs that are 0
+    for builtin transition functions outside the hand-curated BuiltinProc set — an OID→name
+    reversal would be lossy exactly where it matters (ledger residual). Routine reload now
+    SKIPS prokind='a' rows (they'd shadow the aggregate in function resolution). Scanner
+    aggregate_ddl_recovery.go(+test) + wal/aggregate_ddl_test.go deleted; kinds 46-49 + codecs
+    + dispatch case excised. TestPort_AggregateSurvivesRestart (rename + drop + post-restart
+    EXECUTION = 6) green; waldump workload += CREATE/ALTER/DROP AGGREGATE.
+  - [x] **B2.2a pg_cast (kinds 38/39 retired)** — LANDED. `sys_pg_cast.go`: 6-col PG18 row builder
+    (`buildPGCastRow`, SourceType/TargetType names→OIDs via `TypeNameToOID`), heap INSERT +
+    2660 (oid, 16B) + 2661 (src+tgt, 16B `buildIndexTupleOidOidKey`) via the descent machinery,
+    `deleteCastCatalogRow` xmax-stamp for DROP CAST, `mirrorCastCatalogFiles` (2605/2660/2661).
+    Emit sites: CREATE CAST (execCompatNoop case "cast") + DROP CAST (`CastByTypes` OID capture).
+    Reload `reloadUserCastsFromHeap`: fully physical scan of base/<DBOID()>/2605, builtin rows
+    (oid<16384) skipped, endpoint OIDs reversed to names (pgTypeCanonical → table → domain →
+    enum; ""=dead cast), `RegisterCastDuringRecovery`. Scanner cast_ddl_recovery.go(+test) +
+    wal/cast_ddl_test.go deleted; kinds 38/39 + codecs excised from recovery.go. Debug lesson:
+    the reload was correct all along — the durability test's `'int'::regtype` predicate silently
+    matched nothing (goopg regtype input leaves builtin type NAMES as strings; the oid-column
+    comparison error is swallowed by WHERE → 0 rows; ledger row). Test now compares numeric OIDs
+    and scopes `oid >= 16384` (int4→bool has a builtin pg_cast row 10034 that survives the user
+    cast's drop). TestPort_CastSurvivesRestart green.
+  - [x] **B2.1a pg_type index maintenance (2703/2704)** — LANDED. All ten pg_type row writes
+    (enum/composite/domain/range/multirange + arrays, ACL resync) funnel through
+    `writeTypeHeapRowWithIndexes`, which derives the index keys from the built row itself
+    (oid/typname/typnamespace = cols 0-2) and maintains 2703 (oid, 16B) + 2704 (name+nsp, 80B —
+    same shape as 2663). Two structural gaps closed along the way: (1) **empty-placeholder lazy
+    rooting** — 2704 shipped as a metapage-only placeholder that `insertCanonicalSysBtreeLeaf`
+    silently skipped (nBlocks≤1); now `allocateEmptySysBtreeLeafRoot` mirrors PG's `_bt_getroot`
+    write path (needed for pre-existing data dirs + any future placeholder index); (2) **2704
+    bootstrap population** — the empty placeholder meant a real PG standby could not resolve ANY
+    type by name (`SELECT 1::int4` → `type "int4" does not exist`; TYPENAMENSP probes 2704 for
+    builtins too); `bootstrapPgTypeTypnameNspIndex` now bulk-loads one entry per bootstrap heap
+    row (shared entry map with the heap writer). e2e failover: runtime `CREATE TYPE AS ENUM`
+    (heap-insert/FPI records ONLY — no bespoke WAL) resolves on the promoted PG via
+    `'public.b2prep_mood'::regtype::text` — exercising runtime AND bootstrap 2704 entries.
+    **Empirical pin from the failed first attempt**: a surviving RmgrGoopgCatalog(128) record in
+    streamed WAL hard-kills a real PG standby (`FATAL: resource manager with ID 128 not
+    registered`, unrecoverable startup loop) — sequences (65/66), ranges (81/82/117/118), domains
+    (119/120) are live landmines for mixed replication until B1.3b/B2.1b/B2.1c land.
+  - [x] **B2.1b domains** — LANDED. Kinds 119/120 + codecs + dispatch arm + domain_ddl_recovery.go
+    DELETED. NO JSON sidecar needed: the domain reconstructs fully physically — skeleton from its
+    pg_type row (typtypmod→Base.Args via `pgTypeArgsFromTypmod`, the decode twin of pgAttTypmod;
+    typdefaultbin raw SQL → ParseExpr, the pre-existing deviation), CHECKs from NEW narrow
+    pg_constraint heap rows (28-col PG18 builder in sys_pg_constraint.go; contype='c',
+    contypid=domain; conbin=raw expr text; the pg_constraint VIEW stays virtual — pg_class
+    precedent; NO index maintenance, 2664-2667 stay empty → ledgered). InValues (the ONLY thing
+    runtime enforcement reads, expr.go:871) re-derive from conbin's synthesized
+    `VALUE = ANY (ARRAY[...])` text (`domainInValuesFromConbin`). ALTER DOMAIN all 7 arms now
+    durable (were NOT durable at all): pg_type mutations = non-HOT xl_heap_update via the new
+    generic TypeHeapTID cache (catalog.SetTypeHeapTID, seeded by every type-row write AND the
+    reload for ALL user pg_type rows); constraint mutations = pg_constraint INSERT/DELETE.
+    **Bug found by the new test**: RegisterDomainDuringRecovery force-keyed DefaultDBOid(1) while
+    sessions look up under their resolved DB OID (postgres=5) — post-restart CHECK enforcement
+    was silently DISABLED (pre-existing in the WAL-scanner era, never caught because no test
+    asserted post-restart enforcement); reload now keys cat.DBOID(). Known non-goal pinned in the
+    test: goopg never applies domain DEFAULTs at INSERT time (verified pre-restart too — separate
+    pre-existing gap). e2e: CREATE DOMAIN streams as pure heap records; promoted PG casts
+    42::public.b2prep_dom. New TestPort_DomainSurvivesRestart (CHECK enforcement + RENAME +
+    SET DEFAULT across restart); pg_waldump workload += domain create/alter/drop.
+  - [x] **B2.1c ranges** — LANDED. Kinds 81/82/117/118 + codecs + dispatch arm +
+    range_type_ddl_recovery.go DELETED. CREATE TYPE AS RANGE journals the 4 pg_type rows (existing)
+    + a NEW pg_range heap row (sys_pg_range.go, 7-col Form_pg_range, keyed rngtypid — no oid col)
+    with 3542/2228 index entries; DROP stamps it; ALTER RENAME/OWNER = non-HOT pg_type updates of
+    all four rows via the TypeHeapTID cache (resyncRangeHeapAfterAlter). Reload
+    (reloadUserRangeTypesFromHeap) is fully physical: the pg_range row carries the linkage
+    (subtype/multirange/opclass/collation), joined with the range + multirange pg_type rows
+    (names/array peers/owner); subtype name via pgTypeCanonical. RegisterRangeTypeDuringRecovery
+    got the same DBOid-keying fix as domains. ALL nine type builders now carry real I/O proc OIDs
+    (enum_in 3506-, record_in 2290-, range_in 3834-, multirange_in 4231-, array_in 750- —
+    pg_proc.dat-verified). e2e failover: goopg CREATE TYPE AS RANGE → promoted PG executes
+    '[1,5)'::public.b2prep_rng (RANGETYPE syscache → runtime 3542 entry → pg_range row).
+    New TestPort_RangeTypeSurvivesRestart; waldump workload += range create/rename/drop.
+  - [x] **B2.1d enum labels** — LANDED. Enums are restart-durable for the FIRST time. Every label
+    owns a real pg_enum heap row (sys_pg_enum.go) + entries in 3502/3503/3534 (all lazily rooted
+    from empty placeholders); EnumValue gained a persisted OID (the virtual pg_enum view now
+    renders real label OIDs instead of synthetic 20000+i). CREATE = one INSERT per label; ADD
+    VALUE = INSERT; RENAME VALUE = delete+insert (stable OID); enum RENAME/OWNER resync pg_type
+    via TypeHeapTID; DROP stamps all label rows. Reload = reloadUserEnumsFromHeap (pg_type
+    typtype='e' + pg_enum grouped by enumtypid, sorted by sortorder) + RegisterEnumDuringRecovery.
+    **enumsortorder encoding pin**: goopg's shared float4 encoder writes TEXT VARLENA
+    (M0111-0002), which shifted enumlabel under PG's attlen=4 TupleDesc (e2e read "ppy" for
+    "happy"; pg_proc's float4s only survive by pad-back-to-4 luck before 4-aligned columns) —
+    pg_enum encodes sortorder via the "xid" encode-hint carrying IEEE-754 float32 BITS =
+    byte-identical to a real PG float4 on disk. e2e failover: promoted PG casts
+    'happy'::public.b2prep_mood (enum_in → 3503 → goopg's runtime rows). New
+    TestPort_EnumSurvivesRestart (create/add/rename/drop across restart); waldump += enum DDL.
 - [ ] **B3** extension/config (pg_ts_*, pg_transform, pg_event_trigger, pg_publication*/subscription*,
   pg_statistic_ext, pg_constraint/attrdef/depend).
 - [ ] **B4** shared catalogs in `global/` (pg_database, pg_authid/auth_members, pg_tablespace,
@@ -187,6 +430,34 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
   `information_schema` parity vs PG 18.3; crash-after-DDL recovery via generic reload; re-init data dir.
 
 ---
+
+## Log (A9 — checkpoint-opcode landed; A9 COMPLETE, Part A record work done)
+- 2026-07-16: **A9-checkpoint-opcode landed (115121c7) — A9 is complete.** The "deferred: hot-standby
+  entanglement" turned out to have a clean PG-faithful resolution: emit what PG emits. Three findings worth
+  keeping: (1) PG17+ recovery **validates the record at CheckPoint.redo is XLOG_CHECKPOINT_REDO** whenever
+  redo < the checkpoint record — an ONLINE flip without that marker fails `unexpected record type found at
+  redo point`; goopg appends the marker inside `PublishRedoBarrier`'s critical section so the marker start
+  IS the redo (lock order fpiPublishMu→WAL-stripe matches the FPI sections; a no-block-ref record makes no
+  FPI decision → no deadlock). (2) The standby locates the checkpoint via backup_label CHECKPOINT LOCATION /
+  pg_control CheckPoint — those must name the checkpoint RECORD's start, which is no longer the redo point
+  (`invalid resource manager ID in checkpoint record` otherwise). (3) A hot-standby needs
+  `XLOG_RUNNING_XACTS` after an online checkpoint to reach STANDBY_SNAPSHOT_READY — wired from the mvcc
+  snapshot (InProgress = top-level xids; Xmin/Xmax-1 map onto oldestRunningXid/latestCompletedXid).
+  Bonus: the failover e2e dropped 228s→5s (the standby had been retry-looping on the old always-SHUTDOWN
+  chain's basebackup edge cases). Remaining Part-A followups (btree INIT analog, byte-diff tooling,
+  clog-truncate datoid) are unchanged.
+
+## Log (A9 — legacy frame retired; A9 complete except checkpoint-opcode)
+- 2026-07-16: **A9-legacy-frame-retire landed (81d850bc)** — goopg WAL now has exactly ONE on-disk format:
+  the PG-compat page-headered XLogRecord stream. −730/+256 lines. Two behavioural pins worth remembering:
+  (1) the stripe path confines each record to one segment (pads + relocates at boundaries) while the slow
+  path emits true cross-segment contrecords — post-retention reads therefore need stripe-path writers and
+  page-aligned segment sizes in tests; (2) the PG frame's conservative ring reservation is
+  2*(paddedLen+64), so WALBuffers caps below ~1 KiB force every append onto the direct-write bypass.
+  A `-race`-only regression was caught by the gate: the first version of the FlushUpTo unwritten-LSN guard
+  read `s.writeLSN` (state-loop-owned) — rewritten to consult only the atomic `writeLSNMirror`.
+  **A9 status: everything landed except checkpoint-opcode (deferred, hot-standby-entangled, byte-identical
+  no-op for the stream).**
 
 ## Log (A9 — clog-truncate landed via native-size routing)
 - 2026-07-16: **A9-clog-truncate landed — CLOG truncation is now a PG `RM_CLOG`/`CLOG_TRUNCATE` record.**

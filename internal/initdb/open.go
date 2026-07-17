@@ -634,6 +634,22 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return storage.LSN(end), nil
 	}
 
+	// Atomic NON-HOT heap-update change record (B0.2, doc 02a §3): catalog
+	// ALTERs update their heap row in place — old-version xmax stamp +
+	// forward ctid + new version, one xl_heap_update record. Replay routes
+	// to replayDecodedXLogHeapUpdate(hot=false).
+	logHeapUpdate := func(rel storage.RelFileNode, oldBlk storage.BlockNumber, oldSlot uint16, newBlk storage.BlockNumber, newSlot uint16, xmax storage.TransactionID, tupleBytes []byte) (storage.LSN, error) {
+		payload, err := wal.EncodeHeapUpdatePG(rel, oldBlk, oldSlot, newBlk, newSlot, xmax, tupleBytes)
+		if err != nil {
+			return 0, err
+		}
+		_, end, err := walWriter.Append(payload)
+		if err != nil {
+			return 0, err
+		}
+		return storage.LSN(end), nil
+	}
+
 	// Relation-file creation WAL record (M0030-0002). Emitted by
 	// Pool.PinNew when it creates block 0 of a new relfile so crash
 	// recovery can recreate the file before replaying data pages.
@@ -680,6 +696,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		LogHeapFreeze:            logHeapFreeze,
 		LogHeapLock:              logHeapLock,
 		LogHeapHotUpdate:         logHeapHotUpdate,
+		LogHeapUpdate:            logHeapUpdate,
 		LogHeapPruneOpt:          logHeapPruneOpt,
 		LogSmgrCreate:            logSmgrCreate,
 		LogChangeRecord:          logChangeRecord,
@@ -1221,20 +1238,17 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// return paths, and an explicit End (below, after the last pass) frees the
 	// decoded records promptly.
 
-	// M0110-0003: restore user-created schemas (CREATE/DROP SCHEMA) from the
-	// WAL BEFORE loading user tables. goopg has no per-schema on-disk namespace,
-	// so the catalog's schema registry is reconstructed here from the WAL
-	// records (RecordKindCreateSchema/DropSchema). It must run before
-	// loadUserTablesFromHeap / loadUserIndexesFromHeap so those passes can
-	// reverse-map a recovered pg_class.relnamespace OID back to the schema name
-	// (cat.SchemaNameForOID) — otherwise a user-schema table would be reloaded
-	// under the wrong schema. Same WAL-replay mechanism as the database DDL
-	// replay below.
-	if err := replaySchemaDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+	// B1.1 (doc 02c §1): restore user-created schemas from the pg_namespace
+	// HEAP — the generic reload replacing the retired replaySchemaDDLRecords
+	// scanner (schema DDL now journals real heap rows; RecordKinds
+	// 34/35/100/101 are gone). Still runs BEFORE loadUserTablesFromHeap /
+	// loadUserIndexesFromHeap so those passes can reverse-map a recovered
+	// pg_class.relnamespace OID back to the schema name (cat.SchemaNameForOID).
+	if err := reloadUserSchemasFromHeap(mgr, cat, clog); err != nil {
 		_ = pool.Close()
 		_ = walWriter.Close()
 		_ = mgr.Close()
-		return nil, fmt.Errorf("goopg: schema DDL replay: %w", err)
+		return nil, fmt.Errorf("goopg: pg_namespace reload: %w", err)
 	}
 	// M0122-0007 tablespace-registry restart-durability follow-up: restore
 	// CREATE/DROP TABLESPACE entries (pg_tablespace) from the WAL the same
@@ -1283,12 +1297,6 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// (pg_cast) from the WAL the same way. Order relative to transform/schema
 	// replay does not matter — casts are keyed by (source type, target
 	// type), not by schema OID.
-	if err := replayCastDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
-		_ = pool.Close()
-		_ = walWriter.Close()
-		_ = mgr.Close()
-		return nil, fmt.Errorf("goopg: cast DDL replay: %w", err)
-	}
 	// DU-002 restart-persistence follow-up: restore CREATE/DROP CONVERSION
 	// objects (pg_conversion) from the WAL the same way. Unlike
 	// transforms/casts, a conversion is schema-scoped (keyed by namespace
@@ -1329,17 +1337,9 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: collation DDL replay: %w", err)
 	}
-	// DU-002 restart-persistence follow-up (slice 405 ledger resume point
-	// (c)): restore CREATE/ALTER AGGREGATE objects (pg_aggregate/pg_proc)
-	// from the WAL the same way. Unlike collation/conversion, a user
-	// aggregate has no Schema field yet, so order relative to schema replay
-	// does not matter.
-	if err := replayAggregateDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
-		_ = pool.Close()
-		_ = walWriter.Close()
-		_ = mgr.Close()
-		return nil, fmt.Errorf("goopg: aggregate DDL replay: %w", err)
-	}
+	// B2.2 slice 2: the aggregate replay that historically ran here moved
+	// to reloadUserAggregatesFromHeap (after the routines reload below) —
+	// kinds 46-49 retired.
 
 	// M0114: try the fast-start catalog cache (pg_goopg_catalog_cache.json).
 	// If the JSON snapshot is present and valid, populate the catalog directly
@@ -1512,11 +1512,18 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// applied) — the heap-reloaded serial columns read back as their base
 	// integer type because pg_attribute stores the PG-canonical atttypid.
 	// See internal/initdb/sequence_ddl_recovery.go.
-	if err := replaySequenceDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
-		_ = pool.Close()
-		_ = walWriter.Close()
-		_ = mgr.Close()
-		return nil, fmt.Errorf("goopg: sequence DDL replay: %w", err)
+	// B1.3b: sequences reload from the HEAPS + the physical sequence page —
+	// definition from pg_sequence, counter from the XLOG_SEQ_LOG-replayed
+	// page, OWNED BY from pg_depend, identity from attidentity. Replaced
+	// replaySequenceDDLRecords' bespoke WAL scan (kinds 65/66, retired) and
+	// folds in the former reloadSequenceHeapTIDs TID seeding.
+	if cat != nil {
+		if err := reloadSequencesFromHeap(mgr, cat, clog); err != nil {
+			_ = pool.Close()
+			_ = walWriter.Close()
+			_ = mgr.Close()
+			return nil, fmt.Errorf("goopg: sequence heap reload: %w", err)
+		}
 	}
 
 	// Column DEFAULT persistence (root-0020 follow-up): re-parse the DEFAULT
@@ -1604,8 +1611,8 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	}
 
 	// M0106-0011 follow-up (b): regenerate pg_internal.init files after
-	// WAL recovery completes. Crash recovery replays
-	// RecordKindXactCommitInval records which UNLINK the init files
+	// WAL recovery completes. Crash recovery replays commit records
+	// carrying the HAS_INVALS chunk, which UNLINK the init files
 	// (mirrors PG's standby-side redo) but does not regenerate them.
 	// Without this, PG standbys that attach via pg_basebackup after a
 	// crash restart would find missing init files until the first DDL
@@ -1724,6 +1731,23 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		// after the basebackup hid every user tuple created by goopg
 		// after initdb.
 		NextXIDFn: func() uint64 { return uint64(txnMgr.NextXID()) },
+		// A9-checkpoint-opcode: supply the live running-transaction snapshot
+		// for the XLOG_RUNNING_XACTS record emitted before every ONLINE
+		// checkpoint (and CheckPoint.oldestActiveXid). Snapshot semantics
+		// map 1:1 onto xl_running_xacts: InProgress = running top-level
+		// xids (sorted), Xmin = oldest running (nextXid when none),
+		// Xmax-1 = latestCompletedXid.
+		RunningXactsFn: func() ([]uint32, uint32, uint32) {
+			snap := txnMgr.FreshSnapshot()
+			var xids []uint32
+			if len(snap.InProgress) > 0 {
+				xids = make([]uint32, len(snap.InProgress))
+				for i, xid := range snap.InProgress {
+					xids[i] = uint32(xid)
+				}
+			}
+			return xids, uint32(snap.Xmin), uint32(snap.Xmax - 1)
+		},
 		// M0106-0013: wire the catalog's OID counter so each checkpoint
 		// embeds the live nextOid into pg_control and the WAL record.
 		// A crashed cluster can then recover nextOid from pg_control
@@ -1972,11 +1996,26 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// restored event trigger's evtfoid can (in principle) be cross-checked
 	// against a restored routine, though neither replay path validates the
 	// other today.
-	if err := replayFunctionDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+	// B1.2 (doc 02c §2): routines reload from the pg_proc HEAP — the generic
+	// reload replacing the retired replayFunctionDDLRecords scanner
+	// (RecordKinds 61-64/121-123 are gone). Same pass slot as the scanner.
+	if err := reloadUserRoutinesFromHeap(mgr, cat, clog); err != nil {
 		_ = pool.Close()
 		_ = walWriter.Close()
 		_ = mgr.Close()
-		return nil, fmt.Errorf("goopg: function DDL replay: %w", err)
+		return nil, fmt.Errorf("goopg: pg_proc reload: %w", err)
+	}
+
+	// B2.2 slice 2: aggregates reload from their prokind='a' pg_proc rows
+	// — the generic reload replacing the retired replayAggregateDDLRecords
+	// scanner (kinds 46-49). Runs directly after the routines reload (which
+	// skips prokind='a' rows) so the two consumers of the pg_proc heap stay
+	// adjacent and ordered.
+	if err := reloadUserAggregatesFromHeap(mgr, cat, clog); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: pg_aggregate reload: %w", err)
 	}
 
 	// DU-002 restart-persistence follow-up (M0119-0004, DU-002 slice 426
@@ -2007,35 +2046,64 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// RANGE objects from the WAL. Like access methods, range types are keyed
 	// by a plain name string, so order relative to schema replay does not
 	// matter.
-	if err := replayRangeTypeDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
-		_ = pool.Close()
-		_ = walWriter.Close()
-		_ = mgr.Close()
-		return nil, fmt.Errorf("goopg: range type DDL replay: %w", err)
+	// B2.1c: range types reload from the pg_range + pg_type HEAPS (generic
+	// scan, doc 02a §2) — replaced replayRangeTypeDDLRecords' bespoke WAL
+	// scan (RecordKinds 81/82/117/118, retired).
+	// B2.2a: casts reload from the pg_cast HEAP (generic scan) — replaced
+	// replayCastDDLRecords' bespoke WAL scan (kinds 38/39, retired).
+	if cat != nil {
+		if err := reloadUserCastsFromHeap(mgr, cat, clog); err != nil {
+			_ = pool.Close()
+			_ = walWriter.Close()
+			_ = mgr.Close()
+			return nil, fmt.Errorf("goopg: cast heap reload: %w", err)
+		}
+	}
+	if cat != nil {
+		// B2.1d: enums reload from the pg_type + pg_enum heaps — enums
+		// previously had NO restart durability at all. Runs BEFORE the
+		// domain reload so an enum-based domain could resolve its base in
+		// a future slice.
+		if err := reloadUserEnumsFromHeap(mgr, cat, clog); err != nil {
+			_ = pool.Close()
+			_ = walWriter.Close()
+			_ = mgr.Close()
+			return nil, fmt.Errorf("goopg: enum heap reload: %w", err)
+		}
+		if err := reloadUserRangeTypesFromHeap(mgr, cat, clog); err != nil {
+			_ = pool.Close()
+			_ = walWriter.Close()
+			_ = mgr.Close()
+			return nil, fmt.Errorf("goopg: range type heap reload: %w", err)
+		}
 	}
 
 	// M0122-0005 restart-persistence follow-up (deferral ledger 2026-07-06
 	// row: "domains have no restart persistence at all"): restore CREATE/DROP
 	// DOMAIN objects from the WAL. Like range types, domains are keyed by a
 	// plain name string, so order relative to schema replay does not matter.
-	if err := replayDomainDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
-		_ = pool.Close()
-		_ = walWriter.Close()
-		_ = mgr.Close()
-		return nil, fmt.Errorf("goopg: domain DDL replay: %w", err)
+	// B2.1b: domains reload from the pg_type + pg_constraint HEAPS (generic
+	// scan, doc 02a §2) — replaced replayDomainDDLRecords' bespoke WAL scan
+	// (RecordKinds 119/120, retired). Also seeds the TypeHeapTID cache for
+	// every user pg_type row.
+	if cat != nil {
+		if err := reloadUserDomainsFromHeap(mgr, cat, clog); err != nil {
+			_ = pool.Close()
+			_ = walWriter.Close()
+			_ = mgr.Close()
+			return nil, fmt.Errorf("goopg: domain heap reload: %w", err)
+		}
 	}
 
-	// DU-002 restart-persistence follow-up (M0119-0004/M0110-0001,
-	// discovered while verifying the loop #64 CREATE TYPE ... AS RANGE
-	// opclass/collation follow-up — see ledger): restore CREATE/DROP
-	// OPERATOR objects from the WAL. Runs after schema replay (above) since,
-	// unlike range types/access methods, an operator's registry key embeds
-	// its schema name.
-	if err := replayOperatorDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+	// B2.2 slice 3: operators reload from the pg_operator HEAP (generic
+	// scan, doc 02a §2) — replaced replayOperatorDDLRecords' bespoke WAL
+	// scan (kinds 83/84, retired). Still runs after schema replay (above)
+	// since an operator's registry key embeds its schema name.
+	if err := reloadUserOperatorsFromHeap(mgr, cat, clog); err != nil {
 		_ = pool.Close()
 		_ = walWriter.Close()
 		_ = mgr.Close()
-		return nil, fmt.Errorf("goopg: operator DDL replay: %w", err)
+		return nil, fmt.Errorf("goopg: pg_operator reload: %w", err)
 	}
 
 	// DU-002 restart-persistence follow-up (M0119-0004/M0110-0001, closing
@@ -2673,49 +2741,32 @@ func loadUserTablesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *m
 // under CREATE DATABASE reloads into that database's namespace with its
 // data-file routing (Table.DBOid → base/<dbOid>/<relOid>) intact.
 func loadUserTablesFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog, heapDBOid, nsDBOid uint32) error {
+	// B0.1: both scan passes ride the generic catalog-heap reload loop
+	// (catalog_heap_reload.go) — the per-tuple walk, xmin/xmax liveness and
+	// the M0030-0007/M0106-0010 CLOG rules (aborted-xmin filter for every
+	// layout, basebackup out-of-range-xmin pass-through, committed-xmin
+	// requirement for legacy-layout pg_class rows only) now live in
+	// catalogRowLive/scanCatalogHeapRows. Behavior is unchanged; doc 02a
+	// §2.3 is the normative statement of the rules.
+	type recoveredPGClassRow struct {
+		row      catalog.PGClassRow
+		physical bool
+	}
 	classRel := storage.RelFileNode{
 		DBOid:  heapDBOid,
 		RelOid: catalog.RelationRelationId,
 		Fork:   storage.MainFork,
 	}
-	nClassBlocks, err := mgr.NBlocks(classRel)
-	if err != nil || nClassBlocks == 0 {
-		return nil // pg_class absent or empty — old cluster or fresh initdb
-	}
-
-	page := make(storage.Page, storage.BlockSize)
 
 	// Pass 1: collect user table rows from pg_class.
-	type recoveredPGClassRow struct {
-		row      catalog.PGClassRow
-		physical bool
-	}
-	var userTableRows []recoveredPGClassRow
-	for blk := storage.BlockNumber(0); blk < nClassBlocks; blk++ {
-		if err := mgr.ReadBlock(classRel, blk, page); err != nil {
-			return fmt.Errorf("loadUserTablesFromHeap: read pg_class blk %d: %w", blk, err)
-		}
-		count, err := storage.PageLinePointerCount(page)
-		if err != nil {
-			continue
-		}
-		for slot := uint16(1); slot <= uint16(count); slot++ {
-			ht, err := storage.PageGetHeapTuple(page, slot)
-			if err != nil {
-				continue
-			}
-			if ht.Header.Xmin == storage.InvalidTransactionID {
-				continue // not a real tuple
-			}
-			if ht.Header.Xmax != storage.InvalidTransactionID {
-				continue // deleted
-			}
+	classRows, err := scanCatalogHeapRows(mgr, classRel, clog, "pg_class",
+		func(ht storage.HeapTuple, _ storage.ItemPointer) (any, bool, error) {
 			physicalRow := false
 			row, err := catalog.DecodePGClassRow(ht.Data)
 			if err != nil {
 				row, err = catalog.DecodePGClassPhysicalRow(ht.Data)
 				if err != nil {
-					continue
+					return nil, false, err
 				}
 				physicalRow = true
 				// DecodePGClassPhysicalRow only covers the fixed-offset
@@ -2734,81 +2785,55 @@ func loadUserTablesFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, cl
 					}
 				}
 			}
-			// Skip rows from uncommitted or crashed goopg transactions
-			// (M0030-0007). PG basebackup tuples come from a consistent
-			// snapshot and carry xmin values from the upstream cluster
-			// that are out-of-range for our local clog (GetStatus returns
-			// TxnStatusUnknown) — those must not be filtered. But
-			// goopg-emitted rows in the PG18-canonical layout share the
-			// physical decoder path (post-M0106-0010 syncTableToCatalogHeap)
-			// and their xmin IS in our clog: if that xid is aborted (e.g.
-			// CREATE TABLE inside a rolled-back transaction), the row must
-			// be excluded regardless of layout. Applying the filter only
-			// for the explicit Aborted state keeps the basebackup
-			// pass-through intact while honoring local ROLLBACKs.
-			if clog != nil && clog.GetStatus(ht.Header.Xmin) == mvcc.TxnStatusAborted {
-				continue
-			}
-			if !physicalRow && clog != nil && clog.GetStatus(ht.Header.Xmin) != mvcc.TxnStatusCommitted {
-				continue
-			}
-			if (row.RelKind == "r" || row.RelKind == "m" || row.RelKind == "v") && row.OID >= catalog.FirstUserOID {
-				userTableRows = append(userTableRows, recoveredPGClassRow{row: row, physical: physicalRow})
-			}
+			// Legacy-layout rows require a locally-committed xmin
+			// (requireCommittedXmin = !physicalRow); PG18-canonical rows
+			// keep the basebackup pass-through.
+			return recoveredPGClassRow{row: row, physical: physicalRow}, !physicalRow, nil
+		})
+	if err != nil {
+		return fmt.Errorf("loadUserTablesFromHeap: %w", err)
+	}
+	var userTableRows []recoveredPGClassRow
+	for _, r := range classRows {
+		rec := r.(recoveredPGClassRow)
+		if (rec.row.RelKind == "r" || rec.row.RelKind == "m" || rec.row.RelKind == "v" || rec.row.RelKind == "S") && rec.row.OID >= catalog.FirstUserOID {
+			userTableRows = append(userTableRows, rec)
 		}
 	}
 	if len(userTableRows) == 0 {
 		return nil // no user tables in heap
 	}
 
-	// Pass 2: collect pg_attribute rows for user tables.
+	// Pass 2: collect pg_attribute rows for user tables. The pg_attribute
+	// scan never applies the committed-xmin branch (requireCommittedXmin
+	// always false) — see the pg_class decode comment for the rationale.
 	attrRel := storage.RelFileNode{
 		DBOid:  heapDBOid,
 		RelOid: catalog.AttributeRelationId,
 		Fork:   storage.MainFork,
 	}
-	nAttrBlocks, err := mgr.NBlocks(attrRel)
-	if err != nil || nAttrBlocks == 0 {
-		return nil // no attributes — can't reconstruct columns
-	}
-
-	attrByRelOID := map[uint32][]catalog.PGAttributeRow{}
-	for blk := storage.BlockNumber(0); blk < nAttrBlocks; blk++ {
-		if err := mgr.ReadBlock(attrRel, blk, page); err != nil {
-			return fmt.Errorf("loadUserTablesFromHeap: read pg_attribute blk %d: %w", blk, err)
-		}
-		count, err := storage.PageLinePointerCount(page)
-		if err != nil {
-			continue
-		}
-		for slot := uint16(1); slot <= uint16(count); slot++ {
-			ht, err := storage.PageGetHeapTuple(page, slot)
-			if err != nil {
-				continue
-			}
-			if ht.Header.Xmin == storage.InvalidTransactionID {
-				continue
-			}
-			if ht.Header.Xmax != storage.InvalidTransactionID {
-				continue
-			}
-			// Exclude rows from rolled-back goopg transactions. See the
-			// matching comment above the pg_class scan filter for why
-			// only the explicit Aborted state is checked here (basebackup
-			// pass-through hinges on xids unknown to the local clog).
-			if clog != nil && clog.GetStatus(ht.Header.Xmin) == mvcc.TxnStatusAborted {
-				continue
-			}
+	attrRows2, err := scanCatalogHeapRows(mgr, attrRel, clog, "pg_attribute",
+		func(ht storage.HeapTuple, _ storage.ItemPointer) (any, bool, error) {
 			row, err := catalog.DecodePGAttributeRow(ht.Data)
 			if err != nil {
 				row, err = catalog.DecodePGAttributePhysicalRow(ht.Data)
 				if err != nil {
-					continue
+					return nil, false, err
 				}
 			}
-			if !row.AttIsDropped && row.AttRelID >= catalog.FirstUserOID && row.AttNum > 0 {
-				attrByRelOID[row.AttRelID] = append(attrByRelOID[row.AttRelID], row)
-			}
+			return row, false, nil
+		})
+	if err != nil {
+		return fmt.Errorf("loadUserTablesFromHeap: %w", err)
+	}
+	if len(attrRows2) == 0 {
+		return nil // no attributes — can't reconstruct columns
+	}
+	attrByRelOID := map[uint32][]catalog.PGAttributeRow{}
+	for _, r := range attrRows2 {
+		row := r.(catalog.PGAttributeRow)
+		if !row.AttIsDropped && row.AttRelID >= catalog.FirstUserOID && row.AttNum > 0 {
+			attrByRelOID[row.AttRelID] = append(attrByRelOID[row.AttRelID], row)
 		}
 	}
 
@@ -2836,6 +2861,10 @@ func loadUserTablesFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, cl
 				Type:    catalog.Type{Name: catalog.OIDToTypeName(typOID), IsArray: isArray},
 				NotNull: ar.AttNotNull,
 				Ordinal: i,
+				// B1.3b: attidentity round-trips through the heap (the
+				// retired kind-65 IdentityKind marker's replacement).
+				IdentityColumn: ar.AttIdentity != 0,
+				IdentityAlways: ar.AttIdentity == 'a',
 			}
 		}
 
@@ -2863,11 +2892,15 @@ func loadUserTablesFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, cl
 			// restored afterward by replayMatViewRecords (the AST/populated
 			// flag have no heap representation — see RecordKindCreateMatView).
 			IsMatView: tr.RelKind == "m",
+			// B1.3b: sequences (relkind 'S') register as virtual sequence
+			// relations; reloadSequencesFromHeap re-wires the SELECT-able
+			// VirtualRows closure + the counter afterwards.
+			IsSequence: tr.RelKind == "S",
 			// A plain view (relkind='v') has no physical heap storage — mirror
 			// catalog.InMemory.CreateView's Virtual=true. View/ViewDef are
 			// restored afterward by replayViewRecords (the AST has no heap
 			// representation — see RecordKindCreateView).
-			Virtual: tr.RelKind == "v",
+			Virtual: tr.RelKind == "v" || tr.RelKind == "S",
 		}
 		if tr.RelFileNode != 0 && tr.RelFileNode != tr.OID {
 			tbl.RelFileNodeOID = tr.RelFileNode

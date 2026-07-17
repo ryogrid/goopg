@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/executor"
 	"github.com/goopg/goopg/internal/wal"
 )
 
@@ -258,9 +259,14 @@ func TestTSConfigDDLRecoveryReplaysRenameSetSchemaDropMapping(t *testing.T) {
 	}
 	const wantOID = uint32(40461)
 	const wantSchemaOID = uint32(40462)
-	if _, _, werr := rt1.WAL.Append(wal.EncodeCreateSchema("myschema", wantSchemaOID)); werr != nil {
+	// B1.1: schemas persist as pg_namespace heap rows, not bespoke WAL
+	// records — seed the schema the way the runtime does (registry +
+	// heap row via the compat sync, which also mirrors to base/5).
+	imSeed := rt1.Catalog.(*catalog.InMemory)
+	imSeed.RegisterSchemaDuringRecovery("myschema", wantSchemaOID)
+	if werr := executor.SyncCompatSchemaToCatalogHeap(rt1.Pool, imSeed, catalog.DefaultDBOid, "myschema"); werr != nil {
 		_ = rt1.Close()
-		t.Fatalf("WAL.Append create-schema: %v", werr)
+		t.Fatalf("seed schema heap row: %v", werr)
 	}
 	if _, _, werr := rt1.WAL.Append(wal.EncodeCreateTSConfig("myconfig2", "public", wantOID, 10, 3722)); werr != nil {
 		_ = rt1.Close()
@@ -338,9 +344,14 @@ func TestTSDictDDLRecoveryReplaysRenameSetSchemaOptions(t *testing.T) {
 	}
 	const wantOID = uint32(40470)
 	const wantSchemaOID = uint32(40471)
-	if _, _, werr := rt1.WAL.Append(wal.EncodeCreateSchema("mydictschema", wantSchemaOID)); werr != nil {
+	// B1.1: schemas persist as pg_namespace heap rows, not bespoke WAL
+	// records — seed the schema the way the runtime does (registry +
+	// heap row via the compat sync, which also mirrors to base/5).
+	imSeed := rt1.Catalog.(*catalog.InMemory)
+	imSeed.RegisterSchemaDuringRecovery("mydictschema", wantSchemaOID)
+	if werr := executor.SyncCompatSchemaToCatalogHeap(rt1.Pool, imSeed, catalog.DefaultDBOid, "mydictschema"); werr != nil {
 		_ = rt1.Close()
-		t.Fatalf("WAL.Append create-schema: %v", werr)
+		t.Fatalf("seed schema heap row: %v", werr)
 	}
 	if _, _, werr := rt1.WAL.Append(wal.EncodeCreateTSDict("simple_dict2", "public", "stopwords = 'english'", wantOID, 10, 3727)); werr != nil {
 		_ = rt1.Close()

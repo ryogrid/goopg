@@ -64,7 +64,7 @@ func replayCLogFromWAL(walDir string, clog *mvcc.CLog, txnMgr *mvcc.Manager) err
 		// --- Native goopg commit/abort records ---
 		if len(r.Payload) >= wal.XactRecordSize {
 			switch r.Payload[0] {
-			case wal.RecordKindXactCommit, wal.RecordKindXactCommitInval:
+			case wal.RecordKindXactCommit:
 				xid := storage.TransactionID(binary.LittleEndian.Uint32(r.Payload[1:5]))
 				xactStampAndAdvance(clog, txnMgr, xid, true)
 				continue
@@ -159,7 +159,7 @@ func walHasXactRecords(walDir string) (bool, error) {
 	for _, r := range records {
 		if len(r.Payload) >= 5 {
 			switch r.Payload[0] {
-			case wal.RecordKindXactCommit, wal.RecordKindXactCommitInval, wal.RecordKindXactAbort:
+			case wal.RecordKindXactCommit, wal.RecordKindXactAbort:
 				return true, nil
 			}
 		}

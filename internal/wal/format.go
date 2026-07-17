@@ -4,15 +4,11 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"hash/crc32"
-	"sync"
 )
 
 const (
-	recordHeaderSizeLegacy = 8
-	// recordHeaderSize keeps the legacy name for existing call-sites
-	// and tests that exercise the pre-M0014 frame.
-	recordHeaderSize = recordHeaderSizeLegacy
+	// (recordHeaderSizeLegacy / recordHeaderSize — the retired 8-byte IEEE-CRC
+	// frame header — were removed in A9.)
 
 	xlogRecordHeaderSize = SizeOfXLogRecord
 
@@ -23,16 +19,20 @@ const (
 )
 
 const (
-	xlogInfoDefault  uint8 = 0xF0
-	xlogInfoDelete   uint8 = 0x10
-	xlogInfoSplit    uint8 = 0x20
-	xlogInfoAbort    uint8 = 0x20
-	xlogInfoVacuum   uint8 = 0x10
-	xlogInfoLock     uint8 = 0x20
+	xlogInfoDefault uint8 = 0xF0
+	xlogInfoDelete  uint8 = 0x10
+	xlogInfoSplit   uint8 = 0x20
+	xlogInfoAbort   uint8 = 0x20
+	xlogInfoVacuum  uint8 = 0x10
+	xlogInfoLock    uint8 = 0x20
 	// M0102-0007: PG-compatible xl_info values for checkpoint
 	// records so a PG standby can recognise them during recovery.
 	xlogCheckpointOnline   uint8 = 0x10 // XLOG_CHECKPOINT_ONLINE
 	xlogCheckpointShutdown uint8 = 0x00 // XLOG_CHECKPOINT_SHUTDOWN
+	// XLOG_CHECKPOINT_REDO (PG17+, pg_control.h): inserted AT the redo
+	// point of an online checkpoint — recovery validates the record found
+	// at CheckPoint.redo is exactly this when redo < the checkpoint record.
+	xlogCheckpointRedo uint8 = 0xE0
 )
 
 var (
@@ -44,52 +44,8 @@ var (
 	ErrEOS = errors.New("wal: end of stream")
 )
 
-// crcCache caches the CRC-32 of the most recently encoded payload.
-// When the same payload bytes are written consecutively (common for
-// commit/delete markers), the cache avoids recomputing the CRC.
-// M0027-0001.
-var crcCache struct {
-	mu       sync.Mutex
-	last     []byte
-	checksum uint32
-}
-
-func cachedCRC(payload []byte) uint32 {
-	crcCache.mu.Lock()
-	defer crcCache.mu.Unlock()
-	if len(payload) == len(crcCache.last) {
-		match := true
-		for i := range payload {
-			if payload[i] != crcCache.last[i] {
-				match = false
-				break
-			}
-		}
-		if match {
-			return crcCache.checksum
-		}
-	}
-	crc := crc32.ChecksumIEEE(payload)
-	crcCache.last = append(crcCache.last[:0], payload...)
-	crcCache.checksum = crc
-	return crc
-}
-
-// isZeroHeader reports whether the first recordHeaderSize bytes
-// of stream are all zero — the EOS sentinel. Stream shorter than
-// the header counts as the same condition (no further records can
-// fit anyway).
-func isZeroHeader(stream []byte) bool {
-	if len(stream) < recordHeaderSize {
-		return true
-	}
-	for i := 0; i < recordHeaderSize; i++ {
-		if stream[i] != 0 {
-			return false
-		}
-	}
-	return true
-}
+// (isZeroHeader — the legacy 8-byte-frame EOS sentinel — was removed in A9 with
+// the IEEE-CRC frame; the page-aware walk uses isZeroXLogRecordHeader.)
 
 // isZeroXLogRecordHeader reports whether the first 24 bytes are all
 // zero. In page-header mode this is the in-page EOS sentinel inside
@@ -104,33 +60,6 @@ func isZeroXLogRecordHeader(stream []byte) bool {
 		}
 	}
 	return true
-}
-
-func encodeRecord(payload []byte) []byte {
-	buf := make([]byte, recordHeaderSize+len(payload))
-	binary.LittleEndian.PutUint32(buf[0:4], uint32(len(payload)))
-	binary.LittleEndian.PutUint32(buf[4:8], cachedCRC(payload))
-	copy(buf[recordHeaderSize:], payload)
-	return buf
-}
-
-func decodeRecord(stream []byte) ([]byte, int, error) {
-	if len(stream) < recordHeaderSize {
-		return nil, 0, fmt.Errorf("%w: truncated header", ErrCorruptRecord)
-	}
-	payloadLen := int(binary.LittleEndian.Uint32(stream[0:4]))
-	crc := binary.LittleEndian.Uint32(stream[4:8])
-	total := recordHeaderSize + payloadLen
-	if payloadLen < 0 || total > len(stream) {
-		return nil, 0, fmt.Errorf("%w: bad length %d", ErrCorruptRecord, payloadLen)
-	}
-	payload := stream[recordHeaderSize:total]
-	if crc32.ChecksumIEEE(payload) != crc {
-		return nil, 0, fmt.Errorf("%w: checksum mismatch", ErrCorruptRecord)
-	}
-	out := make([]byte, len(payload))
-	copy(out, payload)
-	return out, total, nil
 }
 
 func xlogMainDataHeaderSize(payloadLen int) int {
@@ -211,21 +140,11 @@ func classifyXLogRecord(payload []byte) (Rmgr, uint8, uint32) {
 	if len(payload) == 0 {
 		return RmgrXLog, xlogInfoDefault, 0
 	}
-	// M0102-0007: PG-compatible checkpoint record (88-byte CheckPoint struct).
-	// Goopg's record-kind byte (0x02=RecordKindCheckpoint) would map to an
-	// implausible redo LSN (<256 bytes), so this path takes priority over the
-	// legacy kind-byte dispatch.
-	if len(payload) == 88 {
-		// M0105-0009: use XLOG_CHECKPOINT_SHUTDOWN (0x00) instead of
-		// ONLINE (0x10). PG's xlog_redo for shutdown checkpoints calls
-		// ProcArrayApplyRecoveryInfo() which constructs synthetic
-		// RunningTransactionsData and transitions standbyState to
-		// STANDBY_SNAPSHOT_READY. This enables CheckRecoveryConsistency
-		// to send PMSIGNAL_BEGIN_HOT_STANDBY, allowing the postmaster
-		// to enter PM_HOT_STANDBY. Without this, pg_ctl -w never sees
-		// the server as ready.
-		return RmgrXLog, xlogCheckpointShutdown, 0
-	}
+	// A9-checkpoint-opcode: the classify-by-len==88 checkpoint hack
+	// (M0102-0007/M0105-0009, which could only ever stamp SHUTDOWN) is
+	// retired — PG-compat checkpoints now carry their EXPLICIT opcode
+	// (online/shutdown) via the pre-assembled envelope (EncodeCheckpointPG),
+	// which short-circuits in encodeRecordXLog before classification.
 	// doc 04 §3/§5.4: dispatch on the real PG-compatible (xl_rmid, xl_info)
 	// pair for this RecordKind — a real PG analog (RmgrHeap/RmgrBtree/…)
 	// when one exists, else goopg's custom RmgrGoopgCatalog rmgr (§3.2).
