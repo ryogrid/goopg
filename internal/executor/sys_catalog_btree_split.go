@@ -97,6 +97,11 @@ func keyMetaForSysBtree(indexOID uint32) (btreeIndexKeyMeta, bool) {
 		return btreeIndexKeyMeta{tupleSize: 16, nkeyatts: 1}, true
 	case pgRangeRngmultitypidIndexOID:
 		return btreeIndexKeyMeta{tupleSize: 16, nkeyatts: 1}, true
+	// B2.2a: pg_cast — both bootstrap-populated leaf-roots.
+	case pgCastOidIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 16, nkeyatts: 1}, true
+	case pgCastSourceTargetIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 16, nkeyatts: 2}, true
 	default:
 		return btreeIndexKeyMeta{}, false
 	}

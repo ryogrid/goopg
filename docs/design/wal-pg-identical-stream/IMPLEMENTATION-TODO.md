@@ -295,8 +295,37 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
   protrftypes/probin/proconfig/proacl — PG branches on attisnull (stringToNode("") on every SQL
   function call); now genuinely NULL (pg_class builder convention). e2e failover extended: goopg
   CREATE FUNCTION over WAL → promoted PG resolves by name (2691) AND executes it (2690 + prosrc).
-- [ ] **B2** type/operator families (pg_type/enum/range, pg_operator, pg_opclass/opfamily/amop/amproc,
-  pg_cast, pg_conversion, pg_collation, pg_aggregate).
+- [ ] **B2** type/operator families — B2.1 (pg_type/enum/range/domain) COMPLETE below; **B2.2 staged
+  plan (survey 2026-07-17)**, one catalog per landing on the B2.1 template (heap rows + index entries
+  via descent machinery + physical reload + kind retirement + e2e probe where PG-side read exists):
+  1. **pg_cast** — DONE (B2.2a entry below; kinds 38/39 retired, scanner cast_ddl_recovery.go dead);
+  2. **pg_aggregate** (kinds 46-49; partial write-only sync EXISTS (syncAggregateToCatalogHeap,
+     1 call site, NO index 2650 maintenance, NO reload) — complete it; ArgTypes need the pg_proc
+     join or JSON; scanner aggregate_ddl_recovery.go);
+  3. **pg_operator** (kinds 83/84; 7 emit sites incl. two-pass commutator/negator shells; all-scalar
+     pg_operator row; indexes 2688/2689 populated; scanner operator_ddl_recovery.go);
+  4. **pg_collation** (kinds 42-45/93) + **pg_conversion** (kinds 40/41/130-132) — BOTH registries'
+     *DuringRecovery still FORCE DefaultDBOid (catalog.go:12653/:12776 — the domain/range/enum bug
+     class, fix like RegisterDomainDuringRecovery); indexes populated (3085/3164, 2668-2670);
+  5. **opclass/opfamily/amop/amproc** (kinds 85-92; 9 emit sites; opfamily/opclass recovery already
+     DBOid-guarded; indexes: 2686/2653/2654 are EMPTY placeholders → lazy-root handles).
+  Remaining rmid-128 kinds AFTER B2.2: text-search 104-116, statistics 95-99 (wal/statistics_ddl.go),
+  access-method 70/71, transform 36/37, event-trigger 56-60, pub/sub 50-55, foreign-data 126-129,
+  role/db-config/tablespace/matview/view/index-rename 67-80/94/102-103/124-125 (B3/B4 scope).
+  - [x] **B2.2a pg_cast (kinds 38/39 retired)** — LANDED. `sys_pg_cast.go`: 6-col PG18 row builder
+    (`buildPGCastRow`, SourceType/TargetType names→OIDs via `TypeNameToOID`), heap INSERT +
+    2660 (oid, 16B) + 2661 (src+tgt, 16B `buildIndexTupleOidOidKey`) via the descent machinery,
+    `deleteCastCatalogRow` xmax-stamp for DROP CAST, `mirrorCastCatalogFiles` (2605/2660/2661).
+    Emit sites: CREATE CAST (execCompatNoop case "cast") + DROP CAST (`CastByTypes` OID capture).
+    Reload `reloadUserCastsFromHeap`: fully physical scan of base/<DBOID()>/2605, builtin rows
+    (oid<16384) skipped, endpoint OIDs reversed to names (pgTypeCanonical → table → domain →
+    enum; ""=dead cast), `RegisterCastDuringRecovery`. Scanner cast_ddl_recovery.go(+test) +
+    wal/cast_ddl_test.go deleted; kinds 38/39 + codecs excised from recovery.go. Debug lesson:
+    the reload was correct all along — the durability test's `'int'::regtype` predicate silently
+    matched nothing (goopg regtype input leaves builtin type NAMES as strings; the oid-column
+    comparison error is swallowed by WHERE → 0 rows; ledger row). Test now compares numeric OIDs
+    and scopes `oid >= 16384` (int4→bool has a builtin pg_cast row 10034 that survives the user
+    cast's drop). TestPort_CastSurvivesRestart green.
   - [x] **B2.1a pg_type index maintenance (2703/2704)** — LANDED. All ten pg_type row writes
     (enum/composite/domain/range/multirange + arrays, ACL resync) funnel through
     `writeTypeHeapRowWithIndexes`, which derives the index keys from the built row itself

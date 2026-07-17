@@ -10428,7 +10428,7 @@ func (o *ddlOp) backfillBTree(tree *btree.BTree, tbl *catalog.Table, cols []*cat
 	}
 	seen := map[string]struct{}{}
 	var seenNull map[string]struct{} // null-bearing-row dedup for NULLS NOT DISTINCT
-	var scanRow Row // M0054-0005c: reusable decode buffer.
+	var scanRow Row                  // M0054-0005c: reusable decode buffer.
 	// M0074-0004 / M0107-0001: per-page mctx for varchar / char / text payloads.
 	// Resulting key is copied by caller (`seen[string(key)]` and `tree.Insert`),
 	// so Datums need not outlive the per-page Reset boundary.
@@ -11359,7 +11359,6 @@ func (o *ddlOp) truncateTableAndPartitions(tbl *catalog.Table, pos int, only boo
 	}
 	return nil
 }
-
 
 // walLogCreateRoutine WAL-logs a successful CREATE [OR REPLACE]
 // FUNCTION/PROCEDURE so it survives a restart (DU-002 restart-persistence
@@ -14871,15 +14870,20 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 		// If goopg registered this user cast (CREATE CAST, DU-002 slice 395), drop
 		// it from the registry so it stops round-tripping through pg_dump. An
 		// unregistered cast falls through to the PG-style "does not exist" error.
-		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok && im.DropCast(fromType, toType) {
-			// DU-002 restart-persistence follow-up: mirror the DROP
-			// TRANSFORM WAL emission so the drop survives a restart too.
-			if o.ctx.WAL != nil {
-				if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropCast(fromType, toType)); werr != nil {
-					return fmt.Errorf("wal drop-cast: %w", werr)
-				}
+		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+			// B2.2a: capture the cast's OID before the registry drop, then
+			// stamp its pg_cast heap row (kind 39 retired).
+			var castOID uint32
+			if c := im.CastByTypes(fromType, toType); c != nil {
+				castOID = c.OID
 			}
-			return nil
+			if im.DropCast(fromType, toType) {
+				if castOID != 0 && catalogHeapSyncAvailable(o.ctx) && o.ctx.MaterializeWriterXID() == nil {
+					deleteCastCatalogRow(o.ctx, castOID, o.ctx.Tx.XID)
+					mirrorCastCatalogFiles(o.ctx)
+				}
+				return nil
+			}
 		}
 		msg := fmt.Sprintf("cast from type %s to type %s does not exist", fromCanon, toCanon)
 		if s.IfExists {
@@ -16427,9 +16431,12 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 			// (internal/initdb/cast_ddl_recovery.go) replays into the cast
 			// registry on the next startup. Mirrors CREATE TRANSFORM
 			// (M0119-0004).
-			if o.ctx.WAL != nil {
-				if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateCast(cs.SourceType, cs.TargetType, cs.Context, cs.Method, cs.OID, cs.FuncOID)); werr != nil {
-					return fmt.Errorf("wal create-cast: %w", werr)
+			// B2.2a: the cast journals as a real pg_cast heap row + both
+			// index entries (kind 38 retired); the startup reload
+			// reconstructs the registry from the heap.
+			if catalogHeapSyncAvailable(o.ctx) {
+				if writeCastCatalogRow(o.ctx, cs) == nil {
+					mirrorCastCatalogFiles(o.ctx)
 				}
 			}
 		}
@@ -17923,7 +17930,7 @@ func (o *ddlOp) execAlterSchema(s *parser.AlterSchemaStmt) error {
 			seqDBOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
 			if RenameSequence(oldFull, newFull, seqDBOid) || RenameSequence(tbl.Name, newFull, seqDBOid) {
 				if o.ctx.WAL != nil {
-					dropSequenceCatalogHeapRow(o.ctx, strings.ToLower(strings.TrimSpace(oldFull)), seqDBOid) // B1.3: pg_sequence heap row
+					dropSequenceCatalogHeapRow(o.ctx, strings.ToLower(strings.TrimSpace(oldFull)), seqDBOid)  // B1.3: pg_sequence heap row
 					dropSequenceCatalogHeapRow(o.ctx, strings.ToLower(strings.TrimSpace(tbl.Name)), seqDBOid) // B1.3: pg_sequence heap row
 				}
 				WALLogSequenceState(o.ctx, newFull)

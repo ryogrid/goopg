@@ -421,3 +421,55 @@ func TestPort_EnumSurvivesRestart(t *testing.T) {
 		t.Fatalf("post-restart dropped enum pg_type count = %q, want 0", got)
 	}
 }
+
+// TestPort_CastSurvivesRestart pins B2.2a's pg_cast heap journaling:
+// CREATE CAST reloads from its pg_cast heap row (kinds 38/39 retired) and
+// DROP CAST is durable.
+func TestPort_CastSurvivesRestart(t *testing.T) {
+	c, err := cluster.New("cast-durability", cluster.Options{
+		RepoRoot:     repoRoot(t),
+		DataDir:      filepath.Join(t.TempDir(), "data"),
+		StartupWait:  20 * time.Second,
+		ShutdownWait: 20 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+
+	if err := runSQLSimple(t, c, "CREATE FUNCTION b22_i2t(int) RETURNS text LANGUAGE sql AS 'SELECT $1::text'"); err != nil {
+		t.Fatalf("CREATE FUNCTION: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE CAST (int AS text) WITH FUNCTION b22_i2t(int) AS IMPLICIT"); err != nil {
+		t.Fatalf("CREATE CAST: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE CAST (int AS bool) WITH INOUT"); err != nil {
+		t.Fatalf("CREATE CAST 2: %v", err)
+	}
+	if err := runSQLSimple(t, c, "DROP CAST (int AS bool)"); err != nil {
+		t.Fatalf("DROP CAST: %v", err)
+	}
+
+	if err := c.Stop(cluster.ShutdownFast); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	if err := c.Start(); err != nil {
+		t.Fatalf("restart: %v", err)
+	}
+
+	// Numeric type OIDs (int4=23, text=25, bool=16), not 'int'::regtype:
+	// goopg's regtype input leaves builtin type NAMES as strings (only OID
+	// digits and user-type names resolve), so the oid-column comparison
+	// silently matches nothing (ledger: regtype-builtin-name-input gap).
+	// oid >= 16384 scopes to user casts — int4→bool has a BUILTIN pg_cast
+	// row (10034) that survives the user cast's drop.
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_cast WHERE castsource = 23 AND casttarget = 25 AND oid >= 16384"); got != "1" {
+		t.Fatalf("post-restart pg_cast count = %q, want 1 (cast not reloaded)", got)
+	}
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_cast WHERE castsource = 23 AND casttarget = 16 AND oid >= 16384"); got != "0" {
+		t.Fatalf("post-restart dropped cast count = %q, want 0", got)
+	}
+}

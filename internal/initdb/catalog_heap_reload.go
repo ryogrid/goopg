@@ -785,3 +785,64 @@ func reloadUserEnumsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *
 	}
 	return nil
 }
+
+// reloadUserCastsFromHeap is B2.2a's cast reload — the generic heap-scan
+// replacement for the retired replayCastDDLRecords scanner (RecordKinds
+// 38/39). Fully physical: the six pg_cast columns map 1:1 onto the Cast
+// registry; source/target type names revive via pgTypeCanonical for
+// builtins and the user pg_type rows otherwise.
+func reloadUserCastsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+	castCols := executor.PGCastColumnsPG18()
+	type castRow struct {
+		oid, source, target, funcOID uint32
+		context, method              string
+	}
+	rel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 2605, Fork: storage.MainFork}
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_cast",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			decoded := make(executor.Row, len(castCols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, castCols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			if uint32(decoded[0].Int) < catalog.FirstUserOID {
+				return nil, false, errSkipBuiltinRow
+			}
+			return castRow{
+				oid:     uint32(decoded[0].Int),
+				source:  uint32(decoded[1].Int),
+				target:  uint32(decoded[2].Int),
+				funcOID: uint32(decoded[3].Int),
+				context: decoded[4].StringValue(),
+				method:  decoded[5].StringValue(),
+			}, false, nil
+		})
+	if err != nil || len(rows) == 0 {
+		return err
+	}
+	// User-type OID → name (domains/enums/etc. as cast endpoints).
+	typeName := func(oid uint32) string {
+		if e, ok := pgTypeCanonical(oid); ok {
+			return e.Name
+		}
+		if tbl, _, ok := cat.LookupTableByOIDAllDBs(oid); ok && tbl != nil {
+			return tbl.Name
+		}
+		if d, ok := cat.LookupDomainByOID(oid); ok && d != nil {
+			return d.Name
+		}
+		if et, ok := cat.LookupEnumByOID(oid); ok && et != nil {
+			return et.Name
+		}
+		return ""
+	}
+	for _, raw := range rows {
+		cr := raw.(castRow)
+		src, tgt := typeName(cr.source), typeName(cr.target)
+		if src == "" || tgt == "" {
+			continue // endpoint type gone (dropped) — dead cast
+		}
+		cat.RegisterCastDuringRecovery(src, tgt, cr.context, cr.method, cr.oid, cr.funcOID)
+	}
+	return nil
+}
