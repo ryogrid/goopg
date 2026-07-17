@@ -112,6 +112,19 @@ func keyMetaForSysBtree(indexOID uint32) (btreeIndexKeyMeta, bool) {
 		return btreeIndexKeyMeta{tupleSize: 16, nkeyatts: 1}, true
 	case pgOperatorOprnameLRNIndexOID:
 		return btreeIndexKeyMeta{tupleSize: 88, nkeyatts: 4}, true
+	// B2.2 slice 4: pg_collation (3085/3164 bootstrap-populated) +
+	// pg_conversion (2670 populated; 2668/2669 empty placeholders that the
+	// runtime lazily roots).
+	case pgCollationOidIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 16, nkeyatts: 1}, true
+	case pgCollationNameEncNspIndexID:
+		return btreeIndexKeyMeta{tupleSize: 80, nkeyatts: 3}, true
+	case pgConversionOidIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 16, nkeyatts: 1}, true
+	case pgConversionNameNspIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 80, nkeyatts: 2}, true
+	case pgConversionDefaultIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 24, nkeyatts: 4}, true
 	default:
 		return btreeIndexKeyMeta{}, false
 	}

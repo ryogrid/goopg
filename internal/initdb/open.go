@@ -1297,17 +1297,10 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// (pg_cast) from the WAL the same way. Order relative to transform/schema
 	// replay does not matter — casts are keyed by (source type, target
 	// type), not by schema OID.
-	// DU-002 restart-persistence follow-up: restore CREATE/DROP CONVERSION
-	// objects (pg_conversion) from the WAL the same way. Unlike
-	// transforms/casts, a conversion is schema-scoped (keyed by namespace
-	// OID + name), so this must run after replaySchemaDDLRecords above has
-	// repopulated the schema OID map.
-	if err := replayConversionDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
-		_ = pool.Close()
-		_ = walWriter.Close()
-		_ = mgr.Close()
-		return nil, fmt.Errorf("goopg: conversion DDL replay: %w", err)
-	}
+	// B2.2 slice 4: the conversion replay that historically ran here moved
+	// to reloadUserConversionsFromHeap (after the routines reload — the
+	// conproc name fallback re-derives from the routines registry); kinds
+	// 40/41/130-132 retired.
 	// DU-002 restart-persistence follow-up: restore CREATE/DROP TEXT SEARCH
 	// DICTIONARY objects (pg_ts_dict) and CREATE/ADD MAPPING/DROP TEXT
 	// SEARCH CONFIGURATION objects (pg_ts_config/pg_ts_config_map) from the
@@ -1326,17 +1319,9 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: text search configuration DDL replay: %w", err)
 	}
-	// DU-002 restart-persistence follow-up: restore CREATE/DROP COLLATION
-	// objects (pg_collation) from the WAL the same way. Like a conversion, a
-	// collation is schema-scoped (keyed by namespace OID + name), so this
-	// must run after replaySchemaDDLRecords above has repopulated the schema
-	// OID map.
-	if err := replayCollationDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
-		_ = pool.Close()
-		_ = walWriter.Close()
-		_ = mgr.Close()
-		return nil, fmt.Errorf("goopg: collation DDL replay: %w", err)
-	}
+	// B2.2 slice 4: the collation replay that historically ran here moved to
+	// reloadUserCollationsFromHeap (grouped with the other B-phase heap
+	// reloads); kinds 42-45/93 retired.
 	// B2.2 slice 2: the aggregate replay that historically ran here moved
 	// to reloadUserAggregatesFromHeap (after the routines reload below) —
 	// kinds 46-49 retired.
@@ -2104,6 +2089,24 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = walWriter.Close()
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: pg_operator reload: %w", err)
+	}
+
+	// B2.2 slice 4: collations + conversions reload from their heaps —
+	// generic scans replacing the retired replayCollationDDLRecords /
+	// replayConversionDDLRecords scanners. After the routines reload (the
+	// conversion conproc name fallback) and after schema replay (both
+	// registries re-resolve their namespace by schema name).
+	if err := reloadUserCollationsFromHeap(mgr, cat, clog); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: pg_collation reload: %w", err)
+	}
+	if err := reloadUserConversionsFromHeap(mgr, cat, clog); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: pg_conversion reload: %w", err)
 	}
 
 	// DU-002 restart-persistence follow-up (M0119-0004/M0110-0001, closing

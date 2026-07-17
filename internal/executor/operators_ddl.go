@@ -705,17 +705,15 @@ func (o *ddlOp) execCreateCollation(s *parser.CreateCollationStmt) error {
 	if _, err := im.CreateCollation(uc, schema, s.IfNotExists, dbOid); err != nil {
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 	}
-	// DU-002 restart-persistence follow-up (M0119-0004): goopg has no
-	// per-collation on-disk file namespace, so record a WAL event the
-	// recovery driver (internal/initdb/collation_ddl_recovery.go) replays
-	// into the collation registry on the next startup. Mirrors CREATE
-	// CAST/TRANSFORM/CONVERSION. uc.OID is only set when CreateCollation
-	// actually inserted a new entry (the IF NOT EXISTS "already exists"
-	// path returns the existing OID without touching uc.OID), so this skips
-	// the WAL write for a no-op IF NOT EXISTS hit.
-	if o.ctx.WAL != nil && uc.OID != 0 {
-		if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateCollation(uc.Name, schema, uc.Collate, uc.Ctype, uc.Locale, uc.Rules, uc.OID, uc.Owner, int32(uc.Encoding), uc.Provider, uc.Deterministic)); werr != nil {
-			return fmt.Errorf("wal create-collation: %w", werr)
+	// B2.2 slice 4 (doc 02d §1): the collation journals as a real
+	// pg_collation heap row + 3085/3164 entries (kind 42 retired); the
+	// startup reload reconstructs the registry from the heap. uc.OID is
+	// only set when CreateCollation actually inserted a new entry (the
+	// IF NOT EXISTS "already exists" path returns the existing OID without
+	// touching uc.OID), so this skips the journal for a no-op hit.
+	if uc.OID != 0 {
+		if err := upsertCollationCatalogRow(o.ctx, uc); err != nil {
+			return fmt.Errorf("pg_collation journal: %w", err)
 		}
 	}
 	return nil
@@ -758,10 +756,10 @@ func (o *ddlOp) execAlterCollation(s *parser.AlterCollationStmt) error {
 		if err := im.RenameCollation(s.Name.Name, schema, s.NewName, dbOid); err != nil {
 			return notFound()
 		}
-		if o.ctx.WAL != nil {
-			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterCollationRename(s.Name.Name, schema, s.NewName)); werr != nil {
-				return fmt.Errorf("wal alter-collation-rename: %w", werr)
-			}
+		// B2.2 slice 4: the rename is a canonical pg_collation heap UPDATE
+		// (kind 44 retired).
+		if uc := im.FindCollation(s.NewName, schema, dbOid); uc != nil {
+			_ = upsertCollationCatalogRow(o.ctx, uc)
 		}
 		return nil
 	case "owner":
@@ -776,10 +774,10 @@ func (o *ddlOp) execAlterCollation(s *parser.AlterCollationStmt) error {
 		if !im.SetCollationOwner(s.Name.Name, schema, ownerOID, dbOid) {
 			return notFound()
 		}
-		if o.ctx.WAL != nil {
-			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterCollationOwner(s.Name.Name, schema, ownerOID)); werr != nil {
-				return fmt.Errorf("wal alter-collation-owner: %w", werr)
-			}
+		// B2.2 slice 4: the owner change is a canonical pg_collation heap
+		// UPDATE (kind 45 retired).
+		if uc := im.FindCollation(s.Name.Name, schema, dbOid); uc != nil {
+			_ = upsertCollationCatalogRow(o.ctx, uc)
 		}
 		return nil
 	case "setschema":
@@ -790,10 +788,11 @@ func (o *ddlOp) execAlterCollation(s *parser.AlterCollationStmt) error {
 		if !im.SetCollationSchema(s.Name.Name, schema, newSchema, dbOid) {
 			return notFound()
 		}
-		if o.ctx.WAL != nil {
-			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterCollationSetSchema(s.Name.Name, schema, newSchema)); werr != nil {
-				return fmt.Errorf("wal alter-collation-set-schema: %w", werr)
-			}
+		// B2.2 slice 4: SET SCHEMA is a canonical pg_collation heap UPDATE
+		// (kind 93 retired) — collnamespace changed, so the row moves under
+		// the NEW schema's key.
+		if uc := im.FindCollation(s.Name.Name, newSchema, dbOid); uc != nil {
+			_ = upsertCollationCatalogRow(o.ctx, uc)
 		}
 		return nil
 	case "refresh":
@@ -837,10 +836,18 @@ func (o *ddlOp) execAlterConversion(s *parser.AlterConversionStmt) error {
 		if err := im.RenameConversion(s.Name.Name, schema, s.NewName, dbOid); err != nil {
 			return notFound()
 		}
-		if o.ctx.WAL != nil {
-			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterConversionRename(s.Name.Name, schema, s.NewName)); werr != nil {
-				return fmt.Errorf("wal alter-conversion-rename: %w", werr)
-			}
+		// Move the compat-registry entry with the rename: DROP CONVERSION's
+		// existence gate is DropCompatObject keyed by the CURRENT name, so
+		// a stale original-name entry made rename→drop fail with 42704
+		// (pre-existing gap, surfaced by the B2.2 slice 4 waldump workload).
+		if im.DropCompatObject("conversion", s.Name.String()) {
+			renamed := parser.ObjectName{Schema: s.Name.Schema, Name: s.NewName}
+			im.RegisterCompatObject("conversion", renamed.String())
+		}
+		// B2.2 slice 4: the rename is a canonical pg_conversion heap
+		// UPDATE (kind 130 retired).
+		if uc := im.FindConversion(s.NewName, schema, dbOid); uc != nil {
+			_ = upsertConversionCatalogRow(o.ctx, uc)
 		}
 		return nil
 	case "owner":
@@ -855,10 +862,10 @@ func (o *ddlOp) execAlterConversion(s *parser.AlterConversionStmt) error {
 		if !im.SetConversionOwner(s.Name.Name, schema, ownerOID, dbOid) {
 			return notFound()
 		}
-		if o.ctx.WAL != nil {
-			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterConversionOwner(s.Name.Name, schema, ownerOID)); werr != nil {
-				return fmt.Errorf("wal alter-conversion-owner: %w", werr)
-			}
+		// B2.2 slice 4: the owner change is a canonical pg_conversion heap
+		// UPDATE (kind 131 retired).
+		if uc := im.FindConversion(s.Name.Name, schema, dbOid); uc != nil {
+			_ = upsertConversionCatalogRow(o.ctx, uc)
 		}
 		return nil
 	case "setschema":
@@ -869,10 +876,11 @@ func (o *ddlOp) execAlterConversion(s *parser.AlterConversionStmt) error {
 		if !im.SetConversionSchema(s.Name.Name, schema, newSchema, dbOid) {
 			return notFound()
 		}
-		if o.ctx.WAL != nil {
-			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterConversionSetSchema(s.Name.Name, schema, newSchema)); werr != nil {
-				return fmt.Errorf("wal alter-conversion-set-schema: %w", werr)
-			}
+		// B2.2 slice 4: SET SCHEMA is a canonical pg_conversion heap UPDATE
+		// (kind 132 retired) — connamespace changed, so the row lives under
+		// the NEW schema's key.
+		if uc := im.FindConversion(s.Name.Name, newSchema, dbOid); uc != nil {
+			_ = upsertConversionCatalogRow(o.ctx, uc)
 		}
 		return nil
 	default:
@@ -14914,14 +14922,17 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 			if schema == "" {
 				schema = "public"
 			}
+			var collOID uint32
+			if imOK {
+				if uc := im.FindCollation(name.Name, schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); uc != nil {
+					collOID = uc.OID
+				}
+			}
 			if imOK && im.DropCollation(name.Name, schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
-				// DU-002 restart-persistence follow-up: mirror the DROP
-				// CAST/TRANSFORM/CONVERSION WAL emission so the drop
-				// survives a restart too.
-				if o.ctx.WAL != nil {
-					if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropCollation(name.Name, schema)); werr != nil {
-						return fmt.Errorf("wal drop-collation: %w", werr)
-					}
+				// B2.2 slice 4: stamp xmax on the collation's pg_collation
+				// heap row (kind 43 retired).
+				if collOID != 0 {
+					deleteCollationCatalogRow(o.ctx, collOID)
 				}
 				continue
 			}
@@ -15366,13 +15377,15 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 				// dropped conversion stops round-tripping through pg_dump
 				// (DU-002 slice 399); harmless for the other object types.
 				if objType == "conversion" {
-					if im.DropConversion(s.Names[0].Name, s.Names[0].Schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) && o.ctx.WAL != nil {
-						// DU-002 restart-persistence follow-up: mirror the
-						// DROP CAST/TRANSFORM WAL emission so the drop
-						// survives a restart too.
-						if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropConversion(s.Names[0].Name, s.Names[0].Schema)); werr != nil {
-							return fmt.Errorf("wal drop-conversion: %w", werr)
-						}
+					// B2.2 slice 4: capture the OID before the registry
+					// drop, then stamp xmax on the pg_conversion heap row
+					// (kind 41 retired).
+					var convOID uint32
+					if uc := im.FindConversion(s.Names[0].Name, s.Names[0].Schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); uc != nil {
+						convOID = uc.OID
+					}
+					if im.DropConversion(s.Names[0].Name, s.Names[0].Schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) && convOID != 0 {
+						deleteConversionCatalogRow(o.ctx, convOID)
 					}
 				}
 				if objType == "text search dictionary" {
@@ -16505,15 +16518,12 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		if _, err := im.CreateConversion(uc, schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); err != nil {
 			return &ExecError{Code: "42710", Message: err.Error()}
 		}
-		// DU-002 restart-persistence follow-up (M0119-0004): goopg has no
-		// per-conversion on-disk file namespace, so record a WAL event the
-		// recovery driver (internal/initdb/conversion_ddl_recovery.go)
-		// replays into the conversion registry on the next startup. Mirrors
-		// CREATE CAST/TRANSFORM.
-		if o.ctx.WAL != nil {
-			if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateConversion(uc.Name, schema, uc.ProcSchema, uc.ProcName, uc.OID, uc.Owner, uc.FuncOID, uc.ForEncoding, uc.ToEncoding, uc.Default)); werr != nil {
-				return fmt.Errorf("wal create-conversion: %w", werr)
-			}
+		// B2.2 slice 4 (doc 02d §1): the conversion journals as a real
+		// pg_conversion heap row + 2668/2669/2670 entries (kind 40
+		// retired); the startup reload reconstructs the registry from the
+		// heap.
+		if err := upsertConversionCatalogRow(o.ctx, uc); err != nil {
+			return fmt.Errorf("pg_conversion journal: %w", err)
 		}
 	case "text search dictionary":
 		// Register the dictionary (CREATE TEXT SEARCH DICTIONARY name (TEMPLATE =
