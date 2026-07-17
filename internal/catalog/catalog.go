@@ -16494,6 +16494,37 @@ func (c *InMemory) ForeignDataWrapperOID(name string) uint32 {
 	return 0
 }
 
+// LookupForeignDataWrapperByOID returns the FDW registry entry with this OID,
+// or nil. B3.4: the pg_foreign_server reload reverses srvfdw (an OID column)
+// back to the FdwName the registry stores.
+func (c *InMemory) LookupForeignDataWrapperByOID(oid uint32) *ForeignDataWrapper {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, f := range c.fdws {
+		if f.OID == oid {
+			return f
+		}
+	}
+	return nil
+}
+
+// RegisterForeignDataWrapperDuringRecovery re-registers an FDW from the
+// pg_foreign_data_wrapper heap reload with its recovered OID (B3.4 — the FDW
+// gained restart durability with this slice; it had none before). Idempotent.
+func (c *InMemory) RegisterForeignDataWrapperDuringRecovery(fdw *ForeignDataWrapper) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.fdws == nil {
+		c.fdws = make(map[string]*ForeignDataWrapper)
+	}
+	out := *fdw
+	out.Options = append([]string(nil), fdw.Options...)
+	c.fdws[fdw.Name] = &out
+	if fdw.OID >= c.nextOID {
+		c.nextOID = fdw.OID + 1
+	}
+}
+
 // LookupForeignDataWrapper returns the named FDW's registry entry, or
 // (nil, false) if no such FDW is registered. Unlike RegisterForeignDataWrapper
 // (which creates-or-fetches), this is a read-only lookup — used by
@@ -17286,6 +17317,30 @@ type ForeignServer struct {
 // (internal/executor/operators_sequence.go) so a same-named server in two
 // distinct databases no longer collides (last-writer-wins) the way the
 // pre-4e-follow-up-36 bare-name key did. M0122-0007 4e follow-up 36.
+// LookupForeignServer returns the (dbOid, name) server registry entry, or
+// (nil, false). B3.4: CREATE USER MAPPING resolves umserver to the server's
+// OID.
+func (c *InMemory) LookupForeignServer(name string, dbOid ...uint32) (*ForeignServer, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	srv, ok := c.foreignServers[foreignServerKey(resolveDBOid(dbOid), name)]
+	return srv, ok
+}
+
+// LookupForeignServerByOID returns the server registry entry with this OID
+// (across all databases), or nil. B3.4: the pg_user_mapping reload reverses
+// umserver (an OID column) to the SrvName the registry stores.
+func (c *InMemory) LookupForeignServerByOID(oid uint32) *ForeignServer {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, srv := range c.foreignServers {
+		if srv.OID == oid {
+			return srv
+		}
+	}
+	return nil
+}
+
 func foreignServerKey(dbOid uint32, name string) string {
 	return strconv.FormatUint(uint64(dbOid), 10) + ":" + name
 }
@@ -19235,6 +19290,19 @@ func (c *InMemory) RegisterUserMapping(user, server string, options []string, db
 // DropUserMapping removes a user mapping from dbOid's registry (variadic,
 // defaults to DefaultDBOid). Returns true if found. DU-002 slice 377; dbOid
 // scoping: M0122-0007 4e follow-up 37.
+// LookupUserMapping returns the (dbOid, user, server) mapping registry
+// entry, or (nil, false). B3.4: DROP USER MAPPING captures the OID before the
+// registry drop to stamp its pg_user_mapping heap row.
+func (c *InMemory) LookupUserMapping(user, server string, dbOid ...uint32) (*UserMapping, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.userMappings == nil {
+		return nil, false
+	}
+	um, ok := c.userMappings[userMappingKey(resolveDBOid(dbOid), user, server)]
+	return um, ok
+}
+
 func (c *InMemory) DropUserMapping(user, server string, dbOid ...uint32) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()

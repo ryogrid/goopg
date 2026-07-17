@@ -925,3 +925,62 @@ func TestPort_PublicationSurvivesRestart(t *testing.T) {
 		t.Fatalf("post-restart dropped publication count = %q, want 0", got)
 	}
 }
+
+// TestPort_ForeignDataSurvivesRestart pins B3.4's pg_foreign_data_wrapper +
+// pg_foreign_server + pg_user_mapping heap journaling: CREATE FOREIGN DATA
+// WRAPPER (which gained restart durability in this slice), CREATE SERVER
+// (srvfdw → FDW OID), CREATE USER MAPPING (umserver → server OID, umuser →
+// role OID), and the drops all survive a restart (kinds 126-129 retired).
+func TestPort_ForeignDataSurvivesRestart(t *testing.T) {
+	c, err := cluster.New("foreign-data-durability", cluster.Options{
+		RepoRoot:     repoRoot(t),
+		DataDir:      filepath.Join(t.TempDir(), "data"),
+		StartupWait:  20 * time.Second,
+		ShutdownWait: 20 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+
+	stmts := []string{
+		"CREATE ROLE b34_role",
+		"CREATE FOREIGN DATA WRAPPER b34_fdw",
+		"CREATE SERVER b34_srv FOREIGN DATA WRAPPER b34_fdw",
+		"CREATE USER MAPPING FOR b34_role SERVER b34_srv",
+		"CREATE SERVER b34_gone FOREIGN DATA WRAPPER b34_fdw",
+		"DROP SERVER b34_gone",
+	}
+	for _, s := range stmts {
+		if err := runSQLSimple(t, c, s); err != nil {
+			t.Fatalf("%s: %v", s, err)
+		}
+	}
+
+	if err := c.Stop(cluster.ShutdownFast); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	if err := c.Start(); err != nil {
+		t.Fatalf("restart: %v", err)
+	}
+
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_foreign_data_wrapper WHERE fdwname = 'b34_fdw'"); got != "1" {
+		t.Fatalf("post-restart FDW count = %q, want 1 (FDW durability not added / reloaded)", got)
+	}
+	// The server's srvfdw resolves back to the FDW by OID after reload.
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_foreign_server s JOIN pg_foreign_data_wrapper f ON f.oid = s.srvfdw WHERE s.srvname = 'b34_srv' AND f.fdwname = 'b34_fdw'"); got != "1" {
+		t.Fatalf("post-restart server→FDW join count = %q, want 1 (srvfdw lost)", got)
+	}
+	// The user mapping's umserver + umuser resolve back by OID.
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_user_mappings WHERE srvname = 'b34_srv' AND usename = 'b34_role'"); got != "1" {
+		t.Fatalf("post-restart user-mapping count = %q, want 1 (umserver/umuser lost)", got)
+	}
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_foreign_server WHERE srvname = 'b34_gone'"); got != "0" {
+		t.Fatalf("post-restart dropped server count = %q, want 0", got)
+	}
+}

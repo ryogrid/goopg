@@ -15436,13 +15436,17 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 				// pg_foreign_server after a crash. DropCompatObject is still
 				// called best-effort to clear any stale entry.
 				dbOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
+				// B3.4: capture the OID before the registry drop, then stamp
+				// xmax on the pg_foreign_server heap row (kind 127 retired).
+				var srvOID uint32
+				if srv, ok := im.LookupForeignServer(name, dbOid); ok && srv != nil {
+					srvOID = srv.OID
+				}
 				found := im.DropForeignServer(name, dbOid)
 				im.DropCompatObject("server", name)
 				if found {
-					if o.ctx.WAL != nil {
-						if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropForeignServer(name, dbOid)); werr != nil {
-							return fmt.Errorf("wal drop-foreign-server: %w", werr)
-						}
+					if srvOID != 0 {
+						deleteForeignRowByOID(o.ctx, pgForeignServerRelOID, srvOID)
 					}
 					return nil
 				}
@@ -15495,15 +15499,15 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok && len(s.Names) >= 2 {
 				user, server := o.resolveUserMappingRoleName(s.Names[0].String()), s.Names[1].String()
 				dbOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
+				// B3.4: capture the OID before the registry drop, then stamp
+				// xmax on the pg_user_mapping heap row (kind 129 retired).
+				var umOID uint32
+				if um, ok := im.LookupUserMapping(user, server, dbOid); ok && um != nil {
+					umOID = um.OID
+				}
 				if im.DropUserMapping(user, server, dbOid) {
-					// M0122-0007 user-mapping registry restart-durability
-					// follow-up: persist the drop so it survives a restart,
-					// mirroring DROP SERVER. dbOid scoping: M0122-0007 4e
-					// follow-up 37.
-					if o.ctx.WAL != nil {
-						if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropUserMapping(user, server, dbOid)); werr != nil {
-							return fmt.Errorf("wal drop-user-mapping: %w", werr)
-						}
+					if umOID != 0 {
+						deleteForeignRowByOID(o.ctx, pgUserMappingRelOID, umOID)
 					}
 					return nil
 				}
@@ -15511,6 +15515,11 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 		case "foreign-data wrapper":
 			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
 				fdwName := s.Names[0].String()
+				// B3.4: capture the FDW's heap-row OID before the drop.
+				var fdwOID uint32
+				if fdw, found := im.LookupForeignDataWrapper(fdwName); found && fdw != nil {
+					fdwOID = fdw.OID
+				}
 				if im.DropForeignDataWrapper(fdwName) {
 					// CASCADE: drop all servers associated with this FDW.
 					if s.Behavior == parser.DropCascade {
@@ -15532,14 +15541,23 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 						for _, serverName := range cascadeServers {
 							im.DropCompatObject("fdw-server", fdwName+":"+serverName)
 							im.DropCompatObject("server", serverName)
+							// B3.4: stamp the cascaded server's heap row
+							// (kind 127 retired).
+							var csOID uint32
+							if srv, ok := im.LookupForeignServer(serverName, dbOid); ok && srv != nil {
+								csOID = srv.OID
+							}
 							im.DropForeignServer(serverName, dbOid) // dump-visible registry (DU-002 slice 376)
-							if o.ctx.WAL != nil {
-								if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropForeignServer(serverName, dbOid)); werr != nil {
-									return fmt.Errorf("wal drop-foreign-server: %w", werr)
-								}
+							if csOID != 0 {
+								deleteForeignRowByOID(o.ctx, pgForeignServerRelOID, csOID)
 							}
 							o.ctx.AddNotice(fmt.Sprintf("drop cascades to server %s", serverName))
 						}
+					}
+					// B3.4: stamp the FDW's own pg_foreign_data_wrapper heap
+					// row (the FDW gained durability in this slice).
+					if fdwOID != 0 {
+						deleteForeignRowByOID(o.ctx, pgFdwRelOID, fdwOID)
 					}
 					return nil
 				}
@@ -16096,17 +16114,12 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		// DU-002 slice 376.
 		dbOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
 		srv := im.RegisterForeignServer(s.ObjName.String(), s.TableName.String(), s.ServerType, s.ServerVersion, s.Options, dbOid)
-		// M0122-0007 foreign-server registry restart-durability follow-up:
-		// persist the server so it survives a restart. goopg's foreign-server
-		// registry has no backing heap relation, so record a WAL event the
-		// recovery driver (internal/initdb/foreignserver_ddl_recovery.go)
-		// replays into the registry on the next startup (mirrors CREATE
-		// TABLESPACE). The OID just assigned/refreshed by RegisterForeignServer
-		// is carried so recovery restores the same identity.
-		if o.ctx.WAL != nil {
-			if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateForeignServer(srv.Name, srv.FdwName, srv.Type, srv.Version, srv.Options, srv.OID, srv.DBOid)); werr != nil {
-				return fmt.Errorf("wal create-foreign-server: %w", werr)
-			}
+		// B3.4 (doc 02d §2): the server journals as a real pg_foreign_server
+		// heap row + 113/549 entries (kind 126 retired); writeForeignServer
+		// CatalogRow also ensures the referenced FDW's own row exists so
+		// srvfdw resolves on a standby / reload.
+		if err := writeForeignServerCatalogRow(o.ctx, srv); err != nil {
+			return fmt.Errorf("pg_foreign_server journal: %w", err)
 		}
 	case "foreign-data wrapper":
 		// Register FDW so DROP FOREIGN DATA WRAPPER can succeed AND so it
@@ -16137,6 +16150,11 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		fdw := im.RegisterForeignDataWrapper(s.ObjName.String(), s.Options)
 		fdw.HandlerOID = handlerOID
 		fdw.ValidatorOID = validatorOID
+		// B3.4: the FDW gains restart durability here (it had none before) —
+		// a real pg_foreign_data_wrapper heap row + 112/548 entries.
+		if err := writeFdwCatalogRow(o.ctx, fdw); err != nil {
+			return fmt.Errorf("pg_foreign_data_wrapper journal: %w", err)
+		}
 	case "user mapping":
 		// Register the user mapping (CREATE USER MAPPING FOR <user> SERVER <srv>)
 		// so it round-trips through pg_dump (pg_user_mappings virtual view →
@@ -16154,17 +16172,11 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		umDBOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
 		umUser := o.resolveUserMappingRoleName(s.ObjName.String())
 		um := im.RegisterUserMapping(umUser, s.TableName.String(), s.Options, umDBOid)
-		// M0122-0007 user-mapping registry restart-durability follow-up:
-		// persist the mapping so it survives a restart. goopg's user-mapping
-		// registry has no backing heap relation, so record a WAL event the
-		// recovery driver (internal/initdb/usermapping_ddl_recovery.go)
-		// replays into the registry on the next startup (mirrors CREATE
-		// SERVER). The OID just assigned/refreshed by RegisterUserMapping is
-		// carried so recovery restores the same identity.
-		if o.ctx.WAL != nil {
-			if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateUserMapping(um.UmUser, um.SrvName, um.Options, um.OID, um.DBOid)); werr != nil {
-				return fmt.Errorf("wal create-user-mapping: %w", werr)
-			}
+		// B3.4: the mapping journals as a real pg_user_mapping heap row +
+		// 174/175 entries (kind 128 retired), umuser/umserver resolved to
+		// role/server OIDs.
+		if err := writeUserMappingCatalogRow(o.ctx, um); err != nil {
+			return fmt.Errorf("pg_user_mapping journal: %w", err)
 		}
 	case "operator":
 		// Build the compat key as opName(leftCanon,rightCanon) to match DROP OPERATOR lookup.

@@ -59,7 +59,7 @@ func TestRecordKindToRmgrInfoCustomDefault(t *testing.T) {
 		RecordKindCreateDatabase,
 		RecordKindCreateStatistics,
 		RecordKindRenameIndex,
-		RecordKindDropUserMapping,
+		RecordKindDropSubscription,
 	} {
 		gotRmgr, _ := recordKindToRmgrInfo(kind)
 		if gotRmgr != RmgrGoopgCatalog {
