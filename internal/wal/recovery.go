@@ -854,31 +854,6 @@ const (
 
 
 
-	// RecordKindCreateOperator records a `CREATE OPERATOR name (...)` event
-	// so it survives a restart. goopg has no per-operator on-disk file
-	// namespace (like range types, catalog.InMemory's userOperators map is
-	// a pure in-memory registry), so the physical redo path is a no-op; the
-	// recovery driver in internal/initdb/operator_ddl_recovery.go scans the
-	// WAL for these records after physical replay and re-registers each
-	// operator with its original OID (plus its COMMUTATOR/NEGATOR/RESTRICT/
-	// JOIN cross-references, which are themselves just OIDs by the time
-	// CREATE OPERATOR's live two-pass resolution finishes). Mirrors
-	// RecordKindCreateRangeType. DU-002 restart-persistence follow-up
-	// (M0119-0004/M0110-0001, discovered while verifying the loop #64 CREATE
-	// TYPE ... AS RANGE opclass/collation follow-up — see ledger). Encoded
-	// via the struct-based EncodeCreateOperator/DecodeCreateOperator pair;
-	// see CreateOperatorPayload.
-	RecordKindCreateOperator byte = 83
-
-	// RecordKindDropOperator records a `DROP OPERATOR name (...)` removal by
-	// OID, so it survives a restart. Counterpart to RecordKindCreateOperator;
-	// same no-op physical redo path. OID (not name+arg-types) is carried
-	// because DROP OPERATOR's own overload resolution already happened live,
-	// mirroring RecordKindDropFunction's identical rationale.
-	// Format:
-	//   kind(1) | oid(4)
-	RecordKindDropOperator byte = 84
-
 	// RecordKindCreateOperatorFamily records a `CREATE OPERATOR FAMILY name
 	// USING method` event so it survives a restart. goopg has no
 	// per-operator-family on-disk file namespace (catalog.InMemory's
@@ -2084,145 +2059,6 @@ func DecodeDropAccessMethod(payload []byte) (name string, err error) {
 	return string(payload[3 : 3+nameLen]), nil
 }
 
-
-// CreateOperatorPayload carries the metadata needed to fully reconstruct a
-// catalog.UserOperator during WAL replay. Schema is carried as a bare name
-// (not NamespaceOID) so recovery re-resolves it against the recovered
-// schema registry, mirroring CreateAggregateDuringRecovery's identical
-// choice — replay order does not guarantee a schema keeps the same OID
-// across a crash/restart cycle.
-type CreateOperatorPayload struct {
-	OID           uint32
-	Schema        string
-	Name          string
-	LeftType      string
-	RightType     string
-	FuncOID       uint32
-	Owner         uint32
-	CommutatorOID uint32
-	NegatorOID    uint32
-	RestrictOID   uint32
-	JoinOID       uint32
-	CanMerge      bool
-	CanHash       bool
-}
-
-// EncodeCreateOperator encodes a CREATE OPERATOR event (DU-002
-// restart-persistence follow-up to M0119-0004/M0110-0001). Format
-// documented at the RecordKindCreateOperator constant.
-func EncodeCreateOperator(p CreateOperatorPayload) []byte {
-	var buf bytes.Buffer
-	buf.WriteByte(RecordKindCreateOperator)
-	var u32 [4]byte
-	putU32 := func(v uint32) {
-		binary.LittleEndian.PutUint32(u32[:], v)
-		buf.Write(u32[:])
-	}
-	putU32(p.OID)
-	putU32(p.FuncOID)
-	putU32(p.Owner)
-	putU32(p.CommutatorOID)
-	putU32(p.NegatorOID)
-	putU32(p.RestrictOID)
-	putU32(p.JoinOID)
-	var flags byte
-	if p.CanMerge {
-		flags |= 1 << 0
-	}
-	if p.CanHash {
-		flags |= 1 << 1
-	}
-	buf.WriteByte(flags)
-	writeWALStr := func(s string) {
-		if len(s) > 0xFFFF {
-			s = s[:0xFFFF]
-		}
-		var l [2]byte
-		binary.LittleEndian.PutUint16(l[:], uint16(len(s)))
-		buf.Write(l[:])
-		buf.WriteString(s)
-	}
-	writeWALStr(p.Schema)
-	writeWALStr(p.Name)
-	writeWALStr(p.LeftType)
-	writeWALStr(p.RightType)
-	return buf.Bytes()
-}
-
-// DecodeCreateOperator decodes a RecordKindCreateOperator payload.
-func DecodeCreateOperator(payload []byte) (CreateOperatorPayload, error) {
-	var p CreateOperatorPayload
-	if len(payload) < 30 {
-		return p, fmt.Errorf("wal: create-operator payload too short (%d bytes)", len(payload))
-	}
-	if payload[0] != RecordKindCreateOperator {
-		return p, fmt.Errorf("wal: record kind %d is not create-operator", payload[0])
-	}
-	off := 1
-	readU32 := func() uint32 {
-		v := binary.LittleEndian.Uint32(payload[off : off+4])
-		off += 4
-		return v
-	}
-	p.OID = readU32()
-	p.FuncOID = readU32()
-	p.Owner = readU32()
-	p.CommutatorOID = readU32()
-	p.NegatorOID = readU32()
-	p.RestrictOID = readU32()
-	p.JoinOID = readU32()
-	flags := payload[off]
-	off++
-	p.CanMerge = flags&(1<<0) != 0
-	p.CanHash = flags&(1<<1) != 0
-	readStr := func() (string, error) {
-		if len(payload) < off+2 {
-			return "", fmt.Errorf("wal: create-operator payload truncated (length prefix)")
-		}
-		n := int(binary.LittleEndian.Uint16(payload[off : off+2]))
-		off += 2
-		if len(payload) < off+n {
-			return "", fmt.Errorf("wal: create-operator payload truncated (need %d bytes)", off+n)
-		}
-		s := string(payload[off : off+n])
-		off += n
-		return s, nil
-	}
-	var err error
-	if p.Schema, err = readStr(); err != nil {
-		return p, err
-	}
-	if p.Name, err = readStr(); err != nil {
-		return p, err
-	}
-	if p.LeftType, err = readStr(); err != nil {
-		return p, err
-	}
-	if p.RightType, err = readStr(); err != nil {
-		return p, err
-	}
-	return p, nil
-}
-
-// EncodeDropOperator encodes a DROP OPERATOR event by OID. Format documented
-// at the RecordKindDropOperator constant.
-func EncodeDropOperator(oid uint32) []byte {
-	out := make([]byte, 5)
-	out[0] = RecordKindDropOperator
-	binary.LittleEndian.PutUint32(out[1:5], oid)
-	return out
-}
-
-// DecodeDropOperator decodes a RecordKindDropOperator payload.
-func DecodeDropOperator(payload []byte) (oid uint32, err error) {
-	if len(payload) < 5 {
-		return 0, fmt.Errorf("wal: drop-operator payload too short (%d bytes)", len(payload))
-	}
-	if payload[0] != RecordKindDropOperator {
-		return 0, fmt.Errorf("wal: record kind %d is not drop-operator", payload[0])
-	}
-	return binary.LittleEndian.Uint32(payload[1:5]), nil
-}
 
 // CreateOperatorFamilyPayload carries the metadata needed to fully
 // reconstruct a catalog.UserOperatorFamily during WAL replay. Schema is
@@ -7533,14 +7369,13 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 		// these records after physical replay and re-applies them to the
 		// access method registry.
 		return false, nil
-	case RecordKindCreateOperator, RecordKindDropOperator, RecordKindGrantRoleMembership, RecordKindRevokeRoleMembership:
-		// CREATE/DROP OPERATOR (DU-002 restart-persistence follow-up,
-		// M0119-0004/M0110-0001 loop #65/#66) and GRANT/REVOKE ROLE
-		// membership (M0119-0004-ACLHEAP) records carry only in-memory
-		// registry state (userOperators / roleMembers); goopg has no
-		// per-operator or per-role-membership file namespace, so the
-		// physical replay path has nothing to do. **Bug fix (this loop):**
-		// these four kinds previously had NO case in this switch at all —
+	case RecordKindGrantRoleMembership, RecordKindRevokeRoleMembership:
+		// GRANT/REVOKE ROLE membership (M0119-0004-ACLHEAP) records carry
+		// only in-memory registry state (roleMembers); goopg has no
+		// per-role-membership file namespace, so the physical replay path
+		// has nothing to do. (B2.2 slice 3 retired the CREATE/DROP
+		// OPERATOR kinds, 83/84, that shared this case.) **Bug fix:**
+		// these kinds previously had NO case in this switch at all —
 		// on a data dir where the last checkpoint predates one of these
 		// records (i.e. no shutdown checkpoint ran between the DDL and the
 		// restart, such as a crash restart), ReplayRecords/ApplyRecord

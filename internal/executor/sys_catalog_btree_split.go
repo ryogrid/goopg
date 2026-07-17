@@ -106,6 +106,12 @@ func keyMetaForSysBtree(indexOID uint32) (btreeIndexKeyMeta, bool) {
 	// (161 BKI rows).
 	case pgAggregateFnoidIndexOID:
 		return btreeIndexKeyMeta{tupleSize: 16, nkeyatts: 1}, true
+	// B2.2 slice 3: pg_operator — both bootstrap-populated (2689 is
+	// multi-page: ~800 BKI rows × 88B name+3-oid keys).
+	case pgOperatorOidIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 16, nkeyatts: 1}, true
+	case pgOperatorOprnameLRNIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 88, nkeyatts: 4}, true
 	default:
 		return btreeIndexKeyMeta{}, false
 	}

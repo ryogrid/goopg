@@ -120,6 +120,12 @@ func deleteAggregateCatalogRows(ctx *Context, aggOID uint32) {
 	if !catalogHeapSyncAvailable(ctx) {
 		return
 	}
+	// Materialize the writer XID first: the pg_aggregate stamp below
+	// writes ctx.Tx.XID as xmax, and an unmaterialized XID (0) would be a
+	// silent no-op (caught by the B2.2c operator twin — sibling fix).
+	if err := ctx.MaterializeWriterXID(); err != nil {
+		return
+	}
 	_ = deleteRoutineCatalogHeapRow(ctx, aggOID)
 	stampCatalogRows(ctx, pgAggregateRel(), ctx.Tx.XID, func(data []byte) bool {
 		if len(data) < 4 {

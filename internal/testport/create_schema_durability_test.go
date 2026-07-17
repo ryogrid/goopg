@@ -531,3 +531,64 @@ func TestPort_AggregateSurvivesRestart(t *testing.T) {
 		t.Fatalf("post-restart aggregate execution = %q, want 6 (transfn/initcond/finalfunc lost?)", got)
 	}
 }
+
+// TestPort_OperatorSurvivesRestart pins B2.2 slice 3's pg_operator heap
+// journaling: CREATE OPERATOR (with a COMMUTATOR pair — the two-pass
+// shell/back-patch scheme produces heap UPDATEs) reloads from its
+// pg_operator row (kinds 83/84 retired), a dropped operator stays dropped,
+// and the reloaded operator is EXECUTABLE post-restart.
+func TestPort_OperatorSurvivesRestart(t *testing.T) {
+	c, err := cluster.New("operator-durability", cluster.Options{
+		RepoRoot:     repoRoot(t),
+		DataDir:      filepath.Join(t.TempDir(), "data"),
+		StartupWait:  20 * time.Second,
+		ShutdownWait: 20 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+
+	stmts := []string{
+		"CREATE FUNCTION b22c_addmod(int, int) RETURNS int LANGUAGE sql AS 'SELECT ($1 + $2) % 7'",
+		// Forward COMMUTATOR reference: mints a shell for >+< first, then
+		// the second CREATE fills it in and back-patches (OperatorUpd).
+		"CREATE OPERATOR <+> (LEFTARG = int, RIGHTARG = int, FUNCTION = b22c_addmod, COMMUTATOR = OPERATOR(>+<))",
+		"CREATE OPERATOR >+< (LEFTARG = int, RIGHTARG = int, FUNCTION = b22c_addmod, COMMUTATOR = OPERATOR(<+>))",
+		"CREATE OPERATOR <+< (LEFTARG = int, RIGHTARG = int, FUNCTION = b22c_addmod)",
+		"DROP OPERATOR <+< (int, int)",
+	}
+	for _, s := range stmts {
+		if err := runSQLSimple(t, c, s); err != nil {
+			t.Fatalf("%s: %v", s, err)
+		}
+	}
+
+	if err := c.Stop(cluster.ShutdownFast); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	if err := c.Start(); err != nil {
+		t.Fatalf("restart: %v", err)
+	}
+
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_operator WHERE oprname = '<+>' AND oid >= 16384"); got != "1" {
+		t.Fatalf("post-restart pg_operator count for <+> = %q, want 1 (operator not reloaded)", got)
+	}
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_operator a JOIN pg_operator b ON a.oprcom = b.oid WHERE a.oprname = '<+>' AND b.oprname = '>+<'"); got != "1" {
+		t.Fatalf("post-restart commutator link count = %q, want 1 (back-patch lost)", got)
+	}
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_operator WHERE oprname = '<+<' AND oid >= 16384"); got != "0" {
+		t.Fatalf("post-restart dropped operator count = %q, want 0", got)
+	}
+	// Executing a user-defined operator is out of goopg's scope (the
+	// create_operator regress test is excluded "out of scope for v0"), so
+	// the function link pins via the oprcode → pg_proc join instead.
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_operator o JOIN pg_proc p ON p.oid = o.oprcode::oid WHERE o.oprname = '<+>' AND p.proname = 'b22c_addmod'"); got != "1" {
+		t.Fatalf("post-restart oprcode join count = %q, want 1 (function link lost)", got)
+	}
+}

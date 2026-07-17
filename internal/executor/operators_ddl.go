@@ -15335,15 +15335,9 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 				key := opName + "(" + leftCanon + "," + rightCanon + ")"
 				im.DropCompatObject("operator", key)
 				im.DropUserOperator(schema, opName, leftType, rightType)
-				// DU-002 restart-persistence follow-up (M0119-0004/M0110-0001,
-				// discovered while verifying the loop #64 CREATE TYPE ... AS
-				// RANGE opclass/collation follow-up — see ledger): mirrors
-				// CREATE OPERATOR's own WAL append.
-				if o.ctx.WAL != nil {
-					if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropOperator(existing.OID)); werr != nil {
-						return fmt.Errorf("wal drop-operator: %w", werr)
-					}
-				}
+				// B2.2 slice 3: stamp xmax on the operator's pg_operator
+				// heap row (kind 84 retired).
+				deleteOperatorCatalogRow(o.ctx, existing.OID)
 				return nil
 			}
 		}
@@ -16298,20 +16292,28 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 				}
 			}
 
-			// DU-002 restart-persistence follow-up (M0119-0004/M0110-0001,
-			// discovered while verifying the loop #64 CREATE TYPE ... AS
-			// RANGE opclass/collation follow-up — see ledger): mirrors
-			// CREATE TYPE ... AS RANGE's own WAL append. op's final state
-			// (post COMMUTATOR/NEGATOR back-patch) is what gets persisted,
-			// so a restart reproduces exactly what pg_operator showed the
-			// client before the crash.
-			if o.ctx.WAL != nil {
-				if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateOperator(wal.CreateOperatorPayload{
-					OID: op.OID, Schema: schema, Name: op.Name, LeftType: op.LeftType, RightType: op.RightType,
-					FuncOID: op.FuncOID, Owner: op.Owner, CommutatorOID: op.CommutatorOID, NegatorOID: op.NegatorOID,
-					RestrictOID: op.RestrictOID, JoinOID: op.JoinOID, CanMerge: op.CanMerge, CanHash: op.CanHash,
-				})); werr != nil {
-					return fmt.Errorf("wal create-operator: %w", werr)
+			// B2.2 slice 3 (doc 02d §1): journal op's FINAL state (post
+			// COMMUTATOR/NEGATOR back-patch) as a real pg_operator heap row
+			// + 2688/2689 entries (kind 83 retired). The upsert turns a
+			// shell fill-in into a canonical heap UPDATE at the cached TID
+			// (PG's OperatorUpd); the referenced commutator/negator — a
+			// shell just minted here, or an existing operator just
+			// back-patched — gets its own row upserted too.
+			if err := upsertOperatorCatalogRow(o.ctx, op); err != nil {
+				return fmt.Errorf("pg_operator journal: %w", err)
+			}
+			if hasCommutator && !selfCommutator {
+				if other := im.LookupUserOperatorByOID(commutatorOID); other != nil {
+					if err := upsertOperatorCatalogRow(o.ctx, other); err != nil {
+						return fmt.Errorf("pg_operator journal (commutator): %w", err)
+					}
+				}
+			}
+			if hasNegator {
+				if other := im.LookupUserOperatorByOID(negatorOID); other != nil {
+					if err := upsertOperatorCatalogRow(o.ctx, other); err != nil {
+						return fmt.Errorf("pg_operator journal (negator): %w", err)
+					}
 				}
 			}
 		}

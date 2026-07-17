@@ -69,6 +69,8 @@ DROP CAST (int4 AS bool);
 CREATE AGGREGATE waldump_agg(int) (SFUNC = waldump_add, STYPE = int, INITCOND = '0');
 ALTER AGGREGATE waldump_agg(int) RENAME TO waldump_agg2;
 DROP AGGREGATE waldump_agg2(int);
+CREATE OPERATOR <+> (LEFTARG = int, RIGHTARG = int, FUNCTION = waldump_add, COMMUTATOR = OPERATOR(<+>));
+DROP OPERATOR <+> (int, int);
 CREATE TYPE waldump_mood AS ENUM ('a', 'b');
 ALTER TYPE waldump_mood ADD VALUE 'c';
 CREATE TYPE waldump_rng AS RANGE (subtype = int4);
