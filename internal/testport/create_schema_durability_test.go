@@ -889,3 +889,65 @@ func TestPort_EventTriggerSurvivesRestart(t *testing.T) {
 		t.Fatalf("post-restart evttags length = %q, want 2 (WHEN TAG array lost)", got)
 	}
 }
+
+// TestPort_PublicationSurvivesRestart pins B3.3's pg_publication +
+// pg_publication_rel heap journaling: CREATE PUBLICATION (both FOR ALL
+// TABLES and FOR TABLE with members), ALTER OWNER, and DROP all survive a
+// restart via the heap reload (kinds 50-52 retired; subscription 53-55
+// stays bespoke for B4).
+func TestPort_PublicationSurvivesRestart(t *testing.T) {
+	c, err := cluster.New("publication-durability", cluster.Options{
+		RepoRoot:     repoRoot(t),
+		DataDir:      filepath.Join(t.TempDir(), "data"),
+		StartupWait:  20 * time.Second,
+		ShutdownWait: 20 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+
+	stmts := []string{
+		"CREATE TABLE b33_t1 (a int)",
+		"CREATE TABLE b33_t2 (a int)",
+		"CREATE ROLE b33_owner",
+		"CREATE PUBLICATION b33_all FOR ALL TABLES",
+		"CREATE PUBLICATION b33_some FOR TABLE b33_t1, b33_t2 WITH (publish = 'insert, update')",
+		"ALTER PUBLICATION b33_some OWNER TO b33_owner",
+		"CREATE PUBLICATION b33_gone FOR ALL TABLES",
+		"DROP PUBLICATION b33_gone",
+	}
+	for _, s := range stmts {
+		if err := runSQLSimple(t, c, s); err != nil {
+			t.Fatalf("%s: %v", s, err)
+		}
+	}
+
+	if err := c.Stop(cluster.ShutdownFast); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	if err := c.Start(); err != nil {
+		t.Fatalf("restart: %v", err)
+	}
+
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_publication WHERE pubname = 'b33_all' AND puballtables"); got != "1" {
+		t.Fatalf("post-restart FOR ALL TABLES publication count = %q, want 1 (not reloaded)", got)
+	}
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_publication WHERE pubname = 'b33_some' AND NOT puballtables AND pubinsert AND pubupdate AND NOT pubdelete"); got != "1" {
+		t.Fatalf("post-restart FOR TABLE publication (publish flags) count = %q, want 1", got)
+	}
+	// The two member relations round-trip through the PubSub registry, which
+	// goopg exposes as pg_publication_tables and which the reload repopulates
+	// from the pg_publication_rel heap.
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_publication_tables WHERE pubname = 'b33_some'"); got != "2" {
+		t.Fatalf("post-restart publication member count = %q, want 2 (pub.Tables not reloaded)", got)
+	}
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_publication WHERE pubname = 'b33_gone'"); got != "0" {
+		t.Fatalf("post-restart dropped publication count = %q, want 0", got)
+	}
+}

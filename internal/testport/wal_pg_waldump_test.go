@@ -84,6 +84,11 @@ CREATE EVENT TRIGGER waldump_et ON ddl_command_start WHEN TAG IN ('CREATE TABLE'
 ALTER EVENT TRIGGER waldump_et DISABLE;
 ALTER EVENT TRIGGER waldump_et RENAME TO waldump_et2;
 DROP EVENT TRIGGER waldump_et2;
+CREATE TABLE waldump_pubt (a int);
+CREATE PUBLICATION waldump_pub FOR TABLE waldump_pubt;
+DROP PUBLICATION waldump_pub;
+CREATE PUBLICATION waldump_puball FOR ALL TABLES;
+DROP PUBLICATION waldump_puball;
 CREATE COLLATION waldump_coll (locale = 'C');
 ALTER COLLATION waldump_coll RENAME TO waldump_coll2;
 DROP COLLATION waldump_coll2;

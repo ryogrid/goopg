@@ -1994,6 +1994,18 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, fmt.Errorf("goopg: pg_event_trigger reload: %w", err)
 	}
 
+	// B3.3: publications reload from the pg_publication + pg_publication_rel
+	// HEAPS (generic scan, doc 02a §2) — replaced the publication half of
+	// replayPubSubDDLRecords' bespoke WAL scan (kinds 50-52, retired;
+	// subscription 53-55 stays bespoke for B4). Runs after the table reload
+	// above so pg_publication_rel.prrelid resolves to a qualified name.
+	if err := reloadUserPublicationsFromHeap(mgr, cat, pubsub, clog); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: pg_publication reload: %w", err)
+	}
+
 	// DU-002 restart-persistence follow-up (M0119-0004, loop #71 ledger
 	// resume point): restore CREATE/DROP/ALTER FUNCTION/PROCEDURE objects
 	// from the WAL. Like event triggers, routines are keyed by a plain

@@ -466,6 +466,24 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
     TestPort_EnumSurvivesRestart (create/add/rename/drop across restart); waldump += enum DDL.
 - [ ] **B3** extension/config (pg_ts_*, pg_transform, pg_event_trigger, pg_publication*/subscription*,
   pg_statistic_ext, pg_constraint/attrdef/depend). **IN PROGRESS.**
+  - [x] **B3.3 pg_publication + pg_publication_rel (kinds 50-52 retired)** — LANDED.
+    `sys_pg_publication.go`: 9-col FormData_pg_publication (all-scalar: name + owner OID + publish
+    bools; pubtruncate/pubviaroot journal false — goopg models neither) with a TID cache
+    (publicationHeapTIDs, for ALTER OWNER heap UPDATEs) + 5-col FormData_pg_publication_rel (one
+    row per FOR TABLE member; prrelid = the resolved pg_class OID, prqual/prattrs NULL — no row
+    filters/column lists). Indexes 6110/6111 (pub) + 6112/6113 (pub_rel) all empty placeholders →
+    lazy-root. CREATE writes the base row + member rows; DROP xmax's both (prpubid-matched);
+    ALTER OWNER = base-row UPDATE. Reload: pass 1 scans pg_publication_rel grouping prrelid→
+    qualified name (cat.LookupTableByOID) by prpubid, pass 2 scans pg_publication and hands the
+    grouped Tables to pubsub.CreatePublicationDuringRecovery — runs AFTER the table reload so
+    prrelid resolves. **SUBSCRIPTION (kinds 53-55) stays bespoke**: pg_subscription is a SHARED
+    catalog (global/) → B4; the pubsub scanner keeps only its subscription cases. Publication
+    codec-tests (wal + initdb) trimmed to subscription-only. Note: goopg serves pg_publication/
+    pg_publication_rel as REGISTRY-backed virtual views (the heaps are the standby's copy), so the
+    durability test asserts membership via pg_publication_tables; the heap write→mirror→reload
+    chain is proven by pub.Tables being repopulated post-restart. TestPort_PublicationSurvivesRestart
+    green (FOR ALL TABLES + FOR TABLE w/ 2 members + publish flags + ALTER OWNER + DROP); waldump
+    += CREATE/DROP PUBLICATION (both forms).
   - [x] **B3.2 pg_event_trigger (kinds 56-60 retired)** — LANDED. `sys_pg_event_trigger.go`:
     7-col FormData_pg_event_trigger builder (six scalars + evttags text[] — the WHEN TAG filter,
     declared `Type{Name:"text",IsArray:true}` so encode/decode are the symmetric generic array
