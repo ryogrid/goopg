@@ -2365,6 +2365,11 @@ type InMemory struct {
 	// B2.2 slice 3's upsert cache (shell fill-in / COMMUTATOR-NEGATOR
 	// back-patch = canonical heap UPDATE at the cached TID).
 	operatorHeapTIDs map[uint32]SchemaHeapTID
+	// collationHeapTIDs / conversionHeapTIDs are the pg_collation /
+	// pg_conversion twins (B2.2 slice 4) — ALTER RENAME/OWNER/SET SCHEMA
+	// journal as canonical heap UPDATEs at the cached TID.
+	collationHeapTIDs  map[uint32]SchemaHeapTID
+	conversionHeapTIDs map[uint32]SchemaHeapTID
 
 	// tempNamespaces maps a session's temp-owner token ("s<id>", see
 	// executor.sessionTempOwner) → the OID of that session's temporary
@@ -12237,6 +12242,58 @@ func (c *InMemory) DropOperatorHeapTID(oid uint32) {
 	delete(c.operatorHeapTIDs, oid)
 }
 
+// CollationHeapTID returns the live pg_collation heap TID for oid (B2.2
+// slice 4).
+func (c *InMemory) CollationHeapTID(oid uint32) (SchemaHeapTID, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	tid, ok := c.collationHeapTIDs[oid]
+	return tid, ok
+}
+
+// SetCollationHeapTID records/refreshes the live pg_collation heap TID.
+func (c *InMemory) SetCollationHeapTID(oid uint32, tid SchemaHeapTID) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.collationHeapTIDs == nil {
+		c.collationHeapTIDs = make(map[uint32]SchemaHeapTID)
+	}
+	c.collationHeapTIDs[oid] = tid
+}
+
+// DropCollationHeapTID drops the TID entry (DROP COLLATION).
+func (c *InMemory) DropCollationHeapTID(oid uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.collationHeapTIDs, oid)
+}
+
+// ConversionHeapTID returns the live pg_conversion heap TID for oid (B2.2
+// slice 4).
+func (c *InMemory) ConversionHeapTID(oid uint32) (SchemaHeapTID, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	tid, ok := c.conversionHeapTIDs[oid]
+	return tid, ok
+}
+
+// SetConversionHeapTID records/refreshes the live pg_conversion heap TID.
+func (c *InMemory) SetConversionHeapTID(oid uint32, tid SchemaHeapTID) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.conversionHeapTIDs == nil {
+		c.conversionHeapTIDs = make(map[uint32]SchemaHeapTID)
+	}
+	c.conversionHeapTIDs[oid] = tid
+}
+
+// DropConversionHeapTID drops the TID entry (DROP CONVERSION).
+func (c *InMemory) DropConversionHeapTID(oid uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.conversionHeapTIDs, oid)
+}
+
 // SetSchemaHeapTID records/refreshes the live pg_namespace heap TID for name.
 func (c *InMemory) SetSchemaHeapTID(name string, tid SchemaHeapTID) {
 	c.mu.Lock()
@@ -12573,6 +12630,25 @@ func (c *InMemory) CreateCollation(uc *UserCollation, schema string, ifNotExists
 // collations are never registered in userCollations, so a DROP COLLATION on
 // one of them always returns false (mirrors PG, which also refuses to drop a
 // pinned pg_collation row). M0119-0004.
+// FindCollation returns the registered user collation matching
+// (dbOid, schema, name), or nil — the B2.2 slice 4 emit sites look the
+// struct up after a registry mutation to journal its CURRENT state.
+func (c *InMemory) FindCollation(name, schema string, dbOid ...uint32) *UserCollation {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	oid := resolveDBOid(dbOid)
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	for _, uc := range c.userCollations {
+		if uc.DBOid == oid && uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, name) {
+			return uc
+		}
+	}
+	return nil
+}
+
 func (c *InMemory) DropCollation(name, schema string, dbOid ...uint32) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -12688,11 +12764,14 @@ func (c *InMemory) CreateCollationDuringRecovery(uc *UserCollation, schema strin
 		nsOID = c.schemas["public"]
 	}
 	uc.NamespaceOID = nsOID
-	// WAL replay does not yet carry a dbOid for collation records (see the
-	// DBOid field's doc comment) — every replayed collation lands under
-	// DefaultDBOid, matching every other not-yet-migrated write path's
-	// restart behavior.
-	uc.DBOid = DefaultDBOid
+	// B2.2 slice 4: respect a caller-set DBOid; the zero fallback is
+	// DefaultDBOid — which is ALSO what live postgres-DB sessions key on
+	// (NamespaceDBOid maps PostgresDBOid→DefaultDBOid for namespace-scoped
+	// registries), so the heap reload leaves DBOid unset. Cross-database
+	// collations remain non-dbOid-aware (pre-existing ledger row).
+	if uc.DBOid == 0 {
+		uc.DBOid = DefaultDBOid
+	}
 	for i, existing := range c.userCollations {
 		if existing.OID == uc.OID {
 			c.userCollations[i] = uc
@@ -12778,6 +12857,24 @@ func (c *InMemory) CreateConversion(uc *UserConversion, schema string, dbOid ...
 // `schema` resolves like CreateConversion (unknown → public). dbOid is variadic,
 // defaulting to DefaultDBOid, mirroring DropCollation. DU-002 slice 399; dbOid
 // scoping: M0122-0007 4e follow-up.
+// FindConversion returns the registered user conversion matching
+// (dbOid, schema, name), or nil (FindCollation's twin).
+func (c *InMemory) FindConversion(name, schema string, dbOid ...uint32) *UserConversion {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	oid := resolveDBOid(dbOid)
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	for _, uc := range c.userConversions {
+		if uc.DBOid == oid && uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, name) {
+			return uc
+		}
+	}
+	return nil
+}
+
 func (c *InMemory) DropConversion(name, schema string, dbOid ...uint32) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -12811,11 +12908,12 @@ func (c *InMemory) CreateConversionDuringRecovery(uc *UserConversion, schema str
 		nsOID = c.schemas["public"]
 	}
 	uc.NamespaceOID = nsOID
-	// WAL replay does not yet carry a dbOid for conversion records (see the
-	// DBOid field's doc comment) — every replayed conversion lands under
-	// DefaultDBOid, matching every other not-yet-migrated write path's
-	// restart behavior (mirrors CreateCollationDuringRecovery).
-	uc.DBOid = DefaultDBOid
+	// B2.2 slice 4: respect a caller-set DBOid; zero falls back to
+	// DefaultDBOid — what live postgres-DB sessions key on (see
+	// CreateCollationDuringRecovery).
+	if uc.DBOid == 0 {
+		uc.DBOid = DefaultDBOid
+	}
 	for i, existing := range c.userConversions {
 		if existing.OID == uc.OID {
 			c.userConversions[i] = uc

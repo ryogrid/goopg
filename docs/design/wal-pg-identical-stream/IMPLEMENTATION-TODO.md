@@ -303,14 +303,34 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
      aggregate_ddl_recovery.go dead);
   3. **pg_operator** — DONE (B2.2c entry below; kinds 83/84 retired, scanner
      operator_ddl_recovery.go dead);
-  4. **pg_collation** (kinds 42-45/93) + **pg_conversion** (kinds 40/41/130-132) — BOTH registries'
-     *DuringRecovery still FORCE DefaultDBOid (catalog.go:12653/:12776 — the domain/range/enum bug
-     class, fix like RegisterDomainDuringRecovery); indexes populated (3085/3164, 2668-2670);
+  4. **pg_collation + pg_conversion** — DONE (B2.2d entry below; kinds 40-45/93/130-132 retired,
+     scanners collation_ddl_recovery.go + conversion_ddl_recovery.go dead);
   5. **opclass/opfamily/amop/amproc** (kinds 85-92; 9 emit sites; opfamily/opclass recovery already
      DBOid-guarded; indexes: 2686/2653/2654 are EMPTY placeholders → lazy-root handles).
   Remaining rmid-128 kinds AFTER B2.2: text-search 104-116, statistics 95-99 (wal/statistics_ddl.go),
   access-method 70/71, transform 36/37, event-trigger 56-60, pub/sub 50-55, foreign-data 126-129,
   role/db-config/tablespace/matview/view/index-rename 67-80/94/102-103/124-125 (B3/B4 scope).
+  - [x] **B2.2d pg_collation + pg_conversion (kinds 40-45/93/130-132 retired)** — LANDED.
+    `sys_pg_collation.go` (12-col FormData builder; empty registry strings → NULL; collversion
+    always NULL) + `sys_pg_conversion.go` (8-col; conproc = FuncOID); upsert/TID-cache shape from
+    B2.2c (collationHeapTIDs/conversionHeapTIDs on InMemory) — CREATE = INSERT, ALTER
+    RENAME/OWNER/SET SCHEMA = canonical heap UPDATEs, DROP = xmax with MaterializeWriterXID.
+    Indexes: 3085 {16,1} + 3164 {80,3 name+int4+oid, SIGNED int4 compare — collencoding=-1 sorts
+    first, executor twin of pgBuildIndexTupleNameInt4OidKey} populated; 2670 {16,1} populated;
+    2669 {80,2} + 2668 {24,4 oid+int4+int4+oid} empty placeholders (lazy-root). Reload fully
+    physical; conversion ProcSchema/ProcName fallback re-derived from conproc via routines
+    registry / curated builtins. **DBOid discovery (inverts the survey's assumption):**
+    collation/conversion registries key live postgres-DB sessions under DefaultDBOid
+    (NamespaceDBOid maps 5→1 for namespace-scoped registries) — registering the reload under
+    cat.DBOID()=5 made every post-restart lookup MISS (empirically). The *DuringRecovery methods
+    now respect a caller-set DBOid with the DefaultDBOid zero-fallback; the reload leaves DBOid
+    unset. This differs from domains/enums (which DO key on the resolved session DB) — check
+    NamespaceDBOid per registry before assuming the B2.1b bug class. BONUS FIX: ALTER CONVERSION
+    RENAME left the compat-registry entry under the ORIGINAL name, so rename→drop failed 42704
+    (DROP CONVERSION's existence gate is DropCompatObject) — the rename now moves the entry.
+    Scanners + wal collation/conversion test files deleted; 10 kinds + 20 codec funcs + 2
+    dispatch cases excised (764-line pure deletion). TestPort_CollationSurvivesRestart +
+    TestPort_ConversionSurvivesRestart green; waldump workload += COLLATION/CONVERSION DDL.
   - [x] **B2.2c pg_operator (kinds 83/84 retired)** — LANDED. `sys_pg_operator.go`: 15-col
     FormData_pg_operator builder (oprresult resolved from oprcode via routines registry /
     curated-builtin reversal, 0 for shells); `upsertOperatorCatalogRow` maps PG's two-pass

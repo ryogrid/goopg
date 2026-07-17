@@ -990,3 +990,131 @@ func reloadTypeNameForOID(cat *catalog.InMemory, oid uint32) string {
 	}
 	return ""
 }
+
+// reloadUserCollationsFromHeap is B2.2 slice 4's collation reload — the
+// generic heap-scan replacement for the retired replayCollationDDLRecords
+// scanner (RecordKinds 42-45/93). Fully physical: FormData_pg_collation maps
+// 1:1 onto UserCollation (NULL text columns ↔ "" registry fields). Each
+// collation registers under DefaultDBOid — NamespaceDBOid maps postgres-DB
+// sessions to DefaultDBOid for namespace-scoped registries, so that IS what
+// live lookups key on (unlike the domain/enum registries, which key on the
+// resolved session DB; verified empirically — registering under cat.DBOID()
+// made every post-restart lookup miss). Cross-database collations remain
+// non-dbOid-aware (pre-existing ledger row).
+func reloadUserCollationsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+	collCols := executor.PGCollationColumnsPG18()
+	type collRow struct {
+		uc  catalog.UserCollation
+		tid storage.ItemPointer
+	}
+	rel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 3456, Fork: storage.MainFork}
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_collation",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			decoded := make(executor.Row, len(collCols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, collCols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			if uint32(decoded[0].Int) < catalog.FirstUserOID {
+				return nil, false, errSkipBuiltinRow
+			}
+			provider := byte('c')
+			if p := decoded[4].StringValue(); p != "" {
+				provider = p[0]
+			}
+			return collRow{
+				uc: catalog.UserCollation{
+					OID:           uint32(decoded[0].Int),
+					Name:          decoded[1].StringValue(),
+					NamespaceOID:  uint32(decoded[2].Int),
+					Owner:         uint32(decoded[3].Int),
+					Provider:      provider,
+					Deterministic: decoded[5].BoolValue(),
+					Encoding:      int(int32(decoded[6].Int)),
+					Collate:       decoded[7].StringValue(),
+					Ctype:         decoded[8].StringValue(),
+					Locale:        decoded[9].StringValue(),
+					Rules:         decoded[10].StringValue(),
+				},
+				tid: tid,
+			}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+	for _, raw := range rows {
+		cr := raw.(collRow)
+		schema := cat.SchemaNameForOID(cr.uc.NamespaceOID)
+		if schema == "" {
+			schema = "public"
+		}
+		cat.CreateCollationDuringRecovery(&cr.uc, schema)
+		cat.SetCollationHeapTID(cr.uc.OID, catalog.SchemaHeapTID{Block: uint32(cr.tid.Block), Offset: cr.tid.Offset})
+	}
+	return nil
+}
+
+// reloadUserConversionsFromHeap is the pg_conversion twin (RecordKinds
+// 40/41/130-132 retired). conproc stays an OID in the registry; the
+// dump-facing ProcSchema/ProcName fallback re-derives from it via the
+// routines registry (user funcs) or the curated builtin set — "" when
+// neither resolves (the virtual view then renders from FuncOID, which is
+// the authoritative source anyway).
+func reloadUserConversionsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+	convCols := executor.PGConversionColumnsPG18()
+	type convRow struct {
+		uc  catalog.UserConversion
+		tid storage.ItemPointer
+	}
+	rel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 2607, Fork: storage.MainFork}
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_conversion",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			decoded := make(executor.Row, len(convCols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, convCols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			if uint32(decoded[0].Int) < catalog.FirstUserOID {
+				return nil, false, errSkipBuiltinRow
+			}
+			return convRow{
+				uc: catalog.UserConversion{
+					OID:          uint32(decoded[0].Int),
+					Name:         decoded[1].StringValue(),
+					NamespaceOID: uint32(decoded[2].Int),
+					Owner:        uint32(decoded[3].Int),
+					ForEncoding:  int32(decoded[4].Int),
+					ToEncoding:   int32(decoded[5].Int),
+					FuncOID:      uint32(decoded[6].Int),
+					Default:      decoded[7].BoolValue(),
+				},
+				tid: tid,
+			}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+	rs := cat.Routines()
+	for _, raw := range rows {
+		cr := raw.(convRow)
+		if cr.uc.FuncOID != 0 {
+			if rs != nil {
+				if r := rs.LookupByOID(cr.uc.FuncOID); r != nil {
+					cr.uc.ProcSchema, cr.uc.ProcName = r.Schema, r.Name
+				}
+			}
+			if cr.uc.ProcName == "" {
+				if bp, ok := catalog.LookupBuiltinProcByOID(cr.uc.FuncOID); ok {
+					cr.uc.ProcSchema, cr.uc.ProcName = "pg_catalog", bp.Name
+				}
+			}
+		}
+		schema := cat.SchemaNameForOID(cr.uc.NamespaceOID)
+		if schema == "" {
+			schema = "public"
+		}
+		cat.CreateConversionDuringRecovery(&cr.uc, schema)
+		cat.SetConversionHeapTID(cr.uc.OID, catalog.SchemaHeapTID{Block: uint32(cr.tid.Block), Offset: cr.tid.Offset})
+	}
+	return nil
+}

@@ -592,3 +592,101 @@ func TestPort_OperatorSurvivesRestart(t *testing.T) {
 		t.Fatalf("post-restart oprcode join count = %q, want 1 (function link lost)", got)
 	}
 }
+
+// TestPort_CollationSurvivesRestart pins B2.2 slice 4's pg_collation heap
+// journaling: CREATE COLLATION reloads from its pg_collation row (kinds
+// 42-45/93 retired), ALTER ... RENAME/OWNER survive as heap UPDATEs, and a
+// dropped collation stays dropped.
+func TestPort_CollationSurvivesRestart(t *testing.T) {
+	c, err := cluster.New("collation-durability", cluster.Options{
+		RepoRoot:     repoRoot(t),
+		DataDir:      filepath.Join(t.TempDir(), "data"),
+		StartupWait:  20 * time.Second,
+		ShutdownWait: 20 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+
+	stmts := []string{
+		"CREATE COLLATION b22d_coll (provider = icu, locale = 'de-u-co-phonebk', deterministic = false)",
+		"ALTER COLLATION b22d_coll RENAME TO b22d_coll2",
+		"CREATE ROLE b22d_owner",
+		"ALTER COLLATION b22d_coll2 OWNER TO b22d_owner",
+		"CREATE COLLATION b22d_gone (locale = 'C')",
+		"DROP COLLATION b22d_gone",
+	}
+	for _, s := range stmts {
+		if err := runSQLSimple(t, c, s); err != nil {
+			t.Fatalf("%s: %v", s, err)
+		}
+	}
+
+	if err := c.Stop(cluster.ShutdownFast); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	if err := c.Start(); err != nil {
+		t.Fatalf("restart: %v", err)
+	}
+
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_collation WHERE collname = 'b22d_coll2' AND collprovider = 'i' AND NOT collisdeterministic AND oid >= 16384"); got != "1" {
+		t.Fatalf("post-restart renamed collation count = %q, want 1 (collation not reloaded)", got)
+	}
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_collation WHERE collname IN ('b22d_coll', 'b22d_gone') AND oid >= 16384"); got != "0" {
+		t.Fatalf("post-restart stale collation names count = %q, want 0", got)
+	}
+	if got := queryScalar(t, c,
+		"SELECT colllocale FROM pg_collation WHERE collname = 'b22d_coll2'"); got != "de-u-co-phonebk" {
+		t.Fatalf("post-restart colllocale = %q, want de-u-co-phonebk", got)
+	}
+}
+
+// TestPort_ConversionSurvivesRestart pins B2.2 slice 4's pg_conversion heap
+// journaling (kinds 40/41/130-132 retired): CREATE [DEFAULT] CONVERSION
+// reloads from its pg_conversion row with the conproc link intact, ALTER
+// RENAME survives as a heap UPDATE, and a dropped conversion stays dropped.
+func TestPort_ConversionSurvivesRestart(t *testing.T) {
+	c, err := cluster.New("conversion-durability", cluster.Options{
+		RepoRoot:     repoRoot(t),
+		DataDir:      filepath.Join(t.TempDir(), "data"),
+		StartupWait:  20 * time.Second,
+		ShutdownWait: 20 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+
+	stmts := []string{
+		"CREATE CONVERSION b22d_conv FOR 'LATIN1' TO 'UTF8' FROM iso8859_1_to_utf8",
+		"ALTER CONVERSION b22d_conv RENAME TO b22d_conv2",
+		"CREATE CONVERSION b22d_gone FOR 'LATIN1' TO 'UTF8' FROM iso8859_1_to_utf8",
+		"DROP CONVERSION b22d_gone",
+	}
+	for _, s := range stmts {
+		if err := runSQLSimple(t, c, s); err != nil {
+			t.Fatalf("%s: %v", s, err)
+		}
+	}
+
+	if err := c.Stop(cluster.ShutdownFast); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	if err := c.Start(); err != nil {
+		t.Fatalf("restart: %v", err)
+	}
+
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_conversion WHERE conname = 'b22d_conv2' AND oid >= 16384"); got != "1" {
+		t.Fatalf("post-restart renamed conversion count = %q, want 1 (conversion not reloaded)", got)
+	}
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_conversion WHERE conname IN ('b22d_conv', 'b22d_gone') AND oid >= 16384"); got != "0" {
+		t.Fatalf("post-restart stale conversion names count = %q, want 0", got)
+	}
+}
