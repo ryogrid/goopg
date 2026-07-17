@@ -18143,6 +18143,21 @@ func (c *InMemory) ListUserOperatorFamilies() []*UserOperatorFamily {
 // its identity (schema, name, method). Used by CREATE OPERATOR CLASS to
 // resolve an explicit `FAMILY family_name` clause. The trailing variadic
 // dbOid mirrors RegisterUserOperatorFamily. DU-002 (M0119-0004).
+// LookupUserOperatorFamilyByOID returns the registered family with this OID,
+// or nil. B2.2 slice 5: the pg_amproc reload re-derives AmProcMember.Method
+// (a goopg-only field — pg_amproc has no amprocmethod column) from the
+// member's owning family.
+func (c *InMemory) LookupUserOperatorFamilyByOID(oid uint32) *UserOperatorFamily {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, f := range c.userOperatorFamilies {
+		if f.OID == oid {
+			return f
+		}
+	}
+	return nil
+}
+
 func (c *InMemory) LookupUserOperatorFamily(schema, name string, method uint32, dbOid ...uint32) (*UserOperatorFamily, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
