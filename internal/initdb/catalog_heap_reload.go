@@ -232,6 +232,13 @@ func reloadUserRoutinesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clo
 			if derr != nil {
 				return nil, false, derr
 			}
+			// B2.2 slice 2: prokind='a' rows are aggregates — they belong to
+			// the userAggregates registry (reloadUserAggregatesFromHeap),
+			// not Routines; registering one here would shadow the aggregate
+			// in function resolution.
+			if r.KindChar == "a" {
+				return nil, false, errSkipBuiltinRow
+			}
 			return procRow{r: r, tid: tid}, false, nil
 		})
 	if err != nil {
@@ -843,6 +850,61 @@ func reloadUserCastsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *
 			continue // endpoint type gone (dropped) — dead cast
 		}
 		cat.RegisterCastDuringRecovery(src, tgt, cr.context, cr.method, cr.oid, cr.funcOID)
+	}
+	return nil
+}
+
+// reloadUserAggregatesFromHeap is B2.2 slice 2's aggregate reload — the
+// generic heap-scan replacement for the retired replayAggregateDDLRecords
+// scanner (RecordKinds 46-49). Aggregates journal as prokind='a' pg_proc
+// rows whose proargdefaults JSON meta carries the full UserAggregate
+// definition (Routine.Aggregate — the physical pg_aggregate columns store
+// proc OIDs, which are 0 for builtin transition functions outside the
+// hand-curated BuiltinProc set, so an OID reversal would be lossy exactly
+// where it matters). The pg_aggregate row's own liveness needs no separate
+// check: DROP AGGREGATE stamps xmax on BOTH rows in the same transaction.
+// Must run after reloadUserRoutinesFromHeap (which skips prokind='a' rows)
+// and after the schema reload (RegisterUserAggregateDuringRecovery resolves
+// NamespaceOID by schema name).
+func reloadUserAggregatesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+	rs := cat.Routines()
+	if rs == nil {
+		return nil
+	}
+	type aggRow struct {
+		r   *catalog.Routine
+		tid storage.ItemPointer
+	}
+	rel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 1255, Fork: storage.MainFork}
+	cols := executor.PGProcColumnsPG18()
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_proc(aggregates)",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			decoded := make(executor.Row, len(cols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, cols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			if uint32(decoded[0].Int) < catalog.FirstUserOID {
+				return nil, false, errSkipBuiltinRow
+			}
+			r, derr := executor.DecodePGProcArgMeta(decoded[23].StringValue(), decoded[25].StringValue())
+			if derr != nil {
+				return nil, false, derr
+			}
+			if r.KindChar != "a" || r.Aggregate == nil {
+				return nil, false, errSkipBuiltinRow
+			}
+			return aggRow{r: r, tid: tid}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+	for _, raw := range rows {
+		ar := raw.(aggRow)
+		cat.RegisterUserAggregateDuringRecovery(ar.r.Aggregate, ar.r.Schema)
+		// Seed the routine funnel's TID cache so a post-restart ALTER
+		// AGGREGATE RENAME/OWNER updates the pg_proc row in place.
+		rs.SetHeapTID(ar.r.OID, catalog.SchemaHeapTID{Block: uint32(ar.tid.Block), Offset: ar.tid.Offset})
 	}
 	return nil
 }

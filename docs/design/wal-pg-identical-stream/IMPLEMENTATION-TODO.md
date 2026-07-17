@@ -299,9 +299,8 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
   plan (survey 2026-07-17)**, one catalog per landing on the B2.1 template (heap rows + index entries
   via descent machinery + physical reload + kind retirement + e2e probe where PG-side read exists):
   1. **pg_cast** — DONE (B2.2a entry below; kinds 38/39 retired, scanner cast_ddl_recovery.go dead);
-  2. **pg_aggregate** (kinds 46-49; partial write-only sync EXISTS (syncAggregateToCatalogHeap,
-     1 call site, NO index 2650 maintenance, NO reload) — complete it; ArgTypes need the pg_proc
-     join or JSON; scanner aggregate_ddl_recovery.go);
+  2. **pg_aggregate** — DONE (B2.2b entry below; kinds 46-49 retired, scanner
+     aggregate_ddl_recovery.go dead);
   3. **pg_operator** (kinds 83/84; 7 emit sites incl. two-pass commutator/negator shells; all-scalar
      pg_operator row; indexes 2688/2689 populated; scanner operator_ddl_recovery.go);
   4. **pg_collation** (kinds 42-45/93) + **pg_conversion** (kinds 40/41/130-132) — BOTH registries'
@@ -312,6 +311,21 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
   Remaining rmid-128 kinds AFTER B2.2: text-search 104-116, statistics 95-99 (wal/statistics_ddl.go),
   access-method 70/71, transform 36/37, event-trigger 56-60, pub/sub 50-55, foreign-data 126-129,
   role/db-config/tablespace/matview/view/index-rename 67-80/94/102-103/124-125 (B3/B4 scope).
+  - [x] **B2.2b pg_aggregate (kinds 46-49 retired)** — LANDED. `sys_pg_aggregate.go`: CREATE
+    AGGREGATE journals a synthesized prokind='a' pg_proc row through the B1.2 routine funnel
+    (heap + 2690/2691 + TID cache; field choices copied from the virtual pg_proc view: prolang=
+    internal/cost 1, prosrc=aggregate_dummy, provolatile='i', proisstrict=f, prorettype=finalfn's
+    rettype else stype) PLUS the pg_aggregate row (pre-existing DU-002 405 builder) now with
+    pg_aggregate_fnoid_index (2650) maintenance + mirrors. ALTER RENAME/OWNER = pg_proc heap
+    UPDATE via the funnel; DROP stamps xmax on BOTH rows. Reload = prokind='a' pg_proc scan;
+    the full UserAggregate rides Routine.Aggregate in the proargdefaults JSON meta (B1.2's
+    established channel) because the physical pg_aggregate columns store proc OIDs that are 0
+    for builtin transition functions outside the hand-curated BuiltinProc set — an OID→name
+    reversal would be lossy exactly where it matters (ledger residual). Routine reload now
+    SKIPS prokind='a' rows (they'd shadow the aggregate in function resolution). Scanner
+    aggregate_ddl_recovery.go(+test) + wal/aggregate_ddl_test.go deleted; kinds 46-49 + codecs
+    + dispatch case excised. TestPort_AggregateSurvivesRestart (rename + drop + post-restart
+    EXECUTION = 6) green; waldump workload += CREATE/ALTER/DROP AGGREGATE.
   - [x] **B2.2a pg_cast (kinds 38/39 retired)** — LANDED. `sys_pg_cast.go`: 6-col PG18 row builder
     (`buildPGCastRow`, SourceType/TargetType names→OIDs via `TypeNameToOID`), heap INSERT +
     2660 (oid, 16B) + 2661 (src+tgt, 16B `buildIndexTupleOidOidKey`) via the descent machinery,
