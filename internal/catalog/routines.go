@@ -56,6 +56,14 @@ type Routine struct {
 	BeginAtomic     bool   // PG14 BEGIN ATOMIC ... END body (no AS keyword)
 	IsReturnForm    bool   // PG14 RETURN expr body (stored as "SELECT expr" internally)
 	KindChar        string // prokind: 'f'=function, 'p'=procedure, 'w'=window, 'a'=aggregate
+	// Aggregate carries the full UserAggregate definition on the
+	// synthesized prokind='a' pg_proc row (B2.2 slice 2). It rides the
+	// proargdefaults JSON meta only (never the registry — aggregates live
+	// in userAggregates): the physical pg_aggregate columns store proc
+	// OIDs, which are 0 for builtin transition functions outside the
+	// hand-curated BuiltinProc set, so the startup reload rebuilds the
+	// registry from these names instead of a lossy OID reversal.
+	Aggregate *UserAggregate `json:",omitempty"`
 	// Owner is pg_proc.proowner (role OID), settable via ALTER FUNCTION/
 	// PROCEDURE/ROUTINE ... OWNER TO. 0 means "unset, defaults to the
 	// bootstrap superuser" — see OwnerOrDefault. M0097-0150.

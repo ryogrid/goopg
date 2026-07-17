@@ -473,3 +473,61 @@ func TestPort_CastSurvivesRestart(t *testing.T) {
 		t.Fatalf("post-restart dropped cast count = %q, want 0", got)
 	}
 }
+
+// TestPort_AggregateSurvivesRestart pins B2.2 slice 2's pg_aggregate/pg_proc
+// heap journaling: CREATE AGGREGATE reloads from its prokind='a' pg_proc row
+// (kinds 46-49 retired), an ALTER ... RENAME survives as a pg_proc heap
+// UPDATE, a dropped aggregate stays dropped, and the reloaded aggregate is
+// EXECUTABLE (transfn name fidelity through the JSON meta).
+func TestPort_AggregateSurvivesRestart(t *testing.T) {
+	c, err := cluster.New("aggregate-durability", cluster.Options{
+		RepoRoot:     repoRoot(t),
+		DataDir:      filepath.Join(t.TempDir(), "data"),
+		StartupWait:  20 * time.Second,
+		ShutdownWait: 20 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+
+	stmts := []string{
+		"CREATE FUNCTION b22b_acc(int, int) RETURNS int LANGUAGE sql AS 'SELECT $1 + $2'",
+		"CREATE FUNCTION b22b_fin(int) RETURNS text LANGUAGE sql AS 'SELECT $1::text'",
+		"CREATE AGGREGATE b22b_sum(int) (SFUNC = b22b_acc, STYPE = int, INITCOND = '0', FINALFUNC = b22b_fin)",
+		"CREATE AGGREGATE b22b_gone(int) (SFUNC = b22b_acc, STYPE = int)",
+		"DROP AGGREGATE b22b_gone(int)",
+		"ALTER AGGREGATE b22b_sum(int) RENAME TO b22b_total",
+		"CREATE TABLE b22b_t (v int)",
+		"INSERT INTO b22b_t VALUES (1), (2), (3)",
+	}
+	for _, s := range stmts {
+		if err := runSQLSimple(t, c, s); err != nil {
+			t.Fatalf("%s: %v", s, err)
+		}
+	}
+
+	if err := c.Stop(cluster.ShutdownFast); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	if err := c.Start(); err != nil {
+		t.Fatalf("restart: %v", err)
+	}
+
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_proc WHERE proname = 'b22b_total' AND prokind = 'a'"); got != "1" {
+		t.Fatalf("post-restart renamed aggregate pg_proc count = %q, want 1", got)
+	}
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_proc WHERE proname IN ('b22b_sum', 'b22b_gone') AND prokind = 'a'"); got != "0" {
+		t.Fatalf("post-restart stale aggregate names count = %q, want 0", got)
+	}
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_aggregate a JOIN pg_proc p ON p.oid = a.aggfnoid WHERE p.proname = 'b22b_total'"); got != "1" {
+		t.Fatalf("post-restart pg_aggregate join count = %q, want 1", got)
+	}
+	if got := queryScalar(t, c, "SELECT b22b_total(v) FROM b22b_t"); got != "6" {
+		t.Fatalf("post-restart aggregate execution = %q, want 6 (transfn/initcond/finalfunc lost?)", got)
+	}
+}

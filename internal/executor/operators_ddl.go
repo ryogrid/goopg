@@ -12777,26 +12777,6 @@ func deleteCatalogRowsForOID(ctx *Context, dbOid uint32, relOID uint32, xmax sto
 // `SELECT 1 FROM pg_type WHERE oid = enumtypid` return the expected rows.
 // Mirrors to DBOid=5 (postgres db) so the seqScan (which reads from the
 // session's DBOID) finds the row. M0097-0022 (enum → pg_type parity).
-// syncAggregateToCatalogHeap writes the pg_aggregate row for a CREATE
-// AGGREGATE (OID 2600), keyed by aggfnoid = agg.OID (the aggregate's own
-// pg_proc identity). pg_proc itself is a Virtual view (registerPgProcView
-// enumerates cat.ListUserAggregates() directly; no heap write needed there —
-// see internal/initdb/pg_proc_view.go). DU-002 slice 405.
-func syncAggregateToCatalogHeap(ctx *Context, agg *catalog.UserAggregate) {
-	if !catalogHeapSyncAvailable(ctx) {
-		return
-	}
-	aggRel := storage.RelFileNode{
-		DBOid:  catalog.DefaultDBOid,
-		RelOid: catalog.AggregateRelationId,
-		Fork:   storage.MainFork,
-	}
-	if _, err := writeHeapRowCanonical(ctx, aggRel, pgAggregateColumnsPG18(), buildUserPGAggregateRow(ctx, agg)); err != nil {
-		return
-	}
-	_ = mirrorCatalogRelToPostgresDB(ctx, catalog.AggregateRelationId)
-}
-
 func syncEnumTypeToCatalogHeap(ctx *Context, et *catalog.EnumType) {
 	if !catalogHeapSyncAvailable(ctx) {
 		return
@@ -15162,11 +15142,16 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 		// only, like RenameUserAggregate/LookupUserAggregateByName), so a
 		// name match drops regardless of the DROP statement's ArgTypes.
 		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+			// B2.2 slice 2: capture the OID before the registry drop, then
+			// stamp xmax on the pg_proc + pg_aggregate rows (kind 48
+			// retired).
+			var aggOID uint32
+			if agg, found := im.LookupUserAggregateByName(aggName.Name); found {
+				aggOID = agg.OID
+			}
 			if im.DropUserAggregate(aggName.Name) {
-				if o.ctx.WAL != nil {
-					if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropAggregate(aggName.Name)); werr != nil {
-						return fmt.Errorf("wal drop-aggregate: %w", werr)
-					}
+				if aggOID != 0 {
+					deleteAggregateCatalogRows(o.ctx, aggOID)
 				}
 				return nil
 			}
@@ -18139,17 +18124,12 @@ func (o *ddlOp) execCreateAggregate(s *parser.CreateAggregateStmt) error {
 	}
 	agg.NamespaceOID = nsOID
 	o.ctx.Catalog.RegisterUserAggregate(agg)
-	syncAggregateToCatalogHeap(o.ctx, agg)
-	// DU-002 restart-persistence follow-up (M0119-0004, slice 405 ledger
-	// resume point (c)): goopg has no per-aggregate on-disk file namespace,
-	// so record a WAL event the recovery driver
-	// (internal/initdb/aggregate_ddl_recovery.go) replays into the
-	// user-aggregate registry on the next startup. Mirrors CREATE
-	// CAST/TRANSFORM/CONVERSION/COLLATION.
-	if o.ctx.WAL != nil {
-		if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateAggregate(agg.Name, schema, agg.SType, agg.SFunc, agg.FinalFunc, agg.CombineFunc, agg.InitCond, agg.FinalFuncModify, agg.ArgTypes, agg.OID, agg.SFuncStrict, agg.Variadic)); werr != nil {
-			return fmt.Errorf("wal create-aggregate: %w", werr)
-		}
+	// B2.2 slice 2 (doc 02d §1): the aggregate journals PG-style — a
+	// prokind='a' pg_proc row (routine funnel: heap + 2690/2691) plus the
+	// pg_aggregate row with its 2650 entry; the startup reload joins both
+	// heaps (kind 46 retired, aggregate_ddl_recovery.go deleted).
+	if err := writeAggregateCatalogRows(o.ctx, agg, schema); err != nil {
+		return fmt.Errorf("pg_aggregate journal: %w", err)
 	}
 	return nil
 }
@@ -18166,13 +18146,10 @@ func (o *ddlOp) execAlterAggregateRename(s *parser.AlterAggregateRenameStmt) err
 		return &ExecError{Code: "42883", Pos: s.Pos(),
 			Message: fmt.Sprintf("aggregate %s does not exist", oldName)}
 	}
-	// DU-002 restart-persistence follow-up (M0119-0004, slice 405 ledger
-	// resume point (c)): mirrors execCreateAggregate's WAL emission so the
-	// rename survives a restart.
-	if o.ctx.WAL != nil {
-		if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterAggregateRename(oldName, newName)); werr != nil {
-			return fmt.Errorf("wal alter-aggregate-rename: %w", werr)
-		}
+	// B2.2 slice 2: the rename is a canonical pg_proc heap UPDATE of the
+	// aggregate's prokind='a' row (kind 47 retired).
+	if agg, ok := im.LookupUserAggregateByName(newName); ok {
+		updateAggregateProcRow(o.ctx, agg)
 	}
 	return nil
 }
@@ -18199,13 +18176,10 @@ func (o *ddlOp) execAlterAggregateOwner(s *parser.AlterAggregateOwnerStmt) error
 		return &ExecError{Code: "42883", Pos: s.Pos(),
 			Message: fmt.Sprintf("aggregate %s does not exist", name)}
 	}
-	// DU-002 restart-persistence follow-up (M0119-0004): mirrors
-	// execAlterAggregateRename's WAL emission so the ownership change
-	// survives a restart.
-	if o.ctx.WAL != nil {
-		if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterAggregateOwner(name, ownerOID)); werr != nil {
-			return fmt.Errorf("wal alter-aggregate-owner: %w", werr)
-		}
+	// B2.2 slice 2: the owner change is a canonical pg_proc heap UPDATE of
+	// the aggregate's prokind='a' row (kind 49 retired).
+	if agg, ok := im.LookupUserAggregateByName(name); ok {
+		updateAggregateProcRow(o.ctx, agg)
 	}
 	return nil
 }

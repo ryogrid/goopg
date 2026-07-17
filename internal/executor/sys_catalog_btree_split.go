@@ -102,6 +102,10 @@ func keyMetaForSysBtree(indexOID uint32) (btreeIndexKeyMeta, bool) {
 		return btreeIndexKeyMeta{tupleSize: 16, nkeyatts: 1}, true
 	case pgCastSourceTargetIndexOID:
 		return btreeIndexKeyMeta{tupleSize: 16, nkeyatts: 2}, true
+	// B2.2 slice 2: pg_aggregate_fnoid_index — bootstrap-populated leaf-root
+	// (161 BKI rows).
+	case pgAggregateFnoidIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 16, nkeyatts: 1}, true
 	default:
 		return btreeIndexKeyMeta{}, false
 	}
