@@ -77,6 +77,8 @@ CREATE OPERATOR CLASS public.waldump_class FOR TYPE int4 USING btree FAMILY publ
 ALTER OPERATOR FAMILY public.waldump_fam USING btree ADD OPERATOR 3 ~=~ (int4, int4);
 ALTER OPERATOR FAMILY public.waldump_fam USING btree DROP OPERATOR 3 (int4, int4);
 DROP OPERATOR CLASS public.waldump_class USING btree;
+CREATE TRANSFORM FOR int LANGUAGE sql (FROM SQL WITH FUNCTION prsd_lextype(internal), TO SQL WITH FUNCTION int4recv(internal));
+DROP TRANSFORM FOR int LANGUAGE sql;
 CREATE COLLATION waldump_coll (locale = 'C');
 ALTER COLLATION waldump_coll RENAME TO waldump_coll2;
 DROP COLLATION waldump_coll2;

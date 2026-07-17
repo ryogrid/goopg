@@ -17635,6 +17635,18 @@ func (c *InMemory) TransformExists(typeName, lang string) bool {
 
 // DropTransform removes a user-defined transform from the registry. Returns
 // true if one was found and removed. DU-002 (M0119-0004).
+// LookupTransform returns the registered transform for (type, lang), or
+// nil. B3.1: the DROP TRANSFORM emit site captures the OID before the
+// registry drop so it can stamp the pg_transform heap row.
+func (c *InMemory) LookupTransform(typeName, lang string) *Transform {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.transforms == nil {
+		return nil
+	}
+	return c.transforms[strings.ToLower(typeName)+"\x00"+strings.ToLower(lang)]
+}
+
 func (c *InMemory) DropTransform(typeName, lang string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()

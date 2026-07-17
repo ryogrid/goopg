@@ -14885,13 +14885,17 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 	// language Y does not exist". DU-002 (M0119-0004).
 	if objType == "transform" {
 		im, ok := o.ctx.Catalog.(*catalog.InMemory)
+		var transformOID uint32
+		if ok {
+			if tf := im.LookupTransform(s.TransformType, s.TransformLang); tf != nil {
+				transformOID = tf.OID
+			}
+		}
 		if ok && im.DropTransform(s.TransformType, s.TransformLang) {
-			// DU-002 (M0119-0004) restart persistence: mirror the DROP
-			// SCHEMA WAL emission so the drop survives a restart too.
-			if o.ctx.WAL != nil {
-				if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropTransform(s.TransformType, s.TransformLang)); werr != nil {
-					return fmt.Errorf("wal drop-transform: %w", werr)
-				}
+			// B3.1: stamp xmax on the transform's pg_transform heap row
+			// (kind 37 retired).
+			if transformOID != 0 {
+				deleteTransformCatalogRow(o.ctx, transformOID)
 			}
 			return nil
 		}
@@ -16665,15 +16669,11 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 			toFuncOID = oid
 		}
 		tf := im.RegisterTransform(s.TransformType, s.TransformLang, fromFuncOID, toFuncOID)
-		// DU-002 (M0119-0004) restart persistence: goopg has no per-transform
-		// on-disk file namespace, so record a WAL event the recovery driver
-		// (internal/initdb/transform_ddl_recovery.go) replays into the
-		// transform registry on the next startup. Mirrors CREATE SCHEMA
-		// (M0110-0003).
-		if o.ctx.WAL != nil {
-			if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateTransform(tf.TypeName, tf.Lang, tf.OID, tf.FromFuncOID, tf.ToFuncOID)); werr != nil {
-				return fmt.Errorf("wal create-transform: %w", werr)
-			}
+		// B3.1 (doc 02d §2): the transform journals as a real pg_transform
+		// heap row + 3574/3575 entries (kind 36 retired); the startup
+		// reload reconstructs the registry from the heap.
+		if err := writeTransformCatalogRow(o.ctx, tf); err != nil {
+			return fmt.Errorf("pg_transform journal: %w", err)
 		}
 	default:
 		// text search dictionary/configuration/parser/template, language, etc.

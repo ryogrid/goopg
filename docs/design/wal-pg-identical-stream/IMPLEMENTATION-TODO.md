@@ -465,7 +465,19 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
     'happy'::public.b2prep_mood (enum_in → 3503 → goopg's runtime rows). New
     TestPort_EnumSurvivesRestart (create/add/rename/drop across restart); waldump += enum DDL.
 - [ ] **B3** extension/config (pg_ts_*, pg_transform, pg_event_trigger, pg_publication*/subscription*,
-  pg_statistic_ext, pg_constraint/attrdef/depend).
+  pg_statistic_ext, pg_constraint/attrdef/depend). **IN PROGRESS.**
+  - [x] **B3.1 pg_transform (kinds 36/37 retired)** — LANDED. `sys_pg_transform.go`: 5-col
+    FormData_pg_transform builder (all OIDs; trftype/trflang resolved from the registry's
+    TypeName/Lang via TypeNameToOID/LanguageNameToOID) + heap INSERT with a pre-INSERT xmax
+    stamp of any prior row version (RegisterTransform is idempotent per (type,lang) with a
+    stable OID — CREATE OR REPLACE analog; no TID cache for this low-traffic catalog, so
+    delete+insert leaves exactly one live row) + 3574/3575 index entries (both empty
+    placeholders → lazy-root); DROP stamps xmax. Reload reverses trftype via reloadTypeNameForOID
+    and trflang via the new languageNameForOID (the four languages LanguageNameToOID models).
+    Scanner transform_ddl_recovery.go(+test) + wal/transform_ddl_test.go deleted; kinds 36/37 +
+    4 codecs + dispatch excised; the rmgr-mapping test's retired-kind sample swapped to
+    RecordKindCreateStatistics. TestPort_TransformSurvivesRestart green (numeric-OID predicates —
+    the B2.2a regtype-builtin-name gap); waldump workload += CREATE/DROP TRANSFORM.
 - [ ] **B4** shared catalogs in `global/` (pg_database, pg_authid/auth_members, pg_tablespace,
   pg_foreign_*/user_mapping) + retire the postgres-DB mirror shim.
 - [ ] **B5** Retire `RmgrGoopgCatalog=128` (now unused) — header-side parity complete.

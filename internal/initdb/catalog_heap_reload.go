@@ -1334,3 +1334,59 @@ func reloadAmProcMembersFromHeap(mgr *storage.Manager, cat *catalog.InMemory, cl
 	}
 	return nil
 }
+
+// reloadUserTransformsFromHeap is B3.1's transform reload — the generic
+// heap-scan replacement for the retired replayTransformDDLRecords scanner
+// (RecordKinds 36/37). Fully physical: the five pg_transform columns are all
+// OIDs, and the registry's two name fields reverse from trftype/trflang
+// (the cast-reload type-name pattern; the language name comes from the same
+// four-way builtin map LanguageNameToOID renders forward).
+func reloadUserTransformsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+	cols := executor.PGTransformColumnsPG18()
+	type trfRow struct {
+		oid, typeOID, langOID, fromFn, toFn uint32
+	}
+	rel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 3576, Fork: storage.MainFork}
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_transform",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			decoded := make(executor.Row, len(cols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, cols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			if uint32(decoded[0].Int) < catalog.FirstUserOID {
+				return nil, false, errSkipBuiltinRow
+			}
+			return trfRow{
+				oid:     uint32(decoded[0].Int),
+				typeOID: uint32(decoded[1].Int),
+				langOID: uint32(decoded[2].Int),
+				fromFn:  uint32(decoded[3].Int),
+				toFn:    uint32(decoded[4].Int),
+			}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+	for _, raw := range rows {
+		tr := raw.(trfRow)
+		typeName := reloadTypeNameForOID(cat, tr.typeOID)
+		lang := languageNameForOID(tr.langOID)
+		if typeName == "" || lang == "" {
+			continue // endpoint type or language gone — dead transform
+		}
+		cat.RegisterTransformDuringRecovery(typeName, lang, tr.oid, tr.fromFn, tr.toFn)
+	}
+	return nil
+}
+
+// languageNameForOID reverses catalog.LanguageNameToOID (the four languages
+// goopg models). "" when the OID is not one of them.
+func languageNameForOID(oid uint32) string {
+	for _, name := range []string{"internal", "c", "sql", "plpgsql"} {
+		if catalog.LanguageNameToOID(name) == oid {
+			return name
+		}
+	}
+	return ""
+}
