@@ -2361,6 +2361,10 @@ type InMemory struct {
 	// writeTypeHeapRowWithIndexes INSERT and by the startup reload scan,
 	// refreshed by ALTER heap UPDATEs, deleted with the type row.
 	typeHeapTIDs map[uint32]SchemaHeapTID
+	// operatorHeapTIDs maps a pg_operator row's OID to its live heap TID —
+	// B2.2 slice 3's upsert cache (shell fill-in / COMMUTATOR-NEGATOR
+	// back-patch = canonical heap UPDATE at the cached TID).
+	operatorHeapTIDs map[uint32]SchemaHeapTID
 
 	// tempNamespaces maps a session's temp-owner token ("s<id>", see
 	// executor.sessionTempOwner) → the OID of that session's temporary
@@ -12207,6 +12211,32 @@ func (c *InMemory) DeleteTypeHeapTID(oid uint32) {
 	delete(c.typeHeapTIDs, oid)
 }
 
+// OperatorHeapTID returns the live pg_operator heap TID for oid (B2.2
+// slice 3).
+func (c *InMemory) OperatorHeapTID(oid uint32) (SchemaHeapTID, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	tid, ok := c.operatorHeapTIDs[oid]
+	return tid, ok
+}
+
+// SetOperatorHeapTID records/refreshes the live pg_operator heap TID.
+func (c *InMemory) SetOperatorHeapTID(oid uint32, tid SchemaHeapTID) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.operatorHeapTIDs == nil {
+		c.operatorHeapTIDs = make(map[uint32]SchemaHeapTID)
+	}
+	c.operatorHeapTIDs[oid] = tid
+}
+
+// DropOperatorHeapTID drops the TID entry (DROP OPERATOR).
+func (c *InMemory) DropOperatorHeapTID(oid uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.operatorHeapTIDs, oid)
+}
+
 // SetSchemaHeapTID records/refreshes the live pg_namespace heap TID for name.
 func (c *InMemory) SetSchemaHeapTID(name string, tid SchemaHeapTID) {
 	c.mu.Lock()
@@ -18694,6 +18724,18 @@ var builtinProcsByName = map[string]BuiltinProc{
 func LookupBuiltinProc(name string) (BuiltinProc, bool) {
 	p, ok := builtinProcsByName[strings.ToLower(name)]
 	return p, ok
+}
+
+// LookupBuiltinProcByOID is the OID→entry reversal of LookupBuiltinProc
+// (linear scan — the hand-curated set is small). B2.2 slice 3: pg_operator's
+// oprresult derives from the operator function's return type.
+func LookupBuiltinProcByOID(oid uint32) (BuiltinProc, bool) {
+	for _, p := range builtinProcsByName {
+		if p.OID == oid {
+			return p, true
+		}
+	}
+	return BuiltinProc{}, false
 }
 
 // BuiltinOperator holds a hand-curated built-in pg_operator.dat row — the

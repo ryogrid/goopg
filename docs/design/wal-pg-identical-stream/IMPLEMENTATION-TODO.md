@@ -301,8 +301,8 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
   1. **pg_cast** — DONE (B2.2a entry below; kinds 38/39 retired, scanner cast_ddl_recovery.go dead);
   2. **pg_aggregate** — DONE (B2.2b entry below; kinds 46-49 retired, scanner
      aggregate_ddl_recovery.go dead);
-  3. **pg_operator** (kinds 83/84; 7 emit sites incl. two-pass commutator/negator shells; all-scalar
-     pg_operator row; indexes 2688/2689 populated; scanner operator_ddl_recovery.go);
+  3. **pg_operator** — DONE (B2.2c entry below; kinds 83/84 retired, scanner
+     operator_ddl_recovery.go dead);
   4. **pg_collation** (kinds 42-45/93) + **pg_conversion** (kinds 40/41/130-132) — BOTH registries'
      *DuringRecovery still FORCE DefaultDBOid (catalog.go:12653/:12776 — the domain/range/enum bug
      class, fix like RegisterDomainDuringRecovery); indexes populated (3085/3164, 2668-2670);
@@ -311,6 +311,22 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
   Remaining rmid-128 kinds AFTER B2.2: text-search 104-116, statistics 95-99 (wal/statistics_ddl.go),
   access-method 70/71, transform 36/37, event-trigger 56-60, pub/sub 50-55, foreign-data 126-129,
   role/db-config/tablespace/matview/view/index-rename 67-80/94/102-103/124-125 (B3/B4 scope).
+  - [x] **B2.2c pg_operator (kinds 83/84 retired)** — LANDED. `sys_pg_operator.go`: 15-col
+    FormData_pg_operator builder (oprresult resolved from oprcode via routines registry /
+    curated-builtin reversal, 0 for shells); `upsertOperatorCatalogRow` maps PG's two-pass
+    scheme (OperatorShellMake/OperatorUpd) onto INSERT-or-UPDATE at an operatorHeapTIDs cache
+    (new InMemory map + 3 methods); CREATE journals op's final state AND upserts the referenced
+    commutator/negator (shell just minted, or existing op just back-patched); DROP stamps xmax
+    (MaterializeWriterXID FIRST — an unmaterialized XID stamps xmax=0 silently; the same latent
+    bug was fixed in B2.2b's deleteAggregateCatalogRows). Indexes 2688 {16,1} + 2689 {88,4
+    name+3-oid, executor twin of pgBuildIndexTupleNameOidOidOidKey}. Reload = fully physical
+    pg_operator scan (only type names + schema name reverse; every proc/operator link is an OID
+    in the registry too); shells reload as shells. Scanner operator_ddl_recovery.go(+test) +
+    wal/operator_ddl_test.go deleted (operatorCatalog helper moved to the surviving opclass
+    scanner test); kinds 83/84 + CreateOperatorPayload codec + dispatch excised.
+    TestPort_OperatorSurvivesRestart (forward-COMMUTATOR shell + back-patch link + drop +
+    oprcode join) green. Residuals: user-operator EXECUTION is out of goopg scope (regress
+    create_operator excluded "v0"); expression lexer rejects #-bearing symbols.
   - [x] **B2.2b pg_aggregate (kinds 46-49 retired)** — LANDED. `sys_pg_aggregate.go`: CREATE
     AGGREGATE journals a synthesized prokind='a' pg_proc row through the B1.2 routine funnel
     (heap + 2690/2691 + TID cache; field choices copied from the virtual pg_proc view: prolang=

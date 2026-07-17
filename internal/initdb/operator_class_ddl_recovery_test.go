@@ -8,6 +8,19 @@ import (
 	"github.com/goopg/goopg/internal/wal"
 )
 
+// operatorCatalog asserts Runtime.Catalog's concrete type (moved here from
+// the deleted operator_ddl_recovery_test.go — B2.2 slice 3 retired that
+// scanner; the opclass/opfamily scanner below still uses the helper until
+// its own slice-5 conversion).
+func operatorCatalog(t *testing.T, rt *Runtime) *catalog.InMemory {
+	t.Helper()
+	im, ok := rt.Catalog.(*catalog.InMemory)
+	if !ok {
+		t.Fatalf("Runtime.Catalog is not *catalog.InMemory: %T", rt.Catalog)
+	}
+	return im
+}
+
 // TestOperatorClassDDLRecoveryReplaysCreate confirms the DU-002
 // restart-persistence hook (M0119-0004/M0110-0001, closing the loop #65/#66
 // deferral ledger row's "still open" item (1)): CREATE OPERATOR FAMILY /

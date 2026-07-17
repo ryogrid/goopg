@@ -2095,17 +2095,15 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		}
 	}
 
-	// DU-002 restart-persistence follow-up (M0119-0004/M0110-0001,
-	// discovered while verifying the loop #64 CREATE TYPE ... AS RANGE
-	// opclass/collation follow-up — see ledger): restore CREATE/DROP
-	// OPERATOR objects from the WAL. Runs after schema replay (above) since,
-	// unlike range types/access methods, an operator's registry key embeds
-	// its schema name.
-	if err := replayOperatorDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+	// B2.2 slice 3: operators reload from the pg_operator HEAP (generic
+	// scan, doc 02a §2) — replaced replayOperatorDDLRecords' bespoke WAL
+	// scan (kinds 83/84, retired). Still runs after schema replay (above)
+	// since an operator's registry key embeds its schema name.
+	if err := reloadUserOperatorsFromHeap(mgr, cat, clog); err != nil {
 		_ = pool.Close()
 		_ = walWriter.Close()
 		_ = mgr.Close()
-		return nil, fmt.Errorf("goopg: operator DDL replay: %w", err)
+		return nil, fmt.Errorf("goopg: pg_operator reload: %w", err)
 	}
 
 	// DU-002 restart-persistence follow-up (M0119-0004/M0110-0001, closing

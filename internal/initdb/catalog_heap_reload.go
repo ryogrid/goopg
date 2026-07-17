@@ -908,3 +908,85 @@ func reloadUserAggregatesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, c
 	}
 	return nil
 }
+
+// reloadUserOperatorsFromHeap is B2.2 slice 3's operator reload — the
+// generic heap-scan replacement for the retired replayOperatorDDLRecords
+// scanner (RecordKinds 83/84). Fully physical: every proc link
+// (oprcode/oprrest/oprjoin) and the commutator/negator OIDs are stored as
+// OIDs in the UserOperator registry too, so only the two argument type
+// NAMES (oprleft/oprright) and the schema name (oprnamespace) reverse via
+// lookups. Shell operators (oprcode=0) reload as shells, exactly as the
+// pre-crash server held them. Seeds the operator TID cache so a post-restart
+// back-patch or shell fill-in updates the row in place.
+func reloadUserOperatorsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+	opCols := executor.PGOperatorColumnsPG18()
+	type opRow struct {
+		op  catalog.UserOperator
+		tid storage.ItemPointer
+	}
+	rel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 2617, Fork: storage.MainFork}
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_operator",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			decoded := make(executor.Row, len(opCols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, opCols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			if uint32(decoded[0].Int) < catalog.FirstUserOID {
+				return nil, false, errSkipBuiltinRow
+			}
+			return opRow{
+				op: catalog.UserOperator{
+					OID:           uint32(decoded[0].Int),
+					Name:          decoded[1].StringValue(),
+					NamespaceOID:  uint32(decoded[2].Int),
+					Owner:         uint32(decoded[3].Int),
+					CanMerge:      decoded[5].BoolValue(),
+					CanHash:       decoded[6].BoolValue(),
+					LeftType:      reloadTypeNameForOID(cat, uint32(decoded[7].Int)),
+					RightType:     reloadTypeNameForOID(cat, uint32(decoded[8].Int)),
+					CommutatorOID: uint32(decoded[10].Int),
+					NegatorOID:    uint32(decoded[11].Int),
+					FuncOID:       uint32(decoded[12].Int),
+					RestrictOID:   uint32(decoded[13].Int),
+					JoinOID:       uint32(decoded[14].Int),
+				},
+				tid: tid,
+			}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+	for _, raw := range rows {
+		or := raw.(opRow)
+		schema := cat.SchemaNameForOID(or.op.NamespaceOID)
+		if schema == "" {
+			schema = "public"
+		}
+		cat.RegisterUserOperatorDuringRecovery(&or.op, schema)
+		cat.SetOperatorHeapTID(or.op.OID, catalog.SchemaHeapTID{Block: uint32(or.tid.Block), Offset: or.tid.Offset})
+	}
+	return nil
+}
+
+// reloadTypeNameForOID reverses a pg_type OID to the name the string-keyed
+// registries store — the cast-reload pattern (builtin → table/composite →
+// domain → enum). "" for InvalidOid (a unary operator's absent side).
+func reloadTypeNameForOID(cat *catalog.InMemory, oid uint32) string {
+	if oid == 0 {
+		return ""
+	}
+	if e, ok := pgTypeCanonical(oid); ok {
+		return e.Name
+	}
+	if tbl, _, ok := cat.LookupTableByOIDAllDBs(oid); ok && tbl != nil {
+		return tbl.Name
+	}
+	if d, ok := cat.LookupDomainByOID(oid); ok && d != nil {
+		return d.Name
+	}
+	if et, ok := cat.LookupEnumByOID(oid); ok && et != nil {
+		return et.Name
+	}
+	return ""
+}
