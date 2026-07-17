@@ -999,10 +999,15 @@ func (o *ddlOp) execCreatePublication(s *parser.CreatePublicationStmt) error {
 	// so record a WAL event the recovery driver
 	// (internal/initdb/pubsub_ddl_recovery.go) replays into the PubSub
 	// registry on the next startup. Mirrors CREATE COLLATION.
-	if o.ctx.WAL != nil {
-		if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreatePublication(pub.Name, pub.Tables, pub.OID, pub.Owner, pub.AllTables, pub.PublishInsert, pub.PublishUpdate, pub.PublishDelete)); werr != nil {
-			return fmt.Errorf("wal create-publication: %w", werr)
-		}
+	// B3.3 (doc 02d §2): the publication journals as a real pg_publication
+	// heap row + 6110/6111 entries plus one pg_publication_rel row per FOR
+	// TABLE member (kind 50 retired); the startup reload reconstructs the
+	// PubSub registry from both heaps.
+	if err := upsertPublicationCatalogRow(o.ctx, pub); err != nil {
+		return fmt.Errorf("pg_publication journal: %w", err)
+	}
+	if err := writePublicationMemberRows(o.ctx, pub); err != nil {
+		return fmt.Errorf("pg_publication_rel journal: %w", err)
 	}
 	return nil
 }
@@ -1011,16 +1016,21 @@ func (o *ddlOp) execDropPublication(s *parser.DropPublicationStmt) error {
 	if o.ctx.PubSub == nil {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "DROP PUBLICATION requires PubSub registry in Context"}
 	}
+	// B3.3: capture the OID before the registry drop, then stamp xmax on
+	// the pg_publication row and its pg_publication_rel members (kind 51
+	// retired).
+	var pubOID uint32
+	if pub, ok := o.ctx.PubSub.LookupPublication(s.Name); ok && pub != nil {
+		pubOID = pub.OID
+	}
 	if err := o.ctx.PubSub.DropPublication(s.Name); err != nil {
 		if s.IfExists {
 			return nil
 		}
 		return &ExecError{Code: "42704", Pos: s.Pos(), Message: err.Error()}
 	}
-	if o.ctx.WAL != nil {
-		if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropPublication(s.Name)); werr != nil {
-			return fmt.Errorf("wal drop-publication: %w", werr)
-		}
+	if pubOID != 0 {
+		deletePublicationCatalogRows(o.ctx, pubOID)
 	}
 	return nil
 }
@@ -1106,9 +1116,11 @@ func (o *ddlOp) execAlterPublicationOwner(s *parser.AlterPublicationOwnerStmt) e
 	if serr := o.ctx.PubSub.SetPublicationOwner(s.Name, ownerOID); serr != nil {
 		return &ExecError{Code: "42704", Pos: s.Pos(), Message: serr.Error()}
 	}
-	if o.ctx.WAL != nil {
-		if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterPublicationOwner(s.Name, ownerOID)); werr != nil {
-			return fmt.Errorf("wal alter-publication-owner: %w", werr)
+	// B3.3: the owner change is a canonical pg_publication heap UPDATE
+	// (kind 52 retired).
+	if pub, ok := o.ctx.PubSub.LookupPublication(s.Name); ok && pub != nil {
+		if uerr := upsertPublicationCatalogRow(o.ctx, pub); uerr != nil {
+			return fmt.Errorf("pg_publication journal: %w", uerr)
 		}
 	}
 	return nil

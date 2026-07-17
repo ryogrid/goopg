@@ -1442,3 +1442,77 @@ func reloadUserEventTriggersFromHeap(mgr *storage.Manager, cat *catalog.InMemory
 	}
 	return nil
 }
+
+// reloadUserPublicationsFromHeap is B3.3's publication reload — the generic
+// heap-scan replacement for the pg_publication half of the retired
+// replayPubSubDDLRecords scanner (kinds 50-52; subscription kinds 53-55 stay
+// bespoke, pg_subscription being a SHARED catalog for B4). It scans
+// pg_publication for base rows and pg_publication_rel for FOR TABLE members
+// (prrelid → the qualified table name via cat.LookupTableByOID), then
+// registers each into the PubSub registry. Seeds the InMemory TID cache so a
+// post-restart ALTER PUBLICATION OWNER updates the base row in place.
+func reloadUserPublicationsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, pubsub *catalog.PubSub, clog *mvcc.CLog) error {
+	// Pass 1: member rows, grouped by publication OID.
+	membersByPub := map[uint32][]string{}
+	prCols := executor.PGPublicationRelColumnsPG18()
+	prRel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 6106, Fork: storage.MainFork}
+	prRows, err := scanCatalogHeapRows(mgr, prRel, clog, "pg_publication_rel",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			decoded := make(executor.Row, len(prCols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, prCols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			return [2]uint32{uint32(decoded[1].Int), uint32(decoded[2].Int)}, false, nil // {prpubid, prrelid}
+		})
+	if err != nil {
+		return err
+	}
+	for _, raw := range prRows {
+		pr := raw.([2]uint32)
+		if tbl, ok := cat.LookupTableByOID(pr[1]); ok && tbl != nil {
+			membersByPub[pr[0]] = append(membersByPub[pr[0]], tbl.QualifiedName())
+		}
+	}
+
+	// Pass 2: base rows.
+	pubCols := executor.PGPublicationColumnsPG18()
+	pubRel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 6104, Fork: storage.MainFork}
+	type pubRow struct {
+		pub catalog.Publication
+		tid storage.ItemPointer
+	}
+	rows, err := scanCatalogHeapRows(mgr, pubRel, clog, "pg_publication",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			decoded := make(executor.Row, len(pubCols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, pubCols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			if uint32(decoded[0].Int) < catalog.FirstUserOID {
+				return nil, false, errSkipBuiltinRow
+			}
+			return pubRow{
+				pub: catalog.Publication{
+					OID:           uint32(decoded[0].Int),
+					Name:          decoded[1].StringValue(),
+					Owner:         uint32(decoded[2].Int),
+					AllTables:     decoded[3].BoolValue(),
+					PublishInsert: decoded[4].BoolValue(),
+					PublishUpdate: decoded[5].BoolValue(),
+					PublishDelete: decoded[6].BoolValue(),
+				},
+				tid: tid,
+			}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+	for _, raw := range rows {
+		pr := raw.(pubRow)
+		pr.pub.Tables = membersByPub[pr.pub.OID]
+		pubsub.CreatePublicationDuringRecovery(&pr.pub)
+		cat.SetPublicationHeapTID(pr.pub.OID, catalog.SchemaHeapTID{Block: uint32(pr.tid.Block), Offset: pr.tid.Offset})
+	}
+	return nil
+}

@@ -63,33 +63,6 @@ func replayPubSubDDLRecords(walDir string, pubsub *catalog.PubSub) error {
 			continue
 		}
 		switch rec.Payload[0] {
-		case wal.RecordKindCreatePublication:
-			name, tables, oid, ownerOID, allTables, publishInsert, publishUpdate, publishDelete, derr := wal.DecodeCreatePublication(rec.Payload)
-			if derr != nil {
-				return fmt.Errorf("decode create-publication at lsn %d: %w", rec.StartLSN, derr)
-			}
-			pubsub.CreatePublicationDuringRecovery(&catalog.Publication{
-				Name:          name,
-				OID:           oid,
-				Owner:         ownerOID,
-				AllTables:     allTables,
-				PublishInsert: publishInsert,
-				PublishUpdate: publishUpdate,
-				PublishDelete: publishDelete,
-				Tables:        tables,
-			})
-		case wal.RecordKindDropPublication:
-			name, derr := wal.DecodeDropPublication(rec.Payload)
-			if derr != nil {
-				return fmt.Errorf("decode drop-publication at lsn %d: %w", rec.StartLSN, derr)
-			}
-			pubsub.DropPublicationDuringRecovery(name)
-		case wal.RecordKindAlterPublicationOwner:
-			name, ownerOID, derr := wal.DecodeAlterPublicationOwner(rec.Payload)
-			if derr != nil {
-				return fmt.Errorf("decode alter-publication-owner at lsn %d: %w", rec.StartLSN, derr)
-			}
-			pubsub.SetPublicationOwnerDuringRecovery(name, ownerOID)
 		case wal.RecordKindCreateSubscription:
 			name, conninfo, slotName, publications, oid, ownerOID, enabled, dbOid, derr := wal.DecodeCreateSubscription(rec.Payload)
 			if derr != nil {

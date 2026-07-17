@@ -410,36 +410,6 @@ const (
 	// recovery driver in internal/initdb replays it against the CLog.
 	RecordKindClogTruncate byte = 33
 
-	// RecordKindCreatePublication records a `CREATE PUBLICATION name ...`
-	// event so it survives a restart. goopg has no per-publication on-disk
-	// file namespace (catalog.PubSub is a pure in-memory registry, unlike
-	// pg_class/pg_attribute-backed objects), so the physical redo path is a
-	// no-op; the recovery driver in internal/initdb/pubsub_ddl_recovery.go
-	// scans the WAL for these records after physical replay and
-	// re-registers each publication with its original OID/owner. Mirrors
-	// RecordKindCreateCollation. DU-002 restart-persistence follow-up
-	// (M0119-0004, loop #67 ledger resume point).
-	// Format:
-	//   kind(1) | oid(4) | ownerOID(4) |
-	//   flags(1: bit0=AllTables bit1=PublishInsert bit2=PublishUpdate bit3=PublishDelete) |
-	//   nameLen(2) | name(nameLen bytes) |
-	//   tablesCount(2) | for each: tableLen(2) table(tableLen bytes)
-	RecordKindCreatePublication byte = 50
-
-	// RecordKindDropPublication records a `DROP PUBLICATION name` event.
-	// Counterpart to RecordKindCreatePublication; same no-op physical redo
-	// path. Mirrors RecordKindDropCollation.
-	// Format:
-	//   kind(1) | nameLen(2) | name(nameLen bytes)
-	RecordKindDropPublication byte = 51
-
-	// RecordKindAlterPublicationOwner records an `ALTER PUBLICATION name
-	// OWNER TO newowner` event. Same no-op physical redo path as
-	// RecordKindCreatePublication. Mirrors RecordKindAlterCollationOwner.
-	// Format:
-	//   kind(1) | ownerOID(4) | nameLen(2) | name(nameLen bytes)
-	RecordKindAlterPublicationOwner byte = 52
-
 	// RecordKindCreateSubscription records a `CREATE SUBSCRIPTION name ...`
 	// event so it survives a restart. Same rationale/no-op physical redo
 	// path as RecordKindCreatePublication.
@@ -3129,172 +3099,6 @@ func DecodeRenameIndex(payload []byte) (schema, oldName, newName string, err err
 	return schema, oldName, newName, nil
 }
 
-// publicationFlags packs the four Publication boolean fields into a single
-// byte for EncodeCreatePublication (bit0=AllTables, bit1=PublishInsert,
-// bit2=PublishUpdate, bit3=PublishDelete).
-func publicationFlags(allTables, publishInsert, publishUpdate, publishDelete bool) byte {
-	var f byte
-	if allTables {
-		f |= 1 << 0
-	}
-	if publishInsert {
-		f |= 1 << 1
-	}
-	if publishUpdate {
-		f |= 1 << 2
-	}
-	if publishDelete {
-		f |= 1 << 3
-	}
-	return f
-}
-
-// EncodeCreatePublication encodes a CREATE PUBLICATION event (DU-002
-// restart-persistence follow-up to M0119-0004, loop #67 ledger resume
-// point). The OID is carried so recovery re-registers the publication
-// identically to the live server. Format documented at the
-// RecordKindCreatePublication constant.
-func EncodeCreatePublication(name string, tables []string, oid, ownerOID uint32, allTables, publishInsert, publishUpdate, publishDelete bool) []byte {
-	if len(name) > 0xFFFF {
-		name = name[:0xFFFF]
-	}
-	total := 10 + 2 + len(name) + 2
-	for _, t := range tables {
-		if len(t) > 0xFFFF {
-			t = t[:0xFFFF]
-		}
-		total += 2 + len(t)
-	}
-	out := make([]byte, total)
-	out[0] = RecordKindCreatePublication
-	binary.LittleEndian.PutUint32(out[1:5], oid)
-	binary.LittleEndian.PutUint32(out[5:9], ownerOID)
-	out[9] = publicationFlags(allTables, publishInsert, publishUpdate, publishDelete)
-	off := 10
-	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(name)))
-	off += 2
-	copy(out[off:], name)
-	off += len(name)
-	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(tables)))
-	off += 2
-	for _, t := range tables {
-		if len(t) > 0xFFFF {
-			t = t[:0xFFFF]
-		}
-		binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(t)))
-		off += 2
-		copy(out[off:], t)
-		off += len(t)
-	}
-	return out
-}
-
-// DecodeCreatePublication decodes a RecordKindCreatePublication payload.
-func DecodeCreatePublication(payload []byte) (name string, tables []string, oid, ownerOID uint32, allTables, publishInsert, publishUpdate, publishDelete bool, err error) {
-	if len(payload) < 10 {
-		return "", nil, 0, 0, false, false, false, false, fmt.Errorf("wal: create-publication payload too short (%d bytes)", len(payload))
-	}
-	if payload[0] != RecordKindCreatePublication {
-		return "", nil, 0, 0, false, false, false, false, fmt.Errorf("wal: record kind %d is not create-publication", payload[0])
-	}
-	oid = binary.LittleEndian.Uint32(payload[1:5])
-	ownerOID = binary.LittleEndian.Uint32(payload[5:9])
-	flags := payload[9]
-	allTables = flags&(1<<0) != 0
-	publishInsert = flags&(1<<1) != 0
-	publishUpdate = flags&(1<<2) != 0
-	publishDelete = flags&(1<<3) != 0
-	off := 10
-	if len(payload) < off+2 {
-		return "", nil, 0, 0, false, false, false, false, fmt.Errorf("wal: create-publication payload truncated (need %d bytes)", off+2)
-	}
-	nameLen := int(binary.LittleEndian.Uint16(payload[off : off+2]))
-	off += 2
-	if len(payload) < off+nameLen+2 {
-		return "", nil, 0, 0, false, false, false, false, fmt.Errorf("wal: create-publication payload truncated (need %d bytes)", off+nameLen+2)
-	}
-	name = string(payload[off : off+nameLen])
-	off += nameLen
-	tablesCount := int(binary.LittleEndian.Uint16(payload[off : off+2]))
-	off += 2
-	tables = make([]string, 0, tablesCount)
-	for i := 0; i < tablesCount; i++ {
-		if len(payload) < off+2 {
-			return "", nil, 0, 0, false, false, false, false, fmt.Errorf("wal: create-publication payload truncated (need %d bytes)", off+2)
-		}
-		l := int(binary.LittleEndian.Uint16(payload[off : off+2]))
-		off += 2
-		if len(payload) < off+l {
-			return "", nil, 0, 0, false, false, false, false, fmt.Errorf("wal: create-publication payload truncated (need %d bytes)", off+l)
-		}
-		tables = append(tables, string(payload[off:off+l]))
-		off += l
-	}
-	return name, tables, oid, ownerOID, allTables, publishInsert, publishUpdate, publishDelete, nil
-}
-
-// EncodeDropPublication encodes a DROP PUBLICATION event (DU-002
-// restart-persistence follow-up to M0119-0004, loop #67 ledger resume
-// point). Format documented at the RecordKindDropPublication constant.
-func EncodeDropPublication(name string) []byte {
-	if len(name) > 0xFFFF {
-		name = name[:0xFFFF]
-	}
-	out := make([]byte, 3+len(name))
-	out[0] = RecordKindDropPublication
-	binary.LittleEndian.PutUint16(out[1:3], uint16(len(name)))
-	copy(out[3:], name)
-	return out
-}
-
-// DecodeDropPublication decodes a RecordKindDropPublication payload.
-func DecodeDropPublication(payload []byte) (name string, err error) {
-	if len(payload) < 3 {
-		return "", fmt.Errorf("wal: drop-publication payload too short (%d bytes)", len(payload))
-	}
-	if payload[0] != RecordKindDropPublication {
-		return "", fmt.Errorf("wal: record kind %d is not drop-publication", payload[0])
-	}
-	nameLen := int(binary.LittleEndian.Uint16(payload[1:3]))
-	if len(payload) < 3+nameLen {
-		return "", fmt.Errorf("wal: drop-publication payload truncated (need %d bytes)", 3+nameLen)
-	}
-	return string(payload[3 : 3+nameLen]), nil
-}
-
-// EncodeAlterPublicationOwner encodes an ALTER PUBLICATION ... OWNER TO
-// event (DU-002 restart-persistence follow-up to M0119-0004, loop #67
-// ledger resume point). Format documented at the
-// RecordKindAlterPublicationOwner constant.
-func EncodeAlterPublicationOwner(name string, ownerOID uint32) []byte {
-	if len(name) > 0xFFFF {
-		name = name[:0xFFFF]
-	}
-	out := make([]byte, 7+len(name))
-	out[0] = RecordKindAlterPublicationOwner
-	binary.LittleEndian.PutUint32(out[1:5], ownerOID)
-	binary.LittleEndian.PutUint16(out[5:7], uint16(len(name)))
-	copy(out[7:], name)
-	return out
-}
-
-// DecodeAlterPublicationOwner decodes a RecordKindAlterPublicationOwner
-// payload.
-func DecodeAlterPublicationOwner(payload []byte) (name string, ownerOID uint32, err error) {
-	if len(payload) < 7 {
-		return "", 0, fmt.Errorf("wal: alter-publication-owner payload too short (%d bytes)", len(payload))
-	}
-	if payload[0] != RecordKindAlterPublicationOwner {
-		return "", 0, fmt.Errorf("wal: record kind %d is not alter-publication-owner", payload[0])
-	}
-	ownerOID = binary.LittleEndian.Uint32(payload[1:5])
-	nameLen := int(binary.LittleEndian.Uint16(payload[5:7]))
-	if len(payload) < 7+nameLen {
-		return "", 0, fmt.Errorf("wal: alter-publication-owner payload truncated (need %d bytes)", 7+nameLen)
-	}
-	return string(payload[7 : 7+nameLen]), ownerOID, nil
-}
-
 // EncodeCreateSubscription encodes a CREATE SUBSCRIPTION event (DU-002
 // restart-persistence follow-up to M0119-0004, loop #67 ledger resume
 // point). The OID is carried so recovery re-registers the subscription
@@ -5668,8 +5472,7 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 		// (internal/initdb/open.go invokes replayStatisticsDDLRecords
 		// directly) and so never observed the gap.
 		return false, nil
-	case RecordKindCreatePublication, RecordKindDropPublication, RecordKindAlterPublicationOwner,
-		RecordKindCreateSubscription, RecordKindDropSubscription, RecordKindAlterSubscriptionOwner:
+	case RecordKindCreateSubscription, RecordKindDropSubscription, RecordKindAlterSubscriptionOwner:
 		// CREATE/DROP/ALTER PUBLICATION/SUBSCRIPTION records (DU-002
 		// restart-persistence follow-up, M0119-0004 loop #67 ledger resume
 		// point) carry only catalog.PubSub metadata; goopg has no
