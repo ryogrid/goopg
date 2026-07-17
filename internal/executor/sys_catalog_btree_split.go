@@ -112,6 +112,19 @@ func keyMetaForSysBtree(indexOID uint32) (btreeIndexKeyMeta, bool) {
 		return btreeIndexKeyMeta{tupleSize: 16, nkeyatts: 1}, true
 	case pgOperatorOprnameLRNIndexOID:
 		return btreeIndexKeyMeta{tupleSize: 88, nkeyatts: 4}, true
+	// B2.2 slice 5: pg_opfamily (2754/2755 populated) + pg_opclass (2687
+	// populated, 2686 empty placeholder) + pg_amop (2653/2654 empty
+	// placeholders) + pg_amproc (2655 populated). The name-bearing keys put
+	// the access-method OID FIRST (opfmethod/opcmethod), unlike the
+	// name-first pg_class/pg_type family.
+	case pgOpfamilyOidIndexOID, pgOpclassOidIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 16, nkeyatts: 1}, true
+	case pgOpfamilyAmNameNspIndexOID, pgOpclassAmNameNspIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 80, nkeyatts: 3}, true
+	case pgAmopFamStratIndexOID, pgAmprocFamProcIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 24, nkeyatts: 4}, true
+	case pgAmopOprFamIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 24, nkeyatts: 3}, true
 	// B2.2 slice 4: pg_collation (3085/3164 bootstrap-populated) +
 	// pg_conversion (2670 populated; 2668/2669 empty placeholders that the
 	// runtime lazily roots).

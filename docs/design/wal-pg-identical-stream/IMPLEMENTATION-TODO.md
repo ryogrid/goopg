@@ -295,7 +295,8 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
   protrftypes/probin/proconfig/proacl — PG branches on attisnull (stringToNode("") on every SQL
   function call); now genuinely NULL (pg_class builder convention). e2e failover extended: goopg
   CREATE FUNCTION over WAL → promoted PG resolves by name (2691) AND executes it (2690 + prosrc).
-- [ ] **B2** type/operator families — B2.1 (pg_type/enum/range/domain) COMPLETE below; **B2.2 staged
+- [x] **B2** type/operator families — **COMPLETE**: B2.1 (pg_type/enum/range/domain) + B2.2 (cast/
+  aggregate/operator/collation+conversion/opclass-family) all landed below; **B2.2 staged
   plan (survey 2026-07-17)**, one catalog per landing on the B2.1 template (heap rows + index entries
   via descent machinery + physical reload + kind retirement + e2e probe where PG-side read exists):
   1. **pg_cast** — DONE (B2.2a entry below; kinds 38/39 retired, scanner cast_ddl_recovery.go dead);
@@ -305,11 +306,33 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
      operator_ddl_recovery.go dead);
   4. **pg_collation + pg_conversion** — DONE (B2.2d entry below; kinds 40-45/93/130-132 retired,
      scanners collation_ddl_recovery.go + conversion_ddl_recovery.go dead);
-  5. **opclass/opfamily/amop/amproc** (kinds 85-92; 9 emit sites; opfamily/opclass recovery already
-     DBOid-guarded; indexes: 2686/2653/2654 are EMPTY placeholders → lazy-root handles).
+  5. **opclass/opfamily/amop/amproc** — DONE (B2.2e entry below; kinds 85-92 retired, scanner
+     operator_class_ddl_recovery.go dead). **B2.2 COMPLETE — all five slices landed.**
   Remaining rmid-128 kinds AFTER B2.2: text-search 104-116, statistics 95-99 (wal/statistics_ddl.go),
   access-method 70/71, transform 36/37, event-trigger 56-60, pub/sub 50-55, foreign-data 126-129,
   role/db-config/tablespace/matview/view/index-rename 67-80/94/102-103/124-125 (B3/B4 scope).
+  - [x] **B2.2e opclass/opfamily/amop/amproc (kinds 85-92 retired) — B2.2 COMPLETE** — LANDED.
+    `sys_pg_opclass_family.go`: four FormData builders (pg_opfamily 5-col, pg_opclass 9-col,
+    pg_amop 9-col, pg_amproc 6-col — note the AM OID comes BEFORE the name in both opfamily and
+    opclass, unlike the pg_class/pg_type name-first family) + 9 emit-site swaps (CREATE FAMILY ×2
+    incl. the anonymous family CREATE OPERATOR CLASS auto-creates, CREATE CLASS, amop/amproc
+    member create ×2, ALTER OPERATOR FAMILY DROP member ×2, DROP CLASS, DROP FAMILY). No ALTER
+    RENAME/OWNER surface exists for these objects, so INSERT-at-create + xmax-at-drop only — no
+    TID cache. Indexes: 2754/2755/2687/2655 populated, 2686/2653/2654 lazy-rooted placeholders;
+    three new key builders (oid+name+oid 80B; oid+oid+oid+int2 24B signed-int2 tail;
+    oid+char+oid 24B with the 1-byte-aligned char at offset 4 and the trailing oid re-aligned to
+    8) — all byte-verified against their initdb twins. **ClassOID solved PG-faithfully:**
+    AmOpMember/AmProcMember.ClassOID drives the pg_depend view's INTERNAL-vs-AUTO deptype but
+    pg_amop/pg_amproc have NO column for it — PG's own channel is an INTERNAL pg_depend row on
+    the opclass (opclasscmds.c storeOperators), so the member writers now journal exactly that
+    row (extending B1.3b's narrow pg_depend surface) and the reload re-derives ClassOID from it;
+    an ALTER OPERATOR FAMILY ADD member gets no row, and its zero ClassOID is correct by
+    construction (PG gives those an AUTO dep on the family). Reload order: opfamily → opclass →
+    pg_depend attribution scan → amop/amproc; AmProcMember.Method (goopg-only field — pg_amproc
+    has no amprocmethod) re-derives from the owning family. Scanner + wal test file deleted;
+    kinds 85-92 + 4 payload structs + 16 codec funcs + dispatch case excised (505-line pure
+    deletion). TestPort_OpClassFamilySurvivesRestart green first try (family/class/members +
+    both attribution modes + drops); waldump workload += the full opclass/opfamily DDL set.
   - [x] **B2.2d pg_collation + pg_conversion (kinds 40-45/93/130-132 retired)** — LANDED.
     `sys_pg_collation.go` (12-col FormData builder; empty registry strings → NULL; collversion
     always NULL) + `sys_pg_conversion.go` (8-col; conproc = FuncOID); upsert/TID-cache shape from

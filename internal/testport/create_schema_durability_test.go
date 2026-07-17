@@ -690,3 +690,78 @@ func TestPort_ConversionSurvivesRestart(t *testing.T) {
 		t.Fatalf("post-restart stale conversion names count = %q, want 0", got)
 	}
 }
+
+// TestPort_OpClassFamilySurvivesRestart pins B2.2 slice 5's pg_opfamily /
+// pg_opclass / pg_amop / pg_amproc heap journaling (kinds 85-92 retired):
+// CREATE OPERATOR FAMILY / CLASS (with AS-list members), ALTER OPERATOR
+// FAMILY ADD (a family-attributed "loose" member), and the drops all
+// survive a restart — including each member's CLASS attribution, which
+// rides an INTERNAL pg_depend row because pg_amop/pg_amproc have no column
+// for it (PG's own channel: opclasscmds.c storeOperators).
+func TestPort_OpClassFamilySurvivesRestart(t *testing.T) {
+	c, err := cluster.New("opclass-durability", cluster.Options{
+		RepoRoot:     repoRoot(t),
+		DataDir:      filepath.Join(t.TempDir(), "data"),
+		StartupWait:  20 * time.Second,
+		ShutdownWait: 20 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+
+	stmts := []string{
+		"CREATE OPERATOR public.~=~ (FUNCTION = int4eq, LEFTARG = int4, RIGHTARG = int4)",
+		"CREATE OPERATOR FAMILY public.b22e_fam USING btree",
+		`CREATE OPERATOR CLASS public.b22e_class FOR TYPE int4 USING btree FAMILY public.b22e_fam AS
+			OPERATOR 1 ~=~ (int4, int4),
+			FUNCTION 1 int4eq(int4, int4)`,
+		// A loose (family-attributed) member: no class attribution, so no
+		// INTERNAL pg_depend row — its zero ClassOID must survive too.
+		"ALTER OPERATOR FAMILY public.b22e_fam USING btree ADD OPERATOR 3 ~=~ (int4, int4)",
+		"CREATE OPERATOR FAMILY public.b22e_gone USING btree",
+		"DROP OPERATOR FAMILY public.b22e_gone USING btree",
+	}
+	for _, s := range stmts {
+		if err := runSQLSimple(t, c, s); err != nil {
+			t.Fatalf("%s: %v", s, err)
+		}
+	}
+
+	if err := c.Stop(cluster.ShutdownFast); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	if err := c.Start(); err != nil {
+		t.Fatalf("restart: %v", err)
+	}
+
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_opfamily WHERE opfname = 'b22e_fam' AND oid >= 16384"); got != "1" {
+		t.Fatalf("post-restart pg_opfamily count = %q, want 1 (family not reloaded)", got)
+	}
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_opfamily WHERE opfname = 'b22e_gone' AND oid >= 16384"); got != "0" {
+		t.Fatalf("post-restart dropped family count = %q, want 0", got)
+	}
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_opclass c JOIN pg_opfamily f ON f.oid = c.opcfamily WHERE c.opcname = 'b22e_class' AND f.opfname = 'b22e_fam' AND c.opcintype = 23"); got != "1" {
+		t.Fatalf("post-restart pg_opclass join count = %q, want 1 (class or its family link lost)", got)
+	}
+	// Both AS-list members plus the ALTER-ADD'd loose operator.
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_amop a JOIN pg_opfamily f ON f.oid = a.amopfamily WHERE f.opfname = 'b22e_fam' AND a.oid >= 16384"); got != "2" {
+		t.Fatalf("post-restart pg_amop count = %q, want 2 (AS-list + ALTER-ADD member)", got)
+	}
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_amproc p JOIN pg_opfamily f ON f.oid = p.amprocfamily WHERE f.opfname = 'b22e_fam' AND p.oid >= 16384"); got != "1" {
+		t.Fatalf("post-restart pg_amproc count = %q, want 1", got)
+	}
+	// Class attribution: the AS-list OPERATOR/FUNCTION members keep their
+	// INTERNAL ('i') dependency on the class, while the ALTER-ADD'd member
+	// stays AUTO ('a') on the family (PG's AlterOpFamilyAdd semantics).
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_depend d JOIN pg_opclass c ON c.oid = d.refobjid WHERE d.refclassid = 2616 AND d.deptype = 'i' AND c.opcname = 'b22e_class'"); got != "2" {
+		t.Fatalf("post-restart INTERNAL class-attribution deps = %q, want 2 (member ClassOID lost)", got)
+	}
+}

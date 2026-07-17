@@ -1118,3 +1118,219 @@ func reloadUserConversionsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, 
 	}
 	return nil
 }
+
+// reloadOpClassFamilyFromHeap is B2.2 slice 5's operator-class/family
+// reload — the generic heap-scan replacement for the retired
+// replayOperatorClassDDLRecords scanner (RecordKinds 85-92). It rebuilds all
+// four registries from their heaps in dependency order: pg_opfamily →
+// pg_opclass (needs its family) → pg_amop / pg_amproc (need nothing; every
+// link is an OID).
+//
+// The member structs' ClassOID has no pg_amop/pg_amproc column — PG records
+// that attribution as an INTERNAL pg_depend row on the opclass
+// (opclasscmds.c storeOperators), and goopg now journals the same row, so
+// this reload re-derives ClassOID from pg_depend. A member with no such row
+// is an ALTER OPERATOR FAMILY ADD member, whose zero ClassOID is correct
+// (PG gives those an AUTO dependency on the family instead).
+//
+// Registries key on DefaultDBOid for postgres-DB sessions (NamespaceDBOid),
+// so the reload leaves DBOid unset and the *DuringRecovery zero-fallback
+// supplies it — the B2.2d rule.
+func reloadOpClassFamilyFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+	if err := reloadOpFamiliesFromHeap(mgr, cat, clog); err != nil {
+		return err
+	}
+	if err := reloadOpClassesFromHeap(mgr, cat, clog); err != nil {
+		return err
+	}
+	classByMember, err := scanAmMemberClassDepends(mgr, cat, clog)
+	if err != nil {
+		return err
+	}
+	if err := reloadAmOpMembersFromHeap(mgr, cat, clog, classByMember); err != nil {
+		return err
+	}
+	return reloadAmProcMembersFromHeap(mgr, cat, clog, classByMember)
+}
+
+func reloadOpFamiliesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+	cols := executor.PGOpfamilyColumnsPG18()
+	rel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 2753, Fork: storage.MainFork}
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_opfamily",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			decoded := make(executor.Row, len(cols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, cols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			if uint32(decoded[0].Int) < catalog.FirstUserOID {
+				return nil, false, errSkipBuiltinRow
+			}
+			return catalog.UserOperatorFamily{
+				OID:          uint32(decoded[0].Int),
+				Method:       uint32(decoded[1].Int),
+				Name:         decoded[2].StringValue(),
+				NamespaceOID: uint32(decoded[3].Int),
+				Owner:        uint32(decoded[4].Int),
+			}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+	for _, raw := range rows {
+		fam := raw.(catalog.UserOperatorFamily)
+		schema := cat.SchemaNameForOID(fam.NamespaceOID)
+		if schema == "" {
+			schema = "public"
+		}
+		cat.RegisterUserOperatorFamilyDuringRecovery(&fam, schema)
+	}
+	return nil
+}
+
+func reloadOpClassesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+	cols := executor.PGOpclassColumnsPG18()
+	rel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 2616, Fork: storage.MainFork}
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_opclass",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			decoded := make(executor.Row, len(cols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, cols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			if uint32(decoded[0].Int) < catalog.FirstUserOID {
+				return nil, false, errSkipBuiltinRow
+			}
+			return catalog.UserOperatorClass{
+				OID:          uint32(decoded[0].Int),
+				Method:       uint32(decoded[1].Int),
+				Name:         decoded[2].StringValue(),
+				NamespaceOID: uint32(decoded[3].Int),
+				Owner:        uint32(decoded[4].Int),
+				FamilyOID:    uint32(decoded[5].Int),
+				InTypeOID:    uint32(decoded[6].Int),
+				IsDefault:    decoded[7].BoolValue(),
+				KeyTypeOID:   uint32(decoded[8].Int),
+			}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+	for _, raw := range rows {
+		oc := raw.(catalog.UserOperatorClass)
+		schema := cat.SchemaNameForOID(oc.NamespaceOID)
+		if schema == "" {
+			schema = "public"
+		}
+		cat.RegisterUserOperatorClassDuringRecovery(&oc, schema)
+	}
+	return nil
+}
+
+// scanAmMemberClassDepends returns (member classid, member oid) → owning
+// opclass OID, read from the INTERNAL pg_depend rows the member writers
+// journal (see executor.writeAmMemberClassDependRow).
+func scanAmMemberClassDepends(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) (map[[2]uint32]uint32, error) {
+	cols := executor.PGDependColumnsPG18()
+	rel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 2608, Fork: storage.MainFork}
+	type dep struct {
+		classID, objID, refObjID uint32
+	}
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_depend(opclass members)",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			decoded := make(executor.Row, len(cols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, cols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			classID := uint32(decoded[0].Int)
+			if (classID != 2602 && classID != 2603) ||
+				uint32(decoded[3].Int) != 2616 || decoded[6].StringValue() != "i" {
+				return nil, false, errSkipBuiltinRow // not an opclass-member attribution row
+			}
+			return dep{classID: classID, objID: uint32(decoded[1].Int), refObjID: uint32(decoded[4].Int)}, false, nil
+		})
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[[2]uint32]uint32, len(rows))
+	for _, raw := range rows {
+		d := raw.(dep)
+		out[[2]uint32{d.classID, d.objID}] = d.refObjID
+	}
+	return out, nil
+}
+
+func reloadAmOpMembersFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog, classByMember map[[2]uint32]uint32) error {
+	cols := executor.PGAmopColumnsPG18()
+	rel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 2602, Fork: storage.MainFork}
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_amop",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			decoded := make(executor.Row, len(cols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, cols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			if uint32(decoded[0].Int) < catalog.FirstUserOID {
+				return nil, false, errSkipBuiltinRow
+			}
+			return catalog.AmOpMember{
+				OID:           uint32(decoded[0].Int),
+				FamilyOID:     uint32(decoded[1].Int),
+				LeftType:      uint32(decoded[2].Int),
+				RightType:     uint32(decoded[3].Int),
+				Strategy:      uint32(decoded[4].Int),
+				OperOID:       uint32(decoded[6].Int),
+				Method:        uint32(decoded[7].Int),
+				SortFamilyOID: uint32(decoded[8].Int),
+			}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+	for _, raw := range rows {
+		m := raw.(catalog.AmOpMember)
+		m.ClassOID = classByMember[[2]uint32{2602, m.OID}]
+		cat.RegisterAmOpMemberDuringRecovery(&m)
+	}
+	return nil
+}
+
+func reloadAmProcMembersFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog, classByMember map[[2]uint32]uint32) error {
+	cols := executor.PGAmprocColumnsPG18()
+	rel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 2603, Fork: storage.MainFork}
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_amproc",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			decoded := make(executor.Row, len(cols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, cols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			if uint32(decoded[0].Int) < catalog.FirstUserOID {
+				return nil, false, errSkipBuiltinRow
+			}
+			return catalog.AmProcMember{
+				OID:       uint32(decoded[0].Int),
+				FamilyOID: uint32(decoded[1].Int),
+				LeftType:  uint32(decoded[2].Int),
+				RightType: uint32(decoded[3].Int),
+				ProcNum:   uint32(decoded[4].Int),
+				ProcOID:   uint32(decoded[5].Int),
+			}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+	// pg_amproc has no amprocmethod column (unlike pg_amop's amopmethod) —
+	// AmProcMember.Method (goopg's own field, feeding
+	// amForcesSoftFunctionDependency) re-derives from the owning family.
+	for _, raw := range rows {
+		m := raw.(catalog.AmProcMember)
+		m.ClassOID = classByMember[[2]uint32{2603, m.OID}]
+		if fam := cat.LookupUserOperatorFamilyByOID(m.FamilyOID); fam != nil {
+			m.Method = fam.Method
+		}
+		cat.RegisterAmProcMemberDuringRecovery(&m)
+	}
+	return nil
+}
