@@ -19,7 +19,7 @@ import (
 // Runtime with all four handles populated.
 func TestOpenAfterInitReturnsRuntime(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "data")
-	if err := Init(Options{DataDir: dir}); err != nil {
+	if err := Init(Options{DataDir: dir, NoSync: true}); err != nil {
 		t.Fatal(err)
 	}
 	rt, err := Open(OpenOptions{DataDir: dir, PoolSlots: 4})
@@ -41,7 +41,7 @@ func TestOpenAfterInitReturnsRuntime(t *testing.T) {
 // num_requested column should report "1".
 func TestOpenRegistersStatCheckpointerView(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "data")
-	if err := Init(Options{DataDir: dir}); err != nil {
+	if err := Init(Options{DataDir: dir, NoSync: true}); err != nil {
 		t.Fatal(err)
 	}
 	rt, err := Open(OpenOptions{DataDir: dir, PoolSlots: 4})
@@ -111,7 +111,7 @@ func TestOpenRejectsMissingDir(t *testing.T) {
 // an old data directory.
 func TestOpenRejectsVersionMismatch(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "data")
-	if err := Init(Options{DataDir: dir}); err != nil {
+	if err := Init(Options{DataDir: dir, NoSync: true}); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, "PG_VERSION"), []byte("99\n"), 0o600); err != nil {
@@ -132,7 +132,7 @@ func TestOpenRejectsVersionMismatch(t *testing.T) {
 // SaveCatalog only updates pg_control's nextOid.
 func TestRuntimeSaveAndReloadCatalog(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "data")
-	if err := Init(Options{DataDir: dir}); err != nil {
+	if err := Init(Options{DataDir: dir, NoSync: true}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -168,7 +168,7 @@ func TestRuntimeSaveAndReloadCatalog(t *testing.T) {
 // Open shouldn't double-error if some other path already closed.
 func TestRuntimeCloseIsIdempotent(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "data")
-	if err := Init(Options{DataDir: dir}); err != nil {
+	if err := Init(Options{DataDir: dir, NoSync: true}); err != nil {
 		t.Fatal(err)
 	}
 	rt, err := Open(OpenOptions{DataDir: dir, PoolSlots: 2})
@@ -192,7 +192,7 @@ func TestRuntimeCloseIsIdempotent(t *testing.T) {
 // transactions in the reorder buffer.
 func TestOpenWiresXactMarkerHook(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "data")
-	if err := Init(Options{DataDir: dir}); err != nil {
+	if err := Init(Options{DataDir: dir, NoSync: true}); err != nil {
 		t.Fatal(err)
 	}
 	rt, err := Open(OpenOptions{DataDir: dir, PoolSlots: 4})
@@ -272,7 +272,7 @@ func TestOpenWiresXactMarkerHook(t *testing.T) {
 // paths are unchanged.
 func TestOpenAttachesAIOEngineWhenMethodSet(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "data")
-	if err := Init(Options{DataDir: dir}); err != nil {
+	if err := Init(Options{DataDir: dir, NoSync: true}); err != nil {
 		t.Fatal(err)
 	}
 	rt, err := Open(OpenOptions{
@@ -297,7 +297,7 @@ func TestOpenAttachesAIOEngineWhenMethodSet(t *testing.T) {
 // paths run unchanged.
 func TestOpenLeavesAIONilWithoutMethod(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "data")
-	if err := Init(Options{DataDir: dir}); err != nil {
+	if err := Init(Options{DataDir: dir, NoSync: true}); err != nil {
 		t.Fatal(err)
 	}
 	rt, err := Open(OpenOptions{DataDir: dir, PoolSlots: 4})
@@ -315,7 +315,7 @@ func TestOpenLeavesAIONilWithoutMethod(t *testing.T) {
 // M0030-0001 relfiles are present (created by goopg init).
 func TestOpenRegistersSystemCatalogHeapTables(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "data")
-	if err := Init(Options{DataDir: dir}); err != nil {
+	if err := Init(Options{DataDir: dir, NoSync: true}); err != nil {
 		t.Fatal(err)
 	}
 	rt, err := Open(OpenOptions{DataDir: dir, PoolSlots: 4})
@@ -352,7 +352,7 @@ func TestOpenRegistersSystemCatalogHeapTables(t *testing.T) {
 // its rows come from the heap file, not from a Go closure.
 func TestOpenPGTypeIsNotVirtual(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "data")
-	if err := Init(Options{DataDir: dir}); err != nil {
+	if err := Init(Options{DataDir: dir, NoSync: true}); err != nil {
 		t.Fatal(err)
 	}
 	rt, err := Open(OpenOptions{DataDir: dir, PoolSlots: 4})
@@ -374,7 +374,7 @@ func TestOpenPGTypeIsNotVirtual(t *testing.T) {
 // catalog table registered at startup) is not duplicated after Save+Restore.
 func TestOpenSystemCatalogNotDuplicated(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "data")
-	if err := Init(Options{DataDir: dir}); err != nil {
+	if err := Init(Options{DataDir: dir, NoSync: true}); err != nil {
 		t.Fatal(err)
 	}
 	rt, err := Open(OpenOptions{DataDir: dir, PoolSlots: 4})
@@ -411,7 +411,7 @@ func TestOpenSystemCatalogNotDuplicated(t *testing.T) {
 // pg_type/pg_attribute being registered (backward compatibility).
 func TestOpenOldClusterWithoutM0030FilesStillWorks(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "data")
-	if err := Init(Options{DataDir: dir}); err != nil {
+	if err := Init(Options{DataDir: dir, NoSync: true}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -453,7 +453,7 @@ func TestOpenOldClusterWithoutM0030FilesStillWorks(t *testing.T) {
 // passes bootstrap-XID rows, and the attname/atttypid values are correct.
 func TestPGAttributeSQLSurfaceForUserTable(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "data")
-	if err := Init(Options{DataDir: dir}); err != nil {
+	if err := Init(Options{DataDir: dir, NoSync: true}); err != nil {
 		t.Fatal(err)
 	}
 	rt, err := Open(OpenOptions{DataDir: dir, PoolSlots: 64})

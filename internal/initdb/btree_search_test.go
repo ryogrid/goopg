@@ -12,7 +12,7 @@ import (
 // schema via the NAMESPACENAME syscache → all pg_catalog.X lookups fail.
 func TestPgNamespaceHeapHasPgCatalog(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "data")
-	if err := Init(Options{DataDir: dir}); err != nil {
+	if err := Init(Options{DataDir: dir, NoSync: true}); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
 	data, err := os.ReadFile(filepath.Join(dir, "base", "1", "2615"))
@@ -42,7 +42,7 @@ func TestPgNamespaceHeapHasPgCatalog(t *testing.T) {
 
 func TestPgNamespaceNspnameIndexHasPgCatalog(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "data")
-	if err := Init(Options{DataDir: dir}); err != nil {
+	if err := Init(Options{DataDir: dir, NoSync: true}); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
 	data, err := os.ReadFile(filepath.Join(dir, "base", "1", "2684"))
@@ -107,7 +107,7 @@ func TestPgNamespaceNspnameIndexHasPgCatalog(t *testing.T) {
 // at the expected byte offset so PG's heap_getattr(tup, 8, ...) finds it.
 func TestPgRewriteRowLayout(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "data")
-	if err := Init(Options{DataDir: dir}); err != nil {
+	if err := Init(Options{DataDir: dir, NoSync: true}); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
 

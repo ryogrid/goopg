@@ -136,6 +136,8 @@ func runFailoverPGToGoopg(t *testing.T, repo, pgBasebackupBin, psqlBin string, m
 		DataDir:      standbyDir,
 		StartupWait:  45 * time.Second,
 		ShutdownWait: 10 * time.Second,
+		SyncInit:     true,
+		SyncRuntime:  true,
 	})
 	if err != nil {
 		t.Fatalf("cluster.New standby: %v", err)

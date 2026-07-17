@@ -61,6 +61,42 @@ tmpfs; the `^TestInit` initdb subset 17.9 s on disk → 1.6 s on tmpfs).
   test families are explicitly allowlisted to keep durability on
   ([02 §4](02-durability-off-for-test-servers.md)).
 
+## Implementation status
+
+2026-07-17 (follow-up session, same day): the mechanisms of stages 1, 3, and
+5 are LANDED, effective for both the Ralph loop and interactive sessions —
+02A (`--no-sync` in the smoke-gate init; `SyncInit`/`SyncRuntime` in
+`testutil/cluster`; §4 allowlist applied: replcluster + pubsubcluster peers
+and the durability/recovery/basebackup testport families opt out via
+explicit options or `newDurableCluster`; `internal/initdb` NoSync sweep of
+57 call sites with recovery/restart/crash/sync/checkpoint test files
+excluded), 02B (real `fsync` GUC, default `on`, gating the WAL commit-flush
+barrier, checkpoint smgr `Sync`/`SyncAll`, and the CLOG/pg_subtrans SLRU
+syncs; `testutil/cluster` appends `fsync = off` unless `SyncRuntime`), 04 §1
+(per-process init-template cache with mandatory sysid re-randomization and
+the §1.4 structural guard `TestTemplateCloneEquivalence`), 05 §1 + 06 Part A
+wording (AGENT.md, PROMPT.md, practice cards, plus a new repo `CLAUDE.md`
+covering interactive sessions). Deliberate deviations from the letter of the
+docs: the pgbench smoke server KEEPS `fsync = on` (that gate exists to catch
+TPC-B group-commit concurrency regressions and its TPS windows are the
+tripwire baseline — 02 §4's timing-coverage-shift concern applies to it
+directly); WAL segment-lifecycle syncs (preallocation, dir fsyncs) stay
+ungated (once per 16 MiB, off the commit path); initdb-package tests got the
+NoSync sweep but not template cloning. Stages 2 (tmpfs), 4 (`t.Parallel`),
+and 6 (affected-package selection) remain unimplemented proposals.
+
+First divergence adjudicated per the 06 B.2 protocol, same day:
+`TestPort_ProfileUpdate` hung the full suite (its workers swallowed query
+errors and never reported counts — latent test bug, fixed to report), and
+the underlying error was a fast-only reproducible `40001 could not
+serialize access due to concurrent update (deadlock)` from plain autocommit
+UPDATEs (fast 2/2 fail at ~2.3k TPS, durable 3/3 pass at ~1.3k TPS).
+Attribution: NOT introduced by fsync=off — it is the known deferred
+tuple-lock-FIFO divergence (ledger 0021-0012) surfacing at higher
+throughput, exactly the timing-coverage *increase* doc 02 predicted.
+Resolution: test durable-pinned with a dated comment; un-pin when
+0021-0012 lands.
+
 ## Review round
 
 2026-07-17: adversarial 3-lens agent review (R1 claims-correctness, R2

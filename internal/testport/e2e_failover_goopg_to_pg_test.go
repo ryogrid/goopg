@@ -89,6 +89,8 @@ func runFailoverGoopgToPG(t *testing.T, repo, pgBasebackupBin, psqlBin string, m
 		DataDir:      filepath.Join(baseDir, "goopg-primary"),
 		StartupWait:  45 * time.Second,
 		ShutdownWait: 10 * time.Second,
+		SyncInit:     true,
+		SyncRuntime:  true,
 	})
 	if err != nil {
 		t.Fatalf("cluster.New primary: %v", err)

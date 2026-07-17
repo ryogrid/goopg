@@ -77,7 +77,7 @@ func TestBootstrapPostgresRoleDistinctOSUser(t *testing.T) {
 // before any filesystem layout happens.
 func TestInitRejectsReservedSuperuserName(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "data")
-	err := Init(Options{DataDir: dir, SuperuserName: "pg_test"})
+	err := Init(Options{DataDir: dir, SuperuserName: "pg_test", NoSync: true})
 	if err == nil {
 		t.Fatal("Init accepted reserved superuser name \"pg_test\"; want error")
 	}
@@ -96,7 +96,7 @@ func TestInitRejectsReservedSuperuserName(t *testing.T) {
 func TestInitThreadsSuperuserToPgAuthid(t *testing.T) {
 	t.Setenv("USER", "carol")
 	dir := filepath.Join(t.TempDir(), "data")
-	if err := Init(Options{DataDir: dir, SuperuserName: "carol"}); err != nil {
+	if err := Init(Options{DataDir: dir, SuperuserName: "carol", NoSync: true}); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
 	raw, err := os.ReadFile(filepath.Join(dir, "global", "1260"))

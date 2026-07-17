@@ -19,7 +19,7 @@ import (
 // re-introduction of an ad-hoc default string in this package).
 func TestInitWritesEmbeddedSampleAsPostgresqlConf(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "data")
-	if err := Init(Options{DataDir: dir}); err != nil {
+	if err := Init(Options{DataDir: dir, NoSync: true}); err != nil {
 		t.Fatal(err)
 	}
 	got, err := os.ReadFile(filepath.Join(dir, "postgresql.conf"))

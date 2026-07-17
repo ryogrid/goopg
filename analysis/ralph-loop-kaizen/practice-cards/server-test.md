@@ -16,6 +16,14 @@ whole distro). Always go through the cap:
 - wrap manually: `GOOPG_CG_UNIT=goopg-test scripts/goopg-test-run.sh ./bin/goopg start -D <dir> --listen 127.0.0.1:5533`
 - each concurrent capped run needs its own `GOOPG_CG_UNIT`.
 
+## Test-cluster defaults (fast by design)
+
+`internal/testutil/cluster` inits from a per-process cached template
+(`--no-sync`, sysid re-randomized per clone) and runs servers with
+`fsync = off`. Durability-asserting tests must opt out with
+`SyncInit: true` + `SyncRuntime: true`
+(allowlist: ci/design/test-gate-speedups/02 §4).
+
 ## Foot-guns
 
 - **`pkill -f goopg` self-matches the Bash shell** running the command (exit

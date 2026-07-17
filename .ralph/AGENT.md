@@ -191,6 +191,23 @@ not run; it MUST pass cleanly before you commit:
 RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh   # unit/component suite only
 ```
 
+Fast-gate defaults (mechanisms landed 2026-07-17; design:
+`ci/design/test-gate-speedups/`):
+
+- Throwaway test clusters run FAST by default: the smoke gate inits with
+  `--no-sync`, and `testutil/cluster` inits from a per-process cached
+  template (sysid re-randomized per clone) with `--no-sync`, then runs the
+  server with `fsync = off`. Durability-asserting tests opt OUT with
+  `SyncInit: true` + `SyncRuntime: true` (allowlist:
+  ci/design/test-gate-speedups/02 §4) — write NEW crash-recovery /
+  WAL-replay / replication / restart-durability tests durable-by-default
+  (`newDurableCluster` in testport).
+- NEVER pass `-count=1` to a gate's `go test` — it defeats the test-result
+  cache and turns a ~5 min warm `units` run into a ~40 min cold one.
+  `-count=1` is only for one-off validation runs (flake screens, probes).
+  A cached PASS is a real PASS (scope and limits:
+  ci/design/test-gate-speedups/05 §1 rule 2).
+
 **Headless loop note:** run every gate above in the FOREGROUND (Bash timeouts
 are raised to 15 min default / 60 min max in loop sessions). Never start a gate
 with `run_in_background` and end your turn "waiting for the notification" — in

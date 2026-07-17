@@ -12,7 +12,7 @@ import (
 // so no data directory is left behind.
 func TestInitRejectsRelativeWALDir(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "data")
-	err := Init(Options{DataDir: dir, WALDir: "pgxlog"})
+	err := Init(Options{DataDir: dir, WALDir: "pgxlog", NoSync: true})
 	if err == nil {
 		t.Fatal("Init accepted a relative WAL directory; want error")
 	}
@@ -34,7 +34,7 @@ func TestInitRejectsNonEmptyWALDir(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(walDir, "lost+found"), 0o700); err != nil {
 		t.Fatalf("setup walDir: %v", err)
 	}
-	err := Init(Options{DataDir: dir, WALDir: walDir})
+	err := Init(Options{DataDir: dir, WALDir: walDir, NoSync: true})
 	if err == nil {
 		t.Fatal("Init accepted a non-empty WAL directory; want error")
 	}
@@ -53,7 +53,7 @@ func TestInitRelocatesWALDir(t *testing.T) {
 	dir := filepath.Join(tmp, "data")
 	walDir := filepath.Join(tmp, "pgxlog") // non-existent: Init must create it
 
-	if err := Init(Options{DataDir: dir, WALDir: walDir}); err != nil {
+	if err := Init(Options{DataDir: dir, WALDir: walDir, NoSync: true}); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
 
@@ -88,7 +88,7 @@ func TestInitRelocatesWALDir(t *testing.T) {
 // a symlink.
 func TestInitDefaultWALDirIsPlainSubdir(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "data")
-	if err := Init(Options{DataDir: dir}); err != nil {
+	if err := Init(Options{DataDir: dir, NoSync: true}); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
 	info, err := os.Lstat(filepath.Join(dir, "pg_wal"))

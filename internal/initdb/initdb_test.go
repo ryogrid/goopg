@@ -18,7 +18,7 @@ import (
 // root.
 func TestInitLaysOutDirectoryStructure(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "data")
-	if err := Init(Options{DataDir: dir}); err != nil {
+	if err := Init(Options{DataDir: dir, NoSync: true}); err != nil {
 		t.Fatal(err)
 	}
 	for _, sub := range Subdirs {
@@ -79,7 +79,7 @@ func TestInitRefusesNonEmptyDir(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "stale"), []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	err := Init(Options{DataDir: dir})
+	err := Init(Options{DataDir: dir, NoSync: true})
 	if err == nil {
 		t.Fatal("expected error for non-empty dir")
 	}
@@ -93,7 +93,7 @@ func TestInitRefusesNonEmptyDir(t *testing.T) {
 // with the right permissions before running goopg init.
 func TestInitAcceptsExistingEmptyDir(t *testing.T) {
 	dir := t.TempDir()
-	if err := Init(Options{DataDir: dir}); err != nil {
+	if err := Init(Options{DataDir: dir, NoSync: true}); err != nil {
 		t.Fatalf("init on empty existing dir: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "PG_VERSION")); err != nil {
@@ -115,7 +115,7 @@ func TestInitRejectsEmptyOption(t *testing.T) {
 // initialised empty page), confirming bootstrapSystemCatalogs ran.
 func TestInitCreatesSystemCatalogRelfiles(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "data")
-	if err := Init(Options{DataDir: dir}); err != nil {
+	if err := Init(Options{DataDir: dir, NoSync: true}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -155,7 +155,7 @@ func TestInitCreatesSystemCatalogRelfiles(t *testing.T) {
 // (not raw zeros) — i.e. InitPage ran successfully.
 func TestSystemCatalogRelfilesAreValidHeapPages(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "data")
-	if err := Init(Options{DataDir: dir}); err != nil {
+	if err := Init(Options{DataDir: dir, NoSync: true}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -202,7 +202,7 @@ func TestSystemCatalogRelfilesAreValidHeapPages(t *testing.T) {
 // goopg init's defaults align with goopg start's defaults.
 func TestPGHBADefaultRules(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "data")
-	if err := Init(Options{DataDir: dir}); err != nil {
+	if err := Init(Options{DataDir: dir, NoSync: true}); err != nil {
 		t.Fatal(err)
 	}
 	body, err := os.ReadFile(filepath.Join(dir, "pg_hba.conf"))
@@ -219,7 +219,7 @@ func TestPGHBADefaultRules(t *testing.T) {
 
 func TestPostgresqlAutoConfHeader(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "data")
-	if err := Init(Options{DataDir: dir}); err != nil {
+	if err := Init(Options{DataDir: dir, NoSync: true}); err != nil {
 		t.Fatal(err)
 	}
 	body, err := os.ReadFile(filepath.Join(dir, "postgresql.auto.conf"))
@@ -241,7 +241,7 @@ func TestPostgresqlAutoConfHeader(t *testing.T) {
 // written during initdb contains decodeable rows for the built-in types.
 func TestBootstrappedPGTypeRowsReadable(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "data")
-	if err := Init(Options{DataDir: dir}); err != nil {
+	if err := Init(Options{DataDir: dir, NoSync: true}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -317,7 +317,7 @@ func TestBootstrappedPGTypeRowsReadable(t *testing.T) {
 // three self-referential system catalog entries.
 func TestBootstrappedPGClassRowsReadable(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "data")
-	if err := Init(Options{DataDir: dir}); err != nil {
+	if err := Init(Options{DataDir: dir, NoSync: true}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -380,7 +380,7 @@ func TestBootstrappedPGClassRowsReadable(t *testing.T) {
 // contains column definitions for all three system catalogs.
 func TestBootstrappedPGAttributeRowsReadable(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "data")
-	if err := Init(Options{DataDir: dir}); err != nil {
+	if err := Init(Options{DataDir: dir, NoSync: true}); err != nil {
 		t.Fatal(err)
 	}
 

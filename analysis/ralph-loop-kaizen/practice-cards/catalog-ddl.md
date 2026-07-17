@@ -16,6 +16,8 @@ mismatches break client tools and dependency tracking silently.
   (see [[codec-storage-change]]).
 - Decode catalog rows **header-driven**, not via bare `DecodeRow` assumptions
   ([[analyze_stats_target_test_failing_at_head]]).
+- Never `-count=1` in a gate run (cache policy:
+  ci/design/test-gate-speedups/05 §1).
 
 ## Known traps
 

@@ -38,6 +38,8 @@ func TestPort_SerialSequenceSurvivesRestart(t *testing.T) {
 		DataDir:      filepath.Join(t.TempDir(), "data"),
 		StartupWait:  20 * time.Second,
 		ShutdownWait: 20 * time.Second,
+		SyncInit:     true,
+		SyncRuntime:  true,
 	})
 	if err != nil {
 		t.Fatal(err)

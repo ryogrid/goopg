@@ -43,7 +43,7 @@ func assertInitFilesExist(t *testing.T, dataDir string) {
 // regenerating the files and PG standbys would fail to attach.
 func TestOpenRegeneratesInitFilesAfterRecoveryUnlink(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "data")
-	if err := Init(Options{DataDir: dir}); err != nil {
+	if err := Init(Options{DataDir: dir, NoSync: true}); err != nil {
 		t.Fatal(err)
 	}
 	// First Open + Close to ensure a clean cluster with init files present.
@@ -83,7 +83,7 @@ func TestOpenRegeneratesInitFilesAfterRecoveryUnlink(t *testing.T) {
 // unlink), the next checkpoint restores the files. M0106-0011 follow-up (b).
 func TestCheckpointRegeneratesInitFiles(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "data")
-	if err := Init(Options{DataDir: dir}); err != nil {
+	if err := Init(Options{DataDir: dir, NoSync: true}); err != nil {
 		t.Fatal(err)
 	}
 	rt, err := Open(OpenOptions{DataDir: dir, PoolSlots: 16})
