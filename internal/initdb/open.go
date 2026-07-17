@@ -1283,15 +1283,15 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: user-mapping DDL replay: %w", err)
 	}
-	// DU-002 (M0119-0004) restart persistence: restore CREATE/DROP TRANSFORM
-	// objects (pg_transform) from the WAL the same way. Order relative to
-	// schema replay does not matter — transforms are keyed by (type name,
-	// language), not by schema OID.
-	if err := replayTransformDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+	// B3.1: transforms reload from the pg_transform HEAP (generic scan, doc
+	// 02a §2) — replaced replayTransformDDLRecords' bespoke WAL scan (kinds
+	// 36/37, retired). Order relative to schema replay does not matter —
+	// transforms are keyed by (type, language), not by schema OID.
+	if err := reloadUserTransformsFromHeap(mgr, cat, clog); err != nil {
 		_ = pool.Close()
 		_ = walWriter.Close()
 		_ = mgr.Close()
-		return nil, fmt.Errorf("goopg: transform DDL replay: %w", err)
+		return nil, fmt.Errorf("goopg: pg_transform reload: %w", err)
 	}
 	// DU-002 restart-persistence follow-up: restore CREATE/DROP CAST objects
 	// (pg_cast) from the WAL the same way. Order relative to transform/schema

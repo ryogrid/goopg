@@ -765,3 +765,47 @@ func TestPort_OpClassFamilySurvivesRestart(t *testing.T) {
 		t.Fatalf("post-restart INTERNAL class-attribution deps = %q, want 2 (member ClassOID lost)", got)
 	}
 }
+
+// TestPort_TransformSurvivesRestart pins B3.1's pg_transform heap
+// journaling: CREATE TRANSFORM reloads from its pg_transform row (kinds
+// 36/37 retired) and DROP TRANSFORM is durable.
+func TestPort_TransformSurvivesRestart(t *testing.T) {
+	c, err := cluster.New("transform-durability", cluster.Options{
+		RepoRoot:     repoRoot(t),
+		DataDir:      filepath.Join(t.TempDir(), "data"),
+		StartupWait:  20 * time.Second,
+		ShutdownWait: 20 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+
+	stmts := []string{
+		"CREATE TRANSFORM FOR int LANGUAGE sql (FROM SQL WITH FUNCTION prsd_lextype(internal), TO SQL WITH FUNCTION int4recv(internal))",
+		"CREATE TRANSFORM FOR float8 LANGUAGE sql (FROM SQL WITH FUNCTION prsd_lextype(internal))",
+		"DROP TRANSFORM FOR float8 LANGUAGE sql",
+	}
+	for _, s := range stmts {
+		if err := runSQLSimple(t, c, s); err != nil {
+			t.Fatalf("%s: %v", s, err)
+		}
+	}
+
+	if err := c.Stop(cluster.ShutdownFast); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	if err := c.Start(); err != nil {
+		t.Fatalf("restart: %v", err)
+	}
+
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_transform WHERE trftype = 23 AND oid >= 16384"); got != "1" {
+		t.Fatalf("post-restart pg_transform count for int = %q, want 1 (transform not reloaded)", got)
+	}
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_transform WHERE trftype = 701 AND oid >= 16384"); got != "0" {
+		t.Fatalf("post-restart dropped transform count = %q, want 0", got)
+	}
+}

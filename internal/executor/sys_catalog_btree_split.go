@@ -112,6 +112,13 @@ func keyMetaForSysBtree(indexOID uint32) (btreeIndexKeyMeta, bool) {
 		return btreeIndexKeyMeta{tupleSize: 16, nkeyatts: 1}, true
 	case pgOperatorOprnameLRNIndexOID:
 		return btreeIndexKeyMeta{tupleSize: 88, nkeyatts: 4}, true
+	// B3.1: pg_transform — both indexes ship as empty metapage-only
+	// placeholders (pg_transform.dat has no builtin rows); the runtime
+	// lazily roots them.
+	case pgTransformOidIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 16, nkeyatts: 1}, true
+	case pgTransformTypeLangIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 16, nkeyatts: 2}, true
 	// B2.2 slice 5: pg_opfamily (2754/2755 populated) + pg_opclass (2687
 	// populated, 2686 empty placeholder) + pg_amop (2653/2654 empty
 	// placeholders) + pg_amproc (2655 populated). The name-bearing keys put
