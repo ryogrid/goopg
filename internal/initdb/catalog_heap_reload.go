@@ -1516,3 +1516,145 @@ func reloadUserPublicationsFromHeap(mgr *storage.Manager, cat *catalog.InMemory,
 	}
 	return nil
 }
+
+// reloadForeignDataFromHeap is B3.4's foreign-data reload — the generic
+// heap-scan replacement for the retired replayForeignServerDDLRecords /
+// replayUserMappingDDLRecords scanners (RecordKinds 126-129). It reloads all
+// three catalogs in dependency order: pg_foreign_data_wrapper (gained
+// durability in B3.4 — none before) → pg_foreign_server (srvfdw OID reversed
+// to the FDW name) → pg_user_mapping (umserver OID → server name, umuser OID
+// → role name). Options are text[] columns decoded to "{a,b}" and split via
+// ParseTextArrayLiteral. Per-database catalogs, so the reload keys under
+// DefaultDBOid (the registries' resolveDBOid default), matching live writes.
+func reloadForeignDataFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+	if err := reloadFdwsFromHeap(mgr, cat, clog); err != nil {
+		return err
+	}
+	if err := reloadForeignServersFromHeap(mgr, cat, clog); err != nil {
+		return err
+	}
+	return reloadUserMappingsFromHeap(mgr, cat, clog)
+}
+
+func decodeOptions(d executor.Datum) []string {
+	if lit := d.StringValue(); lit != "" && lit != "{}" {
+		return executor.ParseTextArrayLiteral(lit)
+	}
+	return nil
+}
+
+func reloadFdwsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+	cols := executor.PGForeignDataWrapperColumnsPG18()
+	rel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 2328, Fork: storage.MainFork}
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_foreign_data_wrapper",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			d := make(executor.Row, len(cols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(d, cols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			if uint32(d[0].Int) < catalog.FirstUserOID {
+				return nil, false, errSkipBuiltinRow
+			}
+			return catalog.ForeignDataWrapper{
+				OID:          uint32(d[0].Int),
+				Name:         d[1].StringValue(),
+				Owner:        uint32(d[2].Int),
+				HandlerOID:   uint32(d[3].Int),
+				ValidatorOID: uint32(d[4].Int),
+				Options:      decodeOptions(d[6]),
+			}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+	for _, raw := range rows {
+		fdw := raw.(catalog.ForeignDataWrapper)
+		cat.RegisterForeignDataWrapperDuringRecovery(&fdw)
+	}
+	return nil
+}
+
+func reloadForeignServersFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+	cols := executor.PGForeignServerColumnsPG18()
+	rel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 1417, Fork: storage.MainFork}
+	type srvRow struct {
+		name, fdwName, srvType, srvVersion string
+		options                            []string
+		oid                                uint32
+	}
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_foreign_server",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			d := make(executor.Row, len(cols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(d, cols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			if uint32(d[0].Int) < catalog.FirstUserOID {
+				return nil, false, errSkipBuiltinRow
+			}
+			fdwName := ""
+			if fdw := cat.LookupForeignDataWrapperByOID(uint32(d[3].Int)); fdw != nil {
+				fdwName = fdw.Name
+			}
+			return srvRow{
+				name:       d[1].StringValue(),
+				fdwName:    fdwName,
+				srvType:    d[4].StringValue(),
+				srvVersion: d[5].StringValue(),
+				options:    decodeOptions(d[7]),
+				oid:        uint32(d[0].Int),
+			}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+	for _, raw := range rows {
+		sr := raw.(srvRow)
+		cat.RegisterForeignServerDuringRecovery(sr.name, sr.fdwName, sr.srvType, sr.srvVersion, sr.options, sr.oid)
+	}
+	return nil
+}
+
+func reloadUserMappingsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+	cols := executor.PGUserMappingColumnsPG18()
+	rel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 1418, Fork: storage.MainFork}
+	type umRow struct {
+		user, server string
+		options      []string
+		oid          uint32
+	}
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_user_mapping",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			d := make(executor.Row, len(cols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(d, cols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			if uint32(d[0].Int) < catalog.FirstUserOID {
+				return nil, false, errSkipBuiltinRow
+			}
+			user := "public"
+			if umuser := uint32(d[1].Int); umuser != 0 {
+				if name := cat.RoleNameForOID(umuser); name != "" {
+					user = name
+				}
+			}
+			server := ""
+			if srv := cat.LookupForeignServerByOID(uint32(d[2].Int)); srv != nil {
+				server = srv.Name
+			}
+			return umRow{user: user, server: server, options: decodeOptions(d[3]), oid: uint32(d[0].Int)}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+	for _, raw := range rows {
+		ur := raw.(umRow)
+		if ur.server == "" {
+			continue // server gone — dead mapping
+		}
+		cat.RegisterUserMappingDuringRecovery(ur.user, ur.server, ur.options, ur.oid)
+	}
+	return nil
+}

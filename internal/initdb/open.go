@@ -1283,27 +1283,11 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: tablespace DDL replay: %w", err)
 	}
-	// M0122-0007 foreign-server registry restart-durability follow-up:
-	// restore CREATE/DROP SERVER entries (pg_foreign_server) from the WAL
-	// the same way. goopg's foreign-server registry has no backing heap
-	// relation, so a fresh cluster otherwise reported zero foreign servers
-	// after every restart.
-	if err := replayForeignServerDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
-		_ = pool.Close()
-		_ = walWriter.Close()
-		_ = mgr.Close()
-		return nil, fmt.Errorf("goopg: foreign-server DDL replay: %w", err)
-	}
-	// M0122-0007 user-mapping registry restart-durability follow-up:
-	// restore CREATE/DROP USER MAPPING entries (pg_user_mapping) from the
-	// WAL the same way, after the foreign-server registry above so a
-	// recovered mapping's referenced server already exists.
-	if err := replayUserMappingDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
-		_ = pool.Close()
-		_ = walWriter.Close()
-		_ = mgr.Close()
-		return nil, fmt.Errorf("goopg: user-mapping DDL replay: %w", err)
-	}
+	// B3.4: the foreign-data trio (pg_foreign_data_wrapper / pg_foreign_server
+	// / pg_user_mapping) reloads from its HEAPS below, near the other
+	// B-phase reloads — after the role registry loads, so a user mapping's
+	// umuser OID reverses to a role name. Replaced replayForeignServerDDL
+	// Records / replayUserMappingDDLRecords (kinds 126-129, retired).
 	// B3.1: transforms reload from the pg_transform HEAP (generic scan, doc
 	// 02a §2) — replaced replayTransformDDLRecords' bespoke WAL scan (kinds
 	// 36/37, retired). Order relative to schema replay does not matter —
@@ -1992,6 +1976,16 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = walWriter.Close()
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: pg_event_trigger reload: %w", err)
+	}
+
+	// B3.4: foreign-data trio reload (FDW → server → user-mapping); runs
+	// after the role reload so umuser reverses to a role name (kinds 126-129
+	// retired).
+	if err := reloadForeignDataFromHeap(mgr, cat, clog); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: foreign-data reload: %w", err)
 	}
 
 	// B3.3: publications reload from the pg_publication + pg_publication_rel

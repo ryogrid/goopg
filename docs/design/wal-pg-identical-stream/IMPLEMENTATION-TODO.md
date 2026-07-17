@@ -466,6 +466,23 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
     TestPort_EnumSurvivesRestart (create/add/rename/drop across restart); waldump += enum DDL.
 - [ ] **B3** extension/config (pg_ts_*, pg_transform, pg_event_trigger, pg_publication*/subscription*,
   pg_statistic_ext, pg_constraint/attrdef/depend). **IN PROGRESS.**
+  - [x] **B3.4 pg_foreign_data_wrapper + pg_foreign_server + pg_user_mapping (kinds 126-129
+    retired)** — LANDED. `sys_pg_foreign.go`: three FormData builders (FDW 7-col, server 8-col,
+    user-mapping 4-col; OPTIONS text[] via the evttags codec; fdwacl/srvacl NULL). Cross-refs
+    resolve name→OID at write and reverse OID→name at reload: server.srvfdw = FDW OID,
+    user-mapping.umserver = server OID + umuser = role OID (0=PUBLIC). **The FDW gained restart
+    durability in this slice — it had NONE before** (no kind, no reload); CREATE SERVER also
+    writes the referenced FDW's row so srvfdw resolves on a standby. Low-traffic → no TID cache
+    (delete-then-insert keeps one live row; CREATE OR REPLACE-analog). Indexes 112/548 + 113/549 +
+    174/175 all empty placeholders → lazy-root. Reload order FDW→server→user-mapping, placed after
+    the role reload so umuser reverses to a role name; new catalog helpers
+    LookupForeignDataWrapperByOID / LookupForeignServer(ByOID) / LookupUserMapping /
+    RegisterForeignDataWrapperDuringRecovery. DROP FDW cascades to its servers (each server row
+    xmax'd). Scanners foreignserver_ddl_recovery.go + usermapping_ddl_recovery.go(+tests) +
+    wal/{foreign_server,user_mapping}_ddl_test.go deleted; kinds 126-129 + 8 codecs + 2 dispatch
+    cases excised; rmgr-mapping test's retired sample → RecordKindDropSubscription.
+    TestPort_ForeignDataSurvivesRestart green (FDW + server→FDW join + user-mapping→server/role
+    + DROP); waldump += CREATE/DROP FDW/SERVER.
   - [x] **B3.3 pg_publication + pg_publication_rel (kinds 50-52 retired)** — LANDED.
     `sys_pg_publication.go`: 9-col FormData_pg_publication (all-scalar: name + owner OID + publish
     bools; pubtruncate/pubviaroot journal false — goopg models neither) with a TID cache
