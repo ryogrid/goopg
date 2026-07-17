@@ -8,6 +8,7 @@ package initdb
 // first user — a pure refactor with zero behavior change.
 
 import (
+	"encoding/binary"
 	"fmt"
 	"math"
 	"sort"
@@ -18,6 +19,7 @@ import (
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/storage"
+	"github.com/goopg/goopg/internal/wal"
 )
 
 // catalogRowLive is the SINGLE liveness filter for catalog-heap reload scans,
@@ -246,15 +248,49 @@ func reloadUserRoutinesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clo
 // errSkipBuiltinRow marks reload rows filtered by policy (decode-level skip).
 var errSkipBuiltinRow = fmt.Errorf("catalog reload: builtin row skipped")
 
-// reloadSequenceHeapTIDs is B1.3's pg_sequence TID seeding: for each live
-// pg_sequence heap row, reverse-map seqrelid to the (already kind-65-
-// restored) sequence and record the row's TID + definition fingerprint so
-// post-restart ALTERs update in place. Rows whose seqrelid no longer
-// resolves (dropped sequence's stale row on a pre-B1.3 dir) are skipped.
-func reloadSequenceHeapTIDs(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+// reloadSequencesFromHeap is B1.3b's sequence reload — the generic
+// heap-scan replacement for the retired replaySequenceDDLRecords scanner
+// (RecordKinds 65/66). The DEFINITION comes from the pg_sequence heap row,
+// the COUNTER from the sequence relation's physical page (block 0, rebuilt
+// by XLOG_SEQ_LOG replay), OWNED BY from the narrow pg_depend rows, and
+// identity/serial column state from the pg_attribute reload (attidentity)
+// plus name-derived serial spelling. Also seeds the pg_sequence TID cache.
+//
+// Pre-B1.3b data dirs (sequences journaled only via kind-65) need re-init:
+// their counters have no physical page and the WAL scanner is gone.
+func reloadSequencesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+	// OWNED BY map: seqrelid → (tableOID, attnum) from pg_depend auto rows.
+	depCols := executor.PGDependColumnsPG18()
+	type depRow struct{ objid, refobjid, refsubid uint32 }
+	depRel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 2608, Fork: storage.MainFork}
+	depRaw, err := scanCatalogHeapRows(mgr, depRel, clog, "pg_depend",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			decoded := make(executor.Row, len(depCols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, depCols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			if uint32(decoded[0].Int) != catalog.RelationRelationId || decoded[6].StringValue() != "a" {
+				return nil, false, errSkipBuiltinRow
+			}
+			return depRow{
+				objid:    uint32(decoded[1].Int),
+				refobjid: uint32(decoded[4].Int),
+				refsubid: uint32(decoded[5].Int),
+			}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+	owned := make(map[uint32]depRow, len(depRaw))
+	for _, raw := range depRaw {
+		d := raw.(depRow)
+		owned[d.objid] = d
+	}
+
 	type seqRow struct {
-		seqrelid uint32
-		tid      storage.ItemPointer
+		decoded executor.Row
+		tid     storage.ItemPointer
 	}
 	rel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 2224, Fork: storage.MainFork}
 	cols := executor.PGSequenceColumnsPG18()
@@ -265,14 +301,17 @@ func reloadSequenceHeapTIDs(mgr *storage.Manager, cat *catalog.InMemory, clog *m
 			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, cols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
 				return nil, false, derr
 			}
-			return seqRow{seqrelid: uint32(decoded[0].Int), tid: tid}, false, nil
+			return seqRow{decoded: decoded, tid: tid}, false, nil
 		})
 	if err != nil {
 		return err
 	}
+	page := make(storage.Page, storage.BlockSize)
 	for _, raw := range rows {
 		sr := raw.(seqRow)
-		tbl, dbOid, ok := cat.LookupTableByOIDAllDBs(sr.seqrelid)
+		d := sr.decoded
+		seqrelid := uint32(d[0].Int)
+		tbl, dbOid, ok := cat.LookupTableByOIDAllDBs(seqrelid)
 		if !ok || tbl == nil || !tbl.IsSequence {
 			continue
 		}
@@ -280,11 +319,79 @@ func reloadSequenceHeapTIDs(mgr *storage.Manager, cat *catalog.InMemory, clog *m
 		if tbl.Schema != "" && tbl.Schema != "public" {
 			name = tbl.Schema + "." + tbl.Name
 		}
-		p, ok := executor.SnapshotSequenceState(name, dbOid)
-		if !ok {
-			continue
+		// Counter from the physical sequence page — it lives at the
+		// USER-DATA location base/<cat.DBOID()> (the session's physical
+		// database), not the catalog-heap base/1 + mirror scheme.
+		seqFile := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: seqrelid, Fork: storage.MainFork}
+		last, called := int64(0), false
+		haveCounter := false
+		if n, nerr := mgr.NBlocks(seqFile); nerr == nil && n > 0 {
+			if rerr := mgr.ReadBlock(seqFile, 0, page); rerr == nil {
+				if ht, herr := storage.PageGetHeapTuple(page, 1); herr == nil && len(ht.Data) >= 17 {
+					last = int64(binary.LittleEndian.Uint64(ht.Data[0:8]))
+					called = ht.Data[16] != 0
+					haveCounter = true
+				}
+			}
 		}
-		executor.SeedSequenceHeapTID(name, dbOid, sr.seqrelid,
+		p := wal.SequenceStatePayload{
+			Name:      name,
+			Start:     d[2].Int,
+			Increment: d[3].Int,
+			Max:       d[4].Int,
+			Min:       d[5].Int,
+			Cache:     d[6].Int,
+			Cycle:     d[7].BoolValue(),
+			DataType:  catalog.OIDToTypeName(uint32(d[1].Int)),
+			DBOid:     dbOid,
+		}
+		if haveCounter {
+			p.Current, p.Called = last, called
+		} else {
+			p.Current, p.Called = p.Start, false
+		}
+		// OWNED BY + identity/serial markers from pg_depend + attidentity.
+		if dep, ok := owned[seqrelid]; ok {
+			if ownTbl, _, ok2 := cat.LookupTableByOIDAllDBs(dep.refobjid); ok2 && ownTbl != nil &&
+				int(dep.refsubid) >= 1 && int(dep.refsubid) <= len(ownTbl.Columns) {
+				col := &ownTbl.Columns[dep.refsubid-1]
+				ownName := ownTbl.Name
+				if ownTbl.Schema != "" && ownTbl.Schema != "public" {
+					ownName = ownTbl.Schema + "." + ownTbl.Name
+				}
+				p.OwnedBy = ownName + "." + col.Name
+				if col.IdentityColumn {
+					p.IdentityKind = 1
+					if col.IdentityAlways {
+						p.IdentityKind = 2
+					}
+				} else {
+					// Serial spelling derives from the base int type; the
+					// auto-increment INSERT path keys on Type.Name.
+					switch strings.ToLower(col.Type.Name) {
+					case "int2", "smallint":
+						p.ColSpelling = "smallserial"
+					case "int8", "bigint":
+						p.ColSpelling = "bigserial"
+					case "int4", "integer", "int":
+						p.ColSpelling = "serial"
+					}
+				}
+			}
+		}
+		executor.RestoreSequenceFromWAL(p)
+		executor.CreateSequenceCatalogRelation(cat, parser.ObjectName{Schema: tbl.Schema, Name: tbl.Name}, name, dbOid)
+		// Restore the owning column's serial spelling (heap-reloaded columns
+		// read back as the base integer type).
+		if p.ColSpelling != "" {
+			if dep, ok := owned[seqrelid]; ok {
+				if ownTbl, _, ok2 := cat.LookupTableByOIDAllDBs(dep.refobjid); ok2 && ownTbl != nil &&
+					int(dep.refsubid) >= 1 && int(dep.refsubid) <= len(ownTbl.Columns) {
+					ownTbl.Columns[dep.refsubid-1].Type.Name = p.ColSpelling
+				}
+			}
+		}
+		executor.SeedSequenceHeapTID(name, dbOid, seqrelid,
 			catalog.SchemaHeapTID{Block: uint32(sr.tid.Block), Offset: sr.tid.Offset}, p)
 	}
 	return nil

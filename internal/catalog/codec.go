@@ -43,6 +43,7 @@ const (
 	pgAttributeOffTypID      = 68
 	pgAttributeOffNum        = 74
 	pgAttributeOffNotNull    = 86
+	pgAttributeOffIdentity   = 89
 	pgAttributeOffIsDropped  = 91
 )
 
@@ -577,12 +578,12 @@ func BaseOIDForArray(oid uint32) (uint32, bool) {
 // Only the subset of columns needed to reconstruct the in-memory
 // catalog state is stored; the full upstream shape is deferred.
 type PGClassRow struct {
-	OID            uint32 // oid
-	RelName        string // relname
-	RelNamespace   uint32 // relnamespace (schema OID)
-	RelKind        string // relkind: 'r'=table,'i'=index,'v'=view,'S'=seq
-	RelNAtts       int32  // relnatts
-	RelFileNode    uint32 // relfilenode (0 for virtual / view)
+	OID          uint32 // oid
+	RelName      string // relname
+	RelNamespace uint32 // relnamespace (schema OID)
+	RelKind      string // relkind: 'r'=table,'i'=index,'v'=view,'S'=seq
+	RelNAtts     int32  // relnatts
+	RelFileNode  uint32 // relfilenode (0 for virtual / view)
 	// RelTablespace holds pg_class.reltablespace (0 = database default).
 	// Only DecodePGClassPhysicalRow populates this (the fixed-offset
 	// PG18-canonical layout); the legacy simple encoding decoded by
@@ -609,6 +610,11 @@ type PGAttributeRow struct {
 	AttNum       int32  // attnum (1-based)
 	AttNotNull   bool   // attnotnull
 	AttIsDropped bool   // attisdropped
+	// AttIdentity is attidentity (0, 'a' ALWAYS, 'd' BY DEFAULT). Decoded
+	// only by the PG-physical DecodePGAttributeRow (B1.3b — the sequence
+	// reload restores IdentityColumn/IdentityAlways from it, replacing the
+	// retired kind-65 IdentityKind marker).
+	AttIdentity byte
 }
 
 // PGTypeRow is the v0 on-disk shape of one pg_type tuple.
@@ -948,6 +954,7 @@ func DecodePGAttributePhysicalRow(data []byte) (PGAttributeRow, error) {
 		AttNum:       attNum,
 		AttNotNull:   attNotNull,
 		AttIsDropped: attIsDropped,
+		AttIdentity:  data[pgAttributeOffIdentity],
 	}
 	if !r.AttIsDropped && r.AttTypID == 0 {
 		return r, fmt.Errorf("pg_attribute.atttypid: invalid 0")
@@ -1393,7 +1400,6 @@ func decodePGIndexOIDVector(data []byte, off int) ([]uint32, int, bool) {
 	}
 	return oids, pgIndexAlign4(off + needed), true
 }
-
 
 // PGStatisticRow holds the fields from pg_statistic needed for in-memory
 // planner statistics reconstruction.

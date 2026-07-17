@@ -422,12 +422,27 @@ func collationNameToOID(name string) uint32 {
 	}
 }
 
+// relamFor returns pg_class.relam per relkind: heap for table-like kinds,
+// InvalidOid for sequences and views — PG's RelationInitTableAccessInfo
+// ASSERTS relam == InvalidOid for RELKIND_SEQUENCE (relcache.c:1841; it
+// installs the heap AM routine itself) and views have no storage at all.
+func relamFor(relkind string) int64 {
+	switch relkind {
+	case "S", "v":
+		return 0
+	default:
+		return pgHeapAccessMethodOID
+	}
+}
+
 // buildUserPGClassRow constructs a 34-column PG18-canonical pg_class row for
 // a user-defined table. Mirrors initdb.pgClassRow's per-column ordering and
 // default values.
 func buildUserPGClassRow(cat catalog.Catalog, tbl *catalog.Table) Row {
 	relkind := "r"
-	if tbl.PartitionMethod != "" {
+	if tbl.IsSequence {
+		relkind = "S" // sequence (B1.3b: sequences get real pg_class rows)
+	} else if tbl.PartitionMethod != "" {
 		relkind = "p" // partitioned table
 	} else if tbl.IsMatView {
 		relkind = "m" // materialized view (has physical storage, unlike a plain view)
@@ -479,7 +494,7 @@ func buildUserPGClassRow(cat catalog.Catalog, tbl *catalog.Table) Row {
 		NewIntDatum(0),                                             // reltype (no composite type seeded yet)
 		NewIntDatum(int64(tbl.OfTypeOID)),                          // reloftype (typed table `OF type`; 0 otherwise, DU-002 slice 374)
 		NewIntDatum(bootstrapSuperuserOID),                         // relowner
-		NewIntDatum(pgHeapAccessMethodOID),                         // relam
+		NewIntDatum(relamFor(relkind)),                             // relam (0 for sequences/views — relcache.c:1841 asserts it)
 		NewIntDatum(relfilenode),                                   // relfilenode
 		NewIntDatum(int64(tbl.Tablespace)),                         // reltablespace (0 = default; explicit CREATE TABLE ... TABLESPACE otherwise, M0122-0007)
 		NewIntDatum(0),                                             // relpages

@@ -60,12 +60,13 @@ const (
 	RmgrHeap2   Rmgr = 9  // RM_HEAP2_ID   — heap multi-insert / vacuum
 	RmgrHeap    Rmgr = 10 // RM_HEAP_ID    — heap insert / delete / update
 	RmgrBtree   Rmgr = 11 // RM_BTREE_ID   — btree insert / split
+	RmgrSeq     Rmgr = 15 // RM_SEQ_ID     — sequence page rewrites (B1.3b)
 
 	// MaxKnownRmgr bounds the real-PG IDs goopg defines symbolic
 	// names for in this slice. Values in (MaxKnownRmgr, RmgrGoopgCatalog)
 	// are rejected by the decoder as a typed "emitted by a newer
 	// version" branch.
-	MaxKnownRmgr Rmgr = RmgrBtree
+	MaxKnownRmgr Rmgr = RmgrSeq
 
 	// RmgrGoopgCustomBase is the first ID in PostgreSQL's reserved
 	// custom-rmgr range (RM_MIN_CUSTOM_ID, upstream

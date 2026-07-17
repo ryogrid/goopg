@@ -17,6 +17,8 @@ import (
 	"sync"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"strings"
+
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/storage"
 	"github.com/goopg/goopg/internal/wal"
@@ -25,8 +27,8 @@ import (
 // pgSequenceRelOID / pgSequenceSeqrelidIndexOID are pg_sequence's relation
 // and pkey-index OIDs (postgres/src/include/catalog/pg_sequence.h).
 const (
-	pgSequenceRelOID            = 2224
-	pgSequenceSeqrelidIndexOID  = 5002
+	pgSequenceRelOID           = 2224
+	pgSequenceSeqrelidIndexOID = 5002
 )
 
 // PGSequenceColumnsPG18 mirrors Form_pg_sequence (8 columns, all fixed).
@@ -60,14 +62,14 @@ func seqTypIDForDataType(dataType string) int64 {
 // snapshot the kind-65 payload carries.
 func buildPGSequenceRow(seqrelid uint32, p wal.SequenceStatePayload) Row {
 	return Row{
-		NewIntDatum(int64(seqrelid)),               // seqrelid
+		NewIntDatum(int64(seqrelid)),                 // seqrelid
 		NewIntDatum(seqTypIDForDataType(p.DataType)), // seqtypid
-		NewIntDatum(p.Start),                       // seqstart
-		NewIntDatum(p.Increment),                   // seqincrement
-		NewIntDatum(p.Max),                         // seqmax
-		NewIntDatum(p.Min),                         // seqmin
-		NewIntDatum(p.Cache),                       // seqcache
-		NewBoolDatum(p.Cycle),                      // seqcycle
+		NewIntDatum(p.Start),                         // seqstart
+		NewIntDatum(p.Increment),                     // seqincrement
+		NewIntDatum(p.Max),                           // seqmax
+		NewIntDatum(p.Min),                           // seqmin
+		NewIntDatum(p.Cache),                         // seqcache
+		NewBoolDatum(p.Cycle),                        // seqcycle
 	}
 }
 
@@ -142,6 +144,10 @@ func syncSequenceDefinitionToCatalogHeap(ctx *Context, name string, p wal.Sequen
 	if v, ok := seqHeapTIDs.Load(key); ok && v.(seqHeapEntry).defSig == sig {
 		return // definition unchanged — counter-only snapshot
 	}
+	// B1.3b: OWNED BY journals as a real pg_depend auto-dependency row
+	// (the retired kind-65 carried it before). Runs on every definition
+	// change; writeSequenceOwnedByDependRow stamps any previous row first.
+	syncSequenceOwnedByDependRow(ctx, seqrelid, p)
 	row := buildPGSequenceRow(seqrelid, p)
 	if v, ok := seqHeapTIDs.Load(key); ok {
 		e := v.(seqHeapEntry)
@@ -216,4 +222,135 @@ func dropSequenceCatalogHeapRow(ctx *Context, name string, dbOid uint32) {
 // in place instead of inserting duplicates.
 func SeedSequenceHeapTID(name string, dbOid uint32, seqrelid uint32, tid catalog.SchemaHeapTID, p wal.SequenceStatePayload) {
 	seqHeapTIDs.Store(seqKey(name, resolveSeqDBOid([]uint32{dbOid})), seqHeapEntry{tid: tid, defSig: seqDefSig(seqrelid, p)})
+}
+
+// ── B1.3b: the physical sequence page + XLOG_SEQ_LOG ────────────────────────
+
+// seqDataColumns is FormData_pg_sequence_data (sequence.h:25): the 1-tuple
+// sequence-relation page's row shape.
+func seqDataColumns() []catalog.Column {
+	return []catalog.Column{
+		{Name: "last_value", Type: catalog.Type{Name: "int8"}},
+		{Name: "log_cnt", Type: catalog.Type{Name: "int8"}},
+		{Name: "is_called", Type: catalog.Type{Name: "bool"}},
+	}
+}
+
+// buildSequenceDataTuple builds the frozen on-page sequence tuple.
+func buildSequenceDataTuple(lastValue, logCnt int64, isCalled bool) ([]byte, error) {
+	row := Row{NewIntDatum(lastValue), NewIntDatum(logCnt), NewBoolDatum(isCalled)}
+	body, err := EncodeRowPG(seqDataColumns(), row)
+	if err != nil {
+		return nil, err
+	}
+	tup := storage.NewHeapTuple(storage.FrozenTransactionID, storage.InvalidTransactionID, body)
+	tup.Header.SetNatts(3)
+	tup.Header.Infomask |= storage.HeapXmaxInvalid
+	return tup.MarshalBinary()
+}
+
+// WriteSequencePageAndLog rewrites the sequence relation's single page
+// (base/<db>/<seqrelid> block 0, PG's fill_seq_fork_with_data shape) and
+// journals it as XLOG_SEQ_LOG (B1.3b — replacing RecordKindSequenceState).
+// A zero seqrelid (registry-only sequence in a pre-conversion dir, or a
+// temporary sequence) is a silent no-op.
+func WriteSequencePageAndLog(ctx *Context, name string, dbOid uint32, lastValue, logCnt int64, isCalled bool) {
+	if ctx == nil || ctx.Pool == nil || ctx.Catalog == nil {
+		return
+	}
+	seqrelid := sequenceRelOIDForName(ctx.Catalog, name, dbOid)
+	if seqrelid == 0 {
+		return
+	}
+	tupleBytes, err := buildSequenceDataTuple(lastValue, logCnt, isCalled)
+	if err != nil {
+		return
+	}
+	// The sequence page follows the USER-DATA file convention (base/<the
+	// session's physical database oid>, e.g. base/5 for postgres sessions —
+	// same as every user table's heap file), NOT the catalog-heap base/1 +
+	// mirror scheme: PG's seq_redo and the promoted standby's nextval both
+	// address base/<dbOid>/<seqrelid> directly.
+	physDBOid := ctx.CurrentDatabaseOid
+	if physDBOid == 0 {
+		physDBOid = dbOid
+	}
+	rel := storage.RelFileNode{DBOid: physDBOid, RelOid: seqrelid, Fork: storage.MainFork}
+	pageBytes, err := wal.BuildSequencePage(tupleBytes)
+	if err != nil {
+		return
+	}
+	nBlocks, err := ctx.Pool.NBlocks(rel)
+	if err != nil {
+		return
+	}
+	var slot *storage.Slot
+	if nBlocks == 0 {
+		s, blk, perr := ctx.Pool.PinNew(rel)
+		if perr != nil || blk != 0 {
+			if perr == nil {
+				ctx.Pool.Unpin(s)
+			}
+			return
+		}
+		slot = s
+	} else {
+		s, perr := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: 0})
+		if perr != nil {
+			return
+		}
+		slot = s
+	}
+	slot.Lock()
+	copy(slot.Page(), pageBytes)
+	// The XLOG_SEQ_LOG record fully covers the change (seq_redo rebuilds the
+	// page from the logged tuple), so the dirty mark rides the record — no
+	// separate FPI needed.
+	_ = ctx.Pool.MarkDirtyChangeRecord(slot, func() (storage.LSN, error) {
+		framed, ferr := wal.EncodeSeqLogPG(rel, tupleBytes)
+		if ferr != nil {
+			return 0, ferr
+		}
+		if ctx.WAL == nil {
+			return 0, nil
+		}
+		_, end, aerr := ctx.WAL.Append(framed)
+		return storage.LSN(end), aerr
+	})
+	slot.Unlock()
+	ctx.Pool.Unpin(slot)
+}
+
+// syncSequenceOwnedByDependRow resolves p.OwnedBy ("table.column" or
+// "schema.table.column") to (tableOID, attnum) and maintains the pg_depend
+// auto row. Empty OwnedBy stamps any existing row (OWNED BY NONE).
+func syncSequenceOwnedByDependRow(ctx *Context, seqrelid uint32, p wal.SequenceStatePayload) {
+	if p.OwnedBy == "" {
+		if ctx.MaterializeWriterXID() == nil {
+			deleteSequenceOwnedByDependRow(ctx, seqrelid, ctx.Tx.XID)
+			mirrorDependCatalogFiles(ctx)
+		}
+		return
+	}
+	lastDot := strings.LastIndex(p.OwnedBy, ".")
+	if lastDot < 0 {
+		return
+	}
+	tblName, colName := p.OwnedBy[:lastDot], p.OwnedBy[lastDot+1:]
+	obj := parser.ObjectName{Name: tblName}
+	if i := strings.LastIndex(tblName, "."); i >= 0 {
+		obj = parser.ObjectName{Schema: tblName[:i], Name: tblName[i+1:]}
+	}
+	tbl, ok := ctx.Catalog.LookupTable(obj, catalog.NamespaceDBOid(p.DBOid))
+	if !ok || tbl == nil {
+		return
+	}
+	for i := range tbl.Columns {
+		if strings.EqualFold(tbl.Columns[i].Name, colName) {
+			if writeSequenceOwnedByDependRow(ctx, seqrelid, tbl.OID, int32(i+1)) == nil {
+				mirrorDependCatalogFiles(ctx)
+			}
+			return
+		}
+	}
 }

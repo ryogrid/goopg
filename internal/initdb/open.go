@@ -1526,22 +1526,18 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// applied) — the heap-reloaded serial columns read back as their base
 	// integer type because pg_attribute stores the PG-canonical atttypid.
 	// See internal/initdb/sequence_ddl_recovery.go.
-	if err := replaySequenceDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
-		_ = pool.Close()
-		_ = walWriter.Close()
-		_ = mgr.Close()
-		return nil, fmt.Errorf("goopg: sequence DDL replay: %w", err)
-	}
-	// B1.3: seed the pg_sequence heap-row TID cache from the heap so a
-	// post-restart ALTER SEQUENCE updates its row in place instead of
-	// inserting a duplicate. Runs AFTER the kind-65 replay above (which is
-	// still the definition/counter source of truth until B1.3b) — the heap
-	// rows are the PG-parity surface.
-	if err := reloadSequenceHeapTIDs(mgr, cat, clog); err != nil {
-		_ = pool.Close()
-		_ = walWriter.Close()
-		_ = mgr.Close()
-		return nil, fmt.Errorf("goopg: pg_sequence TID reload: %w", err)
+	// B1.3b: sequences reload from the HEAPS + the physical sequence page —
+	// definition from pg_sequence, counter from the XLOG_SEQ_LOG-replayed
+	// page, OWNED BY from pg_depend, identity from attidentity. Replaced
+	// replaySequenceDDLRecords' bespoke WAL scan (kinds 65/66, retired) and
+	// folds in the former reloadSequenceHeapTIDs TID seeding.
+	if cat != nil {
+		if err := reloadSequencesFromHeap(mgr, cat, clog); err != nil {
+			_ = pool.Close()
+			_ = walWriter.Close()
+			_ = mgr.Close()
+			return nil, fmt.Errorf("goopg: sequence heap reload: %w", err)
+		}
 	}
 
 	// Column DEFAULT persistence (root-0020 follow-up): re-parse the DEFAULT
@@ -2794,7 +2790,7 @@ func loadUserTablesFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, cl
 	var userTableRows []recoveredPGClassRow
 	for _, r := range classRows {
 		rec := r.(recoveredPGClassRow)
-		if (rec.row.RelKind == "r" || rec.row.RelKind == "m" || rec.row.RelKind == "v") && rec.row.OID >= catalog.FirstUserOID {
+		if (rec.row.RelKind == "r" || rec.row.RelKind == "m" || rec.row.RelKind == "v" || rec.row.RelKind == "S") && rec.row.OID >= catalog.FirstUserOID {
 			userTableRows = append(userTableRows, rec)
 		}
 	}
@@ -2859,6 +2855,10 @@ func loadUserTablesFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, cl
 				Type:    catalog.Type{Name: catalog.OIDToTypeName(typOID), IsArray: isArray},
 				NotNull: ar.AttNotNull,
 				Ordinal: i,
+				// B1.3b: attidentity round-trips through the heap (the
+				// retired kind-65 IdentityKind marker's replacement).
+				IdentityColumn: ar.AttIdentity != 0,
+				IdentityAlways: ar.AttIdentity == 'a',
 			}
 		}
 
@@ -2886,11 +2886,15 @@ func loadUserTablesFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, cl
 			// restored afterward by replayMatViewRecords (the AST/populated
 			// flag have no heap representation — see RecordKindCreateMatView).
 			IsMatView: tr.RelKind == "m",
+			// B1.3b: sequences (relkind 'S') register as virtual sequence
+			// relations; reloadSequencesFromHeap re-wires the SELECT-able
+			// VirtualRows closure + the counter afterwards.
+			IsSequence: tr.RelKind == "S",
 			// A plain view (relkind='v') has no physical heap storage — mirror
 			// catalog.InMemory.CreateView's Virtual=true. View/ViewDef are
 			// restored afterward by replayViewRecords (the AST has no heap
 			// representation — see RecordKindCreateView).
-			Virtual: tr.RelKind == "v",
+			Virtual: tr.RelKind == "v" || tr.RelKind == "S",
 		}
 		if tr.RelFileNode != 0 && tr.RelFileNode != tr.OID {
 			tbl.RelFileNodeOID = tr.RelFileNode

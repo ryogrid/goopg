@@ -219,6 +219,17 @@ func runFailoverGoopgToPG(t *testing.T, repo, pgBasebackupBin, psqlBin string, m
 		"CREATE TYPE public.b2prep_rng AS RANGE (subtype = int4)"); err != nil {
 		t.Fatalf("create range type on goopg primary: %v", err)
 	}
+	// B1.3b: sequences journal as RM_SEQ XLOG_SEQ_LOG page rewrites (kinds
+	// 65/66 retired — previously ANY sequence DDL killed the standby with
+	// "resource manager with ID 128 not registered").
+	if err := runSQLSimple(t, primary,
+		"CREATE SEQUENCE public.b2prep_seq INCREMENT 3"); err != nil {
+		t.Fatalf("create sequence on goopg primary: %v", err)
+	}
+	if err := runSQLSimple(t, primary,
+		"SELECT setval('public.b2prep_seq', 90)"); err != nil {
+		t.Fatalf("setval on goopg primary: %v", err)
+	}
 
 	dsn := fmt.Sprintf("host=%s port=%s user=%s dbname=%s sslmode=disable",
 		"127.0.0.1", mustGoopgPort(primary.ListenAddr()), "postgres", "postgres")
@@ -368,6 +379,12 @@ func runFailoverGoopgToPG(t *testing.T, repo, pgBasebackupBin, psqlBin string, m
 	if got := pgScalar(t, standby,
 		"SELECT '[1,5)'::public.b2prep_rng::text"); got != "[1,5)" {
 		t.Fatalf("post-failover range cast = %q, want [1,5)", got)
+	}
+	// B1.3b: the promoted PG serves nextval from the goopg-written physical
+	// sequence page (setval'd to 90, increment 3 ⇒ 93).
+	if got := pgScalar(t, standby,
+		"SELECT nextval('public.b2prep_seq')"); got != "93" {
+		t.Fatalf("post-failover nextval = %q, want 93", got)
 	}
 }
 

@@ -6097,11 +6097,10 @@ func (o *ddlOp) dropTableByRefImmediate(name parser.ObjectName, tbl *catalog.Tab
 	}
 	// Drop sequences that are owned by columns of this table (created via
 	// ALTER SEQUENCE ... OWNED BY table.col, or SERIAL column defaults).
-	// Restart persistence: log a removal record for every implicit sequence
-	// the table owned, so replay does not resurrect them after the DROP TABLE.
+	// B1.3b: kind-66 retired — the pg_sequence/pg_class heap deletes below
+	// ARE the journal for every implicit sequence the table owned.
 	for _, seqName := range DropSequencesOwnedByTable(tbl.Name, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 		if o.ctx.WAL != nil {
-			_, _, _ = o.ctx.WAL.Append(wal.EncodeDropSequence(seqName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)))
 			dropSequenceCatalogHeapRow(o.ctx, seqName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) // B1.3: pg_sequence heap row
 		}
 	}
@@ -7150,9 +7149,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			dbOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
 			if RenameSequence(oldFull, newFull, dbOid) || RenameSequence(oldBare, newFull, dbOid) {
 				if o.ctx.WAL != nil {
-					_, _, _ = o.ctx.WAL.Append(wal.EncodeDropSequence(strings.ToLower(strings.TrimSpace(oldFull)), dbOid))
 					dropSequenceCatalogHeapRow(o.ctx, strings.ToLower(strings.TrimSpace(oldFull)), dbOid) // B1.3: pg_sequence heap row
-					_, _, _ = o.ctx.WAL.Append(wal.EncodeDropSequence(strings.ToLower(strings.TrimSpace(oldBare)), dbOid))
 					dropSequenceCatalogHeapRow(o.ctx, strings.ToLower(strings.TrimSpace(oldBare)), dbOid) // B1.3: pg_sequence heap row
 				}
 				WALLogSequenceState(o.ctx, newFull)
@@ -7371,7 +7368,6 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					// Restart persistence: retire the old name and log the
 					// renamed sequence's state under the new one.
 					if o.ctx.WAL != nil {
-						_, _, _ = o.ctx.WAL.Append(wal.EncodeDropSequence(strings.ToLower(strings.TrimSpace(oldName)), dbOid))
 						dropSequenceCatalogHeapRow(o.ctx, strings.ToLower(strings.TrimSpace(oldName)), dbOid) // B1.3: pg_sequence heap row
 					}
 					WALLogSequenceState(o.ctx, newName)
@@ -8034,9 +8030,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				// sequence's state under the new one (both name forms — the
 				// registry may hold either the bare or qualified key).
 				if o.ctx.WAL != nil {
-					_, _, _ = o.ctx.WAL.Append(wal.EncodeDropSequence(strings.ToLower(strings.TrimSpace(oldFull)), seqDBOid))
 					dropSequenceCatalogHeapRow(o.ctx, strings.ToLower(strings.TrimSpace(oldFull)), seqDBOid) // B1.3: pg_sequence heap row
-					_, _, _ = o.ctx.WAL.Append(wal.EncodeDropSequence(strings.ToLower(strings.TrimSpace(oldBare)), seqDBOid))
 					dropSequenceCatalogHeapRow(o.ctx, strings.ToLower(strings.TrimSpace(oldBare)), seqDBOid) // B1.3: pg_sequence heap row
 				}
 				WALLogSequenceState(o.ctx, newFull)
@@ -14003,6 +13997,12 @@ func (o *ddlOp) execCreateSequence(s *parser.CreateSequenceStmt) error {
 // identity sequence is discoverable by pg_dump. M0110-0001 (DU-002 slice 120).
 func (o *ddlOp) createSeqCatalogTable(seqObjName parser.ObjectName, name string) {
 	CreateSequenceCatalogRelation(o.ctx.Catalog, seqObjName, name, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
+	// B1.3b: the sequence's pg_class row is the reload's ONLY source of its
+	// name/schema (the retired kind-65 carried them before). Write it like
+	// any relation; the sequence reload re-registers the virtual relation.
+	if seqTbl, ok := o.ctx.Catalog.LookupTable(seqObjName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); ok && seqTbl != nil {
+		syncTableToCatalogHeap(o.ctx, seqTbl)
+	}
 }
 
 // CreateSequenceCatalogRelation is the ddlOp-independent core of
@@ -15130,7 +15130,6 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 			// Restart persistence: record the removal so startup replay does
 			// not resurrect the sequence. See RecordKindDropSequence.
 			if o.ctx.WAL != nil {
-				_, _, _ = o.ctx.WAL.Append(wal.EncodeDropSequence(strings.ToLower(strings.TrimSpace(name.String())), seqDBOid))
 				dropSequenceCatalogHeapRow(o.ctx, strings.ToLower(strings.TrimSpace(name.String())), seqDBOid) // B1.3: pg_sequence heap row
 			}
 			// Remove the virtual catalog entry created for SELECT * FROM seq_name. M0097-0024.
@@ -17924,9 +17923,7 @@ func (o *ddlOp) execAlterSchema(s *parser.AlterSchemaStmt) error {
 			seqDBOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
 			if RenameSequence(oldFull, newFull, seqDBOid) || RenameSequence(tbl.Name, newFull, seqDBOid) {
 				if o.ctx.WAL != nil {
-					_, _, _ = o.ctx.WAL.Append(wal.EncodeDropSequence(strings.ToLower(strings.TrimSpace(oldFull)), seqDBOid))
 					dropSequenceCatalogHeapRow(o.ctx, strings.ToLower(strings.TrimSpace(oldFull)), seqDBOid) // B1.3: pg_sequence heap row
-					_, _, _ = o.ctx.WAL.Append(wal.EncodeDropSequence(strings.ToLower(strings.TrimSpace(tbl.Name)), seqDBOid))
 					dropSequenceCatalogHeapRow(o.ctx, strings.ToLower(strings.TrimSpace(tbl.Name)), seqDBOid) // B1.3: pg_sequence heap row
 				}
 				WALLogSequenceState(o.ctx, newFull)

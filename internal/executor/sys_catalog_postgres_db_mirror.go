@@ -160,6 +160,12 @@ func mirrorTouchedCatalogsToPostgresDB(ctx *Context) error {
 		pgProcRelOID,                 // 1255
 		pgProcOidIndexOID,            // 2690
 		pgProcPronameArgsNspIndexOID, // 2691
+		// B1.3b: the sequence reload reads pg_sequence + pg_depend from
+		// base/5 (cat.DBOID()) — without these the registry reload found
+		// ZERO rows (B1.3's TID reseed silently no-op'd the same way).
+		pgSequenceRelOID,           // 2224 pg_sequence
+		pgSequenceSeqrelidIndexOID, // 5002
+		pgDependRelOID,             // 2608 pg_depend (narrow OWNED-BY rows)
 	}
 	for _, oid := range mirroredOIDs {
 		if err := mirrorCatalogRelToPostgresDB(ctx, oid); err != nil {

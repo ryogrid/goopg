@@ -768,46 +768,7 @@ const (
 	//   schema(schemaLen bytes) | newSchemaLen(2) | newSchema(newSchemaLen bytes)
 	RecordKindAlterConversionSetSchema byte = 132
 
-	// RecordKindSequenceState records the FULL state of one sequence
-	// (definition + current counter) so sequences — including the implicit
-	// sequences backing SERIAL/IDENTITY columns — survive a restart. goopg's
-	// sequence registry is in-memory only (executor seqRegistry), and the
-	// pg_attribute heap stores a serial column's atttypid as the base integer
-	// type (PG-canonical, readable by a real PG18 standby), so without this
-	// record both the sequence and the column's serial-ness vanished on
-	// restart and auto-increment INSERTs failed (surfaced by WordPress:
-	// wp_usermeta.umeta_id NOT NULL violations after the first restart).
-	//
-	// The record is emitted (a) whenever a sequence is registered or altered
-	// (CREATE TABLE with SERIAL/IDENTITY, CREATE/ALTER SEQUENCE, setval,
-	// TRUNCATE ... RESTART IDENTITY), and (b) periodically from nextval —
-	// every 32nd fetch it logs the state with Current advanced 32 values
-	// AHEAD of the fetched value, mirroring upstream's SEQ_LOG_VALS
-	// pre-logging (postgres/src/backend/commands/sequence.c, xl_seq_rec):
-	// replaying the pre-logged horizon never repeats a handed-out value, at
-	// the cost of a gap of at most 32 values after a crash — exactly PG's
-	// documented behavior. The periodic re-emit also makes actively-used
-	// sequences self-healing against checkpoint-driven WAL segment pruning
-	// (the same latent limitation the whole logical-DDL record family has).
-	//
-	// Replay is last-record-wins (replaySequenceDDLRecords): each record
-	// fully re-registers the sequence, so create/alter/setval/advance all
-	// share this one kind. Format:
-	//   kind(1) | flags(1: bit0=cycle bit1=called) | identityKind(1:
-	//   0=none 1=BY DEFAULT 2=ALWAYS) | start(8) | increment(8) | min(8) |
-	//   max(8) | cache(8) | current(8) | nameLen(2)+name |
-	//   dataTypeLen(2)+dataType | ownedByLen(2)+ownedBy |
-	//   colSpellingLen(2)+colSpelling
-	// ownedBy is "table.column" for implicit serial/identity sequences (and
-	// explicit OWNED BY); colSpelling is the serial spelling ("bigserial",
-	// "serial", ...) when the sequence backs a SERIAL column, so replay can
-	// restore the column's catalog type (the auto-increment path keys on it).
-	RecordKindSequenceState byte = 65
 
-	// RecordKindDropSequence records a sequence removal (DROP SEQUENCE, or
-	// DROP TABLE cascading to the implicit sequences it owns) so replay does
-	// not resurrect it. Format: kind(1) | nameLen(2) | name.
-	RecordKindDropSequence byte = 66
 
 	// RecordKindRoleState records the FULL state of one role (name +
 	// attribute flags + password verifier) so CREATE/ALTER ROLE survive a
@@ -1406,99 +1367,6 @@ type SequenceStatePayload struct {
 	DBOid        uint32 // owning database oid (M0122-0007 4e); 0 on a pre-4e record, see DecodeSequenceState
 }
 
-// EncodeSequenceState encodes a RecordKindSequenceState record.
-func EncodeSequenceState(p SequenceStatePayload) []byte {
-	var buf bytes.Buffer
-	buf.WriteByte(RecordKindSequenceState)
-	var flags byte
-	if p.Cycle {
-		flags |= 1 << 0
-	}
-	if p.Called {
-		flags |= 1 << 1
-	}
-	buf.WriteByte(flags)
-	buf.WriteByte(p.IdentityKind)
-	var i64 [8]byte
-	for _, v := range []int64{p.Start, p.Increment, p.Min, p.Max, p.Cache, p.Current} {
-		binary.LittleEndian.PutUint64(i64[:], uint64(v))
-		buf.Write(i64[:])
-	}
-	writeStr16 := func(s string) {
-		if len(s) > 0xFFFF {
-			s = s[:0xFFFF]
-		}
-		var l [2]byte
-		binary.LittleEndian.PutUint16(l[:], uint16(len(s)))
-		buf.Write(l[:])
-		buf.WriteString(s)
-	}
-	writeStr16(p.Name)
-	writeStr16(p.DataType)
-	writeStr16(p.OwnedBy)
-	writeStr16(p.ColSpelling)
-	// DBOid is appended as a trailing 4-byte field (M0122-0007 4e) so a
-	// pre-existing WAL record with no trailer still decodes — see
-	// DecodeSequenceState's short-read handling.
-	var oidBuf [4]byte
-	binary.LittleEndian.PutUint32(oidBuf[:], p.DBOid)
-	buf.Write(oidBuf[:])
-	return buf.Bytes()
-}
-
-// DecodeSequenceState decodes a RecordKindSequenceState payload.
-func DecodeSequenceState(payload []byte) (SequenceStatePayload, error) {
-	var p SequenceStatePayload
-	const fixed = 1 + 1 + 1 + 6*8 // kind + flags + identityKind + six int64s
-	if len(payload) < fixed {
-		return p, fmt.Errorf("wal: sequence-state payload too short (%d bytes)", len(payload))
-	}
-	if payload[0] != RecordKindSequenceState {
-		return p, fmt.Errorf("wal: record kind %d is not sequence-state", payload[0])
-	}
-	flags := payload[1]
-	p.Cycle = flags&(1<<0) != 0
-	p.Called = flags&(1<<1) != 0
-	p.IdentityKind = payload[2]
-	off := 3
-	for _, dst := range []*int64{&p.Start, &p.Increment, &p.Min, &p.Max, &p.Cache, &p.Current} {
-		*dst = int64(binary.LittleEndian.Uint64(payload[off : off+8]))
-		off += 8
-	}
-	readStr16 := func() (string, error) {
-		if len(payload) < off+2 {
-			return "", fmt.Errorf("wal: sequence-state payload truncated at offset %d", off)
-		}
-		l := int(binary.LittleEndian.Uint16(payload[off : off+2]))
-		off += 2
-		if len(payload) < off+l {
-			return "", fmt.Errorf("wal: sequence-state string truncated (need %d bytes at %d)", l, off)
-		}
-		s := string(payload[off : off+l])
-		off += l
-		return s, nil
-	}
-	var err error
-	if p.Name, err = readStr16(); err != nil {
-		return p, err
-	}
-	if p.DataType, err = readStr16(); err != nil {
-		return p, err
-	}
-	if p.OwnedBy, err = readStr16(); err != nil {
-		return p, err
-	}
-	if p.ColSpelling, err = readStr16(); err != nil {
-		return p, err
-	}
-	// DBOid is 0 (DefaultDBOid via NamespaceDBOid) for a pre-4e payload that
-	// predates the trailing dbOid field.
-	if len(payload) >= off+4 {
-		p.DBOid = binary.LittleEndian.Uint32(payload[off : off+4])
-		off += 4
-	}
-	return p, nil
-}
 
 // RoleStatePayload is the decoded form of a RecordKindRoleState record: one
 // role's name, OID, attribute flags, and stored credential. See the
@@ -2816,43 +2684,6 @@ func DecodeDropAmProcMember(payload []byte) (familyOID, leftType, rightType, pro
 	return familyOID, leftType, rightType, procNum, nil
 }
 
-// EncodeDropSequence encodes a RecordKindDropSequence record.
-// Format identical to EncodeDropDatabase: kind(1) | nameLen(2) | name, plus a
-// trailing 4-byte dbOid (M0122-0007 4e) appended after the name so a
-// pre-existing WAL record with no trailer still decodes — see
-// DecodeDropSequence's short-read handling.
-func EncodeDropSequence(name string, dbOid uint32) []byte {
-	if len(name) > 0xFFFF {
-		name = name[:0xFFFF]
-	}
-	out := make([]byte, 3+len(name)+4)
-	out[0] = RecordKindDropSequence
-	binary.LittleEndian.PutUint16(out[1:3], uint16(len(name)))
-	copy(out[3:], name)
-	binary.LittleEndian.PutUint32(out[3+len(name):], dbOid)
-	return out
-}
-
-// DecodeDropSequence decodes a RecordKindDropSequence payload. dbOid is 0
-// (DefaultDBOid via NamespaceDBOid) for a pre-4e payload that predates the
-// trailing dbOid field.
-func DecodeDropSequence(payload []byte) (name string, dbOid uint32, err error) {
-	if len(payload) < 3 {
-		return "", 0, fmt.Errorf("wal: drop-sequence payload too short (%d bytes)", len(payload))
-	}
-	if payload[0] != RecordKindDropSequence {
-		return "", 0, fmt.Errorf("wal: record kind %d is not drop-sequence", payload[0])
-	}
-	nameLen := int(binary.LittleEndian.Uint16(payload[1:3]))
-	if len(payload) < 3+nameLen {
-		return "", 0, fmt.Errorf("wal: drop-sequence payload truncated (need %d bytes)", 3+nameLen)
-	}
-	name = string(payload[3 : 3+nameLen])
-	if off := 3 + nameLen; len(payload) >= off+4 {
-		dbOid = binary.LittleEndian.Uint32(payload[off : off+4])
-	}
-	return name, dbOid, nil
-}
 
 
 
@@ -8014,16 +7845,6 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 		// these records after physical replay and re-applies them to the
 		// catalog's cast registry.
 		return false, nil
-	case RecordKindSequenceState, RecordKindDropSequence:
-		// Sequence state / removal records (SERIAL restart persistence)
-		// carry only the executor's in-memory sequence registry state; a
-		// sequence has no physical relation file in goopg, so the physical
-		// replay path has nothing to do. The recovery driver in
-		// internal/initdb/sequence_ddl_recovery.go scans the WAL for these
-		// records after physical replay (and after loadUserTablesFromHeap)
-		// and re-applies them to the sequence registry + the owning
-		// column's serial/identity catalog markers.
-		return false, nil
 	case RecordKindRoleState, RecordKindDropRole, RecordKindAlterRoleRename:
 		// Role state / removal / rename records (CREATE/ALTER/DROP ROLE
 		// restart persistence) carry only the in-memory role registry state +
@@ -8349,6 +8170,18 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 			return false, nil
 		case xlogXactAbort:
 			return false, nil
+		default:
+			return false, unsupportedDecodedXLogRecord(r)
+		}
+	case RmgrSeq:
+		switch xlog.Header.Info & XLRRmgrInfoMask {
+		case xlogSeqLog:
+			// B1.3b: rebuild the 1-tuple sequence page from the logged
+			// tuple (seq_redo analog; whole-page replace = idempotent).
+			if err := replayDecodedXLogSeqLog(mgr, xlog.MainData); err != nil {
+				return false, err
+			}
+			return true, nil
 		default:
 			return false, unsupportedDecodedXLogRecord(r)
 		}

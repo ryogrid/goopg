@@ -1834,6 +1834,7 @@ func bootstrapPostgresDatabase(dataDir string, encodingID int32, locale localeSe
 		2690, 2691, // pg_proc_oid_index, pg_proc_proname_args_nsp_index
 		// 2692, 2693: dedicated bootstrappers (pg_rewrite_oid_index/pg_rewrite_rel_rulename_index)
 		2701, 2703,
+		5002, // pg_sequence_seqrelid_index (B1.3b: runtime inserts route to base/1; without this placeholder the file auto-created 0-byte and every insert silently skipped)
 		2754, // pg_opfamily_am_name_nsp_index (Step 3bn)
 		2755, // pg_opfamily_oid_index (Step 3bo)
 		2704, 3085, 3164,

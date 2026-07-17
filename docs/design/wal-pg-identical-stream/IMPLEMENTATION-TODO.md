@@ -266,7 +266,22 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
     sequence DDL (real pg_waldump parses all B1 records). New
     TestPort_SequenceCatalogRowSurvivesRestart (post-restart ALTER updates in place). Gate: all units,
     initdb 227s, regress 298s, isolation, durability ×4, e2e failover — green.
-  - [ ] **B1.3b** (optional / ledger) `XLOG_SEQ_LOG` flip for the sequence-relation counter page.
+  - [x] **B1.3b** — LANDED. `XLOG_SEQ_LOG` flip complete: kinds 65/66 retired —
+    **RmgrGoopgCatalog now emits ZERO records in the whole B1/B2.1 scope**. The sequence relation
+    is a REAL 1-page file at the USER-DATA location base/<session physical dbOid>/<seqrelid>
+    (page: SEQ_MAGIC 0x1717 special + one frozen {last_value,log_cnt,is_called} tuple placed by
+    hand — goopg's PageAddItemRaw ignores pd_special and clobbered the magic); counter changes
+    ride RM_SEQ(15) XLOG_SEQ_LOG (block-ref WILL_INIT + xl_seq_rec + raw tuple; replay rebuilds
+    the page — seq_redo-identical, no FPI, MarkDirtyChangeRecord). Definition reloads from the
+    FULL pg_sequence heap decode; counter from the page; OWNED BY from NEW narrow pg_depend
+    auto-rows (sys_pg_depend.go); identity from pg_attribute.attidentity (now decoded — offset
+    89); serial spelling derived. Sequences got REAL pg_class rows (relkind='S', **relam=0** —
+    relcache.c:1841 ASSERTS InvalidOid for sequences; views fixed to 0 too) and the table reload
+    accepts relkind 'S'. Mirror set += 2224/5002/2608 (the B1.3 TID reseed had silently read ZERO
+    rows — base/5 never had them); base/1 placeholder list += 5002 (was a 0-byte auto-created
+    file; inserts silently skipped). e2e failover: goopg CREATE SEQUENCE + setval(90) → promoted
+    real PG reads last_value=90 from the page and `nextval` returns 93 — PG natively continuing
+    goopg's sequence. Old data dirs need re-init (the kind-65 scanner is gone).
 - [x] **B2-prep** descent-aware catalog-btree insert — LANDED. The multi-level machinery
   (readSysBtreeMeta/descendSysBtreeToLeaf/insertIntoExistingLeaf/rebuildSysBtreeWithNewEntry,
   M0106-0010 batched-41) already existed; the real gaps were (1) `keyMetaForSysBtree` registration —
