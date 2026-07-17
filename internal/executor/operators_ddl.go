@@ -1181,16 +1181,11 @@ func (o *ddlOp) execCreateEventTrigger(s *parser.CreateEventTriggerStmt) error {
 	if err != nil {
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 	}
-	// DU-002 restart-persistence follow-up (M0119-0004, loop #70 ledger
-	// resume point): goopg has no per-event-trigger on-disk file namespace,
-	// so record a WAL event the recovery driver
-	// (internal/initdb/event_trigger_ddl_recovery.go) replays into the
-	// eventTriggers registry on the next startup. Mirrors CREATE
-	// PUBLICATION.
-	if o.ctx.WAL != nil {
-		if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateEventTrigger(et.Name, et.Event, et.Tags, et.OID, et.Owner, et.FuncOID)); werr != nil {
-			return fmt.Errorf("wal create-event-trigger: %w", werr)
-		}
+	// B3.2 (doc 02d §2): the event trigger journals as a real
+	// pg_event_trigger heap row + 3467/3468 entries (kind 56 retired); the
+	// startup reload reconstructs the registry from the heap.
+	if err := upsertEventTriggerCatalogRow(o.ctx, et); err != nil {
+		return fmt.Errorf("pg_event_trigger journal: %w", err)
 	}
 	return nil
 }
@@ -1211,12 +1206,11 @@ func (o *ddlOp) execAlterEventTrigger(s *parser.AlterEventTriggerStmt) error {
 	notFoundErr := func(err error) *ExecError {
 		return &ExecError{Code: "42704", Pos: s.Pos(), Message: err.Error()}
 	}
-	logEnabled := func(code byte) error {
-		if o.ctx.WAL == nil {
-			return nil
-		}
-		if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterEventTriggerEnabled(s.Name, code)); werr != nil {
-			return fmt.Errorf("wal alter-event-trigger-enabled: %w", werr)
+	// B3.2: an ENABLE/DISABLE variant is a canonical pg_event_trigger heap
+	// UPDATE of the evtenabled column (kind 58 retired).
+	logEnabled := func(byte) error {
+		if et, ok := im.LookupEventTrigger(s.Name); ok {
+			return upsertEventTriggerCatalogRow(o.ctx, et)
 		}
 		return nil
 	}
@@ -1256,9 +1250,12 @@ func (o *ddlOp) execAlterEventTrigger(s *parser.AlterEventTriggerStmt) error {
 			}
 			return notFoundErr(err)
 		}
-		if o.ctx.WAL != nil {
-			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterEventTriggerRename(s.Name, s.NewName)); werr != nil {
-				return fmt.Errorf("wal alter-event-trigger-rename: %w", werr)
+		// B3.2: the rename is a canonical pg_event_trigger heap UPDATE
+		// (kind 59 retired) — evtname changed, so the row moves under the
+		// new name's key.
+		if et, ok := im.LookupEventTrigger(s.NewName); ok {
+			if uerr := upsertEventTriggerCatalogRow(o.ctx, et); uerr != nil {
+				return uerr
 			}
 		}
 	case "owner":
@@ -1276,9 +1273,11 @@ func (o *ddlOp) execAlterEventTrigger(s *parser.AlterEventTriggerStmt) error {
 		if err := im.SetEventTriggerOwner(s.Name, ownerOID); err != nil {
 			return notFoundErr(err)
 		}
-		if o.ctx.WAL != nil {
-			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterEventTriggerOwner(s.Name, ownerOID)); werr != nil {
-				return fmt.Errorf("wal alter-event-trigger-owner: %w", werr)
+		// B3.2: the owner change is a canonical pg_event_trigger heap
+		// UPDATE (kind 60 retired).
+		if et, ok := im.LookupEventTrigger(s.Name); ok {
+			if uerr := upsertEventTriggerCatalogRow(o.ctx, et); uerr != nil {
+				return uerr
 			}
 		}
 	default:
@@ -15442,14 +15441,16 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 			// through pg_dump.
 			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
 				name := s.Names[0].String()
+				// B3.2: capture the OID before the registry drop, then
+				// stamp xmax on the pg_event_trigger heap row (kind 57
+				// retired).
+				var evtOID uint32
+				if et, found := im.LookupEventTrigger(name); found {
+					evtOID = et.OID
+				}
 				if im.DropEventTrigger(name) {
-					// DU-002 restart-persistence follow-up (M0119-0004,
-					// loop #70 ledger resume point): mirrors DROP
-					// PUBLICATION/SUBSCRIPTION.
-					if o.ctx.WAL != nil {
-						if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropEventTrigger(name)); werr != nil {
-							return fmt.Errorf("wal drop-event-trigger: %w", werr)
-						}
+					if evtOID != 0 {
+						deleteEventTriggerCatalogRow(o.ctx, evtOID)
 					}
 					return nil
 				}

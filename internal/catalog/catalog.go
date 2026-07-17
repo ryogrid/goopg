@@ -2370,6 +2370,9 @@ type InMemory struct {
 	// journal as canonical heap UPDATEs at the cached TID.
 	collationHeapTIDs  map[uint32]SchemaHeapTID
 	conversionHeapTIDs map[uint32]SchemaHeapTID
+	// eventTriggerHeapTIDs is the pg_event_trigger twin (B3.2) — ALTER
+	// RENAME/ENABLE/OWNER journal as canonical heap UPDATEs at the cached TID.
+	eventTriggerHeapTIDs map[uint32]SchemaHeapTID
 
 	// tempNamespaces maps a session's temp-owner token ("s<id>", see
 	// executor.sessionTempOwner) → the OID of that session's temporary
@@ -12292,6 +12295,31 @@ func (c *InMemory) DropConversionHeapTID(oid uint32) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	delete(c.conversionHeapTIDs, oid)
+}
+
+// EventTriggerHeapTID returns the live pg_event_trigger heap TID (B3.2).
+func (c *InMemory) EventTriggerHeapTID(oid uint32) (SchemaHeapTID, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	tid, ok := c.eventTriggerHeapTIDs[oid]
+	return tid, ok
+}
+
+// SetEventTriggerHeapTID records/refreshes the live pg_event_trigger heap TID.
+func (c *InMemory) SetEventTriggerHeapTID(oid uint32, tid SchemaHeapTID) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.eventTriggerHeapTIDs == nil {
+		c.eventTriggerHeapTIDs = make(map[uint32]SchemaHeapTID)
+	}
+	c.eventTriggerHeapTIDs[oid] = tid
+}
+
+// DropEventTriggerHeapTID drops the TID entry (DROP EVENT TRIGGER).
+func (c *InMemory) DropEventTriggerHeapTID(oid uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.eventTriggerHeapTIDs, oid)
 }
 
 // SetSchemaHeapTID records/refreshes the live pg_namespace heap TID for name.

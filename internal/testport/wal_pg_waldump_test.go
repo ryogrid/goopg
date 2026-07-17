@@ -79,6 +79,11 @@ ALTER OPERATOR FAMILY public.waldump_fam USING btree DROP OPERATOR 3 (int4, int4
 DROP OPERATOR CLASS public.waldump_class USING btree;
 CREATE TRANSFORM FOR int LANGUAGE sql (FROM SQL WITH FUNCTION prsd_lextype(internal), TO SQL WITH FUNCTION int4recv(internal));
 DROP TRANSFORM FOR int LANGUAGE sql;
+CREATE FUNCTION waldump_et_func() RETURNS event_trigger LANGUAGE plpgsql AS 'BEGIN END';
+CREATE EVENT TRIGGER waldump_et ON ddl_command_start WHEN TAG IN ('CREATE TABLE') EXECUTE FUNCTION waldump_et_func();
+ALTER EVENT TRIGGER waldump_et DISABLE;
+ALTER EVENT TRIGGER waldump_et RENAME TO waldump_et2;
+DROP EVENT TRIGGER waldump_et2;
 CREATE COLLATION waldump_coll (locale = 'C');
 ALTER COLLATION waldump_coll RENAME TO waldump_coll2;
 DROP COLLATION waldump_coll2;
