@@ -16695,6 +16695,18 @@ func (c *InMemory) RegisterAccessMethod(name, amType string, handlerOID uint32, 
 // DropAccessMethod removes a user-defined access method from the registry.
 // Returns true if found. The trailing variadic dbOid mirrors
 // RegisterAccessMethod. DU-002 (M0119-0004).
+// FindAccessMethod returns the (dbOid, name) access-method registry entry,
+// or nil. B3.7: DROP ACCESS METHOD captures the OID before the registry drop
+// to stamp its pg_am heap row.
+func (c *InMemory) FindAccessMethod(name string, dbOid ...uint32) *AccessMethod {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.accessMethods == nil {
+		return nil
+	}
+	return c.accessMethods[accessMethodKey(resolveDBOid(dbOid), name)]
+}
+
 func (c *InMemory) DropAccessMethod(name string, dbOid ...uint32) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()

@@ -2035,15 +2035,15 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, fmt.Errorf("goopg: pg_aggregate reload: %w", err)
 	}
 
-	// DU-002 restart-persistence follow-up (M0119-0004, DU-002 slice 426
-	// ledger resume point): restore CREATE/DROP ACCESS METHOD objects from
-	// the WAL. Like event triggers, access methods are keyed by a plain name
-	// string, so order relative to schema replay does not matter.
-	if err := replayAccessMethodDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+	// B3.7: access methods reload from the pg_am HEAP (generic seq-scan, no
+	// index) — replaced replayAccessMethodDDLRecords' bespoke WAL scan
+	// (kinds 70/71, retired). Keyed by name, so order relative to schema
+	// replay does not matter.
+	if err := reloadUserAccessMethodsFromHeap(mgr, cat, clog); err != nil {
 		_ = pool.Close()
 		_ = walWriter.Close()
 		_ = mgr.Close()
-		return nil, fmt.Errorf("goopg: access method DDL replay: %w", err)
+		return nil, fmt.Errorf("goopg: pg_am reload: %w", err)
 	}
 
 	// DU-002 restart-persistence follow-up (slice 441's own resume point):

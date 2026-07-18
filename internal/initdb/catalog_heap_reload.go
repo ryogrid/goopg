@@ -1825,3 +1825,39 @@ func buildTSConfigMappings(byTok map[int32]map[int32]uint32) []catalog.TSConfigM
 	}
 	return out
 }
+
+// reloadUserAccessMethodsFromHeap is B3.7's access-method reload — the
+// generic heap-scan replacement for the retired replayAccessMethodDDLRecords
+// scanner (RecordKinds 70/71). It seq-scans the pg_am heap (no index exists;
+// see sys_pg_am.go), skips the built-in rows (oid < FirstUserOID), and
+// re-registers each user access method. amtype and amhandler are stored
+// directly (char / pg_proc OID).
+func reloadUserAccessMethodsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+	cols := executor.PGAccessMethodColumnsPG18()
+	rel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 2601, Fork: storage.MainFork}
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_am",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			d := make(executor.Row, len(cols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(d, cols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			if uint32(d[0].Int) < catalog.FirstUserOID {
+				return nil, false, errSkipBuiltinRow
+			}
+			return catalog.AccessMethod{
+				OID:        uint32(d[0].Int),
+				Name:       d[1].StringValue(),
+				HandlerOID: uint32(d[2].Int),
+				AMType:     d[3].StringValue(),
+			}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+	for _, raw := range rows {
+		am := raw.(catalog.AccessMethod)
+		cat.RegisterAccessMethodDuringRecovery(&am)
+	}
+	return nil
+}

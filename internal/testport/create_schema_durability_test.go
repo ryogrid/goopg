@@ -1115,3 +1115,48 @@ func TestPort_TSConfigSurvivesRestart(t *testing.T) {
 		t.Fatalf("post-restart stale config names count = %q, want 0", got)
 	}
 }
+
+// TestPort_AccessMethodSurvivesRestart pins B3.7's pg_am heap journaling:
+// CREATE ACCESS METHOD and DROP both survive a restart via the pg_am heap
+// seq-scan reload (kinds 70/71 retired).
+func TestPort_AccessMethodSurvivesRestart(t *testing.T) {
+	c, err := cluster.New("access-method-durability", cluster.Options{
+		RepoRoot:     repoRoot(t),
+		DataDir:      filepath.Join(t.TempDir(), "data"),
+		StartupWait:  20 * time.Second,
+		ShutdownWait: 20 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+
+	stmts := []string{
+		"CREATE FUNCTION public.b37_am_handler(internal) RETURNS index_am_handler LANGUAGE c AS 'b37_am_handler'",
+		"CREATE ACCESS METHOD b37_am TYPE INDEX HANDLER b37_am_handler",
+		"CREATE ACCESS METHOD b37_gone TYPE INDEX HANDLER b37_am_handler",
+		"DROP ACCESS METHOD b37_gone",
+	}
+	for _, s := range stmts {
+		if err := runSQLSimple(t, c, s); err != nil {
+			t.Fatalf("%s: %v", s, err)
+		}
+	}
+
+	if err := c.Stop(cluster.ShutdownFast); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	if err := c.Start(); err != nil {
+		t.Fatalf("restart: %v", err)
+	}
+
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_am WHERE amname = 'b37_am' AND amtype = 'i'"); got != "1" {
+		t.Fatalf("post-restart access method count = %q, want 1 (not reloaded)", got)
+	}
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_am WHERE amname = 'b37_gone'"); got != "0" {
+		t.Fatalf("post-restart dropped access method count = %q, want 0", got)
+	}
+}
