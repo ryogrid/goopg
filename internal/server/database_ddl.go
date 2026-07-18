@@ -813,6 +813,15 @@ func (s *Server) copyTemplateTables(srcOid, newOid uint32, tables []*catalog.Tab
 		// storage with the template's own Table.Columns, even transiently.
 		cols := append([]catalog.Column(nil), srcTbl.Columns...)
 		name := parser.ObjectName{Schema: srcTbl.Schema, Name: srcTbl.Name}
+		// B4.6 Stage 2 (DEFERRED — see .ralph/deferral_ledger.md): real PG
+		// PRESERVES the template's relation OIDs here (this is where the flip
+		// goes: build a *catalog.Table{OID: srcTbl.OID, DBOid: newOid} +
+		// im.TryRegisterUserTable(tbl, newOid)). The flip is prototyped and
+		// verified for the common paths, but ALTER-then-restart in a copied
+		// database drops the change under OID collision because the WRITE-side
+		// catalog-heap persist still routes pg_attribute by OID defaulting to
+		// DefaultDBOid (the read-side reload is already per-dbOid correct). Kept
+		// on the fresh-OID clone until that write-side dbOid routing is fixed.
 		newTbl, err := im.CreateTable(name, cols, newOid)
 		if err != nil {
 			s.rollbackTemplateCopy(newOid)
