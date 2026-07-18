@@ -1,0 +1,35 @@
+# Example gocomplexity configuration.
+#
+# Every key is optional; omitted keys fall back to the built-in defaults in
+# config.py. CLI flags override values set here.
+
+# Root paths to analyze (relative to --base, default the repo root).
+roots:
+  - internal
+  - cmd
+
+# Directory names to prune anywhere in the tree (spec §4 defaults shown).
+exclude_dirs:
+  - vendor
+  - third_party
+  - testutil
+  - testport
+  - tmp
+  - tools
+  - examples
+
+# Filename glob patterns to exclude.
+exclude_patterns:
+  - "*_test.go"
+
+# Complexity values above which functions are counted/flagged.
+thresholds:
+  - 10
+  - 15
+  - 20
+  - 30
+
+# How many rows to show in ranked report sections.
+top_functions: 100
+top_packages: 20
+top_files: 50
