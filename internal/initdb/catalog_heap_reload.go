@@ -286,6 +286,42 @@ func reloadDbRoleSettingsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, c
 	return nil
 }
 
+// reloadSubscriptionsFromHeap is B4.4's pg_subscription reload — the generic
+// heap-scan replacement for the retired replayPubSubDDLRecords scanner
+// (RecordKinds 53/54/55; the publication kinds were already retired in B3.3).
+// pg_subscription is SHARED (global/6100). Each live row's 8 goopg-tracked
+// columns rebuild a catalog.Subscription (the other 10 PG columns are
+// registry-irrelevant defaults); dropped rows carry xmax and are skipped.
+func reloadSubscriptionsFromHeap(mgr *storage.Manager, pubsub *catalog.PubSub, clog *mvcc.CLog) error {
+	rel := storage.RelFileNode{DBOid: 0, RelOid: 6100, Fork: storage.MainFork}
+	cols := executor.PGSubscriptionColumnsPG18()
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_subscription",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			decoded := make(executor.Row, len(cols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, cols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			return &catalog.Subscription{
+				OID:          uint32(decoded[0].Int),
+				DBOid:        uint32(decoded[1].Int),
+				Name:         decoded[3].StringValue(),
+				Owner:        uint32(decoded[4].Int),
+				Enabled:      decoded[5].BoolValue(),
+				Conninfo:     decoded[13].StringValue(),
+				SlotName:     decoded[14].StringValue(),
+				Publications: executor.ParseTextArrayLiteral(decoded[16].StringValue()),
+			}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+	for _, r := range rows {
+		pubsub.CreateSubscriptionDuringRecovery(r.(*catalog.Subscription))
+	}
+	return nil
+}
+
 // reloadRoleMembershipsFromHeap is B4.3's pg_auth_members reload — the generic
 // heap-scan replacement for the retired replayRoleMembershipRecords scanner
 // (RecordKinds 79/80). pg_auth_members is SHARED (global/1261). Each live row

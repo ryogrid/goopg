@@ -1938,15 +1938,15 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// pg_publication_tables, pg_subscription, pg_subscription_rel).
 	// See docs/design/0008-0003-publication-subscription-ddl.md.
 	pubsub := catalog.NewPubSub()
-	// DU-002 restart-persistence follow-up (M0119-0004, loop #67 ledger
-	// resume point): restore CREATE/DROP/ALTER PUBLICATION/SUBSCRIPTION
-	// objects from the WAL. PubSub is not schema-scoped, so order relative
-	// to schema replay above does not matter.
-	if err := replayPubSubDDLRecords(filepath.Join(abs, "pg_wal"), pubsub); err != nil {
+	// B4.4: restore subscriptions from the pg_subscription SHARED heap
+	// (global/6100), replacing the retired replayPubSubDDLRecords WAL scan
+	// (RecordKinds 53/54/55; publications were converted to pg_publication heap
+	// rows in B3.3). PubSub is not schema-scoped, so order does not matter.
+	if err := reloadSubscriptionsFromHeap(mgr, pubsub, clog); err != nil {
 		_ = pool.Close()
 		_ = walWriter.Close()
 		_ = mgr.Close()
-		return nil, fmt.Errorf("goopg: pubsub DDL replay: %w", err)
+		return nil, fmt.Errorf("goopg: pg_subscription reload: %w", err)
 	}
 	if err := registerPublicationViews(cat, pubsub); err != nil {
 		_ = pool.Close()

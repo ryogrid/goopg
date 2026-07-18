@@ -1073,10 +1073,9 @@ func (o *ddlOp) execCreateSubscription(s *parser.CreateSubscriptionStmt) error {
 	if err != nil {
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 	}
-	if o.ctx.WAL != nil {
-		if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateSubscription(sub.Name, sub.Conninfo, sub.SlotName, sub.Publications, sub.OID, sub.Owner, sub.Enabled, sub.DBOid)); werr != nil {
-			return fmt.Errorf("wal create-subscription: %w", werr)
-		}
+	// B4.4: journal the pg_subscription heap row (replaces kind 53).
+	if err := syncSubscriptionRow(o.ctx, sub.OID, sub); err != nil {
+		return fmt.Errorf("pg_subscription heap write: %w", err)
 	}
 	if o.ctx.OnSubscriptionChange != nil {
 		o.ctx.OnSubscriptionChange()
@@ -1088,16 +1087,20 @@ func (o *ddlOp) execDropSubscription(s *parser.DropSubscriptionStmt) error {
 	if o.ctx.PubSub == nil {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "DROP SUBSCRIPTION requires PubSub registry in Context"}
 	}
+	// Capture the OID before the registry drop so B4.4 can stamp the heap row.
+	var dropOID uint32
+	if sub, ok := o.ctx.PubSub.LookupSubscription(s.Name); ok {
+		dropOID = sub.OID
+	}
 	if err := o.ctx.PubSub.DropSubscription(s.Name); err != nil {
 		if s.IfExists {
 			return nil
 		}
 		return &ExecError{Code: "42704", Pos: s.Pos(), Message: err.Error()}
 	}
-	if o.ctx.WAL != nil {
-		if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropSubscription(s.Name)); werr != nil {
-			return fmt.Errorf("wal drop-subscription: %w", werr)
-		}
+	// B4.4: xmax-stamp the pg_subscription heap row (replaces kind 54).
+	if err := syncSubscriptionRow(o.ctx, dropOID, nil); err != nil {
+		return fmt.Errorf("pg_subscription heap delete: %w", err)
 	}
 	if o.ctx.OnSubscriptionChange != nil {
 		o.ctx.OnSubscriptionChange()
@@ -1164,9 +1167,10 @@ func (o *ddlOp) execAlterSubscriptionOwner(s *parser.AlterSubscriptionOwnerStmt)
 	if serr := o.ctx.PubSub.SetSubscriptionOwner(s.Name, ownerOID); serr != nil {
 		return &ExecError{Code: "42704", Pos: s.Pos(), Message: serr.Error()}
 	}
-	if o.ctx.WAL != nil {
-		if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterSubscriptionOwner(s.Name, ownerOID)); werr != nil {
-			return fmt.Errorf("wal alter-subscription-owner: %w", werr)
+	// B4.4: re-sync the pg_subscription heap row's subowner (replaces kind 55).
+	if sub, ok := o.ctx.PubSub.LookupSubscription(s.Name); ok {
+		if err := syncSubscriptionRow(o.ctx, sub.OID, sub); err != nil {
+			return fmt.Errorf("pg_subscription heap write: %w", err)
 		}
 	}
 	return nil

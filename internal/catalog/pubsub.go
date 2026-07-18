@@ -407,11 +407,12 @@ func (p *PubSub) CreateSubscriptionDuringRecovery(sub *Subscription) {
 	}
 }
 
-// DropSubscriptionDuringRecovery is the idempotent counterpart used for
-// replaying RecordKindDropSubscription. Mirrors
-// DropPublicationDuringRecovery — also clears any tablesync rows for the
-// name, matching DropSubscription. DU-002 restart-persistence follow-up
-// (M0119-0004, loop #67 ledger resume point).
+// DropSubscriptionDuringRecovery is the idempotent counterpart to
+// CreateSubscriptionDuringRecovery. Mirrors DropPublicationDuringRecovery —
+// also clears any tablesync rows for the name, matching DropSubscription.
+// (B4.4 reloads live subscriptions from the pg_subscription heap, so a DROP is
+// implicit — its row is xmax-stamped and skipped by the reload — but this stays
+// for symmetry.)
 func (p *PubSub) DropSubscriptionDuringRecovery(name string) {
 	_ = p.DropSubscription(name)
 }
