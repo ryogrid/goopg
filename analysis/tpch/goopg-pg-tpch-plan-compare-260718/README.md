@@ -358,7 +358,95 @@ goopg ÷ PostgreSQL time ratio against the PG SF1 numbers measured in this study
 
 ---
 
-## 8. Selected plan pairs (full text)
+## 8. Executor-layer performance difference (measured ÷ plan-shape)
+
+The measured gap (§7) is the product of **two** independent factors: *how much
+work the plan asks for* (plan quality) and *how fast that work is executed*
+(executor layer). §6 already isolates the first as the work-volume ratio `V`.
+Dividing it out leaves the second:
+
+```
+E (executor-layer factor) = R_measured (§7)  ÷  V_plan-shape (§6 work-volume)
+```
+
+`E` is the **performance difference of the machinery that runs the plan**, with
+plan quality (join order, access method, subquery decorrelation — i.e. the
+number of rows the plan asks to process) removed. It bundles what is genuinely
+executor-layer: PG's parallel execution (goopg has none), goopg's per-operator
+Go-executor speed (single-threaded, non-PGO) vs PG's C, and per-invocation
+operator overhead. It does **not** include plan-shape/work-volume differences.
+
+| Q | Measured `R` (§7) | Plan `V` (§6) | **Executor `E = R ÷ V`** |
+|---|---:|---:|---:|
+| Q1  | 11×   | ~1.0× | **11×** |
+| Q2  | 231×  | ~1.1× | **211×** |
+| Q3  | 46×   | ~1.9× | **24×** |
+| Q4  | 1156× | ~1.0× | **1156×** |
+| Q5  | 55×   | ~1.1× | **48×** |
+| Q6  | 38×   | ~1.0× | **38×** |
+| Q7  | 286×  | ~1.0× | **286×** |
+| Q8  | 837×  | ~1.0× | **837×** |
+| Q9  | 62×   | ~2.8× | **22×** |
+| Q10 | 28×   | ~1.6× | **17×** |
+| Q11 | 29×   | ~2.8× | **10×** |
+| Q12 | 112×  | ~4.2× | **26×** |
+| Q13 | 56×   | ~1.1× | **49×** |
+| Q14 | 80×   | ~1.1× | **73×** |
+| Q15 | 14×   | ~1.0× | **14×** |
+| Q16 | 7×    | ~1.5× | **5×** |
+| Q17 | 30×   | ~4.2× | **7×** |
+| Q18 | 10×   | ~1.9× | **5×** |
+| Q19 | 414×  | ~31.6× | **13×** |
+| Q20 | 93×   | ~5.5× | **17×** |
+| Q21 | 344×  | ~2.8× | **122×** |
+| Q22 | 1452× | ~1.0× | **1452×** |
+
+**Result — the executor gap is bimodal.**
+
+- **Bulk-data operators** (sequential/index scan, hash join, sort, aggregate,
+  index nested-loop — Q1, Q3, Q5, Q6, Q9–Q14, Q16, Q18–Q20): executor factor
+  **≈ 5–73×, geometric mean ≈ 19×**. This is goopg's *baseline* executor-layer
+  overhead: a single-threaded Go executor with no parallel query, not
+  PGO/`GOAMD64`-optimized, versus PG's parallel C executor. Removing PG's ~1.8×
+  parallelism from the cleanest plan-equivalent cases (Q1, Q6) leaves a pure
+  single-thread per-operator gap of only **~6–20×**.
+- **Correlated-subquery queries** (Q2, Q4, Q7, Q8, Q21, and Q22): executor factor
+  **≈ 120–1450×, geometric mean ≈ 256×**. Here the residual is dominated by
+  goopg's **per-row `SubPlan` open/close overhead** — each `EXISTS`/`IN`/scalar
+  subquery is re-instantiated per outer row, and the fixed per-invocation cost
+  (operator Build/Open/Close) dwarfs the actual probe, which is the exact
+  behaviour documented in
+  [`analysis/tpch-runner-measurement-report-2026-05-06.md`](../../tpch-runner-measurement-report-2026-05-06.md)
+  ("operator Build/Open/Close overhead dominates").
+
+**Two useful reads of this table.**
+
+- **goopg's executor is ~1 order of magnitude (≈19×) slower on bulk operators**,
+  and that is the number to attack for the scan/join/aggregate workload
+  (parallel query + per-operator constant-factor / PGO would close most of it).
+- **The catastrophic queries are not mainly a plan problem or a bulk-executor
+  problem — they are a `SubPlan`-execution problem.** Q19 is the mirror image:
+  its huge *measured* 414× gap is almost entirely **plan** (`E` only ~13×), i.e.
+  a planner/join-order fix would help Q19 far more than an executor speedup,
+  whereas Q4/Q8/Q22 need the executor's per-row-subquery path fixed (or the
+  planner to decorrelate so the SubPlan disappears).
+
+**Caveats (this is an order-of-magnitude decomposition).**
+- `E` inherits **all** the uncertainty of §6 and §7: `R` is from an older goopg
+  build (`26cf58d`) than the `701a5f57` plans, and `V` is a mid-range estimate
+  from plan shape, not a measurement. Treat single-query `E` values as ±1
+  bucket, and rely on the grouped geometric means.
+- **Attribution boundary.** Whether goopg running a correlated subquery per-row
+  (instead of decorrelating to a semi/anti join) is charged to the *planner*
+  (higher `V`) or the *executor* (higher `E`) is a modelling choice. §6 charged
+  most of it to the executor (`V≈1` for Q4/Q8/Q22), which is why their `E` is
+  huge; charging non-decorrelation to the planner instead would move that mass
+  from `E` back into `V`. The **bulk-operator ≈19×** figure is unaffected by this
+  choice and is therefore the most robust executor-layer estimate here.
+
+---
+
+## 9. Selected plan pairs (full text)
 
 Full plans for every query are in [`raw/`](raw/). Two representative contrasts:
 
@@ -404,7 +492,7 @@ PostgreSQL (859 ms, 445 rows):
 
 ---
 
-## 9. Reproduction
+## 10. Reproduction
 
 ```bash
 # 1. Worktree off clean HEAD; symlink the read-only oracle + HammerDB.
