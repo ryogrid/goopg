@@ -5,30 +5,15 @@ import (
 	"github.com/goopg/goopg/internal/executor"
 )
 
-// operatorEntry holds one row of pg_operator as seeded during bootstrap.
-// Field names match the pg_operator.h column names used in initdb.
-type operatorEntry struct {
-	OID        uint32
-	Name       string // oprname
-	Namespace  uint32 // oprnamespace
-	Owner      uint32 // oprowner
-	Kind       byte   // oprkind: 'b'=binary, 'l'=left-unary
-	CanMerge   bool   // oprcanmerge
-	CanHash    bool   // oprcanhash
-	LeftType   uint32 // oprleft
-	RightType  uint32 // oprright
-	ResultType uint32 // oprresult
-	Commutator uint32 // oprcom
-	Negator    uint32 // oprnegate
-	Code       uint32 // oprcode (pg_proc OID)
-	Restrict   uint32 // oprrest (pg_proc OID)
-	Join       uint32 // oprjoin (pg_proc OID)
-}
+// operatorEntry is the pg_operator.dat row type, relocated to package catalog
+// (02e item C S0) so the node-tree resolver can reach the seed without importing
+// initdb. Kept as a local alias so the bootstrap code below is unchanged.
+type operatorEntry = catalog.OperatorEntry
 
 // pgOperatorInitialEntries returns all pg_operator rows seeded during
-// bootstrap.  It delegates to the generated pgOperatorAllEntries table.
+// bootstrap. It delegates to the generated catalog.PGOperatorAllEntries table.
 func pgOperatorInitialEntries() []operatorEntry {
-	return pgOperatorAllEntries()
+	return catalog.PGOperatorAllEntries()
 }
 
 // pgOperatorColDefs returns the 15-column PG18 FormData_pg_operator layout.
