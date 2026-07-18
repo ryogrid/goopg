@@ -46,10 +46,16 @@ func TestPort_ExtendedStatisticsSurvivesRestart(t *testing.T) {
 		"CREATE STATISTICS stx_multi (ndistinct, dependencies) ON a, b, c FROM stx_t"); err != nil {
 		t.Fatalf("CREATE STATISTICS stx_multi: %v", err)
 	}
-	// Expression target (exercises stxexprs + the implicit 'e' stxkind).
+	// Expression target mixed with a simple column (stxexprs + non-empty stxkeys).
 	if err := runSQLSimple(t, c,
 		"CREATE STATISTICS stx_expr ON a, (b + c) FROM stx_t"); err != nil {
 		t.Fatalf("CREATE STATISTICS stx_expr: %v", err)
+	}
+	// Expression-ONLY (zero simple columns) — stxkeys is an empty int2vector,
+	// which the codec rejects unless written as bytes (regression guard).
+	if err := runSQLSimple(t, c,
+		"CREATE STATISTICS stx_expronly ON (a + b), (b + c) FROM stx_t"); err != nil {
+		t.Fatalf("CREATE STATISTICS stx_expronly: %v", err)
 	}
 	// One to rename, one to drop.
 	if err := runSQLSimple(t, c,
@@ -110,5 +116,10 @@ func TestPort_ExtendedStatisticsSurvivesRestart(t *testing.T) {
 		"SELECT pg_get_statisticsobjdef(oid) FROM pg_statistic_ext WHERE stxname = 'stx_expr'")
 	if defExprPost != defExprPre {
 		t.Fatalf("post-restart stx_expr def = %q, want %q (stxexprs decode drifted)", defExprPost, defExprPre)
+	}
+	// Expression-only object survives with its empty stxkeys intact.
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_statistic_ext WHERE stxname = 'stx_expronly'"); got != "1" {
+		t.Fatalf("post-restart stx_expronly count = %q, want 1 (empty-int2vector stxkeys did not survive)", got)
 	}
 }

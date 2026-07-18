@@ -116,12 +116,14 @@ func syncStatisticExtRow(ctx *Context, obj *catalog.StatisticsObject) error {
 		targetDatum = NewIntDatum(int64(int16(*obj.StatTarget)))
 	}
 
-	// stxkeys / stxkind: KindBytes passthrough to the int2vector / char[] codec
-	// arms; an empty list writes the empty ArrayType (KindString sentinel).
-	keysDatum := NewStringDatum("")
-	if len(attnums) > 0 {
-		keysDatum = NewBytesDatum(pgInt2VectorBytes(attnums))
-	}
+	// stxkeys: always KindBytes — the int2vector codec arm (unlike int2[]/char[])
+	// has NO empty-ArrayType fallback and rejects a non-bytes datum. An
+	// expression-only statistics object has zero simple columns, and
+	// pgInt2VectorBytes(nil) is a valid empty int2vector (1-D, dim 0), matching
+	// PG's stxkeys='' for such objects.
+	keysDatum := NewBytesDatum(pgInt2VectorBytes(attnums))
+	// stxkind: the char[] codec arm DOES fall back to the empty ArrayType for a
+	// non-bytes datum, so an empty kind list writes the KindString sentinel.
 	kindDatum := NewStringDatum("")
 	if len(kindChars) > 0 {
 		kindDatum = NewBytesDatum(pgCharArrayBytes(kindChars))

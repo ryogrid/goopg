@@ -3599,10 +3599,18 @@ func NewInMemory() *InMemory {
 		opClassSchemas:         make(map[string]string),
 		userAggregates:         make(map[string]*UserAggregate),
 		schemas: map[string]uint32{
+			// Real PG18 namespace OIDs (pg_namespace.dat / a stock initdb). These
+			// were previously wrong: pg_toast was 2200 (colliding with public) and
+			// information_schema was 99 (which is actually pg_toast's OID). The
+			// collision made SchemaNameForOID(2200) return "public" or "pg_toast"
+			// nondeterministically (Go map range order), silently reloading a
+			// public object into pg_toast. pg_toast=99 also matches initdb.go's
+			// pgNamespaceInitialEntries and the "pg_toast namespace (OID 99)"
+			// assumption baked into the TOAST virtual-row builders.
 			"pg_catalog":         11,
 			"public":             2200,
-			"information_schema": 99,
-			"pg_toast":           2200, // toast uses same OID as public in simplified model
+			"pg_toast":           99,
+			"information_schema": 13183, // stock PG18 initdb-assigned OID
 		},
 		schemaOwners:       make(map[string]uint32),
 		roles:              make(map[string]uint32),
@@ -12238,24 +12246,16 @@ func (c *InMemory) SchemaNameForOID(oid uint32) string {
 	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	// pg_toast shares public's OID (2200) in this simplified model (see
-	// NewInMemory's schemas map), so a bare map scan would pick "public" or
-	// "pg_toast" nondeterministically for that OID — a latent bug for every
-	// reverse-lookup caller (heap-reload schema resolution, pg_get_*def). User
-	// objects are never in pg_toast, so prefer any non-pg_toast name and fall
-	// back to pg_toast only when it is the sole match.
-	var toastFallback string
+	// The schemas map holds distinct OIDs per namespace (NewInMemory uses the
+	// real PG18 values), so this reverse scan is unambiguous. (It was previously
+	// nondeterministic because pg_toast wrongly shared public's OID 2200 — fixed
+	// at the source in NewInMemory rather than worked around here.)
 	for name, o := range c.schemas {
-		if o != oid {
-			continue
+		if o == oid {
+			return name
 		}
-		if name == "pg_toast" {
-			toastFallback = name
-			continue
-		}
-		return name
 	}
-	return toastFallback
+	return ""
 }
 
 // SchemaHeapTID is a pg_namespace heap-row locator (block, line pointer) —
