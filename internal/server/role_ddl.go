@@ -543,6 +543,9 @@ type roleConfigRegistry interface {
 	SetRoleConfig(roleOid, dbOid uint32, name, value string)
 	ResetRoleConfig(roleOid, dbOid uint32, name string)
 	ResetAllRoleConfig(roleOid, dbOid uint32)
+	// RoleConfigEntries returns (roleOid, dbOid)'s current setconfig list,
+	// read after a mutation to re-sync the pg_db_role_setting heap row (B4.2).
+	RoleConfigEntries(roleOid, dbOid uint32) []string
 }
 
 // alterRoleConfigOp is the result of a successful parseAlterRoleConfig
@@ -725,25 +728,16 @@ func (s *Server) applyAlterRoleConfig(op alterRoleConfigOp, liveDBName string, r
 	switch {
 	case op.resetAll:
 		reg.ResetAllRoleConfig(roleOid, dbOid)
-		if s.cfg.WAL != nil {
-			if _, _, werr := s.cfg.WAL.Append(wal.EncodeAlterRoleResetAllConfig(roleOid, dbOid)); werr != nil {
-				return true, werr
-			}
-		}
 	case op.reset:
 		reg.ResetRoleConfig(roleOid, dbOid, op.configName)
-		if s.cfg.WAL != nil {
-			if _, _, werr := s.cfg.WAL.Append(wal.EncodeAlterRoleResetConfig(roleOid, dbOid, op.configName)); werr != nil {
-				return true, werr
-			}
-		}
 	default:
 		reg.SetRoleConfig(roleOid, dbOid, op.configName, op.configValue)
-		if s.cfg.WAL != nil {
-			if _, _, werr := s.cfg.WAL.Append(wal.EncodeAlterRoleSetConfig(roleOid, dbOid, op.configName, op.configValue)); werr != nil {
-				return true, werr
-			}
-		}
+	}
+	// B4.2: re-sync the (dbOid, roleOid) pg_db_role_setting heap row from the
+	// current registry state — replaces RecordKindAlterRoleSetConfig(76)/
+	// ResetConfig(77)/ResetAllConfig(78).
+	if err := s.syncDbRoleSettingHeap(dbOid, roleOid, reg.RoleConfigEntries(roleOid, dbOid)); err != nil {
+		return true, err
 	}
 	return true, nil
 }
