@@ -1059,3 +1059,59 @@ func TestPort_TSDictSurvivesRestart(t *testing.T) {
 		t.Fatalf("post-restart stale dict names count = %q, want 0", got)
 	}
 }
+
+// TestPort_TSConfigSurvivesRestart pins B3.6's pg_ts_config +
+// pg_ts_config_map heap journaling: CREATE TEXT SEARCH CONFIGURATION, ADD
+// MAPPING (config_map rows), ALTER (RENAME / SET SCHEMA), and DROP all
+// survive a restart (kinds 106-113 retired).
+func TestPort_TSConfigSurvivesRestart(t *testing.T) {
+	c, err := cluster.New("tsconfig-durability", cluster.Options{
+		RepoRoot:     repoRoot(t),
+		DataDir:      filepath.Join(t.TempDir(), "data"),
+		StartupWait:  20 * time.Second,
+		ShutdownWait: 20 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+
+	stmts := []string{
+		"CREATE SCHEMA b36_s",
+		"CREATE TEXT SEARCH CONFIGURATION b36_cfg (PARSER = pg_catalog.default)",
+		"ALTER TEXT SEARCH CONFIGURATION b36_cfg ADD MAPPING FOR asciiword, word WITH simple",
+		"ALTER TEXT SEARCH CONFIGURATION b36_cfg RENAME TO b36_cfg2",
+		"ALTER TEXT SEARCH CONFIGURATION b36_cfg2 SET SCHEMA b36_s",
+		"CREATE TEXT SEARCH CONFIGURATION b36_gone (PARSER = pg_catalog.default)",
+		"DROP TEXT SEARCH CONFIGURATION b36_gone",
+	}
+	for _, s := range stmts {
+		if err := runSQLSimple(t, c, s); err != nil {
+			t.Fatalf("%s: %v", s, err)
+		}
+	}
+
+	if err := c.Stop(cluster.ShutdownFast); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	if err := c.Start(); err != nil {
+		t.Fatalf("restart: %v", err)
+	}
+
+	// Renamed + moved to b36_s.
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_ts_config cfg JOIN pg_namespace n ON n.oid = cfg.cfgnamespace WHERE cfg.cfgname = 'b36_cfg2' AND n.nspname = 'b36_s'"); got != "1" {
+		t.Fatalf("post-restart renamed+moved config count = %q, want 1 (not reloaded / ALTER lost)", got)
+	}
+	// The two ADD MAPPING entries (asciiword, word → simple) round-tripped
+	// through pg_ts_config_map.
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_ts_config_map m JOIN pg_ts_config cfg ON cfg.oid = m.mapcfg WHERE cfg.cfgname = 'b36_cfg2'"); got != "2" {
+		t.Fatalf("post-restart pg_ts_config_map count = %q, want 2 (mappings lost)", got)
+	}
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_ts_config WHERE cfgname IN ('b36_cfg', 'b36_gone')"); got != "0" {
+		t.Fatalf("post-restart stale config names count = %q, want 0", got)
+	}
+}

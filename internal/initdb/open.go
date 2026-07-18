@@ -1318,11 +1318,16 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: pg_ts_dict reload: %w", err)
 	}
-	if err := replayTSConfigDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+	// B3.6: text search configurations reload from the pg_ts_config +
+	// pg_ts_config_map HEAPS (generic scan) — replaced replayTSConfigDDLRecords
+	// (kinds 106-113, retired). Runs after the pg_ts_dict reload above so a
+	// mapping's mapdict references a known dictionary; schema-scoped, so it
+	// also runs after replaySchemaDDLRecords.
+	if err := reloadUserTSConfigsFromHeap(mgr, cat, clog); err != nil {
 		_ = pool.Close()
 		_ = walWriter.Close()
 		_ = mgr.Close()
-		return nil, fmt.Errorf("goopg: text search configuration DDL replay: %w", err)
+		return nil, fmt.Errorf("goopg: pg_ts_config reload: %w", err)
 	}
 	// B2.2 slice 4: the collation replay that historically ran here moved to
 	// reloadUserCollationsFromHeap (grouped with the other B-phase heap

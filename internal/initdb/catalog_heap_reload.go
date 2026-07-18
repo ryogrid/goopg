@@ -1709,3 +1709,119 @@ func reloadUserTSDictsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog
 	}
 	return nil
 }
+
+// reloadUserTSConfigsFromHeap is B3.6's text-search-configuration reload —
+// the generic heap-scan replacement for the retired replayTSConfigDDLRecords
+// scanner (RecordKinds 106-113). It reads the base rows from pg_ts_config and
+// the mapping rows from pg_ts_config_map (grouped by mapcfg → the config OID,
+// token type reversed via TSTokenTypeAlias, dictionaries in mapseqno order),
+// assembles each UserTSConfig with its inline Mappings, and registers it via
+// CreateTSConfigDuringRecovery. Runs after the pg_ts_dict reload so a
+// mapping's mapdict OID is a dictionary the registry already knows (though
+// mapdict stays an OID in the mapping regardless). Seeds the base-row TID
+// cache for post-restart ALTER RENAME / SET SCHEMA.
+func reloadUserTSConfigsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+	// Pass 1: config_map rows, grouped by mapcfg then token type.
+	type mapKey struct {
+		cfgOID  uint32
+		tokType int32
+	}
+	mapRowsByCfg := map[uint32]map[int32]map[int32]uint32{} // cfgOID → tokType → seqno → dictOID
+	mapCols := executor.PGTSConfigMapColumnsPG18()
+	mapRel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 3603, Fork: storage.MainFork}
+	if _, err := scanCatalogHeapRows(mgr, mapRel, clog, "pg_ts_config_map",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			d := make(executor.Row, len(mapCols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(d, mapCols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			k := mapKey{cfgOID: uint32(d[0].Int), tokType: int32(d[1].Int)}
+			if mapRowsByCfg[k.cfgOID] == nil {
+				mapRowsByCfg[k.cfgOID] = map[int32]map[int32]uint32{}
+			}
+			if mapRowsByCfg[k.cfgOID][k.tokType] == nil {
+				mapRowsByCfg[k.cfgOID][k.tokType] = map[int32]uint32{}
+			}
+			mapRowsByCfg[k.cfgOID][k.tokType][int32(d[2].Int)] = uint32(d[3].Int)
+			return struct{}{}, false, nil
+		}); err != nil {
+		return err
+	}
+
+	// Pass 2: base rows.
+	cfgCols := executor.PGTSConfigColumnsPG18()
+	cfgRel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 3602, Fork: storage.MainFork}
+	type cfgRow struct {
+		uc  catalog.UserTSConfig
+		tid storage.ItemPointer
+	}
+	rows, err := scanCatalogHeapRows(mgr, cfgRel, clog, "pg_ts_config",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			d := make(executor.Row, len(cfgCols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(d, cfgCols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			if uint32(d[0].Int) < catalog.FirstUserOID {
+				return nil, false, errSkipBuiltinRow
+			}
+			return cfgRow{
+				uc: catalog.UserTSConfig{
+					OID:          uint32(d[0].Int),
+					Name:         d[1].StringValue(),
+					NamespaceOID: uint32(d[2].Int),
+					Owner:        uint32(d[3].Int),
+					Parser:       uint32(d[4].Int),
+					Mappings:     buildTSConfigMappings(mapRowsByCfg[uint32(d[0].Int)]),
+				},
+				tid: tid,
+			}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+	for _, raw := range rows {
+		cr := raw.(cfgRow)
+		schema := cat.SchemaNameForOID(cr.uc.NamespaceOID)
+		if schema == "" {
+			schema = "public"
+		}
+		cat.CreateTSConfigDuringRecovery(&cr.uc, schema)
+		cat.SetTSConfigHeapTID(cr.uc.OID, catalog.SchemaHeapTID{Block: uint32(cr.tid.Block), Offset: cr.tid.Offset})
+	}
+	return nil
+}
+
+// buildTSConfigMappings turns the (tokType → seqno → dictOID) map for one
+// configuration into the inline TSConfigMapping slice, ordering dictionaries
+// by mapseqno and token types by their numeric value.
+func buildTSConfigMappings(byTok map[int32]map[int32]uint32) []catalog.TSConfigMapping {
+	if len(byTok) == 0 {
+		return nil
+	}
+	tokTypes := make([]int32, 0, len(byTok))
+	for tt := range byTok {
+		tokTypes = append(tokTypes, tt)
+	}
+	sort.Slice(tokTypes, func(i, j int) bool { return tokTypes[i] < tokTypes[j] })
+	out := make([]catalog.TSConfigMapping, 0, len(tokTypes))
+	for _, tt := range tokTypes {
+		alias := catalog.TSTokenTypeAlias(int(tt))
+		if alias == "" {
+			continue
+		}
+		bySeq := byTok[tt]
+		seqs := make([]int32, 0, len(bySeq))
+		for s := range bySeq {
+			seqs = append(seqs, s)
+		}
+		sort.Slice(seqs, func(i, j int) bool { return seqs[i] < seqs[j] })
+		dicts := make([]uint32, 0, len(seqs))
+		for _, s := range seqs {
+			dicts = append(dicts, bySeq[s])
+		}
+		out = append(out, catalog.TSConfigMapping{TokenType: alias, DictOIDs: dicts})
+	}
+	return out
+}
