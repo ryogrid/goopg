@@ -78,7 +78,21 @@ const (
 	// byte in the payload remains the authoritative discriminator.
 	RmgrGoopgCustomBase Rmgr = 128
 	// RmgrGoopgCatalog is goopg's single custom resource manager for
-	// all private catalog/DDL record kinds (§3.2 of the doc above).
+	// private record kinds with no PG analog (§3.2 of the doc above).
+	//
+	// Phase B5 COMPLETE: all four goopg-private catalog/DDL kind groups that
+	// historically classified here are RETIRED — they now journal as real
+	// heap/btree/rmgr records a PG standby replays (index 20/21/94, pg_attrdef
+	// 69, statistics 95-99, view/matview 102/103). No goopg-EMITTED record maps
+	// to this rmgr anymore (every RecordKind that still falls through
+	// recordKindToRmgrInfo's default arm — the legacy native heap/btree/xact
+	// Encode paths, subxact markers, smgr-truncate — has zero live emit sites;
+	// checkpoints and sequences emit under their real PG rmgrs via the
+	// pre-assembled path). The constant is retained as the classifier's
+	// total-function fallback and a recovery no-op for any legacy on-disk
+	// rmid-128 record; it is intentionally NOT deleted (removing it would make
+	// recordKindToRmgrInfo a partial function and drop backward-compatible
+	// reading of pre-B5 WAL).
 	RmgrGoopgCatalog Rmgr = RmgrGoopgCustomBase
 )
 

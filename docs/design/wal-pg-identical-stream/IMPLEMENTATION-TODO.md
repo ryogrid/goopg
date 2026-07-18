@@ -652,9 +652,17 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
     DEFERRED (ledger): (a) full canonical node-tree ev_action + relhasrules=true so a standby can QUERY the view
     (needs the absent node-tree serializer); (b) matview IsPopulated across restart (reload defaults populated);
     (c) ALTER VIEW/TABLE RENAME across restart (pre-existing — AlterTableRenameTable never re-syncs pg_class).
-  - [ ] **delete-rmgr**: all four catalog groups are retired; RmgrGoopgCatalog now catches only non-catalog
-    private kinds (subxact markers, checkpoint marker, sequence-state). Removing the rmgr / renaming it is the
-    final cleanup step.
+  - [x] **delete-rmgr** (cleanup) — DONE as documentation, not deletion. Investigation confirmed every Encode
+    function whose RecordKind falls through recordKindToRmgrInfo's default arm (legacy native heap/btree/xact
+    paths, subxact markers, smgr-truncate) has ZERO live emit sites, and checkpoints/sequences emit under their
+    real PG rmgrs — so **no goopg-emitted record maps to rmid-128 anymore**. RmgrGoopgCatalog is retained (not
+    deleted) as the classifier's total-function fallback + a recovery no-op for legacy pre-B5 WAL; removing it
+    would make recordKindToRmgrInfo partial and drop backward-compatible WAL reading. Documented in
+    xlog_record.go / rmgr_map.go / recovery.go dispatch.
+
+**B5 COMPLETE** — all four rmid-128 catalog groups retired; a real PG18 standby replays goopg's catalog-DDL WAL
+(guarded by TestE2E_FailoverGoopgToPG across CREATE INDEX / DEFAULT / STATISTICS / VIEW). The only remaining
+rmid-128 usages are the vestigial classifier fallback + legacy-WAL no-op (no live emitter).
 - [ ] **B-gate**: per-catalog full regress + `internal/testport` isolation; `psql \d`/`\df`/`\dn` +
   `information_schema` parity vs PG 18.3; crash-after-DDL recovery via generic reload; re-init data dir.
 

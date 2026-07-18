@@ -2205,15 +2205,12 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 	}
 	switch xlog.Header.Rmid {
 	case RmgrGoopgCatalog:
-		// doc 04 §5.4 point 3: catalog/DDL RecordKinds with no PG analog
-		// (§3.2 default) fall through nativeApplyRecordKindKnown's
-		// allow-list gate in ApplyRecord (they carry no physical page
-		// state, e.g. RecordKindCreateTransform) and land here. They are
-		// intentionally a no-op: the recovery driver in
-		// internal/initdb/*_ddl_recovery.go re-scans the raw WAL and
-		// re-applies them to the catalog directly (see
-		// wal.IsGoopgNativeRecord / isGoopgOwnedRmgr, which those scanners
-		// rely on to trust r.Payload[0] for this same rmgr).
+		// A decoded rmid-128 record carries no physical page state, so replay
+		// is a no-op. Phase B5 retired every goopg-private catalog/DDL kind that
+		// used to land here (they now journal as real heap/btree records reloaded
+		// from the catalog heaps by internal/initdb/catalog_heap_reload.go, not a
+		// WAL re-scan), so a fresh B5 cluster never reaches this arm; it survives
+		// only to no-op any legacy rmid-128 record in pre-B5 on-disk WAL.
 		return false, nil
 	case RmgrXLog:
 		switch xlog.Header.Info & XLRRmgrInfoMask {

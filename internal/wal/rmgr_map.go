@@ -77,7 +77,14 @@ func recordKindToRmgrInfo(kind byte) (Rmgr, uint8) {
 	case RecordKindPageImage:
 		return RmgrXLog, xlogXLogFPI
 	default:
-		// goopg-private catalog/DDL records: custom rmgr, body-keyed.
+		// Total-function fallback. Phase B5 retired every goopg-private
+		// catalog/DDL kind that used to land here (index/attrdef/statistics/
+		// view+matview → real heap/btree records), so NO live-emitted record
+		// reaches this arm: the only RecordKinds still routed here are legacy
+		// native Encode paths with zero call sites (heap-update/multi-insert/
+		// visible, btree reuse/meta-cleanup, smgr-truncate, subxact markers).
+		// Kept as a safety net + for reading pre-B5 on-disk WAL. See
+		// RmgrGoopgCatalog's declaration (xlog_record.go).
 		return RmgrGoopgCatalog, 0
 	}
 }
