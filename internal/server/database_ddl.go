@@ -1150,6 +1150,73 @@ func (s *Server) syncCopiedTableCatalogHeap(newOid uint32, tbl *catalog.Table) e
 	return nil
 }
 
+// syncPgDatabaseHeapRow INSERTs the pg_database SHARED heap row (global/1262)
+// for a freshly created database from its own short-lived internal transaction
+// (B4.6 Stage 1). The new row's encoding/locale columns are cloned from the
+// template database's heap row (templateOid); the executor writer maintains the
+// 2671/2672 indexes. This is the standby's copy of the database catalog — a
+// real PG18 standby replays the XLOG_HEAP_INSERT; goopg's own pg_database is
+// still served from the registry VirtualRows. A nil Pool/TxnMgr (test/embedded)
+// is a no-op, matching syncCopiedTableCatalogHeap.
+func (s *Server) syncPgDatabaseHeapRow(newOid uint32, name string, owner, templateOid uint32) error {
+	return s.runPgDatabaseHeapTxn(func(ectx *executor.Context) error {
+		return executor.SyncPgDatabaseCatalogRow(ectx, newOid, name, owner, templateOid)
+	})
+}
+
+// deletePgDatabaseHeapRow stamps the pg_database heap row for oid deleted
+// (DROP DATABASE, B4.6 Stage 1) from its own short-lived transaction.
+func (s *Server) deletePgDatabaseHeapRow(oid uint32) error {
+	return s.runPgDatabaseHeapTxn(func(ectx *executor.Context) error {
+		return executor.DeletePgDatabaseCatalogRow(ectx, oid)
+	})
+}
+
+// runPgDatabaseHeapTxn opens a short-lived internal transaction wired for
+// shared-catalog heap writes and runs fn against it, committing on success.
+// Mirrors syncCopiedTableCatalogHeap / syncDbRoleSettingHeap scaffolding.
+// CurrentDatabaseOid is DefaultDBOid so the CatalogHeapSyncAvailable guard can
+// resolve pg_attribute; the write itself targets the SHARED pg_database rel
+// (global/1262, DBOid 0).
+func (s *Server) runPgDatabaseHeapTxn(fn func(*executor.Context) error) error {
+	if s.cfg.Pool == nil || s.cfg.TxnMgr == nil {
+		return nil
+	}
+	ectx := executor.NewContext()
+	ectx.Pool = s.cfg.Pool
+	ectx.Catalog = s.cfg.Catalog
+	ectx.CurrentDatabaseOid = catalog.DefaultDBOid
+	if !executor.CatalogHeapSyncAvailable(ectx) {
+		return nil
+	}
+	tx, err := s.cfg.TxnMgr.Begin(mvcc.IsolationReadCommitted)
+	if err != nil {
+		return fmt.Errorf("begin pg_database sync transaction: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = s.cfg.TxnMgr.Rollback(tx)
+		}
+	}()
+	snap, err := s.cfg.TxnMgr.SnapshotFor(tx)
+	if err != nil {
+		return fmt.Errorf("snapshot for pg_database sync transaction: %w", err)
+	}
+	ectx.TxnMgr = s.cfg.TxnMgr
+	ectx.Tx = tx
+	ectx.Snap = snap
+	ectx.WAL = s.cfg.WAL
+	if err := fn(ectx); err != nil {
+		return err
+	}
+	if err := s.cfg.TxnMgr.Commit(tx); err != nil {
+		return fmt.Errorf("commit pg_database sync transaction: %w", err)
+	}
+	committed = true
+	return nil
+}
+
 // syncDbRoleSettingHeap re-syncs the (setDatabase, setRole) pg_db_role_setting
 // SHARED heap row (global/2964) from the current registry state — the B4.2
 // replacement for the AlterDatabase/RoleSetConfig WAL records. Like
@@ -1355,6 +1422,31 @@ func (s *Server) tryHandleDatabaseDDL(sql string, liveDBName string, actingRole 
 				return true, "", cerr
 			}
 		}
+		// B4.6 Stage 1: journal the new database's pg_database SHARED heap row
+		// (global/1262) so a real PG18 standby sees the catalog row. Written
+		// AFTER the template copy (so a copy failure rolls back before any row
+		// is written) and BEFORE the goopg-private CREATE-DATABASE record. Best-
+		// effort: a failure here must not fail the CREATE — goopg's own
+		// pg_database is served from the registry, and the standby copy is a
+		// stream-parity artifact, so it degrades to "standby missing the row"
+		// rather than aborting a locally-consistent CREATE (matches
+		// walLogRelmapForNewDatabase's best-effort stance).
+		//
+		// resolveCreateDatabaseTemplate collapses srcOid to 0 for an empty /
+		// DefaultDBOid template; re-resolve the template's real oid so the clone
+		// inherits its encoding/locale (every bootstrap DB shares the cluster
+		// locale, so template1/oid-1 is the faithful default source).
+		cloneTemplateOid := srcOid
+		if cloneTemplateOid == 0 {
+			if reg, ok := s.cfg.Catalog.(databaseTemplateRegistry); ok {
+				if o, ok := reg.ResolveDatabaseOid(templateName); ok {
+					cloneTemplateOid = o
+				}
+			}
+		}
+		if err := s.syncPgDatabaseHeapRow(oid, name, owner, cloneTemplateOid); err != nil && s.cfg.Logger != nil {
+			s.cfg.Logger.Warn("pg_database heap row sync failed", "database", name, "err", err)
+		}
 		if s.cfg.WAL != nil {
 			if _, _, werr := s.cfg.WAL.Append(wal.EncodeCreateDatabase(name, owner, oid)); werr != nil {
 				// Roll back the catalog change (and any copied template
@@ -1472,6 +1564,12 @@ func (s *Server) tryHandleDatabaseDDL(sql string, liveDBName string, actingRole 
 				_, _ = cat.CreateDatabase(name, droppedOwner)
 				return true, "", werr
 			}
+		}
+		// B4.6 Stage 1: stamp the pg_database SHARED heap row (global/1262)
+		// deleted now that the drop is durable — a real PG18 standby replays
+		// the XLOG_HEAP_DELETE. Best-effort, same rationale as the CREATE side.
+		if err := s.deletePgDatabaseHeapRow(droppedOid); err != nil && s.cfg.Logger != nil {
+			s.cfg.Logger.Warn("pg_database heap row delete failed", "database", name, "err", err)
 		}
 		// M0122-0007 physical-storage-isolation slice 3: remove base/<oid>
 		// now that the drop is durable (WAL-committed above, or no WAL
