@@ -33,3 +33,6 @@ thresholds:
 top_functions: 100
 top_packages: 20
 top_files: 50
+
+# Minimum consecutive code lines for a block to count as duplicated.
+duplication_min_lines: 6

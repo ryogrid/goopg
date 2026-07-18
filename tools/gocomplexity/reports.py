@@ -15,6 +15,31 @@ import pandas as pd  # noqa: E402
 
 from .models import Aggregate, FunctionMetric, ProjectSummary
 
+
+def _num(value: float) -> str:
+    """Format a number that may be integral without a trailing ``.0``."""
+    if isinstance(value, float) and value.is_integer():
+        return f"{int(value):,}"
+    if isinstance(value, int):
+        return f"{value:,}"
+    return f"{value:,.2f}"
+
+
+def project_summary_rows(s: ProjectSummary) -> list[tuple[str, str]]:
+    """The headline 'Project Summary' rows, in display order."""
+    return [
+        ("LOC", f"{s.loc:,}"),
+        ("Functions", f"{s.num_functions:,}"),
+        ("Average CC", f"{s.cyclomatic.mean:.2f}"),
+        ("Median CC", _num(s.cyclomatic.median)),
+        ("P95 CC", _num(s.cyclomatic.p95)),
+        ("Maximum CC", f"{s.cyclomatic.maximum:,}"),
+        ("Average Cognitive", f"{s.cognitive.mean:.1f}"),
+        ("Maintainability Index", f"{round(s.maintainability_index)}"),
+        ("Duplicate Code", f"{s.duplicate_code_pct:.1f}%"),
+    ]
+
+
 OUTPUT_FILES = (
     "report.html",
     "summary.json",
@@ -67,6 +92,8 @@ def _write_aggregate_csv(out_dir: str, name: str, aggs: list[Aggregate]) -> None
     columns = [
         "key",
         "functions",
+        "loc",
+        "maintainability_index",
         "total_cyclomatic",
         "max_cyclomatic",
         "mean_cyclomatic",
@@ -157,18 +184,31 @@ def _functions_table(metrics: list[FunctionMetric], limit: int) -> str:
 
 def _aggregate_table(aggs: list[Aggregate], limit: int, key_label: str) -> str:
     head = (
-        f"<tr><th>#</th><th>{_esc(key_label)}</th><th>Functions</th>"
-        "<th>Total CC</th><th>Max CC</th><th>Mean CC</th></tr>"
+        f"<tr><th>#</th><th>{_esc(key_label)}</th><th>Functions</th><th>LOC</th>"
+        "<th>MI</th><th>Total CC</th><th>Max CC</th><th>Mean CC</th></tr>"
     )
     rows = []
     for i, a in enumerate(aggs[:limit], 1):
         rows.append(
             f"<tr><td>{i}</td><td>{_esc(a.key)}</td><td class='num'>{_esc(a.functions)}</td>"
+            f"<td class='num'>{_esc(f'{a.loc:,}')}</td>"
+            f"<td class='num'>{_esc(round(a.maintainability_index))}</td>"
             f"<td class='num'>{_esc(a.total_cyclomatic)}</td>"
             f"<td class='num'>{_esc(a.max_cyclomatic)}</td>"
             f"<td class='num'>{_esc(a.mean_cyclomatic)}</td></tr>"
         )
     return f"<table class='rank'>{head}{''.join(rows)}</table>"
+
+
+def _project_summary_card(summary: ProjectSummary) -> str:
+    body = "".join(
+        f"<tr><th>{_esc(k)}</th><td class='num'>{_esc(v)}</td></tr>"
+        for k, v in project_summary_rows(summary)
+    )
+    return (
+        "<div class='card summary'><h3>Project Summary</h3>"
+        f"<table class='kv'>{body}</table></div>"
+    )
 
 
 _CSS = """
@@ -220,6 +260,7 @@ roots: {_esc(", ".join(summary.roots))} &middot;
 {_esc(summary.num_functions)} functions</p>
 
 <div class="cards">
+  {_project_summary_card(summary)}
   {_stats_table("Cyclomatic complexity", summary.cyclomatic)}
   {_stats_table("Cognitive complexity", summary.cognitive)}
 </div>
@@ -251,6 +292,10 @@ def print_console_summary(
 ) -> None:
     """Print a compact human-readable summary to stdout."""
     s = summary
+    print("Project Summary")
+    for label, value in project_summary_rows(s):
+        print(f"  {label:<22}{value:>12}")
+    print()
     print(f"Go Codebase Complexity — {s.num_functions} functions across "
           f"{s.num_files} files, {s.num_packages} packages")
     print(f"  roots: {', '.join(s.roots)}")

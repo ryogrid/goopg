@@ -45,6 +45,7 @@ class Config:
     top_functions: int = 100
     top_packages: int = 20
     top_files: int = 50
+    duplication_min_lines: int = 6
 
     def normalized(self) -> "Config":
         """Return a copy with de-duplicated, sorted threshold list."""
@@ -84,5 +85,7 @@ def load_config(path: str | None) -> Config:
         cfg.top_packages = int(data["top_packages"])
     if "top_files" in data:
         cfg.top_files = int(data["top_files"])
+    if "duplication_min_lines" in data:
+        cfg.duplication_min_lines = int(data["duplication_min_lines"])
 
     return cfg

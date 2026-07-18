@@ -70,6 +70,8 @@ class Aggregate:
     total_cognitive: int
     max_cognitive: int
     mean_cognitive: float
+    loc: int = 0
+    maintainability_index: float = 0.0
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -84,6 +86,12 @@ class ProjectSummary:
     num_files: int
     num_packages: int
     num_functions: int
+    loc: int
+    maintainability_index: float
+    duplicate_code_pct: float
+    duplicate_code_lines: int
+    total_code_lines: int
+    halstead_volume: float
     cyclomatic: MetricStats
     cognitive: MetricStats
     thresholds: list[int]
@@ -98,6 +106,12 @@ class ProjectSummary:
             "num_files": self.num_files,
             "num_packages": self.num_packages,
             "num_functions": self.num_functions,
+            "loc": self.loc,
+            "maintainability_index": self.maintainability_index,
+            "duplicate_code_pct": self.duplicate_code_pct,
+            "duplicate_code_lines": self.duplicate_code_lines,
+            "total_code_lines": self.total_code_lines,
+            "halstead_volume": self.halstead_volume,
             "thresholds": self.thresholds,
             "cyclomatic": self.cyclomatic.to_dict(),
             "cognitive": self.cognitive.to_dict(),

@@ -17,6 +17,7 @@ from .collector import collect_go_files
 from .config import Config, load_config
 from .reports import print_console_summary, write_all
 from .runner import ToolNotFoundError, analyze
+from .sourcemetrics import duplication_pct, scan_sources
 from .stats import build_summary
 
 # Default parent directory for timestamped report dirs (beside the tool).
@@ -74,6 +75,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Exit 1 if any function's cyclomatic complexity exceeds N (CI gate).",
     )
     parser.add_argument(
+        "--dup-min-lines",
+        type=int,
+        metavar="N",
+        help="Minimum consecutive code lines for a duplicate block (default 6).",
+    )
+    parser.add_argument(
+        "--no-duplication",
+        action="store_true",
+        help="Skip duplicate-code detection (the most expensive pass).",
+    )
+    parser.add_argument(
         "--quiet", action="store_true", help="Suppress the console summary."
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -95,6 +107,8 @@ def _resolve_config(args: argparse.Namespace) -> Config:
         cfg.top_packages = args.top_packages
     if args.top_files is not None:
         cfg.top_files = args.top_files
+    if args.dup_min_lines is not None:
+        cfg.duplication_min_lines = args.dup_min_lines
     return cfg.normalized()
 
 
@@ -125,9 +139,25 @@ def main(argv: list[str] | None = None) -> None:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(3)
 
+    # Source-level metrics (LOC / Halstead / Maintainability Index / duplication)
+    # over the same production-only file set.
+    sources = scan_sources(files, base=args.base)
+    if args.no_duplication:
+        total_code = sum(fs.loc for fs in sources.values())
+        duplication = (0.0, 0, total_code)
+    else:
+        duplication = duplication_pct(sources, config.duplication_min_lines)
+
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    summary = build_summary(metrics, config, generated_at, num_files=len(files))
+    summary = build_summary(
+        metrics,
+        config,
+        generated_at,
+        num_files=len(files),
+        sources=sources,
+        duplication=duplication,
+    )
 
     reports_root = args.output_dir or _DEFAULT_REPORTS_ROOT
     out_dir = os.path.join(reports_root, f"report_{stamp}")
