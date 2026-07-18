@@ -1284,3 +1284,51 @@ func TestPort_AuthMembersSurvivesRestart(t *testing.T) {
 		t.Fatalf("post-restart revoked membership count = %q, want 0", got)
 	}
 }
+
+// TestPort_SubscriptionSurvivesRestart validates B4.4: CREATE/DROP/ALTER
+// SUBSCRIPTION OWNER journals a real pg_subscription SHARED heap row
+// (global/6100), and a restart reloads the PubSub registry from it
+// (reloadSubscriptionsFromHeap) — no bespoke kind 53/54/55 record.
+func TestPort_SubscriptionSurvivesRestart(t *testing.T) {
+	c, err := cluster.New("subscription-durability", cluster.Options{
+		RepoRoot:     repoRoot(t),
+		DataDir:      filepath.Join(t.TempDir(), "data"),
+		StartupWait:  20 * time.Second,
+		ShutdownWait: 20 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+
+	stmts := []string{
+		"CREATE SUBSCRIPTION b44_sub CONNECTION 'host=remote dbname=app' PUBLICATION b44_pub WITH (enabled = false)",
+		"ALTER SUBSCRIPTION b44_sub OWNER TO postgres",
+		"CREATE SUBSCRIPTION b44_gone CONNECTION 'host=remote dbname=app' PUBLICATION b44_p2 WITH (enabled = false)",
+		"DROP SUBSCRIPTION b44_gone",
+	}
+	for _, s := range stmts {
+		if err := runSQLSimple(t, c, s); err != nil {
+			t.Fatalf("%s: %v", s, err)
+		}
+	}
+
+	if err := c.Stop(cluster.ShutdownFast); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	if err := c.Start(); err != nil {
+		t.Fatalf("restart: %v", err)
+	}
+
+	// Surviving subscription present (with its conninfo) after reload from heap.
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_subscription WHERE subname = 'b44_sub' AND subconninfo LIKE '%host=remote%'"); got != "1" {
+		t.Fatalf("post-restart subscription count = %q, want 1 (reloaded from heap)", got)
+	}
+	// The dropped subscription must be gone.
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_subscription WHERE subname = 'b44_gone'"); got != "0" {
+		t.Fatalf("post-restart dropped subscription count = %q, want 0", got)
+	}
+}

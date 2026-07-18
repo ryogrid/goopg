@@ -598,6 +598,15 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
     deleted role_membership_recovery.go. Gate: `AuthMembersSurvivesRestart` + executor/server suites.
     Note: no standby benefit until the role-STATE kinds (67/68/72, pg_authid) also convert — this is a
     bounded, non-boot-critical precursor to the pg_authid slice.
+  - [x] **B4.4 pg_subscription (kinds 53-55 retired) — CLOSES the pub/sub group** — LANDED.
+    CREATE/DROP/ALTER SUBSCRIPTION OWNER journal a real pg_subscription SHARED heap row (global/6100);
+    with B3.3's pg_publication the whole pub/sub group is heap-journaled and pubsub_ddl_recovery.go is
+    deleted. Full 18-col PG18 row: goopg's PubSub registry tracks 8, the other 10 get PG defaults. Reuses
+    B4.1a + heap-only (6114/6115 not materialized) + B3.2 text[]. Executor-layer emit; DROP captures the
+    OID before the registry drop. Reload `reloadSubscriptionsFromHeap`. Gate: `SubscriptionSurvivesRestart`
+    + executor/server suites. Lowest-risk remaining B4 (non-boot-critical; only cost is column width).
+    - Remaining B4 (both boot-critical/large): **pg_authid + role-state** (67/68/72, retire SyncPgAuthidFile)
+      and **pg_database** (18/19, needs RM_DBASE + template file-copy streaming).
 - [ ] **B5** Retire `RmgrGoopgCatalog=128` (now unused) — header-side parity complete.
 - [ ] **B-gate**: per-catalog full regress + `internal/testport` isolation; `psql \d`/`\df`/`\dn` +
   `information_schema` parity vs PG 18.3; crash-after-DDL recovery via generic reload; re-init data dir.

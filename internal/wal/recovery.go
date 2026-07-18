@@ -411,30 +411,10 @@ const (
 	// recovery driver in internal/initdb replays it against the CLog.
 	RecordKindClogTruncate byte = 33
 
-	// RecordKindCreateSubscription records a `CREATE SUBSCRIPTION name ...`
-	// event so it survives a restart. Same rationale/no-op physical redo
-	// path as RecordKindCreatePublication.
-	// Format:
-	//   kind(1) | oid(4) | ownerOID(4) | enabledFlag(1) |
-	//   nameLen(2) | name(nameLen bytes) |
-	//   conninfoLen(2) | conninfo(conninfoLen bytes) |
-	//   slotNameLen(2) | slotName(slotNameLen bytes) |
-	//   pubCount(2) | for each: pubLen(2) pub(pubLen bytes)
-	RecordKindCreateSubscription byte = 53
-
-	// RecordKindDropSubscription records a `DROP SUBSCRIPTION name` event.
-	// Counterpart to RecordKindCreateSubscription; same no-op physical redo
-	// path.
-	// Format:
-	//   kind(1) | nameLen(2) | name(nameLen bytes)
-	RecordKindDropSubscription byte = 54
-
-	// RecordKindAlterSubscriptionOwner records an `ALTER SUBSCRIPTION name
-	// OWNER TO newowner` event. Same no-op physical redo path as
-	// RecordKindCreateSubscription.
-	// Format:
-	//   kind(1) | ownerOID(4) | nameLen(2) | name(nameLen bytes)
-	RecordKindAlterSubscriptionOwner byte = 55
+	// Kinds 53-55 (Create/Drop/AlterSubscriptionOwner) retired in B4.4:
+	// CREATE/DROP/ALTER SUBSCRIPTION OWNER now journal a real pg_subscription
+	// heap row (SHARED, global/6100), and a restart reloads the PubSub registry
+	// via reloadSubscriptionsFromHeap. (Publications converted in B3.3.)
 
 	// Kinds 124/125 (CreateTablespace/DropTablespace) retired in B4.1e:
 	// CREATE/DROP TABLESPACE now journals a real pg_tablespace heap row
@@ -1131,180 +1111,6 @@ func DecodeRenameIndex(payload []byte) (schema, oldName, newName string, err err
 	newName = string(payload[off : off+newNameLen])
 	return schema, oldName, newName, nil
 }
-
-// EncodeCreateSubscription encodes a CREATE SUBSCRIPTION event (DU-002
-// restart-persistence follow-up to M0119-0004, loop #67 ledger resume
-// point). The OID is carried so recovery re-registers the subscription
-// identically to the live server. Format documented at the
-// RecordKindCreateSubscription constant. dbOid is appended as a trailing
-// 4-byte field (M0122-0007 4d-ii-part-2b item 1) so a pre-existing WAL
-// file with no trailer still decodes — DecodeCreateSubscription treats a
-// short read of just that trailer as dbOid 0 (DefaultDBOid via
-// NamespaceDBOid), matching the pre-item-1 single-database default.
-func EncodeCreateSubscription(name, conninfo, slotName string, publications []string, oid, ownerOID uint32, enabled bool, dbOid uint32) []byte {
-	strs := []string{name, conninfo, slotName}
-	for i, s := range strs {
-		if len(s) > 0xFFFF {
-			strs[i] = s[:0xFFFF]
-		}
-	}
-	name, conninfo, slotName = strs[0], strs[1], strs[2]
-	total := 10 + 2 + len(name) + 2 + len(conninfo) + 2 + len(slotName) + 2
-	for _, p := range publications {
-		if len(p) > 0xFFFF {
-			p = p[:0xFFFF]
-		}
-		total += 2 + len(p)
-	}
-	total += 4
-	out := make([]byte, total)
-	out[0] = RecordKindCreateSubscription
-	binary.LittleEndian.PutUint32(out[1:5], oid)
-	binary.LittleEndian.PutUint32(out[5:9], ownerOID)
-	if enabled {
-		out[9] = 1
-	}
-	off := 10
-	writeStr := func(s string) {
-		binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(s)))
-		off += 2
-		copy(out[off:], s)
-		off += len(s)
-	}
-	writeStr(name)
-	writeStr(conninfo)
-	writeStr(slotName)
-	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(publications)))
-	off += 2
-	for _, p := range publications {
-		if len(p) > 0xFFFF {
-			p = p[:0xFFFF]
-		}
-		writeStr(p)
-	}
-	binary.LittleEndian.PutUint32(out[off:off+4], dbOid)
-	off += 4
-	return out
-}
-
-// DecodeCreateSubscription decodes a RecordKindCreateSubscription payload.
-// dbOid is 0 (DefaultDBOid via NamespaceDBOid) for a pre-item-1 payload
-// that predates the trailing dbOid field.
-func DecodeCreateSubscription(payload []byte) (name, conninfo, slotName string, publications []string, oid, ownerOID uint32, enabled bool, dbOid uint32, err error) {
-	if len(payload) < 10 {
-		return "", "", "", nil, 0, 0, false, 0, fmt.Errorf("wal: create-subscription payload too short (%d bytes)", len(payload))
-	}
-	if payload[0] != RecordKindCreateSubscription {
-		return "", "", "", nil, 0, 0, false, 0, fmt.Errorf("wal: record kind %d is not create-subscription", payload[0])
-	}
-	oid = binary.LittleEndian.Uint32(payload[1:5])
-	ownerOID = binary.LittleEndian.Uint32(payload[5:9])
-	enabled = payload[9] != 0
-	off := 10
-	readStr := func() (string, error) {
-		if len(payload) < off+2 {
-			return "", fmt.Errorf("wal: create-subscription payload truncated (need %d bytes)", off+2)
-		}
-		l := int(binary.LittleEndian.Uint16(payload[off : off+2]))
-		off += 2
-		if len(payload) < off+l {
-			return "", fmt.Errorf("wal: create-subscription payload truncated (need %d bytes)", off+l)
-		}
-		s := string(payload[off : off+l])
-		off += l
-		return s, nil
-	}
-	if name, err = readStr(); err != nil {
-		return "", "", "", nil, 0, 0, false, 0, err
-	}
-	if conninfo, err = readStr(); err != nil {
-		return "", "", "", nil, 0, 0, false, 0, err
-	}
-	if slotName, err = readStr(); err != nil {
-		return "", "", "", nil, 0, 0, false, 0, err
-	}
-	if len(payload) < off+2 {
-		return "", "", "", nil, 0, 0, false, 0, fmt.Errorf("wal: create-subscription payload truncated (need %d bytes)", off+2)
-	}
-	pubCount := int(binary.LittleEndian.Uint16(payload[off : off+2]))
-	off += 2
-	publications = make([]string, 0, pubCount)
-	for i := 0; i < pubCount; i++ {
-		s, serr := readStr()
-		if serr != nil {
-			return "", "", "", nil, 0, 0, false, 0, serr
-		}
-		publications = append(publications, s)
-	}
-	if len(payload) >= off+4 {
-		dbOid = binary.LittleEndian.Uint32(payload[off : off+4])
-		off += 4
-	}
-	return name, conninfo, slotName, publications, oid, ownerOID, enabled, dbOid, nil
-}
-
-// EncodeDropSubscription encodes a DROP SUBSCRIPTION event (DU-002
-// restart-persistence follow-up to M0119-0004, loop #67 ledger resume
-// point). Format documented at the RecordKindDropSubscription constant.
-func EncodeDropSubscription(name string) []byte {
-	if len(name) > 0xFFFF {
-		name = name[:0xFFFF]
-	}
-	out := make([]byte, 3+len(name))
-	out[0] = RecordKindDropSubscription
-	binary.LittleEndian.PutUint16(out[1:3], uint16(len(name)))
-	copy(out[3:], name)
-	return out
-}
-
-// DecodeDropSubscription decodes a RecordKindDropSubscription payload.
-func DecodeDropSubscription(payload []byte) (name string, err error) {
-	if len(payload) < 3 {
-		return "", fmt.Errorf("wal: drop-subscription payload too short (%d bytes)", len(payload))
-	}
-	if payload[0] != RecordKindDropSubscription {
-		return "", fmt.Errorf("wal: record kind %d is not drop-subscription", payload[0])
-	}
-	nameLen := int(binary.LittleEndian.Uint16(payload[1:3]))
-	if len(payload) < 3+nameLen {
-		return "", fmt.Errorf("wal: drop-subscription payload truncated (need %d bytes)", 3+nameLen)
-	}
-	return string(payload[3 : 3+nameLen]), nil
-}
-
-// EncodeAlterSubscriptionOwner encodes an ALTER SUBSCRIPTION ... OWNER TO
-// event (DU-002 restart-persistence follow-up to M0119-0004, loop #67
-// ledger resume point). Format documented at the
-// RecordKindAlterSubscriptionOwner constant.
-func EncodeAlterSubscriptionOwner(name string, ownerOID uint32) []byte {
-	if len(name) > 0xFFFF {
-		name = name[:0xFFFF]
-	}
-	out := make([]byte, 7+len(name))
-	out[0] = RecordKindAlterSubscriptionOwner
-	binary.LittleEndian.PutUint32(out[1:5], ownerOID)
-	binary.LittleEndian.PutUint16(out[5:7], uint16(len(name)))
-	copy(out[7:], name)
-	return out
-}
-
-// DecodeAlterSubscriptionOwner decodes a RecordKindAlterSubscriptionOwner
-// payload.
-func DecodeAlterSubscriptionOwner(payload []byte) (name string, ownerOID uint32, err error) {
-	if len(payload) < 7 {
-		return "", 0, fmt.Errorf("wal: alter-subscription-owner payload too short (%d bytes)", len(payload))
-	}
-	if payload[0] != RecordKindAlterSubscriptionOwner {
-		return "", 0, fmt.Errorf("wal: record kind %d is not alter-subscription-owner", payload[0])
-	}
-	ownerOID = binary.LittleEndian.Uint32(payload[1:5])
-	nameLen := int(binary.LittleEndian.Uint16(payload[5:7]))
-	if len(payload) < 7+nameLen {
-		return "", 0, fmt.Errorf("wal: alter-subscription-owner payload truncated (need %d bytes)", 7+nameLen)
-	}
-	return string(payload[7 : 7+nameLen]), ownerOID, nil
-}
-
 // FunctionArgPayload is one CREATE FUNCTION/PROCEDURE argument, mirroring
 // the parallel ArgNames/ArgTypes/ArgModes/ArgDefaults slices on
 // catalog.Routine. TypeArgs carries a type's numeric modifiers (e.g.
@@ -3464,16 +3270,6 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 		// crash-recovery on the primary never called ApplyRecord for these
 		// (internal/initdb/open.go invokes replayStatisticsDDLRecords
 		// directly) and so never observed the gap.
-		return false, nil
-	case RecordKindCreateSubscription, RecordKindDropSubscription, RecordKindAlterSubscriptionOwner:
-		// CREATE/DROP/ALTER PUBLICATION/SUBSCRIPTION records (DU-002
-		// restart-persistence follow-up, M0119-0004 loop #67 ledger resume
-		// point) carry only catalog.PubSub metadata; goopg has no
-		// per-publication/subscription file namespace, so the physical
-		// replay path has nothing to do. The recovery driver in
-		// internal/initdb/pubsub_ddl_recovery.go scans the WAL for these
-		// records after physical replay and re-applies them to the PubSub
-		// registry.
 		return false, nil
 	case RecordKindCreateIndex, RecordKindDropIndex, RecordKindRenameIndex:
 		// CREATE/DROP/RENAME INDEX records (M0079-0001; RENAME added
