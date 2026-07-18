@@ -236,6 +236,56 @@ func reloadUserTablespacesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, 
 	return nil
 }
 
+// reloadDbRoleSettingsFromHeap is B4.2's pg_db_role_setting reload — the
+// generic heap-scan replacement for the retired replayDatabaseConfigRecords +
+// replayRoleConfigRecords scanners (RecordKinds 73-78). pg_db_role_setting is
+// SHARED (global/2964). Each live row's setconfig text[] is split back into
+// "name=value" entries and re-applied to the dbRoleSettings/roleSettings
+// registries via the idempotent SetDatabaseConfig (setrole==0) / SetRoleConfig
+// (setrole!=0). Dropped rows (RESET ALL) carry xmax and are skipped by the
+// liveness filter.
+func reloadDbRoleSettingsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+	type cfgRow struct {
+		setDatabase uint32
+		setRole     uint32
+		entries     []string
+	}
+	rel := storage.RelFileNode{DBOid: 0, RelOid: 2964, Fork: storage.MainFork}
+	cols := executor.PGDbRoleSettingColumnsPG18()
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_db_role_setting",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			decoded := make(executor.Row, len(cols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, cols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			return cfgRow{
+				setDatabase: uint32(decoded[0].Int),
+				setRole:     uint32(decoded[1].Int),
+				entries:     executor.ParseTextArrayLiteral(decoded[2].StringValue()),
+			}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+	for _, r := range rows {
+		c := r.(cfgRow)
+		for _, entry := range c.entries {
+			eq := strings.IndexByte(entry, '=')
+			if eq < 0 {
+				continue
+			}
+			name, value := entry[:eq], entry[eq+1:]
+			if c.setRole == 0 {
+				cat.SetDatabaseConfig(c.setDatabase, name, value)
+			} else {
+				cat.SetRoleConfig(c.setRole, c.setDatabase, name, value)
+			}
+		}
+	}
+	return nil
+}
+
 // reloadUserRoutinesFromHeap is B1.2's pg_proc reload — the generic
 // heap-scan replacement for the retired replayFunctionDDLRecords scanner
 // (RecordKinds 61-64/121-123). Live rows with oid >= FirstUserOID carry the

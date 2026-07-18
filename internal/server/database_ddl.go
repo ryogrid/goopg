@@ -1150,6 +1150,52 @@ func (s *Server) syncCopiedTableCatalogHeap(newOid uint32, tbl *catalog.Table) e
 	return nil
 }
 
+// syncDbRoleSettingHeap re-syncs the (setDatabase, setRole) pg_db_role_setting
+// SHARED heap row (global/2964) from the current registry state — the B4.2
+// replacement for the AlterDatabase/RoleSetConfig WAL records. Like
+// syncCopiedTableCatalogHeap it opens its own short-lived internal transaction
+// (config DDL is non-transactional in goopg — the registry mutation and record
+// were always applied immediately, never rolled back). A nil Pool/TxnMgr
+// (test/embedded) is a no-op, matching the old records' nil-WAL fallback.
+func (s *Server) syncDbRoleSettingHeap(setDatabase, setRole uint32, entries []string) error {
+	if s.cfg.Pool == nil || s.cfg.TxnMgr == nil {
+		return nil
+	}
+	ectx := executor.NewContext()
+	ectx.Pool = s.cfg.Pool
+	ectx.Catalog = s.cfg.Catalog
+	ectx.CurrentDatabaseOid = catalog.DefaultDBOid // resolve pg_attribute for the heap-sync guard
+	if !executor.CatalogHeapSyncAvailable(ectx) {
+		return nil
+	}
+	tx, err := s.cfg.TxnMgr.Begin(mvcc.IsolationReadCommitted)
+	if err != nil {
+		return fmt.Errorf("begin pg_db_role_setting sync transaction: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = s.cfg.TxnMgr.Rollback(tx)
+		}
+	}()
+	snap, err := s.cfg.TxnMgr.SnapshotFor(tx)
+	if err != nil {
+		return fmt.Errorf("snapshot for pg_db_role_setting sync transaction: %w", err)
+	}
+	ectx.TxnMgr = s.cfg.TxnMgr
+	ectx.Tx = tx
+	ectx.Snap = snap
+	ectx.WAL = s.cfg.WAL
+	if err := executor.SyncDbRoleSettingRow(ectx, setDatabase, setRole, entries); err != nil {
+		return err
+	}
+	if err := s.cfg.TxnMgr.Commit(tx); err != nil {
+		return fmt.Errorf("commit pg_db_role_setting sync transaction: %w", err)
+	}
+	committed = true
+	return nil
+}
+
 // actingRoleIsSuperuser reports whether actingRole (see resolveActingRoleOID)
 // currently holds the SUPERUSER attribute — the escape hatch dropdb()'s
 // object_ownercheck grants a superuser regardless of database ownership.
@@ -1538,6 +1584,9 @@ type databaseConfigRegistry interface {
 	SetDatabaseConfig(dbOid uint32, name, value string)
 	ResetDatabaseConfig(dbOid uint32, name string)
 	ResetAllDatabaseConfig(dbOid uint32)
+	// DatabaseConfigEntries returns dbOid's current setconfig list, read
+	// after a mutation to re-sync the pg_db_role_setting heap row (B4.2).
+	DatabaseConfigEntries(dbOid uint32) []string
 }
 
 // databaseConnLimitRegistry is the subset of catalog.Catalog the
@@ -1628,25 +1677,16 @@ func (s *Server) applyAlterDatabaseConfig(op alterDatabaseConfigOp, liveDBName s
 	switch {
 	case op.resetAll:
 		cat.ResetAllDatabaseConfig(dbOid)
-		if s.cfg.WAL != nil {
-			if _, _, werr := s.cfg.WAL.Append(wal.EncodeAlterDatabaseResetAllConfig(dbOid)); werr != nil {
-				return true, "", werr
-			}
-		}
 	case op.reset:
 		cat.ResetDatabaseConfig(dbOid, op.configName)
-		if s.cfg.WAL != nil {
-			if _, _, werr := s.cfg.WAL.Append(wal.EncodeAlterDatabaseResetConfig(dbOid, op.configName)); werr != nil {
-				return true, "", werr
-			}
-		}
 	default:
 		cat.SetDatabaseConfig(dbOid, op.configName, op.configValue)
-		if s.cfg.WAL != nil {
-			if _, _, werr := s.cfg.WAL.Append(wal.EncodeAlterDatabaseSetConfig(dbOid, op.configName, op.configValue)); werr != nil {
-				return true, "", werr
-			}
-		}
+	}
+	// B4.2: re-sync the (dbOid, setrole=0) pg_db_role_setting heap row from the
+	// current registry state — replaces RecordKindAlterDatabaseSetConfig(73)/
+	// ResetConfig(74)/ResetAllConfig(75).
+	if err := s.syncDbRoleSettingHeap(uint32(dbOid), 0, cat.DatabaseConfigEntries(dbOid)); err != nil {
+		return true, "", err
 	}
 	return true, "", nil
 }

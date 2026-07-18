@@ -580,6 +580,15 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
     deleted `tablespace_ddl_recovery.go`. Gates: WAL round-trips, `TablespaceSurvivesRestart`,
     `WALPgWaldumpCompat` (pg_waldump parses all three record types). Residual (goopg-view only, ledgered):
     `tablespaceVirtualRows` still hardcodes spcowner=10 — the streamed heap carries the real owner.
+  - [x] **B4.2 pg_db_role_setting (kinds 73-78 retired)** — LANDED. ALTER DATABASE/ROLE SET/RESET/RESET ALL
+    journal a real pg_db_role_setting SHARED heap row (global/2964) instead of the six bespoke config
+    records. Reuses B4.1a (shared WAL locator), the heap-only pattern (2965 index not materialized →
+    seq-scan faithful), and the B3.2 text[] codec. One row per (setdatabase, setrole) carries the whole
+    setconfig; any SET/RESET re-syncs that row (B3.6 collapse pattern). First SERVER-layer catalog heap
+    write — `s.syncDbRoleSettingHeap` opens its own short-lived txn (config DDL is non-transactional),
+    mirroring `syncCopiedTableCatalogHeap`. Reload `reloadDbRoleSettingsFromHeap`; deleted
+    database_config_recovery.go + role_config_recovery.go. Gate: `DbRoleSettingSurvivesRestart` + server
+    suite + waldump.
 - [ ] **B5** Retire `RmgrGoopgCatalog=128` (now unused) — header-side parity complete.
 - [ ] **B-gate**: per-catalog full regress + `internal/testport` isolation; `psql \d`/`\df`/`\dn` +
   `information_schema` parity vs PG 18.3; crash-after-DDL recovery via generic reload; re-init data dir.

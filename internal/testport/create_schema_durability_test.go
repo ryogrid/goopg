@@ -1206,3 +1206,55 @@ func TestPort_TablespaceSurvivesRestart(t *testing.T) {
 		t.Fatalf("post-restart dropped tablespace count = %q, want 0", got)
 	}
 }
+
+// TestPort_DbRoleSettingSurvivesRestart validates B4.2: ALTER DATABASE/ROLE
+// SET/RESET journals a real pg_db_role_setting SHARED heap row (global/2964),
+// and a restart reloads the overrides from it (reloadDbRoleSettingsFromHeap) —
+// no bespoke kind 73-78 record.
+func TestPort_DbRoleSettingSurvivesRestart(t *testing.T) {
+	c, err := cluster.New("dbrolesetting-durability", cluster.Options{
+		RepoRoot:     repoRoot(t),
+		DataDir:      filepath.Join(t.TempDir(), "data"),
+		StartupWait:  20 * time.Second,
+		ShutdownWait: 20 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+
+	stmts := []string{
+		"ALTER DATABASE postgres SET search_path TO b42_dbval",
+		"ALTER ROLE postgres SET statement_timeout TO 12345",
+		"ALTER ROLE postgres SET lock_timeout TO 6789",
+		"ALTER ROLE postgres RESET lock_timeout", // exercise the delete-entry path
+	}
+	for _, s := range stmts {
+		if err := runSQLSimple(t, c, s); err != nil {
+			t.Fatalf("%s: %v", s, err)
+		}
+	}
+
+	if err := c.Stop(cluster.ShutdownFast); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	if err := c.Start(); err != nil {
+		t.Fatalf("restart: %v", err)
+	}
+
+	// Surviving overrides present after reload from the heap.
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_db_role_setting WHERE setconfig::text LIKE '%search_path=b42_dbval%'"); got != "1" {
+		t.Fatalf("post-restart database config count = %q, want 1 (reloaded from heap)", got)
+	}
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_db_role_setting WHERE setconfig::text LIKE '%statement_timeout=12345%'"); got != "1" {
+		t.Fatalf("post-restart role config count = %q, want 1 (reloaded from heap)", got)
+	}
+	// The RESET lock_timeout entry must be gone.
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_db_role_setting WHERE setconfig::text LIKE '%lock_timeout%'"); got != "0" {
+		t.Fatalf("post-restart reset config count = %q, want 0 (entry removed)", got)
+	}
+}

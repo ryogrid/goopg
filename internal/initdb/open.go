@@ -1445,27 +1445,16 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		}
 	}
 
-	// M0119-0004-ACLHEAP (ALTER DATABASE ... SET follow-up): replay
-	// ALTER DATABASE ... SET/RESET WAL records into pg_db_role_setting.
-	// Order relative to replayDatabaseDDLRecords does not matter — each
-	// record carries its own dbOid, not a name resolved through the
-	// database registry.
-	if err := replayDatabaseConfigRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+	// B4.2: restore ALTER DATABASE/ROLE SET overrides from the pg_db_role_setting
+	// SHARED heap (global/2964), replacing the retired replayDatabaseConfigRecords
+	// + replayRoleConfigRecords WAL scans (RecordKinds 73-78). Each row carries
+	// its own (setdatabase, setrole) key, so ordering relative to database/role
+	// DDL replay does not matter.
+	if err := reloadDbRoleSettingsFromHeap(mgr, cat, clog); err != nil {
 		_ = pool.Close()
 		_ = walWriter.Close()
 		_ = mgr.Close()
-		return nil, fmt.Errorf("goopg: database config replay: %w", err)
-	}
-
-	// M0119-0004-ACLHEAP (ALTER ROLE ... SET follow-up): replay ALTER ROLE
-	// ... SET/RESET WAL records into pg_db_role_setting. Each record keys
-	// off the role's OID (stable across a rename/restart), not its name, so
-	// ordering relative to role DDL replay does not matter.
-	if err := replayRoleConfigRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
-		_ = pool.Close()
-		_ = walWriter.Close()
-		_ = mgr.Close()
-		return nil, fmt.Errorf("goopg: role config replay: %w", err)
+		return nil, fmt.Errorf("goopg: pg_db_role_setting reload: %w", err)
 	}
 
 	// M0112: restore per-column planner statistics from pg_statistic.
