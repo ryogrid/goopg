@@ -1160,3 +1160,49 @@ func TestPort_AccessMethodSurvivesRestart(t *testing.T) {
 		t.Fatalf("post-restart dropped access method count = %q, want 0", got)
 	}
 }
+
+// TestPort_TablespaceSurvivesRestart validates B4.1: CREATE/DROP TABLESPACE
+// journals a real pg_tablespace SHARED heap row (global/1213) + pg_shdepend
+// owner dep + RM_TBLSPC record, and a restart reloads the registry from the
+// heap (reloadUserTablespacesFromHeap) — no bespoke kind 124/125 record.
+func TestPort_TablespaceSurvivesRestart(t *testing.T) {
+	c, err := cluster.New("tablespace-durability", cluster.Options{
+		RepoRoot:     repoRoot(t),
+		DataDir:      filepath.Join(t.TempDir(), "data"),
+		StartupWait:  20 * time.Second,
+		ShutdownWait: 20 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+
+	// allow_in_place_tablespaces is a per-session GUC (BootVal off); keep the
+	// SET in the same simple-query batch as the CREATEs so it applies.
+	if err := runSQLSimple(t, c,
+		"SET allow_in_place_tablespaces = on;"+
+			"CREATE TABLESPACE b41_ts LOCATION '';"+
+			"CREATE TABLESPACE b41_gone LOCATION '';"+
+			"DROP TABLESPACE b41_gone"); err != nil {
+		t.Fatalf("create/drop tablespace: %v", err)
+	}
+
+	if err := c.Stop(cluster.ShutdownFast); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	if err := c.Start(); err != nil {
+		t.Fatalf("restart: %v", err)
+	}
+
+	// Surviving tablespace present, with the resolved owner OID (superuser 10),
+	// after reload from the pg_tablespace heap.
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_tablespace WHERE spcname = 'b41_ts' AND spcowner = 10"); got != "1" {
+		t.Fatalf("post-restart tablespace count = %q, want 1 (reloaded from heap)", got)
+	}
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_tablespace WHERE spcname = 'b41_gone'"); got != "0" {
+		t.Fatalf("post-restart dropped tablespace count = %q, want 0", got)
+	}
+}

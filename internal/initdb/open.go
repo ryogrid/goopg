@@ -1271,17 +1271,17 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: pg_namespace reload: %w", err)
 	}
-	// M0122-0007 tablespace-registry restart-durability follow-up: restore
-	// CREATE/DROP TABLESPACE entries (pg_tablespace) from the WAL the same
-	// way. goopg's tablespace registry has no backing heap relation, so
-	// this must run before loadUserTablesFromHeap / loadUserIndexesFromHeap
-	// reconstruct their (now-durable) reltablespace OIDs, so a table/index
-	// pointing at a user tablespace doesn't transiently look orphaned.
-	if err := replayTablespaceDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+	// B4.1e: restore user (in-place) tablespaces from the pg_tablespace SHARED
+	// heap (global/1213), replacing the retired replayTablespaceDDLRecords WAL
+	// scan (RecordKinds 124/125). Must run before loadUserTablesFromHeap /
+	// loadUserIndexesFromHeap reconstruct their (now-durable) reltablespace
+	// OIDs, so a table/index pointing at a user tablespace doesn't transiently
+	// look orphaned.
+	if err := reloadUserTablespacesFromHeap(mgr, cat, clog); err != nil {
 		_ = pool.Close()
 		_ = walWriter.Close()
 		_ = mgr.Close()
-		return nil, fmt.Errorf("goopg: tablespace DDL replay: %w", err)
+		return nil, fmt.Errorf("goopg: pg_tablespace reload: %w", err)
 	}
 	// B3.4: the foreign-data trio (pg_foreign_data_wrapper / pg_foreign_server
 	// / pg_user_mapping) reloads from its HEAPS below, near the other

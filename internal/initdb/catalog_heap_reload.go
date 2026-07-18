@@ -198,6 +198,44 @@ func reloadUserSchemasFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog
 	return nil
 }
 
+// reloadUserTablespacesFromHeap is B4.1e's pg_tablespace reload — the generic
+// heap-scan replacement for the retired replayTablespaceDDLRecords scanner
+// (RecordKinds 124/125). pg_tablespace is a SHARED catalog (global/1213), so
+// the scan targets DBOid=0. Live rows with oid >= FirstUserOID are the user
+// in-place tablespaces; the two bootstrap rows (pg_default/pg_global) are
+// surfaced separately by catalog.tablespaceVirtualRows and skipped by the OID
+// filter. The registry's owner/location fields are never read (the virtual
+// view hardcodes spcowner=10), so they are re-registered empty. Dropped
+// tablespaces carry xmax and the liveness filter skips them.
+func reloadUserTablespacesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+	type tsRow struct {
+		oid  uint32
+		name string
+	}
+	rel := storage.RelFileNode{DBOid: 0, RelOid: 1213, Fork: storage.MainFork}
+	cols := executor.PGTablespaceColumnsPG18()
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_tablespace",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			decoded := make(executor.Row, len(cols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, cols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			return tsRow{oid: uint32(decoded[0].Int), name: decoded[1].StringValue()}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+	for _, r := range rows {
+		ts := r.(tsRow)
+		if ts.oid < catalog.FirstUserOID || ts.name == "" {
+			continue
+		}
+		cat.RegisterTablespaceDuringRecovery(ts.name, "", "", ts.oid)
+	}
+	return nil
+}
+
 // reloadUserRoutinesFromHeap is B1.2's pg_proc reload — the generic
 // heap-scan replacement for the retired replayFunctionDDLRecords scanner
 // (RecordKinds 61-64/121-123). Live rows with oid >= FirstUserOID carry the

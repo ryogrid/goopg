@@ -2,10 +2,51 @@ package wal
 
 import (
 	"bytes"
+	"encoding/binary"
 	"testing"
 
 	"github.com/goopg/goopg/internal/storage"
 )
+
+// locator12 builds the 12-byte on-wire RelFileLocator {spcOid, dbOid, relOid}.
+func locator12(spc, db, rel uint32) []byte {
+	out := make([]byte, 12)
+	binary.LittleEndian.PutUint32(out[0:4], spc)
+	binary.LittleEndian.PutUint32(out[4:8], db)
+	binary.LittleEndian.PutUint32(out[8:12], rel)
+	return out
+}
+
+// TestAssembleXLogRecord_SharedCatalogLocator asserts the B4.1a invariant: a
+// shared catalog (DBOid==0, files under global/) encodes its RelFileLocator
+// with spcOid=GLOBALTABLESPACE_OID(1664)/dbOid=0 so a real PostgreSQL standby
+// routes the replayed block to its own global/, while a per-DB relation keeps
+// spcOid=DEFAULTTABLESPACE_OID(1663). Both must round-trip back to goopg's
+// TblOid=0 convention (DBOid then selects global/ vs base/<db>).
+func TestAssembleXLogRecord_SharedCatalogLocator(t *testing.T) {
+	shared := storage.RelFileNode{DBOid: 0, RelOid: 1213, Fork: storage.MainFork} // pg_tablespace
+	perDB := storage.RelFileNode{DBOid: 5, RelOid: 1259, Fork: storage.MainFork}  // pg_class in postgres DB
+
+	sharedBody := mustAssemble(t, nil, []BlockRef{{ID: 0, Rel: shared, Block: 0, Data: []byte("row")}})
+	perDBBody := mustAssemble(t, nil, []BlockRef{{ID: 0, Rel: perDB, Block: 0, Data: []byte("row")}})
+
+	if !bytes.Contains(sharedBody, locator12(pgGlobalTableSpaceOID, 0, 1213)) {
+		t.Fatalf("shared-catalog locator missing: want spcOid=1664/dbOid=0/relOid=1213")
+	}
+	if bytes.Contains(sharedBody, locator12(pgDefaultTableSpaceOID, 0, 1213)) {
+		t.Fatalf("shared catalog wrongly encoded as pg_default (1663)")
+	}
+	if !bytes.Contains(perDBBody, locator12(pgDefaultTableSpaceOID, 5, 1259)) {
+		t.Fatalf("per-DB locator missing: want spcOid=1663/dbOid=5/relOid=1259")
+	}
+
+	if got := decodeAssembled(t, sharedBody).Blocks[0].Rel; got != shared {
+		t.Fatalf("shared rel round-trip: got %+v want %+v", got, shared)
+	}
+	if got := decodeAssembled(t, perDBBody).Blocks[0].Rel; got != perDB {
+		t.Fatalf("per-DB rel round-trip: got %+v want %+v", got, perDB)
+	}
+}
 
 // decodeAssembled runs an assembled record body back through the faithful
 // decoder (parseXLogRecordData) — the round-trip contract for the encoder.

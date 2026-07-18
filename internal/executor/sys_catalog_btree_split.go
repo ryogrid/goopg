@@ -160,6 +160,12 @@ func keyMetaForSysBtree(indexOID uint32) (btreeIndexKeyMeta, bool) {
 		return btreeIndexKeyMeta{tupleSize: 16, nkeyatts: 1}, true
 	case pgTransformTypeLangIndexOID:
 		return btreeIndexKeyMeta{tupleSize: 16, nkeyatts: 2}, true
+	// B4.1e: pg_tablespace (SHARED, global/) — 2697 oid / 2698 spcname
+	// (name-only). Both bootstrap-populated with the two default rows.
+	case pgTablespaceOidIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 16, nkeyatts: 1}, true
+	case pgTablespaceSpcnameIndexID:
+		return btreeIndexKeyMeta{tupleSize: 72, nkeyatts: 1}, true
 	// B2.2 slice 5: pg_opfamily (2754/2755 populated) + pg_opclass (2687
 	// populated, 2686 empty placeholder) + pg_amop (2653/2654 empty
 	// placeholders) + pg_amproc (2655 populated). The name-bearing keys put
