@@ -1465,29 +1465,17 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		slog.Warn("loadStatisticsFromHeap failed", "err", err)
 	}
 
-	// M0113: recover user indexes from pg_index heap (PG18-canonical path).
-	// Falls back to the WAL-replay path below for clusters that predate M0113
-	// (no pg_index rows written yet).
+	// M0113 / B5 Slice A: recover user indexes from the pg_index heap (2610) +
+	// pg_class (relkind='i'), the PG18-canonical path — reconstructs the full
+	// in-memory index (indkey/unique/primary/indrelid/opclass/collation/
+	// indoption/predicate). This replaced the goopg-private
+	// RecordKindCreateIndex(20)/DropIndex(21)/RenameIndex(94) records (retired in
+	// B5 Slice A): CREATE/DROP/RENAME INDEX now journal only real heap
+	// inserts/deletes/updates on pg_class + pg_index, which a real PG standby
+	// replays. Must run AFTER loadUserTablesFromHeap so the owning table is
+	// already registered.
 	if err := loadUserIndexesFromHeap(mgr, cat, clog); err != nil {
-		slog.Warn("loadUserIndexesFromHeap failed, falling back to WAL replay", "err", err)
-	}
-
-	// M0079-0001: replay CREATE/DROP INDEX WAL records into the
-	// in-memory catalog. Without this pass, indexes created
-	// after the last checkpoint would disappear from
-	// the catalog after a non-graceful restart even though
-	// their relfiles and btree pages are restored by physical
-	// replay. The pgbench `pgbench_accounts.aid` PK was the
-	// surfacing case (~70x TPS regression after restart because
-	// every UPDATE fell back to a 10M-row Seq Scan). Must run
-	// AFTER `loadUserTablesFromHeap` so the owning table is
-	// already in the catalog when we register the index.
-	// M0113: kept as fallback for pre-M0113 clusters without pg_index rows.
-	if err := replayIndexDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
-		_ = pool.Close()
-		_ = walWriter.Close()
-		_ = mgr.Close()
-		return nil, fmt.Errorf("goopg: index DDL replay: %w", err)
+		slog.Warn("loadUserIndexesFromHeap failed", "err", err)
 	}
 
 	// Sequence / SERIAL restart persistence: re-register sequences from
@@ -1511,37 +1499,36 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		}
 	}
 
-	// Column DEFAULT persistence (root-0020 follow-up): re-parse the DEFAULT
-	// expression snapshots emitted by syncTableToCatalogHeap onto the
-	// heap-reloaded columns (DefaultExpr is an in-memory AST pg_attribute
-	// cannot carry). Must run AFTER loadUserTablesFromHeap.
-	if err := replayColumnDefaultsRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+	// B5 Slice B: column DEFAULT persistence via real pg_attrdef HEAP rows
+	// (base/<dbOid>/2604), replacing the retired goopg-private
+	// RecordKindColumnDefaults(69) WAL scan (replayColumnDefaultsRecords). The
+	// reloaded catalog cannot rebuild DefaultExpr ASTs from pg_attribute (only
+	// atthasdef survives), so syncTableToCatalogHeap writes one pg_attrdef row
+	// per defaulted column carrying the expression as SQL text; this pass
+	// re-parses them. Runs as a STANDALONE UNCONDITIONAL pass (not inside
+	// loadUserTablesFromHeap, which the M0114 catalog cache bypasses) AFTER
+	// every table-load pass so both the main DB and each user DB's tables are
+	// registered. A real PG standby replays the heap inserts (no rmid-128).
+	if err := loadColumnDefaultsFromHeap(mgr, cat, clog); err != nil {
 		_ = pool.Close()
 		_ = walWriter.Close()
 		_ = mgr.Close()
-		return nil, fmt.Errorf("goopg: column-defaults replay: %w", err)
+		return nil, fmt.Errorf("goopg: pg_attrdef reload: %w", err)
 	}
 
-	// Materialized-view query persistence (M0119-0004 follow-up): re-parse the
-	// defining-query snapshots emitted by syncTableToCatalogHeap onto the
-	// heap-reloaded matviews (View is an in-memory AST pg_class cannot carry).
-	// Must run AFTER loadUserTablesFromHeap.
-	if err := replayMatViewRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+	// B5 Slice C: view / materialized-view query persistence from the pg_rewrite
+	// HEAP _RETURN rules (base/<dbOid>/2618) written by writeViewRewriteRow,
+	// replacing the retired RecordKindCreateMatView(102)/RecordKindCreateView(103)
+	// WAL scans (replayMatViewRecords/replayViewRecords). Re-parses each rule's
+	// ev_action SQL text to rebuild the view AST. STANDALONE UNCONDITIONAL pass
+	// (not inside loadUserTablesFromHeap, which the M0114 cache bypasses) AFTER
+	// every table-load pass so the owning relkind-tagged relation is registered.
+	// A real PG standby replays the heap inserts (no rmid-128).
+	if err := loadViewsFromHeap(mgr, cat, clog); err != nil {
 		_ = pool.Close()
 		_ = walWriter.Close()
 		_ = mgr.Close()
-		return nil, fmt.Errorf("goopg: matview replay: %w", err)
-	}
-
-	// Plain-view query persistence (M0119-0004 follow-up, sibling of the
-	// matview replay above): re-parse the defining-query snapshots emitted by
-	// syncTableToCatalogHeap onto the heap-reloaded views (View is an
-	// in-memory AST pg_class cannot carry). Must run AFTER loadUserTablesFromHeap.
-	if err := replayViewRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
-		_ = pool.Close()
-		_ = walWriter.Close()
-		_ = mgr.Close()
-		return nil, fmt.Errorf("goopg: view replay: %w", err)
+		return nil, fmt.Errorf("goopg: pg_rewrite reload: %w", err)
 	}
 
 	// Role/auth restart persistence (B4.5, was root-0021): reload the catalog
@@ -2038,16 +2025,20 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, fmt.Errorf("goopg: pg_am reload: %w", err)
 	}
 
-	// DU-002 restart-persistence follow-up (slice 441's own resume point):
-	// restore CREATE/DROP STATISTICS (extended-statistics) objects from the
-	// WAL. Runs after loadUserTablesFromHeap (above) so a restored object's
-	// recorded TableOID lines up with the table it was defined on, though the
-	// catalog stores the OID verbatim rather than re-resolving it.
-	if err := replayStatisticsDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+	// B5 Bstat: restore extended-statistics objects from the pg_statistic_ext
+	// HEAP rows (base/<dbOid>/3381) written by syncStatisticExtRow, replacing
+	// the retired goopg-private RecordKindCreateStatistics(95)/DropStatistics(96)/
+	// AlterStatistics{Rename,Owner,SetSchema}(97/98/99) WAL scan
+	// (replayStatisticsDDLRecords). Runs as a STANDALONE UNCONDITIONAL pass (not
+	// inside loadUserTablesFromHeap, which the M0114 catalog cache bypasses)
+	// AFTER every table-load pass so each object's owning table is registered
+	// (stxkeys attnums decode back to column names via it). A real PG standby
+	// replays the heap inserts (no rmid-128).
+	if err := loadStatisticsExtFromHeap(mgr, cat, clog); err != nil {
 		_ = pool.Close()
 		_ = walWriter.Close()
 		_ = mgr.Close()
-		return nil, fmt.Errorf("goopg: statistics DDL replay: %w", err)
+		return nil, fmt.Errorf("goopg: pg_statistic_ext reload: %w", err)
 	}
 
 	// DU-002 restart-persistence follow-up (M0110-0001, DU-002 slice 429
@@ -2914,9 +2905,10 @@ func loadUserTablesFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, cl
 			Columns:        cols,
 			OID:            tr.OID,
 			SmallDimension: tr.RelName == "region" || tr.RelName == "nation",
-			// IsMatView from relkind alone; View/ViewDef/IsPopulated are
-			// restored afterward by replayMatViewRecords (the AST/populated
-			// flag have no heap representation — see RecordKindCreateMatView).
+			// IsMatView from relkind alone; View/ViewDef are restored afterward
+			// by loadViewsFromHeap re-parsing the pg_rewrite _RETURN rule's
+			// ev_action (B5 Slice C). matview IsPopulated defaults to populated on
+			// reload (a documented deferral).
 			IsMatView: tr.RelKind == "m",
 			// B1.3b: sequences (relkind 'S') register as virtual sequence
 			// relations; reloadSequencesFromHeap re-wires the SELECT-able
@@ -2924,8 +2916,8 @@ func loadUserTablesFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, cl
 			IsSequence: tr.RelKind == "S",
 			// A plain view (relkind='v') has no physical heap storage — mirror
 			// catalog.InMemory.CreateView's Virtual=true. View/ViewDef are
-			// restored afterward by replayViewRecords (the AST has no heap
-			// representation — see RecordKindCreateView).
+			// restored afterward by loadViewsFromHeap (B5 Slice C, from the
+			// pg_rewrite heap — the AST has no pg_class representation).
 			Virtual: tr.RelKind == "v" || tr.RelKind == "S",
 		}
 		if tr.RelFileNode != 0 && tr.RelFileNode != tr.OID {

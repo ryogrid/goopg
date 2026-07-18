@@ -81,18 +81,11 @@ const (
 //	ev_qual      pg_node_tree (BKI_FORCE_NOT_NULL)
 //	ev_action    pg_node_tree (BKI_FORCE_NOT_NULL)
 //
-// Matches pgRewriteAttrs in relcache_init.go column-for-column.
+// Matches pgRewriteAttrs in relcache_init.go column-for-column. Delegates to
+// executor.PGRewriteColumnsPG18 so the bootstrap seed and the B5 Slice C runtime
+// writer (writeViewRewriteRow) / reload (loadViewsFromHeap) cannot drift.
 func pgRewriteColDefs() []catalog.Column {
-	return []catalog.Column{
-		{Name: "oid", Type: catalog.Type{Name: "oid"}},
-		{Name: "rulename", Type: catalog.Type{Name: "name"}},
-		{Name: "ev_class", Type: catalog.Type{Name: "oid"}},
-		{Name: "ev_type", Type: catalog.Type{Name: "char"}},
-		{Name: "ev_enabled", Type: catalog.Type{Name: "char"}},
-		{Name: "is_instead", Type: catalog.Type{Name: "bool"}},
-		{Name: "ev_qual", Type: catalog.Type{Name: "pg_node_tree"}},
-		{Name: "ev_action", Type: catalog.Type{Name: "pg_node_tree"}},
-	}
+	return executor.PGRewriteColumnsPG18()
 }
 
 // pgRewriteEntry describes one Form_pg_rewrite row to seed into the

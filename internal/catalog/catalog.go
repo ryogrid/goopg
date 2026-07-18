@@ -3599,10 +3599,18 @@ func NewInMemory() *InMemory {
 		opClassSchemas:         make(map[string]string),
 		userAggregates:         make(map[string]*UserAggregate),
 		schemas: map[string]uint32{
+			// Real PG18 namespace OIDs (pg_namespace.dat / a stock initdb). These
+			// were previously wrong: pg_toast was 2200 (colliding with public) and
+			// information_schema was 99 (which is actually pg_toast's OID). The
+			// collision made SchemaNameForOID(2200) return "public" or "pg_toast"
+			// nondeterministically (Go map range order), silently reloading a
+			// public object into pg_toast. pg_toast=99 also matches initdb.go's
+			// pgNamespaceInitialEntries and the "pg_toast namespace (OID 99)"
+			// assumption baked into the TOAST virtual-row builders.
 			"pg_catalog":         11,
 			"public":             2200,
-			"information_schema": 99,
-			"pg_toast":           2200, // toast uses same OID as public in simplified model
+			"pg_toast":           99,
+			"information_schema": 13183, // stock PG18 initdb-assigned OID
 		},
 		schemaOwners:       make(map[string]uint32),
 		roles:              make(map[string]uint32),
@@ -12238,6 +12246,10 @@ func (c *InMemory) SchemaNameForOID(oid uint32) string {
 	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	// The schemas map holds distinct OIDs per namespace (NewInMemory uses the
+	// real PG18 values), so this reverse scan is unambiguous. (It was previously
+	// nondeterministic because pg_toast wrongly shared public's OID 2200 — fixed
+	// at the source in NewInMemory rather than worked around here.)
 	for name, o := range c.schemas {
 		if o == oid {
 			return name
@@ -22372,9 +22384,10 @@ func binaryOpSymbol(op parser.OpCode) string {
 // for pg_attrdef.adbin. Used by pg_get_expr to display column defaults in \d.
 // FormatExprForAttrdef deparses a column DEFAULT / CHECK / generated-column
 // expression to SQL text, the same rendering pg_attrdef's adbin display uses.
-// Exported for the column-defaults WAL persistence (RecordKindColumnDefaults):
-// syncTableToCatalogHeap serializes each DefaultExpr with it and startup
-// replay round-trips the text through parser.ParseExpr. root-0020 follow-up.
+// Exported for pg_attrdef heap persistence (B5 Slice B): syncTableToCatalogHeap
+// serializes each DefaultExpr with it into the pg_attrdef row's adbin, and
+// startup reload round-trips the text through parser.ParseExpr. root-0020
+// follow-up, converted from the retired RecordKindColumnDefaults(69) WAL record.
 func FormatExprForAttrdef(e parser.Expr) string { return formatExprForAttrdef(e) }
 
 func formatExprForAttrdef(e parser.Expr) string {

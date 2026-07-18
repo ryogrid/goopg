@@ -626,7 +626,43 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
     - Remaining B4 (boot-critical/large): **pg_database** (18/19, needs an RM_DBASE-style physical record +
       template file-copy streaming to a standby — like B4.1's RM_TBLSPC but bigger). After it, B4 is complete
       and B5 (retire RmgrGoopgCatalog=128) unblocks.
-- [ ] **B5** Retire `RmgrGoopgCatalog=128` (now unused) — header-side parity complete.
+- [ ] **B5** Retire `RmgrGoopgCatalog=128` — header-side parity complete. The full rmid-128 set is 11 kinds
+  in 4 groups (index 20/21/94, pg_attrdef 69, statistics 95-99, view/matview 102/103); retire each group then
+  delete the rmgr. Slice order A(index)→B(pg_attrdef)→Bstat(statistics)→C(view/matview)→delete-rmgr.
+  - [x] **Slice A** (index 20/21/94) — LANDED. CREATE/DROP/RENAME INDEX journal only real pg_class + pg_index
+    heap writes + btree pages (M0113's pg_index heap made 20/21 redundant; RENAME(94) fixed via
+    `resyncIndexClassHeapRow`). Standby-validated (TestE2E_FailoverGoopgToPG index DDL, no rmid-128 FATAL).
+  - [x] **Slice B** (pg_attrdef 69) — LANDED. Column DEFAULTs journal as real pg_attrdef HEAP rows
+    (base/<dbOid>/2604, one XLOG_HEAP_INSERT per defaulted column, adbin as SQL text) via `writeAttrdefRow` in
+    `syncTableToCatalogHeap`; reloaded by a STANDALONE UNCONDITIONAL `loadColumnDefaultsFromHeap` pass (not the
+    cache-bypassed loadUserTablesFromHeap, and keyed on NamespaceDBOid not cat.DBOID()). Retired kind 69 +
+    deleted column_defaults_recovery.go. Standby-validated + TestPort_SerialSequenceSurvivesRestart (was RED).
+  - [x] **Bstat** (statistics 95-99, pg_statistic_ext) — LANDED. CREATE/DROP/ALTER STATISTICS journal real
+    pg_statistic_ext HEAP rows (base/<dbOid>/3381, PG physical column order): stxkeys int2vector attnums,
+    stxstattarget int2, stxkind char[], stxexprs as a text[] literal of the deparsed exprs (node-tree track
+    separable). Reload `loadStatisticsExtFromHeap` decodes them (stxkeys→column names via the owning table,
+    stxkind→kind strings). Fixed a latent nondeterminism in `SchemaNameForOID` (pg_toast shares public's OID
+    2200 → random reverse pick) surfaced by the round-trip test. Standby-validated (E2E CREATE STATISTICS +
+    base/1→base/5 mirror). Retired kinds 95-99 + deleted statistics_ddl{,_recovery}.go.
+  - [x] **Slice C** (view/matview 102/103 → pg_rewrite) — LANDED (narrow removal). CREATE VIEW / MATERIALIZED
+    VIEW journal a real pg_rewrite _RETURN rule HEAP row (base/<dbOid>/2618, ev_action = the query as SQL text,
+    relhasrules stays false) via `writeViewRewriteRow` in syncTableToCatalogHeap; reload `loadViewsFromHeap`
+    re-parses ev_action (ev_class >= FirstUserOID skips the 6 bootstrap replication-view rules). Retired kinds
+    102/103 + deleted view/matview_ddl_recovery.go. Standby-validated (E2E CREATE VIEW + pg_rewrite assertion).
+    DEFERRED (ledger): (a) full canonical node-tree ev_action + relhasrules=true so a standby can QUERY the view
+    (needs the absent node-tree serializer); (b) matview IsPopulated across restart (reload defaults populated);
+    (c) ALTER VIEW/TABLE RENAME across restart (pre-existing — AlterTableRenameTable never re-syncs pg_class).
+  - [x] **delete-rmgr** (cleanup) — DONE as documentation, not deletion. Investigation confirmed every Encode
+    function whose RecordKind falls through recordKindToRmgrInfo's default arm (legacy native heap/btree/xact
+    paths, subxact markers, smgr-truncate) has ZERO live emit sites, and checkpoints/sequences emit under their
+    real PG rmgrs — so **no goopg-emitted record maps to rmid-128 anymore**. RmgrGoopgCatalog is retained (not
+    deleted) as the classifier's total-function fallback + a recovery no-op for legacy pre-B5 WAL; removing it
+    would make recordKindToRmgrInfo partial and drop backward-compatible WAL reading. Documented in
+    xlog_record.go / rmgr_map.go / recovery.go dispatch.
+
+**B5 COMPLETE** — all four rmid-128 catalog groups retired; a real PG18 standby replays goopg's catalog-DDL WAL
+(guarded by TestE2E_FailoverGoopgToPG across CREATE INDEX / DEFAULT / STATISTICS / VIEW). The only remaining
+rmid-128 usages are the vestigial classifier fallback + legacy-WAL no-op (no live emitter).
 - [ ] **B-gate**: per-catalog full regress + `internal/testport` isolation; `psql \d`/`\df`/`\dn` +
   `information_schema` parity vs PG 18.3; crash-after-DDL recovery via generic reload; re-init data dir.
 

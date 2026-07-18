@@ -198,6 +198,350 @@ func reloadUserSchemasFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog
 	return nil
 }
 
+// loadColumnDefaultsFromHeap is B5 Slice B's pg_attrdef reload — the generic
+// heap-scan replacement for the retired replayColumnDefaultsRecords WAL scan
+// (RecordKindColumnDefaults 69). Column DEFAULT expressions now journal as
+// real pg_attrdef HEAP rows (base/<dbOid>/2604, one per defaulted column,
+// adbin = the expression as SQL text) written by syncTableToCatalogHeap; this
+// pass re-parses them onto the reloaded columns. Must run AFTER every
+// loadUserTablesFromHeap pass (main DB + each user DB) so the owning table is
+// already registered.
+//
+// pg_attrdef rows live in each database's OWN heap (the write routes via
+// tableCatalogHeapDBOid = NamespaceDBOid(currentDB)); the main postgres DB's
+// rows land in base/DefaultDBOid/2604. Scan that heap plus each registered
+// user database's heap. Lookups are dbOid-agnostic (LookupTableByOIDAllDBs),
+// matching the old WAL replay, so a row is applied to whichever namespace its
+// table reloaded into.
+func loadColumnDefaultsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+	if cat == nil {
+		return nil
+	}
+	// Main DB catalog rows are written under the DefaultDBOid namespace heap.
+	if err := loadColumnDefaultsFromHeapForDB(mgr, cat, clog, catalog.DefaultDBOid); err != nil {
+		return err
+	}
+	for _, dbName := range cat.ListDatabases() {
+		dbOid := cat.DatabaseOid(dbName)
+		if dbOid == 0 || dbOid == catalog.DefaultDBOid ||
+			dbOid == catalog.PostgresDBOid || dbOid == cat.DBOID() {
+			continue
+		}
+		if err := loadColumnDefaultsFromHeapForDB(mgr, cat, clog, dbOid); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// loadColumnDefaultsFromHeapForDB scans base/<heapDBOid>/2604 and re-parses each
+// live pg_attrdef row's adbin onto the owning table's column (matched by
+// adrelid → table OID, adnum → 1-based ordinal). A missing/empty heap is a
+// no-op. A deparse/reparse gap for one column degrades to the pre-record state
+// (NULL default) rather than failing startup, matching the old replay.
+func loadColumnDefaultsFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog, heapDBOid uint32) error {
+	type adRow struct {
+		adrelid uint32
+		adnum   int16
+		adbin   string
+	}
+	rel := storage.RelFileNode{DBOid: heapDBOid, RelOid: 2604, Fork: storage.MainFork}
+	cols := executor.PGAttrdefColumnsPG18()
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_attrdef",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			decoded := make(executor.Row, len(cols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, cols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			return adRow{
+				adrelid: uint32(decoded[1].Int),
+				adnum:   int16(decoded[2].Int),
+				adbin:   decoded[3].StringValue(),
+			}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+	for _, r := range rows {
+		ad := r.(adRow)
+		if ad.adrelid == 0 || ad.adnum < 1 || ad.adbin == "" {
+			continue
+		}
+		tbl, _, ok := cat.LookupTableByOIDAllDBs(ad.adrelid)
+		if !ok || tbl == nil {
+			continue // table dropped since the row was written
+		}
+		expr, perr := parser.ParseExpr(ad.adbin)
+		if perr != nil {
+			continue
+		}
+		for i := range tbl.Columns {
+			if tbl.Columns[i].Ordinal+1 == int(ad.adnum) {
+				tbl.Columns[i].DefaultExpr = expr
+				break
+			}
+		}
+	}
+	return nil
+}
+
+// statExtRegistryRecovery is the catalog-side surface the pg_statistic_ext
+// reload needs. *catalog.InMemory satisfies it.
+type statExtRegistryRecovery interface {
+	RegisterStatisticsDuringRecovery(schema, name string, oid, tableOID, ownerOID uint32, kinds, columns, exprs []string, hasExpr bool)
+	SetStatisticsTarget(name string, target *int) bool
+	LookupTableByOIDAllDBs(oid uint32) (*catalog.Table, uint32, bool)
+	SchemaNameForOID(oid uint32) string
+}
+
+// statCharToKind is the reload inverse of executor.statKindToChar: PG's
+// stxkind chars → goopg's kind strings. 'e' (expressions) is handled via the
+// stxexprs column, not as a goopg kind.
+var statCharToKind = map[byte]string{
+	'd': "ndistinct",
+	'f': "dependencies",
+	'm': "mcv",
+}
+
+// loadStatisticsExtFromHeap is B5 Bstat's pg_statistic_ext reload — the generic
+// heap-scan replacement for the retired replayStatisticsDDLRecords WAL scan
+// (RecordKindCreateStatistics 95 / DropStatistics 96 / AlterStatistics 97-99).
+// Extended-statistics objects now journal as real pg_statistic_ext HEAP rows
+// (base/<dbOid>/3381) written by syncStatisticExtRow; this pass re-registers
+// them into the statisticsObjs registry (the query path). Must run AFTER every
+// loadUserTablesFromHeap pass so each object's owning table (stxrelid) is
+// registered — stxkeys attnums decode back to column names via it.
+func loadStatisticsExtFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+	if cat == nil {
+		return nil
+	}
+	if err := loadStatisticsExtFromHeapForDB(mgr, cat, clog, catalog.DefaultDBOid); err != nil {
+		return err
+	}
+	for _, dbName := range cat.ListDatabases() {
+		dbOid := cat.DatabaseOid(dbName)
+		if dbOid == 0 || dbOid == catalog.DefaultDBOid ||
+			dbOid == catalog.PostgresDBOid || dbOid == cat.DBOID() {
+			continue
+		}
+		if err := loadStatisticsExtFromHeapForDB(mgr, cat, clog, dbOid); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// loadStatisticsExtFromHeapForDB scans base/<heapDBOid>/3381 and re-registers
+// each live pg_statistic_ext row. A missing/empty heap is a no-op.
+func loadStatisticsExtFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog, heapDBOid uint32) error {
+	var reg statExtRegistryRecovery = cat
+	type stxRow struct {
+		oid, relid, nsOID, owner uint32
+		name                     string
+		attnums                  []int16
+		target                   *int
+		kindChars                []byte
+		exprs                    []string
+	}
+	rel := storage.RelFileNode{DBOid: heapDBOid, RelOid: 3381, Fork: storage.MainFork}
+	cols := executor.PGStatisticExtColumnsPG18()
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_statistic_ext",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			decoded := make(executor.Row, len(cols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, cols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			r := stxRow{
+				oid:   uint32(decoded[0].Int),
+				relid: uint32(decoded[1].Int),
+				name:  decoded[2].StringValue(),
+				nsOID: uint32(decoded[3].Int),
+				owner: uint32(decoded[4].Int),
+			}
+			r.attnums = parsePGVectorInt16Payload([]byte(decoded[5].StringValue()))
+			if !decoded[6].IsNull() {
+				v := int(int16(decoded[6].Int))
+				if v >= 0 {
+					r.target = &v
+				}
+			}
+			r.kindChars = parsePGCharArrayPayload([]byte(decoded[7].StringValue()))
+			if lit := decoded[8].StringValue(); lit != "" {
+				r.exprs = executor.ParseTextArrayLiteral(lit)
+			}
+			return r, false, nil
+		})
+	if err != nil {
+		return err
+	}
+	for _, raw := range rows {
+		r := raw.(stxRow)
+		if r.oid == 0 || r.name == "" {
+			continue
+		}
+		schema := reg.SchemaNameForOID(r.nsOID)
+		if schema == "" {
+			schema = "public"
+		}
+		// stxkeys attnums → simple-column names, via the owning table.
+		var columns []string
+		if tbl, _, ok := reg.LookupTableByOIDAllDBs(r.relid); ok && tbl != nil {
+			for _, an := range r.attnums {
+				for i := range tbl.Columns {
+					if tbl.Columns[i].Ordinal+1 == int(an) {
+						columns = append(columns, tbl.Columns[i].Name)
+						break
+					}
+				}
+			}
+		}
+		// stxkind chars → goopg kind strings ('e' is not a goopg kind).
+		var kinds []string
+		for _, ch := range r.kindChars {
+			if k, ok := statCharToKind[ch]; ok {
+				kinds = append(kinds, k)
+			}
+		}
+		hasExpr := len(r.exprs) > 0
+		reg.RegisterStatisticsDuringRecovery(schema, r.name, r.oid, r.relid, r.owner, kinds, columns, r.exprs, hasExpr)
+		if r.target != nil {
+			qName := schema + "." + r.name
+			reg.SetStatisticsTarget(qName, r.target)
+		}
+	}
+	return nil
+}
+
+// parsePGVectorInt16Payload decodes the ArrayType body (post-varlena-header, as
+// returned by the tuple decoder's varlena default arm) of an int2vector written
+// by executor.pgInt2VectorBytes back to its int16 elements. Body layout:
+// ndim(4) dataoffset(4) elemtype(4) dim(4) lbound(4) elem(2)... ; ndim==0 (the
+// empty ArrayType) yields no elements.
+func parsePGVectorInt16Payload(b []byte) []int16 {
+	if len(b) < 12 || binary.LittleEndian.Uint32(b[0:4]) == 0 || len(b) < 20 {
+		return nil
+	}
+	count := int(binary.LittleEndian.Uint32(b[12:16]))
+	out := make([]int16, 0, count)
+	for i, off := 0, 20; i < count && off+2 <= len(b); i, off = i+1, off+2 {
+		out = append(out, int16(binary.LittleEndian.Uint16(b[off:off+2])))
+	}
+	return out
+}
+
+// parsePGCharArrayPayload decodes the ArrayType body of a char[] written by
+// executor.pgCharArrayBytes back to its 1-byte elements. Same header as
+// parsePGVectorInt16Payload but 1-byte contiguous elements.
+func parsePGCharArrayPayload(b []byte) []byte {
+	if len(b) < 12 || binary.LittleEndian.Uint32(b[0:4]) == 0 || len(b) < 20 {
+		return nil
+	}
+	count := int(binary.LittleEndian.Uint32(b[12:16]))
+	if 20+count > len(b) {
+		count = len(b) - 20
+	}
+	if count <= 0 {
+		return nil
+	}
+	return append([]byte(nil), b[20:20+count]...)
+}
+
+// loadViewsFromHeap is B5 Slice C's pg_rewrite reload — the generic heap-scan
+// replacement for the retired replayMatViewRecords / replayViewRecords WAL scans
+// (RecordKindCreateMatView 102 / RecordKindCreateView 103). A user view /
+// materialized view's defining SELECT now journals as a real pg_rewrite _RETURN
+// rule heap row (base/<dbOid>/2618, ev_action = the query as SQL text) written by
+// writeViewRewriteRow; this pass re-parses ev_action to rebuild the view AST.
+// Must run AFTER every loadUserTablesFromHeap pass (the owning relation, keyed by
+// ev_class, must already be registered with its relkind).
+//
+// Only user rules (ev_class >= FirstUserOID) are processed: the six bootstrap
+// replication-view _RETURN rules (ev_class 12100..12106) carry canonical
+// nodeToString ev_action blobs that are NOT re-parsable SQL and whose views are
+// nailed relcache entries, so they are skipped by the OID filter.
+//
+// matview IsPopulated is a documented deferral (deferral ledger): the retired
+// WAL record carried it, but Slice C stores only the query in pg_rewrite, so a
+// reloaded matview defaults to populated (correct for the common CREATE
+// MATERIALIZED VIEW case; a WITH NO DATA matview loses its unpopulated state
+// across a restart).
+func loadViewsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+	if cat == nil {
+		return nil
+	}
+	if err := loadViewsFromHeapForDB(mgr, cat, clog, catalog.DefaultDBOid); err != nil {
+		return err
+	}
+	for _, dbName := range cat.ListDatabases() {
+		dbOid := cat.DatabaseOid(dbName)
+		if dbOid == 0 || dbOid == catalog.DefaultDBOid ||
+			dbOid == catalog.PostgresDBOid || dbOid == cat.DBOID() {
+			continue
+		}
+		if err := loadViewsFromHeapForDB(mgr, cat, clog, dbOid); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// loadViewsFromHeapForDB scans base/<heapDBOid>/2618 and rebuilds the view AST
+// for each user _RETURN rule. A missing/empty heap is a no-op; a query that no
+// longer re-parses degrades that one view to its pre-record state (a plain
+// relkind-tagged relation with View=nil), never failing startup.
+func loadViewsFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog, heapDBOid uint32) error {
+	type rewriteRow struct {
+		rulename string
+		evClass  uint32
+		evAction string
+	}
+	rel := storage.RelFileNode{DBOid: heapDBOid, RelOid: 2618, Fork: storage.MainFork}
+	cols := executor.PGRewriteColumnsPG18()
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_rewrite",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			decoded := make(executor.Row, len(cols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, cols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			return rewriteRow{
+				rulename: decoded[1].StringValue(),
+				evClass:  uint32(decoded[2].Int),
+				evAction: decoded[7].StringValue(),
+			}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+	for _, raw := range rows {
+		r := raw.(rewriteRow)
+		if r.rulename != "_RETURN" || r.evClass < catalog.FirstUserOID || r.evAction == "" {
+			continue // bootstrap replication-view rules / non-SELECT rules
+		}
+		tbl, _, ok := cat.LookupTableByOIDAllDBs(r.evClass)
+		if !ok || tbl == nil {
+			continue // view dropped since the row was written
+		}
+		stmts, perr := parser.Parse(r.evAction)
+		if perr != nil || len(stmts) != 1 {
+			continue
+		}
+		sel, ok := stmts[0].(*parser.SelectStmt)
+		if !ok {
+			continue
+		}
+		tbl.View = sel
+		tbl.ViewDef = r.evAction
+		if tbl.IsMatView {
+			// Query stored; populated state is a deferral (see the doc comment).
+			tbl.IsPopulated = true
+		}
+	}
+	return nil
+}
+
 // reloadUserTablespacesFromHeap is B4.1e's pg_tablespace reload — the generic
 // heap-scan replacement for the retired replayTablespaceDDLRecords scanner
 // (RecordKinds 124/125). pg_tablespace is a SHARED catalog (global/1213), so
