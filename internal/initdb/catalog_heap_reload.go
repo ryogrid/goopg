@@ -236,6 +236,50 @@ func reloadUserTablespacesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, 
 	return nil
 }
 
+// reloadDatabasesFromHeap is B4.6 Stage 3's pg_database reload — the generic
+// heap-scan replacement for the retired replayDatabaseDDLRecords (RecordKinds
+// 18/19). pg_database is SHARED (global/1262). It re-registers every runtime
+// (user-created) database with its persisted OID + owner (datdba) via
+// RegisterDatabaseDuringRecovery; the three bootstrap databases (postgres,
+// template1, template0; OIDs < FirstUserOID) are hardcoded in the registry at
+// construction and are skipped here. Reading through the buffer pool (Stage 1's
+// XLOG_HEAP_INSERT on 1262 is redo'd before this runs) makes the post-crash
+// reload see the row regardless of file-flush timing — the same crash-consistent
+// path B4.1-B4.5 use. Dropped databases carry xmax and are skipped by the
+// liveness filter.
+func reloadDatabasesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+	if cat == nil {
+		return nil
+	}
+	type dbRow struct {
+		oid   uint32
+		name  string
+		owner uint32
+	}
+	rel := storage.RelFileNode{DBOid: 0, RelOid: catalog.PgDatabaseRelationOID, Fork: storage.MainFork}
+	cols := catalog.PgDatabaseColumnsPG18()
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_database",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			d := make(executor.Row, len(cols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(d, cols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			return dbRow{oid: uint32(d[0].Int), name: d[1].StringValue(), owner: uint32(d[2].Int)}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+	for _, r := range rows {
+		db := r.(dbRow)
+		if db.oid < catalog.FirstUserOID || db.name == "" {
+			continue // bootstrap databases are registered at construction
+		}
+		cat.RegisterDatabaseDuringRecovery(db.name, db.owner, db.oid)
+	}
+	return nil
+}
+
 // reloadRolesFromAuthidHeap is B4.5's pg_authid reload — the generic heap-scan
 // replacement for the retired LoadRolesFromAuthidHeap (raw os.ReadFile) +
 // replayRoleDDLRecords (WAL-tail scanner, RecordKinds 67/68/72). pg_authid is

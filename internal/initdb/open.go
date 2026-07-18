@@ -1385,18 +1385,19 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		}
 	}
 
-	// M0054-0001: replay CREATE/DROP DATABASE WAL records into the
-	// catalog's database registry. Physical WAL replay (line ~212
-	// above) ignored these records because they don't touch on-disk
-	// storage in v0; the recovery driver applies them here, after the
-	// catalog is fully constructed, so the next connection sees an
-	// accurate `pg_database`. Order matters: a drop following a
-	// create cancels out, so we walk records in stream order.
-	if err := replayDatabaseDDLRecords(filepath.Join(abs, "pg_wal"), cat, abs); err != nil {
+	// B4.6 Stage 3 (was M0054-0001): reload the database registry from the
+	// pg_database heap (global/1262). CREATE/DROP DATABASE now journal a real
+	// pg_database heap row (Stage 1) + an RM_DBASE XLOG_DBASE_CREATE_WAL_LOG /
+	// DROP record for the physical directory (redo'd by physical replay above),
+	// so a generic heap scan through the buffer pool — the same crash-consistent
+	// path B4.1-B4.5 use — replaces the retired goopg-private
+	// replayDatabaseDDLRecords (RecordKinds 18/19). Must run before
+	// loadUserTablesFromHeap (the source of the per-DB dbOid list).
+	if err := reloadDatabasesFromHeap(mgr, cat, clog); err != nil {
 		_ = pool.Close()
 		_ = walWriter.Close()
 		_ = mgr.Close()
-		return nil, fmt.Errorf("goopg: database DDL replay: %w", err)
+		return nil, fmt.Errorf("goopg: pg_database reload: %w", err)
 	}
 
 	// M0122-0007 4e follow-up 39: load each distinct-dbOid database's user

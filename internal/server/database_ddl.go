@@ -1459,13 +1459,25 @@ func (s *Server) tryHandleDatabaseDDL(sql string, liveDBName string, actingRole 
 			s.cfg.Logger.Warn("pg_database heap row sync failed", "database", name, "err", err)
 		}
 		if s.cfg.WAL != nil {
-			if _, _, werr := s.cfg.WAL.Append(wal.EncodeCreateDatabase(name, owner, oid)); werr != nil {
-				// Roll back the catalog change (and any copied template
-				// tables) so memory and disk agree.
-				s.rollbackTemplateCopy(oid)
-				_ = cat.DropDatabase(name)
-				s.removeDatabasePhysicalDirectory(oid)
-				return true, "", werr
+			// B4.6 Stage 3: journal a real RM_DBASE XLOG_DBASE_CREATE_WAL_LOG
+			// record (creates base/<oid> on a standby) instead of the retired
+			// goopg-private RecordKindCreateDatabase(18). The database's registry
+			// identity now rides the pg_database heap row (synced just above);
+			// this record carries only the physical directory creation, and its
+			// redo is idempotent. tablespace_id is pg_default (1663) — goopg
+			// databases all live in base/. (Stage 3b will follow it with the
+			// copied relation blocks as full-page-image records.)
+			rec, encErr := wal.EncodeDbaseCreateWalLogPG(oid, catalog.DefaultTablespaceOID, 0)
+			if encErr == nil {
+				_, _, werr := s.cfg.WAL.Append(rec)
+				if werr != nil {
+					// Roll back the catalog change (and any copied template
+					// tables) so memory and disk agree.
+					s.rollbackTemplateCopy(oid)
+					_ = cat.DropDatabase(name)
+					s.removeDatabasePhysicalDirectory(oid)
+					return true, "", werr
+				}
 			}
 		}
 		return true, "", nil
@@ -1561,19 +1573,24 @@ func (s *Server) tryHandleDatabaseDDL(sql string, liveDBName string, actingRole 
 			return true, "", err
 		}
 		if s.cfg.WAL != nil {
-			if _, _, werr := s.cfg.WAL.Append(wal.EncodeDropDatabase(name)); werr != nil {
-				// Re-create the catalog entry (with its original owner) so
-				// the abort is consistent. A fresh oid gets allocated here
-				// rather than restoring the dropped one — acceptable for
-				// this exceedingly rare double-failure edge case (the
-				// DROP's own WAL append failing) since no DropDatabase
-				// record was ever durably written either. The re-created
-				// entry gets a fresh oid (droppedOid's directory is left
-				// as a harmless orphan, matching createDatabasePhysicalDirectory's
-				// own rollback tolerance) — removeDatabasePhysicalDirectory
-				// is only reached below, past this early return.
-				_, _ = cat.CreateDatabase(name, droppedOwner)
-				return true, "", werr
+			// B4.6 Stage 3: journal a real RM_DBASE XLOG_DBASE_DROP record
+			// (removes base/<oid> on a standby) instead of the retired goopg-
+			// private RecordKindDropDatabase(19). goopg databases live in the
+			// default tablespace, so the record carries [1663]. The pg_database
+			// heap row is stamped deleted just below.
+			rec, encErr := wal.EncodeDbaseDropPG(droppedOid, []uint32{catalog.DefaultTablespaceOID}, 0)
+			if encErr == nil {
+				if _, _, werr := s.cfg.WAL.Append(rec); werr != nil {
+					// Re-create the catalog entry (with its original owner) so
+					// the abort is consistent. A fresh oid gets allocated here
+					// rather than restoring the dropped one — acceptable for
+					// this exceedingly rare double-failure edge case (the
+					// DROP's own WAL append failing) since no drop record was
+					// ever durably written either. removeDatabasePhysicalDirectory
+					// is only reached below, past this early return.
+					_, _ = cat.CreateDatabase(name, droppedOwner)
+					return true, "", werr
+				}
 			}
 		}
 		// B4.6 Stage 1: stamp the pg_database SHARED heap row (global/1262)

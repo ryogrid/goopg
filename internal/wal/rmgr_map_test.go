@@ -33,7 +33,7 @@ func TestEmittedRecordKindsClassifyPGCompatible(t *testing.T) {
 		{"ClogTruncate", RecordKindClogTruncate, RmgrCLOG, xlogClogTruncate},
 		{"PageImage", RecordKindPageImage, RmgrXLog, xlogXLogFPI},
 		// A goopg-private catalog/DDL record → custom rmgr, body-keyed.
-		{"CreateDatabase(private)", RecordKindCreateDatabase, RmgrGoopgCatalog, 0},
+		{"CreateIndex(private)", RecordKindCreateIndex, RmgrGoopgCatalog, 0},
 	}
 
 	for _, tc := range cases {

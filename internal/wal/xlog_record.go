@@ -54,8 +54,8 @@ const (
 	RmgrXact    Rmgr = 1 // RM_XACT_ID — commit / abort
 	RmgrStorage Rmgr = 2 // RM_SMGR_ID — relation create / truncate
 	RmgrCLOG    Rmgr = 3 // RM_CLOG_ID — clog (pg_xact) truncation
-	// 4 reserved (Database).
-	RmgrTblspc Rmgr = 5 // RM_TBLSPC_ID  — tablespace create / drop (B4.1d)
+	RmgrDbase   Rmgr = 4 // RM_DBASE_ID — CREATE / DROP DATABASE (B4.6 Stage 3)
+	RmgrTblspc  Rmgr = 5 // RM_TBLSPC_ID  — tablespace create / drop (B4.1d)
 	// 6 reserved (MultiXact).
 	RmgrRelMap  Rmgr = 7  // RM_RELMAP_ID — pg_filenode.map updates (B0.4)
 	RmgrStandby Rmgr = 8  // RM_STANDBY_ID — RUNNING_XACTS snapshot markers
