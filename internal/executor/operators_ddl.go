@@ -340,16 +340,33 @@ func (o *ddlOp) execCreateTablespace(s *parser.CreateTablespaceStmt) error {
 			return &ExecError{Code: "58P01", Pos: s.Pos(), Message: fmt.Sprintf("could not create directory %q: %v", versionDir, mkErr)}
 		}
 	}
-	// M0122-0007 tablespace-registry restart-durability follow-up: persist
-	// the tablespace so it survives a restart. goopg's tablespace registry
-	// has no backing heap relation, so record a WAL event the recovery
-	// driver (internal/initdb/tablespace_ddl_recovery.go) replays into the
-	// registry on the next startup (mirrors CREATE SCHEMA, M0110-0003). The
-	// OID just assigned by CreateTablespace is carried so recovery restores
-	// the same OID.
+	// B4.1: faithful CREATE TABLESPACE journaling (standby-complete), replacing
+	// the retired RecordKindCreateTablespace(124). PostgreSQL's CreateTableSpace
+	// (commands/tablespace.c) emits three things, which we mirror in order:
+	//   1. a pg_tablespace heap row (spcowner = resolved owner OID),
+	//   2. a pg_shdepend SHARED_DEPENDENCY_OWNER row (recordDependencyOnOwner),
+	//   3. an RM_TBLSPC XLOG_TBLSPC_CREATE for the pg_tblspc/<oid> directory.
+	// A restart reloads the registry from the pg_tablespace heap
+	// (reloadUserTablespacesFromHeap), so no bespoke DDL-record scan remains.
+	ownerOID := o.currentDDLOwnerOID()
+	if s.Owner != "" {
+		if roleOID, found := o.ctx.Catalog.RoleOID(s.Owner); found {
+			ownerOID = roleOID
+		}
+	}
+	if err := writeTablespaceCatalogRow(o.ctx, oid, s.Name, ownerOID); err != nil {
+		return fmt.Errorf("pg_tablespace heap write: %w", err)
+	}
+	if err := writeShdependOwnerRow(o.ctx, pgTablespaceClassID, oid, ownerOID); err != nil {
+		return fmt.Errorf("pg_shdepend write: %w", err)
+	}
 	if o.ctx.WAL != nil {
-		if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateTablespace(s.Name, s.Owner, location, oid)); werr != nil {
-			return fmt.Errorf("wal create-tablespace: %w", werr)
+		rec, encErr := wal.EncodeTblspcCreatePG(oid, location, o.ctx.Tx.XID)
+		if encErr != nil {
+			return fmt.Errorf("encode tblspc-create: %w", encErr)
+		}
+		if _, _, werr := o.ctx.WAL.Append(rec); werr != nil {
+			return fmt.Errorf("wal tblspc-create: %w", werr)
 		}
 	}
 	return nil
@@ -389,13 +406,20 @@ func (o *ddlOp) execDropTablespace(s *parser.DropTablespaceStmt) error {
 		}
 		return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("tablespace %q does not exist", s.Name)}
 	}
-	// M0122-0007 tablespace-registry restart-durability follow-up: persist
-	// the drop so it survives a restart (mirrors DROP SCHEMA). Without
-	// this, a tablespace dropped at runtime would be re-registered by
-	// replaying its CREATE TABLESPACE record on the next startup.
+	// B4.1: faithful DROP TABLESPACE journaling, replacing the retired
+	// RecordKindDropTablespace(125). Mirror DropTableSpace (tablespace.c):
+	// xmax-stamp the pg_tablespace row, drop its pg_shdepend owner dep, then
+	// emit RM_TBLSPC XLOG_TBLSPC_DROP for the directory removal. A restart's
+	// pg_tablespace heap reload skips the now-dead row, so the drop persists.
+	deleteTablespaceCatalogRow(o.ctx, oid)
+	deleteShdependRowsForObject(o.ctx, pgTablespaceClassID, oid)
 	if o.ctx.WAL != nil {
-		if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropTablespace(s.Name)); werr != nil {
-			return fmt.Errorf("wal drop-tablespace: %w", werr)
+		rec, encErr := wal.EncodeTblspcDropPG(oid, o.ctx.Tx.XID)
+		if encErr != nil {
+			return fmt.Errorf("encode tblspc-drop: %w", encErr)
+		}
+		if _, _, werr := o.ctx.WAL.Append(rec); werr != nil {
+			return fmt.Errorf("wal tblspc-drop: %w", werr)
 		}
 	}
 	if o.ctx.DataDir != "" {

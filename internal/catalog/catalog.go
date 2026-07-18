@@ -14933,9 +14933,10 @@ func (c *InMemory) DropTablespace(name string) (uint32, bool) {
 }
 
 // RegisterTablespaceDuringRecovery re-registers a tablespace with its
-// original OID/owner/location, replayed from a RecordKindCreateTablespace WAL
-// record (M0122-0007 tablespace-registry restart-durability follow-up).
-// Mirrors RegisterSchemaDuringRecovery.
+// original OID (owner/location are unused strings — the pg_tablespace virtual
+// view hardcodes spcowner=10). Called by B4.1e's reloadUserTablespacesFromHeap
+// from the pg_tablespace SHARED heap (global/1213). Mirrors
+// RegisterSchemaDuringRecovery.
 func (c *InMemory) RegisterTablespaceDuringRecovery(name, owner, location string, oid uint32) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -14951,9 +14952,10 @@ func (c *InMemory) RegisterTablespaceDuringRecovery(name, owner, location string
 	}
 }
 
-// UnregisterTablespaceDuringRecovery removes a tablespace from the registry,
-// replayed from a RecordKindDropTablespace WAL record. Counterpart to
-// RegisterTablespaceDuringRecovery; mirrors UnregisterSchemaDuringRecovery.
+// UnregisterTablespaceDuringRecovery removes a tablespace from the registry.
+// Counterpart to RegisterTablespaceDuringRecovery; retained for symmetry (the
+// B4.1e heap reload skips xmax-stamped rows, so DROP needs no explicit
+// unregister). Mirrors UnregisterSchemaDuringRecovery.
 func (c *InMemory) UnregisterTablespaceDuringRecovery(name string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

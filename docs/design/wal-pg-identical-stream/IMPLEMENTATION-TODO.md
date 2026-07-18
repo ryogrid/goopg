@@ -569,6 +569,17 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
     the B2.2a regtype-builtin-name gap); waldump workload += CREATE/DROP TRANSFORM.
 - [ ] **B4** shared catalogs in `global/` (pg_database, pg_authid/auth_members, pg_tablespace,
   pg_foreign_*/user_mapping) + retire the postgres-DB mirror shim.
+  - [x] **B4.1 pg_tablespace FULLY FAITHFUL (kinds 124/125 retired)** — LANDED. First B4 shared-catalog
+    slice, so it also builds the reusable shared-catalog WAL/btree infra. Five sub-slices:
+    (a) shared RelFileLocator fidelity — DBOid==0 → spcOid=1664/dbOid=0 in the block-ref + SMGR encoders,
+    both decoders accept 1664 (routes to `global/`); (b) `insertCanonicalSysBtreeLeafInDB(explicit dbOid)`
+    for shared indexes; (c) pg_shdepend(1214) heap-only owner-dep writer (`writeShdependOwnerRow`, no index
+    = seq-scan faithful, write-only); (d) NEW `RmgrTblspc=5` — `XLOG_TBLSPC_CREATE`/`DROP` emit+decode+replay
+    (dir MkdirAll/RemoveAll); (e) `sys_pg_tablespace.go` heap writer (real owner OID, indexes 2697/2698) +
+    `execCreate/DropTablespace` emit-swap (heap→shdepend→RM_TBLSPC) + `reloadUserTablespacesFromHeap` +
+    deleted `tablespace_ddl_recovery.go`. Gates: WAL round-trips, `TablespaceSurvivesRestart`,
+    `WALPgWaldumpCompat` (pg_waldump parses all three record types). Residual (goopg-view only, ledgered):
+    `tablespaceVirtualRows` still hardcodes spcowner=10 — the streamed heap carries the real owner.
 - [ ] **B5** Retire `RmgrGoopgCatalog=128` (now unused) — header-side parity complete.
 - [ ] **B-gate**: per-catalog full regress + `internal/testport` isolation; `psql \d`/`\df`/`\dn` +
   `information_schema` parity vs PG 18.3; crash-after-DDL recovery via generic reload; re-init data dir.

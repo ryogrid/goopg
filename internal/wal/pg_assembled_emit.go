@@ -563,7 +563,14 @@ func EncodePageImagePG(rel storage.RelFileNode, blk storage.BlockNumber, page st
 // decodes the body and calls applySmgrCreate — identical to native replaySmgrCreate.
 func EncodeSmgrCreatePG(rel storage.RelFileNode, xid storage.TransactionID) ([]byte, error) {
 	spc := rel.TblOid
-	if spc == 0 {
+	switch {
+	case rel.DBOid == 0:
+		// Shared catalog in global/ — spcOid=1664/dbOid=0 (B4.1a). Not
+		// exercised today (every shared catalog's files pre-exist from
+		// initdb), but keeps DBOid==0 ⟺ spcOid=1664 coherent with the
+		// block-ref encoder above.
+		spc = pgGlobalTableSpaceOID
+	case spc == 0:
 		spc = pgDefaultTableSpaceOID
 	}
 	mainData := make([]byte, 0, 16)
@@ -576,6 +583,38 @@ func EncodeSmgrCreatePG(rel storage.RelFileNode, xid storage.TransactionID) ([]b
 		return nil, err
 	}
 	return framePGAssembled(RmgrStorage, xlogSmgrCreate, uint32(xid), body), nil
+}
+
+// EncodeTblspcCreatePG builds a PostgreSQL RM_TBLSPC tablespace-create record
+// (XLOG_TBLSPC_CREATE) with an `xl_tblspc_create_rec` main-data body
+// (ts_id Oid + null-terminated ts_path) and no block ref, mirroring PG's
+// CreateTableSpace XLogInsert (commands/tablespace.c). location is the LOCATION
+// string (empty for an in-place tablespace); PG's tblspc_redo recreates the
+// pg_tblspc/<oid> directory/symlink from it. The record carries the creating
+// xid in the header so it routes to the decoded replay path (same contract as
+// EncodeSmgrCreatePG). B4.1d.
+func EncodeTblspcCreatePG(tsOID uint32, location string, xid storage.TransactionID) ([]byte, error) {
+	mainData := make([]byte, 0, 4+len(location)+1)
+	mainData = binary.LittleEndian.AppendUint32(mainData, tsOID)
+	mainData = append(mainData, []byte(location)...)
+	mainData = append(mainData, 0) // ts_path null terminator
+	body, err := assembleXLogRecord(mainData, nil)
+	if err != nil {
+		return nil, err
+	}
+	return framePGAssembled(RmgrTblspc, xlogTblspcCreate, uint32(xid), body), nil
+}
+
+// EncodeTblspcDropPG builds a PostgreSQL RM_TBLSPC tablespace-drop record
+// (XLOG_TBLSPC_DROP) with an `xl_tblspc_drop_rec` main-data body (ts_id Oid)
+// and no block ref, mirroring PG's DropTableSpace XLogInsert. B4.1d.
+func EncodeTblspcDropPG(tsOID uint32, xid storage.TransactionID) ([]byte, error) {
+	mainData := binary.LittleEndian.AppendUint32(make([]byte, 0, 4), tsOID)
+	body, err := assembleXLogRecord(mainData, nil)
+	if err != nil {
+		return nil, err
+	}
+	return framePGAssembled(RmgrTblspc, xlogTblspcDrop, uint32(xid), body), nil
 }
 
 // clogXactsPerPage is PostgreSQL's CLOG_XACTS_PER_PAGE: 2 status bits per xact →

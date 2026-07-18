@@ -115,6 +115,10 @@ ALTER TYPE waldump_mood ADD VALUE 'c';
 CREATE TYPE waldump_rng AS RANGE (subtype = int4);
 ALTER TYPE waldump_rng RENAME TO waldump_rng2;
 DROP TYPE waldump_rng2;
+SET allow_in_place_tablespaces = on;
+CREATE TABLESPACE waldump_ts LOCATION '';
+CREATE TABLESPACE waldump_ts_gone LOCATION '';
+DROP TABLESPACE waldump_ts_gone;
 DROP SCHEMA waldump_s2;
 ` + buildInsertSQL(100) + `
 CHECKPOINT;

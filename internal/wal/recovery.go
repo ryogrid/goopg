@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"github.com/goopg/goopg/internal/access/btree"
@@ -435,22 +436,11 @@ const (
 	//   kind(1) | ownerOID(4) | nameLen(2) | name(nameLen bytes)
 	RecordKindAlterSubscriptionOwner byte = 55
 
-	// RecordKindCreateTablespace records a `CREATE TABLESPACE name [OWNER
-	// owner] LOCATION 'location'` event (M0122-0007 tablespace-registry
-	// restart-durability follow-up). goopg's tablespace registry
-	// (catalog.InMemory.tablespaces) is a pure in-memory map with no backing
-	// heap relation, so the physical redo path is a no-op; the recovery
-	// driver in internal/initdb/tablespace_ddl_recovery.go re-registers the
-	// tablespace (with its original OID) after physical replay. Mirrors
-	// RecordKindCreateSchema. Format:
-	//   kind(1) | oid(4) | nameLen(2)+name | ownerLen(2)+owner |
-	//   locationLen(2)+location.
-	RecordKindCreateTablespace byte = 124
-
-	// RecordKindDropTablespace records a `DROP TABLESPACE name` event.
-	// Counterpart to RecordKindCreateTablespace; same no-op physical redo
-	// path. Format: kind(1) | nameLen(2) | name(nameLen bytes).
-	RecordKindDropTablespace byte = 125
+	// Kinds 124/125 (CreateTablespace/DropTablespace) retired in B4.1e:
+	// CREATE/DROP TABLESPACE now journals a real pg_tablespace heap row
+	// (global/1213) + pg_shdepend owner dep + RM_TBLSPC XLOG_TBLSPC_CREATE/
+	// DROP, and a restart reloads the registry from that heap
+	// (reloadUserTablespacesFromHeap).
 
 	// RecordKindRoleState records the FULL state of one role (name +
 	// attribute flags + password verifier) so CREATE/ALTER ROLE survive a
@@ -1481,105 +1471,6 @@ func DecodeView(payload []byte) (ViewPayload, error) {
 	p.Query = string(payload[7 : 7+qLen])
 	return p, nil
 }
-
-// EncodeCreateTablespace encodes a CREATE TABLESPACE event (M0122-0007
-// tablespace-registry restart-durability follow-up). The OID is carried so
-// recovery re-registers the tablespace with the same identifier the live
-// server assigned.
-// Format: kind(1) | oid(4) | nameLen(2)+name | ownerLen(2)+owner |
-//
-//	locationLen(2)+location.
-func EncodeCreateTablespace(name, owner, location string, oid uint32) []byte {
-	if len(name) > 0xFFFF {
-		name = name[:0xFFFF]
-	}
-	if len(owner) > 0xFFFF {
-		owner = owner[:0xFFFF]
-	}
-	if len(location) > 0xFFFF {
-		location = location[:0xFFFF]
-	}
-	out := make([]byte, 11+len(name)+len(owner)+len(location))
-	out[0] = RecordKindCreateTablespace
-	binary.LittleEndian.PutUint32(out[1:5], oid)
-	off := 5
-	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(name)))
-	off += 2
-	copy(out[off:off+len(name)], name)
-	off += len(name)
-	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(owner)))
-	off += 2
-	copy(out[off:off+len(owner)], owner)
-	off += len(owner)
-	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(location)))
-	off += 2
-	copy(out[off:off+len(location)], location)
-	return out
-}
-
-// DecodeCreateTablespace decodes a RecordKindCreateTablespace payload.
-func DecodeCreateTablespace(payload []byte) (name, owner, location string, oid uint32, err error) {
-	if len(payload) < 7 {
-		return "", "", "", 0, fmt.Errorf("wal: create-tablespace payload too short (%d bytes)", len(payload))
-	}
-	if payload[0] != RecordKindCreateTablespace {
-		return "", "", "", 0, fmt.Errorf("wal: record kind %d is not create-tablespace", payload[0])
-	}
-	oid = binary.LittleEndian.Uint32(payload[1:5])
-	off := 5
-	readStr := func() (string, error) {
-		if len(payload) < off+2 {
-			return "", fmt.Errorf("wal: create-tablespace payload truncated at length prefix (offset %d)", off)
-		}
-		l := int(binary.LittleEndian.Uint16(payload[off : off+2]))
-		off += 2
-		if len(payload) < off+l {
-			return "", fmt.Errorf("wal: create-tablespace payload truncated (need %d bytes)", off+l)
-		}
-		s := string(payload[off : off+l])
-		off += l
-		return s, nil
-	}
-	if name, err = readStr(); err != nil {
-		return "", "", "", 0, err
-	}
-	if owner, err = readStr(); err != nil {
-		return "", "", "", 0, err
-	}
-	if location, err = readStr(); err != nil {
-		return "", "", "", 0, err
-	}
-	return name, owner, location, oid, nil
-}
-
-// EncodeDropTablespace encodes a DROP TABLESPACE event.
-// Format: kind(1) | nameLen(2) | name(nameLen bytes).
-func EncodeDropTablespace(name string) []byte {
-	if len(name) > 0xFFFF {
-		name = name[:0xFFFF]
-	}
-	out := make([]byte, 3+len(name))
-	out[0] = RecordKindDropTablespace
-	binary.LittleEndian.PutUint16(out[1:3], uint16(len(name)))
-	copy(out[3:], name)
-	return out
-}
-
-// DecodeDropTablespace decodes a RecordKindDropTablespace payload.
-func DecodeDropTablespace(payload []byte) (name string, err error) {
-	if len(payload) < 3 {
-		return "", fmt.Errorf("wal: drop-tablespace payload too short (%d bytes)", len(payload))
-	}
-	if payload[0] != RecordKindDropTablespace {
-		return "", fmt.Errorf("wal: record kind %d is not drop-tablespace", payload[0])
-	}
-	nameLen := int(binary.LittleEndian.Uint16(payload[1:3]))
-	if len(payload) < 3+nameLen {
-		return "", fmt.Errorf("wal: drop-tablespace payload truncated (need %d bytes)", 3+nameLen)
-	}
-	return string(payload[3 : 3+nameLen]), nil
-}
-
 // EncodeRenameIndex encodes an `ALTER INDEX name RENAME TO newname` event
 // (DU-002 slice 443). Format: kind(1) | schemaLen(2) | schema(schemaLen
 // bytes) | oldNameLen(2) | oldName(oldNameLen bytes) | newNameLen(2) |
@@ -3925,15 +3816,6 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 		// physical replay and re-applies them to the catalog's database
 		// list.
 		return false, nil
-	case RecordKindCreateTablespace, RecordKindDropTablespace:
-		// CREATE/DROP TABLESPACE records (M0122-0007 tablespace-registry
-		// restart-durability follow-up) carry only pg_tablespace registry
-		// metadata; goopg's tablespace registry has no backing heap
-		// relation, so the physical replay path has nothing to do. The
-		// recovery driver in internal/initdb/tablespace_ddl_recovery.go
-		// scans the WAL for these records after physical replay and
-		// re-applies them to the catalog's tablespace registry.
-		return false, nil
 	case RecordKindRoleState, RecordKindDropRole, RecordKindAlterRoleRename:
 		// Role state / removal / rename records (CREATE/ALTER/DROP ROLE
 		// restart persistence) carry only the in-memory role registry state +
@@ -4230,6 +4112,33 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 				return false, err
 			}
 			if err := applySmgrCreate(mgr, rel); err != nil {
+				return false, err
+			}
+			return true, nil
+		default:
+			return false, unsupportedDecodedXLogRecord(r)
+		}
+	case RmgrTblspc:
+		switch xlog.Header.Info & XLRRmgrInfoMask {
+		case xlogTblspcCreate:
+			// B4.1d: recreate the pg_tblspc/<oid> directory (idempotent). A
+			// real PG standby's tblspc_redo does the same from the ts_path;
+			// goopg's own dirs persist on disk across restart, so this is a
+			// defensive MkdirAll for the basebackup-restore edge.
+			oid, _, err := decodeXLogTblspcCreate(xlog.MainData)
+			if err != nil {
+				return false, err
+			}
+			if err := applyTblspcCreate(mgr, oid); err != nil {
+				return false, err
+			}
+			return true, nil
+		case xlogTblspcDrop:
+			oid, err := decodeXLogTblspcDrop(xlog.MainData)
+			if err != nil {
+				return false, err
+			}
+			if err := applyTblspcDrop(mgr, oid); err != nil {
 				return false, err
 			}
 			return true, nil
@@ -5822,7 +5731,10 @@ func decodeXLogSmgrCreate(mainData []byte) (storage.RelFileNode, error) {
 		RelOid: binary.LittleEndian.Uint32(mainData[8:12]),
 		Fork:   storage.ForkNumber(binary.LittleEndian.Uint32(mainData[12:16])),
 	}
-	if rel.TblOid == pgDefaultTableSpaceOID {
+	if rel.TblOid == pgDefaultTableSpaceOID || rel.TblOid == pgGlobalTableSpaceOID {
+		// Both the default (1663) and global/shared (1664) tablespaces map
+		// back to goopg's TblOid=0; DBOid then selects base/<db> vs global/
+		// (sharedOrPerDBRelDir). B4.1a.
 		rel.TblOid = 0
 	}
 	return rel, nil
@@ -5846,6 +5758,51 @@ func applySmgrCreate(mgr *storage.Manager, rel storage.RelFileNode) error {
 	}
 	_, err = mgr.Extend(rel, page)
 	return err
+}
+
+// decodeXLogTblspcCreate parses a PG xl_tblspc_create_rec main-data body
+// (ts_id Oid + null-terminated ts_path). B4.1d.
+func decodeXLogTblspcCreate(mainData []byte) (oid uint32, path string, err error) {
+	if len(mainData) < 4 {
+		return 0, "", fmt.Errorf("wal: xl_tblspc_create_rec main-data len %d (want >= 4)", len(mainData))
+	}
+	oid = binary.LittleEndian.Uint32(mainData[0:4])
+	rest := mainData[4:]
+	if i := bytes.IndexByte(rest, 0); i >= 0 {
+		rest = rest[:i]
+	}
+	return oid, string(rest), nil
+}
+
+// decodeXLogTblspcDrop parses a PG xl_tblspc_drop_rec main-data body (ts_id
+// Oid). B4.1d.
+func decodeXLogTblspcDrop(mainData []byte) (uint32, error) {
+	if len(mainData) < 4 {
+		return 0, fmt.Errorf("wal: xl_tblspc_drop_rec main-data len %d (want >= 4)", len(mainData))
+	}
+	return binary.LittleEndian.Uint32(mainData[0:4]), nil
+}
+
+// applyTblspcCreate recreates the pg_tblspc/<oid> directory (idempotent).
+// goopg's in-place tablespaces are real directories under the data dir; they
+// persist on disk across a restart, so this MkdirAll is a defensive no-op in
+// the common case and only materializes the directory when replaying onto a
+// basebackup that lacks it. B4.1d.
+func applyTblspcCreate(mgr *storage.Manager, oid uint32) error {
+	dir := filepath.Join(mgr.DataDir(), "pg_tblspc", strconv.FormatUint(uint64(oid), 10))
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("wal: tblspc-create replay MkdirAll %q: %w", dir, err)
+	}
+	return nil
+}
+
+// applyTblspcDrop removes the pg_tblspc/<oid> directory (idempotent). B4.1d.
+func applyTblspcDrop(mgr *storage.Manager, oid uint32) error {
+	dir := filepath.Join(mgr.DataDir(), "pg_tblspc", strconv.FormatUint(uint64(oid), 10))
+	if err := os.RemoveAll(dir); err != nil {
+		return fmt.Errorf("wal: tblspc-drop replay RemoveAll %q: %w", dir, err)
+	}
+	return nil
 }
 
 // replaySmgrTruncate truncates the relfile to 0 blocks. Idempotent: if the

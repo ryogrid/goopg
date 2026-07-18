@@ -38,8 +38,10 @@ type BlockRef struct {
 	// references in ascending id order; SameRel back-references the rel of
 	// the immediately preceding reference.
 	ID uint8
-	// Rel identifies the relation file. Rel.TblOid == 0 encodes as the
-	// pg_default tablespace OID (1663), matching PostgreSQL's RelFileLocator.
+	// Rel identifies the relation file. A shared catalog (Rel.DBOid == 0)
+	// encodes as the global tablespace OID (1664); otherwise Rel.TblOid == 0
+	// encodes as the pg_default tablespace OID (1663), matching PostgreSQL's
+	// RelFileLocator. B4.1a.
 	Rel storage.RelFileNode
 	// Block is the block number within Rel's fork.
 	Block storage.BlockNumber
@@ -119,7 +121,12 @@ func assembleXLogRecord(mainData []byte, blocks []BlockRef) ([]byte, error) {
 		// RelFileLocator (unless SAME_REL) + BlockNumber.
 		if !b.SameRel {
 			spc := b.Rel.TblOid
-			if spc == 0 {
+			switch {
+			case b.Rel.DBOid == 0:
+				// Shared catalog in global/ — PG's RelFileLocator carries
+				// spcOid=1664/dbOid=0 (B4.1a).
+				spc = pgGlobalTableSpaceOID
+			case spc == 0:
 				spc = pgDefaultTableSpaceOID
 			}
 			header = binary.LittleEndian.AppendUint32(header, spc)
