@@ -466,6 +466,19 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
     TestPort_EnumSurvivesRestart (create/add/rename/drop across restart); waldump += enum DDL.
 - [ ] **B3** extension/config (pg_ts_*, pg_transform, pg_event_trigger, pg_publication*/subscription*,
   pg_statistic_ext, pg_constraint/attrdef/depend). **IN PROGRESS.**
+  - [x] **B3.5 pg_ts_dict (kinds 104/105/114/115/116 retired)** — LANDED. `sys_pg_ts_dict.go`:
+    6-col FormData_pg_ts_dict builder (all direct — dicttemplate already an OID in UserTSDict,
+    dictinitoption the serialized options text, NULL when empty) + TID cache (tsDictHeapTIDs, for
+    ALTER RENAME/SET SCHEMA/OPTIONS heap UPDATEs) + DROP xmax. Indexes 3604 (dictname+dictnamespace
+    {80,2}) + 3605 (oid) empty placeholders → lazy-root. Reload reverses dictnamespace → schema
+    name; new FindTSDict helper captures the OID at the emit sites. **Text search CONFIGURATION
+    (pg_ts_config + config_map, kinds 106-113) stays bespoke → B3.6**: only the dict half of the
+    shared tsdict/tsconfig scanner (tsdict_ddl_recovery.go deleted; tsconfig_ddl_recovery.go kept)
+    and the combined codec-test files were split to config-only. BONUS: DROP TEXT SEARCH DICTIONARY
+    now returns on a successful registry drop instead of falling through to the DropCompatObject
+    gate (keyed by the current name), so rename-then-drop no longer fails 42704 (pre-existing gap,
+    same class as B3.3's ALTER CONVERSION RENAME fix). TestPort_TSDictSurvivesRestart green
+    (rename + set schema + options + drop); waldump += CREATE/RENAME/SET SCHEMA/DROP TS DICTIONARY.
   - [x] **B3.4 pg_foreign_data_wrapper + pg_foreign_server + pg_user_mapping (kinds 126-129
     retired)** — LANDED. `sys_pg_foreign.go`: three FormData builders (FDW 7-col, server 8-col,
     user-mapping 4-col; OPTIONS text[] via the evttags codec; fdwacl/srvacl NULL). Cross-refs

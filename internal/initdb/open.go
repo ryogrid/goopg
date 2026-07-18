@@ -1306,17 +1306,17 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// to reloadUserConversionsFromHeap (after the routines reload — the
 	// conproc name fallback re-derives from the routines registry); kinds
 	// 40/41/130-132 retired.
-	// DU-002 restart-persistence follow-up: restore CREATE/DROP TEXT SEARCH
-	// DICTIONARY objects (pg_ts_dict) and CREATE/ADD MAPPING/DROP TEXT
-	// SEARCH CONFIGURATION objects (pg_ts_config/pg_ts_config_map) from the
-	// WAL the same way. Like conversion/collation, both are schema-scoped
-	// (keyed by namespace OID + name), so this must run after
-	// replaySchemaDDLRecords above has repopulated the schema OID map.
-	if err := replayTSDictDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+	// B3.5: text search dictionaries reload from the pg_ts_dict HEAP (generic
+	// scan, doc 02a §2) — replaced replayTSDictDDLRecords' bespoke WAL scan
+	// (kinds 104/105/114/115/116, retired). Schema-scoped, so this runs after
+	// replaySchemaDDLRecords above has repopulated the schema OID map. (Text
+	// search CONFIGURATION — pg_ts_config/config_map, kinds 106-113 — stays on
+	// its bespoke records below until B3.6.)
+	if err := reloadUserTSDictsFromHeap(mgr, cat, clog); err != nil {
 		_ = pool.Close()
 		_ = walWriter.Close()
 		_ = mgr.Close()
-		return nil, fmt.Errorf("goopg: text search dictionary DDL replay: %w", err)
+		return nil, fmt.Errorf("goopg: pg_ts_dict reload: %w", err)
 	}
 	if err := replayTSConfigDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
 		_ = pool.Close()

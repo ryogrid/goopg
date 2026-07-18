@@ -1010,3 +1010,52 @@ func TestPort_ForeignDataSurvivesRestart(t *testing.T) {
 		t.Fatalf("post-restart dropped server count = %q, want 0", got)
 	}
 }
+
+// TestPort_TSDictSurvivesRestart pins B3.5's pg_ts_dict heap journaling:
+// CREATE TEXT SEARCH DICTIONARY, ALTER (RENAME / SET SCHEMA / options), and
+// DROP all survive a restart via the pg_ts_dict heap reload (kinds
+// 104/105/114/115/116 retired).
+func TestPort_TSDictSurvivesRestart(t *testing.T) {
+	c, err := cluster.New("tsdict-durability", cluster.Options{
+		RepoRoot:     repoRoot(t),
+		DataDir:      filepath.Join(t.TempDir(), "data"),
+		StartupWait:  20 * time.Second,
+		ShutdownWait: 20 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+
+	stmts := []string{
+		"CREATE SCHEMA b35_s",
+		"CREATE TEXT SEARCH DICTIONARY b35_dict (TEMPLATE = pg_catalog.simple, STOPWORDS = english)",
+		"ALTER TEXT SEARCH DICTIONARY b35_dict RENAME TO b35_dict2",
+		"ALTER TEXT SEARCH DICTIONARY b35_dict2 SET SCHEMA b35_s",
+		"CREATE TEXT SEARCH DICTIONARY b35_gone (TEMPLATE = pg_catalog.simple)",
+		"DROP TEXT SEARCH DICTIONARY b35_gone",
+	}
+	for _, s := range stmts {
+		if err := runSQLSimple(t, c, s); err != nil {
+			t.Fatalf("%s: %v", s, err)
+		}
+	}
+
+	if err := c.Stop(cluster.ShutdownFast); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	if err := c.Start(); err != nil {
+		t.Fatalf("restart: %v", err)
+	}
+
+	// Renamed + moved to schema b35_s, with its init options intact.
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_ts_dict d JOIN pg_namespace n ON n.oid = d.dictnamespace WHERE d.dictname = 'b35_dict2' AND n.nspname = 'b35_s' AND d.dictinitoption IS NOT NULL"); got != "1" {
+		t.Fatalf("post-restart renamed+moved dict count = %q, want 1 (not reloaded / ALTER lost)", got)
+	}
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_ts_dict WHERE dictname IN ('b35_dict', 'b35_gone')"); got != "0" {
+		t.Fatalf("post-restart stale dict names count = %q, want 0", got)
+	}
+}

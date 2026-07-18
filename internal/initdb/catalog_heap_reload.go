@@ -1658,3 +1658,54 @@ func reloadUserMappingsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clo
 	}
 	return nil
 }
+
+// reloadUserTSDictsFromHeap is B3.5's text-search-dictionary reload — the
+// generic heap-scan replacement for the retired replayTSDictDDLRecords
+// scanner (RecordKinds 104/105/114/115/116). All six pg_ts_dict columns map
+// 1:1 onto UserTSDict (dicttemplate is already an OID, dictinitoption the
+// serialized text), so the reload is fully physical; only dictnamespace
+// reverses to a schema name for CreateTSDictDuringRecovery. Seeds the TID
+// cache so a post-restart ALTER updates the row in place.
+func reloadUserTSDictsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+	cols := executor.PGTSDictColumnsPG18()
+	type dictRow struct {
+		ud  catalog.UserTSDict
+		tid storage.ItemPointer
+	}
+	rel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 3600, Fork: storage.MainFork}
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_ts_dict",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			d := make(executor.Row, len(cols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(d, cols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			if uint32(d[0].Int) < catalog.FirstUserOID {
+				return nil, false, errSkipBuiltinRow
+			}
+			return dictRow{
+				ud: catalog.UserTSDict{
+					OID:          uint32(d[0].Int),
+					Name:         d[1].StringValue(),
+					NamespaceOID: uint32(d[2].Int),
+					Owner:        uint32(d[3].Int),
+					Template:     uint32(d[4].Int),
+					InitOption:   d[5].StringValue(),
+				},
+				tid: tid,
+			}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+	for _, raw := range rows {
+		dr := raw.(dictRow)
+		schema := cat.SchemaNameForOID(dr.ud.NamespaceOID)
+		if schema == "" {
+			schema = "public"
+		}
+		cat.CreateTSDictDuringRecovery(&dr.ud, schema)
+		cat.SetTSDictHeapTID(dr.ud.OID, catalog.SchemaHeapTID{Block: uint32(dr.tid.Block), Offset: dr.tid.Offset})
+	}
+	return nil
+}
