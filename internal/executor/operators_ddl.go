@@ -12762,6 +12762,18 @@ func deleteCatalogRowsForOID(ctx *Context, dbOid uint32, relOID uint32, xmax sto
 		}
 		return err == nil && row.AttRelID == relOID
 	})
+	// B5 Slice B: stamp xmax on this relation's pg_attrdef rows too, so an ALTER
+	// re-sync (delete-old-rows + syncTableToCatalogHeap) or a rolled-back CREATE
+	// does not leave stale/duplicate DEFAULT rows visible to the reload. adrelid
+	// is column 1 (bytes 4:8) of the canonical pg_attrdef row.
+	attrdefRel := storage.RelFileNode{
+		DBOid:  dbOid,
+		RelOid: pgAttrdefRelOID,
+		Fork:   storage.MainFork,
+	}
+	stampCatalogRows(ctx, attrdefRel, xmax, func(data []byte) bool {
+		return len(data) >= 8 && binary.LittleEndian.Uint32(data[4:8]) == relOID
+	})
 }
 
 // syncEnumTypeToCatalogHeap writes a single pg_type row for an enum type into
@@ -13219,28 +13231,25 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 		}
 	}
 
-	// Column DEFAULT persistence (root-0020 follow-up): the reloaded catalog
-	// cannot reconstruct DefaultExpr ASTs from pg_attribute (only atthasdef
-	// survives; no runtime pg_attrdef rows), so snapshot every defaulted
-	// column's expression as SQL text in one WAL record per table. Replay
-	// (internal/initdb/column_defaults_recovery.go) re-parses them after
-	// loadUserTablesFromHeap. Emitting here — the single funnel every
-	// table-persisting DDL path passes through — keeps create/alter in sync.
-	if ctx.WAL != nil {
-		var defs []wal.ColumnDefaultEntry
-		for _, col := range tbl.Columns {
-			if col.Dropped || col.DefaultExpr == nil {
-				continue
-			}
-			if exprSQL := catalog.FormatExprForAttrdef(col.DefaultExpr); exprSQL != "" {
-				defs = append(defs, wal.ColumnDefaultEntry{Name: col.Name, Expr: exprSQL})
-			}
+	// B5 Slice B: column DEFAULT persistence via real pg_attrdef HEAP rows
+	// (base/<dbOid>/2604), replacing the goopg-private RecordKindColumnDefaults(69)
+	// record. The reloaded catalog cannot rebuild DefaultExpr ASTs from
+	// pg_attribute (only atthasdef survives), so write one pg_attrdef row per
+	// defaulted column carrying the expression as SQL text (adbin); the reload
+	// (loadColumnDefaultsFromHeap) re-parses it. This is the single funnel every
+	// table-persisting DDL path passes through — the caller stamps the old
+	// pg_attrdef rows via deleteCatalogRowsForOID before a re-sync (ALTER), so
+	// this is a fresh write. A real PG standby replays the heap inserts.
+	for _, col := range tbl.Columns {
+		if col.Dropped || col.DefaultExpr == nil {
+			continue
 		}
-		if len(defs) > 0 {
-			_, _, _ = ctx.WAL.Append(wal.EncodeColumnDefaults(wal.ColumnDefaultsPayload{
-				TableOID: tbl.OID,
-				Defaults: defs,
-			}))
+		exprSQL := catalog.FormatExprForAttrdef(col.DefaultExpr)
+		if exprSQL == "" {
+			continue
+		}
+		if err := writeAttrdefRow(ctx, tbl.OID, int16(col.Ordinal+1), exprSQL); err != nil {
+			return fmt.Errorf("pg_attrdef col %q: %w", col.Name, err)
 		}
 	}
 

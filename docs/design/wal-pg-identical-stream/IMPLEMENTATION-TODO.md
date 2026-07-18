@@ -626,7 +626,23 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
     - Remaining B4 (boot-critical/large): **pg_database** (18/19, needs an RM_DBASE-style physical record +
       template file-copy streaming to a standby — like B4.1's RM_TBLSPC but bigger). After it, B4 is complete
       and B5 (retire RmgrGoopgCatalog=128) unblocks.
-- [ ] **B5** Retire `RmgrGoopgCatalog=128` (now unused) — header-side parity complete.
+- [ ] **B5** Retire `RmgrGoopgCatalog=128` — header-side parity complete. The full rmid-128 set is 11 kinds
+  in 4 groups (index 20/21/94, pg_attrdef 69, statistics 95-99, view/matview 102/103); retire each group then
+  delete the rmgr. Slice order A(index)→B(pg_attrdef)→Bstat(statistics)→C(view/matview)→delete-rmgr.
+  - [x] **Slice A** (index 20/21/94) — LANDED. CREATE/DROP/RENAME INDEX journal only real pg_class + pg_index
+    heap writes + btree pages (M0113's pg_index heap made 20/21 redundant; RENAME(94) fixed via
+    `resyncIndexClassHeapRow`). Standby-validated (TestE2E_FailoverGoopgToPG index DDL, no rmid-128 FATAL).
+  - [x] **Slice B** (pg_attrdef 69) — LANDED. Column DEFAULTs journal as real pg_attrdef HEAP rows
+    (base/<dbOid>/2604, one XLOG_HEAP_INSERT per defaulted column, adbin as SQL text) via `writeAttrdefRow` in
+    `syncTableToCatalogHeap`; reloaded by a STANDALONE UNCONDITIONAL `loadColumnDefaultsFromHeap` pass (not the
+    cache-bypassed loadUserTablesFromHeap, and keyed on NamespaceDBOid not cat.DBOID()). Retired kind 69 +
+    deleted column_defaults_recovery.go. Standby-validated + TestPort_SerialSequenceSurvivesRestart (was RED).
+  - [ ] **Bstat** (statistics 95-99, pg_statistic_ext) — heap-back stxkeys (attnum list, no node tree common
+    case); canonical expression-statistics (stxexprs node tree) is a separable track.
+  - [ ] **Slice C** (view/matview 102/103 → pg_rewrite) — narrow rmid-128 removal (runtime pg_rewrite writer,
+    text ev_action, relhasrules=false); full canonical fidelity blocked on the absent node-tree serializer.
+  - [ ] **delete-rmgr**: remove RmgrGoopgCatalog + the default arm in rmgr_map.go/recovery.go + IsGoopgNativeRecord's
+    CATALOG arm (function survives for non-catalog natives: checkpoint marker, sequence-state 65/66).
 - [ ] **B-gate**: per-catalog full regress + `internal/testport` isolation; `psql \d`/`\df`/`\dn` +
   `information_schema` parity vs PG 18.3; crash-after-DDL recovery via generic reload; re-init data dir.
 

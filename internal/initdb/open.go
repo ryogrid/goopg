@@ -1478,15 +1478,21 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		}
 	}
 
-	// Column DEFAULT persistence (root-0020 follow-up): re-parse the DEFAULT
-	// expression snapshots emitted by syncTableToCatalogHeap onto the
-	// heap-reloaded columns (DefaultExpr is an in-memory AST pg_attribute
-	// cannot carry). Must run AFTER loadUserTablesFromHeap.
-	if err := replayColumnDefaultsRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+	// B5 Slice B: column DEFAULT persistence via real pg_attrdef HEAP rows
+	// (base/<dbOid>/2604), replacing the retired goopg-private
+	// RecordKindColumnDefaults(69) WAL scan (replayColumnDefaultsRecords). The
+	// reloaded catalog cannot rebuild DefaultExpr ASTs from pg_attribute (only
+	// atthasdef survives), so syncTableToCatalogHeap writes one pg_attrdef row
+	// per defaulted column carrying the expression as SQL text; this pass
+	// re-parses them. Runs as a STANDALONE UNCONDITIONAL pass (not inside
+	// loadUserTablesFromHeap, which the M0114 catalog cache bypasses) AFTER
+	// every table-load pass so both the main DB and each user DB's tables are
+	// registered. A real PG standby replays the heap inserts (no rmid-128).
+	if err := loadColumnDefaultsFromHeap(mgr, cat, clog); err != nil {
 		_ = pool.Close()
 		_ = walWriter.Close()
 		_ = mgr.Close()
-		return nil, fmt.Errorf("goopg: column-defaults replay: %w", err)
+		return nil, fmt.Errorf("goopg: pg_attrdef reload: %w", err)
 	}
 
 	// Materialized-view query persistence (M0119-0004 follow-up): re-parse the

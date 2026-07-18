@@ -22372,9 +22372,10 @@ func binaryOpSymbol(op parser.OpCode) string {
 // for pg_attrdef.adbin. Used by pg_get_expr to display column defaults in \d.
 // FormatExprForAttrdef deparses a column DEFAULT / CHECK / generated-column
 // expression to SQL text, the same rendering pg_attrdef's adbin display uses.
-// Exported for the column-defaults WAL persistence (RecordKindColumnDefaults):
-// syncTableToCatalogHeap serializes each DefaultExpr with it and startup
-// replay round-trips the text through parser.ParseExpr. root-0020 follow-up.
+// Exported for pg_attrdef heap persistence (B5 Slice B): syncTableToCatalogHeap
+// serializes each DefaultExpr with it into the pg_attrdef row's adbin, and
+// startup reload round-trips the text through parser.ParseExpr. root-0020
+// follow-up, converted from the retired RecordKindColumnDefaults(69) WAL record.
 func FormatExprForAttrdef(e parser.Expr) string { return formatExprForAttrdef(e) }
 
 func formatExprForAttrdef(e parser.Expr) string {

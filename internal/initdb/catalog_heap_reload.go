@@ -198,6 +198,94 @@ func reloadUserSchemasFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog
 	return nil
 }
 
+// loadColumnDefaultsFromHeap is B5 Slice B's pg_attrdef reload — the generic
+// heap-scan replacement for the retired replayColumnDefaultsRecords WAL scan
+// (RecordKindColumnDefaults 69). Column DEFAULT expressions now journal as
+// real pg_attrdef HEAP rows (base/<dbOid>/2604, one per defaulted column,
+// adbin = the expression as SQL text) written by syncTableToCatalogHeap; this
+// pass re-parses them onto the reloaded columns. Must run AFTER every
+// loadUserTablesFromHeap pass (main DB + each user DB) so the owning table is
+// already registered.
+//
+// pg_attrdef rows live in each database's OWN heap (the write routes via
+// tableCatalogHeapDBOid = NamespaceDBOid(currentDB)); the main postgres DB's
+// rows land in base/DefaultDBOid/2604. Scan that heap plus each registered
+// user database's heap. Lookups are dbOid-agnostic (LookupTableByOIDAllDBs),
+// matching the old WAL replay, so a row is applied to whichever namespace its
+// table reloaded into.
+func loadColumnDefaultsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+	if cat == nil {
+		return nil
+	}
+	// Main DB catalog rows are written under the DefaultDBOid namespace heap.
+	if err := loadColumnDefaultsFromHeapForDB(mgr, cat, clog, catalog.DefaultDBOid); err != nil {
+		return err
+	}
+	for _, dbName := range cat.ListDatabases() {
+		dbOid := cat.DatabaseOid(dbName)
+		if dbOid == 0 || dbOid == catalog.DefaultDBOid ||
+			dbOid == catalog.PostgresDBOid || dbOid == cat.DBOID() {
+			continue
+		}
+		if err := loadColumnDefaultsFromHeapForDB(mgr, cat, clog, dbOid); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// loadColumnDefaultsFromHeapForDB scans base/<heapDBOid>/2604 and re-parses each
+// live pg_attrdef row's adbin onto the owning table's column (matched by
+// adrelid → table OID, adnum → 1-based ordinal). A missing/empty heap is a
+// no-op. A deparse/reparse gap for one column degrades to the pre-record state
+// (NULL default) rather than failing startup, matching the old replay.
+func loadColumnDefaultsFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog, heapDBOid uint32) error {
+	type adRow struct {
+		adrelid uint32
+		adnum   int16
+		adbin   string
+	}
+	rel := storage.RelFileNode{DBOid: heapDBOid, RelOid: 2604, Fork: storage.MainFork}
+	cols := executor.PGAttrdefColumnsPG18()
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_attrdef",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			decoded := make(executor.Row, len(cols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, cols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			return adRow{
+				adrelid: uint32(decoded[1].Int),
+				adnum:   int16(decoded[2].Int),
+				adbin:   decoded[3].StringValue(),
+			}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+	for _, r := range rows {
+		ad := r.(adRow)
+		if ad.adrelid == 0 || ad.adnum < 1 || ad.adbin == "" {
+			continue
+		}
+		tbl, _, ok := cat.LookupTableByOIDAllDBs(ad.adrelid)
+		if !ok || tbl == nil {
+			continue // table dropped since the row was written
+		}
+		expr, perr := parser.ParseExpr(ad.adbin)
+		if perr != nil {
+			continue
+		}
+		for i := range tbl.Columns {
+			if tbl.Columns[i].Ordinal+1 == int(ad.adnum) {
+				tbl.Columns[i].DefaultExpr = expr
+				break
+			}
+		}
+	}
+	return nil
+}
+
 // reloadUserTablespacesFromHeap is B4.1e's pg_tablespace reload — the generic
 // heap-scan replacement for the retired replayTablespaceDDLRecords scanner
 // (RecordKinds 124/125). pg_tablespace is a SHARED catalog (global/1213), so

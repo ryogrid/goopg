@@ -58,7 +58,7 @@ func TestRecordKindToRmgrInfoCustomDefault(t *testing.T) {
 	for _, kind := range []byte{
 		RecordKindCreateView, // still-live rmid-128 kind (was CreateIndex, retired B5 Slice A)
 		RecordKindCreateStatistics,
-		RecordKindColumnDefaults, // still-live rmid-128 kind (was RoleState, retired B4.5)
+		RecordKindCreateMatView, // still-live rmid-128 kind (was ColumnDefaults, retired B5 Slice B)
 	} {
 		gotRmgr, _ := recordKindToRmgrInfo(kind)
 		if gotRmgr != RmgrGoopgCatalog {

@@ -124,8 +124,8 @@ func TestPort_SerialSequenceSurvivesRestart(t *testing.T) {
 			"(DROP SEQUENCE was not durable — a stale state record was replayed)")
 	}
 
-	// (d) Column DEFAULTs survive the restart too (RecordKindColumnDefaults):
-	// an INSERT omitting the defaulted columns must fill them, not NULL.
+	// (d) Column DEFAULTs survive the restart too (B5 Slice B: pg_attrdef heap
+	// rows): an INSERT omitting the defaulted columns must fill them, not NULL.
 	// Regression: WordPress's `comment_count bigint NOT NULL DEFAULT 0`
 	// raised a NOT NULL violation on every post-restart post creation.
 	if err := runSQLSimple(t, c,
