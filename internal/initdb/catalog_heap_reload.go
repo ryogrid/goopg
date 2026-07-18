@@ -448,6 +448,100 @@ func parsePGCharArrayPayload(b []byte) []byte {
 	return append([]byte(nil), b[20:20+count]...)
 }
 
+// loadViewsFromHeap is B5 Slice C's pg_rewrite reload — the generic heap-scan
+// replacement for the retired replayMatViewRecords / replayViewRecords WAL scans
+// (RecordKindCreateMatView 102 / RecordKindCreateView 103). A user view /
+// materialized view's defining SELECT now journals as a real pg_rewrite _RETURN
+// rule heap row (base/<dbOid>/2618, ev_action = the query as SQL text) written by
+// writeViewRewriteRow; this pass re-parses ev_action to rebuild the view AST.
+// Must run AFTER every loadUserTablesFromHeap pass (the owning relation, keyed by
+// ev_class, must already be registered with its relkind).
+//
+// Only user rules (ev_class >= FirstUserOID) are processed: the six bootstrap
+// replication-view _RETURN rules (ev_class 12100..12106) carry canonical
+// nodeToString ev_action blobs that are NOT re-parsable SQL and whose views are
+// nailed relcache entries, so they are skipped by the OID filter.
+//
+// matview IsPopulated is a documented deferral (deferral ledger): the retired
+// WAL record carried it, but Slice C stores only the query in pg_rewrite, so a
+// reloaded matview defaults to populated (correct for the common CREATE
+// MATERIALIZED VIEW case; a WITH NO DATA matview loses its unpopulated state
+// across a restart).
+func loadViewsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+	if cat == nil {
+		return nil
+	}
+	if err := loadViewsFromHeapForDB(mgr, cat, clog, catalog.DefaultDBOid); err != nil {
+		return err
+	}
+	for _, dbName := range cat.ListDatabases() {
+		dbOid := cat.DatabaseOid(dbName)
+		if dbOid == 0 || dbOid == catalog.DefaultDBOid ||
+			dbOid == catalog.PostgresDBOid || dbOid == cat.DBOID() {
+			continue
+		}
+		if err := loadViewsFromHeapForDB(mgr, cat, clog, dbOid); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// loadViewsFromHeapForDB scans base/<heapDBOid>/2618 and rebuilds the view AST
+// for each user _RETURN rule. A missing/empty heap is a no-op; a query that no
+// longer re-parses degrades that one view to its pre-record state (a plain
+// relkind-tagged relation with View=nil), never failing startup.
+func loadViewsFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog, heapDBOid uint32) error {
+	type rewriteRow struct {
+		rulename string
+		evClass  uint32
+		evAction string
+	}
+	rel := storage.RelFileNode{DBOid: heapDBOid, RelOid: 2618, Fork: storage.MainFork}
+	cols := executor.PGRewriteColumnsPG18()
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_rewrite",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			decoded := make(executor.Row, len(cols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, cols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			return rewriteRow{
+				rulename: decoded[1].StringValue(),
+				evClass:  uint32(decoded[2].Int),
+				evAction: decoded[7].StringValue(),
+			}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+	for _, raw := range rows {
+		r := raw.(rewriteRow)
+		if r.rulename != "_RETURN" || r.evClass < catalog.FirstUserOID || r.evAction == "" {
+			continue // bootstrap replication-view rules / non-SELECT rules
+		}
+		tbl, _, ok := cat.LookupTableByOIDAllDBs(r.evClass)
+		if !ok || tbl == nil {
+			continue // view dropped since the row was written
+		}
+		stmts, perr := parser.Parse(r.evAction)
+		if perr != nil || len(stmts) != 1 {
+			continue
+		}
+		sel, ok := stmts[0].(*parser.SelectStmt)
+		if !ok {
+			continue
+		}
+		tbl.View = sel
+		tbl.ViewDef = r.evAction
+		if tbl.IsMatView {
+			// Query stored; populated state is a deferral (see the doc comment).
+			tbl.IsPopulated = true
+		}
+	}
+	return nil
+}
+
 // reloadUserTablespacesFromHeap is B4.1e's pg_tablespace reload — the generic
 // heap-scan replacement for the retired replayTablespaceDDLRecords scanner
 // (RecordKinds 124/125). pg_tablespace is a SHARED catalog (global/1213), so

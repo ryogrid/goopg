@@ -644,10 +644,17 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
     stxkind→kind strings). Fixed a latent nondeterminism in `SchemaNameForOID` (pg_toast shares public's OID
     2200 → random reverse pick) surfaced by the round-trip test. Standby-validated (E2E CREATE STATISTICS +
     base/1→base/5 mirror). Retired kinds 95-99 + deleted statistics_ddl{,_recovery}.go.
-  - [ ] **Slice C** (view/matview 102/103 → pg_rewrite) — narrow rmid-128 removal (runtime pg_rewrite writer,
-    text ev_action, relhasrules=false); full canonical fidelity blocked on the absent node-tree serializer.
-  - [ ] **delete-rmgr**: remove RmgrGoopgCatalog + the default arm in rmgr_map.go/recovery.go + IsGoopgNativeRecord's
-    CATALOG arm (function survives for non-catalog natives: checkpoint marker, sequence-state 65/66).
+  - [x] **Slice C** (view/matview 102/103 → pg_rewrite) — LANDED (narrow removal). CREATE VIEW / MATERIALIZED
+    VIEW journal a real pg_rewrite _RETURN rule HEAP row (base/<dbOid>/2618, ev_action = the query as SQL text,
+    relhasrules stays false) via `writeViewRewriteRow` in syncTableToCatalogHeap; reload `loadViewsFromHeap`
+    re-parses ev_action (ev_class >= FirstUserOID skips the 6 bootstrap replication-view rules). Retired kinds
+    102/103 + deleted view/matview_ddl_recovery.go. Standby-validated (E2E CREATE VIEW + pg_rewrite assertion).
+    DEFERRED (ledger): (a) full canonical node-tree ev_action + relhasrules=true so a standby can QUERY the view
+    (needs the absent node-tree serializer); (b) matview IsPopulated across restart (reload defaults populated);
+    (c) ALTER VIEW/TABLE RENAME across restart (pre-existing — AlterTableRenameTable never re-syncs pg_class).
+  - [ ] **delete-rmgr**: all four catalog groups are retired; RmgrGoopgCatalog now catches only non-catalog
+    private kinds (subxact markers, checkpoint marker, sequence-state). Removing the rmgr / renaming it is the
+    final cleanup step.
 - [ ] **B-gate**: per-catalog full regress + `internal/testport` isolation; `psql \d`/`\df`/`\dn` +
   `information_schema` parity vs PG 18.3; crash-after-DDL recovery via generic reload; re-init data dir.
 

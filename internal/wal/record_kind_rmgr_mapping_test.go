@@ -56,8 +56,11 @@ func TestRecordKindToRmgrInfoAnalogTable(t *testing.T) {
 // kind from each region is enough to catch a range-boundary mistake.
 func TestRecordKindToRmgrInfoCustomDefault(t *testing.T) {
 	for _, kind := range []byte{
-		RecordKindCreateView,    // still-live rmid-128 kind (was CreateIndex, retired B5 Slice A)
-		RecordKindCreateMatView, // still-live rmid-128 kind (was ColumnDefaults, retired B5 Slice B; Statistics retired B5 Bstat)
+		// All B-phase catalog/DDL kinds are retired (index/attrdef/statistics/
+		// view/matview). The subxact markers are among the surviving goopg-private
+		// kinds that still fall through to RmgrGoopgCatalog.
+		RecordKindXactAssignment,
+		RecordKindXactSubAbort,
 	} {
 		gotRmgr, _ := recordKindToRmgrInfo(kind)
 		if gotRmgr != RmgrGoopgCatalog {
@@ -73,7 +76,7 @@ func TestRecordKindToRmgrInfoCustomDefault(t *testing.T) {
 func TestClassifyXLogRecordWiredToRecordKindToRmgrInfo(t *testing.T) {
 	for _, kind := range []byte{
 		RecordKindHeapInsert, RecordKindXactCommit, RecordKindPageImage,
-		RecordKindCreateMatView, RecordKindCreateView,
+		RecordKindXactAssignment, RecordKindXactSubAbort,
 	} {
 		wantRmgr, wantInfo := recordKindToRmgrInfo(kind)
 		rmgr, info, xid := classifyXLogRecord([]byte{kind})

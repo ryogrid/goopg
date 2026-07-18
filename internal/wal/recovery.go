@@ -421,36 +421,14 @@ const (
 	// pg_index), so loadUserIndexesFromHeap restores the rename and a real PG
 	// standby replays it as a pg_class heap UPDATE.
 
-	// RecordKindCreateMatView records a materialized view's defining query
-	// (as SQL text) and populated state so both survive a restart. A matview
-	// is a *catalog.Table with IsMatView=true, View (parser AST) and ViewDef
-	// (raw SQL) set — pg_class.relkind carries 'm' on disk (buildUserPGClassRow),
-	// but loadUserTablesFromHeap cannot reconstruct the AST from relkind alone,
-	// and syncTableToCatalogHeap writes no pg_rewrite-equivalent heap rows. Before
-	// this record, a restarted matview reloaded as an ordinary relkind='m'-blind
-	// table with View=nil (loadUserTablesFromHeap only recognized relkind='r'),
-	// losing both its matview-ness and its refresh query. Emitted from
-	// syncTableToCatalogHeap (the same single funnel as the pg_attrdef rows),
-	// one record per matview, last-record-wins; replay re-parses the query via
-	// parser.Parse. Upstream analog: pg_rewrite (postgres/src/backend/rewrite/rewriteDefine.c).
-	// Format: kind(1) | tableOID(4) | populated(1) | queryLen(2) | querySQL
-	RecordKindCreateMatView byte = 102
-
-	// RecordKindCreateView records a plain (non-materialized) view's defining
-	// query (as SQL text) so it survives a restart. A view is a *catalog.Table
-	// with View (parser AST) and ViewDef (raw SQL) set, Virtual=true, and
-	// pg_class.relkind='v' on disk (buildUserPGClassRow) — but a view has no
-	// physical heap storage and no pg_rewrite-equivalent heap rows, so
-	// loadUserTablesFromHeap can reconstruct the column list from pg_attribute
-	// but not the AST. Before this record, `execCreateView` never called
-	// syncTableToCatalogHeap at all, so a plain view did not survive a restart
-	// even as a downgraded relation — it simply ceased to exist. Emitted from
-	// syncTableToCatalogHeap (the same funnel as RecordKindCreateMatView), one
-	// record per view, last-record-wins; replay re-parses the query via
-	// parser.Parse. Upstream analog: pg_rewrite
-	// (postgres/src/backend/rewrite/rewriteDefine.c).
-	// Format: kind(1) | tableOID(4) | queryLen(2) | querySQL
-	RecordKindCreateView byte = 103
+	// Kinds 102 (CreateMatView) / 103 (CreateView) retired in B5 Slice C: a user
+	// view / materialized view's defining SELECT now journals as a real
+	// pg_rewrite _RETURN rule HEAP row (base/<dbOid>/2618, ev_action = the query
+	// as SQL text) via XLOG_HEAP_INSERT — written by syncTableToCatalogHeap
+	// (writeViewRewriteRow) and reloaded by loadViewsFromHeap. A real PG standby
+	// replays the heap insert (no rmid-128). Upstream analog: pg_rewrite
+	// (postgres/src/backend/rewrite/rewriteDefine.c). (matview IsPopulated across
+	// a restart is a documented deferral — see the deferral ledger.)
 
 	// defaultRecoveryDBOid is the database OID used by
 	// ProcessCommittedInvalidationMessages when unlinking the per-database
@@ -535,99 +513,6 @@ const (
 	roleGrantOptSetSpecified     = 1 << 4
 	roleGrantOptSetValue         = 1 << 5
 )
-// MatViewPayload is the decoded form of a RecordKindCreateMatView record: one
-// materialized view's defining query and populated state.
-type MatViewPayload struct {
-	TableOID    uint32
-	IsPopulated bool
-	Query       string // SELECT body as SQL text (parser.Parse round-trips it)
-}
-
-// EncodeMatView encodes a RecordKindCreateMatView record.
-func EncodeMatView(p MatViewPayload) []byte {
-	var buf bytes.Buffer
-	buf.WriteByte(RecordKindCreateMatView)
-	var b4 [4]byte
-	binary.LittleEndian.PutUint32(b4[:], p.TableOID)
-	buf.Write(b4[:])
-	if p.IsPopulated {
-		buf.WriteByte(1)
-	} else {
-		buf.WriteByte(0)
-	}
-	q := p.Query
-	if len(q) > 0xFFFF {
-		q = q[:0xFFFF]
-	}
-	var b2 [2]byte
-	binary.LittleEndian.PutUint16(b2[:], uint16(len(q)))
-	buf.Write(b2[:])
-	buf.WriteString(q)
-	return buf.Bytes()
-}
-
-// DecodeMatView decodes a RecordKindCreateMatView payload.
-func DecodeMatView(payload []byte) (MatViewPayload, error) {
-	var p MatViewPayload
-	if len(payload) < 8 {
-		return p, fmt.Errorf("wal: matview payload too short (%d bytes)", len(payload))
-	}
-	if payload[0] != RecordKindCreateMatView {
-		return p, fmt.Errorf("wal: record kind %d is not create-matview", payload[0])
-	}
-	p.TableOID = binary.LittleEndian.Uint32(payload[1:5])
-	p.IsPopulated = payload[5] != 0
-	qLen := int(binary.LittleEndian.Uint16(payload[6:8]))
-	if len(payload) < 8+qLen {
-		return p, fmt.Errorf("wal: matview payload truncated (need %d bytes at 8)", qLen)
-	}
-	p.Query = string(payload[8 : 8+qLen])
-	return p, nil
-}
-
-// ViewPayload is the decoded form of a RecordKindCreateView record: one plain
-// view's defining query.
-type ViewPayload struct {
-	TableOID uint32
-	Query    string // SELECT body as SQL text (parser.Parse round-trips it)
-}
-
-// EncodeView encodes a RecordKindCreateView record.
-func EncodeView(p ViewPayload) []byte {
-	var buf bytes.Buffer
-	buf.WriteByte(RecordKindCreateView)
-	var b4 [4]byte
-	binary.LittleEndian.PutUint32(b4[:], p.TableOID)
-	buf.Write(b4[:])
-	q := p.Query
-	if len(q) > 0xFFFF {
-		q = q[:0xFFFF]
-	}
-	var b2 [2]byte
-	binary.LittleEndian.PutUint16(b2[:], uint16(len(q)))
-	buf.Write(b2[:])
-	buf.WriteString(q)
-	return buf.Bytes()
-}
-
-// DecodeView decodes a RecordKindCreateView payload.
-func DecodeView(payload []byte) (ViewPayload, error) {
-	var p ViewPayload
-	if len(payload) < 7 {
-		return p, fmt.Errorf("wal: view payload too short (%d bytes)", len(payload))
-	}
-	if payload[0] != RecordKindCreateView {
-		return p, fmt.Errorf("wal: record kind %d is not create-view", payload[0])
-	}
-	p.TableOID = binary.LittleEndian.Uint32(payload[1:5])
-	qLen := int(binary.LittleEndian.Uint16(payload[5:7]))
-	if len(payload) < 7+qLen {
-		return p, fmt.Errorf("wal: view payload truncated (need %d bytes at 7)", qLen)
-	}
-	p.Query = string(payload[7 : 7+qLen])
-	return p, nil
-}
-
 // EncodeXactAssignment encodes a subxact XID assignment record (M0050-0003).
 // parentXid is the top-level transaction; subXids lists the subxact XIDs
 // that are now children of parentXid. Replay calls Manager.RegisterSubXid
@@ -2243,21 +2128,6 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 		// truncation to the CLog, which has no access to mvcc.Manager from
 		// here. Mirrors PG clog_redo's CLOG_TRUNCATE branch
 		// (postgres/src/backend/access/transam/clog.c:1131).
-		return false, nil
-	case RecordKindCreateMatView:
-		// Materialized-view query snapshots carry only the in-memory
-		// catalog's View AST as SQL text + IsPopulated; no physical page
-		// state (the matview's own heap data is ordinary pg_class-tracked
-		// storage, already covered by loadUserTablesFromHeap). The recovery
-		// driver in internal/initdb/matview_ddl_recovery.go re-parses the
-		// query after loadUserTablesFromHeap.
-		return false, nil
-	case RecordKindCreateView:
-		// Plain-view query snapshots carry only the in-memory catalog's View
-		// AST as SQL text; a view has no physical page state (Virtual=true,
-		// no heap file at all). The recovery driver in
-		// internal/initdb/view_ddl_recovery.go re-parses the query after
-		// loadUserTablesFromHeap.
 		return false, nil
 	case RecordKindXactAssignment, RecordKindXactRollbackTo, RecordKindXactSubAbort:
 		// Subxact markers (M0050-0003) — physical page recovery is

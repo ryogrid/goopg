@@ -270,6 +270,18 @@ func runFailoverGoopgToPG(t *testing.T, repo, pgBasebackupBin, psqlBin string, m
 		t.Fatalf("create statistics on goopg primary: %v", err)
 	}
 
+	// B5 Slice C: CREATE VIEW now journals a real pg_rewrite _RETURN rule heap
+	// row (base/<dbOid>/2618) instead of the goopg-private RecordKindCreateView(103)
+	// rmid-128 record. The standby must replay the heap insert without FATAL and
+	// end up with the rule in pg_rewrite. (The view is not queried on the standby:
+	// its ev_action is goopg SQL text, not a canonical node tree — the narrow
+	// removal keeps relhasrules=false; querying it there is a separate, blocked
+	// track.)
+	if err := runSQLSimple(t, primary,
+		"CREATE VIEW b5c_view AS SELECT client, src FROM public.bench_log WHERE client > 0"); err != nil {
+		t.Fatalf("create view on goopg primary: %v", err)
+	}
+
 	dsn := fmt.Sprintf("host=%s port=%s user=%s dbname=%s sslmode=disable",
 		"127.0.0.1", mustGoopgPort(primary.ListenAddr()), "postgres", "postgres")
 	workCtx, workCancel := context.WithCancel(context.Background())
@@ -460,6 +472,13 @@ func runFailoverGoopgToPG(t *testing.T, repo, pgBasebackupBin, psqlBin string, m
 	if got := pgScalar(t, standby,
 		"SELECT count(*) FROM pg_statistic_ext WHERE stxname = 'b5bstat_stat'"); got != "1" {
 		t.Fatalf("post-failover pg_statistic_ext has b5bstat_stat = %q, want 1 (statistics heap insert not replayed)", got)
+	}
+	// B5 Slice C: the CREATE VIEW replayed to the promoted PG as a pure pg_class
+	// + pg_rewrite heap insert (no rmid-128 record). Assert the _RETURN rule row
+	// landed in pg_rewrite (a catalog scan — the view itself is not queried).
+	if got := pgScalar(t, standby,
+		"SELECT count(*) FROM pg_rewrite r JOIN pg_class c ON c.oid = r.ev_class WHERE c.relname = 'b5c_view' AND r.rulename = '_RETURN'"); got != "1" {
+		t.Fatalf("post-failover pg_rewrite has b5c_view _RETURN rule = %q, want 1 (view rule heap insert not replayed)", got)
 	}
 }
 

@@ -32,8 +32,10 @@ func TestEmittedRecordKindsClassifyPGCompatible(t *testing.T) {
 		{"SmgrCreate", RecordKindSmgrCreate, RmgrStorage, xlogSmgrCreate},
 		{"ClogTruncate", RecordKindClogTruncate, RmgrCLOG, xlogClogTruncate},
 		{"PageImage", RecordKindPageImage, RmgrXLog, xlogXLogFPI},
-		// A goopg-private catalog/DDL record → custom rmgr, body-keyed.
-		{"CreateView(private)", RecordKindCreateView, RmgrGoopgCatalog, 0},
+		// A goopg-private record with no PG analog → custom rmgr, body-keyed.
+		// (All B-phase catalog/DDL kinds are retired; the subxact markers are
+		// among the surviving 128-mapped private kinds.)
+		{"XactAssignment(private)", RecordKindXactAssignment, RmgrGoopgCatalog, 0},
 	}
 
 	for _, tc := range cases {

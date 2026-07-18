@@ -1495,26 +1495,19 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, fmt.Errorf("goopg: pg_attrdef reload: %w", err)
 	}
 
-	// Materialized-view query persistence (M0119-0004 follow-up): re-parse the
-	// defining-query snapshots emitted by syncTableToCatalogHeap onto the
-	// heap-reloaded matviews (View is an in-memory AST pg_class cannot carry).
-	// Must run AFTER loadUserTablesFromHeap.
-	if err := replayMatViewRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+	// B5 Slice C: view / materialized-view query persistence from the pg_rewrite
+	// HEAP _RETURN rules (base/<dbOid>/2618) written by writeViewRewriteRow,
+	// replacing the retired RecordKindCreateMatView(102)/RecordKindCreateView(103)
+	// WAL scans (replayMatViewRecords/replayViewRecords). Re-parses each rule's
+	// ev_action SQL text to rebuild the view AST. STANDALONE UNCONDITIONAL pass
+	// (not inside loadUserTablesFromHeap, which the M0114 cache bypasses) AFTER
+	// every table-load pass so the owning relkind-tagged relation is registered.
+	// A real PG standby replays the heap inserts (no rmid-128).
+	if err := loadViewsFromHeap(mgr, cat, clog); err != nil {
 		_ = pool.Close()
 		_ = walWriter.Close()
 		_ = mgr.Close()
-		return nil, fmt.Errorf("goopg: matview replay: %w", err)
-	}
-
-	// Plain-view query persistence (M0119-0004 follow-up, sibling of the
-	// matview replay above): re-parse the defining-query snapshots emitted by
-	// syncTableToCatalogHeap onto the heap-reloaded views (View is an
-	// in-memory AST pg_class cannot carry). Must run AFTER loadUserTablesFromHeap.
-	if err := replayViewRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
-		_ = pool.Close()
-		_ = walWriter.Close()
-		_ = mgr.Close()
-		return nil, fmt.Errorf("goopg: view replay: %w", err)
+		return nil, fmt.Errorf("goopg: pg_rewrite reload: %w", err)
 	}
 
 	// Role/auth restart persistence (B4.5, was root-0021): reload the catalog
@@ -2891,9 +2884,10 @@ func loadUserTablesFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, cl
 			Columns:        cols,
 			OID:            tr.OID,
 			SmallDimension: tr.RelName == "region" || tr.RelName == "nation",
-			// IsMatView from relkind alone; View/ViewDef/IsPopulated are
-			// restored afterward by replayMatViewRecords (the AST/populated
-			// flag have no heap representation — see RecordKindCreateMatView).
+			// IsMatView from relkind alone; View/ViewDef are restored afterward
+			// by loadViewsFromHeap re-parsing the pg_rewrite _RETURN rule's
+			// ev_action (B5 Slice C). matview IsPopulated defaults to populated on
+			// reload (a documented deferral).
 			IsMatView: tr.RelKind == "m",
 			// B1.3b: sequences (relkind 'S') register as virtual sequence
 			// relations; reloadSequencesFromHeap re-wires the SELECT-able
@@ -2901,8 +2895,8 @@ func loadUserTablesFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, cl
 			IsSequence: tr.RelKind == "S",
 			// A plain view (relkind='v') has no physical heap storage — mirror
 			// catalog.InMemory.CreateView's Virtual=true. View/ViewDef are
-			// restored afterward by replayViewRecords (the AST has no heap
-			// representation — see RecordKindCreateView).
+			// restored afterward by loadViewsFromHeap (B5 Slice C, from the
+			// pg_rewrite heap — the AST has no pg_class representation).
 			Virtual: tr.RelKind == "v" || tr.RelKind == "S",
 		}
 		if tr.RelFileNode != 0 && tr.RelFileNode != tr.OID {

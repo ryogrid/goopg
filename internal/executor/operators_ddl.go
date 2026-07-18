@@ -12774,6 +12774,10 @@ func deleteCatalogRowsForOID(ctx *Context, dbOid uint32, relOID uint32, xmax sto
 	stampCatalogRows(ctx, attrdefRel, xmax, func(data []byte) bool {
 		return len(data) >= 8 && binary.LittleEndian.Uint32(data[4:8]) == relOID
 	})
+	// B5 Slice C: stamp this relation's pg_rewrite _RETURN rule row (ev_class ==
+	// relOID) so a dropped/re-synced view/matview leaves no stale rule visible to
+	// loadViewsFromHeap.
+	stampViewRewriteRows(ctx, dbOid, relOID, xmax)
 }
 
 // syncEnumTypeToCatalogHeap writes a single pg_type row for an enum type into
@@ -13253,40 +13257,20 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 		}
 	}
 
-	// Materialized-view query persistence: pg_class.relkind='m' (set above by
-	// buildUserPGClassRow) tells loadUserTablesFromHeap this is a matview, but
-	// the defining SELECT lives only in tbl.View (an in-memory AST) — goopg
-	// writes no pg_rewrite-equivalent heap rows, so it must be snapshotted as
-	// SQL text the same way M0079-0001's CREATE INDEX record is. Emitted from
-	// this single funnel keeps CREATE and any future ALTER MATERIALIZED VIEW
-	// ... RENAME/SET SCHEMA in sync automatically. Replay:
-	// internal/initdb/matview_ddl_recovery.go.
-	if ctx.Pool != nil && tbl.IsMatView && tbl.ViewDef != "" {
-		payload := wal.EncodeMatView(wal.MatViewPayload{
-			TableOID:    tbl.OID,
-			IsPopulated: tbl.IsPopulated,
-			Query:       tbl.ViewDef,
-		})
-		if _, err := ctx.Pool.LogChangeRecord(payload); err != nil {
-			return fmt.Errorf("matview WAL record: %w", err)
-		}
-	}
-
-	// Plain-view query persistence (M0119-0004 follow-up, sibling of the
-	// matview record above): pg_class.relkind='v' (set above by
-	// buildUserPGClassRow) tells loadUserTablesFromHeap this is a plain view,
-	// but the defining SELECT lives only in tbl.View (an in-memory AST) — same
-	// gap as matviews, snapshotted as SQL text the same way. Emitted from this
-	// single funnel keeps CREATE VIEW and any future ALTER VIEW ...
-	// RENAME/SET SCHEMA in sync automatically. Replay:
-	// internal/initdb/view_ddl_recovery.go.
-	if ctx.Pool != nil && tbl.View != nil && !tbl.IsMatView && tbl.ViewDef != "" {
-		payload := wal.EncodeView(wal.ViewPayload{
-			TableOID: tbl.OID,
-			Query:    tbl.ViewDef,
-		})
-		if _, err := ctx.Pool.LogChangeRecord(payload); err != nil {
-			return fmt.Errorf("view WAL record: %w", err)
+	// B5 Slice C: a view / materialized view's defining SELECT now journals as a
+	// real pg_rewrite _RETURN rule heap row (base/<dbOid>/2618, ev_action = the
+	// query as SQL text) instead of the retired RecordKindCreateMatView(102) /
+	// RecordKindCreateView(103) records. pg_class.relkind ('m'/'v', set above by
+	// buildUserPGClassRow) still tells loadUserTablesFromHeap the relation is a
+	// matview/view; loadViewsFromHeap re-parses the ev_action text to rebuild the
+	// AST. Emitted from this single funnel keeps CREATE and any ALTER ...
+	// RENAME/SET SCHEMA in sync (the caller stamps the old rule first). A real PG
+	// standby replays the heap insert. (matview IsPopulated across a restart is a
+	// documented deferral — the reload defaults matviews to populated; see the
+	// deferral ledger.)
+	if ctx.Pool != nil && tbl.ViewDef != "" && (tbl.IsMatView || tbl.View != nil) {
+		if err := writeViewRewriteRow(ctx, tbl, tbl.ViewDef); err != nil {
+			return fmt.Errorf("pg_rewrite (view/matview): %w", err)
 		}
 	}
 
