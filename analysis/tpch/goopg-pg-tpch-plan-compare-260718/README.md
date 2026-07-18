@@ -194,7 +194,87 @@ Total PostgreSQL wall time for the 22-query stream (warm, single sample):
 
 ---
 
-## 6. Selected plan pairs (full text)
+## 6. Estimated processing-time difference (plan-shape only)
+
+This section estimates, per query, **how much more processing the goopg plan
+would perform than the PostgreSQL plan**, judged **purely from plan shape**.
+
+**Model / assumptions.**
+- Per-operator, per-row unit costs are assumed **equal** across the two engines
+  — i.e., the Go-vs-C constant-factor "implementation difference" is deliberately
+  excluded, as requested. Differences below come only from *what the plan tells
+  the engine to do*: join order, access method (seq/index/bitmap), subquery
+  decorrelation, and parallelism.
+- Two independent components are reported:
+  - **Work volume `V` (処理量 / CPU work)** — total rows processed across the
+    plan, *independent of parallelism*. Driven by join order, access method, and
+    subquery handling.
+  - **Parallelism `P` (wall-clock only)** — PostgreSQL's 2-worker `Gather` plans
+    divide their parallel portion's wall-clock by up to ≈1.8× (Amdahl-limited by
+    the serial Gather/merge/final-aggregate tail); goopg is always serial. This
+    reduces *time* but **not** *work volume*.
+  - **Net wall-clock estimate ≈ V × P** (goopg ÷ PostgreSQL).
+- Cardinalities are grounded in PostgreSQL's `EXPLAIN ANALYZE` actuals
+  ([`raw/pg_explain_analyze.txt`](raw/pg_explain_analyze.txt)). These are
+  **order-of-magnitude** estimates, not measurements — goopg itself was not
+  executed. Reading guide: for **処理量 (CPU work)** look at the `V` column
+  alone; for **処理時間 (wall-clock)** use the net column.
+
+| Q | Work `V` (goopg÷PG) | PG ∥ | Net wall-clock est. (goopg÷PG) | Dominant driver of the difference |
+|---|:--:|:--:|:--:|---|
+| 1  | ≈1.0 | ‖ | **≈1.7–1.9×** | Identical `lineitem` scan+aggregate; entire difference is PG's 2 workers. |
+| 2  | ≈1.0–1.2 | ‖ | ≈1.5–1.8× | Small; both use the min-cost subplan. PG parallelizes the 200 K `part` scan. |
+| 3  | ≈1.5–2.5 | ‖ | **≈3–4×** | goopg hash-joins the full 6 M `lineitem`; PG index-probes `lineitem` only for qualifying orders **and** parallelizes. |
+| 4  | ≈1.0 | ‖ | ≈1.7–1.9× | Same per-order index probe (semi-join ≡ EXISTS filter); difference is parallelism. |
+| 5  | ≈1.0–1.3 | ‖ | ≈1.8–2.2× | Comparable index-join tree; difference mostly parallelism. |
+| 6  | ≈1.0 | ‖ | **≈1.7–1.9×** | Pure `lineitem` scan+aggregate — the cleanest "parallelism-only" case. |
+| 7  | ≈1.0 | ‖ | ≈1.7–2.0× | Comparable join tree; parallelism-driven. |
+| 8  | ≈1.0 | ‖ | ≈1.6–1.9× | Comparable deep index NL; PG parallelizes the `part` scan. |
+| 9  | ≈2–4 | ‖ | **≈4–7×** | goopg full-scans `orders`(1.5 M)+`lineitem`(6 M) in a 4-way hash; PG drives from `part LIKE '%green%'` via indexes + parallel. |
+| 10 | ≈1.3–2 | ‖ | ≈2.5–3.5× | goopg 4-way hash over full tables vs PG parallel hash-join chain. |
+| 11 | ≈2–4 | — | **≈2–4×** | goopg seq-scans 800 K `partsupp`; PG uses the index (~32 K rows via 400 German suppliers). **Neither parallel**, so this is pure work volume. |
+| 12 | ≈3–6 | ‖ | **≈5–10×** | goopg's NL puts `orders`(1.5 M) on the outer and index-probes `lineitem` **1.5 M×**; PG does one parallel hash-join. |
+| 13 | ≈1.0–1.3 | — | **≈1.0–1.3×** | Near-identical (`Hash Left` ≡ `Hash Right` join, twin aggregates); neither parallel → **closest to parity**. |
+| 14 | ≈1.0–1.2 | ‖ | ≈1.8–2.0× | Similar hash/NL; parallelism dominant. |
+| 15a| ≈1.0 | ‖ | ≈1.7–1.9× | View body = `lineitem` scan+group; parallelism only. |
+| 15b| ≈1.0–1.3 | ‖ | ≈1.8–2.2× | Both recompute the grouped revenue for the `max` subquery; parallelism. |
+| 16 | ≈1.2–1.8 | ‖ | ≈2–2.8× | goopg seq-scans `partsupp`; PG uses a parallel index-only scan + hashed NOT-IN subplan. |
+| 17 | ≈3–6 | ‖(sub) | **≈4–8×** | goopg's NL puts `lineitem`(6 M) on the outer and index-probes `part` **6 M×**; PG hash-joins to ~200 parts, subplan run only ~6 K×. |
+| 18 | ≈1.5–2.5 | ‖ | ≈2.5–4× | goopg 4-way hash + a second full `lineitem` scan for the `>313` group; PG parallelizes both. |
+| 19 | ≈10–100 | ‖ | **≈10–100× (worst case)** | goopg drives from `lineitem`(6 M) and index-probes `part` per row; PG drives from the ~516 filtered `part` rows and probes `lineitem` **516×** — a ~10,000× gap in join probes (bounded by goopg's unavoidable 6 M base scan). |
+| 20 | ≈3–10 | ~— | **≈3–10×** | goopg seq-scans 800 K `partsupp` and evaluates the `0.5·sum` subquery per row; PG drives from `part LIKE 'forest%'` (~2 K) via a semi-join. Largely serial on both. |
+| 21 | ≈2–4 | ‖ | **≈3–6×** | goopg 4-way hash over full tables with EXISTS/NOT-EXISTS as per-row filters; PG uses set-oriented semi/anti joins + parallel. |
+| 22 | ≈1.0 | ‖ | ≈1.5–2.0× | Comparable (both probe `orders` per customer); small 150 K `customer` scan; parallelism. |
+
+**Buckets (by net wall-clock estimate).**
+
+- **≈ parity (~1×):** Q13 — nearly identical plans, neither parallel.
+- **Parallelism-bound (~1.7–2×, equal work `V≈1`):** Q1, Q4, Q5, Q6, Q7, Q8,
+  Q14, Q15a, Q15b, Q22, and Q2. Here goopg's *CPU work* (処理量) is essentially
+  equal to PG's; the wall-clock gap is almost entirely PG's 2-worker
+  parallelism. If parallelism is excluded, these are ~1×.
+- **Moderate extra work (~2–4×):** Q3, Q10, Q11, Q16, Q18 — goopg's multi-way
+  hash over full fact tables (vs PG's targeted index access) does more real work,
+  compounded by parallelism.
+- **Large extra work from join-order / non-decorrelation (~4–10×):** Q9, Q12,
+  Q17, Q20, Q21 — goopg drives joins from the large table (`lineitem`/`orders`/
+  `partsupp`) or keeps correlated subqueries as per-row filters.
+- **Severe / order-of-magnitude (≥10×):** Q19 — goopg's join order forces a
+  6 M-row driving side where PG's forces ~516 rows.
+
+**Takeaways.** For roughly half the workload (the aggregate/scan-bound and
+well-indexed star-join queries) the two plans are equivalent in **CPU work**, and
+the expected time gap is essentially PostgreSQL's parallelism (~1.7–1.9×). The
+large gaps are **not** parallelism — they come from two plan-shape properties
+seen in §5: (a) goopg driving a join from the big fact table instead of a small
+filtered dimension (Q3, Q9, Q12, Q17, Q19, Q20), and (b) goopg not decorrelating
+correlated subqueries into set-oriented semi/anti joins (Q17, Q19, Q20, Q21).
+Q19 is the outlier where plan shape alone implies an order-of-magnitude
+difference.
+
+---
+
+## 7. Selected plan pairs (full text)
 
 Full plans for every query are in [`raw/`](raw/). Two representative contrasts:
 
@@ -240,7 +320,7 @@ PostgreSQL (859 ms, 445 rows):
 
 ---
 
-## 7. Reproduction
+## 8. Reproduction
 
 ```bash
 # 1. Worktree off clean HEAD; symlink the read-only oracle + HammerDB.
