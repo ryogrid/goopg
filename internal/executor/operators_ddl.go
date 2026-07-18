@@ -14958,13 +14958,23 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 			if schema == "" {
 				schema = "public"
 			}
-			if imOK && im.DropStatistics(name.Name, schema) {
-				if o.ctx.WAL != nil {
-					if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropStatistics(name.Name, schema)); werr != nil {
-						return fmt.Errorf("wal drop-statistics: %w", werr)
-					}
+			if imOK {
+				// B5 Bstat: capture the OID before the registry drop so the
+				// pg_statistic_ext heap row can be xmax-stamped (the retired
+				// RecordKindDropStatistics(96) replacement). A real PG standby
+				// replays the heap delete.
+				var droppedOID uint32
+				if obj, ok := im.LookupStatistics(schema + "." + name.Name); ok {
+					droppedOID = obj.OID
 				}
-				continue
+				if im.DropStatistics(name.Name, schema) {
+					if droppedOID != 0 && catalogHeapSyncAvailable(o.ctx) {
+						if err := o.ctx.MaterializeWriterXID(); err == nil {
+							stampStatisticExtRows(o.ctx, droppedOID, o.ctx.Tx.XID)
+						}
+					}
+					continue
+				}
 			}
 			if s.IfExists {
 				o.ctx.AddNotice(fmt.Sprintf("statistics object %q does not exist, skipping", name.Name))
@@ -17782,15 +17792,31 @@ func (o *ddlOp) execCreateStatistics(s *parser.CreateStatisticsStmt) error {
 		exprs = append(exprs, defaultExprToSQL(e))
 	}
 	obj := im.RegisterStatisticsFull(schema, s.Name.Name, tableOID, s.Kinds, s.Columns, exprs, s.HasExpr)
-	// DU-002 restart-persistence follow-up (slice 441's own resume point):
-	// CREATE STATISTICS was never WAL-logged, so the object vanished on
-	// restart and ALTER STATISTICS had nothing durable to attach to.
-	if o.ctx.WAL != nil {
-		if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateStatistics(obj.Name, obj.Schema, obj.OID, obj.TableOID, obj.Owner, obj.Kinds, obj.Columns, obj.Exprs, obj.HasExpr)); werr != nil {
-			return fmt.Errorf("wal create-statistics: %w", werr)
+	// B5 Bstat: CREATE STATISTICS journals a real pg_statistic_ext heap row
+	// (base/<dbOid>/3381) instead of the retired RecordKindCreateStatistics(95)
+	// record; the reload (loadStatisticsExtFromHeap) re-registers it. A real PG
+	// standby replays the heap insert.
+	if catalogHeapSyncAvailable(o.ctx) {
+		if err := syncStatisticExtRow(o.ctx, obj); err != nil {
+			return fmt.Errorf("pg_statistic_ext: %w", err)
 		}
 	}
 	return nil
+}
+
+// resyncStatisticExtHeap stamps the old pg_statistic_ext heap row (by OID) and
+// writes the current one, for an ALTER STATISTICS re-sync (RENAME / OWNER / SET
+// SCHEMA / SET STATISTICS). No-op when catalog heap sync is unavailable. The
+// *StatisticsObject pointer is stable across the in-place registry mutation, so
+// callers pass the object they already mutated. B5 Bstat.
+func (o *ddlOp) resyncStatisticExtHeap(obj *catalog.StatisticsObject) error {
+	if obj == nil || !catalogHeapSyncAvailable(o.ctx) {
+		return nil
+	}
+	if err := o.ctx.MaterializeWriterXID(); err == nil {
+		stampStatisticExtRows(o.ctx, obj.OID, o.ctx.Tx.XID)
+	}
+	return syncStatisticExtRow(o.ctx, obj)
 }
 
 // execAlterStatistics applies `ALTER STATISTICS ...` to an extended-statistics
@@ -17821,15 +17847,19 @@ func (o *ddlOp) execAlterStatistics(s *parser.AlterStatisticsStmt) error {
 		}
 		return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("statistics object %q does not exist", s.Name.Name)}
 	}
+	// B5 Bstat: the ALTER mutations below re-sync a real pg_statistic_ext heap
+	// row (stamp old by OID + write new) instead of the retired
+	// RecordKindAlterStatistics{Rename,Owner,SetSchema}(97/98/99) records. The
+	// *StatisticsObject pointer is stable across the in-place mutation, so
+	// capture it once up front (its OID never changes) and re-sync afterward.
+	obj, _ := im.LookupStatistics(name)
 	switch s.Action {
 	case "rename":
 		if !im.RenameStatisticsObject(name, s.NewName) {
 			return notFound()
 		}
-		if o.ctx.WAL != nil {
-			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterStatisticsRename(name, s.NewName)); werr != nil {
-				return fmt.Errorf("wal alter-statistics-rename: %w", werr)
-			}
+		if err := o.resyncStatisticExtHeap(obj); err != nil {
+			return fmt.Errorf("pg_statistic_ext rename: %w", err)
 		}
 		return nil
 	case "owner":
@@ -17844,20 +17874,16 @@ func (o *ddlOp) execAlterStatistics(s *parser.AlterStatisticsStmt) error {
 		if !im.SetStatisticsOwner(name, ownerOID) {
 			return notFound()
 		}
-		if o.ctx.WAL != nil {
-			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterStatisticsOwner(name, ownerOID)); werr != nil {
-				return fmt.Errorf("wal alter-statistics-owner: %w", werr)
-			}
+		if err := o.resyncStatisticExtHeap(obj); err != nil {
+			return fmt.Errorf("pg_statistic_ext owner: %w", err)
 		}
 		return nil
 	case "setschema":
 		if !im.SetStatisticsSchema(name, s.NewSchema) {
 			return notFound()
 		}
-		if o.ctx.WAL != nil {
-			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterStatisticsSetSchema(name, s.NewSchema)); werr != nil {
-				return fmt.Errorf("wal alter-statistics-set-schema: %w", werr)
-			}
+		if err := o.resyncStatisticExtHeap(obj); err != nil {
+			return fmt.Errorf("pg_statistic_ext set schema: %w", err)
 		}
 		return nil
 	}
@@ -17870,6 +17896,9 @@ func (o *ddlOp) execAlterStatistics(s *parser.AlterStatisticsStmt) error {
 		target = &v
 	}
 	im.SetStatisticsTarget(name, target)
+	if err := o.resyncStatisticExtHeap(obj); err != nil {
+		return fmt.Errorf("pg_statistic_ext set statistics: %w", err)
+	}
 	return nil
 }
 

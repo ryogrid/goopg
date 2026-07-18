@@ -261,6 +261,15 @@ func runFailoverGoopgToPG(t *testing.T, repo, pgBasebackupBin, psqlBin string, m
 		t.Fatalf("alter index rename on goopg primary: %v", err)
 	}
 
+	// B5 Bstat: CREATE STATISTICS now journals a real pg_statistic_ext heap row
+	// (base/<dbOid>/3381) instead of the goopg-private RecordKindCreateStatistics(95)
+	// rmid-128 record. A real PG standby must replay the heap insert without FATAL
+	// and end up with the object in pg_statistic_ext.
+	if err := runSQLSimple(t, primary,
+		"CREATE STATISTICS b5bstat_stat (ndistinct) ON client, src FROM public.bench_log"); err != nil {
+		t.Fatalf("create statistics on goopg primary: %v", err)
+	}
+
 	dsn := fmt.Sprintf("host=%s port=%s user=%s dbname=%s sslmode=disable",
 		"127.0.0.1", mustGoopgPort(primary.ListenAddr()), "postgres", "postgres")
 	workCtx, workCancel := context.WithCancel(context.Background())
@@ -444,6 +453,13 @@ func runFailoverGoopgToPG(t *testing.T, repo, pgBasebackupBin, psqlBin string, m
 	if got := pgScalar(t, standby,
 		"SELECT count(*) FROM pg_class WHERE relname = 'b5a_idx'"); got != "0" {
 		t.Fatalf("post-failover old index name b5a_idx still present = %q, want 0 (rename not replayed)", got)
+	}
+	// B5 Bstat: the CREATE STATISTICS replayed to the promoted PG as a pure
+	// pg_statistic_ext heap insert (no rmid-128 record). Its presence in the
+	// standby's pg_statistic_ext proves the heap insert replayed.
+	if got := pgScalar(t, standby,
+		"SELECT count(*) FROM pg_statistic_ext WHERE stxname = 'b5bstat_stat'"); got != "1" {
+		t.Fatalf("post-failover pg_statistic_ext has b5bstat_stat = %q, want 1 (statistics heap insert not replayed)", got)
 	}
 }
 

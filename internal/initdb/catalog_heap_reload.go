@@ -286,6 +286,168 @@ func loadColumnDefaultsFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory
 	return nil
 }
 
+// statExtRegistryRecovery is the catalog-side surface the pg_statistic_ext
+// reload needs. *catalog.InMemory satisfies it.
+type statExtRegistryRecovery interface {
+	RegisterStatisticsDuringRecovery(schema, name string, oid, tableOID, ownerOID uint32, kinds, columns, exprs []string, hasExpr bool)
+	SetStatisticsTarget(name string, target *int) bool
+	LookupTableByOIDAllDBs(oid uint32) (*catalog.Table, uint32, bool)
+	SchemaNameForOID(oid uint32) string
+}
+
+// statCharToKind is the reload inverse of executor.statKindToChar: PG's
+// stxkind chars → goopg's kind strings. 'e' (expressions) is handled via the
+// stxexprs column, not as a goopg kind.
+var statCharToKind = map[byte]string{
+	'd': "ndistinct",
+	'f': "dependencies",
+	'm': "mcv",
+}
+
+// loadStatisticsExtFromHeap is B5 Bstat's pg_statistic_ext reload — the generic
+// heap-scan replacement for the retired replayStatisticsDDLRecords WAL scan
+// (RecordKindCreateStatistics 95 / DropStatistics 96 / AlterStatistics 97-99).
+// Extended-statistics objects now journal as real pg_statistic_ext HEAP rows
+// (base/<dbOid>/3381) written by syncStatisticExtRow; this pass re-registers
+// them into the statisticsObjs registry (the query path). Must run AFTER every
+// loadUserTablesFromHeap pass so each object's owning table (stxrelid) is
+// registered — stxkeys attnums decode back to column names via it.
+func loadStatisticsExtFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+	if cat == nil {
+		return nil
+	}
+	if err := loadStatisticsExtFromHeapForDB(mgr, cat, clog, catalog.DefaultDBOid); err != nil {
+		return err
+	}
+	for _, dbName := range cat.ListDatabases() {
+		dbOid := cat.DatabaseOid(dbName)
+		if dbOid == 0 || dbOid == catalog.DefaultDBOid ||
+			dbOid == catalog.PostgresDBOid || dbOid == cat.DBOID() {
+			continue
+		}
+		if err := loadStatisticsExtFromHeapForDB(mgr, cat, clog, dbOid); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// loadStatisticsExtFromHeapForDB scans base/<heapDBOid>/3381 and re-registers
+// each live pg_statistic_ext row. A missing/empty heap is a no-op.
+func loadStatisticsExtFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog, heapDBOid uint32) error {
+	var reg statExtRegistryRecovery = cat
+	type stxRow struct {
+		oid, relid, nsOID, owner uint32
+		name                     string
+		attnums                  []int16
+		target                   *int
+		kindChars                []byte
+		exprs                    []string
+	}
+	rel := storage.RelFileNode{DBOid: heapDBOid, RelOid: 3381, Fork: storage.MainFork}
+	cols := executor.PGStatisticExtColumnsPG18()
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_statistic_ext",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			decoded := make(executor.Row, len(cols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, cols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			r := stxRow{
+				oid:   uint32(decoded[0].Int),
+				relid: uint32(decoded[1].Int),
+				name:  decoded[2].StringValue(),
+				nsOID: uint32(decoded[3].Int),
+				owner: uint32(decoded[4].Int),
+			}
+			r.attnums = parsePGVectorInt16Payload([]byte(decoded[5].StringValue()))
+			if !decoded[6].IsNull() {
+				v := int(int16(decoded[6].Int))
+				if v >= 0 {
+					r.target = &v
+				}
+			}
+			r.kindChars = parsePGCharArrayPayload([]byte(decoded[7].StringValue()))
+			if lit := decoded[8].StringValue(); lit != "" {
+				r.exprs = executor.ParseTextArrayLiteral(lit)
+			}
+			return r, false, nil
+		})
+	if err != nil {
+		return err
+	}
+	for _, raw := range rows {
+		r := raw.(stxRow)
+		if r.oid == 0 || r.name == "" {
+			continue
+		}
+		schema := reg.SchemaNameForOID(r.nsOID)
+		if schema == "" {
+			schema = "public"
+		}
+		// stxkeys attnums → simple-column names, via the owning table.
+		var columns []string
+		if tbl, _, ok := reg.LookupTableByOIDAllDBs(r.relid); ok && tbl != nil {
+			for _, an := range r.attnums {
+				for i := range tbl.Columns {
+					if tbl.Columns[i].Ordinal+1 == int(an) {
+						columns = append(columns, tbl.Columns[i].Name)
+						break
+					}
+				}
+			}
+		}
+		// stxkind chars → goopg kind strings ('e' is not a goopg kind).
+		var kinds []string
+		for _, ch := range r.kindChars {
+			if k, ok := statCharToKind[ch]; ok {
+				kinds = append(kinds, k)
+			}
+		}
+		hasExpr := len(r.exprs) > 0
+		reg.RegisterStatisticsDuringRecovery(schema, r.name, r.oid, r.relid, r.owner, kinds, columns, r.exprs, hasExpr)
+		if r.target != nil {
+			qName := schema + "." + r.name
+			reg.SetStatisticsTarget(qName, r.target)
+		}
+	}
+	return nil
+}
+
+// parsePGVectorInt16Payload decodes the ArrayType body (post-varlena-header, as
+// returned by the tuple decoder's varlena default arm) of an int2vector written
+// by executor.pgInt2VectorBytes back to its int16 elements. Body layout:
+// ndim(4) dataoffset(4) elemtype(4) dim(4) lbound(4) elem(2)... ; ndim==0 (the
+// empty ArrayType) yields no elements.
+func parsePGVectorInt16Payload(b []byte) []int16 {
+	if len(b) < 12 || binary.LittleEndian.Uint32(b[0:4]) == 0 || len(b) < 20 {
+		return nil
+	}
+	count := int(binary.LittleEndian.Uint32(b[12:16]))
+	out := make([]int16, 0, count)
+	for i, off := 0, 20; i < count && off+2 <= len(b); i, off = i+1, off+2 {
+		out = append(out, int16(binary.LittleEndian.Uint16(b[off:off+2])))
+	}
+	return out
+}
+
+// parsePGCharArrayPayload decodes the ArrayType body of a char[] written by
+// executor.pgCharArrayBytes back to its 1-byte elements. Same header as
+// parsePGVectorInt16Payload but 1-byte contiguous elements.
+func parsePGCharArrayPayload(b []byte) []byte {
+	if len(b) < 12 || binary.LittleEndian.Uint32(b[0:4]) == 0 || len(b) < 20 {
+		return nil
+	}
+	count := int(binary.LittleEndian.Uint32(b[12:16]))
+	if 20+count > len(b) {
+		count = len(b) - 20
+	}
+	if count <= 0 {
+		return nil
+	}
+	return append([]byte(nil), b[20:20+count]...)
+}
+
 // reloadUserTablespacesFromHeap is B4.1e's pg_tablespace reload — the generic
 // heap-scan replacement for the retired replayTablespaceDDLRecords scanner
 // (RecordKinds 124/125). pg_tablespace is a SHARED catalog (global/1213), so

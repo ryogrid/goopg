@@ -2011,16 +2011,20 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, fmt.Errorf("goopg: pg_am reload: %w", err)
 	}
 
-	// DU-002 restart-persistence follow-up (slice 441's own resume point):
-	// restore CREATE/DROP STATISTICS (extended-statistics) objects from the
-	// WAL. Runs after loadUserTablesFromHeap (above) so a restored object's
-	// recorded TableOID lines up with the table it was defined on, though the
-	// catalog stores the OID verbatim rather than re-resolving it.
-	if err := replayStatisticsDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+	// B5 Bstat: restore extended-statistics objects from the pg_statistic_ext
+	// HEAP rows (base/<dbOid>/3381) written by syncStatisticExtRow, replacing
+	// the retired goopg-private RecordKindCreateStatistics(95)/DropStatistics(96)/
+	// AlterStatistics{Rename,Owner,SetSchema}(97/98/99) WAL scan
+	// (replayStatisticsDDLRecords). Runs as a STANDALONE UNCONDITIONAL pass (not
+	// inside loadUserTablesFromHeap, which the M0114 catalog cache bypasses)
+	// AFTER every table-load pass so each object's owning table is registered
+	// (stxkeys attnums decode back to column names via it). A real PG standby
+	// replays the heap inserts (no rmid-128).
+	if err := loadStatisticsExtFromHeap(mgr, cat, clog); err != nil {
 		_ = pool.Close()
 		_ = walWriter.Close()
 		_ = mgr.Close()
-		return nil, fmt.Errorf("goopg: statistics DDL replay: %w", err)
+		return nil, fmt.Errorf("goopg: pg_statistic_ext reload: %w", err)
 	}
 
 	// DU-002 restart-persistence follow-up (M0110-0001, DU-002 slice 429

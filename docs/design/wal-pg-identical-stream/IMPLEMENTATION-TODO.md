@@ -637,8 +637,13 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
     `syncTableToCatalogHeap`; reloaded by a STANDALONE UNCONDITIONAL `loadColumnDefaultsFromHeap` pass (not the
     cache-bypassed loadUserTablesFromHeap, and keyed on NamespaceDBOid not cat.DBOID()). Retired kind 69 +
     deleted column_defaults_recovery.go. Standby-validated + TestPort_SerialSequenceSurvivesRestart (was RED).
-  - [ ] **Bstat** (statistics 95-99, pg_statistic_ext) — heap-back stxkeys (attnum list, no node tree common
-    case); canonical expression-statistics (stxexprs node tree) is a separable track.
+  - [x] **Bstat** (statistics 95-99, pg_statistic_ext) — LANDED. CREATE/DROP/ALTER STATISTICS journal real
+    pg_statistic_ext HEAP rows (base/<dbOid>/3381, PG physical column order): stxkeys int2vector attnums,
+    stxstattarget int2, stxkind char[], stxexprs as a text[] literal of the deparsed exprs (node-tree track
+    separable). Reload `loadStatisticsExtFromHeap` decodes them (stxkeys→column names via the owning table,
+    stxkind→kind strings). Fixed a latent nondeterminism in `SchemaNameForOID` (pg_toast shares public's OID
+    2200 → random reverse pick) surfaced by the round-trip test. Standby-validated (E2E CREATE STATISTICS +
+    base/1→base/5 mirror). Retired kinds 95-99 + deleted statistics_ddl{,_recovery}.go.
   - [ ] **Slice C** (view/matview 102/103 → pg_rewrite) — narrow rmid-128 removal (runtime pg_rewrite writer,
     text ev_action, relhasrules=false); full canonical fidelity blocked on the absent node-tree serializer.
   - [ ] **delete-rmgr**: remove RmgrGoopgCatalog + the default arm in rmgr_map.go/recovery.go + IsGoopgNativeRecord's

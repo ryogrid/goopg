@@ -12238,12 +12238,24 @@ func (c *InMemory) SchemaNameForOID(oid uint32) string {
 	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	// pg_toast shares public's OID (2200) in this simplified model (see
+	// NewInMemory's schemas map), so a bare map scan would pick "public" or
+	// "pg_toast" nondeterministically for that OID — a latent bug for every
+	// reverse-lookup caller (heap-reload schema resolution, pg_get_*def). User
+	// objects are never in pg_toast, so prefer any non-pg_toast name and fall
+	// back to pg_toast only when it is the sole match.
+	var toastFallback string
 	for name, o := range c.schemas {
-		if o == oid {
-			return name
+		if o != oid {
+			continue
 		}
+		if name == "pg_toast" {
+			toastFallback = name
+			continue
+		}
+		return name
 	}
-	return ""
+	return toastFallback
 }
 
 // SchemaHeapTID is a pg_namespace heap-row locator (block, line pointer) —
