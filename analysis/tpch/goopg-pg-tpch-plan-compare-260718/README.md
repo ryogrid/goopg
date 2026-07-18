@@ -274,7 +274,91 @@ difference.
 
 ---
 
-## 7. Selected plan pairs (full text)
+## 7. Reference: measured goopg SF1 runtimes and the actual goopg ÷ PG ratio
+
+§6 estimated the difference from **plan shape only** (implementation-neutral).
+This section adds **actually measured** goopg execution times from the most
+recent all-pass SF1 record in the repository, and computes the real
+goopg ÷ PostgreSQL time ratio against the PG SF1 numbers measured in this study
+(§4).
+
+**Source (goopg, reference values).**
+[`analysis/tests-overview-260706/04-performance-baselines.md`](../../tests-overview-260706/04-performance-baselines.md)
+§B — "the newest full 22/22-pass power-test record": run log
+`run_goopg_20260526-135117.log`, goopg commit `26cf58d`
+(branch `align-data-structure-with-pg`), **HammerDB TPC-H, SF=1**
+(lineitem ≈ 6.0 M — the same scale as this study's PG run), 2026-05-26,
+**FINISHED SUCCESS, all 22 queries, zero errors**, total 1469 s, geomean 36.3 s.
+
+**Caveats (read before using the ratios).**
+- **Same scale, clean ratio:** goopg here is SF1 (lineitem ≈ 6.0 M), matching the
+  PG SF1 run, so goopg ÷ PG is a like-for-like *scale* comparison.
+- **Different goopg build:** these times are from commit `26cf58d` (2026-05-26),
+  **not** the `701a5f57` build whose plans are shown in §4–§6. They also
+  **predate mid-June query optimizations** — the later SF≈0.5 run
+  ([`analysis/tpch-sf0.5-query-timings-20260616.md`](../../tpch-sf0.5-query-timings-20260616.md))
+  shows some queries dropped sharply by then (e.g. Q22 ~85 s → 1.7 s, Q7 ~123 s →
+  62 s even at half scale), so the SF1 ratios for **Q4, Q7, Q22** in particular
+  likely **overstate** current goopg. Treat as the newest *all-pass SF1 record*,
+  not as current HEAD.
+- **Actual measured = implementation-inclusive:** unlike §6, these numbers
+  include goopg's real per-operator cost (single-threaded Go executor, non-PGO
+  `go` build, HammerDB single-VU client timing incl. round-trips) versus PG's
+  parallel release build. That is exactly why these ratios are far larger than
+  §6's plan-shape-only estimates.
+- **Q15** is approximate: goopg's HammerDB Q15 slot (36.7 s) bundles
+  `CREATE VIEW` + body + main + `DROP`; the PG figure (2.677 s) is view-body +
+  main only.
+
+| Q | goopg SF1 (s) | PG SF1 (s) | goopg ÷ PG |
+|---|---:|---:|---:|
+| Q1  | 20.036 | 1.749 | **11×** |
+| Q2  | 59.078 | 0.256 | **231×** |
+| Q3  | 16.789 | 0.364 | 46× |
+| Q4  | 217.190 | 0.188 | **1156×** |
+| Q5  | 18.603 | 0.340 | 55× |
+| Q6  | 13.116 | 0.341 | 38× |
+| Q7  | 122.899 | 0.429 | **286×** |
+| Q8  | 171.430 | 0.205 | **837×** |
+| Q9  | 56.059 | 0.907 | 62× |
+| Q10 | 18.524 | 0.670 | 28× |
+| Q11 | 2.409 | 0.084 | 29× |
+| Q12 | 100.535 | 0.897 | 112× |
+| Q13 | 84.864 | 1.511 | 56× |
+| Q14 | 20.728 | 0.260 | 80× |
+| Q15 | 36.701 *(slot)* | 2.677 *(body+main)* | ~14× |
+| Q16 | 2.904 | 0.397 | **7×** |
+| Q17 | 45.209 | 1.503 | 30× |
+| Q18 | 36.773 | 3.739 | **10×** |
+| Q19 | 24.503 | 0.059 | **414×** |
+| Q20 | 19.451 | 0.209 | 93× |
+| Q21 | 295.057 | 0.859 | **344×** |
+| Q22 | 84.918 | 0.058 | **1452×** |
+| **Total** | **≈1468** | **≈17.7** | **≈83×** |
+
+**Interpretation.**
+
+- **Whole workload:** goopg's 22-query stream takes ≈ 1468 s vs PG's ≈ 17.7 s at
+  SF1 — an **≈83× overall** wall-clock gap on this hardware.
+- **The ratio is largest where PG is sub-second** (efficient parallel + decorrelated
+  plan) while goopg's plan degrades: **Q4 (1156×), Q22 (1452×), Q8 (837×),
+  Q19 (414×), Q21 (344×), Q7 (286×), Q2 (231×)** — every one of these is a
+  correlated-subquery query and/or one where goopg drives the join from the large
+  fact table (the exact plan-shape gaps identified in §5/§6).
+- **The ratio is smallest where PG itself does heavy work** (large result sets):
+  **Q16 (7×), Q18 (10×), Q1 (11×), Q15 (~14×)** — here PG's own runtime is not
+  tiny, so the relative gap compresses.
+- **Relation to §6:** the plan-shape estimate (§6) correctly ranks the *worst*
+  offenders (Q4, Q9, Q17, Q19, Q20, Q21) but massively under-predicts the
+  *magnitude*, because it excludes implementation cost by design. Even a plan-shape
+  near-tie like Q6 (pure scan+aggregate) is ≈38× in practice — that residual is
+  goopg's per-row execution overhead plus PG's parallelism, i.e. precisely the
+  "implementation difference" §6 sets aside. The two sections are complementary:
+  §6 = *what the plan shape alone would cost*; §7 = *what was actually measured*.
+
+---
+
+## 8. Selected plan pairs (full text)
 
 Full plans for every query are in [`raw/`](raw/). Two representative contrasts:
 
@@ -320,7 +404,7 @@ PostgreSQL (859 ms, 445 rows):
 
 ---
 
-## 8. Reproduction
+## 9. Reproduction
 
 ```bash
 # 1. Worktree off clean HEAD; symlink the read-only oracle + HammerDB.
