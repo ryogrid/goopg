@@ -666,6 +666,16 @@ rmid-128 usages are the vestigial classifier fallback + legacy-WAL no-op (no liv
 - [ ] **B-gate**: per-catalog full regress + `internal/testport` isolation; `psql \d`/`\df`/`\dn` +
   `information_schema` parity vs PG 18.3; crash-after-DDL recovery via generic reload; re-init data dir.
 
+## Post-B5 content-fidelity + durability ([02e](02e-content-fidelity-and-durability.md))
+
+- [x] **02e item A** — matview `IsPopulated` across restart via `pg_class.relispopulated` (d8ae99a6).
+- [x] **02e item B** — `ALTER VIEW/TABLE RENAME` pg_class relname re-sync (reuse the RENAME COLUMN arm).
+- [ ] **02e item C** — canonical `pg_node_tree` subsystem (`internal/pgnodes`): resolver + outfuncs + readfuncs +
+  binary datum encoding, so a PG standby can evaluate/query user defaults/stats/views (`relhasrules=true`).
+  Phased S0 (OID indexes from existing seed) → S1 (scalar out/read/datum) → S2 (defaults/stats + standby-eval)
+  → S3 (single-table views + relhasrules flip + standby-query) → S4 (coverage + oracle byte-diff). Graceful
+  degradation mandatory; adversarial standby-eval gates.
+
 ---
 
 ## Log (A9 — checkpoint-opcode landed; A9 COMPLETE, Part A record work done)

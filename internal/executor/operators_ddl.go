@@ -8082,6 +8082,27 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					}}
 				}
 			}
+			// 02e item B: persist the new relname to the pg_class heap. Without
+			// this, a renamed table/view/matview/sequence reverts to its old name
+			// across a restart (loadUserTablesFromHeap reads the stale pg_class
+			// row). RenameTable above already mutated tbl.Name, so re-running the
+			// delete-old-by-OID + write-new pattern (the same arm RENAME COLUMN
+			// uses) rewrites pg_class/pg_attribute/pg_attrdef/pg_rewrite with the
+			// new name; the OID is stable so the pg_rewrite ev_class is unchanged.
+			// The base/1->base/5 mirror is automatic inside syncTableToCatalogHeap.
+			// Orthogonal to the sequence block above (which handles pg_sequence,
+			// not touched by deleteCatalogRowsForOID).
+			if catalogHeapSyncAvailable(o.ctx) {
+				if err := o.ctx.MaterializeWriterXID(); err == nil {
+					xmax := o.ctx.Tx.XID
+					for _, dbOid := range tableCatalogDBOids(o.ctx) {
+						deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
+					}
+				}
+				if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
+					return fmt.Errorf("DDL catalog sync (rename): %w", syncErr)
+				}
+			}
 		case parser.AlterTableRenameColumn:
 			oldColName := act.OldColumnName
 			newColName := act.NewName
