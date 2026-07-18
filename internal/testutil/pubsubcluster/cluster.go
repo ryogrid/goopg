@@ -200,11 +200,16 @@ func newPeer(t *testing.T, peerName, baseDir string, kind ClusterKind, opts Opti
 	dataDir := filepath.Join(baseDir, peerName)
 	switch kind {
 	case ClusterKindGoopg:
+		// Logical-replication peers are on the durability allowlist
+		// (ci/design/test-gate-speedups/02 §4): keep synced init and
+		// runtime fsync; never init from the shared template.
 		c, err := cluster.New(peerName, cluster.Options{
 			RepoRoot:     opts.RepoRoot,
 			DataDir:      dataDir,
 			StartupWait:  opts.StartupWait,
 			ShutdownWait: opts.ShutdownWait,
+			SyncInit:     true,
+			SyncRuntime:  true,
 		})
 		if err != nil {
 			return nil, err

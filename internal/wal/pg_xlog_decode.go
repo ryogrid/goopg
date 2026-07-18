@@ -65,6 +65,10 @@ const (
 	// (doc 04 §3.1) to map SmgrCreate onto RM_SMGR_ID.
 	xlogSmgrCreate uint8 = 0x10
 
+	// RM_TBLSPC_ID info codes (commands/tablespace.h). B4.1d.
+	xlogTblspcCreate uint8 = 0x00 // XLOG_TBLSPC_CREATE
+	xlogTblspcDrop   uint8 = 0x10 // XLOG_TBLSPC_DROP
+
 	// XLOG_FPI (pg_control.h:79), RM_XLOG_ID's full-page-image opcode.
 	// Used by recordKindToRmgrInfo (doc 04 §3.1) to map PageImage.
 	xlogXLogFPI uint8 = 0xB0
@@ -92,6 +96,14 @@ const (
 	sizeOfXLogHeapHeaderData          = 5
 
 	pgDefaultTableSpaceOID uint32 = 1663
+	// pgGlobalTableSpaceOID is GLOBALTABLESPACE_OID: the tablespace of the
+	// cluster-wide SHARED catalogs (pg_database, pg_authid, pg_tablespace,
+	// pg_shdepend, …), whose files live under global/. goopg encodes these
+	// with the DBOid==0 sentinel (sharedOrPerDBRelDir → "global"); on the WAL
+	// wire a shared relation's RelFileLocator carries spcOid=1664/dbOid=0 so a
+	// real PostgreSQL standby routes the replayed block to its own global/.
+	// B4.1a.
+	pgGlobalTableSpaceOID uint32 = 1664
 )
 
 // XLogBlockRef is one block reference carried inside a decoded
@@ -341,11 +353,15 @@ func decodeXLogBlockRefHeader(src []byte, lastRel storage.RelFileNode, haveRel b
 			return xlogBlockMeta{}, 0, storage.RelFileNode{}, false, fmt.Errorf("%w: truncated relfilelocator", ErrCorruptRecord)
 		}
 		spcOID := binary.LittleEndian.Uint32(src[off : off+4])
-		if spcOID != 0 && spcOID != pgDefaultTableSpaceOID {
+		if spcOID != 0 && spcOID != pgDefaultTableSpaceOID && spcOID != pgGlobalTableSpaceOID {
 			return xlogBlockMeta{}, 0, storage.RelFileNode{}, false, fmt.Errorf(
 				"wal: unsupported PostgreSQL tablespace OID %d locator=%x fork_flags=0x%02x data_len=%d",
 				spcOID, src[off:off+sizeOfRelFileLocator], forkFlags, meta.dataLen)
 		}
+		// spcOID is dropped: the shared-vs-per-DB routing is carried by dbOid
+		// (0 → global/, via sharedOrPerDBRelDir). A shared catalog's locator is
+		// spcOid=1664/dbOid=0; TblOid stays 0 so relDir resolves to global/.
+		// B4.1a.
 		meta.ref.Rel = storage.RelFileNode{
 			DBOid:  binary.LittleEndian.Uint32(src[off+4 : off+8]),
 			RelOid: binary.LittleEndian.Uint32(src[off+8 : off+12]),

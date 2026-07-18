@@ -20,7 +20,7 @@ import (
 // goroutine would constitute an invariant violation.
 func TestBackendGoroutineDoesNotFsync(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "data")
-	if err := Init(Options{DataDir: dir}); err != nil {
+	if err := Init(Options{DataDir: dir, NoSync: true}); err != nil {
 		t.Fatal(err)
 	}
 	rt, err := Open(OpenOptions{DataDir: dir, PoolSlots: 64})
@@ -86,7 +86,7 @@ func TestBackendGoroutineDoesNotFsync(t *testing.T) {
 // This is the happy-path companion to TestBackendGoroutineDoesNotFsync.
 func TestCheckpointerFlushAllIsAllowed(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "data")
-	if err := Init(Options{DataDir: dir}); err != nil {
+	if err := Init(Options{DataDir: dir, NoSync: true}); err != nil {
 		t.Fatal(err)
 	}
 	rt, err := Open(OpenOptions{DataDir: dir, PoolSlots: 64})

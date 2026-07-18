@@ -20,7 +20,7 @@ import (
 // ...), its own reserved slot, so both background workers coexist.
 func TestOpenRegistersDistinctWalWriterAndCheckpointerSlots(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "data")
-	if err := Init(Options{DataDir: dir}); err != nil {
+	if err := Init(Options{DataDir: dir, NoSync: true}); err != nil {
 		t.Fatal(err)
 	}
 	rt, err := Open(OpenOptions{DataDir: dir, PoolSlots: 64})
@@ -61,7 +61,7 @@ func TestOpenRegistersDistinctWalWriterAndCheckpointerSlots(t *testing.T) {
 // all (M0122-0003 writeback simplification 3).
 func TestOpenRegistersBgwriterBackgroundSlotWhenEnabled(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "data")
-	if err := Init(Options{DataDir: dir}); err != nil {
+	if err := Init(Options{DataDir: dir, NoSync: true}); err != nil {
 		t.Fatal(err)
 	}
 	rt, err := Open(OpenOptions{
@@ -99,7 +99,7 @@ func TestOpenRegistersBgwriterBackgroundSlotWhenEnabled(t *testing.T) {
 // what CheckpointerConfig's OnLoopStart does inside the real Run() loop.
 func TestCheckpointerWritebackUsesActivityRegistryClock(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "data")
-	if err := Init(Options{DataDir: dir}); err != nil {
+	if err := Init(Options{DataDir: dir, NoSync: true}); err != nil {
 		t.Fatal(err)
 	}
 	rt, err := Open(OpenOptions{DataDir: dir, PoolSlots: 64, TrackIOTiming: true})
@@ -130,7 +130,7 @@ func TestCheckpointerWritebackUsesActivityRegistryClock(t *testing.T) {
 // TestCheckpointerWritebackUsesActivityRegistryClock's bgwriter analogue.
 func TestBgwriterWritebackUsesActivityRegistryClock(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "data")
-	if err := Init(Options{DataDir: dir}); err != nil {
+	if err := Init(Options{DataDir: dir, NoSync: true}); err != nil {
 		t.Fatal(err)
 	}
 	rt, err := Open(OpenOptions{

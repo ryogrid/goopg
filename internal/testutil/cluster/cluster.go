@@ -47,6 +47,20 @@ type Options struct {
 	// "--data-checksums"). Empty by default, so a plain cluster inits exactly
 	// as before.
 	InitArgs []string
+	// SyncInit forces the durability fsync pass of `goopg init` (i.e. does
+	// NOT pass --no-sync). Default false: test clusters are throwaway, so
+	// init skips the recursive fsync, matching upstream pg_regress /
+	// PostgreSQL::Test::Cluster behavior. Set true in crash-recovery /
+	// restart-durability tests that assert on-disk state across a kill
+	// (durability allowlist: ci/design/test-gate-speedups/02 §4).
+	SyncInit bool
+	// SyncRuntime keeps the server's runtime durability syncs on (i.e. does
+	// NOT append `fsync = off` to postgresql.conf). Default false: throwaway
+	// test servers run with fsync=off, matching upstream
+	// PostgreSQL::Test::Cluster (Cluster.pm writes `fsync = off` into every
+	// test instance). Set true together with SyncInit in the durability
+	// allowlist families.
+	SyncRuntime bool
 }
 
 // Cluster is a single goopg test instance (multi-cluster orchestration is
@@ -65,6 +79,8 @@ type Cluster struct {
 	shutdownWait time.Duration
 	logPath      string
 	initArgs     []string
+	syncInit     bool
+	syncRuntime  bool
 
 	mu  sync.Mutex
 	cmd *exec.Cmd
@@ -137,6 +153,8 @@ func New(name string, opts Options) (*Cluster, error) {
 		shutdownWait: shutdown,
 		logPath:      filepath.Join(dataDir, "cluster.log"),
 		initArgs:     opts.InitArgs,
+		syncInit:     opts.SyncInit,
+		syncRuntime:  opts.SyncRuntime,
 	}, nil
 }
 
@@ -145,9 +163,42 @@ func (c *Cluster) DataDir() string    { return c.dataDir }
 func (c *Cluster) ListenAddr() string { return c.listenAddr }
 func (c *Cluster) LogPath() string    { return c.logPath }
 
-// Init runs `goopg init -D <dir>` (plus any configured InitArgs).
+// Init prepares the cluster's data directory: `goopg init -D <dir>` (plus any
+// configured InitArgs). Unless SyncInit is set, init runs with --no-sync (the
+// data dir is throwaway; upstream pg_regress/Cluster.pm do the same), and
+// unless SyncRuntime is set, `fsync = off` is appended to the generated
+// postgresql.conf (Cluster.pm:685's move). Durability-asserting tests set
+// both (ci/design/test-gate-speedups/02 §4).
 func (c *Cluster) Init() error {
-	args := append([]string{"init", "-D", c.dataDir}, c.initArgs...)
+	if err := c.initDataDir(); err != nil {
+		return err
+	}
+	if !c.syncRuntime {
+		if err := c.AppendPostgresqlConf("fsync = off"); err != nil {
+			return fmt.Errorf("append fsync=off: %w", err)
+		}
+	}
+	return nil
+}
+
+// initDataDir materializes the data directory: normally a re-identified copy
+// of the per-process init template (template.go); a direct `goopg init` run
+// when SyncInit is set (durability tests must exercise the real init path),
+// when the argument set is refused by the cache, or when the template path
+// fails for any reason (a cache problem must never fail a test).
+func (c *Cluster) initDataDir() error {
+	if !c.syncInit {
+		if ok, err := c.initFromTemplate(); ok {
+			return nil
+		} else if err != nil {
+			fmt.Fprintf(os.Stderr, "cluster %s: init template unusable (%v); falling back to direct init\n", c.name, err)
+		}
+	}
+	args := []string{"init", "-D", c.dataDir}
+	if !c.syncInit {
+		args = append(args, "--no-sync")
+	}
+	args = append(args, c.initArgs...)
 	res, err := c.runGoopg(args...)
 	if err != nil {
 		return err

@@ -12,7 +12,7 @@ import (
 // This is the sole catalog recovery path — no JSON is written or read.
 func TestCreateTableSurvivesRestartViaCatalogHeap(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "data")
-	if err := Init(Options{DataDir: dir}); err != nil {
+	if err := Init(Options{DataDir: dir, NoSync: true}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -55,7 +55,7 @@ func TestCreateTableSurvivesRestartViaCatalogHeap(t *testing.T) {
 // via DDL-sync are all recovered from heap on restart.
 func TestMultipleTablesLoadFromHeap(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "data")
-	if err := Init(Options{DataDir: dir}); err != nil {
+	if err := Init(Options{DataDir: dir, NoSync: true}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -96,7 +96,7 @@ func TestMultipleTablesLoadFromHeap(t *testing.T) {
 // TestHeapLoadIdempotent verifies that opening twice doesn't corrupt the catalog.
 func TestHeapLoadIdempotent(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "data")
-	if err := Init(Options{DataDir: dir}); err != nil {
+	if err := Init(Options{DataDir: dir, NoSync: true}); err != nil {
 		t.Fatal(err)
 	}
 

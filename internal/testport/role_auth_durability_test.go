@@ -40,6 +40,8 @@ func TestPort_CreateRoleSurvivesRestart(t *testing.T) {
 		DataDir:      dataDir,
 		StartupWait:  20 * time.Second,
 		ShutdownWait: 20 * time.Second,
+		SyncInit:     true,
+		SyncRuntime:  true,
 	})
 	if err != nil {
 		t.Fatal(err)

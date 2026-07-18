@@ -2365,6 +2365,23 @@ type InMemory struct {
 	// B2.2 slice 3's upsert cache (shell fill-in / COMMUTATOR-NEGATOR
 	// back-patch = canonical heap UPDATE at the cached TID).
 	operatorHeapTIDs map[uint32]SchemaHeapTID
+	// collationHeapTIDs / conversionHeapTIDs are the pg_collation /
+	// pg_conversion twins (B2.2 slice 4) — ALTER RENAME/OWNER/SET SCHEMA
+	// journal as canonical heap UPDATEs at the cached TID.
+	collationHeapTIDs  map[uint32]SchemaHeapTID
+	conversionHeapTIDs map[uint32]SchemaHeapTID
+	// eventTriggerHeapTIDs is the pg_event_trigger twin (B3.2) — ALTER
+	// RENAME/ENABLE/OWNER journal as canonical heap UPDATEs at the cached TID.
+	eventTriggerHeapTIDs map[uint32]SchemaHeapTID
+	// publicationHeapTIDs is the pg_publication twin (B3.3) — ALTER OWNER
+	// journals a canonical heap UPDATE at the cached TID.
+	publicationHeapTIDs map[uint32]SchemaHeapTID
+	// tsDictHeapTIDs is the pg_ts_dict twin (B3.5) — ALTER RENAME/SET SCHEMA/
+	// ALTER OPTIONS journal canonical heap UPDATEs at the cached TID.
+	tsDictHeapTIDs map[uint32]SchemaHeapTID
+	// tsConfigHeapTIDs is the pg_ts_config twin (B3.6) — ALTER RENAME/SET
+	// SCHEMA journal canonical heap UPDATEs of the base row at the cached TID.
+	tsConfigHeapTIDs map[uint32]SchemaHeapTID
 
 	// tempNamespaces maps a session's temp-owner token ("s<id>", see
 	// executor.sessionTempOwner) → the OID of that session's temporary
@@ -3322,6 +3339,29 @@ type TSTokenType struct {
 // DefaultParserTokenTypes is the fixed 23-row token-type table for the
 // built-in "default" parser (BuiltinTSParserOID["default"] = 3722). Verified
 // byte-for-byte against `SELECT * FROM ts_token_type(3722)` on real PG 18.3.
+// TSTokenTypeID returns the maptokentype int for a token-type alias, or
+// (0,false) if unknown. B3.6: pg_ts_config_map.maptokentype is the numeric
+// token type; UserTSConfig stores the alias.
+func TSTokenTypeID(alias string) (int, bool) {
+	for _, tt := range DefaultParserTokenTypes {
+		if strings.EqualFold(tt.Alias, alias) {
+			return tt.TokID, true
+		}
+	}
+	return 0, false
+}
+
+// TSTokenTypeAlias reverses TSTokenTypeID (maptokentype int → alias) for the
+// pg_ts_config_map reload. "" if unknown.
+func TSTokenTypeAlias(tokID int) string {
+	for _, tt := range DefaultParserTokenTypes {
+		if tt.TokID == tokID {
+			return tt.Alias
+		}
+	}
+	return ""
+}
+
 var DefaultParserTokenTypes = []TSTokenType{
 	{1, "asciiword", "Word, all ASCII"},
 	{2, "word", "Word, all letters"},
@@ -12237,6 +12277,158 @@ func (c *InMemory) DropOperatorHeapTID(oid uint32) {
 	delete(c.operatorHeapTIDs, oid)
 }
 
+// CollationHeapTID returns the live pg_collation heap TID for oid (B2.2
+// slice 4).
+func (c *InMemory) CollationHeapTID(oid uint32) (SchemaHeapTID, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	tid, ok := c.collationHeapTIDs[oid]
+	return tid, ok
+}
+
+// SetCollationHeapTID records/refreshes the live pg_collation heap TID.
+func (c *InMemory) SetCollationHeapTID(oid uint32, tid SchemaHeapTID) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.collationHeapTIDs == nil {
+		c.collationHeapTIDs = make(map[uint32]SchemaHeapTID)
+	}
+	c.collationHeapTIDs[oid] = tid
+}
+
+// DropCollationHeapTID drops the TID entry (DROP COLLATION).
+func (c *InMemory) DropCollationHeapTID(oid uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.collationHeapTIDs, oid)
+}
+
+// ConversionHeapTID returns the live pg_conversion heap TID for oid (B2.2
+// slice 4).
+func (c *InMemory) ConversionHeapTID(oid uint32) (SchemaHeapTID, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	tid, ok := c.conversionHeapTIDs[oid]
+	return tid, ok
+}
+
+// SetConversionHeapTID records/refreshes the live pg_conversion heap TID.
+func (c *InMemory) SetConversionHeapTID(oid uint32, tid SchemaHeapTID) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.conversionHeapTIDs == nil {
+		c.conversionHeapTIDs = make(map[uint32]SchemaHeapTID)
+	}
+	c.conversionHeapTIDs[oid] = tid
+}
+
+// DropConversionHeapTID drops the TID entry (DROP CONVERSION).
+func (c *InMemory) DropConversionHeapTID(oid uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.conversionHeapTIDs, oid)
+}
+
+// EventTriggerHeapTID returns the live pg_event_trigger heap TID (B3.2).
+func (c *InMemory) EventTriggerHeapTID(oid uint32) (SchemaHeapTID, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	tid, ok := c.eventTriggerHeapTIDs[oid]
+	return tid, ok
+}
+
+// SetEventTriggerHeapTID records/refreshes the live pg_event_trigger heap TID.
+func (c *InMemory) SetEventTriggerHeapTID(oid uint32, tid SchemaHeapTID) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.eventTriggerHeapTIDs == nil {
+		c.eventTriggerHeapTIDs = make(map[uint32]SchemaHeapTID)
+	}
+	c.eventTriggerHeapTIDs[oid] = tid
+}
+
+// DropEventTriggerHeapTID drops the TID entry (DROP EVENT TRIGGER).
+func (c *InMemory) DropEventTriggerHeapTID(oid uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.eventTriggerHeapTIDs, oid)
+}
+
+// PublicationHeapTID returns the live pg_publication heap TID (B3.3).
+func (c *InMemory) PublicationHeapTID(oid uint32) (SchemaHeapTID, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	tid, ok := c.publicationHeapTIDs[oid]
+	return tid, ok
+}
+
+// SetPublicationHeapTID records/refreshes the live pg_publication heap TID.
+func (c *InMemory) SetPublicationHeapTID(oid uint32, tid SchemaHeapTID) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.publicationHeapTIDs == nil {
+		c.publicationHeapTIDs = make(map[uint32]SchemaHeapTID)
+	}
+	c.publicationHeapTIDs[oid] = tid
+}
+
+// DropPublicationHeapTID drops the TID entry (DROP PUBLICATION).
+func (c *InMemory) DropPublicationHeapTID(oid uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.publicationHeapTIDs, oid)
+}
+
+// TSDictHeapTID returns the live pg_ts_dict heap TID (B3.5).
+func (c *InMemory) TSDictHeapTID(oid uint32) (SchemaHeapTID, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	tid, ok := c.tsDictHeapTIDs[oid]
+	return tid, ok
+}
+
+// SetTSDictHeapTID records/refreshes the live pg_ts_dict heap TID.
+func (c *InMemory) SetTSDictHeapTID(oid uint32, tid SchemaHeapTID) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.tsDictHeapTIDs == nil {
+		c.tsDictHeapTIDs = make(map[uint32]SchemaHeapTID)
+	}
+	c.tsDictHeapTIDs[oid] = tid
+}
+
+// DropTSDictHeapTID drops the TID entry (DROP TEXT SEARCH DICTIONARY).
+func (c *InMemory) DropTSDictHeapTID(oid uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.tsDictHeapTIDs, oid)
+}
+
+// TSConfigHeapTID returns the live pg_ts_config base-row heap TID (B3.6).
+func (c *InMemory) TSConfigHeapTID(oid uint32) (SchemaHeapTID, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	tid, ok := c.tsConfigHeapTIDs[oid]
+	return tid, ok
+}
+
+// SetTSConfigHeapTID records/refreshes the live pg_ts_config base-row TID.
+func (c *InMemory) SetTSConfigHeapTID(oid uint32, tid SchemaHeapTID) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.tsConfigHeapTIDs == nil {
+		c.tsConfigHeapTIDs = make(map[uint32]SchemaHeapTID)
+	}
+	c.tsConfigHeapTIDs[oid] = tid
+}
+
+// DropTSConfigHeapTID drops the TID entry (DROP TEXT SEARCH CONFIGURATION).
+func (c *InMemory) DropTSConfigHeapTID(oid uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.tsConfigHeapTIDs, oid)
+}
+
 // SetSchemaHeapTID records/refreshes the live pg_namespace heap TID for name.
 func (c *InMemory) SetSchemaHeapTID(name string, tid SchemaHeapTID) {
 	c.mu.Lock()
@@ -12573,6 +12765,25 @@ func (c *InMemory) CreateCollation(uc *UserCollation, schema string, ifNotExists
 // collations are never registered in userCollations, so a DROP COLLATION on
 // one of them always returns false (mirrors PG, which also refuses to drop a
 // pinned pg_collation row). M0119-0004.
+// FindCollation returns the registered user collation matching
+// (dbOid, schema, name), or nil — the B2.2 slice 4 emit sites look the
+// struct up after a registry mutation to journal its CURRENT state.
+func (c *InMemory) FindCollation(name, schema string, dbOid ...uint32) *UserCollation {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	oid := resolveDBOid(dbOid)
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	for _, uc := range c.userCollations {
+		if uc.DBOid == oid && uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, name) {
+			return uc
+		}
+	}
+	return nil
+}
+
 func (c *InMemory) DropCollation(name, schema string, dbOid ...uint32) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -12688,11 +12899,14 @@ func (c *InMemory) CreateCollationDuringRecovery(uc *UserCollation, schema strin
 		nsOID = c.schemas["public"]
 	}
 	uc.NamespaceOID = nsOID
-	// WAL replay does not yet carry a dbOid for collation records (see the
-	// DBOid field's doc comment) — every replayed collation lands under
-	// DefaultDBOid, matching every other not-yet-migrated write path's
-	// restart behavior.
-	uc.DBOid = DefaultDBOid
+	// B2.2 slice 4: respect a caller-set DBOid; the zero fallback is
+	// DefaultDBOid — which is ALSO what live postgres-DB sessions key on
+	// (NamespaceDBOid maps PostgresDBOid→DefaultDBOid for namespace-scoped
+	// registries), so the heap reload leaves DBOid unset. Cross-database
+	// collations remain non-dbOid-aware (pre-existing ledger row).
+	if uc.DBOid == 0 {
+		uc.DBOid = DefaultDBOid
+	}
 	for i, existing := range c.userCollations {
 		if existing.OID == uc.OID {
 			c.userCollations[i] = uc
@@ -12778,6 +12992,24 @@ func (c *InMemory) CreateConversion(uc *UserConversion, schema string, dbOid ...
 // `schema` resolves like CreateConversion (unknown → public). dbOid is variadic,
 // defaulting to DefaultDBOid, mirroring DropCollation. DU-002 slice 399; dbOid
 // scoping: M0122-0007 4e follow-up.
+// FindConversion returns the registered user conversion matching
+// (dbOid, schema, name), or nil (FindCollation's twin).
+func (c *InMemory) FindConversion(name, schema string, dbOid ...uint32) *UserConversion {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	oid := resolveDBOid(dbOid)
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	for _, uc := range c.userConversions {
+		if uc.DBOid == oid && uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, name) {
+			return uc
+		}
+	}
+	return nil
+}
+
 func (c *InMemory) DropConversion(name, schema string, dbOid ...uint32) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -12811,11 +13043,12 @@ func (c *InMemory) CreateConversionDuringRecovery(uc *UserConversion, schema str
 		nsOID = c.schemas["public"]
 	}
 	uc.NamespaceOID = nsOID
-	// WAL replay does not yet carry a dbOid for conversion records (see the
-	// DBOid field's doc comment) — every replayed conversion lands under
-	// DefaultDBOid, matching every other not-yet-migrated write path's
-	// restart behavior (mirrors CreateCollationDuringRecovery).
-	uc.DBOid = DefaultDBOid
+	// B2.2 slice 4: respect a caller-set DBOid; zero falls back to
+	// DefaultDBOid — what live postgres-DB sessions key on (see
+	// CreateCollationDuringRecovery).
+	if uc.DBOid == 0 {
+		uc.DBOid = DefaultDBOid
+	}
 	for i, existing := range c.userConversions {
 		if existing.OID == uc.OID {
 			c.userConversions[i] = uc
@@ -13063,6 +13296,24 @@ func (c *InMemory) CreateTSDict(ud *UserTSDict, schema string) (uint32, error) {
 // bare name in the given schema from the registry. Returns true if one was
 // found and removed. `schema` resolves like CreateTSDict (unknown → public).
 // DU-002 slice 437.
+// FindTSDict returns the user TS dictionary matching (schema, name), or nil.
+// B3.5: the emit sites capture the OID after a registry mutation to journal
+// the pg_ts_dict heap row.
+func (c *InMemory) FindTSDict(name, schema string) *UserTSDict {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	for _, ud := range c.userTSDicts {
+		if ud.NamespaceOID == nsOID && strings.EqualFold(ud.Name, name) {
+			return ud
+		}
+	}
+	return nil
+}
+
 func (c *InMemory) DropTSDict(name, schema string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -13462,6 +13713,24 @@ func (c *InMemory) CreateTSConfig(uc *UserTSConfig, schema string) (uint32, erro
 // given bare name in the given schema from the registry. Returns true if one
 // was found and removed. `schema` resolves like CreateTSConfig (unknown →
 // public). DU-002 slice 446.
+// FindTSConfig returns the user TS configuration matching (schema, name), or
+// nil. B3.6: the emit sites journal the config's CURRENT state after a
+// registry mutation (base row + config_map rows re-derived from Mappings).
+func (c *InMemory) FindTSConfig(name, schema string) *UserTSConfig {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	for _, uc := range c.userTSConfigs {
+		if uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, name) {
+			return uc
+		}
+	}
+	return nil
+}
+
 func (c *InMemory) DropTSConfig(name, schema string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -14664,9 +14933,10 @@ func (c *InMemory) DropTablespace(name string) (uint32, bool) {
 }
 
 // RegisterTablespaceDuringRecovery re-registers a tablespace with its
-// original OID/owner/location, replayed from a RecordKindCreateTablespace WAL
-// record (M0122-0007 tablespace-registry restart-durability follow-up).
-// Mirrors RegisterSchemaDuringRecovery.
+// original OID (owner/location are unused strings — the pg_tablespace virtual
+// view hardcodes spcowner=10). Called by B4.1e's reloadUserTablespacesFromHeap
+// from the pg_tablespace SHARED heap (global/1213). Mirrors
+// RegisterSchemaDuringRecovery.
 func (c *InMemory) RegisterTablespaceDuringRecovery(name, owner, location string, oid uint32) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -14682,9 +14952,10 @@ func (c *InMemory) RegisterTablespaceDuringRecovery(name, owner, location string
 	}
 }
 
-// UnregisterTablespaceDuringRecovery removes a tablespace from the registry,
-// replayed from a RecordKindDropTablespace WAL record. Counterpart to
-// RegisterTablespaceDuringRecovery; mirrors UnregisterSchemaDuringRecovery.
+// UnregisterTablespaceDuringRecovery removes a tablespace from the registry.
+// Counterpart to RegisterTablespaceDuringRecovery; retained for symmetry (the
+// B4.1e heap reload skips xmax-stamped rows, so DROP needs no explicit
+// unregister). Mirrors UnregisterSchemaDuringRecovery.
 func (c *InMemory) UnregisterTablespaceDuringRecovery(name string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -16340,6 +16611,37 @@ func (c *InMemory) ForeignDataWrapperOID(name string) uint32 {
 	return 0
 }
 
+// LookupForeignDataWrapperByOID returns the FDW registry entry with this OID,
+// or nil. B3.4: the pg_foreign_server reload reverses srvfdw (an OID column)
+// back to the FdwName the registry stores.
+func (c *InMemory) LookupForeignDataWrapperByOID(oid uint32) *ForeignDataWrapper {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, f := range c.fdws {
+		if f.OID == oid {
+			return f
+		}
+	}
+	return nil
+}
+
+// RegisterForeignDataWrapperDuringRecovery re-registers an FDW from the
+// pg_foreign_data_wrapper heap reload with its recovered OID (B3.4 — the FDW
+// gained restart durability with this slice; it had none before). Idempotent.
+func (c *InMemory) RegisterForeignDataWrapperDuringRecovery(fdw *ForeignDataWrapper) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.fdws == nil {
+		c.fdws = make(map[string]*ForeignDataWrapper)
+	}
+	out := *fdw
+	out.Options = append([]string(nil), fdw.Options...)
+	c.fdws[fdw.Name] = &out
+	if fdw.OID >= c.nextOID {
+		c.nextOID = fdw.OID + 1
+	}
+}
+
 // LookupForeignDataWrapper returns the named FDW's registry entry, or
 // (nil, false) if no such FDW is registered. Unlike RegisterForeignDataWrapper
 // (which creates-or-fetches), this is a read-only lookup — used by
@@ -16395,6 +16697,18 @@ func (c *InMemory) RegisterAccessMethod(name, amType string, handlerOID uint32, 
 // DropAccessMethod removes a user-defined access method from the registry.
 // Returns true if found. The trailing variadic dbOid mirrors
 // RegisterAccessMethod. DU-002 (M0119-0004).
+// FindAccessMethod returns the (dbOid, name) access-method registry entry,
+// or nil. B3.7: DROP ACCESS METHOD captures the OID before the registry drop
+// to stamp its pg_am heap row.
+func (c *InMemory) FindAccessMethod(name string, dbOid ...uint32) *AccessMethod {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.accessMethods == nil {
+		return nil
+	}
+	return c.accessMethods[accessMethodKey(resolveDBOid(dbOid), name)]
+}
+
 func (c *InMemory) DropAccessMethod(name string, dbOid ...uint32) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -17132,6 +17446,30 @@ type ForeignServer struct {
 // (internal/executor/operators_sequence.go) so a same-named server in two
 // distinct databases no longer collides (last-writer-wins) the way the
 // pre-4e-follow-up-36 bare-name key did. M0122-0007 4e follow-up 36.
+// LookupForeignServer returns the (dbOid, name) server registry entry, or
+// (nil, false). B3.4: CREATE USER MAPPING resolves umserver to the server's
+// OID.
+func (c *InMemory) LookupForeignServer(name string, dbOid ...uint32) (*ForeignServer, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	srv, ok := c.foreignServers[foreignServerKey(resolveDBOid(dbOid), name)]
+	return srv, ok
+}
+
+// LookupForeignServerByOID returns the server registry entry with this OID
+// (across all databases), or nil. B3.4: the pg_user_mapping reload reverses
+// umserver (an OID column) to the SrvName the registry stores.
+func (c *InMemory) LookupForeignServerByOID(oid uint32) *ForeignServer {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, srv := range c.foreignServers {
+		if srv.OID == oid {
+			return srv
+		}
+	}
+	return nil
+}
+
 func foreignServerKey(dbOid uint32, name string) string {
 	return strconv.FormatUint(uint64(dbOid), 10) + ":" + name
 }
@@ -17537,6 +17875,18 @@ func (c *InMemory) TransformExists(typeName, lang string) bool {
 
 // DropTransform removes a user-defined transform from the registry. Returns
 // true if one was found and removed. DU-002 (M0119-0004).
+// LookupTransform returns the registered transform for (type, lang), or
+// nil. B3.1: the DROP TRANSFORM emit site captures the OID before the
+// registry drop so it can stamp the pg_transform heap row.
+func (c *InMemory) LookupTransform(typeName, lang string) *Transform {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.transforms == nil {
+		return nil
+	}
+	return c.transforms[strings.ToLower(typeName)+"\x00"+strings.ToLower(lang)]
+}
+
 func (c *InMemory) DropTransform(typeName, lang string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -18045,6 +18395,21 @@ func (c *InMemory) ListUserOperatorFamilies() []*UserOperatorFamily {
 // its identity (schema, name, method). Used by CREATE OPERATOR CLASS to
 // resolve an explicit `FAMILY family_name` clause. The trailing variadic
 // dbOid mirrors RegisterUserOperatorFamily. DU-002 (M0119-0004).
+// LookupUserOperatorFamilyByOID returns the registered family with this OID,
+// or nil. B2.2 slice 5: the pg_amproc reload re-derives AmProcMember.Method
+// (a goopg-only field — pg_amproc has no amprocmethod column) from the
+// member's owning family.
+func (c *InMemory) LookupUserOperatorFamilyByOID(oid uint32) *UserOperatorFamily {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, f := range c.userOperatorFamilies {
+		if f.OID == oid {
+			return f
+		}
+	}
+	return nil
+}
+
 func (c *InMemory) LookupUserOperatorFamily(schema, name string, method uint32, dbOid ...uint32) (*UserOperatorFamily, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -19054,6 +19419,19 @@ func (c *InMemory) RegisterUserMapping(user, server string, options []string, db
 // DropUserMapping removes a user mapping from dbOid's registry (variadic,
 // defaults to DefaultDBOid). Returns true if found. DU-002 slice 377; dbOid
 // scoping: M0122-0007 4e follow-up 37.
+// LookupUserMapping returns the (dbOid, user, server) mapping registry
+// entry, or (nil, false). B3.4: DROP USER MAPPING captures the OID before the
+// registry drop to stamp its pg_user_mapping heap row.
+func (c *InMemory) LookupUserMapping(user, server string, dbOid ...uint32) (*UserMapping, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.userMappings == nil {
+		return nil, false
+	}
+	um, ok := c.userMappings[userMappingKey(resolveDBOid(dbOid), user, server)]
+	return um, ok
+}
+
 func (c *InMemory) DropUserMapping(user, server string, dbOid ...uint32) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()

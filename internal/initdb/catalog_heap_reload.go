@@ -198,6 +198,94 @@ func reloadUserSchemasFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog
 	return nil
 }
 
+// reloadUserTablespacesFromHeap is B4.1e's pg_tablespace reload — the generic
+// heap-scan replacement for the retired replayTablespaceDDLRecords scanner
+// (RecordKinds 124/125). pg_tablespace is a SHARED catalog (global/1213), so
+// the scan targets DBOid=0. Live rows with oid >= FirstUserOID are the user
+// in-place tablespaces; the two bootstrap rows (pg_default/pg_global) are
+// surfaced separately by catalog.tablespaceVirtualRows and skipped by the OID
+// filter. The registry's owner/location fields are never read (the virtual
+// view hardcodes spcowner=10), so they are re-registered empty. Dropped
+// tablespaces carry xmax and the liveness filter skips them.
+func reloadUserTablespacesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+	type tsRow struct {
+		oid  uint32
+		name string
+	}
+	rel := storage.RelFileNode{DBOid: 0, RelOid: 1213, Fork: storage.MainFork}
+	cols := executor.PGTablespaceColumnsPG18()
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_tablespace",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			decoded := make(executor.Row, len(cols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, cols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			return tsRow{oid: uint32(decoded[0].Int), name: decoded[1].StringValue()}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+	for _, r := range rows {
+		ts := r.(tsRow)
+		if ts.oid < catalog.FirstUserOID || ts.name == "" {
+			continue
+		}
+		cat.RegisterTablespaceDuringRecovery(ts.name, "", "", ts.oid)
+	}
+	return nil
+}
+
+// reloadDbRoleSettingsFromHeap is B4.2's pg_db_role_setting reload — the
+// generic heap-scan replacement for the retired replayDatabaseConfigRecords +
+// replayRoleConfigRecords scanners (RecordKinds 73-78). pg_db_role_setting is
+// SHARED (global/2964). Each live row's setconfig text[] is split back into
+// "name=value" entries and re-applied to the dbRoleSettings/roleSettings
+// registries via the idempotent SetDatabaseConfig (setrole==0) / SetRoleConfig
+// (setrole!=0). Dropped rows (RESET ALL) carry xmax and are skipped by the
+// liveness filter.
+func reloadDbRoleSettingsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+	type cfgRow struct {
+		setDatabase uint32
+		setRole     uint32
+		entries     []string
+	}
+	rel := storage.RelFileNode{DBOid: 0, RelOid: 2964, Fork: storage.MainFork}
+	cols := executor.PGDbRoleSettingColumnsPG18()
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_db_role_setting",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			decoded := make(executor.Row, len(cols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, cols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			return cfgRow{
+				setDatabase: uint32(decoded[0].Int),
+				setRole:     uint32(decoded[1].Int),
+				entries:     executor.ParseTextArrayLiteral(decoded[2].StringValue()),
+			}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+	for _, r := range rows {
+		c := r.(cfgRow)
+		for _, entry := range c.entries {
+			eq := strings.IndexByte(entry, '=')
+			if eq < 0 {
+				continue
+			}
+			name, value := entry[:eq], entry[eq+1:]
+			if c.setRole == 0 {
+				cat.SetDatabaseConfig(c.setDatabase, name, value)
+			} else {
+				cat.SetRoleConfig(c.setRole, c.setDatabase, name, value)
+			}
+		}
+	}
+	return nil
+}
+
 // reloadUserRoutinesFromHeap is B1.2's pg_proc reload — the generic
 // heap-scan replacement for the retired replayFunctionDDLRecords scanner
 // (RecordKinds 61-64/121-123). Live rows with oid >= FirstUserOID carry the
@@ -989,4 +1077,875 @@ func reloadTypeNameForOID(cat *catalog.InMemory, oid uint32) string {
 		return et.Name
 	}
 	return ""
+}
+
+// reloadUserCollationsFromHeap is B2.2 slice 4's collation reload — the
+// generic heap-scan replacement for the retired replayCollationDDLRecords
+// scanner (RecordKinds 42-45/93). Fully physical: FormData_pg_collation maps
+// 1:1 onto UserCollation (NULL text columns ↔ "" registry fields). Each
+// collation registers under DefaultDBOid — NamespaceDBOid maps postgres-DB
+// sessions to DefaultDBOid for namespace-scoped registries, so that IS what
+// live lookups key on (unlike the domain/enum registries, which key on the
+// resolved session DB; verified empirically — registering under cat.DBOID()
+// made every post-restart lookup miss). Cross-database collations remain
+// non-dbOid-aware (pre-existing ledger row).
+func reloadUserCollationsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+	collCols := executor.PGCollationColumnsPG18()
+	type collRow struct {
+		uc  catalog.UserCollation
+		tid storage.ItemPointer
+	}
+	rel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 3456, Fork: storage.MainFork}
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_collation",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			decoded := make(executor.Row, len(collCols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, collCols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			if uint32(decoded[0].Int) < catalog.FirstUserOID {
+				return nil, false, errSkipBuiltinRow
+			}
+			provider := byte('c')
+			if p := decoded[4].StringValue(); p != "" {
+				provider = p[0]
+			}
+			return collRow{
+				uc: catalog.UserCollation{
+					OID:           uint32(decoded[0].Int),
+					Name:          decoded[1].StringValue(),
+					NamespaceOID:  uint32(decoded[2].Int),
+					Owner:         uint32(decoded[3].Int),
+					Provider:      provider,
+					Deterministic: decoded[5].BoolValue(),
+					Encoding:      int(int32(decoded[6].Int)),
+					Collate:       decoded[7].StringValue(),
+					Ctype:         decoded[8].StringValue(),
+					Locale:        decoded[9].StringValue(),
+					Rules:         decoded[10].StringValue(),
+				},
+				tid: tid,
+			}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+	for _, raw := range rows {
+		cr := raw.(collRow)
+		schema := cat.SchemaNameForOID(cr.uc.NamespaceOID)
+		if schema == "" {
+			schema = "public"
+		}
+		cat.CreateCollationDuringRecovery(&cr.uc, schema)
+		cat.SetCollationHeapTID(cr.uc.OID, catalog.SchemaHeapTID{Block: uint32(cr.tid.Block), Offset: cr.tid.Offset})
+	}
+	return nil
+}
+
+// reloadUserConversionsFromHeap is the pg_conversion twin (RecordKinds
+// 40/41/130-132 retired). conproc stays an OID in the registry; the
+// dump-facing ProcSchema/ProcName fallback re-derives from it via the
+// routines registry (user funcs) or the curated builtin set — "" when
+// neither resolves (the virtual view then renders from FuncOID, which is
+// the authoritative source anyway).
+func reloadUserConversionsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+	convCols := executor.PGConversionColumnsPG18()
+	type convRow struct {
+		uc  catalog.UserConversion
+		tid storage.ItemPointer
+	}
+	rel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 2607, Fork: storage.MainFork}
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_conversion",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			decoded := make(executor.Row, len(convCols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, convCols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			if uint32(decoded[0].Int) < catalog.FirstUserOID {
+				return nil, false, errSkipBuiltinRow
+			}
+			return convRow{
+				uc: catalog.UserConversion{
+					OID:          uint32(decoded[0].Int),
+					Name:         decoded[1].StringValue(),
+					NamespaceOID: uint32(decoded[2].Int),
+					Owner:        uint32(decoded[3].Int),
+					ForEncoding:  int32(decoded[4].Int),
+					ToEncoding:   int32(decoded[5].Int),
+					FuncOID:      uint32(decoded[6].Int),
+					Default:      decoded[7].BoolValue(),
+				},
+				tid: tid,
+			}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+	rs := cat.Routines()
+	for _, raw := range rows {
+		cr := raw.(convRow)
+		if cr.uc.FuncOID != 0 {
+			if rs != nil {
+				if r := rs.LookupByOID(cr.uc.FuncOID); r != nil {
+					cr.uc.ProcSchema, cr.uc.ProcName = r.Schema, r.Name
+				}
+			}
+			if cr.uc.ProcName == "" {
+				if bp, ok := catalog.LookupBuiltinProcByOID(cr.uc.FuncOID); ok {
+					cr.uc.ProcSchema, cr.uc.ProcName = "pg_catalog", bp.Name
+				}
+			}
+		}
+		schema := cat.SchemaNameForOID(cr.uc.NamespaceOID)
+		if schema == "" {
+			schema = "public"
+		}
+		cat.CreateConversionDuringRecovery(&cr.uc, schema)
+		cat.SetConversionHeapTID(cr.uc.OID, catalog.SchemaHeapTID{Block: uint32(cr.tid.Block), Offset: cr.tid.Offset})
+	}
+	return nil
+}
+
+// reloadOpClassFamilyFromHeap is B2.2 slice 5's operator-class/family
+// reload — the generic heap-scan replacement for the retired
+// replayOperatorClassDDLRecords scanner (RecordKinds 85-92). It rebuilds all
+// four registries from their heaps in dependency order: pg_opfamily →
+// pg_opclass (needs its family) → pg_amop / pg_amproc (need nothing; every
+// link is an OID).
+//
+// The member structs' ClassOID has no pg_amop/pg_amproc column — PG records
+// that attribution as an INTERNAL pg_depend row on the opclass
+// (opclasscmds.c storeOperators), and goopg now journals the same row, so
+// this reload re-derives ClassOID from pg_depend. A member with no such row
+// is an ALTER OPERATOR FAMILY ADD member, whose zero ClassOID is correct
+// (PG gives those an AUTO dependency on the family instead).
+//
+// Registries key on DefaultDBOid for postgres-DB sessions (NamespaceDBOid),
+// so the reload leaves DBOid unset and the *DuringRecovery zero-fallback
+// supplies it — the B2.2d rule.
+func reloadOpClassFamilyFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+	if err := reloadOpFamiliesFromHeap(mgr, cat, clog); err != nil {
+		return err
+	}
+	if err := reloadOpClassesFromHeap(mgr, cat, clog); err != nil {
+		return err
+	}
+	classByMember, err := scanAmMemberClassDepends(mgr, cat, clog)
+	if err != nil {
+		return err
+	}
+	if err := reloadAmOpMembersFromHeap(mgr, cat, clog, classByMember); err != nil {
+		return err
+	}
+	return reloadAmProcMembersFromHeap(mgr, cat, clog, classByMember)
+}
+
+func reloadOpFamiliesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+	cols := executor.PGOpfamilyColumnsPG18()
+	rel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 2753, Fork: storage.MainFork}
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_opfamily",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			decoded := make(executor.Row, len(cols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, cols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			if uint32(decoded[0].Int) < catalog.FirstUserOID {
+				return nil, false, errSkipBuiltinRow
+			}
+			return catalog.UserOperatorFamily{
+				OID:          uint32(decoded[0].Int),
+				Method:       uint32(decoded[1].Int),
+				Name:         decoded[2].StringValue(),
+				NamespaceOID: uint32(decoded[3].Int),
+				Owner:        uint32(decoded[4].Int),
+			}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+	for _, raw := range rows {
+		fam := raw.(catalog.UserOperatorFamily)
+		schema := cat.SchemaNameForOID(fam.NamespaceOID)
+		if schema == "" {
+			schema = "public"
+		}
+		cat.RegisterUserOperatorFamilyDuringRecovery(&fam, schema)
+	}
+	return nil
+}
+
+func reloadOpClassesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+	cols := executor.PGOpclassColumnsPG18()
+	rel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 2616, Fork: storage.MainFork}
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_opclass",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			decoded := make(executor.Row, len(cols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, cols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			if uint32(decoded[0].Int) < catalog.FirstUserOID {
+				return nil, false, errSkipBuiltinRow
+			}
+			return catalog.UserOperatorClass{
+				OID:          uint32(decoded[0].Int),
+				Method:       uint32(decoded[1].Int),
+				Name:         decoded[2].StringValue(),
+				NamespaceOID: uint32(decoded[3].Int),
+				Owner:        uint32(decoded[4].Int),
+				FamilyOID:    uint32(decoded[5].Int),
+				InTypeOID:    uint32(decoded[6].Int),
+				IsDefault:    decoded[7].BoolValue(),
+				KeyTypeOID:   uint32(decoded[8].Int),
+			}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+	for _, raw := range rows {
+		oc := raw.(catalog.UserOperatorClass)
+		schema := cat.SchemaNameForOID(oc.NamespaceOID)
+		if schema == "" {
+			schema = "public"
+		}
+		cat.RegisterUserOperatorClassDuringRecovery(&oc, schema)
+	}
+	return nil
+}
+
+// scanAmMemberClassDepends returns (member classid, member oid) → owning
+// opclass OID, read from the INTERNAL pg_depend rows the member writers
+// journal (see executor.writeAmMemberClassDependRow).
+func scanAmMemberClassDepends(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) (map[[2]uint32]uint32, error) {
+	cols := executor.PGDependColumnsPG18()
+	rel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 2608, Fork: storage.MainFork}
+	type dep struct {
+		classID, objID, refObjID uint32
+	}
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_depend(opclass members)",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			decoded := make(executor.Row, len(cols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, cols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			classID := uint32(decoded[0].Int)
+			if (classID != 2602 && classID != 2603) ||
+				uint32(decoded[3].Int) != 2616 || decoded[6].StringValue() != "i" {
+				return nil, false, errSkipBuiltinRow // not an opclass-member attribution row
+			}
+			return dep{classID: classID, objID: uint32(decoded[1].Int), refObjID: uint32(decoded[4].Int)}, false, nil
+		})
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[[2]uint32]uint32, len(rows))
+	for _, raw := range rows {
+		d := raw.(dep)
+		out[[2]uint32{d.classID, d.objID}] = d.refObjID
+	}
+	return out, nil
+}
+
+func reloadAmOpMembersFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog, classByMember map[[2]uint32]uint32) error {
+	cols := executor.PGAmopColumnsPG18()
+	rel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 2602, Fork: storage.MainFork}
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_amop",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			decoded := make(executor.Row, len(cols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, cols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			if uint32(decoded[0].Int) < catalog.FirstUserOID {
+				return nil, false, errSkipBuiltinRow
+			}
+			return catalog.AmOpMember{
+				OID:           uint32(decoded[0].Int),
+				FamilyOID:     uint32(decoded[1].Int),
+				LeftType:      uint32(decoded[2].Int),
+				RightType:     uint32(decoded[3].Int),
+				Strategy:      uint32(decoded[4].Int),
+				OperOID:       uint32(decoded[6].Int),
+				Method:        uint32(decoded[7].Int),
+				SortFamilyOID: uint32(decoded[8].Int),
+			}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+	for _, raw := range rows {
+		m := raw.(catalog.AmOpMember)
+		m.ClassOID = classByMember[[2]uint32{2602, m.OID}]
+		cat.RegisterAmOpMemberDuringRecovery(&m)
+	}
+	return nil
+}
+
+func reloadAmProcMembersFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog, classByMember map[[2]uint32]uint32) error {
+	cols := executor.PGAmprocColumnsPG18()
+	rel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 2603, Fork: storage.MainFork}
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_amproc",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			decoded := make(executor.Row, len(cols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, cols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			if uint32(decoded[0].Int) < catalog.FirstUserOID {
+				return nil, false, errSkipBuiltinRow
+			}
+			return catalog.AmProcMember{
+				OID:       uint32(decoded[0].Int),
+				FamilyOID: uint32(decoded[1].Int),
+				LeftType:  uint32(decoded[2].Int),
+				RightType: uint32(decoded[3].Int),
+				ProcNum:   uint32(decoded[4].Int),
+				ProcOID:   uint32(decoded[5].Int),
+			}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+	// pg_amproc has no amprocmethod column (unlike pg_amop's amopmethod) —
+	// AmProcMember.Method (goopg's own field, feeding
+	// amForcesSoftFunctionDependency) re-derives from the owning family.
+	for _, raw := range rows {
+		m := raw.(catalog.AmProcMember)
+		m.ClassOID = classByMember[[2]uint32{2603, m.OID}]
+		if fam := cat.LookupUserOperatorFamilyByOID(m.FamilyOID); fam != nil {
+			m.Method = fam.Method
+		}
+		cat.RegisterAmProcMemberDuringRecovery(&m)
+	}
+	return nil
+}
+
+// reloadUserTransformsFromHeap is B3.1's transform reload — the generic
+// heap-scan replacement for the retired replayTransformDDLRecords scanner
+// (RecordKinds 36/37). Fully physical: the five pg_transform columns are all
+// OIDs, and the registry's two name fields reverse from trftype/trflang
+// (the cast-reload type-name pattern; the language name comes from the same
+// four-way builtin map LanguageNameToOID renders forward).
+func reloadUserTransformsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+	cols := executor.PGTransformColumnsPG18()
+	type trfRow struct {
+		oid, typeOID, langOID, fromFn, toFn uint32
+	}
+	rel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 3576, Fork: storage.MainFork}
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_transform",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			decoded := make(executor.Row, len(cols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, cols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			if uint32(decoded[0].Int) < catalog.FirstUserOID {
+				return nil, false, errSkipBuiltinRow
+			}
+			return trfRow{
+				oid:     uint32(decoded[0].Int),
+				typeOID: uint32(decoded[1].Int),
+				langOID: uint32(decoded[2].Int),
+				fromFn:  uint32(decoded[3].Int),
+				toFn:    uint32(decoded[4].Int),
+			}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+	for _, raw := range rows {
+		tr := raw.(trfRow)
+		typeName := reloadTypeNameForOID(cat, tr.typeOID)
+		lang := languageNameForOID(tr.langOID)
+		if typeName == "" || lang == "" {
+			continue // endpoint type or language gone — dead transform
+		}
+		cat.RegisterTransformDuringRecovery(typeName, lang, tr.oid, tr.fromFn, tr.toFn)
+	}
+	return nil
+}
+
+// languageNameForOID reverses catalog.LanguageNameToOID (the four languages
+// goopg models). "" when the OID is not one of them.
+func languageNameForOID(oid uint32) string {
+	for _, name := range []string{"internal", "c", "sql", "plpgsql"} {
+		if catalog.LanguageNameToOID(name) == oid {
+			return name
+		}
+	}
+	return ""
+}
+
+// reloadUserEventTriggersFromHeap is B3.2's event-trigger reload — the
+// generic heap-scan replacement for the retired replayEventTriggerDDLRecords
+// scanner (RecordKinds 56-60). Six scalar columns map 1:1 onto EventTrigger;
+// the evttags text[] column decodes to the canonical "{a,b}" text, which
+// ParseTextArrayLiteral splits back to the registry's Tags slice (NULL → nil,
+// no WHEN TAG filter). Seeds the TID cache so a post-restart ALTER updates
+// the row in place.
+func reloadUserEventTriggersFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+	cols := executor.PGEventTriggerColumnsPG18()
+	type etRow struct {
+		et  catalog.EventTrigger
+		tid storage.ItemPointer
+	}
+	rel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 3466, Fork: storage.MainFork}
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_event_trigger",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			decoded := make(executor.Row, len(cols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, cols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			if uint32(decoded[0].Int) < catalog.FirstUserOID {
+				return nil, false, errSkipBuiltinRow
+			}
+			var tags []string
+			if lit := decoded[6].StringValue(); lit != "" && lit != "{}" {
+				tags = executor.ParseTextArrayLiteral(lit)
+			}
+			return etRow{
+				et: catalog.EventTrigger{
+					OID:     uint32(decoded[0].Int),
+					Name:    decoded[1].StringValue(),
+					Event:   decoded[2].StringValue(),
+					Owner:   uint32(decoded[3].Int),
+					FuncOID: uint32(decoded[4].Int),
+					Enabled: decoded[5].StringValue(),
+					Tags:    tags,
+				},
+				tid: tid,
+			}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+	for _, raw := range rows {
+		er := raw.(etRow)
+		cat.RegisterEventTriggerDuringRecovery(&er.et)
+		cat.SetEventTriggerHeapTID(er.et.OID, catalog.SchemaHeapTID{Block: uint32(er.tid.Block), Offset: er.tid.Offset})
+	}
+	return nil
+}
+
+// reloadUserPublicationsFromHeap is B3.3's publication reload — the generic
+// heap-scan replacement for the pg_publication half of the retired
+// replayPubSubDDLRecords scanner (kinds 50-52; subscription kinds 53-55 stay
+// bespoke, pg_subscription being a SHARED catalog for B4). It scans
+// pg_publication for base rows and pg_publication_rel for FOR TABLE members
+// (prrelid → the qualified table name via cat.LookupTableByOID), then
+// registers each into the PubSub registry. Seeds the InMemory TID cache so a
+// post-restart ALTER PUBLICATION OWNER updates the base row in place.
+func reloadUserPublicationsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, pubsub *catalog.PubSub, clog *mvcc.CLog) error {
+	// Pass 1: member rows, grouped by publication OID.
+	membersByPub := map[uint32][]string{}
+	prCols := executor.PGPublicationRelColumnsPG18()
+	prRel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 6106, Fork: storage.MainFork}
+	prRows, err := scanCatalogHeapRows(mgr, prRel, clog, "pg_publication_rel",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			decoded := make(executor.Row, len(prCols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, prCols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			return [2]uint32{uint32(decoded[1].Int), uint32(decoded[2].Int)}, false, nil // {prpubid, prrelid}
+		})
+	if err != nil {
+		return err
+	}
+	for _, raw := range prRows {
+		pr := raw.([2]uint32)
+		if tbl, ok := cat.LookupTableByOID(pr[1]); ok && tbl != nil {
+			membersByPub[pr[0]] = append(membersByPub[pr[0]], tbl.QualifiedName())
+		}
+	}
+
+	// Pass 2: base rows.
+	pubCols := executor.PGPublicationColumnsPG18()
+	pubRel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 6104, Fork: storage.MainFork}
+	type pubRow struct {
+		pub catalog.Publication
+		tid storage.ItemPointer
+	}
+	rows, err := scanCatalogHeapRows(mgr, pubRel, clog, "pg_publication",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			decoded := make(executor.Row, len(pubCols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, pubCols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			if uint32(decoded[0].Int) < catalog.FirstUserOID {
+				return nil, false, errSkipBuiltinRow
+			}
+			return pubRow{
+				pub: catalog.Publication{
+					OID:           uint32(decoded[0].Int),
+					Name:          decoded[1].StringValue(),
+					Owner:         uint32(decoded[2].Int),
+					AllTables:     decoded[3].BoolValue(),
+					PublishInsert: decoded[4].BoolValue(),
+					PublishUpdate: decoded[5].BoolValue(),
+					PublishDelete: decoded[6].BoolValue(),
+				},
+				tid: tid,
+			}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+	for _, raw := range rows {
+		pr := raw.(pubRow)
+		pr.pub.Tables = membersByPub[pr.pub.OID]
+		pubsub.CreatePublicationDuringRecovery(&pr.pub)
+		cat.SetPublicationHeapTID(pr.pub.OID, catalog.SchemaHeapTID{Block: uint32(pr.tid.Block), Offset: pr.tid.Offset})
+	}
+	return nil
+}
+
+// reloadForeignDataFromHeap is B3.4's foreign-data reload — the generic
+// heap-scan replacement for the retired replayForeignServerDDLRecords /
+// replayUserMappingDDLRecords scanners (RecordKinds 126-129). It reloads all
+// three catalogs in dependency order: pg_foreign_data_wrapper (gained
+// durability in B3.4 — none before) → pg_foreign_server (srvfdw OID reversed
+// to the FDW name) → pg_user_mapping (umserver OID → server name, umuser OID
+// → role name). Options are text[] columns decoded to "{a,b}" and split via
+// ParseTextArrayLiteral. Per-database catalogs, so the reload keys under
+// DefaultDBOid (the registries' resolveDBOid default), matching live writes.
+func reloadForeignDataFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+	if err := reloadFdwsFromHeap(mgr, cat, clog); err != nil {
+		return err
+	}
+	if err := reloadForeignServersFromHeap(mgr, cat, clog); err != nil {
+		return err
+	}
+	return reloadUserMappingsFromHeap(mgr, cat, clog)
+}
+
+func decodeOptions(d executor.Datum) []string {
+	if lit := d.StringValue(); lit != "" && lit != "{}" {
+		return executor.ParseTextArrayLiteral(lit)
+	}
+	return nil
+}
+
+func reloadFdwsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+	cols := executor.PGForeignDataWrapperColumnsPG18()
+	rel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 2328, Fork: storage.MainFork}
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_foreign_data_wrapper",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			d := make(executor.Row, len(cols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(d, cols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			if uint32(d[0].Int) < catalog.FirstUserOID {
+				return nil, false, errSkipBuiltinRow
+			}
+			return catalog.ForeignDataWrapper{
+				OID:          uint32(d[0].Int),
+				Name:         d[1].StringValue(),
+				Owner:        uint32(d[2].Int),
+				HandlerOID:   uint32(d[3].Int),
+				ValidatorOID: uint32(d[4].Int),
+				Options:      decodeOptions(d[6]),
+			}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+	for _, raw := range rows {
+		fdw := raw.(catalog.ForeignDataWrapper)
+		cat.RegisterForeignDataWrapperDuringRecovery(&fdw)
+	}
+	return nil
+}
+
+func reloadForeignServersFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+	cols := executor.PGForeignServerColumnsPG18()
+	rel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 1417, Fork: storage.MainFork}
+	type srvRow struct {
+		name, fdwName, srvType, srvVersion string
+		options                            []string
+		oid                                uint32
+	}
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_foreign_server",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			d := make(executor.Row, len(cols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(d, cols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			if uint32(d[0].Int) < catalog.FirstUserOID {
+				return nil, false, errSkipBuiltinRow
+			}
+			fdwName := ""
+			if fdw := cat.LookupForeignDataWrapperByOID(uint32(d[3].Int)); fdw != nil {
+				fdwName = fdw.Name
+			}
+			return srvRow{
+				name:       d[1].StringValue(),
+				fdwName:    fdwName,
+				srvType:    d[4].StringValue(),
+				srvVersion: d[5].StringValue(),
+				options:    decodeOptions(d[7]),
+				oid:        uint32(d[0].Int),
+			}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+	for _, raw := range rows {
+		sr := raw.(srvRow)
+		cat.RegisterForeignServerDuringRecovery(sr.name, sr.fdwName, sr.srvType, sr.srvVersion, sr.options, sr.oid)
+	}
+	return nil
+}
+
+func reloadUserMappingsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+	cols := executor.PGUserMappingColumnsPG18()
+	rel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 1418, Fork: storage.MainFork}
+	type umRow struct {
+		user, server string
+		options      []string
+		oid          uint32
+	}
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_user_mapping",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			d := make(executor.Row, len(cols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(d, cols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			if uint32(d[0].Int) < catalog.FirstUserOID {
+				return nil, false, errSkipBuiltinRow
+			}
+			user := "public"
+			if umuser := uint32(d[1].Int); umuser != 0 {
+				if name := cat.RoleNameForOID(umuser); name != "" {
+					user = name
+				}
+			}
+			server := ""
+			if srv := cat.LookupForeignServerByOID(uint32(d[2].Int)); srv != nil {
+				server = srv.Name
+			}
+			return umRow{user: user, server: server, options: decodeOptions(d[3]), oid: uint32(d[0].Int)}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+	for _, raw := range rows {
+		ur := raw.(umRow)
+		if ur.server == "" {
+			continue // server gone — dead mapping
+		}
+		cat.RegisterUserMappingDuringRecovery(ur.user, ur.server, ur.options, ur.oid)
+	}
+	return nil
+}
+
+// reloadUserTSDictsFromHeap is B3.5's text-search-dictionary reload — the
+// generic heap-scan replacement for the retired replayTSDictDDLRecords
+// scanner (RecordKinds 104/105/114/115/116). All six pg_ts_dict columns map
+// 1:1 onto UserTSDict (dicttemplate is already an OID, dictinitoption the
+// serialized text), so the reload is fully physical; only dictnamespace
+// reverses to a schema name for CreateTSDictDuringRecovery. Seeds the TID
+// cache so a post-restart ALTER updates the row in place.
+func reloadUserTSDictsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+	cols := executor.PGTSDictColumnsPG18()
+	type dictRow struct {
+		ud  catalog.UserTSDict
+		tid storage.ItemPointer
+	}
+	rel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 3600, Fork: storage.MainFork}
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_ts_dict",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			d := make(executor.Row, len(cols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(d, cols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			if uint32(d[0].Int) < catalog.FirstUserOID {
+				return nil, false, errSkipBuiltinRow
+			}
+			return dictRow{
+				ud: catalog.UserTSDict{
+					OID:          uint32(d[0].Int),
+					Name:         d[1].StringValue(),
+					NamespaceOID: uint32(d[2].Int),
+					Owner:        uint32(d[3].Int),
+					Template:     uint32(d[4].Int),
+					InitOption:   d[5].StringValue(),
+				},
+				tid: tid,
+			}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+	for _, raw := range rows {
+		dr := raw.(dictRow)
+		schema := cat.SchemaNameForOID(dr.ud.NamespaceOID)
+		if schema == "" {
+			schema = "public"
+		}
+		cat.CreateTSDictDuringRecovery(&dr.ud, schema)
+		cat.SetTSDictHeapTID(dr.ud.OID, catalog.SchemaHeapTID{Block: uint32(dr.tid.Block), Offset: dr.tid.Offset})
+	}
+	return nil
+}
+
+// reloadUserTSConfigsFromHeap is B3.6's text-search-configuration reload —
+// the generic heap-scan replacement for the retired replayTSConfigDDLRecords
+// scanner (RecordKinds 106-113). It reads the base rows from pg_ts_config and
+// the mapping rows from pg_ts_config_map (grouped by mapcfg → the config OID,
+// token type reversed via TSTokenTypeAlias, dictionaries in mapseqno order),
+// assembles each UserTSConfig with its inline Mappings, and registers it via
+// CreateTSConfigDuringRecovery. Runs after the pg_ts_dict reload so a
+// mapping's mapdict OID is a dictionary the registry already knows (though
+// mapdict stays an OID in the mapping regardless). Seeds the base-row TID
+// cache for post-restart ALTER RENAME / SET SCHEMA.
+func reloadUserTSConfigsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+	// Pass 1: config_map rows, grouped by mapcfg then token type.
+	type mapKey struct {
+		cfgOID  uint32
+		tokType int32
+	}
+	mapRowsByCfg := map[uint32]map[int32]map[int32]uint32{} // cfgOID → tokType → seqno → dictOID
+	mapCols := executor.PGTSConfigMapColumnsPG18()
+	mapRel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 3603, Fork: storage.MainFork}
+	if _, err := scanCatalogHeapRows(mgr, mapRel, clog, "pg_ts_config_map",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			d := make(executor.Row, len(mapCols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(d, mapCols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			k := mapKey{cfgOID: uint32(d[0].Int), tokType: int32(d[1].Int)}
+			if mapRowsByCfg[k.cfgOID] == nil {
+				mapRowsByCfg[k.cfgOID] = map[int32]map[int32]uint32{}
+			}
+			if mapRowsByCfg[k.cfgOID][k.tokType] == nil {
+				mapRowsByCfg[k.cfgOID][k.tokType] = map[int32]uint32{}
+			}
+			mapRowsByCfg[k.cfgOID][k.tokType][int32(d[2].Int)] = uint32(d[3].Int)
+			return struct{}{}, false, nil
+		}); err != nil {
+		return err
+	}
+
+	// Pass 2: base rows.
+	cfgCols := executor.PGTSConfigColumnsPG18()
+	cfgRel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 3602, Fork: storage.MainFork}
+	type cfgRow struct {
+		uc  catalog.UserTSConfig
+		tid storage.ItemPointer
+	}
+	rows, err := scanCatalogHeapRows(mgr, cfgRel, clog, "pg_ts_config",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			d := make(executor.Row, len(cfgCols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(d, cfgCols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			if uint32(d[0].Int) < catalog.FirstUserOID {
+				return nil, false, errSkipBuiltinRow
+			}
+			return cfgRow{
+				uc: catalog.UserTSConfig{
+					OID:          uint32(d[0].Int),
+					Name:         d[1].StringValue(),
+					NamespaceOID: uint32(d[2].Int),
+					Owner:        uint32(d[3].Int),
+					Parser:       uint32(d[4].Int),
+					Mappings:     buildTSConfigMappings(mapRowsByCfg[uint32(d[0].Int)]),
+				},
+				tid: tid,
+			}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+	for _, raw := range rows {
+		cr := raw.(cfgRow)
+		schema := cat.SchemaNameForOID(cr.uc.NamespaceOID)
+		if schema == "" {
+			schema = "public"
+		}
+		cat.CreateTSConfigDuringRecovery(&cr.uc, schema)
+		cat.SetTSConfigHeapTID(cr.uc.OID, catalog.SchemaHeapTID{Block: uint32(cr.tid.Block), Offset: cr.tid.Offset})
+	}
+	return nil
+}
+
+// buildTSConfigMappings turns the (tokType → seqno → dictOID) map for one
+// configuration into the inline TSConfigMapping slice, ordering dictionaries
+// by mapseqno and token types by their numeric value.
+func buildTSConfigMappings(byTok map[int32]map[int32]uint32) []catalog.TSConfigMapping {
+	if len(byTok) == 0 {
+		return nil
+	}
+	tokTypes := make([]int32, 0, len(byTok))
+	for tt := range byTok {
+		tokTypes = append(tokTypes, tt)
+	}
+	sort.Slice(tokTypes, func(i, j int) bool { return tokTypes[i] < tokTypes[j] })
+	out := make([]catalog.TSConfigMapping, 0, len(tokTypes))
+	for _, tt := range tokTypes {
+		alias := catalog.TSTokenTypeAlias(int(tt))
+		if alias == "" {
+			continue
+		}
+		bySeq := byTok[tt]
+		seqs := make([]int32, 0, len(bySeq))
+		for s := range bySeq {
+			seqs = append(seqs, s)
+		}
+		sort.Slice(seqs, func(i, j int) bool { return seqs[i] < seqs[j] })
+		dicts := make([]uint32, 0, len(seqs))
+		for _, s := range seqs {
+			dicts = append(dicts, bySeq[s])
+		}
+		out = append(out, catalog.TSConfigMapping{TokenType: alias, DictOIDs: dicts})
+	}
+	return out
+}
+
+// reloadUserAccessMethodsFromHeap is B3.7's access-method reload — the
+// generic heap-scan replacement for the retired replayAccessMethodDDLRecords
+// scanner (RecordKinds 70/71). It seq-scans the pg_am heap (no index exists;
+// see sys_pg_am.go), skips the built-in rows (oid < FirstUserOID), and
+// re-registers each user access method. amtype and amhandler are stored
+// directly (char / pg_proc OID).
+func reloadUserAccessMethodsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+	cols := executor.PGAccessMethodColumnsPG18()
+	rel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: 2601, Fork: storage.MainFork}
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_am",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			d := make(executor.Row, len(cols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(d, cols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			if uint32(d[0].Int) < catalog.FirstUserOID {
+				return nil, false, errSkipBuiltinRow
+			}
+			return catalog.AccessMethod{
+				OID:        uint32(d[0].Int),
+				Name:       d[1].StringValue(),
+				HandlerOID: uint32(d[2].Int),
+				AMType:     d[3].StringValue(),
+			}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+	for _, raw := range rows {
+		am := raw.(catalog.AccessMethod)
+		cat.RegisterAccessMethodDuringRecovery(&am)
+	}
+	return nil
 }

@@ -357,8 +357,16 @@ func insertCanonicalSysBtreeLeaf(ctx *Context, indexOID uint32, indexTuple []byt
 	// write (tableCatalogHeapDBOid) — a distinct-dbOid database now has its
 	// own bootstrapped catalog btrees (copyBootstrapCatalogImage), so its
 	// entries land beside its heap rows instead of being skipped.
+	return insertCanonicalSysBtreeLeafInDB(ctx, tableCatalogHeapDBOid(ctx), indexOID, indexTuple, cmp)
+}
+
+// insertCanonicalSysBtreeLeafInDB is insertCanonicalSysBtreeLeaf with an
+// explicit heap DBOid. A SHARED catalog index (pg_tablespace 2697/2698,
+// pg_shdepend 1232/1233, …) passes dbOid=0 so the leaf lands in global/<idx>
+// beside its shared heap, instead of the per-DB tableCatalogHeapDBOid. B4.1b.
+func insertCanonicalSysBtreeLeafInDB(ctx *Context, dbOid, indexOID uint32, indexTuple []byte, cmp keyCompareFn) error {
 	rel := storage.RelFileNode{
-		DBOid:  tableCatalogHeapDBOid(ctx),
+		DBOid:  dbOid,
 		RelOid: indexOID,
 		Fork:   storage.MainFork,
 	}

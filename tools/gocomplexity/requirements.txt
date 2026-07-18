@@ -1,0 +1,8 @@
+# Python dependencies for the gocomplexity tool.
+# Install into the project venv:  venv/bin/pip install -r tools/gocomplexity/requirements.txt
+#
+# The external Go binaries gocyclo and gocognit are NOT pip packages; install
+# them separately with `go install` (see README.md).
+PyYAML>=6.0        # config-file parsing
+pandas>=2.2.0      # CSV export / tabular roll-ups
+matplotlib>=3.9.0  # SVG histogram (numpy comes transitively)

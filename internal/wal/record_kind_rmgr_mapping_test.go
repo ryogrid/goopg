@@ -57,9 +57,9 @@ func TestRecordKindToRmgrInfoAnalogTable(t *testing.T) {
 func TestRecordKindToRmgrInfoCustomDefault(t *testing.T) {
 	for _, kind := range []byte{
 		RecordKindCreateDatabase,
-		RecordKindCreateTransform,
+		RecordKindCreateStatistics,
 		RecordKindRenameIndex,
-		RecordKindDropUserMapping,
+		RecordKindDropSubscription,
 	} {
 		gotRmgr, _ := recordKindToRmgrInfo(kind)
 		if gotRmgr != RmgrGoopgCatalog {
@@ -75,7 +75,7 @@ func TestRecordKindToRmgrInfoCustomDefault(t *testing.T) {
 func TestClassifyXLogRecordWiredToRecordKindToRmgrInfo(t *testing.T) {
 	for _, kind := range []byte{
 		RecordKindHeapInsert, RecordKindXactCommit, RecordKindPageImage,
-		RecordKindCreateTransform, RecordKindRenameIndex,
+		RecordKindCreateStatistics, RecordKindRenameIndex,
 	} {
 		wantRmgr, wantInfo := recordKindToRmgrInfo(kind)
 		rmgr, info, xid := classifyXLogRecord([]byte{kind})

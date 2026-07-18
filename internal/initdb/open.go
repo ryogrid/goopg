@@ -144,6 +144,16 @@ type OpenOptions struct {
 	// docs/design/0007-0002-fdatasync-commit-path.md.
 	WALSyncMethod string
 
+	// FsyncDisabled mirrors `fsync = off` (inverted so the Go zero value
+	// keeps the durable PG default): when true, every runtime durability
+	// sync — WAL commit flush, checkpoint data-file sync, CLOG/SLRU sync —
+	// is skipped. Writes still happen in the same order, so process-crash
+	// recovery is unaffected; only host-crash durability is forfeit. Test
+	// harnesses only (upstream Cluster.pm writes `fsync = off` into every
+	// test instance). See
+	// ci/design/test-gate-speedups/02-durability-off-for-test-servers.md.
+	FsyncDisabled bool
+
 	// CommitDelayUs / CommitSiblings forward to wal.Config for the
 	// backend-driven flush group commit (docs/design/wal-backend-flush/).
 	// Mirror the `commit_delay` (µs) and `commit_siblings` GUCs; PG defaults
@@ -280,6 +290,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	mgr := storage.NewManager(storage.ManagerConfig{
 		DataDir:          abs,
 		ChecksumsEnabled: checksumsEnabled,
+		FsyncDisabled:    opts.FsyncDisabled,
 	})
 
 	// Activity registry (M0022 / M0107-0005): per-backend slot array with
@@ -375,6 +386,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		SenderMemoryBuffer:  opts.WALSenderMemoryBuffer,
 		WALBuffers:          opts.WALBuffers,
 		SyncMethod:          opts.WALSyncMethod,
+		FsyncDisabled:       opts.FsyncDisabled,
 		MinWALSize:          opts.WALMinSize,
 		MaxWALSize:          opts.WALMaxSize,
 		CommitDelayUs:       opts.CommitDelayUs,
@@ -933,6 +945,12 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// that page's highest associated commit-record LSN first — the invariant
 	// synchronous_commit=off relies on instead of an inline per-commit fsync.
 	clog.SetFlushWALHook(walWriter.FlushUpTo)
+	// fsync=off (test harnesses only): skip the CLOG store's per-segment
+	// fsyncs; write-through and ordering (including the FlushWAL barrier
+	// above) are unchanged. See ci/design/test-gate-speedups/02.
+	if opts.FsyncDisabled {
+		clog.SetFsyncDisabled(true)
+	}
 	// M0117-0003: wire the persistent pg_subtrans SLRU so subtransaction
 	// parentage survives a restart (gap G5 read path). EnablePersistence opens
 	// the bootstrapped pg_subtrans/ directory (created by initdb) for write-through
@@ -953,6 +971,9 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = walWriter.Close()
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: restore pg_subtrans: %w", err)
+	}
+	if opts.FsyncDisabled {
+		subxactMap.SetFsyncDisabled(true)
 	}
 	txnMgr.SetSubxactMap(subxactMap)
 	// C3-S3 blocker fix B: storage.TupleDeadToAll (prune / VACUUM / the
@@ -1250,93 +1271,67 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: pg_namespace reload: %w", err)
 	}
-	// M0122-0007 tablespace-registry restart-durability follow-up: restore
-	// CREATE/DROP TABLESPACE entries (pg_tablespace) from the WAL the same
-	// way. goopg's tablespace registry has no backing heap relation, so
-	// this must run before loadUserTablesFromHeap / loadUserIndexesFromHeap
-	// reconstruct their (now-durable) reltablespace OIDs, so a table/index
-	// pointing at a user tablespace doesn't transiently look orphaned.
-	if err := replayTablespaceDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+	// B4.1e: restore user (in-place) tablespaces from the pg_tablespace SHARED
+	// heap (global/1213), replacing the retired replayTablespaceDDLRecords WAL
+	// scan (RecordKinds 124/125). Must run before loadUserTablesFromHeap /
+	// loadUserIndexesFromHeap reconstruct their (now-durable) reltablespace
+	// OIDs, so a table/index pointing at a user tablespace doesn't transiently
+	// look orphaned.
+	if err := reloadUserTablespacesFromHeap(mgr, cat, clog); err != nil {
 		_ = pool.Close()
 		_ = walWriter.Close()
 		_ = mgr.Close()
-		return nil, fmt.Errorf("goopg: tablespace DDL replay: %w", err)
+		return nil, fmt.Errorf("goopg: pg_tablespace reload: %w", err)
 	}
-	// M0122-0007 foreign-server registry restart-durability follow-up:
-	// restore CREATE/DROP SERVER entries (pg_foreign_server) from the WAL
-	// the same way. goopg's foreign-server registry has no backing heap
-	// relation, so a fresh cluster otherwise reported zero foreign servers
-	// after every restart.
-	if err := replayForeignServerDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+	// B3.4: the foreign-data trio (pg_foreign_data_wrapper / pg_foreign_server
+	// / pg_user_mapping) reloads from its HEAPS below, near the other
+	// B-phase reloads — after the role registry loads, so a user mapping's
+	// umuser OID reverses to a role name. Replaced replayForeignServerDDL
+	// Records / replayUserMappingDDLRecords (kinds 126-129, retired).
+	// B3.1: transforms reload from the pg_transform HEAP (generic scan, doc
+	// 02a §2) — replaced replayTransformDDLRecords' bespoke WAL scan (kinds
+	// 36/37, retired). Order relative to schema replay does not matter —
+	// transforms are keyed by (type, language), not by schema OID.
+	if err := reloadUserTransformsFromHeap(mgr, cat, clog); err != nil {
 		_ = pool.Close()
 		_ = walWriter.Close()
 		_ = mgr.Close()
-		return nil, fmt.Errorf("goopg: foreign-server DDL replay: %w", err)
-	}
-	// M0122-0007 user-mapping registry restart-durability follow-up:
-	// restore CREATE/DROP USER MAPPING entries (pg_user_mapping) from the
-	// WAL the same way, after the foreign-server registry above so a
-	// recovered mapping's referenced server already exists.
-	if err := replayUserMappingDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
-		_ = pool.Close()
-		_ = walWriter.Close()
-		_ = mgr.Close()
-		return nil, fmt.Errorf("goopg: user-mapping DDL replay: %w", err)
-	}
-	// DU-002 (M0119-0004) restart persistence: restore CREATE/DROP TRANSFORM
-	// objects (pg_transform) from the WAL the same way. Order relative to
-	// schema replay does not matter — transforms are keyed by (type name,
-	// language), not by schema OID.
-	if err := replayTransformDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
-		_ = pool.Close()
-		_ = walWriter.Close()
-		_ = mgr.Close()
-		return nil, fmt.Errorf("goopg: transform DDL replay: %w", err)
+		return nil, fmt.Errorf("goopg: pg_transform reload: %w", err)
 	}
 	// DU-002 restart-persistence follow-up: restore CREATE/DROP CAST objects
 	// (pg_cast) from the WAL the same way. Order relative to transform/schema
 	// replay does not matter — casts are keyed by (source type, target
 	// type), not by schema OID.
-	// DU-002 restart-persistence follow-up: restore CREATE/DROP CONVERSION
-	// objects (pg_conversion) from the WAL the same way. Unlike
-	// transforms/casts, a conversion is schema-scoped (keyed by namespace
-	// OID + name), so this must run after replaySchemaDDLRecords above has
-	// repopulated the schema OID map.
-	if err := replayConversionDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+	// B2.2 slice 4: the conversion replay that historically ran here moved
+	// to reloadUserConversionsFromHeap (after the routines reload — the
+	// conproc name fallback re-derives from the routines registry); kinds
+	// 40/41/130-132 retired.
+	// B3.5: text search dictionaries reload from the pg_ts_dict HEAP (generic
+	// scan, doc 02a §2) — replaced replayTSDictDDLRecords' bespoke WAL scan
+	// (kinds 104/105/114/115/116, retired). Schema-scoped, so this runs after
+	// replaySchemaDDLRecords above has repopulated the schema OID map. (Text
+	// search CONFIGURATION — pg_ts_config/config_map, kinds 106-113 — stays on
+	// its bespoke records below until B3.6.)
+	if err := reloadUserTSDictsFromHeap(mgr, cat, clog); err != nil {
 		_ = pool.Close()
 		_ = walWriter.Close()
 		_ = mgr.Close()
-		return nil, fmt.Errorf("goopg: conversion DDL replay: %w", err)
+		return nil, fmt.Errorf("goopg: pg_ts_dict reload: %w", err)
 	}
-	// DU-002 restart-persistence follow-up: restore CREATE/DROP TEXT SEARCH
-	// DICTIONARY objects (pg_ts_dict) and CREATE/ADD MAPPING/DROP TEXT
-	// SEARCH CONFIGURATION objects (pg_ts_config/pg_ts_config_map) from the
-	// WAL the same way. Like conversion/collation, both are schema-scoped
-	// (keyed by namespace OID + name), so this must run after
-	// replaySchemaDDLRecords above has repopulated the schema OID map.
-	if err := replayTSDictDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+	// B3.6: text search configurations reload from the pg_ts_config +
+	// pg_ts_config_map HEAPS (generic scan) — replaced replayTSConfigDDLRecords
+	// (kinds 106-113, retired). Runs after the pg_ts_dict reload above so a
+	// mapping's mapdict references a known dictionary; schema-scoped, so it
+	// also runs after replaySchemaDDLRecords.
+	if err := reloadUserTSConfigsFromHeap(mgr, cat, clog); err != nil {
 		_ = pool.Close()
 		_ = walWriter.Close()
 		_ = mgr.Close()
-		return nil, fmt.Errorf("goopg: text search dictionary DDL replay: %w", err)
+		return nil, fmt.Errorf("goopg: pg_ts_config reload: %w", err)
 	}
-	if err := replayTSConfigDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
-		_ = pool.Close()
-		_ = walWriter.Close()
-		_ = mgr.Close()
-		return nil, fmt.Errorf("goopg: text search configuration DDL replay: %w", err)
-	}
-	// DU-002 restart-persistence follow-up: restore CREATE/DROP COLLATION
-	// objects (pg_collation) from the WAL the same way. Like a conversion, a
-	// collation is schema-scoped (keyed by namespace OID + name), so this
-	// must run after replaySchemaDDLRecords above has repopulated the schema
-	// OID map.
-	if err := replayCollationDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
-		_ = pool.Close()
-		_ = walWriter.Close()
-		_ = mgr.Close()
-		return nil, fmt.Errorf("goopg: collation DDL replay: %w", err)
-	}
+	// B2.2 slice 4: the collation replay that historically ran here moved to
+	// reloadUserCollationsFromHeap (grouped with the other B-phase heap
+	// reloads); kinds 42-45/93 retired.
 	// B2.2 slice 2: the aggregate replay that historically ran here moved
 	// to reloadUserAggregatesFromHeap (after the routines reload below) —
 	// kinds 46-49 retired.
@@ -1450,27 +1445,16 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		}
 	}
 
-	// M0119-0004-ACLHEAP (ALTER DATABASE ... SET follow-up): replay
-	// ALTER DATABASE ... SET/RESET WAL records into pg_db_role_setting.
-	// Order relative to replayDatabaseDDLRecords does not matter — each
-	// record carries its own dbOid, not a name resolved through the
-	// database registry.
-	if err := replayDatabaseConfigRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+	// B4.2: restore ALTER DATABASE/ROLE SET overrides from the pg_db_role_setting
+	// SHARED heap (global/2964), replacing the retired replayDatabaseConfigRecords
+	// + replayRoleConfigRecords WAL scans (RecordKinds 73-78). Each row carries
+	// its own (setdatabase, setrole) key, so ordering relative to database/role
+	// DDL replay does not matter.
+	if err := reloadDbRoleSettingsFromHeap(mgr, cat, clog); err != nil {
 		_ = pool.Close()
 		_ = walWriter.Close()
 		_ = mgr.Close()
-		return nil, fmt.Errorf("goopg: database config replay: %w", err)
-	}
-
-	// M0119-0004-ACLHEAP (ALTER ROLE ... SET follow-up): replay ALTER ROLE
-	// ... SET/RESET WAL records into pg_db_role_setting. Each record keys
-	// off the role's OID (stable across a rename/restart), not its name, so
-	// ordering relative to role DDL replay does not matter.
-	if err := replayRoleConfigRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
-		_ = pool.Close()
-		_ = walWriter.Close()
-		_ = mgr.Close()
-		return nil, fmt.Errorf("goopg: role config replay: %w", err)
+		return nil, fmt.Errorf("goopg: pg_db_role_setting reload: %w", err)
 	}
 
 	// M0112: restore per-column planner statistics from pg_statistic.
@@ -1977,15 +1961,37 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, err
 	}
 
-	// DU-002 restart-persistence follow-up (M0119-0004, loop #70 ledger
-	// resume point): restore CREATE/DROP/ALTER EVENT TRIGGER objects from
-	// the WAL. Like PubSub, event triggers are not schema-scoped, so order
-	// relative to schema replay above does not matter.
-	if err := replayEventTriggerDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+	// B3.2: event triggers reload from the pg_event_trigger HEAP (generic
+	// scan, doc 02a §2) — replaced replayEventTriggerDDLRecords' bespoke WAL
+	// scan (kinds 56-60, retired). Not schema-scoped, so order relative to
+	// schema replay does not matter.
+	if err := reloadUserEventTriggersFromHeap(mgr, cat, clog); err != nil {
 		_ = pool.Close()
 		_ = walWriter.Close()
 		_ = mgr.Close()
-		return nil, fmt.Errorf("goopg: event trigger DDL replay: %w", err)
+		return nil, fmt.Errorf("goopg: pg_event_trigger reload: %w", err)
+	}
+
+	// B3.4: foreign-data trio reload (FDW → server → user-mapping); runs
+	// after the role reload so umuser reverses to a role name (kinds 126-129
+	// retired).
+	if err := reloadForeignDataFromHeap(mgr, cat, clog); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: foreign-data reload: %w", err)
+	}
+
+	// B3.3: publications reload from the pg_publication + pg_publication_rel
+	// HEAPS (generic scan, doc 02a §2) — replaced the publication half of
+	// replayPubSubDDLRecords' bespoke WAL scan (kinds 50-52, retired;
+	// subscription 53-55 stays bespoke for B4). Runs after the table reload
+	// above so pg_publication_rel.prrelid resolves to a qualified name.
+	if err := reloadUserPublicationsFromHeap(mgr, cat, pubsub, clog); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: pg_publication reload: %w", err)
 	}
 
 	// DU-002 restart-persistence follow-up (M0119-0004, loop #71 ledger
@@ -2018,15 +2024,15 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, fmt.Errorf("goopg: pg_aggregate reload: %w", err)
 	}
 
-	// DU-002 restart-persistence follow-up (M0119-0004, DU-002 slice 426
-	// ledger resume point): restore CREATE/DROP ACCESS METHOD objects from
-	// the WAL. Like event triggers, access methods are keyed by a plain name
-	// string, so order relative to schema replay does not matter.
-	if err := replayAccessMethodDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+	// B3.7: access methods reload from the pg_am HEAP (generic seq-scan, no
+	// index) — replaced replayAccessMethodDDLRecords' bespoke WAL scan
+	// (kinds 70/71, retired). Keyed by name, so order relative to schema
+	// replay does not matter.
+	if err := reloadUserAccessMethodsFromHeap(mgr, cat, clog); err != nil {
 		_ = pool.Close()
 		_ = walWriter.Close()
 		_ = mgr.Close()
-		return nil, fmt.Errorf("goopg: access method DDL replay: %w", err)
+		return nil, fmt.Errorf("goopg: pg_am reload: %w", err)
 	}
 
 	// DU-002 restart-persistence follow-up (slice 441's own resume point):
@@ -2106,18 +2112,35 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, fmt.Errorf("goopg: pg_operator reload: %w", err)
 	}
 
-	// DU-002 restart-persistence follow-up (M0119-0004/M0110-0001, closing
-	// the loop #65/#66 ledger row's "still open" item (1)): restore CREATE
-	// OPERATOR FAMILY / CREATE OPERATOR CLASS (+ its pg_amop/pg_amproc
-	// AS-list members) / DROP OPERATOR CLASS / ALTER OPERATOR FAMILY ...
-	// ADD|DROP objects from the WAL. Runs after the operator DDL replay
-	// above (schema replay must have already run, and a class's AS-list
-	// OPERATOR entries reference user operators by OID).
-	if err := replayOperatorClassDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+	// B2.2 slice 4: collations + conversions reload from their heaps —
+	// generic scans replacing the retired replayCollationDDLRecords /
+	// replayConversionDDLRecords scanners. After the routines reload (the
+	// conversion conproc name fallback) and after schema replay (both
+	// registries re-resolve their namespace by schema name).
+	if err := reloadUserCollationsFromHeap(mgr, cat, clog); err != nil {
 		_ = pool.Close()
 		_ = walWriter.Close()
 		_ = mgr.Close()
-		return nil, fmt.Errorf("goopg: operator class/family DDL replay: %w", err)
+		return nil, fmt.Errorf("goopg: pg_collation reload: %w", err)
+	}
+	if err := reloadUserConversionsFromHeap(mgr, cat, clog); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: pg_conversion reload: %w", err)
+	}
+
+	// B2.2 slice 5: operator families/classes and their pg_amop/pg_amproc
+	// members reload from their HEAPS (generic scans, doc 02a §2) —
+	// replaced replayOperatorClassDDLRecords' bespoke WAL scan (kinds
+	// 85-92, retired). Still runs after the operator reload above (schema
+	// replay must have already run, and a class's AS-list OPERATOR entries
+	// reference user operators by OID).
+	if err := reloadOpClassFamilyFromHeap(mgr, cat, clog); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: pg_opclass/pg_opfamily reload: %w", err)
 	}
 
 	// fix-05: last WAL-scanning recovery pass done — release the memoized WAL

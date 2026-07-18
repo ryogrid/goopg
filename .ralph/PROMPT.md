@@ -67,6 +67,10 @@ identical `go test`/`tpch-spotcheck` command).
   `make race-gate`, pgbench) in the FOREGROUND. Bash timeouts are raised for
   loop sessions: 15 min default, up to 60 min with an explicit `timeout`
   parameter on the Bash call.
+- Never pass `-count=1` to gate `go test` invocations (cache policy:
+  ci/design/test-gate-speedups/05). If a gate is unexpectedly slow, check
+  whether the test cache went cold (branch switch / toolchain change) before
+  suspecting a regression, and say which case it was in `Gates run:`.
 - `run_in_background: true` is allowed ONLY if you consume the result in the
   SAME turn: start it, do other work, then wait with a foreground command
   (`tail --pid=<PID> -f /dev/null`, large timeout) and READ its output file

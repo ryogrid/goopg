@@ -340,16 +340,33 @@ func (o *ddlOp) execCreateTablespace(s *parser.CreateTablespaceStmt) error {
 			return &ExecError{Code: "58P01", Pos: s.Pos(), Message: fmt.Sprintf("could not create directory %q: %v", versionDir, mkErr)}
 		}
 	}
-	// M0122-0007 tablespace-registry restart-durability follow-up: persist
-	// the tablespace so it survives a restart. goopg's tablespace registry
-	// has no backing heap relation, so record a WAL event the recovery
-	// driver (internal/initdb/tablespace_ddl_recovery.go) replays into the
-	// registry on the next startup (mirrors CREATE SCHEMA, M0110-0003). The
-	// OID just assigned by CreateTablespace is carried so recovery restores
-	// the same OID.
+	// B4.1: faithful CREATE TABLESPACE journaling (standby-complete), replacing
+	// the retired RecordKindCreateTablespace(124). PostgreSQL's CreateTableSpace
+	// (commands/tablespace.c) emits three things, which we mirror in order:
+	//   1. a pg_tablespace heap row (spcowner = resolved owner OID),
+	//   2. a pg_shdepend SHARED_DEPENDENCY_OWNER row (recordDependencyOnOwner),
+	//   3. an RM_TBLSPC XLOG_TBLSPC_CREATE for the pg_tblspc/<oid> directory.
+	// A restart reloads the registry from the pg_tablespace heap
+	// (reloadUserTablespacesFromHeap), so no bespoke DDL-record scan remains.
+	ownerOID := o.currentDDLOwnerOID()
+	if s.Owner != "" {
+		if roleOID, found := o.ctx.Catalog.RoleOID(s.Owner); found {
+			ownerOID = roleOID
+		}
+	}
+	if err := writeTablespaceCatalogRow(o.ctx, oid, s.Name, ownerOID); err != nil {
+		return fmt.Errorf("pg_tablespace heap write: %w", err)
+	}
+	if err := writeShdependOwnerRow(o.ctx, pgTablespaceClassID, oid, ownerOID); err != nil {
+		return fmt.Errorf("pg_shdepend write: %w", err)
+	}
 	if o.ctx.WAL != nil {
-		if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateTablespace(s.Name, s.Owner, location, oid)); werr != nil {
-			return fmt.Errorf("wal create-tablespace: %w", werr)
+		rec, encErr := wal.EncodeTblspcCreatePG(oid, location, o.ctx.Tx.XID)
+		if encErr != nil {
+			return fmt.Errorf("encode tblspc-create: %w", encErr)
+		}
+		if _, _, werr := o.ctx.WAL.Append(rec); werr != nil {
+			return fmt.Errorf("wal tblspc-create: %w", werr)
 		}
 	}
 	return nil
@@ -389,13 +406,20 @@ func (o *ddlOp) execDropTablespace(s *parser.DropTablespaceStmt) error {
 		}
 		return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("tablespace %q does not exist", s.Name)}
 	}
-	// M0122-0007 tablespace-registry restart-durability follow-up: persist
-	// the drop so it survives a restart (mirrors DROP SCHEMA). Without
-	// this, a tablespace dropped at runtime would be re-registered by
-	// replaying its CREATE TABLESPACE record on the next startup.
+	// B4.1: faithful DROP TABLESPACE journaling, replacing the retired
+	// RecordKindDropTablespace(125). Mirror DropTableSpace (tablespace.c):
+	// xmax-stamp the pg_tablespace row, drop its pg_shdepend owner dep, then
+	// emit RM_TBLSPC XLOG_TBLSPC_DROP for the directory removal. A restart's
+	// pg_tablespace heap reload skips the now-dead row, so the drop persists.
+	deleteTablespaceCatalogRow(o.ctx, oid)
+	deleteShdependRowsForObject(o.ctx, pgTablespaceClassID, oid)
 	if o.ctx.WAL != nil {
-		if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropTablespace(s.Name)); werr != nil {
-			return fmt.Errorf("wal drop-tablespace: %w", werr)
+		rec, encErr := wal.EncodeTblspcDropPG(oid, o.ctx.Tx.XID)
+		if encErr != nil {
+			return fmt.Errorf("encode tblspc-drop: %w", encErr)
+		}
+		if _, _, werr := o.ctx.WAL.Append(rec); werr != nil {
+			return fmt.Errorf("wal tblspc-drop: %w", werr)
 		}
 	}
 	if o.ctx.DataDir != "" {
@@ -705,17 +729,15 @@ func (o *ddlOp) execCreateCollation(s *parser.CreateCollationStmt) error {
 	if _, err := im.CreateCollation(uc, schema, s.IfNotExists, dbOid); err != nil {
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 	}
-	// DU-002 restart-persistence follow-up (M0119-0004): goopg has no
-	// per-collation on-disk file namespace, so record a WAL event the
-	// recovery driver (internal/initdb/collation_ddl_recovery.go) replays
-	// into the collation registry on the next startup. Mirrors CREATE
-	// CAST/TRANSFORM/CONVERSION. uc.OID is only set when CreateCollation
-	// actually inserted a new entry (the IF NOT EXISTS "already exists"
-	// path returns the existing OID without touching uc.OID), so this skips
-	// the WAL write for a no-op IF NOT EXISTS hit.
-	if o.ctx.WAL != nil && uc.OID != 0 {
-		if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateCollation(uc.Name, schema, uc.Collate, uc.Ctype, uc.Locale, uc.Rules, uc.OID, uc.Owner, int32(uc.Encoding), uc.Provider, uc.Deterministic)); werr != nil {
-			return fmt.Errorf("wal create-collation: %w", werr)
+	// B2.2 slice 4 (doc 02d §1): the collation journals as a real
+	// pg_collation heap row + 3085/3164 entries (kind 42 retired); the
+	// startup reload reconstructs the registry from the heap. uc.OID is
+	// only set when CreateCollation actually inserted a new entry (the
+	// IF NOT EXISTS "already exists" path returns the existing OID without
+	// touching uc.OID), so this skips the journal for a no-op hit.
+	if uc.OID != 0 {
+		if err := upsertCollationCatalogRow(o.ctx, uc); err != nil {
+			return fmt.Errorf("pg_collation journal: %w", err)
 		}
 	}
 	return nil
@@ -758,10 +780,10 @@ func (o *ddlOp) execAlterCollation(s *parser.AlterCollationStmt) error {
 		if err := im.RenameCollation(s.Name.Name, schema, s.NewName, dbOid); err != nil {
 			return notFound()
 		}
-		if o.ctx.WAL != nil {
-			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterCollationRename(s.Name.Name, schema, s.NewName)); werr != nil {
-				return fmt.Errorf("wal alter-collation-rename: %w", werr)
-			}
+		// B2.2 slice 4: the rename is a canonical pg_collation heap UPDATE
+		// (kind 44 retired).
+		if uc := im.FindCollation(s.NewName, schema, dbOid); uc != nil {
+			_ = upsertCollationCatalogRow(o.ctx, uc)
 		}
 		return nil
 	case "owner":
@@ -776,10 +798,10 @@ func (o *ddlOp) execAlterCollation(s *parser.AlterCollationStmt) error {
 		if !im.SetCollationOwner(s.Name.Name, schema, ownerOID, dbOid) {
 			return notFound()
 		}
-		if o.ctx.WAL != nil {
-			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterCollationOwner(s.Name.Name, schema, ownerOID)); werr != nil {
-				return fmt.Errorf("wal alter-collation-owner: %w", werr)
-			}
+		// B2.2 slice 4: the owner change is a canonical pg_collation heap
+		// UPDATE (kind 45 retired).
+		if uc := im.FindCollation(s.Name.Name, schema, dbOid); uc != nil {
+			_ = upsertCollationCatalogRow(o.ctx, uc)
 		}
 		return nil
 	case "setschema":
@@ -790,10 +812,11 @@ func (o *ddlOp) execAlterCollation(s *parser.AlterCollationStmt) error {
 		if !im.SetCollationSchema(s.Name.Name, schema, newSchema, dbOid) {
 			return notFound()
 		}
-		if o.ctx.WAL != nil {
-			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterCollationSetSchema(s.Name.Name, schema, newSchema)); werr != nil {
-				return fmt.Errorf("wal alter-collation-set-schema: %w", werr)
-			}
+		// B2.2 slice 4: SET SCHEMA is a canonical pg_collation heap UPDATE
+		// (kind 93 retired) — collnamespace changed, so the row moves under
+		// the NEW schema's key.
+		if uc := im.FindCollation(s.Name.Name, newSchema, dbOid); uc != nil {
+			_ = upsertCollationCatalogRow(o.ctx, uc)
 		}
 		return nil
 	case "refresh":
@@ -837,10 +860,18 @@ func (o *ddlOp) execAlterConversion(s *parser.AlterConversionStmt) error {
 		if err := im.RenameConversion(s.Name.Name, schema, s.NewName, dbOid); err != nil {
 			return notFound()
 		}
-		if o.ctx.WAL != nil {
-			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterConversionRename(s.Name.Name, schema, s.NewName)); werr != nil {
-				return fmt.Errorf("wal alter-conversion-rename: %w", werr)
-			}
+		// Move the compat-registry entry with the rename: DROP CONVERSION's
+		// existence gate is DropCompatObject keyed by the CURRENT name, so
+		// a stale original-name entry made rename→drop fail with 42704
+		// (pre-existing gap, surfaced by the B2.2 slice 4 waldump workload).
+		if im.DropCompatObject("conversion", s.Name.String()) {
+			renamed := parser.ObjectName{Schema: s.Name.Schema, Name: s.NewName}
+			im.RegisterCompatObject("conversion", renamed.String())
+		}
+		// B2.2 slice 4: the rename is a canonical pg_conversion heap
+		// UPDATE (kind 130 retired).
+		if uc := im.FindConversion(s.NewName, schema, dbOid); uc != nil {
+			_ = upsertConversionCatalogRow(o.ctx, uc)
 		}
 		return nil
 	case "owner":
@@ -855,10 +886,10 @@ func (o *ddlOp) execAlterConversion(s *parser.AlterConversionStmt) error {
 		if !im.SetConversionOwner(s.Name.Name, schema, ownerOID, dbOid) {
 			return notFound()
 		}
-		if o.ctx.WAL != nil {
-			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterConversionOwner(s.Name.Name, schema, ownerOID)); werr != nil {
-				return fmt.Errorf("wal alter-conversion-owner: %w", werr)
-			}
+		// B2.2 slice 4: the owner change is a canonical pg_conversion heap
+		// UPDATE (kind 131 retired).
+		if uc := im.FindConversion(s.Name.Name, schema, dbOid); uc != nil {
+			_ = upsertConversionCatalogRow(o.ctx, uc)
 		}
 		return nil
 	case "setschema":
@@ -869,10 +900,11 @@ func (o *ddlOp) execAlterConversion(s *parser.AlterConversionStmt) error {
 		if !im.SetConversionSchema(s.Name.Name, schema, newSchema, dbOid) {
 			return notFound()
 		}
-		if o.ctx.WAL != nil {
-			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterConversionSetSchema(s.Name.Name, schema, newSchema)); werr != nil {
-				return fmt.Errorf("wal alter-conversion-set-schema: %w", werr)
-			}
+		// B2.2 slice 4: SET SCHEMA is a canonical pg_conversion heap UPDATE
+		// (kind 132 retired) — connamespace changed, so the row lives under
+		// the NEW schema's key.
+		if uc := im.FindConversion(s.Name.Name, newSchema, dbOid); uc != nil {
+			_ = upsertConversionCatalogRow(o.ctx, uc)
 		}
 		return nil
 	default:
@@ -991,10 +1023,15 @@ func (o *ddlOp) execCreatePublication(s *parser.CreatePublicationStmt) error {
 	// so record a WAL event the recovery driver
 	// (internal/initdb/pubsub_ddl_recovery.go) replays into the PubSub
 	// registry on the next startup. Mirrors CREATE COLLATION.
-	if o.ctx.WAL != nil {
-		if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreatePublication(pub.Name, pub.Tables, pub.OID, pub.Owner, pub.AllTables, pub.PublishInsert, pub.PublishUpdate, pub.PublishDelete)); werr != nil {
-			return fmt.Errorf("wal create-publication: %w", werr)
-		}
+	// B3.3 (doc 02d §2): the publication journals as a real pg_publication
+	// heap row + 6110/6111 entries plus one pg_publication_rel row per FOR
+	// TABLE member (kind 50 retired); the startup reload reconstructs the
+	// PubSub registry from both heaps.
+	if err := upsertPublicationCatalogRow(o.ctx, pub); err != nil {
+		return fmt.Errorf("pg_publication journal: %w", err)
+	}
+	if err := writePublicationMemberRows(o.ctx, pub); err != nil {
+		return fmt.Errorf("pg_publication_rel journal: %w", err)
 	}
 	return nil
 }
@@ -1003,16 +1040,21 @@ func (o *ddlOp) execDropPublication(s *parser.DropPublicationStmt) error {
 	if o.ctx.PubSub == nil {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "DROP PUBLICATION requires PubSub registry in Context"}
 	}
+	// B3.3: capture the OID before the registry drop, then stamp xmax on
+	// the pg_publication row and its pg_publication_rel members (kind 51
+	// retired).
+	var pubOID uint32
+	if pub, ok := o.ctx.PubSub.LookupPublication(s.Name); ok && pub != nil {
+		pubOID = pub.OID
+	}
 	if err := o.ctx.PubSub.DropPublication(s.Name); err != nil {
 		if s.IfExists {
 			return nil
 		}
 		return &ExecError{Code: "42704", Pos: s.Pos(), Message: err.Error()}
 	}
-	if o.ctx.WAL != nil {
-		if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropPublication(s.Name)); werr != nil {
-			return fmt.Errorf("wal drop-publication: %w", werr)
-		}
+	if pubOID != 0 {
+		deletePublicationCatalogRows(o.ctx, pubOID)
 	}
 	return nil
 }
@@ -1098,9 +1140,11 @@ func (o *ddlOp) execAlterPublicationOwner(s *parser.AlterPublicationOwnerStmt) e
 	if serr := o.ctx.PubSub.SetPublicationOwner(s.Name, ownerOID); serr != nil {
 		return &ExecError{Code: "42704", Pos: s.Pos(), Message: serr.Error()}
 	}
-	if o.ctx.WAL != nil {
-		if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterPublicationOwner(s.Name, ownerOID)); werr != nil {
-			return fmt.Errorf("wal alter-publication-owner: %w", werr)
+	// B3.3: the owner change is a canonical pg_publication heap UPDATE
+	// (kind 52 retired).
+	if pub, ok := o.ctx.PubSub.LookupPublication(s.Name); ok && pub != nil {
+		if uerr := upsertPublicationCatalogRow(o.ctx, pub); uerr != nil {
+			return fmt.Errorf("pg_publication journal: %w", uerr)
 		}
 	}
 	return nil
@@ -1173,16 +1217,11 @@ func (o *ddlOp) execCreateEventTrigger(s *parser.CreateEventTriggerStmt) error {
 	if err != nil {
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 	}
-	// DU-002 restart-persistence follow-up (M0119-0004, loop #70 ledger
-	// resume point): goopg has no per-event-trigger on-disk file namespace,
-	// so record a WAL event the recovery driver
-	// (internal/initdb/event_trigger_ddl_recovery.go) replays into the
-	// eventTriggers registry on the next startup. Mirrors CREATE
-	// PUBLICATION.
-	if o.ctx.WAL != nil {
-		if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateEventTrigger(et.Name, et.Event, et.Tags, et.OID, et.Owner, et.FuncOID)); werr != nil {
-			return fmt.Errorf("wal create-event-trigger: %w", werr)
-		}
+	// B3.2 (doc 02d §2): the event trigger journals as a real
+	// pg_event_trigger heap row + 3467/3468 entries (kind 56 retired); the
+	// startup reload reconstructs the registry from the heap.
+	if err := upsertEventTriggerCatalogRow(o.ctx, et); err != nil {
+		return fmt.Errorf("pg_event_trigger journal: %w", err)
 	}
 	return nil
 }
@@ -1203,12 +1242,11 @@ func (o *ddlOp) execAlterEventTrigger(s *parser.AlterEventTriggerStmt) error {
 	notFoundErr := func(err error) *ExecError {
 		return &ExecError{Code: "42704", Pos: s.Pos(), Message: err.Error()}
 	}
-	logEnabled := func(code byte) error {
-		if o.ctx.WAL == nil {
-			return nil
-		}
-		if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterEventTriggerEnabled(s.Name, code)); werr != nil {
-			return fmt.Errorf("wal alter-event-trigger-enabled: %w", werr)
+	// B3.2: an ENABLE/DISABLE variant is a canonical pg_event_trigger heap
+	// UPDATE of the evtenabled column (kind 58 retired).
+	logEnabled := func(byte) error {
+		if et, ok := im.LookupEventTrigger(s.Name); ok {
+			return upsertEventTriggerCatalogRow(o.ctx, et)
 		}
 		return nil
 	}
@@ -1248,9 +1286,12 @@ func (o *ddlOp) execAlterEventTrigger(s *parser.AlterEventTriggerStmt) error {
 			}
 			return notFoundErr(err)
 		}
-		if o.ctx.WAL != nil {
-			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterEventTriggerRename(s.Name, s.NewName)); werr != nil {
-				return fmt.Errorf("wal alter-event-trigger-rename: %w", werr)
+		// B3.2: the rename is a canonical pg_event_trigger heap UPDATE
+		// (kind 59 retired) — evtname changed, so the row moves under the
+		// new name's key.
+		if et, ok := im.LookupEventTrigger(s.NewName); ok {
+			if uerr := upsertEventTriggerCatalogRow(o.ctx, et); uerr != nil {
+				return uerr
 			}
 		}
 	case "owner":
@@ -1268,9 +1309,11 @@ func (o *ddlOp) execAlterEventTrigger(s *parser.AlterEventTriggerStmt) error {
 		if err := im.SetEventTriggerOwner(s.Name, ownerOID); err != nil {
 			return notFoundErr(err)
 		}
-		if o.ctx.WAL != nil {
-			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterEventTriggerOwner(s.Name, ownerOID)); werr != nil {
-				return fmt.Errorf("wal alter-event-trigger-owner: %w", werr)
+		// B3.2: the owner change is a canonical pg_event_trigger heap
+		// UPDATE (kind 60 retired).
+		if et, ok := im.LookupEventTrigger(s.Name); ok {
+			if uerr := upsertEventTriggerCatalogRow(o.ctx, et); uerr != nil {
+				return uerr
 			}
 		}
 	default:
@@ -1306,12 +1349,10 @@ func (o *ddlOp) execCreateAccessMethod(s *parser.CreateAccessMethodStmt) error {
 	if err != nil {
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 	}
-	// DU-002 restart-persistence follow-up (M0119-0004, DU-002 slice 426
-	// ledger resume point): mirrors CREATE EVENT TRIGGER.
-	if o.ctx.WAL != nil {
-		if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateAccessMethod(am.Name, am.AMType, am.OID, am.HandlerOID)); werr != nil {
-			return fmt.Errorf("wal create-access-method: %w", werr)
-		}
+	// B3.7 (doc 02d §3b): the access method journals as a real pg_am heap
+	// row (kind 70 retired); the startup reload seq-scans pg_am.
+	if err := writeAccessMethodCatalogRow(o.ctx, am); err != nil {
+		return fmt.Errorf("pg_am journal: %w", err)
 	}
 	return nil
 }
@@ -14877,13 +14918,17 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 	// language Y does not exist". DU-002 (M0119-0004).
 	if objType == "transform" {
 		im, ok := o.ctx.Catalog.(*catalog.InMemory)
+		var transformOID uint32
+		if ok {
+			if tf := im.LookupTransform(s.TransformType, s.TransformLang); tf != nil {
+				transformOID = tf.OID
+			}
+		}
 		if ok && im.DropTransform(s.TransformType, s.TransformLang) {
-			// DU-002 (M0119-0004) restart persistence: mirror the DROP
-			// SCHEMA WAL emission so the drop survives a restart too.
-			if o.ctx.WAL != nil {
-				if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropTransform(s.TransformType, s.TransformLang)); werr != nil {
-					return fmt.Errorf("wal drop-transform: %w", werr)
-				}
+			// B3.1: stamp xmax on the transform's pg_transform heap row
+			// (kind 37 retired).
+			if transformOID != 0 {
+				deleteTransformCatalogRow(o.ctx, transformOID)
 			}
 			return nil
 		}
@@ -14914,14 +14959,17 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 			if schema == "" {
 				schema = "public"
 			}
+			var collOID uint32
+			if imOK {
+				if uc := im.FindCollation(name.Name, schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); uc != nil {
+					collOID = uc.OID
+				}
+			}
 			if imOK && im.DropCollation(name.Name, schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
-				// DU-002 restart-persistence follow-up: mirror the DROP
-				// CAST/TRANSFORM/CONVERSION WAL emission so the drop
-				// survives a restart too.
-				if o.ctx.WAL != nil {
-					if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropCollation(name.Name, schema)); werr != nil {
-						return fmt.Errorf("wal drop-collation: %w", werr)
-					}
+				// B2.2 slice 4: stamp xmax on the collation's pg_collation
+				// heap row (kind 43 retired).
+				if collOID != 0 {
+					deleteCollationCatalogRow(o.ctx, collOID)
 				}
 				continue
 			}
@@ -15012,11 +15060,9 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 					dbOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
 					if fam, found := im.LookupUserOperatorFamily(famSchema, name.Name, famMethodOID, dbOid); found {
 						im.DropUserOperatorFamily(famSchema, name.Name, famMethodOID, dbOid)
-						if o.ctx.WAL != nil {
-							if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropOperatorFamily(fam.OID)); werr != nil {
-								return fmt.Errorf("wal drop-operator-family: %w", werr)
-							}
-						}
+						// B2.2 slice 5: stamp xmax on the family's
+						// pg_opfamily heap row (kind 92 retired).
+						deleteOpclassFamilyRowByOID(o.ctx, pgOpfamilyRelOID, fam.OID)
 						return nil
 					}
 				}
@@ -15035,19 +15081,14 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 						classDBOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
 						oc, ocFound := im.LookupUserOperatorClass(classSchema, name.Name, classMethodOID, classDBOid)
 						im.DropUserOperatorClass(classSchema, name.Name, classMethodOID, classDBOid)
-						// DU-002 restart-persistence follow-up
-						// (M0119-0004/M0110-0001, closing the loop #65/#66
-						// ledger row's "still open" item (1)): mirrors DROP
-						// OPERATOR's own WAL append so the drop survives a
-						// restart. ocFound is false for a class that only
-						// exists in the legacy opClassSchemas registry (no
-						// pg_opclass row was ever registered, e.g. an
-						// unparseable USING method at CREATE time) — nothing
-						// to WAL-log in that case.
-						if ocFound && o.ctx.WAL != nil {
-							if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropOperatorClass(oc.OID)); werr != nil {
-								return fmt.Errorf("wal drop-operator-class: %w", werr)
-							}
+						// B2.2 slice 5: stamp xmax on the class's pg_opclass
+						// heap row (kind 87 retired). ocFound is false for a
+						// class that only exists in the legacy opClassSchemas
+						// registry (no pg_opclass row was ever registered,
+						// e.g. an unparseable USING method at CREATE time) —
+						// nothing to journal in that case.
+						if ocFound {
+							deleteOpclassFamilyRowByOID(o.ctx, pgOpclassRelOID, oc.OID)
 						}
 					}
 					return nil
@@ -15366,37 +15407,55 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 				// dropped conversion stops round-tripping through pg_dump
 				// (DU-002 slice 399); harmless for the other object types.
 				if objType == "conversion" {
-					if im.DropConversion(s.Names[0].Name, s.Names[0].Schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) && o.ctx.WAL != nil {
-						// DU-002 restart-persistence follow-up: mirror the
-						// DROP CAST/TRANSFORM WAL emission so the drop
-						// survives a restart too.
-						if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropConversion(s.Names[0].Name, s.Names[0].Schema)); werr != nil {
-							return fmt.Errorf("wal drop-conversion: %w", werr)
-						}
+					// B2.2 slice 4: capture the OID before the registry
+					// drop, then stamp xmax on the pg_conversion heap row
+					// (kind 41 retired).
+					var convOID uint32
+					if uc := im.FindConversion(s.Names[0].Name, s.Names[0].Schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); uc != nil {
+						convOID = uc.OID
+					}
+					if im.DropConversion(s.Names[0].Name, s.Names[0].Schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) && convOID != 0 {
+						deleteConversionCatalogRow(o.ctx, convOID)
 					}
 				}
 				if objType == "text search dictionary" {
-					// Drop the dump-visible pg_ts_dict registry entry too so a
-					// dropped dictionary stops round-tripping through pg_dump
-					// (DU-002 slice 437). WAL-emit the drop so it survives a
-					// restart, mirroring DROP CONVERSION above.
-					if im.DropTSDict(s.Names[0].Name, s.Names[0].Schema) && o.ctx.WAL != nil {
-						if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropTSDict(s.Names[0].Name, s.Names[0].Schema)); werr != nil {
-							return fmt.Errorf("wal drop-tsdict: %w", werr)
+					// B3.5: capture the OID before the registry drop, then
+					// stamp xmax on the pg_ts_dict heap row (kind 105 retired).
+					var dictOID uint32
+					if ud := im.FindTSDict(s.Names[0].Name, s.Names[0].Schema); ud != nil {
+						dictOID = ud.OID
+					}
+					if im.DropTSDict(s.Names[0].Name, s.Names[0].Schema) {
+						// Return on a successful registry drop rather than
+						// falling through to the DropCompatObject gate below,
+						// which is keyed by the CURRENT name — a renamed
+						// dictionary's compat entry is stale, so rename-then-
+						// drop otherwise failed 42704 (pre-existing gap,
+						// surfaced by the B3.5 waldump workload).
+						if dictOID != 0 {
+							deleteTSDictCatalogRow(o.ctx, dictOID)
 						}
+						im.DropCompatObject(objType, s.Names[0].String())
+						return nil
 					}
 				}
 				if objType == "text search configuration" {
-					// Drop the dump-visible pg_ts_config registry entry (and its
-					// pg_ts_config_map rows, held inline on the same struct) too
-					// so a dropped configuration stops round-tripping through
-					// pg_dump (DU-002 slice 446). WAL-emit the drop so it
-					// survives a restart, mirroring DROP TEXT SEARCH DICTIONARY
-					// above.
-					if im.DropTSConfig(s.Names[0].Name, s.Names[0].Schema) && o.ctx.WAL != nil {
-						if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropTSConfig(s.Names[0].Name, s.Names[0].Schema)); werr != nil {
-							return fmt.Errorf("wal drop-tsconfig: %w", werr)
+					// B3.6: capture the OID before the registry drop, then
+					// stamp xmax on the pg_ts_config base row + all its
+					// pg_ts_config_map rows (kind 108 retired). Return on a
+					// successful drop rather than falling through to the
+					// current-name-keyed DropCompatObject gate (the B3.5
+					// rename-then-drop fix, applied here too).
+					var cfgOID uint32
+					if cfg := im.FindTSConfig(s.Names[0].Name, s.Names[0].Schema); cfg != nil {
+						cfgOID = cfg.OID
+					}
+					if im.DropTSConfig(s.Names[0].Name, s.Names[0].Schema) {
+						if cfgOID != 0 {
+							deleteTSConfigCatalogRows(o.ctx, cfgOID)
 						}
+						im.DropCompatObject(objType, s.Names[0].String())
+						return nil
 					}
 				}
 				if im.DropCompatObject(objType, s.Names[0].String()) {
@@ -15415,13 +15474,17 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 				// pg_foreign_server after a crash. DropCompatObject is still
 				// called best-effort to clear any stale entry.
 				dbOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
+				// B3.4: capture the OID before the registry drop, then stamp
+				// xmax on the pg_foreign_server heap row (kind 127 retired).
+				var srvOID uint32
+				if srv, ok := im.LookupForeignServer(name, dbOid); ok && srv != nil {
+					srvOID = srv.OID
+				}
 				found := im.DropForeignServer(name, dbOid)
 				im.DropCompatObject("server", name)
 				if found {
-					if o.ctx.WAL != nil {
-						if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropForeignServer(name, dbOid)); werr != nil {
-							return fmt.Errorf("wal drop-foreign-server: %w", werr)
-						}
+					if srvOID != 0 {
+						deleteForeignRowByOID(o.ctx, pgForeignServerRelOID, srvOID)
 					}
 					return nil
 				}
@@ -15432,14 +15495,16 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 			// through pg_dump.
 			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
 				name := s.Names[0].String()
+				// B3.2: capture the OID before the registry drop, then
+				// stamp xmax on the pg_event_trigger heap row (kind 57
+				// retired).
+				var evtOID uint32
+				if et, found := im.LookupEventTrigger(name); found {
+					evtOID = et.OID
+				}
 				if im.DropEventTrigger(name) {
-					// DU-002 restart-persistence follow-up (M0119-0004,
-					// loop #70 ledger resume point): mirrors DROP
-					// PUBLICATION/SUBSCRIPTION.
-					if o.ctx.WAL != nil {
-						if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropEventTrigger(name)); werr != nil {
-							return fmt.Errorf("wal drop-event-trigger: %w", werr)
-						}
+					if evtOID != 0 {
+						deleteEventTriggerCatalogRow(o.ctx, evtOID)
 					}
 					return nil
 				}
@@ -15450,14 +15515,15 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 			// through pg_dump.
 			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
 				name := s.Names[0].String()
+				// B3.7: capture the OID before the registry drop, then stamp
+				// xmax on the pg_am heap row (kind 71 retired).
+				var amOID uint32
+				if am := im.FindAccessMethod(name, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); am != nil {
+					amOID = am.OID
+				}
 				if im.DropAccessMethod(name, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
-					// DU-002 restart-persistence follow-up (M0119-0004,
-					// DU-002 slice 426 ledger resume point): mirrors DROP
-					// EVENT TRIGGER.
-					if o.ctx.WAL != nil {
-						if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropAccessMethod(name)); werr != nil {
-							return fmt.Errorf("wal drop-access-method: %w", werr)
-						}
+					if amOID != 0 {
+						deleteAccessMethodCatalogRow(o.ctx, amOID)
 					}
 					return nil
 				}
@@ -15472,15 +15538,15 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok && len(s.Names) >= 2 {
 				user, server := o.resolveUserMappingRoleName(s.Names[0].String()), s.Names[1].String()
 				dbOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
+				// B3.4: capture the OID before the registry drop, then stamp
+				// xmax on the pg_user_mapping heap row (kind 129 retired).
+				var umOID uint32
+				if um, ok := im.LookupUserMapping(user, server, dbOid); ok && um != nil {
+					umOID = um.OID
+				}
 				if im.DropUserMapping(user, server, dbOid) {
-					// M0122-0007 user-mapping registry restart-durability
-					// follow-up: persist the drop so it survives a restart,
-					// mirroring DROP SERVER. dbOid scoping: M0122-0007 4e
-					// follow-up 37.
-					if o.ctx.WAL != nil {
-						if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropUserMapping(user, server, dbOid)); werr != nil {
-							return fmt.Errorf("wal drop-user-mapping: %w", werr)
-						}
+					if umOID != 0 {
+						deleteForeignRowByOID(o.ctx, pgUserMappingRelOID, umOID)
 					}
 					return nil
 				}
@@ -15488,6 +15554,11 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 		case "foreign-data wrapper":
 			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
 				fdwName := s.Names[0].String()
+				// B3.4: capture the FDW's heap-row OID before the drop.
+				var fdwOID uint32
+				if fdw, found := im.LookupForeignDataWrapper(fdwName); found && fdw != nil {
+					fdwOID = fdw.OID
+				}
 				if im.DropForeignDataWrapper(fdwName) {
 					// CASCADE: drop all servers associated with this FDW.
 					if s.Behavior == parser.DropCascade {
@@ -15509,14 +15580,23 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 						for _, serverName := range cascadeServers {
 							im.DropCompatObject("fdw-server", fdwName+":"+serverName)
 							im.DropCompatObject("server", serverName)
+							// B3.4: stamp the cascaded server's heap row
+							// (kind 127 retired).
+							var csOID uint32
+							if srv, ok := im.LookupForeignServer(serverName, dbOid); ok && srv != nil {
+								csOID = srv.OID
+							}
 							im.DropForeignServer(serverName, dbOid) // dump-visible registry (DU-002 slice 376)
-							if o.ctx.WAL != nil {
-								if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropForeignServer(serverName, dbOid)); werr != nil {
-									return fmt.Errorf("wal drop-foreign-server: %w", werr)
-								}
+							if csOID != 0 {
+								deleteForeignRowByOID(o.ctx, pgForeignServerRelOID, csOID)
 							}
 							o.ctx.AddNotice(fmt.Sprintf("drop cascades to server %s", serverName))
 						}
+					}
+					// B3.4: stamp the FDW's own pg_foreign_data_wrapper heap
+					// row (the FDW gained durability in this slice).
+					if fdwOID != 0 {
+						deleteForeignRowByOID(o.ctx, pgFdwRelOID, fdwOID)
 					}
 					return nil
 				}
@@ -16073,17 +16153,12 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		// DU-002 slice 376.
 		dbOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
 		srv := im.RegisterForeignServer(s.ObjName.String(), s.TableName.String(), s.ServerType, s.ServerVersion, s.Options, dbOid)
-		// M0122-0007 foreign-server registry restart-durability follow-up:
-		// persist the server so it survives a restart. goopg's foreign-server
-		// registry has no backing heap relation, so record a WAL event the
-		// recovery driver (internal/initdb/foreignserver_ddl_recovery.go)
-		// replays into the registry on the next startup (mirrors CREATE
-		// TABLESPACE). The OID just assigned/refreshed by RegisterForeignServer
-		// is carried so recovery restores the same identity.
-		if o.ctx.WAL != nil {
-			if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateForeignServer(srv.Name, srv.FdwName, srv.Type, srv.Version, srv.Options, srv.OID, srv.DBOid)); werr != nil {
-				return fmt.Errorf("wal create-foreign-server: %w", werr)
-			}
+		// B3.4 (doc 02d §2): the server journals as a real pg_foreign_server
+		// heap row + 113/549 entries (kind 126 retired); writeForeignServer
+		// CatalogRow also ensures the referenced FDW's own row exists so
+		// srvfdw resolves on a standby / reload.
+		if err := writeForeignServerCatalogRow(o.ctx, srv); err != nil {
+			return fmt.Errorf("pg_foreign_server journal: %w", err)
 		}
 	case "foreign-data wrapper":
 		// Register FDW so DROP FOREIGN DATA WRAPPER can succeed AND so it
@@ -16114,6 +16189,11 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		fdw := im.RegisterForeignDataWrapper(s.ObjName.String(), s.Options)
 		fdw.HandlerOID = handlerOID
 		fdw.ValidatorOID = validatorOID
+		// B3.4: the FDW gains restart durability here (it had none before) —
+		// a real pg_foreign_data_wrapper heap row + 112/548 entries.
+		if err := writeFdwCatalogRow(o.ctx, fdw); err != nil {
+			return fmt.Errorf("pg_foreign_data_wrapper journal: %w", err)
+		}
 	case "user mapping":
 		// Register the user mapping (CREATE USER MAPPING FOR <user> SERVER <srv>)
 		// so it round-trips through pg_dump (pg_user_mappings virtual view →
@@ -16131,17 +16211,11 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		umDBOid := catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)
 		umUser := o.resolveUserMappingRoleName(s.ObjName.String())
 		um := im.RegisterUserMapping(umUser, s.TableName.String(), s.Options, umDBOid)
-		// M0122-0007 user-mapping registry restart-durability follow-up:
-		// persist the mapping so it survives a restart. goopg's user-mapping
-		// registry has no backing heap relation, so record a WAL event the
-		// recovery driver (internal/initdb/usermapping_ddl_recovery.go)
-		// replays into the registry on the next startup (mirrors CREATE
-		// SERVER). The OID just assigned/refreshed by RegisterUserMapping is
-		// carried so recovery restores the same identity.
-		if o.ctx.WAL != nil {
-			if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateUserMapping(um.UmUser, um.SrvName, um.Options, um.OID, um.DBOid)); werr != nil {
-				return fmt.Errorf("wal create-user-mapping: %w", werr)
-			}
+		// B3.4: the mapping journals as a real pg_user_mapping heap row +
+		// 174/175 entries (kind 128 retired), umuser/umserver resolved to
+		// role/server OIDs.
+		if err := writeUserMappingCatalogRow(o.ctx, um); err != nil {
+			return fmt.Errorf("pg_user_mapping journal: %w", err)
 		}
 	case "operator":
 		// Build the compat key as opName(leftCanon,rightCanon) to match DROP OPERATOR lookup.
@@ -16341,16 +16415,10 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 			nsOID = o.ctx.Catalog.SchemaOID("public")
 		}
 		fam := im.RegisterUserOperatorFamily(schema, s.ObjName.Name, nsOID, methodOID, 0, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
-		// DU-002 restart-persistence follow-up (M0119-0004/M0110-0001,
-		// closing the loop #65/#66 ledger row's "still open" item (1)):
-		// mirrors CREATE OPERATOR's own WAL append so the family survives a
-		// restart.
-		if o.ctx.WAL != nil {
-			if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateOperatorFamily(wal.CreateOperatorFamilyPayload{
-				OID: fam.OID, Schema: schema, Name: fam.Name, Method: methodOID,
-			})); werr != nil {
-				return fmt.Errorf("wal create-operator-family: %w", werr)
-			}
+		// B2.2 slice 5 (doc 02d §1): the family journals as a real
+		// pg_opfamily heap row + 2754/2755 entries (kind 85 retired).
+		if err := writeOpFamilyCatalogRow(o.ctx, fam); err != nil {
+			return fmt.Errorf("pg_opfamily journal: %w", err)
 		}
 	case "cast":
 		// Register the user-defined cast (CREATE CAST (source AS target) …) so it
@@ -16505,15 +16573,12 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		if _, err := im.CreateConversion(uc, schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); err != nil {
 			return &ExecError{Code: "42710", Message: err.Error()}
 		}
-		// DU-002 restart-persistence follow-up (M0119-0004): goopg has no
-		// per-conversion on-disk file namespace, so record a WAL event the
-		// recovery driver (internal/initdb/conversion_ddl_recovery.go)
-		// replays into the conversion registry on the next startup. Mirrors
-		// CREATE CAST/TRANSFORM.
-		if o.ctx.WAL != nil {
-			if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateConversion(uc.Name, schema, uc.ProcSchema, uc.ProcName, uc.OID, uc.Owner, uc.FuncOID, uc.ForEncoding, uc.ToEncoding, uc.Default)); werr != nil {
-				return fmt.Errorf("wal create-conversion: %w", werr)
-			}
+		// B2.2 slice 4 (doc 02d §1): the conversion journals as a real
+		// pg_conversion heap row + 2668/2669/2670 entries (kind 40
+		// retired); the startup reload reconstructs the registry from the
+		// heap.
+		if err := upsertConversionCatalogRow(o.ctx, uc); err != nil {
+			return fmt.Errorf("pg_conversion journal: %w", err)
 		}
 	case "text search dictionary":
 		// Register the dictionary (CREATE TEXT SEARCH DICTIONARY name (TEMPLATE =
@@ -16550,14 +16615,10 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		if _, err := im.CreateTSDict(ud, schema); err != nil {
 			return &ExecError{Code: "42710", Message: err.Error()}
 		}
-		// DU-002 restart-persistence follow-up (M0119-0004): record a WAL
-		// event the recovery driver (internal/initdb/tsdict_ddl_recovery.go)
-		// replays into the dictionary registry on the next startup. Mirrors
-		// CREATE CONVERSION/CAST/TRANSFORM.
-		if o.ctx.WAL != nil {
-			if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateTSDict(ud.Name, schema, ud.InitOption, ud.OID, ud.Owner, ud.Template)); werr != nil {
-				return fmt.Errorf("wal create-tsdict: %w", werr)
-			}
+		// B3.5 (doc 02d §2): the dictionary journals as a real pg_ts_dict
+		// heap row + 3604/3605 entries (kind 104 retired).
+		if err := upsertTSDictCatalogRow(o.ctx, ud); err != nil {
+			return fmt.Errorf("pg_ts_dict journal: %w", err)
 		}
 	case "text search configuration":
 		// Register the configuration (CREATE TEXT SEARCH CONFIGURATION name
@@ -16611,17 +16672,10 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		if _, err := im.CreateTSConfig(uc, schema); err != nil {
 			return &ExecError{Code: "42710", Message: err.Error()}
 		}
-		// DU-002 restart-persistence follow-up (M0119-0004): record a WAL
-		// event the recovery driver
-		// (internal/initdb/tsconfig_ddl_recovery.go) replays into the
-		// configuration registry on the next startup, mirroring CREATE TEXT
-		// SEARCH DICTIONARY. ADD MAPPING statements record their own
-		// follow-up WAL event (execAlterTSConfigAddMapping below).
-		if o.ctx.WAL != nil {
-			if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateTSConfig(uc.Name, schema, uc.OID, uc.Owner, uc.Parser)); werr != nil {
-				return fmt.Errorf("wal create-tsconfig: %w", werr)
-			}
-		}
+		// B3.6 (doc 02d §2): the configuration journals as a real
+		// pg_ts_config heap row + its pg_ts_config_map rows after the copy
+		// loop below has populated any FROM-source mappings (kinds 106/107
+		// retired); the single upsert at the end writes both.
 		if copySource != nil {
 			// Copy the source configuration's token-type→dictionary mappings,
 			// mirroring DefineTSConfiguration's post-insert pg_ts_config_map
@@ -16633,11 +16687,13 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 				if uc2, dup := im.AddTSConfigMapping(uc.Name, schema, m.TokenType, m.DictOIDs); uc2 == nil || dup {
 					return fmt.Errorf("internal error: copying tsconfig mapping %q for new configuration %q", m.TokenType, uc.Name)
 				}
-				if o.ctx.WAL != nil {
-					if _, _, werr := o.ctx.WAL.Append(wal.EncodeAddTSConfigMapping(uc.Name, schema, m.TokenType, m.DictOIDs)); werr != nil {
-						return fmt.Errorf("wal add-tsconfig-mapping (copy): %w", werr)
-					}
-				}
+			}
+		}
+		// B3.6: write the base row + all config_map rows from the config's
+		// final mapping set.
+		if cfg := im.FindTSConfig(uc.Name, schema); cfg != nil {
+			if err := upsertTSConfigCatalogRow(o.ctx, cfg); err != nil {
+				return fmt.Errorf("pg_ts_config journal: %w", err)
 			}
 		}
 	case "transform":
@@ -16668,15 +16724,11 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 			toFuncOID = oid
 		}
 		tf := im.RegisterTransform(s.TransformType, s.TransformLang, fromFuncOID, toFuncOID)
-		// DU-002 (M0119-0004) restart persistence: goopg has no per-transform
-		// on-disk file namespace, so record a WAL event the recovery driver
-		// (internal/initdb/transform_ddl_recovery.go) replays into the
-		// transform registry on the next startup. Mirrors CREATE SCHEMA
-		// (M0110-0003).
-		if o.ctx.WAL != nil {
-			if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateTransform(tf.TypeName, tf.Lang, tf.OID, tf.FromFuncOID, tf.ToFuncOID)); werr != nil {
-				return fmt.Errorf("wal create-transform: %w", werr)
-			}
+		// B3.1 (doc 02d §2): the transform journals as a real pg_transform
+		// heap row + 3574/3575 entries (kind 36 retired); the startup
+		// reload reconstructs the registry from the heap.
+		if err := writeTransformCatalogRow(o.ctx, tf); err != nil {
+			return fmt.Errorf("pg_transform journal: %w", err)
 		}
 	default:
 		// text search dictionary/configuration/parser/template, language, etc.
@@ -16713,10 +16765,10 @@ func (o *ddlOp) execAlterTSConfig(s *parser.AlterTSConfigStmt) error {
 		if err := im.RenameTSConfig(s.ConfigName.Name, schema, s.NewName); err != nil {
 			return &ExecError{Code: "42704", Message: err.Error()}
 		}
-		if o.ctx.WAL != nil {
-			if _, _, werr := o.ctx.WAL.Append(wal.EncodeRenameTSConfig(s.ConfigName.Name, schema, s.NewName)); werr != nil {
-				return fmt.Errorf("wal rename-tsconfig: %w", werr)
-			}
+		// B3.6: the rename is a canonical pg_ts_config base-row heap UPDATE
+		// (kind 110 retired).
+		if cfg := im.FindTSConfig(s.NewName, schema); cfg != nil {
+			_ = upsertTSConfigCatalogRow(o.ctx, cfg)
 		}
 		return nil
 	case "setschema":
@@ -16727,10 +16779,10 @@ func (o *ddlOp) execAlterTSConfig(s *parser.AlterTSConfigStmt) error {
 		if !im.SetTSConfigSchema(s.ConfigName.Name, schema, newSchema) {
 			return &ExecError{Code: "42704", Message: fmt.Sprintf("text search configuration %q does not exist", s.ConfigName.Name)}
 		}
-		if o.ctx.WAL != nil {
-			if _, _, werr := o.ctx.WAL.Append(wal.EncodeSetTSConfigSchema(s.ConfigName.Name, schema, newSchema)); werr != nil {
-				return fmt.Errorf("wal set-tsconfig-schema: %w", werr)
-			}
+		// B3.6: SET SCHEMA is a canonical pg_ts_config base-row heap UPDATE
+		// (kind 111 retired).
+		if cfg := im.FindTSConfig(s.ConfigName.Name, newSchema); cfg != nil {
+			_ = upsertTSConfigCatalogRow(o.ctx, cfg)
 		}
 		return nil
 	}
@@ -16773,14 +16825,12 @@ func (o *ddlOp) execAlterTSConfigAddMapping(im *catalog.InMemory, s *parser.Alte
 				Detail:  fmt.Sprintf("Key (mapcfg, maptokentype, mapseqno)=(%d, %d, 1) already exists.", uc.OID, tokID),
 			}
 		}
-		// DU-002 restart-persistence follow-up (M0119-0004): record a WAL
-		// event per token type so the mapping survives a restart, replayed
-		// by internal/initdb/tsconfig_ddl_recovery.go after the
-		// configuration's own CREATE record.
-		if o.ctx.WAL != nil {
-			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAddTSConfigMapping(s.ConfigName.Name, schema, tt, dictOIDs)); werr != nil {
-				return fmt.Errorf("wal add-tsconfig-mapping: %w", werr)
-			}
+	}
+	// B3.6: re-sync the config's pg_ts_config_map rows from its final
+	// mapping set (kind 107 retired).
+	if cfg := im.FindTSConfig(s.ConfigName.Name, schema); cfg != nil {
+		if err := upsertTSConfigCatalogRow(o.ctx, cfg); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -16831,14 +16881,9 @@ func (o *ddlOp) execAlterTSConfigReplaceDict(im *catalog.InMemory, s *parser.Alt
 	if uc == nil {
 		return &ExecError{Code: "42704", Message: fmt.Sprintf("text search configuration %q does not exist", s.ConfigName.Name)}
 	}
-	// DU-002 replacedict follow-up (M0119-0004): record a WAL event so the
-	// substitution survives a restart, replayed by
-	// internal/initdb/tsconfig_ddl_recovery.go after the configuration's
-	// own CREATE record.
-	if o.ctx.WAL != nil {
-		if _, _, werr := o.ctx.WAL.Append(wal.EncodeReplaceTSConfigMappingDict(s.ConfigName.Name, schema, s.TokenTypes, oldOID, newOID)); werr != nil {
-			return fmt.Errorf("wal replace-tsconfig-mapping-dict: %w", werr)
-		}
+	// B3.6: re-sync the config's config_map rows (kind 112 retired).
+	if err := upsertTSConfigCatalogRow(o.ctx, uc); err != nil {
+		return err
 	}
 	return nil
 }
@@ -16865,14 +16910,11 @@ func (o *ddlOp) execAlterTSConfigAlterMapping(im *catalog.InMemory, s *parser.Al
 		if uc == nil {
 			return &ExecError{Code: "42704", Message: fmt.Sprintf("text search configuration %q does not exist", s.ConfigName.Name)}
 		}
-		// DU-002 restart-persistence follow-up (M0119-0004): record a WAL
-		// event per token type so the override survives a restart, replayed
-		// by internal/initdb/tsconfig_ddl_recovery.go after the
-		// configuration's own CREATE record.
-		if o.ctx.WAL != nil {
-			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterTSConfigMapping(s.ConfigName.Name, schema, tt, dictOIDs)); werr != nil {
-				return fmt.Errorf("wal alter-tsconfig-mapping: %w", werr)
-			}
+	}
+	// B3.6: re-sync the config's config_map rows (kind 113 retired).
+	if cfg := im.FindTSConfig(s.ConfigName.Name, schema); cfg != nil {
+		if err := upsertTSConfigCatalogRow(o.ctx, cfg); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -16897,14 +16939,11 @@ func (o *ddlOp) execAlterTSConfigDropMapping(im *catalog.InMemory, s *parser.Alt
 			}
 			return &ExecError{Code: "42704", Message: fmt.Sprintf("mapping for token type %q does not exist", tt)}
 		}
-		// DU-002 restart-persistence follow-up (M0119-0004): record a WAL
-		// event per token type so the removal survives a restart, replayed
-		// by internal/initdb/tsconfig_ddl_recovery.go after the
-		// configuration's own CREATE record.
-		if o.ctx.WAL != nil {
-			if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropTSConfigMapping(s.ConfigName.Name, schema, tt)); werr != nil {
-				return fmt.Errorf("wal drop-tsconfig-mapping: %w", werr)
-			}
+	}
+	// B3.6: re-sync the config's config_map rows (kind 109 retired).
+	if cfg := im.FindTSConfig(s.ConfigName.Name, schema); cfg != nil {
+		if err := upsertTSConfigCatalogRow(o.ctx, cfg); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -16928,10 +16967,10 @@ func (o *ddlOp) execAlterTSDict(s *parser.AlterTSDictStmt) error {
 		if err := im.RenameTSDict(s.DictName.Name, schema, s.NewName); err != nil {
 			return &ExecError{Code: "42704", Message: err.Error()}
 		}
-		if o.ctx.WAL != nil {
-			if _, _, werr := o.ctx.WAL.Append(wal.EncodeRenameTSDict(s.DictName.Name, schema, s.NewName)); werr != nil {
-				return fmt.Errorf("wal rename-tsdict: %w", werr)
-			}
+		// B3.5: the rename is a canonical pg_ts_dict heap UPDATE (kind 114
+		// retired) — dictname changed, so the row moves under the new key.
+		if ud := im.FindTSDict(s.NewName, schema); ud != nil {
+			_ = upsertTSDictCatalogRow(o.ctx, ud)
 		}
 		return nil
 	case "setschema":
@@ -16942,10 +16981,10 @@ func (o *ddlOp) execAlterTSDict(s *parser.AlterTSDictStmt) error {
 		if !im.SetTSDictSchema(s.DictName.Name, schema, newSchema) {
 			return &ExecError{Code: "42704", Message: fmt.Sprintf("text search dictionary %q does not exist", s.DictName.Name)}
 		}
-		if o.ctx.WAL != nil {
-			if _, _, werr := o.ctx.WAL.Append(wal.EncodeSetTSDictSchema(s.DictName.Name, schema, newSchema)); werr != nil {
-				return fmt.Errorf("wal set-tsdict-schema: %w", werr)
-			}
+		// B3.5: SET SCHEMA is a canonical pg_ts_dict heap UPDATE (kind 115
+		// retired) — dictnamespace changed, row under the new schema's key.
+		if ud := im.FindTSDict(s.DictName.Name, newSchema); ud != nil {
+			_ = upsertTSDictCatalogRow(o.ctx, ud)
 		}
 		return nil
 	case "options":
@@ -16960,10 +16999,11 @@ func (o *ddlOp) execAlterTSDict(s *parser.AlterTSDictStmt) error {
 			}
 			return &ExecError{Code: code, Message: err.Error()}
 		}
-		if o.ctx.WAL != nil {
-			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterTSDictOptions(s.DictName.Name, schema, newInitOption)); werr != nil {
-				return fmt.Errorf("wal alter-tsdict-options: %w", werr)
-			}
+		_ = newInitOption
+		// B3.5: ALTER OPTIONS is a canonical pg_ts_dict heap UPDATE (kind
+		// 116 retired) — dictinitoption changed.
+		if ud := im.FindTSDict(s.DictName.Name, schema); ud != nil {
+			_ = upsertTSDictCatalogRow(o.ctx, ud)
 		}
 		return nil
 	}
@@ -18251,16 +18291,10 @@ func (o *ddlOp) execCreateOpClass(s *parser.CreateOpClassStmt) error {
 		// creating role for these compat objects).
 		fam := im.RegisterUserOperatorFamily(schema, s.Name, nsOID, methodOID, 0, dbOid)
 		famOID = fam.OID
-		// DU-002 restart-persistence follow-up (M0119-0004/M0110-0001):
-		// mirrors CREATE OPERATOR FAMILY's own WAL append (execCompatNoop's
-		// "operator family" case) so this auto-created anonymous family
-		// survives a restart too.
-		if o.ctx.WAL != nil {
-			if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateOperatorFamily(wal.CreateOperatorFamilyPayload{
-				OID: fam.OID, Schema: schema, Name: fam.Name, Method: methodOID,
-			})); werr != nil {
-				return fmt.Errorf("wal create-operator-family: %w", werr)
-			}
+		// B2.2 slice 5: the auto-created anonymous family journals the same
+		// pg_opfamily heap row as an explicit CREATE OPERATOR FAMILY.
+		if err := writeOpFamilyCatalogRow(o.ctx, fam); err != nil {
+			return fmt.Errorf("pg_opfamily journal: %w", err)
 		}
 	}
 
@@ -18280,18 +18314,11 @@ func (o *ddlOp) execCreateOpClass(s *parser.CreateOpClassStmt) error {
 		}
 	}
 	oc := im.RegisterUserOperatorClass(schema, s.Name, nsOID, 0, methodOID, famOID, inTypeOID, s.IsDefault, keyTypeOID, dbOid)
-	// DU-002 restart-persistence follow-up (M0119-0004/M0110-0001, closing
-	// the loop #65/#66 ledger row's "still open" item (1)): mirrors CREATE
-	// OPERATOR's own WAL append so the class survives a restart. The
-	// AS-list members are appended separately by registerOpClassMembers
-	// below.
-	if o.ctx.WAL != nil {
-		if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateOperatorClass(wal.CreateOperatorClassPayload{
-			OID: oc.OID, Schema: schema, Name: oc.Name, Method: methodOID, FamilyOID: famOID,
-			InTypeOID: inTypeOID, IsDefault: s.IsDefault, KeyTypeOID: keyTypeOID,
-		})); werr != nil {
-			return fmt.Errorf("wal create-operator-class: %w", werr)
-		}
+	// B2.2 slice 5: the class journals as a real pg_opclass heap row +
+	// 2686/2687 entries (kind 86 retired). The AS-list members journal
+	// their own pg_amop/pg_amproc rows in registerOpClassMembers below.
+	if err := writeOpClassCatalogRow(o.ctx, oc); err != nil {
+		return fmt.Errorf("pg_opclass journal: %w", err)
 	}
 	return o.registerOpClassMembers(im, s.Members, schema, famOID, oc.OID, methodOID, s.Method, s.Pos(), false, "")
 }
@@ -18373,24 +18400,18 @@ func (o *ddlOp) execAlterOpFamilyDrop(s *parser.AlterOpFamilyDropStmt) error {
 				return &ExecError{Code: "42704", Pos: s.Pos(),
 					Message: fmt.Sprintf("function %d(%s,%s) does not exist in operator family %q", m.Number, m.LeftType, m.RightType, fam.Name)}
 			}
-			// DU-002 restart-persistence follow-up (M0119-0004/M0110-0001,
-			// closing the loop #65/#66 ledger row's "still open" item (1)).
-			if o.ctx.WAL != nil {
-				if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropAmProcMember(fam.OID, leftOID, rightOID, uint32(m.Number))); werr != nil {
-					return fmt.Errorf("wal drop-amproc-member: %w", werr)
-				}
-			}
+			// B2.2 slice 5: stamp xmax on the member's pg_amproc heap row
+			// (kind 91 retired).
+			deleteAmMemberRow(o.ctx, pgAmprocRelOID, fam.OID, leftOID, rightOID, int16(m.Number))
 			continue
 		}
 		if !im.RemoveAmOpMember(fam.OID, leftOID, rightOID, uint32(m.Number)) {
 			return &ExecError{Code: "42704", Pos: s.Pos(),
 				Message: fmt.Sprintf("operator %d(%s,%s) does not exist in operator family %q", m.Number, m.LeftType, m.RightType, fam.Name)}
 		}
-		if o.ctx.WAL != nil {
-			if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropAmOpMember(fam.OID, leftOID, rightOID, uint32(m.Number))); werr != nil {
-				return fmt.Errorf("wal drop-amop-member: %w", werr)
-			}
-		}
+		// B2.2 slice 5: stamp xmax on the member's pg_amop heap row (kind
+		// 89 retired).
+		deleteAmMemberRow(o.ctx, pgAmopRelOID, fam.OID, leftOID, rightOID, int16(m.Number))
 	}
 	return nil
 }
@@ -18441,17 +18462,12 @@ func (o *ddlOp) registerOpClassMembers(im *catalog.InMemory, members []parser.Op
 				}
 			}
 			pm := im.RegisterAmProcMember(famOID, classOID, leftOID, rightOID, uint32(m.Number), procOID, methodOID)
-			// DU-002 restart-persistence follow-up (M0119-0004/M0110-0001,
-			// closing the loop #65/#66 ledger row's "still open" item (1)):
-			// covers both a CREATE OPERATOR CLASS ... AS list FUNCTION entry
-			// and an ALTER OPERATOR FAMILY ... ADD FUNCTION entry.
-			if o.ctx.WAL != nil {
-				if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateAmProcMember(wal.AmProcMemberPayload{
-					OID: pm.OID, FamilyOID: pm.FamilyOID, ClassOID: pm.ClassOID, LeftType: pm.LeftType,
-					RightType: pm.RightType, ProcNum: pm.ProcNum, ProcOID: pm.ProcOID, Method: pm.Method,
-				})); werr != nil {
-					return fmt.Errorf("wal create-amproc-member: %w", werr)
-				}
+			// B2.2 slice 5: the member journals as a real pg_amproc heap row
+			// + its 2655 entry (kind 90 retired) — covers both a CREATE
+			// OPERATOR CLASS ... AS list FUNCTION entry and an ALTER
+			// OPERATOR FAMILY ... ADD FUNCTION entry.
+			if err := writeAmProcMemberRow(o.ctx, pm); err != nil {
+				return fmt.Errorf("pg_amproc journal: %w", err)
 			}
 			continue
 		}
@@ -18507,14 +18523,10 @@ func (o *ddlOp) registerOpClassMembers(im *catalog.InMemory, members []parser.Op
 		// closing the loop #65/#66 ledger row's "still open" item (1)):
 		// covers both a CREATE OPERATOR CLASS ... AS list OPERATOR entry
 		// and an ALTER OPERATOR FAMILY ... ADD OPERATOR entry.
-		if o.ctx.WAL != nil {
-			if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateAmOpMember(wal.AmOpMemberPayload{
-				OID: opm.OID, FamilyOID: opm.FamilyOID, ClassOID: opm.ClassOID, LeftType: opm.LeftType,
-				RightType: opm.RightType, Strategy: opm.Strategy, OperOID: opm.OperOID, Method: opm.Method,
-				SortFamilyOID: opm.SortFamilyOID,
-			})); werr != nil {
-				return fmt.Errorf("wal create-amop-member: %w", werr)
-			}
+		// B2.2 slice 5: the member journals as a real pg_amop heap row +
+		// its 2653/2654 entries (kind 88 retired).
+		if err := writeAmOpMemberRow(o.ctx, opm); err != nil {
+			return fmt.Errorf("pg_amop journal: %w", err)
 		}
 	}
 	return nil

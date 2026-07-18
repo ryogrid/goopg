@@ -41,6 +41,8 @@ func TestPort_CreateSchemaSurvivesRestart(t *testing.T) {
 		DataDir:      filepath.Join(t.TempDir(), "data"),
 		StartupWait:  20 * time.Second,
 		ShutdownWait: 20 * time.Second,
+		SyncInit:     true,
+		SyncRuntime:  true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -102,6 +104,8 @@ func TestPort_AlterSchemaSurvivesRestart(t *testing.T) {
 		DataDir:      filepath.Join(t.TempDir(), "data"),
 		StartupWait:  20 * time.Second,
 		ShutdownWait: 20 * time.Second,
+		SyncInit:     true,
+		SyncRuntime:  true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -147,6 +151,8 @@ func TestPort_FunctionSurvivesRestart(t *testing.T) {
 		DataDir:      filepath.Join(t.TempDir(), "data"),
 		StartupWait:  20 * time.Second,
 		ShutdownWait: 20 * time.Second,
+		SyncInit:     true,
+		SyncRuntime:  true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -194,6 +200,8 @@ func TestPort_SequenceCatalogRowSurvivesRestart(t *testing.T) {
 		DataDir:      filepath.Join(t.TempDir(), "data"),
 		StartupWait:  20 * time.Second,
 		ShutdownWait: 20 * time.Second,
+		SyncInit:     true,
+		SyncRuntime:  true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -239,6 +247,8 @@ func TestPort_DomainSurvivesRestart(t *testing.T) {
 		DataDir:      filepath.Join(t.TempDir(), "data"),
 		StartupWait:  20 * time.Second,
 		ShutdownWait: 20 * time.Second,
+		SyncInit:     true,
+		SyncRuntime:  true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -317,6 +327,8 @@ func TestPort_RangeTypeSurvivesRestart(t *testing.T) {
 		DataDir:      filepath.Join(t.TempDir(), "data"),
 		StartupWait:  20 * time.Second,
 		ShutdownWait: 20 * time.Second,
+		SyncInit:     true,
+		SyncRuntime:  true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -372,6 +384,8 @@ func TestPort_EnumSurvivesRestart(t *testing.T) {
 		DataDir:      filepath.Join(t.TempDir(), "data"),
 		StartupWait:  20 * time.Second,
 		ShutdownWait: 20 * time.Second,
+		SyncInit:     true,
+		SyncRuntime:  true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -431,6 +445,8 @@ func TestPort_CastSurvivesRestart(t *testing.T) {
 		DataDir:      filepath.Join(t.TempDir(), "data"),
 		StartupWait:  20 * time.Second,
 		ShutdownWait: 20 * time.Second,
+		SyncInit:     true,
+		SyncRuntime:  true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -485,6 +501,8 @@ func TestPort_AggregateSurvivesRestart(t *testing.T) {
 		DataDir:      filepath.Join(t.TempDir(), "data"),
 		StartupWait:  20 * time.Second,
 		ShutdownWait: 20 * time.Second,
+		SyncInit:     true,
+		SyncRuntime:  true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -543,6 +561,8 @@ func TestPort_OperatorSurvivesRestart(t *testing.T) {
 		DataDir:      filepath.Join(t.TempDir(), "data"),
 		StartupWait:  20 * time.Second,
 		ShutdownWait: 20 * time.Second,
+		SyncInit:     true,
+		SyncRuntime:  true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -590,5 +610,651 @@ func TestPort_OperatorSurvivesRestart(t *testing.T) {
 	if got := queryScalar(t, c,
 		"SELECT count(*) FROM pg_operator o JOIN pg_proc p ON p.oid = o.oprcode::oid WHERE o.oprname = '<+>' AND p.proname = 'b22c_addmod'"); got != "1" {
 		t.Fatalf("post-restart oprcode join count = %q, want 1 (function link lost)", got)
+	}
+}
+
+// TestPort_CollationSurvivesRestart pins B2.2 slice 4's pg_collation heap
+// journaling: CREATE COLLATION reloads from its pg_collation row (kinds
+// 42-45/93 retired), ALTER ... RENAME/OWNER survive as heap UPDATEs, and a
+// dropped collation stays dropped.
+func TestPort_CollationSurvivesRestart(t *testing.T) {
+	c, err := cluster.New("collation-durability", cluster.Options{
+		RepoRoot:     repoRoot(t),
+		DataDir:      filepath.Join(t.TempDir(), "data"),
+		StartupWait:  20 * time.Second,
+		ShutdownWait: 20 * time.Second,
+		SyncInit:     true,
+		SyncRuntime:  true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+
+	stmts := []string{
+		"CREATE COLLATION b22d_coll (provider = icu, locale = 'de-u-co-phonebk', deterministic = false)",
+		"ALTER COLLATION b22d_coll RENAME TO b22d_coll2",
+		"CREATE ROLE b22d_owner",
+		"ALTER COLLATION b22d_coll2 OWNER TO b22d_owner",
+		"CREATE COLLATION b22d_gone (locale = 'C')",
+		"DROP COLLATION b22d_gone",
+	}
+	for _, s := range stmts {
+		if err := runSQLSimple(t, c, s); err != nil {
+			t.Fatalf("%s: %v", s, err)
+		}
+	}
+
+	if err := c.Stop(cluster.ShutdownFast); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	if err := c.Start(); err != nil {
+		t.Fatalf("restart: %v", err)
+	}
+
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_collation WHERE collname = 'b22d_coll2' AND collprovider = 'i' AND NOT collisdeterministic AND oid >= 16384"); got != "1" {
+		t.Fatalf("post-restart renamed collation count = %q, want 1 (collation not reloaded)", got)
+	}
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_collation WHERE collname IN ('b22d_coll', 'b22d_gone') AND oid >= 16384"); got != "0" {
+		t.Fatalf("post-restart stale collation names count = %q, want 0", got)
+	}
+	if got := queryScalar(t, c,
+		"SELECT colllocale FROM pg_collation WHERE collname = 'b22d_coll2'"); got != "de-u-co-phonebk" {
+		t.Fatalf("post-restart colllocale = %q, want de-u-co-phonebk", got)
+	}
+}
+
+// TestPort_ConversionSurvivesRestart pins B2.2 slice 4's pg_conversion heap
+// journaling (kinds 40/41/130-132 retired): CREATE [DEFAULT] CONVERSION
+// reloads from its pg_conversion row with the conproc link intact, ALTER
+// RENAME survives as a heap UPDATE, and a dropped conversion stays dropped.
+func TestPort_ConversionSurvivesRestart(t *testing.T) {
+	c, err := cluster.New("conversion-durability", cluster.Options{
+		RepoRoot:     repoRoot(t),
+		DataDir:      filepath.Join(t.TempDir(), "data"),
+		StartupWait:  20 * time.Second,
+		ShutdownWait: 20 * time.Second,
+		SyncInit:     true,
+		SyncRuntime:  true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+
+	stmts := []string{
+		"CREATE CONVERSION b22d_conv FOR 'LATIN1' TO 'UTF8' FROM iso8859_1_to_utf8",
+		"ALTER CONVERSION b22d_conv RENAME TO b22d_conv2",
+		"CREATE CONVERSION b22d_gone FOR 'LATIN1' TO 'UTF8' FROM iso8859_1_to_utf8",
+		"DROP CONVERSION b22d_gone",
+	}
+	for _, s := range stmts {
+		if err := runSQLSimple(t, c, s); err != nil {
+			t.Fatalf("%s: %v", s, err)
+		}
+	}
+
+	if err := c.Stop(cluster.ShutdownFast); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	if err := c.Start(); err != nil {
+		t.Fatalf("restart: %v", err)
+	}
+
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_conversion WHERE conname = 'b22d_conv2' AND oid >= 16384"); got != "1" {
+		t.Fatalf("post-restart renamed conversion count = %q, want 1 (conversion not reloaded)", got)
+	}
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_conversion WHERE conname IN ('b22d_conv', 'b22d_gone') AND oid >= 16384"); got != "0" {
+		t.Fatalf("post-restart stale conversion names count = %q, want 0", got)
+	}
+}
+
+// TestPort_OpClassFamilySurvivesRestart pins B2.2 slice 5's pg_opfamily /
+// pg_opclass / pg_amop / pg_amproc heap journaling (kinds 85-92 retired):
+// CREATE OPERATOR FAMILY / CLASS (with AS-list members), ALTER OPERATOR
+// FAMILY ADD (a family-attributed "loose" member), and the drops all
+// survive a restart — including each member's CLASS attribution, which
+// rides an INTERNAL pg_depend row because pg_amop/pg_amproc have no column
+// for it (PG's own channel: opclasscmds.c storeOperators).
+func TestPort_OpClassFamilySurvivesRestart(t *testing.T) {
+	c, err := cluster.New("opclass-durability", cluster.Options{
+		RepoRoot:     repoRoot(t),
+		DataDir:      filepath.Join(t.TempDir(), "data"),
+		StartupWait:  20 * time.Second,
+		ShutdownWait: 20 * time.Second,
+		SyncInit:     true,
+		SyncRuntime:  true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+
+	stmts := []string{
+		"CREATE OPERATOR public.~=~ (FUNCTION = int4eq, LEFTARG = int4, RIGHTARG = int4)",
+		"CREATE OPERATOR FAMILY public.b22e_fam USING btree",
+		`CREATE OPERATOR CLASS public.b22e_class FOR TYPE int4 USING btree FAMILY public.b22e_fam AS
+			OPERATOR 1 ~=~ (int4, int4),
+			FUNCTION 1 int4eq(int4, int4)`,
+		// A loose (family-attributed) member: no class attribution, so no
+		// INTERNAL pg_depend row — its zero ClassOID must survive too.
+		"ALTER OPERATOR FAMILY public.b22e_fam USING btree ADD OPERATOR 3 ~=~ (int4, int4)",
+		"CREATE OPERATOR FAMILY public.b22e_gone USING btree",
+		"DROP OPERATOR FAMILY public.b22e_gone USING btree",
+	}
+	for _, s := range stmts {
+		if err := runSQLSimple(t, c, s); err != nil {
+			t.Fatalf("%s: %v", s, err)
+		}
+	}
+
+	if err := c.Stop(cluster.ShutdownFast); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	if err := c.Start(); err != nil {
+		t.Fatalf("restart: %v", err)
+	}
+
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_opfamily WHERE opfname = 'b22e_fam' AND oid >= 16384"); got != "1" {
+		t.Fatalf("post-restart pg_opfamily count = %q, want 1 (family not reloaded)", got)
+	}
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_opfamily WHERE opfname = 'b22e_gone' AND oid >= 16384"); got != "0" {
+		t.Fatalf("post-restart dropped family count = %q, want 0", got)
+	}
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_opclass c JOIN pg_opfamily f ON f.oid = c.opcfamily WHERE c.opcname = 'b22e_class' AND f.opfname = 'b22e_fam' AND c.opcintype = 23"); got != "1" {
+		t.Fatalf("post-restart pg_opclass join count = %q, want 1 (class or its family link lost)", got)
+	}
+	// Both AS-list members plus the ALTER-ADD'd loose operator.
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_amop a JOIN pg_opfamily f ON f.oid = a.amopfamily WHERE f.opfname = 'b22e_fam' AND a.oid >= 16384"); got != "2" {
+		t.Fatalf("post-restart pg_amop count = %q, want 2 (AS-list + ALTER-ADD member)", got)
+	}
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_amproc p JOIN pg_opfamily f ON f.oid = p.amprocfamily WHERE f.opfname = 'b22e_fam' AND p.oid >= 16384"); got != "1" {
+		t.Fatalf("post-restart pg_amproc count = %q, want 1", got)
+	}
+	// Class attribution: the AS-list OPERATOR/FUNCTION members keep their
+	// INTERNAL ('i') dependency on the class, while the ALTER-ADD'd member
+	// stays AUTO ('a') on the family (PG's AlterOpFamilyAdd semantics).
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_depend d JOIN pg_opclass c ON c.oid = d.refobjid WHERE d.refclassid = 2616 AND d.deptype = 'i' AND c.opcname = 'b22e_class'"); got != "2" {
+		t.Fatalf("post-restart INTERNAL class-attribution deps = %q, want 2 (member ClassOID lost)", got)
+	}
+}
+
+// TestPort_TransformSurvivesRestart pins B3.1's pg_transform heap
+// journaling: CREATE TRANSFORM reloads from its pg_transform row (kinds
+// 36/37 retired) and DROP TRANSFORM is durable.
+func TestPort_TransformSurvivesRestart(t *testing.T) {
+	c, err := cluster.New("transform-durability", cluster.Options{
+		RepoRoot:     repoRoot(t),
+		DataDir:      filepath.Join(t.TempDir(), "data"),
+		StartupWait:  20 * time.Second,
+		ShutdownWait: 20 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+
+	stmts := []string{
+		"CREATE TRANSFORM FOR int LANGUAGE sql (FROM SQL WITH FUNCTION prsd_lextype(internal), TO SQL WITH FUNCTION int4recv(internal))",
+		"CREATE TRANSFORM FOR float8 LANGUAGE sql (FROM SQL WITH FUNCTION prsd_lextype(internal))",
+		"DROP TRANSFORM FOR float8 LANGUAGE sql",
+	}
+	for _, s := range stmts {
+		if err := runSQLSimple(t, c, s); err != nil {
+			t.Fatalf("%s: %v", s, err)
+		}
+	}
+
+	if err := c.Stop(cluster.ShutdownFast); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	if err := c.Start(); err != nil {
+		t.Fatalf("restart: %v", err)
+	}
+
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_transform WHERE trftype = 23 AND oid >= 16384"); got != "1" {
+		t.Fatalf("post-restart pg_transform count for int = %q, want 1 (transform not reloaded)", got)
+	}
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_transform WHERE trftype = 701 AND oid >= 16384"); got != "0" {
+		t.Fatalf("post-restart dropped transform count = %q, want 0", got)
+	}
+}
+
+// TestPort_EventTriggerSurvivesRestart pins B3.2's pg_event_trigger heap
+// journaling: CREATE EVENT TRIGGER (with a WHEN TAG filter → evttags text[]
+// array), ALTER ENABLE/DISABLE (evtenabled UPDATE), ALTER RENAME, and DROP
+// all survive a restart via the pg_event_trigger heap reload (kinds 56-60
+// retired).
+func TestPort_EventTriggerSurvivesRestart(t *testing.T) {
+	c, err := cluster.New("event-trigger-durability", cluster.Options{
+		RepoRoot:     repoRoot(t),
+		DataDir:      filepath.Join(t.TempDir(), "data"),
+		StartupWait:  20 * time.Second,
+		ShutdownWait: 20 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+
+	stmts := []string{
+		"CREATE FUNCTION b32_et_func() RETURNS event_trigger LANGUAGE plpgsql AS 'BEGIN END'",
+		"CREATE EVENT TRIGGER b32_et ON ddl_command_start WHEN TAG IN ('CREATE TABLE', 'ALTER TABLE') EXECUTE FUNCTION b32_et_func()",
+		"ALTER EVENT TRIGGER b32_et DISABLE",
+		"ALTER EVENT TRIGGER b32_et RENAME TO b32_et2",
+		"CREATE EVENT TRIGGER b32_gone ON sql_drop EXECUTE FUNCTION b32_et_func()",
+		"DROP EVENT TRIGGER b32_gone",
+	}
+	for _, s := range stmts {
+		if err := runSQLSimple(t, c, s); err != nil {
+			t.Fatalf("%s: %v", s, err)
+		}
+	}
+
+	if err := c.Stop(cluster.ShutdownFast); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	if err := c.Start(); err != nil {
+		t.Fatalf("restart: %v", err)
+	}
+
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_event_trigger WHERE evtname = 'b32_et2' AND evtevent = 'ddl_command_start' AND evtenabled = 'D'"); got != "1" {
+		t.Fatalf("post-restart renamed+disabled event trigger count = %q, want 1 (not reloaded / ALTER lost)", got)
+	}
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_event_trigger WHERE evtname IN ('b32_et', 'b32_gone')"); got != "0" {
+		t.Fatalf("post-restart stale event-trigger names count = %q, want 0", got)
+	}
+	// The WHEN TAG filter (evttags text[]) round-trips.
+	if got := queryScalar(t, c,
+		"SELECT array_length(evttags, 1) FROM pg_event_trigger WHERE evtname = 'b32_et2'"); got != "2" {
+		t.Fatalf("post-restart evttags length = %q, want 2 (WHEN TAG array lost)", got)
+	}
+}
+
+// TestPort_PublicationSurvivesRestart pins B3.3's pg_publication +
+// pg_publication_rel heap journaling: CREATE PUBLICATION (both FOR ALL
+// TABLES and FOR TABLE with members), ALTER OWNER, and DROP all survive a
+// restart via the heap reload (kinds 50-52 retired; subscription 53-55
+// stays bespoke for B4).
+func TestPort_PublicationSurvivesRestart(t *testing.T) {
+	c, err := cluster.New("publication-durability", cluster.Options{
+		RepoRoot:     repoRoot(t),
+		DataDir:      filepath.Join(t.TempDir(), "data"),
+		StartupWait:  20 * time.Second,
+		ShutdownWait: 20 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+
+	stmts := []string{
+		"CREATE TABLE b33_t1 (a int)",
+		"CREATE TABLE b33_t2 (a int)",
+		"CREATE ROLE b33_owner",
+		"CREATE PUBLICATION b33_all FOR ALL TABLES",
+		"CREATE PUBLICATION b33_some FOR TABLE b33_t1, b33_t2 WITH (publish = 'insert, update')",
+		"ALTER PUBLICATION b33_some OWNER TO b33_owner",
+		"CREATE PUBLICATION b33_gone FOR ALL TABLES",
+		"DROP PUBLICATION b33_gone",
+	}
+	for _, s := range stmts {
+		if err := runSQLSimple(t, c, s); err != nil {
+			t.Fatalf("%s: %v", s, err)
+		}
+	}
+
+	if err := c.Stop(cluster.ShutdownFast); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	if err := c.Start(); err != nil {
+		t.Fatalf("restart: %v", err)
+	}
+
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_publication WHERE pubname = 'b33_all' AND puballtables"); got != "1" {
+		t.Fatalf("post-restart FOR ALL TABLES publication count = %q, want 1 (not reloaded)", got)
+	}
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_publication WHERE pubname = 'b33_some' AND NOT puballtables AND pubinsert AND pubupdate AND NOT pubdelete"); got != "1" {
+		t.Fatalf("post-restart FOR TABLE publication (publish flags) count = %q, want 1", got)
+	}
+	// The two member relations round-trip through the PubSub registry, which
+	// goopg exposes as pg_publication_tables and which the reload repopulates
+	// from the pg_publication_rel heap.
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_publication_tables WHERE pubname = 'b33_some'"); got != "2" {
+		t.Fatalf("post-restart publication member count = %q, want 2 (pub.Tables not reloaded)", got)
+	}
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_publication WHERE pubname = 'b33_gone'"); got != "0" {
+		t.Fatalf("post-restart dropped publication count = %q, want 0", got)
+	}
+}
+
+// TestPort_ForeignDataSurvivesRestart pins B3.4's pg_foreign_data_wrapper +
+// pg_foreign_server + pg_user_mapping heap journaling: CREATE FOREIGN DATA
+// WRAPPER (which gained restart durability in this slice), CREATE SERVER
+// (srvfdw → FDW OID), CREATE USER MAPPING (umserver → server OID, umuser →
+// role OID), and the drops all survive a restart (kinds 126-129 retired).
+func TestPort_ForeignDataSurvivesRestart(t *testing.T) {
+	c, err := cluster.New("foreign-data-durability", cluster.Options{
+		RepoRoot:     repoRoot(t),
+		DataDir:      filepath.Join(t.TempDir(), "data"),
+		StartupWait:  20 * time.Second,
+		ShutdownWait: 20 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+
+	stmts := []string{
+		"CREATE ROLE b34_role",
+		"CREATE FOREIGN DATA WRAPPER b34_fdw",
+		"CREATE SERVER b34_srv FOREIGN DATA WRAPPER b34_fdw",
+		"CREATE USER MAPPING FOR b34_role SERVER b34_srv",
+		"CREATE SERVER b34_gone FOREIGN DATA WRAPPER b34_fdw",
+		"DROP SERVER b34_gone",
+	}
+	for _, s := range stmts {
+		if err := runSQLSimple(t, c, s); err != nil {
+			t.Fatalf("%s: %v", s, err)
+		}
+	}
+
+	if err := c.Stop(cluster.ShutdownFast); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	if err := c.Start(); err != nil {
+		t.Fatalf("restart: %v", err)
+	}
+
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_foreign_data_wrapper WHERE fdwname = 'b34_fdw'"); got != "1" {
+		t.Fatalf("post-restart FDW count = %q, want 1 (FDW durability not added / reloaded)", got)
+	}
+	// The server's srvfdw resolves back to the FDW by OID after reload.
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_foreign_server s JOIN pg_foreign_data_wrapper f ON f.oid = s.srvfdw WHERE s.srvname = 'b34_srv' AND f.fdwname = 'b34_fdw'"); got != "1" {
+		t.Fatalf("post-restart server→FDW join count = %q, want 1 (srvfdw lost)", got)
+	}
+	// The user mapping's umserver + umuser resolve back by OID.
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_user_mappings WHERE srvname = 'b34_srv' AND usename = 'b34_role'"); got != "1" {
+		t.Fatalf("post-restart user-mapping count = %q, want 1 (umserver/umuser lost)", got)
+	}
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_foreign_server WHERE srvname = 'b34_gone'"); got != "0" {
+		t.Fatalf("post-restart dropped server count = %q, want 0", got)
+	}
+}
+
+// TestPort_TSDictSurvivesRestart pins B3.5's pg_ts_dict heap journaling:
+// CREATE TEXT SEARCH DICTIONARY, ALTER (RENAME / SET SCHEMA / options), and
+// DROP all survive a restart via the pg_ts_dict heap reload (kinds
+// 104/105/114/115/116 retired).
+func TestPort_TSDictSurvivesRestart(t *testing.T) {
+	c, err := cluster.New("tsdict-durability", cluster.Options{
+		RepoRoot:     repoRoot(t),
+		DataDir:      filepath.Join(t.TempDir(), "data"),
+		StartupWait:  20 * time.Second,
+		ShutdownWait: 20 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+
+	stmts := []string{
+		"CREATE SCHEMA b35_s",
+		"CREATE TEXT SEARCH DICTIONARY b35_dict (TEMPLATE = pg_catalog.simple, STOPWORDS = english)",
+		"ALTER TEXT SEARCH DICTIONARY b35_dict RENAME TO b35_dict2",
+		"ALTER TEXT SEARCH DICTIONARY b35_dict2 SET SCHEMA b35_s",
+		"CREATE TEXT SEARCH DICTIONARY b35_gone (TEMPLATE = pg_catalog.simple)",
+		"DROP TEXT SEARCH DICTIONARY b35_gone",
+	}
+	for _, s := range stmts {
+		if err := runSQLSimple(t, c, s); err != nil {
+			t.Fatalf("%s: %v", s, err)
+		}
+	}
+
+	if err := c.Stop(cluster.ShutdownFast); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	if err := c.Start(); err != nil {
+		t.Fatalf("restart: %v", err)
+	}
+
+	// Renamed + moved to schema b35_s, with its init options intact.
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_ts_dict d JOIN pg_namespace n ON n.oid = d.dictnamespace WHERE d.dictname = 'b35_dict2' AND n.nspname = 'b35_s' AND d.dictinitoption IS NOT NULL"); got != "1" {
+		t.Fatalf("post-restart renamed+moved dict count = %q, want 1 (not reloaded / ALTER lost)", got)
+	}
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_ts_dict WHERE dictname IN ('b35_dict', 'b35_gone')"); got != "0" {
+		t.Fatalf("post-restart stale dict names count = %q, want 0", got)
+	}
+}
+
+// TestPort_TSConfigSurvivesRestart pins B3.6's pg_ts_config +
+// pg_ts_config_map heap journaling: CREATE TEXT SEARCH CONFIGURATION, ADD
+// MAPPING (config_map rows), ALTER (RENAME / SET SCHEMA), and DROP all
+// survive a restart (kinds 106-113 retired).
+func TestPort_TSConfigSurvivesRestart(t *testing.T) {
+	c, err := cluster.New("tsconfig-durability", cluster.Options{
+		RepoRoot:     repoRoot(t),
+		DataDir:      filepath.Join(t.TempDir(), "data"),
+		StartupWait:  20 * time.Second,
+		ShutdownWait: 20 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+
+	stmts := []string{
+		"CREATE SCHEMA b36_s",
+		"CREATE TEXT SEARCH CONFIGURATION b36_cfg (PARSER = pg_catalog.default)",
+		"ALTER TEXT SEARCH CONFIGURATION b36_cfg ADD MAPPING FOR asciiword, word WITH simple",
+		"ALTER TEXT SEARCH CONFIGURATION b36_cfg RENAME TO b36_cfg2",
+		"ALTER TEXT SEARCH CONFIGURATION b36_cfg2 SET SCHEMA b36_s",
+		"CREATE TEXT SEARCH CONFIGURATION b36_gone (PARSER = pg_catalog.default)",
+		"DROP TEXT SEARCH CONFIGURATION b36_gone",
+	}
+	for _, s := range stmts {
+		if err := runSQLSimple(t, c, s); err != nil {
+			t.Fatalf("%s: %v", s, err)
+		}
+	}
+
+	if err := c.Stop(cluster.ShutdownFast); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	if err := c.Start(); err != nil {
+		t.Fatalf("restart: %v", err)
+	}
+
+	// Renamed + moved to b36_s.
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_ts_config cfg JOIN pg_namespace n ON n.oid = cfg.cfgnamespace WHERE cfg.cfgname = 'b36_cfg2' AND n.nspname = 'b36_s'"); got != "1" {
+		t.Fatalf("post-restart renamed+moved config count = %q, want 1 (not reloaded / ALTER lost)", got)
+	}
+	// The two ADD MAPPING entries (asciiword, word → simple) round-tripped
+	// through pg_ts_config_map.
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_ts_config_map m JOIN pg_ts_config cfg ON cfg.oid = m.mapcfg WHERE cfg.cfgname = 'b36_cfg2'"); got != "2" {
+		t.Fatalf("post-restart pg_ts_config_map count = %q, want 2 (mappings lost)", got)
+	}
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_ts_config WHERE cfgname IN ('b36_cfg', 'b36_gone')"); got != "0" {
+		t.Fatalf("post-restart stale config names count = %q, want 0", got)
+	}
+}
+
+// TestPort_AccessMethodSurvivesRestart pins B3.7's pg_am heap journaling:
+// CREATE ACCESS METHOD and DROP both survive a restart via the pg_am heap
+// seq-scan reload (kinds 70/71 retired).
+func TestPort_AccessMethodSurvivesRestart(t *testing.T) {
+	c, err := cluster.New("access-method-durability", cluster.Options{
+		RepoRoot:     repoRoot(t),
+		DataDir:      filepath.Join(t.TempDir(), "data"),
+		StartupWait:  20 * time.Second,
+		ShutdownWait: 20 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+
+	stmts := []string{
+		"CREATE FUNCTION public.b37_am_handler(internal) RETURNS index_am_handler LANGUAGE c AS 'b37_am_handler'",
+		"CREATE ACCESS METHOD b37_am TYPE INDEX HANDLER b37_am_handler",
+		"CREATE ACCESS METHOD b37_gone TYPE INDEX HANDLER b37_am_handler",
+		"DROP ACCESS METHOD b37_gone",
+	}
+	for _, s := range stmts {
+		if err := runSQLSimple(t, c, s); err != nil {
+			t.Fatalf("%s: %v", s, err)
+		}
+	}
+
+	if err := c.Stop(cluster.ShutdownFast); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	if err := c.Start(); err != nil {
+		t.Fatalf("restart: %v", err)
+	}
+
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_am WHERE amname = 'b37_am' AND amtype = 'i'"); got != "1" {
+		t.Fatalf("post-restart access method count = %q, want 1 (not reloaded)", got)
+	}
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_am WHERE amname = 'b37_gone'"); got != "0" {
+		t.Fatalf("post-restart dropped access method count = %q, want 0", got)
+	}
+}
+
+// TestPort_TablespaceSurvivesRestart validates B4.1: CREATE/DROP TABLESPACE
+// journals a real pg_tablespace SHARED heap row (global/1213) + pg_shdepend
+// owner dep + RM_TBLSPC record, and a restart reloads the registry from the
+// heap (reloadUserTablespacesFromHeap) — no bespoke kind 124/125 record.
+func TestPort_TablespaceSurvivesRestart(t *testing.T) {
+	c, err := cluster.New("tablespace-durability", cluster.Options{
+		RepoRoot:     repoRoot(t),
+		DataDir:      filepath.Join(t.TempDir(), "data"),
+		StartupWait:  20 * time.Second,
+		ShutdownWait: 20 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+
+	// allow_in_place_tablespaces is a per-session GUC (BootVal off); keep the
+	// SET in the same simple-query batch as the CREATEs so it applies.
+	if err := runSQLSimple(t, c,
+		"SET allow_in_place_tablespaces = on;"+
+			"CREATE TABLESPACE b41_ts LOCATION '';"+
+			"CREATE TABLESPACE b41_gone LOCATION '';"+
+			"DROP TABLESPACE b41_gone"); err != nil {
+		t.Fatalf("create/drop tablespace: %v", err)
+	}
+
+	if err := c.Stop(cluster.ShutdownFast); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	if err := c.Start(); err != nil {
+		t.Fatalf("restart: %v", err)
+	}
+
+	// Surviving tablespace present, with the resolved owner OID (superuser 10),
+	// after reload from the pg_tablespace heap.
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_tablespace WHERE spcname = 'b41_ts' AND spcowner = 10"); got != "1" {
+		t.Fatalf("post-restart tablespace count = %q, want 1 (reloaded from heap)", got)
+	}
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_tablespace WHERE spcname = 'b41_gone'"); got != "0" {
+		t.Fatalf("post-restart dropped tablespace count = %q, want 0", got)
+	}
+}
+
+// TestPort_DbRoleSettingSurvivesRestart validates B4.2: ALTER DATABASE/ROLE
+// SET/RESET journals a real pg_db_role_setting SHARED heap row (global/2964),
+// and a restart reloads the overrides from it (reloadDbRoleSettingsFromHeap) —
+// no bespoke kind 73-78 record.
+func TestPort_DbRoleSettingSurvivesRestart(t *testing.T) {
+	c, err := cluster.New("dbrolesetting-durability", cluster.Options{
+		RepoRoot:     repoRoot(t),
+		DataDir:      filepath.Join(t.TempDir(), "data"),
+		StartupWait:  20 * time.Second,
+		ShutdownWait: 20 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+
+	stmts := []string{
+		"ALTER DATABASE postgres SET search_path TO b42_dbval",
+		"ALTER ROLE postgres SET statement_timeout TO 12345",
+		"ALTER ROLE postgres SET lock_timeout TO 6789",
+		"ALTER ROLE postgres RESET lock_timeout", // exercise the delete-entry path
+	}
+	for _, s := range stmts {
+		if err := runSQLSimple(t, c, s); err != nil {
+			t.Fatalf("%s: %v", s, err)
+		}
+	}
+
+	if err := c.Stop(cluster.ShutdownFast); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	if err := c.Start(); err != nil {
+		t.Fatalf("restart: %v", err)
+	}
+
+	// Surviving overrides present after reload from the heap.
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_db_role_setting WHERE setconfig::text LIKE '%search_path=b42_dbval%'"); got != "1" {
+		t.Fatalf("post-restart database config count = %q, want 1 (reloaded from heap)", got)
+	}
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_db_role_setting WHERE setconfig::text LIKE '%statement_timeout=12345%'"); got != "1" {
+		t.Fatalf("post-restart role config count = %q, want 1 (reloaded from heap)", got)
+	}
+	// The RESET lock_timeout entry must be gone.
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_db_role_setting WHERE setconfig::text LIKE '%lock_timeout%'"); got != "0" {
+		t.Fatalf("post-restart reset config count = %q, want 0 (entry removed)", got)
 	}
 }

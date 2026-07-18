@@ -118,7 +118,7 @@ func TestPort_Recovery013CrashRestart(t *testing.T) {
 	// M0106-0013: crash-recovery durability gap closed. Test re-enabled.
 	// upstream: postgres/src/test/recovery/t/013_crash_restart.pl
 
-	c := newCluster(t, "recovery013")
+	c := newDurableCluster(t, "recovery013")
 	mustInitStart(t, c)
 
 	ctx := context.Background()
@@ -169,7 +169,7 @@ func TestPort_Recovery019ReplslotLimit(t *testing.T) {
 	}
 	// upstream: postgres/src/test/recovery/t/019_replslot_limit.pl
 
-	c := newCluster(t, "recovery019")
+	c := newDurableCluster(t, "recovery019")
 	if err := c.Init(); err != nil {
 		t.Fatal(err)
 	}
@@ -224,7 +224,7 @@ func TestPort_Recovery038SaveLogicalSlots(t *testing.T) {
 	}
 	// upstream: postgres/src/test/recovery/t/038_save_logical_slots_shutdown.pl
 
-	c := newCluster(t, "recovery038")
+	c := newDurableCluster(t, "recovery038")
 	if err := c.Init(); err != nil {
 		t.Fatal(err)
 	}
@@ -296,7 +296,7 @@ func TestPort_Recovery039EndOfWal(t *testing.T) {
 	}
 	// upstream: postgres/src/test/recovery/t/039_end_of_wal.pl
 
-	c := newCluster(t, "recovery039")
+	c := newDurableCluster(t, "recovery039")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
 
@@ -362,7 +362,7 @@ func TestPort_Recovery047CheckpointPhysicalSlot(t *testing.T) {
 	}
 	// upstream: postgres/src/test/recovery/t/047_checkpoint_physical_slot.pl
 
-	c := newCluster(t, "recovery047")
+	c := newDurableCluster(t, "recovery047")
 	if err := c.Init(); err != nil {
 		t.Fatal(err)
 	}

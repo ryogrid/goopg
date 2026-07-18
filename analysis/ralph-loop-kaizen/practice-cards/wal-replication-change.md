@@ -18,6 +18,12 @@ bug corrupts data silently and only shows under concurrency or after a restart.
 
 ## Known traps
 
+- **Durability allowlist:** crash-recovery / WAL-replay / restart-durability
+  tests must NOT use `--no-sync` init, `fsync=off`, or the cached init
+  template — they assert the durable path itself. New recovery tests default
+  to the durable configuration (`SyncInit: true` + `SyncRuntime: true` in
+  `testutil/cluster`; `newDurableCluster` in testport). List and criteria:
+  ci/design/test-gate-speedups/02 §4.
 - **Standby hot-read MVCC visibility:** replaying a commit must advance the
   visibility horizon (`ReplayXactCommit` → nextXID) or standby reads see stale /
   missing rows (M0094-0005). Verify reads on the standby, not just the primary.

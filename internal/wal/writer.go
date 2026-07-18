@@ -164,6 +164,19 @@ type Config struct {
 	// docs/design/0007-0002-fdatasync-commit-path.md.
 	SyncMethod string
 
+	// FsyncDisabled mirrors `fsync = off` (inverted so the zero value
+	// keeps the durable default): doSync — the per-commit-group
+	// durability barrier — becomes a no-op. Ring drains, pwrites, and
+	// LSN accounting are unchanged (flushedLSN still advances, exactly
+	// like upstream's logFlushResult under fsync=off), so process-crash
+	// recovery still replays everything; only host-crash durability is
+	// forfeit. Segment-lifecycle syncs (preallocation, dir fsyncs on
+	// create/recycle) are deliberately NOT gated: they run once per
+	// 16 MiB segment, off the commit path, and keeping them durable
+	// costs nothing measurable. Test harnesses only. See
+	// ci/design/test-gate-speedups/02-durability-off-for-test-servers.md.
+	FsyncDisabled bool
+
 	// MinWALSize mirrors upstream's `min_wal_size` GUC (bytes). It sets
 	// the floor on how many WAL segments RemoveOldSegments keeps around
 	// as pre-zeroed spares by renaming obsolete segments into fresh
@@ -1902,6 +1915,13 @@ func (s *state) drainBufferUpTo(targetLSN uint64) error {
 // two-way switch — "fsync" flushes inode metadata too, everything
 // else (the "fdatasync" default) skips it.
 func (s *state) doSync(f *os.File) error {
+	// fsync=off: skip the durability syscall itself (and nothing else),
+	// mirroring upstream's pg_fsync/enableFsync short-circuit. The caller's
+	// fsyncCount still counts the sync *request*, as upstream's wal_sync
+	// stat does.
+	if s.cfg.FsyncDisabled {
+		return nil
+	}
 	if s.cfg.SyncMethod == "fsync" {
 		return fullSync(f)
 	}

@@ -112,6 +112,86 @@ func keyMetaForSysBtree(indexOID uint32) (btreeIndexKeyMeta, bool) {
 		return btreeIndexKeyMeta{tupleSize: 16, nkeyatts: 1}, true
 	case pgOperatorOprnameLRNIndexOID:
 		return btreeIndexKeyMeta{tupleSize: 88, nkeyatts: 4}, true
+	// B3.6: pg_ts_config (3712 oid / 3608 cfgname+cfgnamespace {80,2}) +
+	// pg_ts_config_map (3609 mapcfg+maptokentype+mapseqno oid+int4+int4
+	// {24,3}). All empty placeholders → lazy-root.
+	case pgTSConfigOidIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 16, nkeyatts: 1}, true
+	case pgTSConfigNameNspIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 80, nkeyatts: 2}, true
+	case pgTSConfigMapIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 24, nkeyatts: 3}, true
+	// B3.5: pg_ts_dict — 3604 (dictname+dictnamespace name+oid {80,2}) + 3605
+	// (oid); both empty placeholders → lazy-root.
+	case pgTSDictOidIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 16, nkeyatts: 1}, true
+	case pgTSDictNameNspIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 80, nkeyatts: 2}, true
+	// B3.4: foreign-data trio — pg_foreign_data_wrapper (112 oid / 548
+	// fdwname), pg_foreign_server (113 oid / 549 srvname), pg_user_mapping
+	// (174 oid / 175 umuser+umserver). All empty placeholders → lazy-root.
+	case pgFdwOidIndexOID, pgForeignServerOidIdxID, pgUserMappingOidIdxID:
+		return btreeIndexKeyMeta{tupleSize: 16, nkeyatts: 1}, true
+	case pgFdwNameIndexOID, pgForeignServerNameIdx:
+		return btreeIndexKeyMeta{tupleSize: 72, nkeyatts: 1}, true
+	case pgUserMappingUserSrvIdx:
+		return btreeIndexKeyMeta{tupleSize: 16, nkeyatts: 2}, true
+	// B3.3: pg_publication (6110 oid / 6111 pubname NameData {72,1}) +
+	// pg_publication_rel (6112 oid / 6113 prrelid+prpubid {16,2}). All four
+	// ship as empty placeholders the runtime lazily roots.
+	case pgPublicationOidIndexOID, pgPublicationRelOidIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 16, nkeyatts: 1}, true
+	case pgPublicationPubnameIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 72, nkeyatts: 1}, true
+	case pgPublicationRelPrrelidPrpubOID:
+		return btreeIndexKeyMeta{tupleSize: 16, nkeyatts: 2}, true
+	// B3.2: pg_event_trigger — both indexes ship as empty metapage-only
+	// placeholders (no builtin event triggers); the runtime lazily roots
+	// them. 3467 is a single 64-byte NameData key (evtname), like
+	// pg_namespace_nspname_index.
+	case pgEventTriggerOidIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 16, nkeyatts: 1}, true
+	case pgEventTriggerEvtnameIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 72, nkeyatts: 1}, true
+	// B3.1: pg_transform — both indexes ship as empty metapage-only
+	// placeholders (pg_transform.dat has no builtin rows); the runtime
+	// lazily roots them.
+	case pgTransformOidIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 16, nkeyatts: 1}, true
+	case pgTransformTypeLangIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 16, nkeyatts: 2}, true
+	// B4.1e: pg_tablespace (SHARED, global/) — 2697 oid / 2698 spcname
+	// (name-only). Both bootstrap-populated with the two default rows.
+	case pgTablespaceOidIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 16, nkeyatts: 1}, true
+	case pgTablespaceSpcnameIndexID:
+		return btreeIndexKeyMeta{tupleSize: 72, nkeyatts: 1}, true
+	// B2.2 slice 5: pg_opfamily (2754/2755 populated) + pg_opclass (2687
+	// populated, 2686 empty placeholder) + pg_amop (2653/2654 empty
+	// placeholders) + pg_amproc (2655 populated). The name-bearing keys put
+	// the access-method OID FIRST (opfmethod/opcmethod), unlike the
+	// name-first pg_class/pg_type family.
+	case pgOpfamilyOidIndexOID, pgOpclassOidIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 16, nkeyatts: 1}, true
+	case pgOpfamilyAmNameNspIndexOID, pgOpclassAmNameNspIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 80, nkeyatts: 3}, true
+	case pgAmopFamStratIndexOID, pgAmprocFamProcIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 24, nkeyatts: 4}, true
+	case pgAmopOprFamIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 24, nkeyatts: 3}, true
+	// B2.2 slice 4: pg_collation (3085/3164 bootstrap-populated) +
+	// pg_conversion (2670 populated; 2668/2669 empty placeholders that the
+	// runtime lazily roots).
+	case pgCollationOidIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 16, nkeyatts: 1}, true
+	case pgCollationNameEncNspIndexID:
+		return btreeIndexKeyMeta{tupleSize: 80, nkeyatts: 3}, true
+	case pgConversionOidIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 16, nkeyatts: 1}, true
+	case pgConversionNameNspIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 80, nkeyatts: 2}, true
+	case pgConversionDefaultIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 24, nkeyatts: 4}, true
 	default:
 		return btreeIndexKeyMeta{}, false
 	}

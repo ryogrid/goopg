@@ -418,6 +418,9 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		walSenderMemBuf := int64(intGUC(registry, "wal_sender_memory_buffer", 16<<20))
 		walBuffers := int64(intGUC(registry, "wal_buffers", 16<<20))
 		walSyncMethod := stringGUC(registry, "wal_sync_method", "fdatasync")
+		// fsync=off (test harnesses only) turns every runtime durability
+		// sync into a no-op; write ordering/content are unchanged.
+		fsyncEnabled := boolGUC(registry, "fsync", true)
 		// min_wal_size/max_wal_size are stored in MB (matching upstream);
 		// wal.Config.MinWALSize/MaxWALSize want bytes.
 		walMinSizeBytes := int64(intGUC(registry, "min_wal_size", 80)) * 1024 * 1024
@@ -448,6 +451,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			WALSenderMemoryBuffer: walSenderMemBuf,
 			WALBuffers:            walBuffers,
 			WALSyncMethod:         walSyncMethod,
+			FsyncDisabled:         !fsyncEnabled,
 			WALMinSize:            walMinSizeBytes,
 			WALMaxSize:            walMaxSizeBytes,
 			CommitDelayUs:         int64(intGUC(registry, "commit_delay", 0)),

@@ -43,7 +43,7 @@ func TestBuildPgControlDataChecksumVersion(t *testing.T) {
 // stamp pass missed — an unbootable-cluster bug — fails this test.
 func TestInitDataChecksumsBootstrapsVerifiablePages(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "cluster")
-	if err := Init(Options{DataDir: dir, DataChecksums: true}); err != nil {
+	if err := Init(Options{DataDir: dir, DataChecksums: true, NoSync: true}); err != nil {
 		t.Fatalf("Init with DataChecksums=true: %v", err)
 	}
 

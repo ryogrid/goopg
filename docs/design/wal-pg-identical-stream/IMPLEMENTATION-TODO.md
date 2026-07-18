@@ -295,7 +295,8 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
   protrftypes/probin/proconfig/proacl — PG branches on attisnull (stringToNode("") on every SQL
   function call); now genuinely NULL (pg_class builder convention). e2e failover extended: goopg
   CREATE FUNCTION over WAL → promoted PG resolves by name (2691) AND executes it (2690 + prosrc).
-- [ ] **B2** type/operator families — B2.1 (pg_type/enum/range/domain) COMPLETE below; **B2.2 staged
+- [x] **B2** type/operator families — **COMPLETE**: B2.1 (pg_type/enum/range/domain) + B2.2 (cast/
+  aggregate/operator/collation+conversion/opclass-family) all landed below; **B2.2 staged
   plan (survey 2026-07-17)**, one catalog per landing on the B2.1 template (heap rows + index entries
   via descent machinery + physical reload + kind retirement + e2e probe where PG-side read exists):
   1. **pg_cast** — DONE (B2.2a entry below; kinds 38/39 retired, scanner cast_ddl_recovery.go dead);
@@ -303,14 +304,56 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
      aggregate_ddl_recovery.go dead);
   3. **pg_operator** — DONE (B2.2c entry below; kinds 83/84 retired, scanner
      operator_ddl_recovery.go dead);
-  4. **pg_collation** (kinds 42-45/93) + **pg_conversion** (kinds 40/41/130-132) — BOTH registries'
-     *DuringRecovery still FORCE DefaultDBOid (catalog.go:12653/:12776 — the domain/range/enum bug
-     class, fix like RegisterDomainDuringRecovery); indexes populated (3085/3164, 2668-2670);
-  5. **opclass/opfamily/amop/amproc** (kinds 85-92; 9 emit sites; opfamily/opclass recovery already
-     DBOid-guarded; indexes: 2686/2653/2654 are EMPTY placeholders → lazy-root handles).
+  4. **pg_collation + pg_conversion** — DONE (B2.2d entry below; kinds 40-45/93/130-132 retired,
+     scanners collation_ddl_recovery.go + conversion_ddl_recovery.go dead);
+  5. **opclass/opfamily/amop/amproc** — DONE (B2.2e entry below; kinds 85-92 retired, scanner
+     operator_class_ddl_recovery.go dead). **B2.2 COMPLETE — all five slices landed.**
   Remaining rmid-128 kinds AFTER B2.2: text-search 104-116, statistics 95-99 (wal/statistics_ddl.go),
   access-method 70/71, transform 36/37, event-trigger 56-60, pub/sub 50-55, foreign-data 126-129,
   role/db-config/tablespace/matview/view/index-rename 67-80/94/102-103/124-125 (B3/B4 scope).
+  - [x] **B2.2e opclass/opfamily/amop/amproc (kinds 85-92 retired) — B2.2 COMPLETE** — LANDED.
+    `sys_pg_opclass_family.go`: four FormData builders (pg_opfamily 5-col, pg_opclass 9-col,
+    pg_amop 9-col, pg_amproc 6-col — note the AM OID comes BEFORE the name in both opfamily and
+    opclass, unlike the pg_class/pg_type name-first family) + 9 emit-site swaps (CREATE FAMILY ×2
+    incl. the anonymous family CREATE OPERATOR CLASS auto-creates, CREATE CLASS, amop/amproc
+    member create ×2, ALTER OPERATOR FAMILY DROP member ×2, DROP CLASS, DROP FAMILY). No ALTER
+    RENAME/OWNER surface exists for these objects, so INSERT-at-create + xmax-at-drop only — no
+    TID cache. Indexes: 2754/2755/2687/2655 populated, 2686/2653/2654 lazy-rooted placeholders;
+    three new key builders (oid+name+oid 80B; oid+oid+oid+int2 24B signed-int2 tail;
+    oid+char+oid 24B with the 1-byte-aligned char at offset 4 and the trailing oid re-aligned to
+    8) — all byte-verified against their initdb twins. **ClassOID solved PG-faithfully:**
+    AmOpMember/AmProcMember.ClassOID drives the pg_depend view's INTERNAL-vs-AUTO deptype but
+    pg_amop/pg_amproc have NO column for it — PG's own channel is an INTERNAL pg_depend row on
+    the opclass (opclasscmds.c storeOperators), so the member writers now journal exactly that
+    row (extending B1.3b's narrow pg_depend surface) and the reload re-derives ClassOID from it;
+    an ALTER OPERATOR FAMILY ADD member gets no row, and its zero ClassOID is correct by
+    construction (PG gives those an AUTO dep on the family). Reload order: opfamily → opclass →
+    pg_depend attribution scan → amop/amproc; AmProcMember.Method (goopg-only field — pg_amproc
+    has no amprocmethod) re-derives from the owning family. Scanner + wal test file deleted;
+    kinds 85-92 + 4 payload structs + 16 codec funcs + dispatch case excised (505-line pure
+    deletion). TestPort_OpClassFamilySurvivesRestart green first try (family/class/members +
+    both attribution modes + drops); waldump workload += the full opclass/opfamily DDL set.
+  - [x] **B2.2d pg_collation + pg_conversion (kinds 40-45/93/130-132 retired)** — LANDED.
+    `sys_pg_collation.go` (12-col FormData builder; empty registry strings → NULL; collversion
+    always NULL) + `sys_pg_conversion.go` (8-col; conproc = FuncOID); upsert/TID-cache shape from
+    B2.2c (collationHeapTIDs/conversionHeapTIDs on InMemory) — CREATE = INSERT, ALTER
+    RENAME/OWNER/SET SCHEMA = canonical heap UPDATEs, DROP = xmax with MaterializeWriterXID.
+    Indexes: 3085 {16,1} + 3164 {80,3 name+int4+oid, SIGNED int4 compare — collencoding=-1 sorts
+    first, executor twin of pgBuildIndexTupleNameInt4OidKey} populated; 2670 {16,1} populated;
+    2669 {80,2} + 2668 {24,4 oid+int4+int4+oid} empty placeholders (lazy-root). Reload fully
+    physical; conversion ProcSchema/ProcName fallback re-derived from conproc via routines
+    registry / curated builtins. **DBOid discovery (inverts the survey's assumption):**
+    collation/conversion registries key live postgres-DB sessions under DefaultDBOid
+    (NamespaceDBOid maps 5→1 for namespace-scoped registries) — registering the reload under
+    cat.DBOID()=5 made every post-restart lookup MISS (empirically). The *DuringRecovery methods
+    now respect a caller-set DBOid with the DefaultDBOid zero-fallback; the reload leaves DBOid
+    unset. This differs from domains/enums (which DO key on the resolved session DB) — check
+    NamespaceDBOid per registry before assuming the B2.1b bug class. BONUS FIX: ALTER CONVERSION
+    RENAME left the compat-registry entry under the ORIGINAL name, so rename→drop failed 42704
+    (DROP CONVERSION's existence gate is DropCompatObject) — the rename now moves the entry.
+    Scanners + wal collation/conversion test files deleted; 10 kinds + 20 codec funcs + 2
+    dispatch cases excised (764-line pure deletion). TestPort_CollationSurvivesRestart +
+    TestPort_ConversionSurvivesRestart green; waldump workload += COLLATION/CONVERSION DDL.
   - [x] **B2.2c pg_operator (kinds 83/84 retired)** — LANDED. `sys_pg_operator.go`: 15-col
     FormData_pg_operator builder (oprresult resolved from oprcode via routines registry /
     curated-builtin reversal, 0 for shells); `upsertOperatorCatalogRow` maps PG's two-pass
@@ -422,9 +465,130 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
     'happy'::public.b2prep_mood (enum_in → 3503 → goopg's runtime rows). New
     TestPort_EnumSurvivesRestart (create/add/rename/drop across restart); waldump += enum DDL.
 - [ ] **B3** extension/config (pg_ts_*, pg_transform, pg_event_trigger, pg_publication*/subscription*,
-  pg_statistic_ext, pg_constraint/attrdef/depend).
+  pg_statistic_ext, pg_constraint/attrdef/depend). **IN PROGRESS.**
+  - [x] **B3.7 pg_am (kinds 70/71 retired)** — LANDED. `sys_pg_am.go`: 4-col FormData_pg_am builder
+    (oid, amname, amhandler already an OID, amtype 'i'/'t' char). NARROW SURFACE like B1.3b's
+    pg_depend writer — NO index maintenance: goopg bootstraps neither pg_am_oid_index (2652) nor
+    pg_am_name_index (2651) (they are ABSENT, not empty placeholders), so a runtime index insert
+    has nowhere to land; the reload seq-scans the pg_am heap (oid >= FirstUserOID). CREATE writes
+    the row (xmax-stamp-then-insert; no OR REPLACE form); DROP xmax's it via FindAccessMethod-
+    captured OID. Scanner access_method_ddl_recovery.go(+test) + wal/access_method_ddl_test.go
+    deleted; kinds 70/71 + 4 codecs + dispatch excised. TestPort_AccessMethodSurvivesRestart green
+    (CREATE + DROP); waldump += CREATE/DROP ACCESS METHOD. RESIDUAL (ledger): adding the two pg_am
+    indexes populated with the 7 built-in AM rows (the B2.1a 2704 pattern) is a separate
+    standby-completeness task — goopg never had them, so this slice does not regress the standby.
+  - [x] **B3.6 pg_ts_config + pg_ts_config_map (kinds 106-113 retired) — TS group COMPLETE** —
+    LANDED. `sys_pg_ts_config.go`: 5-col FormData_pg_ts_config base builder (cfgparser already an
+    OID) with a TID cache (tsConfigHeapTIDs, for ALTER RENAME/SET SCHEMA base-row UPDATEs) + 4-col
+    FormData_pg_ts_config_map (no oid; mapcfg=config OID, maptokentype=numeric token type via new
+    catalog.TSTokenTypeID, mapseqno=dict index in the token's run, mapdict=pg_ts_dict OID). goopg
+    stores mappings inline on UserTSConfig, so EVERY mutation (CREATE + copy-loop, ADD/DROP/REPLACE/
+    ALTER MAPPING) re-syncs the whole config_map row-set via syncTSConfigMapRows (stamp all rows for
+    mapcfg, rewrite from Mappings) — one uniform path replacing 8 bespoke record kinds. Indexes 3712
+    (oid) + 3608 (cfgname+cfgnamespace {80,2}) + 3609 (mapcfg+maptokentype+mapseqno oid+int4+int4
+    {24,3}, new buildIndexTupleOidInt4Int4Key/cmpKeyOidInt4Int4) empty placeholders → lazy-root.
+    Reload: 2-pass (config_map grouped mapcfg→tokType→seqno→dictOID, token int→alias via
+    TSTokenTypeAlias; then base rows → assemble UserTSConfig w/ inline Mappings →
+    CreateTSConfigDuringRecovery); runs after the pg_ts_dict reload. DROP config returns on
+    successful registry drop (the B3.5 rename-then-drop compat-gate fix, applied here). Scanner
+    tsconfig_ddl_recovery.go + the (now config-only) combined test files deleted. TestPort_TSConfig
+    SurvivesRestart green (add-mapping + rename + set schema + config_map round-trip); waldump +=
+    CREATE/ADD MAPPING/RENAME/DROP TS CONFIGURATION. **With B3.5+B3.6, the entire text-search catalog
+    group (pg_ts_dict/config/config_map, kinds 104-116) is heap-journaled.**
+  - [x] **B3.5 pg_ts_dict (kinds 104/105/114/115/116 retired)** — LANDED. `sys_pg_ts_dict.go`:
+    6-col FormData_pg_ts_dict builder (all direct — dicttemplate already an OID in UserTSDict,
+    dictinitoption the serialized options text, NULL when empty) + TID cache (tsDictHeapTIDs, for
+    ALTER RENAME/SET SCHEMA/OPTIONS heap UPDATEs) + DROP xmax. Indexes 3604 (dictname+dictnamespace
+    {80,2}) + 3605 (oid) empty placeholders → lazy-root. Reload reverses dictnamespace → schema
+    name; new FindTSDict helper captures the OID at the emit sites. **Text search CONFIGURATION
+    (pg_ts_config + config_map, kinds 106-113) stays bespoke → B3.6**: only the dict half of the
+    shared tsdict/tsconfig scanner (tsdict_ddl_recovery.go deleted; tsconfig_ddl_recovery.go kept)
+    and the combined codec-test files were split to config-only. BONUS: DROP TEXT SEARCH DICTIONARY
+    now returns on a successful registry drop instead of falling through to the DropCompatObject
+    gate (keyed by the current name), so rename-then-drop no longer fails 42704 (pre-existing gap,
+    same class as B3.3's ALTER CONVERSION RENAME fix). TestPort_TSDictSurvivesRestart green
+    (rename + set schema + options + drop); waldump += CREATE/RENAME/SET SCHEMA/DROP TS DICTIONARY.
+  - [x] **B3.4 pg_foreign_data_wrapper + pg_foreign_server + pg_user_mapping (kinds 126-129
+    retired)** — LANDED. `sys_pg_foreign.go`: three FormData builders (FDW 7-col, server 8-col,
+    user-mapping 4-col; OPTIONS text[] via the evttags codec; fdwacl/srvacl NULL). Cross-refs
+    resolve name→OID at write and reverse OID→name at reload: server.srvfdw = FDW OID,
+    user-mapping.umserver = server OID + umuser = role OID (0=PUBLIC). **The FDW gained restart
+    durability in this slice — it had NONE before** (no kind, no reload); CREATE SERVER also
+    writes the referenced FDW's row so srvfdw resolves on a standby. Low-traffic → no TID cache
+    (delete-then-insert keeps one live row; CREATE OR REPLACE-analog). Indexes 112/548 + 113/549 +
+    174/175 all empty placeholders → lazy-root. Reload order FDW→server→user-mapping, placed after
+    the role reload so umuser reverses to a role name; new catalog helpers
+    LookupForeignDataWrapperByOID / LookupForeignServer(ByOID) / LookupUserMapping /
+    RegisterForeignDataWrapperDuringRecovery. DROP FDW cascades to its servers (each server row
+    xmax'd). Scanners foreignserver_ddl_recovery.go + usermapping_ddl_recovery.go(+tests) +
+    wal/{foreign_server,user_mapping}_ddl_test.go deleted; kinds 126-129 + 8 codecs + 2 dispatch
+    cases excised; rmgr-mapping test's retired sample → RecordKindDropSubscription.
+    TestPort_ForeignDataSurvivesRestart green (FDW + server→FDW join + user-mapping→server/role
+    + DROP); waldump += CREATE/DROP FDW/SERVER.
+  - [x] **B3.3 pg_publication + pg_publication_rel (kinds 50-52 retired)** — LANDED.
+    `sys_pg_publication.go`: 9-col FormData_pg_publication (all-scalar: name + owner OID + publish
+    bools; pubtruncate/pubviaroot journal false — goopg models neither) with a TID cache
+    (publicationHeapTIDs, for ALTER OWNER heap UPDATEs) + 5-col FormData_pg_publication_rel (one
+    row per FOR TABLE member; prrelid = the resolved pg_class OID, prqual/prattrs NULL — no row
+    filters/column lists). Indexes 6110/6111 (pub) + 6112/6113 (pub_rel) all empty placeholders →
+    lazy-root. CREATE writes the base row + member rows; DROP xmax's both (prpubid-matched);
+    ALTER OWNER = base-row UPDATE. Reload: pass 1 scans pg_publication_rel grouping prrelid→
+    qualified name (cat.LookupTableByOID) by prpubid, pass 2 scans pg_publication and hands the
+    grouped Tables to pubsub.CreatePublicationDuringRecovery — runs AFTER the table reload so
+    prrelid resolves. **SUBSCRIPTION (kinds 53-55) stays bespoke**: pg_subscription is a SHARED
+    catalog (global/) → B4; the pubsub scanner keeps only its subscription cases. Publication
+    codec-tests (wal + initdb) trimmed to subscription-only. Note: goopg serves pg_publication/
+    pg_publication_rel as REGISTRY-backed virtual views (the heaps are the standby's copy), so the
+    durability test asserts membership via pg_publication_tables; the heap write→mirror→reload
+    chain is proven by pub.Tables being repopulated post-restart. TestPort_PublicationSurvivesRestart
+    green (FOR ALL TABLES + FOR TABLE w/ 2 members + publish flags + ALTER OWNER + DROP); waldump
+    += CREATE/DROP PUBLICATION (both forms).
+  - [x] **B3.2 pg_event_trigger (kinds 56-60 retired)** — LANDED. `sys_pg_event_trigger.go`:
+    7-col FormData_pg_event_trigger builder (six scalars + evttags text[] — the WHEN TAG filter,
+    declared `Type{Name:"text",IsArray:true}` so encode/decode are the symmetric generic array
+    path; NULL when no filter, matching event_trigger.c:307) + upsert/TID-cache (eventTriggerHeapTIDs
+    on InMemory — this catalog HAS ALTER surface: ENABLE/DISABLE→evtenabled, RENAME→evtname,
+    OWNER→evtowner, all canonical heap UPDATEs); DROP stamps xmax after MaterializeWriterXID.
+    Indexes 3467 (evtname, single 64-byte NameData key, {72,1}) + 3468 (oid) — both empty
+    placeholders → lazy-root. Reload decodes evttags to the canonical "{a,b}" text and splits it
+    via the new exported executor.ParseTextArrayLiteral (NULL/"{}" → nil Tags). Scanner
+    event_trigger_ddl_recovery.go(+test) + wal/event_trigger_ddl_test.go deleted; kinds 56-60 +
+    10 codecs + dispatch excised. TestPort_EventTriggerSurvivesRestart green (CREATE w/ WHEN TAG +
+    DISABLE + RENAME + DROP + evttags array round-trip); waldump += the full event-trigger DDL set.
+  - [x] **B3.1 pg_transform (kinds 36/37 retired)** — LANDED. `sys_pg_transform.go`: 5-col
+    FormData_pg_transform builder (all OIDs; trftype/trflang resolved from the registry's
+    TypeName/Lang via TypeNameToOID/LanguageNameToOID) + heap INSERT with a pre-INSERT xmax
+    stamp of any prior row version (RegisterTransform is idempotent per (type,lang) with a
+    stable OID — CREATE OR REPLACE analog; no TID cache for this low-traffic catalog, so
+    delete+insert leaves exactly one live row) + 3574/3575 index entries (both empty
+    placeholders → lazy-root); DROP stamps xmax. Reload reverses trftype via reloadTypeNameForOID
+    and trflang via the new languageNameForOID (the four languages LanguageNameToOID models).
+    Scanner transform_ddl_recovery.go(+test) + wal/transform_ddl_test.go deleted; kinds 36/37 +
+    4 codecs + dispatch excised; the rmgr-mapping test's retired-kind sample swapped to
+    RecordKindCreateStatistics. TestPort_TransformSurvivesRestart green (numeric-OID predicates —
+    the B2.2a regtype-builtin-name gap); waldump workload += CREATE/DROP TRANSFORM.
 - [ ] **B4** shared catalogs in `global/` (pg_database, pg_authid/auth_members, pg_tablespace,
   pg_foreign_*/user_mapping) + retire the postgres-DB mirror shim.
+  - [x] **B4.1 pg_tablespace FULLY FAITHFUL (kinds 124/125 retired)** — LANDED. First B4 shared-catalog
+    slice, so it also builds the reusable shared-catalog WAL/btree infra. Five sub-slices:
+    (a) shared RelFileLocator fidelity — DBOid==0 → spcOid=1664/dbOid=0 in the block-ref + SMGR encoders,
+    both decoders accept 1664 (routes to `global/`); (b) `insertCanonicalSysBtreeLeafInDB(explicit dbOid)`
+    for shared indexes; (c) pg_shdepend(1214) heap-only owner-dep writer (`writeShdependOwnerRow`, no index
+    = seq-scan faithful, write-only); (d) NEW `RmgrTblspc=5` — `XLOG_TBLSPC_CREATE`/`DROP` emit+decode+replay
+    (dir MkdirAll/RemoveAll); (e) `sys_pg_tablespace.go` heap writer (real owner OID, indexes 2697/2698) +
+    `execCreate/DropTablespace` emit-swap (heap→shdepend→RM_TBLSPC) + `reloadUserTablespacesFromHeap` +
+    deleted `tablespace_ddl_recovery.go`. Gates: WAL round-trips, `TablespaceSurvivesRestart`,
+    `WALPgWaldumpCompat` (pg_waldump parses all three record types). Residual (goopg-view only, ledgered):
+    `tablespaceVirtualRows` still hardcodes spcowner=10 — the streamed heap carries the real owner.
+  - [x] **B4.2 pg_db_role_setting (kinds 73-78 retired)** — LANDED. ALTER DATABASE/ROLE SET/RESET/RESET ALL
+    journal a real pg_db_role_setting SHARED heap row (global/2964) instead of the six bespoke config
+    records. Reuses B4.1a (shared WAL locator), the heap-only pattern (2965 index not materialized →
+    seq-scan faithful), and the B3.2 text[] codec. One row per (setdatabase, setrole) carries the whole
+    setconfig; any SET/RESET re-syncs that row (B3.6 collapse pattern). First SERVER-layer catalog heap
+    write — `s.syncDbRoleSettingHeap` opens its own short-lived txn (config DDL is non-transactional),
+    mirroring `syncCopiedTableCatalogHeap`. Reload `reloadDbRoleSettingsFromHeap`; deleted
+    database_config_recovery.go + role_config_recovery.go. Gate: `DbRoleSettingSurvivesRestart` + server
+    suite + waldump.
 - [ ] **B5** Retire `RmgrGoopgCatalog=128` (now unused) — header-side parity complete.
 - [ ] **B-gate**: per-catalog full regress + `internal/testport` isolation; `psql \d`/`\df`/`\dn` +
   `information_schema` parity vs PG 18.3; crash-after-DDL recovery via generic reload; re-init data dir.
