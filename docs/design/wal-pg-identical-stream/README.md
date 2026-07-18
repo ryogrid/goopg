@@ -70,6 +70,7 @@ requires, rather than papering over it.
 | [02b](02b-catalog-conversion-recipe.md) | Per-catalog conversion recipe (normative) | The reusable seven-step checklist, read-model matrix, gate list, and transition rules every B1–B4 conversion follows. |
 | [02c](02c-phase-b1-application.md) | Phase-B1 application | pg_namespace / pg_proc / pg_sequence specifics; the pg_sequence catalog-row-only scope decision. |
 | [02d](02d-phase-b2-b5-overview.md) | Phase-B2–B5 overview | Application tables + risk deltas for the remaining groups; shared `global/` catalogs; RmgrGoopgCatalog retirement; ledger index. |
+| [02e](02e-content-fidelity-and-durability.md) | Content fidelity + durability (post-B5 open items) | The three deferrals left after rmid-128 closed: matview `IsPopulated` durability, `ALTER … RENAME` durability, and the canonical `pg_node_tree` subsystem (`internal/pgnodes`) so a PG standby can evaluate/query user defaults/stats/views (`relhasrules=true`). |
 
 Cross-cutting concerns (performance, verification, risk) are covered at the end of
 each doc where they apply, and summarized in §"Program-level view" below.

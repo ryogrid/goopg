@@ -513,7 +513,7 @@ func buildUserPGClassRow(cat catalog.Catalog, tbl *catalog.Table) Row {
 		NewBoolDatum(false),                                        // relhassubclass
 		NewBoolDatum(tbl.RowSecurity),                              // relrowsecurity (DU-002 slice 322)
 		NewBoolDatum(tbl.ForceRowSecurity),                         // relforcerowsecurity (DU-002 slice 322)
-		NewBoolDatum(true),                                         // relispopulated
+		NewBoolDatum(!tbl.IsMatView || tbl.IsPopulated),            // relispopulated (02e item A: faithful for matviews; true for all else)
 		NewStringDatum(replIdent),                                  // relreplident ('d' default; FULL/NOTHING via ALTER, DU-002 slice 305)
 		NewBoolDatum(isPartition),                                  // relispartition
 		NewIntDatum(0),                                             // relrewrite

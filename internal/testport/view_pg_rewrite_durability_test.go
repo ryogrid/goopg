@@ -8,13 +8,9 @@ package testport
 // view AST. This test exercises that full write->restart->reload round-trip for
 // a plain view, a matview, and a dropped view.
 //
-// NOTE: ALTER VIEW/TABLE RENAME across a restart is intentionally NOT asserted
-// here — the renamed relname reverts to the pre-rename name on restart because
-// AlterTableRenameTable does not re-sync the pg_class heap row. That is a
-// PRE-EXISTING gap (the retired WAL records never carried the name either; it
-// always came from pg_class), orthogonal to Slice C, and recorded in the
-// deferral ledger. The view itself + its query still survive (under the old
-// name), which the pg_rewrite reload here does cover.
+// NOTE: ALTER VIEW/TABLE RENAME across a restart is covered by
+// TestPort_RenameSurvivesRestart (02e item B fixed the pg_class relname
+// re-sync). This test focuses on the pg_rewrite view-query reload.
 
 import (
 	"path/filepath"
