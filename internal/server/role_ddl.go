@@ -39,9 +39,9 @@ import (
 	"github.com/goopg/goopg/internal/auth"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/executor"
+	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/protocol"
 	"github.com/goopg/goopg/internal/sqlstate"
-	"github.com/goopg/goopg/internal/wal"
 )
 
 // tryHandleRoleDDL returns (handled, err). dbName is the calling
@@ -136,6 +136,12 @@ func (s *Server) tryHandleRoleDDL(sql string, dbName string, resolveCurrent curr
 		if name == "" {
 			return false, nil // malformed; let caller handle
 		}
+		// Capture the OID before the registry removal — the heap DELETE
+		// (B4.5) stamps the pg_authid row by oid.
+		var oid uint32
+		if im, ok := s.cfg.Catalog.(*catalog.InMemory); ok {
+			oid, _ = im.RoleOID(name)
+		}
 		if err := s.unregisterRole(name, ifExists); err != nil {
 			return true, err
 		}
@@ -144,57 +150,99 @@ func (s *Server) tryHandleRoleDDL(sql string, dbName string, resolveCurrent curr
 			s.cfg.Catalog.UnregisterRole(name)
 		}
 		s.removeRoleCredential(name)
-		if s.cfg.WAL != nil {
-			if _, _, werr := s.cfg.WAL.Append(wal.EncodeDropRole(strings.ToLower(name))); werr != nil {
-				return true, werr
-			}
+		if err := s.deleteAuthidHeapRow(oid); err != nil {
+			return true, err
 		}
-		s.syncAuthidHeap()
 		return true, nil
 	}
 	return false, nil
 }
 
-// persistRoleState makes a role mutation durable: WAL record (crash tail) +
-// pg_authid heap rewrite (durable base). See the file header for the model.
+// persistRoleState makes a role mutation (CREATE/ALTER) durable by journaling
+// the role's current pg_authid heap row (B4.5): a real XLOG_HEAP_INSERT on
+// global/1260 that a PG standby replays, replacing the retired whole-file
+// SyncPgAuthidFile + RecordKindRoleState(67). See the file header.
 func (s *Server) persistRoleState(name string, attrs catalog.RoleAttrs) error {
-	if s.cfg.WAL != nil {
-		var oid uint32
-		if im, ok := s.cfg.Catalog.(*catalog.InMemory); ok {
-			oid, _ = im.RoleOID(name)
-		}
-		if _, _, werr := s.cfg.WAL.Append(wal.EncodeRoleState(wal.RoleStatePayload{
-			Name:        strings.ToLower(name),
-			OID:         oid,
-			CanLogin:    attrs.CanLogin,
-			Superuser:   attrs.Superuser,
-			CreateDB:    attrs.CreateDB,
-			CreateRole:  attrs.CreateRole,
-			Replication: attrs.Replication,
-			BypassRLS:   attrs.BypassRLS,
-			ConnLimit:   attrs.ConnLimit,
-			ValidUntil:  attrs.ValidUntil,
-			CredType:    attrs.CredType,
-			Secret:      attrs.Secret,
-		})); werr != nil {
-			return werr
-		}
+	var oid uint32
+	if im, ok := s.cfg.Catalog.(*catalog.InMemory); ok {
+		oid, _ = im.RoleOID(name)
 	}
-	s.syncAuthidHeap()
-	return nil
+	return s.syncAuthidHeapRow(strings.ToLower(name), oid, attrs)
 }
 
-// syncAuthidHeap rebuilds the pg_authid heap file from the catalog role
-// registry. Best-effort: a failure is logged but does not fail the DDL —
-// the WAL record already carries the state until the next successful sync.
-func (s *Server) syncAuthidHeap() {
-	im, ok := s.cfg.Catalog.(*catalog.InMemory)
-	if !ok || s.cfg.DataDir == "" {
-		return
+// syncAuthidHeapRow re-syncs the single pg_authid row for a role (CREATE/ALTER/
+// RENAME) from its own short-lived transaction, mirroring B4.2's
+// syncDbRoleSettingHeap. pg_authid is SHARED (global/1260); the executor writer
+// stamps the old row + writes the current state + maintains the 2676/2677
+// indexes.
+func (s *Server) syncAuthidHeapRow(rolname string, oid uint32, attrs catalog.RoleAttrs) error {
+	if oid == 0 {
+		return nil
 	}
-	if err := executor.SyncPgAuthidFile(s.cfg.DataDir, im); err != nil && s.cfg.Logger != nil {
-		s.cfg.Logger.Warn("pg_authid heap sync failed", "err", err)
+	secret := ""
+	if attrs.CredType != 0 {
+		secret = attrs.Secret
 	}
+	return s.runAuthidHeapTxn(func(ectx *executor.Context) error {
+		return executor.SyncAuthidRow(ectx, oid, rolname, attrs.Superuser, attrs.CanLogin,
+			attrs.CreateDB, attrs.CreateRole, attrs.Replication, attrs.BypassRLS,
+			attrs.ConnLimit, secret, attrs.ValidUntil)
+	})
+}
+
+// deleteAuthidHeapRow stamps the pg_authid row for oid deleted (DROP ROLE) from
+// its own short-lived transaction (a real XLOG_HEAP_DELETE on global/1260).
+func (s *Server) deleteAuthidHeapRow(oid uint32) error {
+	if oid == 0 {
+		return nil
+	}
+	return s.runAuthidHeapTxn(func(ectx *executor.Context) error {
+		return executor.DeleteAuthidRow(ectx, oid)
+	})
+}
+
+// runAuthidHeapTxn opens a short-lived internal transaction wired for catalog
+// heap writes and runs fn against it, committing on success. Mirrors B4.2's
+// syncDbRoleSettingHeap scaffolding (own Begin/Snapshot/Commit). A missing
+// Pool/TxnMgr (or a catalog with no on-disk pg_attribute, e.g. an in-memory
+// test harness) is a no-op — the registry already holds the runtime truth.
+func (s *Server) runAuthidHeapTxn(fn func(*executor.Context) error) error {
+	if s.cfg.Pool == nil || s.cfg.TxnMgr == nil {
+		return nil
+	}
+	ectx := executor.NewContext()
+	ectx.Pool = s.cfg.Pool
+	ectx.Catalog = s.cfg.Catalog
+	ectx.CurrentDatabaseOid = catalog.DefaultDBOid // resolve pg_attribute for the heap-sync guard
+	if !executor.CatalogHeapSyncAvailable(ectx) {
+		return nil
+	}
+	tx, err := s.cfg.TxnMgr.Begin(mvcc.IsolationReadCommitted)
+	if err != nil {
+		return fmt.Errorf("begin pg_authid sync transaction: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = s.cfg.TxnMgr.Rollback(tx)
+		}
+	}()
+	snap, err := s.cfg.TxnMgr.SnapshotFor(tx)
+	if err != nil {
+		return fmt.Errorf("snapshot for pg_authid sync transaction: %w", err)
+	}
+	ectx.TxnMgr = s.cfg.TxnMgr
+	ectx.Tx = tx
+	ectx.Snap = snap
+	ectx.WAL = s.cfg.WAL
+	if err := fn(ectx); err != nil {
+		return err
+	}
+	if err := s.cfg.TxnMgr.Commit(tx); err != nil {
+		return fmt.Errorf("commit pg_authid sync transaction: %w", err)
+	}
+	committed = true
+	return nil
 }
 
 // renameRole implements `ALTER ROLE/USER <name> RENAME TO <newname>`,
@@ -241,13 +289,19 @@ func (s *Server) renameRole(name, newName string) error {
 			store.Remove(strings.ToLower(name))
 		}
 	}
-	if s.cfg.WAL != nil {
-		if _, _, werr := s.cfg.WAL.Append(wal.EncodeAlterRoleRename(strings.ToLower(name), strings.ToLower(newName))); werr != nil {
-			return werr
+	// Re-sync the pg_authid row by its (preserved) OID: the writer stamps the
+	// old-name row and writes the row under the new rolname (B4.5). A RENAME is
+	// just an attribute change that happens to touch rolname, so it rides the
+	// same per-row path as CREATE/ALTER.
+	var oid uint32
+	attrs := catalog.RoleAttrs{ConnLimit: -1}
+	if isInMem {
+		oid, _ = im.RoleOID(newName)
+		if a, ok := im.LookupRoleAttrs(newName); ok {
+			attrs = a
 		}
 	}
-	s.syncAuthidHeap()
-	return nil
+	return s.syncAuthidHeapRow(strings.ToLower(newName), oid, attrs)
 }
 
 // isReservedRoleName mirrors PostgreSQL's IsReservedName (postgres/src/

@@ -236,6 +236,88 @@ func reloadUserTablespacesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, 
 	return nil
 }
 
+// reloadRolesFromAuthidHeap is B4.5's pg_authid reload — the generic heap-scan
+// replacement for the retired LoadRolesFromAuthidHeap (raw os.ReadFile) +
+// replayRoleDDLRecords (WAL-tail scanner, RecordKinds 67/68/72). pg_authid is
+// SHARED (global/1260). It re-registers user roles with their persisted OID +
+// attributes and records the bootstrap superuser's verifier in the attrs
+// sidecar (SetRoleAttrs special-cases "postgres" so cmd/goopg seeds the auth
+// UserStore); predefined pg_* roles stay heap-only (never registry roles),
+// exactly as LoadRolesFromAuthidHeap did. Reading through the buffer pool (not
+// the raw file) means a post-crash reload sees the redo'd page regardless of
+// when the file itself is flushed — the same crash-consistent path B4.1–B4.4
+// use. Dropped/renamed old rows carry xmax and are skipped by the liveness
+// filter.
+func reloadRolesFromAuthidHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+	if cat == nil {
+		return nil
+	}
+	type authRow struct {
+		oid     uint32
+		rolname string
+		attrs   catalog.RoleAttrs
+	}
+	rel := storage.RelFileNode{DBOid: 0, RelOid: 1260, Fork: storage.MainFork}
+	cols := executor.PGAuthidColumnsPG18()
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_authid",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			d := make(executor.Row, len(cols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(d, cols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			attrs := catalog.RoleAttrs{
+				Superuser:   d[2].BoolValue(),
+				CreateRole:  d[4].BoolValue(),
+				CreateDB:    d[5].BoolValue(),
+				CanLogin:    d[6].BoolValue(),
+				Replication: d[7].BoolValue(),
+				BypassRLS:   d[8].BoolValue(),
+				ConnLimit:   -1,
+			}
+			if !d[9].IsNull() {
+				attrs.ConnLimit = int32(d[9].Int)
+			}
+			if !d[10].IsNull() {
+				if pw := d[10].StringValue(); pw != "" {
+					switch {
+					case strings.HasPrefix(pw, "SCRAM-SHA-256$"):
+						attrs.CredType = 3
+					case len(pw) == 35 && strings.HasPrefix(pw, "md5"):
+						attrs.CredType = 2
+					default:
+						attrs.CredType = 1
+					}
+					attrs.Secret = pw
+				}
+			}
+			if !d[11].IsNull() {
+				attrs.ValidUntil = executor.FormatValidUntilText(d[11].TimeValue())
+			}
+			return authRow{oid: uint32(d[0].Int), rolname: d[1].StringValue(), attrs: attrs}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+	for _, r := range rows {
+		a := r.(authRow)
+		if a.rolname == "" {
+			continue
+		}
+		lower := strings.ToLower(a.rolname)
+		switch {
+		case a.oid == 10 || lower == "postgres":
+			cat.SetRoleAttrs("postgres", a.attrs)
+		case strings.HasPrefix(lower, "pg_"):
+			// predefined — heap-only, not a registry role
+		default:
+			cat.RegisterRoleWithOID(lower, a.oid)
+			cat.SetRoleAttrs(lower, a.attrs)
+		}
+	}
+	return nil
+}
+
 // reloadDbRoleSettingsFromHeap is B4.2's pg_db_role_setting reload — the
 // generic heap-scan replacement for the retired replayDatabaseConfigRecords +
 // replayRoleConfigRecords scanners (RecordKinds 73-78). pg_db_role_setting is

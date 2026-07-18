@@ -14778,14 +14778,13 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 	// rewrite (durable base) — plus the OnRoleDropped hook so the server's
 	// connection-time role set and auth UserStore stay in sync.
 	if objType == "user" || objType == "role" || objType == "group" {
-		persistDrop := func(roleName string) {
-			if o.ctx.WAL != nil {
-				_, _, _ = o.ctx.WAL.Append(wal.EncodeDropRole(roleName))
-			}
-			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok && o.ctx.DataDir != "" {
-				if err := SyncPgAuthidFile(o.ctx.DataDir, im); err != nil {
-					o.ctx.AddNotice(fmt.Sprintf("pg_authid heap sync failed: %v", err))
-				}
+		// oid is captured by the caller before UnregisterRole; the heap DELETE
+		// (B4.5) stamps the pg_authid row by oid — a real XLOG_HEAP_DELETE on
+		// global/1260 replacing the retired RecordKindDropRole(68) +
+		// whole-file SyncPgAuthidFile.
+		persistDrop := func(roleName string, oid uint32) {
+			if err := DeleteAuthidRow(o.ctx, oid); err != nil {
+				o.ctx.AddNotice(fmt.Sprintf("pg_authid heap delete failed: %v", err))
 			}
 			if o.ctx.OnRoleDropped != nil {
 				o.ctx.OnRoleDropped(roleName)
@@ -14808,16 +14807,18 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 				if !exists {
 					o.ctx.AddNotice(fmt.Sprintf("role %q does not exist, skipping", name.Name))
 				} else {
+					oid, _ := o.ctx.Catalog.RoleOID(roleName)
 					o.ctx.Catalog.UnregisterRole(roleName)
-					persistDrop(roleName)
+					persistDrop(roleName, oid)
 				}
 			} else {
 				if !exists {
 					return &ExecError{Code: "42704", Pos: s.Pos(),
 						Message: fmt.Sprintf("role %q does not exist", name.Name)}
 				}
+				oid, _ := o.ctx.Catalog.RoleOID(roleName)
 				o.ctx.Catalog.UnregisterRole(roleName)
-				persistDrop(roleName)
+				persistDrop(roleName, oid)
 			}
 		}
 		return nil

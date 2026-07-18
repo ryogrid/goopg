@@ -1522,21 +1522,17 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, fmt.Errorf("goopg: view replay: %w", err)
 	}
 
-	// Role/auth restart persistence (root-0021): load the durable BASE from
-	// the pg_authid heap file (global/1260 — rewritten on every role DDL by
-	// SyncPgAuthidFile, mirroring PostgreSQL's pg_authid-as-store model),
-	// then replay any newer role WAL records ON TOP (the crash tail).
-	if err := LoadRolesFromAuthidHeap(abs, cat); err != nil {
+	// Role/auth restart persistence (B4.5, was root-0021): reload the catalog
+	// role registry from the pg_authid heap (global/1260). Roles now journal
+	// as real XLOG_HEAP_INSERT/DELETE on 1260 (redo reconstructs the page
+	// before this runs), so a generic heap scan through the buffer pool — the
+	// same crash-consistent path B4.1-B4.4 use — replaces the retired raw-file
+	// LoadRolesFromAuthidHeap + WAL-tail replayRoleDDLRecords (kinds 67/68/72).
+	if err := reloadRolesFromAuthidHeap(mgr, cat, clog); err != nil {
 		_ = pool.Close()
 		_ = walWriter.Close()
 		_ = mgr.Close()
-		return nil, fmt.Errorf("goopg: pg_authid load: %w", err)
-	}
-	if err := replayRoleDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
-		_ = pool.Close()
-		_ = walWriter.Close()
-		_ = mgr.Close()
-		return nil, fmt.Errorf("goopg: role DDL replay: %w", err)
+		return nil, fmt.Errorf("goopg: pg_authid reload: %w", err)
 	}
 
 	// M0119-0004-ACLHEAP (GRANT/REVOKE ROLE membership): replay GRANT/REVOKE
