@@ -39,6 +39,7 @@ const (
 	pgClassOffRelPersistence = 118
 	pgClassOffRelKind        = 119
 	pgClassOffRelNAtts       = 120
+	pgClassOffRelIsPopulated = 129 // relispopulated (02e item A)
 	pgAttributeOffRelID      = 0
 	pgAttributeOffName       = 4
 	pgAttributeOffTypID      = 68
@@ -593,6 +594,11 @@ type PGClassRow struct {
 	RelTablespace  uint32
 	RelPersistence string // relpersistence: 'p'=permanent
 	RelIsShared    bool   // relisshared
+	// RelIsPopulated holds pg_class.relispopulated (matview populated state; true
+	// for every non-matview relation). Only DecodePGClassPhysicalRow populates it
+	// (byte 129 of the fixed part); the legacy DecodePGClassRow leaves it false,
+	// so callers must guard reload use on the physical path. 02e item A.
+	RelIsPopulated bool
 	// RelOptions holds the pg_class.reloptions text[] external literal (e.g.
 	// "{fillfactor=70}"), or "" when absent/NULL. Neither DecodePGClassRow
 	// nor DecodePGClassPhysicalRow populate this (reloptions is a varlena
@@ -868,6 +874,11 @@ func DecodePGClassPhysicalRow(data []byte) (PGClassRow, error) {
 	if relNAtts < 0 {
 		return r, fmt.Errorf("pg_class.relnatts: invalid %d", relNAtts)
 	}
+	// relispopulated (byte 129, inside the length-checked fixed part). 02e item A.
+	relIsPopulated, err := decodePGBool(data[pgClassOffRelIsPopulated], "pg_class.relispopulated")
+	if err != nil {
+		return r, err
+	}
 	r = PGClassRow{
 		OID:            binary.LittleEndian.Uint32(data[pgClassOffOID : pgClassOffOID+4]),
 		RelName:        relName,
@@ -878,6 +889,7 @@ func DecodePGClassPhysicalRow(data []byte) (PGClassRow, error) {
 		RelTablespace:  binary.LittleEndian.Uint32(data[pgClassOffRelTablespace : pgClassOffRelTablespace+4]),
 		RelPersistence: relPersistence,
 		RelIsShared:    relIsShared,
+		RelIsPopulated: relIsPopulated,
 	}
 	return r, nil
 }

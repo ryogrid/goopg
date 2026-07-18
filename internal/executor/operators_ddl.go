@@ -13265,9 +13265,8 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 	// matview/view; loadViewsFromHeap re-parses the ev_action text to rebuild the
 	// AST. Emitted from this single funnel keeps CREATE and any ALTER ...
 	// RENAME/SET SCHEMA in sync (the caller stamps the old rule first). A real PG
-	// standby replays the heap insert. (matview IsPopulated across a restart is a
-	// documented deferral — the reload defaults matviews to populated; see the
-	// deferral ledger.)
+	// standby replays the heap insert. (matview IsPopulated survives a restart via
+	// pg_class.relispopulated — 02e item A.)
 	if ctx.Pool != nil && tbl.ViewDef != "" && (tbl.IsMatView || tbl.View != nil) {
 		if err := writeViewRewriteRow(ctx, tbl, tbl.ViewDef); err != nil {
 			return fmt.Errorf("pg_rewrite (view/matview): %w", err)
