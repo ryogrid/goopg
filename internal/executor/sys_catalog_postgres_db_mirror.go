@@ -166,6 +166,10 @@ func mirrorTouchedCatalogsToPostgresDB(ctx *Context) error {
 		pgSequenceRelOID,           // 2224 pg_sequence
 		pgSequenceSeqrelidIndexOID, // 5002
 		pgDependRelOID,             // 2608 pg_depend (narrow OWNED-BY rows)
+		// B5 Slice C: pg_rewrite _RETURN rule rows for user views/matviews are
+		// written to base/1 by syncTableToCatalogHeap (writeViewRewriteRow); the
+		// standby (dbname=postgres) reads base/5, so the heap must mirror.
+		pgRewriteRelOID, // 2618 pg_rewrite
 	}
 	for _, oid := range mirroredOIDs {
 		if err := mirrorCatalogRelToPostgresDB(ctx, oid); err != nil {

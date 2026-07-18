@@ -1073,10 +1073,9 @@ func (o *ddlOp) execCreateSubscription(s *parser.CreateSubscriptionStmt) error {
 	if err != nil {
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 	}
-	if o.ctx.WAL != nil {
-		if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateSubscription(sub.Name, sub.Conninfo, sub.SlotName, sub.Publications, sub.OID, sub.Owner, sub.Enabled, sub.DBOid)); werr != nil {
-			return fmt.Errorf("wal create-subscription: %w", werr)
-		}
+	// B4.4: journal the pg_subscription heap row (replaces kind 53).
+	if err := syncSubscriptionRow(o.ctx, sub.OID, sub); err != nil {
+		return fmt.Errorf("pg_subscription heap write: %w", err)
 	}
 	if o.ctx.OnSubscriptionChange != nil {
 		o.ctx.OnSubscriptionChange()
@@ -1088,16 +1087,20 @@ func (o *ddlOp) execDropSubscription(s *parser.DropSubscriptionStmt) error {
 	if o.ctx.PubSub == nil {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "DROP SUBSCRIPTION requires PubSub registry in Context"}
 	}
+	// Capture the OID before the registry drop so B4.4 can stamp the heap row.
+	var dropOID uint32
+	if sub, ok := o.ctx.PubSub.LookupSubscription(s.Name); ok {
+		dropOID = sub.OID
+	}
 	if err := o.ctx.PubSub.DropSubscription(s.Name); err != nil {
 		if s.IfExists {
 			return nil
 		}
 		return &ExecError{Code: "42704", Pos: s.Pos(), Message: err.Error()}
 	}
-	if o.ctx.WAL != nil {
-		if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropSubscription(s.Name)); werr != nil {
-			return fmt.Errorf("wal drop-subscription: %w", werr)
-		}
+	// B4.4: xmax-stamp the pg_subscription heap row (replaces kind 54).
+	if err := syncSubscriptionRow(o.ctx, dropOID, nil); err != nil {
+		return fmt.Errorf("pg_subscription heap delete: %w", err)
 	}
 	if o.ctx.OnSubscriptionChange != nil {
 		o.ctx.OnSubscriptionChange()
@@ -1164,9 +1167,10 @@ func (o *ddlOp) execAlterSubscriptionOwner(s *parser.AlterSubscriptionOwnerStmt)
 	if serr := o.ctx.PubSub.SetSubscriptionOwner(s.Name, ownerOID); serr != nil {
 		return &ExecError{Code: "42704", Pos: s.Pos(), Message: serr.Error()}
 	}
-	if o.ctx.WAL != nil {
-		if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterSubscriptionOwner(s.Name, ownerOID)); werr != nil {
-			return fmt.Errorf("wal alter-subscription-owner: %w", werr)
+	// B4.4: re-sync the pg_subscription heap row's subowner (replaces kind 55).
+	if sub, ok := o.ctx.PubSub.LookupSubscription(s.Name); ok {
+		if err := syncSubscriptionRow(o.ctx, sub.OID, sub); err != nil {
+			return fmt.Errorf("pg_subscription heap write: %w", err)
 		}
 	}
 	return nil
@@ -6795,22 +6799,10 @@ func (o *ddlOp) execDropIndex(s *parser.DropIndexStmt) error {
 		if err := o.ctx.Pool.Manager().DropRelation(rel); err != nil {
 			return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
 		}
-		// M0079-0001: emit a DROP INDEX WAL record so a
-		// post-crash recovery doesn't resurrect the index from
-		// an earlier RecordKindCreateIndex still in the WAL.
-		// Best-effort: the catalog mutation has already
-		// completed; logging a failure is preferable to
-		// resurrecting a half-dropped index.
-		if o.ctx.Pool != nil {
-			payload := wal.EncodeDropIndex(wal.DropIndexPayload{
-				OID:    dropOID,
-				Schema: dropSchema,
-				Name:   dropName,
-			})
-			if _, err := o.ctx.Pool.LogChangeRecord(payload); err != nil {
-				return &ExecError{Code: "XX000", Pos: s.Pos(), Message: fmt.Sprintf("drop-index WAL append: %v", err)}
-			}
-		}
+		// B5 Slice A: RecordKindDropIndex(21) retired — the index's pg_class row
+		// is xmax-stamped on disk below (deleteCatalogRowsForOID, WAL-logged),
+		// so loadUserIndexesFromHeap skips it on reload and a real PG standby
+		// replays the same heap delete (no rmid-128 record).
 	}
 	// M0106-0011: DROP INDEX removes the index's pg_class row. Flag the txn
 	// so the commit-time xact-marker hook emits RecordKindXactCommitInval
@@ -6869,12 +6861,8 @@ func ApplyPendingIndexDrops(ctx *Context, sess *BasicSession) {
 		if ctx.Pool != nil {
 			ctx.Pool.InvalidateRel(d.Rel)
 			_ = ctx.Pool.Manager().DropRelation(d.Rel)
-			payload := wal.EncodeDropIndex(wal.DropIndexPayload{
-				OID:    d.OID,
-				Schema: d.Schema,
-				Name:   d.IdxName,
-			})
-			_, _ = ctx.Pool.LogChangeRecord(payload)
+			// B5 Slice A: RecordKindDropIndex(21) retired — the pg_class row is
+			// xmax-stamped on disk below (deleteCatalogRowsForOID, WAL-logged).
 		}
 	}
 	if flagInval && ctx.TxnMgr != nil {
@@ -7379,16 +7367,17 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					if err := im.RenameIndex(oldObjName, newObjName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); err != nil {
 						return &ExecError{Code: "42P07", Pos: act.Pos(), Message: err.Error()}
 					}
-					// Use ctx.Pool.LogChangeRecord, the same WAL-emission path
-					// CREATE/DROP INDEX use just above (M0079-0001) — not
-					// ctx.WAL.Append (the newer per-object-DDL pattern most other
-					// ALTER forms in this file use) — because RenameIndexDuringRecovery
-					// is replayed by the same `replayIndexDDLRecords` driver that
-					// consumes those CREATE/DROP INDEX records, and ctx.Pool is
-					// always wired whereas ctx.WAL is not guaranteed to be in every
-					// executor context that reaches this operator.
-					if o.ctx.Pool != nil {
-						_, _ = o.ctx.Pool.LogChangeRecord(wal.EncodeRenameIndex(oldSchema, oldName, act.NewName))
+					// B5 Slice A: the index name lives in pg_class.relname (not
+					// pg_index), so rewrite the index's pg_class HEAP row with the
+					// new name (RenameIndex mutated idx.Name in place). This makes
+					// the rename durable via loadUserIndexesFromHeap — retiring the
+					// goopg-private RecordKindRenameIndex(94); a real PG standby
+					// replays it as an XLOG_HEAP_UPDATE on pg_class (via the
+					// delete-old + insert-new that resyncIndexClassHeapRow does).
+					if catalogHeapSyncAvailable(o.ctx) {
+						if syncErr := resyncIndexClassHeapRow(o.ctx, idx); syncErr != nil {
+							return syncErr
+						}
 					}
 				}
 			}
@@ -10215,51 +10204,13 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 			return fmt.Errorf("DDL catalog sync: %w", syncErr)
 		}
 	}
-	// M0079-0001: emit a CREATE INDEX WAL record so post-crash
-	// recovery can reconstruct the in-memory catalog entry. The
-	// pg_class heap row written above only carries OID + name +
-	// relkind='i'; the column list, unique flag, primary flag,
-	// and owning-table OID would otherwise be lost on a non-
-	// graceful restart. The WAL record carries the full
-	// metadata; replay happens in
-	// `internal/initdb.replayIndexDDLRecords` after physical
-	// recovery finishes.
-	if o.ctx.Pool != nil {
-		payload := wal.EncodeCreateIndex(wal.CreateIndexPayload{
-			OID:              idx.OID,
-			TableOID:         tbl.OID,
-			Schema:           idxName.Schema,
-			Name:             idxName.Name,
-			Method:           "btree",
-			Columns:          append([]string(nil), columns...),
-			Unique:           unique,
-			Primary:          primary,
-			ColDescending:    idx.ColDescending,
-			ColNullsFirst:    idx.ColNullsFirst,
-			NullsNotDistinct: idx.NullsNotDistinct,
-			HasPredicate:     idx.HasPredicate,
-			PredicateString:  idx.PredicateString,
-			IncludeColumns:   idx.IncludeColumns,
-			ColOpClasses:     idx.ColOpClasses,
-			ColCollations:    idx.ColCollations,
-			Fillfactor:       idx.Fillfactor,
-			DeduplicateItems: idx.DeduplicateItems,
-			Tablespace:       idx.Tablespace,
-		})
-		if _, err := o.ctx.Pool.LogChangeRecord(payload); err != nil {
-			// Best-effort: roll back the in-memory mutation so
-			// memory and (now-incomplete) WAL agree, mirroring
-			// the CreateDatabase emit-then-rollback discipline at
-			// internal/server/database_ddl.go:162-166. The on-
-			// disk btree pages remain — they are harmless without
-			// a catalog entry — but the next graceful SaveCatalog
-			// won't capture this index either.
-			_ = o.ctx.Catalog.DropIndex(idxName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
-			o.ctx.Pool.InvalidateRel(idxRel)
-			_ = o.ctx.Pool.Manager().DropRelation(idxRel)
-			return &ExecError{Code: "XX000", Pos: pos, Message: fmt.Sprintf("create-index WAL append: %v", err)}
-		}
-	}
+	// B5 Slice A: the goopg-private RecordKindCreateIndex(20) record is retired.
+	// The index is fully reconstructible from the heap: syncIndexToCatalogHeap
+	// above wrote the pg_class row (relkind='i') AND the pg_index row (2610)
+	// carrying indkey/indisunique/indisprimary/indrelid/opclass/collation/
+	// indoption/predicate, and loadUserIndexesFromHeap rebuilds the in-memory
+	// entry from both at startup. A real PG standby replays the same heap
+	// inserts (no rmid-128 record).
 	return nil
 }
 
@@ -12811,6 +12762,22 @@ func deleteCatalogRowsForOID(ctx *Context, dbOid uint32, relOID uint32, xmax sto
 		}
 		return err == nil && row.AttRelID == relOID
 	})
+	// B5 Slice B: stamp xmax on this relation's pg_attrdef rows too, so an ALTER
+	// re-sync (delete-old-rows + syncTableToCatalogHeap) or a rolled-back CREATE
+	// does not leave stale/duplicate DEFAULT rows visible to the reload. adrelid
+	// is column 1 (bytes 4:8) of the canonical pg_attrdef row.
+	attrdefRel := storage.RelFileNode{
+		DBOid:  dbOid,
+		RelOid: pgAttrdefRelOID,
+		Fork:   storage.MainFork,
+	}
+	stampCatalogRows(ctx, attrdefRel, xmax, func(data []byte) bool {
+		return len(data) >= 8 && binary.LittleEndian.Uint32(data[4:8]) == relOID
+	})
+	// B5 Slice C: stamp this relation's pg_rewrite _RETURN rule row (ev_class ==
+	// relOID) so a dropped/re-synced view/matview leaves no stale rule visible to
+	// loadViewsFromHeap.
+	stampViewRewriteRows(ctx, dbOid, relOID, xmax)
 }
 
 // syncEnumTypeToCatalogHeap writes a single pg_type row for an enum type into
@@ -13268,65 +13235,42 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 		}
 	}
 
-	// Column DEFAULT persistence (root-0020 follow-up): the reloaded catalog
-	// cannot reconstruct DefaultExpr ASTs from pg_attribute (only atthasdef
-	// survives; no runtime pg_attrdef rows), so snapshot every defaulted
-	// column's expression as SQL text in one WAL record per table. Replay
-	// (internal/initdb/column_defaults_recovery.go) re-parses them after
-	// loadUserTablesFromHeap. Emitting here — the single funnel every
-	// table-persisting DDL path passes through — keeps create/alter in sync.
-	if ctx.WAL != nil {
-		var defs []wal.ColumnDefaultEntry
-		for _, col := range tbl.Columns {
-			if col.Dropped || col.DefaultExpr == nil {
-				continue
-			}
-			if exprSQL := catalog.FormatExprForAttrdef(col.DefaultExpr); exprSQL != "" {
-				defs = append(defs, wal.ColumnDefaultEntry{Name: col.Name, Expr: exprSQL})
-			}
+	// B5 Slice B: column DEFAULT persistence via real pg_attrdef HEAP rows
+	// (base/<dbOid>/2604), replacing the goopg-private RecordKindColumnDefaults(69)
+	// record. The reloaded catalog cannot rebuild DefaultExpr ASTs from
+	// pg_attribute (only atthasdef survives), so write one pg_attrdef row per
+	// defaulted column carrying the expression as SQL text (adbin); the reload
+	// (loadColumnDefaultsFromHeap) re-parses it. This is the single funnel every
+	// table-persisting DDL path passes through — the caller stamps the old
+	// pg_attrdef rows via deleteCatalogRowsForOID before a re-sync (ALTER), so
+	// this is a fresh write. A real PG standby replays the heap inserts.
+	for _, col := range tbl.Columns {
+		if col.Dropped || col.DefaultExpr == nil {
+			continue
 		}
-		if len(defs) > 0 {
-			_, _, _ = ctx.WAL.Append(wal.EncodeColumnDefaults(wal.ColumnDefaultsPayload{
-				TableOID: tbl.OID,
-				Defaults: defs,
-			}))
+		exprSQL := catalog.FormatExprForAttrdef(col.DefaultExpr)
+		if exprSQL == "" {
+			continue
+		}
+		if err := writeAttrdefRow(ctx, tbl.OID, int16(col.Ordinal+1), exprSQL); err != nil {
+			return fmt.Errorf("pg_attrdef col %q: %w", col.Name, err)
 		}
 	}
 
-	// Materialized-view query persistence: pg_class.relkind='m' (set above by
-	// buildUserPGClassRow) tells loadUserTablesFromHeap this is a matview, but
-	// the defining SELECT lives only in tbl.View (an in-memory AST) — goopg
-	// writes no pg_rewrite-equivalent heap rows, so it must be snapshotted as
-	// SQL text the same way M0079-0001's CREATE INDEX record is. Emitted from
-	// this single funnel keeps CREATE and any future ALTER MATERIALIZED VIEW
-	// ... RENAME/SET SCHEMA in sync automatically. Replay:
-	// internal/initdb/matview_ddl_recovery.go.
-	if ctx.Pool != nil && tbl.IsMatView && tbl.ViewDef != "" {
-		payload := wal.EncodeMatView(wal.MatViewPayload{
-			TableOID:    tbl.OID,
-			IsPopulated: tbl.IsPopulated,
-			Query:       tbl.ViewDef,
-		})
-		if _, err := ctx.Pool.LogChangeRecord(payload); err != nil {
-			return fmt.Errorf("matview WAL record: %w", err)
-		}
-	}
-
-	// Plain-view query persistence (M0119-0004 follow-up, sibling of the
-	// matview record above): pg_class.relkind='v' (set above by
-	// buildUserPGClassRow) tells loadUserTablesFromHeap this is a plain view,
-	// but the defining SELECT lives only in tbl.View (an in-memory AST) — same
-	// gap as matviews, snapshotted as SQL text the same way. Emitted from this
-	// single funnel keeps CREATE VIEW and any future ALTER VIEW ...
-	// RENAME/SET SCHEMA in sync automatically. Replay:
-	// internal/initdb/view_ddl_recovery.go.
-	if ctx.Pool != nil && tbl.View != nil && !tbl.IsMatView && tbl.ViewDef != "" {
-		payload := wal.EncodeView(wal.ViewPayload{
-			TableOID: tbl.OID,
-			Query:    tbl.ViewDef,
-		})
-		if _, err := ctx.Pool.LogChangeRecord(payload); err != nil {
-			return fmt.Errorf("view WAL record: %w", err)
+	// B5 Slice C: a view / materialized view's defining SELECT now journals as a
+	// real pg_rewrite _RETURN rule heap row (base/<dbOid>/2618, ev_action = the
+	// query as SQL text) instead of the retired RecordKindCreateMatView(102) /
+	// RecordKindCreateView(103) records. pg_class.relkind ('m'/'v', set above by
+	// buildUserPGClassRow) still tells loadUserTablesFromHeap the relation is a
+	// matview/view; loadViewsFromHeap re-parses the ev_action text to rebuild the
+	// AST. Emitted from this single funnel keeps CREATE and any ALTER ...
+	// RENAME/SET SCHEMA in sync (the caller stamps the old rule first). A real PG
+	// standby replays the heap insert. (matview IsPopulated across a restart is a
+	// documented deferral — the reload defaults matviews to populated; see the
+	// deferral ledger.)
+	if ctx.Pool != nil && tbl.ViewDef != "" && (tbl.IsMatView || tbl.View != nil) {
+		if err := writeViewRewriteRow(ctx, tbl, tbl.ViewDef); err != nil {
+			return fmt.Errorf("pg_rewrite (view/matview): %w", err)
 		}
 	}
 
@@ -14774,14 +14718,13 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 	// rewrite (durable base) — plus the OnRoleDropped hook so the server's
 	// connection-time role set and auth UserStore stay in sync.
 	if objType == "user" || objType == "role" || objType == "group" {
-		persistDrop := func(roleName string) {
-			if o.ctx.WAL != nil {
-				_, _, _ = o.ctx.WAL.Append(wal.EncodeDropRole(roleName))
-			}
-			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok && o.ctx.DataDir != "" {
-				if err := SyncPgAuthidFile(o.ctx.DataDir, im); err != nil {
-					o.ctx.AddNotice(fmt.Sprintf("pg_authid heap sync failed: %v", err))
-				}
+		// oid is captured by the caller before UnregisterRole; the heap DELETE
+		// (B4.5) stamps the pg_authid row by oid — a real XLOG_HEAP_DELETE on
+		// global/1260 replacing the retired RecordKindDropRole(68) +
+		// whole-file SyncPgAuthidFile.
+		persistDrop := func(roleName string, oid uint32) {
+			if err := DeleteAuthidRow(o.ctx, oid); err != nil {
+				o.ctx.AddNotice(fmt.Sprintf("pg_authid heap delete failed: %v", err))
 			}
 			if o.ctx.OnRoleDropped != nil {
 				o.ctx.OnRoleDropped(roleName)
@@ -14804,16 +14747,18 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 				if !exists {
 					o.ctx.AddNotice(fmt.Sprintf("role %q does not exist, skipping", name.Name))
 				} else {
+					oid, _ := o.ctx.Catalog.RoleOID(roleName)
 					o.ctx.Catalog.UnregisterRole(roleName)
-					persistDrop(roleName)
+					persistDrop(roleName, oid)
 				}
 			} else {
 				if !exists {
 					return &ExecError{Code: "42704", Pos: s.Pos(),
 						Message: fmt.Sprintf("role %q does not exist", name.Name)}
 				}
+				oid, _ := o.ctx.Catalog.RoleOID(roleName)
 				o.ctx.Catalog.UnregisterRole(roleName)
-				persistDrop(roleName)
+				persistDrop(roleName, oid)
 			}
 		}
 		return nil
@@ -14997,13 +14942,23 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 			if schema == "" {
 				schema = "public"
 			}
-			if imOK && im.DropStatistics(name.Name, schema) {
-				if o.ctx.WAL != nil {
-					if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropStatistics(name.Name, schema)); werr != nil {
-						return fmt.Errorf("wal drop-statistics: %w", werr)
-					}
+			if imOK {
+				// B5 Bstat: capture the OID before the registry drop so the
+				// pg_statistic_ext heap row can be xmax-stamped (the retired
+				// RecordKindDropStatistics(96) replacement). A real PG standby
+				// replays the heap delete.
+				var droppedOID uint32
+				if obj, ok := im.LookupStatistics(schema + "." + name.Name); ok {
+					droppedOID = obj.OID
 				}
-				continue
+				if im.DropStatistics(name.Name, schema) {
+					if droppedOID != 0 && catalogHeapSyncAvailable(o.ctx) {
+						if err := o.ctx.MaterializeWriterXID(); err == nil {
+							stampStatisticExtRows(o.ctx, droppedOID, o.ctx.Tx.XID)
+						}
+					}
+					continue
+				}
 			}
 			if s.IfExists {
 				o.ctx.AddNotice(fmt.Sprintf("statistics object %q does not exist, skipping", name.Name))
@@ -17821,15 +17776,31 @@ func (o *ddlOp) execCreateStatistics(s *parser.CreateStatisticsStmt) error {
 		exprs = append(exprs, defaultExprToSQL(e))
 	}
 	obj := im.RegisterStatisticsFull(schema, s.Name.Name, tableOID, s.Kinds, s.Columns, exprs, s.HasExpr)
-	// DU-002 restart-persistence follow-up (slice 441's own resume point):
-	// CREATE STATISTICS was never WAL-logged, so the object vanished on
-	// restart and ALTER STATISTICS had nothing durable to attach to.
-	if o.ctx.WAL != nil {
-		if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateStatistics(obj.Name, obj.Schema, obj.OID, obj.TableOID, obj.Owner, obj.Kinds, obj.Columns, obj.Exprs, obj.HasExpr)); werr != nil {
-			return fmt.Errorf("wal create-statistics: %w", werr)
+	// B5 Bstat: CREATE STATISTICS journals a real pg_statistic_ext heap row
+	// (base/<dbOid>/3381) instead of the retired RecordKindCreateStatistics(95)
+	// record; the reload (loadStatisticsExtFromHeap) re-registers it. A real PG
+	// standby replays the heap insert.
+	if catalogHeapSyncAvailable(o.ctx) {
+		if err := syncStatisticExtRow(o.ctx, obj); err != nil {
+			return fmt.Errorf("pg_statistic_ext: %w", err)
 		}
 	}
 	return nil
+}
+
+// resyncStatisticExtHeap stamps the old pg_statistic_ext heap row (by OID) and
+// writes the current one, for an ALTER STATISTICS re-sync (RENAME / OWNER / SET
+// SCHEMA / SET STATISTICS). No-op when catalog heap sync is unavailable. The
+// *StatisticsObject pointer is stable across the in-place registry mutation, so
+// callers pass the object they already mutated. B5 Bstat.
+func (o *ddlOp) resyncStatisticExtHeap(obj *catalog.StatisticsObject) error {
+	if obj == nil || !catalogHeapSyncAvailable(o.ctx) {
+		return nil
+	}
+	if err := o.ctx.MaterializeWriterXID(); err == nil {
+		stampStatisticExtRows(o.ctx, obj.OID, o.ctx.Tx.XID)
+	}
+	return syncStatisticExtRow(o.ctx, obj)
 }
 
 // execAlterStatistics applies `ALTER STATISTICS ...` to an extended-statistics
@@ -17860,15 +17831,19 @@ func (o *ddlOp) execAlterStatistics(s *parser.AlterStatisticsStmt) error {
 		}
 		return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("statistics object %q does not exist", s.Name.Name)}
 	}
+	// B5 Bstat: the ALTER mutations below re-sync a real pg_statistic_ext heap
+	// row (stamp old by OID + write new) instead of the retired
+	// RecordKindAlterStatistics{Rename,Owner,SetSchema}(97/98/99) records. The
+	// *StatisticsObject pointer is stable across the in-place mutation, so
+	// capture it once up front (its OID never changes) and re-sync afterward.
+	obj, _ := im.LookupStatistics(name)
 	switch s.Action {
 	case "rename":
 		if !im.RenameStatisticsObject(name, s.NewName) {
 			return notFound()
 		}
-		if o.ctx.WAL != nil {
-			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterStatisticsRename(name, s.NewName)); werr != nil {
-				return fmt.Errorf("wal alter-statistics-rename: %w", werr)
-			}
+		if err := o.resyncStatisticExtHeap(obj); err != nil {
+			return fmt.Errorf("pg_statistic_ext rename: %w", err)
 		}
 		return nil
 	case "owner":
@@ -17883,20 +17858,16 @@ func (o *ddlOp) execAlterStatistics(s *parser.AlterStatisticsStmt) error {
 		if !im.SetStatisticsOwner(name, ownerOID) {
 			return notFound()
 		}
-		if o.ctx.WAL != nil {
-			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterStatisticsOwner(name, ownerOID)); werr != nil {
-				return fmt.Errorf("wal alter-statistics-owner: %w", werr)
-			}
+		if err := o.resyncStatisticExtHeap(obj); err != nil {
+			return fmt.Errorf("pg_statistic_ext owner: %w", err)
 		}
 		return nil
 	case "setschema":
 		if !im.SetStatisticsSchema(name, s.NewSchema) {
 			return notFound()
 		}
-		if o.ctx.WAL != nil {
-			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterStatisticsSetSchema(name, s.NewSchema)); werr != nil {
-				return fmt.Errorf("wal alter-statistics-set-schema: %w", werr)
-			}
+		if err := o.resyncStatisticExtHeap(obj); err != nil {
+			return fmt.Errorf("pg_statistic_ext set schema: %w", err)
 		}
 		return nil
 	}
@@ -17909,6 +17880,9 @@ func (o *ddlOp) execAlterStatistics(s *parser.AlterStatisticsStmt) error {
 		target = &v
 	}
 	im.SetStatisticsTarget(name, target)
+	if err := o.resyncStatisticExtHeap(obj); err != nil {
+		return fmt.Errorf("pg_statistic_ext set statistics: %w", err)
+	}
 	return nil
 }
 

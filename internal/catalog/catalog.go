@@ -3599,10 +3599,18 @@ func NewInMemory() *InMemory {
 		opClassSchemas:         make(map[string]string),
 		userAggregates:         make(map[string]*UserAggregate),
 		schemas: map[string]uint32{
+			// Real PG18 namespace OIDs (pg_namespace.dat / a stock initdb). These
+			// were previously wrong: pg_toast was 2200 (colliding with public) and
+			// information_schema was 99 (which is actually pg_toast's OID). The
+			// collision made SchemaNameForOID(2200) return "public" or "pg_toast"
+			// nondeterministically (Go map range order), silently reloading a
+			// public object into pg_toast. pg_toast=99 also matches initdb.go's
+			// pgNamespaceInitialEntries and the "pg_toast namespace (OID 99)"
+			// assumption baked into the TOAST virtual-row builders.
 			"pg_catalog":         11,
 			"public":             2200,
-			"information_schema": 99,
-			"pg_toast":           2200, // toast uses same OID as public in simplified model
+			"pg_toast":           99,
+			"information_schema": 13183, // stock PG18 initdb-assigned OID
 		},
 		schemaOwners:       make(map[string]uint32),
 		roles:              make(map[string]uint32),
@@ -5375,6 +5383,45 @@ func (c *InMemory) RevokeRoleMembership(roleOid, memberOid, grantorOid uint32, r
 		delete(c.roleMembers, key)
 	}
 	return true
+}
+
+// LookupRoleMembership returns a copy of the current (roleOid, memberOid,
+// grantorOid) membership and whether it exists. Used by the B4.3
+// pg_auth_members heap writer to re-sync the single affected row from the
+// post-mutation registry state.
+func (c *InMemory) LookupRoleMembership(roleOid, memberOid, grantorOid uint32) (RoleMembership, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if m, ok := c.roleMembers[roleMembershipKey{RoleOID: roleOid, MemberOID: memberOid, GrantorOID: grantorOid}]; ok {
+		return *m, true
+	}
+	return RoleMembership{}, false
+}
+
+// AllRoleMemberships returns a copy of every role-membership row, sorted by OID
+// for deterministic pg_auth_members output. Used by the B4.3 reload.
+func (c *InMemory) AllRoleMemberships() []RoleMembership {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make([]RoleMembership, 0, len(c.roleMembers))
+	for _, m := range c.roleMembers {
+		out = append(out, *m)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].OID < out[j].OID })
+	return out
+}
+
+// RegisterRoleMembershipDuringRecovery re-registers a membership row with its
+// original OID/options, replayed from the pg_auth_members heap
+// (reloadRoleMembershipsFromHeap, B4.3). Mirrors RegisterSchemaDuringRecovery.
+func (c *InMemory) RegisterRoleMembershipDuringRecovery(m RoleMembership) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	cp := m
+	c.roleMembers[roleMembershipKey{RoleOID: m.RoleOID, MemberOID: m.MemberOID, GrantorOID: m.GrantorOID}] = &cp
+	if m.OID >= c.nextOID {
+		c.nextOID = m.OID + 1
+	}
 }
 
 // RevokeRoleMembershipCascadeSet computes, WITHOUT mutating any state, the
@@ -12199,6 +12246,10 @@ func (c *InMemory) SchemaNameForOID(oid uint32) string {
 	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	// The schemas map holds distinct OIDs per namespace (NewInMemory uses the
+	// real PG18 values), so this reverse scan is unambiguous. (It was previously
+	// nondeterministic because pg_toast wrongly shared public's OID 2200 — fixed
+	// at the source in NewInMemory rather than worked around here.)
 	for name, o := range c.schemas {
 		if o == oid {
 			return name
@@ -22333,9 +22384,10 @@ func binaryOpSymbol(op parser.OpCode) string {
 // for pg_attrdef.adbin. Used by pg_get_expr to display column defaults in \d.
 // FormatExprForAttrdef deparses a column DEFAULT / CHECK / generated-column
 // expression to SQL text, the same rendering pg_attrdef's adbin display uses.
-// Exported for the column-defaults WAL persistence (RecordKindColumnDefaults):
-// syncTableToCatalogHeap serializes each DefaultExpr with it and startup
-// replay round-trips the text through parser.ParseExpr. root-0020 follow-up.
+// Exported for pg_attrdef heap persistence (B5 Slice B): syncTableToCatalogHeap
+// serializes each DefaultExpr with it into the pg_attrdef row's adbin, and
+// startup reload round-trips the text through parser.ParseExpr. root-0020
+// follow-up, converted from the retired RecordKindColumnDefaults(69) WAL record.
 func FormatExprForAttrdef(e parser.Expr) string { return formatExprForAttrdef(e) }
 
 func formatExprForAttrdef(e parser.Expr) string {

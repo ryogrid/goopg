@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/goopg/goopg/internal/access/btree"
-	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/control"
 	"github.com/goopg/goopg/internal/storage"
 )
@@ -135,57 +134,22 @@ const (
 	//   kind(1) | subXid(4) = 5 bytes total.
 	RecordKindXactSubAbort byte = 17
 
-	// RecordKindCreateDatabase records a `CREATE DATABASE <name>` event
-	// so the catalog's per-instance database list can be reconstructed
-	// after a crash (M0054-0001). The redo path does NOT touch on-disk
-	// storage — goopg v0 has no per-database file namespacing — so
-	// applyRecord returns (false, nil); the recovery driver in
-	// internal/initdb scans the WAL for these records after physical
-	// replay and re-registers each database name in the catalog.
-	// Format:
-	//   kind(1) | nameLen(2) | name(nameLen bytes)
-	RecordKindCreateDatabase byte = 18
+	// Kinds 18/19 (CreateDatabase/DropDatabase) retired in B4.6 Stage 3:
+	// CREATE/DROP DATABASE now journal a real pg_database SHARED heap row
+	// (global/1262, via XLOG_HEAP_INSERT/DELETE — Stage 1) for the catalog
+	// identity + a real RM_DBASE XLOG_DBASE_CREATE_WAL_LOG / XLOG_DBASE_DROP
+	// record (RmgrDbase=4) for the base/<oid> physical directory, so a real
+	// PG18 standby replays both. A restart reloads the registry from the heap
+	// (reloadDatabasesFromHeap) and physical replay recreates the directory.
 
-	// RecordKindDropDatabase records a `DROP DATABASE <name>` event.
-	// Counterpart to RecordKindCreateDatabase. Same format / replay
-	// semantics; the recovery driver removes the name from the
-	// catalog instead of adding it.
-	RecordKindDropDatabase byte = 19
-
-	// RecordKindCreateIndex records a `CREATE INDEX` event so the
-	// catalog's in-memory index registry can be reconstructed after
-	// a crash that bypasses SaveCatalog (M0079-0001 / pgbench
-	// recovery fix).
-	//
-	// Background: goopg has no `pg_index` heap relation, so the
-	// pg_class row written by `syncIndexToCatalogHeap` (relkind='i')
-	// is insufficient to fully reconstruct an Index — the column
-	// list, unique flag, primary flag, and owning-table OID are
-	// missing. Without WAL-driven recovery the index disappears
-	// from the catalog after restart even though its relfile and
-	// btree pages are intact on disk; pgbench's `pgbench_accounts.aid`
-	// PK was the surfacing case (~70x TPS regression after restart
-	// because every UPDATE fell back to a 10M-row Seq Scan).
-	//
-	// Same redo semantics as RecordKindCreateDatabase: physical
-	// replay (`ApplyRecord`) is a no-op — heap pages and btree
-	// pages are already restored by other record kinds — and the
-	// catalog-side replay runs once after physical recovery
-	// finishes via `internal/initdb.replayIndexDDLRecords`.
-	//
-	// Format:
-	//   kind(1) | oid(4) | tableOid(4) | unique(1) | primary(1) |
-	//   schemaLen(2) | nameLen(2) | methodLen(2) | numCols(2) |
-	//   schema | name | method | colName0Len(2) | colName0 | ... |
-	//   colNameKLen(2) | colNameK
-	RecordKindCreateIndex byte = 20
-
-	// RecordKindDropIndex is the counterpart to
-	// RecordKindCreateIndex. Carries the index OID + qualified
-	// name so the recovery driver can locate and unregister it.
-	// Format:
-	//   kind(1) | oid(4) | schemaLen(2) | nameLen(2) | schema | name
-	RecordKindDropIndex byte = 21
+	// Kinds 20/21 (CreateIndex/DropIndex) retired in B5 Slice A: the "goopg has
+	// no pg_index heap" premise is stale — M0113 added a real pg_index heap
+	// (2610) written at runtime by syncIndexToCatalogHeap alongside the pg_class
+	// (relkind='i') row, and loadUserIndexesFromHeap reconstructs the full
+	// in-memory Index (indkey/unique/primary/indrelid/opclass/collation/
+	// indoption/predicate) from both. CREATE/DROP INDEX now journal only real
+	// heap inserts/deletes on pg_class + pg_index, which a real PG standby
+	// replays (no rmid-128 record). See kind 94 (RenameIndex, also retired).
 
 	// RecordKindBtreeVacuum is a logical change record for one
 	// B-tree page vacuum (M0079-0002). VACUUM emits one per page
@@ -411,30 +375,10 @@ const (
 	// recovery driver in internal/initdb replays it against the CLog.
 	RecordKindClogTruncate byte = 33
 
-	// RecordKindCreateSubscription records a `CREATE SUBSCRIPTION name ...`
-	// event so it survives a restart. Same rationale/no-op physical redo
-	// path as RecordKindCreatePublication.
-	// Format:
-	//   kind(1) | oid(4) | ownerOID(4) | enabledFlag(1) |
-	//   nameLen(2) | name(nameLen bytes) |
-	//   conninfoLen(2) | conninfo(conninfoLen bytes) |
-	//   slotNameLen(2) | slotName(slotNameLen bytes) |
-	//   pubCount(2) | for each: pubLen(2) pub(pubLen bytes)
-	RecordKindCreateSubscription byte = 53
-
-	// RecordKindDropSubscription records a `DROP SUBSCRIPTION name` event.
-	// Counterpart to RecordKindCreateSubscription; same no-op physical redo
-	// path.
-	// Format:
-	//   kind(1) | nameLen(2) | name(nameLen bytes)
-	RecordKindDropSubscription byte = 54
-
-	// RecordKindAlterSubscriptionOwner records an `ALTER SUBSCRIPTION name
-	// OWNER TO newowner` event. Same no-op physical redo path as
-	// RecordKindCreateSubscription.
-	// Format:
-	//   kind(1) | ownerOID(4) | nameLen(2) | name(nameLen bytes)
-	RecordKindAlterSubscriptionOwner byte = 55
+	// Kinds 53-55 (Create/Drop/AlterSubscriptionOwner) retired in B4.4:
+	// CREATE/DROP/ALTER SUBSCRIPTION OWNER now journal a real pg_subscription
+	// heap row (SHARED, global/6100), and a restart reloads the PubSub registry
+	// via reloadSubscriptionsFromHeap. (Publications converted in B3.3.)
 
 	// Kinds 124/125 (CreateTablespace/DropTablespace) retired in B4.1e:
 	// CREATE/DROP TABLESPACE now journals a real pg_tablespace heap row
@@ -442,129 +386,49 @@ const (
 	// DROP, and a restart reloads the registry from that heap
 	// (reloadUserTablespacesFromHeap).
 
-	// RecordKindRoleState records the FULL state of one role (name +
-	// attribute flags + password verifier) so CREATE/ALTER ROLE survive a
-	// restart, like PostgreSQL's pg_authid (which goopg only bootstraps at
-	// initdb — runtime role DDL was in-memory-only before this record).
-	// Passwords are stored as verifiers, never plaintext-by-default: the
-	// server-side handler turns `PASSWORD 'x'` into an upstream-format
-	// SCRAM-SHA-256 verifier (auth.NewSCRAMSecret, mirroring PG's
-	// encrypt_password in postgres/src/backend/libpq/crypt.c) before the
-	// record is emitted, so the WAL carries the same secret shape as
-	// pg_authid.rolpassword. Emitted on CREATE ROLE/USER/GROUP and ALTER
-	// ROLE/USER; replay is last-record-wins so both share this one kind.
-	// The WAL records are the crash-recovery TAIL only: the durable base
-	// store is the pg_authid heap file (global/1260), rewritten atomically
-	// on every role DDL (initdb.SyncPgAuthidFile) exactly like PostgreSQL's
-	// pg_authid heap is the durable store and its WAL records the tail.
-	// Startup loads the heap first, then replays these records on top.
-	// Format:
-	//   kind(1) | flags(1: bit0=canLogin bit1=superuser) | credType(1:
-	//   0=none 1=plaintext 2=md5 3=scram-sha-256) | oid(4) |
-	//   nameLen(2)+name | secretLen(2)+secret
-	RecordKindRoleState byte = 67
+	// Kinds 67/68 (RoleState/DropRole) retired in B4.5: CREATE/ALTER/DROP ROLE
+	// now journals a real pg_authid heap row (SHARED, global/1260) via
+	// XLOG_HEAP_INSERT/DELETE + 2676/2677 index maintenance, and a restart
+	// reloads the registry from that heap (reloadRolesFromAuthidHeap). See
+	// kind 72 below (also retired in B4.5).
 
-	// RecordKindDropRole records a role removal (DROP ROLE/USER/GROUP) so
-	// replay does not resurrect it. Format: kind(1) | nameLen(2) | name.
-	RecordKindDropRole byte = 68
+	// Kind 69 (ColumnDefaults) retired in B5 Slice B: column DEFAULT
+	// expressions now journal as real pg_attrdef HEAP rows (base/<dbOid>/2604,
+	// one per defaulted column, adbin = the expression as SQL text) via
+	// XLOG_HEAP_INSERT — written by syncTableToCatalogHeap (writeAttrdefRow) and
+	// reloaded by loadColumnDefaultsFromHeap. A real PG standby replays the heap
+	// inserts (no rmid-128). Upstream analog: pg_attrdef
+	// (postgres/src/backend/catalog/heap.c StoreAttrDefault).
 
-	// RecordKindColumnDefaults records a table's column DEFAULT expressions
-	// (as SQL text) so they survive a restart. catalog.Column.DefaultExpr is
-	// an in-memory parser AST that loadUserTablesFromHeap cannot reconstruct
-	// — pg_attribute carries only atthasdef and goopg writes no pg_attrdef
-	// heap rows at runtime — so before this record an INSERT omitting a
-	// defaulted column inserted NULL after a restart (WordPress:
-	// `wp_posts.comment_count bigint NOT NULL DEFAULT 0` raised a NOT NULL
-	// violation on every post-restart post creation). Emitted from
-	// syncTableToCatalogHeap (the single funnel every table-persisting DDL
-	// path goes through), one record per table carrying ALL its defaulted
-	// columns; replay is last-record-wins and re-parses each expression via
-	// parser.ParseExpr. Upstream analog: pg_attrdef
-	// (postgres/src/backend/catalog/heap.c StoreAttrDefault). Format:
-	//   kind(1) | tableOID(4) | count(2) | count × (nameLen(2)+name |
-	//   exprLen(2)+exprSQL)
-	RecordKindColumnDefaults byte = 69
-
-	// RecordKindAlterRoleRename records an `ALTER ROLE/USER <name> RENAME TO
-	// <newname>` event so the rename survives a restart. Like
-	// RecordKindRoleState, runtime role DDL never writes the pg_authid heap
-	// directly (only the periodic full-registry SyncPgAuthidFile rewrite
-	// does), so the physical replay path is a no-op; the recovery driver in
-	// internal/initdb/role_ddl_recovery.go re-keys the catalog role registry
-	// entry (preserving its OID) after physical replay. root-0021 follow-up
-	// (M0119-0004).
-	// Format:
-	//   kind(1) | nameLen(2) | name(nameLen bytes) | newNameLen(2) | newName(newNameLen bytes)
-	RecordKindAlterRoleRename byte = 72
+	// Kind 72 (AlterRoleRename) retired in B4.5: ALTER ROLE ... RENAME TO is
+	// just an attribute change on rolname, so it rides the same per-row
+	// pg_authid heap re-sync (stamp by oid + write the row under the new
+	// rolname) as CREATE/ALTER — see the kinds 67/68 note above.
 
 	// Kinds 73-78 (AlterDatabase/RoleSetConfig/ResetConfig/ResetAllConfig)
 	// retired in B4.2: ALTER DATABASE/ROLE SET/RESET now re-syncs a real
 	// pg_db_role_setting heap row (SHARED, global/2964) from the registry, and
 	// a restart reloads it via reloadDbRoleSettingsFromHeap.
 
-	// RecordKindGrantRoleMembership records a `GRANT <role> TO <member>
-	// [WITH { ADMIN | INHERIT | SET } { OPTION | TRUE | FALSE } [, ...]]`
-	// event so the pg_auth_members row survives a restart
-	// (M0119-0004-ACLHEAP, GRANT/REVOKE ROLE membership). goopg has no
-	// per-role file namespace, so the physical redo path is a no-op; the
-	// recovery driver in internal/initdb/role_membership_recovery.go scans
-	// the WAL for these records after physical replay and re-applies them to
-	// catalog.InMemory's roleMembers registry via GrantRoleMembership (which
-	// mints a fresh OID at replay time — pg_auth_members.oid is not dumped
-	// by pg_dump/pg_dumpall, so OID stability across a restart is not
-	// required).
-	// Format:
-	//   kind(1) | roleOid(4) | memberOid(4) | grantorOid(4) | options(1)
-	RecordKindGrantRoleMembership byte = 79
+	// Kinds 79/80 (Grant/RevokeRoleMembership) retired in B4.3: GRANT/REVOKE
+	// role membership now journals a real pg_auth_members heap row (SHARED,
+	// global/1261) re-synced per (roleid, member, grantor) from the registry,
+	// and a restart reloads it via reloadRoleMembershipsFromHeap.
 
-	// RecordKindRevokeRoleMembership records a `REVOKE
-	// [{ADMIN|INHERIT|SET} OPTION FOR] <role> FROM <member>` event. Same
-	// no-op physical redo path as RecordKindGrantRoleMembership.
-	// Format:
-	//   kind(1) | roleOid(4) | memberOid(4) | revokeOption(1)
-	RecordKindRevokeRoleMembership byte = 80
+	// Kind 94 (RenameIndex) retired in B5 Slice A: ALTER INDEX RENAME now
+	// rewrites the index's pg_class HEAP row with the new relname
+	// (resyncIndexClassHeapRow — the index name lives in pg_class, not
+	// pg_index), so loadUserIndexesFromHeap restores the rename and a real PG
+	// standby replays it as a pg_class heap UPDATE.
 
-	// RecordKindRenameIndex records an `ALTER INDEX name RENAME TO newname`
-	// event on a real (non-TOAST) index — previously a functional no-op with
-	// no catalog mutation at all, so there was nothing to WAL-log (DU-002
-	// slice 443). Same no-op physical redo path as RecordKindCreateIndex /
-	// RecordKindDropIndex: only the in-memory index registry's name/key
-	// changes; btree pages and the pg_class row are untouched by a rename.
-	// Format:
-	//   kind(1) | schemaLen(2) | schema(schemaLen bytes) | oldNameLen(2) |
-	//   oldName(oldNameLen bytes) | newNameLen(2) | newName(newNameLen bytes)
-	RecordKindRenameIndex byte = 94
-
-	// RecordKindCreateMatView records a materialized view's defining query
-	// (as SQL text) and populated state so both survive a restart. A matview
-	// is a *catalog.Table with IsMatView=true, View (parser AST) and ViewDef
-	// (raw SQL) set — pg_class.relkind carries 'm' on disk (buildUserPGClassRow),
-	// but loadUserTablesFromHeap cannot reconstruct the AST from relkind alone,
-	// and syncTableToCatalogHeap writes no pg_rewrite-equivalent heap rows. Before
-	// this record, a restarted matview reloaded as an ordinary relkind='m'-blind
-	// table with View=nil (loadUserTablesFromHeap only recognized relkind='r'),
-	// losing both its matview-ness and its refresh query. Emitted from
-	// syncTableToCatalogHeap (the same single funnel as RecordKindColumnDefaults),
-	// one record per matview, last-record-wins; replay re-parses the query via
-	// parser.Parse. Upstream analog: pg_rewrite (postgres/src/backend/rewrite/rewriteDefine.c).
-	// Format: kind(1) | tableOID(4) | populated(1) | queryLen(2) | querySQL
-	RecordKindCreateMatView byte = 102
-
-	// RecordKindCreateView records a plain (non-materialized) view's defining
-	// query (as SQL text) so it survives a restart. A view is a *catalog.Table
-	// with View (parser AST) and ViewDef (raw SQL) set, Virtual=true, and
-	// pg_class.relkind='v' on disk (buildUserPGClassRow) — but a view has no
-	// physical heap storage and no pg_rewrite-equivalent heap rows, so
-	// loadUserTablesFromHeap can reconstruct the column list from pg_attribute
-	// but not the AST. Before this record, `execCreateView` never called
-	// syncTableToCatalogHeap at all, so a plain view did not survive a restart
-	// even as a downgraded relation — it simply ceased to exist. Emitted from
-	// syncTableToCatalogHeap (the same funnel as RecordKindCreateMatView), one
-	// record per view, last-record-wins; replay re-parses the query via
-	// parser.Parse. Upstream analog: pg_rewrite
-	// (postgres/src/backend/rewrite/rewriteDefine.c).
-	// Format: kind(1) | tableOID(4) | queryLen(2) | querySQL
-	RecordKindCreateView byte = 103
+	// Kinds 102 (CreateMatView) / 103 (CreateView) retired in B5 Slice C: a user
+	// view / materialized view's defining SELECT now journals as a real
+	// pg_rewrite _RETURN rule HEAP row (base/<dbOid>/2618, ev_action = the query
+	// as SQL text) via XLOG_HEAP_INSERT — written by syncTableToCatalogHeap
+	// (writeViewRewriteRow) and reloaded by loadViewsFromHeap. A real PG standby
+	// replays the heap insert (no rmid-128). Upstream analog: pg_rewrite
+	// (postgres/src/backend/rewrite/rewriteDefine.c). (matview IsPopulated across
+	// a restart is a documented deferral — see the deferral ledger.)
 
 	// defaultRecoveryDBOid is the database OID used by
 	// ProcessCommittedInvalidationMessages when unlinking the per-database
@@ -615,82 +479,6 @@ const (
 	heapHotUpdateHeaderSize = 20
 )
 
-// EncodeCreateDatabase encodes a CREATE DATABASE event (M0054-0001).
-// Format: kind(1) | nameLen(2) | name(nameLen bytes) | owner(4, datdba OID,
-// M0122-0007) | oid(4, real pg_database.oid, M0122-0007
-// physical-storage-isolation slice 1).
-func EncodeCreateDatabase(name string, owner, oid uint32) []byte {
-	if len(name) > 0xFFFF {
-		// goopg's identifier length cap is far below 64 KiB; truncating
-		// here is defensive — this branch is unreachable under normal
-		// CREATE DATABASE syntax.
-		name = name[:0xFFFF]
-	}
-	out := make([]byte, 3+len(name)+4+4)
-	out[0] = RecordKindCreateDatabase
-	binary.LittleEndian.PutUint16(out[1:3], uint16(len(name)))
-	copy(out[3:], name)
-	binary.LittleEndian.PutUint32(out[3+len(name):], owner)
-	binary.LittleEndian.PutUint32(out[3+len(name)+4:], oid)
-	return out
-}
-
-// DecodeCreateDatabase decodes a RecordKindCreateDatabase payload. owner
-// defaults to catalog.BootstrapSuperuserOID when the payload predates the
-// M0122-0007 owner suffix (no trailing 4 bytes) — keeps replay of a WAL
-// stream written before this change working. oid defaults to 0 (catalog's
-// DatabaseOid "no override" sentinel) when the payload predates the
-// M0122-0007 physical-storage-isolation slice-1 oid suffix.
-func DecodeCreateDatabase(payload []byte) (name string, owner uint32, oid uint32, err error) {
-	if len(payload) < 3 {
-		return "", 0, 0, fmt.Errorf("wal: create-database payload too short (%d bytes)", len(payload))
-	}
-	if payload[0] != RecordKindCreateDatabase {
-		return "", 0, 0, fmt.Errorf("wal: record kind %d is not create-database", payload[0])
-	}
-	nameLen := int(binary.LittleEndian.Uint16(payload[1:3]))
-	if len(payload) < 3+nameLen {
-		return "", 0, 0, fmt.Errorf("wal: create-database payload truncated (need %d bytes)", 3+nameLen)
-	}
-	name = string(payload[3 : 3+nameLen])
-	owner = catalog.BootstrapSuperuserOID
-	if len(payload) >= 3+nameLen+4 {
-		owner = binary.LittleEndian.Uint32(payload[3+nameLen : 3+nameLen+4])
-	}
-	if len(payload) >= 3+nameLen+4+4 {
-		oid = binary.LittleEndian.Uint32(payload[3+nameLen+4 : 3+nameLen+4+4])
-	}
-	return name, owner, oid, nil
-}
-
-// EncodeDropDatabase encodes a DROP DATABASE event (M0054-0001).
-// Format identical to EncodeCreateDatabase.
-func EncodeDropDatabase(name string) []byte {
-	if len(name) > 0xFFFF {
-		name = name[:0xFFFF]
-	}
-	out := make([]byte, 3+len(name))
-	out[0] = RecordKindDropDatabase
-	binary.LittleEndian.PutUint16(out[1:3], uint16(len(name)))
-	copy(out[3:], name)
-	return out
-}
-
-// DecodeDropDatabase decodes a RecordKindDropDatabase payload.
-func DecodeDropDatabase(payload []byte) (name string, err error) {
-	if len(payload) < 3 {
-		return "", fmt.Errorf("wal: drop-database payload too short (%d bytes)", len(payload))
-	}
-	if payload[0] != RecordKindDropDatabase {
-		return "", fmt.Errorf("wal: record kind %d is not drop-database", payload[0])
-	}
-	nameLen := int(binary.LittleEndian.Uint16(payload[1:3]))
-	if len(payload) < 3+nameLen {
-		return "", fmt.Errorf("wal: drop-database payload truncated (need %d bytes)", 3+nameLen)
-	}
-	return string(payload[3 : 3+nameLen]), nil
-}
-
 // SequenceStatePayload is the decoded form of a RecordKindSequenceState
 // record: one sequence's full definition plus its current counter. See the
 // RecordKindSequenceState constant for the on-disk format and the emit
@@ -713,198 +501,6 @@ type SequenceStatePayload struct {
 	DBOid        uint32 // owning database oid (M0122-0007 4e); 0 on a pre-4e record, see DecodeSequenceState
 }
 
-
-// RoleStatePayload is the decoded form of a RecordKindRoleState record: one
-// role's name, OID, attribute flags, and stored credential. See the
-// RecordKindRoleState constant for the on-disk format and emit policy.
-//
-// CreateDB/CreateRole/Replication/BypassRLS/ConnLimit/ValidUntil mirror
-// catalog.RoleAttrs' identically-named fields (DU-002 slice 439 follow-up).
-type RoleStatePayload struct {
-	Name        string
-	OID         uint32 // registry OID — kept stable across restarts
-	CanLogin    bool
-	Superuser   bool
-	CreateDB    bool
-	CreateRole  bool
-	Replication bool
-	BypassRLS   bool
-	ConnLimit   int32
-	ValidUntil  string
-	CredType    byte   // 0=none, 1=plaintext, 2=md5, 3=scram-sha-256
-	Secret      string // stored verifier (or plaintext for CredType 1)
-}
-
-// EncodeRoleState encodes a RecordKindRoleState record.
-func EncodeRoleState(p RoleStatePayload) []byte {
-	var buf bytes.Buffer
-	buf.WriteByte(RecordKindRoleState)
-	var flags byte
-	if p.CanLogin {
-		flags |= 1 << 0
-	}
-	if p.Superuser {
-		flags |= 1 << 1
-	}
-	if p.CreateDB {
-		flags |= 1 << 2
-	}
-	if p.CreateRole {
-		flags |= 1 << 3
-	}
-	if p.Replication {
-		flags |= 1 << 4
-	}
-	if p.BypassRLS {
-		flags |= 1 << 5
-	}
-	buf.WriteByte(flags)
-	buf.WriteByte(p.CredType)
-	var oid [4]byte
-	binary.LittleEndian.PutUint32(oid[:], p.OID)
-	buf.Write(oid[:])
-	var connLimit [4]byte
-	binary.LittleEndian.PutUint32(connLimit[:], uint32(p.ConnLimit))
-	buf.Write(connLimit[:])
-	writeStr16 := func(s string) {
-		if len(s) > 0xFFFF {
-			s = s[:0xFFFF]
-		}
-		var l [2]byte
-		binary.LittleEndian.PutUint16(l[:], uint16(len(s)))
-		buf.Write(l[:])
-		buf.WriteString(s)
-	}
-	writeStr16(p.Name)
-	writeStr16(p.Secret)
-	writeStr16(p.ValidUntil)
-	return buf.Bytes()
-}
-
-// DecodeRoleState decodes a RecordKindRoleState payload.
-func DecodeRoleState(payload []byte) (RoleStatePayload, error) {
-	var p RoleStatePayload
-	if len(payload) < 11 {
-		return p, fmt.Errorf("wal: role-state payload too short (%d bytes)", len(payload))
-	}
-	if payload[0] != RecordKindRoleState {
-		return p, fmt.Errorf("wal: record kind %d is not role-state", payload[0])
-	}
-	flags := payload[1]
-	p.CanLogin = flags&(1<<0) != 0
-	p.Superuser = flags&(1<<1) != 0
-	p.CreateDB = flags&(1<<2) != 0
-	p.CreateRole = flags&(1<<3) != 0
-	p.Replication = flags&(1<<4) != 0
-	p.BypassRLS = flags&(1<<5) != 0
-	p.CredType = payload[2]
-	p.OID = binary.LittleEndian.Uint32(payload[3:7])
-	p.ConnLimit = int32(binary.LittleEndian.Uint32(payload[7:11]))
-	off := 11
-	readStr16 := func() (string, error) {
-		if len(payload) < off+2 {
-			return "", fmt.Errorf("wal: role-state payload truncated at offset %d", off)
-		}
-		l := int(binary.LittleEndian.Uint16(payload[off : off+2]))
-		off += 2
-		if len(payload) < off+l {
-			return "", fmt.Errorf("wal: role-state string truncated (need %d bytes at %d)", l, off)
-		}
-		s := string(payload[off : off+l])
-		off += l
-		return s, nil
-	}
-	var err error
-	if p.Name, err = readStr16(); err != nil {
-		return p, err
-	}
-	if p.Secret, err = readStr16(); err != nil {
-		return p, err
-	}
-	if p.ValidUntil, err = readStr16(); err != nil {
-		return p, err
-	}
-	return p, nil
-}
-
-// EncodeDropRole encodes a RecordKindDropRole record.
-// Format identical to EncodeDropDatabase: kind(1) | nameLen(2) | name.
-func EncodeDropRole(name string) []byte {
-	if len(name) > 0xFFFF {
-		name = name[:0xFFFF]
-	}
-	out := make([]byte, 3+len(name))
-	out[0] = RecordKindDropRole
-	binary.LittleEndian.PutUint16(out[1:3], uint16(len(name)))
-	copy(out[3:], name)
-	return out
-}
-
-// DecodeDropRole decodes a RecordKindDropRole payload.
-func DecodeDropRole(payload []byte) (name string, err error) {
-	if len(payload) < 3 {
-		return "", fmt.Errorf("wal: drop-role payload too short (%d bytes)", len(payload))
-	}
-	if payload[0] != RecordKindDropRole {
-		return "", fmt.Errorf("wal: record kind %d is not drop-role", payload[0])
-	}
-	nameLen := int(binary.LittleEndian.Uint16(payload[1:3]))
-	if len(payload) < 3+nameLen {
-		return "", fmt.Errorf("wal: drop-role payload truncated (need %d bytes)", 3+nameLen)
-	}
-	return string(payload[3 : 3+nameLen]), nil
-}
-
-// EncodeAlterRoleRename encodes a RecordKindAlterRoleRename record.
-func EncodeAlterRoleRename(name, newName string) []byte {
-	if len(name) > 0xFFFF {
-		name = name[:0xFFFF]
-	}
-	if len(newName) > 0xFFFF {
-		newName = newName[:0xFFFF]
-	}
-	var buf bytes.Buffer
-	buf.WriteByte(RecordKindAlterRoleRename)
-	var l [2]byte
-	binary.LittleEndian.PutUint16(l[:], uint16(len(name)))
-	buf.Write(l[:])
-	buf.WriteString(name)
-	binary.LittleEndian.PutUint16(l[:], uint16(len(newName)))
-	buf.Write(l[:])
-	buf.WriteString(newName)
-	return buf.Bytes()
-}
-
-// DecodeAlterRoleRename decodes a RecordKindAlterRoleRename payload.
-func DecodeAlterRoleRename(payload []byte) (name, newName string, err error) {
-	if len(payload) < 3 {
-		return "", "", fmt.Errorf("wal: alter-role-rename payload too short (%d bytes)", len(payload))
-	}
-	if payload[0] != RecordKindAlterRoleRename {
-		return "", "", fmt.Errorf("wal: record kind %d is not alter-role-rename", payload[0])
-	}
-	off := 1
-	readStr16 := func() (string, error) {
-		if len(payload) < off+2 {
-			return "", fmt.Errorf("wal: alter-role-rename payload truncated at offset %d", off)
-		}
-		l := int(binary.LittleEndian.Uint16(payload[off : off+2]))
-		off += 2
-		if len(payload) < off+l {
-			return "", fmt.Errorf("wal: alter-role-rename string truncated (need %d bytes at %d)", l, off)
-		}
-		s := string(payload[off : off+l])
-		off += l
-		return s, nil
-	}
-	if name, err = readStr16(); err != nil {
-		return "", "", err
-	}
-	if newName, err = readStr16(); err != nil {
-		return "", "", err
-	}
-	return name, newName, nil
-}
 // Tri-state bit layout for EncodeGrantRoleMembership/DecodeGrantRoleMembership's
 // options byte: each of admin/inherit/set gets a "specified" bit (the WITH
 // clause named it — nil vs non-nil *bool) and a "value" bit (meaningful only
@@ -917,1003 +513,6 @@ const (
 	roleGrantOptSetSpecified     = 1 << 4
 	roleGrantOptSetValue         = 1 << 5
 )
-
-// EncodeGrantRoleMembership encodes a `GRANT <role> TO <member> [WITH {
-// ADMIN | INHERIT | SET } { OPTION | TRUE | FALSE } [, ...]]` event.
-// admin/inherit/set are tri-state (nil = not specified in the WITH clause).
-// Format: kind(1) | roleOid(4) | memberOid(4) | grantorOid(4) | options(1).
-func EncodeGrantRoleMembership(roleOid, memberOid, grantorOid uint32, admin, inherit, set *bool) []byte {
-	out := make([]byte, 14)
-	out[0] = RecordKindGrantRoleMembership
-	binary.LittleEndian.PutUint32(out[1:5], roleOid)
-	binary.LittleEndian.PutUint32(out[5:9], memberOid)
-	binary.LittleEndian.PutUint32(out[9:13], grantorOid)
-	var opts byte
-	if admin != nil {
-		opts |= roleGrantOptAdminSpecified
-		if *admin {
-			opts |= roleGrantOptAdminValue
-		}
-	}
-	if inherit != nil {
-		opts |= roleGrantOptInheritSpecified
-		if *inherit {
-			opts |= roleGrantOptInheritValue
-		}
-	}
-	if set != nil {
-		opts |= roleGrantOptSetSpecified
-		if *set {
-			opts |= roleGrantOptSetValue
-		}
-	}
-	out[13] = opts
-	return out
-}
-
-// DecodeGrantRoleMembership decodes a RecordKindGrantRoleMembership payload.
-func DecodeGrantRoleMembership(payload []byte) (roleOid, memberOid, grantorOid uint32, admin, inherit, set *bool, err error) {
-	if len(payload) < 14 {
-		return 0, 0, 0, nil, nil, nil, fmt.Errorf("wal: grant-role-membership payload too short (%d bytes)", len(payload))
-	}
-	if payload[0] != RecordKindGrantRoleMembership {
-		return 0, 0, 0, nil, nil, nil, fmt.Errorf("wal: record kind %d is not grant-role-membership", payload[0])
-	}
-	roleOid = binary.LittleEndian.Uint32(payload[1:5])
-	memberOid = binary.LittleEndian.Uint32(payload[5:9])
-	grantorOid = binary.LittleEndian.Uint32(payload[9:13])
-	opts := payload[13]
-	if opts&roleGrantOptAdminSpecified != 0 {
-		v := opts&roleGrantOptAdminValue != 0
-		admin = &v
-	}
-	if opts&roleGrantOptInheritSpecified != 0 {
-		v := opts&roleGrantOptInheritValue != 0
-		inherit = &v
-	}
-	if opts&roleGrantOptSetSpecified != 0 {
-		v := opts&roleGrantOptSetValue != 0
-		set = &v
-	}
-	return roleOid, memberOid, grantorOid, admin, inherit, set, nil
-}
-
-// revokeRoleMembershipOptionByte maps a RoleMembershipChange.RevokeOption
-// string ("" | "admin" | "inherit" | "set") to/from the single wire byte
-// EncodeRevokeRoleMembership persists. M0119-0004-ACLHEAP.
-var revokeRoleMembershipOptionByte = map[string]byte{"": 0, "admin": 1, "inherit": 2, "set": 3}
-var revokeRoleMembershipOptionName = []string{"", "admin", "inherit", "set"}
-
-// EncodeRevokeRoleMembership encodes a `REVOKE [{ADMIN|INHERIT|SET} OPTION
-// FOR] <role> FROM <member> [GRANTED BY <grantor>]` event. grantorOid
-// identifies the single (role, member, grantor) row this revoke targets —
-// real PG's (roleid, member, grantor) unique index allows independent rows
-// from different grantors on the same (role, member) pair, so the grantor
-// must be persisted to replay the correct row on recovery. revokeOption is
-// "" for a plain REVOKE or one of "admin"/"inherit"/"set" for the OPTION FOR
-// prefix (see catalog.InMemory.RevokeRoleMembership).
-// Format: kind(1) | roleOid(4) | memberOid(4) | grantorOid(4) | revokeOption(1).
-func EncodeRevokeRoleMembership(roleOid, memberOid, grantorOid uint32, revokeOption string) []byte {
-	out := make([]byte, 14)
-	out[0] = RecordKindRevokeRoleMembership
-	binary.LittleEndian.PutUint32(out[1:5], roleOid)
-	binary.LittleEndian.PutUint32(out[5:9], memberOid)
-	binary.LittleEndian.PutUint32(out[9:13], grantorOid)
-	out[13] = revokeRoleMembershipOptionByte[revokeOption]
-	return out
-}
-
-// DecodeRevokeRoleMembership decodes a RecordKindRevokeRoleMembership payload.
-func DecodeRevokeRoleMembership(payload []byte) (roleOid, memberOid, grantorOid uint32, revokeOption string, err error) {
-	if len(payload) < 14 {
-		return 0, 0, 0, "", fmt.Errorf("wal: revoke-role-membership payload too short (%d bytes)", len(payload))
-	}
-	if payload[0] != RecordKindRevokeRoleMembership {
-		return 0, 0, 0, "", fmt.Errorf("wal: record kind %d is not revoke-role-membership", payload[0])
-	}
-	roleOid = binary.LittleEndian.Uint32(payload[1:5])
-	memberOid = binary.LittleEndian.Uint32(payload[5:9])
-	grantorOid = binary.LittleEndian.Uint32(payload[9:13])
-	optByte := payload[13]
-	if int(optByte) >= len(revokeRoleMembershipOptionName) {
-		return 0, 0, 0, "", fmt.Errorf("wal: revoke-role-membership unknown option byte %d", optByte)
-	}
-	revokeOption = revokeRoleMembershipOptionName[optByte]
-	return roleOid, memberOid, grantorOid, revokeOption, nil
-}
-
-// ColumnDefaultEntry is one (column, DEFAULT expression SQL) pair inside a
-// RecordKindColumnDefaults record.
-type ColumnDefaultEntry struct {
-	Name string
-	Expr string // DEFAULT expression as SQL text (parser.ParseExpr round-trips it)
-}
-
-// ColumnDefaultsPayload is the decoded form of a RecordKindColumnDefaults
-// record: every defaulted column of one table. See the constant for the emit
-// policy (per-table snapshot from syncTableToCatalogHeap, last-record-wins).
-type ColumnDefaultsPayload struct {
-	TableOID uint32
-	Defaults []ColumnDefaultEntry
-}
-
-// EncodeColumnDefaults encodes a RecordKindColumnDefaults record.
-func EncodeColumnDefaults(p ColumnDefaultsPayload) []byte {
-	var buf bytes.Buffer
-	buf.WriteByte(RecordKindColumnDefaults)
-	var b4 [4]byte
-	binary.LittleEndian.PutUint32(b4[:], p.TableOID)
-	buf.Write(b4[:])
-	var b2 [2]byte
-	binary.LittleEndian.PutUint16(b2[:], uint16(len(p.Defaults)))
-	buf.Write(b2[:])
-	writeStr16 := func(s string) {
-		if len(s) > 0xFFFF {
-			s = s[:0xFFFF]
-		}
-		binary.LittleEndian.PutUint16(b2[:], uint16(len(s)))
-		buf.Write(b2[:])
-		buf.WriteString(s)
-	}
-	for _, d := range p.Defaults {
-		writeStr16(d.Name)
-		writeStr16(d.Expr)
-	}
-	return buf.Bytes()
-}
-
-// DecodeColumnDefaults decodes a RecordKindColumnDefaults payload.
-func DecodeColumnDefaults(payload []byte) (ColumnDefaultsPayload, error) {
-	var p ColumnDefaultsPayload
-	if len(payload) < 7 {
-		return p, fmt.Errorf("wal: column-defaults payload too short (%d bytes)", len(payload))
-	}
-	if payload[0] != RecordKindColumnDefaults {
-		return p, fmt.Errorf("wal: record kind %d is not column-defaults", payload[0])
-	}
-	p.TableOID = binary.LittleEndian.Uint32(payload[1:5])
-	count := int(binary.LittleEndian.Uint16(payload[5:7]))
-	off := 7
-	readStr16 := func() (string, error) {
-		if len(payload) < off+2 {
-			return "", fmt.Errorf("wal: column-defaults payload truncated at offset %d", off)
-		}
-		l := int(binary.LittleEndian.Uint16(payload[off : off+2]))
-		off += 2
-		if len(payload) < off+l {
-			return "", fmt.Errorf("wal: column-defaults string truncated (need %d bytes at %d)", l, off)
-		}
-		s := string(payload[off : off+l])
-		off += l
-		return s, nil
-	}
-	for i := 0; i < count; i++ {
-		var d ColumnDefaultEntry
-		var err error
-		if d.Name, err = readStr16(); err != nil {
-			return p, err
-		}
-		if d.Expr, err = readStr16(); err != nil {
-			return p, err
-		}
-		p.Defaults = append(p.Defaults, d)
-	}
-	return p, nil
-}
-
-// MatViewPayload is the decoded form of a RecordKindCreateMatView record: one
-// materialized view's defining query and populated state.
-type MatViewPayload struct {
-	TableOID    uint32
-	IsPopulated bool
-	Query       string // SELECT body as SQL text (parser.Parse round-trips it)
-}
-
-// EncodeMatView encodes a RecordKindCreateMatView record.
-func EncodeMatView(p MatViewPayload) []byte {
-	var buf bytes.Buffer
-	buf.WriteByte(RecordKindCreateMatView)
-	var b4 [4]byte
-	binary.LittleEndian.PutUint32(b4[:], p.TableOID)
-	buf.Write(b4[:])
-	if p.IsPopulated {
-		buf.WriteByte(1)
-	} else {
-		buf.WriteByte(0)
-	}
-	q := p.Query
-	if len(q) > 0xFFFF {
-		q = q[:0xFFFF]
-	}
-	var b2 [2]byte
-	binary.LittleEndian.PutUint16(b2[:], uint16(len(q)))
-	buf.Write(b2[:])
-	buf.WriteString(q)
-	return buf.Bytes()
-}
-
-// DecodeMatView decodes a RecordKindCreateMatView payload.
-func DecodeMatView(payload []byte) (MatViewPayload, error) {
-	var p MatViewPayload
-	if len(payload) < 8 {
-		return p, fmt.Errorf("wal: matview payload too short (%d bytes)", len(payload))
-	}
-	if payload[0] != RecordKindCreateMatView {
-		return p, fmt.Errorf("wal: record kind %d is not create-matview", payload[0])
-	}
-	p.TableOID = binary.LittleEndian.Uint32(payload[1:5])
-	p.IsPopulated = payload[5] != 0
-	qLen := int(binary.LittleEndian.Uint16(payload[6:8]))
-	if len(payload) < 8+qLen {
-		return p, fmt.Errorf("wal: matview payload truncated (need %d bytes at 8)", qLen)
-	}
-	p.Query = string(payload[8 : 8+qLen])
-	return p, nil
-}
-
-// ViewPayload is the decoded form of a RecordKindCreateView record: one plain
-// view's defining query.
-type ViewPayload struct {
-	TableOID uint32
-	Query    string // SELECT body as SQL text (parser.Parse round-trips it)
-}
-
-// EncodeView encodes a RecordKindCreateView record.
-func EncodeView(p ViewPayload) []byte {
-	var buf bytes.Buffer
-	buf.WriteByte(RecordKindCreateView)
-	var b4 [4]byte
-	binary.LittleEndian.PutUint32(b4[:], p.TableOID)
-	buf.Write(b4[:])
-	q := p.Query
-	if len(q) > 0xFFFF {
-		q = q[:0xFFFF]
-	}
-	var b2 [2]byte
-	binary.LittleEndian.PutUint16(b2[:], uint16(len(q)))
-	buf.Write(b2[:])
-	buf.WriteString(q)
-	return buf.Bytes()
-}
-
-// DecodeView decodes a RecordKindCreateView payload.
-func DecodeView(payload []byte) (ViewPayload, error) {
-	var p ViewPayload
-	if len(payload) < 7 {
-		return p, fmt.Errorf("wal: view payload too short (%d bytes)", len(payload))
-	}
-	if payload[0] != RecordKindCreateView {
-		return p, fmt.Errorf("wal: record kind %d is not create-view", payload[0])
-	}
-	p.TableOID = binary.LittleEndian.Uint32(payload[1:5])
-	qLen := int(binary.LittleEndian.Uint16(payload[5:7]))
-	if len(payload) < 7+qLen {
-		return p, fmt.Errorf("wal: view payload truncated (need %d bytes at 7)", qLen)
-	}
-	p.Query = string(payload[7 : 7+qLen])
-	return p, nil
-}
-// EncodeRenameIndex encodes an `ALTER INDEX name RENAME TO newname` event
-// (DU-002 slice 443). Format: kind(1) | schemaLen(2) | schema(schemaLen
-// bytes) | oldNameLen(2) | oldName(oldNameLen bytes) | newNameLen(2) |
-// newName(newNameLen bytes).
-func EncodeRenameIndex(schema, oldName, newName string) []byte {
-	if len(schema) > 0xFFFF {
-		schema = schema[:0xFFFF]
-	}
-	if len(oldName) > 0xFFFF {
-		oldName = oldName[:0xFFFF]
-	}
-	if len(newName) > 0xFFFF {
-		newName = newName[:0xFFFF]
-	}
-	out := make([]byte, 7+len(schema)+len(oldName)+len(newName))
-	out[0] = RecordKindRenameIndex
-	binary.LittleEndian.PutUint16(out[1:3], uint16(len(schema)))
-	off := 3
-	copy(out[off:], schema)
-	off += len(schema)
-	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(oldName)))
-	off += 2
-	copy(out[off:], oldName)
-	off += len(oldName)
-	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(newName)))
-	off += 2
-	copy(out[off:], newName)
-	return out
-}
-
-// DecodeRenameIndex decodes a RecordKindRenameIndex payload.
-func DecodeRenameIndex(payload []byte) (schema, oldName, newName string, err error) {
-	if len(payload) < 7 {
-		return "", "", "", fmt.Errorf("wal: rename-index payload too short (%d bytes)", len(payload))
-	}
-	if payload[0] != RecordKindRenameIndex {
-		return "", "", "", fmt.Errorf("wal: record kind %d is not rename-index", payload[0])
-	}
-	schemaLen := int(binary.LittleEndian.Uint16(payload[1:3]))
-	off := 3
-	if len(payload) < off+schemaLen+2 {
-		return "", "", "", fmt.Errorf("wal: rename-index payload truncated (need %d bytes)", off+schemaLen+2)
-	}
-	schema = string(payload[off : off+schemaLen])
-	off += schemaLen
-	oldNameLen := int(binary.LittleEndian.Uint16(payload[off : off+2]))
-	off += 2
-	if len(payload) < off+oldNameLen+2 {
-		return "", "", "", fmt.Errorf("wal: rename-index payload truncated (need %d bytes)", off+oldNameLen+2)
-	}
-	oldName = string(payload[off : off+oldNameLen])
-	off += oldNameLen
-	newNameLen := int(binary.LittleEndian.Uint16(payload[off : off+2]))
-	off += 2
-	if len(payload) < off+newNameLen {
-		return "", "", "", fmt.Errorf("wal: rename-index payload truncated (need %d bytes)", off+newNameLen)
-	}
-	newName = string(payload[off : off+newNameLen])
-	return schema, oldName, newName, nil
-}
-
-// EncodeCreateSubscription encodes a CREATE SUBSCRIPTION event (DU-002
-// restart-persistence follow-up to M0119-0004, loop #67 ledger resume
-// point). The OID is carried so recovery re-registers the subscription
-// identically to the live server. Format documented at the
-// RecordKindCreateSubscription constant. dbOid is appended as a trailing
-// 4-byte field (M0122-0007 4d-ii-part-2b item 1) so a pre-existing WAL
-// file with no trailer still decodes — DecodeCreateSubscription treats a
-// short read of just that trailer as dbOid 0 (DefaultDBOid via
-// NamespaceDBOid), matching the pre-item-1 single-database default.
-func EncodeCreateSubscription(name, conninfo, slotName string, publications []string, oid, ownerOID uint32, enabled bool, dbOid uint32) []byte {
-	strs := []string{name, conninfo, slotName}
-	for i, s := range strs {
-		if len(s) > 0xFFFF {
-			strs[i] = s[:0xFFFF]
-		}
-	}
-	name, conninfo, slotName = strs[0], strs[1], strs[2]
-	total := 10 + 2 + len(name) + 2 + len(conninfo) + 2 + len(slotName) + 2
-	for _, p := range publications {
-		if len(p) > 0xFFFF {
-			p = p[:0xFFFF]
-		}
-		total += 2 + len(p)
-	}
-	total += 4
-	out := make([]byte, total)
-	out[0] = RecordKindCreateSubscription
-	binary.LittleEndian.PutUint32(out[1:5], oid)
-	binary.LittleEndian.PutUint32(out[5:9], ownerOID)
-	if enabled {
-		out[9] = 1
-	}
-	off := 10
-	writeStr := func(s string) {
-		binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(s)))
-		off += 2
-		copy(out[off:], s)
-		off += len(s)
-	}
-	writeStr(name)
-	writeStr(conninfo)
-	writeStr(slotName)
-	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(publications)))
-	off += 2
-	for _, p := range publications {
-		if len(p) > 0xFFFF {
-			p = p[:0xFFFF]
-		}
-		writeStr(p)
-	}
-	binary.LittleEndian.PutUint32(out[off:off+4], dbOid)
-	off += 4
-	return out
-}
-
-// DecodeCreateSubscription decodes a RecordKindCreateSubscription payload.
-// dbOid is 0 (DefaultDBOid via NamespaceDBOid) for a pre-item-1 payload
-// that predates the trailing dbOid field.
-func DecodeCreateSubscription(payload []byte) (name, conninfo, slotName string, publications []string, oid, ownerOID uint32, enabled bool, dbOid uint32, err error) {
-	if len(payload) < 10 {
-		return "", "", "", nil, 0, 0, false, 0, fmt.Errorf("wal: create-subscription payload too short (%d bytes)", len(payload))
-	}
-	if payload[0] != RecordKindCreateSubscription {
-		return "", "", "", nil, 0, 0, false, 0, fmt.Errorf("wal: record kind %d is not create-subscription", payload[0])
-	}
-	oid = binary.LittleEndian.Uint32(payload[1:5])
-	ownerOID = binary.LittleEndian.Uint32(payload[5:9])
-	enabled = payload[9] != 0
-	off := 10
-	readStr := func() (string, error) {
-		if len(payload) < off+2 {
-			return "", fmt.Errorf("wal: create-subscription payload truncated (need %d bytes)", off+2)
-		}
-		l := int(binary.LittleEndian.Uint16(payload[off : off+2]))
-		off += 2
-		if len(payload) < off+l {
-			return "", fmt.Errorf("wal: create-subscription payload truncated (need %d bytes)", off+l)
-		}
-		s := string(payload[off : off+l])
-		off += l
-		return s, nil
-	}
-	if name, err = readStr(); err != nil {
-		return "", "", "", nil, 0, 0, false, 0, err
-	}
-	if conninfo, err = readStr(); err != nil {
-		return "", "", "", nil, 0, 0, false, 0, err
-	}
-	if slotName, err = readStr(); err != nil {
-		return "", "", "", nil, 0, 0, false, 0, err
-	}
-	if len(payload) < off+2 {
-		return "", "", "", nil, 0, 0, false, 0, fmt.Errorf("wal: create-subscription payload truncated (need %d bytes)", off+2)
-	}
-	pubCount := int(binary.LittleEndian.Uint16(payload[off : off+2]))
-	off += 2
-	publications = make([]string, 0, pubCount)
-	for i := 0; i < pubCount; i++ {
-		s, serr := readStr()
-		if serr != nil {
-			return "", "", "", nil, 0, 0, false, 0, serr
-		}
-		publications = append(publications, s)
-	}
-	if len(payload) >= off+4 {
-		dbOid = binary.LittleEndian.Uint32(payload[off : off+4])
-		off += 4
-	}
-	return name, conninfo, slotName, publications, oid, ownerOID, enabled, dbOid, nil
-}
-
-// EncodeDropSubscription encodes a DROP SUBSCRIPTION event (DU-002
-// restart-persistence follow-up to M0119-0004, loop #67 ledger resume
-// point). Format documented at the RecordKindDropSubscription constant.
-func EncodeDropSubscription(name string) []byte {
-	if len(name) > 0xFFFF {
-		name = name[:0xFFFF]
-	}
-	out := make([]byte, 3+len(name))
-	out[0] = RecordKindDropSubscription
-	binary.LittleEndian.PutUint16(out[1:3], uint16(len(name)))
-	copy(out[3:], name)
-	return out
-}
-
-// DecodeDropSubscription decodes a RecordKindDropSubscription payload.
-func DecodeDropSubscription(payload []byte) (name string, err error) {
-	if len(payload) < 3 {
-		return "", fmt.Errorf("wal: drop-subscription payload too short (%d bytes)", len(payload))
-	}
-	if payload[0] != RecordKindDropSubscription {
-		return "", fmt.Errorf("wal: record kind %d is not drop-subscription", payload[0])
-	}
-	nameLen := int(binary.LittleEndian.Uint16(payload[1:3]))
-	if len(payload) < 3+nameLen {
-		return "", fmt.Errorf("wal: drop-subscription payload truncated (need %d bytes)", 3+nameLen)
-	}
-	return string(payload[3 : 3+nameLen]), nil
-}
-
-// EncodeAlterSubscriptionOwner encodes an ALTER SUBSCRIPTION ... OWNER TO
-// event (DU-002 restart-persistence follow-up to M0119-0004, loop #67
-// ledger resume point). Format documented at the
-// RecordKindAlterSubscriptionOwner constant.
-func EncodeAlterSubscriptionOwner(name string, ownerOID uint32) []byte {
-	if len(name) > 0xFFFF {
-		name = name[:0xFFFF]
-	}
-	out := make([]byte, 7+len(name))
-	out[0] = RecordKindAlterSubscriptionOwner
-	binary.LittleEndian.PutUint32(out[1:5], ownerOID)
-	binary.LittleEndian.PutUint16(out[5:7], uint16(len(name)))
-	copy(out[7:], name)
-	return out
-}
-
-// DecodeAlterSubscriptionOwner decodes a RecordKindAlterSubscriptionOwner
-// payload.
-func DecodeAlterSubscriptionOwner(payload []byte) (name string, ownerOID uint32, err error) {
-	if len(payload) < 7 {
-		return "", 0, fmt.Errorf("wal: alter-subscription-owner payload too short (%d bytes)", len(payload))
-	}
-	if payload[0] != RecordKindAlterSubscriptionOwner {
-		return "", 0, fmt.Errorf("wal: record kind %d is not alter-subscription-owner", payload[0])
-	}
-	ownerOID = binary.LittleEndian.Uint32(payload[1:5])
-	nameLen := int(binary.LittleEndian.Uint16(payload[5:7]))
-	if len(payload) < 7+nameLen {
-		return "", 0, fmt.Errorf("wal: alter-subscription-owner payload truncated (need %d bytes)", 7+nameLen)
-	}
-	return string(payload[7 : 7+nameLen]), ownerOID, nil
-}
-
-// FunctionArgPayload is one CREATE FUNCTION/PROCEDURE argument, mirroring
-// the parallel ArgNames/ArgTypes/ArgModes/ArgDefaults slices on
-// catalog.Routine. TypeArgs carries a type's numeric modifiers (e.g.
-// numeric(10,2)'s precision/scale) — these do not affect overload
-// resolution (PG's proargtypes is an OID list, not typmods) but do affect
-// pg_dump fidelity, so they are round-tripped like everything else.
-type FunctionArgPayload struct {
-	Name     string
-	TypeName string
-	TypeArgs []int64
-	Mode     string // "i"/"o"/"b"/"v", "" defaults to "i"
-	Default  string
-}
-
-
-// CreateIndexPayload carries the metadata needed to fully
-// reconstruct a btree index in the in-memory catalog during
-// recovery. Order of fields mirrors `catalog.Index`'s exported
-// state. (M0079-0001.)
-type CreateIndexPayload struct {
-	OID      uint32
-	TableOID uint32
-	Schema   string
-	Name     string
-	Method   string
-	Columns  []string
-	Unique   bool
-	Primary  bool
-	// ColDescending / ColNullsFirst carry the per-key-column ASC/DESC +
-	// NULLS FIRST/LAST ordering (mirrors upstream's pg_index.indoption
-	// bitmask) so a restart-triggered replay of this record restores the
-	// exact same catalog.Index.ColDescending/ColNullsFirst state the live
-	// CREATE INDEX produced, instead of silently defaulting every column
-	// to ascending/NULLS LAST. Parallel to Columns; index i describes
-	// Columns[i].
-	ColDescending []bool
-	ColNullsFirst []bool
-	// --- M0122-0006 follow-up: index properties beyond column ordering.
-	// Carried in a self-describing, OPTIONAL trailing "extension" block
-	// (see encodeCreateIndexExtension/decodeCreateIndexExtension) appended
-	// after the ColDescending/ColNullsFirst blocks. Omitted entirely when
-	// every field below is at its zero value, so a plain index's WAL record
-	// stays byte-identical to a pre-this-follow-up record — mirroring
-	// catalog.Index's own "zero means unset, dumps byte-identically"
-	// discipline for these same fields.
-	HasPredicate     bool
-	PredicateString  string
-	IncludeColumns   []string
-	ColOpClasses     []string // parallel to Columns; "" = default opclass
-	ColCollations    []string // parallel to Columns; "" = default collation
-	Fillfactor       int
-	DeduplicateItems *bool
-	NullsNotDistinct bool
-	// Tablespace carries pg_class.reltablespace (0 = database default) so a
-	// CREATE INDEX ... TABLESPACE / ALTER INDEX ... SET TABLESPACE survives an
-	// uncheckpointed crash restart replayed purely from WAL. M0122-0007
-	// tablespace-restart-durability follow-up.
-	Tablespace uint32
-}
-
-// EncodeCreateIndex encodes a CREATE INDEX event (M0079-0001).
-// Format documented at the RecordKindCreateIndex constant.
-//
-// ColDescending/ColNullsFirst (M0122-0006) are appended as two trailing
-// numCols-byte blocks AFTER the column name list, deliberately NOT
-// interleaved with each column's bytes: this keeps the format
-// append-only, so DecodeCreateIndex can still read a pre-M0122-0006 WAL
-// record (which simply lacks the trailing blocks — e.g. an existing
-// on-disk cluster's history) without misparsing column name bytes as
-// order flags.
-//
-// A further optional "extension" block (M0122-0006 follow-up) may follow
-// the order blocks — see hasCreateIndexExtension/encodeCreateIndexExtension.
-func EncodeCreateIndex(p CreateIndexPayload) []byte {
-	const headerSize = 1 + 4 + 4 + 1 + 1 + 2 + 2 + 2 + 2
-	totalLen := headerSize + len(p.Schema) + len(p.Name) + len(p.Method) + 2*len(p.Columns)
-	for _, c := range p.Columns {
-		totalLen += 2 + len(c)
-	}
-	out := make([]byte, totalLen)
-	out[0] = RecordKindCreateIndex
-	binary.LittleEndian.PutUint32(out[1:5], p.OID)
-	binary.LittleEndian.PutUint32(out[5:9], p.TableOID)
-	if p.Unique {
-		out[9] = 1
-	}
-	if p.Primary {
-		out[10] = 1
-	}
-	binary.LittleEndian.PutUint16(out[11:13], uint16(len(p.Schema)))
-	binary.LittleEndian.PutUint16(out[13:15], uint16(len(p.Name)))
-	binary.LittleEndian.PutUint16(out[15:17], uint16(len(p.Method)))
-	binary.LittleEndian.PutUint16(out[17:19], uint16(len(p.Columns)))
-	off := headerSize
-	off += copy(out[off:], p.Schema)
-	off += copy(out[off:], p.Name)
-	off += copy(out[off:], p.Method)
-	for _, c := range p.Columns {
-		binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(c)))
-		off += 2
-		off += copy(out[off:], c)
-	}
-	for i := range p.Columns {
-		if i < len(p.ColDescending) && p.ColDescending[i] {
-			out[off] = 1
-		}
-		off++
-	}
-	for i := range p.Columns {
-		if i < len(p.ColNullsFirst) && p.ColNullsFirst[i] {
-			out[off] = 1
-		}
-		off++
-	}
-	if hasCreateIndexExtension(p) {
-		out = append(out, encodeCreateIndexExtension(p)...)
-	}
-	return out
-}
-
-// Bit layout for encodeCreateIndexExtension's leading flags byte.
-const (
-	ciExtHasPredicate     = 1 << 0
-	ciExtDedupSpecified   = 1 << 1
-	ciExtDedupValue       = 1 << 2
-	ciExtHasOpClasses     = 1 << 3
-	ciExtHasCollations    = 1 << 4
-	ciExtNullsNotDistinct = 1 << 5
-	ciExtHasTablespace    = 1 << 6
-)
-
-// hasCreateIndexExtension reports whether p carries any of the M0122-0006
-// follow-up fields at a non-zero value. When false, EncodeCreateIndex omits
-// the extension block entirely so a plain index's WAL record is unaffected
-// by this follow-up.
-func hasCreateIndexExtension(p CreateIndexPayload) bool {
-	if p.HasPredicate || len(p.IncludeColumns) > 0 || p.Fillfactor != 0 ||
-		p.DeduplicateItems != nil || p.NullsNotDistinct || p.Tablespace != 0 {
-		return true
-	}
-	for _, s := range p.ColOpClasses {
-		if s != "" {
-			return true
-		}
-	}
-	for _, s := range p.ColCollations {
-		if s != "" {
-			return true
-		}
-	}
-	return false
-}
-
-// encodeCreateIndexExtension encodes the M0122-0006 follow-up "index
-// properties" block: a leading flags byte (ciExt* bits), a fillfactor
-// int32, the partial-index predicate string (when present), the INCLUDE
-// column list, and — parallel to p.Columns — per-column opclass/collation
-// overrides (only when at least one column has a non-default value, mirroring
-// the ColOpClasses/ColCollations "empty means all default" catalog contract).
-// Self-terminating: DecodeCreateIndex parses it to end-of-payload and
-// verifies nothing is left over.
-func encodeCreateIndexExtension(p CreateIndexPayload) []byte {
-	var flags byte
-	if p.HasPredicate {
-		flags |= ciExtHasPredicate
-	}
-	if p.DeduplicateItems != nil {
-		flags |= ciExtDedupSpecified
-		if *p.DeduplicateItems {
-			flags |= ciExtDedupValue
-		}
-	}
-	if p.NullsNotDistinct {
-		flags |= ciExtNullsNotDistinct
-	}
-	if p.Tablespace != 0 {
-		flags |= ciExtHasTablespace
-	}
-	numCols := len(p.Columns)
-	hasOpClasses := false
-	for _, s := range p.ColOpClasses {
-		if s != "" {
-			hasOpClasses = true
-			break
-		}
-	}
-	hasCollations := false
-	for _, s := range p.ColCollations {
-		if s != "" {
-			hasCollations = true
-			break
-		}
-	}
-	if hasOpClasses {
-		flags |= ciExtHasOpClasses
-	}
-	if hasCollations {
-		flags |= ciExtHasCollations
-	}
-
-	size := 1 + 4 // flags + fillfactor
-	if p.HasPredicate {
-		size += 2 + len(p.PredicateString)
-	}
-	size += 2 // numInclude
-	for _, c := range p.IncludeColumns {
-		size += 2 + len(c)
-	}
-	if hasOpClasses {
-		for i := 0; i < numCols; i++ {
-			size += 2 + len(stringAt(p.ColOpClasses, i))
-		}
-	}
-	if hasCollations {
-		for i := 0; i < numCols; i++ {
-			size += 2 + len(stringAt(p.ColCollations, i))
-		}
-	}
-	if p.Tablespace != 0 {
-		size += 4
-	}
-
-	out := make([]byte, size)
-	off := 0
-	out[off] = flags
-	off++
-	binary.LittleEndian.PutUint32(out[off:off+4], uint32(int32(p.Fillfactor)))
-	off += 4
-	if p.HasPredicate {
-		binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(p.PredicateString)))
-		off += 2
-		off += copy(out[off:], p.PredicateString)
-	}
-	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(p.IncludeColumns)))
-	off += 2
-	for _, c := range p.IncludeColumns {
-		binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(c)))
-		off += 2
-		off += copy(out[off:], c)
-	}
-	if hasOpClasses {
-		for i := 0; i < numCols; i++ {
-			c := stringAt(p.ColOpClasses, i)
-			binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(c)))
-			off += 2
-			off += copy(out[off:], c)
-		}
-	}
-	if hasCollations {
-		for i := 0; i < numCols; i++ {
-			c := stringAt(p.ColCollations, i)
-			binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(c)))
-			off += 2
-			off += copy(out[off:], c)
-		}
-	}
-	if p.Tablespace != 0 {
-		binary.LittleEndian.PutUint32(out[off:off+4], p.Tablespace)
-		off += 4
-	}
-	return out
-}
-
-func stringAt(s []string, i int) string {
-	if i < len(s) {
-		return s[i]
-	}
-	return ""
-}
-
-// decodeCreateIndexExtension parses the M0122-0006 follow-up block written by
-// encodeCreateIndexExtension, starting at *off, and advances *off past it.
-// Callers must verify *off == len(payload) afterward (nothing left over).
-func decodeCreateIndexExtension(payload []byte, off *int, numCols int, p *CreateIndexPayload) error {
-	if len(payload) < *off+5 {
-		return fmt.Errorf("wal: create-index payload truncated in extension header")
-	}
-	flags := payload[*off]
-	*off++
-	p.Fillfactor = int(int32(binary.LittleEndian.Uint32(payload[*off : *off+4])))
-	*off += 4
-	if flags&ciExtHasPredicate != 0 {
-		if len(payload) < *off+2 {
-			return fmt.Errorf("wal: create-index payload truncated in predicate length")
-		}
-		predLen := int(binary.LittleEndian.Uint16(payload[*off : *off+2]))
-		*off += 2
-		if len(payload) < *off+predLen {
-			return fmt.Errorf("wal: create-index payload truncated in predicate body")
-		}
-		p.HasPredicate = true
-		p.PredicateString = string(payload[*off : *off+predLen])
-		*off += predLen
-	}
-	if len(payload) < *off+2 {
-		return fmt.Errorf("wal: create-index payload truncated in include-columns count")
-	}
-	numInclude := int(binary.LittleEndian.Uint16(payload[*off : *off+2]))
-	*off += 2
-	p.IncludeColumns = make([]string, 0, numInclude)
-	for i := 0; i < numInclude; i++ {
-		if len(payload) < *off+2 {
-			return fmt.Errorf("wal: create-index payload truncated at include column %d header", i)
-		}
-		l := int(binary.LittleEndian.Uint16(payload[*off : *off+2]))
-		*off += 2
-		if len(payload) < *off+l {
-			return fmt.Errorf("wal: create-index payload truncated at include column %d body", i)
-		}
-		p.IncludeColumns = append(p.IncludeColumns, string(payload[*off:*off+l]))
-		*off += l
-	}
-	if flags&ciExtHasOpClasses != 0 {
-		p.ColOpClasses = make([]string, numCols)
-		for i := 0; i < numCols; i++ {
-			if len(payload) < *off+2 {
-				return fmt.Errorf("wal: create-index payload truncated at opclass %d header", i)
-			}
-			l := int(binary.LittleEndian.Uint16(payload[*off : *off+2]))
-			*off += 2
-			if len(payload) < *off+l {
-				return fmt.Errorf("wal: create-index payload truncated at opclass %d body", i)
-			}
-			p.ColOpClasses[i] = string(payload[*off : *off+l])
-			*off += l
-		}
-	}
-	if flags&ciExtHasCollations != 0 {
-		p.ColCollations = make([]string, numCols)
-		for i := 0; i < numCols; i++ {
-			if len(payload) < *off+2 {
-				return fmt.Errorf("wal: create-index payload truncated at collation %d header", i)
-			}
-			l := int(binary.LittleEndian.Uint16(payload[*off : *off+2]))
-			*off += 2
-			if len(payload) < *off+l {
-				return fmt.Errorf("wal: create-index payload truncated at collation %d body", i)
-			}
-			p.ColCollations[i] = string(payload[*off : *off+l])
-			*off += l
-		}
-	}
-	if flags&ciExtDedupSpecified != 0 {
-		v := flags&ciExtDedupValue != 0
-		p.DeduplicateItems = &v
-	}
-	p.NullsNotDistinct = flags&ciExtNullsNotDistinct != 0
-	if flags&ciExtHasTablespace != 0 {
-		if len(payload) < *off+4 {
-			return fmt.Errorf("wal: create-index payload truncated in tablespace")
-		}
-		p.Tablespace = binary.LittleEndian.Uint32(payload[*off : *off+4])
-		*off += 4
-	}
-	return nil
-}
-
-// DecodeCreateIndex decodes a RecordKindCreateIndex payload.
-func DecodeCreateIndex(payload []byte) (CreateIndexPayload, error) {
-	const headerSize = 1 + 4 + 4 + 1 + 1 + 2 + 2 + 2 + 2
-	if len(payload) < headerSize {
-		return CreateIndexPayload{}, fmt.Errorf("wal: create-index payload too short (%d bytes)", len(payload))
-	}
-	if payload[0] != RecordKindCreateIndex {
-		return CreateIndexPayload{}, fmt.Errorf("wal: record kind %d is not create-index", payload[0])
-	}
-	p := CreateIndexPayload{
-		OID:      binary.LittleEndian.Uint32(payload[1:5]),
-		TableOID: binary.LittleEndian.Uint32(payload[5:9]),
-		Unique:   payload[9] != 0,
-		Primary:  payload[10] != 0,
-	}
-	schemaLen := int(binary.LittleEndian.Uint16(payload[11:13]))
-	nameLen := int(binary.LittleEndian.Uint16(payload[13:15]))
-	methodLen := int(binary.LittleEndian.Uint16(payload[15:17]))
-	numCols := int(binary.LittleEndian.Uint16(payload[17:19]))
-	off := headerSize
-	if len(payload) < off+schemaLen+nameLen+methodLen {
-		return CreateIndexPayload{}, fmt.Errorf("wal: create-index payload truncated in fixed strings")
-	}
-	p.Schema = string(payload[off : off+schemaLen])
-	off += schemaLen
-	p.Name = string(payload[off : off+nameLen])
-	off += nameLen
-	p.Method = string(payload[off : off+methodLen])
-	off += methodLen
-	p.Columns = make([]string, 0, numCols)
-	for i := 0; i < numCols; i++ {
-		if len(payload) < off+2 {
-			return CreateIndexPayload{}, fmt.Errorf("wal: create-index payload truncated at column %d header", i)
-		}
-		colLen := int(binary.LittleEndian.Uint16(payload[off : off+2]))
-		off += 2
-		if len(payload) < off+colLen {
-			return CreateIndexPayload{}, fmt.Errorf("wal: create-index payload truncated at column %d body", i)
-		}
-		p.Columns = append(p.Columns, string(payload[off:off+colLen]))
-		off += colLen
-	}
-	// ColDescending/ColNullsFirst (M0122-0006) are two trailing numCols-byte
-	// blocks appended AFTER the column list — append-only so a pre-existing
-	// on-disk WAL record predating this field (which simply ends here, with
-	// no trailing blocks) still decodes: every column defaults to
-	// ascending/NULLS LAST, matching its actual pre-M0122-0006 behavior.
-	p.ColDescending = make([]bool, numCols)
-	p.ColNullsFirst = make([]bool, numCols)
-	switch remaining := len(payload) - off; {
-	case remaining == 0:
-		// Pre-M0122-0006 record: no trailing blocks at all. Valid — every
-		// column defaults to ascending/NULLS LAST, matching its actual
-		// pre-M0122-0006 behavior.
-	case remaining < 2*numCols:
-		return CreateIndexPayload{}, fmt.Errorf("wal: create-index payload truncated in trailing order blocks (have %d trailing bytes, want 0 or at least %d)", remaining, 2*numCols)
-	default:
-		for i := 0; i < numCols; i++ {
-			p.ColDescending[i] = payload[off] != 0
-			off++
-		}
-		for i := 0; i < numCols; i++ {
-			p.ColNullsFirst[i] = payload[off] != 0
-			off++
-		}
-		// M0122-0006 follow-up: an optional "extension" block (predicate/
-		// INCLUDE/opclass/collation/fillfactor/dedup/NULLS NOT DISTINCT) may
-		// follow the order blocks — present iff bytes remain. A record with
-		// remaining == 2*numCols exactly (no extension) is the prior
-		// M0122-0006 format and needs no further parsing here.
-		if off < len(payload) {
-			if err := decodeCreateIndexExtension(payload, &off, numCols, &p); err != nil {
-				return CreateIndexPayload{}, err
-			}
-			if off != len(payload) {
-				return CreateIndexPayload{}, fmt.Errorf("wal: create-index payload has %d unexpected trailing bytes after extension block", len(payload)-off)
-			}
-		}
-	}
-	return p, nil
-}
-
-// DropIndexPayload carries enough metadata to identify which
-// index to remove from the catalog during recovery.
-// (M0079-0001.)
-type DropIndexPayload struct {
-	OID    uint32
-	Schema string
-	Name   string
-}
-
-// EncodeDropIndex encodes a DROP INDEX event (M0079-0001).
-// Format documented at the RecordKindDropIndex constant.
-func EncodeDropIndex(p DropIndexPayload) []byte {
-	const headerSize = 1 + 4 + 2 + 2
-	out := make([]byte, headerSize+len(p.Schema)+len(p.Name))
-	out[0] = RecordKindDropIndex
-	binary.LittleEndian.PutUint32(out[1:5], p.OID)
-	binary.LittleEndian.PutUint16(out[5:7], uint16(len(p.Schema)))
-	binary.LittleEndian.PutUint16(out[7:9], uint16(len(p.Name)))
-	off := headerSize
-	off += copy(out[off:], p.Schema)
-	copy(out[off:], p.Name)
-	return out
-}
-
-// DecodeDropIndex decodes a RecordKindDropIndex payload.
-func DecodeDropIndex(payload []byte) (DropIndexPayload, error) {
-	const headerSize = 1 + 4 + 2 + 2
-	if len(payload) < headerSize {
-		return DropIndexPayload{}, fmt.Errorf("wal: drop-index payload too short (%d bytes)", len(payload))
-	}
-	if payload[0] != RecordKindDropIndex {
-		return DropIndexPayload{}, fmt.Errorf("wal: record kind %d is not drop-index", payload[0])
-	}
-	p := DropIndexPayload{
-		OID: binary.LittleEndian.Uint32(payload[1:5]),
-	}
-	schemaLen := int(binary.LittleEndian.Uint16(payload[5:7]))
-	nameLen := int(binary.LittleEndian.Uint16(payload[7:9]))
-	off := headerSize
-	if len(payload) < off+schemaLen+nameLen {
-		return DropIndexPayload{}, fmt.Errorf("wal: drop-index payload truncated")
-	}
-	p.Schema = string(payload[off : off+schemaLen])
-	off += schemaLen
-	p.Name = string(payload[off : off+nameLen])
-	return p, nil
-}
-
 // EncodeXactAssignment encodes a subxact XID assignment record (M0050-0003).
 // parentXid is the top-level transaction; subXids lists the subxact XIDs
 // that are now children of parentXid. Replay calls Manager.RegisterSubXid
@@ -3530,108 +2129,6 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 		// here. Mirrors PG clog_redo's CLOG_TRUNCATE branch
 		// (postgres/src/backend/access/transam/clog.c:1131).
 		return false, nil
-	case RecordKindCreateDatabase, RecordKindDropDatabase:
-		// CREATE/DROP DATABASE records (M0054-0001) carry only a database
-		// name; goopg v0 has no per-database file namespacing, so the
-		// physical replay path has nothing to do. The recovery driver in
-		// internal/initdb/open.go scans the WAL for these records after
-		// physical replay and re-applies them to the catalog's database
-		// list.
-		return false, nil
-	case RecordKindRoleState, RecordKindDropRole, RecordKindAlterRoleRename:
-		// Role state / removal / rename records (CREATE/ALTER/DROP ROLE
-		// restart persistence) carry only the in-memory role registry state +
-		// credential; runtime role DDL never writes the pg_authid heap
-		// (initdb-only, like all on-disk shared catalogs), so the physical
-		// replay path has nothing to do. The recovery driver in
-		// internal/initdb/role_ddl_recovery.go scans the WAL for these
-		// records after physical replay and re-applies them to the catalog
-		// role registry; cmd/goopg seeds the auth UserStore from it.
-		return false, nil
-	case RecordKindColumnDefaults:
-		// Column DEFAULT snapshots (root-0020 follow-up) carry only the
-		// in-memory catalog's DefaultExpr ASTs as SQL text; no physical
-		// page state. The recovery driver in
-		// internal/initdb/column_defaults_recovery.go re-parses them after
-		// loadUserTablesFromHeap.
-		return false, nil
-	case RecordKindCreateMatView:
-		// Materialized-view query snapshots carry only the in-memory
-		// catalog's View AST as SQL text + IsPopulated; no physical page
-		// state (the matview's own heap data is ordinary pg_class-tracked
-		// storage, already covered by loadUserTablesFromHeap). The recovery
-		// driver in internal/initdb/matview_ddl_recovery.go re-parses the
-		// query after loadUserTablesFromHeap.
-		return false, nil
-	case RecordKindCreateView:
-		// Plain-view query snapshots carry only the in-memory catalog's View
-		// AST as SQL text; a view has no physical page state (Virtual=true,
-		// no heap file at all). The recovery driver in
-		// internal/initdb/view_ddl_recovery.go re-parses the query after
-		// loadUserTablesFromHeap.
-		return false, nil
-	case RecordKindCreateStatistics, RecordKindDropStatistics, RecordKindAlterStatisticsRename, RecordKindAlterStatisticsOwner, RecordKindAlterStatisticsSetSchema:
-		// CREATE/DROP/ALTER STATISTICS records (DU-002 restart-persistence
-		// follow-up) carry only pg_statistic_ext metadata; goopg has no
-		// per-statistics-object file namespace, so the physical replay path
-		// has nothing to do. The recovery driver in
-		// internal/initdb/statistics_ddl_recovery.go scans the WAL for these
-		// records after physical replay and re-applies them to the catalog's
-		// statistics registry. Mirrors the RecordKindCreateCollation case
-		// above; CREATE/DROP STATISTICS (kinds 95/96) were missing this case
-		// entirely until this fix — falling to the switch's default
-		// "unsupported kind" error whenever ApplyRecord ran on a
-		// non-XLog-wrapped native record (the standby streaming-replication
-		// path, internal/wal/stream_replayer.go), even though startup
-		// crash-recovery on the primary never called ApplyRecord for these
-		// (internal/initdb/open.go invokes replayStatisticsDDLRecords
-		// directly) and so never observed the gap.
-		return false, nil
-	case RecordKindCreateSubscription, RecordKindDropSubscription, RecordKindAlterSubscriptionOwner:
-		// CREATE/DROP/ALTER PUBLICATION/SUBSCRIPTION records (DU-002
-		// restart-persistence follow-up, M0119-0004 loop #67 ledger resume
-		// point) carry only catalog.PubSub metadata; goopg has no
-		// per-publication/subscription file namespace, so the physical
-		// replay path has nothing to do. The recovery driver in
-		// internal/initdb/pubsub_ddl_recovery.go scans the WAL for these
-		// records after physical replay and re-applies them to the PubSub
-		// registry.
-		return false, nil
-	case RecordKindGrantRoleMembership, RecordKindRevokeRoleMembership:
-		// GRANT/REVOKE ROLE membership (M0119-0004-ACLHEAP) records carry
-		// only in-memory registry state (roleMembers); goopg has no
-		// per-role-membership file namespace, so the physical replay path
-		// has nothing to do. (B2.2 slice 3 retired the CREATE/DROP
-		// OPERATOR kinds, 83/84, that shared this case.) **Bug fix:**
-		// these kinds previously had NO case in this switch at all —
-		// on a data dir where the last checkpoint predates one of these
-		// records (i.e. no shutdown checkpoint ran between the DDL and the
-		// restart, such as a crash restart), ReplayRecords/ApplyRecord
-		// would hit the `default` branch below and fail the ENTIRE replay
-		// with "unsupported kind N", aborting startup outright — not a
-		// silent data-loss bug, but a crash-recovery availability bug that
-		// a graceful restart (which always takes a shutdown checkpoint,
-		// trimming these pre-checkpoint records out of ReplayRecords'
-		// input before they ever reach ApplyRecord) could never surface.
-		// Discovered while auditing this switch for the CREATE/DROP
-		// OPERATOR CLASS/FAMILY kinds added below — see the deferral
-		// ledger. The recovery drivers in
-		// internal/initdb/operator_ddl_recovery.go and
-		// internal/initdb/role_membership_recovery.go already scan the WAL
-		// unconditionally from LSN 0 (not trimmed to the checkpoint) and
-		// re-apply these records to the catalog, independent of whatever
-		// ApplyRecord does here.
-		return false, nil
-	case RecordKindCreateIndex, RecordKindDropIndex, RecordKindRenameIndex:
-		// CREATE/DROP/RENAME INDEX records (M0079-0001; RENAME added
-		// DU-002 slice 443) carry the catalog metadata that goopg's heap
-		// representation cannot fully store (no pg_index relation). The
-		// on-disk btree pages and the index relfile are restored by
-		// RecordKindBtreeInsert / RecordKindSmgrCreate — a rename touches
-		// neither — so the in-memory catalog state is reconstructed by
-		// `internal/initdb.replayIndexDDLRecords` after physical replay
-		// finishes.
-		return false, nil
 	case RecordKindXactAssignment, RecordKindXactRollbackTo, RecordKindXactSubAbort:
 		// Subxact markers (M0050-0003) — physical page recovery is
 		// a no-op. The mvcc.Manager rebuilds its subxact-to-parent
@@ -3688,11 +2185,6 @@ func nativeApplyRecordKindKnown(kind byte) bool {
 		RecordKindXactCommit,
 		RecordKindXactAbort,
 		RecordKindClogTruncate,
-		RecordKindCreateDatabase,
-		RecordKindDropDatabase,
-		RecordKindCreateIndex,
-		RecordKindDropIndex,
-		RecordKindRenameIndex,
 		RecordKindXactAssignment,
 		RecordKindXactRollbackTo,
 		RecordKindXactSubAbort,
@@ -3713,15 +2205,12 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 	}
 	switch xlog.Header.Rmid {
 	case RmgrGoopgCatalog:
-		// doc 04 §5.4 point 3: catalog/DDL RecordKinds with no PG analog
-		// (§3.2 default) fall through nativeApplyRecordKindKnown's
-		// allow-list gate in ApplyRecord (they carry no physical page
-		// state, e.g. RecordKindCreateTransform) and land here. They are
-		// intentionally a no-op: the recovery driver in
-		// internal/initdb/*_ddl_recovery.go re-scans the raw WAL and
-		// re-applies them to the catalog directly (see
-		// wal.IsGoopgNativeRecord / isGoopgOwnedRmgr, which those scanners
-		// rely on to trust r.Payload[0] for this same rmgr).
+		// A decoded rmid-128 record carries no physical page state, so replay
+		// is a no-op. Phase B5 retired every goopg-private catalog/DDL kind that
+		// used to land here (they now journal as real heap/btree records reloaded
+		// from the catalog heaps by internal/initdb/catalog_heap_reload.go, not a
+		// WAL re-scan), so a fresh B5 cluster never reaches this arm; it survives
+		// only to no-op any legacy rmid-128 record in pre-B5 on-disk WAL.
 		return false, nil
 	case RmgrXLog:
 		switch xlog.Header.Info & XLRRmgrInfoMask {
@@ -3843,6 +2332,34 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 				return false, err
 			}
 			if err := applyTblspcDrop(mgr, oid); err != nil {
+				return false, err
+			}
+			return true, nil
+		default:
+			return false, unsupportedDecodedXLogRecord(r)
+		}
+	case RmgrDbase:
+		switch xlog.Header.Info & XLRRmgrInfoMask {
+		case xlogDbaseCreateWalLog, xlogDbaseCreateFileCopy:
+			// B4.6 Stage 3: recreate base/<db_id> (idempotent). A real PG
+			// standby's dbase_redo does the same; goopg's own dirs persist
+			// across restart, so this is a defensive MkdirAll for the
+			// basebackup-restore edge. The copied relation blocks arrive as
+			// separate full-page-image records (Stage 3b).
+			dbOID, _, err := decodeXLogDbaseCreateWalLog(xlog.MainData)
+			if err != nil {
+				return false, err
+			}
+			if err := applyDbaseCreate(mgr, dbOID); err != nil {
+				return false, err
+			}
+			return true, nil
+		case xlogDbaseDrop:
+			dbOID, err := decodeXLogDbaseDrop(xlog.MainData)
+			if err != nil {
+				return false, err
+			}
+			if err := applyDbaseDrop(mgr, dbOID); err != nil {
 				return false, err
 			}
 			return true, nil
@@ -5505,6 +4022,48 @@ func applyTblspcDrop(mgr *storage.Manager, oid uint32) error {
 	dir := filepath.Join(mgr.DataDir(), "pg_tblspc", strconv.FormatUint(uint64(oid), 10))
 	if err := os.RemoveAll(dir); err != nil {
 		return fmt.Errorf("wal: tblspc-drop replay RemoveAll %q: %w", dir, err)
+	}
+	return nil
+}
+
+// decodeXLogDbaseCreateWalLog parses a PG xl_dbase_create_wal_log_rec main-data
+// body {db_id Oid, tablespace_id Oid}. B4.6 Stage 3.
+func decodeXLogDbaseCreateWalLog(mainData []byte) (dbOID, tsOID uint32, err error) {
+	if len(mainData) < 8 {
+		return 0, 0, fmt.Errorf("wal: xl_dbase_create_wal_log_rec main-data len %d (want >= 8)", len(mainData))
+	}
+	return binary.LittleEndian.Uint32(mainData[0:4]), binary.LittleEndian.Uint32(mainData[4:8]), nil
+}
+
+// decodeXLogDbaseDrop parses a PG xl_dbase_drop_rec main-data body {db_id Oid,
+// ntablespaces int32, tablespace_ids[] Oid}. Only db_id is needed for goopg's
+// single-tablespace replay. B4.6 Stage 3.
+func decodeXLogDbaseDrop(mainData []byte) (dbOID uint32, err error) {
+	if len(mainData) < 8 {
+		return 0, fmt.Errorf("wal: xl_dbase_drop_rec main-data len %d (want >= 8)", len(mainData))
+	}
+	return binary.LittleEndian.Uint32(mainData[0:4]), nil
+}
+
+// applyDbaseCreate recreates the base/<db_id> directory (idempotent). goopg's
+// per-database directories persist on disk across a restart, so this MkdirAll is
+// a defensive no-op in the common case and only materializes the directory when
+// replaying onto a basebackup that lacks it — where the subsequent copied-block
+// full-page-image records (B4.6 Stage 3b) then populate its relation files.
+// B4.6 Stage 3.
+func applyDbaseCreate(mgr *storage.Manager, dbOID uint32) error {
+	dir := filepath.Join(mgr.DataDir(), "base", strconv.FormatUint(uint64(dbOID), 10))
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("wal: dbase-create replay MkdirAll %q: %w", dir, err)
+	}
+	return nil
+}
+
+// applyDbaseDrop removes the base/<db_id> directory (idempotent). B4.6 Stage 3.
+func applyDbaseDrop(mgr *storage.Manager, dbOID uint32) error {
+	dir := filepath.Join(mgr.DataDir(), "base", strconv.FormatUint(uint64(dbOID), 10))
+	if err := os.RemoveAll(dir); err != nil {
+		return fmt.Errorf("wal: dbase-drop replay RemoveAll %q: %w", dir, err)
 	}
 	return nil
 }

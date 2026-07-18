@@ -617,6 +617,43 @@ func EncodeTblspcDropPG(tsOID uint32, xid storage.TransactionID) ([]byte, error)
 	return framePGAssembled(RmgrTblspc, xlogTblspcDrop, uint32(xid), body), nil
 }
 
+// EncodeDbaseCreateWalLogPG builds a PostgreSQL RM_DBASE create record using the
+// WAL_LOG strategy (XLOG_DBASE_CREATE_WAL_LOG) with an
+// `xl_dbase_create_wal_log_rec` main-data body {db_id Oid, tablespace_id Oid},
+// mirroring PG's CreateDatabaseUsingWalLog (commands/dbcommands.c). Its redo
+// creates base/<db_id>/ (+ PG_VERSION); the copied relation blocks follow as
+// separate full-page-image records (EncodePageImagePG) so a standby reconstructs
+// goopg's exact new-database files. B4.6 Stage 3.
+func EncodeDbaseCreateWalLogPG(dbOID, tsOID uint32, xid storage.TransactionID) ([]byte, error) {
+	mainData := make([]byte, 0, 8)
+	mainData = binary.LittleEndian.AppendUint32(mainData, dbOID)
+	mainData = binary.LittleEndian.AppendUint32(mainData, tsOID)
+	body, err := assembleXLogRecord(mainData, nil)
+	if err != nil {
+		return nil, err
+	}
+	return framePGAssembled(RmgrDbase, xlogDbaseCreateWalLog, uint32(xid), body), nil
+}
+
+// EncodeDbaseDropPG builds a PostgreSQL RM_DBASE drop record (XLOG_DBASE_DROP)
+// with an `xl_dbase_drop_rec` main-data body {db_id Oid, ntablespaces int32,
+// tablespace_ids[] Oid}, mirroring PG's dropdb XLogInsert. goopg databases all
+// live in the default tablespace, so tsOIDs is normally [1663]. Its redo removes
+// base/<db_id>/ (per tablespace). B4.6 Stage 3.
+func EncodeDbaseDropPG(dbOID uint32, tsOIDs []uint32, xid storage.TransactionID) ([]byte, error) {
+	mainData := make([]byte, 0, 8+4*len(tsOIDs))
+	mainData = binary.LittleEndian.AppendUint32(mainData, dbOID)
+	mainData = binary.LittleEndian.AppendUint32(mainData, uint32(len(tsOIDs)))
+	for _, ts := range tsOIDs {
+		mainData = binary.LittleEndian.AppendUint32(mainData, ts)
+	}
+	body, err := assembleXLogRecord(mainData, nil)
+	if err != nil {
+		return nil, err
+	}
+	return framePGAssembled(RmgrDbase, xlogDbaseDrop, uint32(xid), body), nil
+}
+
 // clogXactsPerPage is PostgreSQL's CLOG_XACTS_PER_PAGE: 2 status bits per xact →
 // 4 xacts per byte → BLCKSZ*4 per CLOG page. Used to derive xl_clog_truncate's
 // pageno from the oldest surviving xid (matches mvcc.clogXactsPerPage).

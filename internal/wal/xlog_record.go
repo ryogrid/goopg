@@ -54,8 +54,8 @@ const (
 	RmgrXact    Rmgr = 1 // RM_XACT_ID — commit / abort
 	RmgrStorage Rmgr = 2 // RM_SMGR_ID — relation create / truncate
 	RmgrCLOG    Rmgr = 3 // RM_CLOG_ID — clog (pg_xact) truncation
-	// 4 reserved (Database).
-	RmgrTblspc Rmgr = 5 // RM_TBLSPC_ID  — tablespace create / drop (B4.1d)
+	RmgrDbase   Rmgr = 4 // RM_DBASE_ID — CREATE / DROP DATABASE (B4.6 Stage 3)
+	RmgrTblspc  Rmgr = 5 // RM_TBLSPC_ID  — tablespace create / drop (B4.1d)
 	// 6 reserved (MultiXact).
 	RmgrRelMap  Rmgr = 7  // RM_RELMAP_ID — pg_filenode.map updates (B0.4)
 	RmgrStandby Rmgr = 8  // RM_STANDBY_ID — RUNNING_XACTS snapshot markers
@@ -78,7 +78,21 @@ const (
 	// byte in the payload remains the authoritative discriminator.
 	RmgrGoopgCustomBase Rmgr = 128
 	// RmgrGoopgCatalog is goopg's single custom resource manager for
-	// all private catalog/DDL record kinds (§3.2 of the doc above).
+	// private record kinds with no PG analog (§3.2 of the doc above).
+	//
+	// Phase B5 COMPLETE: all four goopg-private catalog/DDL kind groups that
+	// historically classified here are RETIRED — they now journal as real
+	// heap/btree/rmgr records a PG standby replays (index 20/21/94, pg_attrdef
+	// 69, statistics 95-99, view/matview 102/103). No goopg-EMITTED record maps
+	// to this rmgr anymore (every RecordKind that still falls through
+	// recordKindToRmgrInfo's default arm — the legacy native heap/btree/xact
+	// Encode paths, subxact markers, smgr-truncate — has zero live emit sites;
+	// checkpoints and sequences emit under their real PG rmgrs via the
+	// pre-assembled path). The constant is retained as the classifier's
+	// total-function fallback and a recovery no-op for any legacy on-disk
+	// rmid-128 record; it is intentionally NOT deleted (removing it would make
+	// recordKindToRmgrInfo a partial function and drop backward-compatible
+	// reading of pre-B5 WAL).
 	RmgrGoopgCatalog Rmgr = RmgrGoopgCustomBase
 )
 

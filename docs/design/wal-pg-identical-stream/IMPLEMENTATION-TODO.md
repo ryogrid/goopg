@@ -589,7 +589,80 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
     mirroring `syncCopiedTableCatalogHeap`. Reload `reloadDbRoleSettingsFromHeap`; deleted
     database_config_recovery.go + role_config_recovery.go. Gate: `DbRoleSettingSurvivesRestart` + server
     suite + waldump.
-- [ ] **B5** Retire `RmgrGoopgCatalog=128` (now unused) — header-side parity complete.
+  - [x] **B4.3 pg_auth_members (kinds 79/80 retired)** — LANDED. GRANT/REVOKE role membership journals a
+    real pg_auth_members SHARED heap row (global/1261) instead of the two bespoke records. 7 scalar cols;
+    reuses B4.1a + the heap-only pattern (indexes 2694/2695/6302/6303 not materialized → seq-scan faithful).
+    One row per (roleid, member, grantor), re-synced per key on GRANT/REVOKE/cascade (B4.2 pattern). First
+    EXECUTOR-layer B4 slice (rides the session ctx directly — no server-txn dance). New catalog helpers
+    Lookup/All/RegisterRoleMembership…; reload `reloadRoleMembershipsFromHeap` preserves the heap OID;
+    deleted role_membership_recovery.go. Gate: `AuthMembersSurvivesRestart` + executor/server suites.
+    Note: no standby benefit until the role-STATE kinds (67/68/72, pg_authid) also convert — this is a
+    bounded, non-boot-critical precursor to the pg_authid slice.
+  - [x] **B4.4 pg_subscription (kinds 53-55 retired) — CLOSES the pub/sub group** — LANDED.
+    CREATE/DROP/ALTER SUBSCRIPTION OWNER journal a real pg_subscription SHARED heap row (global/6100);
+    with B3.3's pg_publication the whole pub/sub group is heap-journaled and pubsub_ddl_recovery.go is
+    deleted. Full 18-col PG18 row: goopg's PubSub registry tracks 8, the other 10 get PG defaults. Reuses
+    B4.1a + heap-only (6114/6115 not materialized) + B3.2 text[]. Executor-layer emit; DROP captures the
+    OID before the registry drop. Reload `reloadSubscriptionsFromHeap`. Gate: `SubscriptionSurvivesRestart`
+    + executor/server suites. Lowest-risk remaining B4 (non-boot-critical; only cost is column width).
+  - [x] **B4.5 pg_authid + role-state (kinds 67/68/72 retired) — BOOT-CRITICAL AUTH** — LANDED.
+    CREATE/ALTER/DROP/RENAME ROLE journal a real pg_authid SHARED heap row (global/1260) via
+    XLOG_HEAP_INSERT/DELETE + 2676/2677 index maintenance, retiring the whole-file byte-writer
+    `SyncPgAuthidFile` + its `RecordKindRoleState(67)/DropRole(68)/AlterRoleRename(72)` crash-tail and the
+    raw-file reader `ReadPgAuthidRows`/`LoadRolesFromAuthidHeap`. New writer `SyncAuthidRow`/`DeleteAuthidRow`
+    (sys_pg_authid.go) follows B4.1's shared-catalog-with-maintained-indexes shape (2697/2698 → 2676/2677);
+    RENAME rides the per-oid re-sync (stamp old row + write under new rolname). Server-layer CREATE/ALTER/
+    RENAME drive it from an own transaction (`runAuthidHeapTxn`, B4.2 precedent); executor-layer DROP rides
+    the session ctx (captures oid before UnregisterRole). Reload `reloadRolesFromAuthidHeap` via
+    `scanCatalogHeapRows` (buffer-pool + CLOG visibility — immune to the file-flush-timing crash risk a raw
+    read would have) replaces both retired readers + the WAL-tail scanner (role_ddl_recovery.go deleted).
+    The bootstrap superuser (OID 10) + 16 predefined pg_* roles stay in the initdb base page (never
+    re-synced). Guard: the pre-existing over-the-wire `TestPort_CreateRoleSurvivesRestart` (CREATE+SCRAM
+    auth reconnect, NOLOGIN attrs, DROP, ALTER PASSWORD rotation with old-password-must-fail, RENAME — all
+    across restart). Gate: guard + all `*SurvivesRestart` + wal/initdb/executor/server suites + units + smoke.
+    Net-negative (retires a ~150-line whole-file writer + a WAL-tail scanner). No genuine fidelity fork
+    (faithful per-row heap is the only standby-replayable approach); risk was pure execution, guarded by the
+    login e2e written/verified first.
+    - Remaining B4 (boot-critical/large): **pg_database** (18/19, needs an RM_DBASE-style physical record +
+      template file-copy streaming to a standby — like B4.1's RM_TBLSPC but bigger). After it, B4 is complete
+      and B5 (retire RmgrGoopgCatalog=128) unblocks.
+- [ ] **B5** Retire `RmgrGoopgCatalog=128` — header-side parity complete. The full rmid-128 set is 11 kinds
+  in 4 groups (index 20/21/94, pg_attrdef 69, statistics 95-99, view/matview 102/103); retire each group then
+  delete the rmgr. Slice order A(index)→B(pg_attrdef)→Bstat(statistics)→C(view/matview)→delete-rmgr.
+  - [x] **Slice A** (index 20/21/94) — LANDED. CREATE/DROP/RENAME INDEX journal only real pg_class + pg_index
+    heap writes + btree pages (M0113's pg_index heap made 20/21 redundant; RENAME(94) fixed via
+    `resyncIndexClassHeapRow`). Standby-validated (TestE2E_FailoverGoopgToPG index DDL, no rmid-128 FATAL).
+  - [x] **Slice B** (pg_attrdef 69) — LANDED. Column DEFAULTs journal as real pg_attrdef HEAP rows
+    (base/<dbOid>/2604, one XLOG_HEAP_INSERT per defaulted column, adbin as SQL text) via `writeAttrdefRow` in
+    `syncTableToCatalogHeap`; reloaded by a STANDALONE UNCONDITIONAL `loadColumnDefaultsFromHeap` pass (not the
+    cache-bypassed loadUserTablesFromHeap, and keyed on NamespaceDBOid not cat.DBOID()). Retired kind 69 +
+    deleted column_defaults_recovery.go. Standby-validated + TestPort_SerialSequenceSurvivesRestart (was RED).
+  - [x] **Bstat** (statistics 95-99, pg_statistic_ext) — LANDED. CREATE/DROP/ALTER STATISTICS journal real
+    pg_statistic_ext HEAP rows (base/<dbOid>/3381, PG physical column order): stxkeys int2vector attnums,
+    stxstattarget int2, stxkind char[], stxexprs as a text[] literal of the deparsed exprs (node-tree track
+    separable). Reload `loadStatisticsExtFromHeap` decodes them (stxkeys→column names via the owning table,
+    stxkind→kind strings). Fixed a latent nondeterminism in `SchemaNameForOID` (pg_toast shares public's OID
+    2200 → random reverse pick) surfaced by the round-trip test. Standby-validated (E2E CREATE STATISTICS +
+    base/1→base/5 mirror). Retired kinds 95-99 + deleted statistics_ddl{,_recovery}.go.
+  - [x] **Slice C** (view/matview 102/103 → pg_rewrite) — LANDED (narrow removal). CREATE VIEW / MATERIALIZED
+    VIEW journal a real pg_rewrite _RETURN rule HEAP row (base/<dbOid>/2618, ev_action = the query as SQL text,
+    relhasrules stays false) via `writeViewRewriteRow` in syncTableToCatalogHeap; reload `loadViewsFromHeap`
+    re-parses ev_action (ev_class >= FirstUserOID skips the 6 bootstrap replication-view rules). Retired kinds
+    102/103 + deleted view/matview_ddl_recovery.go. Standby-validated (E2E CREATE VIEW + pg_rewrite assertion).
+    DEFERRED (ledger): (a) full canonical node-tree ev_action + relhasrules=true so a standby can QUERY the view
+    (needs the absent node-tree serializer); (b) matview IsPopulated across restart (reload defaults populated);
+    (c) ALTER VIEW/TABLE RENAME across restart (pre-existing — AlterTableRenameTable never re-syncs pg_class).
+  - [x] **delete-rmgr** (cleanup) — DONE as documentation, not deletion. Investigation confirmed every Encode
+    function whose RecordKind falls through recordKindToRmgrInfo's default arm (legacy native heap/btree/xact
+    paths, subxact markers, smgr-truncate) has ZERO live emit sites, and checkpoints/sequences emit under their
+    real PG rmgrs — so **no goopg-emitted record maps to rmid-128 anymore**. RmgrGoopgCatalog is retained (not
+    deleted) as the classifier's total-function fallback + a recovery no-op for legacy pre-B5 WAL; removing it
+    would make recordKindToRmgrInfo partial and drop backward-compatible WAL reading. Documented in
+    xlog_record.go / rmgr_map.go / recovery.go dispatch.
+
+**B5 COMPLETE** — all four rmid-128 catalog groups retired; a real PG18 standby replays goopg's catalog-DDL WAL
+(guarded by TestE2E_FailoverGoopgToPG across CREATE INDEX / DEFAULT / STATISTICS / VIEW). The only remaining
+rmid-128 usages are the vestigial classifier fallback + legacy-WAL no-op (no live emitter).
 - [ ] **B-gate**: per-catalog full regress + `internal/testport` isolation; `psql \d`/`\df`/`\dn` +
   `information_schema` parity vs PG 18.3; crash-after-DDL recovery via generic reload; re-init data dir.
 

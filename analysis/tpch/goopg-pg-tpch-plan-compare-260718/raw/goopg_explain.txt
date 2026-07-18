@@ -1,0 +1,272 @@
+Q1: EXPLAIN plan:
+  Sort  (cost=0.00..0.00 rows=1 width=0)
+    Sort Key: l_returnflag, l_linestatus
+    ->  GroupAggregate (2 keys)  (cost=0.00..0.00 rows=1 width=0)
+      ->  Seq Scan on lineitem  (cost=0.00..0.00 rows=1 width=0)
+            Filter: (l_shipdate <= (<*planner.TypedStringLit> - <*planner.IntervalLit>))
+Q1: OK elapsed=0.00s
+Q2: EXPLAIN plan:
+  Sort  (cost=0.00..0.00 rows=1 width=0)
+    Sort Key: s_acctbal DESC, n_name, s_name, p_partkey
+    ->  Hash Join (INNER)  (cost=0.00..0.00 rows=1 width=0)
+          Filter: (ps_supplycost = <*planner.SubqueryExpr>)
+      ->  Nested Loop (INNER)  (cost=0.00..0.00 rows=1 width=0)
+        ->  Nested Loop (INNER)  (cost=0.00..0.00 rows=1 width=0)
+          ->  Nested Loop (INNER)  (cost=0.00..0.00 rows=1 width=0)
+            ->  Seq Scan on region  (cost=0.00..0.00 rows=1 width=0)
+                  Filter: (r_name = 'EUROPE')
+            ->  Index Scan using nation_regionkey_fkidx on nation  (cost=0.00..0.00 rows=1 width=0)
+                  Index Cond: (n_regionkey = r_regionkey)
+          ->  Index Scan using supplier_nation_fkidx on supplier  (cost=0.00..0.00 rows=1 width=0)
+                Index Cond: (s_nationkey = n_nationkey)
+        ->  Index Scan using partsupp_supplier_fkidx on partsupp  (cost=0.00..0.00 rows=1 width=0)
+              Index Cond: (ps_suppkey = s_suppkey)
+      ->  Seq Scan on part  (cost=0.00..0.00 rows=1 width=0)
+            Filter: ((p_size = 15) AND (p_type LIKE '%BRASS'))
+Q2: OK elapsed=0.00s
+Q3: EXPLAIN plan:
+  Sort  (cost=0.00..0.00 rows=1 width=0)
+    Sort Key: sum DESC, o_orderdate
+    ->  GroupAggregate (3 keys)  (cost=0.00..0.00 rows=1 width=0)
+      ->  Multi-Way Hash Join (3 tables)  (cost=0.00..0.00 rows=1 width=0)
+            Filter: (((c_mktsegment = 'BUILDING') AND (o_orderdate < <*planner.TypedStringLit>)) AND (l_shipdate > <*planner.TypedStringLit>))
+        ->  Seq Scan on orders  (cost=0.00..0.00 rows=1 width=0)
+        ->  Seq Scan on customer  (cost=0.00..0.00 rows=1 width=0)
+        ->  Seq Scan on lineitem  (cost=0.00..0.00 rows=1 width=0)
+Q3: OK elapsed=0.00s
+Q4: EXPLAIN plan:
+  Sort  (cost=0.00..0.00 rows=1 width=0)
+    Sort Key: o_orderpriority
+    ->  GroupAggregate (1 keys)  (cost=0.00..0.00 rows=1 width=0)
+      ->  Seq Scan on orders  (cost=0.00..0.00 rows=1 width=0)
+            Filter: (((o_orderdate >= <*planner.TypedStringLit>) AND (o_orderdate < (<*planner.TypedStringLit> + <*planner.IntervalLit>))) AND <*planner.ExistsExpr>)
+Q4: OK elapsed=0.00s
+Q5: EXPLAIN plan:
+  Sort  (cost=0.00..0.00 rows=1 width=0)
+    Sort Key: sum DESC
+    ->  GroupAggregate (1 keys)  (cost=0.00..0.00 rows=1 width=0)
+      ->  Nested Loop (INNER)  (cost=0.00..0.00 rows=1 width=0)
+        ->  Hash Join (INNER)  (cost=0.00..0.00 rows=1 width=0)
+          ->  Hash Join (INNER)  (cost=0.00..0.00 rows=1 width=0)
+            ->  Nested Loop (INNER)  (cost=0.00..0.00 rows=1 width=0)
+              ->  Nested Loop (INNER)  (cost=0.00..0.00 rows=1 width=0)
+                ->  Seq Scan on region  (cost=0.00..0.00 rows=1 width=0)
+                      Filter: (r_name = 'ASIA')
+                ->  Index Scan using nation_regionkey_fkidx on nation  (cost=0.00..0.00 rows=1 width=0)
+                      Index Cond: (n_regionkey = r_regionkey)
+              ->  Index Scan using supplier_nation_fkidx on supplier  (cost=0.00..0.00 rows=1 width=0)
+                    Index Cond: (s_nationkey = n_nationkey)
+            ->  Seq Scan on lineitem  (cost=0.00..0.00 rows=1 width=0)
+          ->  Seq Scan on orders  (cost=0.00..0.00 rows=1 width=0)
+                Filter: ((o_orderdate >= <*planner.TypedStringLit>) AND (o_orderdate < (<*planner.TypedStringLit> + <*planner.IntervalLit>)))
+        ->  Index Scan using customer_pk on customer  (cost=0.00..0.00 rows=1 width=0)
+              Index Cond: (c_custkey = o_custkey)
+Q5: OK elapsed=0.00s
+Q6: EXPLAIN plan:
+  Aggregate  (cost=0.00..0.00 rows=1 width=0)
+    ->  Seq Scan on lineitem  (cost=0.00..0.00 rows=1 width=0)
+          Filter: (((((l_shipdate >= <*planner.TypedStringLit>) AND (l_shipdate < (<*planner.TypedStringLit> + <*planner.IntervalLit>))) AND (l_discount >= 0.04)) AND (l_discount <= 0.060000000000000005)) AND (l_quantity < 24))
+Q6: OK elapsed=0.00s
+Q7: EXPLAIN plan:
+  Sort  (cost=0.00..0.00 rows=1 width=0)
+    Sort Key: supp_nation, cust_nation, l_year
+    ->  GroupAggregate (3 keys)  (cost=0.00..0.00 rows=1 width=0)
+      ->  Nested Loop (INNER)  (cost=0.00..0.00 rows=1 width=0)
+        ->  Nested Loop (INNER)  (cost=0.00..0.00 rows=1 width=0)
+          ->  Hash Join (INNER)  (cost=0.00..0.00 rows=1 width=0)
+            ->  Multi-Way Hash Join (3 tables)  (cost=0.00..0.00 rows=1 width=0)
+              ->  Seq Scan on orders  (cost=0.00..0.00 rows=1 width=0)
+              ->  Seq Scan on customer  (cost=0.00..0.00 rows=1 width=0)
+              ->  Seq Scan on nation n2  (cost=0.00..0.00 rows=1 width=0)
+            ->  Seq Scan on lineitem  (cost=0.00..0.00 rows=1 width=0)
+                  Filter: ((l_shipdate >= <*planner.TypedStringLit>) AND (l_shipdate <= <*planner.TypedStringLit>))
+          ->  Index Scan using supplier_pk on supplier  (cost=0.00..0.00 rows=1 width=0)
+                Index Cond: (s_suppkey = l_suppkey)
+        ->  Index Scan using nation_pk on nation  (cost=0.00..0.00 rows=1 width=0)
+              Index Cond: (n_nationkey = s_nationkey)
+Q7: OK elapsed=0.00s
+Q8: EXPLAIN plan:
+  Sort  (cost=0.00..0.00 rows=1 width=0)
+    Sort Key: o_year
+    ->  GroupAggregate (1 keys)  (cost=0.00..0.00 rows=1 width=0)
+      ->  Hash Join (INNER)  (cost=0.00..0.00 rows=1 width=0)
+        ->  Nested Loop (INNER)  (cost=0.00..0.00 rows=1 width=0)
+          ->  Nested Loop (INNER)  (cost=0.00..0.00 rows=1 width=0)
+            ->  Nested Loop (INNER)  (cost=0.00..0.00 rows=1 width=0)
+              ->  Hash Join (INNER)  (cost=0.00..0.00 rows=1 width=0)
+                ->  Nested Loop (INNER)  (cost=0.00..0.00 rows=1 width=0)
+                  ->  Nested Loop (INNER)  (cost=0.00..0.00 rows=1 width=0)
+                    ->  Seq Scan on region  (cost=0.00..0.00 rows=1 width=0)
+                          Filter: (r_name = 'AMERICA')
+                    ->  Index Scan using nation_regionkey_fkidx on nation  (cost=0.00..0.00 rows=1 width=0)
+                          Index Cond: (n_regionkey = r_regionkey)
+                  ->  Index Scan using customer_nation_fkidx on customer  (cost=0.00..0.00 rows=1 width=0)
+                        Index Cond: (c_nationkey = n_nationkey)
+                ->  Seq Scan on orders  (cost=0.00..0.00 rows=1 width=0)
+                      Filter: ((o_orderdate >= <*planner.TypedStringLit>) AND (o_orderdate <= <*planner.TypedStringLit>))
+              ->  Index Scan using idx_lineitem_orderkey_fkidx on lineitem  (cost=0.00..0.00 rows=1 width=0)
+                    Index Cond: (l_orderkey = o_orderkey)
+            ->  Index Scan using supplier_pk on supplier  (cost=0.00..0.00 rows=1 width=0)
+                  Index Cond: (s_suppkey = l_suppkey)
+          ->  Index Scan using nation_pk on nation  (cost=0.00..0.00 rows=1 width=0)
+                Index Cond: (n_nationkey = s_nationkey)
+        ->  Seq Scan on part  (cost=0.00..0.00 rows=1 width=0)
+              Filter: (p_type = 'ECONOMY ANODIZED STEEL')
+Q8: OK elapsed=0.00s
+Q9: EXPLAIN plan:
+  Sort  (cost=0.00..0.00 rows=1 width=0)
+    Sort Key: nation, o_year DESC
+    ->  GroupAggregate (2 keys)  (cost=0.00..0.00 rows=1 width=0)
+      ->  Hash Join (INNER)  (cost=0.00..0.00 rows=1 width=0)
+        ->  Nested Loop (INNER)  (cost=0.00..0.00 rows=1 width=0)
+          ->  Multi-Way Hash Join (4 tables)  (cost=0.00..0.00 rows=1 width=0)
+            ->  Seq Scan on orders  (cost=0.00..0.00 rows=1 width=0)
+            ->  Seq Scan on supplier  (cost=0.00..0.00 rows=1 width=0)
+            ->  Seq Scan on nation  (cost=0.00..0.00 rows=1 width=0)
+            ->  Seq Scan on lineitem  (cost=0.00..0.00 rows=1 width=0)
+          ->  Index Scan using partsupp_pk on partsupp  (cost=0.00..0.00 rows=1 width=0)
+                Index Cond: (ps_partkey = l_partkey AND ps_suppkey = l_suppkey)
+        ->  Seq Scan on part  (cost=0.00..0.00 rows=1 width=0)
+              Filter: (p_name LIKE '%green%')
+Q9: OK elapsed=0.00s
+Q10: EXPLAIN plan:
+  Sort  (cost=0.00..0.00 rows=1 width=0)
+    Sort Key: sum DESC
+    ->  GroupAggregate (7 keys)  (cost=0.00..0.00 rows=1 width=0)
+      ->  Multi-Way Hash Join (4 tables)  (cost=0.00..0.00 rows=1 width=0)
+            Filter: (((o_orderdate >= <*planner.TypedStringLit>) AND (o_orderdate < (<*planner.TypedStringLit> + <*planner.IntervalLit>))) AND (l_returnflag = 'R'))
+        ->  Seq Scan on orders  (cost=0.00..0.00 rows=1 width=0)
+        ->  Seq Scan on customer  (cost=0.00..0.00 rows=1 width=0)
+        ->  Seq Scan on nation  (cost=0.00..0.00 rows=1 width=0)
+        ->  Seq Scan on lineitem  (cost=0.00..0.00 rows=1 width=0)
+Q10: OK elapsed=0.00s
+Q11: EXPLAIN plan:
+  Sort  (cost=0.00..0.00 rows=1 width=0)
+    Sort Key: sum DESC
+    ->  GroupAggregate (1 keys)  (cost=0.00..0.00 rows=1 width=0)
+          Filter: (sum > <*planner.SubqueryExpr>)
+      ->  Multi-Way Hash Join (3 tables)  (cost=0.00..0.00 rows=1 width=0)
+            Filter: (n_name = 'GERMANY')
+        ->  Seq Scan on partsupp  (cost=0.00..0.00 rows=1 width=0)
+        ->  Seq Scan on supplier  (cost=0.00..0.00 rows=1 width=0)
+        ->  Seq Scan on nation  (cost=0.00..0.00 rows=1 width=0)
+Q11: OK elapsed=0.00s
+Q12: EXPLAIN plan:
+  Sort  (cost=0.00..0.00 rows=1 width=0)
+    Sort Key: l_shipmode
+    ->  GroupAggregate (1 keys)  (cost=0.00..0.00 rows=1 width=0)
+      ->  Nested Loop (INNER)  (cost=0.00..0.00 rows=1 width=0)
+            Filter: ((((<*planner.InExpr> AND (l_commitdate < l_receiptdate)) AND (l_shipdate < l_commitdate)) AND (l_receiptdate >= <*planner.TypedStringLit>)) AND (l_receiptdate < (<*planner.TypedStringLit> + <*planner.IntervalLit>)))
+        ->  Seq Scan on orders  (cost=0.00..0.00 rows=1 width=0)
+        ->  Index Scan using idx_lineitem_orderkey_fkidx on lineitem  (cost=0.00..0.00 rows=1 width=0)
+              Index Cond: (l_orderkey = o_orderkey)
+Q12: OK elapsed=0.00s
+Q13: EXPLAIN plan:
+  Sort  (cost=0.00..0.00 rows=1 width=0)
+    Sort Key: count DESC, c_count DESC
+    ->  GroupAggregate (1 keys)  (cost=0.00..0.00 rows=1 width=0)
+      ->  GroupAggregate (1 keys)  (cost=0.00..0.00 rows=1 width=0)
+        ->  Hash Join (LEFT)  (cost=0.00..0.00 rows=1 width=0)
+          ->  Seq Scan on customer  (cost=0.00..0.00 rows=1 width=0)
+          ->  Seq Scan on orders  (cost=0.00..0.00 rows=1 width=0)
+                Filter: (o_comment NOT LIKE '%special%requests%')
+Q13: OK elapsed=0.00s
+Q14: EXPLAIN plan:
+  Aggregate  (cost=0.00..0.00 rows=1 width=0)
+    ->  Nested Loop (INNER)  (cost=0.00..0.00 rows=1 width=0)
+          Filter: ((l_shipdate >= <*planner.TypedStringLit>) AND (l_shipdate < (<*planner.TypedStringLit> + <*planner.IntervalLit>)))
+      ->  Seq Scan on lineitem  (cost=0.00..0.00 rows=1 width=0)
+      ->  Index Scan using part_pk on part  (cost=0.00..0.00 rows=1 width=0)
+            Index Cond: (p_partkey = l_partkey)
+Q14: OK elapsed=0.00s
+Q15-CREATEVIEW: OK elapsed=0.00s rows=0
+Q15a-VIEWBODY: EXPLAIN plan:
+  GroupAggregate (1 keys)  (cost=0.00..0.00 rows=1 width=0)
+    ->  Seq Scan on lineitem  (cost=0.00..0.00 rows=1 width=0)
+          Filter: ((l_shipdate >= to_date('1996-01-01', 'YYYY-MM-DD')) AND (l_shipdate < (to_date('1996-01-01', 'YYYY-MM-DD') + <*planner.IntervalLit>)))
+Q15a-VIEWBODY: OK elapsed=0.00s
+Q15b-MAIN: EXPLAIN plan:
+  Sort  (cost=0.00..0.00 rows=1 width=0)
+    Sort Key: s_suppkey
+    ->  Hash Join (INNER)  (cost=0.00..0.00 rows=1 width=0)
+          Filter: (total_revenue = <*planner.SubqueryExpr>)
+      ->  Seq Scan on supplier  (cost=0.00..0.00 rows=1 width=0)
+      ->  GroupAggregate (1 keys)  (cost=0.00..0.00 rows=1 width=0)
+        ->  Seq Scan on lineitem  (cost=0.00..0.00 rows=1 width=0)
+              Filter: ((l_shipdate >= to_date('1996-01-01', 'YYYY-MM-DD')) AND (l_shipdate < (to_date('1996-01-01', 'YYYY-MM-DD') + <*planner.IntervalLit>)))
+Q15b-MAIN: OK elapsed=0.00s
+Q16: EXPLAIN plan:
+  Sort  (cost=0.00..0.00 rows=1 width=0)
+    Sort Key: count DESC, p_brand, p_type, p_size
+    ->  GroupAggregate (3 keys)  (cost=0.00..0.00 rows=1 width=0)
+      ->  Hash Join (?)  (cost=0.00..0.00 rows=1 width=0)
+            Filter: (((p_brand <> 'Brand#45') AND (p_type NOT LIKE 'MEDIUM POLISHED%')) AND <*planner.InExpr>)
+        ->  Nested Loop (INNER)  (cost=0.00..0.00 rows=1 width=0)
+          ->  Seq Scan on partsupp  (cost=0.00..0.00 rows=1 width=0)
+          ->  Index Scan using part_pk on part  (cost=0.00..0.00 rows=1 width=0)
+                Index Cond: (p_partkey = ps_partkey)
+        ->  Seq Scan on supplier  (cost=0.00..0.00 rows=1 width=0)
+              Filter: (s_comment LIKE '%Customer%Complaints%')
+Q16: OK elapsed=0.00s
+Q17: EXPLAIN plan:
+  Aggregate  (cost=0.00..0.00 rows=1 width=0)
+    ->  Nested Loop (INNER)  (cost=0.00..0.00 rows=1 width=0)
+          Filter: (((p_brand = 'Brand#23') AND (p_container = 'MED BOX')) AND (l_quantity < <*planner.SubqueryExpr>))
+      ->  Seq Scan on lineitem  (cost=0.00..0.00 rows=1 width=0)
+      ->  Index Scan using part_pk on part  (cost=0.00..0.00 rows=1 width=0)
+            Index Cond: (p_partkey = l_partkey)
+Q17: OK elapsed=0.00s
+Q18: EXPLAIN plan:
+  Sort  (cost=0.00..0.00 rows=1 width=0)
+    Sort Key: o_totalprice DESC, o_orderdate
+    ->  GroupAggregate (5 keys)  (cost=0.00..0.00 rows=1 width=0)
+      ->  Hash Join (?)  (cost=0.00..0.00 rows=1 width=0)
+            Filter: (true)
+        ->  Multi-Way Hash Join (3 tables)  (cost=0.00..0.00 rows=1 width=0)
+          ->  Seq Scan on orders  (cost=0.00..0.00 rows=1 width=0)
+          ->  Seq Scan on customer  (cost=0.00..0.00 rows=1 width=0)
+          ->  Seq Scan on lineitem  (cost=0.00..0.00 rows=1 width=0)
+        ->  GroupAggregate (1 keys)  (cost=0.00..0.00 rows=1 width=0)
+              Filter: (sum > 313)
+          ->  Seq Scan on lineitem  (cost=0.00..0.00 rows=1 width=0)
+Q18: OK elapsed=0.00s
+Q19: EXPLAIN plan:
+  Aggregate  (cost=0.00..0.00 rows=1 width=0)
+    ->  Nested Loop (INNER)  (cost=0.00..0.00 rows=1 width=0)
+      ->  Seq Scan on lineitem  (cost=0.00..0.00 rows=1 width=0)
+      ->  Index Scan using part_pk on part  (cost=0.00..0.00 rows=1 width=0)
+            Index Cond: (p_partkey = l_partkey)
+Q19: OK elapsed=0.00s
+Q20: EXPLAIN plan:
+  Sort  (cost=0.00..0.00 rows=1 width=0)
+    Sort Key: s_name
+    ->  Hash Join (?)  (cost=0.00..0.00 rows=1 width=0)
+          Filter: (n_name = 'CANADA')
+      ->  Nested Loop (INNER)  (cost=0.00..0.00 rows=1 width=0)
+        ->  Seq Scan on supplier  (cost=0.00..0.00 rows=1 width=0)
+        ->  Index Scan using nation_pk on nation  (cost=0.00..0.00 rows=1 width=0)
+              Index Cond: (n_nationkey = s_nationkey)
+      ->  Hash Join (?)  (cost=0.00..0.00 rows=1 width=0)
+            Filter: (ps_availqty > <*planner.SubqueryExpr>)
+        ->  Seq Scan on partsupp  (cost=0.00..0.00 rows=1 width=0)
+        ->  Seq Scan on part  (cost=0.00..0.00 rows=1 width=0)
+              Filter: (p_name LIKE 'forest%')
+Q20: OK elapsed=0.00s
+Q21: EXPLAIN plan:
+  Sort  (cost=0.00..0.00 rows=1 width=0)
+    Sort Key: count DESC, s_name
+    ->  GroupAggregate (1 keys)  (cost=0.00..0.00 rows=1 width=0)
+      ->  Multi-Way Hash Join (4 tables)  (cost=0.00..0.00 rows=1 width=0)
+            Filter: (((((o_orderstatus = 'F') AND (l_receiptdate > l_commitdate)) AND <*planner.ExistsExpr>) AND (NOT <*planner.ExistsExpr>)) AND (n_name = 'SAUDI ARABIA'))
+        ->  Seq Scan on orders  (cost=0.00..0.00 rows=1 width=0)
+        ->  Seq Scan on supplier  (cost=0.00..0.00 rows=1 width=0)
+        ->  Seq Scan on nation  (cost=0.00..0.00 rows=1 width=0)
+        ->  Seq Scan on lineitem l1  (cost=0.00..0.00 rows=1 width=0)
+Q21: OK elapsed=0.00s
+Q22: EXPLAIN plan:
+  Sort  (cost=0.00..0.00 rows=1 width=0)
+    Sort Key: cntrycode
+    ->  GroupAggregate (1 keys)  (cost=0.00..0.00 rows=1 width=0)
+      ->  Seq Scan on customer  (cost=0.00..0.00 rows=1 width=0)
+            Filter: ((<*planner.InExpr> AND (c_acctbal > <*planner.SubqueryExpr>)) AND (NOT <*planner.ExistsExpr>))
+Q22: OK elapsed=0.00s

@@ -753,6 +753,65 @@ func (s *Server) walLogRelmapForNewDatabase(oid uint32) {
 	_, _, _ = s.cfg.WAL.Append(payload)
 }
 
+// walLogRelfileFPIs emits a full-page-image WAL record (XLOG_FPI) for every
+// block of base/<dbOid>/<relOid>, so a real PG standby — which does not share
+// goopg's disk — reconstructs the raw-copied relation file from the WAL stream.
+// This is PG's WAL_LOG CREATE DATABASE strategy (log_newpage per copied block),
+// completing B4.6 Stage 3a's RM_DBASE record. Best-effort: goopg's own restart
+// reads the file directly from disk, so a WAL-less/embedded setup loses only
+// stream parity, not the file. B4.6 Stage 3b.
+func (s *Server) walLogRelfileFPIs(dbOid, relOid uint32) {
+	if s.cfg.WAL == nil || s.cfg.Pool == nil {
+		return
+	}
+	mgr := s.cfg.Pool.Manager()
+	rel := storage.RelFileNode{DBOid: dbOid, RelOid: relOid, Fork: storage.MainFork}
+	data, err := os.ReadFile(filepath.Join(mgr.DataDir(), mgr.RelPath(rel)))
+	if err != nil {
+		return
+	}
+	for off := 0; off+storage.BlockSize <= len(data); off += storage.BlockSize {
+		blk := storage.BlockNumber(off / storage.BlockSize)
+		page := storage.Page(data[off : off+storage.BlockSize])
+		rec, encErr := wal.EncodePageImagePG(rel, blk, page)
+		if encErr != nil {
+			return
+		}
+		if _, _, aerr := s.cfg.WAL.Append(rec); aerr != nil {
+			return
+		}
+	}
+}
+
+// walLogNewDatabaseCatalogFPIs emits FPIs for every CATALOG relation file in the
+// new database's directory (base/<dbOid>/<numeric>, relfilenode < FirstUserOID —
+// the template0 catalog image copied by CreatePerDatabaseScaffolding). It MUST
+// run before the template's user-table catalog rows are inserted (those land on
+// base/<dbOid>/1259|1249 via XLOG_HEAP_INSERT), so on a standby the pristine
+// template0 catalog pages are laid down first and the user rows are appended on
+// top — not overwritten. pg_filenode.map / PG_VERSION are skipped (the RELMAP
+// record and the RM_DBASE record respectively cover them). B4.6 Stage 3b.
+func (s *Server) walLogNewDatabaseCatalogFPIs(dbOid uint32) {
+	if s.cfg.WAL == nil || s.cfg.Pool == nil {
+		return
+	}
+	dir := filepath.Join(s.cfg.Pool.Manager().DataDir(), "base", strconv.FormatUint(uint64(dbOid), 10))
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		relOid, perr := strconv.ParseUint(e.Name(), 10, 32)
+		if perr != nil || uint32(relOid) >= catalog.FirstUserOID {
+			continue // non-relfile (pg_filenode.map, PG_VERSION) or a user table
+		}
+		s.walLogRelfileFPIs(dbOid, uint32(relOid))
+	}
+}
+
 // removeDatabasePhysicalDirectory best-effort removes base/<oid>. Two
 // callers: (1) CREATE DATABASE rollback when a later step (currently only
 // the WAL append in the databaseDDLCreate branch above) fails — keeps the
@@ -812,9 +871,20 @@ func (s *Server) copyTemplateTables(srcOid, newOid uint32, tables []*catalog.Tab
 		// but this local copy ensures the clone never shares backing-array
 		// storage with the template's own Table.Columns, even transiently.
 		cols := append([]catalog.Column(nil), srcTbl.Columns...)
-		name := parser.ObjectName{Schema: srcTbl.Schema, Name: srcTbl.Name}
-		newTbl, err := im.CreateTable(name, cols, newOid)
-		if err != nil {
+		// B4.6 Stage 2: PRESERVE the template's relation OID in the copy (real
+		// PG semantics — CREATE DATABASE copies relations keeping their OIDs;
+		// only the database OID is new). The new table shares srcTbl.OID but
+		// lives in newOid's namespace (base/<newOid>/<srcOID>), so the same
+		// relOid now legitimately appears in two databases — the catalog
+		// namespace layer and the (dbOid,relOid)-keyed storage isolate them.
+		newTbl := &catalog.Table{
+			Schema:  srcTbl.Schema,
+			Name:    srcTbl.Name,
+			Columns: cols,
+			OID:     srcTbl.OID,
+			DBOid:   newOid,
+		}
+		if err := im.TryRegisterUserTable(newTbl, newOid); err != nil {
 			s.rollbackTemplateCopy(newOid)
 			return fmt.Errorf("cloning table %q: %w", srcTbl.Name, err)
 		}
@@ -1062,6 +1132,12 @@ func (s *Server) copyTemplateRelationFile(oldRel, newRel storage.RelFileNode) er
 	if err := copyRelationFileFsync(oldPath, newPath); err != nil {
 		return fmt.Errorf("copy %s to %s: %w", oldPath, newPath, err)
 	}
+	// B4.6 Stage 3b: WAL-log the copied user relation's blocks as full-page-
+	// image records so a standby reconstructs the data (the catalog rows for
+	// this table are journaled separately by syncCopiedTableCatalogHeap). Runs
+	// after the RM_DBASE create + catalog-image FPIs emitted at CREATE time, so
+	// base/<newDBOid> already exists on the standby.
+	s.walLogRelfileFPIs(newRel.DBOid, newRel.RelOid)
 	return nil
 }
 
@@ -1145,6 +1221,73 @@ func (s *Server) syncCopiedTableCatalogHeap(newOid uint32, tbl *catalog.Table) e
 	}
 	if err := s.cfg.TxnMgr.Commit(tx); err != nil {
 		return fmt.Errorf("commit catalog-heap sync transaction: %w", err)
+	}
+	committed = true
+	return nil
+}
+
+// syncPgDatabaseHeapRow INSERTs the pg_database SHARED heap row (global/1262)
+// for a freshly created database from its own short-lived internal transaction
+// (B4.6 Stage 1). The new row's encoding/locale columns are cloned from the
+// template database's heap row (templateOid); the executor writer maintains the
+// 2671/2672 indexes. This is the standby's copy of the database catalog — a
+// real PG18 standby replays the XLOG_HEAP_INSERT; goopg's own pg_database is
+// still served from the registry VirtualRows. A nil Pool/TxnMgr (test/embedded)
+// is a no-op, matching syncCopiedTableCatalogHeap.
+func (s *Server) syncPgDatabaseHeapRow(newOid uint32, name string, owner, templateOid uint32) error {
+	return s.runPgDatabaseHeapTxn(func(ectx *executor.Context) error {
+		return executor.SyncPgDatabaseCatalogRow(ectx, newOid, name, owner, templateOid)
+	})
+}
+
+// deletePgDatabaseHeapRow stamps the pg_database heap row for oid deleted
+// (DROP DATABASE, B4.6 Stage 1) from its own short-lived transaction.
+func (s *Server) deletePgDatabaseHeapRow(oid uint32) error {
+	return s.runPgDatabaseHeapTxn(func(ectx *executor.Context) error {
+		return executor.DeletePgDatabaseCatalogRow(ectx, oid)
+	})
+}
+
+// runPgDatabaseHeapTxn opens a short-lived internal transaction wired for
+// shared-catalog heap writes and runs fn against it, committing on success.
+// Mirrors syncCopiedTableCatalogHeap / syncDbRoleSettingHeap scaffolding.
+// CurrentDatabaseOid is DefaultDBOid so the CatalogHeapSyncAvailable guard can
+// resolve pg_attribute; the write itself targets the SHARED pg_database rel
+// (global/1262, DBOid 0).
+func (s *Server) runPgDatabaseHeapTxn(fn func(*executor.Context) error) error {
+	if s.cfg.Pool == nil || s.cfg.TxnMgr == nil {
+		return nil
+	}
+	ectx := executor.NewContext()
+	ectx.Pool = s.cfg.Pool
+	ectx.Catalog = s.cfg.Catalog
+	ectx.CurrentDatabaseOid = catalog.DefaultDBOid
+	if !executor.CatalogHeapSyncAvailable(ectx) {
+		return nil
+	}
+	tx, err := s.cfg.TxnMgr.Begin(mvcc.IsolationReadCommitted)
+	if err != nil {
+		return fmt.Errorf("begin pg_database sync transaction: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = s.cfg.TxnMgr.Rollback(tx)
+		}
+	}()
+	snap, err := s.cfg.TxnMgr.SnapshotFor(tx)
+	if err != nil {
+		return fmt.Errorf("snapshot for pg_database sync transaction: %w", err)
+	}
+	ectx.TxnMgr = s.cfg.TxnMgr
+	ectx.Tx = tx
+	ectx.Snap = snap
+	ectx.WAL = s.cfg.WAL
+	if err := fn(ectx); err != nil {
+		return err
+	}
+	if err := s.cfg.TxnMgr.Commit(tx); err != nil {
+		return fmt.Errorf("commit pg_database sync transaction: %w", err)
 	}
 	committed = true
 	return nil
@@ -1301,6 +1444,19 @@ func (s *Server) tryHandleDatabaseDDL(sql string, liveDBName string, actingRole 
 			_ = cat.DropDatabase(name)
 			return true, "", err
 		}
+		// B4.6 Stage 3: journal the RM_DBASE XLOG_DBASE_CREATE_WAL_LOG record
+		// FIRST (a standby creates base/<oid> from it before any block is
+		// written into it), then Stage 3b lays down the template0 catalog image
+		// as full-page-image records — BEFORE copyTemplateTables' user-table
+		// catalog INSERTs below, so on a standby the pristine catalog pages come
+		// first and the user rows append on top. Best-effort stream parity (the
+		// files already exist locally via the image copy above).
+		if s.cfg.WAL != nil {
+			if rec, encErr := wal.EncodeDbaseCreateWalLogPG(oid, catalog.DefaultTablespaceOID, 0); encErr == nil {
+				_, _, _ = s.cfg.WAL.Append(rec)
+			}
+		}
+		s.walLogNewDatabaseCatalogFPIs(oid)
 		// B0.4: journal the new database's pg_filenode.map as a real
 		// XLOG_RELMAP_UPDATE record (upstream WAL_LOG createdb's
 		// RelationMapCopy analog) so the map is reconstructible from WAL —
@@ -1355,16 +1511,35 @@ func (s *Server) tryHandleDatabaseDDL(sql string, liveDBName string, actingRole 
 				return true, "", cerr
 			}
 		}
-		if s.cfg.WAL != nil {
-			if _, _, werr := s.cfg.WAL.Append(wal.EncodeCreateDatabase(name, owner, oid)); werr != nil {
-				// Roll back the catalog change (and any copied template
-				// tables) so memory and disk agree.
-				s.rollbackTemplateCopy(oid)
-				_ = cat.DropDatabase(name)
-				s.removeDatabasePhysicalDirectory(oid)
-				return true, "", werr
+		// B4.6 Stage 1: journal the new database's pg_database SHARED heap row
+		// (global/1262) so a real PG18 standby sees the catalog row. Written
+		// AFTER the template copy (so a copy failure rolls back before any row
+		// is written) and BEFORE the goopg-private CREATE-DATABASE record. Best-
+		// effort: a failure here must not fail the CREATE — goopg's own
+		// pg_database is served from the registry, and the standby copy is a
+		// stream-parity artifact, so it degrades to "standby missing the row"
+		// rather than aborting a locally-consistent CREATE (matches
+		// walLogRelmapForNewDatabase's best-effort stance).
+		//
+		// resolveCreateDatabaseTemplate collapses srcOid to 0 for an empty /
+		// DefaultDBOid template; re-resolve the template's real oid so the clone
+		// inherits its encoding/locale (every bootstrap DB shares the cluster
+		// locale, so template1/oid-1 is the faithful default source).
+		cloneTemplateOid := srcOid
+		if cloneTemplateOid == 0 {
+			if reg, ok := s.cfg.Catalog.(databaseTemplateRegistry); ok {
+				if o, ok := reg.ResolveDatabaseOid(templateName); ok {
+					cloneTemplateOid = o
+				}
 			}
 		}
+		if err := s.syncPgDatabaseHeapRow(oid, name, owner, cloneTemplateOid); err != nil && s.cfg.Logger != nil {
+			s.cfg.Logger.Warn("pg_database heap row sync failed", "database", name, "err", err)
+		}
+		// The RM_DBASE XLOG_DBASE_CREATE_WAL_LOG record + the template0 catalog
+		// image FPIs were emitted early (right after createDatabasePhysicalDirectory)
+		// so the standby lays the catalog down before the user rows; the pg_database
+		// heap row was synced just above.
 		return true, "", nil
 	case databaseDDLDrop:
 		// PG's dropdb() (dbcommands.c) runs its guard checks — ownership,
@@ -1458,20 +1633,31 @@ func (s *Server) tryHandleDatabaseDDL(sql string, liveDBName string, actingRole 
 			return true, "", err
 		}
 		if s.cfg.WAL != nil {
-			if _, _, werr := s.cfg.WAL.Append(wal.EncodeDropDatabase(name)); werr != nil {
-				// Re-create the catalog entry (with its original owner) so
-				// the abort is consistent. A fresh oid gets allocated here
-				// rather than restoring the dropped one — acceptable for
-				// this exceedingly rare double-failure edge case (the
-				// DROP's own WAL append failing) since no DropDatabase
-				// record was ever durably written either. The re-created
-				// entry gets a fresh oid (droppedOid's directory is left
-				// as a harmless orphan, matching createDatabasePhysicalDirectory's
-				// own rollback tolerance) — removeDatabasePhysicalDirectory
-				// is only reached below, past this early return.
-				_, _ = cat.CreateDatabase(name, droppedOwner)
-				return true, "", werr
+			// B4.6 Stage 3: journal a real RM_DBASE XLOG_DBASE_DROP record
+			// (removes base/<oid> on a standby) instead of the retired goopg-
+			// private RecordKindDropDatabase(19). goopg databases live in the
+			// default tablespace, so the record carries [1663]. The pg_database
+			// heap row is stamped deleted just below.
+			rec, encErr := wal.EncodeDbaseDropPG(droppedOid, []uint32{catalog.DefaultTablespaceOID}, 0)
+			if encErr == nil {
+				if _, _, werr := s.cfg.WAL.Append(rec); werr != nil {
+					// Re-create the catalog entry (with its original owner) so
+					// the abort is consistent. A fresh oid gets allocated here
+					// rather than restoring the dropped one — acceptable for
+					// this exceedingly rare double-failure edge case (the
+					// DROP's own WAL append failing) since no drop record was
+					// ever durably written either. removeDatabasePhysicalDirectory
+					// is only reached below, past this early return.
+					_, _ = cat.CreateDatabase(name, droppedOwner)
+					return true, "", werr
+				}
 			}
+		}
+		// B4.6 Stage 1: stamp the pg_database SHARED heap row (global/1262)
+		// deleted now that the drop is durable — a real PG18 standby replays
+		// the XLOG_HEAP_DELETE. Best-effort, same rationale as the CREATE side.
+		if err := s.deletePgDatabaseHeapRow(droppedOid); err != nil && s.cfg.Logger != nil {
+			s.cfg.Logger.Warn("pg_database heap row delete failed", "database", name, "err", err)
 		}
 		// M0122-0007 physical-storage-isolation slice 3: remove base/<oid>
 		// now that the drop is durable (WAL-committed above, or no WAL
