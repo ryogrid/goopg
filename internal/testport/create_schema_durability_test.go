@@ -1232,3 +1232,55 @@ func TestPort_DbRoleSettingSurvivesRestart(t *testing.T) {
 		t.Fatalf("post-restart reset config count = %q, want 0 (entry removed)", got)
 	}
 }
+
+// TestPort_AuthMembersSurvivesRestart validates B4.3: GRANT/REVOKE role
+// membership journals a real pg_auth_members SHARED heap row (global/1261), and
+// a restart reloads the memberships from it (reloadRoleMembershipsFromHeap) —
+// no bespoke kind 79/80 record.
+func TestPort_AuthMembersSurvivesRestart(t *testing.T) {
+	c, err := cluster.New("authmembers-durability", cluster.Options{
+		RepoRoot:     repoRoot(t),
+		DataDir:      filepath.Join(t.TempDir(), "data"),
+		StartupWait:  20 * time.Second,
+		ShutdownWait: 20 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+
+	stmts := []string{
+		"CREATE ROLE b43_grp",
+		"CREATE ROLE b43_mem",
+		"GRANT b43_grp TO b43_mem WITH ADMIN OPTION",
+		"CREATE ROLE b43_gone_grp",
+		"CREATE ROLE b43_gone_mem",
+		"GRANT b43_gone_grp TO b43_gone_mem",
+		"REVOKE b43_gone_grp FROM b43_gone_mem", // exercise the delete path
+	}
+	for _, s := range stmts {
+		if err := runSQLSimple(t, c, s); err != nil {
+			t.Fatalf("%s: %v", s, err)
+		}
+	}
+
+	if err := c.Stop(cluster.ShutdownFast); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	if err := c.Start(); err != nil {
+		t.Fatalf("restart: %v", err)
+	}
+
+	// Surviving membership present (with admin_option) after reload from heap.
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_auth_members WHERE roleid = (SELECT oid FROM pg_authid WHERE rolname='b43_grp') "+
+			"AND member = (SELECT oid FROM pg_authid WHERE rolname='b43_mem') AND admin_option"); got != "1" {
+		t.Fatalf("post-restart membership count = %q, want 1 (reloaded from heap)", got)
+	}
+	// The revoked membership must be gone.
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_auth_members WHERE roleid = (SELECT oid FROM pg_authid WHERE rolname='b43_gone_grp')"); got != "0" {
+		t.Fatalf("post-restart revoked membership count = %q, want 0", got)
+	}
+}

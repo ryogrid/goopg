@@ -502,27 +502,10 @@ const (
 	// pg_db_role_setting heap row (SHARED, global/2964) from the registry, and
 	// a restart reloads it via reloadDbRoleSettingsFromHeap.
 
-	// RecordKindGrantRoleMembership records a `GRANT <role> TO <member>
-	// [WITH { ADMIN | INHERIT | SET } { OPTION | TRUE | FALSE } [, ...]]`
-	// event so the pg_auth_members row survives a restart
-	// (M0119-0004-ACLHEAP, GRANT/REVOKE ROLE membership). goopg has no
-	// per-role file namespace, so the physical redo path is a no-op; the
-	// recovery driver in internal/initdb/role_membership_recovery.go scans
-	// the WAL for these records after physical replay and re-applies them to
-	// catalog.InMemory's roleMembers registry via GrantRoleMembership (which
-	// mints a fresh OID at replay time — pg_auth_members.oid is not dumped
-	// by pg_dump/pg_dumpall, so OID stability across a restart is not
-	// required).
-	// Format:
-	//   kind(1) | roleOid(4) | memberOid(4) | grantorOid(4) | options(1)
-	RecordKindGrantRoleMembership byte = 79
-
-	// RecordKindRevokeRoleMembership records a `REVOKE
-	// [{ADMIN|INHERIT|SET} OPTION FOR] <role> FROM <member>` event. Same
-	// no-op physical redo path as RecordKindGrantRoleMembership.
-	// Format:
-	//   kind(1) | roleOid(4) | memberOid(4) | revokeOption(1)
-	RecordKindRevokeRoleMembership byte = 80
+	// Kinds 79/80 (Grant/RevokeRoleMembership) retired in B4.3: GRANT/REVOKE
+	// role membership now journals a real pg_auth_members heap row (SHARED,
+	// global/1261) re-synced per (roleid, member, grantor) from the registry,
+	// and a restart reloads it via reloadRoleMembershipsFromHeap.
 
 	// RecordKindRenameIndex records an `ALTER INDEX name RENAME TO newname`
 	// event on a real (non-TOAST) index — previously a functional no-op with
@@ -917,111 +900,6 @@ const (
 	roleGrantOptSetSpecified     = 1 << 4
 	roleGrantOptSetValue         = 1 << 5
 )
-
-// EncodeGrantRoleMembership encodes a `GRANT <role> TO <member> [WITH {
-// ADMIN | INHERIT | SET } { OPTION | TRUE | FALSE } [, ...]]` event.
-// admin/inherit/set are tri-state (nil = not specified in the WITH clause).
-// Format: kind(1) | roleOid(4) | memberOid(4) | grantorOid(4) | options(1).
-func EncodeGrantRoleMembership(roleOid, memberOid, grantorOid uint32, admin, inherit, set *bool) []byte {
-	out := make([]byte, 14)
-	out[0] = RecordKindGrantRoleMembership
-	binary.LittleEndian.PutUint32(out[1:5], roleOid)
-	binary.LittleEndian.PutUint32(out[5:9], memberOid)
-	binary.LittleEndian.PutUint32(out[9:13], grantorOid)
-	var opts byte
-	if admin != nil {
-		opts |= roleGrantOptAdminSpecified
-		if *admin {
-			opts |= roleGrantOptAdminValue
-		}
-	}
-	if inherit != nil {
-		opts |= roleGrantOptInheritSpecified
-		if *inherit {
-			opts |= roleGrantOptInheritValue
-		}
-	}
-	if set != nil {
-		opts |= roleGrantOptSetSpecified
-		if *set {
-			opts |= roleGrantOptSetValue
-		}
-	}
-	out[13] = opts
-	return out
-}
-
-// DecodeGrantRoleMembership decodes a RecordKindGrantRoleMembership payload.
-func DecodeGrantRoleMembership(payload []byte) (roleOid, memberOid, grantorOid uint32, admin, inherit, set *bool, err error) {
-	if len(payload) < 14 {
-		return 0, 0, 0, nil, nil, nil, fmt.Errorf("wal: grant-role-membership payload too short (%d bytes)", len(payload))
-	}
-	if payload[0] != RecordKindGrantRoleMembership {
-		return 0, 0, 0, nil, nil, nil, fmt.Errorf("wal: record kind %d is not grant-role-membership", payload[0])
-	}
-	roleOid = binary.LittleEndian.Uint32(payload[1:5])
-	memberOid = binary.LittleEndian.Uint32(payload[5:9])
-	grantorOid = binary.LittleEndian.Uint32(payload[9:13])
-	opts := payload[13]
-	if opts&roleGrantOptAdminSpecified != 0 {
-		v := opts&roleGrantOptAdminValue != 0
-		admin = &v
-	}
-	if opts&roleGrantOptInheritSpecified != 0 {
-		v := opts&roleGrantOptInheritValue != 0
-		inherit = &v
-	}
-	if opts&roleGrantOptSetSpecified != 0 {
-		v := opts&roleGrantOptSetValue != 0
-		set = &v
-	}
-	return roleOid, memberOid, grantorOid, admin, inherit, set, nil
-}
-
-// revokeRoleMembershipOptionByte maps a RoleMembershipChange.RevokeOption
-// string ("" | "admin" | "inherit" | "set") to/from the single wire byte
-// EncodeRevokeRoleMembership persists. M0119-0004-ACLHEAP.
-var revokeRoleMembershipOptionByte = map[string]byte{"": 0, "admin": 1, "inherit": 2, "set": 3}
-var revokeRoleMembershipOptionName = []string{"", "admin", "inherit", "set"}
-
-// EncodeRevokeRoleMembership encodes a `REVOKE [{ADMIN|INHERIT|SET} OPTION
-// FOR] <role> FROM <member> [GRANTED BY <grantor>]` event. grantorOid
-// identifies the single (role, member, grantor) row this revoke targets —
-// real PG's (roleid, member, grantor) unique index allows independent rows
-// from different grantors on the same (role, member) pair, so the grantor
-// must be persisted to replay the correct row on recovery. revokeOption is
-// "" for a plain REVOKE or one of "admin"/"inherit"/"set" for the OPTION FOR
-// prefix (see catalog.InMemory.RevokeRoleMembership).
-// Format: kind(1) | roleOid(4) | memberOid(4) | grantorOid(4) | revokeOption(1).
-func EncodeRevokeRoleMembership(roleOid, memberOid, grantorOid uint32, revokeOption string) []byte {
-	out := make([]byte, 14)
-	out[0] = RecordKindRevokeRoleMembership
-	binary.LittleEndian.PutUint32(out[1:5], roleOid)
-	binary.LittleEndian.PutUint32(out[5:9], memberOid)
-	binary.LittleEndian.PutUint32(out[9:13], grantorOid)
-	out[13] = revokeRoleMembershipOptionByte[revokeOption]
-	return out
-}
-
-// DecodeRevokeRoleMembership decodes a RecordKindRevokeRoleMembership payload.
-func DecodeRevokeRoleMembership(payload []byte) (roleOid, memberOid, grantorOid uint32, revokeOption string, err error) {
-	if len(payload) < 14 {
-		return 0, 0, 0, "", fmt.Errorf("wal: revoke-role-membership payload too short (%d bytes)", len(payload))
-	}
-	if payload[0] != RecordKindRevokeRoleMembership {
-		return 0, 0, 0, "", fmt.Errorf("wal: record kind %d is not revoke-role-membership", payload[0])
-	}
-	roleOid = binary.LittleEndian.Uint32(payload[1:5])
-	memberOid = binary.LittleEndian.Uint32(payload[5:9])
-	grantorOid = binary.LittleEndian.Uint32(payload[9:13])
-	optByte := payload[13]
-	if int(optByte) >= len(revokeRoleMembershipOptionName) {
-		return 0, 0, 0, "", fmt.Errorf("wal: revoke-role-membership unknown option byte %d", optByte)
-	}
-	revokeOption = revokeRoleMembershipOptionName[optByte]
-	return roleOid, memberOid, grantorOid, revokeOption, nil
-}
-
 // ColumnDefaultEntry is one (column, DEFAULT expression SQL) pair inside a
 // RecordKindColumnDefaults record.
 type ColumnDefaultEntry struct {
@@ -3596,31 +3474,6 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 		// internal/initdb/pubsub_ddl_recovery.go scans the WAL for these
 		// records after physical replay and re-applies them to the PubSub
 		// registry.
-		return false, nil
-	case RecordKindGrantRoleMembership, RecordKindRevokeRoleMembership:
-		// GRANT/REVOKE ROLE membership (M0119-0004-ACLHEAP) records carry
-		// only in-memory registry state (roleMembers); goopg has no
-		// per-role-membership file namespace, so the physical replay path
-		// has nothing to do. (B2.2 slice 3 retired the CREATE/DROP
-		// OPERATOR kinds, 83/84, that shared this case.) **Bug fix:**
-		// these kinds previously had NO case in this switch at all —
-		// on a data dir where the last checkpoint predates one of these
-		// records (i.e. no shutdown checkpoint ran between the DDL and the
-		// restart, such as a crash restart), ReplayRecords/ApplyRecord
-		// would hit the `default` branch below and fail the ENTIRE replay
-		// with "unsupported kind N", aborting startup outright — not a
-		// silent data-loss bug, but a crash-recovery availability bug that
-		// a graceful restart (which always takes a shutdown checkpoint,
-		// trimming these pre-checkpoint records out of ReplayRecords'
-		// input before they ever reach ApplyRecord) could never surface.
-		// Discovered while auditing this switch for the CREATE/DROP
-		// OPERATOR CLASS/FAMILY kinds added below — see the deferral
-		// ledger. The recovery drivers in
-		// internal/initdb/operator_ddl_recovery.go and
-		// internal/initdb/role_membership_recovery.go already scan the WAL
-		// unconditionally from LSN 0 (not trimmed to the checkpoint) and
-		// re-apply these records to the catalog, independent of whatever
-		// ApplyRecord does here.
 		return false, nil
 	case RecordKindCreateIndex, RecordKindDropIndex, RecordKindRenameIndex:
 		// CREATE/DROP/RENAME INDEX records (M0079-0001; RENAME added

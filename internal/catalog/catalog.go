@@ -5377,6 +5377,45 @@ func (c *InMemory) RevokeRoleMembership(roleOid, memberOid, grantorOid uint32, r
 	return true
 }
 
+// LookupRoleMembership returns a copy of the current (roleOid, memberOid,
+// grantorOid) membership and whether it exists. Used by the B4.3
+// pg_auth_members heap writer to re-sync the single affected row from the
+// post-mutation registry state.
+func (c *InMemory) LookupRoleMembership(roleOid, memberOid, grantorOid uint32) (RoleMembership, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if m, ok := c.roleMembers[roleMembershipKey{RoleOID: roleOid, MemberOID: memberOid, GrantorOID: grantorOid}]; ok {
+		return *m, true
+	}
+	return RoleMembership{}, false
+}
+
+// AllRoleMemberships returns a copy of every role-membership row, sorted by OID
+// for deterministic pg_auth_members output. Used by the B4.3 reload.
+func (c *InMemory) AllRoleMemberships() []RoleMembership {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make([]RoleMembership, 0, len(c.roleMembers))
+	for _, m := range c.roleMembers {
+		out = append(out, *m)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].OID < out[j].OID })
+	return out
+}
+
+// RegisterRoleMembershipDuringRecovery re-registers a membership row with its
+// original OID/options, replayed from the pg_auth_members heap
+// (reloadRoleMembershipsFromHeap, B4.3). Mirrors RegisterSchemaDuringRecovery.
+func (c *InMemory) RegisterRoleMembershipDuringRecovery(m RoleMembership) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	cp := m
+	c.roleMembers[roleMembershipKey{RoleOID: m.RoleOID, MemberOID: m.MemberOID, GrantorOID: m.GrantorOID}] = &cp
+	if m.OID >= c.nextOID {
+		c.nextOID = m.OID + 1
+	}
+}
+
 // RevokeRoleMembershipCascadeSet computes, WITHOUT mutating any state, the
 // additional pg_auth_members rows a whole-row `REVOKE roleOid FROM
 // memberOid` or a `REVOKE ADMIN OPTION FOR roleOid FROM memberOid` needs to
