@@ -56,10 +56,10 @@ func TestRecordKindToRmgrInfoAnalogTable(t *testing.T) {
 // kind from each region is enough to catch a range-boundary mistake.
 func TestRecordKindToRmgrInfoCustomDefault(t *testing.T) {
 	for _, kind := range []byte{
-		RecordKindCreateDatabase,
+		RecordKindCreateIndex, // still-live rmid-128 kind (was CreateDatabase, retired B4.6 Stage 3)
 		RecordKindCreateStatistics,
 		RecordKindRenameIndex,
-		RecordKindRoleState, // still-live rmid-128 kind (was DropSubscription, retired B4.4)
+		RecordKindColumnDefaults, // still-live rmid-128 kind (was RoleState, retired B4.5)
 	} {
 		gotRmgr, _ := recordKindToRmgrInfo(kind)
 		if gotRmgr != RmgrGoopgCatalog {

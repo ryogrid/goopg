@@ -69,6 +69,11 @@ const (
 	xlogTblspcCreate uint8 = 0x00 // XLOG_TBLSPC_CREATE
 	xlogTblspcDrop   uint8 = 0x10 // XLOG_TBLSPC_DROP
 
+	// RM_DBASE_ID info codes (commands/dbcommands_xlog.h). B4.6 Stage 3.
+	xlogDbaseCreateFileCopy uint8 = 0x00 // XLOG_DBASE_CREATE_FILE_COPY
+	xlogDbaseCreateWalLog   uint8 = 0x10 // XLOG_DBASE_CREATE_WAL_LOG
+	xlogDbaseDrop           uint8 = 0x20 // XLOG_DBASE_DROP
+
 	// XLOG_FPI (pg_control.h:79), RM_XLOG_ID's full-page-image opcode.
 	// Used by recordKindToRmgrInfo (doc 04 §3.1) to map PageImage.
 	xlogXLogFPI uint8 = 0xB0

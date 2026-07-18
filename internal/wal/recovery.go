@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/goopg/goopg/internal/access/btree"
-	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/control"
 	"github.com/goopg/goopg/internal/storage"
 )
@@ -135,22 +134,13 @@ const (
 	//   kind(1) | subXid(4) = 5 bytes total.
 	RecordKindXactSubAbort byte = 17
 
-	// RecordKindCreateDatabase records a `CREATE DATABASE <name>` event
-	// so the catalog's per-instance database list can be reconstructed
-	// after a crash (M0054-0001). The redo path does NOT touch on-disk
-	// storage — goopg v0 has no per-database file namespacing — so
-	// applyRecord returns (false, nil); the recovery driver in
-	// internal/initdb scans the WAL for these records after physical
-	// replay and re-registers each database name in the catalog.
-	// Format:
-	//   kind(1) | nameLen(2) | name(nameLen bytes)
-	RecordKindCreateDatabase byte = 18
-
-	// RecordKindDropDatabase records a `DROP DATABASE <name>` event.
-	// Counterpart to RecordKindCreateDatabase. Same format / replay
-	// semantics; the recovery driver removes the name from the
-	// catalog instead of adding it.
-	RecordKindDropDatabase byte = 19
+	// Kinds 18/19 (CreateDatabase/DropDatabase) retired in B4.6 Stage 3:
+	// CREATE/DROP DATABASE now journal a real pg_database SHARED heap row
+	// (global/1262, via XLOG_HEAP_INSERT/DELETE — Stage 1) for the catalog
+	// identity + a real RM_DBASE XLOG_DBASE_CREATE_WAL_LOG / XLOG_DBASE_DROP
+	// record (RmgrDbase=4) for the base/<oid> physical directory, so a real
+	// PG18 standby replays both. A restart reloads the registry from the heap
+	// (reloadDatabasesFromHeap) and physical replay recreates the directory.
 
 	// RecordKindCreateIndex records a `CREATE INDEX` event so the
 	// catalog's in-memory index registry can be reconstructed after
@@ -422,31 +412,11 @@ const (
 	// DROP, and a restart reloads the registry from that heap
 	// (reloadUserTablespacesFromHeap).
 
-	// RecordKindRoleState records the FULL state of one role (name +
-	// attribute flags + password verifier) so CREATE/ALTER ROLE survive a
-	// restart, like PostgreSQL's pg_authid (which goopg only bootstraps at
-	// initdb — runtime role DDL was in-memory-only before this record).
-	// Passwords are stored as verifiers, never plaintext-by-default: the
-	// server-side handler turns `PASSWORD 'x'` into an upstream-format
-	// SCRAM-SHA-256 verifier (auth.NewSCRAMSecret, mirroring PG's
-	// encrypt_password in postgres/src/backend/libpq/crypt.c) before the
-	// record is emitted, so the WAL carries the same secret shape as
-	// pg_authid.rolpassword. Emitted on CREATE ROLE/USER/GROUP and ALTER
-	// ROLE/USER; replay is last-record-wins so both share this one kind.
-	// The WAL records are the crash-recovery TAIL only: the durable base
-	// store is the pg_authid heap file (global/1260), rewritten atomically
-	// on every role DDL (initdb.SyncPgAuthidFile) exactly like PostgreSQL's
-	// pg_authid heap is the durable store and its WAL records the tail.
-	// Startup loads the heap first, then replays these records on top.
-	// Format:
-	//   kind(1) | flags(1: bit0=canLogin bit1=superuser) | credType(1:
-	//   0=none 1=plaintext 2=md5 3=scram-sha-256) | oid(4) |
-	//   nameLen(2)+name | secretLen(2)+secret
-	RecordKindRoleState byte = 67
-
-	// RecordKindDropRole records a role removal (DROP ROLE/USER/GROUP) so
-	// replay does not resurrect it. Format: kind(1) | nameLen(2) | name.
-	RecordKindDropRole byte = 68
+	// Kinds 67/68 (RoleState/DropRole) retired in B4.5: CREATE/ALTER/DROP ROLE
+	// now journals a real pg_authid heap row (SHARED, global/1260) via
+	// XLOG_HEAP_INSERT/DELETE + 2676/2677 index maintenance, and a restart
+	// reloads the registry from that heap (reloadRolesFromAuthidHeap). See
+	// kind 72 below (also retired in B4.5).
 
 	// RecordKindColumnDefaults records a table's column DEFAULT expressions
 	// (as SQL text) so they survive a restart. catalog.Column.DefaultExpr is
@@ -465,17 +435,10 @@ const (
 	//   exprLen(2)+exprSQL)
 	RecordKindColumnDefaults byte = 69
 
-	// RecordKindAlterRoleRename records an `ALTER ROLE/USER <name> RENAME TO
-	// <newname>` event so the rename survives a restart. Like
-	// RecordKindRoleState, runtime role DDL never writes the pg_authid heap
-	// directly (only the periodic full-registry SyncPgAuthidFile rewrite
-	// does), so the physical replay path is a no-op; the recovery driver in
-	// internal/initdb/role_ddl_recovery.go re-keys the catalog role registry
-	// entry (preserving its OID) after physical replay. root-0021 follow-up
-	// (M0119-0004).
-	// Format:
-	//   kind(1) | nameLen(2) | name(nameLen bytes) | newNameLen(2) | newName(newNameLen bytes)
-	RecordKindAlterRoleRename byte = 72
+	// Kind 72 (AlterRoleRename) retired in B4.5: ALTER ROLE ... RENAME TO is
+	// just an attribute change on rolname, so it rides the same per-row
+	// pg_authid heap re-sync (stamp by oid + write the row under the new
+	// rolname) as CREATE/ALTER — see the kinds 67/68 note above.
 
 	// Kinds 73-78 (AlterDatabase/RoleSetConfig/ResetConfig/ResetAllConfig)
 	// retired in B4.2: ALTER DATABASE/ROLE SET/RESET now re-syncs a real
@@ -578,82 +541,6 @@ const (
 	heapHotUpdateHeaderSize = 20
 )
 
-// EncodeCreateDatabase encodes a CREATE DATABASE event (M0054-0001).
-// Format: kind(1) | nameLen(2) | name(nameLen bytes) | owner(4, datdba OID,
-// M0122-0007) | oid(4, real pg_database.oid, M0122-0007
-// physical-storage-isolation slice 1).
-func EncodeCreateDatabase(name string, owner, oid uint32) []byte {
-	if len(name) > 0xFFFF {
-		// goopg's identifier length cap is far below 64 KiB; truncating
-		// here is defensive — this branch is unreachable under normal
-		// CREATE DATABASE syntax.
-		name = name[:0xFFFF]
-	}
-	out := make([]byte, 3+len(name)+4+4)
-	out[0] = RecordKindCreateDatabase
-	binary.LittleEndian.PutUint16(out[1:3], uint16(len(name)))
-	copy(out[3:], name)
-	binary.LittleEndian.PutUint32(out[3+len(name):], owner)
-	binary.LittleEndian.PutUint32(out[3+len(name)+4:], oid)
-	return out
-}
-
-// DecodeCreateDatabase decodes a RecordKindCreateDatabase payload. owner
-// defaults to catalog.BootstrapSuperuserOID when the payload predates the
-// M0122-0007 owner suffix (no trailing 4 bytes) — keeps replay of a WAL
-// stream written before this change working. oid defaults to 0 (catalog's
-// DatabaseOid "no override" sentinel) when the payload predates the
-// M0122-0007 physical-storage-isolation slice-1 oid suffix.
-func DecodeCreateDatabase(payload []byte) (name string, owner uint32, oid uint32, err error) {
-	if len(payload) < 3 {
-		return "", 0, 0, fmt.Errorf("wal: create-database payload too short (%d bytes)", len(payload))
-	}
-	if payload[0] != RecordKindCreateDatabase {
-		return "", 0, 0, fmt.Errorf("wal: record kind %d is not create-database", payload[0])
-	}
-	nameLen := int(binary.LittleEndian.Uint16(payload[1:3]))
-	if len(payload) < 3+nameLen {
-		return "", 0, 0, fmt.Errorf("wal: create-database payload truncated (need %d bytes)", 3+nameLen)
-	}
-	name = string(payload[3 : 3+nameLen])
-	owner = catalog.BootstrapSuperuserOID
-	if len(payload) >= 3+nameLen+4 {
-		owner = binary.LittleEndian.Uint32(payload[3+nameLen : 3+nameLen+4])
-	}
-	if len(payload) >= 3+nameLen+4+4 {
-		oid = binary.LittleEndian.Uint32(payload[3+nameLen+4 : 3+nameLen+4+4])
-	}
-	return name, owner, oid, nil
-}
-
-// EncodeDropDatabase encodes a DROP DATABASE event (M0054-0001).
-// Format identical to EncodeCreateDatabase.
-func EncodeDropDatabase(name string) []byte {
-	if len(name) > 0xFFFF {
-		name = name[:0xFFFF]
-	}
-	out := make([]byte, 3+len(name))
-	out[0] = RecordKindDropDatabase
-	binary.LittleEndian.PutUint16(out[1:3], uint16(len(name)))
-	copy(out[3:], name)
-	return out
-}
-
-// DecodeDropDatabase decodes a RecordKindDropDatabase payload.
-func DecodeDropDatabase(payload []byte) (name string, err error) {
-	if len(payload) < 3 {
-		return "", fmt.Errorf("wal: drop-database payload too short (%d bytes)", len(payload))
-	}
-	if payload[0] != RecordKindDropDatabase {
-		return "", fmt.Errorf("wal: record kind %d is not drop-database", payload[0])
-	}
-	nameLen := int(binary.LittleEndian.Uint16(payload[1:3]))
-	if len(payload) < 3+nameLen {
-		return "", fmt.Errorf("wal: drop-database payload truncated (need %d bytes)", 3+nameLen)
-	}
-	return string(payload[3 : 3+nameLen]), nil
-}
-
 // SequenceStatePayload is the decoded form of a RecordKindSequenceState
 // record: one sequence's full definition plus its current counter. See the
 // RecordKindSequenceState constant for the on-disk format and the emit
@@ -676,198 +563,6 @@ type SequenceStatePayload struct {
 	DBOid        uint32 // owning database oid (M0122-0007 4e); 0 on a pre-4e record, see DecodeSequenceState
 }
 
-
-// RoleStatePayload is the decoded form of a RecordKindRoleState record: one
-// role's name, OID, attribute flags, and stored credential. See the
-// RecordKindRoleState constant for the on-disk format and emit policy.
-//
-// CreateDB/CreateRole/Replication/BypassRLS/ConnLimit/ValidUntil mirror
-// catalog.RoleAttrs' identically-named fields (DU-002 slice 439 follow-up).
-type RoleStatePayload struct {
-	Name        string
-	OID         uint32 // registry OID — kept stable across restarts
-	CanLogin    bool
-	Superuser   bool
-	CreateDB    bool
-	CreateRole  bool
-	Replication bool
-	BypassRLS   bool
-	ConnLimit   int32
-	ValidUntil  string
-	CredType    byte   // 0=none, 1=plaintext, 2=md5, 3=scram-sha-256
-	Secret      string // stored verifier (or plaintext for CredType 1)
-}
-
-// EncodeRoleState encodes a RecordKindRoleState record.
-func EncodeRoleState(p RoleStatePayload) []byte {
-	var buf bytes.Buffer
-	buf.WriteByte(RecordKindRoleState)
-	var flags byte
-	if p.CanLogin {
-		flags |= 1 << 0
-	}
-	if p.Superuser {
-		flags |= 1 << 1
-	}
-	if p.CreateDB {
-		flags |= 1 << 2
-	}
-	if p.CreateRole {
-		flags |= 1 << 3
-	}
-	if p.Replication {
-		flags |= 1 << 4
-	}
-	if p.BypassRLS {
-		flags |= 1 << 5
-	}
-	buf.WriteByte(flags)
-	buf.WriteByte(p.CredType)
-	var oid [4]byte
-	binary.LittleEndian.PutUint32(oid[:], p.OID)
-	buf.Write(oid[:])
-	var connLimit [4]byte
-	binary.LittleEndian.PutUint32(connLimit[:], uint32(p.ConnLimit))
-	buf.Write(connLimit[:])
-	writeStr16 := func(s string) {
-		if len(s) > 0xFFFF {
-			s = s[:0xFFFF]
-		}
-		var l [2]byte
-		binary.LittleEndian.PutUint16(l[:], uint16(len(s)))
-		buf.Write(l[:])
-		buf.WriteString(s)
-	}
-	writeStr16(p.Name)
-	writeStr16(p.Secret)
-	writeStr16(p.ValidUntil)
-	return buf.Bytes()
-}
-
-// DecodeRoleState decodes a RecordKindRoleState payload.
-func DecodeRoleState(payload []byte) (RoleStatePayload, error) {
-	var p RoleStatePayload
-	if len(payload) < 11 {
-		return p, fmt.Errorf("wal: role-state payload too short (%d bytes)", len(payload))
-	}
-	if payload[0] != RecordKindRoleState {
-		return p, fmt.Errorf("wal: record kind %d is not role-state", payload[0])
-	}
-	flags := payload[1]
-	p.CanLogin = flags&(1<<0) != 0
-	p.Superuser = flags&(1<<1) != 0
-	p.CreateDB = flags&(1<<2) != 0
-	p.CreateRole = flags&(1<<3) != 0
-	p.Replication = flags&(1<<4) != 0
-	p.BypassRLS = flags&(1<<5) != 0
-	p.CredType = payload[2]
-	p.OID = binary.LittleEndian.Uint32(payload[3:7])
-	p.ConnLimit = int32(binary.LittleEndian.Uint32(payload[7:11]))
-	off := 11
-	readStr16 := func() (string, error) {
-		if len(payload) < off+2 {
-			return "", fmt.Errorf("wal: role-state payload truncated at offset %d", off)
-		}
-		l := int(binary.LittleEndian.Uint16(payload[off : off+2]))
-		off += 2
-		if len(payload) < off+l {
-			return "", fmt.Errorf("wal: role-state string truncated (need %d bytes at %d)", l, off)
-		}
-		s := string(payload[off : off+l])
-		off += l
-		return s, nil
-	}
-	var err error
-	if p.Name, err = readStr16(); err != nil {
-		return p, err
-	}
-	if p.Secret, err = readStr16(); err != nil {
-		return p, err
-	}
-	if p.ValidUntil, err = readStr16(); err != nil {
-		return p, err
-	}
-	return p, nil
-}
-
-// EncodeDropRole encodes a RecordKindDropRole record.
-// Format identical to EncodeDropDatabase: kind(1) | nameLen(2) | name.
-func EncodeDropRole(name string) []byte {
-	if len(name) > 0xFFFF {
-		name = name[:0xFFFF]
-	}
-	out := make([]byte, 3+len(name))
-	out[0] = RecordKindDropRole
-	binary.LittleEndian.PutUint16(out[1:3], uint16(len(name)))
-	copy(out[3:], name)
-	return out
-}
-
-// DecodeDropRole decodes a RecordKindDropRole payload.
-func DecodeDropRole(payload []byte) (name string, err error) {
-	if len(payload) < 3 {
-		return "", fmt.Errorf("wal: drop-role payload too short (%d bytes)", len(payload))
-	}
-	if payload[0] != RecordKindDropRole {
-		return "", fmt.Errorf("wal: record kind %d is not drop-role", payload[0])
-	}
-	nameLen := int(binary.LittleEndian.Uint16(payload[1:3]))
-	if len(payload) < 3+nameLen {
-		return "", fmt.Errorf("wal: drop-role payload truncated (need %d bytes)", 3+nameLen)
-	}
-	return string(payload[3 : 3+nameLen]), nil
-}
-
-// EncodeAlterRoleRename encodes a RecordKindAlterRoleRename record.
-func EncodeAlterRoleRename(name, newName string) []byte {
-	if len(name) > 0xFFFF {
-		name = name[:0xFFFF]
-	}
-	if len(newName) > 0xFFFF {
-		newName = newName[:0xFFFF]
-	}
-	var buf bytes.Buffer
-	buf.WriteByte(RecordKindAlterRoleRename)
-	var l [2]byte
-	binary.LittleEndian.PutUint16(l[:], uint16(len(name)))
-	buf.Write(l[:])
-	buf.WriteString(name)
-	binary.LittleEndian.PutUint16(l[:], uint16(len(newName)))
-	buf.Write(l[:])
-	buf.WriteString(newName)
-	return buf.Bytes()
-}
-
-// DecodeAlterRoleRename decodes a RecordKindAlterRoleRename payload.
-func DecodeAlterRoleRename(payload []byte) (name, newName string, err error) {
-	if len(payload) < 3 {
-		return "", "", fmt.Errorf("wal: alter-role-rename payload too short (%d bytes)", len(payload))
-	}
-	if payload[0] != RecordKindAlterRoleRename {
-		return "", "", fmt.Errorf("wal: record kind %d is not alter-role-rename", payload[0])
-	}
-	off := 1
-	readStr16 := func() (string, error) {
-		if len(payload) < off+2 {
-			return "", fmt.Errorf("wal: alter-role-rename payload truncated at offset %d", off)
-		}
-		l := int(binary.LittleEndian.Uint16(payload[off : off+2]))
-		off += 2
-		if len(payload) < off+l {
-			return "", fmt.Errorf("wal: alter-role-rename string truncated (need %d bytes at %d)", l, off)
-		}
-		s := string(payload[off : off+l])
-		off += l
-		return s, nil
-	}
-	if name, err = readStr16(); err != nil {
-		return "", "", err
-	}
-	if newName, err = readStr16(); err != nil {
-		return "", "", err
-	}
-	return name, newName, nil
-}
 // Tri-state bit layout for EncodeGrantRoleMembership/DecodeGrantRoleMembership's
 // options byte: each of admin/inherit/set gets a "specified" bit (the WITH
 // clause named it — nil vs non-nil *bool) and a "value" bit (meaningful only
@@ -3214,24 +2909,6 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 		// here. Mirrors PG clog_redo's CLOG_TRUNCATE branch
 		// (postgres/src/backend/access/transam/clog.c:1131).
 		return false, nil
-	case RecordKindCreateDatabase, RecordKindDropDatabase:
-		// CREATE/DROP DATABASE records (M0054-0001) carry only a database
-		// name; goopg v0 has no per-database file namespacing, so the
-		// physical replay path has nothing to do. The recovery driver in
-		// internal/initdb/open.go scans the WAL for these records after
-		// physical replay and re-applies them to the catalog's database
-		// list.
-		return false, nil
-	case RecordKindRoleState, RecordKindDropRole, RecordKindAlterRoleRename:
-		// Role state / removal / rename records (CREATE/ALTER/DROP ROLE
-		// restart persistence) carry only the in-memory role registry state +
-		// credential; runtime role DDL never writes the pg_authid heap
-		// (initdb-only, like all on-disk shared catalogs), so the physical
-		// replay path has nothing to do. The recovery driver in
-		// internal/initdb/role_ddl_recovery.go scans the WAL for these
-		// records after physical replay and re-applies them to the catalog
-		// role registry; cmd/goopg seeds the auth UserStore from it.
-		return false, nil
 	case RecordKindColumnDefaults:
 		// Column DEFAULT snapshots (root-0020 follow-up) carry only the
 		// in-memory catalog's DefaultExpr ASTs as SQL text; no physical
@@ -3337,8 +3014,6 @@ func nativeApplyRecordKindKnown(kind byte) bool {
 		RecordKindXactCommit,
 		RecordKindXactAbort,
 		RecordKindClogTruncate,
-		RecordKindCreateDatabase,
-		RecordKindDropDatabase,
 		RecordKindCreateIndex,
 		RecordKindDropIndex,
 		RecordKindRenameIndex,
@@ -3492,6 +3167,34 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 				return false, err
 			}
 			if err := applyTblspcDrop(mgr, oid); err != nil {
+				return false, err
+			}
+			return true, nil
+		default:
+			return false, unsupportedDecodedXLogRecord(r)
+		}
+	case RmgrDbase:
+		switch xlog.Header.Info & XLRRmgrInfoMask {
+		case xlogDbaseCreateWalLog, xlogDbaseCreateFileCopy:
+			// B4.6 Stage 3: recreate base/<db_id> (idempotent). A real PG
+			// standby's dbase_redo does the same; goopg's own dirs persist
+			// across restart, so this is a defensive MkdirAll for the
+			// basebackup-restore edge. The copied relation blocks arrive as
+			// separate full-page-image records (Stage 3b).
+			dbOID, _, err := decodeXLogDbaseCreateWalLog(xlog.MainData)
+			if err != nil {
+				return false, err
+			}
+			if err := applyDbaseCreate(mgr, dbOID); err != nil {
+				return false, err
+			}
+			return true, nil
+		case xlogDbaseDrop:
+			dbOID, err := decodeXLogDbaseDrop(xlog.MainData)
+			if err != nil {
+				return false, err
+			}
+			if err := applyDbaseDrop(mgr, dbOID); err != nil {
 				return false, err
 			}
 			return true, nil
@@ -5154,6 +4857,48 @@ func applyTblspcDrop(mgr *storage.Manager, oid uint32) error {
 	dir := filepath.Join(mgr.DataDir(), "pg_tblspc", strconv.FormatUint(uint64(oid), 10))
 	if err := os.RemoveAll(dir); err != nil {
 		return fmt.Errorf("wal: tblspc-drop replay RemoveAll %q: %w", dir, err)
+	}
+	return nil
+}
+
+// decodeXLogDbaseCreateWalLog parses a PG xl_dbase_create_wal_log_rec main-data
+// body {db_id Oid, tablespace_id Oid}. B4.6 Stage 3.
+func decodeXLogDbaseCreateWalLog(mainData []byte) (dbOID, tsOID uint32, err error) {
+	if len(mainData) < 8 {
+		return 0, 0, fmt.Errorf("wal: xl_dbase_create_wal_log_rec main-data len %d (want >= 8)", len(mainData))
+	}
+	return binary.LittleEndian.Uint32(mainData[0:4]), binary.LittleEndian.Uint32(mainData[4:8]), nil
+}
+
+// decodeXLogDbaseDrop parses a PG xl_dbase_drop_rec main-data body {db_id Oid,
+// ntablespaces int32, tablespace_ids[] Oid}. Only db_id is needed for goopg's
+// single-tablespace replay. B4.6 Stage 3.
+func decodeXLogDbaseDrop(mainData []byte) (dbOID uint32, err error) {
+	if len(mainData) < 8 {
+		return 0, fmt.Errorf("wal: xl_dbase_drop_rec main-data len %d (want >= 8)", len(mainData))
+	}
+	return binary.LittleEndian.Uint32(mainData[0:4]), nil
+}
+
+// applyDbaseCreate recreates the base/<db_id> directory (idempotent). goopg's
+// per-database directories persist on disk across a restart, so this MkdirAll is
+// a defensive no-op in the common case and only materializes the directory when
+// replaying onto a basebackup that lacks it — where the subsequent copied-block
+// full-page-image records (B4.6 Stage 3b) then populate its relation files.
+// B4.6 Stage 3.
+func applyDbaseCreate(mgr *storage.Manager, dbOID uint32) error {
+	dir := filepath.Join(mgr.DataDir(), "base", strconv.FormatUint(uint64(dbOID), 10))
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("wal: dbase-create replay MkdirAll %q: %w", dir, err)
+	}
+	return nil
+}
+
+// applyDbaseDrop removes the base/<db_id> directory (idempotent). B4.6 Stage 3.
+func applyDbaseDrop(mgr *storage.Manager, dbOID uint32) error {
+	dir := filepath.Join(mgr.DataDir(), "base", strconv.FormatUint(uint64(dbOID), 10))
+	if err := os.RemoveAll(dir); err != nil {
+		return fmt.Errorf("wal: dbase-drop replay RemoveAll %q: %w", dir, err)
 	}
 	return nil
 }

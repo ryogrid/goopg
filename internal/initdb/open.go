@@ -1406,18 +1406,19 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		}
 	}
 
-	// M0054-0001: replay CREATE/DROP DATABASE WAL records into the
-	// catalog's database registry. Physical WAL replay (line ~212
-	// above) ignored these records because they don't touch on-disk
-	// storage in v0; the recovery driver applies them here, after the
-	// catalog is fully constructed, so the next connection sees an
-	// accurate `pg_database`. Order matters: a drop following a
-	// create cancels out, so we walk records in stream order.
-	if err := replayDatabaseDDLRecords(filepath.Join(abs, "pg_wal"), cat, abs); err != nil {
+	// B4.6 Stage 3 (was M0054-0001): reload the database registry from the
+	// pg_database heap (global/1262). CREATE/DROP DATABASE now journal a real
+	// pg_database heap row (Stage 1) + an RM_DBASE XLOG_DBASE_CREATE_WAL_LOG /
+	// DROP record for the physical directory (redo'd by physical replay above),
+	// so a generic heap scan through the buffer pool — the same crash-consistent
+	// path B4.1-B4.5 use — replaces the retired goopg-private
+	// replayDatabaseDDLRecords (RecordKinds 18/19). Must run before
+	// loadUserTablesFromHeap (the source of the per-DB dbOid list).
+	if err := reloadDatabasesFromHeap(mgr, cat, clog); err != nil {
 		_ = pool.Close()
 		_ = walWriter.Close()
 		_ = mgr.Close()
-		return nil, fmt.Errorf("goopg: database DDL replay: %w", err)
+		return nil, fmt.Errorf("goopg: pg_database reload: %w", err)
 	}
 
 	// M0122-0007 4e follow-up 39: load each distinct-dbOid database's user
@@ -1543,21 +1544,17 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, fmt.Errorf("goopg: view replay: %w", err)
 	}
 
-	// Role/auth restart persistence (root-0021): load the durable BASE from
-	// the pg_authid heap file (global/1260 — rewritten on every role DDL by
-	// SyncPgAuthidFile, mirroring PostgreSQL's pg_authid-as-store model),
-	// then replay any newer role WAL records ON TOP (the crash tail).
-	if err := LoadRolesFromAuthidHeap(abs, cat); err != nil {
+	// Role/auth restart persistence (B4.5, was root-0021): reload the catalog
+	// role registry from the pg_authid heap (global/1260). Roles now journal
+	// as real XLOG_HEAP_INSERT/DELETE on 1260 (redo reconstructs the page
+	// before this runs), so a generic heap scan through the buffer pool — the
+	// same crash-consistent path B4.1-B4.4 use — replaces the retired raw-file
+	// LoadRolesFromAuthidHeap + WAL-tail replayRoleDDLRecords (kinds 67/68/72).
+	if err := reloadRolesFromAuthidHeap(mgr, cat, clog); err != nil {
 		_ = pool.Close()
 		_ = walWriter.Close()
 		_ = mgr.Close()
-		return nil, fmt.Errorf("goopg: pg_authid load: %w", err)
-	}
-	if err := replayRoleDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
-		_ = pool.Close()
-		_ = walWriter.Close()
-		_ = mgr.Close()
-		return nil, fmt.Errorf("goopg: role DDL replay: %w", err)
+		return nil, fmt.Errorf("goopg: pg_authid reload: %w", err)
 	}
 
 	// M0119-0004-ACLHEAP (GRANT/REVOKE ROLE membership): replay GRANT/REVOKE

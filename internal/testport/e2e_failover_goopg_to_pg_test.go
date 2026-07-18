@@ -240,6 +240,16 @@ func runFailoverGoopgToPG(t *testing.T, repo, pgBasebackupBin, psqlBin string, m
 		"SELECT setval('public.b2prep_seq', 90)"); err != nil {
 		t.Fatalf("setval on goopg primary: %v", err)
 	}
+	// B4.6 Stage 3: CREATE DATABASE journals RM_DBASE (XLOG_DBASE_CREATE_WAL_LOG,
+	// rmid 4) + the template0 catalog-image full-page-image records (Stage 3b) +
+	// the pg_database SHARED heap row (Stage 1) — no goopg-private rmid-128
+	// record. A real PG standby must replay all of it without FATAL and end up
+	// with the new database in pg_database. Before B4.6 the bespoke kind-18
+	// record killed the standby with "resource manager with ID 128 not
+	// registered".
+	if err := runSQLSimple(t, primary, "CREATE DATABASE b2prep_db"); err != nil {
+		t.Fatalf("create database on goopg primary: %v", err)
+	}
 
 	dsn := fmt.Sprintf("host=%s port=%s user=%s dbname=%s sslmode=disable",
 		"127.0.0.1", mustGoopgPort(primary.ListenAddr()), "postgres", "postgres")
@@ -401,6 +411,17 @@ func runFailoverGoopgToPG(t *testing.T, repo, pgBasebackupBin, psqlBin string, m
 	if got := pgScalar(t, standby,
 		"SELECT * FROM public.b2prep_srf()"); got != "7" {
 		t.Fatalf("post-failover SRF call = %q, want 7", got)
+	}
+	// B4.6 Stage 3: the goopg-created database survived replication to the
+	// promoted PG. Reaching this assertion AT ALL proves the standby replayed
+	// goopg's CREATE DATABASE WAL — the RM_DBASE XLOG_DBASE_CREATE_WAL_LOG record
+	// (rmid 4) + the template0 catalog-image full-page-image records + the
+	// pg_database SHARED heap row — without FATAL; the pre-B4.6 kind-18 record
+	// would have killed replication with "resource manager with ID 128 not
+	// registered". The row count confirms the pg_database heap INSERT streamed.
+	if got := pgScalar(t, standby,
+		"SELECT count(*) FROM pg_database WHERE datname = 'b2prep_db'"); got != "1" {
+		t.Fatalf("post-failover pg_database has b2prep_db = %q, want 1", got)
 	}
 }
 

@@ -605,8 +605,27 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
     B4.1a + heap-only (6114/6115 not materialized) + B3.2 text[]. Executor-layer emit; DROP captures the
     OID before the registry drop. Reload `reloadSubscriptionsFromHeap`. Gate: `SubscriptionSurvivesRestart`
     + executor/server suites. Lowest-risk remaining B4 (non-boot-critical; only cost is column width).
-    - Remaining B4 (both boot-critical/large): **pg_authid + role-state** (67/68/72, retire SyncPgAuthidFile)
-      and **pg_database** (18/19, needs RM_DBASE + template file-copy streaming).
+  - [x] **B4.5 pg_authid + role-state (kinds 67/68/72 retired) — BOOT-CRITICAL AUTH** — LANDED.
+    CREATE/ALTER/DROP/RENAME ROLE journal a real pg_authid SHARED heap row (global/1260) via
+    XLOG_HEAP_INSERT/DELETE + 2676/2677 index maintenance, retiring the whole-file byte-writer
+    `SyncPgAuthidFile` + its `RecordKindRoleState(67)/DropRole(68)/AlterRoleRename(72)` crash-tail and the
+    raw-file reader `ReadPgAuthidRows`/`LoadRolesFromAuthidHeap`. New writer `SyncAuthidRow`/`DeleteAuthidRow`
+    (sys_pg_authid.go) follows B4.1's shared-catalog-with-maintained-indexes shape (2697/2698 → 2676/2677);
+    RENAME rides the per-oid re-sync (stamp old row + write under new rolname). Server-layer CREATE/ALTER/
+    RENAME drive it from an own transaction (`runAuthidHeapTxn`, B4.2 precedent); executor-layer DROP rides
+    the session ctx (captures oid before UnregisterRole). Reload `reloadRolesFromAuthidHeap` via
+    `scanCatalogHeapRows` (buffer-pool + CLOG visibility — immune to the file-flush-timing crash risk a raw
+    read would have) replaces both retired readers + the WAL-tail scanner (role_ddl_recovery.go deleted).
+    The bootstrap superuser (OID 10) + 16 predefined pg_* roles stay in the initdb base page (never
+    re-synced). Guard: the pre-existing over-the-wire `TestPort_CreateRoleSurvivesRestart` (CREATE+SCRAM
+    auth reconnect, NOLOGIN attrs, DROP, ALTER PASSWORD rotation with old-password-must-fail, RENAME — all
+    across restart). Gate: guard + all `*SurvivesRestart` + wal/initdb/executor/server suites + units + smoke.
+    Net-negative (retires a ~150-line whole-file writer + a WAL-tail scanner). No genuine fidelity fork
+    (faithful per-row heap is the only standby-replayable approach); risk was pure execution, guarded by the
+    login e2e written/verified first.
+    - Remaining B4 (boot-critical/large): **pg_database** (18/19, needs an RM_DBASE-style physical record +
+      template file-copy streaming to a standby — like B4.1's RM_TBLSPC but bigger). After it, B4 is complete
+      and B5 (retire RmgrGoopgCatalog=128) unblocks.
 - [ ] **B5** Retire `RmgrGoopgCatalog=128` (now unused) — header-side parity complete.
 - [ ] **B-gate**: per-catalog full regress + `internal/testport` isolation; `psql \d`/`\df`/`\dn` +
   `information_schema` parity vs PG 18.3; crash-after-DDL recovery via generic reload; re-init data dir.
