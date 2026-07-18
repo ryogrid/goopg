@@ -112,6 +112,15 @@ func keyMetaForSysBtree(indexOID uint32) (btreeIndexKeyMeta, bool) {
 		return btreeIndexKeyMeta{tupleSize: 16, nkeyatts: 1}, true
 	case pgOperatorOprnameLRNIndexOID:
 		return btreeIndexKeyMeta{tupleSize: 88, nkeyatts: 4}, true
+	// B3.6: pg_ts_config (3712 oid / 3608 cfgname+cfgnamespace {80,2}) +
+	// pg_ts_config_map (3609 mapcfg+maptokentype+mapseqno oid+int4+int4
+	// {24,3}). All empty placeholders → lazy-root.
+	case pgTSConfigOidIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 16, nkeyatts: 1}, true
+	case pgTSConfigNameNspIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 80, nkeyatts: 2}, true
+	case pgTSConfigMapIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 24, nkeyatts: 3}, true
 	// B3.5: pg_ts_dict — 3604 (dictname+dictnamespace name+oid {80,2}) + 3605
 	// (oid); both empty placeholders → lazy-root.
 	case pgTSDictOidIndexOID:

@@ -97,6 +97,10 @@ CREATE TEXT SEARCH DICTIONARY waldump_dict (TEMPLATE = pg_catalog.simple, STOPWO
 ALTER TEXT SEARCH DICTIONARY waldump_dict RENAME TO waldump_dict2;
 ALTER TEXT SEARCH DICTIONARY waldump_dict2 SET SCHEMA waldump_s1x;
 DROP TEXT SEARCH DICTIONARY waldump_s1x.waldump_dict2;
+CREATE TEXT SEARCH CONFIGURATION waldump_cfg (PARSER = pg_catalog.default);
+ALTER TEXT SEARCH CONFIGURATION waldump_cfg ADD MAPPING FOR asciiword WITH simple;
+ALTER TEXT SEARCH CONFIGURATION waldump_cfg RENAME TO waldump_cfg2;
+DROP TEXT SEARCH CONFIGURATION waldump_cfg2;
 CREATE COLLATION waldump_coll (locale = 'C');
 ALTER COLLATION waldump_coll RENAME TO waldump_coll2;
 DROP COLLATION waldump_coll2;

@@ -15418,16 +15418,22 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 					}
 				}
 				if objType == "text search configuration" {
-					// Drop the dump-visible pg_ts_config registry entry (and its
-					// pg_ts_config_map rows, held inline on the same struct) too
-					// so a dropped configuration stops round-tripping through
-					// pg_dump (DU-002 slice 446). WAL-emit the drop so it
-					// survives a restart, mirroring DROP TEXT SEARCH DICTIONARY
-					// above.
-					if im.DropTSConfig(s.Names[0].Name, s.Names[0].Schema) && o.ctx.WAL != nil {
-						if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropTSConfig(s.Names[0].Name, s.Names[0].Schema)); werr != nil {
-							return fmt.Errorf("wal drop-tsconfig: %w", werr)
+					// B3.6: capture the OID before the registry drop, then
+					// stamp xmax on the pg_ts_config base row + all its
+					// pg_ts_config_map rows (kind 108 retired). Return on a
+					// successful drop rather than falling through to the
+					// current-name-keyed DropCompatObject gate (the B3.5
+					// rename-then-drop fix, applied here too).
+					var cfgOID uint32
+					if cfg := im.FindTSConfig(s.Names[0].Name, s.Names[0].Schema); cfg != nil {
+						cfgOID = cfg.OID
+					}
+					if im.DropTSConfig(s.Names[0].Name, s.Names[0].Schema) {
+						if cfgOID != 0 {
+							deleteTSConfigCatalogRows(o.ctx, cfgOID)
 						}
+						im.DropCompatObject(objType, s.Names[0].String())
+						return nil
 					}
 				}
 				if im.DropCompatObject(objType, s.Names[0].String()) {
@@ -16643,17 +16649,10 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		if _, err := im.CreateTSConfig(uc, schema); err != nil {
 			return &ExecError{Code: "42710", Message: err.Error()}
 		}
-		// DU-002 restart-persistence follow-up (M0119-0004): record a WAL
-		// event the recovery driver
-		// (internal/initdb/tsconfig_ddl_recovery.go) replays into the
-		// configuration registry on the next startup, mirroring CREATE TEXT
-		// SEARCH DICTIONARY. ADD MAPPING statements record their own
-		// follow-up WAL event (execAlterTSConfigAddMapping below).
-		if o.ctx.WAL != nil {
-			if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateTSConfig(uc.Name, schema, uc.OID, uc.Owner, uc.Parser)); werr != nil {
-				return fmt.Errorf("wal create-tsconfig: %w", werr)
-			}
-		}
+		// B3.6 (doc 02d §2): the configuration journals as a real
+		// pg_ts_config heap row + its pg_ts_config_map rows after the copy
+		// loop below has populated any FROM-source mappings (kinds 106/107
+		// retired); the single upsert at the end writes both.
 		if copySource != nil {
 			// Copy the source configuration's token-type→dictionary mappings,
 			// mirroring DefineTSConfiguration's post-insert pg_ts_config_map
@@ -16665,11 +16664,13 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 				if uc2, dup := im.AddTSConfigMapping(uc.Name, schema, m.TokenType, m.DictOIDs); uc2 == nil || dup {
 					return fmt.Errorf("internal error: copying tsconfig mapping %q for new configuration %q", m.TokenType, uc.Name)
 				}
-				if o.ctx.WAL != nil {
-					if _, _, werr := o.ctx.WAL.Append(wal.EncodeAddTSConfigMapping(uc.Name, schema, m.TokenType, m.DictOIDs)); werr != nil {
-						return fmt.Errorf("wal add-tsconfig-mapping (copy): %w", werr)
-					}
-				}
+			}
+		}
+		// B3.6: write the base row + all config_map rows from the config's
+		// final mapping set.
+		if cfg := im.FindTSConfig(uc.Name, schema); cfg != nil {
+			if err := upsertTSConfigCatalogRow(o.ctx, cfg); err != nil {
+				return fmt.Errorf("pg_ts_config journal: %w", err)
 			}
 		}
 	case "transform":
@@ -16741,10 +16742,10 @@ func (o *ddlOp) execAlterTSConfig(s *parser.AlterTSConfigStmt) error {
 		if err := im.RenameTSConfig(s.ConfigName.Name, schema, s.NewName); err != nil {
 			return &ExecError{Code: "42704", Message: err.Error()}
 		}
-		if o.ctx.WAL != nil {
-			if _, _, werr := o.ctx.WAL.Append(wal.EncodeRenameTSConfig(s.ConfigName.Name, schema, s.NewName)); werr != nil {
-				return fmt.Errorf("wal rename-tsconfig: %w", werr)
-			}
+		// B3.6: the rename is a canonical pg_ts_config base-row heap UPDATE
+		// (kind 110 retired).
+		if cfg := im.FindTSConfig(s.NewName, schema); cfg != nil {
+			_ = upsertTSConfigCatalogRow(o.ctx, cfg)
 		}
 		return nil
 	case "setschema":
@@ -16755,10 +16756,10 @@ func (o *ddlOp) execAlterTSConfig(s *parser.AlterTSConfigStmt) error {
 		if !im.SetTSConfigSchema(s.ConfigName.Name, schema, newSchema) {
 			return &ExecError{Code: "42704", Message: fmt.Sprintf("text search configuration %q does not exist", s.ConfigName.Name)}
 		}
-		if o.ctx.WAL != nil {
-			if _, _, werr := o.ctx.WAL.Append(wal.EncodeSetTSConfigSchema(s.ConfigName.Name, schema, newSchema)); werr != nil {
-				return fmt.Errorf("wal set-tsconfig-schema: %w", werr)
-			}
+		// B3.6: SET SCHEMA is a canonical pg_ts_config base-row heap UPDATE
+		// (kind 111 retired).
+		if cfg := im.FindTSConfig(s.ConfigName.Name, newSchema); cfg != nil {
+			_ = upsertTSConfigCatalogRow(o.ctx, cfg)
 		}
 		return nil
 	}
@@ -16801,14 +16802,12 @@ func (o *ddlOp) execAlterTSConfigAddMapping(im *catalog.InMemory, s *parser.Alte
 				Detail:  fmt.Sprintf("Key (mapcfg, maptokentype, mapseqno)=(%d, %d, 1) already exists.", uc.OID, tokID),
 			}
 		}
-		// DU-002 restart-persistence follow-up (M0119-0004): record a WAL
-		// event per token type so the mapping survives a restart, replayed
-		// by internal/initdb/tsconfig_ddl_recovery.go after the
-		// configuration's own CREATE record.
-		if o.ctx.WAL != nil {
-			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAddTSConfigMapping(s.ConfigName.Name, schema, tt, dictOIDs)); werr != nil {
-				return fmt.Errorf("wal add-tsconfig-mapping: %w", werr)
-			}
+	}
+	// B3.6: re-sync the config's pg_ts_config_map rows from its final
+	// mapping set (kind 107 retired).
+	if cfg := im.FindTSConfig(s.ConfigName.Name, schema); cfg != nil {
+		if err := upsertTSConfigCatalogRow(o.ctx, cfg); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -16859,14 +16858,9 @@ func (o *ddlOp) execAlterTSConfigReplaceDict(im *catalog.InMemory, s *parser.Alt
 	if uc == nil {
 		return &ExecError{Code: "42704", Message: fmt.Sprintf("text search configuration %q does not exist", s.ConfigName.Name)}
 	}
-	// DU-002 replacedict follow-up (M0119-0004): record a WAL event so the
-	// substitution survives a restart, replayed by
-	// internal/initdb/tsconfig_ddl_recovery.go after the configuration's
-	// own CREATE record.
-	if o.ctx.WAL != nil {
-		if _, _, werr := o.ctx.WAL.Append(wal.EncodeReplaceTSConfigMappingDict(s.ConfigName.Name, schema, s.TokenTypes, oldOID, newOID)); werr != nil {
-			return fmt.Errorf("wal replace-tsconfig-mapping-dict: %w", werr)
-		}
+	// B3.6: re-sync the config's config_map rows (kind 112 retired).
+	if err := upsertTSConfigCatalogRow(o.ctx, uc); err != nil {
+		return err
 	}
 	return nil
 }
@@ -16893,14 +16887,11 @@ func (o *ddlOp) execAlterTSConfigAlterMapping(im *catalog.InMemory, s *parser.Al
 		if uc == nil {
 			return &ExecError{Code: "42704", Message: fmt.Sprintf("text search configuration %q does not exist", s.ConfigName.Name)}
 		}
-		// DU-002 restart-persistence follow-up (M0119-0004): record a WAL
-		// event per token type so the override survives a restart, replayed
-		// by internal/initdb/tsconfig_ddl_recovery.go after the
-		// configuration's own CREATE record.
-		if o.ctx.WAL != nil {
-			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterTSConfigMapping(s.ConfigName.Name, schema, tt, dictOIDs)); werr != nil {
-				return fmt.Errorf("wal alter-tsconfig-mapping: %w", werr)
-			}
+	}
+	// B3.6: re-sync the config's config_map rows (kind 113 retired).
+	if cfg := im.FindTSConfig(s.ConfigName.Name, schema); cfg != nil {
+		if err := upsertTSConfigCatalogRow(o.ctx, cfg); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -16925,14 +16916,11 @@ func (o *ddlOp) execAlterTSConfigDropMapping(im *catalog.InMemory, s *parser.Alt
 			}
 			return &ExecError{Code: "42704", Message: fmt.Sprintf("mapping for token type %q does not exist", tt)}
 		}
-		// DU-002 restart-persistence follow-up (M0119-0004): record a WAL
-		// event per token type so the removal survives a restart, replayed
-		// by internal/initdb/tsconfig_ddl_recovery.go after the
-		// configuration's own CREATE record.
-		if o.ctx.WAL != nil {
-			if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropTSConfigMapping(s.ConfigName.Name, schema, tt)); werr != nil {
-				return fmt.Errorf("wal drop-tsconfig-mapping: %w", werr)
-			}
+	}
+	// B3.6: re-sync the config's config_map rows (kind 109 retired).
+	if cfg := im.FindTSConfig(s.ConfigName.Name, schema); cfg != nil {
+		if err := upsertTSConfigCatalogRow(o.ctx, cfg); err != nil {
+			return err
 		}
 	}
 	return nil

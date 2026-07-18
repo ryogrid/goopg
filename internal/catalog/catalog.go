@@ -2379,6 +2379,9 @@ type InMemory struct {
 	// tsDictHeapTIDs is the pg_ts_dict twin (B3.5) — ALTER RENAME/SET SCHEMA/
 	// ALTER OPTIONS journal canonical heap UPDATEs at the cached TID.
 	tsDictHeapTIDs map[uint32]SchemaHeapTID
+	// tsConfigHeapTIDs is the pg_ts_config twin (B3.6) — ALTER RENAME/SET
+	// SCHEMA journal canonical heap UPDATEs of the base row at the cached TID.
+	tsConfigHeapTIDs map[uint32]SchemaHeapTID
 
 	// tempNamespaces maps a session's temp-owner token ("s<id>", see
 	// executor.sessionTempOwner) → the OID of that session's temporary
@@ -3336,6 +3339,29 @@ type TSTokenType struct {
 // DefaultParserTokenTypes is the fixed 23-row token-type table for the
 // built-in "default" parser (BuiltinTSParserOID["default"] = 3722). Verified
 // byte-for-byte against `SELECT * FROM ts_token_type(3722)` on real PG 18.3.
+// TSTokenTypeID returns the maptokentype int for a token-type alias, or
+// (0,false) if unknown. B3.6: pg_ts_config_map.maptokentype is the numeric
+// token type; UserTSConfig stores the alias.
+func TSTokenTypeID(alias string) (int, bool) {
+	for _, tt := range DefaultParserTokenTypes {
+		if strings.EqualFold(tt.Alias, alias) {
+			return tt.TokID, true
+		}
+	}
+	return 0, false
+}
+
+// TSTokenTypeAlias reverses TSTokenTypeID (maptokentype int → alias) for the
+// pg_ts_config_map reload. "" if unknown.
+func TSTokenTypeAlias(tokID int) string {
+	for _, tt := range DefaultParserTokenTypes {
+		if tt.TokID == tokID {
+			return tt.Alias
+		}
+	}
+	return ""
+}
+
 var DefaultParserTokenTypes = []TSTokenType{
 	{1, "asciiword", "Word, all ASCII"},
 	{2, "word", "Word, all letters"},
@@ -12378,6 +12404,31 @@ func (c *InMemory) DropTSDictHeapTID(oid uint32) {
 	delete(c.tsDictHeapTIDs, oid)
 }
 
+// TSConfigHeapTID returns the live pg_ts_config base-row heap TID (B3.6).
+func (c *InMemory) TSConfigHeapTID(oid uint32) (SchemaHeapTID, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	tid, ok := c.tsConfigHeapTIDs[oid]
+	return tid, ok
+}
+
+// SetTSConfigHeapTID records/refreshes the live pg_ts_config base-row TID.
+func (c *InMemory) SetTSConfigHeapTID(oid uint32, tid SchemaHeapTID) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.tsConfigHeapTIDs == nil {
+		c.tsConfigHeapTIDs = make(map[uint32]SchemaHeapTID)
+	}
+	c.tsConfigHeapTIDs[oid] = tid
+}
+
+// DropTSConfigHeapTID drops the TID entry (DROP TEXT SEARCH CONFIGURATION).
+func (c *InMemory) DropTSConfigHeapTID(oid uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.tsConfigHeapTIDs, oid)
+}
+
 // SetSchemaHeapTID records/refreshes the live pg_namespace heap TID for name.
 func (c *InMemory) SetSchemaHeapTID(name string, tid SchemaHeapTID) {
 	c.mu.Lock()
@@ -13662,6 +13713,24 @@ func (c *InMemory) CreateTSConfig(uc *UserTSConfig, schema string) (uint32, erro
 // given bare name in the given schema from the registry. Returns true if one
 // was found and removed. `schema` resolves like CreateTSConfig (unknown →
 // public). DU-002 slice 446.
+// FindTSConfig returns the user TS configuration matching (schema, name), or
+// nil. B3.6: the emit sites journal the config's CURRENT state after a
+// registry mutation (base row + config_map rows re-derived from Mappings).
+func (c *InMemory) FindTSConfig(name, schema string) *UserTSConfig {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	for _, uc := range c.userTSConfigs {
+		if uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, name) {
+			return uc
+		}
+	}
+	return nil
+}
+
 func (c *InMemory) DropTSConfig(name, schema string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()

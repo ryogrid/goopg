@@ -466,6 +466,24 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
     TestPort_EnumSurvivesRestart (create/add/rename/drop across restart); waldump += enum DDL.
 - [ ] **B3** extension/config (pg_ts_*, pg_transform, pg_event_trigger, pg_publication*/subscription*,
   pg_statistic_ext, pg_constraint/attrdef/depend). **IN PROGRESS.**
+  - [x] **B3.6 pg_ts_config + pg_ts_config_map (kinds 106-113 retired) — TS group COMPLETE** —
+    LANDED. `sys_pg_ts_config.go`: 5-col FormData_pg_ts_config base builder (cfgparser already an
+    OID) with a TID cache (tsConfigHeapTIDs, for ALTER RENAME/SET SCHEMA base-row UPDATEs) + 4-col
+    FormData_pg_ts_config_map (no oid; mapcfg=config OID, maptokentype=numeric token type via new
+    catalog.TSTokenTypeID, mapseqno=dict index in the token's run, mapdict=pg_ts_dict OID). goopg
+    stores mappings inline on UserTSConfig, so EVERY mutation (CREATE + copy-loop, ADD/DROP/REPLACE/
+    ALTER MAPPING) re-syncs the whole config_map row-set via syncTSConfigMapRows (stamp all rows for
+    mapcfg, rewrite from Mappings) — one uniform path replacing 8 bespoke record kinds. Indexes 3712
+    (oid) + 3608 (cfgname+cfgnamespace {80,2}) + 3609 (mapcfg+maptokentype+mapseqno oid+int4+int4
+    {24,3}, new buildIndexTupleOidInt4Int4Key/cmpKeyOidInt4Int4) empty placeholders → lazy-root.
+    Reload: 2-pass (config_map grouped mapcfg→tokType→seqno→dictOID, token int→alias via
+    TSTokenTypeAlias; then base rows → assemble UserTSConfig w/ inline Mappings →
+    CreateTSConfigDuringRecovery); runs after the pg_ts_dict reload. DROP config returns on
+    successful registry drop (the B3.5 rename-then-drop compat-gate fix, applied here). Scanner
+    tsconfig_ddl_recovery.go + the (now config-only) combined test files deleted. TestPort_TSConfig
+    SurvivesRestart green (add-mapping + rename + set schema + config_map round-trip); waldump +=
+    CREATE/ADD MAPPING/RENAME/DROP TS CONFIGURATION. **With B3.5+B3.6, the entire text-search catalog
+    group (pg_ts_dict/config/config_map, kinds 104-116) is heap-journaled.**
   - [x] **B3.5 pg_ts_dict (kinds 104/105/114/115/116 retired)** — LANDED. `sys_pg_ts_dict.go`:
     6-col FormData_pg_ts_dict builder (all direct — dicttemplate already an OID in UserTSDict,
     dictinitoption the serialized options text, NULL when empty) + TID cache (tsDictHeapTIDs, for
