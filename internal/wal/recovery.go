@@ -495,28 +495,6 @@ const (
 	//   exprLen(2)+exprSQL)
 	RecordKindColumnDefaults byte = 69
 
-	// RecordKindCreateAccessMethod records a `CREATE ACCESS METHOD name TYPE
-	// {INDEX|TABLE} HANDLER handler_name` event so it survives a restart.
-	// goopg has no per-access-method on-disk file namespace (catalog.InMemory's
-	// accessMethods map is a pure in-memory registry, like eventTriggers), so
-	// the physical redo path is a no-op; the recovery driver in
-	// internal/initdb/access_method_ddl_recovery.go scans the WAL for these
-	// records after physical replay and re-registers each access method with
-	// its original OID. Mirrors RecordKindCreateEventTrigger. DU-002
-	// restart-persistence follow-up (M0119-0004, DU-002 slice 426 ledger
-	// resume point).
-	// Format:
-	//   kind(1) | oid(4) | handlerOID(4) | amType(1: 'i' or 't') |
-	//   nameLen(2) | name(nameLen bytes)
-	RecordKindCreateAccessMethod byte = 70
-
-	// RecordKindDropAccessMethod records a `DROP ACCESS METHOD name` event.
-	// Counterpart to RecordKindCreateAccessMethod; same no-op physical redo
-	// path. Mirrors RecordKindDropEventTrigger.
-	// Format:
-	//   kind(1) | nameLen(2) | name(nameLen bytes)
-	RecordKindDropAccessMethod byte = 71
-
 	// RecordKindAlterRoleRename records an `ALTER ROLE/USER <name> RENAME TO
 	// <newname>` event so the rename survives a restart. Like
 	// RecordKindRoleState, runtime role DDL never writes the pg_authid heap
@@ -1502,78 +1480,6 @@ func DecodeView(payload []byte) (ViewPayload, error) {
 	}
 	p.Query = string(payload[7 : 7+qLen])
 	return p, nil
-}
-
-// EncodeCreateAccessMethod encodes a CREATE ACCESS METHOD event (DU-002
-// restart-persistence follow-up to M0119-0004, DU-002 slice 426 ledger
-// resume point). The OID is carried so recovery re-registers the access
-// method identically to the live server. Format documented at the
-// RecordKindCreateAccessMethod constant.
-func EncodeCreateAccessMethod(name, amType string, oid, handlerOID uint32) []byte {
-	if len(name) > 0xFFFF {
-		name = name[:0xFFFF]
-	}
-	amByte := byte('i')
-	if len(amType) > 0 {
-		amByte = amType[0]
-	}
-	out := make([]byte, 12+len(name))
-	out[0] = RecordKindCreateAccessMethod
-	binary.LittleEndian.PutUint32(out[1:5], oid)
-	binary.LittleEndian.PutUint32(out[5:9], handlerOID)
-	out[9] = amByte
-	binary.LittleEndian.PutUint16(out[10:12], uint16(len(name)))
-	copy(out[12:], name)
-	return out
-}
-
-// DecodeCreateAccessMethod decodes a RecordKindCreateAccessMethod payload.
-func DecodeCreateAccessMethod(payload []byte) (name, amType string, oid, handlerOID uint32, err error) {
-	if len(payload) < 12 {
-		return "", "", 0, 0, fmt.Errorf("wal: create-access-method payload too short (%d bytes)", len(payload))
-	}
-	if payload[0] != RecordKindCreateAccessMethod {
-		return "", "", 0, 0, fmt.Errorf("wal: record kind %d is not create-access-method", payload[0])
-	}
-	oid = binary.LittleEndian.Uint32(payload[1:5])
-	handlerOID = binary.LittleEndian.Uint32(payload[5:9])
-	amType = string(payload[9:10])
-	nameLen := int(binary.LittleEndian.Uint16(payload[10:12]))
-	if len(payload) < 12+nameLen {
-		return "", "", 0, 0, fmt.Errorf("wal: create-access-method payload truncated (need %d bytes)", 12+nameLen)
-	}
-	name = string(payload[12 : 12+nameLen])
-	return name, amType, oid, handlerOID, nil
-}
-
-// EncodeDropAccessMethod encodes a DROP ACCESS METHOD event (DU-002
-// restart-persistence follow-up to M0119-0004, DU-002 slice 426 ledger
-// resume point). Format documented at the RecordKindDropAccessMethod
-// constant.
-func EncodeDropAccessMethod(name string) []byte {
-	if len(name) > 0xFFFF {
-		name = name[:0xFFFF]
-	}
-	out := make([]byte, 3+len(name))
-	out[0] = RecordKindDropAccessMethod
-	binary.LittleEndian.PutUint16(out[1:3], uint16(len(name)))
-	copy(out[3:], name)
-	return out
-}
-
-// DecodeDropAccessMethod decodes a RecordKindDropAccessMethod payload.
-func DecodeDropAccessMethod(payload []byte) (name string, err error) {
-	if len(payload) < 3 {
-		return "", fmt.Errorf("wal: drop-access-method payload too short (%d bytes)", len(payload))
-	}
-	if payload[0] != RecordKindDropAccessMethod {
-		return "", fmt.Errorf("wal: record kind %d is not drop-access-method", payload[0])
-	}
-	nameLen := int(binary.LittleEndian.Uint16(payload[1:3]))
-	if len(payload) < 3+nameLen {
-		return "", fmt.Errorf("wal: drop-access-method payload truncated (need %d bytes)", 3+nameLen)
-	}
-	return string(payload[3 : 3+nameLen]), nil
 }
 
 // EncodeCreateTablespace encodes a CREATE TABLESPACE event (M0122-0007
@@ -4086,16 +3992,6 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 		// internal/initdb/pubsub_ddl_recovery.go scans the WAL for these
 		// records after physical replay and re-applies them to the PubSub
 		// registry.
-		return false, nil
-	case RecordKindCreateAccessMethod, RecordKindDropAccessMethod:
-		// CREATE/DROP ACCESS METHOD records (DU-002 restart-persistence
-		// follow-up, M0119-0004 DU-002 slice 426 ledger resume point) carry
-		// only catalog.InMemory's accessMethods registry metadata; goopg has
-		// no per-access-method file namespace (no pluggable storage engine),
-		// so the physical replay path has nothing to do. The recovery driver
-		// in internal/initdb/access_method_ddl_recovery.go scans the WAL for
-		// these records after physical replay and re-applies them to the
-		// access method registry.
 		return false, nil
 	case RecordKindGrantRoleMembership, RecordKindRevokeRoleMembership:
 		// GRANT/REVOKE ROLE membership (M0119-0004-ACLHEAP) records carry

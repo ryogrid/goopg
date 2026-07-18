@@ -466,6 +466,17 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
     TestPort_EnumSurvivesRestart (create/add/rename/drop across restart); waldump += enum DDL.
 - [ ] **B3** extension/config (pg_ts_*, pg_transform, pg_event_trigger, pg_publication*/subscription*,
   pg_statistic_ext, pg_constraint/attrdef/depend). **IN PROGRESS.**
+  - [x] **B3.7 pg_am (kinds 70/71 retired)** — LANDED. `sys_pg_am.go`: 4-col FormData_pg_am builder
+    (oid, amname, amhandler already an OID, amtype 'i'/'t' char). NARROW SURFACE like B1.3b's
+    pg_depend writer — NO index maintenance: goopg bootstraps neither pg_am_oid_index (2652) nor
+    pg_am_name_index (2651) (they are ABSENT, not empty placeholders), so a runtime index insert
+    has nowhere to land; the reload seq-scans the pg_am heap (oid >= FirstUserOID). CREATE writes
+    the row (xmax-stamp-then-insert; no OR REPLACE form); DROP xmax's it via FindAccessMethod-
+    captured OID. Scanner access_method_ddl_recovery.go(+test) + wal/access_method_ddl_test.go
+    deleted; kinds 70/71 + 4 codecs + dispatch excised. TestPort_AccessMethodSurvivesRestart green
+    (CREATE + DROP); waldump += CREATE/DROP ACCESS METHOD. RESIDUAL (ledger): adding the two pg_am
+    indexes populated with the 7 built-in AM rows (the B2.1a 2704 pattern) is a separate
+    standby-completeness task — goopg never had them, so this slice does not regress the standby.
   - [x] **B3.6 pg_ts_config + pg_ts_config_map (kinds 106-113 retired) — TS group COMPLETE** —
     LANDED. `sys_pg_ts_config.go`: 5-col FormData_pg_ts_config base builder (cfgparser already an
     OID) with a TID cache (tsConfigHeapTIDs, for ALTER RENAME/SET SCHEMA base-row UPDATEs) + 4-col

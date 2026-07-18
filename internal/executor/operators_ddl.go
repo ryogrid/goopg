@@ -1325,12 +1325,10 @@ func (o *ddlOp) execCreateAccessMethod(s *parser.CreateAccessMethodStmt) error {
 	if err != nil {
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 	}
-	// DU-002 restart-persistence follow-up (M0119-0004, DU-002 slice 426
-	// ledger resume point): mirrors CREATE EVENT TRIGGER.
-	if o.ctx.WAL != nil {
-		if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateAccessMethod(am.Name, am.AMType, am.OID, am.HandlerOID)); werr != nil {
-			return fmt.Errorf("wal create-access-method: %w", werr)
-		}
+	// B3.7 (doc 02d §3b): the access method journals as a real pg_am heap
+	// row (kind 70 retired); the startup reload seq-scans pg_am.
+	if err := writeAccessMethodCatalogRow(o.ctx, am); err != nil {
+		return fmt.Errorf("pg_am journal: %w", err)
 	}
 	return nil
 }
@@ -15493,14 +15491,15 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 			// through pg_dump.
 			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
 				name := s.Names[0].String()
+				// B3.7: capture the OID before the registry drop, then stamp
+				// xmax on the pg_am heap row (kind 71 retired).
+				var amOID uint32
+				if am := im.FindAccessMethod(name, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); am != nil {
+					amOID = am.OID
+				}
 				if im.DropAccessMethod(name, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
-					// DU-002 restart-persistence follow-up (M0119-0004,
-					// DU-002 slice 426 ledger resume point): mirrors DROP
-					// EVENT TRIGGER.
-					if o.ctx.WAL != nil {
-						if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropAccessMethod(name)); werr != nil {
-							return fmt.Errorf("wal drop-access-method: %w", werr)
-						}
+					if amOID != 0 {
+						deleteAccessMethodCatalogRow(o.ctx, amOID)
 					}
 					return nil
 				}
