@@ -57,6 +57,7 @@ func TestPort_WALPgWaldumpCompat(t *testing.T) {
 	workload := `
 CREATE TABLE wal_test (id serial primary key, val text);
 CREATE SCHEMA waldump_s1;
+CREATE SCHEMA waldump_s1x;
 ALTER SCHEMA waldump_s1 RENAME TO waldump_s2;
 CREATE FUNCTION waldump_add(a int, b int) RETURNS int LANGUAGE sql AS 'SELECT a + b';
 CREATE SEQUENCE waldump_seq INCREMENT 3;
@@ -92,6 +93,10 @@ DROP PUBLICATION waldump_puball;
 CREATE FOREIGN DATA WRAPPER waldump_fdw;
 CREATE SERVER waldump_srv FOREIGN DATA WRAPPER waldump_fdw;
 DROP SERVER waldump_srv;
+CREATE TEXT SEARCH DICTIONARY waldump_dict (TEMPLATE = pg_catalog.simple, STOPWORDS = english);
+ALTER TEXT SEARCH DICTIONARY waldump_dict RENAME TO waldump_dict2;
+ALTER TEXT SEARCH DICTIONARY waldump_dict2 SET SCHEMA waldump_s1x;
+DROP TEXT SEARCH DICTIONARY waldump_s1x.waldump_dict2;
 CREATE COLLATION waldump_coll (locale = 'C');
 ALTER COLLATION waldump_coll RENAME TO waldump_coll2;
 DROP COLLATION waldump_coll2;

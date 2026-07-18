@@ -15397,14 +15397,24 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 					}
 				}
 				if objType == "text search dictionary" {
-					// Drop the dump-visible pg_ts_dict registry entry too so a
-					// dropped dictionary stops round-tripping through pg_dump
-					// (DU-002 slice 437). WAL-emit the drop so it survives a
-					// restart, mirroring DROP CONVERSION above.
-					if im.DropTSDict(s.Names[0].Name, s.Names[0].Schema) && o.ctx.WAL != nil {
-						if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropTSDict(s.Names[0].Name, s.Names[0].Schema)); werr != nil {
-							return fmt.Errorf("wal drop-tsdict: %w", werr)
+					// B3.5: capture the OID before the registry drop, then
+					// stamp xmax on the pg_ts_dict heap row (kind 105 retired).
+					var dictOID uint32
+					if ud := im.FindTSDict(s.Names[0].Name, s.Names[0].Schema); ud != nil {
+						dictOID = ud.OID
+					}
+					if im.DropTSDict(s.Names[0].Name, s.Names[0].Schema) {
+						// Return on a successful registry drop rather than
+						// falling through to the DropCompatObject gate below,
+						// which is keyed by the CURRENT name — a renamed
+						// dictionary's compat entry is stale, so rename-then-
+						// drop otherwise failed 42704 (pre-existing gap,
+						// surfaced by the B3.5 waldump workload).
+						if dictOID != 0 {
+							deleteTSDictCatalogRow(o.ctx, dictOID)
 						}
+						im.DropCompatObject(objType, s.Names[0].String())
+						return nil
 					}
 				}
 				if objType == "text search configuration" {
@@ -16576,14 +16586,10 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		if _, err := im.CreateTSDict(ud, schema); err != nil {
 			return &ExecError{Code: "42710", Message: err.Error()}
 		}
-		// DU-002 restart-persistence follow-up (M0119-0004): record a WAL
-		// event the recovery driver (internal/initdb/tsdict_ddl_recovery.go)
-		// replays into the dictionary registry on the next startup. Mirrors
-		// CREATE CONVERSION/CAST/TRANSFORM.
-		if o.ctx.WAL != nil {
-			if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateTSDict(ud.Name, schema, ud.InitOption, ud.OID, ud.Owner, ud.Template)); werr != nil {
-				return fmt.Errorf("wal create-tsdict: %w", werr)
-			}
+		// B3.5 (doc 02d §2): the dictionary journals as a real pg_ts_dict
+		// heap row + 3604/3605 entries (kind 104 retired).
+		if err := upsertTSDictCatalogRow(o.ctx, ud); err != nil {
+			return fmt.Errorf("pg_ts_dict journal: %w", err)
 		}
 	case "text search configuration":
 		// Register the configuration (CREATE TEXT SEARCH CONFIGURATION name
@@ -16950,10 +16956,10 @@ func (o *ddlOp) execAlterTSDict(s *parser.AlterTSDictStmt) error {
 		if err := im.RenameTSDict(s.DictName.Name, schema, s.NewName); err != nil {
 			return &ExecError{Code: "42704", Message: err.Error()}
 		}
-		if o.ctx.WAL != nil {
-			if _, _, werr := o.ctx.WAL.Append(wal.EncodeRenameTSDict(s.DictName.Name, schema, s.NewName)); werr != nil {
-				return fmt.Errorf("wal rename-tsdict: %w", werr)
-			}
+		// B3.5: the rename is a canonical pg_ts_dict heap UPDATE (kind 114
+		// retired) — dictname changed, so the row moves under the new key.
+		if ud := im.FindTSDict(s.NewName, schema); ud != nil {
+			_ = upsertTSDictCatalogRow(o.ctx, ud)
 		}
 		return nil
 	case "setschema":
@@ -16964,10 +16970,10 @@ func (o *ddlOp) execAlterTSDict(s *parser.AlterTSDictStmt) error {
 		if !im.SetTSDictSchema(s.DictName.Name, schema, newSchema) {
 			return &ExecError{Code: "42704", Message: fmt.Sprintf("text search dictionary %q does not exist", s.DictName.Name)}
 		}
-		if o.ctx.WAL != nil {
-			if _, _, werr := o.ctx.WAL.Append(wal.EncodeSetTSDictSchema(s.DictName.Name, schema, newSchema)); werr != nil {
-				return fmt.Errorf("wal set-tsdict-schema: %w", werr)
-			}
+		// B3.5: SET SCHEMA is a canonical pg_ts_dict heap UPDATE (kind 115
+		// retired) — dictnamespace changed, row under the new schema's key.
+		if ud := im.FindTSDict(s.DictName.Name, newSchema); ud != nil {
+			_ = upsertTSDictCatalogRow(o.ctx, ud)
 		}
 		return nil
 	case "options":
@@ -16982,10 +16988,11 @@ func (o *ddlOp) execAlterTSDict(s *parser.AlterTSDictStmt) error {
 			}
 			return &ExecError{Code: code, Message: err.Error()}
 		}
-		if o.ctx.WAL != nil {
-			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterTSDictOptions(s.DictName.Name, schema, newInitOption)); werr != nil {
-				return fmt.Errorf("wal alter-tsdict-options: %w", werr)
-			}
+		_ = newInitOption
+		// B3.5: ALTER OPTIONS is a canonical pg_ts_dict heap UPDATE (kind
+		// 116 retired) — dictinitoption changed.
+		if ud := im.FindTSDict(s.DictName.Name, schema); ud != nil {
+			_ = upsertTSDictCatalogRow(o.ctx, ud)
 		}
 		return nil
 	}

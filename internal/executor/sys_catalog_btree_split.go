@@ -112,6 +112,12 @@ func keyMetaForSysBtree(indexOID uint32) (btreeIndexKeyMeta, bool) {
 		return btreeIndexKeyMeta{tupleSize: 16, nkeyatts: 1}, true
 	case pgOperatorOprnameLRNIndexOID:
 		return btreeIndexKeyMeta{tupleSize: 88, nkeyatts: 4}, true
+	// B3.5: pg_ts_dict — 3604 (dictname+dictnamespace name+oid {80,2}) + 3605
+	// (oid); both empty placeholders → lazy-root.
+	case pgTSDictOidIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 16, nkeyatts: 1}, true
+	case pgTSDictNameNspIndexOID:
+		return btreeIndexKeyMeta{tupleSize: 80, nkeyatts: 2}, true
 	// B3.4: foreign-data trio — pg_foreign_data_wrapper (112 oid / 548
 	// fdwname), pg_foreign_server (113 oid / 549 srvname), pg_user_mapping
 	// (174 oid / 175 umuser+umserver). All empty placeholders → lazy-root.

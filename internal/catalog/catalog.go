@@ -2376,6 +2376,9 @@ type InMemory struct {
 	// publicationHeapTIDs is the pg_publication twin (B3.3) — ALTER OWNER
 	// journals a canonical heap UPDATE at the cached TID.
 	publicationHeapTIDs map[uint32]SchemaHeapTID
+	// tsDictHeapTIDs is the pg_ts_dict twin (B3.5) — ALTER RENAME/SET SCHEMA/
+	// ALTER OPTIONS journal canonical heap UPDATEs at the cached TID.
+	tsDictHeapTIDs map[uint32]SchemaHeapTID
 
 	// tempNamespaces maps a session's temp-owner token ("s<id>", see
 	// executor.sessionTempOwner) → the OID of that session's temporary
@@ -12350,6 +12353,31 @@ func (c *InMemory) DropPublicationHeapTID(oid uint32) {
 	delete(c.publicationHeapTIDs, oid)
 }
 
+// TSDictHeapTID returns the live pg_ts_dict heap TID (B3.5).
+func (c *InMemory) TSDictHeapTID(oid uint32) (SchemaHeapTID, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	tid, ok := c.tsDictHeapTIDs[oid]
+	return tid, ok
+}
+
+// SetTSDictHeapTID records/refreshes the live pg_ts_dict heap TID.
+func (c *InMemory) SetTSDictHeapTID(oid uint32, tid SchemaHeapTID) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.tsDictHeapTIDs == nil {
+		c.tsDictHeapTIDs = make(map[uint32]SchemaHeapTID)
+	}
+	c.tsDictHeapTIDs[oid] = tid
+}
+
+// DropTSDictHeapTID drops the TID entry (DROP TEXT SEARCH DICTIONARY).
+func (c *InMemory) DropTSDictHeapTID(oid uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.tsDictHeapTIDs, oid)
+}
+
 // SetSchemaHeapTID records/refreshes the live pg_namespace heap TID for name.
 func (c *InMemory) SetSchemaHeapTID(name string, tid SchemaHeapTID) {
 	c.mu.Lock()
@@ -13217,6 +13245,24 @@ func (c *InMemory) CreateTSDict(ud *UserTSDict, schema string) (uint32, error) {
 // bare name in the given schema from the registry. Returns true if one was
 // found and removed. `schema` resolves like CreateTSDict (unknown → public).
 // DU-002 slice 437.
+// FindTSDict returns the user TS dictionary matching (schema, name), or nil.
+// B3.5: the emit sites capture the OID after a registry mutation to journal
+// the pg_ts_dict heap row.
+func (c *InMemory) FindTSDict(name, schema string) *UserTSDict {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	for _, ud := range c.userTSDicts {
+		if ud.NamespaceOID == nsOID && strings.EqualFold(ud.Name, name) {
+			return ud
+		}
+	}
+	return nil
+}
+
 func (c *InMemory) DropTSDict(name, schema string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
