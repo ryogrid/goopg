@@ -462,11 +462,9 @@ func parsePGCharArrayPayload(b []byte) []byte {
 // nodeToString ev_action blobs that are NOT re-parsable SQL and whose views are
 // nailed relcache entries, so they are skipped by the OID filter.
 //
-// matview IsPopulated is a documented deferral (deferral ledger): the retired
-// WAL record carried it, but Slice C stores only the query in pg_rewrite, so a
-// reloaded matview defaults to populated (correct for the common CREATE
-// MATERIALIZED VIEW case; a WITH NO DATA matview loses its unpopulated state
-// across a restart).
+// matview IsPopulated is restored from pg_class.relispopulated during
+// loadUserTablesFromHeap (02e item A), which runs before this pass, so this pass
+// only rebuilds the query AST and must NOT touch tbl.IsPopulated.
 func loadViewsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
 	if cat == nil {
 		return nil
@@ -534,10 +532,11 @@ func loadViewsFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, clog *m
 		}
 		tbl.View = sel
 		tbl.ViewDef = r.evAction
-		if tbl.IsMatView {
-			// Query stored; populated state is a deferral (see the doc comment).
-			tbl.IsPopulated = true
-		}
+		// 02e item A: matview IsPopulated is now restored from
+		// pg_class.relispopulated during loadUserTablesFromHeap (which runs
+		// before this pass), so DO NOT clobber it here. The previous
+		// unconditional `tbl.IsPopulated = true` lost a WITH NO DATA matview's
+		// unpopulated state across restart.
 	}
 	return nil
 }

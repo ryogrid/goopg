@@ -2930,6 +2930,14 @@ func loadUserTablesFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, cl
 		// had a non-default tablespace and a legacy-format row predating this
 		// field.
 		tbl.Tablespace = tr.RelTablespace
+		// Restore matview populated state from pg_class.relispopulated (02e item
+		// A). Only the physical decoder reads byte 129; the legacy path leaves it
+		// Go-zero false, so guard on `physical` to never demote a matview. For a
+		// non-matview IsPopulated is unused, so the physical-only assignment is
+		// harmless there.
+		if recovered.physical && tbl.IsMatView {
+			tbl.IsPopulated = tr.RelIsPopulated
+		}
 		// Restore storage parameters (fillfactor, autovacuum_*, and for
 		// views security_barrier/security_invoker/check_option) from the
 		// heap-persisted reloptions column — otherwise they silently
