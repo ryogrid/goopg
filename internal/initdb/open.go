@@ -1570,11 +1570,17 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// pg_auth_members.oid is not dumped by pg_dump/pg_dumpall and so has no
 	// stability requirement of its own) risks a numeric OID collision with a
 	// role OID loaded afterward.
-	if err := replayRoleMembershipRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+	// B4.3: restore role memberships from the pg_auth_members SHARED heap
+	// (global/1261), replacing the retired replayRoleMembershipRecords WAL scan
+	// (RecordKinds 79/80). Unlike the old scan (which minted fresh OIDs via
+	// GrantRoleMembership), the heap reload preserves each row's original OID
+	// (RegisterRoleMembershipDuringRecovery) — still kept after role load so its
+	// nextOID advance cannot collide with a role OID loaded afterward.
+	if err := reloadRoleMembershipsFromHeap(mgr, cat, clog); err != nil {
 		_ = pool.Close()
 		_ = walWriter.Close()
 		_ = mgr.Close()
-		return nil, fmt.Errorf("goopg: role membership replay: %w", err)
+		return nil, fmt.Errorf("goopg: pg_auth_members reload: %w", err)
 	}
 
 	// M0106-0013: stamp the clog from WAL commit/abort records and advance

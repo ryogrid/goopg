@@ -5,7 +5,6 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
-	"github.com/goopg/goopg/internal/wal"
 )
 
 // execRoleMembershipChange applies a `GRANT <role> TO <role>`/`REVOKE ...
@@ -86,14 +85,16 @@ func (o *ddlOp) execRoleMembershipChange(rc *parser.RoleMembershipChange) error 
 					}
 					for _, dep := range deps {
 						im.RevokeRoleMembership(roleOid, dep.MemberOID, dep.GrantorOID, "")
-						if o.ctx.WAL != nil {
-							_, _, _ = o.ctx.WAL.Append(wal.EncodeRevokeRoleMembership(roleOid, dep.MemberOID, dep.GrantorOID, ""))
+						// B4.3: re-sync the pg_auth_members heap row (replaces kind 80).
+						if err := syncAuthMemberRow(o.ctx, im, roleOid, dep.MemberOID, dep.GrantorOID); err != nil {
+							return err
 						}
 					}
 				}
 				im.RevokeRoleMembership(roleOid, memberOid, grantorOid, rc.RevokeOption)
-				if o.ctx.WAL != nil {
-					_, _, _ = o.ctx.WAL.Append(wal.EncodeRevokeRoleMembership(roleOid, memberOid, grantorOid, rc.RevokeOption))
+				// B4.3: re-sync the pg_auth_members heap row (replaces kind 80).
+				if err := syncAuthMemberRow(o.ctx, im, roleOid, memberOid, grantorOid); err != nil {
+					return err
 				}
 			}
 		}
@@ -144,8 +145,9 @@ func (o *ddlOp) execRoleMembershipChange(rc *parser.RoleMembershipChange) error 
 
 		for _, memberOid := range memberOids {
 			im.GrantRoleMembership(roleOid, memberOid, grantorOid, rc.AdminOption, rc.InheritOption, rc.SetOption)
-			if o.ctx.WAL != nil {
-				_, _, _ = o.ctx.WAL.Append(wal.EncodeGrantRoleMembership(roleOid, memberOid, grantorOid, rc.AdminOption, rc.InheritOption, rc.SetOption))
+			// B4.3: journal the pg_auth_members heap row (replaces kind 79).
+			if err := syncAuthMemberRow(o.ctx, im, roleOid, memberOid, grantorOid); err != nil {
+				return err
 			}
 		}
 	}

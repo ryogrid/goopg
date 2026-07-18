@@ -589,6 +589,15 @@ no `gofmt -w` (go1.25/1.26 mismatch); re-init data dirs after on-disk format cha
     mirroring `syncCopiedTableCatalogHeap`. Reload `reloadDbRoleSettingsFromHeap`; deleted
     database_config_recovery.go + role_config_recovery.go. Gate: `DbRoleSettingSurvivesRestart` + server
     suite + waldump.
+  - [x] **B4.3 pg_auth_members (kinds 79/80 retired)** — LANDED. GRANT/REVOKE role membership journals a
+    real pg_auth_members SHARED heap row (global/1261) instead of the two bespoke records. 7 scalar cols;
+    reuses B4.1a + the heap-only pattern (indexes 2694/2695/6302/6303 not materialized → seq-scan faithful).
+    One row per (roleid, member, grantor), re-synced per key on GRANT/REVOKE/cascade (B4.2 pattern). First
+    EXECUTOR-layer B4 slice (rides the session ctx directly — no server-txn dance). New catalog helpers
+    Lookup/All/RegisterRoleMembership…; reload `reloadRoleMembershipsFromHeap` preserves the heap OID;
+    deleted role_membership_recovery.go. Gate: `AuthMembersSurvivesRestart` + executor/server suites.
+    Note: no standby benefit until the role-STATE kinds (67/68/72, pg_authid) also convert — this is a
+    bounded, non-boot-critical precursor to the pg_authid slice.
 - [ ] **B5** Retire `RmgrGoopgCatalog=128` (now unused) — header-side parity complete.
 - [ ] **B-gate**: per-catalog full regress + `internal/testport` isolation; `psql \d`/`\df`/`\dn` +
   `information_schema` parity vs PG 18.3; crash-after-DDL recovery via generic reload; re-init data dir.

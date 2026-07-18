@@ -286,6 +286,40 @@ func reloadDbRoleSettingsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, c
 	return nil
 }
 
+// reloadRoleMembershipsFromHeap is B4.3's pg_auth_members reload — the generic
+// heap-scan replacement for the retired replayRoleMembershipRecords scanner
+// (RecordKinds 79/80). pg_auth_members is SHARED (global/1261). Each live row
+// is re-registered into the roleMembers registry with its original OID and
+// option flags; revoked rows carry xmax and are skipped by the liveness filter.
+func reloadRoleMembershipsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+	rel := storage.RelFileNode{DBOid: 0, RelOid: 1261, Fork: storage.MainFork}
+	cols := executor.PGAuthMembersColumnsPG18()
+	rows, err := scanCatalogHeapRows(mgr, rel, clog, "pg_auth_members",
+		func(ht storage.HeapTuple, tid storage.ItemPointer) (any, bool, error) {
+			natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+			decoded := make(executor.Row, len(cols))
+			if derr := executor.DecodeRowIntoMctxPGTuple(decoded, cols, ht.Data, ht.Bitmap, natts, nil); derr != nil {
+				return nil, false, derr
+			}
+			return catalog.RoleMembership{
+				OID:           uint32(decoded[0].Int),
+				RoleOID:       uint32(decoded[1].Int),
+				MemberOID:     uint32(decoded[2].Int),
+				GrantorOID:    uint32(decoded[3].Int),
+				AdminOption:   decoded[4].BoolValue(),
+				InheritOption: decoded[5].BoolValue(),
+				SetOption:     decoded[6].BoolValue(),
+			}, false, nil
+		})
+	if err != nil {
+		return err
+	}
+	for _, r := range rows {
+		cat.RegisterRoleMembershipDuringRecovery(r.(catalog.RoleMembership))
+	}
+	return nil
+}
+
 // reloadUserRoutinesFromHeap is B1.2's pg_proc reload — the generic
 // heap-scan replacement for the retired replayFunctionDDLRecords scanner
 // (RecordKinds 61-64/121-123). Live rows with oid >= FirstUserOID carry the
