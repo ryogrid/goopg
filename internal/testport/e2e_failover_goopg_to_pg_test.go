@@ -248,6 +248,18 @@ func runFailoverGoopgToPG(t *testing.T, repo, pgBasebackupBin, psqlBin string, m
 	if err := runSQLSimple(t, primary, "CREATE DATABASE b2prep_db"); err != nil {
 		t.Fatalf("create database on goopg primary: %v", err)
 	}
+	// B5 Slice A: CREATE / ALTER INDEX RENAME now journal ONLY real pg_class +
+	// pg_index heap inserts/updates + btree page writes — no goopg-private
+	// RecordKindCreateIndex(20)/RenameIndex(94) rmid-128 record. A real PG
+	// standby must replay them without FATAL and end up with the renamed index
+	// in pg_class. (Before B5 Slice A the kind-20/94 records killed the standby
+	// with "resource manager with ID 128 not registered".)
+	if err := runSQLSimple(t, primary, "CREATE INDEX b5a_idx ON public.bench_log (client)"); err != nil {
+		t.Fatalf("create index on goopg primary: %v", err)
+	}
+	if err := runSQLSimple(t, primary, "ALTER INDEX b5a_idx RENAME TO b5a_idx_renamed"); err != nil {
+		t.Fatalf("alter index rename on goopg primary: %v", err)
+	}
 
 	dsn := fmt.Sprintf("host=%s port=%s user=%s dbname=%s sslmode=disable",
 		"127.0.0.1", mustGoopgPort(primary.ListenAddr()), "postgres", "postgres")
@@ -420,6 +432,18 @@ func runFailoverGoopgToPG(t *testing.T, repo, pgBasebackupBin, psqlBin string, m
 	if got := pgScalar(t, standby,
 		"SELECT count(*) FROM pg_database WHERE datname = 'b2prep_db'"); got != "1" {
 		t.Fatalf("post-failover pg_database has b2prep_db = %q, want 1", got)
+	}
+	// B5 Slice A: the goopg-created-and-renamed index survived replication as
+	// pure pg_class + pg_index heap rows + btree pages (no rmid-128 record). The
+	// renamed name in pg_class proves both CREATE INDEX and ALTER INDEX RENAME
+	// replayed to the promoted PG without FATAL.
+	if got := pgScalar(t, standby,
+		"SELECT count(*) FROM pg_class WHERE relname = 'b5a_idx_renamed' AND relkind = 'i'"); got != "1" {
+		t.Fatalf("post-failover pg_class has b5a_idx_renamed index = %q, want 1", got)
+	}
+	if got := pgScalar(t, standby,
+		"SELECT count(*) FROM pg_class WHERE relname = 'b5a_idx'"); got != "0" {
+		t.Fatalf("post-failover old index name b5a_idx still present = %q, want 0 (rename not replayed)", got)
 	}
 }
 

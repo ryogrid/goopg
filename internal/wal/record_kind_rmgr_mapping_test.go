@@ -56,9 +56,8 @@ func TestRecordKindToRmgrInfoAnalogTable(t *testing.T) {
 // kind from each region is enough to catch a range-boundary mistake.
 func TestRecordKindToRmgrInfoCustomDefault(t *testing.T) {
 	for _, kind := range []byte{
-		RecordKindCreateIndex, // still-live rmid-128 kind (was CreateDatabase, retired B4.6 Stage 3)
+		RecordKindCreateView, // still-live rmid-128 kind (was CreateIndex, retired B5 Slice A)
 		RecordKindCreateStatistics,
-		RecordKindRenameIndex,
 		RecordKindColumnDefaults, // still-live rmid-128 kind (was RoleState, retired B4.5)
 	} {
 		gotRmgr, _ := recordKindToRmgrInfo(kind)
@@ -75,7 +74,7 @@ func TestRecordKindToRmgrInfoCustomDefault(t *testing.T) {
 func TestClassifyXLogRecordWiredToRecordKindToRmgrInfo(t *testing.T) {
 	for _, kind := range []byte{
 		RecordKindHeapInsert, RecordKindXactCommit, RecordKindPageImage,
-		RecordKindCreateStatistics, RecordKindRenameIndex,
+		RecordKindCreateStatistics, RecordKindCreateView,
 	} {
 		wantRmgr, wantInfo := recordKindToRmgrInfo(kind)
 		rmgr, info, xid := classifyXLogRecord([]byte{kind})

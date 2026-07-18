@@ -1444,29 +1444,17 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		slog.Warn("loadStatisticsFromHeap failed", "err", err)
 	}
 
-	// M0113: recover user indexes from pg_index heap (PG18-canonical path).
-	// Falls back to the WAL-replay path below for clusters that predate M0113
-	// (no pg_index rows written yet).
+	// M0113 / B5 Slice A: recover user indexes from the pg_index heap (2610) +
+	// pg_class (relkind='i'), the PG18-canonical path — reconstructs the full
+	// in-memory index (indkey/unique/primary/indrelid/opclass/collation/
+	// indoption/predicate). This replaced the goopg-private
+	// RecordKindCreateIndex(20)/DropIndex(21)/RenameIndex(94) records (retired in
+	// B5 Slice A): CREATE/DROP/RENAME INDEX now journal only real heap
+	// inserts/deletes/updates on pg_class + pg_index, which a real PG standby
+	// replays. Must run AFTER loadUserTablesFromHeap so the owning table is
+	// already registered.
 	if err := loadUserIndexesFromHeap(mgr, cat, clog); err != nil {
-		slog.Warn("loadUserIndexesFromHeap failed, falling back to WAL replay", "err", err)
-	}
-
-	// M0079-0001: replay CREATE/DROP INDEX WAL records into the
-	// in-memory catalog. Without this pass, indexes created
-	// after the last checkpoint would disappear from
-	// the catalog after a non-graceful restart even though
-	// their relfiles and btree pages are restored by physical
-	// replay. The pgbench `pgbench_accounts.aid` PK was the
-	// surfacing case (~70x TPS regression after restart because
-	// every UPDATE fell back to a 10M-row Seq Scan). Must run
-	// AFTER `loadUserTablesFromHeap` so the owning table is
-	// already in the catalog when we register the index.
-	// M0113: kept as fallback for pre-M0113 clusters without pg_index rows.
-	if err := replayIndexDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
-		_ = pool.Close()
-		_ = walWriter.Close()
-		_ = mgr.Close()
-		return nil, fmt.Errorf("goopg: index DDL replay: %w", err)
+		slog.Warn("loadUserIndexesFromHeap failed", "err", err)
 	}
 
 	// Sequence / SERIAL restart persistence: re-register sequences from

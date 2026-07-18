@@ -6799,22 +6799,10 @@ func (o *ddlOp) execDropIndex(s *parser.DropIndexStmt) error {
 		if err := o.ctx.Pool.Manager().DropRelation(rel); err != nil {
 			return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
 		}
-		// M0079-0001: emit a DROP INDEX WAL record so a
-		// post-crash recovery doesn't resurrect the index from
-		// an earlier RecordKindCreateIndex still in the WAL.
-		// Best-effort: the catalog mutation has already
-		// completed; logging a failure is preferable to
-		// resurrecting a half-dropped index.
-		if o.ctx.Pool != nil {
-			payload := wal.EncodeDropIndex(wal.DropIndexPayload{
-				OID:    dropOID,
-				Schema: dropSchema,
-				Name:   dropName,
-			})
-			if _, err := o.ctx.Pool.LogChangeRecord(payload); err != nil {
-				return &ExecError{Code: "XX000", Pos: s.Pos(), Message: fmt.Sprintf("drop-index WAL append: %v", err)}
-			}
-		}
+		// B5 Slice A: RecordKindDropIndex(21) retired — the index's pg_class row
+		// is xmax-stamped on disk below (deleteCatalogRowsForOID, WAL-logged),
+		// so loadUserIndexesFromHeap skips it on reload and a real PG standby
+		// replays the same heap delete (no rmid-128 record).
 	}
 	// M0106-0011: DROP INDEX removes the index's pg_class row. Flag the txn
 	// so the commit-time xact-marker hook emits RecordKindXactCommitInval
@@ -6873,12 +6861,8 @@ func ApplyPendingIndexDrops(ctx *Context, sess *BasicSession) {
 		if ctx.Pool != nil {
 			ctx.Pool.InvalidateRel(d.Rel)
 			_ = ctx.Pool.Manager().DropRelation(d.Rel)
-			payload := wal.EncodeDropIndex(wal.DropIndexPayload{
-				OID:    d.OID,
-				Schema: d.Schema,
-				Name:   d.IdxName,
-			})
-			_, _ = ctx.Pool.LogChangeRecord(payload)
+			// B5 Slice A: RecordKindDropIndex(21) retired — the pg_class row is
+			// xmax-stamped on disk below (deleteCatalogRowsForOID, WAL-logged).
 		}
 	}
 	if flagInval && ctx.TxnMgr != nil {
@@ -7383,16 +7367,17 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					if err := im.RenameIndex(oldObjName, newObjName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); err != nil {
 						return &ExecError{Code: "42P07", Pos: act.Pos(), Message: err.Error()}
 					}
-					// Use ctx.Pool.LogChangeRecord, the same WAL-emission path
-					// CREATE/DROP INDEX use just above (M0079-0001) — not
-					// ctx.WAL.Append (the newer per-object-DDL pattern most other
-					// ALTER forms in this file use) — because RenameIndexDuringRecovery
-					// is replayed by the same `replayIndexDDLRecords` driver that
-					// consumes those CREATE/DROP INDEX records, and ctx.Pool is
-					// always wired whereas ctx.WAL is not guaranteed to be in every
-					// executor context that reaches this operator.
-					if o.ctx.Pool != nil {
-						_, _ = o.ctx.Pool.LogChangeRecord(wal.EncodeRenameIndex(oldSchema, oldName, act.NewName))
+					// B5 Slice A: the index name lives in pg_class.relname (not
+					// pg_index), so rewrite the index's pg_class HEAP row with the
+					// new name (RenameIndex mutated idx.Name in place). This makes
+					// the rename durable via loadUserIndexesFromHeap — retiring the
+					// goopg-private RecordKindRenameIndex(94); a real PG standby
+					// replays it as an XLOG_HEAP_UPDATE on pg_class (via the
+					// delete-old + insert-new that resyncIndexClassHeapRow does).
+					if catalogHeapSyncAvailable(o.ctx) {
+						if syncErr := resyncIndexClassHeapRow(o.ctx, idx); syncErr != nil {
+							return syncErr
+						}
 					}
 				}
 			}
@@ -10219,51 +10204,13 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 			return fmt.Errorf("DDL catalog sync: %w", syncErr)
 		}
 	}
-	// M0079-0001: emit a CREATE INDEX WAL record so post-crash
-	// recovery can reconstruct the in-memory catalog entry. The
-	// pg_class heap row written above only carries OID + name +
-	// relkind='i'; the column list, unique flag, primary flag,
-	// and owning-table OID would otherwise be lost on a non-
-	// graceful restart. The WAL record carries the full
-	// metadata; replay happens in
-	// `internal/initdb.replayIndexDDLRecords` after physical
-	// recovery finishes.
-	if o.ctx.Pool != nil {
-		payload := wal.EncodeCreateIndex(wal.CreateIndexPayload{
-			OID:              idx.OID,
-			TableOID:         tbl.OID,
-			Schema:           idxName.Schema,
-			Name:             idxName.Name,
-			Method:           "btree",
-			Columns:          append([]string(nil), columns...),
-			Unique:           unique,
-			Primary:          primary,
-			ColDescending:    idx.ColDescending,
-			ColNullsFirst:    idx.ColNullsFirst,
-			NullsNotDistinct: idx.NullsNotDistinct,
-			HasPredicate:     idx.HasPredicate,
-			PredicateString:  idx.PredicateString,
-			IncludeColumns:   idx.IncludeColumns,
-			ColOpClasses:     idx.ColOpClasses,
-			ColCollations:    idx.ColCollations,
-			Fillfactor:       idx.Fillfactor,
-			DeduplicateItems: idx.DeduplicateItems,
-			Tablespace:       idx.Tablespace,
-		})
-		if _, err := o.ctx.Pool.LogChangeRecord(payload); err != nil {
-			// Best-effort: roll back the in-memory mutation so
-			// memory and (now-incomplete) WAL agree, mirroring
-			// the CreateDatabase emit-then-rollback discipline at
-			// internal/server/database_ddl.go:162-166. The on-
-			// disk btree pages remain — they are harmless without
-			// a catalog entry — but the next graceful SaveCatalog
-			// won't capture this index either.
-			_ = o.ctx.Catalog.DropIndex(idxName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
-			o.ctx.Pool.InvalidateRel(idxRel)
-			_ = o.ctx.Pool.Manager().DropRelation(idxRel)
-			return &ExecError{Code: "XX000", Pos: pos, Message: fmt.Sprintf("create-index WAL append: %v", err)}
-		}
-	}
+	// B5 Slice A: the goopg-private RecordKindCreateIndex(20) record is retired.
+	// The index is fully reconstructible from the heap: syncIndexToCatalogHeap
+	// above wrote the pg_class row (relkind='i') AND the pg_index row (2610)
+	// carrying indkey/indisunique/indisprimary/indrelid/opclass/collation/
+	// indoption/predicate, and loadUserIndexesFromHeap rebuilds the in-memory
+	// entry from both at startup. A real PG standby replays the same heap
+	// inserts (no rmid-128 record).
 	return nil
 }
 
