@@ -48,12 +48,20 @@ dependency-free).
   `opno`/`opfuncid`/`opresulttype` come straight from the seed row so a PG
   standby resolves the same OIDs. Collation follows PG: `inputcollid`/`opcollid`
   are `100` only when a text operand/result is involved, else `0`.
+- **Plain built-in function calls** (`FuncExpr`): the `funcid` forward-resolves
+  by `(proname, actual-arg-type OIDs)` via `LookupProcForNode`, and
+  `funcresulttype` comes from the generated `pgProcRetTypeByOID` leaf map
+  (`catalog.ProcResultType`, emitted by `cmd/gen-pg-proc-data -names`). Only the
+  ordinary-call shape is accepted — no aggregate/window decoration (`OVER`,
+  `FILTER`, `ORDER BY`, `WITHIN GROUP`, `DISTINCT`), no star argument, no
+  `VARIADIC` spread, and only unqualified / `pg_catalog`-qualified names.
+  `funcformat = 0` (`COERCE_EXPLICIT_CALL`); `funccollid`/`inputcollid` are `100`
+  when a text result/operand is involved, else `0`.
 
-Everything else (function calls, casts, numeric/other datums, a string literal
-in a non-text context, column references, subqueries) returns `ErrUnsupported`
-so the writer keeps SQL text. `ResolveExpr` is all-or-nothing: any unsupported
-sub-node aborts the whole resolution, which is exactly the `SupportsExpr`
-predicate.
+Everything else (non-built-in casts, numeric/other datums, a string literal in a
+non-text context, column references, subqueries) returns `ErrUnsupported` so the
+writer keeps SQL text. `ResolveExpr` is all-or-nothing: any unsupported sub-node
+aborts the whole resolution, which is exactly the `SupportsExpr` predicate.
 
 ## The gate
 
@@ -63,20 +71,27 @@ predicate.
 - `40 + 2` forward-resolves to an `OpExpr` with a non-zero seed `opno`/`opfuncid`
   and int4 result/args.
 - Full reload round-trip resolve → `Out` → `Read` → `Rebuild` → re-`ResolveExpr`
-  is byte-stable for `42`, `-1`, a bigint, `40 + 2`, `1 + 2 * 3` — proving
-  `Rebuild` is a faithful inverse without depending on parser node positions.
-- `SupportsExpr` accept/reject table (rejects `upper('x')`, `'5'`::int context,
-  `1.5`, `a + 1`).
+  is byte-stable for `42`, `-1`, a bigint, `40 + 2`, `1 + 2 * 3`, and
+  `upper('x')` — proving `Rebuild` is a faithful inverse without depending on
+  parser node positions (a `FuncExpr` rebuilds via `funcid → proname → re-resolve`).
+- `upper('x')` `Out` pinned byte-for-byte against a **live PG18.3
+  `pg_attrdef.adbin`** golden captured from `b text DEFAULT upper('x')` (funcid
+  871, funcresulttype 25/text, `funccollid`/`inputcollid` 100).
+- `SupportsExpr` accept/reject table (accepts `upper('x')`; rejects `'5'`::int
+  context, `1.5`, `a + 1`).
+
+## Resolved after the initial sub-slice-1 commit
+
+- **`FuncExpr` resolution** landed alongside sub-slice 1 (`e85ccb53`) — the
+  generator now emits a `pgProcRetTypeByOID` leaf map, `catalog.ProcResultType`
+  reads it, and `resolveFuncCall`/`rebuildFuncExpr` handle `parser.FuncCall`. A
+  follow-up loop (2026-07-19) validated the output byte-for-byte against a live
+  PG18.3 `adbin` golden and reconciled the previously-red `SupportsExpr` test
+  (it had still asserted `upper('x')` was unsupported). This unblocks the
+  `DEFAULT upper('x')` arm of the S2 E2E gate.
 
 ## Deferred (S2 sub-slice 2 and beyond) — see the deferral ledger
 
-- **`FuncExpr` resolution** needs a leaf-package `pg_proc` **return-type** map
-  (`funcresulttype`): S0 generated only name + arg-type reverse maps, and
-  `internal/pgnodes` cannot import `internal/initdb`'s fuller `pgProcEntry`
-  table. Next step: extend `cmd/gen-pg-proc-data -names` to emit a
-  `pgProcRetTypeByOID` leaf map (the generator already parses `prorettype`), add
-  a `catalog.ProcRetTypeForNode`/return-type accessor, then handle `parser.FuncCall`
-  in `resolve`. This unblocks the `DEFAULT upper('x')` arm of the S2 E2E gate.
 - **Writer wiring**: `internal/executor/operators_ddl.go` (the `writeAttrdefRow`
   funnel) + `internal/executor/sys_pg_statistic_ext.go` (`stxexprs`) emit
   `NewBytesDatum(canonical)` when `SupportsExpr`, else the current SQL text — no

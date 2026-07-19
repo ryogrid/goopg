@@ -50,6 +50,15 @@ func TestResolveExprCanonicalOut(t *testing.T) {
 			targetType: OidText,
 			want:       "{CONST :consttype 25 :consttypmod -1 :constcollid 100 :constlen -1 :constbyval false :constisnull false :location -1 :constvalue 6 [ 24 0 0 0 104 105 ]}",
 		},
+		{
+			// Plain built-in FuncExpr: upper('x'). funcid 871 (upper),
+			// funcresulttype 25 (text), collations DEFAULT_COLLATION_OID (100)
+			// on both the text arg and result. Byte-for-byte identical to a live
+			// PG18.3 pg_attrdef.adbin captured from `b text DEFAULT upper('x')`.
+			sql:        "upper('x')",
+			targetType: OidText,
+			want:       "{FUNCEXPR :funcid 871 :funcresulttype 25 :funcretset false :funcvariadic false :funcformat 0 :funccollid 100 :inputcollid 100 :args ({CONST :consttype 25 :consttypmod -1 :constcollid 100 :constlen -1 :constbyval false :constisnull false :location -1 :constvalue 5 [ 20 0 0 0 120 ]}) :location -1}",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.sql, func(t *testing.T) {
@@ -110,6 +119,7 @@ func TestResolveRebuildRoundTrip(t *testing.T) {
 		{"5000000000", 0},
 		{"40 + 2", OidInt4},
 		{"1 + 2 * 3", OidInt4},
+		{"upper('x')", OidText}, // FuncExpr: funcid→proname→re-resolve fixed point
 	} {
 		t.Run(tc.sql, func(t *testing.T) {
 			n1, err := ResolveExpr(mustParse(t, tc.sql), tc.targetType)
@@ -166,8 +176,10 @@ func TestRebuildNegativeConstShape(t *testing.T) {
 }
 
 // TestSupportsExprRejectsOutOfSubset verifies the all-or-nothing shape check
-// declines expressions with any unsupported node (function calls, casts, a
-// string literal in a non-text context) so the writer keeps SQL text.
+// declines expressions with any unsupported node (a non-built-in cast, a
+// numeric datum, a column reference, or a string literal in a non-text
+// context) so the writer keeps SQL text — while accepting the supported subset
+// (literals, folded unary minus, OpExpr, and plain built-in FuncExpr).
 func TestSupportsExprRejectsOutOfSubset(t *testing.T) {
 	supported := []struct {
 		sql        string
@@ -177,6 +189,7 @@ func TestSupportsExprRejectsOutOfSubset(t *testing.T) {
 		{"-2147483648", OidInt4},
 		{"'ok'", OidText},
 		{"10 - 3", OidInt4},
+		{"upper('x')", OidText}, // plain built-in FuncExpr forward-resolves
 	}
 	for _, tc := range supported {
 		if !SupportsExpr(mustParse(t, tc.sql), tc.targetType) {
@@ -188,10 +201,9 @@ func TestSupportsExprRejectsOutOfSubset(t *testing.T) {
 		sql        string
 		targetType uint32
 	}{
-		{"upper('x')", OidText},        // FuncExpr deferred (no proc rettype map)
-		{"'5'", OidInt4},               // string literal in a non-text context
-		{"1.5", 0},                     // numeric datum deferred
-		{"a + 1", OidInt4},             // column reference
+		{"'5'", OidInt4},   // string literal in a non-text context
+		{"1.5", 0},         // numeric datum deferred
+		{"a + 1", OidInt4}, // column reference
 	}
 	for _, tc := range unsupported {
 		if SupportsExpr(mustParse(t, tc.sql), tc.targetType) {

@@ -5652,10 +5652,18 @@ existing encoder, `constcollid=100` / `consttypmod=n+4`.
       int4/int8 literals (make_const magnitude typing), unary-minus fold (doNegate,
       all-0xFF sign-ext), text literals in text context, binary OpExpr. Design doc
       `0123-0002-pgnodes-scalar-resolver.md` + README index + ledger row.
-      SUB-SLICE 2 REMAINS (own gated commit — the risky/E2E half): (a) `FuncExpr`
-      resolution — blocked on a leaf `pgProcRetTypeByOID` map (S0 emitted only
-      names+arg-types; extend `cmd/gen-pg-proc-data -names`, it already parses
-      prorettype); (b) wire `writeAttrdefRow`
+      SUB-SLICE 2 part (a) — `FuncExpr` resolution — **LANDED + VALIDATED
+      (2026-07-19)**: `cmd/gen-pg-proc-data -names` now emits a
+      `pgProcRetTypeByOID` leaf map, `catalog.ProcResultType` reads it, and
+      `resolveFuncCall`/`rebuildFuncExpr` handle `parser.FuncCall`. The resolver
+      code shipped with sub-slice 1 (`e85ccb53`) but left its `SupportsExpr`
+      test asserting `upper('x')` was unsupported → HEAD `go test
+      ./internal/pgnodes/` was RED. This loop captured a live PG18.3 `adbin`
+      golden for `b text DEFAULT upper('x')` (funcid 871 / funcresulttype 25 /
+      collid 100), confirmed the resolver matches it byte-for-byte, and
+      reconciled the test (`upper('x')` now a supported case + a golden Out pin +
+      a resolve→Rebuild→re-resolve round-trip case). HEAD green again.
+      SUB-SLICE 2 REMAINS (own gated commit — the risky/E2E half): (b) wire `writeAttrdefRow`
       + the `stxexprs` writer to emit canonical bytes when supported, else fall
       + the `stxexprs` writer to emit canonical bytes when supported, else fall
       back to SQL text (`NewBytesDatum(canonical)` vs `NewStringDatum(sqltext)`;

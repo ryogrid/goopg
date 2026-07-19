@@ -7,14 +7,14 @@ package pgnodes
 // and the S1 codec (Out/Read).
 //
 // Scope of THIS sub-slice: literal Consts (int4/int8/text), a unary minus
-// folded onto an integer literal (PG's doNegate + make_const), and binary
+// folded onto an integer literal (PG's doNegate + make_const), binary
 // operators (OpExpr) whose operand types forward-resolve to a built-in
-// pg_operator row. FuncExpr resolution is deferred: it needs a leaf-package
-// pg_proc return-type map (funcresulttype) that S0 did not generate — tracked
-// in the deferral ledger. Any expression outside this subset makes ResolveExpr
-// return ErrUnsupported so the writer degrades to storing SQL text
-// (all-or-nothing; see unsupported.go and 02e §3's graceful-degradation
-// invariant — never partial-emit).
+// pg_operator row, and plain built-in function calls (FuncExpr) whose funcid
+// forward-resolves via S0's catalog.LookupProcForNode and whose result type
+// comes from the generated pg_proc return-type map (catalog.ProcResultType).
+// Any expression outside this subset makes ResolveExpr return ErrUnsupported so
+// the writer degrades to storing SQL text (all-or-nothing; see unsupported.go
+// and 02e §3's graceful-degradation invariant — never partial-emit).
 //
 // Provenance for the coercion/typing decisions: PostgreSQL types an integer
 // literal by its own magnitude (make_const in parse_node.c: int4 if it fits,
