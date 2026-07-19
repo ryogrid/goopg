@@ -311,10 +311,11 @@ func TestCastDegradesGracefully(t *testing.T) {
 		sql     string
 		colType uint32
 	}{
-		{"int_to_text_target", "5::text", OidText},                       // non-numeric-category target
-		{"text_literal_to_float8", "'5'::float8", OidFloat8},             // text source arm not modeled
-		{"text_literal_to_int4", "'5'::int4", OidInt4},                   // text source arm not modeled
-		{"typmod_cast_bare_numeric_col", "5::numeric(10,2)", OidNumeric}, // bare-numeric col → RelabelType, not modeled
+		{"int_to_text_target", "5::text", OidText},           // non-numeric-category target
+		{"text_literal_to_float8", "'5'::float8", OidFloat8}, // text source arm not modeled
+		{"text_literal_to_int4", "'5'::int4", OidInt4},       // text source arm not modeled
+		// (sub-slice 24 now models the bare-numeric-col typmod'd cast via an implicit
+		// RelabelType — covered in numeric_relabel_test.go — so it is no longer a degrade.)
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

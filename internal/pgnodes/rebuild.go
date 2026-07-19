@@ -33,6 +33,8 @@ func Rebuild(n Node) (parser.Expr, error) {
 		return rebuildDistinctExpr(v)
 	case *FuncExpr:
 		return rebuildFuncExpr(v)
+	case *RelabelType:
+		return rebuildRelabelType(v, Rebuild)
 	case *BoolExpr:
 		return rebuildBoolExpr(v)
 	case *NullTest:
@@ -287,6 +289,22 @@ func rebuildFuncExprWith(f *FuncExpr, rec func(Node) (parser.Expr, error)) (pars
 		args = append(args, arg)
 	}
 	return &parser.FuncCall{Name: parser.ObjectName{Name: name}, Args: args}, nil
+}
+
+// rebuildRelabelType reconstructs a RELABELTYPE. The only form the forward path
+// emits is the IMPLICIT bare-numeric relabel (wrapNumericRelabelToBare, relabelformat
+// 2) that strips a typmod'd numeric default back to the bare `numeric` column's typmod
+// -1. Like the implicit casts in rebuildFuncExprWith, an implicit RelabelType has no
+// SQL syntax — pg_get_expr renders only the inner expression — so it rebuilds to its
+// argument. Re-resolving that argument (the `::numeric(p,s)` cast) in the same bare
+// numeric column context re-wraps the identical RelabelType (fixed point). An explicit
+// RelabelType (relabelformat != 2, not emitted here) is rejected rather than silently
+// dropped.
+func rebuildRelabelType(r *RelabelType, rec func(Node) (parser.Expr, error)) (parser.Expr, error) {
+	if r.Relabelformat != 2 {
+		return nil, fmt.Errorf("pgnodes: Rebuild: unsupported RelabelType relabelformat %d", r.Relabelformat)
+	}
+	return rec(r.Arg)
 }
 
 // numericCastPackedTypmod reports whether f is the explicit `::numeric(p,s)` length

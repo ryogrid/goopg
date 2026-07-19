@@ -136,7 +136,8 @@ func TestNumericLenCoerceRebuildRoundTrip(t *testing.T) {
 // branch: an explicit `::numeric(10,2)` cast into a numeric(10,2) column already
 // carries the column typmod, so NO implicit length coercion is added (the stored
 // node stays the funcformat-1 cast). A bare numeric column (typmod -1) with the same
-// cast still degrades (RelabelType, not modeled).
+// cast now wraps the cast in an implicit RelabelType (sub-slice 24), not a numeric()
+// length coercion.
 func TestNumericLenCoerceNoWrapWhenTypmodMatches(t *testing.T) {
 	// Matching typmod: the resolved node is the funcformat-1 explicit cast, unwrapped.
 	n, ok := ResolveForColumnTypmod(mustParse(t, "5.5::numeric(10,2)"), OidNumeric, 655366)
@@ -148,8 +149,13 @@ func TestNumericLenCoerceNoWrapWhenTypmodMatches(t *testing.T) {
 		t.Fatalf("matching typmod: got %T funcformat, want funcformat-1 explicit cast (no implicit wrap)", n)
 	}
 
-	// Bare numeric column: the explicit typmod'd cast still degrades (RelabelType).
-	if _, ok := ResolveForColumnTypmod(mustParse(t, "5.5::numeric(10,2)"), OidNumeric, -1); ok {
-		t.Fatalf("bare numeric column with a typmod'd cast should degrade (RelabelType), got canonical")
+	// Bare numeric column: the explicit typmod'd cast is re-labelled to typmod -1 via
+	// an implicit RelabelType (sub-slice 24), no longer a degrade.
+	nb, ok := ResolveForColumnTypmod(mustParse(t, "5.5::numeric(10,2)"), OidNumeric, -1)
+	if !ok {
+		t.Fatalf("bare numeric column with a typmod'd cast should wrap in a RelabelType, got degrade")
+	}
+	if _, isRelabel := nb.(*RelabelType); !isRelabel {
+		t.Fatalf("bare numeric column with a typmod'd cast should produce a RelabelType, got %T", nb)
 	}
 }

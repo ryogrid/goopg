@@ -1185,8 +1185,59 @@ still needs **no** wrap — sub-slice 22's cast already carries the column typmo
   pgbench smoke via pre-commit.
 
 The one remaining numeric degrade is the **bare `numeric` column with a typmod'd cast
-default** (`col numeric DEFAULT 5.5::numeric(8,1)` → `RelabelType`), deferred to a
-future `RelabelType` IR-node slice.
+default** (`col numeric DEFAULT 5.5::numeric(8,1)` → `RelabelType`), closed by
+sub-slice 24 below.
+
+## Sub-slice 24 — bare-`numeric`-column typmod'd DEFAULT `RelabelType`
+
+Sub-slice 23 closed the length-coercion case for a `numeric(p,s)` column but left the
+mirror case: a **bare** `numeric` column (atttypmod −1) whose DEFAULT *does* carry a
+length typmod, e.g. `col numeric DEFAULT 5.5::numeric(8,1)`. `coerce_type_typmod`
+(parse_coerce.c) reaches its **no-op** branch here — the target typmod is −1, so a
+`numeric()` length coercion would do nothing — and instead re-labels the exposed typmod
+back to −1 with an **IMPLICIT `RelabelType`** (`relabelformat` 2, `COERCE_IMPLICIT_CAST`).
+A live probe confirmed the shape (`resulttype` 1700, `resulttypmod` −1, `resultcollid`
+0):
+
+```
+RelabelType  (relabelformat 2, resulttypmod -1 — strips the typmod for the bare column)
+  └─ arg: the resolved default, whatever its shape:
+           • funcformat-1 1703 cast        (DEFAULT 5.5::numeric(8,1))
+           • 1703 over int4_numeric (1740) (DEFAULT 5::numeric(8,1))
+           • 1703 over int8_numeric (1781) (DEFAULT 5000000000::numeric(8,1))
+```
+
+(An *explicit* re-cast to bare numeric — `(5.5::numeric(8,1))::numeric` — is the same
+`RelabelType` with `relabelformat` **1**; not emitted by the DEFAULT path, so not modeled.)
+`pg_get_expr` deparses the implicit relabel invisibly (just the inner `5.5::numeric(8,1)`),
+so the rebuild path unwraps it.
+
+### Changes
+
+- `resolver_expr.go`: `ResolveForColumnTypmod`'s bare-numeric branch
+  (`targetTypmod < 0`, node typmod `>= 0`) now wraps the node via new
+  `wrapNumericRelabelToBare` (`RelabelType`, `resulttypmod` −1, `relabelformat` 2) instead
+  of returning `(nil, false)`.
+- `rebuild.go`: new `case *RelabelType` → `rebuildRelabelType`, which unwraps the
+  implicit (`relabelformat` 2) form to its argument (matching `pg_get_expr`) so
+  re-resolving the inner cast in the same bare-column context re-wraps a byte-identical
+  tree (fixed point). An explicit `relabelformat` (≠2) is rejected, not silently dropped.
+- The `RelabelType` IR node + `RELABELTYPE` codec (`outfuncs.go`/`readfuncs.go`) already
+  existed from S1; only the resolver/rebuild wiring was missing. No executor change.
+
+### Gates (all green)
+
+- `internal/pgnodes/numeric_relabel_test.go` — 4 live-captured PG18.3 goldens
+  (`5.5::numeric(8,1)`, `5::numeric(8,1)`, `5000000000::numeric(8,1)`,
+  `(-2.5)::numeric(8,1)`) through golden + codec + rebuild fixed-point loops, plus a
+  no-wrap guard (a bare decimal default stays a plain `Const`; explicit-relabel reject).
+- `internal/testport/oracle_pgnodes_adbin_test.go` — 2 bare-`numeric` cases added
+  (**59 cases total**, all byte-identical vs PG18.3, ≈1.65s).
+- `numeric_lencoerce_test.go` / `cast_test.go` reconciled (the bare-numeric typmod'd cast
+  flipped from degrade to canonical); full `pgnodes` package + `go vet` + gofmt clean;
+  executor attrdef siblings green; pgbench smoke via pre-commit.
+
+All numeric column/typmod DEFAULT shapes are now canonical; no numeric degrade remains.
 
 ## Byte-diff oracle gate (adbin) — `internal/testport/oracle_pgnodes_adbin_test.go`
 

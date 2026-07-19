@@ -83,11 +83,14 @@ func ResolveForColumn(e parser.Expr, targetType uint32) (Node, bool) {
 // the resolved node's typmod, e.g. col numeric(10,2) DEFAULT 5.5::numeric(10,2)) needs
 // NO wrap — sub-slice 22's funcformat-1 cast already carries it.
 //
-// The one numeric case still degraded is a BARE numeric column (targetTypmod < 0)
-// whose default is an explicit `::numeric(p,s)` cast (the resolved node carries a
-// typmod >= 0): PG strips the typmod back with a RelabelType (a node not modeled
-// here), so this returns (nil, false). targetTypmod is -1 for every non-numeric-typmod
-// caller via ResolveForColumn.
+// A BARE numeric column (targetTypmod < 0) whose default carries a typmod >= 0
+// (an explicit `::numeric(p,s)` cast, sub-slice 22) is handled by coerce_type_typmod's
+// OTHER branch: since the target typmod is -1 the length coercion is a no-op, so PG
+// strips the exposed typmod back to -1 with an IMPLICIT RelabelType (relabelformat 2)
+// rather than a numeric() call — e.g. col numeric DEFAULT 5.5::numeric(8,1) stores a
+// RELABELTYPE(resulttypmod -1, relabelformat 2) around the funcformat-1 cast
+// (wrapNumericRelabelToBare). targetTypmod is -1 for every non-numeric-typmod caller
+// via ResolveForColumn.
 func ResolveForColumnTypmod(e parser.Expr, targetType uint32, targetTypmod int32) (Node, bool) {
 	n, typ, err := resolve(e, targetType)
 	if err != nil || typ != targetType {
@@ -103,10 +106,12 @@ func ResolveForColumnTypmod(e parser.Expr, targetType uint32, targetTypmod int32
 			}
 			return n, true
 		}
-		// Bare numeric column: an explicit `::numeric(p,s)` cast (exprTypmod >= 0)
-		// would be re-labelled to typmod -1 via a RelabelType — not modeled → degrade.
+		// Bare numeric column: an explicit `::numeric(p,s)` cast (exprTypmod >= 0) is
+		// re-labelled back to typmod -1 via an IMPLICIT RelabelType (coerce_type_typmod:
+		// target typmod -1 ⇒ the length coercion is a no-op, so PG emits a RelabelType,
+		// not a numeric() call). A default already at typmod -1 needs no relabel.
 		if exprTypmod >= 0 {
-			return nil, false
+			n = wrapNumericRelabelToBare(n)
 		}
 	}
 	return n, true
@@ -145,6 +150,26 @@ func wrapNumericLengthCoercion(n Node, packedTypmod int32) Node {
 		Inputcollid:    0,
 		Args:           []Node{n, NewInt4Const(packedTypmod)},
 		Location:       -1,
+	}
+}
+
+// wrapNumericRelabelToBare wraps a numeric-typed node that carries a length typmod
+// (>= 0) in PG's IMPLICIT RelabelType (relabelformat 2, COERCE_IMPLICIT_CAST) that
+// strips the exposed typmod back to -1 for a bare `numeric` column. coerce_type_typmod
+// (parse_coerce.c) reaches this form when the target typmod is -1: the numeric() length
+// coercion would be a no-op, so PG emits a RelabelType instead of a function call.
+// resulttypmod is always -1 (bare numeric); resultcollid 0 (numeric is not collatable).
+// The rebuild inverse (rebuildRelabelType) unwraps it invisibly like pg_get_expr, so
+// re-resolving the inner `::numeric(p,s)` cast in the same bare-column context is a
+// fixed point.
+func wrapNumericRelabelToBare(n Node) Node {
+	return &RelabelType{
+		Arg:           n,
+		Resulttype:    OidNumeric,
+		Resulttypmod:  -1,
+		Resultcollid:  0,
+		Relabelformat: 2, // COERCE_IMPLICIT_CAST
+		Location:      -1,
 	}
 }
 

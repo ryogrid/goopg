@@ -1334,8 +1334,26 @@ existing encoder, `constcollid=100` / `consttypmod=n+4`.
       guard) + oracle_pgnodes_adbin_test.go now 57 cases all byte-identical vs PG18.3
       (1.58s); executor attrdef siblings green. Design 0123-0005 §"Sub-slice 23"; ledger
       2026-07-20 (bare-numeric-column RelabelType still deferred).
-      REMAINING: bare-`numeric`-column typmod'd-cast DEFAULT (`col numeric DEFAULT
-      5.5::numeric(8,1)` → RelabelType IR node, still degrades); float4-common (no
+      SUB-SLICE 24 LANDED (2026-07-20): bare-`numeric`-column typmod'd DEFAULT
+      **`RelabelType`** (closes sub-slice 23's last numeric degrade). A bare `numeric`
+      column (atttypmod -1) whose DEFAULT carries a length typmod (`numeric DEFAULT
+      5.5::numeric(8,1)`/`5::numeric(8,1)`/`5000000000::numeric(8,1)`/`(-2.5)::numeric(8,1)`)
+      now wraps the resolved node in an IMPLICIT `RelabelType` (relabelformat 2,
+      resulttypmod -1, resultcollid 0) that strips the exposed typmod back to the column's
+      -1 — `coerce_type_typmod`'s no-op branch (target typmod -1 ⇒ the numeric() length
+      coercion would do nothing, so PG emits a RelabelType not a func call), byte-identical
+      to PG18.3 (live-probed). resolver_expr.go `ResolveForColumnTypmod` bare-numeric branch
+      wraps via new `wrapNumericRelabelToBare` instead of degrading; rebuild.go new
+      `case *RelabelType`→`rebuildRelabelType` unwraps the implicit form invisibly like
+      pg_get_expr (fixed point; explicit relabelformat≠2 rejected). The `RelabelType` IR
+      node + RELABELTYPE codec already existed from S1 — only resolver/rebuild wiring was
+      missing. NO executor change. Gate `internal/pgnodes/numeric_relabel_test.go` (4 live
+      PG18.3 goldens + codec/rebuild loops + no-wrap guard) + oracle_pgnodes_adbin_test.go
+      now 59 cases all byte-identical vs PG18.3 (1.65s); numeric_lencoerce_test/cast_test
+      reconciled (bare-numeric typmod'd cast flipped degrade→canonical); executor attrdef
+      siblings green. Design 0123-0005 §"Sub-slice 24" + README index. ALL numeric column/
+      typmod DEFAULT shapes now canonical.
+      REMAINING: float4-common (no
       float8) CASE mix (needs int/numeric→float4 arms + outer column cast); date-time-
       family CASE coercion (searched CASE over date/timestamptz `::type`-cast literal
       arms — needs a `date` OID-1082 datum + explicit `::timestamptz`/`::date` cast

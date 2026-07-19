@@ -200,6 +200,11 @@ var adbinOracleCases = []adbinOracleCase{
 	{"lencoerce_int8_10_2", "numeric(10,2)", pgnodes.OidNumeric, "5000000000"},
 	{"lencoerce_explicit_8_1_into_10_2", "numeric(10,2)", pgnodes.OidNumeric, "5.5::numeric(8,1)"},
 	{"lencoerce_decimal_10_0", "numeric(10,0)", pgnodes.OidNumeric, "5.5"},
+	// Sub-slice 24: a BARE numeric column whose default carries a typmod is re-labelled
+	// back to typmod -1 via an implicit RelabelType (coerce_type_typmod's no-op branch),
+	// not a numeric() length coercion.
+	{"relabel_bare_explicit_8_1", "numeric", pgnodes.OidNumeric, "5.5::numeric(8,1)"},
+	{"relabel_bare_int4_explicit_8_1", "numeric", pgnodes.OidNumeric, "5::numeric(8,1)"},
 }
 
 // TestOraclePgnodesAdbinBytesMatchPG is the M0123-S4 byte-diff oracle: for each
