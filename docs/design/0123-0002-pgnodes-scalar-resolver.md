@@ -90,16 +90,23 @@ aborts the whole resolution, which is exactly the `SupportsExpr` predicate.
   (it had still asserted `upper('x')` was unsupported). This unblocks the
   `DEFAULT upper('x')` arm of the S2 E2E gate.
 
-## Deferred (S2 sub-slice 2 and beyond) — see the deferral ledger
+## Landed in S2 sub-slice 2 — see `0123-0003-pgnodes-attrdef-writer-reload-wiring.md`
 
-- **Writer wiring**: `internal/executor/operators_ddl.go` (the `writeAttrdefRow`
-  funnel) + `internal/executor/sys_pg_statistic_ext.go` (`stxexprs`) emit
-  `NewBytesDatum(canonical)` when `SupportsExpr`, else the current SQL text — no
-  codec change (`pg_node_tree` already passes `KindBytes` through).
-- **Reload swap**: `internal/initdb/catalog_heap_reload.go`
-  `loadColumnDefaultsFromHeap` / `loadStatisticsExtFromHeap` branch on a 1-byte
-  discriminator (canonical dumps begin `{`) → `pgnodes.Read` → `Rebuild`, else
-  `parser.ParseExpr`; kept standalone-unconditional per `NamespaceDBOid`.
-- **E2E**: adversarial standby-eval per the milestone (`DEFAULT 40+2`,
-  `DEFAULT upper('x')`, `DEFAULT -1`; PG standby `INSERT … DEFAULT VALUES`
-  asserted `=(42,'X',-1)` and `==` goopg's own).
+- **`pg_attrdef` writer wiring**: `writeAttrdefRow` now stores canonical bytes via
+  `pgnodes.ResolveForColumn` (exact-type-match) → `Out`, else SQL text — as a
+  plain `string` datum (nodeToString is pure ASCII, so no `NewBytesDatum` / codec
+  change was needed after all).
+- **`pg_attrdef` reload swap**: `loadColumnDefaultsFromHeap` branches on the
+  leading `{` → `pgnodes.Read` → `Rebuild`, else `parser.ParseExpr`; still
+  standalone-unconditional per `NamespaceDBOid`.
+
+## Still deferred (see the deferral ledger, 2026-07-19)
+
+- **`stxexprs` canonical writer/reload**: blocked on a `List` IR node
+  (`pg_statistic_ext.stxexprs` is a `List` of trees, `(...)` not `{...}`); the
+  writer keeps the goopg `text[]` SQL-text literal until S3/S4 adds `List`.
+- **Adversarial standby-eval E2E**: blocked by `pg_attrdef` catalog completeness
+  on the standby, NOT by the canonical bytes — goopg's streamed `pg_attribute`
+  (relid 2604) does not give a real PG18 a usable `adbin` column, and PG's
+  `AttrDefaultFetch` opens the unmaterialized `adrelid/adnum` index (OID 2656).
+  Both are orthogonal `pg_attrdef`-surface gaps; resume point in 0123-0003.

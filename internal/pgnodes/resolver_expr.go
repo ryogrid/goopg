@@ -52,6 +52,29 @@ func ResolveExpr(e parser.Expr, targetType uint32) (Node, error) {
 	return n, err
 }
 
+// ResolveForColumn is the writer-facing entry point for a column DEFAULT (or any
+// value stored FOR a specific type). It returns the canonical IR only when the
+// WHOLE expression resolves AND its top-level result type OID equals targetType
+// exactly. The exact-match guard is a fidelity requirement, not a nicety: PG's
+// build_column_default returns the stored expression already coerced to the
+// attribute type (see postgres/src/backend/catalog/heap.c:build_column_default →
+// coerce_to_target_type), so a real standby that stringToNode()'s a canonical
+// adbin whose top node is, say, an int4 Const for a numeric/smallint column
+// would insert a mistyped Datum. ResolveExpr itself does NOT check this (it types
+// an integer literal purely by magnitude, ignoring the column context beyond the
+// int8-widening / text-coercion cases), so the writer must. When the types do not
+// match — DEFAULT 0 on numeric, DEFAULT 5 on smallint, a string literal on a
+// non-text column — this returns (nil, false) and the writer degrades to SQL
+// text (all-or-nothing; 02e §3). This keeps SupportsExpr's already-tested
+// semantics unchanged for the resolver's own round-trip gate.
+func ResolveForColumn(e parser.Expr, targetType uint32) (Node, bool) {
+	n, typ, err := resolve(e, targetType)
+	if err != nil || typ != targetType {
+		return nil, false
+	}
+	return n, true
+}
+
 // resolve returns the IR node AND its result type OID (needed to forward-resolve
 // an enclosing operator/function). The returned type is 0 only for a Const whose
 // type is genuinely unknown, which cannot happen here (every leaf resolves to a

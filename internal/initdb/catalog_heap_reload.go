@@ -18,6 +18,7 @@ import (
 	"github.com/goopg/goopg/internal/executor"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/parser"
+	"github.com/goopg/goopg/internal/pgnodes"
 	"github.com/goopg/goopg/internal/storage"
 	"github.com/goopg/goopg/internal/wal"
 )
@@ -272,7 +273,7 @@ func loadColumnDefaultsFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory
 		if !ok || tbl == nil {
 			continue // table dropped since the row was written
 		}
-		expr, perr := parser.ParseExpr(ad.adbin)
+		expr, perr := rebuildAttrdefExpr(ad.adbin)
 		if perr != nil {
 			continue
 		}
@@ -284,6 +285,27 @@ func loadColumnDefaultsFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory
 		}
 	}
 	return nil
+}
+
+// rebuildAttrdefExpr turns a stored pg_attrdef.adbin back into a goopg
+// default-expression AST. M0123-S2 (sub-slice 2): adbin now comes in two forms,
+// discriminated by the first byte — a canonical PG18 pg_node_tree always opens
+// with '{' (nodeToString's WRITE_NODE_TYPE brace), whereas goopg's legacy SQL
+// text never does (a bare expression like `40 + 2` / `upper('x')` / `'{}'::jsonb`
+// starts with a digit, letter, quote, or sign, never '{'). Canonical bytes are
+// read by pgnodes.Read → Rebuild (the reload-time inverse of ResolveForColumn);
+// SQL text keeps going through parser.ParseExpr. A malformed value in either form
+// returns an error so the caller degrades that one column to a NULL default
+// rather than failing startup, matching the pre-canonical behavior.
+func rebuildAttrdefExpr(adbin string) (parser.Expr, error) {
+	if len(adbin) > 0 && adbin[0] == '{' {
+		node, err := pgnodes.Read(adbin)
+		if err != nil {
+			return nil, err
+		}
+		return pgnodes.Rebuild(node)
+	}
+	return parser.ParseExpr(adbin)
 }
 
 // statExtRegistryRecovery is the catalog-side surface the pg_statistic_ext

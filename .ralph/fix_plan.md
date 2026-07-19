@@ -5663,17 +5663,26 @@ existing encoder, `constcollid=100` / `consttypmod=n+4`.
       collid 100), confirmed the resolver matches it byte-for-byte, and
       reconciled the test (`upper('x')` now a supported case + a golden Out pin +
       a resolve→Rebuild→re-resolve round-trip case). HEAD green again.
-      SUB-SLICE 2 REMAINS (own gated commit — the risky/E2E half): (b) wire `writeAttrdefRow`
-      + the `stxexprs` writer to emit canonical bytes when supported, else fall
-      + the `stxexprs` writer to emit canonical bytes when supported, else fall
-      back to SQL text (`NewBytesDatum(canonical)` vs `NewStringDatum(sqltext)`;
-      no codec change — `pg_node_tree` already passes `KindBytes` through). Swap
-      `loadColumnDefaultsFromHeap` / `loadStatisticsExtFromHeap` to
-      `pgnodes.Read → rebuild` (1-byte discriminator: canonical dumps begin `{`);
-      keep them standalone-unconditional per-`NamespaceDBOid`. Gate: adversarial
-      standby-eval E2E — goopg primary `CREATE TABLE t(a int DEFAULT 40+2,
-      b text DEFAULT upper('x'), c int DEFAULT -1)`; PG standby
-      `INSERT … DEFAULT VALUES`, assert row `=(42,'X',-1)` AND `==` goopg's own.
+      SUB-SLICE 2 parts (b)(c) — canonical `pg_attrdef.adbin` writer + reload —
+      **LANDED (2026-07-19)**: new `pgnodes.ResolveForColumn` (exact-type-match
+      gate) drives `canonicalAttrdefText` in the `writeAttrdefRow` funnel
+      (`internal/executor/sys_pg_attrdef.go` / `operators_ddl.go`); the reload
+      `rebuildAttrdefExpr` (`internal/initdb/catalog_heap_reload.go`)
+      discriminates on the leading `{` → `pgnodes.Read`→`Rebuild`, else
+      `parser.ParseExpr`. `adbin` stored as a plain `string` (nodeToString is
+      pure ASCII — no `NewBytesDatum`/codec change). Gate: fast units
+      (`TestResolveForColumn`, `TestCanonicalAttrdefText`, `TestRebuildAttrdefExpr`)
+      + PG18.3 byte goldens + full `internal/initdb` + `TestE2E_FailoverGoopgToPG`.
+      Design `0123-0003-pgnodes-attrdef-writer-reload-wiring.md`.
+      SUB-SLICE 2 DEFERRED (ledger 2026-07-19, both orthogonal to node-tree
+      serialization): (1) the adversarial **standby-EVAL** E2E is blocked by
+      `pg_attrdef` catalog completeness — a real PG18 standby can't build a usable
+      `pg_attrdef` tupledesc from goopg's streamed `pg_attribute` (relid 2604 has
+      no usable `adbin` column) and `AttrDefaultFetch` opens the unmaterialized
+      `adrelid/adnum` index (OID 2656); needs bootstrap `pg_attribute` completion
+      + 2656/2657 index materialization first. (2) canonical **`stxexprs`** is
+      blocked on a `List` IR node (`stxexprs` is a `List` of trees, `(...)` not
+      `{...}`) — arrives with S3/S4.
 - [ ] M0123-S3 — `resolver_query.go` (goopg `*parser.SelectStmt` + catalog → IR
       `Query` for single-base-relation views) + the `Query`/`RangeTblEntry`/
       `RTEPermissionInfo`/`FromExpr`/`RangeTblRef`/`TargetEntry`/`Var` tags in

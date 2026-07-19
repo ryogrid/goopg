@@ -13269,11 +13269,11 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 		if col.Dropped || col.DefaultExpr == nil {
 			continue
 		}
-		exprSQL := catalog.FormatExprForAttrdef(col.DefaultExpr)
-		if exprSQL == "" {
+		adbin := canonicalAttrdefText(col)
+		if adbin == "" {
 			continue
 		}
-		if err := writeAttrdefRow(ctx, tbl.OID, int16(col.Ordinal+1), exprSQL); err != nil {
+		if err := writeAttrdefRow(ctx, tbl.OID, int16(col.Ordinal+1), adbin); err != nil {
 			return fmt.Errorf("pg_attrdef col %q: %w", col.Name, err)
 		}
 	}

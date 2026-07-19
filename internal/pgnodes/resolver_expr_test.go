@@ -227,3 +227,67 @@ func TestResolveExprTypeStability(t *testing.T) {
 	}
 	_ = reflect.TypeOf(n) // keep reflect import if shape checks are trimmed later
 }
+
+// TestResolveForColumn covers the writer-facing, exact-type-match gate used to
+// decide whether a column DEFAULT is stored as a canonical pg_node_tree
+// (pgnodes.ResolveForColumn true) or degrades to SQL text (false). The guard is
+// a fidelity requirement: PG's build_column_default returns the default already
+// coerced to the attribute type, so a canonical tree whose top node's type does
+// not match the column type would misinsert on a standby.
+func TestResolveForColumn(t *testing.T) {
+	const oidNumeric, oidInt2 = 1700, 21
+	cases := []struct {
+		sql        string
+		targetType uint32
+		wantOK     bool
+	}{
+		// Exact-match: accepted.
+		{"40 + 2", OidInt4, true},   // OpExpr int4 == int4 column
+		{"-1", OidInt4, true},       // negative int4 Const
+		{"upper('x')", OidText, true}, // FuncExpr text == text column
+		{"5000000000", OidInt8, true}, // int8 literal == int8 column
+		{"'hi'", OidText, true},     // text Const == text column
+		// Type mismatch: must fall back to SQL text (wantOK false) so a standby
+		// never inserts a mistyped Datum.
+		{"0", oidNumeric, false}, // int4 Const for a numeric column
+		{"5", oidInt2, false},    // int4 Const for a smallint column
+		{"'x'", OidInt4, false},  // string literal on a non-text column
+		// Outside the canonical subset at all: SQL text.
+		{"now()", OidText, false}, // now() has no seeded overload here
+	}
+	for _, tc := range cases {
+		node, ok := ResolveForColumn(mustParse(t, tc.sql), tc.targetType)
+		if ok != tc.wantOK {
+			t.Errorf("ResolveForColumn(%q, %d) ok = %v, want %v", tc.sql, tc.targetType, ok, tc.wantOK)
+			continue
+		}
+		if ok && node == nil {
+			t.Errorf("ResolveForColumn(%q, %d) returned nil node with ok=true", tc.sql, tc.targetType)
+		}
+		if !ok && node != nil {
+			t.Errorf("ResolveForColumn(%q, %d) returned non-nil node with ok=false", tc.sql, tc.targetType)
+		}
+	}
+}
+
+// TestResolveForColumnRoundTripDiscriminator asserts the canonical output the
+// writer stores always opens with '{' (the reload discriminator) while the SQL
+// text fallback never does — the property rebuildAttrdefExpr keys on.
+func TestResolveForColumnRoundTripDiscriminator(t *testing.T) {
+	node, ok := ResolveForColumn(mustParse(t, "40 + 2"), OidInt4)
+	if !ok {
+		t.Fatal("expected canonical support for 40 + 2 on int4")
+	}
+	adbin := Out(node)
+	if len(adbin) == 0 || adbin[0] != '{' {
+		t.Fatalf("canonical adbin %q must open with '{'", adbin)
+	}
+	// Reload inverse: Read -> Rebuild reproduces an evaluable AST.
+	back, err := Read(adbin)
+	if err != nil {
+		t.Fatalf("Read(%q): %v", adbin, err)
+	}
+	if _, err := Rebuild(back); err != nil {
+		t.Fatalf("Rebuild: %v", err)
+	}
+}

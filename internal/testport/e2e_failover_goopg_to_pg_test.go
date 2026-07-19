@@ -480,6 +480,21 @@ func runFailoverGoopgToPG(t *testing.T, repo, pgBasebackupBin, psqlBin string, m
 		"SELECT count(*) FROM pg_rewrite r JOIN pg_class c ON c.oid = r.ev_class WHERE c.relname = 'b5c_view' AND r.rulename = '_RETURN'"); got != "1" {
 		t.Fatalf("post-failover pg_rewrite has b5c_view _RETURN rule = %q, want 1 (view rule heap insert not replayed)", got)
 	}
+
+	// NOTE (M0123-S2 sub-slice 2, 2026-07-19): goopg now stores column DEFAULTs as
+	// CANONICAL PG18 pg_node_tree in pg_attrdef.adbin (byte-identical to real PG18,
+	// pinned in internal/pgnodes), but the ADVERSARIAL standby-consumption gate for
+	// it is DEFERRED, not added here. A real PG standby cannot yet read goopg's
+	// pg_attrdef for DEFAULT evaluation: (1) pg_attrdef is a non-nailed catalog
+	// whose tupledesc PG rebuilds from the streamed pg_attribute rows, and goopg's
+	// on-disk pg_attribute for relid 2604 does not expose a usable `adbin` column
+	// (a direct `pg_get_expr(adbin, adrelid)` query fails "column adbin does not
+	// exist"); and (2) PG's AttrDefaultFetch (relcache.c) opens pg_attrdef BY its
+	// adrelid/adnum index (AttrDefaultIndexId 2656), which goopg does not
+	// materialize ("could not open relation with OID 2656"). Both are pg_attrdef
+	// catalog-completeness gaps orthogonal to node-tree serialization; see the
+	// deferral ledger (2026-07-19). The canonical writer + reload sibling pair is
+	// gated by fast unit tests (internal/pgnodes, internal/executor, internal/initdb).
 }
 
 func runGoopgBasebackupToPG(t *testing.T, repo, bin string, primary *cluster.Cluster, outDir, slotName string) {
