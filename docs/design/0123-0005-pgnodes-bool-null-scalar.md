@@ -813,6 +813,42 @@ SQL text.
   initdb `TestRebuildAttrdefExpr`/`TestRebuildViewFromEvAction` green; gofmt clean;
   pgbench smoke via pre-commit hook.
 
+## Byte-diff oracle gate (adbin) — `internal/testport/oracle_pgnodes_adbin_test.go`
+
+The per-datum golden tests above each hard-code a `want` `adbin` string a
+developer captured by hand from a live PG18.3. That is fast but leaves two gaps:
+a hand-copied golden can silently drift from what PG18 actually emits, and a new
+datum/expression type needs a separate manual capture step. `TestOraclePgnodes\
+AdbinBytesMatchPG` closes both by re-deriving the oracle **live**: for each
+`(column type, DEFAULT expr)` case it
+
+1. `CREATE TABLE t (v <type> DEFAULT (<expr>))` on a fresh PG18 (`pgcluster.New`
+   + `Start`),
+2. reads back `pg_attrdef.adbin::text`,
+3. normalizes `:location <N>` → `:location -1` (PG18 stores catalog
+   `pg_node_tree` with `write_location_fields=false`, so for `adbin` this is a
+   no-op belt; goopg's `Out` always emits `-1`), and
+4. asserts `pgnodes.ResolveForColumn(parser.ParseExpr(expr), oid)` → `Out` is
+   **byte-identical**. A goopg SQL-text fallback (`ok==false`) on a case PG stores
+   canonically is itself a failure.
+
+The 25 cases span every S4-canonical family: bare `Const` leaves (int4/int8 by
+magnitude, folded negative, text, numeric decimal/scientific/negative),
+`int4→numeric` cast FuncExpr, built-in FuncExpr (`upper`), timestamptz literal
+Const, `BoolExpr`/`NullTest`/`OpExpr` (incl. `makeAndExpr` 3-arg flattening),
+`BooleanTest` (`IS TRUE`/`IS UNKNOWN`), `DistinctExpr` (int + text), and
+`CaseExpr` (searched + simple, same-type and cross-type int→numeric / int4→int8
+result coercion). Every case is drawn from an existing `internal/pgnodes` golden
+so `ResolveForColumn` is known to accept it — the added value is that the `want`
+now comes from a live PG18, catching both transcription drift and future
+coverage gaps automatically.
+
+Gating matches the other heterogeneous E2E tests: skipped under `-short`, when
+`GOOPG_SKIP_PGNODES_ORACLE` is set, and when the upstream PG binaries are absent
+(`pgcluster.Available`). Wall time ≈ 1.3 s (one initdb + 25 `CREATE TABLE`s).
+The view `ev_action` oracle (`ResolveViewQuery`/`pg_rewrite`) needs a
+`RelationResolver` shim over live-PG catalog metadata and is deferred below.
+
 ## Deferred
 
 - **Cross-family** float-common-*without*-float8 `CASE` mixes still degrade: a mix
@@ -826,7 +862,12 @@ SQL text.
   `WHEN` value PG would cast) still degrades to SQL text: PG inserts a cast
   FuncExpr on the RHS (and, for some coercions, a RelabelType above the
   placeholder) that this subset does not yet model.
-- The byte-diff oracle gate remains in M0123-S4. Operator-driven implicit
-  coercion in view quals (which would let a `timestamptz`/`int2`→`numeric`
-  string literal resolve inside a view `WHERE`) is also still SQL-text — only
-  the exact scalar-column DEFAULT context folds a `timestamptz`/numeric literal.
+- The byte-diff oracle now covers the **`adbin` (column DEFAULT) path** (see the
+  section above). The **view `ev_action` (`pg_rewrite`) oracle** is still
+  deferred: `ResolveViewQuery` needs a `RelationResolver` shim that answers
+  base-table column metadata from the live PG18 catalog before the same
+  create-on-PG / read-back / byte-diff loop can run over `ev_action::text`.
+- Operator-driven implicit coercion in view quals (which would let a
+  `timestamptz`/`int2`→`numeric` string literal resolve inside a view `WHERE`)
+  is also still SQL-text — only the exact scalar-column DEFAULT context folds a
+  `timestamptz`/numeric literal.

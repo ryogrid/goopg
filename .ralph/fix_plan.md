@@ -1205,7 +1205,23 @@ existing encoder, `constcollid=100` / `consttypmod=n+4`.
       case_test.go (4 live goldens tables ucf/ucf5: int4/int8/numeric→float8 +
       three-family int4+float4+float8; degrade case swapped int4_float8_no_numeric→
       float4_common_no_float8). Design 0123-0005 §"Sub-slice 16".
-      REMAINING: float4-common (no float8) CASE mix (needs int/numeric→float4 arms +
-      outer column cast); date-time-family CASE coercion; simple-form WHEN value
-      needing implicit cast to operand type; operator-driven view-qual coercion
-      (unblocks int2/timestamptz literals in view quals); byte-diff oracle.
+      BYTE-DIFF ORACLE (adbin) LANDED (2026-07-19): new
+      internal/testport/oracle_pgnodes_adbin_test.go
+      (TestOraclePgnodesAdbinBytesMatchPG). For each of 25 canonical
+      (column-type, DEFAULT-expr) cases it CREATE TABLEs the default on a LIVE
+      PG18 (pgcluster.New+Start), reads back pg_attrdef.adbin::text, normalizes
+      `:location N`→`-1`, and asserts pgnodes.ResolveForColumn→Out is
+      byte-identical (SQL-text fallback on a PG-canonical case = failure). Spans
+      every S4-canonical family: int4/int8/text/numeric Consts (decimal/sci/neg),
+      int4→numeric cast, upper() FuncExpr, timestamptz literal, BoolExpr/NullTest/
+      OpExpr (+3-arg AND flatten), BooleanTest, DistinctExpr (int+text), CaseExpr
+      (searched+simple, int→numeric / int4→int8 coercion). Cases drawn from
+      existing pgnodes goldens so the added value is a LIVE oracle (catches
+      hand-capture drift + auto-covers future types), not a fresh assertion.
+      Gated: -short + GOOPG_SKIP_PGNODES_ORACLE + pgcluster.Available; ≈1.3s.
+      All 25 GREEN vs PG18.3. Design 0123-0005 §"Byte-diff oracle gate (adbin)".
+      REMAINING: view ev_action (pg_rewrite) oracle (needs RelationResolver shim
+      over live PG catalog); float4-common (no float8) CASE mix (needs
+      int/numeric→float4 arms + outer column cast); date-time-family CASE
+      coercion; simple-form WHEN value needing implicit cast to operand type;
+      operator-driven view-qual coercion (unblocks int2/timestamptz literals).

@@ -1,35 +1,33 @@
-Task: M0123-S4 sub-slice 16 — UNIFIED cross-FAMILY CASE coercion (any
-int/numeric/float → float8). COMPLETE this loop; committing + pushing.
+Task: M0123-S4 — byte-diff oracle gate (adbin). COMPLETE this loop; committing + pushing.
 
-Landed: a CASE mix spanning the exact-integer/numeric and binary-float families
-that CONTAINS float8 now folds to canonical casetype float8 (was SQL text).
-- selectCaseCommonType (resolver_expr.go): rewritten from two disjoint families
-  to ONE walk over PG's numeric type category {int4,int8,numeric,float4,float8};
-  float8 is the category's PREFERRED type so it wins whenever present (precedence
-  float8>numeric>int8>int4). A float4-but-no-float8 mix → common type float4 +
-  outer column cast (unmodeled → degrade).
-- coerceCaseResult: new int4/int8/numeric→float8 arms via wrapToFloat8Cast
-  (float8(int4)=316 / float8(int8)=482 / float8(numeric)=1746, funcformat 2,
-  castcontext 'i'). float4→float8 still via wrapFloat4ToFloat8Cast (311).
-- rebuild.go isImplicitToFloat8Cast unwraps {316,482,1746} funcformat==2 (guard
-  load-bearing: same OIDs appear funcformat 0 for explicit float8(int) calls).
+Landed: new internal/testport/oracle_pgnodes_adbin_test.go
+(TestOraclePgnodesAdbinBytesMatchPG) — the S4 "byte-diff oracle" deliverable for
+the column-DEFAULT (adbin) path. For each of 25 canonical (col-type, DEFAULT-expr)
+cases it CREATE TABLEs the default on a LIVE PG18 (pgcluster.New+Start), reads
+back pg_attrdef.adbin::text, normalizes `:location N`→`-1`, and asserts
+pgnodes.ResolveForColumn→Out is byte-identical. SQL-text fallback on a
+PG-canonical case = hard failure. Cases span every S4 family (int/text/numeric
+Consts, int4→numeric cast, upper(), timestamptz lit, BoolExpr/NullTest/OpExpr,
+BooleanTest, DistinctExpr, CaseExpr searched+simple + int→numeric/int4→int8
+coercion), all drawn from existing pgnodes goldens → the value is a LIVE oracle
+(catches hand-capture drift + auto-covers future types).
 
-Key symbols: selectCaseCommonType, coerceCaseResult, wrapToFloat8Cast,
-isImplicitToFloat8Cast, rebuildFuncExprWith.
+Key symbols: TestOraclePgnodesAdbinBytesMatchPG, normalizeOracleLocations,
+adbinOracleCase; drives pgnodes.ResolveForColumn/Out + parser.ParseExpr +
+pgcluster.New/Start/Exec/QueryScalar.
 
-Gates (GREEN): full pgnodes pkg, go build ./..., go vet ./internal/pgnodes/,
-gofmt clean (3 files), executor TestCanonicalAttrdefText/TestDefault/
-TestResolveForColumn + initdb TestRebuildAttrdefExpr/TestRebuildViewFromEvAction,
-ralph-state-guard. pgbench smoke runs in pre-commit hook. Goldens captured live
-from a throwaway PG18.3 (tables ucf/ucf5, funcids 316/482/1746/311/318).
+Gates (GREEN): all 25 subtests PASS vs live PG18.3 (1.3s); -short SKIP verified;
+go build ./..., go vet ./internal/testport/, gofmt clean; ralph-state-guard
+(self-repaired to consistent). pgbench smoke runs in pre-commit hook on commit.
 
-Next step: pick from M0123-S4 REMAINING (fix_plan ~L1194): (a) float4-common
-(no float8) CASE mix — needs int/numeric→float4 cast arms + model the OUTER
-float8(float4) column cast that wraps a sub-column-type CASE (resolveCaseExprWith
-/ ResolveForColumn); OR (b) the byte-diff oracle harness (goopg adbin/ev_action
-== real-PG18 for identical DDL, :location normalized) — the last big S4
-deliverable. Recommend (b).
+Next step: pick next M0123-S4 REMAINING (fix_plan ~L1013). Recommend the VIEW
+ev_action (pg_rewrite) byte-diff oracle: parameterize the harness on a
+resolver-driver func, add a RelationResolver that runs
+`SELECT attname,atttypid,attnum FROM pg_attribute WHERE attrelid='<tbl>'::regclass
+AND attnum>0` on the pgcluster handle, then diff pgnodes.ResolveViewQuery→Out vs
+normalized pg_rewrite.ev_action. OR: float4-common CASE mix (int/numeric→float4
+arms + outer column cast).
 
-Gates run: pgnodes (green), executor/initdb siblings (green), build/vet (green),
-gofmt (clean), ralph-state-guard (pending final run), pgbench smoke (pre-commit).
+Gates run: oracle (25 green vs PG18), build/vet (green), gofmt (clean),
+ralph-state-guard (consistent after repair), pgbench smoke (pre-commit).
 In-flight: none.
