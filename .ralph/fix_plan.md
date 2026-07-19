@@ -47,23 +47,30 @@ every clean, green (build + pre-commit) checkpoint.
 
 ## WIP recovery (priority #1 — before M-NIGHTLY, one-time)
 
-<!-- Added 2026-07-18 for the wal-pg-nodetree switch. The main checkout's
-     pre-switch Ralph WIP was stashed with a unique tag before checking out this
-     branch so `git checkout` was clean. Recover it FIRST so no work is lost. -->
+<!-- Added 2026-07-18 for the wal-pg-nodetree switch; UPDATED 2026-07-19: the
+     pre-switch Ralph WIP has now been un-stashed and MERGED back into the
+     working tree (uncommitted) — it applied cleanly onto wal-pg-nodetree. It is
+     no longer in a stash; recover it as ordinary uncommitted WIP. (The pristine
+     stash commit 6d5d9115 was dropped but remains GC-recoverable via reflog.) -->
 
-- [ ] wip/recover-pre-nodetree-switch — recover the stashed pre-branch-switch WIP
-      and resolve it. The stash commit is **`6d5d9115c36c78d15e71af2c1b920c5b2e43214c`**
-      (tag `item-c-setup-preserve-20260719-092213`, made on
-      `wal-body-and-ddl-log-pg-compatible`). Apply it by SHA (robust to shared-stack
-      index shifts): `git stash apply 6d5d9115` (NOT pop — shared stack), inspect the diff
-      (`.ralph/progress.json`, `internal/executor/context.go`, `operators.go`,
-      `internal/server/dispatch.go`), and EITHER finish + commit it if it is
-      coherent work-in-progress on THIS branch, OR — if it belongs to the old
-      `wal-body-and-ddl-log-pg-compatible` task and doesn't apply cleanly here —
-      set it aside on its own branch / re-stash it and record a
-      `.ralph/deferral_ledger.md` row so it is not lost. Then drop the applied
-      stash entry once handled. Check this box only when the WIP is committed
-      somewhere or explicitly ledgered.
+- [x] wip/recover-pre-nodetree-switch — DONE 2026-07-19: the code WIP
+      (`internal/executor/context.go`, `internal/executor/operators.go`,
+      `internal/server/dispatch.go`) was coherent WIP on THIS branch — the
+      executor/server half of the M0122-0007 4e ts_dict dbOid-scoping
+      follow-up — and was finished (catalog half added) + committed this loop.
+      (`.ralph/progress.json`/`ci/logs/launch.log` are Ralph-infra churn, not
+      product WIP, left to the loop driver.)
+- [x] wip/recover-pre-nodetree-switch (superseded note) — finish the pre-branch-switch WIP that is
+      **already restored as uncommitted changes in the working tree** (not stashed):
+      `.ralph/progress.json`, `ci/logs/launch.log`, `internal/executor/context.go`,
+      `internal/executor/operators.go`, `internal/server/dispatch.go`. Inspect the
+      diff (`git diff`), and EITHER finish + commit it if it is coherent WIP on
+      THIS branch, OR — if it belongs to the old
+      `wal-body-and-ddl-log-pg-compatible` task — move it to its own branch and
+      record a `.ralph/deferral_ledger.md` row so it is not lost. (Backup: the
+      original stash commit was `6d5d9115c36c78d15e71af2c1b920c5b2e43214c`,
+      GC-recoverable via reflog if needed.) Check this box only when the WIP is
+      committed somewhere or explicitly ledgered.
 
 ## M-NIGHTLY — Nightly regression triage (STANDING — HIGHEST PRIORITY)
 
@@ -4952,6 +4959,23 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       Create/Drop + a `*ForDBOid` lister + per-connection wiring through
       `executor.Context`/`dispatch.go`'s `wireExtensionRows`), verify via the
       same `TestPort_PgDumpConnectionSetup` soft probe.
+      **DONE 2026-07-19** (ts_dict registry dbOid-scoped): UserTSDict.DBOid +
+      variadic dbOid on Create/Find/Drop/Rename/SetSchema/AlterOptions +
+      ListUserTSDictsForDBOid/PGTSDictRowsForDBOid (built-in "simple" prefix) +
+      per-connection wiring (PgTSDictRows/pgTSDictRowLister) + 6 operators_ddl
+      call sites + TestCreateTSDictCrossDatabaseIsolation. DU-002 probe advanced
+      to a NEW blocker `invalid column numbering in table "nninh4"` (pg_attribute
+      attnum-ordering gap, not registry scoping). See design doc 0122-0018
+      §"TS dictionary registry ... dbOid scoping" + the 2026-07-19 ledger row.
+      Two residuals ledgered: unfiltered ListUserTSDicts in resolveTSDictOID/
+      expr.go, and WAL/recovery DBOid persistence.
+- [ ] **DU-002 next blocker — `invalid column numbering in table "nninh4"`**
+      (source: TestPort_PgDumpConnectionSetup, M0122-0007 4e). pg_dump errors on
+      a pg_attribute attnum-ordering / column-numbering gap for the inheritance
+      test table `nninh4` (dropped/inherited columns). Not a registry-scoping
+      collision — a different subsystem (pg_attribute physical attnum order).
+      Repro: `go test -v -run '^TestPort_PgDumpConnectionSetup$'
+      ./internal/testport/`; inspect the emitted pg_attribute rows for nninh4.
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002). `002_save_fullpage`
       (WD-003) + live `pg_waldump --rmgr=Heap2` round-trip DONE. **Still open:** only
       `001_basic.pl`'s server-dependent tier (per-rmgr/relation/block filtering) —

@@ -2717,6 +2717,68 @@ Gates: `go build ./...`/`go vet ./...` clean; `go test ./internal/parser/...
 `go test -v -run '^TestPort_PgDumpConnectionSetup$' ./internal/testport/`
 PASS (soft-log confirms the advance).
 
+### TS dictionary registry (`catalog.InMemory.userTSDicts`) dbOid scoping — LANDED (2026-07-19)
+
+Closes the resume point the ALTER CONVERSION section recorded: `UserTSDict`
+had no `DBOid` field, and `c.userTSDicts` was one flat, server-wide
+`[]*UserTSDict` slice, so a `CREATE TEXT SEARCH DICTIONARY public.simple_dict
+...` restoring into a fresh second database collided with the source
+database's own same-named dictionary (`text search dictionary "simple_dict"
+already exists`).
+
+Applied the identical M0122-0007 4e pattern, mirroring the `userConversions`
+scoping directly above (same slice-of-pointers-with-a-`DBOid`-field shape):
+
+- `UserTSDict.DBOid uint32` added.
+- `CreateTSDict`/`FindTSDict`/`DropTSDict`/`RenameTSDict`/`SetTSDictSchema`/
+  `AlterTSDictOptions` gained a trailing variadic `dbOid ...uint32` (via
+  `resolveDBOid`), filtering/stamping `DBOid` alongside the existing
+  `NamespaceOID` check.
+- `CreateTSDictDuringRecovery` stamps `ud.DBOid = DefaultDBOid` when unset
+  (WAL replay carries no dbOid yet, matching every sibling recovery path's
+  documented convention). The `*DuringRecovery` rename/setschema/options
+  counterparts delegate to the base functions with no dbOid argument, which
+  now correctly resolves to `DefaultDBOid` via the same convention.
+- New `ListUserTSDictsForDBOid(dbOid)` (mirrors
+  `ListUserConversionsForDBOid`) and `PGTSDictRowsForDBOid(dbOid)` (mirrors
+  `PGConversionRowsForDBOid`, but **with** a BKI-pinned prefix: the one
+  built-in `simple` dictionary is always row 0, since a CREATE TEXT SEARCH
+  CONFIGURATION's `ADD MAPPING ... WITH simple` clause names it and
+  dumpTSConfig's `mapdict::regdictionary` cast needs a live row by OID). These
+  replace the old unfiltered `ListUserTSDicts()`-backed `pgTSDict.VirtualRows`
+  closure.
+- Per-connection wiring added end-to-end, mirroring the pg_conversion wiring:
+  `executor.Context.PgTSDictRows func() [][]string` (context.go), a
+  `pg_ts_dict`-named branch in `operators.go`'s virtual-row materializer, and
+  `dispatch.go`'s `pgTSDictRowLister` interface + `wireExtensionRows` wiring.
+- Threaded `catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)` through all live
+  `operators_ddl.go` call sites (CREATE, DROP, and the rename/setschema/
+  options ALTER branches).
+- New `internal/catalog/create_tsdict_dbscope_test.go`
+  (`TestCreateTSDictCrossDatabaseIsolation`, mirrors
+  `TestCreateConversionCrossDatabaseIsolation`, accounting for the always-
+  present builtin `simple` row).
+
+Two residual gaps recorded as deferral-ledger rows (not this loop's blocker):
+(1) the unfiltered `ListUserTSDicts()` still backs `resolveTSDictOID`
+(operators_ddl.go) and an `expr.go` name lookup — a TS-config mapping could
+resolve a dictionary by name across databases; (2) WAL/recovery persistence of
+`UserTSDict.DBOid` is not yet round-tripped (the same restart-persistence
+deferral every sibling registry carries).
+
+Confirmed via the DU-002 probe: the round-trip's failure point moved past
+`text search dictionary "simple_dict" already exists` entirely to a NEW,
+unrelated blocker — `pg_dump: error: invalid column numbering in table
+"nninh4"`, a pg_attribute attnum-ordering (inheritance/dropped-column)
+catalog-parity gap, not a registry-scoping one. See the 2026-07-19
+deferral-ledger row for the resume point.
+
+Gates: `go build ./...` clean; `go test ./internal/catalog/...
+./internal/executor/... ./internal/server/... ./internal/initdb/...` PASS;
+`go test -v -run '^TestPort_PgDumpConnectionSetup$' ./internal/testport/` PASS
+(soft-log confirms the advance to the `nninh4` blocker);
+`RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh` PASS.
+
 ## Deferred / explicitly out of scope
 
 - Unifying `ResolveDatabaseOid`'s switch with the `pg_database` `VirtualRows`

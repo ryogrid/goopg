@@ -2144,6 +2144,15 @@ func (s *Server) wireExtensionRows(ectx *executor.Context, dbName string) {
 			return pcv.PGConversionRowsForDBOid(catalog.NamespaceDBOid(ectx.CurrentDatabaseOid))
 		}
 	}
+	// pg_ts_dict must likewise reflect the connecting database's own CREATE
+	// TEXT SEARCH DICTIONARY'd dictionaries, not always DefaultDBOid's.
+	// Mirrors the pg_conversion wiring above. M0122-0007 4e follow-up
+	// (DU-002 round-trip probe unblock).
+	if ptd, ok := s.cfg.Catalog.(pgTSDictRowLister); ok {
+		ectx.PgTSDictRows = func() [][]string {
+			return ptd.PGTSDictRowsForDBOid(catalog.NamespaceDBOid(ectx.CurrentDatabaseOid))
+		}
+	}
 }
 
 // pgClassRowLister is implemented by catalog.InMemory to expose a
@@ -2257,6 +2266,13 @@ type pgCollationRowLister interface {
 // M0122-0007 4e follow-up (DU-002 round-trip probe unblock).
 type pgConversionRowLister interface {
 	PGConversionRowsForDBOid(dbOid uint32) [][]string
+}
+
+// pgTSDictRowLister is implemented by catalog.InMemory to expose a
+// per-database pg_ts_dict row-set, mirroring pgConversionRowLister above.
+// M0122-0007 4e follow-up (DU-002 round-trip probe unblock).
+type pgTSDictRowLister interface {
+	PGTSDictRowsForDBOid(dbOid uint32) [][]string
 }
 
 func undoEnumDDLForRollback(connTx *connTxState, cat catalog.Catalog, dbOid uint32) {

@@ -587,6 +587,15 @@ type Context struct {
 	// round-trip probe unblock).
 	PgConversionRows func() [][]string
 
+	// PgTSDictRows mirrors PgConversionRows above for the pg_ts_dict catalog
+	// table: it lists CurrentDatabaseOid's own CREATE TEXT SEARCH
+	// DICTIONARY'd dictionaries (plus the shared BKI-pinned "simple" builtin)
+	// rather than always DefaultDBOid's (catalog.InMemory's
+	// PGTSDictRowsForDBOid). Wired by the server to close over
+	// CurrentDatabaseOid. M0122-0007 4e follow-up (DU-002 round-trip probe
+	// unblock).
+	PgTSDictRows func() [][]string
+
 	// NonSuperuserRole, when non-empty, means the session is currently running
 	// under a non-superuser role (set via SET SESSION AUTHORIZATION). Privilege
 	// checks that require superuser (e.g. LEAKPROOF function attribute) must
