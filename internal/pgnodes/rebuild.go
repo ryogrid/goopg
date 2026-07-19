@@ -243,12 +243,13 @@ func rebuildFuncExprWith(f *FuncExpr, rec func(Node) (parser.Expr, error)) (pars
 		isImplicitFloat4ToFloat8Cast(f) || isImplicitToFloat8Cast(f) {
 		return rec(f.Args[0])
 	}
-	// An EXPLICIT integer cast (funcformat 1) keeps its `::type` node in adbin, so
-	// — unlike the implicit casts above — it rebuilds to a CastExpr, not the bare
-	// argument. Re-resolving `inner::type` re-emits the identical funcformat-1
-	// FuncExpr (fixed point). The funcformat==1 guard distinguishes it from the
-	// implicit int4→int8 (481, funcformat 2) form handled just above.
-	if typeName, ok := explicitIntegerCastTypeName(f); ok {
+	// An EXPLICIT numeric-family cast (funcformat 1) keeps its `::type` node in
+	// adbin, so — unlike the implicit casts above — it rebuilds to a CastExpr, not
+	// the bare argument. Re-resolving `inner::type` re-emits the identical
+	// funcformat-1 FuncExpr (fixed point). The funcformat==1 guard distinguishes it
+	// from the implicit int4→int8 (481) / int→numeric (1740/1781, funcformat 2)
+	// forms handled just above.
+	if typeName, ok := explicitCastTypeName(f); ok {
 		inner, err := rec(f.Args[0])
 		if err != nil {
 			return nil, err
@@ -326,14 +327,17 @@ func isImplicitToFloat8Cast(f *FuncExpr) bool {
 		len(f.Args) == 1
 }
 
-// explicitIntegerCastTypeName reports whether f is one of the explicit
-// integer→integer cast FuncExprs the forward resolver emits (resolveCastExpr:
-// int2(int4)=314, int8(int4)=481, int4(int8)=480, int2(int8)=714, all
+// explicitCastTypeName reports whether f is one of the explicit numeric-family
+// cast FuncExprs the forward resolver emits (resolveCastExpr / numericFamilyCast\
+// Funcid: int2(int4)=314, int8(int4)=481, int4(int8)=480, int2(int8)=714 int→int;
+// int2_numeric=1782, int4_numeric=1740, int8_numeric=1781 int→numeric;
+// numeric_int2=1783, numeric_int4=1744, numeric_int8=1779 numeric→int; all
 // COERCE_EXPLICIT_CAST funcformat 1 with one argument) and returns the canonical
 // target type name for the reconstructed `::type` cast. The funcformat==1 guard
 // is load-bearing: funcid 481 also appears with funcformat 2 as the IMPLICIT
-// int4→int8 widening, which rebuilds by unwrapping instead.
-func explicitIntegerCastTypeName(f *FuncExpr) (string, bool) {
+// int4→int8 widening, and 1740/1781 as the implicit int→numeric coercion, both of
+// which rebuild by unwrapping instead.
+func explicitCastTypeName(f *FuncExpr) (string, bool) {
 	if f.Funcformat != 1 || len(f.Args) != 1 {
 		return "", false
 	}
@@ -347,6 +351,22 @@ func explicitIntegerCastTypeName(f *FuncExpr) (string, bool) {
 			return "int4", true
 		}
 	case 481: // int8(int4)
+		if f.Funcresulttype == OidInt8 {
+			return "int8", true
+		}
+	case 1782, 1740, 1781: // int2/int4/int8 → numeric
+		if f.Funcresulttype == OidNumeric {
+			return "numeric", true
+		}
+	case 1783: // numeric → int2
+		if f.Funcresulttype == OidInt2 {
+			return "int2", true
+		}
+	case 1744: // numeric → int4
+		if f.Funcresulttype == OidInt4 {
+			return "int4", true
+		}
+	case 1779: // numeric → int8
 		if f.Funcresulttype == OidInt8 {
 			return "int8", true
 		}

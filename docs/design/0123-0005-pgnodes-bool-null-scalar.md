@@ -966,6 +966,46 @@ stored `adbin`.
   `TestE2E_FailoverGoopgToPG` green; initdb/executor attrdef sibling tests green;
   `go vet` + `go build ./...` clean; gofmt clean; pgbench smoke via pre-commit.
 
+## Sub-slice 20 — explicit numeric↔integer `::type` casts
+
+Sub-slice 19 modeled the explicit integer→integer casts; this slice extends the
+same funcformat-1 machinery to the rest of the **numeric family** — casts that
+cross the integer/`numeric` boundary in either direction (`5.5::int4`,
+`5::numeric`, `(-2.5)::int4`). PG stores each identically to the integer casts: a
+`COERCE_EXPLICIT_CAST` (`funcformat` **1**) `FuncExpr` naming the `pg_cast`
+conversion function, kept verbatim in `adbin`, with the operand resolved at its
+**natural** type first (a decimal literal → `numeric` `Const`, an integer literal
+→ `int4`/`int8` `Const`).
+
+### Changes
+
+- `resolver_expr.go`: `isIntegerType`→`isNumericFamilyType` (adds `numeric` to the
+  accepted target set) and `integerCastFuncid`→`numericFamilyCastFuncid` (adds the
+  six cross-boundary arms: `int2/int4/int8_numeric`=1782/1740/1781 int→numeric;
+  `numeric_int2/int4/int8`=1783/1744/1779 numeric→int). The typmod-qualified guard
+  (`len(v.Typmods)!=0`) still rejects `::numeric(10,2)` — that length coercion is a
+  distinct `numeric(numeric,int4)` call, not modeled here.
+- `rebuild.go`: `explicitIntegerCastTypeName`→`explicitCastTypeName` gains the
+  numeric arms → target type name (`1740/1781/1782`→`numeric`, `1744`→`int4`,
+  `1779`→`int8`, `1783`→`int2`). The `funcformat==1` guard stays load-bearing:
+  `1740`/`1781` also appear as the **implicit** int→numeric coercion (funcformat 2,
+  sub-slice 4a), which rebuilds by unwrapping instead. `rebuildConst`'s existing
+  `numeric` arm (sub-slice 3) reconstructs a `numeric` operand (incl. the negative
+  `(-2.5)` fold) for a fixed point.
+
+### Gates (all green)
+
+- `internal/pgnodes/cast_test.go` — 6 new live-captured PG18.3 scalar `adbin`
+  goldens (`5.5::int4`/`::int8`/`::int2`, `(-2.5)::int4`, `5::numeric`,
+  `9999999999::numeric`) through the golden + codec + rebuild fixed-point loops;
+  the degradation matrix swaps the now-canonical `numeric→int4` case for
+  `numeric→float8` (float family still out of scope).
+- `internal/testport/oracle_pgnodes_adbin_test.go` — the same 6 cases added to the
+  live oracle (**42 cases total**, all byte-identical vs PG18.3, ≈1.45s).
+- full `pgnodes` package + `TestE2E_FailoverGoopgToPG` + initdb/executor attrdef
+  siblings green; `go vet` + `go build ./...` + gofmt clean; pgbench smoke via
+  pre-commit.
+
 ## Byte-diff oracle gate (adbin) — `internal/testport/oracle_pgnodes_adbin_test.go`
 
 The per-datum golden tests above each hard-code a `want` `adbin` string a

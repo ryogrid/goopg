@@ -130,6 +130,17 @@ var adbinOracleCases = []adbinOracleCase{
 	{"cast_noop_int4", "int", pgnodes.OidInt4, "5::int4"},
 	{"cast_noop_int8", "int8", pgnodes.OidInt8, "9999999999::int8"},
 	{"case_simple_explicit_cast_operand", "int8", pgnodes.OidInt8, "CASE 5::int8 WHEN 1 THEN 10::int8 ELSE 20::int8 END"},
+	// Explicit numeric↔integer `::type` casts (sub-slice 20): the funcformat-1
+	// COERCE_EXPLICIT_CAST siblings of the implicit numeric-family coercions —
+	// numeric_int4=1744 / numeric_int8=1779 / numeric_int2=1783 (numeric→int),
+	// int4_numeric=1740 / int8_numeric=1781 (int→numeric). The operand is resolved
+	// at its natural type first (decimal→numeric Const, integer→int4/int8 Const).
+	{"cast_numeric_to_int4", "int", pgnodes.OidInt4, "5.5::int4"},
+	{"cast_numeric_to_int8", "int8", pgnodes.OidInt8, "5.5::int8"},
+	{"cast_numeric_to_int2", "int2", pgnodes.OidInt2, "5.5::int2"},
+	{"cast_neg_numeric_to_int4", "int", pgnodes.OidInt4, "(-2.5)::int4"},
+	{"cast_int4_to_numeric", "numeric", pgnodes.OidNumeric, "5::numeric"},
+	{"cast_int8_to_numeric", "numeric", pgnodes.OidNumeric, "9999999999::numeric"},
 }
 
 // TestOraclePgnodesAdbinBytesMatchPG is the M0123-S4 byte-diff oracle: for each
