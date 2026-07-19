@@ -315,6 +315,36 @@ argument is a column `Var` reloads inside a view qual (the same pattern as
 - `go build ./...` + `go vet ./internal/pgnodes/` clean; full `pgnodes` package
   and `internal/executor` `TestCanonicalAttrdef*` still green.
 
+## Sub-slice 6 — `BOOLEANTEST` in the VIEW-query path
+
+Sub-slice 5 wired `BOOLEANTEST` only into the scalar (column-DEFAULT) resolver;
+a view whose `WHERE` qual used `IS [NOT] TRUE/FALSE/UNKNOWN` still fell back to
+SQL text. This slice routes the query-scoped resolver/rebuild through the same
+recursion-injectable `…With` builders sub-slice 2 used for `BoolExpr`/`NullTest`:
+
+- `resolver_query.go` — `queryScope.resolveExpr` adds a
+  `case *parser.IsBoolExpr: return resolveBooleanTestWith(v, s.resolveExpr)`,
+  directly after the `*parser.IsNullExpr` arm. Threading `s.resolveExpr` as the
+  recursion lets the `BOOLEANTEST` operand be (or contain) a base-relation column
+  `Var`, so `(client > 0) IS TRUE` resolves canonically instead of degrading.
+- `rebuild_query.go` — `viewRebuildScope.rebuildExpr` adds a
+  `case *BooleanTest: return rebuildBooleanTestWith(v, s.rebuildExpr)`, the exact
+  inverse over the view scope, mirroring the `*NullTest` arm.
+
+No new IR, codec, or builder code — only two dispatch arms; the sub-slice-5
+`…With` variants already existed for exactly this purpose.
+
+### Gates (all green)
+
+- `internal/pgnodes/view_bool_null_test.go` — two new live-captured PG18.3
+  `pg_rewrite.ev_action` goldens over `bench_log` (relid 16384): `v5`
+  (`(client > 0) IS TRUE`, `booltesttype 0`) and `v6`
+  (`(client > 0) IS NOT FALSE`, `booltesttype 3`, a non-zero ordinal). They join
+  the existing table-driven `TestResolveViewQueryBoolNull` (forward byte-for-byte),
+  `…RoundTrip` (Out→Read→Out), and `TestRebuildViewQueryBoolNull`
+  (resolve→`RebuildViewQuery`→re-resolve fixed point).
+- full `pgnodes` package + `go vet ./internal/pgnodes/` + `go build ./...` clean.
+
 ## Deferred
 
 - `CASE` and `IS DISTINCT FROM`, plus the byte-diff oracle gate, remain in

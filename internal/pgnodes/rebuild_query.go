@@ -173,6 +173,8 @@ func (s *viewRebuildScope) rebuildExpr(n Node) (parser.Expr, error) {
 		return rebuildBoolExprWith(v, s.rebuildExpr)
 	case *NullTest:
 		return rebuildNullTestWith(v, s.rebuildExpr)
+	case *BooleanTest:
+		return rebuildBooleanTestWith(v, s.rebuildExpr)
 	default:
 		return nil, fmt.Errorf("pgnodes: RebuildViewQuery: unsupported node %T", n)
 	}

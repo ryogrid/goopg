@@ -5832,6 +5832,23 @@ existing encoder, `constcollid=100` / `consttypmod=n+4`.
       PG18.3 adbin goldens + parser math table + graceful-degradation matrix) +
       executor `TestCanonicalAttrdefText` (timestamptz-literal + no-offset
       cases); `TestE2E_FailoverGoopgToPG` green. Design 0123-0005 §"Sub-slice 4b".
-      REMAINING: `CASE`/`BooleanTest`/`IS DISTINCT FROM`; operator-driven
+      SUB-SLICE 5 LANDED (2026-07-19): canonical **`BOOLEANTEST`
+      (`x IS [NOT] TRUE/FALSE/UNKNOWN`)** SCALAR node — a dedicated `BooleanTest`
+      (primnodes.h, 6-value ordinal enum), booltesttype a PLAIN INT
+      (WRITE_ENUM_FIELD), stored unfolded in adbin. ir.go/outfuncs.go/readfuncs.go
+      + resolver_expr.go (`*parser.IsBoolExpr`→resolveBooleanTest[With],
+      `booleanTestType` flag→ordinal) + rebuild.go (exact inverse, out-of-range
+      reject). Gate `internal/pgnodes/booleantest_test.go` (6 live PG18.3 adbin
+      goldens, one per ordinal). Design 0123-0005 §"Sub-slice 5".
+      SUB-SLICE 6 LANDED (2026-07-19): **`BOOLEANTEST` in the VIEW-query path** —
+      routed `queryScope.resolveExpr` (`*parser.IsBoolExpr`→resolveBooleanTestWith)
+      + `viewRebuildScope.rebuildExpr` (`*BooleanTest`→rebuildBooleanTestWith)
+      through the sub-slice-5 injectable `*With` builders, so a view
+      `WHERE (x) IS [NOT] TRUE/FALSE/UNKNOWN` emits canonical ev_action
+      (was SQL text). Two dispatch arms only; no new IR/codec. Gate
+      `internal/pgnodes/view_bool_null_test.go` (2 new live PG18.3 ev_action
+      goldens v5 IS TRUE / v6 IS NOT FALSE) + executor Rewrite/View tests.
+      Design 0123-0005 §"Sub-slice 6".
+      REMAINING: `CASE`/`IS DISTINCT FROM`; operator-driven
       view-qual coercion (unblocks int2/timestamptz→ literals in view quals);
       byte-diff oracle.

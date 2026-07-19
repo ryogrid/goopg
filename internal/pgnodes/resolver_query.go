@@ -297,6 +297,12 @@ func (s *queryScope) resolveExpr(e parser.Expr, expected uint32) (Node, uint32, 
 		// argument resolved in the relation scope (so it may be a column Var).
 		return resolveNullTestWith(v, s.resolveExpr)
 
+	case *parser.IsBoolExpr:
+		// x IS [NOT] TRUE/FALSE/UNKNOWN over a view column/expression ->
+		// BOOLEANTEST, with the argument resolved in the relation scope (so it
+		// may be a column Var). Mirrors the NULLTEST view wiring above.
+		return resolveBooleanTestWith(v, s.resolveExpr)
+
 	case *parser.UnaryOp:
 		switch v.Op {
 		case parser.OpUnaryPos:
