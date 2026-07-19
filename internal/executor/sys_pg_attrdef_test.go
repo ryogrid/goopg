@@ -76,6 +76,15 @@ func TestCanonicalAttrdefText(t *testing.T) {
 		{"str-cast-bool", col("bool", "'t'::bool"), true, []string{"CONST", "16", "constlen 1"}},
 		{"str-col-int4", col("int4", "'123'"), true, []string{"CONST", "23"}},
 		{"str-col-bool", col("bool", "'yes'"), true, []string{"CONST", "16"}},
+		// An unknown-type STRING literal coerced to text/numeric folds via textin /
+		// numeric_in to a canonical by-value Const (no cast node), byte-identical to
+		// the bare literal. `'5.50'` keeps dscale 2. M0123-S4 sub-slice 29.
+		{"str-cast-text", col("text", "'foo'::text"), true, []string{"CONST", "25"}},
+		{"str-cast-numeric", col("numeric", "'5.5'::numeric"), true, []string{"CONST", "1700"}},
+		{"str-col-numeric", col("numeric", "'5.50'"), true, []string{"CONST", "1700"}},
+		// A NaN string cast to numeric uses a special varlena not modeled here, so it
+		// degrades to SQL text (all-or-nothing). M0123-S4 sub-slice 29.
+		{"str-numeric-nan", col("numeric", "'NaN'::numeric"), false, []string{"NaN"}},
 		// SQL-text fallback: a bare integer literal `5` in an int2 column is int4-typed
 		// then wrapped in an int4→int2 cast FuncExpr (not modeled), so type != int2 → text.
 		{"smallint-lit", col("int2", "5"), false, []string{"5"}},

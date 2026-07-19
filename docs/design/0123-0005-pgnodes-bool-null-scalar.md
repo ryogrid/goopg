@@ -1441,10 +1441,64 @@ extended to emit an `int2` `Const` (doing so would mis-fold the bare-integer for
 
 ### Deferred (ledger)
 
-`::text` / `::oid` / `::numeric` / `::float4` / `::float8` string-literal folds (PG
-folds these too, via `textin`/`oidin`/`numeric_in`/`float4in`/`float8in`, but they are
-not modeled in this slice); non-decimal integer spellings (`0x`/`0o`/`0b`, `_`
+`::oid` / `::float4` / `::float8` string-literal folds (PG folds these too, via
+`oidin`/`float4in`/`float8in`, but they are not modeled in this slice — see sub-slice
+29 below for `::text`/`::numeric`); non-decimal integer spellings (`0x`/`0o`/`0b`, `_`
 separators).
+
+## Sub-slice 29 — string-literal cast folds to text / numeric
+
+Sub-slice 28 folded `bool`/`int2`/`int4`/`int8` string literals; this extends the same
+parse-time-fold mechanism across `textin` and `numeric_in`. An unknown-type string
+literal coerced to `text`/`numeric` — by an explicit `::T` cast (`'foo'::text`,
+`'5.5'::numeric`) **or** a typed column context (`col numeric DEFAULT '5.5'`) — folds via
+`coerce_type` → `stringTypeToConst` → the input function to a by-value `Const` with **no
+cast node**, byte-identical to PG18.3. Both forms previously degraded to SQL text (except
+the `text`-**column** context, already handled by `resolve`'s `StringConst` arm; only the
+explicit `::text` cast was degrading).
+
+### Why the fold is byte-identical to the bare literal
+
+`textin` is a verbatim byte copy — no whitespace trimming, and it never fails — so every
+`'…'::text` folds. `numeric_in` (`set_var_from_str`) preserves the display scale and
+folds a leading sign into the value, so `'5.5'::numeric` produces the **identical**
+`NumericData` varlena as the bare numeric literal `5.5`, and `'5.50'` keeps `dscale` 2
+(distinct varlena from `5.5`). The fold therefore reuses the already-proven `NewNumericConst`
+/ `NewTextConst` datum machinery (sub-slices 3 / the text leaf) — no new datum bytes.
+
+### Changes
+
+- `resolver_expr.go` — two new arms in the shared `foldStringLiteralConst`: `OidText`
+  (`NewTextConst(s)`, always ok) and `OidNumeric` (`NewNumericConst(pgTrimSpace(s), false)`,
+  ok unless the input function would reject — a non-decimal / `NaN` / `±Infinity` string).
+  No rebuild change: a text `Const` already rebuilds to a `StringConst` and a numeric
+  `Const` to a `NumericConst` (sub-slices 3 / the text leaf), both re-resolving to the
+  identical fold in the column context (the fixed point).
+
+### Deferred (ledger)
+
+`NaN` / `Infinity` / `-Infinity` string casts to numeric (PG folds these to a special
+`NumericData` varlena — the short/long header is not modeled, so they degrade to SQL text);
+a typmod-qualified string cast `'5.5'::numeric(10,2)` (PG folds the length coercion into
+the input function at parse time — a bare numeric `Const` at the target scale — but
+`resolveNumericTypmodCast` resolves the unknown operand as `text` and degrades); `::oid`
+and `::float4`/`::float8` string folds (still unmodeled — the latter needs a float datum
++ `float*in` Ryu parse).
+
+### Gates (all green)
+
+- `internal/pgnodes/string_text_numeric_cast_test.go` — 4 goldens
+  (`text_cast`/`numeric_cast`/`numeric_cast_trailing_zero`/`numeric_cast_negative`) resolved
+  with an **unknown** context + codec round-trip; a `MatchesBareFold` pair test (5 pairs
+  including `'5.5'::numeric == 5.5` and `'5.50'::numeric == 5.50`); a `RebuildRoundTrip`
+  fixed point; and a specials/bad-input degradation matrix (`NaN`/`Infinity`/`-Infinity`/
+  non-numeric/empty).
+- `internal/testport/oracle_pgnodes_adbin_test.go` — 5 cases added (`str_cast_text`,
+  `str_cast_numeric`, `str_cast_numeric_scale`, `str_cast_numeric_neg`, `str_col_numeric`)
+  — **72 cases total**, all byte-identical vs LIVE PG18.3.
+- `internal/executor/sys_pg_attrdef_test.go` — 4 cases (`str-cast-text`, `str-cast-numeric`,
+  `str-col-numeric` canonical; `str-numeric-nan` retained as the specials-degrade boundary).
+- Full `pgnodes` package + `go vet` + gofmt clean; pgbench smoke via pre-commit.
 
 ## Byte-diff oracle gate (adbin) — `internal/testport/oracle_pgnodes_adbin_test.go`
 
@@ -1465,8 +1519,9 @@ AdbinBytesMatchPG` closes both by re-deriving the oracle **live**: for each
    **byte-identical**. A goopg SQL-text fallback (`ok==false`) on a case PG stores
    canonically is itself a failure.
 
-The 29 cases span every S4-canonical family: bare `Const` leaves (int4/int8 by
-magnitude, folded negative, text, numeric decimal/scientific/negative),
+The 72 cases span every S4-canonical family: bare `Const` leaves (int4/int8 by
+magnitude, folded negative, text, numeric decimal/scientific/negative, string-literal
+folds to bool/int2/int4/int8/text/numeric),
 `int4→numeric` cast FuncExpr, built-in FuncExpr (`upper`), timestamptz/date literal
 Const (bare + explicit `::T` cast form),
 `BoolExpr`/`NullTest`/`OpExpr` (incl. `makeAndExpr` 3-arg flattening),

@@ -1408,8 +1408,24 @@ existing encoder, `constcollid=100` / `consttypmod=n+4`.
       str-col cases; cast_test/resolver_expr_test sibling reconciliations. Design
       0123-0005 §"Sub-slice 28"; ledger 2026-07-20 (text/numeric/float/oid string folds
       + bare-integer→int2 cast deferred).
-      REMAINING: text/numeric/float/oid string-literal folds
-      (`'x'::text`/`'5'::numeric`/`'5'::float8`); the bare-integer→int2 implicit cast
+      SUB-SLICE 29 LANDED (2026-07-20): string-literal cast folds to **text / numeric**
+      (closes sub-slice 28's text/numeric deferral). An unknown-type STRING literal
+      coerced to text/numeric — explicit `::T` cast (`'foo'::text`, `'5.5'::numeric`) OR
+      typed column context (`col numeric DEFAULT '5.5'`) — folds at parse time via
+      textin/numeric_in to a by-value Const with NO cast node, byte-identical to PG18.3.
+      Two new arms in `foldStringLiteralConst`: OidText (NewTextConst, verbatim, always
+      ok) + OidNumeric (NewNumericConst(pgTrimSpace(s)) — reuses proven numeric datum;
+      `'5.5'::numeric` == bare `5.5`, `'5.50'` keeps dscale 2). No rebuild change (text→
+      StringConst, numeric→NumericConst already re-fold to the fixed point). Gate
+      `internal/pgnodes/string_text_numeric_cast_test.go` (4 goldens + codec + MatchesBare
+      pairs incl. `'5.5'::numeric==5.5` + RebuildRoundTrip + NaN/Infinity/bad-degrade
+      matrix) + oracle_pgnodes_adbin_test.go now **72 cases** all byte-identical vs LIVE
+      PG18.3 + executor `TestCanonicalAttrdefText` 4 cases. Design 0123-0005 §"Sub-slice
+      29"; ledger 2026-07-20 (NaN/Infinity numeric specials + typmod'd `'5.5'::numeric(10,2)`
+      + oid/float string folds deferred).
+      REMAINING: float/oid string-literal folds
+      (`'5'::float8`/`'5'::oid`); typmod'd string numeric cast (`'5.5'::numeric(10,2)`);
+      NaN/±Infinity numeric specials; the bare-integer→int2 implicit cast
       FuncExpr (`int2 DEFAULT 5`); float4-common (no float8) CASE mix (needs
       int/numeric→float4 arms + outer column cast); operator-driven view-qual coercion
       (unblocks int2/timestamptz literals inside a view WHERE); other length types

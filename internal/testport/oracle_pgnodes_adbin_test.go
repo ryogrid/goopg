@@ -237,6 +237,18 @@ var adbinOracleCases = []adbinOracleCase{
 	{"str_cast_bool_false", "bool", pgnodes.OidBool, "'false'::bool"},
 	{"str_col_int4", "int", pgnodes.OidInt4, "'123'"},
 	{"str_col_bool_yes", "bool", pgnodes.OidBool, "'yes'"},
+	// Sub-slice 29: an unknown-type STRING literal coerced to text/numeric folds at
+	// parse time via the input function (textin / numeric_in) to a by-value Const with
+	// NO cast node — byte-identical to the same literal in that type's column context.
+	// text is a verbatim byte copy (no trimming); numeric_in preserves the display
+	// scale, so `'5.50'` keeps dscale 2 and a leading sign folds into the value. This
+	// closes the explicit-`::text`/`::numeric`-cast asymmetry (previously SQL text) and
+	// the bare numeric-column string DEFAULT.
+	{"str_cast_text", "text", pgnodes.OidText, "'foo'::text"},
+	{"str_cast_numeric", "numeric", pgnodes.OidNumeric, "'5.5'::numeric"},
+	{"str_cast_numeric_scale", "numeric", pgnodes.OidNumeric, "'5.50'::numeric"},
+	{"str_cast_numeric_neg", "numeric", pgnodes.OidNumeric, "'-2.5'::numeric"},
+	{"str_col_numeric", "numeric", pgnodes.OidNumeric, "'5.5'"},
 }
 
 // TestOraclePgnodesAdbinBytesMatchPG is the M0123-S4 byte-diff oracle: for each

@@ -220,9 +220,9 @@ func resolve(e parser.Expr, expected uint32) (Node, uint32, error) {
 		// In a concrete non-text column context PG folds the unknown-type literal to
 		// a by-value Const at parse time (stringTypeToConst → the type's input
 		// function), with NO cast node. foldStringLiteralConst reproduces that for
-		// the modeled types (bool / int2 / int4 / int8 / date / the deterministic
-		// timestamptz subset); anything it cannot fold byte-identically degrades to
-		// SQL text (all-or-nothing; 02e §3).
+		// the modeled types (bool / int2 / int4 / int8 / numeric / date / the
+		// deterministic timestamptz subset); anything it cannot fold byte-identically
+		// degrades to SQL text (all-or-nothing; 02e §3).
 		if n, t, ok := foldStringLiteralConst(v.Value, expected); ok {
 			return n, t, nil
 		}
@@ -340,6 +340,24 @@ func foldStringLiteralConst(s string, targetOID uint32) (Node, uint32, bool) {
 		if n, ok := parseIntFromString(s, 64); ok {
 			return NewInt8Const(n), OidInt8, true
 		}
+	case OidText:
+		// An unknown-type literal cast to text (`'foo'::text`) folds via textin to a
+		// bare text Const — a VERBATIM byte copy, no whitespace trimming, and textin
+		// never fails, so every string folds. Byte-identical to the same literal in a
+		// text column context (resolve's StringConst arm handles that before reaching
+		// here); this arm closes the explicit-`::text`-cast asymmetry only.
+		return NewTextConst(s), OidText, true
+	case OidNumeric:
+		// An unknown-type literal cast to numeric (`'5.5'::numeric`) folds via numeric_in
+		// to a bare numeric Const — byte-identical to the bare numeric literal `5.5` in
+		// the same context (set_var_from_str preserves the display scale, so `'5.50'`
+		// keeps dscale 2). numeric_in trims ASCII whitespace and parses an optional sign,
+		// scientific notation, and the specials NaN / ±Infinity; NewNumericConst
+		// reproduces the finite decimal/scientific subset and errors on the specials
+		// (which use a distinct varlena not modeled here), so those degrade to SQL text.
+		if n, err := NewNumericConst(pgTrimSpace(s), false); err == nil {
+			return n, OidNumeric, true
+		}
 	case OidDate:
 		if days, ok := parseDateDays(s); ok {
 			return NewDateConst(days), OidDate, true
@@ -386,9 +404,9 @@ func resolveCastExpr(v *parser.CastExpr) (Node, uint32, error) {
 	// foldStringLiteralConst) — the explicit `::type` only supplies the target type,
 	// it does not add a wrapper. This closes the asymmetry where `DEFAULT '123'`
 	// folded canonically but `DEFAULT '123'::int4` degraded to SQL text. Modeled fold
-	// targets: bool / int2 / int4 / int8 / date (all TimeZone-independent input
-	// functions) plus the deterministic timestamptz subset (explicit offset /
-	// 'epoch'). A TimeZone-dependent timestamptz form, a literal the input function
+	// targets: bool / int2 / int4 / int8 / text / numeric / date (all
+	// TimeZone-independent input functions) plus the deterministic timestamptz subset
+	// (explicit offset / 'epoch'). A TimeZone-dependent timestamptz form, a literal the input function
 	// would reject, an unmodeled target, or a typmod-qualified target
 	// (`::timestamptz(3)`, handled below) degrades to SQL text (all-or-nothing; 02e
 	// §3). A non-string operand (`now()::date`, `5::int8`) is a genuine conversion /
