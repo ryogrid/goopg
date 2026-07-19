@@ -1,33 +1,21 @@
-Task: M0123-S4 — byte-diff oracle gate (ev_action / view path). COMPLETE this
-loop; committing + pushing.
+(idle — nothing in flight)
 
-Landed: new internal/testport/oracle_pgnodes_ev_action_test.go
-(TestOraclePgnodesEvActionBytesMatchPG) — the query-tree analogue of the adbin
-oracle. Seeds one shared bench_log(client int, src text) on a LIVE PG18, then for
-each of 13 canonical view cases CREATE VIEWs the SELECT, reads back
-pg_rewrite.ev_action::text, normalizes `:location N`→-1, and asserts
-pgnodes.ResolveViewQuery→OutRuleAction is byte-identical (ErrUnsupported on a
-PG-canonical case = hard failure). The piece the adbin path lacked: a LIVE
-RelationResolver (liveRelationResolver) reading the base relation's real
-relid/relkind (pg_class) + full column list (attname/attnum/atttypid/atttypmod/
-attcollation via string_agg+QueryScalar, oids/relkind ::text-cast to dodge
-`text||"char"` ambiguity) from the SAME cluster → goopg Var/RTE OIDs match PG's
-ev_action, no baked 16384. Cases mirror pgnodes view goldens v/v2 + v3–v13.
+Last loop (#29): M0123-S4 sub-slice 17 — simple-form CASE WHEN-value implicit
+coercion (numeric operand + int4 value). LANDED + committed. NO resolver change
+(resolveCaseWhenCond already resolves the WHEN value with the operand type as its
+expected type → resolveIntLiteral applies int4_numeric, buildOpExpr picks
+numeric_eq). Added 2 live PG18.3 scalar adbin goldens (case_test.go
+simple_numeric_operand_int_when_coerce{,_multi}) + 2 live-oracle cases
+(oracle_pgnodes_adbin_test.go, now 27) + doc comment on resolveCaseWhenCond +
+design 0123-0005 §"Sub-slice 17" + ledger row (int8/explicit-cast-operand
+deferral).
 
-Key symbols: TestOraclePgnodesEvActionBytesMatchPG, liveRelationResolver
-(pgnodes.RelationResolver impl), parseSelectForOracle, normalizeOracleLocations
-(shared w/ adbin oracle); drives pgnodes.ResolveViewQuery/OutRuleAction +
-parser.Parse + pgcluster.New/Start/Exec/QueryScalar.
+Gates GREEN: pgnodes pkg, adbin oracle 27/27 vs PG18.3 (1.29s), build/vet/gofmt
+clean, ralph-state-guard consistent (auto-repaired), pgbench smoke via pre-commit.
 
-Gates (GREEN): all 13 subtests PASS vs live PG18.3 (1.25s); -short SKIP verified;
-go build ./..., go vet ./internal/testport/, gofmt clean; ralph-state-guard
-(self-repaired to consistent). pgbench smoke runs in pre-commit hook on commit.
-
-Next step: pick next M0123-S4 REMAINING (fix_plan ~L1013). Recommend float4-common
-(no float8) CASE mix (int/numeric→float4 cast arms + outer float8(float4) column
-cast in resolver_expr.go selectCaseCommonType/coerceCaseResult), OR operator-driven
-implicit coercion in view quals (resolver_query.go queryScope.resolveExpr).
-
-Gates run: ev_action oracle (13 green vs PG18), build/vet (green), gofmt (clean),
-ralph-state-guard (consistent after repair), pgbench smoke (pre-commit).
-In-flight: none.
+Next (M0123-S4 REMAINING): float4-common (no float8) CASE mix (needs
+int/numeric→float4 arms + outer float8(float4) column cast); date-time-family CASE
+coercion; simple-form WHEN with int8/explicit-cast operand (native cross-type op
+416 + explicit-cast FuncExpr operand modeling); operator-driven view-qual coercion
+(int2/timestamptz literals). Resume: internal/pgnodes/resolver_expr.go
+selectCaseCommonType/coerceCaseResult/operandTypmodCollid.

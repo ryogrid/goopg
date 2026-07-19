@@ -1237,7 +1237,24 @@ existing encoder, `constcollid=100` / `consttypmod=n+4`.
       BooleanTest, CaseExpr searched+simple, DistinctExpr (+NULL-operand rewrite).
       All 13 GREEN vs PG18.3 (1.25s); -short SKIP verified; build/vet/gofmt clean.
       Design 0123-0005 §"Byte-diff oracle gate (ev_action)".
+      SUB-SLICE 17 LANDED (2026-07-19): simple-form CASE **WHEN-value implicit
+      coercion** (numeric operand + int4 value). PG's make_op coerces the value up
+      to the operand type when no native cross-type `=` operator exists: a numeric
+      operand has no `numeric=int4` op, so PG picks numeric_eq (opno 1752) and wraps
+      the int4 value in the implicit int4_numeric (1740, funcformat 2) cast; the
+      CaseTestExpr placeholder stays un-coerced. NO resolver change — resolveCase\
+      WhenCond already resolves the value with the operand type as its expected
+      type (resolveIntLiteral applies the same cast, buildOpExpr picks the exact
+      op), so this slice makes the intentional-but-untested path GUARANTEED: 2 live
+      PG18.3 scalar adbin goldens (case_test.go `simple_numeric_operand_int_when_\
+      coerce{,_multi}`, table sd) through golden/codec/rebuild-fixed-point loops +
+      2 live-oracle cases (oracle_pgnodes_adbin_test.go, now 27). Comment on
+      resolveCaseWhenCond documents the make_op coercion model + the un-modeled
+      native-cross-type-operator boundary. Design 0123-0005 §"Sub-slice 17";
+      ledger 2026-07-19 (int8/explicit-cast operand deferral). Gates GREEN: full
+      pgnodes pkg, adbin oracle 27/27 vs PG18.3 (1.29s), build/vet/gofmt clean.
       REMAINING: float4-common (no float8) CASE mix (needs int/numeric→float4 arms
       + outer column cast); date-time-family CASE coercion; simple-form WHEN value
-      needing implicit cast to operand type; operator-driven view-qual coercion
-      (unblocks int2/timestamptz literals).
+      with an int8/explicit-cast operand (native cross-type op 416, no coercion —
+      needs explicit-cast FuncExpr operand modeling); operator-driven view-qual
+      coercion (unblocks int2/timestamptz literals).

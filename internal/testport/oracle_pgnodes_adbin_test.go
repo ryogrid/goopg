@@ -103,6 +103,12 @@ var adbinOracleCases = []adbinOracleCase{
 	{"case_bool", "bool", pgnodes.OidBool, "CASE WHEN (1<2) THEN true ELSE false END"},
 	{"case_numeric_cast", "numeric", pgnodes.OidNumeric, "CASE WHEN true THEN 1 ELSE 2.5 END"},
 	{"case_int8_widen", "int8", pgnodes.OidInt8, "CASE WHEN true THEN 1 ELSE 5000000000 END"},
+	// Simple-form WHEN-value implicit coercion: a numeric operand with an int4
+	// WHEN value — PG (no cross-type numeric=int4 operator) coerces the value via
+	// int4_numeric and picks numeric_eq; the CaseTestExpr placeholder stays typed
+	// numeric and un-coerced.
+	{"case_simple_numeric_coerce", "numeric", pgnodes.OidNumeric, "CASE 5.0 WHEN 1 THEN 100.0 ELSE 200.0 END"},
+	{"case_simple_numeric_coerce_multi", "numeric", pgnodes.OidNumeric, "CASE 3.5 WHEN 1 THEN 1.5 WHEN 2 THEN 2.5 ELSE 3.5 END"},
 }
 
 // TestOraclePgnodesAdbinBytesMatchPG is the M0123-S4 byte-diff oracle: for each

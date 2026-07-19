@@ -842,9 +842,19 @@ func coerceCaseResult(node Node, fromType, toType uint32) (Node, error) {
 // (testExpr==nil) the condition must itself resolve to bool. In the simple form
 // it is PG's expanded `operand = val`: an OpExpr whose left arg is the
 // CaseTestExpr placeholder and right arg is the resolved val (transformCaseExpr →
-// makeSimpleA_Expr "="). buildOpExpr requires an exact (operandType = valType)
-// operator so the placeholder is never wrapped in a coercion — the shape
-// ruleutils recognizes; any other combination degrades to SQL text.
+// makeSimpleA_Expr "=" → make_op).
+//
+// The value is resolved with the operand type as its EXPECTED type, which models
+// the coercion side of make_op: when the value's natural type differs from the
+// operand type and no cross-type "=" operator exists, PG coerces the value up to
+// the operand type before selecting the operator (e.g. a numeric operand with an
+// int4 value → int4_numeric cast on the value, numeric_eq operator; sub-slice 17
+// goldens simple_numeric_operand_int_when_coerce*). buildOpExpr then requires an
+// EXACT (operandType = valType) operator so the CaseTestExpr placeholder is never
+// itself wrapped in a coercion — the shape ruleutils recognizes. A pair PG would
+// resolve through a native cross-type operator (e.g. int8 operand + int4 value →
+// int8=int4 op 416 with the value left un-coerced) is not modeled and degrades to
+// SQL text rather than emitting a divergent tree.
 func resolveCaseWhenCond(when parser.Expr, testExpr *CaseTestExpr, argType uint32, rec scopedResolve) (Node, error) {
 	if testExpr == nil {
 		cond, condType, err := rec(when, OidBool)
