@@ -194,6 +194,9 @@ func TestSupportsExprRejectsOutOfSubset(t *testing.T) {
 		{"-2.5", OidNumeric},    // folded negative numeric Const
 		{"'5'", OidInt4},        // string literal folds to int4 Const (sub-slice 28)
 		{"'t'", OidBool},        // string literal folds to bool Const (sub-slice 28)
+		{"'5'", OidFloat8},      // string literal folds to float8 Const (sub-slice 29c)
+		{"'5.5'", OidFloat4},    // string literal folds to float4 Const (sub-slice 29c)
+		{"'5'", OidOid},         // string literal folds to oid Const (sub-slice 29c)
 	}
 	for _, tc := range supported {
 		if !SupportsExpr(mustParse(t, tc.sql), tc.targetType) {
@@ -205,9 +208,9 @@ func TestSupportsExprRejectsOutOfSubset(t *testing.T) {
 		sql        string
 		targetType uint32
 	}{
-		{"'abc'", OidInt4}, // non-numeric string literal → int input rejects (degrades)
-		{"'5'", OidFloat8}, // float string-literal fold not modeled this slice (degrades)
-		{"a + 1", OidInt4}, // column reference
+		{"'abc'", OidInt4},        // non-numeric string literal → int input rejects (degrades)
+		{"'Infinity'", OidFloat8}, // non-finite float spelling not folded (degrades)
+		{"a + 1", OidInt4},        // column reference
 	}
 	for _, tc := range unsupported {
 		if SupportsExpr(mustParse(t, tc.sql), tc.targetType) {
@@ -246,19 +249,19 @@ func TestResolveForColumn(t *testing.T) {
 		wantOK     bool
 	}{
 		// Exact-match: accepted.
-		{"40 + 2", OidInt4, true},   // OpExpr int4 == int4 column
-		{"-1", OidInt4, true},       // negative int4 Const
+		{"40 + 2", OidInt4, true},     // OpExpr int4 == int4 column
+		{"-1", OidInt4, true},         // negative int4 Const
 		{"upper('x')", OidText, true}, // FuncExpr text == text column
 		{"5000000000", OidInt8, true}, // int8 literal == int8 column
-		{"'hi'", OidText, true},     // text Const == text column
+		{"'hi'", OidText, true},       // text Const == text column
 		// Integer literal in a numeric column: canonical via the implicit
 		// int4_numeric/int8_numeric cast FuncExpr (M0123-S4 sub-slice 4a).
-		{"0", oidNumeric, true},       // int4 -> numeric implicit cast
+		{"0", oidNumeric, true},          // int4 -> numeric implicit cast
 		{"5000000000", oidNumeric, true}, // int8 -> numeric implicit cast
 		// Type mismatch: must fall back to SQL text (wantOK false) so a standby
 		// never inserts a mistyped Datum.
-		{"5", oidInt2, false}, // int4 Const for a smallint column (int2 cast unsupported)
-		{"'x'", OidInt4, false},  // string literal on a non-text column
+		{"5", oidInt2, false},   // int4 Const for a smallint column (int2 cast unsupported)
+		{"'x'", OidInt4, false}, // string literal on a non-text column
 		// Outside the canonical subset at all: SQL text.
 		{"now()", OidText, false}, // now() has no seeded overload here
 	}

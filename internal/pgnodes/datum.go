@@ -3,6 +3,7 @@ package pgnodes
 import (
 	"encoding/binary"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 )
@@ -97,6 +98,46 @@ func NewBoolConst(v bool) *Const {
 	}
 }
 
+// NewOidConst builds a Const for an oid literal folded from an unknown-type string
+// (`'5'::oid` / `col oid DEFAULT '5'`). An Oid is a 32-bit UNSIGNED by-value type, so
+// ObjectIdGetDatum ZERO-extends it into the 8-byte datum word (unlike a negative
+// int4, which sign-extends) — the value is always taken as an unsigned 32-bit
+// quantity here so the high four bytes stay 0.
+func NewOidConst(v uint32) *Const {
+	return &Const{
+		ConstType: OidOid, ConstTypmod: -1, ConstCollid: 0,
+		ConstLen: 4, ConstByval: true, Location: -1,
+		Datum: byvalWord(int64(v)),
+	}
+}
+
+// NewFloat8Const builds a Const for a float8 (double precision) literal folded from
+// an unknown-type string. Float8GetDatum reinterprets the IEEE-754 double's bits as
+// an int64 (Int64GetDatum), so the datum word is the raw 8-byte little-endian bit
+// pattern. FLOAT8PASSBYVAL is true on the 64-bit build goopg targets, so the Const is
+// by-value with constlen 8.
+func NewFloat8Const(v float64) *Const {
+	return &Const{
+		ConstType: OidFloat8, ConstTypmod: -1, ConstCollid: 0,
+		ConstLen: 8, ConstByval: true, Location: -1,
+		Datum: byvalWord(int64(math.Float64bits(v))),
+	}
+}
+
+// NewFloat4Const builds a Const for a float4 (real) literal folded from an
+// unknown-type string. Float4GetDatum reinterprets the 32-bit IEEE-754 float's bits
+// as an int32 and then Int32GetDatum SIGN-extends that int32 into the 8-byte datum
+// word — so a float whose bit pattern has the high bit set (a negative float) fills
+// the high four bytes with 0xFF, exactly as Int32GetDatum would for a negative int4.
+// int32(bits) then widening to int64 reproduces that sign extension.
+func NewFloat4Const(v float32) *Const {
+	return &Const{
+		ConstType: OidFloat4, ConstTypmod: -1, ConstCollid: 0,
+		ConstLen: 4, ConstByval: true, Location: -1,
+		Datum: byvalWord(int64(int32(math.Float32bits(v)))),
+	}
+}
+
 // caseTypeMeta returns the on-disk (constlen, constbyval) for a type OID that
 // this slice models as a CASE result / casetype, with ok=false for any other
 // type. It backs two decisions: (1) a synthesized NULL defresult (a CASE with
@@ -174,6 +215,102 @@ func parseIntFromString(s string, bits int) (int64, bool) {
 		return 0, false
 	}
 	return n, true
+}
+
+// parseOidFromString reproduces the UNSIGNED-DECIMAL subset of PG's oidin →
+// oidin_subr (utils/adt/oid.c), which strtoul-parses base 10 and range-checks the
+// result to the 32-bit Oid width. Accepts leading/trailing ASCII whitespace, an
+// optional '+' sign, then one-or-more base-10 digits in [0, 4294967295]. It
+// intentionally excludes the '-' sign strtoul would accept (which wraps around modulo
+// 2^32 — an obscure form) and any non-decimal base, so a string accepted here yields
+// the byte-identical Oid PG's input function would compute; anything else degrades to
+// SQL text (all-or-nothing).
+func parseOidFromString(s string) (uint32, bool) {
+	t := pgTrimSpace(s)
+	if t == "" {
+		return 0, false
+	}
+	body := t
+	if body[0] == '+' {
+		body = body[1:]
+	}
+	if body == "" {
+		return 0, false
+	}
+	for i := 0; i < len(body); i++ {
+		if body[i] < '0' || body[i] > '9' {
+			return 0, false
+		}
+	}
+	n, err := strconv.ParseUint(body, 10, 32)
+	if err != nil {
+		return 0, false
+	}
+	return uint32(n), true
+}
+
+// isDecimalFloatText reports whether t (already whitespace-trimmed) is a plain
+// C-decimal floating-point spelling that BOTH strtod/strtof (PG float8in/float4in)
+// and Go's strconv.ParseFloat parse to the identical IEEE-754 value: only the
+// characters [0-9 + - . e E] appear and at least one digit is present. Positional
+// validity ("1e", "1.2.3", "+-5") is left to ParseFloat, so an accepted-here string
+// that ParseFloat also accepts is a finite decimal float. It deliberately rejects the
+// special spellings (Inf/Infinity/NaN — a distinct non-finite datum), hexadecimal
+// floats (0x…p…, which contain 'x'/'p'), and underscore separators, because those are
+// either non-finite or parsed differently; both correctly-rounded parsers then agree
+// on the bits of every accepted string.
+func isDecimalFloatText(t string) bool {
+	if t == "" {
+		return false
+	}
+	hasDigit := false
+	for i := 0; i < len(t); i++ {
+		c := t[i]
+		switch {
+		case c >= '0' && c <= '9':
+			hasDigit = true
+		case c == '+' || c == '-' || c == '.' || c == 'e' || c == 'E':
+			// positional validity is enforced by strconv.ParseFloat below
+		default:
+			return false
+		}
+	}
+	return hasDigit
+}
+
+// parseFloat8FromString reproduces the FINITE-DECIMAL subset of PG's float8in →
+// float8in_internal (utils/adt/float.c), which parses with the platform strtod. Both
+// strtod and Go's correctly-rounded strconv.ParseFloat round the identical decimal
+// string to the same IEEE-754 double, so an accepted string folds byte-identically.
+// Returns ok=false for a non-decimal spelling, a special (Inf/NaN), or an
+// out-of-range value ParseFloat flags with ErrRange (which PG's input function would
+// itself reject) — all of which degrade to SQL text (all-or-nothing).
+func parseFloat8FromString(s string) (float64, bool) {
+	t := pgTrimSpace(s)
+	if !isDecimalFloatText(t) {
+		return 0, false
+	}
+	f, err := strconv.ParseFloat(t, 64)
+	if err != nil {
+		return 0, false
+	}
+	return f, true
+}
+
+// parseFloat4FromString is the float4 (real) analogue of parseFloat8FromString,
+// backing PG's float4in → float4in_internal (strtof). strconv.ParseFloat with a
+// bitSize of 32 returns the float64 nearest to the correctly-rounded float32 value,
+// so float32(result) is exactly the single-precision value strtof would produce.
+func parseFloat4FromString(s string) (float32, bool) {
+	t := pgTrimSpace(s)
+	if !isDecimalFloatText(t) {
+		return 0, false
+	}
+	f, err := strconv.ParseFloat(t, 32)
+	if err != nil {
+		return 0, false
+	}
+	return float32(f), true
 }
 
 // parseBoolLiteral reproduces PG boolin → parse_bool_with_len (utils/adt/bool.c):

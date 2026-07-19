@@ -1434,8 +1434,24 @@ existing encoder, `constcollid=100` / `consttypmod=n+4`.
       BadDegrade reject matrix) + oracle now **75 cases** byte-identical vs LIVE PG18.3 +
       executor `str-numeric-nan` flipped canonical. Design 0123-0005 §"Sub-slice 29b";
       ledger 2026-07-20 (typmod'd `'5.5'::numeric(10,2)` + oid/float string folds still open).
-      REMAINING: float/oid string-literal folds
-      (`'5'::float8`/`'5'::oid`); typmod'd string numeric cast (`'5.5'::numeric(10,2)`);
+      SUB-SLICE 29c LANDED (2026-07-20): string-literal cast folds to **oid / float4 /
+      float8** (closes sub-slice 28/29's oid/float deferral). An unknown-type STRING literal
+      coerced to oid/float4/float8 — explicit `::T` cast (`'5'::float8`, `'5'::oid`) OR typed
+      column context (`col float8 DEFAULT '5.5'`) — folds at parse time via oidin/float4in/
+      float8in to a by-value Const with NO cast node, byte-identical to PG18.3. Three new arms
+      in `foldStringLiteralConst`. datum.go NewOidConst (32-bit unsigned → ZERO-extends the
+      datum word) / NewFloat8Const (raw IEEE double bits) / NewFloat4Const (32-bit float bits
+      SIGN-extend, so `(-2.5)::float4` fills the high word with 0xFF, like a negative int4) +
+      parseOidFromString (unsigned-decimal subset) + parseFloat8/4FromString (finite-decimal
+      subset sharing isDecimalFloatText; both PG strtod/strtof and Go ParseFloat are correctly
+      rounded → identical bits). rebuild.go: each folds back to a StringConst (decimal for oid,
+      FormatFloat 'g'/-1 shortest round-trip for floats) → re-folds to the fixed point. Gate
+      `internal/pgnodes/string_float_oid_cast_test.go` (8 live PG18.3 goldens + codec +
+      cast==col-context pairs + rebuild fixed point + BadDegrade matrix incl. non-finite
+      Inf/NaN) + oracle_pgnodes_adbin_test.go now **85 cases** all byte-identical vs LIVE
+      PG18.3; resolver_expr_test/cast_test siblings reconciled. Design 0123-0005 §"Sub-slice
+      29c".
+      REMAINING: typmod'd string numeric cast (`'5.5'::numeric(10,2)`);
       the bare-integer→int2 implicit cast
       FuncExpr (`int2 DEFAULT 5`); float4-common (no float8) CASE mix (needs
       int/numeric→float4 arms + outer column cast); operator-driven view-qual coercion

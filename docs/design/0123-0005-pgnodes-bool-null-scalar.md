@@ -1555,6 +1555,71 @@ falls through to the finite parser (and ultimately degrades to SQL text). The ou
   (`CONST`/`1700`).
 - Full `pgnodes` package + `go vet` + gofmt clean; pgbench smoke via pre-commit.
 
+## Sub-slice 29c — string-literal cast folds to oid / float4 / float8
+
+Sub-slices 28/29 folded `bool`/`int2`/`int4`/`int8`/`text`/`numeric` string literals and
+**deferred** the remaining numeric-family targets `oid`, `float4`, `float8`. This closes
+that deferral, extending the shared `foldStringLiteralConst` across `oidin` / `float4in` /
+`float8in`. An unknown-type string literal coerced to one of these — by an explicit
+`::type` cast (`'5'::float8`) or a typed column context (`col float8 DEFAULT '5.5'`) —
+folds at parse time (`coerce_type` → `stringTypeToConst` → the type input function) to a
+by-value `Const` with **no** cast node, byte-identical to PG18.3.
+
+### The three datum traps
+
+- **oid** (`OID 26`, `constlen 4`) is 32-bit **unsigned**; `ObjectIdGetDatum` **zero**-extends
+  it into the 8-byte datum word (a negative int4 would sign-extend). `outDatum` prints
+  `sizeof(Datum)` = 8 bytes but the length prefix is `constlen` (4) → `:constvalue 4 [ … ]`.
+- **float8** (`OID 701`, `constlen 8`) reinterprets the IEEE-754 double's bits as an int64
+  (`Float8GetDatum` → `Int64GetDatum`): the raw little-endian 64-bit pattern in the word.
+- **float4** (`OID 700`, `constlen 4`) reinterprets the 32-bit float's bits as an int32 and
+  `Int32GetDatum` **sign**-extends them — so a *negative* float (`-2.5`, bits `0xC0200000`)
+  fills the high four bytes with `0xFF`, exactly like a negative int4. `(-2.5)::float4`
+  stores `[ 0 0 32 -64 -1 -1 -1 -1 ]`.
+
+### Why the folded float bits are byte-identical
+
+`float8in`/`float4in` parse with the platform `strtod`/`strtof`, which is correctly rounded
+(round-to-nearest-even). Go's `strconv.ParseFloat` is likewise correctly rounded, so both
+map any finite decimal spelling to the *same* IEEE-754 bit pattern. The fold is restricted
+to a **finite-decimal subset** (`isDecimalFloatText`: only `[0-9 + - . e E]`, ≥1 digit;
+positional validity left to `ParseFloat`), which excludes the special spellings
+(`Inf`/`Infinity`/`NaN` — a distinct non-finite datum), hex floats (`0x…p…`), and
+underscore separators — those degrade to SQL text (all-or-nothing; 02e §3). `oidin`'s subset
+is unsigned-decimal in `[0, 2³²-1]`; the `strtoul` wrap-around `-1` form and non-decimal
+bases are excluded.
+
+### Changes
+
+- `datum.go` — `NewOidConst` / `NewFloat8Const` / `NewFloat4Const` (the by-value builders,
+  each documenting its zero-/sign-extension); `parseOidFromString` (unsigned-decimal subset
+  of `oidin_subr`), `parseFloat8FromString` / `parseFloat4FromString` (finite-decimal subset
+  of `float8in`/`float4in`) sharing the `isDecimalFloatText` char-class guard. New import
+  `math` (Float64bits/Float32bits).
+- `resolver_expr.go` — three arms added to `foldStringLiteralConst` (`OidOid`/`OidFloat4`/
+  `OidFloat8`), reached by BOTH sibling paths (resolve's `StringConst` arm + `resolveCastExpr`
+  string block).
+- `rebuild.go` — three `rebuildConst` cases: rebuild each folded `Const` to a plain
+  `StringConst` — the decimal spelling for oid, `FormatFloat('g', -1, …)` (shortest
+  round-tripping decimal) for the floats — which re-folds through `foldStringLiteralConst`
+  to the identical bits in the folded type's column context (fixed point). New import `math`.
+
+### Gates (all green)
+
+- `internal/pgnodes/string_float_oid_cast_test.go` — 8 live PG18.3 goldens (oid; float8
+  int/decimal/negative/scientific; float4 int/decimal/negative) forward byte-for-byte + codec
+  round-trip + `ResolveForColumn` accepts + cast==column-context pairs + resolve→Rebuild→
+  re-resolve fixed point + a `BadDegrade` matrix (non-numeric, empty, signed/out-of-range oid,
+  decimal-point oid, non-finite float, trailing junk).
+- `internal/testport/oracle_pgnodes_adbin_test.go` — 10 cases added (`str_cast_oid`/`str_col_oid`/
+  `str_cast_float8`/`_decimal`/`_neg`/`_sci`/`str_col_float8`/`str_cast_float4`/`_decimal`/`_neg`)
+  — **85 cases total**, all byte-identical vs LIVE PG18.3.
+- `resolver_expr_test.go` / `cast_test.go` sibling reconciliations: the `SupportsExpr`
+  supported set gains the three folds; `cast_test.go`'s degrade matrix swaps `'5'::float8`
+  (now canonical) for `'Infinity'::float8` (a non-finite spelling that still degrades).
+- Full `pgnodes` package + `go vet` + gofmt clean; executor/initdb attrdef siblings green;
+  pgbench smoke via pre-commit.
+
 ## Byte-diff oracle gate (adbin) — `internal/testport/oracle_pgnodes_adbin_test.go`
 
 The per-datum golden tests above each hard-code a `want` `adbin` string a

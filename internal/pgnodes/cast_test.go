@@ -311,12 +311,15 @@ func TestCastDegradesGracefully(t *testing.T) {
 		sql     string
 		colType uint32
 	}{
-		{"int_to_text_target", "5::text", OidText},           // non-numeric-category target
-		{"text_literal_to_float8", "'5'::float8", OidFloat8}, // float string-literal fold not modeled (deferred)
+		{"int_to_text_target", "5::text", OidText},                  // non-numeric-category target
+		{"nonfinite_float_string", "'Infinity'::float8", OidFloat8}, // non-finite float string not folded
 		// (sub-slice 24 now models the bare-numeric-col typmod'd cast via an implicit
 		// RelabelType — covered in numeric_relabel_test.go — so it is no longer a degrade.
 		// sub-slice 28 now folds a string literal cast to bool/int2/int4/int8 — covered
-		// in string_cast_test.go — so `'5'::int4` is likewise no longer a degrade.)
+		// in string_cast_test.go — so `'5'::int4` is likewise no longer a degrade.
+		// sub-slice 29c now folds a FINITE-decimal string cast to oid/float4/float8 —
+		// covered in string_float_oid_cast_test.go — so only a non-finite float spelling
+		// like `'Infinity'::float8` still degrades here.)
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

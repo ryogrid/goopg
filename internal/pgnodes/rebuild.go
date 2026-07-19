@@ -15,6 +15,7 @@ package pgnodes
 import (
 	"encoding/binary"
 	"fmt"
+	"math"
 	"strconv"
 	"sync"
 
@@ -535,6 +536,26 @@ func rebuildConst(c *Const) (parser.Expr, error) {
 		return &parser.BooleanConst{Value: int64FromByvalWord(c.Datum) != 0}, nil
 	case OidText:
 		return &parser.StringConst{Value: textFromVarlena(c.Datum)}, nil
+	case OidOid:
+		// An oid Const only arises from folding an unknown-type string literal
+		// (`'5'::oid` / `col oid DEFAULT '5'`). Rebuild to the decimal STRING spelling
+		// (like the int2 arm) so a re-resolve in the oid column context re-folds through
+		// foldStringLiteralConst → oid Const (the fixed point). The datum word is a
+		// zero-extended 32-bit unsigned value, recovered by masking to the low 4 bytes.
+		return &parser.StringConst{Value: strconv.FormatUint(uint64(uint32(int64FromByvalWord(c.Datum))), 10)}, nil
+	case OidFloat8:
+		// A float8 Const only arises from folding an unknown-type string literal. The
+		// datum word is the raw IEEE-754 double's bits; render the shortest decimal that
+		// round-trips (FormatFloat 'g'/-1) so a re-resolve in the float8 column context
+		// re-folds to the identical bits — the fixed point.
+		f := math.Float64frombits(uint64(int64FromByvalWord(c.Datum)))
+		return &parser.StringConst{Value: strconv.FormatFloat(f, 'g', -1, 64)}, nil
+	case OidFloat4:
+		// The float4 analogue: the datum word holds the 32-bit IEEE bits sign-extended,
+		// recovered by masking to the low 4 bytes. FormatFloat with bitSize 32 emits the
+		// shortest decimal that round-trips through parseFloat4FromString (fixed point).
+		f := math.Float32frombits(uint32(int64FromByvalWord(c.Datum)))
+		return &parser.StringConst{Value: strconv.FormatFloat(float64(f), 'g', -1, 32)}, nil
 	case OidNumeric:
 		// Decode the packed NumericData back to its canonical decimal text
 		// (preserving dscale trailing zeros so a re-resolve is a fixed point);

@@ -255,6 +255,22 @@ var adbinOracleCases = []adbinOracleCase{
 	{"str_cast_numeric_nan", "numeric", pgnodes.OidNumeric, "'NaN'::numeric"},
 	{"str_cast_numeric_inf", "numeric", pgnodes.OidNumeric, "'Infinity'::numeric"},
 	{"str_cast_numeric_neg_inf", "numeric", pgnodes.OidNumeric, "'-Infinity'::numeric"},
+	// Sub-slice 29c: an unknown-type STRING literal coerced to oid / float4 / float8 —
+	// by an explicit `::type` cast or a typed column context — folds at parse time to a
+	// by-value Const via the type input function (oidin / float4in / float8in), with NO
+	// cast node. oid zero-extends into the datum word; float bits reinterpret as
+	// int32/int64 (float4 sign-extends). Both PG's strtod/strtof and Go's ParseFloat are
+	// correctly rounded, so the folded bits are identical.
+	{"str_cast_oid", "oid", pgnodes.OidOid, "'5'::oid"},
+	{"str_col_oid", "oid", pgnodes.OidOid, "'42'"},
+	{"str_cast_float8", "float8", pgnodes.OidFloat8, "'5'::float8"},
+	{"str_cast_float8_decimal", "float8", pgnodes.OidFloat8, "'5.5'::float8"},
+	{"str_cast_float8_neg", "float8", pgnodes.OidFloat8, "'-2.5'::float8"},
+	{"str_cast_float8_sci", "float8", pgnodes.OidFloat8, "'1.5e10'::float8"},
+	{"str_col_float8", "float8", pgnodes.OidFloat8, "'5.5'"},
+	{"str_cast_float4", "float4", pgnodes.OidFloat4, "'5'::float4"},
+	{"str_cast_float4_decimal", "float4", pgnodes.OidFloat4, "'5.5'::float4"},
+	{"str_cast_float4_neg", "float4", pgnodes.OidFloat4, "'-2.5'::float4"},
 }
 
 // TestOraclePgnodesAdbinBytesMatchPG is the M0123-S4 byte-diff oracle: for each

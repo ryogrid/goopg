@@ -359,6 +359,26 @@ func foldStringLiteralConst(s string, targetOID uint32) (Node, uint32, bool) {
 		if n, err := NewNumericConst(pgTrimSpace(s), false); err == nil {
 			return n, OidNumeric, true
 		}
+	case OidOid:
+		// An unknown-type literal cast to oid (`'5'::oid` / `col oid DEFAULT '5'`)
+		// folds via oidin to a by-value oid Const (zero-extended into the datum word);
+		// the unsigned-decimal subset degrades any non-decimal / out-of-range form.
+		if v, ok := parseOidFromString(s); ok {
+			return NewOidConst(v), OidOid, true
+		}
+	case OidFloat4:
+		// `'5'::float4` folds via float4in (strtof) to a by-value float4 Const (the
+		// 32-bit IEEE bits sign-extended into the datum word); finite-decimal subset.
+		if v, ok := parseFloat4FromString(s); ok {
+			return NewFloat4Const(v), OidFloat4, true
+		}
+	case OidFloat8:
+		// `'5'::float8` folds via float8in (strtod) to a by-value float8 Const (the raw
+		// 64-bit IEEE bits in the datum word); finite-decimal subset. Both PG's strtod
+		// and Go's ParseFloat are correctly rounded, so the folded bits are identical.
+		if v, ok := parseFloat8FromString(s); ok {
+			return NewFloat8Const(v), OidFloat8, true
+		}
 	case OidDate:
 		if days, ok := parseDateDays(s); ok {
 			return NewDateConst(days), OidDate, true
