@@ -1120,6 +1120,74 @@ subset of `numerictypmodin`'s range).
 - full `pgnodes` package + `go vet` + gofmt clean; initdb reload + executor attrdef
   siblings green; pgbench smoke via pre-commit.
 
+## Sub-slice 23 — IMPLICIT numeric column length coercion (`coerce_type_typmod`)
+
+Sub-slice 22 emitted the explicit `::numeric(p,s)` cast canonically **only when the
+column's typmod equalled the cast's**, and degraded every mismatch to SQL text — with
+a note that PG "wraps in a RelabelType". A live probe (six `numeric(p,s)` DEFAULTs)
+showed that note was imprecise: the RelabelType appears **only** for a *bare* `numeric`
+column (typmod −1). The common, high-impact case — a `numeric(p,s)` column whose
+DEFAULT does *not* already carry that typmod — is handled by an **implicit length
+coercion**, not a RelabelType. This slice models it, closing sub-slice 22's degrade
+for every case except the bare-column RelabelType.
+
+`build_column_default` (heap.c) coerces a stored default to the attribute's
+`(type, typmod)`. For a `numeric(p,s)` column, `coerce_type_typmod` (parse_coerce.c)
+adds an **IMPLICIT** `numeric(numeric, int4)` = `funcid` **1703**, **funcformat 2**,
+whenever the stored default's own typmod differs from the column's:
+
+```
+FuncExpr 1703  (funcformat 2, IMPLICIT — the column length coercion)
+  ├─ arg0: the resolved default, whatever its shape:
+  │          • a bare decimal → numeric Const                 (DEFAULT 5.5)
+  │          • an int literal  → int4_numeric/int8_numeric     (DEFAULT 0 / 5000000000)
+  │          • a mismatched explicit cast → funcformat-1 1703  (DEFAULT 5.5::numeric(8,1))
+  └─ arg1: Const int4 = the COLUMN's packed atttypmod
+```
+
+`pg_get_expr` renders this wrap **invisibly** (an implicit cast has no `::type`
+syntax — it deparses as just `5.5`, `0`, or `5.5::numeric(8,1)`), so the rebuild path
+must unwrap it.
+
+Rule (exactly `coerce_type_typmod`): the wrap is applied iff the column typmod
+`targetTypmod >= 0` **and** it differs from the resolved node's own typmod. A node's
+numeric typmod is `−1` for everything except an explicit funcformat-1 1703 cast, which
+carries `(p,s)`. So `col numeric(10,2) DEFAULT 5.5::numeric(10,2)` (matching typmod)
+still needs **no** wrap — sub-slice 22's cast already carries the column typmod.
+
+### Changes
+
+- `resolver_expr.go`: `ResolveForColumnTypmod` rewritten around
+  `coerce_type_typmod` — when `targetType == numeric` and `targetTypmod >= 0`, it wraps
+  the resolved node (via new `wrapNumericLengthCoercion`, funcformat 2) unless the
+  node's typmod (new `numericNodeTypmod`) already matches. A **bare** numeric column
+  (`targetTypmod < 0`) whose node carries a typmod (explicit cast) still degrades — the
+  RelabelType case, unchanged.
+- `rebuild.go`: `isImplicitNumericLengthCoercion` (funcid 1703, **funcformat 2**, 2
+  args) joins the implicit-cast unwrap block in `rebuildFuncExprWith`, so the wrap
+  rebuilds to its inner argument (matching `pg_get_expr`). The `funcformat==2` guard
+  keeps it distinct from the explicit `::numeric(p,s)` cast (funcformat 1, same funcid)
+  that `numericTypmodCastPS` rebuilds to a `CastExpr`.
+- No executor change: `sys_pg_attrdef.go` already threads the column typmod into
+  `ResolveForColumnTypmod` (sub-slice 22), so the writer now emits the wrap for free —
+  `numeric(10,2) DEFAULT 5.5`/`0`/`5000000000` were previously SQL-text fallbacks.
+
+### Gates (all green)
+
+- `internal/pgnodes/numeric_lencoerce_test.go` — 6 live-captured PG18.3 goldens
+  (`5.5`, `0`, `5000000000`, `5.5::numeric(8,1)`, `5.5` into `numeric(10,0)`, `-2.5`)
+  through golden + codec + rebuild fixed-point loops, plus a no-wrap/degrade guard
+  (matching-typmod explicit cast stays funcformat-1; bare-numeric column still
+  degrades).
+- `internal/testport/oracle_pgnodes_adbin_test.go` — 5 cases added with mismatched
+  `numeric(p,s)` columns (**57 cases total**, all byte-identical vs PG18.3, ≈1.58s).
+- full `pgnodes` package + `go vet` + gofmt clean; executor attrdef siblings green;
+  pgbench smoke via pre-commit.
+
+The one remaining numeric degrade is the **bare `numeric` column with a typmod'd cast
+default** (`col numeric DEFAULT 5.5::numeric(8,1)` → `RelabelType`), deferred to a
+future `RelabelType` IR-node slice.
+
 ## Byte-diff oracle gate (adbin) — `internal/testport/oracle_pgnodes_adbin_test.go`
 
 The per-datum golden tests above each hard-code a `want` `adbin` string a

@@ -240,7 +240,8 @@ func rebuildFuncExprWith(f *FuncExpr, rec func(Node) (parser.Expr, error)) (pars
 	// a re-resolve re-wraps the identical FuncExpr (fixed point), rather than a
 	// spurious numeric(<int>) function call.
 	if isImplicitIntToNumericCast(f) || isImplicitInt4ToInt8Cast(f) ||
-		isImplicitFloat4ToFloat8Cast(f) || isImplicitToFloat8Cast(f) {
+		isImplicitFloat4ToFloat8Cast(f) || isImplicitToFloat8Cast(f) ||
+		isImplicitNumericLengthCoercion(f) {
 		return rec(f.Args[0])
 	}
 	// An EXPLICIT `::numeric(p,s)` length coercion (numeric(numeric,int4) = funcid
@@ -318,6 +319,23 @@ func numericTypmodCastPS(f *FuncExpr) (p, s int64, ok bool) {
 		return 0, 0, false
 	}
 	return t >> 16, t & 0x7ff, true
+}
+
+// isImplicitNumericLengthCoercion reports whether f is the IMPLICIT numeric length
+// coercion coerce_type_typmod adds when a numeric column's typmod differs from the
+// stored default's (see wrapNumericLengthCoercion): numeric(numeric, int4) = funcid
+// 1703, funcformat 2 (IMPLICIT), a numeric result, and two args whose second is a
+// non-null int4 typmod Const. pg_get_expr renders it invisibly (an implicit cast has
+// no `::type` syntax), so rebuild unwraps to Args[0]; a re-resolve through
+// ResolveForColumnTypmod re-wraps the identical node (fixed point). The funcformat==2
+// guard separates it from the EXPLICIT `::numeric(p,s)` cast (funcformat 1, same
+// funcid 1703) that numericCastPackedTypmod/numericTypmodCastPS rebuild to a CastExpr.
+func isImplicitNumericLengthCoercion(f *FuncExpr) bool {
+	if f.Funcid != 1703 || f.Funcformat != 2 || f.Funcresulttype != OidNumeric || len(f.Args) != 2 {
+		return false
+	}
+	tc, isConst := f.Args[1].(*Const)
+	return isConst && tc.ConstType == OidInt4 && !tc.ConstIsNull
 }
 
 // isImplicitIntToNumericCast reports whether f is the exact FuncExpr the forward

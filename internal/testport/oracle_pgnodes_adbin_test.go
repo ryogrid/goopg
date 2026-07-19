@@ -189,6 +189,17 @@ var adbinOracleCases = []adbinOracleCase{
 	{"cast_int_to_numeric_10_2", "numeric(10,2)", pgnodes.OidNumeric, "5::numeric(10,2)"},
 	{"cast_numeric_to_numeric_10_2", "numeric(10,2)", pgnodes.OidNumeric, "5.5::numeric(10,2)"},
 	{"cast_int_to_numeric_10_0", "numeric(10,0)", pgnodes.OidNumeric, "5::numeric(10,0)"},
+	// IMPLICIT numeric length coercion (sub-slice 23): when a numeric(p,s) column's
+	// DEFAULT does NOT already carry the column typmod, coerce_type_typmod wraps the
+	// stored default in an IMPLICIT numeric(numeric,int4)=1703 (funcformat 2) to the
+	// column typmod — around a bare decimal Const, an int→numeric implicit cast, or a
+	// mismatched explicit `::numeric(8,1)` cast. numericColSQLTypmod feeds the same
+	// column typmod the executor writer derives, so goopg re-wraps identically.
+	{"lencoerce_decimal_10_2", "numeric(10,2)", pgnodes.OidNumeric, "5.5"},
+	{"lencoerce_int4_10_2", "numeric(10,2)", pgnodes.OidNumeric, "0"},
+	{"lencoerce_int8_10_2", "numeric(10,2)", pgnodes.OidNumeric, "5000000000"},
+	{"lencoerce_explicit_8_1_into_10_2", "numeric(10,2)", pgnodes.OidNumeric, "5.5::numeric(8,1)"},
+	{"lencoerce_decimal_10_0", "numeric(10,0)", pgnodes.OidNumeric, "5.5"},
 }
 
 // TestOraclePgnodesAdbinBytesMatchPG is the M0123-S4 byte-diff oracle: for each

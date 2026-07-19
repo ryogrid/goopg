@@ -1316,9 +1316,28 @@ existing encoder, `constcollid=100` / `consttypmod=n+4`.
       text→float8) + oracle_pgnodes_adbin_test.go now 49 cases all byte-identical vs
       PG18.3 (1.52s); TestE2E_FailoverGoopgToPG + attrdef siblings green. Design
       0123-0005 §"Sub-slice 21".
-      REMAINING: float4-common (no float8) CASE mix (needs int/numeric→float4 arms
-      + outer column cast); date-time-family CASE coercion (searched CASE over
-      date/timestamptz `::type`-cast literal arms — needs a `date` OID-1082 datum +
-      explicit `::timestamptz`/`::date` cast folding of a string literal in a
-      natural/non-column context); operator-driven view-qual coercion (unblocks
-      int2/timestamptz literals).
+      SUB-SLICE 23 LANDED (2026-07-20): IMPLICIT **numeric column length coercion**
+      (`coerce_type_typmod`) — closes sub-slice 22's degrade for the common case. A
+      `numeric(p,s)` column DEFAULT whose stored value does NOT already carry that
+      typmod (`numeric(10,2) DEFAULT 5.5`/`0`/`5000000000`/`5.5::numeric(8,1)`, incl.
+      `numeric(10,0) DEFAULT 5.5`) now wraps the resolved node in the funcformat-**2**
+      sibling of `numeric(numeric,int4)`=1703 with the COLUMN's packed typmod Const,
+      byte-identical to PG18.3 (a live probe showed the working-set "RelabelType" note
+      was imprecise — RelabelType is ONLY the bare-`numeric`-column case). resolver_expr.go
+      `ResolveForColumnTypmod` rewritten around coerce_type_typmod (wrap iff
+      targetTypmod>=0 and != the node's own typmod via new numericNodeTypmod +
+      wrapNumericLengthCoercion); rebuild.go `isImplicitNumericLengthCoercion` (funcid
+      1703 funcformat 2, 2 args) joins the implicit-cast unwrap block so the wrap
+      rebuilds invisibly like pg_get_expr (fixed point). NO executor change — the writer
+      already threads the column typmod (sub-slice 22). Gate
+      `internal/pgnodes/numeric_lencoerce_test.go` (6 live PG18.3 goldens + no-wrap/degrade
+      guard) + oracle_pgnodes_adbin_test.go now 57 cases all byte-identical vs PG18.3
+      (1.58s); executor attrdef siblings green. Design 0123-0005 §"Sub-slice 23"; ledger
+      2026-07-20 (bare-numeric-column RelabelType still deferred).
+      REMAINING: bare-`numeric`-column typmod'd-cast DEFAULT (`col numeric DEFAULT
+      5.5::numeric(8,1)` → RelabelType IR node, still degrades); float4-common (no
+      float8) CASE mix (needs int/numeric→float4 arms + outer column cast); date-time-
+      family CASE coercion (searched CASE over date/timestamptz `::type`-cast literal
+      arms — needs a `date` OID-1082 datum + explicit `::timestamptz`/`::date` cast
+      folding of a string literal in a natural/non-column context); operator-driven
+      view-qual coercion (unblocks int2/timestamptz literals).

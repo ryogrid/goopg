@@ -72,27 +72,80 @@ func ResolveForColumn(e parser.Expr, targetType uint32) (Node, bool) {
 }
 
 // ResolveForColumnTypmod is ResolveForColumn with the column's packed typmod. It
-// exists because a top-level `::numeric(p,s)` length coercion (funcid 1703) is
-// byte-identical to PG's stored adbin ONLY when the column's own typmod equals the
-// cast's: PG's build_column_default coerces the stored default to the attribute's
-// (type, typmod), and when the cast typmod differs from the column typmod (the
-// common case being a bare `numeric` column, typmod -1) PG wraps the coercion in a
-// RelabelType that re-labels to the column typmod — a node this slice does not
-// model. So a top-level numeric length coercion whose embedded typmod ≠ targetTypmod
-// degrades to SQL text (all-or-nothing; 02e §3). targetTypmod is -1 for a column with
-// no length qualifier (every non-numeric-typmod caller via ResolveForColumn), which
-// naturally rejects a `::numeric(p,s)` default on a bare `numeric` column.
+// reproduces PG's coerce_type_typmod (parse_coerce.c), which build_column_default
+// applies to the stored default AFTER coercing it to the attribute's type: when a
+// NUMERIC column carries a length typmod (targetTypmod >= 0) that differs from the
+// resolved default's own typmod, PG wraps the default in an IMPLICIT numeric length
+// coercion numeric(numeric, int4) = funcid 1703, funcformat 2 (wrapNumericLength\
+// Coercion) — e.g. col numeric(10,2) DEFAULT 5.5 stores a funcformat-2 1703 around
+// the bare 5.5 Const; DEFAULT 5.5::numeric(8,1) wraps the funcformat-1 explicit cast;
+// DEFAULT 0 wraps the int4_numeric implicit cast. A matching typmod (targetTypmod ==
+// the resolved node's typmod, e.g. col numeric(10,2) DEFAULT 5.5::numeric(10,2)) needs
+// NO wrap — sub-slice 22's funcformat-1 cast already carries it.
+//
+// The one numeric case still degraded is a BARE numeric column (targetTypmod < 0)
+// whose default is an explicit `::numeric(p,s)` cast (the resolved node carries a
+// typmod >= 0): PG strips the typmod back with a RelabelType (a node not modeled
+// here), so this returns (nil, false). targetTypmod is -1 for every non-numeric-typmod
+// caller via ResolveForColumn.
 func ResolveForColumnTypmod(e parser.Expr, targetType uint32, targetTypmod int32) (Node, bool) {
 	n, typ, err := resolve(e, targetType)
 	if err != nil || typ != targetType {
 		return nil, false
 	}
-	if f, ok := n.(*FuncExpr); ok {
-		if castTypmod, isNumericLenCoerce := numericCastPackedTypmod(f); isNumericLenCoerce && castTypmod != targetTypmod {
+	if targetType == OidNumeric {
+		exprTypmod := numericNodeTypmod(n)
+		if targetTypmod >= 0 {
+			// The column has a length qualifier: coerce_type_typmod adds an implicit
+			// numeric() length coercion whenever the stored typmod differs from it.
+			if exprTypmod != targetTypmod {
+				n = wrapNumericLengthCoercion(n, targetTypmod)
+			}
+			return n, true
+		}
+		// Bare numeric column: an explicit `::numeric(p,s)` cast (exprTypmod >= 0)
+		// would be re-labelled to typmod -1 via a RelabelType — not modeled → degrade.
+		if exprTypmod >= 0 {
 			return nil, false
 		}
 	}
 	return n, true
+}
+
+// numericNodeTypmod returns the numeric typmod a resolved top-level node carries, or
+// -1 when it carries none. Only an EXPLICIT `::numeric(p,s)` length coercion (funcid
+// 1703, funcformat 1 — sub-slice 22) embeds a typmod; a bare numeric Const, an
+// implicit int→numeric cast (1740/1781), or any other numeric-returning node has
+// result typmod -1. ResolveForColumnTypmod uses this to decide whether the column's
+// length coercion is a no-op (typmod already matches) or must be emitted.
+func numericNodeTypmod(n Node) int32 {
+	if f, ok := n.(*FuncExpr); ok {
+		if tm, isExplicitLenCoerce := numericCastPackedTypmod(f); isExplicitLenCoerce {
+			return tm
+		}
+	}
+	return -1
+}
+
+// wrapNumericLengthCoercion wraps a numeric-typed node in PG's implicit numeric length
+// coercion numeric(numeric, int4) = funcid 1703, funcformat 2 (COERCE_IMPLICIT_CAST)
+// to the packed column typmod — the node coerce_type_typmod adds when a numeric
+// column's typmod differs from the stored default's. It shares funcid 1703 with the
+// EXPLICIT `::numeric(p,s)` cast (resolveNumericTypmodCast, funcformat 1); the
+// funcformat distinguishes them in both codec bytes and rebuild
+// (isImplicitNumericLengthCoercion unwraps this form invisibly, matching pg_get_expr).
+func wrapNumericLengthCoercion(n Node, packedTypmod int32) Node {
+	return &FuncExpr{
+		Funcid:         1703, // numeric(numeric, int4) length coercion
+		Funcresulttype: OidNumeric,
+		Funcretset:     false,
+		Funcvariadic:   false,
+		Funcformat:     2, // COERCE_IMPLICIT_CAST
+		Funccollid:     0,
+		Inputcollid:    0,
+		Args:           []Node{n, NewInt4Const(packedTypmod)},
+		Location:       -1,
+	}
 }
 
 // NumericColumnTypmod packs a numeric column's (precision[, scale]) type arguments
