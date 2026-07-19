@@ -1,36 +1,28 @@
 (idle — nothing in flight)
 
-Last loop (#43): M0123-S4 sub-slice 29 — string-literal cast folds to text/numeric.
-LANDED + committed. An unknown-type STRING literal coerced to text/numeric — explicit
-`::T` cast (`'foo'::text`, `'5.5'::numeric`) OR typed column context (`col numeric
-DEFAULT '5.5'`) — folds at parse time via textin/numeric_in to a by-value Const, NO
-cast node, byte-identical to PG18.3. Closes sub-slice 28's text/numeric deferral.
-KEY: `'5.5'::numeric` is byte-identical to bare `5.5` (same NumericData varlena);
-`'5.50'` keeps dscale 2. Only the explicit-`::text`-cast form was actually degrading
-(text COLUMN context already handled by resolve's StringConst arm); numeric col +
-explicit cast both degraded before.
+Last loop (#44): M0123-S4 sub-slice 29b — numeric specials NaN/±Infinity fold.
+LANDED + committed. `'NaN'/'Infinity'/'-Infinity'::numeric` (and numeric column DEFAULT)
+now fold to a canonical digitless NUMERIC_SPECIAL 6-byte varlena (n_header
+0xC000/0xD000/0xF000, high byte prints signed -64/-48/-16) instead of degrading — 3
+oracle cases byte-identical vs LIVE PG18.3 (now 75 total). Closes item (1)/resume-(a)
+of the sub-slice 29 ledger row.
 
-Files: internal/pgnodes/resolver_expr.go (2 new arms in shared foldStringLiteralConst:
-OidText=NewTextConst verbatim always-ok, OidNumeric=NewNumericConst(pgTrimSpace(s))
-reusing sub-slice-3 datum). NO rebuild/codec change (text→StringConst, numeric→
-NumericConst already re-fold to the fixed point). NEW string_text_numeric_cast_test.go;
-oracle adbin +5 (now 72); executor sys_pg_attrdef +4 (incl. str-numeric-nan degrade).
-Design 0123-0005 §"Sub-slice 29" + fix_plan + ledger.
+Files: internal/pgnodes/datum.go (numericVar.special field + parseNumericSpecial exact
+numeric_in port + varlena/decodeNumericVar/specialText + consts numericExtSignMask/NaN/
+PInf/NInf + ciHasPrefix); rebuild.go (OidNumeric special→StringConst spelling, fixed
+point); resolver_expr.go (fold comment). Tests: string_text_numeric_cast_test.go (+3
+goldens, SpecialsFold 10-spelling matrix, BadDegrade reject matrix), executor
+sys_pg_attrdef_test.go (str-numeric-nan flipped canonical), oracle +3. Design 0123-0005
+§"Sub-slice 29b" + README + fix_plan + ledger.
 
-Gates GREEN: full pgnodes pkg; adbin oracle 72/72 byte-identical vs LIVE PG18.3
-(1.88s); executor TestCanonicalAttrdefText; go build ./..., go vet (pgnodes/testport/
-executor), gofmt clean; pgbench smoke via pre-commit; ralph-state-guard OK.
+Gates GREEN: full pgnodes pkg; adbin oracle 75/75 byte-identical vs LIVE PG18.3;
+executor TestCanonicalAttrdefText; go build ./..., go vet (pgnodes/testport/executor),
+gofmt clean; pgbench smoke via pre-commit; ralph-state-guard OK.
 
-Nightly triage (run 20260719-094219, sha c217c692): all 5 AI items already [x] stale
-(fixed at HEAD). No new nightly work.
-
-Next (M0123-S4 REMAINING): (1) numeric specials `'NaN'/'Infinity'/'-Infinity'::numeric`
-(special 0xC000-header varlena — NewNumericConst NaN/±Inf fast path); (2) typmod'd
-string numeric cast `'5.5'::numeric(10,2)` (resolveNumericTypmodCast should special-case
-a StringConst operand: numeric_in then in-place length coercion, no cast node); (3)
-`::oid`/`::float4`/`::float8` string folds (need NewOidConst + a float8 datum + float*in
-Ryu-inverse parse); (4) bare-integer→int2 implicit cast FuncExpr (`int2 DEFAULT 5`,
-funcid 314 — resolveIntLiteral int2-context arm emitting the cast, NOT a bare Const);
-(5) float4-common CASE mix (selectCaseCommonType/coerceCaseResult); (6) operator-driven
-view-qual coercion (resolver_query.go); (7) other length types (varchar(N), timestamp(N),
-bit(N)); (8) broader date input forms (infinity/BC/DateStyle/textual-month).
+Next (M0123-S4 REMAINING): (b) typmod'd string numeric cast `'5.5'::numeric(10,2)`
+(resolveNumericTypmodCast should special-case a *parser.StringConst operand: numeric_in
+then in-place length coercion, no cast node); (c) `::oid`/`::float4`/`::float8` string
+folds (need NewOidConst + a by-value float8 datum + float*in Ryu-inverse parse); the
+bare-integer→int2 implicit cast FuncExpr (funcid 314, `int2 DEFAULT 5`); float4-common
+CASE mix; operator-driven view-qual coercion (resolver_query.go); other length types
+(varchar(N), timestamp(N), bit(N)); broader date input forms (infinity/BC/DateStyle).

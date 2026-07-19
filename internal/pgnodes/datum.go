@@ -253,11 +253,17 @@ func NewTextConst(s string) *Const {
 // dumps byte-for-byte — so reproducing these exact bytes is what makes goopg's
 // pg_node_tree numeric Const byte-identical to real PG18 (adbin / ev_action).
 const (
-	numericSignMask            = 0xC000
-	numericPos                 = 0x0000
-	numericNeg                 = 0x4000
-	numericShort               = 0x8000
-	numericSpecial             = 0xC000
+	numericSignMask = 0xC000
+	numericPos      = 0x0000
+	numericNeg      = 0x4000
+	numericShort    = 0x8000
+	numericSpecial  = 0xC000
+	// NUMERIC_SPECIAL sub-classes (numeric.c NUMERIC_EXT_SIGN_MASK): NaN and the two
+	// infinities carry no digits/weight/dscale — the full uint16 n_header IS the value.
+	numericExtSignMask         = 0xF000
+	numericNaN                 = 0xC000 // NUMERIC_NAN
+	numericPInf                = 0xD000 // NUMERIC_PINF (+Infinity)
+	numericNInf                = 0xF000 // NUMERIC_NINF (-Infinity)
 	numericShortSignMask       = 0x2000
 	numericShortDscaleMask     = 0x1F80
 	numericShortDscaleShift    = 7
@@ -278,6 +284,9 @@ type numericVar struct {
 	weight   int
 	dscale   int
 	digits   []int16
+	// special is 0 for a finite value; otherwise the NUMERIC_SPECIAL n_header
+	// (numericNaN / numericPInf / numericNInf). A special carries no digits.
+	special uint16
 }
 
 // parseNumericVar mirrors numeric.c:set_var_from_str (NBASE=10000, DEC_DIGITS=4)
@@ -285,6 +294,12 @@ type numericVar struct {
 // verbatim parser.NumericConst value); negative folds in an outer unary minus
 // the way gram.y's doNegate produces a negative Const.
 func parseNumericVar(text string, negative bool) (numericVar, error) {
+	// numeric_in recognizes the NaN / ±Infinity specials before set_var_from_str,
+	// producing a digitless NUMERIC_SPECIAL varlena. Detect them first; a finite
+	// literal (digit or '.' after the optional sign) falls through unchanged.
+	if sp, ok := parseNumericSpecial(text, negative); ok {
+		return sp, nil
+	}
 	cp := text
 	if len(cp) > 0 && (cp[0] == '+' || cp[0] == '-') {
 		if cp[0] == '-' {
@@ -368,6 +383,73 @@ func parseNumericVar(text string, negative bool) (numericVar, error) {
 	return v, nil
 }
 
+// parseNumericSpecial reproduces the NaN / ±Infinity recognition numeric_in performs
+// before set_var_from_str (utils/adt/numeric.c). It mirrors PG's exact rules so the
+// fold is byte-identical and, crucially, never accepts a spelling PG rejects:
+//   - the sign is read from the FIRST non-space char; the specials are only tried
+//     when the next char is neither a digit nor '.';
+//   - "NaN" is matched from BEFORE the sign (numstart), so a signed NaN never matches
+//     (numeric_in mandates NaN carry no sign);
+//   - "Infinity" (8 chars) and "inf" (3 chars) are matched AFTER the sign, which
+//     selects +Inf vs -Inf; matching is case-insensitive and prefix-only;
+//   - only whitespace may follow the matched token.
+//
+// `negative` is the outer doNegate sign (a numeric negate of ±Inf flips it, of NaN is
+// NaN). Returns ok=false for anything not a special, so parseNumericVar's finite path
+// takes over (and ultimately the fold degrades to SQL text on a genuine syntax error).
+func parseNumericSpecial(text string, negative bool) (numericVar, bool) {
+	cp := pgTrimSpace(text)
+	numstart := cp
+	negSign := false
+	if len(cp) > 0 && cp[0] == '+' {
+		cp = cp[1:]
+	} else if len(cp) > 0 && cp[0] == '-' {
+		negSign = true
+		cp = cp[1:]
+	}
+	// Specials only apply when the char after the sign is neither a digit nor '.'.
+	if len(cp) == 0 || cp[0] == '.' || (cp[0] >= '0' && cp[0] <= '9') {
+		return numericVar{}, false
+	}
+	var header uint16
+	var rest string
+	switch {
+	case ciHasPrefix(numstart, "NaN"): // sign-inclusive: a signed NaN cannot match
+		header = numericNaN
+		rest = numstart[len("NaN"):]
+	case ciHasPrefix(cp, "Infinity"):
+		header = numericPInf
+		rest = cp[len("Infinity"):]
+	case ciHasPrefix(cp, "inf"):
+		header = numericPInf
+		rest = cp[len("inf"):]
+	default:
+		return numericVar{}, false
+	}
+	if pgTrimSpace(rest) != "" { // trailing junk (non-space) → not a special
+		return numericVar{}, false
+	}
+	if header != numericNaN {
+		if negSign {
+			header = numericNInf
+		}
+		if negative { // outer doNegate flips the infinity
+			if header == numericPInf {
+				header = numericNInf
+			} else {
+				header = numericPInf
+			}
+		}
+	}
+	return numericVar{special: header}, true
+}
+
+// ciHasPrefix reports whether s begins with prefix, case-insensitively (ASCII —
+// mirroring pg_strncasecmp's prefix comparison over the special-value spellings).
+func ciHasPrefix(s, prefix string) bool {
+	return len(s) >= len(prefix) && strings.EqualFold(s[:len(prefix)], prefix)
+}
+
 // strip mirrors numeric.c:strip_var (also re-applied inside make_result): drop
 // leading/trailing zero NBASE digits and force a zero value to weight 0 / POS.
 func (v *numericVar) strip() {
@@ -392,6 +474,15 @@ func (v *numericVar) strip() {
 // + int16 n_weight) header and the int16 base-10000 digits, all little-endian to
 // match an x86-64 PostgreSQL's in-memory representation that outfuncs dumps.
 func (v numericVar) varlena() []byte {
+	if v.special != 0 {
+		// NUMERIC_SPECIAL: a 6-byte varlena — a 4-byte length header (VARSIZE<<2) plus
+		// the uint16 n_header, no weight/dscale/digits (make_result for const_nan /
+		// const_pinf / const_ninf, size NUMERIC_HDRSZ_SHORT = VARHDRSZ + sizeof(uint16)).
+		out := make([]byte, 6)
+		binary.LittleEndian.PutUint32(out[0:4], uint32(6)<<2)
+		binary.LittleEndian.PutUint16(out[4:], v.special)
+		return out
+	}
 	n := len(v.digits)
 	short := v.dscale <= numericShortDscaleMax &&
 		v.weight <= numericShortWeightMax && v.weight >= numericShortWeightMin
@@ -434,8 +525,9 @@ func (v numericVar) varlena() []byte {
 }
 
 // NewNumericConst builds a numeric (OID 1700) Const from a decimal/scientific
-// literal. numeric is a non-collatable varlena, so constcollid 0, constlen -1,
-// constbyval false — matching PG's make_const for a T_Float/decimal token.
+// literal OR a NaN/±Infinity special spelling (parseNumericVar recognizes both).
+// numeric is a non-collatable varlena, so constcollid 0, constlen -1, constbyval
+// false — matching PG's make_const for a T_Float/decimal token.
 func NewNumericConst(text string, negative bool) (*Const, error) {
 	v, err := parseNumericVar(text, negative)
 	if err != nil {
@@ -449,8 +541,9 @@ func NewNumericConst(text string, negative bool) (*Const, error) {
 }
 
 // decodeNumericVar inverts varlena: it reads the packed on-disk NumericData back
-// into a numericVar. NaN/Infinity (NUMERIC_SPECIAL) are rejected — the scalar
-// subset only ever encodes finite literals.
+// into a numericVar. NaN/Infinity (NUMERIC_SPECIAL) decode to a digitless numericVar
+// carrying only the ext-sign header in .special; a header with unexpected low bits is
+// rejected.
 func decodeNumericVar(data []byte) (numericVar, error) {
 	if len(data) < 6 {
 		return numericVar{}, fmt.Errorf("pgnodes: numeric datum too short (%d bytes)", len(data))
@@ -477,7 +570,12 @@ func decodeNumericVar(data []byte) (numericVar, error) {
 		v.weight = int(int16(binary.LittleEndian.Uint16(data[6:])))
 		off = 8
 	default:
-		return numericVar{}, fmt.Errorf("pgnodes: numeric special value (NaN/Inf) not supported")
+		// NUMERIC_SPECIAL: NaN / +Inf / -Inf carry only the ext-sign header (no digits).
+		switch header & numericExtSignMask {
+		case numericNaN, numericPInf, numericNInf:
+			return numericVar{special: header & numericExtSignMask}, nil
+		}
+		return numericVar{}, fmt.Errorf("pgnodes: numeric special value (unknown header 0x%04x)", header)
 	}
 	rest := data[off:]
 	n := len(rest) / 2
@@ -486,6 +584,20 @@ func decodeNumericVar(data []byte) (numericVar, error) {
 		v.digits[i] = int16(binary.LittleEndian.Uint16(rest[2*i:]))
 	}
 	return v, nil
+}
+
+// specialText renders a NUMERIC_SPECIAL back to the canonical string spelling
+// numeric_out would emit (used by Rebuild to re-derive the string literal that
+// re-folds to this same Const — the fixed point).
+func (v numericVar) specialText() string {
+	switch v.special {
+	case numericPInf:
+		return "Infinity"
+	case numericNInf:
+		return "-Infinity"
+	default:
+		return "NaN"
+	}
 }
 
 // text renders the unsigned decimal string with exactly dscale fractional

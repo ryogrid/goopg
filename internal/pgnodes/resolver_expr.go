@@ -353,8 +353,9 @@ func foldStringLiteralConst(s string, targetOID uint32) (Node, uint32, bool) {
 		// the same context (set_var_from_str preserves the display scale, so `'5.50'`
 		// keeps dscale 2). numeric_in trims ASCII whitespace and parses an optional sign,
 		// scientific notation, and the specials NaN / ±Infinity; NewNumericConst
-		// reproduces the finite decimal/scientific subset and errors on the specials
-		// (which use a distinct varlena not modeled here), so those degrade to SQL text.
+		// reproduces the finite decimal/scientific subset AND the specials (a digitless
+		// NUMERIC_SPECIAL varlena), so those fold too. A genuine syntax error (a
+		// non-numeric string, an unsupported non-decimal base) still degrades to SQL text.
 		if n, err := NewNumericConst(pgTrimSpace(s), false); err == nil {
 			return n, OidNumeric, true
 		}

@@ -17,8 +17,8 @@ import (
 // text folds a VERBATIM byte copy (textin never trims and never fails); numeric_in
 // preserves the display scale (`'5.50'` keeps dscale 2) and folds a leading sign
 // into the value, so `'5.5'::numeric` is byte-identical to the bare numeric literal
-// `5.5`. The NaN / ±Infinity specials use a distinct varlena not modeled here and
-// degrade to SQL text (all-or-nothing).
+// `5.5`. The NaN / ±Infinity specials fold to a digitless NUMERIC_SPECIAL varlena
+// (sub-slice 29b); only a genuine numeric_in syntax error degrades to SQL text.
 //
 // Each `want` is a LIVE PG18.3 capture (re-derived by the oracle gate
 // internal/testport/oracle_pgnodes_adbin_test.go, cases str_cast_text / str_cast_
@@ -52,6 +52,27 @@ var stringTextNumericCastGolden = []struct {
 		sql:  "'-2.5'::numeric",
 		oid:  OidNumeric,
 		want: `{CONST :consttype 1700 :consttypmod -1 :constcollid 0 :constlen -1 :constbyval false :constisnull false :location -1 :constvalue 10 [ 40 0 0 0 -128 -96 2 0 -120 19 ]}`,
+	},
+	// The NaN / ±Infinity specials fold to a digitless NUMERIC_SPECIAL varlena (6
+	// bytes: 4-byte length header 24 = 6<<2, then the uint16 n_header — 0xC000 NaN /
+	// 0xD000 +Inf / 0xF000 -Inf, whose high byte prints signed: -64 / -48 / -16).
+	{
+		name: "numeric_cast_nan",
+		sql:  "'NaN'::numeric",
+		oid:  OidNumeric,
+		want: `{CONST :consttype 1700 :consttypmod -1 :constcollid 0 :constlen -1 :constbyval false :constisnull false :location -1 :constvalue 6 [ 24 0 0 0 0 -64 ]}`,
+	},
+	{
+		name: "numeric_cast_inf",
+		sql:  "'Infinity'::numeric",
+		oid:  OidNumeric,
+		want: `{CONST :consttype 1700 :consttypmod -1 :constcollid 0 :constlen -1 :constbyval false :constisnull false :location -1 :constvalue 6 [ 24 0 0 0 0 -48 ]}`,
+	},
+	{
+		name: "numeric_cast_neg_inf",
+		sql:  "'-Infinity'::numeric",
+		oid:  OidNumeric,
+		want: `{CONST :consttype 1700 :consttypmod -1 :constcollid 0 :constlen -1 :constbyval false :constisnull false :location -1 :constvalue 6 [ 24 0 0 0 0 -16 ]}`,
 	},
 }
 
@@ -149,17 +170,59 @@ func TestStringTextNumericCastRebuildRoundTrip(t *testing.T) {
 	}
 }
 
-// TestStringNumericCastSpecialsAndBadDegrade guards the numeric fold boundary: the
-// NaN / ±Infinity specials (a distinct varlena PG models but this subset does not)
-// and a non-numeric string all degrade to SQL text rather than fold a wrong datum.
-// text has no such boundary — textin accepts every string — so it is not listed.
-func TestStringNumericCastSpecialsAndBadDegrade(t *testing.T) {
+// TestStringNumericCastSpecialsFold proves the NaN / ±Infinity specials, and the
+// case-insensitive / short "inf" / "+inf" spellings numeric_in also accepts, all fold
+// to the expected digitless NUMERIC_SPECIAL Const rather than degrading to SQL text.
+func TestStringNumericCastSpecialsFold(t *testing.T) {
+	cases := []struct {
+		sql    string
+		header uint16
+	}{
+		{"'NaN'::numeric", numericNaN},
+		{"'nan'::numeric", numericNaN},    // case-insensitive
+		{"'  NaN '::numeric", numericNaN}, // surrounding whitespace trimmed
+		{"'Infinity'::numeric", numericPInf},
+		{"'+Infinity'::numeric", numericPInf},
+		{"'infinity'::numeric", numericPInf},
+		{"'inf'::numeric", numericPInf},
+		{"'+inf'::numeric", numericPInf},
+		{"'-Infinity'::numeric", numericNInf},
+		{"'-inf'::numeric", numericNInf},
+	}
+	for _, tc := range cases {
+		t.Run(tc.sql, func(t *testing.T) {
+			n, ok := ResolveForColumn(mustParse(t, tc.sql), OidNumeric)
+			if !ok {
+				t.Fatalf("ResolveForColumn(%q, numeric) degraded, want a special Const", tc.sql)
+			}
+			c, isConst := n.(*Const)
+			if !isConst {
+				t.Fatalf("%q resolved to %T, want *Const", tc.sql, n)
+			}
+			v, err := decodeNumericVar(c.Datum)
+			if err != nil {
+				t.Fatalf("decodeNumericVar(%q): %v", tc.sql, err)
+			}
+			if v.special != tc.header {
+				t.Fatalf("%q: special header 0x%04x, want 0x%04x", tc.sql, v.special, tc.header)
+			}
+		})
+	}
+}
+
+// TestStringNumericCastBadDegrade guards the numeric fold boundary: a non-numeric
+// string, an empty string, and a signed-NaN / malformed-infinity form (all rejected
+// by numeric_in) degrade to SQL text rather than fold a wrong datum. text has no such
+// boundary — textin accepts every string — so it is not listed.
+func TestStringNumericCastBadDegrade(t *testing.T) {
 	for _, sql := range []string{
-		"'NaN'::numeric",       // special varlena, not modeled
-		"'Infinity'::numeric",  // special varlena, not modeled
-		"'-Infinity'::numeric", // special varlena, not modeled
-		"'abc'::numeric",       // not a number
-		"''::numeric",          // empty
+		"'abc'::numeric",   // not a number
+		"''::numeric",      // empty
+		"'+NaN'::numeric",  // NaN must not carry a sign (numeric_in rejects)
+		"'-NaN'::numeric",  // same
+		"'infin'::numeric", // not "inf" and not "infinity"
+		"'inf x'::numeric", // trailing junk after a valid token
+		"'Infinityx'::numeric",
 	} {
 		t.Run(sql, func(t *testing.T) {
 			if _, ok := ResolveForColumn(mustParse(t, sql), OidNumeric); ok {

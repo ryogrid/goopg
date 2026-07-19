@@ -249,6 +249,12 @@ var adbinOracleCases = []adbinOracleCase{
 	{"str_cast_numeric_scale", "numeric", pgnodes.OidNumeric, "'5.50'::numeric"},
 	{"str_cast_numeric_neg", "numeric", pgnodes.OidNumeric, "'-2.5'::numeric"},
 	{"str_col_numeric", "numeric", pgnodes.OidNumeric, "'5.5'"},
+	// Sub-slice 29b: the NaN / ±Infinity specials fold to a digitless NUMERIC_SPECIAL
+	// varlena (make_result for const_nan / const_pinf / const_ninf) — byte-identical
+	// to the same string in a numeric column context.
+	{"str_cast_numeric_nan", "numeric", pgnodes.OidNumeric, "'NaN'::numeric"},
+	{"str_cast_numeric_inf", "numeric", pgnodes.OidNumeric, "'Infinity'::numeric"},
+	{"str_cast_numeric_neg_inf", "numeric", pgnodes.OidNumeric, "'-Infinity'::numeric"},
 }
 
 // TestOraclePgnodesAdbinBytesMatchPG is the M0123-S4 byte-diff oracle: for each

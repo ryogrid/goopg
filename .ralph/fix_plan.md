@@ -1423,9 +1423,20 @@ existing encoder, `constcollid=100` / `consttypmod=n+4`.
       PG18.3 + executor `TestCanonicalAttrdefText` 4 cases. Design 0123-0005 §"Sub-slice
       29"; ledger 2026-07-20 (NaN/Infinity numeric specials + typmod'd `'5.5'::numeric(10,2)`
       + oid/float string folds deferred).
+      SUB-SLICE 29b LANDED (2026-07-20): numeric specials `'NaN'`/`'Infinity'`/`'-Infinity'`
+      `::numeric` (and numeric column DEFAULT) now fold to a canonical digitless
+      NUMERIC_SPECIAL 6-byte varlena (n_header 0xC000/0xD000/0xF000) instead of degrading —
+      byte-identical to LIVE PG18.3. `datum.go`: `numericVar.special` field + `parseNumericSpecial`
+      (exact numeric_in pre-set_var_from_str recognition: unsigned NaN, ±Inf via sign, case-
+      insensitive prefix-only, trailing-whitespace-only) + `varlena()`/`decodeNumericVar`/
+      `specialText()`; `rebuild.go` OidNumeric arm → StringConst spelling (fixed point).
+      Gate `string_text_numeric_cast_test.go` (+3 goldens, SpecialsFold 10-spelling matrix,
+      BadDegrade reject matrix) + oracle now **75 cases** byte-identical vs LIVE PG18.3 +
+      executor `str-numeric-nan` flipped canonical. Design 0123-0005 §"Sub-slice 29b";
+      ledger 2026-07-20 (typmod'd `'5.5'::numeric(10,2)` + oid/float string folds still open).
       REMAINING: float/oid string-literal folds
       (`'5'::float8`/`'5'::oid`); typmod'd string numeric cast (`'5.5'::numeric(10,2)`);
-      NaN/±Infinity numeric specials; the bare-integer→int2 implicit cast
+      the bare-integer→int2 implicit cast
       FuncExpr (`int2 DEFAULT 5`); float4-common (no float8) CASE mix (needs
       int/numeric→float4 arms + outer column cast); operator-driven view-qual coercion
       (unblocks int2/timestamptz literals inside a view WHERE); other length types

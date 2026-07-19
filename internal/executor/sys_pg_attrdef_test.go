@@ -82,9 +82,9 @@ func TestCanonicalAttrdefText(t *testing.T) {
 		{"str-cast-text", col("text", "'foo'::text"), true, []string{"CONST", "25"}},
 		{"str-cast-numeric", col("numeric", "'5.5'::numeric"), true, []string{"CONST", "1700"}},
 		{"str-col-numeric", col("numeric", "'5.50'"), true, []string{"CONST", "1700"}},
-		// A NaN string cast to numeric uses a special varlena not modeled here, so it
-		// degrades to SQL text (all-or-nothing). M0123-S4 sub-slice 29.
-		{"str-numeric-nan", col("numeric", "'NaN'::numeric"), false, []string{"NaN"}},
+		// A NaN string cast to numeric folds to a canonical digitless NUMERIC_SPECIAL
+		// Const (consttype 1700, constlen -1). M0123-S4 sub-slice 29b.
+		{"str-numeric-nan", col("numeric", "'NaN'::numeric"), true, []string{"CONST", "1700"}},
 		// SQL-text fallback: a bare integer literal `5` in an int2 column is int4-typed
 		// then wrapped in an int4→int2 cast FuncExpr (not modeled), so type != int2 → text.
 		{"smallint-lit", col("int2", "5"), false, []string{"5"}},

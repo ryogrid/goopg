@@ -1500,6 +1500,61 @@ and `::float4`/`::float8` string folds (still unmodeled — the latter needs a f
   `str-col-numeric` canonical; `str-numeric-nan` retained as the specials-degrade boundary).
 - Full `pgnodes` package + `go vet` + gofmt clean; pgbench smoke via pre-commit.
 
+## Sub-slice 29b — numeric specials (`NaN` / `±Infinity`) fold
+
+Sub-slice 29 folded finite `numeric` string casts and **deferred** the three specials
+(`'NaN'::numeric`, `'Infinity'::numeric`, `'-Infinity'::numeric`), which PG folds to a
+distinct `NUMERIC_SPECIAL` varlena the finite decomposition did not model. This closes
+that deferral: `numeric_in` recognizes the specials *before* `set_var_from_str`, so this
+slice reproduces that recognition and the digitless special varlena.
+
+### The special varlena
+
+A special `numeric` is `make_result(&const_nan | &const_pinf | &const_ninf)` — a **6-byte**
+value (`NUMERIC_HDRSZ_SHORT` = `VARHDRSZ` + `sizeof(uint16)`): the 4-byte varlena length
+header (`6<<2` = 24, little-endian) followed by the `uint16` `n_header` and **no**
+weight/dscale/digits. The header carries the whole value via `NUMERIC_EXT_SIGN_MASK`
+(`0xF000`): `NUMERIC_NAN` `0xC000`, `NUMERIC_PINF` `0xD000`, `NUMERIC_NINF` `0xF000`. Its
+high byte prints signed under `outDatum`'s `%d`: `-64` / `-48` / `-16`.
+
+### Matching `numeric_in`'s recognition exactly (`utils/adt/numeric.c`)
+
+`parseNumericSpecial` mirrors PG's rules so the fold never accepts a spelling PG rejects:
+the sign is read from the first non-space char; specials are tried only when the next char
+is neither a digit nor `.`; **`NaN` is matched from *before* the sign** (so a signed
+`+NaN`/`-NaN` never matches — PG mandates `NaN` be unsigned); `Infinity` (8 chars) and
+`inf` (3 chars) are matched *after* the sign, which selects `+Inf` vs `-Inf`; matching is
+case-insensitive and prefix-only; only whitespace may follow the token. Anything else
+falls through to the finite parser (and ultimately degrades to SQL text). The outer
+`doNegate` `negative` flips an infinity (a numeric negate of `±Inf`; of `NaN` is `NaN`).
+
+### Changes
+
+- `datum.go` — `numericVar` gains a `special uint16` field (0 = finite); `parseNumericVar`
+  calls `parseNumericSpecial` first; `varlena()` emits the 6-byte special form when set;
+  `decodeNumericVar` decodes a special header back into `.special` (was: rejected);
+  `specialText()` renders `NaN`/`Infinity`/`-Infinity` for rebuild. New consts
+  `numericExtSignMask`/`numericNaN`/`numericPInf`/`numericNInf`, helper `ciHasPrefix`.
+- `rebuild.go` — the `OidNumeric` arm rebuilds a special to a `StringConst` of its spelling
+  (mirroring the int2 arm), which re-folds through `foldStringLiteralConst` →
+  `NewNumericConst` to the identical special `Const` in a numeric column context (fixed
+  point) — a `NumericConst` token cannot spell `NaN`.
+- `resolver_expr.go` — the `OidNumeric` fold comment updated: specials now fold; only a
+  genuine `numeric_in` syntax error degrades.
+
+### Gates (all green)
+
+- `internal/pgnodes/string_text_numeric_cast_test.go` — 3 new specials goldens
+  (`numeric_cast_nan`/`_inf`/`_neg_inf`) folded + codec round-trip + rebuild fixed point;
+  a `SpecialsFold` matrix (10 spellings incl. `nan`, `inf`, `+inf`, `-inf`, trimmed) checks
+  the decoded `.special` header; a `BadDegrade` matrix (`+NaN`/`-NaN`/`infin`/`inf x`/
+  `Infinityx`/non-numeric/empty) confirms the reject boundary.
+- `internal/testport/oracle_pgnodes_adbin_test.go` — 3 cases added (`str_cast_numeric_nan`/
+  `_inf`/`_neg_inf`) — **75 cases total**, all byte-identical vs LIVE PG18.3.
+- `internal/executor/sys_pg_attrdef_test.go` — `str-numeric-nan` flipped to canonical
+  (`CONST`/`1700`).
+- Full `pgnodes` package + `go vet` + gofmt clean; pgbench smoke via pre-commit.
+
 ## Byte-diff oracle gate (adbin) — `internal/testport/oracle_pgnodes_adbin_test.go`
 
 The per-datum golden tests above each hard-code a `want` `adbin` string a

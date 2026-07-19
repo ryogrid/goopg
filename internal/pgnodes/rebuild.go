@@ -543,6 +543,13 @@ func rebuildConst(c *Const) (parser.Expr, error) {
 		if err != nil {
 			return nil, fmt.Errorf("pgnodes: Rebuild: numeric Const: %w", err)
 		}
+		if v.special != 0 {
+			// A NaN/±Infinity numeric has no numeric-literal token; it only arises from
+			// folding a STRING literal, so rebuild to that string spelling (mirroring the
+			// int2 arm) — in a numeric column context it re-folds through
+			// foldStringLiteralConst → NewNumericConst to this identical special Const.
+			return &parser.StringConst{Value: v.specialText()}, nil
+		}
 		lit := &parser.NumericConst{Value: v.text()}
 		if v.negative {
 			return &parser.UnaryOp{Op: parser.OpUnaryNeg, Operand: lit}, nil
