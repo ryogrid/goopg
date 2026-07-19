@@ -345,10 +345,69 @@ No new IR, codec, or builder code — only two dispatch arms; the sub-slice-5
   (resolve→`RebuildViewQuery`→re-resolve fixed point).
 - full `pgnodes` package + `go vet ./internal/pgnodes/` + `go build ./...` clean.
 
+## Sub-slice 7 — canonical `CASEEXPR` / `CASEWHEN` (searched form)
+
+A column DEFAULT (or, later, a view qual/target) `CASE WHEN cond THEN result …
+[ELSE result] END` now resolves to a canonical PG18 `CaseExpr` tree instead of
+degrading to SQL text. Like `BoolExpr`/`BooleanTest`, `cookDefault` stores it in
+`pg_attrdef.adbin` unfolded.
+
+### IR + codec (`ir.go`, `outfuncs.go`, `readfuncs.go`)
+
+`CaseExpr{Casetype, Casecollid, Arg, Args, Defresult, Location}` mirrors the
+generated `_outCaseExpr` field order; `CaseWhen{Expr, Result, Location}` mirrors
+`_outCaseWhen`. `Args` is a `[]Node` of `*CaseWhen`, so `wNodeList`/
+`readNodeListField` handle it exactly as any other node list, and both `outNode`
+and `readNode` gained `CASEEXPR`/`CASEWHEN` dispatch arms. `Arg` is always `<>`
+(searched form only; see below).
+
+### Forward + reload (`resolver_expr.go`, `rebuild.go`, `datum.go`)
+
+`resolveCaseExprWith` (with a scalar `resolveCaseExpr` wrapper threading the
+scalar `resolve`, and the `…With(rec)` recursion for a later view-qual slice)
+mirrors `transformCaseExpr` for the **searched** form only:
+
+- Every WHEN condition must resolve to `bool` (`coerce_to_boolean` is not
+  reproduced — a non-bool condition degrades to SQL text).
+- Every WHEN result and any ELSE must resolve to the **same** non-collatable
+  type; that type is `casetype` and `casecollid` is `0`. `caseTypeMeta`
+  (`datum.go`) is the allowlist (bool/int2/int4/int8/oid/numeric/timestamptz) —
+  a collatable or unmodeled result type returns `ok=false` so the writer never
+  emits a wrong non-zero `casecollid` (all-or-nothing; 02e §3).
+- When ELSE is omitted, PG synthesizes a typed NULL `Const` of `casetype`
+  (`transformCaseExpr` coerces an untyped NULL `A_Const`); `newNullConst`
+  reproduces it (`constisnull true`, `constvalue <>`, the type's
+  `constlen`/`constbyval`).
+
+`rebuildCaseExprWith` is the exact inverse: a NULL-`Const` `Defresult` rebuilds
+to an **omitted** ELSE, so `resolve → Rebuild → re-resolve` re-synthesizes
+byte-identical bytes (the fixed point). The simple form (`CASE operand WHEN …`,
+which PG expands into a `CaseTestExpr` placeholder + an `operand = val` OpExpr
+per WHEN) and cross-type `select_common_type` coercion are **deferred** — both
+degrade to SQL text (see ledger).
+
+### Gates (all green)
+
+- `internal/pgnodes/case_test.go` — five live-captured PG18.3 `adbin` goldens
+  (int with ELSE, int no-ELSE with the typed NULL defresult, a two-WHEN body
+  over `OPEXPR` conditions, numeric, bool): forward resolve→`Out` byte-for-byte,
+  `ResolveForColumn` accepts, `Read`→`Out` codec round-trip, resolve→`Rebuild`
+  →re-resolve fixed point, plus a graceful-degradation matrix (mixed-type,
+  simple form, text-result all stay SQL text).
+- `internal/executor/sys_pg_attrdef_test.go` `TestCanonicalAttrdefText` gains a
+  canonical `case-expr` + `case-no-else` case (flipped from SQL-text) and a
+  `case-mixed` SQL-text case.
+- `go vet ./internal/pgnodes/` + `go build ./...` + `gofmt -l` clean; full
+  `pgnodes` + `internal/initdb` packages green.
+
 ## Deferred
 
-- `CASE` and `IS DISTINCT FROM`, plus the byte-diff oracle gate, remain in
-  M0123-S4. Operator-driven implicit coercion in view quals (which would let a
+- The `CASE` **view-query path** (routing `resolver_query`/`rebuild_query`
+  through `resolveCaseExprWith`/`rebuildCaseExprWith`, mirroring sub-slice 6),
+  the **simple form** (`CASE operand WHEN …` — CaseTestExpr placeholder), and
+  `select_common_type` cross-type result coercion remain in M0123-S4.
+- `IS DISTINCT FROM` and the byte-diff oracle gate remain in M0123-S4.
+  Operator-driven implicit coercion in view quals (which would let a
   `timestamptz`/`int2`→`numeric` string literal resolve inside a view `WHERE`)
   is also still SQL-text — only the exact scalar-column DEFAULT context folds a
   `timestamptz`/numeric literal.

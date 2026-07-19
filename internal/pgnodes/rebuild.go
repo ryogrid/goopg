@@ -37,6 +37,8 @@ func Rebuild(n Node) (parser.Expr, error) {
 		return rebuildNullTest(v)
 	case *BooleanTest:
 		return rebuildBooleanTest(v)
+	case *CaseExpr:
+		return rebuildCaseExpr(v)
 	default:
 		return nil, fmt.Errorf("pgnodes: Rebuild: unsupported node %T", n)
 	}
@@ -137,6 +139,49 @@ func rebuildBooleanTestWith(bt *BooleanTest, rec func(Node) (parser.Expr, error)
 		out.Negated = true
 	default:
 		return nil, fmt.Errorf("pgnodes: Rebuild: bad booltesttype %d", bt.BoolTestType)
+	}
+	return out, nil
+}
+
+// rebuildCaseExpr rebuilds a scalar CaseExpr into a parser.CaseExpr.
+func rebuildCaseExpr(c *CaseExpr) (parser.Expr, error) {
+	return rebuildCaseExprWith(c, Rebuild)
+}
+
+// rebuildCaseExprWith is the inverse of resolveCaseExprWith: it rebuilds a
+// searched-form CaseExpr into a parser.CaseExpr, threading the injected
+// recursion so a CASE inside a view qual rebuilds its Var operands. A NULL
+// Const Defresult is the synthesized "no ELSE" default (transformCaseExpr), so
+// it rebuilds back to an omitted ELSE — a re-resolve re-synthesizes identical
+// bytes (the fixed point).
+func rebuildCaseExprWith(c *CaseExpr, rec func(Node) (parser.Expr, error)) (parser.Expr, error) {
+	if c.Arg != nil {
+		return nil, fmt.Errorf("pgnodes: Rebuild: CASE with a test operand is unsupported")
+	}
+	out := &parser.CaseExpr{}
+	for _, a := range c.Args {
+		w, ok := a.(*CaseWhen)
+		if !ok {
+			return nil, fmt.Errorf("pgnodes: Rebuild: CASEEXPR arg is %T, want *CaseWhen", a)
+		}
+		cond, err := rec(w.Expr)
+		if err != nil {
+			return nil, err
+		}
+		res, err := rec(w.Result)
+		if err != nil {
+			return nil, err
+		}
+		out.Whens = append(out.Whens, parser.CaseWhen{When: cond, Then: res})
+	}
+	if cst, ok := c.Defresult.(*Const); ok && cst.ConstIsNull {
+		out.Else = nil
+	} else {
+		el, err := rec(c.Defresult)
+		if err != nil {
+			return nil, err
+		}
+		out.Else = el
 	}
 	return out, nil
 }

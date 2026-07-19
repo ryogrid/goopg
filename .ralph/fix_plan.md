@@ -5849,6 +5849,20 @@ existing encoder, `constcollid=100` / `consttypmod=n+4`.
       `internal/pgnodes/view_bool_null_test.go` (2 new live PG18.3 ev_action
       goldens v5 IS TRUE / v6 IS NOT FALSE) + executor Rewrite/View tests.
       Design 0123-0005 §"Sub-slice 6".
-      REMAINING: `CASE`/`IS DISTINCT FROM`; operator-driven
-      view-qual coercion (unblocks int2/timestamptz→ literals in view quals);
-      byte-diff oracle.
+      SUB-SLICE 7 LANDED (2026-07-19): canonical **`CASEEXPR`/`CASEWHEN`
+      (searched form)** — a column DEFAULT `CASE WHEN cond THEN result …
+      [ELSE result] END` now resolves to a canonical CaseExpr (was SQL text).
+      ir.go `CaseExpr`/`CaseWhen` + outfuncs/readfuncs CASEEXPR/CASEWHEN dispatch;
+      resolver_expr.go `*parser.CaseExpr`→resolveCaseExpr(+`…With` recursion),
+      mirroring transformCaseExpr for the searched form (WHEN conds→bool, all
+      results+ELSE same non-collatable casetype, casecollid 0, omitted ELSE →
+      typed NULL Const via newNullConst); rebuild.go `*CaseExpr`→rebuildCaseExpr
+      (NULL defresult ↔ omitted ELSE = fixed point). datum.go caseTypeMeta
+      allowlist. Gate `internal/pgnodes/case_test.go` (5 live PG18.3 adbin
+      goldens + degradation matrix) + executor `TestCanonicalAttrdefText`
+      reconciled (case-expr/case-no-else flipped canonical). Design 0123-0005
+      §"Sub-slice 7".
+      REMAINING: CASE **view-query** wiring (2 dispatch arms, mirror sub-slice 6)
+      + simple form (`CASE operand WHEN …`, needs CaseTestExpr) + cross-type
+      result coercion; `IS DISTINCT FROM`; operator-driven view-qual coercion
+      (unblocks int2/timestamptz literals in view quals); byte-diff oracle.

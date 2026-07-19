@@ -43,6 +43,10 @@ func outNode(sb *strings.Builder, n Node) {
 		outNullTest(sb, v)
 	case *BooleanTest:
 		outBooleanTest(sb, v)
+	case *CaseExpr:
+		outCaseExpr(sb, v)
+	case *CaseWhen:
+		outCaseWhen(sb, v)
 	case *Query:
 		outQuery(sb, v)
 	case *RangeTblEntry:
@@ -278,4 +282,24 @@ func outBooleanTest(sb *strings.Builder, b *BooleanTest) {
 	wNode(sb, "arg", b.Arg)
 	wInt(sb, "booltesttype", b.BoolTestType)
 	wLoc(sb, "location", b.Location)
+}
+
+// outCaseExpr mirrors _outCaseExpr (generated outfuncs.funcs.c): casetype,
+// casecollid, arg, args, defresult, location.
+func outCaseExpr(sb *strings.Builder, c *CaseExpr) {
+	sb.WriteString("CASEEXPR")
+	wOid(sb, "casetype", c.Casetype)
+	wOid(sb, "casecollid", c.Casecollid)
+	wNode(sb, "arg", c.Arg)
+	wNodeList(sb, "args", c.Args)
+	wNode(sb, "defresult", c.Defresult)
+	wLoc(sb, "location", c.Location)
+}
+
+// outCaseWhen mirrors _outCaseWhen: expr, result, location.
+func outCaseWhen(sb *strings.Builder, w *CaseWhen) {
+	sb.WriteString("CASEWHEN")
+	wNode(sb, "expr", w.Expr)
+	wNode(sb, "result", w.Result)
+	wLoc(sb, "location", w.Location)
 }

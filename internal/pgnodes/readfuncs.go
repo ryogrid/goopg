@@ -112,6 +112,10 @@ func readNode(t *tokenizer) (Node, error) {
 		n, err = readNullTest(t)
 	case "BOOLEANTEST":
 		n, err = readBooleanTest(t)
+	case "CASEEXPR":
+		n, err = readCaseExpr(t)
+	case "CASEWHEN":
+		n, err = readCaseWhen(t)
 	case "QUERY":
 		n, err = readQuery(t)
 	case "RANGETBLENTRY":
@@ -478,6 +482,48 @@ func readBooleanTest(t *tokenizer) (*BooleanTest, error) {
 		return nil, err
 	}
 	return b, nil
+}
+
+// readCaseExpr mirrors the generated _readCaseExpr: casetype, casecollid, arg,
+// args, defresult, location.
+func readCaseExpr(t *tokenizer) (*CaseExpr, error) {
+	c := &CaseExpr{}
+	var err error
+	if c.Casetype, err = readUint32(t); err != nil {
+		return nil, err
+	}
+	if c.Casecollid, err = readUint32(t); err != nil {
+		return nil, err
+	}
+	if c.Arg, err = readNodeField(t); err != nil {
+		return nil, err
+	}
+	if c.Args, err = readNodeListField(t); err != nil {
+		return nil, err
+	}
+	if c.Defresult, err = readNodeField(t); err != nil {
+		return nil, err
+	}
+	if c.Location, err = readInt32(t); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+// readCaseWhen mirrors the generated _readCaseWhen: expr, result, location.
+func readCaseWhen(t *tokenizer) (*CaseWhen, error) {
+	w := &CaseWhen{}
+	var err error
+	if w.Expr, err = readNodeField(t); err != nil {
+		return nil, err
+	}
+	if w.Result, err = readNodeField(t); err != nil {
+		return nil, err
+	}
+	if w.Location, err = readInt32(t); err != nil {
+		return nil, err
+	}
+	return w, nil
 }
 
 func readSQLValueFunction(t *tokenizer) (*SQLValueFunction, error) {

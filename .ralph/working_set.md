@@ -1,33 +1,41 @@
-Task: M0123-S4 sub-slice 6 — route BOOLEANTEST through the VIEW-query dispatch.
-COMPLETE this loop (committing).
+Task: M0123-S4 sub-slice 7 — canonical CASEEXPR/CASEWHEN (searched form),
+scalar column-DEFAULT scope. COMPLETE this loop (committing).
 
-Landed: a view `WHERE (x) IS [NOT] TRUE/FALSE/UNKNOWN` now emits canonical
-pg_rewrite.ev_action (was SQL-text fallback). Two dispatch arms only, reusing the
-sub-slice-5 recursion-injectable `*With` BOOLEANTEST builders:
-- resolver_query.go: queryScope.resolveExpr adds
-  `case *parser.IsBoolExpr: resolveBooleanTestWith(v, s.resolveExpr)` (after the
-  IsNullExpr arm; Var-aware operand).
-- rebuild_query.go: viewRebuildScope.rebuildExpr adds
-  `case *BooleanTest: rebuildBooleanTestWith(v, s.rebuildExpr)` (mirrors NullTest).
-- view_bool_null_test.go (NEW goldens): v5 `(client>0) IS TRUE` (booltesttype 0)
-  + v6 `(client>0) IS NOT FALSE` (booltesttype 3) — live PG18.3 ev_action, joined
-  into the table-driven forward / RoundTrip / RebuildViewQuery-fixed-point tests.
+Landed: a column DEFAULT `CASE WHEN cond THEN result … [ELSE result] END`
+(searched form) now emits canonical PG18 pg_attrdef.adbin (was SQL-text
+fallback). Codec+resolver+rebuild in one commit (sibling rule):
+- ir.go: CaseExpr{Casetype,Casecollid,Arg,Args,Defresult,Location} + CaseWhen
+  {Expr,Result,Location}; Args is []Node of *CaseWhen.
+- outfuncs.go/readfuncs.go: outNode/readNode CASEEXPR+CASEWHEN arms +
+  out/readCaseExpr, out/readCaseWhen.
+- resolver_expr.go: `*parser.CaseExpr`→resolveCaseExpr + resolveCaseExprWith(rec)
+  (recursion-injectable, ready for view path). Searched form only; WHEN conds→
+  bool; all results+ELSE same non-collatable casetype (casecollid 0); omitted
+  ELSE → typed NULL Const (newNullConst).
+- datum.go: caseTypeMeta allowlist (bool/int2/int4/int8/oid/numeric/timestamptz)
+  + newNullConst.
+- rebuild.go: `*CaseExpr`→rebuildCaseExpr + rebuildCaseExprWith(rec); NULL
+  defresult ↔ omitted ELSE (fixed point).
+- NEW gate case_test.go: 5 live PG18.3 adbin goldens + degradation matrix.
+- Reconciled executor sys_pg_attrdef_test.go TestCanonicalAttrdefText
+  (case-expr/case-no-else flipped SQL-text→canonical; case-mixed stays text).
 
-No new IR/codec/builder. executor sys_pg_rewrite.go (ResolveViewQuery) picks it
-up automatically.
+Gates (GREEN): pgnodes full package, go vet ./internal/pgnodes/, go build ./...,
+gofmt -l clean, executor TestCanonicalAttrdefText, internal/initdb full.
+pgbench smoke via pre-commit hook (on commit).
 
-Gates (GREEN): pgnodes package (ViewQueryBoolNull + BooleanTest + full),
-executor Rewrite/View/CanonicalAttrdef, go vet ./internal/pgnodes/,
-go build ./..., gofmt -l clean. pgbench smoke via pre-commit hook.
-Design 0123-0005 §"Sub-slice 6" + fix_plan S4 note + ledger row appended.
+Key symbols: resolveCaseExprWith, rebuildCaseExprWith, caseTypeMeta,
+newNullConst, outCaseExpr/outCaseWhen, readCaseExpr/readCaseWhen.
 
-Key symbols: queryScope.resolveExpr, viewRebuildScope.rebuildExpr,
-resolveBooleanTestWith, rebuildBooleanTestWith.
+Note: `postgres` symlink (→ ../postgres) went missing at session start; restored
+it this loop (untracked convenience symlink, not committed).
 
-Next step (next loop): CaseExpr (CASE WHEN) — full codec+resolver+rebuild+scalar
-+view with live PG18.3 adbin/ev_action goldens (ir.go/outfuncs.go/readfuncs.go/
-resolver_expr.go/rebuild.go, mirror the BOOLEANTEST slice shape), then
-DistinctExpr (IS DISTINCT FROM), then the byte-diff oracle harness. Optionally add
-a BOOLEANTEST standby pg_get_viewdef parse case to e2e_failover_goopg_to_pg_test.go.
+Next step (next loop): CASE view-query wiring (sub-slice 8) — route
+resolver_query.go queryScope.resolveExpr `*parser.CaseExpr`→
+resolveCaseExprWith(v, s.resolveExpr) + rebuild_query.go viewRebuildScope.
+rebuildExpr `*CaseExpr`→rebuildCaseExprWith(v, s.rebuildExpr) (mirror sub-slice
+6), with a live PG18.3 ev_action view golden. Then the simple form (CaseTestExpr
+node + operand=val expansion), then DistinctExpr (IS DISTINCT FROM), then the
+byte-diff oracle harness.
 
 In-flight: none.

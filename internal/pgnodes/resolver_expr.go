@@ -115,6 +115,9 @@ func resolve(e parser.Expr, expected uint32) (Node, uint32, error) {
 	case *parser.IsBoolExpr:
 		return resolveBooleanTest(v)
 
+	case *parser.CaseExpr:
+		return resolveCaseExpr(v)
+
 	case *parser.UnaryOp:
 		switch v.Op {
 		case parser.OpUnaryPos:
@@ -440,6 +443,81 @@ func resolveBooleanTestWith(e *parser.IsBoolExpr, rec scopedResolve) (Node, uint
 		return nil, 0, err
 	}
 	return &BooleanTest{Arg: arg, BoolTestType: booleanTestType(e), Location: -1}, OidBool, nil
+}
+
+// resolveCaseExpr resolves a scalar (column-DEFAULT scope) CASE expression.
+func resolveCaseExpr(e *parser.CaseExpr) (Node, uint32, error) {
+	return resolveCaseExprWith(e, resolve)
+}
+
+// resolveCaseExprWith resolves a searched-form CASE to a canonical CaseExpr,
+// threading the injected recursion so a CASE inside a view qual can resolve
+// WHEN/result operands over base-relation Vars (mirrors resolveBooleanTestWith).
+//
+// Only the searched form is modeled: the simple form (`CASE operand WHEN val …`)
+// transforms in PG into a CaseTestExpr placeholder + an `operand = val` OpExpr
+// per WHEN (transformCaseExpr), a distinct node subset left to a later slice.
+// All WHEN conditions must resolve to bool and all results (plus any ELSE) to
+// the SAME non-collatable type — select_common_type cross-type coercion is
+// deferred; a mixed-type or collatable CASE returns ErrUnsupported so the writer
+// degrades to SQL text (all-or-nothing).
+func resolveCaseExprWith(e *parser.CaseExpr, rec scopedResolve) (Node, uint32, error) {
+	if e.Operand != nil {
+		return nil, 0, ErrUnsupported // simple form — deferred
+	}
+	if len(e.Whens) == 0 {
+		return nil, 0, ErrUnsupported
+	}
+	var (
+		args     []Node
+		casetype uint32
+		seeded   bool
+	)
+	for _, w := range e.Whens {
+		cond, condType, err := rec(w.When, OidBool)
+		if err != nil {
+			return nil, 0, err
+		}
+		if condType != OidBool {
+			// coerce_to_boolean would apply in PG; keep the subset bounded.
+			return nil, 0, ErrUnsupported
+		}
+		res, resType, err := rec(w.Then, 0)
+		if err != nil {
+			return nil, 0, err
+		}
+		if !seeded {
+			casetype, seeded = resType, true
+		} else if resType != casetype {
+			return nil, 0, ErrUnsupported // mixed result types — deferred
+		}
+		args = append(args, &CaseWhen{Expr: cond, Result: res, Location: -1})
+	}
+
+	var defresult Node
+	if e.Else != nil {
+		res, resType, err := rec(e.Else, 0)
+		if err != nil {
+			return nil, 0, err
+		}
+		if resType != casetype {
+			return nil, 0, ErrUnsupported // mixed result types — deferred
+		}
+		defresult = res
+	}
+
+	constlen, constbyval, ok := caseTypeMeta(casetype)
+	if !ok {
+		return nil, 0, ErrUnsupported // unmodeled or collatable casetype
+	}
+	if defresult == nil {
+		// ELSE omitted → PG synthesizes a typed NULL Const of casetype.
+		defresult = newNullConst(casetype, constlen, constbyval)
+	}
+	return &CaseExpr{
+		Casetype: casetype, Casecollid: 0, Arg: nil,
+		Args: args, Defresult: defresult, Location: -1,
+	}, casetype, nil
 }
 
 // buildOpExpr looks the operator up by spelling + already-resolved operand type

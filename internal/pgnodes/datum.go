@@ -80,6 +80,44 @@ func NewBoolConst(v bool) *Const {
 	}
 }
 
+// caseTypeMeta returns the on-disk (constlen, constbyval) for a type OID that
+// this slice models as a CASE result / casetype, with ok=false for any other
+// type. It backs two decisions: (1) a synthesized NULL defresult (a CASE with
+// no ELSE) needs the common type's length/byval, and (2) collatable types
+// (text/varchar/…) are deliberately ABSENT, so a CASE over them returns ok=false
+// and degrades to SQL text rather than emitting a wrong non-zero casecollid
+// (this subset always writes casecollid 0).
+func caseTypeMeta(oid uint32) (constlen int32, constbyval bool, ok bool) {
+	switch oid {
+	case OidBool:
+		return 1, true, true
+	case OidInt2:
+		return 2, true, true
+	case OidInt4, OidOid:
+		return 4, true, true
+	case OidInt8:
+		return 8, true, true
+	case OidNumeric:
+		return -1, false, true
+	case OidTimestamptz:
+		return 8, true, true
+	default:
+		return 0, false, false
+	}
+}
+
+// newNullConst builds the typed NULL Const PG synthesizes for a CASE without an
+// ELSE branch (transformCaseExpr coerces an untyped NULL A_Const to the common
+// type): constisnull=true with no datum, but the target type's constlen/byval
+// and constcollid 0.
+func newNullConst(oid uint32, constlen int32, constbyval bool) *Const {
+	return &Const{
+		ConstType: oid, ConstTypmod: -1, ConstCollid: 0,
+		ConstLen: constlen, ConstByval: constbyval, ConstIsNull: true,
+		Location: -1, Datum: nil,
+	}
+}
+
 // NewTextConst builds a Const for a text literal (constcollid = 100, varlena).
 func NewTextConst(s string) *Const {
 	return &Const{

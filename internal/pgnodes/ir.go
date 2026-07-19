@@ -176,3 +176,39 @@ type BooleanTest struct {
 }
 
 func (*BooleanTest) nodeTag() string { return "BOOLEANTEST" }
+
+// CaseExpr mirrors _outCaseExpr (generated outfuncs.funcs.c): casetype,
+// casecollid, arg, args, defresult, location. This is the SQL `CASE` node.
+//
+// Only the *searched* form (`CASE WHEN cond THEN result … [ELSE result] END`)
+// is modeled here, so Arg is always nil. The *simple* form (`CASE operand WHEN
+// val …`) transforms in PG into a CaseTestExpr placeholder in Arg plus an
+// `operand = val` OpExpr per WHEN — a distinct node subset left to a later
+// slice (the resolver degrades it to SQL text).
+//
+// casetype is the common result type across defresult + every WHEN result
+// (select_common_type); this subset only emits canonical bytes when all of
+// them resolve to the *same* non-collatable type, so casecollid is always 0.
+// Args holds *CaseWhen nodes; when ELSE is omitted PG synthesizes a typed NULL
+// Const of casetype as Defresult (transformCaseExpr coerces an untyped NULL
+// A_Const to the common type).
+type CaseExpr struct {
+	Casetype   uint32 // casetype   (common result type OID)
+	Casecollid uint32 // casecollid (0 for the non-collatable subset)
+	Arg        Node   // arg        (nil for the searched form)
+	Args       []Node // args       (list of *CaseWhen)
+	Defresult  Node   // defresult  (ELSE result, or a typed NULL Const)
+	Location   int32  // location
+}
+
+func (*CaseExpr) nodeTag() string { return "CASEEXPR" }
+
+// CaseWhen mirrors _outCaseWhen: expr (the boolean condition), result (its
+// value), location. One `WHEN cond THEN result` arm inside a CaseExpr.
+type CaseWhen struct {
+	Expr     Node  // expr   (boolean condition)
+	Result   Node  // result (arm value, coerced to casetype)
+	Location int32 // location
+}
+
+func (*CaseWhen) nodeTag() string { return "CASEWHEN" }
