@@ -1191,7 +1191,21 @@ existing encoder, `constcollid=100` / `consttypmod=n+4`.
       multi-arm two-casts — float results produced by float4()/float8() conv funcs
       since there is no float literal leaf); added OidFloat4=700 + float
       caseTypeMeta. Design 0123-0005 §"Sub-slice 15".
-      REMAINING: unified cross-FAMILY (int/numeric + float → float8) CASE result
-      coercion; date-time-family CASE coercion; simple-form WHEN value needing
-      implicit cast to operand type; operator-driven view-qual coercion (unblocks
-      int2/timestamptz literals in view quals); byte-diff oracle.
+      SUB-SLICE 16 LANDED (2026-07-19): UNIFIED cross-FAMILY CASE coercion (any
+      int/numeric/float → float8). selectCaseCommonType rewritten from two disjoint
+      families to ONE walk over PG's numeric type category {int4,int8,numeric,
+      float4,float8}; float8 is the category's PREFERRED type so it wins whenever a
+      float8 result is present (common type = float8 > numeric > int8 > int4).
+      coerceCaseResult gains int4/int8/numeric→float8 arms via new wrapToFloat8Cast
+      (float8(int4)=316 / float8(int8)=482 / float8(numeric)=1746, all funcformat 2,
+      castcontext 'i'); rebuild isImplicitToFloat8Cast unwraps them (funcformat==2
+      guard is load-bearing — same OIDs appear funcformat 0 for explicit float8(int)
+      conversion calls). Scope boundary: a float4-but-no-float8 mix has common type
+      float4 + an OUTER float8(float4) column cast (unmodeled → degrade). Gate
+      case_test.go (4 live goldens tables ucf/ucf5: int4/int8/numeric→float8 +
+      three-family int4+float4+float8; degrade case swapped int4_float8_no_numeric→
+      float4_common_no_float8). Design 0123-0005 §"Sub-slice 16".
+      REMAINING: float4-common (no float8) CASE mix (needs int/numeric→float4 arms +
+      outer column cast); date-time-family CASE coercion; simple-form WHEN value
+      needing implicit cast to operand type; operator-driven view-qual coercion
+      (unblocks int2/timestamptz literals in view quals); byte-diff oracle.

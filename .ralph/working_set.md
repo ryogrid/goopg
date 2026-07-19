@@ -1,40 +1,35 @@
-Task: M0123-S4 sub-slice 15 — CASE cross-FAMILY float coercion (float4→float8).
-COMPLETE this loop; committing + pushing.
+Task: M0123-S4 sub-slice 16 — UNIFIED cross-FAMILY CASE coercion (any
+int/numeric/float → float8). COMPLETE this loop; committing + pushing.
 
-Landed: a CASE mixing float4+float8 results now folds to canonical casetype
-float8 (was SQL text). Completes the binary-float family.
-- selectCaseCommonType (resolver_expr.go): restructured to classify results into
-  two DISJOINT families and fold only a within-family mix — exact-integer/numeric
-  {int4,int8,numeric} (widest) OR float {float4,float8}→float8 (float8 IS
-  preferred). A cross-family span (int4+float8) still degrades to SQL text.
-- coerceCaseResult: new float4→float8 arm via wrapFloat4ToFloat8Cast = implicit
-  float8(float4) cast FuncExpr (funcid 311, funcresulttype 701, funcformat 2),
-  from pg_cast.dat (castsource float4→float8, castcontext 'i', method 'f' /
-  prosrc ftod). Byte-identical to PG18.3.
-- rebuild.go isImplicitFloat4ToFloat8Cast unwraps it in rebuildFuncExprWith →
-  fixed point.
-- datum.go: added OidFloat4=700 + float4/float8 caseTypeMeta (float8 byval).
-NOTE: float CASE results are produced by float4()/float8() conv funcs (funcid
-318/316, funcformat 0) — the pgnodes resolver has no float literal/::cast leaf.
+Landed: a CASE mix spanning the exact-integer/numeric and binary-float families
+that CONTAINS float8 now folds to canonical casetype float8 (was SQL text).
+- selectCaseCommonType (resolver_expr.go): rewritten from two disjoint families
+  to ONE walk over PG's numeric type category {int4,int8,numeric,float4,float8};
+  float8 is the category's PREFERRED type so it wins whenever present (precedence
+  float8>numeric>int8>int4). A float4-but-no-float8 mix → common type float4 +
+  outer column cast (unmodeled → degrade).
+- coerceCaseResult: new int4/int8/numeric→float8 arms via wrapToFloat8Cast
+  (float8(int4)=316 / float8(int8)=482 / float8(numeric)=1746, funcformat 2,
+  castcontext 'i'). float4→float8 still via wrapFloat4ToFloat8Cast (311).
+- rebuild.go isImplicitToFloat8Cast unwraps {316,482,1746} funcformat==2 (guard
+  load-bearing: same OIDs appear funcformat 0 for explicit float8(int) calls).
 
-Key symbols: selectCaseCommonType, coerceCaseResult, wrapFloat4ToFloat8Cast,
-isImplicitFloat4ToFloat8Cast, rebuildFuncExprWith, caseTypeMeta.
+Key symbols: selectCaseCommonType, coerceCaseResult, wrapToFloat8Cast,
+isImplicitToFloat8Cast, rebuildFuncExprWith.
 
 Gates (GREEN): full pgnodes pkg, go build ./..., go vet ./internal/pgnodes/,
-gofmt clean (4 files), executor TestCanonicalAttrdefText/TestDefault/
-TestResolveForColumn + initdb TestRebuildAttrdefExpr, ralph-state-guard
-(auto-repaired→consistent). pgbench smoke runs in pre-commit hook.
-Goldens captured live from a throwaway PG18.3 (table cf, funcid 311/318/316).
+gofmt clean (3 files), executor TestCanonicalAttrdefText/TestDefault/
+TestResolveForColumn + initdb TestRebuildAttrdefExpr/TestRebuildViewFromEvAction,
+ralph-state-guard. pgbench smoke runs in pre-commit hook. Goldens captured live
+from a throwaway PG18.3 (tables ucf/ucf5, funcids 316/482/1746/311/318).
 
-Next step: pick from M0123-S4 REMAINING (fix_plan ~L1180): (a) UNIFIED cross-
-family CASE coercion — generalize selectCaseCommonType to PG's per-typcategory
-select_common_type walk (int/numeric+float → float8) + add int→float8/
-numeric→float8 cast arms to coerceCaseResult (funcids: float8(int4)=316,
-float8(int8)=482, float8(numeric)=1746); OR (b) the byte-diff oracle harness (the
-last big M0123-S4 deliverable, goopg adbin/ev_action == real-PG18, :location
-normalized). Recommend (b) the oracle gate. Resume file for (a):
-internal/pgnodes/resolver_expr.go selectCaseCommonType/coerceCaseResult.
+Next step: pick from M0123-S4 REMAINING (fix_plan ~L1194): (a) float4-common
+(no float8) CASE mix — needs int/numeric→float4 cast arms + model the OUTER
+float8(float4) column cast that wraps a sub-column-type CASE (resolveCaseExprWith
+/ ResolveForColumn); OR (b) the byte-diff oracle harness (goopg adbin/ev_action
+== real-PG18 for identical DDL, :location normalized) — the last big S4
+deliverable. Recommend (b).
 
 Gates run: pgnodes (green), executor/initdb siblings (green), build/vet (green),
-gofmt (clean), ralph-state-guard (repaired→consistent), pgbench smoke (pre-commit).
+gofmt (clean), ralph-state-guard (pending final run), pgbench smoke (pre-commit).
 In-flight: none.

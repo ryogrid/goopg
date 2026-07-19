@@ -758,14 +758,69 @@ funcformat 0). The three goldens use exactly that shape.
   executor `TestCanonicalAttrdefText`/`TestDefault`/`TestResolveForColumn` +
   initdb `TestRebuildAttrdefExpr` green; gofmt clean.
 
+## Sub-slice 16 — UNIFIED cross-FAMILY `CASE` coercion (any int/numeric/float → `float8`)
+
+Sub-slices 13–15 folded a `CASE` mix only *within* one numeric family (the
+exact-integer/numeric `{int4,int8,numeric}` OR the binary-float `{float4,float8}`).
+This slice unifies them: PG's `select_common_type` (`parse_coerce.c`) walks the
+**whole numeric type category** (`TYPCATEGORY_NUMERIC 'N'` =
+`{int2,int4,int8,numeric,float4,float8,oid,…}`), and **`float8` is that category's
+PREFERRED type** (`typispreferred=t`). So the moment any result is `float8`, the
+walk stays on it — the common type of a mix that *contains* `float8` is `float8`,
+and every other member coerces up to it. A `bool DEFAULT`/`float8 DEFAULT`
+`CASE WHEN … THEN 1 ELSE float8(2) END` now folds to canonical `casetype 701`
+instead of SQL text.
+
+- `selectCaseCommonType(resultTypes)` (`resolver_expr.go`) is rewritten from the
+  two-disjoint-families form to one category walk over
+  `{int4,int8,numeric,float4,float8}`. Precedence of the reachable common types:
+  `float8` (preferred — wins whenever present) > `numeric` > `int8` > `int4`. Any
+  type outside the set (or a collatable type) → degrade.
+- `coerceCaseResult(node, from, to)` gains the `int4`/`int8`/`numeric` → `float8`
+  arms via new `wrapToFloat8Cast`, choosing the implicit cast `FuncExpr` by source
+  type (`pg_cast.dat`, all castcontext `'i'`, castmethod `'f'`): **`float8(int4)`
+  316**, **`float8(int8)` 482**, **`float8(numeric)` 1746**; funcresulttype
+  `float8`, funcformat 2, byte-identical to PG's un-const-folded stored tree.
+  (`float4`→`float8` still routes through `wrapFloat4ToFloat8Cast`/311.)
+- Rebuild: `rebuildFuncExprWith` (`rebuild.go`) recognises the new casts via
+  `isImplicitToFloat8Cast` (funcid ∈ {316,482,1746} / funcformat **2** /
+  funcresulttype float8 / one arg) and unwraps them to the inner result — a fixed
+  point. The `funcformat==2` guard is load-bearing: the same OIDs appear with
+  funcformat **0** for an explicit `float8(<int>)` conversion call (which must
+  rebuild back to that call, e.g. the ELSE `float8(2)` in `uc1`), and only the
+  implicit-cast form is unwrapped.
+
+**Scope boundary (deliberately unmodeled → degrade):** a mix with `float4` but
+**no** `float8` (e.g. `numeric`+`float4`+`int4`) has PG common type `float4`, and
+PG then wraps the *whole* `CASE` in an OUTER `float8(float4)` **column** cast
+(observed live: `casetype 700` inside an outer `FUNCEXPR 311`). This subset has no
+`int/numeric`→`float4` cast arm and emits no outer column cast, so
+`selectCaseCommonType` returns false for a float4-common mix and the writer keeps
+SQL text.
+
+### Gates (all green)
+
+- `internal/pgnodes/case_test.go` — four live-captured PG18.3 scalar `adbin`
+  goldens (tables `ucf`/`ucf5`) through the golden/codec/rebuild-fixed-point loops:
+  `unified_int4_to_float8_when` (int4→float8 on `WHEN`, native float8 ELSE),
+  `unified_int8_to_float8_else` (int8→float8 on `ELSE`),
+  `unified_numeric_to_float8_when` (numeric→float8 on `WHEN`),
+  `unified_int4_float4_float8_three_families` (int4→float8 316 + float4→float8 311
+  + native float8 in one CASE). `TestCaseDegradesGracefully` swaps its stale
+  `int4_float8_no_numeric` case (now canonical) for `float4_common_no_float8`.
+- full `pgnodes` package + `go vet ./internal/pgnodes/` + `go build ./...` clean;
+  executor `TestCanonicalAttrdefText`/`TestDefault`/`TestResolveForColumn` +
+  initdb `TestRebuildAttrdefExpr`/`TestRebuildViewFromEvAction` green; gofmt clean;
+  pgbench smoke via pre-commit hook.
+
 ## Deferred
 
-- **Cross-family** `CASE` result mixes still degrade to SQL text. Sub-slices 13/14
-  cover the full exact-integer / numeric family `{int4,int8,numeric}` and 15 covers
-  the binary-float family `{float4,float8}`, but a mix that *spans* the two (e.g.
-  `int4`+`float8`, PG common type `float8` via an implicit int→float cast) is not
-  yet modeled, nor are the date-time families. The unified per-category
-  preferred-type walk (any-int/numeric/float → `float8`) is the natural next step.
+- **Cross-family** float-common-*without*-float8 `CASE` mixes still degrade: a mix
+  whose PG common type is `float4` (float4 present, no float8) resolves to a
+  `float4` CASE wrapped in an outer `float8(float4)` column cast, which needs the
+  `int/numeric`→`float4` cast arms plus outer-column-cast modeling; and the
+  date-time families are not yet modeled. Sub-slice 16 covers every mix whose
+  common type is `int8`/`numeric`/`float8`.
 - A simple-form `WHEN` value that needs an implicit coercion to the operand type
   (no exact `operandType = valType` operator — e.g. a numeric operand vs a
   `WHEN` value PG would cast) still degrades to SQL text: PG inserts a cast
