@@ -118,6 +118,9 @@ func resolve(e parser.Expr, expected uint32) (Node, uint32, error) {
 	case *parser.CaseExpr:
 		return resolveCaseExpr(v)
 
+	case *parser.CastExpr:
+		return resolveCastExpr(v)
+
 	case *parser.IsDistinctFromExpr:
 		return resolveDistinctFrom(v)
 
@@ -181,6 +184,84 @@ func resolveFuncCall(f *parser.FuncCall) (Node, uint32, error) {
 		argOIDs = append(argOIDs, t)
 	}
 	return buildFuncExpr(f.Name.Name, argNodes, argOIDs)
+}
+
+// resolveCastExpr resolves an explicit `expr::type` cast. Scope of this slice:
+// the integer family (int2/int4/int8). PG's coerce_type applies the cast to the
+// operand at its NATURAL type — a cast to the operand's own type is a no-op
+// (coerce_type returns the node unchanged, so `5::int4` stays a bare int4 Const
+// and `9999999999::int8` a bare int8 Const), and a genuine integer conversion
+// becomes a COERCE_EXPLICIT_CAST (funcformat 1) FuncExpr naming the pg_cast
+// conversion function (e.g. int8(int4) OID 481). This is the funcformat-1 sibling
+// of the implicit-cast helpers (wrapInt4ToInt8Cast, funcformat 2): same OIDs,
+// different funcformat, because an explicit `::type` keeps its cast node in adbin
+// while an implicit coercion PG re-derives from context. Any non-integer target,
+// a typmod-qualified target, or a source PG models with a different cast method
+// (RelabelType / IO coercion / const-fold) degrades to SQL text (all-or-nothing;
+// 02e §3). The operand is resolved with an unknown context (expected=0) so its
+// own magnitude typing decides int4-vs-int8 before the cast is applied.
+func resolveCastExpr(v *parser.CastExpr) (Node, uint32, error) {
+	if len(v.Typmods) != 0 {
+		return nil, 0, ErrUnsupported
+	}
+	if v.Type.Schema != "" && v.Type.Schema != "pg_catalog" {
+		return nil, 0, ErrUnsupported
+	}
+	targetOID := catalog.TypeNameToOID(v.Type.Name)
+	if !isIntegerType(targetOID) {
+		return nil, 0, ErrUnsupported // only integer-family casts modeled here
+	}
+	arg, srcType, err := resolve(v.Operand, 0)
+	if err != nil {
+		return nil, 0, err
+	}
+	if srcType == targetOID {
+		// A cast to the operand's own type is a no-op; PG emits no RelabelType or
+		// FuncExpr for an exact type match, just the inner node.
+		return arg, srcType, nil
+	}
+	funcid, resultType, ok := integerCastFuncid(srcType, targetOID)
+	if !ok {
+		return nil, 0, ErrUnsupported
+	}
+	return &FuncExpr{
+		Funcid:         funcid,
+		Funcresulttype: resultType,
+		Funcretset:     false,
+		Funcvariadic:   false,
+		Funcformat:     1, // COERCE_EXPLICIT_CAST
+		Funccollid:     0,
+		Inputcollid:    0,
+		Args:           []Node{arg},
+		Location:       -1,
+	}, resultType, nil
+}
+
+// isIntegerType reports whether oid is one of the exact-integer types this slice
+// models as an explicit-cast target (int2/int4/int8).
+func isIntegerType(oid uint32) bool {
+	return oid == OidInt2 || oid == OidInt4 || oid == OidInt8
+}
+
+// integerCastFuncid returns the pg_cast conversion-function OID (castmethod 'f')
+// and its result type for an explicit integer→integer cast, and false for any
+// pair outside {int2,int4,int8}² this slice models. A literal source is always
+// int4 or int8 (make_const magnitude typing never yields int2), so only those two
+// source rows are needed today; every OID is from pg_proc.dat / pg_cast.dat
+// (int2(int4)=314, int8(int4)=481, int4(int8)=480, int2(int8)=714).
+func integerCastFuncid(fromType, toType uint32) (funcid, resultType uint32, ok bool) {
+	switch {
+	case fromType == OidInt4 && toType == OidInt2:
+		return 314, OidInt2, true
+	case fromType == OidInt4 && toType == OidInt8:
+		return 481, OidInt8, true
+	case fromType == OidInt8 && toType == OidInt4:
+		return 480, OidInt4, true
+	case fromType == OidInt8 && toType == OidInt2:
+		return 714, OidInt2, true
+	default:
+		return 0, 0, false
+	}
 }
 
 // funcCallGuard rejects any non-plain-call decoration on a function call. These
@@ -908,6 +989,13 @@ func operandTypmodCollid(n Node) (typmod int32, collid uint32, ok bool) {
 		return v.Vartypmod, v.Varcollid, true
 	case *Const:
 		return v.ConstTypmod, v.ConstCollid, true
+	case *FuncExpr:
+		// A function/cast operand (e.g. an explicit `5::int8` = int8(int4)) carries
+		// no typmod — exprTypmod(T_FuncExpr) is always -1 in PG — and its collation
+		// is exprCollation == funccollid. transformCaseExpr builds the CaseTestExpr
+		// from exactly these, so a simple-form CASE over a cast/function operand
+		// emits a canonical placeholder rather than degrading.
+		return -1, v.Funccollid, true
 	default:
 		return 0, 0, false
 	}

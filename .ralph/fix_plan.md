@@ -1266,8 +1266,26 @@ existing encoder, `constcollid=100` / `consttypmod=n+4`.
       `simple_int4_operand_int8_when_native` CASE 1 WHEN 5000000000…, opno 15) via
       golden/codec/rebuild loops + 2 live-oracle cases (oracle_pgnodes_adbin_test.go,
       now 29, all byte-identical vs PG18.3). Design 0123-0005 §"Sub-slice 18".
+      SUB-SLICE 19 LANDED (2026-07-19): explicit integer **`::type` cast**
+      (int2/int4/int8). PG stores `expr::inttype` as a COERCE_EXPLICIT_CAST
+      (funcformat 1) FuncExpr naming the pg_cast conversion function (int2(int4)=314
+      / int8(int4)=481 / int4(int8)=480 / int2(int8)=714), KEPT verbatim in adbin —
+      the funcformat-1 sibling of the implicit-cast helpers (funcformat 2, same
+      OIDs); a cast to the operand's own type is a no-op (bare Const). New
+      resolver_expr.go `resolveCastExpr`/`isIntegerType`/`integerCastFuncid`
+      (`*parser.CastExpr` arm; operand resolved at NATURAL type so magnitude typing
+      picks the source), operandTypmodCollid gains a `*FuncExpr` arm (typmod -1 /
+      collid funccollid) so a simple-form CASE with an EXPLICIT-cast operand
+      (`CASE 5::int8 WHEN 1 …`) emits canonical bytes — closing the "explicit-cast
+      operand simple CASE" item; rebuild.go `explicitIntegerCastTypeName` rebuilds
+      it to a `::type` CastExpr (funcformat==1 guard; fixed point) vs the implicit
+      481/funcformat-2 unwrap. Gate `internal/pgnodes/cast_test.go` (7 live PG18.3
+      goldens + degradation matrix) + oracle_pgnodes_adbin_test.go now 36 cases,
+      all byte-identical vs PG18.3; TestE2E_FailoverGoopgToPG + initdb/executor
+      attrdef siblings green. Design 0123-0005 §"Sub-slice 19".
       REMAINING: float4-common (no float8) CASE mix (needs int/numeric→float4 arms
-      + outer column cast); date-time-family CASE coercion; simple-form WHEN value
-      with an EXPLICIT-cast operand (int8(int4) funcformat-1 FuncExpr operand
-      modeling); operator-driven view-qual
-      coercion (unblocks int2/timestamptz literals).
+      + outer column cast); date-time-family CASE coercion (searched CASE over
+      date/timestamptz `::type`-cast literal arms — needs a `date` OID-1082 datum +
+      explicit `::timestamptz`/`::date` cast folding of a string literal in a
+      natural/non-column context); operator-driven view-qual coercion (unblocks
+      int2/timestamptz literals).

@@ -903,6 +903,69 @@ golden changed.
   `go vet ./internal/pgnodes/ ./internal/testport/` + `go build ./...` clean;
   gofmt clean; pgbench smoke via pre-commit hook.
 
+## Sub-slice 19 — explicit integer `::type` casts
+
+Every `CASE`/`Const`/`FuncExpr` slice so far emitted the *implicit* casts PG's
+`coerce_type` derives from context (int→numeric, int4→int8 widening, →float8).
+This slice models the **explicit** `expr::type` cast for the integer family
+(`int2`/`int4`/`int8`), which PG stores differently: `coerce_to_target_type`
+called with `COERCION_EXPLICIT` builds a `FuncExpr` with `funcformat`
+`COERCE_EXPLICIT_CAST` (**1**) naming the `pg_cast` conversion function — and,
+unlike an implicit coercion, that cast node is **kept verbatim in `adbin`**
+(ruleutils deparses it back to `::type`). A cast to the operand's *own* type is a
+no-op: `coerce_type` returns the inner node unchanged, so `5::int4` stores a bare
+`int4` `Const` and `9999999999::int8` (a literal `make_const` already typed
+`int8`) a bare `int8` `Const` — no `RelabelType`, no `FuncExpr`.
+
+### Forward (`resolver_expr.go`)
+
+`resolve` gains a `*parser.CastExpr` arm → `resolveCastExpr`:
+
+1. reject a typmod-qualified target (`::numeric(10,2)`) and a non-`pg_catalog`
+   schema qualifier;
+2. map the target type name via `catalog.TypeNameToOID`; only the integer family
+   (`isIntegerType`) is modeled — anything else degrades to SQL text;
+3. resolve the operand at its **natural** type (`expected=0`) so its own
+   magnitude typing (`int4` vs `int8`) decides the *source* before the cast;
+4. if source == target, return the inner node (the no-op case);
+5. else look the conversion function up by (source, target) in
+   `integerCastFuncid` — `int2(int4)=314`, `int8(int4)=481`, `int4(int8)=480`,
+   `int2(int8)=714`, all from `pg_proc.dat`/`pg_cast.dat` — and build the
+   `funcformat 1` `FuncExpr` (the sibling of `wrapInt4ToInt8Cast`'s `funcformat 2`
+   form; same OID 481, different funcformat).
+
+`operandTypmodCollid` also gains a `*FuncExpr` arm (`typmod -1`, `collid
+funccollid`, matching PG's `exprTypmod(T_FuncExpr)==-1` / `exprCollation ==
+funccollid`), so a **simple-form `CASE` whose operand is an explicit cast**
+(`CASE 5::int8 WHEN 1 THEN … END`) types its `CaseTestExpr` placeholder from the
+cast `FuncExpr` instead of degrading — closing the "explicit-cast operand simple
+CASE" item.
+
+### Reload (`rebuild.go`)
+
+`rebuildFuncExprWith` gains an `explicitIntegerCastTypeName` branch (checked
+*after* the implicit-cast unwrap arms, gated on `funcformat==1`): an explicit cast
+rebuilds to a `*parser.CastExpr{Operand: inner, Type: {Name: "int2|int4|int8"}}`,
+**not** the bare argument. Re-resolving `inner::type` re-emits the identical
+`funcformat 1` `FuncExpr` — a fixed point — while the implicit `481`/`funcformat 2`
+form still unwraps. goopg evaluates the rebuilt `CastExpr` natively, so its own
+reload value is unchanged; the win is that a PG standby can now EVALUATE the
+stored `adbin`.
+
+### Gates (all green)
+
+- `internal/pgnodes/cast_test.go` — 7 live-captured PG18.3 scalar `adbin` goldens
+  (`5::int2`/`5::int8`/`9999999999::int4`/`9999999999::int2` explicit casts,
+  `5::int4`/`9999999999::int8` no-ops, and the explicit-cast-operand simple CASE)
+  through golden + codec-round-trip + resolve→Rebuild→re-resolve fixed-point
+  loops, plus a degradation matrix (non-integer target, numeric/text source,
+  typmod-qualified).
+- `internal/testport/oracle_pgnodes_adbin_test.go` — the same 7 cases added to the
+  live oracle (**36 cases total**, all byte-identical vs PG18.3).
+- full `pgnodes` package + `TestOraclePgnodesAdbinBytesMatchPG` +
+  `TestE2E_FailoverGoopgToPG` green; initdb/executor attrdef sibling tests green;
+  `go vet` + `go build ./...` clean; gofmt clean; pgbench smoke via pre-commit.
+
 ## Byte-diff oracle gate (adbin) — `internal/testport/oracle_pgnodes_adbin_test.go`
 
 The per-datum golden tests above each hard-code a `want` `adbin` string a

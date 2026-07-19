@@ -117,6 +117,19 @@ var adbinOracleCases = []adbinOracleCase{
 	// resolution: a native (operand,value) operator wins before coercion.
 	{"case_simple_int8_operand_int4_when", "int8", pgnodes.OidInt8, "CASE 5000000000 WHEN 1 THEN 10000000000 ELSE 20000000000 END"},
 	{"case_simple_int4_operand_int8_when", "int", pgnodes.OidInt4, "CASE 1 WHEN 5000000000 THEN 10 ELSE 20 END"},
+	// Explicit integer `::type` casts (sub-slice 19): a COERCE_EXPLICIT_CAST
+	// (funcformat 1) FuncExpr per pg_cast (int2(int4)=314, int8(int4)=481,
+	// int4(int8)=480, int2(int8)=714), and a no-op cast to the operand's own type
+	// (stored as the bare Const). Plus a simple-form CASE whose operand is an
+	// explicit cast (int8(int4) placeholder) with explicit-cast results so the
+	// casetype matches the column and no outer coercion wraps it.
+	{"cast_int4_to_int2", "int2", pgnodes.OidInt2, "5::int2"},
+	{"cast_int4_to_int8", "int8", pgnodes.OidInt8, "5::int8"},
+	{"cast_int8_to_int4", "int", pgnodes.OidInt4, "9999999999::int4"},
+	{"cast_int8_to_int2", "int2", pgnodes.OidInt2, "9999999999::int2"},
+	{"cast_noop_int4", "int", pgnodes.OidInt4, "5::int4"},
+	{"cast_noop_int8", "int8", pgnodes.OidInt8, "9999999999::int8"},
+	{"case_simple_explicit_cast_operand", "int8", pgnodes.OidInt8, "CASE 5::int8 WHEN 1 THEN 10::int8 ELSE 20::int8 END"},
 }
 
 // TestOraclePgnodesAdbinBytesMatchPG is the M0123-S4 byte-diff oracle: for each

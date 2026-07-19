@@ -243,6 +243,18 @@ func rebuildFuncExprWith(f *FuncExpr, rec func(Node) (parser.Expr, error)) (pars
 		isImplicitFloat4ToFloat8Cast(f) || isImplicitToFloat8Cast(f) {
 		return rec(f.Args[0])
 	}
+	// An EXPLICIT integer cast (funcformat 1) keeps its `::type` node in adbin, so
+	// — unlike the implicit casts above — it rebuilds to a CastExpr, not the bare
+	// argument. Re-resolving `inner::type` re-emits the identical funcformat-1
+	// FuncExpr (fixed point). The funcformat==1 guard distinguishes it from the
+	// implicit int4→int8 (481, funcformat 2) form handled just above.
+	if typeName, ok := explicitIntegerCastTypeName(f); ok {
+		inner, err := rec(f.Args[0])
+		if err != nil {
+			return nil, err
+		}
+		return &parser.CastExpr{Operand: inner, Type: parser.ObjectName{Name: typeName}}, nil
+	}
 	name, ok := catalog.RegprocName(f.Funcid)
 	if !ok {
 		return nil, fmt.Errorf("pgnodes: Rebuild: unknown function OID %d", f.Funcid)
@@ -312,6 +324,34 @@ func isImplicitToFloat8Cast(f *FuncExpr) bool {
 		f.Funcformat == 2 &&
 		f.Funcresulttype == OidFloat8 &&
 		len(f.Args) == 1
+}
+
+// explicitIntegerCastTypeName reports whether f is one of the explicit
+// integer→integer cast FuncExprs the forward resolver emits (resolveCastExpr:
+// int2(int4)=314, int8(int4)=481, int4(int8)=480, int2(int8)=714, all
+// COERCE_EXPLICIT_CAST funcformat 1 with one argument) and returns the canonical
+// target type name for the reconstructed `::type` cast. The funcformat==1 guard
+// is load-bearing: funcid 481 also appears with funcformat 2 as the IMPLICIT
+// int4→int8 widening, which rebuilds by unwrapping instead.
+func explicitIntegerCastTypeName(f *FuncExpr) (string, bool) {
+	if f.Funcformat != 1 || len(f.Args) != 1 {
+		return "", false
+	}
+	switch f.Funcid {
+	case 314, 714: // int2(int4), int2(int8)
+		if f.Funcresulttype == OidInt2 {
+			return "int2", true
+		}
+	case 480: // int4(int8)
+		if f.Funcresulttype == OidInt4 {
+			return "int4", true
+		}
+	case 481: // int8(int4)
+		if f.Funcresulttype == OidInt8 {
+			return "int8", true
+		}
+	}
+	return "", false
 }
 
 // rebuildConst reconstructs a literal. int4/int8 datums decode from the 8-byte
