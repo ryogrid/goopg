@@ -545,6 +545,13 @@ func rebuildConst(c *Const) (parser.Expr, error) {
 		// value is inside the literal string, not a unary minus.
 		usec := int64FromByvalWord(c.Datum)
 		return &parser.StringConst{Value: formatTimestamptzUTC(usec)}, nil
+	case OidDate:
+		// Render the DateADT day count back into a canonical "YYYY-MM-DD" literal
+		// which re-resolves to the identical Const in a date column context — the
+		// fixed point. A pre-2000 (negative) day count lives inside the literal
+		// string, not a unary minus.
+		days := int32(int64FromByvalWord(c.Datum))
+		return &parser.StringConst{Value: formatDate(days)}, nil
 	default:
 		return nil, fmt.Errorf("pgnodes: Rebuild: unsupported Const type OID %d", c.ConstType)
 	}

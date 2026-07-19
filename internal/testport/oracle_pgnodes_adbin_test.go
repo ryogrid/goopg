@@ -211,6 +211,12 @@ var adbinOracleCases = []adbinOracleCase{
 	// visible `::numeric` syntax, unlike the implicit relabelformat-2 form above.
 	{"explicit_relabel_bare_8_1", "numeric", pgnodes.OidNumeric, "(5.5::numeric(8,1))::numeric"},
 	{"explicit_relabel_bare_int4_8_1", "numeric", pgnodes.OidNumeric, "(5::numeric(8,1))::numeric"},
+	// Sub-slice 26: a `date` column DEFAULT literal is folded to a by-value DateADT
+	// Const (int32 days-since-2000) at parse time — date_in is TimeZone-independent,
+	// so a plain ISO date literal always folds; a pre-2000 date sign-extends.
+	{"date_post_2000", "date", pgnodes.OidDate, "'2024-03-15'"},
+	{"date_epoch", "date", pgnodes.OidDate, "'2000-01-01'"},
+	{"date_pre_epoch", "date", pgnodes.OidDate, "'1999-12-31'"},
 }
 
 // TestOraclePgnodesAdbinBytesMatchPG is the M0123-S4 byte-diff oracle: for each

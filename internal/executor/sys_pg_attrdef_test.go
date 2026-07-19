@@ -45,6 +45,11 @@ func TestCanonicalAttrdefText(t *testing.T) {
 		{"tstz-lit", col("timestamptz", "'2024-01-15 10:30:00+00'"), true, []string{"CONST", "1184", "constlen 8"}},
 		// A timestamptz literal WITHOUT an offset is TimeZone-dependent → SQL text.
 		{"tstz-lit-notz", col("timestamptz", "'2024-01-15 10:30:00'"), false, []string{"2024-01-15"}},
+		// A date literal folds to a canonical by-value DateADT Const (consttype
+		// 1082, constlen 4) — date_in is TimeZone-independent. M0123-S4 sub-slice 26.
+		{"date-lit", col("date", "'2024-03-15'"), true, []string{"CONST", "1082", "constlen 4"}},
+		// An invalid calendar triple (Feb 30) can't fold → SQL text fallback.
+		{"date-lit-invalid", col("date", "'2024-02-30'"), false, []string{"2024-02-30"}},
 		// Integer literal in a numeric column: canonical via the implicit
 		// int4_numeric cast FuncExpr (funcid 1740, funcformat 2). M0123-S4 sub-slice 4a.
 		{"numeric-int-lit", col("numeric", "0"), true, []string{"FUNCEXPR", "1740", "1700"}},

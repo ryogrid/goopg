@@ -1286,6 +1286,55 @@ An inner operand that carries **no** typmod (`(5.5::numeric)::numeric`) stays a 
 - Full `pgnodes` package + `go vet` + gofmt clean; ev_action oracle 13/13; executor
   attrdef siblings green; pgbench smoke via pre-commit.
 
+## Sub-slice 26 — canonical `date` (OID 1082) `Const` datums
+
+A `date` column DEFAULT literal (`d date DEFAULT '2024-03-15'`) previously fell back
+to SQL text. PG folds such a literal to a **by-value `DateADT` `Const`** at parse
+time: `coerce_type`'s `stringTypeToConst` calls `date_in` immediately, and — unlike a
+`timestamptz` literal — `date_in` is **TimeZone-independent**, so *any* plain ISO date
+literal folds deterministically (no offset/`Z` determinism boundary; the only guard is
+calendar validity). The stored `adbin` is therefore a `Const`, not a cast FuncExpr.
+
+`DateADT` is a signed `int32` = days since the PostgreSQL epoch (2000-01-01,
+`POSTGRES_EPOCH_JDATE`). The wire form is exactly the `int4` `Const` shape but
+`consttype 1082`: `outDatum` prints `constlen 4` yet emits all `sizeof(Datum)==8`
+bytes, and a pre-2000 (negative) day count sign-extends into the high bytes
+(`DateADTGetDatum` = `Int32GetDatum`). Example live PG18.3 goldens:
+
+- `'2024-03-15'` → day 8840 (0x2288) → `constvalue 4 [ -120 34 0 0 0 0 0 0 ]`
+- `'2000-01-01'` → day 0 → all-zero datum word
+- `'1999-12-31'` → day -1 → `[ -1 -1 -1 -1 -1 -1 -1 -1 ]` (sign-extended)
+
+### Changes
+
+- `datum.go`: `OidDate = 1082`; `NewDateConst(days int32)` (by-value, constlen 4);
+  `parseDateDays` (reuses the existing `date2j`/`parseDateFields` math, with a
+  `j2date∘date2j` round-trip guard that rejects a non-canonical calendar triple like
+  month 13 / Feb 30 so only a genuine date folds); `formatDate` (the `j2date` inverse
+  for rebuild).
+- `resolver_expr.go`: the `StringConst` case gains a `date` arm (parallel to the
+  `timestamptz` arm) — a date-context literal that `parseDateDays` accepts folds to
+  `NewDateConst`, else `ErrUnsupported` → SQL text.
+- `rebuild.go`: `rebuildConst` gains an `OidDate` case rendering the day count back to
+  a canonical `"YYYY-MM-DD"` literal (fixed point on re-resolve).
+- Engine wiring is unchanged: `catalog.TypeNameToOID("date")` already returns `1082`,
+  so the executor's `canonicalAttrdefText`→`ResolveForColumnTypmod` funnel routes a
+  `date` column's DEFAULT through the new arm automatically.
+
+### Gates (all green)
+
+- `internal/pgnodes/date_test.go` — 5 live-captured PG18.3 goldens (post-2000, epoch,
+  pre-epoch -1, year 0001, max date 5874897-12-31) through golden + codec round-trip +
+  resolve→Rebuild→re-resolve fixed-point loops; a graceful-degradation matrix
+  (invalid calendar triples + a date-shaped string in a text column) and a direct
+  `parseDateDays` math table.
+- `internal/testport/oracle_pgnodes_adbin_test.go` — 3 date cases added
+  (**64 cases total**, all byte-identical vs LIVE PG18.3).
+- `internal/executor/sys_pg_attrdef_test.go` — `date-lit` (canonical, consttype 1082,
+  constlen 4) + `date-lit-invalid` (Feb 30 → SQL text fallback).
+- Full `pgnodes` package + `go vet` + gofmt clean; initdb reload siblings green;
+  pgbench smoke via pre-commit.
+
 ## Byte-diff oracle gate (adbin) — `internal/testport/oracle_pgnodes_adbin_test.go`
 
 The per-datum golden tests above each hard-code a `want` `adbin` string a

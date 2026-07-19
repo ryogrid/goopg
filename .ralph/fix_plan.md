@@ -1353,9 +1353,27 @@ existing encoder, `constcollid=100` / `consttypmod=n+4`.
       reconciled (bare-numeric typmod'd cast flipped degrade→canonical); executor attrdef
       siblings green. Design 0123-0005 §"Sub-slice 24" + README index. ALL numeric column/
       typmod DEFAULT shapes now canonical.
+      SUB-SLICE 25 LANDED (2026-07-20, committed `be88fb66`): EXPLICIT bare-`numeric`
+      cast `RelabelType` (relabelformat 1) — the visible-syntax counterpart of 24's
+      implicit form; see design 0123-0005 §"Sub-slice 25".
+      SUB-SLICE 26 LANDED (2026-07-20): canonical **`date` (OID 1082) `Const` datums**.
+      A `date` column DEFAULT literal (`d date DEFAULT '2024-03-15'`) now folds to a
+      by-value `DateADT` `Const` (int32 days-since-2000, constlen 4) byte-for-byte
+      identical to PG18.3's `pg_attrdef.adbin` — `date_in` is TimeZone-INDEPENDENT so
+      (unlike timestamptz) any plain ISO date literal folds deterministically; the only
+      guard is calendar validity (`j2date∘date2j` round-trip rejects month 13 / Feb 30).
+      datum.go `OidDate`/`NewDateConst`/`parseDateDays`/`formatDate` (reuses the existing
+      `date2j`/`j2date`/`parseDateFields` math); resolver_expr.go StringConst gains a date
+      arm parallel to timestamptz; rebuild.go rebuildConst gains an OidDate case (fixed
+      point). Engine wiring unchanged (`TypeNameToOID("date")`==1082 already routes it).
+      Gate `internal/pgnodes/date_test.go` (5 live PG18.3 goldens + math table + graceful
+      degradation) + oracle_pgnodes_adbin_test.go now **64 cases** all byte-identical vs
+      LIVE PG18.3 + executor `TestCanonicalAttrdefText` date-lit/date-lit-invalid. Design
+      0123-0005 §"Sub-slice 26". DEFERRED (ledger): non-ISO / special date input forms
+      (`infinity`/`-infinity`, BC years, `DateStyle`-dependent `MM/DD/YYYY`, textual month).
       REMAINING: float4-common (no
       float8) CASE mix (needs int/numeric→float4 arms + outer column cast); date-time-
       family CASE coercion (searched CASE over date/timestamptz `::type`-cast literal
-      arms — needs a `date` OID-1082 datum + explicit `::timestamptz`/`::date` cast
-      folding of a string literal in a natural/non-column context); operator-driven
-      view-qual coercion (unblocks int2/timestamptz literals).
+      arms — now that the `date` OID-1082 datum exists, needs explicit `::timestamptz`/
+      `::date` cast folding of a string literal in a natural/non-column context);
+      operator-driven view-qual coercion (unblocks int2/timestamptz literals).

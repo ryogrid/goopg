@@ -226,6 +226,14 @@ func resolve(e parser.Expr, expected uint32) (Node, uint32, error) {
 				return NewTimestamptzConst(usec), OidTimestamptz, nil
 			}
 		}
+		// A date context folds a plain ISO date literal to a by-value DateADT
+		// Const (date_in is TimeZone-independent, so — unlike timestamptz — no
+		// determinism boundary beyond the calendar-validity guard in parseDateDays).
+		if expected == OidDate {
+			if days, ok := parseDateDays(v.Value); ok {
+				return NewDateConst(days), OidDate, nil
+			}
+		}
 		return nil, 0, ErrUnsupported
 
 	case *parser.IsNullExpr:

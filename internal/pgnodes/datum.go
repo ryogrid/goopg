@@ -18,6 +18,7 @@ const (
 	OidFloat4      = 700
 	OidFloat8      = 701
 	OidNumeric     = 1700
+	OidDate        = 1082
 	OidTimestamptz = 1184
 )
 
@@ -513,6 +514,48 @@ func NewTimestamptzConst(usec int64) *Const {
 		ConstLen: 8, ConstByval: true, Location: -1,
 		Datum: byvalWord(usec),
 	}
+}
+
+// NewDateConst builds a Const for a date value (DateADT: signed int32 days since
+// the PostgreSQL epoch, 2000-01-01). It is by-value (constlen 4, constbyval true,
+// constcollid 0) and sign-extends into the 8-byte datum word so a pre-2000 date
+// fills the high bytes with 0xFF (Int32GetDatum / DateADTGetDatum), while a
+// post-2000 date zero-extends — exactly the int4 Const wire form but consttype
+// 1082.
+func NewDateConst(days int32) *Const {
+	return &Const{
+		ConstType: OidDate, ConstTypmod: -1, ConstCollid: 0,
+		ConstLen: 4, ConstByval: true, Location: -1,
+		Datum: byvalWord(int64(days)),
+	}
+}
+
+// parseDateDays parses a "YYYY-MM-DD" date literal into DateADT days-since-2000,
+// returning ok=false for anything outside that deterministic subset (the resolver
+// then degrades to SQL text). A plain ISO date is TimeZone-independent — unlike a
+// timestamptz literal — so date_in folds it to a Const at parse time regardless
+// of session GUCs. The round-trip guard (j2date∘date2j is the identity ONLY on a
+// valid calendar date) rejects a non-canonical field triple like month 13 / day
+// 32 so only a genuine date literal folds.
+func parseDateDays(s string) (int32, bool) {
+	s = strings.TrimSpace(s)
+	y, m, d, ok := parseDateFields(s)
+	if !ok || y < 1 {
+		return 0, false
+	}
+	jd := date2j(y, m, d)
+	if ry, rm, rd := j2date(jd); ry != y || rm != m || rd != d {
+		return 0, false
+	}
+	return int32(jd - postgresEpochJDate), true
+}
+
+// formatDate renders a stored DateADT day count back into the canonical
+// "YYYY-MM-DD" literal, the inverse of parseDateDays (used by the rebuild path so
+// a re-resolve is a fixed point).
+func formatDate(days int32) string {
+	y, m, d := j2date(int(days) + postgresEpochJDate)
+	return fmt.Sprintf("%04d-%02d-%02d", y, m, d)
 }
 
 // parseTimestamptzMicros parses a timestamptz literal into microseconds since the
