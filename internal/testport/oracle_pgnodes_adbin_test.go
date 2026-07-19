@@ -25,8 +25,9 @@ package testport
 //
 // Scope of THIS slice: column DEFAULTs (the ResolveForColumn/adbin path), which
 // carries the bulk of S4's datum + scalar-expression work. The view ev_action
-// oracle (ResolveViewQuery/pg_rewrite) needs a RelationResolver shim over live
-// PG catalog metadata and is deferred (see .ralph/deferral_ledger.md).
+// oracle (ResolveViewQuery/pg_rewrite) is the sibling
+// oracle_pgnodes_ev_action_test.go, which adds a RelationResolver shim over live
+// PG catalog metadata.
 
 import (
 	"fmt"

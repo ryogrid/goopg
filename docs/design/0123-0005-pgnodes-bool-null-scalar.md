@@ -846,8 +846,40 @@ coverage gaps automatically.
 Gating matches the other heterogeneous E2E tests: skipped under `-short`, when
 `GOOPG_SKIP_PGNODES_ORACLE` is set, and when the upstream PG binaries are absent
 (`pgcluster.Available`). Wall time ≈ 1.3 s (one initdb + 25 `CREATE TABLE`s).
-The view `ev_action` oracle (`ResolveViewQuery`/`pg_rewrite`) needs a
-`RelationResolver` shim over live-PG catalog metadata and is deferred below.
+
+## Byte-diff oracle gate (ev_action) — `internal/testport/oracle_pgnodes_ev_action_test.go`
+
+The query-tree analogue of the `adbin` oracle above, closing the same
+transcription-drift / coverage-drift gaps for the **view `ev_action`
+(`pg_rewrite`) path**. `TestOraclePgnodesEvActionBytesMatchPG` seeds one shared
+base relation `bench_log(client int, src text)` on a fresh PG18, then for each
+canonical view case
+
+1. `CREATE VIEW v AS <select>` on the live PG18,
+2. reads back `pg_rewrite.ev_action::text` (the single `_RETURN` rule),
+3. normalizes `:location <N>` → `:location -1` (here the belt actually matters —
+   a stored rule can carry real source offsets that goopg's `Out` always writes
+   as `-1`), and
+4. asserts `pgnodes.ResolveViewQuery(sel, resolver)` → `OutRuleAction` is
+   **byte-identical**. A goopg `ErrUnsupported` degradation on a case PG stores
+   canonically is itself a failure.
+
+The one piece the `adbin` path does not need is the **`RelationResolver` shim**:
+`ResolveViewQuery` must stamp each `Var`'s `varno`/`varattno`/`vartype`/
+`varcollid` and the RTE `relid` from the base relation, so the test implements
+`pgnodes.RelationResolver` (`liveRelationResolver`) by reading the SAME live
+cluster's `pg_class` (real `oid`/`relkind`) and `pg_attribute` (name, `attnum`,
+`atttypid`, `atttypmod`, `attcollation`) via `string_agg` + `QueryScalar`.
+Because the relid and column OIDs are read **live**, goopg's emitted bytes and
+PG's `ev_action` reference the identical relid — nothing bakes in a fixed 16384,
+so the diff is robust to catalog OID drift.
+
+The 13 cases mirror the `internal/pgnodes` view goldens (`resolver_query_test.go`
+`v`/`v2`, `view_bool_null_test.go` `v3`–`v13`) and exercise every canonical
+query-qual shape S4 emits: `OpExpr`, a computed `FuncExpr` target (`upper`),
+`BoolExpr` AND/OR/NOT, `NullTest`, `BooleanTest`, `CaseExpr` (searched + simple),
+and `DistinctExpr` (incl. its `NullTest` rewrite against a NULL operand). Same
+gating and ≈ 1.3 s wall time as the `adbin` oracle.
 
 ## Deferred
 
@@ -862,11 +894,10 @@ The view `ev_action` oracle (`ResolveViewQuery`/`pg_rewrite`) needs a
   `WHEN` value PG would cast) still degrades to SQL text: PG inserts a cast
   FuncExpr on the RHS (and, for some coercions, a RelabelType above the
   placeholder) that this subset does not yet model.
-- The byte-diff oracle now covers the **`adbin` (column DEFAULT) path** (see the
-  section above). The **view `ev_action` (`pg_rewrite`) oracle** is still
-  deferred: `ResolveViewQuery` needs a `RelationResolver` shim that answers
-  base-table column metadata from the live PG18 catalog before the same
-  create-on-PG / read-back / byte-diff loop can run over `ev_action::text`.
+- The byte-diff oracle now covers **both** the **`adbin` (column DEFAULT) path**
+  and the **view `ev_action` (`pg_rewrite`) path** (see the two oracle sections
+  above); the view oracle's `liveRelationResolver` answers base-table column
+  metadata from the live PG18 catalog.
 - Operator-driven implicit coercion in view quals (which would let a
   `timestamptz`/`int2`→`numeric` string literal resolve inside a view `WHERE`)
   is also still SQL-text — only the exact scalar-column DEFAULT context folds a

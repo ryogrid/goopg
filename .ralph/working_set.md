@@ -1,33 +1,33 @@
-Task: M0123-S4 — byte-diff oracle gate (adbin). COMPLETE this loop; committing + pushing.
+Task: M0123-S4 — byte-diff oracle gate (ev_action / view path). COMPLETE this
+loop; committing + pushing.
 
-Landed: new internal/testport/oracle_pgnodes_adbin_test.go
-(TestOraclePgnodesAdbinBytesMatchPG) — the S4 "byte-diff oracle" deliverable for
-the column-DEFAULT (adbin) path. For each of 25 canonical (col-type, DEFAULT-expr)
-cases it CREATE TABLEs the default on a LIVE PG18 (pgcluster.New+Start), reads
-back pg_attrdef.adbin::text, normalizes `:location N`→`-1`, and asserts
-pgnodes.ResolveForColumn→Out is byte-identical. SQL-text fallback on a
-PG-canonical case = hard failure. Cases span every S4 family (int/text/numeric
-Consts, int4→numeric cast, upper(), timestamptz lit, BoolExpr/NullTest/OpExpr,
-BooleanTest, DistinctExpr, CaseExpr searched+simple + int→numeric/int4→int8
-coercion), all drawn from existing pgnodes goldens → the value is a LIVE oracle
-(catches hand-capture drift + auto-covers future types).
+Landed: new internal/testport/oracle_pgnodes_ev_action_test.go
+(TestOraclePgnodesEvActionBytesMatchPG) — the query-tree analogue of the adbin
+oracle. Seeds one shared bench_log(client int, src text) on a LIVE PG18, then for
+each of 13 canonical view cases CREATE VIEWs the SELECT, reads back
+pg_rewrite.ev_action::text, normalizes `:location N`→-1, and asserts
+pgnodes.ResolveViewQuery→OutRuleAction is byte-identical (ErrUnsupported on a
+PG-canonical case = hard failure). The piece the adbin path lacked: a LIVE
+RelationResolver (liveRelationResolver) reading the base relation's real
+relid/relkind (pg_class) + full column list (attname/attnum/atttypid/atttypmod/
+attcollation via string_agg+QueryScalar, oids/relkind ::text-cast to dodge
+`text||"char"` ambiguity) from the SAME cluster → goopg Var/RTE OIDs match PG's
+ev_action, no baked 16384. Cases mirror pgnodes view goldens v/v2 + v3–v13.
 
-Key symbols: TestOraclePgnodesAdbinBytesMatchPG, normalizeOracleLocations,
-adbinOracleCase; drives pgnodes.ResolveForColumn/Out + parser.ParseExpr +
-pgcluster.New/Start/Exec/QueryScalar.
+Key symbols: TestOraclePgnodesEvActionBytesMatchPG, liveRelationResolver
+(pgnodes.RelationResolver impl), parseSelectForOracle, normalizeOracleLocations
+(shared w/ adbin oracle); drives pgnodes.ResolveViewQuery/OutRuleAction +
+parser.Parse + pgcluster.New/Start/Exec/QueryScalar.
 
-Gates (GREEN): all 25 subtests PASS vs live PG18.3 (1.3s); -short SKIP verified;
+Gates (GREEN): all 13 subtests PASS vs live PG18.3 (1.25s); -short SKIP verified;
 go build ./..., go vet ./internal/testport/, gofmt clean; ralph-state-guard
 (self-repaired to consistent). pgbench smoke runs in pre-commit hook on commit.
 
-Next step: pick next M0123-S4 REMAINING (fix_plan ~L1013). Recommend the VIEW
-ev_action (pg_rewrite) byte-diff oracle: parameterize the harness on a
-resolver-driver func, add a RelationResolver that runs
-`SELECT attname,atttypid,attnum FROM pg_attribute WHERE attrelid='<tbl>'::regclass
-AND attnum>0` on the pgcluster handle, then diff pgnodes.ResolveViewQuery→Out vs
-normalized pg_rewrite.ev_action. OR: float4-common CASE mix (int/numeric→float4
-arms + outer column cast).
+Next step: pick next M0123-S4 REMAINING (fix_plan ~L1013). Recommend float4-common
+(no float8) CASE mix (int/numeric→float4 cast arms + outer float8(float4) column
+cast in resolver_expr.go selectCaseCommonType/coerceCaseResult), OR operator-driven
+implicit coercion in view quals (resolver_query.go queryScope.resolveExpr).
 
-Gates run: oracle (25 green vs PG18), build/vet (green), gofmt (clean),
+Gates run: ev_action oracle (13 green vs PG18), build/vet (green), gofmt (clean),
 ralph-state-guard (consistent after repair), pgbench smoke (pre-commit).
 In-flight: none.

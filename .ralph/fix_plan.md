@@ -1220,8 +1220,24 @@ existing encoder, `constcollid=100` / `consttypmod=n+4`.
       hand-capture drift + auto-covers future types), not a fresh assertion.
       Gated: -short + GOOPG_SKIP_PGNODES_ORACLE + pgcluster.Available; ≈1.3s.
       All 25 GREEN vs PG18.3. Design 0123-0005 §"Byte-diff oracle gate (adbin)".
-      REMAINING: view ev_action (pg_rewrite) oracle (needs RelationResolver shim
-      over live PG catalog); float4-common (no float8) CASE mix (needs
-      int/numeric→float4 arms + outer column cast); date-time-family CASE
-      coercion; simple-form WHEN value needing implicit cast to operand type;
-      operator-driven view-qual coercion (unblocks int2/timestamptz literals).
+      BYTE-DIFF ORACLE (ev_action) LANDED (2026-07-19): new
+      internal/testport/oracle_pgnodes_ev_action_test.go
+      (TestOraclePgnodesEvActionBytesMatchPG) — the query-tree analogue. Seeds
+      one shared bench_log(client int, src text) on a live PG18, then for each of
+      13 canonical view cases CREATE VIEWs the SELECT, reads back
+      pg_rewrite.ev_action::text, normalizes :location→-1, and asserts
+      pgnodes.ResolveViewQuery→OutRuleAction is byte-identical (ErrUnsupported on
+      a PG-canonical case = failure). The piece the adbin path lacks: a LIVE
+      RelationResolver (liveRelationResolver) that reads the base relation's real
+      relid/relkind (pg_class) + full column list (pg_attribute attname/attnum/
+      atttypid/atttypmod/attcollation via string_agg+QueryScalar) from the SAME
+      cluster, so goopg's Var/RTE OIDs match PG's ev_action regardless of catalog
+      OID drift (no baked 16384). Cases mirror pgnodes view goldens (v/v2 +
+      v3–v13): OpExpr, computed FuncExpr target, BoolExpr AND/OR/NOT, NullTest,
+      BooleanTest, CaseExpr searched+simple, DistinctExpr (+NULL-operand rewrite).
+      All 13 GREEN vs PG18.3 (1.25s); -short SKIP verified; build/vet/gofmt clean.
+      Design 0123-0005 §"Byte-diff oracle gate (ev_action)".
+      REMAINING: float4-common (no float8) CASE mix (needs int/numeric→float4 arms
+      + outer column cast); date-time-family CASE coercion; simple-form WHEN value
+      needing implicit cast to operand type; operator-driven view-qual coercion
+      (unblocks int2/timestamptz literals).
