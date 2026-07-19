@@ -101,12 +101,16 @@ class TestCLIModes(unittest.TestCase):
         proc = self._cli("--check", fixture)
         self.assertEqual(proc.returncode, 0)
 
-    def test_check_on_inline_pipes_table_exits_zero(self):
-        """Table with backtick-protected pipes should be valid."""
+    def test_check_on_inline_pipes_table_flags_unescaped_pipes(self):
+        """Pipes inside backticks are NOT protected in GFM tables.
+
+        GitHub splits a cell on such pipes, so they must be escaped; the
+        checker must report them (exit 1) rather than call the table valid.
+        """
         fixture = os.path.join(FIXTURES_DIR, "table_with_inline_pipes.md")
         proc = self._cli("--check", fixture)
         self.assertEqual(
-            proc.returncode, 0,
+            proc.returncode, 1,
             f"stderr: {proc.stderr}",
         )
 

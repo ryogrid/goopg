@@ -108,3 +108,13 @@ func LookupProcForNode(name string, argOIDs []uint32) (uint32, bool) {
 	funcid, ok := nodeProcIndex[procNodeKey(name, argOIDs)]
 	return funcid, ok
 }
+
+// ProcResultType returns the prorettype (result type OID) of a built-in pg_proc
+// entry by its funcid, mirroring pg_proc.prorettype. The canonical
+// pg_node_tree resolver needs it to fill a FuncExpr's funcresulttype after
+// LookupProcForNode has resolved the funcid. Returns false for an OID absent
+// from the PG18 seed.
+func ProcResultType(funcid uint32) (uint32, bool) {
+	ret, ok := pgProcRetTypeByOID[funcid]
+	return ret, ok
+}

@@ -102,6 +102,36 @@ class TestTokenizeRow(unittest.TestCase):
         self.assertTrue(cells[1].is_code)
         self.assertFalse(cells[2].is_code)
 
+    def test_bare_prose_pipe_not_a_separator(self):
+        """A ``|`` wedged between content chars is prose, not a separator."""
+        cells = tokenize_row("| a | REVOKE {ADMIN|INHERIT|SET} FOR | c |")
+        self.assertEqual(len(cells), 3)
+        self.assertEqual(cells[1].content, "REVOKE {ADMIN|INHERIT|SET} FOR")
+
+    def test_c_style_double_pipe_in_prose_not_separators(self):
+        """A ``||`` flanked by content (C-style OR) is prose, not empty cells."""
+        cells = tokenize_row("| a | (!IsMatView||IsPopulated) | c |")
+        self.assertEqual(len(cells), 3)
+        self.assertEqual(cells[1].content, "(!IsMatView||IsPopulated)")
+
+    def test_empty_cell_still_splits_when_space_flanked(self):
+        """A space-flanked ``||`` is still a genuine empty cell."""
+        cells = tokenize_row("| a || c |")
+        self.assertEqual(len(cells), 3)
+        self.assertEqual(cells[1].content, "")
+
+    def test_prose_pipe_mixed_with_real_separators(self):
+        """Prose pipes must not inflate the column count of a real row."""
+        line = (
+            "| - | 2026-07-18 | task-id "
+            "| REVOKE {ADMIN|INHERIT|SET} and (!A||B) checks "
+            "| col5 | col6 | col7 |"
+        )
+        cells = tokenize_row(line)
+        self.assertEqual(len(cells), 7)
+        self.assertEqual(cells[4].content, "col5")
+        self.assertEqual(cells[6].content, "col7")
+
 
 class TestEscapeEmbeddedPipes(unittest.TestCase):
     """Tests for escape_embedded_pipes()."""
@@ -114,9 +144,11 @@ class TestEscapeEmbeddedPipes(unittest.TestCase):
         result = escape_embedded_pipes("a | b | c")
         self.assertEqual(result, r"a \| b \| c")
 
-    def test_pipes_inside_backticks_preserved(self):
+    def test_pipes_inside_backticks_also_escaped(self):
+        # GFM tables split on pipes BEFORE inline parsing, so backticks do
+        # NOT protect a pipe — it must be escaped as \| even inside code.
         result = escape_embedded_pipes("a `x|y` b | c")
-        self.assertEqual(result, r"a `x|y` b \| c")
+        self.assertEqual(result, r"a `x\|y` b \| c")
 
     def test_already_escaped_pipes_preserved(self):
         result = escape_embedded_pipes(r"a \| b")
@@ -124,7 +156,17 @@ class TestEscapeEmbeddedPipes(unittest.TestCase):
 
     def test_mixed_escaped_and_bare(self):
         result = escape_embedded_pipes(r"a \| b | c `d|e` | f")
-        self.assertEqual(result, r"a \| b \| c `d|e` \| f")
+        self.assertEqual(result, r"a \| b \| c `d\|e` \| f")
+
+    def test_double_pipe_in_backticks_escaped(self):
+        # A C-style ``||`` inside code (the real-world deferral-ledger case).
+        result = escape_embedded_pipes("`if a || b`")
+        self.assertEqual(result, r"`if a \|\| b`")
+
+    def test_escaping_is_idempotent(self):
+        once = escape_embedded_pipes("a | `b|c` | d")
+        twice = escape_embedded_pipes(once)
+        self.assertEqual(once, twice)
 
 
 if __name__ == "__main__":

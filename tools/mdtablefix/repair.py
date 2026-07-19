@@ -34,7 +34,35 @@ def repair_table(table: Table) -> Table:
         else:
             _repair_undersplit_row(row, expected_cols, table)
 
+    # Normalize: escape any bare ``|`` still embedded in cell content.
+    # These come from prose pipes the tokenizer intentionally kept inside a
+    # cell (e.g. ``{ADMIN|INHERIT|SET}``); left un-escaped they would render
+    # as spurious column separators on GitHub.  Escaping is idempotent —
+    # backtick spans and existing ``\|`` are preserved — so already-correct
+    # cells are untouched.
+    for row in table.data_rows:
+        _escape_bare_pipes_in_row(row, table)
+
     return table
+
+
+def _escape_bare_pipes_in_row(row: Row, table: Table) -> None:
+    """Escape bare ``|`` in each cell of *row*, recording any change."""
+    for col_idx, cell in enumerate(row.cells):
+        escaped = escape_embedded_pipes(cell.content)
+        if escaped != cell.content:
+            cell.content = escaped
+            table.fixes.append(
+                Fix(
+                    type="escaped_pipe",
+                    line=row.line_number,
+                    column=col_idx + 1,
+                    detail=(
+                        f"Escaped bare pipe(s) in column {col_idx + 1} "
+                        "so they render as literal text, not separators"
+                    ),
+                )
+            )
 
 
 def _repair_oversplit_row(row: Row, expected: int, table: Table) -> None:

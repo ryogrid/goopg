@@ -86,9 +86,88 @@ func resolve(e parser.Expr, expected uint32) (Node, uint32, error) {
 	case *parser.BinaryOp:
 		return resolveBinaryOp(v)
 
+	case *parser.FuncCall:
+		return resolveFuncCall(v)
+
 	default:
 		return nil, 0, ErrUnsupported
 	}
+}
+
+// resolveFuncCall resolves a plain built-in function call to a FuncExpr. Only
+// the ordinary-call shape is supported: no aggregate/window decoration (OVER,
+// FILTER, ORDER BY, WITHIN GROUP, DISTINCT), no star argument, and no VARIADIC
+// spread. Each argument is forward-resolved with an unknown context, the funcid
+// is looked up by (name + actual argument type OIDs) via S0's
+// catalog.LookupProcForNode, and the result type comes from pg_proc.prorettype
+// (catalog.ProcResultType). Anything outside this subset — including an
+// argument the literal-typing rules cannot coerce to a seeded overload — yields
+// ErrUnsupported so the writer degrades to SQL text (all-or-nothing).
+//
+// Provenance: PG builds this FuncExpr in make_fn_expr / ParseFuncOrColumn; a
+// bare call carries funcformat = COERCE_EXPLICIT_CALL (0), funcretset/
+// funcvariadic false for the scalar subset, and collations propagated from the
+// (only text here) collatable operands — DEFAULT_COLLATION_OID (100).
+func resolveFuncCall(f *parser.FuncCall) (Node, uint32, error) {
+	// Reject any non-plain-call decoration; these never appear in a stored
+	// column DEFAULT / statistics expression but guard against silently
+	// emitting a FuncExpr that drops the decoration's semantics.
+	if f.Star || f.Distinct || f.Over != nil || f.Filter != nil ||
+		len(f.OrderBy) != 0 || len(f.WithinGroup) != 0 {
+		return nil, 0, ErrUnsupported
+	}
+	for _, isVariadic := range f.Variadic {
+		if isVariadic {
+			return nil, 0, ErrUnsupported
+		}
+	}
+	// Only unqualified or pg_catalog-qualified built-ins are forward-resolvable.
+	if f.Name.Schema != "" && f.Name.Schema != "pg_catalog" {
+		return nil, 0, ErrUnsupported
+	}
+
+	argNodes := make([]Node, 0, len(f.Args))
+	argOIDs := make([]uint32, 0, len(f.Args))
+	for _, a := range f.Args {
+		n, t, err := resolve(a, 0)
+		if err != nil {
+			return nil, 0, err
+		}
+		argNodes = append(argNodes, n)
+		argOIDs = append(argOIDs, t)
+	}
+
+	funcid, ok := catalog.LookupProcForNode(f.Name.Name, argOIDs)
+	if !ok {
+		return nil, 0, ErrUnsupported
+	}
+	resultType, ok := catalog.ProcResultType(funcid)
+	if !ok || resultType == 0 {
+		return nil, 0, ErrUnsupported
+	}
+
+	inputcollid := uint32(0)
+	for _, t := range argOIDs {
+		if isCollatable(t) {
+			inputcollid = DefaultCollationOid
+			break
+		}
+	}
+	funccollid := uint32(0)
+	if isCollatable(resultType) {
+		funccollid = DefaultCollationOid
+	}
+	return &FuncExpr{
+		Funcid:         funcid,
+		Funcresulttype: resultType,
+		Funcretset:     false,
+		Funcvariadic:   false,
+		Funcformat:     0, // COERCE_EXPLICIT_CALL
+		Funccollid:     funccollid,
+		Inputcollid:    inputcollid,
+		Args:           argNodes,
+		Location:       -1,
+	}, resultType, nil
 }
 
 // resolveIntLiteral types a (possibly already-negated) integer value the way PG

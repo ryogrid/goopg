@@ -1,9 +1,18 @@
-"""Backtick-aware cell splitter for markdown table rows.
+"""Cell splitter and pipe-escaper for markdown table rows.
 
-The central insight: pipe characters (``|``) inside inline code spans
-(backtick-delimited) are NOT column separators.  This module locates
-backtick spans, masks their content, then splits the row on the
-remaining (real) pipe characters.
+Two distinct concerns live here:
+
+* **Splitting** (``tokenize_row``) recovers a row's *intended* columns.
+  An author's real separators are the top-level, whitespace-padded ``|``
+  markers outside any backtick span, so — purely as a structural heuristic —
+  we mask backtick spans and tightly-wedged "prose" pipes, then split on the
+  remaining pipes.
+
+* **Escaping** (``escape_embedded_pipes``) makes a cell render correctly on
+  GitHub.  Here the backtick masking does NOT apply: a GFM table row is
+  split into cells *before* inline parsing, so the only literal pipe is a
+  backslash-escaped ``\\|`` — a pipe inside `` `code` `` is still a column
+  separator on GitHub.  Every bare pipe is therefore escaped, code or not.
 """
 
 from __future__ import annotations
@@ -57,6 +66,49 @@ def _find_escaped_pipe_positions(line: str) -> set[int]:
     return {m.start() for m in re.finditer(r"\\\|", line)}
 
 
+# Whitespace characters that, when they flank a run of pipes, mark it as a
+# *column separator* run rather than a prose pipe.
+_SEPARATOR_FLANK = frozenset(" \t")
+
+
+def _is_prose_pipe(line: str, idx: int) -> bool:
+    """Return True if the ``|`` at *idx* is a literal pipe, not a separator.
+
+    Well-formed table cells are space-padded, so real column separators
+    look like `` | `` (whitespace on at least one side) and the outer
+    markers touch the string boundary.  Empty cells appear as a run of
+    pipes flanked by whitespace, e.g. `` || `` or `` ||| ``.
+
+    A run of pipes wedged tightly between two content characters — the
+    single ``|`` in ``ADMIN|INHERIT`` or ``{a|b}``, or the ``||`` in a
+    C-style expression like ``(!IsMatView||IsPopulated)`` — is prose that
+    an author wrote without escaping, not a column boundary.  Splitting on
+    such pipes oversplits the row and corrupts its real column structure,
+    so we keep them inside the cell (they are escaped to ``\\|`` on output).
+
+    The decision is made per *run*: we look past any adjacent pipes to the
+    first non-pipe character on each side.  A run touching whitespace or a
+    string boundary on either side is a separator; a run flanked by content
+    characters on both sides is prose.
+    """
+    n = len(line)
+
+    # Expand to the full contiguous run of pipes containing *idx*.
+    run_start = idx
+    while run_start > 0 and line[run_start - 1] == "|":
+        run_start -= 1
+    run_end = idx
+    while run_end + 1 < n and line[run_end + 1] == "|":
+        run_end += 1
+
+    left = line[run_start - 1] if run_start > 0 else ""
+    right = line[run_end + 1] if run_end + 1 < n else ""
+    if left == "" or right == "":
+        # The run touches a string boundary — an outer table marker.
+        return False
+    return left not in _SEPARATOR_FLANK and right not in _SEPARATOR_FLANK
+
+
 def tokenize_row(line: str) -> list[Cell]:
     """Split a table row into cells, respecting backtick code spans.
 
@@ -88,9 +140,14 @@ def tokenize_row(line: str) -> list[Cell]:
         if pos + 1 < len(masked):
             masked[pos + 1] = "\x00"
 
-    # ---- split on real (unmasked) pipes -------------------------------
+    # ---- split on real (unmasked, non-prose) pipes --------------------
+    # A pipe that is tightly wedged between two content characters (e.g.
+    # ``ADMIN|INHERIT``) is a literal pipe an author forgot to escape, not
+    # a column separator.  Treating it as a separator oversplits the row.
     real_pipe_positions = [
-        idx for idx, ch in enumerate(masked) if ch == "|"
+        idx
+        for idx, ch in enumerate(masked)
+        if ch == "|" and not _is_prose_pipe(line, idx)
     ]
 
     cells_raw: list[str] = []
@@ -117,37 +174,24 @@ def tokenize_row(line: str) -> list[Cell]:
     return result
 
 
+# Matches a bare ``|`` — one NOT already backslash-escaped as ``\|``.
+_BARE_PIPE = re.compile(r"(?<!\\)\|")
+
+
 def escape_embedded_pipes(cell_text: str) -> str:
-    """Escape literal ``|`` as ``\\|``, but NOT inside backtick spans.
+    """Escape every literal ``|`` in a cell as ``\\|``.
 
-    Already-escaped ``\\|`` sequences are preserved (not double-escaped).
-    Backtick-delimited code is passed through unchanged; only bare pipes
-    in the surrounding markdown text are escaped.
+    In a GitHub-Flavored-Markdown *table*, a cell is split on pipes
+    **before** its inline content is parsed, so ONLY a backslash-escaped
+    ``\\|`` counts as a literal pipe.  Crucially, backtick code spans do
+    **not** protect pipes here: ``| `a|b` |`` renders as two columns on
+    GitHub, not one cell containing ``a|b``.  A literal pipe inside code
+    must therefore also be written ``\\|`` — GitHub strips the backslash
+    when extracting the cell, so `` `if v \\| w` `` renders as
+    ``<code>if v | w</code>`` in a single cell.
+
+    We escape every bare pipe wherever it appears (prose or code alike).
+    Already-escaped ``\\|`` sequences are preserved (not double-escaped),
+    which makes the operation idempotent.
     """
-    backtick_spans = _find_backtick_spans(cell_text)
-
-    def _escape_outside_backticks(text: str) -> str:
-        """Escape bare ``|`` → ``\\|``, preserving existing ``\\|``."""
-        # Protect already-escaped pipes, then escape bare pipes, then restore.
-        text = text.replace("\\|", "\x01")
-        text = text.replace("|", "\\|")
-        text = text.replace("\x01", "\\|")
-        return text
-
-    if not backtick_spans:
-        return _escape_outside_backticks(cell_text)
-
-    # Build result piecewise, escaping only outside backtick spans.
-    result_parts: list[str] = []
-    prev_end = 0
-    for start, end in backtick_spans:
-        # Escape pipes in the text BEFORE this backtick span.
-        before = cell_text[prev_end:start]
-        result_parts.append(_escape_outside_backticks(before))
-        # Pass the backtick span through unchanged.
-        result_parts.append(cell_text[start:end])
-        prev_end = end
-    # Escape pipes in the trailing text after the last backtick span.
-    result_parts.append(_escape_outside_backticks(cell_text[prev_end:]))
-
-    return "".join(result_parts)
+    return _BARE_PIPE.sub(r"\\|", cell_text)

@@ -414,6 +414,18 @@ func emitNamesOnly(entries []procEntry) {
 		}
 		fmt.Printf("\t%d: %s,\n", e.OID, goStringSlice(e.ArgTypeNames))
 	}
+	fmt.Printf("}\n\n")
+
+	fmt.Printf("// pgProcRetTypeByOID is a generated OID -> prorettype (result type OID)\n")
+	fmt.Printf("// index of every PG18 pg_proc.dat entry (%d entries), backing\n", len(entries))
+	fmt.Printf("// ProcResultType. The canonical pg_node_tree resolver (02e item C) needs\n")
+	fmt.Printf("// a function's funcresulttype to emit a FuncExpr, which the reverse\n")
+	fmt.Printf("// name/arg-type indexes above do not carry. Same leaf-package-copy\n")
+	fmt.Printf("// rationale as pgProcNamesByOID above.\n")
+	fmt.Printf("var pgProcRetTypeByOID = map[uint32]uint32{\n")
+	for _, e := range entries {
+		fmt.Printf("\t%d: %d,\n", e.OID, e.RetType)
+	}
 	fmt.Printf("}\n")
 }
 

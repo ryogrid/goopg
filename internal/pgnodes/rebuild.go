@@ -29,9 +29,33 @@ func Rebuild(n Node) (parser.Expr, error) {
 		return rebuildConst(v)
 	case *OpExpr:
 		return rebuildOpExpr(v)
+	case *FuncExpr:
+		return rebuildFuncExpr(v)
 	default:
 		return nil, fmt.Errorf("pgnodes: Rebuild: unsupported node %T", n)
 	}
+}
+
+// rebuildFuncExpr reconstructs a plain function call. The funcid is reverse-
+// mapped to its proname (catalog.RegprocName, the same PG18 seed the forward
+// resolver used) and each argument is rebuilt recursively. The call is emitted
+// unqualified (proname only): goopg resolves built-ins by bare name, and the
+// forward resolver accepts an empty schema, so resolve→Rebuild→re-resolve is a
+// fixed point.
+func rebuildFuncExpr(f *FuncExpr) (parser.Expr, error) {
+	name, ok := catalog.RegprocName(f.Funcid)
+	if !ok {
+		return nil, fmt.Errorf("pgnodes: Rebuild: unknown function OID %d", f.Funcid)
+	}
+	args := make([]parser.Expr, 0, len(f.Args))
+	for _, a := range f.Args {
+		arg, err := Rebuild(a)
+		if err != nil {
+			return nil, err
+		}
+		args = append(args, arg)
+	}
+	return &parser.FuncCall{Name: parser.ObjectName{Name: name}, Args: args}, nil
 }
 
 // rebuildConst reconstructs a literal. int4/int8 datums decode from the 8-byte

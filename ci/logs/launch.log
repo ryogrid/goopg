@@ -52,3 +52,4 @@
 2026-07-19T09:42:27+09:00 [RUN]	S1 lanes start (L: units,race | H: testport,pgbench — filtered by NIGHTLY_STAGES)
 2026-07-19T10:20:12+09:00 [RUN]	S1 barrier reached
 2026-07-19T10:53:21+09:00 [RUN]	end status_rc=2 (0 pass / 2 fail / 3 inconclusive) — see summary.md
+2026-07-19T10:55:45+09:00 [RUN]	log-push: committed + pushed batch logs to origin/wal-pg-nodetree
