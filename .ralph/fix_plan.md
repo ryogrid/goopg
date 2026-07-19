@@ -5697,11 +5697,21 @@ existing encoder, `constcollid=100` / `consttypmod=n+4`.
       view w/ computed `upper()` + no qual) + structural spot-check
       (`selectedCols==[8 9]`, qual `OpExpr.opno==521`) + `hasAggs true` rejection.
       `go test ./internal/pgnodes/` + `go vet` green. Design
-      `0123-0004-pgnodes-query-serializer.md`. REMAINING (sub-slice 2):
-      `resolver_query.go` (goopg `*parser.SelectStmt` + catalog → IR
-      `Query` for single-base-relation views) + the `Query`/`RangeTblEntry`/
-      `RTEPermissionInfo`/`FromExpr`/`RangeTblRef`/`TargetEntry`/`Var` tags in
-      out/read/rebuild + view shape-check. Wire `writeViewRewriteRow` to canonical
+      `0123-0004-pgnodes-query-serializer.md`.
+      SUB-SLICE 2 part (a) — the resolver — **LANDED (2026-07-19)**:
+      `resolver_query.go` (`ResolveViewQuery`: goopg `*parser.SelectStmt` +
+      `RelationResolver` → IR `Query` for single-base-relation SELECT views;
+      computes `Var` varno/varattno, the `selectedCols` `+7` bias
+      (`-FirstLowInvalidHeapAttributeNumber`), `resorigtbl/resorigcol`, `resname`,
+      the fixed `RTE_RELATION`/`AccessShareLock`/`ACL_SELECT`/`perminfoindex=1`
+      skeleton; the `OpExpr`/`FuncExpr` builders `buildOpExpr`/`buildFuncExpr`/
+      `funcCallGuard` were extracted from S2's `resolver_expr.go` so scalar +
+      query-scoped resolvers build byte-identical nodes; pure leaf, NO wiring).
+      Gate `resolver_query_test.go`: resolve→`OutRuleAction` == both live PG18.3
+      goldens byte-for-byte + resolve→`Out`→`Read`→re-`Out` round-trip +
+      structural spot-check + 10-case `ErrUnsupported` matrix; `go test
+      ./internal/pgnodes/` + `go vet` green. REMAINING (sub-slice 2 b/c):
+      `rebuild.go` (IR `Query` → goopg view AST for reload). Wire `writeViewRewriteRow` to canonical
       `ev_action` + set the per-table `catalog.Table.RuleIsCanonical` flag; flip
       `pg18_user_catalog_rows.go:511` `relhasrules` to read it (leave the
       `catalog.go` system/information_schema virtual builders false). Swap

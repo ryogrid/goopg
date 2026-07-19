@@ -1,4 +1,4 @@
-# 0123-0004 — `internal/pgnodes` query-tree serializer (M0123-S3, sub-slice 1)
+# 0123-0004 — `internal/pgnodes` query-tree serializer + resolver (M0123-S3, sub-slices 1–2a)
 
 Status: accepted
 Milestone: M0123 (canonical `pg_node_tree` serialization), slice S3
@@ -88,11 +88,45 @@ qual `OpExpr.opno == 521`) so a byte-identical but semantically wrong decode
 can't slip through, plus a negative test that a `hasAggs true` query is rejected
 by the shape gate. `go test ./internal/pgnodes/` green; `go vet` clean.
 
+## Sub-slice 2a — the resolver (`resolver_query.go`)
+
+`ResolveViewQuery(*parser.SelectStmt, RelationResolver) (*Query, error)` is the
+forward direction (the query-tree analogue of S2's `ResolveExpr`), a pure
+`internal/pgnodes` addition with **no engine wiring yet**. It converts a goopg
+view definition into the IR `Query` whose `OutRuleAction` bytes are identical to
+what PG stores in `pg_rewrite.ev_action` for the same DDL.
+
+- **Scope** = exactly the shape the codec round-trips: `SELECT <targets> FROM
+  <one table> [WHERE <qual>]`, target list of column refs / scalar exprs, no
+  alias, no `*`. Everything else → `ErrUnsupported` (writer stores SQL text,
+  keeps `relhasrules=false`; all-or-nothing per 02e §3).
+- **`RelationResolver`** is a small interface (`LookupRelation(schema, name) →
+  *RelationInfo`) the wiring layer (sub-slice 2c) implements against the live
+  catalog; the leaf package stays dependency-free of the executor. `RelationInfo`
+  carries the base relation's OID/relkind and its full column list
+  (name/attno/type/typmod/collation).
+- **What it computes** (matching PG parse-analysis):
+  `Var.varno`=1 / `varattno`=attno / syn fields; the `selectedCols` Bitmapset
+  (each referenced attno biased by `+selectedColsBias`, where
+  `selectedColsBias = -FirstLowInvalidHeapAttributeNumber = 7`,
+  `postgres/src/include/access/sysattr.h`); `TargetEntry.resorigtbl/resorigcol`
+  (relid+attno for a plain `Var`, 0 for a computed expr); `resname` (AS alias,
+  else column name, else function name); the fixed `RTE_RELATION` /
+  `AccessShareLock` (`rellockmode`=1) / `ACL_SELECT` (`requiredPerms`=2) /
+  `perminfoindex`=1 skeleton; `inh`=true.
+- **Sharing with S2**: the operator/function builders (`buildOpExpr`,
+  `buildFuncExpr`, `funcCallGuard`) were extracted from `resolver_expr.go` so the
+  scalar and query-scoped resolvers construct byte-identical `OpExpr`/`FuncExpr`;
+  the only new leaf is the column reference → `Var`.
+- **Gate** (`resolver_query_test.go`): resolving each of the two golden views'
+  goopg SELECT AST → `OutRuleAction` == the live PG18.3 `ev_action` golden
+  byte-for-byte; a resolve→`Out`→`Read`→re-`Out` round-trip; a structural
+  spot-check (`selectedCols`, `resorigtbl/resorigcol`); and a 10-case
+  `ErrUnsupported` matrix (GROUP BY / ORDER BY / LIMIT / DISTINCT / aliased FROM /
+  `*` / two relations / unknown column / unknown relation / set op).
+
 ## Deferred to sub-slice 2 (M0123-S3 wiring)
 
-- `resolver_query.go`: `*parser.SelectStmt` + catalog → IR `Query` (this is
-  where `Var.varno`/`varattno`, the `selectedCols` offset encoding, `resorigtbl`,
-  and `perminfoindex` are computed).
 - `rebuild.go`: IR `Query` → goopg view AST for the reload path.
 - Wire `writeViewRewriteRow` to store canonical `ev_action`; set
   `catalog.Table.RuleIsCanonical`; flip `pg18_user_catalog_rows.go` `relhasrules`

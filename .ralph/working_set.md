@@ -1,38 +1,38 @@
-Task: M0123-S3 sub-slice 1 — pure `internal/pgnodes` query-tree CODEC (no wiring).
-COMPLETE + committed this loop.
+Task: M0123-S3 sub-slice 2 part (a) — pgnodes view-query resolver.
+COMPLETE + committed this loop (pure internal/pgnodes, no engine wiring).
 
-Landed: IR nodes Query/RangeTblEntry/RTEPermissionInfo/FromExpr/RangeTblRef/
-TargetEntry/Var/Alias (ir_query.go) + 2 new wire primitives — Bitmapset
-`(b ...)` and String value node `"col"` (quoted, via outNode T_String path) vs
-bare WRITE_STRING_FIELD via a faithful outToken port. outfuncs_query.go emits the
-full ~45-field Query skeleton (fixed fields = view defaults) in outfuncs.c order +
-OutRuleAction outer `(...)` ev_action wrapper. readfuncs_query.go = inverse AND
-shape gate (readQuery validates every fixed field; readRangeTblEntry rejects
-non-RTE_RELATION/tablesample/securityQuals → clean error = "keep SQL text").
+Landed: `ResolveViewQuery(*parser.SelectStmt, RelationResolver) (*Query, error)`
+(resolver_query.go) — goopg single-base-relation SELECT view → IR Query whose
+OutRuleAction bytes == PG18 pg_rewrite.ev_action for the same DDL. Computes Var
+varno/varattno/syn, selectedCols +7 bias (-FirstLowInvalidHeapAttributeNumber),
+resorigtbl/resorigcol, resname, fixed RTE_RELATION/AccessShareLock/ACL_SELECT/
+perminfoindex=1 skeleton. RelationResolver leaf interface keeps executor import
+out. Extracted buildOpExpr/buildFuncExpr/funcCallGuard from resolver_expr.go so
+scalar+query resolvers build byte-identical nodes (S2 goldens still green).
+Gotcha found: plain single-table SELECT fills BOTH sel.From (len 1) AND
+sel.FromExprs (one FromExpr, empty Joins) → reject joins on len(Joins)!=0.
 
-Files: internal/pgnodes/ir_query.go (new), outfuncs_query.go (new),
-readfuncs_query.go (new), query_roundtrip_test.go (new), outfuncs.go (+8 dispatch
-cases), readfuncs.go (+8 dispatch cases), docs/design/0123-0004-*.md (new) +
-README index, .ralph/fix_plan.md (S3 sub-slice-1 note) + deferral_ledger.md.
+Files: internal/pgnodes/resolver_query.go (new), resolver_query_test.go (new),
+resolver_expr.go (extracted shared builders), docs/design/0123-0004-*.md
+(retitled sub-slices 1–2a + resolver section) + README index, .ralph/fix_plan.md
+(S3 sub-slice 2a note) + deferral_ledger.md (new row).
 
-Key symbols: pgnodes.OutRuleAction / ReadRuleAction (ev_action list wrapper),
-Query/RangeTblEntry/RTEPermissionInfo/FromExpr/RangeTblRef/TargetEntry/Var/Alias,
-Bitmapset, outToken/unToken, wBitmapset/readBitmapsetField, wStringList.
+Key symbols: pgnodes.ResolveViewQuery, RelationResolver, RelationInfo,
+ColumnInfo, queryScope (resolveExpr/resolveColumnRef/resolveTarget/selectedCols),
+buildOpExpr, buildFuncExpr, funcCallGuard, selectedColsBias.
 
-Gates run: go build ./... clean; go vet ./internal/pgnodes/ clean; gofmt -l = only
-pre-existing resolver_expr_test.go (version mismatch, not mine); go test
-./internal/pgnodes/ GREEN incl. TestRuleActionRoundTrip (2 live PG18.3 goldens,
-byte-for-byte) + TestRuleActionStructure + TestRuleActionShapeGate; pgbench smoke
-via pre-commit hook.
+Gates run: go build ./... clean; go vet ./internal/pgnodes/ clean; gofmt -l =
+only pre-existing resolver_expr_test.go (version mismatch, not mine); go test
+./internal/pgnodes/ GREEN incl. TestResolveViewQuery (2 live PG18.3 goldens,
+byte-for-byte) + RoundTrip + Structure + Unsupported(10). pgbench smoke via
+pre-commit hook.
 
-Next step (next loop): M0123-S3 sub-slice 2 — the WIRING. (a) resolver_query.go
-(*parser.SelectStmt + catalog → IR Query; compute varno/varattno, selectedCols
-offset attno-FirstLowInvalidHeapAttributeNumber=-7, resorigtbl, perminfoindex);
-(b) rebuild.go Query→goopg view AST; (c) wire writeViewRewriteRow→OutRuleAction,
-set catalog.Table.RuleIsCanonical, flip pg18_user_catalog_rows.go:511 relhasrules,
-swap loadViewsFromHeap, update relhasrules=false test lock-ins
-(pg_stat_wal_receiver_nailed_test.go:111-114, e2e_failover_goopg_to_pg_test.go:278);
-(d) gate: standby-query E2E (goopg CREATE VIEW + PG18 standby SELECT * FROM v ==
-goopg's own rows). See deferral_ledger 2026-07-19 M0123-S3 sub-slice 1 row.
+Next step (next loop): M0123-S3 sub-slice 2 part (b) — rebuild.go: add Query/
+RangeTblEntry/RTEPermissionInfo/FromExpr/RangeTblRef/TargetEntry/Var arms
+rebuilding a goopg view AST for the reload path (inverse of ResolveViewQuery,
+mirrors how S2's rebuild.go inverts ResolveExpr). Then part (c) the engine
+wiring (writeViewRewriteRow→OutRuleAction, RuleIsCanonical, relhasrules flip,
+loadViewsFromHeap swap, test lock-ins) + standby-query E2E. See deferral_ledger
+2026-07-19 M0123-S3 sub-slice 2 part (a) row.
 
 In-flight: none.

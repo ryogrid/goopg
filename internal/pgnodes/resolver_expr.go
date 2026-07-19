@@ -132,23 +132,9 @@ func resolve(e parser.Expr, expected uint32) (Node, uint32, error) {
 // funcvariadic false for the scalar subset, and collations propagated from the
 // (only text here) collatable operands — DEFAULT_COLLATION_OID (100).
 func resolveFuncCall(f *parser.FuncCall) (Node, uint32, error) {
-	// Reject any non-plain-call decoration; these never appear in a stored
-	// column DEFAULT / statistics expression but guard against silently
-	// emitting a FuncExpr that drops the decoration's semantics.
-	if f.Star || f.Distinct || f.Over != nil || f.Filter != nil ||
-		len(f.OrderBy) != 0 || len(f.WithinGroup) != 0 {
-		return nil, 0, ErrUnsupported
+	if err := funcCallGuard(f); err != nil {
+		return nil, 0, err
 	}
-	for _, isVariadic := range f.Variadic {
-		if isVariadic {
-			return nil, 0, ErrUnsupported
-		}
-	}
-	// Only unqualified or pg_catalog-qualified built-ins are forward-resolvable.
-	if f.Name.Schema != "" && f.Name.Schema != "pg_catalog" {
-		return nil, 0, ErrUnsupported
-	}
-
 	argNodes := make([]Node, 0, len(f.Args))
 	argOIDs := make([]uint32, 0, len(f.Args))
 	for _, a := range f.Args {
@@ -159,8 +145,40 @@ func resolveFuncCall(f *parser.FuncCall) (Node, uint32, error) {
 		argNodes = append(argNodes, n)
 		argOIDs = append(argOIDs, t)
 	}
+	return buildFuncExpr(f.Name.Name, argNodes, argOIDs)
+}
 
-	funcid, ok := catalog.LookupProcForNode(f.Name.Name, argOIDs)
+// funcCallGuard rejects any non-plain-call decoration on a function call. These
+// never appear in a stored column DEFAULT / statistics expression / view target
+// but guarding prevents silently emitting a FuncExpr that drops the
+// decoration's semantics (aggregate/window/VARIADIC spread), and rejects a
+// non-built-in schema qualifier (only unqualified or pg_catalog-qualified
+// built-ins forward-resolve via S0's proc index). Shared by the scalar
+// (resolver_expr.go) and query-scoped (resolver_query.go) resolvers.
+func funcCallGuard(f *parser.FuncCall) error {
+	if f.Star || f.Distinct || f.Over != nil || f.Filter != nil ||
+		len(f.OrderBy) != 0 || len(f.WithinGroup) != 0 {
+		return ErrUnsupported
+	}
+	for _, isVariadic := range f.Variadic {
+		if isVariadic {
+			return ErrUnsupported
+		}
+	}
+	if f.Name.Schema != "" && f.Name.Schema != "pg_catalog" {
+		return ErrUnsupported
+	}
+	return nil
+}
+
+// buildFuncExpr forward-resolves a built-in function by (name + already-resolved
+// argument type OIDs) via S0's catalog.LookupProcForNode, takes its result type
+// from the generated pg_proc return-type map (catalog.ProcResultType), and
+// constructs the canonical FuncExpr with PG's collation propagation
+// (DEFAULT_COLLATION_OID when a collatable operand/result is involved, else 0).
+// Shared by both resolvers so each builds a byte-identical FuncExpr.
+func buildFuncExpr(name string, argNodes []Node, argOIDs []uint32) (Node, uint32, error) {
+	funcid, ok := catalog.LookupProcForNode(name, argOIDs)
 	if !ok {
 		return nil, 0, ErrUnsupported
 	}
@@ -168,7 +186,6 @@ func resolveFuncCall(f *parser.FuncCall) (Node, uint32, error) {
 	if !ok || resultType == 0 {
 		return nil, 0, ErrUnsupported
 	}
-
 	inputcollid := uint32(0)
 	for _, t := range argOIDs {
 		if isCollatable(t) {
@@ -218,7 +235,16 @@ func resolveBinaryOp(b *parser.BinaryOp) (Node, uint32, error) {
 	if err != nil {
 		return nil, 0, err
 	}
-	spelling := b.Op.String()
+	return buildOpExpr(lNode, lType, rNode, rType, b.Op.String())
+}
+
+// buildOpExpr looks the operator up by spelling + already-resolved operand type
+// OIDs (S0's catalog.LookupOperatorForNode) and constructs the canonical OpExpr
+// with PG's collation rule (the only collatable type this subset emits is text,
+// so inputcollid/opcollid are DEFAULT_COLLATION_OID when a text operand/result
+// is involved, else 0). Shared by the scalar (resolver_expr.go) and query-scoped
+// (resolver_query.go) resolvers so both build a byte-identical OpExpr.
+func buildOpExpr(lNode Node, lType uint32, rNode Node, rType uint32, spelling string) (Node, uint32, error) {
 	op, ok := catalog.LookupOperatorForNode(spelling, lType, rType)
 	if !ok {
 		return nil, 0, ErrUnsupported
