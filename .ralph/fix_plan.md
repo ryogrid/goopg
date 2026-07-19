@@ -1300,6 +1300,22 @@ existing encoder, `constcollid=100` / `consttypmod=n+4`.
       oracle_pgnodes_adbin_test.go now 42 cases all byte-identical vs PG18.3 (1.45s);
       TestE2E_FailoverGoopgToPG + initdb/executor attrdef siblings green. Design
       0123-0005 §"Sub-slice 20".
+      SUB-SLICE 21 LANDED (2026-07-19): explicit **float-family `::type` casts**
+      (float4/float8) — extends sub-slices 19/20's funcformat-1 machinery across the
+      binary-float boundary. All six types (int2/int4/int8/numeric/float4/float8) are
+      TYPCATEGORY_NUMERIC members with a pg_cast conversion function, so any `expr::T`
+      between them is a COERCE_EXPLICIT_CAST (funcformat 1) FuncExpr kept in adbin.
+      `5::float4`/`5::float8`/`5.5::float4`/`5.5::float8`/`9999999999::float4`/`::float8`
+      + nested `(5.5::float8)::int4` now emit canonical pg_attrdef.adbin (was SQL text).
+      resolver_expr.go isNumericFamilyType accepts float4/float8; numericFamilyCastFuncid
+      gains the full float matrix (int→float 236/318/652/235/316/482, numeric↔float
+      1745/1746/1742/1743, float↔float 311/312, float→int 238/319/653/237/317/483).
+      rebuild.go explicitCastTypeName gains float arms (funcformat==1 guard load-bearing
+      — 311/316/482/1746 also appear funcformat-2 as the implicit CASE→float8 coercion).
+      NO new node/codec. Gate cast_test.go (7 live PG18.3 goldens + degrade matrix now
+      text→float8) + oracle_pgnodes_adbin_test.go now 49 cases all byte-identical vs
+      PG18.3 (1.52s); TestE2E_FailoverGoopgToPG + attrdef siblings green. Design
+      0123-0005 §"Sub-slice 21".
       REMAINING: float4-common (no float8) CASE mix (needs int/numeric→float4 arms
       + outer column cast); date-time-family CASE coercion (searched CASE over
       date/timestamptz `::type`-cast literal arms — needs a `date` OID-1082 datum +

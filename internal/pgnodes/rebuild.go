@@ -329,14 +329,13 @@ func isImplicitToFloat8Cast(f *FuncExpr) bool {
 
 // explicitCastTypeName reports whether f is one of the explicit numeric-family
 // cast FuncExprs the forward resolver emits (resolveCastExpr / numericFamilyCast\
-// Funcid: int2(int4)=314, int8(int4)=481, int4(int8)=480, int2(int8)=714 int→int;
-// int2_numeric=1782, int4_numeric=1740, int8_numeric=1781 int→numeric;
-// numeric_int2=1783, numeric_int4=1744, numeric_int8=1779 numeric→int; all
-// COERCE_EXPLICIT_CAST funcformat 1 with one argument) and returns the canonical
-// target type name for the reconstructed `::type` cast. The funcformat==1 guard
-// is load-bearing: funcid 481 also appears with funcformat 2 as the IMPLICIT
-// int4→int8 widening, and 1740/1781 as the implicit int→numeric coercion, both of
-// which rebuild by unwrapping instead.
+// Funcid — the full int/numeric/float matrix from that function's table) and
+// returns the canonical target type name for the reconstructed `::type` cast. All
+// are COERCE_EXPLICIT_CAST funcformat 1 with one argument. The funcformat==1 guard
+// is load-bearing: several OIDs also appear with funcformat 2 as IMPLICIT casts —
+// int8(int4)=481 (int4→int8 widening), 1740/1781 (int→numeric), float8(float4)=311
+// and 316/482/1746 (CASE →float8 coercion) — all of which rebuild by unwrapping
+// (isImplicit*) instead of reconstructing a `::type` node.
 func explicitCastTypeName(f *FuncExpr) (string, bool) {
 	if f.Funcformat != 1 || len(f.Args) != 1 {
 		return "", false
@@ -367,6 +366,39 @@ func explicitCastTypeName(f *FuncExpr) (string, bool) {
 			return "int4", true
 		}
 	case 1779: // numeric → int8
+		if f.Funcresulttype == OidInt8 {
+			return "int8", true
+		}
+	// int2/int4/int8/numeric/float8 → float4 (float8(float4)=312 sits here too).
+	case 236, 318, 652, 1745, 312: // *→float4
+		if f.Funcresulttype == OidFloat4 {
+			return "float4", true
+		}
+	// int2/int4/int8/numeric/float4 → float8. The funcformat==1 guard above is
+	// load-bearing: 235/316/482/1746 and float8(float4)=311 also appear with
+	// funcformat 2 as the IMPLICIT CASE-coercion casts (isImplicitToFloat8Cast /
+	// isImplicitFloat4ToFloat8Cast), which rebuild by unwrapping instead.
+	case 235, 316, 482, 1746, 311: // *→float8
+		if f.Funcresulttype == OidFloat8 {
+			return "float8", true
+		}
+	// float4/float8 → numeric.
+	case 1742, 1743: // float→numeric
+		if f.Funcresulttype == OidNumeric {
+			return "numeric", true
+		}
+	// float4/float8 → int2 (int2(float4)=238, int2(float8)=237).
+	case 238, 237: // float→int2
+		if f.Funcresulttype == OidInt2 {
+			return "int2", true
+		}
+	// float4/float8 → int4 (int4(float4)=319, int4(float8)=317).
+	case 319, 317: // float→int4
+		if f.Funcresulttype == OidInt4 {
+			return "int4", true
+		}
+	// float4/float8 → int8 (int8(float4)=653, int8(float8)=483).
+	case 653, 483: // float→int8
 		if f.Funcresulttype == OidInt8 {
 			return "int8", true
 		}

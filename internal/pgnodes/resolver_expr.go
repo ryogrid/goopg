@@ -186,23 +186,26 @@ func resolveFuncCall(f *parser.FuncCall) (Node, uint32, error) {
 	return buildFuncExpr(f.Name.Name, argNodes, argOIDs)
 }
 
-// resolveCastExpr resolves an explicit `expr::type` cast. Scope of this slice:
-// the numeric family — the exact integers (int2/int4/int8) AND arbitrary-precision
-// numeric (OID 1700). PG's coerce_type applies the cast to the operand at its
-// NATURAL type — a cast to the operand's own type is a no-op (coerce_type returns
-// the node unchanged, so `5::int4` stays a bare int4 Const and `9999999999::int8`
-// a bare int8 Const), and a genuine conversion becomes a COERCE_EXPLICIT_CAST
-// (funcformat 1) FuncExpr naming the pg_cast conversion function (e.g. int8(int4)
-// OID 481, numeric_int4 OID 1744, int4_numeric OID 1740). This is the funcformat-1
-// sibling of the implicit-cast helpers (wrapInt4ToInt8Cast / wrapIntToNumericCast,
-// funcformat 2): same OIDs, different funcformat, because an explicit `::type`
-// keeps its cast node in adbin while an implicit coercion PG re-derives from
-// context. Any target outside {int2,int4,int8,numeric}, a typmod-qualified target
-// (`::numeric(10,2)` — the length coercion is a distinct numeric(numeric,int4)
-// call not modeled here), or a source PG models with a different cast method
-// (RelabelType / IO coercion / const-fold) degrades to SQL text (all-or-nothing;
-// 02e §3). The operand is resolved with an unknown context (expected=0) so its
-// own magnitude typing decides int4-vs-int8-vs-numeric before the cast is applied.
+// resolveCastExpr resolves an explicit `expr::type` cast. Scope: PG's numeric type
+// category — the exact integers (int2/int4/int8), arbitrary-precision numeric (OID
+// 1700), AND the binary floats (float4/float8, OIDs 700/701). PG's coerce_type
+// applies the cast to the operand at its NATURAL type — a cast to the operand's
+// own type is a no-op (coerce_type returns the node unchanged, so `5::int4` stays a
+// bare int4 Const and `9999999999::int8` a bare int8 Const), and a genuine
+// conversion becomes a COERCE_EXPLICIT_CAST (funcformat 1) FuncExpr naming the
+// pg_cast conversion function (e.g. int8(int4) OID 481, numeric_int4 OID 1744,
+// float8(int4) OID 316, numeric_float8 OID 1746). This is the funcformat-1 sibling
+// of the implicit-cast helpers (wrapInt4ToInt8Cast / wrapIntToNumericCast /
+// wrapToFloat8Cast, funcformat 2): same OIDs, different funcformat, because an
+// explicit `::type` keeps its cast node in adbin while an implicit coercion PG
+// re-derives from context. Any target outside {int2,int4,int8,numeric,float4,
+// float8}, a typmod-qualified target (`::numeric(10,2)` — the length coercion is a
+// distinct numeric(numeric,int4) call not modeled here), or a source PG models with
+// a different cast method (RelabelType / IO coercion / const-fold) degrades to SQL
+// text (all-or-nothing; 02e §3). The operand is resolved with an unknown context
+// (expected=0) so its own magnitude typing decides int4-vs-int8-vs-numeric (a
+// literal never types directly as float — a float source only arises via a nested
+// `(x::floatT)::T`) before the cast is applied.
 func resolveCastExpr(v *parser.CastExpr) (Node, uint32, error) {
 	if len(v.Typmods) != 0 {
 		return nil, 0, ErrUnsupported
@@ -241,20 +244,42 @@ func resolveCastExpr(v *parser.CastExpr) (Node, uint32, error) {
 }
 
 // isNumericFamilyType reports whether oid is one of the numeric-family types this
-// slice models as an explicit-cast target (int2/int4/int8/numeric).
+// slice models as an explicit-cast target: the exact integers (int2/int4/int8),
+// arbitrary-precision numeric, AND the binary floats (float4/float8). All six are
+// members of PG's TYPCATEGORY_NUMERIC, and every ordered pair among them has a
+// pg_cast conversion function (castmethod 'f'), so any `expr::T` between them is a
+// COERCE_EXPLICIT_CAST FuncExpr (sub-slice 21 added the float arms to the
+// int/numeric core of sub-slices 19/20).
 func isNumericFamilyType(oid uint32) bool {
-	return oid == OidInt2 || oid == OidInt4 || oid == OidInt8 || oid == OidNumeric
+	return oid == OidInt2 || oid == OidInt4 || oid == OidInt8 || oid == OidNumeric ||
+		oid == OidFloat4 || oid == OidFloat8
 }
 
 // numericFamilyCastFuncid returns the pg_cast conversion-function OID (castmethod
 // 'f') and its result type for an explicit cast between numeric-family types, and
-// false for any pair outside {int2,int4,int8,numeric}² this slice models. A literal
-// source is int4, int8, or numeric (make_const magnitude typing never yields int2
-// directly, but a nested `(x::int2)::T` can), so all three integer widths plus
-// numeric are covered as sources. Every OID is from pg_proc.dat / pg_cast.dat:
-// int2(int4)=314, int8(int4)=481, int4(int8)=480, int2(int8)=714 (int→int);
-// int2_numeric=1782, int4_numeric=1740, int8_numeric=1781 (int→numeric);
-// numeric_int2=1783, numeric_int4=1744, numeric_int8=1779 (numeric→int).
+// false for any pair outside {int2,int4,int8,numeric,float4,float8}² this slice
+// models. A literal source is int4, int8, or numeric (make_const magnitude typing
+// never yields int2 or a float directly, but a nested `(x::int2)::T` /
+// `(x::float8)::T` can), so all six widths are covered as sources — the float and
+// int2 source arms are reachable only through such nesting. Every OID is from
+// pg_proc.dat / pg_cast.dat:
+//
+//	int→int:      int2(int4)=314, int8(int4)=481, int4(int8)=480, int2(int8)=714
+//	int→numeric:  int2_numeric=1782, int4_numeric=1740, int8_numeric=1781
+//	numeric→int:  numeric_int2=1783, numeric_int4=1744, numeric_int8=1779
+//	int→float4:   float4(int2)=236, float4(int4)=318, float4(int8)=652
+//	int→float8:   float8(int2)=235, float8(int4)=316, float8(int8)=482
+//	numeric↔float: numeric_float4=1745, numeric_float8=1746,
+//	              float4_numeric=1742, float8_numeric=1743
+//	float↔float:  float8(float4)=311, float4(float8)=312
+//	float4→int:   int2(float4)=238, int4(float4)=319, int8(float4)=653
+//	float8→int:   int2(float8)=237, int4(float8)=317, int8(float8)=483
+//
+// The float8(float4)=311 / int→float8 / numeric_float8 OIDs are shared with the
+// IMPLICIT CASE-coercion helpers (wrapFloat4ToFloat8Cast / wrapToFloat8Cast,
+// funcformat 2); here they carry funcformat 1 because the `::type` is explicit —
+// the funcformat distinguishes the two on the rebuild path (explicitCastTypeName
+// vs isImplicit*).
 func numericFamilyCastFuncid(fromType, toType uint32) (funcid, resultType uint32, ok bool) {
 	switch {
 	// integer → integer
@@ -280,6 +305,48 @@ func numericFamilyCastFuncid(fromType, toType uint32) (funcid, resultType uint32
 		return 1744, OidInt4, true
 	case fromType == OidNumeric && toType == OidInt8:
 		return 1779, OidInt8, true
+	// integer → float4
+	case fromType == OidInt2 && toType == OidFloat4:
+		return 236, OidFloat4, true
+	case fromType == OidInt4 && toType == OidFloat4:
+		return 318, OidFloat4, true
+	case fromType == OidInt8 && toType == OidFloat4:
+		return 652, OidFloat4, true
+	// integer → float8
+	case fromType == OidInt2 && toType == OidFloat8:
+		return 235, OidFloat8, true
+	case fromType == OidInt4 && toType == OidFloat8:
+		return 316, OidFloat8, true
+	case fromType == OidInt8 && toType == OidFloat8:
+		return 482, OidFloat8, true
+	// numeric ↔ float
+	case fromType == OidNumeric && toType == OidFloat4:
+		return 1745, OidFloat4, true
+	case fromType == OidNumeric && toType == OidFloat8:
+		return 1746, OidFloat8, true
+	case fromType == OidFloat4 && toType == OidNumeric:
+		return 1742, OidNumeric, true
+	case fromType == OidFloat8 && toType == OidNumeric:
+		return 1743, OidNumeric, true
+	// float ↔ float
+	case fromType == OidFloat4 && toType == OidFloat8:
+		return 311, OidFloat8, true
+	case fromType == OidFloat8 && toType == OidFloat4:
+		return 312, OidFloat4, true
+	// float4 → integer
+	case fromType == OidFloat4 && toType == OidInt2:
+		return 238, OidInt2, true
+	case fromType == OidFloat4 && toType == OidInt4:
+		return 319, OidInt4, true
+	case fromType == OidFloat4 && toType == OidInt8:
+		return 653, OidInt8, true
+	// float8 → integer
+	case fromType == OidFloat8 && toType == OidInt2:
+		return 237, OidInt2, true
+	case fromType == OidFloat8 && toType == OidInt4:
+		return 317, OidInt4, true
+	case fromType == OidFloat8 && toType == OidInt8:
+		return 483, OidInt8, true
 	default:
 		return 0, 0, false
 	}

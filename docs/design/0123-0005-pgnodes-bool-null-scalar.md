@@ -1006,6 +1006,49 @@ conversion function, kept verbatim in `adbin`, with the operand resolved at its
   siblings green; `go vet` + `go build ./...` + gofmt clean; pgbench smoke via
   pre-commit.
 
+## Sub-slice 21 — explicit float-family `::type` casts
+
+Sub-slices 19–20 modeled the explicit `::type` casts within the integer/`numeric`
+core; this slice extends the same funcformat-1 machinery across the **binary-float
+boundary** (`float4`/`float8`, OIDs 700/701). All six types (`int2`/`int4`/`int8`/
+`numeric`/`float4`/`float8`) are members of PG's `TYPCATEGORY_NUMERIC`, and every
+ordered pair among them has a `pg_cast` conversion function (`castmethod 'f'`), so
+any `expr::T` between them is a `COERCE_EXPLICIT_CAST` (`funcformat` **1**)
+`FuncExpr` kept verbatim in `adbin`. Reachable user-facing forms — the operand is a
+literal, which types naturally as `int4`/`int8`/`numeric` (there is **no** float
+literal leaf) — are `5::float4`, `5::float8`, `5.5::float8`, `9999999999::float4`,
+etc. A float **source** arm is reachable only through a nested `(x::float8)::int4`.
+
+### Changes
+
+- `resolver_expr.go`: `isNumericFamilyType` accepts `float4`/`float8` targets, and
+  `numericFamilyCastFuncid` gains the full float matrix — int→float4
+  (`float4(int2/int4/int8)`=236/318/652), int→float8 (`float8(int2/int4/int8)`=
+  235/316/482), numeric↔float (`numeric_float4`=1745, `numeric_float8`=1746,
+  `float4_numeric`=1742, `float8_numeric`=1743), float↔float (`float8(float4)`=311,
+  `float4(float8)`=312), and float→int (`int2/int4/int8(float4)`=238/319/653,
+  `int2/int4/int8(float8)`=237/317/483). No new node/codec — the existing `FuncExpr`
+  path carries them.
+- `rebuild.go`: `explicitCastTypeName` gains the float arms → target type name. The
+  `funcformat==1` guard is **load-bearing**: `float8(float4)`=311 and the int/numeric
+  →float8 OIDs (316/482/1746) also appear with funcformat 2 as the IMPLICIT `CASE`
+  →float8 coercion (`isImplicitToFloat8Cast` / `isImplicitFloat4ToFloat8Cast`,
+  sub-slices 15–16), which rebuild by unwrapping instead. Rebuild needs no float
+  `Const` handling — a float source is always another (cast) `FuncExpr`, never a
+  bare float `Const`.
+
+### Gates (all green)
+
+- `internal/pgnodes/cast_test.go` — 7 new live-captured PG18.3 scalar `adbin`
+  goldens (`5::float4`/`::float8`, `9999999999::float4`/`::float8`, `5.5::float4`/
+  `::float8`, and the nested `(5.5::float8)::int4`) through the golden + codec +
+  rebuild fixed-point loops; the degradation matrix swaps the now-canonical
+  `numeric→float8` case for a `text→float8` source (unmodeled source arm).
+- `internal/testport/oracle_pgnodes_adbin_test.go` — the same 7 cases added to the
+  live oracle (**49 cases total**, all byte-identical vs PG18.3, ≈1.52s).
+- full `pgnodes` package + `go vet` + gofmt clean; `TestE2E_FailoverGoopgToPG` +
+  initdb/executor attrdef siblings green; pgbench smoke via pre-commit.
+
 ## Byte-diff oracle gate (adbin) — `internal/testport/oracle_pgnodes_adbin_test.go`
 
 The per-datum golden tests above each hard-code a `want` `adbin` string a

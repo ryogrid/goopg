@@ -135,6 +135,69 @@ var castGolden = []struct {
 		colType: OidNumeric,
 		want:    `{FUNCEXPR :funcid 1781 :funcresulttype 1700 :funcretset false :funcvariadic false :funcformat 1 :funccollid 0 :inputcollid 0 :args ({CONST :consttype 20 :consttypmod -1 :constcollid 0 :constlen 8 :constbyval true :constisnull false :location -1 :constvalue 8 [ -1 -29 11 84 2 0 0 0 ]}) :location -1}`,
 	},
+
+	// M0123-S4 sub-slice 21 — explicit float-family `::type` casts (float4/float8),
+	// extending the funcformat-1 machinery across the binary-float boundary. A
+	// literal source is int4/int8 (integer) or numeric (decimal), so the reachable
+	// arms are int→float and numeric→float; PG stores each as a COERCE_EXPLICIT_CAST
+	// FuncExpr naming the pg_cast conversion function. int→float4: float4(int4)=318,
+	// float4(int8)=652; int→float8: float8(int4)=316, float8(int8)=482; numeric→
+	// float: numeric_float8=1746, numeric_float4=1745. A nested `(x::float8)::int4`
+	// reaches the float→int arm (int4(float8)=317). Every `want` captured LIVE from
+	// PostgreSQL 18.3. NOTE 316/482/1746 are the funcformat-1 EXPLICIT siblings of
+	// the funcformat-2 implicit CASE →float8 coercion (wrapToFloat8Cast); the
+	// funcformat keeps them apart on the rebuild path.
+
+	// integer source → float4 / float8 (i4tof=318, i4tod=316).
+	{
+		name:    "explicit_int4_to_float4",
+		sql:     "5::float4",
+		colType: OidFloat4,
+		want:    `{FUNCEXPR :funcid 318 :funcresulttype 700 :funcretset false :funcvariadic false :funcformat 1 :funccollid 0 :inputcollid 0 :args ({CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 5 0 0 0 0 0 0 0 ]}) :location -1}`,
+	},
+	{
+		name:    "explicit_int4_to_float8",
+		sql:     "5::float8",
+		colType: OidFloat8,
+		want:    `{FUNCEXPR :funcid 316 :funcresulttype 701 :funcretset false :funcvariadic false :funcformat 1 :funccollid 0 :inputcollid 0 :args ({CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 5 0 0 0 0 0 0 0 ]}) :location -1}`,
+	},
+	// int8 source (a literal too large for int4) → float4 / float8 (i8tof=652,
+	// i8tod=482).
+	{
+		name:    "explicit_int8_to_float4",
+		sql:     "9999999999::float4",
+		colType: OidFloat4,
+		want:    `{FUNCEXPR :funcid 652 :funcresulttype 700 :funcretset false :funcvariadic false :funcformat 1 :funccollid 0 :inputcollid 0 :args ({CONST :consttype 20 :consttypmod -1 :constcollid 0 :constlen 8 :constbyval true :constisnull false :location -1 :constvalue 8 [ -1 -29 11 84 2 0 0 0 ]}) :location -1}`,
+	},
+	{
+		name:    "explicit_int8_to_float8",
+		sql:     "9999999999::float8",
+		colType: OidFloat8,
+		want:    `{FUNCEXPR :funcid 482 :funcresulttype 701 :funcretset false :funcvariadic false :funcformat 1 :funccollid 0 :inputcollid 0 :args ({CONST :consttype 20 :consttypmod -1 :constcollid 0 :constlen 8 :constbyval true :constisnull false :location -1 :constvalue 8 [ -1 -29 11 84 2 0 0 0 ]}) :location -1}`,
+	},
+	// numeric source (a decimal literal → numeric Const 5.5) → float4 / float8
+	// (numeric_float4=1745, numeric_float8=1746).
+	{
+		name:    "explicit_numeric_to_float4",
+		sql:     "5.5::float4",
+		colType: OidFloat4,
+		want:    `{FUNCEXPR :funcid 1745 :funcresulttype 700 :funcretset false :funcvariadic false :funcformat 1 :funccollid 0 :inputcollid 0 :args ({CONST :consttype 1700 :consttypmod -1 :constcollid 0 :constlen -1 :constbyval false :constisnull false :location -1 :constvalue 10 [ 40 0 0 0 -128 -128 5 0 -120 19 ]}) :location -1}`,
+	},
+	{
+		name:    "explicit_numeric_to_float8",
+		sql:     "5.5::float8",
+		colType: OidFloat8,
+		want:    `{FUNCEXPR :funcid 1746 :funcresulttype 701 :funcretset false :funcvariadic false :funcformat 1 :funccollid 0 :inputcollid 0 :args ({CONST :consttype 1700 :consttypmod -1 :constcollid 0 :constlen -1 :constbyval false :constisnull false :location -1 :constvalue 10 [ 40 0 0 0 -128 -128 5 0 -120 19 ]}) :location -1}`,
+	},
+	// A NESTED cast reaches a float SOURCE arm: `(5.5::float8)::int4` resolves the
+	// operand to numeric_float8 (1746), then float8→int4 via int4(float8)=317. This
+	// is the only way a float-typed operand appears (there is no float literal leaf).
+	{
+		name:    "explicit_nested_float8_to_int4",
+		sql:     "(5.5::float8)::int4",
+		colType: OidInt4,
+		want:    `{FUNCEXPR :funcid 317 :funcresulttype 23 :funcretset false :funcvariadic false :funcformat 1 :funccollid 0 :inputcollid 0 :args ({FUNCEXPR :funcid 1746 :funcresulttype 701 :funcretset false :funcvariadic false :funcformat 1 :funccollid 0 :inputcollid 0 :args ({CONST :consttype 1700 :consttypmod -1 :constcollid 0 :constlen -1 :constbyval false :constisnull false :location -1 :constvalue 10 [ 40 0 0 0 -128 -128 5 0 -120 19 ]}) :location -1}) :location -1}`,
+	},
 }
 
 // TestCastResolveMatchesGolden parses each SQL default and asserts ResolveExpr →
@@ -200,21 +263,22 @@ func TestCastResolveRebuildRoundTrip(t *testing.T) {
 	}
 }
 
-// TestCastDegradesGracefully documents the bounded-subset boundary: only
-// numeric-family casts (int2/int4/int8/numeric)² are modeled. A cast target
-// outside that family, a source type this slice does not carry a cast arm for
-// (text→int4), and a typmod-qualified numeric target (a distinct length-coercion
-// call) must degrade to SQL text rather than emit a divergent tree.
+// TestCastDegradesGracefully documents the bounded-subset boundary: only casts
+// within PG's numeric type category (int2/int4/int8/numeric/float4/float8)² are
+// modeled. A cast target outside that category (text), a source type this slice
+// does not carry a cast arm for (text→int4, text→float8), and a typmod-qualified
+// numeric target (a distinct length-coercion call) must degrade to SQL text rather
+// than emit a divergent tree.
 func TestCastDegradesGracefully(t *testing.T) {
 	cases := []struct {
 		name    string
 		sql     string
 		colType uint32
 	}{
-		{"int_to_text_target", "5::text", OidText},             // non-numeric-family target
-		{"numeric_to_float8_target", "5.5::float8", OidFloat8}, // float family not modeled
-		{"text_literal_to_int4", "'5'::int4", OidInt4},         // text source arm not modeled
-		{"typmod_qualified", "5::numeric(10,2)", OidNumeric},   // typmod-qualified target
+		{"int_to_text_target", "5::text", OidText},           // non-numeric-category target
+		{"text_literal_to_float8", "'5'::float8", OidFloat8}, // text source arm not modeled
+		{"text_literal_to_int4", "'5'::int4", OidInt4},       // text source arm not modeled
+		{"typmod_qualified", "5::numeric(10,2)", OidNumeric}, // typmod-qualified target
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -1,29 +1,31 @@
 (idle — nothing in flight)
 
-Last loop (#33): M0123-S4 sub-slice 20 — explicit numeric↔integer `::type` cast
-(extends sub-slice 19's funcformat-1 machinery across the int/numeric boundary).
-LANDED + committed. `5.5::int4`/`::int8`/`::int2`, `(-2.5)::int4`, `5::numeric`,
-`9999999999::numeric` now emit canonical pg_attrdef.adbin (was SQL text). PG stores
-each as a COERCE_EXPLICIT_CAST (funcformat 1) FuncExpr: numeric_int4=1744 /
-numeric_int8=1779 / numeric_int2=1783 (numeric→int); int4_numeric=1740 /
-int8_numeric=1781 (int→numeric); operand resolved at NATURAL type first.
-resolver_expr.go isIntegerType→isNumericFamilyType + integerCastFuncid→
-numericFamilyCastFuncid (6 cross-boundary arms). rebuild.go
-explicitIntegerCastTypeName→explicitCastTypeName (numeric arms; funcformat==1 guard
-still separates the implicit 1740/1781 funcformat-2 unwrap). rebuildConst numeric
-arm handles the negative fold (fixed point).
+Last loop (#35): M0123-S4 sub-slice 21 — explicit float-family `::type` casts
+(float4/float8). LANDED + committed. Extends sub-slices 19/20's funcformat-1
+machinery across the binary-float boundary: all six TYPCATEGORY_NUMERIC types
+(int2/int4/int8/numeric/float4/float8) have a pg_cast conv func, so any `expr::T`
+between them is a COERCE_EXPLICIT_CAST (funcformat 1) FuncExpr kept in adbin.
+`5::float4`/`5::float8`/`5.5::float4`/`5.5::float8`/`9999999999::float4`/`::float8`
++ nested `(5.5::float8)::int4` now emit canonical pg_attrdef.adbin (was SQL text).
 
-Gates GREEN: internal/pgnodes/cast_test.go (6 new live PG18.3 goldens + degrade
-matrix now numeric→float8) via golden/codec/rebuild loops; adbin oracle now 42/42 vs
-PG18.3 (1.45s); TestE2E_FailoverGoopgToPG (6.3s, one transient FAIL from a scratch-
-cluster collision — re-ran clean) + initdb/executor attrdef siblings green;
-build/vet/gofmt clean; state-guard reconciled; pgbench smoke via pre-commit.
+Files: internal/pgnodes/resolver_expr.go (isNumericFamilyType accepts float4/float8;
+numericFamilyCastFuncid full float matrix — int→float 236/318/652/235/316/482,
+numeric↔float 1745/1746/1742/1743, float↔float 311/312, float→int
+238/319/653/237/317/483); rebuild.go (explicitCastTypeName float arms, funcformat==1
+guard separates the implicit CASE→float8 casts 311/316/482/1746);
+internal/pgnodes/cast_test.go (+7 goldens, degrade swap text→float8);
+internal/testport/oracle_pgnodes_adbin_test.go (+7, now 49). NO new node/codec.
 
-Next (M0123-S4 REMAINING): (1) float-family explicit-cast arms — float↔{int,numeric}
-(`5.5::float8`=float8 conv FuncExpr, `5::float4`) in resolveCastExpr/
-numericFamilyCastFuncid; (2) a `date` OID-1082 datum in datum.go + `::date`/
-`::timestamptz` string-literal fold for the date-time-family CASE arms; (3)
-typmod-qualified numeric target (`::numeric(10,2)` = numeric(numeric,int4) length
-coercion); (4) float4-common (no float8) CASE mix; (5) operator-driven view-qual
-coercion. Resume: internal/pgnodes/resolver_expr.go resolveCastExpr/
-numericFamilyCastFuncid (add float arms) + datum.go (date datum).
+Gates GREEN: full pgnodes pkg; cast_test 7 new goldens (golden/codec/rebuild loops);
+adbin oracle 49/49 byte-identical vs LIVE PG18.3 (1.52s); executor/initdb attrdef
+siblings green; TestE2E_FailoverGoopgToPG (6.66s async+sync); build/vet/gofmt clean;
+pgbench smoke via pre-commit.
+
+Next (M0123-S4 REMAINING): (1) float4-common (no float8) CASE result mix — needs
+int/numeric→float4 arms + outer float8(float4) column cast (selectCaseCommonType/
+coerceCaseResult); (2) date-time-family CASE coercion — needs a `date` OID-1082
+datum (datum.go) + `::date`/`::timestamptz` string-literal fold in a natural/non-
+column context; (3) typmod-qualified numeric/float target (`::numeric(10,2)` =
+numeric(numeric,int4) length coercion); (4) operator-driven view-qual coercion
+(unblocks int2/timestamptz literals); (5) a float literal leaf in parser + float
+Const datum would unlock top-level float cast sources (nested-only today).

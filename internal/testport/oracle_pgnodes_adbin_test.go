@@ -141,6 +141,19 @@ var adbinOracleCases = []adbinOracleCase{
 	{"cast_neg_numeric_to_int4", "int", pgnodes.OidInt4, "(-2.5)::int4"},
 	{"cast_int4_to_numeric", "numeric", pgnodes.OidNumeric, "5::numeric"},
 	{"cast_int8_to_numeric", "numeric", pgnodes.OidNumeric, "9999999999::numeric"},
+	// Explicit float-family `::type` casts (sub-slice 21): the funcformat-1
+	// COERCE_EXPLICIT_CAST arms across the binary-float boundary. int→float
+	// (float4(int4)=318 / float8(int4)=316 / float4(int8)=652 / float8(int8)=482),
+	// numeric→float (numeric_float4=1745 / numeric_float8=1746), and a nested
+	// `(x::float8)::int4` reaching a float SOURCE arm (int4(float8)=317). 316/482/
+	// 1746 are the funcformat-1 siblings of the implicit CASE →float8 coercion.
+	{"cast_int4_to_float4", "float4", pgnodes.OidFloat4, "5::float4"},
+	{"cast_int4_to_float8", "float8", pgnodes.OidFloat8, "5::float8"},
+	{"cast_int8_to_float4", "float4", pgnodes.OidFloat4, "9999999999::float4"},
+	{"cast_int8_to_float8", "float8", pgnodes.OidFloat8, "9999999999::float8"},
+	{"cast_numeric_to_float4", "float4", pgnodes.OidFloat4, "5.5::float4"},
+	{"cast_numeric_to_float8", "float8", pgnodes.OidFloat8, "5.5::float8"},
+	{"cast_nested_float8_to_int4", "int", pgnodes.OidInt4, "(5.5::float8)::int4"},
 }
 
 // TestOraclePgnodesAdbinBytesMatchPG is the M0123-S4 byte-diff oracle: for each
