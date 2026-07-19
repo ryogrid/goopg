@@ -15,6 +15,7 @@ const (
 	OidInt4        = 23
 	OidText        = 25
 	OidOid         = 26
+	OidFloat4      = 700
 	OidFloat8      = 701
 	OidNumeric     = 1700
 	OidTimestamptz = 1184
@@ -97,6 +98,11 @@ func caseTypeMeta(oid uint32) (constlen int32, constbyval bool, ok bool) {
 	case OidInt4, OidOid:
 		return 4, true, true
 	case OidInt8:
+		return 8, true, true
+	case OidFloat4:
+		return 4, true, true
+	case OidFloat8:
+		// FLOAT8PASSBYVAL is true on the 64-bit build goopg targets.
 		return 8, true, true
 	case OidNumeric:
 		return -1, false, true

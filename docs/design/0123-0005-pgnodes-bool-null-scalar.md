@@ -709,12 +709,63 @@ type the narrower one implicitly coerces to but not vice-versa — `int4`→`int
   executor `TestCanonicalAttrdefText`/`TestDefault`/`TestResolveForColumn` +
   initdb `TestRebuildAttrdefExpr` green.
 
+## Sub-slice 15 — `CASE` cross-FAMILY float result coercion (`float4`→`float8`)
+
+Sub-slices 13/14 closed the exact-integer / numeric family. This slice adds the
+second numeric family PG models: the **binary floats** `{float4,float8}`. A mixed
+`CASE` whose results are `float4`+`float8` now folds to `float8` instead of
+degrading to SQL text.
+
+`select_common_type` (`parse_coerce.c`) walks the result list: `float8` **is** a
+preferred type in the numeric category (`typispreferred=t`), so `float4` implicitly
+coerces to `float8` but never the reverse — the common type of any float mix is
+`float8`.
+
+- `selectCaseCommonType(resultTypes)` (`resolver_expr.go`) is restructured to
+  classify each result into one of two disjoint families and only fold a mix that
+  stays **within one family**: the exact-integer family `{int4,int8,numeric}`
+  (widest present) *or* the float family `{float4,float8}` (→ `float8`). A
+  **cross-family** mix (e.g. `int4`+`float8`) — which PG itself folds to `float8`
+  via an implicit int→float cast — is deliberately left unmodeled here and still
+  degrades to SQL text (all-or-nothing).
+- `coerceCaseResult(node, from, to)` gains the `float4`→`float8` arm: it wraps the
+  `float4` result in `wrapFloat4ToFloat8Cast` — the implicit `float8(float4)` cast
+  `FuncExpr` (`pg_cast.dat`: castsource float4 → casttarget float8, castfunc
+  `float8(float4)` **OID 311** / `prosrc ftod`, castcontext `'i'`, castmethod
+  `'f'`), funcresulttype float8, funcformat 2, byte-identical to PG's un-const-
+  folded stored tree. The `float8` side never needs a cast.
+- Rebuild: `rebuildFuncExprWith` (`rebuild.go`) recognises the new cast via
+  `isImplicitFloat4ToFloat8Cast` (funcid 311 / funcformat 2 / funcresulttype
+  float8 / one arg) alongside the sibling int casts, and unwraps it to the inner
+  `float4` result — so a mixed float CASE is a fixed point.
+
+Note: this canonicalizer has **no float *literal* leaf** (a decimal literal is
+`numeric`, and `::float` casts are not yet a resolvable node), so the only way a
+`float4`/`float8` result reaches the CASE walk today is a float-returning function
+call — e.g. the `float4()`/`float8()` conversion functions (funcid 318/316,
+funcformat 0). The three goldens use exactly that shape.
+
+### Gates (all green)
+
+- `internal/pgnodes/case_test.go` — three live-captured PG18.3 scalar `adbin`
+  goldens (table `cf`) through the golden/codec/rebuild-fixed-point loops:
+  `crossfam_float4_then_float8_else` (cast on `WHEN`),
+  `crossfam_float8_then_float4_else` (cast on `ELSE`),
+  `crossfam_two_float4_casts` (a multi-arm CASE with two `float8(float4)` casts).
+- `internal/pgnodes/datum.go` — added `OidFloat4 = 700` + `float4`/`float8`
+  `caseTypeMeta` entries (float8 is FLOAT8PASSBYVAL byval on the 64-bit build).
+- full `pgnodes` package + `go vet ./internal/pgnodes/` + `go build ./...` clean;
+  executor `TestCanonicalAttrdefText`/`TestDefault`/`TestResolveForColumn` +
+  initdb `TestRebuildAttrdefExpr` green; gofmt clean.
+
 ## Deferred
 
-- Cross-type `CASE` results **outside the exact-integer / numeric family** (e.g.
-  the float or date-time families, `int4`+`float8` → common type `float8`) still
-  degrade to SQL text: those cross-family casts are not yet modeled. Sub-slices 13
-  and 14 together cover the full `{int4,int8,numeric}` family.
+- **Cross-family** `CASE` result mixes still degrade to SQL text. Sub-slices 13/14
+  cover the full exact-integer / numeric family `{int4,int8,numeric}` and 15 covers
+  the binary-float family `{float4,float8}`, but a mix that *spans* the two (e.g.
+  `int4`+`float8`, PG common type `float8` via an implicit int→float cast) is not
+  yet modeled, nor are the date-time families. The unified per-category
+  preferred-type walk (any-int/numeric/float → `float8`) is the natural next step.
 - A simple-form `WHEN` value that needs an implicit coercion to the operand type
   (no exact `operandType = valType` operator — e.g. a numeric operand vs a
   `WHEN` value PG would cast) still degrades to SQL text: PG inserts a cast

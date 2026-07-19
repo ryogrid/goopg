@@ -164,6 +164,36 @@ var caseGolden = []struct {
 		colType: OidInt8,
 		want:    `{CASEEXPR :casetype 20 :casecollid 0 :arg <> :args ({CASEWHEN :expr {CONST :consttype 16 :consttypmod -1 :constcollid 0 :constlen 1 :constbyval true :constisnull false :location -1 :constvalue 1 [ 0 0 0 0 0 0 0 0 ]} :result {FUNCEXPR :funcid 481 :funcresulttype 20 :funcretset false :funcvariadic false :funcformat 2 :funccollid 0 :inputcollid 0 :args ({CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 1 0 0 0 0 0 0 0 ]}) :location -1} :location -1} {CASEWHEN :expr {CONST :consttype 16 :consttypmod -1 :constcollid 0 :constlen 1 :constbyval true :constisnull false :location -1 :constvalue 1 [ 1 0 0 0 0 0 0 0 ]} :result {FUNCEXPR :funcid 481 :funcresulttype 20 :funcretset false :funcvariadic false :funcformat 2 :funccollid 0 :inputcollid 0 :args ({CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 2 0 0 0 0 0 0 0 ]}) :location -1} :location -1}) :defresult {CONST :consttype 20 :consttypmod -1 :constcollid 0 :constlen 8 :constbyval true :constisnull false :location -1 :constvalue 8 [ 0 -14 5 42 1 0 0 0 ]} :location -1}`,
 	},
+	// M0123-S4 sub-slice 15: CASE cross-FAMILY *float* coercion. The results
+	// mix float4 and float8 (produced here by the float4()/float8() conversion
+	// functions — funcid 318/316, funcformat 0 — since this canonicalizer has
+	// no float *literal* leaf). select_common_type walks the binary-float
+	// family: float4 implicitly coerces to float8 (a preferred type) but not the
+	// reverse, so the common type is float8 (casetype 701), and each float4
+	// result is wrapped in the implicit float8(float4) cast FuncExpr (funcid 311,
+	// funcformat 2), un-const-folded in the stored tree. Captured live from
+	// PG18.3 (table cf):
+	//   f1 float8 DEFAULT (CASE WHEN true THEN float4(1) ELSE float8(2) END)  -- cast on WHEN
+	//   f2 float8 DEFAULT (CASE WHEN true THEN float8(1) ELSE float4(2) END)  -- cast on ELSE
+	//   f3 float8 DEFAULT (CASE WHEN (1=1) THEN float4(10) WHEN (2=2) THEN float8(20) ELSE float4(30) END)
+	{
+		name:    "crossfam_float4_then_float8_else",
+		sql:     "CASE WHEN true THEN float4(1) ELSE float8(2) END",
+		colType: OidFloat8,
+		want:    `{CASEEXPR :casetype 701 :casecollid 0 :arg <> :args ({CASEWHEN :expr {CONST :consttype 16 :consttypmod -1 :constcollid 0 :constlen 1 :constbyval true :constisnull false :location -1 :constvalue 1 [ 1 0 0 0 0 0 0 0 ]} :result {FUNCEXPR :funcid 311 :funcresulttype 701 :funcretset false :funcvariadic false :funcformat 2 :funccollid 0 :inputcollid 0 :args ({FUNCEXPR :funcid 318 :funcresulttype 700 :funcretset false :funcvariadic false :funcformat 0 :funccollid 0 :inputcollid 0 :args ({CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 1 0 0 0 0 0 0 0 ]}) :location -1}) :location -1} :location -1}) :defresult {FUNCEXPR :funcid 316 :funcresulttype 701 :funcretset false :funcvariadic false :funcformat 0 :funccollid 0 :inputcollid 0 :args ({CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 2 0 0 0 0 0 0 0 ]}) :location -1} :location -1}`,
+	},
+	{
+		name:    "crossfam_float8_then_float4_else",
+		sql:     "CASE WHEN true THEN float8(1) ELSE float4(2) END",
+		colType: OidFloat8,
+		want:    `{CASEEXPR :casetype 701 :casecollid 0 :arg <> :args ({CASEWHEN :expr {CONST :consttype 16 :consttypmod -1 :constcollid 0 :constlen 1 :constbyval true :constisnull false :location -1 :constvalue 1 [ 1 0 0 0 0 0 0 0 ]} :result {FUNCEXPR :funcid 316 :funcresulttype 701 :funcretset false :funcvariadic false :funcformat 0 :funccollid 0 :inputcollid 0 :args ({CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 1 0 0 0 0 0 0 0 ]}) :location -1} :location -1}) :defresult {FUNCEXPR :funcid 311 :funcresulttype 701 :funcretset false :funcvariadic false :funcformat 2 :funccollid 0 :inputcollid 0 :args ({FUNCEXPR :funcid 318 :funcresulttype 700 :funcretset false :funcvariadic false :funcformat 0 :funccollid 0 :inputcollid 0 :args ({CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 2 0 0 0 0 0 0 0 ]}) :location -1}) :location -1} :location -1}`,
+	},
+	{
+		name:    "crossfam_two_float4_casts",
+		sql:     "CASE WHEN (1=1) THEN float4(10) WHEN (2=2) THEN float8(20) ELSE float4(30) END",
+		colType: OidFloat8,
+		want:    `{CASEEXPR :casetype 701 :casecollid 0 :arg <> :args ({CASEWHEN :expr {OPEXPR :opno 96 :opfuncid 65 :opresulttype 16 :opretset false :opcollid 0 :inputcollid 0 :args ({CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 1 0 0 0 0 0 0 0 ]} {CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 1 0 0 0 0 0 0 0 ]}) :location -1} :result {FUNCEXPR :funcid 311 :funcresulttype 701 :funcretset false :funcvariadic false :funcformat 2 :funccollid 0 :inputcollid 0 :args ({FUNCEXPR :funcid 318 :funcresulttype 700 :funcretset false :funcvariadic false :funcformat 0 :funccollid 0 :inputcollid 0 :args ({CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 10 0 0 0 0 0 0 0 ]}) :location -1}) :location -1} :location -1} {CASEWHEN :expr {OPEXPR :opno 96 :opfuncid 65 :opresulttype 16 :opretset false :opcollid 0 :inputcollid 0 :args ({CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 2 0 0 0 0 0 0 0 ]} {CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 2 0 0 0 0 0 0 0 ]}) :location -1} :result {FUNCEXPR :funcid 316 :funcresulttype 701 :funcretset false :funcvariadic false :funcformat 0 :funccollid 0 :inputcollid 0 :args ({CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 20 0 0 0 0 0 0 0 ]}) :location -1} :location -1}) :defresult {FUNCEXPR :funcid 311 :funcresulttype 701 :funcretset false :funcvariadic false :funcformat 2 :funccollid 0 :inputcollid 0 :args ({FUNCEXPR :funcid 318 :funcresulttype 700 :funcretset false :funcvariadic false :funcformat 0 :funccollid 0 :inputcollid 0 :args ({CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 30 0 0 0 0 0 0 0 ]}) :location -1}) :location -1} :location -1}`,
+	},
 }
 
 // TestCaseResolveMatchesGolden parses each SQL default and asserts

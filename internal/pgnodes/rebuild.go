@@ -239,7 +239,8 @@ func rebuildFuncExprWith(f *FuncExpr, rec func(Node) (parser.Expr, error)) (pars
 	// bare integer literal in a numeric context. Rebuild to the inner argument so
 	// a re-resolve re-wraps the identical FuncExpr (fixed point), rather than a
 	// spurious numeric(<int>) function call.
-	if isImplicitIntToNumericCast(f) || isImplicitInt4ToInt8Cast(f) {
+	if isImplicitIntToNumericCast(f) || isImplicitInt4ToInt8Cast(f) ||
+		isImplicitFloat4ToFloat8Cast(f) {
 		return rec(f.Args[0])
 	}
 	name, ok := catalog.RegprocName(f.Funcid)
@@ -278,6 +279,20 @@ func isImplicitInt4ToInt8Cast(f *FuncExpr) bool {
 	return f.Funcid == 481 &&
 		f.Funcformat == 2 &&
 		f.Funcresulttype == OidInt8 &&
+		len(f.Args) == 1
+}
+
+// isImplicitFloat4ToFloat8Cast reports whether f is the exact FuncExpr the
+// forward resolver emits for a float4 result widened to a common float8 type (see
+// wrapFloat4ToFloat8Cast): float8(float4) (311), an implicit-cast form (funcformat
+// 2) with a single argument. Like the int→numeric / int4→int8 casts it has no SQL
+// call syntax that would round-trip as an implicit cast — the CASE common-type
+// walk re-derives it from the bare float4 result in a float8 context — so rebuild
+// unwraps to the inner argument for a re-resolve fixed point.
+func isImplicitFloat4ToFloat8Cast(f *FuncExpr) bool {
+	return f.Funcid == 311 &&
+		f.Funcformat == 2 &&
+		f.Funcresulttype == OidFloat8 &&
 		len(f.Args) == 1
 }
 

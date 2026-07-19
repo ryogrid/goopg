@@ -309,6 +309,26 @@ func wrapInt4ToInt8Cast(arg Node) Node {
 	}
 }
 
+// wrapFloat4ToFloat8Cast builds the implicit float4->float8 width-coercion
+// FuncExpr that PG's coerce_type emits for a float4 result promoted to a common
+// float8 type (see pg_cast.dat: castsource float4 -> casttarget float8, castfunc
+// float8(float4) OID 311 / prosrc ftod, castcontext 'i', castmethod 'f').
+// funcresulttype float8; funcformat = COERCE_IMPLICIT_CAST (2); no collation. The
+// float8 side never needs a cast.
+func wrapFloat4ToFloat8Cast(arg Node) Node {
+	return &FuncExpr{
+		Funcid:         311, // float8(float4)
+		Funcresulttype: OidFloat8,
+		Funcretset:     false,
+		Funcvariadic:   false,
+		Funcformat:     2, // COERCE_IMPLICIT_CAST
+		Funccollid:     0,
+		Inputcollid:    0,
+		Args:           []Node{arg},
+		Location:       -1,
+	}
+}
+
 // resolveNumericLiteral types a decimal/scientific literal as numeric (OID 1700)
 // — PG's scanner types a T_Float token numeric regardless of the surrounding
 // context. negative folds an outer unary minus into the packed Const the way
@@ -582,13 +602,14 @@ func resolveCaseExpr(e *parser.CaseExpr) (Node, uint32, error) {
 //
 // Result types need NOT be identical: PG's transformCaseExpr runs
 // select_common_type over the WHEN results plus any ELSE, then coerce_to_common_
-// type inserts a cast on each mismatched result. This models the bounded
-// exact-integer/numeric family subset (see selectCaseCommonType /
-// coerceCaseResult) — a mix drawn from {int4,int8,numeric} folds to the widest
-// member (numeric > int8 > int4), with each narrower result wrapped in the exact
-// implicit-cast FuncExpr (int_numeric 1740/1781, or int8(int4) 481). Any other
-// mix, or a collatable common type, returns ErrUnsupported so the writer degrades
-// to SQL text (all-or-nothing).
+// type inserts a cast on each mismatched result. This models two bounded numeric
+// families (see selectCaseCommonType / coerceCaseResult): a mix drawn from the
+// exact-integer/numeric family {int4,int8,numeric} folds to its widest member
+// (numeric > int8 > int4), and a mix drawn from the binary-float family
+// {float4,float8} folds to float8 — each narrower result wrapped in the exact
+// implicit-cast FuncExpr (int_numeric 1740/1781, int8(int4) 481, or float8(float4)
+// 311). A cross-family mix, or a collatable common type, returns ErrUnsupported so
+// the writer degrades to SQL text (all-or-nothing).
 func resolveCaseExprWith(e *parser.CaseExpr, rec scopedResolve) (Node, uint32, error) {
 	if len(e.Whens) == 0 {
 		return nil, 0, ErrUnsupported
@@ -688,14 +709,14 @@ func resolveCaseExprWith(e *parser.CaseExpr, rec scopedResolve) (Node, uint32, e
 // selectCaseCommonType models the subset of PG's select_common_type
 // (parse_coerce.c) that this canonicalizer supports for CASE results. When every
 // result already shares one type, that type is returned unchanged. A mix is
-// modeled only inside the exact-integer/numeric family: the types must all be
-// drawn from {int4,int8,numeric}, and the common type is the widest present —
-// numeric if any numeric appears, else int8 if any int8 appears, else int4. This
-// reproduces PG's preferred-type walk, where a narrower type implicitly coerces
-// to a wider one but not the reverse (none of these three is a preferred type, so
-// the walk always advances toward the wider member: int4→int8→numeric). Any type
-// outside this family (e.g. a float or a collatable type) returns false, so the
-// CASE degrades to SQL text (all-or-nothing).
+// modeled only WITHIN a single numeric family: the exact-integer/numeric family
+// {int4,int8,numeric} (common type = widest present: numeric > int8 > int4) or
+// the binary-float family {float4,float8} (common type = float8). This reproduces
+// PG's preferred-type walk, where a narrower type implicitly coerces to a wider
+// one but not the reverse (int4→int8→numeric within the exact family; float4→
+// float8 within the float family — float8 is a preferred type). A CROSS-family
+// mix (e.g. int4+float8), a collatable type, or any type outside both families
+// returns false, so the CASE degrades to SQL text (all-or-nothing).
 func selectCaseCommonType(types []uint32) (uint32, bool) {
 	if len(types) == 0 {
 		return 0, false
@@ -710,7 +731,15 @@ func selectCaseCommonType(types []uint32) (uint32, bool) {
 	if allSame {
 		return types[0], true
 	}
-	hasNumeric, hasInt8 := false, false
+	// A genuine mix is modeled only WITHIN a single family: the exact-integer/
+	// numeric family {int4,int8,numeric} or the binary-float family
+	// {float4,float8}. A cross-family mix (e.g. int4+float8) — which PG would
+	// itself fold via an implicit cast to the preferred type float8 — is
+	// deliberately left unmodeled here, so it returns false and the CASE degrades
+	// to SQL text (all-or-nothing). The two families are disjoint, so each type
+	// lands in at most one and the family flags never both stay true for a mix.
+	hasNumeric, hasInt8, allIntFam := false, false, true
+	allFloatFam := true
 	for _, t := range types {
 		switch t {
 		case OidInt4:
@@ -719,29 +748,40 @@ func selectCaseCommonType(types []uint32) (uint32, bool) {
 		case OidNumeric:
 			hasNumeric = true
 		default:
-			return 0, false
+			allIntFam = false
+		}
+		switch t {
+		case OidFloat4, OidFloat8:
+		default:
+			allFloatFam = false
 		}
 	}
 	switch {
-	case hasNumeric:
+	case allIntFam && hasNumeric:
 		return OidNumeric, true
-	case hasInt8:
+	case allIntFam && hasInt8:
 		return OidInt8, true
-	default:
+	case allIntFam:
 		// A mix drawn from {int4} only would have been all-same; this arm is
-		// unreachable for the accepted family but keeps the switch total.
+		// unreachable for the accepted int family but keeps the switch total.
 		return OidInt4, true
+	case allFloatFam:
+		// The only float members are float4/float8, so a non-all-same float mix
+		// must contain float8; the widest (float8 is a preferred type) is float8.
+		return OidFloat8, true
+	default:
+		return 0, false
 	}
 }
 
 // coerceCaseResult applies PG's coerce_to_common_type to one CASE result. It is
 // the identity when the result already has the common type; otherwise it wraps
 // the narrower result in the exact implicit-cast FuncExpr PG stores un-const-
-// folded: int4/int8 → numeric via int4_numeric (1740) / int8_numeric (1781), and
-// int4 → int8 via int8(int4) (481). No other coercion is modeled — the only
-// mismatches selectCaseCommonType can yield are these narrowing→widening cases
-// within the int/numeric family, so this stays total for the accepted subset;
-// anything else returns ErrUnsupported.
+// folded: int4/int8 → numeric via int4_numeric (1740) / int8_numeric (1781),
+// int4 → int8 via int8(int4) (481), and float4 → float8 via float8(float4) (311).
+// No other coercion is modeled — the only mismatches selectCaseCommonType can
+// yield are these narrowing→widening cases within one numeric family, so this
+// stays total for the accepted subset; anything else returns ErrUnsupported.
 func coerceCaseResult(node Node, fromType, toType uint32) (Node, error) {
 	if fromType == toType {
 		return node, nil
@@ -751,6 +791,9 @@ func coerceCaseResult(node Node, fromType, toType uint32) (Node, error) {
 	}
 	if toType == OidInt8 && fromType == OidInt4 {
 		return wrapInt4ToInt8Cast(node), nil
+	}
+	if toType == OidFloat8 && fromType == OidFloat4 {
+		return wrapFloat4ToFloat8Cast(node), nil
 	}
 	return nil, ErrUnsupported
 }

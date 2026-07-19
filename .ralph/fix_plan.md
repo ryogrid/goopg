@@ -1178,7 +1178,20 @@ existing encoder, `constcollid=100` / `consttypmod=n+4`.
       degrade test swapped its now-canonical int4+int8 case for int4+float8 (common
       float8, outside family → SQL text); added OidFloat8=701. Design 0123-0005
       §"Sub-slice 14".
-      REMAINING: cross-FAMILY CASE result coercion in the float / date-time
-      families; simple-form WHEN value needing implicit cast to operand type;
-      operator-driven view-qual coercion (unblocks int2/timestamptz literals in
-      view quals); byte-diff oracle.
+      SUB-SLICE 15 LANDED (2026-07-19): CASE **cross-FAMILY float coercion**
+      (float4+float8→float8) — the binary-float family. selectCaseCommonType
+      restructured to classify results into two disjoint families and fold only a
+      within-family mix (exact-integer/numeric {int4,int8,numeric} OR float
+      {float4,float8}→float8; float8 is a preferred type). coerceCaseResult gains
+      the float4→float8 arm via new wrapFloat4ToFloat8Cast (implicit float8(float4)
+      cast FuncExpr, funcid 311 / funcresulttype 701 / funcformat 2, from
+      pg_cast.dat castcontext 'i'), byte-identical to PG18.3 un-const-folded.
+      rebuild.go isImplicitFloat4ToFloat8Cast unwraps it (fixed point). Gate
+      case_test.go (3 live goldens from table cf: cast-on-WHEN, cast-on-ELSE,
+      multi-arm two-casts — float results produced by float4()/float8() conv funcs
+      since there is no float literal leaf); added OidFloat4=700 + float
+      caseTypeMeta. Design 0123-0005 §"Sub-slice 15".
+      REMAINING: unified cross-FAMILY (int/numeric + float → float8) CASE result
+      coercion; date-time-family CASE coercion; simple-form WHEN value needing
+      implicit cast to operand type; operator-driven view-qual coercion (unblocks
+      int2/timestamptz literals in view quals); byte-diff oracle.
