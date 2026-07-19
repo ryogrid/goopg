@@ -118,6 +118,9 @@ func resolve(e parser.Expr, expected uint32) (Node, uint32, error) {
 	case *parser.CaseExpr:
 		return resolveCaseExpr(v)
 
+	case *parser.IsDistinctFromExpr:
+		return resolveDistinctFrom(v)
+
 	case *parser.UnaryOp:
 		switch v.Op {
 		case parser.OpUnaryPos:
@@ -320,6 +323,62 @@ func resolveBinaryOp(b *parser.BinaryOp) (Node, uint32, error) {
 		return nil, 0, err
 	}
 	return buildOpExpr(lNode, lType, rNode, rType, b.Op.String())
+}
+
+// resolveDistinctFrom resolves `a IS [NOT] DISTINCT FROM b` to a DISTINCTEXPR
+// (with a NOT BoolExpr wrapper for the NOT form), mirroring PG's
+// transformAExprDistinct → make_distinct_op. It threads the scalar `resolve` so
+// operand literals type as usual.
+func resolveDistinctFrom(d *parser.IsDistinctFromExpr) (Node, uint32, error) {
+	return resolveDistinctFromWith(d, resolve)
+}
+
+// resolveDistinctFromWith resolves `a IS [NOT] DISTINCT FROM b` through the
+// injected recursion `rec` (so the query-scoped path can thread
+// queryScope.resolveExpr and let the operands be column Vars in a view qual).
+// Both operands forward-resolve with an unknown context, then buildDistinctExpr
+// looks up the `=` operator for their types and tags the node DISTINCTEXPR.
+// `IS NOT DISTINCT FROM` wraps that DistinctExpr in a NOT BoolExpr exactly as
+// transformAExprDistinct does (makeBoolExpr(NOT_EXPR, [DistinctExpr])). NULL
+// operands are NOT special-cased to a NullTest here (PG's
+// make_nulltest_from_distinct) — they degrade to SQL text; see the deferral
+// ledger.
+func resolveDistinctFromWith(d *parser.IsDistinctFromExpr, rec scopedResolve) (Node, uint32, error) {
+	lNode, lType, err := rec(d.Left, 0)
+	if err != nil {
+		return nil, 0, err
+	}
+	rNode, rType, err := rec(d.Right, 0)
+	if err != nil {
+		return nil, 0, err
+	}
+	node, _, err := buildDistinctExpr(lNode, lType, rNode, rType)
+	if err != nil {
+		return nil, 0, err
+	}
+	if d.Negated {
+		return &BoolExpr{Boolop: BoolExprNot, Args: []Node{node}, Location: -1}, OidBool, nil
+	}
+	return node, OidBool, nil
+}
+
+// buildDistinctExpr builds a DISTINCTEXPR over the `=` operator for the operand
+// types. PG's make_distinct_op calls make_op on `=` and then just
+// NodeSetTag(result, T_DistinctExpr) — the node is byte-identical to a plain
+// `a = b` OpExpr except the tag — so we reuse buildOpExpr and re-tag. make_op's
+// result must yield boolean (make_distinct_op errors otherwise), which every
+// operator this subset resolves does.
+func buildDistinctExpr(lNode Node, lType uint32, rNode Node, rType uint32) (Node, uint32, error) {
+	node, resType, err := buildOpExpr(lNode, lType, rNode, rType, "=")
+	if err != nil {
+		return nil, 0, err
+	}
+	op := node.(*OpExpr)
+	if op.Opresulttype != OidBool {
+		return nil, 0, ErrUnsupported
+	}
+	d := DistinctExpr(*op)
+	return &d, resType, nil
 }
 
 // scopedResolve is the recursion an operand is resolved through by the *With

@@ -100,6 +100,8 @@ func readNode(t *tokenizer) (Node, error) {
 		n, err = readFuncExpr(t)
 	case "OPEXPR":
 		n, err = readOpExpr(t)
+	case "DISTINCTEXPR":
+		n, err = readDistinctExpr(t)
 	case "RELABELTYPE":
 		n, err = readRelabelType(t)
 	case "COERCEVIAIO":
@@ -344,32 +346,52 @@ func readFuncExpr(t *tokenizer) (*FuncExpr, error) {
 
 func readOpExpr(t *tokenizer) (*OpExpr, error) {
 	o := &OpExpr{}
-	var err error
-	if o.Opno, err = readUint32(t); err != nil {
-		return nil, err
-	}
-	if o.Opfuncid, err = readUint32(t); err != nil {
-		return nil, err
-	}
-	if o.Opresulttype, err = readUint32(t); err != nil {
-		return nil, err
-	}
-	if o.Opretset, err = readBool(t); err != nil {
-		return nil, err
-	}
-	if o.Opcollid, err = readUint32(t); err != nil {
-		return nil, err
-	}
-	if o.Inputcollid, err = readUint32(t); err != nil {
-		return nil, err
-	}
-	if o.Args, err = readNodeListField(t); err != nil {
-		return nil, err
-	}
-	if o.Location, err = readInt32(t); err != nil {
+	if err := readOpExprFields(t, o); err != nil {
 		return nil, err
 	}
 	return o, nil
+}
+
+// readDistinctExpr mirrors _readDistinctExpr: the same field list as
+// _readOpExpr (DistinctExpr and OpExpr are the same struct in PG), read into an
+// OpExpr and re-tagged.
+func readDistinctExpr(t *tokenizer) (*DistinctExpr, error) {
+	o := &OpExpr{}
+	if err := readOpExprFields(t, o); err != nil {
+		return nil, err
+	}
+	d := DistinctExpr(*o)
+	return &d, nil
+}
+
+// readOpExprFields reads the shared OpExpr/DistinctExpr field list into o.
+func readOpExprFields(t *tokenizer, o *OpExpr) error {
+	var err error
+	if o.Opno, err = readUint32(t); err != nil {
+		return err
+	}
+	if o.Opfuncid, err = readUint32(t); err != nil {
+		return err
+	}
+	if o.Opresulttype, err = readUint32(t); err != nil {
+		return err
+	}
+	if o.Opretset, err = readBool(t); err != nil {
+		return err
+	}
+	if o.Opcollid, err = readUint32(t); err != nil {
+		return err
+	}
+	if o.Inputcollid, err = readUint32(t); err != nil {
+		return err
+	}
+	if o.Args, err = readNodeListField(t); err != nil {
+		return err
+	}
+	if o.Location, err = readInt32(t); err != nil {
+		return err
+	}
+	return nil
 }
 
 func readRelabelType(t *tokenizer) (*RelabelType, error) {

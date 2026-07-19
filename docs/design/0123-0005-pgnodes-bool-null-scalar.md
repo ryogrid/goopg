@@ -444,12 +444,71 @@ No new IR, codec, or builder code — only two dispatch arms.
   SELECT — the adversarial standby proof for the CASE query wiring.
 - full `pgnodes` package + `go vet ./internal/pgnodes/` + `go build ./...` clean.
 
+## Sub-slice 9 — canonical `DISTINCTEXPR` (`a IS [NOT] DISTINCT FROM b`) scalar node
+
+A column DEFAULT of the shape `bool DEFAULT (a IS [NOT] DISTINCT FROM b)` now
+resolves to a canonical `DISTINCTEXPR` (was SQL-text fallback). This mirrors
+PG's `transformAExprDistinct` → `make_distinct_op`
+(`src/backend/parser/parse_expr.c`): the node is a `make_op` `OpExpr` over the
+`=` operator with `NodeSetTag(result, T_DistinctExpr)`. PG relies on
+"DistinctExpr and OpExpr being same struct", so the on-disk field list is
+byte-identical to `OPEXPR` — only the type token differs. `IS NOT DISTINCT FROM`
+is that `DISTINCTEXPR` wrapped in a `NOT` `BOOLEXPR`
+(`makeBoolExpr(NOT_EXPR, [DistinctExpr])`).
+
+### IR + codec (`ir.go`, `outfuncs.go`, `readfuncs.go`)
+
+- `ir.go`: `type DistinctExpr OpExpr` — a defined type over `OpExpr`, reproducing
+  PG's same-struct relationship; `nodeTag()` returns `"DISTINCTEXPR"`.
+- `outfuncs.go`: `outOpExpr` is factored into `outOpExprFields` (the shared field
+  writer); `outDistinctExpr` writes the `DISTINCTEXPR` token then the same
+  fields via `(*OpExpr)(d)`.
+- `readfuncs.go`: symmetric factoring — `readOpExprFields` reads the shared
+  fields; `readDistinctExpr` reads into an `OpExpr` and re-tags to
+  `*DistinctExpr` (mirroring `_readDistinctExpr`, which reuses the `OpExpr`
+  field list).
+
+### Forward + reload (`resolver_expr.go`, `rebuild.go`)
+
+- `resolver_expr.go`: `*parser.IsDistinctFromExpr` → `resolveDistinctFrom`
+  (`…With` recursion-injectable so sub-slice 10 can thread
+  `queryScope.resolveExpr` for view quals over column Vars). Both operands
+  forward-resolve with an unknown context; `buildDistinctExpr` reuses
+  `buildOpExpr` for the `=` operator (so `opno`/`opfuncid`/collation are
+  byte-identical to a plain `a = b`) and re-tags. `IS NOT DISTINCT FROM` wraps
+  the result in a `NOT` `BoolExpr`.
+- `rebuild.go`: `*DistinctExpr` → `rebuildDistinctExpr` (`…With` injectable) →
+  `IsDistinctFromExpr{Negated:false}`. The `NOT` wrapper is rebuilt by the
+  existing `rebuildBoolExpr` `NOT` arm into `NOT (a IS DISTINCT FROM b)` — a
+  distinct spelling that re-resolves to the identical `NOT`-`BOOLEXPR`/
+  `DISTINCTEXPR` IR, so `resolve→Rebuild→re-resolve` is still a fixed point.
+
+### Gates (all green)
+
+- `internal/pgnodes/distinct_test.go` — five live-captured PG18.3 `adbin`
+  goldens (int `=` opno 96, the `IS NOT DISTINCT FROM` `NOT`-`BOOLEXPR` wrapper,
+  text `=` opno 98 with `inputcollid 100`, numeric `=` opno 1752, bool `=` opno
+  91), each: forward byte-for-byte (`ResolveExpr`→`Out`) + `ResolveForColumn`
+  accepts + codec round-trip (`Read`→`Out`) + resolve→`Rebuild`→re-resolve fixed
+  point.
+- `internal/executor/` default-validation + attrdef sibling tests
+  (`TestDefault*`, `TestCanonicalAttrdef*`) unchanged and green (`ok4`
+  `1 IS DISTINCT FROM 2` still a valid constant DEFAULT; `bad7` column-ref-in-
+  distinct still rejected).
+- full `pgnodes` package + `go vet ./internal/pgnodes/` + `go build ./...` clean.
+
 ## Deferred
 
 - The `CASE` **simple form** (`CASE operand WHEN …` — CaseTestExpr placeholder)
   and `select_common_type` cross-type result coercion remain in M0123-S4.
-- `IS DISTINCT FROM` and the byte-diff oracle gate remain in M0123-S4.
-  Operator-driven implicit coercion in view quals (which would let a
-  `timestamptz`/`int2`→`numeric` string literal resolve inside a view `WHERE`)
-  is also still SQL-text — only the exact scalar-column DEFAULT context folds a
-  `timestamptz`/numeric literal.
+- `DISTINCTEXPR` in the VIEW-query path (`queryScope.resolveExpr` /
+  `viewRebuildScope.rebuildExpr` wiring, mirroring sub-slice 6/8) is sub-slice
+  10 — the scalar node landed here, but a view `WHERE a IS DISTINCT FROM b`
+  still emits SQL text until wired.
+- `IS DISTINCT FROM NULL` is NOT special-cased to a `NullTest` (PG's
+  `make_nulltest_from_distinct` rewrites `x IS DISTINCT FROM NULL` →
+  `x IS NOT NULL`); a NULL operand degrades to SQL text. See the deferral ledger.
+- The byte-diff oracle gate remains in M0123-S4. Operator-driven implicit
+  coercion in view quals (which would let a `timestamptz`/`int2`→`numeric`
+  string literal resolve inside a view `WHERE`) is also still SQL-text — only
+  the exact scalar-column DEFAULT context folds a `timestamptz`/numeric literal.

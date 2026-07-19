@@ -29,6 +29,8 @@ func Rebuild(n Node) (parser.Expr, error) {
 		return rebuildConst(v)
 	case *OpExpr:
 		return rebuildOpExpr(v)
+	case *DistinctExpr:
+		return rebuildDistinctExpr(v)
 	case *FuncExpr:
 		return rebuildFuncExpr(v)
 	case *BoolExpr:
@@ -312,6 +314,33 @@ func rebuildOpExprWith(o *OpExpr, rec func(Node) (parser.Expr, error)) (parser.E
 		return nil, err
 	}
 	return &parser.BinaryOp{Op: op, Left: left, Right: right}, nil
+}
+
+// rebuildDistinctExpr reconstructs `a IS DISTINCT FROM b`. The NOT form
+// (`IS NOT DISTINCT FROM`) is a NOT BoolExpr wrapping a DistinctExpr, so it is
+// rebuilt by rebuildBoolExpr's NOT arm into `NOT (a IS DISTINCT FROM b)` — a
+// distinct spelling that re-resolves to the identical BOOLEXPR/DISTINCTEXPR IR,
+// so resolve→Rebuild→re-resolve is still a fixed point.
+func rebuildDistinctExpr(d *DistinctExpr) (parser.Expr, error) {
+	return rebuildDistinctExprWith(d, Rebuild)
+}
+
+// rebuildDistinctExprWith rebuilds a DISTINCTEXPR through the injected recursion
+// `rec` (so operands may be column Vars in the view-reload path). The two args
+// rebuild to the left/right of a non-negated IsDistinctFromExpr.
+func rebuildDistinctExprWith(d *DistinctExpr, rec func(Node) (parser.Expr, error)) (parser.Expr, error) {
+	if len(d.Args) != 2 {
+		return nil, fmt.Errorf("pgnodes: Rebuild: DistinctExpr with %d args (want 2)", len(d.Args))
+	}
+	left, err := rec(d.Args[0])
+	if err != nil {
+		return nil, err
+	}
+	right, err := rec(d.Args[1])
+	if err != nil {
+		return nil, err
+	}
+	return &parser.IsDistinctFromExpr{Left: left, Right: right, Negated: false}, nil
 }
 
 // int64FromByvalWord decodes the little-endian 8-byte Datum word (see

@@ -31,6 +31,8 @@ func outNode(sb *strings.Builder, n Node) {
 		outFuncExpr(sb, v)
 	case *OpExpr:
 		outOpExpr(sb, v)
+	case *DistinctExpr:
+		outDistinctExpr(sb, v)
 	case *RelabelType:
 		outRelabelType(sb, v)
 	case *CoerceViaIO:
@@ -196,6 +198,21 @@ func outFuncExpr(sb *strings.Builder, f *FuncExpr) {
 // opcollid, inputcollid, args, location.
 func outOpExpr(sb *strings.Builder, o *OpExpr) {
 	sb.WriteString("OPEXPR")
+	outOpExprFields(sb, o)
+}
+
+// outDistinctExpr mirrors _outDistinctExpr: identical field list to _outOpExpr
+// (DistinctExpr and OpExpr are the same struct in PG), only the type token
+// differs.
+func outDistinctExpr(sb *strings.Builder, d *DistinctExpr) {
+	sb.WriteString("DISTINCTEXPR")
+	outOpExprFields(sb, (*OpExpr)(d))
+}
+
+// outOpExprFields writes the shared OpExpr/DistinctExpr field list (everything
+// after the type token): opno, opfuncid, opresulttype, opretset, opcollid,
+// inputcollid, args, location.
+func outOpExprFields(sb *strings.Builder, o *OpExpr) {
 	wOid(sb, "opno", o.Opno)
 	wOid(sb, "opfuncid", o.Opfuncid)
 	wOid(sb, "opresulttype", o.Opresulttype)

@@ -74,6 +74,19 @@ type OpExpr struct {
 
 func (*OpExpr) nodeTag() string { return "OPEXPR" }
 
+// DistinctExpr mirrors _outDistinctExpr in outfuncs.funcs.c. PG relies on
+// "DistinctExpr and OpExpr being same struct" (make_distinct_op just
+// NodeSetTag(result, T_DistinctExpr) on a make_op OpExpr), so the field list —
+// and hence the codec — is byte-identical to OpExpr; only the WRITE_NODE_TYPE
+// token differs ("DISTINCTEXPR"). We reproduce that relationship with a defined
+// type over OpExpr. `a IS DISTINCT FROM b` resolves the `=` operator for the
+// operand types (opresulttype must be bool) and tags the node DISTINCTEXPR;
+// `a IS NOT DISTINCT FROM b` is that DistinctExpr wrapped in a NOT BoolExpr
+// (transformAExprDistinct: makeBoolExpr(NOT_EXPR, [DistinctExpr])).
+type DistinctExpr OpExpr
+
+func (*DistinctExpr) nodeTag() string { return "DISTINCTEXPR" }
+
 // RelabelType mirrors _outRelabelType in outfuncs.funcs.c. It is a
 // binary-compatible type coercion (e.g. int4 literal -> oid).
 type RelabelType struct {
