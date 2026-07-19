@@ -1049,6 +1049,77 @@ etc. A float **source** arm is reachable only through a nested `(x::float8)::int
 - full `pgnodes` package + `go vet` + gofmt clean; `TestE2E_FailoverGoopgToPG` +
   initdb/executor attrdef siblings green; pgbench smoke via pre-commit.
 
+## Sub-slice 22 — explicit typmod-qualified numeric cast `::numeric(p,s)`
+
+Sub-slices 19–21 modeled the *typmod-less* explicit `::type` casts. This slice adds
+the first **length-coercion** cast: `expr::numeric(p[,s])`. PG's
+`coerce_to_target_type` (parse_coerce.c) resolves this in two stages — `coerce_type`
+coerces the operand to bare `numeric`, then `coerce_type_typmod` applies a length
+coercion `numeric(numeric, int4)` (`funcid` **1703**) whose second argument is an
+`int4` `Const` holding the packed `atttypmod`. The stored `adbin` (captured LIVE
+from PG18.3) is:
+
+```
+FuncExpr 1703  (funcformat 1, EXPLICIT)
+  ├─ arg0: operand→numeric — int operand wraps in int4_numeric/int8_numeric
+  │        (1740/1781, funcformat 2 IMPLICIT); a decimal operand is a bare numeric Const
+  └─ arg1: Const int4 = numerictypmodin(p,s) = ((p<<16)|(s&0x7ff)) + VARHDRSZ(4)
+```
+
+`numeric(10,2)` → 655366 `[6 0 10 0]`; `numeric(10,0)`/`numeric(10)` → 655364
+`[4 0 10 0]` (scale defaults to 0). `numeric(10)` and `numeric(10,0)` pack to the
+**same** typmod, so rebuild always emits the 2-element `[p,s]` form — a fixed point
+either way.
+
+### The RelabelType / column-typmod subtlety (why the writer now threads typmod)
+
+This bare-1703 shape is what PG stores **only when the column's own typmod equals
+the cast's** (e.g. `col numeric(10,2) DEFAULT (5::numeric(10,2))`). When the column
+is bare `numeric` (typmod −1), PG wraps the whole coercion in a `RelabelType` that
+re-labels the result back to the column's typmod — a node this slice does **not**
+model. `ResolveForColumn` only knew the column's *type OID*, not its typmod, so it
+could not tell the two apart. The fix adds `ResolveForColumnTypmod(e, targetType,
+targetTypmod)` (old signature delegates with typmod −1); a top-level 1703 length
+coercion whose embedded typmod ≠ `targetTypmod` degrades to SQL text. The executor
+writer (`sys_pg_attrdef.go`) derives the column typmod via
+`pgnodes.NumericColumnTypmod(col.Type.Args)` — so a matching `numeric(p,s)` column
+emits canonical bytes and a bare `numeric` column degrades. Nested/intermediate
+typmod casts (`(5::numeric(10,2))::int4`) are unaffected: only the **top** node is
+column-coerced, so the check inspects only the top node.
+
+### Changes
+
+- `resolver_expr.go`: `resolveCastExpr` routes a typmod-qualified `numeric` target to
+  new `resolveNumericTypmodCast`, which coerces the operand to `numeric` (via
+  `wrapIntToNumericCast`, funcformat 2) and wraps it in the 1703 length coercion
+  (funcformat 1). `numericTypmodValue` reproduces `numerictypmodin`. New
+  `ResolveForColumnTypmod` + `NumericColumnTypmod`.
+- `rebuild.go`: `numericCastPackedTypmod` recognizes the 1703/funcformat-1 node and
+  returns its packed typmod (used by the writer gate); `numericTypmodCastPS` decodes
+  it back to `(p,s)`; `rebuildFuncExprWith` rebuilds it to a `CastExpr{Type:numeric,
+  Typmods:[p,s]}` (fixed point, placed before `explicitCastTypeName`).
+- `sys_pg_attrdef.go`: writer threads `col.Type.Args`→typmod into
+  `ResolveForColumnTypmod`.
+
+Sources other than `int4`/`int8`/`numeric` (int2, the binary floats) reach `numeric`
+via a different helper set (`int2_numeric`=1782, `float*_numeric`=1742/1743) not
+wired here and degrade; a scale outside `0 ≤ s ≤ p` also degrades (conservative
+subset of `numerictypmodin`'s range).
+
+### Gates (all green)
+
+- `internal/pgnodes/cast_test.go` — 3 new live-captured PG18.3 goldens
+  (`5::numeric(10,2)`, `5.5::numeric(10,2)`, `5::numeric(10,0)`) through the golden +
+  codec + rebuild fixed-point loops; the golden struct gains a `colTypmod` field and
+  the acceptance check uses `ResolveForColumnTypmod`. The degradation matrix reframes
+  the old `typmod_qualified` case as `typmod_cast_bare_numeric_col` (bare-numeric
+  column → RelabelType, not modeled).
+- `internal/testport/oracle_pgnodes_adbin_test.go` — 3 cases added to the live oracle
+  with `numeric(p,s)` columns (**52 cases total**, all byte-identical vs PG18.3,
+  ≈1.57s); a `numericColSQLTypmod` helper mirrors the writer's typmod derivation.
+- full `pgnodes` package + `go vet` + gofmt clean; initdb reload + executor attrdef
+  siblings green; pgbench smoke via pre-commit.
+
 ## Byte-diff oracle gate (adbin) — `internal/testport/oracle_pgnodes_adbin_test.go`
 
 The per-datum golden tests above each hard-code a `want` `adbin` string a
@@ -1143,3 +1214,12 @@ gating and ≈ 1.3 s wall time as the `adbin` oracle.
   `timestamptz`/`int2`→`numeric` string literal resolve inside a view `WHERE`)
   is also still SQL-text — only the exact scalar-column DEFAULT context folds a
   `timestamptz`/numeric literal.
+- **`::numeric(p,s)` on a typmod-mismatched column** (sub-slice 22): only a column
+  whose typmod *equals* the cast's emits the canonical bare-1703 form. A bare
+  `numeric` column (typmod −1) — or any mismatched `numeric(p',s')` — degrades,
+  because PG wraps the length coercion in a `RelabelType` re-labeling to the column
+  typmod (`postgres/src/backend/parser/parse_coerce.c:coerce_type_typmod` →
+  `coerce_to_target_type`'s trailing `RelabelType`), a node not yet in the IR. Also
+  still deferred: typmod-qualified casts to the **other** length types (`varchar(N)`
+  = `CoerceViaIO`, `timestamp(N)`, `bit(N)`), and non-int/numeric sources into
+  `numeric(p,s)` (`int2`, the binary floats).

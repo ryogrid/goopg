@@ -34,12 +34,36 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/pgnodes"
 	"github.com/goopg/goopg/internal/testutil/pgcluster"
 )
+
+// numericColSQLTypmod packs the length qualifier of a "numeric(p[,s])" column SQL
+// type into PG's atttypmod for ResolveForColumnTypmod, mirroring what the executor
+// writer derives from catalog.Type.Args. Any non-numeric or unqualified column type
+// returns -1 (no length qualifier), matching the writer's bare-column path.
+func numericColSQLTypmod(colSQL string) int32 {
+	s := strings.TrimSpace(colSQL)
+	if !strings.HasPrefix(s, "numeric(") || !strings.HasSuffix(s, ")") {
+		return -1
+	}
+	inner := s[len("numeric(") : len(s)-1]
+	parts := strings.Split(inner, ",")
+	args := make([]int64, 0, len(parts))
+	for _, p := range parts {
+		n, err := strconv.ParseInt(strings.TrimSpace(p), 10, 64)
+		if err != nil {
+			return -1
+		}
+		args = append(args, n)
+	}
+	return pgnodes.NumericColumnTypmod(args)
+}
 
 // oracleLocationRe matches every `:location <N>` token (N may be negative). PG18
 // writes catalog pg_node_tree with location fields already normalized to -1
@@ -59,7 +83,7 @@ func normalizeOracleLocations(s string) string {
 // lines up with what PG18 records in pg_attrdef.adbin.
 type adbinOracleCase struct {
 	name   string
-	colSQL string // SQL column type, e.g. "int", "numeric", "timestamptz"
+	colSQL string // SQL column type, e.g. "int", "numeric", "numeric(10,2)"
 	colOid uint32 // matching pgnodes OID for ResolveForColumn
 	def    string // DEFAULT expression text (parsed by BOTH PG and goopg)
 }
@@ -154,6 +178,17 @@ var adbinOracleCases = []adbinOracleCase{
 	{"cast_numeric_to_float4", "float4", pgnodes.OidFloat4, "5.5::float4"},
 	{"cast_numeric_to_float8", "float8", pgnodes.OidFloat8, "5.5::float8"},
 	{"cast_nested_float8_to_int4", "int", pgnodes.OidInt4, "(5.5::float8)::int4"},
+	// Explicit typmod-qualified numeric cast `::numeric(p,s)` (sub-slice 22): PG's
+	// coerce_to_target_type follows the base int→numeric cast with a length coercion
+	// numeric(numeric,int4)=1703 (funcformat 1) carrying an int4 typmod Const =
+	// ((p<<16)|s)+VARHDRSZ. The COLUMN typmod MUST match the cast (colSQL declares
+	// numeric(p,s)) so PG stores the bare 1703 form with no RelabelType wrapper —
+	// numericColSQLTypmod(colSQL) feeds ResolveForColumnTypmod the same typmod. An
+	// integer operand wraps in int4_numeric (1740, funcformat 2); a decimal operand
+	// is already a numeric Const.
+	{"cast_int_to_numeric_10_2", "numeric(10,2)", pgnodes.OidNumeric, "5::numeric(10,2)"},
+	{"cast_numeric_to_numeric_10_2", "numeric(10,2)", pgnodes.OidNumeric, "5.5::numeric(10,2)"},
+	{"cast_int_to_numeric_10_0", "numeric(10,0)", pgnodes.OidNumeric, "5::numeric(10,0)"},
 }
 
 // TestOraclePgnodesAdbinBytesMatchPG is the M0123-S4 byte-diff oracle: for each
@@ -201,7 +236,7 @@ func TestOraclePgnodesAdbinBytesMatchPG(t *testing.T) {
 			if err != nil {
 				t.Fatalf("goopg parser.ParseExpr(%q): %v", tc.def, err)
 			}
-			node, ok := pgnodes.ResolveForColumn(expr, tc.colOid)
+			node, ok := pgnodes.ResolveForColumnTypmod(expr, tc.colOid, numericColSQLTypmod(tc.colSQL))
 			if !ok {
 				t.Fatalf("goopg ResolveForColumn(%q, oid=%d) degraded to SQL text, but PG18 stored a canonical adbin:\n  PG18: %s",
 					tc.def, tc.colOid, want)

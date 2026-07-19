@@ -68,11 +68,43 @@ func ResolveExpr(e parser.Expr, targetType uint32) (Node, error) {
 // text (all-or-nothing; 02e §3). This keeps SupportsExpr's already-tested
 // semantics unchanged for the resolver's own round-trip gate.
 func ResolveForColumn(e parser.Expr, targetType uint32) (Node, bool) {
+	return ResolveForColumnTypmod(e, targetType, -1)
+}
+
+// ResolveForColumnTypmod is ResolveForColumn with the column's packed typmod. It
+// exists because a top-level `::numeric(p,s)` length coercion (funcid 1703) is
+// byte-identical to PG's stored adbin ONLY when the column's own typmod equals the
+// cast's: PG's build_column_default coerces the stored default to the attribute's
+// (type, typmod), and when the cast typmod differs from the column typmod (the
+// common case being a bare `numeric` column, typmod -1) PG wraps the coercion in a
+// RelabelType that re-labels to the column typmod — a node this slice does not
+// model. So a top-level numeric length coercion whose embedded typmod ≠ targetTypmod
+// degrades to SQL text (all-or-nothing; 02e §3). targetTypmod is -1 for a column with
+// no length qualifier (every non-numeric-typmod caller via ResolveForColumn), which
+// naturally rejects a `::numeric(p,s)` default on a bare `numeric` column.
+func ResolveForColumnTypmod(e parser.Expr, targetType uint32, targetTypmod int32) (Node, bool) {
 	n, typ, err := resolve(e, targetType)
 	if err != nil || typ != targetType {
 		return nil, false
 	}
+	if f, ok := n.(*FuncExpr); ok {
+		if castTypmod, isNumericLenCoerce := numericCastPackedTypmod(f); isNumericLenCoerce && castTypmod != targetTypmod {
+			return nil, false
+		}
+	}
 	return n, true
+}
+
+// NumericColumnTypmod packs a numeric column's (precision[, scale]) type arguments
+// into PG's atttypmod, or returns -1 when the column carries no valid numeric
+// length qualifier (bare `numeric`, or arguments outside numerictypmodin's range).
+// The writer passes this to ResolveForColumnTypmod so a `::numeric(p,s)` DEFAULT is
+// emitted canonically only for a matching numeric(p,s) column.
+func NumericColumnTypmod(args []int64) int32 {
+	if tm, ok := numericTypmodValue(args); ok {
+		return tm
+	}
+	return -1
 }
 
 // resolve returns the IR node AND its result type OID (needed to forward-resolve
@@ -207,13 +239,21 @@ func resolveFuncCall(f *parser.FuncCall) (Node, uint32, error) {
 // literal never types directly as float — a float source only arises via a nested
 // `(x::floatT)::T`) before the cast is applied.
 func resolveCastExpr(v *parser.CastExpr) (Node, uint32, error) {
-	if len(v.Typmods) != 0 {
-		return nil, 0, ErrUnsupported
-	}
 	if v.Type.Schema != "" && v.Type.Schema != "pg_catalog" {
 		return nil, 0, ErrUnsupported
 	}
 	targetOID := catalog.TypeNameToOID(v.Type.Name)
+	if len(v.Typmods) != 0 {
+		// Only a typmod-qualified numeric target (`::numeric(p[,s])`) is modeled:
+		// PG's coerce_to_target_type follows the base int→numeric cast with a
+		// length coercion numeric(numeric, int4). Every other typmod'd target
+		// (varchar(N), timestamp(N), …) uses a different coercion node (CoerceViaIO
+		// / a length-cast func with a different OID) and degrades to SQL text.
+		if targetOID != OidNumeric {
+			return nil, 0, ErrUnsupported
+		}
+		return resolveNumericTypmodCast(v)
+	}
 	if !isNumericFamilyType(targetOID) {
 		return nil, 0, ErrUnsupported // only int2/int4/int8/numeric casts modeled here
 	}
@@ -241,6 +281,82 @@ func resolveCastExpr(v *parser.CastExpr) (Node, uint32, error) {
 		Args:           []Node{arg},
 		Location:       -1,
 	}, resultType, nil
+}
+
+// resolveNumericTypmodCast resolves an explicit `expr::numeric(p[,s])` cast — a
+// numeric target carrying a length typmod (sub-slice 22). PG's
+// coerce_to_target_type first coerces the operand to bare numeric (coerce_type),
+// then applies a length coercion numeric(numeric, int4) = funcid 1703 whose second
+// argument is an int4 Const holding the packed typmod. The result:
+//
+//	FuncExpr 1703 (funcformat 1, EXPLICIT)
+//	  ├─ arg0: operand coerced to numeric — an integer operand wraps in
+//	  │        int4_numeric/int8_numeric (funcformat 2, IMPLICIT, via
+//	  │        wrapIntToNumericCast); a numeric operand passes through unchanged
+//	  └─ arg1: Const int4 = numerictypmodin(p,s)
+//
+// This is the byte shape PG stores when the DEFAULT's column typmod MATCHES the
+// cast typmod (e.g. col numeric(10,2) DEFAULT (5::numeric(10,2))). When the column
+// is bare `numeric` (typmod -1), PG wraps the whole thing in a RelabelType that
+// strips the typmod back to the column's — that RelabelType node is not modeled
+// here (ResolveForColumn sees only the column's type OID, not its typmod), so a
+// typmod-mismatched column degrades to SQL text (all-or-nothing; 02e §3). Sources
+// other than int4/int8/numeric (int2, the binary floats) reach numeric through a
+// different helper set (int2_numeric=1782, float4_numeric=1742, float8_numeric=1743)
+// not wired here and also degrade.
+func resolveNumericTypmodCast(v *parser.CastExpr) (Node, uint32, error) {
+	typmod, ok := numericTypmodValue(v.Typmods)
+	if !ok {
+		return nil, 0, ErrUnsupported
+	}
+	arg, srcType, err := resolve(v.Operand, 0)
+	if err != nil {
+		return nil, 0, err
+	}
+	var numericArg Node
+	switch srcType {
+	case OidNumeric:
+		numericArg = arg // already numeric — coerce_type is a no-op
+	case OidInt4, OidInt8:
+		numericArg = wrapIntToNumericCast(arg, srcType) // implicit int→numeric (funcformat 2)
+	default:
+		return nil, 0, ErrUnsupported
+	}
+	return &FuncExpr{
+		Funcid:         1703, // numeric(numeric, int4) length coercion
+		Funcresulttype: OidNumeric,
+		Funcretset:     false,
+		Funcvariadic:   false,
+		Funcformat:     1, // COERCE_EXPLICIT_CAST
+		Funccollid:     0,
+		Inputcollid:    0,
+		Args:           []Node{numericArg, NewInt4Const(typmod)},
+		Location:       -1,
+	}, OidNumeric, nil
+}
+
+// numericTypmodValue reproduces PG's numerictypmodin (numeric.c): for numeric(p)
+// scale defaults to 0, and the packed typmod is ((p << 16) | (s & 0x7ff)) +
+// VARHDRSZ, where VARHDRSZ = 4. Precision must be 1..NUMERIC_MAX_PRECISION (1000).
+// This slice accepts only the common 0 <= scale <= precision subset — a strict
+// subset of PG's valid range (PG18 also permits negative and over-precision scale),
+// so anything accepted here yields the identical typmod PG would compute; a scale
+// outside the subset degrades (conservative all-or-nothing). Returns false for an
+// arity numerictypmodin itself rejects (0 or >2 components).
+func numericTypmodValue(typmods []int64) (int32, bool) {
+	var prec, scale int64
+	switch len(typmods) {
+	case 1:
+		prec, scale = typmods[0], 0
+	case 2:
+		prec, scale = typmods[0], typmods[1]
+	default:
+		return 0, false
+	}
+	if prec < 1 || prec > 1000 || scale < 0 || scale > prec {
+		return 0, false
+	}
+	return int32(((prec << 16) | (scale & 0x7ff)) + 4), true
 }
 
 // isNumericFamilyType reports whether oid is one of the numeric-family types this

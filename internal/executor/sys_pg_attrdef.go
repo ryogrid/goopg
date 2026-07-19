@@ -40,7 +40,13 @@ func canonicalAttrdefText(col catalog.Column) string {
 		return ""
 	}
 	targetOID := catalog.TypeNameToOID(col.Type.Name)
-	if node, ok := pgnodes.ResolveForColumn(col.DefaultExpr, targetOID); ok {
+	// Thread the column's numeric typmod so a `::numeric(p,s)` DEFAULT emits
+	// canonical bytes only when the column typmod matches the cast's (else PG wraps
+	// the coercion in a RelabelType this slice doesn't model; ResolveForColumnTypmod
+	// degrades). NumericColumnTypmod yields -1 for a bare/non-numeric column, which
+	// correctly rejects a typmod cast there.
+	targetTypmod := pgnodes.NumericColumnTypmod(col.Type.Args)
+	if node, ok := pgnodes.ResolveForColumnTypmod(col.DefaultExpr, targetOID, targetTypmod); ok {
 		return pgnodes.Out(node)
 	}
 	return catalog.FormatExprForAttrdef(col.DefaultExpr)

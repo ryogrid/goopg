@@ -243,6 +243,23 @@ func rebuildFuncExprWith(f *FuncExpr, rec func(Node) (parser.Expr, error)) (pars
 		isImplicitFloat4ToFloat8Cast(f) || isImplicitToFloat8Cast(f) {
 		return rec(f.Args[0])
 	}
+	// An EXPLICIT `::numeric(p,s)` length coercion (numeric(numeric,int4) = funcid
+	// 1703, funcformat 1) rebuilds to a typmod-qualified CastExpr. Args[0] is the
+	// operand coerced to numeric (its own implicit int→numeric wrap, if any, unwraps
+	// via rec); Args[1] is the int4 typmod Const, decoded back to (p,s). Re-resolving
+	// `inner::numeric(p,s)` re-emits the identical FuncExpr (fixed point). Placed
+	// before explicitCastTypeName because 1703 is not in that single-arg table.
+	if p, s, ok := numericTypmodCastPS(f); ok {
+		inner, err := rec(f.Args[0])
+		if err != nil {
+			return nil, err
+		}
+		return &parser.CastExpr{
+			Operand: inner,
+			Type:    parser.ObjectName{Name: "numeric"},
+			Typmods: []int64{p, s},
+		}, nil
+	}
 	// An EXPLICIT numeric-family cast (funcformat 1) keeps its `::type` node in
 	// adbin, so — unlike the implicit casts above — it rebuilds to a CastExpr, not
 	// the bare argument. Re-resolving `inner::type` re-emits the identical
@@ -269,6 +286,38 @@ func rebuildFuncExprWith(f *FuncExpr, rec func(Node) (parser.Expr, error)) (pars
 		args = append(args, arg)
 	}
 	return &parser.FuncCall{Name: parser.ObjectName{Name: name}, Args: args}, nil
+}
+
+// numericCastPackedTypmod reports whether f is the explicit `::numeric(p,s)` length
+// coercion the forward path emits (resolveNumericTypmodCast) — numeric(numeric,
+// int4) = funcid 1703, funcformat 1 (EXPLICIT), a numeric result, and exactly two
+// args whose second is a non-null int4 typmod Const — and returns that Const's
+// packed atttypmod. ResolveForColumnTypmod uses it to gate on a column-typmod match.
+func numericCastPackedTypmod(f *FuncExpr) (int32, bool) {
+	if f.Funcid != 1703 || f.Funcformat != 1 || f.Funcresulttype != OidNumeric || len(f.Args) != 2 {
+		return 0, false
+	}
+	tc, isConst := f.Args[1].(*Const)
+	if !isConst || tc.ConstType != OidInt4 || tc.ConstIsNull || len(tc.Datum) < 8 {
+		return 0, false
+	}
+	return int32(int64FromByvalWord(tc.Datum)), true
+}
+
+// numericTypmodCastPS decodes a `::numeric(p,s)` cast's precision and scale by
+// inverting numerictypmodin: t = typmod - VARHDRSZ(4), p = t >> 16, s = t & 0x7ff.
+// Returns false for any FuncExpr numericCastPackedTypmod rejects, or a typmod below
+// VARHDRSZ (never emitted by the forward path).
+func numericTypmodCastPS(f *FuncExpr) (p, s int64, ok bool) {
+	packed, isCast := numericCastPackedTypmod(f)
+	if !isCast {
+		return 0, 0, false
+	}
+	t := int64(packed) - 4
+	if t < 0 {
+		return 0, 0, false
+	}
+	return t >> 16, t & 0x7ff, true
 }
 
 // isImplicitIntToNumericCast reports whether f is the exact FuncExpr the forward

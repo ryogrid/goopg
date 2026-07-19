@@ -21,10 +21,11 @@ package pgnodes
 import "testing"
 
 var castGolden = []struct {
-	name    string
-	sql     string
-	colType uint32
-	want    string
+	name      string
+	sql       string
+	colType   uint32
+	colTypmod int32 // packed atttypmod for a typmod-qualified column (0 = none)
+	want      string
 }{
 	// int4 source (a literal that fits int4) → wider/narrower integer target.
 	{
@@ -198,6 +199,38 @@ var castGolden = []struct {
 		colType: OidInt4,
 		want:    `{FUNCEXPR :funcid 317 :funcresulttype 23 :funcretset false :funcvariadic false :funcformat 1 :funccollid 0 :inputcollid 0 :args ({FUNCEXPR :funcid 1746 :funcresulttype 701 :funcretset false :funcvariadic false :funcformat 1 :funccollid 0 :inputcollid 0 :args ({CONST :consttype 1700 :consttypmod -1 :constcollid 0 :constlen -1 :constbyval false :constisnull false :location -1 :constvalue 10 [ 40 0 0 0 -128 -128 5 0 -120 19 ]}) :location -1}) :location -1}`,
 	},
+
+	// M0123-S4 sub-slice 22 — explicit typmod-qualified numeric cast `::numeric(p,s)`.
+	// PG's coerce_to_target_type follows the base int→numeric cast with a length
+	// coercion numeric(numeric, int4) = funcid 1703 (funcformat 1, EXPLICIT) whose
+	// second arg is an int4 Const holding numerictypmodin(p,s) = ((p<<16)|s)+VARHDRSZ(4)
+	// — numeric(10,2)=655366 [6 0 10 0], numeric(10,0)=655364 [4 0 10 0]. arg0 is the
+	// operand coerced to numeric: an integer operand wraps in int4_numeric (1740,
+	// funcformat 2, IMPLICIT); a decimal operand is already a numeric Const. This is
+	// the byte shape ONLY when the column typmod matches the cast (colTypmod set); a
+	// bare-numeric column wraps the coercion in a RelabelType not modeled here.
+	{
+		name:      "explicit_int4_to_numeric_10_2",
+		sql:       "5::numeric(10,2)",
+		colType:   OidNumeric,
+		colTypmod: 655366,
+		want:      `{FUNCEXPR :funcid 1703 :funcresulttype 1700 :funcretset false :funcvariadic false :funcformat 1 :funccollid 0 :inputcollid 0 :args ({FUNCEXPR :funcid 1740 :funcresulttype 1700 :funcretset false :funcvariadic false :funcformat 2 :funccollid 0 :inputcollid 0 :args ({CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 5 0 0 0 0 0 0 0 ]}) :location -1} {CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 6 0 10 0 0 0 0 0 ]}) :location -1}`,
+	},
+	{
+		name:      "explicit_numeric_to_numeric_10_2",
+		sql:       "5.5::numeric(10,2)",
+		colType:   OidNumeric,
+		colTypmod: 655366,
+		want:      `{FUNCEXPR :funcid 1703 :funcresulttype 1700 :funcretset false :funcvariadic false :funcformat 1 :funccollid 0 :inputcollid 0 :args ({CONST :consttype 1700 :consttypmod -1 :constcollid 0 :constlen -1 :constbyval false :constisnull false :location -1 :constvalue 10 [ 40 0 0 0 -128 -128 5 0 -120 19 ]} {CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 6 0 10 0 0 0 0 0 ]}) :location -1}`,
+	},
+	// scale defaults to 0 for numeric(p): numeric(10,0)=655364 [4 0 10 0].
+	{
+		name:      "explicit_int4_to_numeric_10_0",
+		sql:       "5::numeric(10,0)",
+		colType:   OidNumeric,
+		colTypmod: 655364,
+		want:      `{FUNCEXPR :funcid 1703 :funcresulttype 1700 :funcretset false :funcvariadic false :funcformat 1 :funccollid 0 :inputcollid 0 :args ({FUNCEXPR :funcid 1740 :funcresulttype 1700 :funcretset false :funcvariadic false :funcformat 2 :funccollid 0 :inputcollid 0 :args ({CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 5 0 0 0 0 0 0 0 ]}) :location -1} {CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 4 0 10 0 0 0 0 0 ]}) :location -1}`,
+	},
 }
 
 // TestCastResolveMatchesGolden parses each SQL default and asserts ResolveExpr →
@@ -213,8 +246,8 @@ func TestCastResolveMatchesGolden(t *testing.T) {
 			if got := Out(n); got != tc.want {
 				t.Fatalf("Out mismatch for %q:\n got: %s\nwant: %s", tc.sql, got, tc.want)
 			}
-			if _, ok := ResolveForColumn(mustParse(t, tc.sql), tc.colType); !ok {
-				t.Fatalf("ResolveForColumn(%q, %d) rejected a matching-type default", tc.sql, tc.colType)
+			if _, ok := ResolveForColumnTypmod(mustParse(t, tc.sql), tc.colType, tc.colTypmod); !ok {
+				t.Fatalf("ResolveForColumnTypmod(%q, %d, %d) rejected a matching-type default", tc.sql, tc.colType, tc.colTypmod)
 			}
 		})
 	}
@@ -265,20 +298,23 @@ func TestCastResolveRebuildRoundTrip(t *testing.T) {
 
 // TestCastDegradesGracefully documents the bounded-subset boundary: only casts
 // within PG's numeric type category (int2/int4/int8/numeric/float4/float8)² are
-// modeled. A cast target outside that category (text), a source type this slice
-// does not carry a cast arm for (text→int4, text→float8), and a typmod-qualified
-// numeric target (a distinct length-coercion call) must degrade to SQL text rather
-// than emit a divergent tree.
+// modeled. A cast target outside that category (text) and a source type this slice
+// does not carry a cast arm for (text→int4, text→float8) must degrade to SQL text
+// rather than emit a divergent tree. A `::numeric(p,s)` cast targeting a BARE
+// numeric column (ResolveForColumn = typmod -1) also degrades: PG wraps the length
+// coercion in a RelabelType to the column's typmod (a node this slice does not
+// model), so only a matching numeric(p,s) column (ResolveForColumnTypmod, tested in
+// the golden set) emits it canonically.
 func TestCastDegradesGracefully(t *testing.T) {
 	cases := []struct {
 		name    string
 		sql     string
 		colType uint32
 	}{
-		{"int_to_text_target", "5::text", OidText},           // non-numeric-category target
-		{"text_literal_to_float8", "'5'::float8", OidFloat8}, // text source arm not modeled
-		{"text_literal_to_int4", "'5'::int4", OidInt4},       // text source arm not modeled
-		{"typmod_qualified", "5::numeric(10,2)", OidNumeric}, // typmod-qualified target
+		{"int_to_text_target", "5::text", OidText},                       // non-numeric-category target
+		{"text_literal_to_float8", "'5'::float8", OidFloat8},             // text source arm not modeled
+		{"text_literal_to_int4", "'5'::int4", OidInt4},                   // text source arm not modeled
+		{"typmod_cast_bare_numeric_col", "5::numeric(10,2)", OidNumeric}, // bare-numeric col → RelabelType, not modeled
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
