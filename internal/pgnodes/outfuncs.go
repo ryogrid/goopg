@@ -49,6 +49,8 @@ func outNode(sb *strings.Builder, n Node) {
 		outCaseExpr(sb, v)
 	case *CaseWhen:
 		outCaseWhen(sb, v)
+	case *CaseTestExpr:
+		outCaseTestExpr(sb, v)
 	case *Query:
 		outQuery(sb, v)
 	case *RangeTblEntry:
@@ -319,4 +321,12 @@ func outCaseWhen(sb *strings.Builder, w *CaseWhen) {
 	wNode(sb, "expr", w.Expr)
 	wNode(sb, "result", w.Result)
 	wLoc(sb, "location", w.Location)
+}
+
+// outCaseTestExpr mirrors _outCaseTestExpr: typeId, typeMod, collation.
+func outCaseTestExpr(sb *strings.Builder, c *CaseTestExpr) {
+	sb.WriteString("CASETESTEXPR")
+	wOid(sb, "typeId", c.Typeid)
+	wInt(sb, "typeMod", c.Typemod)
+	wOid(sb, "collation", c.Collation)
 }

@@ -64,6 +64,37 @@ var caseGolden = []struct {
 		colType: OidBool,
 		want:    `{CASEEXPR :casetype 16 :casecollid 0 :arg <> :args ({CASEWHEN :expr {OPEXPR :opno 97 :opfuncid 66 :opresulttype 16 :opretset false :opcollid 0 :inputcollid 0 :args ({CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 1 0 0 0 0 0 0 0 ]} {CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 2 0 0 0 0 0 0 0 ]}) :location -1} :result {CONST :consttype 16 :consttypmod -1 :constcollid 0 :constlen 1 :constbyval true :constisnull false :location -1 :constvalue 1 [ 1 0 0 0 0 0 0 0 ]} :location -1}) :defresult {CONST :consttype 16 :consttypmod -1 :constcollid 0 :constlen 1 :constbyval true :constisnull false :location -1 :constvalue 1 [ 0 0 0 0 0 0 0 0 ]} :location -1}`,
 	},
+	// Simple form (sub-slice 12): the operand becomes CaseExpr.arg (a Const here)
+	// and each `WHEN val` becomes an OpExpr `CaseTestExpr = val`. Captured live
+	// from PG18.3 (table cs):
+	//   s1 int     DEFAULT (CASE 1 WHEN 1 THEN 10 ELSE 20 END)
+	//   s2 int     DEFAULT (CASE 2 WHEN 1 THEN 10 WHEN 2 THEN 20 END)  -- no ELSE
+	//   s3 numeric DEFAULT (CASE 3 WHEN 3 THEN 1.5 ELSE 2.5 END)
+	//   s4 int     DEFAULT (CASE 5 WHEN 4 THEN 40 WHEN 5 THEN 50 ELSE 60 END)
+	{
+		name:    "simple_int_else",
+		sql:     "CASE 1 WHEN 1 THEN 10 ELSE 20 END",
+		colType: OidInt4,
+		want:    `{CASEEXPR :casetype 23 :casecollid 0 :arg {CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 1 0 0 0 0 0 0 0 ]} :args ({CASEWHEN :expr {OPEXPR :opno 96 :opfuncid 65 :opresulttype 16 :opretset false :opcollid 0 :inputcollid 0 :args ({CASETESTEXPR :typeId 23 :typeMod -1 :collation 0} {CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 1 0 0 0 0 0 0 0 ]}) :location -1} :result {CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 10 0 0 0 0 0 0 0 ]} :location -1}) :defresult {CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 20 0 0 0 0 0 0 0 ]} :location -1}`,
+	},
+	{
+		name:    "simple_int_two_when_no_else",
+		sql:     "CASE 2 WHEN 1 THEN 10 WHEN 2 THEN 20 END",
+		colType: OidInt4,
+		want:    `{CASEEXPR :casetype 23 :casecollid 0 :arg {CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 2 0 0 0 0 0 0 0 ]} :args ({CASEWHEN :expr {OPEXPR :opno 96 :opfuncid 65 :opresulttype 16 :opretset false :opcollid 0 :inputcollid 0 :args ({CASETESTEXPR :typeId 23 :typeMod -1 :collation 0} {CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 1 0 0 0 0 0 0 0 ]}) :location -1} :result {CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 10 0 0 0 0 0 0 0 ]} :location -1} {CASEWHEN :expr {OPEXPR :opno 96 :opfuncid 65 :opresulttype 16 :opretset false :opcollid 0 :inputcollid 0 :args ({CASETESTEXPR :typeId 23 :typeMod -1 :collation 0} {CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 2 0 0 0 0 0 0 0 ]}) :location -1} :result {CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 20 0 0 0 0 0 0 0 ]} :location -1}) :defresult {CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull true :location -1 :constvalue <>} :location -1}`,
+	},
+	{
+		name:    "simple_numeric_else",
+		sql:     "CASE 3 WHEN 3 THEN 1.5 ELSE 2.5 END",
+		colType: OidNumeric,
+		want:    `{CASEEXPR :casetype 1700 :casecollid 0 :arg {CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 3 0 0 0 0 0 0 0 ]} :args ({CASEWHEN :expr {OPEXPR :opno 96 :opfuncid 65 :opresulttype 16 :opretset false :opcollid 0 :inputcollid 0 :args ({CASETESTEXPR :typeId 23 :typeMod -1 :collation 0} {CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 3 0 0 0 0 0 0 0 ]}) :location -1} :result {CONST :consttype 1700 :consttypmod -1 :constcollid 0 :constlen -1 :constbyval false :constisnull false :location -1 :constvalue 10 [ 40 0 0 0 -128 -128 1 0 -120 19 ]} :location -1}) :defresult {CONST :consttype 1700 :consttypmod -1 :constcollid 0 :constlen -1 :constbyval false :constisnull false :location -1 :constvalue 10 [ 40 0 0 0 -128 -128 2 0 -120 19 ]} :location -1}`,
+	},
+	{
+		name:    "simple_int_two_when_else",
+		sql:     "CASE 5 WHEN 4 THEN 40 WHEN 5 THEN 50 ELSE 60 END",
+		colType: OidInt4,
+		want:    `{CASEEXPR :casetype 23 :casecollid 0 :arg {CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 5 0 0 0 0 0 0 0 ]} :args ({CASEWHEN :expr {OPEXPR :opno 96 :opfuncid 65 :opresulttype 16 :opretset false :opcollid 0 :inputcollid 0 :args ({CASETESTEXPR :typeId 23 :typeMod -1 :collation 0} {CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 4 0 0 0 0 0 0 0 ]}) :location -1} :result {CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 40 0 0 0 0 0 0 0 ]} :location -1} {CASEWHEN :expr {OPEXPR :opno 96 :opfuncid 65 :opresulttype 16 :opretset false :opcollid 0 :inputcollid 0 :args ({CASETESTEXPR :typeId 23 :typeMod -1 :collation 0} {CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 5 0 0 0 0 0 0 0 ]}) :location -1} :result {CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 50 0 0 0 0 0 0 0 ]} :location -1}) :defresult {CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 60 0 0 0 0 0 0 0 ]} :location -1}`,
+	},
 }
 
 // TestCaseResolveMatchesGolden parses each SQL default and asserts
@@ -131,10 +162,10 @@ func TestCaseResolveRebuildRoundTrip(t *testing.T) {
 }
 
 // TestCaseDegradesGracefully covers the bounded-subset boundaries: a
-// mixed-result-type CASE (select_common_type coercion — deferred), the simple
-// form (`CASE operand WHEN …`, a CaseTestExpr placeholder subset — deferred),
-// and a collatable result type (text — would need a non-zero casecollid). Each
-// must NOT resolve to a canonical node, so the writer keeps SQL text.
+// mixed-result-type CASE (select_common_type coercion — deferred, both in the
+// searched and simple form), and a collatable result type (text — would need a
+// non-zero casecollid). Each must NOT resolve to a canonical node, so the writer
+// keeps SQL text.
 func TestCaseDegradesGracefully(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -142,8 +173,8 @@ func TestCaseDegradesGracefully(t *testing.T) {
 		colType uint32
 	}{
 		{"mixed_int_numeric", "CASE WHEN true THEN 1 ELSE 2.5 END", OidNumeric},
-		{"simple_form", "CASE 1 WHEN 1 THEN 10 ELSE 20 END", OidInt4},
 		{"text_result", "CASE WHEN true THEN 'a' ELSE 'b' END", OidText},
+		{"simple_mixed_result", "CASE 1 WHEN 1 THEN 1 ELSE 2.5 END", OidNumeric},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

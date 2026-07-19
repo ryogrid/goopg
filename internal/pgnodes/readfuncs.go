@@ -118,6 +118,8 @@ func readNode(t *tokenizer) (Node, error) {
 		n, err = readCaseExpr(t)
 	case "CASEWHEN":
 		n, err = readCaseWhen(t)
+	case "CASETESTEXPR":
+		n, err = readCaseTestExpr(t)
 	case "QUERY":
 		n, err = readQuery(t)
 	case "RANGETBLENTRY":
@@ -546,6 +548,23 @@ func readCaseWhen(t *tokenizer) (*CaseWhen, error) {
 		return nil, err
 	}
 	return w, nil
+}
+
+// readCaseTestExpr mirrors the generated _readCaseTestExpr: typeId, typeMod,
+// collation.
+func readCaseTestExpr(t *tokenizer) (*CaseTestExpr, error) {
+	c := &CaseTestExpr{}
+	var err error
+	if c.Typeid, err = readUint32(t); err != nil {
+		return nil, err
+	}
+	if c.Typemod, err = readInt32(t); err != nil {
+		return nil, err
+	}
+	if c.Collation, err = readUint32(t); err != nil {
+		return nil, err
+	}
+	return c, nil
 }
 
 func readSQLValueFunction(t *tokenizer) (*SQLValueFunction, error) {

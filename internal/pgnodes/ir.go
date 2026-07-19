@@ -193,11 +193,13 @@ func (*BooleanTest) nodeTag() string { return "BOOLEANTEST" }
 // CaseExpr mirrors _outCaseExpr (generated outfuncs.funcs.c): casetype,
 // casecollid, arg, args, defresult, location. This is the SQL `CASE` node.
 //
-// Only the *searched* form (`CASE WHEN cond THEN result … [ELSE result] END`)
-// is modeled here, so Arg is always nil. The *simple* form (`CASE operand WHEN
-// val …`) transforms in PG into a CaseTestExpr placeholder in Arg plus an
-// `operand = val` OpExpr per WHEN — a distinct node subset left to a later
-// slice (the resolver degrades it to SQL text).
+// Both forms are modeled. The *searched* form (`CASE WHEN cond THEN result …
+// [ELSE result] END`) leaves Arg nil. The *simple* form (`CASE operand WHEN
+// val …`) sets Arg to the resolved operand and rewrites each WHEN into an
+// `operand = val` OpExpr whose left arg is a CaseTestExpr placeholder typed from
+// the operand (transformCaseExpr in parse_expr.c: it substitutes the operand for
+// every placeholder at evaluation time). The deparse inverse (ruleutils
+// get_rule_expr) recognizes that shape and prints just the RHS of each OpExpr.
 //
 // casetype is the common result type across defresult + every WHEN result
 // (select_common_type); this subset only emits canonical bytes when all of
@@ -225,3 +227,16 @@ type CaseWhen struct {
 }
 
 func (*CaseWhen) nodeTag() string { return "CASEWHEN" }
+
+// CaseTestExpr mirrors _outCaseTestExpr: typeId, typeMod, collation. It is the
+// placeholder PG substitutes the simple-form CASE operand into (parse_expr.c
+// transformCaseExpr sets typeId/typeMod/collation from exprType/exprTypmod/
+// exprCollation of the operand). It appears only as the left arg of the
+// `operand = val` OpExpr inside each simple-form CaseWhen; it never stands alone.
+type CaseTestExpr struct {
+	Typeid    uint32 // typeId    (operand type OID)
+	Typemod   int32  // typeMod   (operand typmod)
+	Collation uint32 // collation (operand collation OID)
+}
+
+func (*CaseTestExpr) nodeTag() string { return "CASETESTEXPR" }

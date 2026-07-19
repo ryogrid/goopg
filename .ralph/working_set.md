@@ -1,31 +1,39 @@
-Task: M0123-S4 sub-slice 11 — `IS [NOT] DISTINCT FROM NULL` → NullTest rewrite. COMPLETE (committing).
+Task: M0123-S4 sub-slice 12 — CASE **simple form** (`CASE operand WHEN val …`)
+→ canonical CASEEXPR with a CaseTestExpr placeholder. COMPLETE (committing).
 
-Landed: an undecorated NULL literal on either side of `IS [NOT] DISTINCT FROM`
-now resolves to a canonical NULLTEST (was SQL-text fallback), reproducing PG's
-transformAExprDistinct → make_nulltest_from_distinct (parse_expr.c). Rewrite fires
-pre-resolution; negation folded into nulltesttype (NO NOT wrapper). Both scalar
-and view-query paths inherit it (shared resolveDistinctFromWith).
-- resolver_expr.go: new helper distinctNullTestArg (bare *parser.NullConst on
-  right-then-left, mirroring exprIsNullConstant order) + special case in
-  resolveDistinctFromWith: IS DISTINCT FROM NULL→nulltesttype 1 (IS_NOT_NULL),
-  IS NOT DISTINCT FROM NULL→nulltesttype 0 (IS_NULL). NULL::type cast → ordinary
-  DISTINCTEXPR path (not a NullConst). Rebuild UNCHANGED (NullTest already
-  round-trips to `x IS [NOT] NULL`, the pg_get_viewdef fixed point).
-- view_bool_null_test.go: v11 (`client IS DISTINCT FROM NULL`, nulltesttype 1) +
-  v12 (`client IS NOT DISTINCT FROM NULL`, nulltesttype 0, no NOT wrapper), both
-  LIVE-captured from PG18.3 (fresh cluster, bench_log relid 16384). Added to
-  viewBoolNullCases (forward/round-trip/rebuild-fixed-point) + structural asserts.
+Landed: `CASE operand WHEN val THEN … END` now resolves canonically (was SQL
+text), reproducing transformCaseExpr (parse_expr.c): operand → CaseExpr.arg,
+each `WHEN val` → OpExpr `placeholder = val` whose left arg is a CaseTestExpr
+typed from the operand (typeId/typeMod/collation). Deparse inverse (ruleutils)
+shows only the OpExpr RHS.
+- NEW NODE ir.go CaseTestExpr{Typeid,Typemod,Collation} + nodeTag CASETESTEXPR;
+  outfuncs.go outCaseTestExpr (`{CASETESTEXPR :typeId N :typeMod N :collation N}`,
+  matches generated _outCaseTestExpr); readfuncs.go readCaseTestExpr + dispatch.
+- resolver_expr.go: resolveCaseExprWith handles e.Operand!=nil (Arg + testExpr);
+  operandTypmodCollid extracts typmod/collid from Var/Const operand; new
+  resolveCaseWhenCond builds each arm (searched=bool cond; simple=buildOpExpr
+  placeholder=val). buildOpExpr needs an EXACT (opType=valType) `=` operator so
+  the placeholder is never coercion-wrapped.
+- rebuild.go: rebuildCaseExprWith restores Operand for Arg!=nil; new
+  rebuildCaseWhenCond unwraps each OpExpr and rebuilds only Args[1] (WHEN value).
+- Tests: case_test.go 4 live PG18.3 scalar adbin goldens (simple_int_else,
+  _two_when_no_else, _numeric_else, _two_when_else); view_bool_null_test.go v13
+  (`CASE client WHEN 5 THEN true ELSE false END`, Var-operand) golden + structural
+  assert; degrade test now uses simple-form mixed-result.
 
-Gates (GREEN): pgnodes full pkg + verbose v11/v12 (forward/round-trip/structure),
-go build ./..., go vet ./internal/pgnodes/, gofmt clean on touched files.
-pgbench smoke via pre-commit hook (on commit).
+Gates (GREEN): full pgnodes pkg, go build ./..., go vet ./internal/pgnodes/,
+gofmt clean on touched files, executor TestCanonicalAttrdef/TestDefault,
+ralph-state-guard (auto-repaired→consistent). pgbench smoke via pre-commit hook.
 
-Key symbols: distinctNullTestArg, resolveDistinctFromWith, NullTest, IsNull/IsNotNull.
+Key symbols: CaseTestExpr, resolveCaseExprWith, resolveCaseWhenCond,
+operandTypmodCollid, rebuildCaseExprWith, rebuildCaseWhenCond, buildOpExpr.
 
-Next step (sub-slice 12): CASE **simple form** (`CASE operand WHEN …` — CaseTestExpr
-placeholder); resolveCaseExprWith currently returns ErrUnsupported for the simple
-form (resolver_expr.go). Then select_common_type cross-type result coercion, then
-the byte-diff oracle harness. All open in M0123-S4 (see design 0123-0005 Deferred).
+Next step (sub-slice 13): select_common_type CROSS-TYPE result coercion (a CASE
+whose WHEN/ELSE results differ in type — searched OR simple; defresult is "most
+significant" per transformCaseExpr). Then the byte-diff oracle harness. All open
+in M0123-S4 (design 0123-0005 §Deferred). Resume: resolver_expr.go
+resolveCaseExprWith result-type seeding loop.
 
-Gates run: pgnodes (green), go build/vet (green), gofmt (clean), ralph-state-guard (pending).
+Gates run: pgnodes (green), executor attrdef/default (green), build/vet (green),
+gofmt (clean), ralph-state-guard (repaired→consistent).
 In-flight: none.

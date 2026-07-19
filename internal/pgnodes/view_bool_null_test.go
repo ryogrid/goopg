@@ -107,6 +107,19 @@ const goldenViewV11 = `({QUERY :commandType 1 :querySource 0 :canSetTag true :ut
 //	CREATE VIEW v12 AS SELECT client, src FROM bench_log WHERE client IS NOT DISTINCT FROM NULL;
 const goldenViewV12 = `({QUERY :commandType 1 :querySource 0 :canSetTag true :utilityStmt <> :resultRelation 0 :hasAggs false :hasWindowFuncs false :hasTargetSRFs false :hasSubLinks false :hasDistinctOn false :hasRecursive false :hasModifyingCTE false :hasForUpdate false :hasRowSecurity false :hasGroupRTE false :isReturn false :cteList <> :rtable ({RANGETBLENTRY :alias <> :eref {ALIAS :aliasname bench_log :colnames ("client" "src")} :rtekind 0 :relid 16384 :inh true :relkind r :rellockmode 1 :perminfoindex 1 :tablesample <> :lateral false :inFromCl true :securityQuals <>}) :rteperminfos ({RTEPERMISSIONINFO :relid 16384 :inh true :requiredPerms 2 :checkAsUser 0 :selectedCols (b 8 9) :insertedCols (b) :updatedCols (b)}) :jointree {FROMEXPR :fromlist ({RANGETBLREF :rtindex 1}) :quals {NULLTEST :arg {VAR :varno 1 :varattno 1 :vartype 23 :vartypmod -1 :varcollid 0 :varnullingrels (b) :varlevelsup 0 :varreturningtype 0 :varnosyn 1 :varattnosyn 1 :location -1} :nulltesttype 0 :argisrow false :location -1}} :mergeActionList <> :mergeTargetRelation 0 :mergeJoinCondition <> :targetList ({TARGETENTRY :expr {VAR :varno 1 :varattno 1 :vartype 23 :vartypmod -1 :varcollid 0 :varnullingrels (b) :varlevelsup 0 :varreturningtype 0 :varnosyn 1 :varattnosyn 1 :location -1} :resno 1 :resname client :ressortgroupref 0 :resorigtbl 16384 :resorigcol 1 :resjunk false} {TARGETENTRY :expr {VAR :varno 1 :varattno 2 :vartype 25 :vartypmod -1 :varcollid 100 :varnullingrels (b) :varlevelsup 0 :varreturningtype 0 :varnosyn 1 :varattnosyn 2 :location -1} :resno 2 :resname src :ressortgroupref 0 :resorigtbl 16384 :resorigcol 2 :resjunk false}) :override 0 :onConflict <> :returningOldAlias <> :returningNewAlias <> :returningList <> :groupClause <> :groupDistinct false :groupingSets <> :havingQual <> :windowClause <> :distinctClause <> :sortClause <> :limitOffset <> :limitCount <> :limitOption 0 :rowMarks <> :setOperations <> :constraintDeps <> :withCheckOptions <> :stmt_location -1 :stmt_len -1})`
 
+// goldenViewV13 is v13's ev_action (M0123-S4 sub-slice 12): a SIMPLE-form
+// CASEEXPR whose operand is the base-relation column `client` (so :arg is a VAR,
+// not <>), one CASEWHEN whose expr is the OPEXPR `CaseTestExpr = 5`, and an
+// explicit ELSE. This is the query-scoped analogue of the scalar sub-slice-12
+// goldens and exercises the Var-operand path (CaseTestExpr typed from the Var's
+// vartypmod/varcollid) plus the deparse inverse (only the OpExpr RHS surfaces as
+// the WHEN value). Captured live from PG18.3 (relid rewritten 16394→16384 to
+// match the shared bench_log fixture):
+//
+//	CREATE VIEW v13 AS SELECT client, src FROM bench_log
+//	  WHERE CASE client WHEN 5 THEN true ELSE false END;
+const goldenViewV13 = `({QUERY :commandType 1 :querySource 0 :canSetTag true :utilityStmt <> :resultRelation 0 :hasAggs false :hasWindowFuncs false :hasTargetSRFs false :hasSubLinks false :hasDistinctOn false :hasRecursive false :hasModifyingCTE false :hasForUpdate false :hasRowSecurity false :hasGroupRTE false :isReturn false :cteList <> :rtable ({RANGETBLENTRY :alias <> :eref {ALIAS :aliasname bench_log :colnames ("client" "src")} :rtekind 0 :relid 16384 :inh true :relkind r :rellockmode 1 :perminfoindex 1 :tablesample <> :lateral false :inFromCl true :securityQuals <>}) :rteperminfos ({RTEPERMISSIONINFO :relid 16384 :inh true :requiredPerms 2 :checkAsUser 0 :selectedCols (b 8 9) :insertedCols (b) :updatedCols (b)}) :jointree {FROMEXPR :fromlist ({RANGETBLREF :rtindex 1}) :quals {CASEEXPR :casetype 16 :casecollid 0 :arg {VAR :varno 1 :varattno 1 :vartype 23 :vartypmod -1 :varcollid 0 :varnullingrels (b) :varlevelsup 0 :varreturningtype 0 :varnosyn 1 :varattnosyn 1 :location -1} :args ({CASEWHEN :expr {OPEXPR :opno 96 :opfuncid 65 :opresulttype 16 :opretset false :opcollid 0 :inputcollid 0 :args ({CASETESTEXPR :typeId 23 :typeMod -1 :collation 0} {CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 5 0 0 0 0 0 0 0 ]}) :location -1} :result {CONST :consttype 16 :consttypmod -1 :constcollid 0 :constlen 1 :constbyval true :constisnull false :location -1 :constvalue 1 [ 1 0 0 0 0 0 0 0 ]} :location -1}) :defresult {CONST :consttype 16 :consttypmod -1 :constcollid 0 :constlen 1 :constbyval true :constisnull false :location -1 :constvalue 1 [ 0 0 0 0 0 0 0 0 ]} :location -1}} :mergeActionList <> :mergeTargetRelation 0 :mergeJoinCondition <> :targetList ({TARGETENTRY :expr {VAR :varno 1 :varattno 1 :vartype 23 :vartypmod -1 :varcollid 0 :varnullingrels (b) :varlevelsup 0 :varreturningtype 0 :varnosyn 1 :varattnosyn 1 :location -1} :resno 1 :resname client :ressortgroupref 0 :resorigtbl 16384 :resorigcol 1 :resjunk false} {TARGETENTRY :expr {VAR :varno 1 :varattno 2 :vartype 25 :vartypmod -1 :varcollid 100 :varnullingrels (b) :varlevelsup 0 :varreturningtype 0 :varnosyn 1 :varattnosyn 2 :location -1} :resno 2 :resname src :ressortgroupref 0 :resorigtbl 16384 :resorigcol 2 :resjunk false}) :override 0 :onConflict <> :returningOldAlias <> :returningNewAlias <> :returningList <> :groupClause <> :groupDistinct false :groupingSets <> :havingQual <> :windowClause <> :distinctClause <> :sortClause <> :limitOffset <> :limitCount <> :limitOption 0 :rowMarks <> :setOperations <> :constraintDeps <> :withCheckOptions <> :stmt_location -1 :stmt_len -1})`
+
 var viewBoolNullCases = []struct {
 	name, sql, golden string
 }{
@@ -120,6 +133,7 @@ var viewBoolNullCases = []struct {
 	{"v10_distinctexpr_not", "SELECT client, src FROM bench_log WHERE client IS NOT DISTINCT FROM 5", goldenViewV10},
 	{"v11_distinct_from_null", "SELECT client, src FROM bench_log WHERE client IS DISTINCT FROM NULL", goldenViewV11},
 	{"v12_not_distinct_from_null", "SELECT client, src FROM bench_log WHERE client IS NOT DISTINCT FROM NULL", goldenViewV12},
+	{"v13_simple_case_var_operand", "SELECT client, src FROM bench_log WHERE CASE client WHEN 5 THEN true ELSE false END", goldenViewV13},
 }
 
 // TestResolveViewQueryBoolNull is the forward gate: a multi-condition view qual
@@ -363,5 +377,40 @@ func TestViewQueryBoolNullStructure(t *testing.T) {
 	}
 	if isn, ok := sel12.Where.(*parser.IsNullExpr); !ok || isn.Negated {
 		t.Errorf("v12 rebuilt WHERE = %#v, want IS NULL (IsNullExpr not negated)", sel12.Where)
+	}
+
+	// v13: a SIMPLE-form CASEEXPR whose Arg is the `client` Var (not nil) and whose
+	// single arm's condition is the OPEXPR `CaseTestExpr = 5`. Rebuild must restore
+	// the Operand and emit only the OpExpr RHS as the WHEN value, re-resolving to
+	// the same simple-form IR (the pg_get_viewdef fixed point).
+	q13, err := ResolveViewQuery(parseSelect(t, viewBoolNullCases[10].sql), benchLogResolver{})
+	if err != nil {
+		t.Fatalf("ResolveViewQuery v13: %v", err)
+	}
+	ce13, ok := q13.Jointree.(*FromExpr).Quals.(*CaseExpr)
+	if !ok || ce13.Casetype != OidBool || len(ce13.Args) != 1 {
+		t.Fatalf("v13 qual = %#v, want 1-arm CASEEXPR of bool", q13.Jointree.(*FromExpr).Quals)
+	}
+	if _, ok := ce13.Arg.(*Var); !ok {
+		t.Errorf("v13 CASE arg = %T, want *Var (client operand)", ce13.Arg)
+	}
+	cw13, ok := ce13.Args[0].(*CaseWhen)
+	if !ok {
+		t.Fatalf("v13 arm0 = %T, want *CaseWhen", ce13.Args[0])
+	}
+	op13, ok := cw13.Expr.(*OpExpr)
+	if !ok || len(op13.Args) != 2 {
+		t.Fatalf("v13 arm0 cond = %#v, want 2-arg OpExpr (placeholder = 5)", cw13.Expr)
+	}
+	if _, ok := op13.Args[0].(*CaseTestExpr); !ok {
+		t.Errorf("v13 arm0 cond left = %T, want *CaseTestExpr placeholder", op13.Args[0])
+	}
+	sel13, err := RebuildViewQuery(q13)
+	if err != nil {
+		t.Fatalf("RebuildViewQuery v13: %v", err)
+	}
+	ce, ok := sel13.Where.(*parser.CaseExpr)
+	if !ok || ce.Operand == nil || len(ce.Whens) != 1 || ce.Else == nil {
+		t.Errorf("v13 rebuilt WHERE = %#v, want simple CASE (operand set, 1 WHEN, explicit ELSE)", sel13.Where)
 	}
 }

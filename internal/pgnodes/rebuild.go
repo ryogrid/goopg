@@ -151,22 +151,30 @@ func rebuildCaseExpr(c *CaseExpr) (parser.Expr, error) {
 }
 
 // rebuildCaseExprWith is the inverse of resolveCaseExprWith: it rebuilds a
-// searched-form CaseExpr into a parser.CaseExpr, threading the injected
-// recursion so a CASE inside a view qual rebuilds its Var operands. A NULL
-// Const Defresult is the synthesized "no ELSE" default (transformCaseExpr), so
-// it rebuilds back to an omitted ELSE — a re-resolve re-synthesizes identical
-// bytes (the fixed point).
+// CaseExpr into a parser.CaseExpr, threading the injected recursion so a CASE
+// inside a view qual rebuilds its Var operands. A NULL Const Defresult is the
+// synthesized "no ELSE" default (transformCaseExpr), so it rebuilds back to an
+// omitted ELSE — a re-resolve re-synthesizes identical bytes (the fixed point).
+//
+// For the simple form (Arg != nil) it mirrors ruleutils get_rule_expr: the
+// operand rebuilds to Operand, and each WHEN condition is the OpExpr
+// `placeholder = val`, so only its RHS (the second arg) is emitted as the
+// parser WHEN value — the placeholder itself never surfaces in SQL text.
 func rebuildCaseExprWith(c *CaseExpr, rec func(Node) (parser.Expr, error)) (parser.Expr, error) {
-	if c.Arg != nil {
-		return nil, fmt.Errorf("pgnodes: Rebuild: CASE with a test operand is unsupported")
-	}
 	out := &parser.CaseExpr{}
+	if c.Arg != nil {
+		operand, err := rec(c.Arg)
+		if err != nil {
+			return nil, err
+		}
+		out.Operand = operand
+	}
 	for _, a := range c.Args {
 		w, ok := a.(*CaseWhen)
 		if !ok {
 			return nil, fmt.Errorf("pgnodes: Rebuild: CASEEXPR arg is %T, want *CaseWhen", a)
 		}
-		cond, err := rec(w.Expr)
+		cond, err := rebuildCaseWhenCond(w.Expr, c.Arg != nil, rec)
 		if err != nil {
 			return nil, err
 		}
@@ -186,6 +194,29 @@ func rebuildCaseExprWith(c *CaseExpr, rec func(Node) (parser.Expr, error)) (pars
 		out.Else = el
 	}
 	return out, nil
+}
+
+// rebuildCaseWhenCond rebuilds one WHEN condition. In the searched form
+// (!simple) the stored node is the boolean condition itself. In the simple form
+// it is the OpExpr `placeholder = val`; ruleutils deparses just the RHS, so this
+// unwraps the OpExpr and rebuilds its second arg (the WHEN value). The left arg
+// is the CaseTestExpr placeholder and is intentionally dropped — the operand is
+// rebuilt separately into CaseExpr.Operand.
+func rebuildCaseWhenCond(cond Node, simple bool, rec func(Node) (parser.Expr, error)) (parser.Expr, error) {
+	if !simple {
+		return rec(cond)
+	}
+	op, ok := cond.(*OpExpr)
+	if !ok {
+		return nil, fmt.Errorf("pgnodes: Rebuild: simple-form CASE WHEN is %T, want *OpExpr", cond)
+	}
+	if len(op.Args) != 2 {
+		return nil, fmt.Errorf("pgnodes: Rebuild: simple-form CASE WHEN OpExpr has %d args, want 2", len(op.Args))
+	}
+	if _, ok := op.Args[0].(*CaseTestExpr); !ok {
+		return nil, fmt.Errorf("pgnodes: Rebuild: simple-form CASE WHEN left arg is %T, want *CaseTestExpr", op.Args[0])
+	}
+	return rec(op.Args[1])
 }
 
 // rebuildFuncExpr reconstructs a plain function call whose arguments are scalar

@@ -565,10 +565,66 @@ byte-identical to what PG stores:
   assertions in `TestViewQueryBoolNullStructure`.
 - full `pgnodes` package + `go vet ./internal/pgnodes/` + `go build ./...` clean.
 
+## Sub-slice 12 — `CASE` **simple form** (`CaseTestExpr` placeholder)
+
+`CASE operand WHEN val THEN … END` now resolves to a canonical `CASEEXPR`
+instead of degrading to SQL text. PG's `transformCaseExpr` (parse_expr.c) turns
+the simple form into: `newc->arg` = the transformed operand, and each `WHEN val`
+expanded via `makeSimpleA_Expr(AEXPR_OP, "=", placeholder, val)` into an OpExpr
+`placeholder = val` whose left arg is a `CaseTestExpr` typed from the operand
+(`typeId`/`typeMod`/`collation` = `exprType`/`exprTypmod`/`exprCollation` of the
+operand). The deparse inverse (ruleutils `get_rule_expr`) recognizes that shape
+and prints just the OpExpr RHS as the WHEN value.
+
+### New node — `CaseTestExpr` (generated `_outCaseTestExpr`)
+
+`{CASETESTEXPR :typeId <oid> :typeMod <int> :collation <oid>}` — added to
+`ir.go` (struct + `nodeTag`), `outfuncs.go` (`outCaseTestExpr` + dispatch), and
+`readfuncs.go` (`readCaseTestExpr` + `"CASETESTEXPR"` dispatch). It appears only
+as the left arg of the per-WHEN OpExpr; it never stands alone.
+
+### Forward + reload (`resolver_expr.go`, `rebuild.go`)
+
+- `resolveCaseExprWith`: when `e.Operand != nil`, resolve the operand once into
+  `Arg`, extract `(typmod, collid)` via `operandTypmodCollid` (Var → vartypmod/
+  varcollid, Const → consttypmod/constcollid; any other operand shape degrades),
+  and build the `CaseTestExpr` placeholder. `resolveCaseWhenCond` builds each arm:
+  searched form keeps the bool condition; simple form emits
+  `buildOpExpr(placeholder, argType, val, valType, "=")`. `buildOpExpr` requires
+  an **exact** `(operandType = valType)` operator (the index is keyed on exact
+  left/right OIDs), so the placeholder is never wrapped in an implicit coercion —
+  matching the shape ruleutils recognizes; a WHEN value needing coercion degrades
+  to SQL text.
+- `rebuildCaseExprWith`: for `Arg != nil` it restores `Operand` and, via
+  `rebuildCaseWhenCond`, unwraps each arm's OpExpr and rebuilds only its second
+  arg (the WHEN value); the `CaseTestExpr` placeholder is dropped (the operand is
+  rebuilt separately). A `re-resolve` reproduces identical bytes (fixed point).
+
+### Gates (all green)
+
+- `internal/pgnodes/case_test.go` — four live-captured PG18.3 scalar `adbin`
+  goldens (`simple_int_else`, `simple_int_two_when_no_else` (synthesized NULL
+  defresult), `simple_numeric_else`, `simple_int_two_when_else`), each through
+  the golden/codec/rebuild-fixed-point loops; `TestCaseDegradesGracefully` now
+  covers a simple-form mixed-result-type CASE (still SQL text).
+- `internal/pgnodes/view_bool_null_test.go` — `v13` (`CASE client WHEN 5 THEN
+  true ELSE false END`) live `ev_action` golden exercising the **Var-operand**
+  path (`:arg` a VAR, `CaseTestExpr` typed from vartypmod/varcollid): forward +
+  codec round-trip + rebuild fixed point + a structural assertion (`Arg` is a
+  Var, arm cond is `CaseTestExpr = 5` OpExpr, rebuilt WHERE is a simple CASE with
+  operand set).
+- full `pgnodes` package + `go vet ./internal/pgnodes/` + `go build ./...` clean.
+
 ## Deferred
 
-- The `CASE` **simple form** (`CASE operand WHEN …` — CaseTestExpr placeholder)
-  and `select_common_type` cross-type result coercion remain in M0123-S4.
+- `select_common_type` cross-type result coercion (a `CASE` whose WHEN/ELSE
+  results are different types) remains in M0123-S4, in both the searched and
+  simple form.
+- A simple-form `WHEN` value that needs an implicit coercion to the operand type
+  (no exact `operandType = valType` operator — e.g. a numeric operand vs a
+  `WHEN` value PG would cast) still degrades to SQL text: PG inserts a cast
+  FuncExpr on the RHS (and, for some coercions, a RelabelType above the
+  placeholder) that this subset does not yet model.
 - The byte-diff oracle gate remains in M0123-S4. Operator-driven implicit
   coercion in view quals (which would let a `timestamptz`/`int2`→`numeric`
   string literal resolve inside a view `WHERE`) is also still SQL-text — only

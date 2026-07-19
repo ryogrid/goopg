@@ -548,23 +548,45 @@ func resolveCaseExpr(e *parser.CaseExpr) (Node, uint32, error) {
 	return resolveCaseExprWith(e, resolve)
 }
 
-// resolveCaseExprWith resolves a searched-form CASE to a canonical CaseExpr,
-// threading the injected recursion so a CASE inside a view qual can resolve
-// WHEN/result operands over base-relation Vars (mirrors resolveBooleanTestWith).
+// resolveCaseExprWith resolves a CASE to a canonical CaseExpr, threading the
+// injected recursion so a CASE inside a view qual can resolve WHEN/result
+// operands over base-relation Vars (mirrors resolveBooleanTestWith).
 //
-// Only the searched form is modeled: the simple form (`CASE operand WHEN val …`)
-// transforms in PG into a CaseTestExpr placeholder + an `operand = val` OpExpr
-// per WHEN (transformCaseExpr), a distinct node subset left to a later slice.
-// All WHEN conditions must resolve to bool and all results (plus any ELSE) to
-// the SAME non-collatable type — select_common_type cross-type coercion is
-// deferred; a mixed-type or collatable CASE returns ErrUnsupported so the writer
-// degrades to SQL text (all-or-nothing).
+// Both forms are modeled. The searched form (`CASE WHEN cond THEN …`) leaves Arg
+// nil and requires every WHEN condition to resolve to bool. The simple form
+// (`CASE operand WHEN val …`) resolves the operand once into Arg and rewrites
+// each `WHEN val` into the OpExpr `placeholder = val` — exactly PG's
+// transformCaseExpr, which substitutes a CaseTestExpr for the operand. Only a
+// Var/Const operand carrying an exact (operandType = valType) `=` operator is
+// accepted so the placeholder is never coercion-wrapped; anything else degrades
+// to SQL text.
+//
+// All results (plus any ELSE) must resolve to the SAME non-collatable type —
+// select_common_type cross-type coercion is deferred; a mixed-type or collatable
+// CASE returns ErrUnsupported so the writer degrades to SQL text (all-or-nothing).
 func resolveCaseExprWith(e *parser.CaseExpr, rec scopedResolve) (Node, uint32, error) {
-	if e.Operand != nil {
-		return nil, 0, ErrUnsupported // simple form — deferred
-	}
 	if len(e.Whens) == 0 {
 		return nil, 0, ErrUnsupported
+	}
+	// Simple form: resolve the operand once and build the CaseTestExpr placeholder
+	// typed from it (transformCaseExpr: typeId/typeMod/collation from the operand).
+	// The searched form leaves both nil.
+	var (
+		arg      Node
+		argType  uint32
+		testExpr *CaseTestExpr
+	)
+	if e.Operand != nil {
+		aNode, aType, err := rec(e.Operand, 0)
+		if err != nil {
+			return nil, 0, err
+		}
+		tmod, collid, ok := operandTypmodCollid(aNode)
+		if !ok {
+			return nil, 0, ErrUnsupported // unmodeled operand shape
+		}
+		arg, argType = aNode, aType
+		testExpr = &CaseTestExpr{Typeid: aType, Typemod: tmod, Collation: collid}
 	}
 	var (
 		args     []Node
@@ -572,13 +594,9 @@ func resolveCaseExprWith(e *parser.CaseExpr, rec scopedResolve) (Node, uint32, e
 		seeded   bool
 	)
 	for _, w := range e.Whens {
-		cond, condType, err := rec(w.When, OidBool)
+		cond, err := resolveCaseWhenCond(w.When, testExpr, argType, rec)
 		if err != nil {
 			return nil, 0, err
-		}
-		if condType != OidBool {
-			// coerce_to_boolean would apply in PG; keep the subset bounded.
-			return nil, 0, ErrUnsupported
 		}
 		res, resType, err := rec(w.Then, 0)
 		if err != nil {
@@ -613,9 +631,58 @@ func resolveCaseExprWith(e *parser.CaseExpr, rec scopedResolve) (Node, uint32, e
 		defresult = newNullConst(casetype, constlen, constbyval)
 	}
 	return &CaseExpr{
-		Casetype: casetype, Casecollid: 0, Arg: nil,
+		Casetype: casetype, Casecollid: 0, Arg: arg,
 		Args: args, Defresult: defresult, Location: -1,
 	}, casetype, nil
+}
+
+// resolveCaseWhenCond resolves one WHEN condition. In the searched form
+// (testExpr==nil) the condition must itself resolve to bool. In the simple form
+// it is PG's expanded `operand = val`: an OpExpr whose left arg is the
+// CaseTestExpr placeholder and right arg is the resolved val (transformCaseExpr →
+// makeSimpleA_Expr "="). buildOpExpr requires an exact (operandType = valType)
+// operator so the placeholder is never wrapped in a coercion — the shape
+// ruleutils recognizes; any other combination degrades to SQL text.
+func resolveCaseWhenCond(when parser.Expr, testExpr *CaseTestExpr, argType uint32, rec scopedResolve) (Node, error) {
+	if testExpr == nil {
+		cond, condType, err := rec(when, OidBool)
+		if err != nil {
+			return nil, err
+		}
+		if condType != OidBool {
+			// coerce_to_boolean would apply in PG; keep the subset bounded.
+			return nil, ErrUnsupported
+		}
+		return cond, nil
+	}
+	valNode, valType, err := rec(when, argType)
+	if err != nil {
+		return nil, err
+	}
+	op, opType, err := buildOpExpr(testExpr, argType, valNode, valType, "=")
+	if err != nil {
+		return nil, err
+	}
+	if opType != OidBool {
+		return nil, ErrUnsupported
+	}
+	return op, nil
+}
+
+// operandTypmodCollid extracts exprTypmod/exprCollation from the operand node
+// types this subset accepts as a simple-form CASE test operand (Var, Const). The
+// CaseTestExpr placeholder carries both so a standby substitutes a value of the
+// operand's exact declared type/collation; any other operand shape degrades to
+// SQL text.
+func operandTypmodCollid(n Node) (typmod int32, collid uint32, ok bool) {
+	switch v := n.(type) {
+	case *Var:
+		return v.Vartypmod, v.Varcollid, true
+	case *Const:
+		return v.ConstTypmod, v.ConstCollid, true
+	default:
+		return 0, 0, false
+	}
 }
 
 // buildOpExpr looks the operator up by spelling + already-resolved operand type
