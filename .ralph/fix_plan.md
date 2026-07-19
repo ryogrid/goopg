@@ -5816,6 +5816,22 @@ existing encoder, `constcollid=100` / `consttypmod=n+4`.
       no-wrap guard); sibling gates reconciled (resolver_expr_test /
       sys_pg_attrdef_test / catalog_heap_reload_attrdef_test flip the numeric-int
       case to canonical); `TestE2E_FailoverGoopgToPG` green. Design 0123-0005
-      §"Sub-slice 4a". REMAINING: timestamptz datums; `CASE`/`BooleanTest`/
-      `IS DISTINCT FROM`; int2→numeric + operator-driven view-qual coercion;
+      §"Sub-slice 4a".
+      SUB-SLICE 4b LANDED (2026-07-19): canonical **`timestamptz` (OID 1184)
+      Const datums**. A `timestamptz` column DEFAULT literal now folds to a
+      canonical by-value `int64` Const of μs-since-2000 (constlen 8, consttype
+      1184) byte-for-byte identical to PG18.3's `pg_attrdef.adbin` (PG folds an
+      "unknown" string literal to the target type at parse time via
+      coerce_type→timestamptz_in, so adbin is a folded Const not a cast). Uses
+      PG's exact integer `date2j`/`j2date` Julian-day math (datum.go
+      `NewTimestamptzConst`/`parseTimestamptzMicros`/`formatTimestamptzUTC`); the
+      `resolver_expr.go` StringConst case + `rebuild.go` rebuildConst gain a
+      timestamptz branch (fixed point). DETERMINISTIC subset only (explicit
+      offset / `Z` / `epoch`); a TimeZone-dependent form (no offset / bare date)
+      degrades to SQL text. Gate `internal/pgnodes/timestamptz_test.go` (4 live
+      PG18.3 adbin goldens + parser math table + graceful-degradation matrix) +
+      executor `TestCanonicalAttrdefText` (timestamptz-literal + no-offset
+      cases); `TestE2E_FailoverGoopgToPG` green. Design 0123-0005 §"Sub-slice 4b".
+      REMAINING: `CASE`/`BooleanTest`/`IS DISTINCT FROM`; operator-driven
+      view-qual coercion (unblocks int2/timestamptz→ literals in view quals);
       byte-diff oracle.

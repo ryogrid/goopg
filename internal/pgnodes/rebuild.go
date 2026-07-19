@@ -186,6 +186,13 @@ func rebuildConst(c *Const) (parser.Expr, error) {
 			return &parser.UnaryOp{Op: parser.OpUnaryNeg, Operand: lit}, nil
 		}
 		return lit, nil
+	case OidTimestamptz:
+		// Render the μs datum back into a canonical UTC timestamp literal (with an
+		// explicit +00 offset) so a re-resolve in the timestamptz column context
+		// reproduces the identical Const — the fixed point. A negative (pre-2000)
+		// value is inside the literal string, not a unary minus.
+		usec := int64FromByvalWord(c.Datum)
+		return &parser.StringConst{Value: formatTimestamptzUTC(usec)}, nil
 	default:
 		return nil, fmt.Errorf("pgnodes: Rebuild: unsupported Const type OID %d", c.ConstType)
 	}

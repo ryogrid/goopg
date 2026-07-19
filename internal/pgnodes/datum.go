@@ -9,13 +9,14 @@ import (
 
 // PostgreSQL type OIDs used by the scalar Const subset (pg_type.dat).
 const (
-	OidBool    = 16
-	OidInt8    = 20
-	OidInt2    = 21
-	OidInt4    = 23
-	OidText    = 25
-	OidOid     = 26
-	OidNumeric = 1700
+	OidBool        = 16
+	OidInt8        = 20
+	OidInt2        = 21
+	OidInt4        = 23
+	OidText        = 25
+	OidOid         = 26
+	OidNumeric     = 1700
+	OidTimestamptz = 1184
 )
 
 // DefaultCollationOid is DEFAULT_COLLATION_OID (pg_collation.dat "default"),
@@ -391,5 +392,304 @@ func (v numericVar) text() string {
 		}
 		sb.WriteString(fs)
 	}
+	return sb.String()
+}
+
+// timestamptz (OID 1184) on-disk / in-memory form. PostgreSQL stores a
+// timestamptz as a by-value int64 count of microseconds relative to
+// POSTGRES_EPOCH_JDATE (2000-01-01 00:00:00 UTC) — TimestampTz in
+// timestamp.h / datetime.c. A DEFAULT literal like '2024-01-15 10:30:00+00' is
+// coerced from an "unknown" string literal to timestamptz *at parse time*
+// (coerce_type's stringTypeToConst path calls timestamptz_in immediately), so
+// PG's stored pg_attrdef.adbin / pg_rewrite.ev_action holds a folded Const, not
+// a cast FuncExpr — outfuncs.c:outDatum dumps its 8 little-endian bytes.
+const (
+	// Julian day numbers PostgreSQL pins in timestamp.h.
+	postgresEpochJDate = 2451545 // 2000-01-01
+	unixEpochJDate     = 2440588 // 1970-01-01
+	usecsPerDay        = int64(86400) * 1000000
+)
+
+// unixEpochMicros is timestamptz 'epoch' (1970-01-01 00:00:00 UTC) expressed as
+// microseconds since the PostgreSQL epoch — negative because it predates 2000.
+const unixEpochMicros = int64(unixEpochJDate-postgresEpochJDate) * 86400 * 1000000
+
+// date2j is PostgreSQL's Gregorian date → Julian day number (datetime.c:date2j),
+// exact integer arithmetic (no floating point, correct across the proleptic
+// calendar). Used to convert a parsed timestamp's calendar fields to a day count.
+func date2j(y, m, d int) int {
+	if m > 2 {
+		m++
+		y += 4800
+	} else {
+		m += 13
+		y += 4799
+	}
+	century := y / 100
+	julian := y*365 - 32167
+	julian += y/4 - century + century/4
+	julian += 7834*m/256 + d
+	return julian
+}
+
+// j2date is the inverse (datetime.c:j2date): Julian day number → Gregorian
+// (year, month, day). Used by the rebuild path to render a stored μs value back
+// into a UTC timestamp literal.
+func j2date(jd int) (year, month, day int) {
+	julian := uint32(jd)
+	julian += 32044
+	quad := julian / 146097
+	extra := (julian-quad*146097)*4 + 3
+	julian += 60 + quad*3 + extra/146097
+	quad = julian / 1461
+	julian -= quad * 1461
+	y := int(julian * 4 / 1461)
+	if y != 0 {
+		julian = (julian + 305) % 365
+	} else {
+		julian = (julian + 306) % 366
+	}
+	julian += 123
+	y += int(quad) * 4
+	year = y - 4800
+	quad = julian * 2141 / 65536
+	day = int(julian) - int(7834*quad/256)
+	month = int(quad+10)%12 + 1
+	return year, month, day
+}
+
+// NewTimestamptzConst builds a Const for a timestamptz value (μs since the
+// PostgreSQL epoch). Like the integer Consts it is by-value (constlen 8,
+// constbyval true, constcollid 0) and sign-extends into the 8-byte datum word so
+// a pre-2000 value fills the high bytes with 0xFF (Int64GetDatum).
+func NewTimestamptzConst(usec int64) *Const {
+	return &Const{
+		ConstType: OidTimestamptz, ConstTypmod: -1, ConstCollid: 0,
+		ConstLen: 8, ConstByval: true, Location: -1,
+		Datum: byvalWord(usec),
+	}
+}
+
+// parseTimestamptzMicros parses a timestamptz literal into microseconds since the
+// PostgreSQL epoch, returning ok=false for any form outside the deterministic
+// subset (which the resolver then degrades to SQL text). PG folds such a literal
+// at parse time using the session TimeZone GUC, so only forms whose UTC instant
+// is unambiguous are supported: an ISO date+time with an EXPLICIT numeric offset
+// (or 'Z'), plus the 'epoch' keyword. A bare date, or a date+time without an
+// offset, depends on the server's TimeZone and is left to SQL-text fallback.
+func parseTimestamptzMicros(s string) (int64, bool) {
+	s = strings.TrimSpace(s)
+	if strings.EqualFold(s, "epoch") {
+		return unixEpochMicros, true
+	}
+
+	// Split the date from the "time+offset" tail on the first space or 'T'.
+	sep := strings.IndexAny(s, " Tt")
+	if sep < 0 {
+		return 0, false
+	}
+	dateStr, rest := s[:sep], s[sep+1:]
+
+	y, mo, d, ok := parseDateFields(dateStr)
+	if !ok {
+		return 0, false
+	}
+
+	// Locate the timezone offset: the first '+', '-', or 'Z'/'z' in the tail
+	// (the time part itself contains only digits, ':' and '.'). An explicit
+	// offset is REQUIRED for determinism.
+	off := strings.IndexAny(rest, "+-Zz")
+	if off < 0 {
+		return 0, false
+	}
+	timeStr, offStr := rest[:off], rest[off:]
+
+	hh, mi, ss, fracUsec, ok := parseTimeFields(timeStr)
+	if !ok {
+		return 0, false
+	}
+	offSec, ok := parseTZOffsetSeconds(offStr)
+	if !ok {
+		return 0, false
+	}
+
+	days := int64(date2j(y, mo, d) - postgresEpochJDate)
+	// UTC instant = wall-clock at the given offset minus that offset.
+	totalSec := days*86400 + int64(hh)*3600 + int64(mi)*60 + int64(ss) - offSec
+	return totalSec*1000000 + fracUsec, true
+}
+
+// parseDateFields parses "YYYY-MM-DD" (each field a plain non-negative integer;
+// BC / variable-form years are out of the supported subset).
+func parseDateFields(s string) (y, m, d int, ok bool) {
+	parts := strings.Split(s, "-")
+	if len(parts) != 3 {
+		return 0, 0, 0, false
+	}
+	var err error
+	if y, err = strconv.Atoi(parts[0]); err != nil || y < 0 {
+		return 0, 0, 0, false
+	}
+	if m, err = strconv.Atoi(parts[1]); err != nil || m < 1 || m > 12 {
+		return 0, 0, 0, false
+	}
+	if d, err = strconv.Atoi(parts[2]); err != nil || d < 1 || d > 31 {
+		return 0, 0, 0, false
+	}
+	return y, m, d, true
+}
+
+// parseTimeFields parses "HH:MM[:SS[.frac]]" into hours/minutes/seconds and the
+// fractional part as microseconds (rounded to μs, matching PG's rint). Seconds
+// default to 0 when omitted.
+func parseTimeFields(s string) (hh, mi, ss int, fracUsec int64, ok bool) {
+	parts := strings.Split(s, ":")
+	if len(parts) < 2 || len(parts) > 3 {
+		return 0, 0, 0, 0, false
+	}
+	var err error
+	if hh, err = strconv.Atoi(parts[0]); err != nil || hh < 0 || hh > 23 {
+		return 0, 0, 0, 0, false
+	}
+	if mi, err = strconv.Atoi(parts[1]); err != nil || mi < 0 || mi > 59 {
+		return 0, 0, 0, 0, false
+	}
+	if len(parts) == 3 {
+		secStr := parts[2]
+		if dot := strings.IndexByte(secStr, '.'); dot >= 0 {
+			fracUsec, ok = fracToMicros(secStr[dot+1:])
+			if !ok {
+				return 0, 0, 0, 0, false
+			}
+			secStr = secStr[:dot]
+		}
+		if ss, err = strconv.Atoi(secStr); err != nil || ss < 0 || ss > 60 {
+			return 0, 0, 0, 0, false
+		}
+	}
+	return hh, mi, ss, fracUsec, true
+}
+
+// fracToMicros converts fractional-second digits to microseconds, rounding a
+// >6-digit fraction to the nearest μs (PG rounds sub-microsecond precision).
+func fracToMicros(frac string) (int64, bool) {
+	if frac == "" {
+		return 0, false
+	}
+	for i := 0; i < len(frac); i++ {
+		if frac[i] < '0' || frac[i] > '9' {
+			return 0, false
+		}
+	}
+	if len(frac) > 6 {
+		v, _ := strconv.ParseInt(frac[:6], 10, 64)
+		if frac[6] >= '5' {
+			v++ // round half-up; a carry to 1000000 simply adds a second downstream
+		}
+		return v, true
+	}
+	padded := frac + strings.Repeat("0", 6-len(frac))
+	v, err := strconv.ParseInt(padded, 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return v, true
+}
+
+// parseTZOffsetSeconds parses a timezone offset ('Z'/'z' = UTC, or
+// (+|-)HH[[:]MM[[:]SS]]) into signed seconds east of UTC.
+func parseTZOffsetSeconds(s string) (int64, bool) {
+	if s == "Z" || s == "z" {
+		return 0, true
+	}
+	if len(s) < 2 || (s[0] != '+' && s[0] != '-') {
+		return 0, false
+	}
+	neg := s[0] == '-'
+	body := s[1:]
+	var oh, om, os int
+	var err error
+	if strings.ContainsRune(body, ':') {
+		parts := strings.Split(body, ":")
+		if len(parts) < 1 || len(parts) > 3 {
+			return 0, false
+		}
+		if oh, err = strconv.Atoi(parts[0]); err != nil {
+			return 0, false
+		}
+		if len(parts) >= 2 {
+			if om, err = strconv.Atoi(parts[1]); err != nil {
+				return 0, false
+			}
+		}
+		if len(parts) == 3 {
+			if os, err = strconv.Atoi(parts[2]); err != nil {
+				return 0, false
+			}
+		}
+	} else {
+		// Packed form: HH, HHMM, or HHMMSS.
+		switch len(body) {
+		case 2:
+			oh, err = strconv.Atoi(body)
+		case 4:
+			oh, err = strconv.Atoi(body[:2])
+			if err == nil {
+				om, err = strconv.Atoi(body[2:4])
+			}
+		case 6:
+			oh, err = strconv.Atoi(body[:2])
+			if err == nil {
+				om, err = strconv.Atoi(body[2:4])
+			}
+			if err == nil {
+				os, err = strconv.Atoi(body[4:6])
+			}
+		default:
+			return 0, false
+		}
+		if err != nil {
+			return 0, false
+		}
+	}
+	if oh < 0 || oh > 15 || om < 0 || om > 59 || os < 0 || os > 59 {
+		return 0, false
+	}
+	total := int64(oh)*3600 + int64(om)*60 + int64(os)
+	if neg {
+		total = -total
+	}
+	return total, true
+}
+
+// formatTimestamptzUTC renders a μs-since-epoch value back into a canonical UTC
+// timestamp literal ("YYYY-MM-DD HH:MM:SS[.ffffff]+00", trailing fractional
+// zeros trimmed). It is the rebuild-time inverse: re-resolving the result (with
+// its explicit +00 offset) reproduces the identical μs, so
+// resolve→Rebuild→re-resolve is a fixed point. The rendering need not match
+// timestamptz_out's session-TimeZone form — only round-trip to the same instant.
+func formatTimestamptzUTC(usec int64) string {
+	day := usec / usecsPerDay
+	rem := usec % usecsPerDay
+	if rem < 0 {
+		rem += usecsPerDay
+		day--
+	}
+	y, mo, d := j2date(int(day) + postgresEpochJDate)
+	sec := rem / 1000000
+	fracUsec := rem % 1000000
+	hh := sec / 3600
+	mi := (sec % 3600) / 60
+	ss := sec % 60
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "%04d-%02d-%02d %02d:%02d:%02d", y, mo, d, hh, mi, ss)
+	if fracUsec > 0 {
+		frac := fmt.Sprintf("%06d", fracUsec)
+		frac = strings.TrimRight(frac, "0")
+		sb.WriteByte('.')
+		sb.WriteString(frac)
+	}
+	sb.WriteString("+00")
 	return sb.String()
 }

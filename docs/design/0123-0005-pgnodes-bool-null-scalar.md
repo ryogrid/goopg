@@ -228,9 +228,57 @@ the shared `*With` recursion so a view qual carrying the same cast rebuilds too.
   all flipped the `numeric DEFAULT 0` case from SQL-text to canonical FuncExpr.
 - `TestE2E_FailoverGoopgToPG` (a real PG18 standby) still green.
 
+## Sub-slice 4b — canonical `timestamptz` (OID 1184) Const datums
+
+A `timestamptz` `DEFAULT` literal is **not** stored as a cast expression: PG's
+`coerce_type` folds an "unknown" string literal to the target type at parse time
+(`stringTypeToConst` → `timestamptz_in`), so `pg_attrdef.adbin` holds a folded
+by-value `Const` — a signed `int64` of microseconds relative to
+`POSTGRES_EPOCH_JDATE` (2000-01-01 UTC), `constlen 8` / `constbyval true` /
+`consttype 1184`. Same 8-byte `outDatum` word as the integer Consts (a pre-2000
+value sign-extends to all-`0xFF` high bytes).
+
+### Datum codec (`datum.go`)
+
+`NewTimestamptzConst(usec)` builds the by-value Const. `parseTimestamptzMicros`
+converts a literal to μs using PG's exact integer `date2j` (Gregorian → Julian
+day, `datetime.c`) — no floating point, correct across the proleptic calendar.
+The **deterministic subset only**: an ISO date+time with an EXPLICIT numeric
+offset (or `Z`), plus the `epoch` keyword. A bare date or an offset-less
+date+time is `TimeZone`-GUC-dependent, so it returns `ok=false` and the writer
+degrades to SQL text (all-or-nothing; 02e §3) — a standby must never disagree
+with goopg on the folded instant. `formatTimestamptzUTC` (via the inverse
+`j2date`) renders μs back to a canonical `YYYY-MM-DD HH:MM:SS[.ffffff]+00`
+literal for the rebuild path; re-resolving it (explicit `+00`) reproduces the
+identical datum (fixed point).
+
+### Forward + reload (`resolver_expr.go`, `rebuild.go`)
+
+The `StringConst` case gains an `expected == OidTimestamptz` branch that folds
+via `parseTimestamptzMicros`. `rebuildConst` gains an `OidTimestamptz` case that
+renders the datum back to a `StringConst` UTC literal. Scalar (column DEFAULT)
+scope only — a string literal compared to a `timestamptz` column in a view qual
+needs operator-driven coercion (the `>` operand type inferred from the Var),
+which stays deferred.
+
+### Gates (all green)
+
+- `internal/pgnodes/timestamptz_test.go` — four live-captured PG18.3 `adbin`
+  goldens (`'2024-01-15 10:30:00+00'`, the epoch `'2000-01-01 00:00:00+00'`,
+  the `'epoch'` keyword, sub-second negative `'1999-12-31 23:59:59.5+00'`):
+  forward resolve→`Out` byte-for-byte, `ResolveForColumn` accepts, `Read`→`Out`
+  codec round-trip, resolve→`Rebuild`→re-resolve fixed point; a
+  graceful-degradation matrix (no-offset / bare-date / garbage reject, text
+  context stays text); and a direct `parseTimestamptzMicros` math table
+  (`T`/`Z`, `+05:30`, packed `-0530`, epoch, negatives).
+- `internal/executor/sys_pg_attrdef_test.go` `TestCanonicalAttrdefText` gains a
+  `timestamptz` literal case (canonical Const) + a no-offset case (SQL text).
+- `TestE2E_FailoverGoopgToPG` still green.
+
 ## Deferred
 
-- `timestamptz` datums, `CASE`, `BooleanTest` (`IS TRUE`/`IS FALSE`),
-  `IS DISTINCT FROM`, and the byte-diff oracle gate remain in M0123-S4. (The
-  `int2`→`numeric` and general operator-driven implicit coercion in view quals
-  are also still SQL-text — only the exact numeric-column DEFAULT context casts.)
+- `CASE`, `BooleanTest` (`IS TRUE`/`IS FALSE`), `IS DISTINCT FROM`, and the
+  byte-diff oracle gate remain in M0123-S4. Operator-driven implicit coercion in
+  view quals (which would let a `timestamptz`/`int2`→`numeric` string literal
+  resolve inside a view `WHERE`) is also still SQL-text — only the exact
+  scalar-column DEFAULT context folds a `timestamptz`/numeric literal.

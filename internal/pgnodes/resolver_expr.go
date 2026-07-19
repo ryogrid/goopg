@@ -98,6 +98,15 @@ func resolve(e parser.Expr, expected uint32) (Node, uint32, error) {
 		if expected == OidText || expected == 0 {
 			return NewTextConst(v.Value), OidText, nil
 		}
+		// In a timestamptz context PG folds the literal to a Const at parse time
+		// (stringTypeToConst → timestamptz_in). Reproduce that only for the
+		// deterministic subset (explicit offset / 'epoch'); a TimeZone-dependent
+		// form falls back to SQL text (all-or-nothing; 02e §3).
+		if expected == OidTimestamptz {
+			if usec, ok := parseTimestamptzMicros(v.Value); ok {
+				return NewTimestamptzConst(usec), OidTimestamptz, nil
+			}
+		}
 		return nil, 0, ErrUnsupported
 
 	case *parser.IsNullExpr:
