@@ -120,6 +120,14 @@ func rebuildFuncExpr(f *FuncExpr) (parser.Expr, error) {
 // query-tree scope (rebuild_query.go) reuse this to rebuild FuncExprs whose
 // arguments may be column Vars, not only scalars.
 func rebuildFuncExprWith(f *FuncExpr, rec func(Node) (parser.Expr, error)) (parser.Expr, error) {
+	// An implicit int->numeric coercion (int4_numeric/int8_numeric emitted by
+	// coerce_to_target_type) has no SQL call syntax: PG re-derives it from the
+	// bare integer literal in a numeric context. Rebuild to the inner argument so
+	// a re-resolve re-wraps the identical FuncExpr (fixed point), rather than a
+	// spurious numeric(<int>) function call.
+	if isImplicitIntToNumericCast(f) {
+		return rec(f.Args[0])
+	}
 	name, ok := catalog.RegprocName(f.Funcid)
 	if !ok {
 		return nil, fmt.Errorf("pgnodes: Rebuild: unknown function OID %d", f.Funcid)
@@ -133,6 +141,17 @@ func rebuildFuncExprWith(f *FuncExpr, rec func(Node) (parser.Expr, error)) (pars
 		args = append(args, arg)
 	}
 	return &parser.FuncCall{Name: parser.ObjectName{Name: name}, Args: args}, nil
+}
+
+// isImplicitIntToNumericCast reports whether f is the exact FuncExpr the forward
+// resolver emits for a bare integer literal in a numeric context (see
+// wrapIntToNumericCast): int4_numeric (1740) or int8_numeric (1781), an
+// implicit-cast form (funcformat 2), with a single argument.
+func isImplicitIntToNumericCast(f *FuncExpr) bool {
+	return (f.Funcid == 1740 || f.Funcid == 1781) &&
+		f.Funcformat == 2 &&
+		f.Funcresulttype == OidNumeric &&
+		len(f.Args) == 1
 }
 
 // rebuildConst reconstructs a literal. int4/int8 datums decode from the 8-byte

@@ -187,8 +187,50 @@ see ledger).
   `OutRuleAction` byte-for-byte, codec round-trip, and `RebuildViewQuery` fixed
   point.
 
+## Sub-slice 4a (2026-07-19): the implicit `int`→`numeric` cast FuncExpr
+
+Closes the sub-slice-3 discovery above. A bare **integer** literal in a numeric
+column context (`numeric DEFAULT 0` / `12345` / `-5` / `5000000000`) is typed
+`int4`/`int8` by the scanner (`make_const`), then `coerce_to_target_type` wraps
+it in an implicit-cast `FuncExpr` — `int4_numeric` (funcid **1740**) or
+`int8_numeric` (funcid **1781**) — with `funcformat` **2** (`COERCE_IMPLICIT_CAST`)
+and no collation. So PG's `adbin`/`ev_action` is a `FuncExpr` over an `int4`/`int8`
+`Const`, never a numeric `Const`. (A literal is never `int2`, so `int2_numeric`
+1782 never arises here; `int2` column targets stay SQL-text.)
+
+### Forward (`resolver_expr.go`)
+
+`resolveIntLiteral(v, expected)` now, when `expected == OidNumeric`, wraps the
+`int4`/`int8` `Const` it already builds in `wrapIntToNumericCast` (funcid
+1740/1781, result 1700, funcformat 2). Any other context keeps the bare `Const`.
+The negative fold is unchanged and happens **before** the cast (`-5` → `int4`
+Const `-5` inside the FuncExpr), matching `doNegate` then `coerce_type`.
+
+### Reload inverse (`rebuild.go`)
+
+`isImplicitIntToNumericCast` recognises the exact FuncExpr shape (funcid
+1740/1781, funcformat 2, result 1700, one arg); `rebuildFuncExprWith` then
+rebuilds it to the **inner** integer literal (not a spurious `numeric(<int>)`
+call), so a re-resolve re-wraps byte-identical bytes (fixed point). Handled in
+the shared `*With` recursion so a view qual carrying the same cast rebuilds too.
+
+### Gates (all green)
+
+- `internal/pgnodes/numeric_cast_test.go` — five live-captured PG18.3 `adbin`
+  goldens (`12345`, `0`, `-5`, `5000000000`, `32767`): forward resolve→`Out`
+  byte-for-byte, `ResolveForColumn` now ACCEPTS them as canonical, `Read`→`Out`
+  codec round-trip, resolve→`Rebuild`→re-resolve fixed point, a rebuilt-shape
+  check (integer literal / `UnaryOp`, never a `FuncCall`), and an int-context
+  guard (no wrap when the column is `int4`).
+- Sibling gates reconciled: `resolver_expr_test.go` `TestResolveForColumn`,
+  `internal/executor/sys_pg_attrdef_test.go` `TestCanonicalAttrdefText`, and
+  `internal/initdb/catalog_heap_reload_attrdef_test.go` `TestRebuildAttrdefExpr`
+  all flipped the `numeric DEFAULT 0` case from SQL-text to canonical FuncExpr.
+- `TestE2E_FailoverGoopgToPG` (a real PG18 standby) still green.
+
 ## Deferred
 
-- `timestamptz` datums, the `int4_numeric` implicit-cast FuncExpr for
-  integer-valued numeric defaults, `CASE`, `BooleanTest` (`IS TRUE`/`IS FALSE`),
-  `IS DISTINCT FROM`, and the byte-diff oracle gate remain in M0123-S4.
+- `timestamptz` datums, `CASE`, `BooleanTest` (`IS TRUE`/`IS FALSE`),
+  `IS DISTINCT FROM`, and the byte-diff oracle gate remain in M0123-S4. (The
+  `int2`→`numeric` and general operator-driven implicit coercion in view quals
+  are also still SQL-text — only the exact numeric-column DEFAULT context casts.)

@@ -24,7 +24,10 @@ func TestRebuildAttrdefExpr(t *testing.T) {
 		{"int4-neg", "-1", pgnodes.OidInt4, true},
 		{"text-func", "upper('x')", pgnodes.OidText, true},
 		{"int8-lit", "5000000000", pgnodes.OidInt8, true},
-		{"numeric-fallback", "0", 1700, false}, // type mismatch → SQL text
+		// Integer literal in a numeric column: canonical via the implicit
+		// int4_numeric cast FuncExpr; reload rebuilds it back to the bare "0"
+		// literal (M0123-S4 sub-slice 4a).
+		{"numeric-int-cast", "0", 1700, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -40,8 +40,10 @@ func TestCanonicalAttrdefText(t *testing.T) {
 		// now() on a timestamptz column resolves to a canonical FuncExpr (funcid
 		// 1299, result 1184 == column type) — a real standby can evaluate it.
 		{"now-tstz", col("timestamptz", "now()"), true, []string{"FUNCEXPR", "1299"}},
+		// Integer literal in a numeric column: canonical via the implicit
+		// int4_numeric cast FuncExpr (funcid 1740, funcformat 2). M0123-S4 sub-slice 4a.
+		{"numeric-int-lit", col("numeric", "0"), true, []string{"FUNCEXPR", "1740", "1700"}},
 		// SQL-text fallback: type mismatch or a node outside the scalar subset.
-		{"numeric-lit", col("numeric", "0"), false, []string{"0"}},
 		{"smallint-lit", col("int2", "5"), false, []string{"5"}},
 		{"case-expr", col("int4", "CASE WHEN true THEN 1 ELSE 2 END"), false, []string{"CASE"}},
 	}

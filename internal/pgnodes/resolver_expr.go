@@ -231,11 +231,45 @@ func buildFuncExpr(name string, argNodes []Node, argOIDs []uint32) (Node, uint32
 // make_const does — int4 when it fits, else int8 — and honours a widening int8
 // context (DEFAULT 5 on a bigint column stores an int8 Const).
 func resolveIntLiteral(v int64, expected uint32) (Node, uint32, error) {
+	var c Node
+	var ityp uint32
 	if expected == OidInt8 || !fitsInt4(v) {
-		return NewInt8Const(v), OidInt8, nil
+		c, ityp = NewInt8Const(v), OidInt8
+	} else {
+		// expected is int4, unknown, or a compatible context: emit int4.
+		c, ityp = NewInt4Const(int32(v)), OidInt4
 	}
-	// expected is int4, unknown, or a compatible context: emit int4.
-	return NewInt4Const(int32(v)), OidInt4, nil
+	// A bare integer literal assigned to a numeric column is typed int4/int8 by
+	// the scanner (make_const), then coerce_to_target_type wraps it in an
+	// IMPLICIT-CAST FuncExpr — int4_numeric (1740) or int8_numeric (1781) — so
+	// PG's adbin/ev_action is a FuncExpr, not a numeric Const. Reproduce that
+	// only in an exact numeric context; a plain int context keeps the bare Const.
+	if expected == OidNumeric {
+		return wrapIntToNumericCast(c, ityp), OidNumeric, nil
+	}
+	return c, ityp, nil
+}
+
+// wrapIntToNumericCast builds the implicit int->numeric coercion FuncExpr that
+// PG's coerce_type emits for a bare integer literal in a numeric context.
+// funcid: int4_numeric (1740) for int4, int8_numeric (1781) for int8 (a literal
+// is never int2). funcformat = COERCE_IMPLICIT_CAST (2); no collation.
+func wrapIntToNumericCast(arg Node, argType uint32) Node {
+	funcid := uint32(1740) // int4_numeric
+	if argType == OidInt8 {
+		funcid = 1781 // int8_numeric
+	}
+	return &FuncExpr{
+		Funcid:         funcid,
+		Funcresulttype: OidNumeric,
+		Funcretset:     false,
+		Funcvariadic:   false,
+		Funcformat:     2, // COERCE_IMPLICIT_CAST
+		Funccollid:     0,
+		Inputcollid:    0,
+		Args:           []Node{arg},
+		Location:       -1,
+	}
 }
 
 // resolveNumericLiteral types a decimal/scientific literal as numeric (OID 1700)

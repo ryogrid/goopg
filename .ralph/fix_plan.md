@@ -5798,5 +5798,24 @@ existing encoder, `constcollid=100` / `consttypmod=n+4`.
       fixed point. DISCOVERY: integer-valued numeric defaults (`DEFAULT 0`,
       `DEFAULT 12345`) are int4 wrapped in an `int4_numeric` cast FuncExpr
       (funcid 1740), NOT numeric Consts — still SQL-text (deferred). Design
-      0123-0005 §"Sub-slice 3". REMAINING: `int4_numeric` implicit cast;
-      timestamptz datums; `CASE`/`BooleanTest`/`IS DISTINCT FROM`; byte-diff oracle.
+      0123-0005 §"Sub-slice 3".
+      SUB-SLICE 4a LANDED (2026-07-19): the implicit **`int`→`numeric` cast
+      FuncExpr** (closes the sub-slice-3 discovery). A bare integer literal in a
+      numeric column context now resolves to an implicit-cast `FuncExpr`
+      (`int4_numeric` funcid 1740 / `int8_numeric` funcid 1781, funcformat 2)
+      byte-for-byte identical to PG18.3's `adbin` — `resolveIntLiteral` wraps the
+      int4/int8 Const via new `wrapIntToNumericCast` when `expected==OidNumeric`
+      (negative fold before the cast); `rebuild.go` `isImplicitIntToNumericCast`
+      +`rebuildFuncExprWith` rebuild it back to the inner integer literal (fixed
+      point). `numeric DEFAULT 0/12345/-5/5000000000` now emit canonical
+      `pg_attrdef.adbin` via the already-wired `ResolveForColumn`→
+      `canonicalAttrdefText` path (was SQL-text fallback). Gate
+      `internal/pgnodes/numeric_cast_test.go` (5 live PG18.3 adbin goldens:
+      forward byte-for-byte + ResolveForColumn accepts + codec round-trip +
+      resolve→Rebuild→re-resolve fixed point + rebuilt-shape + int-context
+      no-wrap guard); sibling gates reconciled (resolver_expr_test /
+      sys_pg_attrdef_test / catalog_heap_reload_attrdef_test flip the numeric-int
+      case to canonical); `TestE2E_FailoverGoopgToPG` green. Design 0123-0005
+      §"Sub-slice 4a". REMAINING: timestamptz datums; `CASE`/`BooleanTest`/
+      `IS DISTINCT FROM`; int2→numeric + operator-driven view-qual coercion;
+      byte-diff oracle.
