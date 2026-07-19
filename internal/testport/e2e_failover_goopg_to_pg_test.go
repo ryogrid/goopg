@@ -299,6 +299,18 @@ func runFailoverGoopgToPG(t *testing.T, repo, pgBasebackupBin, psqlBin string, m
 		t.Fatalf("create multi-condition view on goopg primary: %v", err)
 	}
 
+	// M0123-S4 sub-slice 8: a searched CASE expression in the WHERE qual is now
+	// inside the canonical subset too — the query-scoped resolver routes
+	// *parser.CaseExpr through the same recursion-injectable resolveCaseExprWith /
+	// rebuildCaseExprWith builders the scalar DEFAULT path (sub-slice 7) uses. This
+	// view therefore streams a canonical pg_node_tree CASEEXPR ev_action +
+	// relhasrules=true, and the promoted PG must PARSE it with pg_get_viewdef (the
+	// adversarial standby proof for the CASE query wiring).
+	if err := runSQLSimple(t, primary,
+		"CREATE VIEW b5c_view3 AS SELECT client, src FROM public.bench_log WHERE CASE WHEN client > 0 THEN true ELSE false END"); err != nil {
+		t.Fatalf("create case-expr view on goopg primary: %v", err)
+	}
+
 	dsn := fmt.Sprintf("host=%s port=%s user=%s dbname=%s sslmode=disable",
 		"127.0.0.1", mustGoopgPort(primary.ListenAddr()), "postgres", "postgres")
 	workCtx, workCancel := context.WithCancel(context.Background())
@@ -465,6 +477,26 @@ func runFailoverGoopgToPG(t *testing.T, repo, pgBasebackupBin, psqlBin string, m
 	for _, want := range []string{"SELECT client,", "src", "FROM bench_log", "src IS NOT NULL", "client > 0"} {
 		if !strings.Contains(vd2, want) {
 			t.Fatalf("standby pg_get_viewdef(b5c_view2)=%q, missing %q", vd2, want)
+		}
+	}
+
+	// M0123-S4 sub-slice 8: the same proof for the CASE-expr view. Its canonical
+	// ev_action is a searched CASEEXPR (casetype bool) over a WHEN OpExpr + ELSE;
+	// the promoted PG must report relhasrules=true and reconstruct the CASE WHERE
+	// via pg_get_viewdef — byte-level proof the CASE query wiring is
+	// PG18-node-tree-compatible, not merely that the heap row replays.
+	if got := pgScalar(t, standby,
+		"SELECT relhasrules FROM pg_class WHERE relname = 'b5c_view3'"); got != "t" {
+		t.Fatalf("standby relhasrules(b5c_view3)=%q, want t (canonical CASE ev_action)", got)
+	}
+	viewdef3, err := pgScalarMaybe(standby, "SELECT pg_get_viewdef('public.b5c_view3'::regclass)")
+	if err != nil {
+		t.Fatalf("standby pg_get_viewdef(b5c_view3): %v (PG could not parse the canonical CASE ev_action)", err)
+	}
+	vd3 := strings.Join(strings.Fields(viewdef3), " ")
+	for _, want := range []string{"SELECT client,", "src", "FROM bench_log", "CASE WHEN (client > 0)", "THEN true", "ELSE false", "END"} {
+		if !strings.Contains(vd3, want) {
+			t.Fatalf("standby pg_get_viewdef(b5c_view3)=%q, missing %q", vd3, want)
 		}
 	}
 	// KNOWN BLOCKER (deferral ledger 2026-07-19, M0123-S3 sub-slice 2c): a direct

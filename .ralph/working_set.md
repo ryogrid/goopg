@@ -1,41 +1,27 @@
-Task: M0123-S4 sub-slice 7 — canonical CASEEXPR/CASEWHEN (searched form),
-scalar column-DEFAULT scope. COMPLETE this loop (committing).
+Task: M0123-S4 sub-slice 8 — CASE view-query wiring. COMPLETE this loop (committing).
 
-Landed: a column DEFAULT `CASE WHEN cond THEN result … [ELSE result] END`
-(searched form) now emits canonical PG18 pg_attrdef.adbin (was SQL-text
-fallback). Codec+resolver+rebuild in one commit (sibling rule):
-- ir.go: CaseExpr{Casetype,Casecollid,Arg,Args,Defresult,Location} + CaseWhen
-  {Expr,Result,Location}; Args is []Node of *CaseWhen.
-- outfuncs.go/readfuncs.go: outNode/readNode CASEEXPR+CASEWHEN arms +
-  out/readCaseExpr, out/readCaseWhen.
-- resolver_expr.go: `*parser.CaseExpr`→resolveCaseExpr + resolveCaseExprWith(rec)
-  (recursion-injectable, ready for view path). Searched form only; WHEN conds→
-  bool; all results+ELSE same non-collatable casetype (casecollid 0); omitted
-  ELSE → typed NULL Const (newNullConst).
-- datum.go: caseTypeMeta allowlist (bool/int2/int4/int8/oid/numeric/timestamptz)
-  + newNullConst.
-- rebuild.go: `*CaseExpr`→rebuildCaseExpr + rebuildCaseExprWith(rec); NULL
-  defresult ↔ omitted ELSE (fixed point).
-- NEW gate case_test.go: 5 live PG18.3 adbin goldens + degradation matrix.
-- Reconciled executor sys_pg_attrdef_test.go TestCanonicalAttrdefText
-  (case-expr/case-no-else flipped SQL-text→canonical; case-mixed stays text).
+Landed: a view `WHERE CASE WHEN … THEN … [ELSE …] END` (searched form) now emits
+canonical PG18 pg_rewrite.ev_action (was SQL-text fallback). Two dispatch arms only
+(no new IR/codec), mirroring sub-slice 6:
+- resolver_query.go: queryScope.resolveExpr `*parser.CaseExpr`→resolveCaseExprWith(v, s.resolveExpr).
+- rebuild_query.go: viewRebuildScope.rebuildExpr `*CaseExpr`→rebuildCaseExprWith(v, s.rebuildExpr).
+  (searched-form / same-casetype / caseTypeMeta guards live inside the *With builders.)
+- view_bool_null_test.go: +2 live PG18.3 ev_action goldens (v7 one-WHEN+ELSE bool;
+  v8 two-WHENs+omitted-ELSE→typed-NULL defresult constisnull=t) into the 4 table-driven
+  tests; +v7/v8 structural asserts in TestViewQueryBoolNullStructure.
+- e2e_failover_goopg_to_pg_test.go: +b5c_view3 CASE view — real PG18 standby reports
+  relhasrules=true + pg_get_viewdef PARSES the CASE ev_action.
 
-Gates (GREEN): pgnodes full package, go vet ./internal/pgnodes/, go build ./...,
-gofmt -l clean, executor TestCanonicalAttrdefText, internal/initdb full.
-pgbench smoke via pre-commit hook (on commit).
+Gates (GREEN): pgnodes full pkg, go vet ./internal/pgnodes/ + ./internal/testport/,
+go build ./..., gofmt -l clean, TestE2E_FailoverGoopgToPG (6.3s). pgbench smoke via
+pre-commit hook (on commit).
 
-Key symbols: resolveCaseExprWith, rebuildCaseExprWith, caseTypeMeta,
-newNullConst, outCaseExpr/outCaseWhen, readCaseExpr/readCaseWhen.
+Key symbols: resolveCaseExprWith, rebuildCaseExprWith (both already recursion-injectable
+from sub-slice 7), queryScope.resolveExpr, viewRebuildScope.rebuildExpr.
 
-Note: `postgres` symlink (→ ../postgres) went missing at session start; restored
-it this loop (untracked convenience symlink, not committed).
-
-Next step (next loop): CASE view-query wiring (sub-slice 8) — route
-resolver_query.go queryScope.resolveExpr `*parser.CaseExpr`→
-resolveCaseExprWith(v, s.resolveExpr) + rebuild_query.go viewRebuildScope.
-rebuildExpr `*CaseExpr`→rebuildCaseExprWith(v, s.rebuildExpr) (mirror sub-slice
-6), with a live PG18.3 ev_action view golden. Then the simple form (CaseTestExpr
-node + operand=val expansion), then DistinctExpr (IS DISTINCT FROM), then the
-byte-diff oracle harness.
+Next step (next loop): CASE simple form (`CASE operand WHEN val …` — needs CaseTestExpr
+placeholder + `operand = val` OpExpr per WHEN, mirrors transformCaseExpr) and
+select_common_type cross-type result coercion. Then `IS DISTINCT FROM` (DistinctExpr),
+then operator-driven view-qual implicit coercion, then the byte-diff oracle harness.
 
 In-flight: none.

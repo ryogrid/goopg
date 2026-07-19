@@ -5862,7 +5862,18 @@ existing encoder, `constcollid=100` / `consttypmod=n+4`.
       goldens + degradation matrix) + executor `TestCanonicalAttrdefText`
       reconciled (case-expr/case-no-else flipped canonical). Design 0123-0005
       §"Sub-slice 7".
-      REMAINING: CASE **view-query** wiring (2 dispatch arms, mirror sub-slice 6)
-      + simple form (`CASE operand WHEN …`, needs CaseTestExpr) + cross-type
-      result coercion; `IS DISTINCT FROM`; operator-driven view-qual coercion
-      (unblocks int2/timestamptz literals in view quals); byte-diff oracle.
+      SUB-SLICE 8 LANDED (2026-07-19): **`CASEEXPR` in the VIEW-query path** —
+      routed `queryScope.resolveExpr` (`*parser.CaseExpr`→resolveCaseExprWith)
+      + `viewRebuildScope.rebuildExpr` (`*CaseExpr`→rebuildCaseExprWith) through
+      the sub-slice-7 injectable `*With` builders, so a view `WHERE CASE WHEN …
+      THEN … [ELSE …] END` emits canonical ev_action (was SQL text). Two dispatch
+      arms only; no new IR/codec (searched-form / same-casetype / caseTypeMeta
+      guards live in resolveCaseExprWith). Gate `internal/pgnodes/view_bool_null_test.go`
+      (2 new live PG18.3 ev_action goldens: v7 one-WHEN+ELSE bool, v8
+      two-WHENs+omitted-ELSE→typed-NULL defresult; forward + codec round-trip +
+      rebuild fixed point + v7/v8 structural asserts) + `TestE2E_FailoverGoopgToPG`
+      (new b5c_view3: a real PG18 standby reports relhasrules=true +
+      pg_get_viewdef PARSES the CASE ev_action). Design 0123-0005 §"Sub-slice 8".
+      REMAINING: CASE simple form (`CASE operand WHEN …`, needs CaseTestExpr) +
+      cross-type result coercion; `IS DISTINCT FROM`; operator-driven view-qual
+      coercion (unblocks int2/timestamptz literals in view quals); byte-diff oracle.

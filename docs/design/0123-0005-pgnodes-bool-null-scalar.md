@@ -400,12 +400,54 @@ degrade to SQL text (see ledger).
 - `go vet ./internal/pgnodes/` + `go build ./...` + `gofmt -l` clean; full
   `pgnodes` + `internal/initdb` packages green.
 
+## Sub-slice 8 — `CASEEXPR` in the VIEW-query path
+
+Sub-slice 7 wired `CASEEXPR`/`CASEWHEN` only into the scalar (column-DEFAULT)
+resolver; a view whose `WHERE` qual (or, in scope, target) used a searched
+`CASE` still fell back to SQL text. This slice routes the query-scoped
+resolver/rebuild through the same recursion-injectable `…With` builders
+sub-slice 7 already exposed for exactly this purpose (mirroring sub-slice 6's
+`BOOLEANTEST` wiring):
+
+- `resolver_query.go` — `queryScope.resolveExpr` adds a
+  `case *parser.CaseExpr: return resolveCaseExprWith(v, s.resolveExpr)`, directly
+  after the `*parser.IsBoolExpr` arm. Threading `s.resolveExpr` as the recursion
+  lets every `WHEN` condition and result operand be (or contain) a base-relation
+  column `Var`, so `CASE WHEN client > 0 THEN true ELSE false END` resolves
+  canonically instead of degrading. The searched-form-only / same-casetype /
+  `caseTypeMeta` allowlist guards live inside `resolveCaseExprWith`, so the simple
+  form and mixed-type CASE still return `ErrUnsupported` → SQL text.
+- `rebuild_query.go` — `viewRebuildScope.rebuildExpr` adds a
+  `case *CaseExpr: return rebuildCaseExprWith(v, s.rebuildExpr)`, the exact inverse
+  over the view scope. The omitted-`ELSE` ↔ synthesized-NULL-`Const` fixed point
+  (sub-slice 7) is preserved through the view path unchanged.
+
+No new IR, codec, or builder code — only two dispatch arms.
+
+### Gates (all green)
+
+- `internal/pgnodes/view_bool_null_test.go` — two new live-captured PG18.3
+  `pg_rewrite.ev_action` goldens over `bench_log` (relid 16384): `v7`
+  (`CASE WHEN client > 0 THEN true ELSE false END` — one `WHEN` + explicit
+  `ELSE`, `casetype 16`) and `v8`
+  (`CASE WHEN src IS NULL THEN false WHEN client > 0 THEN true END` — two
+  `WHEN`s + omitted `ELSE` → typed-NULL `defresult`, `constisnull true`). They
+  join the existing table-driven `TestResolveViewQueryBoolNull` (forward
+  byte-for-byte), `…RoundTrip` (Out→Read→Out), and `TestRebuildViewQueryBoolNull`
+  (resolve→`RebuildViewQuery`→re-resolve fixed point); `TestViewQueryBoolNullStructure`
+  gains v7/v8 structural assertions (explicit-ELSE non-null `Const` vs
+  omitted-ELSE synthesized-NULL `Const`, and the rebuilt-AST `Else` presence).
+- `internal/testport/e2e_failover_goopg_to_pg_test.go` — new `b5c_view3`
+  (`… WHERE CASE WHEN client > 0 THEN true ELSE false END`): a real PG18 standby
+  reports `relhasrules=true` and `pg_get_viewdef` PARSES the canonical CASE
+  `ev_action` back to the `CASE WHEN (client > 0) THEN true ELSE false END`
+  SELECT — the adversarial standby proof for the CASE query wiring.
+- full `pgnodes` package + `go vet ./internal/pgnodes/` + `go build ./...` clean.
+
 ## Deferred
 
-- The `CASE` **view-query path** (routing `resolver_query`/`rebuild_query`
-  through `resolveCaseExprWith`/`rebuildCaseExprWith`, mirroring sub-slice 6),
-  the **simple form** (`CASE operand WHEN …` — CaseTestExpr placeholder), and
-  `select_common_type` cross-type result coercion remain in M0123-S4.
+- The `CASE` **simple form** (`CASE operand WHEN …` — CaseTestExpr placeholder)
+  and `select_common_type` cross-type result coercion remain in M0123-S4.
 - `IS DISTINCT FROM` and the byte-diff oracle gate remain in M0123-S4.
   Operator-driven implicit coercion in view quals (which would let a
   `timestamptz`/`int2`→`numeric` string literal resolve inside a view `WHERE`)

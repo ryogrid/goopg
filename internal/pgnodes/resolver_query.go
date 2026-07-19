@@ -303,6 +303,14 @@ func (s *queryScope) resolveExpr(e parser.Expr, expected uint32) (Node, uint32, 
 		// may be a column Var). Mirrors the NULLTEST view wiring above.
 		return resolveBooleanTestWith(v, s.resolveExpr)
 
+	case *parser.CaseExpr:
+		// CASE WHEN cond THEN result … [ELSE result] END over view
+		// columns/expressions -> CASEEXPR, with WHEN/result operands resolved in
+		// the relation scope (so they may be column Vars). Mirrors the BOOLEANTEST
+		// view wiring above (sub-slice 6); searched form only (resolveCaseExprWith
+		// returns ErrUnsupported for the simple form).
+		return resolveCaseExprWith(v, s.resolveExpr)
+
 	case *parser.UnaryOp:
 		switch v.Op {
 		case parser.OpUnaryPos:
