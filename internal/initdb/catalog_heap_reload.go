@@ -308,6 +308,46 @@ func rebuildAttrdefExpr(adbin string) (parser.Expr, error) {
 	return parser.ParseExpr(adbin)
 }
 
+// rebuildViewFromEvAction turns a stored pg_rewrite.ev_action back into a goopg
+// view-definition AST. M0123-S3 sub-slice 2c: ev_action now comes in two forms,
+// discriminated by the leading "(" — a canonical PG18 rule action is a List of
+// query trees, so nodeToString(list) always opens "({QUERY ...})", whereas
+// goopg's legacy SQL-text fallback is a SELECT statement that never starts with
+// "(" (a parenthesized subquery view like "(SELECT ...)" is not in the
+// single-base-relation subset the canonical writer accepts, so it always took
+// the SQL-text path and never produced a leading "("). Canonical bytes are read
+// by pgnodes.ReadRuleAction → RebuildViewQuery (the reload-time inverse of
+// ResolveViewQuery); SQL text keeps going through parser.Parse. canonical
+// reports which form was decoded so the caller can restore RuleIsCanonical. A
+// malformed value in either form returns ok=false so the caller degrades that
+// one view to a plain relation rather than failing startup.
+func rebuildViewFromEvAction(evAction string) (sel *parser.SelectStmt, canonical bool, ok bool) {
+	if strings.HasPrefix(evAction, "({") {
+		nodes, err := pgnodes.ReadRuleAction(evAction)
+		if err != nil || len(nodes) != 1 {
+			return nil, false, false
+		}
+		q, qok := nodes[0].(*pgnodes.Query)
+		if !qok {
+			return nil, false, false
+		}
+		s, err := pgnodes.RebuildViewQuery(q)
+		if err != nil {
+			return nil, false, false
+		}
+		return s, true, true
+	}
+	stmts, perr := parser.Parse(evAction)
+	if perr != nil || len(stmts) != 1 {
+		return nil, false, false
+	}
+	s, sok := stmts[0].(*parser.SelectStmt)
+	if !sok {
+		return nil, false, false
+	}
+	return s, false, true
+}
+
 // statExtRegistryRecovery is the catalog-side surface the pg_statistic_ext
 // reload needs. *catalog.InMemory satisfies it.
 type statExtRegistryRecovery interface {
@@ -544,16 +584,16 @@ func loadViewsFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, clog *m
 		if !ok || tbl == nil {
 			continue // view dropped since the row was written
 		}
-		stmts, perr := parser.Parse(r.evAction)
-		if perr != nil || len(stmts) != 1 {
-			continue
-		}
-		sel, ok := stmts[0].(*parser.SelectStmt)
+		sel, canonical, ok := rebuildViewFromEvAction(r.evAction)
 		if !ok {
-			continue
+			continue // unparseable ev_action ⇒ leave the view as a plain relation
 		}
 		tbl.View = sel
 		tbl.ViewDef = r.evAction
+		// M0123-S3 sub-slice 2c: a canonical ev_action restores relhasrules=true so
+		// a re-emitted pg_class row (post-restart ALTER re-sync) stays consistent
+		// with the row the standby already replayed at CREATE VIEW time.
+		tbl.RuleIsCanonical = canonical
 		// 02e item A: matview IsPopulated is now restored from
 		// pg_class.relispopulated during loadUserTablesFromHeap (which runs
 		// before this pass), so DO NOT clobber it here. The previous

@@ -164,11 +164,52 @@ goopg re-registers/plans the view exactly as before.
   matrix (non-SELECT command, empty rtable, empty target list, out-of-range Var
   attno).
 
-## Deferred to sub-slice 2c (M0123-S3 wiring)
+## Sub-slice 2c — the engine wiring (LANDED 2026-07-19)
 
-- Wire `writeViewRewriteRow` to store canonical `ev_action`; set
-  `catalog.Table.RuleIsCanonical`; flip `pg18_user_catalog_rows.go` `relhasrules`
-  to read it; swap `loadViewsFromHeap`; update the `relhasrules=false` test
-  lock-ins.
-- Gate: standby-query E2E (goopg primary `CREATE VIEW` + a PG standby
-  `SELECT * FROM v` returning rows `==` goopg's own).
+The resolver (2a) and reload inverse (2b) are now wired into the runtime so a
+plain view's `pg_rewrite.ev_action` is a canonical PG18 node tree end-to-end.
+
+**Write path.** `executor.canonicalViewEvAction(ctx, tbl, sqlText)` runs
+`pgnodes.ResolveViewQuery` (via the new `viewRelationResolver`, a
+`pgnodes.RelationResolver` backed by the live catalog) and returns
+`(OutRuleAction bytes, true)` for a supported plain view, else `(sqlText,
+false)`. `syncTableToCatalogHeap` calls it **before** `buildUserPGClassRow` and
+stores the result in `tbl.RuleIsCanonical` — this ordering is load-bearing: the
+streamed `pg_class` heap row is what a PG standby reads for `relhasrules`, so the
+flag must be set before that row is built (an earlier draft set it inside
+`writeViewRewriteRow`, which runs *after* the pg_class write, and the standby saw
+`relhasrules=false`). The resolved `ev_action` is threaded to
+`writeViewRewriteRow` so resolution runs once.
+
+**Var type fidelity.** `viewColumnCanonicalType` derives each column's
+`atttypid/atttypmod/attcollation` by reading them back out of
+`buildUserPGAttributeRow` — the exact bytes the standby's `pg_attribute` carries
+— so a serialized `Var`'s `vartype/varcollid` cannot drift from the standby's own
+catalog. Array/domain/enum/composite/range columns (OID ≥ `FirstUserOID`) fall
+out of the subset → SQL-text fallback.
+
+**`relhasrules`.** Both the heap row (`buildUserPGClassRow`) and the virtual
+`pg_class` builder (`catalog.go`) now read `tbl.RuleIsCanonical`; every
+system/`information_schema` relation keeps it false (they never set the flag).
+
+**Reload.** `loadViewsFromHeapForDB` calls `rebuildViewFromEvAction`, which
+discriminates on the leading `"({"`: canonical → `ReadRuleAction` →
+`RebuildViewQuery` (restores `RuleIsCanonical=true`), else `parser.Parse`.
+
+**Gates.**
+- `internal/pgnodes` unchanged (still green).
+- `executor` `TestViewColumnCanonicalType` / `TestViewAttrIndexConstants`.
+- `initdb` `TestRebuildViewFromEvAction` (both ev_action forms + garbage).
+- `testport` `TestPort_ViewsSurviveRestart` now asserts `relhasrules=true`
+  survives a goopg restart (canonical write → reload round-trip).
+- `testport` `TestE2E_FailoverGoopgToPG`: a real PG18 standby reports
+  `relhasrules=true` and, via `pg_get_viewdef`, PARSES the canonical `ev_action`
+  through its own `stringToNode` and DEPARSES it back to the exact defining
+  SELECT — the adversarial proof of byte-level serializer compatibility.
+
+**Deferred (ledger 2026-07-19):** a direct `SELECT * FROM v` on the promoted
+standby still fails `42809` — PG's rewriter uses the relcache rule lock
+(`rd_rules`), not the direct `pg_rewrite` scan `pg_get_viewdef` uses, and the
+copied `pg_internal.init` caches a ruleless relcache entry for the view.
+Row-level standby evaluation waits on relcache `rd_rules` population; the
+canonical serializer + wiring are proven independently of it.

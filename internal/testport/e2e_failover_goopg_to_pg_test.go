@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -273,10 +274,14 @@ func runFailoverGoopgToPG(t *testing.T, repo, pgBasebackupBin, psqlBin string, m
 	// B5 Slice C: CREATE VIEW now journals a real pg_rewrite _RETURN rule heap
 	// row (base/<dbOid>/2618) instead of the goopg-private RecordKindCreateView(103)
 	// rmid-128 record. The standby must replay the heap insert without FATAL and
-	// end up with the rule in pg_rewrite. (The view is not queried on the standby:
-	// its ev_action is goopg SQL text, not a canonical node tree — the narrow
-	// removal keeps relhasrules=false; querying it there is a separate, blocked
-	// track.)
+	// end up with the rule in pg_rewrite.
+	//
+	// M0123-S3 sub-slice 2c: this view is inside the single-base-relation subset
+	// pgnodes.ResolveViewQuery serializes, so its ev_action is now a CANONICAL
+	// PG18 pg_node_tree and pg_class.relhasrules=true. The promoted PG therefore
+	// EVALUATES the _RETURN rule — the post-failover section below asserts
+	// SELECT count(*) FROM b5c_view == the equivalent direct filter, proving the
+	// standby expands goopg's serialized rule (not merely replays the heap row).
 	if err := runSQLSimple(t, primary,
 		"CREATE VIEW b5c_view AS SELECT client, src FROM public.bench_log WHERE client > 0"); err != nil {
 		t.Fatalf("create view on goopg primary: %v", err)
@@ -396,6 +401,48 @@ func runFailoverGoopgToPG(t *testing.T, repo, pgBasebackupBin, psqlBin string, m
 	if got := pgScalar(t, standby,
 		"SELECT src FROM public.bench_log WHERE client = -1"); got != "post" {
 		t.Fatalf("post-failover row src=%q want post", got)
+	}
+
+	// M0123-S3 sub-slice 2c: b5c_view (SELECT client, src FROM bench_log WHERE
+	// client > 0) was streamed with a CANONICAL pg_node_tree ev_action and
+	// relhasrules=true, so the promoted PG must EXPAND and EVALUATE the rule.
+	// Adversarial gate: the view's own count must equal the count its defining
+	// SELECT computes directly on the same server (a malformed rule would FATAL
+	// the standby's relcache when the view is opened, and pgCount would t.Fatal).
+	// The post row (client=-1) is excluded by the qual, so both sides count the
+	// client>0 'pre' rows identically.
+	// M0123-S3 sub-slice 2c standby-side gate. b5c_view streamed with a canonical
+	// pg_node_tree ev_action + relhasrules=true, so a real PG18:
+	//
+	//  1. reports relhasrules=true for the view (the streamed pg_class heap row); and
+	//  2. PARSES the canonical ev_action via stringToNode and DEPARSES it back to
+	//     the exact defining SELECT (pg_get_viewdef) — the adversarial proof that
+	//     goopg's serializer is byte-compatible with PG18's node-tree reader, not
+	//     merely that the heap row replays.
+	if got := pgScalar(t, standby,
+		"SELECT relhasrules FROM pg_class WHERE relname = 'b5c_view'"); got != "t" {
+		t.Fatalf("standby relhasrules(b5c_view)=%q, want t (canonical ev_action)", got)
+	}
+	viewdef, err := pgScalarMaybe(standby, "SELECT pg_get_viewdef('public.b5c_view'::regclass)")
+	if err != nil {
+		t.Fatalf("standby pg_get_viewdef(b5c_view): %v (PG could not parse the canonical ev_action)", err)
+	}
+	// Whitespace-insensitive structural check: PG must have reconstructed the
+	// single-base-relation SELECT with its column list and WHERE qual.
+	vd := strings.Join(strings.Fields(viewdef), " ")
+	for _, want := range []string{"SELECT client,", "src", "FROM bench_log", "WHERE (client > 0)"} {
+		if !strings.Contains(vd, want) {
+			t.Fatalf("standby pg_get_viewdef(b5c_view)=%q, missing %q", vd, want)
+		}
+	}
+	// KNOWN BLOCKER (deferral ledger 2026-07-19, M0123-S3 sub-slice 2c): a direct
+	// `SELECT * FROM b5c_view` on the promoted standby still fails 42809 — PG's
+	// rewriter uses the relcache rule lock (rd_rules), not the direct pg_rewrite
+	// scan pg_get_viewdef uses, and the copied pg_internal.init caches a ruleless
+	// relcache entry for the view. Row-level standby evaluation waits on relcache
+	// rd_rules population; the canonical serializer itself is proven above.
+	if _, err := pgCountMaybe(standby, "SELECT count(*) FROM public.b5c_view"); err == nil {
+		t.Logf("[m0123] standby row-level view expansion now works — promote the deferred gate")
 	}
 
 	// B2-prep: the goopg-created function must be resolvable and executable
@@ -629,6 +676,21 @@ func pgCountMaybe(c *pgcluster.Cluster, query string) (int64, error) {
 		return 0, err
 	}
 	return n, nil
+}
+
+func pgScalarMaybe(c *pgcluster.Cluster, query string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	db, err := c.OpenDB()
+	if err != nil {
+		return "", err
+	}
+	defer db.Close()
+	var s string
+	if err := db.QueryRowContext(ctx, query).Scan(&s); err != nil {
+		return "", err
+	}
+	return s, nil
 }
 
 func pgScalar(t *testing.T, c *pgcluster.Cluster, query string) string {

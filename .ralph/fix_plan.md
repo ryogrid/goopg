@@ -5726,17 +5726,29 @@ existing encoder, `constcollid=100` / `consttypmod=n+4`.
       `OutRuleAction` == golden byte-for-byte + rebuilt-AST structural check +
       producer/reader-mismatch matrix; `go test ./internal/pgnodes/` + `go vet`
       + `go build ./...` green. Design 0123-0004 §"Sub-slice 2b" + README index.
-      REMAINING (sub-slice 2 c):
-      Wire `writeViewRewriteRow` to canonical
-      `ev_action` + set the per-table `catalog.Table.RuleIsCanonical` flag; flip
-      `pg18_user_catalog_rows.go:511` `relhasrules` to read it (leave the
-      `catalog.go` system/information_schema virtual builders false). Swap
-      `loadViewsFromHeap`. Update the `relhasrules=false` test lock-ins
-      (`pg_stat_wal_receiver_nailed_test.go:111-114`,
-      `e2e_failover_goopg_to_pg_test.go:278`). Gate: standby-query E2E — goopg
-      primary `CREATE VIEW v AS SELECT client, src FROM bench_log WHERE client>0`
-      + one view over a USER-DEFINED function (≥16384 OID path); PG standby
-      `SELECT * FROM v` returns the correct rows `==` goopg's own.
+      SUB-SLICE 2 part (c) — the ENGINE WIRING — LANDED (2026-07-19):
+      `catalog.Table.RuleIsCanonical` field; executor `viewRelationResolver`
+      (pgnodes.RelationResolver over the live catalog) + `viewColumnCanonicalType`
+      (atttypid/typmod/collation read back from buildUserPGAttributeRow so a Var's
+      vartype can't drift from the standby's pg_attribute); `canonicalViewEvAction`
+      resolves a plain view's ev_action to canonical `({QUERY...})` bytes else SQL
+      text; `syncTableToCatalogHeap` sets `RuleIsCanonical` BEFORE
+      buildUserPGClassRow (load-bearing ordering — the streamed pg_class heap
+      row is the standby's relhasrules source). relhasrules reads the flag in BOTH
+      the heap row (`pg18_user_catalog_rows.go`) and the virtual builder
+      (`catalog.go:6978`); system/info-schema stay false. Reload
+      `rebuildViewFromEvAction` discriminates leading `({` →
+      ReadRuleAction->RebuildViewQuery (restores the flag) else parser.Parse.
+      Gates: TestViewColumnCanonicalType/TestViewAttrIndexConstants (executor),
+      TestRebuildViewFromEvAction (initdb), TestPort_ViewsSurviveRestart
+      (relhasrules=true survives restart), TestE2E_FailoverGoopgToPG (a real PG18
+      standby reports relhasrules=true and pg_get_viewdef PARSES the canonical
+      ev_action via stringToNode + deparses it back to the exact SELECT). Design
+      0123-0004 sub-slice 2c. DEFERRED (ledger 2026-07-19): row-level standby eval
+      — a direct `SELECT * FROM v` on the promoted standby still fails 42809
+      (rewriter uses relcache rd_rules, not the pg_rewrite scan pg_get_viewdef
+      uses; copied pg_internal.init caches a ruleless entry). Next: S4 coverage OR
+      the rd_rules standby-eval unblock.
 - [ ] M0123-S4 — coverage + hardening: more datum types (numeric, timestamptz,
       more), `CASE`/`BoolExpr`/`NullTest` in target lists, more operators; and the
       byte-diff oracle gate (goopg's emitted `ev_action`/`adbin` `==` real-PG18's

@@ -20,6 +20,8 @@ import (
 	"encoding/binary"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
+	"github.com/goopg/goopg/internal/pgnodes"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -50,12 +52,42 @@ func pgRewriteRel(ctx *Context) storage.RelFileNode {
 	return storage.RelFileNode{DBOid: tableCatalogHeapDBOid(ctx), RelOid: pgRewriteRelOID, Fork: storage.MainFork}
 }
 
+// canonicalViewEvAction resolves a view/matview's pg_rewrite ev_action into one
+// of two forms (M0123-S3 sub-slice 2c):
+//
+//	canonical — a plain view whose defining SELECT is inside the single-base-
+//	relation subset pgnodes.ResolveViewQuery supports serializes to a real PG18
+//	pg_node_tree ("({QUERY ...})"). canonical=true is the caller's signal to set
+//	tbl.RuleIsCanonical (⇒ pg_class.relhasrules=true) so a real PG18 standby
+//	EVALUATES the rule (SELECT * FROM view works on the standby).
+//
+//	SQL text — every unsupported view (JOIN/aggregate/subquery/…) and every
+//	materialized view keeps goopg's node-tree-as-text fallback and
+//	canonical=false, so relhasrules stays false and the standby never tries to
+//	expand a rule it cannot parse. Graceful-degradation invariant (02e §3):
+//	unsupported shape ⇒ fall back, never FATAL, never partial-emit.
+//
+// This MUST be resolved BEFORE buildUserPGClassRow writes the pg_class heap row
+// (syncTableToCatalogHeap sets tbl.RuleIsCanonical up front): the streamed heap
+// row is what a PG standby reads, and a relhasrules=false row would leave the
+// standby unable to expand a canonical rule it did stream into pg_rewrite.
+func canonicalViewEvAction(ctx *Context, tbl *catalog.Table, sqlText string) (evAction string, canonical bool) {
+	if tbl.View != nil && !tbl.IsMatView {
+		if q, err := pgnodes.ResolveViewQuery(tbl.View, viewRelationResolver{ctx: ctx}); err == nil {
+			return pgnodes.OutRuleAction([]pgnodes.Node{q}), true
+		}
+	}
+	return sqlText, false
+}
+
 // writeViewRewriteRow writes the _RETURN ON-SELECT rule row for a view or
-// materialized view (ev_class = the relation's pg_class OID, ev_action = its
-// defining SELECT as SQL text). Called from syncTableToCatalogHeap after the
-// pg_class row; the caller stamps the old rule via deleteCatalogRowsForOID on an
-// ALTER re-sync / rolled-back CREATE, so this is a fresh write.
-func writeViewRewriteRow(ctx *Context, tbl *catalog.Table, query string) error {
+// materialized view (ev_class = the relation's pg_class OID) with an already-
+// resolved ev_action (see canonicalViewEvAction). Called from
+// syncTableToCatalogHeap; the caller stamps the old rule via
+// deleteCatalogRowsForOID on an ALTER re-sync / rolled-back CREATE, so this is a
+// fresh write. goopg's own reload (loadViewsFromHeap) discriminates the two
+// ev_action forms by the leading "({" and rebuilds the view AST accordingly.
+func writeViewRewriteRow(ctx *Context, tbl *catalog.Table, evAction string) error {
 	rel := pgRewriteRel(ctx)
 	row := Row{
 		NewIntDatum(int64(ctx.Catalog.AllocOID())), // oid (rule OID; identity only)
@@ -65,12 +97,107 @@ func writeViewRewriteRow(ctx *Context, tbl *catalog.Table, query string) error {
 		NewIntDatum(int64('O')),                    // ev_enabled = ALWAYS
 		NewBoolDatum(true),                         // is_instead
 		NewStringDatum("<>"),                       // ev_qual (empty node tree)
-		NewStringDatum(query),                      // ev_action (SQL text — node-tree-as-text)
+		NewStringDatum(evAction),                   // ev_action (canonical node tree or SQL text)
 	}
 	if _, err := writeHeapRowCanonical(ctx, rel, PGRewriteColumnsPG18(), row); err != nil {
 		return err
 	}
 	return nil
+}
+
+// viewRelationResolver adapts the live catalog to pgnodes.RelationResolver so
+// ResolveViewQuery can look up the single base relation a supported view selects
+// from. It resolves against the connection's current database and returns
+// (nil,false) — which the resolver treats as ErrUnsupported → SQL-text fallback —
+// for anything outside the plain-scalar-builtin-column subset.
+type viewRelationResolver struct {
+	ctx *Context
+}
+
+// LookupRelation resolves the view's FROM name to its column metadata. It is a
+// no-match (SQL-text fallback) unless every column is a plain scalar built-in
+// type, because a Var's serialized vartype/varcollid MUST equal the atttypid/
+// attcollation the standby sees in its own pg_attribute — the exact same values
+// buildUserPGAttributeRow writes. viewColumnCanonicalType reuses that writer so
+// the two paths cannot drift (sibling-paths-must-agree).
+func (r viewRelationResolver) LookupRelation(schema, name string) (*pgnodes.RelationInfo, bool) {
+	tbl, ok := r.ctx.Catalog.LookupTable(
+		parser.ObjectName{Schema: schema, Name: name},
+		catalog.NamespaceDBOid(r.ctx.CurrentDatabaseOid))
+	if !ok || tbl == nil {
+		return nil, false
+	}
+	cols := make([]pgnodes.ColumnInfo, 0, len(tbl.Columns))
+	for _, col := range tbl.Columns {
+		typeOID, typmod, collation, ok := viewColumnCanonicalType(r.ctx.Catalog, tbl, col)
+		if !ok {
+			return nil, false // user/array/dropped column ⇒ not serializable
+		}
+		cols = append(cols, pgnodes.ColumnInfo{
+			Name:      col.Name,
+			Attno:     int32(col.Ordinal + 1),
+			TypeOID:   typeOID,
+			Typmod:    typmod,
+			Collation: collation,
+		})
+	}
+	return &pgnodes.RelationInfo{
+		Relid:   tbl.OID,
+		Relname: tbl.Name,
+		Relkind: relkindByteForTable(tbl),
+		Columns: cols,
+	}, true
+}
+
+// pg_attribute physical column indices (pgAttributeColumnsPG18 order) that
+// viewColumnCanonicalType reads back. Verified by a unit test against the
+// schema column names so a layout change can't silently misalign them.
+const (
+	attTypidRowIdx     = 2  // atttypid
+	attTypmodRowIdx    = 5  // atttypmod
+	attCollationRowIdx = 19 // attcollation
+)
+
+// viewColumnCanonicalType returns the atttypid/atttypmod/attcollation a column
+// serializes to in a canonical view Var, or ok=false when the column falls
+// outside the plain-scalar-builtin subset (arrays and user-defined enum/
+// composite/domain/range types, all of which the pgnodes query resolver does
+// not model). It obtains the values from buildUserPGAttributeRow — the exact
+// bytes the standby's pg_attribute carries — so a serialized Var's vartype
+// always equals the standby's atttypid.
+func viewColumnCanonicalType(cat catalog.Catalog, tbl *catalog.Table, col catalog.Column) (typeOID uint32, typmod int32, collation uint32, ok bool) {
+	if col.Type.IsArray || col.DeclaredTypeName != "" {
+		return 0, 0, 0, false // array / domain column: not in the supported subset
+	}
+	row := buildUserPGAttributeRow(cat, tbl, col)
+	typeOID = uint32(row[attTypidRowIdx].Int)
+	typmod = int32(row[attTypmodRowIdx].Int)
+	collation = uint32(row[attCollationRowIdx].Int)
+	// Any dynamic user-type OID (enum/composite/domain/range) is >= FirstUserOID;
+	// the pgnodes resolver only understands built-in scalar OIDs.
+	if typeOID >= catalog.FirstUserOID {
+		return 0, 0, 0, false
+	}
+	return typeOID, typmod, collation, true
+}
+
+// relkindByteForTable mirrors buildUserPGClassRow's relkind derivation as the
+// single byte the RTE_RELATION node stores (RangeTblEntry.relkind). A supported
+// view's base relation is normally an ordinary table ('r'); the other kinds are
+// included for completeness.
+func relkindByteForTable(tbl *catalog.Table) byte {
+	switch {
+	case tbl.IsSequence:
+		return 'S'
+	case tbl.PartitionMethod != "":
+		return 'p'
+	case tbl.IsMatView:
+		return 'm'
+	case tbl.View != nil:
+		return 'v'
+	default:
+		return 'r'
+	}
 }
 
 // stampViewRewriteRows stamps xmax on every live pg_rewrite row whose ev_class

@@ -13215,6 +13215,17 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 	// restart leaked the table into the postgres namespace (with its data
 	// unreachable, since the reloaded Table lost its DBOid routing).
 	heapDBOid := tableCatalogHeapDBOid(ctx)
+	// M0123-S3 sub-slice 2c: resolve the view's canonical pg_rewrite ev_action
+	// (and set tbl.RuleIsCanonical) BEFORE buildUserPGClassRow so the streamed
+	// pg_class heap row's relhasrules matches the rule that will be written to
+	// pg_rewrite below. A PG standby reads relhasrules from this heap row; a late
+	// flag would leave it false and the standby couldn't expand the canonical
+	// rule it did stream. viewEvAction is threaded to writeViewRewriteRow so the
+	// resolution runs exactly once.
+	viewEvAction := tbl.ViewDef
+	if ctx.Pool != nil && tbl.ViewDef != "" && (tbl.IsMatView || tbl.View != nil) {
+		viewEvAction, tbl.RuleIsCanonical = canonicalViewEvAction(ctx, tbl, tbl.ViewDef)
+	}
 	classRel := storage.RelFileNode{
 		DBOid:  heapDBOid,
 		RelOid: catalog.RelationRelationId,
@@ -13289,7 +13300,7 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 	// standby replays the heap insert. (matview IsPopulated survives a restart via
 	// pg_class.relispopulated — 02e item A.)
 	if ctx.Pool != nil && tbl.ViewDef != "" && (tbl.IsMatView || tbl.View != nil) {
-		if err := writeViewRewriteRow(ctx, tbl, tbl.ViewDef); err != nil {
+		if err := writeViewRewriteRow(ctx, tbl, viewEvAction); err != nil {
 			return fmt.Errorf("pg_rewrite (view/matview): %w", err)
 		}
 	}

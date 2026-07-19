@@ -459,6 +459,18 @@ type Table struct {
 	// (false for WITH NO DATA, true after first REFRESH). M0097-0013.
 	IsPopulated bool
 
+	// RuleIsCanonical marks a plain view (relkind='v') whose pg_rewrite _RETURN
+	// rule was written with a canonical PG18 pg_node_tree ev_action (the
+	// internal/pgnodes query-tree serializer, M0123-S3), not goopg's SQL-text
+	// fallback. It is HARD-coupled to pg_class.relhasrules=true: a real PG18
+	// standby that sees relhasrules=true FATALs its relcache if ev_action is not
+	// a parseable node tree, so the writer sets this flag ONLY after
+	// pgnodes.ResolveViewQuery succeeds and stores canonical bytes; every
+	// unsupported view keeps SQL text + RuleIsCanonical=false. Restored on
+	// startup by loadViewsFromHeap (canonical ev_action ⇒ true). False for
+	// matviews and every system/information_schema virtual relation.
+	RuleIsCanonical bool
+
 	// ForeignServerName marks this table as a foreign table (`CREATE FOREIGN
 	// TABLE ... SERVER <name>`), giving it relkind='f'. Empty for an ordinary
 	// table. DU-002 slice 417.
@@ -6928,6 +6940,13 @@ func (c *InMemory) PGClassRowsForDBOid(dbOid uint32) [][]string {
 			if len(t.Triggers) > 0 {
 				relHasTriggers = "t"
 			}
+			// relhasrules is true for a plain view whose pg_rewrite _RETURN rule
+			// was written with a canonical PG18 pg_node_tree ev_action (M0123-S3
+			// sub-slice 2c). RuleIsCanonical is only ever set on user views, so
+			// system-catalog virtual relations (RuleIsCanonical=false) stay 'f'.
+			// This mirrors the heap pg_class row buildUserPGClassRow writes so
+			// goopg's own introspection and the streamed catalog agree.
+			relHasRules := boolToPGChar(t.RuleIsCanonical)
 			// relacl — NULL until a GRANT records non-owner privileges, then the
 			// materialized aclitem[] (owner full + each grantee). pg_dump's
 			// getTables reads this directly and re-emits GRANTs (buildACLCommands,
@@ -6963,7 +6982,7 @@ func (c *InMemory) PGClassRowsForDBOid(dbOid uint32) [][]string {
 				relkind,                         // 17: relkind
 				strconv.Itoa(len(t.Columns)),    // 18: relnatts
 				strconv.Itoa(relchecks),         // 19: relchecks
-				"f",                             // 20: relhasrules
+				relHasRules,                     // 20: relhasrules
 				relHasTriggers,                  // 21: relhastriggers
 				func() string {
 					if len(c.partitionChildren[t.OID]) > 0 {
