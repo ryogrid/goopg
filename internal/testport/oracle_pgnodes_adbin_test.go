@@ -217,6 +217,12 @@ var adbinOracleCases = []adbinOracleCase{
 	{"date_post_2000", "date", pgnodes.OidDate, "'2024-03-15'"},
 	{"date_epoch", "date", pgnodes.OidDate, "'2000-01-01'"},
 	{"date_pre_epoch", "date", pgnodes.OidDate, "'1999-12-31'"},
+	// Sub-slice 27: an explicit `::date` / `::timestamptz` cast of a bare string
+	// literal folds to the SAME by-value Const at parse time (coerce_type →
+	// stringTypeToConst); the `::type` supplies the target type but adds no cast
+	// node, so the adbin is byte-identical to the bare-literal column-context fold.
+	{"date_cast", "date", pgnodes.OidDate, "'2024-03-15'::date"},
+	{"timestamptz_cast", "timestamptz", pgnodes.OidTimestamptz, "'2024-01-15 10:30:00+00'::timestamptz"},
 }
 
 // TestOraclePgnodesAdbinBytesMatchPG is the M0123-S4 byte-diff oracle: for each

@@ -1,32 +1,34 @@
 (idle — nothing in flight)
 
-Last loop (#40): M0123-S4 sub-slice 26 — canonical `date` (OID 1082) Const datums.
-LANDED + committed. A `date` column DEFAULT literal (`d date DEFAULT '2024-03-15'`)
-now folds to a by-value DateADT Const (int32 days-since-2000, constlen 4, consttype
-1082) byte-for-byte identical to PG18.3's pg_attrdef.adbin. date_in is TimeZone-
-INDEPENDENT so (unlike timestamptz) any plain ISO date folds deterministically; the
-only guard is calendar validity (j2date∘date2j round-trip rejects month 13 / Feb 30).
+Last loop (#41): M0123-S4 sub-slice 27 — explicit `::date` / `::timestamptz` cast
+of a string literal folds to the SAME by-value Const as the bare-literal column
+form. LANDED + committed. PG folds an unknown-type string literal at parse time
+(coerce_type→stringTypeToConst→type input func) into a Const whose consttype is the
+cast target, with NO cast node — so `'2024-03-15'::date` stores a bare DateADT Const
+byte-identical to `DEFAULT '2024-03-15'`. Closes the asymmetry where the bare form
+was canonical but the explicit-cast form degraded to SQL text.
 
-Files: internal/pgnodes/datum.go (OidDate=1082, NewDateConst, parseDateDays,
-formatDate — reuse existing date2j/j2date/parseDateFields math); resolver_expr.go
-(StringConst date arm parallel to timestamptz); rebuild.go (rebuildConst OidDate case);
-date_test.go (NEW: 5 live goldens + math table + degradation); oracle_pgnodes_adbin_
-test.go (+3 date cases → 64 total); executor/sys_pg_attrdef_test.go (+date-lit / date-
-lit-invalid). NO executor change (TypeNameToOID("date")==1082 already routes it).
-Design 0123-0005 §"Sub-slice 26" + fix_plan + ledger.
+Files: internal/pgnodes/resolver_expr.go (resolveCastExpr leading date/timestamptz
+string-fold arm — parseDateDays/parseTimestamptzMicros; non-string operand / invalid
+/ TZ-dependent / typmod'd → ErrUnsupported). NO IR/codec/rebuild change (folded Const
+== column-context form; rebuildConst's OidDate/OidTimestamptz arms already invert it).
+NEW internal/pgnodes/datetime_cast_test.go (3 goldens w/ UNKNOWN context + cast==bare
+pair + degradation matrix + column-scoped reload fixed point); oracle_pgnodes_adbin_
+test.go +2 (date_cast/timestamptz_cast → 29 cases); executor sys_pg_attrdef_test.go
++date-cast/tstz-cast/tstz-cast-notz. Design 0123-0005 §"Sub-slice 27" + fix_plan + ledger.
 
-Gates GREEN: full pgnodes pkg; adbin oracle 64/64 byte-identical vs LIVE PG18.3;
-executor+initdb attrdef siblings; go build ./..., go vet (pgnodes/testport/executor),
+Gates GREEN: full pgnodes pkg; adbin oracle 29/29 byte-identical vs LIVE PG18.3;
+executor TestCanonicalAttrdefText; go build ./..., go vet (pgnodes/testport/executor),
 gofmt clean; pgbench smoke via pre-commit.
 
 Nightly triage (run 20260719-094219, sha c217c692): all 5 AI items already [x] stale
 (predate HEAD). No new nightly work.
 
-Next (M0123-S4 REMAINING): (1) float4-common (no float8) CASE result mix — int/numeric
-→float4 arms + outer float8(float4) column cast (selectCaseCommonType/coerceCaseResult);
-(2) date-time-family CASE coercion — now that the date datum exists, needs a `::date`/
-`::timestamptz` CastExpr fold of a StringConst in a natural/non-column context; (3) other
-length types (varchar(N)=CoerceViaIO, timestamp(N), bit(N)); (4) operator-driven view-qual
-coercion; (5) broader date input forms — infinity/-infinity, BC years, DateStyle-dependent
-MDY/DMY, textual month (ledger sub-slice 26 resume point). ALL numeric + date column
-DEFAULT Const shapes now canonical.
+Next (M0123-S4 REMAINING): (1) broader literal-cast folds — string→int4/int8/bool
+(`'123'::int4`, `'t'::bool`) via pg_atoi/boolin analogues in resolveCastExpr; (2)
+float4-common (no float8) CASE mix — int/numeric→float4 arms + outer float8(float4)
+column cast (selectCaseCommonType/coerceCaseResult); (3) operator-driven view-qual
+coercion (unblocks int2/timestamptz literals inside a view WHERE — resolver_query.go);
+(4) other length types (varchar(N)=CoerceViaIO, timestamp(N), bit(N)); (5) broader date
+input forms (infinity/-infinity, BC years, DateStyle MDY/DMY, textual month — datum.go
+parseDateDays). ALL date/timestamptz literal (bare + explicit-cast) Const shapes canonical.

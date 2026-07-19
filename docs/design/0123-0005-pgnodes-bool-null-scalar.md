@@ -1335,6 +1335,49 @@ bytes, and a pre-2000 (negative) day count sign-extends into the high bytes
 - Full `pgnodes` package + `go vet` + gofmt clean; initdb reload siblings green;
   pgbench smoke via pre-commit.
 
+## Sub-slice 27 — explicit `::date` / `::timestamptz` cast of a string literal
+
+Sub-slices 26 and 4b folded a `date` / `timestamptz` DEFAULT literal to a by-value
+`Const`, but only in a **column context** (the target type came from the column). The
+explicit-cast form (`d date DEFAULT '2024-03-15'::date`) still degraded to SQL text —
+an asymmetry, because PG stores the two forms **byte-identically**. An explicit
+`::T` cast of a *bare string literal* is a parse-time coercion of an unknown-type
+literal: `coerce_type` folds it via `stringTypeToConst` → the type's input function
+into a `Const` whose `consttype` is the target type, with **no cast node** in the tree
+(the `::T` supplies the target type but adds no wrapper). So `'2024-03-15'::date`
+stores the exact same bare `DateADT` `Const` as the column-context fold.
+
+### Changes
+
+- `resolver_expr.go` — `resolveCastExpr` gains a leading arm: when the target is
+  `date`/`timestamptz`, the operand is a bare `*parser.StringConst`, and there is no
+  typmod, fold the literal directly (`parseDateDays` / `parseTimestamptzMicros`) to
+  `NewDateConst` / `NewTimestamptzConst`. `date_in` is TimeZone-independent so any
+  plain ISO date folds; `timestamptz` keeps its deterministic subset (explicit
+  offset / `epoch`). A non-string operand (`now()::date` — a genuine conversion node),
+  an unparseable/invalid literal, a TimeZone-dependent `timestamptz` form, or a
+  typmod-qualified target (`::timestamptz(3)`) all fall through to `ErrUnsupported` →
+  SQL text (all-or-nothing; 02e §3).
+- No IR, codec, or `rebuild.go` change: the folded `Const` is byte-identical to the
+  column-context form, so `rebuildConst`'s existing `OidDate`/`OidTimestamptz` arms
+  (bare-string, column-scoped fixed point) already invert it. The reload re-resolves
+  the rebuilt bare literal in the restored column context, exactly as sub-slice 26.
+
+### Gates (all green)
+
+- `internal/pgnodes/datetime_cast_test.go` — 3 goldens (`'2024-03-15'::date`,
+  `'1999-12-31'::date`, `'2024-01-15 10:30:00+00'::timestamptz`) resolved with an
+  **unknown** context (proving the type comes from the cast); a `MatchesBareFold` pair
+  test (cast form `==` column-context form); a degradation matrix (non-string operand,
+  invalid literal, no-offset `timestamptz`, `::timestamp` with no modeled datum); and a
+  column-scoped reload fixed-point loop.
+- `internal/testport/oracle_pgnodes_adbin_test.go` — `date_cast` + `timestamptz_cast`
+  added (**29 cases total**, all byte-identical vs LIVE PG18.3; PG confirms the
+  explicit-cast form stores a bare `Const`).
+- `internal/executor/sys_pg_attrdef_test.go` — `date-cast` / `tstz-cast` (canonical) +
+  `tstz-cast-notz` (SQL-text fallback).
+- Full `pgnodes` package + `go vet` + gofmt clean; pgbench smoke via pre-commit.
+
 ## Byte-diff oracle gate (adbin) — `internal/testport/oracle_pgnodes_adbin_test.go`
 
 The per-datum golden tests above each hard-code a `want` `adbin` string a
@@ -1354,10 +1397,11 @@ AdbinBytesMatchPG` closes both by re-deriving the oracle **live**: for each
    **byte-identical**. A goopg SQL-text fallback (`ok==false`) on a case PG stores
    canonically is itself a failure.
 
-The 27 cases span every S4-canonical family: bare `Const` leaves (int4/int8 by
+The 29 cases span every S4-canonical family: bare `Const` leaves (int4/int8 by
 magnitude, folded negative, text, numeric decimal/scientific/negative),
-`int4→numeric` cast FuncExpr, built-in FuncExpr (`upper`), timestamptz literal
-Const, `BoolExpr`/`NullTest`/`OpExpr` (incl. `makeAndExpr` 3-arg flattening),
+`int4→numeric` cast FuncExpr, built-in FuncExpr (`upper`), timestamptz/date literal
+Const (bare + explicit `::T` cast form),
+`BoolExpr`/`NullTest`/`OpExpr` (incl. `makeAndExpr` 3-arg flattening),
 `BooleanTest` (`IS TRUE`/`IS UNKNOWN`), `DistinctExpr` (int + text), and
 `CaseExpr` (searched + simple, same-type and cross-type int→numeric / int4→int8
 result coercion, and simple-form WHEN-value int→numeric coercion). Every case is

@@ -50,6 +50,15 @@ func TestCanonicalAttrdefText(t *testing.T) {
 		{"date-lit", col("date", "'2024-03-15'"), true, []string{"CONST", "1082", "constlen 4"}},
 		// An invalid calendar triple (Feb 30) can't fold → SQL text fallback.
 		{"date-lit-invalid", col("date", "'2024-02-30'"), false, []string{"2024-02-30"}},
+		// An explicit `::date` / `::timestamptz` cast of a string literal folds to the
+		// SAME by-value Const (parse-time unknown-literal coercion adds no cast node),
+		// so the writer stores canonical adbin identical to the bare-literal form.
+		// M0123-S4 sub-slice 27.
+		{"date-cast", col("date", "'2024-03-15'::date"), true, []string{"CONST", "1082", "constlen 4"}},
+		{"tstz-cast", col("timestamptz", "'2024-01-15 10:30:00+00'::timestamptz"), true, []string{"CONST", "1184", "constlen 8"}},
+		// A `::timestamptz` cast of a TimeZone-dependent (no-offset) literal still
+		// degrades to SQL text — the cast supplies the type, not determinism.
+		{"tstz-cast-notz", col("timestamptz", "'2024-01-15 10:30:00'::timestamptz"), false, []string{"2024-01-15"}},
 		// Integer literal in a numeric column: canonical via the implicit
 		// int4_numeric cast FuncExpr (funcid 1740, funcformat 2). M0123-S4 sub-slice 4a.
 		{"numeric-int-lit", col("numeric", "0"), true, []string{"FUNCEXPR", "1740", "1700"}},

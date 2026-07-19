@@ -1371,9 +1371,24 @@ existing encoder, `constcollid=100` / `consttypmod=n+4`.
       LIVE PG18.3 + executor `TestCanonicalAttrdefText` date-lit/date-lit-invalid. Design
       0123-0005 §"Sub-slice 26". DEFERRED (ledger): non-ISO / special date input forms
       (`infinity`/`-infinity`, BC years, `DateStyle`-dependent `MM/DD/YYYY`, textual month).
+      SUB-SLICE 27 LANDED (2026-07-20): explicit **`::date` / `::timestamptz` cast of a
+      string literal**. `d date DEFAULT '2024-03-15'::date` (and the timestamptz form) now
+      folds to the SAME by-value Const as the bare-literal column-context form — PG's
+      coerce_type folds an unknown-type literal via stringTypeToConst→the type input
+      function with NO cast node, so the adbin is byte-identical (closes the asymmetry
+      where the bare form was canonical but the explicit-cast form degraded). resolver_expr.go
+      `resolveCastExpr` gains a leading date/timestamptz string-fold arm (parseDateDays /
+      parseTimestamptzMicros; non-string operand / invalid literal / TZ-dependent form /
+      typmod'd target → ErrUnsupported). NO IR/codec/rebuild change (the folded Const is
+      identical to the column-context form; rebuildConst's existing OidDate/OidTimestamptz
+      arms invert it via the column-scoped fixed point). Gate `internal/pgnodes/datetime_
+      cast_test.go` (3 goldens resolved with UNKNOWN context + cast==bare-fold pair +
+      degradation matrix + column-scoped reload fixed point) + oracle_pgnodes_adbin_test.go
+      now **29 cases** all byte-identical vs LIVE PG18.3 (PG confirms the bare-Const store)
+      + executor `TestCanonicalAttrdefText` date-cast/tstz-cast/tstz-cast-notz. Design
+      0123-0005 §"Sub-slice 27".
       REMAINING: float4-common (no
-      float8) CASE mix (needs int/numeric→float4 arms + outer column cast); date-time-
-      family CASE coercion (searched CASE over date/timestamptz `::type`-cast literal
-      arms — now that the `date` OID-1082 datum exists, needs explicit `::timestamptz`/
-      `::date` cast folding of a string literal in a natural/non-column context);
-      operator-driven view-qual coercion (unblocks int2/timestamptz literals).
+      float8) CASE mix (needs int/numeric→float4 arms + outer column cast); operator-driven
+      view-qual coercion (unblocks int2/timestamptz literals inside a view WHERE); other
+      length types (`varchar(N)`=CoerceViaIO, `timestamp(N)`, `bit(N)`); broader date input
+      forms (`infinity`, BC years, DateStyle-dependent).

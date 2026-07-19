@@ -338,6 +338,38 @@ func resolveCastExpr(v *parser.CastExpr) (Node, uint32, error) {
 		return nil, 0, ErrUnsupported
 	}
 	targetOID := catalog.TypeNameToOID(v.Type.Name)
+	// An explicit `::date` / `::timestamptz` cast of a BARE string literal is a
+	// parse-time coercion of an unknown-type literal: PG's coerce_type folds it via
+	// stringTypeToConst → the type's input function to a by-value Const, with NO cast
+	// node in the tree (coerce_type collapses the coercion into the folded Const's
+	// consttype). The stored adbin is therefore byte-identical to the same literal
+	// written in a date/timestamptz COLUMN context (resolve's StringConst arm) — the
+	// explicit `::type` only supplies the target type, it does not add a wrapper.
+	// This closes the asymmetry where `DEFAULT '2024-03-15'` folded canonically but
+	// `DEFAULT '2024-03-15'::date` degraded to SQL text. Only the two by-value
+	// datum types with a modeled fold qualify: date_in is TimeZone-independent so any
+	// plain ISO date literal folds (parseDateDays guards calendar validity), while
+	// timestamptz folds only the deterministic subset (parseTimestamptzMicros — an
+	// explicit offset / 'epoch'); a TimeZone-dependent form, an unparseable literal,
+	// or a typmod-qualified target (`::timestamptz(3)`) degrades to SQL text
+	// (all-or-nothing; 02e §3). A non-string operand (`now()::date`) is a genuine
+	// conversion node, not a literal fold, and is out of scope.
+	if len(v.Typmods) == 0 {
+		if lit, isStr := v.Operand.(*parser.StringConst); isStr {
+			switch targetOID {
+			case OidDate:
+				if days, ok := parseDateDays(lit.Value); ok {
+					return NewDateConst(days), OidDate, nil
+				}
+				return nil, 0, ErrUnsupported
+			case OidTimestamptz:
+				if usec, ok := parseTimestamptzMicros(lit.Value); ok {
+					return NewTimestamptzConst(usec), OidTimestamptz, nil
+				}
+				return nil, 0, ErrUnsupported
+			}
+		}
+	}
 	if len(v.Typmods) != 0 {
 		// Only a typmod-qualified numeric target (`::numeric(p[,s])`) is modeled:
 		// PG's coerce_to_target_type follows the base int→numeric cast with a
