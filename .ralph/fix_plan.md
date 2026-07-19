@@ -5782,5 +5782,21 @@ existing encoder, `constcollid=100` / `consttypmod=n+4`.
       forward + codec round-trip + rebuild fixed point + structure) and
       `TestE2E_FailoverGoopgToPG` (new b5c_view2: a real PG18 standby reports
       relhasrules=true + pg_get_viewdef PARSES the bool/null ev_action). Design
-      0123-0005 §"Sub-slice 2" + README index. REMAINING: numeric/timestamptz
-      datums; `CASE`/`BooleanTest`/`IS DISTINCT FROM`; the byte-diff oracle gate.
+      0123-0005 §"Sub-slice 2" + README index.
+      SUB-SLICE 3 LANDED (2026-07-19): canonical **`numeric` (OID 1700) Const
+      datums**. A decimal/scientific literal now packs into the on-disk
+      `NumericData` varlena (`datum.go` `parseNumericVar`=set_var_from_str+strip_var,
+      `varlena`=make_result_opt_error: short/long header + int16 NBASE=10000
+      digits, all little-endian) byte-for-byte identical to PG18.3's adbin/
+      ev_action; `decodeNumericVar`+`text`(=get_str_from_var) invert for rebuild
+      preserving dscale trailing zeros (`100.50`≠`100.5`). Wired `*parser.NumericConst`
+      (+ folded negative via `OpUnaryNeg`→doNegate) into BOTH the scalar and
+      query-scoped resolvers/rebuild. Gate `internal/pgnodes/numeric_test.go`
+      (green): 6 live scalar adbin goldens (100.50/0.001/9999.9999/π-digits/-2.5/1E-10)
+      + a live `vn` view ev_action golden (`amount > 100.50 AND rate < 0.001`),
+      each forward byte-for-byte + codec round-trip + resolve→Rebuild→re-resolve
+      fixed point. DISCOVERY: integer-valued numeric defaults (`DEFAULT 0`,
+      `DEFAULT 12345`) are int4 wrapped in an `int4_numeric` cast FuncExpr
+      (funcid 1740), NOT numeric Consts — still SQL-text (deferred). Design
+      0123-0005 §"Sub-slice 3". REMAINING: `int4_numeric` implicit cast;
+      timestamptz datums; `CASE`/`BooleanTest`/`IS DISTINCT FROM`; byte-diff oracle.

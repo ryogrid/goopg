@@ -84,6 +84,11 @@ func resolve(e parser.Expr, expected uint32) (Node, uint32, error) {
 	case *parser.IntegerConst:
 		return resolveIntLiteral(v.Value, expected)
 
+	case *parser.NumericConst:
+		// A decimal/scientific literal is typed numeric by PG's scanner
+		// regardless of context (make_const on a T_Float token).
+		return resolveNumericLiteral(v.Value, false)
+
 	case *parser.BooleanConst:
 		return NewBoolConst(v.Value), OidBool, nil
 
@@ -103,9 +108,12 @@ func resolve(e parser.Expr, expected uint32) (Node, uint32, error) {
 		case parser.OpUnaryPos:
 			return resolve(v.Operand, expected)
 		case parser.OpUnaryNeg:
-			// PG folds `- <int literal>` into one negative Const (doNegate).
+			// PG folds `- <literal>` into one negative Const (doNegate).
 			if lit, ok := v.Operand.(*parser.IntegerConst); ok {
 				return resolveIntLiteral(-lit.Value, expected)
+			}
+			if lit, ok := v.Operand.(*parser.NumericConst); ok {
+				return resolveNumericLiteral(lit.Value, true)
 			}
 			return nil, 0, ErrUnsupported
 		case parser.OpNot:
@@ -228,6 +236,18 @@ func resolveIntLiteral(v int64, expected uint32) (Node, uint32, error) {
 	}
 	// expected is int4, unknown, or a compatible context: emit int4.
 	return NewInt4Const(int32(v)), OidInt4, nil
+}
+
+// resolveNumericLiteral types a decimal/scientific literal as numeric (OID 1700)
+// — PG's scanner types a T_Float token numeric regardless of the surrounding
+// context. negative folds an outer unary minus into the packed Const the way
+// gram.y's doNegate produces a single negative numeric Const.
+func resolveNumericLiteral(text string, negative bool) (Node, uint32, error) {
+	n, err := NewNumericConst(text, negative)
+	if err != nil {
+		return nil, 0, err
+	}
+	return n, OidNumeric, nil
 }
 
 // resolveBinaryOp resolves a two-operand operator to an OpExpr by forward-

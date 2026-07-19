@@ -135,7 +135,60 @@ SQL-text fallback + `relhasrules=false`).
   reports `relhasrules=true` for `b5c_view2` and PARSES its canonical bool/null
   `ev_action` via `pg_get_viewdef` (reconstructs `src IS NOT NULL` + `client > 0`).
 
+## Sub-slice 3 (2026-07-19): canonical `numeric` (OID 1700) Const datums
+
+A decimal / scientific literal (`parser.NumericConst`) now resolves to a numeric
+`Const` whose `constvalue` is the packed on-disk `NumericData` varlena, byte-for-
+byte identical to what PostgreSQL 18.3 stores in `adbin` / `ev_action`.
+
+### The on-disk format (`internal/pgnodes/datum.go`)
+
+`numeric` is a non-collatable varlena (`constcollid 0`, `constlen -1`,
+`constbyval false`). `outfuncs.c:outDatum` dumps the whole varlena — including
+the 4-byte length header — one signed byte at a time, so reproducing the exact
+in-memory bytes an x86-64 PG holds is what makes the tree byte-identical. The
+encoder mirrors `numeric.c` faithfully:
+
+1. `parseNumericVar` = `set_var_from_str` + `strip_var` (NBASE = 10000,
+   `DEC_DIGITS = 4`): parse sign / decimal point / exponent to a decimal
+   `dweight`+`dscale`, convert to base-10000 digits, then strip leading/trailing
+   zero NBASE digits (a zero value forces `weight 0` / `POS`).
+2. `varlena` = `make_result_opt_error`: emit `VARSIZE << 2` (little-endian, the
+   `va_4byte` header form) then either the **short** header (`uint16 n_header` =
+   `NUMERIC_SHORT | sign | (dscale << 7) | weight-6-bit`, chosen when
+   `dscale ≤ 63` and `weight ∈ [-64, 63]`) or the **long** header
+   (`uint16 n_sign_dscale` + `int16 n_weight`), followed by the `int16`
+   base-10000 digits — all little-endian.
+3. `decodeNumericVar` + `text` = the inverse (`get_str_from_var`) for rebuild,
+   preserving `dscale` trailing zeros so `100.50` re-encodes identically (does
+   NOT collapse to `100.5`).
+
+A folded negative (`- 2.5`) resolves via the `OpUnaryNeg`→`NumericConst` branch
+to a single negative `Const` (gram.y's `doNegate`), and rebuilds back to
+`UnaryOp{-, NumericConst}` — the parser's own tagging.
+
+### Discovery: integer-valued numeric defaults are NOT numeric Consts
+
+`numeric DEFAULT 0` / `DEFAULT 12345` are typed **int4** by the scanner and
+wrapped in an `int4_numeric` cast `FuncExpr` (funcid 1740) — only a literal with
+a decimal point / exponent is typed numeric. goopg does not yet emit that
+implicit-cast FuncExpr, so those defaults still degrade to SQL text (deferred;
+see ledger).
+
+### Gates (all green)
+
+- `internal/pgnodes/numeric_test.go` — six live-captured PG18.3 scalar `adbin`
+  goldens (`100.50`, `0.001`, `9999.9999`, `3.14159265358979`, `-2.5`, `1E-10`):
+  forward resolve→`Out` byte-for-byte, `Read`→`Out` codec round-trip,
+  resolve→`Rebuild`→re-resolve fixed point, exact rebuilt-literal-text +
+  dscale-preservation check, and negative-Const rebuild shape.
+- Same file — a live-captured `ev_action` view golden (`vn`: `amount > 100.50 AND
+  rate < 0.001` over numeric columns, OPEXPR opno 1756/1754): forward
+  `OutRuleAction` byte-for-byte, codec round-trip, and `RebuildViewQuery` fixed
+  point.
+
 ## Deferred
 
-- `numeric`/`timestamptz` datums, `CASE`, `BooleanTest` (`IS TRUE`/`IS FALSE`),
+- `timestamptz` datums, the `int4_numeric` implicit-cast FuncExpr for
+  integer-valued numeric defaults, `CASE`, `BooleanTest` (`IS TRUE`/`IS FALSE`),
   `IS DISTINCT FROM`, and the byte-diff oracle gate remain in M0123-S4.

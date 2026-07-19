@@ -154,6 +154,19 @@ func rebuildConst(c *Const) (parser.Expr, error) {
 		return &parser.BooleanConst{Value: int64FromByvalWord(c.Datum) != 0}, nil
 	case OidText:
 		return &parser.StringConst{Value: textFromVarlena(c.Datum)}, nil
+	case OidNumeric:
+		// Decode the packed NumericData back to its canonical decimal text
+		// (preserving dscale trailing zeros so a re-resolve is a fixed point);
+		// a negative value becomes UnaryOp{-, |v|}, matching doNegate.
+		v, err := decodeNumericVar(c.Datum)
+		if err != nil {
+			return nil, fmt.Errorf("pgnodes: Rebuild: numeric Const: %w", err)
+		}
+		lit := &parser.NumericConst{Value: v.text()}
+		if v.negative {
+			return &parser.UnaryOp{Op: parser.OpUnaryNeg, Operand: lit}, nil
+		}
+		return lit, nil
 	default:
 		return nil, fmt.Errorf("pgnodes: Rebuild: unsupported Const type OID %d", c.ConstType)
 	}

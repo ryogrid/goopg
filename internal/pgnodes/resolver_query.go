@@ -280,6 +280,9 @@ func (s *queryScope) resolveExpr(e parser.Expr, expected uint32) (Node, uint32, 
 	case *parser.IntegerConst:
 		return resolveIntLiteral(v.Value, expected)
 
+	case *parser.NumericConst:
+		return resolveNumericLiteral(v.Value, false)
+
 	case *parser.BooleanConst:
 		return NewBoolConst(v.Value), OidBool, nil
 
@@ -301,6 +304,9 @@ func (s *queryScope) resolveExpr(e parser.Expr, expected uint32) (Node, uint32, 
 		case parser.OpUnaryNeg:
 			if lit, ok := v.Operand.(*parser.IntegerConst); ok {
 				return resolveIntLiteral(-lit.Value, expected)
+			}
+			if lit, ok := v.Operand.(*parser.NumericConst); ok {
+				return resolveNumericLiteral(lit.Value, true)
 			}
 			return nil, 0, ErrUnsupported
 		case parser.OpNot:

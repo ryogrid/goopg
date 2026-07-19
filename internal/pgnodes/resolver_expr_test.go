@@ -177,9 +177,9 @@ func TestRebuildNegativeConstShape(t *testing.T) {
 
 // TestSupportsExprRejectsOutOfSubset verifies the all-or-nothing shape check
 // declines expressions with any unsupported node (a non-built-in cast, a
-// numeric datum, a column reference, or a string literal in a non-text
-// context) so the writer keeps SQL text — while accepting the supported subset
-// (literals, folded unary minus, OpExpr, and plain built-in FuncExpr).
+// column reference, or a string literal in a non-text context) so the writer
+// keeps SQL text — while accepting the supported subset (literals including
+// numeric, folded unary minus, OpExpr, and plain built-in FuncExpr).
 func TestSupportsExprRejectsOutOfSubset(t *testing.T) {
 	supported := []struct {
 		sql        string
@@ -190,6 +190,8 @@ func TestSupportsExprRejectsOutOfSubset(t *testing.T) {
 		{"'ok'", OidText},
 		{"10 - 3", OidInt4},
 		{"upper('x')", OidText}, // plain built-in FuncExpr forward-resolves
+		{"1.5", OidNumeric},     // numeric datum (M0123-S4 sub-slice 3)
+		{"-2.5", OidNumeric},    // folded negative numeric Const
 	}
 	for _, tc := range supported {
 		if !SupportsExpr(mustParse(t, tc.sql), tc.targetType) {
@@ -202,7 +204,6 @@ func TestSupportsExprRejectsOutOfSubset(t *testing.T) {
 		targetType uint32
 	}{
 		{"'5'", OidInt4},   // string literal in a non-text context
-		{"1.5", 0},         // numeric datum deferred
 		{"a + 1", OidInt4}, // column reference
 	}
 	for _, tc := range unsupported {
