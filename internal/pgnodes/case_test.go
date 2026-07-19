@@ -256,6 +256,30 @@ var caseGolden = []struct {
 		colType: OidNumeric,
 		want:    `{CASEEXPR :casetype 1700 :casecollid 0 :arg {CONST :consttype 1700 :consttypmod -1 :constcollid 0 :constlen -1 :constbyval false :constisnull false :location -1 :constvalue 10 [ 40 0 0 0 -128 -128 3 0 -120 19 ]} :args ({CASEWHEN :expr {OPEXPR :opno 1752 :opfuncid 1718 :opresulttype 16 :opretset false :opcollid 0 :inputcollid 0 :args ({CASETESTEXPR :typeId 1700 :typeMod -1 :collation 0} {FUNCEXPR :funcid 1740 :funcresulttype 1700 :funcretset false :funcvariadic false :funcformat 2 :funccollid 0 :inputcollid 0 :args ({CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 1 0 0 0 0 0 0 0 ]}) :location -1}) :location -1} :result {CONST :consttype 1700 :consttypmod -1 :constcollid 0 :constlen -1 :constbyval false :constisnull false :location -1 :constvalue 10 [ 40 0 0 0 -128 -128 1 0 -120 19 ]} :location -1} {CASEWHEN :expr {OPEXPR :opno 1752 :opfuncid 1718 :opresulttype 16 :opretset false :opcollid 0 :inputcollid 0 :args ({CASETESTEXPR :typeId 1700 :typeMod -1 :collation 0} {FUNCEXPR :funcid 1740 :funcresulttype 1700 :funcretset false :funcvariadic false :funcformat 2 :funccollid 0 :inputcollid 0 :args ({CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 2 0 0 0 0 0 0 0 ]}) :location -1}) :location -1} :result {CONST :consttype 1700 :consttypmod -1 :constcollid 0 :constlen -1 :constbyval false :constisnull false :location -1 :constvalue 10 [ 40 0 0 0 -128 -128 2 0 -120 19 ]} :location -1}) :defresult {CONST :consttype 1700 :consttypmod -1 :constcollid 0 :constlen -1 :constbyval false :constisnull false :location -1 :constvalue 10 [ 40 0 0 0 -128 -128 3 0 -120 19 ]} :location -1}`,
 	},
+	// Simple-form WHEN-value NATIVE cross-type operator (sub-slice 18): unlike the
+	// numeric operand above, an integer operand paired with a differently-sized
+	// integer value has a native cross-type `=` operator, so PG's make_op picks it
+	// with the value LEFT UN-coerced (no int4_numeric-style cast). An int8 operand
+	// + int4 value resolves to int8=int4 (opno 416 / opfuncid 474 int84eq); the
+	// commutated int4 operand + int8 value resolves to int4=int8 (opno 15 /
+	// opfuncid 852 int48eq). The CaseTestExpr placeholder keeps the operand's exact
+	// type and the value Const keeps its own type — this is the shape ruleutils
+	// deparses. Captured live from PG18.3 (bytes verified byte-for-byte by the
+	// oracle_pgnodes_adbin_test.go live gate):
+	//   b1 int8 DEFAULT (CASE 5000000000 WHEN 1 THEN 10000000000 ELSE 20000000000 END)
+	//   b2 int  DEFAULT (CASE 1 WHEN 5000000000 THEN 10 ELSE 20 END)
+	{
+		name:    "simple_int8_operand_int4_when_native",
+		sql:     "CASE 5000000000 WHEN 1 THEN 10000000000 ELSE 20000000000 END",
+		colType: OidInt8,
+		want:    `{CASEEXPR :casetype 20 :casecollid 0 :arg {CONST :consttype 20 :consttypmod -1 :constcollid 0 :constlen 8 :constbyval true :constisnull false :location -1 :constvalue 8 [ 0 -14 5 42 1 0 0 0 ]} :args ({CASEWHEN :expr {OPEXPR :opno 416 :opfuncid 474 :opresulttype 16 :opretset false :opcollid 0 :inputcollid 0 :args ({CASETESTEXPR :typeId 20 :typeMod -1 :collation 0} {CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 1 0 0 0 0 0 0 0 ]}) :location -1} :result {CONST :consttype 20 :consttypmod -1 :constcollid 0 :constlen 8 :constbyval true :constisnull false :location -1 :constvalue 8 [ 0 -28 11 84 2 0 0 0 ]} :location -1}) :defresult {CONST :consttype 20 :consttypmod -1 :constcollid 0 :constlen 8 :constbyval true :constisnull false :location -1 :constvalue 8 [ 0 -56 23 -88 4 0 0 0 ]} :location -1}`,
+	},
+	{
+		name:    "simple_int4_operand_int8_when_native",
+		sql:     "CASE 1 WHEN 5000000000 THEN 10 ELSE 20 END",
+		colType: OidInt4,
+		want:    `{CASEEXPR :casetype 23 :casecollid 0 :arg {CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 1 0 0 0 0 0 0 0 ]} :args ({CASEWHEN :expr {OPEXPR :opno 15 :opfuncid 852 :opresulttype 16 :opretset false :opcollid 0 :inputcollid 0 :args ({CASETESTEXPR :typeId 23 :typeMod -1 :collation 0} {CONST :consttype 20 :consttypmod -1 :constcollid 0 :constlen 8 :constbyval true :constisnull false :location -1 :constvalue 8 [ 0 -14 5 42 1 0 0 0 ]}) :location -1} :result {CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 10 0 0 0 0 0 0 0 ]} :location -1}) :defresult {CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 20 0 0 0 0 0 0 0 ]} :location -1}`,
+	},
 }
 
 // TestCaseResolveMatchesGolden parses each SQL default and asserts

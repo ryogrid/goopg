@@ -835,10 +835,11 @@ server.
 
 A pair PG would resolve through a *native* cross-type operator — e.g. an `int8`
 operand + `int4` value picks `int8=int4` (opno 416) and leaves the value
-**un-coerced** — is deliberately NOT modeled: such an operand is written by PG as
-an explicit-cast `FuncExpr` (`5::int8` → `int8(int4)` funcformat 1, un-const-
-folded), which `operandTypmodCollid` rejects, so the whole simple `CASE` degrades
-to SQL text rather than emitting a divergent tree. See Deferred.
+**un-coerced** — was NOT modeled at this slice (`resolveCaseWhenCond` resolved the
+value with the operand type as its expected type, which for an `int8` operand
+coerced the `int4` value up to `int8` and emitted a divergent `int8=int8` tree).
+**Sub-slice 18 (below) closes this**, resolving the value at its natural type and
+selecting the native operator when one exists.
 
 ### Gates (all green)
 
@@ -849,6 +850,57 @@ to SQL text rather than emitting a divergent tree. See Deferred.
 - `internal/testport/oracle_pgnodes_adbin_test.go` — the same two cases
   (`case_simple_numeric_coerce{,_multi}`) added to the live oracle (27 cases total).
 - full `pgnodes` package + `go vet ./internal/testport/` + `go build ./...` clean;
+  gofmt clean; pgbench smoke via pre-commit hook.
+
+## Sub-slice 18 — simple-form `CASE` WHEN-value NATIVE cross-type operator
+
+Sub-slice 17 handled the *coercion* branch of `make_op` (numeric operand + int
+value → cast + `numeric_eq`). This slice adds the *native-operator* branch that
+runs FIRST in PG's `make_op` → `oper()`: when a `pg_operator` row matches the
+operand and value types directly — including a cross-type integer operator —
+PG uses it with **both arguments left un-coerced**. The two integer cross-type
+`=` operators are `int8=int4` (opno 416 / oprcode `int84eq` 474) and its
+commutator `int4=int8` (opno 15 / oprcode `int48eq` 852); PG's seed also carries
+`int2=int4` (532), `int2=int8` (1862), etc.
+
+### The two phases (`resolveCaseWhenCond`)
+
+The old body resolved the WHEN value with the operand type as its *expected*
+type — which for an `int8` operand + `int4` literal silently promoted the value
+to `int8` and emitted `int8=int8` (opno 410), a tree PG never writes. The new
+body models `make_op` faithfully:
+
+1. Resolve the value at its **natural** type (`rec(when, 0)` — no coercion
+   context), so a small integer literal stays `int4`, a big one `int8`, `2.5`
+   `numeric`, etc.
+2. `catalog.LookupOperatorForNode("=", operandType, valType)` — if a native row
+   exists (exact or cross-type), use the value **un-coerced**; `buildOpExpr`
+   fills the exact `opno`/`opfuncid`/`opresulttype`.
+3. Otherwise (no native row, e.g. `numeric = int4`) fall to sub-slice 17's path:
+   `coerceCaseResult(value, valType, operandType)` widens the value up to the
+   operand type and `buildOpExpr` selects the same-type operator.
+
+The `CaseTestExpr` placeholder (the operator's left arg) is never itself wrapped
+in a coercion — the shape `ruleutils` deparses — so a pair that would require
+coercing the *operand*, or a value coercion `coerceCaseResult` does not model,
+still degrades to SQL text. The numeric-operand goldens from sub-slice 17 reach a
+byte-identical tree under the new body (natural-type `int4` Const + `int4_numeric`
+cast via `coerceCaseResult` == the old expected-type resolution), so no existing
+golden changed.
+
+### Gates (all green)
+
+- `internal/pgnodes/case_test.go` — two live-captured PG18.3 scalar `adbin`
+  goldens through the golden/codec/rebuild-fixed-point loops:
+  `simple_int8_operand_int4_when_native`
+  (`CASE 5000000000 WHEN 1 THEN 10000000000 ELSE 20000000000 END`, opno 416) and
+  `simple_int4_operand_int8_when_native`
+  (`CASE 1 WHEN 5000000000 THEN 10 ELSE 20 END`, opno 15).
+- `internal/testport/oracle_pgnodes_adbin_test.go` — the same two cases
+  (`case_simple_int8_operand_int4_when` / `case_simple_int4_operand_int8_when`)
+  added to the live oracle (**29 cases total**, all byte-identical vs PG18.3).
+- full `pgnodes` package + `TestOraclePgnodesEvActionBytesMatchPG` green;
+  `go vet ./internal/pgnodes/ ./internal/testport/` + `go build ./...` clean;
   gofmt clean; pgbench smoke via pre-commit hook.
 
 ## Byte-diff oracle gate (adbin) — `internal/testport/oracle_pgnodes_adbin_test.go`
@@ -928,11 +980,15 @@ gating and ≈ 1.3 s wall time as the `adbin` oracle.
   `int/numeric`→`float4` cast arms plus outer-column-cast modeling; and the
   date-time families are not yet modeled. Sub-slice 16 covers every mix whose
   common type is `int8`/`numeric`/`float8`.
-- A simple-form `WHEN` value that needs an implicit coercion to the operand type
-  (no exact `operandType = valType` operator — e.g. a numeric operand vs a
-  `WHEN` value PG would cast) still degrades to SQL text: PG inserts a cast
-  FuncExpr on the RHS (and, for some coercions, a RelabelType above the
-  placeholder) that this subset does not yet model.
+- Simple-form `WHEN`-value resolution now models both `make_op` phases — the
+  native cross-type operator (sub-slice 18) and the coerce-value-up path
+  (sub-slice 17, limited to the `int4/int8`→`numeric` widenings `coerceCaseResult`
+  emits). A `WHEN` value whose coercion to the operand type is NOT one of those
+  arms (e.g. a text/date operand with a differently-typed value, or a coercion PG
+  represents with a `RelabelType` above the placeholder) still degrades to SQL
+  text. An explicit-cast operand (`5::int8 WHEN …`) also still degrades: PG writes
+  it as an un-const-folded `int8(int4)` `FuncExpr` operand (funcformat 1), which
+  `operandTypmodCollid` rejects.
 - The byte-diff oracle now covers **both** the **`adbin` (column DEFAULT) path**
   and the **view `ev_action` (`pg_rewrite`) path** (see the two oracle sections
   above); the view oracle's `liveRelationResolver` answers base-table column

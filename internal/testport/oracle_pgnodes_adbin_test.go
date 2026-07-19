@@ -109,6 +109,14 @@ var adbinOracleCases = []adbinOracleCase{
 	// numeric and un-coerced.
 	{"case_simple_numeric_coerce", "numeric", pgnodes.OidNumeric, "CASE 5.0 WHEN 1 THEN 100.0 ELSE 200.0 END"},
 	{"case_simple_numeric_coerce_multi", "numeric", pgnodes.OidNumeric, "CASE 3.5 WHEN 1 THEN 1.5 WHEN 2 THEN 2.5 ELSE 3.5 END"},
+	// Simple-form WHEN-value NATIVE cross-type operator (sub-slice 18): an int8
+	// operand with an int4 WHEN value resolves through the native int8=int4
+	// operator (opno 416, int84eq) — PG's make_op leaves the value UN-coerced,
+	// unlike the numeric operand above. The commutated form (int4 operand + int8
+	// value) picks int4=int8 (opno 15, int48eq). Both exercise the two-phase
+	// resolution: a native (operand,value) operator wins before coercion.
+	{"case_simple_int8_operand_int4_when", "int8", pgnodes.OidInt8, "CASE 5000000000 WHEN 1 THEN 10000000000 ELSE 20000000000 END"},
+	{"case_simple_int4_operand_int8_when", "int", pgnodes.OidInt4, "CASE 1 WHEN 5000000000 THEN 10 ELSE 20 END"},
 }
 
 // TestOraclePgnodesAdbinBytesMatchPG is the M0123-S4 byte-diff oracle: for each

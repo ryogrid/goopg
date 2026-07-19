@@ -844,17 +844,24 @@ func coerceCaseResult(node Node, fromType, toType uint32) (Node, error) {
 // CaseTestExpr placeholder and right arg is the resolved val (transformCaseExpr →
 // makeSimpleA_Expr "=" → make_op).
 //
-// The value is resolved with the operand type as its EXPECTED type, which models
-// the coercion side of make_op: when the value's natural type differs from the
-// operand type and no cross-type "=" operator exists, PG coerces the value up to
-// the operand type before selecting the operator (e.g. a numeric operand with an
-// int4 value → int4_numeric cast on the value, numeric_eq operator; sub-slice 17
-// goldens simple_numeric_operand_int_when_coerce*). buildOpExpr then requires an
-// EXACT (operandType = valType) operator so the CaseTestExpr placeholder is never
-// itself wrapped in a coercion — the shape ruleutils recognizes. A pair PG would
-// resolve through a native cross-type operator (e.g. int8 operand + int4 value →
-// int8=int4 op 416 with the value left un-coerced) is not modeled and degrades to
-// SQL text rather than emitting a divergent tree.
+// The value is resolved with its NATURAL type (no coercion context), then PG's
+// make_op two-phase operator resolution is modeled:
+//
+//  1. If a native "=" operator matches (operandType, valType) directly — including
+//     a cross-type integer operator such as int8=int4 (opno 416, int84eq) — PG's
+//     oper() uses it with the value LEFT UN-COERCED. This is the exact/binary-
+//     compatible match phase.
+//  2. Otherwise PG coerces the value up to the operand type via
+//     coerce_to_common_type and selects the exact operator on the operand type —
+//     e.g. a numeric operand with an int4 value has no numeric=int4 operator, so
+//     the value is wrapped in int4_numeric (funcid 1740, funcformat 2) and
+//     numeric_eq (opno 1752) applies (sub-slice 17 goldens
+//     simple_numeric_operand_int_when_coerce*).
+//
+// The CaseTestExpr placeholder (the operator's left arg) is never itself wrapped
+// in a coercion — the shape ruleutils recognizes — so a pair that would require
+// coercing the operand (or a value coercion coerceCaseResult does not model)
+// degrades to SQL text rather than emitting a divergent tree.
 func resolveCaseWhenCond(when parser.Expr, testExpr *CaseTestExpr, argType uint32, rec scopedResolve) (Node, error) {
 	if testExpr == nil {
 		cond, condType, err := rec(when, OidBool)
@@ -867,9 +874,18 @@ func resolveCaseWhenCond(when parser.Expr, testExpr *CaseTestExpr, argType uint3
 		}
 		return cond, nil
 	}
-	valNode, valType, err := rec(when, argType)
+	valNode, valType, err := rec(when, 0)
 	if err != nil {
 		return nil, err
+	}
+	if _, native := catalog.LookupOperatorForNode("=", argType, valType); !native {
+		// Phase 2: no native (operand, value) operator — coerce the value up to
+		// the operand type, then require the exact operator on the operand type.
+		coerced, cerr := coerceCaseResult(valNode, valType, argType)
+		if cerr != nil {
+			return nil, cerr
+		}
+		valNode, valType = coerced, argType
 	}
 	op, opType, err := buildOpExpr(testExpr, argType, valNode, valType, "=")
 	if err != nil {

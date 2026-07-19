@@ -1253,8 +1253,21 @@ existing encoder, `constcollid=100` / `consttypmod=n+4`.
       native-cross-type-operator boundary. Design 0123-0005 §"Sub-slice 17";
       ledger 2026-07-19 (int8/explicit-cast operand deferral). Gates GREEN: full
       pgnodes pkg, adbin oracle 27/27 vs PG18.3 (1.29s), build/vet/gofmt clean.
+      SUB-SLICE 18 LANDED (2026-07-19): simple-form CASE **WHEN-value NATIVE
+      cross-type operator** (closes the sub-slice-17 boundary). resolveCaseWhenCond
+      now resolves the WHEN value at its NATURAL type (`rec(when, 0)`) and models
+      PG make_op's two phases: (1) if a native `=` operator matches (operandType,
+      valType) directly — incl. cross-type int8=int4 (opno 416, int84eq) / int4=int8
+      (opno 15, int48eq) — use it with the value UN-coerced; (2) else coerce the
+      value up to the operand type via coerceCaseResult (sub-slice 17's numeric path
+      is unchanged — natural int4 Const + int4_numeric cast == old expected-type
+      resolution, byte-identical, no golden churn). Gate case_test.go
+      (`simple_int8_operand_int4_when_native` CASE 5000000000 WHEN 1…, opno 416;
+      `simple_int4_operand_int8_when_native` CASE 1 WHEN 5000000000…, opno 15) via
+      golden/codec/rebuild loops + 2 live-oracle cases (oracle_pgnodes_adbin_test.go,
+      now 29, all byte-identical vs PG18.3). Design 0123-0005 §"Sub-slice 18".
       REMAINING: float4-common (no float8) CASE mix (needs int/numeric→float4 arms
       + outer column cast); date-time-family CASE coercion; simple-form WHEN value
-      with an int8/explicit-cast operand (native cross-type op 416, no coercion —
-      needs explicit-cast FuncExpr operand modeling); operator-driven view-qual
+      with an EXPLICIT-cast operand (int8(int4) funcformat-1 FuncExpr operand
+      modeling); operator-driven view-qual
       coercion (unblocks int2/timestamptz literals).
