@@ -6,11 +6,23 @@ import (
 )
 
 // lsnIdle is the sentinel stored in an insertionTracker slot when a
-// stripe is not currently inserting a record. Zero is the natural
-// choice (all-zero state is "idle"); call sites that legitimately
-// reserve LSN 0 do not exist in production paths (LSN 0 is the
-// invalid sentinel throughout PG and goopg).
-const lsnIdle = int64(0)
+// stripe is not currently inserting a record.
+//
+// It is -1 (NOT zero). Byte-LSN 0 is a legitimate reservation start —
+// a fresh cluster / freshly reset walBuffer begins its byte-addressed
+// LSN space at 0, so the very first WAL record on that stream reserves
+// [0, total) and the owning stripe calls setInsertingAt(stripe, 0).
+// If the idle sentinel were 0, that first active reservation would be
+// indistinguishable from "idle": lowestActiveLSN would skip the stripe
+// (v != lsnIdle is false for v==0), the tail publisher would advance
+// the drain watermark past the still-being-written LSN-0 record, and
+// the drain goroutine would read those bytes while the stripe writer's
+// writeReserved is still writing them — a data race caught by
+// TestDrainSafetyStress (M-NIGHTLY AI-20260717-010601-001). Because the
+// zero value of atomic.Int64 is 0 (== an active LSN-0 slot, NOT idle),
+// newInsertionTracker MUST explicitly initialise every slot to lsnIdle
+// rather than relying on the struct's zero value.
+const lsnIdle = int64(-1)
 
 // lsnNoActive is the return value of insertionTracker.lowestActiveLSN
 // when every stripe is idle. math.MaxInt64 is a deliberate choice so
@@ -96,17 +108,21 @@ type insertionTracker struct {
 }
 
 // newInsertionTracker returns an idle tracker — every stripe slot is
-// lsnIdle. The zero value of atomic.Int64 is 0 == lsnIdle, so this
-// is structurally a zero-state struct; the constructor exists only
-// to match the foundation pattern (newInsertPosTracker,
-// newWALBuffer, etc.) and to centralise any future per-construction
-// invariants.
+// lsnIdle. lsnIdle is -1, NOT the atomic.Int64 zero value, precisely so
+// that byte-LSN 0 is a distinguishable active reservation (see the
+// lsnIdle doc comment); the constructor therefore MUST store lsnIdle
+// into every slot rather than relying on the struct's zero value (which
+// would leave every stripe reading as "actively inserting at LSN 0").
 func newInsertionTracker() *insertionTracker {
-	return &insertionTracker{}
+	t := &insertionTracker{}
+	for i := range t.inserting {
+		t.inserting[i].Store(lsnIdle)
+	}
+	return t
 }
 
 // setInsertingAt publishes that stripe i is currently inserting a
-// record starting at lsn. Pass lsnIdle (== 0) to mark the stripe
+// record starting at lsn. Pass lsnIdle (== -1) to mark the stripe
 // idle once the byte write is complete. The caller MUST hold the
 // matching stripe lock (`appendLockSet.locks[i]`) for the duration
 // of the begin/end pair; the tracker itself does no validation

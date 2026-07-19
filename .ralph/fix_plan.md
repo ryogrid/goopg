@@ -99,20 +99,31 @@ every clean, green (build + pre-commit) checkpoint.
      placeholder is a comment, not a checkbox, so the plan-complete exit
      heuristic stays live.) -->
 
-- [ ] race/internal/wal — race suite failed in internal/wal (AI-20260717-010601-001;
-      repro: `go test -race -timeout 15m ./internal/wal/`). NOTE a REOPEN (an
-      earlier `- [x] race/internal/wal` fix below did not hold; first-seen new
-      20260717). Re-run the repro at HEAD first — the log may be stale.
-- [ ] regress/errors — regress case `errors` diverged (baseline pass): output
-      mismatch, normalization rules need extension (AI-20260717-010601-002;
-      repro: `go test -v -run 'TestPort_RegressSuite/errors' ./internal/testport/`).
-      Also failed the previous run.
-- [ ] regress/portals_p2 — regress case `portals_p2` diverged (baseline pass):
-      output mismatch, normalization (AI-20260717-010601-003; repro:
-      `go test -v -run 'TestPort_RegressSuite/portals_p2' ./internal/testport/`).
-- [ ] regress/select — regress case `select` diverged (baseline pass): output
-      mismatch, normalization (AI-20260717-010601-004; repro:
-      `go test -v -run 'TestPort_RegressSuite/select' ./internal/testport/`).
+- [x] race/internal/wal — race suite failed in internal/wal (AI-20260717-010601-001;
+      repro: `go test -race -timeout 15m ./internal/wal/`). REOPEN of the 0107-0011
+      test-only fix — this was a DIFFERENT, GENUINE production data race in
+      `TestDrainSafetyStress`: the drain goroutine's `writeAt` reads WAL-ring bytes
+      a fast-path stripe `writeReserved` is still writing. Root-caused via a
+      deterministic `writeReserved` assertion (`panic if lsn < tail`) → TWO causes:
+      (1) `insertionTracker` idle sentinel `lsnIdle==0` aliased the legitimate
+      byte-LSN-0 first reservation on a fresh/reset walBuffer, so `lowestActiveLSN`
+      treated the LSN-0 stripe as idle and the tail publisher advanced the drain
+      watermark past a still-being-written record — fixed `lsnIdle=-1` + constructor
+      slot init; (2) `appendPGCompat` Path A released `appendMu` across its direct
+      `writeAt`, letting concurrent RLock stripe writers reserve into its unreserved
+      range and publish a tail the trailing `walBuf.reset(end)` rewound — fixed by
+      holding `appendMu.Lock()` across the whole Path A section. Verified: 0/60
+      below-tail writes (was 25/25 pre-fix1, ~55/60 after fix1 alone),
+      TestDrainSafetyStress 40/40 under -race, whole-package -race 3/3, unit+vet
+      clean, pgbench smoke PASS. Design doc 0107-0012 + README index + ledger row.
+- [x] regress/errors — regress case `errors` diverged (baseline pass)
+      (AI-20260717-010601-002). STALE — PASSES at HEAD (`go test -v -run
+      'TestPort_RegressSuite/errors$' ./internal/testport/` → PASS 0.02s this loop).
+      The nightly log (sha 194123903413) was stale; no product fix needed.
+- [x] regress/portals_p2 — regress case `portals_p2` diverged (baseline pass)
+      (AI-20260717-010601-003). STALE — PASSES at HEAD (same run, PASS 0.03s).
+- [x] regress/select — regress case `select` diverged (baseline pass)
+      (AI-20260717-010601-004). STALE — PASSES at HEAD (same run, PASS 0.19s).
 
 - [x] testport/* build-break cascade (run 20260712-020530, ~39 AI items:
       AI-20260712-020530-001..039 — TestPort_IsolationStats,
