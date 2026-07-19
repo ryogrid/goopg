@@ -110,6 +110,8 @@ func readNode(t *tokenizer) (Node, error) {
 		n, err = readBoolExpr(t)
 	case "NULLTEST":
 		n, err = readNullTest(t)
+	case "BOOLEANTEST":
+		n, err = readBooleanTest(t)
 	case "QUERY":
 		n, err = readQuery(t)
 	case "RANGETBLENTRY":
@@ -459,6 +461,23 @@ func readNullTest(t *tokenizer) (*NullTest, error) {
 		return nil, err
 	}
 	return n, nil
+}
+
+// readBooleanTest mirrors the generated _readBooleanTest: arg, booltesttype,
+// location.
+func readBooleanTest(t *tokenizer) (*BooleanTest, error) {
+	b := &BooleanTest{}
+	var err error
+	if b.Arg, err = readNodeField(t); err != nil {
+		return nil, err
+	}
+	if b.BoolTestType, err = readInt32(t); err != nil {
+		return nil, err
+	}
+	if b.Location, err = readInt32(t); err != nil {
+		return nil, err
+	}
+	return b, nil
 }
 
 func readSQLValueFunction(t *tokenizer) (*SQLValueFunction, error) {

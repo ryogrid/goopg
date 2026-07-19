@@ -35,6 +35,8 @@ func Rebuild(n Node) (parser.Expr, error) {
 		return rebuildBoolExpr(v)
 	case *NullTest:
 		return rebuildNullTest(v)
+	case *BooleanTest:
+		return rebuildBooleanTest(v)
 	default:
 		return nil, fmt.Errorf("pgnodes: Rebuild: unsupported node %T", n)
 	}
@@ -103,6 +105,40 @@ func rebuildNullTestWith(nt *NullTest, rec func(Node) (parser.Expr, error)) (par
 		return nil, err
 	}
 	return &parser.IsNullExpr{Operand: operand, Negated: nt.NullTestType == IsNotNull}, nil
+}
+
+// rebuildBooleanTest reconstructs `x IS [NOT] TRUE/FALSE/UNKNOWN`.
+func rebuildBooleanTest(bt *BooleanTest) (parser.Expr, error) {
+	return rebuildBooleanTestWith(bt, Rebuild)
+}
+
+// rebuildBooleanTestWith rebuilds a BOOLEANTEST through the injected recursion
+// `rec` (so the argument may be a column Var in the view-reload path). The
+// booltesttype ordinal is the exact inverse of resolver_expr.go's
+// booleanTestType, so resolve→Rebuild→re-resolve is a fixed point.
+func rebuildBooleanTestWith(bt *BooleanTest, rec func(Node) (parser.Expr, error)) (parser.Expr, error) {
+	operand, err := rec(bt.Arg)
+	if err != nil {
+		return nil, err
+	}
+	out := &parser.IsBoolExpr{Operand: operand}
+	switch bt.BoolTestType {
+	case IsTrue:
+		out.TestTrue = true
+	case IsNotTrue:
+		out.TestTrue, out.Negated = true, true
+	case IsFalse:
+		out.TestFalse = true
+	case IsNotFalse:
+		out.TestFalse, out.Negated = true, true
+	case IsUnknown:
+		// neither TestTrue nor TestFalse; not negated
+	case IsNotUnknown:
+		out.Negated = true
+	default:
+		return nil, fmt.Errorf("pgnodes: Rebuild: bad booltesttype %d", bt.BoolTestType)
+	}
+	return out, nil
 }
 
 // rebuildFuncExpr reconstructs a plain function call whose arguments are scalar

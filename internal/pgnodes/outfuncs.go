@@ -41,6 +41,8 @@ func outNode(sb *strings.Builder, n Node) {
 		outBoolExpr(sb, v)
 	case *NullTest:
 		outNullTest(sb, v)
+	case *BooleanTest:
+		outBooleanTest(sb, v)
 	case *Query:
 		outQuery(sb, v)
 	case *RangeTblEntry:
@@ -267,4 +269,13 @@ func outNullTest(sb *strings.Builder, n *NullTest) {
 	wInt(sb, "nulltesttype", n.NullTestType)
 	wBool(sb, "argisrow", n.ArgIsRow)
 	wLoc(sb, "location", n.Location)
+}
+
+// outBooleanTest mirrors _outBooleanTest (generated outfuncs.funcs.c): arg,
+// booltesttype, location. booltesttype is a plain integer ordinal.
+func outBooleanTest(sb *strings.Builder, b *BooleanTest) {
+	sb.WriteString("BOOLEANTEST")
+	wNode(sb, "arg", b.Arg)
+	wInt(sb, "booltesttype", b.BoolTestType)
+	wLoc(sb, "location", b.Location)
 }

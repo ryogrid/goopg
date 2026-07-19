@@ -151,3 +151,28 @@ type NullTest struct {
 }
 
 func (*NullTest) nodeTag() string { return "NULLTEST" }
+
+// BoolTestType enum values mirror postgres/src/include/nodes/primnodes.h
+// (IS_TRUE, IS_NOT_TRUE, IS_FALSE, IS_NOT_FALSE, IS_UNKNOWN, IS_NOT_UNKNOWN).
+// _outBooleanTest writes booltesttype as the plain integer ordinal (a
+// WRITE_ENUM_FIELD), not a token — unlike BoolExpr's :boolop.
+const (
+	IsTrue       int32 = iota // IS_TRUE
+	IsNotTrue                 // IS_NOT_TRUE
+	IsFalse                   // IS_FALSE
+	IsNotFalse                // IS_NOT_FALSE
+	IsUnknown                 // IS_UNKNOWN
+	IsNotUnknown              // IS_NOT_UNKNOWN
+)
+
+// BooleanTest mirrors _outBooleanTest (generated outfuncs.funcs.c): arg,
+// booltesttype, location. The argument is always boolean and the result is
+// always boolean (never NULL). This is the `expr IS [NOT] TRUE/FALSE/UNKNOWN`
+// node — distinct from NullTest (`IS [NOT] NULL`).
+type BooleanTest struct {
+	Arg          Node  // arg (a boolean-valued expression)
+	BoolTestType int32 // booltesttype (0=IS TRUE … 5=IS NOT UNKNOWN)
+	Location     int32 // location
+}
+
+func (*BooleanTest) nodeTag() string { return "BOOLEANTEST" }

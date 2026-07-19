@@ -112,6 +112,9 @@ func resolve(e parser.Expr, expected uint32) (Node, uint32, error) {
 	case *parser.IsNullExpr:
 		return resolveNullTest(v)
 
+	case *parser.IsBoolExpr:
+		return resolveBooleanTest(v)
+
 	case *parser.UnaryOp:
 		switch v.Op {
 		case parser.OpUnaryPos:
@@ -396,6 +399,47 @@ func resolveNullTestWith(e *parser.IsNullExpr, rec scopedResolve) (Node, uint32,
 		ntt = IsNotNull
 	}
 	return &NullTest{Arg: arg, NullTestType: ntt, ArgIsRow: false, Location: -1}, OidBool, nil
+}
+
+// booleanTestType maps goopg's parser.IsBoolExpr flags (TestTrue/TestFalse/
+// Negated) to PG's BoolTestType ordinal. Neither TestTrue nor TestFalse means
+// IS [NOT] UNKNOWN (see internal/parser expr.go IsBoolExpr).
+func booleanTestType(e *parser.IsBoolExpr) int32 {
+	switch {
+	case e.TestTrue:
+		if e.Negated {
+			return IsNotTrue
+		}
+		return IsTrue
+	case e.TestFalse:
+		if e.Negated {
+			return IsNotFalse
+		}
+		return IsFalse
+	default:
+		if e.Negated {
+			return IsNotUnknown
+		}
+		return IsUnknown
+	}
+}
+
+// resolveBooleanTest resolves `x IS [NOT] TRUE/FALSE/UNKNOWN` to a BOOLEANTEST.
+// The argument is boolean-valued (PG requires it), so it resolves in a bool
+// context; the result type is always bool.
+func resolveBooleanTest(e *parser.IsBoolExpr) (Node, uint32, error) {
+	return resolveBooleanTestWith(e, resolve)
+}
+
+// resolveBooleanTestWith resolves a BOOLEANTEST through the injected recursion
+// `rec` (so the argument may be a column Var in the view-qual path). Mirrors
+// resolveNullTestWith; the operand is resolved in a bool context.
+func resolveBooleanTestWith(e *parser.IsBoolExpr, rec scopedResolve) (Node, uint32, error) {
+	arg, _, err := rec(e.Operand, OidBool)
+	if err != nil {
+		return nil, 0, err
+	}
+	return &BooleanTest{Arg: arg, BoolTestType: booleanTestType(e), Location: -1}, OidBool, nil
 }
 
 // buildOpExpr looks the operator up by spelling + already-resolved operand type

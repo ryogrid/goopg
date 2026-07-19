@@ -275,10 +275,50 @@ which stays deferred.
   `timestamptz` literal case (canonical Const) + a no-offset case (SQL text).
 - `TestE2E_FailoverGoopgToPG` still green.
 
+## Sub-slice 5 — canonical `BOOLEANTEST` (`x IS [NOT] TRUE/FALSE/UNKNOWN`)
+
+`x IS TRUE` is **not** an operator or NullTest: PG parses it to a dedicated
+`BooleanTest` node (`primnodes.h`) with a `booltesttype` enum ordinal, and
+`cookDefault` stores it in `pg_attrdef.adbin` unfolded (like `BoolExpr` — no
+const-folding of the DEFAULT). The result is always boolean, never NULL.
+
+### IR + codec (`ir.go`, `outfuncs.go`, `readfuncs.go`)
+
+`BooleanTest{Arg, BoolTestType, Location}` mirrors the struct field order, so
+`outBooleanTest` writes `{BOOLEANTEST :arg … :booltesttype N :location -1}`.
+`booltesttype` is a plain integer ordinal (`WRITE_ENUM_FIELD` writes the `int`,
+unlike `BoolExpr`'s `:boolop and` token), N∈0..5 =
+`IS_TRUE/IS_NOT_TRUE/IS_FALSE/IS_NOT_FALSE/IS_UNKNOWN/IS_NOT_UNKNOWN`.
+`readBooleanTest` reads the three fields symmetrically; it accepts any int and
+leaves range-checking to `Rebuild` (a corrupt ordinal degrades the reload to SQL
+text rather than mis-parsing).
+
+### Forward + reload (`resolver_expr.go`, `rebuild.go`)
+
+`resolveBooleanTest` maps goopg's `parser.IsBoolExpr` flags
+(`TestTrue`/`TestFalse`/`Negated`; neither test flag ⇒ `UNKNOWN`) to the ordinal
+via `booleanTestType`, resolving the argument in a `bool` context.
+`rebuildBooleanTest` is the exact inverse (ordinal → the three flags), so
+resolve→`Rebuild`→re-resolve is a fixed point for all six ordinals. Both have
+`…With(rec)` variants threading the injected recursion, so a `BOOLEANTEST` whose
+argument is a column `Var` reloads inside a view qual (the same pattern as
+`NullTest`/`BoolExpr`).
+
+### Gates (all green)
+
+- `internal/pgnodes/booleantest_test.go` — six live-captured PG18.3 `adbin`
+  goldens, one per ordinal 0..5 (`true IS [NOT] TRUE`, `false IS [NOT] FALSE`,
+  `(1=1) IS [NOT] UNKNOWN` — the last two prove a non-trivial `OPEXPR` argument):
+  forward resolve→`Out` byte-for-byte, `ResolveForColumn` accepts, `Read`→`Out`
+  codec round-trip, resolve→`Rebuild`→re-resolve fixed point, plus an
+  out-of-range-ordinal `Rebuild`-rejection guard.
+- `go build ./...` + `go vet ./internal/pgnodes/` clean; full `pgnodes` package
+  and `internal/executor` `TestCanonicalAttrdef*` still green.
+
 ## Deferred
 
-- `CASE`, `BooleanTest` (`IS TRUE`/`IS FALSE`), `IS DISTINCT FROM`, and the
-  byte-diff oracle gate remain in M0123-S4. Operator-driven implicit coercion in
-  view quals (which would let a `timestamptz`/`int2`→`numeric` string literal
-  resolve inside a view `WHERE`) is also still SQL-text — only the exact
-  scalar-column DEFAULT context folds a `timestamptz`/numeric literal.
+- `CASE` and `IS DISTINCT FROM`, plus the byte-diff oracle gate, remain in
+  M0123-S4. Operator-driven implicit coercion in view quals (which would let a
+  `timestamptz`/`int2`→`numeric` string literal resolve inside a view `WHERE`)
+  is also still SQL-text — only the exact scalar-column DEFAULT context folds a
+  `timestamptz`/numeric literal.
