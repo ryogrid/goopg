@@ -664,12 +664,57 @@ fixed point (`THEN 1 ELSE 2.5` → `int4_numeric(1)` / numeric → rebuilds to
 - full `pgnodes` package + `go vet ./internal/pgnodes/` + `go build ./...` clean;
   executor `TestCanonicalAttrdefText`/`TestDefault` green.
 
+## Sub-slice 14 — `CASE` cross-FAMILY integer result coercion (`int4`→`int8`)
+
+Sub-slice 13 folded a mixed `CASE` only when the common type was `numeric`; a mix
+of `int4`+`int8` **with no numeric** still degraded to SQL text because its PG
+common type `int8` needs an int→int *width* cast (not the int→numeric cast 13
+modeled). This slice closes that gap — the last member of the exact-integer /
+numeric family.
+
+`select_common_type` (`parse_coerce.c`) walks the result list: none of `int4`,
+`int8`, `numeric` is a *preferred* type (`typispreferred=f`; only `float8` is
+preferred in the numeric category), so for each pair the walk advances to whichever
+type the narrower one implicitly coerces to but not vice-versa — `int4`→`int8`
+→`numeric`. The common type is therefore the **widest member present**.
+
+- `selectCaseCommonType(resultTypes)` (`resolver_expr.go`) now returns the widest
+  of the family: `numeric` if any numeric appears, else `int8` if any `int8`
+  appears, else `int4`. Any type outside `{int4,int8,numeric}` (a float, a
+  collatable type, …) still returns false → SQL text.
+- `coerceCaseResult(node, from, to)` gains the `int4`→`int8` arm: it wraps the
+  `int4` result in `wrapInt4ToInt8Cast` — the implicit `int8(int4)` cast
+  `FuncExpr` (`pg_cast.dat`: castsource int4 → casttarget int8, castfunc
+  `int8(int4)` **OID 481**, castcontext `'i'`, castmethod `'f'`), funcresulttype
+  int8, funcformat 2, byte-identical to PG's un-const-folded stored tree. The
+  `int8` side never needs a cast.
+- Rebuild: `rebuildFuncExprWith` (`rebuild.go`) recognises the new cast via
+  `isImplicitInt4ToInt8Cast` (funcid 481 / funcformat 2 / funcresulttype int8 /
+  one arg) alongside the sub-slice-4a `isImplicitIntToNumericCast`, and unwraps it
+  to the inner integer literal — so a mixed CASE is a fixed point (`THEN 1 ELSE
+  5000000000` → `int8(int4)(1)` / int8 → rebuilds to `THEN 1 ELSE 5000000000`).
+
+### Gates (all green)
+
+- `internal/pgnodes/case_test.go` — four live-captured PG18.3 scalar `adbin`
+  goldens through the golden/codec/rebuild-fixed-point loops:
+  `crossfam_int4_then_int8_else` (cast on `WHEN`), `crossfam_int8_then_int4_else`
+  (cast on `ELSE`), `crossfam_simple_int4_int8` (simple form),
+  `crossfam_two_int4_casts` (a multi-arm CASE with two `int8(int4)` casts).
+  `TestCaseDegradesGracefully` swaps its now-canonical `int4`+`int8` case for
+  `int4`+`float8` (common type `float8`, outside the modeled family → still SQL
+  text) alongside the `text` case.
+- `internal/pgnodes/datum.go` — added `OidFloat8 = 701` to express that boundary.
+- full `pgnodes` package + `go vet ./internal/pgnodes/` + `go build ./...` clean;
+  executor `TestCanonicalAttrdefText`/`TestDefault`/`TestResolveForColumn` +
+  initdb `TestRebuildAttrdefExpr` green.
+
 ## Deferred
 
-- Cross-type `CASE` results **outside the int/numeric family** (e.g. `int4`+`int8`
-  with no numeric → common type `int8`, or the float / date-time families) still
-  degrade to SQL text: the needed int→int / cross-family casts are not yet
-  modeled. Sub-slice 13 covers only the numeric family.
+- Cross-type `CASE` results **outside the exact-integer / numeric family** (e.g.
+  the float or date-time families, `int4`+`float8` → common type `float8`) still
+  degrade to SQL text: those cross-family casts are not yet modeled. Sub-slices 13
+  and 14 together cover the full `{int4,int8,numeric}` family.
 - A simple-form `WHEN` value that needs an implicit coercion to the operand type
   (no exact `operandType = valType` operator — e.g. a numeric operand vs a
   `WHEN` value PG would cast) still degrades to SQL text: PG inserts a cast

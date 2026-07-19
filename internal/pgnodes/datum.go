@@ -15,6 +15,7 @@ const (
 	OidInt4        = 23
 	OidText        = 25
 	OidOid         = 26
+	OidFloat8      = 701
 	OidNumeric     = 1700
 	OidTimestamptz = 1184
 )

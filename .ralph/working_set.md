@@ -1,39 +1,35 @@
-Task: M0123-S4 sub-slice 12 — CASE **simple form** (`CASE operand WHEN val …`)
-→ canonical CASEEXPR with a CaseTestExpr placeholder. COMPLETE (committing).
+Task: M0123-S4 sub-slice 14 — CASE cross-FAMILY integer coercion (int4→int8).
+COMPLETE this loop; committing + pushing.
 
-Landed: `CASE operand WHEN val THEN … END` now resolves canonically (was SQL
-text), reproducing transformCaseExpr (parse_expr.c): operand → CaseExpr.arg,
-each `WHEN val` → OpExpr `placeholder = val` whose left arg is a CaseTestExpr
-typed from the operand (typeId/typeMod/collation). Deparse inverse (ruleutils)
-shows only the OpExpr RHS.
-- NEW NODE ir.go CaseTestExpr{Typeid,Typemod,Collation} + nodeTag CASETESTEXPR;
-  outfuncs.go outCaseTestExpr (`{CASETESTEXPR :typeId N :typeMod N :collation N}`,
-  matches generated _outCaseTestExpr); readfuncs.go readCaseTestExpr + dispatch.
-- resolver_expr.go: resolveCaseExprWith handles e.Operand!=nil (Arg + testExpr);
-  operandTypmodCollid extracts typmod/collid from Var/Const operand; new
-  resolveCaseWhenCond builds each arm (searched=bool cond; simple=buildOpExpr
-  placeholder=val). buildOpExpr needs an EXACT (opType=valType) `=` operator so
-  the placeholder is never coercion-wrapped.
-- rebuild.go: rebuildCaseExprWith restores Operand for Arg!=nil; new
-  rebuildCaseWhenCond unwraps each OpExpr and rebuilds only Args[1] (WHEN value).
-- Tests: case_test.go 4 live PG18.3 scalar adbin goldens (simple_int_else,
-  _two_when_no_else, _numeric_else, _two_when_else); view_bool_null_test.go v13
-  (`CASE client WHEN 5 THEN true ELSE false END`, Var-operand) golden + structural
-  assert; degrade test now uses simple-form mixed-result.
+Landed: a CASE mixing int4+int8 results with NO numeric now folds to canonical
+casetype int8 (was SQL text). Completes the {int4,int8,numeric} family.
+- selectCaseCommonType (resolver_expr.go): returns the WIDEST family member present
+  (numeric>int8>int4). None is a preferred type (only float8 is, per pg_type
+  typispreferred), so PG's select_common_type walk always widens int4→int8→numeric.
+  Anything outside {int4,int8,numeric} → false → SQL text.
+- coerceCaseResult: new int4→int8 arm via wrapInt4ToInt8Cast = implicit int8(int4)
+  cast FuncExpr (funcid 481, funcresulttype 20, funcformat 2), from pg_cast.dat
+  (castsource int4→int8, castcontext 'i', method 'f'). Byte-identical to PG18.3.
+- rebuild.go isImplicitInt4ToInt8Cast unwraps it in rebuildFuncExprWith → fixed point.
+- datum.go: added OidFloat8=701 (for the degrade boundary).
+
+Key symbols: selectCaseCommonType, coerceCaseResult, wrapInt4ToInt8Cast,
+isImplicitInt4ToInt8Cast, rebuildFuncExprWith.
 
 Gates (GREEN): full pgnodes pkg, go build ./..., go vet ./internal/pgnodes/,
-gofmt clean on touched files, executor TestCanonicalAttrdef/TestDefault,
-ralph-state-guard (auto-repaired→consistent). pgbench smoke via pre-commit hook.
+gofmt clean (4 files), executor TestCanonicalAttrdefText/TestDefault/
+TestResolveForColumn + initdb TestRebuildAttrdefExpr, ralph-state-guard
+(auto-repaired→consistent). pgbench smoke runs in pre-commit hook.
+Goldens captured live from a throwaway PG18.3 (table cw, funcid 481 confirmed).
 
-Key symbols: CaseTestExpr, resolveCaseExprWith, resolveCaseWhenCond,
-operandTypmodCollid, rebuildCaseExprWith, rebuildCaseWhenCond, buildOpExpr.
+Next step: pick from M0123-S4 REMAINING (fix_plan ~L1173): (a) the byte-diff
+oracle harness (goopg emitted adbin/ev_action == real-PG18 for identical DDL,
+:location normalized) — the last big M0123-S4 deliverable; OR (b) FLOAT-family
+CASE coercion (float4→float8 cast + a float branch in selectCaseCommonType/
+coerceCaseResult, OIDs 700/701); OR (c) operator-driven view-qual coercion.
+Recommend (a) the oracle gate. Resume file for (b):
+internal/pgnodes/resolver_expr.go selectCaseCommonType/coerceCaseResult.
 
-Next step (sub-slice 13): select_common_type CROSS-TYPE result coercion (a CASE
-whose WHEN/ELSE results differ in type — searched OR simple; defresult is "most
-significant" per transformCaseExpr). Then the byte-diff oracle harness. All open
-in M0123-S4 (design 0123-0005 §Deferred). Resume: resolver_expr.go
-resolveCaseExprWith result-type seeding loop.
-
-Gates run: pgnodes (green), executor attrdef/default (green), build/vet (green),
-gofmt (clean), ralph-state-guard (repaired→consistent).
+Gates run: pgnodes (green), executor/initdb siblings (green), build/vet (green),
+gofmt (clean), ralph-state-guard (repaired→consistent), pgbench smoke (pre-commit).
 In-flight: none.

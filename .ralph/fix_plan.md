@@ -1166,7 +1166,19 @@ existing encoder, `constcollid=100` / `consttypmod=n+4`.
       simple-form, cast-on-ELSE, multi-arm int8+int4); sibling sys_pg_attrdef_test
       case-mixed flipped canonical; degrade test now covers int4+int8-no-numeric +
       text. Design 0123-0005 §"Sub-slice 13".
-      REMAINING: cross-FAMILY CASE result coercion (int-width-only int4+int8→int8,
-      float / date-time families); simple-form WHEN value needing implicit cast to
-      operand type; operator-driven view-qual coercion (unblocks int2/timestamptz
-      literals in view quals); byte-diff oracle.
+      SUB-SLICE 14 LANDED (2026-07-19): CASE **cross-FAMILY integer coercion**
+      (int4+int8-no-numeric→int8) — the last member of the exact-integer/numeric
+      family. selectCaseCommonType now returns the WIDEST family member present
+      (numeric>int8>int4; none is a preferred type so PG's walk always widens);
+      coerceCaseResult gains the int4→int8 arm via new wrapInt4ToInt8Cast (implicit
+      int8(int4) cast FuncExpr, funcid 481 / funcresulttype 20 / funcformat 2, from
+      pg_cast.dat castcontext 'i'), byte-identical to PG18.3 un-const-folded.
+      rebuild.go isImplicitInt4ToInt8Cast unwraps it (fixed point). Gate case_test.go
+      (4 live goldens: cast-on-WHEN, cast-on-ELSE, simple-form, multi-arm two-casts);
+      degrade test swapped its now-canonical int4+int8 case for int4+float8 (common
+      float8, outside family → SQL text); added OidFloat8=701. Design 0123-0005
+      §"Sub-slice 14".
+      REMAINING: cross-FAMILY CASE result coercion in the float / date-time
+      families; simple-form WHEN value needing implicit cast to operand type;
+      operator-driven view-qual coercion (unblocks int2/timestamptz literals in
+      view quals); byte-diff oracle.
