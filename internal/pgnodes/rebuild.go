@@ -36,20 +36,28 @@ func Rebuild(n Node) (parser.Expr, error) {
 	}
 }
 
-// rebuildFuncExpr reconstructs a plain function call. The funcid is reverse-
-// mapped to its proname (catalog.RegprocName, the same PG18 seed the forward
-// resolver used) and each argument is rebuilt recursively. The call is emitted
-// unqualified (proname only): goopg resolves built-ins by bare name, and the
-// forward resolver accepts an empty schema, so resolve→Rebuild→re-resolve is a
-// fixed point.
+// rebuildFuncExpr reconstructs a plain function call whose arguments are scalar
+// nodes (the S2 DEFAULT-expression scope, where Rebuild is the recursion).
 func rebuildFuncExpr(f *FuncExpr) (parser.Expr, error) {
+	return rebuildFuncExprWith(f, Rebuild)
+}
+
+// rebuildFuncExprWith reconstructs a plain function call, rebuilding each
+// argument through the caller-supplied recursion. The funcid is reverse-mapped
+// to its proname (catalog.RegprocName, the same PG18 seed the forward resolver
+// used) and the call is emitted unqualified (proname only): goopg resolves
+// built-ins by bare name, and the forward resolver accepts an empty schema, so
+// resolve→Rebuild→re-resolve is a fixed point. The recursion parameter lets the
+// query-tree scope (rebuild_query.go) reuse this to rebuild FuncExprs whose
+// arguments may be column Vars, not only scalars.
+func rebuildFuncExprWith(f *FuncExpr, rec func(Node) (parser.Expr, error)) (parser.Expr, error) {
 	name, ok := catalog.RegprocName(f.Funcid)
 	if !ok {
 		return nil, fmt.Errorf("pgnodes: Rebuild: unknown function OID %d", f.Funcid)
 	}
 	args := make([]parser.Expr, 0, len(f.Args))
 	for _, a := range f.Args {
-		arg, err := Rebuild(a)
+		arg, err := rec(a)
 		if err != nil {
 			return nil, err
 		}
@@ -79,10 +87,19 @@ func rebuildConst(c *Const) (parser.Expr, error) {
 	}
 }
 
-// rebuildOpExpr reconstructs a binary operator. The opno is reverse-mapped to
-// its spelling (from the same pg_operator seed S0 resolved forward), then to a
-// parser OpCode.
+// rebuildOpExpr reconstructs a binary operator whose operands are scalar nodes
+// (the S2 DEFAULT-expression scope, where Rebuild is the recursion).
 func rebuildOpExpr(o *OpExpr) (parser.Expr, error) {
+	return rebuildOpExprWith(o, Rebuild)
+}
+
+// rebuildOpExprWith reconstructs a binary operator, rebuilding each operand
+// through the caller-supplied recursion. The opno is reverse-mapped to its
+// spelling (from the same pg_operator seed S0 resolved forward), then to a
+// parser OpCode. The recursion parameter lets the query-tree scope
+// (rebuild_query.go) reuse this to rebuild OpExprs whose operands may be column
+// Vars, not only scalars.
+func rebuildOpExprWith(o *OpExpr, rec func(Node) (parser.Expr, error)) (parser.Expr, error) {
 	if len(o.Args) != 2 {
 		return nil, fmt.Errorf("pgnodes: Rebuild: OpExpr with %d args (want 2)", len(o.Args))
 	}
@@ -94,11 +111,11 @@ func rebuildOpExpr(o *OpExpr) (parser.Expr, error) {
 	if op == parser.OpUnknown {
 		return nil, fmt.Errorf("pgnodes: Rebuild: operator %q has no goopg OpCode", name)
 	}
-	left, err := Rebuild(o.Args[0])
+	left, err := rec(o.Args[0])
 	if err != nil {
 		return nil, err
 	}
-	right, err := Rebuild(o.Args[1])
+	right, err := rec(o.Args[1])
 	if err != nil {
 		return nil, err
 	}

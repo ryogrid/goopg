@@ -1,4 +1,4 @@
-# 0123-0004 — `internal/pgnodes` query-tree serializer + resolver (M0123-S3, sub-slices 1–2a)
+# 0123-0004 — `internal/pgnodes` query-tree serializer + resolver + rebuild (M0123-S3, sub-slices 1–2b)
 
 Status: accepted
 Milestone: M0123 (canonical `pg_node_tree` serialization), slice S3
@@ -125,9 +125,47 @@ what PG stores in `pg_rewrite.ev_action` for the same DDL.
   `ErrUnsupported` matrix (GROUP BY / ORDER BY / LIMIT / DISTINCT / aliased FROM /
   `*` / two relations / unknown column / unknown relation / set op).
 
-## Deferred to sub-slice 2 (M0123-S3 wiring)
+## Sub-slice 2b — the rebuild inverse (`rebuild_query.go`)
 
-- `rebuild.go`: IR `Query` → goopg view AST for the reload path.
+`RebuildViewQuery(*Query) (*parser.SelectStmt, error)` is the reload-time inverse
+of `ResolveViewQuery` (the query-tree analogue of S2's scalar `Rebuild`), still a
+pure `internal/pgnodes` addition with **no engine wiring yet**. On restart the
+per-database view reload reads the stored `ev_action` (`ReadRuleAction`) and
+`RebuildViewQuery` turns the IR `Query` back into a goopg view-definition AST so
+goopg re-registers/plans the view exactly as before.
+
+- **Self-describing rebuild — no live catalog lookup.** The `Query` already
+  carries everything the inverse needs: the FROM item's name is the single RTE
+  `eref.aliasname` and every column name is that `eref.colnames` list (the
+  forward resolver populates it with the relation's full column list in
+  attribute-number order), so a `Var`'s `varattno` maps straight back to a
+  column reference via `colnames[attno-1]`. This is why the rebuild takes no
+  `RelationResolver` — unlike the forward direction, it needs no external
+  metadata.
+- **Fixed point.** `ResolveViewQuery → OutRuleAction … ReadRuleAction →
+  RebuildViewQuery → ResolveViewQuery` reproduces the input `Query`
+  byte-for-byte. The one subtlety is the target `resname`: `rebuildTarget`
+  emits an explicit `AS` alias **only** when the stored `resname` differs from
+  the name the forward `queryScope.targetName` would auto-derive (a column
+  reference's column name, a function call's name) — the exact inverse of that
+  rule — so plain column targets round-trip without redundant aliases while an
+  aliased computed target (`upper(src) AS us`) keeps its alias.
+- **Sharing with S2's `rebuild.go`.** `rebuildOpExpr`/`rebuildFuncExpr` were made
+  recursion-injectable (`rebuildOpExprWith`/`rebuildFuncExprWith(node, rec)`) so
+  the query scope reuses the identical opno→spelling→`OpCode` and
+  funcid→proname reconstruction while supplying its own recursion that also
+  handles column `Var`s; the scalar path passes `Rebuild` unchanged. The only
+  new leaf is `Var` → `parser.ColumnRef`.
+- **Gate** (`rebuild_query_test.go`): for both golden views, resolve → rebuild →
+  re-resolve → `OutRuleAction` == the live PG18.3 `ev_action` golden
+  byte-for-byte; a structural inspection of the rebuilt AST (FROM item;
+  no-redundant-alias on a plain column target; `WHERE` operator shape; explicit
+  alias retained for an aliased computed target); and a producer/reader-mismatch
+  matrix (non-SELECT command, empty rtable, empty target list, out-of-range Var
+  attno).
+
+## Deferred to sub-slice 2c (M0123-S3 wiring)
+
 - Wire `writeViewRewriteRow` to store canonical `ev_action`; set
   `catalog.Table.RuleIsCanonical`; flip `pg18_user_catalog_rows.go` `relhasrules`
   to read it; swap `loadViewsFromHeap`; update the `relhasrules=false` test

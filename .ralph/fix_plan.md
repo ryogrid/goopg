@@ -5710,8 +5710,24 @@ existing encoder, `constcollid=100` / `consttypmod=n+4`.
       Gate `resolver_query_test.go`: resolve→`OutRuleAction` == both live PG18.3
       goldens byte-for-byte + resolve→`Out`→`Read`→re-`Out` round-trip +
       structural spot-check + 10-case `ErrUnsupported` matrix; `go test
-      ./internal/pgnodes/` + `go vet` green. REMAINING (sub-slice 2 b/c):
-      `rebuild.go` (IR `Query` → goopg view AST for reload). Wire `writeViewRewriteRow` to canonical
+      ./internal/pgnodes/` + `go vet` green.
+      SUB-SLICE 2 part (b) — the reload inverse — **LANDED (2026-07-19)**:
+      `rebuild_query.go` (`RebuildViewQuery(*Query) (*parser.SelectStmt, error)`),
+      the query-tree analogue of S2's scalar `Rebuild`. Self-describing (no
+      `RelationResolver`): FROM name = the single RTE `eref.aliasname`, column
+      names = that `eref.colnames`, so `Var.varattno`→`colnames[attno-1]`.
+      Fixed point resolve→`Out`…`Read`→`RebuildViewQuery`→resolve reproduces the
+      input `Query` byte-for-byte (`rebuildTarget` emits an explicit alias only
+      when `resname` differs from the forward `targetName` auto-derivation — the
+      exact inverse). Refactor: `rebuild.go`'s `rebuildOpExpr`/`rebuildFuncExpr`
+      made recursion-injectable (`*With(node, rec)`) so the query scope reuses
+      the identical opno/funcid reconstruction with `Var`-aware recursion. Gate
+      `rebuild_query_test.go`: both goldens resolve→rebuild→re-resolve→
+      `OutRuleAction` == golden byte-for-byte + rebuilt-AST structural check +
+      producer/reader-mismatch matrix; `go test ./internal/pgnodes/` + `go vet`
+      + `go build ./...` green. Design 0123-0004 §"Sub-slice 2b" + README index.
+      REMAINING (sub-slice 2 c):
+      Wire `writeViewRewriteRow` to canonical
       `ev_action` + set the per-table `catalog.Table.RuleIsCanonical` flag; flip
       `pg18_user_catalog_rows.go:511` `relhasrules` to read it (leave the
       `catalog.go` system/information_schema virtual builders false). Swap
