@@ -97,6 +97,35 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
       pgnodes S1/S2 + mdtablefix commits now at HEAD `12969b77`. Verified: the
       four cases (plus their suite dependencies copyselect/subselect) all PASS
       (18.8s); the normalization-rule divergence no longer reproduces. No new work.
+      **RE-VERIFIED 2026-07-20** (nightly run 20260720-005224, AI-20260720-005224-002/
+      -003/-004/-005 — re-reported at sha `be88fb66` ≈ HEAD `fb5de5c4`): re-ran the
+      same repro in isolation at HEAD — `errors`/`portals_p2`/`select` PASS,
+      `index_including` SKIPs (deferred), suite green (18.95s). NOT reopened: the
+      normalization divergence only manifests in the nightly's full-suite ordering /
+      co-load, never in the isolated repro the action-item prescribes. No new work;
+      candidate for a `regress_suite` normalization-hardening follow-up if it persists.
+- [x] **TestE2E_FailoverPGtoGoopg/sync_on** — heterogeneous PG→goopg physical
+      failover zero-loss invariant FAILed in nightly run 20260720-005224
+      (AI-20260720-005224-001: `sync_remote_apply zero-loss violated: count(*)=5 want 6`;
+      repro: `go test -v -run '^TestE2E_FailoverPGtoGoopg$/sync_on' ./internal/testport/`).
+      **Flake at HEAD — passes 4/4** (`fb5de5c4`, 8.2s each, isolated). Not a
+      deterministic regression: the pgnodes S4 commits between the nightly sha and HEAD
+      touch only parse-time DEFAULT folding, nothing in WAL/replication/promotion. The
+      nightly host was under co-load (`mmap … MAP_HUGETLB failed, huge pages disabled`
+      in pg.log) which shifts sync-rep feedback timing. The invariant itself is real
+      (a `synchronous_commit=on` COMMIT must be durable on the standby before it
+      returns) — see the 2026-07-20 deferral-ledger row for the sync-feedback /
+      last-record-replay durability edge to chase if it recurs. No weakening of the test.
+- [x] **pgbench/nightly** — nightly heavy-write stage (s=50 c=100 j=20 T=180) logged
+      4 failed transactions / 19.5M (0.000%), all `current transaction is aborted,
+      commands ignored` at TPC-B command 4 (AI-20260720-005224-006; repro:
+      `REPO_ROOT=$PWD RUN_DIR=$(mktemp -d) bash ci/batch/stages/stage-pgbench.sh`).
+      **Known limitation, not a new regression.** Command 4 (`UPDATE pgbench_branches`)
+      aborts because an earlier command in the same txn hit goopg's non-FIFO tuple-lock
+      path (100 clients contending 50 branch rows) and raised instead of queuing — the
+      documented `goopg_dml_conflict_no_fifo_tuple_lock` / ledger 0021-0012 gap (route
+      tuple locks through `tableLockMgr` for FIFO waits). 4/19.5M is the tail of that
+      known edge; no separate fix here — tracked by the existing deferral row.
 
 _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan_010.md`)_
 
