@@ -15,6 +15,7 @@ package pgnodes
 import (
 	"encoding/binary"
 	"fmt"
+	"strconv"
 	"sync"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -520,6 +521,15 @@ func rebuildConst(c *Const) (parser.Expr, error) {
 			return &parser.UnaryOp{Op: parser.OpUnaryNeg, Operand: &parser.IntegerConst{Value: -v}}, nil
 		}
 		return &parser.IntegerConst{Value: v}, nil
+	case OidInt2:
+		// An int2 Const only arises from folding an unknown-type string literal
+		// (`'5'::int2` / `col int2 DEFAULT '5'`) — a bare integer literal is int4 and
+		// PG wraps it in an int4→int2 cast FuncExpr, never an int2 Const. Rebuild to a
+		// STRING literal (not an IntegerConst) so a re-resolve in the int2 column
+		// context routes back through foldStringLiteralConst → int2 Const (the fixed
+		// point); an IntegerConst would resolve via resolveIntLiteral to an int4 Const
+		// and break it. A negative value lives inside the literal, not a unary minus.
+		return &parser.StringConst{Value: strconv.FormatInt(int64FromByvalWord(c.Datum), 10)}, nil
 	case OidBool:
 		// The by-value word is 0 (false) or 1 (true); see datum.go:NewBoolConst.
 		return &parser.BooleanConst{Value: int64FromByvalWord(c.Datum) != 0}, nil

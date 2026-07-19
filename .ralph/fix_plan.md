@@ -1387,8 +1387,31 @@ existing encoder, `constcollid=100` / `consttypmod=n+4`.
       now **29 cases** all byte-identical vs LIVE PG18.3 (PG confirms the bare-Const store)
       + executor `TestCanonicalAttrdefText` date-cast/tstz-cast/tstz-cast-notz. Design
       0123-0005 §"Sub-slice 27".
-      REMAINING: float4-common (no
-      float8) CASE mix (needs int/numeric→float4 arms + outer column cast); operator-driven
-      view-qual coercion (unblocks int2/timestamptz literals inside a view WHERE); other
-      length types (`varchar(N)`=CoerceViaIO, `timestamp(N)`, `bit(N)`); broader date input
-      forms (`infinity`, BC years, DateStyle-dependent).
+      SUB-SLICE 28 LANDED (2026-07-20): string-literal cast folds to **bool / int2 /
+      int4 / int8** (closes sub-slice 27's `'123'::int4`/`'t'::bool` deferral). An
+      unknown-type STRING literal coerced to bool/int2/int4/int8 — explicit `::T` cast
+      OR typed column context (`col int4 DEFAULT '123'`) — folds at parse time to a
+      by-value Const via the type input function (int4in/int8in/int2in/boolin), with NO
+      cast node, byte-identical to PG18.3. New shared `foldStringLiteralConst` routes
+      BOTH sibling paths (resolve's StringConst arm + resolveCastExpr string block).
+      datum.go: NewInt2Const + parseIntFromString (decimal subset of pg_strtoint) +
+      parseBoolLiteral (parse_bool_with_len port) + pgTrimSpace. rebuild.go: OidInt2 →
+      STRING literal (re-folds via foldStringLiteralConst; a bare IntegerConst would
+      resolve to int4 and break the fixed point). KEY BOUNDARY: bare integer `int2
+      DEFAULT 5` is an int4→int2 cast FuncExpr (funcid 314), NOT an int2 Const — only
+      the unknown-STRING form folds, so foldStringLiteralConst fires only on
+      *parser.StringConst and resolveIntLiteral is untouched. Gate
+      `internal/pgnodes/string_cast_test.go` (6 goldens + codec + cast==bare-fold pairs
+      + bool-spelling table + non-string-operand boundary + degradation matrix +
+      column-scoped reload fixed point) + oracle_pgnodes_adbin_test.go now **67 cases**
+      all byte-identical vs LIVE PG18.3 + executor `TestCanonicalAttrdefText` 6 str-cast/
+      str-col cases; cast_test/resolver_expr_test sibling reconciliations. Design
+      0123-0005 §"Sub-slice 28"; ledger 2026-07-20 (text/numeric/float/oid string folds
+      + bare-integer→int2 cast deferred).
+      REMAINING: text/numeric/float/oid string-literal folds
+      (`'x'::text`/`'5'::numeric`/`'5'::float8`); the bare-integer→int2 implicit cast
+      FuncExpr (`int2 DEFAULT 5`); float4-common (no float8) CASE mix (needs
+      int/numeric→float4 arms + outer column cast); operator-driven view-qual coercion
+      (unblocks int2/timestamptz literals inside a view WHERE); other length types
+      (`varchar(N)`=CoerceViaIO, `timestamp(N)`, `bit(N)`); broader date input forms
+      (`infinity`, BC years, DateStyle-dependent).

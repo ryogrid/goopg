@@ -223,6 +223,20 @@ var adbinOracleCases = []adbinOracleCase{
 	// node, so the adbin is byte-identical to the bare-literal column-context fold.
 	{"date_cast", "date", pgnodes.OidDate, "'2024-03-15'::date"},
 	{"timestamptz_cast", "timestamptz", pgnodes.OidTimestamptz, "'2024-01-15 10:30:00+00'::timestamptz"},
+	// Sub-slice 28: an unknown-type STRING literal coerced to bool/int2/int4/int8 —
+	// by an explicit `::type` cast or a typed column context — folds at parse time to
+	// a by-value Const via the type input function (int4in/int8in/int2in/boolin), with
+	// NO cast node, byte-identical to the analogous integer/bool datum. A bare integer
+	// literal is int4-typed and would instead carry an int4→int2 cast FuncExpr, so only
+	// the string-literal form folds (covered in string_cast_test.go).
+	{"str_cast_int4", "int", pgnodes.OidInt4, "'123'::int4"},
+	{"str_cast_int4_neg", "int", pgnodes.OidInt4, "'-5'::int4"},
+	{"str_cast_int8", "int8", pgnodes.OidInt8, "'123'::int8"},
+	{"str_cast_int2", "int2", pgnodes.OidInt2, "'12'::int2"},
+	{"str_cast_bool_true", "bool", pgnodes.OidBool, "'t'::bool"},
+	{"str_cast_bool_false", "bool", pgnodes.OidBool, "'false'::bool"},
+	{"str_col_int4", "int", pgnodes.OidInt4, "'123'"},
+	{"str_col_bool_yes", "bool", pgnodes.OidBool, "'yes'"},
 }
 
 // TestOraclePgnodesAdbinBytesMatchPG is the M0123-S4 byte-diff oracle: for each

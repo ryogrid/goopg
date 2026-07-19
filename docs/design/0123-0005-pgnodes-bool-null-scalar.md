@@ -1378,6 +1378,74 @@ stores the exact same bare `DateADT` `Const` as the column-context fold.
   `tstz-cast-notz` (SQL-text fallback).
 - Full `pgnodes` package + `go vet` + gofmt clean; pgbench smoke via pre-commit.
 
+## Sub-slice 28 — string-literal cast folds to bool / int2 / int4 / int8
+
+Sub-slice 27 folded `date`/`timestamptz` string literals; this extends the same
+parse-time-fold mechanism across the **boolean and exact-integer** input functions.
+An unknown-type string literal coerced to `bool`/`int2`/`int4`/`int8` — by an
+explicit `::T` cast (`'123'::int4`, `'t'::bool`) **or** a typed column context
+(`col int4 DEFAULT '123'`) — folds via `coerce_type` → `stringTypeToConst` → the
+type input function (`int4in`/`int8in`/`int2in`/`boolin`) to a by-value `Const` with
+**no cast node**, byte-identical to PG18.3 (`ad.adbin`). Both forms were previously
+SQL-text degradations.
+
+### The unknown-vs-int4 boundary (why only *string* literals fold)
+
+The fold is specific to an **unknown-type** literal. A *bare integer literal* `5` is
+already `int4`-typed by the scanner, so `int2 DEFAULT 5` is **not** an `int2` `Const`
+— PG wraps it in an implicit `int4→int2` cast `FuncExpr` (`funcid 314`, funcformat 2),
+a distinct un-folded shape not modeled here. Only `'5'::int2` / `col int2 DEFAULT '5'`
+(unknown string) folds. This is why `foldStringLiteralConst` fires exclusively on a
+`*parser.StringConst` operand, and why `resolveIntLiteral` was deliberately **not**
+extended to emit an `int2` `Const` (doing so would mis-fold the bare-integer form).
+
+### Changes
+
+- `datum.go` — `NewInt2Const(int16)` (constlen 2); `parseIntFromString(s, bits)` (the
+  decimal subset of `pg_strtoint16/32/64_safe`: ASCII whitespace + optional sign +
+  base-10 digits, range-checked; non-decimal `0x`/`0o`/`0b` and `_` separators are
+  excluded so any accepted string yields PG's exact value); `parseBoolLiteral` (a
+  faithful port of `parse_bool_with_len` — the case-insensitive unique-prefix rules for
+  `true`/`yes`/`on`/`1` and `false`/`no`/`off`/`0`, with the ambiguous-`o` guard);
+  `pgTrimSpace` (the six C-`isspace` ASCII whitespace chars, not Unicode).
+- `resolver_expr.go` — new shared `foldStringLiteralConst(s, targetOID)` folds a string
+  literal for the modeled types (bool / int2 / int4 / int8 / date / the deterministic
+  `timestamptz` subset). BOTH sibling paths route through it: `resolve`'s `StringConst`
+  arm (column context, after the text/unknown special case) and `resolveCastExpr`'s
+  string-operand block (explicit cast). A string-operand cast whose fold fails degrades
+  directly rather than falling through to the numeric-family cast path (which would
+  mis-resolve the literal as `text`).
+- `rebuild.go` — new `OidInt2` arm rebuilds to a **string** literal (not an
+  `IntegerConst`), so a column-scoped re-resolve routes back through
+  `foldStringLiteralConst` → `int2` `Const` (the fixed point); a bare `IntegerConst`
+  would resolve via `resolveIntLiteral` to an `int4` `Const` and break it. `int4`/`int8`
+  keep their existing `IntegerConst` rebuild (`resolveIntLiteral` re-types from the
+  column context); `bool` keeps its `BooleanConst` rebuild.
+
+### Gates (all green)
+
+- `internal/pgnodes/string_cast_test.go` — 6 goldens (int4/int4-neg/int8/int2/bool-true/
+  bool-false) resolved with an **unknown** context + codec round-trip; a `MatchesBareFold`
+  pair test (8 pairs, cast form `==` column form); a `BoolSpellings` table pinning
+  `parse_bool_with_len`; a `NonStringOperandNotFolded` boundary test (`5::int2` stays a
+  `funcid 314` `FuncExpr`, and bare `int2 DEFAULT 5` degrades); a degradation matrix
+  (non-numeric, fractional, hex, overflow, empty); and a column-scoped reload fixed point.
+- `internal/testport/oracle_pgnodes_adbin_test.go` — 8 cases added (`str_cast_int4`,
+  `str_cast_int4_neg`, `str_cast_int8`, `str_cast_int2`, `str_cast_bool_true`,
+  `str_cast_bool_false`, `str_col_int4`, `str_col_bool_yes`) — **67 cases total**, all
+  byte-identical vs LIVE PG18.3.
+- `internal/executor/sys_pg_attrdef_test.go` — 6 canonical cases (`str-cast-int4/int8/
+  int2/bool`, `str-col-int4/bool`); the pre-existing `smallint-lit` (bare `5` → SQL text)
+  is retained as the un-folded-integer boundary.
+- Full `pgnodes` package + `go vet` + gofmt clean; pgbench smoke via pre-commit.
+
+### Deferred (ledger)
+
+`::text` / `::oid` / `::numeric` / `::float4` / `::float8` string-literal folds (PG
+folds these too, via `textin`/`oidin`/`numeric_in`/`float4in`/`float8in`, but they are
+not modeled in this slice); non-decimal integer spellings (`0x`/`0o`/`0b`, `_`
+separators).
+
 ## Byte-diff oracle gate (adbin) — `internal/testport/oracle_pgnodes_adbin_test.go`
 
 The per-datum golden tests above each hard-code a `want` `adbin` string a

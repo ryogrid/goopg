@@ -61,6 +61,20 @@ func NewInt4Const(v int32) *Const {
 	}
 }
 
+// NewInt2Const builds a Const for an int2 (smallint) literal. A negative value
+// sign-extends into the 8-byte datum word, reproducing Int16GetDatum. An int2
+// Const only ever arises from folding an unknown-type string literal in an int2
+// context (`'5'::int2` / `col int2 DEFAULT '5'`) — a bare integer literal `5` is
+// int4-typed and PG wraps it in an int4→int2 cast FuncExpr (funcid 314), not an
+// int2 Const, so this constructor is deliberately NOT reached from resolveIntLiteral.
+func NewInt2Const(v int16) *Const {
+	return &Const{
+		ConstType: OidInt2, ConstTypmod: -1, ConstCollid: 0,
+		ConstLen: 2, ConstByval: true, Location: -1,
+		Datum: byvalWord(int64(v)),
+	}
+}
+
 // NewInt8Const builds a Const for an int8 (bigint) literal.
 func NewInt8Const(v int64) *Const {
 	return &Const{
@@ -112,6 +126,105 @@ func caseTypeMeta(oid uint32) (constlen int32, constbyval bool, ok bool) {
 	default:
 		return 0, false, false
 	}
+}
+
+// pgTrimSpace trims exactly the six ASCII whitespace characters C's isspace()
+// recognises in the C locale (space, \t, \n, \v, \f, \r), matching the whitespace
+// PostgreSQL's numeric/bool input functions skip. It deliberately does NOT use
+// strings.TrimSpace, which trims the wider Unicode whitespace set and would accept
+// literals PG's input functions reject.
+func pgTrimSpace(s string) string {
+	return strings.TrimFunc(s, func(r rune) bool {
+		switch r {
+		case ' ', '\t', '\n', '\v', '\f', '\r':
+			return true
+		}
+		return false
+	})
+}
+
+// parseIntFromString reproduces the DECIMAL subset of PG's pg_strtoint16/32/64_safe
+// (utils/adt/numutils.c) that backs int2in/int4in/int8in: leading/trailing ASCII
+// whitespace, an optional +/- sign, then one-or-more base-10 digits, range-checked
+// to the target width (bits = 16/32/64). It intentionally excludes the non-decimal
+// base prefixes (0x/0o/0b) and '_' digit separators PG 16+ also accepts — those
+// forms exist but are folded to SQL text (all-or-nothing), so any string accepted
+// here yields the byte-identical value PG's input function would compute. Returns
+// ok=false for an empty/sign-only/non-decimal string or an out-of-range value (a
+// value PG's input function would itself reject with an error).
+func parseIntFromString(s string, bits int) (int64, bool) {
+	t := pgTrimSpace(s)
+	if t == "" {
+		return 0, false
+	}
+	body := t
+	if body[0] == '+' || body[0] == '-' {
+		body = body[1:]
+	}
+	if body == "" {
+		return 0, false
+	}
+	for i := 0; i < len(body); i++ {
+		if body[i] < '0' || body[i] > '9' {
+			return 0, false
+		}
+	}
+	n, err := strconv.ParseInt(t, 10, bits)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
+// parseBoolLiteral reproduces PG boolin → parse_bool_with_len (utils/adt/bool.c):
+// after stripping surrounding whitespace the (case-insensitive) value must be a
+// UNIQUE PREFIX of an accepted spelling — true/yes/on/1 → true, false/no/off/0 →
+// false. Any prefix of "true" (t, tr, tru, true) is true, of "false" (f, fa, …)
+// is false, and so on; "on"/"off" require at least two characters to disambiguate
+// (a lone "o" is rejected), while "1"/"0" must be exactly one character. Returns
+// ok=false for anything else — the strings PG's boolin would reject with an error.
+func parseBoolLiteral(s string) (value bool, ok bool) {
+	v := strings.ToLower(pgTrimSpace(s))
+	if v == "" {
+		return false, false
+	}
+	switch v[0] {
+	case 't':
+		if strings.HasPrefix("true", v) {
+			return true, true
+		}
+	case 'f':
+		if strings.HasPrefix("false", v) {
+			return false, true
+		}
+	case 'y':
+		if strings.HasPrefix("yes", v) {
+			return true, true
+		}
+	case 'n':
+		if strings.HasPrefix("no", v) {
+			return false, true
+		}
+	case 'o':
+		// "on"/"off" share the prefix "o"; PG requires >= 2 chars to disambiguate.
+		if len(v) >= 2 {
+			if strings.HasPrefix("on", v) {
+				return true, true
+			}
+			if strings.HasPrefix("off", v) {
+				return false, true
+			}
+		}
+	case '1':
+		if len(v) == 1 {
+			return true, true
+		}
+	case '0':
+		if len(v) == 1 {
+			return false, true
+		}
+	}
+	return false, false
 }
 
 // newNullConst builds the typed NULL Const PG synthesizes for a CASE without an

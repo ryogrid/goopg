@@ -192,6 +192,8 @@ func TestSupportsExprRejectsOutOfSubset(t *testing.T) {
 		{"upper('x')", OidText}, // plain built-in FuncExpr forward-resolves
 		{"1.5", OidNumeric},     // numeric datum (M0123-S4 sub-slice 3)
 		{"-2.5", OidNumeric},    // folded negative numeric Const
+		{"'5'", OidInt4},        // string literal folds to int4 Const (sub-slice 28)
+		{"'t'", OidBool},        // string literal folds to bool Const (sub-slice 28)
 	}
 	for _, tc := range supported {
 		if !SupportsExpr(mustParse(t, tc.sql), tc.targetType) {
@@ -203,7 +205,8 @@ func TestSupportsExprRejectsOutOfSubset(t *testing.T) {
 		sql        string
 		targetType uint32
 	}{
-		{"'5'", OidInt4},   // string literal in a non-text context
+		{"'abc'", OidInt4}, // non-numeric string literal → int input rejects (degrades)
+		{"'5'", OidFloat8}, // float string-literal fold not modeled this slice (degrades)
 		{"a + 1", OidInt4}, // column reference
 	}
 	for _, tc := range unsupported {

@@ -1,34 +1,38 @@
 (idle — nothing in flight)
 
-Last loop (#41): M0123-S4 sub-slice 27 — explicit `::date` / `::timestamptz` cast
-of a string literal folds to the SAME by-value Const as the bare-literal column
-form. LANDED + committed. PG folds an unknown-type string literal at parse time
-(coerce_type→stringTypeToConst→type input func) into a Const whose consttype is the
-cast target, with NO cast node — so `'2024-03-15'::date` stores a bare DateADT Const
-byte-identical to `DEFAULT '2024-03-15'`. Closes the asymmetry where the bare form
-was canonical but the explicit-cast form degraded to SQL text.
+Last loop (#42): M0123-S4 sub-slice 28 — string-literal cast folds to bool/int2/
+int4/int8. LANDED + committed. An unknown-type STRING literal coerced to
+bool/int2/int4/int8 — explicit `::T` cast OR typed column context (`col int4
+DEFAULT '123'`) — folds at parse time to a by-value Const via the type input
+function (int4in/int8in/int2in/boolin), NO cast node, byte-identical to PG18.3.
+Closes sub-slice 27's `'123'::int4`/`'t'::bool` deferral. KEY BOUNDARY (live-probed):
+bare integer `int2 DEFAULT 5` is an int4→int2 cast FuncExpr (funcid 314), NOT an
+int2 Const — only the unknown-STRING form folds, so foldStringLiteralConst fires
+only on *parser.StringConst; resolveIntLiteral untouched.
 
-Files: internal/pgnodes/resolver_expr.go (resolveCastExpr leading date/timestamptz
-string-fold arm — parseDateDays/parseTimestamptzMicros; non-string operand / invalid
-/ TZ-dependent / typmod'd → ErrUnsupported). NO IR/codec/rebuild change (folded Const
-== column-context form; rebuildConst's OidDate/OidTimestamptz arms already invert it).
-NEW internal/pgnodes/datetime_cast_test.go (3 goldens w/ UNKNOWN context + cast==bare
-pair + degradation matrix + column-scoped reload fixed point); oracle_pgnodes_adbin_
-test.go +2 (date_cast/timestamptz_cast → 29 cases); executor sys_pg_attrdef_test.go
-+date-cast/tstz-cast/tstz-cast-notz. Design 0123-0005 §"Sub-slice 27" + fix_plan + ledger.
+Files: internal/pgnodes/datum.go (NewInt2Const, parseIntFromString=pg_strtoint
+decimal subset, parseBoolLiteral=parse_bool_with_len port, pgTrimSpace);
+resolver_expr.go (shared foldStringLiteralConst routes BOTH resolve StringConst arm
++ resolveCastExpr string block); rebuild.go (OidInt2→StringConst so re-resolve
+re-folds; int4/int8/bool keep existing rebuild). NEW string_cast_test.go; oracle
+adbin +8 (now 67); executor sys_pg_attrdef_test +6; cast_test/resolver_expr_test
+sibling reconciliations. Design 0123-0005 §"Sub-slice 28" + fix_plan + ledger.
 
-Gates GREEN: full pgnodes pkg; adbin oracle 29/29 byte-identical vs LIVE PG18.3;
-executor TestCanonicalAttrdefText; go build ./..., go vet (pgnodes/testport/executor),
-gofmt clean; pgbench smoke via pre-commit.
+Gates GREEN: full pgnodes pkg; adbin oracle 67/67 byte-identical vs LIVE PG18.3;
+executor TestCanonicalAttrdefText; go build ./..., go vet (pgnodes/executor/
+testport), gofmt clean (resolver_expr_test.go block-246 flag is pre-existing
+go1.25-vs-go1.26.3 mismatch, NOT mine — never gofmt -w); pgbench smoke via pre-commit.
 
-Nightly triage (run 20260719-094219, sha c217c692): all 5 AI items already [x] stale
-(predate HEAD). No new nightly work.
+Nightly triage (run 20260719-094219, sha c217c692): all 5 AI items already [x]
+stale (predate HEAD). No new nightly work.
 
-Next (M0123-S4 REMAINING): (1) broader literal-cast folds — string→int4/int8/bool
-(`'123'::int4`, `'t'::bool`) via pg_atoi/boolin analogues in resolveCastExpr; (2)
-float4-common (no float8) CASE mix — int/numeric→float4 arms + outer float8(float4)
-column cast (selectCaseCommonType/coerceCaseResult); (3) operator-driven view-qual
-coercion (unblocks int2/timestamptz literals inside a view WHERE — resolver_query.go);
-(4) other length types (varchar(N)=CoerceViaIO, timestamp(N), bit(N)); (5) broader date
-input forms (infinity/-infinity, BC years, DateStyle MDY/DMY, textual month — datum.go
-parseDateDays). ALL date/timestamptz literal (bare + explicit-cast) Const shapes canonical.
+Next (M0123-S4 REMAINING): (1) text/numeric/float/oid string-literal folds
+(`'x'::text`/`'5'::numeric`/`'5'::float8` — add OidText/OidNumeric/OidFloat*/OidOid
+arms to foldStringLiteralConst; float needs a float datum + float*in parse); (2)
+bare-integer→int2 implicit cast FuncExpr (`int2 DEFAULT 5`, funcid 314 — needs a
+resolveIntLiteral int2-context arm emitting the cast, NOT a bare Const); (3)
+float4-common (no float8) CASE mix (selectCaseCommonType/coerceCaseResult); (4)
+operator-driven view-qual coercion (resolver_query.go); (5) other length types
+(varchar(N)=CoerceViaIO, timestamp(N), bit(N)); (6) broader date input forms
+(infinity/-infinity, BC years, DateStyle MDY/DMY, textual month — datum.go
+parseDateDays).

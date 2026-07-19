@@ -67,7 +67,17 @@ func TestCanonicalAttrdefText(t *testing.T) {
 		{"case-expr", col("int4", "CASE WHEN true THEN 1 ELSE 2 END"), true, []string{"CASEEXPR", "CASEWHEN", "casetype 23"}},
 		// A no-ELSE CASE keeps a typed NULL defresult and is still canonical.
 		{"case-no-else", col("int4", "CASE WHEN true THEN 1 END"), true, []string{"CASEEXPR", "constisnull true"}},
-		// SQL-text fallback: type mismatch or a node outside the scalar subset.
+		// An unknown-type STRING literal coerced to bool/int2/int4/int8 (explicit cast
+		// or typed column context) folds to a canonical by-value Const via the type
+		// input function, with NO cast node. M0123-S4 sub-slice 28.
+		{"str-cast-int4", col("int4", "'123'::int4"), true, []string{"CONST", "23", "constlen 4"}},
+		{"str-cast-int8", col("int8", "'123'::int8"), true, []string{"CONST", "20", "constlen 8"}},
+		{"str-cast-int2", col("int2", "'12'::int2"), true, []string{"CONST", "21", "constlen 2"}},
+		{"str-cast-bool", col("bool", "'t'::bool"), true, []string{"CONST", "16", "constlen 1"}},
+		{"str-col-int4", col("int4", "'123'"), true, []string{"CONST", "23"}},
+		{"str-col-bool", col("bool", "'yes'"), true, []string{"CONST", "16"}},
+		// SQL-text fallback: a bare integer literal `5` in an int2 column is int4-typed
+		// then wrapped in an int4→int2 cast FuncExpr (not modeled), so type != int2 → text.
 		{"smallint-lit", col("int2", "5"), false, []string{"5"}},
 		// A mixed-result-type CASE (int vs numeric) now folds via select_common_
 		// type: casetype numeric (1700), the int result wrapped in the implicit

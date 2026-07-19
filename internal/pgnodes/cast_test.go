@@ -312,10 +312,11 @@ func TestCastDegradesGracefully(t *testing.T) {
 		colType uint32
 	}{
 		{"int_to_text_target", "5::text", OidText},           // non-numeric-category target
-		{"text_literal_to_float8", "'5'::float8", OidFloat8}, // text source arm not modeled
-		{"text_literal_to_int4", "'5'::int4", OidInt4},       // text source arm not modeled
+		{"text_literal_to_float8", "'5'::float8", OidFloat8}, // float string-literal fold not modeled (deferred)
 		// (sub-slice 24 now models the bare-numeric-col typmod'd cast via an implicit
-		// RelabelType — covered in numeric_relabel_test.go — so it is no longer a degrade.)
+		// RelabelType — covered in numeric_relabel_test.go — so it is no longer a degrade.
+		// sub-slice 28 now folds a string literal cast to bool/int2/int4/int8 — covered
+		// in string_cast_test.go — so `'5'::int4` is likewise no longer a degrade.)
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

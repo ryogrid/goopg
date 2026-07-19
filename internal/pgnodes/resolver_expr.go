@@ -217,22 +217,14 @@ func resolve(e parser.Expr, expected uint32) (Node, uint32, error) {
 		if expected == OidText || expected == 0 {
 			return NewTextConst(v.Value), OidText, nil
 		}
-		// In a timestamptz context PG folds the literal to a Const at parse time
-		// (stringTypeToConst → timestamptz_in). Reproduce that only for the
-		// deterministic subset (explicit offset / 'epoch'); a TimeZone-dependent
-		// form falls back to SQL text (all-or-nothing; 02e §3).
-		if expected == OidTimestamptz {
-			if usec, ok := parseTimestamptzMicros(v.Value); ok {
-				return NewTimestamptzConst(usec), OidTimestamptz, nil
-			}
-		}
-		// A date context folds a plain ISO date literal to a by-value DateADT
-		// Const (date_in is TimeZone-independent, so — unlike timestamptz — no
-		// determinism boundary beyond the calendar-validity guard in parseDateDays).
-		if expected == OidDate {
-			if days, ok := parseDateDays(v.Value); ok {
-				return NewDateConst(days), OidDate, nil
-			}
+		// In a concrete non-text column context PG folds the unknown-type literal to
+		// a by-value Const at parse time (stringTypeToConst → the type's input
+		// function), with NO cast node. foldStringLiteralConst reproduces that for
+		// the modeled types (bool / int2 / int4 / int8 / date / the deterministic
+		// timestamptz subset); anything it cannot fold byte-identically degrades to
+		// SQL text (all-or-nothing; 02e §3).
+		if n, t, ok := foldStringLiteralConst(v.Value, expected); ok {
+			return n, t, nil
 		}
 		return nil, 0, ErrUnsupported
 
@@ -313,6 +305,53 @@ func resolveFuncCall(f *parser.FuncCall) (Node, uint32, error) {
 	return buildFuncExpr(f.Name.Name, argNodes, argOIDs)
 }
 
+// foldStringLiteralConst reproduces PG's parse-time coercion of an unknown-type
+// string literal to a target type that has a modeled input function
+// (stringTypeToConst → the type's *_in function). PG collapses that coercion into a
+// by-value Const with NO cast node in the tree, so the stored adbin is
+// byte-identical whether the literal appears in a typed column context
+// (`col int4 DEFAULT '123'`) or under an explicit cast (`'123'::int4`) — both
+// sibling paths route here. Returns ok=false for a target type not modeled here,
+// or a literal the modeled input function would reject / that this subset does not
+// fold deterministically (a TimeZone-dependent timestamptz form, a non-decimal
+// integer spelling), so the caller degrades to SQL text (all-or-nothing; 02e §3).
+//
+// This is the string-literal analogue of the numeric-family FuncExpr casts
+// resolveCastExpr builds for a NUMERIC-typed operand: a bare integer literal `5`
+// is already int4-typed, so coercing it to int2 keeps a visible int4→int2 cast
+// FuncExpr; only an *unknown-type* string literal folds to a bare Const via the
+// input function. The two operand kinds are therefore intentionally handled by
+// different code (StringConst here vs a resolved numeric node in resolveCastExpr).
+func foldStringLiteralConst(s string, targetOID uint32) (Node, uint32, bool) {
+	switch targetOID {
+	case OidBool:
+		if b, ok := parseBoolLiteral(s); ok {
+			return NewBoolConst(b), OidBool, true
+		}
+	case OidInt2:
+		if n, ok := parseIntFromString(s, 16); ok {
+			return NewInt2Const(int16(n)), OidInt2, true
+		}
+	case OidInt4:
+		if n, ok := parseIntFromString(s, 32); ok {
+			return NewInt4Const(int32(n)), OidInt4, true
+		}
+	case OidInt8:
+		if n, ok := parseIntFromString(s, 64); ok {
+			return NewInt8Const(n), OidInt8, true
+		}
+	case OidDate:
+		if days, ok := parseDateDays(s); ok {
+			return NewDateConst(days), OidDate, true
+		}
+	case OidTimestamptz:
+		if usec, ok := parseTimestamptzMicros(s); ok {
+			return NewTimestamptzConst(usec), OidTimestamptz, true
+		}
+	}
+	return nil, 0, false
+}
+
 // resolveCastExpr resolves an explicit `expr::type` cast. Scope: PG's numeric type
 // category — the exact integers (int2/int4/int8), arbitrary-precision numeric (OID
 // 1700), AND the binary floats (float4/float8, OIDs 700/701). PG's coerce_type
@@ -338,36 +377,32 @@ func resolveCastExpr(v *parser.CastExpr) (Node, uint32, error) {
 		return nil, 0, ErrUnsupported
 	}
 	targetOID := catalog.TypeNameToOID(v.Type.Name)
-	// An explicit `::date` / `::timestamptz` cast of a BARE string literal is a
-	// parse-time coercion of an unknown-type literal: PG's coerce_type folds it via
-	// stringTypeToConst → the type's input function to a by-value Const, with NO cast
-	// node in the tree (coerce_type collapses the coercion into the folded Const's
-	// consttype). The stored adbin is therefore byte-identical to the same literal
-	// written in a date/timestamptz COLUMN context (resolve's StringConst arm) — the
-	// explicit `::type` only supplies the target type, it does not add a wrapper.
-	// This closes the asymmetry where `DEFAULT '2024-03-15'` folded canonically but
-	// `DEFAULT '2024-03-15'::date` degraded to SQL text. Only the two by-value
-	// datum types with a modeled fold qualify: date_in is TimeZone-independent so any
-	// plain ISO date literal folds (parseDateDays guards calendar validity), while
-	// timestamptz folds only the deterministic subset (parseTimestamptzMicros — an
-	// explicit offset / 'epoch'); a TimeZone-dependent form, an unparseable literal,
-	// or a typmod-qualified target (`::timestamptz(3)`) degrades to SQL text
-	// (all-or-nothing; 02e §3). A non-string operand (`now()::date`) is a genuine
-	// conversion node, not a literal fold, and is out of scope.
+	// An explicit `::type` cast of a BARE string literal is a parse-time coercion of
+	// an unknown-type literal: PG's coerce_type folds it via stringTypeToConst → the
+	// type's input function to a by-value Const, with NO cast node in the tree
+	// (coerce_type collapses the coercion into the folded Const's consttype). The
+	// stored adbin is therefore byte-identical to the same literal written in that
+	// type's COLUMN context (resolve's StringConst arm, which shares
+	// foldStringLiteralConst) — the explicit `::type` only supplies the target type,
+	// it does not add a wrapper. This closes the asymmetry where `DEFAULT '123'`
+	// folded canonically but `DEFAULT '123'::int4` degraded to SQL text. Modeled fold
+	// targets: bool / int2 / int4 / int8 / date (all TimeZone-independent input
+	// functions) plus the deterministic timestamptz subset (explicit offset /
+	// 'epoch'). A TimeZone-dependent timestamptz form, a literal the input function
+	// would reject, an unmodeled target, or a typmod-qualified target
+	// (`::timestamptz(3)`, handled below) degrades to SQL text (all-or-nothing; 02e
+	// §3). A non-string operand (`now()::date`, `5::int8`) is a genuine conversion /
+	// numeric-family cast, not a literal fold, and falls through to the logic below.
 	if len(v.Typmods) == 0 {
 		if lit, isStr := v.Operand.(*parser.StringConst); isStr {
-			switch targetOID {
-			case OidDate:
-				if days, ok := parseDateDays(lit.Value); ok {
-					return NewDateConst(days), OidDate, nil
-				}
-				return nil, 0, ErrUnsupported
-			case OidTimestamptz:
-				if usec, ok := parseTimestamptzMicros(lit.Value); ok {
-					return NewTimestamptzConst(usec), OidTimestamptz, nil
-				}
-				return nil, 0, ErrUnsupported
+			if n, t, ok := foldStringLiteralConst(lit.Value, targetOID); ok {
+				return n, t, nil
 			}
+			// A string literal is PG type "unknown"; an explicit cast to any concrete
+			// type is a parse-time fold, never a runtime cast node — so if the fold is
+			// not reproducible byte-identically we degrade rather than fall through to
+			// the numeric-family cast path (which would mis-resolve the literal as text).
+			return nil, 0, ErrUnsupported
 		}
 	}
 	if len(v.Typmods) != 0 {
