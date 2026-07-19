@@ -291,20 +291,35 @@ func rebuildFuncExprWith(f *FuncExpr, rec func(Node) (parser.Expr, error)) (pars
 	return &parser.FuncCall{Name: parser.ObjectName{Name: name}, Args: args}, nil
 }
 
-// rebuildRelabelType reconstructs a RELABELTYPE. The only form the forward path
-// emits is the IMPLICIT bare-numeric relabel (wrapNumericRelabelToBare, relabelformat
-// 2) that strips a typmod'd numeric default back to the bare `numeric` column's typmod
-// -1. Like the implicit casts in rebuildFuncExprWith, an implicit RelabelType has no
-// SQL syntax — pg_get_expr renders only the inner expression — so it rebuilds to its
-// argument. Re-resolving that argument (the `::numeric(p,s)` cast) in the same bare
-// numeric column context re-wraps the identical RelabelType (fixed point). An explicit
-// RelabelType (relabelformat != 2, not emitted here) is rejected rather than silently
-// dropped.
+// rebuildRelabelType reconstructs a RELABELTYPE. The forward path emits two forms,
+// both stripping a typmod'd numeric to bare `numeric` (typmod -1) via
+// wrapNumericRelabelToBare, distinguished by relabelformat:
+//
+//   - relabelformat 2 (IMPLICIT, sub-slice 24): a bare `numeric` COLUMN whose stored
+//     DEFAULT carries a typmod. Like the implicit casts in rebuildFuncExprWith it has
+//     no SQL syntax — pg_get_expr renders only the inner expression — so it rebuilds
+//     to its argument. Re-resolving that argument (the `::numeric(p,s)` cast) in the
+//     same bare numeric column context re-wraps the identical RelabelType.
+//   - relabelformat 1 (EXPLICIT, sub-slice 25): an explicit `(inner)::numeric` cast of
+//     a typmod'd numeric operand. pg_get_expr renders the visible `::numeric` syntax,
+//     so it rebuilds to a bare (no-typmod) `::numeric` CastExpr. Re-resolving
+//     `inner::numeric` re-emits the identical relabelformat-1 RelabelType.
+//
+// Either way the rebuild is a fixed point. Any other relabelformat is not emitted by
+// the forward path and is rejected rather than silently dropped.
 func rebuildRelabelType(r *RelabelType, rec func(Node) (parser.Expr, error)) (parser.Expr, error) {
-	if r.Relabelformat != 2 {
+	switch r.Relabelformat {
+	case 2:
+		return rec(r.Arg)
+	case 1:
+		inner, err := rec(r.Arg)
+		if err != nil {
+			return nil, err
+		}
+		return &parser.CastExpr{Operand: inner, Type: parser.ObjectName{Name: "numeric"}}, nil
+	default:
 		return nil, fmt.Errorf("pgnodes: Rebuild: unsupported RelabelType relabelformat %d", r.Relabelformat)
 	}
-	return rec(r.Arg)
 }
 
 // numericCastPackedTypmod reports whether f is the explicit `::numeric(p,s)` length

@@ -128,8 +128,11 @@ func TestNumericRelabelNoWrapWhenNoTypmod(t *testing.T) {
 		t.Fatalf("bare decimal default should resolve to a bare numeric Const, got %T", n)
 	}
 
-	// Rebuild rejects a non-implicit (explicit) RelabelType rather than dropping it.
-	if _, err := rebuildRelabelType(&RelabelType{Relabelformat: 1}, Rebuild); err == nil {
-		t.Fatalf("rebuildRelabelType should reject an explicit (relabelformat 1) node")
+	// Rebuild rejects an unmodeled relabelformat (0 = COERCE_EXPLICIT_CALL, never
+	// emitted for these numeric strips) rather than silently dropping it. The
+	// EXPLICIT relabelformat 1 form is now modeled (sub-slice 25) and has its own
+	// round-trip coverage in numeric_relabel_explicit_test.go.
+	if _, err := rebuildRelabelType(&RelabelType{Relabelformat: 0}, Rebuild); err == nil {
+		t.Fatalf("rebuildRelabelType should reject an unmodeled (relabelformat 0) node")
 	}
 }

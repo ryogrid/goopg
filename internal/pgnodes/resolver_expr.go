@@ -111,7 +111,7 @@ func ResolveForColumnTypmod(e parser.Expr, targetType uint32, targetTypmod int32
 		// target typmod -1 ⇒ the length coercion is a no-op, so PG emits a RelabelType,
 		// not a numeric() call). A default already at typmod -1 needs no relabel.
 		if exprTypmod >= 0 {
-			n = wrapNumericRelabelToBare(n)
+			n = wrapNumericRelabelToBare(n, 2) // COERCE_IMPLICIT_CAST
 		}
 	}
 	return n, true
@@ -154,21 +154,30 @@ func wrapNumericLengthCoercion(n Node, packedTypmod int32) Node {
 }
 
 // wrapNumericRelabelToBare wraps a numeric-typed node that carries a length typmod
-// (>= 0) in PG's IMPLICIT RelabelType (relabelformat 2, COERCE_IMPLICIT_CAST) that
-// strips the exposed typmod back to -1 for a bare `numeric` column. coerce_type_typmod
-// (parse_coerce.c) reaches this form when the target typmod is -1: the numeric() length
-// coercion would be a no-op, so PG emits a RelabelType instead of a function call.
-// resulttypmod is always -1 (bare numeric); resultcollid 0 (numeric is not collatable).
-// The rebuild inverse (rebuildRelabelType) unwraps it invisibly like pg_get_expr, so
-// re-resolving the inner `::numeric(p,s)` cast in the same bare-column context is a
-// fixed point.
-func wrapNumericRelabelToBare(n Node) Node {
+// (>= 0) in PG's RelabelType that strips the exposed typmod back to -1 for a bare
+// `numeric` target. coerce_type_typmod (parse_coerce.c) reaches this form when the
+// target typmod is -1: the numeric() length coercion would be a no-op, so PG emits a
+// RelabelType instead of a function call. resulttypmod is always -1 (bare numeric);
+// resultcollid 0 (numeric is not collatable).
+//
+// relabelformat selects the coercion display context, and it is load-bearing for the
+// rebuild inverse:
+//   - 2 (COERCE_IMPLICIT_CAST, sub-slice 24): a bare `numeric` COLUMN whose stored
+//     DEFAULT carries a typmod. pg_get_expr renders it invisibly, so rebuildRelabelType
+//     unwraps to the inner cast.
+//   - 1 (COERCE_EXPLICIT_CAST, sub-slice 25): an explicit `(inner)::numeric` cast of a
+//     typmod'd numeric operand. pg_get_expr renders the `::numeric` syntax, so
+//     rebuildRelabelType reconstructs a bare `::numeric` CastExpr.
+//
+// Either way, re-resolving the rebuilt form in the same context re-wraps a byte-
+// identical RelabelType (fixed point).
+func wrapNumericRelabelToBare(n Node, relabelformat int32) Node {
 	return &RelabelType{
 		Arg:           n,
 		Resulttype:    OidNumeric,
 		Resulttypmod:  -1,
 		Resultcollid:  0,
-		Relabelformat: 2, // COERCE_IMPLICIT_CAST
+		Relabelformat: relabelformat,
 		Location:      -1,
 	}
 }
@@ -338,6 +347,15 @@ func resolveCastExpr(v *parser.CastExpr) (Node, uint32, error) {
 	arg, srcType, err := resolve(v.Operand, 0)
 	if err != nil {
 		return nil, 0, err
+	}
+	if targetOID == OidNumeric && srcType == OidNumeric && numericNodeTypmod(arg) >= 0 {
+		// An explicit bare `::numeric` cast of a numeric operand that CARRIES a length
+		// typmod (e.g. `(5.5::numeric(8,1))::numeric`) is NOT a no-op: coerce_type_typmod
+		// applies a length coercion to the target typmod -1, which collapses to an
+		// EXPLICIT RelabelType (relabelformat 1, COERCE_EXPLICIT_CAST) stripping the
+		// exposed typmod. (An operand already at typmod -1 falls through to the no-op
+		// branch below — numericNodeTypmod returns -1 and PG emits no relabel.)
+		return wrapNumericRelabelToBare(arg, 1), OidNumeric, nil
 	}
 	if srcType == targetOID {
 		// A cast to the operand's own type is a no-op; PG emits no RelabelType or

@@ -1208,7 +1208,7 @@ RelabelType  (relabelformat 2, resulttypmod -1 — strips the typmod for the bar
 ```
 
 (An *explicit* re-cast to bare numeric — `(5.5::numeric(8,1))::numeric` — is the same
-`RelabelType` with `relabelformat` **1**; not emitted by the DEFAULT path, so not modeled.)
+`RelabelType` with `relabelformat` **1**; modeled by sub-slice 25 below.)
 `pg_get_expr` deparses the implicit relabel invisibly (just the inner `5.5::numeric(8,1)`),
 so the rebuild path unwraps it.
 
@@ -1238,6 +1238,53 @@ so the rebuild path unwraps it.
   executor attrdef siblings green; pgbench smoke via pre-commit.
 
 All numeric column/typmod DEFAULT shapes are now canonical; no numeric degrade remains.
+
+## Sub-slice 25 — EXPLICIT bare-`numeric` cast `RelabelType` (`relabelformat` 1)
+
+The explicit counterpart of sub-slice 24. An explicit re-cast of a typmod'd numeric to
+bare `numeric` — `(5.5::numeric(8,1))::numeric` — is **not** a no-op: `coerce_to_target_type`
+applies a length coercion to the target typmod −1, which `coerce_type_typmod` collapses to
+a `RelabelType`. Because the outer cast is written explicitly, PG stamps it
+`COERCE_EXPLICIT_CAST` (`relabelformat` **1**), and `pg_get_expr` deparses the **visible**
+`::numeric` syntax (unlike the implicit `relabelformat` 2 form, which it hides). A live
+PG18.3 probe confirmed the shape (`resulttype` 1700, `resulttypmod` −1, `resultcollid` 0,
+`relabelformat` 1) — byte-identical to sub-slice 24's tree except for the `relabelformat`:
+
+```
+RelabelType  (relabelformat 1, resulttypmod -1 — strips the operand's typmod)
+  └─ arg: the resolved inner cast, whatever its shape:
+           • funcformat-1 1703 cast        ((5.5::numeric(8,1))::numeric)
+           • 1703 over int4_numeric (1740) ((5::numeric(8,1))::numeric)
+```
+
+An inner operand that carries **no** typmod (`(5.5::numeric)::numeric`) stays a true no-op
+— `numericNodeTypmod` returns −1 and PG emits no relabel.
+
+### Changes
+
+- `resolver_expr.go`: `resolveCastExpr`'s bare-`numeric` target arm now, before the
+  same-type no-op branch, detects a numeric operand carrying a length typmod
+  (`numericNodeTypmod(arg) >= 0`) and wraps it via `wrapNumericRelabelToBare(arg, 1)`.
+  That helper is generalized from sub-slice 24 to take the `relabelformat` (2 for the
+  implicit column-DEFAULT strip, 1 for this explicit cast).
+- `rebuild.go`: `rebuildRelabelType` now switches on `relabelformat` — 2 unwraps to the
+  inner argument (implicit, `pg_get_expr`-invisible), 1 rebuilds to a bare (no-typmod)
+  `::numeric` `CastExpr` (explicit, `pg_get_expr`-visible). Re-resolving `inner::numeric`
+  re-wraps a byte-identical `relabelformat` 1 tree (fixed point). Any other `relabelformat`
+  is rejected, not silently dropped.
+- No executor change; the `RELABELTYPE` codec already round-trips any `relabelformat`.
+
+### Gates (all green)
+
+- `internal/pgnodes/numeric_relabel_explicit_test.go` — 2 live-captured PG18.3 goldens
+  (`(5.5::numeric(8,1))::numeric`, `(5::numeric(8,1))::numeric`) through golden + codec +
+  rebuild fixed-point loops, plus a no-wrap guard (a typmod-less `::numeric` cast stays a
+  plain `Const`). Sub-slice 24's reject-guard flipped to `relabelformat` 0 (0/1/2 now the
+  live set; 0 stays rejected).
+- `internal/testport/oracle_pgnodes_adbin_test.go` — 2 explicit-relabel cases added
+  (**61 cases total**, all byte-identical vs PG18.3, ≈1.63s).
+- Full `pgnodes` package + `go vet` + gofmt clean; ev_action oracle 13/13; executor
+  attrdef siblings green; pgbench smoke via pre-commit.
 
 ## Byte-diff oracle gate (adbin) — `internal/testport/oracle_pgnodes_adbin_test.go`
 
@@ -1333,12 +1380,11 @@ gating and ≈ 1.3 s wall time as the `adbin` oracle.
   `timestamptz`/`int2`→`numeric` string literal resolve inside a view `WHERE`)
   is also still SQL-text — only the exact scalar-column DEFAULT context folds a
   `timestamptz`/numeric literal.
-- **`::numeric(p,s)` on a typmod-mismatched column** (sub-slice 22): only a column
-  whose typmod *equals* the cast's emits the canonical bare-1703 form. A bare
-  `numeric` column (typmod −1) — or any mismatched `numeric(p',s')` — degrades,
-  because PG wraps the length coercion in a `RelabelType` re-labeling to the column
-  typmod (`postgres/src/backend/parser/parse_coerce.c:coerce_type_typmod` →
-  `coerce_to_target_type`'s trailing `RelabelType`), a node not yet in the IR. Also
-  still deferred: typmod-qualified casts to the **other** length types (`varchar(N)`
-  = `CoerceViaIO`, `timestamp(N)`, `bit(N)`), and non-int/numeric sources into
-  `numeric(p,s)` (`int2`, the binary floats).
+- **`::numeric(p,s)` on a typmod-mismatched column** (sub-slices 22–25): the
+  `RelabelType` re-label that `coerce_type_typmod` emits when a column's typmod differs
+  from the cast's is now in the IR — sub-slice 23 handles a `numeric(p',s')` mismatch
+  (implicit length coercion), sub-slice 24 the bare `numeric` column DEFAULT (implicit
+  `relabelformat` 2), and sub-slice 25 the explicit `(inner)::numeric` re-cast
+  (`relabelformat` 1). Still deferred: typmod-qualified casts to the **other** length
+  types (`varchar(N)` = `CoerceViaIO`, `timestamp(N)`, `bit(N)`), and non-int/numeric
+  sources into `numeric(p,s)` (`int2`, the binary floats).

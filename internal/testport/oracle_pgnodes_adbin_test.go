@@ -205,6 +205,12 @@ var adbinOracleCases = []adbinOracleCase{
 	// not a numeric() length coercion.
 	{"relabel_bare_explicit_8_1", "numeric", pgnodes.OidNumeric, "5.5::numeric(8,1)"},
 	{"relabel_bare_int4_explicit_8_1", "numeric", pgnodes.OidNumeric, "5::numeric(8,1)"},
+	// Sub-slice 25: an EXPLICIT `(inner)::numeric` cast of a typmod'd numeric operand
+	// collapses to an EXPLICIT RelabelType (relabelformat 1) stripping the typmod to -1
+	// (coerce_type_typmod's no-op branch, COERCE_EXPLICIT_CAST). pg_get_expr renders the
+	// visible `::numeric` syntax, unlike the implicit relabelformat-2 form above.
+	{"explicit_relabel_bare_8_1", "numeric", pgnodes.OidNumeric, "(5.5::numeric(8,1))::numeric"},
+	{"explicit_relabel_bare_int4_8_1", "numeric", pgnodes.OidNumeric, "(5::numeric(8,1))::numeric"},
 }
 
 // TestOraclePgnodesAdbinBytesMatchPG is the M0123-S4 byte-diff oracle: for each
