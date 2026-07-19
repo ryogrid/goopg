@@ -311,6 +311,14 @@ func (s *queryScope) resolveExpr(e parser.Expr, expected uint32) (Node, uint32, 
 		// returns ErrUnsupported for the simple form).
 		return resolveCaseExprWith(v, s.resolveExpr)
 
+	case *parser.IsDistinctFromExpr:
+		// a IS [NOT] DISTINCT FROM b over view columns/expressions ->
+		// DISTINCTEXPR (the NOT form wrapped in a NOT BOOLEXPR by
+		// resolveDistinctFromWith itself), with both operands resolved in the
+		// relation scope so they may be column Vars. Mirrors the BOOLEANTEST /
+		// CASEEXPR view wiring above (sub-slice 6/8).
+		return resolveDistinctFromWith(v, s.resolveExpr)
+
 	case *parser.UnaryOp:
 		switch v.Op {
 		case parser.OpUnaryPos:

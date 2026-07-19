@@ -497,14 +497,39 @@ is that `DISTINCTEXPR` wrapped in a `NOT` `BOOLEXPR`
   distinct still rejected).
 - full `pgnodes` package + `go vet ./internal/pgnodes/` + `go build ./...` clean.
 
+## Sub-slice 10 — `DISTINCTEXPR` view-query wiring
+
+The scalar `DISTINCTEXPR` node from sub-slice 9 is now routed through the
+view-query resolver/rebuild so a view `WHERE a IS [NOT] DISTINCT FROM b` over
+base-relation columns serializes to canonical `pg_rewrite.ev_action` (was
+SQL-text fallback). Purely two dispatch arms — the recursion-injectable
+`…With` builders already exist:
+
+- `resolver_query.go`: `queryScope.resolveExpr` gains a
+  `*parser.IsDistinctFromExpr` arm → `resolveDistinctFromWith(v, s.resolveExpr)`,
+  so both operands resolve in the relation scope (a column becomes a `Var`). The
+  `IS NOT DISTINCT FROM` `NOT`-`BOOLEXPR` wrapper is emitted by
+  `resolveDistinctFromWith` itself, so no extra arm is needed for the NOT form.
+- `rebuild_query.go`: `viewRebuildScope.rebuildExpr` gains a `*DistinctExpr` arm
+  → `rebuildDistinctExprWith(v, s.rebuildExpr)`; the `NOT` wrapper rebuilds via
+  the existing `rebuildBoolExprWith` `NOT` arm (which re-enters the new
+  `DISTINCTEXPR` arm) into `NOT (a IS DISTINCT FROM b)`.
+
+### Gates (all green)
+
+- `internal/pgnodes/view_bool_null_test.go` — two live-captured PG18.3
+  `ev_action` goldens (`v9` = `client IS DISTINCT FROM 5` bare `DISTINCTEXPR`
+  opno 96 over a column `Var` + `Const`; `v10` = `client IS NOT DISTINCT FROM 5`
+  single-arg `NOT` `BOOLEXPR` wrapping it), each: forward byte-for-byte
+  (`ResolveViewQuery`→`OutRuleAction`) + codec round-trip
+  (`Out`→`Read`→`Out`) + resolve→`RebuildViewQuery`→re-resolve fixed point +
+  a structural assertion (`TestViewQueryBoolNullStructure`).
+- full `pgnodes` package + `go vet ./internal/pgnodes/` + `go build ./...` clean.
+
 ## Deferred
 
 - The `CASE` **simple form** (`CASE operand WHEN …` — CaseTestExpr placeholder)
   and `select_common_type` cross-type result coercion remain in M0123-S4.
-- `DISTINCTEXPR` in the VIEW-query path (`queryScope.resolveExpr` /
-  `viewRebuildScope.rebuildExpr` wiring, mirroring sub-slice 6/8) is sub-slice
-  10 — the scalar node landed here, but a view `WHERE a IS DISTINCT FROM b`
-  still emits SQL text until wired.
 - `IS DISTINCT FROM NULL` is NOT special-cased to a `NullTest` (PG's
   `make_nulltest_from_distinct` rewrites `x IS DISTINCT FROM NULL` →
   `x IS NOT NULL`); a NULL operand degrades to SQL text. See the deferral ledger.
