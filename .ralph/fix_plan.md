@@ -27,12 +27,42 @@ Priority banner below or a dependency forces another order**.
 preempt everything below** — see the M-NIGHTLY milestone directly under this
 banner.
 
+**⚡ 2026-07-18 directive — branch `wal-pg-nodetree`, priority order for this loop:**
+> This checkout is on `wal-pg-nodetree` to develop **M0123 (canonical `pg_node_tree`)**
+> — see `docs/milestones/0123-canonical-pg-node-tree-serialization.md` and
+> `docs/design/wal-pg-identical-stream/02e §3`. Work in THIS priority order:
+> 1. **WIP recovery** — first restore & resolve the stashed pre-switch WIP (the
+>    "WIP recovery" item directly under this banner), never silently drop it;
+> 2. **M-NIGHTLY** — the standing nightly-triage items below (they preempt as usual);
+> 3. **M0123** — the S1→S4 slices at the BOTTOM of this file (S0 already landed).
+> The other roadmap milestones (M0110/M0119/M0122) stay parked below M0123 until
+> M0123 is complete.
+
 Work order: **M0117 → M0118** (both complete + archived), then resume **M0110**
 (its **M0119-0004/0005/0006/0007** spinoffs are the active, in-progress form of
 that work), with **M0095** parked (blocked on logical decoding). **M0120 / M0121
 are CLOSED** (2026-07-04) and archived. Policy: fix blockers in place; do NOT
 defer unless genuinely compelling (then record a ledger row); commit + push at
 every clean, green (build + pre-commit) checkpoint.
+
+## WIP recovery (priority #1 — before M-NIGHTLY, one-time)
+
+<!-- Added 2026-07-18 for the wal-pg-nodetree switch. The main checkout's
+     pre-switch Ralph WIP was stashed with a unique tag before checking out this
+     branch so `git checkout` was clean. Recover it FIRST so no work is lost. -->
+
+- [ ] wip/recover-pre-nodetree-switch — recover the stashed pre-branch-switch WIP
+      and resolve it. Find the tagged stash: `git stash list --format='%gd %H %gs'
+      | grep item-c-setup-preserve` (tag `item-c-setup-preserve-<ts>`). Apply it
+      with `git stash apply <sha>` (NOT pop — shared stack), inspect the diff
+      (`.ralph/progress.json`, `internal/executor/context.go`, `operators.go`,
+      `internal/server/dispatch.go`), and EITHER finish + commit it if it is
+      coherent work-in-progress on THIS branch, OR — if it belongs to the old
+      `wal-body-and-ddl-log-pg-compatible` task and doesn't apply cleanly here —
+      set it aside on its own branch / re-stash it and record a
+      `.ralph/deferral_ledger.md` row so it is not lost. Then drop the applied
+      stash entry once handled. Check this box only when the WIP is committed
+      somewhere or explicitly ledgered.
 
 ## M-NIGHTLY — Nightly regression triage (STANDING — HIGHEST PRIORITY)
 
@@ -60,6 +90,21 @@ every clean, green (build + pre-commit) checkpoint.
      (Tasks are added here by the in-loop agent, one per subject. This
      placeholder is a comment, not a checkbox, so the plan-complete exit
      heuristic stays live.) -->
+
+- [ ] race/internal/wal — race suite failed in internal/wal (AI-20260717-010601-001;
+      repro: `go test -race -timeout 15m ./internal/wal/`). NOTE a REOPEN (an
+      earlier `- [x] race/internal/wal` fix below did not hold; first-seen new
+      20260717). Re-run the repro at HEAD first — the log may be stale.
+- [ ] regress/errors — regress case `errors` diverged (baseline pass): output
+      mismatch, normalization rules need extension (AI-20260717-010601-002;
+      repro: `go test -v -run 'TestPort_RegressSuite/errors' ./internal/testport/`).
+      Also failed the previous run.
+- [ ] regress/portals_p2 — regress case `portals_p2` diverged (baseline pass):
+      output mismatch, normalization (AI-20260717-010601-003; repro:
+      `go test -v -run 'TestPort_RegressSuite/portals_p2' ./internal/testport/`).
+- [ ] regress/select — regress case `select` diverged (baseline pass): output
+      mismatch, normalization (AI-20260717-010601-004; repro:
+      `go test -v -run 'TestPort_RegressSuite/select' ./internal/testport/`).
 
 - [x] testport/* build-break cascade (run 20260712-020530, ~39 AI items:
       AI-20260712-020530-001..039 — TestPort_IsolationStats,
@@ -11633,3 +11678,83 @@ mirroring M0119's ledger `status` column.
       lanes. Low priority relative to the M0122 PG-compat buckets above — pick
       up only when no M0122/M0119 item is in flight, since this is
       Ralph-tooling, not user-facing PG compatibility.
+
+## M0123 — Canonical `pg_node_tree` serialization (branch `wal-pg-nodetree`)
+
+**Priority: after WIP-recovery (#1) and M-NIGHTLY (#2), M0123 is #3 — the active
+focus of this branch.** Milestone doc:
+`docs/milestones/0123-canonical-pg-node-tree-serialization.md`; design:
+`docs/design/wal-pg-identical-stream/02e-content-fidelity-and-durability.md §3`.
+
+Goal: a canonical PG18 `pg_node_tree` serializer (new `internal/pgnodes` leaf
+package: resolver + `outfuncs` + `readfuncs` + binary datum encoding) so a real
+PG18 standby can EVALUATE/QUERY goopg's user column DEFAULTs (`pg_attrdef.adbin`),
+extended-statistics expressions (`pg_statistic_ext.stxexprs`), and views
+(`pg_rewrite.ev_action`, `pg_class.relhasrules=true`). goopg has NO OID-resolved
+node tree today (name-based AST; analyzer only type-checks; runtime resolves by
+name), so this is a resolver + serializer + datum codec, not just an `outfuncs`
+port. Phased S0→S4; each slice = one gated commit (build/vet + touched-package
+units + testport + `TestE2E_FailoverGoopgToPG`, plus the slice's standby assertion).
+
+**Invariants (do NOT skip — see 02e §3):** graceful degradation is MANDATORY
+(`unsupported.go` all-or-nothing subset check → unsupported shape falls back to
+SQL text, and views additionally keep `relhasrules=false`; never FATAL, never
+partial-emit). `relhasrules=true` is per-table (`catalog.Table.RuleIsCanonical`)
+and HARD-coupled to a canonical `ev_action` (a non-parseable one FATALs PG's
+relcache). Verification is ADVERSARIAL: the standby COMPUTES and the result is
+asserted `==` goopg's own (not merely "replays without FATAL"). Datum traps:
+by-value sign-extension (negative int4 → all-`0xFF` high bytes; oid zero-extends),
+signed-char decimal wire form, text 4-byte varlena header, numeric reuses goopg's
+existing encoder, `constcollid=100` / `consttypmod=n+4`.
+
+- [x] M0123-S0 — forward operator/proc OID indexes from the existing seed data
+      (`catalog.LookupOperatorForNode(spelling,leftOID,rightOID)` /
+      `catalog.LookupProcForNode(name,argOIDs)`); the 799-row pg_operator seed was
+      relocated to `internal/catalog`; pseudo-type collisions guarded by a
+      round-trip check. LANDED (`10d26374`); pinning test in
+      `internal/catalog/pg_node_oid_lookup_test.go` (15 operators, 6 procs,
+      negatives), deterministic.
+- [ ] M0123-S1 — create the `internal/pgnodes` leaf package: `ir.go` (scalar IR:
+      `Const`/`FuncExpr`/`OpExpr`/`RelabelType`/`CoerceViaIO`/`SQLValueFunction`),
+      `datum.go` (`Const` value ↔ raw PG datum bytes per type — see the datum
+      traps above; wire form `<len> [ b0 b1 … ]` signed-char decimals; by-value
+      types emit the 8-byte datum word, by-ref emit `VARSIZE` varlena bytes),
+      `outfuncs.go` (IR → S-expression; field order mirrors
+      `postgres/src/backend/nodes/outfuncs.funcs.c` `_out<Tag>` EXACTLY, inline
+      provenance comment per tag — `_outConst` order: consttype, consttypmod,
+      constcollid, constlen, constbyval, constisnull, location, constvalue),
+      `readfuncs.go` (text → IR; a `pg_strtok`/`nodeRead` mirror). Gate: golden
+      round-trip — hand-built IR → `Out` → text byte-equal to a real-PG
+      `nodeToString` golden (`scripts/pg-oracle-diff.sh`, `:location`→-1
+      normalized), then `Read → IR'` deep-equal. NO writer wired yet → no e2e.
+      One-loop-sized: land the scalar subset only.
+- [ ] M0123-S2 — `resolver_expr.go` (goopg `parser.Expr` + catalog → scalar IR,
+      using the S0 lookups + `TypeNameToOID`) + scalar `rebuild.go` (IR → goopg
+      AST for reload) + `unsupported.go` scalar shape-check. Wire `writeAttrdefRow`
+      + the `stxexprs` writer to emit canonical bytes when supported, else fall
+      back to SQL text (`NewBytesDatum(canonical)` vs `NewStringDatum(sqltext)`;
+      no codec change — `pg_node_tree` already passes `KindBytes` through). Swap
+      `loadColumnDefaultsFromHeap` / `loadStatisticsExtFromHeap` to
+      `pgnodes.Read → rebuild` (1-byte discriminator: canonical dumps begin `{`);
+      keep them standalone-unconditional per-`NamespaceDBOid`. Gate: adversarial
+      standby-eval E2E — goopg primary `CREATE TABLE t(a int DEFAULT 40+2,
+      b text DEFAULT upper('x'), c int DEFAULT -1)`; PG standby
+      `INSERT … DEFAULT VALUES`, assert row `=(42,'X',-1)` AND `==` goopg's own.
+- [ ] M0123-S3 — `resolver_query.go` (goopg `*parser.SelectStmt` + catalog → IR
+      `Query` for single-base-relation views) + the `Query`/`RangeTblEntry`/
+      `RTEPermissionInfo`/`FromExpr`/`RangeTblRef`/`TargetEntry`/`Var` tags in
+      out/read/rebuild + view shape-check. Wire `writeViewRewriteRow` to canonical
+      `ev_action` + set the per-table `catalog.Table.RuleIsCanonical` flag; flip
+      `pg18_user_catalog_rows.go:511` `relhasrules` to read it (leave the
+      `catalog.go` system/information_schema virtual builders false). Swap
+      `loadViewsFromHeap`. Update the `relhasrules=false` test lock-ins
+      (`pg_stat_wal_receiver_nailed_test.go:111-114`,
+      `e2e_failover_goopg_to_pg_test.go:278`). Gate: standby-query E2E — goopg
+      primary `CREATE VIEW v AS SELECT client, src FROM bench_log WHERE client>0`
+      + one view over a USER-DEFINED function (≥16384 OID path); PG standby
+      `SELECT * FROM v` returns the correct rows `==` goopg's own.
+- [ ] M0123-S4 — coverage + hardening: more datum types (numeric, timestamptz,
+      more), `CASE`/`BoolExpr`/`NullTest` in target lists, more operators; and the
+      byte-diff oracle gate (goopg's emitted `ev_action`/`adbin` `==` real-PG18's
+      for the identical DDL, `:location` normalized). Decompose into sub-slices;
+      each its own gated commit.
