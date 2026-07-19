@@ -11805,9 +11805,21 @@ existing encoder, `constcollid=100` / `consttypmod=n+4`.
       text varlena header, int8-max, bool short-len, OpExpr, FuncExpr, null Const).
       NO resolver/writer wired yet (S2). Design doc `0123-0001-pgnodes-scalar-
       serializer.md` + README index + ledger row (2026-07-19). LANDED.
-- [ ] M0123-S2 — `resolver_expr.go` (goopg `parser.Expr` + catalog → scalar IR,
-      using the S0 lookups + `TypeNameToOID`) + scalar `rebuild.go` (IR → goopg
-      AST for reload) + `unsupported.go` scalar shape-check. Wire `writeAttrdefRow`
+- [ ] M0123-S2 — SUB-SLICE 1 LANDED (2026-07-19): `resolver_expr.go`
+      (`ResolveExpr`: goopg `parser.Expr` → scalar IR via S0 `LookupOperatorForNode`)
+      + `rebuild.go` (`Rebuild`: IR → goopg AST for reload) + `unsupported.go`
+      (`SupportsExpr` all-or-nothing shape check), all pure `internal/pgnodes`
+      additions (no wiring), gated by `resolver_expr_test.go` (10 subtests:
+      canonical-Out pins for int4/neg-int4/bigint/text, `40+2`→OpExpr forward-
+      resolution, full resolve→Out→Read→Rebuild→re-resolve round-trip). Supported:
+      int4/int8 literals (make_const magnitude typing), unary-minus fold (doNegate,
+      all-0xFF sign-ext), text literals in text context, binary OpExpr. Design doc
+      `0123-0002-pgnodes-scalar-resolver.md` + README index + ledger row.
+      SUB-SLICE 2 REMAINS (own gated commit — the risky/E2E half): (a) `FuncExpr`
+      resolution — blocked on a leaf `pgProcRetTypeByOID` map (S0 emitted only
+      names+arg-types; extend `cmd/gen-pg-proc-data -names`, it already parses
+      prorettype); (b) wire `writeAttrdefRow`
+      + the `stxexprs` writer to emit canonical bytes when supported, else fall
       + the `stxexprs` writer to emit canonical bytes when supported, else fall
       back to SQL text (`NewBytesDatum(canonical)` vs `NewStringDatum(sqltext)`;
       no codec change — `pg_node_tree` already passes `KindBytes` through). Swap

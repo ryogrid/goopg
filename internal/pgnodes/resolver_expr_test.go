@@ -1,0 +1,217 @@
+package pgnodes
+
+import (
+	"reflect"
+	"testing"
+
+	"github.com/goopg/goopg/internal/parser"
+)
+
+// mustParse parses a scalar SQL expression or fails the test.
+func mustParse(t *testing.T, sql string) parser.Expr {
+	t.Helper()
+	e, err := parser.ParseExpr(sql)
+	if err != nil {
+		t.Fatalf("ParseExpr(%q): %v", sql, err)
+	}
+	return e
+}
+
+// TestResolveExprCanonicalOut pins ResolveExpr's canonical byte output for the
+// supported scalar subset (literal Const, folded unary minus, OpExpr). The
+// int-literal and negative-int strings are byte-identical to the S1 goldens.
+func TestResolveExprCanonicalOut(t *testing.T) {
+	cases := []struct {
+		sql        string
+		targetType uint32
+		want       string
+	}{
+		{
+			sql:        "42",
+			targetType: OidInt4,
+			want:       "{CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 42 0 0 0 0 0 0 0 ]}",
+		},
+		{
+			// PG folds `- 1` into one negative int4 Const (doNegate); the datum
+			// word sign-extends to 0xFF bytes → -1 in the signed decimal wire form.
+			sql:        "-1",
+			targetType: OidInt4,
+			want:       "{CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ -1 -1 -1 -1 -1 -1 -1 -1 ]}",
+		},
+		{
+			// Bigint literal (does not fit int4) → int8 Const.
+			sql:        "5000000000",
+			targetType: 0,
+			want:       "{CONST :consttype 20 :consttypmod -1 :constcollid 0 :constlen 8 :constbyval true :constisnull false :location -1 :constvalue 8 [ 0 -14 5 42 1 0 0 0 ]}",
+		},
+		{
+			// text literal in a text context.
+			sql:        "'hi'",
+			targetType: OidText,
+			want:       "{CONST :consttype 25 :consttypmod -1 :constcollid 100 :constlen -1 :constbyval false :constisnull false :location -1 :constvalue 6 [ 24 0 0 0 104 105 ]}",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.sql, func(t *testing.T) {
+			n, err := ResolveExpr(mustParse(t, tc.sql), tc.targetType)
+			if err != nil {
+				t.Fatalf("ResolveExpr(%q): %v", tc.sql, err)
+			}
+			if got := Out(n); got != tc.want {
+				t.Fatalf("Out mismatch for %q:\n got: %s\nwant: %s", tc.sql, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestResolveBinaryOpForwardResolves verifies `40 + 2` resolves to an OpExpr
+// whose operator OID/funcid/result type come from the S0 pg_operator index and
+// whose two args are the int4 operand Consts.
+func TestResolveBinaryOpForwardResolves(t *testing.T) {
+	n, err := ResolveExpr(mustParse(t, "40 + 2"), OidInt4)
+	if err != nil {
+		t.Fatalf("ResolveExpr(40 + 2): %v", err)
+	}
+	op, ok := n.(*OpExpr)
+	if !ok {
+		t.Fatalf("want *OpExpr, got %T", n)
+	}
+	if op.Opno == 0 || op.Opfuncid == 0 {
+		t.Fatalf("operator not forward-resolved: opno=%d opfuncid=%d", op.Opno, op.Opfuncid)
+	}
+	if op.Opresulttype != OidInt4 {
+		t.Fatalf("opresulttype = %d, want %d (int4)", op.Opresulttype, OidInt4)
+	}
+	if op.Opcollid != 0 || op.Inputcollid != 0 {
+		t.Fatalf("int4 op collations must be 0, got opcollid=%d inputcollid=%d", op.Opcollid, op.Inputcollid)
+	}
+	if len(op.Args) != 2 {
+		t.Fatalf("want 2 args, got %d", len(op.Args))
+	}
+	for i, a := range op.Args {
+		c, ok := a.(*Const)
+		if !ok || c.ConstType != OidInt4 {
+			t.Fatalf("arg %d = %T (want int4 Const)", i, a)
+		}
+	}
+}
+
+// TestResolveRebuildRoundTrip runs the full reload path: resolve → Out → Read →
+// Rebuild → re-resolve, and asserts the canonical bytes are stable across it.
+// This proves Rebuild is a faithful inverse without depending on parser node
+// positions (which differ between a fresh parse and a rebuilt AST).
+func TestResolveRebuildRoundTrip(t *testing.T) {
+	for _, tc := range []struct {
+		sql        string
+		targetType uint32
+	}{
+		{"42", OidInt4},
+		{"-1", OidInt4},
+		{"5000000000", 0},
+		{"40 + 2", OidInt4},
+		{"1 + 2 * 3", OidInt4},
+	} {
+		t.Run(tc.sql, func(t *testing.T) {
+			n1, err := ResolveExpr(mustParse(t, tc.sql), tc.targetType)
+			if err != nil {
+				t.Fatalf("ResolveExpr(%q): %v", tc.sql, err)
+			}
+			s1 := Out(n1)
+
+			// Read back the canonical text into a fresh IR and confirm it is
+			// byte-stable (S1 guarantee, re-checked here for the resolved shape).
+			n2, err := Read(s1)
+			if err != nil {
+				t.Fatalf("Read(%q): %v", s1, err)
+			}
+			if got := Out(n2); got != s1 {
+				t.Fatalf("Read round-trip changed bytes:\n got: %s\nwant: %s", got, s1)
+			}
+
+			// Rebuild to a goopg AST and re-resolve; canonical bytes must match.
+			ast, err := Rebuild(n1)
+			if err != nil {
+				t.Fatalf("Rebuild: %v", err)
+			}
+			n3, err := ResolveExpr(ast, tc.targetType)
+			if err != nil {
+				t.Fatalf("re-ResolveExpr rebuilt AST: %v", err)
+			}
+			if got := Out(n3); got != s1 {
+				t.Fatalf("Rebuild not faithful for %q:\n got: %s\nwant: %s", tc.sql, got, s1)
+			}
+		})
+	}
+}
+
+// TestRebuildNegativeConstShape confirms a negative int Const rebuilds to the
+// parser's canonical `-N` shape (UnaryOp over a positive IntegerConst).
+func TestRebuildNegativeConstShape(t *testing.T) {
+	n, err := ResolveExpr(mustParse(t, "-7"), OidInt4)
+	if err != nil {
+		t.Fatalf("ResolveExpr(-7): %v", err)
+	}
+	ast, err := Rebuild(n)
+	if err != nil {
+		t.Fatalf("Rebuild: %v", err)
+	}
+	u, ok := ast.(*parser.UnaryOp)
+	if !ok || u.Op != parser.OpUnaryNeg {
+		t.Fatalf("want UnaryOp{-}, got %T", ast)
+	}
+	lit, ok := u.Operand.(*parser.IntegerConst)
+	if !ok || lit.Value != 7 {
+		t.Fatalf("want IntegerConst{7}, got %+v", u.Operand)
+	}
+}
+
+// TestSupportsExprRejectsOutOfSubset verifies the all-or-nothing shape check
+// declines expressions with any unsupported node (function calls, casts, a
+// string literal in a non-text context) so the writer keeps SQL text.
+func TestSupportsExprRejectsOutOfSubset(t *testing.T) {
+	supported := []struct {
+		sql        string
+		targetType uint32
+	}{
+		{"1", OidInt4},
+		{"-2147483648", OidInt4},
+		{"'ok'", OidText},
+		{"10 - 3", OidInt4},
+	}
+	for _, tc := range supported {
+		if !SupportsExpr(mustParse(t, tc.sql), tc.targetType) {
+			t.Errorf("SupportsExpr(%q, %d) = false, want true", tc.sql, tc.targetType)
+		}
+	}
+
+	unsupported := []struct {
+		sql        string
+		targetType uint32
+	}{
+		{"upper('x')", OidText},        // FuncExpr deferred (no proc rettype map)
+		{"'5'", OidInt4},               // string literal in a non-text context
+		{"1.5", 0},                     // numeric datum deferred
+		{"a + 1", OidInt4},             // column reference
+	}
+	for _, tc := range unsupported {
+		if SupportsExpr(mustParse(t, tc.sql), tc.targetType) {
+			t.Errorf("SupportsExpr(%q, %d) = true, want false", tc.sql, tc.targetType)
+		}
+	}
+}
+
+// TestResolveExprTypeStability guards the resolve() result-type propagation:
+// an int4 op over int4 operands stays int4 (so an enclosing operator resolves).
+func TestResolveExprTypeStability(t *testing.T) {
+	n, ty, err := resolve(mustParse(t, "1 + 1"), OidInt4)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if ty != OidInt4 {
+		t.Fatalf("result type = %d, want int4 (%d)", ty, OidInt4)
+	}
+	if _, ok := n.(*OpExpr); !ok {
+		t.Fatalf("want *OpExpr, got %T", n)
+	}
+	_ = reflect.TypeOf(n) // keep reflect import if shape checks are trimmed later
+}

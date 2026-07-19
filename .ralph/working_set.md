@@ -1,31 +1,23 @@
-Loop COMPLETE + committed: M0123-S1 (canonical pg_node_tree scalar serializer).
-All 4 M-NIGHTLY items from run 20260717-010601 were already closed (race fixed
-faf9c7da; 3 regress items STALE/pass-at-HEAD), so this loop advanced M0123 (#3
-priority, the wal-pg-nodetree branch focus).
+Task: M0123-S2 sub-slice 1 — pgnodes scalar resolver/rebuild/shape-check. COMPLETE + committed this loop.
 
-**Task (done):** M0123-S1 — new leaf pkg `internal/pgnodes`: a byte-faithful
-PG18 `pg_node_tree` serializer (`Out`) + reader (`Read`) for the scalar IR
-(Const/FuncExpr/OpExpr/RelabelType/CoerceViaIO/SQLValueFunction).
+Files (all new, internal/pgnodes/):
+- resolver_expr.go — ResolveExpr(parser.Expr,targetType)→Node (int4/int8 lit, unary-minus fold, text lit, binary OpExpr via S0 LookupOperatorForNode); ErrUnsupported = fall back to SQL text.
+- rebuild.go — Rebuild(Node)→parser.Expr (reload inverse); opno→spelling via lazy reverse index over catalog.PGOperatorAllEntries.
+- unsupported.go — SupportsExpr all-or-nothing predicate.
+- resolver_expr_test.go — 10 subtests (canonical-Out pins, 40+2→OpExpr, resolve→Out→Read→Rebuild→re-resolve round-trip, accept/reject table).
 
-**Files:** internal/pgnodes/{ir,datum,outfuncs,readfuncs,pgnodes_test}.go (new);
-docs/design/0123-0001-pgnodes-scalar-serializer.md (new) + README.md index;
-.ralph/fix_plan.md (S1 → [x]); .ralph/deferral_ledger.md (S2/S3/S4 row).
+Gates run (all green): go build ./... ; go vet ./internal/pgnodes ; go test ./internal/pgnodes (10 new + 4 S1 pass); make ralph-state-guard consistent; pgbench smoke via pre-commit hook.
 
-**Key symbols:** pgnodes.Out/Read, outDatum (by-value 8-byte word signed
-decimals; by-ref varlena header VARSIZE<<2), byvalWord/textVarlena, tokenizer
-(pg_strtok port), readDatum. Field order mirrors postgres outfuncs.c per tag.
+Next step (M0123-S2 sub-slice 2 — its own gated commit, the risky/E2E half):
+  (a) FuncExpr: extend cmd/gen-pg-proc-data -names to emit pgProcRetTypeByOID leaf
+      map (generator already parses prorettype @main.go:247) + catalog accessor,
+      then handle *parser.FuncCall in resolve/rebuild.
+  (b) wire writeAttrdefRow (operators_ddl.go:13272) + sys_pg_statistic_ext.go
+      stxexprs → NewBytesDatum(pgnodes.Out(ir)) when SupportsExpr else NewStringDatum.
+  (c) swap loadColumnDefaultsFromHeap/loadStatisticsExtFromHeap
+      (initdb/catalog_heap_reload.go) to pgnodes.Read→Rebuild on '{' discriminator.
+  (d) adversarial standby-eval E2E: DEFAULT 40+2/upper('x')/-1; PG18 standby
+      INSERT DEFAULT VALUES asserted =(42,'X',-1) AND ==goopg's own.
+  See deferral_ledger 2026-07-19 M0123-S2 sub-slice 1 row for full resume points.
 
-**Gates run (all green):** go build ./... OK; go vet ./internal/pgnodes OK;
-go test -v ./internal/pgnodes 20/20 subtests PASS — Out is byte-identical to
-REAL PG18.3 pg_attrdef.adbin goldens (captured from a live throwaway server,
-now torn down). make ralph-state-guard consistent (auto-repaired the recurring
-stale completed marker). pgbench smoke = the pre-commit hook at commit time.
-
-**Next step:** M0123-S2 — resolver_expr.go (goopg parser.Expr + catalog +
-S0 LookupOperator/ProcForNode → IR) + rebuild.go + unsupported.go; wire
-writeAttrdefRow / stxexprs writer to emit pgnodes.Out(ir) when supported;
-swap loadColumnDefaultsFromHeap / loadStatisticsExtFromHeap to pgnodes.Read →
-rebuild (1-byte discriminator: canonical dumps begin `{`). Adversarial
-standby-eval E2E gate (see fix_plan M0123-S2 + ledger 2026-07-19 row).
-
-**In-flight:** none.
+In-flight: none.
