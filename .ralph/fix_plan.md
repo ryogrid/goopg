@@ -52,9 +52,10 @@ every clean, green (build + pre-commit) checkpoint.
      branch so `git checkout` was clean. Recover it FIRST so no work is lost. -->
 
 - [ ] wip/recover-pre-nodetree-switch — recover the stashed pre-branch-switch WIP
-      and resolve it. Find the tagged stash: `git stash list --format='%gd %H %gs'
-      | grep item-c-setup-preserve` (tag `item-c-setup-preserve-<ts>`). Apply it
-      with `git stash apply <sha>` (NOT pop — shared stack), inspect the diff
+      and resolve it. The stash commit is **`6d5d9115c36c78d15e71af2c1b920c5b2e43214c`**
+      (tag `item-c-setup-preserve-20260719-092213`, made on
+      `wal-body-and-ddl-log-pg-compatible`). Apply it by SHA (robust to shared-stack
+      index shifts): `git stash apply 6d5d9115` (NOT pop — shared stack), inspect the diff
       (`.ralph/progress.json`, `internal/executor/context.go`, `operators.go`,
       `internal/server/dispatch.go`), and EITHER finish + commit it if it is
       coherent work-in-progress on THIS branch, OR — if it belongs to the old
