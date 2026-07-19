@@ -82,6 +82,22 @@ _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan
      placeholder is a comment, not a checkbox, so the plan-complete exit
      heuristic stays live.) -->
 
+- [x] **TestPort_IsolationPreparedTransactions** — testport spec FAILed in
+      nightly run 20260719-094219 (AI-20260719-094219-001; repro:
+      `go test -v -run '^TestPort_IsolationPreparedTransactions$' ./internal/testport/`).
+      **Stale — already fixed at HEAD.** The nightly ran at sha `c217c692`, which
+      predates `f20cda39` (demote strict→defer for the runner-timing false-positive,
+      the memory-noted fix). Re-run at HEAD `12969b77` PASSES (57.9s). No new work.
+- [x] **regress/errors, regress/index_including, regress/portals_p2, regress/select**
+      — four `TestPort_RegressSuite` cases reported "output mismatch; normalization
+      rules need extension" in nightly run 20260719-094219 (AI-20260719-094219-002/
+      -003/-004/-005; repro:
+      `go test -v -run 'TestPort_RegressSuite/(errors|index_including|portals_p2|select)$' ./internal/testport/`).
+      **Stale — all four PASS at HEAD.** Nightly sha `c217c692` predates the
+      pgnodes S1/S2 + mdtablefix commits now at HEAD `12969b77`. Verified: the
+      four cases (plus their suite dependencies copyselect/subselect) all PASS
+      (18.8s); the normalization-rule divergence no longer reproduces. No new work.
+
 _(completed `[x]` subtasks archived → `completed_milestones/completed_fix_plan_010.md`)_
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)

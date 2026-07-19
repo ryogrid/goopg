@@ -1,23 +1,20 @@
-Task: M0123-S2 sub-slice 1 — pgnodes scalar resolver/rebuild/shape-check. COMPLETE + committed this loop.
+Task: M-NIGHTLY triage of nightly run 20260719-094219 (5 AI items). COMPLETE — all stale.
 
-Files (all new, internal/pgnodes/):
-- resolver_expr.go — ResolveExpr(parser.Expr,targetType)→Node (int4/int8 lit, unary-minus fold, text lit, binary OpExpr via S0 LookupOperatorForNode); ErrUnsupported = fall back to SQL text.
-- rebuild.go — Rebuild(Node)→parser.Expr (reload inverse); opno→spelling via lazy reverse index over catalog.PGOperatorAllEntries.
-- unsupported.go — SupportsExpr all-or-nothing predicate.
-- resolver_expr_test.go — 10 subtests (canonical-Out pins, 40+2→OpExpr, resolve→Out→Read→Rebuild→re-resolve round-trip, accept/reject table).
+Findings: nightly ran at sha c217c692 (predates HEAD 12969b77 pgnodes S1/S2 +
+mdtablefix + f20cda39 demote). Re-ran all 5 repros at HEAD, ALL PASS:
+- AI-...-001 TestPort_IsolationPreparedTransactions → PASS (57.9s); stale, fixed by f20cda39 demote.
+- AI-...-002/003/004/005 regress errors/index_including/portals_p2/select → all PASS (18.8s suite).
+Recorded as [x] stale entries under M-NIGHTLY in fix_plan.md. No code changed → no
+design doc / no deferral row needed.
 
-Gates run (all green): go build ./... ; go vet ./internal/pgnodes ; go test ./internal/pgnodes (10 new + 4 S1 pass); make ralph-state-guard consistent; pgbench smoke via pre-commit hook.
+Gates run: 3 testport runs (all green above); make ralph-state-guard; pre-commit pgbench smoke on the fix_plan-only commit.
 
-Next step (M0123-S2 sub-slice 2 — its own gated commit, the risky/E2E half):
-  (a) FuncExpr: extend cmd/gen-pg-proc-data -names to emit pgProcRetTypeByOID leaf
-      map (generator already parses prorettype @main.go:247) + catalog accessor,
-      then handle *parser.FuncCall in resolve/rebuild.
-  (b) wire writeAttrdefRow (operators_ddl.go:13272) + sys_pg_statistic_ext.go
-      stxexprs → NewBytesDatum(pgnodes.Out(ir)) when SupportsExpr else NewStringDatum.
-  (c) swap loadColumnDefaultsFromHeap/loadStatisticsExtFromHeap
-      (initdb/catalog_heap_reload.go) to pgnodes.Read→Rebuild on '{' discriminator.
-  (d) adversarial standby-eval E2E: DEFAULT 40+2/upper('x')/-1; PG18 standby
-      INSERT DEFAULT VALUES asserted =(42,'X',-1) AND ==goopg's own.
-  See deferral_ledger 2026-07-19 M0123-S2 sub-slice 1 row for full resume points.
+Next step (next loop — no in-flight nightly items remain): resume M0123-S2 sub-slice 2
+(the risky/E2E half) per the prior working_set — (a) FuncExpr resolve/rebuild via
+pgProcRetTypeByOID leaf map from cmd/gen-pg-proc-data; (b) wire writeAttrdefRow
+(operators_ddl.go:13272) + sys_pg_statistic_ext.go stxexprs → pgnodes.Out when
+SupportsExpr; (c) swap loadColumnDefaultsFromHeap/loadStatisticsExtFromHeap
+(initdb/catalog_heap_reload.go) to pgnodes.Read→Rebuild on '{' discriminator;
+(d) adversarial PG18 standby-eval E2E for DEFAULT 40+2/upper('x')/-1.
 
 In-flight: none.
