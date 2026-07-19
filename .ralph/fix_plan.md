@@ -11750,20 +11750,18 @@ existing encoder, `constcollid=100` / `consttypmod=n+4`.
       round-trip check. LANDED (`10d26374`); pinning test in
       `internal/catalog/pg_node_oid_lookup_test.go` (15 operators, 6 procs,
       negatives), deterministic.
-- [ ] M0123-S1 — create the `internal/pgnodes` leaf package: `ir.go` (scalar IR:
+- [x] M0123-S1 — created the `internal/pgnodes` leaf package: `ir.go` (scalar IR:
       `Const`/`FuncExpr`/`OpExpr`/`RelabelType`/`CoerceViaIO`/`SQLValueFunction`),
-      `datum.go` (`Const` value ↔ raw PG datum bytes per type — see the datum
-      traps above; wire form `<len> [ b0 b1 … ]` signed-char decimals; by-value
-      types emit the 8-byte datum word, by-ref emit `VARSIZE` varlena bytes),
-      `outfuncs.go` (IR → S-expression; field order mirrors
-      `postgres/src/backend/nodes/outfuncs.funcs.c` `_out<Tag>` EXACTLY, inline
-      provenance comment per tag — `_outConst` order: consttype, consttypmod,
-      constcollid, constlen, constbyval, constisnull, location, constvalue),
-      `readfuncs.go` (text → IR; a `pg_strtok`/`nodeRead` mirror). Gate: golden
-      round-trip — hand-built IR → `Out` → text byte-equal to a real-PG
-      `nodeToString` golden (`scripts/pg-oracle-diff.sh`, `:location`→-1
-      normalized), then `Read → IR'` deep-equal. NO writer wired yet → no e2e.
-      One-loop-sized: land the scalar subset only.
+      `datum.go` (`Const` value ↔ raw PG datum bytes + typed constructors),
+      `outfuncs.go` (IR → S-expression, field order mirrors `outfuncs.c` per tag),
+      `readfuncs.go` (`pg_strtok`/`nodeRead` port; unsupported tag = clean error).
+      Gate: `pgnodes_test.go` pins `Out` byte-for-byte against **real PG18.3
+      `pg_attrdef.adbin` goldens** captured from a live server (`adbin ==
+      nodeToString`), then `Read → DeepEqual → re-Out` round-trip — 20 subtests
+      green (all datum traps: negative int4 sign-extend, oid RelabelType,
+      text varlena header, int8-max, bool short-len, OpExpr, FuncExpr, null Const).
+      NO resolver/writer wired yet (S2). Design doc `0123-0001-pgnodes-scalar-
+      serializer.md` + README index + ledger row (2026-07-19). LANDED.
 - [ ] M0123-S2 — `resolver_expr.go` (goopg `parser.Expr` + catalog → scalar IR,
       using the S0 lookups + `TypeNameToOID`) + scalar `rebuild.go` (IR → goopg
       AST for reload) + `unsupported.go` scalar shape-check. Wire `writeAttrdefRow`
