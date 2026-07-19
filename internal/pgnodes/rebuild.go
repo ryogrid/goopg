@@ -46,12 +46,21 @@ func Rebuild(n Node) (parser.Expr, error) {
 // flattened on the way in, so resolve→Rebuild→re-resolve is a fixed point. NOT
 // is a single-operand UnaryOp.
 func rebuildBoolExpr(b *BoolExpr) (parser.Expr, error) {
+	return rebuildBoolExprWith(b, Rebuild)
+}
+
+// rebuildBoolExprWith rebuilds a BOOLEXPR through the injected recursion `rec`.
+// NOT -> a single UnaryOp{OpNot}; AND/OR -> a left-nested chain of BinaryOps
+// (the inverse of the forward flattening: an n-arg BoolExpr becomes
+// `((a op b) op c) …`). The query-scoped reload threads
+// viewRebuildScope.rebuildExpr so a bool operand may itself be a column Var.
+func rebuildBoolExprWith(b *BoolExpr, rec func(Node) (parser.Expr, error)) (parser.Expr, error) {
 	switch b.Boolop {
 	case BoolExprNot:
 		if len(b.Args) != 1 {
 			return nil, fmt.Errorf("pgnodes: Rebuild: NOT BoolExpr with %d args (want 1)", len(b.Args))
 		}
-		operand, err := Rebuild(b.Args[0])
+		operand, err := rec(b.Args[0])
 		if err != nil {
 			return nil, err
 		}
@@ -64,12 +73,12 @@ func rebuildBoolExpr(b *BoolExpr) (parser.Expr, error) {
 		if len(b.Args) < 2 {
 			return nil, fmt.Errorf("pgnodes: Rebuild: AND/OR BoolExpr with %d args (want >=2)", len(b.Args))
 		}
-		acc, err := Rebuild(b.Args[0])
+		acc, err := rec(b.Args[0])
 		if err != nil {
 			return nil, err
 		}
 		for _, a := range b.Args[1:] {
-			r, err := Rebuild(a)
+			r, err := rec(a)
 			if err != nil {
 				return nil, err
 			}
@@ -83,7 +92,13 @@ func rebuildBoolExpr(b *BoolExpr) (parser.Expr, error) {
 
 // rebuildNullTest reconstructs `x IS [NOT] NULL`.
 func rebuildNullTest(nt *NullTest) (parser.Expr, error) {
-	operand, err := Rebuild(nt.Arg)
+	return rebuildNullTestWith(nt, Rebuild)
+}
+
+// rebuildNullTestWith rebuilds a NULLTEST through the injected recursion `rec`
+// (so the argument may be a column Var in the view-reload path).
+func rebuildNullTestWith(nt *NullTest, rec func(Node) (parser.Expr, error)) (parser.Expr, error) {
+	operand, err := rec(nt.Arg)
 	if err != nil {
 		return nil, err
 	}

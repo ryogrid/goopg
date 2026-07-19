@@ -5766,6 +5766,21 @@ existing encoder, `constcollid=100` / `consttypmod=n+4`.
       (and/or/not). Gate `internal/pgnodes/bool_null_test.go` (green): 6
       live-captured PG18.3 adbin goldens byte-for-byte + Read round-trip +
       resolve→Rebuild→re-resolve DeepEqual + nested-right + bad-boolop reject.
-      Design `0123-0005-pgnodes-bool-null-scalar.md`. REMAINING: view-query
-      (`resolver_query.go`) BoolExpr/NullTest qual wiring; numeric/timestamptz
+      Design `0123-0005-pgnodes-bool-null-scalar.md`.
+      SUB-SLICE 2 LANDED (2026-07-19): VIEW-QUERY bool/null wiring. The three
+      scalar helpers (`resolveBoolBinary`/`resolveBoolNot`/`resolveNullTest`)
+      became thin wrappers over recursion-injectable `*With` variants
+      (`scopedResolve` fwd, `func(Node)(parser.Expr,error)` rebuild), mirroring
+      how 0123-0004 sub-slice 2b made rebuildOpExpr/rebuildFuncExpr injectable.
+      `queryScope.resolveExpr` (resolver_query.go) now dispatches BooleanConst /
+      IsNullExpr / UnaryOp{OpNot} / BinaryOp{OpAnd|OpOr} through them, and
+      `viewRebuildScope.rebuildExpr` (rebuild_query.go) adds BoolExpr/NullTest
+      cases — so a multi-condition view qual (`... WHERE src IS NOT NULL AND
+      client > 0`) now emits a CANONICAL ev_action + relhasrules=true (was
+      SQL-text fallback). Gates (GREEN): `internal/pgnodes/view_bool_null_test.go`
+      (2 live PG18.3 goldens: v3 AND/NULLTEST/OPEXPR, v4 OR/nested-NOT/NULLTEST —
+      forward + codec round-trip + rebuild fixed point + structure) and
+      `TestE2E_FailoverGoopgToPG` (new b5c_view2: a real PG18 standby reports
+      relhasrules=true + pg_get_viewdef PARSES the bool/null ev_action). Design
+      0123-0005 §"Sub-slice 2" + README index. REMAINING: numeric/timestamptz
       datums; `CASE`/`BooleanTest`/`IS DISTINCT FROM`; the byte-diff oracle gate.

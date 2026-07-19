@@ -280,11 +280,19 @@ func (s *queryScope) resolveExpr(e parser.Expr, expected uint32) (Node, uint32, 
 	case *parser.IntegerConst:
 		return resolveIntLiteral(v.Value, expected)
 
+	case *parser.BooleanConst:
+		return NewBoolConst(v.Value), OidBool, nil
+
 	case *parser.StringConst:
 		if expected == OidText || expected == 0 {
 			return NewTextConst(v.Value), OidText, nil
 		}
 		return nil, 0, ErrUnsupported
+
+	case *parser.IsNullExpr:
+		// x IS [NOT] NULL over a view column/expression -> NULLTEST, with the
+		// argument resolved in the relation scope (so it may be a column Var).
+		return resolveNullTestWith(v, s.resolveExpr)
 
 	case *parser.UnaryOp:
 		switch v.Op {
@@ -295,11 +303,23 @@ func (s *queryScope) resolveExpr(e parser.Expr, expected uint32) (Node, uint32, 
 				return resolveIntLiteral(-lit.Value, expected)
 			}
 			return nil, 0, ErrUnsupported
+		case parser.OpNot:
+			// NOT x -> single-arg NOT BOOLEXPR, argument in the relation scope.
+			return resolveBoolNotWith(v.Operand, s.resolveExpr)
 		default:
 			return nil, 0, ErrUnsupported
 		}
 
 	case *parser.BinaryOp:
+		// AND/OR fold to a (flattened) BOOLEXPR; every other operator to an
+		// OpExpr. Operands resolve in the relation scope so a multi-condition
+		// view qual (`a IS NOT NULL AND b > 0`) becomes canonical ev_action.
+		switch v.Op {
+		case parser.OpAnd:
+			return resolveBoolBinaryWith(v, BoolExprAnd, s.resolveExpr)
+		case parser.OpOr:
+			return resolveBoolBinaryWith(v, BoolExprOr, s.resolveExpr)
+		}
 		lNode, lType, err := s.resolveExpr(v.Left, 0)
 		if err != nil {
 			return nil, 0, err

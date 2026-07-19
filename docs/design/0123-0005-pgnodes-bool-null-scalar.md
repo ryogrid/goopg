@@ -99,12 +99,43 @@ from a live PG18.3 server (`pg_attrdef.adbin == nodeToString`):
 `go build ./...` + `go vet ./internal/pgnodes ./internal/executor ./internal/initdb`
 clean; the standard pre-commit pgbench smoke runs on the commit.
 
+## Sub-slice 2 (2026-07-19): view-query `WHERE`/target wiring
+
+The scalar helpers above are now recursion-injectable so the query-scoped
+resolver/rebuild reuse them over base-relation columns, mirroring how
+`rebuildOpExpr`/`rebuildFuncExpr` were made injectable in 0123-0004 sub-slice 2b.
+
+- `resolver_expr.go`: `resolveBoolBinary`/`resolveBoolNot`/`resolveNullTest`
+  become thin wrappers over `*With` variants that take a
+  `scopedResolve = func(parser.Expr, uint32) (Node, uint32, error)` recursion.
+  The scalar path threads its own `resolve`; the query path threads
+  `queryScope.resolveExpr`. Same builder → byte-identical `BOOLEXPR`/`NULLTEST`.
+- `resolver_query.go`: `queryScope.resolveExpr` gains `*parser.BooleanConst`,
+  `*parser.IsNullExpr` (→ `resolveNullTestWith`), `UnaryOp{OpNot}` (→
+  `resolveBoolNotWith`), and an `AND`/`OR` dispatch (→ `resolveBoolBinaryWith`)
+  *before* the operator-seed lookup — exactly the scalar dispatch, now over Vars.
+- `rebuild.go`: `rebuildBoolExpr`/`rebuildNullTest` gain `*With` variants taking a
+  `func(Node) (parser.Expr, error)` recursion; `rebuild_query.go`'s
+  `viewRebuildScope.rebuildExpr` adds `*BoolExpr`/`*NullTest` cases routing
+  through them so a bool/null operand may itself be a column `Var`.
+
+A multi-condition view (`... WHERE src IS NOT NULL AND client > 0`) now emits a
+canonical `pg_rewrite.ev_action` and sets `pg_class.relhasrules=true` (was
+SQL-text fallback + `relhasrules=false`).
+
+### Gates (all green)
+
+- `internal/pgnodes/view_bool_null_test.go` — two live-captured PG18.3
+  `ev_action` goldens (`v3`: `AND` over `NULLTEST`+`OPEXPR`; `v4`: `OR` over a
+  nested `NOT` `BOOLEXPR` + `NULLTEST`): forward resolve→`OutRuleAction`
+  byte-for-byte, `Out`→`Read`→`Out` codec round-trip, resolve→`RebuildViewQuery`
+  →re-resolve fixed point, and a structural spot-check (AND/OR/NOT shape,
+  `IsNotNull`, nested-NOT-not-flattened, rebuilt compound `WHERE`).
+- `internal/testport/e2e_failover_goopg_to_pg_test.go` — a real PG18 standby
+  reports `relhasrules=true` for `b5c_view2` and PARSES its canonical bool/null
+  `ev_action` via `pg_get_viewdef` (reconstructs `src IS NOT NULL` + `client > 0`).
+
 ## Deferred
 
-- View-query `WHERE`/target `BoolExpr`/`NullTest`: `resolver_query.go` resolves
-  quals in its own `Var`-aware scope and does not yet route through these
-  helpers — next sub-slice (extract `*With` recursion variants, mirroring how
-  `rebuildOpExpr`/`rebuildFuncExpr` were made recursion-injectable in 0123-0004
-  sub-slice 2b).
 - `numeric`/`timestamptz` datums, `CASE`, `BooleanTest` (`IS TRUE`/`IS FALSE`),
   `IS DISTINCT FROM`, and the byte-diff oracle gate remain in M0123-S4.

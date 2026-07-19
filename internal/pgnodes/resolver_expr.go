@@ -253,6 +253,16 @@ func resolveBinaryOp(b *parser.BinaryOp) (Node, uint32, error) {
 	return buildOpExpr(lNode, lType, rNode, rType, b.Op.String())
 }
 
+// scopedResolve is the recursion an operand is resolved through by the *With
+// bool/null builders. The scalar resolver threads its own `resolve`; the
+// query-scoped resolver (resolver_query.go) threads queryScope.resolveExpr so a
+// BoolExpr/NullTest operand inside a view WHERE-qual or target may itself be a
+// column Var. Both have the identical (expr, expectedType) -> (node, type, err)
+// shape, so the builders emit byte-identical BOOLEXPR/NULLTEST nodes either way
+// (M0123-S4 sub-slice 2: view-query bool/null wiring, mirroring how 2b made
+// rebuildOpExpr/rebuildFuncExpr recursion-injectable).
+type scopedResolve = func(parser.Expr, uint32) (Node, uint32, error)
+
 // resolveBoolBinary resolves an AND/OR operator to a BOOLEXPR, reproducing PG's
 // makeAndExpr/makeOrExpr flattening: `a AND b AND c` parses left-associatively
 // as `(a AND b) AND c`, and PG collapses that into ONE BoolExpr with three args
@@ -263,11 +273,20 @@ func resolveBinaryOp(b *parser.BinaryOp) (Node, uint32, error) {
 // (`a AND (b AND c)`) is a distinct parse tree and stays nested, exactly as PG
 // keeps it nested. The result type is always bool.
 func resolveBoolBinary(b *parser.BinaryOp, boolop int32) (Node, uint32, error) {
-	lNode, _, err := resolve(b.Left, OidBool)
+	return resolveBoolBinaryWith(b, boolop, resolve)
+}
+
+// resolveBoolBinaryWith resolves an AND/OR operator to a BOOLEXPR, reproducing
+// PG's makeAndExpr/makeOrExpr flattening (see resolveBoolBinary's comment for
+// the full rationale). Operands resolve through `rec`, so the query-scoped
+// resolver can thread queryScope.resolveExpr and flatten `a AND b AND c` over
+// view columns exactly as the scalar path flattens it over literals.
+func resolveBoolBinaryWith(b *parser.BinaryOp, boolop int32, rec scopedResolve) (Node, uint32, error) {
+	lNode, _, err := rec(b.Left, OidBool)
 	if err != nil {
 		return nil, 0, err
 	}
-	rNode, _, err := resolve(b.Right, OidBool)
+	rNode, _, err := rec(b.Right, OidBool)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -281,7 +300,13 @@ func resolveBoolBinary(b *parser.BinaryOp, boolop int32) (Node, uint32, error) {
 // resolveBoolNot resolves `NOT x` to a single-arg NOT BOOLEXPR (makeNotExpr does
 // no flattening). Result type bool.
 func resolveBoolNot(operand parser.Expr) (Node, uint32, error) {
-	n, _, err := resolve(operand, OidBool)
+	return resolveBoolNotWith(operand, resolve)
+}
+
+// resolveBoolNotWith resolves `NOT x` to a single-arg NOT BOOLEXPR (makeNotExpr
+// does no flattening). Result type bool. The operand resolves through `rec`.
+func resolveBoolNotWith(operand parser.Expr, rec scopedResolve) (Node, uint32, error) {
+	n, _, err := rec(operand, OidBool)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -292,7 +317,14 @@ func resolveBoolNot(operand parser.Expr) (Node, uint32, error) {
 // resolves in an unknown context (IS NULL applies to any type); argisrow is
 // false for the scalar subset. Result type bool.
 func resolveNullTest(e *parser.IsNullExpr) (Node, uint32, error) {
-	arg, _, err := resolve(e.Operand, 0)
+	return resolveNullTestWith(e, resolve)
+}
+
+// resolveNullTestWith resolves `x IS [NOT] NULL` to a NULLTEST. The argument
+// resolves through `rec` in an unknown context (IS NULL applies to any type);
+// argisrow is false for the scalar subset. Result type bool.
+func resolveNullTestWith(e *parser.IsNullExpr, rec scopedResolve) (Node, uint32, error) {
+	arg, _, err := rec(e.Operand, 0)
 	if err != nil {
 		return nil, 0, err
 	}
