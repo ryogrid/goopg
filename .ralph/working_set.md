@@ -1,37 +1,38 @@
-Task: M0123-S2 sub-slice 2 parts (b)(c) — canonical pg_attrdef.adbin writer +
-reload wiring. COMPLETE + committed this loop.
+Task: M0123-S3 sub-slice 1 — pure `internal/pgnodes` query-tree CODEC (no wiring).
+COMPLETE + committed this loop.
 
-Landed: `pgnodes.ResolveForColumn(e,targetType)→(Node,bool)` (exact-type-match
-gate) drives `canonicalAttrdefText` in the `writeAttrdefRow` funnel; reload
-`rebuildAttrdefExpr` discriminates on leading `{`→Read/Rebuild else ParseExpr.
-adbin stored as plain string (nodeToString is pure ASCII — no NewBytesDatum).
+Landed: IR nodes Query/RangeTblEntry/RTEPermissionInfo/FromExpr/RangeTblRef/
+TargetEntry/Var/Alias (ir_query.go) + 2 new wire primitives — Bitmapset
+`(b ...)` and String value node `"col"` (quoted, via outNode T_String path) vs
+bare WRITE_STRING_FIELD via a faithful outToken port. outfuncs_query.go emits the
+full ~45-field Query skeleton (fixed fields = view defaults) in outfuncs.c order +
+OutRuleAction outer `(...)` ev_action wrapper. readfuncs_query.go = inverse AND
+shape gate (readQuery validates every fixed field; readRangeTblEntry rejects
+non-RTE_RELATION/tablesample/securityQuals → clean error = "keep SQL text").
 
-Files: internal/pgnodes/resolver_expr.go (+ResolveForColumn) & _test.go,
-internal/executor/sys_pg_attrdef.go (+canonicalAttrdefText) & operators_ddl.go
-(caller) & sys_pg_attrdef_test.go (new), internal/initdb/catalog_heap_reload.go
-(+rebuildAttrdefExpr) & catalog_heap_reload_attrdef_test.go (new),
-internal/testport/e2e_failover_goopg_to_pg_test.go (deferral comment only),
-docs/design/0123-0003-*.md (new) + 0123-0002-*.md + README, fix_plan + ledger.
+Files: internal/pgnodes/ir_query.go (new), outfuncs_query.go (new),
+readfuncs_query.go (new), query_roundtrip_test.go (new), outfuncs.go (+8 dispatch
+cases), readfuncs.go (+8 dispatch cases), docs/design/0123-0004-*.md (new) +
+README index, .ralph/fix_plan.md (S3 sub-slice-1 note) + deferral_ledger.md.
 
-Gates run: go build ./... clean; go vet clean; internal/pgnodes GREEN;
-TestCanonicalAttrdefText GREEN; TestRebuildAttrdefExpr GREEN; full internal/initdb
-(105s) GREEN; TestE2E_FailoverGoopgToPG GREEN; ralph-state-guard OK (auto-repair);
-pgbench smoke via pre-commit hook.
+Key symbols: pgnodes.OutRuleAction / ReadRuleAction (ev_action list wrapper),
+Query/RangeTblEntry/RTEPermissionInfo/FromExpr/RangeTblRef/TargetEntry/Var/Alias,
+Bitmapset, outToken/unToken, wBitmapset/readBitmapsetField, wStringList.
 
-DISCOVERED / DEFERRED (ledger 2026-07-19, both orthogonal to node-tree serde):
- (1) standby-EVAL E2E blocked by pg_attrdef catalog completeness — real PG18
-     standby can't build a usable pg_attrdef tupledesc from goopg's streamed
-     pg_attribute (relid 2604 lacks usable `adbin` col: `column "adbin" does not
-     exist`) AND AttrDefaultFetch opens the unmaterialized adrelid/adnum index
-     (OID 2656: `could not open relation with OID 2656`). Fix = bootstrap
-     pg_attribute completion + materialize 2656/2657 index files, THEN re-add the
-     standby INSERT DEFAULT VALUES assertion to e2e_failover_goopg_to_pg_test.go.
- (2) canonical stxexprs blocked on a List IR node (stxexprs is `(...)` List of
-     trees) — arrives with S3/S4.
+Gates run: go build ./... clean; go vet ./internal/pgnodes/ clean; gofmt -l = only
+pre-existing resolver_expr_test.go (version mismatch, not mine); go test
+./internal/pgnodes/ GREEN incl. TestRuleActionRoundTrip (2 live PG18.3 goldens,
+byte-for-byte) + TestRuleActionStructure + TestRuleActionShapeGate; pgbench smoke
+via pre-commit hook.
 
-Next step (next loop): M0123-S3 — resolver_query.go (SelectStmt→Query IR) +
-Query/RTE/Var out/read/rebuild + writeViewRewriteRow canonical ev_action +
-RuleIsCanonical flag; OR pick the deferred pg_attrdef-index materialization to
-unblock the standby-eval gate. S3 is the fix_plan's next unchecked M0123 item.
+Next step (next loop): M0123-S3 sub-slice 2 — the WIRING. (a) resolver_query.go
+(*parser.SelectStmt + catalog → IR Query; compute varno/varattno, selectedCols
+offset attno-FirstLowInvalidHeapAttributeNumber=-7, resorigtbl, perminfoindex);
+(b) rebuild.go Query→goopg view AST; (c) wire writeViewRewriteRow→OutRuleAction,
+set catalog.Table.RuleIsCanonical, flip pg18_user_catalog_rows.go:511 relhasrules,
+swap loadViewsFromHeap, update relhasrules=false test lock-ins
+(pg_stat_wal_receiver_nailed_test.go:111-114, e2e_failover_goopg_to_pg_test.go:278);
+(d) gate: standby-query E2E (goopg CREATE VIEW + PG18 standby SELECT * FROM v ==
+goopg's own rows). See deferral_ledger 2026-07-19 M0123-S3 sub-slice 1 row.
 
 In-flight: none.

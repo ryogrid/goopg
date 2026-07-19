@@ -37,6 +37,22 @@ func outNode(sb *strings.Builder, n Node) {
 		outCoerceViaIO(sb, v)
 	case *SQLValueFunction:
 		outSQLValueFunction(sb, v)
+	case *Query:
+		outQuery(sb, v)
+	case *RangeTblEntry:
+		outRangeTblEntry(sb, v)
+	case *RTEPermissionInfo:
+		outRTEPermissionInfo(sb, v)
+	case *FromExpr:
+		outFromExpr(sb, v)
+	case *RangeTblRef:
+		outRangeTblRef(sb, v)
+	case *TargetEntry:
+		outTargetEntry(sb, v)
+	case *Var:
+		outVar(sb, v)
+	case *Alias:
+		outAlias(sb, v)
 	default:
 		panic(fmt.Sprintf("pgnodes: outNode: unsupported node type %T", n))
 	}

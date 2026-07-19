@@ -5683,7 +5683,22 @@ existing encoder, `constcollid=100` / `consttypmod=n+4`.
       + 2656/2657 index materialization first. (2) canonical **`stxexprs`** is
       blocked on a `List` IR node (`stxexprs` is a `List` of trees, `(...)` not
       `{...}`) — arrives with S3/S4.
-- [ ] M0123-S3 — `resolver_query.go` (goopg `*parser.SelectStmt` + catalog → IR
+- [ ] M0123-S3 — SUB-SLICE 1 LANDED (2026-07-19): the pure `internal/pgnodes`
+      query-tree **codec** (no wiring), mirroring how S1 landed the scalar codec
+      before S2's resolver. New IR `Query`/`RangeTblEntry`/`RTEPermissionInfo`/
+      `FromExpr`/`RangeTblRef`/`TargetEntry`/`Var`/`Alias` (`ir_query.go`) + two
+      new wire primitives (`Bitmapset` `(b ...)`; String value node `"col"`) +
+      `outfuncs_query.go` (full ~45-field `Query` skeleton in `outfuncs.c` order,
+      `OutRuleAction` outer `(...)` wrapper) + `readfuncs_query.go` (inverse, and
+      the shape gate: `readQuery` validates every fixed field, `readRangeTblEntry`
+      rejects non-`RTE_RELATION`/`tablesample`/`securityQuals`). Gate:
+      `query_roundtrip_test.go` — `Out(Read(golden)) == golden` byte-for-byte
+      against 2 live-captured PG18.3 `ev_action` goldens (view w/ `WHERE` qual;
+      view w/ computed `upper()` + no qual) + structural spot-check
+      (`selectedCols==[8 9]`, qual `OpExpr.opno==521`) + `hasAggs true` rejection.
+      `go test ./internal/pgnodes/` + `go vet` green. Design
+      `0123-0004-pgnodes-query-serializer.md`. REMAINING (sub-slice 2):
+      `resolver_query.go` (goopg `*parser.SelectStmt` + catalog → IR
       `Query` for single-base-relation views) + the `Query`/`RangeTblEntry`/
       `RTEPermissionInfo`/`FromExpr`/`RangeTblRef`/`TargetEntry`/`Var` tags in
       out/read/rebuild + view shape-check. Wire `writeViewRewriteRow` to canonical

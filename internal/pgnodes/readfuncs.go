@@ -106,6 +106,22 @@ func readNode(t *tokenizer) (Node, error) {
 		n, err = readCoerceViaIO(t)
 	case "SQLVALUEFUNCTION":
 		n, err = readSQLValueFunction(t)
+	case "QUERY":
+		n, err = readQuery(t)
+	case "RANGETBLENTRY":
+		n, err = readRangeTblEntry(t)
+	case "RTEPERMISSIONINFO":
+		n, err = readRTEPermissionInfo(t)
+	case "FROMEXPR":
+		n, err = readFromExpr(t)
+	case "RANGETBLREF":
+		n, err = readRangeTblRef(t)
+	case "TARGETENTRY":
+		n, err = readTargetEntry(t)
+	case "VAR":
+		n, err = readVar(t)
+	case "ALIAS":
+		n, err = readAlias(t)
 	default:
 		return nil, fmt.Errorf("pgnodes: unsupported node tag %q", label)
 	}
