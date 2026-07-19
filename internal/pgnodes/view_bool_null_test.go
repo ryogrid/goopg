@@ -88,6 +88,25 @@ const goldenViewV9 = `({QUERY :commandType 1 :querySource 0 :canSetTag true :uti
 //	CREATE VIEW v10 AS SELECT client, src FROM bench_log WHERE client IS NOT DISTINCT FROM 5;
 const goldenViewV10 = `({QUERY :commandType 1 :querySource 0 :canSetTag true :utilityStmt <> :resultRelation 0 :hasAggs false :hasWindowFuncs false :hasTargetSRFs false :hasSubLinks false :hasDistinctOn false :hasRecursive false :hasModifyingCTE false :hasForUpdate false :hasRowSecurity false :hasGroupRTE false :isReturn false :cteList <> :rtable ({RANGETBLENTRY :alias <> :eref {ALIAS :aliasname bench_log :colnames ("client" "src")} :rtekind 0 :relid 16384 :inh true :relkind r :rellockmode 1 :perminfoindex 1 :tablesample <> :lateral false :inFromCl true :securityQuals <>}) :rteperminfos ({RTEPERMISSIONINFO :relid 16384 :inh true :requiredPerms 2 :checkAsUser 0 :selectedCols (b 8 9) :insertedCols (b) :updatedCols (b)}) :jointree {FROMEXPR :fromlist ({RANGETBLREF :rtindex 1}) :quals {BOOLEXPR :boolop not :args ({DISTINCTEXPR :opno 96 :opfuncid 65 :opresulttype 16 :opretset false :opcollid 0 :inputcollid 0 :args ({VAR :varno 1 :varattno 1 :vartype 23 :vartypmod -1 :varcollid 0 :varnullingrels (b) :varlevelsup 0 :varreturningtype 0 :varnosyn 1 :varattnosyn 1 :location -1} {CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 5 0 0 0 0 0 0 0 ]}) :location -1}) :location -1}} :mergeActionList <> :mergeTargetRelation 0 :mergeJoinCondition <> :targetList ({TARGETENTRY :expr {VAR :varno 1 :varattno 1 :vartype 23 :vartypmod -1 :varcollid 0 :varnullingrels (b) :varlevelsup 0 :varreturningtype 0 :varnosyn 1 :varattnosyn 1 :location -1} :resno 1 :resname client :ressortgroupref 0 :resorigtbl 16384 :resorigcol 1 :resjunk false} {TARGETENTRY :expr {VAR :varno 1 :varattno 2 :vartype 25 :vartypmod -1 :varcollid 100 :varnullingrels (b) :varlevelsup 0 :varreturningtype 0 :varnosyn 1 :varattnosyn 2 :location -1} :resno 2 :resname src :ressortgroupref 0 :resorigtbl 16384 :resorigcol 2 :resjunk false}) :override 0 :onConflict <> :returningOldAlias <> :returningNewAlias <> :returningList <> :groupClause <> :groupDistinct false :groupingSets <> :havingQual <> :windowClause <> :distinctClause <> :sortClause <> :limitOffset <> :limitCount <> :limitOption 0 :rowMarks <> :setOperations <> :constraintDeps <> :withCheckOptions <> :stmt_location -1 :stmt_len -1})`
 
+// goldenViewV11 is v11's ev_action (M0123-S4 sub-slice 11): `client IS DISTINCT
+// FROM NULL` does NOT become a DISTINCTEXPR — PG's transformAExprDistinct rewrites
+// an undecorated-NULL operand via make_nulltest_from_distinct into a NULLTEST
+// (nulltesttype 1 = IS NOT NULL) over the other operand (the client Var), with NO
+// NOT wrapper and argisrow false. pg_get_viewdef renders `client IS NOT NULL`.
+// Captured live from PG18.3 (bench_log relid 16384):
+//
+//	CREATE VIEW v11 AS SELECT client, src FROM bench_log WHERE client IS DISTINCT FROM NULL;
+const goldenViewV11 = `({QUERY :commandType 1 :querySource 0 :canSetTag true :utilityStmt <> :resultRelation 0 :hasAggs false :hasWindowFuncs false :hasTargetSRFs false :hasSubLinks false :hasDistinctOn false :hasRecursive false :hasModifyingCTE false :hasForUpdate false :hasRowSecurity false :hasGroupRTE false :isReturn false :cteList <> :rtable ({RANGETBLENTRY :alias <> :eref {ALIAS :aliasname bench_log :colnames ("client" "src")} :rtekind 0 :relid 16384 :inh true :relkind r :rellockmode 1 :perminfoindex 1 :tablesample <> :lateral false :inFromCl true :securityQuals <>}) :rteperminfos ({RTEPERMISSIONINFO :relid 16384 :inh true :requiredPerms 2 :checkAsUser 0 :selectedCols (b 8 9) :insertedCols (b) :updatedCols (b)}) :jointree {FROMEXPR :fromlist ({RANGETBLREF :rtindex 1}) :quals {NULLTEST :arg {VAR :varno 1 :varattno 1 :vartype 23 :vartypmod -1 :varcollid 0 :varnullingrels (b) :varlevelsup 0 :varreturningtype 0 :varnosyn 1 :varattnosyn 1 :location -1} :nulltesttype 1 :argisrow false :location -1}} :mergeActionList <> :mergeTargetRelation 0 :mergeJoinCondition <> :targetList ({TARGETENTRY :expr {VAR :varno 1 :varattno 1 :vartype 23 :vartypmod -1 :varcollid 0 :varnullingrels (b) :varlevelsup 0 :varreturningtype 0 :varnosyn 1 :varattnosyn 1 :location -1} :resno 1 :resname client :ressortgroupref 0 :resorigtbl 16384 :resorigcol 1 :resjunk false} {TARGETENTRY :expr {VAR :varno 1 :varattno 2 :vartype 25 :vartypmod -1 :varcollid 100 :varnullingrels (b) :varlevelsup 0 :varreturningtype 0 :varnosyn 1 :varattnosyn 2 :location -1} :resno 2 :resname src :ressortgroupref 0 :resorigtbl 16384 :resorigcol 2 :resjunk false}) :override 0 :onConflict <> :returningOldAlias <> :returningNewAlias <> :returningList <> :groupClause <> :groupDistinct false :groupingSets <> :havingQual <> :windowClause <> :distinctClause <> :sortClause <> :limitOffset <> :limitCount <> :limitOption 0 :rowMarks <> :setOperations <> :constraintDeps <> :withCheckOptions <> :stmt_location -1 :stmt_len -1})`
+
+// goldenViewV12 is v12's ev_action (M0123-S4 sub-slice 11): the NOT form
+// `client IS NOT DISTINCT FROM NULL` — make_nulltest_from_distinct folds the
+// negation into the NULLTEST (nulltesttype 0 = IS NULL) rather than wrapping a
+// DISTINCTEXPR in a NOT, so there is NO NOT BOOLEXPR here (contrast v10). Captured
+// live from PG18.3:
+//
+//	CREATE VIEW v12 AS SELECT client, src FROM bench_log WHERE client IS NOT DISTINCT FROM NULL;
+const goldenViewV12 = `({QUERY :commandType 1 :querySource 0 :canSetTag true :utilityStmt <> :resultRelation 0 :hasAggs false :hasWindowFuncs false :hasTargetSRFs false :hasSubLinks false :hasDistinctOn false :hasRecursive false :hasModifyingCTE false :hasForUpdate false :hasRowSecurity false :hasGroupRTE false :isReturn false :cteList <> :rtable ({RANGETBLENTRY :alias <> :eref {ALIAS :aliasname bench_log :colnames ("client" "src")} :rtekind 0 :relid 16384 :inh true :relkind r :rellockmode 1 :perminfoindex 1 :tablesample <> :lateral false :inFromCl true :securityQuals <>}) :rteperminfos ({RTEPERMISSIONINFO :relid 16384 :inh true :requiredPerms 2 :checkAsUser 0 :selectedCols (b 8 9) :insertedCols (b) :updatedCols (b)}) :jointree {FROMEXPR :fromlist ({RANGETBLREF :rtindex 1}) :quals {NULLTEST :arg {VAR :varno 1 :varattno 1 :vartype 23 :vartypmod -1 :varcollid 0 :varnullingrels (b) :varlevelsup 0 :varreturningtype 0 :varnosyn 1 :varattnosyn 1 :location -1} :nulltesttype 0 :argisrow false :location -1}} :mergeActionList <> :mergeTargetRelation 0 :mergeJoinCondition <> :targetList ({TARGETENTRY :expr {VAR :varno 1 :varattno 1 :vartype 23 :vartypmod -1 :varcollid 0 :varnullingrels (b) :varlevelsup 0 :varreturningtype 0 :varnosyn 1 :varattnosyn 1 :location -1} :resno 1 :resname client :ressortgroupref 0 :resorigtbl 16384 :resorigcol 1 :resjunk false} {TARGETENTRY :expr {VAR :varno 1 :varattno 2 :vartype 25 :vartypmod -1 :varcollid 100 :varnullingrels (b) :varlevelsup 0 :varreturningtype 0 :varnosyn 1 :varattnosyn 2 :location -1} :resno 2 :resname src :ressortgroupref 0 :resorigtbl 16384 :resorigcol 2 :resjunk false}) :override 0 :onConflict <> :returningOldAlias <> :returningNewAlias <> :returningList <> :groupClause <> :groupDistinct false :groupingSets <> :havingQual <> :windowClause <> :distinctClause <> :sortClause <> :limitOffset <> :limitCount <> :limitOption 0 :rowMarks <> :setOperations <> :constraintDeps <> :withCheckOptions <> :stmt_location -1 :stmt_len -1})`
+
 var viewBoolNullCases = []struct {
 	name, sql, golden string
 }{
@@ -99,6 +118,8 @@ var viewBoolNullCases = []struct {
 	{"v8_caseexpr_no_else", "SELECT client, src FROM bench_log WHERE CASE WHEN src IS NULL THEN false WHEN client > 0 THEN true END", goldenViewV8},
 	{"v9_distinctexpr", "SELECT client, src FROM bench_log WHERE client IS DISTINCT FROM 5", goldenViewV9},
 	{"v10_distinctexpr_not", "SELECT client, src FROM bench_log WHERE client IS NOT DISTINCT FROM 5", goldenViewV10},
+	{"v11_distinct_from_null", "SELECT client, src FROM bench_log WHERE client IS DISTINCT FROM NULL", goldenViewV11},
+	{"v12_not_distinct_from_null", "SELECT client, src FROM bench_log WHERE client IS NOT DISTINCT FROM NULL", goldenViewV12},
 }
 
 // TestResolveViewQueryBoolNull is the forward gate: a multi-condition view qual
@@ -299,5 +320,48 @@ func TestViewQueryBoolNullStructure(t *testing.T) {
 	}
 	if _, ok := be10.Args[0].(*DistinctExpr); !ok {
 		t.Errorf("v10 NOT arg = %T, want *DistinctExpr", be10.Args[0])
+	}
+
+	// v11: `client IS DISTINCT FROM NULL` is NOT a DISTINCTEXPR — the undecorated
+	// NULL operand makes PG rewrite it to a NULLTEST (IS NOT NULL) over the client
+	// Var (make_nulltest_from_distinct), with no `=` operator lookup. Rebuild maps
+	// it back to `IS NOT NULL` (the stable fixed point, matching pg_get_viewdef),
+	// NOT to the original IS DISTINCT FROM spelling.
+	q11, err := ResolveViewQuery(parseSelect(t, viewBoolNullCases[8].sql), benchLogResolver{})
+	if err != nil {
+		t.Fatalf("ResolveViewQuery v11: %v", err)
+	}
+	nt11, ok := q11.Jointree.(*FromExpr).Quals.(*NullTest)
+	if !ok || nt11.NullTestType != IsNotNull || nt11.ArgIsRow {
+		t.Fatalf("v11 qual = %#v, want IS-NOT-NULL NullTest (argisrow false)", q11.Jointree.(*FromExpr).Quals)
+	}
+	if _, ok := nt11.Arg.(*Var); !ok {
+		t.Errorf("v11 NullTest arg = %T, want *Var (client column)", nt11.Arg)
+	}
+	sel11, err := RebuildViewQuery(q11)
+	if err != nil {
+		t.Fatalf("RebuildViewQuery v11: %v", err)
+	}
+	if isn, ok := sel11.Where.(*parser.IsNullExpr); !ok || !isn.Negated {
+		t.Errorf("v11 rebuilt WHERE = %#v, want IS NOT NULL (IsNullExpr Negated)", sel11.Where)
+	}
+
+	// v12: the NOT form `client IS NOT DISTINCT FROM NULL` folds the negation into
+	// the NULLTEST (IS NULL) — there is NO NOT BoolExpr wrapper (contrast v10's
+	// DISTINCTEXPR-under-NOT). Rebuild round-trips to `IS NULL`.
+	q12, err := ResolveViewQuery(parseSelect(t, viewBoolNullCases[9].sql), benchLogResolver{})
+	if err != nil {
+		t.Fatalf("ResolveViewQuery v12: %v", err)
+	}
+	nt12, ok := q12.Jointree.(*FromExpr).Quals.(*NullTest)
+	if !ok || nt12.NullTestType != IsNull || nt12.ArgIsRow {
+		t.Fatalf("v12 qual = %#v, want IS-NULL NullTest (argisrow false, no NOT wrapper)", q12.Jointree.(*FromExpr).Quals)
+	}
+	sel12, err := RebuildViewQuery(q12)
+	if err != nil {
+		t.Fatalf("RebuildViewQuery v12: %v", err)
+	}
+	if isn, ok := sel12.Where.(*parser.IsNullExpr); !ok || isn.Negated {
+		t.Errorf("v12 rebuilt WHERE = %#v, want IS NULL (IsNullExpr not negated)", sel12.Where)
 	}
 }

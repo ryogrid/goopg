@@ -526,13 +526,49 @@ SQL-text fallback). Purely two dispatch arms — the recursion-injectable
   a structural assertion (`TestViewQueryBoolNullStructure`).
 - full `pgnodes` package + `go vet ./internal/pgnodes/` + `go build ./...` clean.
 
+## Sub-slice 11 — `IS [NOT] DISTINCT FROM NULL` → `NullTest` rewrite
+
+An undecorated NULL literal on either side of `IS [NOT] DISTINCT FROM` is no
+longer a SQL-text fallback: `resolveDistinctFromWith` now reproduces PG's
+`transformAExprDistinct` → `make_nulltest_from_distinct` (`parse_expr.c`).
+"If either input is an undecorated NULL literal, transform to a NullTest on the
+other input" — this avoids requiring the datatype to have an `=` operator and is
+byte-identical to what PG stores:
+
+- The rewrite fires **before** resolving operands (PG tests `exprIsNullConstant`
+  on the raw `A_Const`). A new `distinctNullTestArg` helper detects a bare
+  `*parser.NullConst` on the right (checked first, matching PG) or the left and
+  returns the other operand. A decorated `NULL::type` is a cast node, not a
+  `NullConst`, so it correctly takes the ordinary `DISTINCTEXPR` path — exactly
+  as PG's `IsA(arg, A_Const)` guard requires.
+- `IS DISTINCT FROM NULL` → `NULLTEST` `nulltesttype 1` (IS NOT NULL);
+  `IS NOT DISTINCT FROM NULL` → `NULLTEST` `nulltesttype 0` (IS NULL). The
+  negation is folded into `nulltesttype`, so there is **no** `NOT` `BOOLEXPR`
+  wrapper (contrast sub-slice 10's `DISTINCTEXPR`-under-`NOT`). `argisrow` is
+  false regardless of operand type.
+- The result is a plain `NullTest`, so the existing rebuild path already
+  round-trips it: `RebuildViewQuery` emits `x IS [NOT] NULL`, matching
+  `pg_get_viewdef` (`WHERE (client IS NOT NULL)` / `(client IS NULL)`) — a stable
+  fixed point that does **not** restore the original `IS DISTINCT FROM` spelling.
+  No rebuild-path change was needed. The query-scoped resolver inherits the
+  behavior for free (it already dispatches `*parser.IsDistinctFromExpr` →
+  `resolveDistinctFromWith`).
+
+### Gates (all green)
+
+- `internal/pgnodes/view_bool_null_test.go` — two more live-captured PG18.3
+  `ev_action` goldens (`v11` = `client IS DISTINCT FROM NULL` → `NULLTEST`
+  nulltesttype 1; `v12` = `client IS NOT DISTINCT FROM NULL` → `NULLTEST`
+  nulltesttype 0, no `NOT` wrapper), each: forward byte-for-byte + codec
+  round-trip + resolve→`RebuildViewQuery`→re-resolve fixed point (asserting the
+  rebuilt WHERE is `IS [NOT] NULL`, not `IS DISTINCT FROM`) + structural
+  assertions in `TestViewQueryBoolNullStructure`.
+- full `pgnodes` package + `go vet ./internal/pgnodes/` + `go build ./...` clean.
+
 ## Deferred
 
 - The `CASE` **simple form** (`CASE operand WHEN …` — CaseTestExpr placeholder)
   and `select_common_type` cross-type result coercion remain in M0123-S4.
-- `IS DISTINCT FROM NULL` is NOT special-cased to a `NullTest` (PG's
-  `make_nulltest_from_distinct` rewrites `x IS DISTINCT FROM NULL` →
-  `x IS NOT NULL`); a NULL operand degrades to SQL text. See the deferral ledger.
 - The byte-diff oracle gate remains in M0123-S4. Operator-driven implicit
   coercion in view quals (which would let a `timestamptz`/`int2`→`numeric`
   string literal resolve inside a view `WHERE`) is also still SQL-text — only

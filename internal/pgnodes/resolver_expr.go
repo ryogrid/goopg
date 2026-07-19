@@ -339,11 +339,32 @@ func resolveDistinctFrom(d *parser.IsDistinctFromExpr) (Node, uint32, error) {
 // Both operands forward-resolve with an unknown context, then buildDistinctExpr
 // looks up the `=` operator for their types and tags the node DISTINCTEXPR.
 // `IS NOT DISTINCT FROM` wraps that DistinctExpr in a NOT BoolExpr exactly as
-// transformAExprDistinct does (makeBoolExpr(NOT_EXPR, [DistinctExpr])). NULL
-// operands are NOT special-cased to a NullTest here (PG's
-// make_nulltest_from_distinct) — they degrade to SQL text; see the deferral
-// ledger.
+// transformAExprDistinct does (makeBoolExpr(NOT_EXPR, [DistinctExpr])).
+//
+// An UNDECORATED NULL literal on either side is special-cased to a NullTest on
+// the other operand, mirroring PG's transformAExprDistinct →
+// make_nulltest_from_distinct (parse_expr.c): "If either input is an undecorated
+// NULL literal, transform to a NullTest on the other input. That's simpler than a
+// full DistinctExpr, and it avoids needing to require that the datatype have an =
+// operator." The rewrite fires BEFORE resolving operands (PG tests
+// exprIsNullConstant on the raw A_Const), maps `IS DISTINCT FROM NULL` →
+// IS_NOT_NULL and `IS NOT DISTINCT FROM NULL` → IS_NULL, and produces a plain
+// NullTest with NO NOT wrapper (the negation is folded into nulltesttype).
+// argisrow is false regardless of operand type. Only a bare NULL qualifies — a
+// decorated `NULL::int` parses to a cast (not *parser.NullConst) and takes the
+// ordinary DISTINCTEXPR path, exactly as PG's IsA(arg, A_Const) guard requires.
 func resolveDistinctFromWith(d *parser.IsDistinctFromExpr, rec scopedResolve) (Node, uint32, error) {
+	if arg, ok := distinctNullTestArg(d); ok {
+		node, _, err := rec(arg, 0)
+		if err != nil {
+			return nil, 0, err
+		}
+		ntt := IsNotNull // IS DISTINCT FROM NULL  -> IS NOT NULL
+		if d.Negated {
+			ntt = IsNull // IS NOT DISTINCT FROM NULL -> IS NULL
+		}
+		return &NullTest{Arg: node, NullTestType: ntt, ArgIsRow: false, Location: -1}, OidBool, nil
+	}
 	lNode, lType, err := rec(d.Left, 0)
 	if err != nil {
 		return nil, 0, err
@@ -360,6 +381,24 @@ func resolveDistinctFromWith(d *parser.IsDistinctFromExpr, rec scopedResolve) (N
 		return &BoolExpr{Boolop: BoolExprNot, Args: []Node{node}, Location: -1}, OidBool, nil
 	}
 	return node, OidBool, nil
+}
+
+// distinctNullTestArg reports whether an `a IS [NOT] DISTINCT FROM b` has an
+// undecorated NULL literal on one side and, if so, returns the OTHER operand —
+// the argument PG's make_nulltest_from_distinct wraps in a NullTest. It mirrors
+// exprIsNullConstant (parse_expr.c): only a bare *parser.NullConst counts (a
+// `NULL::type` cast is a different node and is NOT a null constant here). PG
+// checks the right operand first, then the left, so `NULL IS DISTINCT FROM NULL`
+// tests the left (right is NULL) and yields a NullTest over the left NULL — we
+// preserve that ordering.
+func distinctNullTestArg(d *parser.IsDistinctFromExpr) (parser.Expr, bool) {
+	if _, ok := d.Right.(*parser.NullConst); ok {
+		return d.Left, true
+	}
+	if _, ok := d.Left.(*parser.NullConst); ok {
+		return d.Right, true
+	}
+	return nil, false
 }
 
 // buildDistinctExpr builds a DISTINCTEXPR over the `=` operator for the operand
