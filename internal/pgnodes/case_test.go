@@ -95,6 +95,40 @@ var caseGolden = []struct {
 		colType: OidInt4,
 		want:    `{CASEEXPR :casetype 23 :casecollid 0 :arg {CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 5 0 0 0 0 0 0 0 ]} :args ({CASEWHEN :expr {OPEXPR :opno 96 :opfuncid 65 :opresulttype 16 :opretset false :opcollid 0 :inputcollid 0 :args ({CASETESTEXPR :typeId 23 :typeMod -1 :collation 0} {CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 4 0 0 0 0 0 0 0 ]}) :location -1} :result {CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 40 0 0 0 0 0 0 0 ]} :location -1} {CASEWHEN :expr {OPEXPR :opno 96 :opfuncid 65 :opresulttype 16 :opretset false :opcollid 0 :inputcollid 0 :args ({CASETESTEXPR :typeId 23 :typeMod -1 :collation 0} {CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 5 0 0 0 0 0 0 0 ]}) :location -1} :result {CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 50 0 0 0 0 0 0 0 ]} :location -1}) :defresult {CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 60 0 0 0 0 0 0 0 ]} :location -1}`,
 	},
+	// Cross-type result coercion (sub-slice 13): a CASE whose WHEN/ELSE results
+	// differ in type. PG's transformCaseExpr runs select_common_type over the
+	// results, then coerce_to_common_type wraps each mismatched result in a cast.
+	// For the numeric family an int result coerces to numeric via the implicit
+	// int4_numeric (1740) / int8_numeric (1781) FuncExpr (un-const-folded in the
+	// stored tree). Captured live from PG18.3 (tables cx/cy):
+	//   m1 numeric DEFAULT (CASE WHEN true THEN 1 ELSE 2.5 END)        -- cast on WHEN
+	//   m2 numeric DEFAULT (CASE 1 WHEN 1 THEN 1 ELSE 2.5 END)         -- simple form
+	//   m3 numeric DEFAULT (CASE WHEN true THEN 2.5 ELSE 1 END)        -- cast on ELSE
+	//   m4 numeric DEFAULT (CASE WHEN false THEN 5000000000 WHEN true THEN 3 ELSE 2.5 END) -- int8+int4 casts
+	{
+		name:    "crosstype_int_then_numeric_else",
+		sql:     "CASE WHEN true THEN 1 ELSE 2.5 END",
+		colType: OidNumeric,
+		want:    `{CASEEXPR :casetype 1700 :casecollid 0 :arg <> :args ({CASEWHEN :expr {CONST :consttype 16 :consttypmod -1 :constcollid 0 :constlen 1 :constbyval true :constisnull false :location -1 :constvalue 1 [ 1 0 0 0 0 0 0 0 ]} :result {FUNCEXPR :funcid 1740 :funcresulttype 1700 :funcretset false :funcvariadic false :funcformat 2 :funccollid 0 :inputcollid 0 :args ({CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 1 0 0 0 0 0 0 0 ]}) :location -1} :location -1}) :defresult {CONST :consttype 1700 :consttypmod -1 :constcollid 0 :constlen -1 :constbyval false :constisnull false :location -1 :constvalue 10 [ 40 0 0 0 -128 -128 2 0 -120 19 ]} :location -1}`,
+	},
+	{
+		name:    "crosstype_simple_int_numeric",
+		sql:     "CASE 1 WHEN 1 THEN 1 ELSE 2.5 END",
+		colType: OidNumeric,
+		want:    `{CASEEXPR :casetype 1700 :casecollid 0 :arg {CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 1 0 0 0 0 0 0 0 ]} :args ({CASEWHEN :expr {OPEXPR :opno 96 :opfuncid 65 :opresulttype 16 :opretset false :opcollid 0 :inputcollid 0 :args ({CASETESTEXPR :typeId 23 :typeMod -1 :collation 0} {CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 1 0 0 0 0 0 0 0 ]}) :location -1} :result {FUNCEXPR :funcid 1740 :funcresulttype 1700 :funcretset false :funcvariadic false :funcformat 2 :funccollid 0 :inputcollid 0 :args ({CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 1 0 0 0 0 0 0 0 ]}) :location -1} :location -1}) :defresult {CONST :consttype 1700 :consttypmod -1 :constcollid 0 :constlen -1 :constbyval false :constisnull false :location -1 :constvalue 10 [ 40 0 0 0 -128 -128 2 0 -120 19 ]} :location -1}`,
+	},
+	{
+		name:    "crosstype_numeric_then_int_else",
+		sql:     "CASE WHEN true THEN 2.5 ELSE 1 END",
+		colType: OidNumeric,
+		want:    `{CASEEXPR :casetype 1700 :casecollid 0 :arg <> :args ({CASEWHEN :expr {CONST :consttype 16 :consttypmod -1 :constcollid 0 :constlen 1 :constbyval true :constisnull false :location -1 :constvalue 1 [ 1 0 0 0 0 0 0 0 ]} :result {CONST :consttype 1700 :consttypmod -1 :constcollid 0 :constlen -1 :constbyval false :constisnull false :location -1 :constvalue 10 [ 40 0 0 0 -128 -128 2 0 -120 19 ]} :location -1}) :defresult {FUNCEXPR :funcid 1740 :funcresulttype 1700 :funcretset false :funcvariadic false :funcformat 2 :funccollid 0 :inputcollid 0 :args ({CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 1 0 0 0 0 0 0 0 ]}) :location -1} :location -1}`,
+	},
+	{
+		name:    "crosstype_int8_int4_numeric",
+		sql:     "CASE WHEN false THEN 5000000000 WHEN true THEN 3 ELSE 2.5 END",
+		colType: OidNumeric,
+		want:    `{CASEEXPR :casetype 1700 :casecollid 0 :arg <> :args ({CASEWHEN :expr {CONST :consttype 16 :consttypmod -1 :constcollid 0 :constlen 1 :constbyval true :constisnull false :location -1 :constvalue 1 [ 0 0 0 0 0 0 0 0 ]} :result {FUNCEXPR :funcid 1781 :funcresulttype 1700 :funcretset false :funcvariadic false :funcformat 2 :funccollid 0 :inputcollid 0 :args ({CONST :consttype 20 :consttypmod -1 :constcollid 0 :constlen 8 :constbyval true :constisnull false :location -1 :constvalue 8 [ 0 -14 5 42 1 0 0 0 ]}) :location -1} :location -1} {CASEWHEN :expr {CONST :consttype 16 :consttypmod -1 :constcollid 0 :constlen 1 :constbyval true :constisnull false :location -1 :constvalue 1 [ 1 0 0 0 0 0 0 0 ]} :result {FUNCEXPR :funcid 1740 :funcresulttype 1700 :funcretset false :funcvariadic false :funcformat 2 :funccollid 0 :inputcollid 0 :args ({CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 3 0 0 0 0 0 0 0 ]}) :location -1} :location -1}) :defresult {CONST :consttype 1700 :consttypmod -1 :constcollid 0 :constlen -1 :constbyval false :constisnull false :location -1 :constvalue 10 [ 40 0 0 0 -128 -128 2 0 -120 19 ]} :location -1}`,
+	},
 }
 
 // TestCaseResolveMatchesGolden parses each SQL default and asserts
@@ -161,20 +195,20 @@ func TestCaseResolveRebuildRoundTrip(t *testing.T) {
 	}
 }
 
-// TestCaseDegradesGracefully covers the bounded-subset boundaries: a
-// mixed-result-type CASE (select_common_type coercion — deferred, both in the
-// searched and simple form), and a collatable result type (text — would need a
-// non-zero casecollid). Each must NOT resolve to a canonical node, so the writer
-// keeps SQL text.
+// TestCaseDegradesGracefully covers the bounded-subset boundaries that remain
+// SQL text after sub-slice 13's cross-type coercion landed: a collatable result
+// type (text — would need a non-zero casecollid), and an integer-width-only mix
+// (int4+int8 with no numeric, whose PG common type int8 needs an int→int width
+// cast this subset does not model). Each must NOT resolve to a canonical node, so
+// the writer keeps SQL text.
 func TestCaseDegradesGracefully(t *testing.T) {
 	cases := []struct {
 		name    string
 		sql     string
 		colType uint32
 	}{
-		{"mixed_int_numeric", "CASE WHEN true THEN 1 ELSE 2.5 END", OidNumeric},
 		{"text_result", "CASE WHEN true THEN 'a' ELSE 'b' END", OidText},
-		{"simple_mixed_result", "CASE 1 WHEN 1 THEN 1 ELSE 2.5 END", OidNumeric},
+		{"int4_int8_no_numeric", "CASE WHEN true THEN 1 ELSE 5000000000 END", OidInt8},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

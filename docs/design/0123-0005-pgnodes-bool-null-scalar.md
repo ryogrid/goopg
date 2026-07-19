@@ -615,11 +615,61 @@ as the left arg of the per-WHEN OpExpr; it never stands alone.
   operand set).
 - full `pgnodes` package + `go vet ./internal/pgnodes/` + `go build ./...` clean.
 
+## Sub-slice 13 — `CASE` cross-type result coercion (`select_common_type`)
+
+A `CASE` whose WHEN/ELSE results differ in type previously degraded to SQL text.
+PG's `transformCaseExpr` (`parse_expr.c`) instead runs `select_common_type`
+(`parse_coerce.c`) over the result list (every `WHEN … THEN` result plus the
+`ELSE`, or the synthesized `UNKNOWN` NULL when `ELSE` is omitted), sets
+`casetype` to the winner, then calls `coerce_to_common_type` on each result to
+insert a cast where the result type differs from the common type. The stored
+`adbin`/`ev_action` keeps those casts **un-const-folded** (parse-analysis output,
+not planner output), exactly as sub-slice 4a established for a top-level default.
+
+This slice models the bounded **numeric family** — the common cross-type case:
+
+- `selectCaseCommonType(resultTypes)` (`resolver_expr.go`): all-same → that type;
+  a mix drawn from `{int4,int8,numeric}` that includes `numeric` → `numeric`
+  (reproducing PG's preferred-type walk, where an integer implicitly coerces to
+  numeric but not the reverse, so numeric wins). Any other mix — notably an
+  `int4`+`int8` mix with no numeric, whose PG common type `int8` needs an
+  int→int width cast — returns false so the CASE stays SQL text.
+- `coerceCaseResult(node, from, to)`: identity when `from == to`; an `int4`/`int8`
+  result whose common type is `numeric` is wrapped in the already-existing
+  implicit `int_numeric` cast `FuncExpr` (`wrapIntToNumericCast`: `int4_numeric`
+  1740 / `int8_numeric` 1781, funcformat 2), byte-identical to PG.
+- `resolveCaseExprWith` now resolves all conditions + results **first** (un-coerced,
+  collecting result types), selects the common type, then wraps each result — so
+  the cast can land on a `WHEN` result, on the `ELSE`, or on several arms of a
+  multi-arm CASE, matching PG's per-result coercion.
+
+Rebuild is unchanged: `rebuildCaseExprWith` recurses through each result via the
+existing `rebuildFuncExprWith` → `isImplicitIntToNumericCast` (sub-slice 4a),
+which unwraps the cast back to the inner integer literal — so a mixed CASE is a
+fixed point (`THEN 1 ELSE 2.5` → `int4_numeric(1)` / numeric → rebuilds to
+`THEN 1 ELSE 2.5`).
+
+### Gates (all green)
+
+- `internal/pgnodes/case_test.go` — four live-captured PG18.3 scalar `adbin`
+  goldens through the golden/codec/rebuild-fixed-point loops:
+  `crosstype_int_then_numeric_else` (cast on `WHEN`), `crosstype_simple_int_numeric`
+  (simple form), `crosstype_numeric_then_int_else` (cast on `ELSE`),
+  `crosstype_int8_int4_numeric` (a multi-arm CASE with both an `int8_numeric` and
+  an `int4_numeric` cast). `TestCaseDegradesGracefully` now covers the two
+  boundaries that stay SQL text: a collatable (`text`) result and an
+  integer-width-only (`int4`+`int8`, no numeric) mix.
+- `internal/executor/sys_pg_attrdef_test.go` — the `case-mixed` sibling flips from
+  SQL text to canonical (`casetype 1700`, `FUNCEXPR 1740`).
+- full `pgnodes` package + `go vet ./internal/pgnodes/` + `go build ./...` clean;
+  executor `TestCanonicalAttrdefText`/`TestDefault` green.
+
 ## Deferred
 
-- `select_common_type` cross-type result coercion (a `CASE` whose WHEN/ELSE
-  results are different types) remains in M0123-S4, in both the searched and
-  simple form.
+- Cross-type `CASE` results **outside the int/numeric family** (e.g. `int4`+`int8`
+  with no numeric → common type `int8`, or the float / date-time families) still
+  degrade to SQL text: the needed int→int / cross-family casts are not yet
+  modeled. Sub-slice 13 covers only the numeric family.
 - A simple-form `WHEN` value that needs an implicit coercion to the operand type
   (no exact `operandType = valType` operator — e.g. a numeric operand vs a
   `WHEN` value PG would cast) still degrades to SQL text: PG inserts a cast

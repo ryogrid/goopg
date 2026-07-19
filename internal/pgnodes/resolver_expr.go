@@ -561,9 +561,14 @@ func resolveCaseExpr(e *parser.CaseExpr) (Node, uint32, error) {
 // accepted so the placeholder is never coercion-wrapped; anything else degrades
 // to SQL text.
 //
-// All results (plus any ELSE) must resolve to the SAME non-collatable type —
-// select_common_type cross-type coercion is deferred; a mixed-type or collatable
-// CASE returns ErrUnsupported so the writer degrades to SQL text (all-or-nothing).
+// Result types need NOT be identical: PG's transformCaseExpr runs
+// select_common_type over the WHEN results plus any ELSE, then coerce_to_common_
+// type inserts a cast on each mismatched result. This models the bounded
+// numeric-family subset (see selectCaseCommonType / coerceCaseResult) — a
+// mix drawn from {int4,int8,numeric} that includes numeric folds to numeric,
+// with each integer result wrapped in the implicit int_numeric cast FuncExpr.
+// Any other mix, or a collatable common type, returns ErrUnsupported so the
+// writer degrades to SQL text (all-or-nothing).
 func resolveCaseExprWith(e *parser.CaseExpr, rec scopedResolve) (Node, uint32, error) {
 	if len(e.Whens) == 0 {
 		return nil, 0, ErrUnsupported
@@ -588,10 +593,16 @@ func resolveCaseExprWith(e *parser.CaseExpr, rec scopedResolve) (Node, uint32, e
 		arg, argType = aNode, aType
 		testExpr = &CaseTestExpr{Typeid: aType, Typemod: tmod, Collation: collid}
 	}
+	// Resolve all conditions + results first (un-coerced), collecting the result
+	// types so the common type can be selected the way transformCaseExpr does.
+	type arm struct {
+		cond    Node
+		res     Node
+		resType uint32
+	}
 	var (
-		args     []Node
-		casetype uint32
-		seeded   bool
+		arms        []arm
+		resultTypes []uint32
 	)
 	for _, w := range e.Whens {
 		cond, err := resolveCaseWhenCond(w.When, testExpr, argType, rec)
@@ -602,31 +613,49 @@ func resolveCaseExprWith(e *parser.CaseExpr, rec scopedResolve) (Node, uint32, e
 		if err != nil {
 			return nil, 0, err
 		}
-		if !seeded {
-			casetype, seeded = resType, true
-		} else if resType != casetype {
-			return nil, 0, ErrUnsupported // mixed result types — deferred
-		}
-		args = append(args, &CaseWhen{Expr: cond, Result: res, Location: -1})
+		arms = append(arms, arm{cond, res, resType})
+		resultTypes = append(resultTypes, resType)
 	}
-
-	var defresult Node
+	var (
+		elseRes  Node
+		elseType uint32
+		hasElse  bool
+	)
 	if e.Else != nil {
 		res, resType, err := rec(e.Else, 0)
 		if err != nil {
 			return nil, 0, err
 		}
-		if resType != casetype {
-			return nil, 0, ErrUnsupported // mixed result types — deferred
-		}
-		defresult = res
+		elseRes, elseType, hasElse = res, resType, true
+		resultTypes = append(resultTypes, resType)
 	}
 
+	casetype, ok := selectCaseCommonType(resultTypes)
+	if !ok {
+		return nil, 0, ErrUnsupported // unmodeled cross-type mix — deferred
+	}
 	constlen, constbyval, ok := caseTypeMeta(casetype)
 	if !ok {
 		return nil, 0, ErrUnsupported // unmodeled or collatable casetype
 	}
-	if defresult == nil {
+
+	// coerce_to_common_type: wrap each result in the cast to casetype, if needed.
+	args := make([]Node, 0, len(arms))
+	for _, a := range arms {
+		res, err := coerceCaseResult(a.res, a.resType, casetype)
+		if err != nil {
+			return nil, 0, err
+		}
+		args = append(args, &CaseWhen{Expr: a.cond, Result: res, Location: -1})
+	}
+	var defresult Node
+	if hasElse {
+		res, err := coerceCaseResult(elseRes, elseType, casetype)
+		if err != nil {
+			return nil, 0, err
+		}
+		defresult = res
+	} else {
 		// ELSE omitted → PG synthesizes a typed NULL Const of casetype.
 		defresult = newNullConst(casetype, constlen, constbyval)
 	}
@@ -634,6 +663,63 @@ func resolveCaseExprWith(e *parser.CaseExpr, rec scopedResolve) (Node, uint32, e
 		Casetype: casetype, Casecollid: 0, Arg: arg,
 		Args: args, Defresult: defresult, Location: -1,
 	}, casetype, nil
+}
+
+// selectCaseCommonType models the subset of PG's select_common_type
+// (parse_coerce.c) that this canonicalizer supports for CASE results. When every
+// result already shares one type, that type is returned unchanged. A mix is only
+// modeled for the numeric family: the types must all be drawn from
+// {int4,int8,numeric} AND include at least one numeric, in which case numeric is
+// the common type — this reproduces PG's preferred-type walk, where an integer
+// implicitly coerces to numeric but not the reverse, so numeric wins. Any other
+// mix (e.g. int4+int8 with no numeric, whose PG common type int8 needs an
+// int→int width cast this subset does not model) returns false so the CASE
+// degrades to SQL text.
+func selectCaseCommonType(types []uint32) (uint32, bool) {
+	if len(types) == 0 {
+		return 0, false
+	}
+	allSame := true
+	for _, t := range types[1:] {
+		if t != types[0] {
+			allSame = false
+			break
+		}
+	}
+	if allSame {
+		return types[0], true
+	}
+	hasNumeric := false
+	for _, t := range types {
+		switch t {
+		case OidInt4, OidInt8:
+		case OidNumeric:
+			hasNumeric = true
+		default:
+			return 0, false
+		}
+	}
+	if hasNumeric {
+		return OidNumeric, true
+	}
+	return 0, false
+}
+
+// coerceCaseResult applies PG's coerce_to_common_type to one CASE result. It is
+// the identity when the result already has the common type; an int4/int8 result
+// whose common type is numeric is wrapped in the implicit int_numeric cast
+// FuncExpr (int4_numeric 1740 / int8_numeric 1781), byte-identical to PG's
+// un-const-folded stored tree. No other coercion is modeled (selectCaseCommonType
+// only yields a mismatch inside the int/numeric family, so this stays total for
+// the accepted subset); anything else returns ErrUnsupported.
+func coerceCaseResult(node Node, fromType, toType uint32) (Node, error) {
+	if fromType == toType {
+		return node, nil
+	}
+	if toType == OidNumeric && (fromType == OidInt4 || fromType == OidInt8) {
+		return wrapIntToNumericCast(node, fromType), nil
+	}
+	return nil, ErrUnsupported
 }
 
 // resolveCaseWhenCond resolves one WHEN condition. In the searched form

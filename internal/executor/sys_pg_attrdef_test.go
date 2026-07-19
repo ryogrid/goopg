@@ -55,9 +55,10 @@ func TestCanonicalAttrdefText(t *testing.T) {
 		{"case-no-else", col("int4", "CASE WHEN true THEN 1 END"), true, []string{"CASEEXPR", "constisnull true"}},
 		// SQL-text fallback: type mismatch or a node outside the scalar subset.
 		{"smallint-lit", col("int2", "5"), false, []string{"5"}},
-		// A mixed-result-type CASE (int vs numeric) needs select_common_type
-		// coercion (deferred) → SQL text.
-		{"case-mixed", col("numeric", "CASE WHEN true THEN 1 ELSE 2.5 END"), false, []string{"CASE"}},
+		// A mixed-result-type CASE (int vs numeric) now folds via select_common_
+		// type: casetype numeric (1700), the int result wrapped in the implicit
+		// int4_numeric cast FuncExpr (funcid 1740). M0123-S4 sub-slice 13.
+		{"case-mixed", col("numeric", "CASE WHEN true THEN 1 ELSE 2.5 END"), true, []string{"CASEEXPR", "casetype 1700", "FUNCEXPR", "1740"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

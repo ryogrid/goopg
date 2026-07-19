@@ -1149,9 +1149,24 @@ existing encoder, `constcollid=100` / `consttypmod=n+4`.
       `internal/pgnodes/distinct_test.go` (5 live PG18.3 adbin goldens: int/NOT-
       wrapper/text-collid100/numeric/bool) + executor default/attrdef siblings
       green. Design 0123-0005 §"Sub-slice 9".
-      REMAINING: DISTINCTEXPR view-query wiring (sub-slice 10, 2 dispatch arms;
-      view ev_action golden already captured); `IS DISTINCT FROM NULL`→NullTest
-      special case (make_nulltest_from_distinct); CASE simple form (`CASE operand
-      WHEN …`, needs CaseTestExpr) + cross-type result coercion; operator-driven
-      view-qual coercion (unblocks int2/timestamptz literals in view quals);
-      byte-diff oracle.
+      SUB-SLICE 10 LANDED (2026-07-19): DISTINCTEXPR view-query wiring.
+      SUB-SLICE 11 LANDED (2026-07-19): `IS [NOT] DISTINCT FROM NULL`→NullTest
+      rewrite (make_nulltest_from_distinct).
+      SUB-SLICE 12 LANDED (2026-07-19): CASE simple form (`CASE operand WHEN …`)
+      via a CaseTestExpr placeholder.
+      SUB-SLICE 13 LANDED (2026-07-19): CASE **cross-type result coercion**
+      (`select_common_type`) — a mixed-result CASE (searched OR simple) now folds
+      via the numeric-family common type: types drawn from {int4,int8,numeric}
+      that include numeric → casetype numeric, each integer result wrapped in the
+      implicit int4_numeric(1740)/int8_numeric(1781) cast FuncExpr, byte-identical
+      to PG18.3 (un-const-folded). New selectCaseCommonType/coerceCaseResult in
+      resolver_expr.go; resolve now collects all results first, selects the common
+      type, then coerces each. Rebuild reuses the sub-slice-4a int→numeric cast
+      unwrap → fixed point. Gate case_test.go (4 live goldens: cast-on-WHEN,
+      simple-form, cast-on-ELSE, multi-arm int8+int4); sibling sys_pg_attrdef_test
+      case-mixed flipped canonical; degrade test now covers int4+int8-no-numeric +
+      text. Design 0123-0005 §"Sub-slice 13".
+      REMAINING: cross-FAMILY CASE result coercion (int-width-only int4+int8→int8,
+      float / date-time families); simple-form WHEN value needing implicit cast to
+      operand type; operator-driven view-qual coercion (unblocks int2/timestamptz
+      literals in view quals); byte-diff oracle.
