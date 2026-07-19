@@ -37,6 +37,10 @@ func outNode(sb *strings.Builder, n Node) {
 		outCoerceViaIO(sb, v)
 	case *SQLValueFunction:
 		outSQLValueFunction(sb, v)
+	case *BoolExpr:
+		outBoolExpr(sb, v)
+	case *NullTest:
+		outNullTest(sb, v)
 	case *Query:
 		outQuery(sb, v)
 	case *RangeTblEntry:
@@ -226,4 +230,41 @@ func outSQLValueFunction(sb *strings.Builder, s *SQLValueFunction) {
 	wOid(sb, "type", s.Type)
 	wInt(sb, "typmod", s.Typmod)
 	wLoc(sb, "location", s.Location)
+}
+
+// boolopToken maps a BoolExprType to the bare token _outBoolExpr writes for the
+// :boolop field ("and"/"or"/"not" — the do-it-yourself enum representation in
+// outfuncs.c). An out-of-range value panics: it can only arise from a corrupt IR
+// (the resolver never produces one), and a silent wrong token would desync Read.
+func boolopToken(op int32) string {
+	switch op {
+	case BoolExprAnd:
+		return "and"
+	case BoolExprOr:
+		return "or"
+	case BoolExprNot:
+		return "not"
+	default:
+		panic(fmt.Sprintf("pgnodes: outBoolExpr: bad boolop %d", op))
+	}
+}
+
+// outBoolExpr mirrors _outBoolExpr (a custom_read_write node in outfuncs.c):
+// boolop (as a bare token, NOT an integer), then args, then location.
+func outBoolExpr(sb *strings.Builder, b *BoolExpr) {
+	sb.WriteString("BOOLEXPR")
+	sb.WriteString(" :boolop ")
+	sb.WriteString(boolopToken(b.Boolop))
+	wNodeList(sb, "args", b.Args)
+	wLoc(sb, "location", b.Location)
+}
+
+// outNullTest mirrors _outNullTest (generated outfuncs.funcs.c): arg,
+// nulltesttype, argisrow, location.
+func outNullTest(sb *strings.Builder, n *NullTest) {
+	sb.WriteString("NULLTEST")
+	wNode(sb, "arg", n.Arg)
+	wInt(sb, "nulltesttype", n.NullTestType)
+	wBool(sb, "argisrow", n.ArgIsRow)
+	wLoc(sb, "location", n.Location)
 }

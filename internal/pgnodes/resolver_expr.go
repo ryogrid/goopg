@@ -84,6 +84,9 @@ func resolve(e parser.Expr, expected uint32) (Node, uint32, error) {
 	case *parser.IntegerConst:
 		return resolveIntLiteral(v.Value, expected)
 
+	case *parser.BooleanConst:
+		return NewBoolConst(v.Value), OidBool, nil
+
 	case *parser.StringConst:
 		// A bare string literal is PG type "unknown"; in a text context it is
 		// text. Only the text (or unknown/any) context is supported here.
@@ -91,6 +94,9 @@ func resolve(e parser.Expr, expected uint32) (Node, uint32, error) {
 			return NewTextConst(v.Value), OidText, nil
 		}
 		return nil, 0, ErrUnsupported
+
+	case *parser.IsNullExpr:
+		return resolveNullTest(v)
 
 	case *parser.UnaryOp:
 		switch v.Op {
@@ -102,6 +108,9 @@ func resolve(e parser.Expr, expected uint32) (Node, uint32, error) {
 				return resolveIntLiteral(-lit.Value, expected)
 			}
 			return nil, 0, ErrUnsupported
+		case parser.OpNot:
+			// NOT x → a single-arg BOOLEXPR (makeNotExpr; no flattening).
+			return resolveBoolNot(v.Operand)
 		default:
 			return nil, 0, ErrUnsupported
 		}
@@ -227,6 +236,12 @@ func resolveIntLiteral(v int64, expected uint32) (Node, uint32, error) {
 // only collatable type this subset emits is text, so inputcollid/opcollid are
 // DEFAULT_COLLATION_OID (100) when a text operand/result is involved, else 0.
 func resolveBinaryOp(b *parser.BinaryOp) (Node, uint32, error) {
+	switch b.Op {
+	case parser.OpAnd:
+		return resolveBoolBinary(b, BoolExprAnd)
+	case parser.OpOr:
+		return resolveBoolBinary(b, BoolExprOr)
+	}
 	lNode, lType, err := resolve(b.Left, 0)
 	if err != nil {
 		return nil, 0, err
@@ -236,6 +251,56 @@ func resolveBinaryOp(b *parser.BinaryOp) (Node, uint32, error) {
 		return nil, 0, err
 	}
 	return buildOpExpr(lNode, lType, rNode, rType, b.Op.String())
+}
+
+// resolveBoolBinary resolves an AND/OR operator to a BOOLEXPR, reproducing PG's
+// makeAndExpr/makeOrExpr flattening: `a AND b AND c` parses left-associatively
+// as `(a AND b) AND c`, and PG collapses that into ONE BoolExpr with three args
+// (it appends the right operand to a same-boolop left BoolExpr). We resolve the
+// left operand first and, when it already resolved to a BoolExpr of the same
+// boolop (the left-nested spine), append the right operand to its args instead
+// of nesting — otherwise emit a two-arg BoolExpr. A parenthesised right side
+// (`a AND (b AND c)`) is a distinct parse tree and stays nested, exactly as PG
+// keeps it nested. The result type is always bool.
+func resolveBoolBinary(b *parser.BinaryOp, boolop int32) (Node, uint32, error) {
+	lNode, _, err := resolve(b.Left, OidBool)
+	if err != nil {
+		return nil, 0, err
+	}
+	rNode, _, err := resolve(b.Right, OidBool)
+	if err != nil {
+		return nil, 0, err
+	}
+	if be, ok := lNode.(*BoolExpr); ok && be.Boolop == boolop {
+		be.Args = append(be.Args, rNode)
+		return be, OidBool, nil
+	}
+	return &BoolExpr{Boolop: boolop, Args: []Node{lNode, rNode}, Location: -1}, OidBool, nil
+}
+
+// resolveBoolNot resolves `NOT x` to a single-arg NOT BOOLEXPR (makeNotExpr does
+// no flattening). Result type bool.
+func resolveBoolNot(operand parser.Expr) (Node, uint32, error) {
+	n, _, err := resolve(operand, OidBool)
+	if err != nil {
+		return nil, 0, err
+	}
+	return &BoolExpr{Boolop: BoolExprNot, Args: []Node{n}, Location: -1}, OidBool, nil
+}
+
+// resolveNullTest resolves `x IS [NOT] NULL` to a NULLTEST. The argument
+// resolves in an unknown context (IS NULL applies to any type); argisrow is
+// false for the scalar subset. Result type bool.
+func resolveNullTest(e *parser.IsNullExpr) (Node, uint32, error) {
+	arg, _, err := resolve(e.Operand, 0)
+	if err != nil {
+		return nil, 0, err
+	}
+	ntt := IsNull
+	if e.Negated {
+		ntt = IsNotNull
+	}
+	return &NullTest{Arg: arg, NullTestType: ntt, ArgIsRow: false, Location: -1}, OidBool, nil
 }
 
 // buildOpExpr looks the operator up by spelling + already-resolved operand type

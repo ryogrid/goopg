@@ -106,6 +106,10 @@ func readNode(t *tokenizer) (Node, error) {
 		n, err = readCoerceViaIO(t)
 	case "SQLVALUEFUNCTION":
 		n, err = readSQLValueFunction(t)
+	case "BOOLEXPR":
+		n, err = readBoolExpr(t)
+	case "NULLTEST":
+		n, err = readNullTest(t)
 	case "QUERY":
 		n, err = readQuery(t)
 	case "RANGETBLENTRY":
@@ -405,6 +409,56 @@ func readCoerceViaIO(t *tokenizer) (*CoerceViaIO, error) {
 		return nil, err
 	}
 	return c, nil
+}
+
+// readBoolExpr mirrors _readBoolExpr (a custom_read_write node): the :boolop
+// field is a bare token ("and"/"or"/"not"), not an integer, so it is parsed by
+// hand before the generated args/location fields.
+func readBoolExpr(t *tokenizer) (*BoolExpr, error) {
+	b := &BoolExpr{}
+	t.skipField() // :boolop
+	tok, ok := t.next()
+	if !ok {
+		return nil, fmt.Errorf("pgnodes: expected boolop token")
+	}
+	switch tok {
+	case "and":
+		b.Boolop = BoolExprAnd
+	case "or":
+		b.Boolop = BoolExprOr
+	case "not":
+		b.Boolop = BoolExprNot
+	default:
+		return nil, fmt.Errorf("pgnodes: unrecognized boolop %q", tok)
+	}
+	var err error
+	if b.Args, err = readNodeListField(t); err != nil {
+		return nil, err
+	}
+	if b.Location, err = readInt32(t); err != nil {
+		return nil, err
+	}
+	return b, nil
+}
+
+// readNullTest mirrors the generated _readNullTest: arg, nulltesttype, argisrow,
+// location.
+func readNullTest(t *tokenizer) (*NullTest, error) {
+	n := &NullTest{}
+	var err error
+	if n.Arg, err = readNodeField(t); err != nil {
+		return nil, err
+	}
+	if n.NullTestType, err = readInt32(t); err != nil {
+		return nil, err
+	}
+	if n.ArgIsRow, err = readBool(t); err != nil {
+		return nil, err
+	}
+	if n.Location, err = readInt32(t); err != nil {
+		return nil, err
+	}
+	return n, nil
 }
 
 func readSQLValueFunction(t *tokenizer) (*SQLValueFunction, error) {

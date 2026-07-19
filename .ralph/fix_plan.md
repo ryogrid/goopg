@@ -5754,3 +5754,18 @@ existing encoder, `constcollid=100` / `consttypmod=n+4`.
       byte-diff oracle gate (goopg's emitted `ev_action`/`adbin` `==` real-PG18's
       for the identical DDL, `:location` normalized). Decompose into sub-slices;
       each its own gated commit.
+      SUB-SLICE 1 LANDED (2026-07-19): canonical **`BoolExpr` (AND/OR/NOT) +
+      `NullTest` (IS [NOT] NULL)** scalar nodes — codec + resolver + rebuild in
+      one commit (encode↔decode↔resolve↔rebuild). `bool`-typed column DEFAULTs
+      (`bool DEFAULT (a IS NOT NULL)`, `DEFAULT (x AND y)`) now emit canonical
+      `pg_attrdef.adbin` via the already-wired `ResolveForColumn`→
+      `canonicalAttrdefText` path (was SQL-text fallback). Reproduced PG's
+      `makeAndExpr` n-ary flattening (`(a AND b) AND c` → one 3-arg BoolExpr;
+      parenthesised right stays nested) + the exact left-nested rebuild inverse
+      (fixed point). `BoolExpr` custom_read_write `:boolop` bare token
+      (and/or/not). Gate `internal/pgnodes/bool_null_test.go` (green): 6
+      live-captured PG18.3 adbin goldens byte-for-byte + Read round-trip +
+      resolve→Rebuild→re-resolve DeepEqual + nested-right + bad-boolop reject.
+      Design `0123-0005-pgnodes-bool-null-scalar.md`. REMAINING: view-query
+      (`resolver_query.go`) BoolExpr/NullTest qual wiring; numeric/timestamptz
+      datums; `CASE`/`BooleanTest`/`IS DISTINCT FROM`; the byte-diff oracle gate.

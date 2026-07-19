@@ -110,3 +110,44 @@ type SQLValueFunction struct {
 }
 
 func (*SQLValueFunction) nodeTag() string { return "SQLVALUEFUNCTION" }
+
+// BoolExprType enum values mirror postgres/src/include/nodes/primnodes.h
+// (AND_EXPR, OR_EXPR, NOT_EXPR). _outBoolExpr writes these as the bare tokens
+// "and"/"or"/"not" (a do-it-yourself enum representation), NOT as integers.
+const (
+	BoolExprAnd int32 = iota // AND_EXPR
+	BoolExprOr               // OR_EXPR
+	BoolExprNot              // NOT_EXPR
+)
+
+// BoolExpr mirrors _outBoolExpr in outfuncs.c (a custom_read_write node). AND/OR
+// are n-ary: PG's makeAndExpr/makeOrExpr flatten a left-nested chain of the same
+// operator (`a AND b AND c`) into ONE BoolExpr with three args, so the resolver
+// reproduces that flattening. NOT is always a single-arg BoolExpr.
+type BoolExpr struct {
+	Boolop   int32  // boolop (BoolExprType: 0=and, 1=or, 2=not)
+	Args     []Node // args
+	Location int32  // location
+}
+
+func (*BoolExpr) nodeTag() string { return "BOOLEXPR" }
+
+// NullTestType enum values mirror postgres/src/include/nodes/primnodes.h
+// (IS_NULL, IS_NOT_NULL).
+const (
+	IsNull    int32 = iota // IS_NULL
+	IsNotNull              // IS_NOT_NULL
+)
+
+// NullTest mirrors _outNullTest (generated outfuncs.funcs.c): arg, nulltesttype,
+// argisrow, location. The result is always boolean. argisrow is false for the
+// scalar subset (a row-valued IS NULL sets it true, which this slice does not
+// emit).
+type NullTest struct {
+	Arg          Node  // arg
+	NullTestType int32 // nulltesttype (0=IS NULL, 1=IS NOT NULL)
+	ArgIsRow     bool  // argisrow
+	Location     int32 // location
+}
+
+func (*NullTest) nodeTag() string { return "NULLTEST" }

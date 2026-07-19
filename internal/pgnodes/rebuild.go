@@ -31,9 +31,63 @@ func Rebuild(n Node) (parser.Expr, error) {
 		return rebuildOpExpr(v)
 	case *FuncExpr:
 		return rebuildFuncExpr(v)
+	case *BoolExpr:
+		return rebuildBoolExpr(v)
+	case *NullTest:
+		return rebuildNullTest(v)
 	default:
 		return nil, fmt.Errorf("pgnodes: Rebuild: unsupported node %T", n)
 	}
+}
+
+// rebuildBoolExpr reconstructs an AND/OR/NOT BOOLEXPR into goopg's AST. goopg has
+// no n-ary boolean node, so an n-arg AND/OR folds back into a LEFT-nested chain
+// of BinaryOps (`[a b c]` → `(a AND b) AND c`) — the exact tree PG's makeAndExpr
+// flattened on the way in, so resolve→Rebuild→re-resolve is a fixed point. NOT
+// is a single-operand UnaryOp.
+func rebuildBoolExpr(b *BoolExpr) (parser.Expr, error) {
+	switch b.Boolop {
+	case BoolExprNot:
+		if len(b.Args) != 1 {
+			return nil, fmt.Errorf("pgnodes: Rebuild: NOT BoolExpr with %d args (want 1)", len(b.Args))
+		}
+		operand, err := Rebuild(b.Args[0])
+		if err != nil {
+			return nil, err
+		}
+		return &parser.UnaryOp{Op: parser.OpNot, Operand: operand}, nil
+	case BoolExprAnd, BoolExprOr:
+		op := parser.OpAnd
+		if b.Boolop == BoolExprOr {
+			op = parser.OpOr
+		}
+		if len(b.Args) < 2 {
+			return nil, fmt.Errorf("pgnodes: Rebuild: AND/OR BoolExpr with %d args (want >=2)", len(b.Args))
+		}
+		acc, err := Rebuild(b.Args[0])
+		if err != nil {
+			return nil, err
+		}
+		for _, a := range b.Args[1:] {
+			r, err := Rebuild(a)
+			if err != nil {
+				return nil, err
+			}
+			acc = &parser.BinaryOp{Op: op, Left: acc, Right: r}
+		}
+		return acc, nil
+	default:
+		return nil, fmt.Errorf("pgnodes: Rebuild: bad boolop %d", b.Boolop)
+	}
+}
+
+// rebuildNullTest reconstructs `x IS [NOT] NULL`.
+func rebuildNullTest(nt *NullTest) (parser.Expr, error) {
+	operand, err := Rebuild(nt.Arg)
+	if err != nil {
+		return nil, err
+	}
+	return &parser.IsNullExpr{Operand: operand, Negated: nt.NullTestType == IsNotNull}, nil
 }
 
 // rebuildFuncExpr reconstructs a plain function call whose arguments are scalar
@@ -80,6 +134,9 @@ func rebuildConst(c *Const) (parser.Expr, error) {
 			return &parser.UnaryOp{Op: parser.OpUnaryNeg, Operand: &parser.IntegerConst{Value: -v}}, nil
 		}
 		return &parser.IntegerConst{Value: v}, nil
+	case OidBool:
+		// The by-value word is 0 (false) or 1 (true); see datum.go:NewBoolConst.
+		return &parser.BooleanConst{Value: int64FromByvalWord(c.Datum) != 0}, nil
 	case OidText:
 		return &parser.StringConst{Value: textFromVarlena(c.Datum)}, nil
 	default:
