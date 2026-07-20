@@ -382,6 +382,15 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 			return Datum{}, &ExecError{Code: "XX000", Pos: x.Pos(), Message: fmt.Sprintf("outer column ref %s/idx=%d out of range (width=%d)", x.Name, x.Index, len(outer))}
 		}
 		return outer[x.Index], nil
+	case *planner.ExecParamRef:
+		// PARAM_EXEC slot read (D4.1). The enclosing sublink's eval
+		// site bound the slot via bindSubPlanParams before running
+		// this plan; position-independent, no scope stack involved.
+		// An unset read is a lowering bug, never a NULL.
+		if ctx == nil || x.ID < 0 || x.ID >= len(ctx.ParamExec) || !ctx.ParamSet[x.ID] {
+			return Datum{}, &ExecError{Code: "XX000", Pos: x.Pos(), Message: fmt.Sprintf("SubPlan parameter $%d read before assignment", x.ID)}
+		}
+		return ctx.ParamExec[x.ID], nil
 	case *planner.CaseExpr:
 		return evalCaseExpr(x, slotToRow(slot), ctx)
 	case *planner.SubqueryExpr:
@@ -6688,6 +6697,29 @@ func evalRowFuncCallVsSubqueryExpr(op parser.OpCode, rowArgs []planner.Expr, sqO
 	return NewBoolDatum(op == parser.OpEq), nil
 }
 
+// bindSubPlanParams evaluates a lowered sublink's Args against the
+// current outer row, writes them into their ParamExec slots, and
+// returns the projected cache key: the sublink's identity plus the
+// bound VALUES — never the full outer row. Distinct outer rows that
+// agree on the correlation columns therefore share a cache entry, and
+// two sublink sites can never collide (the key embeds the expr
+// pointer), which closes the correlated collectInValues collision
+// hazard (ch.04 §2) for every lowered sublink. D4.1/D4.4.
+func bindSubPlanParams(exprPtr any, parParam []int, args []planner.Expr, row Row, ctx *Context) (string, error) {
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "%p", exprPtr)
+	for i, a := range args {
+		v, err := evalExpr(a, row, ctx)
+		if err != nil {
+			return "", err
+		}
+		ctx.SetParamExec(parParam[i], v)
+		sb.WriteByte(0x1f)
+		sb.WriteString(datumKey(v))
+	}
+	return sb.String(), nil
+}
+
 // collectInValues returns the inner set for `IN (...)`. When
 // the source is a subquery, drains it; the subquery must have
 // exactly one column. Otherwise evaluates the value list.
@@ -6713,9 +6745,22 @@ func collectInValues(x *planner.InExpr, row Row, ctx *Context) ([]Datum, error) 
 		// a single execution.
 		stat := ctx.subPlanStat(x)
 		stat.Calls++
-		cacheKey := subqueryCacheKey(row)
-		if x.IsNonCorrelated {
+		lowered := len(x.ParParam) > 0
+		var cacheKey string
+		switch {
+		case lowered:
+			// D4.1: bind the params first — the projected key derives
+			// from the bound values, and the inner plan reads the
+			// slots instead of the OuterRows stack.
+			var err error
+			cacheKey, err = bindSubPlanParams(x, x.ParParam, x.Args, row, ctx)
+			if err != nil {
+				return nil, err
+			}
+		case x.IsNonCorrelated:
 			cacheKey = nonCorrelatedCacheKey(x)
+		default:
+			cacheKey = subqueryCacheKey(row)
 		}
 		if ctx.SubqueryCache != nil {
 			if ctx.SubqueryCacheScope != len(ctx.OuterRows) {
@@ -6729,10 +6774,14 @@ func collectInValues(x *planner.InExpr, row Row, ctx *Context) ([]Datum, error) 
 		}
 		stat.CacheMisses++
 		stat.Rebuilds++
-		// Push the outer row so correlated refs inside the
-		// IN-subquery resolve against it. Pop on return.
-		ctx.OuterRows = append(ctx.OuterRows, row)
-		defer func() { ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1] }()
+		if !lowered {
+			// Push the outer row so correlated refs inside the
+			// IN-subquery resolve against it. Pop on return. A
+			// lowered subquery has no such refs — its correlation
+			// arrives through the ParamExec slots bound above.
+			ctx.OuterRows = append(ctx.OuterRows, row)
+			defer func() { ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1] }()
+		}
 		op, err := Build(x.Plan)
 		if err != nil {
 			return nil, err
@@ -6813,11 +6862,23 @@ func evalExistsExpr(x *planner.ExistsExpr, row Row, ctx *Context) (Datum, error)
 			return Datum{}, &ExecError{Code: "57014", Message: "canceling statement due to user request"}
 		}
 	}
-	// Push the outer row so correlated column refs in the inner
-	// plan can resolve against it. Pop on return regardless of
-	// outcome.
-	ctx.OuterRows = append(ctx.OuterRows, row)
-	defer func() { ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1] }()
+	if len(x.ParParam) > 0 {
+		// D4.1 lowered path: bind the correlation params; the inner
+		// plan reads ParamExec slots, so no OuterRows push. The
+		// projected key is discarded — correlated EXISTS deliberately
+		// has NO result cache yet: caching it would collapse per-row
+		// re-execution of volatile inners (matrix M13) before the
+		// Stage-9 cacheability gate exists to forbid that.
+		if _, err := bindSubPlanParams(x, x.ParParam, x.Args, row, ctx); err != nil {
+			return Datum{}, err
+		}
+	} else {
+		// Push the outer row so correlated column refs in the inner
+		// plan can resolve against it. Pop on return regardless of
+		// outcome.
+		ctx.OuterRows = append(ctx.OuterRows, row)
+		defer func() { ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1] }()
+	}
 
 	stat := ctx.subPlanStat(x)
 	stat.Calls++
@@ -6899,8 +6960,21 @@ func evalSubquery(x *planner.SubqueryExpr, row Row, ctx *Context) (Datum, error)
 			return Datum{}, &ExecError{Code: "57014", Message: "canceling statement due to user request"}
 		}
 	}
-	ctx.OuterRows = append(ctx.OuterRows, row)
-	defer func() { ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1] }()
+	lowered := len(x.ParParam) > 0
+	var loweredKey string
+	if lowered {
+		// D4.1: bind the correlation params before any inner-plan
+		// path runs — both the CorrSubqOps rescan below and a full
+		// rebuild read the slots via ExecParamRef.
+		var bindErr error
+		loweredKey, bindErr = bindSubPlanParams(x, x.ParParam, x.Args, row, ctx)
+		if bindErr != nil {
+			return Datum{}, bindErr
+		}
+	} else {
+		ctx.OuterRows = append(ctx.OuterRows, row)
+		defer func() { ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1] }()
+	}
 
 	stat := ctx.subPlanStat(x)
 	stat.Calls++
@@ -6915,11 +6989,16 @@ func evalSubquery(x *planner.SubqueryExpr, row Row, ctx *Context) (Datum, error)
 	}
 
 	// Check cache for scalar subquery results. For non-correlated
-	// subqueries (M0058-0001), use a constant cache key.
+	// subqueries (M0058-0001), use a constant cache key. Lowered
+	// correlated subqueries key on the bound param VALUES (projected
+	// key, D4.4) instead of the full outer row.
 	var cacheKey string
-	if x.IsNonCorrelated {
+	switch {
+	case lowered:
+		cacheKey = loweredKey
+	case x.IsNonCorrelated:
 		cacheKey = nonCorrelatedCacheKey(x)
-	} else {
+	default:
 		cacheKey = fmt.Sprintf("%p|%s", x, subqueryCacheKey(row))
 	}
 	if ctx.SubqueryCache != nil {
@@ -7071,7 +7150,7 @@ func planIsIndexScanBased(n planner.Node) bool {
 type corrSubqHashInfo struct {
 	scan       *planner.SeqScan        // inner table to scan
 	scanColIdx int                     // index of the join key column in SeqScan output
-	outerRef   *planner.OuterColumnRef // outer column reference for join key lookup
+	outerRef   planner.Expr // outer join-key value: OuterColumnRef or (lowered) ExecParamRef
 	projExpr   planner.Expr            // project expression to evaluate for result
 }
 
@@ -7104,21 +7183,27 @@ func extractCorrSubqHashInfo(n planner.Node) (corrSubqHashInfo, bool) {
 	if !ok {
 		return corrSubqHashInfo{}, false
 	}
-	// Filter predicate must be: ColumnRef = OuterColumnRef (or reversed).
+	// Filter predicate must be: ColumnRef = <outer value> (or reversed),
+	// where the outer value is an OuterColumnRef (stack path) or, after
+	// D4.1 lowering, an ExecParamRef reading a bound ParamExec slot —
+	// both evaluate position-independently at lookup time.
 	bop, ok := filterPred.(*planner.BinaryOp)
 	if !ok || bop.Op != parser.OpEq {
 		return corrSubqHashInfo{}, false
 	}
+	isOuterVal := func(e planner.Expr) bool {
+		switch e.(type) {
+		case *planner.OuterColumnRef, *planner.ExecParamRef:
+			return true
+		}
+		return false
+	}
 	var innerCol *planner.ColumnRef
-	var outerRef *planner.OuterColumnRef
-	if c, ok2 := bop.Left.(*planner.ColumnRef); ok2 {
-		if o, ok3 := bop.Right.(*planner.OuterColumnRef); ok3 {
-			innerCol, outerRef = c, o
-		}
-	} else if c, ok2 := bop.Right.(*planner.ColumnRef); ok2 {
-		if o, ok3 := bop.Left.(*planner.OuterColumnRef); ok3 {
-			innerCol, outerRef = c, o
-		}
+	var outerRef planner.Expr
+	if c, ok2 := bop.Left.(*planner.ColumnRef); ok2 && isOuterVal(bop.Right) {
+		innerCol, outerRef = c, bop.Right
+	} else if c, ok2 := bop.Right.(*planner.ColumnRef); ok2 && isOuterVal(bop.Left) {
+		innerCol, outerRef = c, bop.Left
 	}
 	if innerCol == nil || outerRef == nil {
 		return corrSubqHashInfo{}, false

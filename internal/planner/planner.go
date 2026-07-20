@@ -80,7 +80,21 @@ func ResolveIndexPredicate(predicate parser.Expr, tbl *catalog.Table) (Expr, err
 	return resolveExpr(predicate, ctx)
 }
 
+// Plan is the public planning entry: dispatch to the per-statement
+// planner, then run the PARAM_EXEC lowering pass (D4.1,
+// subplan_lower.go) exactly once over the finished tree — after every
+// rewrite that can remove or reshape sublinks, and with one flat
+// param-slot space for the whole statement (nested planSelect calls
+// must not each run it, or slot IDs would collide across levels).
 func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
+	node, err := planStmt(stmt, cat)
+	if err != nil {
+		return nil, err
+	}
+	return lowerSubPlanParams(node), nil
+}
+
+func planStmt(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 	switch s := stmt.(type) {
 	case *parser.SelectStmt:
 		// Rewrite `(srf(...)).*` target-list indirection-stars into

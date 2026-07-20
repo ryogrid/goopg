@@ -245,6 +245,13 @@ type InExpr struct {
 	Plan            Node // populated when the source is a subquery
 	List            []Expr
 	IsNonCorrelated bool
+	// ParParam/Args: PARAM_EXEC lowering (D4.1, subplan_lower.go).
+	// Args[i] is evaluated against the current outer row and written to
+	// ParamExec slot ParParam[i] before Plan runs; Plan then reads the
+	// slots via ExecParamRef instead of walking ctx.OuterRows. Empty =
+	// non-correlated, or an unlowered shape still on the stack path.
+	ParParam []int
+	Args     []Expr
 }
 
 func (e *InExpr) Pos() int { return e.pos }
@@ -261,6 +268,9 @@ type ExistsExpr struct {
 	Negated         bool
 	Plan            Node
 	IsNonCorrelated bool
+	// ParParam/Args: see InExpr — PARAM_EXEC lowering (D4.1).
+	ParParam []int
+	Args     []Expr
 }
 
 func (e *ExistsExpr) Pos() int { return e.pos }
@@ -314,6 +324,9 @@ type SubqueryExpr struct {
 	pos             int
 	Plan            Node
 	IsNonCorrelated bool
+	// ParParam/Args: see InExpr — PARAM_EXEC lowering (D4.1).
+	ParParam []int
+	Args     []Expr
 }
 
 // ArraySubqueryExpr represents ARRAY(SELECT ...) — collects all rows of the
@@ -463,6 +476,27 @@ type ParamRef struct {
 
 func (e *ParamRef) Pos() int { return e.pos }
 func (*ParamRef) exprNode()  {}
+
+// ExecParamRef reads a PARAM_EXEC-style parameter slot
+// (Context.ParamExec[ID]) filled by an enclosing SubPlan eval site just
+// before the inner plan runs. It is the plan-internal correlation
+// parameter of D4.1 (design bundle correlated-subquery-planning), the
+// analog of upstream's PARAM_EXEC Params produced by
+// SS_replace_correlation_vars — and deliberately a separate node from
+// ParamRef, which is the PARAM_EXTERN client bind-parameter side of the
+// same paramkind split PG makes.
+//
+// IDs come from one flat per-statement slot space (subplan_lower.go), so
+// nesting levels cannot collide and evaluation is position-independent:
+// unlike OuterColumnRef there is no lexical-scope stack walk.
+type ExecParamRef struct {
+	pos  int
+	ID   int
+	Type catalog.Type
+}
+
+func (e *ExecParamRef) Pos() int { return e.pos }
+func (*ExecParamRef) exprNode()  {}
 
 // BinaryOp — Left Op Right.
 //

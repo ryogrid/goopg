@@ -106,6 +106,22 @@ type Context struct {
 	SubqueryCache      map[string][]Datum
 	SubqueryCacheScope int // OuterRows len when cached; cleared on change
 
+	// ParamExec is the PARAM_EXEC analog (D4.1): one slot per
+	// plan-assigned ExecParamRef ID, filled by a lowered sublink's eval
+	// site just before its inner plan runs, and read by the inner plan
+	// via planner.ExecParamRef instead of the ctx.OuterRows stack walk.
+	// Sized lazily on first write (SetParamExec) — slot IDs come from a
+	// per-statement counter, so growth is bounded by the statement's
+	// sublink correlation count. ParamSet distinguishes a written slot
+	// from a zero Datum; reading an unset slot is a lowering bug and
+	// errors loudly. ParamDirty mirrors upstream's chgParam: set
+	// unconditionally on every write (PG performs no value comparison,
+	// nodeSubplan.c:236-244); the value-compare rescan shortcut is
+	// Stage 9's business, gated on cacheability.
+	ParamExec  []Datum
+	ParamSet   []bool
+	ParamDirty []bool
+
 	// CorrSubqOps caches pre-built, pre-opened operators for correlated
 	// scalar subqueries so the same plan can be rescanned for each outer
 	// row without repeated Build+openPrep (lock acquire + btree.Open)
@@ -711,6 +727,24 @@ type SubPlanSiteStats struct {
 // code paths that evaluate expressions with a bare or absent
 // Context in tests keep working; the returned block is then
 // discarded.
+// SetParamExec writes a PARAM_EXEC slot, growing the slot arrays on
+// demand, and marks it dirty (chgParam-style, unconditionally — see the
+// field comment). Nil-Context safe like subPlanStat: some expression
+// paths evaluate with a bare Context in tests.
+func (c *Context) SetParamExec(id int, v Datum) {
+	if c == nil || id < 0 {
+		return
+	}
+	for id >= len(c.ParamExec) {
+		c.ParamExec = append(c.ParamExec, Datum{})
+		c.ParamSet = append(c.ParamSet, false)
+		c.ParamDirty = append(c.ParamDirty, false)
+	}
+	c.ParamExec[id] = v
+	c.ParamSet[id] = true
+	c.ParamDirty[id] = true
+}
+
 func (c *Context) subPlanStat(e planner.Expr) *SubPlanSiteStats {
 	if c == nil {
 		return &SubPlanSiteStats{}

@@ -678,6 +678,11 @@ func formatExprPGReg(e planner.Expr, reg *subPlanReg) string {
 		return x.Name + "(" + strings.Join(args, ", ") + ")"
 	case *planner.ParamRef:
 		return fmt.Sprintf("$%d", x.Number)
+	case *planner.ExecParamRef:
+		// PARAM_EXEC slot (D4.1) — upstream prints exec params the
+		// same `$N` way (e.g. `Index Cond: (l_orderkey = $0)`); the
+		// number is the flat per-statement slot ID.
+		return fmt.Sprintf("$%d", x.ID)
 	case *planner.TypedStringLit:
 		// Upstream renders a typed literal as `'value'::type`
 		// (ruleutils.c get_const_expr with showtype).

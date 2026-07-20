@@ -490,9 +490,9 @@ User-directed reorder: S6 ahead of S2, to make Stage 6's harvest enableable.
       units:        PASS (2026-07-21, whole module, combined tree with the cancel fix)
       spotcheck:    PASS (Q12=2 / Q13=33)
       pgbench-hook: PASS (see commit)
-- commit: _(next stage fills it in)_
+- commit: `5dc37087`
 
-## Out-of-band 2 — cancelled-backend spin fix (user-directed, parallel with Stage 7)  [ ]
+## Out-of-band 2 — cancelled-backend spin fix (user-directed, parallel with Stage 7)  [x]
 
 Fixed the 4th `csq-S6` deferral-ledger row. **Root cause revised by the repro**:
 the NL join probe loops already had throttled `ctx.Err()` checks (M0058-0005) —
@@ -514,15 +514,43 @@ was `distinctOp.Open` (the `Unique` node), not the NL join.
 - [x] tests: 4 in `internal/server/cancel_propagation_test.go` (incl. the
       MSG_PEEK non-consumption pin), 1 in `internal/executor/cancel_distinct_test.go`
 - gates: shared with Stage 7 above (units PASS, spotcheck PASS)
-- commit: _(next stage fills it in)_
+- commit: `64fa1e42`
 
-## Stage 8 — S2b: D4.1 param slots  [ ]
+## Stage 8 — S2b: D4.1 param slots  [x]
 
-- [ ] `ExecParamRef` planner node (distinct from `ParamRef` = PARAM_EXTERN)
-- [ ] `ParParam` / `Args` on sublink nodes; depth-tracked lowering pass; Level ≥ 2 forwarding
-- [ ] `Context.ParamExec` + `ParamDirty`
-- [ ] EXPLAIN renders correlated refs as `$N` (PG-faithful)
-- gates: units / spotcheck / plan-gate / pgbench-hook — _pending_
+- [x] `ExecParamRef{ID,Type}` planner node (distinct from `ParamRef` = PARAM_EXTERN,
+      mirroring PG's paramkind split); `ParParam []int` + `Args []Expr` on sublink nodes
+- [x] lowering pass `internal/planner/subplan_lower.go`, run ONCE per statement from
+      `Plan()` (end-of-planSelect was rejected: nested planSelect calls would re-run it
+      and collide slot ids); shared analysis/rewrite walker bails on any unmodelled
+      node/expr kind — a lowered eval site stops pushing `OuterRows`, so a ref hiding in
+      an unmodelled corner must veto lowering, not dangle
+- [x] Level ≥ 2 forwarding: the intermediate sublink grows a param whose Arg is an
+      `ExecParamRef` reading the host's slot (projected cache keys stay truthful)
+- [x] `Context.ParamExec`/`ParamSet`/`ParamDirty` (lazy growth; dirty set
+      unconditionally, PG-style — the value-compare shortcut is Stage 9's, behind the
+      cacheability gate); unset read = loud XX000, never NULL
+- [x] all three eval sites take the lowered path: bind Args → slots, no `OuterRows`
+      push; cache keys become expr-pointer + **param values** — the projected keys of
+      D4.4 arriving naturally, fixing the correlated `collectInValues` collision hazard
+      for lowered sublinks. Correlated EXISTS deliberately gains NO cache yet (would
+      collapse volatile inners before Stage 9's cacheability gate exists)
+- [x] `extractCorrSubqHashInfo` taught the `col = ExecParamRef` form; `CorrSubqOps`
+      rescan path composes (param evaluation is position-independent — the PG model)
+- [x] EXPLAIN renders `$N` (slot id, `$0`-based like PG's PARAM_EXEC)
+- [x] **latent wrong-results bug found by the M8 test and fixed**: a sublink whose only
+      correlation sits inside a *nested* sublink was computed `IsNonCorrelated=true`
+      (the flag's walker never descends into `.Plan`) and cached under a constant key;
+      the lowering now derives the truth from `ParParam` and corrects the flag
+- scope note: DML sublinks (`UPDATE … WHERE EXISTS`) and sublinks nested inside
+  `InExpr` operands stay on the stack path (host discovery doesn't reach them; safe)
+- gates:
+      units:        PASS (2026-07-21, whole module)
+      spotcheck:    PASS (Q12=2 / Q13=33)
+      plan-gate:    DIFFER on Q17/Q20 only (their SubPlan subtrees now print `$0`
+                    instead of the ambiguous self-named refs — the exact display fix
+                    predicted); recaptured `csq-s8-params`, 22/22 MATCH
+      pgbench-hook: PASS (see commit)
 - commit: _pending_
 
 ## Stage 9 — S2c: `subPlanHandle` rescan-not-rebuild  [ ]
