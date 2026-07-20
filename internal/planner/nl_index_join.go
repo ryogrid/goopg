@@ -497,14 +497,52 @@ func tryBuildNLI(j *Join, cat catalog.Catalog) (*NestedLoopIndexJoin, bool) {
 		}
 	}
 
+	// Keep any conjunct the index probe does NOT enforce.
+	//
+	// The pre-existing code assumed `j.Predicate` held nothing but the
+	// equi-conjunct that becomes the probe key, on the grounds that
+	// pushdown separates non-key conjuncts upstream. That assumption
+	// breaks for a predicate spanning two relations: pushdown cannot
+	// place it on either scan, so it stays on the join — and NLI then
+	// dropped it silently. TPC-H Q7's nation pair
+	// `(n1.n_name='FRANCE' AND n2.n_name='GERMANY') OR (…GERMANY…FRANCE…)`
+	// is exactly that shape, and losing it made Q7 return every
+	// nation pair (486 K rows instead of 4 after grouping).
+	//
+	// Such conjuncts are kept as the NLI's residual Predicate, which the
+	// executor evaluates against `outer ++ inner`. Their ColumnRef
+	// indices cannot be reused as-is: they were resolved against this
+	// join's layout at bind time, and an earlier NLI/MHJ rewrite below
+	// us may since have reordered a child's output. They are therefore
+	// re-resolved by name against the joined schema below, using the
+	// same (Name, SourceTableIdx) rule `reresolveJoinByName`'s
+	// predRebind uses so self-joined aliases (Q7's `nation n1` / `n2`,
+	// Q21's three `lineitem` aliases) disambiguate correctly.
+	var leftover []Expr
+	if residualPred == nil && j.Predicate != nil {
+		for _, c := range splitAnd(j.Predicate) {
+			if nliConsumedByProbe(c, idx, keys) {
+				continue
+			}
+			leftover = append(leftover, c)
+		}
+	}
+
 	// Build the inner IndexScan. For single-column indexes we
 	// keep using `Key` for backward compatibility with all
 	// existing single-column callers / tests; for composite
 	// indexes we use `Keys` so the executor encodes every
 	// leading column in declared order with no suffix padding.
 	inner := &IndexScan{
-		pos:    innerScan.Pos(),
-		Table:  innerScan.Table,
+		pos:   innerScan.Pos(),
+		Table: innerScan.Table,
+		// The FROM-clause alias must survive the rewrite: later
+		// passes disambiguate a self-joined relation by alias, so
+		// dropping it makes `n1.col` in `FROM nation n1, nation n2`
+		// bind to whichever relation happens to sit at the matching
+		// slot base — silently returning a neighbouring table's
+		// columns instead of failing.
+		Alias:  innerScan.Alias,
 		Index:  idx,
 		schema: innerScan.Output(),
 	}
@@ -527,6 +565,69 @@ func tryBuildNLI(j *Join, cat catalog.Catalog) (*NestedLoopIndexJoin, bool) {
 		joinedSchema = append(joinedSchema, inner.Output()...)
 	}
 
+	// Place the surviving conjuncts (see above) on the NLI, re-resolving
+	// their ColumnRefs against `outer ++ inner`. Semi / Anti project the
+	// outer schema only, so a residual that reaches into the inner side
+	// has nowhere to live there — decline the rewrite for that shape
+	// rather than evaluate it against a mismatched row. Resolution is
+	// computed for every ref BEFORE any is written back, so a rewrite we
+	// end up declining leaves the shared predicate untouched.
+	if len(leftover) > 0 {
+		if j.Type == JoinTypeSemi || j.Type == JoinTypeAnti {
+			return nil, false
+		}
+		outerSchema2 := outerNode.Output()
+		innerSchema2 := inner.Output()
+		resolveIn := func(schema Schema, cr *ColumnRef, offset int) int {
+			if cr.SourceTableIdx != 0 {
+				if i := findColumnIndexByNameAndSource(schema, cr.Name, cr.SourceTableIdx, offset); i >= 0 {
+					return i
+				}
+			}
+			return findUniqueColumnIndex(schema, cr.Name, offset)
+		}
+		type rebindTarget struct {
+			ref    *ColumnRef
+			newIdx int
+		}
+		var targets []rebindTarget
+		resolvable := true
+		for _, c := range leftover {
+			visitColumnRefs(c, func(e Expr) {
+				cr, isCol := e.(*ColumnRef)
+				if !isCol || cr.Name == "" || !resolvable {
+					return
+				}
+				// Prefer the side the current index points at, then
+				// fall back to the other — the same hint predRebind
+				// uses, which keeps `a.id = b.id` on its own sides
+				// when names collide.
+				first, firstOff := outerSchema2, 0
+				second, secondOff := innerSchema2, len(outerSchema2)
+				if cr.Index >= len(outerSchema2) {
+					first, firstOff = innerSchema2, len(outerSchema2)
+					second, secondOff = outerSchema2, 0
+				}
+				if i := resolveIn(first, cr, firstOff); i >= 0 {
+					targets = append(targets, rebindTarget{cr, i})
+					return
+				}
+				if i := resolveIn(second, cr, secondOff); i >= 0 {
+					targets = append(targets, rebindTarget{cr, i})
+					return
+				}
+				resolvable = false
+			})
+		}
+		if !resolvable {
+			return nil, false
+		}
+		for _, t := range targets {
+			t.ref.Index = t.newIdx
+		}
+		residualPred = combineAnd(leftover)
+	}
+
 	nli := &NestedLoopIndexJoin{
 		pos:   j.pos,
 		Type:  j.Type,
@@ -543,6 +644,34 @@ func tryBuildNLI(j *Join, cat catalog.Catalog) (*NestedLoopIndexJoin, bool) {
 		schema:    joinedSchema,
 	}
 	return nli, true
+}
+
+// nliConsumedByProbe reports whether conjunct c is exactly one of the
+// equi-conjuncts the inner IndexScan probe encodes — inner index column
+// = outer expression — and is therefore already enforced by the probe
+// itself. Matching requires both the index column name AND pointer
+// identity of the outer side against the chosen probe key, so a second
+// equality binding the same inner column to a different outer
+// expression is correctly reported as NOT consumed and survives as a
+// residual (the shape bushy DP's edge selection can leave behind).
+func nliConsumedByProbe(c Expr, idx *catalog.Index, keys []Expr) bool {
+	bin, ok := c.(*BinaryOp)
+	if !ok || bin.Op != parser.OpEq || idx == nil {
+		return false
+	}
+	for i, k := range keys {
+		if i >= len(idx.Columns) {
+			break
+		}
+		col := idx.Columns[i]
+		if lc, isCol := bin.Left.(*ColumnRef); isCol && lc.Name == col && bin.Right == k {
+			return true
+		}
+		if rc, isCol := bin.Right.(*ColumnRef); isCol && rc.Name == col && bin.Left == k {
+			return true
+		}
+	}
+	return false
 }
 
 // collectCrossSideEquiKeys walks j.Predicate (and j.LeftKey/RightKey

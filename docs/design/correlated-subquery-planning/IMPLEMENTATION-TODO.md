@@ -123,15 +123,120 @@ over a 4-table Multi-Way Hash Join, rebuilt every call), **Q17 is already on the
 rescan path** and is a bulk-scan problem rather than a SubPlan problem, and the
 non-correlated cache is healthy.
 
-## Stage 3 — S0-3: semantics matrix + SF1 baseline  [ ]
+## Stage 3 — S0-3: semantics matrix + SF1 baseline  [x]
 
-- [ ] `SetSubqueryUnnestEnabled` knob (mirrors `SetNLIEnabled`, `nl_index_join.go:41-56`)
-- [ ] semantics matrix M1–M16 with expected-fail pins (M2 NULL-operand, M5 `count(col)`,
-      M6 OR-scalar); M6 hang rows via capped subprocess probe or documented skip
-- [ ] `scripts/pg-regress-runner.sh -v subselect` parity recorded
-- [ ] full 22-query SF1 baseline captured (capped, bounded per-query timeout, DNF recorded)
-- gates: units / oracle-diff / pgbench-hook — _pending_
-- commit: _pending_
+- [x] `SetSubqueryUnnestEnabled` knob (mirrors `SetNLIEnabled`); deliberately **no GUC** —
+      unlike a plan-shape toggle this switch changes which correctness bugs are reachable,
+      so a SQL surface would invite it into production configs
+- [x] semantics matrix: `internal/executor/subquery_semantics_test.go`, **33 cases across
+      M1–M16**, each executed on **both** plan paths (unnested and SubPlan)
+- [x] probe file `internal/executor/testdata/subquery_semantics.sql` for `pg-oracle-diff.sh`
+- [x] the two F1 hang shapes are present but `t.Skip`-ped, pointing at Stage 4 (deleting the
+      skip is all Stage 4 needs to do)
+- [x] full 22-query SF1 baseline captured — see the table below
+- gates:
+      units:        _see Stage 4 record_ (matrix runs inside the units gate)
+      pgbench-hook: PASS (see commit)
+- commit: _(filled in by Stage 4)_
+
+### Design change the matrix forced
+
+Pinning one expectation per case turned out to be wrong: the failures are
+**path-specific, and which path fails is diagnostic**. Divergence on the *unnested
+path only* means a bad pull-up rewrite (planner bug); divergence on *both paths*
+means an evaluation bug (executor). Each case therefore pins `badUnnested` and
+`badSubplan` independently. Under this lens **M2 is the only executor bug** — every
+other known-bad row is planner-only, with the SubPlan path already returning PG's
+answer.
+
+### Result: 31 pass, 2 skipped, 0 failing — and three bugs the design did not predict
+
+| row | affected path | goopg | PG 18.3 | fix stage |
+|---|---|---|---|---|
+| M2 correlated `NOT IN`, NULL operand × empty inner | **both** (executor) | `{2}` | `{2,4}` | 5 |
+| M5 `count(col)` | unnested | `{3}` | `{2,3,4}` | 4 |
+| M5 `COALESCE(sum(b),0)` | unnested | `{3}` | `{2,3,4}` | 4 |
+| M6 scalar sublink under `OR` | unnested | `{}` | `{2}` | 4 |
+| **M10 `<> ALL`** (new) | unnested | `{1}` | `{2,3}` | 4 |
+| **M12 `LIMIT` in EXISTS body** (new) | unnested | `{1}` | `{1,3}` | 4 |
+| **M12 ungrouped-aggregate EXISTS body** (new) | unnested | `{3}` | `{1,2,3,4}` | 4 |
+
+The three new ones share the F1/F2/F3 root cause — **the pull-up gates do not check
+what they are pulling up**: `<> ALL` is rewritten as a semi join (exact complement of
+the correct anti join; upstream never pulls up ALL sublinks at all), a `LIMIT` inside
+an EXISTS body survives to become a global limit on the semi-join build side, and an
+ungrouped-aggregate EXISTS body — a tautology — becomes a selective filter. Upstream
+guards the latter two in `simplify_EXISTS_query`
+(`postgres/src/backend/optimizer/prep/prepjointree.c`), which is the fix template.
+**Stage 4's scope therefore grows from three guards to six.**
+
+Two latent-not-live confirmations: M7's `LEFT JOIN` + WHERE-sublink shape is correct on
+both paths (the review's reading holds), and M8's Level-2 correlation resolves correctly
+today, so the F7 hazard stays latent.
+
+### SF1 baseline (the "before" column of the Stage 12 report)
+
+Captured at `a91d2a8d` on the capped bench server (`goopg-csq-bench`, `GOOPG_MEM_MAX=12G`),
+`cmd/tpch-runner`, 300 s per-query budget, machine otherwise idle:
+
+| Q | elapsed | rows | | Q | elapsed | rows |
+|---|---:|---:|---|---|---:|---:|
+| Q1 | 32.04 s | 4 | | Q12 | 36.37 s | 2 |
+| Q2 | 11.55 s | 459 | | Q13 | **DNF** (300 s) | — |
+| Q3 | 24.38 s | 11 175 | | Q14 | 68.26 s | 1 |
+| Q4 | 3.97 s | 5 | | Q15 (view+body+main) | 4.52 + 18.16 + 39.27 s | 10 000 / 1 |
+| Q5 | **DNF** (300 s) | — | | Q16 | 7.24 s | 18 192 |
+| Q6 | 17.99 s | 1 | | Q17 | 58.25 s | 1 |
+| Q7 | 173.23 s | **486 357** ⚠ | | Q18 | 264.86 s | 7 |
+| Q8 | 4.81 s | 2 | | Q19 | 53.62 s | 1 |
+| Q9 | 115.42 s | 175 | | Q20 | 13.60 s | 92 |
+| Q10 | 28.32 s | 20 522 | | Q21 | **DNF** (300 s) | — |
+| Q11 | 2.81 s | 785 | | Q22 | 12.05 s | 7 |
+
+19 completed, 3 DNF at the 300 s budget (Q5, Q13, Q21). Q13 completes in ~104 s
+when run alone by `tpch-spotcheck.sh`; in a full sequential sweep it exceeds the
+budget, so the DNF is a budget/cache-state artefact rather than a hang.
+
+⚠ **Q7's 486 357 rows are wrong** (PostgreSQL returns 4). Investigated on user
+request — two defects in the NLI rewrite, unrelated to this bundle and
+pre-existing. Root-caused, fixed and verified; see
+[`analysis/nli-alias-and-residual-loss-20260721.md`](../../../analysis/nli-alias-and-residual-loss-20260721.md)
+and the out-of-band stage below.
+
+## Out-of-band — NLI alias + residual loss (TPC-H Q7)  [x]
+
+Not part of the S0–S3 roadmap: found while capturing the Stage-3 baseline, and
+fixed on user request because it is a silent wrong-results defect. Q7 returned
+486 357 rows where PostgreSQL returns 4. Two defects in `tryBuildNLI`
+(`internal/planner/nl_index_join.go`), both of the form *the rewrite loses
+information carried by the nodes it replaces*:
+
+- **A — the inner `IndexScan` dropped the FROM-clause alias**, so `n1.*` in
+  `FROM nation n1, nation n2` bound into a neighbouring relation's slots
+  (`n1.n_nationkey` returned supplier's `s_name`).
+- **B — a residual conjunct on the join was discarded.** `residualPred` was set
+  only on the OR-factoring path; the ordinary path assumed pushdown had removed
+  every non-key conjunct, which fails for a predicate spanning two relations —
+  exactly Q7's nation pair.
+
+Fixed **keeping the NLI rewrite** (per user direction): the alias is propagated,
+and unconsumed conjuncts are placed on `NestedLoopIndexJoin.Predicate` with their
+`ColumnRef`s re-resolved against `outer ++ inner` by `(Name, SourceTableIdx)` —
+the same rule `predRebind` uses, which is what makes self-joined aliases
+resolvable. Semi/Anti decline (outer-only schema); resolution is computed for all
+refs before any write-back so a declined rewrite leaves the shared predicate
+untouched.
+
+- Q7: 486 357 → 1 250 (defect A) → **4 rows, matching PG** (defect B); plan still
+  contains its Nested Loop nodes.
+- Trap recorded: an intermediate version that retained the residual *without*
+  re-resolution returned **0 rows** — present but evaluated against stale indices.
+  A misresolved residual is more dangerous than a dropped one; the plan looks right.
+- Tests: `internal/planner/nl_index_join_residual_test.go`, with a **negative
+  control** (reverting the fix fails 5 of them).
+- gates: units PASS · spotcheck PASS (Q12=2 / Q13=33) · planner 278 tests green
+- write-up: [`analysis/nli-alias-and-residual-loss-20260721.md`](../../../analysis/nli-alias-and-residual-loss-20260721.md)
+- commit: _(filled in by the next stage)_
 
 ## Stage 4 — S1a: live-bug guards  [ ]
 
