@@ -138,6 +138,14 @@ type Context struct {
 	// values are the projected result datum.
 	CorrSubqHashMaps map[*planner.SubqueryExpr]map[string]Datum
 
+	// SubPlanHandles keeps each sublink's inner operator tree built
+	// (and, where safe, open) across outer rows — the Stage-9 (D4.2)
+	// rescan-not-rebuild engine. Keyed by the sublink expression's
+	// pointer, like SubPlanStats. Torn down by CloseSubPlans at the
+	// statement-dispatch seam. Nil until a sublink executes with the
+	// engine enabled (GOOPG_SUBPLAN_RESCAN, default on).
+	SubPlanHandles map[planner.Expr]*subPlanHandle
+
 	// SubPlanStats records, per sublink expression, what its
 	// evaluation actually cost during this statement. It exists
 	// because the interesting question about a correlated subquery

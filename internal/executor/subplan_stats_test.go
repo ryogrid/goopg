@@ -61,12 +61,14 @@ func onlyStat(t *testing.T, ctx *Context) *SubPlanSiteStats {
 	return nil
 }
 
-// TestSubPlanStatsCorrelatedExistsRebuildsEveryCall pins the
-// pathology the design bundle set out to fix: correlated EXISTS has
-// no operator-reuse path, so every outer row pays a full
-// Build+Open+Close of the inner plan. Upstream never does this — it
-// rescans (nodeSubplan.c ExecScanSubPlan → ExecReScan).
-func TestSubPlanStatsCorrelatedExistsRebuildsEveryCall(t *testing.T) {
+// TestSubPlanStatsCorrelatedExistsRescans pins the Stage-9 (S2c) fix
+// of the pathology this test originally documented: correlated EXISTS
+// used to Build+Open+Close its inner plan per outer row; the SubPlan
+// handle now builds once and rescans, which is what upstream always
+// does (nodeSubplan.c ExecScanSubPlan → ExecReScan). The legacy
+// counter shape (Rebuilds == Calls) is pinned separately by the
+// kill-switch test in subplan_handle_test.go.
+func TestSubPlanStatsCorrelatedExistsRescans(t *testing.T) {
 	ctx, cleanup := statsFixture(t)
 	defer cleanup()
 
@@ -77,11 +79,11 @@ func TestSubPlanStatsCorrelatedExistsRebuildsEveryCall(t *testing.T) {
 	if s.Calls != 3 {
 		t.Errorf("Calls = %d, want 3 (one per t1 row)", s.Calls)
 	}
-	if s.Rebuilds != s.Calls {
-		t.Errorf("Rebuilds = %d, want == Calls (%d): correlated EXISTS rebuilds per row today", s.Rebuilds, s.Calls)
+	if s.Rebuilds != 1 {
+		t.Errorf("Rebuilds = %d, want 1 (built once, then rescanned)", s.Rebuilds)
 	}
-	if s.Rescans != 0 {
-		t.Errorf("Rescans = %d, want 0: no reuse path exists for EXISTS yet", s.Rescans)
+	if s.Rescans != s.Calls-1 {
+		t.Errorf("Rescans = %d, want Calls-1 (%d)", s.Rescans, s.Calls-1)
 	}
 }
 

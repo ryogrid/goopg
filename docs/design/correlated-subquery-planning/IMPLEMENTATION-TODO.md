@@ -46,9 +46,9 @@ reserved by the spotcheck script). Never bare `pkill`.
 | 4 | S1a live-bug guards (grew to six) | S1 | D3.0 (F1–F3 + M10/M12×2) | [x] `b731b196` |
 | 5 | S1b NOT-IN executor fix | S1 | F4 | [x] `b2a68945` |
 | 6 | S1c collector fix (landed gated OFF) | S1 | D3.0 (IndexScan.Key) | [x] `82117265` |
-| 6b | **S6-pre: NLI semi/anti residual + harvest policy** (user-directed reorder) | S6 | D6.2 (minimal) | [ ] |
-| 7 | S2a operator resets | S2 | D4.2 (prereq) | [ ] |
-| 8 | S2b param slots | S2 | D4.1 | [ ] |
+| 6b | **S6-pre: NLI semi/anti residual + harvest policy** (user-directed reorder) | S6 | D6.2 (minimal) | [x] `32ecf587` |
+| 7 | S2a operator resets | S2 | D4.2 (prereq) | [x] `5dc37087` |
+| 8 | S2b param slots | S2 | D4.1 | [x] `f9a36e39` |
 | 9 | S2c SubPlan handles | S2 | D4.2 + cacheability gate | [ ] |
 | 10 | S2d cache + lifecycle | S2 | D4.4, D4.5 | [ ] |
 | 11 | S3 hashed SubPlan | S3 | D4.3 | [ ] |
@@ -553,15 +553,48 @@ was `distinctOp.Open` (the `Unique` node), not the NL join.
       pgbench-hook: PASS (see commit)
 - commit: _pending_
 
-## Stage 9 — S2c: `subPlanHandle` rescan-not-rebuild  [ ]
+## Stage 9 — S2c: `subPlanHandle` rescan-not-rebuild  [x]
 
-- [ ] per-rooted-operator rescan policy (IndexScan/Aggregate re-Open; SeqScan rewind;
-      Sort/MHJ/NLI Close+Open)
-- [ ] cacheability classifier: volatile function or `LockRows` inner ⇒ never cached,
-      never rescan-skipped (ch.07 M13; PG-fidelity blocker fix)
-- [ ] kill switch `GOOPG_SUBPLAN_RESCAN=off`
-- [ ] all three eval sites routed through handles
-- gates: units / spotcheck / **race-gate** / V6 shows rebuilds→0 / pgbench-hook — _pending_
+- [x] `internal/executor/subplan.go`: `classifySubPlan` decides rescanKind + cacheable
+      in one walk — `reOpen` for Filter/Project/Aggregate/Limit/Distinct chains over
+      SeqScan/IndexScan/Values/GenerateSeries; `closeOpen` for Sort/WindowAgg/LockRows/
+      Join/MHJ/NLI/IndexOnlyScan; **any unmodelled node → rebuild** (never violate an
+      unknown operator's lifecycle)
+- [x] all three eval sites acquire ops through `acquireSubPlanOp` (single seam shared
+      with the legacy path); `CorrSubqOps` absorbed — its registry survives only under
+      the kill switch, so rollback restores pre-Stage-9 behavior exactly
+- [x] cacheability gate: `LockRows` node or volatile function ⇒ never result-cached,
+      re-executed per call (M13 stays green). Volatility = deny-listed volatile builtins
+      (`random`, `nextval`, `clock_timestamp`, …) + catalog `Volatile=="v"` routines;
+      STABLE builtins deliberately cacheable per statement (PG's STABLE contract).
+      **Deviation from the plan's "unknown ⇒ not cacheable"**: goopg's builtins are not
+      registered in the catalog, so that rule would have disabled subquery caching
+      wholesale — the deny-list matches PG's i/s-marked builtins instead (documented)
+- [x] non-correlated caching untouched (InitPlan semantics: upstream evaluates
+      uncorrelated sublinks once even when volatile)
+- [x] kill switch `GOOPG_SUBPLAN_RESCAN=off` + `SetSubPlanRescanEnabled`
+- [x] `CloseSubPlans()` deferred at both dispatch ectx-creation seams (simple+extended)
+- [x] **bug found by matrix row M12 and fixed**: `distinctOp` reset `rows`/`idx` in
+      neither Open nor Close — ANY re-run accumulated the previous run's rows and kept
+      a stale cursor (`{1,2,3}` vs PG's `{1,3}`). Stage-7-style Open reset applied.
+      (`distinctOnOp` has the same latent shape; classifies as `rebuild` today — safe —
+      noted for whoever models it.)
+- [x] counters: first build / rebuild-kind = `Rebuilds++`; re-Open AND Close+Open =
+      `Rescans++` (Close+Open reconstructs runtime state only — upstream's ExecReScan
+      does the same for hash state); correlated-EXISTS stats test flipped to pin the fix
+      (`Rebuilds == 1, Rescans == Calls−1`), legacy shape pinned via the kill switch
+- [x] `internal/planner/walk_export.go` exports the walkers so the classifier reuses
+      the one maintained next to the node definitions
+- [x] tests: `subplan_handle_test.go` 8/8 + whole matrix/suites green
+- honest TPC-H expectation: small — after S6 only Q17/Q20 scalars remain as correlated
+  SubPlans and both already rescanned; the stage's real wins are the M6/M14-class
+  escaped shapes (rescan instead of rebuild), the M12 distinctOp fix, and
+  volatile/LockRows correctness
+- gates:
+      units:        PASS (2026-07-21, whole module)
+      spotcheck:    PASS (Q12=2 / Q13=33)
+      race-gate:    PASS (whole non-cluster module under -race)
+      pgbench-hook: PASS (see commit)
 - commit: _pending_
 
 ## Stage 10 — S2d: projected cache keys + lifecycle  [ ]

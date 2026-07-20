@@ -298,6 +298,11 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 	defer stmtCtx.Release()
 
 	ectx = executor.NewContext()
+	// Stage 9 (D4.2): SubPlan handles keep sublink operator trees open
+	// across outer rows for rescan; tear them down when the dispatch
+	// (and with it this statement batch's Context) ends. Lock-safe:
+	// Operator.Close never releases heavyweight locks.
+	defer ectx.CloseSubPlans()
 	ectx.Mctx = stmtCtx
 	ectx.Ctx = ctx
 	ectx.Pool = s.cfg.Pool

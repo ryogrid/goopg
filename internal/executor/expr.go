@@ -6762,7 +6762,13 @@ func collectInValues(x *planner.InExpr, row Row, ctx *Context) ([]Datum, error) 
 		default:
 			cacheKey = subqueryCacheKey(row)
 		}
-		if ctx.SubqueryCache != nil {
+		// Correlated results may be cached only when the inner plan is
+		// free of volatile functions and LockRows (Stage 9 cacheability
+		// gate, ch.07 M13). Non-correlated sublinks cache regardless —
+		// upstream's InitPlan is evaluated once per statement even when
+		// volatile (see subplan.go).
+		cacheable := x.IsNonCorrelated || subPlanResultCacheable(ctx, x, x.Plan, false)
+		if cacheable && ctx.SubqueryCache != nil {
 			if ctx.SubqueryCacheScope != len(ctx.OuterRows) {
 				clear(ctx.SubqueryCache)
 				ctx.SubqueryCacheScope = len(ctx.OuterRows)
@@ -6773,7 +6779,6 @@ func collectInValues(x *planner.InExpr, row Row, ctx *Context) ([]Datum, error) 
 			}
 		}
 		stat.CacheMisses++
-		stat.Rebuilds++
 		if !lowered {
 			// Push the outer row so correlated refs inside the
 			// IN-subquery resolve against it. Pop on return. A
@@ -6782,15 +6787,11 @@ func collectInValues(x *planner.InExpr, row Row, ctx *Context) ([]Datum, error) 
 			ctx.OuterRows = append(ctx.OuterRows, row)
 			defer func() { ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1] }()
 		}
-		op, err := Build(x.Plan)
+		op, done, err := acquireSubPlanOp(ctx, x, x.Plan, false)
 		if err != nil {
 			return nil, err
 		}
-		if err := op.Open(ctx); err != nil {
-			_ = op.Close()
-			return nil, err
-		}
-		defer func() { _ = op.Close() }()
+		defer done()
 		var out []Datum
 		for {
 			slot, err := op.Next()
@@ -6808,11 +6809,13 @@ func collectInValues(x *planner.InExpr, row Row, ctx *Context) ([]Datum, error) 
 		}
 		// Cache the result so subsequent rows with the same
 		// correlation values skip the inner-plan execution.
-		if ctx.SubqueryCache == nil {
-			ctx.SubqueryCache = make(map[string][]Datum)
-			ctx.SubqueryCacheScope = len(ctx.OuterRows)
+		if cacheable {
+			if ctx.SubqueryCache == nil {
+				ctx.SubqueryCache = make(map[string][]Datum)
+				ctx.SubqueryCacheScope = len(ctx.OuterRows)
+			}
+			ctx.SubqueryCache[cacheKey] = out
 		}
-		ctx.SubqueryCache[cacheKey] = out
 		return out, nil
 	}
 	// Evaluate each list element. When the list has a single element that
@@ -6916,25 +6919,16 @@ func evalExistsExpr(x *planner.ExistsExpr, row Row, ctx *Context) (Datum, error)
 }
 
 func existsImpl(x *planner.ExistsExpr, ctx *Context) (Datum, error) {
-	// Every call re-instantiates the inner plan: correlated EXISTS
-	// has no operator-reuse path today (unlike the scalar
-	// subqueryImpl below), so this counter is expected to track
-	// Calls exactly until the S2 rescan work lands.
-	ctx.subPlanStat(x).Rebuilds++
-	op, err := Build(x.Plan)
+	// Stage 9 (D4.2): the inner plan is built once per statement and
+	// re-run via its handle; only the legacy path (kill switch off)
+	// re-instantiates per call. The lockRowsOp maxDrain=1 EXISTS
+	// optimisation (M0100-0005) is applied at handle build inside
+	// acquireSubPlanOp.
+	op, done, err := acquireSubPlanOp(ctx, x, x.Plan, true)
 	if err != nil {
 		return Datum{}, err
 	}
-	// EXISTS only needs the first row — limit lockRowsOp drain to 1 so
-	// it does not scan the full inner table (matching PostgreSQL). M0100-0005.
-	if lop, ok := op.(*lockRowsOp); ok {
-		lop.maxDrain = 1
-	}
-	if err := op.Open(ctx); err != nil {
-		_ = op.Close()
-		return Datum{}, err
-	}
-	defer func() { _ = op.Close() }()
+	defer done()
 	_, err = op.Next()
 	hasRow := err == nil
 	if err != nil && err != EOF {
@@ -6979,13 +6973,14 @@ func evalSubquery(x *planner.SubqueryExpr, row Row, ctx *Context) (Datum, error)
 	stat := ctx.subPlanStat(x)
 	stat.Calls++
 
-	// Fast path: correlated subquery using a pre-opened cached operator.
-	// Skip SubqueryCache entirely — the operator already rescans correctly
-	// for each outer row, so the key-build + map overhead is unnecessary.
-	if !x.IsNonCorrelated && ctx.CorrSubqOps != nil {
-		if _, inCache := ctx.CorrSubqOps[x]; inCache || planIsIndexScanBased(x.Plan) {
-			return subqueryImpl(x, ctx)
-		}
+	// Fast path: correlated subquery whose inner plan is an index-probe
+	// chain. Skip SubqueryCache entirely — the operator rescans correctly
+	// per outer row (Stage-9 handle, or the legacy CorrSubqOps registry
+	// when the engine is off), so the key-build + map overhead is
+	// unnecessary. Rescanning caches nothing, so this path needs no
+	// volatility gate.
+	if !x.IsNonCorrelated && planIsIndexScanBased(x.Plan) {
+		return subqueryImpl(x, ctx)
 	}
 
 	// Check cache for scalar subquery results. For non-correlated
@@ -7001,7 +6996,11 @@ func evalSubquery(x *planner.SubqueryExpr, row Row, ctx *Context) (Datum, error)
 	default:
 		cacheKey = fmt.Sprintf("%p|%s", x, subqueryCacheKey(row))
 	}
-	if ctx.SubqueryCache != nil {
+	// Correlated results may be served from the cache only when the
+	// inner plan is volatility/LockRows-free (Stage 9 gate, ch.07 M13);
+	// non-correlated results follow InitPlan semantics and always cache.
+	cacheable := x.IsNonCorrelated || subPlanResultCacheable(ctx, x, x.Plan, false)
+	if cacheable && ctx.SubqueryCache != nil {
 		if ctx.SubqueryCacheScope != len(ctx.OuterRows) {
 			clear(ctx.SubqueryCache)
 			ctx.SubqueryCacheScope = len(ctx.OuterRows)
@@ -7020,11 +7019,13 @@ func evalSubquery(x *planner.SubqueryExpr, row Row, ctx *Context) (Datum, error)
 		return Datum{}, err
 	}
 	// Store in cache
-	if ctx.SubqueryCache == nil {
-		ctx.SubqueryCache = make(map[string][]Datum)
-		ctx.SubqueryCacheScope = len(ctx.OuterRows)
+	if cacheable {
+		if ctx.SubqueryCache == nil {
+			ctx.SubqueryCache = make(map[string][]Datum)
+			ctx.SubqueryCacheScope = len(ctx.OuterRows)
+		}
+		ctx.SubqueryCache[cacheKey] = []Datum{val}
 	}
-	ctx.SubqueryCache[cacheKey] = []Datum{val}
 	return val, nil
 }
 
@@ -7040,8 +7041,20 @@ func subqueryImpl(x *planner.SubqueryExpr, ctx *Context) (Datum, error) {
 	//    Scan the inner table ONCE (O(N)) to build key→value map, then do
 	//    O(1) lookups. Works even when no btree index exists.
 	if !x.IsNonCorrelated {
-		// Path 1: IndexScan-based (btree index exists).
+		// Path 1: IndexScan-based (btree index exists). With the
+		// Stage-9 engine the generic handle serves this (classified
+		// rescanReOpen — identical lifecycle to the old CorrSubqOps
+		// registry, which remains only for the legacy kill-switch
+		// path).
 		if planIsIndexScanBased(x.Plan) {
+			if subPlanRescanEnabled() {
+				op, done, err := acquireSubPlanOp(ctx, x, x.Plan, false)
+				if err != nil {
+					return Datum{}, err
+				}
+				defer done()
+				return subqueryReadOne(op, x)
+			}
 			if ctx.CorrSubqOps == nil {
 				ctx.CorrSubqOps = make(map[*planner.SubqueryExpr]Operator)
 			}
@@ -7069,7 +7082,11 @@ func subqueryImpl(x *planner.SubqueryExpr, ctx *Context) (Datum, error) {
 		}
 
 		// Path 2: Hash map for Project(Filter(SeqScan, col = OuterColumnRef)).
-		if info, ok := extractCorrSubqHashInfo(x.Plan); ok {
+		// The map freezes the inner table's derived values for the whole
+		// statement, so it is a result cache — gated on cacheability
+		// (volatile projections must re-execute per row, ch.07 M13).
+		if info, ok := extractCorrSubqHashInfo(x.Plan); ok &&
+			subPlanResultCacheable(ctx, x, x.Plan, false) {
 			if ctx.CorrSubqHashMaps == nil {
 				ctx.CorrSubqHashMaps = make(map[*planner.SubqueryExpr]map[string]Datum)
 			}
@@ -7105,16 +7122,11 @@ func subqueryImpl(x *planner.SubqueryExpr, ctx *Context) (Datum, error) {
 		}
 	}
 
-	ctx.subPlanStat(x).Rebuilds++
-	op, err := Build(x.Plan)
+	op, done, err := acquireSubPlanOp(ctx, x, x.Plan, false)
 	if err != nil {
 		return Datum{}, err
 	}
-	if err := op.Open(ctx); err != nil {
-		_ = op.Close()
-		return Datum{}, err
-	}
-	defer func() { _ = op.Close() }()
+	defer done()
 	return subqueryReadOne(op, x)
 }
 

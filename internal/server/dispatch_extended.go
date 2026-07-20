@@ -139,6 +139,9 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 	}
 
 	ectx := executor.NewContext()
+	// Stage 9 (D4.2): tear down SubPlan rescan handles with the
+	// statement's Context (see dispatch.go for rationale).
+	defer ectx.CloseSubPlans()
 	ectx.Ctx = ctx
 	ectx.Pool = s.cfg.Pool
 	ectx.Catalog = s.cfg.Catalog

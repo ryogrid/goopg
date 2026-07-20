@@ -29,6 +29,14 @@ func (o *distinctOp) Schema() planner.Schema { return o.schema }
 
 func (o *distinctOp) Open(ctx *Context) error {
 	o.ctx = ctx
+	// Reset accumulation state so re-Open re-drains from scratch.
+	// Neither Open nor Close cleared these before Stage 9 (S2c): a
+	// SubPlan handle re-running a DISTINCT body accumulated the
+	// previous outer row's rows and kept a stale cursor (found by
+	// matrix row M12). Same unconditionally-correct pattern as the
+	// Stage-7 limitOp reset.
+	o.rows = nil
+	o.idx = 0
 	if err := o.child.Open(ctx); err != nil {
 		return err
 	}
