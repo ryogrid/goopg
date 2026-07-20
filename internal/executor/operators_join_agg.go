@@ -119,16 +119,53 @@ func newJoinOp(plan *planner.Join, left, right Operator) *joinOp {
 
 func (o *joinOp) Open(ctx *Context) error {
 	o.ctx = ctx
-	// M0061-0001: Semi / Anti join must run through the lazy hash
-	// path; the materialising NL / Merge paths don't implement
-	// "emit probe row at most once" semantics. The planner only
-	// emits Semi/Anti with Algo=JoinAlgoHash, but defend against
-	// future changes that might leave Algo unset.
+	// M0061-0001: keyed Semi / Anti joins run through the lazy hash
+	// path. S4a (D3.2, matrix M14) adds a KEYLESS form: a sublink
+	// whose correlation is entirely non-equi residuals decorrelates
+	// to Algo=JoinAlgoNestedLoop with the residuals as Predicate —
+	// runNestedLoop implements its emit-once semantics (semi: left
+	// row on first qualifying inner row; anti: left row iff none).
+	// Any other algo (Merge, or an unset zero value that is NOT the
+	// planner's explicit NestedLoop choice with a predicate) stays
+	// an internal error.
 	if o.plan.Type == planner.JoinTypeSemi || o.plan.Type == planner.JoinTypeAnti {
-		if o.plan.Algo != planner.JoinAlgoHash {
-			return fmt.Errorf("internal error: semi/anti join requires hash algorithm, got %d", o.plan.Algo)
+		switch o.plan.Algo {
+		case planner.JoinAlgoHash:
+			return o.openLazyHashJoin(ctx)
+		case planner.JoinAlgoNestedLoop:
+			if o.plan.Predicate == nil {
+				// A keyless semi/anti with no predicate would be an
+				// unconditional cross semi — the planner never builds
+				// it (unnestExistsExpr's belt); refuse loudly.
+				return fmt.Errorf("internal error: nested-loop semi/anti join without a predicate")
+			}
+			if err := o.left.Open(ctx); err != nil {
+				return err
+			}
+			if err := o.right.Open(ctx); err != nil {
+				_ = o.left.Close()
+				return err
+			}
+			leftRows, err := drainRowsCtx(o.left, ctx)
+			if err != nil {
+				return err
+			}
+			rightRows, err := drainRowsCtx(o.right, ctx)
+			if err != nil {
+				return err
+			}
+			leftWidth := len(o.left.Schema())
+			if leftWidth == 0 && len(leftRows) > 0 {
+				leftWidth = len(leftRows[0])
+			}
+			rightWidth := len(o.right.Schema())
+			if rightWidth == 0 && len(rightRows) > 0 {
+				rightWidth = len(rightRows[0])
+			}
+			return o.runNestedLoop(leftRows, rightRows, leftWidth, rightWidth)
+		default:
+			return fmt.Errorf("internal error: semi/anti join requires hash or nested-loop algorithm, got %d", o.plan.Algo)
 		}
-		return o.openLazyHashJoin(ctx)
 	}
 	// Lateral joins must always use the per-row driver path so the right-side
 	// plan can evaluate OuterColumnRef nodes against the current left row.
@@ -323,6 +360,7 @@ func (o *joinOp) runNestedLoop(leftRows, rightRows []Row, leftWidth, rightWidth 
 			}
 		}
 		matched := false
+		semiAnti := o.plan.Type == planner.JoinTypeSemi || o.plan.Type == planner.JoinTypeAnti
 		for j, r := range rightRows {
 			// M0062-followup: also check ctx.Err() inside the inner
 			// loop, every 4096 iterations. Q13 (customer LEFT JOIN
@@ -341,14 +379,39 @@ func (o *joinOp) runNestedLoop(leftRows, rightRows []Row, leftWidth, rightWidth 
 				return err
 			}
 			if !ok {
+				// NULL predicate results count as no-match
+				// (joinPredicateMatch), which is exactly the
+				// semi/anti contract too.
 				continue
 			}
 			matched = true
+			if semiAnti {
+				// S4a (D3.2): keyless semi/anti — one qualifying
+				// inner row decides this outer row; never emit the
+				// joined row (the join's schema is outer-only) and
+				// never scan further inner rows.
+				break
+			}
 			rightMatched[j] = true
 			o.rows = append(o.rows, joined)
 			if o.leftCTIDs != nil {
 				o.rowSourceLeft = append(o.rowSourceLeft, i)
 			}
+		}
+		if semiAnti {
+			// Semi emits the left row exactly once iff a qualifying
+			// inner row exists; Anti iff none does.
+			hit := matched
+			if o.plan.Type == planner.JoinTypeAnti {
+				hit = !matched
+			}
+			if hit {
+				o.rows = append(o.rows, append(Row(nil), l...))
+				if o.leftCTIDs != nil {
+					o.rowSourceLeft = append(o.rowSourceLeft, i)
+				}
+			}
+			continue
 		}
 		if !matched && (o.plan.Type == planner.JoinTypeLeft || o.plan.Type == planner.JoinTypeFull) {
 			o.rows = append(o.rows, concatRows(l, nullRight))

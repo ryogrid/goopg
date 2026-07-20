@@ -63,7 +63,7 @@ type known struct {
 // diagnostic, so the struct records them independently rather than collapsing
 // them into one "expected failure" flag.
 type semanticsCase struct {
-	// id is the matrix row (M1..M16) this case belongs to.
+	// id is the matrix row (M1..M19) this case belongs to.
 	id string
 	// desc names the specific behaviour being pinned.
 	desc string
@@ -408,6 +408,49 @@ func semanticsCases() []semanticsCase {
 			sql: "SELECT a FROM t1 WHERE t1.b >= (" +
 				"SELECT min(y.b) FROM t2 y WHERE y.a = t1.a AND y.b <= t1.b) ORDER BY a",
 			want: []string{"1"},
+		},
+
+		// ---- M17: duplicate outer rows x residual scalar -----------------
+		{
+			id: "M17",
+			desc: "fully-duplicate outer rows keep their multiplicity through the " +
+				"aggregate-above-join residual rewrite",
+			// UNION ALL doubles every t1 row, so the outer side feeds two
+			// IDENTICAL (1,10) rows into the rewrite. Grouping the joined
+			// rows by the outer columns alone would collapse them into one;
+			// the per-row ordinal tag must keep both. Both paths must emit
+			// the row twice.
+			sql: "SELECT x.a FROM (SELECT a, b FROM t1 UNION ALL SELECT a, b FROM t1) x " +
+				"WHERE x.b >= (SELECT min(y.b) FROM t2 y WHERE y.a = x.a AND y.b <= x.b) ORDER BY x.a",
+			want: []string{"1", "1"},
+		},
+
+		// ---- M18: correlated NOT IN with residual (stays SubPlan) --------
+		{
+			id: "M18",
+			desc: "correlated NOT IN with a non-equi residual keeps three-valued " +
+				"NULL semantics (deliberately NOT lifted; planner pin: TestNotInResidualStaysSubPlan)",
+			// Rows a=1..3 see a NULL in their inner set (t2 has (3,NULL)),
+			// so `a NOT IN (...)` is UNKNOWN — filtered, not returned.
+			// Only a=4, whose inner set is empty, passes. An anti join
+			// produced by naive residual lifting would return 2,3,4.
+			sql:  "SELECT a FROM t1 WHERE a NOT IN (SELECT y.b FROM t2 y WHERE y.a >= t1.a) ORDER BY a",
+			want: []string{"4"},
+		},
+
+		// ---- M19: non-aggregate scalar with residual: 21000 agreement ----
+		{
+			id: "M19",
+			desc: "a NON-aggregate correlated scalar with a residual raises 21000 on " +
+				"both paths (residual lifting must not extend past the aggregate whitelist)",
+			// For t1 row (1,10) the sublink yields two rows (10 and 11):
+			// PG raises 21000 "more than one row returned by a subquery
+			// used as an expression". The aggregate-above-join rewrite is
+			// gated on the NULL-on-empty aggregate shape, so this shape
+			// must stay a SubPlan and keep the runtime error on both paths.
+			sql: "SELECT a FROM t1 WHERE t1.b = (" +
+				"SELECT y.b FROM t2 y WHERE y.a = t1.a AND y.b >= t1.b) ORDER BY a",
+			wantErrCode: "21000",
 		},
 	}
 }

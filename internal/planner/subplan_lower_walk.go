@@ -128,6 +128,10 @@ func lowerTraverseNode(n Node, fx lowerExprFn) bool {
 			}
 		}
 		return true
+	case *OrdinalityWrap:
+		// S4a scalar-residual rewrite wraps the outer side in an
+		// ordinal tag; it carries no expressions of its own.
+		return lowerTraverseNode(x.Child, fx)
 	case *LockRows:
 		if !one(&x.LimitCount) || !one(&x.OffsetCount) {
 			return false

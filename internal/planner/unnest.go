@@ -5,6 +5,7 @@ import (
 	"strings"
 	"sync/atomic"
 
+	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
 )
 
@@ -626,11 +627,12 @@ func canUnnestSubquery(sub *SubqueryExpr) bool {
 			return false
 		}
 	}
-	params := collectUnnestParams(agg)
-	if params == nil {
-		return false
-	}
-	if len(params) == 0 {
+	// S4a (D3.2): decompose via the shared collector — non-equi outer
+	// conjuncts become liftable residuals instead of a bail. Scalars
+	// keep requiring ≥1 equijoin pair (the GROUP-BY/hash key); a
+	// zero-equijoin scalar stays a SubPlan.
+	eup := collectUnnestParamsAndResiduals(agg)
+	if eup == nil || len(eup.Params) == 0 {
 		return false
 	}
 	// S6 (D6.2) selectivity-aware policy — a measured amendment to the
@@ -828,6 +830,8 @@ func harvestIndexKeyParams(node Node) []unnestParam {
 			}
 		case *LockRows:
 			walk(x.Child)
+		case *OrdinalityWrap:
+			walk(x.Child)
 		}
 	}
 	walk(node)
@@ -904,6 +908,8 @@ func walkPlanExprs(node Node, visit func(Expr)) {
 		for _, t := range n.Targets {
 			walkExprTree(t, visit)
 		}
+	case *OrdinalityWrap:
+		walkPlanExprs(n.Child, visit)
 	case *Aggregate:
 		walkPlanExprs(n.Child, visit)
 		for _, g := range n.GroupExprs {
@@ -1154,7 +1160,49 @@ func clonePlanReplacingOuter(node Node, replace map[*OuterColumnRef]*ColumnRef) 
 		f := *n
 		f.Child = child
 		if n.Predicate != nil {
-			f.Predicate = cloneExprReplacingOuter(n.Predicate, replace)
+			// S4a (ledger csq-S6 row 2): drop replacement-formed
+			// tautologies at clone time. A correlation conjunct
+			// `inner_col = OuterColumnRef` whose outer side maps to
+			// that same inner column becomes `col = col` after
+			// replacement — semantically inert here (the enclosing
+			// join re-establishes the equality via its key, and a
+			// NULL inner key never matches a hash probe anyway), but
+			// it survived into Q20's decorrelated plan as visible
+			// noise (`l_suppkey = l_suppkey`). Only pairs formed BY
+			// the replacement are dropped; a user-written self
+			// comparison (an IS NOT NULL idiom) is preserved.
+			isReplacementTautology := func(c Expr) bool {
+				bin, ok := c.(*BinaryOp)
+				if !ok || bin.Op != parser.OpEq {
+					return false
+				}
+				check := func(a, b Expr) bool {
+					oc, ok := a.(*OuterColumnRef)
+					if !ok {
+						return false
+					}
+					mapped, inMap := replace[oc]
+					if !inMap {
+						return false
+					}
+					cr, ok := b.(*ColumnRef)
+					return ok && mapped.Index == cr.Index && mapped.Name == cr.Name
+				}
+				return check(bin.Left, bin.Right) || check(bin.Right, bin.Left)
+			}
+			conjs := splitAnd(n.Predicate)
+			kept := make([]Expr, 0, len(conjs))
+			for _, c := range conjs {
+				if isReplacementTautology(c) {
+					continue
+				}
+				kept = append(kept, cloneExprReplacingOuter(c, replace))
+			}
+			if len(kept) == 0 {
+				f.Predicate = &BooleanConst{pos: n.pos, Value: true}
+			} else {
+				f.Predicate = combineAnd(kept)
+			}
 		}
 		return &f, nil
 	case *Project:
@@ -1676,10 +1724,21 @@ func unnestSubquery(sub *SubqueryExpr, outer Node) (Node, error) {
 	if proj, ok := plan.(*Project); ok {
 		plan = proj.Child
 	}
-	params := collectUnnestParams(plan.(*Aggregate))
-	if len(params) == 0 {
+	agg := plan.(*Aggregate)
+	eup := collectUnnestParamsAndResiduals(agg)
+	if eup == nil || len(eup.Params) == 0 {
 		return nil, nil
 	}
+	// S4a (D3.2): a scalar with non-equi residual correlation (matrix
+	// M16: `t1.b >= (SELECT min(y.b) FROM y WHERE y.a = t1.a AND
+	// y.b <= t1.b)`) cannot ride the GROUP-BY-inner rewrite — the
+	// residual references a pre-aggregation inner column against an
+	// outer value, which no finite inner grouping expresses. It takes
+	// the aggregate-above-join form instead.
+	if len(eup.Residuals) > 0 {
+		return unnestScalarWithResiduals(sub, outer, agg, eup)
+	}
+	params := eup.Params
 	subPlan, subSchema, err := buildUnnestedSubquery(sub, params)
 	if err != nil {
 		return nil, err
@@ -1802,6 +1861,240 @@ func unnestSubquery(sub *SubqueryExpr, outer Node) (Node, error) {
 		schema:   mergedSchema,
 	}
 	filter.Child = join
+	return outer, nil
+}
+
+// shiftExprColumnIdx deep-clones e with every ColumnRef.Index shifted
+// by delta. Used by the aggregate-above-join scalar rewrite to move
+// aggregate-argument references from inner-relative coordinates into
+// the joined (left ++ inner) row. OuterColumnRefs cannot appear here
+// (the collector's all-accounted guarantee); anything unmodelled is
+// returned as-is, which is safe for ref-free leaves only — callers
+// must have validated the expression via residualExprLiftable-class
+// checks or the aggregate-arg guarantee.
+func shiftExprColumnIdx(e Expr, delta int) Expr {
+	if e == nil {
+		return nil
+	}
+	switch x := e.(type) {
+	case *ColumnRef:
+		cl := *x
+		cl.Index += delta
+		return &cl
+	case *BinaryOp:
+		return &BinaryOp{pos: x.Pos(), Op: x.Op, Left: shiftExprColumnIdx(x.Left, delta), Right: shiftExprColumnIdx(x.Right, delta)}
+	case *UnaryOp:
+		return &UnaryOp{pos: x.Pos(), Op: x.Op, Operand: shiftExprColumnIdx(x.Operand, delta)}
+	case *FuncCall:
+		args := make([]Expr, len(x.Args))
+		for i, a := range x.Args {
+			args[i] = shiftExprColumnIdx(a, delta)
+		}
+		return &FuncCall{pos: x.Pos(), Name: x.Name, Args: args, Star: x.Star}
+	case *CastExpr:
+		cl := *x
+		cl.Operand = shiftExprColumnIdx(x.Operand, delta)
+		return &cl
+	default:
+		return e
+	}
+}
+
+// unnestScalarWithResiduals decorrelates a scalar sublink whose
+// correlation carries non-equi residuals (S4a / D3.2, matrix M16/M17).
+// The GROUP-BY-inner rewrite cannot express a residual like
+// `y.b <= t1.b` (it compares a pre-aggregation inner column against an
+// outer value), so the aggregate moves ABOVE the join:
+//
+//	Filter(orig comparison with sub → aggcol)(
+//	  Aggregate{GROUP BY outer cols ++ __unnest_ord; agg(shifted arg)}(
+//	    Join{INNER, hash}(OrdinalityWrap(outer), raw inner clone)
+//	      ON equijoins AND residuals ))
+//
+// The OrdinalityWrap appends a per-row ordinal to the outer side and
+// that ordinal joins the GROUP BY key, so two fully-duplicate outer
+// rows keep their multiplicity (matrix M17) — grouping by the outer
+// columns alone would collapse them. The ordinal and aggregate columns
+// sit AFTER the preserved outer-column prefix, so downstream column
+// indices are unchanged, the same convention as the GROUP-BY-inner
+// rewrite's merged schema.
+//
+// Legality is exactly D3.4's: the INNER join drops outer rows with an
+// empty correlation group, which matches SubPlan semantics only for
+// NULL-on-empty aggregates under a comparison — enforced by
+// canUnnestSubquery before this function is reached.
+func unnestScalarWithResiduals(sub *SubqueryExpr, outer Node, agg *Aggregate, eup *existsUnnestPlan) (Node, error) {
+	params := eup.Params
+
+	filter, conjunct := findFilterContainingSubquery(outer, sub)
+	if filter == nil {
+		return nil, nil
+	}
+	// Same S1a guard as the base rewrite: the sublink must be applied
+	// unconditionally to every row of its conjunct.
+	if !subqueryANDReachable(conjunct, sub) {
+		return nil, nil
+	}
+
+	// Clone the RAW inner (the aggregate's input): equijoin refs are
+	// neutralised via the replace map; residual conjuncts keep their
+	// OuterColumnRefs and are stripped below (they re-appear on the
+	// join predicate).
+	replace := make(map[*OuterColumnRef]*ColumnRef, len(params))
+	for _, p := range params {
+		replace[p.OuterRef] = p.SubCol
+	}
+	innerRaw, err := clonePlanReplacingOuter(agg.Child, replace)
+	if err != nil {
+		return nil, err
+	}
+	stripOuterRefConjuncts(innerRaw)
+	innerRaw = unnestSubqueriesInPlan(innerRaw)
+	innerRaw = unwrapTrivialWrappers(innerRaw)
+	if planHasOuterRefRemaining(innerRaw) {
+		return nil, nil
+	}
+
+	outerChild := filter.Child
+	outerSchema := outerChild.Output()
+	outerWidth := len(outerSchema)
+	innerSchema := innerRaw.Output()
+
+	// Ordinal-tagged outer side (reuses the WITH ORDINALITY plan node
+	// and its reopen-safe executor).
+	ordSchema := make(Schema, 0, outerWidth+1)
+	ordSchema = append(ordSchema, outerSchema...)
+	ordSchema = append(ordSchema, SchemaColumn{Name: "__unnest_ord", Type: catalog.Type{Name: "int8"}})
+	tagged := &OrdinalityWrap{
+		pos:        sub.Pos(),
+		Child:      outerChild,
+		OrdColName: "__unnest_ord",
+		schema:     ordSchema,
+	}
+	leftWidth := outerWidth + 1
+
+	// Join predicate: every equijoin pair plus the lifted residuals,
+	// all in joined-row (left ++ inner) coordinates.
+	var conj []Expr
+	for _, p := range params {
+		conj = append(conj, &BinaryOp{
+			pos: sub.Pos(), Op: parser.OpEq,
+			Left: &ColumnRef{
+				pos:            p.OuterRef.Pos(),
+				Index:          p.OuterRef.Index,
+				Name:           p.OuterRef.Name,
+				Type:           p.OuterRef.Type,
+				SourceTableIdx: p.OuterRef.SourceTableIdx,
+			},
+			Right: &ColumnRef{
+				pos:            p.SubCol.Pos(),
+				Index:          leftWidth + p.SubCol.Index,
+				Name:           p.SubCol.Name,
+				Type:           p.SubCol.Type,
+				SourceTableIdx: p.SubCol.SourceTableIdx,
+			},
+		})
+	}
+	joinPred := combineAnd(conj)
+	if resid := liftResidualConjuncts(eup.Residuals, nil, outerSchema, leftWidth); resid != nil {
+		joinPred = &BinaryOp{pos: sub.Pos(), Op: parser.OpAnd, Left: joinPred, Right: resid}
+	}
+
+	joinSchema := make(Schema, 0, leftWidth+len(innerSchema))
+	joinSchema = append(joinSchema, ordSchema...)
+	joinSchema = append(joinSchema, innerSchema...)
+	join := &Join{
+		pos:       sub.Pos(),
+		Type:      JoinTypeInner,
+		Algo:      JoinAlgoHash,
+		Left:      tagged,
+		Right:     innerRaw,
+		Predicate: joinPred,
+		LeftKey: &ColumnRef{
+			pos:            params[0].OuterRef.Pos(),
+			Index:          params[0].OuterRef.Index,
+			Name:           params[0].OuterRef.Name,
+			Type:           params[0].OuterRef.Type,
+			SourceTableIdx: params[0].OuterRef.SourceTableIdx,
+		},
+		// Merged-row coordinate: the lazy hash path evaluates BOTH
+		// keys against a (leftWidth + rightWidth) padded row, with
+		// the build/probe row copied into its own region — so the
+		// right key must index into the right region.
+		RightKey: &ColumnRef{
+			pos:   params[0].SubCol.Pos(),
+			Index: leftWidth + params[0].SubCol.Index,
+			Name:  params[0].SubCol.Name,
+			Type:  params[0].SubCol.Type,
+		},
+		schema: joinSchema,
+	}
+
+	// Aggregate above the join: group by the preserved outer prefix
+	// plus the ordinal; the aggregate argument shifts into joined-row
+	// coordinates.
+	groupExprs := make([]Expr, 0, leftWidth)
+	for i, sc := range outerSchema {
+		groupExprs = append(groupExprs, &ColumnRef{
+			pos:            sub.Pos(),
+			Index:          i,
+			Name:           sc.Name,
+			Type:           sc.Type,
+			SourceTableIdx: sc.SourceTableIdx,
+		})
+	}
+	groupExprs = append(groupExprs, &ColumnRef{
+		pos:   sub.Pos(),
+		Index: outerWidth,
+		Name:  "__unnest_ord",
+		Type:  catalog.Type{Name: "int8"},
+	})
+	call := cloneAggregateCall(agg.Aggs[0])
+	if call.Arg != nil {
+		call.Arg = shiftExprColumnIdx(call.Arg, leftWidth)
+	}
+	if call.Arg2 != nil {
+		call.Arg2 = shiftExprColumnIdx(call.Arg2, leftWidth)
+	}
+	for i, ea := range call.ExtraArgs {
+		call.ExtraArgs[i] = shiftExprColumnIdx(ea, leftWidth)
+	}
+	aggSchema := make(Schema, 0, leftWidth+1)
+	aggSchema = append(aggSchema, ordSchema...)
+	aggSchema = append(aggSchema, SchemaColumn{Name: agg.Aggs[0].Name, Type: agg.Aggs[0].Type})
+	newAgg := &Aggregate{
+		pos:        sub.Pos(),
+		Child:      join,
+		GroupExprs: groupExprs,
+		Aggs:       []AggregateCall{call},
+		schema:     aggSchema,
+	}
+
+	// Substitute the sublink in its conjunct with the aggregate
+	// output column (via the Project target when one wraps the
+	// aggregate — Q20's `0.5 * sum` lesson, M0071-0002-followup).
+	aggColRef := &ColumnRef{
+		pos:   sub.Pos(),
+		Index: leftWidth,
+		Name:  agg.Aggs[0].Name,
+		Type:  agg.Aggs[0].Type,
+	}
+	var replacement Expr = aggColRef
+	if proj, ok := sub.Plan.(*Project); ok && len(proj.Targets) == 1 {
+		replacement = cloneExprSubstituteAggIdx0(proj.Targets[0], aggColRef)
+	}
+	newConjunct := replaceExprInConjunct(conjunct, sub, replacement)
+	conjuncts := splitAnd(filter.Predicate)
+	newConjuncts := make([]Expr, 0, len(conjuncts))
+	for _, c := range conjuncts {
+		if c == conjunct {
+			newConjuncts = append(newConjuncts, newConjunct)
+		} else {
+			newConjuncts = append(newConjuncts, c)
+		}
+	}
+	filter.Predicate = combineAnd(newConjuncts)
+	filter.Child = newAgg
 	return outer, nil
 }
 
@@ -1955,22 +2248,46 @@ func canUnnestInExprDepth(in *InExpr, depth int) bool {
 		// outer unnest doesn't gate on the inner.
 		return true
 	}
-	// Collect equijoin pairs — all OuterColumnRefs must be in
-	// equality joins with inner ColumnRefs.
-	params := collectUnnestParams(plan)
-	if params == nil || len(params) == 0 {
+	// S4a (D3.2): decompose the correlation into equijoin params plus
+	// liftable residuals via the shared collector (the EXISTS
+	// mechanism). A fully-unaccounted correlation still bails.
+	eup := collectUnnestParamsAndResiduals(plan)
+	if eup == nil {
 		return false
 	}
-	// unnestInExpr always keys the resulting join on the correlation
-	// pair (params[0]), never on in.Operand directly — that only
-	// encodes the same predicate as the original `operand IN
-	// (subquery)` when the correlation identifies exactly the value
-	// being tested. See correlatedInOperandSafeToUnnest's doc comment
-	// for the two required conditions and why a mismatch would
-	// silently change the query's meaning, not just miss an
-	// optimization.
-	if !correlatedInOperandSafeToUnnest(in, params) {
+	// Correlated NOT IN is deliberately NOT extended to residual
+	// shapes: its unnesting is only proven sound for the exact
+	// operand-safe single-equijoin form below (the equality
+	// correlation excludes NULLs, making the plain Anti join
+	// correct). A residual reintroduces general three-valued
+	// semantics per correlation group — that stays a SubPlan
+	// (M0122-0011 deferral ledger).
+	if in.Negated && len(eup.Residuals) > 0 {
 		return false
+	}
+	if len(eup.Params) == 0 {
+		// S4a zero-equijoin form: the IN's own operand equality
+		// (`operand = projected value`) supplies the hash key, so —
+		// unlike EXISTS — this stays a HASH semi join; the residuals
+		// ride on the join predicate. NOT IN excluded above.
+		if in.Negated || len(eup.Residuals) == 0 {
+			return false
+		}
+		if !isUnnestableNonCorrelatedIn(in) {
+			return false
+		}
+	} else {
+		// unnestInExpr keys the resulting join on the correlation
+		// pair (params[0]), never on in.Operand directly — that only
+		// encodes the same predicate as the original `operand IN
+		// (subquery)` when the correlation identifies exactly the
+		// value being tested. See correlatedInOperandSafeToUnnest's
+		// doc comment for the two required conditions and why a
+		// mismatch would silently change the query's meaning, not
+		// just miss an optimization.
+		if !correlatedInOperandSafeToUnnest(in, eup.Params) {
+			return false
+		}
 	}
 	// M0062-0004: nested IN subqueries are now accepted *if* each
 	// is itself unnestable. The pre-fix blanket reject blocked
@@ -2041,12 +2358,17 @@ func unnestInExpr(in *InExpr, outer Node) (Node, error) {
 	if in.IsNonCorrelated {
 		return unnestNonCorrelatedInExpr(in, outer)
 	}
-	params := collectUnnestParams(in.Plan)
-	if len(params) == 0 {
+	eup := collectUnnestParamsAndResiduals(in.Plan)
+	if eup == nil || (len(eup.Params) == 0 && len(eup.Residuals) == 0) {
 		return nil, nil
 	}
+	params := eup.Params
 	// Replace OuterColumnRefs in the inner plan with their
 	// corresponding ColumnRefs so the inner plan is self-contained.
+	// Residual refs are NOT in the map — clonePlanReplacingOuter
+	// leaves them as OuterColumnRefs and stripOuterRefConjuncts
+	// removes their conjuncts below (they are re-established on the
+	// join predicate by liftResidualConjuncts).
 	replace := make(map[*OuterColumnRef]*ColumnRef, len(params))
 	for _, p := range params {
 		replace[p.OuterRef] = p.SubCol
@@ -2055,10 +2377,18 @@ func unnestInExpr(in *InExpr, outer Node) (Node, error) {
 	if err != nil {
 		return nil, err
 	}
+	if len(eup.Residuals) > 0 {
+		stripOuterRefConjuncts(innerPlan)
+	}
 	// Recursively unnest any scalar subqueries still inside the
 	// inner plan (e.g. Q20's lineitem aggregate inside the
 	// partsupp IN subquery).
 	innerPlan = unnestSubqueriesInPlan(innerPlan)
+	// S4a belt: a surviving OuterColumnRef means the decomposition
+	// was incomplete — never build a join over an unbound reference.
+	if planHasOuterRefRemaining(innerPlan) {
+		return nil, nil
+	}
 
 	// Find the Filter that wraps the outer node.
 	filter, _ := findFilterContainingInExpr(outer, in)
@@ -2078,13 +2408,22 @@ func unnestInExpr(in *InExpr, outer Node) (Node, error) {
 	outerWidth := len(outerChild.Output())
 	innerWidth := len(innerPlan.Output())
 
-	// Build semi-join keys.
-	outerKey := &ColumnRef{
-		pos:            params[0].OuterRef.Pos(),
-		Index:          params[0].OuterRef.Index,
-		Name:           params[0].OuterRef.Name,
-		Type:           params[0].OuterRef.Type,
-		SourceTableIdx: params[0].OuterRef.SourceTableIdx,
+	// Build semi-join keys. With ≥1 correlation pair the join is keyed
+	// on params[0] (operand safety checked in canUnnestInExprDepth).
+	// S4a zero-equijoin form: the IN's own operand equality supplies
+	// the key — LeftKey is the operand expression itself (general
+	// exprs allowed per M0122-0011), RightKey the inner output column.
+	var outerKeyExpr Expr
+	if len(params) > 0 {
+		outerKeyExpr = &ColumnRef{
+			pos:            params[0].OuterRef.Pos(),
+			Index:          params[0].OuterRef.Index,
+			Name:           params[0].OuterRef.Name,
+			Type:           params[0].OuterRef.Type,
+			SourceTableIdx: params[0].OuterRef.SourceTableIdx,
+		}
+	} else {
+		outerKeyExpr = in.Operand
 	}
 	// innerKey.Index is the position of the inner plan's output column in the
 	// merged (outer ++ inner) schema. innerKey.Name MUST match the inner plan's
@@ -2094,15 +2433,25 @@ func unnestInExpr(in *InExpr, outer Node) (Node, error) {
 	// ("f2"), predRebind won't find "f1" on the right side and falls back to the
 	// left, silently setting innerKey.Index to the outer "f1" position (0), which
 	// corrupts the hash-join key and produces 0 matches.
-	innerOutName := params[0].SubCol.Name
+	innerOutName := ""
+	innerOutType := catalog.Type{}
+	innerPos := in.Pos()
+	if len(params) > 0 {
+		innerOutName = params[0].SubCol.Name
+		innerOutType = params[0].SubCol.Type
+		innerPos = params[0].SubCol.Pos()
+	}
 	if out := innerPlan.Output(); len(out) > 0 {
 		innerOutName = out[0].Name
+		if len(params) == 0 {
+			innerOutType = out[0].Type
+		}
 	}
 	innerKey := &ColumnRef{
-		pos:            params[0].SubCol.Pos(),
+		pos:            innerPos,
 		Index:          outerWidth,
 		Name:           innerOutName,
-		Type:           params[0].SubCol.Type,
+		Type:           innerOutType,
 		SourceTableIdx: 0, // inner output column; no outer source identity
 	}
 
@@ -2130,7 +2479,12 @@ func unnestInExpr(in *InExpr, outer Node) (Node, error) {
 		filter.Predicate = combineAnd(newConjuncts)
 	}
 
-	semiPred := &BinaryOp{pos: in.Pos(), Op: parser.OpEq, Left: outerKey, Right: innerKey}
+	var semiPred Expr = &BinaryOp{pos: in.Pos(), Op: parser.OpEq, Left: outerKeyExpr, Right: innerKey}
+	// S4a (D3.2): AND the lifted residual conjuncts onto the join
+	// predicate, exactly the EXISTS mechanism (shared rewriter).
+	if resid := liftResidualConjuncts(eup.Residuals, nil, outerChild.Output(), outerWidth); resid != nil {
+		semiPred = &BinaryOp{pos: in.Pos(), Op: parser.OpAnd, Left: semiPred, Right: resid}
+	}
 	joinType := JoinTypeSemi
 	if effNegated {
 		joinType = JoinTypeAnti
@@ -2143,7 +2497,7 @@ func unnestInExpr(in *InExpr, outer Node) (Node, error) {
 		Left:      outerChild,
 		Right:     innerPlan,
 		Predicate: semiPred,
-		LeftKey:   outerKey,
+		LeftKey:   outerKeyExpr,
 		RightKey:  innerKey,
 		schema:    append(Schema(nil), outerChild.Output()...),
 	}
@@ -2555,27 +2909,30 @@ func stripOuterRefConjuncts(node Node) {
 	case *Join:
 		stripOuterRefConjuncts(n.Left)
 		stripOuterRefConjuncts(n.Right)
+	case *OrdinalityWrap:
+		stripOuterRefConjuncts(n.Child)
 	}
 }
 
-// existsUnnestPlan describes how an EXISTS subquery's correlation
-// predicate decomposes for unnesting:
+// existsUnnestPlan describes how a sublink's correlation predicate
+// decomposes for unnesting:
 //   - Params: equijoin pairs that become the join's hash key(s).
 //   - Residuals: the original (uncloned) BinaryOp / general
 //     conjunct expressions that reference an OuterColumnRef but
 //     are NOT a pure column-equijoin pair. Examples: `<>`,
 //     range comparisons, function calls. After unnesting these
 //     are lifted onto the join's `Predicate` with both inner
-//     ColumnRefs shifted by `outerWidth` and OuterColumnRefs
-//     rewritten to ColumnRefs at their outer-side index.
+//     ColumnRefs shifted by the left side's width and
+//     OuterColumnRefs rewritten to ColumnRefs at their outer-side
+//     index (see liftResidualConjuncts).
 //
-// (M0062-0005.)
+// (M0062-0005; generalized to all three sublink kinds in S4a/D3.2.)
 type existsUnnestPlan struct {
 	Params    []unnestParam
 	Residuals []Expr
 }
 
-// collectExistsUnnestParamsAndResiduals splits the inner plan's
+// collectUnnestParamsAndResiduals splits the inner plan's
 // top-level conjuncts (anywhere a Filter sits) into:
 //   - equijoin params (existing collectUnnestParams logic), and
 //   - non-equi residuals that reference an OuterColumnRef.
@@ -2583,7 +2940,50 @@ type existsUnnestPlan struct {
 // Returns nil if the plan has any OuterColumnRef that does NOT
 // appear in either bucket — those would still be correlated after
 // the lift, which we cannot handle.
-func collectExistsUnnestParamsAndResiduals(node Node) *existsUnnestPlan {
+//
+// residualExprLiftable reports whether a residual conjunct is built
+// entirely from expression kinds liftResidualConjuncts knows how to
+// index-rewrite. Anything else (CaseExpr, nested sublinks, row
+// constructors, ...) would pass through the rewriter's default arm
+// UNREWRITTEN and evaluate with stale column indices on the joined
+// row — a silent-wrong-results class. Such conjuncts make the whole
+// sublink non-liftable (the collector reports the refs unaccounted
+// and the sublink stays a SubPlan).
+//
+// Kept in lockstep with liftResidualConjuncts' rewriteIdx switch —
+// the two are the sibling paths of one contract.
+func residualExprLiftable(e Expr) bool {
+	if e == nil {
+		return true
+	}
+	switch x := e.(type) {
+	case *OuterColumnRef, *ColumnRef:
+		return true
+	case *IntegerConst, *NumericConst, *StringConst, *BooleanConst,
+		*NullConst, *TypedStringLit, *IntervalLit:
+		return true
+	case *BinaryOp:
+		return residualExprLiftable(x.Left) && residualExprLiftable(x.Right)
+	case *UnaryOp:
+		return residualExprLiftable(x.Operand)
+	case *FuncCall:
+		for _, a := range x.Args {
+			if !residualExprLiftable(a) {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
+// S4a (D3.2): this is the shared collector for EXISTS, IN and
+// scalar sublinks. Historically only the EXISTS loop lifted
+// residuals (the IN/scalar loops used collectUnnestParams, which
+// bails on ANY non-equijoin outer ref); the residual mechanism is
+// one and the same for all three — the difference between the
+// loops is only how the resulting join is keyed and typed.
+func collectUnnestParamsAndResiduals(node Node) *existsUnnestPlan {
 	var params []unnestParam
 	var residuals []Expr
 	outerInEquijoin := make(map[*OuterColumnRef]bool)
@@ -2616,14 +3016,27 @@ func collectExistsUnnestParamsAndResiduals(node Node) *existsUnnestPlan {
 				// refs (no OuterColumnRef nested under e.g. a
 				// further OR or CASE), record it as a residual.
 				var refs []*OuterColumnRef
-				outerOK := true
 				walkExprTree(c, func(e Expr) {
 					if oc, ok := e.(*OuterColumnRef); ok {
 						refs = append(refs, oc)
 					}
 				})
-				_ = outerOK
-				if len(refs) > 0 {
+				// S4a: only record the conjunct as a residual when (a)
+				// the index rewriter can handle every node in it
+				// (residualExprLiftable) and (b) every ref targets the
+				// IMMEDIATE outer scope. A Level>1 ref belongs to the
+				// grandparent query; rewriting it against the immediate
+				// outer schema would silently read the wrong scope —
+				// exactly the hazard TestLowerTwoLevelForwarding's
+				// fixture encodes. Such refs stay unaccounted and the
+				// sublink remains a SubPlan.
+				levelOK := true
+				for _, oc := range refs {
+					if oc.Level > 1 {
+						levelOK = false
+					}
+				}
+				if len(refs) > 0 && levelOK && residualExprLiftable(c) {
 					residuals = append(residuals, c)
 					for _, oc := range refs {
 						outerInResidual[oc] = true
@@ -2699,9 +3112,15 @@ func canUnnestExistsExpr(ex *ExistsExpr) bool {
 	if !existsBodySafeForPullup(plan) {
 		return false
 	}
-	eup := collectExistsUnnestParamsAndResiduals(plan)
-	if eup == nil || len(eup.Params) == 0 {
-		// Need at least one equijoin to drive the hash join.
+	eup := collectUnnestParamsAndResiduals(plan)
+	if eup == nil {
+		return false
+	}
+	// S4a (D3.2): ≥1 equijoin drives a hash semi/anti; zero equijoins
+	// with liftable residuals drives a nested-loop semi/anti (M14).
+	// Only a fully-unaccounted correlation (eup == nil above) or an
+	// empty decomposition bails.
+	if len(eup.Params) == 0 && len(eup.Residuals) == 0 {
 		return false
 	}
 	var hasNestedSub bool
@@ -2720,6 +3139,99 @@ func canUnnestExistsExpr(ex *ExistsExpr) bool {
 		return false
 	}
 	return true
+}
+
+// resolveOuterSchemaIdx re-resolves an outer-side column reference by
+// Name (and, when known, SourceTableIdx) against the actual outer
+// schema. The binder set Index against FROM-cumulative offsets at parse
+// time; bushy / MHJ / NLI rewrites may have reordered the runtime row
+// layout (M0071-0003/-0009 — Q21's three lineitem aliases). Factored out
+// of unnestExistsExpr in S4a so the IN and scalar residual lifts share
+// the exact same resolution rules (sibling-path discipline).
+func resolveOuterSchemaIdx(outerSchema Schema, name string, fallback int, sourceTableIdx int16) int {
+	if fallback >= 0 && fallback < len(outerSchema) && outerSchema[fallback].Name == name {
+		if sourceTableIdx == 0 || outerSchema[fallback].SourceTableIdx == sourceTableIdx {
+			return fallback
+		}
+	}
+	if sourceTableIdx != 0 {
+		for i, c := range outerSchema {
+			if c.Name == name && c.SourceTableIdx == sourceTableIdx {
+				return i
+			}
+		}
+	}
+	first := -1
+	count := 0
+	for i, c := range outerSchema {
+		if c.Name == name {
+			if first < 0 {
+				first = i
+			}
+			count++
+		}
+	}
+	if count == 1 {
+		return first
+	}
+	return fallback
+}
+
+// liftResidualConjuncts rewrites lifted residual conjuncts (plus any
+// inner-only lifted conjuncts) for evaluation against the joined
+// (left ++ inner) row: an OuterColumnRef becomes a ColumnRef resolved
+// against outerSchema (outer columns form the left prefix, indices
+// unchanged), and an inner ColumnRef is shifted by innerShift (the
+// left side's total width). Returns nil when there is nothing to lift.
+func liftResidualConjuncts(residuals, innerOnly []Expr, outerSchema Schema, innerShift int) Expr {
+	if len(residuals) == 0 && len(innerOnly) == 0 {
+		return nil
+	}
+	var rewriteIdx func(Expr) Expr
+	rewriteIdx = func(e Expr) Expr {
+		if e == nil {
+			return nil
+		}
+		switch x := e.(type) {
+		case *OuterColumnRef:
+			return &ColumnRef{
+				pos:            x.Pos(),
+				Index:          resolveOuterSchemaIdx(outerSchema, x.Name, x.Index, x.SourceTableIdx),
+				Name:           x.Name,
+				Type:           x.Type,
+				SourceTableIdx: x.SourceTableIdx,
+			}
+		case *ColumnRef:
+			cl := *x
+			cl.Index = innerShift + x.Index
+			return &cl
+		case *BinaryOp:
+			return &BinaryOp{
+				pos:   x.Pos(),
+				Op:    x.Op,
+				Left:  rewriteIdx(x.Left),
+				Right: rewriteIdx(x.Right),
+			}
+		case *UnaryOp:
+			return &UnaryOp{pos: x.Pos(), Op: x.Op, Operand: rewriteIdx(x.Operand)}
+		case *FuncCall:
+			args := make([]Expr, len(x.Args))
+			for i, a := range x.Args {
+				args[i] = rewriteIdx(a)
+			}
+			return &FuncCall{pos: x.Pos(), Name: x.Name, Args: args, Star: x.Star}
+		default:
+			return e
+		}
+	}
+	var conj []Expr
+	for _, r := range residuals {
+		conj = append(conj, rewriteIdx(r))
+	}
+	for _, r := range innerOnly {
+		conj = append(conj, rewriteIdx(r))
+	}
+	return combineAnd(conj)
 }
 
 // unnestExistsExpr rewrites a top-level EXISTS / NOT EXISTS
@@ -2747,8 +3259,18 @@ func unnestExistsExpr(ex *ExistsExpr, outer Node) (Node, error) {
 	if !canUnnestExistsExpr(ex) {
 		return nil, nil
 	}
-	eup := collectExistsUnnestParamsAndResiduals(ex.Plan)
-	if eup == nil || len(eup.Params) == 0 {
+	eup := collectUnnestParamsAndResiduals(ex.Plan)
+	if eup == nil {
+		return nil, nil
+	}
+	// S4a (D3.2): zero equijoin pairs with liftable residuals is now
+	// accepted — a hash join is impossible (no key), so the result is a
+	// nested-loop semi/anti join whose predicate carries the residuals
+	// (matrix M14: `EXISTS (SELECT 1 FROM y WHERE y.b > t1.b)`). This is
+	// O(N·M) exactly like the SubPlan it replaces, minus the per-call
+	// operator lifecycle; D6.3a's cost gate later arbitrates SubPlan vs
+	// NL semi where it matters.
+	if len(eup.Params) == 0 && len(eup.Residuals) == 0 {
 		return nil, nil
 	}
 	params := eup.Params
@@ -2869,6 +3391,13 @@ func unnestExistsExpr(ex *ExistsExpr, outer Node) (Node, error) {
 	outerChild := filter.Child
 	outerWidth := len(outerChild.Output())
 
+	// Belt (checked BEFORE any tree mutation below): a keyless
+	// semi/anti needs at least one residual to serve as its join
+	// predicate — an unconditional cross semi must never be built.
+	if len(params) == 0 && len(eup.Residuals) == 0 {
+		return nil, nil
+	}
+
 	// Build keys. The probe (outer) key uses the outer column ref
 	// at its original index; the build (inner) key uses the inner
 	// ColumnRef adjusted to point into the inner plan's own
@@ -2876,23 +3405,30 @@ func unnestExistsExpr(ex *ExistsExpr, outer Node) (Node, error) {
 	// outer-only and the build side reads from a row of inner
 	// width alone (see executor's openLazyHashJoin path for
 	// BuildLeft=false).
-	outerKey := &ColumnRef{
-		pos:            params[0].OuterRef.Pos(),
-		Index:          params[0].OuterRef.Index,
-		Name:           params[0].OuterRef.Name,
-		Type:           params[0].OuterRef.Type,
-		SourceTableIdx: params[0].OuterRef.SourceTableIdx,
-	}
-	// The executor's evalHashKey is given a padded row of width
-	// (leftWidth + rightWidth). For semi/anti the right key reads
-	// the inner column from the right-side region of that padded
-	// row, so its Index must be `outerWidth + innerColIndex`.
-	innerKey := &ColumnRef{
-		pos:            params[0].SubCol.Pos(),
-		Index:          outerWidth + params[0].SubCol.Index,
-		Name:           params[0].SubCol.Name,
-		Type:           params[0].SubCol.Type,
-		SourceTableIdx: params[0].SubCol.SourceTableIdx,
+	//
+	// S4a (D3.2): with zero equijoin pairs there is no hash key —
+	// the join runs as a nested-loop semi/anti whose Predicate
+	// carries the lifted residuals (matrix M14); both keys stay nil.
+	var outerKey, innerKey *ColumnRef
+	if len(params) > 0 {
+		outerKey = &ColumnRef{
+			pos:            params[0].OuterRef.Pos(),
+			Index:          params[0].OuterRef.Index,
+			Name:           params[0].OuterRef.Name,
+			Type:           params[0].OuterRef.Type,
+			SourceTableIdx: params[0].OuterRef.SourceTableIdx,
+		}
+		// The executor's evalHashKey is given a padded row of width
+		// (leftWidth + rightWidth). For semi/anti the right key reads
+		// the inner column from the right-side region of that padded
+		// row, so its Index must be `outerWidth + innerColIndex`.
+		innerKey = &ColumnRef{
+			pos:            params[0].SubCol.Pos(),
+			Index:          outerWidth + params[0].SubCol.Index,
+			Name:           params[0].SubCol.Name,
+			Type:           params[0].SubCol.Type,
+			SourceTableIdx: params[0].SubCol.SourceTableIdx,
+		}
 	}
 
 	// Drop the EXISTS conjunct (or its wrapping NOT) entirely;
@@ -2936,119 +3472,31 @@ func unnestExistsExpr(ex *ExistsExpr, outer Node) (Node, error) {
 	// against an unrelated value → silent over-match (rows = 0
 	// vs canonical ~411).
 	outerSchema := outerChild.Output()
-	resolveOuterIdx := func(name string, fallback int, sourceTableIdx int16) int {
-		// Disambiguate self-joins (Q21 has lineitem l1, l2, l3):
-		// the binder's offset uses l1.offset; we look up the
-		// matching offset by walking outerSchema's name list and
-		// finding the one whose absolute position matches the
-		// fallback. This preserves multi-binding semantics.
-		if fallback >= 0 && fallback < len(outerSchema) && outerSchema[fallback].Name == name {
-			// Position still aligns AND (when known) the source
-			// identity also matches; trust the binder's index.
-			if sourceTableIdx == 0 || outerSchema[fallback].SourceTableIdx == sourceTableIdx {
-				return fallback
-			}
-			// Position aligns by Name but source-identity tells
-			// us this slot belongs to a sibling self-join binding
-			// — fall through to the SourceTableIdx-aware lookup.
-		}
-		// M0071-0009: when the OuterColumnRef knows its source
-		// identity (SourceTableIdx > 0), prefer the column whose
-		// schema entry matches both Name and SourceTableIdx. This
-		// is what makes Q21's l3.l_suppkey <> l1.l_suppkey resolve
-		// correctly even though `l_suppkey` appears multiple times
-		// in the outer schema.
-		if sourceTableIdx != 0 {
-			for i, c := range outerSchema {
-				if c.Name == name && c.SourceTableIdx == sourceTableIdx {
-					return i
-				}
-			}
-		}
-		// The schema's positions diverged from FROM-cumulative
-		// AND we have no source identity (or no match). Walk and
-		// pick the first column with matching Name — safe ONLY
-		// when the column name is unique in the outer schema.
-		// For ambiguous cases (self-join) keep fallback.
-		first := -1
-		count := 0
-		for i, c := range outerSchema {
-			if c.Name == name {
-				if first < 0 {
-					first = i
-				}
-				count++
-			}
-		}
-		if count == 1 {
-			return first
-		}
-		return fallback
-	}
-	var joinPredicate Expr
-	if len(eup.Residuals) > 0 || len(innerOnlyLifted) > 0 {
-		var rewriteIdx func(Expr) Expr
-		rewriteIdx = func(e Expr) Expr {
-			if e == nil {
-				return nil
-			}
-			switch x := e.(type) {
-			case *OuterColumnRef:
-				return &ColumnRef{
-					pos:            x.Pos(),
-					Index:          resolveOuterIdx(x.Name, x.Index, x.SourceTableIdx),
-					Name:           x.Name,
-					Type:           x.Type,
-					SourceTableIdx: x.SourceTableIdx,
-				}
-			case *ColumnRef:
-				cl := *x
-				cl.Index = outerWidth + x.Index
-				return &cl
-			case *BinaryOp:
-				return &BinaryOp{
-					pos:   x.Pos(),
-					Op:    x.Op,
-					Left:  rewriteIdx(x.Left),
-					Right: rewriteIdx(x.Right),
-				}
-			case *UnaryOp:
-				return &UnaryOp{pos: x.Pos(), Op: x.Op, Operand: rewriteIdx(x.Operand)}
-			case *FuncCall:
-				args := make([]Expr, len(x.Args))
-				for i, a := range x.Args {
-					args[i] = rewriteIdx(a)
-				}
-				return &FuncCall{pos: x.Pos(), Name: x.Name, Args: args, Star: x.Star}
-			default:
-				return e
-			}
-		}
-		var residualConj []Expr
-		for _, r := range eup.Residuals {
-			residualConj = append(residualConj, rewriteIdx(r))
-		}
-		// M0063-0004: inner-only conjuncts (no OuterColumnRef)
-		// also need their inner ColumnRef indices shifted by
-		// outerWidth so they evaluate against the joinBuf.
-		for _, r := range innerOnlyLifted {
-			residualConj = append(residualConj, rewriteIdx(r))
-		}
-		joinPredicate = combineAnd(residualConj)
-	}
+	// S4a: index rewriting for lifted residuals is shared with the IN and
+	// scalar paths — see liftResidualConjuncts / resolveOuterSchemaIdx.
+	joinPredicate := liftResidualConjuncts(eup.Residuals, innerOnlyLifted, outerSchema, outerWidth)
 
+	algo := JoinAlgoHash
+	if len(params) == 0 {
+		// Zero equijoin pairs: no hash key exists. The executor runs
+		// this as a materialising nested-loop semi/anti with emit-once
+		// semantics (operators_join_agg.go runNestedLoop). The
+		// residuals are guaranteed non-empty here (checked before any
+		// tree mutation), so joinPredicate is non-nil.
+		algo = JoinAlgoNestedLoop
+	}
 	join := &Join{
 		pos:       ex.Pos(),
 		Type:      joinType,
-		Algo:      JoinAlgoHash,
+		Algo:      algo,
 		Left:      outerChild,
 		Right:     innerPlan,
 		Predicate: joinPredicate,
-		LeftKey:   outerKey,
-		RightKey:  innerKey,
-		// Schema is the outer side only — semi/anti joins do not
-		// project inner columns.
-		schema: append(Schema(nil), outerChild.Output()...),
+		schema:    append(Schema(nil), outerChild.Output()...),
+	}
+	if outerKey != nil {
+		join.LeftKey = outerKey
+		join.RightKey = innerKey
 	}
 	filter.Child = join
 	return outer, nil

@@ -705,8 +705,8 @@ was `distinctOp.Open` (the `Unique` node), not the NL join.
 
 | # | Stage | Scope | Status |
 |---|---|---|---|
-| R2-0 | harness guard + NLI-Predicate EXPLAIN | throttle-trap refusal in the wrapper; NLI residual visible | [ ] |
-| R2-1 | S4a: D3.2 residual lifting (IN/scalar) + NL semi/anti + tautology strip | | [ ] |
+| R2-0 | harness guard + NLI-Predicate EXPLAIN | throttle-trap refusal in the wrapper; NLI residual visible | [x] `3a620f2b` |
+| R2-1 | S4a: D3.2 residual lifting (IN/scalar) + NL semi/anti + tautology strip | | [x] (this commit) |
 | R2-2 | S4b: D3.3 nested-sublink tolerance (deep walk + clone fix) | | [ ] |
 | R2-3 | D6.3a: subplan cost helper + NLI semi/anti cost gate | | [ ] |
 | R2-4 | S5a: unnest before join search (semi/anti pinned) | | [ ] |
@@ -742,4 +742,47 @@ was `distinctOp.Open` (the `Unique` node), not the NL join.
                   l_receiptdate`; Q19's OR residual now visible); tree shapes
                   unchanged. Recaptured `csq-r2-0-nli-display`, 22/22 MATCH
       pgbench-hook: PASS (see commit)
-- commit: _(filled by R2-1)_
+- commit: `3a620f2b`
+
+## R2-1 — S4a: D3.2 residual lifting + NL semi/anti + tautology strip  [x]
+
+- [x] `collectExistsUnnestParamsAndResiduals` generalized into the shared
+      `collectUnnestParamsAndResiduals` for all three sublink kinds; non-equi
+      outer-ref conjuncts become lifted residuals instead of bails. Two guards
+      added during the work: a **Level guard** (residuals with `Level > 1` refs
+      rejected — caught live by the M8 fixture, which would have lifted a
+      grandparent ref against the immediate outer's schema) and a
+      **`residualExprLiftable` allowlist** (only expression kinds the rewriter
+      models; anything else — CASE etc. — vetoes at collection time, closing a
+      latent stale-index silent-wrong-results hazard in the pre-existing code)
+- [x] IN residuals AND-ed onto the semi predicate; **correlated NOT IN with
+      residuals stays bailed** (three-valued NULL semantics; new matrix row M18
+      pins that a naive anti-lift would wrongly return {2,3,4} vs PG's {4})
+- [x] zero-equijoin EXISTS (M14 class) → `Join{Semi/Anti, Algo:NestedLoop}`;
+      the executor's NL join gains **early-out semi/anti modes** (emit outer on
+      first qualifying inner / on none; NULL predicate = no-match; replaces the
+      hard "semi/anti requires hash" error). Zero-param IN uses its operand
+      equality as a hash key instead (never needs NL)
+- [x] scalar residuals (M16 class) via **aggregate-above-join** —
+      `Filter(cmp)(Aggregate{GROUP BY outer cols + ordinal}(Join{INNER}(
+      OrdinalityWrap(outer), raw inner) ON equis AND residuals))` — reusing the
+      existing WITH-ORDINALITY machinery as the duplicate-multiplicity tag
+      (no new executor op needed). New matrix rows: **M17** (duplicate outer
+      rows preserved — the ordinal is what keeps both), **M19** (non-aggregate
+      scalar + residual raises 21000 on both paths — lifting must not leak past
+      the aggregate whitelist)
+- [x] tautology strip in `clonePlanReplacingOuter`: replacement-formed
+      `col = col` conjuncts dropped at clone time (the Q20 `l_suppkey =
+      l_suppkey` residue class); user-written self-comparisons survive
+- [x] hash-key coordinate contract established (RightKey uses merged
+      `leftWidth+innerIdx` coordinates — cost one wrong-result round in testing)
+- gates:
+      units:      PASS (2026-07-21, whole module; matrix now M1–M19, both paths)
+      race-gate:  PASS (new NL semi/anti executor mode)
+      spotcheck:  PASS (Q12=2 / Q13=33)
+      plan-gate:  **22/22 MATCH** — zero TPC-H diffs, as predicted (no TPC-H
+                  query has the zero-equijoin or scalar-residual shapes; Q17/Q20
+                  bail earlier via the probe-cheap policy; Q2's correlation is
+                  absorbed by the index harvest before reaching the Filter arm)
+      pgbench-hook: PASS (see commit)
+- commit: _(filled by R2-2)_

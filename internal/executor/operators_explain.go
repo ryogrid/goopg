@@ -1133,6 +1133,12 @@ func describePlan(n planner.Node) string {
 		// detail is too verbose for the single-line label and
 		// is left to a future VERBOSE-only extension.
 		return "LockRows"
+	case *planner.OrdinalityWrap:
+		// WITH ORDINALITY wrapper; also reused by the S4a scalar
+		// residual rewrite to tag the outer side with a per-row
+		// ordinal (preserving duplicate-row multiplicity through
+		// the aggregate-above-join shape).
+		return "Ordinality"
 	case *planner.MultiHashJoin:
 		// M0054-0003b: render the M0038 multi-way hash join
 		// explicitly so EXPLAIN shows the join shape instead of
@@ -1222,6 +1228,8 @@ func planChildren(n planner.Node) []planner.Node {
 	case *planner.CTEScan:
 		return []planner.Node{p.Child}
 	case *planner.LockRows:
+		return []planner.Node{p.Child}
+	case *planner.OrdinalityWrap:
 		return []planner.Node{p.Child}
 	case *planner.MultiHashJoin:
 		// M0054-0003b: walk every input table of the multi-way

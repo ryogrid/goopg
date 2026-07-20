@@ -65,8 +65,37 @@ func TestCanUnnestSubqueryWithExtraOuterRef(t *testing.T) {
 	}
 	sub := &SubqueryExpr{pos: 0, Plan: agg}
 
-	if canUnnestSubquery(sub) {
-		t.Error("canUnnestSubquery returned true for subquery with non-equijoin OuterColumnRef")
+	// S4a (D3.2): a non-equijoin outer ref is now a liftable residual
+	// (the aggregate-above-join rewrite carries it on the join
+	// predicate), so this shape is unnestable — the historical bail
+	// this test used to pin was the pre-S4a limitation.
+	if !canUnnestSubquery(sub) {
+		t.Error("canUnnestSubquery returned false for a liftable residual correlation (D3.2)")
+	}
+
+	// The unliftable variant — the residual buried in an expression
+	// kind the index rewriter does not model (CASE) — must still bail.
+	casePred := &BinaryOp{pos: 0, Op: parser.OpAnd, Left: eqExpr, Right: &CaseExpr{
+		pos: 0,
+		Whens: []CaseWhen{{
+			When: &BinaryOp{pos: 0, Op: parser.OpGt, Left: outerExtra2(), Right: &ColumnRef{pos: 0, Index: 3, Name: "ps_availqty", Type: catalog.Type{Name: "int8"}}},
+			Then: &BooleanConst{pos: 0, Value: true},
+		}},
+		Else: &BooleanConst{pos: 0, Value: false},
+	}}
+	aggCase := &Aggregate{
+		pos: 0,
+		Child: &Filter{
+			pos:       0,
+			Child:     &SeqScan{pos: 0, Table: &catalog.Table{Name: "partsupp"}},
+			Predicate: casePred,
+		},
+		Aggs: []AggregateCall{
+			{pos: 0, Name: "min", Arg: &ColumnRef{pos: 0, Index: 2, Name: "ps_supplycost", Type: catalog.Type{Name: "numeric"}}, Type: catalog.Type{Name: "numeric"}},
+		},
+	}
+	if canUnnestSubquery(&SubqueryExpr{pos: 0, Plan: aggCase}) {
+		t.Error("canUnnestSubquery returned true for a CASE-buried (unliftable) correlation")
 	}
 }
 
@@ -307,18 +336,19 @@ func TestRecursiveUnnestInsideNonUnnestableIN(t *testing.T) {
 	}
 
 	// Outer IN's inner plan is correlated with `a` through a
-	// non-equijoin predicate (b_val > a_id). M0122-0011 follow-up
-	// widened non-correlated-IN unnesting to accept any scalar
-	// operand (not just a bare ColumnRef), so a non-ColumnRef LHS
-	// alone no longer keeps this outer IN non-unnestable — an
-	// inequality correlation still does, since collectUnnestParams
-	// only admits OuterColumnRefs that appear in an equijoin. The
-	// inner scalar subquery IS correlated with b (c_b_key = b_key)
-	// and should still be unnested by walkSubqueryPlansInExpr — the
-	// M0040-0004 invariant this test pins.
+	// CASE-wrapped predicate, which residualExprLiftable refuses (an
+	// unmodelled expression kind would evaluate stale indices if
+	// lifted), so the outer IN genuinely stays a SubPlan. (The test
+	// originally used a plain inequality correlation `b_val > a_id`,
+	// but S4a/D3.2's residual lifting made that shape UNNESTABLE —
+	// see TestInResidualLiftUnnests.) The inner scalar subquery IS
+	// correlated with b (c_b_key = b_key) and must still be unnested
+	// in place by walkSubqueryPlansInExpr — the M0040-0004 invariant
+	// this test pins.
 	sql := `SELECT a_id FROM a WHERE a_id + 1 IN (
 		SELECT b_id FROM b
-		WHERE b_val > a_id AND b_val > (SELECT SUM(c_qty) FROM c WHERE c_b_key = b_key)
+		WHERE CASE WHEN b_val > a_id THEN true ELSE false END
+		  AND b_val > (SELECT SUM(c_qty) FROM c WHERE c_b_key = b_key)
 	)`
 	stmt := parseOne(t, sql)
 	plan, err := Plan(stmt, cat)
@@ -398,5 +428,113 @@ where exists (
 	// EXISTS subqueries are out of scope for v0 unnesting.
 	if hasJoinWithAggregateChild(plan) {
 		t.Error("EXISTS subquery was incorrectly unnested (v0 scope)")
+	}
+}
+
+// outerExtra2 builds a fresh non-equijoin outer ref for the CASE
+// variant in TestCanUnnestSubqueryWithExtraOuterRef (pointer identity
+// matters to the collector's accounting maps).
+func outerExtra2() *OuterColumnRef {
+	return &OuterColumnRef{pos: 0, Level: 1, Index: 1, Name: "p_size", Type: catalog.Type{Name: "int8"}}
+}
+
+// TestInResidualLiftUnnests pins S4a/D3.2 item 2: a non-negated IN
+// whose only correlation is a liftable non-equi residual now unnests
+// to a semi join. The IN's own operand/projection equality supplies
+// the hash key (there is no equijoin param), and the residual is
+// AND-ed onto the join predicate — mirroring the EXISTS treatment.
+func TestInResidualLiftUnnests(t *testing.T) {
+	cat := twoTablesCatalog(t)
+	sql := "SELECT x FROM t1 WHERE x IN (SELECT y FROM t2 WHERE z > t1.x)"
+	node, err := Plan(parseOne(t, sql), cat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if in := findInExpr(node); in != nil {
+		t.Errorf("InExpr survived residual-lift unnesting: %s", planString(node))
+	}
+	j := findFirstJoinByType(node, JoinTypeSemi)
+	if j == nil {
+		t.Fatalf("residual-only IN did not become a semi join: %s", planString(node))
+	}
+	if j.Algo != JoinAlgoHash {
+		t.Errorf("IN semi join algo = %d, want JoinAlgoHash (operand equality is the key)", j.Algo)
+	}
+	if j.LeftKey == nil || j.RightKey == nil {
+		t.Error("IN semi join must keep the operand/projection hash keys")
+	}
+	if j.Predicate == nil {
+		t.Error("lifted residual missing from the IN semi join predicate")
+	}
+}
+
+// TestNotInResidualStaysSubPlan pins the deliberate S4a non-goal: a
+// correlated NOT IN with a lifted residual must stay a SubPlan. NOT IN
+// carries three-valued NULL semantics (one NULL in the inner set makes
+// every non-matching outer row UNKNOWN, i.e. filtered), which the anti
+// join produced by residual lifting does not model. canUnnestInExprDepth
+// bails on Negated+residuals; this test keeps that gate honest.
+func TestNotInResidualStaysSubPlan(t *testing.T) {
+	cat := twoTablesCatalog(t)
+	sql := "SELECT x FROM t1 WHERE x NOT IN (SELECT y FROM t2 WHERE z > t1.x)"
+	node, err := Plan(parseOne(t, sql), cat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if in := findInExpr(node); in == nil {
+		t.Fatalf("correlated NOT IN with residual must stay a SubPlan: %s", planString(node))
+	}
+	if findFirstJoinByType(node, JoinTypeAnti) != nil {
+		t.Error("correlated NOT IN with residual was incorrectly converted to an anti join")
+	}
+}
+
+// TestScalarTwoKeyCorrelationStripsTautology pins the S4a tautology
+// strip in clonePlanReplacingOuter: a 2-key correlated scalar (Q20's
+// shape) groups the cloned inner by both correlation columns, and the
+// correlation conjuncts themselves become `col = col` after the
+// outer→inner replacement. Those replacement-formed self-equalities
+// must be dropped at clone time — Q20's decorrelated plan carried a
+// visible `l_suppkey = l_suppkey` residue before the strip.
+func TestScalarTwoKeyCorrelationStripsTautology(t *testing.T) {
+	cat := catalog.NewInMemory()
+	if _, err := cat.CreateTable(parser.ObjectName{Name: "o"}, []catalog.Column{
+		{Name: "o_k1", Type: catalog.Type{Name: "int8"}},
+		{Name: "o_k2", Type: catalog.Type{Name: "int8"}},
+		{Name: "o_val", Type: catalog.Type{Name: "int8"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cat.CreateTable(parser.ObjectName{Name: "i"}, []catalog.Column{
+		{Name: "i_k1", Type: catalog.Type{Name: "int8"}},
+		{Name: "i_k2", Type: catalog.Type{Name: "int8"}},
+		{Name: "i_qty", Type: catalog.Type{Name: "int8"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sql := `SELECT o_val FROM o WHERE o_val > (
+		SELECT sum(i_qty) FROM i WHERE i_k1 = o_k1 AND i_k2 = o_k2)`
+	node, err := Plan(parseOne(t, sql), cat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasJoinWithAggregateChild(node) {
+		t.Fatalf("2-key correlated scalar did not unnest: %s", planString(node))
+	}
+	var tautology Expr
+	walkPlanExprs(node, func(e Expr) {
+		bin, ok := e.(*BinaryOp)
+		if !ok || bin.Op != parser.OpEq {
+			return
+		}
+		l, lok := bin.Left.(*ColumnRef)
+		r, rok := bin.Right.(*ColumnRef)
+		if lok && rok && l.Index == r.Index && l.Name == r.Name {
+			tautology = e
+		}
+	})
+	if tautology != nil {
+		t.Errorf("replacement-formed self-equality survived the strip: %#v in %s",
+			tautology, planString(node))
 	}
 }
