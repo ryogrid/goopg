@@ -467,13 +467,54 @@ User-directed reorder: S6 ahead of S2, to make Stage 6's harvest enableable.
    null-padded row on the no-match fallback; LEFT is excluded from the new
    Filter-inner path, but the pre-existing hazard deserves an audit.
 
-## Stage 7 — S2a: operator reset prerequisites  [ ]
+## Stage 7 — S2a: operator reset prerequisites  [x]
 
-- [ ] `limitOp.Open` resets `skipped` / `emitted` / `inTiesPhase` / `tieKeyVals`
-- [ ] `seqScanOp` re-open rewinds without leaking `sctx` / scan ring or re-recording SIREAD
-- [ ] double-`Open` unit tests for Limit / SeqScan / Sort(Close+Open)
-- gates: units / spotcheck / pgbench-hook — _pending_
-- commit: _pending_
+- [x] `limitOp.Open` resets `emitted` / `skipped` / `inTiesPhase` / `tieKeyVals` at the
+      top of Open (was reset nowhere — a retained `LIMIT 1` subplan would EOF forever
+      under Stage-9 handle reuse)
+- [x] `seqScanOp` re-open: same-Context re-open takes a new `rewind()` — reuses the held
+      mctx arena (after `sctx.Reset()`, the same contract block-advance already imposes),
+      releases leftover ring/page-pin/scanRow from partial drains, re-reads `NBlocks`,
+      recreates the ring (no documented rewind contract on `storage.ScanRing`), and skips
+      statement-scoped idempotent work (privilege check, SIREAD recording, lock
+      acquisition). Different-Context re-open releases and takes the full path. `Close`
+      refactored onto the shared `releaseScanState()` so the two release paths cannot
+      drift.
+- [x] Sort deliberately gets NO reset path (Stage 9 uses Close+Open); pinned by test
+- [x] `internal/executor/operator_reset_test.go` — 6 tests incl. the sctx-pointer-reuse
+      leak observable, partial-drain pin release, and the `Filter{IndexScan}` double-Open
+      shape S6 made rescan-eligible
+- ch.04 §4.2 addendum: seqScan's re-Open leak also covered the scan ring and a leftover
+  page pin after partial drains (the chapter's "(≈ verify per-op)" hedge, now verified)
+- gates:
+      units:        PASS (2026-07-21, whole module, combined tree with the cancel fix)
+      spotcheck:    PASS (Q12=2 / Q13=33)
+      pgbench-hook: PASS (see commit)
+- commit: _(next stage fills it in)_
+
+## Out-of-band 2 — cancelled-backend spin fix (user-directed, parallel with Stage 7)  [ ]
+
+Fixed the 4th `csq-S6` deferral-ledger row. **Root cause revised by the repro**:
+the NL join probe loops already had throttled `ctx.Err()` checks (M0058-0005) —
+clean cancels always worked. The real gaps were (a) a killed client sends no
+CancelRequest and a CPU-bound query never touches the socket, so nothing ever
+cancelled the context, and (b) the one uncovered drain loop in the incident plan
+was `distinctOp.Open` (the `Unique` node), not the NL join.
+
+- [x] `internal/server/eof_watch.go` — per-query watcher polling the client
+      socket every 500 ms with `recvfrom(MSG_PEEK|MSG_DONTWAIT)` via
+      `SyscallConn().Control`; FIN/errno → `queryCancel()`. MSG_PEEK never
+      consumes and never touches the shared bufio.Reader/deadlines (that hazard
+      is why 0058-0001 §6's read-deadline scheme was rejected); armed around both
+      dispatch sites, skipped for replication connections
+- [x] `distinctOp.Open` drain checks `ctx.Err()` every 1024 rows
+- [x] live repro before/after: client killed at 15 s → CPU stuck ~80–102 %
+      indefinitely before; **0.0 % at t+3 s** after. Clean cancel unchanged
+      (57014). Q12 right after the cancels: canonical 2 rows.
+- [x] tests: 4 in `internal/server/cancel_propagation_test.go` (incl. the
+      MSG_PEEK non-consumption pin), 1 in `internal/executor/cancel_distinct_test.go`
+- gates: shared with Stage 7 above (units PASS, spotcheck PASS)
+- commit: _(next stage fills it in)_
 
 ## Stage 8 — S2b: D4.1 param slots  [ ]
 

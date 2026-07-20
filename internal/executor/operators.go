@@ -462,6 +462,15 @@ func newLimitOp(plan *planner.Limit, child Operator) *limitOp {
 
 func (o *limitOp) Open(ctx *Context) error {
 	o.ctx = ctx
+	// S2a (design bundle ch.04 §4.2): reset the per-execution counters so a
+	// re-Open restarts the limit window. Neither Open nor Close cleared
+	// them before; every consumer happened to Build a fresh operator, so a
+	// retained `LIMIT 1` subplan under handle reuse would return EOF for
+	// every outer row after the first.
+	o.emitted = 0
+	o.skipped = 0
+	o.inTiesPhase = false
+	o.tieKeyVals = nil
 	if err := o.child.Open(ctx); err != nil {
 		return err
 	}
