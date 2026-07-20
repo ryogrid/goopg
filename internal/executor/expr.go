@@ -6427,7 +6427,7 @@ func evalInExpr(x *planner.InExpr, slot SlotView, ctx *Context) (Datum, error) {
 	// semantics; ch.07 M2, fixed for the correlated-empty-inner case in
 	// bundle stage S1b). Only a NON-empty list makes the result NULL.
 	// The subquery therefore must run even for NULL operands; the cost
-	// is bounded by the SubqueryCache and, later, the S2 handles.
+	// is bounded by the sublink result caches and, later, the S2 handles.
 	operandNull := operand.IsNull()
 
 	row := slotToRow(slot)
@@ -6768,12 +6768,12 @@ func collectInValues(x *planner.InExpr, row Row, ctx *Context) ([]Datum, error) 
 		// upstream's InitPlan is evaluated once per statement even when
 		// volatile (see subplan.go).
 		cacheable := x.IsNonCorrelated || subPlanResultCacheable(ctx, x, x.Plan, false)
-		if cacheable && ctx.SubqueryCache != nil {
-			if ctx.SubqueryCacheScope != len(ctx.OuterRows) {
-				clear(ctx.SubqueryCache)
-				ctx.SubqueryCacheScope = len(ctx.OuterRows)
-			}
-			if cached, ok := ctx.SubqueryCache[cacheKey]; ok {
+		// Only param-lowered keys are scope-independent (Stage 10);
+		// everything else lives in the scoped store with the
+		// historical clear-on-depth-change guard.
+		scoped := !lowered
+		if cacheable {
+			if cached, ok := ctx.subqCacheGet(cacheKey, scoped); ok {
 				stat.CacheHits++
 				return cached, nil
 			}
@@ -6810,11 +6810,7 @@ func collectInValues(x *planner.InExpr, row Row, ctx *Context) ([]Datum, error) 
 		// Cache the result so subsequent rows with the same
 		// correlation values skip the inner-plan execution.
 		if cacheable {
-			if ctx.SubqueryCache == nil {
-				ctx.SubqueryCache = make(map[string][]Datum)
-				ctx.SubqueryCacheScope = len(ctx.OuterRows)
-			}
-			ctx.SubqueryCache[cacheKey] = out
+			ctx.subqCachePut(cacheKey, scoped, out)
 		}
 		return out, nil
 	}
@@ -6890,29 +6886,21 @@ func evalExistsExpr(x *planner.ExistsExpr, row Row, ctx *Context) (Datum, error)
 	// returns the same boolean for every outer row. Cache it
 	// under a constant key.
 	if x.IsNonCorrelated {
+		// Scoped store: the IsNonCorrelated flag is only trustworthy
+		// where lowering verified it, and a non-correlated EXISTS is
+		// never lowered (no params) — keep the historical
+		// clear-on-depth-change guard (Stage 10).
 		cacheKey := nonCorrelatedCacheKey(x)
-		if ctx.SubqueryCache != nil {
-			if ctx.SubqueryCacheScope != len(ctx.OuterRows) {
-				clear(ctx.SubqueryCache)
-				ctx.SubqueryCacheScope = len(ctx.OuterRows)
-			}
-			if cached, ok := ctx.SubqueryCache[cacheKey]; ok {
-				if len(cached) == 1 {
-					stat.CacheHits++
-					return cached[0], nil
-				}
-			}
+		if cached, ok := ctx.subqCacheGet(cacheKey, true); ok && len(cached) == 1 {
+			stat.CacheHits++
+			return cached[0], nil
 		}
 		stat.CacheMisses++
 		val, err := existsImpl(x, ctx)
 		if err != nil {
 			return Datum{}, err
 		}
-		if ctx.SubqueryCache == nil {
-			ctx.SubqueryCache = make(map[string][]Datum)
-			ctx.SubqueryCacheScope = len(ctx.OuterRows)
-		}
-		ctx.SubqueryCache[cacheKey] = []Datum{val}
+		ctx.subqCachePut(cacheKey, true, []Datum{val})
 		return val, nil
 	}
 	return existsImpl(x, ctx)
@@ -6974,7 +6962,7 @@ func evalSubquery(x *planner.SubqueryExpr, row Row, ctx *Context) (Datum, error)
 	stat.Calls++
 
 	// Fast path: correlated subquery whose inner plan is an index-probe
-	// chain. Skip SubqueryCache entirely — the operator rescans correctly
+	// chain. Skip the result caches entirely — the operator rescans correctly
 	// per outer row (Stage-9 handle, or the legacy CorrSubqOps registry
 	// when the engine is off), so the key-build + map overhead is
 	// unnecessary. Rescanning caches nothing, so this path needs no
@@ -7000,12 +6988,11 @@ func evalSubquery(x *planner.SubqueryExpr, row Row, ctx *Context) (Datum, error)
 	// inner plan is volatility/LockRows-free (Stage 9 gate, ch.07 M13);
 	// non-correlated results follow InitPlan semantics and always cache.
 	cacheable := x.IsNonCorrelated || subPlanResultCacheable(ctx, x, x.Plan, false)
-	if cacheable && ctx.SubqueryCache != nil {
-		if ctx.SubqueryCacheScope != len(ctx.OuterRows) {
-			clear(ctx.SubqueryCache)
-			ctx.SubqueryCacheScope = len(ctx.OuterRows)
-		}
-		if cached, ok := ctx.SubqueryCache[cacheKey]; ok {
+	// Stage 10: lowered keys are scope-independent; the rest keep the
+	// clear-on-depth-change guard (see Context field comment).
+	scoped := !lowered
+	if cacheable {
+		if cached, ok := ctx.subqCacheGet(cacheKey, scoped); ok {
 			stat.CacheHits++
 			if len(cached) == 1 {
 				return cached[0], nil
@@ -7020,11 +7007,7 @@ func evalSubquery(x *planner.SubqueryExpr, row Row, ctx *Context) (Datum, error)
 	}
 	// Store in cache
 	if cacheable {
-		if ctx.SubqueryCache == nil {
-			ctx.SubqueryCache = make(map[string][]Datum)
-			ctx.SubqueryCacheScope = len(ctx.OuterRows)
-		}
-		ctx.SubqueryCache[cacheKey] = []Datum{val}
+		ctx.subqCachePut(cacheKey, scoped, []Datum{val})
 	}
 	return val, nil
 }
@@ -7094,6 +7077,23 @@ func subqueryImpl(x *planner.SubqueryExpr, ctx *Context) (Datum, error) {
 			if built {
 				ctx.subPlanStat(x).CacheHits++
 			} else {
+				// The map freezes a whole inner table's worth of
+				// derived values, so it draws on the shared result
+				// cache budget (Stage 10, D4.5/D6.4): a pre-build
+				// reservation from the planner's row estimate, then
+				// a post-build reconcile to the measured size. When
+				// either step does not fit, the statement falls back
+				// to the per-row rescan path below — always correct,
+				// just uncached.
+				reserved, fits := ctx.corrSubqHashMapReserve(info.scan)
+				if !fits {
+					op, done, err := acquireSubPlanOp(ctx, x, x.Plan, false)
+					if err != nil {
+						return Datum{}, err
+					}
+					defer done()
+					return subqueryReadOne(op, x)
+				}
 				// Building the map scans the whole inner table
 				// once — a rebuild, but only ever one of them.
 				st := ctx.subPlanStat(x)
@@ -7104,7 +7104,12 @@ func subqueryImpl(x *planner.SubqueryExpr, ctx *Context) (Datum, error) {
 				if hmErr != nil {
 					return Datum{}, hmErr
 				}
-				ctx.CorrSubqHashMaps[x] = hm
+				if ctx.corrSubqHashMapReconcile(reserved, hm) {
+					ctx.CorrSubqHashMaps[x] = hm
+				}
+				// On reconcile failure the map still answers THIS
+				// row (it is already built), it just is not
+				// retained — the next row rebuilds or rescans.
 			}
 			// Look up the outer column value.
 			outerVal, err := evalExprSlot(info.outerRef, nil, ctx)

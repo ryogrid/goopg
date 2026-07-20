@@ -9,6 +9,7 @@ import (
 
 	"github.com/goopg/goopg/internal/activity"
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/executor/kvcache"
 	"github.com/goopg/goopg/internal/lockmgr"
 	"github.com/goopg/goopg/internal/lockwait"
 	"github.com/goopg/goopg/internal/mctx"
@@ -96,15 +97,30 @@ type Context struct {
 	// innermost outer scope.
 	OuterRows []Row
 
-	// SubqueryCache stores subquery results keyed by outer-row
-	// values so correlated subqueries are executed at most once
-	// per distinct outer value rather than per outer row.  Keys
-	// are datumKey-derived strings; values are []Dat um for
-	// InExpr or Datum for scalar subqueries.  The cache is
-	// notionally per-subquery — a production implementation
-	// would namespace by InExpr/SubqueryExpr identity.
-	SubqueryCache      map[string][]Datum
-	SubqueryCacheScope int // OuterRows len when cached; cleared on change
+	// Sublink result caches (Stage 10, D4.4/D4.5). Two stores over one
+	// shared byte budget (subqBudget, capped at WorkMem/4 per ch.06
+	// D6.4; WorkMem == 0 means unlimited — never a silent fallback
+	// constant):
+	//
+	//   - subqCacheSafe holds entries whose keys are provably
+	//     scope-independent: param-lowered sublinks (key = expr pointer
+	//     + bound param VALUES, which — thanks to Level-forwarding —
+	//     reflect every outer row the sublink truly depends on). These
+	//     survive OuterRows depth changes.
+	//   - subqCacheScoped holds every other key family (full-outer-row
+	//     keys and constant IsNonCorrelated keys on unlowered paths)
+	//     and keeps the historical guard: cleared whenever the
+	//     OuterRows depth changes (subqCacheScope). The guard stays
+	//     because an unlowered sublink's IsNonCorrelated flag can be
+	//     wrong when its only correlation hides inside a nested
+	//     sublink (the flag's walker does not descend .Plan; lowering
+	//     corrects the flag, but only where lowering ran).
+	//
+	// Access goes through subqCacheGet/subqCachePut in subq_cache.go.
+	subqBudget      *kvcache.Budget
+	subqCacheSafe   *kvcache.Cache
+	subqCacheScoped *kvcache.Cache
+	subqCacheScope  int // OuterRows len for subqCacheScoped's entries
 
 	// ParamExec is the PARAM_EXEC analog (D4.1): one slot per
 	// plan-assigned ExecParamRef ID, filled by a lowered sublink's eval
@@ -156,7 +172,7 @@ type Context struct {
 	// bundle, gate V6). Surfaced by EXPLAIN ANALYZE.
 	//
 	// Written on the single statement-executing goroutine, in the
-	// same style as SubqueryCache above; no synchronisation.
+	// same style as the sublink result caches above; no synchronisation.
 	SubPlanStats map[planner.Expr]*SubPlanSiteStats
 
 	// MultiAssignSubqCache caches the result row of a MultiAssignSubqRow
@@ -724,7 +740,7 @@ type SubPlanSiteStats struct {
 	// operator tree that was already built (the CorrSubqOps path).
 	Rescans int64
 	// CacheHits / CacheMisses count Calls answered from, or
-	// missing in, a result cache (SubqueryCache or the correlated
+	// missing in, a result cache (the kvcache-backed sublink stores or the correlated
 	// hash-map path). A miss is normally followed by a Rebuild.
 	CacheHits   int64
 	CacheMisses int64
