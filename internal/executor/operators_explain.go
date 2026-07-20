@@ -328,18 +328,18 @@ func (o *explainOp) Close() error { return nil }
 // default). `EXPLAIN (COSTS OFF) ...` therefore renders bare
 // node labels, matching upstream `COSTS OFF` output.
 func walkPlan(b *strings.Builder, n planner.Node, depth int, rows *[]Row, opts parser.ExplainOptions) {
-	walkPlanFiltered(n, depth, rows, opts, nil)
+	walkPlanFiltered(n, depth, rows, opts, nil, &subPlanReg{})
 }
 
 // walkPlanFiltered is the inner driver for walkPlan. attachedFilter
 // is a Filter.Predicate carried down from a Filter wrapper that
 // was skipped above us — it is rendered as `Filter:` detail under
 // the next scan-like node we render.
-func walkPlanFiltered(n planner.Node, depth int, rows *[]Row, opts parser.ExplainOptions, attachedFilter planner.Expr) {
+func walkPlanFiltered(n planner.Node, depth int, rows *[]Row, opts parser.ExplainOptions, attachedFilter planner.Expr, reg *subPlanReg) {
 	// Skip Project wrappers: PG has no "Projection" plan node;
 	// the projection is part of the parent / scan's render.
 	if p, ok := n.(*planner.Project); ok {
-		walkPlanFiltered(p.Child, depth, rows, opts, attachedFilter)
+		walkPlanFiltered(p.Child, depth, rows, opts, attachedFilter, reg)
 		return
 	}
 	// Skip Filter wrappers and push their predicate down to be
@@ -355,7 +355,7 @@ func walkPlanFiltered(n planner.Node, depth int, rows *[]Row, opts parser.Explai
 		if attachedFilter != nil {
 			next = attachedFilter
 		}
-		walkPlanFiltered(f.Child, depth, rows, opts, next)
+		walkPlanFiltered(f.Child, depth, rows, opts, next, reg)
 		return
 	}
 
@@ -383,7 +383,7 @@ func walkPlanFiltered(n planner.Node, depth int, rows *[]Row, opts parser.Explai
 	// label plus 2 spaces, mirroring PG's `Sort Key:` / `Index
 	// Cond:` / `Filter:` indent convention.
 	detailIndent := strings.Repeat(" ", len(prefix)+2)
-	emitNodeDetailLines(n, detailIndent, rows, attachedFilter)
+	emitNodeDetailLines(n, detailIndent, rows, attachedFilter, reg)
 
 	if opts.Verbose {
 		if cols := schemaColumnNames(n); len(cols) > 0 {
@@ -392,8 +392,45 @@ func walkPlanFiltered(n planner.Node, depth int, rows *[]Row, opts parser.Explai
 		}
 	}
 
+	// Sublinks referenced by this node's detail lines print their
+	// inner plan as an indented `SubPlan N` subtree, as upstream's
+	// ExplainSubPlans does.
+	emitSubPlanSubtrees(rows, depth, detailIndent, opts, reg, func(sub planner.Node, subDepth int) {
+		walkPlanFiltered(sub, subDepth, rows, opts, nil, reg)
+	})
+
 	for _, c := range planChildren(n) {
-		walkPlanFiltered(c, depth+1, rows, opts, nil)
+		walkPlanFiltered(c, depth+1, rows, opts, nil, reg)
+	}
+}
+
+// emitSubPlanSubtrees drains the sublinks assigned while rendering
+// the current node and prints each as
+//
+//	SubPlan N
+//	  ->  <inner plan tree>
+//
+// render walks one sublink's inner plan at the given depth. The
+// queue is drained in a loop because a sublink's own plan can
+// reference further sublinks, which assign higher numbers as they
+// are rendered (matching upstream's nested-SubPlan output).
+func emitSubPlanSubtrees(rows *[]Row, depth int, detailIndent string, opts parser.ExplainOptions, reg *subPlanReg, render func(planner.Node, int)) {
+	for {
+		pending := reg.takePending()
+		if len(pending) == 0 {
+			return
+		}
+		for _, sp := range pending {
+			*rows = append(*rows, Row{NewStringDatum(detailIndent + fmt.Sprintf("SubPlan %d", sp.n))})
+			if sp.plan != nil {
+				// Indent the sublink's plan one "->" level under the
+				// `SubPlan N` line, matching upstream's shape. A node
+				// rendered at depth d starts its "->" at 2*d columns,
+				// while detailIndent sits at 2*depth+6; depth+4 puts
+				// the subtree at 2*depth+8 — i.e. detailIndent+2.
+				render(sp.plan, depth+4)
+			}
+		}
 	}
 }
 
@@ -401,13 +438,13 @@ func walkPlanFiltered(n planner.Node, depth int, rows *[]Row, opts parser.Explai
 // belong under n (Sort Key / Index Cond / Filter). attachedFilter
 // is a Filter.Predicate from a Filter wrapper above n that was
 // skipped — it surfaces as `Filter:` when n is a scan-like node.
-func emitNodeDetailLines(n planner.Node, indent string, rows *[]Row, attachedFilter planner.Expr) {
+func emitNodeDetailLines(n planner.Node, indent string, rows *[]Row, attachedFilter planner.Expr, reg *subPlanReg) {
 	switch p := n.(type) {
 	case *planner.Sort:
 		if len(p.Keys) > 0 {
 			parts := make([]string, 0, len(p.Keys))
 			for _, k := range p.Keys {
-				s := formatExprPG(k.Expr)
+				s := formatExprPGReg(k.Expr, reg)
 				if k.Desc {
 					s += " DESC"
 				}
@@ -423,15 +460,15 @@ func emitNodeDetailLines(n planner.Node, indent string, rows *[]Row, attachedFil
 			*rows = append(*rows, Row{NewStringDatum(indent + "Sort Key: " + strings.Join(parts, ", "))})
 		}
 	case *planner.IndexScan:
-		if cond := formatIndexCond(p); cond != "" {
+		if cond := formatIndexCond(p, reg); cond != "" {
 			*rows = append(*rows, Row{NewStringDatum(indent + "Index Cond: " + cond)})
 		}
 		if attachedFilter != nil {
-			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprPG(attachedFilter)))})
+			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprPGReg(attachedFilter, reg)))})
 		}
 	case *planner.SeqScan:
 		if attachedFilter != nil {
-			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprPG(attachedFilter)))})
+			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprPGReg(attachedFilter, reg)))})
 		}
 	default:
 		// Non-scan nodes keep an attached Filter alive — render it
@@ -440,7 +477,7 @@ func emitNodeDetailLines(n planner.Node, indent string, rows *[]Row, attachedFil
 		// Aggregate). Matches PG's behaviour of rendering Filter on
 		// the node it most directly applies to.
 		if attachedFilter != nil {
-			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprPG(attachedFilter)))})
+			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprPGReg(attachedFilter, reg)))})
 		}
 	}
 }
@@ -448,7 +485,7 @@ func emitNodeDetailLines(n planner.Node, indent string, rows *[]Row, attachedFil
 // formatIndexCond renders the equality / range condition of an
 // IndexScan node as a PG-style `(col = key)` (or range) expression.
 // Empty when the scan has no bound (full-range probe).
-func formatIndexCond(p *planner.IndexScan) string {
+func formatIndexCond(p *planner.IndexScan, reg *subPlanReg) string {
 	if p == nil || p.Index == nil {
 		return ""
 	}
@@ -456,27 +493,27 @@ func formatIndexCond(p *planner.IndexScan) string {
 	// Multi-column equality probe.
 	if len(p.Keys) > 0 && len(cols) >= len(p.Keys) {
 		if len(p.Keys) == 1 {
-			return wrapParen(cols[0] + " = " + formatExprPG(p.Keys[0]))
+			return wrapParen(cols[0] + " = " + formatExprPGReg(p.Keys[0], reg))
 		}
 		parts := make([]string, len(p.Keys))
 		for i, k := range p.Keys {
-			parts[i] = cols[i] + " = " + formatExprPG(k)
+			parts[i] = cols[i] + " = " + formatExprPGReg(k, reg)
 		}
 		return wrapParen(strings.Join(parts, " AND "))
 	}
 	// Single-column equality.
 	if p.Key != nil && len(cols) > 0 {
-		return wrapParen(cols[0] + " = " + formatExprPG(p.Key))
+		return wrapParen(cols[0] + " = " + formatExprPGReg(p.Key, reg))
 	}
 	// Range scan.
 	if (p.LowKey != nil || p.HighKey != nil) && len(cols) > 0 {
 		col := cols[0]
 		var parts []string
 		if p.LowKey != nil {
-			parts = append(parts, col+" >= "+formatExprPG(p.LowKey))
+			parts = append(parts, col+" >= "+formatExprPGReg(p.LowKey, reg))
 		}
 		if p.HighKey != nil {
-			parts = append(parts, col+" <= "+formatExprPG(p.HighKey))
+			parts = append(parts, col+" <= "+formatExprPGReg(p.HighKey, reg))
 		}
 		if len(parts) > 0 {
 			return wrapParen(strings.Join(parts, " AND "))
@@ -509,13 +546,88 @@ func wrapParen(s string) string {
 	return "(" + s + ")"
 }
 
+// subPlanReg assigns PG-style "SubPlan N" numbers to the sublink
+// expressions encountered while rendering one EXPLAIN result, and
+// queues their inner plans so the owning node can print them as
+// indented `SubPlan N` subtrees (upstream: ExplainSubPlans in
+// postgres/src/backend/commands/explain.c).
+//
+// Numbers are allocated in render (pre-order) encounter order,
+// which is deterministic for a given plan. goopg has no plan-time
+// SubPlan node to carry upstream's `plan_id`, so the numbering is
+// display-local; it becomes structural when param slots land
+// (design 04-subplan-execution-engine.md, D4.1).
+//
+// A nil *subPlanReg is safe to use: assign reports 0 and queues
+// nothing, so callers without a registry (JSON rendering, direct
+// formatExprPG users) keep working unchanged.
+type subPlanReg struct {
+	num     map[planner.Expr]int
+	pending []subPlanEntry
+}
+
+// subPlanEntry is one assigned-but-not-yet-emitted sublink.
+type subPlanEntry struct {
+	n    int
+	plan planner.Node
+}
+
+// assign returns the SubPlan number already given to e, or
+// allocates the next one and queues e's inner plan for emission.
+func (r *subPlanReg) assign(e planner.Expr, plan planner.Node) int {
+	if r == nil {
+		return 0
+	}
+	if n, ok := r.num[e]; ok {
+		return n
+	}
+	if r.num == nil {
+		r.num = make(map[planner.Expr]int)
+	}
+	n := len(r.num) + 1
+	r.num[e] = n
+	r.pending = append(r.pending, subPlanEntry{n: n, plan: plan})
+	return n
+}
+
+// takePending returns the sublinks assigned since the last call
+// and clears the queue.
+func (r *subPlanReg) takePending() []subPlanEntry {
+	if r == nil || len(r.pending) == 0 {
+		return nil
+	}
+	out := r.pending
+	r.pending = nil
+	return out
+}
+
+// subPlanName renders the `SubPlan N` token for e, matching
+// upstream's SubPlan.plan_name. Without a registry the number is
+// unknown, so the bare kind is printed instead of a wrong number.
+func subPlanName(r *subPlanReg, e planner.Expr, plan planner.Node) string {
+	if n := r.assign(e, plan); n > 0 {
+		return fmt.Sprintf("SubPlan %d", n)
+	}
+	return "SubPlan"
+}
+
 // formatExprPG renders a planner expression in upstream PG's
-// EXPLAIN style: column names, integer/string/numeric literals,
-// and infix operators. Falls back to a compact `<type>` token
-// for expression kinds we don't yet render (sufficient for the
-// isolation specs that pass through `EXPLAIN (COSTS OFF)`; the
-// detail line is informational).
+// EXPLAIN style with no SubPlan registry — sublinks render as
+// `SubPlan` without a number. Prefer formatExprPGReg from the
+// EXPLAIN walkers so sublinks are numbered and their subtrees
+// emitted.
 func formatExprPG(e planner.Expr) string {
+	return formatExprPGReg(e, nil)
+}
+
+// formatExprPGReg renders a planner expression in upstream PG's
+// EXPLAIN style: column names, integer/string/numeric literals,
+// and infix operators. Sublinks (EXISTS / IN / scalar subquery)
+// render as PG-style SubPlan references via reg. Falls back to a
+// compact `<type>` token for expression kinds we don't yet render
+// (sufficient for the isolation specs that pass through
+// `EXPLAIN (COSTS OFF)`; the detail line is informational).
+func formatExprPGReg(e planner.Expr, reg *subPlanReg) string {
 	if e == nil {
 		return ""
 	}
@@ -540,21 +652,95 @@ func formatExprPG(e planner.Expr) string {
 	case *planner.NullConst:
 		return "NULL"
 	case *planner.BinaryOp:
-		return "(" + formatExprPG(x.Left) + " " + x.Op.String() + " " + formatExprPG(x.Right) + ")"
+		return "(" + formatExprPGReg(x.Left, reg) + " " + x.Op.String() + " " + formatExprPGReg(x.Right, reg) + ")"
 	case *planner.UnaryOp:
-		return "(" + x.Op.String() + " " + formatExprPG(x.Operand) + ")"
+		return "(" + x.Op.String() + " " + formatExprPGReg(x.Operand, reg) + ")"
 	case *planner.CastExpr:
-		return formatExprPG(x.Operand)
+		return formatExprPGReg(x.Operand, reg)
 	case *planner.FuncCall:
 		args := make([]string, len(x.Args))
 		for i, a := range x.Args {
-			args[i] = formatExprPG(a)
+			args[i] = formatExprPGReg(a, reg)
 		}
 		return x.Name + "(" + strings.Join(args, ", ") + ")"
 	case *planner.ParamRef:
 		return fmt.Sprintf("$%d", x.Number)
+	case *planner.TypedStringLit:
+		// Upstream renders a typed literal as `'value'::type`
+		// (ruleutils.c get_const_expr with showtype).
+		return "'" + strings.ReplaceAll(x.Value, "'", "''") + "'::" + x.Type
+	case *planner.IntervalLit:
+		// `interval 'N' <unit>` (Qualified) folds the unit into the
+		// literal text so the rendering stays a single typed constant.
+		lit := x.Value
+		if x.Unit != "" {
+			lit += " " + x.Unit
+		}
+		return "'" + strings.ReplaceAll(lit, "'", "''") + "'::interval"
+	case *planner.ExistsExpr:
+		// Upstream renders EXISTS sublinks as `EXISTS(SubPlan N)`
+		// (ruleutils.c get_rule_expr, T_SubPlan / EXISTS_SUBLINK).
+		s := "EXISTS(" + subPlanName(reg, x, x.Plan) + ")"
+		if x.Negated {
+			return "NOT " + s
+		}
+		return s
+	case *planner.SubqueryExpr:
+		// EXPR_SUBLINK: upstream decorates scalar subplan
+		// references with nothing but parentheses.
+		return "(" + subPlanName(reg, x, x.Plan) + ")"
+	case *planner.ArraySubqueryExpr:
+		// ARRAY_SUBLINK: upstream prints `ARRAY(<plan_name>)`.
+		return "ARRAY(" + subPlanName(reg, x, x.Plan) + ")"
+	case *planner.InExpr:
+		return formatInExprPG(x, reg)
 	}
 	return fmt.Sprintf("<%T>", e)
+}
+
+// formatInExprPG renders an InExpr — either a sublink form
+// (`x = ANY (SubPlan N)`) or a literal in-list (`x = ANY (...)`).
+//
+// Divergence from upstream: PG renders an ANY sublink as
+// `(ANY (<testexpr>))`, where the testexpr's PARAM_EXEC
+// references (`$0`) stand in for the subplan's output. goopg has
+// no param slots yet, so the operand and the SubPlan reference are
+// rendered side by side instead; this converges on PG's form when
+// D4.1 lands param slots.
+func formatInExprPG(x *planner.InExpr, reg *subPlanReg) string {
+	operand := formatExprPGReg(x.Operand, reg)
+
+	// Comparison spelling: default `=` for IN, or the explicit
+	// operator when the parser recorded one (`col < ALL (...)`).
+	op := "="
+	if x.AnyOp != 0 {
+		op = x.AnyOp.String()
+	} else if x.NotEqualAny {
+		op = "<>"
+	}
+	// Quantifier: ALL for `op ALL(...)`, ANY otherwise. A plain
+	// NOT IN is `NOT (x = ANY (...))`, matching PG's deparse.
+	quant := "ANY"
+	if x.AllOp {
+		quant = "ALL"
+	}
+
+	var rhs string
+	if x.Plan != nil {
+		rhs = subPlanName(reg, x, x.Plan)
+	} else {
+		parts := make([]string, len(x.List))
+		for i, v := range x.List {
+			parts[i] = formatExprPGReg(v, reg)
+		}
+		rhs = strings.Join(parts, ", ")
+	}
+
+	s := "(" + operand + " " + op + " " + quant + " (" + rhs + "))"
+	if x.Negated {
+		return "(NOT " + s + ")"
+	}
+	return s
 }
 
 // schemaColumnNames returns the names of n's output columns,
@@ -578,12 +764,12 @@ func schemaColumnNames(n planner.Node) []string {
 // from the instrumentation table. Loops > 0 means the operator
 // ran at least once. Total time is in milliseconds.
 func walkPlanAnalyze(b *strings.Builder, n planner.Node, depth int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable) {
-	walkPlanAnalyzeFiltered(n, depth, rows, opts, stats, nil)
+	walkPlanAnalyzeFiltered(n, depth, rows, opts, stats, nil, &subPlanReg{})
 }
 
-func walkPlanAnalyzeFiltered(n planner.Node, depth int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable, attachedFilter planner.Expr) {
+func walkPlanAnalyzeFiltered(n planner.Node, depth int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable, attachedFilter planner.Expr, reg *subPlanReg) {
 	if p, ok := n.(*planner.Project); ok {
-		walkPlanAnalyzeFiltered(p.Child, depth, rows, opts, stats, attachedFilter)
+		walkPlanAnalyzeFiltered(p.Child, depth, rows, opts, stats, attachedFilter, reg)
 		return
 	}
 	if f, ok := n.(*planner.Filter); ok {
@@ -591,7 +777,7 @@ func walkPlanAnalyzeFiltered(n planner.Node, depth int, rows *[]Row, opts parser
 		if attachedFilter != nil {
 			next = attachedFilter
 		}
-		walkPlanAnalyzeFiltered(f.Child, depth, rows, opts, stats, next)
+		walkPlanAnalyzeFiltered(f.Child, depth, rows, opts, stats, next, reg)
 		return
 	}
 
@@ -621,7 +807,7 @@ func walkPlanAnalyzeFiltered(n planner.Node, depth int, rows *[]Row, opts parser
 	*rows = append(*rows, Row{NewStringDatum(label)})
 
 	detailIndent := strings.Repeat(" ", len(prefix)+2)
-	emitNodeDetailLines(n, detailIndent, rows, attachedFilter)
+	emitNodeDetailLines(n, detailIndent, rows, attachedFilter, reg)
 
 	// IndexOnlyScan emits a "Heap Fetches: N" detail line under ANALYZE,
 	// matching upstream's text format (design 0118-0102).
@@ -653,8 +839,14 @@ func walkPlanAnalyzeFiltered(n planner.Node, depth int, rows *[]Row, opts parser
 		}
 	}
 
+	// Sublink subtrees keep their instrumentation: stats is passed
+	// through so inner nodes still report actual rows / loops.
+	emitSubPlanSubtrees(rows, depth, detailIndent, opts, reg, func(sub planner.Node, subDepth int) {
+		walkPlanAnalyzeFiltered(sub, subDepth, rows, opts, stats, nil, reg)
+	})
+
 	for _, c := range planChildren(n) {
-		walkPlanAnalyzeFiltered(c, depth+1, rows, opts, stats, nil)
+		walkPlanAnalyzeFiltered(c, depth+1, rows, opts, stats, nil, reg)
 	}
 }
 
@@ -832,10 +1024,18 @@ func describePlan(n planner.Node) string {
 		if p.Algo == planner.JoinAlgoMerge {
 			algo = "Merge Join"
 		}
-		if p.Algo == planner.JoinAlgoHash && p.BuildLeft {
-			return fmt.Sprintf("%s (%s, build=left)", algo, joinTypeName(p.Type))
+		// A NullAware anti join (from unnesting a non-correlated
+		// NOT IN, M0122-0011) carries three-valued-NULL semantics
+		// the join type alone does not convey; surface it so plan
+		// diffs can tell the two anti joins apart.
+		jt := joinTypeName(p.Type)
+		if p.Type == planner.JoinTypeAnti && p.NullAware {
+			jt += " NULL-AWARE"
 		}
-		return fmt.Sprintf("%s (%s)", algo, joinTypeName(p.Type))
+		if p.Algo == planner.JoinAlgoHash && p.BuildLeft {
+			return fmt.Sprintf("%s (%s, build=left)", algo, jt)
+		}
+		return fmt.Sprintf("%s (%s)", algo, jt)
 	case *planner.Distinct:
 		return "Unique"
 	case *planner.Aggregate:
@@ -935,6 +1135,15 @@ func joinTypeName(t planner.JoinType) string {
 		return "FULL"
 	case planner.JoinTypeCross:
 		return "CROSS"
+	case planner.JoinTypeSemi:
+		// Produced by EXISTS / IN unnesting (M0061-0001). Rendered
+		// inside goopg's `<algo> (<type>)` label rather than
+		// upstream's `Hash Semi Join` node spelling — switching to
+		// PG's spelling would churn every existing plan line and is
+		// tracked separately.
+		return "SEMI"
+	case planner.JoinTypeAnti:
+		return "ANTI"
 	}
 	return "?"
 }

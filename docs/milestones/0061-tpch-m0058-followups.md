@@ -1,5 +1,16 @@
 # Milestone 0061 — TPC-H M0058 Follow-ups
 
+> **Annotation 2026-07-20 (historical status correction).** M0061-0001
+> (EXISTS/NOT EXISTS → semi/anti join unnesting) **landed** in commit `faf2e71f`
+> despite the unticked boxes below. A 2026-07-20 measurement found that the
+> shipped pass does **not fire on the TPC-H bench schema**: an index on the inner
+> correlation column moves the correlation equijoin into `IndexScan.Key`, where
+> the unnest collectors never look
+> (`docs/design/correlated-subquery-planning/evidence/review-probes-20260720.md`).
+> Follow-up work is now owned by the design bundle
+> [`docs/design/correlated-subquery-planning/`](../design/correlated-subquery-planning/README.md);
+> re-enablement is its phase S1. Left as written for the historical record.
+
 **Status:** planned
 **Depends on:** Milestone 0058 (commit `d509107`, verified in
 `analysis/tpch-m0058-verification-2026-05-07.md`)
