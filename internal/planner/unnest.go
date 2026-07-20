@@ -1,6 +1,7 @@
 package planner
 
 import (
+	"os"
 	"strings"
 	"sync/atomic"
 
@@ -26,6 +27,14 @@ var subqueryUnnestOn atomic.Bool
 
 func init() {
 	subqueryUnnestOn.Store(true)
+	// Default ON since phase S6 (D6.2 minimal) landed: with index-driven
+	// semi/anti NLI + the scalar probe-cheap policy, decorrelation no
+	// longer regresses the selective TPC-H shapes (measured — see
+	// IMPLEMENTATION-TODO.md Stage 6b). Rollback switches:
+	// SetIndexKeyHarvestEnabled(false) from Go, or the environment
+	// variable GOOPG_INDEXKEY_HARVEST=off at server start (operational
+	// kill switch, same spirit as the planned GOOPG_SUBPLAN_RESCAN).
+	indexKeyHarvestOn.Store(os.Getenv("GOOPG_INDEXKEY_HARVEST") != "off")
 }
 
 // SetSubqueryUnnestEnabled flips the sublink pull-up pass on or off.
@@ -311,6 +320,77 @@ func countSublinksInExpr(e Expr) int {
 	return n
 }
 
+// pushConjunctsBelowSemiAnti sinks f's sublink-free conjuncts below the
+// semi/anti join chain sitting directly under it, onto the chain's true
+// outer input. S6 (D6.2), design bundle
+// docs/design/correlated-subquery-planning.
+//
+// Semantics: a semi/anti join only *filters* its outer side — it never
+// duplicates, drops-and-extends, or projects inner columns — so for any
+// outer-side predicate p, σ_p(outer ⋉ inner) ≡ σ_p(outer) ⋉ inner (and
+// likewise for ▷). Every conjunct left on f after the pull-up loops
+// references the outer schema by construction (semi/anti output IS the
+// outer schema), so column indices need no translation on the way down.
+//
+// Why it matters: the conjuncts sunk here are exactly the ones the
+// SubPlan path evaluated *before* the sublink via AND short-circuit.
+// TPC-H Q4 probes its EXISTS for only the ~57 K date-qualified orders on
+// the SubPlan path; without this sink the decorrelated semi join drives
+// from all 1.5 M rows — and the NLI cost gate, seeing the raw scan
+// estimate, refuses the index-driven form outright. Sinking restores
+// both the driving cardinality and the gate's view of it.
+//
+// Conjuncts that still carry a sublink stay on f: their evaluation
+// point is unchanged either way, and the EXPLAIN/driver machinery
+// expects surviving SubPlan filters above the join.
+func pushConjunctsBelowSemiAnti(f *Filter) {
+	top, ok := f.Child.(*Join)
+	if !ok || (top.Type != JoinTypeSemi && top.Type != JoinTypeAnti) {
+		return
+	}
+	var sinkable, keep []Expr
+	for _, c := range splitAnd(f.Predicate) {
+		if bc, isBool := c.(*BooleanConst); isBool && bc.Value {
+			continue // tautology left by a completed pull-up
+		}
+		if countSublinksInExpr(c) == 0 {
+			sinkable = append(sinkable, c)
+		} else {
+			keep = append(keep, c)
+		}
+	}
+	if len(sinkable) == 0 {
+		return
+	}
+	// Descend to the bottom of the semi/anti chain.
+	bottom := top
+	for {
+		next, isJoin := bottom.Left.(*Join)
+		if !isJoin || (next.Type != JoinTypeSemi && next.Type != JoinTypeAnti) {
+			break
+		}
+		bottom = next
+	}
+	if inner, isF := bottom.Left.(*Filter); isF {
+		// Merge into an existing outer-side Filter rather than stacking.
+		inner.Predicate = combineAnd(append(sinkable, splitAnd(inner.Predicate)...))
+	} else {
+		bottom.Left = &Filter{
+			pos:       f.Pos(),
+			Predicate: combineAnd(sinkable),
+			Child:     bottom.Left,
+		}
+	}
+	// Each semi/anti join in the chain publishes its outer's schema;
+	// wrapping the outer in a Filter changes no widths or names, so
+	// the cached schemas stay valid.
+	if len(keep) == 0 {
+		f.Predicate = &BooleanConst{pos: f.Pos(), Value: true}
+	} else {
+		f.Predicate = combineAnd(keep)
+	}
+}
+
 // unnestSubqueriesInPlan walks the plan tree and attempts to
 // unnest any SubqueryExpr found in Filter predicates. This is
 // the post-pass called after the initial plan tree is built
@@ -401,6 +481,13 @@ func unnestSubqueriesInPlan(node Node) Node {
 		// (e.g. Q20's lineitem scalar subquery inside the partsupp IN
 		// clause, where the outer IN itself has no equijoin correlation).
 		n.Predicate = walkSubqueryPlansInExpr(n.Predicate)
+		// S6 (D6.2): once every sublink at this Filter has been
+		// processed, sink the remaining sublink-free conjuncts BELOW
+		// any semi/anti join chain the pull-ups installed. Doing it
+		// after the loops (not inside the rewrites) matters: a second
+		// sublink in the same predicate (Q21's NOT EXISTS next to its
+		// EXISTS) must stay visible to the driver loops above.
+		pushConjunctsBelowSemiAnti(n)
 	case *Join:
 		n.Left = unnestSubqueriesInPlan(n.Left)
 		n.Right = unnestSubqueriesInPlan(n.Right)
@@ -543,7 +630,52 @@ func canUnnestSubquery(sub *SubqueryExpr) bool {
 	if params == nil {
 		return false
 	}
-	return len(params) > 0
+	if len(params) == 0 {
+		return false
+	}
+	// S6 (D6.2) selectivity-aware policy — a measured amendment to the
+	// bundle's D6.1 ("decorrelation is structural, not costed"): on this
+	// executor, decorrelating a scalar whose inner plan is already an
+	// index-probe shape is a LOSS, because the executor's CorrSubqOps
+	// path rescans that shape per distinct outer key without rebuilding
+	// (Q17: rebuilds=1, rescans=6667). Rewriting it into a whole-table
+	// GROUP BY + join was measured at SF1 as Q17 58.27 s → 86.65 s and
+	// Q20 12.29 s → 26.57 s. A NON-probe-shaped inner has no such cheap
+	// path — Q2's Aggregate over a 4-table join was rebuilt per call at
+	// ≈26 ms and decorrelating it measured 10.87 s → 3.36 s. Upstream
+	// can decorrelate unconditionally only because it also has
+	// index-driven and parallel joins to execute the result with;
+	// until goopg does, the inner's shape decides.
+	if innerPlanIsIndexProbeCheap(sub.Plan) {
+		return false
+	}
+	return true
+}
+
+// innerPlanIsIndexProbeCheap mirrors the executor's planIsIndexScanBased
+// criterion (internal/executor/expr.go): IndexScan, Project(IndexScan),
+// or Aggregate over either — the shapes the executor's CorrSubqOps cache
+// re-Opens per outer key instead of rebuilding. Kept in lockstep with
+// that function: if the executor learns to rescan a new shape cheaply,
+// this predicate must learn it too, or scalars of that shape will
+// decorrelate away from the better path.
+func innerPlanIsIndexProbeCheap(n Node) bool {
+	switch x := n.(type) {
+	case *IndexScan:
+		return true
+	case *Project:
+		return innerPlanIsIndexProbeCheap(x.Child)
+	case *Aggregate:
+		return innerPlanIsIndexProbeCheap(x.Child)
+	case *Filter:
+		// A filter over an index probe is still probe-cheap (the executor's
+		// filterOp is stateless and re-Open-safe) — this is TPC-H Q20's
+		// date-windowed `sum(l_quantity)` over the composite FK index.
+		// Measured 2026-07-21: decorrelating it costs 24.2 s vs 12.3 s on
+		// the SubPlan path even before the rescan win.
+		return innerPlanIsIndexProbeCheap(x.Child)
+	}
+	return false
 }
 
 func collectUnnestParams(node Node) []unnestParam {
@@ -749,6 +881,18 @@ func walkPlanExprs(node Node, visit func(Expr)) {
 		}
 		if n.RightKey != nil {
 			walkExprTree(n.RightKey, visit)
+		}
+	case *NestedLoopIndexJoin:
+		// S6: a sublink's inner plan runs the full planning pipeline,
+		// so it can contain NLI nodes. Without this case the
+		// all-accounted OuterColumnRef check never looked inside them —
+		// an outer ref hiding in an NLI residual or probe key escaped
+		// accounting and the pull-up proceeded over an unbound
+		// reference.
+		walkPlanExprs(n.Outer, visit)
+		walkPlanExprs(n.Inner, visit)
+		if n.Predicate != nil {
+			walkExprTree(n.Predicate, visit)
 		}
 	case *Filter:
 		walkPlanExprs(n.Child, visit)

@@ -318,10 +318,10 @@ func findFirstAggregate(node Node) *Aggregate {
 }
 
 func TestIndexKeyCorrelatedExistsDecorrelates(t *testing.T) {
-	// The harvest is gated off by default (see SetIndexKeyHarvestEnabled);
-	// these tests exercise it explicitly.
+	// The harvest is ON by default since S6; enabled explicitly here so the
+	// test is self-contained regardless of sibling-test toggles.
 	SetIndexKeyHarvestEnabled(true)
-	t.Cleanup(func() { SetIndexKeyHarvestEnabled(false) })
+	t.Cleanup(func() { SetIndexKeyHarvestEnabled(true) }) // restore the ON default
 
 	cat := indexedCorrCatalog(t)
 	sql := "SELECT o_key FROM outer_t WHERE EXISTS (SELECT 1 FROM inner_t WHERE i_key = outer_t.o_key)"
@@ -347,10 +347,10 @@ func TestIndexKeyCorrelatedExistsDecorrelates(t *testing.T) {
 }
 
 func TestIndexKeyCorrelatedNotExistsDecorrelatesToAnti(t *testing.T) {
-	// The harvest is gated off by default (see SetIndexKeyHarvestEnabled);
-	// these tests exercise it explicitly.
+	// The harvest is ON by default since S6; enabled explicitly here so the
+	// test is self-contained regardless of sibling-test toggles.
 	SetIndexKeyHarvestEnabled(true)
-	t.Cleanup(func() { SetIndexKeyHarvestEnabled(false) })
+	t.Cleanup(func() { SetIndexKeyHarvestEnabled(true) }) // restore the ON default
 
 	cat := indexedCorrCatalog(t)
 	sql := "SELECT o_key FROM outer_t WHERE NOT EXISTS (SELECT 1 FROM inner_t WHERE i_key = outer_t.o_key)"
@@ -370,10 +370,10 @@ func TestIndexKeyCorrelatedNotExistsDecorrelatesToAnti(t *testing.T) {
 }
 
 func TestIndexKeyExistsWithInnerResidualDecorrelates(t *testing.T) {
-	// The harvest is gated off by default (see SetIndexKeyHarvestEnabled);
-	// these tests exercise it explicitly.
+	// The harvest is ON by default since S6; enabled explicitly here so the
+	// test is self-contained regardless of sibling-test toggles.
 	SetIndexKeyHarvestEnabled(true)
-	t.Cleanup(func() { SetIndexKeyHarvestEnabled(false) })
+	t.Cleanup(func() { SetIndexKeyHarvestEnabled(true) }) // restore the ON default
 
 	cat := indexedCorrCatalog(t)
 	sql := "SELECT o_key FROM outer_t WHERE EXISTS (SELECT 1 FROM inner_t WHERE i_key = outer_t.o_key AND i_a < i_b)"
@@ -398,11 +398,16 @@ func TestIndexKeyExistsWithInnerResidualDecorrelates(t *testing.T) {
 	}
 }
 
-func TestIndexKeyCorrelatedScalarDecorrelates(t *testing.T) {
-	// The harvest is gated off by default (see SetIndexKeyHarvestEnabled);
-	// these tests exercise it explicitly.
+// TestIndexKeyScalarProbeCheapStaysSubPlan pins the S6 (D6.2)
+// selectivity-aware policy — the measured amendment to the bundle's
+// D6.1: a correlated scalar whose inner plans as an index probe
+// (Aggregate over IndexScan — the Q17/Q20 shape) is served better by the
+// executor's CorrSubqOps rescan path (Q17: rebuilds=1, rescans=6667)
+// than by a whole-table GROUP BY + join (measured 58.27 s → 86.65 s), so
+// even with the harvest enabled it must remain a SubPlan.
+func TestIndexKeyScalarProbeCheapStaysSubPlan(t *testing.T) {
 	SetIndexKeyHarvestEnabled(true)
-	t.Cleanup(func() { SetIndexKeyHarvestEnabled(false) })
+	t.Cleanup(func() { SetIndexKeyHarvestEnabled(true) }) // restore the ON default
 
 	cat := indexedCorrCatalog(t)
 	sql := "SELECT o_key FROM outer_t WHERE o_val < (SELECT avg(i_a) FROM inner_t WHERE i_key = outer_t.o_key)"
@@ -410,8 +415,40 @@ func TestIndexKeyCorrelatedScalarDecorrelates(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if findFirstJoinByType(node, JoinTypeInner) != nil && findFirstAggregate(node) != nil {
+		t.Fatalf("index-probe-cheap scalar must NOT decorrelate (S6 policy)")
+	}
+	if !planHasSubqueryExpr(node) {
+		t.Fatalf("the scalar SubqueryExpr should survive as a SubPlan")
+	}
+}
+
+// TestIndexKeyScalarJoinInnerDecorrelates is the policy's other half —
+// the Q2 shape: a correlated scalar whose inner joins another table has
+// no cheap rescan form (its SubPlan path rebuilt an Aggregate over a
+// multi-table join at ≈26 ms per call; decorrelating measured
+// 10.87 s → 3.36 s), so with the harvest on it must decorrelate to the
+// GROUP BY + INNER join.
+func TestIndexKeyScalarJoinInnerDecorrelates(t *testing.T) {
+	SetIndexKeyHarvestEnabled(true)
+	t.Cleanup(func() { SetIndexKeyHarvestEnabled(true) }) // restore the ON default
+
+	cat := indexedCorrCatalog(t)
+	// extra_t joins inner_t inside the subquery, so the inner plan is an
+	// Aggregate over a join — not an index-probe shape.
+	if _, err := cat.CreateTable(parser.ObjectName{Name: "extra_t"}, []catalog.Column{
+		{Name: "e_id", Type: catalog.Type{Name: "int4"}, NotNull: true},
+		{Name: "e_w", Type: catalog.Type{Name: "int4"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sql := "SELECT o_key FROM outer_t WHERE o_val < (SELECT min(i_a) FROM inner_t, extra_t WHERE i_key = outer_t.o_key AND e_id = i_b)"
+	node, err := Plan(parseOne(t, sql), cat)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if findFirstJoinByType(node, JoinTypeInner) == nil {
-		t.Fatalf("correlated scalar avg on an indexed inner did not decorrelate to an INNER join")
+		t.Fatalf("scalar with a multi-table inner did not decorrelate to an INNER join")
 	}
 	if findFirstAggregate(node) == nil {
 		t.Fatalf("decorrelated scalar should build a GROUP BY aggregate")
@@ -424,14 +461,80 @@ func TestIndexKeyCorrelatedScalarDecorrelates(t *testing.T) {
 	}
 }
 
+// TestIndexKeyExistsResidualBecomesNLISemi is the S6 (D6.2) end-to-end
+// Q4-shape assertion: with the harvest on, an EXISTS whose body carries
+// an inner-only residual AND whose WHERE has an outer local conjunct
+// must plan as an index-driven NLI semi join — residual on the NLI, the
+// local conjunct sunk BELOW the join (pushConjunctsBelowSemiAnti) so the
+// probe count and the NLI cost gate both see the filtered outer.
+func TestIndexKeyExistsResidualBecomesNLISemi(t *testing.T) {
+	SetIndexKeyHarvestEnabled(true)
+	t.Cleanup(func() { SetIndexKeyHarvestEnabled(true) }) // restore the ON default
+
+	cat := indexedCorrCatalog(t)
+	sql := "SELECT o_key FROM outer_t WHERE o_val > 5 AND EXISTS (SELECT 1 FROM inner_t WHERE i_key = outer_t.o_key AND i_a < i_b)"
+	node, err := Plan(parseOne(t, sql), cat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var nli *NestedLoopIndexJoin
+	var walk func(Node)
+	walk = func(n Node) {
+		if n == nil || nli != nil {
+			return
+		}
+		switch x := n.(type) {
+		case *NestedLoopIndexJoin:
+			if x.Type == JoinTypeSemi {
+				nli = x
+				return
+			}
+			walk(x.Outer)
+		case *Join:
+			walk(x.Left)
+			walk(x.Right)
+		case *Filter:
+			walk(x.Child)
+		case *Project:
+			walk(x.Child)
+		case *Aggregate:
+			walk(x.Child)
+		case *Sort:
+			walk(x.Child)
+		case *Limit:
+			walk(x.Child)
+		}
+	}
+	walk(node)
+	if nli == nil {
+		t.Fatalf("EXISTS with inner residual did not become an NLI semi join")
+	}
+	if nli.Predicate == nil {
+		t.Fatalf("the inner residual was lost — NLI.Predicate is nil")
+	}
+	f, isFilter := nli.Outer.(*Filter)
+	if !isFilter {
+		t.Fatalf("the outer local conjunct was not sunk below the semi join; NLI.Outer is %T", nli.Outer)
+	}
+	if !exprTreeMentions(f.Predicate, "o_val") {
+		t.Fatalf("the sunk Filter does not carry the o_val conjunct")
+	}
+	if sp := selfProbeIndexScan(node); sp != nil {
+		t.Fatalf("self-probe IndexScan survived: %v", sp.Index)
+	}
+	if planHasSubqueryExpr(node) {
+		t.Fatalf("an ExistsExpr survived after decorrelation")
+	}
+}
+
 // TestIndexKeyToggleDeterminism: the same correlated EXISTS decorrelates
 // whether or not the inner correlation column is indexed. Before the fix
 // only the index-less form fired.
 func TestIndexKeyToggleDeterminism(t *testing.T) {
-	// The harvest is gated off by default (see SetIndexKeyHarvestEnabled);
-	// these tests exercise it explicitly.
+	// The harvest is ON by default since S6; enabled explicitly here so the
+	// test is self-contained regardless of sibling-test toggles.
 	SetIndexKeyHarvestEnabled(true)
-	t.Cleanup(func() { SetIndexKeyHarvestEnabled(false) })
+	t.Cleanup(func() { SetIndexKeyHarvestEnabled(true) }) // restore the ON default
 
 	sql := "SELECT o_key FROM outer_t WHERE EXISTS (SELECT 1 FROM inner_t WHERE i_key = outer_t.o_key)"
 
@@ -463,10 +566,10 @@ func TestIndexKeyToggleDeterminism(t *testing.T) {
 // making the NLI path preserve the second equality — would return wrong
 // results, so this test guards the refusal.
 func TestIndexKeyCompositeCorrelationStaysSubPlan(t *testing.T) {
-	// The harvest is gated off by default (see SetIndexKeyHarvestEnabled);
-	// these tests exercise it explicitly.
+	// The harvest is ON by default since S6; enabled explicitly here so the
+	// test is self-contained regardless of sibling-test toggles.
 	SetIndexKeyHarvestEnabled(true)
-	t.Cleanup(func() { SetIndexKeyHarvestEnabled(false) })
+	t.Cleanup(func() { SetIndexKeyHarvestEnabled(true) }) // restore the ON default
 
 	cat := indexedCorrCatalog(t)
 	sql := "SELECT o_key FROM outer_t WHERE EXISTS (SELECT 1 FROM inner_t WHERE i_key = outer_t.o_key AND i_a = outer_t.o_val)"
@@ -486,10 +589,10 @@ func TestIndexKeyCompositeCorrelationStaysSubPlan(t *testing.T) {
 // LowKey/HighKey, which is NOT an equijoin and must keep the shape a
 // SubPlan (matrix row M14).
 func TestIndexKeyRangeCorrelationStaysSubPlan(t *testing.T) {
-	// The harvest is gated off by default (see SetIndexKeyHarvestEnabled);
-	// these tests exercise it explicitly.
+	// The harvest is ON by default since S6; enabled explicitly here so the
+	// test is self-contained regardless of sibling-test toggles.
 	SetIndexKeyHarvestEnabled(true)
-	t.Cleanup(func() { SetIndexKeyHarvestEnabled(false) })
+	t.Cleanup(func() { SetIndexKeyHarvestEnabled(true) }) // restore the ON default
 
 	cat := indexedCorrCatalog(t)
 	sql := "SELECT o_key FROM outer_t WHERE EXISTS (SELECT 1 FROM inner_t WHERE i_key > outer_t.o_key)"

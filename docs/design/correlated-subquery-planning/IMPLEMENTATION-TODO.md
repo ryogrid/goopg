@@ -45,7 +45,8 @@ reserved by the spotcheck script). Never bare `pkill`.
 | 3 | S0-3 semantics matrix + SF1 baseline | S0 | V1, V2, V4, W1 | [x] `b731b196` |
 | 4 | S1a live-bug guards (grew to six) | S1 | D3.0 (F1–F3 + M10/M12×2) | [x] `b731b196` |
 | 5 | S1b NOT-IN executor fix | S1 | F4 | [x] `b2a68945` |
-| 6 | S1c collector fix | S1 | D3.0 (IndexScan.Key) | [ ] |
+| 6 | S1c collector fix (landed gated OFF) | S1 | D3.0 (IndexScan.Key) | [x] `82117265` |
+| 6b | **S6-pre: NLI semi/anti residual + harvest policy** (user-directed reorder) | S6 | D6.2 (minimal) | [ ] |
 | 7 | S2a operator resets | S2 | D4.2 (prereq) | [ ] |
 | 8 | S2b param slots | S2 | D4.1 | [ ] |
 | 9 | S2c SubPlan handles | S2 | D4.2 + cacheability gate | [ ] |
@@ -55,6 +56,13 @@ reserved by the spotcheck script). Never bare `pkill`.
 
 Order: 1 → 2 → 3 → 4 → 5 → 6 sequential (ch.03 §2.5 mandates guards before the collector
 fix); 7 independent, landed early to soak alone; 8 → 9 → 10 → 11 sequential; 12 last.
+
+**Roadmap reorder (2026-07-21, user decision):** Stage 6's measurement showed
+decorrelation regresses selective correlated sublinks while goopg's only semi/anti
+execution is a hash join (Q4 3.87 s → 276 s). Rather than land S1c enabled or
+cost-gate it, the user chose to pull **phase S6 (D6.2 — index-driven NLI semi/anti
+with residual support)** ahead of S2, then enable the harvest with a re-measure.
+Stage 6b below is that work.
 
 ---
 
@@ -376,6 +384,88 @@ the choice. Recorded in ch.03 and ch.06 as a measured amendment to D6.1.
       units / spotcheck (**tripwire**) / plan-gate (review → recapture `csq-s1-collector`)
       perf: P-S1a (Q4 ≤ 3 s), P-S1b (Q22 ≤ 1 s) — _pending_
 - commit: _pending_
+
+## Stage 6b — S6 (D6.2 minimal): NLI semi/anti residuals + harvest enablement  [ ]
+
+User-directed reorder: S6 ahead of S2, to make Stage 6's harvest enableable.
+
+- [x] `tryBuildNLI` accepts a **residual-bearing Semi/Anti** (the Q7-fix decline
+      replaced by the same name+`SourceTableIdx` rebind the Inner case uses);
+      OR-factoring residual merges instead of being overwritten
+- [x] `tryBuildNLI` accepts **`Filter{SeqScan}` as the inner side** (INNER/SEMI/ANTI;
+      LEFT deliberately excluded — its no-match fallback would evaluate the residual
+      against the null-padded row and drop preserved outer rows, Q13 is the tripwire);
+      filter conjuncts deep-cloned with indices shifted into `outer ++ inner` coords,
+      original predicate never mutated (decline paths restore via a `committed` flag)
+- [x] executor verified NOT broken for inner-referencing semi/anti residuals:
+      `VirtualSlot.Get` reads the always-full outer+inner column mapping and
+      `evalExprSlot` bounds-checks against `Width()`, not the outer-only emit schema —
+      pinned by 4 new executor tests (semi + anti, incl. NULL rows) instead of rewritten
+- [x] `pushConjunctsBelowSemiAnti`: sublink-free conjuncts sink below the semi/anti
+      chain onto the true outer input (`σ_p(outer ⋉ inner) ≡ σ_p(outer) ⋉ inner`;
+      indices need no translation since semi/anti output = outer schema) — restores
+      Q4's ~57 K driving cardinality and lets the NLI cost gate see the filtered estimate
+- [x] **scalar harvest policy**: scalars decorrelate only when the inner plan is NOT
+      index-probe-cheap; EXISTS/NOT EXISTS always harvest. Initially
+      IndexScan/Project/Aggregate; **extended to admit `Filter` in the chain in BOTH
+      twins** (planner `innerPlanIsIndexProbeCheap` ↔ executor `planIsIndexScanBased`,
+      sibling-path rule) — the executor side gives Q20's SubPlan the `CorrSubqOps`
+      rescan path it never had (was rebuilds=8552/rescans=0)
+- [x] `walkPlanExprs` gains a `*NestedLoopIndexJoin` case (pre-existing accounting
+      hole: sublink inner plans can contain NLIs whose Key/Predicate hid
+      `OuterColumnRef`s from the all-accounted check)
+- [x] `indexKeyHarvestOn` default flipped **ON** (rollback:
+      `SetIndexKeyHarvestEnabled(false)`); test cleanups restore the ON default
+- targeted measurements (SF1, idle, capped server; baseline = `639c9e7a` sweep):
+      Q2 10.87 s → **2.20 s** (4.9×) · Q20 12.29 s → **3.71 s** (3.3×) ·
+      Q22 7.83 s → **0.87 s** (9.0×, P-S1b ≤1 s met) · Q17 58.27 → 60.31 s (noise) ·
+      Q4 3.87 → 4.44 s (+15 %; now the PG-parity `Nested Loop (SEMI)` shape probing
+      `idx_lineitem_orderkey` with the date filter sunk below — accepted)
+- correctness cross-checks: Q4 values identical between the NLI path and an
+  independent IN-form run (52 834 qualifying orders); semantics matrix green on
+  both paths; NLI/unnest suites green
+- Q9 guard: the first cut also unwrapped Filter inners for INNER joins and
+  regressed Q9 (115 s → DNF: `part LIKE '%green%'` became ~6 M per-row index
+  probes). Restricted to Semi/Anti; an INNER unwrap needs a real cost
+  comparison first (D6.3). Q9 verified restored (117.9 s / 175 rows).
+- operational kill switch added: `GOOPG_INDEXKEY_HARVEST=off` at server start
+  (first use: the Q21 cross-check below).
+- **Q21 unlocked and cross-validated**: completes for the first time on this
+  data (284.07 s in the sweep, 370 rows); the SubPlan path (harvest off via the
+  env switch, 600 s budget) returns the **identical 370 rows** in 136.5 s warm.
+- full 22-query sweep (`evidence/sf1-after-s6-harvest.txt`): row counts
+  identical to the post-NLI-fix sweep everywhere except Q21 DNF→370 rows
+  (the unlock); Q9's DNF in that sweep was the INNER-unwrap regression, since
+  restricted and re-verified; Q15-CREATEVIEW's 76 s sample was transient
+  (re-run: 0.04 s).
+- gates:
+      units:      PASS (2026-07-21, whole module, harvest ON default)
+      spotcheck:  PASS (Q12=2 / Q13=33)
+      plan-gate:  DIFFER confined to the six subquery-bearing queries
+                  (Q2/Q4/Q16/Q20/Q21/Q22 — the intended set; Q12/Q13 and all
+                  sublink-free queries MATCH); recaptured `csq-s6-harvest`,
+                  now 22/22 MATCH
+      pgbench-hook: PASS (see commit)
+- commit: _(filled in by the next stage)_
+
+### Follow-ups recorded (out of scope here — ledgered in `.ralph/deferral_ledger.md`, five `csq-S6` rows dated 2026-07-21, per user direction)
+
+1. EXPLAIN still does not print `NestedLoopIndexJoin.Predicate` — Q4's residual is
+   invisible in the plan text (pre-existing; noted at the Q7 fix too).
+2. Q20's decorrelated variant (before the policy reverted it) left a tautological
+   `l_suppkey = l_suppkey` conjunct in the cloned inner filter — harmless for
+   results but sloppy; multi-param scalar clone should strip consumed pairs.
+3. A derived-table under a plain NL cross join returns 0 rows on the bench data
+   (`orders, (SELECT DISTINCT l_orderkey FROM lineitem WHERE …) lk WHERE o_orderkey
+   = lk.l_orderkey` → 0 rows fast, while the derived subquery alone counts 1.37 M)
+   — pre-existing wrong-results bug, NLI/unnest not involved (plan is
+   `NL (CROSS) + Filter` + `Unique`); needs its own investigation.
+4. A cancelled cross-join backend kept spinning at 227 % CPU / 11.7 GB RSS and
+   starved subsequent queries into DNF until a server restart — the known
+   cancel-propagation gap, hit live during this stage's measurements.
+5. LEFT-join NLI residuals (from the Q7 leftover path) would evaluate against the
+   null-padded row on the no-match fallback; LEFT is excluded from the new
+   Filter-inner path, but the pre-existing hazard deserves an audit.
 
 ## Stage 7 — S2a: operator reset prerequisites  [ ]
 

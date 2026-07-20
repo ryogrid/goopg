@@ -255,13 +255,15 @@ func TestNLIConsumedByProbe(t *testing.T) {
 	}
 }
 
-// TestNLIDeclinesSemiJoinWithResidual pins the Semi/Anti carve-out: those
-// join types project the outer schema only, so a residual reaching into
-// the inner side has nowhere to live. The rewrite must decline AND leave
-// the shared predicate untouched — resolution is computed for every ref
-// before any is written back, so a declined rewrite must not have
-// rebound anything.
-func TestNLIDeclinesSemiJoinWithResidual(t *testing.T) {
+// TestNLISemiAntiAcceptResidual pins the S6 (D6.2) reversal of the
+// earlier Semi/Anti carve-out: a residual-bearing semi/anti join now
+// becomes an NLI, carrying the residual on Predicate. Although semi/anti
+// EMIT the outer schema only, the executor evaluates the residual through
+// virtualOut, whose column mapping spans outer ++ inner regardless of the
+// emit schema — so an inner-referencing residual is evaluable. The
+// resolved indices must land in range of outer ++ inner and name the
+// right columns.
+func TestNLISemiAntiAcceptResidual(t *testing.T) {
 	cat := catalog.NewInMemory()
 	supplier, err := cat.CreateTable(parser.ObjectName{Name: "supplier"}, []catalog.Column{
 		{Name: "s_suppkey", Type: catalog.Type{Name: "int4"}, NotNull: true},
@@ -309,13 +311,68 @@ func TestNLIDeclinesSemiJoinWithResidual(t *testing.T) {
 				Predicate: residual,
 				schema:    append(Schema(nil), outer.Output()...),
 			}
-			if nli, ok := tryBuildNLI(j, cat); ok {
-				t.Fatalf("%s join with an inner-side residual must not become an NLI; got %#v", jt.name, nli)
+			nli, ok := tryBuildNLI(j, cat)
+			if !ok {
+				t.Fatalf("%s join with an inner-side residual must now become an NLI (S6/D6.2)", jt.name)
 			}
-			if innerName.Index != leftWidth+1 || outerName.Index != 2 {
-				t.Fatalf("declined rewrite rebound the shared predicate: n_name@%d s_name@%d (want %d, 2)",
-					innerName.Index, outerName.Index, leftWidth+1)
+			if nli.Type != jt.typ {
+				t.Fatalf("join type not preserved: got %v want %v", nli.Type, jt.typ)
 			}
+			if nli.Predicate == nil {
+				t.Fatalf("%s NLI lost its residual predicate", jt.name)
+			}
+			// Emit schema stays outer-only; the residual's indices must
+			// resolve within outer ++ inner.
+			if got, want := len(nli.Output()), len(outer.Output()); got != want {
+				t.Fatalf("semi/anti NLI schema width = %d, want outer-only %d", got, want)
+			}
+			assertResidualIndicesResolve(t, nli)
 		})
+	}
+}
+
+// TestNLISemiDeclinesUnresolvableResidual keeps the compute-before-
+// write-back property observable: a residual naming a column that exists
+// on neither side must decline the rewrite AND leave the shared
+// predicate's indices untouched.
+func TestNLISemiDeclinesUnresolvableResidual(t *testing.T) {
+	cat := catalog.NewInMemory()
+	supplier, err := cat.CreateTable(parser.ObjectName{Name: "supplier"}, []catalog.Column{
+		{Name: "s_suppkey", Type: catalog.Type{Name: "int4"}, NotNull: true},
+		{Name: "s_nationkey", Type: catalog.Type{Name: "int4"}, NotNull: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	nation, err := cat.CreateTable(parser.ObjectName{Name: "nation"}, []catalog.Column{
+		{Name: "n_nationkey", Type: catalog.Type{Name: "int4"}, NotNull: true},
+		{Name: "n_name", Type: catalog.Type{Name: "varchar", Args: []int64{25}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cat.CreateIndex(parser.ObjectName{Name: "nation_pk"}, nation,
+		[]string{"n_nationkey"}, true, "btree", true); err != nil {
+		t.Fatal(err)
+	}
+	outer := &SeqScan{Table: supplier, schema: tableSchemaWithSource(supplier, 1)}
+	inner := &SeqScan{Table: nation, schema: tableSchemaWithSource(nation, 2)}
+	leftWidth := len(outer.Output())
+	ghost := &ColumnRef{Index: leftWidth + 1, Name: "no_such_column", SourceTableIdx: 0}
+	j := &Join{
+		Type:      JoinTypeSemi,
+		Algo:      JoinAlgoHash,
+		Left:      outer,
+		Right:     inner,
+		LeftKey:   &ColumnRef{Index: 1, Name: "s_nationkey", SourceTableIdx: 1},
+		RightKey:  &ColumnRef{Index: leftWidth, Name: "n_nationkey", SourceTableIdx: 2},
+		Predicate: &BinaryOp{Op: parser.OpGt, Left: ghost, Right: &IntegerConst{Value: 0}},
+		schema:    append(Schema(nil), outer.Output()...),
+	}
+	if nli, ok := tryBuildNLI(j, cat); ok {
+		t.Fatalf("unresolvable residual must decline the rewrite; got %#v", nli)
+	}
+	if ghost.Index != leftWidth+1 {
+		t.Fatalf("declined rewrite rebound the shared predicate: got %d want %d", ghost.Index, leftWidth+1)
 	}
 }

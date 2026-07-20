@@ -291,6 +291,63 @@ func tryBuildNLI(j *Join, cat catalog.Catalog) (*NestedLoopIndexJoin, bool) {
 		j.Type != JoinTypeSemi && j.Type != JoinTypeAnti {
 		return nil, false
 	}
+	// S6 (D6.2): accept `Filter{SeqScan}` as the RIGHT inner side by
+	// tentatively unwrapping it — the Filter's conjuncts join the
+	// residual set (indices shifted into outer++inner coordinates via
+	// clones; the originals stay untouched) and the bare SeqScan takes
+	// its place for the rest of the analysis. `committed` gates the
+	// restore: every decline path below leaves j exactly as found.
+	//
+	// This is what lets a decorrelated EXISTS body with an inner-only
+	// conjunct (Q4's `l_commitdate < l_receiptdate`) stay index-driven:
+	// its inner arrives as Filter{residual}(SeqScan), which previously
+	// fell through pickInnerSide to the hash path.
+	//
+	// LEFT is deliberately excluded: its no-match fallback currently
+	// evaluates the residual against the null-padded row (see
+	// operators_nljoin.go), which would drop preserved outer rows —
+	// and the canonical Q13 LEFT-join shape (`orders` behind a
+	// NOT-LIKE Filter) is this repo's most expensive historical
+	// silent-regression tripwire. The hash path keeps serving it.
+	// Semi/Anti ONLY — an INNER join was included at first and regressed
+	// TPC-H Q9 (115 s → DNF at 300 s): its `part` scan with a `%green%`
+	// LIKE arrives as Filter{SeqScan}, and unwrapping it turned a
+	// hash-side build into ~6 M per-row index probes with the LIKE
+	// evaluated per probe. Semi/Anti have no such exposure (their outer
+	// is the small side by construction of the unnest rewrite), and are
+	// the shapes this path exists for. An INNER Filter-inner unwrap needs
+	// a real cost comparison first (bundle D6.3).
+	committed := false
+	var hoistedInner []Expr
+	if f, isF := j.Right.(*Filter); isF &&
+		(j.Type == JoinTypeSemi || j.Type == JoinTypeAnti) {
+		if ss, isSS := f.Child.(*SeqScan); isSS && f.Predicate != nil && !f.LeafLocal {
+			shift := len(j.Left.Output())
+			okAll := true
+			for _, c := range splitAnd(f.Predicate) {
+				if bc, isBool := c.(*BooleanConst); isBool && bc.Value {
+					continue
+				}
+				cl, supported := cloneExprShiftIdx(c, shift)
+				if !supported {
+					okAll = false
+					break
+				}
+				hoistedInner = append(hoistedInner, cl)
+			}
+			if okAll {
+				savedRight := j.Right
+				j.Right = ss
+				defer func() {
+					if !committed {
+						j.Right = savedRight
+					}
+				}()
+			} else {
+				hoistedInner = nil
+			}
+		}
+	}
 	// Equi-join detection: prefer the `LeftKey = RightKey` shape
 	// already attached when Algo == Hash. Fall back to inspecting
 	// `Predicate` for non-Hash joins. M0054-0006-followup-Q19:
@@ -527,6 +584,12 @@ func tryBuildNLI(j *Join, cat catalog.Catalog) (*NestedLoopIndexJoin, bool) {
 			leftover = append(leftover, c)
 		}
 	}
+	// S6: conjuncts hoisted out of a Filter{SeqScan} inner join the
+	// residual set. Their clones already carry outer++inner-shaped
+	// indices (see the unwrap block above); the rebind below re-resolves
+	// them by name against the actual joined schema like every other
+	// leftover conjunct.
+	leftover = append(leftover, hoistedInner...)
 
 	// Build the inner IndexScan. For single-column indexes we
 	// keep using `Key` for backward compatibility with all
@@ -566,16 +629,19 @@ func tryBuildNLI(j *Join, cat catalog.Catalog) (*NestedLoopIndexJoin, bool) {
 	}
 
 	// Place the surviving conjuncts (see above) on the NLI, re-resolving
-	// their ColumnRefs against `outer ++ inner`. Semi / Anti project the
-	// outer schema only, so a residual that reaches into the inner side
-	// has nowhere to live there — decline the rewrite for that shape
-	// rather than evaluate it against a mismatched row. Resolution is
+	// their ColumnRefs against `outer ++ inner`. This includes Semi /
+	// Anti: although they EMIT the outer schema only, the executor
+	// evaluates the residual through virtualOut, whose column mapping
+	// always spans outer ++ inner regardless of the emit schema
+	// (operators_nljoin.go builds cols over both source slots, and
+	// evalExprSlot bounds-checks against Width(), not the schema) — so
+	// an inner-referencing residual resolves correctly. S6 (D6.2)
+	// replaced the earlier blanket decline, which forced every
+	// residual-bearing semi/anti onto the hash path and cost Q4 a
+	// 6 M-row build where an index probe sufficed. Resolution is
 	// computed for every ref BEFORE any is written back, so a rewrite we
 	// end up declining leaves the shared predicate untouched.
 	if len(leftover) > 0 {
-		if j.Type == JoinTypeSemi || j.Type == JoinTypeAnti {
-			return nil, false
-		}
 		outerSchema2 := outerNode.Output()
 		innerSchema2 := inner.Output()
 		resolveIn := func(schema Schema, cr *ColumnRef, offset int) int {
@@ -625,9 +691,18 @@ func tryBuildNLI(j *Join, cat catalog.Catalog) (*NestedLoopIndexJoin, bool) {
 		for _, t := range targets {
 			t.ref.Index = t.newIdx
 		}
-		residualPred = combineAnd(leftover)
+		if residualPred != nil {
+			// OR-factoring path (Q19) plus hoisted inner conjuncts:
+			// keep the OR predicate AND the hoisted set. (The OR
+			// predicate itself is intentionally not re-resolved here —
+			// pre-existing behaviour; see the Q7 write-up's follow-ups.)
+			residualPred = combineAnd(append([]Expr{residualPred}, leftover...))
+		} else {
+			residualPred = combineAnd(leftover)
+		}
 	}
 
+	committed = true
 	nli := &NestedLoopIndexJoin{
 		pos:   j.pos,
 		Type:  j.Type,
@@ -644,6 +719,66 @@ func tryBuildNLI(j *Join, cat catalog.Catalog) (*NestedLoopIndexJoin, bool) {
 		schema:    joinedSchema,
 	}
 	return nli, true
+}
+
+// cloneExprShiftIdx deep-clones a conjunct hoisted out of a
+// Filter{SeqScan} inner side, shifting every ColumnRef.Index by `shift`
+// so the clone addresses the NLI's outer++inner row instead of the inner
+// scan's own row. Name/Type/SourceTableIdx are preserved — the leftover
+// rebind re-resolves the final index by name, using the shifted value
+// only as the which-side hint.
+//
+// Returns ok=false for any node kind it does not positively recognise —
+// including OuterColumnRef, which inside an inner filter means a
+// correlation into a scope above this join that a flat outer++inner row
+// cannot supply. Declining the whole rewrite (the caller's response)
+// keeps the hash path serving those shapes.
+func cloneExprShiftIdx(e Expr, shift int) (Expr, bool) {
+	switch x := e.(type) {
+	case nil:
+		return nil, true
+	case *ColumnRef:
+		cl := *x
+		if cl.Index >= 0 {
+			cl.Index += shift
+		}
+		return &cl, true
+	case *IntegerConst, *NumericConst, *StringConst, *BooleanConst,
+		*NullConst, *TypedStringLit, *IntervalLit:
+		return e, true // literals are immutable — share
+	case *BinaryOp:
+		l, okL := cloneExprShiftIdx(x.Left, shift)
+		r, okR := cloneExprShiftIdx(x.Right, shift)
+		if !okL || !okR {
+			return nil, false
+		}
+		return &BinaryOp{pos: x.Pos(), Op: x.Op, Left: l, Right: r}, true
+	case *UnaryOp:
+		op, ok := cloneExprShiftIdx(x.Operand, shift)
+		if !ok {
+			return nil, false
+		}
+		return &UnaryOp{pos: x.Pos(), Op: x.Op, Operand: op}, true
+	case *CastExpr:
+		op, ok := cloneExprShiftIdx(x.Operand, shift)
+		if !ok {
+			return nil, false
+		}
+		cl := *x
+		cl.Operand = op
+		return &cl, true
+	case *FuncCall:
+		args := make([]Expr, len(x.Args))
+		for i, a := range x.Args {
+			cl, ok := cloneExprShiftIdx(a, shift)
+			if !ok {
+				return nil, false
+			}
+			args[i] = cl
+		}
+		return &FuncCall{pos: x.Pos(), Name: x.Name, Args: args, Star: x.Star}, true
+	}
+	return nil, false
 }
 
 // nliConsumedByProbe reports whether conjunct c is exactly one of the

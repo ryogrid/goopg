@@ -7054,6 +7054,14 @@ func planIsIndexScanBased(n planner.Node) bool {
 		// child is reopened via the child.Open call. Safe as long as the child
 		// (IndexScan) is safe.
 		return planIsIndexScanBased(x.Child)
+	case *planner.Filter:
+		// filterOp carries no state besides child+pred; Open just re-opens
+		// the child. Admitting it lets Aggregate{Filter{IndexScan}} shapes
+		// (an index probe with extra local conjuncts, e.g. TPC-H Q20's
+		// date-windowed sum) ride the rescan path instead of rebuilding
+		// per call. Kept in lockstep with the planner's
+		// innerPlanIsIndexProbeCheap (S6 scalar policy).
+		return planIsIndexScanBased(x.Child)
 	}
 	return false
 }
