@@ -359,12 +359,44 @@ history (H-c dismissed): the loops fire whenever the inner side plans as a
 filtered scan. The IN loop is unaffected because its correlation rides the
 *operand*, not an inner Filter conjunct.
 
+**Magnitude answered too (Stage 2, V6 counters).** The open question of whether
+Q4 evaluates its `EXISTS` once per `orders` row (≈1.5 M) or only for the
+date-filtered subset (≈57 K) is settled by measurement: **57 640** — the
+date-range conjunct short-circuits first. Measured with `EXPLAIN (ANALYZE,
+TIMING OFF)` against the SF1 bench data at commit `379dd402`
+[measured-at-HEAD 379dd402]:
+
+| Query | SubPlan | kind | calls | rebuilds | rescans | cache hits | query exec |
+|---|---|---|---:|---:|---:|---:|---:|
+| Q2 | 1 | scalar `min` (correlated) | 621 | 621 | 0 | 0 | 16.4 s |
+| Q4 | 1 | `EXISTS` (correlated) | 57 640 | 57 640 | 0 | 0 | 6.45 s |
+| Q17 | 1 | scalar `avg` (correlated) | 6 668 | **1** | **6 667** | 0 | 54.5 s |
+| Q20 | 1 | scalar `sum` (correlated) | 8 552 | 8 552 | 0 | 0 | 2.55 s |
+| Q22 | 1 | scalar `avg` (non-correlated) | 11 828 | 1 | 0 | **11 827** | 0.91 s |
+| Q22 | 2 | `NOT EXISTS` (correlated) | 5 415 | 5 415 | 0 | 0 | (same query) |
+
+Three findings that re-rank the roadmap's expected wins:
+
+- **Q2 is the worst per-call site, not Q4.** 621 calls consume a large share of
+  16.4 s — ≈26 ms per invocation, because the sublink's inner plan is an
+  `Aggregate` over a **4-table Multi-Way Hash Join** that is rebuilt from
+  scratch every call. Q4's `EXISTS` costs ≈112 µs per call by comparison. The
+  D4.2 rescan contract therefore pays off in proportion to inner-plan
+  complexity, and Q2 is its headline case.
+- **Q17 is already on the rescan path and is *not* a SubPlan problem.**
+  `rebuilds=1, rescans=6667` shows `CorrSubqOps` working as designed; its 54.5 s
+  is dominated by the 6 M-row outer `lineitem` scan, which belongs to the
+  bulk-executor gap (out of this bundle's scope). Q17 should be removed from the
+  "SubPlan-bound" bucket.
+- **The non-correlated cache works** (Q22 SubPlan 1: 11 827 hits / 1 miss),
+  confirming M0058-0001 is healthy and that S3's hashed SubPlan targets a
+  different cost (per-probe linear scan), not a cache miss.
+
 Remaining W1 work in S0 (confirmation, not discovery):
 
-1. Per TPC-H query (Q2/Q4/Q17/Q20/Q21/Q22), confirm with the V6 counters and
-   a one-off instrumented run that `IndexScan.Key` absorption is the gate
-   that fires (and record any query where a *different* gate dominates —
-   Q21's dual-EXISTS and Q20's nested-IN may hit G2/G3 first).
+1. ~~Per TPC-H query, confirm the gate with V6 counters~~ — **done**, table
+   above. Q21 was not measured (its runtime exceeds the probe budget at SF1);
+   its dual-EXISTS gate attribution stays as analysed in §6.
 2. Re-run the P1–P6 probes plus the 2026-07-20 review probes and archive as
    `evidence/unnest-probes-<newhead>.txt`.
 3. Record each surviving sublink's gate (G1–G10) in the dossier below,

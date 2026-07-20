@@ -122,6 +122,19 @@ type Context struct {
 	// values are the projected result datum.
 	CorrSubqHashMaps map[*planner.SubqueryExpr]map[string]Datum
 
+	// SubPlanStats records, per sublink expression, what its
+	// evaluation actually cost during this statement. It exists
+	// because the interesting question about a correlated subquery
+	// — "did the executor re-instantiate the inner plan once per
+	// outer row, or reuse it?" — is invisible in EXPLAIN output
+	// otherwise, and was previously answered only by Fermi
+	// estimates (see the correlated-subquery-planning design
+	// bundle, gate V6). Surfaced by EXPLAIN ANALYZE.
+	//
+	// Written on the single statement-executing goroutine, in the
+	// same style as SubqueryCache above; no synchronisation.
+	SubPlanStats map[planner.Expr]*SubPlanSiteStats
+
 	// MultiAssignSubqCache caches the result row of a MultiAssignSubqRow
 	// evaluation (tuple SET subquery). Keyed by *planner.MultiAssignSubqRow
 	// pointer (as uintptr). Cleared by the update executor at the start of
@@ -663,6 +676,54 @@ type Context struct {
 	// DELETE has no new). M0100-0007.
 	MergeOldRow Row
 	MergeNewRow Row
+}
+
+// SubPlanSiteStats counts what one sublink expression (a
+// SubqueryExpr / InExpr / ExistsExpr carrying an inner plan) did
+// during a statement.
+//
+// The distinction that matters is Rebuilds vs Rescans: a rebuild
+// tears down and re-instantiates the inner plan's operator tree
+// for one outer row, which is the cost that makes un-decorrelated
+// correlated subqueries quadratic; a rescan reuses an already-open
+// operator and only re-probes it. Upstream PostgreSQL only ever
+// rescans (ExecReScan in nodeSubplan.c), so a plan showing
+// Calls == Rebuilds is running the shape upstream never runs.
+type SubPlanSiteStats struct {
+	// Calls is the number of times a result was requested from
+	// this sublink — one per outer row that reached it.
+	Calls int64
+	// Rebuilds is the number of Calls that had to Build + Open
+	// (and later Close) the inner plan's operator tree.
+	Rebuilds int64
+	// Rescans is the number of Calls served by re-Opening an
+	// operator tree that was already built (the CorrSubqOps path).
+	Rescans int64
+	// CacheHits / CacheMisses count Calls answered from, or
+	// missing in, a result cache (SubqueryCache or the correlated
+	// hash-map path). A miss is normally followed by a Rebuild.
+	CacheHits   int64
+	CacheMisses int64
+}
+
+// subPlanStat returns the counter block for sublink e, allocating
+// it (and the map) on first use. Safe on a nil Context so the many
+// code paths that evaluate expressions with a bare or absent
+// Context in tests keep working; the returned block is then
+// discarded.
+func (c *Context) subPlanStat(e planner.Expr) *SubPlanSiteStats {
+	if c == nil {
+		return &SubPlanSiteStats{}
+	}
+	if c.SubPlanStats == nil {
+		c.SubPlanStats = make(map[planner.Expr]*SubPlanSiteStats)
+	}
+	s, ok := c.SubPlanStats[e]
+	if !ok {
+		s = &SubPlanSiteStats{}
+		c.SubPlanStats[e] = s
+	}
+	return s
 }
 
 // backendPID resolves the owning backend's PID string for synthetic pg_locks

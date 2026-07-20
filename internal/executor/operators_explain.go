@@ -108,7 +108,7 @@ func (o *explainOp) Open(ctx *Context) error {
 			return nil
 		}
 		var b strings.Builder
-		walkPlanAnalyze(&b, o.plan.Child, 0, &o.rows, opts, stats)
+		walkPlanAnalyze(&b, o.plan.Child, 0, &o.rows, opts, stats, ctx.SubPlanStats)
 		appendExplainSettingsRow(ctx, opts, &o.rows)
 		if summary {
 			o.rows = append(o.rows,
@@ -395,7 +395,7 @@ func walkPlanFiltered(n planner.Node, depth int, rows *[]Row, opts parser.Explai
 	// Sublinks referenced by this node's detail lines print their
 	// inner plan as an indented `SubPlan N` subtree, as upstream's
 	// ExplainSubPlans does.
-	emitSubPlanSubtrees(rows, depth, detailIndent, opts, reg, func(sub planner.Node, subDepth int) {
+	emitSubPlanSubtrees(rows, detailIndent, opts, reg, nil, func(sub planner.Node, subDepth int) {
 		walkPlanFiltered(sub, subDepth, rows, opts, nil, reg)
 	})
 
@@ -414,21 +414,31 @@ func walkPlanFiltered(n planner.Node, depth int, rows *[]Row, opts parser.Explai
 // queue is drained in a loop because a sublink's own plan can
 // reference further sublinks, which assign higher numbers as they
 // are rendered (matching upstream's nested-SubPlan output).
-func emitSubPlanSubtrees(rows *[]Row, depth int, detailIndent string, opts parser.ExplainOptions, reg *subPlanReg, render func(planner.Node, int)) {
+// spStats, when non-nil (the ANALYZE path), appends this sublink's
+// measured execution counters to its `SubPlan N` line.
+func emitSubPlanSubtrees(rows *[]Row, detailIndent string, opts parser.ExplainOptions, reg *subPlanReg, spStats map[planner.Expr]*SubPlanSiteStats, render func(planner.Node, int)) {
 	for {
 		pending := reg.takePending()
 		if len(pending) == 0 {
 			return
 		}
 		for _, sp := range pending {
-			*rows = append(*rows, Row{NewStringDatum(detailIndent + fmt.Sprintf("SubPlan %d", sp.n))})
+			line := detailIndent + fmt.Sprintf("SubPlan %d", sp.n)
+			if s := spStats[sp.expr]; s != nil {
+				line += fmt.Sprintf(" (calls=%d rebuilds=%d rescans=%d hits=%d misses=%d)",
+					s.Calls, s.Rebuilds, s.Rescans, s.CacheHits, s.CacheMisses)
+			}
+			*rows = append(*rows, Row{NewStringDatum(line)})
 			if sp.plan != nil {
 				// Indent the sublink's plan one "->" level under the
 				// `SubPlan N` line, matching upstream's shape. A node
 				// rendered at depth d starts its "->" at 2*d columns,
-				// while detailIndent sits at 2*depth+6; depth+4 puts
-				// the subtree at 2*depth+8 — i.e. detailIndent+2.
-				render(sp.plan, depth+4)
+				// so the depth that lands on detailIndent+2 is
+				// (len(detailIndent)+2)/2. Deriving it from the indent
+				// rather than from depth keeps the root node right:
+				// depth 0 has no "->  " prefix, so its detailIndent is
+				// 4 columns narrower than every deeper node's.
+				render(sp.plan, (len(detailIndent)+2)/2)
 			}
 		}
 	}
@@ -566,9 +576,12 @@ type subPlanReg struct {
 	pending []subPlanEntry
 }
 
-// subPlanEntry is one assigned-but-not-yet-emitted sublink.
+// subPlanEntry is one assigned-but-not-yet-emitted sublink. expr
+// is retained so ANALYZE can look the sublink's execution counters
+// up in Context.SubPlanStats when rendering its `SubPlan N` line.
 type subPlanEntry struct {
 	n    int
+	expr planner.Expr
 	plan planner.Node
 }
 
@@ -586,7 +599,7 @@ func (r *subPlanReg) assign(e planner.Expr, plan planner.Node) int {
 	}
 	n := len(r.num) + 1
 	r.num[e] = n
-	r.pending = append(r.pending, subPlanEntry{n: n, plan: plan})
+	r.pending = append(r.pending, subPlanEntry{n: n, expr: e, plan: plan})
 	return n
 }
 
@@ -763,13 +776,13 @@ func schemaColumnNames(n planner.Node) []string {
 // `(actual time=startup..total rows=R loops=L)` suffix pulled
 // from the instrumentation table. Loops > 0 means the operator
 // ran at least once. Total time is in milliseconds.
-func walkPlanAnalyze(b *strings.Builder, n planner.Node, depth int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable) {
-	walkPlanAnalyzeFiltered(n, depth, rows, opts, stats, nil, &subPlanReg{})
+func walkPlanAnalyze(b *strings.Builder, n planner.Node, depth int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable, spStats map[planner.Expr]*SubPlanSiteStats) {
+	walkPlanAnalyzeFiltered(n, depth, rows, opts, stats, spStats, nil, &subPlanReg{})
 }
 
-func walkPlanAnalyzeFiltered(n planner.Node, depth int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable, attachedFilter planner.Expr, reg *subPlanReg) {
+func walkPlanAnalyzeFiltered(n planner.Node, depth int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable, spStats map[planner.Expr]*SubPlanSiteStats, attachedFilter planner.Expr, reg *subPlanReg) {
 	if p, ok := n.(*planner.Project); ok {
-		walkPlanAnalyzeFiltered(p.Child, depth, rows, opts, stats, attachedFilter, reg)
+		walkPlanAnalyzeFiltered(p.Child, depth, rows, opts, stats, spStats, attachedFilter, reg)
 		return
 	}
 	if f, ok := n.(*planner.Filter); ok {
@@ -777,7 +790,7 @@ func walkPlanAnalyzeFiltered(n planner.Node, depth int, rows *[]Row, opts parser
 		if attachedFilter != nil {
 			next = attachedFilter
 		}
-		walkPlanAnalyzeFiltered(f.Child, depth, rows, opts, stats, next, reg)
+		walkPlanAnalyzeFiltered(f.Child, depth, rows, opts, stats, spStats, next, reg)
 		return
 	}
 
@@ -841,12 +854,12 @@ func walkPlanAnalyzeFiltered(n planner.Node, depth int, rows *[]Row, opts parser
 
 	// Sublink subtrees keep their instrumentation: stats is passed
 	// through so inner nodes still report actual rows / loops.
-	emitSubPlanSubtrees(rows, depth, detailIndent, opts, reg, func(sub planner.Node, subDepth int) {
-		walkPlanAnalyzeFiltered(sub, subDepth, rows, opts, stats, nil, reg)
+	emitSubPlanSubtrees(rows, detailIndent, opts, reg, spStats, func(sub planner.Node, subDepth int) {
+		walkPlanAnalyzeFiltered(sub, subDepth, rows, opts, stats, spStats, nil, reg)
 	})
 
 	for _, c := range planChildren(n) {
-		walkPlanAnalyzeFiltered(c, depth+1, rows, opts, stats, nil, reg)
+		walkPlanAnalyzeFiltered(c, depth+1, rows, opts, stats, spStats, nil, reg)
 	}
 }
 

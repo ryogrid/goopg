@@ -6691,6 +6691,8 @@ func collectInValues(x *planner.InExpr, row Row, ctx *Context) ([]Datum, error) 
 		// inner plan returns the same set for every outer row,
 		// so a constant cache key collapses re-evaluation to
 		// a single execution.
+		stat := ctx.subPlanStat(x)
+		stat.Calls++
 		cacheKey := subqueryCacheKey(row)
 		if x.IsNonCorrelated {
 			cacheKey = nonCorrelatedCacheKey(x)
@@ -6701,9 +6703,12 @@ func collectInValues(x *planner.InExpr, row Row, ctx *Context) ([]Datum, error) 
 				ctx.SubqueryCacheScope = len(ctx.OuterRows)
 			}
 			if cached, ok := ctx.SubqueryCache[cacheKey]; ok {
+				stat.CacheHits++
 				return cached, nil
 			}
 		}
+		stat.CacheMisses++
+		stat.Rebuilds++
 		// Push the outer row so correlated refs inside the
 		// IN-subquery resolve against it. Pop on return.
 		ctx.OuterRows = append(ctx.OuterRows, row)
@@ -6794,6 +6799,9 @@ func evalExistsExpr(x *planner.ExistsExpr, row Row, ctx *Context) (Datum, error)
 	ctx.OuterRows = append(ctx.OuterRows, row)
 	defer func() { ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1] }()
 
+	stat := ctx.subPlanStat(x)
+	stat.Calls++
+
 	// For non-correlated EXISTS (M0058-0001), the inner plan
 	// returns the same boolean for every outer row. Cache it
 	// under a constant key.
@@ -6806,10 +6814,12 @@ func evalExistsExpr(x *planner.ExistsExpr, row Row, ctx *Context) (Datum, error)
 			}
 			if cached, ok := ctx.SubqueryCache[cacheKey]; ok {
 				if len(cached) == 1 {
+					stat.CacheHits++
 					return cached[0], nil
 				}
 			}
 		}
+		stat.CacheMisses++
 		val, err := existsImpl(x, ctx)
 		if err != nil {
 			return Datum{}, err
@@ -6825,6 +6835,11 @@ func evalExistsExpr(x *planner.ExistsExpr, row Row, ctx *Context) (Datum, error)
 }
 
 func existsImpl(x *planner.ExistsExpr, ctx *Context) (Datum, error) {
+	// Every call re-instantiates the inner plan: correlated EXISTS
+	// has no operator-reuse path today (unlike the scalar
+	// subqueryImpl below), so this counter is expected to track
+	// Calls exactly until the S2 rescan work lands.
+	ctx.subPlanStat(x).Rebuilds++
 	op, err := Build(x.Plan)
 	if err != nil {
 		return Datum{}, err
@@ -6867,6 +6882,9 @@ func evalSubquery(x *planner.SubqueryExpr, row Row, ctx *Context) (Datum, error)
 	ctx.OuterRows = append(ctx.OuterRows, row)
 	defer func() { ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1] }()
 
+	stat := ctx.subPlanStat(x)
+	stat.Calls++
+
 	// Fast path: correlated subquery using a pre-opened cached operator.
 	// Skip SubqueryCache entirely — the operator already rescans correctly
 	// for each outer row, so the key-build + map overhead is unnecessary.
@@ -6890,12 +6908,14 @@ func evalSubquery(x *planner.SubqueryExpr, row Row, ctx *Context) (Datum, error)
 			ctx.SubqueryCacheScope = len(ctx.OuterRows)
 		}
 		if cached, ok := ctx.SubqueryCache[cacheKey]; ok {
+			stat.CacheHits++
 			if len(cached) == 1 {
 				return cached[0], nil
 			}
 			return NullDatum, nil
 		}
 	}
+	stat.CacheMisses++
 	val, err := subqueryImpl(x, ctx)
 	if err != nil {
 		return Datum{}, err
@@ -6927,7 +6947,13 @@ func subqueryImpl(x *planner.SubqueryExpr, ctx *Context) (Datum, error) {
 				ctx.CorrSubqOps = make(map[*planner.SubqueryExpr]Operator)
 			}
 			op, found := ctx.CorrSubqOps[x]
-			if !found {
+			if found {
+				// Re-Open of an already-built operator: the one
+				// place goopg already does what upstream always
+				// does (ExecReScan rather than re-instantiate).
+				ctx.subPlanStat(x).Rescans++
+			} else {
+				ctx.subPlanStat(x).Rebuilds++
 				var buildErr error
 				op, buildErr = Build(x.Plan)
 				if buildErr != nil {
@@ -6949,7 +6975,14 @@ func subqueryImpl(x *planner.SubqueryExpr, ctx *Context) (Datum, error) {
 				ctx.CorrSubqHashMaps = make(map[*planner.SubqueryExpr]map[string]Datum)
 			}
 			hm, built := ctx.CorrSubqHashMaps[x]
-			if !built {
+			if built {
+				ctx.subPlanStat(x).CacheHits++
+			} else {
+				// Building the map scans the whole inner table
+				// once — a rebuild, but only ever one of them.
+				st := ctx.subPlanStat(x)
+				st.CacheMisses++
+				st.Rebuilds++
 				var hmErr error
 				hm, hmErr = buildCorrSubqHashMap(info, ctx)
 				if hmErr != nil {
@@ -6973,6 +7006,7 @@ func subqueryImpl(x *planner.SubqueryExpr, ctx *Context) (Datum, error) {
 		}
 	}
 
+	ctx.subPlanStat(x).Rebuilds++
 	op, err := Build(x.Plan)
 	if err != nil {
 		return Datum{}, err

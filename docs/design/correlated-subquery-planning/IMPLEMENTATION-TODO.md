@@ -13,6 +13,11 @@ Twelve commit-sized stages. One commit + push per stage; the `.githooks/pre-comm
 pgbench smoke runs on every commit (never `--no-verify`). This file is updated **in the
 same commit as the stage it records**.
 
+Bookkeeping convention: a stage's gate results are written **in that stage's own
+commit**; its resulting commit hash — unknowable until the commit exists — is filled
+in by the **next** stage's commit, so no stage needs an amend (which would re-run the
+pre-commit pgbench smoke for a one-line edit).
+
 Gate vocabulary:
 
 - **units** — `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh`
@@ -78,17 +83,45 @@ fix); 7 independent, landed early to soak alone; 8 → 9 → 10 → 11 sequentia
                     and typed literals changed. Captured a fresh baseline
                     `plan_snapshots/csq-s0-explain.txt`; `make plan-gate` now **22/22 MATCH**.
       pgbench-hook: PASS (see commit)
-- commit: `4dfda28f`
+- commit: `379dd402`
 
-## Stage 2 — S0-2: V6 per-SubPlan counters  [ ]
+## Stage 2 — S0-2: V6 per-SubPlan counters  [x]
 
-- [ ] `Context.SubPlanStats` (calls / rebuilds / rescans / cache hits / misses)
-- [ ] counter hooks in `collectInValues`, `existsImpl`, `subqueryImpl`
-- [ ] EXPLAIN ANALYZE emits the per-SubPlan counter line
-- [ ] W1 per-query confirmation recorded in ch.01 dossier (Q4 invocation magnitude:
-      ≈57 K vs ≈1.5 M — V6 acceptance)
-- gates: units / spotcheck / plan-gate(empty) / pgbench-hook — _pending_
-- commit: _pending_
+- [x] `SubPlanSiteStats` + `Context.SubPlanStats` + `subPlanStat()` accessor (nil-safe)
+- [x] counter hooks classifying every path of `collectInValues`, `evalExistsExpr`/
+      `existsImpl`, `evalSubquery`/`subqueryImpl` (incl. the `CorrSubqOps` rescan and
+      `CorrSubqHashMaps` paths); invariant `Rebuilds + Rescans == Calls` holds on fixtures
+- [x] EXPLAIN **ANALYZE** appends `(calls=… rebuilds=… rescans=… hits=… misses=…)` to the
+      `SubPlan N` line; plain EXPLAIN unchanged
+- [x] fixed a Stage-1 rendering bug found by the new tests: a sublink on the **root** node
+      indented its subtree 4 columns too deep (root has no `->` prefix). Subtree depth is
+      now derived from the detail indent, identical for depth ≥ 1
+- [x] **W1 magnitude answered: Q4 = 57 640 calls**, not ≈1.5 M — the date conjunct
+      short-circuits. Full counter table recorded in ch.01 §5.
+- gates:
+      units:        PASS (2026-07-20, whole module)
+      spotcheck:    PASS (Q12=2 / Q13=33; 42.2 s / 103.6 s)
+      plan-gate:    22/22 MATCH vs `csq-s0-explain` (counters are ANALYZE-only)
+      pgbench-hook: PASS (see commit)
+- V6 acceptance: `calls == rebuilds`, `rescans = 0` reproduced on Q4 ✔
+- commit: _(filled in by Stage 3)_
+
+### Measured ground truth (S0 exit data)
+
+| Query | SubPlan | kind | calls | rebuilds | rescans | hits | exec |
+|---|---|---|---:|---:|---:|---:|---:|
+| Q2 | 1 | scalar `min` corr. | 621 | 621 | 0 | 0 | 16.4 s |
+| Q4 | 1 | `EXISTS` corr. | 57 640 | 57 640 | 0 | 0 | 6.45 s |
+| Q17 | 1 | scalar `avg` corr. | 6 668 | 1 | 6 667 | 0 | 54.5 s |
+| Q20 | 1 | scalar `sum` corr. | 8 552 | 8 552 | 0 | 0 | 2.55 s |
+| Q22 | 1 | scalar `avg` non-corr. | 11 828 | 1 | 0 | 11 827 | 0.91 s |
+| Q22 | 2 | `NOT EXISTS` corr. | 5 415 | 5 415 | 0 | 0 | — |
+
+Re-ranking this forces on the roadmap (see ch.01 §5 for the full argument):
+**Q2 is the worst per-call site** (≈26 ms/call — its inner plan is an `Aggregate`
+over a 4-table Multi-Way Hash Join, rebuilt every call), **Q17 is already on the
+rescan path** and is a bulk-scan problem rather than a SubPlan problem, and the
+non-correlated cache is healthy.
 
 ## Stage 3 — S0-3: semantics matrix + SF1 baseline  [ ]
 
