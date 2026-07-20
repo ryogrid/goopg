@@ -156,13 +156,37 @@ func lowerSublinkTree(h *sublinkHandle, a *paramAlloc) {
 // nested sublink is either lowerable (recursed) or self-contained
 // (excluded kinds), and that no LATERAL join scope intervenes.
 func analyzeSublink(plan Node, depth int) bool {
-	return lowerTraverseNode(plan, func(e Expr) (Expr, bool, bool) {
+	var fx lowerExprFn
+	fx = func(e Expr) (Expr, bool, bool) {
 		switch x := e.(type) {
 		case *OuterColumnRef:
 			return e, true, x.Level <= depth
 		case *SubqueryExpr, *ExistsExpr, *InExpr:
 			if h := handleFor(e); h != nil {
-				return e, true, analyzeSublink(h.plan, depth+1)
+				if !analyzeSublink(h.plan, depth+1) {
+					return e, true, false
+				}
+				// S4b fix: an IN's Operand and literal List evaluate in
+				// the HOST scope (this plan), not inside the sublink —
+				// handled=true above stops generic descent, so without
+				// this explicit traversal an OuterColumnRef hiding in
+				// the operand was invisible to the analysis: the
+				// enclosing sublink got lowered (its eval site stopped
+				// pushing OuterRows) and the un-lowered operand ref
+				// dangled at runtime (matrix M21's XX000).
+				if in, isIn := e.(*InExpr); isIn {
+					if in.Operand != nil {
+						if _, ok := lowerTraverseExpr(in.Operand, fx); !ok {
+							return e, true, false
+						}
+					}
+					for _, le := range in.List {
+						if _, ok := lowerTraverseExpr(le, fx); !ok {
+							return e, true, false
+						}
+					}
+				}
+				return e, true, true
 			}
 			// Row-constructor InExpr with a plan: excluded,
 			// self-pushing at eval time.
@@ -189,7 +213,8 @@ func analyzeSublink(plan Node, depth int) bool {
 			// property — checked below via the node hook.
 		}
 		return e, false, true
-	}) && !planContainsLateralJoin(plan)
+	}
+	return lowerTraverseNode(plan, fx) && !planContainsLateralJoin(plan)
 }
 
 // excludedRefsWithin reports whether an excluded sublink's plan
@@ -338,7 +363,8 @@ func slotFor(chain []*lowerScope, k int, ref *OuterColumnRef, dist int, a *param
 func rewriteSublinkPlan(chain []*lowerScope, a *paramAlloc) {
 	k := len(chain) - 1
 	sc := chain[k]
-	ok := lowerTraverseNode(sc.h.plan, func(e Expr) (Expr, bool, bool) {
+	var fx lowerExprFn
+	fx = func(e Expr) (Expr, bool, bool) {
 		switch x := e.(type) {
 		case *OuterColumnRef:
 			id := slotFor(chain, k, x, x.Level, a)
@@ -346,6 +372,25 @@ func rewriteSublinkPlan(chain []*lowerScope, a *paramAlloc) {
 		case *SubqueryExpr, *ExistsExpr, *InExpr:
 			if h := handleFor(e); h != nil {
 				rewriteSublinkPlan(append(chain, &lowerScope{h: h, slots: map[refKey]int{}}), a)
+				// S4b fix (mirror of analyzeSublink): the operand and
+				// literal list are THIS plan's expressions — rewrite
+				// their refs against the current chain position.
+				if in, isIn := e.(*InExpr); isIn {
+					if in.Operand != nil {
+						if ne, ok := lowerTraverseExpr(in.Operand, fx); ok {
+							in.Operand = ne
+						} else {
+							return e, true, false
+						}
+					}
+					for i, le := range in.List {
+						if ne, ok := lowerTraverseExpr(le, fx); ok {
+							in.List[i] = ne
+						} else {
+							return e, true, false
+						}
+					}
+				}
 				return e, true, true
 			}
 			return e, false, true
@@ -355,7 +400,8 @@ func rewriteSublinkPlan(chain []*lowerScope, a *paramAlloc) {
 			return e, true, true
 		}
 		return e, false, true
-	})
+	}
+	ok := lowerTraverseNode(sc.h.plan, fx)
 	if !ok {
 		// Cannot happen when analysis passed (same traversal); if it
 		// ever does, the params recorded so far are still consistent

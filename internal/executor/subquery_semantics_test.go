@@ -452,6 +452,46 @@ func semanticsCases() []semanticsCase {
 				"SELECT y.b FROM t2 y WHERE y.a = t1.a AND y.b >= t1.b) ORDER BY a",
 			wantErrCode: "21000",
 		},
+
+		// ---- M20-M22: D3.3 nested-sublink tolerance (S4b) ----------------
+		// M15 above pins the ESCAPING shape (its nested IN references t1,
+		// a Level-2 ref seen from inside — it must stay a SubPlan). These
+		// rows pin the complements the stage introduces.
+		{
+			id: "M20",
+			desc: "nested sublink correlated only to the EXISTS body (Level 1) rides " +
+				"into the semi-join build side as a SubPlan; results unchanged",
+			// z=(1,10): nested set {10,11} contains 10 -> EXISTS true for
+			// t1.a=1. z=(3,NULL): NULL IN {NULL} is NULL -> no. Others: no z.
+			sql: "SELECT a FROM t1 WHERE EXISTS (" +
+				"SELECT 1 FROM t2 z WHERE z.a = t1.a AND z.b IN (" +
+				"SELECT y.b FROM t2 y WHERE y.a = z.a)) ORDER BY a",
+			want: []string{"1"},
+		},
+		{
+			id: "M21",
+			desc: "correlation hiding inside a nested IN's OPERAND (host-scope position " +
+				"the shallow walkers treat as a leaf) keeps the EXISTS a SubPlan and correct",
+			// exists(z.a=t1.a) AND t1.b IN {10,11,NULL}: a=1 (b=10) yes;
+			// a=3 (b=30 vs NULL-bearing set) NULL -> no; a=2,4: no z.
+			sql: "SELECT a FROM t1 WHERE EXISTS (" +
+				"SELECT 1 FROM t2 z WHERE z.a = t1.a AND t1.b IN (" +
+				"SELECT y.b FROM t2 y)) ORDER BY a",
+			want: []string{"1"},
+		},
+		{
+			id: "M22",
+			desc: "zero-equijoin EXISTS (NL semi) whose build side carries a nested " +
+				"SubPlan evaluates the SubPlan correctly during the build drain",
+			// Qualifying z rows need z.a IN {y.a : y.b = z.b}: z=(1,10) and
+			// (1,11) qualify (their own a=1 is in the set); z=(3,NULL) has
+			// an empty nested set -> false. Then EXISTS(z.b > t1.b) over
+			// b in {10,11}: t1.a=1 (b=10 < 11) yes; a=2,3 no; a=4 (NULL) no.
+			sql: "SELECT a FROM t1 WHERE EXISTS (" +
+				"SELECT 1 FROM t2 z WHERE z.b > t1.b AND z.a IN (" +
+				"SELECT y.a FROM t2 y WHERE y.b = z.b)) ORDER BY a",
+			want: []string{"1"},
+		},
 	}
 }
 

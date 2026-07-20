@@ -706,8 +706,8 @@ was `distinctOp.Open` (the `Unique` node), not the NL join.
 | # | Stage | Scope | Status |
 |---|---|---|---|
 | R2-0 | harness guard + NLI-Predicate EXPLAIN | throttle-trap refusal in the wrapper; NLI residual visible | [x] `3a620f2b` |
-| R2-1 | S4a: D3.2 residual lifting (IN/scalar) + NL semi/anti + tautology strip | | [x] (this commit) |
-| R2-2 | S4b: D3.3 nested-sublink tolerance (deep walk + clone fix) | | [ ] |
+| R2-1 | S4a: D3.2 residual lifting (IN/scalar) + NL semi/anti + tautology strip | | [x] `55ad7fdb` |
+| R2-2 | S4b: D3.3 nested-sublink tolerance (deep walk + clone fix) | | [x] (this commit) |
 | R2-3 | D6.3a: subplan cost helper + NLI semi/anti cost gate | | [ ] |
 | R2-4 | S5a: unnest before join search (semi/anti pinned) | | [ ] |
 | R2-5 | S5b | **deferred** (ledger row in R2-4) | — |
@@ -785,4 +785,39 @@ was `distinctOp.Open` (the `Unique` node), not the NL join.
                   bail earlier via the probe-cheap policy; Q2's correlation is
                   absorbed by the index harvest before reaching the Filter arm)
       pgbench-hook: PASS (see commit)
-- commit: _(filled by R2-2)_
+- commit: `55ad7fdb`
+
+## R2-2 — S4b: D3.3 nested-sublink tolerance  [x]
+
+- [x] deep walkers (`walkPlanExprsDeep` etc.): descend into sublink `.Plan`s with
+      per-boundary depth tracking AND into IN Operand/List at host scope (a second
+      blind spot found during the work); negative control pins that the shallow
+      walker cannot see a nested Level-2 ref
+- [x] **escape check** replaces the blanket `hasNestedSub` bail: a ref at nested
+      depth d ≥ 1 escapes iff `Level > d` (the directive's `d+1` was off by one —
+      corrected and pinned at both boundaries). Depth-0 refs keep the accounted
+      logic, which now also sees operand-hidden refs
+- [x] params-side twin hardening: `extractEquijoinPair`/`harvestIndexKeyParams`
+      reject `Level > 1` keys
+- [x] `cloneExprLeaf` deep-copies sublink nodes (verbatim nested-plan clone —
+      invariant argued at the site: the escape check guarantees no ref to the
+      unnested scope; body-relative refs keep their host); unnest-then-mutate
+      aliasing regression pinned
+- [x] **bonus pre-existing bug fixed** (found by new matrix row M21): Stage-8
+      lowering stopped descent at a lowerable sublink, so an `OuterColumnRef` in a
+      nested IN's Operand was never rewritten — the enclosing EXISTS stopped
+      pushing `OuterRows` and the ref dangled at runtime (live XX000 reproduced).
+      Both lowering phases now traverse Operand/List
+- [x] matrix M15 re-read: its fixture is the ESCAPING shape (stays SubPlan by
+      design — it became the escaping-ref pin); new rows **M20** (body-correlated
+      nested sublink rides into the hash-semi build side), **M21** (operand-hidden
+      ref stays SubPlan, correct both paths), **M22** (NL-semi build side evaluates
+      a nested SubPlan). Matrix now M1–M22, all green on both paths
+- gates:
+      units:      PASS (2026-07-21, whole module)
+      spotcheck:  PASS (Q12=2 / Q13=33)
+      plan-gate:  **22/22 MATCH** (zero TPC-H diffs, as predicted — Q4/Q21/Q22
+                  bodies have no nested sublinks; Q20's IN already carried its
+                  nested scalar, now deep-copied with identical shape)
+      pgbench-hook: PASS (see commit)
+- commit: _(filled by R2-3)_

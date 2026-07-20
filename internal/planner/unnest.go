@@ -774,6 +774,14 @@ func harvestIndexKeyParams(node Node) []unnestParam {
 				if !ok || is.Index == nil || col >= len(is.Index.Columns) {
 					return
 				}
+				// D3.3: same Level-1-only rule as extractEquijoinPair —
+				// a Level-2 key targets the grandparent, not the scope
+				// being unnested; harvesting it would join against the
+				// wrong schema. Left unharvested it stays unaccounted
+				// and the sublink correctly remains a SubPlan.
+				if oc.Level > 1 {
+					return
+				}
 				name := is.Index.Columns[col]
 				idx := -1
 				for i, sc := range schema {
@@ -845,6 +853,71 @@ func harvestIndexKeyParams(node Node) []unnestParam {
 // actually neutralised in the clone (e.g. a partial multi-key harvest),
 // and installing such a join would evaluate an unbound reference at
 // runtime. Callers treat true as "bail to the SubPlan path".
+// walkPlanExprsDeep is walkPlanExprs with sublink descent (D3.3/S4b):
+// every expression is reported together with its sublink-plan depth —
+// the number of sublink `.Plan` boundaries between the walk root and
+// the expression. A sublink's non-plan children (an IN's Operand and
+// literal List) evaluate in the HOST scope and are therefore visited at
+// the sublink's own depth; only entering the inner Plan increments it.
+//
+// The depth is what makes scope-escape analysis possible: an
+// OuterColumnRef at planDepth d references, for Level L ≤ d, a scope
+// inside the walk root's subtree (still valid if the root is pulled up
+// as a join input — the ref's host is unchanged), while L > d reaches
+// PAST the root. After a pull-up the outer query's row is no longer on
+// the executor's OuterRows stack when the root runs as a join input, so
+// such a ref would silently resolve against whatever occupies that
+// stack slot — the grandparent-aliasing wrong-results hazard the
+// shallow walkers cannot see.
+func walkPlanExprsDeep(node Node, planDepth int, visit func(Expr, int)) {
+	if node == nil {
+		return
+	}
+	walkPlanExprs(node, func(e Expr) {
+		visit(e, planDepth)
+		deepVisitSublinkChildren(e, planDepth, visit)
+	})
+}
+
+// walkExprTreeDeep is walkExprTree with the same sublink descent and
+// depth contract as walkPlanExprsDeep.
+func walkExprTreeDeep(e Expr, planDepth int, visit func(Expr, int)) {
+	walkExprTree(e, func(sub Expr) {
+		visit(sub, planDepth)
+		deepVisitSublinkChildren(sub, planDepth, visit)
+	})
+}
+
+// deepVisitSublinkChildren descends into the parts of a sublink node
+// the shallow walkers skip: host-scope expression children at the same
+// depth, and the inner Plan at depth+1.
+func deepVisitSublinkChildren(e Expr, planDepth int, visit func(Expr, int)) {
+	switch x := e.(type) {
+	case *SubqueryExpr:
+		walkPlanExprsDeep(x.Plan, planDepth+1, visit)
+	case *ExistsExpr:
+		walkPlanExprsDeep(x.Plan, planDepth+1, visit)
+	case *InExpr:
+		// Operand and List evaluate in the host scope; walkExprTree
+		// treats the whole InExpr as a leaf, so without this descent an
+		// OuterColumnRef hiding inside the operand is invisible to
+		// every analysis built on the shallow walkers.
+		walkExprTreeDeep(x.Operand, planDepth, visit)
+		for _, le := range x.List {
+			walkExprTreeDeep(le, planDepth, visit)
+		}
+		if x.Plan != nil {
+			walkPlanExprsDeep(x.Plan, planDepth+1, visit)
+		}
+	case *ArraySubqueryExpr:
+		walkPlanExprsDeep(x.Plan, planDepth+1, visit)
+	case *MultiAssignSubqElem:
+		if x.Row != nil && x.Row.Plan != nil {
+			walkPlanExprsDeep(x.Row.Plan, planDepth+1, visit)
+		}
+	}
+}
+
 func planHasOuterRefRemaining(node Node) bool {
 	found := false
 	walkPlanExprs(node, func(e Expr) {
@@ -856,12 +929,19 @@ func planHasOuterRefRemaining(node Node) bool {
 }
 
 func extractEquijoinPair(a, b Expr) (*OuterColumnRef, *ColumnRef) {
-	if o, ok := a.(*OuterColumnRef); ok {
+	// D3.3 (S4b): only a Level-1 ref is a decorrelation key. The unnest
+	// joins the sublink against its IMMEDIATE host; a Level-2 ref
+	// targets the grandparent, and using it as a join key would bind
+	// the key's Index against the wrong schema (reachable via the
+	// driver's recursive descent into a body whose nested sublink
+	// references the true outer query — the same escaping-ref family
+	// the deep accounting check guards, but on the params side).
+	if o, ok := a.(*OuterColumnRef); ok && o.Level <= 1 {
 		if c, ok := b.(*ColumnRef); ok {
 			return o, c
 		}
 	}
-	if o, ok := b.(*OuterColumnRef); ok {
+	if o, ok := b.(*OuterColumnRef); ok && o.Level <= 1 {
 		if c, ok := a.(*ColumnRef); ok {
 			return o, c
 		}
@@ -1465,9 +1545,67 @@ func cloneExprReplacingOuter(e Expr, replace map[*OuterColumnRef]*ColumnRef) Exp
 		cl := *x
 		cl.Source = cloneExprReplacingOuter(x.Source, replace)
 		return &cl
+	case *SubqueryExpr:
+		cl := *x
+		cl.Plan = clonePlanVerbatimOrShare(x.Plan)
+		return &cl
+	case *ExistsExpr:
+		cl := *x
+		cl.Plan = clonePlanVerbatimOrShare(x.Plan)
+		return &cl
+	case *InExpr:
+		cl := *x
+		// The operand and literal list evaluate in the HOST scope (the
+		// body being cloned), so they go through the ordinary replacing
+		// clone; only the inner plan is copied verbatim.
+		cl.Operand = cloneExprReplacingOuter(x.Operand, replace)
+		if len(x.List) > 0 {
+			cl.List = make([]Expr, len(x.List))
+			for i, le := range x.List {
+				cl.List[i] = cloneExprReplacingOuter(le, replace)
+			}
+		}
+		cl.Plan = clonePlanVerbatimOrShare(x.Plan)
+		return &cl
+	case *ArraySubqueryExpr:
+		cl := *x
+		cl.Plan = clonePlanVerbatimOrShare(x.Plan)
+		return &cl
 	default:
 		return cloneExprLeaf(x)
 	}
+}
+
+// clonePlanVerbatimOrShare structurally clones a nested sublink's inner
+// plan (D3.3/S4b — closes the F7 aliasing trap where clone and original
+// shared the nested Plan pointer, so a later in-place pass mutated
+// both trees).
+//
+// The clone is VERBATIM (empty replace map) by invariant: the deep
+// escape check in collectUnnestParamsAndResiduals guarantees the nested
+// plan contains no reference to the scope being unnested (any
+// Level > planDepth ref bails the pull-up first), and its shallower
+// refs are body-relative — the body remains their host after pull-up
+// with unchanged relative depth, so they copy unchanged. Pointer-keyed
+// replacement could not touch them anyway: the replace map holds the
+// exact *OuterColumnRef pointers harvested from the body's own
+// conjuncts, never pointers from inside a nested plan.
+//
+// On a clone failure (a node kind clonePlanReplacingOuter does not
+// model) the ORIGINAL pointer is returned — the pre-D3.3 sharing
+// behaviour, no worse than before. canUnnestExistsExpr prechecks
+// clonability (planCloneSupported), making the fallback unreachable on
+// the EXISTS pull-up path; other cloning paths degrade to sharing
+// rather than failing outright.
+func clonePlanVerbatimOrShare(p Node) Node {
+	if p == nil {
+		return nil
+	}
+	cl, err := clonePlanReplacingOuter(p, map[*OuterColumnRef]*ColumnRef{})
+	if err != nil || cl == nil {
+		return p
+	}
+	return cl
 }
 
 // cloneExprSubstituteAggIdx0 clones an expression tree (typically
@@ -1570,6 +1708,32 @@ func cloneExprLeaf(e Expr) Expr {
 		return &c
 	case *OuterColumnRef:
 		c := *x
+		return &c
+	case *SubqueryExpr:
+		// D3.3: sublink nodes are NOT leaves — sharing them (the old
+		// default-arm behaviour) aliased the nested Plan between clone
+		// and original, so a later in-place pass mutated both trees.
+		c := *x
+		c.Plan = clonePlanVerbatimOrShare(x.Plan)
+		return &c
+	case *ExistsExpr:
+		c := *x
+		c.Plan = clonePlanVerbatimOrShare(x.Plan)
+		return &c
+	case *InExpr:
+		c := *x
+		c.Operand = cloneExprReplacingOuter(x.Operand, map[*OuterColumnRef]*ColumnRef{})
+		if len(x.List) > 0 {
+			c.List = make([]Expr, len(x.List))
+			for i, le := range x.List {
+				c.List[i] = cloneExprReplacingOuter(le, map[*OuterColumnRef]*ColumnRef{})
+			}
+		}
+		c.Plan = clonePlanVerbatimOrShare(x.Plan)
+		return &c
+	case *ArraySubqueryExpr:
+		c := *x
+		c.Plan = clonePlanVerbatimOrShare(x.Plan)
 		return &c
 	default:
 		return e
@@ -3069,13 +3233,39 @@ func collectUnnestParamsAndResiduals(node Node) *existsUnnestPlan {
 		outerInEquijoin[p.OuterRef] = true
 	}
 
-	// Verify every OuterColumnRef is accounted for.
+	// Verify every OuterColumnRef is accounted for — DEEPLY (D3.3/S4b).
+	//
+	// planDepth 0 refs are the body's own correlation and must be an
+	// equijoin param or a lifted residual. This now includes refs hiding
+	// inside a nested sublink's Operand (host-scope position the shallow
+	// walker treats as a leaf): they can never be collected as params or
+	// residuals, so they fail the check and the sublink stays a SubPlan —
+	// previously, on the IN/scalar paths (which never had the EXISTS
+	// blanket nested-sublink bail), such refs slipped through unaccounted
+	// and the pull-up proceeded over a dangling reference.
+	//
+	// planDepth ≥ 1 refs live inside nested sublink plans. Level ≤
+	// planDepth targets a scope inside the body's own subtree — the
+	// nested sublink remains a SubPlan whose eval site pushes its host
+	// row, so the ref stays valid after pull-up with unchanged relative
+	// depth. Level > planDepth reaches PAST the body: after pull-up the
+	// outer query's row is no longer on the OuterRows stack when the body
+	// runs as a join input, and the ref would silently resolve against
+	// whatever occupies that slot (wrong-scope aliasing, no error). Bail.
 	allAccounted := true
-	walkPlanExprs(node, func(e Expr) {
-		if o, ok := e.(*OuterColumnRef); ok {
+	walkPlanExprsDeep(node, 0, func(e Expr, planDepth int) {
+		o, ok := e.(*OuterColumnRef)
+		if !ok {
+			return
+		}
+		if planDepth == 0 {
 			if !outerInEquijoin[o] && !outerInResidual[o] {
 				allAccounted = false
 			}
+			return
+		}
+		if o.Level > planDepth {
+			allAccounted = false
 		}
 	})
 	if !allAccounted {
@@ -3123,22 +3313,122 @@ func canUnnestExistsExpr(ex *ExistsExpr) bool {
 	if len(eup.Params) == 0 && len(eup.Residuals) == 0 {
 		return false
 	}
-	var hasNestedSub bool
-	walkPlanExprs(plan, func(e Expr) {
-		if in2, ok := e.(*InExpr); ok && in2.Plan != nil {
-			hasNestedSub = true
+	// D3.3 (S4b): nested sublinks inside the EXISTS body no longer bail
+	// wholesale. The deep escape check inside
+	// collectUnnestParamsAndResiduals (above) guarantees no ref inside a
+	// nested sublink reaches past the body (Level > planDepth bails), so
+	// a nested sublink rides into the semi/anti build side as an ordinary
+	// SubPlan: its Level-1 refs keep targeting the body, which remains
+	// its host after pull-up with unchanged relative depth, and
+	// unnestExistsExpr's recursive unnestSubqueriesInPlan(innerPlan) call
+	// optimises it in place.
+	//
+	// What must still bail is a nested sublink whose inner plan the
+	// verbatim cloner cannot copy: cloneExprReplacingOuter would fall
+	// back to SHARING the plan pointer (the F7 aliasing trap this stage
+	// closes), so refuse the pull-up instead — the SubPlan path is
+	// always correct.
+	clonable := true
+	walkPlanExprsDeep(plan, 0, func(e Expr, planDepth int) {
+		if !clonable || planDepth != 0 {
+			return
 		}
-		if ex2, ok := e.(*ExistsExpr); ok && ex2.Plan != nil {
-			hasNestedSub = true
-		}
-		if sq2, ok := e.(*SubqueryExpr); ok && sq2.Plan != nil {
-			hasNestedSub = true
+		switch s := e.(type) {
+		case *InExpr:
+			if s.Plan != nil && !planCloneSupported(s.Plan) {
+				clonable = false
+			}
+		case *ExistsExpr:
+			if s.Plan != nil && !planCloneSupported(s.Plan) {
+				clonable = false
+			}
+		case *SubqueryExpr:
+			if s.Plan != nil && !planCloneSupported(s.Plan) {
+				clonable = false
+			}
+		case *ArraySubqueryExpr:
+			if s.Plan != nil && !planCloneSupported(s.Plan) {
+				clonable = false
+			}
+		case *MultiAssignSubqElem:
+			// UPDATE-only machinery with a deliberately SHARED row
+			// node; not expected inside an EXISTS body, and the
+			// verbatim cloner does not model its sharing. Bail.
+			clonable = false
 		}
 	})
-	if hasNestedSub {
+	return clonable
+}
+
+// planCloneSupported reports whether clonePlanReplacingOuter can
+// structurally clone every node of the plan, including the plans of any
+// nested sublinks (recursively). Used by canUnnestExistsExpr before
+// lifting a body that carries nested sublinks: an unclonable nested
+// plan would silently degrade to pointer sharing inside
+// clonePlanVerbatimOrShare, resurrecting the aliasing hazard.
+func planCloneSupported(node Node) bool {
+	ok := true
+	var walk func(Node)
+	walk = func(n Node) {
+		if n == nil || !ok {
+			return
+		}
+		switch x := n.(type) {
+		case *Join:
+			walk(x.Left)
+			walk(x.Right)
+		case *Filter:
+			walk(x.Child)
+		case *Project:
+			walk(x.Child)
+		case *Aggregate:
+			walk(x.Child)
+		case *Sort:
+			walk(x.Child)
+		case *Limit:
+			walk(x.Child)
+		case *SeqScan:
+		case *IndexScan:
+		case *MultiHashJoin:
+			for _, t := range x.Tables {
+				walk(t)
+			}
+		case *Values:
+		default:
+			ok = false
+		}
+	}
+	walk(node)
+	if !ok {
 		return false
 	}
-	return true
+	nestedOK := true
+	walkPlanExprs(node, func(e Expr) {
+		if !nestedOK {
+			return
+		}
+		switch s := e.(type) {
+		case *InExpr:
+			if s.Plan != nil && !planCloneSupported(s.Plan) {
+				nestedOK = false
+			}
+		case *ExistsExpr:
+			if s.Plan != nil && !planCloneSupported(s.Plan) {
+				nestedOK = false
+			}
+		case *SubqueryExpr:
+			if s.Plan != nil && !planCloneSupported(s.Plan) {
+				nestedOK = false
+			}
+		case *ArraySubqueryExpr:
+			if s.Plan != nil && !planCloneSupported(s.Plan) {
+				nestedOK = false
+			}
+		case *MultiAssignSubqElem:
+			nestedOK = false
+		}
+	})
+	return nestedOK
 }
 
 // resolveOuterSchemaIdx re-resolves an outer-side column reference by
