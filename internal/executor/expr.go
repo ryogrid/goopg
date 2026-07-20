@@ -6506,6 +6506,14 @@ func evalInExpr(x *planner.InExpr, slot SlotView, ctx *Context) (Datum, error) {
 		// All elements equal operand (or list empty) → false
 		return NewBoolDatum(false), nil
 	}
+	// Stage 11 (S3/D4.3): plain-equality IN/NOT IN over an uncorrelated
+	// subquery probes a hashed value set instead of scanning linearly.
+	// Falls through to the linear loop whenever the probe declines
+	// (correlated, unhashable kinds, cross-family coercion, kill switch,
+	// budget pressure) — the linear path is the correctness reference.
+	if res, served := evalInHashProbe(x, operand, values, ctx); served {
+		return res, nil
+	}
 	sawNull := false
 	for _, v := range values {
 		if v.IsNull() {
@@ -6781,11 +6789,51 @@ func collectInValues(x *planner.InExpr, row Row, ctx *Context) ([]Datum, error) 
 		stat.CacheMisses++
 		if !lowered {
 			// Push the outer row so correlated refs inside the
-			// IN-subquery resolve against it. Pop on return. A
-			// lowered subquery has no such refs — its correlation
-			// arrives through the ParamExec slots bound above.
+			// IN-subquery resolve against it. Popped explicitly
+			// below BEFORE the cache Put (with a defer as the
+			// error-path belt): the Get above ran at the HOST
+			// depth, and the scoped store clears whenever the
+			// depth changes — a Put issued while the pushed scope
+			// is still live lands one depth deeper, so the very
+			// next host-depth Get would wipe it. That mismatch
+			// silently re-ran every scoped non-correlated IN once
+			// per outer row (the M0058-0001 pathology returning
+			// through the Stage-10 store split; caught by the
+			// Stage-11 hash tests).
 			ctx.OuterRows = append(ctx.OuterRows, row)
-			defer func() { ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1] }()
+			popped := false
+			pop := func() {
+				if !popped {
+					popped = true
+					ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1]
+				}
+			}
+			defer pop()
+			op, done, err := acquireSubPlanOp(ctx, x, x.Plan, false)
+			if err != nil {
+				return nil, err
+			}
+			defer done()
+			var out []Datum
+			for {
+				slot, err := op.Next()
+				if err == EOF {
+					break
+				}
+				if err != nil {
+					return nil, err
+				}
+				r := slotRow(slot)
+				if len(r) != 1 {
+					return nil, &ExecError{Code: "42601", Pos: x.Pos(), Message: fmt.Sprintf("subquery used as IN argument returned %d columns, expected 1", len(r))}
+				}
+				out = append(out, r[0])
+			}
+			pop()
+			if cacheable {
+				ctx.subqCachePut(cacheKey, scoped, out)
+			}
+			return out, nil
 		}
 		op, done, err := acquireSubPlanOp(ctx, x, x.Plan, false)
 		if err != nil {
@@ -6875,12 +6923,19 @@ func evalExistsExpr(x *planner.ExistsExpr, row Row, ctx *Context) (Datum, error)
 		// Push the outer row so correlated column refs in the inner
 		// plan can resolve against it. Pop on return regardless of
 		// outcome.
-		ctx.OuterRows = append(ctx.OuterRows, row)
-		defer func() { ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1] }()
+		// The push happens BELOW, after the host-depth cache check:
+		// the scoped store clears whenever the OuterRows depth
+		// changes, so cache Get/Put must both run at the HOST depth
+		// or they ping-pong-clear against sibling sublinks' entries
+		// (the collectInValues variant of this bug re-ran every
+		// scoped non-correlated IN once per outer row; see the
+		// Stage-11 depth-fix comment there).
 	}
 
 	stat := ctx.subPlanStat(x)
 	stat.Calls++
+
+	lowered := len(x.ParParam) > 0
 
 	// For non-correlated EXISTS (M0058-0001), the inner plan
 	// returns the same boolean for every outer row. Cache it
@@ -6896,12 +6951,24 @@ func evalExistsExpr(x *planner.ExistsExpr, row Row, ctx *Context) (Datum, error)
 			return cached[0], nil
 		}
 		stat.CacheMisses++
-		val, err := existsImpl(x, ctx)
+		val, err := existsWithScope(x, row, ctx, lowered)
 		if err != nil {
 			return Datum{}, err
 		}
 		ctx.subqCachePut(cacheKey, true, []Datum{val})
 		return val, nil
+	}
+	return existsWithScope(x, row, ctx, lowered)
+}
+
+// existsWithScope runs existsImpl with the outer row pushed for the
+// unlowered path (correlated refs — or a mislabelled IsNonCorrelated —
+// resolve against it) and popped again before returning, so callers'
+// cache operations always run at the host depth.
+func existsWithScope(x *planner.ExistsExpr, row Row, ctx *Context, lowered bool) (Datum, error) {
+	if !lowered {
+		ctx.OuterRows = append(ctx.OuterRows, row)
+		defer func() { ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1] }()
 	}
 	return existsImpl(x, ctx)
 }
@@ -6953,10 +7020,13 @@ func evalSubquery(x *planner.SubqueryExpr, row Row, ctx *Context) (Datum, error)
 		if bindErr != nil {
 			return Datum{}, bindErr
 		}
-	} else {
-		ctx.OuterRows = append(ctx.OuterRows, row)
-		defer func() { ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1] }()
 	}
+	// The unlowered push happens inside subqueryWithScope, not here:
+	// the scoped result store clears whenever the OuterRows depth
+	// changes, so the cache Get/Put below must run at the HOST depth
+	// or they ping-pong-clear against sibling sublinks' entries (the
+	// collectInValues variant of this bug re-ran every scoped
+	// non-correlated IN once per outer row; Stage-11 depth fix).
 
 	stat := ctx.subPlanStat(x)
 	stat.Calls++
@@ -6968,7 +7038,7 @@ func evalSubquery(x *planner.SubqueryExpr, row Row, ctx *Context) (Datum, error)
 	// unnecessary. Rescanning caches nothing, so this path needs no
 	// volatility gate.
 	if !x.IsNonCorrelated && planIsIndexScanBased(x.Plan) {
-		return subqueryImpl(x, ctx)
+		return subqueryWithScope(x, row, ctx, lowered)
 	}
 
 	// Check cache for scalar subquery results. For non-correlated
@@ -7001,15 +7071,26 @@ func evalSubquery(x *planner.SubqueryExpr, row Row, ctx *Context) (Datum, error)
 		}
 	}
 	stat.CacheMisses++
-	val, err := subqueryImpl(x, ctx)
+	val, err := subqueryWithScope(x, row, ctx, lowered)
 	if err != nil {
 		return Datum{}, err
 	}
-	// Store in cache
+	// Store in cache (host depth — see the comment above).
 	if cacheable {
 		ctx.subqCachePut(cacheKey, scoped, []Datum{val})
 	}
 	return val, nil
+}
+
+// subqueryWithScope runs subqueryImpl with the outer row pushed for the
+// unlowered path and popped before returning, so callers' cache
+// operations always run at the host depth.
+func subqueryWithScope(x *planner.SubqueryExpr, row Row, ctx *Context, lowered bool) (Datum, error) {
+	if !lowered {
+		ctx.OuterRows = append(ctx.OuterRows, row)
+		defer func() { ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1] }()
+	}
+	return subqueryImpl(x, ctx)
 }
 
 func subqueryImpl(x *planner.SubqueryExpr, ctx *Context) (Datum, error) {

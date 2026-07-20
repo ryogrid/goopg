@@ -49,8 +49,8 @@ reserved by the spotcheck script). Never bare `pkill`.
 | 6b | **S6-pre: NLI semi/anti residual + harvest policy** (user-directed reorder) | S6 | D6.2 (minimal) | [x] `32ecf587` |
 | 7 | S2a operator resets | S2 | D4.2 (prereq) | [x] `5dc37087` |
 | 8 | S2b param slots | S2 | D4.1 | [x] `f9a36e39` |
-| 9 | S2c SubPlan handles | S2 | D4.2 + cacheability gate | [ ] |
-| 10 | S2d cache + lifecycle | S2 | D4.4, D4.5 | [ ] |
+| 9 | S2c SubPlan handles | S2 | D4.2 + cacheability gate | [x] `60ca88f9` |
+| 10 | S2d cache + lifecycle | S2 | D4.4, D4.5 | [x] `cd62dfe8` |
 | 11 | S3 hashed SubPlan | S3 | D4.3 | [ ] |
 | 12 | FINAL measurement + report | — | V4/V5 | [ ] |
 
@@ -113,7 +113,7 @@ Stage 6b below is that work.
       plan-gate:    22/22 MATCH vs `csq-s0-explain` (counters are ANALYZE-only)
       pgbench-hook: PASS (see commit)
 - V6 acceptance: `calls == rebuilds`, `rescans = 0` reproduced on Q4 ✔
-- commit: _(filled in by Stage 3)_
+- commit: `a91d2a8d`
 
 ### Measured ground truth (S0 exit data)
 
@@ -339,7 +339,7 @@ semi/anti execution. Roadmap reordered on user direction: **S6 before enabling S
 - gates:
       units:      PASS (2026-07-21, flag off)
       spotcheck:  PASS (Q12=2 / Q13=33)
-- commit: _(filled in by the S6 stage)_
+- commit: `82117265`
 
 ### Why it is gated off — measured, machine idle, SF1
 
@@ -383,7 +383,7 @@ the choice. Recorded in ch.03 and ch.06 as a measured amendment to D6.1.
 - gates:
       units / spotcheck (**tripwire**) / plan-gate (review → recapture `csq-s1-collector`)
       perf: P-S1a (Q4 ≤ 3 s), P-S1b (Q22 ≤ 1 s) — _pending_
-- commit: _pending_
+- commit: superseded — the Stage-6 perf gates were re-run and met in Stage 6b (see below); S1c itself landed in `82117265`
 
 ## Stage 6b — S6 (D6.2 minimal): NLI semi/anti residuals + harvest enablement  [ ]
 
@@ -446,7 +446,7 @@ User-directed reorder: S6 ahead of S2, to make Stage 6's harvest enableable.
                   sublink-free queries MATCH); recaptured `csq-s6-harvest`,
                   now 22/22 MATCH
       pgbench-hook: PASS (see commit)
-- commit: _(filled in by the next stage)_
+- commit: `32ecf587`
 
 ### Follow-ups recorded (out of scope here — ledgered in `.ralph/deferral_ledger.md`, five `csq-S6` rows dated 2026-07-21, per user direction)
 
@@ -551,7 +551,7 @@ was `distinctOp.Open` (the `Unique` node), not the NL join.
                     instead of the ambiguous self-named refs — the exact display fix
                     predicted); recaptured `csq-s8-params`, 22/22 MATCH
       pgbench-hook: PASS (see commit)
-- commit: _pending_
+- commit: `f9a36e39`
 
 ## Stage 9 — S2c: `subPlanHandle` rescan-not-rebuild  [x]
 
@@ -595,25 +595,63 @@ was `distinctOp.Open` (the `Unique` node), not the NL join.
       spotcheck:    PASS (Q12=2 / Q13=33)
       race-gate:    PASS (whole non-cluster module under -race)
       pgbench-hook: PASS (see commit)
-- commit: _pending_
+- commit: `60ca88f9`
 
-## Stage 10 — S2d: projected cache keys + lifecycle  [ ]
+## Stage 10 — S2d: kvcache + shared budget + scope-guard split  [x]
 
-- [ ] `kvcache` hash+LRU library with byte accounting (reused by Stage 11)
-- [ ] projected cache keys (expr pointer + parParam datums) — fixes the correlated
-      `collectInValues` key-collision wrong-results hazard
-- [ ] retire `CorrSubqOps` / `CorrSubqHashMaps` / `SubqueryCacheScope`
-- [ ] `CloseSubPlans()` at statement end (idempotent); WorkMem budget, `WorkMem == 0` = unlimited
-- gates: units / spotcheck / race-gate / P-S2 / pgbench-hook — _pending_
-- commit: _pending_
+(Projected keys and `CorrSubqOps` retirement had already arrived with Stages 8/9;
+`CloseSubPlans()` with Stage 9. This stage consolidated the rest.)
 
-## Stage 11 — S3: hashed SubPlan  [ ]
+- [x] `internal/executor/kvcache`: byte-budgeted LRU + a **shared `Budget`** type so
+      the statement's result caches sit under one cap (ch.06 D6.4); single-goroutine
+      contract documented; Stage 11 and a future Memoize reuse it
+- [x] sublink results split into two stores (`subq_cache.go`): `subqCacheSafe` for
+      param-lowered self-describing keys (survive depth changes) vs `subqCacheScoped`
+      for unlowered full-row and `IsNonCorrelated` constant keys, which keep the
+      historical clear-on-depth-change guard — **`SubqueryCacheScope` narrowed, not
+      retired** (the nested-`.Plan` mislabeling still exists on unlowered hosts)
+- [x] `CorrSubqHashMaps` kept but budget-aware (pre-build `EstimateRows × 64 B`
+      reservation, post-build reconcile; failed reservation ⇒ no map, rescan serves)
+- [x] budget = `WorkMem/4` when `WorkMem > 0`; **`WorkMem == 0` = unlimited** (never
+      the hash join's silent 512 MiB substitute); per-sublink `PeakCachedBytes`
+      deliberately skipped (shared budget ⇒ per-sublink attribution would lie)
+- [x] tests: kvcache 6 + budget/scope/hash-map 4; all suites + matrix green
+- gates:
+      units:        PASS (2026-07-21) · spotcheck PASS (Q12=2 / Q13=33) · race-gate PASS
+      pgbench-hook: PASS
+- commit: `cd62dfe8`
 
-- [ ] two-hashtable NULL-correct hash execution for uncorrelated IN / NOT IN SubPlans
-- [ ] hashability gate (estimated rows × width vs WorkMem); linear scan becomes fallback
-- [ ] kill switch `GOOPG_HASHED_SUBPLAN=off`
-- [ ] M1 / M2 / M10 exercised through the hashed path (unnest knob off)
-- gates: units / spotcheck / race-gate / P-S3 / pgbench-hook — _pending_
+## Stage 11 — S3: hashed SubPlan  [x]
+
+- [x] `internal/executor/subplan_hash.go`: `subPlanHash{set, hasNull}` built once per
+      uncorrelated plain-equality IN/NOT-IN sublink from the cached value slice; stored
+      in the SAME scoped kvcache store under the slice's key stem + a hash suffix, so it
+      inherits the slice's lifetime, budget pressure and scope guard and can never
+      outlive the slice it derives from. Probe: hit→TRUE, miss+hasNull→NULL, miss→FALSE,
+      `Negated` inverts, NULL stays NULL (PG `ExecHashSubPlan` truth table, single-col)
+- [x] coercion safety: hashing only when operand and elements share a `datumKey`-vs-
+      `compareEq`-provably-agreeing family (int/int64-mantissa-numeric via
+      `canonicalNumericKey`; string (non-arena); bytes; bool; time); anything else —
+      incl. cross-family coercions like `10 IN ('10')` — falls back to the linear loop
+- [x] budget-aware via the shared kvcache Budget; refused Put degrades to linear;
+      volatile/LockRows inners never hashed; empty sets and `= ANY`/`<> ALL` stay linear
+- [x] kill switch `GOOPG_HASHED_SUBPLAN=off` + `SetHashedSubPlanEnabled`
+- [x] M1/M2/M10 matrix rows exercise the hashed probe on their SubPlan-path runs
+- [x] **Stage-10 regression found by the new test and fixed**: `collectInValues` did its
+      cache Get at host depth but Put inside its own pushed `OuterRows` scope — the
+      Stage-10 scoped store clears on every depth change, so scoped non-correlated
+      sublinks silently re-executed **once per outer row** (results correct, caching
+      dead — the M0058-0001 pathology returning). `evalExistsExpr`/`evalSubquery` had
+      the sibling form. All three sites now Get AND Put at host depth; pinned by
+      `TestScopedCacheDepthConsistency`
+- [x] tests: 7 new, all suites + matrix green
+- honest TPC-H impact: the hashed probe itself is algorithmic insurance for
+  unnesting-escaping shapes (IN-under-OR etc.); **the depth fix is the TPC-H-relevant
+  outcome** — it restores once-per-statement execution for scoped non-correlated
+  sublinks on the SubPlan path
+- gates:
+      units:        PASS (2026-07-21) · spotcheck PASS (Q12=2 / Q13=33) · race-gate PASS
+      pgbench-hook: PASS
 - commit: _pending_
 
 ## Stage 12 — FINAL: measurement and report  [ ]
