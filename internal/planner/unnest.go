@@ -560,6 +560,17 @@ func collectUnnestParams(node Node) []unnestParam {
 			outerInEquijoin[outer] = true
 		}
 	})
+	// D3.0: also harvest correlations the inner planner absorbed into an
+	// IndexScan's equality probe key. On an indexed inner table the
+	// correlation equijoin `l_orderkey = o_orderkey` never appears as a
+	// Filter conjunct — it becomes `IndexScan.Key = OuterColumnRef` — so
+	// without this the all-accounted check below bails on every indexed
+	// correlated subquery, which is why decorrelation never fired on the
+	// TPC-H schema (bundle W1). See harvestIndexKeyParams.
+	for _, p := range harvestIndexKeyParams(node) {
+		params = append(params, p)
+		outerInEquijoin[p.OuterRef] = true
+	}
 	// Every OuterColumnRef in the plan must be accounted for by
 	// an equijoin pair. If any OuterColumnRef appears outside an
 	// equijoin, the subquery is not unnestable.
@@ -575,6 +586,137 @@ func collectUnnestParams(node Node) []unnestParam {
 		return nil
 	}
 	return params
+}
+
+// harvestIndexKeyParams finds correlation equijoins that the inner
+// planner folded into an IndexScan's equality probe key(s) and returns
+// them as unnestParams, exactly as if they had been written as Filter
+// conjuncts `Index.Columns[i] = OuterColumnRef`.
+//
+// Only the equality probe (`Key`, and each `Keys[i]`) is harvested.
+// `LowKey`/`HighKey` are range bounds, not equijoins — a correlation
+// there is genuinely non-decorrelatable and must keep failing the
+// all-accounted check so the shape stays a SubPlan (matrix M14).
+//
+// The synthesised SubCol references the index's i-th column resolved
+// against the scan's own output schema, so the group-by / hash-join key
+// built from it lands on the right column. A key column that is not
+// present in the scan schema (should not happen for a base-table index)
+// is skipped, which makes the OuterColumnRef unaccounted and the whole
+// subquery bail — the safe direction.
+// Gated OFF by default pending index-driven semi/anti execution.
+// Measured at SF1 on 2026-07-21 with the harvest enabled: Q2 10.87 s →
+// 3.36 s and Q22 7.83 s → 1.66 s, but Q4 3.87 s → 276.08 s, Q17 58.27 s →
+// 86.65 s, Q20 12.29 s → 26.57 s. The regressions are not a defect in this
+// harvest — the decorrelated plans are correct — but a consequence of
+// goopg executing every semi/anti join as a HASH join. A selective
+// correlated EXISTS (Q4 probes ~57 K date-filtered orders through
+// idx_lineitem_orderkey) becomes a hash semi join that scans and hashes
+// all 6 M lineitem rows. Upstream can decorrelate unconditionally because
+// it also has index-driven and parallel semi joins; goopg does not yet.
+//
+// Bundle phase S6 (D6.2, NLI semi/anti with a residual-bearing inner) is
+// the prerequisite; this flag flips on there, with a re-measure.
+var indexKeyHarvestOn atomic.Bool
+
+// SetIndexKeyHarvestEnabled toggles harvesting correlation equijoins out
+// of an inner IndexScan probe key. Test-only, like SetSubqueryUnnestEnabled.
+func SetIndexKeyHarvestEnabled(on bool) { indexKeyHarvestOn.Store(on) }
+
+func harvestIndexKeyParams(node Node) []unnestParam {
+	if !indexKeyHarvestOn.Load() {
+		return nil
+	}
+	var out []unnestParam
+	var walk func(Node)
+	walk = func(n Node) {
+		if n == nil {
+			return
+		}
+		if is, ok := n.(*IndexScan); ok {
+			schema := is.Output()
+			harvestKey := func(keyExpr Expr, col int) {
+				oc, ok := keyExpr.(*OuterColumnRef)
+				if !ok || is.Index == nil || col >= len(is.Index.Columns) {
+					return
+				}
+				name := is.Index.Columns[col]
+				idx := -1
+				for i, sc := range schema {
+					if sc.Name == name {
+						idx = i
+						break
+					}
+				}
+				if idx < 0 {
+					return
+				}
+				out = append(out, unnestParam{
+					OuterRef: oc,
+					SubCol: &ColumnRef{
+						pos:            oc.Pos(),
+						Index:          idx,
+						Name:           name,
+						Type:           schema[idx].Type,
+						SourceTableIdx: schema[idx].SourceTableIdx,
+					},
+				})
+			}
+			if is.Key != nil {
+				harvestKey(is.Key, 0)
+			}
+			for i, k := range is.Keys {
+				harvestKey(k, i)
+			}
+		}
+		// Recurse through the single/dual-child plan nodes an inner
+		// subquery body can contain (mirrors walkPlanExprs' structure,
+		// but only descends — the leaf work is above).
+		switch x := n.(type) {
+		case *Join:
+			walk(x.Left)
+			walk(x.Right)
+		case *Filter:
+			walk(x.Child)
+		case *Project:
+			walk(x.Child)
+		case *Aggregate:
+			walk(x.Child)
+		case *Sort:
+			walk(x.Child)
+		case *Limit:
+			walk(x.Child)
+		case *Distinct:
+			walk(x.Child)
+		case *DistinctOn:
+			walk(x.Child)
+		case *MultiHashJoin:
+			for _, tbl := range x.Tables {
+				walk(tbl)
+			}
+		case *LockRows:
+			walk(x.Child)
+		}
+	}
+	walk(node)
+	return out
+}
+
+// planHasOuterRef reports whether any OuterColumnRef survives anywhere
+// in a (cloned, decorrelated) inner plan. After the D3.0 harvest +
+// clone rewrite the inner plan must be self-contained; a surviving
+// OuterColumnRef means a correlation was harvested as a param but not
+// actually neutralised in the clone (e.g. a partial multi-key harvest),
+// and installing such a join would evaluate an unbound reference at
+// runtime. Callers treat true as "bail to the SubPlan path".
+func planHasOuterRefRemaining(node Node) bool {
+	found := false
+	walkPlanExprs(node, func(e Expr) {
+		if _, ok := e.(*OuterColumnRef); ok {
+			found = true
+		}
+	})
+	return found
 }
 
 func extractEquijoinPair(a, b Expr) (*OuterColumnRef, *ColumnRef) {
@@ -938,17 +1080,103 @@ func clonePlanReplacingOuter(node Node, replace map[*OuterColumnRef]*ColumnRef) 
 		c := *n
 		return &c, nil
 	case *IndexScan:
-		c := *n
-		if n.Key != nil {
-			c.Key = cloneExprReplacingOuter(n.Key, replace)
+		// D3.0 clone crux: an equality probe key that is a harvested
+		// correlation (an *OuterColumnRef in the replace map) would,
+		// after replacement, become the scan's OWN column — a circular
+		// self-probe (probe lineitem's l_orderkey index by l_orderkey).
+		// The equality is now enforced by the enclosing semi/anti/
+		// GROUP-BY join, so drop it: convert the scan to a SeqScan,
+		// preserving the alias (Q7's lesson — a dropped alias silently
+		// mis-binds self-joins). Any probe key that is NOT a harvested
+		// correlation (a constant, or an inner-bound ref) is preserved
+		// as an equality Filter above the SeqScan; likewise the range
+		// bounds. Keys that are genuinely non-correlated leave the scan
+		// an IndexScan (the else branch).
+		isHarvested := func(e Expr) bool {
+			oc, ok := e.(*OuterColumnRef)
+			if !ok {
+				return false
+			}
+			_, inMap := replace[oc]
+			return inMap
+		}
+		correlated := isHarvested(n.Key)
+		for _, k := range n.Keys {
+			if isHarvested(k) {
+				correlated = true
+			}
+		}
+		if !correlated {
+			c := *n
+			if n.Key != nil {
+				c.Key = cloneExprReplacingOuter(n.Key, replace)
+			}
+			if len(n.Keys) > 0 {
+				c.Keys = make([]Expr, len(n.Keys))
+				for i, k := range n.Keys {
+					c.Keys[i] = cloneExprReplacingOuter(k, replace)
+				}
+			}
+			if n.LowKey != nil {
+				c.LowKey = cloneExprReplacingOuter(n.LowKey, replace)
+			}
+			if n.HighKey != nil {
+				c.HighKey = cloneExprReplacingOuter(n.HighKey, replace)
+			}
+			return &c, nil
+		}
+		seq := &SeqScan{
+			pos:                   n.pos,
+			Table:                 n.Table,
+			Alias:                 n.Alias,
+			schema:                n.schema,
+			PrivilegeCheckRole:    n.PrivilegeCheckRole,
+			PrivilegeCheckRoleSet: n.PrivilegeCheckRoleSet,
+		}
+		// Preserve any non-correlation probe keys / range bounds as a
+		// Filter above the SeqScan. `indexColRef` resolves the index's
+		// i-th column against the scan schema so the rebuilt equality
+		// binds the right slot.
+		indexColRef := func(col int) *ColumnRef {
+			if n.Index == nil || col >= len(n.Index.Columns) {
+				return nil
+			}
+			name := n.Index.Columns[col]
+			for i, sc := range n.schema {
+				if sc.Name == name {
+					return &ColumnRef{pos: n.pos, Index: i, Name: name, Type: sc.Type, SourceTableIdx: sc.SourceTableIdx}
+				}
+			}
+			return nil
+		}
+		var conds []Expr
+		if n.Key != nil && !isHarvested(n.Key) {
+			if col := indexColRef(0); col != nil {
+				conds = append(conds, &BinaryOp{pos: n.pos, Op: parser.OpEq, Left: col, Right: cloneExprReplacingOuter(n.Key, replace)})
+			}
+		}
+		for i, k := range n.Keys {
+			if isHarvested(k) {
+				continue
+			}
+			if col := indexColRef(i); col != nil {
+				conds = append(conds, &BinaryOp{pos: n.pos, Op: parser.OpEq, Left: col, Right: cloneExprReplacingOuter(k, replace)})
+			}
 		}
 		if n.LowKey != nil {
-			c.LowKey = cloneExprReplacingOuter(n.LowKey, replace)
+			if col := indexColRef(0); col != nil {
+				conds = append(conds, &BinaryOp{pos: n.pos, Op: parser.OpGe, Left: col, Right: cloneExprReplacingOuter(n.LowKey, replace)})
+			}
 		}
 		if n.HighKey != nil {
-			c.HighKey = cloneExprReplacingOuter(n.HighKey, replace)
+			if col := indexColRef(0); col != nil {
+				conds = append(conds, &BinaryOp{pos: n.pos, Op: parser.OpLe, Left: col, Right: cloneExprReplacingOuter(n.HighKey, replace)})
+			}
 		}
-		return &c, nil
+		if len(conds) > 0 {
+			return &Filter{pos: n.pos, Child: seq, Predicate: combineAnd(conds)}, nil
+		}
+		return seq, nil
 	case *MultiHashJoin:
 		c := *n
 		c.Tables = make([]Node, len(n.Tables))
@@ -1311,6 +1539,12 @@ func unnestSubquery(sub *SubqueryExpr, outer Node) (Node, error) {
 	subPlan, subSchema, err := buildUnnestedSubquery(sub, params)
 	if err != nil {
 		return nil, err
+	}
+	// D3.0 belt: if the clone did not fully neutralise the correlation
+	// (e.g. a partial multi-key harvest), leave the sublink as a SubPlan
+	// rather than install a join over an unbound OuterColumnRef.
+	if planHasOuterRefRemaining(subPlan) {
+		return nil, nil
 	}
 	filter, conjunct := findFilterContainingSubquery(outer, sub)
 	if filter == nil {
@@ -2267,6 +2501,17 @@ func collectExistsUnnestParamsAndResiduals(node Node) *existsUnnestPlan {
 	}
 	walkFilters(node)
 
+	// D3.0: harvest the correlation the inner planner folded into an
+	// IndexScan equality key (see collectUnnestParams / harvestIndexKeyParams).
+	// This is what makes EXISTS decorrelate on the TPC-H schema: Q4's
+	// `l_orderkey = o_orderkey` lives in the index probe, not a Filter,
+	// and the residual `l_commitdate < l_receiptdate` is lifted by the
+	// Filter walk above — the two compose into a semi join with a residual.
+	for _, p := range harvestIndexKeyParams(node) {
+		params = append(params, p)
+		outerInEquijoin[p.OuterRef] = true
+	}
+
 	// Verify every OuterColumnRef is accounted for.
 	allAccounted := true
 	walkPlanExprs(node, func(e Expr) {
@@ -2363,6 +2608,19 @@ func unnestExistsExpr(ex *ExistsExpr, outer Node) (Node, error) {
 		return nil, nil
 	}
 	params := eup.Params
+	// Only params[0] becomes the hash key below; a second equijoin pair
+	// (a composite-index correlation, or two Filter equi-conjuncts) would
+	// have to ride as a residual. A NON-equi residual is fine and is the
+	// common case (Q21's `l2.l_suppkey <> l1.l_suppkey`), but an *equi*
+	// residual on a semi/anti join interacts badly with the downstream
+	// NLI rewrite (it can be extracted as a competing probe key and the
+	// pair silently dropped), so refuse the pull-up and let the SubPlan
+	// path — always correct — serve a multi-equijoin EXISTS. No TPC-H
+	// query needs this; composite-correlated EXISTS decorrelation is a
+	// recorded follow-up.
+	if len(params) > 1 {
+		return nil, nil
+	}
 
 	// Find the Filter that contains this ExistsExpr conjunct.
 	filter, conjunct := findFilterContainingExistsExpr(outer, ex)
@@ -2453,6 +2711,14 @@ func unnestExistsExpr(ex *ExistsExpr, outer Node) (Node, error) {
 		innerPlan = proj.Child
 		// Unwrap any Filter(true) that might now be at the top.
 		innerPlan = unwrapTrivialWrappers(innerPlan)
+	}
+	// D3.0 belt: the equijoin residuals were lifted onto the join
+	// predicate below and the equi-pair keys neutralised in the clone;
+	// if any OuterColumnRef still survives in the inner plan the harvest
+	// was incomplete, so bail to the SubPlan path rather than build a
+	// semi/anti join over an unbound reference.
+	if planHasOuterRefRemaining(innerPlan) {
+		return nil, nil
 	}
 	var innerOnlyLifted []Expr
 

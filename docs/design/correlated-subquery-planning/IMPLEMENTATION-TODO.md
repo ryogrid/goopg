@@ -39,11 +39,12 @@ reserved by the spotcheck script). Never bare `pkill`.
 
 | # | Stage | Phase | Decisions | Status |
 |---|---|---|---|---|
-| 1 | S0-1 EXPLAIN rendering | S0 | ch.06 §6 | [ ] |
-| 2 | S0-2 SubPlan counters | S0 | V6 | [ ] |
-| 3 | S0-3 semantics matrix + SF1 baseline | S0 | V1, V2, V4, W1 | [ ] |
-| 4 | S1a live-bug guards | S1 | D3.0 (F1, F2, F3) | [ ] |
-| 5 | S1b NOT-IN executor fix | S1 | F4 | [ ] |
+| 1 | S0-1 EXPLAIN rendering | S0 | ch.06 §6 | [x] `379dd402` |
+| 2 | S0-2 SubPlan counters | S0 | V6 | [x] `a91d2a8d` |
+| — | out-of-band: NLI alias + residual (Q7) | — | — | [x] `639c9e7a` |
+| 3 | S0-3 semantics matrix + SF1 baseline | S0 | V1, V2, V4, W1 | [x] `b731b196` |
+| 4 | S1a live-bug guards (grew to six) | S1 | D3.0 (F1–F3 + M10/M12×2) | [x] `b731b196` |
+| 5 | S1b NOT-IN executor fix | S1 | F4 | [x] `b2a68945` |
 | 6 | S1c collector fix | S1 | D3.0 (IndexScan.Key) | [ ] |
 | 7 | S2a operator resets | S2 | D4.2 (prereq) | [ ] |
 | 8 | S2b param slots | S2 | D4.1 | [ ] |
@@ -301,9 +302,68 @@ unpredicted live bugs (see Stage 3's table and ch.03 §2.5, updated).
       units:        PASS (2026-07-21, whole module)
       spotcheck:    PASS (Q12=2 / Q13=33)
       pgbench-hook: PASS (see commit)
-- commit: _(filled in by Stage 6)_
+- commit: `b2a68945`
 
-## Stage 6 — S1c: D3.0 collector fix (`IndexScan.Key` harvest)  [ ]
+## Stage 6 — S1c: D3.0 collector fix (`IndexScan.Key` harvest)  [x] *(landed gated OFF)*
+
+**The stage works and is the roadmap's turning point — but it must not be enabled
+yet.** Implemented, tested, and measured; the harvest is behind
+`SetIndexKeyHarvestEnabled` (default **off**) until phase S6 lands index-driven
+semi/anti execution. Roadmap reordered on user direction: **S6 before enabling S1c.**
+
+- [x] `harvestIndexKeyParams` harvests correlation equijoins folded into
+      `IndexScan.Key`/`Keys[i]` for both the scalar and the EXISTS collector;
+      `LowKey`/`HighKey` deliberately **not** harvested (range correlation is not an
+      equijoin — matrix M14 pins that it stays a SubPlan)
+- [x] `clonePlanReplacingOuter` converts a harvested IndexScan to a `SeqScan`
+      (preserving Table/**Alias**/schema, re-attaching Filter conjuncts) instead of
+      emitting the circular self-probe the naive replacement produced
+- [x] `planHasOuterRefRemaining` belt: any `OuterColumnRef` surviving the clone
+      cancels the rewrite and falls back to the SubPlan path
+- [x] **bug found and fixed mid-stage:** `unnestExistsExpr` used only `params[0]` as
+      the hash key and silently dropped further equijoin pairs, so a composite
+      correlation over-matched on the first key alone. Multi-equijoin EXISTS now
+      bails to a SubPlan (always correct); composite-EXISTS decorrelation is a
+      recorded follow-up. No TPC-H query needs it (Q21 is 1 equijoin + 1 *non*-equi
+      residual, which still works)
+- [x] 7 tests in `internal/planner/unnest_indexkey_test.go`, each enabling the flag
+      explicitly; whole planner + executor suites green with the flag off
+- gates:
+      units:      PASS (2026-07-21, flag off)
+      spotcheck:  PASS (Q12=2 / Q13=33)
+- commit: _(filled in by the S6 stage)_
+
+### Why it is gated off — measured, machine idle, SF1
+
+With the harvest **enabled**, decorrelation finally fires on the TPC-H schema
+(Q4 → Hash Join SEMI, Q21 → ANTI+SEMI, Q2/Q17/Q20 → GroupAggregate joins,
+Q22's NOT EXISTS → NL ANTI). Row counts stay correct. Runtimes do not:
+
+| Q | before S1c (`639c9e7a`) | with harvest on | |
+|---|---:|---:|---|
+| Q2 | 10.87 s | **3.36 s** | ✅ 3.2× |
+| Q22 | 7.83 s | **1.66 s** | ✅ 4.7× |
+| Q4 | 3.87 s | **276.08 s** | ❌ 71× |
+| Q17 | 58.27 s | 86.65 s | ❌ 1.5× |
+| Q20 | 12.29 s | 26.57 s | ❌ 2.2× |
+
+(An earlier sweep suggested the same direction but was co-load contaminated —
+a no-subquery query also went DNF. The table above is a clean, idle-machine
+re-measure, which reproduced it.)
+
+**Mechanism.** goopg executes every semi/anti join as a **hash** join. A
+*selective* correlated EXISTS is therefore made worse by decorrelating it: Q4's
+SubPlan path probes `idx_lineitem_orderkey` for only the ~57 K date-filtered
+orders, while the semi join scans and hashes all 6 M `lineitem` rows. Q2 and Q22
+improve because their SubPlan paths were paying a heavy per-call rebuild
+(Q2: an `Aggregate` over a 4-table MHJ at ≈26 ms/call).
+
+**Design consequence — this contradicts D6.1** ("decorrelation is structural, not
+costed", adopted as PG-faithful). Upstream can decorrelate unconditionally because
+it also has index-driven and parallel semi joins. goopg has neither yet, so on this
+executor decorrelation is a *trade*, not a strict win. Either the executor gains
+index-driven semi/anti (phase S6 / D6.2 — the chosen path) or the planner must cost
+the choice. Recorded in ch.03 and ch.06 as a measured amendment to D6.1.
 
 - [ ] harvest equality `Key`/`Keys[i]` correlations (range `LowKey`/`HighKey` still bail)
 - [ ] `clonePlanReplacingOuter` emits `SeqScan` instead of a circular self-probe IndexScan
