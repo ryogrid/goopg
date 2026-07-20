@@ -284,15 +284,24 @@ unpredicted live bugs (see Stage 3's table and ch.03 §2.5, updated).
                     TPC-H does not use)
       full sweep:   row-count diff vs baseline = Q7 only (the NLI fix); see above
       pgbench-hook: PASS (see commit)
-- commit: _(filled in by Stage 5)_
+- commit: `b731b196`
 
-## Stage 5 — S1b: `NULL NOT IN (∅)` executor fix  [ ]
+## Stage 5 — S1b: `NULL NOT IN (∅)` executor fix  [x]
 
-- [ ] `evalInExpr` NULL-operand path collects inner values before deciding
-- [ ] vacuous results: IN → false, NOT IN → true, ALL → true, ANY → false
-- [ ] matrix row M2 flips expected-fail → green
-- gates: units / spotcheck / pgbench-hook — _pending_
-- commit: _pending_
+- [x] `evalInExpr` no longer short-circuits to NULL on a NULL operand: it now
+      collects the inner values first and decides — vacuous over an empty list
+      (IN → false, NOT IN → true, `op ALL(∅)` → true, `op ANY(∅)` → false),
+      NULL only when the list is non-empty
+- [x] matrix row M2 (correlated NOT IN, NULL operand × empty inner) flipped
+      green — **the matrix now has zero pinned bugs**; all 33 cases return
+      PG's answer on both plan paths
+- deliberate cost note: NULL operands now execute the subquery (required for
+  correctness); bounded by `SubqueryCache` today and the S2 handles later
+- gates:
+      units:        PASS (2026-07-21, whole module)
+      spotcheck:    PASS (Q12=2 / Q13=33)
+      pgbench-hook: PASS (see commit)
+- commit: _(filled in by Stage 6)_
 
 ## Stage 6 — S1c: D3.0 collector fix (`IndexScan.Key` harvest)  [ ]
 

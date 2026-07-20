@@ -6411,14 +6411,34 @@ func evalInExpr(x *planner.InExpr, slot SlotView, ctx *Context) (Datum, error) {
 	if err != nil {
 		return Datum{}, err
 	}
-	if operand.IsNull() {
-		return NullDatum, nil
-	}
+	// A NULL operand does NOT short-circuit to NULL: the answer depends
+	// on whether the (sub)list is empty. `NULL IN (∅)` is FALSE and
+	// `NULL NOT IN (∅)` is TRUE — the quantifier is vacuous, so the
+	// operand's nullness never enters into it (PG scalar-array/sublink
+	// semantics; ch.07 M2, fixed for the correlated-empty-inner case in
+	// bundle stage S1b). Only a NON-empty list makes the result NULL.
+	// The subquery therefore must run even for NULL operands; the cost
+	// is bounded by the SubqueryCache and, later, the S2 handles.
+	operandNull := operand.IsNull()
 
 	row := slotToRow(slot)
 	values, err := collectInValues(x, row, ctx)
 	if err != nil {
 		return Datum{}, err
+	}
+	if operandNull {
+		if len(values) == 0 {
+			// Vacuous quantification over an empty list.
+			switch {
+			case x.AnyOp != 0 && x.AllOp:
+				return NewBoolDatum(true), nil // op ALL(∅) — vacuously true
+			case x.AnyOp != 0:
+				return NewBoolDatum(false), nil // op ANY(∅) — vacuously false
+			default:
+				return NewBoolDatum(x.Negated), nil // IN → false, NOT IN → true
+			}
+		}
+		return NullDatum, nil
 	}
 	// op ALL semantics (ScalarArrayOpExpr, useOr=false): `left op ALL(...)` —
 	// AND of (left op elem) for each element; false as soon as one element

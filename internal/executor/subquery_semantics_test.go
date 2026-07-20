@@ -172,20 +172,11 @@ func semanticsCases() []semanticsCase {
 			id:   "M2",
 			desc: "correlated NOT IN, NULL operand x empty inner: NULL NOT IN (empty) is TRUE (vacuous)",
 			sql:  "SELECT a FROM t1 WHERE b NOT IN (SELECT b FROM t2 WHERE t2.a = t1.a) ORDER BY a",
+			// Fixed in Stage 5 (S1b): evalInExpr used to short-circuit to
+			// NULL on a NULL operand before consulting the inner set,
+			// making the vacuous-truth case (`NULL NOT IN (∅)` = TRUE)
+			// unreachable — both paths returned {2}.
 			want: []string{"2", "4"},
-			// Executor-side bug, so BOTH paths are wrong: evalInExpr returns
-			// NULL for a NULL operand before consulting the inner set at all,
-			// making the vacuous-truth case unreachable.
-			badUnnested: &known{
-				rows:    []string{"2"},
-				why:     "evalInExpr short-circuits on a NULL operand before collecting the inner set",
-				fixedIn: "Stage 5 (S1b)",
-			},
-			badSubplan: &known{
-				rows:    []string{"2"},
-				why:     "evalInExpr short-circuits on a NULL operand before collecting the inner set",
-				fixedIn: "Stage 5 (S1b)",
-			},
 		},
 
 		// ---- M3: EXISTS / NOT EXISTS with NULL correlation ---------------
