@@ -94,7 +94,10 @@ func walkRewriteNLI(n Node, cat catalog.Catalog) Node {
 		x.Left = walkRewriteNLI(x.Left, cat)
 		x.Right = walkRewriteNLI(x.Right, cat)
 		if nli, ok := tryBuildNLI(x, cat); ok {
-			return nli
+			// S7 (D5.1): consider a Memoize cache on the inner probe.
+			// The Filter-promotion path above recurses through this
+			// case, so one insertion point covers every NLI build.
+			return maybeAttachMemoize(nli)
 		}
 		return x
 	case *Filter:

@@ -671,10 +671,45 @@ type NestedLoopIndexJoin struct {
 	Inner     *IndexScan
 	Predicate Expr // residual filter applied per joined row
 	schema    Schema
+
+	// InnerMemo, when non-nil, interposes a Memoize cache between the
+	// join driver and the inner index probe (bundle phase S7 / D5.1).
+	// Its Child field ALIASES the same *IndexScan as Inner, so every
+	// pass that rewrites Inner in place (remaps, re-resolution) keeps
+	// working unmodified; the Memoize node exists for EXPLAIN fidelity
+	// and executor construction. Nil = no cache (the common case; the
+	// insertion gate requires ANALYZE stats, which are in-memory and
+	// restart-lost).
+	InnerMemo *Memoize
 }
 
 func (n *NestedLoopIndexJoin) Pos() int       { return n.pos }
 func (n *NestedLoopIndexJoin) Output() Schema { return n.schema }
+
+// Memoize is a parameterized result cache on the inner side of a
+// NestedLoopIndexJoin (bundle phase S7; PG oracle:
+// postgres/src/backend/executor/nodeMemoize.c, inserted where
+// get_memoize_path fires in optimizer/path/joinpath.c). It caches the
+// inner index probe's result rows keyed by the probe parameter values,
+// serving repeats without re-scanning.
+//
+// KeyExprs are the probe-key expressions (they reference OUTER columns
+// and are evaluated against the bound outer slot — the same expressions
+// the aliased Child IndexScan consumes as Key/Keys). SingleRow marks a
+// provably-unique probe (entries complete after the first row, PG's
+// `singlerow`). EstEntries is the planner's cache-population estimate
+// for initial sizing (cost_memoize_rescan analog); the executor clamps
+// by the runtime memory budget.
+type Memoize struct {
+	pos        int
+	Child      *IndexScan
+	KeyExprs   []Expr
+	SingleRow  bool
+	EstEntries int64
+}
+
+func (n *Memoize) Pos() int       { return n.pos }
+func (n *Memoize) Output() Schema { return n.Child.Output() }
 
 // IndexOnlyScan is a covered index scan (M0046-0004): all projected columns
 // come from the B-tree index key, so no heap fetch is needed when the

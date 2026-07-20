@@ -146,3 +146,9 @@ func (c *Cache) Len() int { return len(c.m) }
 
 // Evictions returns how many entries budget pressure has evicted.
 func (c *Cache) Evictions() int64 { return c.evictions }
+
+// BudgetLimit exposes the byte budget this cache evicts against
+// (<= 0 = unlimited). Lets a caller detect that a single in-flight
+// entry can never fit and abandon it early (the Memoize overflow
+// case) instead of buffering unboundedly before a doomed Put.
+func (c *Cache) BudgetLimit() int64 { return c.budget.Limit() }

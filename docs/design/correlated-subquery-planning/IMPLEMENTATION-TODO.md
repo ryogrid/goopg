@@ -711,8 +711,8 @@ was `distinctOp.Open` (the `Unique` node), not the NL join.
 | R2-3 | D6.3a: subplan cost helper + NLI semi/anti cost gate | | [x] `b35714b7` |
 | R2-4 | S5a: unnest before join search (semi/anti pinned) | | [x] `a607cf2b` |
 | R2-5 | S5b | **deferred** (ledger row in R2-4) | — |
-| R2-6 | D6.3b: INNER Filter-inner NLI unwrap, cost-gated | | [x] (this commit) |
-| R2-7 | S7: Memoize | | [ ] |
+| R2-6 | D6.3b: INNER Filter-inner NLI unwrap, cost-gated | | [x] `8d453246` |
+| R2-7 | S7: Memoize | | [x] (this commit) |
 | R2-8 | FINAL: sweep + report | | [ ] |
 
 ## R2-0 — harness guard + NLI-Predicate EXPLAIN  [x]
@@ -916,4 +916,43 @@ was `distinctOp.Open` (the `Unique` node), not the NL join.
                   unwrap declines ⇒ shapes unchanged)
       Q9 tripwire: **90.52 s / 175 rows** — unchanged-to-better vs the 104–118 s band
       pgbench-hook: PASS (see commit)
-- commit: _(filled by R2-7)_
+- commit: `8d453246`
+
+## R2-7 — S7: Memoize (parameterized result cache under NLI)  [x]
+
+- [x] plan side (`internal/planner/plan.go` + `memoize.go`): `Memoize` node
+      (Child aliases the NLI's `*IndexScan`, KeyExprs, SingleRow, EstEntries) +
+      `NestedLoopIndexJoin.InnerMemo`; `maybeAttachMemoize` runs at the end of
+      `walkRewriteNLI`'s `*Join` case. Gate (ch.05 §4, STRICTER than the NLI
+      gate): switch on → INNER/LEFT only (**never** Semi/Anti — early-out probes
+      can't complete an entry) → every probe key a bare outer `ColumnRef` (also
+      subsumes volatility) → **stats mandatory** (outerRows ≥ 1000,
+      hitFrac = 1 − nd/outerRows ≥ 0.5). Fresh servers have no in-memory ANALYZE
+      stats ⇒ zero attach — matches PG memoizing zero of 22 TPC-H @ SF1.
+- [x] exec side (`internal/executor/operators_memoize.go`): `memoizeOp`
+      implements the new `nliInner` protocol interface (openPrep/BindOuter/
+      Rescan/Next/Close), wrapping the bare `*indexScanOp`; kvcache-backed
+      (budget WorkMem/4, **deliberately not** EstEntries-derived — a row-size
+      underestimate would LRU-thrash), complete-entries-only, SingleRow
+      completes after the first row (nodeMemoize.c:832), oversize entry →
+      abandon + pass-through, per-row `MaterializeArena` deep copy (M0073-0004
+      retention contract). Cache keys evaluate the CHILD's live Key/Keys —
+      immune to post-`walkRewriteNLI` expr replacement staleness.
+- [x] `executor.go` build case constructs `memoizeOp` when `InnerMemo != nil`;
+      FOR UPDATE TID walks unwrap via `nliInnerIndexScan` (operators_lockrows.go)
+- [x] EXPLAIN: `Memoize` node between Nested Loop and Index Scan with
+      `Cache Key:` line; ANALYZE adds `Hits/Misses/Evictions/Overflows`
+      (Memory Usage deferred — accounting is budget-grade, not report-grade)
+- [x] `enable_memoize` GUC un-no-op'd via `registry.OnChange` bridge in
+      cmd/goopg/main.go (same pattern as enable_nestloop_index); env kill
+      switch `GOOPG_MEMOIZE=off`; `planner.SetMemoizeEnabled` test hook
+- [x] tests: planner gate table (7 cases + kill switch + out-of-schema key),
+      executor e2e ×3 (Memoize node + off/on result equality; exact
+      `Hits: 30  Misses: 10` ANALYZE counters; tiny-budget overflow
+      pass-through `Misses: 40  Overflows: 40` with exact results)
+- gates:
+      units:      PASS (2026-07-21) · spotcheck PASS (Q12=2 / Q13=33)
+      plan-gate:  22/22 MATCH vs csq-r2-0-nli-display (no persisted stats on the
+                  bench server ⇒ zero Memoize attach ⇒ shapes unchanged, by design)
+      race-gate:  PASS
+- commit: _(filled by R2-8)_

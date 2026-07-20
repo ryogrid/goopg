@@ -175,6 +175,11 @@ type Context struct {
 	// same style as the sublink result caches above; no synchronisation.
 	SubPlanStats map[planner.Expr]*SubPlanSiteStats
 
+	// MemoizeStats carries the per-Memoize-node ANALYZE counters
+	// (Hits/Misses/Evictions/Overflows), keyed by plan node like
+	// SubPlanStats. Lazily allocated by memoizeStat. S7.
+	MemoizeStats map[*planner.Memoize]*MemoizeStats
+
 	// MultiAssignSubqCache caches the result row of a MultiAssignSubqRow
 	// evaluation (tuple SET subquery). Keyed by *planner.MultiAssignSubqRow
 	// pointer (as uintptr). Cleared by the update executor at the start of

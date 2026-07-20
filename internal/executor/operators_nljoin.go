@@ -38,7 +38,7 @@ import (
 type nestedLoopIndexJoinOp struct {
 	plan  *planner.NestedLoopIndexJoin
 	outer Operator
-	inner *indexScanOp
+	inner nliInner
 	ctx   *Context
 
 	// outerWidth / innerWidth are captured in Open() from the child
@@ -80,7 +80,34 @@ type nestedLoopIndexJoinOp struct {
 	openOnce        bool
 }
 
-func newNestedLoopIndexJoinOp(p *planner.NestedLoopIndexJoin, outer Operator, inner *indexScanOp) *nestedLoopIndexJoinOp {
+// nliInner is the protocol the NLI driver requires of its inner side:
+// prepared once (openPrep), then per outer row BindOuter + Rescan, with
+// Next draining the probe's matches. Satisfied by *indexScanOp (the
+// bare probe) and *memoizeOp (S7's parameterized result cache, which
+// forwards to a child *indexScanOp on cache misses).
+type nliInner interface {
+	Schema() planner.Schema
+	openPrep(ctx *Context) error
+	Next() (TupleSlot, error)
+	BindOuter(slot SlotView, outerWidth int)
+	Rescan(outerSlot SlotView, outerWidth int) error
+	Close() error
+}
+
+// nliInnerIndexScan unwraps an nliInner to its underlying index scan
+// (identity for a bare probe, the child for a memoize wrapper). Used by
+// the FOR UPDATE TID-provider walks, which need the concrete scan.
+func nliInnerIndexScan(in nliInner) *indexScanOp {
+	switch x := in.(type) {
+	case *indexScanOp:
+		return x
+	case *memoizeOp:
+		return x.child
+	}
+	return nil
+}
+
+func newNestedLoopIndexJoinOp(p *planner.NestedLoopIndexJoin, outer Operator, inner nliInner) *nestedLoopIndexJoinOp {
 	return &nestedLoopIndexJoinOp{plan: p, outer: outer, inner: inner}
 }
 

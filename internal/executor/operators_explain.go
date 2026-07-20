@@ -108,7 +108,7 @@ func (o *explainOp) Open(ctx *Context) error {
 			return nil
 		}
 		var b strings.Builder
-		walkPlanAnalyze(&b, o.plan.Child, 0, &o.rows, opts, stats, ctx.SubPlanStats)
+		walkPlanAnalyze(&b, o.plan.Child, 0, &o.rows, opts, stats, ctx.SubPlanStats, ctx.MemoizeStats)
 		appendExplainSettingsRow(ctx, opts, &o.rows)
 		if summary {
 			o.rows = append(o.rows,
@@ -489,6 +489,15 @@ func emitNodeDetailLines(n planner.Node, indent string, rows *[]Row, attachedFil
 		if attachedFilter != nil {
 			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprPGReg(attachedFilter, reg)))})
 		}
+	case *planner.Memoize:
+		// Upstream shape: `Cache Key: t.a, t.b` under the Memoize node.
+		if len(p.KeyExprs) > 0 {
+			parts := make([]string, 0, len(p.KeyExprs))
+			for _, ke := range p.KeyExprs {
+				parts = append(parts, formatExprPGReg(ke, reg))
+			}
+			*rows = append(*rows, Row{NewStringDatum(indent + "Cache Key: " + strings.Join(parts, ", "))})
+		}
 	case *planner.SeqScan:
 		if attachedFilter != nil {
 			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprPGReg(attachedFilter, reg)))})
@@ -794,13 +803,13 @@ func schemaColumnNames(n planner.Node) []string {
 // `(actual time=startup..total rows=R loops=L)` suffix pulled
 // from the instrumentation table. Loops > 0 means the operator
 // ran at least once. Total time is in milliseconds.
-func walkPlanAnalyze(b *strings.Builder, n planner.Node, depth int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable, spStats map[planner.Expr]*SubPlanSiteStats) {
-	walkPlanAnalyzeFiltered(n, depth, rows, opts, stats, spStats, nil, &subPlanReg{})
+func walkPlanAnalyze(b *strings.Builder, n planner.Node, depth int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable, spStats map[planner.Expr]*SubPlanSiteStats, memoStats map[*planner.Memoize]*MemoizeStats) {
+	walkPlanAnalyzeFiltered(n, depth, rows, opts, stats, spStats, memoStats, nil, &subPlanReg{})
 }
 
-func walkPlanAnalyzeFiltered(n planner.Node, depth int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable, spStats map[planner.Expr]*SubPlanSiteStats, attachedFilter planner.Expr, reg *subPlanReg) {
+func walkPlanAnalyzeFiltered(n planner.Node, depth int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable, spStats map[planner.Expr]*SubPlanSiteStats, memoStats map[*planner.Memoize]*MemoizeStats, attachedFilter planner.Expr, reg *subPlanReg) {
 	if p, ok := n.(*planner.Project); ok {
-		walkPlanAnalyzeFiltered(p.Child, depth, rows, opts, stats, spStats, attachedFilter, reg)
+		walkPlanAnalyzeFiltered(p.Child, depth, rows, opts, stats, spStats, memoStats, attachedFilter, reg)
 		return
 	}
 	if f, ok := n.(*planner.Filter); ok {
@@ -808,7 +817,7 @@ func walkPlanAnalyzeFiltered(n planner.Node, depth int, rows *[]Row, opts parser
 		if attachedFilter != nil {
 			next = attachedFilter
 		}
-		walkPlanAnalyzeFiltered(f.Child, depth, rows, opts, stats, spStats, next, reg)
+		walkPlanAnalyzeFiltered(f.Child, depth, rows, opts, stats, spStats, memoStats, next, reg)
 		return
 	}
 
@@ -848,6 +857,18 @@ func walkPlanAnalyzeFiltered(n planner.Node, depth int, rows *[]Row, opts parser
 		}
 	}
 
+	// Memoize emits its cache counters under ANALYZE, matching upstream's
+	// show_memoize_info line shape (S7; Memory Usage is deferred — our
+	// byte accounting is a budget approximation, not a report-grade
+	// number).
+	if m, isMemo := n.(*planner.Memoize); isMemo {
+		if ms := memoStats[m]; ms != nil {
+			*rows = append(*rows, Row{NewStringDatum(detailIndent + fmt.Sprintf(
+				"Hits: %d  Misses: %d  Evictions: %d  Overflows: %d",
+				ms.Hits, ms.Misses, ms.Evictions, ms.Overflows))})
+		}
+	}
+
 	// EXPLAIN (ANALYZE, BUFFERS) emits a "Buffers: shared hit=N read=N"
 	// detail line per node (design 0122-0003 BUFFERS slice). Shared-only,
 	// hit/read-only for now — local/temp buffers and dirtied/written
@@ -873,11 +894,11 @@ func walkPlanAnalyzeFiltered(n planner.Node, depth int, rows *[]Row, opts parser
 	// Sublink subtrees keep their instrumentation: stats is passed
 	// through so inner nodes still report actual rows / loops.
 	emitSubPlanSubtrees(rows, detailIndent, opts, reg, spStats, func(sub planner.Node, subDepth int) {
-		walkPlanAnalyzeFiltered(sub, subDepth, rows, opts, stats, spStats, nil, reg)
+		walkPlanAnalyzeFiltered(sub, subDepth, rows, opts, stats, spStats, memoStats, nil, reg)
 	})
 
 	for _, c := range planChildren(n) {
-		walkPlanAnalyzeFiltered(c, depth+1, rows, opts, stats, spStats, nil, reg)
+		walkPlanAnalyzeFiltered(c, depth+1, rows, opts, stats, spStats, memoStats, nil, reg)
 	}
 }
 
@@ -1150,6 +1171,8 @@ func describePlan(n planner.Node) string {
 		// IndexScan side. The inner IndexScan node renders its
 		// own label (`Index Scan using <idx> on <table>`) below.
 		return fmt.Sprintf("Nested Loop (%s)", joinTypeName(p.Type))
+	case *planner.Memoize:
+		return "Memoize"
 	case *planner.Merge:
 		return fmt.Sprintf("Merge on %s", p.Target.QualifiedName())
 	case *planner.CTEDMLPrefix:
@@ -1242,8 +1265,15 @@ func planChildren(n planner.Node) []planner.Node {
 		copy(out, p.Tables)
 		return out
 	case *planner.NestedLoopIndexJoin:
-		// M0054-0006: render outer driver and inner index probe.
+		// M0054-0006: render outer driver and inner index probe. With an
+		// S7 Memoize attached, the cache node renders between the join
+		// and the probe (InnerMemo.Child aliases p.Inner).
+		if p.InnerMemo != nil {
+			return []planner.Node{p.Outer, p.InnerMemo}
+		}
 		return []planner.Node{p.Outer, p.Inner}
+	case *planner.Memoize:
+		return []planner.Node{p.Child}
 	case *planner.Merge:
 		return []planner.Node{p.Source}
 	case *planner.CTEDMLPrefix:
