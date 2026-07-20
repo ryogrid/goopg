@@ -688,3 +688,58 @@ was `distinctOp.Open` (the `Unique` node), not the NL join.
 | 2026-07-21 | 3+4 | **Stages 3 and 4 share one commit**, contrary to the one-commit-per-stage rule. Stage 4's guards were developed while Stage 3's matrix was still uncommitted (both touch `unnest.go` and the matrix file), so every gate in this window ran against the combined tree; splitting retroactively would have manufactured two intermediate states that were never gate-tested. The TODO keeps separate stage records. |
 | 2026-07-21 | 3 | The M6 hang rows were added as `t.Skip` entries rather than the capped-subprocess probe the plan sketched — the guard fix was one stage away, and a probe harness for a bug about to be fixed was not worth the complexity. Stage 4 removed the skips the same day. |
 | 2026-07-20 | 1 | `OuterColumnRef` still renders as a bare column name, so a correlated self-join subplan prints `Index Cond: (l_orderkey = l_orderkey)` — ambiguous but not wrong. Stage 8 (D4.1) replaces it with `$N`, which is both PG-faithful and unambiguous. Not patched separately to keep the stage diff minimal. |
+
+
+---
+
+# ROUND 2 — S4 / S5a / D6.3 / S7 + measurement-harness guard
+
+| field | value |
+| --- | --- |
+| status | in-progress |
+| started | 2026-07-21 |
+| branch | `planner-kaizen2` (base `a8233ac4`) |
+| scope | bundle phases S4, S5a, full D6.3, S7 + the throttle-trap harness guard. **S5b DEFERRED by user decision** (reopen criterion: post-S5a plan-compare shows a query slower AND differing from PG only by semi/anti placement) |
+
+## Round-2 stage table
+
+| # | Stage | Scope | Status |
+|---|---|---|---|
+| R2-0 | harness guard + NLI-Predicate EXPLAIN | throttle-trap refusal in the wrapper; NLI residual visible | [ ] |
+| R2-1 | S4a: D3.2 residual lifting (IN/scalar) + NL semi/anti + tautology strip | | [ ] |
+| R2-2 | S4b: D3.3 nested-sublink tolerance (deep walk + clone fix) | | [ ] |
+| R2-3 | D6.3a: subplan cost helper + NLI semi/anti cost gate | | [ ] |
+| R2-4 | S5a: unnest before join search (semi/anti pinned) | | [ ] |
+| R2-5 | S5b | **deferred** (ledger row in R2-4) | — |
+| R2-6 | D6.3b: INNER Filter-inner NLI unwrap, cost-gated | | [ ] |
+| R2-7 | S7: Memoize | | [ ] |
+| R2-8 | FINAL: sweep + report | | [ ] |
+
+## R2-0 — harness guard + NLI-Predicate EXPLAIN  [x]
+
+- [x] `scripts/goopg-test-run.sh`: `to_bytes()` normalizer (systemd K/M/G/T base-1024,
+      Go KiB/MiB/GiB, bare bytes, infinity) + **fail-fast refusal (`exit 2`)** when
+      `GOOPG_MEM_HIGH < GOMEMLIMIT` — the throttle trap that faked two round-1 sweep-tail
+      collapses (GOGC=off ⇒ GC fires only near GOMEMLIMIT; a lower memory.high parks the
+      scope in the kernel reclaim band). Silently adjusting either knob was rejected:
+      raising the cap defeats it, lowering GOMEMLIMIT silently changes benchmark
+      conditions. Unparsable values warn-and-continue; `MEM_MAX < MEM_HIGH` warns.
+- [x] manual matrix verified: `GOOPG_MEM_HIGH=4G` → refused rc=2; defaults pass;
+      `GOMEMLIMIT=20GiB` vs `MEM_HIGH=20G` pass (equal); garbage unit warns+continues;
+      `MEM_MAX<MEM_HIGH` warns
+- [x] `bench/tpch/env_goopg.sh`: invariant comment (enforced by the wrapper all bench
+      servers start through)
+- [x] EXPLAIN: `emitNodeDetailLines` gains the `*planner.NestedLoopIndexJoin` case —
+      the residual `Predicate` (hoisted inner filters, OR-factoring residuals, Q4's
+      decorrelated-EXISTS residual) now renders as `Filter: (…)`; closes the first
+      `csq-S6` ledger row
+- [x] test `TestNLIResidualPredicateRendered`
+- gates:
+      units:      PASS (2026-07-21, whole module)
+      spotcheck:  PASS (Q12=2 / Q13=33)
+      plan-gate:  DIFFER on Q4/Q7/Q19/Q21 — all Filter-line-only on Nested Loop nodes
+                  (Q4's `(true)` placeholder became the real `l_commitdate <
+                  l_receiptdate`; Q19's OR residual now visible); tree shapes
+                  unchanged. Recaptured `csq-r2-0-nli-display`, 22/22 MATCH
+      pgbench-hook: PASS (see commit)
+- commit: _(filled by R2-1)_

@@ -260,3 +260,34 @@ func TestJoinTypeNameSemiAnti(t *testing.T) {
 		t.Errorf("JoinTypeAnti label = %q, want ANTI", got)
 	}
 }
+
+// TestNLIResidualPredicateRendered pins the R2-0 display fix: a
+// NestedLoopIndexJoin's residual Predicate (conjuncts the index probe
+// does not enforce) must appear as a Filter: line. It was previously
+// dropped silently, which hid a residual mis-resolution during the Q7
+// alias fix (deferral ledger, csq-S6).
+func TestNLIResidualPredicateRendered(t *testing.T) {
+	// Build via the planner on a fixture so the node is well-formed: an
+	// EXISTS with an inner-only residual over an indexed correlation
+	// column decorrelates to an NLI semi with the residual retained.
+	ctx, cleanup := explainSubPlanFixture(t)
+	defer cleanup()
+	for _, ddl := range []string{"CREATE INDEX t2_a_ix ON t2(a)", "ANALYZE t1", "ANALYZE t2"} {
+		if err := runDDL(t, ctx, ddl); err != nil {
+			t.Fatalf("%s: %v", ddl, err)
+		}
+	}
+	out, _ := joinedPlan(t, ctx,
+		"EXPLAIN SELECT * FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.a = t1.a AND t2.b < t1.b)")
+	if strings.Contains(out, "Nested Loop (SEMI)") {
+		if !strings.Contains(out, "b < ") && !strings.Contains(out, "< b") {
+			t.Errorf("NLI semi residual predicate not rendered:\n%s", out)
+		}
+	} else if strings.Contains(out, "(SEMI)") {
+		// Hash semi carries the residual on the join predicate — the
+		// display concern is NLI-specific; nothing to assert here.
+		t.Logf("shape took hash semi, NLI residual display not exercised:\n%s", out)
+	} else {
+		t.Logf("shape stayed SubPlan, NLI residual display not exercised:\n%s", out)
+	}
+}

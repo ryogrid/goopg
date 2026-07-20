@@ -72,6 +72,11 @@ mkdir -p "${TMP}" "${LOG_DIR}" "${RUNTIME_DIR}"
 # while keeping ≥ 18 GB free for the OS, swap-avoidance, and any
 # co-resident processes (browser, IDE, claude-code itself).
 # Override with `GOMEMLIMIT=20GiB` for hosts with ≥ 64 GB RAM.
+# NOTE (2026-07-21): with GOGC=off below, the GC only fires as the heap nears
+# this limit. Any cgroup soft cap (GOOPG_MEM_HIGH) must sit ABOVE it or the
+# server parks in the kernel throttle band after one big query — the wrapper
+# scripts/goopg-test-run.sh, which every bench server start goes through,
+# enforces this invariant and refuses misconfigured combinations.
 export GOMEMLIMIT=${GOMEMLIMIT:-12GiB}
 
 # M0066-0001: GOGC=off disables proactive growth-triggered GC; the

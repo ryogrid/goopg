@@ -476,6 +476,19 @@ func emitNodeDetailLines(n planner.Node, indent string, rows *[]Row, attachedFil
 		if attachedFilter != nil {
 			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprPGReg(attachedFilter, reg)))})
 		}
+	case *planner.NestedLoopIndexJoin:
+		// The NLI's residual predicate (conjuncts the index probe does not
+		// enforce — hoisted inner filters, OR-factoring residuals,
+		// decorrelated-EXISTS residuals like Q4's l_commitdate <
+		// l_receiptdate) was previously invisible in EXPLAIN, which hid a
+		// mis-resolution during the Q7 alias/residual fix (deferral ledger,
+		// csq-S6). Render it as a Filter: line, house style.
+		if p.Predicate != nil {
+			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprPGReg(p.Predicate, reg)))})
+		}
+		if attachedFilter != nil {
+			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprPGReg(attachedFilter, reg)))})
+		}
 	case *planner.SeqScan:
 		if attachedFilter != nil {
 			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprPGReg(attachedFilter, reg)))})
