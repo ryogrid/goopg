@@ -3313,6 +3313,21 @@ func canUnnestExistsExpr(ex *ExistsExpr) bool {
 	if len(eup.Params) == 0 && len(eup.Residuals) == 0 {
 		return false
 	}
+	// D6.3a: SubPlan-vs-NL-semi for the zero-equijoin shape — resolved
+	// analytically in the NL semi's favor, so no cost consultation is
+	// performed. The NL semi materialises the body WITHOUT its lifted
+	// residuals exactly once and re-scans that set per outer row; the
+	// SubPlan path re-runs the body's driving scan per call. Under the
+	// estimateSubplanCostPerCall model those are the same quantity
+	// (per-call scan work ≥ materialised output for every shape class:
+	// a SeqScan body scans the table either way; an index-probe body's
+	// probe yields the same match set the NL re-scans), so the SubPlan
+	// can never be estimated cheaper — its only real advantage is the
+	// S2 handles' per-param-value result caching, which this
+	// deliberately rough model does not chase (ch.06 §4: precision
+	// beyond ordering-safety is a non-goal). The keep-SubPlan branch
+	// sketched in the D6.3a plan is therefore intentionally absent;
+	// TestZeroEquijoinPrefersNLSemi pins the behavior.
 	// D3.3 (S4b): nested sublinks inside the EXISTS body no longer bail
 	// wholesale. The deep escape check inside
 	// collectUnnestParamsAndResiduals (above) guarantees no ref inside a

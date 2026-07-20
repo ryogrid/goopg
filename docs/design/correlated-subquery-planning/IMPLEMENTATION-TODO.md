@@ -707,8 +707,8 @@ was `distinctOp.Open` (the `Unique` node), not the NL join.
 |---|---|---|---|
 | R2-0 | harness guard + NLI-Predicate EXPLAIN | throttle-trap refusal in the wrapper; NLI residual visible | [x] `3a620f2b` |
 | R2-1 | S4a: D3.2 residual lifting (IN/scalar) + NL semi/anti + tautology strip | | [x] `55ad7fdb` |
-| R2-2 | S4b: D3.3 nested-sublink tolerance (deep walk + clone fix) | | [x] (this commit) |
-| R2-3 | D6.3a: subplan cost helper + NLI semi/anti cost gate | | [ ] |
+| R2-2 | S4b: D3.3 nested-sublink tolerance (deep walk + clone fix) | | [x] `712827cc` |
+| R2-3 | D6.3a: subplan cost helper + NLI semi/anti cost gate | | [x] (this commit) |
 | R2-4 | S5a: unnest before join search (semi/anti pinned) | | [ ] |
 | R2-5 | S5b | **deferred** (ledger row in R2-4) | — |
 | R2-6 | D6.3b: INNER Filter-inner NLI unwrap, cost-gated | | [ ] |
@@ -820,4 +820,42 @@ was `distinctOp.Open` (the `Unique` node), not the NL join.
                   bodies have no nested sublinks; Q20's IN already carried its
                   nested scalar, now deep-copied with identical shape)
       pgbench-hook: PASS (see commit)
-- commit: _(filled by R2-3)_
+- commit: `712827cc`
+
+## R2-3 — D6.3a: subplan cost helper + stats-aware NLI semi/anti gate  [x]
+
+- [x] `internal/planner/subplan_cost.go`: `estimateSubplanCostPerCall` — per-call
+      SubPlan cost for ordering-safety only (index-probe chains cost one match set;
+      SeqScan chains full rows; unknown → 0 = UNKNOWN, never "free"). First live
+      consumer arrives with D6.3b (the R2-1 zero-equijoin consultation was resolved
+      analytically in the NL semi's favor — the SubPlan's per-call scan work is ≥ the
+      NL's one-time materialisation re-scan in every shape class; documented at the
+      site, pinned by `TestZeroEquijoinPrefersNLSemi`)
+- [x] `nliCostGateAccepts` rewrite: INNER/LEFT keep the historical `≤100 000`
+      heuristic bit-for-bit; SEMI/ANTI use `matchSet = innerRows/NDistinct(probe
+      col)`, `probeCost = matchSet` (full match set, not an early-out blend — the
+      no-match case must exhaust it; pessimism biases toward hash), accept ⇔
+      `outerRows×matchSet < innerRows + outerRows`
+- [x] **live-fire correction during the stage** — the first cut's "no stats →
+      conservative reject" rule was falsified on the bench server: goopg's ANALYZE
+      statistics are **in-memory only and lost on every restart**, so no-stats is
+      the COMMON case, and the rule permanently disabled semi/anti NLI in practice —
+      plan-gate flipped Q4/Q21/Q22, with Q4 as the 276 s / 71× hash-semi shape the
+      gate exists to prevent. Root-caused with an env-gated debug print
+      (`GOOPG_NLI_COSTGATE_DEBUG=1`, kept): `EstimateRows(outer)=0` at gate time on
+      a fresh server. **Rule inverted: no usable stats → optimistic accept (the
+      pre-D6.3a behavior every green sweep actually ran with); the stats-aware
+      formula refines only where ANALYZE data exists.** Gate-table tests flipped
+      with the rationale inline
+- [x] legacy escape hatch `GOOPG_NLI_COSTGATE=legacy` + `SetNLICostGateLegacy`
+- [x] placement-property pin `TestSublinkConjunctPlacementProperty` (S5a insurance)
+- [x] stats fixtures added to pre-existing NLI tests that now exercise the
+      stats-aware path; discovered en route: the in-process test harness's ANALYZE
+      is a no-op (stats set directly on catalog tables instead, commented)
+- gates:
+      units:      PASS (2026-07-21, whole module; matrix M1–M22 both paths)
+      spotcheck:  PASS (Q12=2 / Q13=33)
+      plan-gate:  after the correction, **22/22 MATCH** (Q4/Q21/Q22 restored to
+                  their R2-0 shapes); live Q4 6.53 s / Q22 1.58 s (NLI shapes)
+      pgbench-hook: PASS (see commit)
+- commit: _(filled by R2-4)_

@@ -30,6 +30,8 @@ package planner
 // this provides the rollback path.
 
 import (
+	"fmt"
+	"os"
 	"sync/atomic"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -47,6 +49,10 @@ var nliEnabled atomic.Bool
 
 func init() {
 	nliEnabled.Store(true)
+	// D6.3a escape hatch: GOOPG_NLI_COSTGATE=legacy restores the
+	// stats-blind semi/anti gate for one stage (deleted in R2-8 if
+	// unused).
+	nliCostGateLegacy.Store(os.Getenv("GOOPG_NLI_COSTGATE") == "legacy")
 }
 
 // SetNLIEnabled flips the M0054-0006 NLI rule on or off. Test-
@@ -413,7 +419,7 @@ func tryBuildNLI(j *Join, cat catalog.Catalog) (*NestedLoopIndexJoin, bool) {
 	if outerNode == nil {
 		return nil, false
 	}
-	if !nliCostGateAccepts(outerNode, innerScan, idx) {
+	if !nliCostGateAccepts(j.Type, outerNode, innerScan, idx) {
 		return nil, false
 	}
 	// M0063-0001: skip NLI when the outer is an isolated-scope
@@ -1162,33 +1168,89 @@ func otherChild(j *Join, innerScan *SeqScan) Node {
 	return nil
 }
 
+// nliCostGateLegacy restores the pre-D6.3a bare heuristic for
+// semi/anti joins (env GOOPG_NLI_COSTGATE=legacy at process start, or
+// SetNLICostGateLegacy from tests). Escape hatch for one stage; slated
+// for deletion in R2-8 if unused. INNER behavior is identical either
+// way.
+var nliCostGateLegacy atomic.Bool
+
+// SetNLICostGateLegacy toggles the legacy (stats-blind) cost gate for
+// semi/anti NLI decisions. Test hook, mirroring SetNLIEnabled.
+func SetNLICostGateLegacy(on bool) { nliCostGateLegacy.Store(on) }
+
 // nliCostGateAccepts returns true when the cost model finds NLI
 // preferable to (or at least competitive with) Hash for the given
-// shape. The heuristic:
+// shape.
 //
-//   - When the outer side has an estimated row count ≤
-//     `nliMaxOuterRowsHeuristic`, NLI is preferred (each outer row
-//     costs an index probe; the build cost of Hash dominates for
-//     small outer sides).
-//   - Otherwise, NLI is rejected — Hash's amortised O(L+R) wins
-//     over NLI's O(L * log R) at scale until cost-model
-//     statistics from M0006 are wired to override this threshold.
+// INNER (and LEFT) joins keep the historical heuristic unchanged:
 //
-// Rows are estimated via the existing `EstimateRows`; when
-// statistics are absent, the function returns small values and
-// NLI is accepted by default — which is fine for the goopg
-// workloads where the outer driver of an unanalysed table is
-// typically small (CTEs, derived tables, small dimension tables).
-func nliCostGateAccepts(outer Node, innerScan *SeqScan, idx *catalog.Index) bool {
+//   - outer estimate ≤ nliMaxOuterRowsHeuristic → accept;
+//     unknown estimate → optimistic accept. INNER regressions are out
+//     of D6.3a's scope.
+//
+// SEMI/ANTI joins (D6.3a, design bundle ch.06 §3.2; oracle:
+// postgres/src/backend/optimizer/path/costsize.c
+// compute_semi_anti_join_factors / final_cost_nestloop) use ANALYZE
+// statistics:
+//
+//	matchSet  = max(1, innerRows / NDistinct(inner probe column))
+//	probeCost = matchSet
+//	accept  ⇔ outerRows × probeCost < innerRows + outerRows
+//
+// The right-hand side is the hash alternative: one build pass over the
+// inner (≈ innerRows) plus one O(1) probe per outer row. probeCost is
+// deliberately the FULL match set, not an early-out blend: both semi
+// and anti probes can stop at the first matching row (semi emits, anti
+// suppresses), but the expensive case — no match — must exhaust the
+// match set, and estimating the match probability from column overlap
+// is more model than the decision needs. Using the pessimistic bound
+// biases toward hash, the safe direction (a wrong "hash" costs a build
+// pass; a wrong "NLI" on a big outer costs outerRows × matchSet, the
+// Q4-regression class).
+//
+// No usable stats (RowCount or probe-column NDistinct missing) →
+// REJECT for semi/anti — keep the hash join. This is the documented
+// conservative rule: a stats-blind index-probe loop over an unknown
+// inner is exactly how the 71× Q4-class regressions happen.
+func nliCostGateAccepts(joinType JoinType, outer Node, innerScan *SeqScan, idx *catalog.Index) bool {
 	outerRows := EstimateRows(outer)
-	if outerRows <= 0 {
-		// No estimate available — be optimistic. The cost gate
-		// will be tightened in M0054-0006 follow-ups when
-		// statistics-aware row counts land.
-		return true
+	semiAnti := joinType == JoinTypeSemi || joinType == JoinTypeAnti
+	if !semiAnti || nliCostGateLegacy.Load() {
+		// Historical heuristic (also the legacy escape hatch for
+		// semi/anti): small-or-unknown outer → NLI.
+		if outerRows <= 0 {
+			return true
+		}
+		return outerRows <= nliMaxOuterRowsHeuristic
 	}
-	if outerRows <= nliMaxOuterRowsHeuristic {
-		return true
+	var innerRows, matchSet int64
+	if innerScan != nil && innerScan.Table != nil {
+		innerRows = tableRows(innerScan.Table)
+		matchSet = matchSetByColumnName(innerScan.Table, firstIndexColumn(idx))
 	}
-	return false
+	statsKnown := outerRows > 0 && innerRows > 0 && matchSet > 0
+	accept := true
+	if statsKnown {
+		accept = outerRows*matchSet < innerRows+outerRows
+	}
+	// No usable stats → OPTIMISTIC accept (the pre-D6.3a behavior).
+	//
+	// The first cut of this gate rejected semi/anti NLI without stats
+	// ("a stats-blind index-probe loop is how Q4-class regressions
+	// happen"). Measured reality inverted that: goopg's ANALYZE
+	// statistics live in memory only and are lost on every server
+	// restart, so the no-stats case is the COMMON case — and rejecting
+	// it permanently disabled semi/anti NLI in practice, reproducing
+	// the exact regression the gate exists to prevent (Q4 as a hash
+	// semi: 276 s; as NLI-semi: ~3.5 s — the 71× class, measured
+	// 2026-07-21 on the fresh bench server). The optimistic default is
+	// the behavior every green sweep to date actually ran with; the
+	// stats-aware formula refines the decision only where ANALYZE data
+	// exists (unit-test fixtures, long-lived sessions).
+	if os.Getenv("GOOPG_NLI_COSTGATE_DEBUG") == "1" {
+		fmt.Fprintf(os.Stderr, "nli-costgate: type=%v outer=%T outerRows=%d innerRows=%d matchSet=%d statsKnown=%v accept=%v\n",
+			joinType, outer, outerRows, innerRows, matchSet, statsKnown, accept)
+	}
+	return accept
 }

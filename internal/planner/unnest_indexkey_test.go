@@ -51,6 +51,16 @@ func indexedCorrCatalog(t *testing.T) catalog.Catalog {
 	if _, err := c.CreateIndex(parser.ObjectName{Name: "inner_key_a_idx"}, inner, []string{"i_key", "i_a"}, false, "btree", false); err != nil {
 		t.Fatal(err)
 	}
+	// D6.3a: the semi/anti NLI cost gate requires ANALYZE stats and keeps
+	// hash without them. These numbers model the selective shape the
+	// fixture exists for: 1 000 outer rows probing a 10 000-row inner
+	// whose correlation column has ~5 000 distinct values (match set 2).
+	outer.Stats = &catalog.TableStats{RowCount: 1000, Columns: []catalog.ColumnStats{
+		{NDistinct: 1000}, {NDistinct: 500},
+	}}
+	inner.Stats = &catalog.TableStats{RowCount: 10000, Columns: []catalog.ColumnStats{
+		{NDistinct: 10000}, {NDistinct: 5000}, {NDistinct: 100}, {NDistinct: 50},
+	}}
 	return c
 }
 

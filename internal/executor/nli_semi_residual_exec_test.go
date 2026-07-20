@@ -30,6 +30,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
 )
 
@@ -54,6 +56,21 @@ func newNLIResidualFixture(t *testing.T) (*Context, func()) {
 			cleanup()
 			t.Fatalf("fixture %q: %v", stmt, err)
 		}
+	}
+	// D6.3a: the semi/anti NLI cost gate is stats-aware and keeps hash
+	// without ANALYZE data. The in-process fixture's ANALYZE is a no-op
+	// (rows=0), so set the stats directly: 4 outer rows probing a 4-row
+	// inner with 3 distinct keys (match set 1) — the selective shape
+	// these tests exist for.
+	if tbl, ok := ctx.Catalog.LookupTable(parser.ObjectName{Name: "ord"}); ok {
+		tbl.Stats = &catalog.TableStats{RowCount: 4, Columns: []catalog.ColumnStats{
+			{NDistinct: 4}, {NDistinct: 4},
+		}}
+	}
+	if tbl, ok := ctx.Catalog.LookupTable(parser.ObjectName{Name: "line"}); ok {
+		tbl.Stats = &catalog.TableStats{RowCount: 4, Columns: []catalog.ColumnStats{
+			{NDistinct: 3}, {NDistinct: 3}, {NDistinct: 3},
+		}}
 	}
 	return ctx, cleanup
 }

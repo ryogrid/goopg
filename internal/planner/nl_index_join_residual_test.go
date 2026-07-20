@@ -284,6 +284,14 @@ func TestNLISemiAntiAcceptResidual(t *testing.T) {
 		[]string{"n_nationkey"}, true, "btree", true); err != nil {
 		t.Fatal(err)
 	}
+	// D6.3a: semi/anti NLI now requires stats. 10 000 suppliers probing
+	// the 25-row nation PK (match set 1) is the canonical selective shape.
+	supplier.Stats = &catalog.TableStats{RowCount: 10000, Columns: []catalog.ColumnStats{
+		{NDistinct: 10000}, {NDistinct: 25}, {NDistinct: 10000},
+	}}
+	nation.Stats = &catalog.TableStats{RowCount: 25, Columns: []catalog.ColumnStats{
+		{NDistinct: 25}, {NDistinct: 25},
+	}}
 
 	outer := &SeqScan{Table: supplier, schema: tableSchemaWithSource(supplier, 1)}
 	inner := &SeqScan{Table: nation, schema: tableSchemaWithSource(nation, 2)}
@@ -355,6 +363,14 @@ func TestNLISemiDeclinesUnresolvableResidual(t *testing.T) {
 		[]string{"n_nationkey"}, true, "btree", true); err != nil {
 		t.Fatal(err)
 	}
+	// D6.3a: semi/anti NLI now requires stats. 10 000 suppliers probing
+	// the 25-row nation PK (match set 1) is the canonical selective shape.
+	supplier.Stats = &catalog.TableStats{RowCount: 10000, Columns: []catalog.ColumnStats{
+		{NDistinct: 10000}, {NDistinct: 25}, {NDistinct: 10000},
+	}}
+	nation.Stats = &catalog.TableStats{RowCount: 25, Columns: []catalog.ColumnStats{
+		{NDistinct: 25}, {NDistinct: 25},
+	}}
 	outer := &SeqScan{Table: supplier, schema: tableSchemaWithSource(supplier, 1)}
 	inner := &SeqScan{Table: nation, schema: tableSchemaWithSource(nation, 2)}
 	leftWidth := len(outer.Output())
