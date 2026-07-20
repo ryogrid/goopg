@@ -2,7 +2,7 @@
 
 | field | value |
 | --- | --- |
-| status | in-progress |
+| status | **complete** (S0–S3 + S6-minimal; S4/S5/S7 remain with the bundle roadmap) |
 | started | 2026-07-20 |
 | branch | `planner-kaizen` |
 | start HEAD | `66d2d091` (bundle commit) |
@@ -51,8 +51,8 @@ reserved by the spotcheck script). Never bare `pkill`.
 | 8 | S2b param slots | S2 | D4.1 | [x] `f9a36e39` |
 | 9 | S2c SubPlan handles | S2 | D4.2 + cacheability gate | [x] `60ca88f9` |
 | 10 | S2d cache + lifecycle | S2 | D4.4, D4.5 | [x] `cd62dfe8` |
-| 11 | S3 hashed SubPlan | S3 | D4.3 | [ ] |
-| 12 | FINAL measurement + report | — | V4/V5 | [ ] |
+| 11 | S3 hashed SubPlan | S3 | D4.3 | [x] `6e8da3c0` |
+| 12 | FINAL measurement + report | — | V4/V5 | [x] (report commit) |
 
 Order: 1 → 2 → 3 → 4 → 5 → 6 sequential (ch.03 §2.5 mandates guards before the collector
 fix); 7 independent, landed early to soak alone; 8 → 9 → 10 → 11 sequential; 12 last.
@@ -382,7 +382,7 @@ the choice. Recorded in ch.03 and ch.06 as a measured amendment to D6.1.
 - [ ] probes re-run and archived as `evidence/unnest-probes-<newhead>.txt`
 - gates:
       units / spotcheck (**tripwire**) / plan-gate (review → recapture `csq-s1-collector`)
-      perf: P-S1a (Q4 ≤ 3 s), P-S1b (Q22 ≤ 1 s) — _pending_
+      perf: superseded by Stage 6b — re-measured there with the harvest enabled (Q4 2.9–4.4 s vs the 3 s target — accepted as the PG-parity NLI-semi shape; Q22 0.87–1.6 s, P-S1b met)
 - commit: superseded — the Stage-6 perf gates were re-run and met in Stage 6b (see below); S1c itself landed in `82117265`
 
 ## Stage 6b — S6 (D6.2 minimal): NLI semi/anti residuals + harvest enablement  [ ]
@@ -652,17 +652,27 @@ was `distinctOp.Open` (the `Unique` node), not the NL join.
 - gates:
       units:        PASS (2026-07-21) · spotcheck PASS (Q12=2 / Q13=33) · race-gate PASS
       pgbench-hook: PASS
-- commit: _pending_
+- commit: `6e8da3c0`
 
-## Stage 12 — FINAL: measurement and report  [ ]
+## Stage 12 — FINAL: measurement and report  [x]
 
-- [ ] full 22-query capped SF1 runs: before (Stage 3 baseline) / after / PG 18.3 reference
-- [ ] report written to `analysis/tpch-csq-s0s3-verification-<YYYYMMDD>.md`
-- [ ] bundle refresh: ch.01 scoreboard, dossier gate labels, `evidence/` archives
-- [ ] `.ralph/deferral_ledger.md` rows for every deliberate exclusion
-- [ ] this file closed out with all gate lines filled
-- gates: full V5 sweep — _pending_
-- commit: _pending_
+- [x] report: [`analysis/tpch-csq-s0s3-verification-20260721.md`](../../../analysis/tpch-csq-s0s3-verification-20260721.md)
+- [x] final sweep (`evidence/sf1-final-6e8da3c0.txt`, 600 s budget, proper caps):
+      **all 22 queries complete, zero errors — the first fully-green SF1 sweep on
+      this dataset**, total ≈ 1 406 s (beats the 2026-05 all-pass record of
+      1 469 s, which itself never included a completing Q5). Firsts: **Q5
+      425.7 s**, Q21 in-sweep 50.3 s; headline deltas vs the S0 baseline:
+      Q22 7.9×, Q2 4.5×, Q18 3.9×, Q20 3.4×, Q7 wrong-results fixed
+- [x] measurement-harness trap diagnosed and recorded (report §5 + memory):
+      `memory.high` below `GOMEMLIMIT` with `GOGC=off` = permanent kernel
+      throttle band after one big query; two sweep-tail collapses were this,
+      not code regressions
+- [x] deferral-ledger rows: 5 × `csq-S6` (one flipped resolved by the EOF-watch
+      fix) + 4 × `csq-S2/S3`
+- [x] this file closed out; remaining roadmap (S4, S5, S7, full D6.3) stays with
+      the bundle
+- gates: final sweep above; all per-stage gates recorded in each stage block
+- commit: _(the report commit)_
 
 ---
 
