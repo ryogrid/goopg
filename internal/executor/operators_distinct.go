@@ -34,7 +34,20 @@ func (o *distinctOp) Open(ctx *Context) error {
 	}
 	// Drain all rows and deduplicate.
 	seen := make(map[string]struct{})
+	rowN := 0
 	for {
+		// Cancellation: check ctx.Err() every 1024 rows so a
+		// CancelRequest (or the client-EOF watcher) interrupts a
+		// DISTINCT over a multi-million-row child. Same throttled
+		// pattern as runNestedLoop (M0058-0005 family); this loop was
+		// part of the csq-S6 spin incident's plan (`Unique` over a
+		// 6 M-row lineitem scan).
+		rowN++
+		if rowN&0x3FF == 0 && ctx.Ctx != nil {
+			if cerr := ctx.Ctx.Err(); cerr != nil {
+				return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+			}
+		}
 		slot, err := o.child.Next()
 		if err == EOF {
 			break
