@@ -708,8 +708,8 @@ was `distinctOp.Open` (the `Unique` node), not the NL join.
 | R2-0 | harness guard + NLI-Predicate EXPLAIN | throttle-trap refusal in the wrapper; NLI residual visible | [x] `3a620f2b` |
 | R2-1 | S4a: D3.2 residual lifting (IN/scalar) + NL semi/anti + tautology strip | | [x] `55ad7fdb` |
 | R2-2 | S4b: D3.3 nested-sublink tolerance (deep walk + clone fix) | | [x] `712827cc` |
-| R2-3 | D6.3a: subplan cost helper + NLI semi/anti cost gate | | [x] (this commit) |
-| R2-4 | S5a: unnest before join search (semi/anti pinned) | | [ ] |
+| R2-3 | D6.3a: subplan cost helper + NLI semi/anti cost gate | | [x] `b35714b7` |
+| R2-4 | S5a: unnest before join search (semi/anti pinned) | | [x] (this commit) |
 | R2-5 | S5b | **deferred** (ledger row in R2-4) | — |
 | R2-6 | D6.3b: INNER Filter-inner NLI unwrap, cost-gated | | [ ] |
 | R2-7 | S7: Memoize | | [ ] |
@@ -858,4 +858,35 @@ was `distinctOp.Open` (the `Unique` node), not the NL join.
       plan-gate:  after the correction, **22/22 MATCH** (Q4/Q21/Q22 restored to
                   their R2-0 shapes); live Q4 6.53 s / Q22 1.58 s (NLI shapes)
       pgbench-hook: PASS (see commit)
-- commit: _(filled by R2-4)_
+- commit: `b35714b7`
+
+## R2-4 — S5a: unnest before join search, semi/anti pinned  [x]
+
+- [x] flag `unnestPreDPOn` (default ON, env `GOOPG_UNNEST_PREDP=off`, legacy pipeline
+      preserved verbatim behind it)
+- [x] pre-DP position engages only for EXISTS/IN-family WHEREs
+      (`whereEligibleForPreDPUnnest`); scalar-family statements keep the legacy order
+      (their INNER/Aggregate/Ordinality spines would need their own re-resolution
+      machinery — widening later; nothing precludes S5b)
+- [x] `runJoinSearchBelowPinned` (`internal/planner/predp.go`): descends the retained
+      Filter + pinned semi/anti spine to the original FROM chain (pointer identity),
+      runs the historical DP block verbatim on the sunk `Filter{chain}`, splices back;
+      degenerate case (no pins) = byte-identical legacy input/position
+- [x] F8 re-resolution only on detected layout change (`layoutPosMap` nil fast path —
+      the common case, since stats are restart-lost): bottom-up `reresolveJoinByName`
+      (does NOT skip semi/anti — the :2074 guard only skips schema widening, correct
+      and kept) + explicit outer-only `j.schema` refresh + retained-Filter remap via
+      `remapByPosMap`/`remapOuterRefsInSubplan`, mirroring the MHJ path
+- [x] tests: F8 remap (stats-forced DP reorder; name+schema assertions on the pinned
+      join; both hash-semi and NLI-semi forms), end-to-end value check on both flag
+      settings, sublink-free byte-stability flag on/off, flag-off legacy, eligibility
+- [x] S5b deferral ledger row appended (reopen criterion recorded)
+- gates:
+      units:      PASS (2026-07-21, whole module; M1–M22 matrix runs the new order)
+      spotcheck:  PASS (Q12=2 / Q13=33)
+      plan-gate:  **22/22 MATCH** — the predicted outcome: sublink-free queries take
+                  the degenerate path (byte-identical); EXISTS/IN-family queries
+                  converge to identical trees on the stats-less bench server;
+                  scalar-family queries take the legacy order by eligibility
+      pgbench-hook: PASS (see commit)
+- commit: _(filled by R2-6)_
