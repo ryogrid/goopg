@@ -315,18 +315,23 @@ func tryBuildNLI(j *Join, cat catalog.Catalog) (*NestedLoopIndexJoin, bool) {
 	// and the canonical Q13 LEFT-join shape (`orders` behind a
 	// NOT-LIKE Filter) is this repo's most expensive historical
 	// silent-regression tripwire. The hash path keeps serving it.
-	// Semi/Anti ONLY — an INNER join was included at first and regressed
-	// TPC-H Q9 (115 s → DNF at 300 s): its `part` scan with a `%green%`
-	// LIKE arrives as Filter{SeqScan}, and unwrapping it turned a
-	// hash-side build into ~6 M per-row index probes with the LIKE
-	// evaluated per probe. Semi/Anti have no such exposure (their outer
-	// is the small side by construction of the unnest rewrite), and are
-	// the shapes this path exists for. An INNER Filter-inner unwrap needs
-	// a real cost comparison first (bundle D6.3).
+	// Semi/Anti unwrap unconditionally; INNER behind a cost check
+	// (D6.3b). The first cut included INNER unconditionally and
+	// regressed TPC-H Q9 (115 s → DNF at 300 s): its `part` scan with a
+	// `%green%` LIKE arrives as Filter{SeqScan}, and unwrapping it
+	// turned a hash-side build into ~6 M per-row index probes with the
+	// LIKE evaluated per probe. Semi/Anti have no such exposure (their
+	// outer is the small side by construction of the unnest rewrite).
+	// For INNER the unwrap is tentative here and confirmed by
+	// `innerUnwrapCostAccepts` once the probe index is known — a
+	// decline returns through the deferred restore below, so the hash
+	// path keeps serving exactly as before.
 	committed := false
 	var hoistedInner []Expr
+	innerUnwrapped := false
+	var innerUnwrapResidualMult int64
 	if f, isF := j.Right.(*Filter); isF &&
-		(j.Type == JoinTypeSemi || j.Type == JoinTypeAnti) {
+		(j.Type == JoinTypeSemi || j.Type == JoinTypeAnti || j.Type == JoinTypeInner) {
 		if ss, isSS := f.Child.(*SeqScan); isSS && f.Predicate != nil && !f.LeafLocal {
 			shift := len(j.Left.Output())
 			okAll := true
@@ -349,6 +354,10 @@ func tryBuildNLI(j *Join, cat catalog.Catalog) (*NestedLoopIndexJoin, bool) {
 						j.Right = savedRight
 					}
 				}()
+				if j.Type == JoinTypeInner {
+					innerUnwrapped = true
+					innerUnwrapResidualMult = residualCostMultiplier(splitAnd(f.Predicate))
+				}
 			} else {
 				hoistedInner = nil
 			}
@@ -420,6 +429,11 @@ func tryBuildNLI(j *Join, cat catalog.Catalog) (*NestedLoopIndexJoin, bool) {
 		return nil, false
 	}
 	if !nliCostGateAccepts(j.Type, outerNode, innerScan, idx) {
+		return nil, false
+	}
+	if innerUnwrapped && !innerUnwrapCostAccepts(outerNode, innerScan, idx, innerUnwrapResidualMult) {
+		// The deferred restore above reverts the tentative unwrap;
+		// the join stays on the hash path.
 		return nil, false
 	}
 	// M0063-0001: skip NLI when the outer is an isolated-scope
@@ -1251,6 +1265,71 @@ func nliCostGateAccepts(joinType JoinType, outer Node, innerScan *SeqScan, idx *
 	if os.Getenv("GOOPG_NLI_COSTGATE_DEBUG") == "1" {
 		fmt.Fprintf(os.Stderr, "nli-costgate: type=%v outer=%T outerRows=%d innerRows=%d matchSet=%d statsKnown=%v accept=%v\n",
 			joinType, outer, outerRows, innerRows, matchSet, statsKnown, accept)
+	}
+	return accept
+}
+
+// residualCostMultiplier classifies the per-probe evaluation cost of the
+// Filter conjuncts an INNER unwrap would hoist onto the NLI. Pattern-match
+// predicates (LIKE family, regex family) and function calls are an order
+// of magnitude more expensive per evaluation than plain comparisons — the
+// Q9 killer was exactly a `%green%` LIKE evaluated ~6 M times — so their
+// presence surcharges the probe cost in innerUnwrapCostAccepts.
+func residualCostMultiplier(conjuncts []Expr) int64 {
+	expensive := false
+	for _, c := range conjuncts {
+		WalkExprTree(c, func(e Expr) {
+			switch x := e.(type) {
+			case *BinaryOp:
+				switch x.Op {
+				case parser.OpLike, parser.OpNotLike, parser.OpILike, parser.OpNotILike,
+					parser.OpRegexMatch, parser.OpRegexIMatch, parser.OpRegexNoMatch, parser.OpRegexINoMatch:
+					expensive = true
+				}
+			case *FuncCall:
+				expensive = true
+			}
+		})
+	}
+	if expensive {
+		return 8
+	}
+	return 1
+}
+
+// innerUnwrapCostAccepts confirms a tentative INNER Filter{SeqScan}-inner
+// unwrap once the probe index is known (D6.3b, resolving the csq-S2/S3
+// ledger row about the Q9 71× regression).
+//
+//	matchSet  = max(1, innerRows / NDistinct(probe column))
+//	accept  ⇔ outerRows × (matchSet + residualMult) < innerRows + outerRows
+//
+// The right-hand side is the hash alternative (one build pass over the
+// inner plus O(1) probes); residualMult surcharges pattern-match/function
+// residuals per residualCostMultiplier.
+//
+// No usable stats → DECLINE — deliberately the OPPOSITE default from
+// nliCostGateAccepts' semi/anti rule (optimistic accept), and both are
+// argued from the same fact: goopg's ANALYZE statistics are in-memory and
+// restart-lost, so no-stats is the COMMON case. For semi/anti, rejecting
+// without stats would permanently disable a shape whose measured upside is
+// large (Q4: NLI 3.5 s vs hash 276 s) — so unknown accepts. For the INNER
+// unwrap the asymmetry runs the other way: declining just keeps today's
+// hash behavior (Q9 runs fine at ~104–118 s), while a wrong accept is the
+// catastrophic direction (Q9 → DNF). Status quo is the safe default on
+// unknown stats, so unknown declines.
+func innerUnwrapCostAccepts(outer Node, innerScan *SeqScan, idx *catalog.Index, residualMult int64) bool {
+	outerRows := EstimateRows(outer)
+	var innerRows, matchSet int64
+	if innerScan != nil && innerScan.Table != nil {
+		innerRows = tableRows(innerScan.Table)
+		matchSet = matchSetByColumnName(innerScan.Table, firstIndexColumn(idx))
+	}
+	statsKnown := outerRows > 0 && innerRows > 0 && matchSet > 0
+	accept := statsKnown && outerRows*(matchSet+residualMult) < innerRows+outerRows
+	if os.Getenv("GOOPG_NLI_COSTGATE_DEBUG") == "1" {
+		fmt.Fprintf(os.Stderr, "nli-costgate: inner-unwrap outer=%T outerRows=%d innerRows=%d matchSet=%d residualMult=%d statsKnown=%v accept=%v\n",
+			outer, outerRows, innerRows, matchSet, residualMult, statsKnown, accept)
 	}
 	return accept
 }

@@ -709,9 +709,9 @@ was `distinctOp.Open` (the `Unique` node), not the NL join.
 | R2-1 | S4a: D3.2 residual lifting (IN/scalar) + NL semi/anti + tautology strip | | [x] `55ad7fdb` |
 | R2-2 | S4b: D3.3 nested-sublink tolerance (deep walk + clone fix) | | [x] `712827cc` |
 | R2-3 | D6.3a: subplan cost helper + NLI semi/anti cost gate | | [x] `b35714b7` |
-| R2-4 | S5a: unnest before join search (semi/anti pinned) | | [x] (this commit) |
+| R2-4 | S5a: unnest before join search (semi/anti pinned) | | [x] `a607cf2b` |
 | R2-5 | S5b | **deferred** (ledger row in R2-4) | — |
-| R2-6 | D6.3b: INNER Filter-inner NLI unwrap, cost-gated | | [ ] |
+| R2-6 | D6.3b: INNER Filter-inner NLI unwrap, cost-gated | | [x] (this commit) |
 | R2-7 | S7: Memoize | | [ ] |
 | R2-8 | FINAL: sweep + report | | [ ] |
 
@@ -889,4 +889,31 @@ was `distinctOp.Open` (the `Unique` node), not the NL join.
                   converge to identical trees on the stats-less bench server;
                   scalar-family queries take the legacy order by eligibility
       pgbench-hook: PASS (see commit)
-- commit: _(filled by R2-6)_
+- commit: `a607cf2b`
+
+## R2-6 — D6.3b: cost-gated INNER Filter-inner NLI unwrap  [x]
+
+- [x] the S6 unwrap accepts `JoinTypeInner` tentatively, confirmed after index
+      resolution by `innerUnwrapCostAccepts`: accept ⇔ `outerRows × (matchSet +
+      residualMult) < innerRows + outerRows`; residualMult ×8 when any hoisted
+      conjunct carries LIKE/regex/FuncCall (the Q9 killer class), ×1 plain; decline
+      restores `j.Right` to the Filter (hash path serves as before). LEFT excluded.
+- [x] **no stats → DECLINE** — deliberately asymmetric with R2-3's optimistic
+      semi/anti default; both argued side by side in the code from the same fact
+      (ANALYZE stats are in-memory/restart-lost): semi/anti rejection would disable
+      a 71×-upside shape, INNER decline keeps today's healthy hash (a wrong accept
+      is the DNF direction)
+- [x] `estimateSubplanCostPerCall` found no natural consumer here (direct helpers
+      express the decision exactly); remains for future D6.3 consumers
+- [x] 7 new tests incl. the side-by-side no-stats asymmetry pin and j.Right
+      restoration on decline; discovery: reaching the unwrap through Plan() is
+      pass-order dependent (Q15b Filter-promotion path bypasses it on simple
+      shapes), so the pins construct the join directly — documented in the test file
+- [x] resolves the `csq-S2/S3` INNER-unwrap deferral-ledger row (flipped resolved)
+- gates:
+      units:      PASS (2026-07-21) · spotcheck PASS (Q12=2 / Q13=33)
+      plan-gate:  22/22 MATCH (no persisted stats on the bench server ⇒ every INNER
+                  unwrap declines ⇒ shapes unchanged)
+      Q9 tripwire: **90.52 s / 175 rows** — unchanged-to-better vs the 104–118 s band
+      pgbench-hook: PASS (see commit)
+- commit: _(filled by R2-7)_
