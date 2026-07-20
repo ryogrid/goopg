@@ -1,6 +1,315 @@
 package planner
 
-import "github.com/goopg/goopg/internal/parser"
+import (
+	"strings"
+	"sync/atomic"
+
+	"github.com/goopg/goopg/internal/parser"
+)
+
+// subqueryUnnestOn is the package-level kill-switch for the whole
+// sublink pull-up pass. Initialised to "on" (1), i.e. current
+// behaviour. Two consumers:
+//
+//   - the rollback path for the S1 decorrelation work (design bundle
+//     docs/design/correlated-subquery-planning, phase S1): flipping it
+//     off restores the SubPlan-only plans, which the S2 execution
+//     engine keeps fast, so neither setting carries a correctness risk;
+//   - the semantics matrix (ch.07 V1), which runs every case twice —
+//     once decorrelated and once through the SubPlan path — because the
+//     count-bug and NULL rows are exactly where the transformed and
+//     untransformed plans can silently diverge.
+//
+// Unlike `enable_nestloop_index` this has no GUC yet; see
+// SetSubqueryUnnestEnabled.
+var subqueryUnnestOn atomic.Bool
+
+func init() {
+	subqueryUnnestOn.Store(true)
+}
+
+// SetSubqueryUnnestEnabled flips the sublink pull-up pass on or off.
+// Test-only API, mirroring SetNLIEnabled: there is deliberately no
+// `enable_subquery_unnest` GUC, because unlike a plan-shape toggle this
+// switch also changes which correctness bugs are reachable, and a SQL
+// surface would invite it into production configs.
+func SetSubqueryUnnestEnabled(on bool) {
+	subqueryUnnestOn.Store(on)
+}
+
+// subqueryUnnestEnabled reports whether the pull-up pass should run.
+func subqueryUnnestEnabled() bool { return subqueryUnnestOn.Load() }
+
+// --- S1a pull-up guards -----------------------------------------------
+//
+// Design bundle docs/design/correlated-subquery-planning §2.5 of
+// 03-planner-decorrelation-extensions.md. Every helper below answers the
+// same question the pull-up gates historically forgot to ask: *what* is
+// being pulled up, and *where does it sit* in the predicate. Each one is
+// a bail — the SubPlan path already produces PostgreSQL's answer for the
+// shapes they reject, so refusing to decorrelate is always safe.
+
+// inExprTopConjunct locates the top-level conjunct of filter.Predicate
+// that the given InExpr occupies, and reports whether the pull-up may
+// proceed at all.
+//
+// The sublink qualifies only when it *is* a top-level conjunct, or is the
+// operand of a single `NOT` wrapping a top-level conjunct — mirroring the
+// EXISTS gate in unnestExistsExpr. The second form flips the join to its
+// dual (negateFlip), exactly the way that gate flips `negated`.
+//
+// Why this is load-bearing: findFilterContainingInExpr matches the InExpr
+// *anywhere* in the predicate (findExprInExpr descends through OR and NOT),
+// while the callers' conjunct removal only ever matches top-level
+// conjuncts. For a sublink buried under OR/NOT the join was installed but
+// the predicate never shrank, so the driver loop re-found the same node and
+// wrapped another join every iteration — an unbounded planning loop.
+// Pulling the sublink out of an OR is also semantically wrong (a semi/anti
+// join applies it unconditionally, losing the other arm), so the fix is to
+// bail rather than to remove the conjunct more cleverly.
+func inExprTopConjunct(filter *Filter, in *InExpr) (topConjunct Expr, negateFlip bool, ok bool) {
+	var target Expr = in
+	for _, c := range splitAnd(filter.Predicate) {
+		if c == target {
+			return c, false, true
+		}
+		if u, isNot := c.(*UnaryOp); isNot && u.Op == parser.OpNot && u.Operand == target {
+			return c, true, true
+		}
+	}
+	return nil, false, false
+}
+
+// inExprIsPlainEquality reports whether in is the plain equality sublink
+// form — `x IN (SELECT …)`, `x NOT IN (SELECT …)`, or `x = ANY (SELECT …)`.
+//
+// Only that form may become a semi/anti join here, because the rewrite
+// hardcodes an OpEq join predicate. The parser encodes the other
+// quantified comparisons differently (internal/parser/select.go):
+//
+//	x <> ALL (…) / x < ALL (…) / x > ANY (…) → AnyOp set, AllOp per quantifier
+//	x != ANY (…)                             → NotEqualAny (an OR of !=)
+//	x = ALL (…)                              → NOT(InExpr{NotEqualAny})
+//
+// Rewriting any of those with an equality join silently returns a
+// different result set — `<> ALL` became a semi join, i.e. the exact
+// complement of the correct answer. Upstream is stricter still: its
+// pull-up handles ANY and EXISTS sublinks only, never ALL
+// (pull_up_sublinks_qual_recurse, src/backend/optimizer/prep/prepjointree.c).
+//
+// Follow-up: `x <> ALL (…)` is equivalent to `x NOT IN (…)` and could be
+// routed to the existing NullAware anti-join path instead of bailing.
+// Deliberately not attempted here — correctness first.
+func inExprIsPlainEquality(in *InExpr) bool {
+	return in.AnyOp == parser.OpUnknown && !in.AllOp && !in.NotEqualAny
+}
+
+// subqueryANDReachable reports whether target is reachable from conjunct
+// through AND-transparent expression nodes only: comparisons, arithmetic,
+// nested ANDs and casts. An OR, NOT, CASE or function call on the path
+// means the scalar sublink is not unconditionally applied to every row.
+//
+// The scalar rewrite replaces the sublink with a column of a GROUP BY
+// aggregate joined with an INNER join, so an outer row whose correlation
+// group is empty disappears from the result *before* the surrounding
+// expression is evaluated. Under a top-level conjunct that is the correct
+// outcome (the comparison would have been NULL, hence false). Under an OR
+// it is not: the other arm never gets its chance, which is how
+// `a = 2 OR b > (SELECT sum(…) …)` lost the `a = 2` rows.
+func subqueryANDReachable(conjunct Expr, target *SubqueryExpr) bool {
+	if conjunct == nil {
+		return false
+	}
+	if conjunct == Expr(target) {
+		return true
+	}
+	switch x := conjunct.(type) {
+	case *BinaryOp:
+		if x.Op == parser.OpOr {
+			return false
+		}
+		return subqueryANDReachable(x.Left, target) || subqueryANDReachable(x.Right, target)
+	case *CastExpr:
+		return subqueryANDReachable(x.Operand, target)
+	}
+	return false
+}
+
+// nullOnEmptyAggregates lists the aggregates whose value over zero input
+// rows is NULL. Only these may drive the scalar INNER-join rewrite: the
+// rewrite drops outer rows with an empty correlation group, which matches
+// PostgreSQL only when the subquery would have returned NULL for them (a
+// NULL comparison filters the row anyway).
+//
+// count() is the counterexample that made this a live bug: it returns 0,
+// so `x > (SELECT count(c) …)` must *keep* unmatched outer rows. The
+// `count(*)` spelling was already rejected by the Star check, which is
+// precisely why the bug hid — the obvious probe is the one spelling that
+// happens to be correct.
+var nullOnEmptyAggregates = map[string]bool{
+	"min": true,
+	"max": true,
+	"avg": true,
+	"sum": true,
+}
+
+// nullPreservingScalarTarget reports whether e yields NULL whenever the
+// aggregate result it is built from is NULL.
+//
+// The scalar subquery's Project wrapper can convert the aggregate's NULL
+// into a non-NULL value, which reintroduces the count-bug even for a
+// whitelisted aggregate: `COALESCE(sum(b), 0)` returns 0 over an empty
+// group, so unmatched outer rows must survive — but the INNER join drops
+// them. Arithmetic stays strict (`0.5 * sum` is NULL when sum is), which
+// is what TPC-H Q20 relies on; function calls and CASE do not.
+func nullPreservingScalarTarget(e Expr) bool {
+	switch x := e.(type) {
+	case *ColumnRef:
+		return true
+	case *IntegerConst, *NumericConst, *StringConst, *BooleanConst, *NullConst:
+		return true
+	case *CastExpr:
+		return nullPreservingScalarTarget(x.Operand)
+	case *UnaryOp:
+		return nullPreservingScalarTarget(x.Operand)
+	case *BinaryOp:
+		// AND/OR are not strict: `false AND NULL` is false.
+		if x.Op == parser.OpAnd || x.Op == parser.OpOr {
+			return false
+		}
+		return nullPreservingScalarTarget(x.Left) && nullPreservingScalarTarget(x.Right)
+	}
+	return false
+}
+
+// existsBodySafeForPullup mirrors the refusal conditions of upstream's
+// simplify_EXISTS_query (src/backend/optimizer/plan/subselect.c), which
+// gates convert_EXISTS_sublink_to_join.
+//
+// EXISTS asks only whether the body yields at least one row, so upstream
+// discards the target list, GROUP BY, DISTINCT and ORDER BY — none of them
+// can turn zero rows into some rows or vice versa — but refuses outright
+// when the body has aggregates, HAVING or OFFSET, and accepts LIMIT only
+// when it is a positive constant (which it then drops).
+//
+// Two of those refusals were live wrong-results bugs here:
+//
+//   - an ungrouped aggregate body is a *tautology* (the aggregate always
+//     produces exactly one row) so the EXISTS is always true; building a
+//     semi join on the aggregate's output turned it into a selective filter;
+//   - a LIMIT inside the body survived the pull-up and became a *global*
+//     limit on the semi-join build side, so only one correlation key could
+//     ever match.
+//
+// goopg is stricter than upstream on one point: any *Aggregate on the
+// body's own spine is refused, including a GROUP BY with no aggregate
+// calls, which upstream would simplify away. Grouping rewrites the body's
+// output schema, and the join key is bound by name against that schema, so
+// allowing it would need key-rebinding work that buys nothing measurable.
+// *Distinct is refused for the same reason (it is also absent from
+// clonePlanReplacingOuter, so it could not be pulled up regardless).
+//
+// Only the body's *own* query level is inspected: the walk stops at the
+// first join or scan. An Aggregate or Limit below that belongs to a
+// derived table in the body's FROM — a separate query level, which
+// upstream's per-Query hasAggs/limitCount flags likewise ignore — and its
+// clauses stay meaningful after the pull-up.
+func existsBodySafeForPullup(node Node) bool {
+	switch n := node.(type) {
+	case nil:
+		return true
+	case *Aggregate:
+		return false
+	case *Distinct:
+		return false
+	case *Limit:
+		// OFFSET changes which rows survive, so it can turn a
+		// non-empty body empty: never strippable.
+		if n.Offset != nil {
+			return false
+		}
+		if !isPositiveConstLimit(n.Limit) {
+			return false
+		}
+		return existsBodySafeForPullup(n.Child)
+	case *Filter:
+		return existsBodySafeForPullup(n.Child)
+	case *Project:
+		return existsBodySafeForPullup(n.Child)
+	case *Sort:
+		return existsBodySafeForPullup(n.Child)
+	}
+	// A join, a scan, or any other node ends the body's own spine.
+	return true
+}
+
+// isPositiveConstLimit reports whether e is a constant row count greater
+// than zero. `LIMIT 0` makes EXISTS unconditionally false and must never
+// be dropped; a non-constant limit cannot be reasoned about at plan time.
+func isPositiveConstLimit(e Expr) bool {
+	for {
+		c, ok := e.(*CastExpr)
+		if !ok {
+			break
+		}
+		e = c.Operand
+	}
+	lit, ok := e.(*IntegerConst)
+	return ok && lit.Value > 0
+}
+
+// stripPositiveConstLimits removes the Limit nodes that
+// existsBodySafeForPullup accepted, mirroring simplify_EXISTS_query's
+// "we can drop the LIMIT" step. Only reachable for bodies that already
+// passed that gate, so every Limit on the spine here is strippable.
+//
+// The walk mirrors existsBodySafeForPullup's and stops at the first join
+// or scan: a Limit inside a derived table belongs to that subquery's own
+// definition and must be preserved.
+func stripPositiveConstLimits(node Node) Node {
+	switch n := node.(type) {
+	case *Limit:
+		child := stripPositiveConstLimits(n.Child)
+		if n.Offset == nil && isPositiveConstLimit(n.Limit) {
+			return child
+		}
+		n.Child = child
+		return n
+	case *Filter:
+		n.Child = stripPositiveConstLimits(n.Child)
+	case *Project:
+		n.Child = stripPositiveConstLimits(n.Child)
+	case *Sort:
+		n.Child = stripPositiveConstLimits(n.Child)
+	}
+	return node
+}
+
+// countSublinksInExpr counts the pull-up candidates present in a predicate:
+// IN / EXISTS / scalar sublinks that still carry an inner plan. Nested
+// sublinks inside another sublink's plan are not counted — walkExprTree
+// does not descend into Plan — which is what the driver loops want, since
+// they only ever rewrite sublinks at this level.
+func countSublinksInExpr(e Expr) int {
+	n := 0
+	walkExprTree(e, func(x Expr) {
+		switch t := x.(type) {
+		case *InExpr:
+			if t.Plan != nil {
+				n++
+			}
+		case *ExistsExpr:
+			if t.Plan != nil {
+				n++
+			}
+		case *SubqueryExpr:
+			if t.Plan != nil {
+				n++
+			}
+		}
+	})
+	return n
+}
 
 // unnestSubqueriesInPlan walks the plan tree and attempts to
 // unnest any SubqueryExpr found in Filter predicates. This is
@@ -10,10 +319,21 @@ func unnestSubqueriesInPlan(node Node) Node {
 	if node == nil {
 		return nil
 	}
+	if !subqueryUnnestEnabled() {
+		return node
+	}
 	switch n := node.(type) {
 	case *Filter:
 		n.Child = unnestSubqueriesInPlan(n.Child)
+		// Each loop below rewrites one sublink per iteration and relies
+		// on the rewrite removing (or substituting) that sublink from the
+		// predicate to make progress. The `remaining >= before` break is a
+		// permanent belt: it converts any future mismatch between "where
+		// the sublink was found" and "which conjunct got removed" from an
+		// unbounded planning loop into a correct — merely unoptimised —
+		// plan, because whatever is left simply stays a SubPlan.
 		for {
+			before := countSublinksInExpr(n.Predicate)
 			sub := findSubqueryInExpr(n.Predicate)
 			if sub == nil {
 				break
@@ -23,14 +343,18 @@ func unnestSubqueriesInPlan(node Node) Node {
 				break
 			}
 			node = newOuter
-			if f, ok := newOuter.(*Filter); ok {
-				n = f
-			} else {
+			f, ok := newOuter.(*Filter)
+			if !ok {
 				return newOuter
+			}
+			n = f
+			if countSublinksInExpr(n.Predicate) >= before {
+				break
 			}
 		}
 		// M0040-0002: also try to unnest IN (subquery) expressions
 		for {
+			before := countSublinksInExpr(n.Predicate)
 			in := findInExprInExpr(n.Predicate)
 			if in == nil {
 				break
@@ -40,16 +364,20 @@ func unnestSubqueriesInPlan(node Node) Node {
 				break
 			}
 			node = newOuter
-			if f, ok := newOuter.(*Filter); ok {
-				n = f
-			} else {
+			f, ok := newOuter.(*Filter)
+			if !ok {
 				return newOuter
+			}
+			n = f
+			if countSublinksInExpr(n.Predicate) >= before {
+				break
 			}
 		}
 		// M0061-0001: EXISTS / NOT EXISTS → semi-join / anti-join.
 		// Same shape as the IN loop above; runs after IN-unnesting so
 		// any IN inside an EXISTS subquery has already been pulled up.
 		for {
+			before := countSublinksInExpr(n.Predicate)
 			ex := findExistsExprInExpr(n.Predicate)
 			if ex == nil {
 				break
@@ -59,10 +387,13 @@ func unnestSubqueriesInPlan(node Node) Node {
 				break
 			}
 			node = newOuter
-			if f, ok := newOuter.(*Filter); ok {
-				n = f
-			} else {
+			f, ok := newOuter.(*Filter)
+			if !ok {
 				return newOuter
+			}
+			n = f
+			if countSublinksInExpr(n.Predicate) >= before {
+				break
 			}
 		}
 		// M0040-0004: walk remaining SubqueryExpr/InExpr inner plans
@@ -191,6 +522,22 @@ func canUnnestSubquery(sub *SubqueryExpr) bool {
 	call := agg.Aggs[0]
 	if call.Star || call.Distinct {
 		return false
+	}
+	// S1a guard: the rewrite drops outer rows whose correlation group is
+	// empty, which only matches PostgreSQL when the subquery's value over
+	// zero rows is NULL — see nullOnEmptyAggregates.
+	if !nullOnEmptyAggregates[strings.ToLower(call.Name)] {
+		return false
+	}
+	// ... and when the target list does not convert that NULL back into a
+	// value the outer comparison can succeed on (nullPreservingScalarTarget).
+	if proj, hasProj := sub.Plan.(*Project); hasProj {
+		if len(proj.Targets) != 1 {
+			return false
+		}
+		if !nullPreservingScalarTarget(proj.Targets[0]) {
+			return false
+		}
 	}
 	params := collectUnnestParams(agg)
 	if params == nil {
@@ -969,6 +1316,13 @@ func unnestSubquery(sub *SubqueryExpr, outer Node) (Node, error) {
 	if filter == nil {
 		return nil, nil
 	}
+	// S1a guard: refuse when the sublink is not unconditionally applied to
+	// every row of the conjunct (OR / NOT / CASE / function argument). The
+	// INNER-join rewrite would drop empty-group rows before the rest of the
+	// expression ever ran. See subqueryANDReachable.
+	if !subqueryANDReachable(conjunct, sub) {
+		return nil, nil
+	}
 	outerChild := filter.Child
 	outerWidth := len(outerChild.Output())
 	aggColRef := &ColumnRef{
@@ -1201,6 +1555,12 @@ func canUnnestInExprDepth(in *InExpr, depth int) bool {
 	if plan == nil {
 		return false
 	}
+	// S1a guard: the rewrite hardcodes an equality join predicate, so only
+	// the plain IN / NOT IN / `= ANY` form may be pulled up. See
+	// inExprIsPlainEquality.
+	if !inExprIsPlainEquality(in) {
+		return false
+	}
 	// M0069-0005: non-correlated IN — the inner plan has zero
 	// OuterColumnRefs and the outer key is the IN's left operand
 	// (`x IN (SELECT y FROM ...)` becomes a SemiJoin on x = y).
@@ -1323,10 +1683,18 @@ func unnestInExpr(in *InExpr, outer Node) (Node, error) {
 	innerPlan = unnestSubqueriesInPlan(innerPlan)
 
 	// Find the Filter that wraps the outer node.
-	filter, conjunct := findFilterContainingInExpr(outer, in)
+	filter, _ := findFilterContainingInExpr(outer, in)
 	if filter == nil {
 		return nil, nil
 	}
+	// S1a guard: the sublink must occupy a top-level conjunct (optionally
+	// under a single NOT, which flips the join to its dual). Anything else
+	// stays a SubPlan — see inExprTopConjunct.
+	conjunct, negateFlip, topOK := inExprTopConjunct(filter, in)
+	if !topOK {
+		return nil, nil
+	}
+	effNegated := in.Negated != negateFlip
 
 	outerChild := filter.Child
 	outerWidth := len(outerChild.Output())
@@ -1386,7 +1754,7 @@ func unnestInExpr(in *InExpr, outer Node) (Node, error) {
 
 	semiPred := &BinaryOp{pos: in.Pos(), Op: parser.OpEq, Left: outerKey, Right: innerKey}
 	joinType := JoinTypeSemi
-	if in.Negated {
+	if effNegated {
 		joinType = JoinTypeAnti
 	}
 	_ = innerWidth
@@ -1456,10 +1824,17 @@ func unnestNonCorrelatedInExpr(in *InExpr, outer Node) (Node, error) {
 		Type:  innerOut[0].Type,
 	}
 
-	filter, conjunct := findFilterContainingInExpr(outer, in)
+	filter, _ := findFilterContainingInExpr(outer, in)
 	if filter == nil {
 		return nil, nil
 	}
+	// S1a guard: same top-level-conjunct requirement as the correlated
+	// path — see inExprTopConjunct.
+	conjunct, negateFlip, topOK := inExprTopConjunct(filter, in)
+	if !topOK {
+		return nil, nil
+	}
+	effNegated := in.Negated != negateFlip
 
 	outerChild := filter.Child
 	outerWidth := len(outerChild.Output())
@@ -1514,7 +1889,7 @@ func unnestNonCorrelatedInExpr(in *InExpr, outer Node) (Node, error) {
 	semiPred := &BinaryOp{pos: in.Pos(), Op: parser.OpEq, Left: outerKey, Right: innerKey}
 	_ = innerWidth
 	joinType := JoinTypeSemi
-	if in.Negated {
+	if effNegated {
 		joinType = JoinTypeAnti
 	}
 	join := &Join{
@@ -1526,7 +1901,7 @@ func unnestNonCorrelatedInExpr(in *InExpr, outer Node) (Node, error) {
 		Predicate: semiPred,
 		LeftKey:   outerKey,
 		RightKey:  innerKey,
-		NullAware: in.Negated,
+		NullAware: effNegated,
 		schema:    append(Schema(nil), outerChild.Output()...),
 	}
 	filter.Child = join
@@ -1929,6 +2304,12 @@ func canUnnestExistsExpr(ex *ExistsExpr) bool {
 	if ex.IsNonCorrelated {
 		return false
 	}
+	// S1a guard: EXISTS asks only "any rows?", but the body can carry
+	// clauses whose meaning does not survive being turned into a
+	// semi/anti-join build side — see existsBodySafeForPullup.
+	if !existsBodySafeForPullup(plan) {
+		return false
+	}
 	eup := collectExistsUnnestParamsAndResiduals(plan)
 	if eup == nil || len(eup.Params) == 0 {
 		// Need at least one equijoin to drive the hash join.
@@ -2042,6 +2423,11 @@ func unnestExistsExpr(ex *ExistsExpr, outer Node) (Node, error) {
 	// be removed for plan tidiness AND so M0063-0004's NLI rewrite
 	// can see a bare SeqScan beneath.
 	stripOuterRefConjuncts(innerPlan)
+	// S1a guard: drop the LIMIT that existsBodySafeForPullup accepted.
+	// Left in place it would cap the whole semi-join build side rather
+	// than each correlation group, so only one key could ever match —
+	// mirrors simplify_EXISTS_query's "we can drop the LIMIT" step.
+	innerPlan = stripPositiveConstLimits(innerPlan)
 	innerPlan = unnestSubqueriesInPlan(innerPlan)
 	// M0063-0004: simplify trivial wrappers so M0054-0006 NLI can
 	// recognise the inner side as a *SeqScan in `pickInnerSide`.

@@ -155,12 +155,15 @@ contain no `<*planner.ExistsExpr>` / correlated `<*planner.SubqueryExpr>`
 filter strings (Q21's dual-EXISTS may additionally need D3.3 — the
 instrumentation will say).
 
-### 2.5 S1-blocking guards (live bugs measured 2026-07-20)
+### 2.5 S1-blocking guards (live bugs measured 2026-07-20 and 2026-07-21)
 
-Three guards fix behavior reachable **today** on index-less shapes
-([evidence/review-probes-20260720.md](evidence/review-probes-20260720.md)
-§§1–3) and are the *first* S1 deliverable, before the §2.4 collector fix
-widens exposure:
+**Six** guards fix behavior reachable **today** on index-less shapes and are the
+*first* S1 deliverable, before the §2.4 collector fix widens exposure. Guards 1–3
+come from the review probes
+([evidence/review-probes-20260720.md](evidence/review-probes-20260720.md) §§1–3);
+guards 4–6 were found by the V1 semantics matrix built in phase S0
+(`internal/executor/subquery_semantics_test.go`, [measured-at-HEAD a91d2a8d]) and
+were **not predicted by this bundle** — see the note after the list.
 
 1. **IN-loop top-conjunct bail** — mirror the EXISTS gate: before rewriting,
    `unnestInExpr`/`unnestNonCorrelatedInExpr` must require the found `InExpr`
@@ -185,7 +188,39 @@ widens exposure:
 3. **NULL-on-empty aggregate whitelist** — see D3.4 (§7): only aggregates
    that return NULL on empty input (MIN/MAX/AVG/SUM) may decorrelate through
    the INNER-join rewrite; `count(col)` currently passes the gate and returns
-   wrong results (probes §2).
+   wrong results (probes §2). Note `Star` already bails `count(*)`, which is
+   why the bug hid: the obvious probe is the one spelling that is correct.
+4. **ALL-form sublinks must not become semi joins.** `x <> ALL (subquery)`
+   currently unnests to `JoinTypeSemi`, returning the exact **complement** of
+   the correct answer (`{1}` where PG returns `{2,3}`). Upstream never pulls up
+   ALL sublinks at all — `pull_up_sublinks_qual_recurse` handles ANY and
+   EXISTS only. Minimum correct fix: bail on the ALL form (`InExpr.AllOp` /
+   `NotEqualAny`) and let the SubPlan path serve it, which already returns PG's
+   answer. Optional improvement, since `<> ALL` ≡ `NOT IN`: route it to the
+   existing NullAware anti-join path (M0122-0011) rather than bailing — but
+   only if the NULL algebra is proven identical by the M10 matrix rows.
+5. **EXISTS bodies with `LIMIT`/`OFFSET`.** A `LIMIT` inside the body survives
+   pull-up and becomes a **global** limit on the semi-join build side, so only
+   one correlation key can ever match (`{1}` vs PG `{1,3}`). Upstream's
+   `simplify_EXISTS_query`
+   (`postgres/src/backend/optimizer/prep/prepjointree.c`) is the template: it
+   *removes* a provably-positive constant LIMIT (existence is unaffected by a
+   row cap ≥ 1) and refuses the pull-up otherwise. `LIMIT 0` must never be
+   stripped — it makes EXISTS unconditionally false.
+6. **EXISTS bodies with aggregates / GROUP BY / HAVING.** An ungrouped
+   aggregate body is a **tautology** (the aggregate always returns exactly one
+   row), so `EXISTS(SELECT count(*) …)` is always true; goopg builds a semi
+   join on the aggregate's output and turns it into a selective filter (`{3}`
+   vs PG `{1,2,3,4}`). Same fix template: mirror `simplify_EXISTS_query`'s
+   refusal conditions rather than inventing a new list.
+
+> **Why these three were missed.** Guards 1–3 were found by probing the
+> *correlation* machinery; guards 4–6 are failures to inspect **what is being
+> pulled up** — the operator form (ALL vs ANY) and the subquery body (LIMIT,
+> aggregate). The bundle's own coverage matrix listed M12's body shapes as an
+> open question ("gates which bodies D3.0/S1 may unnest") and did not mention
+> ALL at all. The lesson for S4: every widening of the pull-up gates needs a
+> matching body/operator-form audit, not just a correlation audit.
 
 **Defensive belt** (cheap, permanent): assert in the driver loop that each
 iteration strictly decreases the number of sublink nodes in the Filter's

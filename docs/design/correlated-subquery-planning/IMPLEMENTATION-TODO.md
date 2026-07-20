@@ -135,9 +135,13 @@ non-correlated cache is healthy.
       skip is all Stage 4 needs to do)
 - [x] full 22-query SF1 baseline captured — see the table below
 - gates:
-      units:        _see Stage 4 record_ (matrix runs inside the units gate)
+      units:        PASS (2026-07-21, whole module — matrix runs inside the units gate)
+      plan-gate:    22/22 MATCH vs `csq-s0-explain` (knob defaults on; no plan change)
+      oracle-diff:  expectations pinned from PG 18.3 documented semantics; the live
+                    `pg-oracle-diff.sh` run over `testdata/subquery_semantics.sql` is
+                    folded into Stage 12's V5 sweep
       pgbench-hook: PASS (see commit)
-- commit: _(filled in by Stage 4)_
+- commit: shared with Stage 4 (see deviations log)
 
 ### Design change the matrix forced
 
@@ -236,18 +240,51 @@ untouched.
   control** (reverting the fix fails 5 of them).
 - gates: units PASS · spotcheck PASS (Q12=2 / Q13=33) · planner 278 tests green
 - write-up: [`analysis/nli-alias-and-residual-loss-20260721.md`](../../../analysis/nli-alias-and-residual-loss-20260721.md)
-- commit: _(filled in by the next stage)_
+- post-fix full sweep: row-count diff vs the Stage-3 baseline is **Q7 only**
+  (486 357 → 4); Q5/Q13/Q21 DNF unchanged — no collateral row-count movement
+- commit: `639c9e7a`
 
-## Stage 4 — S1a: live-bug guards  [ ]
+## Stage 4 — S1a: live-bug guards  [x]
 
-- [ ] F1 — IN pull-up top-conjunct gate + NOT-wrapper → Anti flip
-- [ ] F3 — scalar AND-reachability gate
-- [ ] F2 — NULL-on-empty aggregate whitelist (`min`/`max`/`avg`/`sum`)
-- [ ] driver-loop shrink assertion (belt)
-- [ ] planner tests for all three review-probe hang shapes + OR-scalar + `count(col)`
-- [ ] matrix rows M5 / M6 flip expected-fail → green
-- gates: units / spotcheck / plan-gate(empty) / pgbench-hook — _pending_
-- commit: _pending_
+Scope grew from three guards to **six** after the Stage-3 matrix found three
+unpredicted live bugs (see Stage 3's table and ch.03 §2.5, updated).
+
+- [x] guard 1 (F1) — IN pull-up top-conjunct gate; a single `NOT (…)` wrapper flips
+      to a NullAware Anti join (semantically = `NOT IN`) instead of bailing
+- [x] guard 2 (F3) — scalar AND-reachability gate (`subqueryANDReachable`)
+- [x] guard 3 (F2) — NULL-on-empty aggregate whitelist (`min`/`max`/`avg`/`sum`)
+      **plus** `nullPreservingScalarTarget`: the whitelist alone is insufficient
+      because `COALESCE(sum(b),0)` is non-NULL on empty groups and reintroduces the
+      count bug through the `Project` wrapper; arithmetic (`0.2*avg`) stays allowed
+- [x] guard 4 (new) — ALL-form sublinks (`AllOp`/`NotEqualAny`) bail: `<> ALL`
+      was unnesting to a **semi** join (exact complement). Routing to the anti-join
+      path is a recorded follow-up
+- [x] guard 5 (new) — EXISTS bodies with `LIMIT`/`OFFSET`: positive-constant LIMIT
+      stripped (`stripPositiveConstLimits`, existence unaffected), everything else
+      bails; `LIMIT 0` never stripped. Mirrors `simplify_EXISTS_query`
+      (`postgres/src/backend/optimizer/plan/subselect.c`)
+- [x] guard 6 (new) — EXISTS bodies with aggregates/DISTINCT bail (a tautological
+      aggregate body was becoming a selective semi-join filter). Both body checks
+      stop at the first join/scan so a derived table's own aggregates/LIMITs are
+      not misattributed to the body spine
+- [x] defensive belt: each driver-loop iteration must strictly decrease the
+      sublink count or the loop breaks (future find/remove mismatch → correct
+      unoptimised plan instead of an infinite planner loop)
+- [x] `internal/planner/unnest_guards_test.go` — 17 tests, each guard paired with a
+      must-still-unnest neighbour
+- [x] matrix flips: M5 ×2, M6 scalar-OR, M10, M12 ×2 now green on both paths;
+      the two F1 hang rows un-skipped and complete in milliseconds. M2 stays
+      pinned (executor bug — Stage 5)
+- [x] TPC-H shapes preserved: Q16 NOT-IN, Q2/Q17/Q20 scalars, Q4/Q21/Q22 EXISTS,
+      Q18 IN — all still unnest (43 pre-existing unnest tests green)
+- gates:
+      units:        PASS (2026-07-21, whole module, incl. matrix + guards)
+      spotcheck:    PASS (Q12=2 / Q13=33)
+      plan-gate:    22/22 MATCH vs `csq-s0-explain` (guards only restrict shapes
+                    TPC-H does not use)
+      full sweep:   row-count diff vs baseline = Q7 only (the NLI fix); see above
+      pgbench-hook: PASS (see commit)
+- commit: _(filled in by Stage 5)_
 
 ## Stage 5 — S1b: `NULL NOT IN (∅)` executor fix  [ ]
 
@@ -339,4 +376,6 @@ untouched.
 | 2026-07-20 | 1 | Join labels keep goopg's existing `Hash Join (SEMI)` convention rather than switching to PG's `Hash Semi Join` spelling — the latter would churn every TPC-H plan line and is orthogonal to this bundle. |
 | 2026-07-20 | 1 | `(x = ANY (SubPlan N))` renders the operand inline, where upstream prints the testexpr with `$N` PARAM_EXEC refs (`ruleutils.c` `get_sublink_expr`) and prefixes `hashed ` when the subplan uses a hash table. goopg has no param slots until Stage 8 and no hashed SubPlan until Stage 11; both converge there. |
 | 2026-07-20 | 1 | The pre-existing plan-gate baseline `plan_snapshots/m0077-final.txt` (M0077 era) diverges 22/22 from current output for reasons unrelated to this work — the EXPLAIN format itself evolved (cost column added, `Projection` wrappers folded, schema-qualified relation names). The gate was therefore effectively dead. Replaced with `csq-s0-explain.txt` as the live baseline; later stages diff against it. |
+| 2026-07-21 | 3+4 | **Stages 3 and 4 share one commit**, contrary to the one-commit-per-stage rule. Stage 4's guards were developed while Stage 3's matrix was still uncommitted (both touch `unnest.go` and the matrix file), so every gate in this window ran against the combined tree; splitting retroactively would have manufactured two intermediate states that were never gate-tested. The TODO keeps separate stage records. |
+| 2026-07-21 | 3 | The M6 hang rows were added as `t.Skip` entries rather than the capped-subprocess probe the plan sketched — the guard fix was one stage away, and a probe harness for a bug about to be fixed was not worth the complexity. Stage 4 removed the skips the same day. |
 | 2026-07-20 | 1 | `OuterColumnRef` still renders as a bare column name, so a correlated self-join subplan prints `Index Cond: (l_orderkey = l_orderkey)` — ambiguous but not wrong. Stage 8 (D4.1) replaces it with `$N`, which is both PG-faithful and unambiguous. Not patched separately to keep the stage diff minimal. |
