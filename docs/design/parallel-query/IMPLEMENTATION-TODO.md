@@ -25,7 +25,7 @@ degrading the smoke gate from 700 to 390 TPS and aborting a transaction.
 | P0 | GUC fidelity fixes | `UnitBlocks`, `min_parallel_*` units, `max_parallel_workers`, enum bool synonyms, cost ceilings | [x] (this commit) |
 | P1 | Session GUC plumbing | `session*` readers + typed context fields, both protocol paths | [x] (this commit) |
 | P2 | `HashAggregate` label correction | rename before `Partial `/`Finalize ` prefixes cement the misnomer | [x] (this commit) |
-| P3 | Concurrency substrate | worker contexts, per-worker arenas, `Perm()` mutex, error/panic/cancel, per-worker instrumenters | [ ] |
+| P3 | Concurrency substrate | worker contexts, per-worker arenas, `Perm()` mutex, error/panic/cancel | [x] (this commit) |
 | P4 | Parallel Seq Scan + Gather | shared block allocator, Gather operator; insertion still OFF | [ ] |
 | P5 | Partial / Finalize aggregation | `AggMode`, combine rules, whitelist refusals | [ ] |
 
@@ -196,4 +196,70 @@ returns 22/22 MATCH.
 - gates: units PASS; race-gate PASS (`internal/executor`); spotcheck PASS
   (Q12=2 / Q13=33); **plan-gate: intended 20-line label-only diff, reviewed
   and recaptured; 22/22 MATCH against the new baseline**
+- commit: _(this commit)_
+
+## P3 — Concurrency substrate  [x]
+
+Chapter 03's contracts, with **no parallel execution attached**. `race-gate` is
+the point of the stage.
+
+- [x] `NewWorkerContext` (`internal/executor/parallel_worker_ctx.go`) splits the
+      ~130-field `*Context` by field rather than introducing a type hierarchy.
+      The field list was **re-derived against `context.go`**, not copied from
+      the design — the struct is actively edited and a field added since would
+      have defaulted to *shared*, the dangerous direction.
+- [x] `ParamExec` / `ParamSet` / `ParamDirty` / `OuterRows` are **copied by
+      value**, not cloned empty. Empty clones are a correctness bug:
+      `ExecParamRef` raises `XX000 "SubPlan parameter $N read before
+      assignment"` on an unset slot, and the slots are bound by the *enclosing*
+      sublink before the inner plan runs. Copied rather than aliased because
+      `SetParamExec` grows them lazily and a shared backing array would race on
+      append. Pinned by test.
+- [x] Connection callbacks left nil, so a worker reaching one panics at the
+      call site instead of mutating session state off-goroutine. Consequence
+      recorded for P6: virtual catalog relations are backed by the `Pg*Rows`
+      callbacks, so the post-pass must refuse a Gather over them.
+- [x] `MaterializeForTransfer` / `AssertTransferable`
+      (`internal/executor/parallel_runtime.go`). The assertion checks
+      `ArenaID == 0 || ArenaID == PermContextID` on **every kind**, not just
+      string/bytes — `cloneRowOwned` promotes only those two, but big-mantissa
+      `KindNumeric` is arena-backed too and falls through with `ArenaID`
+      intact. Pinned by a test asserting `cloneRow` does **not** satisfy the
+      contract, since it is the obvious-looking helper that passes every
+      single-threaded test.
+- [x] **`mctx.Perm()` made safe for concurrent allocation.** Pre-existing
+      defect: the permanent arena is process-global with an unsynchronised bump
+      allocator, and `Bytes` reads the same slice `growChunk` appends to and
+      memmoves — so two concurrent *sessions* doing big-mantissa numeric
+      arithmetic already raced, independently of parallel query.
+      The lock lives at **package level**, not on `Context`: exactly one
+      context is ever shared, and `Context` is size-constrained to ≤96 B by
+      `TestContextSizeof` — an embedded `RWMutex` would cost 24 B on every
+      per-statement and per-expression context to protect one process-global
+      one. `RWMutex` because a permanent payload is written once and read many
+      times.
+      **Verified the test actually catches the bug**: temporarily disabling
+      the gate makes `-race` report DATA RACE immediately.
+- [x] `ParallelGroup` — first-error-wins box, per-worker `recover()` converting
+      a panic to `XX000` (a panic in a goroutine the server did not start would
+      otherwise kill the *process*; `serveConn`'s recover only covers the
+      connection goroutine), and child-context cancellation.
+
+**Design bug found by the stage's own test.** The first `Wait()` cancelled
+before joining. That let a worker blocked on `ctx.Done()` wake, report
+`context.Canceled`, and win the first-error race against a sibling's genuine
+failure — the caller would have seen "context canceled" instead of the error
+that actually failed the query. Cancellation is a *consequence* of failure
+here, not a peer of it. `Wait` now joins first and cancels after; callers
+terminating early call `Cancel` then `Wait`, which is the documented contract
+and is what the Gather operator will do in P4.
+
+- gates: units PASS; **race-gate PASS (46 packages)**; spotcheck PASS
+  (Q12=2 / Q13=33); plan-gate 22/22 MATCH
+- note: one race-gate run reported `TestReserveEmittedAndPublishConcurrentChainAndStripePublishConsistent`
+  (`internal/wal`) failing. Investigated rather than re-run away: the test
+  passes 5/5 in isolation and 3/3 for the whole package under `-race` both
+  with and without this change, and a second full race-gate run is green. It
+  touches no code this stage modifies. Recorded as load-dependent flakiness,
+  not attributed to this change and not dismissed.
 - commit: _(this commit)_
