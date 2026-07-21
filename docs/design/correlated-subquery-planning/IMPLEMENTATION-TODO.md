@@ -988,8 +988,8 @@ was `distinctOp.Open` (the `Unique` node), not the NL join.
 |---|---|---|---|
 | R3-0 | design chapter + this TODO part | docs only; agent-reviewed, review findings folded back in | [x] `3656dbda` (+ review amendments) |
 | R3-1 | item 4: NLI LEFT executor fix (2 defects) + pins | live wrong-results bug: NLI returned 1 of 4 rows vs hash's 4 | [x] `70792111` |
-| R3-3 | item 2: string-shape hazard fix + big-numeric widening | the other live hazard — ordered before R3-2 per review | [ ] |
-| R3-2 | item 1: zero-rows falsification + regression pins | World A confirmed on SF1 (1 375 096 = 1 375 096) | [ ] |
+| R3-3 | item 2: big-numeric hash-key fix (+ string hazard REFUTED) | found a live wrong-results bug in hash JOINS, not just the probe | [x] `d9cab218` |
+| R3-2 | item 1: zero-rows falsification + regression pins | World A confirmed on SF1 (1 375 096 = 1 375 096) | [x] (this commit) |
 | R3-4 | item 5: composite EXISTS/NOT EXISTS + M23–M27 | also writes the missing Project-strip guard | [ ] |
 | R3-5 | item 3: DML-sublink lowering | dedicated wrapper, NOT a walkPlanExprs extension | [ ] |
 | R3-6 | FINAL: gates + tripwire spotcheck + report + ledger resolutions | | [ ] |
@@ -1013,3 +1013,33 @@ was `distinctOp.Open` (the `Unique` node), not the NL join.
       D6.3b's `innerUnwrapCostAccepts` treatment to admit LEFT)
 - [x] gates: units PASS; race-gate PASS; spotcheck Q12=2/Q13=33 PASS;
       plan-gate 22/22 MATCH
+
+## R3-3 — big-numeric hash keys  [x] `d9cab218`
+
+- [x] escalation: the ledger's "widen the probe allowlist" was covering a live
+      wrong-results bug — `datumKey` is the key for equi-join build/probe sides
+      and grouping, and its KindNumeric arm read the lossy int64 accessor in the
+      big lane (mctx offset encoding, not the value). Measured 1 pair instead of
+      3 on a 3-row equi-join; `k = <big literal>` correct on the same rows
+- [x] `canonicalBigNumericKey` shares the int64 lane's normalisation and returns
+      to it when the stripped mantissa fits — the two lanes converge on one key,
+      so `hashFamNumeric` absorbs the big lane without splitting
+- [x] string-shape hazard REFUTED by measurement (compareEq's string arm is a
+      plain byte comparison; compareDatum's UUID/LSN/row/array normalisations are
+      ordering helpers the equality path never reaches) — design chapter records
+      the refutation; stale arena-string comments corrected
+- [x] gates: units PASS; race-gate PASS; spotcheck Q12=2/Q13=33; plan-gate 22/22
+
+## R3-2 — derived-table zero-rows: falsified at HEAD  [x]
+
+- [x] not reproducible: the ledger's exact query returns 1 375 096 on the capped
+      SF1 server, equal to the derived subquery's own count (bounded variant
+      238 = 238)
+- [x] hypothesised mechanism structurally impossible: the non-lateral NL path
+      drains both children exactly once before looping over the slices; no
+      per-outer re-Open. `distinctOp.Open` resets unconditionally (Stage-9/M12)
+- [x] permanent guards: `derived_table_join_rows_test.go` pins BOTH the ledger's
+      NL-over-Unique shape (still reachable index-free) and the index-driven NLI
+      shape SF1 takes today, so a regression cannot hide behind the planner
+      having moved on
+- [x] ledger row marked resolved (falsified-at-HEAD, with the evidence trail)
