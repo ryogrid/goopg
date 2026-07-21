@@ -696,7 +696,7 @@ was `distinctOp.Open` (the `Unique` node), not the NL join.
 
 | field | value |
 | --- | --- |
-| status | in-progress |
+| status | **complete** (S4 + S5a + full D6.3 + S7 + harness guard; S5b deferred w/ reopen criterion) |
 | started | 2026-07-21 |
 | branch | `planner-kaizen2` (base `a8233ac4`) |
 | scope | bundle phases S4, S5a, full D6.3, S7 + the throttle-trap harness guard. **S5b DEFERRED by user decision** (reopen criterion: post-S5a plan-compare shows a query slower AND differing from PG only by semi/anti placement) |
@@ -712,8 +712,8 @@ was `distinctOp.Open` (the `Unique` node), not the NL join.
 | R2-4 | S5a: unnest before join search (semi/anti pinned) | | [x] `a607cf2b` |
 | R2-5 | S5b | **deferred** (ledger row in R2-4) | — |
 | R2-6 | D6.3b: INNER Filter-inner NLI unwrap, cost-gated | | [x] `8d453246` |
-| R2-7 | S7: Memoize | | [x] (this commit) |
-| R2-8 | FINAL: sweep + report | | [ ] |
+| R2-7 | S7: Memoize | | [x] `894485ba` |
+| R2-8 | FINAL: sweep + report | | [x] (this commit) |
 
 ## R2-0 — harness guard + NLI-Predicate EXPLAIN  [x]
 
@@ -955,4 +955,18 @@ was `distinctOp.Open` (the `Unique` node), not the NL join.
       plan-gate:  22/22 MATCH vs csq-r2-0-nli-display (no persisted stats on the
                   bench server ⇒ zero Memoize attach ⇒ shapes unchanged, by design)
       race-gate:  PASS
-- commit: _(filled by R2-8)_
+- commit: `894485ba`
+
+## R2-8 — FINAL: sweep + report  [x]
+
+- [x] close-out SF1 sweep (`evidence/sf1-r2-final-894485ba.txt`, 600 s budget,
+      guarded wrapper): **24/24 slots complete, zero errors, every row count
+      byte-identical to round 1**; total ≈ 1 167 s vs 1 406 s (plans identical —
+      the delta is variance/warm-cache, stated honestly in the report). Tripwires:
+      Q4 3.42 s (NLI semi through two new gates), Q9 100.08 s (INNER unwrap
+      declined), Q12=2/Q13=33, Q21 27.75 s / 370 rows, Q22 0.75 s
+- [x] report: [`analysis/tpch-csq-round2-verification-20260721.md`](../../../analysis/tpch-csq-round2-verification-20260721.md)
+- [x] `GOOPG_NLI_COSTGATE=legacy` retained deliberately (documented escape hatch,
+      exercised by the gate suite) — the "delete if unused" clause does not apply
+- [x] round-2 part of this file closed
+- commit: _(the report commit)_
