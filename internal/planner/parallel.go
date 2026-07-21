@@ -275,13 +275,11 @@ func computeParallelWorkers(subtree Node, s ParallelSettings) int {
 
 	blocks, known := parallelRelationBlocks(scan.Table, s)
 	if !known {
-		// No statistics → no Gather. This is the OPPOSITE default from the
-		// semi/anti NLI gate, which optimistically accepts without stats, and
-		// the asymmetry is deliberate: accepting without evidence risks
-		// spawning workers for a tiny relation plus N× the per-operator
-		// memory, while declining merely keeps today's behaviour. goopg's
-		// ANALYZE statistics are in-memory and lost on restart, so "no stats"
-		// is a COMMON production state, not an edge case.
+		// Size unknown — refuse. Note this is NOT "no ANALYZE statistics":
+		// the size input is a live block count, which needs no ANALYZE (see
+		// parallelRelationBlocks). Reaching here means the storage manager
+		// could not answer at all, which is a real anomaly rather than a
+		// normal cold-start state.
 		if !forced {
 			return 0
 		}
@@ -312,20 +310,29 @@ func computeParallelWorkers(subtree Node, s ParallelSettings) int {
 }
 
 // parallelRelationBlocks returns the relation size in blocks.
+//
+// This is a SIZE query, not a statistics lookup, and the distinction is the
+// whole reason the gate works on a freshly started server.
+//
+// PG does the same thing: compute_parallel_worker() takes `rel->pages`, and
+// estimate_rel_size() fills that from a live RelationGetNumberOfBlocks() call
+// (postgres/src/backend/optimizer/util/plancat.c:1097-1100). `pg_class.relpages`
+// — the ANALYZE/VACUUM-maintained catalog value — is consulted only afterwards,
+// to scale the TUPLE estimate. So PG chooses a worker count without needing
+// ANALYZE at all, and so does this.
+//
+// An earlier cut of this function used `Stats.RowCount / 60` as a block proxy.
+// That was wrong twice over: the divisor was invented, and RowCount is never
+// restored at startup even though the column statistics are
+// (internal/initdb/open.go builds TableStats{Columns: ...} with RowCount left
+// zero — see the deferral ledger). The result was a gate that refused every
+// query on any server that had not been ANALYZEd since boot, while looking
+// like a deliberate policy.
 func parallelRelationBlocks(t *catalog.Table, s ParallelSettings) (int64, bool) {
-	if s.BlocksForTable != nil {
-		if b, ok := s.BlocksForTable(t); ok {
-			return b, true
-		}
+	if s.BlocksForTable == nil {
+		return 0, false
 	}
-	// Fall back to the row estimate. This IS an approximation — it ignores
-	// row width and page fill — and choosing it changes which relations cross
-	// the threshold, so it is recorded rather than silently assumed.
-	if t.Stats != nil && t.Stats.RowCount > 0 {
-		const assumedRowsPerBlock = 60
-		return t.Stats.RowCount / assumedRowsPerBlock, true
-	}
-	return 0, false
+	return s.BlocksForTable(t)
 }
 
 // tableParallelWorkersReloption reads the per-table parallel_workers setting.

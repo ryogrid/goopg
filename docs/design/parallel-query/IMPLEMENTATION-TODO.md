@@ -2,7 +2,7 @@
 
 | field | value |
 | --- | --- |
-| status | **P0–P6 complete.** Gather insertion is live behind the size gate; parallel execution is verified identical to serial |
+| status | **P0–P6 complete and MEASURED.** Parallel scan is live by default and delivers ~2.8x on scan-bound TPC-H queries (Q1 2.75x, Q6 2.83x) at 3-way parallelism |
 | started | 2026-07-21 |
 | branch | `parallel-query` |
 | start HEAD | `592f166a` (bundle commit) |
@@ -454,21 +454,52 @@ the walk deliberately fails toward serial for any node it does not model,
 because duplicating rows is a wrong-results bug while declining to parallelise
 is a missed optimisation.
 
-### Honest status: shipped, but dormant by default
+### P6 follow-up: the size gate, and two measurement lessons
 
-plan-gate is **22/22 MATCH** — no TPC-H plan changed. That is not the size gate
-being conservative in principle; it is that goopg's ANALYZE statistics are
-in-memory and lost on restart, so a freshly started server has none, and the
-no-stats refusal declines every query. Verified reachable with
-`SET debug_parallel_query = on`, where a Gather appears and returns results
-identical to serial (`count(*)` 120 149 and `sum` 6 007 450 both ways; also
-verified on an `l_shipmode` filter at 856 240 rows).
+The first cut of P6 shipped a feature that never fired, and reported a speedup
+that was not real. Both were corrected in the follow-up commit; both are worth
+recording because the failure modes were invisible to every gate.
 
-So the feature is correct and live, but on a fresh server it will not fire
-until `ANALYZE` has run. Making it fire by default needs relation sizes from
-the storage manager rather than the row-estimate approximation — the
-`BlocksForTable` hook exists for exactly that and is currently unset.
+**1. The size gate was keyed on the wrong input.** It used
+`Stats.RowCount / 60` — an invented divisor over a field that is *never
+restored at startup* (see the `pq-P6` deferral-ledger row: goopg rebuilds
+column statistics from `pg_statistic` but leaves `RowCount` zero). So the gate
+refused every query on any server that had not been ANALYZEd since boot, while
+presenting as deliberate policy.
+
+The fix is what PG actually does: `compute_parallel_worker()` takes
+`rel->pages`, which `estimate_rel_size()` fills from a live
+`RelationGetNumberOfBlocks()` call (`plancat.c:1097-1100`);
+`pg_class.relpages` is consulted only afterwards, to scale the *tuple*
+estimate. So the gate now reads `smgr.NBlocks` — an O(1) in-memory counter
+(`internal/storage/smgr.go:933`), not a scan and not a statistics lookup. PG
+chooses a worker count without ANALYZE, and so does goopg. Parallelism is now
+live by default: Q1, Q6 and Q15a-VIEWBODY gain a Gather.
+
+**2. The first speedup number was cache warming, not parallelism.** A
+cold-then-warm comparison showed 23.4 s → 13.9 s and looked like 1.68x.
+Re-measured warm with alternating order it was 13.0 / 12.6 / 12.6 / 12.6 —
+**no difference at all.**
+
+Chasing that zero found a real design bug: `Next()` ran the leader's own child
+to *exhaustion* before ever reading the channel. Workers filled their buffer,
+blocked on send, and contributed nothing while the leader claimed every
+remaining block. The feature was structurally inert. PG's `gather_getnext`
+interleaves — try the readers without blocking, else take ONE tuple locally
+(`nodeGather.c`) — and goopg now does the same.
+
+**Measured after the fix** (SF1, warm, alternating order, same server):
+
+| query | serial | 2 workers + leader | speedup |
+|---|---:|---:|---:|
+| ad-hoc `count/sum` over `lineitem` | 12.40 / 12.50 s | 4.62 / 4.57 s | **2.71x** |
+| TPC-H Q1 | 19.42 s | 7.15 / 7.05 s | **2.75x** |
+| TPC-H Q6 | 14.62 s | 5.23 / 5.17 s | **2.83x** |
+
+Against a 3.0x ceiling for leader + 2 workers, that is 90–94 % efficiency.
 
 - gates: units PASS; **race-gate PASS**; spotcheck PASS (Q12=2 / Q13=33);
-  plan-gate 22/22 MATCH; live serial-vs-parallel identity verified on SF1
-- commit: _(this commit)_
+  plan-gate — 3 queries gained a Gather (Q1, Q6, Q15a-VIEWBODY), diff reviewed
+  and classified as Gather-insertion only, recaptured as
+  `plan_snapshots/pq-p6-gather.txt`, 22/22 MATCH against it
+- commits: `2e0caa46` (insertion) + _(this commit)_ (size gate + interleaving)

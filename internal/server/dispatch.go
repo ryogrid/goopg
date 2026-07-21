@@ -22,6 +22,7 @@ import (
 	"github.com/goopg/goopg/internal/planner"
 	"github.com/goopg/goopg/internal/protocol"
 	"github.com/goopg/goopg/internal/sqlstate"
+	"github.com/goopg/goopg/internal/storage"
 	"github.com/goopg/goopg/internal/wal"
 )
 
@@ -1202,7 +1203,41 @@ func applyParallelPostPass(node planner.Node, sess *config.SessionRegistry, ectx
 		MinTableScanBlocks:  sessionMinParallelTableScanSize(sess),
 		DebugParallelQuery:  sessionDebugParallelQuery(sess),
 		IsSerializable:      ectx.Tx.Isolation == mvcc.IsolationSerializable,
+		BlocksForTable:      parallelBlocksForTable(ectx),
 	})
+}
+
+// parallelBlocksForTable returns the relation-size lookup the parallel size
+// gate uses. It is a live O(1) counter read (storage.relFile.nBlocks holds the
+// value in memory), NOT a statistics lookup and NOT a scan — the same input
+// PG's compute_parallel_worker() gets from RelationGetNumberOfBlocks().
+//
+// This is what lets the gate work on a freshly started server: goopg's ANALYZE
+// row count is not restored at startup (ledger row pq-P6), so anything keyed on
+// it would refuse every query until an ANALYZE had run.
+func parallelBlocksForTable(ectx *executor.Context) func(*catalog.Table) (int64, bool) {
+	if ectx == nil {
+		return nil
+	}
+	return parallelBlocksForTableFrom(ectx.Pool, ectx.Catalog)
+}
+
+// parallelBlocksForTableFrom is the pool/catalog form, for the extended
+// protocol where planning happens before an executor context exists.
+func parallelBlocksForTableFrom(pool *storage.Pool, cat catalog.Catalog) func(*catalog.Table) (int64, bool) {
+	if pool == nil || cat == nil {
+		return nil
+	}
+	return func(t *catalog.Table) (int64, bool) {
+		if t == nil {
+			return 0, false
+		}
+		n, err := pool.NBlocks(cat.RelFileNode(t))
+		if err != nil {
+			return 0, false
+		}
+		return int64(n), true
+	}
 }
 
 // ── parallel-query session GUCs (docs/design/parallel-query, P1) ──────────
@@ -1568,7 +1603,7 @@ func searchPathSchemas(sess *config.SessionRegistry) []string {
 // search_path, mirroring internal/executor/expr.go's regObjectSchemaVisible
 // (used there to decide regproc/regoperator/regtype schema-qualification).
 // Unlike searchPathSchemas above, an explicitly empty search_path (pg_dump's
-// search_path='', ALWAYS_SECURE_SEARCH_PATH_SQL) is NOT defaulted back to
+// search_path=”, ALWAYS_SECURE_SEARCH_PATH_SQL) is NOT defaulted back to
 // public here — it correctly yields no visible schemas, forcing
 // RegtypeName's caller to schema-qualify a user-defined type name.
 // getSetting is nil-safe (a nil executor.Context.GetSetting, or no session

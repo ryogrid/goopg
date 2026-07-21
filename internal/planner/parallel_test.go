@@ -14,11 +14,22 @@ import (
 	"github.com/goopg/goopg/internal/parser"
 )
 
+// parallelTestSettings supplies a relation size directly. The gate reads block
+// counts from the storage manager in production — a live O(1) counter, the same
+// input PG's compute_parallel_worker() uses — so tests inject the size rather
+// than fabricating statistics. An earlier cut keyed the gate on
+// Stats.RowCount, which is never restored at startup (ledger row pq-P6) and so
+// silently refused everything on a fresh server.
 func parallelTestSettings() ParallelSettings {
+	return parallelTestSettingsBlocks(4096) // 4x the threshold ⇒ 2 workers
+}
+
+func parallelTestSettingsBlocks(blocks int64) ParallelSettings {
 	return ParallelSettings{
 		MaxWorkersPerGather: 2,
 		MinTableScanBlocks:  1024,
 		DebugParallelQuery:  "off",
+		BlocksForTable:      func(*catalog.Table) (int64, bool) { return blocks, true },
 	}
 }
 
@@ -32,7 +43,8 @@ func bigTable(t *testing.T, name string) *catalog.Table {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 1024 blocks at the assumed 60 rows/block ⇒ well past the threshold.
+	// Statistics are irrelevant to the size gate now — it reads block counts.
+	// Left populated so these fixtures also exercise the no-interference case.
 	tbl.Stats = &catalog.TableStats{RowCount: 1_000_000}
 	return tbl
 }
@@ -174,13 +186,16 @@ func TestMaybeAddGatherRefusals(t *testing.T) {
 	}
 }
 
-// TestMaybeAddGatherNoStatsRefuses pins the gate's default direction, which is
-// the OPPOSITE of the semi/anti NLI gate's optimistic accept. Accepting
-// without evidence risks spawning workers for a tiny relation; declining keeps
-// today's behaviour. goopg's ANALYZE stats are in-memory and restart-lost, so
-// "no stats" is a common production state, not an edge case — which is exactly
-// why the choice of default has to be deliberate.
-func TestMaybeAddGatherNoStatsRefuses(t *testing.T) {
+// TestMaybeAddGatherWorksWithoutStatistics pins the property that motivated
+// moving the gate onto block counts: a table that has NEVER been ANALYZEd must
+// still be eligible.
+//
+// PG behaves this way too — compute_parallel_worker() takes rel->pages from a
+// live RelationGetNumberOfBlocks() call, and consults pg_class.relpages only
+// afterwards to scale the tuple estimate. An earlier cut of this gate keyed on
+// Stats.RowCount and therefore refused every query on a freshly started server,
+// because goopg restores column statistics at startup but not the row count.
+func TestMaybeAddGatherWorksWithoutStatistics(t *testing.T) {
 	cat := catalog.NewInMemory()
 	tbl, err := cat.CreateTable(parser.ObjectName{Name: "nostats"}, []catalog.Column{
 		{Name: "a", Type: catalog.Type{Name: "int4"}},
@@ -188,18 +203,34 @@ func TestMaybeAddGatherNoStatsRefuses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if tbl.Stats != nil {
+		t.Fatal("fixture should have no statistics")
+	}
 	root := &Project{Child: seqScanOver(tbl), schema: Schema{{Name: "a"}}}
-	if planHasGather(MaybeAddGather(root, parallelTestSettings())) {
-		t.Error("a relation with no statistics must not get a parallel path")
+	if !planHasGather(MaybeAddGather(root, parallelTestSettingsBlocks(4096))) {
+		t.Error("a large un-ANALYZEd relation must still be eligible: the size " +
+			"gate reads block counts, not statistics")
+	}
+}
+
+// TestMaybeAddGatherUnknownSizeRefuses pins the remaining refusal: if the
+// storage manager cannot answer at all, decline. That is a real anomaly, not
+// the ordinary cold-start state the previous test covers.
+func TestMaybeAddGatherUnknownSizeRefuses(t *testing.T) {
+	tbl := bigTable(t, "big")
+	s := parallelTestSettings()
+	s.BlocksForTable = func(*catalog.Table) (int64, bool) { return 0, false }
+	root := &Project{Child: seqScanOver(tbl), schema: Schema{{Name: "a"}}}
+	if planHasGather(MaybeAddGather(root, s)) {
+		t.Error("an unknown relation size must decline")
 	}
 }
 
 // TestMaybeAddGatherSmallRelationRefuses pins the size rule.
 func TestMaybeAddGatherSmallRelationRefuses(t *testing.T) {
 	tbl := bigTable(t, "small")
-	tbl.Stats = &catalog.TableStats{RowCount: 100} // ≈1 block
 	root := &Project{Child: seqScanOver(tbl), schema: Schema{{Name: "a"}}}
-	if planHasGather(MaybeAddGather(root, parallelTestSettings())) {
+	if planHasGather(MaybeAddGather(root, parallelTestSettingsBlocks(10))) {
 		t.Error("a relation below min_parallel_table_scan_size must stay serial")
 	}
 }
@@ -208,8 +239,7 @@ func TestMaybeAddGatherSmallRelationRefuses(t *testing.T) {
 // bypasses the SIZE gate but must NOT bypass the safety refusals.
 func TestDebugParallelQueryForcesPastSizeGate(t *testing.T) {
 	tbl := bigTable(t, "small")
-	tbl.Stats = &catalog.TableStats{RowCount: 10}
-	s := parallelTestSettings()
+	s := parallelTestSettingsBlocks(10) // far below the threshold
 	s.DebugParallelQuery = "on"
 
 	root := &Project{Child: seqScanOver(tbl), schema: Schema{{Name: "a"}}}

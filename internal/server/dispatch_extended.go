@@ -125,6 +125,9 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 		MaxWorkersPerGather: sessionMaxParallelWorkersPerGather(sess),
 		MinTableScanBlocks:  sessionMinParallelTableScanSize(sess),
 		DebugParallelQuery:  sessionDebugParallelQuery(sess),
+		// The size lookup needs only the pool and catalog, both available on
+		// the server here — unlike ectx, which does not exist yet on this path.
+		BlocksForTable: parallelBlocksForTableFrom(s.cfg.Pool, s.cfg.Catalog),
 	})
 
 	// Use an offset procNum to avoid overwriting the connection's own

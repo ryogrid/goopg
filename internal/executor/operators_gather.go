@@ -237,11 +237,32 @@ func (o *gatherOp) Next() (TupleSlot, error) {
 			o.slot.row = row
 			return &o.slot, nil
 		}
-		// Leader participation: execute our own share before blocking on the
-		// channel. Note the cost PG has too — while the leader is running the
-		// child it is NOT draining, so workers can block on send. That is what
-		// parallel_leader_participation = off exists to avoid.
+		// Leader participation, INTERLEAVED with draining — this ordering is
+		// load-bearing, not stylistic.
+		//
+		// An earlier version ran the leader's own child to exhaustion before
+		// ever reading the channel. Workers then filled their buffer
+		// (gatherChanDepth batches), blocked on send, and contributed nothing
+		// further while the leader claimed every remaining block from the
+		// shared allocator. Measured effect: parallel and serial were within
+		// 1% of each other — the feature was structurally inert, and only an
+		// uncontrolled warm-cache comparison made it look like a 1.68x win.
+		//
+		// PG's gather_getnext has the shape below: try the readers first
+		// WITHOUT blocking, and otherwise take ONE tuple from the local plan
+		// (nodeGather.c). The leader stays a peer that also drains, rather
+		// than a producer that happens to drain afterwards.
 		if o.leaderChild != nil {
+			select {
+			case batch, ok := <-o.ch:
+				if ok {
+					o.cur, o.curIdx = batch.rows, 0
+					continue
+				}
+				// Channel closed: keep taking local rows until exhausted.
+			default:
+				// Nothing ready from workers; fall through to one local row.
+			}
 			slot, err := o.leaderChild.Next()
 			if err == nil && slot != nil {
 				// The leader's own rows never cross a goroutine boundary, so
