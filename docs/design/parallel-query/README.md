@@ -113,6 +113,7 @@ its enforcement point in the chapter that owns it.
 | [08](08-planner-integration.md) | Planner Integration, GUCs, and EXPLAIN | Gather placement, the worker-count rule without a cost model, per-session GUC plumbing, GUC corrections, PG-faithful EXPLAIN rendering |
 | [09](09-verification-and-measurement.md) | Correctness Gates and Measurement Plan | Serial≡parallel identity, race-gate, plan-gate, the aggregate matrix, cancellation and leak tests, honest speedup reporting |
 | [10](10-roadmap.md) | Phased Roadmap | P0–P7 with acceptance criteria, kill switches, and per-phase plan-stability predictions |
+| [11](11-partial-aggregation-cost-model.md) | A Cost Model for the Partial-Aggregation Split | When splitting an aggregate across a Gather pays and when it does not; `estimate_num_groups` in miniature, the mutex-merge cost goopg's design substitutes for PG's tuple transfer, the memory ceiling, and the two ANALYZE defects the premise does not survive without |
 
 ## Reading order
 

@@ -177,6 +177,16 @@ suppress parallel plans that are in fact profitable.
 For now the size rule alone governs, which has the honest property of being a
 rule this engine can actually evaluate.
 
+**Superseded in part by [11](11-partial-aggregation-cost-model.md).** The
+partial-aggregation split needs a comparison the size rule cannot express, so
+chapter 11 supplies one — self-contained, comparing only split against
+no-split, which share their entire subtree and therefore need no absolute
+scale. It also sets the goopg values this section argued for rather than
+assumed: `parallel_setup_cost` at 50 against PG's 100 000 (relative to
+`cpu_tuple_cost`), and `parallel_tuple_cost` at 2 against PG's 10. Both remain
+un-consulted for Gather PLACEMENT, which is still governed by the size rule
+alone; chapter 11 consults them only for the split decision.
+
 ## 4. GUC plumbing
 
 ### 4.1 The problem

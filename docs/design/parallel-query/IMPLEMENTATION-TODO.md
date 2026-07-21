@@ -778,6 +778,21 @@ finding: the serial hash build over the 1.5 M-row side.
 
 ### Recorded, not fixed
 
+> **CORRECTION (chapter [11](11-partial-aggregation-cost-model.md) §0).** The
+> paragraph below names the wrong query and is left in place with this note
+> rather than silently rewritten, because it was the stated motivation for the
+> cost-model work that followed.
+>
+> Q13's aggregate does not read `customer`. It reads the output of
+> `customer LEFT JOIN orders` — ~1.5 M rows at SF1 — and reduces that to 150 k
+> groups per worker, a **4× reduction the split should perform**. 150,000 is
+> the probe side's row count, not the aggregate's input. Q13 was never the
+> hazard.
+>
+> The real case is **Q18's inner aggregate**,
+> `select l_orderkey from lineitem group by l_orderkey`: 1.5 M distinct keys
+> over 6 M rows, so every input row becomes a state and nothing is reduced.
+
 **The split has no cost model.** Q13 groups by `c_custkey` — **150,000
 groups**, one per probe row — so its Partial nodes merge 150 k entries per
 worker through the accumulator mutex for no reduction at all. It does not show
