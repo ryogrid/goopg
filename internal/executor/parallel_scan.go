@@ -139,6 +139,16 @@ func attachParallelScan(op Operator, st *parallelScanState) bool {
 		// combines N full results into an N-times overcount — arithmetically
 		// plausible output with nothing to flag it.
 		return attachParallelScan(x.child, st)
+	case *multiHashJoinOp:
+		// Chapter 12. Partition ONLY the probe scan. The build children are
+		// structurally unreachable from this expression, so "each worker gets
+		// a partition of the build input" — the failure the two-way path
+		// guards against with a three-place rule — is impossible here. Each
+		// worker rebuilds its own dimension tables from the full build scans,
+		// which is correct because those scans are not partitioned and cheap
+		// because the dimensions are the small side by the probe-selection
+		// rule.
+		return attachParallelScan(x.children[x.plan.ProbeTable], st)
 	case *sortOp:
 		// P7. A Sort inside the partial subtree is legal ONLY under Gather
 		// Merge: each worker sorts its own partition and the leader merges the

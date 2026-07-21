@@ -351,8 +351,35 @@ func drivingSeqScan(n Node) *SeqScan {
 			return drivingSeqScan(x.Left)
 		}
 		return drivingSeqScan(x.Right)
+	case *MultiHashJoin:
+		// Chapter 12. An MHJ is partial through its PROBE side only. Unlike a
+		// two-way Join it needs no shared build: attachParallelScan partitions
+		// only this probe scan, so each worker rebuilds the (small, by the
+		// probe-selection rule) dimension tables itself and the result is
+		// exactly correct. The probe is named explicitly, so there is no
+		// side-derivation that could disagree across call sites.
+		if !multiHashJoinIsPartialCapable(x) {
+			return nil
+		}
+		return drivingSeqScan(x.Tables[x.ProbeTable])
 	}
 	return nil
+}
+
+// multiHashJoinIsPartialCapable is the explicit approval point drivingSeqScan's
+// "refuse toward serial" discipline requires. An MHJ is INNER by construction
+// (collectMultiHashTables refuses any other join type, and the node has no Type
+// field), and its residual Filters are per-probe-row WHERE conjuncts over the
+// concatenated output row, so the predicate is nearly trivial — it exists so a
+// malformed node fails toward serial rather than panicking.
+func multiHashJoinIsPartialCapable(m *MultiHashJoin) bool {
+	if m == nil {
+		return false
+	}
+	if m.ProbeTable < 0 || m.ProbeTable >= len(m.Tables) {
+		return false
+	}
+	return m.Tables[m.ProbeTable] != nil
 }
 
 // ParallelChildrenForTest exposes the post-pass's child walk to tests in other
@@ -633,6 +660,18 @@ func parallelChildren(n Node) []Node {
 		// rebuildWithGather refuse any join drivingSeqScan has not explicitly
 		// approved, since both bail on len(kids) != 1.
 		return []Node{x.Left, x.Right}
+	case *MultiHashJoin:
+		// Chapter 12 §7 — the safety fix, and the one dangerous item in this
+		// change. Without it subtreeHasUnsafeNode stops dead at an MHJ and
+		// treats "no children" as "nothing unsafe below" (the opposite of
+		// conservative for the SAFETY walk), so a temp / virtual / LockRows
+		// relation under the probe side would go unseen the moment
+		// drivingSeqScan learned about MHJ. Must land with that change, never
+		// after. Returning all Tables does not break the placement walks:
+		// findPartialSubtree takes the MHJ via drivingSeqScan before its
+		// len(kids)!=1 check, and rebuildWithGather matches root==target
+		// before walking children.
+		return x.Tables
 	case *NestedLoopIndexJoin:
 		return []Node{x.Outer, x.Inner}
 	}

@@ -174,6 +174,37 @@ partitioning, parallel builds — are deliberately out of scope.
   alternating, against the §0.1 serial baseline, and report the speedup plainly
   — small if it is small.
 
+## 5.1 Measured result — and what it revealed about §1
+
+Q3 on SF1, warm, alternating, with ANALYZE run:
+
+| lanes (leader + workers) | Q3 | vs serial |
+|---|---:|---|
+| 1 (serial) | 19.7 s | — |
+| 3 (2 workers) | 9.4 s | **2.09x** |
+| 5 (4 workers) | 10.5 s | 1.9x |
+| 9 (8 workers) | 11.4 s | 1.7x |
+
+Row counts match serial (11,175) at every worker count — correct. But the
+speedup **peaks at two workers and degrades past it**, and that degradation
+contradicts §1's convenient claim that "the dimension tables are the small side
+by construction."
+
+They are not, in Q3. The probe-selection rule picks the *largest* table as the
+probe (`lineitem`, 6 M), but the *second* largest — `orders`, 1.5 M — is a
+BUILD table, and §1's design has every worker rebuild it independently. At eight
+workers that is nine lanes each rebuilding a 1.5 M-row hash table, ~13.5 M rows
+of redundant build work against a 6 M-row probe, so the rebuild overtakes the
+parallelism it was meant to enable.
+
+This is honest and it is the P8→P10 pattern deliberately: ship the correct
+simple version, measure, let the measurement motivate the next increment rather
+than pre-building it. At the common setting (PG's default
+`max_parallel_workers_per_gather` is 2) the result is a clean ~2x. The
+degradation is a scaling ceiling, not a correctness or a regression issue — and
+it converts §6's deferred shared build from a speculative optimisation into one
+motivated by a number.
+
 ## 6. Deliberately not done
 
 **No shared build.** §1 establishes it is unnecessary for correctness and of low
@@ -181,9 +212,13 @@ value here, because the build side is small by the probe-selection rule. Adding
 it would mean widening `ctx.SharedHashBuilds` (typed `map[*planner.Join]…`), a
 `MultiHashJoin`-keyed lookup, an `applySharedBuild` analogue, worker-context
 propagation and Gather-Close reset — the most complex machinery in the P8 line,
-for a re-read of small dimension tables. Reopen only if a measured MHJ shows the
-per-worker dimension rebuild dominating, which the §0.1 profile (44 % probe
-scan) says it does not.
+for a re-read of small dimension tables. **This reopen condition is now MET** (§5.1): Q3's
+per-worker rebuild of the 1.5 M-row `orders` build table is what caps scaling
+past two workers. The shared build — publishing each build table once, as P8
+does for the two-way join — is the natural next phase, and it is now motivated
+by a measurement rather than proposed on spec. The §0.1 profile (44 % probe
+scan) established the probe is worth parallelising; §5.1 establishes the build
+rebuild is what then limits it.
 
 **No probe-selection floor.** An earlier draft proposed refusing when the
 selected probe is small. It is redundant: once change (b) makes
