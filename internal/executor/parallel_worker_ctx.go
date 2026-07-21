@@ -110,6 +110,10 @@ func NewWorkerContext(leader *Context, workerMctx *mctx.Context, workerCtx conte
 	// would defeat the entire point of building once.
 	w.SharedHashBuilds = leader.SharedHashBuilds
 
+	// P9: partial-aggregate accumulators, by reference. Shared and WRITTEN by
+	// this worker — each accumulator serialises its own merges.
+	w.PartialAggStates = leader.PartialAggStates
+
 	// ── per-worker: cancellation and arena ───────────────────────────────
 	w.Ctx = workerCtx
 	w.Mctx = workerMctx

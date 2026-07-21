@@ -30,7 +30,8 @@ degrading the smoke gate from 700 to 390 TPS and aborting a transaction.
 | P5 | Partial / Finalize aggregation | combine rules + whitelist refusals | [x] `726999e4` |
 | P6 | Enable Gather insertion | post-pass, safety refusals, worker-count rule, identity gate | [x] `90ac9d98` |
 | P7 | Gather Merge | per-worker Sort + leader-side merge; ordering gate | [x] `a98b5a64` |
-| P8 | Parallel Hash Join | build once in the leader, share by pointer; partial probe side | [x] (this commit) |
+| P8 | Parallel Hash Join | build once in the leader, share by pointer; partial probe side | [x] `37742171` |
+| P9 | Partial / Finalize placement | split aggregates across the Gather; EXPLAIN prefixes | [x] (this commit) |
 
 ## Design amendments to fold in during these stages
 
@@ -163,7 +164,7 @@ the pre-existing simple-path-only inconsistency survived.
 - gates: units PASS; race-gate PASS (`internal/executor`, `internal/config`);
   spotcheck PASS (Q12=2 / Q13=33); **plan-gate 22/22 MATCH** — zero diffs as
   predicted, nothing reads the values yet
-- commit: _(this commit)_
+- commit: `37742171`
 
 ## P2 — `HashAggregate` label correction  [x]
 
@@ -685,4 +686,111 @@ speculation, which they were not before.
 - gates: units PASS; race-gate PASS (including a probe-heavy `-count=2` run
   over the parallel suite); spotcheck PASS (Q12=2 / **Q13=33**, the query whose
   plan changed); plan-gate 1 reviewed diff, recaptured, then 22/22 MATCH
+- commit: _(this commit)_
+
+## P9 — Partial / Finalize placement  [x]
+
+P5 built the combine rules and proved them in isolation; nothing placed a
+split. P9 places it. This phase was **chosen by measurement, not by roadmap
+order** — the roadmap ends at P8.
+
+### Why this one, and how that was established
+
+After P8, Q1 was measured across worker counts rather than at a single one:
+
+| lanes (leader + workers) | Q1 |
+|---|---:|
+| 1 (serial) | 21.27 s |
+| 3 | 7.84 s |
+| 5 | 7.15 s |
+| 9 | 7.35 s |
+
+Adding workers past two bought nothing. Solving `T(n) = S + P/n` across those
+points puts **~6.1 s of the 7.1 s floor in the serial tail**: the leader was
+receiving ~5.9 M rows through the Gather and aggregating all of them down to
+four groups by itself. No amount of parallel scanning could touch it.
+
+That is the whole case for P9, and it is worth noting that the intuition
+before measuring was the opposite — P6's "2.75x of a 3.0x ceiling, 92 %
+efficient" reading suggested there was nothing left, because at two workers
+the serial tail is still hidden.
+
+### The transport question, and why the states do not travel
+
+The obvious design puts transition states in the rows, which needs either a
+pointer-bearing `Datum` kind (against the pointer-free-Datum work) or a
+side-channel threaded through `rowBatch`, `TupleSlot` and the Gather — making
+a node whose whole job is "move rows" learn about aggregation.
+
+Instead the Partial node publishes into a shared accumulator keyed by its own
+plan node, exactly as P8 publishes hash tables, and the Finalize node reads it
+after draining the Gather to EOF. **The Gather needs no knowledge of
+aggregation at all**, and the schema is unchanged at every level.
+
+The synchronisation is free: a Partial node does all of its work in `Open`
+(drain, group, merge) before it returns, so when the Gather reports EOF every
+worker has already merged. Combining happens on insert under the accumulator's
+own mutex, so no worker's group map outlives its own `Open`.
+
+The Partial node emits **zero rows**. That is the one thing in this phase that
+looks like a bug and is not, so both sides refuse loudly if the pairing is
+missing: a Partial without an accumulator and a Finalize without a
+`PartialSource` each raise XX000 rather than quietly returning nothing.
+
+### A pre-existing wrong-results bug the P9 tests found
+
+`TestPartialAggregateRefusals` failed on `string_agg` — and not because of the
+split, which the whitelist correctly refuses. **Plain Gather, shipped in P6,
+already broke order-dependent aggregates.** The Gather concatenates worker
+batches in arrival order, so a leader-side `string_agg` over gathered rows
+returned its elements shuffled, differently on every run, for any query large
+enough to parallelise.
+
+PostgreSQL tolerates exactly this — it marks these aggregates parallel-safe and
+documents the unordered result as implementation-defined. goopg now refuses
+instead (`AggregateIsOrderSensitive`, consulted by `subtreeHasUnsafeNode`),
+for two reasons: the stated contract in chapter 09 is that a parallel plan
+returns what the serial plan returns, and these aggregates are not decomposable
+anyway, so refusing costs only a parallel scan while copying PG's laxity would
+cost determinism on a query that was stable before parallelism existed. An
+explicit `ORDER BY` inside the aggregate makes it deterministic again and is
+not refused.
+
+### Measured effect
+
+Q1, warm, alternating, same server:
+
+| lanes | before P9 | after P9 | |
+|---|---:|---:|---|
+| 1 (serial) | 21.27 s | 21.05 s | unchanged, as it must be |
+| 3 | 7.84 s | 7.51 s | 2.80x |
+| 5 | 7.15 s | **4.72 s** | 4.46x — 89 % of ceiling |
+| 9 | 7.35 s | **4.01 s** | 5.25x |
+
+**1.51x further at four workers, 1.83x at eight.** The serial floor drops from
+~6.1 s to ~3.1 s; scaling past two workers exists now where it did not before.
+
+Q13 is unchanged (109.6 s parallel vs 109.8 s serial). Its serial time drifted
+from 105.3 s to 115.6 s between sessions on the same unchanged code path, so
+the machine moved under the measurement — the comparison that matters is the
+same-session pair, and it shows no regression. Q13 is still dominated by P8's
+finding: the serial hash build over the 1.5 M-row side.
+
+### Recorded, not fixed
+
+**The split has no cost model.** Q13 groups by `c_custkey` — **150,000
+groups**, one per probe row — so its Partial nodes merge 150 k entries per
+worker through the accumulator mutex for no reduction at all. It does not show
+as a regression there because the query is build-bound, but the shape is real:
+when the group count approaches the input row count, the split is pure
+overhead. PG guards this with cost estimates; goopg has no absolute node costs
+(chapter 01 §4), and inventing a row-count heuristic would repeat the P6 error
+of gating on statistics that are never restored (ledger `pq-P6`). Left as a
+measured, documented hazard.
+
+- gates: units PASS; race-gate PASS; spotcheck PASS (Q12=2 / **Q13=33**);
+  plan-gate — 4 queries gained the split (Q1, Q6, Q13, Q15a-VIEWBODY), every
+  diff the same shape (aggregate moved below the Gather, `Finalize `/`Partial `
+  prefixes added), reviewed and recaptured as
+  `plan_snapshots/pq-p9-partialagg.txt`, 22/22 MATCH against it
 - commit: _(this commit)_

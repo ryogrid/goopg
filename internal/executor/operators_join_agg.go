@@ -1344,6 +1344,20 @@ func newAggregateOp(plan *planner.Aggregate, child Operator) *aggregateOp {
 func (o *aggregateOp) Open(ctx *Context) error {
 	o.ctx = ctx
 	o.idx = 0 // reset read cursor — o.rows is rebuilt below, so always start at 0
+
+	// P9 Finalize: publish the accumulator BEFORE opening the child, because
+	// the child is a Gather and opening it launches the workers that write to
+	// it. Registering afterwards would be a race with the first worker.
+	var accum *aggPartialAccum
+	if o.plan.Mode == planner.AggModeFinal && o.plan.PartialSource != nil {
+		accum = newAggPartialAccum()
+		if ctx.PartialAggStates == nil {
+			ctx.PartialAggStates = map[*planner.Aggregate]*aggPartialAccum{}
+		}
+		ctx.PartialAggStates[o.plan.PartialSource] = accum
+		defer delete(ctx.PartialAggStates, o.plan.PartialSource)
+	}
+
 	if err := o.child.Open(ctx); err != nil {
 		return err
 	}
@@ -1438,6 +1452,60 @@ func (o *aggregateOp) Open(ctx *Context) error {
 				return err
 			}
 		}
+	}
+
+	switch o.plan.Mode {
+	case planner.AggModePartial:
+		// Publish this worker's groups and emit NOTHING. The Finalize node
+		// supplies every output row from the accumulator, so a Partial node
+		// returning zero rows is by construction, not a failure — see the
+		// loud refusal on the Finalize side if the accumulator is missing.
+		pub := lookupAggPartialAccum(ctx, o.plan)
+		if pub == nil {
+			return &ExecError{
+				Code: "XX000",
+				Message: "internal error: partial aggregate has no accumulator; " +
+					"a Partial node was built without the Finalize node that reads it",
+			}
+		}
+		for _, key := range order {
+			gr := groups[key]
+			if gr == nil {
+				continue
+			}
+			if err := pub.merge(key, gr.groupValues, gr.passthroughVals, gr.aggs, o.plan.Aggs); err != nil {
+				return err
+			}
+		}
+		o.rows = nil
+		return nil
+
+	case planner.AggModeFinal:
+		if accum == nil {
+			return &ExecError{
+				Code:    "XX000",
+				Message: "internal error: finalize aggregate has no partial source",
+			}
+		}
+		// The child (a Gather) has been drained to EOF, so every worker has
+		// returned from its Open and every merge is complete. Replace the
+		// locally-collected groups — which are empty, the Partial nodes having
+		// emitted no rows — with the combined ones, and fall through to the
+		// ordinary emit path so finishAgg, passthrough and the output sort are
+		// the SAME code serial execution uses.
+		accum.mu.Lock()
+		groups = make(map[string]*groupRuntime, len(accum.groups))
+		order = order[:0]
+		for _, key := range accum.order {
+			g := accum.groups[key]
+			groups[key] = &groupRuntime{
+				groupValues:     g.groupValues,
+				passthroughVals: g.passthrough,
+				aggs:            g.states,
+			}
+			order = append(order, key)
+		}
+		accum.mu.Unlock()
 	}
 
 	o.rows = make([]Row, 0, len(order))

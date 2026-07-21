@@ -132,6 +132,13 @@ func attachParallelScan(op Operator, st *parallelScanState) bool {
 			return attachParallelScan(x.left, st)
 		}
 		return attachParallelScan(x.right, st)
+	case *aggregateOp:
+		// P9. A Partial aggregate inside the partial subtree must read only
+		// its worker's PARTITION. Without this the walk stops at the aggregate,
+		// every worker aggregates the WHOLE relation, and the Finalize node
+		// combines N full results into an N-times overcount — arithmetically
+		// plausible output with nothing to flag it.
+		return attachParallelScan(x.child, st)
 	case *sortOp:
 		// P7. A Sort inside the partial subtree is legal ONLY under Gather
 		// Merge: each worker sorts its own partition and the leader merges the

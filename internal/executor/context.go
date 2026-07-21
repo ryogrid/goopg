@@ -257,6 +257,18 @@ type Context struct {
 	// Nil outside a Gather, which is the serial case.
 	SharedHashBuilds map[*planner.Join]*sharedHashBuild
 
+	// PartialAggStates carries per-group aggregate transition states from the
+	// Partial nodes running in workers up to the Finalize node in the leader
+	// (P9, chapter 06), keyed by the Partial node.
+	//
+	// Registered by the Finalize node before it opens its child, so it is in
+	// place by the time any worker exists. Unlike SharedHashBuilds this is
+	// WRITTEN by workers — each accumulator carries its own mutex, and the
+	// combine happens on insert.
+	//
+	// Nil outside a split aggregate, which is the serial case.
+	PartialAggStates map[*planner.Aggregate]*aggPartialAccum
+
 	// AnalyzeRandSeed, when non-zero, makes ANALYZE's reservoir
 	// sampler reproducible. Tests set it; production leaves it
 	// zero so the sampler reseeds from the wall clock.

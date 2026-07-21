@@ -889,7 +889,31 @@ type Aggregate struct {
 	Aggs        []AggregateCall
 	Passthrough []Expr
 	schema      Schema
+
+	// Mode splits an aggregate across a parallel boundary (P9). The zero
+	// value is AggModeSimple, so every existing construction site keeps
+	// today's semantics without being touched.
+	Mode AggMode
+	// PartialSource is set on a Finalize node and points at the Partial node
+	// below the Gather whose per-group states it combines. Stated explicitly
+	// rather than rediscovered by walking down through the Gather, because the
+	// two nodes are created together and the link is what pairs them at
+	// runtime.
+	PartialSource *Aggregate
 }
+
+// AggMode is an aggregate node's role in a parallel split.
+type AggMode int8
+
+const (
+	// AggModeSimple is an ordinary, whole-input aggregate.
+	AggModeSimple AggMode = iota
+	// AggModePartial aggregates one worker's share and publishes the per-group
+	// transition states instead of finished values.
+	AggModePartial
+	// AggModeFinal combines the published states and produces the result.
+	AggModeFinal
+)
 
 func (n *Aggregate) Pos() int       { return n.pos }
 func (n *Aggregate) Output() Schema { return n.schema }

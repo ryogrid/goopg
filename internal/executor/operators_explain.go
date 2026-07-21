@@ -1108,10 +1108,22 @@ func describePlan(n planner.Node) string {
 	case *planner.Distinct:
 		return "Unique"
 	case *planner.Aggregate:
+		// P9: PG prefixes a split aggregate's two halves with "Partial " and
+		// "Finalize " (explain.c, from the Agg node's aggsplit). Without them
+		// a parallel plan shows two identical HashAggregate lines stacked with
+		// a Gather between, which reads as a bug rather than as the split it
+		// is. This is the prefix P2's rename was sequenced to protect.
+		prefix := ""
+		switch p.Mode {
+		case planner.AggModePartial:
+			prefix = "Partial "
+		case planner.AggModeFinal:
+			prefix = "Finalize "
+		}
 		if len(p.GroupExprs) == 0 {
 			// PG labels an ungrouped aggregate (AGG_PLAIN) "Aggregate"
 			// regardless of strategy, so this one is already faithful.
-			return "Aggregate"
+			return prefix + "Aggregate"
 		}
 		// P2 (docs/design/parallel-query/06 §4.1): this used to say
 		// "GroupAggregate", which in PG means specifically the SORTED,
@@ -1128,7 +1140,7 @@ func describePlan(n planner.Node) string {
 		// The "(%d keys)" suffix is goopg's own; PG emits a separate
 		// "Group Key: <exprs>" detail line instead. Kept as-is to hold this
 		// stage to the rename — see the TODO's follow-up note.
-		return fmt.Sprintf("HashAggregate (%d keys)", len(p.GroupExprs))
+		return fmt.Sprintf("%sHashAggregate (%d keys)", prefix, len(p.GroupExprs))
 	case *planner.WindowAgg:
 		return fmt.Sprintf("WindowAgg (%d funcs)", len(p.Funcs))
 	case *planner.SeqScan:

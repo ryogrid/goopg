@@ -107,25 +107,37 @@ func MaybeAddGather(root Node, s ParallelSettings) Node {
 	}
 
 	// Find the deepest point at which the subtree below is partial-capable.
-	// mergeKeys non-nil means the target is a Sort that the workers run
-	// themselves, so the leader must merge rather than concatenate.
-	target, mergeKeys, ok := findPartialSubtree(root)
+	tgt, ok := findPartialSubtree(root)
 	if !ok {
 		return root
 	}
 
-	// Worker count comes from the scan, so for a Sort target it is computed
-	// from what the Sort reads, not from the Sort node itself.
-	sized := target
-	if mergeKeys != nil {
-		sized = target.(*Sort).Child
+	// Worker count comes from the scan, so a wrapper target (Sort, Aggregate)
+	// is sized by what it reads rather than by itself.
+	sized := tgt.node
+	switch {
+	case tgt.mergeKeys != nil:
+		sized = tgt.node.(*Sort).Child
+	case tgt.splitAgg:
+		sized = tgt.node.(*Aggregate).Child
 	}
 	workers := computeParallelWorkers(sized, s)
 	if workers <= 0 {
 		return root
 	}
 
-	return rebuildWithGather(root, target, workers, mergeKeys)
+	return rebuildWithGather(root, tgt, workers)
+}
+
+// partialTarget is where the Gather goes and what kind it must be.
+type partialTarget struct {
+	node Node
+	// mergeKeys non-nil ⇒ the target is a Sort the workers run themselves, so
+	// the leader must MERGE the streams rather than concatenate them.
+	mergeKeys []SortKey
+	// splitAgg ⇒ the target is an Aggregate to split into Partial (in the
+	// workers) and Finalize (in the leader).
+	splitAgg bool
 }
 
 // statementIsParallelSafe applies the whole-plan refusals. Each is a case
@@ -159,6 +171,17 @@ func subtreeHasUnsafeNode(n Node) bool {
 			// disables parallelism outright for plans carrying row marks.
 			unsafe = true
 			return
+		case *Aggregate:
+			// An order-sensitive aggregate above a Gather returns its elements
+			// in worker-arrival order — a different order on every run. It is
+			// not decomposable either, so parallelising below it buys only the
+			// scan and costs determinism. Refused outright.
+			for _, call := range x.Aggs {
+				if AggregateIsOrderSensitive(call) {
+					unsafe = true
+					return
+				}
+			}
 		case *SeqScan:
 			if tableIsUnsafeForParallel(x.Table) {
 				unsafe = true
@@ -211,9 +234,23 @@ func tableIsUnsafeForParallel(t *catalog.Table) bool {
 // subtree as large as possible — i.e. immediately below the lowest node that
 // terminates partial-ness. PG reaches the same placement by costing partial
 // paths; here it is by construction.
-func findPartialSubtree(root Node) (Node, []SortKey, bool) {
+func findPartialSubtree(root Node) (partialTarget, bool) {
 	cur := root
 	for {
+		// P9: an Aggregate over a partial-capable subtree splits rather than
+		// terminating. Each worker aggregates its own share and publishes
+		// per-group transition states; the leader combines them. PG's
+		//
+		//   Finalize HashAggregate -> Gather -> Partial HashAggregate -> Parallel Seq Scan
+		//
+		// This is the placement that matters most on TPC-H. Without it Q1
+		// funnels ~5.9 M rows through the Gather into ONE leader-side
+		// aggregate to produce four groups, and measurement shows that serial
+		// tail pinning the query at ~7.1 s no matter how many workers run.
+		if agg, isAgg := cur.(*Aggregate); isAgg && aggregateSplitIsSafe(agg) &&
+			drivingSeqScan(agg.Child) != nil {
+			return partialTarget{node: agg, splitAgg: true}, true
+		}
 		// P7: a Sort directly over a partial-capable subtree does not have to
 		// terminate partial-ness. Each worker sorts its own partition and the
 		// leader merges the ordered streams — PG's
@@ -229,23 +266,23 @@ func findPartialSubtree(root Node) (Node, []SortKey, bool) {
 		// truncation to reason about: every worker emits its whole partition.
 		if srt, isSort := cur.(*Sort); isSort && len(srt.Keys) > 0 &&
 			drivingSeqScan(srt.Child) != nil {
-			return srt, srt.Keys, true
+			return partialTarget{node: srt, mergeKeys: srt.Keys}, true
 		}
 		if terminatesPartial(cur) {
 			kids := parallelChildren(cur)
 			if len(kids) != 1 {
-				return nil, nil, false
+				return partialTarget{}, false
 			}
 			cur = kids[0]
 			continue
 		}
 		// cur is partial-capable if it bottoms out in an eligible seq scan.
 		if drivingSeqScan(cur) != nil {
-			return cur, nil, true
+			return partialTarget{node: cur}, true
 		}
 		kids := parallelChildren(cur)
 		if len(kids) != 1 {
-			return nil, nil, false
+			return partialTarget{}, false
 		}
 		cur = kids[0]
 	}
@@ -462,10 +499,13 @@ func tableParallelWorkersReloption(t *catalog.Table) int {
 // rebuildWithGather returns a copy of root's spine with target replaced by
 // Gather{target}. Nodes not on the path are shared by pointer; nothing is
 // mutated.
-func rebuildWithGather(root, target Node, workers int, mergeKeys []SortKey) Node {
-	if root == target {
-		if mergeKeys != nil {
-			return NewGatherMerge(root.Pos(), root, workers, mergeKeys)
+func rebuildWithGather(root Node, tgt partialTarget, workers int) Node {
+	if root == tgt.node {
+		switch {
+		case tgt.mergeKeys != nil:
+			return NewGatherMerge(root.Pos(), root, workers, tgt.mergeKeys)
+		case tgt.splitAgg:
+			return splitAggregate(root.(*Aggregate), workers)
 		}
 		return NewGather(root.Pos(), root, workers)
 	}
@@ -473,11 +513,35 @@ func rebuildWithGather(root, target Node, workers int, mergeKeys []SortKey) Node
 	if len(kids) != 1 {
 		return root
 	}
-	rebuilt := rebuildWithGather(kids[0], target, workers, mergeKeys)
+	rebuilt := rebuildWithGather(kids[0], tgt, workers)
 	if rebuilt == kids[0] {
 		return root
 	}
 	return replaceSingleChild(root, rebuilt)
+}
+
+// splitAggregate turns one Aggregate into Finalize -> Gather -> Partial.
+//
+// Both new nodes are SHALLOW COPIES of the original: the post-pass runs on a
+// plan held by a process-wide cache that other sessions may be executing right
+// now, so setting Mode on the original would be a data race and would also
+// corrupt the serial plan every other session sees.
+//
+// The schema is unchanged at every level. The Partial node emits no ROWS at
+// all — it publishes per-group states through a side channel and the Finalize
+// reads them from there — so nothing downstream sees a different shape, and
+// the Gather in between needs no knowledge of aggregation whatsoever.
+func splitAggregate(a *Aggregate, workers int) Node {
+	partial := *a
+	partial.Mode = AggModePartial
+
+	gather := NewGather(a.Pos(), &partial, workers)
+
+	final := *a
+	final.Mode = AggModeFinal
+	final.Child = gather
+	final.PartialSource = &partial
+	return &final
 }
 
 // replaceSingleChild returns a SHALLOW COPY of n with its single child

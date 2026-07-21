@@ -34,44 +34,13 @@ func normalizeAggName(n string) string { return strings.ToLower(strings.TrimSpac
 // aggregateIsDecomposable reports whether an aggregate call can be split into
 // partial + finalize.
 //
-// This is a WHITELIST, deliberately. applyAgg ends in a `default:` catch-all
-// that does `st.count++; st.sum += arg.Int` for any unrecognised name, so a
-// blacklist would let an aggregate added later split through that arm and
-// return garbage. A name absent from this function is refused, not guessed at.
+// The rule itself lives in the planner (planner.AggregateIsDecomposable),
+// because the planner is what must refuse to build a split and the executor is
+// what must refuse to combine one. Two copies of a whitelist would eventually
+// disagree, and the direction of that disagreement is a silent wrong answer:
+// the planner splitting something combineAggRuntime has no rule for.
 func aggregateIsDecomposable(call planner.AggregateCall) bool {
-	// Order-dependence and global-state requirements defeat the split
-	// regardless of the function.
-	if call.Distinct {
-		// Each worker's `distinct` map sees only its own share, so dedup
-		// would be per-worker rather than global.
-		return false
-	}
-	if len(call.OrderBy) > 0 {
-		// An ORDER BY inside the aggregate makes the result depend on input
-		// order, which parallel scans do not preserve.
-		return false
-	}
-	if call.UserAgg != nil {
-		// A user aggregate is decomposable exactly when it declares a
-		// combine function — which is what COMBINEFUNC is for, and which
-		// goopg already parses and stores.
-		return call.UserAgg.CombineFunc != ""
-	}
-
-	switch normalizeAggName(call.Name) {
-	case "count", "sum", "avg", "min", "max",
-		"bool_and", "every", "bool_or",
-		"bit_and", "bit_or", "bit_xor",
-		"any_value",
-		"var_pop", "var_samp", "variance", "stddev_pop", "stddev_samp", "stddev",
-		"regr_count", "regr_avgx", "regr_avgy", "regr_sxx", "regr_syy", "regr_sxy",
-		"covar_pop", "covar_samp", "regr_r2", "regr_slope", "regr_intercept", "corr":
-		return true
-	default:
-		// Includes array_agg and string_agg (order-dependent), the
-		// WITHIN GROUP ordered-set aggregates, and anything new.
-		return false
-	}
+	return planner.AggregateIsDecomposable(call)
 }
 
 // combineAggRuntime merges src into dst for the named aggregate.
