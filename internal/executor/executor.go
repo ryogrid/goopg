@@ -216,6 +216,12 @@ func Build(plan planner.Node) (Operator, error) {
 		return maybeInstrument(p, newGatherOp(p, func() (Operator, error) {
 			return Build(p.Child)
 		})), nil
+	case *planner.GatherMerge:
+		// Same per-worker construction as Gather; the difference is entirely in
+		// how the leader consumes the streams.
+		return maybeInstrument(p, newGatherMergeOp(p, func() (Operator, error) {
+			return Build(p.Child)
+		})), nil
 	case *planner.Distinct:
 		child, err := Build(p.Child)
 		if err != nil {

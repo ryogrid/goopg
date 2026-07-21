@@ -107,17 +107,25 @@ func MaybeAddGather(root Node, s ParallelSettings) Node {
 	}
 
 	// Find the deepest point at which the subtree below is partial-capable.
-	target, ok := findPartialSubtree(root)
+	// mergeKeys non-nil means the target is a Sort that the workers run
+	// themselves, so the leader must merge rather than concatenate.
+	target, mergeKeys, ok := findPartialSubtree(root)
 	if !ok {
 		return root
 	}
 
-	workers := computeParallelWorkers(target, s)
+	// Worker count comes from the scan, so for a Sort target it is computed
+	// from what the Sort reads, not from the Sort node itself.
+	sized := target
+	if mergeKeys != nil {
+		sized = target.(*Sort).Child
+	}
+	workers := computeParallelWorkers(sized, s)
 	if workers <= 0 {
 		return root
 	}
 
-	return rebuildWithGather(root, target, workers)
+	return rebuildWithGather(root, target, workers, mergeKeys)
 }
 
 // statementIsParallelSafe applies the whole-plan refusals. Each is a case
@@ -203,24 +211,41 @@ func tableIsUnsafeForParallel(t *catalog.Table) bool {
 // subtree as large as possible — i.e. immediately below the lowest node that
 // terminates partial-ness. PG reaches the same placement by costing partial
 // paths; here it is by construction.
-func findPartialSubtree(root Node) (Node, bool) {
+func findPartialSubtree(root Node) (Node, []SortKey, bool) {
 	cur := root
 	for {
+		// P7: a Sort directly over a partial-capable subtree does not have to
+		// terminate partial-ness. Each worker sorts its own partition and the
+		// leader merges the ordered streams — PG's
+		//
+		//   Gather Merge -> Sort -> Parallel Seq Scan
+		//
+		// which moves the sort, the expensive part, off the leader entirely.
+		// This is reported to the caller rather than decided here because it
+		// changes which Gather variant gets built, and building a plain Gather
+		// over per-worker Sorts would silently return unordered rows.
+		//
+		// goopg's Sort carries no top-N limit, so there is no per-worker
+		// truncation to reason about: every worker emits its whole partition.
+		if srt, isSort := cur.(*Sort); isSort && len(srt.Keys) > 0 &&
+			drivingSeqScan(srt.Child) != nil {
+			return srt, srt.Keys, true
+		}
 		if terminatesPartial(cur) {
 			kids := parallelChildren(cur)
 			if len(kids) != 1 {
-				return nil, false
+				return nil, nil, false
 			}
 			cur = kids[0]
 			continue
 		}
 		// cur is partial-capable if it bottoms out in an eligible seq scan.
 		if drivingSeqScan(cur) != nil {
-			return cur, true
+			return cur, nil, true
 		}
 		kids := parallelChildren(cur)
 		if len(kids) != 1 {
-			return nil, false
+			return nil, nil, false
 		}
 		cur = kids[0]
 	}
@@ -231,12 +256,15 @@ func terminatesPartial(n Node) bool {
 	switch n.(type) {
 	case *Limit, *Distinct, *DistinctOn, *WindowAgg, *SetOp,
 		*RecursiveUnion, *WorkTableScan, *Memoize, *NestedLoopIndexJoin,
-		*Aggregate, *Sort, *Gather:
-		// Aggregate and Sort terminate partial-ness in P6 because the
-		// partial/finalize split (P5's combine rules) and Gather Merge are
-		// not wired into the planner yet — the machinery exists, the
-		// placement does not. Lifting these is the next increment, not a
-		// gap in the refusal set.
+		*Aggregate, *Sort, *Gather, *GatherMerge:
+		// Aggregate still terminates partial-ness: the partial/finalize split
+		// (P5's combine rules) exists as machinery but is not placed by the
+		// planner yet.
+		//
+		// Sort remains listed because it terminates in the GENERAL case — a
+		// Sort over something that is not a plain partial scan. The one shape
+		// it does not terminate, Sort directly over a partial-capable subtree,
+		// is taken by findPartialSubtree before this check runs.
 		return true
 	}
 	return false
@@ -351,15 +379,18 @@ func tableParallelWorkersReloption(t *catalog.Table) int {
 // rebuildWithGather returns a copy of root's spine with target replaced by
 // Gather{target}. Nodes not on the path are shared by pointer; nothing is
 // mutated.
-func rebuildWithGather(root, target Node, workers int) Node {
+func rebuildWithGather(root, target Node, workers int, mergeKeys []SortKey) Node {
 	if root == target {
+		if mergeKeys != nil {
+			return NewGatherMerge(root.Pos(), root, workers, mergeKeys)
+		}
 		return NewGather(root.Pos(), root, workers)
 	}
 	kids := parallelChildren(root)
 	if len(kids) != 1 {
 		return root
 	}
-	rebuilt := rebuildWithGather(kids[0], target, workers)
+	rebuilt := rebuildWithGather(kids[0], target, workers, mergeKeys)
 	if rebuilt == kids[0] {
 		return root
 	}

@@ -122,6 +122,14 @@ func attachParallelScan(op Operator, st *parallelScanState) bool {
 		return attachParallelScan(x.child, st)
 	case *instrumentedOp:
 		return attachParallelScan(x.inner, st)
+	case *sortOp:
+		// P7. A Sort inside the partial subtree is legal ONLY under Gather
+		// Merge: each worker sorts its own partition and the leader merges the
+		// already-ordered streams. Plain Gather over per-worker Sorts would
+		// interleave them and lose the ordering, so the planner never builds
+		// that shape — see findPartialSubtree, which returns a Sort as the
+		// partial root only together with the GatherMerge it requires.
+		return attachParallelScan(x.child, st)
 	}
 	return false
 }

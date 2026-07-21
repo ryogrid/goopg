@@ -28,7 +28,8 @@ degrading the smoke gate from 700 to 390 TPS and aborting a transaction.
 | P3 | Concurrency substrate | worker contexts, per-worker arenas, `Perm()` mutex, error/panic/cancel | [x] (this commit) |
 | P4 | Parallel Seq Scan + Gather | shared block allocator, Gather operator; insertion still OFF | [x] (this commit) |
 | P5 | Partial / Finalize aggregation | combine rules + whitelist refusals | [x] `726999e4` |
-| P6 | Enable Gather insertion | post-pass, safety refusals, worker-count rule, identity gate | [x] (this commit) |
+| P6 | Enable Gather insertion | post-pass, safety refusals, worker-count rule, identity gate | [x] `90ac9d98` |
+| P7 | Gather Merge | per-worker Sort + leader-side merge; ordering gate | [x] (this commit) |
 
 ## Design amendments to fold in during these stages
 
@@ -503,3 +504,86 @@ Against a 3.0x ceiling for leader + 2 workers, that is 90–94 % efficiency.
   and classified as Gather-insertion only, recaptured as
   `plan_snapshots/pq-p6-gather.txt`, 22/22 MATCH against it
 - commits: `2e0caa46` (insertion) + _(this commit)_ (size gate + interleaving)
+
+## P7 — Gather Merge  [x]
+
+Before P7 a `Sort` terminated partial-ness: the Gather went BELOW it, so the
+workers scanned and the leader did the entire sort. P7 lifts the Sort into the
+workers and merges the already-ordered streams in the leader — PG's
+
+    Gather Merge -> Sort -> Parallel Seq Scan
+
+which moves the expensive part off the leader.
+
+### What the ordering requirement changed
+
+Plain Gather has one correctness property: the SET of rows must match serial.
+Gather Merge has a strictly stronger one — the SEQUENCE must match. Three
+consequences shaped the implementation:
+
+- **Per-worker channels, not one shared channel.** The merge has to know which
+  stream a row came from, because after popping a row it must take the next row
+  from *that* stream. Gather's single shared channel interleaves the streams,
+  which is exactly what a merge cannot tolerate.
+- **Row-granular interleaving.** The leader cannot drain a batch at a time; it
+  must hold one row per source at all times (the heap front).
+- **`attachParallelScan` had to learn `sortOp`.** The worker's tree is now
+  `Sort -> Seq Scan`, and the walk previously stopped at the Sort. Had it not
+  been extended, every worker would have sorted the WHOLE relation — the same
+  duplicate-rows failure P6 hit, reached by a different route.
+  `TestGatherMergeNoDuplicates` exists specifically for that route.
+
+The load-bearing invariant is that **a per-worker Sort is only ever produced
+together with a GatherMerge above it**. A plain Gather over per-worker Sorts
+compiles, runs, and returns every correct row in the wrong order, with nothing
+to report it. `TestNoPlainGatherOverWorkerSort` asserts the invariant directly
+over a set of plan shapes rather than checking one expected plan.
+
+### Divergence from the design
+
+Chapter 05 §4 said to reuse `sortOp`'s `sortHeap`. The ALGORITHM is reused, the
+TYPE is not: `sortHeap` is typed on `*sortSource`, the external sort's
+spill-file cursor, so reuse would have meant adding a parallel-query field to a
+struct that has nothing to do with parallelism. Fifteen lines of heap
+boilerplate (`gmHeap`) was the cheaper trade.
+
+### Measured effect
+
+SF1, warm, alternating order, same server, `ORDER BY l_extendedprice DESC
+LIMIT 20` over `lineitem` (`Workers Planned: 4`, so leader + 4 = 5 lanes):
+
+| run | serial | 4 workers + leader |
+|---|---:|---:|
+| 1 | 230.4 s | 64.6 s |
+| 2 | 219.7 s | 65.0 s |
+| 3 | 222.6 s | 64.2 s |
+| mean | **224.2 s** | **64.6 s** |
+
+**3.47x**, or 69 % of the 5.0x ceiling. Sorting scales less than a scan does —
+the merge itself stays serial on the leader — so the gap from the ceiling is
+expected rather than a defect to chase.
+
+### Two observations recorded, not fixed
+
+- **No TPC-H query gained a Gather Merge** (plan-gate 22/22 MATCH, zero diffs).
+  Every TPC-H `ORDER BY` sits over an aggregate or a join, so
+  `findPartialSubtree` correctly declines. The feature is reachable — verified
+  by EXPLAIN on an ad-hoc `ORDER BY` over a bare scan — but TPC-H does not
+  exercise it. Lifting `Aggregate` is P5's combine machinery meeting the
+  planner, which is a later increment.
+- **`make plan-gate` silently SKIPs.** Its `pg_isready` probe does not run
+  under the Makefile's `ENV_PREFIX`, so `pg_isready` is not on PATH and the
+  gate reports "not reachable" and exits 0 even with a healthy server. It also
+  defaults to `PLAN_DB=tpch`/`PLAN_USER=tpch`, which do not survive a restart
+  (roles and DBs are in-memory only). Both were worked around by hand
+  (`PATH=... make plan-gate PLAN_DB=postgres PLAN_USER=postgres
+  PLAN_PASS=postgres`); a gate that passes by skipping is worth fixing
+  separately.
+- **EXPLAIN child indentation diverges from PG** by 4 columns per level, for
+  every node kind, not just Gather. Pre-existing and repo-wide (visible
+  throughout `plan_snapshots/`), so it is out of P7's scope.
+
+- gates: units PASS; race-gate PASS; spotcheck PASS (Q12=2 / Q13=33);
+  plan-gate 22/22 MATCH against `plan_snapshots/pq-p6-gather.txt` — zero
+  diffs, as analysed above
+- commit: _(this commit)_

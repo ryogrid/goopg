@@ -456,6 +456,13 @@ func emitNodeDetailLines(n planner.Node, indent string, rows *[]Row, attachedFil
 		// ANALYZE walk instead.
 		*rows = append(*rows, Row{NewStringDatum(
 			indent + fmt.Sprintf("Workers Planned: %d", p.WorkersPlanned))})
+	case *planner.GatherMerge:
+		// PG prints Workers Planned for Gather Merge and, unlike Sort, does NOT
+		// print the merge keys (explain.c has no show_sort_keys call in the
+		// T_GatherMerge arm) — the keys are the child Sort's, and it prints
+		// them itself one line below.
+		*rows = append(*rows, Row{NewStringDatum(
+			indent + fmt.Sprintf("Workers Planned: %d", p.WorkersPlanned))})
 	case *planner.Sort:
 		if len(p.Keys) > 0 {
 			parts := make([]string, 0, len(p.Keys))
@@ -1096,6 +1103,8 @@ func describePlan(n planner.Node) string {
 		return fmt.Sprintf("%s (%s)", algo, jt)
 	case *planner.Gather:
 		return "Gather"
+	case *planner.GatherMerge:
+		return "Gather Merge"
 	case *planner.Distinct:
 		return "Unique"
 	case *planner.Aggregate:
@@ -1254,6 +1263,8 @@ func planChildren(n planner.Node) []planner.Node {
 	case *planner.Limit:
 		return []planner.Node{p.Child}
 	case *planner.Gather:
+		return []planner.Node{p.Child}
+	case *planner.GatherMerge:
 		return []planner.Node{p.Child}
 	case *planner.Distinct:
 		return []planner.Node{p.Child}

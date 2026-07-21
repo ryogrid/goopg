@@ -1929,6 +1929,33 @@ func NewGather(pos int, child Node, nWorkers int) *Gather {
 	return &Gather{pos: pos, Child: child, WorkersPlanned: nWorkers, schema: child.Output()}
 }
 
+// GatherMerge is Gather with output ordering preserved: each worker produces a
+// stream already sorted by Keys, and the leader merges them with a heap.
+//
+// The node exists — rather than sorting above a plain Gather — so the sort can
+// be PARTIAL: N workers each sort their own share in parallel and the leader
+// only merges. Sorting above a Gather would serialise the whole sort in the
+// leader and give back most of the benefit.
+//
+// P7 of docs/design/parallel-query/ (chapter 05 §4).
+type GatherMerge struct {
+	pos            int
+	Child          Node
+	WorkersPlanned int
+	// Keys is the ordering every worker's stream is already sorted by, and
+	// which the leader's merge preserves.
+	Keys   []SortKey
+	schema Schema
+}
+
+func (n *GatherMerge) Pos() int       { return n.pos }
+func (n *GatherMerge) Output() Schema { return n.schema }
+
+// NewGatherMerge wraps child in an order-preserving Gather.
+func NewGatherMerge(pos int, child Node, nWorkers int, keys []SortKey) *GatherMerge {
+	return &GatherMerge{pos: pos, Child: child, WorkersPlanned: nWorkers, Keys: keys, schema: child.Output()}
+}
+
 type Distinct struct {
 	pos    int
 	Child  Node
