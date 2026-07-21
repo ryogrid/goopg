@@ -357,6 +357,34 @@ fresh `pg_class` row carrying `reltuples`/`relpages`, with a matching reload, is
 the same shape. Follow `UpdateRelStats` (`catalog.go:12184`), which merges
 without discarding `Columns`, rather than `SetTableStats`.
 
+#### 4.2.1 Two findings from a first implementation attempt
+
+Recorded because both cost real time to find and neither is visible from
+reading the code.
+
+**The append must target the session's database, not `DefaultDBOid`.**
+`persistStatsToPGStatistic` hardcodes `catalog.DefaultDBOid`, so copying its
+`RelFileNode` for pg_class looks correct and silently does nothing:
+`pg_class` rows are written per database by CREATE TABLE, so the appended row
+lands in `base/<DefaultDBOid>/1259` while the reload scans
+`base/<sessionDB>/1259`. The row is written, is durable, and is never read.
+Use `catalogDBOids(ctx)`, which is what the DDL path uses.
+
+With that fixed, one ANALYZE + restart round-trips correctly: the reload sees
+both the CREATE TABLE row (`reltuples=0`) and the ANALYZE row
+(`reltuples=500`), and the OID de-duplication keeps the later one.
+
+**A SECOND ANALYZE + restart does not, and the cause is not yet established.**
+On the third server start the pg_class reload does not observe the relation's
+rows at all — the table is present but its relstats read zero, so something
+other than `loadUserTablesFromHeapForDB` is supplying it on that path. This is
+the steady-state case (ANALYZE runs repeatedly), so the work was reverted
+rather than landed half-working. The next attempt should start by establishing
+which code path reconstructs a relation on a start that follows a start which
+already reconstructed it — the two catalog-DDL durability mechanisms
+(pg_class heap-append versus goopg-private WAL record and startup replay) are
+the obvious suspects.
+
 **Autovacuum, correctly stated.** An earlier draft had this backwards.
 `needsVacuum` (`autovacuum/launcher.go:233-236`) is:
 
