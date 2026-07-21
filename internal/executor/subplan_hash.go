@@ -58,15 +58,25 @@ func hashedSubPlanEnabled() bool { return hashedSubPlanOn.Load() }
 //
 // The hash-safe families are deliberately narrow:
 //
-//   - hashFamNumeric: KindInt and int64-mantissa KindNumeric.
-//     datumKey routes both through canonicalNumericKey, whose
-//     trailing-zero normalisation matches compareDatum's scale-aware
-//     equality (`1` == `1.0` == `1.00`). Big-mantissa numerics
-//     (flagBigNumeric) are excluded: datumKey would read the lossy
-//     int64 lane and collide distinct values.
-//   - hashFamString: KindString only. The arena variants are NOT safe —
-//     datumKey has no arena case and would collapse every arena string
-//     into one `k:<kind>` bucket.
+//   - hashFamNumeric: KindInt and KindNumeric in BOTH mantissa lanes.
+//     datumKey routes them through canonicalNumericKey /
+//     canonicalBigNumericKey, whose shared trailing-zero normalisation
+//     matches compareDatum's scale-aware equality (`1` == `1.0` ==
+//     `1.00`) and makes the two lanes converge on one key. (Before
+//     R3-3 the big lane was excluded here because datumKey read the
+//     lossy int64 accessor — which was also silently dropping pairs in
+//     hash JOINS on such columns, the reason that fix landed in
+//     datumKey rather than in a probe-local workaround.)
+//   - hashFamString: KindString, arena-backed or not. Both resolve
+//     through d.StringValue(), and datumKey's `"s:" + …` concatenation
+//     copies the bytes into a fresh heap string, so the map key never
+//     aliases arena storage. (The pre-M0107-0002 layout had a separate
+//     KindStringArena that datumKey did not handle; that Kind no longer
+//     exists.) Equality agrees with the linear oracle by construction:
+//     compareEq compares two strings with plain `==`, exactly what
+//     datumKey's key equality expresses — compareDatum's UUID / pg_lsn
+//     / row / array normalisations are ORDERING helpers that the
+//     equality path never reaches.
 //   - hashFamBytes / hashFamBool / hashFamTime: exact-value kinds whose
 //     datumKey is injective (Time uses UnixNano; compareEq uses
 //     Time.Equal — same instant relation).
@@ -93,9 +103,10 @@ func subPlanHashFamilyOf(d Datum) subPlanHashFamily {
 	case KindInt:
 		return hashFamNumeric
 	case KindNumeric:
-		if d.Flags&flagBigNumeric != 0 {
-			return hashFamNone
-		}
+		// R3-3: big-mantissa numerics are hashable now that datumKey
+		// routes them through canonicalBigNumericKey, which shares the
+		// int64 lane's normalisation (so the two lanes converge on one
+		// key and the family need not split).
 		return hashFamNumeric
 	case KindString:
 		return hashFamString

@@ -3075,6 +3075,18 @@ func datumKey(d Datum) string {
 		// scale-0 KindNumeric. Normalise both to the same shape.
 		return canonicalNumericKey(d.Int, 0)
 	case KindNumeric:
+		// R3-3: the big-mantissa lane must not go through
+		// NumericMantissaValue(). For a flagBigNumeric datum that
+		// accessor returns d.Int, which in this lane holds the mctx
+		// (offset<<32 | len) encoding rather than the value — so two
+		// equal big numerics stored at different offsets produced
+		// DIFFERENT keys and a hash join silently dropped the pair
+		// (measured: a 3-row equi-join on numerics past int64
+		// returned 1 row). numericMant reads the correct mantissa
+		// from either lane.
+		if d.Flags&flagBigNumeric != 0 {
+			return canonicalBigNumericKey(numericMant(d), int(d.Scale))
+		}
 		return canonicalNumericKey(d.NumericMantissaValue(), int(d.Scale))
 	case KindString:
 		return "s:" + d.StringValue()
@@ -3121,6 +3133,42 @@ func canonicalNumericKey(mantissa int64, scale int) string {
 	var buf [32]byte
 	b := append(buf[:0], 'm', ':')
 	b = strconv.AppendInt(b, mantissa, 10)
+	b = append(b, ':')
+	b = strconv.AppendInt(b, int64(scale), 10)
+	return string(b)
+}
+
+// canonicalBigNumericKey is canonicalNumericKey's big.Int lane. It
+// applies the identical normalisation (strip trailing zero digit/scale
+// pairs) so the two lanes AGREE: a value that fits int64 after
+// stripping is handed back to canonicalNumericKey, which means
+// `1.0000...` in the big lane and `1` in the fast lane produce one key.
+// That convergence is what lets hashFamNumeric cover both lanes without
+// splitting the family, and it mirrors numericCmp's aligned-mantissa
+// equality — the relation compareEq actually uses.
+//
+// The big.Int allocations here are acceptable because this lane is cold:
+// the int64 fast path above handles every normal-magnitude numeric.
+func canonicalBigNumericKey(m *big.Int, scale int) string {
+	if m.Sign() == 0 {
+		return "m:0:0"
+	}
+	ten := big.NewInt(10)
+	q, r := new(big.Int), new(big.Int)
+	for scale > 0 {
+		q.QuoRem(m, ten, r)
+		if r.Sign() != 0 {
+			break
+		}
+		m.Set(q)
+		scale--
+	}
+	if m.IsInt64() {
+		return canonicalNumericKey(m.Int64(), scale)
+	}
+	var b []byte
+	b = append(b, 'm', ':')
+	b = append(b, m.String()...)
 	b = append(b, ':')
 	b = strconv.AppendInt(b, int64(scale), 10)
 	return string(b)

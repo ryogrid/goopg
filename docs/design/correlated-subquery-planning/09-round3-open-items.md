@@ -101,7 +101,24 @@ subplan_hash.go:66-72/:78 claiming otherwise are stale. What actually
 declines today: big-mantissa numerics, cross-family mixes, and
 out-of-allowlist kinds (enum, interval, toast pointer).
 
-### 2.2 Big-mantissa numeric → hashable
+### 2.2 Big-mantissa numeric → hashable (and a live wrong-results bug)
+
+**Escalation found while implementing:** the lossy accessor is not confined
+to the IN probe. `datumKey` is the canonical key for **equi-join build and
+probe sides** (`evalHashKey`, operators_join_agg.go:~818) and for grouping,
+so two equal big numerics stored at different mctx offsets produced
+different keys and their pair was silently dropped. Measured on a 3-row
+equi-join over numerics past int64: **1 pair returned instead of 3**, with
+`k = <big literal>` equality correct on the same data (proving the value
+and `compareEq` were fine and localising the fault to the key). The
+correlated-IN form failed the same way on both the hashed and the linear
+setting, because the planner decorrelates it into a semi JOIN — which uses
+the same key.
+
+This is why the fix lands in `datumKey` rather than as a probe-local
+workaround: the probe widening is a by-product of repairing a join-level
+wrong-results bug.
+
 
 Root cause of the decline: for a `flagBigNumeric` datum,
 `NumericMantissaValue()` returns `d.Int`, which in the big lane holds the
@@ -120,25 +137,31 @@ split**, exactly matching `numericCmp`'s aligned-mantissa equality. Then
 delete the `flagBigNumeric` decline (subplan_hash.go:96-98). Cost: one
 big.Int allocation per key on the cold big-numeric path only.
 
-### 2.3 NEW hazard found: hashFamString vs compareEq special normalisation
+### 2.3 The suspected hashFamString hazard — REFUTED by measurement
 
-`compareDatum` applies **special normalisation for UUID / pg_lsn /
-row-literal / array-literal shaped strings** (expr.go:2464-2551) that
-`datumKey`'s plain `"s:" + value` does **not** replicate: two strings that
-`compareEq` treats as equal (hyphenated vs non-hyphenated UUID, `0/10` vs
-`0/010` LSN) get different hash keys → the hashed probe can report a miss
-where the linear loop reports a match. These values are `KindString` and are
-**accepted into `hashFamString` today** — this is a live correctness hazard
-that predates the widening and must be fixed in the same stage.
+The review raised a plausible hazard: `compareDatum` applies special
+normalisation for UUID / pg_lsn / row-literal / array-literal shaped
+strings (expr.go:2464-2551) that `datumKey`'s plain `"s:" + value` does not
+replicate, so the hashed probe could miss where the linear loop matches.
 
-Fix direction (conservative): make `buildSubPlanHash` **decline** a string
-set (and `evalInHashProbe` decline a string operand) when any value matches
-the special-normalisation shapes that `compareDatum` treats specially —
-i.e. narrow `hashFamString` to plain strings, keeping the linear loop the
-oracle for the exotic shapes. Replicating the normalisation inside
-`datumKey` is the rejected alternative: it duplicates a subtle sibling
-(`pattern_sibling_paths_must_agree`) for a rare shape with no measured
-workload behind it.
+**It does not apply to this path.** The hashed probe's oracle is the linear
+loop, which compares with `compareEq`, and `compareEq`'s string arm is a
+plain `a.StringValue() == b.StringValue()` (expr.go:~7573) — it never
+reaches `compareDatum`'s normalisations, which are ORDERING helpers
+(`compareDatum` is the comparison used for sorts, min/max, and the numeric
+arm). `datumKey` expresses exactly the same equality, so the two agree by
+construction. Probed live on both paths with hyphen/case-varied UUIDs and
+`0/10` vs `0/010` LSN strings: hashed ≡ linear.
+
+Separately checked: uuid-TYPED columns agree with PG too, because goopg
+normalises at coercion time (the same discipline as bpchar trimming), so
+both paths return the match. Any residual `compareEq`-vs-PG deviation for
+uuid/pg_lsn equality would affect the linear loop and the hash probe
+**identically** and is therefore not a hash-probe hazard; it belongs to
+`compareEq` and gets a ledger row, not a stage.
+
+The permanent value here is a regression pin asserting hashed ≡ linear for
+these string shapes, not a fix.
 
 ### 2.4 Deliberately still declined (each with reason, ledger-recorded)
 
