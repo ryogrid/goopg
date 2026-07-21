@@ -65,6 +65,12 @@ type ParallelSettings struct {
 	DebugParallelQuery string
 	// IsSerializable suppresses parallelism under SERIALIZABLE.
 	IsSerializable bool
+	// LeaderParticipates is `parallel_leader_participation`. It reaches the
+	// planner because the split cost model needs the parallel divisor, which
+	// counts the leader as a worker while its contribution is positive
+	// (chapter 11 §1.3). Zero value false is safe: it understates the divisor,
+	// which understates the split's benefit.
+	LeaderParticipates bool
 	// BlocksForTable returns a relation's size in blocks. Optional: when nil
 	// the size gate falls back to the row estimate, which is an approximation
 	// and is recorded as such.
@@ -107,7 +113,7 @@ func MaybeAddGather(root Node, s ParallelSettings) Node {
 	}
 
 	// Find the deepest point at which the subtree below is partial-capable.
-	tgt, ok := findPartialSubtree(root)
+	tgt, ok := findPartialSubtree(root, s)
 	if !ok {
 		return root
 	}
@@ -234,7 +240,7 @@ func tableIsUnsafeForParallel(t *catalog.Table) bool {
 // subtree as large as possible — i.e. immediately below the lowest node that
 // terminates partial-ness. PG reaches the same placement by costing partial
 // paths; here it is by construction.
-func findPartialSubtree(root Node) (partialTarget, bool) {
+func findPartialSubtree(root Node, s ParallelSettings) (partialTarget, bool) {
 	cur := root
 	for {
 		// P9: an Aggregate over a partial-capable subtree splits rather than
@@ -249,7 +255,20 @@ func findPartialSubtree(root Node) (partialTarget, bool) {
 		// tail pinning the query at ~7.1 s no matter how many workers run.
 		if agg, isAgg := cur.(*Aggregate); isAgg && aggregateSplitIsSafe(agg) &&
 			drivingSeqScan(agg.Child) != nil {
-			return partialTarget{node: agg, splitAgg: true}, true
+			// The gate has to run HERE, not after the walk. Refusing must let
+			// the loop fall through terminatesPartial(*Aggregate) and place
+			// the Gather BELOW the aggregate — and that fallback is precisely
+			// the "without the split" alternative the cost model costs
+			// against.
+			//
+			// That is also why the settings are threaded in: the model needs
+			// the parallel divisor, and MaybeAddGather does not compute the
+			// worker count until after this walk has chosen a target. There is
+			// no circularity — the sizing input (agg.Child) is in scope right
+			// here — so the resolution is simply to size it now.
+			if splitAggregateIsProfitable(agg, computeParallelWorkers(agg.Child, s), s.LeaderParticipates) {
+				return partialTarget{node: agg, splitAgg: true}, true
+			}
 		}
 		// P7: a Sort directly over a partial-capable subtree does not have to
 		// terminate partial-ness. Each worker sorts its own partition and the
@@ -294,9 +313,11 @@ func terminatesPartial(n Node) bool {
 	case *Limit, *Distinct, *DistinctOn, *WindowAgg, *SetOp,
 		*RecursiveUnion, *WorkTableScan, *Memoize, *NestedLoopIndexJoin,
 		*Aggregate, *Sort, *Gather, *GatherMerge:
-		// Aggregate still terminates partial-ness: the partial/finalize split
-		// (P5's combine rules) exists as machinery but is not placed by the
-		// planner yet.
+		// Aggregate reaches here only when the split was REFUSED — either the
+		// node is not decomposable (aggregateSplitIsSafe) or the cost model
+		// declined (splitAggregateIsProfitable). Terminating is then correct
+		// and is the fallback the model costs against: the Gather goes below
+		// the aggregate, which is the pre-P9 shape.
 		//
 		// Sort remains listed because it terminates in the GENERAL case — a
 		// Sort over something that is not a plain partial scan. The one shape

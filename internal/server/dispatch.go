@@ -1201,6 +1201,7 @@ func applyParallelPostPass(node planner.Node, sess *config.SessionRegistry, ectx
 	return planner.MaybeAddGather(node, planner.ParallelSettings{
 		MaxWorkersPerGather: sessionMaxParallelWorkersPerGather(sess),
 		MinTableScanBlocks:  sessionMinParallelTableScanSize(sess),
+		LeaderParticipates:  sessionParallelLeaderParticipation(sess),
 		DebugParallelQuery:  sessionDebugParallelQuery(sess),
 		IsSerializable:      ectx.Tx.Isolation == mvcc.IsolationSerializable,
 		BlocksForTable:      parallelBlocksForTable(ectx),

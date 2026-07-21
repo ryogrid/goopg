@@ -1620,6 +1620,20 @@ type ColumnStats struct {
 	NullFrac  float64    `json:"null_frac,omitempty"`
 	MCV       []MCVEntry `json:"mcv,omitempty"`
 	Histogram []string   `json:"histogram,omitempty"`
+
+	// NDistinctFrac is distinct values as a FRACTION of the relation's rows,
+	// in (0, 1]. 1.0 means "every row is its own group"; 0 means unknown.
+	//
+	// This is PG's negative `stadistinct` (selfuncs.c get_variable_numdistinct),
+	// and it is stored as a fraction rather than a count for a specific reason:
+	// the parallel-aggregate split gate needs only the RATIO of groups to rows,
+	// never either absolute quantity. Keeping it scale-free means the gate
+	// works on a freshly started server, where TableStats.RowCount is still
+	// zero because it is never restored (ledger row pq-P6).
+	//
+	// NDistinct above remains the absolute SAMPLE count every existing
+	// consumer already reads; this field is additive and does not change it.
+	NDistinctFrac float64 `json:"ndistinct_frac,omitempty"`
 }
 
 // MCVEntry is one entry in a per-column MCV list. Frequency is

@@ -472,6 +472,19 @@ func computeColumnStats(sample []Row, colIdx int, statsTarget int, dsCtx *Contex
 
 	stats.NullFrac = float64(nullCount) / float64(len(sample))
 	stats.NDistinct = int64(len(freq))
+	// The distinct-to-rows RATIO, measured on the sample.
+	//
+	// Deliberately NOT scaled up to the table (no Haas-Stokes): the ratio is
+	// what the parallel-aggregate split gate consumes, and its sampling bias
+	// runs in the safe direction. For a low-cardinality column the sample
+	// over-states the fraction (6 distinct in 30,000 sampled rows reads as
+	// 2e-4 where the truth over 6M rows is 5e-7), which over-states the
+	// gate's reduction ratio and therefore makes it MORE likely to refuse.
+	// For a near-unique column every sampled value is distinct and the ratio
+	// is 1.0, which is exactly right and is the case the gate exists to catch.
+	if nonNull > 0 {
+		stats.NDistinctFrac = float64(len(freq)) / float64(nonNull)
+	}
 
 	if nonNull == 0 {
 		return stats

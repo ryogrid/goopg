@@ -64,8 +64,14 @@ func (c *InMemory) PGStatsRowsForDBOid(dbOid uint32) [][]string {
 			}
 
 			nullFrac := strconv.FormatFloat(cs.NullFrac, 'g', -1, 32)
+			// Same sign convention as the pg_statistic write path: PG's
+			// pg_stats.n_distinct is negative when the value scales with the
+			// relation's row count.
 			var distinctF float64
-			if cs.NDistinct > 0 {
+			switch {
+			case cs.NDistinctFrac > 0:
+				distinctF = -cs.NDistinctFrac
+			case cs.NDistinct > 0:
 				distinctF = float64(cs.NDistinct)
 			}
 			nDistinct := strconv.FormatFloat(distinctF, 'g', -1, 32)

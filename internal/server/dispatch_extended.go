@@ -124,6 +124,7 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 	node = planner.MaybeAddGather(node, planner.ParallelSettings{
 		MaxWorkersPerGather: sessionMaxParallelWorkersPerGather(sess),
 		MinTableScanBlocks:  sessionMinParallelTableScanSize(sess),
+		LeaderParticipates:  sessionParallelLeaderParticipation(sess),
 		DebugParallelQuery:  sessionDebugParallelQuery(sess),
 		// The size lookup needs only the pool and catalog, both available on
 		// the server here — unlike ectx, which does not exist yet on this path.

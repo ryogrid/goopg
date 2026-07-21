@@ -31,7 +31,8 @@ degrading the smoke gate from 700 to 390 TPS and aborting a transaction.
 | P6 | Enable Gather insertion | post-pass, safety refusals, worker-count rule, identity gate | [x] `90ac9d98` |
 | P7 | Gather Merge | per-worker Sort + leader-side merge; ordering gate | [x] `a98b5a64` |
 | P8 | Parallel Hash Join | build once in the leader, share by pointer; partial probe side | [x] `37742171` |
-| P9 | Partial / Finalize placement | split aggregates across the Gather; EXPLAIN prefixes | [x] (this commit) |
+| P9 | Partial / Finalize placement | split aggregates across the Gather; EXPLAIN prefixes | [x] `9917539d` |
+| P10 | Split cost model | gate the split on the reduction ratio; chapter 11 | [x] (this commit) |
 
 ## Design amendments to fold in during these stages
 
@@ -200,7 +201,7 @@ returns 22/22 MATCH.
 - gates: units PASS; race-gate PASS (`internal/executor`); spotcheck PASS
   (Q12=2 / Q13=33); **plan-gate: intended 20-line label-only diff, reviewed
   and recaptured; 22/22 MATCH against the new baseline**
-- commit: _(this commit)_
+- commit: `9917539d`
 
 ## P3 — Concurrency substrate  [x]
 
@@ -808,4 +809,58 @@ measured, documented hazard.
   diff the same shape (aggregate moved below the Gather, `Finalize `/`Partial `
   prefixes added), reviewed and recaptured as
   `plan_snapshots/pq-p9-partialagg.txt`, 22/22 MATCH against it
+- commit: _(this commit)_
+
+## P10 — the split cost model  [x]
+
+Chapter [11](11-partial-aggregation-cost-model.md), implemented **without** the
+pg_class persistence that chapter assumed it needed (ledger row `pq-P10`).
+
+The insight that removed the prerequisite: the gate needs the reduction ratio
+`rho = Gw*d/R`, and with the clamp `Gw = min(ndistinct, R/d)` that collapses to
+`rho = min(1, (ndistinct/R)*d)` — a RATIO, never either absolute quantity. The
+ratio is exactly PG's negative `stadistinct`, and goopg's on-disk pg_statistic
+already carried it (`codec.go:1424` documents the sign convention); only the
+sign handling was missing. Both write paths clamped negatives away and the
+restore discarded them into 0. So ANALYZE now stores the distinct-to-rows
+fraction and it round-trips through a column that already existed — no
+Haas-Stokes, no reltuples writeback, no new persistence machinery at all.
+
+The sampling bias runs the safe way. A low-cardinality column over-states its
+fraction (6 distinct in 30,000 sampled rows reads as 2e-4 where the truth over
+6M rows is 5e-7), which over-states `rho` and makes the gate MORE likely to
+refuse. A near-unique column reads 1.0, which is exact and is the case the gate
+exists for.
+
+Verified on SF1 with ANALYZE run:
+
+| shape | `n_distinct` | verdict |
+|---|---:|---|
+| Q1 — `GROUP BY l_returnflag, l_linestatus` | -1e-4 x -6.7e-5 | **splits** (Finalize / Gather / Partial) |
+| Q18 inner — `GROUP BY l_orderkey` | -0.99 | **refused**, falls back to Gather-below-aggregate |
+
+Five splits survive across the reference set; Q18 has none.
+
+### Scope limit, deliberately
+
+The gate applies only where the aggregate reads a base relation directly. The
+fraction is relative to the BASE relation's rows, but a join-fed aggregate
+reads the join's output — Q13's `c_custkey` is unique within `customer` (f=1)
+yet accounts for a tenth of the 1.5M-row join it aggregates, so applying the
+fraction there would refuse a 10x reduction. Those shapes keep today's ungated
+behaviour, which also sidesteps the large regression the design review flagged.
+It also does not descend a Project, because `columnStatsForChild` passes the
+output ordinal through unremapped — a wrong n_distinct is worse than none.
+
+### The plan-gate recapture conflates two causes, and that is stated
+
+18 of 22 queries diverged, but **the split gate is not the main cause**:
+running ANALYZE on the bench database to satisfy this feature's premise changed
+the statistics, and with them join orders. Q9's diff is a Multi-Way Hash Join
+going from 4 tables to 3 with `(stats)` annotations and real row counts — no
+aggregate involved. The gate's own effect was verified per-query by EXPLAIN
+instead, which is the only way to attribute it. Recaptured as
+`plan_snapshots/pq-p10-splitgate.txt`, 22/22 MATCH against it.
+
+- gates: units PASS; race-gate PASS; plan-gate 22/22 against the recapture
 - commit: _(this commit)_
