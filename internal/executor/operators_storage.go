@@ -1274,6 +1274,10 @@ func (o *seqScanOp) Open(ctx *Context) error {
 		return err
 	}
 	o.nBlocks = n
+	// Parallel scan: publish the relation size to the shared allocator. Every
+	// worker's scan calls this with the same value during Open; sync.Once makes
+	// the first one authoritative and supplies the happens-before edge.
+	o.pscan.setBoundary(n)
 	o.curBlock = 0
 	o.curSlot = 0
 	o.slotMax = 0
@@ -1393,6 +1397,10 @@ func (o *seqScanOp) rewind() error {
 		return err
 	}
 	o.nBlocks = n
+	// Parallel scan: publish the relation size to the shared allocator. Every
+	// worker's scan calls this with the same value during Open; sync.Once makes
+	// the first one authoritative and supplies the happens-before edge.
+	o.pscan.setBoundary(n)
 	o.curBlock = 0
 	o.curSlot = 0
 	o.slotMax = 0

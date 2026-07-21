@@ -78,6 +78,13 @@ type gatherOp struct {
 	// selfCancelled records that WE cancelled the group (early Close), so
 	// Close can tell a self-inflicted 57014 apart from a genuine failure.
 	selfCancelled bool
+
+	// pscan is the shared block allocator every child tree's driving scan is
+	// wired to. Without it each tree would scan the WHOLE relation and the
+	// Gather would return N copies of every row — which is exactly what
+	// happened the first time these pieces were connected, and what the
+	// serial-vs-parallel identity check caught.
+	pscan *parallelScanState
 }
 
 func newGatherOp(p *planner.Gather, buildChild func() (Operator, error)) *gatherOp {
@@ -113,6 +120,8 @@ func (o *gatherOp) Open(ctx *Context) error {
 
 	o.group = NewParallelGroup(ctx.Ctx)
 	o.ch = make(chan rowBatch, gatherChanDepth*(n+1))
+	// One allocator shared by every child tree, including the leader's.
+	o.pscan = newParallelScanState(0)
 
 	// Worker arenas are allocated HERE, by the leader, before any goroutine
 	// starts: mctx.Acquire appends to parent.children without synchronisation,
@@ -145,6 +154,9 @@ func (o *gatherOp) Open(ctx *Context) error {
 		if err != nil {
 			return err
 		}
+		// The leader takes blocks from the same allocator as the workers —
+		// it is a peer, not an extra full scan.
+		attachParallelScan(child, o.pscan)
 		if err := child.Open(ctx); err != nil {
 			_ = child.Close()
 			return err
@@ -169,6 +181,7 @@ func (o *gatherOp) runWorker(idx int, wctx *Context) error {
 	if err != nil {
 		return err
 	}
+	attachParallelScan(child, o.pscan)
 	defer func() { _ = child.Close() }()
 	if err := child.Open(wctx); err != nil {
 		return err

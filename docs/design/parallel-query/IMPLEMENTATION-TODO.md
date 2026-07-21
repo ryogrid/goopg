@@ -2,7 +2,7 @@
 
 | field | value |
 | --- | --- |
-| status | **P0–P5 complete** (scaffolding done, zero user-visible behaviour change). P6 — the first phase that changes plans for every user — is presented for approval separately |
+| status | **P0–P6 complete.** Gather insertion is live behind the size gate; parallel execution is verified identical to serial |
 | started | 2026-07-21 |
 | branch | `parallel-query` |
 | start HEAD | `592f166a` (bundle commit) |
@@ -27,7 +27,8 @@ degrading the smoke gate from 700 to 390 TPS and aborting a transaction.
 | P2 | `HashAggregate` label correction | rename before `Partial `/`Finalize ` prefixes cement the misnomer | [x] (this commit) |
 | P3 | Concurrency substrate | worker contexts, per-worker arenas, `Perm()` mutex, error/panic/cancel | [x] (this commit) |
 | P4 | Parallel Seq Scan + Gather | shared block allocator, Gather operator; insertion still OFF | [x] (this commit) |
-| P5 | Partial / Finalize aggregation | combine rules + whitelist refusals | [x] (this commit) |
+| P5 | Partial / Finalize aggregation | combine rules + whitelist refusals | [x] `726999e4` |
+| P6 | Enable Gather insertion | post-pass, safety refusals, worker-count rule, identity gate | [x] (this commit) |
 
 ## Design amendments to fold in during these stages
 
@@ -403,3 +404,71 @@ planning-time GUC reads go through the session registry rather than the
 executor context. It also needs the refusals chapter 08 §1.1 lists — DML,
 SERIALIZABLE, row marks, temp tables, virtual catalog relations, and
 parallel-unsafe functions.
+
+## P6 — Enable Gather insertion  [x]
+
+The first stage whose behaviour a user can observe.
+
+- [x] `planner.MaybeAddGather` (`internal/planner/parallel.go`) — a post-pass
+      over the finished plan, mirroring the NLI/Memoize rewrite shape rather
+      than adding partial paths to a join search that has no path abstraction.
+- [x] **Runs AFTER the plan-cache lookup, on both protocol paths.**
+      `plancache.go` is process-wide and cross-session, keyed on
+      namespace-oid + normalised SQL only, so caching a plan that already
+      contained a Gather would let one session's worker count leak into
+      another's execution — `SET max_parallel_workers_per_gather = 0` would
+      silently fail to disable parallelism. The cache holds SERIAL plans; the
+      wrap is per statement.
+- [x] **Non-mutating**, and pinned by test: the pass copies only the spine and
+      shares every untouched subtree by pointer. The cached node is read
+      concurrently by every other session running the same SQL, so an in-place
+      edit would be a race that race-gate catches only under load.
+- [x] Wired at **three** sites, not two — the simple path's cache block, the
+      extended path, and `executeOneSimpleStmt`'s own fallback, which plans for
+      statements the cache block skips (multi-statement queries, NOTIFY/2PC,
+      pending DDL). A Gather appearing on one entry point but not another is
+      how a feature comes to look intermittent.
+- [x] Safety refusals, each enforced and tested: DML, SERIALIZABLE, row marks
+      (`SELECT … FOR UPDATE` is not DML but still stamps xmax), temp tables,
+      virtual catalog relations (backed by the `Pg*Rows` callbacks that worker
+      contexts deliberately nil), and the `GOOPG_PARALLEL=off` kill switch.
+- [x] Worker count reproduces upstream's `compute_parallel_worker()` ×3 ladder
+      including the `parallel_workers` reloption precedence — a reloption goopg
+      has parsed and stored since M0110-0001 and never read.
+- [x] **No stats → no Gather**, the opposite default from the semi/anti NLI
+      gate. Accepting without evidence risks workers for a tiny relation;
+      declining keeps today's behaviour.
+- [x] `EXPLAIN` descends into `Explain.Child`, so `EXPLAIN <query>` renders the
+      same plan the query executes. Without it EXPLAIN would systematically
+      under-report parallelism — worse than useless, since EXPLAIN is the tool
+      people use to check whether parallelism happened. (Found because the
+      first live check showed no Gather.)
+
+**The bug this stage's identity gate caught.** Connecting the Gather to the
+allocator revealed that nothing wired the allocator INTO the child trees: each
+worker built an ordinary serial scan and read the whole relation. On live
+TPC-H data the parallel query returned **240 298 rows where serial returned
+120 149** — exactly double. Nothing else would have noticed: the plan looked
+right, no assertion failed, no race fired. `attachParallelScan` fixes it, and
+the walk deliberately fails toward serial for any node it does not model,
+because duplicating rows is a wrong-results bug while declining to parallelise
+is a missed optimisation.
+
+### Honest status: shipped, but dormant by default
+
+plan-gate is **22/22 MATCH** — no TPC-H plan changed. That is not the size gate
+being conservative in principle; it is that goopg's ANALYZE statistics are
+in-memory and lost on restart, so a freshly started server has none, and the
+no-stats refusal declines every query. Verified reachable with
+`SET debug_parallel_query = on`, where a Gather appears and returns results
+identical to serial (`count(*)` 120 149 and `sum` 6 007 450 both ways; also
+verified on an `l_shipmode` filter at 856 240 rows).
+
+So the feature is correct and live, but on a fresh server it will not fire
+until `ANALYZE` has run. Making it fire by default needs relation sizes from
+the storage manager rather than the row-estimate approximation — the
+`BlocksForTable` hook exists for exactly that and is currently unset.
+
+- gates: units PASS; **race-gate PASS**; spotcheck PASS (Q12=2 / Q13=33);
+  plan-gate 22/22 MATCH; live serial-vs-parallel identity verified on SF1
+- commit: _(this commit)_

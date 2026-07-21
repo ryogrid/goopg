@@ -14,6 +14,7 @@ package executor
 // complete description of the work split.
 
 import (
+	"sync"
 	"sync/atomic"
 
 	"github.com/goopg/goopg/internal/storage"
@@ -36,14 +37,32 @@ type parallelScanState struct {
 	// exhaustion is detected without a second synchronisation point.
 	next atomic.Uint64
 
-	// nBlocks is the scan boundary, captured once by the leader before any
-	// worker starts. Immutable thereafter.
-	nBlocks storage.BlockNumber
+	// nBlocks is the scan boundary. It is not known when the Gather creates
+	// this state — the relation size is read in seqScanOp.Open — so the first
+	// scan to open publishes it under initOnce and the rest observe it.
+	// Immutable thereafter.
+	nBlocks  storage.BlockNumber
+	initOnce sync.Once
 }
 
-// newParallelScanState builds the allocator for a scan of nBlocks blocks.
+// newParallelScanState builds an allocator whose boundary is not yet known.
 func newParallelScanState(nBlocks storage.BlockNumber) *parallelScanState {
-	return &parallelScanState{nBlocks: nBlocks}
+	s := &parallelScanState{}
+	if nBlocks > 0 {
+		s.setBoundary(nBlocks)
+	}
+	return s
+}
+
+// setBoundary publishes the relation size. Idempotent: every worker's scan
+// calls it during Open with the same value, and only the first takes effect.
+// sync.Once supplies the happens-before edge that makes nBlocks safe to read
+// without further synchronisation.
+func (s *parallelScanState) setBoundary(n storage.BlockNumber) {
+	if s == nil {
+		return
+	}
+	s.initOnce.Do(func() { s.nBlocks = n })
 }
 
 // nextBlock claims the next block for the calling worker, or reports
@@ -72,4 +91,37 @@ func (s *parallelScanState) claimed() uint64 {
 		return 0
 	}
 	return s.next.Load()
+}
+
+// attachParallelScan wires op's driving sequential scan to the shared block
+// allocator, making that tree scan a PARTITION of the relation rather than all
+// of it.
+//
+// This is the step whose absence produced N copies of every row the first time
+// the Gather and the allocator were connected: each worker built an ordinary
+// serial seqScanOp, and every one of them read the whole table. The
+// serial-vs-parallel identity check caught it immediately — 240298 rows where
+// serial returned 120149 — which is precisely why that check exists.
+//
+// The walk is deliberately narrow. It descends only through the row-wise
+// wrappers a partial subtree may contain, and stops at the first scan. A node
+// it does not model is left alone, which means the tree simply stays serial —
+// duplicating rows is a wrong-results bug, whereas declining to parallelise is
+// merely a missed optimisation, so the ambiguous case must fail toward serial.
+func attachParallelScan(op Operator, st *parallelScanState) bool {
+	if st == nil {
+		return false
+	}
+	switch x := op.(type) {
+	case *seqScanOp:
+		x.pscan = st
+		return true
+	case *filterOp:
+		return attachParallelScan(x.child, st)
+	case *projectOp:
+		return attachParallelScan(x.child, st)
+	case *instrumentedOp:
+		return attachParallelScan(x.inner, st)
+	}
+	return false
 }

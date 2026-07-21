@@ -963,6 +963,10 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 				}
 				precached = freshNode
 			}
+			// P6: wrap AFTER the cache read/write, so the CACHE holds the
+			// serial plan and the Gather is chosen per statement from this
+			// session's GUCs. See applyParallelPostPass.
+			precached = applyParallelPostPass(precached, sess, ectx)
 		}
 		// M0097-0059: enforce statement_timeout by deriving a deadline
 		// context. The executor checks ctx.Ctx.Err() at each outer-row
@@ -1172,6 +1176,33 @@ func sessionOpportunisticPrune(sess *config.SessionRegistry) bool {
 		return true // GUC not registered yet, default on
 	}
 	return strings.EqualFold(strings.TrimSpace(eff), "on")
+}
+
+// applyParallelPostPass wraps a finished plan in a Gather when the statement
+// and the session's settings allow it. P6 of docs/design/parallel-query/.
+//
+// It is called AFTER the plan-cache lookup on BOTH protocol paths, and that
+// placement is load-bearing rather than incidental. plancache.go is
+// process-wide and cross-session, keyed on namespace-oid + normalised SQL only
+// — no session identity, no GUC fingerprint. Caching a plan that already
+// contained a Gather would let one session's max_parallel_workers_per_gather
+// leak into another's execution, so `SET max_parallel_workers_per_gather = 0`
+// would silently fail to disable parallelism. The cache therefore stores
+// SERIAL plans, and this wraps per statement.
+//
+// planner.MaybeAddGather is correspondingly non-mutating: it returns a new
+// root sharing the cached children, because that cached node is being read
+// concurrently by every other session running the same SQL.
+func applyParallelPostPass(node planner.Node, sess *config.SessionRegistry, ectx *executor.Context) planner.Node {
+	if node == nil || ectx == nil {
+		return node
+	}
+	return planner.MaybeAddGather(node, planner.ParallelSettings{
+		MaxWorkersPerGather: sessionMaxParallelWorkersPerGather(sess),
+		MinTableScanBlocks:  sessionMinParallelTableScanSize(sess),
+		DebugParallelQuery:  sessionDebugParallelQuery(sess),
+		IsSerializable:      ectx.Tx.Isolation == mvcc.IsolationSerializable,
+	})
 }
 
 // ── parallel-query session GUCs (docs/design/parallel-query, P1) ──────────
@@ -2468,6 +2499,16 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 		}
 		// Note: plan cache storage happens at the dispatch level (caller
 		// stores if cacheKey was computed). This function only executes.
+		//
+		// P6: this fallback plans for statements the caller's cache block
+		// skipped (multi-statement queries, NOTIFY/2PC, pending DDL). It
+		// needs the parallel post-pass too — the caller only applies it to
+		// the cached path, and a Gather that appears on one entry point but
+		// not another is exactly the kind of inconsistency that makes a
+		// feature look intermittent.
+		if sess, _ := ctx.AdvisorySessionIdentity.(*config.SessionRegistry); sess != nil {
+			node = applyParallelPostPass(node, sess, ctx)
+		}
 	}
 	// Transaction verbs: BEGIN/COMMIT/ROLLBACK require per-connection
 	// explicit transaction management (M0096-0005). BEGIN promotes the

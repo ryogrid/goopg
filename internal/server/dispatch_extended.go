@@ -111,6 +111,22 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 		return &extendedQueryResult{CommandTag: transactionTag(tx.Verb)}, nil
 	}
 
+	// P6: wrap AFTER the plan-cache read/write above, so the cache holds the
+	// SERIAL plan and the Gather is chosen per statement from this session's
+	// GUCs. See applyParallelPostPass in dispatch.go for why the placement
+	// matters.
+	//
+	// Note this path reads the GUCs from `sess` directly rather than from an
+	// executor context: on the extended protocol, planning happens ~40 lines
+	// before ectx exists. The isolation level is likewise not yet known here,
+	// and the extended path always begins a fresh READ COMMITTED transaction
+	// below, so SERIALIZABLE cannot apply.
+	node = planner.MaybeAddGather(node, planner.ParallelSettings{
+		MaxWorkersPerGather: sessionMaxParallelWorkersPerGather(sess),
+		MinTableScanBlocks:  sessionMinParallelTableScanSize(sess),
+		DebugParallelQuery:  sessionDebugParallelQuery(sess),
+	})
+
 	// Use an offset procNum to avoid overwriting the connection's own
 	// ProcArray slot when an explicit transaction is active. The offset
 	// mirrors the COPY transaction strategy in copy.go.
