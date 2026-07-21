@@ -977,7 +977,7 @@ was `distinctOp.Open` (the `Unique` node), not the NL join.
 
 | field | value |
 | --- | --- |
-| status | in progress |
+| status | **complete** (all five open rows closed: 2 were live wrong-results bugs, 1 was falsified, 2 implemented) |
 | started | 2026-07-21 |
 | branch | `planner-kaizen3` (base `872b424d`) |
 | scope | the five open rows from round 2 report §6: derived-table zero-rows, hashed-probe family limits, DML-sublink lowering, LEFT+residual NLI hazard, composite-equijoin EXISTS. Design first (user direction): [`09-round3-open-items.md`](09-round3-open-items.md) |
@@ -992,7 +992,7 @@ was `distinctOp.Open` (the `Unique` node), not the NL join.
 | R3-2 | item 1: zero-rows falsification + regression pins | World A confirmed on SF1 (1 375 096 = 1 375 096) | [x] (this commit) |
 | R3-4 | item 5: composite EXISTS/NOT EXISTS + M23–M26 | also wrote the missing Project-strip guard | [x] (this commit) |
 | R3-5 | item 3: DML-sublink lowering | dedicated wrapper, NOT a walkPlanExprs extension | [x] (this commit) |
-| R3-6 | FINAL: gates + tripwire spotcheck + report + ledger resolutions | | [ ] |
+| R3-6 | FINAL: gates + sweep + report + ledger resolutions | | [x] (this commit) |
 
 ## R3-1 — NLI LEFT residual semantics  [x] `70792111`
 
@@ -1090,3 +1090,19 @@ was `distinctOp.Open` (the `Unique` node), not the NL join.
       (the second reads the column being written, so snapshot semantics actually
       discriminate) — every case re-run with the rescan and hashed switches off
 - [x] gates: units PASS; race-gate PASS; spotcheck Q12=2/Q13=33; plan-gate 22/22
+
+## R3-6 — FINAL  [x]
+
+- [x] close-out SF1 sweep (`evidence/sf1-r3-final-bb90089a.txt`, 600 s budget,
+      guarded wrapper): **24/24 complete, zero errors, every row count
+      byte-identical to round 2** (verified by diffing the evidence files with
+      timings stripped); total ≈ 1 162 s vs 1 167 s — 0.4 %, i.e. noise, which
+      is the correct outcome for a round that changed no TPC-H plan
+- [x] plan-gate 22/22 MATCH at every stage, as predicted: none of the five
+      items occurs in TPC-H (no LEFT join with a cross-relation ON residual, no
+      numerics past int64, no composite-correlated EXISTS, no DML at all)
+- [x] full `go test -race ./internal/executor ./internal/planner` PASS
+- [x] report: [`analysis/tpch-csq-round3-verification-20260721.md`](../../../analysis/tpch-csq-round3-verification-20260721.md)
+- [x] all five ledger rows resolved, each recording what its original framing
+      got wrong; deliberate exclusions re-recorded with reasons
+- [x] no new kill switches introduced this round
