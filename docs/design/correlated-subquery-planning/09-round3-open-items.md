@@ -171,8 +171,11 @@ big lane.
 (planner.go:94) — the gap is entirely inside host discovery:
 `walkPlanExprs` (unnest.go:970-1147) has cases for ~20 node kinds but
 **none for `*Update` / `*Delete` / `*Insert` / `*Merge`**, so a DML root
-falls through the type switch without descending into `Update.Child` (where
-`planUpdate` hangs the WHERE as a `Filter`, planner.go:8532-8574). Even a
+falls through the type switch without descending into `Update.Child`. Note
+`planUpdate` hangs the WHERE as a `Filter` **on its fallback arm only**
+(planner.go:8553-8560); the `planIndexScanFromWhere` arm (:8541-8552)
+absorbs the predicate into an `*IndexScan` probe key, so DML host discovery
+must handle both `Update.Child` shapes. Even a
 CTE-wrapped DML is missed: the `*CTEDMLPrefix` case recurses into the DML
 node, which then no-ops. `unnestSubqueriesInPlan` is likewise DML-blind
 (called only from `planSelect`), so DML WHERE sublinks are neither unnested
@@ -207,29 +210,34 @@ ledger-recorded):
   workload;
 - `Merge` clauses and `OnConflict` expressions — same argument.
 
-**Implementation shape: a dedicated wrapper, NOT an extension of the shared
-walker.** `walkPlanExprs` has eight non-test callers, and all but host
-discovery are *detection predicates* whose answers would change if the
-walker suddenly descended into DML nodes: `planContainsLateralJoin`
-(subplan_lower.go:276), `planHasOuterRef` (planner.go:10225),
-`collectUnnestParams` (unnest.go:704), the all-accounted check
-(unnest.go:730), `planHasOuterRefRemaining` (unnest.go:941), the deep-walk
-worker (unnest.go:894), a bushy-DP visit (bushy.go:1728), plus the exported
-`WalkPlanExprs` (walk_export.go:10).
+**Implementation mandate: a dedicated wrapper, NOT an extension of the
+shared walker.** `walkPlanExprs` has **ten non-test call sites plus a
+cross-package export** (`walk_export.go:10` → executor/subplan.go:162).
+Most are detection predicates that could absorb extra descent safely
+(over-detection just bails), but **two cannot**:
 
-Worse, `planContainsLateralJoin` documents a **paired-coverage contract**
-with the lowering traversal: "over-detection is safe (a bail),
-under-detection is impossible for shapes the lowering traversal accepts,
-because that traversal bails on every node kind `walkPlanExprs` does not
-also cover" (subplan_lower.go:~273-276). Widening the shared walker
-perturbs both sides of an argument that currently holds by construction.
+- `bushy.go:1728` (`remapOuterRefsInSubplan`) — a **rewriter**: it mutates
+  `OuterColumnRef.Index`, so newly-visited DML-child expressions would be
+  remapped.
+- `unnest.go:704` (`collectUnnestParams`) — a **harvester**: it would
+  collect equijoin pairs from inside a CTE-DML body.
+
+Since DML nodes are **already reachable** from the shared walker via
+`*CTEDMLPrefix` (unnest.go:1124-1126), adding DML cases in place would
+newly expose CTE-DML bodies to both. `planContainsLateralJoin` moreover
+documents a **paired-coverage contract** with the lowering traversal
+("over-detection is safe (a bail), under-detection is impossible … because
+that traversal bails on every node kind `walkPlanExprs` does not also
+cover", subplan_lower.go:~273-276) — widening perturbs both sides of an
+argument that currently holds by construction.
 
 Therefore R3-5 adds a **host-discovery-local** walker (e.g.
 `walkPlanExprsIncludingDML`) that handles the DML cases and delegates
 everything else to `walkPlanExprs`, and changes **only** the
 `lowerSubPlanParams` call site (subplan_lower.go:117). Every other caller
-keeps today's exact behaviour, and the paired-coverage contract is
-re-argued in a comment at the new wrapper rather than silently invalidated.
+keeps today's exact behaviour; the paired-coverage contract is re-argued in
+a comment at the new wrapper; and a test pins that `walkPlanExprs` itself
+still does not descend into `Update.Child` (protecting bushy.go:1728).
 
 Halloween/EPQ safety: lowering changes only *how* the outer value reaches
 the subplan (param slot vs. stack push), never *when* it runs or which
@@ -275,6 +283,14 @@ residual `Predicate` to a **LEFT** NLI today, ungated by join type:
 - **Q19 OR-factoring** (nl_index_join.go:380-386): a LEFT ON that is a pure
   OR-of-ANDs with a common equi conjunct.
 
+The first route depends on `j.LeftKey`/`RightKey` having been pre-attached:
+`extractEquiKeys` (nl_index_join.go:1084-1092) inspects `j.Predicate` only
+when it is a *bare* top-level `OpEq`, so an AND-shaped ON residual reaches
+the leftover code solely via the `LeftKey != nil` arm that
+planner.go:2050-2055 populates for LEFT. Verified in-process:
+`cust LEFT JOIN ordr ON c_key = o_key AND o_total > c_bal` yields
+`NLI{Type: JoinTypeLeft, Predicate != nil}`.
+
 So the hazard is live, merely un-exercised by TPC-H's 22 queries.
 
 ### 4.2 The two executor defects (operators_nljoin.go)
@@ -297,6 +313,15 @@ So the hazard is live, merely un-exercised by TPC-H's 22 queries.
   WHERE filter. The hash path already does this correctly
   (operators_join_agg.go:1023-1028 emits the padded row without
   re-evaluating the predicate).
+
+  Worse in practice than the ledger implied: `nliConsumedByProbe`
+  (nl_index_join.go:815-833) matches the probe key by **pointer identity**
+  (`bin.Right == k`) against a rebuilt `keys` slice, which generally fails
+  — so the retained residual typically still *contains the equi probe-key
+  conjunct*. The null-padded row then fails on that conjunct alone, meaning
+  **every** unmatched outer row is dropped regardless of whether the ON
+  residual references an inner column. Confirmed live: the NLI path
+  returned 1 of 4 rows where the hash path returned 4.
 
 ### 4.3 Fix design
 
@@ -347,9 +372,14 @@ S1c made it bail. Correlated IN has the same guard indirectly
 
 The machinery already exists end-to-end:
 
-- **Template:** the scalar path already does multi-param — key on
-  `params[0]`, AND the remaining pairs onto `join.Predicate`
-  (unnest.go:2018-2025).
+- **Template:** the scalar path already does multi-param
+  (unnest.go:2012-2025, :2040-2042) — but note what it actually does: it
+  ANDs **every** pair, `params[0]` included, onto `join.Predicate` and
+  *additionally* sets `LeftKey`/`RightKey` from pair 0. Note also the
+  coordinate asymmetry the EXISTS port must reproduce: predicate
+  `innerKeyExprs[i].Index = outerWidth + i` (merged coordinates) vs
+  `RightKey.Index = 0` (inner-child-local). Copying the template without
+  noticing this produces silently mis-indexed residuals.
 - **Executor:** the lazy hash semi/anti walks every hash-bucket match and
   applies the full `plan.Predicate` per match
   (operators_join_agg.go:1097-1124) — an equi residual is evaluated exactly
@@ -373,11 +403,13 @@ join predicate alongside the lifted non-equi residuals.
   composite index consumes all pairs, and leaves uncovered pairs as
   residuals otherwise — the design pins this with an indexed-vs-unindexed
   dual test rather than keeping the bail.
-- **Project-strip index math:** the inner-plan simplification at
-  unnest.go:3688-3703 strips a non-identity `Project` assuming key-column
-  reachability in the raw scan schema; the composite fix must verify every
-  `params[i].SubCol.Index` remains valid against the stripped schema or
-  refuse the strip.
+- **Project-strip index math:** the strip at unnest.go:3696-3703 is
+  **unconditional** — its comment claims a "check whether RightKey column
+  index is accessible in the projected output" that is not implemented, so
+  this is a stale-comment/dead-guard defect today, not merely a widening
+  caveat. The composite fix must *write* that guard (validate every
+  `params[i].SubCol.Index` against the stripped schema, else refuse the
+  strip), not verify an existing one.
 - **NOT EXISTS NULL semantics are safe with a plain anti join** (no
   `NullAware`): EXISTS is a pure existence test — an equality with NULL on
   either side is UNKNOWN, never TRUE, so a NULL key is a non-match, not a
@@ -412,14 +444,18 @@ a ledger row. All server starts under the cgroup wrapper
 (`scripts/csq-bench-server.sh` / `scripts/goopg-test-run.sh`), which since
 R2-0 refuses `memory.high < GOMEMLIMIT`.
 
+Ordering rationale: §1.4 resolves item 1 as World A (no bug), so its stage
+is documentation-and-pins. The only remaining **live wrong-results** items
+are item 4 and §2.3's string-normalisation hazard, so both precede it.
+
 | # | stage | scope | named tripwires |
 |---|---|---|---|
 | R3-0 | this design chapter + TODO round-3 part | docs only | — |
-| R3-1 | item 4: NLI LEFT executor fix (defects 1+2) + T1/T2 + planner leak pin; S6-unwrap LEFT exclusion re-recorded as cost-motivated | race-gate; Q13 spotcheck (hash path must stay untouched); plan-gate zero-diff expected |
-| R3-2 | item 1: close World A (falsification evidence + two regression pins) or fix World B | spotcheck; the SF1 probe pair |
-| R3-3 | item 2: string-shape decline (hazard first) + big-numeric widening + stale-comment fix + fixture growth | units gate table; plan-gate zero-diff expected |
-| R3-4 | item 5: composite EXISTS/NOT EXISTS + M23–M27 + NLI composite pins | Q4/Q21/Q22 spotcheck (semi/anti shapes must not move); plan-gate zero-diff expected (no TPC-H query has a composite-correlated EXISTS) |
-| R3-5 | item 3: DML-sublink lowering per §3 | dual-path DML tests; race-gate if executor state touched |
+| R3-1 | item 4: NLI LEFT executor fix (defects 1+2) + T1/T2 + planner leak pin; S6-unwrap LEFT exclusion re-recorded as cost-motivated | race-gate; Q13 spotcheck (hash path must stay untouched); plan-gate zero-diff expected — **but the SF1 set has no LEFT+cross-relation-residual query, so plan-gate green does not exercise this fix; the end-to-end row-count assertions do** |
+| R3-3 | item 2: string-shape decline (the live hazard, first) + big-numeric widening + stale-comment fix + fixture growth | units gate table; plan-gate zero-diff expected |
+| R3-2 | item 1: close World A (falsification evidence + two regression pins) | spotcheck; the SF1 probe pair |
+| R3-4 | item 5: composite EXISTS/NOT EXISTS + M23–M27 + NLI composite pins + the Project-strip guard | Q4/Q21/Q22 spotcheck (semi/anti shapes must not move); plan-gate zero-diff expected (no TPC-H query has a composite-correlated EXISTS); **explicit coordinate-space assertion** (Predicate merged vs RightKey child-local) |
+| R3-5 | item 3: DML-sublink lowering per §3 | dual-path DML tests; race-gate if executor state touched; pin that `walkPlanExprs` still does not descend into `Update.Child` |
 | R3-6 | FINAL: full gate sweep + capped SF1 spotcheck-plus (the five tripwire queries) + round-3 report + ledger row resolutions | all |
 
 Plan-stability expectation: **zero TPC-H plan changes in every stage** —

@@ -986,10 +986,30 @@ was `distinctOp.Open` (the `Unique` node), not the NL join.
 
 | # | Stage | Scope | Status |
 |---|---|---|---|
-| R3-0 | design chapter + this TODO part | docs only | [ ] |
-| R3-1 | item 4: NLI LEFT executor fix (2 defects) + pins | live wrong-results bug (leak paths exist) | [ ] |
-| R3-2 | item 1: zero-rows falsification + regression pins | World A confirmed on SF1 | [ ] |
-| R3-3 | item 2: string-shape hazard fix + big-numeric widening | includes NEW hashFamString hazard | [ ] |
-| R3-4 | item 5: composite EXISTS/NOT EXISTS + M23–M27 | | [ ] |
-| R3-5 | item 3: DML-sublink lowering | scope per design §3 | [ ] |
+| R3-0 | design chapter + this TODO part | docs only; agent-reviewed, review findings folded back in | [x] `3656dbda` (+ review amendments) |
+| R3-1 | item 4: NLI LEFT executor fix (2 defects) + pins | live wrong-results bug: NLI returned 1 of 4 rows vs hash's 4 | [x] `70792111` |
+| R3-3 | item 2: string-shape hazard fix + big-numeric widening | the other live hazard — ordered before R3-2 per review | [ ] |
+| R3-2 | item 1: zero-rows falsification + regression pins | World A confirmed on SF1 (1 375 096 = 1 375 096) | [ ] |
+| R3-4 | item 5: composite EXISTS/NOT EXISTS + M23–M27 | also writes the missing Project-strip guard | [ ] |
+| R3-5 | item 3: DML-sublink lowering | dedicated wrapper, NOT a walkPlanExprs extension | [ ] |
 | R3-6 | FINAL: gates + tripwire spotcheck + report + ledger resolutions | | [ ] |
+
+## R3-1 — NLI LEFT residual semantics  [x] `70792111`
+
+- [x] root cause confirmed live: the ledger's "planner declines LEFT+residual"
+      premise is false — two ungated routes (leftover retention, OR-factoring)
+      deliver `NLI{Type: LEFT, Predicate != nil}`; both pinned by
+      `internal/planner/nli_left_residual_leak_test.go`
+- [x] defect 1: match flag set on row-produced (no LEFT reset) → fixed by
+      recording on predicate-PASS; field renamed `leftJoinEmitted` →
+      `outerMatched` since the old name no longer described its contents
+- [x] defect 2: null-pad fallback gated on evaluating the residual against the
+      padding → now unconditional (PG evaluates a join condition only against
+      real inner rows), matching the hash path's long-standing behaviour
+- [x] severity found worse than recorded: `nliConsumedByProbe` compares the
+      probe key by pointer identity, so the residual keeps the equi conjunct
+      and EVERY unmatched outer row was dropped
+- [x] S6 unwrap's LEFT exclusion re-recorded as **cost**-motivated (needs
+      D6.3b's `innerUnwrapCostAccepts` treatment to admit LEFT)
+- [x] gates: units PASS; race-gate PASS; spotcheck Q12=2/Q13=33 PASS;
+      plan-gate 22/22 MATCH
