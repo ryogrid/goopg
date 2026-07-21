@@ -1092,9 +1092,26 @@ func describePlan(n planner.Node) string {
 		return "Unique"
 	case *planner.Aggregate:
 		if len(p.GroupExprs) == 0 {
+			// PG labels an ungrouped aggregate (AGG_PLAIN) "Aggregate"
+			// regardless of strategy, so this one is already faithful.
 			return "Aggregate"
 		}
-		return fmt.Sprintf("GroupAggregate (%d keys)", len(p.GroupExprs))
+		// P2 (docs/design/parallel-query/06 §4.1): this used to say
+		// "GroupAggregate", which in PG means specifically the SORTED,
+		// streaming strategy (AGG_SORTED). goopg has exactly one grouped
+		// implementation and it is a hash aggregate — aggregateOp.Open
+		// builds `groups := map[string]*groupRuntime{}` for every case,
+		// with no sorted/streaming variant and no hash-agg spill. The label
+		// was therefore describing a strategy the engine does not have.
+		//
+		// Corrected here rather than later because P5 prefixes these labels
+		// with "Partial "/"Finalize " for parallel aggregation, which would
+		// otherwise cement "Partial GroupAggregate" onto a hash node.
+		//
+		// The "(%d keys)" suffix is goopg's own; PG emits a separate
+		// "Group Key: <exprs>" detail line instead. Kept as-is to hold this
+		// stage to the rename — see the TODO's follow-up note.
+		return fmt.Sprintf("HashAggregate (%d keys)", len(p.GroupExprs))
 	case *planner.WindowAgg:
 		return fmt.Sprintf("WindowAgg (%d funcs)", len(p.Funcs))
 	case *planner.SeqScan:

@@ -24,7 +24,7 @@ degrading the smoke gate from 700 to 390 TPS and aborting a transaction.
 |---|---|---|---|
 | P0 | GUC fidelity fixes | `UnitBlocks`, `min_parallel_*` units, `max_parallel_workers`, enum bool synonyms, cost ceilings | [x] (this commit) |
 | P1 | Session GUC plumbing | `session*` readers + typed context fields, both protocol paths | [x] (this commit) |
-| P2 | `HashAggregate` label correction | rename before `Partial `/`Finalize ` prefixes cement the misnomer | [ ] |
+| P2 | `HashAggregate` label correction | rename before `Partial `/`Finalize ` prefixes cement the misnomer | [x] (this commit) |
 | P3 | Concurrency substrate | worker contexts, per-worker arenas, `Perm()` mutex, error/panic/cancel, per-worker instrumenters | [ ] |
 | P4 | Parallel Seq Scan + Gather | shared block allocator, Gather operator; insertion still OFF | [ ] |
 | P5 | Partial / Finalize aggregation | `AggMode`, combine rules, whitelist refusals | [ ] |
@@ -160,4 +160,40 @@ the pre-existing simple-path-only inconsistency survived.
 - gates: units PASS; race-gate PASS (`internal/executor`, `internal/config`);
   spotcheck PASS (Q12=2 / Q13=33); **plan-gate 22/22 MATCH** — zero diffs as
   predicted, nothing reads the values yet
+- commit: _(this commit)_
+
+## P2 — `HashAggregate` label correction  [x]
+
+- [x] `describePlan` emitted `GroupAggregate (%d keys)` for grouped
+      aggregates. In PG, `GroupAggregate` means specifically the **sorted,
+      streaming** strategy (`AGG_SORTED`) — a strategy goopg does not have.
+      Verified before renaming: `aggregateOp.Open` builds
+      `groups := map[string]*groupRuntime{}` for every case
+      (`operators_join_agg.go:1312`), with no sorted/streaming variant and no
+      hash-agg spill. The label was describing a strategy the engine lacks.
+- [x] The ungrouped case keeps `Aggregate`, which is already faithful — PG
+      labels `AGG_PLAIN` that way regardless of strategy.
+- [x] Done now rather than later because P5 prefixes these labels with
+      `Partial `/`Finalize `, which would otherwise cement
+      `Partial GroupAggregate` onto a hash node.
+- [x] Verified no test or code depends on the old string — the only
+      references were design docs and archived evidence captures, which are
+      historical records and correctly keep the label they were taken with.
+
+**Follow-up recorded, not done:** the `(%d keys)` suffix is goopg's own
+invention; PG emits a bare `HashAggregate` plus a separate
+`Group Key: <exprs>` detail line, which goopg does not emit at all. Adding it
+is a genuine fidelity improvement but a *different* change, and bundling it
+here would have muddied the plan-gate review — two edits landing in one
+recapture is exactly how an unintended diff gets waved through.
+
+Plan-gate diff review (the point of this stage): 17/22 queries diverged,
+**20 changed lines, every one of them the label**. Classified mechanically by
+sorting the diff — no tree shape, key count, filter, or scan line moved. New
+baseline captured as `plan_snapshots/pq-p2-hashagg.txt`; re-run against it
+returns 22/22 MATCH.
+
+- gates: units PASS; race-gate PASS (`internal/executor`); spotcheck PASS
+  (Q12=2 / Q13=33); **plan-gate: intended 20-line label-only diff, reviewed
+  and recaptured; 22/22 MATCH against the new baseline**
 - commit: _(this commit)_
