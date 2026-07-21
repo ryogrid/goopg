@@ -2,7 +2,7 @@
 
 | field | value |
 | --- | --- |
-| status | in progress |
+| status | **P0–P5 complete** (scaffolding done, zero user-visible behaviour change). P6 — the first phase that changes plans for every user — is presented for approval separately |
 | started | 2026-07-21 |
 | branch | `parallel-query` |
 | start HEAD | `592f166a` (bundle commit) |
@@ -27,7 +27,7 @@ degrading the smoke gate from 700 to 390 TPS and aborting a transaction.
 | P2 | `HashAggregate` label correction | rename before `Partial `/`Finalize ` prefixes cement the misnomer | [x] (this commit) |
 | P3 | Concurrency substrate | worker contexts, per-worker arenas, `Perm()` mutex, error/panic/cancel | [x] (this commit) |
 | P4 | Parallel Seq Scan + Gather | shared block allocator, Gather operator; insertion still OFF | [x] (this commit) |
-| P5 | Partial / Finalize aggregation | `AggMode`, combine rules, whitelist refusals | [ ] |
+| P5 | Partial / Finalize aggregation | combine rules + whitelist refusals | [x] (this commit) |
 
 ## Design amendments to fold in during these stages
 
@@ -331,3 +331,75 @@ and the zero-worker case.
   (Q12=2 / Q13=33); plan-gate 22/22 MATCH — zero diffs as predicted, nothing
   inserts a Gather yet
 - commit: _(this commit)_
+
+## P5 — Partial / Finalize aggregation  [x]
+
+The combine layer: merging the per-group partial states workers produce.
+
+- [x] **No serialisation needed at all.** PG's `aggserialfn`/`aggdeserialfn`
+      exist solely because an `internal`-typed transition state cannot cross a
+      process boundary. Workers here hand the `aggRuntime` across a channel
+      directly, which removes an entire feature surface — and with it a
+      classic round-trip mismatch bug class. What it costs instead: a DEEP
+      MERGE with an explicit rule per pointer field, not a struct add.
+- [x] `aggregateIsDecomposable` is a **whitelist**. `applyAgg` ends in a
+      `default:` arm that silently does `count++; sum += arg.Int` for any
+      unrecognised name, so a blacklist would let an aggregate added later
+      split through it and return garbage. Refusals: `DISTINCT`, aggregate
+      `ORDER BY`, `array_agg`/`string_agg` (order-dependent), `WITHIN GROUP`,
+      user aggregates without `COMBINEFUNC`, and anything unknown.
+- [x] `avg` needed no new state: `sum` and `avg` share one transition arm
+      accumulating `(sum, count)` and diverge only in `finishAgg`, so the
+      composite transition state PG must synthesise already exists.
+- [x] **The float variance lane — the trap.** `floatSx` is Σx, *not* the mean
+      (read the field comment, not the algorithm's name), so `Sx` adds plainly
+      and only `Sxx` needs a correction term. Implemented as PG's
+      `float8_combine`, including its `N == 0` cases handled **before** the
+      general formula — that formula divides by both counts, and a worker
+      producing an empty partial for a group is routine.
+- [x] The `regr_*`/`covar_*`/`corr` family adds plainly, and for a reason
+      worth recording: goopg stores **uncentered** raw sums, unlike PG's
+      centered Youngs-Cramer regression state. It is the opposite of the
+      variance case, so the two must not be reasoned about together.
+- [x] Exact `big.Int` and `big.Rat` lanes add, with nil treated as zero — a
+      worker that saw no rows for a group leaves them nil.
+- [x] Variance NaN convention (`floatM2 = NaN`) combined separately from
+      `floatSpecial`, which covers only sum/avg.
+
+**Verified the tests catch the design's own error.** Substituting the design's
+original Chan-Golub-LeVeque-over-means formula makes
+`TestCombineVarianceMatchesSerial` report `var_pop` as **7.75 and 16.0 where
+serial says 4** — the silent wrong-results failure chapter 06 warns about,
+committed by chapter 06's first draft and caught here.
+
+Coverage: the whitelist and every refusal; exact aggregates asserted
+**bit-identical** to serial across 2/3/4-way splits; the variance family within
+a ULP tolerance (float lanes cannot be bit-identical — chapter 09 §1's stated
+carve-out); empty partials in both directions; the full NaN/±Inf precedence
+table; the exact-integer lane including a nil partial; and the loud failure for
+an aggregate with no rule.
+
+- gates: units PASS; **race-gate PASS**; spotcheck PASS (Q12=2 / Q13=33);
+  plan-gate 22/22 MATCH — zero diffs, nothing plans a split yet
+- commit: _(this commit)_
+
+---
+
+## Status after P5
+
+The substrate is complete and every stage is independently committed. What
+exists: correct GUCs, per-session plumbing, worker contexts with a proven
+ownership contract, a parallel scan allocator, a working Gather with leader
+participation, and combine rules for every decomposable aggregate.
+
+What does **not** exist: any plan containing a Gather. Nothing in the planner
+inserts one, so behaviour is byte-identical to before this work — which is why
+plan-gate is 22/22 at every stage.
+
+**P6 is the phase that changes that**, and it is the first that affects every
+user. Its prerequisites are recorded above under "Design amendments": the
+post-pass must run AFTER the plan-cache lookup and must be non-mutating, and
+planning-time GUC reads go through the session registry rather than the
+executor context. It also needs the refusals chapter 08 §1.1 lists — DML,
+SERIALIZABLE, row marks, temp tables, virtual catalog relations, and
+parallel-unsafe functions.
