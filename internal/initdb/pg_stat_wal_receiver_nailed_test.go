@@ -108,9 +108,13 @@ func TestPgClassRowForViewSetsZeroRelfilenode(t *testing.T) {
 	if row[7].Int != 0 {
 		t.Fatalf("view pg_class.relfilenode=%d want 0", row[7].Int)
 	}
-	// relhasrules=false until ev_action format is fully compatible with PG18.
-	// See pgClassRow: the `relHasRules = true` line is commented out pending Step 3dm.
+	// NAILED replication system views (12100-12106) keep relhasrules=false: their
+	// canonical ev_action IS present, but PG serves these views from its own
+	// built-in relcache entries, so enabling standby-side rule expansion for them
+	// is a separate track. M0123-S3 sub-slice 2c landed canonical ev_action +
+	// relhasrules=true for USER views only (buildUserPGClassRow reads
+	// tbl.RuleIsCanonical); this bootstrap pgClassRow path is unaffected.
 	if row[20].BoolValue() {
-		t.Fatalf("view pg_class.relhasrules=true want false (Step 3dm not yet landed)")
+		t.Fatalf("nailed view pg_class.relhasrules=true want false")
 	}
 }

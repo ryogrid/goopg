@@ -80,7 +80,21 @@ func ResolveIndexPredicate(predicate parser.Expr, tbl *catalog.Table) (Expr, err
 	return resolveExpr(predicate, ctx)
 }
 
+// Plan is the public planning entry: dispatch to the per-statement
+// planner, then run the PARAM_EXEC lowering pass (D4.1,
+// subplan_lower.go) exactly once over the finished tree — after every
+// rewrite that can remove or reshape sublinks, and with one flat
+// param-slot space for the whole statement (nested planSelect calls
+// must not each run it, or slot IDs would collide across levels).
 func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
+	node, err := planStmt(stmt, cat)
+	if err != nil {
+		return nil, err
+	}
+	return lowerSubPlanParams(node), nil
+}
+
+func planStmt(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 	switch s := stmt.(type) {
 	case *parser.SelectStmt:
 		// Rewrite `(srf(...)).*` target-list indirection-stars into
@@ -879,6 +893,10 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		ctx.parent = planParent
 	}
 
+	// preDPUnnested marks that the S5a pre-DP path already ran the
+	// sublink pull-up, so the legacy post-pushdown call site must not
+	// run it a second time.
+	preDPUnnested := false
 	if s.Where != nil {
 		// Aggregate functions are not allowed in WHERE. M0097-0035.
 		// Exception: correlated outer-scope aggregates (all column refs reference
@@ -909,11 +927,26 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 				return nil, err
 			}
 			node = &Filter{pos: s.Where.Pos(), Child: node, Predicate: pred}
-			// Attempt bushy-join DP when all tables have ANALYZE
-			// stats. This replaces the left-deep CROSS chain with
-			// a DPccp-style optimal bushy tree that eliminates
-			// Cartesian products. See internal/planner/bushy.go.
-			if f, ok := node.(*Filter); ok {
+			if unnestPreDPEnabled() && whereEligibleForPreDPUnnest(pred) {
+				// S5a (D3.1): pull up sublinks BEFORE join-order
+				// search — matching upstream's pull_up_sublinks-
+				// before-join-planning order — then run the join
+				// search on the subtree below the pinned semi/anti
+				// spine. Engaged only for EXISTS/IN-family WHERE
+				// sublinks; see predp.go for the scope rationale
+				// and the post-search spine re-resolution.
+				f := node.(*Filter)
+				origChain := f.Child
+				node = unnestSubqueriesInPlan(node)
+				node = runJoinSearchBelowPinned(node, origChain, ctx, cat)
+				preDPUnnested = true
+			} else if f, ok := node.(*Filter); ok {
+				// Legacy order (GOOPG_UNNEST_PREDP=off, or a scalar-
+				// family sublink in the WHERE): bushy-join DP when all
+				// tables have ANALYZE stats. This replaces the
+				// left-deep CROSS chain with a DPccp-style optimal
+				// bushy tree that eliminates Cartesian products. See
+				// internal/planner/bushy.go.
 				if newChild, newPred := tryBushyDP(f.Child, f.Predicate, ctx, cat); newPred == nil {
 					node = newChild // all conjuncts consumed → remove Filter
 				} else if newChild != f.Child {
@@ -938,11 +971,15 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		}
 	}
 
-	// Unnest correlated scalar subqueries after predicate pushdown
-	// has finalised the join tree. Subqueries that are unnestable
-	// (equijoin correlation, simple aggregate) are rewritten as
-	// GROUP BY aggregate + hash join. See internal/planner/unnest.go.
-	node = unnestSubqueriesInPlan(node)
+	// Unnest correlated subqueries. With the S5a pre-DP position
+	// engaged the pull-up already ran before join search above; this
+	// legacy call site covers everything else (single-table paths,
+	// scalar-family statements, GOOPG_UNNEST_PREDP=off). Subqueries
+	// that are unnestable are rewritten to semi/anti joins or GROUP BY
+	// aggregate + hash join. See internal/planner/unnest.go.
+	if !preDPUnnested {
+		node = unnestSubqueriesInPlan(node)
+	}
 
 	// Rewrite chains of ≥3 hash-joined tables into a single
 	// MultiHashJoin node.  Column indices are remapped inside

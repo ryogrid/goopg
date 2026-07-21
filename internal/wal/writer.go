@@ -1522,13 +1522,34 @@ func (s *state) appendPGCompat(payload []byte) (uint64, uint64, error) {
 	// space between the drain and the write, avoiding errWALBufferReservedOutOfRange.
 	needsDrain := s.walBuf != nil && int64(reserveSize) > s.walBuf.free()-s.walBuf.reservedBytes.Load()
 	if s.walBuf == nil || !s.walBuf.canHold(reserveSize) || needsDrain {
+		// Hold appendMu.Lock() across the ENTIRE Path A critical section —
+		// drain, the direct writeAt, the trailing walBuf.reset, and the
+		// tracker resync. Path A writes its record straight to the segment
+		// file (bypassing the stripe ring) and does NOT reserve its
+		// [writePos, end) LSN range in the insertPosTracker. If concurrent
+		// fast-path stripe writers (appendMu.RLock) were allowed to run
+		// during the writeAt window — as an earlier version that released
+		// appendMu before writeAt permitted — they would reserve into that
+		// same range from the not-yet-advanced curr, land bytes in the ring,
+		// and publish a tail that the trailing walBuf.reset(end) then rewinds.
+		// The rewind leaves a stripe's writeReserved landing BELOW the
+		// (rewound) drain tail, which the drain goroutine is concurrently
+		// reading — a data race caught by TestDrainSafetyStress (M-NIGHTLY
+		// AI-20260717-010601-001). Freezing RLock stripe writers for the whole
+		// section is the invariant this path's comment always claimed
+		// ("appendMu.Lock() is held across drain + write") but the
+		// release-before-writeAt code had silently broken. Lock ordering is
+		// unchanged (writeMu → appendMu); the exclusive Lock only blocks
+		// fast-path appenders for the duration of this uncommon overflow/
+		// oversized-record write, and Path A already holds writeMu so no
+		// other slow path or flush holder runs concurrently anyway.
 		s.appendMu.Lock()
+		defer s.appendMu.Unlock()
 		// Publish + drain any buffered bytes before the direct write.
 		if s.walBuf != nil && s.walBuf.resident() > 0 {
 			curr, _ := s.core.Load()
 			s.core.PublishUpTo(int64(curr))
 			if err := s.drainBufferBytes(s.walBuf.resident(), drainReasonOverflow); err != nil {
-				s.appendMu.Unlock()
 				return 0, 0, err
 			}
 		}
@@ -1539,25 +1560,17 @@ func (s *state) appendPGCompat(payload []byte) (uint64, uint64, error) {
 		writePos := int64(trackerCurr)
 		record, realRecLen, err := encodeRecordXLog(payload, trackerPrev)
 		if err != nil {
-			s.appendMu.Unlock()
 			return 0, 0, err
 		}
 		stream, leading := emitWithPageHeaders(record, realRecLen, writePos, s.cfg.SegmentSize, s.sysID, s.tli)
 		start := uint64(writePos) + uint64(leading) + 1
-		s.writePos = writePos + int64(len(stream))
-		end := uint64(s.writePos)
-		s.appendMu.Unlock()
+		end := uint64(writePos) + uint64(len(stream))
 
 		if err := s.writeAt(writePos, stream); err != nil {
-			s.appendMu.Lock()
-			if s.writePos == writePos+int64(len(stream)) {
-				s.writePos = writePos
-			}
-			s.appendMu.Unlock()
 			return 0, 0, err
 		}
+		s.writePos = int64(end)
 
-		s.appendMu.Lock()
 		if s.walBuf != nil {
 			s.walBuf.reset(int64(end))
 		}
@@ -1571,7 +1584,6 @@ func (s *state) appendPGCompat(payload []byte) (uint64, uint64, error) {
 		// concurrent tryAppend goroutines start at the correct position.
 		// prevRecPtr field update dropped: tracker prev is authoritative.
 		s.core.resetPosition(end, start-1)
-		s.appendMu.Unlock()
 		return start, end, nil
 	}
 

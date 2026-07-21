@@ -150,14 +150,61 @@ class TestRepairWithBacktickContent(unittest.TestCase):
         )
         repaired = repair_table(table)
         # The backtick content `d|e` should be in cell [3] (0-indexed),
-        # which is one of the "keep" cells (not merged).
-        self.assertIn("`d|e`", repaired.data_rows[0].cells[3].content)
+        # which is one of the "keep" cells (not merged).  Its inner pipe is
+        # escaped to \| because GFM tables split on pipes even inside code.
+        self.assertIn(r"`d\|e`", repaired.data_rows[0].cells[3].content)
         # Cell [5] is "g" (also a keep cell).
         self.assertEqual("g", repaired.data_rows[0].cells[5].content)
         # The last cell should be the merged cells h and i.
         last_cell = repaired.data_rows[0].cells[-1].content
         self.assertIn("h", last_cell)
         self.assertIn("i", last_cell)
+
+
+class TestRepairProsePipes(unittest.TestCase):
+    """Bare prose pipes must be escaped in place, not merged right-to-left."""
+
+    def _seven_col_table(self, data_line: str) -> Table:
+        from ..parser import parse_document
+
+        header = "| c1 | c2 | c3 | c4 | c5 | c6 | c7 |"
+        sep = "| --- | --- | --- | --- | --- | --- | --- |"
+        text = f"{header}\n{sep}\n{data_line}\n"
+        doc = parse_document(text)
+        tables = [b for b in doc.blocks if isinstance(b, Table)]
+        return tables[0]
+
+    def test_single_prose_pipe_row_stays_seven_columns(self):
+        """A 7-col row with ``{A|B|C}`` must not become oversplit/merged."""
+        line = (
+            "| - | 2026-07-18 | task | "
+            "REVOKE {ADMIN|INHERIT|SET} OPTION | c5 | c6 | c7 |"
+        )
+        table = self._seven_col_table(line)
+        repaired = repair_table(table)
+        cells = repaired.data_rows[0].cells
+        self.assertEqual(len(cells), 7)
+        # The real trailing columns must be preserved, NOT merged together.
+        self.assertEqual(cells[4].content, "c5")
+        self.assertEqual(cells[5].content, "c6")
+        self.assertEqual(cells[6].content, "c7")
+        # The prose pipes are escaped in place inside column 4.
+        self.assertEqual(cells[3].content, r"REVOKE {ADMIN\|INHERIT\|SET} OPTION")
+
+    def test_c_style_double_pipe_row_stays_seven_columns(self):
+        """A 7-col row with ``(!X||Y)`` must not be split into empty cells."""
+        line = (
+            "| - | 2026-07-18 | task | "
+            "flag=(!IsMatView||IsPopulated) here | c5 | c6 | c7 |"
+        )
+        table = self._seven_col_table(line)
+        repaired = repair_table(table)
+        cells = repaired.data_rows[0].cells
+        self.assertEqual(len(cells), 7)
+        self.assertEqual(cells[6].content, "c7")
+        self.assertEqual(
+            cells[3].content, r"flag=(!IsMatView\|\|IsPopulated) here"
+        )
 
 
 if __name__ == "__main__":

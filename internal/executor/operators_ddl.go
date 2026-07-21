@@ -13215,6 +13215,17 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 	// restart leaked the table into the postgres namespace (with its data
 	// unreachable, since the reloaded Table lost its DBOid routing).
 	heapDBOid := tableCatalogHeapDBOid(ctx)
+	// M0123-S3 sub-slice 2c: resolve the view's canonical pg_rewrite ev_action
+	// (and set tbl.RuleIsCanonical) BEFORE buildUserPGClassRow so the streamed
+	// pg_class heap row's relhasrules matches the rule that will be written to
+	// pg_rewrite below. A PG standby reads relhasrules from this heap row; a late
+	// flag would leave it false and the standby couldn't expand the canonical
+	// rule it did stream. viewEvAction is threaded to writeViewRewriteRow so the
+	// resolution runs exactly once.
+	viewEvAction := tbl.ViewDef
+	if ctx.Pool != nil && tbl.ViewDef != "" && (tbl.IsMatView || tbl.View != nil) {
+		viewEvAction, tbl.RuleIsCanonical = canonicalViewEvAction(ctx, tbl, tbl.ViewDef)
+	}
 	classRel := storage.RelFileNode{
 		DBOid:  heapDBOid,
 		RelOid: catalog.RelationRelationId,
@@ -13269,11 +13280,11 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 		if col.Dropped || col.DefaultExpr == nil {
 			continue
 		}
-		exprSQL := catalog.FormatExprForAttrdef(col.DefaultExpr)
-		if exprSQL == "" {
+		adbin := canonicalAttrdefText(col)
+		if adbin == "" {
 			continue
 		}
-		if err := writeAttrdefRow(ctx, tbl.OID, int16(col.Ordinal+1), exprSQL); err != nil {
+		if err := writeAttrdefRow(ctx, tbl.OID, int16(col.Ordinal+1), adbin); err != nil {
 			return fmt.Errorf("pg_attrdef col %q: %w", col.Name, err)
 		}
 	}
@@ -13289,7 +13300,7 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 	// standby replays the heap insert. (matview IsPopulated survives a restart via
 	// pg_class.relispopulated — 02e item A.)
 	if ctx.Pool != nil && tbl.ViewDef != "" && (tbl.IsMatView || tbl.View != nil) {
-		if err := writeViewRewriteRow(ctx, tbl, tbl.ViewDef); err != nil {
+		if err := writeViewRewriteRow(ctx, tbl, viewEvAction); err != nil {
 			return fmt.Errorf("pg_rewrite (view/matview): %w", err)
 		}
 	}
@@ -15397,10 +15408,10 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 					// B3.5: capture the OID before the registry drop, then
 					// stamp xmax on the pg_ts_dict heap row (kind 105 retired).
 					var dictOID uint32
-					if ud := im.FindTSDict(s.Names[0].Name, s.Names[0].Schema); ud != nil {
+					if ud := im.FindTSDict(s.Names[0].Name, s.Names[0].Schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); ud != nil {
 						dictOID = ud.OID
 					}
-					if im.DropTSDict(s.Names[0].Name, s.Names[0].Schema) {
+					if im.DropTSDict(s.Names[0].Name, s.Names[0].Schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 						// Return on a successful registry drop rather than
 						// falling through to the DropCompatObject gate below,
 						// which is keyed by the CURRENT name — a renamed
@@ -16587,7 +16598,7 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 			Template:   templOID,
 			InitOption: serializeTSDictOptions(s.TSDictOptions),
 		}
-		if _, err := im.CreateTSDict(ud, schema); err != nil {
+		if _, err := im.CreateTSDict(ud, schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); err != nil {
 			return &ExecError{Code: "42710", Message: err.Error()}
 		}
 		// B3.5 (doc 02d §2): the dictionary journals as a real pg_ts_dict
@@ -16939,12 +16950,12 @@ func (o *ddlOp) execAlterTSDict(s *parser.AlterTSDictStmt) error {
 	}
 	switch s.Action {
 	case "rename":
-		if err := im.RenameTSDict(s.DictName.Name, schema, s.NewName); err != nil {
+		if err := im.RenameTSDict(s.DictName.Name, schema, s.NewName, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); err != nil {
 			return &ExecError{Code: "42704", Message: err.Error()}
 		}
 		// B3.5: the rename is a canonical pg_ts_dict heap UPDATE (kind 114
 		// retired) — dictname changed, so the row moves under the new key.
-		if ud := im.FindTSDict(s.NewName, schema); ud != nil {
+		if ud := im.FindTSDict(s.NewName, schema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); ud != nil {
 			_ = upsertTSDictCatalogRow(o.ctx, ud)
 		}
 		return nil
@@ -16953,17 +16964,17 @@ func (o *ddlOp) execAlterTSDict(s *parser.AlterTSDictStmt) error {
 		if newSchema == "" {
 			newSchema = "public"
 		}
-		if !im.SetTSDictSchema(s.DictName.Name, schema, newSchema) {
+		if !im.SetTSDictSchema(s.DictName.Name, schema, newSchema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)) {
 			return &ExecError{Code: "42704", Message: fmt.Sprintf("text search dictionary %q does not exist", s.DictName.Name)}
 		}
 		// B3.5: SET SCHEMA is a canonical pg_ts_dict heap UPDATE (kind 115
 		// retired) — dictnamespace changed, row under the new schema's key.
-		if ud := im.FindTSDict(s.DictName.Name, newSchema); ud != nil {
+		if ud := im.FindTSDict(s.DictName.Name, newSchema, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid)); ud != nil {
 			_ = upsertTSDictCatalogRow(o.ctx, ud)
 		}
 		return nil
 	case "options":
-		newInitOption, err := im.AlterTSDictOptions(s.DictName.Name, schema, s.Options)
+		newInitOption, err := im.AlterTSDictOptions(s.DictName.Name, schema, s.Options, catalog.NamespaceDBOid(o.ctx.CurrentDatabaseOid))
 		if err != nil {
 			// verify_dictoptions' rejection (ValidateTSDictOptions) surfaces as
 			// ERRCODE_INVALID_PARAMETER_VALUE (22023); any other failure here is

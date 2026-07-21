@@ -29,12 +29,33 @@ func (o *distinctOp) Schema() planner.Schema { return o.schema }
 
 func (o *distinctOp) Open(ctx *Context) error {
 	o.ctx = ctx
+	// Reset accumulation state so re-Open re-drains from scratch.
+	// Neither Open nor Close cleared these before Stage 9 (S2c): a
+	// SubPlan handle re-running a DISTINCT body accumulated the
+	// previous outer row's rows and kept a stale cursor (found by
+	// matrix row M12). Same unconditionally-correct pattern as the
+	// Stage-7 limitOp reset.
+	o.rows = nil
+	o.idx = 0
 	if err := o.child.Open(ctx); err != nil {
 		return err
 	}
 	// Drain all rows and deduplicate.
 	seen := make(map[string]struct{})
+	rowN := 0
 	for {
+		// Cancellation: check ctx.Err() every 1024 rows so a
+		// CancelRequest (or the client-EOF watcher) interrupts a
+		// DISTINCT over a multi-million-row child. Same throttled
+		// pattern as runNestedLoop (M0058-0005 family); this loop was
+		// part of the csq-S6 spin incident's plan (`Unique` over a
+		// 6 M-row lineitem scan).
+		rowN++
+		if rowN&0x3FF == 0 && ctx.Ctx != nil {
+			if cerr := ctx.Ctx.Err(); cerr != nil {
+				return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+			}
+		}
 		slot, err := o.child.Next()
 		if err == EOF {
 			break

@@ -151,8 +151,14 @@ func Build(plan planner.Node) (Operator, error) {
 		if err != nil {
 			return nil, err
 		}
-		// Inner is always an *IndexScan by plan-node contract.
-		innerScan := newIndexScanOp(p.Inner)
+		// Inner is always an *IndexScan by plan-node contract; an
+		// optional InnerMemo (S7) interposes the memoize cache — its
+		// Child aliases the same *IndexScan, so the probe machinery
+		// is identical either way.
+		var innerScan nliInner = newIndexScanOp(p.Inner)
+		if p.InnerMemo != nil {
+			innerScan = newMemoizeOp(p.InnerMemo, innerScan.(*indexScanOp))
+		}
 		// M0071-0013 Stage D-1: NLI now composes outer + inner via
 		// a persistent VirtualSlot. outerMS.row is overwritten per
 		// outer row before the inner Rescan; the IndexScan still

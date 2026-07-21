@@ -1129,7 +1129,7 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 		return
 	}
 
-	s.runPostStartupLoop(connCtx, cancelEntry, r, w, sess, logger, isReplication, app, params["database"], sessCtx, pid, procNum)
+	s.runPostStartupLoop(connCtx, cancelEntry, raw, r, w, sess, logger, isReplication, app, params["database"], sessCtx, pid, procNum)
 }
 
 // isReplicationStartupParam interprets the StartupMessage `replication`
@@ -1408,7 +1408,7 @@ func (s *Server) cleanupSessionTempObjects(sess *config.SessionRegistry) {
 	im.DropTempNamespace(owner)
 }
 
-func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, r *protocol.FrameReader, w *protocol.FrameWriter, sess *config.SessionRegistry, logger *slog.Logger, isReplication bool, appName, dbName string, sessCtx *mctx.Context, pid uint32, procNum int32) {
+func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, raw net.Conn, r *protocol.FrameReader, w *protocol.FrameWriter, sess *config.SessionRegistry, logger *slog.Logger, isReplication bool, appName, dbName string, sessCtx *mctx.Context, pid uint32, procNum int32) {
 	extended := newExtendedState()
 	// procNum is the connection-lifetime ProcArray slot acquired by
 	// serveConn via mvcc.AcquireConnSlot (M0107-0004; the slot is reused
@@ -1554,7 +1554,18 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, r *
 				// connection and the cancellation must not fire until
 				// handleQueryOrCopy completes.
 			}
+			// Arm the client-EOF watcher so a client that dies mid-query
+			// (no CancelRequest ever arrives) cancels queryCtx instead of
+			// leaving the backend computing for hours (csq-S6 deferral).
+			// Replication connections manage their own socket lifecycle
+			// and never arm it; the watcher is stopped the moment the
+			// handler returns, before the loop reads the next frame.
+			var eofWatch *clientEOFWatch
+			if !isReplication {
+				eofWatch = startClientEOFWatch(raw, queryCancel, logger)
+			}
 			nextCopyIn, err := s.handleQueryOrCopy(queryCtx, r, w, sess, f.Payload, connTx, prepStmts)
+			eofWatch.Stop()
 			entry.clearQueryCancel()
 			queryCancel()
 			if err != nil {
@@ -1616,7 +1627,16 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, r *
 		case protocol.MsgExecute:
 			queryCtx, queryCancel := context.WithCancel(ctx)
 			entry.setQueryCancel(queryCancel)
+			// Same client-EOF watcher as the MsgQuery path: an extended-
+			// protocol Execute is where the long-running work happens.
+			// MSG_PEEK never consumes, so frames the client pipelined
+			// behind Execute (Sync etc.) are untouched.
+			var eofWatch *clientEOFWatch
+			if !isReplication {
+				eofWatch = startClientEOFWatch(raw, queryCancel, logger)
+			}
 			em, err := s.handleExecuteFrame(queryCtx, extended, f.Payload, w, sess, connTx)
+			eofWatch.Stop()
 			entry.clearQueryCancel()
 			queryCancel()
 			if err != nil {

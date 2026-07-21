@@ -18,6 +18,7 @@ import (
 	"github.com/goopg/goopg/internal/executor"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/parser"
+	"github.com/goopg/goopg/internal/pgnodes"
 	"github.com/goopg/goopg/internal/storage"
 	"github.com/goopg/goopg/internal/wal"
 )
@@ -272,7 +273,7 @@ func loadColumnDefaultsFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory
 		if !ok || tbl == nil {
 			continue // table dropped since the row was written
 		}
-		expr, perr := parser.ParseExpr(ad.adbin)
+		expr, perr := rebuildAttrdefExpr(ad.adbin)
 		if perr != nil {
 			continue
 		}
@@ -284,6 +285,67 @@ func loadColumnDefaultsFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory
 		}
 	}
 	return nil
+}
+
+// rebuildAttrdefExpr turns a stored pg_attrdef.adbin back into a goopg
+// default-expression AST. M0123-S2 (sub-slice 2): adbin now comes in two forms,
+// discriminated by the first byte — a canonical PG18 pg_node_tree always opens
+// with '{' (nodeToString's WRITE_NODE_TYPE brace), whereas goopg's legacy SQL
+// text never does (a bare expression like `40 + 2` / `upper('x')` / `'{}'::jsonb`
+// starts with a digit, letter, quote, or sign, never '{'). Canonical bytes are
+// read by pgnodes.Read → Rebuild (the reload-time inverse of ResolveForColumn);
+// SQL text keeps going through parser.ParseExpr. A malformed value in either form
+// returns an error so the caller degrades that one column to a NULL default
+// rather than failing startup, matching the pre-canonical behavior.
+func rebuildAttrdefExpr(adbin string) (parser.Expr, error) {
+	if len(adbin) > 0 && adbin[0] == '{' {
+		node, err := pgnodes.Read(adbin)
+		if err != nil {
+			return nil, err
+		}
+		return pgnodes.Rebuild(node)
+	}
+	return parser.ParseExpr(adbin)
+}
+
+// rebuildViewFromEvAction turns a stored pg_rewrite.ev_action back into a goopg
+// view-definition AST. M0123-S3 sub-slice 2c: ev_action now comes in two forms,
+// discriminated by the leading "(" — a canonical PG18 rule action is a List of
+// query trees, so nodeToString(list) always opens "({QUERY ...})", whereas
+// goopg's legacy SQL-text fallback is a SELECT statement that never starts with
+// "(" (a parenthesized subquery view like "(SELECT ...)" is not in the
+// single-base-relation subset the canonical writer accepts, so it always took
+// the SQL-text path and never produced a leading "("). Canonical bytes are read
+// by pgnodes.ReadRuleAction → RebuildViewQuery (the reload-time inverse of
+// ResolveViewQuery); SQL text keeps going through parser.Parse. canonical
+// reports which form was decoded so the caller can restore RuleIsCanonical. A
+// malformed value in either form returns ok=false so the caller degrades that
+// one view to a plain relation rather than failing startup.
+func rebuildViewFromEvAction(evAction string) (sel *parser.SelectStmt, canonical bool, ok bool) {
+	if strings.HasPrefix(evAction, "({") {
+		nodes, err := pgnodes.ReadRuleAction(evAction)
+		if err != nil || len(nodes) != 1 {
+			return nil, false, false
+		}
+		q, qok := nodes[0].(*pgnodes.Query)
+		if !qok {
+			return nil, false, false
+		}
+		s, err := pgnodes.RebuildViewQuery(q)
+		if err != nil {
+			return nil, false, false
+		}
+		return s, true, true
+	}
+	stmts, perr := parser.Parse(evAction)
+	if perr != nil || len(stmts) != 1 {
+		return nil, false, false
+	}
+	s, sok := stmts[0].(*parser.SelectStmt)
+	if !sok {
+		return nil, false, false
+	}
+	return s, false, true
 }
 
 // statExtRegistryRecovery is the catalog-side surface the pg_statistic_ext
@@ -522,16 +584,16 @@ func loadViewsFromHeapForDB(mgr *storage.Manager, cat *catalog.InMemory, clog *m
 		if !ok || tbl == nil {
 			continue // view dropped since the row was written
 		}
-		stmts, perr := parser.Parse(r.evAction)
-		if perr != nil || len(stmts) != 1 {
-			continue
-		}
-		sel, ok := stmts[0].(*parser.SelectStmt)
+		sel, canonical, ok := rebuildViewFromEvAction(r.evAction)
 		if !ok {
-			continue
+			continue // unparseable ev_action ⇒ leave the view as a plain relation
 		}
 		tbl.View = sel
 		tbl.ViewDef = r.evAction
+		// M0123-S3 sub-slice 2c: a canonical ev_action restores relhasrules=true so
+		// a re-emitted pg_class row (post-restart ALTER re-sync) stays consistent
+		// with the row the standby already replayed at CREATE VIEW time.
+		tbl.RuleIsCanonical = canonical
 		// 02e item A: matview IsPopulated is now restored from
 		// pg_class.relispopulated during loadUserTablesFromHeap (which runs
 		// before this pass), so DO NOT clobber it here. The previous

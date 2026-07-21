@@ -63,6 +63,18 @@ func TestPort_ViewsSurviveRestart(t *testing.T) {
 	if got := queryScalar(t, c, "SELECT count(*) FROM v_plain"); got != "2" {
 		t.Fatalf("pre-restart v_plain count = %q, want 2", got)
 	}
+	// M0123-S3 sub-slice 2c: v_plain is a single-base-relation SELECT with a
+	// WHERE qual — the subset pgnodes.ResolveViewQuery serializes — so its
+	// ev_action is a canonical pg_node_tree and pg_class.relhasrules=true. The
+	// matview keeps SQL-text ev_action + relhasrules=false.
+	if got := queryScalar(t, c,
+		"SELECT relhasrules FROM pg_class WHERE relname = 'v_plain'"); got != "true" {
+		t.Fatalf("pre-restart v_plain relhasrules = %q, want true (canonical ev_action)", got)
+	}
+	if got := queryScalar(t, c,
+		"SELECT relhasrules FROM pg_class WHERE relname = 'v_mat'"); got != "false" {
+		t.Fatalf("pre-restart v_mat relhasrules = %q, want false (matview keeps SQL text)", got)
+	}
 
 	if err := c.Stop(cluster.ShutdownFast); err != nil {
 		t.Fatalf("stop: %v", err)
@@ -79,6 +91,12 @@ func TestPort_ViewsSurviveRestart(t *testing.T) {
 	}
 	if got := queryScalar(t, c, "SELECT sum(val) FROM v_plain"); got != "50" {
 		t.Fatalf("post-restart v_plain sum(val) = %q, want 50 (WHERE predicate lost)", got)
+	}
+	// relhasrules=true must survive the restart — the reload discriminated the
+	// canonical ev_action ("({") and restored tbl.RuleIsCanonical.
+	if got := queryScalar(t, c,
+		"SELECT relhasrules FROM pg_class WHERE relname = 'v_plain'"); got != "true" {
+		t.Fatalf("post-restart v_plain relhasrules = %q, want true (RuleIsCanonical not restored)", got)
 	}
 	// Matview survives as a matview (relkind='m') and returns its populated row.
 	if got := queryScalar(t, c,

@@ -68,6 +68,10 @@ func EstimateRows(n Node) int64 {
 		return EstimateRows(x.Child)
 	case *Join:
 		return estimateJoin(x)
+	case *OrdinalityWrap:
+		// Pass-through wrapper: appends an ordinal column, row count
+		// unchanged (S4a scalar residual rewrite reuses it).
+		return EstimateRows(x.Child)
 	case *Aggregate:
 		return estimateAggregate(x)
 	case *Insert:

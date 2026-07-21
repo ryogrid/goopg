@@ -245,6 +245,13 @@ type InExpr struct {
 	Plan            Node // populated when the source is a subquery
 	List            []Expr
 	IsNonCorrelated bool
+	// ParParam/Args: PARAM_EXEC lowering (D4.1, subplan_lower.go).
+	// Args[i] is evaluated against the current outer row and written to
+	// ParamExec slot ParParam[i] before Plan runs; Plan then reads the
+	// slots via ExecParamRef instead of walking ctx.OuterRows. Empty =
+	// non-correlated, or an unlowered shape still on the stack path.
+	ParParam []int
+	Args     []Expr
 }
 
 func (e *InExpr) Pos() int { return e.pos }
@@ -261,6 +268,9 @@ type ExistsExpr struct {
 	Negated         bool
 	Plan            Node
 	IsNonCorrelated bool
+	// ParParam/Args: see InExpr — PARAM_EXEC lowering (D4.1).
+	ParParam []int
+	Args     []Expr
 }
 
 func (e *ExistsExpr) Pos() int { return e.pos }
@@ -314,6 +324,9 @@ type SubqueryExpr struct {
 	pos             int
 	Plan            Node
 	IsNonCorrelated bool
+	// ParParam/Args: see InExpr — PARAM_EXEC lowering (D4.1).
+	ParParam []int
+	Args     []Expr
 }
 
 // ArraySubqueryExpr represents ARRAY(SELECT ...) — collects all rows of the
@@ -463,6 +476,27 @@ type ParamRef struct {
 
 func (e *ParamRef) Pos() int { return e.pos }
 func (*ParamRef) exprNode()  {}
+
+// ExecParamRef reads a PARAM_EXEC-style parameter slot
+// (Context.ParamExec[ID]) filled by an enclosing SubPlan eval site just
+// before the inner plan runs. It is the plan-internal correlation
+// parameter of D4.1 (design bundle correlated-subquery-planning), the
+// analog of upstream's PARAM_EXEC Params produced by
+// SS_replace_correlation_vars — and deliberately a separate node from
+// ParamRef, which is the PARAM_EXTERN client bind-parameter side of the
+// same paramkind split PG makes.
+//
+// IDs come from one flat per-statement slot space (subplan_lower.go), so
+// nesting levels cannot collide and evaluation is position-independent:
+// unlike OuterColumnRef there is no lexical-scope stack walk.
+type ExecParamRef struct {
+	pos  int
+	ID   int
+	Type catalog.Type
+}
+
+func (e *ExecParamRef) Pos() int { return e.pos }
+func (*ExecParamRef) exprNode()  {}
 
 // BinaryOp — Left Op Right.
 //
@@ -637,10 +671,45 @@ type NestedLoopIndexJoin struct {
 	Inner     *IndexScan
 	Predicate Expr // residual filter applied per joined row
 	schema    Schema
+
+	// InnerMemo, when non-nil, interposes a Memoize cache between the
+	// join driver and the inner index probe (bundle phase S7 / D5.1).
+	// Its Child field ALIASES the same *IndexScan as Inner, so every
+	// pass that rewrites Inner in place (remaps, re-resolution) keeps
+	// working unmodified; the Memoize node exists for EXPLAIN fidelity
+	// and executor construction. Nil = no cache (the common case; the
+	// insertion gate requires ANALYZE stats, which are in-memory and
+	// restart-lost).
+	InnerMemo *Memoize
 }
 
 func (n *NestedLoopIndexJoin) Pos() int       { return n.pos }
 func (n *NestedLoopIndexJoin) Output() Schema { return n.schema }
+
+// Memoize is a parameterized result cache on the inner side of a
+// NestedLoopIndexJoin (bundle phase S7; PG oracle:
+// postgres/src/backend/executor/nodeMemoize.c, inserted where
+// get_memoize_path fires in optimizer/path/joinpath.c). It caches the
+// inner index probe's result rows keyed by the probe parameter values,
+// serving repeats without re-scanning.
+//
+// KeyExprs are the probe-key expressions (they reference OUTER columns
+// and are evaluated against the bound outer slot — the same expressions
+// the aliased Child IndexScan consumes as Key/Keys). SingleRow marks a
+// provably-unique probe (entries complete after the first row, PG's
+// `singlerow`). EstEntries is the planner's cache-population estimate
+// for initial sizing (cost_memoize_rescan analog); the executor clamps
+// by the runtime memory budget.
+type Memoize struct {
+	pos        int
+	Child      *IndexScan
+	KeyExprs   []Expr
+	SingleRow  bool
+	EstEntries int64
+}
+
+func (n *Memoize) Pos() int       { return n.pos }
+func (n *Memoize) Output() Schema { return n.Child.Output() }
 
 // IndexOnlyScan is a covered index scan (M0046-0004): all projected columns
 // come from the B-tree index key, so no heap fetch is needed when the

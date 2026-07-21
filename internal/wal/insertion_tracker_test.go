@@ -263,15 +263,21 @@ func TestInsertionTrackerConcurrentPublicationReader(t *testing.T) {
 	reader.Wait()
 }
 
-// Pins the package constants. lsnIdle == 0 is load-bearing because
-// the zero value of atomic.Int64 is 0 and we rely on that to make
-// the constructor cheap (no per-slot Store loop). lsnNoActive ==
-// math.MaxInt64 is load-bearing because the publication-side min()
-// composes with it without a special branch.
+// Pins the package constants. lsnIdle == -1 is load-bearing because
+// byte-LSN 0 is a legitimate active reservation (a fresh cluster /
+// reset walBuffer starts its byte-addressed LSN space at 0), so the
+// idle sentinel must be a value no reservation can ever take. Using 0
+// would alias the first WAL record's active slot with "idle" and let
+// the tail publisher race the drain against the LSN-0 stripe writer
+// (M-NIGHTLY AI-20260717-010601-001; TestDrainSafetyStress). Because
+// -1 is NOT the atomic.Int64 zero value, newInsertionTracker
+// explicitly initialises every slot — see TestInsertionTrackerFreshIsIdle.
+// lsnNoActive == math.MaxInt64 is load-bearing because the
+// publication-side min() composes with it without a special branch.
 func TestInsertionTrackerSentinelConstants(t *testing.T) {
 	t.Parallel()
-	if lsnIdle != 0 {
-		t.Errorf("lsnIdle: got %d, want 0 (atomic.Int64 zero value contract)", lsnIdle)
+	if lsnIdle != -1 {
+		t.Errorf("lsnIdle: got %d, want -1 (byte-LSN 0 must be distinguishable from idle)", lsnIdle)
 	}
 	if lsnNoActive != int64(math.MaxInt64) {
 		t.Errorf("lsnNoActive: got %d, want math.MaxInt64", lsnNoActive)

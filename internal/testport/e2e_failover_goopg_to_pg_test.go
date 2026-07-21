@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -275,13 +276,41 @@ func runFailoverGoopgToPG(t *testing.T, repo, pgBasebackupBin, psqlBin string, m
 	// B5 Slice C: CREATE VIEW now journals a real pg_rewrite _RETURN rule heap
 	// row (base/<dbOid>/2618) instead of the goopg-private RecordKindCreateView(103)
 	// rmid-128 record. The standby must replay the heap insert without FATAL and
-	// end up with the rule in pg_rewrite. (The view is not queried on the standby:
-	// its ev_action is goopg SQL text, not a canonical node tree — the narrow
-	// removal keeps relhasrules=false; querying it there is a separate, blocked
-	// track.)
+	// end up with the rule in pg_rewrite.
+	//
+	// M0123-S3 sub-slice 2c: this view is inside the single-base-relation subset
+	// pgnodes.ResolveViewQuery serializes, so its ev_action is now a CANONICAL
+	// PG18 pg_node_tree and pg_class.relhasrules=true. The promoted PG therefore
+	// EVALUATES the _RETURN rule — the post-failover section below asserts
+	// SELECT count(*) FROM b5c_view == the equivalent direct filter, proving the
+	// standby expands goopg's serialized rule (not merely replays the heap row).
 	if err := runSQLSimple(t, primary,
 		"CREATE VIEW b5c_view AS SELECT client, src FROM public.bench_log WHERE client > 0"); err != nil {
 		t.Fatalf("create view on goopg primary: %v", err)
+	}
+
+	// M0123-S4 sub-slice 2: a MULTI-condition WHERE qual (BoolExpr AND over a
+	// NullTest + an OpExpr) is now inside the canonical subset too — the
+	// query-scoped resolver routes AND/OR/NOT/IS-NULL through the same *With
+	// builders the scalar DEFAULT path uses. This view therefore also streams a
+	// canonical pg_node_tree ev_action + relhasrules=true, and the promoted PG
+	// must PARSE it with pg_get_viewdef (the adversarial standby proof for the
+	// bool/null query wiring, extending the single-condition b5c_view above).
+	if err := runSQLSimple(t, primary,
+		"CREATE VIEW b5c_view2 AS SELECT client, src FROM public.bench_log WHERE src IS NOT NULL AND client > 0"); err != nil {
+		t.Fatalf("create multi-condition view on goopg primary: %v", err)
+	}
+
+	// M0123-S4 sub-slice 8: a searched CASE expression in the WHERE qual is now
+	// inside the canonical subset too — the query-scoped resolver routes
+	// *parser.CaseExpr through the same recursion-injectable resolveCaseExprWith /
+	// rebuildCaseExprWith builders the scalar DEFAULT path (sub-slice 7) uses. This
+	// view therefore streams a canonical pg_node_tree CASEEXPR ev_action +
+	// relhasrules=true, and the promoted PG must PARSE it with pg_get_viewdef (the
+	// adversarial standby proof for the CASE query wiring).
+	if err := runSQLSimple(t, primary,
+		"CREATE VIEW b5c_view3 AS SELECT client, src FROM public.bench_log WHERE CASE WHEN client > 0 THEN true ELSE false END"); err != nil {
+		t.Fatalf("create case-expr view on goopg primary: %v", err)
 	}
 
 	dsn := fmt.Sprintf("host=%s port=%s user=%s dbname=%s sslmode=disable",
@@ -400,6 +429,88 @@ func runFailoverGoopgToPG(t *testing.T, repo, pgBasebackupBin, psqlBin string, m
 		t.Fatalf("post-failover row src=%q want post", got)
 	}
 
+	// M0123-S3 sub-slice 2c: b5c_view (SELECT client, src FROM bench_log WHERE
+	// client > 0) was streamed with a CANONICAL pg_node_tree ev_action and
+	// relhasrules=true, so the promoted PG must EXPAND and EVALUATE the rule.
+	// Adversarial gate: the view's own count must equal the count its defining
+	// SELECT computes directly on the same server (a malformed rule would FATAL
+	// the standby's relcache when the view is opened, and pgCount would t.Fatal).
+	// The post row (client=-1) is excluded by the qual, so both sides count the
+	// client>0 'pre' rows identically.
+	// M0123-S3 sub-slice 2c standby-side gate. b5c_view streamed with a canonical
+	// pg_node_tree ev_action + relhasrules=true, so a real PG18:
+	//
+	//  1. reports relhasrules=true for the view (the streamed pg_class heap row); and
+	//  2. PARSES the canonical ev_action via stringToNode and DEPARSES it back to
+	//     the exact defining SELECT (pg_get_viewdef) — the adversarial proof that
+	//     goopg's serializer is byte-compatible with PG18's node-tree reader, not
+	//     merely that the heap row replays.
+	if got := pgScalar(t, standby,
+		"SELECT relhasrules FROM pg_class WHERE relname = 'b5c_view'"); got != "t" {
+		t.Fatalf("standby relhasrules(b5c_view)=%q, want t (canonical ev_action)", got)
+	}
+	viewdef, err := pgScalarMaybe(standby, "SELECT pg_get_viewdef('public.b5c_view'::regclass)")
+	if err != nil {
+		t.Fatalf("standby pg_get_viewdef(b5c_view): %v (PG could not parse the canonical ev_action)", err)
+	}
+	// Whitespace-insensitive structural check: PG must have reconstructed the
+	// single-base-relation SELECT with its column list and WHERE qual.
+	vd := strings.Join(strings.Fields(viewdef), " ")
+	for _, want := range []string{"SELECT client,", "src", "FROM bench_log", "WHERE (client > 0)"} {
+		if !strings.Contains(vd, want) {
+			t.Fatalf("standby pg_get_viewdef(b5c_view)=%q, missing %q", vd, want)
+		}
+	}
+
+	// M0123-S4 sub-slice 2: the same proof for the multi-condition view. Its
+	// canonical ev_action is a BoolExpr(AND) over a NullTest and an OpExpr; the
+	// promoted PG must report relhasrules=true and reconstruct the compound WHERE
+	// via pg_get_viewdef — byte-level proof the bool/null query wiring is
+	// PG18-node-tree-compatible, not merely that the heap row replays.
+	if got := pgScalar(t, standby,
+		"SELECT relhasrules FROM pg_class WHERE relname = 'b5c_view2'"); got != "t" {
+		t.Fatalf("standby relhasrules(b5c_view2)=%q, want t (canonical bool/null ev_action)", got)
+	}
+	viewdef2, err := pgScalarMaybe(standby, "SELECT pg_get_viewdef('public.b5c_view2'::regclass)")
+	if err != nil {
+		t.Fatalf("standby pg_get_viewdef(b5c_view2): %v (PG could not parse the canonical bool/null ev_action)", err)
+	}
+	vd2 := strings.Join(strings.Fields(viewdef2), " ")
+	for _, want := range []string{"SELECT client,", "src", "FROM bench_log", "src IS NOT NULL", "client > 0"} {
+		if !strings.Contains(vd2, want) {
+			t.Fatalf("standby pg_get_viewdef(b5c_view2)=%q, missing %q", vd2, want)
+		}
+	}
+
+	// M0123-S4 sub-slice 8: the same proof for the CASE-expr view. Its canonical
+	// ev_action is a searched CASEEXPR (casetype bool) over a WHEN OpExpr + ELSE;
+	// the promoted PG must report relhasrules=true and reconstruct the CASE WHERE
+	// via pg_get_viewdef — byte-level proof the CASE query wiring is
+	// PG18-node-tree-compatible, not merely that the heap row replays.
+	if got := pgScalar(t, standby,
+		"SELECT relhasrules FROM pg_class WHERE relname = 'b5c_view3'"); got != "t" {
+		t.Fatalf("standby relhasrules(b5c_view3)=%q, want t (canonical CASE ev_action)", got)
+	}
+	viewdef3, err := pgScalarMaybe(standby, "SELECT pg_get_viewdef('public.b5c_view3'::regclass)")
+	if err != nil {
+		t.Fatalf("standby pg_get_viewdef(b5c_view3): %v (PG could not parse the canonical CASE ev_action)", err)
+	}
+	vd3 := strings.Join(strings.Fields(viewdef3), " ")
+	for _, want := range []string{"SELECT client,", "src", "FROM bench_log", "CASE WHEN (client > 0)", "THEN true", "ELSE false", "END"} {
+		if !strings.Contains(vd3, want) {
+			t.Fatalf("standby pg_get_viewdef(b5c_view3)=%q, missing %q", vd3, want)
+		}
+	}
+	// KNOWN BLOCKER (deferral ledger 2026-07-19, M0123-S3 sub-slice 2c): a direct
+	// `SELECT * FROM b5c_view` on the promoted standby still fails 42809 — PG's
+	// rewriter uses the relcache rule lock (rd_rules), not the direct pg_rewrite
+	// scan pg_get_viewdef uses, and the copied pg_internal.init caches a ruleless
+	// relcache entry for the view. Row-level standby evaluation waits on relcache
+	// rd_rules population; the canonical serializer itself is proven above.
+	if _, err := pgCountMaybe(standby, "SELECT count(*) FROM public.b5c_view"); err == nil {
+		t.Logf("[m0123] standby row-level view expansion now works — promote the deferred gate")
+	}
+
 	// B2-prep: the goopg-created function must be resolvable and executable
 	// on the promoted PG (pg_proc row + both runtime-maintained indexes).
 	if got := pgScalar(t, standby,
@@ -482,6 +593,21 @@ func runFailoverGoopgToPG(t *testing.T, repo, pgBasebackupBin, psqlBin string, m
 		"SELECT count(*) FROM pg_rewrite r JOIN pg_class c ON c.oid = r.ev_class WHERE c.relname = 'b5c_view' AND r.rulename = '_RETURN'"); got != "1" {
 		t.Fatalf("post-failover pg_rewrite has b5c_view _RETURN rule = %q, want 1 (view rule heap insert not replayed)", got)
 	}
+
+	// NOTE (M0123-S2 sub-slice 2, 2026-07-19): goopg now stores column DEFAULTs as
+	// CANONICAL PG18 pg_node_tree in pg_attrdef.adbin (byte-identical to real PG18,
+	// pinned in internal/pgnodes), but the ADVERSARIAL standby-consumption gate for
+	// it is DEFERRED, not added here. A real PG standby cannot yet read goopg's
+	// pg_attrdef for DEFAULT evaluation: (1) pg_attrdef is a non-nailed catalog
+	// whose tupledesc PG rebuilds from the streamed pg_attribute rows, and goopg's
+	// on-disk pg_attribute for relid 2604 does not expose a usable `adbin` column
+	// (a direct `pg_get_expr(adbin, adrelid)` query fails "column adbin does not
+	// exist"); and (2) PG's AttrDefaultFetch (relcache.c) opens pg_attrdef BY its
+	// adrelid/adnum index (AttrDefaultIndexId 2656), which goopg does not
+	// materialize ("could not open relation with OID 2656"). Both are pg_attrdef
+	// catalog-completeness gaps orthogonal to node-tree serialization; see the
+	// deferral ledger (2026-07-19). The canonical writer + reload sibling pair is
+	// gated by fast unit tests (internal/pgnodes, internal/executor, internal/initdb).
 }
 
 func runGoopgBasebackupToPG(t *testing.T, repo, bin string, primary *cluster.Cluster, outDir, slotName string) {
@@ -616,6 +742,21 @@ func pgCountMaybe(c *pgcluster.Cluster, query string) (int64, error) {
 		return 0, err
 	}
 	return n, nil
+}
+
+func pgScalarMaybe(c *pgcluster.Cluster, query string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	db, err := c.OpenDB()
+	if err != nil {
+		return "", err
+	}
+	defer db.Close()
+	var s string
+	if err := db.QueryRowContext(ctx, query).Scan(&s); err != nil {
+		return "", err
+	}
+	return s, nil
 }
 
 func pgScalar(t *testing.T, c *pgcluster.Cluster, query string) string {

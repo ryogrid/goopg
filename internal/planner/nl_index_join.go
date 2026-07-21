@@ -30,6 +30,8 @@ package planner
 // this provides the rollback path.
 
 import (
+	"fmt"
+	"os"
 	"sync/atomic"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -47,6 +49,10 @@ var nliEnabled atomic.Bool
 
 func init() {
 	nliEnabled.Store(true)
+	// D6.3a escape hatch: GOOPG_NLI_COSTGATE=legacy restores the
+	// stats-blind semi/anti gate for one stage (deleted in R2-8 if
+	// unused).
+	nliCostGateLegacy.Store(os.Getenv("GOOPG_NLI_COSTGATE") == "legacy")
 }
 
 // SetNLIEnabled flips the M0054-0006 NLI rule on or off. Test-
@@ -88,7 +94,10 @@ func walkRewriteNLI(n Node, cat catalog.Catalog) Node {
 		x.Left = walkRewriteNLI(x.Left, cat)
 		x.Right = walkRewriteNLI(x.Right, cat)
 		if nli, ok := tryBuildNLI(x, cat); ok {
-			return nli
+			// S7 (D5.1): consider a Memoize cache on the inner probe.
+			// The Filter-promotion path above recurses through this
+			// case, so one insertion point covers every NLI build.
+			return maybeAttachMemoize(nli)
 		}
 		return x
 	case *Filter:
@@ -291,6 +300,83 @@ func tryBuildNLI(j *Join, cat catalog.Catalog) (*NestedLoopIndexJoin, bool) {
 		j.Type != JoinTypeSemi && j.Type != JoinTypeAnti {
 		return nil, false
 	}
+	// S6 (D6.2): accept `Filter{SeqScan}` as the RIGHT inner side by
+	// tentatively unwrapping it — the Filter's conjuncts join the
+	// residual set (indices shifted into outer++inner coordinates via
+	// clones; the originals stay untouched) and the bare SeqScan takes
+	// its place for the rest of the analysis. `committed` gates the
+	// restore: every decline path below leaves j exactly as found.
+	//
+	// This is what lets a decorrelated EXISTS body with an inner-only
+	// conjunct (Q4's `l_commitdate < l_receiptdate`) stay index-driven:
+	// its inner arrives as Filter{residual}(SeqScan), which previously
+	// fell through pickInnerSide to the hash path.
+	//
+	// LEFT is deliberately excluded — but as of R3-1 for COST, not
+	// correctness. The original reason was that the operator's no-match
+	// fallback evaluated the residual against the null-padded row and
+	// so dropped preserved outer rows; that defect is fixed (see
+	// operators_nljoin.go's outerMatched discipline, pinned by
+	// internal/executor/nli_left_residual_exec_test.go), and note it was
+	// never a real guard anyway: a cross-relation ON residual already
+	// reaches a LEFT NLI through the leftover-retention path below
+	// (pinned by nli_left_residual_leak_test.go).
+	//
+	// What still argues against unwrapping LEFT here is the Q9-class
+	// blowup this gate exists to prevent, in its most expensive known
+	// form: the canonical Q13 shape (`orders` behind a NOT-LIKE Filter)
+	// would turn a hash build into per-probe NOT-LIKE evaluations over
+	// the full inner. Admitting LEFT would therefore need the same
+	// `innerUnwrapCostAccepts` treatment INNER got in D6.3b, not merely
+	// the correctness fix. The hash path keeps serving it.
+	// Semi/Anti unwrap unconditionally; INNER behind a cost check
+	// (D6.3b). The first cut included INNER unconditionally and
+	// regressed TPC-H Q9 (115 s → DNF at 300 s): its `part` scan with a
+	// `%green%` LIKE arrives as Filter{SeqScan}, and unwrapping it
+	// turned a hash-side build into ~6 M per-row index probes with the
+	// LIKE evaluated per probe. Semi/Anti have no such exposure (their
+	// outer is the small side by construction of the unnest rewrite).
+	// For INNER the unwrap is tentative here and confirmed by
+	// `innerUnwrapCostAccepts` once the probe index is known — a
+	// decline returns through the deferred restore below, so the hash
+	// path keeps serving exactly as before.
+	committed := false
+	var hoistedInner []Expr
+	innerUnwrapped := false
+	var innerUnwrapResidualMult int64
+	if f, isF := j.Right.(*Filter); isF &&
+		(j.Type == JoinTypeSemi || j.Type == JoinTypeAnti || j.Type == JoinTypeInner) {
+		if ss, isSS := f.Child.(*SeqScan); isSS && f.Predicate != nil && !f.LeafLocal {
+			shift := len(j.Left.Output())
+			okAll := true
+			for _, c := range splitAnd(f.Predicate) {
+				if bc, isBool := c.(*BooleanConst); isBool && bc.Value {
+					continue
+				}
+				cl, supported := cloneExprShiftIdx(c, shift)
+				if !supported {
+					okAll = false
+					break
+				}
+				hoistedInner = append(hoistedInner, cl)
+			}
+			if okAll {
+				savedRight := j.Right
+				j.Right = ss
+				defer func() {
+					if !committed {
+						j.Right = savedRight
+					}
+				}()
+				if j.Type == JoinTypeInner {
+					innerUnwrapped = true
+					innerUnwrapResidualMult = residualCostMultiplier(splitAnd(f.Predicate))
+				}
+			} else {
+				hoistedInner = nil
+			}
+		}
+	}
 	// Equi-join detection: prefer the `LeftKey = RightKey` shape
 	// already attached when Algo == Hash. Fall back to inspecting
 	// `Predicate` for non-Hash joins. M0054-0006-followup-Q19:
@@ -356,7 +442,12 @@ func tryBuildNLI(j *Join, cat catalog.Catalog) (*NestedLoopIndexJoin, bool) {
 	if outerNode == nil {
 		return nil, false
 	}
-	if !nliCostGateAccepts(outerNode, innerScan, idx) {
+	if !nliCostGateAccepts(j.Type, outerNode, innerScan, idx) {
+		return nil, false
+	}
+	if innerUnwrapped && !innerUnwrapCostAccepts(outerNode, innerScan, idx, innerUnwrapResidualMult) {
+		// The deferred restore above reverts the tentative unwrap;
+		// the join stays on the hash path.
 		return nil, false
 	}
 	// M0063-0001: skip NLI when the outer is an isolated-scope
@@ -497,14 +588,58 @@ func tryBuildNLI(j *Join, cat catalog.Catalog) (*NestedLoopIndexJoin, bool) {
 		}
 	}
 
+	// Keep any conjunct the index probe does NOT enforce.
+	//
+	// The pre-existing code assumed `j.Predicate` held nothing but the
+	// equi-conjunct that becomes the probe key, on the grounds that
+	// pushdown separates non-key conjuncts upstream. That assumption
+	// breaks for a predicate spanning two relations: pushdown cannot
+	// place it on either scan, so it stays on the join — and NLI then
+	// dropped it silently. TPC-H Q7's nation pair
+	// `(n1.n_name='FRANCE' AND n2.n_name='GERMANY') OR (…GERMANY…FRANCE…)`
+	// is exactly that shape, and losing it made Q7 return every
+	// nation pair (486 K rows instead of 4 after grouping).
+	//
+	// Such conjuncts are kept as the NLI's residual Predicate, which the
+	// executor evaluates against `outer ++ inner`. Their ColumnRef
+	// indices cannot be reused as-is: they were resolved against this
+	// join's layout at bind time, and an earlier NLI/MHJ rewrite below
+	// us may since have reordered a child's output. They are therefore
+	// re-resolved by name against the joined schema below, using the
+	// same (Name, SourceTableIdx) rule `reresolveJoinByName`'s
+	// predRebind uses so self-joined aliases (Q7's `nation n1` / `n2`,
+	// Q21's three `lineitem` aliases) disambiguate correctly.
+	var leftover []Expr
+	if residualPred == nil && j.Predicate != nil {
+		for _, c := range splitAnd(j.Predicate) {
+			if nliConsumedByProbe(c, idx, keys) {
+				continue
+			}
+			leftover = append(leftover, c)
+		}
+	}
+	// S6: conjuncts hoisted out of a Filter{SeqScan} inner join the
+	// residual set. Their clones already carry outer++inner-shaped
+	// indices (see the unwrap block above); the rebind below re-resolves
+	// them by name against the actual joined schema like every other
+	// leftover conjunct.
+	leftover = append(leftover, hoistedInner...)
+
 	// Build the inner IndexScan. For single-column indexes we
 	// keep using `Key` for backward compatibility with all
 	// existing single-column callers / tests; for composite
 	// indexes we use `Keys` so the executor encodes every
 	// leading column in declared order with no suffix padding.
 	inner := &IndexScan{
-		pos:    innerScan.Pos(),
-		Table:  innerScan.Table,
+		pos:   innerScan.Pos(),
+		Table: innerScan.Table,
+		// The FROM-clause alias must survive the rewrite: later
+		// passes disambiguate a self-joined relation by alias, so
+		// dropping it makes `n1.col` in `FROM nation n1, nation n2`
+		// bind to whichever relation happens to sit at the matching
+		// slot base — silently returning a neighbouring table's
+		// columns instead of failing.
+		Alias:  innerScan.Alias,
 		Index:  idx,
 		schema: innerScan.Output(),
 	}
@@ -527,6 +662,81 @@ func tryBuildNLI(j *Join, cat catalog.Catalog) (*NestedLoopIndexJoin, bool) {
 		joinedSchema = append(joinedSchema, inner.Output()...)
 	}
 
+	// Place the surviving conjuncts (see above) on the NLI, re-resolving
+	// their ColumnRefs against `outer ++ inner`. This includes Semi /
+	// Anti: although they EMIT the outer schema only, the executor
+	// evaluates the residual through virtualOut, whose column mapping
+	// always spans outer ++ inner regardless of the emit schema
+	// (operators_nljoin.go builds cols over both source slots, and
+	// evalExprSlot bounds-checks against Width(), not the schema) — so
+	// an inner-referencing residual resolves correctly. S6 (D6.2)
+	// replaced the earlier blanket decline, which forced every
+	// residual-bearing semi/anti onto the hash path and cost Q4 a
+	// 6 M-row build where an index probe sufficed. Resolution is
+	// computed for every ref BEFORE any is written back, so a rewrite we
+	// end up declining leaves the shared predicate untouched.
+	if len(leftover) > 0 {
+		outerSchema2 := outerNode.Output()
+		innerSchema2 := inner.Output()
+		resolveIn := func(schema Schema, cr *ColumnRef, offset int) int {
+			if cr.SourceTableIdx != 0 {
+				if i := findColumnIndexByNameAndSource(schema, cr.Name, cr.SourceTableIdx, offset); i >= 0 {
+					return i
+				}
+			}
+			return findUniqueColumnIndex(schema, cr.Name, offset)
+		}
+		type rebindTarget struct {
+			ref    *ColumnRef
+			newIdx int
+		}
+		var targets []rebindTarget
+		resolvable := true
+		for _, c := range leftover {
+			visitColumnRefs(c, func(e Expr) {
+				cr, isCol := e.(*ColumnRef)
+				if !isCol || cr.Name == "" || !resolvable {
+					return
+				}
+				// Prefer the side the current index points at, then
+				// fall back to the other — the same hint predRebind
+				// uses, which keeps `a.id = b.id` on its own sides
+				// when names collide.
+				first, firstOff := outerSchema2, 0
+				second, secondOff := innerSchema2, len(outerSchema2)
+				if cr.Index >= len(outerSchema2) {
+					first, firstOff = innerSchema2, len(outerSchema2)
+					second, secondOff = outerSchema2, 0
+				}
+				if i := resolveIn(first, cr, firstOff); i >= 0 {
+					targets = append(targets, rebindTarget{cr, i})
+					return
+				}
+				if i := resolveIn(second, cr, secondOff); i >= 0 {
+					targets = append(targets, rebindTarget{cr, i})
+					return
+				}
+				resolvable = false
+			})
+		}
+		if !resolvable {
+			return nil, false
+		}
+		for _, t := range targets {
+			t.ref.Index = t.newIdx
+		}
+		if residualPred != nil {
+			// OR-factoring path (Q19) plus hoisted inner conjuncts:
+			// keep the OR predicate AND the hoisted set. (The OR
+			// predicate itself is intentionally not re-resolved here —
+			// pre-existing behaviour; see the Q7 write-up's follow-ups.)
+			residualPred = combineAnd(append([]Expr{residualPred}, leftover...))
+		} else {
+			residualPred = combineAnd(leftover)
+		}
+	}
+
+	committed = true
 	nli := &NestedLoopIndexJoin{
 		pos:   j.pos,
 		Type:  j.Type,
@@ -543,6 +753,94 @@ func tryBuildNLI(j *Join, cat catalog.Catalog) (*NestedLoopIndexJoin, bool) {
 		schema:    joinedSchema,
 	}
 	return nli, true
+}
+
+// cloneExprShiftIdx deep-clones a conjunct hoisted out of a
+// Filter{SeqScan} inner side, shifting every ColumnRef.Index by `shift`
+// so the clone addresses the NLI's outer++inner row instead of the inner
+// scan's own row. Name/Type/SourceTableIdx are preserved — the leftover
+// rebind re-resolves the final index by name, using the shifted value
+// only as the which-side hint.
+//
+// Returns ok=false for any node kind it does not positively recognise —
+// including OuterColumnRef, which inside an inner filter means a
+// correlation into a scope above this join that a flat outer++inner row
+// cannot supply. Declining the whole rewrite (the caller's response)
+// keeps the hash path serving those shapes.
+func cloneExprShiftIdx(e Expr, shift int) (Expr, bool) {
+	switch x := e.(type) {
+	case nil:
+		return nil, true
+	case *ColumnRef:
+		cl := *x
+		if cl.Index >= 0 {
+			cl.Index += shift
+		}
+		return &cl, true
+	case *IntegerConst, *NumericConst, *StringConst, *BooleanConst,
+		*NullConst, *TypedStringLit, *IntervalLit:
+		return e, true // literals are immutable — share
+	case *BinaryOp:
+		l, okL := cloneExprShiftIdx(x.Left, shift)
+		r, okR := cloneExprShiftIdx(x.Right, shift)
+		if !okL || !okR {
+			return nil, false
+		}
+		return &BinaryOp{pos: x.Pos(), Op: x.Op, Left: l, Right: r}, true
+	case *UnaryOp:
+		op, ok := cloneExprShiftIdx(x.Operand, shift)
+		if !ok {
+			return nil, false
+		}
+		return &UnaryOp{pos: x.Pos(), Op: x.Op, Operand: op}, true
+	case *CastExpr:
+		op, ok := cloneExprShiftIdx(x.Operand, shift)
+		if !ok {
+			return nil, false
+		}
+		cl := *x
+		cl.Operand = op
+		return &cl, true
+	case *FuncCall:
+		args := make([]Expr, len(x.Args))
+		for i, a := range x.Args {
+			cl, ok := cloneExprShiftIdx(a, shift)
+			if !ok {
+				return nil, false
+			}
+			args[i] = cl
+		}
+		return &FuncCall{pos: x.Pos(), Name: x.Name, Args: args, Star: x.Star}, true
+	}
+	return nil, false
+}
+
+// nliConsumedByProbe reports whether conjunct c is exactly one of the
+// equi-conjuncts the inner IndexScan probe encodes — inner index column
+// = outer expression — and is therefore already enforced by the probe
+// itself. Matching requires both the index column name AND pointer
+// identity of the outer side against the chosen probe key, so a second
+// equality binding the same inner column to a different outer
+// expression is correctly reported as NOT consumed and survives as a
+// residual (the shape bushy DP's edge selection can leave behind).
+func nliConsumedByProbe(c Expr, idx *catalog.Index, keys []Expr) bool {
+	bin, ok := c.(*BinaryOp)
+	if !ok || bin.Op != parser.OpEq || idx == nil {
+		return false
+	}
+	for i, k := range keys {
+		if i >= len(idx.Columns) {
+			break
+		}
+		col := idx.Columns[i]
+		if lc, isCol := bin.Left.(*ColumnRef); isCol && lc.Name == col && bin.Right == k {
+			return true
+		}
+		if rc, isCol := bin.Right.(*ColumnRef); isCol && rc.Name == col && bin.Left == k {
+			return true
+		}
+	}
+	return false
 }
 
 // collectCrossSideEquiKeys walks j.Predicate (and j.LeftKey/RightKey
@@ -898,33 +1196,154 @@ func otherChild(j *Join, innerScan *SeqScan) Node {
 	return nil
 }
 
+// nliCostGateLegacy restores the pre-D6.3a bare heuristic for
+// semi/anti joins (env GOOPG_NLI_COSTGATE=legacy at process start, or
+// SetNLICostGateLegacy from tests). Escape hatch for one stage; slated
+// for deletion in R2-8 if unused. INNER behavior is identical either
+// way.
+var nliCostGateLegacy atomic.Bool
+
+// SetNLICostGateLegacy toggles the legacy (stats-blind) cost gate for
+// semi/anti NLI decisions. Test hook, mirroring SetNLIEnabled.
+func SetNLICostGateLegacy(on bool) { nliCostGateLegacy.Store(on) }
+
 // nliCostGateAccepts returns true when the cost model finds NLI
 // preferable to (or at least competitive with) Hash for the given
-// shape. The heuristic:
+// shape.
 //
-//   - When the outer side has an estimated row count ≤
-//     `nliMaxOuterRowsHeuristic`, NLI is preferred (each outer row
-//     costs an index probe; the build cost of Hash dominates for
-//     small outer sides).
-//   - Otherwise, NLI is rejected — Hash's amortised O(L+R) wins
-//     over NLI's O(L * log R) at scale until cost-model
-//     statistics from M0006 are wired to override this threshold.
+// INNER (and LEFT) joins keep the historical heuristic unchanged:
 //
-// Rows are estimated via the existing `EstimateRows`; when
-// statistics are absent, the function returns small values and
-// NLI is accepted by default — which is fine for the goopg
-// workloads where the outer driver of an unanalysed table is
-// typically small (CTEs, derived tables, small dimension tables).
-func nliCostGateAccepts(outer Node, innerScan *SeqScan, idx *catalog.Index) bool {
+//   - outer estimate ≤ nliMaxOuterRowsHeuristic → accept;
+//     unknown estimate → optimistic accept. INNER regressions are out
+//     of D6.3a's scope.
+//
+// SEMI/ANTI joins (D6.3a, design bundle ch.06 §3.2; oracle:
+// postgres/src/backend/optimizer/path/costsize.c
+// compute_semi_anti_join_factors / final_cost_nestloop) use ANALYZE
+// statistics:
+//
+//	matchSet  = max(1, innerRows / NDistinct(inner probe column))
+//	probeCost = matchSet
+//	accept  ⇔ outerRows × probeCost < innerRows + outerRows
+//
+// The right-hand side is the hash alternative: one build pass over the
+// inner (≈ innerRows) plus one O(1) probe per outer row. probeCost is
+// deliberately the FULL match set, not an early-out blend: both semi
+// and anti probes can stop at the first matching row (semi emits, anti
+// suppresses), but the expensive case — no match — must exhaust the
+// match set, and estimating the match probability from column overlap
+// is more model than the decision needs. Using the pessimistic bound
+// biases toward hash, the safe direction (a wrong "hash" costs a build
+// pass; a wrong "NLI" on a big outer costs outerRows × matchSet, the
+// Q4-regression class).
+//
+// No usable stats (RowCount or probe-column NDistinct missing) →
+// REJECT for semi/anti — keep the hash join. This is the documented
+// conservative rule: a stats-blind index-probe loop over an unknown
+// inner is exactly how the 71× Q4-class regressions happen.
+func nliCostGateAccepts(joinType JoinType, outer Node, innerScan *SeqScan, idx *catalog.Index) bool {
 	outerRows := EstimateRows(outer)
-	if outerRows <= 0 {
-		// No estimate available — be optimistic. The cost gate
-		// will be tightened in M0054-0006 follow-ups when
-		// statistics-aware row counts land.
-		return true
+	semiAnti := joinType == JoinTypeSemi || joinType == JoinTypeAnti
+	if !semiAnti || nliCostGateLegacy.Load() {
+		// Historical heuristic (also the legacy escape hatch for
+		// semi/anti): small-or-unknown outer → NLI.
+		if outerRows <= 0 {
+			return true
+		}
+		return outerRows <= nliMaxOuterRowsHeuristic
 	}
-	if outerRows <= nliMaxOuterRowsHeuristic {
-		return true
+	var innerRows, matchSet int64
+	if innerScan != nil && innerScan.Table != nil {
+		innerRows = tableRows(innerScan.Table)
+		matchSet = matchSetByColumnName(innerScan.Table, firstIndexColumn(idx))
 	}
-	return false
+	statsKnown := outerRows > 0 && innerRows > 0 && matchSet > 0
+	accept := true
+	if statsKnown {
+		accept = outerRows*matchSet < innerRows+outerRows
+	}
+	// No usable stats → OPTIMISTIC accept (the pre-D6.3a behavior).
+	//
+	// The first cut of this gate rejected semi/anti NLI without stats
+	// ("a stats-blind index-probe loop is how Q4-class regressions
+	// happen"). Measured reality inverted that: goopg's ANALYZE
+	// statistics live in memory only and are lost on every server
+	// restart, so the no-stats case is the COMMON case — and rejecting
+	// it permanently disabled semi/anti NLI in practice, reproducing
+	// the exact regression the gate exists to prevent (Q4 as a hash
+	// semi: 276 s; as NLI-semi: ~3.5 s — the 71× class, measured
+	// 2026-07-21 on the fresh bench server). The optimistic default is
+	// the behavior every green sweep to date actually ran with; the
+	// stats-aware formula refines the decision only where ANALYZE data
+	// exists (unit-test fixtures, long-lived sessions).
+	if os.Getenv("GOOPG_NLI_COSTGATE_DEBUG") == "1" {
+		fmt.Fprintf(os.Stderr, "nli-costgate: type=%v outer=%T outerRows=%d innerRows=%d matchSet=%d statsKnown=%v accept=%v\n",
+			joinType, outer, outerRows, innerRows, matchSet, statsKnown, accept)
+	}
+	return accept
+}
+
+// residualCostMultiplier classifies the per-probe evaluation cost of the
+// Filter conjuncts an INNER unwrap would hoist onto the NLI. Pattern-match
+// predicates (LIKE family, regex family) and function calls are an order
+// of magnitude more expensive per evaluation than plain comparisons — the
+// Q9 killer was exactly a `%green%` LIKE evaluated ~6 M times — so their
+// presence surcharges the probe cost in innerUnwrapCostAccepts.
+func residualCostMultiplier(conjuncts []Expr) int64 {
+	expensive := false
+	for _, c := range conjuncts {
+		WalkExprTree(c, func(e Expr) {
+			switch x := e.(type) {
+			case *BinaryOp:
+				switch x.Op {
+				case parser.OpLike, parser.OpNotLike, parser.OpILike, parser.OpNotILike,
+					parser.OpRegexMatch, parser.OpRegexIMatch, parser.OpRegexNoMatch, parser.OpRegexINoMatch:
+					expensive = true
+				}
+			case *FuncCall:
+				expensive = true
+			}
+		})
+	}
+	if expensive {
+		return 8
+	}
+	return 1
+}
+
+// innerUnwrapCostAccepts confirms a tentative INNER Filter{SeqScan}-inner
+// unwrap once the probe index is known (D6.3b, resolving the csq-S2/S3
+// ledger row about the Q9 71× regression).
+//
+//	matchSet  = max(1, innerRows / NDistinct(probe column))
+//	accept  ⇔ outerRows × (matchSet + residualMult) < innerRows + outerRows
+//
+// The right-hand side is the hash alternative (one build pass over the
+// inner plus O(1) probes); residualMult surcharges pattern-match/function
+// residuals per residualCostMultiplier.
+//
+// No usable stats → DECLINE — deliberately the OPPOSITE default from
+// nliCostGateAccepts' semi/anti rule (optimistic accept), and both are
+// argued from the same fact: goopg's ANALYZE statistics are in-memory and
+// restart-lost, so no-stats is the COMMON case. For semi/anti, rejecting
+// without stats would permanently disable a shape whose measured upside is
+// large (Q4: NLI 3.5 s vs hash 276 s) — so unknown accepts. For the INNER
+// unwrap the asymmetry runs the other way: declining just keeps today's
+// hash behavior (Q9 runs fine at ~104–118 s), while a wrong accept is the
+// catastrophic direction (Q9 → DNF). Status quo is the safe default on
+// unknown stats, so unknown declines.
+func innerUnwrapCostAccepts(outer Node, innerScan *SeqScan, idx *catalog.Index, residualMult int64) bool {
+	outerRows := EstimateRows(outer)
+	var innerRows, matchSet int64
+	if innerScan != nil && innerScan.Table != nil {
+		innerRows = tableRows(innerScan.Table)
+		matchSet = matchSetByColumnName(innerScan.Table, firstIndexColumn(idx))
+	}
+	statsKnown := outerRows > 0 && innerRows > 0 && matchSet > 0
+	accept := statsKnown && outerRows*(matchSet+residualMult) < innerRows+outerRows
+	if os.Getenv("GOOPG_NLI_COSTGATE_DEBUG") == "1" {
+		fmt.Fprintf(os.Stderr, "nli-costgate: inner-unwrap outer=%T outerRows=%d innerRows=%d matchSet=%d residualMult=%d statsKnown=%v accept=%v\n",
+			outer, outerRows, innerRows, matchSet, residualMult, statsKnown, accept)
+	}
+	return accept
 }

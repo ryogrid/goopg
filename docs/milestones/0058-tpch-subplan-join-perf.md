@@ -1,5 +1,17 @@
 # Milestone 0058 — TPC-H SubPlan & Join-Unnesting Performance Fixes
 
+> **Annotation 2026-07-20 (historical status correction).** The checkboxes below
+> were never ticked, but most of this milestone **did land**: M0058-0001/-0003/
+> -0004/-0005/-0006 shipped in commit `d5091071` (see
+> `analysis/tpch-m0058-verification-2026-05-07.md`), and M0058-0002
+> (EXISTS/NOT EXISTS unnesting) landed later as M0061-0001 (`faf2e71f`). This
+> milestone is left as written for the historical record — do not tick it
+> retroactively. Ongoing work in this area is now owned by the design bundle
+> [`docs/design/correlated-subquery-planning/`](../design/correlated-subquery-planning/README.md),
+> which supersedes the unimplemented remainder of design doc
+> [`0058-0001`](../design/0058-0001-subplan-and-join-optimisation.md) and tracks
+> implementation in its `IMPLEMENTATION-TODO.md` (phases S0–S7).
+
 **Status:** planned
 **Depends on:** Milestone 0054 (TPC-H perf), Milestone 0057 (measurement infra)
 **Drives:** 22/22 TPC-H SF=1 query completion within 1-hour-per-query budget

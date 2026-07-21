@@ -15,10 +15,42 @@ package executor
 
 import (
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/pgnodes"
 	"github.com/goopg/goopg/internal/storage"
 )
 
 const pgAttrdefRelOID = 2604 // pg_attrdef
+
+// canonicalAttrdefText computes the pg_attrdef.adbin text for a defaulted column.
+// M0123-S2 (sub-slice 2): when the column's DEFAULT expression is fully
+// representable as a canonical PG18 pg_node_tree AND its top-level result type
+// matches the column type exactly (pgnodes.ResolveForColumn), it emits the
+// canonical S-expression (a leading-'{' string a real PG18 standby can parse via
+// stringToNode and EVALUATE — e.g. INSERT ... DEFAULT VALUES on a promoted
+// standby); otherwise it degrades to goopg's established SQL-text convention
+// (FormatExprForAttrdef, re-parsed by the reload). All-or-nothing per 02e §3: a
+// partial canonical emit is never produced, and a type mismatch (DEFAULT 0 on a
+// numeric/smallint column) falls back to text so a standby never inserts a
+// mistyped Datum. The canonical form is pure ASCII (datum bytes are rendered as
+// decimals in nodeToString), so it stores byte-identically through NewStringDatum
+// and the reload's StringValue() decode — no codec change; the leading '{' is the
+// reload discriminator between the two forms.
+func canonicalAttrdefText(col catalog.Column) string {
+	if col.DefaultExpr == nil {
+		return ""
+	}
+	targetOID := catalog.TypeNameToOID(col.Type.Name)
+	// Thread the column's numeric typmod so a `::numeric(p,s)` DEFAULT emits
+	// canonical bytes only when the column typmod matches the cast's (else PG wraps
+	// the coercion in a RelabelType this slice doesn't model; ResolveForColumnTypmod
+	// degrades). NumericColumnTypmod yields -1 for a bare/non-numeric column, which
+	// correctly rejects a typmod cast there.
+	targetTypmod := pgnodes.NumericColumnTypmod(col.Type.Args)
+	if node, ok := pgnodes.ResolveForColumnTypmod(col.DefaultExpr, targetOID, targetTypmod); ok {
+		return pgnodes.Out(node)
+	}
+	return catalog.FormatExprForAttrdef(col.DefaultExpr)
+}
 
 // PGAttrdefColumnsPG18 mirrors FormData_pg_attrdef (oid, adrelid, adnum, adbin).
 // Exported for the initdb heap reload (loadColumnDefaultsFromHeap).

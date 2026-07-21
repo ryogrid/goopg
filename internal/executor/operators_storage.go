@@ -1046,6 +1046,24 @@ func (o *seqScanOp) Open(ctx *Context) error {
 	if ctx.Pool == nil || ctx.Catalog == nil {
 		return &ExecError{Code: "XX000", Pos: o.pos, Message: "SeqScan requires storage handles in Context"}
 	}
+	// S2a (design bundle ch.04 §4.2): Open on an already-open scan is a
+	// rewind, mirroring indexScanOp's `o.ctx != nil` reopen detection. The
+	// full path below would leak the previous mctx arena and scan ring
+	// (both released only in Close), re-record SIREADs, and re-run
+	// privilege/lock work. All of that state is statement-scoped and
+	// unchanged within a statement (locks are statement-scoped; PostgreSQL
+	// likewise checks privileges once at executor startup, not per
+	// rescan), so the rewind only resets position state. A re-Open under
+	// a *different* Context falls through to the full path after
+	// releasing the held resources — its caches (enum/ACL columns, rel)
+	// derive from the plan node and stay valid, but snapshot-dependent
+	// state must be re-established.
+	if o.sctx != nil {
+		if o.ctx == ctx {
+			return o.rewind()
+		}
+		o.releaseScanState()
+	}
 	if o.tbl != nil && !dmlPrivilegePermittedAs(ctx, o.tbl, "SELECT", selectPrivilegeCheckRole(ctx, o.privilegeCheckRoleSet, o.privilegeCheckRole)) {
 		return &ExecError{Code: "42501", Pos: o.pos, Message: fmt.Sprintf("permission denied for table %s", o.tbl.Name)}
 	}
@@ -1280,7 +1298,12 @@ func (o *seqScanOp) refillPrefetchWindow(rel storage.RelFileNode) {
 	}
 }
 
-func (o *seqScanOp) Close() error {
+// releaseScanState drops every resource the scan holds between Open and
+// Close: the ring (or the bare page pin), the borrowed scan row, and the
+// per-operator mctx arena. Shared by Close and the full-reopen fallback in
+// Open so the two release paths cannot drift. Position fields are left to
+// the caller.
+func (o *seqScanOp) releaseScanState() {
 	if o.ring != nil {
 		o.ring.Close()
 		o.ring = nil
@@ -1306,6 +1329,52 @@ func (o *seqScanOp) Close() error {
 		o.sctx.Release()
 		o.sctx = nil
 	}
+}
+
+// rewind re-positions an already-open scan at block 0 for a rescan
+// (S2a, design bundle ch.04 §4.2). It reuses the held mctx arena —
+// after a Reset, exactly the lifetime contract the scan's own
+// block-advance Reset already imposes on arena-backed datums — and
+// releases any page pin / ring position a partial drain left behind.
+// NBlocks is re-read (the relation may have grown mid-statement); the
+// ring is recreated rather than rewound because storage.ScanRing has no
+// documented rewind contract, and a fresh ring is provably equivalent
+// to the fresh-Open path. Cumulative stats are NOT recorded here — the
+// scan is not finished; statReturned keeps accumulating and Close
+// records the total once.
+func (o *seqScanOp) rewind() error {
+	if o.ring != nil {
+		o.ring.Close()
+		o.ring = nil
+		o.activePage = nil
+	} else if o.pinned != nil {
+		o.ctx.Pool.Unpin(o.pinned)
+		o.pinned = nil
+		o.activePage = nil
+	}
+	if o.scanRow != nil {
+		releaseRow(o.scanRow)
+		o.scanRow = nil
+	}
+	n, err := o.ctx.Pool.NBlocks(o.rel)
+	if err != nil {
+		return err
+	}
+	o.nBlocks = n
+	o.curBlock = 0
+	o.curSlot = 0
+	o.slotMax = 0
+	o.prefetchedThru = 0
+	o.sctx.Reset()
+	if o.ctx.Pool != nil && int(n) > o.ctx.Pool.Capacity()/4 {
+		o.ring = storage.NewScanRing(o.ctx.Pool, o.rel)
+	}
+	o.refillPrefetchWindow(o.rel)
+	return nil
+}
+
+func (o *seqScanOp) Close() error {
+	o.releaseScanState()
 	// Record this sequential scan into cumulative relation stats: one scan that
 	// read statReturned visible tuples (mirrors pgstat_count_heap_scan +
 	// pgstat_count_heap_getnext). Non-transactional, gated by track_counts.

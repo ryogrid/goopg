@@ -321,7 +321,7 @@ func findScanLeaf(op Operator) currentTIDProvider {
 			if left := findScanLeaf(v.outer); left != nil {
 				return left
 			}
-			return v.inner
+			return nliInnerIndexScan(v.inner)
 		case *multiHashJoinOp:
 			// Hash join: the probe side scans the driving (non-build) table.
 			// When probeOp has not yet been assigned (pre-Open), fall through.
@@ -378,9 +378,9 @@ func findScanLeafForRel(op Operator, targetRel storage.RelFileNode) currentTIDPr
 			if left := findScanLeafForRel(v.outer, targetRel); left != nil {
 				return left
 			}
-			if v.inner != nil && v.inner.ctx != nil &&
-				v.inner.ctx.Catalog.RelFileNode(v.inner.plan.Table) == targetRel {
-				return v.inner
+			if is := nliInnerIndexScan(v.inner); is != nil && is.ctx != nil &&
+				is.ctx.Catalog.RelFileNode(is.plan.Table) == targetRel {
+				return is
 			}
 			return nil
 		case *multiHashJoinOp:

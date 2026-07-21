@@ -38,7 +38,7 @@ import (
 type nestedLoopIndexJoinOp struct {
 	plan  *planner.NestedLoopIndexJoin
 	outer Operator
-	inner *indexScanOp
+	inner nliInner
 	ctx   *Context
 
 	// outerWidth / innerWidth are captured in Open() from the child
@@ -74,13 +74,48 @@ type nestedLoopIndexJoinOp struct {
 	// state: when an outer row is being processed, currentOuter
 	// holds it and innerExhausted tracks whether we've already
 	// drained the inner's matches for this outer row.
-	currentOuter    Row
-	innerExhausted  bool
-	leftJoinEmitted bool // for LEFT outer: did we emit the null-padded fallback?
-	openOnce        bool
+	currentOuter   Row
+	innerExhausted bool
+	// outerMatched records whether the current outer row has a
+	// QUALIFYING inner match — one that passed plan.Predicate, not
+	// merely one the index probe produced. LEFT's null-pad fallback and
+	// Anti's emit-the-outer fallback both key off it, and both are only
+	// correct under that definition: the NLI Predicate is the JOIN ON
+	// residual, so an inner row failing it is not a match at all
+	// (R3-1; before it, this was set on row-produced and named
+	// leftJoinEmitted, which silently dropped preserved LEFT rows).
+	outerMatched bool
+	openOnce     bool
 }
 
-func newNestedLoopIndexJoinOp(p *planner.NestedLoopIndexJoin, outer Operator, inner *indexScanOp) *nestedLoopIndexJoinOp {
+// nliInner is the protocol the NLI driver requires of its inner side:
+// prepared once (openPrep), then per outer row BindOuter + Rescan, with
+// Next draining the probe's matches. Satisfied by *indexScanOp (the
+// bare probe) and *memoizeOp (S7's parameterized result cache, which
+// forwards to a child *indexScanOp on cache misses).
+type nliInner interface {
+	Schema() planner.Schema
+	openPrep(ctx *Context) error
+	Next() (TupleSlot, error)
+	BindOuter(slot SlotView, outerWidth int)
+	Rescan(outerSlot SlotView, outerWidth int) error
+	Close() error
+}
+
+// nliInnerIndexScan unwraps an nliInner to its underlying index scan
+// (identity for a bare probe, the child for a memoize wrapper). Used by
+// the FOR UPDATE TID-provider walks, which need the concrete scan.
+func nliInnerIndexScan(in nliInner) *indexScanOp {
+	switch x := in.(type) {
+	case *indexScanOp:
+		return x
+	case *memoizeOp:
+		return x.child
+	}
+	return nil
+}
+
+func newNestedLoopIndexJoinOp(p *planner.NestedLoopIndexJoin, outer Operator, inner nliInner) *nestedLoopIndexJoinOp {
 	return &nestedLoopIndexJoinOp{plan: p, outer: outer, inner: inner}
 }
 
@@ -113,7 +148,7 @@ func (o *nestedLoopIndexJoinOp) Open(ctx *Context) error {
 
 	o.currentOuter = nil
 	o.innerExhausted = true
-	o.leftJoinEmitted = true
+	o.outerMatched = true
 	// Open the inner once (acquires the relation lock and opens
 	// the btree). Per-outer-row work happens in Rescan + the
 	// inner's own Next() loop.
@@ -132,27 +167,30 @@ func (o *nestedLoopIndexJoinOp) Next() (TupleSlot, error) {
 			innerSlot, err := o.inner.Next()
 			if err == EOF {
 				o.innerExhausted = true
-				// LEFT-join fallback: when no inner row matched
-				// AND we are LEFT-join, emit the null-padded outer
-				// row exactly once before advancing.
-				if !o.leftJoinEmitted && o.plan.Type == planner.JoinTypeLeft {
-					o.leftJoinEmitted = true
+				// LEFT-join fallback: when no inner row QUALIFIED
+				// (no probe candidate, or none passed the residual)
+				// emit the null-padded outer row exactly once.
+				//
+				// R3-1: the emission is unconditional. plan.Predicate
+				// is the JOIN ON residual, and PG evaluates a join
+				// condition only against real inner rows — never
+				// against the null padding it just synthesised. This
+				// code used to gate the fallback on evaluating the
+				// residual against o.nullInner, where an inner-column
+				// reference yields NULL -> false, dropping the
+				// preserved outer row. The hash join has always done
+				// it this way (openLazyHashJoin's null-pad path).
+				if !o.outerMatched && o.plan.Type == planner.JoinTypeLeft {
+					o.outerMatched = true
 					o.outerMS.row = o.currentOuter
 					o.innerMS.row = o.nullInner
-					if ok, perr := o.evalPredicateSlot(); perr != nil {
-						return nil, perr
-					} else if ok {
-						return o.virtualOut, nil
-					}
+					return o.virtualOut, nil
 				}
-				// M0063-0004: Anti-join fallback. When no inner
-				// match passed evalPredicate AND the join is
-				// JoinTypeAnti, emit the outer row alone (the
-				// "matched at least one" indicator was set when
-				// any inner pass would have happened — by the
-				// !o.leftJoinEmitted reuse on Anti below).
-				if o.plan.Type == planner.JoinTypeAnti && !o.leftJoinEmitted {
-					o.leftJoinEmitted = true
+				// M0063-0004: Anti-join fallback. When no inner row
+				// passed the predicate AND the join is JoinTypeAnti,
+				// emit the outer row alone.
+				if o.plan.Type == planner.JoinTypeAnti && !o.outerMatched {
+					o.outerMatched = true
 					o.outerOnly.row = o.currentOuter
 					return o.outerOnly, nil
 				}
@@ -162,9 +200,6 @@ func (o *nestedLoopIndexJoinOp) Next() (TupleSlot, error) {
 				return nil, err
 			}
 			innerRow := slotRow(innerSlot)
-			// Mark that some inner row was produced (used by
-			// LEFT and Anti's "no-match" fallbacks).
-			o.leftJoinEmitted = true
 			o.outerMS.row = o.currentOuter
 			o.innerMS.row = innerRow
 			ok, perr := o.evalPredicateSlot()
@@ -172,15 +207,22 @@ func (o *nestedLoopIndexJoinOp) Next() (TupleSlot, error) {
 				return nil, perr
 			}
 			if !ok {
-				// Inner row failed the residual Predicate.
-				// Reset the leftJoinEmitted bit so Anti's
-				// "no qualifying match" fallback can fire if
-				// every inner row fails.
-				if o.plan.Type == planner.JoinTypeAnti {
-					o.leftJoinEmitted = false
-				}
+				// The probe produced this row but the residual
+				// rejected it, so it is not a match at all —
+				// leave outerMatched alone and try the next
+				// candidate.
 				continue
 			}
+			// R3-1: a QUALIFYING match. Recording it here rather
+			// than on row-produced is what makes both fallbacks
+			// correct — LEFT null-pads iff no candidate ever
+			// passed, Anti emits iff none passed. The old code set
+			// the bit above and reset it on failure for Anti only,
+			// a discipline that cannot work for LEFT: its loop
+			// revisits candidates after emitting one, so a reset
+			// would re-arm the fallback and duplicate the outer
+			// row. Setting on pass needs no reset in either case.
+			o.outerMatched = true
 			// M0063-0004: Semi emits the OUTER row exactly
 			// once on first qualifying match; advance to the
 			// next outer.
@@ -242,7 +284,7 @@ func (o *nestedLoopIndexJoinOp) Next() (TupleSlot, error) {
 			return nil, err
 		}
 		o.innerExhausted = false
-		o.leftJoinEmitted = false
+		o.outerMatched = false
 	}
 }
 

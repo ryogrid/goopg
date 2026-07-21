@@ -459,6 +459,18 @@ type Table struct {
 	// (false for WITH NO DATA, true after first REFRESH). M0097-0013.
 	IsPopulated bool
 
+	// RuleIsCanonical marks a plain view (relkind='v') whose pg_rewrite _RETURN
+	// rule was written with a canonical PG18 pg_node_tree ev_action (the
+	// internal/pgnodes query-tree serializer, M0123-S3), not goopg's SQL-text
+	// fallback. It is HARD-coupled to pg_class.relhasrules=true: a real PG18
+	// standby that sees relhasrules=true FATALs its relcache if ev_action is not
+	// a parseable node tree, so the writer sets this flag ONLY after
+	// pgnodes.ResolveViewQuery succeeds and stores canonical bytes; every
+	// unsupported view keeps SQL text + RuleIsCanonical=false. Restored on
+	// startup by loadViewsFromHeap (canonical ev_action ⇒ true). False for
+	// matviews and every system/information_schema virtual relation.
+	RuleIsCanonical bool
+
 	// ForeignServerName marks this table as a foreign table (`CREATE FOREIGN
 	// TABLE ... SERVER <name>`), giving it relkind='f'. Empty for an ordinary
 	// table. DU-002 slice 417.
@@ -3297,6 +3309,18 @@ type UserTSDict struct {
 	// at CREATE time so dumpTSDictionary can re-emit it verbatim. "" (no options)
 	// means the pg_ts_dict.dictinitoption column is NULL.
 	InitOption string
+	// DBOid is the real physical database oid this dictionary was CREATE TEXT
+	// SEARCH DICTIONARY'd under (mirrors catalog.UserConversion.DBOid).
+	// Registry entries are matched by (DBOid, NamespaceOID, Name), so two
+	// distinct databases may each CREATE TEXT SEARCH DICTIONARY a same-named
+	// dictionary without colliding (the DU-002 pg_dump round-trip restores a
+	// dump's dictionaries into a fresh database whose registry must not clash
+	// with the source database's). Defaults to DefaultDBOid for every call
+	// site that does not pass an explicit dbOid (resolveDBOid's convention),
+	// including WAL replay (dictionary restart-persistence is not yet
+	// dbOid-aware — see the matching deferral ledger row). M0122-0007 4e
+	// follow-up (DU-002 round-trip probe unblock).
+	DBOid uint32
 }
 
 // BuiltinTSParserOID maps the fixed real-PG OID (pg_ts_parser.dat) of the one
@@ -6916,6 +6940,13 @@ func (c *InMemory) PGClassRowsForDBOid(dbOid uint32) [][]string {
 			if len(t.Triggers) > 0 {
 				relHasTriggers = "t"
 			}
+			// relhasrules is true for a plain view whose pg_rewrite _RETURN rule
+			// was written with a canonical PG18 pg_node_tree ev_action (M0123-S3
+			// sub-slice 2c). RuleIsCanonical is only ever set on user views, so
+			// system-catalog virtual relations (RuleIsCanonical=false) stay 'f'.
+			// This mirrors the heap pg_class row buildUserPGClassRow writes so
+			// goopg's own introspection and the streamed catalog agree.
+			relHasRules := boolToPGChar(t.RuleIsCanonical)
 			// relacl — NULL until a GRANT records non-owner privileges, then the
 			// materialized aclitem[] (owner full + each grantee). pg_dump's
 			// getTables reads this directly and re-emits GRANTs (buildACLCommands,
@@ -6951,7 +6982,7 @@ func (c *InMemory) PGClassRowsForDBOid(dbOid uint32) [][]string {
 				relkind,                         // 17: relkind
 				strconv.Itoa(len(t.Columns)),    // 18: relnatts
 				strconv.Itoa(relchecks),         // 19: relchecks
-				"f",                             // 20: relhasrules
+				relHasRules,                     // 20: relhasrules
 				relHasTriggers,                  // 21: relhastriggers
 				func() string {
 					if len(c.partitionChildren[t.OID]) > 0 {
@@ -10336,39 +10367,15 @@ func (c *InMemory) registerSystemTables() {
 		},
 		OID: 3600,
 	}
+	// The base virtual view always reflects DefaultDBOid's dictionaries plus
+	// the BKI-pinned "simple" builtin (namespace dumpability still filters the
+	// builtin out of getTSDictionaries' own dump list, matching the previous
+	// "always empty" behavior there). A per-connection dbOid-scoped row-set is
+	// wired in via executor.Context.PgTSDictRows so a pg_dump restoring into a
+	// non-default database sees only its own dictionaries (DU-002 slice 446;
+	// dbOid scoping: M0122-0007 4e follow-up).
 	pgTSDict.VirtualRows = func() [][]string {
-		dicts := c.ListUserTSDicts()
-		// As of DU-002 slice 446, this view also surfaces the one built-in
-		// dictionary (BuiltinTSDictOID["simple"]) in the pg_catalog namespace:
-		// a CREATE TEXT SEARCH CONFIGURATION's ADD MAPPING ... WITH simple
-		// clause names it, and dumpTSConfig's mapdict::regdictionary cast
-		// needs a live row (by OID) to resolve it back to a bare "simple".
-		// Namespace dumpability still filters it out of getTSDictionaries'
-		// own dump list, matching the previous "always empty" behavior there.
-		rows := make([][]string, 0, len(dicts)+1)
-		rows = append(rows, []string{
-			strconv.FormatUint(uint64(BuiltinTSDictOID["simple"]), 10),   // oid
-			"simple", // dictname
-			"11",     // dictnamespace (pg_catalog OID=11)
-			"10",     // dictowner (bootstrap superuser)
-			strconv.FormatUint(uint64(BuiltinTSTemplateOID["simple"]), 10), // dicttemplate
-			VirtualNull, // dictinitoption
-		})
-		for _, ud := range dicts {
-			initOpt := VirtualNull
-			if ud.InitOption != "" {
-				initOpt = ud.InitOption
-			}
-			rows = append(rows, []string{
-				strconv.FormatUint(uint64(ud.OID), 10), // oid
-				ud.Name,                                // dictname
-				strconv.FormatUint(uint64(ud.NamespaceOID), 10), // dictnamespace
-				strconv.FormatUint(uint64(ud.Owner), 10),        // dictowner
-				strconv.FormatUint(uint64(ud.Template), 10),     // dicttemplate
-				initOpt, // dictinitoption
-			})
-		}
-		return rows
+		return c.PGTSDictRowsForDBOid(DefaultDBOid)
 	}
 	c.ns(DefaultDBOid).tables["pg_catalog.pg_ts_dict"] = pgTSDict
 
@@ -13323,22 +13330,28 @@ func (c *InMemory) PGConversionRowsForDBOid(dbOid uint32) [][]string {
 // re-emit it. `schema` is the (already-resolved) schema name the dictionary
 // lives in; an unknown schema resolves to the public namespace OID. Returns
 // the new OID, or 0 with an error if a same-named dictionary already exists in
-// the same namespace (PG enforces a unique (dictname, dictnamespace)). DU-002
-// slice 437 (M0119-0004).
-func (c *InMemory) CreateTSDict(ud *UserTSDict, schema string) (uint32, error) {
+// the same (dbOid, namespace) (PG enforces a unique (dictname, dictnamespace)
+// per database). dbOid is variadic (resolveDBOid's convention, defaulting to
+// DefaultDBOid) so two distinct databases may each CREATE TEXT SEARCH
+// DICTIONARY a same-named dictionary without colliding — mirrors
+// CreateConversion. DU-002 slice 437 (M0119-0004); dbOid scoping: M0122-0007 4e
+// follow-up.
+func (c *InMemory) CreateTSDict(ud *UserTSDict, schema string, dbOid ...uint32) (uint32, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	oid := resolveDBOid(dbOid)
 	nsOID := c.schemas[strings.ToLower(schema)]
 	if nsOID == 0 {
 		nsOID = c.schemas["public"]
 	}
 	for _, existing := range c.userTSDicts {
-		if existing.NamespaceOID == nsOID && strings.EqualFold(existing.Name, ud.Name) {
+		if existing.DBOid == oid && existing.NamespaceOID == nsOID && strings.EqualFold(existing.Name, ud.Name) {
 			return 0, fmt.Errorf("text search dictionary %q already exists", ud.Name)
 		}
 	}
 	ud.OID = c.allocOIDLocked()
 	ud.NamespaceOID = nsOID
+	ud.DBOid = oid
 	c.userTSDicts = append(c.userTSDicts, ud)
 	return ud.OID, nil
 }
@@ -13350,30 +13363,32 @@ func (c *InMemory) CreateTSDict(ud *UserTSDict, schema string) (uint32, error) {
 // FindTSDict returns the user TS dictionary matching (schema, name), or nil.
 // B3.5: the emit sites capture the OID after a registry mutation to journal
 // the pg_ts_dict heap row.
-func (c *InMemory) FindTSDict(name, schema string) *UserTSDict {
+func (c *InMemory) FindTSDict(name, schema string, dbOid ...uint32) *UserTSDict {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	oid := resolveDBOid(dbOid)
 	nsOID := c.schemas[strings.ToLower(schema)]
 	if nsOID == 0 {
 		nsOID = c.schemas["public"]
 	}
 	for _, ud := range c.userTSDicts {
-		if ud.NamespaceOID == nsOID && strings.EqualFold(ud.Name, name) {
+		if ud.DBOid == oid && ud.NamespaceOID == nsOID && strings.EqualFold(ud.Name, name) {
 			return ud
 		}
 	}
 	return nil
 }
 
-func (c *InMemory) DropTSDict(name, schema string) bool {
+func (c *InMemory) DropTSDict(name, schema string, dbOid ...uint32) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	oid := resolveDBOid(dbOid)
 	nsOID := c.schemas[strings.ToLower(schema)]
 	if nsOID == 0 {
 		nsOID = c.schemas["public"]
 	}
 	for i, ud := range c.userTSDicts {
-		if ud.NamespaceOID == nsOID && strings.EqualFold(ud.Name, name) {
+		if ud.DBOid == oid && ud.NamespaceOID == nsOID && strings.EqualFold(ud.Name, name) {
 			c.userTSDicts = append(c.userTSDicts[:i], c.userTSDicts[i+1:]...)
 			return true
 		}
@@ -13394,6 +13409,66 @@ func (c *InMemory) ListUserTSDicts() []*UserTSDict {
 	return out
 }
 
+// ListUserTSDictsForDBOid returns dbOid's own user-created text search
+// dictionaries, in creation order. Unlike ListUserTSDicts (unfiltered), this
+// scopes to one database so pg_dump's getTSDictionaries sees only the
+// connecting database's own dictionaries. Mirrors
+// ListUserConversionsForDBOid. M0122-0007 4e follow-up (DU-002 round-trip
+// probe unblock).
+func (c *InMemory) ListUserTSDictsForDBOid(dbOid uint32) []*UserTSDict {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(c.userTSDicts) == 0 {
+		return nil
+	}
+	out := make([]*UserTSDict, 0, len(c.userTSDicts))
+	for _, ud := range c.userTSDicts {
+		if ud.DBOid == dbOid {
+			out = append(out, ud)
+		}
+	}
+	return out
+}
+
+// PGTSDictRowsForDBOid builds the pg_ts_dict catalog row-set for dbOid: the
+// one BKI-pinned built-in dictionary ("simple", in pg_catalog) always
+// prepended — a CREATE TEXT SEARCH CONFIGURATION's ADD MAPPING ... WITH simple
+// clause names it and dumpTSConfig's mapdict::regdictionary cast needs a live
+// row (by OID) to resolve it back — followed by dbOid's own registered user
+// dictionaries. The virtual pg_ts_dict view calls this with DefaultDBOid so
+// every existing caller (server dispatch without a per-connection PgTSDictRows
+// wire-up, every test) sees byte-identical behavior; a per-connection dbOid is
+// wired in via executor.Context.PgTSDictRows (internal/server/dispatch.go's
+// wireExtensionRows). Mirrors PGConversionRowsForDBOid. M0122-0007 4e
+// follow-up (DU-002 round-trip probe unblock).
+func (c *InMemory) PGTSDictRowsForDBOid(dbOid uint32) [][]string {
+	dicts := c.ListUserTSDictsForDBOid(dbOid)
+	rows := make([][]string, 0, len(dicts)+1)
+	rows = append(rows, []string{
+		strconv.FormatUint(uint64(BuiltinTSDictOID["simple"]), 10),   // oid
+		"simple", // dictname
+		"11",     // dictnamespace (pg_catalog OID=11)
+		"10",     // dictowner (bootstrap superuser)
+		strconv.FormatUint(uint64(BuiltinTSTemplateOID["simple"]), 10), // dicttemplate
+		VirtualNull, // dictinitoption
+	})
+	for _, ud := range dicts {
+		initOpt := VirtualNull
+		if ud.InitOption != "" {
+			initOpt = ud.InitOption
+		}
+		rows = append(rows, []string{
+			strconv.FormatUint(uint64(ud.OID), 10), // oid
+			ud.Name,                                // dictname
+			strconv.FormatUint(uint64(ud.NamespaceOID), 10), // dictnamespace
+			strconv.FormatUint(uint64(ud.Owner), 10),        // dictowner
+			strconv.FormatUint(uint64(ud.Template), 10),     // dicttemplate
+			initOpt, // dictinitoption
+		})
+	}
+	return rows
+}
+
 // CreateTSDictDuringRecovery is the idempotent version of CreateTSDict used
 // by the WAL-replay driver (internal/initdb/tsdict_ddl_recovery.go). Unlike
 // CreateTSDict it takes the OID from the WAL record (so the recovered
@@ -13410,6 +13485,11 @@ func (c *InMemory) CreateTSDictDuringRecovery(ud *UserTSDict, schema string) {
 		nsOID = c.schemas["public"]
 	}
 	ud.NamespaceOID = nsOID
+	// Respect a caller-set DBOid; zero falls back to DefaultDBOid — what live
+	// postgres-DB sessions key on (mirrors CreateConversionDuringRecovery).
+	if ud.DBOid == 0 {
+		ud.DBOid = DefaultDBOid
+	}
 	for i, existing := range c.userTSDicts {
 		if existing.OID == ud.OID {
 			c.userTSDicts[i] = ud
@@ -13610,16 +13690,17 @@ func DeserializeTSDictOptions(s string) []parser.TSDictOption {
 // dictinitoption text (for the caller's WAL record) and an error if no such
 // dictionary is registered. DU-002 ALTER TEXT SEARCH DICTIONARY follow-up
 // (M0119-0004).
-func (c *InMemory) AlterTSDictOptions(name, schema string, directives []parser.TSDictOption) (string, error) {
+func (c *InMemory) AlterTSDictOptions(name, schema string, directives []parser.TSDictOption, dbOid ...uint32) (string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	oid := resolveDBOid(dbOid)
 	nsOID := c.schemas[strings.ToLower(schema)]
 	if nsOID == 0 {
 		nsOID = c.schemas["public"]
 	}
 	var target *UserTSDict
 	for _, ud := range c.userTSDicts {
-		if ud.NamespaceOID == nsOID && strings.EqualFold(ud.Name, name) {
+		if ud.DBOid == oid && ud.NamespaceOID == nsOID && strings.EqualFold(ud.Name, name) {
 			target = ud
 			break
 		}
@@ -13673,20 +13754,24 @@ func (c *InMemory) AlterTSDictOptionsDuringRecovery(name, schema, initOption str
 // RenameTSDict implements ALTER TEXT SEARCH DICTIONARY name RENAME TO
 // newName, mirroring RenameTSConfig. DU-002 ALTER TEXT SEARCH DICTIONARY
 // follow-up (M0119-0004).
-func (c *InMemory) RenameTSDict(name, schema, newName string) error {
+func (c *InMemory) RenameTSDict(name, schema, newName string, dbOid ...uint32) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	oid := resolveDBOid(dbOid)
 	nsOID := c.schemas[strings.ToLower(schema)]
 	if nsOID == 0 {
 		nsOID = c.schemas["public"]
 	}
 	var target *UserTSDict
 	for _, ud := range c.userTSDicts {
-		if ud.NamespaceOID == nsOID && strings.EqualFold(ud.Name, name) {
+		if ud.DBOid != oid || ud.NamespaceOID != nsOID {
+			continue
+		}
+		if strings.EqualFold(ud.Name, name) {
 			target = ud
 			continue
 		}
-		if ud.NamespaceOID == nsOID && strings.EqualFold(ud.Name, newName) {
+		if strings.EqualFold(ud.Name, newName) {
 			return fmt.Errorf("text search dictionary %q already exists", newName)
 		}
 	}
@@ -13701,9 +13786,10 @@ func (c *InMemory) RenameTSDict(name, schema, newName string) error {
 // newSchema, mirroring SetTSConfigSchema. Returns false if no such
 // dictionary is registered. DU-002 ALTER TEXT SEARCH DICTIONARY follow-up
 // (M0119-0004).
-func (c *InMemory) SetTSDictSchema(name, schema, newSchema string) bool {
+func (c *InMemory) SetTSDictSchema(name, schema, newSchema string, dbOid ...uint32) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	oid := resolveDBOid(dbOid)
 	nsOID := c.schemas[strings.ToLower(schema)]
 	if nsOID == 0 {
 		nsOID = c.schemas["public"]
@@ -13713,7 +13799,7 @@ func (c *InMemory) SetTSDictSchema(name, schema, newSchema string) bool {
 		newNsOID = c.schemas["public"]
 	}
 	for _, ud := range c.userTSDicts {
-		if ud.NamespaceOID == nsOID && strings.EqualFold(ud.Name, name) {
+		if ud.DBOid == oid && ud.NamespaceOID == nsOID && strings.EqualFold(ud.Name, name) {
 			ud.NamespaceOID = newNsOID
 			return true
 		}

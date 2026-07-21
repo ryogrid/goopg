@@ -397,6 +397,12 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	registry.OnChange("enable_nestloop_index", func(value string) {
 		planner.SetNLIEnabled(value == "on" || value == "true" || value == "1")
 	})
+	// S7: same bridge for `SET enable_memoize` — the upstream planner-method
+	// GUC now gates a real plan shape (Memoize under NLI) instead of being
+	// a registration-only no-op.
+	registry.OnChange("enable_memoize", func(value string) {
+		planner.SetMemoizeEnabled(value == "on" || value == "true" || value == "1")
+	})
 	if *confPath != "" {
 		entries, err := config.ParseConfigFile(*confPath)
 		if err != nil {

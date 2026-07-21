@@ -508,7 +508,7 @@ func buildUserPGClassRow(cat catalog.Catalog, tbl *catalog.Table) Row {
 		NewStringDatum(relkind),                                    // relkind
 		NewIntDatum(int64(len(tbl.Columns))),                       // relnatts
 		NewIntDatum(0),                                             // relchecks
-		NewBoolDatum(false),                                        // relhasrules
+		NewBoolDatum(tbl.RuleIsCanonical),                          // relhasrules (M0123-S3: true iff a canonical pg_node_tree ev_action was written)
 		NewBoolDatum(false),                                        // relhastriggers
 		NewBoolDatum(false),                                        // relhassubclass
 		NewBoolDatum(tbl.RowSecurity),                              // relrowsecurity (DU-002 slice 322)

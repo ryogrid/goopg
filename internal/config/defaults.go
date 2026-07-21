@@ -923,6 +923,9 @@ func BuildDefaultRegistry() *Registry {
 		"enable_partitionwise_join", "enable_partitionwise_aggregate",
 		"enable_parallel_hash", "enable_parallel_append",
 		"enable_gathermerge", "enable_incremental_sort",
+		// enable_memoize is no longer a no-op: like enable_nestloop_index
+		// above, cmd/goopg/main.go bridges its OnChange to the planner's
+		// process-global kill-switch (S7).
 		"enable_async_append", "enable_memoize",
 		"enable_presorted_aggregate", "enable_distinct_reordering",
 		"enable_group_by_reordering", "enable_self_join_elimination",

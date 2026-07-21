@@ -1,0 +1,54 @@
+# W1 unnest probes — HEAD e4a43ba6 2026-07-19T20:14:42Z
+== P1: minimal correlated EXISTS (equijoin only) ==
+                            QUERY PLAN                             
+-------------------------------------------------------------------
+ Aggregate  (cost=0.00..0.00 rows=1 width=0)
+   ->  Seq Scan on public.orders  (cost=0.00..0.00 rows=1 width=0)
+         Filter: (<*planner.ExistsExpr>)
+(3 rows)
+
+== P2: EXISTS + outer local predicate (pushdown interaction) ==
+                                       QUERY PLAN                                       
+----------------------------------------------------------------------------------------
+ Aggregate  (cost=0.00..0.00 rows=1 width=0)
+   ->  Seq Scan on public.orders  (cost=0.00..0.00 rows=1 width=0)
+         Filter: ((o_orderdate >= <*planner.TypedStringLit>) AND <*planner.ExistsExpr>)
+(3 rows)
+
+== P3: EXISTS + inner-only residual (Q4 exact shape minus date range) ==
+                            QUERY PLAN                             
+-------------------------------------------------------------------
+ Aggregate  (cost=0.00..0.00 rows=1 width=0)
+   ->  Seq Scan on public.orders  (cost=0.00..0.00 rows=1 width=0)
+         Filter: (<*planner.ExistsExpr>)
+(3 rows)
+
+== P4: minimal NOT EXISTS (Q22 core) ==
+                             QUERY PLAN                              
+---------------------------------------------------------------------
+ Aggregate  (cost=0.00..0.00 rows=1 width=0)
+   ->  Seq Scan on public.customer  (cost=0.00..0.00 rows=1 width=0)
+         Filter: (NOT <*planner.ExistsExpr>)
+(3 rows)
+
+== P5: correlated scalar agg (Q17 core) ==
+                             QUERY PLAN                              
+---------------------------------------------------------------------
+ Aggregate  (cost=0.00..0.00 rows=1 width=0)
+   ->  Seq Scan on public.lineitem  (cost=0.00..0.00 rows=1 width=0)
+         Filter: (l_quantity < <*planner.SubqueryExpr>)
+(3 rows)
+
+== P6: correlated IN (semi-join path) ==
+                                                  QUERY PLAN                                                  
+--------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=0.00..0.00 rows=1 width=0)
+   ->  Hash Join (?)  (cost=0.00..0.00 rows=1 width=0)
+         Filter: (true)
+     ->  Seq Scan on public.customer  (cost=0.00..0.00 rows=1 width=0)
+     ->  Index Only Scan using public.order_customer_fkidx on public.orders  (cost=0.00..0.00 rows=1 width=0)
+(5 rows)
+
+== P7: timed Q22 then Q4 (SF1, runtime scoreboard) ==
+Q22: OK elapsed=1.80s rows=7
+Q4: OK elapsed=7.41s rows=5

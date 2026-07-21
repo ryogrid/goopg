@@ -9,6 +9,7 @@ import (
 
 	"github.com/goopg/goopg/internal/activity"
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/executor/kvcache"
 	"github.com/goopg/goopg/internal/lockmgr"
 	"github.com/goopg/goopg/internal/lockwait"
 	"github.com/goopg/goopg/internal/mctx"
@@ -96,15 +97,46 @@ type Context struct {
 	// innermost outer scope.
 	OuterRows []Row
 
-	// SubqueryCache stores subquery results keyed by outer-row
-	// values so correlated subqueries are executed at most once
-	// per distinct outer value rather than per outer row.  Keys
-	// are datumKey-derived strings; values are []Dat um for
-	// InExpr or Datum for scalar subqueries.  The cache is
-	// notionally per-subquery — a production implementation
-	// would namespace by InExpr/SubqueryExpr identity.
-	SubqueryCache      map[string][]Datum
-	SubqueryCacheScope int // OuterRows len when cached; cleared on change
+	// Sublink result caches (Stage 10, D4.4/D4.5). Two stores over one
+	// shared byte budget (subqBudget, capped at WorkMem/4 per ch.06
+	// D6.4; WorkMem == 0 means unlimited — never a silent fallback
+	// constant):
+	//
+	//   - subqCacheSafe holds entries whose keys are provably
+	//     scope-independent: param-lowered sublinks (key = expr pointer
+	//     + bound param VALUES, which — thanks to Level-forwarding —
+	//     reflect every outer row the sublink truly depends on). These
+	//     survive OuterRows depth changes.
+	//   - subqCacheScoped holds every other key family (full-outer-row
+	//     keys and constant IsNonCorrelated keys on unlowered paths)
+	//     and keeps the historical guard: cleared whenever the
+	//     OuterRows depth changes (subqCacheScope). The guard stays
+	//     because an unlowered sublink's IsNonCorrelated flag can be
+	//     wrong when its only correlation hides inside a nested
+	//     sublink (the flag's walker does not descend .Plan; lowering
+	//     corrects the flag, but only where lowering ran).
+	//
+	// Access goes through subqCacheGet/subqCachePut in subq_cache.go.
+	subqBudget      *kvcache.Budget
+	subqCacheSafe   *kvcache.Cache
+	subqCacheScoped *kvcache.Cache
+	subqCacheScope  int // OuterRows len for subqCacheScoped's entries
+
+	// ParamExec is the PARAM_EXEC analog (D4.1): one slot per
+	// plan-assigned ExecParamRef ID, filled by a lowered sublink's eval
+	// site just before its inner plan runs, and read by the inner plan
+	// via planner.ExecParamRef instead of the ctx.OuterRows stack walk.
+	// Sized lazily on first write (SetParamExec) — slot IDs come from a
+	// per-statement counter, so growth is bounded by the statement's
+	// sublink correlation count. ParamSet distinguishes a written slot
+	// from a zero Datum; reading an unset slot is a lowering bug and
+	// errors loudly. ParamDirty mirrors upstream's chgParam: set
+	// unconditionally on every write (PG performs no value comparison,
+	// nodeSubplan.c:236-244); the value-compare rescan shortcut is
+	// Stage 9's business, gated on cacheability.
+	ParamExec  []Datum
+	ParamSet   []bool
+	ParamDirty []bool
 
 	// CorrSubqOps caches pre-built, pre-opened operators for correlated
 	// scalar subqueries so the same plan can be rescanned for each outer
@@ -121,6 +153,32 @@ type Context struct {
 	// even when no btree index exists. Keys are datumKey(inner_col_value);
 	// values are the projected result datum.
 	CorrSubqHashMaps map[*planner.SubqueryExpr]map[string]Datum
+
+	// SubPlanHandles keeps each sublink's inner operator tree built
+	// (and, where safe, open) across outer rows — the Stage-9 (D4.2)
+	// rescan-not-rebuild engine. Keyed by the sublink expression's
+	// pointer, like SubPlanStats. Torn down by CloseSubPlans at the
+	// statement-dispatch seam. Nil until a sublink executes with the
+	// engine enabled (GOOPG_SUBPLAN_RESCAN, default on).
+	SubPlanHandles map[planner.Expr]*subPlanHandle
+
+	// SubPlanStats records, per sublink expression, what its
+	// evaluation actually cost during this statement. It exists
+	// because the interesting question about a correlated subquery
+	// — "did the executor re-instantiate the inner plan once per
+	// outer row, or reuse it?" — is invisible in EXPLAIN output
+	// otherwise, and was previously answered only by Fermi
+	// estimates (see the correlated-subquery-planning design
+	// bundle, gate V6). Surfaced by EXPLAIN ANALYZE.
+	//
+	// Written on the single statement-executing goroutine, in the
+	// same style as the sublink result caches above; no synchronisation.
+	SubPlanStats map[planner.Expr]*SubPlanSiteStats
+
+	// MemoizeStats carries the per-Memoize-node ANALYZE counters
+	// (Hits/Misses/Evictions/Overflows), keyed by plan node like
+	// SubPlanStats. Lazily allocated by memoizeStat. S7.
+	MemoizeStats map[*planner.Memoize]*MemoizeStats
 
 	// MultiAssignSubqCache caches the result row of a MultiAssignSubqRow
 	// evaluation (tuple SET subquery). Keyed by *planner.MultiAssignSubqRow
@@ -587,6 +645,15 @@ type Context struct {
 	// round-trip probe unblock).
 	PgConversionRows func() [][]string
 
+	// PgTSDictRows mirrors PgConversionRows above for the pg_ts_dict catalog
+	// table: it lists CurrentDatabaseOid's own CREATE TEXT SEARCH
+	// DICTIONARY'd dictionaries (plus the shared BKI-pinned "simple" builtin)
+	// rather than always DefaultDBOid's (catalog.InMemory's
+	// PGTSDictRowsForDBOid). Wired by the server to close over
+	// CurrentDatabaseOid. M0122-0007 4e follow-up (DU-002 round-trip probe
+	// unblock).
+	PgTSDictRows func() [][]string
+
 	// NonSuperuserRole, when non-empty, means the session is currently running
 	// under a non-superuser role (set via SET SESSION AUTHORIZATION). Privilege
 	// checks that require superuser (e.g. LEAKPROOF function attribute) must
@@ -654,6 +721,72 @@ type Context struct {
 	// DELETE has no new). M0100-0007.
 	MergeOldRow Row
 	MergeNewRow Row
+}
+
+// SubPlanSiteStats counts what one sublink expression (a
+// SubqueryExpr / InExpr / ExistsExpr carrying an inner plan) did
+// during a statement.
+//
+// The distinction that matters is Rebuilds vs Rescans: a rebuild
+// tears down and re-instantiates the inner plan's operator tree
+// for one outer row, which is the cost that makes un-decorrelated
+// correlated subqueries quadratic; a rescan reuses an already-open
+// operator and only re-probes it. Upstream PostgreSQL only ever
+// rescans (ExecReScan in nodeSubplan.c), so a plan showing
+// Calls == Rebuilds is running the shape upstream never runs.
+type SubPlanSiteStats struct {
+	// Calls is the number of times a result was requested from
+	// this sublink — one per outer row that reached it.
+	Calls int64
+	// Rebuilds is the number of Calls that had to Build + Open
+	// (and later Close) the inner plan's operator tree.
+	Rebuilds int64
+	// Rescans is the number of Calls served by re-Opening an
+	// operator tree that was already built (the CorrSubqOps path).
+	Rescans int64
+	// CacheHits / CacheMisses count Calls answered from, or
+	// missing in, a result cache (the kvcache-backed sublink stores or the correlated
+	// hash-map path). A miss is normally followed by a Rebuild.
+	CacheHits   int64
+	CacheMisses int64
+}
+
+// subPlanStat returns the counter block for sublink e, allocating
+// it (and the map) on first use. Safe on a nil Context so the many
+// code paths that evaluate expressions with a bare or absent
+// Context in tests keep working; the returned block is then
+// discarded.
+// SetParamExec writes a PARAM_EXEC slot, growing the slot arrays on
+// demand, and marks it dirty (chgParam-style, unconditionally — see the
+// field comment). Nil-Context safe like subPlanStat: some expression
+// paths evaluate with a bare Context in tests.
+func (c *Context) SetParamExec(id int, v Datum) {
+	if c == nil || id < 0 {
+		return
+	}
+	for id >= len(c.ParamExec) {
+		c.ParamExec = append(c.ParamExec, Datum{})
+		c.ParamSet = append(c.ParamSet, false)
+		c.ParamDirty = append(c.ParamDirty, false)
+	}
+	c.ParamExec[id] = v
+	c.ParamSet[id] = true
+	c.ParamDirty[id] = true
+}
+
+func (c *Context) subPlanStat(e planner.Expr) *SubPlanSiteStats {
+	if c == nil {
+		return &SubPlanSiteStats{}
+	}
+	if c.SubPlanStats == nil {
+		c.SubPlanStats = make(map[planner.Expr]*SubPlanSiteStats)
+	}
+	s, ok := c.SubPlanStats[e]
+	if !ok {
+		s = &SubPlanSiteStats{}
+		c.SubPlanStats[e] = s
+	}
+	return s
 }
 
 // backendPID resolves the owning backend's PID string for synthetic pg_locks
