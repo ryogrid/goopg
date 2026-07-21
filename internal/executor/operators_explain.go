@@ -450,6 +450,12 @@ func emitSubPlanSubtrees(rows *[]Row, detailIndent string, opts parser.ExplainOp
 // skipped — it surfaces as `Filter:` when n is a scan-like node.
 func emitNodeDetailLines(n planner.Node, indent string, rows *[]Row, attachedFilter planner.Expr, reg *subPlanReg) {
 	switch p := n.(type) {
+	case *planner.Gather:
+		// PG emits `Workers Planned:` in PLAIN EXPLAIN — it is a plan-time
+		// property. `Workers Launched:` is execution-time and belongs to the
+		// ANALYZE walk instead.
+		*rows = append(*rows, Row{NewStringDatum(
+			indent + fmt.Sprintf("Workers Planned: %d", p.WorkersPlanned))})
 	case *planner.Sort:
 		if len(p.Keys) > 0 {
 			parts := make([]string, 0, len(p.Keys))
@@ -1088,6 +1094,8 @@ func describePlan(n planner.Node) string {
 			return fmt.Sprintf("%s (%s, build=left)", algo, jt)
 		}
 		return fmt.Sprintf("%s (%s)", algo, jt)
+	case *planner.Gather:
+		return "Gather"
 	case *planner.Distinct:
 		return "Unique"
 	case *planner.Aggregate:
@@ -1244,6 +1252,8 @@ func planChildren(n planner.Node) []planner.Node {
 	case *planner.Sort:
 		return []planner.Node{p.Child}
 	case *planner.Limit:
+		return []planner.Node{p.Child}
+	case *planner.Gather:
 		return []planner.Node{p.Child}
 	case *planner.Distinct:
 		return []planner.Node{p.Child}

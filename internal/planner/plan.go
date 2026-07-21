@@ -1895,6 +1895,40 @@ func (n *SetOp) Output() Schema { return n.Left.Output() }
 // Distinct eliminates duplicate rows from its child, implementing
 // SELECT DISTINCT. Deduplication uses the same rowKey hash as the
 // recursive UNION dedup path. M0097-0005.
+// Gather is the boundary between parallel and serial execution: Child is run
+// by WorkersPlanned goroutines whose output this node interleaves in arbitrary
+// order. Everything below a Gather is a PARTIAL plan — run by several workers
+// simultaneously, it collectively produces the full result exactly once.
+//
+// P4 of docs/design/parallel-query/ (chapter 05). Nothing in the planner
+// inserts one yet; insertion is P6.
+//
+// Divergence from PostgreSQL: PG's Gather is substantially a transport
+// implementation — one shm_mq per worker, tuples serialised in and out — while
+// goopg's is a fan-out over a Go channel, since workers share the address
+// space. The risk correspondingly moves from "is the transport correct" to "is
+// the shutdown correct".
+type Gather struct {
+	pos   int
+	Child Node
+	// WorkersPlanned is the worker count chosen at plan time. EXPLAIN renders
+	// it as PG's `Workers Planned:`; the number actually launched can be lower
+	// when the cluster-wide cap is exhausted, which is why PG reports both.
+	WorkersPlanned int
+	// SingleCopy mirrors PG's single_copy: run Child in exactly one worker
+	// rather than partitioning it. Reserved; nothing sets it yet.
+	SingleCopy bool
+	schema     Schema
+}
+
+func (n *Gather) Pos() int       { return n.pos }
+func (n *Gather) Output() Schema { return n.schema }
+
+// NewGather wraps child in a Gather that plans nWorkers workers.
+func NewGather(pos int, child Node, nWorkers int) *Gather {
+	return &Gather{pos: pos, Child: child, WorkersPlanned: nWorkers, schema: child.Output()}
+}
+
 type Distinct struct {
 	pos    int
 	Child  Node

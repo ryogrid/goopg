@@ -26,7 +26,7 @@ degrading the smoke gate from 700 to 390 TPS and aborting a transaction.
 | P1 | Session GUC plumbing | `session*` readers + typed context fields, both protocol paths | [x] (this commit) |
 | P2 | `HashAggregate` label correction | rename before `Partial `/`Finalize ` prefixes cement the misnomer | [x] (this commit) |
 | P3 | Concurrency substrate | worker contexts, per-worker arenas, `Perm()` mutex, error/panic/cancel | [x] (this commit) |
-| P4 | Parallel Seq Scan + Gather | shared block allocator, Gather operator; insertion still OFF | [ ] |
+| P4 | Parallel Seq Scan + Gather | shared block allocator, Gather operator; insertion still OFF | [x] (this commit) |
 | P5 | Partial / Finalize aggregation | `AggMode`, combine rules, whitelist refusals | [ ] |
 
 ## Design amendments to fold in during these stages
@@ -262,4 +262,72 @@ and is what the Gather operator will do in P4.
   with and without this change, and a second full race-gate run is green. It
   touches no code this stage modifies. Recorded as load-dependent flakiness,
   not attributed to this change and not dismissed.
+- commit: _(this commit)_
+
+## P4 — Parallel Seq Scan + Gather  [x]
+
+First stage that actually executes in parallel — but does **not** plan it.
+Nothing inserts a Gather; the tests construct the node directly.
+
+- [x] `parallelScanState` (`internal/executor/parallel_scan.go`): one
+      `atomic.Uint64`. PG's equivalent lives in DSM behind a spinlock and
+      carries chunk size, ramp-down schedule and sync-scan position; goopg
+      needs none of that, so the state reduces to a counter. One block per
+      claim — PG's chunking exists mainly to amortise its spinlock, which has
+      no analogue here.
+- [x] `seqScanOp` gains `pscan`. The two `curBlock++` sites were routed through
+      a single `advanceBlock()` helper rather than edited in place, so the
+      serial and parallel disciplines cannot drift apart. Everything else stays
+      per-worker: pin, page, decode buffer, emitted slot, per-page arena, ring,
+      prefetch watermark.
+- [x] Ring **disabled** for parallel scans (`ScanRing` has zero
+      synchronisation). Both documented side effects are stated in the code:
+      it removes pool-pollution protection for exactly the large relations the
+      ring exists to protect, and — because the hint-bit path is gated on
+      `o.pinned != nil`, which is nil under the ring — it turns hint-bit
+      writing **on** for those scans.
+- [x] Prefetch disabled for parallel scans: with a shared allocator a worker's
+      next block is not `curBlock+1`, so a per-worker lookahead window
+      prefetches blocks it will never read. N workers supply the I/O
+      concurrency directly.
+- [x] `planner.Gather` + `gatherOp` (`internal/executor/operators_gather.go`):
+      batching (256 rows), buffered channel as the entire flow-control
+      mechanism, per-worker arenas allocated **by the leader**, and
+      `Close` = cancel → **drain** → join → merge notices → release arenas.
+- [x] Implemented as a legacy `Operator` — verified `buildRec`'s `default` arm
+      wraps it in an `OpAdapter`, so the live `BuildFastIterator` path reaches
+      it with zero slab changes. Each worker builds its own tree from the
+      shared read-only plan (`Build` is a pure function of the plan node).
+- [x] EXPLAIN: label, `planChildren` (a new node is invisible without it), and
+      `Workers Planned:` in `emitNodeDetailLines` so it renders in plain
+      EXPLAIN as PG does.
+
+**Three bugs found by this stage's own tests**, all in the first cut:
+
+1. **`max_parallel_workers = 0` meant "no cap" instead of "no parallelism".**
+   The clamp was `if cap > 0 && n > cap`, so setting the GUC to zero — the
+   documented way to disable parallel query — would have been silently
+   ineffective. It now clamps unconditionally, matching the P1 readers whose
+   fallback is 0 for exactly this reason.
+2. **A Gather with zero workers returned zero rows.** That is a wrong-results
+   bug wearing the costume of a degraded plan: a Gather is a transport, not a
+   filter. Fixed by implementing leader participation now rather than deferring
+   it — the leader runs the child itself whenever nothing else will, and
+   honours `parallel_leader_participation` otherwise.
+3. **Early `Close` reported SQLSTATE 57014.** Abandoning a scan (satisfied
+   `LIMIT`, error above the Gather) cancels the workers, who then correctly
+   report cancellation — and returning that turned a normal early exit into a
+   query error. `Close` now distinguishes a self-inflicted cancellation from a
+   genuine one.
+
+Coverage: allocator partitioning under 8 goroutines (every block exactly once —
+a duplicate double-counts rows, a gap loses them); union-of-workers row
+identity; the transfer contract at the boundary; worker error; worker panic
+(process must survive); **early-close deadlock** with workers deliberately
+blocked mid-send; cancellation; goroutine-leak across five open/close cycles;
+and the zero-worker case.
+
+- gates: units PASS; **race-gate PASS (46 packages)**; spotcheck PASS
+  (Q12=2 / Q13=33); plan-gate 22/22 MATCH — zero diffs as predicted, nothing
+  inserts a Gather yet
 - commit: _(this commit)_
