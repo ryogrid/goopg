@@ -564,18 +564,29 @@ func TestIndexKeyToggleDeterminism(t *testing.T) {
 	}
 }
 
-// TestIndexKeyCompositeCorrelationStaysSubPlan: a two-column (composite)
-// correlation must NOT be pulled up to a semi/anti join, because the
-// second equijoin pair would have to ride as an equi-residual on the
-// semi join, which the downstream NLI rewrite can silently drop (the
-// pair gets extracted as a competing probe key). Refusing the pull-up
-// keeps the answer correct via the SubPlan path; no TPC-H query needs
-// composite-EXISTS decorrelation. Single-column correlations still fire
-// (the other tests here). Composite decorrelation is a recorded
-// follow-up. A regression that starts pulling this up — without also
-// making the NLI path preserve the second equality — would return wrong
-// results, so this test guards the refusal.
-func TestIndexKeyCompositeCorrelationStaysSubPlan(t *testing.T) {
+// TestIndexKeyCompositeCorrelationDecorrelatesKeepingBothPairs: a
+// two-column (composite) correlation DOES pull up to a semi/anti join as
+// of R3-4 — and the second equijoin pair must survive on the join
+// predicate.
+//
+// This test previously pinned the opposite (the S1c bail: composite EXISTS
+// stays a SubPlan). That bail existed because the pre-S1c code keyed on
+// params[0] and silently DROPPED the rest, over-matching; refusing the
+// pull-up was the correct emergency fix, and its stated fear was that the
+// downstream NLI rewrite could extract an extra pair as a competing probe
+// key and lose the first. R3-4 handles that instead of avoiding it:
+// collectCrossSideEquiKeys harvests LeftKey/RightKey together with the
+// predicate conjuncts, so a covering composite index consumes every pair,
+// and any pair it does not cover stays on the predicate where the
+// executor's lazy hash semi/anti re-checks it per bucket match.
+//
+// The invariant the old test really protected — "the second equality is
+// never silently lost" — is what this version asserts, now on the
+// decorrelated shape. See also composite_exists_unnest_test.go (coordinate
+// spaces, composite probe consuming both pairs) and
+// internal/executor/composite_exists_nli_test.go (end-to-end rows on both
+// index shapes, cross-checked against the SubPlan path).
+func TestIndexKeyCompositeCorrelationDecorrelatesKeepingBothPairs(t *testing.T) {
 	// The harvest is ON by default since S6; enabled explicitly here so the
 	// test is self-contained regardless of sibling-test toggles.
 	SetIndexKeyHarvestEnabled(true)
@@ -587,12 +598,64 @@ func TestIndexKeyCompositeCorrelationStaysSubPlan(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if hasAnySemiOrAnti(node) {
-		t.Fatalf("composite (two-equijoin) EXISTS must NOT decorrelate — the second pair can be dropped by the NLI rewrite")
+	if !hasAnySemiOrAnti(node) {
+		t.Fatalf("composite (two-equijoin) EXISTS should decorrelate to a semi/anti join as of R3-4")
 	}
-	if !planHasSubqueryExpr(node) {
-		t.Fatalf("composite EXISTS should remain a SubPlan")
+	if planHasSubqueryExpr(node) {
+		t.Fatalf("composite EXISTS should no longer leave a SubPlan behind")
 	}
+	// The load-bearing half: the pair that did NOT become the hash key
+	// must still be enforced somewhere. With this catalog's index the
+	// join converts to an NLI, where "enforced" means the composite probe
+	// consumed both keys; without one it stays a hash semi join carrying
+	// the pair on its predicate. Accept either, reject neither being true
+	// — that combination is the historical over-match.
+	if j := findSemiOrAntiJoin(node); j != nil {
+		if j.Predicate == nil {
+			t.Fatalf("second equijoin pair vanished: hash semi join has no predicate")
+		}
+		return
+	}
+	nli := findSemiOrAntiNLI(node)
+	if nli == nil {
+		t.Fatalf("neither a semi/anti Join nor NLI found despite hasAnySemiOrAnti")
+	}
+	if len(nli.Inner.Keys) < 2 && nli.Predicate == nil {
+		t.Fatalf("second equijoin pair vanished: NLI probe has %d key(s) and no residual predicate",
+			len(nli.Inner.Keys))
+	}
+}
+
+// findSemiOrAntiNLI returns the first Semi/Anti NestedLoopIndexJoin.
+func findSemiOrAntiNLI(n Node) *NestedLoopIndexJoin {
+	var found *NestedLoopIndexJoin
+	var walk func(Node)
+	walk = func(cur Node) {
+		if cur == nil || found != nil {
+			return
+		}
+		switch x := cur.(type) {
+		case *NestedLoopIndexJoin:
+			if x.Type == JoinTypeSemi || x.Type == JoinTypeAnti {
+				found = x
+				return
+			}
+			walk(x.Outer)
+		case *Project:
+			walk(x.Child)
+		case *Filter:
+			walk(x.Child)
+		case *Sort:
+			walk(x.Child)
+		case *Aggregate:
+			walk(x.Child)
+		case *Join:
+			walk(x.Left)
+			walk(x.Right)
+		}
+	}
+	walk(n)
+	return found
 }
 
 // TestIndexKeyRangeCorrelationStaysSubPlan: a range correlation lands in

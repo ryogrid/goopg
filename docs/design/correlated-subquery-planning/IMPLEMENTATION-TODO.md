@@ -990,7 +990,7 @@ was `distinctOp.Open` (the `Unique` node), not the NL join.
 | R3-1 | item 4: NLI LEFT executor fix (2 defects) + pins | live wrong-results bug: NLI returned 1 of 4 rows vs hash's 4 | [x] `70792111` |
 | R3-3 | item 2: big-numeric hash-key fix (+ string hazard REFUTED) | found a live wrong-results bug in hash JOINS, not just the probe | [x] `d9cab218` |
 | R3-2 | item 1: zero-rows falsification + regression pins | World A confirmed on SF1 (1 375 096 = 1 375 096) | [x] (this commit) |
-| R3-4 | item 5: composite EXISTS/NOT EXISTS + M23–M27 | also writes the missing Project-strip guard | [ ] |
+| R3-4 | item 5: composite EXISTS/NOT EXISTS + M23–M26 | also wrote the missing Project-strip guard | [x] (this commit) |
 | R3-5 | item 3: DML-sublink lowering | dedicated wrapper, NOT a walkPlanExprs extension | [ ] |
 | R3-6 | FINAL: gates + tripwire spotcheck + report + ledger resolutions | | [ ] |
 
@@ -1043,3 +1043,30 @@ was `distinctOp.Open` (the `Unique` node), not the NL join.
       shape SF1 takes today, so a regression cannot hide behind the planner
       having moved on
 - [x] ledger row marked resolved (falsified-at-HEAD, with the evidence trail)
+
+## R3-4 — composite EXISTS decorrelation  [x]
+
+- [x] `len(params) > 1` bail lifted: params[0] keeps the hash key, params[1:]
+      are synthesised in the PRE-REWRITE space and passed through
+      `liftResidualConjuncts` with the real residuals, so merged-coordinate
+      mapping lives in exactly one place
+- [x] the bail's "competing probe key" fear handled, not avoided: with a
+      covering composite index the probe consumes BOTH pairs (`Index Cond:
+      (j1 = k1 AND j2 = k2)`, Keys>=2); without one the pair stays on the
+      predicate and the executor re-checks it per bucket match
+- [x] **wrote the Project-strip guard** that the comment had claimed but never
+      implemented — bounds AND name check per params[i].SubCol.Index against
+      the stripped inner schema (an in-range index on the wrong column is the
+      silent case)
+- [x] corrected a stale comment claiming RightKey used inner-local indices on
+      this path (it uses merged; the SCALAR template uses inner-local — the two
+      must not be copied into each other)
+- [x] `TestIndexKeyCompositeCorrelationStaysSubPlan` rewritten (not deleted) to
+      pin the new shape while keeping the invariant it really protected:
+      the second equality is never silently lost
+- [x] coverage: matrix M23–M26; planner pins for predicate content, coordinate
+      spaces, composite probe; executor end-to-end on both index shapes,
+      cross-checked against the SubPlan path
+- [x] gates: units PASS; race-gate PASS; spotcheck Q12=2/Q13=33; Q4 semi-join
+      value 5 rows; plan-gate 22/22 MATCH (no TPC-H query has a
+      composite-correlated EXISTS, so zero plan movement was the prediction)

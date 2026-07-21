@@ -3597,18 +3597,42 @@ func unnestExistsExpr(ex *ExistsExpr, outer Node) (Node, error) {
 		return nil, nil
 	}
 	params := eup.Params
-	// Only params[0] becomes the hash key below; a second equijoin pair
-	// (a composite-index correlation, or two Filter equi-conjuncts) would
-	// have to ride as a residual. A NON-equi residual is fine and is the
-	// common case (Q21's `l2.l_suppkey <> l1.l_suppkey`), but an *equi*
-	// residual on a semi/anti join interacts badly with the downstream
-	// NLI rewrite (it can be extracted as a competing probe key and the
-	// pair silently dropped), so refuse the pull-up and let the SubPlan
-	// path — always correct — serve a multi-equijoin EXISTS. No TPC-H
-	// query needs this; composite-correlated EXISTS decorrelation is a
-	// recorded follow-up.
-	if len(params) > 1 {
-		return nil, nil
+	// R3-4: composite (multi-equijoin) EXISTS decorrelates. params[0]
+	// becomes the hash key as before; params[1:] ride as ordinary equi
+	// conjuncts on the join predicate, which is exactly how the scalar
+	// path has always handled its extra pairs and what the executor
+	// already enforces — the lazy hash semi/anti re-evaluates the FULL
+	// plan.Predicate against every bucket match, so an equi residual is
+	// checked per candidate just like Q21's non-equi `<>`.
+	//
+	// This supersedes the S1c bail. That bail was correct-but-blunt: the
+	// pre-S1c code used only params[0] as the key and SILENTLY DROPPED
+	// the rest (over-matching), so refusing the pull-up was the right
+	// emergency fix. Its stated fear — that the downstream NLI rewrite
+	// might extract an extra pair as a competing probe key and lose the
+	// first — is handled rather than avoided: collectCrossSideEquiKeys
+	// harvests LeftKey/RightKey AND the predicate conjuncts together, so
+	// a covering composite index consumes all pairs, and any pair the
+	// index does not cover stays on the predicate and is re-checked by
+	// the executor. Pinned by the indexed/unindexed pair of tests.
+	//
+	// The extra conjuncts are synthesised in the PRE-REWRITE coordinate
+	// space (OuterColumnRef + inner-local ColumnRef) and handed to
+	// liftResidualConjuncts alongside the real residuals, so the merged
+	// coordinate mapping lives in exactly one place. Hand-building
+	// merged indices here would duplicate that mapping — and the two
+	// spaces differ (predicate refs are outer++inner, RightKey is
+	// inner-child-local), which is precisely where a copy would drift.
+	// (guarded: the M14 zero-equijoin shape has no params at all, and
+	// slicing an empty slice from index 1 panics)
+	var extraPairConjuncts []Expr
+	for _, p := range params[min(1, len(params)):] {
+		extraPairConjuncts = append(extraPairConjuncts, &BinaryOp{
+			pos:   p.OuterRef.Pos(),
+			Op:    parser.OpEq,
+			Left:  p.OuterRef,
+			Right: p.SubCol,
+		})
 	}
 
 	// Find the Filter that contains this ExistsExpr conjunct.
@@ -3693,13 +3717,28 @@ func unnestExistsExpr(ex *ExistsExpr, outer Node) (Node, error) {
 	// must expose that schema — not a projected subset. A Project that
 	// does NOT contain the key column in its output targets is stripped.
 	if proj, ok := innerPlan.(*Project); ok && !proj.IsolatedScope {
-		// Check whether RightKey column index is accessible in the projected
-		// output. For EXISTS inner plans the equijoin key is always a column
-		// from the scan (SubCol.Index = index in the scan schema, not in the
-		// project output). Strip the project so the hash sees the scan row.
+		// For EXISTS inner plans the equijoin key is always a column from
+		// the scan (SubCol.Index indexes the scan schema, not the project
+		// output). Strip the project so the hash sees the scan row.
 		innerPlan = proj.Child
 		// Unwrap any Filter(true) that might now be at the top.
 		innerPlan = unwrapTrivialWrappers(innerPlan)
+	}
+	// R3-4: validate that every correlation column actually resolves in
+	// the inner plan's schema. The comment above this strip used to claim
+	// a "check whether the key index is accessible" that was never
+	// implemented, so a mismatch would surface as a wrong-column read at
+	// runtime rather than a bail. It matters more now that params[1:] are
+	// consumed too: with one key a bad index was mostly a self-join
+	// aliasing accident, but every extra pair is another chance to index
+	// past a schema the strip reshaped. Name-check as well as bounds-check
+	// — an in-range index pointing at the wrong column is the silent case.
+	innerSchema := innerPlan.Output()
+	for _, p := range params {
+		if p.SubCol.Index < 0 || p.SubCol.Index >= len(innerSchema) ||
+			!strings.EqualFold(innerSchema[p.SubCol.Index].Name, p.SubCol.Name) {
+			return nil, nil
+		}
 	}
 	// D3.0 belt: the equijoin residuals were lifted onto the join
 	// predicate below and the equi-pair keys neutralised in the clone;
@@ -3723,11 +3762,14 @@ func unnestExistsExpr(ex *ExistsExpr, outer Node) (Node, error) {
 
 	// Build keys. The probe (outer) key uses the outer column ref
 	// at its original index; the build (inner) key uses the inner
-	// ColumnRef adjusted to point into the inner plan's own
-	// schema, NOT a merged schema, because the join's output is
-	// outer-only and the build side reads from a row of inner
-	// width alone (see executor's openLazyHashJoin path for
-	// BuildLeft=false).
+	// ColumnRef in MERGED outer++inner coordinates — see the shift
+	// applied to innerKey below. (An earlier version of this comment
+	// claimed the opposite, "the inner plan's own schema, NOT a merged
+	// schema"; that was stale and contradicted the code two lines down.
+	// Corrected in R3-4, whose composite pairs made the convention
+	// load-bearing in a second place. Note the scalar multi-param
+	// template DOES use inner-child-local RightKey indices, so the two
+	// paths must not be copied into one another.)
 	//
 	// S4a (D3.2): with zero equijoin pairs there is no hash key —
 	// the join runs as a nested-loop semi/anti whose Predicate
@@ -3797,7 +3839,17 @@ func unnestExistsExpr(ex *ExistsExpr, outer Node) (Node, error) {
 	outerSchema := outerChild.Output()
 	// S4a: index rewriting for lifted residuals is shared with the IN and
 	// scalar paths — see liftResidualConjuncts / resolveOuterSchemaIdx.
-	joinPredicate := liftResidualConjuncts(eup.Residuals, innerOnlyLifted, outerSchema, outerWidth)
+	// R3-4: params[1:] join the residual set here, so they pass through
+	// the same OuterColumnRef->outer-index / inner-ColumnRef->+outerWidth
+	// rewrite as every other lifted conjunct. Copy rather than append in
+	// place: eup.Residuals belongs to the caller's collector result.
+	residualsWithPairs := eup.Residuals
+	if len(extraPairConjuncts) > 0 {
+		residualsWithPairs = make([]Expr, 0, len(eup.Residuals)+len(extraPairConjuncts))
+		residualsWithPairs = append(residualsWithPairs, eup.Residuals...)
+		residualsWithPairs = append(residualsWithPairs, extraPairConjuncts...)
+	}
+	joinPredicate := liftResidualConjuncts(residualsWithPairs, innerOnlyLifted, outerSchema, outerWidth)
 
 	algo := JoinAlgoHash
 	if len(params) == 0 {

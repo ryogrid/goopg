@@ -492,6 +492,52 @@ func semanticsCases() []semanticsCase {
 				"SELECT y.a FROM t2 y WHERE y.b = z.b)) ORDER BY a",
 			want: []string{"1"},
 		},
+		{
+			id: "M23",
+			desc: "composite (two-equijoin) EXISTS enforces BOTH pairs — the historical " +
+				"over-match was keying on the first pair and dropping the second",
+			// Only t1(1,10) has a t2 row agreeing on BOTH columns. t1(3,30)
+			// is the load-bearing row: it matches t2(3,NULL) on `a` alone,
+			// so a first-key-only implementation would wrongly emit it.
+			sql: "SELECT a FROM t1 WHERE EXISTS (" +
+				"SELECT 1 FROM t2 y WHERE y.a = t1.a AND y.b = t1.b) ORDER BY a",
+			want: []string{"1"},
+		},
+		{
+			id: "M24",
+			desc: "composite NOT EXISTS treats a NULL key column as a non-match, not as " +
+				"NOT-IN-style poisoning (plain anti join, never NullAware)",
+			// EXISTS is a pure existence test: an equality with NULL on
+			// either side is UNKNOWN, never TRUE, so it simply fails to
+			// match. t1(3,30) vs t2(3,NULL) and t1(4,NULL) both therefore
+			// SURVIVE the NOT EXISTS — where the NOT IN form would go NULL.
+			sql: "SELECT a FROM t1 WHERE NOT EXISTS (" +
+				"SELECT 1 FROM t2 y WHERE y.a = t1.a AND y.b = t1.b) ORDER BY a",
+			want: []string{"2", "3", "4"},
+		},
+		{
+			id: "M25",
+			desc: "composite EXISTS with an additional non-equi residual keeps equi and " +
+				"non-equi conjuncts coexisting on the semi-join predicate",
+			// Same as M23 plus a residual that excludes nothing, proving the
+			// equi pairs and the `<>` share the predicate without either
+			// being dropped; y.b <> 99 holds for every non-NULL b.
+			sql: "SELECT a FROM t1 WHERE EXISTS (" +
+				"SELECT 1 FROM t2 y WHERE y.a = t1.a AND y.b = t1.b AND y.b <> 99) ORDER BY a",
+			want: []string{"1"},
+		},
+		{
+			id: "M26",
+			desc: "composite EXISTS whose second pair excludes every candidate returns " +
+				"the empty set on both paths",
+			// y.b = t1.a can never hold together with y.a = t1.a on this
+			// fixture (t2's b values are 10/11/NULL, its a values 1/1/3),
+			// so the semi join must produce nothing rather than falling
+			// back to first-key matches.
+			sql: "SELECT a FROM t1 WHERE EXISTS (" +
+				"SELECT 1 FROM t2 y WHERE y.a = t1.a AND y.b = t1.a) ORDER BY a",
+			want: []string{},
+		},
 	}
 }
 
