@@ -62,6 +62,7 @@ refusing those rewrites. Where PG refuses a rewrite (OR-position sublinks,
 | [06](06-cost-model-touchpoints.md) | Costing Subplans, Semi/Anti Methods, and Caches | NLI semi/anti, SubPlan cost charging, thresholds, EXPLAIN visibility |
 | [07](07-verification-and-measurement.md) | Correctness Gates and Measurement Plan | Semantics test matrix, oracle parity, plan gates, perf gates, instrumentation |
 | [08](08-roadmap-and-milestones.md) | Phased Implementation Roadmap | Phases S0–S7 with acceptance criteria, dependency graph, milestone policy, hygiene tasks |
+| [09](09-round3-open-items.md) | Round 3: Closing the Open Ledger Rows | Investigation-backed designs for the five rows left open by rounds 1–2: NLI LEFT residual (live bug), zero-rows falsification, hash-probe widening + string-shape hazard, composite EXISTS, DML-sublink lowering |
 
 Raw evidence captured for this bundle lives in [evidence/](evidence/):
 `explain-head-e4a43ba6.txt` (EXPLAIN of the 11 subquery-bearing TPC-H

@@ -970,3 +970,26 @@ was `distinctOp.Open` (the `Unique` node), not the NL join.
       exercised by the gate suite) — the "delete if unused" clause does not apply
 - [x] round-2 part of this file closed
 - commit: _(the report commit)_
+
+---
+
+# ROUND 3 — closing the earlier rounds' open ledger rows
+
+| field | value |
+| --- | --- |
+| status | in progress |
+| started | 2026-07-21 |
+| branch | `planner-kaizen3` (base `872b424d`) |
+| scope | the five open rows from round 2 report §6: derived-table zero-rows, hashed-probe family limits, DML-sublink lowering, LEFT+residual NLI hazard, composite-equijoin EXISTS. Design first (user direction): [`09-round3-open-items.md`](09-round3-open-items.md) |
+
+## Round-3 stage table
+
+| # | Stage | Scope | Status |
+|---|---|---|---|
+| R3-0 | design chapter + this TODO part | docs only | [ ] |
+| R3-1 | item 4: NLI LEFT executor fix (2 defects) + pins | live wrong-results bug (leak paths exist) | [ ] |
+| R3-2 | item 1: zero-rows falsification + regression pins | World A confirmed on SF1 | [ ] |
+| R3-3 | item 2: string-shape hazard fix + big-numeric widening | includes NEW hashFamString hazard | [ ] |
+| R3-4 | item 5: composite EXISTS/NOT EXISTS + M23–M27 | | [ ] |
+| R3-5 | item 3: DML-sublink lowering | scope per design §3 | [ ] |
+| R3-6 | FINAL: gates + tripwire spotcheck + report + ledger resolutions | | [ ] |
