@@ -151,12 +151,18 @@ The same argument extends: all build tables are constructed serially by the
 leader and published read-only; the probe side becomes partial. Nothing about
 MHJ is structurally hostile to this.
 
-However, MHJ is **not** in v1 scope. It has no PG equivalent, so there is no
-oracle plan to compare against, and it interacts with the planner's join-order
-DP in ways that would widen the plan-gate surface considerably. Parallelising
-the two-way `Join` first gives the TPC-H benefit (the reference set uses
-`Parallel Hash Join`, i.e. the two-way form) with a bounded blast radius.
-Recorded in [10](10-roadmap.md).
+MHJ was **not** in v1 scope, and the reasoning here was partly wrong — see
+[12](12-parallel-multi-way-hash-join.md) §0, which parallelises it. Two
+corrections: (1) "parallelising the two-way `Join` first gives the TPC-H
+benefit" is false — P8 shipped and changed one plan (Q13) with no measurable
+gain, because goopg collapses multi-table joins into `MultiHashJoin`, so the
+two-way form the reference set never actually uses. (2) MHJ does **not**
+interact with the join-order DP: `rewriteMultiWayChain` runs after the DP
+finishes and `MaybeAddGather` is a non-mutating post-pass. The one true reason
+was the absent oracle plan, which [12](12-parallel-multi-way-hash-join.md) §4
+handles with a stated PG-comparability invariant. The build side being the
+small side (§3.1) is what makes the parallel MHJ *simpler* than this two-way
+case, not harder.
 
 ## 7. Semi / Anti joins
 
