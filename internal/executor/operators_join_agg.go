@@ -471,7 +471,44 @@ func (o *joinOp) coalesceUsingRow(merged Row) {
 // openLazyHashJoin builds a hash table from the build side and sets
 // up lazy output. When ctx.WorkMem > 0, the build side uses
 // drainRowsBounded to spill to disk if row data exceeds the budget.
+// openLazyHashJoin builds the hash table (or adopts a shared one) and opens
+// the probe side.
+//
+// P8 split this into two halves. Under parallelism the build must happen ONCE,
+// in the leader, before any worker starts, while each worker opens only its own
+// (partial) probe side — so "drain the build, then open the probe" could no
+// longer be a single indivisible step.
 func (o *joinOp) openLazyHashJoin(ctx *Context) error {
+	// A Gather pre-builds the shared table in the leader and publishes it
+	// before fan-out. It is frozen at that point and never written again,
+	// which is the whole reason workers can read it with no lock.
+	if sb := lookupSharedHashBuild(ctx, o.plan); sb != nil {
+		o.applySharedBuild(sb)
+		return o.openProbeSide(ctx, sb.probeIsLeft)
+	}
+	probeIsLeft, err := o.buildLazyHashTable(ctx)
+	if err != nil {
+		return err
+	}
+	return o.openProbeSide(ctx, probeIsLeft)
+}
+
+// openProbeSide opens whichever side the build did not consume.
+func (o *joinOp) openProbeSide(ctx *Context, probeIsLeft bool) error {
+	probe := o.right
+	if probeIsLeft {
+		probe = o.left
+	}
+	if err := probe.Open(ctx); err != nil {
+		return err
+	}
+	o.lazyProbe = probe
+	return nil
+}
+
+// buildLazyHashTable drains the build side into o.lazyHash and reports which
+// side is left for probing. It does NOT open the probe side.
+func (o *joinOp) buildLazyHashTable(ctx *Context) (bool, error) {
 	leftWidth := len(o.left.Schema())
 	rightWidth := len(o.right.Schema())
 	o.lazyLW = leftWidth
@@ -499,11 +536,17 @@ func (o *joinOp) openLazyHashJoin(ctx *Context) error {
 		buildLeft = false
 	}
 	if buildLeft {
-		if err := o.left.Open(ctx); err != nil { return err }
+		if err := o.left.Open(ctx); err != nil {
+			return false, err
+		}
 		buildOp, err := drainRowsBounded(o.left, budget)
 		_ = o.left.Close()
-		if err != nil { return err }
-		if err := buildOp.Open(ctx); err != nil { return err }
+		if err != nil {
+			return false, err
+		}
+		if err := buildOp.Open(ctx); err != nil {
+		return false, err
+	}
 		var nullRight Row
 		var keyRow Row
 		buildCount := 0
@@ -515,13 +558,17 @@ func (o *joinOp) openLazyHashJoin(ctx *Context) error {
 			// while build keeps draining.
 			if buildCount&0xFFF == 0 && ctx != nil && ctx.Ctx != nil {
 				if err := ctx.Ctx.Err(); err != nil {
-					return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+					return false, &ExecError{Code: "57014", Message: "canceling statement due to user request"}
 				}
 			}
 			buildCount++
 			lSlot, err := buildOp.Next()
-			if err == EOF { break }
-			if err != nil { return err }
+			if err == EOF {
+			break
+		}
+			if err != nil {
+			return false, err
+		}
 			l := slotRow(lSlot)
 			if leftWidth == 0 && len(l) > 0 {
 				leftWidth = len(l); o.lazyLW = leftWidth
@@ -535,28 +582,37 @@ func (o *joinOp) openLazyHashJoin(ctx *Context) error {
 			copy(keyRow[:leftWidth], l)
 			copy(keyRow[leftWidth:], nullRight)
 			key, ok, err := o.evalHashKey(o.plan.LeftKey, keyRow)
-			if err != nil { return err }
+			if err != nil {
+			return false, err
+		}
 			if !ok { continue }
 			if o.lazyHash == nil { o.lazyHash = make(map[string][]Row) }
 			o.lazyHash[key] = append(o.lazyHash[key], l)
 		}
 		_ = buildOp.Close()
-		if err := o.right.Open(ctx); err != nil { return err }
-		o.lazyProbe = o.right
-		return nil
+		return false, nil
 	}
-	if err := o.right.Open(ctx); err != nil { return err }
+	if err := o.right.Open(ctx); err != nil {
+		return false, err
+	}
 	// M0118-0009 (eval-plan-qual): preserve build-side heap ctids when a
 	// downstream FOR UPDATE locks a relation on this (right) build side.
 	if o.preserveCTIDRel != nil {
 		if sl := findScanLeafForRel(o.right, *o.preserveCTIDRel); sl != nil {
-			return o.buildHashRightWithCTID(ctx, sl, leftWidth, rightWidth)
+			if err := o.buildHashRightWithCTID(ctx, sl, leftWidth, rightWidth); err != nil {
+				return false, err
+			}
+			return true, nil
 		}
 	}
 	buildOp, err := drainRowsBounded(o.right, budget)
 	_ = o.right.Close()
-	if err != nil { return err }
-	if err := buildOp.Open(ctx); err != nil { return err }
+	if err != nil {
+			return false, err
+		}
+	if err := buildOp.Open(ctx); err != nil {
+		return false, err
+	}
 	var nullLeft Row
 	var keyRow Row
 	buildCount := 0
@@ -564,13 +620,17 @@ func (o *joinOp) openLazyHashJoin(ctx *Context) error {
 		// M0062-followup: same ctx check on the build-right path.
 		if buildCount&0xFFF == 0 && ctx != nil && ctx.Ctx != nil {
 			if err := ctx.Ctx.Err(); err != nil {
-				return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+				return false, &ExecError{Code: "57014", Message: "canceling statement due to user request"}
 			}
 		}
 		buildCount++
 		rSlot, err := buildOp.Next()
-		if err == EOF { break }
-		if err != nil { return err }
+		if err == EOF {
+			break
+		}
+		if err != nil {
+			return false, err
+		}
 		r := slotRow(rSlot)
 		if rightWidth == 0 && len(r) > 0 {
 			rightWidth = len(r); o.lazyRW = rightWidth
@@ -584,7 +644,9 @@ func (o *joinOp) openLazyHashJoin(ctx *Context) error {
 		copy(keyRow[:leftWidth], nullLeft)
 		copy(keyRow[leftWidth:], r)
 		key, ok, err := o.evalHashKey(o.plan.RightKey, keyRow)
-		if err != nil { return err }
+		if err != nil {
+			return false, err
+		}
 		if o.plan.NullAware {
 			o.antiBuildRows++
 		}
@@ -598,9 +660,7 @@ func (o *joinOp) openLazyHashJoin(ctx *Context) error {
 		o.lazyHash[key] = append(o.lazyHash[key], r)
 	}
 	_ = buildOp.Close()
-	if err := o.left.Open(ctx); err != nil { return err }
-	o.lazyProbe = o.left
-	return nil
+	return true, nil
 }
 
 // buildHashRightWithCTID is the ctid-preserving variant of the !BuildLeft build
@@ -646,10 +706,8 @@ func (o *joinOp) buildHashRightWithCTID(ctx *Context, scanLeaf currentTIDProvide
 		o.lazyHash[key] = append(o.lazyHash[key], r)
 		o.lazyHashCTID[key] = append(o.lazyHashCTID[key], ctids[i])
 	}
-	if err := o.left.Open(ctx); err != nil {
-		return err
-	}
-	o.lazyProbe = o.left
+	// P8: the probe side is opened by the caller, not here — the build and
+	// probe halves of Open are separable now.
 	return nil
 }
 

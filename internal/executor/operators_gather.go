@@ -85,6 +85,10 @@ type gatherOp struct {
 	// happened the first time these pieces were connected, and what the
 	// serial-vs-parallel identity check caught.
 	pscan *parallelScanState
+
+	// ownsSharedBuilds records that this Gather published hash tables on the
+	// session context (P8) and must retract them at Close.
+	ownsSharedBuilds bool
 }
 
 func newGatherOp(p *planner.Gather, buildChild func() (Operator, error)) *gatherOp {
@@ -97,6 +101,24 @@ func (o *gatherOp) Schema() planner.Schema { return o.schema }
 // ANALYZE renders as PG's `Workers Launched:`. It can be lower than
 // WorkersPlanned once the cluster-wide cap is honoured (P6).
 func (o *gatherOp) WorkersLaunched() int { return o.launched }
+
+// prebuildHashJoins publishes shared hash tables on ctx for the duration of
+// this Gather. The leader's own child tree reads them from ctx directly, which
+// is why they are set on the session context rather than only on the worker
+// copies. Nesting is not a concern: a Gather never appears inside another
+// Gather's partial subtree (terminatesPartial refuses it).
+func (o *gatherOp) prebuildHashJoins(ctx *Context) error {
+	prebuilt, err := prebuildSharedHashJoins(ctx, o.plan.Child, o.buildChild)
+	if err != nil {
+		return err
+	}
+	if prebuilt == nil {
+		return nil
+	}
+	ctx.SharedHashBuilds = prebuilt
+	o.ownsSharedBuilds = true
+	return nil
+}
 
 func (o *gatherOp) Open(ctx *Context) error {
 	o.ctx = ctx
@@ -122,6 +144,14 @@ func (o *gatherOp) Open(ctx *Context) error {
 	o.ch = make(chan rowBatch, gatherChanDepth*(n+1))
 	// One allocator shared by every child tree, including the leader's.
 	o.pscan = newParallelScanState(0)
+
+	// P8: hash-join build sides run ONCE, here, before anything fans out.
+	// This must precede both NewWorkerContext (which copies the reference)
+	// and the goroutine launches (which is the publication edge that makes
+	// unlocked reads of the tables safe).
+	if err := o.prebuildHashJoins(ctx); err != nil {
+		return err
+	}
 
 	// Worker arenas are allocated HERE, by the leader, before any goroutine
 	// starts: mctx.Acquire appends to parent.children without synchronisation,
@@ -322,6 +352,12 @@ func (o *gatherOp) Close() error {
 		a.Release()
 	}
 	o.workers, o.arenas = nil, nil
+	if o.ownsSharedBuilds && o.ctx != nil {
+		// Retract the published tables so a later serial statement on this
+		// session does not adopt a stale build for the same plan node.
+		o.ctx.SharedHashBuilds = nil
+		o.ownsSharedBuilds = false
+	}
 
 	if o.drainErr != nil {
 		return o.drainErr

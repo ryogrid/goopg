@@ -280,8 +280,91 @@ func drivingSeqScan(n Node) *SeqScan {
 		return drivingSeqScan(x.Child)
 	case *Project:
 		return drivingSeqScan(x.Child)
+	case *Join:
+		// P8. A hash join is partial through its PROBE side only: the build
+		// side is drained once by the leader before fan-out, and the probe is
+		// what the workers split. Returning the probe's scan also makes the
+		// size rule measure the right relation — the probe is the big side by
+		// the planner's own build-side choice.
+		if !hashJoinIsPartialCapable(x) {
+			return nil
+		}
+		if joinProbeSideIsLeft(x) {
+			return drivingSeqScan(x.Left)
+		}
+		return drivingSeqScan(x.Right)
 	}
 	return nil
+}
+
+// ParallelChildrenForTest exposes the post-pass's child walk to tests in other
+// packages, which need to traverse a rebuilt plan to find the Gather.
+func ParallelChildrenForTest(n Node) []Node { return parallelChildren(n) }
+
+// HasShareableHashJoin reports whether a partial subtree contains a hash join
+// whose build side the leader must pre-build before fanning out (P8).
+//
+// The executor asks this BEFORE constructing anything. Building a throwaway
+// operator tree to find out would call the Gather's child-builder an extra
+// time, and a child-builder is not required to be side-effect-free.
+func HasShareableHashJoin(n Node) bool {
+	switch x := n.(type) {
+	case nil:
+		return false
+	case *Join:
+		if !hashJoinIsPartialCapable(x) {
+			return false
+		}
+		return true
+	}
+	for _, c := range parallelChildren(n) {
+		if HasShareableHashJoin(c) {
+			return true
+		}
+	}
+	return false
+}
+
+// joinProbeSideIsLeft mirrors the executor's probeSideIsLeft. The two must
+// agree: if they disagree the parallel scan lands on the BUILD side, every
+// worker hashes a partition of the build input, and the join silently drops
+// matches.
+func joinProbeSideIsLeft(p *Join) bool {
+	buildLeft := p.BuildLeft
+	if p.Type == JoinTypeSemi || p.Type == JoinTypeAnti {
+		buildLeft = false
+	}
+	return !buildLeft
+}
+
+// hashJoinIsPartialCapable states which hash joins may run with a partial
+// probe side.
+//
+// The rule is not "hash join" but "hash join whose per-probe-row verdict is
+// worker-local". Everything below turns on that:
+//
+//   - INNER, SEMI and ANTI decide each probe row against the frozen build
+//     table alone, so partitioning the probe is transparent.
+//   - LEFT qualifies only with the outer on the PROBE side (!BuildLeft), which
+//     is the only LEFT shape the lazy-hash runtime implements anyway: its
+//     null-padding is per-probe-row and needs no cross-worker state.
+//   - FULL and RIGHT would require knowing which BUILD rows went unmatched
+//     across ALL workers — a cross-worker reduction that does not exist here.
+//     Refused rather than approximated.
+//
+// LATERAL is excluded because its right side is re-planned per outer row and
+// never takes the hash path at all.
+func hashJoinIsPartialCapable(p *Join) bool {
+	if p == nil || p.Algo != JoinAlgoHash || p.Lateral {
+		return false
+	}
+	switch p.Type {
+	case JoinTypeInner, JoinTypeSemi, JoinTypeAnti:
+		return true
+	case JoinTypeLeft:
+		return !p.BuildLeft
+	}
+	return false
 }
 
 // computeParallelWorkers reproduces upstream's compute_parallel_worker()
@@ -458,6 +541,12 @@ func parallelChildren(n Node) []Node {
 	case *LockRows:
 		return []Node{x.Child}
 	case *Join:
+		// Both sides. This is what lets the SAFETY walk
+		// (subtreeHasUnsafeNode) see temp tables, virtual catalog relations
+		// and LockRows sitting under a join once P8 made joins
+		// partial-capable. Two children also make findPartialSubtree and
+		// rebuildWithGather refuse any join drivingSeqScan has not explicitly
+		// approved, since both bail on len(kids) != 1.
 		return []Node{x.Left, x.Right}
 	case *NestedLoopIndexJoin:
 		return []Node{x.Outer, x.Inner}

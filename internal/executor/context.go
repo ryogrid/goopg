@@ -244,6 +244,19 @@ type Context struct {
 	// plans in testing. Empty is equivalent to "off".
 	DebugParallelQuery string
 
+	// SharedHashBuilds carries hash-join build tables that a Gather built ONCE
+	// in the leader and published before fanning out (P8, chapter 07). A
+	// joinOp finding its own plan node here adopts the table instead of
+	// building one, and opens only its probe side.
+	//
+	// Read-only for the entire lifetime of the fan-out. Every worker holds the
+	// same map and the same tables, unlocked, which is safe for exactly one
+	// reason: nothing writes to them after publication. Any future code that
+	// inserted into lazyHash during probing would turn this into a data race.
+	//
+	// Nil outside a Gather, which is the serial case.
+	SharedHashBuilds map[*planner.Join]*sharedHashBuild
+
 	// AnalyzeRandSeed, when non-zero, makes ANALYZE's reservoir
 	// sampler reproducible. Tests set it; production leaves it
 	// zero so the sampler reseeds from the wall clock.

@@ -104,6 +104,12 @@ func NewWorkerContext(leader *Context, workerMctx *mctx.Context, workerCtx conte
 	w.ParallelLeaderParticipation = leader.ParallelLeaderParticipation
 	w.DebugParallelQuery = leader.DebugParallelQuery
 
+	// P8: shared hash tables, by reference. This is deliberately in the
+	// SHARED category rather than copied: the map and every table in it are
+	// frozen before this worker exists, so sharing costs nothing and copying
+	// would defeat the entire point of building once.
+	w.SharedHashBuilds = leader.SharedHashBuilds
+
 	// ── per-worker: cancellation and arena ───────────────────────────────
 	w.Ctx = workerCtx
 	w.Mctx = workerMctx

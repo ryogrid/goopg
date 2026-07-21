@@ -59,6 +59,9 @@ type gatherMergeOp struct {
 
 	closed        bool
 	selfCancelled bool
+
+	// ownsSharedBuilds — see gatherOp; P8 hash tables published on ctx.
+	ownsSharedBuilds bool
 }
 
 func newGatherMergeOp(p *planner.GatherMerge, buildChild func() (Operator, error)) *gatherMergeOp {
@@ -87,6 +90,17 @@ func (o *gatherMergeOp) Open(ctx *Context) error {
 
 	o.group = NewParallelGroup(ctx.Ctx)
 	o.pscan = newParallelScanState(0)
+
+	// P8: build shared hash tables once, before fan-out. Same ordering
+	// requirement as gatherOp — before worker contexts, before goroutines.
+	prebuilt, err := prebuildSharedHashJoins(ctx, o.plan.Child, o.buildChild)
+	if err != nil {
+		return err
+	}
+	if prebuilt != nil {
+		ctx.SharedHashBuilds = prebuilt
+		o.ownsSharedBuilds = true
+	}
 
 	// Unlike plain Gather, each worker gets its OWN channel: the merge needs
 	// to know which stream a row came from, because it must take the next row
@@ -363,6 +377,10 @@ func (o *gatherMergeOp) Close() error {
 		a.Release()
 	}
 	o.workers, o.arenas = nil, nil
+	if o.ownsSharedBuilds && o.ctx != nil {
+		o.ctx.SharedHashBuilds = nil
+		o.ownsSharedBuilds = false
+	}
 
 	if o.sortErr != nil {
 		return o.sortErr

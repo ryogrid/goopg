@@ -122,6 +122,16 @@ func attachParallelScan(op Operator, st *parallelScanState) bool {
 		return attachParallelScan(x.child, st)
 	case *instrumentedOp:
 		return attachParallelScan(x.inner, st)
+	case *joinOp:
+		// P8. Only the PROBE side is partial: the build side was drained once
+		// by the leader before fan-out. Attaching the allocator to the build
+		// side instead would give each worker a PARTITION of the build input,
+		// so every worker's hash table would be missing most of its rows and
+		// the join would silently drop matches.
+		if probeSideIsLeft(x.plan) {
+			return attachParallelScan(x.left, st)
+		}
+		return attachParallelScan(x.right, st)
 	case *sortOp:
 		// P7. A Sort inside the partial subtree is legal ONLY under Gather
 		// Merge: each worker sorts its own partition and the leader merges the

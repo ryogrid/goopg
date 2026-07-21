@@ -29,7 +29,8 @@ degrading the smoke gate from 700 to 390 TPS and aborting a transaction.
 | P4 | Parallel Seq Scan + Gather | shared block allocator, Gather operator; insertion still OFF | [x] (this commit) |
 | P5 | Partial / Finalize aggregation | combine rules + whitelist refusals | [x] `726999e4` |
 | P6 | Enable Gather insertion | post-pass, safety refusals, worker-count rule, identity gate | [x] `90ac9d98` |
-| P7 | Gather Merge | per-worker Sort + leader-side merge; ordering gate | [x] (this commit) |
+| P7 | Gather Merge | per-worker Sort + leader-side merge; ordering gate | [x] `a98b5a64` |
+| P8 | Parallel Hash Join | build once in the leader, share by pointer; partial probe side | [x] (this commit) |
 
 ## Design amendments to fold in during these stages
 
@@ -114,7 +115,7 @@ the cost ceilings.
 - gates: units PASS; race-gate PASS (`internal/config`); spotcheck PASS
   (Q12=2 / Q13=33); **plan-gate 22/22 MATCH** — zero diffs as predicted, no
   planner code touched
-- commit: _(this commit)_
+- commit: `a98b5a64`
 
 ## P1 — Session GUC plumbing  [x]
 
@@ -586,4 +587,102 @@ expected rather than a defect to chase.
 - gates: units PASS; race-gate PASS; spotcheck PASS (Q12=2 / Q13=33);
   plan-gate 22/22 MATCH against `plan_snapshots/pq-p6-gather.txt` — zero
   diffs, as analysed above
+- commit: _(this commit)_
+
+## P8 — Parallel Hash Join  [x]
+
+Build once in the leader, publish, share by pointer; every worker probes the
+same frozen table and opens only its own partial probe side.
+
+PG needs a DSA allocator, a barrier protocol with explicit phases
+(`PHJ_BUILD_*`) and shared-memory batch spilling to get here, and offers a
+second non-shared variant besides. goopg needs a struct and a map lookup,
+because a map is safe for unlimited concurrent reads with no writer and the
+goroutine-start edge publishes it. That is the largest structural
+simplification in the bundle, and it held up exactly as chapter 07 predicted.
+
+### What the implementation actually required
+
+- **A two-phase `Open`.** `openLazyHashJoin` drained the build child, closed
+  it, and opened the probe child in one indivisible step. Under parallelism the
+  halves must separate: the leader runs the build before fan-out, each worker
+  opens only its probe. Split into `buildLazyHashTable` + `openProbeSide`.
+- **The build-computed SCALARS, not just the map.** `antiBuildRows`,
+  `antiBuildHasNull`, `preserveBuildSide` and the width fields are per-INSTANCE
+  fields on `joinOp`, so sharing the table does not carry them.
+  `antiBuildHasNull` is the dangerous one: it decides `NOT IN`'s
+  three-valued-NULL result, and a worker defaulting it to `false` returns
+  hundreds of rows where SQL says the answer is empty.
+  `TestParallelHashJoinNotInNullSemantics` exists for that single flag.
+- **Eligibility is narrower than "hash join".** The rule is "hash join whose
+  per-probe-row verdict is worker-local": INNER, SEMI and ANTI qualify; LEFT
+  qualifies only with the outer on the probe side (`!BuildLeft`), which is the
+  only LEFT shape the lazy-hash runtime implements anyway; FULL and RIGHT are
+  refused, because they need to know which BUILD rows went unmatched across ALL
+  workers and no such cross-worker reduction exists.
+- **The probe-side rule is stated once and consulted three times** — build
+  loop, `attachParallelScan`, planner. They must agree: a disagreement puts the
+  parallel scan on the BUILD side, where every worker hashes a partition of the
+  build input and the join silently drops matches.
+
+### One correction found by the existing tests
+
+The first cut built a throwaway operator tree unconditionally and then looked
+for hash joins in it. That called the Gather's child-builder one extra time —
+harmless for the production builder (a pure `Build(p.Child)`) but not for the
+P4 Gather tests, whose builders arm a failure with `sync.Once` or partition
+rows by call index. Three of them failed immediately. The fix is better than
+the workaround would have been: decide from the PLAN
+(`planner.HasShareableHashJoin`) before constructing anything, so the common
+case costs nothing at all.
+
+### Measured effect: essentially none on TPC-H, and the reason is worth reading
+
+plan-gate: **1 of 22 queries changed** — Q13's LEFT hash join gained a Gather.
+Diff reviewed as Gather-insertion-only (identical join tree, plus the node and
+`Workers Planned`), recaptured as `plan_snapshots/pq-p8-hashjoin.txt`, 22/22
+MATCH against it.
+
+Q13 timing, warm and alternating:
+
+| | serial | 4 workers + leader |
+|---|---:|---:|
+| run 1 | 105.3 s | 102.4 s |
+| run 2 | 101.2 s | 100.3 s |
+
+**~1.5 %, which is noise.** The cause is structural, not a defect in the
+implementation:
+
+- `customer` (the probe side) has **150,000** rows; `orders` (the build side)
+  has **1,500,000**. Q13 is a LEFT join with `customer` as the outer, so the
+  runtime requires outer = probe, so the build side is necessarily the 10×
+  larger table. P8 parallelises the small side and leaves 90 % of the input to
+  the serial leader.
+- The other 21 queries are unaffected because TPC-H's multi-table joins collapse
+  into goopg's `MultiHashJoin`, which chapter 07 §6 puts out of v1 scope
+  (no PG counterpart, hence no oracle plan).
+
+So P8 is correct, exercised, and currently worth almost nothing on this
+workload. That is the honest result and it should not be dressed up.
+
+### What it tells us to do next
+
+This is precisely the reopen condition recorded for **cooperative parallel
+hash build** in [10](10-roadmap.md) — "a measured plan where build time
+dominates". Q13 is now that measured plan. Two candidate follow-ups, in
+increasing order of cost:
+
+1. **Parallelise the build's scan+filter, keep insertion serial.** Q13's build
+   side carries `o_comment NOT LIKE '%special%requests%'` over 1.5 M rows; a
+   producer/consumer split would parallelise the predicate while one goroutine
+   owns the map. Much cheaper than PG's design and probably most of the win.
+2. **A genuinely concurrent build** (sharded or per-worker-partial-then-merge),
+   which is what PG's barrier machinery buys.
+
+Neither is P8. Both are now motivated by a measurement rather than by
+speculation, which they were not before.
+
+- gates: units PASS; race-gate PASS (including a probe-heavy `-count=2` run
+  over the parallel suite); spotcheck PASS (Q12=2 / **Q13=33**, the query whose
+  plan changed); plan-gate 1 reviewed diff, recaptured, then 22/22 MATCH
 - commit: _(this commit)_
