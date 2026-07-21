@@ -114,12 +114,56 @@ func lowerSubPlanParams(root Node) Node {
 		return root
 	}
 	a := &paramAlloc{}
-	walkPlanExprs(root, func(e Expr) {
+	walkPlanExprsIncludingDML(root, func(e Expr) {
 		if h := handleFor(e); h != nil {
 			lowerSublinkTree(h, a)
 		}
 	})
 	return root
+}
+
+// walkPlanExprsIncludingDML is host discovery's DML-aware walker: it
+// descends into a DML node's child plan (where the WHERE clause lives)
+// and then delegates to walkPlanExprs, which handles every other node
+// kind.
+//
+// R3-5: the DML cases live HERE rather than inside walkPlanExprs because
+// that walker is shared by ten call sites, and two of them are not
+// detectors that could absorb extra descent harmlessly:
+// remapOuterRefsInSubplan (bushy.go) MUTATES OuterColumnRef.Index, and
+// collectUnnestParams (unnest.go) HARVESTS equijoin pairs. DML nodes are
+// already reachable from the shared walker through *CTEDMLPrefix, so
+// teaching it the DML cases in place would newly expose CTE-DML bodies to
+// both. planContainsLateralJoin additionally documents a paired-coverage
+// contract with the lowering traversal ("under-detection is impossible …
+// because that traversal bails on every node kind walkPlanExprs does not
+// also cover"); widening the shared walker would perturb both sides of an
+// argument that currently holds by construction.
+//
+// That contract still holds for this wrapper: it only makes host
+// discovery see MORE, and the inner traversal (lowerTraverseNode) is
+// never handed a DML node — a sublink's inner plan cannot be DML, since
+// DML-in-CTE is the separate *CTEDMLPrefix shape.
+//
+// Scope: the child-plan predicate only. UPDATE … FROM / DELETE … USING
+// loose predicates (FromPred/UsingPred) and their scan lists, MERGE
+// clauses, and ON CONFLICT expressions deliberately stay on the legacy
+// OuterRows-stack path — lowered Args there would need combined-schema
+// SourceTableIdx values, which is a larger correctness argument with no
+// measured workload behind it. Unlowered is slower, never wrong.
+func walkPlanExprsIncludingDML(n Node, fn func(Expr)) {
+	switch x := n.(type) {
+	case *Update:
+		walkPlanExprsIncludingDML(x.Child, fn)
+		return
+	case *Delete:
+		walkPlanExprsIncludingDML(x.Child, fn)
+		return
+	case *Insert:
+		walkPlanExprsIncludingDML(x.Source, fn)
+		return
+	}
+	walkPlanExprs(n, fn)
 }
 
 // refKey identifies one distinct outer-value demand for slot dedup

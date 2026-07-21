@@ -991,7 +991,7 @@ was `distinctOp.Open` (the `Unique` node), not the NL join.
 | R3-3 | item 2: big-numeric hash-key fix (+ string hazard REFUTED) | found a live wrong-results bug in hash JOINS, not just the probe | [x] `d9cab218` |
 | R3-2 | item 1: zero-rows falsification + regression pins | World A confirmed on SF1 (1 375 096 = 1 375 096) | [x] (this commit) |
 | R3-4 | item 5: composite EXISTS/NOT EXISTS + M23–M26 | also wrote the missing Project-strip guard | [x] (this commit) |
-| R3-5 | item 3: DML-sublink lowering | dedicated wrapper, NOT a walkPlanExprs extension | [ ] |
+| R3-5 | item 3: DML-sublink lowering | dedicated wrapper, NOT a walkPlanExprs extension | [x] (this commit) |
 | R3-6 | FINAL: gates + tripwire spotcheck + report + ledger resolutions | | [ ] |
 
 ## R3-1 — NLI LEFT residual semantics  [x] `70792111`
@@ -1070,3 +1070,23 @@ was `distinctOp.Open` (the `Unique` node), not the NL join.
 - [x] gates: units PASS; race-gate PASS; spotcheck Q12=2/Q13=33; Q4 semi-join
       value 5 rows; plan-gate 22/22 MATCH (no TPC-H query has a
       composite-correlated EXISTS, so zero plan movement was the prediction)
+
+## R3-5 — DML-sublink lowering  [x]
+
+- [x] root cause: `lowerSubPlanParams` always ran for DML roots, but
+      `walkPlanExprs` had no DML case, so the root fell through its type switch
+      without descending into `Child` (where `planUpdate` hangs the WHERE)
+- [x] fixed with `walkPlanExprsIncludingDML`, a host-discovery-local wrapper —
+      the shared walker is NOT extended (two of its ten callers mutate/harvest
+      rather than detect, and DML is already reachable there via `CTEDMLPrefix`)
+- [x] zero executor plumbing needed: `bindSubPlanParams` binds Args against
+      whatever row the eval site was handed, which for DML is the target row
+- [x] deliberate scope limit, guarded by test: `FromPred`/`UsingPred`, MERGE
+      clauses and ON CONFLICT stay on the legacy stack path (lowered Args there
+      need combined-schema `SourceTableIdx`)
+- [x] coverage: planner shape + a pin that `walkPlanExprs` still does not
+      descend into `Update.Child`; executor row-effects for EXISTS / NOT EXISTS /
+      correlated IN / scalar / DELETE, plus two self-referencing Halloween cases
+      (the second reads the column being written, so snapshot semantics actually
+      discriminate) — every case re-run with the rescan and hashed switches off
+- [x] gates: units PASS; race-gate PASS; spotcheck Q12=2/Q13=33; plan-gate 22/22
