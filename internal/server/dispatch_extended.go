@@ -154,6 +154,11 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 	ectx.Checkpointer = s.cfg.Checkpointer
 	ectx.StatsTarget = sessionStatsTarget(sess)
 	ectx.WorkMem = sessionWorkMem(sess)
+	ectx.MaxParallelWorkersPerGather = sessionMaxParallelWorkersPerGather(sess)
+	ectx.MaxParallelWorkers = sessionMaxParallelWorkers(sess)
+	ectx.MinParallelTableScanBlocks = sessionMinParallelTableScanSize(sess)
+	ectx.ParallelLeaderParticipation = sessionParallelLeaderParticipation(sess)
+	ectx.DebugParallelQuery = sessionDebugParallelQuery(sess)
 	if sess != nil {
 		ectx.AdvisorySessionIdentity = sess
 		ectx.GetSetting = func(name string) (string, bool) {

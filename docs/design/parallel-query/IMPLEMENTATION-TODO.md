@@ -23,7 +23,7 @@ degrading the smoke gate from 700 to 390 TPS and aborting a transaction.
 | # | Stage | Scope | Status |
 |---|---|---|---|
 | P0 | GUC fidelity fixes | `UnitBlocks`, `min_parallel_*` units, `max_parallel_workers`, enum bool synonyms, cost ceilings | [x] (this commit) |
-| P1 | Session GUC plumbing | `session*` readers + typed context fields, both protocol paths | [ ] |
+| P1 | Session GUC plumbing | `session*` readers + typed context fields, both protocol paths | [x] (this commit) |
 | P2 | `HashAggregate` label correction | rename before `Partial `/`Finalize ` prefixes cement the misnomer | [ ] |
 | P3 | Concurrency substrate | worker contexts, per-worker arenas, `Perm()` mutex, error/panic/cancel, per-worker instrumenters | [ ] |
 | P4 | Parallel Seq Scan + Gather | shared block allocator, Gather operator; insertion still OFF | [ ] |
@@ -112,4 +112,52 @@ the cost ceilings.
 - gates: units PASS; race-gate PASS (`internal/config`); spotcheck PASS
   (Q12=2 / Q13=33); **plan-gate 22/22 MATCH** — zero diffs as predicted, no
   planner code touched
+- commit: _(this commit)_
+
+## P1 — Session GUC plumbing  [x]
+
+- [x] Five readers in `internal/server/dispatch.go`, following the
+      `sessionStatsTarget` shape: `sessionMaxParallelWorkersPerGather`,
+      `sessionMaxParallelWorkers`, `sessionMinParallelTableScanSize`,
+      `sessionParallelLeaderParticipation`, `sessionDebugParallelQuery`.
+- [x] **Fallback direction chosen per reader, not copied.** Worker counts fall
+      back to **0 (serial)** because zero is a legitimate user setting and the
+      safe direction. `min_parallel_table_scan_size` falls back to PG's
+      **1024 blocks**, NOT to zero — zero would mean "every relation qualifies
+      for a parallel path", the unsafe direction. Leader participation falls
+      back to **on**, PG's default. This matters because six other
+      `NewContext()` sites (COPY, DDL, role DDL) populate nothing.
+- [x] All reads go through `sess.Get`, never `GetDisplay`: `Get` returns the
+      canonical bare integer (`"1024"`), `GetDisplay` the human form
+      (`"8MB"`). Internal arithmetic must use the former
+      (`internal/config/session.go:85-90`).
+- [x] Five typed fields on `executor.Context` documented in the `StatsTarget`
+      convention (name the GUC, name the consumer, state what the zero value
+      means, note the wire path populates it).
+- [x] Assigned on **both** protocol paths — `dispatch.go` and
+      `dispatch_extended.go`. The existing precedent is applied
+      inconsistently (`FreezeMinAge` / `EnableOpportunisticPrune` are
+      simple-path only), so it was not copied mechanically.
+- [x] PL/pgSQL child-context propagation **verified rather than assumed**:
+      `plpgsql_runtime.go:386-388` derives a child with `*child = *ctx`, a
+      whole-struct copy, so new fields propagate for free. Pinned by a test,
+      because that is a property of the copy style and a future switch to
+      field-by-field derivation would silently zero them.
+- [x] Planning-time reads deliberately NOT routed through the context — the
+      extended path plans at `dispatch_extended.go:92`/`:103`, before `ectx`
+      exists at `:141`. The Gather post-pass (P6) reads from `sess` at the
+      planning call sites; these context fields serve execution-time needs
+      (fan-out size, leader participation). The two needs are distinct.
+
+Coverage: `internal/server/parallel_session_gucs_test.go` — per-reader tables
+including the nil-registry case and the fallback *direction* each protects;
+`TestSessionDebugParallelQuery` also exercises P0's hidden synonyms end to end
+(`SET debug_parallel_query = true` observed as canonical `"on"`);
+`TestParallelGUCsReachExecutorContext` closes the seam nothing covered before —
+the `ectx.X = sessionX(sess)` assignment lines themselves, which is exactly how
+the pre-existing simple-path-only inconsistency survived.
+
+- gates: units PASS; race-gate PASS (`internal/executor`, `internal/config`);
+  spotcheck PASS (Q12=2 / Q13=33); **plan-gate 22/22 MATCH** — zero diffs as
+  predicted, nothing reads the values yet
 - commit: _(this commit)_

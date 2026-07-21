@@ -375,6 +375,11 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 	ectx.Checkpointer = s.cfg.Checkpointer
 	ectx.StatsTarget = sessionStatsTarget(sess)
 	ectx.WorkMem = sessionWorkMem(sess)
+	ectx.MaxParallelWorkersPerGather = sessionMaxParallelWorkersPerGather(sess)
+	ectx.MaxParallelWorkers = sessionMaxParallelWorkers(sess)
+	ectx.MinParallelTableScanBlocks = sessionMinParallelTableScanSize(sess)
+	ectx.ParallelLeaderParticipation = sessionParallelLeaderParticipation(sess)
+	ectx.DebugParallelQuery = sessionDebugParallelQuery(sess)
 	if sess != nil {
 		ectx.AdvisorySessionIdentity = sess
 		ectx.GetSetting = func(name string) (string, bool) {
@@ -1167,6 +1172,113 @@ func sessionOpportunisticPrune(sess *config.SessionRegistry) bool {
 		return true // GUC not registered yet, default on
 	}
 	return strings.EqualFold(strings.TrimSpace(eff), "on")
+}
+
+// ── parallel-query session GUCs (docs/design/parallel-query, P1) ──────────
+//
+// These follow the sessionStatsTarget shape exactly: three layers of
+// defensive fallback (nil registry / unregistered GUC / unparseable value),
+// each landing on a value that is CORRECT rather than a sentinel. That matters
+// here more than usual — six other executor.NewContext() sites (copy.go,
+// database_ddl.go, role_ddl.go) set no session GUCs at all, so a zero value
+// must mean something sane on its own.
+//
+// All of them read via sess.Get, never GetDisplay: Get returns the canonical
+// bare integer ("1024"), GetDisplay returns the human form ("8MB"). Internal
+// arithmetic must use the former (internal/config/session.go:85-90).
+
+// sessionMaxParallelWorkersPerGather reads `max_parallel_workers_per_gather`.
+// Zero means "no parallelism" and is a legitimate user setting, not an
+// absence — so an unreadable GUC falls back to 0 (serial), the safe direction.
+func sessionMaxParallelWorkersPerGather(sess *config.SessionRegistry) int {
+	if sess == nil {
+		return 0
+	}
+	_, eff, ok := sess.Get("max_parallel_workers_per_gather")
+	if !ok {
+		return 0
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(eff))
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
+}
+
+// sessionMaxParallelWorkers reads the cluster-wide `max_parallel_workers`
+// cap. Same fallback reasoning as above: 0 disables parallelism entirely,
+// which is the direction that cannot cause harm.
+func sessionMaxParallelWorkers(sess *config.SessionRegistry) int {
+	if sess == nil {
+		return 0
+	}
+	_, eff, ok := sess.Get("max_parallel_workers")
+	if !ok {
+		return 0
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(eff))
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
+}
+
+// sessionMinParallelTableScanSize reads `min_parallel_table_scan_size` in
+// BLOCKS — the GUC's native unit as of P0. A relation smaller than this never
+// gets a parallel path (upstream compute_parallel_worker,
+// postgres/src/backend/optimizer/path/allpaths.c:4273).
+//
+// Zero here would mean "every relation qualifies", which is the unsafe
+// direction, so an unreadable GUC falls back to PG's default of 1024 blocks
+// (8MB) rather than to zero.
+func sessionMinParallelTableScanSize(sess *config.SessionRegistry) int64 {
+	const pgDefaultBlocks = 1024 // (8 * 1024 * 1024) / BLCKSZ
+	if sess == nil {
+		return pgDefaultBlocks
+	}
+	_, eff, ok := sess.Get("min_parallel_table_scan_size")
+	if !ok {
+		return pgDefaultBlocks
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(eff), 10, 64)
+	if err != nil || n < 0 {
+		return pgDefaultBlocks
+	}
+	return n
+}
+
+// sessionParallelLeaderParticipation reads `parallel_leader_participation`.
+// Upstream's default is on; an unreadable GUC keeps that.
+func sessionParallelLeaderParticipation(sess *config.SessionRegistry) bool {
+	if sess == nil {
+		return true
+	}
+	_, eff, ok := sess.Get("parallel_leader_participation")
+	if !ok {
+		return true
+	}
+	return strings.EqualFold(strings.TrimSpace(eff), "on")
+}
+
+// sessionDebugParallelQuery reads `debug_parallel_query`, upstream's lever for
+// forcing parallel plans in testing. Returns the canonical enum value
+// ("off" / "on" / "regress"); the P0 synonym work means a user may have
+// written `true`, and canonicalisation has already mapped it to "on".
+func sessionDebugParallelQuery(sess *config.SessionRegistry) string {
+	if sess == nil {
+		return "off"
+	}
+	_, eff, ok := sess.Get("debug_parallel_query")
+	if !ok {
+		return "off"
+	}
+	v := strings.ToLower(strings.TrimSpace(eff))
+	switch v {
+	case "on", "regress":
+		return v
+	default:
+		return "off"
+	}
 }
 
 func sessionWorkMem(sess *config.SessionRegistry) int64 {
