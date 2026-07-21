@@ -312,12 +312,23 @@ func tryBuildNLI(j *Join, cat catalog.Catalog) (*NestedLoopIndexJoin, bool) {
 	// its inner arrives as Filter{residual}(SeqScan), which previously
 	// fell through pickInnerSide to the hash path.
 	//
-	// LEFT is deliberately excluded: its no-match fallback currently
-	// evaluates the residual against the null-padded row (see
-	// operators_nljoin.go), which would drop preserved outer rows —
-	// and the canonical Q13 LEFT-join shape (`orders` behind a
-	// NOT-LIKE Filter) is this repo's most expensive historical
-	// silent-regression tripwire. The hash path keeps serving it.
+	// LEFT is deliberately excluded — but as of R3-1 for COST, not
+	// correctness. The original reason was that the operator's no-match
+	// fallback evaluated the residual against the null-padded row and
+	// so dropped preserved outer rows; that defect is fixed (see
+	// operators_nljoin.go's outerMatched discipline, pinned by
+	// internal/executor/nli_left_residual_exec_test.go), and note it was
+	// never a real guard anyway: a cross-relation ON residual already
+	// reaches a LEFT NLI through the leftover-retention path below
+	// (pinned by nli_left_residual_leak_test.go).
+	//
+	// What still argues against unwrapping LEFT here is the Q9-class
+	// blowup this gate exists to prevent, in its most expensive known
+	// form: the canonical Q13 shape (`orders` behind a NOT-LIKE Filter)
+	// would turn a hash build into per-probe NOT-LIKE evaluations over
+	// the full inner. Admitting LEFT would therefore need the same
+	// `innerUnwrapCostAccepts` treatment INNER got in D6.3b, not merely
+	// the correctness fix. The hash path keeps serving it.
 	// Semi/Anti unwrap unconditionally; INNER behind a cost check
 	// (D6.3b). The first cut included INNER unconditionally and
 	// regressed TPC-H Q9 (115 s → DNF at 300 s): its `part` scan with a
