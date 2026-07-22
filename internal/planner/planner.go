@@ -985,7 +985,15 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 	// MultiHashJoin node.  Column indices are remapped inside
 	// collectMultiHashTables using scanForCol, so parent
 	// expressions (incl. unnest keys) stay aligned.
-	node = rewriteMultiWayChain(node, cat)
+	//
+	// Cost-model ch. 12 §3: the cost-driven planner drops MultiHashJoin
+	// (PG has none) so the DP's PG-shaped binary tree is final and the
+	// order-then-rewrite mismatch that regressed Q9 cannot recur. When
+	// mhjPackingEnabled is off, this packing pass is skipped. MHJ stays
+	// a valid executor operator; only the cost path forgoes it.
+	if mhjPackingEnabled {
+		node = rewriteMultiWayChain(node, cat)
+	}
 	// M0054-0006a-pre: after MultiHashJoin construction, walk the
 	// plan tree and route single-table constant-RHS equality
 	// predicates from `*Filter` wrappers and `mh.Filters` into the

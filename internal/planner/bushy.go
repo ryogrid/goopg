@@ -3,10 +3,22 @@ package planner
 import (
 	"fmt"
 	"math/bits"
+	"os"
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
 )
+
+// GOOPG_COST_DRIVEN_JOINORDER=1 enables the C4 cost-driven join-order
+// planner (real PG-unit path cost) with MultiHashJoin packing dropped
+// (ch. 12). Off by default so production planning is unchanged; used to
+// measure the pivot on the bench server before promoting the default.
+func init() {
+	if os.Getenv("GOOPG_COST_DRIVEN_JOINORDER") == "1" {
+		costDrivenJoinOrder = true
+		mhjPackingEnabled = false
+	}
+}
 
 // scanKey uniquely identifies a scan by its catalog table pointer and
 // FROM‑clause alias.  For self‑joins (e.g. `nation n1, nation n2`)
@@ -515,6 +527,47 @@ type dpEntry struct {
 	// old prefix-sum, so behaviour is unchanged for every plan the
 	// integer DP produces today.
 	layout map[int]int
+
+	// pgCost is the subtree's cost in real PG units (cost.h), built
+	// bottom-up: base = costSeqscan; join = hashJoinCost over the two
+	// children's pgCosts (or nestloopCost when the join will convert
+	// to an NL-index, C4-pg-ii). When costDrivenJoinOrder is on the DP
+	// selects the join order by pgCost.Total instead of the integer
+	// `cost` heuristic (cost-model ch. 12 §2). Always computed so the
+	// switch is a comparison-key change, not a structural one.
+	pgCost Cost
+}
+
+// costDrivenJoinOrder switches enumerateBushyPlans from the integer
+// `output + build*4 + probe` argmin (bushy.go:764) to real PG-unit
+// path cost (dpEntry.pgCost) for join-order selection — the C4 pivot
+// (cost-model ch. 12 §2). Default OFF: the integer DP is unchanged and
+// plan-preserving until a measurement gate promotes the switch.
+var costDrivenJoinOrder = false
+
+// SetCostDrivenJoinOrder toggles cost-driven join-order selection.
+// Returns the previous value so a caller/test can restore it.
+func SetCostDrivenJoinOrder(v bool) bool {
+	prev := costDrivenJoinOrder
+	costDrivenJoinOrder = v
+	return prev
+}
+
+// mhjPackingEnabled controls whether planSelect packs binary hash-join
+// chains into a MultiHashJoin (rewriteMultiWayChain). PG has no MHJ;
+// the cost-driven planner drops it (ch. 12 §3) so the DP's PG-shaped
+// binary tree is final and the order-then-rewrite mismatch that
+// regressed Q9 cannot recur. Default ON to preserve the current
+// (non-cost-driven) planner; SetCostDrivenJoinOrder(true) should be
+// paired with SetMHJPackingEnabled(false).
+var mhjPackingEnabled = true
+
+// SetMHJPackingEnabled toggles MultiHashJoin packing. Returns the
+// previous value.
+func SetMHJPackingEnabled(v bool) bool {
+	prev := mhjPackingEnabled
+	mhjPackingEnabled = v
+	return prev
 }
 
 func enumerateBushyPlans(g *joinGraph, conjuncts []Expr, relInfos []baseRelInfo, cat catalog.Catalog) (Node, []Expr, error) {
@@ -552,10 +605,13 @@ func enumerateBushyPlans(g *joinGraph, conjuncts []Expr, relInfos []baseRelInfo,
 
 	edgeUsed := make([]bool, len(g.edges))
 	dp := make(map[uint16]dpEntry)
+	cp := defaultCostParams()
 
 	for i := 0; i < g.nodes; i++ {
 		mask := uint16(1 << i)
-		dp[mask] = dpEntry{plan: g.scans[i], rows: rowCounts[i], cost: rowCounts[i], layout: map[int]int{i: 0}}
+		width := nodeTupleWidth(g.scans[i])
+		baseCost := costSeqscan(cp, estScanPages(float64(rowCounts[i]), width), float64(rowCounts[i]), 0)
+		dp[mask] = dpEntry{plan: g.scans[i], rows: rowCounts[i], cost: rowCounts[i], layout: map[int]int{i: 0}, pgCost: baseCost}
 	}
 
 	for size := 2; size <= g.nodes; size++ {
@@ -593,10 +649,26 @@ func enumerateBushyPlans(g *joinGraph, conjuncts []Expr, relInfos []baseRelInfo,
 				// cardinality estimate rather than its cost
 				// (the two diverge once the build term enters).
 				outRows, cost := estimateJoinCost(entryA.rows, entryB.rows, edge, g, cat)
-				if best == nil || cost < best.cost {
+				// Real PG-unit cost of this join (ch. 12 §2). Built over
+				// the two children's pgCosts; one hash clause for the
+				// canonical equi-join edge. Cardinality (outRows) is
+				// unchanged — only the SELECTION key differs by mode.
+				pgCost := hashJoinCost(cp, entryA.pgCost, entryB.pgCost,
+					float64(entryA.rows), float64(entryB.rows), float64(outRows), 1)
+				// Selection key: real PG cost when cost-driven, else the
+				// integer heuristic (default, plan-preserving).
+				better := best == nil
+				if !better {
+					if costDrivenJoinOrder {
+						better = pgCost.Total < best.pgCost.Total
+					} else {
+						better = cost < best.cost
+					}
+				}
+				if better {
 					join := buildJoinFromDP(entryA.plan, entryB.plan, entryA.rows, entryB.rows, a, b, entryA.layout, entryB.layout, edge, g)
 					mergedLayout := mergeSubsetLayouts(entryA.layout, entryB.layout, len(entryA.plan.Output()))
-					best = &dpEntry{plan: join, rows: outRows, cost: cost, layout: mergedLayout}
+					best = &dpEntry{plan: join, rows: outRows, cost: cost, layout: mergedLayout, pgCost: pgCost}
 					bestEdgeIdx = edgeIdx
 				}
 			})
