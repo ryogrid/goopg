@@ -67,12 +67,25 @@ memory — [05](05-statistics-and-estimation-inputs.md) §4), `--per-query-timeo
 generous, bench server and pgbench smoke run **sequentially, never concurrently**.
 Report the worker count with every number.
 
-## 3. Tier 3 — plan-gate as a divergence registry, not an equality gate
+## 3. Tier 3 — two plan gates: self-snapshot regression, then vs-PG divergence
 
-`make plan-gate` ([memory: needs `PATH` + `PLAN_DB=postgres PLAN_USER=postgres`])
-diffs goopg's plans against PG's `EXPLAIN`. Under a cost model this **cannot** be an
-equality gate: goopg legitimately chooses plans PG cannot express. The gate is
-reframed as a **classifier**:
+There are **two distinct gates**, and an earlier draft of this chapter conflated
+them. Both are used, at different phase boundaries:
+
+- **`make plan-gate` is a goopg-vs-*self-snapshot* regression gate**, not a vs-PG
+  diff. `cmd/plan-snapshot` captures goopg's own `EXPLAIN` for every TPC-H query
+  against the running goopg bench server (`127.0.0.1:65433`) and diffs the current
+  capture against the newest saved baseline `plan_snapshots/*.txt` (it SKIPs, exit
+  0, if no baseline or no server). This is the gate the **plan-preserving** phases
+  (C0–C3, [11](11-roadmap.md)) use: capture a baseline before C0, then require
+  **zero diffs** — byte-identical `EXPLAIN`, mock `cost=0.00..0.00` included, since
+  the `structural` mode's `(rows=N)` regex does not match the current PG-style
+  annotation. Plan-*changing* phases (C4, C6) re-baseline and review the diff.
+- **The vs-PostgreSQL comparison is `scripts/pg-oracle-diff.sh` /
+  `scripts/pg-regress-runner.sh`**, which diff goopg's plan/output against a real
+  PostgreSQL. This is the gate that classifies plan *divergence* at C4. Under a
+  cost model it **cannot** be an equality gate: goopg legitimately chooses plans PG
+  cannot express. It is used as a **classifier**:
 
 - Every place goopg's chosen plan differs from PG's is recorded and classified
   against a **Divergence-from-PostgreSQL allow-list**, assembled from the per-
@@ -90,9 +103,11 @@ reframed as a **classifier**:
   if goopg picks a plan PG would never pick and it is not a known structural
   divergence, the cost function is wrong.
 
-Crucially, plan-gate compares plan **shape**, not cost **numbers**: goopg's
+Crucially, the vs-PG comparison is on plan **shape**, not cost **numbers**: goopg's
 `cost=` need not equal PG's (§3.1). The surfaced costs are for human debuggability
-and internal consistency ([03](03-path-substrate-and-plan-creation.md) §5).
+and internal consistency ([03](03-path-substrate-and-plan-creation.md) §5). And the
+self-snapshot `make plan-gate` never looks at PG at all — it only guards goopg
+against *unintended* plan drift between commits.
 
 ### 3.1 PG is the oracle for functions, never for plans
 
@@ -125,9 +140,10 @@ and the Round-4 doc's own discipline:
 
 Every implementation phase ([11](11-roadmap.md)) also carries the standing gates,
 listed once: unit tests, `make race-gate`, `scripts/tpch-spotcheck.sh` (Q12 = 2 /
-Q13 = 33), `make plan-gate` (as the §3 classifier), and the pre-commit pgbench
-smoke ([memory: never `--no-verify`; bench server stopped before commit]). Only the
-*additional* gate per phase is called out in the roadmap.
+Q13 = 33), `make plan-gate` (the §3 self-snapshot regression gate; and
+`scripts/pg-oracle-diff.sh` for the vs-PG classification at C4), and the pre-commit
+pgbench smoke ([memory: never `--no-verify`; bench server stopped before commit]).
+Only the *additional* gate per phase is called out in the roadmap.
 
 ## 6. Unit-level cost checks
 
