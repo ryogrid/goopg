@@ -169,6 +169,21 @@ no desync). Staged:
 
 _(newest first; each entry: date — sub-step — gate result — commit)_
 
+- 2026-07-23 — **C4 Q9=0 Phase-1 correctness fix LANDED (`33d9c8b3`) — skip NLI under
+  cost-driven order.** Root cause corrected (design doc 13 §2.1): NOT the composite probe —
+  an NLI subtree emits a runtime tuple diverging from its OID-sorted Output() schema inside a
+  derived-table scope, so ANY downstream join (hash OR NLI) binding to that schema reads wrong
+  columns. Measured (`GOOPG_PROBE_DEBUG`): the l_suppkey key slot reads l_linenumber (1,2,3…).
+  Two narrower fixes FAILED: composite-only decline (partsupp hash still drops, outer holds
+  other NLIs); IsolatedScope decline (Q9's plain derived table is NOT flagged IsolatedScope —
+  only unnest/rename set it). Landed net: `rewriteJoinsToNLI` no-ops under costDrivenJoinOrder
+  → all-hash. **Q9@300k=175 ✓, 6-table repro=16216 ✓, tpch-spotcheck PASS** (provable no-op for
+  production; gated default OFF). Trade-off: cost-driven loses NL-index perf (Q9@6M may time
+  out) until Phase 2. Design doc 13 written; wrote diagnostic instrumentation (GOOPG_NLI_DEBUG,
+  GOOPG_PROBE_DEBUG) then reverted. **NEXT = Phase 2** (doc 13 §4.2): make an NLI's runtime
+  output match its Output() schema so NLI can be re-enabled under cost-driven with perf. Also
+  landed en route: arena-retention (`65965d47`) + int64 overflow (`9106121e`) — real, not the
+  cause. FAST REPRO for Phase 2: cost-driven NLI-on, the doc-13 §1 minimal derived-table query.
 - 2026-07-23 — **Q9=0 = the KNOWN-DEFERRED composite-NLI schema-vs-runtime-layout bug
   (M0067-0003 → M0068), independently rediscovered + precisely characterized + minimal
   repro.** `nl_index_join.go:142-150` already documents it: the composite `partsupp_pk`

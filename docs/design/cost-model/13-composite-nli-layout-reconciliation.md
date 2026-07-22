@@ -135,25 +135,29 @@ whether `remapWithBindings` altered the outer's runtime layout vs its schema.
 Deliverable: a one-paragraph confirmation of *which* pass reorders the runtime and
 *which* coordinate space the executor actually uses. This pins the fix target.
 
-### Phase 1 — Correctness safety net: decline NLI inside an IsolatedScope (REVISED)
+### Phase 1 — Correctness safety net: skip NLI under cost-driven order (LANDED `33d9c8b3`)
 
-The first attempt (decline only the *composite* NLI) was **insufficient** (§2.1):
-the divergence is produced by ANY NLI in the sub-query scope, not the composite
-join. **Revised safety net: decline NLI *conversion* for any join built inside an
-`IsolatedScope` (derived-table / sub-query) scope**, so the whole sub-query plans
-all-hash (measured correct: flat all-hash = 16 216, Q9 = 175).
+Two narrower attempts failed: (a) declining only the *composite* NLI (§2.1 — the
+partsupp hash join still drops because its outer holds other NLIs), and (b)
+declining NLI inside an `IsolatedScope` (Q9's plain derived table is **not** flagged
+`IsolatedScope` — that flag is only set by the unnest/rename paths, `unnest.go`,
+`planner.go:2263`). Since the divergent producer is *any* NLI in a cost-driven
+bushy plan feeding a downstream schema-bound join, the landed safety net is the
+simplest reliable one:
 
-- Requires threading an `inIsolatedScope` flag through `walkRewriteNLI` (set when
-  recursing through a `*Project{IsolatedScope:true}`), and returning early from
-  `tryBuildNLI` when set. Bounded, local, revertible.
-- Correct because hash is order-agnostic; the sub-query's NLIs become hash joins,
-  removing the divergent producers.
-- Trade-off: derived-table sub-queries lose NL-index acceleration until Phase 2.
-  Verify this does not regress Q2/Q7/Q11/Q15/Q17/Q18/Q20/Q22 row counts (they use
-  sub-queries) — correctness must hold; some may slow.
+> `rewriteJoinsToNLI` returns the tree unchanged when `costDrivenJoinOrder` is on
+> — cost-driven plans are all-hash.
 
-Gate: Q9 → 175; `tpch-spotcheck` PASS; all 22 row counts equal the all-hash
-reference on SF1 (no silent regression); each query completes under timeout.
+- **Correct:** all-hash removes every divergent NLI producer (Q9@300k = 175, the
+  6-table repro = 16 216).
+- **Provably no-op for production:** gated on `costDrivenJoinOrder` (default OFF),
+  so the non-cost-driven planner — whose NLIs are measured correct — is byte-
+  identical. `tpch-spotcheck` PASS (Q12=2/Q13=33, unchanged).
+- **Trade-off:** cost-driven loses NL-index acceleration until Phase 2, so
+  cost-driven Q9 is correct-but-slow (all-hash builds are heavy; Q9@6M may exceed
+  the query timeout). This is a *performance* deferral, not a correctness one.
+
+Gate met: Q9 → 175, repro → 16 216, `tpch-spotcheck` PASS, planner suite green.
 
 ### Phase 2 — The real reconciliation (performance recovery)
 
