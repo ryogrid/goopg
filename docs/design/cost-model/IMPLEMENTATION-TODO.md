@@ -16,10 +16,14 @@ Branch: `introduce-costmodel`. Design of record: `docs/design/cost-model/`.
 - [x] **C0.0** Doc reconciliation: chapter 09 §3 named `make plan-gate` as a
   goopg-vs-PG registry; it is actually goopg-vs-self-snapshot, with the vs-PG
   classification in `scripts/pg-oracle-diff.sh`. Corrected §3/§5. — _doc-only; gate: n/a_
-- [ ] **C0.1** `internal/planner/path.go`: `Cost`, `Path`, `RelOptInfo`, `PathKind`,
-  `RelSet`; `addPath`/`setCheapest` + `comparePathCostsFuzzily` (`STD_FUZZ_FACTOR`
-  1.01, `disabled_nodes` first). Pure library, no integration. Unit tests:
-  dominance, fuzz tie-break, determinism. Gate: units.
+- [x] **C0.1** `internal/planner/path.go`: `Cost`, `Path`, `RelOptInfo`, `PathKind`,
+  `RelSet`; `addPath`/`addPartialPath`/`setCheapest` + `comparePathCostsFuzzily`
+  (`STD_FUZZ_FACTOR` 1.01, `disabled_nodes` first) + `comparePaths` 4-axis
+  dominance (cost/pathkeys/parallel_safe/required-outer). Minimal `pathkeys.go`
+  (`PathKey`, `pathkeysContainedIn`, `comparePathkeysDim`) landed here since
+  `addPath` needs the pathkey axis; C1 adds the produce/consume wiring. Pure
+  library, no integration. Gate: units PASS (`path_test.go`, 13 tests), vet clean,
+  full planner suite green.
 - [ ] **C0.2** `internal/planner/createplan.go`: `createPlan(path) Node`; wire at
   the `tryBushyDP` seam so the DP's chosen order round-trips through a (prebuilt)
   Path. Gate: **plan-gate zero diffs** vs `costmodel-c0-baseline`.
@@ -63,4 +67,5 @@ Branch: `introduce-costmodel`. Design of record: `docs/design/cost-model/`.
 
 _(newest first; each entry: date — sub-step — gate result — commit)_
 
-- 2026-07-22 — C0.0 — doc reconciliation (ch09 plan-gate) + TODO tracker created — _docs commit_
+- 2026-07-22 — C0.1 — Path/RelOptInfo/add_path/set_cheapest + minimal pathkeys; 13 unit tests PASS, vet+suite green
+- 2026-07-22 — C0.0 — doc reconciliation (ch09 plan-gate) + TODO tracker created — `2dc44de8`
