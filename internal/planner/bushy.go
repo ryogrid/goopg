@@ -875,6 +875,57 @@ const (
 // rather than re-reading raw table sizes.
 //
 // (M0077-0003 / Slice C per design 02 §3.)
+// accurateKeyDistinct returns the distinct-value count of a single join-key
+// column, preferring the UNSATURATED estimate NDistinctFrac × RowCount (PG's
+// negative stadistinct fraction) over the raw sample NDistinct (saturates
+// ~30000). It resolves the SPECIFIC key column (not the table max) because an
+// equijoin's selectivity is governed by the joined columns only. Mirrors
+// cardinality.go's columnNDistinctForChild resolution (ColumnRef.Index indexes
+// the base table's positional Stats.Columns). Returns 0 when unresolvable.
+func accurateKeyDistinct(key Expr, tbl *catalog.Table) int64 {
+	if tbl == nil || tbl.Stats == nil {
+		return 0
+	}
+	cr, ok := key.(*ColumnRef)
+	if !ok {
+		return 0
+	}
+	idx := cr.Index
+	if idx < 0 || idx >= len(tbl.Stats.Columns) {
+		return 0
+	}
+	cs := tbl.Stats.Columns[idx]
+	if cs.NDistinctFrac > 0 && tbl.Stats.RowCount > 0 {
+		return int64(cs.NDistinctFrac * float64(tbl.Stats.RowCount))
+	}
+	return cs.NDistinct
+}
+
+// maxColSaturatedDistinct is the historical fallback: the largest per-column
+// SAMPLE NDistinct across the table. Used when the join key does not resolve to
+// a base-table ColumnRef, so keyless/degenerate edges estimate as before.
+func maxColSaturatedDistinct(tbl *catalog.Table) int64 {
+	if tbl == nil || tbl.Stats == nil {
+		return 0
+	}
+	best := int64(0)
+	for _, cs := range tbl.Stats.Columns {
+		if cs.NDistinct > best {
+			best = cs.NDistinct
+		}
+	}
+	return best
+}
+
+// sideKeyDistinct resolves the accurate join-key distinct for one side, falling
+// back to the table's saturated max when the key is unresolvable.
+func sideKeyDistinct(key Expr, tbl *catalog.Table) int64 {
+	if d := accurateKeyDistinct(key, tbl); d > 0 {
+		return d
+	}
+	return maxColSaturatedDistinct(tbl)
+}
+
 func estimateJoinCost(leftRows, rightRows int64, edge *joinEdge, g *joinGraph, cat catalog.Catalog) (outputRows, cost int64) {
 	if leftRows <= 0 {
 		leftRows = 1
@@ -883,22 +934,38 @@ func estimateJoinCost(leftRows, rightRows int64, edge *joinEdge, g *joinGraph, c
 		rightRows = 1
 	}
 	ndv := int64(1)
-	if edge.leftTable < len(g.tables) && g.tables[edge.leftTable] != nil {
-		tbl := g.tables[edge.leftTable]
-		if tbl.Stats != nil {
-			for _, cs := range tbl.Stats.Columns {
-				if cs.NDistinct > 0 {
-					ndv = max(ndv, int64(cs.NDistinct))
+	if costDrivenJoinOrder {
+		// Cost-driven order needs cardinality close to PG's (ch. 12 §5):
+		// resolve the JOIN-KEY column's unsaturated distinct
+		// (NDistinctFrac × RowCount) rather than the table's saturated
+		// max. This precondition is what makes PG's constants reproduce
+		// PG's plan shape; it is deliberately NOT applied to the integer
+		// DP, whose build*4 weights are calibrated to the saturated
+		// regime and regress under accurate cardinality (measured).
+		if edge.leftTable < len(g.tables) {
+			ndv = max(ndv, sideKeyDistinct(edge.leftKey, g.tables[edge.leftTable]))
+		}
+		if edge.rightTable < len(g.tables) {
+			ndv = max(ndv, sideKeyDistinct(edge.rightKey, g.tables[edge.rightTable]))
+		}
+	} else {
+		if edge.leftTable < len(g.tables) && g.tables[edge.leftTable] != nil {
+			tbl := g.tables[edge.leftTable]
+			if tbl.Stats != nil {
+				for _, cs := range tbl.Stats.Columns {
+					if cs.NDistinct > 0 {
+						ndv = max(ndv, int64(cs.NDistinct))
+					}
 				}
 			}
 		}
-	}
-	if edge.rightTable < len(g.tables) && g.tables[edge.rightTable] != nil {
-		tbl := g.tables[edge.rightTable]
-		if tbl.Stats != nil {
-			for _, cs := range tbl.Stats.Columns {
-				if cs.NDistinct > 0 {
-					ndv = max(ndv, int64(cs.NDistinct))
+		if edge.rightTable < len(g.tables) && g.tables[edge.rightTable] != nil {
+			tbl := g.tables[edge.rightTable]
+			if tbl.Stats != nil {
+				for _, cs := range tbl.Stats.Columns {
+					if cs.NDistinct > 0 {
+						ndv = max(ndv, int64(cs.NDistinct))
+					}
 				}
 			}
 		}
