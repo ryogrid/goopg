@@ -55,8 +55,13 @@ Branch: `introduce-costmodel`. Design of record: `docs/design/cost-model/`.
   the block-count source (`smgr.NBlocks` via `BlocksForTable`) plug in at C3.
 
 ## C3 — Cost functions + path generation
-- [ ] **C3.1** `cost_funcs.go`: per-node PG-unit cost functions reading config GUCs;
-  unit checks vs oracle (`get_parallel_divisor(2)=2.4`, …).
+- [x] **C3.1** `cost_funcs.go`: per-node PG-unit cost functions —
+  `getParallelDivisor`, `costSeqscan`, `costSortRun`, `hashJoinCost`,
+  `nestloopCost`, `mergeJoinCost`, `gatherCost`, `aggCost` — plus `costParams` and
+  `defaultCostParams`. 7 unit tests vs hand-computed oracle values
+  (`getParallelDivisor(2)=2.4`, `costSeqscan(1000,100000,1)=2250`, build-is-startup,
+  gather setup+transfer) + a **drift guard** asserting `defaultCostParams` equals
+  the config-registered GUC BootVals. Pure, no live caller. Gate: units PASS.
 - [ ] **C3.2** Generate costed scan + join paths into pathlists (selection still on
   integer DP). `addPath`/`setCheapest` dominance gate. Gate: plan-gate zero diffs.
 
@@ -83,7 +88,8 @@ Branch: `introduce-costmodel`. Design of record: `docs/design/cost-model/`.
 
 _(newest first; each entry: date — sub-step — gate result — commit)_
 
-- 2026-07-22 — C2.1/C2.2 — relsize.go: baseRelRows + width estimator + estimate_rel_size fallback; cold-start test PASS; plan-preserving
+- 2026-07-22 — C3.1 — cost_funcs.go: 8 per-node PG-unit cost functions + 7 oracle tests + config drift guard; plan-preserving
+- 2026-07-22 — C2.1/C2.2 — relsize.go: baseRelRows + width estimator + estimate_rel_size fallback; cold-start test PASS; plan-preserving — `1e5b5a4f`
 - 2026-07-22 — C1.1 — pathkeys API completed (pathkeysForSortKeys) + 9 tests; plan-preserving, suite green — `b4770527`
 - 2026-07-22 — C0.2 — create_plan seam wired at bushy.go:207 (identity in C0); warm baseline captured; suite+createplan tests green — `b44998b5`
 - 2026-07-22 — C0.1 — Path/RelOptInfo/add_path/set_cheapest + minimal pathkeys; 13 unit tests PASS, vet+suite green — `4fee8d87`
