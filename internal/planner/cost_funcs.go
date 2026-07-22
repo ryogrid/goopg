@@ -1,6 +1,21 @@
 package planner
 
-import "math"
+import (
+	"math"
+	"os"
+	"strconv"
+)
+
+// envFloatDefault reads a float from the environment, returning def when unset
+// or unparseable. Used for measurement-time cost-calibration overrides.
+func envFloatDefault(key string, def float64) float64 {
+	if v := os.Getenv(key); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			return f
+		}
+	}
+	return def
+}
 
 // Per-node cost functions, reproduced from PostgreSQL's costsize.c in PG's units
 // (seq_page_cost = 1.0). See docs/design/cost-model/ chapter 02. Phase C3.1:
@@ -137,8 +152,19 @@ func gatherCost(cp costParams, sub Cost, outputRows float64) Cost {
 // (nestloopCost's innerRescanTotal). It is what makes NL-index cheap for a
 // selective outer side and ruinous for a large one — the Q9 lesson (ch. 07 §4.5).
 func indexProbeCost(cp costParams) float64 {
-	return 2*cp.randomPageCost + cp.cpuIndexTupleCost + cp.cpuTupleCost + cp.cpuOperatorCost
+	return indexProbeCostMultiplier * (2*cp.randomPageCost + cp.cpuIndexTupleCost + cp.cpuTupleCost + cp.cpuOperatorCost)
 }
+
+// indexProbeCostMultiplier scales indexProbeCost. PG's constants (multiplier 1)
+// under-cost goopg's NL-index probe — goopg materialises the whole TID list
+// eagerly per probe (ch. 06 §5), so an NL-probe of a large relation runs far
+// slower than PG's random_page_cost model predicts, and the cost-driven DP would
+// pick ruinous PG-shaped NL plans (measured: Q5/Q9 20-200x). This multiplier
+// recalibrates the probe cost toward goopg's in-memory reality so the DP prefers
+// a hash join over NL-probing a large outer. Overridable via
+// GOOPG_INDEX_PROBE_MULT for measurement; the calibrated default is set once a
+// value is validated on SF1.
+var indexProbeCostMultiplier = envFloatDefault("GOOPG_INDEX_PROBE_MULT", 1.0)
 
 // multiHashJoinCost costs goopg's N-way MultiHashJoin under the comparability
 // invariant (design ch. 06 §4.1): build each dimension hash table (charged as

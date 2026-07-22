@@ -570,6 +570,62 @@ func SetMHJPackingEnabled(v bool) bool {
 	return prev
 }
 
+// nliCostDelegation, when true (default under cost-driven order), makes
+// the DP cost each candidate join as the method rewriteJoinsToNLI will
+// ACTUALLY build it (ch. 12 §4): consult tryBuildNLI on a clone and, if
+// convertible, cost the join with nestloopCost + indexProbeCost instead
+// of hashJoinCost. Construction stays solely in rewriteJoinsToNLI — the
+// DP only borrows tryBuildNLI as the shared predicate so its ranking and
+// the executed method cannot desync.
+var nliCostDelegation = true
+
+// SetNLICostDelegation toggles delegated NLI costing. Returns previous.
+func SetNLICostDelegation(v bool) bool {
+	prev := nliCostDelegation
+	nliCostDelegation = v
+	return prev
+}
+
+// isProbableInnerScan reports whether a node is a base-relation scan
+// (optionally behind a Filter) — the shape tryBuildNLI index-probes as
+// the NLI inner. Used to decide which side drives the loop when costing
+// a delegated NLI (ch. 12 §4).
+func isProbableInnerScan(n Node) bool {
+	switch x := n.(type) {
+	case *SeqScan, *IndexScan:
+		return true
+	case *Filter:
+		return isProbableInnerScan(x.Child)
+	}
+	return false
+}
+
+// costJoinCandidate returns the PG-unit cost of a candidate join as the
+// method it will actually execute. Default: hashJoinCost. When NLI-cost
+// delegation is on and tryBuildNLI reports the join convertible (on a
+// shallow clone, so no mutation escapes), it is costed as a nested loop
+// whose inner is one index probe per outer row — the cost that makes the
+// DP avoid orders that NL-probe a large relation.
+func costJoinCandidate(cp costParams, join *Join, entryA, entryB dpEntry, outRows int64, cat catalog.Catalog) Cost {
+	hashCost := hashJoinCost(cp, entryA.pgCost, entryB.pgCost,
+		float64(entryA.rows), float64(entryB.rows), float64(outRows), 1)
+	if !nliCostDelegation || cat == nil || join == nil {
+		return hashCost
+	}
+	clone := *join
+	if _, ok := tryBuildNLI(&clone, cat); !ok {
+		return hashCost
+	}
+	// tryBuildNLI prefers the Right child as the index-probed inner; the
+	// other side drives the loop. Cost = outer scan + one probe per outer
+	// row (indexProbeCost) + per-output CPU.
+	outerCost, outerRows, innerCost := entryA.pgCost, entryA.rows, entryB.pgCost
+	if !isProbableInnerScan(entryB.plan) {
+		outerCost, outerRows, innerCost = entryB.pgCost, entryB.rows, entryA.pgCost
+	}
+	return nestloopCost(cp, outerCost, innerCost, float64(outerRows), float64(outRows), indexProbeCost(cp))
+}
+
 func enumerateBushyPlans(g *joinGraph, conjuncts []Expr, relInfos []baseRelInfo, cat catalog.Catalog) (Node, []Expr, error) {
 	if g.nodes == 0 {
 		return nil, nil, nil
@@ -649,14 +705,20 @@ func enumerateBushyPlans(g *joinGraph, conjuncts []Expr, relInfos []baseRelInfo,
 				// cardinality estimate rather than its cost
 				// (the two diverge once the build term enters).
 				outRows, cost := estimateJoinCost(entryA.rows, entryB.rows, edge, g, cat)
-				// Real PG-unit cost of this join (ch. 12 §2). Built over
-				// the two children's pgCosts; one hash clause for the
-				// canonical equi-join edge. Cardinality (outRows) is
-				// unchanged — only the SELECTION key differs by mode.
-				pgCost := hashJoinCost(cp, entryA.pgCost, entryB.pgCost,
-					float64(entryA.rows), float64(entryB.rows), float64(outRows), 1)
+				// Cost-driven mode builds the candidate join up front so its
+				// pgCost can reflect the method rewriteJoinsToNLI will build
+				// (ch. 12 §2, §4). Integer mode defers the build to the
+				// winner only (unchanged, plan-preserving).
+				var join *Join
+				var mergedLayout map[int]int
+				var pgCost Cost
+				if costDrivenJoinOrder {
+					join = buildJoinFromDP(entryA.plan, entryB.plan, entryA.rows, entryB.rows, a, b, entryA.layout, entryB.layout, edge, g)
+					mergedLayout = mergeSubsetLayouts(entryA.layout, entryB.layout, len(entryA.plan.Output()))
+					pgCost = costJoinCandidate(cp, join, entryA, entryB, outRows, cat)
+				}
 				// Selection key: real PG cost when cost-driven, else the
-				// integer heuristic (default, plan-preserving).
+				// integer heuristic.
 				better := best == nil
 				if !better {
 					if costDrivenJoinOrder {
@@ -666,8 +728,10 @@ func enumerateBushyPlans(g *joinGraph, conjuncts []Expr, relInfos []baseRelInfo,
 					}
 				}
 				if better {
-					join := buildJoinFromDP(entryA.plan, entryB.plan, entryA.rows, entryB.rows, a, b, entryA.layout, entryB.layout, edge, g)
-					mergedLayout := mergeSubsetLayouts(entryA.layout, entryB.layout, len(entryA.plan.Output()))
+					if join == nil {
+						join = buildJoinFromDP(entryA.plan, entryB.plan, entryA.rows, entryB.rows, a, b, entryA.layout, entryB.layout, edge, g)
+						mergedLayout = mergeSubsetLayouts(entryA.layout, entryB.layout, len(entryA.plan.Output()))
+					}
 					best = &dpEntry{plan: join, rows: outRows, cost: cost, layout: mergedLayout, pgCost: pgCost}
 					bestEdgeIdx = edgeIdx
 				}
