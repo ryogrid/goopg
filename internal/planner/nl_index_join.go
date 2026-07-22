@@ -82,6 +82,21 @@ func rewriteJoinsToNLI(n Node, cat catalog.Catalog) Node {
 	if !nliEnabled.Load() {
 		return n
 	}
+	// Phase 1 correctness safety net (design doc 13 §4). Under cost-driven
+	// join order, an NLI subtree's runtime tuple order diverges from its
+	// OID-sorted Output() schema inside a derived-table scope, so every
+	// downstream join that binds keys to that schema (hash OR NLI) reads
+	// the wrong columns — TPC-H Q9 returns 0 rows (§2.1). Measured: an
+	// all-hash cost-driven plan is correct; ANY NLI in the plan breaks it.
+	// Until the Phase-2 layout reconciliation lands, skip NLI conversion
+	// under cost-driven order so those plans are all-hash. Gated on the
+	// cost-driven flag (default OFF), so the production (non-cost-driven)
+	// planner — whose NLIs are measured correct — is untouched; this is a
+	// performance deferral for the experimental cost path, not a
+	// correctness change for production.
+	if costDrivenJoinOrder {
+		return n
+	}
 	return walkRewriteNLI(n, cat)
 }
 
